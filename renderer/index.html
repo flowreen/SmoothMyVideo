@@ -23,6 +23,7 @@
   #log { background:#101010; color:#ccc; font-family:Consolas,monospace; font-size:12px;
          height:150px; overflow:auto; white-space:pre-wrap; padding:8px; border-radius:6px; }
   .hint { color:var(--sub); font-size:11px; }
+  body.drag { outline:3px dashed var(--green); outline-offset:-10px; }
 </style>
 </head>
 <body>
@@ -31,7 +32,7 @@
 
   <div class="row">
     <button id="pick">Select video...</button>
-    <span id="path" class="hint">No file selected</span>
+    <span id="path" class="hint">No file selected. You can also drag a video onto the window.</span>
   </div>
 
   <div class="panel" id="info" style="display:none">
@@ -68,7 +69,7 @@
   <div id="log"></div>
 
 <script>
-const { ipcRenderer, shell } = require('electron');
+const { ipcRenderer, shell, webUtils } = require('electron');
 let info = null, input = null, lastOut = null, haveFrames = 1, totalFrames = 1, procStart = 0, cancelled = false;
 function fmtTime(s){ s=Math.max(0,Math.round(s)); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
 
@@ -81,8 +82,8 @@ function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const 
 function refresh(){ if(!input) return; $('outfps').textContent = '≈ '+targetFps()+' fps';
   lastOut = outName(); $('out').textContent = lastOut; }
 
-$('pick').onclick = async () => {
-  const f = await ipcRenderer.invoke('pick-video'); if(!f) return;
+async function loadVideo(f){
+  if(!f) return;
   input = f; $('path').textContent = f;
   const p = await ipcRenderer.invoke('probe', f);
   if(p.error){ alert('Could not read video: '+p.error); return; }
@@ -97,8 +98,19 @@ $('pick').onclick = async () => {
   $('go').disabled = false; $('open').disabled = true;
   $('status').textContent = 'Ready. Pick a multiplier and click Smooth It!';
   refresh();
-};
+}
+$('pick').onclick = async () => { await loadVideo(await ipcRenderer.invoke('pick-video')); };
 $('multi').onchange = refresh;
+
+// Drag a video file onto the window to load it (ignored while a job is running).
+document.addEventListener('dragover', (e) => { e.preventDefault(); if($('cancel').disabled) document.body.classList.add('drag'); });
+document.addEventListener('dragleave', (e) => { if(e.relatedTarget === null) document.body.classList.remove('drag'); });
+document.addEventListener('drop', (e) => {
+  e.preventDefault(); document.body.classList.remove('drag');
+  if(!$('cancel').disabled) return;            // a job is in progress
+  const f = (e.dataTransfer.files || [])[0];
+  if(f) loadVideo(webUtils.getPathForFile(f));
+});
 
 $('go').onclick = () => {
   if(!input) return;
