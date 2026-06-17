@@ -1,23 +1,25 @@
-/tmp
-/out-tsc
+# build output
 /dist
 
+# dependencies
 /node_modules
 npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-/.pnp
-.pnp.js
 
-.vscode/*
+# editor
+.idea/
+.vscode/
 
 # python engine
 engine/.venv/
 engine/**/__pycache__/
 engine/GMFSS_Fortuna/vid_out/
 
-# large model weights (download separately)
+# large model weights (download separately, see README)
 engine/GMFSS_Fortuna/train_log/
 
-# outputs / scratch
+# generated video outputs / scratch
 *.mp4
+# ...but keep sample source clips, e.g. samples/gtest.mp4 (the 24fps example)
+!samples/*.mp4
+# ...while still ignoring generated interpolation outputs in samples (e.g. *_48fps.mp4)
+samples/*fps.mp4
