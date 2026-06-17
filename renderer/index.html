@@ -70,6 +70,7 @@
 
 <script>
 const { ipcRenderer, shell, webUtils } = require('electron');
+const path = require('path');
 let info = null, input = null, lastOut = null, haveFrames = 1, totalFrames = 1, procStart = 0, cancelled = false;
 function fmtTime(s){ s=Math.max(0,Math.round(s)); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
 
@@ -85,6 +86,7 @@ function refresh(){ if(!input) return; $('outfps').textContent = '≈ '+targetFp
 async function loadVideo(f){
   if(!f) return;
   input = f; $('path').textContent = f;
+  try { localStorage.setItem('dir', path.dirname(f)); } catch {}
   const p = await ipcRenderer.invoke('probe', f);
   if(p.error){ alert('Could not read video: '+p.error); return; }
   const s = (p.streams||[])[0] || {};
@@ -99,8 +101,12 @@ async function loadVideo(f){
   $('status').textContent = 'Ready. Pick a multiplier and click Smooth It!';
   refresh();
 }
-$('pick').onclick = async () => { await loadVideo(await ipcRenderer.invoke('pick-video')); };
-$('multi').onchange = refresh;
+$('pick').onclick = async () => { await loadVideo(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
+$('multi').onchange = () => { localStorage.setItem('multi', $('multi').value); refresh(); };
+
+// Restore the last chosen multiplier from the previous session.
+const savedMulti = localStorage.getItem('multi');
+if(savedMulti && [...$('multi').options].some(o => o.value === savedMulti)) $('multi').value = savedMulti;
 
 // Drag a video file onto the window to load it (ignored while a job is running).
 document.addEventListener('dragover', (e) => { e.preventDefault(); if($('cancel').disabled) document.body.classList.add('drag'); });

@@ -17,7 +17,8 @@ Working end to end and verified by the user on real clips. Nothing is half finis
 
 - GUI: select a video (or drag one onto the window), view its info (resolution, source
   fps, duration, codec), choose a multiplier, click **Smooth It!**. **Cancel** kills the
-  running job; **Open folder** reveals the result.
+  running job; **Open folder** reveals the result. The last used folder and multiplier
+  are remembered between sessions.
 - Progress: a bar that starts at the source frame count and fills to the post process
   total, plus a live frame counter and an ETA.
 - Output: written beside the source as `<name>_<fps>fps.mp4`, encoded with
@@ -39,7 +40,8 @@ Working end to end and verified by the user on real clips. Nothing is half finis
   engine, streams progress, tracks the running child so **Cancel** can `taskkill /T /F` it.
 - `renderer/index.html` - the UI (select or drag in a video, multiplier, progress bar
   with frame counter and ETA, Cancel, Open folder, log). Uses `require('electron')`;
-  a dropped file is resolved to a path with `webUtils.getPathForFile`.
+  a dropped file is resolved to a path with `webUtils.getPathForFile`, and the last
+  folder and multiplier are saved in `localStorage`.
 - `engine/gmfss_interp.py` - GMFSS pipe engine: ffmpeg decode (rgb24) into GMFSS into
   ffmpeg encode (`hevc_nvenc`, audio copied). Always fp16. Prints `PROGRESS k/total` to
   stderr. `_add_cuda_dll_dirs()` puts the nvidia wheel bin dirs on the Windows DLL search
@@ -100,7 +102,6 @@ Small UX:
 - Arbitrary target fps. The original intent allowed any output fps (editable, up to 1000).
   The UI currently exposes only fixed multipliers (2x, 4x, 8x, 16x). Add a free numeric
   fps field. The engine takes a multiplier today and could take a target fps instead.
-- Remember the last used folder for the file dialog and the last chosen multiplier.
 - Let the user pick a custom output location instead of always writing beside the source.
 
 Larger:

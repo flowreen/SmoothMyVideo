@@ -31,8 +31,9 @@ app.whenReady().then(createWindow);
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
-ipcMain.handle('pick-video', async () => {
+ipcMain.handle('pick-video', async (_e, defaultPath?: string) => {
   const r = await dialog.showOpenDialog(win!, {
+    defaultPath,
     properties: ['openFile'],
     filters: [{ name: 'Video', extensions: ['mp4', 'mkv', 'mov', 'avi', 'webm', 'm4v', 'wmv', 'ts'] }],
   });
