@@ -1,0 +1,16 @@
+{
+  "name": "smoothmyvideo",
+  "version": "0.1.0",
+  "description": "Desktop GUI for AI video frame interpolation (GMFSS), Python engine under the hood",
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "tsc && electron .",
+    "starti": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true, maxRetries: 3 }); fs.rmSync('package-lock.json', { force: true })\" && npm install && npm start"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "electron": "latest",
+    "typescript": "latest"
+  },
+  "private": true
+}

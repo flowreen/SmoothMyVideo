@@ -1,0 +1,140 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>SmoothMyVideo</title>
+<style>
+  :root { --green:#76b900; --panel:#2a2a2a; --bg:#1b1b1b; --text:#eaeaea; --sub:#9a9a9a; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:18px; background:var(--bg); color:var(--text);
+         font-family:'Segoe UI',sans-serif; }
+  h1 { margin:0; font-size:22px; }
+  .sub { color:var(--sub); font-size:12px; margin:2px 0 14px; }
+  button { font:inherit; padding:7px 12px; border:0; border-radius:6px; cursor:pointer; }
+  .panel { background:var(--panel); border-radius:8px; padding:12px 14px; margin:10px 0; }
+  .row { display:flex; align-items:center; gap:10px; margin:6px 0; }
+  .k { color:var(--sub); width:110px; } .v { font-family:Consolas,monospace; }
+  #go { background:var(--green); color:#0d0d0d; font-weight:700; font-size:15px; padding:10px 18px; }
+  #go:disabled { background:#444; color:#888; cursor:default; }
+  select, input { font:inherit; background:#101010; color:var(--text); border:1px solid #444;
+                  border-radius:5px; padding:5px 8px; }
+  #bar { height:18px; background:#101010; border-radius:9px; overflow:hidden; }
+  #fill { height:100%; width:0; background:var(--green); transition:width .15s; }
+  #log { background:#101010; color:#ccc; font-family:Consolas,monospace; font-size:12px;
+         height:150px; overflow:auto; white-space:pre-wrap; padding:8px; border-radius:6px; }
+  .hint { color:var(--sub); font-size:11px; }
+</style>
+</head>
+<body>
+  <h1>SmoothMyVideo</h1>
+  <div class="sub">GMFSS frame interpolation on your GeForce. Offline.</div>
+
+  <div class="row">
+    <button id="pick">Select video...</button>
+    <span id="path" class="hint">No file selected</span>
+  </div>
+
+  <div class="panel" id="info" style="display:none">
+    <div class="row"><span class="k">Resolution</span><span class="v" id="res">-</span></div>
+    <div class="row"><span class="k">Source FPS</span><span class="v" id="fps">-</span></div>
+    <div class="row"><span class="k">Duration</span><span class="v" id="dur">-</span></div>
+    <div class="row"><span class="k">Codec</span><span class="v" id="codec">-</span></div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <span class="k">Multiplier</span>
+      <select id="multi">
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+        <option value="8">8x</option>
+        <option value="16">16x</option>
+      </select>
+      <span class="hint" id="outfps"></span>
+    </div>
+    <div class="row"><span class="k">Saves to</span><span class="v hint" id="out"></span></div>
+  </div>
+
+  <div class="row">
+    <button id="go" disabled>Smooth It!</button>
+    <button id="cancel" disabled>Cancel</button>
+    <button id="open" disabled>Open folder</button>
+    <span id="status" class="hint">Select a video to begin.</span>
+  </div>
+
+  <div class="panel"><div id="bar"><div id="fill"></div></div>
+    <div class="hint" id="frames" style="margin-top:6px"></div></div>
+
+  <div id="log"></div>
+
+<script>
+const { ipcRenderer, shell } = require('electron');
+let info = null, input = null, lastOut = null, haveFrames = 1, totalFrames = 1, procStart = 0, cancelled = false;
+function fmtTime(s){ s=Math.max(0,Math.round(s)); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
+
+const $ = (id) => document.getElementById(id);
+function log(t){ $('log').textContent += t; $('log').scrollTop = $('log').scrollHeight; }
+function srcFps(){ const [n,d]=(info.fps||'24/1').split('/'); return (+n)/((+d)||1); }
+function targetFps(){ return Math.round(srcFps()*(+$('multi').value)); }
+function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
+  return b + '_' + targetFps() + 'fps.mp4'; }
+function refresh(){ if(!input) return; $('outfps').textContent = '≈ '+targetFps()+' fps';
+  lastOut = outName(); $('out').textContent = lastOut; }
+
+$('pick').onclick = async () => {
+  const f = await ipcRenderer.invoke('pick-video'); if(!f) return;
+  input = f; $('path').textContent = f;
+  const p = await ipcRenderer.invoke('probe', f);
+  if(p.error){ alert('Could not read video: '+p.error); return; }
+  const s = (p.streams||[])[0] || {};
+  info = { fps: s.r_frame_rate, w: s.width, h: s.height, nb: +(s.nb_frames||0),
+           dur: +((p.format||{}).duration||0), codec: s.codec_name };
+  $('info').style.display='block';
+  $('res').textContent = s.width+' x '+s.height;
+  $('fps').textContent = srcFps().toFixed(3);
+  const d=info.dur|0; $('dur').textContent = (d/3600|0)+':'+String((d%3600/60|0)).padStart(2,'0')+':'+String(d%60).padStart(2,'0');
+  $('codec').textContent = s.codec_name || '?';
+  $('go').disabled = false; $('open').disabled = true;
+  $('status').textContent = 'Ready. Pick a multiplier and click Smooth It!';
+  refresh();
+};
+$('multi').onchange = refresh;
+
+$('go').onclick = () => {
+  if(!input) return;
+  procStart = 0;
+  haveFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
+  totalFrames = Math.max(haveFrames+1, Math.round(haveFrames*(+$('multi').value)));
+  cancelled = false;
+  $('go').disabled = true; $('pick').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
+  $('status').textContent = 'Smoothing on the GPU...';
+  $('fill').style.width = (100*haveFrames/totalFrames)+'%';
+  $('frames').textContent = 'Frames: '+haveFrames+' / '+totalFrames;
+  log('>> '+input+'  ->  '+targetFps()+' fps ('+$('multi').value+'x)\n');
+  ipcRenderer.send('run', { input, multi:+$('multi').value, output: lastOut });
+};
+$('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
+$('cancel').onclick = () => { cancelled = true; $('cancel').disabled = true; $('status').textContent = 'Cancelling...'; ipcRenderer.send('cancel'); };
+
+ipcRenderer.on('engine-out', (_e, t) => {
+  const m = /PROGRESS\s+(\d+)\/(\d+)/.exec(t);
+  if(m){ const done=+m[1], tot=+m[2]||1; const frac=done/tot;
+    if(!procStart) procStart = Date.now();
+    const val = haveFrames + frac*(totalFrames-haveFrames);
+    $('fill').style.width = (100*val/totalFrames)+'%';
+    let eta = '';
+    const el = (Date.now()-procStart)/1000;
+    if(frac > 0.02 && frac < 1) eta = '   ETA ' + fmtTime(el*(1-frac)/frac);
+    $('frames').textContent = 'Frames: '+Math.round(val)+' / '+totalFrames+'  ('+Math.round(100*val/totalFrames)+'%)' + eta;
+  } else if(!/Optical Flow Grid Size/.test(t)) { log(t); }
+});
+ipcRenderer.on('engine-done', (_e, code) => {
+  $('go').disabled=false; $('pick').disabled=false; $('cancel').disabled=true;
+  if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n'); }
+  else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalFrames+' / '+totalFrames+'  (100%)';
+    $('status').textContent='Done!'; $('open').disabled=false; log('>> Saved: '+lastOut+'\n'); }
+  else { $('status').textContent='Failed (exit '+code+'). See log.'; log('>> Failed (exit '+code+')\n'); }
+});
+</script>
+</body>
+</html>

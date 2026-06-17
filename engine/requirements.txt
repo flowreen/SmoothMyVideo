@@ -1,0 +1,13 @@
+# 1) torch first (Blackwell cu128 wheel):
+#    .venv\Scripts\python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# 2) then: .venv\Scripts\python -m pip install -r requirements.txt
+numpy
+opencv-python
+tqdm
+
+# Speed: cupy softsplat path (validated on RTX 5090 / sm_120, ~1.7x on fp16 inference).
+# The nvrtc + runtime wheels are required so cupy can JIT its kernels; the engine adds
+# their bin dirs to the Windows DLL search at startup (_add_cuda_dll_dirs).
+cupy-cuda12x
+nvidia-cuda-nvrtc-cu12
+nvidia-cuda-runtime-cu12
