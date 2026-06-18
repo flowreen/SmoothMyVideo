@@ -16,7 +16,8 @@ multipliers.
 Working end to end and verified by the user on real clips. Nothing is half finished.
 
 - GUI: select a video (or drag one onto the window), view its info (resolution, source
-  fps, duration, codec), choose a multiplier, click **Smooth It!**. **Cancel** kills the
+  fps, duration, codec), choose a multiplier or type a target fps, click **Smooth It!**.
+  **Cancel** kills the
   running job; **Open folder** reveals the result. The last used folder and multiplier
   are remembered between sessions.
 - Progress: a bar that starts at the source frame count and fills to the post process
@@ -39,12 +40,13 @@ Working end to end and verified by the user on real clips. Nothing is half finis
 - `src/main.ts` - Electron main: window, open and save dialogs, ffprobe (`-of json`),
   spawns the engine, streams progress, tracks the running child so **Cancel** can
   `taskkill /T /F` it.
-- `renderer/index.html` - the UI (select or drag in a video, multiplier, output path
-  with **Change...**, progress bar with frame counter and ETA, Cancel, Open folder, log).
+- `renderer/index.html` - the UI (select or drag in a video, multiplier or fps, output
+  path with **Change...**, progress bar with frame counter and ETA, Cancel, Open folder, log).
   Uses `require('electron')`; a dropped file is resolved to a path with
   `webUtils.getPathForFile`, and the last folder and multiplier are saved in `localStorage`.
 - `engine/gmfss_interp.py` - GMFSS pipe engine: ffmpeg decode (rgb24) into GMFSS into
-  ffmpeg encode (`hevc_nvenc`, audio copied). Always fp16. Prints `PROGRESS k/total` to
+  ffmpeg encode (`hevc_nvenc`, audio copied). Always fp16; takes an integer `<multi>` or
+  `--fps TARGET` for an arbitrary resampled output fps. Prints `PROGRESS k/total` to
   stderr. `_add_cuda_dll_dirs()` puts the nvidia wheel bin dirs on the Windows DLL search
   before the model imports so cupy can JIT its kernel.
 - `engine/GMFSS_Fortuna/` - GMFSS model code (inference chain only) plus `train_log/`
@@ -99,11 +101,6 @@ Triton plus MSVC, neither installed).
 For whoever picks this up. Ordered roughly small to large. The recurring small step work
 is essentially exhausted; the real remaining items are the two larger ones.
 
-Small UX:
-- Arbitrary target fps. The original intent allowed any output fps (editable, up to 1000).
-  The UI currently exposes only fixed multipliers (2x, 4x, 8x, 16x). Add a free numeric
-  fps field. The engine takes a multiplier today and could take a target fps instead.
-
 Larger:
 - Package into a distributable installer with electron-builder. The catch is size: it has
   to ship the Python venv with torch and cupy, which is multiple GB. Decide between
@@ -120,5 +117,9 @@ Constraints to keep in mind:
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\.venv\Scripts\python engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0]
+engine\.venv\Scripts\python engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET]
 ```
+
+`--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
+interpolates at arbitrary fractional timesteps). `<multi>` stays required as a positional
+but is ignored when `--fps` is given.

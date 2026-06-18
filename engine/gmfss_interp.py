@@ -3,10 +3,12 @@ GMFSS pipe interpolation engine for SmoothMyVideo.
 ffmpeg decode (rgb24) -> GMFSS anime union model -> ffmpeg encode (hevc_nvenc, audio copied).
 Streams frames so there is no PNG folder. Prints "PROGRESS k/total" to stderr for the GUI.
 
-Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0]   (always runs fp16)
+Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET]   (always runs fp16)
+       --fps overrides <multi>, resampling the timeline to TARGET output fps.
 """
 import os
 import sys
+import math
 import argparse
 import subprocess
 import numpy as np
@@ -22,6 +24,8 @@ ap.add_argument("input")
 ap.add_argument("multi", type=int)
 ap.add_argument("output", nargs="?", default=None)
 ap.add_argument("--scale", type=float, default=1.0)
+ap.add_argument("--fps", type=float, default=None,
+                help="target output fps; overrides <multi> via timeline resampling")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
@@ -37,9 +41,17 @@ def probe(path):
     return w, h, int(num), int(den), nb
 
 W, H, num, den, NB = probe(inp)
+FPS_MODE = args.fps is not None and args.fps > 0
+src_fps = num / den
+if FPS_MODE:
+    ratio = args.fps / src_fps                 # output frames per source frame
+    rate_str = f"{args.fps:g}"
+    out_label = int(round(args.fps))
+else:
+    rate_str = f"{num * args.multi}/{den}"
+    out_label = int(round(src_fps * args.multi))
 out_path = os.path.abspath(args.output) if args.output else \
-    os.path.splitext(inp)[0] + f"_{int(round(num / den * args.multi))}fps.mp4"
-out_num = num * args.multi
+    os.path.splitext(inp)[0] + f"_{out_label}fps.mp4"
 fsize = W * H * 3
 total_pairs = max(1, NB - 1) if NB else 0
 
@@ -114,7 +126,7 @@ dec = subprocess.Popen(
     [FFMPEG, "-v", "error", "-i", inp, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
     stdout=subprocess.PIPE, creationflags=NO_WINDOW)
 enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
-           "-s", f"{W}x{H}", "-r", f"{out_num}/{den}", "-i", "-", "-i", inp,
+           "-s", f"{W}x{H}", "-r", rate_str, "-i", "-", "-i", inp,
            "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy",
            "-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18",
            "-b:v", "0", "-pix_fmt", "yuv420p", out_path]
@@ -126,19 +138,33 @@ if prev is None:
     sys.exit("no frames decoded")
 I0 = to_tensor(prev)
 k = 0
+i = 0
 try:
     while True:
         cur = read_exact(dec.stdout, fsize)
         if cur is None:
             break
         I1 = to_tensor(cur)
-        with amp():
-            reuse = model.reuse(I0, I1, scale)
-            mids = make_inference(I0, I1, reuse, n)
-        enc.stdin.write(prev)
-        for m in mids:
-            enc.stdin.write(to_bytes(m))
+        if FPS_MODE:
+            # emit the output frames whose time falls in [i, i+1) source-frame units
+            fracs = [j / ratio - i for j in range(math.ceil(i * ratio), math.ceil((i + 1) * ratio))]
+            need = any(fr > 1e-6 for fr in fracs)
+            with amp():
+                reuse = model.reuse(I0, I1, scale) if need else None
+                for fr in fracs:
+                    if fr <= 1e-6:
+                        enc.stdin.write(prev)            # coincides with source frame i
+                    else:
+                        enc.stdin.write(to_bytes(model.inference(I0, I1, reuse, fr)))
+        else:
+            with amp():
+                reuse = model.reuse(I0, I1, scale)
+                mids = make_inference(I0, I1, reuse, n)
+            enc.stdin.write(prev)
+            for m in mids:
+                enc.stdin.write(to_bytes(m))
         prev, I0 = cur, I1
+        i += 1
         k += 1
         if k % 10 == 0:
             sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()

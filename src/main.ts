@@ -62,8 +62,9 @@ ipcMain.handle('probe', async (_e, file: string) => {
 
 let current: ChildProcess | null = null;
 
-ipcMain.on('run', (e, opts: { input: string; multi: number; output: string }) => {
+ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
+  if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
   const proc = spawn(pyExe(), args, { cwd: ENGINE });
   current = proc;
   const onData = (buf: Buffer) => e.sender.send('engine-out', buf.toString());

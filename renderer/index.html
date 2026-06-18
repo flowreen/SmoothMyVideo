@@ -52,7 +52,8 @@
         <option value="8">8x</option>
         <option value="16">16x</option>
       </select>
-      <span class="hint" id="outfps"></span>
+      <span class="hint">or fps</span>
+      <input id="fpsin" type="number" min="1" max="1000" step="0.001" style="width:80px">
     </div>
     <div class="row"><span class="k">Saves to</span>
       <button id="changeout" class="mini" disabled>Change...</button>
@@ -74,16 +75,20 @@
 <script>
 const { ipcRenderer, shell, webUtils } = require('electron');
 const path = require('path');
-let info = null, input = null, lastOut = null, customOut = null, haveFrames = 1, totalFrames = 1, procStart = 0, cancelled = false;
+let info = null, input = null, lastOut = null, customOut = null, useFps = false, haveFrames = 1, totalFrames = 1, procStart = 0, cancelled = false;
 function fmtTime(s){ s=Math.max(0,Math.round(s)); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
 
 const $ = (id) => document.getElementById(id);
 function log(t){ $('log').textContent += t; $('log').scrollTop = $('log').scrollHeight; }
 function srcFps(){ const [n,d]=(info.fps||'24/1').split('/'); return (+n)/((+d)||1); }
-function targetFps(){ return Math.round(srcFps()*(+$('multi').value)); }
+function targetFps(){ return useFps ? parseFloat($('fpsin').value) : Math.round(srcFps()*(+$('multi').value)); }
+function outRatio(){ return useFps ? targetFps()/srcFps() : (+$('multi').value); }
+function syncFpsField(){ if(info) $('fpsin').value = Math.round(srcFps()*(+$('multi').value)); }
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
-  return b + '_' + targetFps() + 'fps.mp4'; }
-function refresh(){ if(!input) return; $('outfps').textContent = '≈ '+targetFps()+' fps';
+  return b + '_' + Math.round(targetFps()) + 'fps.mp4'; }
+function refresh(){ if(!input) return;
+  const t = targetFps();
+  if(!(t > 0)){ $('out').textContent = 'enter an output fps between 1 and 1000'; lastOut = null; return; }
   lastOut = customOut || outName(); $('out').textContent = lastOut; }
 
 async function loadVideo(f){
@@ -101,11 +106,13 @@ async function loadVideo(f){
   const d=info.dur|0; $('dur').textContent = (d/3600|0)+':'+String((d%3600/60|0)).padStart(2,'0')+':'+String(d%60).padStart(2,'0');
   $('codec').textContent = s.codec_name || '?';
   $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true;
-  $('status').textContent = 'Ready. Pick a multiplier and click Smooth It!';
+  $('status').textContent = 'Ready. Pick a multiplier or fps, then click Smooth It!';
+  useFps = false; syncFpsField();
   refresh();
 }
 $('pick').onclick = async () => { await loadVideo(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
-$('multi').onchange = () => { localStorage.setItem('multi', $('multi').value); refresh(); };
+$('multi').onchange = () => { localStorage.setItem('multi', $('multi').value); useFps = false; syncFpsField(); refresh(); };
+$('fpsin').oninput = () => { useFps = true; refresh(); };
 
 // Restore the last chosen multiplier from the previous session.
 const savedMulti = localStorage.getItem('multi');
@@ -123,16 +130,20 @@ document.addEventListener('drop', (e) => {
 
 $('go').onclick = () => {
   if(!input) return;
+  const t = targetFps();
+  if(!(t > 0)){ alert('Enter an output fps between 1 and 1000.'); return; }
   procStart = 0;
   haveFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
-  totalFrames = Math.max(haveFrames+1, Math.round(haveFrames*(+$('multi').value)));
+  totalFrames = Math.max(haveFrames+1, Math.round(haveFrames*outRatio()));
   cancelled = false;
   $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
   $('status').textContent = 'Smoothing on the GPU...';
   $('fill').style.width = (100*haveFrames/totalFrames)+'%';
   $('frames').textContent = 'Frames: '+haveFrames+' / '+totalFrames;
-  log('>> '+input+'  ->  '+targetFps()+' fps ('+$('multi').value+'x)\n');
-  ipcRenderer.send('run', { input, multi:+$('multi').value, output: lastOut });
+  log('>> '+input+'  ->  '+Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')+'\n');
+  const payload = { input, multi:+$('multi').value, output: lastOut };
+  if(useFps) payload.fps = t;
+  ipcRenderer.send('run', payload);
 };
 $('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
 $('changeout').onclick = async () => {
