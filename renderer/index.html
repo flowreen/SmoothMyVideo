@@ -82,13 +82,14 @@ const $ = (id) => document.getElementById(id);
 function log(t){ $('log').textContent += t; $('log').scrollTop = $('log').scrollHeight; }
 function srcFps(){ const [n,d]=(info.fps||'24/1').split('/'); return (+n)/((+d)||1); }
 function targetFps(){ return useFps ? parseFloat($('fpsin').value) : Math.round(srcFps()*(+$('multi').value)); }
+function fpsValid(t){ return useFps ? (t >= 1 && t <= 1000) : (t > 0); }
 function outRatio(){ return useFps ? targetFps()/srcFps() : (+$('multi').value); }
 function syncFpsField(){ if(info) $('fpsin').value = Math.round(srcFps()*(+$('multi').value)); }
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
   return b + '_' + Math.round(targetFps()) + 'fps.mp4'; }
 function refresh(){ if(!input) return;
   const t = targetFps();
-  if(!(t > 0)){ $('out').textContent = 'enter an output fps between 1 and 1000'; lastOut = null; return; }
+  if(!fpsValid(t)){ $('out').textContent = 'enter an output fps between 1 and 1000'; lastOut = null; return; }
   lastOut = customOut || outName(); $('out').textContent = lastOut; }
 
 async function loadVideo(f){
@@ -112,7 +113,7 @@ async function loadVideo(f){
 }
 $('pick').onclick = async () => { await loadVideo(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
 $('multi').onchange = () => { localStorage.setItem('multi', $('multi').value); useFps = false; syncFpsField(); refresh(); };
-$('fpsin').oninput = () => { useFps = true; refresh(); };
+$('fpsin').oninput = () => { useFps = true; if(parseFloat($('fpsin').value) > 1000) $('fpsin').value = 1000; refresh(); };
 
 // Restore the last chosen multiplier from the previous session.
 const savedMulti = localStorage.getItem('multi');
@@ -131,7 +132,7 @@ document.addEventListener('drop', (e) => {
 $('go').onclick = () => {
   if(!input) return;
   const t = targetFps();
-  if(!(t > 0)){ alert('Enter an output fps between 1 and 1000.'); return; }
+  if(!fpsValid(t)){ alert('Enter an output fps between 1 and 1000.'); return; }
   procStart = 0;
   haveFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
   totalFrames = Math.max(haveFrames+1, Math.round(haveFrames*outRatio()));
