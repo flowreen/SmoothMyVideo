@@ -4,7 +4,10 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 const ROOT = path.join(__dirname, '..');
-const ENGINE = path.join(ROOT, 'engine');
+// When packaged, the engine ships as an unpacked extraResource (the Python files and
+// venv must be real files on disk, not inside app.asar). The renderer and icon stay
+// under ROOT (Electron reads those from the asar fine).
+const ENGINE = app.isPackaged ? path.join(process.resourcesPath, 'engine') : path.join(ROOT, 'engine');
 const VENV_PY = path.join(ENGINE, '.venv', 'Scripts', 'python.exe');
 const ENGINE_SCRIPT = path.join(ENGINE, 'gmfss_interp.py');
 

@@ -1,16 +1,33 @@
 {
   "name": "smoothmyvideo",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Desktop GUI for AI video frame interpolation (GMFSS), Python engine under the hood",
   "main": "dist/main.js",
   "scripts": {
     "start": "tsc && electron .",
-    "starti": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true, maxRetries: 3 }); fs.rmSync('package-lock.json', { force: true })\" && npm install && npm start"
+    "starti": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true, maxRetries: 3 }); fs.rmSync('package-lock.json', { force: true })\" && npm install && npm start",
+    "pack": "tsc && electron-builder --dir",
+    "dist": "tsc && electron-builder"
   },
   "devDependencies": {
     "@types/node": "latest",
     "electron": "latest",
+    "electron-builder": "latest",
     "typescript": "latest"
   },
-  "private": true
+  "private": true,
+  "build": {
+    "appId": "com.smoothmyvideo.app",
+    "productName": "SmoothMyVideo",
+    "directories": { "output": "release" },
+    "files": ["dist/**/*", "renderer/**/*", "icon.ico", "icon.png"],
+    "extraResources": [
+      {
+        "from": "engine",
+        "to": "engine",
+        "filter": ["**/*", "!**/__pycache__/**", "!GMFSS_Fortuna/vid_out/**"]
+      }
+    ],
+    "win": { "target": "zip", "icon": "icon.ico" }
+  }
 }

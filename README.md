@@ -82,6 +82,10 @@ clone is missing them.
 ## Scripts
 - `npm start` - build and launch.
 - `npm run starti` - wipe `node_modules` and `package-lock.json`, fresh install, then start.
+- `npm run pack` - build an unpacked app into `release/win-unpacked/` with the engine and
+  venv bundled. For local testing (see the packaging caveat under "What can be done next").
+- `npm run dist` - build the distributable `release/SmoothMyVideo-<version>-win.zip`
+  (around 3 GB). Recipients extract it and run `SmoothMyVideo.exe`; no install step.
 
 ## Performance
 Precision is **fp16 only** (fp32 was removed: fp16 is visually lossless versus fp32,
@@ -103,9 +107,17 @@ For whoever picks this up. Ordered roughly small to large. The recurring small s
 is essentially exhausted; the real remaining items are the two larger ones.
 
 Larger:
-- Package into a distributable installer with electron-builder. The catch is size: it has
-  to ship the Python venv with torch and cupy, which is multiple GB. Decide between
-  bundling the venv or a first run setup step that builds it.
+- Make the packaged build portable. Done so far: `npm run pack` builds an unpacked app
+  under `release/win-unpacked/` (engine and venv bundled as `extraResources`) and it runs
+  on the build machine (verified end to end), and `npm run dist` zips it to
+  `release/SmoothMyVideo-<version>-win.zip`. Two findings shaped this. (1) NSIS is out: its
+  `makensis` compiler cannot memory map an app archive this large (about 2.4 GB), so the
+  target is a zip, not an installer. (2) The bundle is not portable: a Windows venv is not
+  self contained, its `pyvenv.cfg` home points at the system Python 3.12 and the standard
+  library lives there, so the copied venv breaks on a machine that lacks that Python. To
+  ship something that works on a clean machine, rebuild the engine environment on a
+  relocatable Python base (the embeddable Python distribution, or a python-build-standalone
+  build) before bundling.
 - TensorRT speed path. This is the headroom beyond the cupy ceiling (fp8 or NVFP4, more
   kernel fusion). It is a much larger undertaking for a conv heavy model like GMFSS and
   was not attempted.
