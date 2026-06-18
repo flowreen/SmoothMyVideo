@@ -12,6 +12,8 @@ npm-debug.log*
 
 # python engine
 engine/.venv/
+engine/runtime/
+engine/bin/
 engine/**/__pycache__/
 engine/GMFSS_Fortuna/vid_out/
 

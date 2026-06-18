@@ -16,7 +16,13 @@ import torch
 from torch.nn import functional as F
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GMFSS_Fortuna")
-FFMPEG, FFPROBE = "ffmpeg", "ffprobe"
+# Prefer ffmpeg/ffprobe bundled at engine/bin so a packaged build needs no system
+# ffmpeg on PATH; fall back to the bare PATH names for dev.
+_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+def _tool(name):
+    exe = os.path.join(_BIN, name + ".exe")
+    return exe if os.path.isfile(exe) else name
+FFMPEG, FFPROBE = _tool("ffmpeg"), _tool("ffprobe")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 ap = argparse.ArgumentParser()

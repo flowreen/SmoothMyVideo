@@ -5,14 +5,19 @@ import * as fs from 'fs';
 
 const ROOT = path.join(__dirname, '..');
 // When packaged, the engine ships as an unpacked extraResource (the Python files and
-// venv must be real files on disk, not inside app.asar). The renderer and icon stay
+// runtime must be real files on disk, not inside app.asar). The renderer and icon stay
 // under ROOT (Electron reads those from the asar fine).
 const ENGINE = app.isPackaged ? path.join(process.resourcesPath, 'engine') : path.join(ROOT, 'engine');
-const VENV_PY = path.join(ENGINE, '.venv', 'Scripts', 'python.exe');
+// Bundled, relocatable python-build-standalone runtime (full stdlib + torch/cupy stack).
+// Its python.exe sits at the runtime root, not under a Scripts/ subdir like a venv.
+const RUNTIME_PY = path.join(ENGINE, 'runtime', 'python.exe');
 const ENGINE_SCRIPT = path.join(ENGINE, 'gmfss_interp.py');
+// Prefer ffprobe bundled at engine/bin (portable build); fall back to PATH for dev.
+const FFPROBE = fs.existsSync(path.join(ENGINE, 'bin', 'ffprobe.exe'))
+  ? path.join(ENGINE, 'bin', 'ffprobe.exe') : 'ffprobe';
 
 function pyExe(): string {
-  return fs.existsSync(VENV_PY) ? VENV_PY : 'python';
+  return fs.existsSync(RUNTIME_PY) ? RUNTIME_PY : 'python';
 }
 
 let win: BrowserWindow | null = null;
@@ -53,7 +58,7 @@ ipcMain.handle('pick-output', async (_e, defaultPath?: string) => {
 
 ipcMain.handle('probe', async (_e, file: string) => {
   return new Promise((resolve) => {
-    execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0',
+    execFile(FFPROBE, ['-v', 'error', '-select_streams', 'v:0',
       '-show_entries', 'stream=width,height,r_frame_rate,codec_name,nb_frames',
       '-show_entries', 'format=duration', '-of', 'json', file],
       (err, stdout) => {
