@@ -137,7 +137,7 @@ $('go').onclick = () => {
   haveFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
   totalFrames = Math.max(haveFrames+1, Math.round(haveFrames*outRatio()));
   cancelled = false;
-  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
+  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
   $('status').textContent = 'Smoothing on the GPU...';
   $('fill').style.width = (100*haveFrames/totalFrames)+'%';
   $('frames').textContent = 'Frames: '+haveFrames+' / '+totalFrames;
@@ -166,7 +166,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
   } else if(!/Optical Flow Grid Size/.test(t)) { log(t); }
 });
 ipcRenderer.on('engine-done', (_e, code) => {
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('cancel').disabled=true;
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n'); }
   else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalFrames+' / '+totalFrames+'  (100%)';
     $('status').textContent='Done!'; $('open').disabled=false; log('>> Saved: '+lastOut+'\n'); }
