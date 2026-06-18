@@ -21,13 +21,13 @@ Working end to end and verified by the user on real clips. Nothing is half finis
   are remembered between sessions.
 - Progress: a bar that starts at the source frame count and fills to the post process
   total, plus a live frame counter and an ETA.
-- Output: written beside the source as `<name>_<fps>fps.mp4`, encoded with
-  `hevc_nvenc`, original audio copied through.
+- Output: written beside the source as `<name>_<fps>fps.mp4` (or a custom path chosen
+  with **Change...**), encoded with `hevc_nvenc`, original audio copied through.
 - Engine: GMFSS at fp16 with a cupy softsplat kernel, about 2.2x faster than the
   original fp32 path. See Performance below.
 - Launch: Desktop and Start menu shortcuts, a no console `SmoothMyVideo.vbs`, and a
   custom icon.
-- A sample 24fps clip ships in `samples/gtest.mp4` for quick testing.
+- A sample 24fps clip ships in `samples/test.mp4` for quick testing.
 
 ## Run it
 - Double click the **SmoothMyVideo** shortcut (Desktop / Start menu), or `SmoothMyVideo.vbs`.
@@ -36,12 +36,13 @@ Working end to end and verified by the user on real clips. Nothing is half finis
   result is written next to the source as `<name>_<fps>fps.mp4`.
 
 ## Architecture
-- `src/main.ts` - Electron main: window, file dialog, ffprobe (`-of json`), spawns the
-  engine, streams progress, tracks the running child so **Cancel** can `taskkill /T /F` it.
-- `renderer/index.html` - the UI (select or drag in a video, multiplier, progress bar
-  with frame counter and ETA, Cancel, Open folder, log). Uses `require('electron')`;
-  a dropped file is resolved to a path with `webUtils.getPathForFile`, and the last
-  folder and multiplier are saved in `localStorage`.
+- `src/main.ts` - Electron main: window, open and save dialogs, ffprobe (`-of json`),
+  spawns the engine, streams progress, tracks the running child so **Cancel** can
+  `taskkill /T /F` it.
+- `renderer/index.html` - the UI (select or drag in a video, multiplier, output path
+  with **Change...**, progress bar with frame counter and ETA, Cancel, Open folder, log).
+  Uses `require('electron')`; a dropped file is resolved to a path with
+  `webUtils.getPathForFile`, and the last folder and multiplier are saved in `localStorage`.
 - `engine/gmfss_interp.py` - GMFSS pipe engine: ffmpeg decode (rgb24) into GMFSS into
   ffmpeg encode (`hevc_nvenc`, audio copied). Always fp16. Prints `PROGRESS k/total` to
   stderr. `_add_cuda_dll_dirs()` puts the nvidia wheel bin dirs on the Windows DLL search
@@ -102,7 +103,6 @@ Small UX:
 - Arbitrary target fps. The original intent allowed any output fps (editable, up to 1000).
   The UI currently exposes only fixed multipliers (2x, 4x, 8x, 16x). Add a free numeric
   fps field. The engine takes a multiplier today and could take a target fps instead.
-- Let the user pick a custom output location instead of always writing beside the source.
 
 Larger:
 - Package into a distributable installer with electron-builder. The catch is size: it has

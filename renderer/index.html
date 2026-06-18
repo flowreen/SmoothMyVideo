@@ -24,6 +24,7 @@
          height:150px; overflow:auto; white-space:pre-wrap; padding:8px; border-radius:6px; }
   .hint { color:var(--sub); font-size:11px; }
   body.drag { outline:3px dashed var(--green); outline-offset:-10px; }
+  button.mini { padding:3px 9px; font-size:12px; background:#3a3a3a; color:var(--text); }
 </style>
 </head>
 <body>
@@ -53,7 +54,9 @@
       </select>
       <span class="hint" id="outfps"></span>
     </div>
-    <div class="row"><span class="k">Saves to</span><span class="v hint" id="out"></span></div>
+    <div class="row"><span class="k">Saves to</span>
+      <button id="changeout" class="mini" disabled>Change...</button>
+      <span class="v hint" id="out"></span></div>
   </div>
 
   <div class="row">
@@ -71,7 +74,7 @@
 <script>
 const { ipcRenderer, shell, webUtils } = require('electron');
 const path = require('path');
-let info = null, input = null, lastOut = null, haveFrames = 1, totalFrames = 1, procStart = 0, cancelled = false;
+let info = null, input = null, lastOut = null, customOut = null, haveFrames = 1, totalFrames = 1, procStart = 0, cancelled = false;
 function fmtTime(s){ s=Math.max(0,Math.round(s)); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
 
 const $ = (id) => document.getElementById(id);
@@ -81,11 +84,11 @@ function targetFps(){ return Math.round(srcFps()*(+$('multi').value)); }
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
   return b + '_' + targetFps() + 'fps.mp4'; }
 function refresh(){ if(!input) return; $('outfps').textContent = '≈ '+targetFps()+' fps';
-  lastOut = outName(); $('out').textContent = lastOut; }
+  lastOut = customOut || outName(); $('out').textContent = lastOut; }
 
 async function loadVideo(f){
   if(!f) return;
-  input = f; $('path').textContent = f;
+  input = f; customOut = null; $('path').textContent = f;
   try { localStorage.setItem('dir', path.dirname(f)); } catch {}
   const p = await ipcRenderer.invoke('probe', f);
   if(p.error){ alert('Could not read video: '+p.error); return; }
@@ -97,7 +100,7 @@ async function loadVideo(f){
   $('fps').textContent = srcFps().toFixed(3);
   const d=info.dur|0; $('dur').textContent = (d/3600|0)+':'+String((d%3600/60|0)).padStart(2,'0')+':'+String(d%60).padStart(2,'0');
   $('codec').textContent = s.codec_name || '?';
-  $('go').disabled = false; $('open').disabled = true;
+  $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true;
   $('status').textContent = 'Ready. Pick a multiplier and click Smooth It!';
   refresh();
 }
@@ -124,7 +127,7 @@ $('go').onclick = () => {
   haveFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
   totalFrames = Math.max(haveFrames+1, Math.round(haveFrames*(+$('multi').value)));
   cancelled = false;
-  $('go').disabled = true; $('pick').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
+  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
   $('status').textContent = 'Smoothing on the GPU...';
   $('fill').style.width = (100*haveFrames/totalFrames)+'%';
   $('frames').textContent = 'Frames: '+haveFrames+' / '+totalFrames;
@@ -132,6 +135,10 @@ $('go').onclick = () => {
   ipcRenderer.send('run', { input, multi:+$('multi').value, output: lastOut });
 };
 $('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
+$('changeout').onclick = async () => {
+  const chosen = await ipcRenderer.invoke('pick-output', customOut || outName());
+  if(chosen){ customOut = chosen; refresh(); }
+};
 $('cancel').onclick = () => { cancelled = true; $('cancel').disabled = true; $('status').textContent = 'Cancelling...'; ipcRenderer.send('cancel'); };
 
 ipcRenderer.on('engine-out', (_e, t) => {
@@ -147,7 +154,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
   } else if(!/Optical Flow Grid Size/.test(t)) { log(t); }
 });
 ipcRenderer.on('engine-done', (_e, code) => {
-  $('go').disabled=false; $('pick').disabled=false; $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('cancel').disabled=true;
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n'); }
   else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalFrames+' / '+totalFrames+'  (100%)';
     $('status').textContent='Done!'; $('open').disabled=false; log('>> Saved: '+lastOut+'\n'); }

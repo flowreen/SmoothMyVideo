@@ -40,6 +40,14 @@ ipcMain.handle('pick-video', async (_e, defaultPath?: string) => {
   return r.canceled ? null : r.filePaths[0];
 });
 
+ipcMain.handle('pick-output', async (_e, defaultPath?: string) => {
+  const r = await dialog.showSaveDialog(win!, {
+    defaultPath,
+    filters: [{ name: 'MP4 video', extensions: ['mp4'] }],
+  });
+  return r.canceled ? null : (r.filePath || null);
+});
+
 ipcMain.handle('probe', async (_e, file: string) => {
   return new Promise((resolve) => {
     execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0',
