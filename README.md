@@ -33,8 +33,9 @@ Working end to end and verified by the user on real clips. Nothing is half finis
 ## Run it
 - Double click the **SmoothMyVideo** shortcut (Desktop / Start menu), or `SmoothMyVideo.vbs`.
 - Or from a terminal: `npm start` (builds, then launches).
-- Pick a video, choose a multiplier (2x / 4x / 8x / 16x), click **Smooth It!**. The
-  result is written next to the source as `<name>_<fps>fps.mp4`.
+- Select a video (or drag one onto the window), choose a multiplier (2x / 4x / 8x / 16x)
+  or type a target fps, then click **Smooth It!**. The result is written next to the
+  source as `<name>_<fps>fps.mp4`, or wherever you point it with **Change...**.
 
 ## Architecture
 - `src/main.ts` - Electron main: window, open and save dialogs, ffprobe (`-of json`),
