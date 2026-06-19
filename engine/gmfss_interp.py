@@ -1,14 +1,24 @@
 """
 GMFSS pipe interpolation engine for SmoothMyVideo.
-ffmpeg decode (rgb24) -> GMFSS anime union model -> ffmpeg encode (hevc_nvenc, audio copied).
+ffmpeg decode -> GMFSS anime union model -> ffmpeg encode (audio copied).
 Streams frames so there is no PNG folder. Prints "PROGRESS k/total" to stderr for the GUI.
 
-Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET]   (always runs fp16)
+Performance first, no quality knobs: the pipeline always runs fp16, always targets visually
+lossless, and always uses the fastest backend the machine supports.
+- Backend: TensorRT engines by default (built+cached per resolution on first run), with
+  automatic eager fallback when TensorRT is unavailable. Pass --no-trt to force eager.
+- Encoder: the matching NVENC for the source codec (h264/hevc/av1) when the device has a
+  usable NVENC session, otherwise an automatic CPU fallback to SVT-AV1 (the strongest
+  visually lossless software encoder in the bundled LGPL ffmpeg; x264/x265 are not built in).
+  Source bit depth (8/10 bit), chroma and colour signalling are preserved either way.
+
+Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
 """
 import os
 import sys
 import math
+import json
 import argparse
 import subprocess
 import numpy as np
@@ -32,25 +42,59 @@ ap.add_argument("output", nargs="?", default=None)
 ap.add_argument("--scale", type=float, default=1.0)
 ap.add_argument("--fps", type=float, default=None,
                 help="target output fps; overrides <multi> via timeline resampling")
-ap.add_argument("--trt", action="store_true",
-                help="use TensorRT engines (built and cached per resolution on first run)")
+ap.add_argument("--no-trt", action="store_true",
+                help="disable the default TensorRT backend and run the eager pipeline")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
 
 def probe(path):
+    # JSON (not csv) so the extra color/format fields stay robust when any of them is
+    # absent or "unknown" rather than shifting column positions.
     out = subprocess.check_output(
-        [FFPROBE, "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
-         "-of", "csv=p=0", path], text=True, creationflags=NO_WINDOW).strip().split(",")
-    w, h, rate = int(out[0]), int(out[1]), out[2]
-    num, den = (rate.split("/") + ["1"])[:2]
-    nb = int(out[3]) if len(out) > 3 and out[3].isdigit() else 0
-    return w, h, int(num), int(den), nb
+        [FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=width,height,r_frame_rate,nb_frames,codec_name,pix_fmt,"
+         "bits_per_raw_sample,color_space,color_transfer,color_primaries,color_range",
+         "-of", "json", path], text=True, creationflags=NO_WINDOW)
+    st = (json.loads(out).get("streams") or [{}])[0]
+    w, h = int(st["width"]), int(st["height"])
+    num, den = (str(st.get("r_frame_rate") or "0/1").split("/") + ["1"])[:2]
+    nb = int(st["nb_frames"]) if str(st.get("nb_frames") or "").isdigit() else 0
+    return w, h, int(num), int(den or "1"), nb, st
 
-W, H, num, den, NB = probe(inp)
+W, H, num, den, NB, ST = probe(inp)
+
+# --- source characteristics, for matched "passthrough quality" encoding ---
+def _tag(key):
+    v = ST.get(key)
+    return v if v and v not in ("unknown", "reserved", "N/A") else None
+
+SRC_CODEC = (ST.get("codec_name") or "").lower()
+SRC_PIX = ST.get("pix_fmt") or "yuv420p"
+_bpr = ST.get("bits_per_raw_sample")
+if _bpr and str(_bpr).isdigit():
+    SRC_BITS = int(_bpr)
+elif any(s in SRC_PIX for s in ("p10", "10le", "10be")):
+    SRC_BITS = 10
+elif any(s in SRC_PIX for s in ("p12", "12le", "12be")):
+    SRC_BITS = 12
+else:
+    SRC_BITS = 8
+TEN_BIT = SRC_BITS >= 10
+CHROMA444 = "444" in SRC_PIX
 FPS_MODE = args.fps is not None and args.fps > 0
 src_fps = num / den
+if not NB:
+    # MKV and other streaming containers routinely report nb_frames as N/A. Without a
+    # real count, total_pairs would be 0 and the GUI's PROGRESS bar divides by ~zero
+    # (runs off to millions of %). Estimate the frame count from the container duration.
+    try:
+        dur = float(subprocess.check_output(
+            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", inp], text=True, creationflags=NO_WINDOW).strip())
+        NB = max(0, int(round(dur * src_fps)))
+    except (subprocess.CalledProcessError, ValueError):
+        NB = 0
 if FPS_MODE:
     ratio = args.fps / src_fps                 # output frames per source frame
     rate_str = f"{args.fps:g}"
@@ -60,7 +104,17 @@ else:
     out_label = int(round(src_fps * args.multi))
 out_path = os.path.abspath(args.output) if args.output else \
     os.path.splitext(inp)[0] + f"_{out_label}fps.mp4"
-fsize = W * H * 3
+
+# Decode/encode bit depth follows the source. 8 bit clips keep the original fast rgb24
+# path byte for byte; 10 bit and up are carried as 16 bit rgb (rgb48le) so the model
+# (fp16, which holds 10 bit precision) never truncates them to 8 bit. GMFSS_Fortuna,
+# GMFSS_union and enhancr all emit 8 bit from this point; carrying 10 bit through is the
+# one step past them, and it is free because the pipe was already fp16.
+if TEN_BIT:
+    DEC_FMT, NP_DT, MAXV, BPP = "rgb48le", np.uint16, 65535.0, 6
+else:
+    DEC_FMT, NP_DT, MAXV, BPP = "rgb24", np.uint8, 255.0, 3
+fsize = W * H * BPP
 total_pairs = max(1, NB - 1) if NB else 0
 
 sys.path.insert(0, REPO)
@@ -94,12 +148,18 @@ model.eval()
 model.device()
 sys.stderr.write("GMFSS union model loaded (fp16)\n"); sys.stderr.flush()
 
-if args.trt:
-    # swap sub nets for TensorRT engines (built+cached per resolution on first run,
-    # eager fallback on any failure). trt_runtime lives next to this script.
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import trt_runtime
-    trt_runtime.trtify(model)
+if not args.no_trt:
+    # Default backend: swap sub nets for TensorRT engines (built+cached per resolution on
+    # first run, per-subnet eager fallback on any build/run failure). trt_runtime imports
+    # tensorrt at module load, so an environment without a working TensorRT is caught here
+    # and the eager pipeline is used instead. trt_runtime lives next to this script.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import trt_runtime
+        trt_runtime.trtify(model)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[trt] unavailable, using eager pipeline: {repr(e)[:200]}\n")
+        sys.stderr.flush()
 
 scale = args.scale
 tmp = max(64, int(64 / scale))
@@ -110,13 +170,14 @@ def amp():
     return torch.autocast("cuda", dtype=torch.float16)
 
 def to_tensor(buf):
-    a = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
-    t = torch.from_numpy(a.transpose(2, 0, 1).copy()).to(device).unsqueeze(0).float() / 255.
+    a = np.frombuffer(buf, NP_DT).reshape(H, W, 3)
+    t = torch.from_numpy(a.transpose(2, 0, 1).copy()).to(device).unsqueeze(0).float() / MAXV
     return F.interpolate(t, (ph, pw), mode="bilinear", align_corners=False)
 
 def to_bytes(t):
     t = F.interpolate(t.float(), (H, W), mode="bilinear", align_corners=False)
-    return (t[0] * 255.).clamp(0, 255).byte().cpu().numpy().transpose(1, 2, 0).tobytes()
+    a = (t[0] * MAXV).clamp(0, MAXV).cpu().numpy().transpose(1, 2, 0)
+    return a.astype(NP_DT).tobytes()
 
 def make_inference(I0, I1, reuse, n):
     if model.version >= 3.9:
@@ -138,14 +199,91 @@ def read_exact(stream, nbytes):
     return bytes(buf)
 
 dec = subprocess.Popen(
-    [FFMPEG, "-v", "error", "-i", inp, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+    [FFMPEG, "-v", "error", "-i", inp, "-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
     stdout=subprocess.PIPE, creationflags=NO_WINDOW)
-enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+
+# Match the encoder family to the source codec so output stays in kind (h264 -> h264,
+# hevc -> hevc, av1 -> av1); anything else defaults to hevc. NVENC H.264 is 8 bit only,
+# so a 10 bit source that came in as h264 is promoted to HEVC main10.
+_CODEC_ENC = {"h264": "h264_nvenc", "avc": "h264_nvenc", "hevc": "hevc_nvenc",
+              "h265": "hevc_nvenc", "av1": "av1_nvenc"}
+venc = _CODEC_ENC.get(SRC_CODEC, "hevc_nvenc")
+if TEN_BIT and venc == "h264_nvenc":
+    venc = "hevc_nvenc"
+
+def _enc_works(name):
+    # Real availability check: actually open the encoder on a tiny frame. NVENC fails fast
+    # here when the device has no usable encode session (no NVIDIA GPU, a GPU too old for
+    # this codec, or no driver), which is exactly the case the software fallback covers.
+    try:
+        return subprocess.run(
+            [FFMPEG, "-hide_banner", "-v", "error", "-f", "lavfi",
+             "-i", "color=c=black:s=256x256:d=1:r=24", "-frames:v", "1",
+             "-c:v", name, "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=NO_WINDOW).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+USE_NVENC = _enc_works(venc)
+if not USE_NVENC:
+    # No usable NVENC on this device: fall back to the best visually lossless software
+    # encoder in the bundled (LGPL) ffmpeg. SVT-AV1 has true CRF rate control and clean
+    # 8/10 bit support; libx264/libx265 are GPL and not compiled into this build.
+    sys.stderr.write(f"NVENC ({venc}) unavailable on this device; "
+                     f"falling back to CPU libsvtav1\n"); sys.stderr.flush()
+    venc = "libsvtav1"
+
+# Output pixel format: preserve 10 bit and 4:4:4 where the encoder allows it, otherwise the
+# standard 8 bit 4:2:0. NVENC takes 10 bit as p010le; SVT-AV1 wants planar yuv420p10le and
+# has no 4:4:4 path, so the fallback stays 4:2:0.
+if TEN_BIT:
+    out_pix = "p010le" if USE_NVENC else "yuv420p10le"
+elif CHROMA444 and venc in ("h264_nvenc", "hevc_nvenc"):
+    out_pix = "yuv444p"
+else:
+    out_pix = "yuv420p"
+
+# Always visually lossless. NVENC: constant quality VBR around the point the linked H.264
+# guide calls visually lossless (CQ 17, CQ 20 for AV1), AQ on, a small chroma QP boost.
+# SVT-AV1 CPU fallback: CRF 20 (its visually lossless range) at preset 8, fast enough not
+# to starve the GPU frame pipe.
+if USE_NVENC:
+    cq = "20" if venc == "av1_nvenc" else "17"
+    qargs = ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
+             "-spatial_aq", "1", "-temporal_aq", "1"]
+    if venc in ("h264_nvenc", "hevc_nvenc"):
+        qargs += ["-qp_cb_offset", "-2", "-qp_cr_offset", "-2"]
+else:
+    qargs = ["-crf", "20", "-preset", "8"]
+
+prof = ["-profile:v", "main10"] if (TEN_BIT and venc == "hevc_nvenc") else []
+
+# Carry the source colour signalling through. NVENC ignores the bare -color_* output flags
+# for transfer/primaries (verified: only matrix and range stick), which would strip HDR
+# signalling, so the values are stamped onto the frames with setparams before the pixel
+# conversion, and the -color_* flags are kept too so the mp4 'colr' atom is written. This
+# also makes the RGB -> YUV conversion use the source matrix instead of swscale's guess.
+# The values come straight from ffprobe of this same ffmpeg, so they are valid filter input.
+sp, color = [], []
+for sp_opt, flag, key in (("range", "-color_range", "color_range"),
+                          ("colorspace", "-colorspace", "color_space"),
+                          ("color_trc", "-color_trc", "color_transfer"),
+                          ("color_primaries", "-color_primaries", "color_primaries")):
+    v = _tag(key)
+    if v:
+        sp.append(f"{sp_opt}={v}")
+        color += [flag, v]
+vf = ",".join((["setparams=" + ":".join(sp)] if sp else []) + [f"format={out_pix}"])
+
+enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", DEC_FMT,
            "-s", f"{W}x{H}", "-r", rate_str, "-i", "-", "-i", inp,
            "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy",
-           "-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "22",
-           "-b:v", "0", "-pix_fmt", "yuv420p", out_path]
+           "-c:v", venc, "-vf", vf]
+enc_cmd += qargs + prof + color + [out_path]
 enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
+sys.stderr.write(f"encode: {venc} visually-lossless -> {out_pix}  "
+                 f"(source {SRC_CODEC or '?'} {SRC_BITS}bit {SRC_PIX})\n"); sys.stderr.flush()
 
 n = args.multi - 1
 prev = read_exact(dec.stdout, fsize)

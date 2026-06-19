@@ -29,7 +29,7 @@
 </head>
 <body>
   <h1>SmoothMyVideo</h1>
-  <div class="sub">GMFSS frame interpolation on your GeForce. Offline.</div>
+  <div class="sub">GMFSS frame interpolation on your GeForce. Offline · visually lossless · fastest backend chosen automatically.</div>
 
   <div class="row">
     <button id="pick">Select video...</button>
@@ -55,12 +55,6 @@
       <span class="hint">or fps</span>
       <input id="fpsin" type="number" min="1" max="1000" step="0.001" style="width:80px">
     </div>
-    <div class="row"><span class="k">Engine</span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer">
-        <input type="checkbox" id="trt" style="width:auto;padding:0">
-        TensorRT (faster; builds once per resolution, a few minutes the first time)
-      </label>
-    </div>
     <div class="row"><span class="k">Saves to</span>
       <button id="changeout" class="mini" disabled>Change...</button>
       <span class="v hint" id="out"></span></div>
@@ -81,8 +75,9 @@
 <script>
 const { ipcRenderer, shell, webUtils } = require('electron');
 const path = require('path');
-let info = null, input = null, lastOut = null, customOut = null, useFps = false, haveFrames = 1, totalFrames = 1, procStart = 0, cancelled = false;
-function fmtTime(s){ s=Math.max(0,Math.round(s)); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
+let info = null, input = null, lastOut = null, customOut = null, useFps = false, fpp = 1, totalGen = 1, prevK = 0, prevT = 0, rates = [], procStart = 0, cancelled = false;
+function fmtEta(s){ s=Math.max(0,Math.round(s)); const m=Math.floor(s/60), ss=s%60;
+  return m>0 ? m+'m '+String(ss).padStart(2,'0')+'s' : ss+'s'; }
 
 const $ = (id) => document.getElementById(id);
 function log(t){ $('log').textContent += t; $('log').scrollTop = $('log').scrollHeight; }
@@ -125,10 +120,6 @@ $('fpsin').oninput = () => { useFps = true; if(parseFloat($('fpsin').value) > 10
 const savedMulti = localStorage.getItem('multi');
 if(savedMulti && [...$('multi').options].some(o => o.value === savedMulti)) $('multi').value = savedMulti;
 
-// Remember the TensorRT toggle between sessions.
-$('trt').onchange = () => localStorage.setItem('trt', $('trt').checked ? '1' : '0');
-if(localStorage.getItem('trt') === '1') $('trt').checked = true;
-
 // Drag a video file onto the window to load it (ignored while a job is running).
 document.addEventListener('dragover', (e) => { e.preventDefault(); if($('cancel').disabled) document.body.classList.add('drag'); });
 document.addEventListener('dragleave', (e) => { if(e.relatedTarget === null) document.body.classList.remove('drag'); });
@@ -143,16 +134,17 @@ $('go').onclick = () => {
   if(!input) return;
   const t = targetFps();
   if(!fpsValid(t)){ alert('Enter an output fps between 1 and 1000.'); return; }
-  procStart = 0;
-  haveFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
-  totalFrames = Math.max(haveFrames+1, Math.round(haveFrames*outRatio()));
+  procStart = 0; prevK = 0; prevT = 0; rates = [];
+  fpp = outRatio();                                    // output frames produced per source frame
+  const srcFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
+  totalGen = Math.max(1, Math.round(srcFrames*fpp));   // total frames the conversion will output
   cancelled = false;
   $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
-  $('status').textContent = 'Smoothing on the GPU...';
-  $('fill').style.width = (100*haveFrames/totalFrames)+'%';
-  $('frames').textContent = 'Frames: '+haveFrames+' / '+totalFrames;
+  $('status').textContent = 'Warming up the model...';
+  $('fill').style.width = '0%';
+  $('frames').textContent = 'Warming up (loading model, first frames)...';
   log('>> '+input+'  ->  '+Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')+'\n');
-  const payload = { input, multi:+$('multi').value, output: lastOut, trt: $('trt').checked };
+  const payload = { input, multi:+$('multi').value, output: lastOut };
   if(useFps) payload.fps = t;
   ipcRenderer.send('run', payload);
 };
@@ -165,14 +157,33 @@ $('cancel').onclick = () => { cancelled = true; $('cancel').disabled = true; $('
 
 ipcRenderer.on('engine-out', (_e, t) => {
   const m = /PROGRESS\s+(\d+)\/(\d+)/.exec(t);
-  if(m){ const done=+m[1], tot=+m[2]||1; const frac=done/tot;
-    if(!procStart){ procStart = Date.now(); $('status').textContent = 'Smoothing on the GPU...'; }
-    const val = haveFrames + frac*(totalFrames-haveFrames);
-    $('fill').style.width = (100*val/totalFrames)+'%';
-    let eta = '';
-    const el = (Date.now()-procStart)/1000;
-    if(frac > 0.02 && frac < 1) eta = '   ETA ' + fmtTime(el*(1-frac)/frac);
-    $('frames').textContent = 'Frames: '+Math.round(val)+' / '+totalFrames+'  ('+Math.round(100*val/totalFrames)+'%)' + eta;
+  if(m){ const done=+m[1], tot=+m[2]||1;
+    // Clamp to [0,1]: a missing/zero denominator (e.g. an MKV with no nb_frames) would
+    // otherwise make frac huge and send the bar past 100% (the runaway 9999999% bug).
+    const frac = Math.min(1, Math.max(0, done/tot));
+    const pct = 100*frac;                              // 0% at first generated frame -> 100% at last
+    $('fill').style.width = pct+'%';
+    const now = Date.now();
+    if(!procStart){
+      // First generated frame is in, so warmup (model load + first inference) is over.
+      // Anchor the speed/ETA clock here so neither is skewed by that one-time startup cost.
+      procStart = now; prevK = done; prevT = now;
+      $('status').textContent = 'Smoothing on the GPU...';
+      $('frames').textContent = 'Frames: '+Math.round(done*fpp)+' / '+totalGen+'  ('+Math.round(pct)+'%)   ·   measuring speed...';
+      return;
+    }
+    // Sample this interval's throughput (output frames/sec) into a short trailing window.
+    const dt = (now-prevT)/1000, dk = done-prevK;
+    if(dt > 0 && dk > 0){ rates.push(dk*fpp/dt); if(rates.length > 9) rates.shift(); }
+    prevK = done; prevT = now;
+    let speed = '   ·   measuring speed...';
+    if(rates.length >= 3){
+      const s = rates.slice().sort((a,b)=>a-b);
+      const fps = s[s.length>>1];                      // median rate: robust to jitter and any warmup tail
+      const etaSec = fps > 0 ? (tot-done)*fpp/fps : 0;
+      speed = '   ·   '+Math.round(fps)+' fps   ·   ETA '+fmtEta(etaSec);
+    }
+    $('frames').textContent = 'Frames: '+Math.round(done*fpp)+' / '+totalGen+'  ('+Math.round(pct)+'%)'+speed;
   } else {
     if(/\[trt\] building/.test(t)) $('status').textContent = 'Building TensorRT engines (one time for this resolution)...';
     if(!/Optical Flow Grid Size/.test(t)) log(t);
@@ -181,7 +192,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
 ipcRenderer.on('engine-done', (_e, code) => {
   $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('cancel').disabled=true;
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n'); }
-  else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalFrames+' / '+totalFrames+'  (100%)';
+  else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen+'  (100%)';
     $('status').textContent='Done!'; $('open').disabled=false; log('>> Saved: '+lastOut+'\n'); }
   else { $('status').textContent='Failed (exit '+code+'). See log.'; log('>> Failed (exit '+code+')\n'); }
 });

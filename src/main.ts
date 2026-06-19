@@ -25,7 +25,7 @@ let win: BrowserWindow | null = null;
 function createWindow() {
   win = new BrowserWindow({
     width: 780,
-    height: 760,
+    height: 700,
     title: 'SmoothMyVideo',
     backgroundColor: '#1b1b1b',
     icon: path.join(ROOT, 'icon.ico'),
@@ -70,10 +70,9 @@ ipcMain.handle('probe', async (_e, file: string) => {
 
 let current: ChildProcess | null = null;
 
-ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; trt?: boolean }) => {
+ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
   if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
-  if (opts.trt) args.push('--trt');
   // PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from crashing the engine
   // during first-run TRT builds; SMV_TRT_CACHE is a guaranteed writable cache location.
   const env = { ...process.env, PYTHONUTF8: '1',
