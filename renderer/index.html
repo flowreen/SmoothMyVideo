@@ -55,6 +55,12 @@
       <span class="hint">or fps</span>
       <input id="fpsin" type="number" min="1" max="1000" step="0.001" style="width:80px">
     </div>
+    <div class="row"><span class="k">Engine</span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+        <input type="checkbox" id="trt" style="width:auto;padding:0">
+        TensorRT (faster; builds once per resolution, a few minutes the first time)
+      </label>
+    </div>
     <div class="row"><span class="k">Saves to</span>
       <button id="changeout" class="mini" disabled>Change...</button>
       <span class="v hint" id="out"></span></div>
@@ -119,6 +125,10 @@ $('fpsin').oninput = () => { useFps = true; if(parseFloat($('fpsin').value) > 10
 const savedMulti = localStorage.getItem('multi');
 if(savedMulti && [...$('multi').options].some(o => o.value === savedMulti)) $('multi').value = savedMulti;
 
+// Remember the TensorRT toggle between sessions.
+$('trt').onchange = () => localStorage.setItem('trt', $('trt').checked ? '1' : '0');
+if(localStorage.getItem('trt') === '1') $('trt').checked = true;
+
 // Drag a video file onto the window to load it (ignored while a job is running).
 document.addEventListener('dragover', (e) => { e.preventDefault(); if($('cancel').disabled) document.body.classList.add('drag'); });
 document.addEventListener('dragleave', (e) => { if(e.relatedTarget === null) document.body.classList.remove('drag'); });
@@ -142,7 +152,7 @@ $('go').onclick = () => {
   $('fill').style.width = (100*haveFrames/totalFrames)+'%';
   $('frames').textContent = 'Frames: '+haveFrames+' / '+totalFrames;
   log('>> '+input+'  ->  '+Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')+'\n');
-  const payload = { input, multi:+$('multi').value, output: lastOut };
+  const payload = { input, multi:+$('multi').value, output: lastOut, trt: $('trt').checked };
   if(useFps) payload.fps = t;
   ipcRenderer.send('run', payload);
 };
@@ -156,14 +166,17 @@ $('cancel').onclick = () => { cancelled = true; $('cancel').disabled = true; $('
 ipcRenderer.on('engine-out', (_e, t) => {
   const m = /PROGRESS\s+(\d+)\/(\d+)/.exec(t);
   if(m){ const done=+m[1], tot=+m[2]||1; const frac=done/tot;
-    if(!procStart) procStart = Date.now();
+    if(!procStart){ procStart = Date.now(); $('status').textContent = 'Smoothing on the GPU...'; }
     const val = haveFrames + frac*(totalFrames-haveFrames);
     $('fill').style.width = (100*val/totalFrames)+'%';
     let eta = '';
     const el = (Date.now()-procStart)/1000;
     if(frac > 0.02 && frac < 1) eta = '   ETA ' + fmtTime(el*(1-frac)/frac);
     $('frames').textContent = 'Frames: '+Math.round(val)+' / '+totalFrames+'  ('+Math.round(100*val/totalFrames)+'%)' + eta;
-  } else if(!/Optical Flow Grid Size/.test(t)) { log(t); }
+  } else {
+    if(/\[trt\] building/.test(t)) $('status').textContent = 'Building TensorRT engines (one time for this resolution)...';
+    if(!/Optical Flow Grid Size/.test(t)) log(t);
+  }
 });
 ipcRenderer.on('engine-done', (_e, code) => {
   $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('cancel').disabled=true;

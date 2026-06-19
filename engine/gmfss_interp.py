@@ -32,6 +32,8 @@ ap.add_argument("output", nargs="?", default=None)
 ap.add_argument("--scale", type=float, default=1.0)
 ap.add_argument("--fps", type=float, default=None,
                 help="target output fps; overrides <multi> via timeline resampling")
+ap.add_argument("--trt", action="store_true",
+                help="use TensorRT engines (built and cached per resolution on first run)")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
@@ -92,6 +94,13 @@ model.eval()
 model.device()
 sys.stderr.write("GMFSS union model loaded (fp16)\n"); sys.stderr.flush()
 
+if args.trt:
+    # swap sub nets for TensorRT engines (built+cached per resolution on first run,
+    # eager fallback on any failure). trt_runtime lives next to this script.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import trt_runtime
+    trt_runtime.trtify(model)
+
 scale = args.scale
 tmp = max(64, int(64 / scale))
 ph = ((H - 1) // tmp + 1) * tmp
@@ -134,7 +143,7 @@ dec = subprocess.Popen(
 enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
            "-s", f"{W}x{H}", "-r", rate_str, "-i", "-", "-i", inp,
            "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy",
-           "-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18",
+           "-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "22",
            "-b:v", "0", "-pix_fmt", "yuv420p", out_path]
 enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
 

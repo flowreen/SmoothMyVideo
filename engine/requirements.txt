@@ -11,3 +11,11 @@ tqdm
 cupy-cuda12x
 nvidia-cuda-nvrtc-cu12
 nvidia-cuda-runtime-cu12
+
+# Optional TensorRT backend (--trt): native TRT engines for the 5 GMFSS sub nets,
+# about 2.2x over the cupy fp16 path. `tensorrt` pulls ~2GB of cu13 libraries that
+# coexist fine with torch's cu128. onnx + onnxscript drive the dynamo ONNX exporter
+# used to build the engines.
+tensorrt
+onnx
+onnxscript

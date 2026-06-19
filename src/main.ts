@@ -70,10 +70,15 @@ ipcMain.handle('probe', async (_e, file: string) => {
 
 let current: ChildProcess | null = null;
 
-ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number }) => {
+ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; trt?: boolean }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
   if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
-  const proc = spawn(pyExe(), args, { cwd: ENGINE });
+  if (opts.trt) args.push('--trt');
+  // PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from crashing the engine
+  // during first-run TRT builds; SMV_TRT_CACHE is a guaranteed writable cache location.
+  const env = { ...process.env, PYTHONUTF8: '1',
+    SMV_TRT_CACHE: path.join(app.getPath('userData'), 'trt_cache') };
+  const proc = spawn(pyExe(), args, { cwd: ENGINE, env });
   current = proc;
   const onData = (buf: Buffer) => e.sender.send('engine-out', buf.toString());
   proc.stdout.on('data', onData);

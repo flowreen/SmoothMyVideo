@@ -11,7 +11,7 @@ RIFE refiner, plus MetricNet, FeatureNet, FusionNet and softsplat warping. It pr
 clean interpolated frames where the older NVIDIA optical flow path (FRUC) tore at high
 multipliers.
 
-## Status (2026-06-18)
+## Status (2026-06-19)
 
 Working end to end and verified on real clips. The packaged build is now fully self
 contained: a recipient extracts the zip and runs `SmoothMyVideo.exe` with no Python, no
@@ -26,7 +26,8 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
 - Output: written beside the source as `<name>_<fps>fps.mp4` (or a custom path chosen
   with **Change...**), encoded with `hevc_nvenc`, original audio copied through.
 - Engine: GMFSS at fp16 with a cupy softsplat kernel, about 2.2x faster than the
-  original fp32 path. See Performance below.
+  original fp32 path. An optional TensorRT backend (the **TensorRT** checkbox, or
+  `--trt`) adds about another 2.2x on top. See Performance below.
 - Bundled: a relocatable Python 3.14 runtime (torch cu128 + cupy) at `engine/runtime`,
   and a static ffmpeg with `hevc_nvenc` at `engine/bin`. Both ship inside the zip; the
   app uses neither system Python nor system ffmpeg.
@@ -46,9 +47,12 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   spawns the engine, streams progress, tracks the running child so **Cancel** can
   `taskkill /T /F` it. Resolves the interpreter as `engine/runtime/python.exe`
   (`RUNTIME_PY`, falls back to `python` on PATH) and ffprobe as `engine/bin/ffprobe.exe`
-  (`FFPROBE`, falls back to `ffprobe` on PATH).
+  (`FFPROBE`, falls back to `ffprobe` on PATH). When the TensorRT toggle is on it adds
+  `--trt` and sets `PYTHONUTF8` plus a writable `SMV_TRT_CACHE` (under userData) for the
+  engine cache.
 - `renderer/index.html` - the UI (select or drag in a video, multiplier or fps, output
-  path with **Change...**, progress bar with frame counter and ETA, Cancel, Open folder, log).
+  path with **Change...**, a **TensorRT** toggle, progress bar with frame counter and ETA,
+  Cancel, Open folder, log).
   Uses `require('electron')`; a dropped file is resolved to a path with
   `webUtils.getPathForFile`, and the last folder and multiplier are saved in `localStorage`.
 - `engine/gmfss_interp.py` - GMFSS pipe engine: ffmpeg decode (rgb24) into GMFSS into
@@ -57,6 +61,10 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   stderr. Resolves `ffmpeg`/`ffprobe` from `engine/bin` first and falls back to PATH
   (`_tool()`). `_add_cuda_dll_dirs()` puts the nvidia wheel bin dirs on the Windows DLL
   search before the model imports so cupy can JIT its kernel.
+- `engine/trt_runtime.py` - optional TensorRT backend. `trtify(model)` swaps the five GMFSS
+  sub nets for engines exported under autocast and built strongly typed (fp16); softsplat
+  and the interpolate glue stay in eager. Engines are cached per `(net, shapes, gpu, trt
+  version)` under `SMV_TRT_CACHE`, built on first use, with eager fallback on any failure.
 - `engine/runtime/` - bundled relocatable Python (python-build-standalone CPython 3.14)
   with the full GPU stack installed (torch cu128, cupy, nvidia wheels). Gitignored, see Setup.
 - `engine/bin/` - bundled static `ffmpeg.exe` + `ffprobe.exe` (built with `hevc_nvenc`)
@@ -92,7 +100,9 @@ engine\runtime\python.exe -m pip install -r engine\requirements.txt
 `requirements.txt` includes `cupy-cuda12x` plus the `nvidia-cuda-nvrtc-cu12` and
 `nvidia-cuda-runtime-cu12` wheels. cupy needs those to JIT its softsplat kernel; the
 engine adds their bin dirs to the Windows DLL search at startup (`_add_cuda_dll_dirs`)
-so `nvrtc-builtins*.dll` is found. A standard `python -m venv` is **not** usable here: a
+so `nvrtc-builtins*.dll` is found. It also pulls `tensorrt` plus `onnx`/`onnxscript` for
+the optional `--trt` backend; `tensorrt` brings about 2 GB of cu13 libraries that coexist
+with torch's cu128. A standard `python -m venv` is **not** usable here: a
 Windows venv keeps its standard library in the base Python install, so it is not
 relocatable and breaks on a machine that lacks that exact Python. python-build-standalone
 is self contained, which is what makes the bundle portable.
@@ -115,8 +125,9 @@ they are large. Restore them from the original GMFSS_Fortuna release.
 - `npm run pack` - build an unpacked app into `release/win-unpacked/` with the engine
   (including its bundled `runtime` and `bin`) shipped as `extraResources`. For local testing.
 - `npm run dist` - build the distributable `release/SmoothMyVideo-<version>-win.zip`
-  (about 3.2 GB). Recipients extract it and run `SmoothMyVideo.exe`; no install step, and
-  nothing is required on the target machine but the NVIDIA driver.
+  (about 5 GB with the TensorRT backend bundled, or 3.2 GB without it). Recipients extract
+  it and run `SmoothMyVideo.exe`; no install step, and nothing is required on the target
+  machine but the NVIDIA driver.
 
 ## Performance
 Precision is **fp16 only** (fp32 was removed: fp16 is visually lossless versus fp32,
@@ -130,8 +141,23 @@ Core inference at 1080p (warmup plus cuda.synchronize, excludes model load and f
 A 360 frame clip at 16x lands around 17 minutes. Measure with `engine/benchmark.py`,
 which logs dated entries to `BENCHMARKS.md` so progress is tracked over time.
 
+**TensorRT (optional, the TensorRT checkbox or `--trt`).** Each of the five sub networks
+(FeatureNet, GMFlow, MetricNet, IFNet, FusionNet) is exported to ONNX under autocast and
+built into a strongly typed fp16 TensorRT engine; softsplat (cupy) and the interpolate
+glue stay in eager. Measured on the RTX 5090: GMFlow (the heavy net, run twice per pair)
+2.33x, FeatureNet 1.60x, and about **2.2x end to end** over the cupy fp16 path, numerically
+matching (interpolated frame mean diff about 1%). Engines build on first use for each input
+resolution (a few minutes) and are cached, so later runs at that resolution start instantly.
+They are specific to the GPU, the resolution, and the TensorRT version, and rebuild on a
+different machine. Any engine that fails to build falls back to eager, so the app never breaks.
+
 Tried and not viable on this machine: `torch.compile` (its inductor backend needs
-Triton plus MSVC, neither installed).
+Triton plus MSVC, neither installed); and **dynamic shape** TensorRT engines (one engine
+covering a range of resolutions via a `min`/`opt`/`max` profile). The latter fails because
+GMFlow and IFNet warp with `grid_sample`, which the dynamo ONNX exporter routes through
+`cudnn_grid_sampler` with no ONNX translation on the dynamic path (the static export
+handles it fine). Dynamic engines are also documented as somewhat slower with more VRAM,
+so static per resolution engines, built on first use and cached, are the right call.
 
 ## What can be done next
 For whoever picks this up.
@@ -140,8 +166,11 @@ For whoever picks this up.
   verified locally with system Python and ffmpeg stripped from PATH, but it has not yet
   been run on a *separate* PC. Copy `release/SmoothMyVideo-<version>-win.zip` to a machine
   with no Python and no ffmpeg (just an NVIDIA driver), extract, and run `SmoothMyVideo.exe`.
-- **TensorRT speed path.** The headroom beyond the cupy ceiling (fp8 or NVFP4, more kernel
-  fusion). A much larger undertaking for a conv heavy model like GMFSS; not attempted.
+  Test both paths: a normal render, and one with the **TensorRT** toggle on (the first TRT
+  render at a given resolution spends a few minutes building engines, then caches them).
+- **TensorRT fp8 / NVFP4.** The native TensorRT backend is done (about 2.2x, see
+  Performance). The remaining headroom is fp8 or NVFP4 on the Blackwell tensor cores,
+  which needs calibration and is accuracy sensitive for a flow model; not attempted.
 - **Smaller ffmpeg.** `engine/bin` uses static builds (about 174 MB each). A shared ffmpeg
   build would shrink the bundle by a couple hundred MB at the cost of carrying its DLLs.
 
@@ -161,9 +190,10 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--trt]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
 interpolates at arbitrary fractional timesteps). `<multi>` stays required as a positional
-but is ignored when `--fps` is given.
+but is ignored when `--fps` is given. `--trt` runs the TensorRT backend (engines built and
+cached per resolution on first use, with eager fallback on any failure).

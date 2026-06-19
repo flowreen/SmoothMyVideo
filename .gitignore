@@ -17,6 +17,12 @@ engine/bin/
 engine/**/__pycache__/
 engine/GMFSS_Fortuna/vid_out/
 
+# tensorrt engine cache + export artifacts (machine specific, built on first run)
+engine/trt_cache/
+engine/*.onnx
+engine/*.onnx.data
+engine/*.engine
+
 # large model weights (download separately, see README)
 engine/GMFSS_Fortuna/train_log/
 
