@@ -34,7 +34,12 @@ time slot, which has no frame after it to interpolate toward, is filled by holdi
 generated frame. Duration therefore matches the source.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
+       [--sharpen S] [--no-interp]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
+       --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
+       offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
+       --no-interp skips interpolation entirely: the clip is only re-encoded at its source fps
+       with --sharpen applied, for users who just want the sharpening and not the smoothing.
 """
 import os
 import sys
@@ -67,9 +72,18 @@ ap.add_argument("--fps", type=float, default=None,
                 help="target output fps; overrides <multi> via timeline resampling")
 ap.add_argument("--no-trt", action="store_true",
                 help="disable the default TensorRT backend and run the eager pipeline")
+ap.add_argument("--sharpen", type=float, nargs="?", const=0.8, default=0.0,
+                help="FSR-style RCAS sharpening strength 0..1 applied to every output frame "
+                     "(0 = off, the default). A bare --sharpen uses 0.8. Offsets the uniform-look "
+                     "softness; RCAS self-limits, so even 1.0 keeps texture (unlike plain CAS).")
+ap.add_argument("--no-interp", action="store_true",
+                help="skip GMFSS interpolation: only re-encode at the source fps with --sharpen "
+                     "applied (sharpening without smoothing). The model and TRT are never loaded.")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
+SHARPEN = max(0.0, min(1.0, args.sharpen))   # CAS strength on every output frame; 0 = off
+NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
 
 def probe(path):
     # JSON (not csv) so the extra color/format fields stay robust when any of them is
@@ -118,7 +132,11 @@ if not NB:
         NB = max(0, int(round(dur * src_fps)))
     except (subprocess.CalledProcessError, ValueError):
         NB = 0
-if FPS_MODE:
+if NO_INTERP:
+    # Sharpen-only: keep the source frame rate, emit one frame per source frame.
+    rate_str = f"{num}/{den}"
+    out_label = int(round(src_fps))
+elif FPS_MODE:
     ratio = args.fps / src_fps                 # output frames per source frame
     rate_str = f"{args.fps:g}"
     out_label = int(round(args.fps))
@@ -126,7 +144,7 @@ else:
     rate_str = f"{num * args.multi}/{den}"
     out_label = int(round(src_fps * args.multi))
 out_path = os.path.abspath(args.output) if args.output else \
-    os.path.splitext(inp)[0] + f"_{out_label}fps.mp4"
+    os.path.splitext(inp)[0] + (("_sharpened" if NO_INTERP else f"_{out_label}fps") + ".mp4")
 
 # Decode/encode bit depth follows the source. 8 bit clips keep the original fast rgb24
 # path byte for byte; 10 bit and up are carried as 16 bit rgb (rgb48le) so the model
@@ -139,6 +157,9 @@ else:
     DEC_FMT, NP_DT, MAXV, BPP = "rgb24", np.uint8, 255.0, 3
 fsize = W * H * BPP
 total_pairs = max(1, NB - 1) if NB else 0
+# Progress denominator: interpolation steps over source pairs (NB-1); the sharpen-only pass
+# instead processes one unit per source frame (NB).
+total_units = NB if NO_INTERP else total_pairs
 
 sys.path.insert(0, REPO)
 os.chdir(REPO)
@@ -161,28 +182,35 @@ def _add_cuda_dll_dirs():
                 except OSError:
                     pass
                 os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
-_add_cuda_dll_dirs()
-from model.GMFSS_infer_u import Model
-model = Model()
-if not hasattr(model, "version"):
-    model.version = 0
-model.load_model("train_log", -1)
-model.eval()
-model.device()
-sys.stderr.write("GMFSS union model loaded (fp16)\n"); sys.stderr.flush()
+if NO_INTERP:
+    # Sharpen-only / re-encode: the GMFSS model and the TensorRT backend are never loaded, so
+    # there is no warmup and no first-run engine build. Each frame just gets the RCAS pass.
+    model = None
+    sys.stderr.write("no-interp mode: GMFSS interpolation disabled "
+                     "(re-encode at source fps with optional FSR sharpen)\n"); sys.stderr.flush()
+else:
+    _add_cuda_dll_dirs()
+    from model.GMFSS_infer_u import Model
+    model = Model()
+    if not hasattr(model, "version"):
+        model.version = 0
+    model.load_model("train_log", -1)
+    model.eval()
+    model.device()
+    sys.stderr.write("GMFSS union model loaded (fp16)\n"); sys.stderr.flush()
 
-if not args.no_trt:
-    # Default backend: swap sub nets for TensorRT engines (built+cached per resolution on
-    # first run, per-subnet eager fallback on any build/run failure). trt_runtime imports
-    # tensorrt at module load, so an environment without a working TensorRT is caught here
-    # and the eager pipeline is used instead. trt_runtime lives next to this script.
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import trt_runtime
-        trt_runtime.trtify(model)
-    except Exception as e:  # noqa: BLE001
-        sys.stderr.write(f"[trt] unavailable, using eager pipeline: {repr(e)[:200]}\n")
-        sys.stderr.flush()
+    if not args.no_trt:
+        # Default backend: swap sub nets for TensorRT engines (built+cached per resolution on
+        # first run, per-subnet eager fallback on any build/run failure). trt_runtime imports
+        # tensorrt at module load, so an environment without a working TensorRT is caught here
+        # and the eager pipeline is used instead. trt_runtime lives next to this script.
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import trt_runtime
+            trt_runtime.trtify(model)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[trt] unavailable, using eager pipeline: {repr(e)[:200]}\n")
+            sys.stderr.flush()
 
 scale = args.scale
 tmp = max(64, int(64 / scale))
@@ -194,7 +222,14 @@ def amp():
 
 def to_tensor(buf):
     a = np.frombuffer(buf, NP_DT).reshape(H, W, 3)
-    t = torch.from_numpy(a.transpose(2, 0, 1).copy()).to(device).unsqueeze(0).float() / MAXV
+    # Pinned host buffer + non_blocking H2D: a pageable .to() blocks the main thread until the
+    # copy finishes, but a page-locked (pinned) source lets .to() return immediately, so the
+    # thread races ahead to queue this frame's inference and fetch the next while the upload runs
+    # on the CUDA stream. PyTorch's caching pinned allocator reuses the locked block across frames
+    # and defers its reuse until the copy's event completes, so dropping the Python-side reference
+    # right after is safe; the per-frame cost is one host copy, not a fresh page-lock.
+    t = torch.from_numpy(a.transpose(2, 0, 1).copy()).pin_memory()
+    t = t.to(device, non_blocking=True).unsqueeze(0).float() / MAXV
     # Reach the multiple of 64 the model needs by padding the bottom/right edge, not by
     # resizing the whole frame up and back. A bilinear resize (the old path here and in
     # to_bytes) resamples every pixel and softens the entire image; padding then cropping
@@ -202,8 +237,40 @@ def to_tensor(buf):
     # replicate (vs zero) extends the edge smoothly so the flow net has no hard border to track.
     return F.pad(t, (0, pw - W, 0, ph - H), mode="replicate")
 
+RCAS_LIMIT = 0.1875 - 1e-6   # AMD FSR_RCAS_LIMIT = 0.25 - 1/16
+
+def _rcas(img, con):
+    """AMD FidelityFX RCAS (Robust Contrast-Adaptive Sharpening) on a [1,3,H,W] float image in [0,1].
+
+    This is the sharpen AMD FSR and Lossless Scaling's FSR mode use, not the plain CAS the ffmpeg
+    `cas` filter applies. RCAS limits its sharpening lobe to the 4-neighbour min/max (no overshoot or
+    ringing) and attenuates it in noisy regions (the FSR_RCAS_DENOISE term), so it crisps real edges
+    without amplifying fine texture/grain into mush the way CAS does at high strength. The lobe is one
+    scalar per pixel applied to all three channels, so it cannot decorrelate them into colour speckle.
+    con in (0, 1] scales the strength (1 = AMD's max, sharpness 0); con <= 0 is a no-op.
+    """
+    p = F.pad(img, (1, 1, 1, 1), mode="replicate")        # replicate so edges don't sharpen to black
+    b, h = p[..., 0:-2, 1:-1], p[..., 2:, 1:-1]           # up, down
+    d, f = p[..., 1:-1, 0:-2], p[..., 1:-1, 2:]           # left, right
+    e = img                                               # centre
+    def luma(x): return x[:, 1:2] + 0.5 * (x[:, 0:1] + x[:, 2:3])   # green-weighted, as in FSR
+    bL, dL, eL, fL, hL = luma(b), luma(d), luma(e), luma(f), luma(h)
+    rng = torch.maximum(torch.maximum(torch.maximum(bL, dL), torch.maximum(fL, hL)), eL) \
+        - torch.minimum(torch.minimum(torch.minimum(bL, dL), torch.minimum(fL, hL)), eL)
+    nz = (0.25 * (bL + dL + fL + hL) - eL).abs() / (rng + 1e-4)
+    nz = -0.5 * nz.clamp(0.0, 1.0) + 1.0                   # ~1 on flat areas, ->0.5 in noise
+    mn4 = torch.minimum(torch.minimum(b, d), torch.minimum(f, h))
+    mx4 = torch.maximum(torch.maximum(b, d), torch.maximum(f, h))
+    hit_min = mn4 / (4.0 * mx4 + 1e-4)
+    hit_max = (1.0 - mx4) / (4.0 * mn4 - 4.0 - 1e-4)       # denom strictly < 0: no divide-by-zero
+    lobe = torch.maximum(-hit_min, hit_max).amax(dim=1, keepdim=True)   # most-limiting channel
+    lobe = lobe.clamp(max=0.0).clamp(min=-RCAS_LIMIT) * con * nz
+    return ((e + lobe * (b + d + f + h)) / (1.0 + 4.0 * lobe)).clamp(0.0, 1.0)
+
 def to_bytes(t):
     t = t.float()[..., :H, :W]            # crop off the padding added in to_tensor
+    if SHARPEN > 0:
+        t = _rcas(t, SHARPEN)             # FSR-style RCAS sharpen (GUI "FSR" / --sharpen); see _rcas
     # Round to nearest, not truncate: numpy's float->uint cast floors, which biases every frame
     # ~0.5 LSB low (a uniform darkening, and the wrong quantisation of the model output). Rounding
     # is the unbiased mapping back to integer samples; every emitted frame goes through here.
@@ -295,6 +362,11 @@ for sp_opt, flag, key in (("range", "-color_range", "color_range"),
     if v:
         sp.append(f"{sp_opt}={v}")
         color += [flag, v]
+# Sharpening (the GUI "FSR" toggle / --sharpen) is applied in-engine on the GPU by _rcas() inside
+# to_bytes, NOT here. It uses AMD FidelityFX RCAS, the exact sharpen AMD FSR and Lossless Scaling's
+# FSR mode use; ffmpeg only ships the older, blunter `cas`, which over-sharpens fine texture into
+# mush at high strength (RCAS limits its lobe to the local min/max and eases off in noisy areas, so
+# it crisps edges without destroying texture). So the encode vf is just the colour-tag passthrough.
 vf = ",".join((["setparams=" + ":".join(sp)] if sp else []) + [f"format={out_pix}"])
 
 enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", DEC_FMT,
@@ -303,8 +375,9 @@ enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", DEC_FMT,
            "-c:v", venc, "-vf", vf]
 enc_cmd += qargs + prof + color + [out_path]
 enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
+_sharp_note = f"  sharpen(rcas)={SHARPEN:g}" if SHARPEN > 0 else ""
 sys.stderr.write(f"encode: {venc} visually-lossless -> {out_pix}  "
-                 f"(source {SRC_CODEC or '?'} {SRC_BITS}bit {SRC_PIX})\n"); sys.stderr.flush()
+                 f"(source {SRC_CODEC or '?'} {SRC_BITS}bit {SRC_PIX}){_sharp_note}\n"); sys.stderr.flush()
 
 # Encode on a background thread so ffmpeg writes overlap the next frame's GPU work instead of
 # stalling the single pipe. One writer pulling a bounded FIFO preserves frame order, so the
@@ -342,6 +415,34 @@ def _reader():
         pass
 rt = threading.Thread(target=_reader, daemon=True)
 rt.start()
+
+if NO_INTERP:
+    # Sharpen-only pass: no interpolation, one output frame per source frame at the source fps.
+    # Each decoded frame is RCAS-sharpened on the GPU when --sharpen > 0, or passed straight
+    # through (a plain re-encode) when it is 0. Shares the same encode pipe/threads as the
+    # interpolation path, so colour signalling, bit depth and audio are handled identically.
+    k = 0
+    try:
+        while True:
+            buf = rq.get()
+            if buf is None:
+                break
+            wq.put(to_bytes(to_tensor(buf)) if SHARPEN > 0 else buf)
+            k += 1
+            if k % 10 == 0:
+                sys.stderr.write(f"PROGRESS {k}/{total_units}\n"); sys.stderr.flush()
+    finally:
+        wq.put(None)            # sentinel: let the writer drain its queue and exit
+        wt.join()
+        enc.stdin.close()
+        dec.stdout.close()
+        enc.wait()
+        dec.wait()
+    if _werr:
+        raise _werr[0]          # surface a failed encode pipe as a nonzero exit
+    sys.stderr.write(f"done {k} frames "
+                     f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n")
+    sys.exit(0)
 
 prev = rq.get()
 if prev is None:

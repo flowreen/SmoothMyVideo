@@ -18,9 +18,15 @@ contained: a recipient extracts the zip and runs `SmoothMyVideo.exe` with no Pyt
 pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
 
 - GUI: select a video (or drag one onto the window), view its info (resolution, source
-  fps, duration, codec), choose a multiplier or type a target fps, click **Smooth It!**.
-  **Cancel** kills the running job; **Open folder** reveals the result. The last used
-  folder and multiplier are remembered between sessions.
+  fps, duration, codec), choose a multiplier, type a target fps, or tick **match screen
+  refresh rate** to target your monitor's Hz (rounded up), then click **Smooth It!**. An
+  **FSR** toggle (FSR-style RCAS sharpening, on at full strength by default, with a
+  strength slider) crisps the output. The **Interpolate** toggle (on by default) is the
+  master switch for frame generation: untick it to *only* sharpen the video, keeping the
+  source frame rate (the multiplier / fps / match-screen controls grey out and the engine
+  skips the GMFSS model entirely). **Cancel** kills the running job; **Open folder**
+  reveals the result. The last used folder, multiplier, sharpen, interpolate and
+  match-screen settings are remembered between sessions.
 - Progress: a bar that starts at the source frame count and fills to the post process
   total, plus a live frame counter and an ETA.
 - Output: written beside the source as `<name>_<fps>fps.mp4` (or a custom path chosen
@@ -63,15 +69,19 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
 ## Architecture
 - `src/main.ts` - Electron main: window, open and save dialogs, ffprobe (`-of json`),
   spawns the engine, streams progress, tracks the running child so **Cancel** can
-  `taskkill /T /F` it. Resolves the interpreter as `engine/runtime/python.exe`
+  `taskkill /T /F` it. A `refresh-rate` IPC returns the rounded-up refresh rate of the
+  monitor the window is on (`screen.getDisplayMatching`) for the match-screen option.
+  Resolves the interpreter as `engine/runtime/python.exe`
   (`RUNTIME_PY`, falls back to `python` on PATH) and ffprobe as `engine/bin/ffprobe.exe`
   (`FFPROBE`, falls back to `ffprobe` on PATH). It always sets `PYTHONUTF8` plus a writable
   `SMV_TRT_CACHE` (under userData) for the engine cache, since the engine runs the TensorRT
   backend by default.
-- `renderer/index.html` - the UI (select or drag in a video, multiplier or fps, output path
-  with **Change...**, progress bar with frame counter and ETA, Cancel, Open folder, log).
-  Uses `require('electron')`; a dropped file is resolved to a path with
-  `webUtils.getPathForFile`, and the last folder and multiplier are saved in `localStorage`.
+- `renderer/index.html` - the UI (select or drag in a video, an **Interpolate** master
+  toggle, multiplier / fps / **match screen refresh rate**, an **FSR** sharpen toggle with
+  strength slider, output path with **Change...**, progress bar with frame counter and ETA,
+  Cancel, Open folder, log). Uses `require('electron')`; a dropped file is resolved to a path
+  with `webUtils.getPathForFile`, and the folder, multiplier, sharpen, interpolate and
+  match-screen settings are saved in `localStorage`.
 - `engine/gmfss_interp.py` - GMFSS pipe engine: ffmpeg decode into GMFSS into ffmpeg
   encode (audio copied), always encoding HEVC with the bit depth and colour tags matched to the
   probed source and always targeting visually lossless (see Passthrough quality). Runs the
@@ -347,13 +357,44 @@ For whoever picks this up.
   option, used in enhancr, is to chain a restoration or upscaling model (RealESRGAN, SCUNet) after
   interpolation to re sharpen, at the cost of a second model per frame. The `scale` flag is
   already at its sharp maximum (1.0); lowering it is what blurs.
+- **FSR-style sharpening with RCAS (done; on by default in the GUI).** The uniform look (every output
+  frame generated on a half step grid, see Uniform look) trades a little global sharpness for
+  consistency, so the whole clip is a touch softer than the source. The counter is AMD FidelityFX
+  **RCAS** (Robust Contrast-Adaptive Sharpening), the exact sharpen AMD FSR and Lossless Scaling's FSR
+  mode use, implemented on the GPU in the engine (`_rcas()` in `gmfss_interp.py`, applied to every
+  output frame in `to_bytes`). RCAS limits its sharpening lobe to the four-neighbour min/max (no
+  overshoot or ringing) and eases off in noisy/textured regions (its denoise term), so it crisps real
+  edges and recovers detail without amplifying fine texture into grain or mush. It replaced an earlier
+  attempt with ffmpeg's plain `cas` filter, which has neither limiter: in RGB it decorrelated channel
+  noise into red/blue speckle, and even luma-only at high strength it ground fine mountain texture into
+  grey grain (measured as 2.7-3.3x the high-frequency content of the clean frame, versus ~1.1x for
+  RCAS). RCAS computes one scalar lobe per pixel and applies it to all three channels, so it cannot
+  recreate the colour speckle. The GUI **FSR** toggle plus a 0..1 strength slider (default **on at
+  1.0**; RCAS self-limits, so 1.0 keeps texture, unlike CAS) drives it; the on/off state and value
+  persist between sessions. At the engine CLI the flag is off unless given (`--sharpen S`; a bare
+  `--sharpen` uses 0.8; `0`/omitted leaves frames untouched). Verified on the sample (extracted frames,
+  side-by-side crop): RCAS@1.0 crisps the dragon's edges and recovers mountain detail with the texture
+  intact, at about 1.55 MB/frame versus the clean 1.42 MB (CAS was 2.7-3.3 MB).
+- **Upscale to screen resolution (planned: minimal NVIDIA NIS).** Real-time RTX VSR (mpv's
+  `d3d11vpp=scaling-mode=nvidia`) cannot be baked into the file: the bundled ffmpeg has no `d3d11vpp`
+  and no AI super-resolution filter, and true VSR would need NVIDIA's Maxine/NGX Video Effects SDK (a
+  large separate engine) or a TensorRT SR model. The agreed minimal path is instead **NVIDIA Image
+  Scaling (NIS)** - NVIDIA's open-source spatial upscaler plus sharpener (NVScaler/NVSharpen), a plain
+  shader with no model or SDK, and itself one of Lossless Scaling's scaling modes. It can be done the
+  way RCAS was (a small GPU pass in the engine, or libplacebo's `custom_shader_path` with the public
+  NIS `.hook`), upscaling each output frame to a chosen target (e.g. the monitor resolution) before
+  encode. Caveat: it bloats an already-large interpolated file and is spatial-only, not AI; mpv's live
+  VSR at playback stays the higher-quality, zero-storage alternative. Not yet implemented.
 - **Overlapped decode, inference and encode (done).** Decode and encode now run on background
   reader and writer threads fed by bounded FIFO queues, so ffmpeg input and output pipe I/O
   overlap the next frame's GPU work instead of stalling a single thread (one reader and one
   writer preserve frame order, so the output is unchanged; the bounds apply backpressure rather
   than growing memory, and a failed encode write is surfaced as a nonzero exit). This matches the
-  reader plus writer pattern in GMFSS_Fortuna's own inference_video.py. The one remaining piece is
-  non_blocking host to device copies (the to_tensor upload is still synchronous), a minor gain on top.
+  reader plus writer pattern in GMFSS_Fortuna's own inference_video.py. The host to device upload is
+  non blocking too now: `to_tensor` stages each frame in pinned (page locked) memory and copies it with
+  `non_blocking=True`, so the main thread no longer stalls on the copy and races ahead to queue the next
+  frame's GPU work (a pageable `.to()` is synchronous; only a pinned source copies async). That closes
+  the last synchronous stall in the overlap design.
 - **Batch queue.** Process several files (or a folder) unattended, one after another. Pure UI
   work in the renderer and main process, no engine change.
 - **Optional smaller items.** Add a live preview of the frame being written. (Encoding is now
@@ -381,11 +422,16 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
 interpolates at arbitrary fractional timesteps). `<multi>` stays required as a positional
 but is ignored when `--fps` is given. The encode always targets visually lossless and the
 backend is TensorRT by default (engines built and cached per resolution on first use, with
-eager fallback on any failure); `--no-trt` forces the eager pipeline.
+eager fallback on any failure); `--no-trt` forces the eager pipeline. `--sharpen S` applies
+Contrast Adaptive Sharpening (`strength` 0..1) to every output frame to offset the uniform
+look softness; it is off unless given (a bare `--sharpen` uses 0.8). `--no-interp` skips
+interpolation entirely: the clip is only re-encoded at its source fps with `--sharpen`
+applied (one output frame per source frame, no GMFSS model or TRT loaded), for when you
+just want the sharpening and not the smoothing.

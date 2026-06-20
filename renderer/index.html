@@ -18,6 +18,7 @@
   #go:disabled { background:#444; color:#888; cursor:default; }
   select, input { font:inherit; background:#101010; color:var(--text); border:1px solid #444;
                   border-radius:5px; padding:5px 8px; }
+  select:disabled, input:disabled { opacity:.45; cursor:not-allowed; }
   #bar { height:18px; background:#101010; border-radius:9px; overflow:hidden; }
   #fill { height:100%; width:0; background:var(--green); transition:width .15s; }
   #log { background:#101010; color:#ccc; font-family:Consolas,monospace; font-size:12px;
@@ -45,6 +46,13 @@
 
   <div class="panel">
     <div class="row">
+      <span class="k">Interpolate</span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="interp" checked style="width:auto;padding:0;accent-color:var(--green);">
+        generate in-between frames for smoother motion (off = only sharpen the video)
+      </label>
+    </div>
+    <div class="row">
       <span class="k">Multiplier</span>
       <select id="multi">
         <option value="2">2x</option>
@@ -54,6 +62,25 @@
       </select>
       <span class="hint">or fps</span>
       <input id="fpsin" type="number" min="1" max="1000" step="0.001" style="width:80px">
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="screenfps" style="width:auto;padding:0;accent-color:var(--green);">
+        match screen refresh rate (<span id="screenhz">?</span> Hz)
+      </label>
+    </div>
+    <div class="row">
+      <span class="k">Sharpen</span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;accent-color:var(--green);"> FSR
+      </label>
+      <span id="sharpwrap" style="display:flex;align-items:center;gap:8px;">
+        <input id="sharpval" type="range" min="0" max="1" step="0.05" value="1"
+               style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
+        <span class="v" id="sharpnum">1.00</span>
+      </span>
+      <span class="hint">sharpens for a crisper picture</span>
     </div>
     <div class="row"><span class="k">Saves to</span>
       <button id="changeout" class="mini" disabled>Change...</button>
@@ -96,13 +123,19 @@ function paint(){
   }
   $('frames').textContent = 'Frames: '+Math.round(curDone*fpp)+' / '+totalGen+'  ('+Math.round(curPct)+'%)'+speed;
 }
+function interpOn(){ return $('interp').checked; }
 function srcFps(){ const [n,d]=(info.fps||'24/1').split('/'); return (+n)/((+d)||1); }
-function targetFps(){ return useFps ? parseFloat($('fpsin').value) : Math.round(srcFps()*(+$('multi').value)); }
-function fpsValid(t){ return useFps ? (t >= 1 && t <= 1000) : (t > 0); }
-function outRatio(){ return useFps ? targetFps()/srcFps() : (+$('multi').value); }
+// With interpolation off the output keeps the source fps (we only sharpen), so the multiplier/
+// fps controls no longer drive the target rate or the 1:1 output-frame ratio.
+function targetFps(){ if(!interpOn()) return srcFps();
+  return useFps ? parseFloat($('fpsin').value) : Math.round(srcFps()*(+$('multi').value)); }
+function fpsValid(t){ if(!interpOn()) return true;
+  return useFps ? (t >= 1 && t <= 1000) : (t > 0); }
+function outRatio(){ if(!interpOn()) return 1;
+  return useFps ? targetFps()/srcFps() : (+$('multi').value); }
 function syncFpsField(){ if(info) $('fpsin').value = Math.round(srcFps()*(+$('multi').value)); }
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
-  return b + '_' + Math.round(targetFps()) + 'fps.mp4'; }
+  return interpOn() ? (b + '_' + Math.round(targetFps()) + 'fps.mp4') : (b + '_sharpened.mp4'); }
 function refresh(){ if(!input) return;
   const t = targetFps();
   if(!fpsValid(t)){ $('out').textContent = 'enter an output fps between 1 and 1000'; lastOut = null; return; }
@@ -124,8 +157,7 @@ async function loadVideo(f){
   $('codec').textContent = s.codec_name || '?';
   $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true;
   $('status').textContent = 'Ready. Pick a multiplier or fps, then click Smooth It!';
-  useFps = false; syncFpsField();
-  refresh();
+  applyScreenFps();      // re-asserts the interp / screen-rate state and recomputes the output name
 }
 $('pick').onclick = async () => { await loadVideo(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
 $('multi').onchange = () => { localStorage.setItem('multi', $('multi').value); useFps = false; syncFpsField(); refresh(); };
@@ -134,6 +166,58 @@ $('fpsin').oninput = () => { useFps = true; if(parseFloat($('fpsin').value) > 10
 // Restore the last chosen multiplier from the previous session.
 const savedMulti = localStorage.getItem('multi');
 if(savedMulti && [...$('multi').options].some(o => o.value === savedMulti)) $('multi').value = savedMulti;
+
+// Sharpen (CAS): a checkbox enables Contrast Adaptive Sharpening and reveals a 0..1 strength slider;
+// unchecking hides the slider and disables it. Default is on at full strength (1.0). The strength is
+// forwarded to the engine as --sharpen; both the on/off state and the value persist between sessions.
+function syncSharpen(){
+  const on = $('sharpen').checked;
+  $('sharpwrap').style.display = on ? 'flex' : 'none';
+  $('sharpnum').textContent = (+$('sharpval').value).toFixed(2);
+}
+const savedSharpOn = localStorage.getItem('sharpenOn');
+if(savedSharpOn !== null) $('sharpen').checked = savedSharpOn === '1';
+const savedSharpVal = localStorage.getItem('sharpenVal');
+if(savedSharpVal !== null) $('sharpval').value = savedSharpVal;
+syncSharpen();
+$('sharpen').onchange = () => { localStorage.setItem('sharpenOn', $('sharpen').checked ? '1' : '0'); syncSharpen(); };
+$('sharpval').oninput = () => { localStorage.setItem('sharpenVal', $('sharpval').value); syncSharpen(); };
+
+// Match screen refresh rate: when checked, the output target fps is the monitor's refresh rate
+// (rounded up, fetched from the main process) and the multiplier / fps inputs are overridden and
+// greyed. The detected rate fills the label; the on/off state persists. applyScreenFps re-asserts
+// the override after a video loads or a run finishes, since both otherwise reset the fps mode.
+let screenHz = 60;
+function applyScreenFps(){
+  const interp = interpOn();
+  const on = interp && $('screenfps').checked;   // the screen-rate override only applies when interpolating
+  // Multiplier + fps are greyed when interpolation is off (no rate change) or when the
+  // screen-rate override owns the target fps.
+  $('multi').disabled = !interp || $('screenfps').checked;
+  $('fpsin').disabled = !interp || $('screenfps').checked;
+  if(on){ useFps = true; $('fpsin').value = screenHz; }
+  else if(interp){ useFps = false; syncFpsField(); }
+  else { useFps = false; }                        // interpolation off: target fps = source fps
+  refresh();
+}
+if(localStorage.getItem('screenfps') === '1') $('screenfps').checked = true;
+$('screenfps').onchange = () => { localStorage.setItem('screenfps', $('screenfps').checked ? '1' : '0'); applyScreenFps(); };
+ipcRenderer.invoke('refresh-rate').then(hz => {
+  screenHz = (+hz) || 60; $('screenhz').textContent = screenHz;
+  if($('screenfps').checked) applyScreenFps();
+});
+
+// Interpolate: master toggle for GMFSS frame generation. Unchecked, the app only re-encodes the
+// video with the FSR sharpen applied (no in-between frames), so the multiplier, fps and screen-
+// rate controls are greyed, the output keeps the source frame rate, and the engine skips the
+// model entirely. The on/off state persists between sessions; default on.
+function syncInterp(){
+  $('screenfps').disabled = !interpOn();
+  applyScreenFps();      // recomputes multi/fpsin enable, the fps mode, and the output name
+}
+if(localStorage.getItem('interp') === '0') $('interp').checked = false;
+$('interp').onchange = () => { localStorage.setItem('interp', $('interp').checked ? '1' : '0'); syncInterp(); };
+syncInterp();
 
 // Drag a video file onto the window to load it (ignored while a job is running).
 document.addEventListener('dragover', (e) => { e.preventDefault(); if($('cancel').disabled) document.body.classList.add('drag'); });
@@ -149,19 +233,26 @@ $('go').onclick = () => {
   if(!input) return;
   const t = targetFps();
   if(!fpsValid(t)){ alert('Enter an output fps between 1 and 1000.'); return; }
+  const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
+  // With interpolation off, the sharpen pass is the only effect; nothing to do if it is off too.
+  if(!interpOn() && sharpenStrength <= 0){
+    alert('Nothing to do: turn on Interpolate, or enable FSR sharpening (the only effect when interpolation is off).');
+    return;
+  }
   procStart = 0; baseK = 0; etaAnchor = 0; etaAnchorTime = 0; lastFps = 0; curDone = 0; curPct = 0;
   clearInterval(etaTimer); etaTimer = setInterval(paint, 500);   // ticks the ETA down between frames
-  fpp = outRatio();                                    // output frames produced per source frame
+  fpp = outRatio();                                    // output frames produced per source frame (1 when not interpolating)
   const srcFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
   totalGen = Math.max(1, Math.round(srcFrames*fpp));   // total frames the conversion will output
   cancelled = false;
-  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
-  $('status').textContent = 'Warming up the model...';
+  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
+  $('status').textContent = interpOn() ? 'Warming up the model...' : 'Sharpening...';
   $('fill').style.width = '0%';
-  $('frames').textContent = 'Warming up (loading model, first frames)...';
-  log('>> '+input+'  ->  '+Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')+'\n');
-  const payload = { input, multi:+$('multi').value, output: lastOut };
-  if(useFps) payload.fps = t;
+  $('frames').textContent = interpOn() ? 'Warming up (loading model, first frames)...' : 'Sharpening frames...';
+  log('>> '+input+'  ->  '+(interpOn() ? (Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')) : 'FSR sharpen only (no interpolation)')+'\n');
+  const payload = { input, multi:+$('multi').value, output: lastOut, interp: interpOn() };
+  if(interpOn() && useFps) payload.fps = t;
+  payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   ipcRenderer.send('run', payload);
 };
 $('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
@@ -209,7 +300,8 @@ ipcRenderer.on('engine-out', (_e, t) => {
 });
 ipcRenderer.on('engine-done', (_e, code) => {
   clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('interp').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('cancel').disabled=true;
+  syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n'); }
   else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen+'  (100%)';
     $('status').textContent='Done!'; $('open').disabled=false; log('>> Saved: '+lastOut+'\n'); }

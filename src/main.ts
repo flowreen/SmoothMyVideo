@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, screen } from 'electron';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -68,11 +68,26 @@ ipcMain.handle('probe', async (_e, file: string) => {
   });
 });
 
+ipcMain.handle('refresh-rate', () => {
+  // Refresh rate of the monitor the app window is on (fallback: primary), rounded up so a
+  // 59.94 / 143.9 Hz panel targets a clean 60 / 144. Feeds the renderer's "match screen" option.
+  try {
+    const d = win ? screen.getDisplayMatching(win.getBounds()) : screen.getPrimaryDisplay();
+    return Math.ceil(d.displayFrequency || screen.getPrimaryDisplay().displayFrequency || 60);
+  } catch { return 60; }
+});
+
 let current: ChildProcess | null = null;
 
-ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number }) => {
+ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; interp?: boolean }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
-  if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
+  // Interpolation is the default; interp === false means the user only wants the sharpen pass,
+  // so tell the engine to skip frame generation (and ignore any fps/multi) entirely.
+  if (opts.interp === false) args.push('--no-interp');
+  else if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
+  // FSR-style RCAS sharpening strength (GUI checkbox + slider). 0/omitted = off, leaving the
+  // frames value-preserving; >0 enables the in-engine RCAS pass. Works with or without interp.
+  if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
   // PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from crashing the engine
   // during first-run TRT builds; SMV_TRT_CACHE is a guaranteed writable cache location.
   const env = { ...process.env, PYTHONUTF8: '1',
