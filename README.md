@@ -24,12 +24,19 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
 - Progress: a bar that starts at the source frame count and fills to the post process
   total, plus a live frame counter and an ETA.
 - Output: written beside the source as `<name>_<fps>fps.mp4` (or a custom path chosen
-  with **Change...**). Always visually lossless, no quality knob. Passthrough encoding: the
-  encoder family is matched to the source codec (h264/hevc/av1) using NVENC when the device
-  has a usable encode session, the source bit depth is preserved (8 bit, or 10 bit and HDR
-  via `p010le`), the source colour signalling is carried through, and original audio is
-  copied. With no usable NVENC it falls back automatically to CPU SVT-AV1, still visually
-  lossless (see Passthrough quality).
+  with **Change...**). Always visually lossless, no quality knob. The output is always HEVC
+  (`hevc_nvenc`) when the device has a usable NVENC session, since HEVC at the same quality is
+  far smaller than H.264 and an interpolated clip is a new artifact (matching an H.264 source
+  would only bloat it). The source bit depth is preserved (8 bit, or 10 bit and HDR via
+  `p010le`), the source colour signalling is carried through, and original audio is copied. With
+  no usable NVENC it falls back automatically to CPU SVT-AV1, still visually lossless (see
+  Passthrough quality).
+- Uniform look (no popping): every output frame is interpolated, the first and last included.
+  No source frame is passed through and none lands on a source timestamp, because the sample
+  grid is shifted half a step so each frame is an interior blend. This removes the sharp original
+  then soft tween alternation that otherwise makes fine detail pop in and out on every Nth frame.
+  The whole clip is uniformly a touch softer than the source in exchange for that consistency.
+  See Uniform look below.
 - Engine: GMFSS at fp16 with a cupy softsplat kernel, about 2.2x faster than the original
   fp32 path. The TensorRT backend is the default when available (about another 2.2x on top,
   built and cached per resolution on first run) and falls back automatically to the eager
@@ -66,11 +73,13 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   Uses `require('electron')`; a dropped file is resolved to a path with
   `webUtils.getPathForFile`, and the last folder and multiplier are saved in `localStorage`.
 - `engine/gmfss_interp.py` - GMFSS pipe engine: ffmpeg decode into GMFSS into ffmpeg
-  encode (audio copied), with the encoder family, bit depth and colour tags matched to the
+  encode (audio copied), always encoding HEVC with the bit depth and colour tags matched to the
   probed source and always targeting visually lossless (see Passthrough quality). Runs the
   TensorRT backend by default (per-subnet eager fallback; `--no-trt` forces eager) and NVENC
   with an automatic CPU SVT-AV1 fallback. Always fp16; takes an integer `<multi>` or
-  `--fps TARGET` for an arbitrary resampled output fps. To keep generated frames sharp it pads
+  `--fps TARGET` for an arbitrary resampled output fps. Every emitted frame is a GMFSS render on a
+  grid offset by half a step, so no source frame is passed through and none lands on a source
+  timestamp and the whole clip shares one look (see Uniform look). To keep generated frames sharp it pads
   each frame to the multiple of 64 the model needs (rather than resizing, which resamples every
   pixel) and rounds the output to nearest instead of truncating; it also holds byte exact
   duplicate source frames instead of interpolating them, and runs the ffmpeg decode and encode
@@ -230,15 +239,49 @@ Recommendations, with the repo each came from:
   run on this GPU. Its one speed advantage, TensorRT, is already covered by SMV's modern stack
   (torch 2.11 `cu128`, TensorRT 11.1).
 
-## Passthrough quality
-The encode is matched to the source so interpolation is the only thing that changes, not the
-format. From the ffprobe of the input the engine picks:
+## Uniform look (no detail popping)
+A naive interpolator keeps the original frames and inserts generated tweens between them, so the
+output alternates byte exact source frames (sharp, full real detail) with softer model frames.
+At the interpolation rate that reads as fine detail popping in and out (sharp original, then soft
+tween, then sharp original), which breaks immersion. SmoothMyVideo instead generates *every*
+output frame: it samples on a grid shifted by half an output step, so no frame coincides with a
+source timestamp and every frame is an interior blend. For an integer `multi` M the timesteps
+inside each source pair are `1/2M, 3/2M, ... (2M-1)/2M` (symmetric around 0.5, spacing `1/M`);
+`--fps` mode uses the same half step offset. The first and last output frames are generated too.
+This is the "generate every displayed frame, never pass a real one through" idea (as requested,
+modelled on Lossless Scaling's fully generated output).
 
-- **Codec family.** h264 -> `h264_nvenc`, hevc -> `hevc_nvenc`, av1 -> `av1_nvenc`, anything
-  else -> `hevc_nvenc`. A 10 bit clip that arrived as h264 is promoted to HEVC because NVENC
-  H.264 is 8 bit only. The chosen NVENC encoder is preflighted on a tiny frame; if the device
-  has no usable NVENC session (no NVIDIA GPU, a GPU too old for that codec, or no driver) the
-  engine falls back to CPU `libsvtav1` for the encode.
+A tempting cheaper fix, keeping the original timing but regenerating the frames that sit on a
+source timestamp through GMFSS at timestep 0, does **not** work: at `t=0` the model reconstructs
+the frame about as sharply as the original, so the pop survives. Measured on the sample clip
+(sharpness = variance of the Laplacian, mean over frames):
+
+| Output | on grid vs tween sharpness | even/odd ratio | mean (source 42.5) |
+| --- | --- | --- | --- |
+| regenerate on grid at `t=0` | 43.1 vs 37.1 | 1.16 (visible pop) | 40.1 |
+| half step grid (shipped) | 38.1 vs 36.5 | 1.04 (uniform) | 37.3 |
+
+The cost: the true pixels that sat on the source grid are dropped, so the clip is uniformly a
+little softer than a passthrough render, and that uniformity is the goal. The output frame count
+is `multi*frames` (true doubling for 2x, and so on): every source frame gets `multi` output
+frames, and the last source frame's own time slot, which has no frame after it to interpolate
+toward, is filled by holding the last generated frame. This matches the count you intuitively
+expect, the source duration, and the GUI's own frame total, and it is the same target fps
+approach Topaz uses. Held cels (byte exact duplicate source frames) are still detected and
+rendered once, so a static shot stays as crisp as its source without per frame shimmer.
+
+## Passthrough quality
+The encode keeps the source's bit depth, chroma and colour, so the only deliberate changes are
+interpolation and the codec (always HEVC). From the ffprobe of the input the engine sets:
+
+- **Codec.** Always HEVC (`hevc_nvenc`), whatever the source codec was. HEVC at the same visually
+  lossless CQ is far smaller than H.264, and the interpolated clip is a brand new artifact, so
+  echoing the source codec would only bloat it: a 3 Mbps H.264 source produced a 100 Mbps H.264
+  output under the old match the source rule, and HEVC brings that to about a quarter of the size
+  at the same quality. Other interpolation tools agree (enhancr, Topaz and Flowframes all offer a
+  codec menu centred on HEVC and AV1; GMFSS_Fortuna's own script only dumps `mp4v`). The encoder
+  is preflighted on a tiny frame; if the device has no usable HEVC NVENC session (no NVIDIA GPU, a
+  GPU too old, or no driver) the engine falls back to CPU `libsvtav1` for the encode.
 - **Bit depth.** 8 bit decodes via `rgb24`; 10 bit and up decode via `rgb48le` and encode to
   `p010le` (HEVC `main10`). The pipe is already fp16, which holds 10 bit precision, so this is
   free. GMFSS_Fortuna and GMFSS_union are 8 bit only, and enhancr runs GMFSS inference in
@@ -255,9 +298,10 @@ format. From the ffprobe of the input the engine picks:
 The bundled ffmpeg is the BtbN **lgpl** build, which has no `libx264`/`libx265`, so the
 software fallback uses `libsvtav1` (SVT-AV1: true CRF, clean 8 and 10 bit) rather than an
 x264/x265 `-crf` path. True lossless of the
-*source* is not possible for an interpolator (frames are invented and the originals are round
-tripped through RGB), so "passthrough" here means adding no visible encode loss and not
-downgrading the source format.
+*source* is not possible for an interpolator, and here every output frame is generated rather
+than copied from the source (see Uniform look), so "passthrough" refers only to the codec
+family, bit depth and colour signalling. It means adding no visible encode loss and not
+downgrading the source format, not preserving the original pixels frame for frame.
 
 ## What can be done next
 For whoever picks this up.
@@ -313,8 +357,8 @@ For whoever picks this up.
 - **Batch queue.** Process several files (or a folder) unattended, one after another. Pure UI
   work in the renderer and main process, no engine change.
 - **Optional smaller items.** Add a live preview of the frame being written. (Encoding is now
-  done: source matched codec, preserved bit depth and colour, always visually lossless, with
-  an automatic CPU SVT-AV1 fallback when NVENC is unavailable; see Passthrough quality.)
+  done: always HEVC, preserved bit depth and colour, always visually lossless, with an automatic
+  CPU SVT-AV1 fallback when NVENC is unavailable; see Passthrough quality.)
 - **TensorRT fp8 / NVFP4.** The native TensorRT backend is done (about 2.2x, see
   Performance). The remaining headroom is fp8 or NVFP4 on the Blackwell tensor cores,
   which needs calibration and is accuracy sensitive for a flow model; not attempted.

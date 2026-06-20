@@ -7,10 +7,31 @@ Performance first, no quality knobs: the pipeline always runs fp16, always targe
 lossless, and always uses the fastest backend the machine supports.
 - Backend: TensorRT engines by default (built+cached per resolution on first run), with
   automatic eager fallback when TensorRT is unavailable. Pass --no-trt to force eager.
-- Encoder: the matching NVENC for the source codec (h264/hevc/av1) when the device has a
-  usable NVENC session, otherwise an automatic CPU fallback to SVT-AV1 (the strongest
-  visually lossless software encoder in the bundled LGPL ffmpeg; x264/x265 are not built in).
-  Source bit depth (8/10 bit), chroma and colour signalling are preserved either way.
+- Encoder: HEVC (hevc_nvenc) for every source when the device has a usable NVENC session,
+  otherwise an automatic CPU fallback to SVT-AV1 (the strongest visually lossless software
+  encoder in the bundled LGPL ffmpeg; x264/x265 are not built in). The output codec does not
+  echo the source: HEVC at the same visually lossless CQ is far smaller than H.264, and an
+  interpolated clip is a new artifact, so matching an H.264 source would only bloat it. Source
+  bit depth (8/10 bit), chroma and colour signalling are preserved either way.
+
+Uniform look (every frame generated): the output is fully smoothed. NO emitted frame is a source
+frame and none sits on a source timestamp. The output grid is shifted by half an output step, so
+every frame is an interior blend: timesteps 1/2M, 3/2M, ... (2M-1)/2M within each source pair for
+an integer multi M (symmetric around 0.5, spacing 1/M), and the analogous half step offset in
+--fps mode. The first and last output frames are therefore generated too. This is deliberate. A
+passthrough interpolator interleaves byte exact source frames (sharp, full real detail) with the
+softer generated tweens, so on every Nth frame fine detail snaps in and out (sharp original, soft
+tween, sharp original ...), a periodic shimmer that breaks immersion. Note that running a source
+frame back through GMFSS at timestep 0 does NOT fix this: at t=0 the model reconstructs it about
+as sharply as the original (measured ~equal), so the pop survives. Keeping every output frame off
+the source grid is what makes the whole timeline one consistent softness. This mirrors the
+"generate every displayed frame, never pass a real one through" behaviour requested from Lossless
+Scaling. The cost: the true pixels that sat on the source grid are dropped, so the clip is
+uniformly a touch softer than a passthrough render (that uniformity is the goal). The output frame
+count is multi*frames (true doubling for 2x, etc., matching target fps tools like Topaz and the
+GUI's own total): every source frame gets multi output frames, and the last source frame's own
+time slot, which has no frame after it to interpolate toward, is filled by holding the last
+generated frame. Duration therefore matches the source.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
@@ -183,21 +204,11 @@ def to_tensor(buf):
 
 def to_bytes(t):
     t = t.float()[..., :H, :W]            # crop off the padding added in to_tensor
-    # Round to nearest, not truncate: numpy's float->uint cast floors, which biases every
-    # interpolated frame ~0.5 LSB low against the byte-exact source frames it is interleaved
-    # with, a structured source-vs-tween brightness step. Rounding removes that bias.
+    # Round to nearest, not truncate: numpy's float->uint cast floors, which biases every frame
+    # ~0.5 LSB low (a uniform darkening, and the wrong quantisation of the model output). Rounding
+    # is the unbiased mapping back to integer samples; every emitted frame goes through here.
     a = (t[0] * MAXV).round().clamp(0, MAXV).cpu().numpy().transpose(1, 2, 0)
     return a.astype(NP_DT).tobytes()
-
-def make_inference(I0, I1, reuse, n):
-    if model.version >= 3.9:
-        return [model.inference(I0, I1, reuse, (i + 1) * 1. / (n + 1)) for i in range(n)]
-    middle = model.inference(I0, I1, scale)
-    if n == 1:
-        return [middle]
-    first = make_inference(I0, middle, reuse, n // 2)
-    second = make_inference(middle, I1, reuse, n // 2)
-    return [*first, middle, *second] if n % 2 else [*first, *second]
 
 def read_exact(stream, nbytes):
     buf = bytearray()
@@ -212,14 +223,14 @@ dec = subprocess.Popen(
     [FFMPEG, "-v", "error", "-i", inp, "-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
     stdout=subprocess.PIPE, creationflags=NO_WINDOW)
 
-# Match the encoder family to the source codec so output stays in kind (h264 -> h264,
-# hevc -> hevc, av1 -> av1); anything else defaults to hevc. NVENC H.264 is 8 bit only,
-# so a 10 bit source that came in as h264 is promoted to HEVC main10.
-_CODEC_ENC = {"h264": "h264_nvenc", "avc": "h264_nvenc", "hevc": "hevc_nvenc",
-              "h265": "hevc_nvenc", "av1": "av1_nvenc"}
-venc = _CODEC_ENC.get(SRC_CODEC, "hevc_nvenc")
-if TEN_BIT and venc == "h264_nvenc":
-    venc = "hevc_nvenc"
+# Always encode HEVC, whatever the source codec is. The interpolated clip is a brand new artifact
+# (many times the source's frame count), and HEVC at the same visually lossless CQ is far smaller
+# than H.264, so echoing an H.264 source would roughly quadruple the file for no quality gain. It
+# is also what the polished interpolation apps steer toward (enhancr, Topaz, Flowframes all offer
+# a codec menu and lean on HEVC/AV1); GMFSS_Fortuna's own script only dumps mp4v. HEVC carries
+# 10 bit (main10) and 4:4:4 cleanly. NVENC is used when the device has a usable HEVC session, with
+# the automatic CPU fallback below when it does not.
+venc = "hevc_nvenc"
 
 def _enc_works(name):
     # Real availability check: actually open the encoder on a tiny frame. NVENC fails fast
@@ -332,7 +343,6 @@ def _reader():
 rt = threading.Thread(target=_reader, daemon=True)
 rt.start()
 
-n = args.multi - 1
 prev = rq.get()
 if prev is None:
     sys.exit("no frames decoded")
@@ -340,48 +350,68 @@ I0 = to_tensor(prev)
 k = 0
 i = 0
 dups = 0
+last_out = None         # bytes of the most recent emitted frame, held across the final slot
 try:
     while True:
         cur = rq.get()
         if cur is None:
             break
         I1 = to_tensor(cur)
-        # Exact duplicate source frames (anime is drawn on twos/threes, so held cels decode
-        # byte-identically) need no interpolation: the correct tween of a still is the still
-        # itself. Holding the frame skips the wasted flow+inference and the shimmer GMFSS can
-        # add when fed two identical frames. The bytes compare short-circuits, so it is ~free
-        # on real motion.
+        # Held cels: anime is drawn on twos/threes, so repeated frames decode byte for byte alike.
+        # Every timestep between two identical frames renders the same still, so render it once and
+        # reuse those bytes for all of this pair's slots; this also avoids the shimmer GMFSS can add
+        # on identical input. The bytes compare short circuits, so it is ~free to detect.
         dup = cur == prev
         if dup:
             dups += 1
         if FPS_MODE:
-            # emit the output frames whose time falls in [i, i+1) source-frame units
-            fracs = [j / ratio - i for j in range(math.ceil(i * ratio), math.ceil((i + 1) * ratio))]
-            need = any(fr > 1e-6 for fr in fracs)
-            with amp():
-                reuse = model.reuse(I0, I1, scale) if (need and not dup) else None
-                for fr in fracs:
-                    if dup or fr <= 1e-6:
-                        wq.put(prev)            # held frame, or coincides with source i
-                    else:
-                        wq.put(to_bytes(model.inference(I0, I1, reuse, fr)))
-        else:
-            wq.put(prev)
-            if dup:
-                for _ in range(n):
-                    wq.put(prev)
-            else:
+            # Emit the output frames whose time falls in [i, i+1) source frame units, but on a grid
+            # shifted by half an output step ((j + 0.5)/ratio, not j/ratio) so no frame lands on a
+            # source timestamp. Every frame is therefore an interior blend with the same softness as
+            # its neighbours, instead of a sharp source frame that pops; see the module docstring.
+            lo = math.ceil(i * ratio - 0.5)
+            hi = math.ceil((i + 1) * ratio - 0.5)
+            fracs = [(j + 0.5) / ratio - i for j in range(lo, hi)]
+            if fracs:
                 with amp():
                     reuse = model.reuse(I0, I1, scale)
-                    mids = make_inference(I0, I1, reuse, n)
-                for m in mids:
-                    wq.put(to_bytes(m))
+                    held = to_bytes(model.inference(I0, I1, reuse, 0.5)) if dup else None
+                    for fr in fracs:
+                        last_out = held if dup else to_bytes(model.inference(I0, I1, reuse, fr))
+                        wq.put(last_out)
+        else:
+            # Multi mode: emit multi frames per source frame on a grid offset by half a step,
+            # timesteps 1/2M, 3/2M, ... (2M-1)/2M (symmetric around 0.5, spacing 1/M). None is at 0
+            # or 1, so no output frame is a copy (or near copy) of a source frame and the clip shares
+            # one look. The matching M frames for the last source frame are the held tail below.
+            M = args.multi
+            with amp():
+                reuse = model.reuse(I0, I1, scale)
+                if dup:
+                    held = to_bytes(model.inference(I0, I1, reuse, 0.5))
+                    last_out = held
+                    for _ in range(M):
+                        wq.put(held)
+                else:
+                    for j in range(M):
+                        last_out = to_bytes(model.inference(I0, I1, reuse, (2 * j + 1) / (2 * M)))
+                        wq.put(last_out)
         prev, I0 = cur, I1
         i += 1
         k += 1
         if k % 10 == 0:
             sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
-    wq.put(prev)
+    # Closing slot for the last source frame (i is now its index): its own time interval [i, i+1),
+    # which has no frame after it to interpolate toward. Hold the last generated frame across it so
+    # the output covers the full source duration and lands on exactly multi*frames (true doubling,
+    # the target fps behaviour Topaz uses) instead of stopping one slot short. It is held, so it
+    # stays soft and does not pop. A single decoded frame has no pair at all, so it just passes through.
+    if last_out is None:
+        wq.put(prev)
+    else:
+        tail = (math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)) if FPS_MODE else args.multi
+        for _ in range(tail):
+            wq.put(last_out)
 finally:
     wq.put(None)            # sentinel: let the writer drain its queue and exit
     wt.join()
