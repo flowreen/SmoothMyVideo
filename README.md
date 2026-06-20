@@ -11,7 +11,7 @@ RIFE refiner, plus MetricNet, FeatureNet, FusionNet and softsplat warping. It pr
 clean interpolated frames where the older NVIDIA optical flow path (FRUC) tore at high
 multipliers.
 
-## Status (2026-06-19)
+## Status (2026-06-20)
 
 Working end to end and verified on real clips. The packaged build is now fully self
 contained: a recipient extracts the zip and runs `SmoothMyVideo.exe` with no Python, no
@@ -34,6 +34,11 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   fp32 path. The TensorRT backend is the default when available (about another 2.2x on top,
   built and cached per resolution on first run) and falls back automatically to the eager
   pipeline when TensorRT is unavailable. See Performance below.
+- Quality and throughput refinements: generated frames are kept sharp (the model's multiple
+  of 64 size requirement is met by padding, not resizing, and the output is rounded to nearest
+  rather than truncated), byte exact duplicate source frames are held instead of interpolated
+  (anime is drawn on twos), and the ffmpeg decode and encode run on background reader and
+  writer threads so pipe I/O overlaps GPU work.
 - Bundled: a relocatable Python 3.14 runtime (torch cu128 + cupy) at `engine/runtime`,
   and a static ffmpeg (NVENC plus a CPU SVT-AV1 fallback) at `engine/bin`. Both ship inside
   the zip; the app uses neither system Python nor system ffmpeg.
@@ -65,7 +70,11 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   probed source and always targeting visually lossless (see Passthrough quality). Runs the
   TensorRT backend by default (per-subnet eager fallback; `--no-trt` forces eager) and NVENC
   with an automatic CPU SVT-AV1 fallback. Always fp16; takes an integer `<multi>` or
-  `--fps TARGET` for an arbitrary resampled output fps. Prints `PROGRESS k/total` to
+  `--fps TARGET` for an arbitrary resampled output fps. To keep generated frames sharp it pads
+  each frame to the multiple of 64 the model needs (rather than resizing, which resamples every
+  pixel) and rounds the output to nearest instead of truncating; it also holds byte exact
+  duplicate source frames instead of interpolating them, and runs the ffmpeg decode and encode
+  on background reader and writer threads so pipe I/O overlaps GPU work. Prints `PROGRESS k/total` to
   stderr. Resolves `ffmpeg`/`ffprobe` from `engine/bin` first and falls back to PATH
   (`_tool()`). `_add_cuda_dll_dirs()` puts the nvidia wheel bin dirs on the Windows DLL
   search before the model imports so cupy can JIT its kernel.
@@ -159,13 +168,23 @@ resolution (a few minutes) and are cached, so later runs at that resolution star
 They are specific to the GPU, the resolution, and the TensorRT version, and rebuild on a
 different machine. Any engine that fails to build falls back to eager, so the app never breaks.
 
-Tried and not viable on this machine: `torch.compile` (its inductor backend needs
-Triton plus MSVC, neither installed); and **dynamic shape** TensorRT engines (one engine
-covering a range of resolutions via a `min`/`opt`/`max` profile). The latter fails because
-GMFlow and IFNet warp with `grid_sample`, which the dynamo ONNX exporter routes through
-`cudnn_grid_sampler` with no ONNX translation on the dynamic path (the static export
-handles it fine). Dynamic engines are also documented as somewhat slower with more VRAM,
-so static per resolution engines, built on first use and cached, are the right call.
+`torch.compile` was tried and dropped. Its inductor backend needs Triton plus MSVC;
+Triton is a pip wheel that would bundle fine, but the path is deliberately not bundled,
+for two reasons. First, inductor compiles just in time, on the first call on whatever
+machine runs it, so MSVC would have to ship and work on every recipient's PC, breaking the
+"only the NVIDIA driver is assumed" promise (MSVC is also not cleanly redistributable and
+would add multiple GB to an already large zip). Second, it would only duplicate the
+TensorRT backend, which already fuses these same nets at about 2.2x and serializes to a
+portable cached engine, so there is no clear win for this model class. Compiling from
+Dynamo/FX would sidestep the grid_sample ONNX issue below and avoid per resolution builds,
+but neither is worth shipping a compiler to every machine.
+
+**Dynamic shape** TensorRT engines (one engine covering a range of resolutions via a
+`min`/`opt`/`max` profile) were also tried. They fail because GMFlow and IFNet warp with
+`grid_sample`, which the dynamo ONNX exporter routes through `cudnn_grid_sampler` with no
+ONNX translation on the dynamic path (the static export handles it fine). Dynamic engines
+are also documented as somewhat slower with more VRAM, so static per resolution engines,
+built on first use and cached, are the right call.
 
 ## Benchmark vs other GMFSS engines (2026-06-19)
 Compared SmoothMyVideo against the three repos it draws from, to find per frame speedups
@@ -260,34 +279,37 @@ For whoever picks this up.
   A forward/backward flow consistency or warp error check separates the two cleanly and reuses
   work already done. enhancr leans on VapourSynth misc.SCDetect, a plain frame difference
   detector that has exactly this pan false positive, so this is a place to do better than it.
-- **Duplicate frame handling for anime.** GMFSS targets anime, which is drawn on twos and
-  threes, so many consecutive source frames are identical. Running inference on an identical
-  pair is wasted compute and can make the flow model shimmer on degenerate input; detecting
-  the duplicate and repeating the frame avoids both. A cheap downscaled frame difference covers
-  this and the cut signal above with one metric (very high means cut, near zero means duplicate,
-  in between means interpolate). This cheap skip is not a full de judder: truly smoothing on
-  twos motion needs duplicate removal plus retiming so the real motion is spread evenly to the
-  target fps, which is a larger feature worth its own pass.
-- **Sharper generated frames.** The blur in interpolated frames has two parts with different
-  fixes. The free one: the engine makes dimensions divisible by 64 by resizing the whole frame
-  up a fraction and back with bilinear (`to_tensor` and `to_bytes`), which resamples every pixel.
-  Padding to the next multiple of 64 with `F.pad`, running the model, then cropping back resamples
-  none of the real content and is strictly sharper. All three GMFSS scripts (this one, Fortuna's
-  `inference_video.py`, enhancr) resize, so this is a known better technique none of them wired
-  up; Fortuna even ships an unused `pad_image` function that hints at the intent. The effect is
-  subtle (about a one percent stretch at 1080p), free, and never worse. The blur people actually
-  notice is motion ghosting at fast motion and occlusions, a flow accuracy problem: try the
+- **Duplicate frame handling for anime (exact case done).** GMFSS targets anime, which is drawn
+  on twos and threes, so many consecutive source frames are identical. The engine now detects a
+  byte exact duplicate pair and holds the frame instead of interpolating, skipping the wasted
+  compute and the shimmer GMFSS can add on identical input (measured: 1 of 24 pairs in the sample
+  clip, with the next nearest pair an order of magnitude away in mean difference, so exact match
+  has no false positives). Still open: catch near duplicates too with a small downscaled frame
+  difference threshold rather than exact equality, which also feeds the cut signal above (very
+  high means cut, near zero means duplicate, in between means interpolate). Even so this cheap
+  skip is not a full de judder: truly smoothing on twos motion needs duplicate removal plus
+  retiming so the real motion is spread evenly to the target fps, a larger feature worth its own pass.
+- **Sharper generated frames (free half done).** The free half is fixed: `to_tensor` and
+  `to_bytes` now pad to the next multiple of 64 the model needs and crop the padding back,
+  instead of resizing the whole frame up a fraction and back with bilinear. No real pixel is
+  resampled any more, so the frames are strictly sharper at no cost (replicate padding keeps the
+  flow net from tracking a hard edge). All three GMFSS scripts (this one, Fortuna's
+  `inference_video.py`, enhancr) resized, so this was a known better technique none of them wired
+  up. The blur that remains is motion ghosting at fast motion and occlusions, a flow accuracy
+  problem: try the
   AnimeRun anime optical flow fine tune of the Fortuna weights (enhancr exposes it as GMFSS
   Fortuna Union, model 1) as a drop in weight swap for less ghosting on anime, and let the scene
   detection and dedup items stop the model interpolating where the flow is meaningless. The heavy
   option, used in enhancr, is to chain a restoration or upscaling model (RealESRGAN, SCUNet) after
   interpolation to re sharpen, at the cost of a second model per frame. The `scale` flag is
   already at its sharp maximum (1.0); lowering it is what blurs.
-- **Overlapped decode, inference and encode.** The loop reads one frame, interpolates, then
-  writes, all on one thread, so the GPU stalls during pipe I/O. GMFSS_Fortuna's own
-  inference_video.py runs a reader thread and a writer thread feeding bounded queues; porting
-  that pattern plus non_blocking host to device copies overlaps ffmpeg I/O with GPU work for a
-  throughput gain on top of fp16, cupy and TensorRT.
+- **Overlapped decode, inference and encode (done).** Decode and encode now run on background
+  reader and writer threads fed by bounded FIFO queues, so ffmpeg input and output pipe I/O
+  overlap the next frame's GPU work instead of stalling a single thread (one reader and one
+  writer preserve frame order, so the output is unchanged; the bounds apply backpressure rather
+  than growing memory, and a failed encode write is surfaced as a nonzero exit). This matches the
+  reader plus writer pattern in GMFSS_Fortuna's own inference_video.py. The one remaining piece is
+  non_blocking host to device copies (the to_tensor upload is still synchronous), a minor gain on top.
 - **Batch queue.** Process several files (or a folder) unattended, one after another. Pure UI
   work in the renderer and main process, no engine change.
 - **Optional smaller items.** Add a live preview of the frame being written. (Encoding is now

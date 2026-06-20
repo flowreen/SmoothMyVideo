@@ -21,6 +21,8 @@ import math
 import json
 import argparse
 import subprocess
+import threading
+import queue
 import numpy as np
 import torch
 from torch.nn import functional as F
@@ -172,11 +174,19 @@ def amp():
 def to_tensor(buf):
     a = np.frombuffer(buf, NP_DT).reshape(H, W, 3)
     t = torch.from_numpy(a.transpose(2, 0, 1).copy()).to(device).unsqueeze(0).float() / MAXV
-    return F.interpolate(t, (ph, pw), mode="bilinear", align_corners=False)
+    # Reach the multiple of 64 the model needs by padding the bottom/right edge, not by
+    # resizing the whole frame up and back. A bilinear resize (the old path here and in
+    # to_bytes) resamples every pixel and softens the entire image; padding then cropping
+    # leaves all real content bit-untouched, so the generated frames are strictly sharper.
+    # replicate (vs zero) extends the edge smoothly so the flow net has no hard border to track.
+    return F.pad(t, (0, pw - W, 0, ph - H), mode="replicate")
 
 def to_bytes(t):
-    t = F.interpolate(t.float(), (H, W), mode="bilinear", align_corners=False)
-    a = (t[0] * MAXV).clamp(0, MAXV).cpu().numpy().transpose(1, 2, 0)
+    t = t.float()[..., :H, :W]            # crop off the padding added in to_tensor
+    # Round to nearest, not truncate: numpy's float->uint cast floors, which biases every
+    # interpolated frame ~0.5 LSB low against the byte-exact source frames it is interleaved
+    # with, a structured source-vs-tween brightness step. Rounding removes that bias.
+    a = (t[0] * MAXV).round().clamp(0, MAXV).cpu().numpy().transpose(1, 2, 0)
     return a.astype(NP_DT).tobytes()
 
 def make_inference(I0, I1, reuse, n):
@@ -285,46 +295,100 @@ enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
 sys.stderr.write(f"encode: {venc} visually-lossless -> {out_pix}  "
                  f"(source {SRC_CODEC or '?'} {SRC_BITS}bit {SRC_PIX})\n"); sys.stderr.flush()
 
+# Encode on a background thread so ffmpeg writes overlap the next frame's GPU work instead of
+# stalling the single pipe. One writer pulling a bounded FIFO preserves frame order, so the
+# output bytes are exactly what the serial path produced; the bound caps buffered frames so a
+# slow encoder applies backpressure rather than growing memory. On a write failure the writer
+# keeps draining (so the producer never blocks on a full queue) and the error is surfaced after join.
+wq = queue.Queue(maxsize=8)
+_werr = []
+def _writer():
+    while True:
+        buf = wq.get()
+        if buf is None:
+            break
+        if _werr:
+            continue
+        try:
+            enc.stdin.write(buf)
+        except Exception as e:  # noqa: BLE001
+            _werr.append(e)
+wt = threading.Thread(target=_writer, daemon=True)
+wt.start()
+
+# Symmetrically, read the decode pipe on its own thread into a bounded queue so the next frame
+# is prefetched while the GPU works the current one. Frames stay ordered (one reader, FIFO);
+# the bound caps prefetch so a fast decoder applies backpressure. EOF is signalled by None.
+rq = queue.Queue(maxsize=8)
+def _reader():
+    try:
+        while True:
+            buf = read_exact(dec.stdout, fsize)
+            rq.put(buf)
+            if buf is None:
+                break
+    except Exception:  # noqa: BLE001 - pipe closed during shutdown, stop quietly
+        pass
+rt = threading.Thread(target=_reader, daemon=True)
+rt.start()
+
 n = args.multi - 1
-prev = read_exact(dec.stdout, fsize)
+prev = rq.get()
 if prev is None:
     sys.exit("no frames decoded")
 I0 = to_tensor(prev)
 k = 0
 i = 0
+dups = 0
 try:
     while True:
-        cur = read_exact(dec.stdout, fsize)
+        cur = rq.get()
         if cur is None:
             break
         I1 = to_tensor(cur)
+        # Exact duplicate source frames (anime is drawn on twos/threes, so held cels decode
+        # byte-identically) need no interpolation: the correct tween of a still is the still
+        # itself. Holding the frame skips the wasted flow+inference and the shimmer GMFSS can
+        # add when fed two identical frames. The bytes compare short-circuits, so it is ~free
+        # on real motion.
+        dup = cur == prev
+        if dup:
+            dups += 1
         if FPS_MODE:
             # emit the output frames whose time falls in [i, i+1) source-frame units
             fracs = [j / ratio - i for j in range(math.ceil(i * ratio), math.ceil((i + 1) * ratio))]
             need = any(fr > 1e-6 for fr in fracs)
             with amp():
-                reuse = model.reuse(I0, I1, scale) if need else None
+                reuse = model.reuse(I0, I1, scale) if (need and not dup) else None
                 for fr in fracs:
-                    if fr <= 1e-6:
-                        enc.stdin.write(prev)            # coincides with source frame i
+                    if dup or fr <= 1e-6:
+                        wq.put(prev)            # held frame, or coincides with source i
                     else:
-                        enc.stdin.write(to_bytes(model.inference(I0, I1, reuse, fr)))
+                        wq.put(to_bytes(model.inference(I0, I1, reuse, fr)))
         else:
-            with amp():
-                reuse = model.reuse(I0, I1, scale)
-                mids = make_inference(I0, I1, reuse, n)
-            enc.stdin.write(prev)
-            for m in mids:
-                enc.stdin.write(to_bytes(m))
+            wq.put(prev)
+            if dup:
+                for _ in range(n):
+                    wq.put(prev)
+            else:
+                with amp():
+                    reuse = model.reuse(I0, I1, scale)
+                    mids = make_inference(I0, I1, reuse, n)
+                for m in mids:
+                    wq.put(to_bytes(m))
         prev, I0 = cur, I1
         i += 1
         k += 1
         if k % 10 == 0:
             sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
-    enc.stdin.write(prev)
+    wq.put(prev)
 finally:
+    wq.put(None)            # sentinel: let the writer drain its queue and exit
+    wt.join()
     enc.stdin.close()
     dec.stdout.close()
     enc.wait()
     dec.wait()
-sys.stderr.write(f"done {k} pairs -> {out_path}\n")
+if _werr:
+    raise _werr[0]          # surface a failed encode pipe as a nonzero exit
+sys.stderr.write(f"done {k} pairs ({dups} held as duplicates) -> {out_path}\n")
