@@ -82,9 +82,69 @@
       </span>
       <span class="hint">sharpens for a crisper picture</span>
     </div>
+    <div class="row">
+      <span class="k">Upscale to</span>
+      <select id="upres">
+        <option value="0">Off (keep source resolution)</option>
+        <option value="screen">Match screen</option>
+        <option value="1080">1080p &middot; Full HD</option>
+        <option value="1440">1440p &middot; 2K</option>
+        <option value="2160">2160p &middot; 4K</option>
+        <option value="4320">4320p &middot; 8K</option>
+        <option value="custom">Custom height&hellip;</option>
+      </select>
+      <span id="upcustomwrap" style="display:none;align-items:center;gap:8px;">
+        <input id="upcustom" type="range" min="720" max="4320" step="2" value="2160"
+               style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
+        <span class="v" id="upcustomnum">2160p</span>
+      </span>
+      <span class="v hint" id="upinfo"></span>
+    </div>
     <div class="row"><span class="k">Saves to</span>
       <button id="changeout" class="mini" disabled>Change...</button>
       <span class="v hint" id="out"></span></div>
+  </div>
+
+  <div class="panel" id="rtxpanel">
+    <div class="row" style="margin-bottom:2px">
+      <span class="k">NVIDIA RTX</span>
+      <span class="hint">Opt-in, off by default. Uses NVIDIA's own RTX Video models (one-time download).</span>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;accent-color:var(--green);">
+        RTX Video Super Resolution <span class="hint">(AI for the upscale above)</span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="rtxhdr" style="width:auto;padding:0;accent-color:var(--green);">
+        RTX HDR <span class="hint">(convert SDR video to HDR)</span>
+      </label>
+    </div>
+    <div class="row" id="hdrnitswrap" style="display:none">
+      <span class="k"></span>
+      <span class="hint">Peak brightness</span>
+      <input id="hdrnits" type="range" min="400" max="2000" step="100" value="1000"
+             style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
+      <span class="v" id="hdrnitsnum">1000 nits</span>
+      <span class="hint">how bright HDR highlights can get</span>
+    </div>
+    <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px">
+        <span id="rtxstatus" class="v">checking...</span>
+        <button id="rtxrecheck" class="mini">Re-check</button>
+      </div>
+      <div class="hint" id="rtxsteps" style="line-height:1.6;margin-bottom:8px"></div>
+      <div class="row" style="flex-wrap:wrap;gap:6px">
+        <button id="rtxget" class="mini">Get from NVIDIA</button>
+        <button id="rtxinstall" class="mini">Install runtime</button>
+        <button id="rtxbrowsedir" class="mini">Choose folder&hellip;</button>
+        <button id="rtxbrowsezip" class="mini">Choose .zip&hellip;</button>
+      </div>
+    </div>
   </div>
 
   <div class="row">
@@ -135,7 +195,10 @@ function outRatio(){ if(!interpOn()) return 1;
   return useFps ? targetFps()/srcFps() : (+$('multi').value); }
 function syncFpsField(){ if(info) $('fpsin').value = Math.round(srcFps()*(+$('multi').value)); }
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
-  return interpOn() ? (b + '_' + Math.round(targetFps()) + 'fps.mp4') : (b + '_sharpened.mp4'); }
+  const d = upDims();                                   // upscale target ({w,h} or null); tag the new height
+  const res = d ? '_' + d.h + 'p' : '';
+  return interpOn() ? (b + '_' + Math.round(targetFps()) + 'fps' + res + '.mp4')
+                    : (b + (d ? res : '_sharpened') + '.mp4'); }
 function refresh(){ if(!input) return;
   const t = targetFps();
   if(!fpsValid(t)){ $('out').textContent = 'enter an output fps between 1 and 1000'; lastOut = null; return; }
@@ -158,6 +221,7 @@ async function loadVideo(f){
   $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true;
   $('status').textContent = 'Ready. Pick a multiplier or fps, then click Smooth It!';
   applyScreenFps();      // re-asserts the interp / screen-rate state and recomputes the output name
+  syncUpscale();         // recompute the upscale target + output dims for this video's resolution
 }
 $('pick').onclick = async () => { await loadVideo(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
 $('multi').onchange = () => { localStorage.setItem('multi', $('multi').value); useFps = false; syncFpsField(); refresh(); };
@@ -207,6 +271,112 @@ ipcRenderer.invoke('refresh-rate').then(hz => {
   if($('screenfps').checked) applyScreenFps();
 });
 
+// Upscale-to-resolution: a target height chosen from the dropdown (or the Custom slider) drives an
+// arbitrary upscale factor (targetHeight / sourceHeight), keeping the source aspect ratio. RTX VSR
+// (the #rtxvsr toggle, once its runtime is installed) does the upscale with NVIDIA AI; with it off or
+// absent the engine uses a bicubic resize. Off by default; the choice persists. Independent of
+// interpolation, so it also applies in sharpen-only mode. There is no integer-scale restriction (RTX
+// VSR was probed clean past 8K), so any target up to the 8K option is allowed.
+let screenW = 0, screenH = 0, rtxReady = { vsr:false, hdr:false, bridge:false };
+function upTargetH(){                            // chosen output height (0 = off)
+  const v = $('upres').value;
+  if(v === '0') return 0;
+  if(v === 'screen') return screenH || 0;
+  if(v === 'custom') return +$('upcustom').value || 0;
+  return +v || 0;
+}
+function upDims(){                               // {w,h} of the upscaled output, or null when not upscaling
+  if(!info || !info.h || !info.w) return null;
+  const th = upTargetH();
+  if(!th || th <= info.h) return null;          // upscale only; a target at/below the source is a no-op
+  const h = th - (th % 2);
+  const w = Math.round(info.w * h / info.h); return { w: w - (w % 2), h };
+}
+function upFactor(){ const d = upDims(); return d ? d.h / info.h : 0; }   // arbitrary factor (0 = off)
+function upBackendName(){ return ($('rtxvsr').checked && rtxReady.vsr) ? 'RTX VSR' : 'bicubic'; }
+function syncUpscale(){
+  $('upcustomwrap').style.display = $('upres').value === 'custom' ? 'inline-flex' : 'none';
+  $('upcustomnum').textContent = (+$('upcustom').value) + 'p';
+  let txt = '';
+  if($('upres').value !== '0'){
+    const d = upDims();
+    if(d) txt = '→ ' + d.w + ' × ' + d.h + '  ·  ' + upBackendName()
+                + (upBackendName() === 'bicubic' ? ' (turn on RTX VSR for AI)' : '');
+    else if(info) txt = 'source is already at/above that height — no upscale';
+    else txt = 'load a video to preview the result';
+  }
+  $('upinfo').textContent = txt;
+  refresh();             // the target height is tagged into the output filename
+}
+function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.value === 'screen');
+  if(o) o.textContent = 'Match screen' + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
+const savedUpres = localStorage.getItem('upres');
+if(savedUpres && [...$('upres').options].some(o => o.value === savedUpres)) $('upres').value = savedUpres;
+const savedUpcustom = localStorage.getItem('upcustom'); if(savedUpcustom) $('upcustom').value = savedUpcustom;
+$('upres').onchange = () => { localStorage.setItem('upres', $('upres').value); syncUpscale(); };
+$('upcustom').oninput = () => { localStorage.setItem('upcustom', $('upcustom').value); syncUpscale(); };
+ipcRenderer.invoke('screen-size').then(s => { screenW = (s&&s.width)||0; screenH = (s&&s.height)||0; setScreenOptLabel(); syncUpscale(); });
+
+// NVIDIA RTX (opt-in): real RTX Video Super Resolution + RTX HDR via the engine/rtxvideo CUDA bridge
+// + NVIDIA's feature DLLs. Both OFF by default. The feature DLLs are non-redistributable, so the app
+// can't bundle them; instead it auto-detects a downloaded RTX Video SDK and copies the two DLLs into
+// engine/rtxvideo for you (one click). Readiness = the bridge + the feature's model DLL present.
+let rtxScan = { folder:null, zip:null };
+function syncRtx(){
+  const on = $('rtxvsr').checked || $('rtxhdr').checked;
+  $('rtxsetup').style.display = on ? 'block' : 'none';
+  $('hdrnitswrap').style.display = $('rtxhdr').checked ? 'flex' : 'none';
+  if(on) checkRtxReady();
+}
+async function checkRtxReady(){
+  $('rtxstatus').textContent = 'checking...'; $('rtxstatus').style.color = 'var(--sub)';
+  try { rtxReady = await ipcRenderer.invoke('rtx-ready'); } catch { rtxReady = { vsr:false, hdr:false, bridge:false }; }
+  try { rtxScan = await ipcRenderer.invoke('rtx-scan'); } catch { rtxScan = { folder:null, zip:null }; }
+  const needVsr = $('rtxvsr').checked, needHdr = $('rtxhdr').checked;
+  const ok = (!needVsr || rtxReady.vsr) && (!needHdr || rtxReady.hdr);
+  const lines = [];
+  if(needVsr) lines.push((rtxReady.vsr ? '✓' : '✗') + ' RTX Video Super Resolution');
+  if(needHdr) lines.push((rtxReady.hdr ? '✓' : '✗') + ' RTX HDR');
+  if(ok){
+    $('rtxstatus').textContent = '✓ READY'; $('rtxstatus').style.color = 'var(--green)';
+    $('rtxsteps').innerHTML = lines.join('<br>') + '<br>The RTX Video runtime is installed.';
+  } else {
+    $('rtxstatus').textContent = '✗ NOT READY'; $('rtxstatus').style.color = '#e85c5c';
+    const found = rtxScan.folder || rtxScan.zip;
+    const detail = found
+      ? 'Found an RTX Video SDK at:<br><span class="v">' + found + '</span><br>Click <b>Install runtime</b> to finish.'
+      : 'Click <b>Get from NVIDIA</b> to download the RTX Video SDK in your browser, then <b>Install runtime</b> — it finds the download and copies the files into place automatically.';
+    $('rtxsteps').innerHTML = lines.join('<br>') + '<br>' + detail;
+  }
+  $('rtxinstall').disabled = false;
+  syncUpscale();         // the upscale backend label depends on VSR readiness
+}
+async function doInstall(source){
+  $('rtxstatus').textContent = 'installing...'; $('rtxstatus').style.color = 'var(--sub)';
+  $('rtxinstall').disabled = true;
+  let r = {}; try { r = await ipcRenderer.invoke('rtx-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
+  if(!r.ok) $('rtxsteps').innerHTML = '✗ ' + (r.error || 'install failed')
+      + '<br>Use <b>Choose folder…</b> or <b>Choose .zip…</b> to point at the downloaded SDK.';
+  await checkRtxReady();
+}
+$('rtxget').onclick = () => ipcRenderer.invoke('rtx-open-download');
+$('rtxinstall').onclick = () => doInstall();                                   // auto-detect the SDK
+$('rtxbrowsedir').onclick = async () => { const p = await ipcRenderer.invoke('rtx-choose','dir'); if(p) doInstall(p); };
+$('rtxbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('rtx-choose','zip'); if(p) doInstall(p); };
+$('rtxrecheck').onclick = checkRtxReady;
+// HDR peak luminance (nits): persists; the row shows only when RTX HDR is on.
+const savedNits = localStorage.getItem('hdrNits'); if(savedNits) $('hdrnits').value = savedNits;
+function syncHdrNits(){ $('hdrnitsnum').textContent = (+$('hdrnits').value) + ' nits'; }
+$('hdrnits').oninput = () => { localStorage.setItem('hdrNits', $('hdrnits').value); syncHdrNits(); };
+syncHdrNits();
+if(localStorage.getItem('rtxvsrOn') === '1') $('rtxvsr').checked = true;   // default OFF
+if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // default OFF
+$('rtxvsr').onchange = () => { localStorage.setItem('rtxvsrOn', $('rtxvsr').checked ? '1' : '0'); syncRtx(); syncUpscale(); };
+$('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); };
+syncRtx();
+// Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
+ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); });
+
 // Interpolate: master toggle for GMFSS frame generation. Unchecked, the app only re-encodes the
 // video with the FSR sharpen applied (no in-between frames), so the multiplier, fps and screen-
 // rate controls are greyed, the output keeps the source frame rate, and the engine skips the
@@ -234,9 +404,14 @@ $('go').onclick = () => {
   const t = targetFps();
   if(!fpsValid(t)){ alert('Enter an output fps between 1 and 1000.'); return; }
   const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
-  // With interpolation off, the sharpen pass is the only effect; nothing to do if it is off too.
-  if(!interpOn() && sharpenStrength <= 0){
-    alert('Nothing to do: turn on Interpolate, or enable FSR sharpening (the only effect when interpolation is off).');
+  const dims = upDims();                               // upscale target ({w,h} or null)
+  const factor = upFactor();                           // arbitrary upscale factor (0 = off)
+  const useRtxVsr = factor > 0 && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale, else bicubic
+  const rtxhdr = $('rtxhdr').checked && rtxReady.hdr;  // HDR only when its runtime is installed
+  // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
+  // HDR is on. Bail only when nothing at all is enabled.
+  if(!interpOn() && sharpenStrength <= 0 && factor <= 0 && !rtxhdr){
+    alert('Nothing to do: turn on Interpolate, pick an Upscale resolution, enable FSR sharpening, or turn on RTX HDR (and install its runtime).');
     return;
   }
   procStart = 0; baseK = 0; etaAnchor = 0; etaAnchorTime = 0; lastFps = 0; curDone = 0; curPct = 0;
@@ -245,14 +420,24 @@ $('go').onclick = () => {
   const srcFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
   totalGen = Math.max(1, Math.round(srcFrames*fpp));   // total frames the conversion will output
   cancelled = false;
-  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
-  $('status').textContent = interpOn() ? 'Warming up the model...' : 'Sharpening...';
+  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrnits').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
+  // What this run does, for the status / log (mainly relevant when interpolation is off).
+  const passes = []; if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
+  const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
+  $('status').textContent = interpOn() ? 'Warming up the model...' : offLabel;
   $('fill').style.width = '0%';
-  $('frames').textContent = interpOn() ? 'Warming up (loading model, first frames)...' : 'Sharpening frames...';
-  log('>> '+input+'  ->  '+(interpOn() ? (Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')) : 'FSR sharpen only (no interpolation)')+'\n');
+  $('frames').textContent = interpOn() ? 'Warming up (loading model, first frames)...' : offLabel;
+  const what = interpOn() ? (Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')) : 'no interpolation';
+  const extra = (dims ? '  ·  '+(useRtxVsr ? 'RTX VSR' : 'bicubic')+' '+dims.w+'×'+dims.h : '')
+              + (rtxhdr ? '  ·  RTX HDR '+(+$('hdrnits').value)+' nits' : '')
+              + (sharpenStrength>0 ? '  ·  FSR '+sharpenStrength : '');
+  log('>> '+input+'  ->  '+what+extra+'\n');
   const payload = { input, multi:+$('multi').value, output: lastOut, interp: interpOn() };
   if(interpOn() && useFps) payload.fps = t;
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
+  if(factor > 0) payload.upscale = factor;             // arbitrary upscale factor (target height / source)
+  if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else bicubic)
+  if(rtxhdr){ payload.rtxhdr = true; payload.hdrNits = +$('hdrnits').value; }   // HDR10 + peak luminance
   ipcRenderer.send('run', payload);
 };
 $('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
@@ -300,7 +485,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
 });
 ipcRenderer.on('engine-done', (_e, code) => {
   clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('interp').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('interp').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=false; $('hdrnits').disabled=false; $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n'); }
   else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen+'  (100%)';

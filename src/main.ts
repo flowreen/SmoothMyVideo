@@ -1,7 +1,8 @@
-import { app, BrowserWindow, ipcMain, dialog, screen } from 'electron';
-import { spawn, execFile, ChildProcess } from 'child_process';
+import { app, BrowserWindow, ipcMain, dialog, screen, shell } from 'electron';
+import { spawn, execFile, execFileSync, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 
 const ROOT = path.join(__dirname, '..');
 // When packaged, the engine ships as an unpacked extraResource (the Python files and
@@ -77,9 +78,124 @@ ipcMain.handle('refresh-rate', () => {
   } catch { return 60; }
 });
 
+ipcMain.handle('screen-size', () => {
+  // Physical pixel resolution of the monitor the window is on (fallback: primary). display.size is
+  // in logical DIPs, so multiply by the scale factor to get the real panel resolution. Feeds the
+  // renderer's "RTX Video Super Resolution: upscale to screen" target.
+  try {
+    const d = win ? screen.getDisplayMatching(win.getBounds()) : screen.getPrimaryDisplay();
+    const f = d.scaleFactor || 1;
+    return { width: Math.round(d.size.width * f), height: Math.round(d.size.height * f) };
+  } catch { return { width: 0, height: 0 }; }
+});
+
+// --- RTX Video runtime: readiness + one-click install --------------------------------------------
+// The opt-in RTX features (VSR / TrueHDR) run through the compiled CUDA bridge (rtxvideo_cuda.dll,
+// which ships with the app) plus NVIDIA's two RTX Video feature DLLs. Those feature DLLs are NVIDIA
+// proprietary and NON-redistributable, so they are never bundled; the user downloads NVIDIA's RTX
+// Video SDK (a deliberate, EULA-gated action) and this app drops the two DLLs into engine/rtxvideo
+// for them. A feature is "ready" only when the bridge AND its feature DLL are present there.
+const RTX_DIR = path.join(ENGINE, 'rtxvideo');
+const RTX_FEATURE_DLLS = ['nvngx_vsr.dll', 'nvngx_truehdr.dll'];
+const RTX_SDK_URL = 'https://developer.nvidia.com/rtx-video-sdk';
+const SYS_TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+const fileExists = (p: string) => { try { return fs.existsSync(p); } catch { return false; } };
+
+// A directory "has the runtime" when both feature DLLs sit in it. The SDK keeps them under
+// bin/Windows/x64/rel, so probe the dir itself, that subpath, and one level of child dirs.
+function findFeatureDllDir(root: string): string | null {
+  if (!root) return null;
+  const rel = path.join('bin', 'Windows', 'x64', 'rel');
+  const hasBoth = (d: string) => RTX_FEATURE_DLLS.every((n) => fileExists(path.join(d, n)));
+  const seeds = [root, path.join(root, rel)];
+  try {
+    for (const e of fs.readdirSync(root, { withFileTypes: true }))
+      if (e.isDirectory()) seeds.push(path.join(root, e.name), path.join(root, e.name, rel));
+  } catch { /* unreadable root */ }
+  return seeds.find(hasBoth) || null;
+}
+
+// Look in the usual download spots for an extracted SDK folder or a recognizable SDK .zip.
+function scanForSdk(): { folder: string | null; zip: string | null } {
+  const roots: string[] = [];
+  for (const k of ['downloads', 'desktop', 'home'] as const) { try { roots.push(app.getPath(k)); } catch { /* none */ } }
+  let folder: string | null = null;
+  for (const r of roots) { folder = findFeatureDllDir(r); if (folder) break; }
+  let zip: string | null = null;
+  for (const r of roots) {
+    try {
+      const hit = fs.readdirSync(r, { withFileTypes: true })
+        .find((e) => e.isFile() && /\.zip$/i.test(e.name) && /rtx.*video.*sdk/i.test(e.name));
+      if (hit) { zip = path.join(r, hit.name); break; }
+    } catch { /* unreadable root */ }
+  }
+  return { folder, zip };
+}
+
+// Copy the two feature DLLs out of a chosen source (an extracted SDK folder or an SDK .zip) into
+// engine/rtxvideo. Zips are handled with Windows' bundled bsdtar, extracting only the two members.
+function installRtx(source: string): { ok: boolean; error?: string; copied: string[] } {
+  try { fs.mkdirSync(RTX_DIR, { recursive: true }); } catch { /* exists */ }
+  let srcFiles: string[] = [];
+  try {
+    if (/\.zip$/i.test(source)) {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'smv-rtx-'));
+      execFileSync(SYS_TAR, ['-xf', source, '-C', tmp, '*nvngx_vsr.dll', '*nvngx_truehdr.dll']);
+      const found: string[] = [];
+      const walk = (d: string) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p); else if (RTX_FEATURE_DLLS.includes(e.name)) found.push(p);
+      } };
+      walk(tmp);
+      srcFiles = found;
+    } else {
+      const dir = findFeatureDllDir(source) || (fileExists(path.join(source, RTX_FEATURE_DLLS[0])) ? source : null);
+      if (dir) srcFiles = RTX_FEATURE_DLLS.map((n) => path.join(dir, n));
+    }
+  } catch (e) { return { ok: false, error: String(e), copied: [] }; }
+  const present = srcFiles.filter(fileExists);
+  if (present.length < RTX_FEATURE_DLLS.length)
+    return { ok: false, error: 'nvngx_vsr.dll / nvngx_truehdr.dll not found in the selected RTX Video SDK', copied: [] };
+  const copied: string[] = [];
+  try {
+    for (const f of present) { fs.copyFileSync(f, path.join(RTX_DIR, path.basename(f))); copied.push(path.basename(f)); }
+  } catch (e) { return { ok: false, error: String(e), copied }; }
+  return { ok: true, copied };
+}
+
+ipcMain.handle('rtx-ready', () => {
+  const bridge = fileExists(path.join(RTX_DIR, 'rtxvideo_cuda.dll'));
+  return {
+    vsr: bridge && fileExists(path.join(RTX_DIR, 'nvngx_vsr.dll')),
+    hdr: bridge && fileExists(path.join(RTX_DIR, 'nvngx_truehdr.dll')),
+    bridge, dir: RTX_DIR,
+  };
+});
+
+ipcMain.handle('rtx-open-download', () => { shell.openExternal(RTX_SDK_URL); return true; });
+
+// Auto-detect a downloaded SDK so the renderer can offer a one-click install.
+ipcMain.handle('rtx-scan', () => scanForSdk());
+
+// Install from a given source, or auto-detect one when none is passed.
+ipcMain.handle('rtx-install', (_e, source?: string) => {
+  let src = source;
+  if (!src) { const s = scanForSdk(); src = s.folder || s.zip || undefined; }
+  if (!src) return { ok: false, error: 'No RTX Video SDK found in Downloads/Desktop. Use "Get from NVIDIA", then "Choose..."', copied: [] };
+  return installRtx(src);
+});
+
+// Manual picker fallback: a folder (extracted SDK) or a .zip.
+ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
+  const r = await dialog.showOpenDialog(win!, mode === 'dir'
+    ? { title: 'Select the extracted RTX Video SDK folder', properties: ['openDirectory'] }
+    : { title: 'Select the RTX Video SDK .zip', properties: ['openFile'], filters: [{ name: 'Zip', extensions: ['zip'] }] });
+  return r.canceled ? null : (r.filePaths[0] || null);
+});
+
 let current: ChildProcess | null = null;
 
-ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; interp?: boolean }) => {
+ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; interp?: boolean; upscale?: number; rtxvsr?: boolean; rtxhdr?: boolean; hdrNits?: number }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
   // Interpolation is the default; interp === false means the user only wants the sharpen pass,
   // so tell the engine to skip frame generation (and ignore any fps/multi) entirely.
@@ -88,6 +204,22 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
   // FSR-style RCAS sharpening strength (GUI checkbox + slider). 0/omitted = off, leaving the
   // frames value-preserving; >0 enables the in-engine RCAS pass. Works with or without interp.
   if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
+  // Upscale factor (an arbitrary float, source height -> chosen target height), computed by the
+  // renderer from the resolution selector. >1 enables the upscale pass. Without --rtx-vsr this is a
+  // bicubic resize; with it, RTX Video Super Resolution (any target resolution, no integer-scale
+  // limit), which the engine degrades to bicubic if the RTX runtime is absent.
+  if (opts.upscale && opts.upscale > 1) args.push('--upscale', String(opts.upscale));
+  // RTX VSR: use the real RTX Video SDK (the engine/rtxvideo CUDA bridge) for the upscale step.
+  // Only meaningful alongside --upscale (it supplies the target resolution). Falls back to bicubic
+  // if the bridge or RTX Video runtime is unavailable.
+  if (opts.rtxvsr && opts.upscale && opts.upscale > 1) args.push('--rtx-vsr');
+  // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
+  // on, the RTX bridge does VSR then TrueHDR in one pass). --hdr-nits sets the HDR peak luminance
+  // (400..2000). The engine falls back to an SDR render if the bridge is unavailable.
+  if (opts.rtxhdr) {
+    args.push('--rtx-hdr');
+    if (opts.hdrNits && opts.hdrNits > 0) args.push('--hdr-nits', String(opts.hdrNits));
+  }
   // PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from crashing the engine
   // during first-run TRT builds; SMV_TRT_CACHE is a guaranteed writable cache location.
   const env = { ...process.env, PYTHONUTF8: '1',

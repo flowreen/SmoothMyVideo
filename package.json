@@ -28,7 +28,8 @@
         "to": "engine",
         "filter": ["**/*", "!**/__pycache__/**", "!GMFSS_Fortuna/vid_out/**", "!.venv/**",
           "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine",
-          "!trt_poc.py", "!trt_poc_gmflow.py", "!trt_integration_test.py", "!trt_dynamic_test.py"]
+          "!trt_poc.py", "!trt_poc_gmflow.py", "!trt_integration_test.py", "!trt_dynamic_test.py",
+          "!rtxvideo/*.dll", "!rtxvideo/build_src/**"]
       }
     ],
     "win": { "target": "zip", "icon": "icon.ico" }

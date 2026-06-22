@@ -34,12 +34,18 @@ time slot, which has no frame after it to interpolate toward, is filled by holdi
 generated frame. Duration therefore matches the source.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
-       [--sharpen S] [--no-interp]
+       [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
        --no-interp skips interpolation entirely: the clip is only re-encoded at its source fps
        with --sharpen applied, for users who just want the sharpening and not the smoothing.
+       --upscale F spatially upscales every output frame before encode by an arbitrary factor
+       (1.0 = off). With --rtx-vsr it runs NVIDIA RTX Video Super Resolution (real AI SR, any
+       target resolution); otherwise a high-quality bicubic resize. Decode and interpolation
+       stay at the source resolution.
+       --rtx-hdr converts the output to HDR10 via the RTX Video TrueHDR model; --hdr-nits sets the
+       HDR peak luminance (400..2000, default 1000).
 """
 import os
 import sys
@@ -53,10 +59,11 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GMFSS_Fortuna")
+ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.join(ENGINE_DIR, "GMFSS_Fortuna")
 # Prefer ffmpeg/ffprobe bundled at engine/bin so a packaged build needs no system
 # ffmpeg on PATH; fall back to the bare PATH names for dev.
-_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+_BIN = os.path.join(ENGINE_DIR, "bin")
 def _tool(name):
     exe = os.path.join(_BIN, name + ".exe")
     return exe if os.path.isfile(exe) else name
@@ -79,11 +86,36 @@ ap.add_argument("--sharpen", type=float, nargs="?", const=0.8, default=0.0,
 ap.add_argument("--no-interp", action="store_true",
                 help="skip GMFSS interpolation: only re-encode at the source fps with --sharpen "
                      "applied (sharpening without smoothing). The model and TRT are never loaded.")
+ap.add_argument("--upscale", type=float, nargs="?", const=1.5, default=1.0,
+                help="spatially upscale every output frame before encode by this factor (1.0 = off, "
+                     "the default; a bare --upscale uses 1.5). With --rtx-vsr this is RTX Video "
+                     "Super Resolution (AI, any target resolution), otherwise a bicubic resize. "
+                     "Decode and interpolation stay at the source resolution.")
+ap.add_argument("--rtx-vsr", action="store_true",
+                help="use the NVIDIA RTX Video SDK (real RTX VSR) for the --upscale step. Requires "
+                     "--upscale and the engine/rtxvideo bridge + feature DLLs; falls back to "
+                     "bicubic if unavailable.")
+ap.add_argument("--rtx-hdr", action="store_true",
+                help="convert the output to HDR10 with the RTX Video SDK TrueHDR model (SDR to HDR): "
+                     "10-bit BT.2020 PQ. Combines with --upscale (the RTX bridge does VSR then "
+                     "TrueHDR in one pass). Needs engine/rtxvideo; falls back to an SDR render if "
+                     "the bridge is unavailable.")
+ap.add_argument("--hdr-nits", type=int, default=1000,
+                help="HDR10 peak luminance in nits for --rtx-hdr (the TrueHDR MaxLuminance and the "
+                     "stream's mastering-display / MaxCLL metadata). Clamped to 400..2000; "
+                     "default 1000.")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
 SHARPEN = max(0.0, min(1.0, args.sharpen))   # CAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
+UPSCALE_F = max(1.0, min(8.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
+                                             # RTX VSR has no integer-scale limit (probed clean past
+                                             # 8K), so any factor is allowed up to an 8x sanity cap.
+UPSCALE = UPSCALE_F > 1.0
+RTX_VSR = args.rtx_vsr                        # use the RTX Video SDK (real RTX VSR) for --upscale
+RTX_HDR = args.rtx_hdr                         # convert the output to HDR10 via RTX Video TrueHDR
+HDR_NITS = max(400, min(2000, args.hdr_nits)) # HDR10 peak luminance (TrueHDR target + metadata)
 
 def probe(path):
     # JSON (not csv) so the extra color/format fields stay robust when any of them is
@@ -156,6 +188,16 @@ if TEN_BIT:
 else:
     DEC_FMT, NP_DT, MAXV, BPP = "rgb24", np.uint8, 255.0, 3
 fsize = W * H * BPP
+# Output spatial resolution. Decode and GMFSS interpolation stay at the source W x H; each finished
+# frame is upscaled to OUT_W x OUT_H just before encode (in to_bytes), so only the encoder input
+# size changes. RTX VSR upscales to any output rectangle (no integer-scale restriction), so the
+# requested factor is applied directly; both source dimensions scale by the same factor, so the
+# aspect ratio is preserved, and each is rounded down to an even number (required by yuv420p /
+# p010le). The bicubic fallback targets the same dims.
+if UPSCALE:
+    OUT_W, OUT_H = (round(W * UPSCALE_F) // 2) * 2, (round(H * UPSCALE_F) // 2) * 2
+else:
+    OUT_W, OUT_H = W, H
 total_pairs = max(1, NB - 1) if NB else 0
 # Progress denominator: interpolation steps over source pairs (NB-1); the sharpen-only pass
 # instead processes one unit per source frame (NB).
@@ -212,6 +254,45 @@ else:
             sys.stderr.write(f"[trt] unavailable, using eager pipeline: {repr(e)[:200]}\n")
             sys.stderr.flush()
 
+# Upscale / HDR backend, loaded once for this resolution, then run per frame. Independent of
+# NO_INTERP, so sharpen-only runs can also upscale or convert to HDR. The AI backend is the NVIDIA
+# RTX Video SDK (engine/rtxvideo bridges its CUDA path; see rtxvideo.py):
+#   _RTXVSR - RTX Video Super Resolution, used when --rtx-vsr is given (the GUI "RTX Video Super
+#             Resolution" toggle). When it is absent, _upscale() falls back to bicubic.
+#   _RTXHDR - RTX TrueHDR (--rtx-hdr): SDR -> HDR10, optionally with VSR baked into the same eval.
+# Any setup failure leaves the object None and the render degrades gracefully (bicubic upscale, or
+# an SDR render), so a missing/blocked RTX runtime never breaks a render.
+_RTXVSR = None
+_RTXHDR = None
+# RTX HDR (TrueHDR): when on, the RTX bridge converts every output frame SDR -> HDR10, and when
+# upscaling is also requested it does VSR in the SAME eval (so the separate upscale path is
+# bypassed). The output is packed 10-bit BT.2020 PQ, which forces the HDR encode path below. A load
+# failure leaves _RTXHDR None and the render falls back to the normal SDR path + upscale backend.
+if RTX_HDR:
+    try:
+        sys.path.insert(0, ENGINE_DIR)
+        import rtxvideo
+        _RTXHDR = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=UPSCALE, hdr=True, hdr_max_nits=HDR_NITS)
+        _vsr_note = f" + VSR -> {OUT_W}x{OUT_H}" if UPSCALE else ""
+        sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits{_vsr_note}) HDR10 (BT.2020 PQ)\n")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[rtx] HDR unavailable, rendering SDR: {repr(e)[:200]}\n")
+        _RTXHDR = None
+    sys.stderr.flush()
+# Upscale backend, only when RTX HDR is not already handling the upscale (HDR off, or HDR failed to
+# load): RTX VSR when requested, else _upscale() uses bicubic.
+if UPSCALE and _RTXHDR is None and RTX_VSR:
+    try:
+        sys.path.insert(0, ENGINE_DIR)
+        import rtxvideo
+        _RTXVSR = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=True, vsr_quality=4)
+        sys.stderr.write(f"RTX Video Super Resolution ready (Ultra) -> {OUT_W}x{OUT_H}\n")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[rtx] VSR unavailable, using bicubic upscale: {repr(e)[:200]}\n")
+        _RTXVSR = None
+    sys.stderr.flush()
+HDR_ACTIVE = _RTXHDR is not None              # drives the 10-bit BT.2020 PQ encode path below
+
 scale = args.scale
 tmp = max(64, int(64 / scale))
 ph = ((H - 1) // tmp + 1) * tmp
@@ -267,10 +348,34 @@ def _rcas(img, con):
     lobe = lobe.clamp(max=0.0).clamp(min=-RCAS_LIMIT) * con * nz
     return ((e + lobe * (b + d + f + h)) / (1.0 + 4.0 * lobe)).clamp(0.0, 1.0)
 
+def _upscale(t, ow, oh):
+    """Spatially upscale a [1,3,H,W] RGB float image in [0,1] to (oh, ow), per output frame.
+
+    Uses RTX VSR (the RTX Video SDK, _RTXVSR) when it loaded (--rtx-vsr + the runtime present),
+    which outputs exactly (ow, oh); otherwise a high-quality bicubic resize. If VSR fails mid-run it
+    is dropped (set None) and the rest of the clip falls back to bicubic; bicubic is clamped because
+    it can overshoot past [0,1].
+    """
+    global _RTXVSR
+    if _RTXVSR is not None:
+        try:
+            return _RTXVSR.run_vsr(t)
+        except Exception as e:  # noqa: BLE001 - degrade to bicubic for the rest of the run
+            sys.stderr.write(f"[rtx] VSR run failed, using bicubic: {repr(e)[:160]}\n")
+            sys.stderr.flush()
+            _RTXVSR = None
+    return F.interpolate(t, size=(oh, ow), mode="bicubic", align_corners=False).clamp(0.0, 1.0)
+
 def to_bytes(t):
     t = t.float()[..., :H, :W]            # crop off the padding added in to_tensor
     if SHARPEN > 0:
         t = _rcas(t, SHARPEN)             # FSR-style RCAS sharpen (GUI "FSR" / --sharpen); see _rcas
+    if _RTXHDR is not None:
+        # RTX TrueHDR (with VSR baked in when upscaling): returns packed 10-bit BT.2020 PQ RGB
+        # (x2rgb10le) already at OUT_W x OUT_H, so it bypasses _upscale and the SDR quantise below.
+        return _RTXHDR.run_hdr(t)
+    if UPSCALE:
+        t = _upscale(t, OUT_W, OUT_H)     # spatial upscale to the target resolution; see _upscale
     # Round to nearest, not truncate: numpy's float->uint cast floors, which biases every frame
     # ~0.5 LSB low (a uniform darkening, and the wrong quantisation of the model output). Rounding
     # is the unbiased mapping back to integer samples; every emitted frame goes through here.
@@ -325,7 +430,8 @@ if not USE_NVENC:
 # Output pixel format: preserve 10 bit and 4:4:4 where the encoder allows it, otherwise the
 # standard 8 bit 4:2:0. NVENC takes 10 bit as p010le; SVT-AV1 wants planar yuv420p10le and
 # has no 4:4:4 path, so the fallback stays 4:2:0.
-if TEN_BIT:
+if HDR_ACTIVE or TEN_BIT:
+    # HDR10 (TrueHDR) is always 10-bit; a 10-bit source is also carried as 10-bit.
     out_pix = "p010le" if USE_NVENC else "yuv420p10le"
 elif CHROMA444 and venc in ("h264_nvenc", "hevc_nvenc"):
     out_pix = "yuv444p"
@@ -345,7 +451,7 @@ if USE_NVENC:
 else:
     qargs = ["-crf", "20", "-preset", "8"]
 
-prof = ["-profile:v", "main10"] if (TEN_BIT and venc == "hevc_nvenc") else []
+prof = ["-profile:v", "main10"] if ((TEN_BIT or HDR_ACTIVE) and venc == "hevc_nvenc") else []
 
 # Carry the source colour signalling through. NVENC ignores the bare -color_* output flags
 # for transfer/primaries (verified: only matrix and range stick), which would strip HDR
@@ -353,15 +459,24 @@ prof = ["-profile:v", "main10"] if (TEN_BIT and venc == "hevc_nvenc") else []
 # conversion, and the -color_* flags are kept too so the mp4 'colr' atom is written. This
 # also makes the RGB -> YUV conversion use the source matrix instead of swscale's guess.
 # The values come straight from ffprobe of this same ffmpeg, so they are valid filter input.
-sp, color = [], []
-for sp_opt, flag, key in (("range", "-color_range", "color_range"),
-                          ("colorspace", "-colorspace", "color_space"),
-                          ("color_trc", "-color_trc", "color_transfer"),
-                          ("color_primaries", "-color_primaries", "color_primaries")):
-    v = _tag(key)
-    if v:
-        sp.append(f"{sp_opt}={v}")
-        color += [flag, v]
+if HDR_ACTIVE:
+    # TrueHDR output is full-range BT.2020 PQ RGB10 (x2bgr10le). Force HDR10 signalling regardless of
+    # the source: stamp BT.2020 / PQ (smpte2084) and convert to limited-range BT.2020 YUV (the matrix
+    # is applied to the PQ-encoded signal as-is, no tone map), the same setparams-before-format idiom
+    # the SDR path uses to carry an HDR source through.
+    sp = ["range=tv", "colorspace=bt2020nc", "color_trc=smpte2084", "color_primaries=bt2020"]
+    color = ["-color_range", "tv", "-colorspace", "bt2020nc",
+             "-color_trc", "smpte2084", "-color_primaries", "bt2020"]
+else:
+    sp, color = [], []
+    for sp_opt, flag, key in (("range", "-color_range", "color_range"),
+                              ("colorspace", "-colorspace", "color_space"),
+                              ("color_trc", "-color_trc", "color_transfer"),
+                              ("color_primaries", "-color_primaries", "color_primaries")):
+        v = _tag(key)
+        if v:
+            sp.append(f"{sp_opt}={v}")
+            color += [flag, v]
 # Sharpening (the GUI "FSR" toggle / --sharpen) is applied in-engine on the GPU by _rcas() inside
 # to_bytes, NOT here. It uses AMD FidelityFX RCAS, the exact sharpen AMD FSR and Lossless Scaling's
 # FSR mode use; ffmpeg only ships the older, blunter `cas`, which over-sharpens fine texture into
@@ -369,15 +484,22 @@ for sp_opt, flag, key in (("range", "-color_range", "color_range"),
 # it crisps edges without destroying texture). So the encode vf is just the colour-tag passthrough.
 vf = ",".join((["setparams=" + ":".join(sp)] if sp else []) + [f"format={out_pix}"])
 
-enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", DEC_FMT,
-           "-s", f"{W}x{H}", "-r", rate_str, "-i", "-", "-i", inp,
+# The piped frames are DEC_FMT (rgb24/rgb48le) normally, but the RTX HDR pass emits packed 10-bit
+# BT.2020 PQ RGB, so the encoder input format switches when HDR is active. The TrueHDR output is
+# x2rgb10le (B in the low 10 bits): the model's channel 0 is blue, which lands in the low bits of the
+# CUDA 101010_2 packing, verified by an R/B swap when read as x2bgr10le.
+ENC_IN_FMT = "x2rgb10le" if HDR_ACTIVE else DEC_FMT
+enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", ENC_IN_FMT,
+           "-s", f"{OUT_W}x{OUT_H}", "-r", rate_str, "-i", "-", "-i", inp,
            "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy",
            "-c:v", venc, "-vf", vf]
 enc_cmd += qargs + prof + color + [out_path]
 enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
 _sharp_note = f"  sharpen(rcas)={SHARPEN:g}" if SHARPEN > 0 else ""
+_up_note = f"  upscale={UPSCALE_F:g}x->{OUT_W}x{OUT_H}" if UPSCALE else ""
+_hdr_note = "  HDR10(TrueHDR,BT.2020 PQ)" if HDR_ACTIVE else ""
 sys.stderr.write(f"encode: {venc} visually-lossless -> {out_pix}  "
-                 f"(source {SRC_CODEC or '?'} {SRC_BITS}bit {SRC_PIX}){_sharp_note}\n"); sys.stderr.flush()
+                 f"(source {SRC_CODEC or '?'} {SRC_BITS}bit {SRC_PIX}){_sharp_note}{_up_note}{_hdr_note}\n"); sys.stderr.flush()
 
 # Encode on a background thread so ffmpeg writes overlap the next frame's GPU work instead of
 # stalling the single pipe. One writer pulling a bounded FIFO preserves frame order, so the
@@ -427,7 +549,10 @@ if NO_INTERP:
             buf = rq.get()
             if buf is None:
                 break
-            wq.put(to_bytes(to_tensor(buf)) if SHARPEN > 0 else buf)
+            # Route through to_bytes (decode->tensor->process->bytes) when there is any per-frame
+            # GPU work to do (sharpen and/or upscale); otherwise pass the raw frame straight to the
+            # encoder as a plain re-encode.
+            wq.put(to_bytes(to_tensor(buf)) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE) else buf)
             k += 1
             if k % 10 == 0:
                 sys.stderr.write(f"PROGRESS {k}/{total_units}\n"); sys.stderr.flush()
@@ -506,9 +631,10 @@ try:
     # which has no frame after it to interpolate toward. Hold the last generated frame across it so
     # the output covers the full source duration and lands on exactly multi*frames (true doubling,
     # the target fps behaviour Topaz uses) instead of stopping one slot short. It is held, so it
-    # stays soft and does not pop. A single decoded frame has no pair at all, so it just passes through.
+    # stays soft and does not pop. A single decoded frame has no pair at all, so it just passes
+    # through (still routed through to_bytes when sharpening/upscaling so its dims match the encoder).
     if last_out is None:
-        wq.put(prev)
+        wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE) else prev)
     else:
         tail = (math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)) if FPS_MODE else args.multi
         for _ in range(tail):

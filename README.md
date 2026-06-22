@@ -21,12 +21,18 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   fps, duration, codec), choose a multiplier, type a target fps, or tick **match screen
   refresh rate** to target your monitor's Hz (rounded up), then click **Smooth It!**. An
   **FSR** toggle (FSR-style RCAS sharpening, on at full strength by default, with a
-  strength slider) crisps the output. The **Interpolate** toggle (on by default) is the
-  master switch for frame generation: untick it to *only* sharpen the video, keeping the
-  source frame rate (the multiplier / fps / match-screen controls grey out and the engine
-  skips the GMFSS model entirely). **Cancel** kills the running job; **Open folder**
-  reveals the result. The last used folder, multiplier, sharpen, interpolate and
-  match-screen settings are remembered between sessions.
+  strength slider) crisps the output. An **Upscale to** selector resizes the output to a chosen
+  resolution (Off / Match screen / 1080p / 1440p / 4K / 8K / a custom height), keeping the source
+  aspect ratio; the **RTX Video Super Resolution** toggle (opt-in, see NVIDIA RTX) does that
+  upscale with NVIDIA AI, otherwise it is a bicubic resize. The **Interpolate** toggle (on by
+  default) is the master switch for frame generation: untick it to *only* sharpen / upscale the
+  video, keeping the source frame rate (the multiplier / fps / match-screen controls grey out and
+  the engine skips the GMFSS model entirely). An opt-in **NVIDIA RTX** panel adds real RTX Video
+  Super Resolution and **RTX HDR** (SDR to HDR10, with a peak-brightness slider); both are off by
+  default and unlock once the RTX Video runtime is installed (a one-click in-app installer, see
+  NVIDIA RTX). **Cancel** kills the running job; **Open folder** reveals the result. The last used
+  folder, multiplier, sharpen, upscale resolution, interpolate, match-screen, RTX and HDR settings
+  are remembered between sessions.
 - Progress: a bar that starts at the source frame count and fills to the post process
   total, plus a live frame counter and an ETA.
 - Output: written beside the source as `<name>_<fps>fps.mp4` (or a custom path chosen
@@ -154,6 +160,17 @@ present for a portable `npm run dist`.
 **4. GMFSS weights into `engine/GMFSS_Fortuna/train_log`**
 The weights (feat, flownet, fusionnet, metric, rife pkl files) are gitignored because
 they are large. Restore them from the original GMFSS_Fortuna release.
+
+## Dev toolchain
+The development machine has Visual Studio 2019 Build Tools v142 (MSVC `cl.exe` 19.29) and the
+Windows 10 SDK (10.0.19041) installed, so native code that links the NVIDIA SDK import
+libraries can be built locally. This is what enables the RTX Video bridge: the SDK is NGX based
+and its entry points live in a static import lib `nvsdk_ngx_s.lib`, so they cannot be reached by
+ctypes alone and need a compile (see `engine/rtxvideo/build_src/BUILD.md` for the recipe). The
+DX11 and DX12 paths build with only MSVC and the Windows SDK; the CUDA and
+Vulkan sample paths would each need the CUDA Toolkit or the Vulkan SDK first, neither of which
+is installed. This does not change the shipping promise: nothing that needs MSVC is bundled,
+and a recipient still needs only the NVIDIA driver.
 
 ## Scripts
 - `npm start` - build (`tsc`) and launch.
@@ -375,16 +392,34 @@ For whoever picks this up.
   `--sharpen` uses 0.8; `0`/omitted leaves frames untouched). Verified on the sample (extracted frames,
   side-by-side crop): RCAS@1.0 crisps the dragon's edges and recovers mountain detail with the texture
   intact, at about 1.55 MB/frame versus the clean 1.42 MB (CAS was 2.7-3.3 MB).
-- **Upscale to screen resolution (planned: minimal NVIDIA NIS).** Real-time RTX VSR (mpv's
-  `d3d11vpp=scaling-mode=nvidia`) cannot be baked into the file: the bundled ffmpeg has no `d3d11vpp`
-  and no AI super-resolution filter, and true VSR would need NVIDIA's Maxine/NGX Video Effects SDK (a
-  large separate engine) or a TensorRT SR model. The agreed minimal path is instead **NVIDIA Image
-  Scaling (NIS)** - NVIDIA's open-source spatial upscaler plus sharpener (NVScaler/NVSharpen), a plain
-  shader with no model or SDK, and itself one of Lossless Scaling's scaling modes. It can be done the
-  way RCAS was (a small GPU pass in the engine, or libplacebo's `custom_shader_path` with the public
-  NIS `.hook`), upscaling each output frame to a chosen target (e.g. the monitor resolution) before
-  encode. Caveat: it bloats an already-large interpolated file and is spatial-only, not AI; mpv's live
-  VSR at playback stays the higher-quality, zero-storage alternative. Not yet implemented.
+- **Upscale to any resolution + RTX VSR / RTX HDR (done).** The GUI **Upscale to** selector picks a
+  target (Off / Match screen / 1080p / 1440p / 4K / 8K / custom height); the engine's `--upscale F`
+  resizes each output frame just before encode by an arbitrary factor (aspect preserved, even
+  dimensions), with decode and GMFSS interpolation staying at the source resolution. The AI backend is
+  **NVIDIA RTX Video Super Resolution** (opt-in `--rtx-vsr`), with a bicubic resize as the fallback.
+  RTX VSR places no integer-scale restriction on the output (probed clean and crash-free to 16K on a
+  24 GB GPU - it is memory-bound, not model-bound), so any exact target up to the 8K option is allowed;
+  the old 2x/3x/4x limit was a quirk of Maxine SuperRes, which has been **removed** (DLSS never applied
+  to video - it needs a game engine's motion vectors/depth/jitter, which a finished frame lacks).
+  **RTX HDR (SDR to HDR10)** is also done (`--rtx-hdr`): the TrueHDR pass outputs 10-bit BT.2020 PQ
+  (`x2rgb10le`), tagged HDR10 (p010 / main10 / smpte2084), and composes with VSR in one bridge eval.
+  The HDR **peak brightness** (TrueHDR `MaxLuminance`) is user-selectable, 400..2000 nits (default
+  1000), via the GUI slider / `--hdr-nits`; it shapes the PQ pixel values, so it is meaningful even
+  though HDR10 *static* metadata (mastering-display / MaxCLL) is **not** written - the bundled LGPL
+  ffmpeg cannot inject it on the `hevc_nvenc` path (`-master_display` is a libx265/GPL option and the
+  `hevc_metadata` bitstream filter has no such field), and HDR10 still tone-maps correctly from the
+  PQ/BT.2020 signalling without it. Both features run through a small compiled CUDA bridge
+  `engine/rtxvideo/rtxvideo_cuda.dll` (built from the SDK's CUDA convenience layer plus a path shim;
+  sources + build recipe in `engine/rtxvideo/build_src/`), which feeds each frame into NGX by GPU
+  pointer the same zero-copy way TensorRT is driven; `engine/rtxvideo.py` wraps it. **Shipping:** the
+  feature DLLs (`nvngx_vsr.dll`, `nvngx_truehdr.dll`) are non-redistributable and the bridge is a local
+  build, so all of `engine/rtxvideo/` is gitignored and excluded from the packaged zip - RTX stays a
+  local feature. Setup is one click in the **NVIDIA RTX** panel: it auto-detects a downloaded RTX Video
+  SDK (Downloads / Desktop, a folder or a `.zip`) and **Install runtime** copies the two feature DLLs
+  into `engine/rtxvideo` (zips are read with Windows' `bsdtar`, extracting only those two members);
+  **Get from NVIDIA** opens the SDK page in the browser and **Choose folder / .zip** are manual
+  fallbacks. The RTX toggles unlock only once the runtime is present (`rtx-ready` gates them). For
+  viewing on this PC, mpv's live RTX VSR at playback stays the zero-storage alternative.
 - **Overlapped decode, inference and encode (done).** Decode and encode now run on background
   reader and writer threads fed by bounded FIFO queues, so ffmpeg input and output pipe I/O
   overlap the next frame's GPU work instead of stalling a single thread (one reader and one
@@ -422,7 +457,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -434,4 +469,12 @@ Contrast Adaptive Sharpening (`strength` 0..1) to every output frame to offset t
 look softness; it is off unless given (a bare `--sharpen` uses 0.8). `--no-interp` skips
 interpolation entirely: the clip is only re-encoded at its source fps with `--sharpen`
 applied (one output frame per source frame, no GMFSS model or TRT loaded), for when you
-just want the sharpening and not the smoothing.
+just want the sharpening and not the smoothing. `--upscale F` spatially upscales every
+output frame by an arbitrary factor `F` (e.g. `2.0`, or `1.5`, ...) just before encode,
+leaving decode and interpolation at the source resolution; it is off at `1.0` unless given
+(a bare `--upscale` uses `1.5`, clamped to 8.0). With `--rtx-vsr` the upscale uses NVIDIA RTX
+Video Super Resolution (real AI SR, any target resolution; needs the `engine/rtxvideo`
+runtime), otherwise a bicubic resize. `--rtx-hdr` converts the output to HDR10 (BT.2020 PQ)
+via the RTX Video TrueHDR model, and `--hdr-nits N` sets the HDR peak luminance (400..2000,
+default 1000); HDR composes with `--upscale` in a single RTX bridge pass. See What can be
+done next for the RTX runtime / installer details.

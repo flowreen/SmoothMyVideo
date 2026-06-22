@@ -15,6 +15,10 @@ engine/.venv/
 engine/runtime/
 engine/bin/
 engine/**/__pycache__/
+
+# RTX Video runtime: NVIDIA's feature DLLs (nvngx_*.dll) are non-redistributable and the bridge
+# (rtxvideo_cuda.dll) is locally built; the whole folder is local-only (see engine/rtxvideo.py).
+engine/rtxvideo/
 engine/GMFSS_Fortuna/vid_out/
 
 # tensorrt engine cache + export artifacts (machine specific, built on first run)
