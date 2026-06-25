@@ -11,11 +11,31 @@ RIFE refiner, plus MetricNet, FeatureNet, FusionNet and softsplat warping. It pr
 clean interpolated frames where the older NVIDIA optical flow path (FRUC) tore at high
 multipliers.
 
-## Status (2026-06-20)
+## Status (2026-06-25)
 
 Working end to end and verified on real clips. The packaged build is now fully self
 contained: a recipient extracts the zip and runs `SmoothMyVideo.exe` with no Python, no
 pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
+
+**Recent (2026-06-25):**
+- **Production-grade HDR10 mastering.** RTX HDR writes HDR10 static metadata (mastering-display plus
+  measured MaxCLL/MaxFALL), so one PQ file tone-maps on any display with no per-display nits input.
+  TrueHDR Saturation defaults to a faithful **0** (its SDK "neutral" 100 over-saturates versus the
+  source); Contrast/MiddleGray stay at the neutral 100/50. The per-display nits slider was removed in
+  favour of a fixed 1000-nit master. See HDR mastering.
+- **SDR to HDR colour validated.** A real SDR/HDR reference pair confirmed the conversion is
+  colour-faithful and the cyan/cool look is the HDR to SDR viewing transform, not the pipeline. See
+  What can be done next.
+- **CUDA 13 migration.** The bundled runtime moved to torch 2.12.1+cu130 + cupy-cuda13x + TensorRT
+  cu13, validated end to end (eager, RTX HDR, TensorRT). See Setup.
+
+**Software stack updates still pending:**
+- **Re-bundle on CUDA 13.** `npm run dist` has not been re-run since the migration, so the shipped zip
+  still carries the old cu128 runtime. Rebuild it before distributing.
+- **Clean-machine test on CUDA 13.** The cu13 runtime (and the RTX `cudart64_12.dll` bundling) were
+  validated on the dev box but not yet on a separate PC (the long-standing open item).
+- **Optional torch bump.** Stable torch 2.12.1+cu130 is the current pick; 2.13/2.14 nightly cu130
+  exist but there is no reason to move yet.
 
 - GUI: select a video (or drag one onto the window), view its info (resolution, source
   fps, duration, codec), choose a multiplier, type a target fps, or tick **match screen
@@ -58,7 +78,7 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   rather than truncated), byte exact duplicate source frames are held instead of interpolated
   (anime is drawn on twos), and the ffmpeg decode and encode run on background reader and
   writer threads so pipe I/O overlaps GPU work.
-- Bundled: a relocatable Python 3.14 runtime (torch cu128 + cupy) at `engine/runtime`,
+- Bundled: a relocatable Python 3.14 runtime (torch cu130 / CUDA 13 + cupy) at `engine/runtime`,
   and a static ffmpeg (NVENC plus a CPU SVT-AV1 fallback) at `engine/bin`. Both ship inside
   the zip; the app uses neither system Python nor system ffmpeg.
 - Launch: Desktop and Start menu shortcuts, a no console `SmoothMyVideo.vbs`, and a
@@ -108,7 +128,7 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   and the interpolate glue stay in eager. Engines are cached per `(net, shapes, gpu, trt
   version)` under `SMV_TRT_CACHE`, built on first use, with eager fallback on any failure.
 - `engine/runtime/` - bundled relocatable Python (python-build-standalone CPython 3.14)
-  with the full GPU stack installed (torch cu128, cupy, nvidia wheels). Gitignored, see Setup.
+  with the full GPU stack installed (torch cu130 / CUDA 13, cupy-cuda13x, nvidia cu13 wheels). Gitignored, see Setup.
 - `engine/bin/` - bundled static `ffmpeg.exe` + `ffprobe.exe` (built with `hevc_nvenc`)
   plus their license. Gitignored, see Setup.
 - `engine/GMFSS_Fortuna/` - GMFSS model code (inference chain only) plus `train_log/`
@@ -133,18 +153,19 @@ node node_modules/electron/install.js
 The bundled interpreter is a relocatable
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases)
 CPython 3.14 (the `install_only` win64 build). Download it, unpack the tarball, and move
-its inner `python/` folder to `engine/runtime`. Then install the Blackwell cu128 GPU
+its inner `python/` folder to `engine/runtime`. Then install the Blackwell **CUDA 13** GPU
 stack into it (this is the exact environment that gets bundled):
 ```
-engine\runtime\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+engine\runtime\python.exe -m pip install torch==2.12.1 torchvision --index-url https://download.pytorch.org/whl/cu130
 engine\runtime\python.exe -m pip install -r engine\requirements.txt
 ```
-`requirements.txt` includes `cupy-cuda12x` plus the `nvidia-cuda-nvrtc-cu12` and
-`nvidia-cuda-runtime-cu12` wheels. cupy needs those to JIT its softsplat kernel; the
-engine adds their bin dirs to the Windows DLL search at startup (`_add_cuda_dll_dirs`)
-so `nvrtc-builtins*.dll` is found. It also pulls `tensorrt` plus `onnx`/`onnxscript` for
-the default TensorRT backend; `tensorrt` brings about 2 GB of cu13 libraries that coexist
-with torch's cu128. A standard `python -m venv` is **not** usable here: a
+`requirements.txt` includes `cupy-cuda13x` plus the `nvidia-cuda-nvrtc` and
+`nvidia-cuda-runtime` wheels (the CUDA 13 wheels dropped the `-cuXX` suffix; the
+`nvidia-cuda-*-cu13` packages are deprecated placeholders that fail to build, so use the
+unsuffixed names). cupy JITs its softsplat kernel and uses `cuda-pathfinder` to locate the
+CUDA 13 runtime, so the old `nvrtc-builtins` DLL-search shim is no longer load-bearing. It also
+pulls `tensorrt` (the cu13 build, ~2 GB of CUDA 13.3 libraries, matching torch's cu130) plus
+`onnx`/`onnxscript` for the default TensorRT backend. A standard `python -m venv` is **not** usable here: a
 Windows venv keeps its standard library in the base Python install, so it is not
 relocatable and breaks on a machine that lacks that exact Python. python-build-standalone
 is self contained, which is what makes the bundle portable.
@@ -175,12 +196,11 @@ and a recipient still needs only the NVIDIA driver.
 ## Scripts
 - `npm start` - build (`tsc`) and launch.
 - `npm run starti` - wipe `node_modules` and `package-lock.json`, fresh install, then start.
-- `npm run pack` - build an unpacked app into `release/win-unpacked/` with the engine
-  (including its bundled `runtime` and `bin`) shipped as `extraResources`. For local testing.
-- `npm run dist` - build the distributable `release/SmoothMyVideo-<version>-win.zip`
-  (about 5 GB with the TensorRT backend bundled, or 3.2 GB without it). Recipients extract
-  it and run `SmoothMyVideo.exe`; no install step, and nothing is required on the target
-  machine but the NVIDIA driver.
+- `npm run dist` - the single build command. It wipes `release/` (inlined `fs.rmSync`), compiles with
+  `tsc`, then runs `electron-builder`, whose zip target produces **both** `release/win-unpacked/` and
+  `release/SmoothMyVideo-<version>-win.zip` (about 4 GB with the TensorRT backend bundled). Recipients
+  extract the zip and run `SmoothMyVideo.exe`; no install step, and nothing is required on the target
+  machine but the NVIDIA driver. `release/` is wiped first, so no stale artifacts are ever bundled.
 
 ## Performance
 Precision is **fp16 only** (fp32 was removed: fp16 is visually lossless versus fp32,
@@ -264,7 +284,7 @@ Recommendations, with the repo each came from:
   dead; only a CPU torch lite build with no TensorRT survives on the Internet Archive) and
   enhancr 0.9.9 is torch 2.1 plus TensorRT 8.6.1, which predate Blackwell `sm_120` and will not
   run on this GPU. Its one speed advantage, TensorRT, is already covered by SMV's modern stack
-  (torch 2.11 `cu128`, TensorRT 11.1).
+  (torch 2.12 `cu130`, TensorRT 11.1).
 
 ## Uniform look (no detail popping)
 A naive interpolator keeps the original frames and inserts generated tweens between them, so the
@@ -330,8 +350,50 @@ than copied from the source (see Uniform look), so "passthrough" refers only to 
 family, bit depth and colour signalling. It means adding no visible encode loss and not
 downgrading the source format, not preserving the original pixels frame for frame.
 
+## HDR mastering (production-grade HDR10)
+The **RTX HDR** path (`--rtx-hdr`) produces a real HDR10 master, not just a PQ-tagged file. The point
+to understand: HDR does not make the file look different per screen. The picture is graded once
+against an absolute reference (PQ encodes absolute nits, not relative brightness), and each display
+tone-maps that reference down to its own peak. Metadata is what makes that adaptation accurate. The
+engine does the four things a production HDR10 deliverable is made of:
+
+1. **Encode PQ / BT.2020, 10-bit.** TrueHDR outputs BT.2020 PQ (SMPTE 2084); the encode is `main10` /
+   `p010le` with the colour signalling stamped via `setparams` (NVENC drops the bare `-color_*`
+   transfer / primaries otherwise).
+2. **Do not add saturation.** TrueHDR Saturation defaults to **0** (faithful), not the SDK's own
+   "neutral" 100: measured against the source, 100 pushes mean saturation about a third high (the SDR
+   to HDR model adds vibrance of its own), while 0 lands on the original's colour and is not washed
+   out. Contrast and MiddleGray stay at the SDK neutral 100 / 50. `--hdr-saturation` (0..200) tunes
+   it; 100 restores the vivid look.
+3. **Master to a fixed peak, set once.** `--hdr-nits` (default 1000) is the mastering peak the PQ
+   values are shaped to, not a per-monitor knob. 1000 is the consumer standard; 4000 is premium.
+4. **Write the mastering metadata.** `mdcv` (mastering-display: BT.2020 / D65 + the peak) and `clli`
+   (MaxCLL / MaxFALL measured from the frames) are injected into the mp4 by `engine/hdr10_meta.py`. A
+   400-nit panel reads these and rolls the highlights down; a 1000-nit panel shows it near-native. One
+   file, no per-display input.
+
+That is the same mechanism a Dolby Vision or HDR10 master uses to look right on a 4000-nit reference
+monitor, a 1000-nit OLED and a 400-nit TV. The tiers beyond HDR10, for whoever wants to go further:
+- **HDR10+** (royalty-free to author): adds *dynamic*, per-scene metadata for better low-nit roll-off.
+  Author it with `hdr10plus_tool` and feed x265 via `dhdr10-info`; needs an x265 built with HDR10+
+  (the bundled LGPL ffmpeg has neither libx265 nor HDR10+).
+- **Dolby Vision** (licensed): per-shot colorist trims for specific target nits, with HDR10 fallback
+  (profile 8.1). Creation and distribution need a Dolby licence and the content-mapping analysis is
+  gated behind DaVinci Resolve or Dolby's tools; `dovi_tool` only extracts / edits / muxes the RPU.
+  Out of scope for a self-contained, offline app.
+
 ## What can be done next
 For whoever picks this up.
+
+- **SDR to HDR colour / cyan (investigated, resolved).** Using a real reference pair (a Costa Rica 4K
+  HDR clip and its SDR version), SMV's SDR to HDR was confirmed colour-faithful: tonemapping SMV's HDR
+  back to SDR matches the source, and the *real* graded HDR cools even more under the identical
+  tonemap, so the cyan/cool cast is the HDR to SDR viewing transform (a screenshot or a player's
+  tonemap), not the conversion. A Contrast/MiddleGray sweep confirmed those knobs change tone, not
+  colour (Saturation is the only colour control, defaulted to a faithful 0). The lone residual is a
+  slight brightness lift / cool shift intrinsic to the HDR expansion that saturation cannot remove;
+  TrueHDR exposes no white-balance control, so nudging it would need a custom shader or a post trim.
+  Low priority, since on a real HDR display the file is correct.
 
 - **Clean machine test (the one open item).** The packaged zip is self contained and was
   verified locally with system Python and ffmpeg stripped from PATH, but it has not yet
@@ -391,7 +453,11 @@ For whoever picks this up.
   persist between sessions. At the engine CLI the flag is off unless given (`--sharpen S`; a bare
   `--sharpen` uses 0.8; `0`/omitted leaves frames untouched). Verified on the sample (extracted frames,
   side-by-side crop): RCAS@1.0 crisps the dragon's edges and recovers mountain detail with the texture
-  intact, at about 1.55 MB/frame versus the clean 1.42 MB (CAS was 2.7-3.3 MB).
+  intact, at about 1.55 MB/frame versus the clean 1.42 MB (CAS was 2.7-3.3 MB). The sharpen runs at the
+  **output** resolution: the per-frame order in `to_bytes` is upscale (RTX VSR or bicubic), then RCAS,
+  then RTX TrueHDR. So RCAS crisps the final-resolution image (a source-resolution sharpen would just be
+  scaled up and softened by the upscaler), the AI upscaler still receives an unsharpened, in-distribution
+  frame, and the sharpen stays in SDR where its luma weighting is valid (ahead of the HDR expansion).
 - **Upscale to any resolution + RTX VSR / RTX HDR (done).** The GUI **Upscale to** selector picks a
   target (Off / Match screen / 1080p / 1440p / 4K / 8K / custom height); the engine's `--upscale F`
   resizes each output frame just before encode by an arbitrary factor (aspect preserved, even
@@ -402,13 +468,26 @@ For whoever picks this up.
   the old 2x/3x/4x limit was a quirk of Maxine SuperRes, which has been **removed** (DLSS never applied
   to video - it needs a game engine's motion vectors/depth/jitter, which a finished frame lacks).
   **RTX HDR (SDR to HDR10)** is also done (`--rtx-hdr`): the TrueHDR pass outputs 10-bit BT.2020 PQ
-  (`x2rgb10le`), tagged HDR10 (p010 / main10 / smpte2084), and composes with VSR in one bridge eval.
-  The HDR **peak brightness** (TrueHDR `MaxLuminance`) is user-selectable, 400..2000 nits (default
-  1000), via the GUI slider / `--hdr-nits`; it shapes the PQ pixel values, so it is meaningful even
-  though HDR10 *static* metadata (mastering-display / MaxCLL) is **not** written - the bundled LGPL
-  ffmpeg cannot inject it on the `hevc_nvenc` path (`-master_display` is a libx265/GPL option and the
-  `hevc_metadata` bitstream filter has no such field), and HDR10 still tone-maps correctly from the
-  PQ/BT.2020 signalling without it. Both features run through a small compiled CUDA bridge
+  (`x2rgb10le`), tagged HDR10 (p010 / main10 / smpte2084). VSR and TrueHDR run as **two separate bridge
+  passes** (`run_vsr` then `run_hdr`, via the bridge's `evaluate_vsr_deviceptr` / `evaluate_thdr_deviceptr`
+  entries), not the SDK's fused VSR->THDR eval, so the RCAS sharpen lands between them at the output
+  resolution (see the FSR bullet for why that order is the quality-correct one).
+  The HDR **peak brightness** (TrueHDR `MaxLuminance`) defaults to 1000 nits (the SDK allows
+  400..2000, on the GUI slider / `--hdr-nits`). This is the **mastering peak**: a target the picture
+  is graded to *once*, not a per-viewer setting. TrueHDR Saturation defaults to **0** (faithful): the
+  SDK's own "neutral" 100 measurably oversaturates versus the SDR source (about a third high), and 0
+  lands on the original's colour without washing it out. Contrast / MiddleGray stay at the SDK neutral
+  100 / 50; `--hdr-saturation` (0..200, ranges in `nvsdk_ngx_defs_truehdr.h`) tunes it, 100 = vivid.
+  **HDR10 static metadata is written** (`engine/hdr10_meta.py`): the mastering-display colour volume
+  (BT.2020 primaries, D65 white, the chosen peak) and the content light level (MaxCLL / MaxFALL
+  **measured** from the actual frames) are stamped into the mp4 as the `mdcv` / `clli` boxes after the
+  encode. The bundled LGPL ffmpeg cannot write these on the `hevc_nvenc` path (`-master_display` is a
+  libx265/GPL option, the `hevc_metadata` bitstream filter has no such field, and `hevc_nvenc` exposes
+  no mastering / CLL option - all verified against the bundled binary), so the boxes are injected
+  directly at the container level (idempotent; `stco` / `co64` chunk offsets patched for any layout).
+  With them, this one PQ file tone-maps correctly on both a 1000-nit and a 400-nit display with no
+  per-display nits input, the same way an HDR10 / Dolby Vision master adapts (minus the per-shot
+  dynamic metadata; see HDR mastering above). Both features run through a small compiled CUDA bridge
   `engine/rtxvideo/rtxvideo_cuda.dll` (built from the SDK's CUDA convenience layer plus a path shim;
   sources + build recipe in `engine/rtxvideo/build_src/`), which feeds each frame into NGX by GPU
   pointer the same zero-copy way TensorRT is driven; `engine/rtxvideo.py` wraps it. **Shipping:** the
@@ -448,8 +527,11 @@ an NSIS installer**: `makensis` cannot memory map an app archive this large (abo
 so the installer target was dropped.
 
 ## Constraints to keep in mind
-- RTX 50 (Blackwell, sm_120): torch must be the cu128 build, and do not break
-  `_add_cuda_dll_dirs` or cupy will fail to find `nvrtc-builtins`.
+- RTX 50 (Blackwell, sm_120): torch is the **cu130** build (CUDA 13). cupy-cuda13x locates the
+  runtime via `cuda-pathfinder`, so `_add_cuda_dll_dirs` is no longer load-bearing for nvrtc.
+- RTX Video bridge on CUDA 13: keep the cu12-built `rtxvideo_cuda.dll` and ship `cudart64_12.dll`
+  next to it in `engine/rtxvideo/`. NVIDIA's NGX static lib is CUDA-12-ABI, so a bridge relinked
+  against CUDA 13 crashes in `create()` (see `engine/rtxvideo/build_src/BUILD.md`).
 - Keep `engine/runtime` a relocatable python-build-standalone install. Do not replace it
   with a `python -m venv` venv, which is not self contained and breaks the portable bundle.
 - The renderer uses `require('electron')` with nodeIntegration on, so it cannot run in a
@@ -475,6 +557,9 @@ leaving decode and interpolation at the source resolution; it is off at `1.0` un
 (a bare `--upscale` uses `1.5`, clamped to 8.0). With `--rtx-vsr` the upscale uses NVIDIA RTX
 Video Super Resolution (real AI SR, any target resolution; needs the `engine/rtxvideo`
 runtime), otherwise a bicubic resize. `--rtx-hdr` converts the output to HDR10 (BT.2020 PQ)
-via the RTX Video TrueHDR model, and `--hdr-nits N` sets the HDR peak luminance (400..2000,
-default 1000); HDR composes with `--upscale` in a single RTX bridge pass. See What can be
-done next for the RTX runtime / installer details.
+via the RTX Video TrueHDR model, and `--hdr-nits N` sets the mastering peak luminance (400..2000,
+default 1000); the output also gets HDR10 static metadata (mastering-display plus measured
+MaxCLL/MaxFALL, written by `engine/hdr10_meta.py`) so one file tone-maps to any display.
+The per-frame order is upscale (RTX VSR or bicubic), then RCAS sharpen at the
+output resolution, then TrueHDR; VSR and TrueHDR run as two separate RTX bridge passes so the
+sharpen can sit between them. See What can be done next for the RTX runtime / installer details.

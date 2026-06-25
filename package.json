@@ -6,9 +6,8 @@
   "main": "dist/main.js",
   "scripts": {
     "start": "tsc && electron .",
-    "starti": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true, maxRetries: 3 }); fs.rmSync('package-lock.json', { force: true })\" && npm install && npm start",
-    "pack": "tsc && electron-builder --dir",
-    "dist": "tsc && electron-builder"
+    "starti": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true })\" && npm install && npm start",
+    "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && electron-builder"
   },
   "devDependencies": {
     "@types/node": "latest",
@@ -29,7 +28,7 @@
         "filter": ["**/*", "!**/__pycache__/**", "!GMFSS_Fortuna/vid_out/**", "!.venv/**",
           "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine",
           "!trt_poc.py", "!trt_poc_gmflow.py", "!trt_integration_test.py", "!trt_dynamic_test.py",
-          "!rtxvideo/*.dll", "!rtxvideo/build_src/**"]
+          "!rtxvideo/**"]
       }
     ],
     "win": { "target": "zip", "icon": "icon.ico" }

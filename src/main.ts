@@ -97,7 +97,7 @@ ipcMain.handle('screen-size', () => {
 // for them. A feature is "ready" only when the bridge AND its feature DLL are present there.
 const RTX_DIR = path.join(ENGINE, 'rtxvideo');
 const RTX_FEATURE_DLLS = ['nvngx_vsr.dll', 'nvngx_truehdr.dll'];
-const RTX_SDK_URL = 'https://developer.nvidia.com/rtx-video-sdk';
+const RTX_SDK_URL = 'https://developer.nvidia.com/rtx-video-sdk/getting-started';
 const SYS_TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
 const fileExists = (p: string) => { try { return fs.existsSync(p); } catch { return false; } };
 
@@ -147,7 +147,10 @@ function installRtx(source: string): { ok: boolean; error?: string; copied: stri
         if (e.isDirectory()) walk(p); else if (RTX_FEATURE_DLLS.includes(e.name)) found.push(p);
       } };
       walk(tmp);
-      srcFiles = found;
+      // The SDK ships arm64 + x64 (dev/rel) copies of each DLL; take the x64 release build.
+      const pick = (n: string) => { const all = found.filter((f) => path.basename(f) === n);
+        return all.find((f) => /x64[\\/]+rel/i.test(f)) || all[0]; };
+      srcFiles = RTX_FEATURE_DLLS.map(pick).filter((f): f is string => !!f);
     } else {
       const dir = findFeatureDllDir(source) || (fileExists(path.join(source, RTX_FEATURE_DLLS[0])) ? source : null);
       if (dir) srcFiles = RTX_FEATURE_DLLS.map((n) => path.join(dir, n));
@@ -158,8 +161,18 @@ function installRtx(source: string): { ok: boolean; error?: string; copied: stri
     return { ok: false, error: 'nvngx_vsr.dll / nvngx_truehdr.dll not found in the selected RTX Video SDK', copied: [] };
   const copied: string[] = [];
   try {
-    for (const f of present) { fs.copyFileSync(f, path.join(RTX_DIR, path.basename(f))); copied.push(path.basename(f)); }
-  } catch (e) { return { ok: false, error: String(e), copied }; }
+    for (const f of present) {
+      const dest = path.join(RTX_DIR, path.basename(f));
+      // Overwrite any existing copy (a newer SDK release replaces the old DLLs), even one a previous
+      // extraction left read-only; clearing the flag first avoids an EPERM on copy.
+      try { if (fileExists(dest)) fs.chmodSync(dest, 0o666); } catch { /* best effort */ }
+      fs.copyFileSync(f, dest);
+      copied.push(path.basename(f));
+    }
+  } catch (e) {
+    return { ok: false, error: 'Could not overwrite the RTX DLLs in engine/rtxvideo (' + String(e)
+      + '). If a render is running, stop it and try again.', copied };
+  }
   return { ok: true, copied };
 }
 
@@ -174,10 +187,7 @@ ipcMain.handle('rtx-ready', () => {
 
 ipcMain.handle('rtx-open-download', () => { shell.openExternal(RTX_SDK_URL); return true; });
 
-// Auto-detect a downloaded SDK so the renderer can offer a one-click install.
-ipcMain.handle('rtx-scan', () => scanForSdk());
-
-// Install from a given source, or auto-detect one when none is passed.
+// Install from a given source (the picked .zip), or auto-detect one when none is passed.
 ipcMain.handle('rtx-install', (_e, source?: string) => {
   let src = source;
   if (!src) { const s = scanForSdk(); src = s.folder || s.zip || undefined; }
@@ -195,7 +205,7 @@ ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
 
 let current: ChildProcess | null = null;
 
-ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; interp?: boolean; upscale?: number; rtxvsr?: boolean; rtxhdr?: boolean; hdrNits?: number }) => {
+ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; interp?: boolean; upscale?: number; rtxvsr?: boolean; rtxhdr?: boolean }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
   // Interpolation is the default; interp === false means the user only wants the sharpen pass,
   // so tell the engine to skip frame generation (and ignore any fps/multi) entirely.
@@ -214,11 +224,11 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
   // if the bridge or RTX Video runtime is unavailable.
   if (opts.rtxvsr && opts.upscale && opts.upscale > 1) args.push('--rtx-vsr');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
-  // on, the RTX bridge does VSR then TrueHDR in one pass). --hdr-nits sets the HDR peak luminance
-  // (400..2000). The engine falls back to an SDR render if the bridge is unavailable.
+  // on, the RTX bridge does VSR then TrueHDR in one pass). The engine masters at a fixed 1000-nit
+  // peak (its --hdr-nits default) and writes the HDR10 metadata, so there is no per-display nits
+  // knob; it falls back to an SDR render if the bridge is unavailable.
   if (opts.rtxhdr) {
     args.push('--rtx-hdr');
-    if (opts.hdrNits && opts.hdrNits > 0) args.push('--hdr-nits', String(opts.hdrNits));
   }
   // PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from crashing the engine
   // during first-run TRT builds; SMV_TRT_CACHE is a guaranteed writable cache location.

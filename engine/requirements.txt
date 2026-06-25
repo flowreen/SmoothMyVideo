@@ -1,21 +1,22 @@
-# 1) torch first (Blackwell cu128 wheel):
-#    .venv\Scripts\python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-# 2) then: .venv\Scripts\python -m pip install -r requirements.txt
+# 1) torch first (Blackwell cu130 wheel):
+#    engine\runtime\python.exe -m pip install torch==2.12.1 torchvision --index-url https://download.pytorch.org/whl/cu130
+# 2) then: engine\runtime\python.exe -m pip install -r requirements.txt
 numpy
 opencv-python
 tqdm
 
-# Speed: cupy softsplat path (validated on RTX 5090 / sm_120, ~1.7x on fp16 inference).
-# The nvrtc + runtime wheels are required so cupy can JIT its kernels; the engine adds
-# their bin dirs to the Windows DLL search at startup (_add_cuda_dll_dirs).
-cupy-cuda12x
-nvidia-cuda-nvrtc-cu12
-nvidia-cuda-runtime-cu12
+# Speed: cupy softsplat path (validated on RTX 5090 / sm_120). cupy-cuda13x uses cuda-pathfinder to
+# locate the CUDA 13 runtime, so the old nvrtc DLL-search shim is no longer load-bearing; the nvrtc +
+# runtime wheels are still listed so they are present. NOTE: the CUDA 13 wheels DROPPED the -cuXX
+# suffix - the nvidia-cuda-*-cu13 packages are deprecated placeholders that fail to build, so use the
+# unsuffixed names below (they resolve to 13.x).
+cupy-cuda13x
+nvidia-cuda-nvrtc
+nvidia-cuda-runtime
 
-# Optional TensorRT backend (--trt): native TRT engines for the 5 GMFSS sub nets,
-# about 2.2x over the cupy fp16 path. `tensorrt` pulls ~2GB of cu13 libraries that
-# coexist fine with torch's cu128. onnx + onnxscript drive the dynamo ONNX exporter
-# used to build the engines.
+# Optional TensorRT backend (--trt): native TRT engines for the 5 GMFSS sub nets, about 2.2x over the
+# cupy fp16 path. `tensorrt` is the cu13 build (CUDA 13.3 libs), matching torch's cu130. onnx +
+# onnxscript drive the dynamo ONNX exporter used to build the engines.
 tensorrt
 onnx
 onnxscript

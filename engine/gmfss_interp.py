@@ -44,8 +44,9 @@ Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--
        (1.0 = off). With --rtx-vsr it runs NVIDIA RTX Video Super Resolution (real AI SR, any
        target resolution); otherwise a high-quality bicubic resize. Decode and interpolation
        stay at the source resolution.
-       --rtx-hdr converts the output to HDR10 via the RTX Video TrueHDR model; --hdr-nits sets the
-       HDR peak luminance (400..2000, default 1000).
+       --rtx-hdr converts the output to HDR10 (BT.2020 PQ) via the RTX Video TrueHDR model and writes
+       HDR10 static metadata (mastering-display + measured MaxCLL/MaxFALL, see hdr10_meta.py);
+       --hdr-nits sets the mastering peak luminance (400..2000, default 1000).
 """
 import os
 import sys
@@ -104,6 +105,15 @@ ap.add_argument("--hdr-nits", type=int, default=1000,
                 help="HDR10 peak luminance in nits for --rtx-hdr (the TrueHDR MaxLuminance and the "
                      "stream's mastering-display / MaxCLL metadata). Clamped to 400..2000; "
                      "default 1000.")
+ap.add_argument("--hdr-saturation", type=int, default=0,
+                help="TrueHDR Saturation for --rtx-hdr (SDK range 0..200). Default 0 = faithful, no "
+                     "added saturation: the SDK's own 'neutral' 100 measurably oversaturates vs the "
+                     "SDR source, while 0 matches it. 100 restores the vivid look; in between trades.")
+ap.add_argument("--hdr-contrast", type=int, default=100,
+                help="TrueHDR Contrast for --rtx-hdr (SDK range 0..200, default 100 = neutral).")
+ap.add_argument("--hdr-middlegray", type=int, default=50,
+                help="TrueHDR MiddleGray for --rtx-hdr (SDK range 10..100, default 50). Midtone "
+                     "anchor; affects brightness, not colour.")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
@@ -116,6 +126,9 @@ UPSCALE = UPSCALE_F > 1.0
 RTX_VSR = args.rtx_vsr                        # use the RTX Video SDK (real RTX VSR) for --upscale
 RTX_HDR = args.rtx_hdr                         # convert the output to HDR10 via RTX Video TrueHDR
 HDR_NITS = max(400, min(2000, args.hdr_nits)) # HDR10 peak luminance (TrueHDR target + metadata)
+HDR_SAT = max(0, min(200, args.hdr_saturation))  # TrueHDR Saturation; default 0 = faithful to source
+HDR_CON = max(0, min(200, args.hdr_contrast))    # TrueHDR Contrast (100 = SDK neutral)
+HDR_MG = max(10, min(100, args.hdr_middlegray))  # TrueHDR MiddleGray midtone anchor (50 = SDK default)
 
 def probe(path):
     # JSON (not csv) so the extra color/format fields stay robust when any of them is
@@ -256,42 +269,44 @@ else:
 
 # Upscale / HDR backend, loaded once for this resolution, then run per frame. Independent of
 # NO_INTERP, so sharpen-only runs can also upscale or convert to HDR. The AI backend is the NVIDIA
-# RTX Video SDK (engine/rtxvideo bridges its CUDA path; see rtxvideo.py):
-#   _RTXVSR - RTX Video Super Resolution, used when --rtx-vsr is given (the GUI "RTX Video Super
-#             Resolution" toggle). When it is absent, _upscale() falls back to bicubic.
-#   _RTXHDR - RTX TrueHDR (--rtx-hdr): SDR -> HDR10, optionally with VSR baked into the same eval.
-# Any setup failure leaves the object None and the render degrades gracefully (bicubic upscale, or
-# an SDR render), so a missing/blocked RTX runtime never breaks a render.
-_RTXVSR = None
-_RTXHDR = None
-# RTX HDR (TrueHDR): when on, the RTX bridge converts every output frame SDR -> HDR10, and when
-# upscaling is also requested it does VSR in the SAME eval (so the separate upscale path is
-# bypassed). The output is packed 10-bit BT.2020 PQ, which forces the HDR encode path below. A load
-# failure leaves _RTXHDR None and the render falls back to the normal SDR path + upscale backend.
-if RTX_HDR:
+# RTX Video SDK (engine/rtxvideo bridges its CUDA path; see rtxvideo.py). VSR and TrueHDR run as
+# SEPARATE passes so the RCAS sharpen lands at the OUTPUT resolution between them (the max-quality
+# order: upscale the clean frame, sharpen at final res, then expand to HDR), instead of the SDK's
+# fused VSR->THDR pass which would force the sharpen at the source resolution ahead of VSR.
+#
+# One bridge instance holds whatever features are needed (the SDK bridge is a single processor):
+#   _RTX.run_vsr - RTX Video Super Resolution (--rtx-vsr); _upscale() falls back to bicubic if absent.
+#   _RTX.run_hdr - RTX TrueHDR (--rtx-hdr): SDR -> HDR10 at the output resolution.
+# Any setup failure leaves _RTX None and the render degrades gracefully (bicubic upscale, SDR render),
+# so a missing/blocked RTX runtime never breaks a render.
+_RTX = None
+_need_vsr = UPSCALE and RTX_VSR              # AI upscale via RTX VSR (else bicubic / no upscale)
+_need_hdr = RTX_HDR                          # SDR -> HDR10 via RTX TrueHDR
+RTX_VSR_ACTIVE = False                       # True once the RTX VSR pass is confirmed available
+HDR_ACTIVE = False                           # drives the 10-bit BT.2020 PQ encode path below
+if _need_vsr or _need_hdr:
     try:
         sys.path.insert(0, ENGINE_DIR)
         import rtxvideo
-        _RTXHDR = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=UPSCALE, hdr=True, hdr_max_nits=HDR_NITS)
-        _vsr_note = f" + VSR -> {OUT_W}x{OUT_H}" if UPSCALE else ""
-        sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits{_vsr_note}) HDR10 (BT.2020 PQ)\n")
+        # OUT_W x OUT_H is the final resolution: VSR's target and the size TrueHDR runs at. It equals
+        # W x H when not upscaling, so a no-/bicubic-upscale HDR run still runs TrueHDR at the right
+        # size. VSR and TrueHDR features both live on this one instance when both are requested.
+        _RTX = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=_need_vsr, hdr=_need_hdr,
+                                 hdr_max_nits=HDR_NITS, hdr_contrast=HDR_CON, hdr_saturation=HDR_SAT,
+                                 hdr_middlegray=HDR_MG)
+        RTX_VSR_ACTIVE = _need_vsr
+        HDR_ACTIVE = _need_hdr
+        if _need_vsr:
+            sys.stderr.write(f"RTX Video Super Resolution ready (Ultra) -> {OUT_W}x{OUT_H}\n")
+        if _need_hdr:
+            sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits, sat {HDR_SAT}, con {HDR_CON}, "
+                             f"mg {HDR_MG}) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
     except Exception as e:  # noqa: BLE001
-        sys.stderr.write(f"[rtx] HDR unavailable, rendering SDR: {repr(e)[:200]}\n")
-        _RTXHDR = None
+        sys.stderr.write(f"[rtx] unavailable, falling back (bicubic upscale / SDR): {repr(e)[:200]}\n")
+        _RTX = None
+        RTX_VSR_ACTIVE = False
+        HDR_ACTIVE = False
     sys.stderr.flush()
-# Upscale backend, only when RTX HDR is not already handling the upscale (HDR off, or HDR failed to
-# load): RTX VSR when requested, else _upscale() uses bicubic.
-if UPSCALE and _RTXHDR is None and RTX_VSR:
-    try:
-        sys.path.insert(0, ENGINE_DIR)
-        import rtxvideo
-        _RTXVSR = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=True, vsr_quality=4)
-        sys.stderr.write(f"RTX Video Super Resolution ready (Ultra) -> {OUT_W}x{OUT_H}\n")
-    except Exception as e:  # noqa: BLE001
-        sys.stderr.write(f"[rtx] VSR unavailable, using bicubic upscale: {repr(e)[:200]}\n")
-        _RTXVSR = None
-    sys.stderr.flush()
-HDR_ACTIVE = _RTXHDR is not None              # drives the 10-bit BT.2020 PQ encode path below
 
 scale = args.scale
 tmp = max(64, int(64 / scale))
@@ -351,31 +366,38 @@ def _rcas(img, con):
 def _upscale(t, ow, oh):
     """Spatially upscale a [1,3,H,W] RGB float image in [0,1] to (oh, ow), per output frame.
 
-    Uses RTX VSR (the RTX Video SDK, _RTXVSR) when it loaded (--rtx-vsr + the runtime present),
+    Uses RTX VSR (the RTX Video SDK, _RTX.run_vsr) when it loaded (--rtx-vsr + the runtime present),
     which outputs exactly (ow, oh); otherwise a high-quality bicubic resize. If VSR fails mid-run it
-    is dropped (set None) and the rest of the clip falls back to bicubic; bicubic is clamped because
-    it can overshoot past [0,1].
+    is dropped (RTX_VSR_ACTIVE set False) and the rest of the clip falls back to bicubic; bicubic is
+    clamped because it can overshoot past [0,1].
     """
-    global _RTXVSR
-    if _RTXVSR is not None:
+    global RTX_VSR_ACTIVE
+    if RTX_VSR_ACTIVE and _RTX is not None:
         try:
-            return _RTXVSR.run_vsr(t)
+            return _RTX.run_vsr(t)
         except Exception as e:  # noqa: BLE001 - degrade to bicubic for the rest of the run
             sys.stderr.write(f"[rtx] VSR run failed, using bicubic: {repr(e)[:160]}\n")
             sys.stderr.flush()
-            _RTXVSR = None
+            RTX_VSR_ACTIVE = False
     return F.interpolate(t, size=(oh, ow), mode="bicubic", align_corners=False).clamp(0.0, 1.0)
 
 def to_bytes(t):
     t = t.float()[..., :H, :W]            # crop off the padding added in to_tensor
-    if SHARPEN > 0:
-        t = _rcas(t, SHARPEN)             # FSR-style RCAS sharpen (GUI "FSR" / --sharpen); see _rcas
-    if _RTXHDR is not None:
-        # RTX TrueHDR (with VSR baked in when upscaling): returns packed 10-bit BT.2020 PQ RGB
-        # (x2rgb10le) already at OUT_W x OUT_H, so it bypasses _upscale and the SDR quantise below.
-        return _RTXHDR.run_hdr(t)
+    # Pipeline order, chosen for max quality (VSR -> RCAS -> TrueHDR):
+    #   1. upscale the clean interpolated frame (the AI upscaler gets an unsharpened, in-distribution
+    #      input);
+    #   2. sharpen at the OUTPUT resolution (RCAS crisps the final image instead of being blurred up
+    #      by the upscaler);
+    #   3. expand to HDR last (sharpening stays in SDR, where RCAS's luma weighting is valid).
+    # VSR and TrueHDR are separate RTX passes (see rtxvideo.py) so RCAS can sit between them.
     if UPSCALE:
-        t = _upscale(t, OUT_W, OUT_H)     # spatial upscale to the target resolution; see _upscale
+        t = _upscale(t, OUT_W, OUT_H)     # RTX VSR (_RTX.run_vsr) or bicubic; -> OUT_W x OUT_H
+    if SHARPEN > 0:
+        t = _rcas(t, SHARPEN)             # FSR-style RCAS sharpen at the output res (GUI "FSR"); see _rcas
+    if HDR_ACTIVE:
+        # RTX TrueHDR: SDR -> packed 10-bit BT.2020 PQ RGB (x2rgb10le) at OUT_W x OUT_H. This drives
+        # the HDR encode path below, so it bypasses the SDR quantise.
+        return _RTX.run_hdr(t)
     # Round to nearest, not truncate: numpy's float->uint cast floors, which biases every frame
     # ~0.5 LSB low (a uniform darkening, and the wrong quantisation of the model output). Rounding
     # is the unbiased mapping back to integer samples; every emitted frame goes through here.
@@ -538,6 +560,28 @@ def _reader():
 rt = threading.Thread(target=_reader, daemon=True)
 rt.start()
 
+
+def _write_hdr10_metadata():
+    """Stamp HDR10 static metadata into the finished mp4 (mastering display + content light level).
+
+    The bundled LGPL ffmpeg cannot write it on the hevc_nvenc path (no encoder/BSF option exists),
+    so hdr10_meta adds the ISOBMFF boxes directly: the mastering display peak is the TrueHDR target
+    (HDR_NITS), and MaxCLL/MaxFALL are measured from the actual frames. With this, one PQ/BT.2020
+    file tone-maps correctly on both a 1000-nit and a 400-nit display with no per-display setting.
+    Best-effort: a failure logs a note but never fails the render."""
+    if not HDR_ACTIVE or not str(out_path).lower().endswith(".mp4"):
+        return
+    try:
+        import hdr10_meta
+        cll = int(getattr(_RTX, "maxcll", 0) or 0)
+        fall = int(getattr(_RTX, "maxfall", 0) or 0)
+        if hdr10_meta.inject_hdr10(out_path, max_nits=HDR_NITS, maxcll=cll, maxfall=fall):
+            sys.stderr.write(f"HDR10 metadata: mastered {HDR_NITS} nits (BT.2020/D65), "
+                             f"measured MaxCLL {cll} / MaxFALL {fall} nits\n"); sys.stderr.flush()
+    except Exception as e:  # noqa: BLE001 - container metadata is a finishing touch, not load-bearing
+        sys.stderr.write(f"HDR10 metadata: skipped ({e})\n"); sys.stderr.flush()
+
+
 if NO_INTERP:
     # Sharpen-only pass: no interpolation, one output frame per source frame at the source fps.
     # Each decoded frame is RCAS-sharpened on the GPU when --sharpen > 0, or passed straight
@@ -565,6 +609,7 @@ if NO_INTERP:
         dec.wait()
     if _werr:
         raise _werr[0]          # surface a failed encode pipe as a nonzero exit
+    _write_hdr10_metadata()
     sys.stderr.write(f"done {k} frames "
                      f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n")
     sys.exit(0)
@@ -648,4 +693,5 @@ finally:
     dec.wait()
 if _werr:
     raise _werr[0]          # surface a failed encode pipe as a nonzero exit
+_write_hdr10_metadata()
 sys.stderr.write(f"done {k} pairs ({dups} held as duplicates) -> {out_path}\n")
