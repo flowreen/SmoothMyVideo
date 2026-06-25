@@ -114,6 +114,17 @@ ap.add_argument("--hdr-contrast", type=int, default=100,
 ap.add_argument("--hdr-middlegray", type=int, default=50,
                 help="TrueHDR MiddleGray for --rtx-hdr (SDK range 10..100, default 50). Midtone "
                      "anchor; affects brightness, not colour.")
+ap.add_argument("--hdr-mastering-prim", choices=["p3", "bt2020", "bt709"], default="p3",
+                help="mastering-display primaries stamped into the HDR10 mdcv box for --rtx-hdr: "
+                     "p3 (Display P3, the default and what normal HDR masters carry, so a player "
+                     "reports real chromaticities), bt2020 (full nominal BT.2020), or bt709 (the "
+                     "true SDR-source gamut). Cosmetic gamut hint; the stream stays BT.2020 PQ and "
+                     "the frames decode identically.")
+ap.add_argument("--hdr-color", choices=["faithful", "raw"], default="faithful",
+                help="colour handling for --rtx-hdr. faithful (default): keep TrueHDR's luminance (the "
+                     "HDR brightness expansion) but take chromaticity from the SDR source, because the "
+                     "model rotates hues (it greens/cyans the blues even at saturation 0); accurate "
+                     "colour at full HDR brightness. raw: emit TrueHDR's colour unmodified.")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
@@ -129,6 +140,8 @@ HDR_NITS = max(400, min(2000, args.hdr_nits)) # HDR10 peak luminance (TrueHDR ta
 HDR_SAT = max(0, min(200, args.hdr_saturation))  # TrueHDR Saturation; default 0 = faithful to source
 HDR_CON = max(0, min(200, args.hdr_contrast))    # TrueHDR Contrast (100 = SDK neutral)
 HDR_MG = max(10, min(100, args.hdr_middlegray))  # TrueHDR MiddleGray midtone anchor (50 = SDK default)
+HDR_MASTER_PRIM = args.hdr_mastering_prim         # mdcv mastering-display gamut hint (p3/bt2020/bt709)
+HDR_FAITHFUL = args.hdr_color == "faithful"       # keep TrueHDR luma but source chroma (accurate colour)
 
 def probe(path):
     # JSON (not csv) so the extra color/format fields stay robust when any of them is
@@ -293,14 +306,14 @@ if _need_vsr or _need_hdr:
         # size. VSR and TrueHDR features both live on this one instance when both are requested.
         _RTX = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=_need_vsr, hdr=_need_hdr,
                                  hdr_max_nits=HDR_NITS, hdr_contrast=HDR_CON, hdr_saturation=HDR_SAT,
-                                 hdr_middlegray=HDR_MG)
+                                 hdr_middlegray=HDR_MG, hdr_faithful_color=HDR_FAITHFUL)
         RTX_VSR_ACTIVE = _need_vsr
         HDR_ACTIVE = _need_hdr
         if _need_vsr:
             sys.stderr.write(f"RTX Video Super Resolution ready (Ultra) -> {OUT_W}x{OUT_H}\n")
         if _need_hdr:
             sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits, sat {HDR_SAT}, con {HDR_CON}, "
-                             f"mg {HDR_MG}) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
+                             f"mg {HDR_MG}, colour {args.hdr_color}) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"[rtx] unavailable, falling back (bicubic upscale / SDR): {repr(e)[:200]}\n")
         _RTX = None
@@ -575,8 +588,9 @@ def _write_hdr10_metadata():
         import hdr10_meta
         cll = int(getattr(_RTX, "maxcll", 0) or 0)
         fall = int(getattr(_RTX, "maxfall", 0) or 0)
-        if hdr10_meta.inject_hdr10(out_path, max_nits=HDR_NITS, maxcll=cll, maxfall=fall):
-            sys.stderr.write(f"HDR10 metadata: mastered {HDR_NITS} nits (BT.2020/D65), "
+        prim = hdr10_meta.MASTERING_PRIMARIES.get(HDR_MASTER_PRIM, hdr10_meta.P3_D65_GBR)
+        if hdr10_meta.inject_hdr10(out_path, max_nits=HDR_NITS, maxcll=cll, maxfall=fall, primaries=prim):
+            sys.stderr.write(f"HDR10 metadata: mastered {HDR_NITS} nits ({HDR_MASTER_PRIM.upper()}/D65), "
                              f"measured MaxCLL {cll} / MaxFALL {fall} nits\n"); sys.stderr.flush()
     except Exception as e:  # noqa: BLE001 - container metadata is a finishing touch, not load-bearing
         sys.stderr.write(f"HDR10 metadata: skipped ({e})\n"); sys.stderr.flush()

@@ -8,7 +8,8 @@ container level, the same place ffmpeg's own mov muxer would: two ISOBMFF boxes 
 sample entry, next to the `hvcC`/`colr` boxes that are already there.
 
 - `mdcv` - Mastering Display Colour Volume (ISO/IEC 23001-17 / SMPTE ST 2086): the display the
-  content was mastered on (BT.2020 primaries, D65 white, peak/black luminance). This is the box a
+  content was mastered on (grading-monitor primaries - Display P3 + D65 white by default - plus
+  peak/black luminance). This is the box a
   TV uses to tone-map: it says "graded for a 1000-nit display", so a 400-nit panel knows to roll
   the highlights down instead of guessing. Without it a player only has the PQ/BT.2020 signalling
   and assumes a default peak.
@@ -29,10 +30,18 @@ All multi-byte fields are big-endian (ISOBMFF). Chromaticities are in units of 0
 import struct
 import sys
 
-# BT.2020 primaries and D65 white point in mdcv's 0.00002 units (coord * 50000). The box order is
-# Green, Blue, Red (SMPTE ST 2086 / ISO 23001-17), not RGB.
-BT2020_GBR = ((8500, 39850), (6550, 2300), (35400, 14600))   # G, B, R  (0.170,0.797)(0.131,0.046)(0.708,0.292)
+# Mastering-display gamuts in mdcv's 0.00002 units (coord * 50000). Box order is Green, Blue, Red
+# (SMPTE ST 2086 / ISO 23001-17), not RGB. Real HDR masters carry their grading monitor's primaries
+# (almost always Display P3 inside a BT.2020 container), which is why a player prints explicit
+# chromaticities for them; the nominal BT.2020 set instead collapses to the bare name "bt.2020". P3 is
+# the default here: it is the de-facto grading gamut and a faithful bound for SDR-sourced TrueHDR
+# output (whose real gamut sits within P3), so the file reads like a normal HDR master. The stream's
+# own colr/VUI primaries stay BT.2020 either way - this box is only the mastering-display hint.
+P3_D65_GBR = ((13250, 34500), (7500, 3000), (34000, 16000))  # G(0.265,0.690) B(0.150,0.060) R(0.680,0.320)
+BT2020_GBR = ((8500, 39850), (6550, 2300), (35400, 14600))   # G(0.170,0.797) B(0.131,0.046) R(0.708,0.292)
+BT709_GBR  = ((15000, 30000), (7500, 3000), (32000, 16500))  # G(0.300,0.600) B(0.150,0.060) R(0.640,0.330)
 D65 = (15635, 16450)                                          # (0.3127, 0.3290)
+MASTERING_PRIMARIES = {"p3": P3_D65_GBR, "bt2020": BT2020_GBR, "bt709": BT709_GBR}
 
 _CONTAINERS = (b"moov", b"trak", b"mdia", b"minf", b"stbl")   # plain container boxes (8-byte header)
 
@@ -98,7 +107,7 @@ def _mdcv_clli(primaries, white, max_nits, min_nits, maxcll, maxfall):
 
 
 def inject_hdr10(path, max_nits=1000, min_nits=0.0001, maxcll=0, maxfall=0,
-                 primaries=BT2020_GBR, white=D65):
+                 primaries=P3_D65_GBR, white=D65):
     """Add mdcv + clli to the video sample entry of the MP4 at `path`, in place.
 
     Returns True if written, False if skipped (already present, or the structure was not the
@@ -197,8 +206,11 @@ if __name__ == "__main__":
         nits = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
         cll = int(sys.argv[4]) if len(sys.argv) > 4 else 0
         fall = int(sys.argv[5]) if len(sys.argv) > 5 else 0
-        print("wrote" if inject_hdr10(sys.argv[2], nits, maxcll=cll, maxfall=fall) else "skipped")
+        prim = MASTERING_PRIMARIES.get(sys.argv[6], P3_D65_GBR) if len(sys.argv) > 6 else P3_D65_GBR
+        print("wrote" if inject_hdr10(sys.argv[2], nits, maxcll=cll, maxfall=fall, primaries=prim)
+              else "skipped")
     elif len(sys.argv) >= 3 and sys.argv[1] == "dump":
         _dump(sys.argv[2])
     else:
-        print("usage: hdr10_meta.py inject <file.mp4> [nits] [maxcll] [maxfall] | dump <file.mp4>")
+        print("usage: hdr10_meta.py inject <file.mp4> [nits] [maxcll] [maxfall] [p3|bt2020|bt709] | "
+              "dump <file.mp4>")

@@ -114,7 +114,7 @@ class RTXVideo:
 
     def __init__(self, width, height, out_w, out_h, vsr=True, hdr=False, vsr_quality=4,
                  hdr_max_nits=1000, hdr_contrast=100, hdr_saturation=0, hdr_middlegray=50,
-                 rtx_dir=RTX_DIR):
+                 hdr_faithful_color=True, rtx_dir=RTX_DIR):
         # Make sure torch's primary CUDA context exists and is current on this thread before the
         # bridge retains it (create is called with cuContext=NULL -> cuDevicePrimaryCtxRetain).
         torch.zeros(8, device="cuda")
@@ -160,6 +160,13 @@ class RTXVideo:
             self._hdr_in = torch.empty((self.oH, self.oW, 4), dtype=torch.uint8, device="cuda")
             self._hdr_in[..., 3] = 255
             self._hdr_out = torch.empty((self.oH, self.oW, 4), dtype=torch.uint8, device="cuda")
+            # Faithful-colour HDR (default): keep TrueHDR's luminance but take chromaticity from the SDR
+            # source, since the model rotates hues (measurably greens/cyans the blues) even at saturation
+            # 0. Needs the linear BT.709 -> linear BT.2020 primaries matrix (BT.2087).
+            self._faithful = bool(hdr_faithful_color)
+            self._m709_2020 = torch.tensor(
+                [[0.6274, 0.3293, 0.0433], [0.0691, 0.9195, 0.0114], [0.0164, 0.0880, 0.8956]],
+                dtype=torch.float32, device="cuda")
 
     def run_vsr(self, rgb):
         """RTX VSR only on a [1,3,H,W] RGB float tensor in [0,1] on CUDA; returns a [1,3,oH,oW] RGB
@@ -196,11 +203,42 @@ class RTXVideo:
         torch.cuda.synchronize()
         if r != _API_SUCCESS:
             raise RuntimeError("rtx_video_api_cuda_evaluate_thdr_deviceptr failed")
+        if self._faithful:
+            return self._chroma_correct(rgb, self._hdr_out)   # source chroma + TrueHDR luma; measures light
         try:
             self._measure_light(self._hdr_out)
         except Exception:  # noqa: BLE001 - measurement is best-effort; never fail a render over it
             pass
         return self._hdr_out.cpu().numpy().tobytes()   # [oH,oW,4] packed 10:10:10:2 == x2rgb10le
+
+    def _chroma_correct(self, rgb, packed):
+        """Faithful-colour HDR. TrueHDR expands luminance well (the real HDR conversion) but rotates
+        hues - it measurably pushes blues toward green/cyan even at saturation 0 - so keep its per-pixel
+        luminance and take chromaticity from the colorimetrically-correct SDR source. All in linear
+        BT.2020: decode the TrueHDR PQ output to linear for its luminance; convert the SDR source (gamma
+        BT.709) to linear BT.2020 for its unit-luminance colour; recombine and re-encode to PQ, packing
+        the same x2rgb10le (B in the low 10 bits) the raw path emits."""
+        u = packed.view(torch.int32).squeeze(-1)                              # [H,W]  B|G<<10|R<<20|A<<30
+        thdr = torch.stack([(u >> 20) & 1023, (u >> 10) & 1023, u & 1023], 0).float().div_(1023.0)  # R,G,B code'
+        ep = thdr.pow(1.0 / _PQ_M2)                                           # PQ EOTF -> linear (1.0==10000nit)
+        lin_t = ((ep - _PQ_C1).clamp_(min=0.0) / (_PQ_C2 - _PQ_C3 * ep).clamp_(min=1e-6)).pow_(1.0 / _PQ_M1)
+        y_t = 0.2627 * lin_t[0] + 0.6780 * lin_t[1] + 0.0593 * lin_t[2]       # BT.2020 luminance [H,W]
+        s = rgb[0].clamp(0.0, 1.0)                                            # [3,H,W] SDR, gamma BT.709
+        lin709 = torch.where(s < 0.081, s / 4.5, ((s + 0.099) / 1.099).clamp(min=0.0).pow(1.0 / 0.45))
+        lin = torch.einsum("ij,jhw->ihw", self._m709_2020, lin709)           # linear BT.2020 [3,H,W]
+        y_s = (0.2627 * lin[0] + 0.6780 * lin[1] + 0.0593 * lin[2]).clamp_(min=1e-6)
+        out = (lin * (y_t / y_s)).clamp_(0.0, 1.0)                            # source chroma @ TrueHDR luma
+        try:                                                                  # MaxCLL/FALL from corrected px
+            mx = out.max(0).values
+            self._cll = max(self._cll, float(mx.max().item()) * 10000.0)
+            self._fall = max(self._fall, float(mx.mean().item()) * 10000.0)
+        except Exception:  # noqa: BLE001
+            pass
+        lm = out.pow(_PQ_M1)                                                  # linear -> PQ OETF -> code'
+        code = (((_PQ_C1 + _PQ_C2 * lm) / (1.0 + _PQ_C3 * lm)).pow_(_PQ_M2)
+                .mul_(1023.0).round_().clamp_(0, 1023).to(torch.int64))
+        pk = (code[2] & 1023) | ((code[1] & 1023) << 10) | ((code[0] & 1023) << 20) | (3 << 30)
+        return pk.cpu().numpy().astype("<u4").tobytes()                      # [H,W] -> x2rgb10le bytes
 
     def _measure_light(self, packed):
         """Accumulate MaxCLL/MaxFALL from one packed 10-bit PQ frame ([H,W,4] uint8 ==
