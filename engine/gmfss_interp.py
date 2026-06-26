@@ -114,12 +114,14 @@ ap.add_argument("--hdr-contrast", type=int, default=100,
 ap.add_argument("--hdr-middlegray", type=int, default=50,
                 help="TrueHDR MiddleGray for --rtx-hdr (SDK range 10..100, default 50). Midtone "
                      "anchor; affects brightness, not colour.")
-ap.add_argument("--hdr-mastering-prim", choices=["p3", "bt2020", "bt709"], default="p3",
-                help="mastering-display primaries stamped into the HDR10 mdcv box for --rtx-hdr: "
-                     "p3 (Display P3, the default and what normal HDR masters carry, so a player "
-                     "reports real chromaticities), bt2020 (full nominal BT.2020), or bt709 (the "
-                     "true SDR-source gamut). Cosmetic gamut hint; the stream stays BT.2020 PQ and "
-                     "the frames decode identically.")
+ap.add_argument("--hdr-mastering-prim", choices=["display-p3", "dci-p3", "bt2020", "bt709"],
+                default="display-p3",
+                help="mastering-display colorspace stamped into the HDR10 mdcv box for --rtx-hdr: "
+                     "display-p3 (P3 gamut + D65, the default and what normal HDR masters carry, so a "
+                     "player reports real chromaticities), dci-p3 (same P3 gamut, DCI theatrical white, "
+                     "SMPTE RP431-2), bt2020 (full nominal BT.2020), or bt709 (the true SDR-source "
+                     "gamut). Cosmetic gamut hint; the stream stays BT.2020 PQ and the frames decode "
+                     "identically.")
 ap.add_argument("--hdr-color", choices=["faithful", "raw"], default="faithful",
                 help="colour handling for --rtx-hdr. faithful (default): keep TrueHDR's luminance (the "
                      "HDR brightness expansion) but take chromaticity from the SDR source, because the "
@@ -140,7 +142,7 @@ HDR_NITS = max(400, min(2000, args.hdr_nits)) # HDR10 peak luminance (TrueHDR ta
 HDR_SAT = max(0, min(200, args.hdr_saturation))  # TrueHDR Saturation; default 0 = faithful to source
 HDR_CON = max(0, min(200, args.hdr_contrast))    # TrueHDR Contrast (100 = SDK neutral)
 HDR_MG = max(10, min(100, args.hdr_middlegray))  # TrueHDR MiddleGray midtone anchor (50 = SDK default)
-HDR_MASTER_PRIM = args.hdr_mastering_prim         # mdcv mastering-display gamut hint (p3/bt2020/bt709)
+HDR_MASTER_PRIM = args.hdr_mastering_prim         # mdcv mastering-display colorspace (display-p3/dci-p3/bt2020/bt709)
 HDR_FAITHFUL = args.hdr_color == "faithful"       # keep TrueHDR luma but source chroma (accurate colour)
 
 def probe(path):
@@ -588,9 +590,9 @@ def _write_hdr10_metadata():
         import hdr10_meta
         cll = int(getattr(_RTX, "maxcll", 0) or 0)
         fall = int(getattr(_RTX, "maxfall", 0) or 0)
-        prim = hdr10_meta.MASTERING_PRIMARIES.get(HDR_MASTER_PRIM, hdr10_meta.P3_D65_GBR)
-        if hdr10_meta.inject_hdr10(out_path, max_nits=HDR_NITS, maxcll=cll, maxfall=fall, primaries=prim):
-            sys.stderr.write(f"HDR10 metadata: mastered {HDR_NITS} nits ({HDR_MASTER_PRIM.upper()}/D65), "
+        if hdr10_meta.inject_hdr10(out_path, max_nits=HDR_NITS, maxcll=cll, maxfall=fall,
+                                   colorspace=HDR_MASTER_PRIM):
+            sys.stderr.write(f"HDR10 metadata: mastered {HDR_NITS} nits ({HDR_MASTER_PRIM}), "
                              f"measured MaxCLL {cll} / MaxFALL {fall} nits\n"); sys.stderr.flush()
     except Exception as e:  # noqa: BLE001 - container metadata is a finishing touch, not load-bearing
         sys.stderr.write(f"HDR10 metadata: skipped ({e})\n"); sys.stderr.flush()

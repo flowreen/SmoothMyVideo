@@ -114,7 +114,7 @@ def cuda_kernel(strFunction:str, strKernel:str, objVariables:typing.Dict):
         # end
 
         while True:
-            objMatch = re.search('(SIZE_)([0-4])(\()([^\)]*)(\))', strKernel)
+            objMatch = re.search(r'(SIZE_)([0-4])(\()([^\)]*)(\))', strKernel)
 
             if objMatch is None:
                 break
@@ -129,7 +129,7 @@ def cuda_kernel(strFunction:str, strKernel:str, objVariables:typing.Dict):
         # end
 
         while True:
-            objMatch = re.search('(OFFSET_)([0-4])(\()', strKernel)
+            objMatch = re.search(r'(OFFSET_)([0-4])(\()', strKernel)
 
             if objMatch is None:
                 break
@@ -168,7 +168,7 @@ def cuda_kernel(strFunction:str, strKernel:str, objVariables:typing.Dict):
         # end
 
         while True:
-            objMatch = re.search('(VALUE_)([0-4])(\()', strKernel)
+            objMatch = re.search(r'(VALUE_)([0-4])(\()', strKernel)
 
             if objMatch is None:
                 break
@@ -276,7 +276,7 @@ def softsplat(tenIn:torch.Tensor, tenFlow:torch.Tensor, tenMetric:torch.Tensor, 
 
 class softsplat_func(torch.autograd.Function):
     @staticmethod
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(self, tenIn, tenFlow):
         tenOut = tenIn.new_zeros([tenIn.shape[0], tenIn.shape[1], tenIn.shape[2], tenIn.shape[3]])
 
@@ -355,7 +355,7 @@ class softsplat_func(torch.autograd.Function):
     # end
 
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(self, tenOutgrad):
         tenIn, tenFlow = self.saved_tensors
 
