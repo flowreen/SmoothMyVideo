@@ -122,11 +122,15 @@ ap.add_argument("--hdr-mastering-prim", choices=["display-p3", "dci-p3", "bt2020
                      "SMPTE RP431-2), bt2020 (full nominal BT.2020), or bt709 (the true SDR-source "
                      "gamut). Cosmetic gamut hint; the stream stays BT.2020 PQ and the frames decode "
                      "identically.")
-ap.add_argument("--hdr-color", choices=["faithful", "raw"], default="faithful",
-                help="colour handling for --rtx-hdr. faithful (default): keep TrueHDR's luminance (the "
-                     "HDR brightness expansion) but take chromaticity from the SDR source, because the "
-                     "model rotates hues (it greens/cyans the blues even at saturation 0); accurate "
-                     "colour at full HDR brightness. raw: emit TrueHDR's colour unmodified.")
+ap.add_argument("--hdr-color", choices=["vivid", "faithful", "raw"], default="vivid",
+                help="colour handling for --rtx-hdr (the TrueHDR model rotates hues - it greens/cyans the "
+                     "blues - even at saturation 0). vivid (default): keep TrueHDR luminance, take the SDR "
+                     "source's hue, and scale chroma in ICtCp by --hdr-vividness - a hue-linear saturation "
+                     "gain (HDR pop, no hue shift). faithful: source hue AND saturation, accurate but never "
+                     "richer than the source. raw: TrueHDR colour unmodified.")
+ap.add_argument("--hdr-vividness", type=float, default=1.3,
+                help="for --hdr-color vivid: chroma gain over the colorimetric source, applied in ICtCp so "
+                     "hue never shifts. 1.0 == faithful, >1 richer; default 1.3. Clamped 0..4.")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
@@ -143,7 +147,8 @@ HDR_SAT = max(0, min(200, args.hdr_saturation))  # TrueHDR Saturation; default 0
 HDR_CON = max(0, min(200, args.hdr_contrast))    # TrueHDR Contrast (100 = SDK neutral)
 HDR_MG = max(10, min(100, args.hdr_middlegray))  # TrueHDR MiddleGray midtone anchor (50 = SDK default)
 HDR_MASTER_PRIM = args.hdr_mastering_prim         # mdcv mastering-display colorspace (display-p3/dci-p3/bt2020/bt709)
-HDR_FAITHFUL = args.hdr_color == "faithful"       # keep TrueHDR luma but source chroma (accurate colour)
+HDR_COLOR = args.hdr_color                         # vivid (default) / faithful / raw colour handling
+HDR_VIVIDNESS = max(0.0, min(4.0, args.hdr_vividness))  # vivid chroma gain over source (1.0 == faithful)
 
 def probe(path):
     # JSON (not csv) so the extra color/format fields stay robust when any of them is
@@ -308,14 +313,15 @@ if _need_vsr or _need_hdr:
         # size. VSR and TrueHDR features both live on this one instance when both are requested.
         _RTX = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=_need_vsr, hdr=_need_hdr,
                                  hdr_max_nits=HDR_NITS, hdr_contrast=HDR_CON, hdr_saturation=HDR_SAT,
-                                 hdr_middlegray=HDR_MG, hdr_faithful_color=HDR_FAITHFUL)
+                                 hdr_middlegray=HDR_MG, hdr_color=HDR_COLOR, hdr_vividness=HDR_VIVIDNESS)
         RTX_VSR_ACTIVE = _need_vsr
         HDR_ACTIVE = _need_hdr
         if _need_vsr:
             sys.stderr.write(f"RTX Video Super Resolution ready (Ultra) -> {OUT_W}x{OUT_H}\n")
         if _need_hdr:
+            _viv = f" {HDR_VIVIDNESS:g}" if HDR_COLOR == "vivid" else ""
             sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits, sat {HDR_SAT}, con {HDR_CON}, "
-                             f"mg {HDR_MG}, colour {args.hdr_color}) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
+                             f"mg {HDR_MG}, colour {HDR_COLOR}{_viv}) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"[rtx] unavailable, falling back (bicubic upscale / SDR): {repr(e)[:200]}\n")
         _RTX = None
@@ -339,8 +345,8 @@ def to_tensor(buf):
     # on the CUDA stream. PyTorch's caching pinned allocator reuses the locked block across frames
     # and defers its reuse until the copy's event completes, so dropping the Python-side reference
     # right after is safe; the per-frame cost is one host copy, not a fresh page-lock.
-    t = torch.from_numpy(a.transpose(2, 0, 1).copy()).pin_memory()
-    t = t.to(device, non_blocking=True).unsqueeze(0).float() / MAXV
+    t = torch.from_numpy(a.copy()).pin_memory()                  # HWC, one flat memcpy (no strided CPU transpose)
+    t = t.to(device, non_blocking=True).permute(2, 0, 1).unsqueeze(0).float() / MAXV  # HWC->CHW folds into the GPU cast
     # Reach the multiple of 64 the model needs by padding the bottom/right edge, not by
     # resizing the whole frame up and back. A bilinear resize (the old path here and in
     # to_bytes) resamples every pixel and softens the entire image; padding then cropping
@@ -416,7 +422,7 @@ def to_bytes(t):
     # Round to nearest, not truncate: numpy's float->uint cast floors, which biases every frame
     # ~0.5 LSB low (a uniform darkening, and the wrong quantisation of the model output). Rounding
     # is the unbiased mapping back to integer samples; every emitted frame goes through here.
-    a = (t[0] * MAXV).round().clamp(0, MAXV).cpu().numpy().transpose(1, 2, 0)
+    a = (t[0] * MAXV).round().clamp(0, MAXV).permute(1, 2, 0).contiguous().cpu().numpy()  # CHW->HWC on GPU
     return a.astype(NP_DT).tobytes()
 
 def read_exact(stream, nbytes):
@@ -597,6 +603,16 @@ def _write_hdr10_metadata():
     except Exception as e:  # noqa: BLE001 - container metadata is a finishing touch, not load-bearing
         sys.stderr.write(f"HDR10 metadata: skipped ({e})\n"); sys.stderr.flush()
 
+
+# Run the whole interpolation/encode pipeline on one non-default CUDA stream so TRT, softsplat's cupy
+# kernel and the torch glue all share it: same-stream ordering then makes each op's output ready for the
+# next with no per-call host sync (the old per-engine synchronize in trt_runtime is gone), leaving just
+# the implicit drain at each frame's .cpu() download. The non-default stream also keeps TensorRT's
+# default-stream warning away. Sync first so model weights and RTX init (issued on the default stream)
+# are visible on the new stream.
+torch.cuda.synchronize()
+_infer_stream = torch.cuda.Stream()
+torch.cuda.set_stream(_infer_stream)
 
 if NO_INTERP:
     # Sharpen-only pass: no interpolation, one output frame per source frame at the source fps.

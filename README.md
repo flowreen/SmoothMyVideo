@@ -23,12 +23,14 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   TrueHDR Saturation defaults to a faithful **0** (its SDK "neutral" 100 over-saturates versus the
   source); Contrast/MiddleGray stay at the neutral 100/50. The per-display nits slider was removed in
   favour of a fixed 1000-nit master. See HDR mastering.
-- **Faithful-colour HDR (cyan/teal fixed).** The blue/teal cast in RTX HDR output was root-caused to
-  the **TrueHDR model itself** rotating hues (it greens the blues even at Saturation 0); SMV's decode,
-  interpolation and encode were each proven colour-faithful. RTX HDR now keeps TrueHDR's luminance (the
-  HDR expansion) but takes chromaticity from the SDR source, in linear BT.2020, removing about 78% of
-  the shift at full HDR brightness. On by default (`--hdr-color faithful`; `raw` restores the old
-  model colour). See HDR mastering.
+- **Faithful & vivid HDR colour (cyan/teal fixed).** The blue/teal cast in RTX HDR output was
+  root-caused to the **TrueHDR model itself** rotating hues (it greens the blues even at Saturation 0);
+  SMV's decode, interpolation and encode were each proven colour-faithful. The fix keeps TrueHDR's
+  luminance (the HDR expansion) but rebuilds colour from the SDR source's hue. Default `vivid` works in
+  ICtCp (BT.2100) and scales chroma by `--hdr-vividness` (1.3) for HDR pop with the hue locked - measured
+  A/B shows the model adds no real colourfulness at Saturation 0 (it mostly rotates hue), so richness is
+  taken from the source, hue-linearly. `faithful` keeps the source's own saturation; `raw` restores the
+  unmodified model colour. See HDR mastering.
 - **HDR10 mastering primaries default to Display P3.** The injected `mdcv` now carries P3 / D65 (the
   real grading gamut, and a faithful bound for SDR-sourced HDR), so a player reports real chromaticities
   like other HDR masters instead of collapsing to the nominal BT.2020 name. Selected by colorspace
@@ -233,6 +235,14 @@ resolution (a few minutes) and are cached, so later runs at that resolution star
 They are specific to the GPU, the resolution, and the TensorRT version, and rebuild on a
 different machine. Any engine that fails to build falls back to eager, so the app never breaks.
 
+A code-side performance audit (2026-06-26) probed or attempted six further optimizations and found the
+pipeline is **at its practical compute limit** on this hardware and model: I/O and host-sync changes are
+perf-neutral (it is GPU-compute-bound, not launch or sync bound), batching the per-timestep nets does not
+help (FusionNet is already saturated at batch 1), and fp8 fails a quality gate (precision, 61px flow
+outliers). Two non-regressing cleanups were kept: GPU-side transposes, and the whole inference now runs on
+one CUDA stream with no per-call TensorRT sync (which also keeps the TRT default-stream warning fixed). See
+**Performance headroom** under What can be done next for the per-item results.
+
 `torch.compile` was tried and dropped. Its inductor backend needs Triton plus MSVC;
 Triton is a pip wheel that would bundle fine, but the path is deliberately not bundled,
 for two reasons. First, inductor compiles just in time, on the first call on whatever
@@ -374,10 +384,12 @@ engine does the four things a production HDR10 deliverable is made of:
    model adds vibrance of its own); 0 lands on the original's colour without washing out.
    `--hdr-saturation` (0..200) tunes it, 100 = vivid; Contrast and MiddleGray stay at the SDK neutral
    100 / 50. Hue: even at Saturation 0 the model still rotates hues (it measurably greens the blues, so
-   skies and snow read cyan/teal), and the SDK has no hue control, so **faithful colour** mode keeps
-   TrueHDR's luminance but takes chromaticity from the SDR source, recombined in linear BT.2020
-   (`RTXVideo._chroma_correct`). Accurate colour at full HDR brightness, on by default
-   (`--hdr-color faithful`; `raw` emits TrueHDR's colour unmodified).
+   skies and snow read cyan/teal), and the SDK has no hue control, so SMV rebuilds colour from the source
+   hue. Default `vivid` does it in ICtCp (BT.2100): keep TrueHDR's luminance, lock the hue to the source,
+   and scale chroma by `--hdr-vividness` (default 1.3) for a hue-linear saturation gain - HDR pop, no hue
+   shift (`RTXVideo._ictcp_correct`). `faithful` keeps the source's own saturation in linear BT.2020
+   (`RTXVideo._chroma_correct`); `raw` emits TrueHDR's colour unmodified. Accurate hue at full HDR
+   brightness, on by default.
 3. **Master to a fixed peak, set once.** `--hdr-nits` (default 1000) is the mastering peak the PQ
    values are shaped to, not a per-monitor knob. 1000 is the consumer standard; 4000 is premium.
 4. **Write the mastering metadata.** `mdcv` (mastering-display: Display P3 / D65 by default, the
@@ -409,8 +421,10 @@ For whoever picks this up.
   shift survived a no-interpolation render, isolating it to the model. TrueHDR exposes no hue / white
   balance knob, so the fix keeps its per-pixel luminance and **transplants the source chromaticity** in
   linear BT.2020 (`RTXVideo._chroma_correct`): about 78% of the cast removed (+0.048 to +0.011), the
-  residual being 4:2:0 chroma subsampling on the p010 encode. On by default (`--hdr-color faithful`;
-  `raw` for the old model colour). Note: an earlier "viewing transform, not the pipeline" reading was
+  residual being 4:2:0 chroma subsampling on the p010 encode. `faithful` mode is this linear transplant;
+  the default `vivid` does the same hue lock in ICtCp and adds a hue-linear saturation gain
+  (`--hdr-vividness`, `RTXVideo._ictcp_correct`), since the model adds no real chroma at Saturation 0;
+  `raw` keeps the old model colour. Note: an earlier "viewing transform, not the pipeline" reading was
   **wrong** - it judged the neutral white point normalized by green, which hides a green shift; the
   shift is hue-dependent and shows in saturated blues, which is why the mountains looked teal.
 
@@ -541,9 +555,64 @@ For whoever picks this up.
 - **Optional smaller items.** Add a live preview of the frame being written. (Encoding is now
   done: always HEVC, preserved bit depth and colour, always visually lossless, with an automatic
   CPU SVT-AV1 fallback when NVENC is unavailable; see Passthrough quality.)
-- **TensorRT fp8 / NVFP4.** The native TensorRT backend is done (about 2.2x, see
-  Performance). The remaining headroom is fp8 or NVFP4 on the Blackwell tensor cores,
-  which needs calibration and is accuracy sensitive for a flow model; not attempted.
+- **Performance headroom (ranked easiest to hardest, 2026-06-26 code audit).** The pipeline is already
+  fp16 + cupy softsplat, TensorRT on all five sub-nets, pinned async upload, threaded decode/encode
+  overlap and byte exact duplicate skip (`torch.compile` is ruled out for this model class: it would only
+  duplicate the TensorRT backend with no win, and shipping a JIT compiler breaks the no-deps promise; MSVC
+  is present locally but Triton is not, see Dev toolchain).
+  Remaining code side wins, in implementation order:
+  1. **GPU side transposes.** `to_tensor` / `to_bytes` do the HWC/CHW transpose on the CPU (a host copy
+     per frame); upload and download in HWC and permute on the GPU instead. Low risk, bit identical.
+     *Done 2026-06-26: correct and kept, but perf-neutral here (the CPU transpose was never the bottleneck).*
+  2. **One shared CUDA stream, drop the per call TRT sync.** Every TRT sub-net call host synchronizes
+     (`trt_runtime.py`), dozens of full GPU drains per pair at high multipliers. softsplat already runs
+     on `torch.cuda.current_stream()`, so run the whole inference inside one stream (not the default
+     one, so the stream warning stays fixed), enqueue TRT on it, and drop the per call sync. Medium risk.
+     *Done 2026-06-26: replaces the per-engine-stream warning fix, keeps the warning gone and removes the
+     redundant per-call syncs. Measured perf-neutral on a 16x 1080p render on the 5090 (removed ~840 host
+     syncs per run with no wall-clock change), which shows the pipeline is **GPU-compute-bound** here, not
+     sync or launch bound. That is the key finding: items 1 to 3 (I/O and syncs) cannot move a
+     compute-bound wall clock; the real levers are items 4 and 5.*
+  3. **Async pinned D2H.** `to_bytes` ends in a blocking pageable `.cpu()` each frame; pin a reusable
+     host buffer, copy non blocking with an event, and let the writer thread resolve it so the download
+     overlaps the next frame's compute. Low to medium risk.
+     *Reassessed 2026-06-26: targets the same I/O path items 1 to 2 showed is not the bottleneck, so
+     expected perf-neutral on a compute-bound render; deferred as cleanup only, not a speedup.*
+  4. **Batch the per timestep inference at high multipliers.** `inference()` repeats per output frame
+     with only `timestep` changing; batch the timesteps (batch dim = M - 1) to collapse 8 warps + IFNet
+     + FusionNet per frame into one batched pass. Biggest win at 8x to 16x. Medium risk.
+     *Probed 2026-06-26 (eager batch-scaling of the per-timestep nets): NOT worth it. FusionNet DOMINATES
+     (~52ms/elem at 544x960) and does NOT benefit from batching - confirmed over 5 stable trials with
+     `cudnn.benchmark=False`: per-elem 51.7ms (b1) -> 55.1ms (b2) -> 55.7ms (b4), i.e. ~6-8% net NEGATIVE,
+     the flat-then-rising signature of a compute-saturated net. (A first pass showed ~2.8x worse, but that
+     was a `cudnn.benchmark=True` algo-selection artifact: huge variance, it even mis-picked batch 1 at
+     150ms vs 53ms run to run. Ruled out by the deterministic retest.) IFNet (the minor ~7ms net) batches
+     better, but cannot offset the saturated bottleneck, so the overall ceiling is tiny. Confirms the
+     pipeline is at its per-timestep compute limit. Skipped.*
+  5. **fp8 / NVFP4 engines for GMFlow (the bottleneck).** Blackwell fp8 tensor cores are about 2x fp16;
+     build GMFlow (and maybe Feature / Fusion) fp8, keep softmax / normalize fp16. Accuracy sensitive
+     for a flow model, so gate on a PSNR check vs fp16. Was the standing "fp8 / NVFP4 not attempted" item.
+     *Attempted 2026-06-26 (modelopt fp8 PTQ, quality-gated): FAILED the gate, reverted. GMFlow flow vs
+     fp16 was fine on average (mean|d| 0.31px, rmse 0.67px, near the fp16-TRT baseline) but had
+     catastrophic outliers (maxdiff 61px): fp8's narrow e4m3 range cannot hold GMFlow's large flow
+     magnitudes (up to ~121px at half res), so a few pixels splat to the wrong place = visible glitches.
+     modelopt's fp8 CUDA extension cannot build here (the CUDA Toolkit / nvcc is not installed; MSVC `cl.exe`
+     19.29 IS present, see Dev toolchain), so calibration ran on the pure-torch fp8 sim, which is accurate
+     (just slower) - so the 61px is real fp8 precision behaviour, not a tooling artefact. modelopt
+     uninstalled, core stack verified intact. Selective per-layer fp8 (keep the wide-range correlation /
+     attention layers in fp16, quantize only the safe convs) might salvage it, but that is deeper research.*
+  6. **CUDA graph capture of `inference()`.** Fixed shapes; capture the ~20 op subgraph to kill launch
+     overhead. Highest effort and risk, needs persistent I/O buffers. Only helps a launch-bound pipeline,
+     which this is not (see below), so expected neutral. Not attempted.
+
+  **Conclusion (2026-06-26 audit, all six probed or attempted):** items 1 to 3 are perf-neutral (the render
+  is GPU-compute-bound, not sync/launch/IO-bound); 4 is skipped (the dominant per-timestep net FusionNet is
+  already GPU-saturated and does not batch); 5 fails the quality gate (fp8 cannot hold GMFlow's flow range,
+  61px outliers); 6 is irrelevant (not launch-bound). Net: the pipeline is at its practical compute limit on
+  this hardware + model. Items 1 (transposes) and 2 (one shared stream, no per-call TRT sync) were kept as
+  correct, non-regressing cleanups (2 also keeps the TRT default-stream warning fixed). Further speed would
+  need a smaller/faster model, lower precision with accepted quality loss (fails for this flow model), or
+  newer hardware - not a code change.
 - **Smaller ffmpeg.** `engine/bin` uses static builds (about 174 MB each). A shared ffmpeg
   build would shrink the bundle by a couple hundred MB at the cost of carrying its DLLs.
 
@@ -566,7 +635,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color faithful|raw] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|faithful|raw] [--hdr-vividness V] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -587,8 +656,9 @@ runtime), otherwise a bicubic resize. `--rtx-hdr` converts the output to HDR10 (
 via the RTX Video TrueHDR model, and `--hdr-nits N` sets the mastering peak luminance (400..2000,
 default 1000); the output also gets HDR10 static metadata (mastering-display plus measured
 MaxCLL/MaxFALL, written by `engine/hdr10_meta.py`) so one file tone-maps to any display.
-`--hdr-color` picks colour handling (default `faithful`: keep TrueHDR's luminance but take chromaticity
-from the SDR source, fixing the model's hue shift; `raw` emits TrueHDR's colour unmodified), and
+`--hdr-color` picks colour handling (default `vivid`: keep TrueHDR's luminance, lock hue to the SDR
+source, and scale chroma in ICtCp by `--hdr-vividness` (default 1.3) for HDR pop with no hue shift;
+`faithful` keeps the source's own saturation; `raw` emits TrueHDR's colour unmodified), and
 `--hdr-mastering-prim {display-p3,dci-p3,bt2020,bt709}` sets the `mdcv` mastering gamut by colorspace
 name (default display-p3, metadata only).
 The per-frame order is upscale (RTX VSR or bicubic), then RCAS sharpen at the

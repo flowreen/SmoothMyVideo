@@ -56,7 +56,6 @@ class TRTModule:
         self.runtime = trt.Runtime(TRT_LOGGER)
         self.engine = self.runtime.deserialize_cuda_engine(serialized)
         self.context = self.engine.create_execution_context()
-        self.stream = torch.cuda.Stream()  # dedicated non-default stream (TRT warns on the default one)
         self.inputs, self.outputs = [], []
         for i in range(self.engine.num_io_tensors):
             n = self.engine.get_tensor_name(i)
@@ -78,9 +77,11 @@ class TRTModule:
             o = torch.empty(s, dtype=d, device="cuda")  # fresh each call; outputs may persist
             outs.append(o)
             self.context.set_tensor_address(n, o.data_ptr())
-        self.stream.wait_stream(torch.cuda.current_stream())  # inputs prepared on the caller's stream are ready first
-        self.context.execute_async_v3(self.stream.cuda_stream)
-        self.stream.synchronize()                             # block until outputs are materialized (as before)
+        # Enqueue on the caller's current stream and do NOT host-sync. The whole pipeline (this engine,
+        # softsplat's cupy kernel, and the torch glue) runs on one shared stream the caller sets, so
+        # same-stream ordering makes the outputs ready for the next op with no per-call GPU drain. The
+        # caller using a non-default stream is also what keeps TensorRT's default-stream warning away.
+        self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
         return outs[0] if len(outs) == 1 else tuple(outs)
 
 

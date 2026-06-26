@@ -44,6 +44,18 @@ _PQ_M1, _PQ_M2 = 0.1593017578125, 78.84375
 _PQ_C1, _PQ_C2, _PQ_C3 = 0.8359375, 18.8515625, 18.6875
 
 
+def _pq_to_linear(e):
+    """SMPTE ST 2084 EOTF: PQ code' in [0,1] -> display-linear in [0,1] (1.0 == 10000 nits)."""
+    ep = e.clamp(0.0, 1.0).pow(1.0 / _PQ_M2)
+    return ((ep - _PQ_C1).clamp(min=0.0) / (_PQ_C2 - _PQ_C3 * ep).clamp(min=1e-6)).pow(1.0 / _PQ_M1)
+
+
+def _linear_to_pq(lin):
+    """SMPTE ST 2084 inverse EOTF: display-linear in [0,1] (1.0 == 10000 nits) -> PQ code' in [0,1]."""
+    lm = lin.clamp(min=0.0).pow(_PQ_M1)
+    return ((_PQ_C1 + _PQ_C2 * lm) / (1.0 + _PQ_C3 * lm)).pow(_PQ_M2)
+
+
 class _RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_uint32), ("top", ctypes.c_uint32),
                 ("right", ctypes.c_uint32), ("bottom", ctypes.c_uint32)]
@@ -114,7 +126,7 @@ class RTXVideo:
 
     def __init__(self, width, height, out_w, out_h, vsr=True, hdr=False, vsr_quality=4,
                  hdr_max_nits=1000, hdr_contrast=100, hdr_saturation=0, hdr_middlegray=50,
-                 hdr_faithful_color=True, rtx_dir=RTX_DIR):
+                 hdr_color="vivid", hdr_vividness=1.3, rtx_dir=RTX_DIR):
         # Make sure torch's primary CUDA context exists and is current on this thread before the
         # bridge retains it (create is called with cuContext=NULL -> cuDevicePrimaryCtxRetain).
         torch.zeros(8, device="cuda")
@@ -160,13 +172,30 @@ class RTXVideo:
             self._hdr_in = torch.empty((self.oH, self.oW, 4), dtype=torch.uint8, device="cuda")
             self._hdr_in[..., 3] = 255
             self._hdr_out = torch.empty((self.oH, self.oW, 4), dtype=torch.uint8, device="cuda")
-            # Faithful-colour HDR (default): keep TrueHDR's luminance but take chromaticity from the SDR
-            # source, since the model rotates hues (measurably greens/cyans the blues) even at saturation
-            # 0. Needs the linear BT.709 -> linear BT.2020 primaries matrix (BT.2087).
-            self._faithful = bool(hdr_faithful_color)
+            # Colour handling (the model rotates hues - it greens/cyans the blues - even at saturation 0):
+            #   raw      - emit TrueHDR's colour unmodified.
+            #   faithful - keep TrueHDR luminance, take chromaticity (hue AND saturation) from the SDR
+            #              source; accurate but never richer than the source (see _chroma_correct).
+            #   vivid    - keep TrueHDR luminance, take the source hue, and scale chroma by _vividness in
+            #              ICtCp; a hue-linear saturation gain - HDR pop with no hue shift (see _ictcp_correct).
+            # All need the linear BT.709 -> linear BT.2020 primaries matrix (BT.2087); vivid also needs the
+            # BT.2100 ICtCp matrices below. _vividness is a chroma gain over the source: 1.0 == faithful.
+            self._color_mode = hdr_color if hdr_color in ("vivid", "faithful", "raw") else "vivid"
+            self._vividness = max(0.0, min(4.0, float(hdr_vividness)))
             self._m709_2020 = torch.tensor(
                 [[0.6274, 0.3293, 0.0433], [0.0691, 0.9195, 0.0114], [0.0164, 0.0880, 0.8956]],
                 dtype=torch.float32, device="cuda")
+            # BT.2100 ICtCp (vivid): linear BT.2020 RGB -> LMS, and PQ L'M'S' -> ICtCp, plus the
+            # numerically-inverted returns. Hue is ~the ICtCp Ct/Cp angle, so working here lets vivid
+            # restore the source hue while keeping TrueHDR's intensity (I) and chroma magnitude.
+            _rgb2lms = torch.tensor([[1688., 2146., 262.], [683., 2951., 462.], [99., 309., 3688.]],
+                                    dtype=torch.float64) / 4096.0
+            _lms2ictcp = torch.tensor([[2048., 2048., 0.], [6610., -13613., 7003.],
+                                       [17933., -17390., -543.]], dtype=torch.float64) / 4096.0
+            self._rgb2lms = _rgb2lms.to(torch.float32).cuda()
+            self._lms2ictcp = _lms2ictcp.to(torch.float32).cuda()
+            self._lms2rgb = torch.linalg.inv(_rgb2lms).to(torch.float32).cuda()
+            self._ictcp2lms = torch.linalg.inv(_lms2ictcp).to(torch.float32).cuda()
 
     def run_vsr(self, rgb):
         """RTX VSR only on a [1,3,H,W] RGB float tensor in [0,1] on CUDA; returns a [1,3,oH,oW] RGB
@@ -203,8 +232,10 @@ class RTXVideo:
         torch.cuda.synchronize()
         if r != _API_SUCCESS:
             raise RuntimeError("rtx_video_api_cuda_evaluate_thdr_deviceptr failed")
-        if self._faithful:
+        if self._color_mode == "faithful":
             return self._chroma_correct(rgb, self._hdr_out)   # source chroma + TrueHDR luma; measures light
+        if self._color_mode == "vivid":
+            return self._ictcp_correct(rgb, self._hdr_out)    # source hue + TrueHDR luma & chroma; measures light
         try:
             self._measure_light(self._hdr_out)
         except Exception:  # noqa: BLE001 - measurement is best-effort; never fail a render over it
@@ -237,6 +268,45 @@ class RTXVideo:
         lm = out.pow(_PQ_M1)                                                  # linear -> PQ OETF -> code'
         code = (((_PQ_C1 + _PQ_C2 * lm) / (1.0 + _PQ_C3 * lm)).pow_(_PQ_M2)
                 .mul_(1023.0).round_().clamp_(0, 1023).to(torch.int64))
+        pk = (code[2] & 1023) | ((code[1] & 1023) << 10) | ((code[0] & 1023) << 20) | (3 << 30)
+        return pk.cpu().numpy().astype("<u4").tobytes()                      # [H,W] -> x2rgb10le bytes
+
+    def _ictcp_correct(self, rgb, packed):
+        """Vivid HDR (default). Keeps TrueHDR's luminance (the real HDR expansion) but rebuilds colour in
+        ICtCp (BT.2100), the constant-intensity, hue-linear space: it takes the colorimetric SDR source's
+        hue AND a _vividness-scaled chroma. Scaling Ct/Cp uniformly preserves the hue ANGLE, so this adds
+        saturation pop WITHOUT any hue shift - unlike the TrueHDR model, which greens/cyans the blues, and
+        unlike just cranking the SDK Saturation, which oversaturates AND rotates. _vividness is a gain over
+        the source chroma: 1.0 == _chroma_correct (faithful), >1 richer. Packs the same x2rgb10le."""
+        u = packed.view(torch.int32).squeeze(-1)                             # [H,W]  B|G<<10|R<<20|A<<30
+        thdr = torch.stack([(u >> 20) & 1023, (u >> 10) & 1023, u & 1023], 0).float().div_(1023.0)
+        lin_t = _pq_to_linear(thdr)                                          # TrueHDR linear BT.2020 [3,H,W]
+        y_t = 0.2627 * lin_t[0] + 0.6780 * lin_t[1] + 0.0593 * lin_t[2]      # BT.2020 luminance
+        s = rgb[0].clamp(0.0, 1.0)                                           # SDR source, gamma BT.709
+        lin709 = torch.where(s < 0.081, s / 4.5, ((s + 0.099) / 1.099).clamp(min=0.0).pow(1.0 / 0.45))
+        lin = torch.einsum("ij,jhw->ihw", self._m709_2020, lin709)          # source linear BT.2020
+        y_s = (0.2627 * lin[0] + 0.6780 * lin[1] + 0.0593 * lin[2]).clamp_(min=1e-6)
+        lin_f = lin * (y_t / y_s)                                            # source chroma @ TrueHDR luma
+
+        def _to_ictcp(linrgb):
+            lms = torch.einsum("ij,jhw->ihw", self._rgb2lms, linrgb.clamp(min=0.0))
+            return torch.einsum("ij,jhw->ihw", self._lms2ictcp, _linear_to_pq(lms))
+
+        ic_f = _to_ictcp(lin_f)                                             # I, Ct, Cp: source hue & sat @ TrueHDR luma
+        # Scale chroma in ICtCp by _vividness. Scaling Ct/Cp uniformly preserves the hue ANGLE, so this is
+        # a hue-linear saturation gain over the colorimetric source - pop with no hue shift. (The model adds
+        # no real colourfulness at saturation 0; it mostly rotates hue, so richness is taken from the source
+        # here, not from TrueHDR's hue-wrong chroma.) 1.0 == faithful; >1 richer.
+        ictcp = torch.stack([ic_f[0], ic_f[1] * self._vividness, ic_f[2] * self._vividness], 0)
+        lms = _pq_to_linear(torch.einsum("ij,jhw->ihw", self._ictcp2lms, ictcp))
+        out = torch.einsum("ij,jhw->ihw", self._lms2rgb, lms).clamp_(0.0, 1.0)   # linear BT.2020
+        try:                                                                # MaxCLL/FALL from corrected px
+            mx = out.max(0).values
+            self._cll = max(self._cll, float(mx.max().item()) * 10000.0)
+            self._fall = max(self._fall, float(mx.mean().item()) * 10000.0)
+        except Exception:  # noqa: BLE001
+            pass
+        code = _linear_to_pq(out).mul_(1023.0).round_().clamp_(0, 1023).to(torch.int64)
         pk = (code[2] & 1023) | ((code[1] & 1023) << 10) | ((code[0] & 1023) << 20) | (3 << 30)
         return pk.cpu().numpy().astype("<u4").tobytes()                      # [H,W] -> x2rgb10le bytes
 
