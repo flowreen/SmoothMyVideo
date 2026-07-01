@@ -1,0 +1,143 @@
+"""Single-frame preview for the GUI's before/after pane.
+
+Renders ONE source frame at the current spatial settings and writes <out>_original.png (the untouched
+source) and <out>_processed.png. The processed side applies the SAME passes in the SAME order as a full
+render (to_bytes in gmfss_interp.py): FSR RCAS sharpening first, in SDR (the shared rcas.py, the exact
+kernel the render uses), then RTX TrueHDR when --rtx-hdr. No interpolation,
+no encode, so the GUI can scrub settings and see the effect before a full render.
+
+The HDR result is PQ/BT.2020, which a normal canvas cannot show, so it is tonemapped to sRGB for
+display: exposure is anchored to the SDR source (median luminance match), so midtones keep the source
+brightness and only the highlight expansion differs; a Reinhard shoulder above the knee rolls the
+expanded highlights toward white instead of clipping. (An earlier 99th-percentile auto-exposure made
+the whole preview dim and washed out, because the brightest HDR highlight was dragging every midtone
+down.) RCAS runs on the CPU when HDR is off, so a sharpen-only preview never touches CUDA, and when neither
+sharpen nor HDR is requested the frame is copied straight through without even importing torch (the
+GUI auto-loads a preview on every video select, so the do-nothing case stays instant and the pane
+labels it "Unchanged"). RTX VSR / upscale preview is a later addition.
+"""
+import os
+import sys
+import argparse
+
+import numpy as np
+import cv2
+
+ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ENGINE_DIR)
+
+# linear BT.2020 -> linear BT.709, for tonemapping the PQ HDR output down to an sRGB preview.
+_M2020_709 = np.array([[1.6605, -0.5876, -0.0728], [-0.1246, 1.1329, -0.0083],
+                       [-0.0182, -0.1006, 1.1187]], np.float32)
+
+
+def _read_frame(path, which):
+    cap = cv2.VideoCapture(path)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    idx = max(0, n // 2) if which == "mid" else max(0, min(n - 1, int(which)))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+    ok, bgr = cap.read()
+    if not ok:                                   # seek can miss on some codecs; fall back to frame 0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, bgr = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError("could not read a frame from " + path)
+    return bgr, idx, n
+
+
+def _lum709(a):
+    return 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
+
+
+def _tonemap(lin2020, src_rgb_u8):
+    """Linear BT.2020 (1.0 == 10000 nits) -> sRGB uint8 RGB, anchored to the SDR source.
+
+    Exposure: scale so the HDR frame's median luminance equals the SDR source's (in linear 709), so
+    midtones read exactly as bright as the original and the preview never dims or washes out.
+    Highlights: per-channel Reinhard shoulder above the knee, so the HDR expansion shows up as
+    highlights blooming toward white (the closest an SDR canvas gets to "brighter than white").
+    """
+    lin709 = np.clip(lin2020 @ _M2020_709.T, 0.0, None)
+    s = src_rgb_u8.astype(np.float32) / 255.0
+    lin_s = np.where(s <= 0.04045, s / 12.92, np.power((s + 0.055) / 1.055, 2.4))
+    ls, lh = _lum709(lin_s), _lum709(lin709)
+    m = ls > 1e-4                                # anchor on lit content; skip black borders
+    k = (float(np.median(ls[m])) / max(1e-9, float(np.median(lh[m])))) if m.any() else 1.0
+    x = lin709 * k
+    knee = 0.75
+    t = (x - knee) / (1.0 - knee)
+    y = np.where(x <= knee, x, knee + (1.0 - knee) * (t / (1.0 + np.abs(t))))
+    srgb = np.where(y <= 0.0031308, y * 12.92,
+                    1.055 * np.power(np.clip(y, 0.0, None), 1 / 2.4) - 0.055)
+    return (np.clip(srgb, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def _hdr_process(t, args):
+    """[1,3,H,W] SDR tensor on CUDA -> packed x2rgb10le bytes via RTX TrueHDR at the given settings."""
+    import rtxvideo
+    h, w = t.shape[2], t.shape[3]
+    rtx = rtxvideo.RTXVideo(
+        w, h, w, h, vsr=False, hdr=True, hdr_max_nits=max(400, min(2000, args.hdr_nits)),
+        hdr_contrast=max(0, min(200, args.hdr_contrast)),
+        hdr_saturation=max(0, min(200, args.hdr_saturation)),
+        hdr_middlegray=max(10, min(100, args.hdr_middlegray)),
+        hdr_color=args.hdr_color, hdr_vividness=max(0.0, min(4.0, args.hdr_vividness)))
+    try:
+        return rtx.run_hdr(t)
+    finally:
+        rtx.close()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("input")
+    ap.add_argument("--frame", default="mid", help="source frame index, or 'mid' (default)")
+    ap.add_argument("--out", required=True,
+                    help="output prefix; writes <out>_original.png and <out>_processed.png")
+    ap.add_argument("--rtx-hdr", action="store_true", help="convert the processed frame to HDR (tonemapped)")
+    ap.add_argument("--sharpen", type=float, default=0.0, help="FSR RCAS sharpen strength 0..1")
+    ap.add_argument("--hdr-nits", type=int, default=1000)
+    ap.add_argument("--hdr-color", choices=["vivid", "rtx", "raw"], default="vivid")
+    ap.add_argument("--hdr-vividness", type=float, default=1.0)
+    ap.add_argument("--hdr-saturation", type=int, default=0)
+    ap.add_argument("--hdr-contrast", type=int, default=100)
+    ap.add_argument("--hdr-middlegray", type=int, default=50)
+    args = ap.parse_args()
+    strength = max(0.0, min(1.0, args.sharpen))
+
+    bgr, idx, n = _read_frame(args.input, args.frame)
+    rgb_u8 = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    if strength > 0 or args.rtx_hdr:
+        import torch                       # heavy import, skipped entirely on the unchanged fast path
+        from rcas import rcas              # the render engine's own FSR RCAS kernel
+        # Same order as a render (to_bytes): RCAS in SDR first, HDR last. CPU when HDR is off.
+        dev = "cuda" if args.rtx_hdr else "cpu"
+        t = torch.from_numpy(rgb_u8).to(dev).float().div(255.0).permute(2, 0, 1).unsqueeze(0).contiguous()
+        if strength > 0:
+            t = rcas(t, strength)
+        if args.rtx_hdr:
+            packed = _hdr_process(t, args)
+            u = np.frombuffer(packed, "<u4").reshape(bgr.shape[0], bgr.shape[1])
+            code = np.stack([(u >> 20) & 1023, (u >> 10) & 1023, u & 1023], -1).astype(np.float32) / 1023.0
+            import rtxvideo
+            lin = rtxvideo._pq_to_linear(torch.from_numpy(code)).numpy()
+            proc_rgb = _tonemap(lin, rgb_u8)
+        else:
+            proc_rgb = (t[0].permute(1, 2, 0).clamp(0, 1).mul(255).round().to(torch.uint8).cpu().numpy())
+    else:
+        proc_rgb = rgb_u8                  # nothing enabled: the render would leave the frame as is
+
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    p_orig, p_proc = args.out + "_original.png", args.out + "_processed.png"
+    cv2.imwrite(p_orig, bgr)
+    cv2.imwrite(p_proc, cv2.cvtColor(proc_rgb, cv2.COLOR_RGB2BGR))
+    sys.stdout.write(f"preview frame {idx}/{n} {bgr.shape[1]}x{bgr.shape[0]} hdr={int(args.rtx_hdr)} "
+                     f"sharpen={strength:g} -> {p_orig} | {p_proc}\n")
+
+
+if __name__ == "__main__":
+    main()

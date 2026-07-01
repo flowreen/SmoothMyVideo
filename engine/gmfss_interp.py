@@ -83,7 +83,7 @@ ap.add_argument("--no-trt", action="store_true",
 ap.add_argument("--sharpen", type=float, nargs="?", const=0.8, default=0.0,
                 help="FSR-style RCAS sharpening strength 0..1 applied to every output frame "
                      "(0 = off, the default). A bare --sharpen uses 0.8. Offsets the uniform-look "
-                     "softness; RCAS self-limits, so even 1.0 keeps texture (unlike plain CAS).")
+                     "softness; RCAS self-limits, so even 1.0 keeps texture.")
 ap.add_argument("--no-interp", action="store_true",
                 help="skip GMFSS interpolation: only re-encode at the source fps with --sharpen "
                      "applied (sharpening without smoothing). The model and TRT are never loaded.")
@@ -122,19 +122,24 @@ ap.add_argument("--hdr-mastering-prim", choices=["display-p3", "dci-p3", "bt2020
                      "SMPTE RP431-2), bt2020 (full nominal BT.2020), or bt709 (the true SDR-source "
                      "gamut). Cosmetic gamut hint; the stream stays BT.2020 PQ and the frames decode "
                      "identically.")
-ap.add_argument("--hdr-color", choices=["vivid", "faithful", "raw"], default="vivid",
+ap.add_argument("--hdr-color", choices=["vivid", "rtx", "raw"], default="vivid",
                 help="colour handling for --rtx-hdr (the TrueHDR model rotates hues - it greens/cyans the "
-                     "blues - even at saturation 0). vivid (default): keep TrueHDR luminance, take the SDR "
-                     "source's hue, and scale chroma in ICtCp by --hdr-vividness - a hue-linear saturation "
-                     "gain (HDR pop, no hue shift). faithful: source hue AND saturation, accurate but never "
-                     "richer than the source. raw: TrueHDR colour unmodified.")
-ap.add_argument("--hdr-vividness", type=float, default=1.3,
+                     "blues - even at saturation 0). vivid (default): keep TrueHDR's luminance, take the SDR "
+                     "source's hue, and scale its chroma in ICtCp by --hdr-vividness - a hue-linear "
+                     "saturation control (1.0 = faithful colour, cyan removed; >1 adds pop, no hue shift). "
+                     "raw: TrueHDR colour unmodified (the cyan-shifted reference). rtx drives saturation "
+                     "with the SDK --hdr-saturation like real RTX TrueHDR, hue-corrected (chroma magnitude "
+                     "from TrueHDR, hue from the source, floored at source) which is the familiar NVIDIA "
+                     "slider without the cyan cast.")
+ap.add_argument("--hdr-vividness", type=float, default=1.0,
                 help="for --hdr-color vivid: chroma gain over the colorimetric source, applied in ICtCp so "
-                     "hue never shifts. 1.0 == faithful, >1 richer; default 1.3. Clamped 0..4.")
+                     "hue never shifts - the de-facto Saturation slider. 1.0 (default) = faithful, >1 richer "
+                     "(~1.5 vibrant, 2.0 strong). Clamped 0..4. The SDK --hdr-saturation is INERT in vivid "
+                     "mode (the model's chroma is dropped and rebuilt from the source).")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
-SHARPEN = max(0.0, min(1.0, args.sharpen))   # CAS strength on every output frame; 0 = off
+SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
 UPSCALE_F = max(1.0, min(8.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
                                              # RTX VSR has no integer-scale limit (probed clean past
@@ -354,35 +359,9 @@ def to_tensor(buf):
     # replicate (vs zero) extends the edge smoothly so the flow net has no hard border to track.
     return F.pad(t, (0, pw - W, 0, ph - H), mode="replicate")
 
-RCAS_LIMIT = 0.1875 - 1e-6   # AMD FSR_RCAS_LIMIT = 0.25 - 1/16
-
-def _rcas(img, con):
-    """AMD FidelityFX RCAS (Robust Contrast-Adaptive Sharpening) on a [1,3,H,W] float image in [0,1].
-
-    This is the sharpen AMD FSR and Lossless Scaling's FSR mode use, not the plain CAS the ffmpeg
-    `cas` filter applies. RCAS limits its sharpening lobe to the 4-neighbour min/max (no overshoot or
-    ringing) and attenuates it in noisy regions (the FSR_RCAS_DENOISE term), so it crisps real edges
-    without amplifying fine texture/grain into mush the way CAS does at high strength. The lobe is one
-    scalar per pixel applied to all three channels, so it cannot decorrelate them into colour speckle.
-    con in (0, 1] scales the strength (1 = AMD's max, sharpness 0); con <= 0 is a no-op.
-    """
-    p = F.pad(img, (1, 1, 1, 1), mode="replicate")        # replicate so edges don't sharpen to black
-    b, h = p[..., 0:-2, 1:-1], p[..., 2:, 1:-1]           # up, down
-    d, f = p[..., 1:-1, 0:-2], p[..., 1:-1, 2:]           # left, right
-    e = img                                               # centre
-    def luma(x): return x[:, 1:2] + 0.5 * (x[:, 0:1] + x[:, 2:3])   # green-weighted, as in FSR
-    bL, dL, eL, fL, hL = luma(b), luma(d), luma(e), luma(f), luma(h)
-    rng = torch.maximum(torch.maximum(torch.maximum(bL, dL), torch.maximum(fL, hL)), eL) \
-        - torch.minimum(torch.minimum(torch.minimum(bL, dL), torch.minimum(fL, hL)), eL)
-    nz = (0.25 * (bL + dL + fL + hL) - eL).abs() / (rng + 1e-4)
-    nz = -0.5 * nz.clamp(0.0, 1.0) + 1.0                   # ~1 on flat areas, ->0.5 in noise
-    mn4 = torch.minimum(torch.minimum(b, d), torch.minimum(f, h))
-    mx4 = torch.maximum(torch.maximum(b, d), torch.maximum(f, h))
-    hit_min = mn4 / (4.0 * mx4 + 1e-4)
-    hit_max = (1.0 - mx4) / (4.0 * mn4 - 4.0 - 1e-4)       # denom strictly < 0: no divide-by-zero
-    lobe = torch.maximum(-hit_min, hit_max).amax(dim=1, keepdim=True)   # most-limiting channel
-    lobe = lobe.clamp(max=0.0).clamp(min=-RCAS_LIMIT) * con * nz
-    return ((e + lobe * (b + d + f + h)) / (1.0 + 4.0 * lobe)).clamp(0.0, 1.0)
+# AMD FidelityFX RCAS, shared with the single-frame preview (preview.py) so the preview shows exactly
+# the sharpen a full render applies; the implementation moved verbatim to rcas.py (same folder).
+from rcas import rcas as _rcas  # noqa: E402
 
 def _upscale(t, ow, oh):
     """Spatially upscale a [1,3,H,W] RGB float image in [0,1] to (oh, ow), per output frame.
@@ -522,9 +501,8 @@ else:
             color += [flag, v]
 # Sharpening (the GUI "FSR" toggle / --sharpen) is applied in-engine on the GPU by _rcas() inside
 # to_bytes, NOT here. It uses AMD FidelityFX RCAS, the exact sharpen AMD FSR and Lossless Scaling's
-# FSR mode use; ffmpeg only ships the older, blunter `cas`, which over-sharpens fine texture into
-# mush at high strength (RCAS limits its lobe to the local min/max and eases off in noisy areas, so
-# it crisps edges without destroying texture). So the encode vf is just the colour-tag passthrough.
+# FSR mode use (it limits its lobe to the local min/max and eases off in noisy areas, so it crisps
+# edges without destroying texture). So the encode vf is just the colour-tag passthrough.
 vf = ",".join((["setparams=" + ":".join(sp)] if sp else []) + [f"format={out_pix}"])
 
 # The piped frames are DEC_FMT (rgb24/rgb48le) normally, but the RTX HDR pass emits packed 10-bit

@@ -13,6 +13,7 @@ const ENGINE = app.isPackaged ? path.join(process.resourcesPath, 'engine') : pat
 // Its python.exe sits at the runtime root, not under a Scripts/ subdir like a venv.
 const RUNTIME_PY = path.join(ENGINE, 'runtime', 'python.exe');
 const ENGINE_SCRIPT = path.join(ENGINE, 'gmfss_interp.py');
+const PREVIEW_SCRIPT = path.join(ENGINE, 'preview.py');
 // Prefer ffprobe bundled at engine/bin (portable build); fall back to PATH for dev.
 const FFPROBE = fs.existsSync(path.join(ENGINE, 'bin', 'ffprobe.exe'))
   ? path.join(ENGINE, 'bin', 'ffprobe.exe') : 'ffprobe';
@@ -246,4 +247,30 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
 ipcMain.on('cancel', () => {
   const c = current;
   if (c && c.pid) { execFile('taskkill', ['/pid', String(c.pid), '/T', '/F'], () => {}); }
+});
+
+// Before/after preview: render ONE source frame at the current spatial settings (RTX HDR when opts.hdr,
+// FSR/CAS sharpen when opts.sharpen > 0; no interpolation, no encode) and hand back the two PNG paths
+// for the renderer's side-by-side pane. preview.py writes <prefix>_original.png and _processed.png; a
+// fixed prefix is reused each call (the renderer cache-busts its img src) so previews never pile up.
+// Resolves with { error } instead when the frame or the RTX bridge is unavailable.
+ipcMain.handle('preview', (_e, opts: { input: string; frame?: number | string; sharpen?: number;
+    hdr?: boolean; nits?: number; color?: string; saturation?: number; vividness?: number }) => {
+  return new Promise((resolve) => {
+    const dir = path.join(app.getPath('userData'), 'preview');
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* already exists */ }
+    const prefix = path.join(dir, 'frame');
+    const args = ['-u', PREVIEW_SCRIPT, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
+    if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
+    if (opts.hdr) args.push('--rtx-hdr', '--hdr-nits', String(opts.nits ?? 1000),
+      '--hdr-color', String(opts.color ?? 'vivid'), '--hdr-vividness', String(opts.vividness ?? 1),
+      '--hdr-saturation', String(opts.saturation ?? 0));
+    const env = { ...process.env, PYTHONUTF8: '1' };
+    execFile(pyExe(), args, { cwd: ENGINE, env }, (err, stdout, stderr) => {
+      if (err) { resolve({ error: String(stderr || err).slice(-400) }); return; }
+      const m = /frame (\d+)\/(\d+)/.exec(String(stdout ?? ''));
+      resolve({ original: prefix + '_original.png', processed: prefix + '_processed.png',
+        frame: m ? Number(m[1]) : null, total: m ? Number(m[2]) : null });
+    });
+  });
 });

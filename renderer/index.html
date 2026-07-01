@@ -26,6 +26,10 @@
   .hint { color:var(--sub); font-size:11px; }
   body.drag { outline:3px dashed var(--green); outline-offset:-10px; }
   button.mini { padding:3px 9px; font-size:12px; background:#3a3a3a; color:var(--text); }
+  .spinwheel { width:34px; height:34px; border:3px solid rgba(255,255,255,.25);
+               border-top-color:var(--green); border-radius:50%; animation:spin .8s linear infinite;
+               filter:drop-shadow(0 0 2px rgba(0,0,0,.7)); }
+  @keyframes spin { to { transform:rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -82,7 +86,7 @@
         <option value="custom">Custom height&hellip;</option>
       </select>
       <span id="upcustomwrap" style="display:none;align-items:center;gap:8px;">
-        <input id="upcustom" type="range" min="720" max="4320" step="2" value="2160"
+        <input id="upcustom" type="range" min="720" max="8192" step="2" value="2160"
                style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
         <span class="v" id="upcustomnum">2160p</span>
       </span>
@@ -136,6 +140,38 @@
         <span class="v" id="sharpnum">1.00</span>
       </span>
       <span class="hint">crisper picture; runs after the upscale, before HDR</span>
+    </div>
+  </div>
+
+  <div class="panel" id="previewpanel" style="display:none">
+    <div class="row">
+      <span class="k">Preview</span>
+      <span class="hint" id="hdrpreviewhint">your sharpen / HDR settings on a real frame · updates automatically</span>
+    </div>
+    <div id="hdrpreview" style="display:none;margin-top:6px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <div style="flex:1;text-align:center;min-width:0">
+          <div class="hint" style="margin-bottom:4px">Original</div>
+          <div id="prevorigwrap" style="overflow:hidden;border-radius:6px;position:relative">
+            <img id="prevorig" alt="original frame" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
+            <div id="prevorigspin" style="display:none;position:absolute;align-items:center;justify-content:center;pointer-events:none"><div class="spinwheel"></div></div>
+          </div>
+        </div>
+        <div style="flex:0 0 auto;font-size:30px;line-height:1;color:var(--green);font-weight:700">&rarr;</div>
+        <div style="flex:1;text-align:center;min-width:0">
+          <div class="hint" id="prevproclabel" style="margin-bottom:4px">Processed</div>
+          <div id="prevprocwrap" style="overflow:hidden;border-radius:6px;position:relative">
+            <img id="prevproc" alt="processed frame" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
+            <div id="prevspin" style="display:none;position:absolute;align-items:center;justify-content:center;pointer-events:none"><div class="spinwheel"></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="row" style="justify-content:center;gap:10px;margin-top:6px">
+        <button id="prevprev" class="mini" style="visibility:hidden">&lsaquo; back</button>
+        <span class="v" id="prevlabel">frame &mdash;</span>
+        <button id="prevnext" class="mini">random frame &rsaquo;</button>
+      </div>
+      <div class="hint" id="prevnote" style="text-align:center;margin-top:4px"></div>
     </div>
   </div>
 
@@ -214,6 +250,7 @@ async function loadVideo(f){
   $('status').textContent = 'Ready. Pick a multiplier or fps, then click Smooth It!';
   applyScreenFps();      // re-asserts the interp / screen-rate state and recomputes the output name
   syncUpscale();         // recompute the upscale target + output dims for this video's resolution
+  openPreviewForVideo(); // auto-load the before/after preview for this video
 }
 $('pick').onclick = async () => { await loadVideo(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
 $('multi').onchange = () => { localStorage.setItem('multi', $('multi').value); useFps = false; syncFpsField(); refresh(); };
@@ -230,6 +267,7 @@ function syncSharpen(){
   const on = $('sharpen').checked;
   $('sharpwrap').style.display = on ? 'flex' : 'none';
   $('sharpnum').textContent = (+$('sharpval').value).toFixed(2);
+  syncPreview();        // show/hide the preview panel as sharpen turns on/off
 }
 const savedSharpOn = localStorage.getItem('sharpenOn');
 if(savedSharpOn !== null) $('sharpen').checked = savedSharpOn === '1';
@@ -268,7 +306,13 @@ ipcRenderer.invoke('refresh-rate').then(hz => {
 // (the #rtxvsr toggle, once its runtime is installed) does the upscale with NVIDIA AI; with it off or
 // absent the engine uses a bicubic resize. Off by default; the choice persists. Independent of
 // interpolation, so it also applies in sharpen-only mode. There is no integer-scale restriction (RTX
-// VSR was probed clean past 8K), so any target up to the 8K option is allowed.
+// VSR was probed clean past 8K), but the output is bounded by two real limits: the hevc_nvenc encoder
+// caps either dimension at 8192px (verified on the RTX 5090: 8192 ok, 8320 fails; RTX VSR itself goes
+// higher but the encode is the wall), and the engine clamps the upscale factor to 8x. The custom-height
+// slider and upDims() honour both, so the long side never exceeds 8192px (4608p for 16:9, up to 8192p
+// for portrait) and the factor never exceeds 8x.
+const ENC_MAX = 8192;                            // hevc_nvenc max width/height (verified on the RTX 5090)
+const MAX_FACTOR = 8;                            // engine UPSCALE_F clamp (gmfss_interp.py)
 let screenW = 0, screenH = 0, rtxReady = { vsr:false, hdr:false, bridge:false };
 function upTargetH(){                            // chosen output height (0 = off)
   const v = $('upres').value;
@@ -277,23 +321,34 @@ function upTargetH(){                            // chosen output height (0 = of
   if(v === 'custom') return +$('upcustom').value || 0;
   return +v || 0;
 }
-function upDims(){                               // {w,h} of the upscaled output, or null when not upscaling
+function upDims(){                               // {w,h} of the upscaled output (encoder/factor clamped), or null
   if(!info || !info.h || !info.w) return null;
-  const th = upTargetH();
+  let th = upTargetH();
   if(!th || th <= info.h) return null;          // upscale only; a target at/below the source is a no-op
-  const h = th - (th % 2);
-  const w = Math.round(info.w * h / info.h); return { w: w - (w % 2), h };
+  th = Math.min(th, info.h * MAX_FACTOR, ENC_MAX);   // 8x engine factor cap, then the encoder long-side cap
+  let h = th - (th % 2);
+  let w = Math.round(info.w * h / info.h); w = w - (w % 2);
+  if(w > ENC_MAX){                              // wide aspect: width is the binding side, fit it to 8192px
+    h = Math.floor(ENC_MAX * info.h / info.w / 2) * 2;
+    w = Math.round(info.w * h / info.h); w = w - (w % 2);
+  }
+  return { w, h };
 }
 function upFactor(){ const d = upDims(); return d ? d.h / info.h : 0; }   // arbitrary factor (0 = off)
 function upBackendName(){ return ($('rtxvsr').checked && rtxReady.vsr) ? 'RTX VSR' : 'bicubic'; }
 function syncUpscale(){
   $('upcustomwrap').style.display = $('upres').value === 'custom' ? 'inline-flex' : 'none';
+  if(info && info.w && info.h){                  // bound the custom slider to what this source + encoder can reach
+    const m = Math.max(720, Math.min(Math.floor(ENC_MAX * Math.min(1, info.h / info.w) / 2) * 2, info.h * MAX_FACTOR));
+    if(+$('upcustom').max !== m){ $('upcustom').max = m; if(+$('upcustom').value > m) $('upcustom').value = m; }
+  }
   $('upcustomnum').textContent = (+$('upcustom').value) + 'p';
   let txt = '';
   if($('upres').value !== '0'){
     const d = upDims();
     if(d) txt = '→ ' + d.w + ' × ' + d.h + '  ·  ' + upBackendName()
-                + (upBackendName() === 'bicubic' ? ' (turn on RTX VSR for AI)' : '');
+                + (upBackendName() === 'bicubic' ? ' (turn on RTX VSR for AI)' : '')
+                + ((d.w >= ENC_MAX || d.h >= ENC_MAX) ? '  ·  at the 8192px encoder cap' : '');
     else if(info) txt = 'source is already at/above that height — no upscale';
     else txt = 'load a video to preview the result';
   }
@@ -344,6 +399,7 @@ async function checkRtxReady(){
   // screen space; it reappears only while something needed is still missing.
   $('rtxsetup').style.display = ok ? 'none' : 'block';
   syncUpscale();         // the upscale backend label depends on VSR readiness
+  refreshPreviewIfOpen(); // re-render the open preview now that HDR readiness is known
 }
 async function doInstall(source){
   $('rtxsetup').style.display = 'block';   // show install progress (checkRtxReady collapses it again on success)
@@ -359,10 +415,139 @@ $('rtxbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('rt
 if(localStorage.getItem('rtxvsrOn') === '1') $('rtxvsr').checked = true;   // default OFF
 if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // default OFF
 $('rtxvsr').onchange = () => { localStorage.setItem('rtxvsrOn', $('rtxvsr').checked ? '1' : '0'); syncRtx(); syncUpscale(); };
-$('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); };
+$('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); refreshPreviewIfOpen(); };
 syncRtx();
 // Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
-ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); });
+ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); syncPreview(); });
+
+// Before/after preview (panel above Smooth It): render ONE frame at the current spatial settings via the
+// engine's preview.py and show original vs processed. It applies RTX HDR (when on + ready) and FSR/CAS
+// sharpen (when on), so the user can see how those settings change the picture before a full render.
+// Back / random-frame step through random positions across the clip. HDR is tonemapped to sRGB because
+// this canvas cannot show PQ. Images load as object URLs (nodeIntegration) to dodge file:// webSecurity,
+// and old URLs are revoked so memory does not grow.
+const _fs = require('fs');
+let prevTotal = 0, prevIdx = 0, prevHist = [];
+function sharpStrength(){ return $('sharpen').checked ? (parseFloat($('sharpval').value) || 0) : 0; }
+function setPrevImg(el, file){
+  const old = el.dataset.url; if(old){ try { URL.revokeObjectURL(old); } catch {} }
+  const url = URL.createObjectURL(new Blob([_fs.readFileSync(file)], { type: 'image/png' }));
+  el.dataset.url = url; el.src = url;
+  el.style.visibility = '';        // imgs start hidden so the broken-image icon never shows pre-load
+}
+function updatePrevNav(){          // back only makes sense once a second frame has been generated
+  $('prevprev').style.visibility = prevHist.length > 1 ? '' : 'hidden';
+}
+function syncPreview(){            // the preview panel appears once a video is loaded
+  $('previewpanel').style.display = input ? '' : 'none';
+}
+let prevBusy = false, prevPending = null;   // serialize renders; rapid setting changes coalesce
+let lastPrevInput = null;                    // which video the shown original belongs to
+let lastPrevKey = '', inflightPrevKey = '';  // dedupe: what is shown / what is rendering right now
+async function loadPreview(frame){
+  if(!input) return;
+  if(prevBusy){ prevPending = (frame == null ? 'mid' : frame); return; }
+  prevBusy = true;
+  const hdr = $('rtxhdr').checked && rtxReady.hdr, sharpen = sharpStrength();
+  inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame), sharpen, hdr]);
+  $('hdrpreview').style.display = 'block';
+  if($('prevproc').clientHeight < 40) $('prevprocwrap').style.minHeight = '120px';  // spinner space on first load
+  setSpin($('prevprocwrap'), $('prevspin'), true);
+  // The original pane gets the wheel too, but only when the original is actually about to change:
+  // first load, a different video, or a frame step. Settings tweaks keep the same original frame.
+  const origChanging = !$('prevorig').dataset.url || lastPrevInput !== input
+    || (frame != null && frame !== 'mid' && frame !== prevIdx);
+  if(origChanging){
+    if($('prevorig').clientHeight < 40) $('prevorigwrap').style.minHeight = '120px';
+    setSpin($('prevorigwrap'), $('prevorigspin'), true);
+  }
+  let r; try { r = await ipcRenderer.invoke('preview', { input, frame: (frame == null ? 'mid' : frame),
+    sharpen, hdr, nits: 1000, color: 'vivid', vividness: 1, saturation: 0 }); }
+  catch(e){ r = { error: String(e) }; }
+  setSpin($('prevprocwrap'), $('prevspin'), false);
+  $('prevprocwrap').style.minHeight = '';
+  setSpin($('prevorigwrap'), $('prevorigspin'), false);
+  $('prevorigwrap').style.minHeight = '';
+  prevBusy = false;
+  if(prevPending != null){ const f = prevPending; prevPending = null; loadPreview(f); }
+  if(!r || r.error){ lastPrevKey = '';   // never dedupe-skip a retry after a failure
+    $('prevnote').textContent = 'preview unavailable: ' + ((r && r.error) || 'no result'); return; }
+  if(r.total) prevTotal = r.total;
+  if(typeof r.frame === 'number') prevIdx = r.frame;
+  setPrevImg($('prevorig'), r.original);
+  setPrevImg($('prevproc'), r.processed);
+  lastPrevInput = input;
+  lastPrevKey = JSON.stringify([input, prevIdx, sharpen, hdr]);
+  const active = hdr || sharpen > 0;
+  $('prevproclabel').textContent = !active ? 'Unchanged'
+    : 'Processed' + (hdr && sharpen > 0 ? ' (HDR + FSR)' : hdr ? ' (HDR, tonemapped)' : ' (FSR sharpen)');
+  $('prevlabel').textContent = 'frame ' + prevIdx + (prevTotal ? ' / ' + prevTotal : '');
+  $('prevnote').textContent = (!active ? 'no FSR or RTX HDR enabled, the output will match the source'
+    : hdr ? 'HDR is cyan-corrected and tonemapped to show on this SDR screen'
+    : 'FSR sharpening is subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
+}
+function randFrame(){ return prevTotal > 1 ? Math.floor(Math.random() * prevTotal) : 'mid'; }
+function refreshPreviewIfOpen(){           // re-render the shown frame when sharpen / HDR changes
+  if(!input) return;
+  syncPreview();
+  const frame = prevHist.length ? prevHist[prevHist.length - 1] : 'mid';
+  const key = JSON.stringify([input, frame, sharpStrength(), $('rtxhdr').checked && rtxReady.hdr]);
+  // Skip when the effective settings already match what is shown (or what is mid-render), so the
+  // checkbox handler and checkRtxReady's async refresh don't double-render the same state.
+  if(key === (prevBusy ? inflightPrevKey : lastPrevKey)) return;
+  loadPreview(frame);
+}
+function openPreviewForVideo(){            // auto-load the pane when a video is selected
+  syncPreview(); prevHist = []; prevTotal = 0; prevIdx = 0; updatePrevNav();
+  loadPreview('mid').then(() => { if(prevTotal && !prevHist.length) prevHist = [prevIdx]; updatePrevNav(); });
+}
+$('prevnext').onclick = async () => { await loadPreview(randFrame()); prevHist.push(prevIdx); updatePrevNav(); };
+$('prevprev').onclick = async () => { if(prevHist.length > 1){ prevHist.pop(); updatePrevNav(); await loadPreview(prevHist[prevHist.length - 1]); } };
+$('sharpval').addEventListener('change', refreshPreviewIfOpen);
+$('sharpen').addEventListener('change', refreshPreviewIfOpen);
+
+// 1:1 zoom: the pane shrinks 1080p+ frames ~6x, which visually erases sharpening, so clicking either
+// image toggles both to native pixels inside scrollable boxes with mirrored scrolling for A/B compare.
+let prevZoom = false, prevSyncing = false;
+function applyPrevZoom(){
+  for(const [w, i] of [['prevorigwrap', 'prevorig'], ['prevprocwrap', 'prevproc']]){
+    const wrap = $(w), img = $(i);
+    wrap.style.overflow = prevZoom ? 'auto' : 'hidden';
+    wrap.style.maxHeight = prevZoom ? '320px' : '';
+    img.style.width = prevZoom ? 'auto' : '100%';
+    img.style.maxWidth = prevZoom ? 'none' : '';
+    img.style.cursor = prevZoom ? 'zoom-out' : 'zoom-in';
+  }
+}
+function prevScrollSync(src, dst){
+  if(prevSyncing) return; prevSyncing = true;
+  dst.scrollLeft = src.scrollLeft; dst.scrollTop = src.scrollTop;
+  prevSyncing = false;
+}
+function setSpin(wrap, spin, on){
+  // Sized/positioned to the VISIBLE window of the scroll box, so the wheel stays centred in view
+  // when the pane is zoomed 1:1 and scrolled (an inset-0 overlay would sit at the scroll origin).
+  if(!on){ spin.style.display = 'none'; return; }
+  spin.style.left = wrap.scrollLeft + 'px'; spin.style.top = wrap.scrollTop + 'px';
+  spin.style.width = wrap.clientWidth + 'px'; spin.style.height = wrap.clientHeight + 'px';
+  spin.style.display = 'flex';
+}
+function repositionSpins(){          // keep a visible wheel glued to the viewport while scrolling
+  for(const [w, s] of [['prevorigwrap', 'prevorigspin'], ['prevprocwrap', 'prevspin']]){
+    const spin = $(s); if(spin.style.display !== 'none') setSpin($(w), spin, true);
+  }
+}
+$('prevorigwrap').addEventListener('scroll', () => { prevScrollSync($('prevorigwrap'), $('prevprocwrap')); repositionSpins(); });
+$('prevprocwrap').addEventListener('scroll', () => { prevScrollSync($('prevprocwrap'), $('prevorigwrap')); repositionSpins(); });
+function togglePrevZoom(){
+  prevZoom = !prevZoom; applyPrevZoom();
+  if(prevZoom){ const w = $('prevorigwrap');           // land in the middle of the frame, both panes
+    w.scrollLeft = ($('prevorig').scrollWidth - w.clientWidth) / 2;
+    w.scrollTop = ($('prevorig').scrollHeight - w.clientHeight) / 2; }
+  repositionSpins();
+}
+$('prevorig').onclick = togglePrevZoom;
+$('prevproc').onclick = togglePrevZoom;
 
 // Interpolate: master toggle for GMFSS frame generation. Unchecked, the app only re-encodes the
 // video with the FSR sharpen applied (no in-between frames), so the multiplier, fps and screen-
