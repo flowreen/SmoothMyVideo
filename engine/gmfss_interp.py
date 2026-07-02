@@ -36,7 +36,7 @@ generated frame. Duration therefore matches the source.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
-       [--out-bits {8,10}] [--no-scene-detect]
+       [--out-bits {8,10}] [--no-scene-detect] [--no-near-dup]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
@@ -57,6 +57,7 @@ import os
 import sys
 import math
 import json
+import time
 import argparse
 import subprocess
 import threading
@@ -112,6 +113,13 @@ ap.add_argument("--codec", choices=["hevc", "av1", "vvc"], default="hevc",
                      "vvc: H.266 via CPU libvvenc (best compression, slow, limited player support; "
                      "always 10-bit). The NVENC choices fall back to CPU libsvtav1 when no usable "
                      "session exists; vvc falls back to HEVC if libvvenc is absent.")
+ap.add_argument("--no-near-dup", action="store_true",
+                help="disable near-duplicate detection. By default a pair whose frames differ only "
+                     "by compression noise (anime drawn on twos/threes re-encoded lossily, so held "
+                     "cels are no longer byte-identical) is held like an exact duplicate instead of "
+                     "interpolated, skipping wasted compute and the shimmer GMFSS adds when it "
+                     "interpolates pure noise. Real motion is never held: the detector reacts to "
+                     "spatially coherent change (even a tiny blink or a 1px pan), not noise.")
 ap.add_argument("--no-scene-detect", action="store_true",
                 help="disable hard-cut detection. By default the engine detects true scene cuts "
                      "(via forward/backward flow consistency plus warp residual, reusing the flows "
@@ -171,9 +179,12 @@ inp = os.path.abspath(args.input)
 SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
 SCENE_DETECT = not args.no_scene_detect      # hold frames across true cuts instead of morphing
-UPSCALE_F = max(1.0, min(8.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
-                                             # RTX VSR has no integer-scale limit (probed clean past
-                                             # 8K), so any factor is allowed up to an 8x sanity cap.
+NEAR_DUP = not args.no_near_dup              # hold noise-only pairs like exact duplicates
+UPSCALE_F = max(1.0, min(16.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
+                                             # RTX VSR has no integer-scale limit (probed clean to
+                                             # 16K), so any factor is allowed up to a 16x sanity cap
+                                             # (16K from 720p); the encoder pick below handles the
+                                             # >8192px sizes NVENC cannot encode.
 UPSCALE = UPSCALE_F > 1.0
 RTX_VSR = args.rtx_vsr                        # use the RTX Video SDK (real RTX VSR) for --upscale
 RTX_HDR = args.rtx_hdr                         # convert the output to HDR10 via RTX Video TrueHDR
@@ -350,6 +361,17 @@ _RTX = None
 # pixels it assumes are SDR gamma. Skip the conversion and carry the source HDR through unchanged
 # (the SDR colour path below already stamps the source transfer/primaries onto the output).
 SRC_HDR_IN = (_tag("color_transfer") or "") in ("smpte2084", "arib-std-b67")
+# TrueHDR is also capped at 8192 px: at 16K its ICtCp colour math alone needs ~10 GB of
+# intermediate tensors on top of the SDK and VSR buffers, which oversubscribes a 24 GB card.
+# On Windows, VRAM oversubscription does not fail cleanly - WDDM starts evicting under load and
+# the NVIDIA driver can stall in kernel mode long enough to trip the DPC watchdog (bugcheck
+# 0x133, a hard reboot). Refusing up front is the only safe behaviour.
+if RTX_HDR and (OUT_W > 8192 or OUT_H > 8192):
+    sys.stderr.write(f"[rtx] RTX HDR is limited to 8192px outputs ({OUT_W}x{OUT_H} requested): "
+                     "TrueHDR at this size oversubscribes GPU memory, which can hard-crash the "
+                     "system (DPC watchdog). Rendering SDR; lower the upscale target to combine "
+                     "it with HDR.\n"); sys.stderr.flush()
+    RTX_HDR = False
 if RTX_HDR and SRC_HDR_IN:
     sys.stderr.write(f"[rtx] source is already HDR (transfer {_tag('color_transfer')}); TrueHDR "
                      "converts SDR only, skipping the HDR conversion (source HDR signalling is "
@@ -433,6 +455,100 @@ def _upscale(t, ow, oh):
             RTX_VSR_ACTIVE = False
     return F.interpolate(t, size=(oh, ow), mode="bicubic", align_corners=False).clamp(0.0, 1.0)
 
+# --- live output preview ----------------------------------------------------------------------
+# When SMV_LIVE_PREVIEW is set (the GUI passes a path under its userData dir), a small JPEG of
+# the most recently produced frame is dropped there about once a second and the GUI shows it as
+# a "what is being written right now" thumbnail. Time-gated, so the cost is one 480p download +
+# JPEG encode per second (~ms) and exactly zero when the env var is absent (CLI runs). Written
+# tmp-then-replace so the poller never reads a half-written file. The thumbnail shows what the
+# OUTPUT will look like: an HDR render's frame is the graded TrueHDR result (unpacked from the
+# packed PQ bytes and tonemapped for the sRGB canvas with the SAME source-anchored tonemap the
+# before/after pane uses - preview.py's _tonemap - so colour mode, vibrance and contrast all
+# show); an HDR SOURCE carried through gets the pane's self-anchored _tonemap_pq (raw PQ code
+# values would read flat and washed out). preview.py guards its main(), so it imports clean.
+LIVE_PREVIEW = os.environ.get("SMV_LIVE_PREVIEW")
+_live_last = 0.0
+
+def _live_small(img):
+    """[3,H,W] float in [0,1] -> HxWx3 uint8 numpy, downscaled to <=480 tall (even width)."""
+    h, w = img.shape[-2], img.shape[-1]
+    if h > 480:
+        img = F.interpolate(img[None], size=(480, max(2, round(w * 480 / h / 2) * 2)),
+                            mode="bilinear", align_corners=False)[0]
+    return (img.clamp(0, 1) * 255).round().byte().permute(1, 2, 0).cpu().numpy()
+
+_live_q = None      # single-slot handoff to the formatting worker; created on the first tick
+_live_thread = None
+
+def _live_worker():
+    """Formats and writes the thumbnails off the render thread. The heavy part of a tick is CPU
+    formatting (PQ unpack + tonemap + JPEG, ~100 ms for an HDR frame), and the render pipeline is
+    GPU-compute-bound with idle cores, so moving it here makes the render-thread cost of a tick
+    just the ~ms GPU downscale in _live_small. One worker + a 1-slot queue: ticks that arrive
+    while it is busy are simply skipped (put_nowait below), never queued up."""
+    import cv2
+    import preview as _prev                   # importable: preview.py guards main(); the pane's tonemaps
+    while True:
+        item = _live_q.get()
+        if item is None:                      # flush sentinel: drain finished, exit
+            return
+        kind, rgb, packed = item
+        try:
+            if kind == "hdr":
+                # Graded HDR frame: unpack run_hdr's x2rgb10le (R>>20, G>>10, B low bits), decode
+                # PQ to linear and tonemap anchored to the SDR frame it was graded from, exactly
+                # like the before/after pane. Stride-subsample the packed words before any math:
+                # the shifts/stack/resize then see only a thumbnail-sized grid (nearest-pixel
+                # subsampling is invisible at this size).
+                import rtxvideo
+                u = np.frombuffer(packed, "<u4").reshape(OUT_H, OUT_W)
+                step = max(1, OUT_H // 480)
+                if step > 1:
+                    u = u[::step, ::step]
+                code = np.stack([(u >> 20) & 1023, (u >> 10) & 1023, u & 1023], -1).astype(np.float32) / 1023.0
+                if code.shape[0] > 480:
+                    code = cv2.resize(code, (max(2, round(code.shape[1] * 480 / code.shape[0] / 2) * 2), 480),
+                                      interpolation=cv2.INTER_AREA)
+                lin = rtxvideo._pq_to_linear(torch.from_numpy(code)).numpy()
+                rgb = _prev._tonemap(lin, rgb)
+            elif kind == "pq":
+                rgb = _prev._tonemap_pq(rgb)  # PQ source carried through: display-map it like the pane
+            tmp = LIVE_PREVIEW + ".tmp.jpg"
+            if cv2.imwrite(tmp, np.ascontiguousarray(rgb[:, :, ::-1])):   # RGB -> BGR for cv2
+                os.replace(tmp, LIVE_PREVIEW)
+        except Exception:  # noqa: BLE001 - a thumbnail must never break (or stall) the render
+            pass
+
+def _live_flush():
+    """Let the worker finish the tick in flight (and the render's final thumbnail) before exit;
+    bounded so a wedged worker can never hold the render open (it is a daemon thread)."""
+    if _live_q is not None:
+        try:
+            _live_q.put(None, timeout=2)
+            _live_thread.join(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+def _live_preview(t, hdr_packed=None):
+    global _live_last, _live_q, _live_thread
+    if not LIVE_PREVIEW or time.time() - _live_last < 1.0:
+        return
+    _live_last = time.time()
+    try:
+        if _live_q is None:
+            _live_q = queue.Queue(maxsize=1)
+            _live_thread = threading.Thread(target=_live_worker, daemon=True)
+            _live_thread.start()
+        kind = "hdr" if hdr_packed is not None else ("pq" if SRC_HDR_IN else "sdr")
+        # The render thread only snapshots: a ~480p GPU downscale + download (_live_small) and,
+        # for HDR, a reference to the already-host packed bytes. All decoding/tonemapping/JPEG
+        # happens on the worker.
+        _live_q.put_nowait((kind, _live_small(t[0]), hdr_packed))
+    except queue.Full:
+        pass               # worker still formatting the previous tick: skip this one
+    except Exception:  # noqa: BLE001 - a thumbnail must never break the render
+        pass
+
 def to_bytes(t):
     t = t.float()[..., :H, :W]            # crop off the padding added in to_tensor
     # Pipeline order, chosen for max quality (VSR -> RCAS -> TrueHDR):
@@ -448,8 +564,12 @@ def to_bytes(t):
         t = _rcas(t, SHARPEN)             # FSR-style RCAS sharpen at the output res (GUI "FSR"); see _rcas
     if HDR_ACTIVE:
         # RTX TrueHDR: SDR -> packed 10-bit BT.2020 PQ RGB (x2rgb10le) at OUT_W x OUT_H. This drives
-        # the HDR encode path below, so it bypasses the SDR quantise.
-        return _RTX.run_hdr(t)
+        # the HDR encode path below, so it bypasses the SDR quantise. The live thumbnail is made
+        # from the graded output (tonemapped), so the GUI shows the actual HDR look.
+        out = _RTX.run_hdr(t)
+        _live_preview(t, out)
+        return out
+    _live_preview(t)                      # GUI live thumbnail (time-gated; no-op without the env var)
     # Round to nearest, not truncate: numpy's float->uint cast floors, which biases every frame
     # ~0.5 LSB low (a uniform darkening, and the wrong quantisation of the model output). Rounding
     # is the unbiased mapping back to integer samples; every emitted frame goes through here.
@@ -531,6 +651,38 @@ def _pair_is_cut(i, I0, I1, reuse):
                          "holding boundary frames instead of interpolating\n"); sys.stderr.flush()
     return cut
 
+# --- near-duplicate detection ---------------------------------------------------------------
+# Anime is drawn on twos and threes, so held cels repeat; after a lossy encode the repeats are
+# no longer byte-identical (the exact-equality check above misses them) and GMFSS interpolates
+# pure compression noise: M inferences per pair wasted, plus a subtle shimmer on what should be
+# a rock-still shot. A pair whose difference is noise-only is therefore held like an exact dup.
+# The detector must never hold visible motion (that would create judder, the thing the app
+# exists to remove), so it keys on spatial coherence, not amount: the SIGNED difference is
+# averaged per 16 px block (random encode noise cancels inside a block; real change, however
+# small or local - a blink, a 1 px pan - is coherent and survives), and the maximum block wins.
+# A plain mean-abs difference would do the opposite: its noise floor never averages away, and a
+# tiny blinking dot drowns in it. The threshold is a HARM BOUND rather than a noise/motion
+# classifier (at these amplitudes the two are not separable even in principle: an ultra-slow
+# morph measures BELOW dither noise): holding emits the pair midpoint, so the worst-case error
+# vs true interpolation is half the pair difference, i.e. <= ~1.5 8-bit levels in the single
+# most-changed block at this threshold - at or below the source's own quantisation noise,
+# invisible whether the sub-threshold change was noise or drift.
+# Calibration (2026-07-02, SMV_SCENE_DEBUG sweeps; maxblock values):
+#   duplicated cels + temporal noise alls=1/2/3   0.0068..0.0099 / 0.008..0.012 / 0.0075..0.016
+#   ultra-slow gradient morph                     ~0.002           (held: harmless per the bound)
+#   1 px/frame photo pan, 1 s fade (+ noise)      0.033..0.047 / 0.035..0.052   (~3x margin)
+#   24 px blink toggle, normal anime motion       ~0.82 / 0.71..0.85            (60x+ margin)
+NEARDUP_TH = 0.012      # max block-mean signed diff, [0,1] scale (~3 8-bit levels)
+
+def _near_dup(i, I0, I1):
+    """True when pair i differs only by compression noise; logged under SMV_SCENE_DEBUG."""
+    if not NEAR_DUP:
+        return False
+    d = F.avg_pool2d((I0 - I1).float(), 16).abs().max().item()
+    if SCENE_DEBUG:
+        sys.stderr.write(f"DUP {i} maxblock={d:.5f}\n"); sys.stderr.flush()
+    return d < NEARDUP_TH
+
 def _soft_still(I):
     """One source frame rendered the way held duplicate cels already are: GMFSS on the (I, I)
     pair at t=0.5. Emitting the raw source frame here would pop (sharp against the soft tweens
@@ -575,22 +727,96 @@ dec = subprocess.Popen(
 # degrade gracefully: a missing NVENC session falls back to CPU libsvtav1, a missing libvvenc to
 # HEVC.
 
-def _enc_works(name):
-    # Real availability check: actually open the encoder on a tiny frame. NVENC fails fast
-    # here when the device has no usable encode session (no NVIDIA GPU, a GPU too old for
-    # this codec, or no driver), which is exactly the case the software fallback covers.
+def _enc_works(name, size="256x256", fast=False):
+    # Real availability check: actually open the encoder on a frame of the given size. NVENC
+    # fails fast here when the device has no usable encode session (no NVIDIA GPU, a GPU too
+    # old for this codec, or no driver), which is exactly the case the software fallback
+    # covers. With an output-sized `size` this doubles as a resolution-capability probe (the
+    # CPU encoders' ceilings are build/machine dependent); `fast` switches to each encoder's
+    # fastest preset there, since open/size failures do not depend on the preset.
     try:
+        args = [FFMPEG, "-hide_banner", "-v", "error", "-f", "lavfi",
+                "-i", f"color=c=black:s={size}:d=1:r=24", "-frames:v", "1"]
+        if fast:
+            args += ["-vf", "format=yuv420p10le"]
+            if name == "libsvtav1":
+                args += ["-preset", "12"]
+            elif name == "libvvenc":
+                args += ["-preset", "faster"]
         return subprocess.run(
-            [FFMPEG, "-hide_banner", "-v", "error", "-f", "lavfi",
-             "-i", "color=c=black:s=256x256:d=1:r=24", "-frames:v", "1",
-             "-c:v", name, "-f", "null", "-"],
+            args + ["-c:v", name, "-f", "null", "-"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=NO_WINDOW).returncode == 0
     except Exception:  # noqa: BLE001
         return False
 
 venc = {"av1": "av1_nvenc", "vvc": "libvvenc"}.get(CODEC, "hevc_nvenc")
-if venc == "libvvenc" and not _enc_works(venc):
+NVENC_MAX = 8192   # hevc_nvenc AND av1_nvenc refuse anything larger in either dimension (probed
+                   # on the RTX 5090: 8192 passes, 8704 "No capable devices"); HEVC as a format
+                   # tops out at 8192 anyway, so past this the codec family must change.
+if OUT_W > NVENC_MAX or OUT_H > NVENC_MAX:
+    # Beyond NVENC: only the CPU encoders can take it, and their ceilings are not fixed numbers
+    # (this build's SVT-AV1 passed 12288x6912 and refused 14336x8064; vvenc took 15360x8640), so
+    # probe candidates AT the real output size. Order by measured probe cost: above ~90 MP
+    # SVT-AV1 is expected to refuse and its failing probe costs ~40 s, while a passing vvenc
+    # probe costs ~3 s, so VVC goes first there; below that SVT-AV1 (AV1 plays far more widely
+    # than VVC) gets the first shot. --codec vvc keeps VVC first at any size.
+    order = ["libvvenc", "libsvtav1"] if (CODEC == "vvc" or OUT_W * OUT_H > 90_000_000) \
+        else ["libsvtav1", "libvvenc"]
+    sys.stderr.write(f"{OUT_W}x{OUT_H} exceeds the {NVENC_MAX}px NVENC/HEVC limit; probing CPU "
+                     "encoders at the output size (one-time, up to ~1 min)...\n"); sys.stderr.flush()
+    for cand in order:
+        if _enc_works(cand, f"{OUT_W}x{OUT_H}", fast=True):
+            venc = cand
+            break
+    else:
+        sys.exit(f"no bundled encoder can encode {OUT_W}x{OUT_H}; lower the upscale target")
+    sys.stderr.write(f"encoding {OUT_W}x{OUT_H} with {venc} "
+                     f"({'H.266/VVC' if venc == 'libvvenc' else 'AV1'}, CPU)\n"); sys.stderr.flush()
+
+    # RAM preflight (fail closed). The CPU encoders keep dozens of pictures in flight at these
+    # sizes. MEASURED IN-PIPELINE at 15360x8640 (per-process RSS during a real render): the
+    # encode-side ffmpeg peaks at ~42 GB (vvenc's own ~30 GB working set - GOP/threads knobs do
+    # not shrink it; maxparallelframes=2 in qargs below saves ~4 GB at no wall cost - plus
+    # ffmpeg's fixed inter-stage frame queues carrying ~0.8 GB raw frames), the engine python
+    # ~8 GB, the decode ffmpeg ~5 GB. SVT-AV1 standalone is ~33.5 GB at 12288x6912 (its banner
+    # calls >=8K support a work-in-progress). Running out of physical RAM here does not fail
+    # cleanly: with a small pagefile the machine reaches commit exhaustion, kernel drivers
+    # stall, and the DPC watchdog hard-reboots the box (bugcheck 0x133, observed 2026-07-02 on
+    # a 64 GB machine, reproduced under a monitored rerun). Refusing up front with an
+    # actionable message is the only safe behaviour.
+    def _avail_ram_gb():
+        try:
+            import ctypes
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                           [(n, ctypes.c_ulonglong) for n in
+                            ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                             "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+            ms = _MS()
+            ms.dwLength = ctypes.sizeof(_MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            return ms.ullAvailPhys / 1e9
+        except Exception:  # noqa: BLE001 - non-Windows or API failure: skip the gate
+            return 0.0
+    _mp = OUT_W * OUT_H / 1e6
+    # Coefficients calibrated on the monitored 15360x8640 run (133 MP): the whole pipeline had
+    # consumed ~47 GB of available RAM at 87% progress when the watchdog killed it, so ~48 GB
+    # true peak + margin -> 0.36 GB/MP for the vvenc path. SVT-AV1 measures fatter per pixel
+    # (33.5 GB standalone at 85 MP before pipeline overhead) -> 0.55 GB/MP. Mid sizes stay
+    # practical (9600x5400 -> ~35 GB); true 16K honestly needs a ~64 GB machine with nearly
+    # everything closed, or more RAM.
+    _need = (0.36 if venc == "libvvenc" else 0.55) * _mp + 6.0
+    _avail = _avail_ram_gb()
+    if _avail and _avail < _need:
+        sys.exit(f"{OUT_W}x{OUT_H} needs ~{_need:.0f} GB of free RAM (the CPU encoder alone "
+                 f"holds ~40 GB of frames in flight at this size) but only {_avail:.0f} GB is "
+                 "available. Close other applications, lower the upscale target, or run on a "
+                 "machine with more memory; proceeding anyway can freeze or hard-crash the "
+                 "whole system (DPC watchdog).")
+    sys.stderr.write(f"RAM preflight: ~{_need:.0f} GB needed, {_avail:.0f} GB available\n")
+    sys.stderr.flush()
+elif venc == "libvvenc" and not _enc_works(venc):
     sys.stderr.write("libvvenc (H.266/VVC) unavailable in this ffmpeg; using HEVC instead\n")
     sys.stderr.flush()
     venc = "hevc_nvenc"
@@ -634,6 +860,10 @@ elif venc == "libvvenc":
     # vvenc has no CRF; QP 21 with its perceptual QP adaptation (qpa, on by default) sits in the
     # visually lossless range, and the fast preset keeps 1080p from being glacial on the CPU.
     qargs = ["-qp", "21", "-preset", "fast"]
+    if OUT_W > NVENC_MAX or OUT_H > NVENC_MAX:
+        # Ultra sizes: cap frame-level parallelism. Measured at 15360x8640 (24 frames): default
+        # peaks ~34 GB RAM, maxparallelframes=2 peaks ~30 GB at the SAME wall time.
+        qargs += ["-vvenc-params", "maxparallelframes=2"]
 else:
     qargs = ["-crf", "20", "-preset", "8"]
 
@@ -689,8 +919,14 @@ elif NO_INTERP and not (SHARPEN > 0 or UPSCALE):
     ENC_IN_FMT = DEC_FMT
 else:
     ENC_IN_FMT = OUT_RAW_FMT
+# At ultra sizes, strip ffmpeg's input-side buffering: the demux thread queue defaults to 8
+# packets and the rawvideo decoder frame-threads across every core, each slot holding a full
+# raw frame - invisible at 1080p (~50 MB total) but ~0.8 GB per slot at 16K, i.e. tens of GB
+# of silent pooling on top of the encoder's own ~30 GB working set (measured: the encode-side
+# ffmpeg peaked at 42.8 GB in-pipeline vs 29.8 GB standalone before this cap).
+_TQ = ["-threads", "1", "-thread_queue_size", "1"] if (OUT_W > NVENC_MAX or OUT_H > NVENC_MAX) else []
 enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", ENC_IN_FMT,
-           "-s", f"{OUT_W}x{OUT_H}", "-r", rate_str, "-i", "-", "-i", inp,
+           "-s", f"{OUT_W}x{OUT_H}", "-r", rate_str] + _TQ + ["-i", "-", "-i", inp,
            "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy",
            "-c:v", venc, "-vf", vf]
 # VVC-in-MP4 muxing is gated behind -strict experimental on some ffmpeg versions; harmless otherwise.
@@ -706,8 +942,11 @@ sys.stderr.write(f"encode: {venc} visually-lossless -> {out_pix}  "
 # stalling the single pipe. One writer pulling a bounded FIFO preserves frame order, so the
 # output bytes are exactly what the serial path produced; the bound caps buffered frames so a
 # slow encoder applies backpressure rather than growing memory. On a write failure the writer
-# keeps draining (so the producer never blocks on a full queue) and the error is surfaced after join.
-wq = queue.Queue(maxsize=8)
+# keeps draining (so the producer never blocks on a full queue) and the error is surfaced after
+# join. The bound is byte-aware: 8 frames was sized for ~10 MB frames, but a 16K rgb48le frame
+# is ~0.8 GB, so cap the buffered bytes at ~1.5 GB instead of a fixed frame count.
+_ENC_BPP = 4 if ENC_IN_FMT == "x2rgb10le" else (6 if ENC_IN_FMT == "rgb48le" else 3)
+wq = queue.Queue(maxsize=max(1, min(8, int(1.5e9 // max(1, OUT_W * OUT_H * _ENC_BPP)))))
 _werr = []
 def _writer():
     while True:
@@ -726,7 +965,8 @@ wt.start()
 # Symmetrically, read the decode pipe on its own thread into a bounded queue so the next frame
 # is prefetched while the GPU works the current one. Frames stay ordered (one reader, FIFO);
 # the bound caps prefetch so a fast decoder applies backpressure. EOF is signalled by None.
-rq = queue.Queue(maxsize=8)
+# Byte-aware like wq, for very large sources.
+rq = queue.Queue(maxsize=max(2, min(8, int(1.5e9 // max(1, fsize)))))
 def _reader():
     try:
         while True:
@@ -800,6 +1040,7 @@ if NO_INTERP:
     if _werr:
         raise _werr[0]          # surface a failed encode pipe as a nonzero exit
     _write_hdr10_metadata()
+    _live_flush()               # let the final live thumbnail land before exit
     sys.stderr.write(f"done {k} frames "
                      f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n")
     sys.exit(0)
@@ -811,6 +1052,7 @@ I0 = to_tensor(prev)
 k = 0
 i = 0
 dups = 0
+neardups = 0            # subset of dups: noise-only pairs caught by _near_dup, not byte equality
 cuts = 0                # hard cuts held instead of interpolated (see scene cut detection)
 last_out = None         # bytes of the most recent emitted frame, held across the final slot
 try:
@@ -819,11 +1061,15 @@ try:
         if cur is None:
             break
         I1 = to_tensor(cur)
-        # Held cels: anime is drawn on twos/threes, so repeated frames decode byte for byte alike.
-        # Every timestep between two identical frames renders the same still, so render it once and
-        # reuse those bytes for all of this pair's slots; this also avoids the shimmer GMFSS can add
-        # on identical input. The bytes compare short circuits, so it is ~free to detect.
+        # Held cels: anime is drawn on twos/threes, so repeated frames decode byte for byte alike
+        # (exact bytes compare, ~free) or, after a lossy re-encode, alike up to compression noise
+        # (_near_dup). Every timestep between two such frames renders the same still, so render it
+        # once and reuse those bytes for all of this pair's slots; this also avoids the shimmer
+        # GMFSS can add on (near-)identical input.
         dup = cur == prev
+        if not dup and _near_dup(i, I0, I1):
+            dup = True
+            neardups += 1
         if dup:
             dups += 1
         if FPS_MODE:
@@ -902,4 +1148,6 @@ finally:
 if _werr:
     raise _werr[0]          # surface a failed encode pipe as a nonzero exit
 _write_hdr10_metadata()
-sys.stderr.write(f"done {k} pairs ({dups} held as duplicates, {cuts} cuts held) -> {out_path}\n")
+_live_flush()               # let the final live thumbnail land before exit
+sys.stderr.write(f"done {k} pairs ({dups} held as duplicates ({neardups} near), {cuts} cuts held) "
+                 f"-> {out_path}\n")

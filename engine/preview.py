@@ -168,8 +168,10 @@ def main():
     src_hdr = transfer in ("smpte2084", "arib-std-b67")
     do_hdr = args.rtx_hdr and not src_hdr   # TrueHDR is SDR-to-HDR; the engine skips it on HDR sources
     h0, w0 = bgr.shape[0], bgr.shape[1]
-    up = max(1.0, min(8.0, args.upscale))
+    up = max(1.0, min(16.0, args.upscale))
     ow, oh = ((round(w0 * up) // 2) * 2, (round(h0 * up) // 2) * 2) if up > 1.0 else (w0, h0)
+    if do_hdr and (ow > 8192 or oh > 8192):
+        do_hdr = False   # mirror the engine: TrueHDR past 8192px oversubscribes VRAM (DPC-watchdog risk)
     vsr_used = False
 
     if strength > 0 or do_hdr or up > 1.0:

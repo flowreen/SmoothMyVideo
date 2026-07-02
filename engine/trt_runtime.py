@@ -5,12 +5,16 @@ Strategy (validated in trt_poc.py / trt_poc_gmflow.py): each sub net is exported
 to ONNX under autocast(fp16) via the dynamo exporter (mixed fp16/fp32 matching the
 app's precision), then built into a strongly typed TRT engine. softsplat (cupy) and
 the F.interpolate glue stay in eager. Engines are built on first use for a given
-input resolution and cached on disk per (net, shapes, gpu, trt version).
+input resolution and cached on disk per (net, shapes, gpu, trt version, weights hash);
+the weights fingerprint in the name means a train_log swap invalidates the cache
+automatically (stale engines are deleted at startup) instead of silently serving
+engines compiled from the old model.
 
 trtify(model) swaps model.feat_ext / flownet / metricnet / ifnet / fusionnet for
 wrappers with identical call signatures, so GMFSS_infer_u is untouched. Any export
 or build failure falls back to the original eager module, so the app never breaks.
 """
+import hashlib
 import os
 import sys
 import time
@@ -40,6 +44,25 @@ def _gpu_tag():
     return f"{name}-trt{trt.__version__}".replace(".", "_")
 
 
+def _weights_tag():
+    """Fingerprint of the train_log weights, baked into every engine filename so a compiled
+    engine can never outlive the weights it was exported from: swapped .pkl files change the
+    tag, which is a cache miss (fresh build) plus garbage collection of the stale engines
+    below. Hashes the file CONTENTS, not mtimes - a fresh unzip/copy of identical weights
+    must not throw away ~6 min of builds per resolution. The ~75 MB read costs ~0.2 s once
+    per engine start, and the same files are about to be loaded by torch anyway."""
+    h = hashlib.md5()
+    wdir = os.path.join(HERE, "GMFSS_Fortuna", "train_log")
+    for n in sorted(os.listdir(wdir)):
+        if n.endswith(".pkl"):
+            with open(os.path.join(wdir, n), "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+    return "w" + h.hexdigest()[:10]
+
+
+
+
 def _shape_tag(tensors):
     return "_".join("x".join(map(str, t.shape)) for t in tensors)
 
@@ -47,6 +70,34 @@ def _shape_tag(tensors):
 def _log(msg):
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
+
+
+WEIGHTS_TAG = _weights_tag()
+
+# Reconcile the cache with the current weights, once per engine start:
+#   - engines named for a DIFFERENT weights fingerprint are stale by definition: delete them
+#     (this is the "force delete the ancient engines" step - without it a weight swap would
+#     silently keep serving the old model, because build_or_load finds engines by name and
+#     never consults the .pkl files again);
+#   - engines from before fingerprinting (no _w suffix) are migrated by RENAME to the current
+#     tag instead of deleted: every historical build came from the only weights this app has
+#     ever shipped (hash-verified against upstream), so they are known good and rebuilding
+#     them would cost ~6 min per resolution for nothing;
+#   - stray .onnx/.onnx.data intermediates (a crashed build) are junk either way.
+for _fn in os.listdir(CACHE_DIR):
+    _p = os.path.join(CACHE_DIR, _fn)
+    try:
+        if _fn.endswith((".onnx", ".onnx.data")):
+            os.remove(_p)
+        elif _fn.endswith(".engine") and f"_{WEIGHTS_TAG}" not in _fn:
+            if "_w" not in _fn:  # pre-fingerprint name: adopt it for the current weights
+                os.rename(_p, _p[:-len(".engine")] + f"_{WEIGHTS_TAG}.engine")
+                _log(f"[trt] adopted cached engine for current weights: {_fn}")
+            else:                # fingerprinted for other weights: stale, remove
+                os.remove(_p)
+                _log(f"[trt] removed stale engine (weights changed): {_fn}")
+    except OSError:
+        pass  # cache hygiene is best effort; a locked file just stays until next start
 
 
 class TRTModule:
@@ -103,7 +154,7 @@ def _build_serialized(onnx_path):
 def build_or_load(name, export_module, example_inputs, input_names, output_names):
     """Return a TRTModule for export_module at these input shapes, building and
     caching (autocast fp16 ONNX -> strongly typed engine) on a cache miss."""
-    tag = f"{name}_{_shape_tag(example_inputs)}_{_gpu_tag()}"
+    tag = f"{name}_{_shape_tag(example_inputs)}_{_gpu_tag()}_{WEIGHTS_TAG}"
     engine_path = os.path.join(CACHE_DIR, tag + ".engine")
     if os.path.isfile(engine_path):
         with open(engine_path, "rb") as f:

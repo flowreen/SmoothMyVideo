@@ -88,10 +88,11 @@
         <option value="1440">1440p &middot; 2K</option>
         <option value="2160">2160p &middot; 4K</option>
         <option value="4320">4320p &middot; 8K</option>
+        <option value="8640">8640p &middot; 16K</option>
         <option value="custom">Custom height&hellip;</option>
       </select>
       <span id="upcustomwrap" style="display:none;align-items:center;gap:8px;">
-        <input id="upcustom" type="range" min="720" max="8192" step="2" value="2160"
+        <input id="upcustom" type="range" min="720" max="8640" step="2" value="2160"
                style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
         <span class="v" id="upcustomnum">2160p</span>
       </span>
@@ -228,11 +229,14 @@
     <button id="go" disabled>Smooth It!</button>
     <button id="cancel" disabled>Cancel</button>
     <button id="open" disabled>Open folder</button>
+    <button id="play" disabled>Play video</button>
     <span id="status" class="hint">Select a video to begin.</span>
   </div>
 
   <div class="panel"><div id="bar"><div id="fill"></div></div>
-    <div class="hint" id="frames" style="margin-top:6px"></div></div>
+    <div class="hint" id="frames" style="margin-top:6px"></div>
+    <img id="live" title="The frame being written right now" alt=""
+         style="display:none;margin-top:8px;max-width:100%;border-radius:4px"></div>
 
   <div id="log"></div>
 
@@ -240,6 +244,10 @@
 const { ipcRenderer, shell, webUtils } = require('electron');
 const path = require('path');
 let info = null, input = null, lastOut = null, customOut = null, useFps = false, fpp = 1, totalGen = 1, procStart = 0, baseK = 0, cancelled = false;
+// Batch queue: inputs waiting after the current one. Filled by a multi-select pick or a multi-file
+// drop; consumed one at a time on engine-done (same settings for every file, default output names).
+let batch = [], batchTotal = 1, batchAuto = false;
+function fileTag(){ return batchTotal > 1 ? 'File ' + (batchTotal - batch.length) + '/' + batchTotal + ' · ' : ''; }
 // ETA is a live countdown. Each PROGRESS frame re-anchors it to the average pace since warmup,
 // and a timer ticks the displayed seconds down between frames so it never sits frozen. curDone/
 // curPct hold the last frame numbers so the timer can repaint the line with no new PROGRESS.
@@ -290,11 +298,12 @@ function refresh(){ if(!input) return;
   lastOut = customOut || outName(); $('out').textContent = lastOut; }
 
 async function loadVideo(f){
-  if(!f) return;
+  if(!f) return false;
   input = f; customOut = null; $('path').textContent = f;
   try { localStorage.setItem('dir', path.dirname(f)); } catch {}
   const p = await ipcRenderer.invoke('probe', f);
-  if(p.error){ alert('Could not read video: '+p.error); return; }
+  // A modal alert would stall an unattended batch, so mid-batch probe failures go to the log.
+  if(p.error){ if(batchAuto) log('>> Could not read '+f+': '+p.error+'\n'); else alert('Could not read video: '+p.error); return false; }
   const s = (p.streams||[])[0] || {};
   info = { fps: s.r_frame_rate, w: s.width, h: s.height, nb: +(s.nb_frames||0),
            dur: +((p.format||{}).duration||0), codec: s.codec_name,
@@ -309,13 +318,23 @@ async function loadVideo(f){
   $('fps').textContent = srcFps().toFixed(3);
   const d=info.dur|0; $('dur').textContent = (d/3600|0)+':'+String((d%3600/60|0)).padStart(2,'0')+':'+String(d%60).padStart(2,'0');
   $('codec').textContent = s.codec_name || '?';
-  $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true;
+  $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true; $('play').disabled = true;
+  $('live').style.display = 'none';   // stale live thumbnail belongs to the previous video
   $('status').textContent = 'Ready. Pick a multiplier or fps, then click Smooth It!';
   applyScreenFps();      // re-asserts the interp / screen-rate state and recomputes the output name
   syncUpscale();         // recompute the upscale target + output dims for this video's resolution
-  openPreviewForVideo(); // auto-load the before/after preview for this video
+  if(!batchAuto) openPreviewForVideo(); // before/after preview; skipped when a batch auto-advances
+  return true;
 }
-$('pick').onclick = async () => { await loadVideo(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
+// One or more inputs: the first loads now, the rest queue for the same settings back to back.
+function queueVideos(paths){
+  const list = (paths || []).filter(Boolean);
+  if(!list.length) return;
+  batch = list.slice(1); batchTotal = list.length;
+  if(batchTotal > 1) log('>> Queued '+batchTotal+' files (same settings, default output names)\n');
+  loadVideo(list[0]);
+}
+$('pick').onclick = async () => { queueVideos(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
 $('multi').onchange = () => { localStorage.setItem('multi', $('multi').value); useFps = false; syncFpsField(); refresh(); };
 $('fpsin').oninput = () => { useFps = true; if(parseFloat($('fpsin').value) > 1000) $('fpsin').value = 1000; refresh(); };
 
@@ -369,13 +388,14 @@ ipcRenderer.invoke('refresh-rate').then(hz => {
 // (the #rtxvsr toggle, once its runtime is installed) does the upscale with NVIDIA AI; with it off or
 // absent the engine uses a bicubic resize. Off by default; the choice persists. Independent of
 // interpolation, so it also applies in sharpen-only mode. There is no integer-scale restriction (RTX
-// VSR was probed clean past 8K), but the output is bounded by two real limits: the hevc_nvenc encoder
-// caps either dimension at 8192px (verified on the RTX 5090: 8192 ok, 8320 fails; RTX VSR itself goes
-// higher but the encode is the wall), and the engine clamps the upscale factor to 8x. The custom-height
-// slider and upDims() honour both, so the long side never exceeds 8192px (4608p for 16:9, up to 8192p
-// for portrait) and the factor never exceeds 8x.
-const ENC_MAX = 8192;                            // hevc_nvenc max width/height (verified on the RTX 5090)
-const MAX_FACTOR = 8;                            // engine UPSCALE_F clamp (gmfss_interp.py)
+// VSR was probed clean to 16K), but the output is bounded by two real limits: the encoders top out at
+// 16K (NVENC caps either dimension at 8192px, verified on the RTX 5090; past that the ENGINE switches
+// to a CPU encoder automatically - AV1 to ~12K, H.266/VVC to 16K, verified 15360x8640 - so the GUI
+// wall is VVC's), and the engine clamps the upscale factor to 16x. The custom-height slider and
+// upDims() honour both, so the long side never exceeds 15360px and the factor never exceeds 16x.
+const ENC_MAX = 15360;                           // 16K long side: the last encoder standing (libvvenc)
+const NVENC_MAX = 8192;                          // above this the engine encodes on the CPU (slower)
+const MAX_FACTOR = 16;                           // engine UPSCALE_F clamp (gmfss_interp.py)
 let screenW = 0, screenH = 0, rtxReady = { vsr:false, hdr:false, bridge:false };
 function upTargetH(){                            // chosen output height (0 = off)
   const v = $('upres').value;
@@ -411,7 +431,8 @@ function syncUpscale(){
     const d = upDims();
     if(d) txt = '→ ' + d.w + ' × ' + d.h + '  ·  ' + upBackendName()
                 + (upBackendName() === 'bicubic' ? ' (turn on RTX VSR for AI)' : '')
-                + ((d.w >= ENC_MAX || d.h >= ENC_MAX) ? '  ·  at the 8192px encoder cap' : '');
+                + ((d.w > NVENC_MAX || d.h > NVENC_MAX) ? '  ·  CPU encode at this size (slower)' : '')
+                + ((d.w >= ENC_MAX || d.h >= ENC_MAX) ? '  ·  at the 16K encoder cap' : '');
     else if(info) txt = 'source is already at/above that height — no upscale';
     else txt = 'load a video to preview the result';
   }
@@ -498,11 +519,26 @@ const _fs = require('fs');
 let prevTotal = 0, prevIdx = 0, prevHist = [];
 function sharpStrength(){ return $('sharpen').checked ? (parseFloat($('sharpval').value) || 0) : 0; }
 function hdrOn(){ return $('rtxhdr').checked && rtxReady.hdr && !(info && info.srcHdr); }
-function setPrevImg(el, file){
+function setPrevImg(el, file, mime){
   const old = el.dataset.url; if(old){ try { URL.revokeObjectURL(old); } catch {} }
-  const url = URL.createObjectURL(new Blob([_fs.readFileSync(file)], { type: 'image/png' }));
+  const url = URL.createObjectURL(new Blob([_fs.readFileSync(file)], { type: mime || 'image/png' }));
   el.dataset.url = url; el.src = url;
   el.style.visibility = '';        // imgs start hidden so the broken-image icon never shows pre-load
+}
+
+// Live progress thumbnail: during a render the engine drops a small JPEG of the frame it just
+// produced (~1/s, SMV_LIVE_PREVIEW); poll it by mtime and show it under the progress bar.
+let livePath = null, liveTimer = null, liveM = 0;
+ipcRenderer.invoke('live-path').then(p => { livePath = p; });
+function updateLive(){
+  if(!livePath) return;
+  try {
+    const m = _fs.statSync(livePath).mtimeMs;
+    if(m === liveM) return;                       // nothing new yet
+    liveM = m;
+    setPrevImg($('live'), livePath, 'image/jpeg');
+    $('live').style.display = 'block';
+  } catch {}                                      // not written yet this run
 }
 function updatePrevNav(){          // back only makes sense once a second frame has been generated
   $('prevprev').style.visibility = prevHist.length > 1 ? '' : 'hidden';
@@ -705,13 +741,14 @@ document.addEventListener('dragleave', (e) => { if(e.relatedTarget === null) doc
 document.addEventListener('drop', (e) => {
   e.preventDefault(); document.body.classList.remove('drag');
   if(!$('cancel').disabled) return;            // a job is in progress
-  const f = (e.dataTransfer.files || [])[0];
-  if(!f) return;
-  if(/\.zip$/i.test(f.name)){                  // an RTX Video SDK .zip: install the runtime
+  const files = [...(e.dataTransfer.files || [])];
+  if(!files.length) return;
+  if(/\.zip$/i.test(files[0].name)){           // an RTX Video SDK .zip: install the runtime
     if($('rtxsetup').style.display === 'none') $('rtxsetup').style.display = 'block';   // reveal install feedback
-    doInstall(webUtils.getPathForFile(f));
+    doInstall(webUtils.getPathForFile(files[0]));
   } else {
-    loadVideo(webUtils.getPathForFile(f));     // anything else: load it as a video
+    // Anything else: load it as a video; several dropped files become a batch queue.
+    queueVideos(files.map(f => webUtils.getPathForFile(f)));
   }
 });
 
@@ -732,15 +769,20 @@ $('go').onclick = () => {
   }
   procStart = 0; baseK = 0; etaAnchor = 0; etaAnchorTime = 0; lastFps = 0; curDone = 0; curPct = 0;
   clearInterval(etaTimer); etaTimer = setInterval(paint, 500);   // ticks the ETA down between frames
+  // Live thumbnail: only frames written by THIS run may show, so anchor the mtime watermark to
+  // whatever is on disk now (a previous run's leftover) and hide the old image until a new write.
+  try { liveM = _fs.statSync(livePath).mtimeMs; } catch { liveM = 0; }
+  $('live').style.display = 'none';
+  clearInterval(liveTimer); liveTimer = setInterval(updateLive, 1000);
   fpp = outRatio();                                    // output frames produced per source frame (1 when not interpolating)
   const srcFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
   totalGen = Math.max(1, Math.round(srcFrames*fpp));   // total frames the conversion will output
   cancelled = false;
-  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
+  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false;
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
-  $('status').textContent = interpOn() ? 'Warming up the model...' : offLabel;
+  $('status').textContent = fileTag() + (interpOn() ? 'Warming up the model...' : offLabel);
   $('fill').style.width = '0%';
   $('frames').textContent = interpOn() ? 'Warming up (loading model, first frames)...' : offLabel;
   const what = interpOn() ? (Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')) : 'no interpolation';
@@ -764,6 +806,7 @@ $('go').onclick = () => {
   ipcRenderer.send('run', payload);
 };
 $('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
+$('play').onclick = () => { if(lastOut) shell.openPath(lastOut); };   // system default player
 $('changeout').onclick = async () => {
   const chosen = await ipcRenderer.invoke('pick-output', customOut || outName());
   if(chosen){ customOut = chosen; refresh(); }
@@ -787,7 +830,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
       // First generated frame is in, so warmup (model load + first inference) is over. Anchor the
       // clock here so the average pace excludes that one-time startup cost and this first frame.
       procStart = now; baseK = done;
-      $('status').textContent = 'Smoothing on the GPU...';
+      $('status').textContent = fileTag() + 'Smoothing on the GPU...';
       paint();
       return;
     }
@@ -808,12 +851,26 @@ ipcRenderer.on('engine-out', (_e, t) => {
 });
 ipcRenderer.on('engine-done', (_e, code) => {
   clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
+  clearInterval(liveTimer); liveTimer = null; updateLive();   // final pull: the last written frame
   $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('interp').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
-  if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n'); }
+  if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
+    if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');
+    batch = []; batchTotal = 1; }
   else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen+'  (100%)';
-    $('status').textContent='Done!'; $('open').disabled=false; log('>> Saved: '+lastOut+'\n'); }
-  else { $('status').textContent='Failed (exit '+code+'). See log.'; log('>> Failed (exit '+code+')\n'); }
+    $('status').textContent='Done!'; $('open').disabled=false; $('play').disabled=false; log('>> Saved: '+lastOut+'\n');
+    if(batch.length){
+      // Batch: load the next queued file and start it with the same settings. batchAuto suppresses
+      // the modal probe alert and the preview refresh while the queue advances unattended.
+      const next = batch.shift();
+      batchAuto = true;
+      loadVideo(next).then(ok => { batchAuto = false;
+        if(ok) $('go').onclick();
+        else { $('status').textContent = 'Batch stopped: could not read '+next; batch = []; batchTotal = 1; } });
+    } else if(batchTotal > 1){ $('status').textContent = 'Done! All '+batchTotal+' files processed.'; batchTotal = 1; } }
+  else { $('status').textContent='Failed (exit '+code+'). See log.'; log('>> Failed (exit '+code+')\n');
+    if(batch.length) log('>> Batch stopped ('+batch.length+' queued files not processed)\n');
+    batch = []; batchTotal = 1; }
 });
 </script>
 </body>

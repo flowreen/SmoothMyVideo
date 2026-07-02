@@ -73,7 +73,7 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   refresh rate** to target your monitor's Hz (rounded up), then click **Smooth It!**. An
   **FSR** toggle (FSR-style RCAS sharpening, on at full strength by default, with a
   strength slider) crisps the output. An **Upscale to** selector resizes the output to a chosen
-  resolution (Off / Match screen / 1080p / 1440p / 4K / 8K / a custom height), keeping the source
+  resolution (Off / Match screen / 1080p / 1440p / 4K / 8K / 16K / a custom height), keeping the source
   aspect ratio; the **RTX Video Super Resolution** toggle (opt-in, see NVIDIA RTX) does that
   upscale with NVIDIA AI, otherwise it is a bicubic resize. The **Interpolate** toggle (on by
   default) is the master switch for frame generation: untick it to *only* sharpen / upscale the
@@ -101,6 +101,10 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   original audio is copied. With
   no usable NVENC it falls back automatically to CPU SVT-AV1, still visually lossless (see
   Passthrough quality).
+- Batch: pick or drop several files at once and they queue, rendering back to back with the
+  same settings and default output names (status shows `File k/N`; Cancel clears the queue).
+  After a render, **Play video** opens the result in the system default player and
+  **Open folder** reveals it.
 - Uniform look (no popping): every output frame is interpolated, the first and last included.
   No source frame is passed through and none lands on a source timestamp, because the sample
   grid is shifted half a step so each frame is an interior blend. This removes the sharp original
@@ -143,8 +147,9 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
 - `renderer/index.html` - the UI (select or drag in a video, an **Interpolate** master
   toggle, multiplier / fps / **match screen refresh rate**, an **FSR** sharpen toggle with
   strength slider, output path with **Change...**, progress bar with frame counter and ETA,
-  Cancel, Open folder, log). Uses `require('electron')`; a dropped file is resolved to a path
-  with `webUtils.getPathForFile`, and the folder, multiplier, sharpen, interpolate and
+  Cancel, Open folder, Play video, log). Uses `require('electron')`; dropped files are resolved
+  to paths with `webUtils.getPathForFile` (several picked or dropped files queue as a batch and
+  render back to back), and the folder, multiplier, sharpen, interpolate and
   match-screen settings are saved in `localStorage`.
 - `engine/gmfss_interp.py` - GMFSS pipe engine: ffmpeg decode into GMFSS into ffmpeg
   encode (audio copied), always encoding HEVC at 10 bit with the colour tags matched to the
@@ -164,7 +169,13 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
 - `engine/trt_runtime.py` - optional TensorRT backend. `trtify(model)` swaps the five GMFSS
   sub nets for engines exported under autocast and built strongly typed (fp16); softsplat
   and the interpolate glue stay in eager. Engines are cached per `(net, shapes, gpu, trt
-  version)` under `SMV_TRT_CACHE`, built on first use, with eager fallback on any failure.
+  version, weights hash)` under `SMV_TRT_CACHE`, built on first use, with eager fallback on any
+  failure. The weights hash (an md5 of the `train_log` .pkl contents, in every engine filename
+  since 2026-07-02) makes the cache self-invalidating: swapping the model weights is a cache
+  miss plus automatic deletion of the stale engines at the next engine start, instead of
+  silently serving engines compiled from the old model (`build_or_load` finds engines by name
+  and never re-reads the .pkl files). Pre-fingerprint caches were adopted by rename, not
+  rebuilt, since only one weight set has ever shipped.
 - `engine/runtime/` - bundled relocatable Python (python-build-standalone CPython 3.14)
   with the full GPU stack installed (torch cu130 / CUDA 13, cupy-cuda13x, nvidia cu13 wheels). Gitignored, see Setup.
 - `engine/bin/` - bundled static `ffmpeg.exe` + `ffprobe.exe` (built with `hevc_nvenc`)
@@ -484,16 +495,28 @@ For whoever picks this up.
   0.10..0.21 blends before). Cuts are logged to stderr and counted in the done line;
   `--no-scene-detect` disables it, `SMV_SCENE_DEBUG=1` prints both metrics per pair. Still
   open from this family: near-duplicate detection (see the next bullet).
-- **Duplicate frame handling for anime (exact case done).** GMFSS targets anime, which is drawn
-  on twos and threes, so many consecutive source frames are identical. The engine now detects a
-  byte exact duplicate pair and holds the frame instead of interpolating, skipping the wasted
-  compute and the shimmer GMFSS can add on identical input (measured: 1 of 24 pairs in the sample
-  clip, with the next nearest pair an order of magnitude away in mean difference, so exact match
-  has no false positives). Still open: catch near duplicates too with a small downscaled frame
-  difference threshold rather than exact equality, which also feeds the cut signal above (very
-  high means cut, near zero means duplicate, in between means interpolate). Even so this cheap
-  skip is not a full de judder: truly smoothing on twos motion needs duplicate removal plus
-  retiming so the real motion is spread evenly to the target fps, a larger feature worth its own pass.
+- **Duplicate frame handling for anime (exact + near done).** GMFSS targets anime, which is drawn
+  on twos and threes, so many consecutive source frames repeat. Byte exact repeats have long been
+  detected and held; since 2026-07-02 repeats that differ only by compression noise (a lossy
+  re-encode makes held cels no longer byte identical) are held too. The detector averages the
+  SIGNED frame difference per 16 px block and takes the maximum block (`NEARDUP_TH` 0.012): random
+  noise cancels inside a block while real change, however small or local (a blink, a 1 px pan),
+  is spatially coherent and survives, where a plain mean-abs difference would drown a tiny mover
+  in its own noise floor. The threshold is a harm bound, not a noise/motion classifier (an
+  ultra-slow morph genuinely measures below dither noise, so the classes are not separable):
+  holding emits the pair midpoint, so worst-case error is half the pair difference, about 1.5
+  8-bit levels in the single most-changed block - at the source's own quantisation noise,
+  invisible either way. Measured: 13/13 noisy repeat pairs held on a duplicated-cels test clip
+  with zero false holds on a 1 px/frame pan, a 1 s fade, a 24 px blink toggle, and normal
+  content (real motion sits 3x..60x above the bound). The win is compute: a 16x render of
+  twos-cadence content went 65 s to 34 s (1.9x), since held pairs render once instead of 16
+  times. (Honesty note: measured within-pair shimmer of interpolating noise pairs was ~zero at
+  2x, so the quality argument is stability insurance, not a visible fix.) `--no-near-dup`
+  disables it; `SMV_SCENE_DEBUG=1` prints the per-pair block metric alongside the cut metrics.
+  Still open: this is not a full de judder - truly smoothing on twos motion needs duplicate
+  removal plus retiming so the real motion is spread evenly to the target fps, a larger feature
+  worth its own pass. (The cut signal ended up flow-based rather than the frame-difference idea
+  sketched here earlier; see the scene change bullet.)
 - **Sharper generated frames (free half done).** The free half is fixed: `to_tensor` and
   `to_bytes` now pad to the next multiple of 64 the model needs and crop the padding back,
   instead of resizing the whole frame up a fraction and back with bilinear. No real pixel is
@@ -501,10 +524,14 @@ For whoever picks this up.
   flow net from tracking a hard edge). All three GMFSS scripts (this one, Fortuna's
   `inference_video.py`, enhancr) resized, so this was a known better technique none of them wired
   up. The blur that remains is motion ghosting at fast motion and occlusions, a flow accuracy
-  problem: try the
-  AnimeRun anime optical flow fine tune of the Fortuna weights (enhancr exposes it as GMFSS
-  Fortuna Union, model 1) as a drop in weight swap for less ghosting on anime, and let the scene
-  detection and dedup items stop the model interpolating where the flow is meaningless. The heavy
+  problem. The AnimeRun
+  fine tune idea is RESOLVED (2026-07-02): the shipped `train_log` weights already ARE the
+  AnimeRun anime optical flow fine tune - verified by downloading both upstream Model Zoo zips
+  (the bundled GMFSS_Fortuna README's own Drive links) and hashing: the "new union model using
+  anime optical flow data fine-tune" is byte-identical to our five .pkl files, while the
+  original union model differs in four of five (only rife.pkl shared). So there is no better
+  drop-in weight set to swap to; the scene detection and dedup items (both now done) stop the
+  model interpolating where the flow is meaningless. The heavy
   option, used in enhancr, is to chain a restoration or upscaling model (RealESRGAN, SCUNet) after
   interpolation to re sharpen, at the cost of a second model per frame. The `scale` flag is
   already at its sharp maximum (1.0); lowering it is what blurs.
@@ -528,12 +555,33 @@ For whoever picks this up.
   scaled up and softened by the upscaler), the AI upscaler still receives an unsharpened, in-distribution
   frame, and the sharpen stays in SDR where its luma weighting is valid (ahead of the HDR expansion).
 - **Upscale to any resolution + RTX VSR / RTX HDR (done).** The GUI **Upscale to** selector picks a
-  target (Off / Match screen / 1080p / 1440p / 4K / 8K / custom height); the engine's `--upscale F`
+  target (Off / Match screen / 1080p / 1440p / 4K / 8K / 16K / custom height); the engine's `--upscale F`
   resizes each output frame just before encode by an arbitrary factor (aspect preserved, even
   dimensions), with decode and GMFSS interpolation staying at the source resolution. The AI backend is
   **NVIDIA RTX Video Super Resolution** (opt-in `--rtx-vsr`), with a bicubic resize as the fallback.
   RTX VSR places no integer-scale restriction on the output (probed clean and crash-free to 16K on a
-  24 GB GPU - it is memory-bound, not model-bound), so any exact target up to the 8K option is allowed;
+  24 GB GPU - it is memory-bound, not model-bound), so any exact target up to the 16K option is allowed.
+  **16K support (2026-07-02):** past 8192 px in either dimension NVENC cannot encode (probed: 8192
+  passes, 8704 fails, both codecs) and HEVC as a format ends there too, so the engine probes the CPU
+  encoders AT the output size and switches automatically - SVT-AV1 (AV1) up to ~12K (12288x6912
+  passed, 14336x8064 refused on this build), then H.266/VVC (`libvvenc`, verified at 15360x8640,
+  ~4 s/frame to encode) as the last encoder standing; a stderr notice names the pick, the GUI warns
+  "CPU encode at this size", and the factor cap is 16x. Verified end to end from 1080p: 4x stays
+  NVENC HEVC, 5x (9600x5400) auto-picks SVT-AV1, 8x (15360x8640) auto-picks VVC, with and without
+  RTX VSR (VSR runs the full 16K natively). **RAM safety (added 2026-07-03 after a real DPC-watchdog
+  BSOD, bugcheck 0x133):** the CPU encoders keep dozens of frames in flight at these sizes - the
+  encode-side ffmpeg alone was measured at ~42 GB RSS during a 16K render (vvenc's ~30 GB working
+  set plus ffmpeg's fixed inter-stage frame queues; GOP/thread knobs barely shrink it,
+  `maxparallelframes=2` saves ~4 GB at no wall cost and is applied automatically) - and exhausting
+  physical RAM with a small pagefile ends in commit exhaustion, stalled kernel drivers, and a
+  hard reboot. The engine therefore runs a **fail-closed RAM preflight** for >8192 px outputs
+  (~0.36 GB per megapixel for the VVC path, ~0.55 for SVT-AV1, calibrated on a monitored render
+  that was watchdog-killed at 87% with ~47 GB consumed): true 16K needs ~54 GB of free RAM and is
+  refused with an actionable message otherwise; ~10K (9600x5400) needs ~35 GB and passes on a
+  64 GB machine. RTX HDR is separately capped at 8192 px (TrueHDR's colour math at 16K would
+  oversubscribe VRAM, the other half of the crash risk). A 16K rgb48le pipe frame is ~0.8 GB (the
+  writer queue is byte-bounded and ffmpeg's input queue/threads are capped at ultra sizes), and
+  16K playback support is thin everywhere - treat it as an archival/stills-adjacent format;
   the old 2x/3x/4x limit was a quirk of Maxine SuperRes, which has been **removed** (DLSS never applied
   to video - it needs a game engine's motion vectors/depth/jitter, which a finished frame lacks).
   **RTX HDR (SDR to HDR10)** is also done (`--rtx-hdr`): the TrueHDR pass outputs 10-bit BT.2020 PQ
@@ -579,8 +627,15 @@ For whoever picks this up.
   `non_blocking=True`, so the main thread no longer stalls on the copy and races ahead to queue the next
   frame's GPU work (a pageable `.to()` is synchronous; only a pinned source copies async). That closes
   the last synchronous stall in the overlap design.
-- **Batch queue.** Process several files (or a folder) unattended, one after another. Pure UI
-  work in the renderer and main process, no engine change.
+- **Batch queue (done 2026-07-02).** Pick several files in the dialog (multi-select) or drop
+  several onto the window and they queue: each renders back to back with the same settings and
+  a default output name beside its source (a custom **Change...** path applies only to the file
+  it was set on). The status line shows `File k/N`, the queue advances automatically on success,
+  and it stops on a failure, an unreadable file, or Cancel (which also clears the queue). While
+  the queue auto-advances, the probe alert is routed to the log (no modal to block an unattended
+  run) and the before/after preview refresh is skipped. Renderer + main process only (the file
+  dialog gained `multiSelections`), no engine change. Folder picking is not a separate mode:
+  multi-select inside the folder (Ctrl+A) covers it.
 - **AV1 and H.266/VVC output codecs (done 2026-06-28).** `--codec {hevc,av1,vvc}` plus the GUI
   **Codec** dropdown. `av1` uses the Blackwell hardware encoder (`av1_nvenc`, CQ 20, smaller than
   HEVC at the same visually lossless quality; CPU `libsvtav1` fallback), `vvc` uses CPU `libvvenc`
@@ -588,9 +643,26 @@ For whoever picks this up.
   `-strict experimental`, falling back to HEVC when libvvenc is absent). The HDR10 `mdcv`/`clli`
   box injection is codec agnostic. Validated: AV1 SDR bt709, AV1 HDR PQ with boxes, VVC SDR 10-bit.
   HEVC stays the default for player compatibility.
-- **Optional smaller items.** Add a live preview of the frame being written. (Encoding is now
-  done: always HEVC, 10-bit output by default with preserved colour, always visually lossless,
-  with an automatic CPU SVT-AV1 fallback when NVENC is unavailable; see Passthrough quality.)
+- **Live preview of the frame being written (done 2026-07-02).** During a render the GUI shows a
+  thumbnail of the frame most recently produced, under the progress bar, refreshing about once a
+  second. The engine drops a 480p JPEG (`SMV_LIVE_PREVIEW`, set by the GUI to a userData path)
+  from inside `to_bytes` - time-gated to ~1/s, and split producer/worker so the render thread
+  only snapshots (a 480p GPU downscale + download, measured 0.25 ms per tick at 1080p and 4K,
+  i.e. ~0.03% of the render) while a background thread does all decoding/tonemapping/JPEG work
+  (~5 ms SDR, ~100 ms HDR per tick on an otherwise idle core; the pipeline is GPU-bound, see the
+  performance audit). A busy worker skips ticks instead of queueing, a bounded flush at render
+  end lets the final thumbnail land, and the cost is exactly zero for CLI runs without the env
+  var; written tmp-then-rename so the poller never reads a torn file. The thumbnail shows what the OUTPUT will look like: an HDR
+  render's frame is the graded TrueHDR result (the packed PQ bytes are unpacked, downscaled and
+  tonemapped with the SAME source-anchored tonemap the before/after pane uses, so colour mode,
+  vibrance and contrast all show - verified pixel-close to the pane's rendition, MAD 0.008, and a
+  satboost 1.0 grade visibly lifts the thumb's saturation 83 -> 134), and an HDR source carried
+  through gets the pane's self-anchored PQ display map instead of reading flat and washed out.
+  The renderer polls the file's mtime once a
+  second, anchors the watermark at run start so a previous run's leftover never shows, and keeps
+  the final frame visible after Done. (Encoding itself was already done: always HEVC, 10-bit
+  output by default with preserved colour, always visually lossless, with an automatic CPU
+  SVT-AV1 fallback when NVENC is unavailable; see Passthrough quality.)
 - **Performance headroom (ranked easiest to hardest, 2026-06-26 code audit).** The pipeline is already
   fp16 + cupy softsplat, TensorRT on all five sub-nets, pinned async upload, threaded decode/encode
   overlap and byte exact duplicate skip (`torch.compile` is ruled out for this model class: it would only
@@ -712,7 +784,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--no-scene-detect] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--no-scene-detect] [--no-near-dup] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -730,10 +802,13 @@ never band, `8` restores the legacy 8-bit output for maximum device compatibilit
 sources only; the output never drops below the source depth, and HDR and VVC are always
 10-bit). `--no-scene-detect` disables hard-cut detection (on by default; see Scene change
 detection under What can be done next for how it works and the calibration numbers).
+`--no-near-dup` disables near-duplicate holding (on by default: repeats that differ only by
+compression noise are held like exact duplicates; see Duplicate frame handling).
 `--upscale F` spatially upscales every
 output frame by an arbitrary factor `F` (e.g. `2.0`, or `1.5`, ...) just before encode,
 leaving decode and interpolation at the source resolution; it is off at `1.0` unless given
-(a bare `--upscale` uses `1.5`, clamped to 8.0). With `--rtx-vsr` the upscale uses NVIDIA RTX
+(a bare `--upscale` uses `1.5`, clamped to 16.0; above 8192 px the encoder switches to CPU
+AV1/VVC automatically, see the upscale bullet). With `--rtx-vsr` the upscale uses NVIDIA RTX
 Video Super Resolution (real AI SR, any target resolution; needs the `engine/rtxvideo`
 runtime), otherwise a bicubic resize. `--rtx-hdr` converts the output to HDR10 (BT.2020 PQ)
 via the RTX Video TrueHDR model, and `--hdr-nits N` sets the mastering peak luminance (400..2000,

@@ -53,12 +53,14 @@ app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
 ipcMain.handle('pick-video', async (_e, defaultPath?: string) => {
+  // Multi-select: several files become a batch queue in the renderer (processed back to back
+  // with the same settings); a single selection behaves as before.
   const r = await dialog.showOpenDialog(win!, {
     defaultPath,
-    properties: ['openFile'],
+    properties: ['openFile', 'multiSelections'],
     filters: [{ name: 'Video', extensions: ['mp4', 'mkv', 'mov', 'avi', 'webm', 'm4v', 'wmv', 'ts'] }],
   });
-  return r.canceled ? null : r.filePaths[0];
+  return r.canceled ? null : r.filePaths;
 });
 
 ipcMain.handle('pick-output', async (_e, defaultPath?: string) => {
@@ -217,6 +219,11 @@ ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
 
 let current: ChildProcess | null = null;
 
+// Live progress thumbnail: the engine overwrites this JPEG about once a second during a render
+// (see SMV_LIVE_PREVIEW below); the renderer polls it by mtime and shows the frame being written.
+const LIVE_JPG = path.join(app.getPath('userData'), 'preview', 'live.jpg');
+ipcMain.handle('live-path', () => LIVE_JPG);
+
 ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; interp?: boolean; upscale?: number; rtxvsr?: boolean; rtxhdr?: boolean; codec?: string; hdrcolor?: string; hdrsat?: number; hdrcon?: number; hdrsb?: number; hdrvib?: number }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
   // Output codec family (hevc default / av1 / vvc); the engine owns encoder pick + fallbacks.
@@ -256,8 +263,12 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
   }
   // PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from crashing the engine
   // during first-run TRT builds; SMV_TRT_CACHE is a guaranteed writable cache location.
+  // SMV_LIVE_PREVIEW makes the engine drop a small JPEG of the frame being written about
+  // once a second; the renderer polls it for the live progress thumbnail.
+  try { fs.mkdirSync(path.join(app.getPath('userData'), 'preview'), { recursive: true }); } catch { /* exists */ }
   const env = { ...process.env, PYTHONUTF8: '1',
-    SMV_TRT_CACHE: path.join(app.getPath('userData'), 'trt_cache') };
+    SMV_TRT_CACHE: path.join(app.getPath('userData'), 'trt_cache'),
+    SMV_LIVE_PREVIEW: LIVE_JPG };
   const proc = spawn(pyExe(), args, { cwd: ENGINE, env });
   current = proc;
   const onData = (buf: Buffer) => e.sender.send('engine-out', buf.toString());
