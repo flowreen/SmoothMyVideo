@@ -11,8 +11,9 @@ lossless, and always uses the fastest backend the machine supports.
   otherwise an automatic CPU fallback to SVT-AV1 (the strongest visually lossless software
   encoder in the bundled LGPL ffmpeg; x264/x265 are not built in). The output codec does not
   echo the source: HEVC at the same visually lossless CQ is far smaller than H.264, and an
-  interpolated clip is a new artifact, so matching an H.264 source would only bloat it. Source
-  bit depth (8/10 bit), chroma and colour signalling are preserved either way.
+  interpolated clip is a new artifact, so matching an H.264 source would only bloat it. Chroma
+  and colour signalling are preserved either way; the output is 10 bit by default whatever the
+  source depth (see --out-bits below), never less than the source.
 
 Uniform look (every frame generated): the output is fully smoothed. NO emitted frame is a source
 frame and none sits on a source timestamp. The output grid is shifted by half an output step, so
@@ -35,11 +36,15 @@ generated frame. Duration therefore matches the source.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
+       [--out-bits {8,10}] [--no-scene-detect]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
        --no-interp skips interpolation entirely: the clip is only re-encoded at its source fps
        with --sharpen applied, for users who just want the sharpening and not the smoothing.
+       --no-scene-detect disables hard-cut detection (on by default: a true scene cut is held
+       across the boundary instead of interpolated, which would morph the two shots together;
+       fast pans are unaffected, see the scene cut detection block below).
        --upscale F spatially upscales every output frame before encode by an arbitrary factor
        (1.0 = off). With --rtx-vsr it runs NVIDIA RTX Video Super Resolution (real AI SR, any
        target resolution); otherwise a high-quality bicubic resize. Decode and interpolation
@@ -107,6 +112,20 @@ ap.add_argument("--codec", choices=["hevc", "av1", "vvc"], default="hevc",
                      "vvc: H.266 via CPU libvvenc (best compression, slow, limited player support; "
                      "always 10-bit). The NVENC choices fall back to CPU libsvtav1 when no usable "
                      "session exists; vvc falls back to HEVC if libvvenc is absent.")
+ap.add_argument("--no-scene-detect", action="store_true",
+                help="disable hard-cut detection. By default the engine detects true scene cuts "
+                     "(via forward/backward flow consistency plus warp residual, reusing the flows "
+                     "GMFSS already computes) and holds the boundary frames across the cut instead "
+                     "of interpolating, which would morph one shot into the next as a smeared "
+                     "ghost. Fast pans and action are not affected: their flow is large but "
+                     "consistent, which is exactly what the check separates.")
+ap.add_argument("--out-bits", type=int, choices=[8, 10], default=10,
+                help="output bit depth. 10 (default): encode 10-bit (HEVC main10 / 10-bit AV1) even "
+                     "from an 8-bit source - every emitted frame is computed in floating point, so "
+                     "the two extra bits carry real sub-8-bit precision instead of re-quantising the "
+                     "blend to 8 bit, which is what bands gradients (skies, glows). Any modern "
+                     "HEVC/AV1 decoder plays 10-bit. 8: legacy 8-bit output for maximum device "
+                     "compatibility (the only reason to pick it). HDR and VVC are always 10-bit.")
 ap.add_argument("--hdr-nits", type=int, default=1000,
                 help="HDR10 peak luminance in nits for --rtx-hdr (the TrueHDR MaxLuminance and the "
                      "stream's mastering-display / MaxCLL metadata). Clamped to 400..2000; "
@@ -151,6 +170,7 @@ args = ap.parse_args()
 inp = os.path.abspath(args.input)
 SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
+SCENE_DETECT = not args.no_scene_detect      # hold frames across true cuts instead of morphing
 UPSCALE_F = max(1.0, min(8.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
                                              # RTX VSR has no integer-scale limit (probed clean past
                                              # 8K), so any factor is allowed up to an 8x sanity cap.
@@ -200,6 +220,9 @@ elif any(s in SRC_PIX for s in ("p12", "12le", "12be")):
 else:
     SRC_BITS = 8
 TEN_BIT = SRC_BITS >= 10
+TEN_BIT_OUT = args.out_bits >= 10 or TEN_BIT   # 10-bit output (the default; --out-bits 8 = legacy
+                                               # compat, honoured for 8-bit sources only: output
+                                               # never drops below the source depth)
 CHROMA444 = "444" in SRC_PIX
 FPS_MODE = args.fps is not None and args.fps > 0
 src_fps = num / den
@@ -228,15 +251,21 @@ else:
 out_path = os.path.abspath(args.output) if args.output else \
     os.path.splitext(inp)[0] + (("_sharpened" if NO_INTERP else f"_{out_label}fps") + ".mp4")
 
-# Decode/encode bit depth follows the source. 8 bit clips keep the original fast rgb24
-# path byte for byte; 10 bit and up are carried as 16 bit rgb (rgb48le) so the model
-# (fp16, which holds 10 bit precision) never truncates them to 8 bit. GMFSS_Fortuna,
-# GMFSS_union and enhancr all emit 8 bit from this point; carrying 10 bit through is the
-# one step past them, and it is free because the pipe was already fp16.
+# Decode bit depth follows the source: 8 bit clips decode as rgb24 byte for byte; 10 bit and
+# up are carried as 16 bit rgb (rgb48le) so the model (fp16, which holds 10 bit precision)
+# never truncates them to 8 bit. The OUTPUT side is decoupled and defaults to 10 bit whatever
+# the source (--out-bits): every emitted frame is a floating point blend, so quantising back
+# to 8 bit would throw away real sub-8-bit precision the interpolation just created and band
+# the gradients. Frames leave to_bytes as 16 bit rgb whenever either side is >8 bit and the
+# encoder dithers down to its 10-bit format; --out-bits 8 restores the legacy 8-bit output.
 if TEN_BIT:
     DEC_FMT, NP_DT, MAXV, BPP = "rgb48le", np.uint16, 65535.0, 6
 else:
     DEC_FMT, NP_DT, MAXV, BPP = "rgb24", np.uint8, 255.0, 3
+if TEN_BIT_OUT:
+    OUT_RAW_FMT, OUT_NP_DT, OUT_MAXV = "rgb48le", np.uint16, 65535.0
+else:
+    OUT_RAW_FMT, OUT_NP_DT, OUT_MAXV = "rgb24", np.uint8, 255.0
 fsize = W * H * BPP
 # Output spatial resolution. Decode and GMFSS interpolation stay at the source W x H; each finished
 # frame is upscaled to OUT_W x OUT_H just before encode (in to_bytes), so only the encoder input
@@ -424,8 +453,106 @@ def to_bytes(t):
     # Round to nearest, not truncate: numpy's float->uint cast floors, which biases every frame
     # ~0.5 LSB low (a uniform darkening, and the wrong quantisation of the model output). Rounding
     # is the unbiased mapping back to integer samples; every emitted frame goes through here.
-    a = (t[0] * MAXV).round().clamp(0, MAXV).permute(1, 2, 0).contiguous().cpu().numpy()  # CHW->HWC on GPU
-    return a.astype(NP_DT).tobytes()
+    # Quantise at the OUTPUT depth (OUT_MAXV, 16 bit unless --out-bits 8 on an 8-bit source), not
+    # the decode depth: this is where the float precision either survives into the 10-bit encode
+    # or gets flattened to 8-bit steps.
+    a = (t[0] * OUT_MAXV).round().clamp(0, OUT_MAXV).permute(1, 2, 0).contiguous().cpu().numpy()  # CHW->HWC on GPU
+    return a.astype(OUT_NP_DT).tobytes()
+
+# --- scene cut detection --------------------------------------------------------------------
+# Interpolating across a hard cut morphs one shot into the next (a smeared ghost frame), so cut
+# pairs hold the boundary frames instead. Detection reuses the flows model.reuse() has already
+# computed, so it costs a few grid_samples per pair. A raw pixel difference cannot be the signal
+# here: a fast pan also produces a huge frame difference and would be falsely flagged, killing
+# interpolation exactly where it is most wanted. Two flow-based checks separate the cases, and
+# BOTH must fire (a false cut is worse than a missed one, which just keeps today's behaviour):
+#   occ   - forward/backward consistency: for real motion flow01(x) + flow10(x + flow01(x)) ~ 0;
+#           on a cut the two flows are unrelated, so most pixels fail the check. A pan fails only
+#           in its disocclusion band.
+#   photo - warp residual: reconstruct each frame from the other by backward-warping with the
+#           matching flow; on a cut even the best flow cannot make the content match.
+# Set SMV_SCENE_DEBUG=1 to log both metrics for every pair (used to calibrate the thresholds).
+# Calibration (2026-07-02, samples/test.mp4 family; SMV_SCENE_DEBUG sweeps):
+#   within-shot anime pairs      occ 0.042..0.063   photo 0.034..0.047
+#   fast pan 25 px/frame         occ 0.000          photo ~0.005
+#   whip pan 100 px/frame        occ 0.000          photo 0.006..0.022   (flow tracks it: no cut)
+#   animated gradient morph      occ <=0.063        photo 0.0002
+#   same-shot crop-zoom reframe  occ 0.196          photo 0.056          (a coherent zoom: leave it)
+#   true content cut             occ 1.000          photo 0.260          (fires)
+# The thresholds sit in that gap with ~8x margin on the false-positive side (occ) and 2..3x on
+# the detection side. Raising sensitivity enough to also catch the same-shot reframe would sit
+# only ~1.2x above normal-content photo noise, so borderline reframes deliberately interpolate
+# (GMFlow matches them and renders a coherent zoom, not a smear).
+SCENE_DEBUG = bool(os.environ.get("SMV_SCENE_DEBUG"))
+SCENE_OCC_TH = 0.5      # fraction of pixels failing the fwd/bwd consistency check
+SCENE_PHOTO_TH = 0.08   # mean abs warp-reconstruction error, [0,1] scale
+_scene_grid = None      # cached base pixel grid, [1,h,w,2]; flows keep one shape per run
+
+def _flow_grid(flow):
+    """grid_sample coordinates that sample position x + flow(x) (align_corners=True)."""
+    global _scene_grid
+    _, _, h, w = flow.shape
+    if _scene_grid is None or _scene_grid.shape[1:3] != (h, w):
+        gy, gx = torch.meshgrid(
+            torch.arange(h, device=flow.device, dtype=torch.float32),
+            torch.arange(w, device=flow.device, dtype=torch.float32), indexing="ij")
+        _scene_grid = torch.stack((gx, gy), dim=-1).unsqueeze(0)
+    g = _scene_grid + flow.permute(0, 2, 3, 1)
+    return torch.stack((g[..., 0] * (2.0 / (w - 1)) - 1.0,
+                        g[..., 1] * (2.0 / (h - 1)) - 1.0), dim=-1)
+
+def _cut_metrics(I0, I1, flow01, flow10):
+    """(occ, photo) for one pair; flows are the half-resolution ones out of model.reuse()."""
+    f01, f10 = flow01.float(), flow10.float()
+    g01, g10 = _flow_grid(f01), _flow_grid(f10)
+    f10w = F.grid_sample(f10, g01, mode="bilinear", padding_mode="border", align_corners=True)
+    res = (f01 + f10w).square().sum(1).sqrt()
+    mag = f01.square().sum(1).sqrt() + f10w.square().sum(1).sqrt()
+    # occlusion-style test: inconsistent if the residual exceeds 5% of the motion, floored at
+    # 1.5 half-res px so near-static content is not judged on sub-pixel noise
+    occ = (res > torch.clamp(0.05 * mag, min=1.5)).float().mean()
+    i0h = F.interpolate(I0, scale_factor=0.5, mode="bilinear", align_corners=False).float()
+    i1h = F.interpolate(I1, scale_factor=0.5, mode="bilinear", align_corners=False).float()
+    r1 = F.grid_sample(i0h, g10, mode="bilinear", padding_mode="border", align_corners=True)
+    r0 = F.grid_sample(i1h, g01, mode="bilinear", padding_mode="border", align_corners=True)
+    photo = 0.5 * ((r1 - i1h).abs().mean() + (r0 - i0h).abs().mean())
+    return occ.item(), photo.item()
+
+def _pair_is_cut(i, I0, I1, reuse):
+    """Decide whether source pair i is a hard cut (and log it); False when detection is off."""
+    if not SCENE_DETECT:
+        return False
+    occ, photo = _cut_metrics(I0, I1, reuse[0], reuse[1])
+    if SCENE_DEBUG:
+        sys.stderr.write(f"SCENE {i} occ={occ:.3f} photo={photo:.4f}\n"); sys.stderr.flush()
+    cut = occ > SCENE_OCC_TH and photo > SCENE_PHOTO_TH
+    if cut:
+        sys.stderr.write(f"cut detected at pair {i} (occ {occ:.2f}, photo {photo:.3f}): "
+                         "holding boundary frames instead of interpolating\n"); sys.stderr.flush()
+    return cut
+
+def _soft_still(I):
+    """One source frame rendered the way held duplicate cels already are: GMFSS on the (I, I)
+    pair at t=0.5. Emitting the raw source frame here would pop (sharp against the soft tweens
+    around it, see Uniform look); the model's own reconstruction keeps the clip's one look."""
+    r = model.reuse(I, I, scale)
+    return to_bytes(model.inference(I, I, r, 0.5))
+
+def _emit_cut(I0, I1, fracs):
+    """Frames for a cut pair: slots before the boundary (t<0.5) hold shot A's still, the rest
+    hold shot B's, so the cut lands sharp between two output frames instead of as a morph."""
+    a = b = None
+    outs = []
+    for fr in fracs:
+        if fr < 0.5:
+            if a is None:
+                a = _soft_still(I0)
+            outs.append(a)
+        else:
+            if b is None:
+                b = _soft_still(I1)
+            outs.append(b)
+    return outs
 
 def read_exact(stream, nbytes):
     buf = bytearray()
@@ -477,16 +604,19 @@ if USE_NVENC and not _enc_works(venc):
     venc = "libsvtav1"
     USE_NVENC = False
 
-# Output pixel format: preserve 10 bit and 4:4:4 where the encoder allows it, otherwise the
-# standard 8 bit 4:2:0. NVENC takes 10 bit as p010le; SVT-AV1 wants planar yuv420p10le and
-# has no 4:4:4 path, so the fallback stays 4:2:0.
+# Output pixel format: 10 bit by default (--out-bits), preserving 4:4:4 where the encoder
+# allows it. NVENC takes 10 bit as p010le (4:2:0) or yuv444p16le (4:4:4, rext profile; the
+# high 10 of 16 bits are used); SVT-AV1 wants planar yuv420p10le and has no 4:4:4 path, so
+# the CPU fallback stays 4:2:0.
 if venc == "libvvenc":
     out_pix = "yuv420p10le"                  # libvvenc's only supported input format (always main10)
-elif HDR_ACTIVE or TEN_BIT:
-    # HDR10 (TrueHDR) is always 10-bit; a 10-bit source is also carried as 10-bit.
+elif HDR_ACTIVE:
+    # HDR10 (TrueHDR) is always 10-bit 4:2:0 regardless of --out-bits.
     out_pix = "p010le" if USE_NVENC else "yuv420p10le"
 elif CHROMA444 and venc in ("h264_nvenc", "hevc_nvenc"):
-    out_pix = "yuv444p"
+    out_pix = "yuv444p16le" if TEN_BIT_OUT else "yuv444p"
+elif TEN_BIT_OUT:
+    out_pix = "p010le" if USE_NVENC else "yuv420p10le"
 else:
     out_pix = "yuv420p"
 
@@ -507,7 +637,14 @@ elif venc == "libvvenc":
 else:
     qargs = ["-crf", "20", "-preset", "8"]
 
-prof = ["-profile:v", "main10"] if ((TEN_BIT or HDR_ACTIVE) and venc == "hevc_nvenc") else []
+# HEVC profile follows the pixel format: main10 for 10-bit 4:2:0, rext (range extensions) for
+# 4:4:4 at 10 bit. Other encoders pick their profile from the input format on their own.
+if venc == "hevc_nvenc" and out_pix == "yuv444p16le":
+    prof = ["-profile:v", "rext"]
+elif venc == "hevc_nvenc" and out_pix == "p010le":
+    prof = ["-profile:v", "main10"]
+else:
+    prof = []
 
 # Carry the source colour signalling through. NVENC ignores the bare -color_* output flags
 # for transfer/primaries (verified: only matrix and range stick), which would strip HDR
@@ -539,11 +676,19 @@ else:
 # edges without destroying texture). So the encode vf is just the colour-tag passthrough.
 vf = ",".join((["setparams=" + ":".join(sp)] if sp else []) + [f"format={out_pix}"])
 
-# The piped frames are DEC_FMT (rgb24/rgb48le) normally, but the RTX HDR pass emits packed 10-bit
-# BT.2020 PQ RGB, so the encoder input format switches when HDR is active. The TrueHDR output is
-# x2rgb10le (B in the low 10 bits): the model's channel 0 is blue, which lands in the low bits of the
-# CUDA 101010_2 packing, verified by an R/B swap when read as x2bgr10le.
-ENC_IN_FMT = "x2rgb10le" if HDR_ACTIVE else DEC_FMT
+# The encoder pipe format. The RTX HDR pass emits packed 10-bit BT.2020 PQ RGB (x2rgb10le: B in
+# the low 10 bits of the CUDA 101010_2 packing - the model's channel 0 is blue, verified by an
+# R/B swap when read as x2bgr10le). Otherwise frames come out of to_bytes at the OUTPUT raw
+# depth (OUT_RAW_FMT). The one path that bypasses to_bytes - the plain no-interp re-encode with
+# no sharpen/upscale - pipes the decoded bytes straight through at DEC_FMT; the encoder's format
+# filter still raises an 8-bit source to the 10-bit out_pix there, which softens encoder-side
+# banding even though a plain re-encode has no float precision to preserve.
+if HDR_ACTIVE:
+    ENC_IN_FMT = "x2rgb10le"
+elif NO_INTERP and not (SHARPEN > 0 or UPSCALE):
+    ENC_IN_FMT = DEC_FMT
+else:
+    ENC_IN_FMT = OUT_RAW_FMT
 enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", ENC_IN_FMT,
            "-s", f"{OUT_W}x{OUT_H}", "-r", rate_str, "-i", "-", "-i", inp,
            "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy",
@@ -666,6 +811,7 @@ I0 = to_tensor(prev)
 k = 0
 i = 0
 dups = 0
+cuts = 0                # hard cuts held instead of interpolated (see scene cut detection)
 last_out = None         # bytes of the most recent emitted frame, held across the final slot
 try:
     while True:
@@ -691,10 +837,20 @@ try:
             if fracs:
                 with amp():
                     reuse = model.reuse(I0, I1, scale)
-                    held = to_bytes(model.inference(I0, I1, reuse, 0.5)) if dup else None
-                    for fr in fracs:
-                        last_out = held if dup else to_bytes(model.inference(I0, I1, reuse, fr))
-                        wq.put(last_out)
+                    if dup:
+                        held = to_bytes(model.inference(I0, I1, reuse, 0.5))
+                        for _ in fracs:
+                            last_out = held
+                            wq.put(held)
+                    elif _pair_is_cut(i, I0, I1, reuse):
+                        cuts += 1
+                        for out in _emit_cut(I0, I1, fracs):
+                            last_out = out
+                            wq.put(out)
+                    else:
+                        for fr in fracs:
+                            last_out = to_bytes(model.inference(I0, I1, reuse, fr))
+                            wq.put(last_out)
         else:
             # Multi mode: emit multi frames per source frame on a grid offset by half a step,
             # timesteps 1/2M, 3/2M, ... (2M-1)/2M (symmetric around 0.5, spacing 1/M). None is at 0
@@ -708,6 +864,11 @@ try:
                     last_out = held
                     for _ in range(M):
                         wq.put(held)
+                elif _pair_is_cut(i, I0, I1, reuse):
+                    cuts += 1
+                    for out in _emit_cut(I0, I1, [(2 * j + 1) / (2 * M) for j in range(M)]):
+                        last_out = out
+                        wq.put(out)
                 else:
                     for j in range(M):
                         last_out = to_bytes(model.inference(I0, I1, reuse, (2 * j + 1) / (2 * M)))
@@ -722,9 +883,11 @@ try:
     # the output covers the full source duration and lands on exactly multi*frames (true doubling,
     # the target fps behaviour Topaz uses) instead of stopping one slot short. It is held, so it
     # stays soft and does not pop. A single decoded frame has no pair at all, so it just passes
-    # through (still routed through to_bytes when sharpening/upscaling so its dims match the encoder).
+    # through (still routed through to_bytes when sharpening/upscaling changes its dims, or when
+    # the pipe carries the output depth and the raw decode bytes would be the wrong size).
     if last_out is None:
-        wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE) else prev)
+        wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE
+                                or DEC_FMT != OUT_RAW_FMT) else prev)
     else:
         tail = (math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)) if FPS_MODE else args.multi
         for _ in range(tail):
@@ -739,4 +902,4 @@ finally:
 if _werr:
     raise _werr[0]          # surface a failed encode pipe as a nonzero exit
 _write_hdr10_metadata()
-sys.stderr.write(f"done {k} pairs ({dups} held as duplicates) -> {out_path}\n")
+sys.stderr.write(f"done {k} pairs ({dups} held as duplicates, {cuts} cuts held) -> {out_path}\n")

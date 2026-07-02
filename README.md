@@ -95,8 +95,10 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   with **Change...**). Always visually lossless, no quality knob. The output is always HEVC
   (`hevc_nvenc`) when the device has a usable NVENC session, since HEVC at the same quality is
   far smaller than H.264 and an interpolated clip is a new artifact (matching an H.264 source
-  would only bloat it). The source bit depth is preserved (8 bit, or 10 bit and HDR via
-  `p010le`), the source colour signalling is carried through, and original audio is copied. With
+  would only bloat it). The output is 10 bit (`p010le` / `main10`) whatever the source depth, so
+  the float-precision interpolated frames never get re-quantised to 8 bit levels (which is what
+  bands gradients like skies and glows); the source colour signalling is carried through, and
+  original audio is copied. With
   no usable NVENC it falls back automatically to CPU SVT-AV1, still visually lossless (see
   Passthrough quality).
 - Uniform look (no popping): every output frame is interpolated, the first and last included.
@@ -145,7 +147,7 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   with `webUtils.getPathForFile`, and the folder, multiplier, sharpen, interpolate and
   match-screen settings are saved in `localStorage`.
 - `engine/gmfss_interp.py` - GMFSS pipe engine: ffmpeg decode into GMFSS into ffmpeg
-  encode (audio copied), always encoding HEVC with the bit depth and colour tags matched to the
+  encode (audio copied), always encoding HEVC at 10 bit with the colour tags matched to the
   probed source and always targeting visually lossless (see Passthrough quality). Runs the
   TensorRT backend by default (per-subnet eager fallback; `--no-trt` forces eager) and NVENC
   with an automatic CPU SVT-AV1 fallback. Always fp16; takes an integer `<multi>` or
@@ -362,8 +364,9 @@ approach Topaz uses. Held cels (byte exact duplicate source frames) are still de
 rendered once, so a static shot stays as crisp as its source without per frame shimmer.
 
 ## Passthrough quality
-The encode keeps the source's bit depth, chroma and colour, so the only deliberate changes are
-interpolation and the codec (always HEVC). From the ffprobe of the input the engine sets:
+The encode keeps the source's chroma and colour and never drops below its bit depth, so the
+deliberate changes are interpolation, the codec (always HEVC) and the default 10-bit output.
+From the ffprobe of the input the engine sets:
 
 - **Codec.** Always HEVC (`hevc_nvenc`), whatever the source codec was. HEVC at the same visually
   lossless CQ is far smaller than H.264, and the interpolated clip is a brand new artifact, so
@@ -373,11 +376,17 @@ interpolation and the codec (always HEVC). From the ffprobe of the input the eng
   codec menu centred on HEVC and AV1; GMFSS_Fortuna's own script only dumps `mp4v`). The encoder
   is preflighted on a tiny frame; if the device has no usable HEVC NVENC session (no NVIDIA GPU, a
   GPU too old, or no driver) the engine falls back to CPU `libsvtav1` for the encode.
-- **Bit depth.** 8 bit decodes via `rgb24`; 10 bit and up decode via `rgb48le` and encode to
-  `p010le` (HEVC `main10`). The pipe is already fp16, which holds 10 bit precision, so this is
-  free. GMFSS_Fortuna and GMFSS_union are 8 bit only, and enhancr runs GMFSS inference in
-  float but writes 8 bit (`YUV422P8`), so carrying 10 bit all the way to the file is one step
-  past all three references.
+- **Bit depth.** Decode follows the source (8 bit via `rgb24` byte for byte; 10 bit and up via
+  `rgb48le` so nothing truncates before the model), but the encode is **10 bit by default for
+  every source** (`p010le` / HEVC `main10`, `yuv444p16le` + `rext` for 4:4:4 sources, 10-bit AV1;
+  `--out-bits 8` restores the legacy 8-bit output for maximum device compatibility, honoured for
+  8-bit sources only). Every emitted frame is a floating point blend (the pipe is fp16, which
+  holds 10 bit precision), so quantising back to 8 bit would throw away real sub-8-bit precision
+  the interpolation just created and band smooth gradients (skies, glows); measured on a dark
+  gradient clip, the 8-bit render keeps the source's 70 distinct luma levels while the 10-bit
+  render carries 281. GMFSS_Fortuna and GMFSS_union are 8 bit only, and enhancr runs GMFSS
+  inference in float but writes 8 bit (`YUV422P8`), so writing the float precision into a 10-bit
+  file is one step past all three references.
 - **Colour.** The source matrix, transfer, primaries and range are stamped on with a
   `setparams` filter (NVENC drops transfer and primaries from the bare `-color_*` output
   flags), so bt2020 / PQ / HLG HDR signalling survives the round trip.
@@ -450,23 +459,31 @@ For whoever picks this up.
   **wrong** - it judged the neutral white point normalized by green, which hides a green shift; the
   shift is hue-dependent and shows in saturated blues, which is why the mountains looked teal.
 
-- **Clean machine test (the one open item).** The packaged zip is self contained and was
-  verified locally with system Python and ffmpeg stripped from PATH, but it has not yet
-  been run on a *separate* PC. Copy `release/SmoothMyVideo-<version>-win.zip` to a machine
-  with no Python and no ffmpeg (just an NVIDIA driver), extract, and run `SmoothMyVideo.exe`.
-  Test both paths: a normal render, and one with the **TensorRT** toggle on (the first TRT
-  render at a given resolution spends a few minutes building engines, then caches them).
-- **Scene change detection (skip interpolation across true cuts).** The engine interpolates
-  every pair, so at a hard cut it morphs one shot into the next and emits a smeared ghost
-  frame. The fix is to detect the cut and emit a held frame instead of a tween. Do not use a
-  raw pixel difference threshold for this: a fast camera pan or hard action also produces a
-  large pixel difference and would be falsely flagged as a cut, killing interpolation exactly
-  where it is most wanted. Use the optical flow GMFSS already computes (gmflow returns flow01
-  and flow10 per pair): on a real cut the forward and backward flow disagree and the warp
-  residual is large, while a fast pan has large but consistent flow with a small warp residual.
-  A forward/backward flow consistency or warp error check separates the two cleanly and reuses
-  work already done. enhancr leans on VapourSynth misc.SCDetect, a plain frame difference
-  detector that has exactly this pan false positive, so this is a place to do better than it.
+- **Clean machine test (waived 2026-06-28).** The packaged zip is self contained and was
+  verified locally with system Python and ffmpeg stripped from PATH; a run on a *separate*
+  PC was waived as a requirement, so no portability items remain open. If it is ever wanted
+  anyway: copy `release/SmoothMyVideo-<version>-win.zip` to a machine with no Python and no
+  ffmpeg (just an NVIDIA driver), extract, run `SmoothMyVideo.exe`, and test both a normal
+  render and one with the **TensorRT** toggle on (the first TRT render at a given resolution
+  spends a few minutes building engines, then caches them).
+- **Scene change detection (done 2026-07-02).** The engine no longer morphs one shot into the
+  next at a hard cut: cut pairs are detected and the boundary frames are held instead (slots
+  before the mid point hold shot A, the rest hold shot B, so the cut lands sharp between two
+  output frames). The held frames are rendered the way held duplicate cels already are (GMFSS
+  on the `(I, I)` pair at t=0.5), keeping the clip's uniform soft look instead of popping a
+  sharp source frame into a run of tweens. Detection reuses the flows `model.reuse()` already
+  computes, per the plan: not a raw pixel difference (a fast pan would false-positive; enhancr's
+  VapourSynth `misc.SCDetect` has exactly that flaw) but two flow checks that must BOTH fire - the
+  forward/backward consistency failure fraction (`occ` > 0.5) and the bidirectional warp
+  reconstruction error (`photo` > 0.08). Measured: within-shot anime pairs sit at occ
+  0.042..0.063 / photo 0.034..0.047, a 100 px/frame whip pan at occ 0.000 (GMFlow tracks it,
+  confirming the design premise), and a true cut saturates at occ 1.000 / photo 0.260 - roughly
+  8x margin against false positives. A same-shot crop-zoom reframe (occ 0.196) deliberately
+  still interpolates: the flow matches it, so the tween is a coherent zoom, not a smear. At the
+  boundary the ghost is measurably gone (output frames match their own shot at MAD ~0.006 vs
+  0.10..0.21 blends before). Cuts are logged to stderr and counted in the done line;
+  `--no-scene-detect` disables it, `SMV_SCENE_DEBUG=1` prints both metrics per pair. Still
+  open from this family: near-duplicate detection (see the next bullet).
 - **Duplicate frame handling for anime (exact case done).** GMFSS targets anime, which is drawn
   on twos and threes, so many consecutive source frames are identical. The engine now detects a
   byte exact duplicate pair and holds the frame instead of interpolating, skipping the wasted
@@ -564,17 +581,16 @@ For whoever picks this up.
   the last synchronous stall in the overlap design.
 - **Batch queue.** Process several files (or a folder) unattended, one after another. Pure UI
   work in the renderer and main process, no engine change.
-- **AV1 and H.266/VVC output codecs.** Output is always HEVC today (CPU SVT-AV1 is only a fallback when
-  no NVENC session exists). Make AV1 a first-class, selectable output codec: Blackwell has a hardware AV1
-  encoder (`av1_nvenc`, present in the bundled BtbN build) and AV1 at the same visually lossless quality
-  is smaller than HEVC, so it is a near-free win on this GPU. Then add **H.266/VVC** for a further size
-  drop, which is the larger task: the bundled LGPL ffmpeg has no VVC encoder, so it needs `libvvenc`/vvenc
-  (or a standalone `vvencapp`) bundled, plus a GUI codec picker (HEVC / AV1 / VVC) and matched
-  visually-lossless rate settings per codec. VVC decode/player support is still thin, so HEVC stays the
-  default; AV1 is the safer first step.
+- **AV1 and H.266/VVC output codecs (done 2026-06-28).** `--codec {hevc,av1,vvc}` plus the GUI
+  **Codec** dropdown. `av1` uses the Blackwell hardware encoder (`av1_nvenc`, CQ 20, smaller than
+  HEVC at the same visually lossless quality; CPU `libsvtav1` fallback), `vvc` uses CPU `libvvenc`
+  (QP 21 preset fast, always 10-bit `yuv420p10le` - its only input format - muxed with
+  `-strict experimental`, falling back to HEVC when libvvenc is absent). The HDR10 `mdcv`/`clli`
+  box injection is codec agnostic. Validated: AV1 SDR bt709, AV1 HDR PQ with boxes, VVC SDR 10-bit.
+  HEVC stays the default for player compatibility.
 - **Optional smaller items.** Add a live preview of the frame being written. (Encoding is now
-  done: always HEVC, preserved bit depth and colour, always visually lossless, with an automatic
-  CPU SVT-AV1 fallback when NVENC is unavailable; see Passthrough quality.)
+  done: always HEVC, 10-bit output by default with preserved colour, always visually lossless,
+  with an automatic CPU SVT-AV1 fallback when NVENC is unavailable; see Passthrough quality.)
 - **Performance headroom (ranked easiest to hardest, 2026-06-26 code audit).** The pipeline is already
   fp16 + cupy softsplat, TensorRT on all five sub-nets, pinned async upload, threaded decode/encode
   overlap and byte exact duplicate skip (`torch.compile` is ruled out for this model class: it would only
@@ -696,7 +712,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--no-scene-detect] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -708,7 +724,13 @@ Contrast Adaptive Sharpening (`strength` 0..1) to every output frame to offset t
 look softness; it is off unless given (a bare `--sharpen` uses 0.8). `--no-interp` skips
 interpolation entirely: the clip is only re-encoded at its source fps with `--sharpen`
 applied (one output frame per source frame, no GMFSS model or TRT loaded), for when you
-just want the sharpening and not the smoothing. `--upscale F` spatially upscales every
+just want the sharpening and not the smoothing. `--out-bits` sets the output bit depth:
+`10` (the default) encodes 10-bit even from an 8-bit source so the float-precision frames
+never band, `8` restores the legacy 8-bit output for maximum device compatibility (8-bit
+sources only; the output never drops below the source depth, and HDR and VVC are always
+10-bit). `--no-scene-detect` disables hard-cut detection (on by default; see Scene change
+detection under What can be done next for how it works and the calibration numbers).
+`--upscale F` spatially upscales every
 output frame by an arbitrary factor `F` (e.g. `2.0`, or `1.5`, ...) just before encode,
 leaving decode and interpolation at the source resolution; it is off at `1.0` unless given
 (a bare `--upscale` uses `1.5`, clamped to 8.0). With `--rtx-vsr` the upscale uses NVIDIA RTX
