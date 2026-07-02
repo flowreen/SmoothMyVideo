@@ -101,6 +101,12 @@ ap.add_argument("--rtx-hdr", action="store_true",
                      "10-bit BT.2020 PQ. Combines with --upscale (the RTX bridge does VSR then "
                      "TrueHDR in one pass). Needs engine/rtxvideo; falls back to an SDR render if "
                      "the bridge is unavailable.")
+ap.add_argument("--codec", choices=["hevc", "av1", "vvc"], default="hevc",
+                help="output codec. hevc (default): hevc_nvenc, the smallest widely-supported "
+                     "visually lossless choice. av1: av1_nvenc (RTX 40/50 hardware encode). "
+                     "vvc: H.266 via CPU libvvenc (best compression, slow, limited player support; "
+                     "always 10-bit). The NVENC choices fall back to CPU libsvtav1 when no usable "
+                     "session exists; vvc falls back to HEVC if libvvenc is absent.")
 ap.add_argument("--hdr-nits", type=int, default=1000,
                 help="HDR10 peak luminance in nits for --rtx-hdr (the TrueHDR MaxLuminance and the "
                      "stream's mastering-display / MaxCLL metadata). Clamped to 400..2000; "
@@ -124,18 +130,22 @@ ap.add_argument("--hdr-mastering-prim", choices=["display-p3", "dci-p3", "bt2020
                      "identically.")
 ap.add_argument("--hdr-color", choices=["vivid", "rtx", "raw"], default="vivid",
                 help="colour handling for --rtx-hdr (the TrueHDR model rotates hues - it greens/cyans the "
-                     "blues - even at saturation 0). vivid (default): keep TrueHDR's luminance, take the SDR "
-                     "source's hue, and scale its chroma in ICtCp by --hdr-vividness - a hue-linear "
-                     "saturation control (1.0 = faithful colour, cyan removed; >1 adds pop, no hue shift). "
-                     "raw: TrueHDR colour unmodified (the cyan-shifted reference). rtx drives saturation "
-                     "with the SDK --hdr-saturation like real RTX TrueHDR, hue-corrected (chroma magnitude "
-                     "from TrueHDR, hue from the source, floored at source) which is the familiar NVIDIA "
-                     "slider without the cyan cast.")
-ap.add_argument("--hdr-vividness", type=float, default=1.0,
-                help="for --hdr-color vivid: chroma gain over the colorimetric source, applied in ICtCp so "
-                     "hue never shifts - the de-facto Saturation slider. 1.0 (default) = faithful, >1 richer "
-                     "(~1.5 vibrant, 2.0 strong). Clamped 0..4. The SDK --hdr-saturation is INERT in vivid "
-                     "mode (the model's chroma is dropped and rebuilt from the source).")
+                     "blues - even at saturation 0). vivid (default): keep TrueHDR's luminance but take the "
+                     "SDR source's hue AND chroma in ICtCp - faithful colour, cyan removed; the SDK "
+                     "--hdr-saturation is inert here (the model's chroma is dropped entirely). rtx: drive "
+                     "saturation with the SDK --hdr-saturation like real RTX TrueHDR, hue-corrected (chroma "
+                     "magnitude from TrueHDR, hue from the source, floored at source), the familiar NVIDIA "
+                     "slider without the cyan cast. raw: TrueHDR colour unmodified (a debug/reference mode "
+                     "with the cyan cast).")
+ap.add_argument("--hdr-vibrance", type=float, default=0.0,
+                help="Dynamic Vibrance Intensity for --rtx-hdr (vivid/rtx colour modes): boost muted "
+                     "colours without touching already-saturated ones or hue (applied in ICtCp). "
+                     "0 (default) = off, 1 = full boost; inert in raw mode.")
+ap.add_argument("--hdr-satboost", type=float, default=0.0,
+                help="Dynamic Vibrance Saturation boost for --rtx-hdr: uniform extra saturation on top "
+                     "of the colour mode (0..1 = +0..100%%, hue-safe in ICtCp). Independent of "
+                     "--hdr-saturation, which is RTX HDR's own TrueHDR knob, mirroring NVIDIA's two "
+                     "separate filters. 0 (default) = off; inert in raw mode.")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
@@ -147,13 +157,15 @@ UPSCALE_F = max(1.0, min(8.0, args.upscale)) # output spatial upscale factor (cl
 UPSCALE = UPSCALE_F > 1.0
 RTX_VSR = args.rtx_vsr                        # use the RTX Video SDK (real RTX VSR) for --upscale
 RTX_HDR = args.rtx_hdr                         # convert the output to HDR10 via RTX Video TrueHDR
+CODEC = args.codec                             # output codec family: hevc (default) / av1 / vvc
 HDR_NITS = max(400, min(2000, args.hdr_nits)) # HDR10 peak luminance (TrueHDR target + metadata)
 HDR_SAT = max(0, min(200, args.hdr_saturation))  # TrueHDR Saturation; default 0 = faithful to source
 HDR_CON = max(0, min(200, args.hdr_contrast))    # TrueHDR Contrast (100 = SDK neutral)
 HDR_MG = max(10, min(100, args.hdr_middlegray))  # TrueHDR MiddleGray midtone anchor (50 = SDK default)
 HDR_MASTER_PRIM = args.hdr_mastering_prim         # mdcv mastering-display colorspace (display-p3/dci-p3/bt2020/bt709)
 HDR_COLOR = args.hdr_color                         # vivid (default) / faithful / raw colour handling
-HDR_VIVIDNESS = max(0.0, min(4.0, args.hdr_vividness))  # vivid chroma gain over source (1.0 == faithful)
+HDR_VIBRANCE = max(0.0, min(1.0, args.hdr_vibrance))    # vibrance Intensity in ICtCp (0 = off)
+HDR_SATBOOST = max(0.0, min(1.0, args.hdr_satboost))    # vibrance uniform Saturation boost (0 = off)
 
 def probe(path):
     # JSON (not csv) so the extra color/format fields stay robust when any of them is
@@ -305,6 +317,15 @@ else:
 # Any setup failure leaves _RTX None and the render degrades gracefully (bicubic upscale, SDR render),
 # so a missing/blocked RTX runtime never breaks a render.
 _RTX = None
+# TrueHDR is an SDR-to-HDR model: feeding it an already-PQ/HLG source would expand PQ-encoded
+# pixels it assumes are SDR gamma. Skip the conversion and carry the source HDR through unchanged
+# (the SDR colour path below already stamps the source transfer/primaries onto the output).
+SRC_HDR_IN = (_tag("color_transfer") or "") in ("smpte2084", "arib-std-b67")
+if RTX_HDR and SRC_HDR_IN:
+    sys.stderr.write(f"[rtx] source is already HDR (transfer {_tag('color_transfer')}); TrueHDR "
+                     "converts SDR only, skipping the HDR conversion (source HDR signalling is "
+                     "carried through as-is)\n"); sys.stderr.flush()
+    RTX_HDR = False
 _need_vsr = UPSCALE and RTX_VSR              # AI upscale via RTX VSR (else bicubic / no upscale)
 _need_hdr = RTX_HDR                          # SDR -> HDR10 via RTX TrueHDR
 RTX_VSR_ACTIVE = False                       # True once the RTX VSR pass is confirmed available
@@ -318,15 +339,17 @@ if _need_vsr or _need_hdr:
         # size. VSR and TrueHDR features both live on this one instance when both are requested.
         _RTX = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=_need_vsr, hdr=_need_hdr,
                                  hdr_max_nits=HDR_NITS, hdr_contrast=HDR_CON, hdr_saturation=HDR_SAT,
-                                 hdr_middlegray=HDR_MG, hdr_color=HDR_COLOR, hdr_vividness=HDR_VIVIDNESS)
+                                 hdr_middlegray=HDR_MG, hdr_color=HDR_COLOR, hdr_vibrance=HDR_VIBRANCE,
+                                 hdr_satboost=HDR_SATBOOST)
         RTX_VSR_ACTIVE = _need_vsr
         HDR_ACTIVE = _need_hdr
         if _need_vsr:
             sys.stderr.write(f"RTX Video Super Resolution ready (Ultra) -> {OUT_W}x{OUT_H}\n")
         if _need_hdr:
-            _viv = f" {HDR_VIVIDNESS:g}" if HDR_COLOR == "vivid" else ""
+            _vib = f", vib {HDR_VIBRANCE:g}" if HDR_VIBRANCE > 0 else ""
+            _sb = f", sb {HDR_SATBOOST:g}" if HDR_SATBOOST > 0 else ""
             sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits, sat {HDR_SAT}, con {HDR_CON}, "
-                             f"mg {HDR_MG}, colour {HDR_COLOR}{_viv}) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
+                             f"mg {HDR_MG}, colour {HDR_COLOR}{_vib}{_sb}) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"[rtx] unavailable, falling back (bicubic upscale / SDR): {repr(e)[:200]}\n")
         _RTX = None
@@ -417,14 +440,13 @@ dec = subprocess.Popen(
     [FFMPEG, "-v", "error", "-i", inp, "-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
     stdout=subprocess.PIPE, creationflags=NO_WINDOW)
 
-# Always encode HEVC, whatever the source codec is. The interpolated clip is a brand new artifact
-# (many times the source's frame count), and HEVC at the same visually lossless CQ is far smaller
-# than H.264, so echoing an H.264 source would roughly quadruple the file for no quality gain. It
-# is also what the polished interpolation apps steer toward (enhancr, Topaz, Flowframes all offer
-# a codec menu and lean on HEVC/AV1); GMFSS_Fortuna's own script only dumps mp4v. HEVC carries
-# 10 bit (main10) and 4:4:4 cleanly. NVENC is used when the device has a usable HEVC session, with
-# the automatic CPU fallback below when it does not.
-venc = "hevc_nvenc"
+# The output codec never echoes the source: the interpolated clip is a brand new artifact (many
+# times the source's frame count), so it gets a modern efficient codec. --codec picks the family:
+# HEVC (default; smallest widely-supported visually lossless choice, carries 10 bit and 4:4:4
+# cleanly), AV1 (RTX 40/50 have AV1 NVENC hardware), or H.266/VVC (libvvenc on the CPU: the best
+# compression of the three, slow, limited player support, always 10-bit main10). Hardware picks
+# degrade gracefully: a missing NVENC session falls back to CPU libsvtav1, a missing libvvenc to
+# HEVC.
 
 def _enc_works(name):
     # Real availability check: actually open the encoder on a tiny frame. NVENC fails fast
@@ -440,19 +462,27 @@ def _enc_works(name):
     except Exception:  # noqa: BLE001
         return False
 
-USE_NVENC = _enc_works(venc)
-if not USE_NVENC:
-    # No usable NVENC on this device: fall back to the best visually lossless software
-    # encoder in the bundled (LGPL) ffmpeg. SVT-AV1 has true CRF rate control and clean
-    # 8/10 bit support; libx264/libx265 are GPL and not compiled into this build.
+venc = {"av1": "av1_nvenc", "vvc": "libvvenc"}.get(CODEC, "hevc_nvenc")
+if venc == "libvvenc" and not _enc_works(venc):
+    sys.stderr.write("libvvenc (H.266/VVC) unavailable in this ffmpeg; using HEVC instead\n")
+    sys.stderr.flush()
+    venc = "hevc_nvenc"
+USE_NVENC = venc.endswith("_nvenc")
+if USE_NVENC and not _enc_works(venc):
+    # No usable NVENC session for this codec on this device: fall back to the best visually
+    # lossless software encoder in the bundled (LGPL) ffmpeg. SVT-AV1 has true CRF rate control
+    # and clean 8/10 bit support; libx264/libx265 are GPL and not compiled into this build.
     sys.stderr.write(f"NVENC ({venc}) unavailable on this device; "
                      f"falling back to CPU libsvtav1\n"); sys.stderr.flush()
     venc = "libsvtav1"
+    USE_NVENC = False
 
 # Output pixel format: preserve 10 bit and 4:4:4 where the encoder allows it, otherwise the
 # standard 8 bit 4:2:0. NVENC takes 10 bit as p010le; SVT-AV1 wants planar yuv420p10le and
 # has no 4:4:4 path, so the fallback stays 4:2:0.
-if HDR_ACTIVE or TEN_BIT:
+if venc == "libvvenc":
+    out_pix = "yuv420p10le"                  # libvvenc's only supported input format (always main10)
+elif HDR_ACTIVE or TEN_BIT:
     # HDR10 (TrueHDR) is always 10-bit; a 10-bit source is also carried as 10-bit.
     out_pix = "p010le" if USE_NVENC else "yuv420p10le"
 elif CHROMA444 and venc in ("h264_nvenc", "hevc_nvenc"):
@@ -470,6 +500,10 @@ if USE_NVENC:
              "-spatial_aq", "1", "-temporal_aq", "1"]
     if venc in ("h264_nvenc", "hevc_nvenc"):
         qargs += ["-qp_cb_offset", "-2", "-qp_cr_offset", "-2"]
+elif venc == "libvvenc":
+    # vvenc has no CRF; QP 21 with its perceptual QP adaptation (qpa, on by default) sits in the
+    # visually lossless range, and the fast preset keeps 1080p from being glacial on the CPU.
+    qargs = ["-qp", "21", "-preset", "fast"]
 else:
     qargs = ["-crf", "20", "-preset", "8"]
 
@@ -514,7 +548,8 @@ enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", ENC_IN_FMT
            "-s", f"{OUT_W}x{OUT_H}", "-r", rate_str, "-i", "-", "-i", inp,
            "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy",
            "-c:v", venc, "-vf", vf]
-enc_cmd += qargs + prof + color + [out_path]
+# VVC-in-MP4 muxing is gated behind -strict experimental on some ffmpeg versions; harmless otherwise.
+enc_cmd += qargs + prof + color + (["-strict", "experimental"] if venc == "libvvenc" else []) + [out_path]
 enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
 _sharp_note = f"  sharpen(rcas)={SHARPEN:g}" if SHARPEN > 0 else ""
 _up_note = f"  upscale={UPSCALE_F:g}x->{OUT_W}x{OUT_H}" if UPSCALE else ""

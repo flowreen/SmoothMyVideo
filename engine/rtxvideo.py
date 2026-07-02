@@ -38,6 +38,10 @@ RTX_DIR = os.environ.get(
 
 _API_SUCCESS = 1
 
+# Vibrance reference chroma: the ICtCp chroma magnitude treated as "fully saturated" (no boost).
+# Measured on sample content: mean scene chroma ~0.04, saturated anime fills ~0.10-0.15.
+_VIBRANCE_CREF = 0.12
+
 # SMPTE ST 2084 (PQ) EOTF constants, used to measure MaxCLL/MaxFALL from the TrueHDR output so the
 # HDR10 content-light metadata reflects the actual frames rather than a guess.
 _PQ_M1, _PQ_M2 = 0.1593017578125, 78.84375
@@ -126,7 +130,7 @@ class RTXVideo:
 
     def __init__(self, width, height, out_w, out_h, vsr=True, hdr=False, vsr_quality=4,
                  hdr_max_nits=1000, hdr_contrast=100, hdr_saturation=0, hdr_middlegray=50,
-                 hdr_color="vivid", hdr_vividness=1.0, rtx_dir=RTX_DIR):
+                 hdr_color="vivid", hdr_vibrance=0.0, hdr_satboost=0.0, rtx_dir=RTX_DIR):
         # Make sure torch's primary CUDA context exists and is current on this thread before the
         # bridge retains it (create is called with cuContext=NULL -> cuDevicePrimaryCtxRetain).
         torch.zeros(8, device="cuda")
@@ -173,12 +177,10 @@ class RTXVideo:
             self._hdr_in[..., 3] = 255
             self._hdr_out = torch.empty((self.oH, self.oW, 4), dtype=torch.uint8, device="cuda")
             # Colour handling (the model rotates hues - it greens/cyans the blues - even at saturation 0):
-            #   vivid (default) - keep TrueHDR's luminance (the HDR expansion), take the SDR source's hue,
-            #                     and scale its chroma by _vividness in ICtCp (see _ictcp_correct). _vividness
-            #                     is a hue-linear saturation control: 1.0 = faithful colour (cyan rotation
-            #                     removed, saturation matching the source), >1 adds pop with no hue shift. It
-            #                     is the de-facto Saturation slider; the SDK Saturation knob (_thdr) is inert
-            #                     here because the model's chroma is dropped and rebuilt from the source.
+            #   vivid (default) - keep TrueHDR's luminance (the HDR expansion), take the SDR source's hue
+            #                     AND chroma in ICtCp (see _ictcp_correct): faithful colour, cyan rotation
+            #                     removed, saturation matching the source. The SDK Saturation knob (_thdr)
+            #                     is inert here because the model's chroma is dropped entirely.
             #   rtx             - keep TrueHDR's luminance, take the SDR source's hue, but take TrueHDR's own
             #                     chroma MAGNITUDE (floored at the source) in ICtCp (see _rtx_correct). The SDK
             #                     Saturation knob (_thdr) drives the magnitude here, so the slider edits
@@ -186,8 +188,15 @@ class RTXVideo:
             #   raw             - emit TrueHDR's colour unmodified (the cyan-shifted reference).
             # All keep the linear BT.709 -> linear BT.2020 primaries matrix (BT.2087); vivid and rtx also need
             # the BT.2100 ICtCp matrices below.
+            # The Dynamic Vibrance analog on top of vivid/rtx (inert in raw mode), mirroring NVIDIA's
+            # separate vibrance filter with its two controls: _vibrance (Intensity, 0..1) is a chroma
+            # gain weighted toward LOW-chroma pixels (muted colours pop, saturated colours and skin
+            # stay put) and _satboost (Saturation boost, 0..1 = +0..100%) is a uniform chroma gain,
+            # independent of the TrueHDR SDK Saturation that RTX HDR's own slider drives. Both are
+            # hue-safe because Ct/Cp scale uniformly per pixel (see _vibrance_gain).
             self._color_mode = hdr_color if hdr_color in ("vivid", "rtx", "raw") else "vivid"
-            self._vividness = max(0.0, min(4.0, float(hdr_vividness)))
+            self._vibrance = max(0.0, min(1.0, float(hdr_vibrance)))
+            self._satboost = max(0.0, min(1.0, float(hdr_satboost)))
             self._m709_2020 = torch.tensor(
                 [[0.6274, 0.3293, 0.0433], [0.0691, 0.9195, 0.0114], [0.0164, 0.0880, 0.8956]],
                 dtype=torch.float32, device="cuda")
@@ -239,7 +248,7 @@ class RTXVideo:
         if r != _API_SUCCESS:
             raise RuntimeError("rtx_video_api_cuda_evaluate_thdr_deviceptr failed")
         if self._color_mode == "vivid":
-            return self._ictcp_correct(rgb, self._hdr_out)    # source hue + _vividness chroma @ TrueHDR luma
+            return self._ictcp_correct(rgb, self._hdr_out)    # source hue & chroma @ TrueHDR luma
         if self._color_mode == "rtx":
             return self._rtx_correct(rgb, self._hdr_out)      # source hue + TrueHDR chroma magnitude @ TrueHDR luma
         try:
@@ -248,13 +257,25 @@ class RTXVideo:
             pass
         return self._hdr_out.cpu().numpy().tobytes()   # [oH,oW,4] packed 10:10:10:2 == x2rgb10le
 
+    def _vibrance_gain(self, ct, cp):
+        """The Dynamic Vibrance analog: scale Ct/Cp by the product of the uniform Saturation boost
+        (1 + _satboost) and the Intensity term, a gain weighted toward LOW-chroma pixels so muted
+        colours pop while already-saturated colours (and skin) stay put. The Intensity weight falls
+        linearly from full boost at zero chroma to none at _VIBRANCE_CREF, roughly the ICtCp chroma
+        of strongly saturated content. Per-pixel uniform Ct/Cp scaling preserves the hue angle, so
+        neither control can reintroduce a cast. No-op when both are 0."""
+        if self._vibrance <= 0.0 and self._satboost <= 0.0:
+            return ct, cp
+        c = torch.hypot(ct, cp)
+        g = (1.0 + self._satboost) * (1.0 + self._vibrance * (1.0 - (c / _VIBRANCE_CREF).clamp(0.0, 1.0)))
+        return ct * g, cp * g
+
     def _ictcp_correct(self, rgb, packed):
-        """Vivid HDR (default). Keeps TrueHDR's luminance (the real HDR expansion) but rebuilds colour in
-        ICtCp (BT.2100), the constant-intensity, hue-linear space: it takes the colorimetric SDR source's
-        hue AND a _vividness-scaled chroma. Scaling Ct/Cp uniformly preserves the hue ANGLE, so this adds
-        saturation pop WITHOUT any hue shift - unlike the TrueHDR model, which greens/cyans the blues, and
-        unlike just cranking the SDK Saturation, which oversaturates AND rotates (and is inert here - the
-        model's chroma is dropped). _vividness gains the source chroma: 1.0 = faithful, >1 richer. x2rgb10le."""
+        """Faithful HDR (the default vivid mode). Keeps TrueHDR's luminance (the real HDR expansion) but
+        rebuilds colour in ICtCp (BT.2100), the constant-intensity, hue-linear space, from the
+        colorimetric SDR source's hue AND chroma - so the picture keeps exactly the source's colours at
+        HDR brightness, unlike the TrueHDR model, which greens/cyans the blues. The SDK Saturation is
+        inert here (the model's chroma is dropped); only _vibrance modifies chroma. Packs x2rgb10le."""
         u = packed.view(torch.int32).squeeze(-1)                             # [H,W]  B|G<<10|R<<20|A<<30
         thdr = torch.stack([(u >> 20) & 1023, (u >> 10) & 1023, u & 1023], 0).float().div_(1023.0)
         lin_t = _pq_to_linear(thdr)                                          # TrueHDR linear BT.2020 [3,H,W]
@@ -270,11 +291,8 @@ class RTXVideo:
             return torch.einsum("ij,jhw->ihw", self._lms2ictcp, _linear_to_pq(lms))
 
         ic_f = _to_ictcp(lin_f)                                             # I, Ct, Cp: source hue & sat @ TrueHDR luma
-        # Scale chroma in ICtCp by _vividness. Scaling Ct/Cp uniformly preserves the hue ANGLE, so this is
-        # a hue-linear saturation gain over the colorimetric source - pop with no hue shift. (The model adds
-        # no real colourfulness at saturation 0; it mostly rotates hue, so richness is taken from the source
-        # here, not from TrueHDR's hue-wrong chroma.) 1.0 == faithful; >1 richer.
-        ictcp = torch.stack([ic_f[0], ic_f[1] * self._vividness, ic_f[2] * self._vividness], 0)
+        ct, cp = self._vibrance_gain(ic_f[1], ic_f[2])
+        ictcp = torch.stack([ic_f[0], ct, cp], 0)
         lms = _pq_to_linear(torch.einsum("ij,jhw->ihw", self._ictcp2lms, ictcp))
         out = torch.einsum("ij,jhw->ihw", self._lms2rgb, lms).clamp_(0.0, 1.0)   # linear BT.2020
         try:                                                                # MaxCLL/FALL from corrected px
@@ -314,7 +332,8 @@ class RTXVideo:
         mag_f = torch.hypot(ic_f[1], ic_f[2]).clamp_(min=1e-8)      # source chroma magnitude
         mag = torch.maximum(torch.hypot(ic_t[1], ic_t[2]), mag_f)   # TrueHDR magnitude, floored at source
         d = mag / mag_f
-        ictcp = torch.stack([ic_f[0], ic_f[1] * d, ic_f[2] * d], 0)
+        ct, cp = self._vibrance_gain(ic_f[1] * d, ic_f[2] * d)
+        ictcp = torch.stack([ic_f[0], ct, cp], 0)
         lms = _pq_to_linear(torch.einsum("ij,jhw->ihw", self._ictcp2lms, ictcp))
         out = torch.einsum("ij,jhw->ihw", self._lms2rgb, lms).clamp_(0.0, 1.0)   # linear BT.2020
         try:                                                                # MaxCLL/FALL from corrected px

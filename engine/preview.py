@@ -14,11 +14,17 @@ the whole preview dim and washed out, because the brightest HDR highlight was dr
 down.) RCAS runs on the CPU when HDR is off, so a sharpen-only preview never touches CUDA, and when neither
 sharpen nor HDR is requested the frame is copied straight through without even importing torch (the
 GUI auto-loads a preview on every video select, so the do-nothing case stays instant and the pane
-labels it "Unchanged"). RTX VSR / upscale preview is a later addition.
+labels it "Unchanged").
+
+HDR sources: when the input itself is already HDR (PQ transfer), TrueHDR is skipped, it is an
+SDR-to-HDR model and the engine skips it for HDR sources too; sharpening still applies (on the
+decoded PQ pixels, exactly as a render does), and BOTH panes are tonemapped for display so the
+preview does not read flat and washed out. RTX VSR / upscale preview is a later addition.
 """
 import os
 import sys
 import argparse
+import subprocess
 
 import numpy as np
 import cv2
@@ -29,6 +35,34 @@ sys.path.insert(0, ENGINE_DIR)
 # linear BT.2020 -> linear BT.709, for tonemapping the PQ HDR output down to an sRGB preview.
 _M2020_709 = np.array([[1.6605, -0.5876, -0.0728], [-0.1246, 1.1329, -0.0083],
                        [-0.0182, -0.1006, 1.1187]], np.float32)
+
+# SMPTE ST 2084 (PQ) constants, numpy twin of the ones in rtxvideo.py (no torch dependency here).
+_PQ_M1, _PQ_M2 = 0.1593017578125, 78.84375
+_PQ_C1, _PQ_C2, _PQ_C3 = 0.8359375, 18.8515625, 18.6875
+
+
+def _ffprobe():
+    exe = os.path.join(ENGINE_DIR, "bin", "ffprobe.exe")
+    return exe if os.path.isfile(exe) else "ffprobe"
+
+
+def _src_transfer(path):
+    """The source's color_transfer tag ('' when unknown); smpte2084/arib-std-b67 mark HDR sources."""
+    try:
+        out = subprocess.check_output(
+            [_ffprobe(), "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=color_transfer", "-of", "csv=p=0", path],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return out.decode("utf-8", "replace").strip().rstrip(",").lower()   # csv adds a trailing comma
+    except Exception:  # noqa: BLE001 - probe is best-effort; treat unknown as SDR
+        return ""
+
+
+def _pq_to_linear_np(e):
+    """SMPTE ST 2084 EOTF in numpy: PQ code' in [0,1] -> display-linear (1.0 == 10000 nits)."""
+    ep = np.power(np.clip(e, 0.0, 1.0), 1.0 / _PQ_M2)
+    return np.power(np.clip(ep - _PQ_C1, 0.0, None) / np.clip(_PQ_C2 - _PQ_C3 * ep, 1e-6, None),
+                    1.0 / _PQ_M1)
 
 
 def _read_frame(path, which):
@@ -50,13 +84,22 @@ def _lum709(a):
     return 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
 
 
+def _shoulder_srgb(x):
+    """Shared display encode: linear BT.709 with exposure applied -> sRGB uint8, per-channel Reinhard
+    shoulder above the knee so expanded highlights roll toward white instead of clipping."""
+    knee = 0.75
+    t = (x - knee) / (1.0 - knee)
+    y = np.where(x <= knee, x, knee + (1.0 - knee) * (t / (1.0 + np.abs(t))))
+    srgb = np.where(y <= 0.0031308, y * 12.92,
+                    1.055 * np.power(np.clip(y, 0.0, None), 1 / 2.4) - 0.055)
+    return (np.clip(srgb, 0.0, 1.0) * 255).astype(np.uint8)
+
+
 def _tonemap(lin2020, src_rgb_u8):
     """Linear BT.2020 (1.0 == 10000 nits) -> sRGB uint8 RGB, anchored to the SDR source.
 
     Exposure: scale so the HDR frame's median luminance equals the SDR source's (in linear 709), so
     midtones read exactly as bright as the original and the preview never dims or washes out.
-    Highlights: per-channel Reinhard shoulder above the knee, so the HDR expansion shows up as
-    highlights blooming toward white (the closest an SDR canvas gets to "brighter than white").
     """
     lin709 = np.clip(lin2020 @ _M2020_709.T, 0.0, None)
     s = src_rgb_u8.astype(np.float32) / 255.0
@@ -64,13 +107,20 @@ def _tonemap(lin2020, src_rgb_u8):
     ls, lh = _lum709(lin_s), _lum709(lin709)
     m = ls > 1e-4                                # anchor on lit content; skip black borders
     k = (float(np.median(ls[m])) / max(1e-9, float(np.median(lh[m])))) if m.any() else 1.0
-    x = lin709 * k
-    knee = 0.75
-    t = (x - knee) / (1.0 - knee)
-    y = np.where(x <= knee, x, knee + (1.0 - knee) * (t / (1.0 + np.abs(t))))
-    srgb = np.where(y <= 0.0031308, y * 12.92,
-                    1.055 * np.power(np.clip(y, 0.0, None), 1 / 2.4) - 0.055)
-    return (np.clip(srgb, 0.0, 1.0) * 255).astype(np.uint8)
+    return _shoulder_srgb(lin709 * k)
+
+
+def _tonemap_pq(rgb_u8):
+    """Display an already-HDR (PQ) frame on the sRGB preview: decode the PQ code values to linear
+    BT.2020, anchor exposure so the median luminance lands at a typical SDR diffuse level (0.2
+    linear), and roll the highlights with the shared shoulder. Self-anchored, because an HDR source
+    has no SDR reference frame to match against."""
+    lin2020 = _pq_to_linear_np(rgb_u8.astype(np.float32) / 255.0)
+    lin709 = np.clip(lin2020 @ _M2020_709.T, 0.0, None)
+    lh = _lum709(lin709)
+    m = lh > 1e-5
+    k = (0.20 / max(1e-9, float(np.median(lh[m])))) if m.any() else 1.0
+    return _shoulder_srgb(lin709 * k)
 
 
 def _hdr_process(t, args):
@@ -82,7 +132,8 @@ def _hdr_process(t, args):
         hdr_contrast=max(0, min(200, args.hdr_contrast)),
         hdr_saturation=max(0, min(200, args.hdr_saturation)),
         hdr_middlegray=max(10, min(100, args.hdr_middlegray)),
-        hdr_color=args.hdr_color, hdr_vividness=max(0.0, min(4.0, args.hdr_vividness)))
+        hdr_color=args.hdr_color, hdr_vibrance=max(0.0, min(1.0, args.hdr_vibrance)),
+        hdr_satboost=max(0.0, min(1.0, args.hdr_satboost)))
     try:
         return rtx.run_hdr(t)
     finally:
@@ -99,7 +150,8 @@ def main():
     ap.add_argument("--sharpen", type=float, default=0.0, help="FSR RCAS sharpen strength 0..1")
     ap.add_argument("--hdr-nits", type=int, default=1000)
     ap.add_argument("--hdr-color", choices=["vivid", "rtx", "raw"], default="vivid")
-    ap.add_argument("--hdr-vividness", type=float, default=1.0)
+    ap.add_argument("--hdr-vibrance", type=float, default=0.0)
+    ap.add_argument("--hdr-satboost", type=float, default=0.0)
     ap.add_argument("--hdr-saturation", type=int, default=0)
     ap.add_argument("--hdr-contrast", type=int, default=100)
     ap.add_argument("--hdr-middlegray", type=int, default=50)
@@ -108,16 +160,20 @@ def main():
 
     bgr, idx, n = _read_frame(args.input, args.frame)
     rgb_u8 = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    transfer = _src_transfer(args.input)
+    src_hdr = transfer in ("smpte2084", "arib-std-b67")
+    do_hdr = args.rtx_hdr and not src_hdr   # TrueHDR is SDR-to-HDR; the engine skips it on HDR sources
 
-    if strength > 0 or args.rtx_hdr:
+    if strength > 0 or do_hdr:
         import torch                       # heavy import, skipped entirely on the unchanged fast path
         from rcas import rcas              # the render engine's own FSR RCAS kernel
-        # Same order as a render (to_bytes): RCAS in SDR first, HDR last. CPU when HDR is off.
-        dev = "cuda" if args.rtx_hdr else "cpu"
+        # Same order as a render (to_bytes): RCAS first (on the decoded pixels, PQ-encoded ones
+        # included, exactly as the render sharpens), HDR last. CPU when HDR is off.
+        dev = "cuda" if do_hdr else "cpu"
         t = torch.from_numpy(rgb_u8).to(dev).float().div(255.0).permute(2, 0, 1).unsqueeze(0).contiguous()
         if strength > 0:
             t = rcas(t, strength)
-        if args.rtx_hdr:
+        if do_hdr:
             packed = _hdr_process(t, args)
             u = np.frombuffer(packed, "<u4").reshape(bgr.shape[0], bgr.shape[1])
             code = np.stack([(u >> 20) & 1023, (u >> 10) & 1023, u & 1023], -1).astype(np.float32) / 1023.0
@@ -129,14 +185,20 @@ def main():
     else:
         proc_rgb = rgb_u8                  # nothing enabled: the render would leave the frame as is
 
+    # Display conversion: a PQ (HDR10) source cannot be shown raw on the sRGB canvas (it reads flat
+    # and washed out), so both panes get the self-anchored tonemap. HLG is shown as-is (it is
+    # designed to degrade acceptably on SDR displays). The do_hdr output was already tonemapped.
+    orig_disp = _tonemap_pq(rgb_u8) if transfer == "smpte2084" else rgb_u8
+    proc_disp = _tonemap_pq(proc_rgb) if (transfer == "smpte2084" and not do_hdr) else proc_rgb
+
     out_dir = os.path.dirname(os.path.abspath(args.out))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     p_orig, p_proc = args.out + "_original.png", args.out + "_processed.png"
-    cv2.imwrite(p_orig, bgr)
-    cv2.imwrite(p_proc, cv2.cvtColor(proc_rgb, cv2.COLOR_RGB2BGR))
-    sys.stdout.write(f"preview frame {idx}/{n} {bgr.shape[1]}x{bgr.shape[0]} hdr={int(args.rtx_hdr)} "
-                     f"sharpen={strength:g} -> {p_orig} | {p_proc}\n")
+    cv2.imwrite(p_orig, cv2.cvtColor(orig_disp, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(p_proc, cv2.cvtColor(proc_disp, cv2.COLOR_RGB2BGR))
+    sys.stdout.write(f"preview frame {idx}/{n} {bgr.shape[1]}x{bgr.shape[0]} hdr={int(do_hdr)} "
+                     f"sharpen={strength:g} srchdr={int(src_hdr)} -> {p_orig} | {p_proc}\n")
 
 
 if __name__ == "__main__":

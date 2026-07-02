@@ -29,6 +29,11 @@
   .spinwheel { width:34px; height:34px; border:3px solid rgba(255,255,255,.25);
                border-top-color:var(--green); border-radius:50%; animation:spin .8s linear infinite;
                filter:drop-shadow(0 0 2px rgba(0,0,0,.7)); }
+  /* Small red tick marking the default position on a slider. All current defaults sit mid-scale,
+     so the tick is painted at 50%; a slider with an off-centre default would override
+     background-position inline. Fades with the control when disabled. */
+  input.defmark { background-color:transparent; background-image:linear-gradient(#e85c5c,#e85c5c);
+                  background-repeat:no-repeat; background-size:2px 12px; background-position:50% 50%; }
   @keyframes spin { to { transform:rotate(360deg); } }
 </style>
 </head>
@@ -92,6 +97,15 @@
       </span>
       <span class="v hint" id="upinfo"></span>
     </div>
+    <div class="row">
+      <span class="k">Codec</span>
+      <select id="outcodec">
+        <option value="hevc">HEVC &middot; H.265 (GPU, recommended)</option>
+        <option value="av1">AV1 (GPU)</option>
+        <option value="vvc">H.266 &middot; VVC (CPU, slow)</option>
+      </select>
+      <span class="hint">output video codec; audio is copied</span>
+    </div>
     <div class="row"><span class="k">Saves to</span>
       <button id="changeout" class="mini" disabled>Change...</button>
       <span class="v hint" id="out"></span></div>
@@ -109,12 +123,47 @@
         RTX Video Super Resolution <span class="hint">(AI for the upscale above)</span>
       </label>
     </div>
-    <div class="row">
+    <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="rtxhdr" style="width:auto;padding:0;accent-color:var(--green);">
-        RTX HDR <span class="hint">(convert SDR video to HDR)</span>
+        RTX HDR <span class="hint" id="rtxhdrhint">(convert SDR video to HDR)</span>
       </label>
+      <span id="hdrtonewrap" style="display:none;align-items:center;gap:8px;">
+        <span class="hint" title="RTX HDR tone curve; 0 = NVIDIA default">Contrast</span>
+        <input id="hdrcon" type="range" min="-100" max="100" step="5" value="0" class="defmark"
+               style="width:100px;padding:0;border:0;accent-color:var(--green);">
+        <span class="v" id="hdrconnum">0</span>
+        <span class="hint" style="margin-left:6px"
+              title="NVIDIA's saturation, hue-corrected; 0 = NVIDIA default, -100 = true to source">Saturation</span>
+        <input id="hdrsat" type="range" min="-100" max="100" step="5" value="0" class="defmark"
+               style="width:100px;padding:0;border:0;accent-color:var(--green);">
+        <span class="v" id="hdrsatnum">0</span>
+      </span>
+    </div>
+    <div id="hdrcolorwrap" style="display:none">
+      <div class="row" style="flex-wrap:wrap">
+        <span class="k"></span>
+        <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;"
+               title="NVIDIA-style vibrance on top of RTX HDR: boosts colours hue-safely, muted ones most">
+          <input type="checkbox" id="hdrdynvib" style="width:auto;padding:0;accent-color:var(--green);">
+          RTX Dynamic Vibrance
+        </label>
+        <span id="hdrsbwrap" style="display:inline-flex;align-items:center;gap:8px;"
+              title="uniform extra saturation from the vibrance filter, independent of RTX HDR's Saturation; 0 = none">
+          <span class="hint">Saturation boost</span>
+          <input id="hdrsb" type="range" min="0" max="100" step="5" value="50" class="defmark"
+                 style="width:100px;padding:0;border:0;accent-color:var(--green);">
+          <span class="v" id="hdrsbnum">50</span>
+        </span>
+        <span id="hdrvibwrap" style="display:inline-flex;align-items:center;gap:8px;"
+              title="strength of the muted-colour boost; saturated colours and skin stay put">
+          <span class="hint">Intensity</span>
+          <input id="hdrvib" type="range" min="0" max="100" step="5" value="50" class="defmark"
+                 style="width:100px;padding:0;border:0;accent-color:var(--green);">
+          <span class="v" id="hdrvibnum">50</span>
+        </span>
+      </div>
     </div>
     <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
       <div class="row" style="margin:0 0 6px">
@@ -151,7 +200,7 @@
     <div id="hdrpreview" style="display:none;margin-top:6px">
       <div style="display:flex;align-items:center;gap:8px">
         <div style="flex:1;text-align:center;min-width:0">
-          <div class="hint" style="margin-bottom:4px">Original</div>
+          <div class="hint" id="prevoriglabel" style="margin-bottom:4px">Original</div>
           <div id="prevorigwrap" style="overflow:hidden;border-radius:6px;position:relative">
             <img id="prevorig" alt="original frame" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
             <div id="prevorigspin" style="display:none;position:absolute;align-items:center;justify-content:center;pointer-events:none"><div class="spinwheel"></div></div>
@@ -240,7 +289,13 @@ async function loadVideo(f){
   if(p.error){ alert('Could not read video: '+p.error); return; }
   const s = (p.streams||[])[0] || {};
   info = { fps: s.r_frame_rate, w: s.width, h: s.height, nb: +(s.nb_frames||0),
-           dur: +((p.format||{}).duration||0), codec: s.codec_name };
+           dur: +((p.format||{}).duration||0), codec: s.codec_name,
+           transfer: s.color_transfer || '' };
+  info.srcHdr = info.transfer === 'smpte2084' || info.transfer === 'arib-std-b67';
+  // TrueHDR converts SDR only; for an HDR source the engine carries the HDR through untouched.
+  $('rtxhdr').disabled = info.srcHdr;
+  $('rtxhdrhint').textContent = info.srcHdr ? '(source is already HDR, carried through as-is)'
+                                            : '(convert SDR video to HDR)';
   $('info').style.display='block';
   $('res').textContent = s.width+' x '+s.height;
   $('fps').textContent = srcFps().toFixed(3);
@@ -357,6 +412,10 @@ function syncUpscale(){
 }
 function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.value === 'screen');
   if(o) o.textContent = 'Match screen' + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
+// NOTE: the element id is outcodec, NOT codec - id "codec" is taken by the source-codec info span.
+const savedCodec = localStorage.getItem('codec');
+if(savedCodec && [...$('outcodec').options].some(o => o.value === savedCodec)) $('outcodec').value = savedCodec;
+$('outcodec').onchange = () => localStorage.setItem('codec', $('outcodec').value);
 const savedUpres = localStorage.getItem('upres');
 if(savedUpres && [...$('upres').options].some(o => o.value === savedUpres)) $('upres').value = savedUpres;
 const savedUpcustom = localStorage.getItem('upcustom'); if(savedUpcustom) $('upcustom').value = savedUpcustom;
@@ -429,6 +488,7 @@ ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); s
 const _fs = require('fs');
 let prevTotal = 0, prevIdx = 0, prevHist = [];
 function sharpStrength(){ return $('sharpen').checked ? (parseFloat($('sharpval').value) || 0) : 0; }
+function hdrOn(){ return $('rtxhdr').checked && rtxReady.hdr && !(info && info.srcHdr); }
 function setPrevImg(el, file){
   const old = el.dataset.url; if(old){ try { URL.revokeObjectURL(old); } catch {} }
   const url = URL.createObjectURL(new Blob([_fs.readFileSync(file)], { type: 'image/png' }));
@@ -440,16 +500,21 @@ function updatePrevNav(){          // back only makes sense once a second frame 
 }
 function syncPreview(){            // the preview panel appears once a video is loaded
   $('previewpanel').style.display = input ? '' : 'none';
+  syncHdrColor();                  // HDR colour controls track the HDR toggle / readiness / source
 }
 let prevBusy = false, prevPending = null;   // serialize renders; rapid setting changes coalesce
+let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown / mid-render preview
+function prevSettingsSig(){                 // everything that changes what the processed pane shows
+  const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
+  return [sharpStrength(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon()];
+}
 let lastPrevInput = null;                    // which video the shown original belongs to
-let lastPrevKey = '', inflightPrevKey = '';  // dedupe: what is shown / what is rendering right now
 async function loadPreview(frame){
   if(!input) return;
   if(prevBusy){ prevPending = (frame == null ? 'mid' : frame); return; }
   prevBusy = true;
-  const hdr = $('rtxhdr').checked && rtxReady.hdr, sharpen = sharpStrength();
-  inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame), sharpen, hdr]);
+  const hdr = hdrOn(), sharpen = sharpStrength(), sig = prevSettingsSig();
+  inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame)].concat(sig));
   $('hdrpreview').style.display = 'block';
   if($('prevproc').clientHeight < 40) $('prevprocwrap').style.minHeight = '120px';  // spinner space on first load
   setSpin($('prevprocwrap'), $('prevspin'), true);
@@ -461,8 +526,9 @@ async function loadPreview(frame){
     if($('prevorig').clientHeight < 40) $('prevorigwrap').style.minHeight = '120px';
     setSpin($('prevorigwrap'), $('prevorigspin'), true);
   }
-  let r; try { r = await ipcRenderer.invoke('preview', { input, frame: (frame == null ? 'mid' : frame),
-    sharpen, hdr, nits: 1000, color: 'vivid', vividness: 1, saturation: 0 }); }
+  let r; try { r = await ipcRenderer.invoke('preview', Object.assign(
+    { input, frame: (frame == null ? 'mid' : frame), sharpen, hdr, nits: 1000,
+      vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon() }, hdrColorPayload())); }
   catch(e){ r = { error: String(e) }; }
   setSpin($('prevprocwrap'), $('prevspin'), false);
   $('prevprocwrap').style.minHeight = '';
@@ -477,13 +543,16 @@ async function loadPreview(frame){
   setPrevImg($('prevorig'), r.original);
   setPrevImg($('prevproc'), r.processed);
   lastPrevInput = input;
-  lastPrevKey = JSON.stringify([input, prevIdx, sharpen, hdr]);
+  lastPrevKey = JSON.stringify([input, prevIdx].concat(sig));
   const active = hdr || sharpen > 0;
+  const srcHdr = !!(info && info.srcHdr);
+  $('prevoriglabel').textContent = srcHdr ? 'Original (HDR, tonemapped)' : 'Original';
   $('prevproclabel').textContent = !active ? 'Unchanged'
     : 'Processed' + (hdr && sharpen > 0 ? ' (HDR + FSR)' : hdr ? ' (HDR, tonemapped)' : ' (FSR sharpen)');
   $('prevlabel').textContent = 'frame ' + prevIdx + (prevTotal ? ' / ' + prevTotal : '');
-  $('prevnote').textContent = (!active ? 'no FSR or RTX HDR enabled, the output will match the source'
-    : hdr ? 'HDR is cyan-corrected and tonemapped to show on this SDR screen'
+  $('prevnote').textContent = (srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
+    : !active ? 'no FSR or RTX HDR enabled, the output will match the source'
+    : hdr ? 'HDR is tonemapped to show on this SDR screen'
     : 'FSR sharpening is subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
 }
 function randFrame(){ return prevTotal > 1 ? Math.floor(Math.random() * prevTotal) : 'mid'; }
@@ -491,7 +560,7 @@ function refreshPreviewIfOpen(){           // re-render the shown frame when sha
   if(!input) return;
   syncPreview();
   const frame = prevHist.length ? prevHist[prevHist.length - 1] : 'mid';
-  const key = JSON.stringify([input, frame, sharpStrength(), $('rtxhdr').checked && rtxReady.hdr]);
+  const key = JSON.stringify([input, frame].concat(prevSettingsSig()));
   // Skip when the effective settings already match what is shown (or what is mid-render), so the
   // checkbox handler and checkRtxReady's async refresh don't double-render the same state.
   if(key === (prevBusy ? inflightPrevKey : lastPrevKey)) return;
@@ -505,6 +574,62 @@ $('prevnext').onclick = async () => { await loadPreview(randFrame()); prevHist.p
 $('prevprev').onclick = async () => { if(prevHist.length > 1){ prevHist.pop(); updatePrevNav(); await loadPreview(prevHist[prevHist.length - 1]); } };
 $('sharpval').addEventListener('change', refreshPreviewIfOpen);
 $('sharpen').addEventListener('change', refreshPreviewIfOpen);
+
+// RTX HDR colour controls: Colour mode (Faithful = vivid 1.0, the accurate default; NVIDIA vivid =
+// the rtx mode where the Saturation slider behaves like real RTX TrueHDR but hue-corrected), plus a
+// Vibrance boost for muted colours. The engine's raw mode (the unmodified model output, cyan cast
+// and all) is deliberately NOT offered here - it is a known-defective rendition kept at the CLI
+// (--hdr-color raw) as a debug/reference only.
+function hdrColorPayload(){
+  // The RTX HDR Saturation slider spans true-to-source (-100) to NVIDIA-max (+100), always
+  // hue-corrected: above -100 it drives NVIDIA's TrueHDR saturation via the rtx colour mode.
+  // At -100 (SDK 0) it routes to the exact source-chroma path: the rtx safety floor (per-pixel
+  // max against the source) would otherwise leave a small excess (~0.33/255 mean pixel diff).
+  const sat = sdkSat();
+  if(sat > 0) return { color: 'rtx', saturation: sat };
+  return { color: 'vivid', saturation: 0 };   // Saturation at -100 = true to source, exact
+}
+// The Dynamic Vibrance sliders belong to that feature: both are 0 when it is switched off, and
+// the feature at 0/0 is identity (NVIDIA convention, verified in the App).
+function effVibrance(){ return $('hdrdynvib').checked ? (+$('hdrvib').value || 0) / 100 : 0; }
+function effSatBoost(){ return $('hdrdynvib').checked ? (+$('hdrsb').value || 0) / 100 : 0; }
+function syncHdrColor(){
+  const showHdr = $('rtxhdr').checked && rtxReady.hdr && !(info && info.srcHdr);
+  $('hdrtonewrap').style.display = showHdr ? 'inline-flex' : 'none';  // RTX HDR's own Contrast + Saturation
+  $('hdrcolorwrap').style.display = showHdr ? '' : 'none';
+  // RTX HDR's sliders are always live; the Dynamic Vibrance sliders belong to that feature and sit
+  // greyed out until it is switched on (unchecked = no vibrance, like the App).
+  $('hdrcon').disabled = false;
+  $('hdrsat').disabled = false;
+  const on = $('hdrdynvib').checked;
+  $('hdrsb').disabled = !on;
+  $('hdrvib').disabled = !on;
+  $('hdrconnum').textContent = $('hdrcon').value;
+  $('hdrsatnum').textContent = $('hdrsat').value;
+  $('hdrsbnum').textContent = $('hdrsb').value;
+  $('hdrvibnum').textContent = $('hdrvib').value;
+}
+// Display scales mirror the NVIDIA App's RTX HDR filter (-100..100, 0 = NVIDIA default); the
+// engine keeps the TrueHDR SDK scales (0..200, 100 neutral).
+function sdkCon(){ return 100 + (+$('hdrcon').value || 0); }
+function sdkSat(){ return 100 + (+$('hdrsat').value || 0); }
+const savedDynVib = localStorage.getItem('dynVib');       // vibrance on/off (gates its two sliders)
+if(savedDynVib === '1') $('hdrdynvib').checked = true;
+const savedHdrSat = localStorage.getItem('hdrSatApp');   // App scale -100..100 (older keys orphaned)
+if(savedHdrSat !== null) $('hdrsat').value = savedHdrSat;
+const savedHdrCon = localStorage.getItem('hdrCon'); if(savedHdrCon !== null) $('hdrcon').value = savedHdrCon;
+const savedHdrSB = localStorage.getItem('hdrSB'); if(savedHdrSB !== null) $('hdrsb').value = savedHdrSB;
+const savedHdrVib = localStorage.getItem('hdrVib'); if(savedHdrVib !== null) $('hdrvib').value = savedHdrVib;
+$('hdrdynvib').onchange = () => { localStorage.setItem('dynVib', $('hdrdynvib').checked ? '1' : '0'); syncHdrColor(); refreshPreviewIfOpen(); };
+$('hdrsat').oninput = () => { localStorage.setItem('hdrSatApp', $('hdrsat').value); $('hdrsatnum').textContent = $('hdrsat').value; };
+$('hdrsat').addEventListener('change', refreshPreviewIfOpen);
+$('hdrcon').oninput = () => { localStorage.setItem('hdrCon', $('hdrcon').value); $('hdrconnum').textContent = $('hdrcon').value; };
+$('hdrcon').addEventListener('change', refreshPreviewIfOpen);
+$('hdrsb').oninput = () => { localStorage.setItem('hdrSB', $('hdrsb').value); $('hdrsbnum').textContent = $('hdrsb').value; };
+$('hdrsb').addEventListener('change', refreshPreviewIfOpen);
+$('hdrvib').oninput = () => { localStorage.setItem('hdrVib', $('hdrvib').value); $('hdrvibnum').textContent = $('hdrvib').value; };
+$('hdrvib').addEventListener('change', refreshPreviewIfOpen);
+syncHdrColor();
 
 // 1:1 zoom: the pane shrinks 1080p+ frames ~6x, which visually erases sharpening, so clicking either
 // image toggles both to native pixels inside scrollable boxes with mirrored scrolling for A/B compare.
@@ -586,7 +711,7 @@ $('go').onclick = () => {
   const dims = upDims();                               // upscale target ({w,h} or null)
   const factor = upFactor();                           // arbitrary upscale factor (0 = off)
   const useRtxVsr = factor > 0 && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale, else bicubic
-  const rtxhdr = $('rtxhdr').checked && rtxReady.hdr;  // HDR only when its runtime is installed
+  const rtxhdr = hdrOn();  // HDR only when its runtime is installed and the source is SDR
   // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
   // HDR is on. Bail only when nothing at all is enabled.
   if(!interpOn() && sharpenStrength <= 0 && factor <= 0 && !rtxhdr){
@@ -599,7 +724,7 @@ $('go').onclick = () => {
   const srcFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
   totalGen = Math.max(1, Math.round(srcFrames*fpp));   // total frames the conversion will output
   cancelled = false;
-  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
+  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('cancel').disabled = false;
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -614,9 +739,16 @@ $('go').onclick = () => {
   const payload = { input, multi:+$('multi').value, output: lastOut, interp: interpOn() };
   if(interpOn() && useFps) payload.fps = t;
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
+  payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)
   if(factor > 0) payload.upscale = factor;             // arbitrary upscale factor (target height / source)
   if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else bicubic)
-  if(rtxhdr){ payload.rtxhdr = true; }   // HDR10; engine masters at a fixed 1000-nit peak
+  if(rtxhdr){ payload.rtxhdr = true;     // HDR10; engine masters at a fixed 1000-nit peak
+    const hp = hdrColorPayload();        // zero-strength Dynamic Vibrance routes to the source path
+    payload.hdrcolor = hp.color;                                   // vivid (default) / rtx
+    payload.hdrsat = hp.saturation;                                // SDK Saturation (rtx mode)
+    payload.hdrcon = sdkCon();                                     // SDK Contrast (100 = neutral)
+    payload.hdrsb = effSatBoost();                                 // vibrance uniform gain (0..1)
+    payload.hdrvib = effVibrance(); }
   ipcRenderer.send('run', payload);
 };
 $('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
@@ -664,7 +796,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
 });
 ipcRenderer.on('engine-done', (_e, code) => {
   clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('interp').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=false; $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('interp').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n'); }
   else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen+'  (100%)';

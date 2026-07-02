@@ -37,7 +37,18 @@ function createWindow() {
   win.loadFile(path.join(ROOT, 'renderer', 'index.html'));
 }
 
-app.whenReady().then(createWindow);
+// Single instance only. A second launch shares this profile dir, and Chromium's disk/GPU cache and
+// Local Storage locks (held by the first instance) make the second window come up empty ("Unable to
+// move the cache: Access is denied", "Gpu Cache Creation failed"); it would also fight the first
+// instance over the preview PNGs and the TRT cache. So a second launch focuses the running window.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); }
+  });
+  app.whenReady().then(createWindow);
+}
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
@@ -61,7 +72,7 @@ ipcMain.handle('pick-output', async (_e, defaultPath?: string) => {
 ipcMain.handle('probe', async (_e, file: string) => {
   return new Promise((resolve) => {
     execFile(FFPROBE, ['-v', 'error', '-select_streams', 'v:0',
-      '-show_entries', 'stream=width,height,r_frame_rate,codec_name,nb_frames',
+      '-show_entries', 'stream=width,height,r_frame_rate,codec_name,nb_frames,color_transfer',
       '-show_entries', 'format=duration', '-of', 'json', file],
       (err, stdout) => {
         if (err) { resolve({ error: String(err) }); return; }
@@ -206,8 +217,10 @@ ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
 
 let current: ChildProcess | null = null;
 
-ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; interp?: boolean; upscale?: number; rtxvsr?: boolean; rtxhdr?: boolean }) => {
+ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; interp?: boolean; upscale?: number; rtxvsr?: boolean; rtxhdr?: boolean; codec?: string; hdrcolor?: string; hdrsat?: number; hdrcon?: number; hdrsb?: number; hdrvib?: number }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
+  // Output codec family (hevc default / av1 / vvc); the engine owns encoder pick + fallbacks.
+  if (opts.codec && opts.codec !== 'hevc') args.push('--codec', opts.codec);
   // Interpolation is the default; interp === false means the user only wants the sharpen pass,
   // so tell the engine to skip frame generation (and ignore any fps/multi) entirely.
   if (opts.interp === false) args.push('--no-interp');
@@ -230,6 +243,16 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
   // knob; it falls back to an SDR render if the bridge is unavailable.
   if (opts.rtxhdr) {
     args.push('--rtx-hdr');
+    // HDR colour controls: mode (vivid default / rtx / raw), the SDK Saturation (drives rtx and raw
+    // modes; inert in vivid), and the vibrance boost (vivid/rtx modes).
+    if (opts.hdrcolor && opts.hdrcolor !== 'vivid') {
+      args.push('--hdr-color', opts.hdrcolor);
+      if (typeof opts.hdrsat === 'number') args.push('--hdr-saturation', String(opts.hdrsat));
+    }
+    if (opts.hdrvib && opts.hdrvib > 0) args.push('--hdr-vibrance', String(opts.hdrvib));
+    if (opts.hdrsb && opts.hdrsb > 0) args.push('--hdr-satboost', String(opts.hdrsb));
+    // RTX HDR tone curve (SDK 0..200, 100 = neutral; the GUI shows the App's -100..100 scale).
+    if (typeof opts.hdrcon === 'number' && opts.hdrcon !== 100) args.push('--hdr-contrast', String(opts.hdrcon));
   }
   // PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from crashing the engine
   // during first-run TRT builds; SMV_TRT_CACHE is a guaranteed writable cache location.
@@ -255,7 +278,7 @@ ipcMain.on('cancel', () => {
 // fixed prefix is reused each call (the renderer cache-busts its img src) so previews never pile up.
 // Resolves with { error } instead when the frame or the RTX bridge is unavailable.
 ipcMain.handle('preview', (_e, opts: { input: string; frame?: number | string; sharpen?: number;
-    hdr?: boolean; nits?: number; color?: string; saturation?: number; vividness?: number }) => {
+    hdr?: boolean; nits?: number; color?: string; saturation?: number; vibrance?: number; satboost?: number; contrast?: number }) => {
   return new Promise((resolve) => {
     const dir = path.join(app.getPath('userData'), 'preview');
     try { fs.mkdirSync(dir, { recursive: true }); } catch { /* already exists */ }
@@ -263,8 +286,9 @@ ipcMain.handle('preview', (_e, opts: { input: string; frame?: number | string; s
     const args = ['-u', PREVIEW_SCRIPT, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
     if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
     if (opts.hdr) args.push('--rtx-hdr', '--hdr-nits', String(opts.nits ?? 1000),
-      '--hdr-color', String(opts.color ?? 'vivid'), '--hdr-vividness', String(opts.vividness ?? 1),
-      '--hdr-saturation', String(opts.saturation ?? 0));
+      '--hdr-color', String(opts.color ?? 'vivid'),
+      '--hdr-saturation', String(opts.saturation ?? 0), '--hdr-vibrance', String(opts.vibrance ?? 0),
+      '--hdr-satboost', String(opts.satboost ?? 0), '--hdr-contrast', String(opts.contrast ?? 100));
     const env = { ...process.env, PYTHONUTF8: '1' };
     execFile(pyExe(), args, { cwd: ENGINE, env }, (err, stdout, stderr) => {
       if (err) { resolve({ error: String(stderr || err).slice(-400) }); return; }

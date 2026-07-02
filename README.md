@@ -25,12 +25,12 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   favour of a fixed 1000-nit master. See HDR mastering.
 - **Faithful & vivid HDR colour (cyan/teal fixed).** The blue/teal cast in RTX HDR output was
   root-caused to the **TrueHDR model itself** rotating hues (it greens the blues even at Saturation 0);
-  SMV's decode, interpolation and encode were each proven colour-faithful. The fix keeps TrueHDR's
-  luminance (the HDR expansion) but rebuilds colour from the SDR source's hue in ICtCp (BT.2100), with a
-  hue-linear chroma gain `--hdr-vividness` (default **1.0 = faithful**, cyan removed; >1 adds pop with no
-  hue shift, ~1.5 vibrant). Measured A/B: the model adds no real colourfulness at Saturation 0 - it mostly
-  rotates hue - so richness comes from the source; `--hdr-vividness` is the de-facto saturation slider and
-  the SDK Saturation knob is inert in this mode. `raw` restores the unmodified model colour. See HDR mastering.
+  SMV's decode, interpolation and encode were each proven colour-faithful. The default `vivid` mode keeps
+  TrueHDR's luminance (the HDR expansion) but rebuilds colour from the SDR source's hue AND chroma in
+  ICtCp (BT.2100): faithful colour, cyan removed, and the SDK Saturation knob is inert (the model's
+  chroma is dropped entirely; measured A/B, the model adds no real colourfulness at Saturation 0, it
+  mostly rotates hue). Colour pop comes from the `rtx` mode and `--hdr-vibrance` instead. `raw` restores
+  the unmodified model colour. See HDR mastering.
 - **HDR10 mastering primaries default to Display P3.** The injected `mdcv` now carries P3 / D65 (the
   real grading gamut, and a faithful bound for SDR-sourced HDR), so a player reports real chromaticities
   like other HDR masters instead of collapsing to the nominal BT.2020 name. Selected by colorspace
@@ -42,9 +42,29 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   cu13, validated end to end (eager, RTX HDR, TensorRT), and the distributable zip was rebuilt on cu13
   (`npm run dist`). See Setup.
 
+**Recent (2026-06-28):**
+- **Output codec selector (HEVC / AV1 / H.266).** A **Codec** dropdown picks the output family:
+  HEVC (`hevc_nvenc`, the default), AV1 (`av1_nvenc`, hardware encode on RTX 40/50), or H.266/VVC
+  (CPU `libvvenc`, the best compression of the three, slow, limited player support, always 10-bit).
+  Hardware picks degrade gracefully (no NVENC session falls back to CPU `libsvtav1`; a missing
+  `libvvenc` falls back to HEVC). RTX HDR works with all three, and the injected HDR10 static
+  metadata is codec-agnostic (verified `mdcv`/`clli` inside an `av01` sample entry).
+- **HDR sources handled properly.** Dropping an already-HDR file (PQ or HLG transfer) now: keeps
+  interpolation/sharpening/upscaling working as before with the source HDR signalling carried
+  through untouched; disables the RTX HDR toggle (TrueHDR is an SDR-to-HDR model, and the engine
+  also guards the CLI flag, skipping the conversion with a notice); and tonemaps the preview pane
+  for display, PQ shown raw used to read flat and washed out.
+- **Single-instance app.** Launching SmoothMyVideo while it is already running no longer opens an
+  empty second window. Both instances shared one Chromium profile, and the disk/GPU cache and Local
+  Storage locks held by the first left the second renderer blank ("Unable to move the cache: Access
+  is denied", "Gpu Cache Creation failed", captured from a live repro); a second instance would also
+  fight the first over the preview PNGs and the TRT cache. A second launch now just focuses the
+  running window (`app.requestSingleInstanceLock`).
+- **Cleanup.** The clean-machine second-PC test was retired as an open item and the old cu12
+  rollback runtime (`engine/runtime_cu12_bak`) was deleted; the cu13 stack has been validated end
+  to end on the dev box across eager, TensorRT, RTX VSR/HDR, all three codecs and the packaged zip.
+
 **Software stack updates still pending:**
-- **Clean-machine test on CUDA 13.** The cu13 runtime (and the RTX `cudart64_12.dll` bundling) were
-  validated on the dev box but not yet on a separate PC (the long-standing open item).
 - **Optional torch bump.** Stable torch 2.12.1+cu130 is the current pick; 2.13/2.14 nightly cu130
   exist but there is no reason to move yet.
 
@@ -379,16 +399,15 @@ engine does the four things a production HDR10 deliverable is made of:
 1. **Encode PQ / BT.2020, 10-bit.** TrueHDR outputs BT.2020 PQ (SMPTE 2084); the encode is `main10` /
    `p010le` with the colour signalling stamped via `setparams` (NVENC drops the bare `-color_*`
    transfer / primaries otherwise).
-2. **Keep the source colour (hue locked, saturation on a dial).** The default `vivid` mode rebuilds
-   colour in ICtCp (BT.2100): it keeps TrueHDR's luminance (the HDR expansion) but takes the **hue** from
-   the colorimetric SDR source and scales the source **chroma** by `--hdr-vividness`
-   (`RTXVideo._ictcp_correct`). Scaling Ct/Cp uniformly preserves the hue angle, so this is a hue-linear
-   saturation control: **1.0 (default) = faithful** colour with the cyan rotation removed, >1 adds pop
-   (~1.5 vibrant, 2.0 strong) with no hue shift. Why a source-driven gain and not the SDK's own knob: even
-   at Saturation 0 the model rotates hues (greens the blues, so skies and snow read cyan/teal) *and* adds
-   no real colourfulness, so its chroma is dropped entirely - which also makes the SDK `--hdr-saturation`
-   inert in `vivid` (it only affects `raw`). `raw` emits TrueHDR's colour unmodified. Accurate hue at full
-   HDR brightness, on by default.
+2. **Keep the source colour (hue and chroma locked).** The default `vivid` mode rebuilds colour in
+   ICtCp (BT.2100): it keeps TrueHDR's luminance (the HDR expansion) but takes the **hue and chroma**
+   from the colorimetric SDR source (`RTXVideo._ictcp_correct`), so the picture keeps exactly the
+   source's colours at HDR brightness. Why not the SDK's own knob: even at Saturation 0 the model
+   rotates hues (greens the blues, so skies and snow read cyan/teal) *and* adds no real colourfulness,
+   so its chroma is dropped entirely - which also makes the SDK `--hdr-saturation` inert in `vivid`.
+   Pop, when wanted, comes from `--hdr-color rtx` (NVIDIA's saturation, hue-corrected) and
+   `--hdr-vibrance`. `raw` emits TrueHDR's colour unmodified. Accurate hue at full HDR brightness, on
+   by default.
 3. **Master to a fixed peak, set once.** `--hdr-nits` (default 1000) is the mastering peak the PQ
    values are shaped to, not a per-monitor knob. 1000 is the consumer standard; 4000 is premium.
 4. **Write the mastering metadata.** `mdcv` (mastering-display: Display P3 / D65 by default, the
@@ -420,10 +439,9 @@ For whoever picks this up.
   shift survived a no-interpolation render, isolating it to the model. TrueHDR exposes no hue / white
   balance knob, so the fix keeps its per-pixel luminance and **transplants the source chromaticity** in
   ICtCp (BT.2100, `RTXVideo._ictcp_correct`): about 78% of the cast removed (+0.048 to +0.011), the
-  residual being 4:2:0 chroma subsampling on the p010 encode. This is the default `vivid` mode at
-  `--hdr-vividness 1.0`; >1 adds a hue-linear saturation gain on top (the model adds no real chroma at
-  Saturation 0, so richness comes from the source, and the SDK Saturation knob is dropped). `raw` keeps
-  the old model colour. Note: an earlier "viewing transform, not the pipeline" reading was
+  residual being 4:2:0 chroma subsampling on the p010 encode. This is the default `vivid` mode (the
+  model adds no real chroma at Saturation 0, so nothing of value is lost by dropping the SDK Saturation
+  knob along with the model's hue-rotated chroma). `raw` keeps the old model colour. Note: an earlier "viewing transform, not the pipeline" reading was
   **wrong** - it judged the neutral white point normalized by green, which hides a green shift; the
   shift is hue-dependent and shows in saturated blues, which is why the mountains looked teal.
 
@@ -503,11 +521,11 @@ For whoever picks this up.
   resolution (see the FSR bullet for why that order is the quality-correct one).
   The HDR **peak brightness** (TrueHDR `MaxLuminance`) defaults to 1000 nits (the SDK allows
   400..2000, on the GUI slider / `--hdr-nits`). This is the **mastering peak**: a target the picture
-  is graded to *once*, not a per-viewer setting. Colour saturation is handled by `--hdr-vividness` in the
-  default `vivid` mode (a source-chroma gain in ICtCp, 1.0 = faithful, >1 for pop), **not** the SDK
-  Saturation - which is dropped along with the rest of the model's hue-rotated chroma. The SDK
-  `--hdr-saturation` (0..200, default 0, ranges in `nvsdk_ngx_defs_truehdr.h`) and Contrast / MiddleGray
-  (SDK neutral 100 / 50) therefore only affect `raw` mode now.
+  is graded to *once*, not a per-viewer setting. The default `vivid` mode keeps the source's own
+  saturation (the model's hue-rotated chroma is dropped, so the SDK Saturation is inert there); colour
+  pop comes from `--hdr-color rtx` (where the SDK `--hdr-saturation`, 0..200, ranges in
+  `nvsdk_ngx_defs_truehdr.h`, drives NVIDIA's saturation hue-corrected) and from `--hdr-vibrance`.
+  Contrast / MiddleGray stay at the SDK neutral 100 / 50.
   **HDR10 static metadata is written** (`engine/hdr10_meta.py`): the mastering-display colour volume
   (BT.2020 primaries, D65 white, the chosen peak) and the content light level (MaxCLL / MaxFALL
   **measured** from the actual frames) are stamped into the mp4 as the `mdcv` / `clli` boxes after the
@@ -612,17 +630,29 @@ For whoever picks this up.
   newer hardware - not a code change.
 - **Smaller ffmpeg.** `engine/bin` uses static builds (about 174 MB each). A shared ffmpeg
   build would shrink the bundle by a couple hundred MB at the cost of carrying its DLLs.
-- **RTX-faithful Saturation slider (verified, not yet wired).** Today the default `vivid` mode
-  rebuilds chroma from the SDR source, so NVIDIA's TrueHDR Saturation slider is inert and
-  `--hdr-vividness` is the de-facto control. A proposed `rtx` colour mode would route the SDK
-  Saturation through the ICtCp hue-lock instead: take the chroma magnitude from TrueHDR (so the
-  slider responds exactly like RTX TrueHDR) and the hue from the source (so the cyan/teal cast
-  stays fixed), floored at the source chroma so low settings never go flatter than SDR. Verified
-  2026-06-27 on `samples/test.mp4`: across SDK Saturation 0 to 200 the corrected mean ICtCp chroma
-  tracks raw TrueHDR (0.044 to 0.056, versus raw 0.038 to 0.056) while blue hue stays locked at the
-  source 217 degrees at every setting (raw sits at about 199). Gives the "RTX HDR minus the cyan
-  cast" experience with the familiar slider; keep the current source-chroma `vivid` as the accurate
-  faithful preset.
+- **HDR colour controls in the GUI (final layout 2026-07-02).** Two features, mirroring the NVIDIA
+  App's two separate filters, each with NVIDIA's own control names, App display scales, and a small
+  red tick marking the default position on every slider:
+  **RTX HDR** - inline right of its checkbox: **Contrast** and **Saturation**, both -100..100 with 0 =
+  NVIDIA's default (the TrueHDR SDK scales 0..200 internally). Saturation is hue-corrected end to
+  end: above -100 it drives NVIDIA's own TrueHDR saturation via the engine's `rtx` colour mode
+  (chroma magnitude from the model, floored at the source, hue locked to the source so the cyan/teal
+  cast is gone); at exactly -100 it routes to the source-chroma path (`vivid`), bit-exact true to
+  source (the rtx floor would otherwise leave ~0.33/255 mean pixel difference). Default 0 = NVIDIA's
+  out-of-box HDR look, hue-corrected; verified chroma tracks the SDK knob (0.044 to 0.056 across the
+  range) with blue hue locked at the source 217 degrees (raw model sits at ~199).
+  **RTX Dynamic Vibrance** - a checkbox with **Saturation boost** and **Intensity** to its right
+  (both 0..100, defaults 50/50 as read off a fresh filter in the NVIDIA App 2026-07-02), greyed out
+  until the feature is on, and inert at 0/0 (NVIDIA convention: the filter at zero strength changes
+  nothing). NVIDIA's actual Dynamic Vibrance is a live game filter, not part of the RTX Video SDK,
+  so this is SMV's hue-safe ICtCp analog stacking on top of whatever RTX HDR produced: Saturation
+  boost (`--hdr-satboost`, 0..1 = +0..100%) is a uniform chroma gain, independent of RTX HDR's
+  Saturation exactly like NVIDIA's two separate filters (verified uniform: low- and high-chroma
+  pixels gain 1.498x/1.499x at 0.5, hue drift under 0.02 degrees); Intensity (`--hdr-vibrance`)
+  weights the boost toward muted colours (1.79x low-chroma versus 1.40x high-chroma at full, skin
+  protected). All persisted, passed to renders, picked up live by the preview pane, and RTX VSR
+  always runs at the SDK's maximum quality (level 4, Ultra). The engine's `raw` mode (the unmodified
+  model output, cyan cast and all) stays CLI-only (`--hdr-color raw`) as a debug/reference.
 - **Before and after preview pane in the GUI (v2 done).** Shipped 2026-06-27, reworked 2026-06-28: a
   fast single-frame engine path (`engine/preview.py`), a `main.ts` `preview` IPC handler (returns the
   two PNG paths plus frame index and count), and a Preview panel above Smooth It in
@@ -637,9 +667,8 @@ For whoever picks this up.
   selected (no button), shows a spinner over the processed image while a render is in flight, labels
   the result "Unchanged" when neither FSR nor RTX HDR is enabled (that case copies the frame straight
   through without importing torch, about 0.4 s), and serializes renders so rapid slider changes
-  coalesce instead of overlapping. Remaining: extend the preview to the VSR/upscale pass, and have it
-  pick up the Saturation/vibrance controls once those land (it currently previews the default HDR
-  colour).
+  coalesce instead of overlapping. The pane follows the HDR Colour/Saturation/Vibrance controls live
+  (2026-06-28). Remaining: extend the preview to the VSR/upscale pass.
 
 History (already done): the build was made portable by bundling a relocatable
 python-build-standalone runtime (replacing a non relocatable venv) and a static ffmpeg
@@ -660,7 +689,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vividness V] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -681,12 +710,12 @@ runtime), otherwise a bicubic resize. `--rtx-hdr` converts the output to HDR10 (
 via the RTX Video TrueHDR model, and `--hdr-nits N` sets the mastering peak luminance (400..2000,
 default 1000); the output also gets HDR10 static metadata (mastering-display plus measured
 MaxCLL/MaxFALL, written by `engine/hdr10_meta.py`) so one file tone-maps to any display.
-`--hdr-color` picks colour handling (default `vivid`: keep TrueHDR's luminance, lock hue to the SDR
-source, and scale chroma in ICtCp by `--hdr-vividness`, default 1.0 = faithful, >1 for pop with no hue
-shift - the de-facto saturation slider, so the SDK `--hdr-saturation` is inert here; `rtx`: drive
+`--hdr-color` picks colour handling (default `vivid`: keep TrueHDR's luminance, take the SDR source's
+hue AND chroma in ICtCp - faithful colour, and the SDK `--hdr-saturation` is inert here; `rtx`: drive
 saturation with the SDK `--hdr-saturation` like real RTX TrueHDR but hue-corrected (TrueHDR's chroma
 magnitude, source hue, floored at source) so the familiar NVIDIA slider works without the cyan cast;
-`raw` emits TrueHDR's colour unmodified), and
+`raw` emits TrueHDR's colour unmodified, a debug/reference mode with the cyan cast, CLI only and
+deliberately not offered in the GUI), and
 `--hdr-mastering-prim {display-p3,dci-p3,bt2020,bt709}` sets the `mdcv` mastering gamut by colorspace
 name (default display-p3, metadata only).
 The per-frame order is upscale (RTX VSR or bicubic), then RCAS sharpen at the
