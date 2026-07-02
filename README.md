@@ -78,12 +78,17 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   upscale with NVIDIA AI, otherwise it is a bicubic resize. The **Interpolate** toggle (on by
   default) is the master switch for frame generation: untick it to *only* sharpen / upscale the
   video, keeping the source frame rate (the multiplier / fps / match-screen controls grey out and
-  the engine skips the GMFSS model entirely). An opt-in **NVIDIA RTX** panel adds real RTX Video
-  Super Resolution and **RTX HDR** (SDR to HDR10, with a peak-brightness slider); both are off by
-  default and unlock once the RTX Video runtime is installed (a one-click in-app installer, see
-  NVIDIA RTX). **Cancel** kills the running job; **Open folder** reveals the result. The last used
-  folder, multiplier, sharpen, upscale resolution, interpolate, match-screen, RTX and HDR settings
-  are remembered between sessions.
+  the engine skips the GMFSS model entirely). A **Codec** selector picks the output codec: HEVC
+  (default, GPU), AV1 (GPU) or H.266/VVC (CPU). An opt-in **NVIDIA RTX** panel adds real RTX Video
+  Super Resolution and **RTX HDR** (SDR to HDR10) with App-style **Contrast** and **Saturation**
+  sliders, plus an **RTX Dynamic Vibrance** filter (**Saturation boost** / **Intensity**); all off
+  by default and unlocked once the RTX Video runtime is installed (a one-click in-app installer,
+  see NVIDIA RTX). A **Preview** pane above Smooth It shows original versus processed on real
+  frames (random-frame stepper, click an image for 1:1 pixels) and follows every spatial setting
+  live. **Cancel** kills the running job; **Open folder** reveals the result. The last used folder,
+  multiplier, sharpen, codec, upscale resolution, interpolate, match-screen, RTX and HDR settings
+  are remembered between sessions, and are wiped once automatically when a new build changes their
+  storage format (a stored settings-schema version guards against stale-key conflicts).
 - Progress: a bar that starts at the source frame count and fills to the post process
   total, plus a live frame counter and an ETA.
 - Output: written beside the source as `<name>_<fps>fps.mp4` (or a custom path chosen
@@ -667,8 +672,10 @@ For whoever picks this up.
   selected (no button), shows a spinner over the processed image while a render is in flight, labels
   the result "Unchanged" when neither FSR nor RTX HDR is enabled (that case copies the frame straight
   through without importing torch, about 0.4 s), and serializes renders so rapid slider changes
-  coalesce instead of overlapping. The pane follows the HDR Colour/Saturation/Vibrance controls live
-  (2026-06-28). Remaining: extend the preview to the VSR/upscale pass.
+  coalesce instead of overlapping. The pane follows every HDR colour control live (2026-06-28) and,
+  since 2026-07-02, the Upscale / RTX VSR setting too: the processed side runs upscale (RTX VSR, or
+  bicubic when the runtime is absent), then RCAS at the output resolution, then HDR, exactly the
+  render's order, so the 1:1 zoom shows real output pixels. Nothing remains outstanding for the pane.
 
 History (already done): the build was made portable by bundling a relocatable
 python-build-standalone runtime (replacing a non relocatable venv) and a static ffmpeg

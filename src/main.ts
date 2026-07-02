@@ -278,13 +278,18 @@ ipcMain.on('cancel', () => {
 // fixed prefix is reused each call (the renderer cache-busts its img src) so previews never pile up.
 // Resolves with { error } instead when the frame or the RTX bridge is unavailable.
 ipcMain.handle('preview', (_e, opts: { input: string; frame?: number | string; sharpen?: number;
-    hdr?: boolean; nits?: number; color?: string; saturation?: number; vibrance?: number; satboost?: number; contrast?: number }) => {
+    hdr?: boolean; nits?: number; color?: string; saturation?: number; vibrance?: number; satboost?: number; contrast?: number;
+    upscale?: number; rtxvsr?: boolean }) => {
   return new Promise((resolve) => {
     const dir = path.join(app.getPath('userData'), 'preview');
     try { fs.mkdirSync(dir, { recursive: true }); } catch { /* already exists */ }
     const prefix = path.join(dir, 'frame');
     const args = ['-u', PREVIEW_SCRIPT, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
     if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
+    if (opts.upscale && opts.upscale > 1) {
+      args.push('--upscale', String(opts.upscale));
+      if (opts.rtxvsr) args.push('--rtx-vsr');
+    }
     if (opts.hdr) args.push('--rtx-hdr', '--hdr-nits', String(opts.nits ?? 1000),
       '--hdr-color', String(opts.color ?? 'vivid'),
       '--hdr-saturation', String(opts.saturation ?? 0), '--hdr-vibrance', String(opts.vibrance ?? 0),

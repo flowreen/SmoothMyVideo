@@ -14,7 +14,9 @@ the whole preview dim and washed out, because the brightest HDR highlight was dr
 down.) RCAS runs on the CPU when HDR is off, so a sharpen-only preview never touches CUDA, and when neither
 sharpen nor HDR is requested the frame is copied straight through without even importing torch (the
 GUI auto-loads a preview on every video select, so the do-nothing case stays instant and the pane
-labels it "Unchanged").
+labels it "Unchanged"). --upscale (with optional --rtx-vsr) runs the spatial upscale first, exactly
+like a render: upscale to the output resolution, RCAS there, HDR last; VSR degrades to bicubic when
+the RTX runtime is absent, mirroring the engine.
 
 HDR sources: when the input itself is already HDR (PQ transfer), TrueHDR is skipped, it is an
 SDR-to-HDR model and the engine skips it for HDR sources too; sharpening still applies (on the
@@ -105,8 +107,10 @@ def _tonemap(lin2020, src_rgb_u8):
     s = src_rgb_u8.astype(np.float32) / 255.0
     lin_s = np.where(s <= 0.04045, s / 12.92, np.power((s + 0.055) / 1.055, 2.4))
     ls, lh = _lum709(lin_s), _lum709(lin709)
-    m = ls > 1e-4                                # anchor on lit content; skip black borders
-    k = (float(np.median(ls[m])) / max(1e-9, float(np.median(lh[m])))) if m.any() else 1.0
+    # Per-image lit-content masks: the HDR frame may be at the upscaled output resolution while the
+    # SDR reference stays at source resolution, so one shared mask cannot index both.
+    ms, mh = ls > 1e-4, lh > 1e-6
+    k = (float(np.median(ls[ms])) / max(1e-9, float(np.median(lh[mh])))) if (ms.any() and mh.any()) else 1.0
     return _shoulder_srgb(lin709 * k)
 
 
@@ -123,21 +127,17 @@ def _tonemap_pq(rgb_u8):
     return _shoulder_srgb(lin709 * k)
 
 
-def _hdr_process(t, args):
-    """[1,3,H,W] SDR tensor on CUDA -> packed x2rgb10le bytes via RTX TrueHDR at the given settings."""
+def _make_rtx(w, h, ow, oh, need_vsr, need_hdr, args):
+    """One RTX Video instance for whatever the preview needs (VSR to ow x oh and/or TrueHDR at
+    ow x oh), configured exactly like the render engine's. Raises if the bridge/runtime is absent."""
     import rtxvideo
-    h, w = t.shape[2], t.shape[3]
-    rtx = rtxvideo.RTXVideo(
-        w, h, w, h, vsr=False, hdr=True, hdr_max_nits=max(400, min(2000, args.hdr_nits)),
+    return rtxvideo.RTXVideo(
+        w, h, ow, oh, vsr=need_vsr, hdr=need_hdr, hdr_max_nits=max(400, min(2000, args.hdr_nits)),
         hdr_contrast=max(0, min(200, args.hdr_contrast)),
         hdr_saturation=max(0, min(200, args.hdr_saturation)),
         hdr_middlegray=max(10, min(100, args.hdr_middlegray)),
         hdr_color=args.hdr_color, hdr_vibrance=max(0.0, min(1.0, args.hdr_vibrance)),
         hdr_satboost=max(0.0, min(1.0, args.hdr_satboost)))
-    try:
-        return rtx.run_hdr(t)
-    finally:
-        rtx.close()
 
 
 def main():
@@ -148,6 +148,10 @@ def main():
                     help="output prefix; writes <out>_original.png and <out>_processed.png")
     ap.add_argument("--rtx-hdr", action="store_true", help="convert the processed frame to HDR (tonemapped)")
     ap.add_argument("--sharpen", type=float, default=0.0, help="FSR RCAS sharpen strength 0..1")
+    ap.add_argument("--upscale", type=float, default=1.0,
+                    help="spatial upscale factor for the processed side (1 = off, clamped to 8)")
+    ap.add_argument("--rtx-vsr", action="store_true",
+                    help="use RTX Video Super Resolution for --upscale (falls back to bicubic)")
     ap.add_argument("--hdr-nits", type=int, default=1000)
     ap.add_argument("--hdr-color", choices=["vivid", "rtx", "raw"], default="vivid")
     ap.add_argument("--hdr-vibrance", type=float, default=0.0)
@@ -163,25 +167,49 @@ def main():
     transfer = _src_transfer(args.input)
     src_hdr = transfer in ("smpte2084", "arib-std-b67")
     do_hdr = args.rtx_hdr and not src_hdr   # TrueHDR is SDR-to-HDR; the engine skips it on HDR sources
+    h0, w0 = bgr.shape[0], bgr.shape[1]
+    up = max(1.0, min(8.0, args.upscale))
+    ow, oh = ((round(w0 * up) // 2) * 2, (round(h0 * up) // 2) * 2) if up > 1.0 else (w0, h0)
+    vsr_used = False
 
-    if strength > 0 or do_hdr:
+    if strength > 0 or do_hdr or up > 1.0:
         import torch                       # heavy import, skipped entirely on the unchanged fast path
         from rcas import rcas              # the render engine's own FSR RCAS kernel
-        # Same order as a render (to_bytes): RCAS first (on the decoded pixels, PQ-encoded ones
-        # included, exactly as the render sharpens), HDR last. CPU when HDR is off.
-        dev = "cuda" if do_hdr else "cpu"
+        need_vsr = up > 1.0 and args.rtx_vsr
+        dev = "cuda" if (do_hdr or need_vsr) else "cpu"
         t = torch.from_numpy(rgb_u8).to(dev).float().div(255.0).permute(2, 0, 1).unsqueeze(0).contiguous()
-        if strength > 0:
-            t = rcas(t, strength)
-        if do_hdr:
-            packed = _hdr_process(t, args)
-            u = np.frombuffer(packed, "<u4").reshape(bgr.shape[0], bgr.shape[1])
-            code = np.stack([(u >> 20) & 1023, (u >> 10) & 1023, u & 1023], -1).astype(np.float32) / 1023.0
-            import rtxvideo
-            lin = rtxvideo._pq_to_linear(torch.from_numpy(code)).numpy()
-            proc_rgb = _tonemap(lin, rgb_u8)
-        else:
-            proc_rgb = (t[0].permute(1, 2, 0).clamp(0, 1).mul(255).round().to(torch.uint8).cpu().numpy())
+        rtx = None
+        if need_vsr or do_hdr:
+            try:
+                rtx = _make_rtx(w0, h0, ow, oh, need_vsr, do_hdr, args)
+            except Exception:  # noqa: BLE001 - like the render: no bridge means bicubic + SDR
+                rtx, do_hdr, need_vsr = None, False, False
+        try:
+            # Same order as a render (to_bytes): upscale, then RCAS at the OUTPUT resolution, then HDR.
+            if up > 1.0:
+                if rtx is not None and need_vsr:
+                    try:
+                        t = rtx.run_vsr(t)
+                        vsr_used = True
+                    except Exception:  # noqa: BLE001 - degrade to bicubic like the render does
+                        pass
+                if not vsr_used:
+                    import torch.nn.functional as tf
+                    t = tf.interpolate(t, size=(oh, ow), mode="bicubic", align_corners=False).clamp(0.0, 1.0)
+            if strength > 0:
+                t = rcas(t, strength)
+            if do_hdr and rtx is not None:
+                packed = rtx.run_hdr(t)
+                u = np.frombuffer(packed, "<u4").reshape(oh, ow)
+                code = np.stack([(u >> 20) & 1023, (u >> 10) & 1023, u & 1023], -1).astype(np.float32) / 1023.0
+                import rtxvideo
+                lin = rtxvideo._pq_to_linear(torch.from_numpy(code)).numpy()
+                proc_rgb = _tonemap(lin, rgb_u8)
+            else:
+                proc_rgb = (t[0].permute(1, 2, 0).clamp(0, 1).mul(255).round().to(torch.uint8).cpu().numpy())
+        finally:
+            if rtx is not None:
+                rtx.close()
     else:
         proc_rgb = rgb_u8                  # nothing enabled: the render would leave the frame as is
 
@@ -197,8 +225,8 @@ def main():
     p_orig, p_proc = args.out + "_original.png", args.out + "_processed.png"
     cv2.imwrite(p_orig, cv2.cvtColor(orig_disp, cv2.COLOR_RGB2BGR))
     cv2.imwrite(p_proc, cv2.cvtColor(proc_disp, cv2.COLOR_RGB2BGR))
-    sys.stdout.write(f"preview frame {idx}/{n} {bgr.shape[1]}x{bgr.shape[0]} hdr={int(do_hdr)} "
-                     f"sharpen={strength:g} srchdr={int(src_hdr)} -> {p_orig} | {p_proc}\n")
+    sys.stdout.write(f"preview frame {idx}/{n} {ow}x{oh} hdr={int(do_hdr)} sharpen={strength:g} "
+                     f"srchdr={int(src_hdr)} up={up:g} vsr={int(vsr_used)} -> {p_orig} | {p_proc}\n")
 
 
 if __name__ == "__main__":
