@@ -122,7 +122,7 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   (anime is drawn on twos), and the ffmpeg decode and encode run on background reader and
   writer threads so pipe I/O overlaps GPU work.
 - Bundled: a relocatable Python 3.14 runtime (torch cu130 / CUDA 13 + cupy) at `engine/runtime`,
-  and a static ffmpeg (NVENC plus a CPU SVT-AV1 fallback) at `engine/bin`. Both ship inside
+  and a shared-build ffmpeg (NVENC plus a CPU SVT-AV1 fallback) at `engine/bin`. Both ship inside
   the zip; the app uses neither system Python nor system ffmpeg.
 - Launch: Desktop and Start menu shortcuts, a no console `SmoothMyVideo.vbs`, and a
   custom icon.
@@ -179,8 +179,9 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   rebuilt, since only one weight set has ever shipped.
 - `engine/runtime/` - bundled relocatable Python (python-build-standalone CPython 3.14)
   with the full GPU stack installed (torch cu130 / CUDA 13, cupy-cuda13x, nvidia cu13 wheels). Gitignored, see Setup.
-- `engine/bin/` - bundled static `ffmpeg.exe` + `ffprobe.exe` (built with `hevc_nvenc`)
-  plus their license. Gitignored, see Setup.
+- `engine/bin/` - bundled shared-build `ffmpeg.exe` + `ffprobe.exe` (built with `hevc_nvenc`)
+  plus the FFmpeg DLLs both exes load (one copy of `avcodec` and friends instead of two
+  static embeddings) and their license. Gitignored, see Setup.
 - `engine/GMFSS_Fortuna/` - GMFSS model code (inference chain only) plus `train_log/`
   weights (gitignored, see Setup).
 - `engine/benchmark.py` - speed benchmark; appends a dated entry to `BENCHMARKS.md`.
@@ -221,12 +222,13 @@ relocatable and breaks on a machine that lacks that exact Python. python-build-s
 is self contained, which is what makes the bundle portable.
 
 **3. ffmpeg into `engine/bin`**
-Download a static Windows ffmpeg that includes `hevc_nvenc` (e.g.
+Download a shared Windows ffmpeg that includes `hevc_nvenc` (e.g.
 [BtbN FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases),
-`ffmpeg-master-latest-win64-lgpl.zip`) and copy `bin\ffmpeg.exe` and `bin\ffprobe.exe`
-into `engine\bin`. The app prefers these and only falls back to ffmpeg/ffprobe on PATH,
-so for local dev you can skip this if you already have ffmpeg installed; it must be
-present for a portable `npm run dist`.
+`ffmpeg-master-latest-win64-lgpl-shared.zip`) and copy `bin\ffmpeg.exe`, `bin\ffprobe.exe`
+and all the `bin\*.dll` files into `engine\bin` (skip `ffplay.exe`). A static build's two
+exes also work but nearly triple the size. The app prefers these and only falls back to
+ffmpeg/ffprobe on PATH, so for local dev you can skip this if you already have ffmpeg
+installed; it must be present for a portable `npm run dist`.
 
 **4. GMFSS weights into `engine/GMFSS_Fortuna/train_log`**
 The weights (feat, flownet, fusionnet, metric, rife pkl files) are gitignored because
@@ -542,10 +544,35 @@ For whoever picks this up.
   times. (Honesty note: measured within-pair shimmer of interpolating noise pairs was ~zero at
   2x, so the quality argument is stability insurance, not a visible fix.) `--no-near-dup`
   disables it; `SMV_SCENE_DEBUG=1` prints the per-pair block metric alongside the cut metrics.
-  Still open: this is not a full de judder - truly smoothing on twos motion needs duplicate
-  removal plus retiming so the real motion is spread evenly to the target fps, a larger feature
-  worth its own pass. (The cut signal ended up flow-based rather than the frame-difference idea
-  sketched here earlier; see the scene change bullet.)
+  The full de-judder this bullet used to leave open is **done (2026-07-03)** and **on by
+  default** (`--no-dejudder` opts out): a run of duplicates (one drawing, up to 4
+  frames - twos, threes, fours) and the next distinct frame are interpolated as a SINGLE span,
+  emitting the very same output slots at the very same times but with timesteps spread evenly
+  across the span, so the motion advances a constant amount per output frame instead of
+  freezing and jumping at the source's own cadence. Measured on a twos-cadence fixture (a box
+  moving 8 px per drawing, 2x): apparent per-frame motion goes from the classic 0/2/4/2 px
+  steps (the source judder, delta std 1.42) to ~2 px every single frame (std 0.46, no zero
+  frames, no spikes); threes content, `--fps` mode and noisy near-duplicate runs measure the
+  same evenness. Safeguards, each verified: runs longer than 4 frames are true stills and hold
+  exactly as before (a 12-frame still measured zero motion in both paths - an intentional hold
+  is never smeared into a slow morph, and the decision is sticky to the run's real end, so a
+  long still is never retimed from its middle); a scene cut detected on a span holds each side
+  with the sharp change on the very same output frame as the classic path (mean-luma trace
+  jumps 62 -> 174 in one step, no blend frames); frame count and duration are untouched by
+  construction (a retimed span emits the identical slot grid). `--no-dejudder` opts out for
+  anyone who wants the animator's deliberate twos/threes pacing preserved instead of uniform
+  motion; there is deliberately no GUI knob - the app exists to smooth, so smoothing the
+  duplicates is simply what a render does (it briefly shipped as an opt-in checkbox before
+  being made the default the same day). The cost of the default is small - much less than the
+  slot count suggests (measured only ~1.3x slower at 16x on twos content: one `reuse()`, the
+  expensive GMFlow half, is shared across each span where the per-pair path ran one per
+  pair). Mixed-cadence
+  shots (characters on twos and threes in one scene) never form global duplicate runs and
+  simply interpolate the classic way - the same graceful degradation MultiPassDedup documents;
+  DRBA's per-pixel Distance-Ratio-Map timestep control (which preserves the original pacing
+  rather than flattening it) remains the heavier alternative if pacing-preserving
+  interpolation is ever wanted. (The cut signal ended up flow-based rather than the
+  frame-difference idea sketched here earlier; see the scene change bullet.)
 - **Sharper generated frames (free half done).** The free half is fixed: `to_tensor` and
   `to_bytes` now pad to the next multiple of 64 the model needs and crop the padding back,
   instead of resizing the whole frame up a fraction and back with bilinear. No real pixel is
@@ -754,8 +781,17 @@ For whoever picks this up.
   correct, non-regressing cleanups (2 also keeps the TRT default-stream warning fixed). Further speed would
   need a smaller/faster model, lower precision with accepted quality loss (fails for this flow model), or
   newer hardware - not a code change.
-- **Smaller ffmpeg.** `engine/bin` uses static builds (about 174 MB each). A shared ffmpeg
-  build would shrink the bundle by a couple hundred MB at the cost of carrying its DLLs.
+- **Smaller ffmpeg (done 2026-07-03).** `engine/bin` now bundles the BtbN LGPL **shared** build
+  (small `ffmpeg.exe`/`ffprobe.exe` plus one set of FFmpeg DLLs next to them; `ffplay.exe` left
+  out): 137 MB versus the old two ~174 MB static exes' 332 MB, a 195 MB saving that came
+  entirely from no longer embedding two copies of libavcodec and friends. Verified end to end
+  from the bundled location: all four encoders probe clean (`hevc_nvenc`, `av1_nvenc`,
+  `libsvtav1`, `libvvenc`), the sample renders 2x in HEVC / AV1 / VVC (Main 10, 50 frames,
+  structure identical to the static-build renders), and the worst-case HDR-into-MKV two-stage
+  finalize carries every track and the value-exact HDR10 side data. One engine fix rode along:
+  newer FFmpeg removed the deprecated underscore NVENC aliases, so the encode args now use
+  `-spatial-aq`/`-temporal-aq` (dash forms, accepted for years, so older PATH ffmpegs keep
+  working).
 - **HDR colour controls in the GUI (final layout 2026-07-02).** Two features, mirroring the NVIDIA
   App's two separate filters, each with NVIDIA's own control names, App display scales, and a small
   red tick marking the default position on every slider:
@@ -799,8 +835,9 @@ For whoever picks this up.
   render's order, so the 1:1 zoom shows real output pixels. Nothing remains outstanding for the pane.
 
 History (already done): the build was made portable by bundling a relocatable
-python-build-standalone runtime (replacing a non relocatable venv) and a static ffmpeg
-(replacing the bare `ffmpeg`/`ffprobe` PATH dependency). The distributable is a **zip, not
+python-build-standalone runtime (replacing a non relocatable venv) and a bundled ffmpeg
+(replacing the bare `ffmpeg`/`ffprobe` PATH dependency; static at first, the shared build
+since 2026-07-03). The distributable is a **zip, not
 an NSIS installer**: `makensis` cannot memory map an app archive this large (about 2.4 GB),
 so the installer target was dropped.
 
@@ -817,7 +854,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--no-scene-detect] [--no-near-dup] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--no-scene-detect] [--no-near-dup] [--no-dejudder] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -837,6 +874,11 @@ sources only; the output never drops below the source depth, and HDR and VVC are
 detection under What can be done next for how it works and the calibration numbers).
 `--no-near-dup` disables near-duplicate holding (on by default: repeats that differ only by
 compression noise are held like exact duplicates; see Duplicate frame handling).
+`--no-dejudder` disables de-judder retiming (on by default: runs of duplicate frames - anime
+drawn on twos/threes - are retimed together with the next distinct frame as one interpolation
+span, spreading the real motion evenly across the output instead of holding then jumping;
+long stills and scene cuts still hold; see Duplicate frame handling for the measurements and
+safeguards). Disabling preserves the source's own cadence.
 `--no-passthrough` disables track passthrough (on by default: all audio/subtitle tracks,
 chapters and fonts are copied, switching the default output to .mkv when the tracks need it;
 see the Tracks bullet under Passthrough quality).
