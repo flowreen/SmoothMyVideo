@@ -101,11 +101,11 @@
     <div class="row">
       <span class="k">Codec</span>
       <select id="outcodec">
-        <option value="hevc">HEVC &middot; H.265 (GPU, recommended)</option>
-        <option value="av1">AV1 (GPU)</option>
-        <option value="vvc">H.266 &middot; VVC (CPU, slow)</option>
+        <option value="hevc">HEVC &middot; H.265 &middot; GPU &middot; plays everywhere (recommended)</option>
+        <option value="av1">AV1 &middot; GPU &middot; royalty-free, best for web playback</option>
+        <option value="vvc">H.266 &middot; VVC &middot; CPU &middot; much smaller file, slow, few players</option>
       </select>
-      <span class="hint">output video codec; audio is copied</span>
+      <span class="hint" id="codechint"></span>
     </div>
     <div class="row"><span class="k">Saves to</span>
       <button id="changeout" class="mini" disabled>Change...</button>
@@ -290,8 +290,9 @@ function syncFpsField(){ if(info) $('fpsin').value = Math.round(srcFps()*(+$('mu
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
   const d = upDims();                                   // upscale target ({w,h} or null); tag the new height
   const res = d ? '_' + d.h + 'p' : '';
-  return interpOn() ? (b + '_' + Math.round(targetFps()) + 'fps' + res + '.mp4')
-                    : (b + (d ? res : '_sharpened') + '.mp4'); }
+  const ext = (info && info.needMkv) ? '.mkv' : '.mp4';   // subtitles/extra tracks ride in mkv
+  return interpOn() ? (b + '_' + Math.round(targetFps()) + 'fps' + res + ext)
+                    : (b + (d ? res : '_sharpened') + ext); }
 function refresh(){ if(!input) return;
   const t = targetFps();
   if(!fpsValid(t)){ $('out').textContent = 'enter an output fps between 1 and 1000'; lastOut = null; return; }
@@ -304,10 +305,18 @@ async function loadVideo(f){
   const p = await ipcRenderer.invoke('probe', f);
   // A modal alert would stall an unattended batch, so mid-batch probe failures go to the log.
   if(p.error){ if(batchAuto) log('>> Could not read '+f+': '+p.error+'\n'); else alert('Could not read video: '+p.error); return false; }
-  const s = (p.streams||[])[0] || {};
+  const streams = p.streams || [];
+  const s = streams.find(x => x.codec_type === 'video') || streams[0] || {};
+  // Track passthrough: subtitles or mp4-incompatible audio push the output container to .mkv
+  // (mirrors the engine's own MP4_AUDIO_OK rule, so the name shown matches what it writes).
+  const MP4A = ['aac','ac3','eac3','mp3','alac','opus','flac'];
+  const auds = streams.filter(x => x.codec_type === 'audio');
+  const subs = streams.filter(x => x.codec_type === 'subtitle');
   info = { fps: s.r_frame_rate, w: s.width, h: s.height, nb: +(s.nb_frames||0),
            dur: +((p.format||{}).duration||0), codec: s.codec_name,
-           transfer: s.color_transfer || '' };
+           transfer: s.color_transfer || '',
+           nAud: auds.length, nSub: subs.length,
+           needMkv: subs.length > 0 || auds.some(a => !MP4A.includes((a.codec_name||'').toLowerCase())) };
   info.srcHdr = info.transfer === 'smpte2084' || info.transfer === 'arib-std-b67';
   // TrueHDR converts SDR only; for an HDR source the engine carries the HDR through untouched.
   $('rtxhdr').disabled = info.srcHdr;
@@ -317,7 +326,9 @@ async function loadVideo(f){
   $('res').textContent = s.width+' x '+s.height;
   $('fps').textContent = srcFps().toFixed(3);
   const d=info.dur|0; $('dur').textContent = (d/3600|0)+':'+String((d%3600/60|0)).padStart(2,'0')+':'+String(d%60).padStart(2,'0');
-  $('codec').textContent = s.codec_name || '?';
+  $('codec').textContent = (s.codec_name || '?')
+    + (info.nAud > 1 || info.nSub ? '  ·  ' + info.nAud + ' audio · ' + info.nSub
+       + ' subtitle' + (info.nSub === 1 ? '' : 's') + ' (kept' + (info.needMkv ? ', MKV output)' : ')') : '');
   $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true; $('play').disabled = true;
   $('live').style.display = 'none';   // stale live thumbnail belongs to the previous video
   $('status').textContent = 'Ready. Pick a multiplier or fps, then click Smooth It!';
@@ -442,9 +453,19 @@ function syncUpscale(){
 function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.value === 'screen');
   if(o) o.textContent = 'Match screen' + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
 // NOTE: the element id is outcodec, NOT codec - id "codec" is taken by the source-codec info span.
+// Per-choice guidance so the trade-off is clear without leaving the dropdown. Size claims are
+// from a real A/B at the engine's verified visually-lossless settings (2026-07-03 tuning:
+// HEVC CQ17 2.35 MB / AV1 CQ22 2.04 MB / VVC QP20 0.73 MB on the same interpolated sample).
+const CODEC_HINTS = {
+  hevc: 'safest choice: TVs, phones, editors and players all take it; audio is copied',
+  av1:  'same GPU speed and size class as HEVC (a bit smaller on normal content); royalty-free, plays in every modern browser, but devices from before ~2020 may not decode it',
+  vvc:  'smallest files of the three (down to a third of HEVC), but the CPU encode is slow and almost no player supports H.266 yet (archival)',
+};
+function syncCodec(){ $('codechint').textContent = CODEC_HINTS[$('outcodec').value] || ''; }
 const savedCodec = localStorage.getItem('codec');
 if(savedCodec && [...$('outcodec').options].some(o => o.value === savedCodec)) $('outcodec').value = savedCodec;
-$('outcodec').onchange = () => localStorage.setItem('codec', $('outcodec').value);
+$('outcodec').onchange = () => { localStorage.setItem('codec', $('outcodec').value); syncCodec(); };
+syncCodec();
 const savedUpres = localStorage.getItem('upres');
 if(savedUpres && [...$('upres').options].some(o => o.value === savedUpres)) $('upres').value = savedUpres;
 const savedUpcustom = localStorage.getItem('upcustom'); if(savedUpcustom) $('upcustom').value = savedUpcustom;

@@ -98,7 +98,8 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   would only bloat it). The output is 10 bit (`p010le` / `main10`) whatever the source depth, so
   the float-precision interpolated frames never get re-quantised to 8 bit levels (which is what
   bands gradients like skies and glows); the source colour signalling is carried through, and
-  original audio is copied. With
+  every audio track, subtitle track (translations), chapter and font attachment is copied too
+  (the output becomes .mkv automatically when the tracks need it; see Passthrough quality). With
   no usable NVENC it falls back automatically to CPU SVT-AV1, still visually lossless (see
   Passthrough quality).
 - Batch: pick or drop several files at once and they queue, rendering back to back with the
@@ -401,10 +402,38 @@ From the ffprobe of the input the engine sets:
 - **Colour.** The source matrix, transfer, primaries and range are stamped on with a
   `setparams` filter (NVENC drops transfer and primaries from the bare `-color_*` output
   flags), so bt2020 / PQ / HLG HDR signalling survives the round trip.
-- **Quality.** Always visually lossless, no knob. On NVENC: constant quality VBR around CQ 17
-  (CQ 20 for AV1), the visually lossless point from the linked H.264 guide, with AQ on and a
-  small chroma QP boost. On the `libsvtav1` fallback: CRF 20 at preset 8, SVT-AV1's visually
-  lossless range. Audio is always copied.
+- **Quality.** Always visually lossless, no knob. On NVENC: constant quality VBR with AQ on and
+  a small chroma QP boost; the values were **verified and tuned against a lossless 8K master
+  (2026-07-03)** with frame-aligned VMAF/PSNR/SSIM. HEVC **CQ 17** is the quality reference:
+  VMAF 99.78 / 57.0 dB / SSIM 0.9986 (worst frame 55.1 dB). AV1's CQ scale is not HEVC's - the
+  old CQ 20 measured *higher* fidelity than the reference at larger size, so AV1 now runs
+  **CQ 22**: still above the reference on every metric (VMAF 99.84 / 58.2 dB / SSIM 0.9988) at
+  ~13% smaller files (CQ 23 dips just below the reference, so 22 is the sweet spot). VVC had
+  the thinnest margin, so it moved from QP 21 to **QP 20**: VMAF 99.82 / 51.3 dB / SSIM 0.9966
+  at ~5% more bits, still under a third of the HEVC size. All three sit far past the ~95 VMAF
+  transparency bar and the SSIM >= 0.995 visually lossless target on both mean and worst frame.
+  One conditional: vvenc's perceptual QP adaptation (QPA) INVERTS on high-fps interpolated
+  streams - it saves ~27% on normal content but bloated a 360fps render enough to make VVC
+  *larger* than HEVC at 8K - so the engine switches QPA off above 120 fps output (measured 46%
+  smaller there, both variants above the standards; a stderr note says when). On the
+  `libsvtav1` fallback: CRF 20 at preset 8, SVT-AV1's visually lossless range. Audio is
+  always copied.
+- **Tracks (translations passthrough, 2026-07-03).** Every audio track, subtitle track, the
+  chapter list and font attachments are copied into the output (the old behaviour - first audio
+  only, everything else dropped - is `--no-passthrough`). Container rule: mp4 cannot hold styled
+  ASS/PGS subtitles or some audio codecs, so the default output name switches to **.mkv**
+  whenever the source has subtitles or mp4-incompatible audio (anything outside
+  aac/ac3/eac3/mp3/alac/opus/flac); an explicitly chosen `.mp4` path keeps mp4 and drops the
+  incompatible tracks with a notice. `mov_text` subtitles (mp4-native) are converted to SRT for
+  mkv since they cannot be stream-copied. Verified on a worst-case fixture (jpn+eng audio,
+  styled ASS sub, font attachment, chapters): all tracks and language tags survive into the
+  interpolated .mkv; plain single-audio mp4 sources behave exactly as before. HDR renders that
+  land in .mkv keep the full HDR10 static metadata too, via a two-stage finalize: the video is
+  encoded to a temp .mp4, the `mdcv`/`clli` boxes are injected there (the injector is
+  ISOBMFF-only), and a stream-copy remux merges it with the source's tracks into the final .mkv -
+  ffmpeg maps the boxes onto Matroska's NATIVE `MasteringMetadata`/`MaxCLL` elements (verified
+  value-exact: MaxCLL/MaxFALL, P3 primaries and the 1000-nit peak all survive). For comparison,
+  Topaz Video AI drops subtitles entirely; Flowframes copies audio+subs like this does.
 
 The bundled ffmpeg is the BtbN **lgpl** build, which has no `libx264`/`libx265`, so the
 software fallback uses `libsvtav1` (SVT-AV1: true CRF, clean 8 and 10 bit) rather than an
@@ -637,9 +666,13 @@ For whoever picks this up.
   dialog gained `multiSelections`), no engine change. Folder picking is not a separate mode:
   multi-select inside the folder (Ctrl+A) covers it.
 - **AV1 and H.266/VVC output codecs (done 2026-06-28).** `--codec {hevc,av1,vvc}` plus the GUI
-  **Codec** dropdown. `av1` uses the Blackwell hardware encoder (`av1_nvenc`, CQ 20, smaller than
-  HEVC at the same visually lossless quality; CPU `libsvtav1` fallback), `vvc` uses CPU `libvvenc`
-  (QP 21 preset fast, always 10-bit `yuv420p10le` - its only input format - muxed with
+  **Codec** dropdown (labels + a per-choice hint spell out the trade-offs since 2026-07-03).
+  `av1` uses the Blackwell hardware encoder (`av1_nvenc`, CQ 22 since the 2026-07-03 tuning; CPU
+  `libsvtav1` fallback) - at the verified visually lossless settings it now measures slightly
+  SMALLER than HEVC on the sample (2.04 vs 2.35 MB) while still exceeding HEVC's fidelity, and
+  its other pitch is being royalty-free and decodable in every modern browser; `vvc` measured
+  ~3.2x smaller (0.73 MB) and uses CPU `libvvenc`
+  (QP 20 preset fast, always 10-bit `yuv420p10le` - its only input format - muxed with
   `-strict experimental`, falling back to HEVC when libvvenc is absent). The HDR10 `mdcv`/`clli`
   box injection is codec agnostic. Validated: AV1 SDR bt709, AV1 HDR PQ with boxes, VVC SDR 10-bit.
   HEVC stays the default for player compatibility.
@@ -784,7 +817,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--no-scene-detect] [--no-near-dup] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--no-scene-detect] [--no-near-dup] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -804,6 +837,9 @@ sources only; the output never drops below the source depth, and HDR and VVC are
 detection under What can be done next for how it works and the calibration numbers).
 `--no-near-dup` disables near-duplicate holding (on by default: repeats that differ only by
 compression noise are held like exact duplicates; see Duplicate frame handling).
+`--no-passthrough` disables track passthrough (on by default: all audio/subtitle tracks,
+chapters and fonts are copied, switching the default output to .mkv when the tracks need it;
+see the Tracks bullet under Passthrough quality).
 `--upscale F` spatially upscales every
 output frame by an arbitrary factor `F` (e.g. `2.0`, or `1.5`, ...) just before encode,
 leaving decode and interpolation at the source resolution; it is off at `1.0` unless given

@@ -64,17 +64,21 @@ ipcMain.handle('pick-video', async (_e, defaultPath?: string) => {
 });
 
 ipcMain.handle('pick-output', async (_e, defaultPath?: string) => {
+  // One combined filter so the dialog keeps whichever extension the default name carries
+  // (.mkv when the passthrough tracks need it, .mp4 otherwise).
   const r = await dialog.showSaveDialog(win!, {
     defaultPath,
-    filters: [{ name: 'MP4 video', extensions: ['mp4'] }],
+    filters: [{ name: 'Video', extensions: ['mp4', 'mkv'] }],
   });
   return r.canceled ? null : (r.filePath || null);
 });
 
 ipcMain.handle('probe', async (_e, file: string) => {
+  // All streams (not just v:0): the renderer needs the audio/subtitle track list to decide
+  // whether the passthrough output must be .mkv (subtitles / mp4-incompatible audio).
   return new Promise((resolve) => {
-    execFile(FFPROBE, ['-v', 'error', '-select_streams', 'v:0',
-      '-show_entries', 'stream=width,height,r_frame_rate,codec_name,nb_frames,color_transfer',
+    execFile(FFPROBE, ['-v', 'error',
+      '-show_entries', 'stream=codec_type,width,height,r_frame_rate,codec_name,nb_frames,color_transfer',
       '-show_entries', 'format=duration', '-of', 'json', file],
       (err, stdout) => {
         if (err) { resolve({ error: String(err) }); return; }

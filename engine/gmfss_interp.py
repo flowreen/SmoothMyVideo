@@ -36,7 +36,7 @@ generated frame. Duration therefore matches the source.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
-       [--out-bits {8,10}] [--no-scene-detect] [--no-near-dup]
+       [--out-bits {8,10}] [--no-scene-detect] [--no-near-dup] [--no-passthrough]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
@@ -113,6 +113,12 @@ ap.add_argument("--codec", choices=["hevc", "av1", "vvc"], default="hevc",
                      "vvc: H.266 via CPU libvvenc (best compression, slow, limited player support; "
                      "always 10-bit). The NVENC choices fall back to CPU libsvtav1 when no usable "
                      "session exists; vvc falls back to HEVC if libvvenc is absent.")
+ap.add_argument("--no-passthrough", action="store_true",
+                help="disable track passthrough. By default EVERY audio track, subtitle track "
+                     "(translations), chapter list and font attachment is copied into the output, "
+                     "and the container switches from mp4 to mkv automatically when the tracks "
+                     "need it (styled ASS/PGS subtitles, exotic audio codecs). With this flag the "
+                     "output is always mp4 with only the first audio track, the old behaviour.")
 ap.add_argument("--no-near-dup", action="store_true",
                 help="disable near-duplicate detection. By default a pair whose frames differ only "
                      "by compression noise (anime drawn on twos/threes re-encoded lossily, so held "
@@ -180,6 +186,7 @@ SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output fra
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
 SCENE_DETECT = not args.no_scene_detect      # hold frames across true cuts instead of morphing
 NEAR_DUP = not args.no_near_dup              # hold noise-only pairs like exact duplicates
+PASSTHROUGH = not args.no_passthrough        # copy all audio/subtitle/chapter/font tracks through
 UPSCALE_F = max(1.0, min(16.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
                                              # RTX VSR has no integer-scale limit (probed clean to
                                              # 16K), so any factor is allowed up to a 16x sanity cap
@@ -259,8 +266,37 @@ elif FPS_MODE:
 else:
     rate_str = f"{num * args.multi}/{den}"
     out_label = int(round(src_fps * args.multi))
+# --- track passthrough (translations) --------------------------------------------------------
+# The output used to be mp4 with only the first audio track: every subtitle track, extra audio
+# language, chapter list and font attachment was silently dropped. With PASSTHROUGH (default)
+# they are all copied through. Container rule: mp4 cannot hold styled ASS/PGS subtitles or some
+# audio codecs, so the DEFAULT output name switches to .mkv whenever the source has subtitles or
+# mp4-incompatible audio; an EXPLICIT output path keeps its extension and the mapping adapts
+# (subtitles/exotic audio are dropped from an explicit .mp4, with a notice). mov_text subtitles
+# (mp4-native) cannot be *copied* into mkv, so those streams are converted to SRT.
+MP4_AUDIO_OK = {"aac", "ac3", "eac3", "mp3", "alac", "opus", "flac"}   # flac/opus verified in this build
+MKV_SUB_COPY_OK = {"ass", "ssa", "subrip", "srt", "hdmv_pgs_subtitle", "dvd_subtitle", "webvtt"}
+AUD_STREAMS, SUB_STREAMS, HAS_ATTACH = [], [], False   # (input-1 absolute index, codec) per stream
+if PASSTHROUGH:
+    try:
+        _ts = json.loads(subprocess.check_output(
+            [FFPROBE, "-v", "error", "-show_entries", "stream=index,codec_type,codec_name",
+             "-of", "json", inp], text=True, creationflags=NO_WINDOW)).get("streams", [])
+        for _s in _ts:
+            _ty, _c = _s.get("codec_type", ""), (_s.get("codec_name") or "").lower()
+            if _ty == "audio":
+                AUD_STREAMS.append((_s.get("index"), _c))
+            elif _ty == "subtitle":
+                SUB_STREAMS.append((_s.get("index"), _c))
+            elif _ty == "attachment":
+                HAS_ATTACH = True
+    except Exception:  # noqa: BLE001 - probe failure: behave like the legacy single-audio path
+        pass
+NEED_MKV = PASSTHROUGH and (bool(SUB_STREAMS) or any(c not in MP4_AUDIO_OK for _, c in AUD_STREAMS))
 out_path = os.path.abspath(args.output) if args.output else \
-    os.path.splitext(inp)[0] + (("_sharpened" if NO_INTERP else f"_{out_label}fps") + ".mp4")
+    os.path.splitext(inp)[0] + (("_sharpened" if NO_INTERP else f"_{out_label}fps")
+                                + (".mkv" if NEED_MKV else ".mp4"))
+OUT_IS_MKV = out_path.lower().endswith(".mkv")
 
 # Decode bit depth follows the source: 8 bit clips decode as rgb24 byte for byte; 10 bit and
 # up are carried as 16 bit rgb (rgb48le) so the model (fp16, which holds 10 bit precision)
@@ -846,20 +882,40 @@ elif TEN_BIT_OUT:
 else:
     out_pix = "yuv420p"
 
-# Always visually lossless. NVENC: constant quality VBR around the point the linked H.264
-# guide calls visually lossless (CQ 17, CQ 20 for AV1), AQ on, a small chroma QP boost.
-# SVT-AV1 CPU fallback: CRF 20 (its visually lossless range) at preset 8, fast enough not
-# to starve the GPU frame pipe.
+# Always visually lossless, with the values VERIFIED against a lossless 8K master (2026-07-03;
+# exact args, frame-aligned VMAF/PSNR/SSIM). HEVC CQ 17 is the app's quality reference:
+# VMAF 99.78 / 57.0 dB / SSIM 0.9986. Note hevc_nvenc's CQ SATURATES on easy content: CQ 14-21
+# produced byte-identical bitstreams here (the mode's internal quality ceiling; response starts
+# at CQ 22 and the knob verifiably works at 30/40), so 17 sits ON the max-quality plateau with
+# ~4 steps of margin for harder content where the ceiling shifts. AV1's CQ scale is not HEVC's
+# and does NOT saturate there: CQ 22 still exceeds the reference on every metric
+# (99.84 / 58.2 / 0.9988) at 13% smaller files than the old over-provisioned CQ 20 (CQ 23 dips
+# just below the reference, so 22 it is; neighbors 21/23 both measured). NVENC runs AQ + a
+# small chroma QP boost. SVT-AV1 CPU fallback: CRF 20 (its visually lossless range) at
+# preset 8, fast enough not to starve the GPU frame pipe.
 if USE_NVENC:
-    cq = "20" if venc == "av1_nvenc" else "17"
+    cq = "22" if venc == "av1_nvenc" else "17"
     qargs = ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
              "-spatial_aq", "1", "-temporal_aq", "1"]
     if venc in ("h264_nvenc", "hevc_nvenc"):
         qargs += ["-qp_cb_offset", "-2", "-qp_cr_offset", "-2"]
 elif venc == "libvvenc":
-    # vvenc has no CRF; QP 21 with its perceptual QP adaptation (qpa, on by default) sits in the
-    # visually lossless range, and the fast preset keeps 1080p from being glacial on the CPU.
-    qargs = ["-qp", "21", "-preset", "fast"]
+    # vvenc has no CRF; QP with its perceptual QP adaptation (qpa, on by default). QP 20 verified
+    # VMAF 99.82 / 51.3 dB / SSIM 0.9966 on the 8K master, one QP of extra headroom over the old
+    # QP 21 (the thinnest margin of the three codecs) for ~5% size; still ~4.4x smaller than
+    # HEVC. The fast preset keeps 1080p from being glacial on the CPU.
+    qargs = ["-qp", "20", "-preset", "fast"]
+    if out_label > 120:
+        # QPA (perceptual QP adaptation) INVERTS on high-fps interpolated streams: on normal
+        # content it saves bits (raises QP where texture masks errors; 24fps 8K master: 1.9 MB
+        # with vs 2.6 MB without), but a 120+fps stream is wall-to-wall smooth tween frames, so
+        # QPA lowers QP everywhere and bloats the file (360fps: 3.2 MB with vs 1.7 MB without at
+        # 1080p; at 8K it even made VVC LARGER than HEVC). Both variants measure above the
+        # visually-lossless standards (VMAF 99.1-99.8, SSIM >= 0.9977), so switch it off where
+        # it hurts and keep it where it helps.
+        qargs += ["-qpa", "0"]
+        sys.stderr.write(f"vvenc: qpa off for {out_label} fps output (bit-saver inverts on "
+                         "high-fps tween streams)\n"); sys.stderr.flush()
     if OUT_W > NVENC_MAX or OUT_H > NVENC_MAX:
         # Ultra sizes: cap frame-level parallelism. Measured at 15360x8640 (24 frames): default
         # peaks ~34 GB RAM, maxparallelframes=2 peaks ~30 GB at the SAME wall time.
@@ -925,12 +981,62 @@ else:
 # of silent pooling on top of the encoder's own ~30 GB working set (measured: the encode-side
 # ffmpeg peaked at 42.8 GB in-pipeline vs 29.8 GB standalone before this cap).
 _TQ = ["-threads", "1", "-thread_queue_size", "1"] if (OUT_W > NVENC_MAX or OUT_H > NVENC_MAX) else []
+# Track mapping (see the passthrough block above). Audio: every track into mkv; into mp4 only
+# the compatible ones (auto-mp4 implies all are compatible, so selective mapping only bites
+# when an explicit .mp4 path overrode the mkv choice). Subtitles/fonts: mkv only, with
+# mov_text converted to SRT per stream. Chapters ride along in both containers.
+_maps, _drops = [], []
+if PASSTHROUGH:
+    if OUT_IS_MKV:
+        _maps += ["-map", "1:a?"]
+    else:
+        _good = [i for i, c in AUD_STREAMS if c in MP4_AUDIO_OK]
+        for _i in _good:
+            _maps += ["-map", f"1:{_i}"]
+        if len(_good) < len(AUD_STREAMS):
+            _drops.append(f"{len(AUD_STREAMS) - len(_good)} audio track(s) (codec not mp4-compatible)")
+    _maps += ["-c:a", "copy"]
+    if OUT_IS_MKV and SUB_STREAMS:
+        _maps += ["-map", "1:s?", "-c:s", "copy"]
+        for _j, (_i, _c) in enumerate(SUB_STREAMS):
+            if _c not in MKV_SUB_COPY_OK:
+                _maps += [f"-c:s:{_j}", "srt"]     # mov_text etc: mp4-native, transcode for mkv
+    elif SUB_STREAMS:
+        _drops.append(f"{len(SUB_STREAMS)} subtitle track(s) (mp4 output; use .mkv to keep them)")
+    if OUT_IS_MKV and HAS_ATTACH:
+        _maps += ["-map", "1:t?"]
+    _maps += ["-map_chapters", "1"]
+    _n_sub = len(SUB_STREAMS) if OUT_IS_MKV else 0
+    _n_aud = len(AUD_STREAMS) if OUT_IS_MKV else len([1 for _, c in AUD_STREAMS if c in MP4_AUDIO_OK])
+    if _n_aud > 1 or _n_sub or (OUT_IS_MKV and HAS_ATTACH):
+        sys.stderr.write(f"passthrough: {_n_aud} audio, {_n_sub} subtitle track(s)"
+                         f"{', fonts' if (OUT_IS_MKV and HAS_ATTACH) else ''}, chapters -> "
+                         f"{'mkv' if OUT_IS_MKV else 'mp4'}\n")
+    for _d in _drops:
+        sys.stderr.write(f"passthrough: dropping {_d}\n")
+    sys.stderr.flush()
+else:
+    _maps = ["-map", "1:a:0?", "-c:a", "copy"]
+# HDR into MKV runs TWO-STAGE so the HDR10 static metadata survives: the injector writes ISOBMFF
+# boxes (mp4-only), but ffmpeg's mov demuxer reads mdcv/clli into stream side data and the
+# Matroska muxer writes them as MKV's NATIVE MasteringMetadata/MaxCLL elements (verified: values
+# map exactly). So: stage 1 encodes the video alone into a temp .mp4 (no source input at all, so
+# not even chapters sneak in), the boxes are injected there, and stage 2 stream-copy remuxes the
+# temp video plus the source's tracks into the final .mkv (see _finalize_output).
+HDR_MKV_2STAGE = HDR_ACTIVE and OUT_IS_MKV
+if HDR_MKV_2STAGE:
+    _ENC_TARGET = out_path + ".video.tmp.mp4"
+    _stage2_maps, _maps = _maps, []
+    _in2 = []
+else:
+    _ENC_TARGET = out_path
+    _stage2_maps = []
+    _in2 = ["-i", inp]
 enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", ENC_IN_FMT,
-           "-s", f"{OUT_W}x{OUT_H}", "-r", rate_str] + _TQ + ["-i", "-", "-i", inp,
-           "-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy",
-           "-c:v", venc, "-vf", vf]
+           "-s", f"{OUT_W}x{OUT_H}", "-r", rate_str] + _TQ + ["-i", "-"] + _in2 + \
+          ["-map", "0:v:0"] + _maps + ["-c:v", venc, "-vf", vf]
 # VVC-in-MP4 muxing is gated behind -strict experimental on some ffmpeg versions; harmless otherwise.
-enc_cmd += qargs + prof + color + (["-strict", "experimental"] if venc == "libvvenc" else []) + [out_path]
+enc_cmd += qargs + prof + color + (["-strict", "experimental"] if venc == "libvvenc" else []) + [_ENC_TARGET]
 enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
 _sharp_note = f"  sharpen(rcas)={SHARPEN:g}" if SHARPEN > 0 else ""
 _up_note = f"  upscale={UPSCALE_F:g}x->{OUT_W}x{OUT_H}" if UPSCALE else ""
@@ -980,26 +1086,48 @@ rt = threading.Thread(target=_reader, daemon=True)
 rt.start()
 
 
-def _write_hdr10_metadata():
-    """Stamp HDR10 static metadata into the finished mp4 (mastering display + content light level).
+def _write_hdr10_metadata(target):
+    """Stamp HDR10 static metadata into an mp4 (mastering display + content light level).
 
     The bundled LGPL ffmpeg cannot write it on the hevc_nvenc path (no encoder/BSF option exists),
     so hdr10_meta adds the ISOBMFF boxes directly: the mastering display peak is the TrueHDR target
     (HDR_NITS), and MaxCLL/MaxFALL are measured from the actual frames. With this, one PQ/BT.2020
     file tone-maps correctly on both a 1000-nit and a 400-nit display with no per-display setting.
     Best-effort: a failure logs a note but never fails the render."""
-    if not HDR_ACTIVE or not str(out_path).lower().endswith(".mp4"):
+    if not HDR_ACTIVE or not str(target).lower().endswith(".mp4"):
         return
     try:
         import hdr10_meta
         cll = int(getattr(_RTX, "maxcll", 0) or 0)
         fall = int(getattr(_RTX, "maxfall", 0) or 0)
-        if hdr10_meta.inject_hdr10(out_path, max_nits=HDR_NITS, maxcll=cll, maxfall=fall,
+        if hdr10_meta.inject_hdr10(target, max_nits=HDR_NITS, maxcll=cll, maxfall=fall,
                                    colorspace=HDR_MASTER_PRIM):
             sys.stderr.write(f"HDR10 metadata: mastered {HDR_NITS} nits ({HDR_MASTER_PRIM}), "
                              f"measured MaxCLL {cll} / MaxFALL {fall} nits\n"); sys.stderr.flush()
     except Exception as e:  # noqa: BLE001 - container metadata is a finishing touch, not load-bearing
         sys.stderr.write(f"HDR10 metadata: skipped ({e})\n"); sys.stderr.flush()
+
+
+def _finalize_output():
+    """Finish the container. Plain renders: inject the HDR10 boxes into the mp4 when HDR is on.
+    HDR-into-MKV renders (HDR_MKV_2STAGE): the boxes are injected into the stage-1 video-only
+    temp mp4, then a stream-copy remux merges that video with the source's passthrough tracks
+    into the final .mkv - ffmpeg maps the mdcv/clli boxes onto Matroska's native
+    MasteringMetadata/MaxCLL elements (verified value-exact), so nothing is lost."""
+    if not HDR_MKV_2STAGE:
+        _write_hdr10_metadata(out_path)
+        return
+    _write_hdr10_metadata(_ENC_TARGET)
+    cmd = [FFMPEG, "-v", "error", "-y", "-i", _ENC_TARGET, "-i", inp,
+           "-map", "0:v:0", "-c:v", "copy"] + _stage2_maps + [out_path]
+    try:
+        subprocess.run(cmd, check=True, creationflags=NO_WINDOW)
+        os.remove(_ENC_TARGET)
+        sys.stderr.write("HDR10 metadata carried into the MKV as native MasteringMetadata/MaxCLL "
+                         "elements\n"); sys.stderr.flush()
+    except Exception as e:  # noqa: BLE001 - keep the finished video rather than fail the render
+        sys.stderr.write(f"final MKV remux failed ({e}); the HDR video (with metadata, without "
+                         f"the extra tracks) was kept at {_ENC_TARGET}\n"); sys.stderr.flush()
 
 
 # Run the whole interpolation/encode pipeline on one non-default CUDA stream so TRT, softsplat's cupy
@@ -1039,7 +1167,7 @@ if NO_INTERP:
         dec.wait()
     if _werr:
         raise _werr[0]          # surface a failed encode pipe as a nonzero exit
-    _write_hdr10_metadata()
+    _finalize_output()
     _live_flush()               # let the final live thumbnail land before exit
     sys.stderr.write(f"done {k} frames "
                      f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n")
@@ -1147,7 +1275,7 @@ finally:
     dec.wait()
 if _werr:
     raise _werr[0]          # surface a failed encode pipe as a nonzero exit
-_write_hdr10_metadata()
+_finalize_output()
 _live_flush()               # let the final live thumbnail land before exit
 sys.stderr.write(f"done {k} pairs ({dups} held as duplicates ({neardups} near), {cuts} cuts held) "
                  f"-> {out_path}\n")
