@@ -36,7 +36,7 @@ generated frame. Duration therefore matches the source.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
-       [--out-bits {8,10}] [--scene-detect] [--no-near-dup] [--no-dejudder] [--restore]
+       [--out-bits {8,10}] [--scene-detect] [--restore]
        [--no-passthrough]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
@@ -46,12 +46,9 @@ Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--
        --scene-detect enables hard-cut detection (a detected cut is held across the boundary
        instead of interpolated). OFF by default: real action content lands in the detector's
        gray zone and a false hold stutters the smoothing; see the scene cut detection block.
-       --no-dejudder disables de-judder retiming. By default, runs of duplicate frames (anime
-       drawn on twos/threes) are retimed together with the next distinct frame as ONE
-       interpolation span, spreading the real motion evenly across the output (full de-judder)
-       instead of holding the duplicates and jumping; long stills still hold, and so do
-       detected cuts under --scene-detect (see the de-judder block below). Disabling preserves
-       the source's own cadence.
+       Every source pair is interpolated uniformly on the same output-slot grid, so
+       near-identical drawings (anime on twos/threes) get the same even motion as real motion
+       and the source's own frame timings are preserved exactly; nothing is held or retimed.
        --restore runs Real-ESRGAN's anime-video model (bundled realesr-animevideov3) on every
        output frame to clean noise and redraw linework (fine texture can flatten), before the
        upscale (without RTX VSR its 4x output directly feeds the upscale). Off by default;
@@ -141,22 +138,6 @@ ap.add_argument("--no-passthrough", action="store_true",
                      "and the container switches from mp4 to mkv automatically when the tracks "
                      "need it (styled ASS/PGS subtitles, exotic audio codecs). With this flag the "
                      "output is always mp4 with only the first audio track, the old behaviour.")
-ap.add_argument("--no-near-dup", action="store_true",
-                help="disable near-duplicate detection. By default a pair whose frames differ only "
-                     "by compression noise (anime drawn on twos/threes re-encoded lossily, so held "
-                     "cels are no longer byte-identical) is held like an exact duplicate instead of "
-                     "interpolated, skipping wasted compute and the shimmer GMFSS adds when it "
-                     "interpolates pure noise. Real motion is never held: the detector reacts to "
-                     "spatially coherent change (even a tiny blink or a 1px pan), not noise.")
-ap.add_argument("--no-dejudder", action="store_true",
-                help="disable de-judder retiming. By default a run of duplicate source frames "
-                     "(one drawing held for up to 4 frames - anime twos/threes) and the next "
-                     "distinct frame are interpolated as a single span, so the real motion "
-                     "spreads evenly across the output instead of freezing and jumping at the "
-                     "source's own cadence; longer runs are intentional stills and are held, "
-                     "and detected cuts are never retimed across when --scene-detect is on. "
-                     "Disabling preserves the animator's twos/threes pacing (and the compute "
-                     "the duplicate hold saves).")
 ap.add_argument("--scene-detect", action="store_true",
                 help="enable hard-cut detection: detected cuts (forward/backward flow "
                      "consistency plus warp residual, from flows GMFSS already computes) are "
@@ -219,10 +200,6 @@ inp = os.path.abspath(args.input)
 SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
 SCENE_DETECT = args.scene_detect             # opt-in: hold frames across detected cuts (see help)
-NEAR_DUP = not args.no_near_dup              # hold noise-only pairs like exact duplicates
-DEJUDDER = not args.no_dejudder              # retime duplicate runs (twos/threes) into even motion
-DEJUDDER_CAP = 4    # longest duplicate run (source frames per drawing: twos/threes/fours) a span
-                    # may retime across; longer runs are intentional stills and hold as before
 PASSTHROUGH = not args.no_passthrough        # copy all audio/subtitle/chapter/font tracks through
 UPSCALE_F = max(1.0, min(16.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
                                              # RTX VSR has no integer-scale limit (probed clean to
@@ -787,38 +764,6 @@ def _pair_is_cut(i, I0, I1, reuse):
                          "holding boundary frames instead of interpolating\n"); sys.stderr.flush()
     return cut
 
-# --- near-duplicate detection ---------------------------------------------------------------
-# Anime is drawn on twos and threes, so held cels repeat; after a lossy encode the repeats are
-# no longer byte-identical (the exact-equality check above misses them) and GMFSS interpolates
-# pure compression noise: M inferences per pair wasted, plus a subtle shimmer on what should be
-# a rock-still shot. A pair whose difference is noise-only is therefore held like an exact dup.
-# The detector must never hold visible motion (that would create judder, the thing the app
-# exists to remove), so it keys on spatial coherence, not amount: the SIGNED difference is
-# averaged per 16 px block (random encode noise cancels inside a block; real change, however
-# small or local - a blink, a 1 px pan - is coherent and survives), and the maximum block wins.
-# A plain mean-abs difference would do the opposite: its noise floor never averages away, and a
-# tiny blinking dot drowns in it. The threshold is a HARM BOUND rather than a noise/motion
-# classifier (at these amplitudes the two are not separable even in principle: an ultra-slow
-# morph measures BELOW dither noise): holding emits the pair midpoint, so the worst-case error
-# vs true interpolation is half the pair difference, i.e. <= ~1.5 8-bit levels in the single
-# most-changed block at this threshold - at or below the source's own quantisation noise,
-# invisible whether the sub-threshold change was noise or drift.
-# Calibration (2026-07-02, SMV_SCENE_DEBUG sweeps; maxblock values):
-#   duplicated cels + temporal noise alls=1/2/3   0.0068..0.0099 / 0.008..0.012 / 0.0075..0.016
-#   ultra-slow gradient morph                     ~0.002           (held: harmless per the bound)
-#   1 px/frame photo pan, 1 s fade (+ noise)      0.033..0.047 / 0.035..0.052   (~3x margin)
-#   24 px blink toggle, normal anime motion       ~0.82 / 0.71..0.85            (60x+ margin)
-NEARDUP_TH = 0.012      # max block-mean signed diff, [0,1] scale (~3 8-bit levels)
-
-def _near_dup(i, I0, I1):
-    """True when pair i differs only by compression noise; logged under SMV_SCENE_DEBUG."""
-    if not NEAR_DUP:
-        return False
-    d = F.avg_pool2d((I0 - I1).float(), 16).abs().max().item()
-    if SCENE_DEBUG:
-        sys.stderr.write(f"DUP {i} maxblock={d:.5f}\n"); sys.stderr.flush()
-    return d < NEARDUP_TH
-
 def _soft_still(I):
     """One source frame rendered the way held duplicate cels already are: GMFSS on the (I, I)
     pair at t=0.5. Emitting the raw source frame here would pop (sharp against the soft tweens
@@ -1297,212 +1242,40 @@ if prev is None:
 I0 = to_tensor(prev)
 k = 0
 i = 0
-dups = 0
-neardups = 0            # subset of dups: noise-only pairs caught by _near_dup, not byte equality
 cuts = 0                # hard cuts held instead of interpolated (see scene cut detection)
-retimed = 0             # source pairs whose slots were retimed across a de-judder span
-spans = 0               # de-judder spans emitted (one drawing + the next distinct frame)
 last_out = None         # bytes of the most recent emitted frame, held across the final slot
 
-# --- de-judder retiming (--dejudder) ----------------------------------------------------------
-# Anime drawn on twos/threes holds each drawing for 2-3 source frames. The classic loop (now
-# the --no-dejudder path) keeps that cadence: duplicate pairs are held, so at the output rate
-# the motion still freezes and jumps - judder, just at the source's own rhythm. The app exists
-# to smooth motion, so retiming is the DEFAULT: a RUN of duplicates (one
-# drawing, up to DEJUDDER_CAP frames) plus the next distinct frame is interpolated as a SINGLE
-# span: the very same output slots are emitted at the very same times (the _pair_fracs grid, so
-# frame count, duration and A/V sync are untouched by construction), but their timesteps run
-# (p + fr)/L between the two DISTINCT drawings, spreading the real motion evenly instead of
-# holding then jumping. Runs longer than the cap are true stills (an intentional hold, not a
-# cadence): retiming one would smear it into a slow-motion morph, so they hold exactly like the
-# classic path - and _dj_holding keeps that decision sticky to the run's REAL end, so a long
-# still is never retimed from the middle once its start was judged a still. A scene cut
-# detected on a span holds each side instead, with the sharp change at the span's last source
-# step (boundary L - 0.5), exactly where the classic path lands it. Mixed-cadence shots
-# (characters on twos and threes at once) never form global duplicate runs, so they simply
-# interpolate the classic way - the same graceful degradation MultiPassDedup documents.
-# Cost: every slot of a retimed span is a distinct inference, so this trades back the compute
-# the duplicate hold saved (roughly 2x slower at high multipliers on twos content).
-_dj_buf = [(prev, I0)]  # (bytes, tensor) lookahead window; _dj_buf[0] is the current frame
-_dj_eof = False
-
-def _dj_fill(n):
-    """Grow the lookahead window to n frames; False when the stream ends first."""
-    global _dj_eof
-    while len(_dj_buf) < n and not _dj_eof:
-        b = rq.get()
-        if b is None:
-            _dj_eof = True
-        else:
-            _dj_buf.append((b, to_tensor(b)))
-    return len(_dj_buf) >= n
-
-def _dj_dup(p, a, b):
-    """The classic duplicate test for pair p: 1 = byte-exact, 2 = noise-only, 0 = distinct."""
-    if b[0] == a[0]:
-        return 1
-    if _near_dup(p, a[1], b[1]):
-        return 2
-    return 0
-
-def _dj_tick():
-    """One source pair consumed: drop its frame, advance the counters and the progress line."""
-    global i, k
-    del _dj_buf[0]
-    i += 1
-    k += 1
-    if k % 10 == 0:
-        sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
-
-def _dj_hold_pair():
-    """Emit the current pair held - the classic duplicate path, one still for all its slots."""
-    global last_out
-    fracs = _pair_fracs(i)
-    if fracs:
-        with amp():
-            r = model.reuse(_dj_buf[0][1], _dj_buf[1][1], scale)
-            held = to_bytes(model.inference(_dj_buf[0][1], _dj_buf[1][1], r, 0.5))
-        for _ in fracs:
-            last_out = held
-            wq.put(held)
-    _dj_tick()
-
-def _dj_norm_pair():
-    """Emit the current pair the classic non-duplicate way (cut check + per-slot tweens)."""
-    global last_out, cuts
-    fracs = _pair_fracs(i)
-    if fracs:
-        A, B = _dj_buf[0][1], _dj_buf[1][1]
-        with amp():
-            r = model.reuse(A, B, scale)
-            if _pair_is_cut(i, A, B, r):
-                cuts += 1
-                for out in _emit_cut(A, B, fracs):
-                    last_out = out
-                    wq.put(out)
-            else:
-                for fr in fracs:
-                    last_out = to_bytes(model.inference(A, B, r, fr))
-                    wq.put(last_out)
-    _dj_tick()
-
 try:
-    if DEJUDDER:
-        _dj_holding = False   # inside a longer-than-cap still: hold pairs until it really ends
-        while _dj_fill(2):
-            if _dj_holding:
-                d = _dj_dup(i, _dj_buf[0], _dj_buf[1])
-                if d:
-                    dups += 1
-                    if d == 2:
-                        neardups += 1
-                    _dj_hold_pair()
+    while True:
+        cur = rq.get()
+        if cur is None:
+            break
+        I1 = to_tensor(cur)
+        # Uniform smoothing: every source pair is interpolated on the _pair_fracs slot grid, so
+        # near-identical drawings (anime on twos/threes, held cels blurred only by encode noise,
+        # or exact repeats) get exactly the same even motion as real motion. Nothing is held or
+        # retimed - the source's own frame timings are preserved by construction, and the gap
+        # between every pair of consecutive source frames is smoothed the same way. (--fps mode
+        # can still leave a pair zero slots.) With --scene-detect a detected hard cut holds its
+        # boundary frames instead of morphing across it.
+        fracs = _pair_fracs(i)
+        if fracs:
+            with amp():
+                reuse = model.reuse(I0, I1, scale)
+                if _pair_is_cut(i, I0, I1, reuse):
+                    cuts += 1
+                    for out in _emit_cut(I0, I1, fracs):
+                        last_out = out
+                        wq.put(out)
                 else:
-                    _dj_holding = False    # the still ends here: a normal pair (cut check incl.)
-                    _dj_norm_pair()
-                continue
-            # Measure the duplicate run starting at the current frame (bounded lookahead):
-            # frames 0..L-1 are one drawing; found = the next distinct frame is in the window.
-            L, found, rdups = 1, False, []
-            while _dj_fill(L + 1):
-                d = _dj_dup(i + L - 1, _dj_buf[L - 1], _dj_buf[L])
-                if not d:
-                    found = True
-                    break
-                rdups.append(d)
-                L += 1
-                if L > DEJUDDER_CAP:
-                    break
-            if found and L == 1:
-                _dj_norm_pair()            # no duplicates: a plain classic pair
-            elif found:
-                # One drawing held for L frames, then a new one: retime the whole span.
-                A, B = _dj_buf[0][1], _dj_buf[L][1]
-                with amp():
-                    r = model.reuse(A, B, scale)
-                    if _pair_is_cut(i, A, B, r):
-                        # A cut straight after the held drawing: hold each side, sharp change
-                        # at the span's last source step, exactly like the classic path.
-                        cuts += 1
-                        for d in rdups:
-                            dups += 1
-                            if d == 2:
-                                neardups += 1
-                        aS = bS = None
-                        for p in range(L):
-                            for fr in _pair_fracs(i):
-                                if p + fr < L - 0.5:
-                                    if aS is None:
-                                        aS = _soft_still(A)
-                                    last_out = aS
-                                else:
-                                    if bS is None:
-                                        bS = _soft_still(B)
-                                    last_out = bS
-                                wq.put(last_out)
-                            _dj_tick()
-                    else:
-                        spans += 1
-                        retimed += L
-                        for p in range(L):
-                            for fr in _pair_fracs(i):
-                                last_out = to_bytes(model.inference(A, B, r, (p + fr) / L))
-                                wq.put(last_out)
-                            _dj_tick()
-            else:
-                # A still longer than the cap (or trailing duplicates at EOF): hold every
-                # classified pair like the classic path, then stay holding to the run's true
-                # end - a long still must never be retimed from the middle (its tail would
-                # become a slow-motion morph).
-                for d in rdups:
-                    dups += 1
-                    if d == 2:
-                        neardups += 1
-                    _dj_hold_pair()
-                _dj_holding = True
-        prev, I0 = _dj_buf[0]      # the shared tail below holds across the last frame's slot
-    else:
-        while True:
-            cur = rq.get()
-            if cur is None:
-                break
-            I1 = to_tensor(cur)
-            # Held cels: anime is drawn on twos/threes, so repeated frames decode byte for byte
-            # alike (exact bytes compare, ~free) or, after a lossy re-encode, alike up to
-            # compression noise (_near_dup). Every timestep between two such frames renders the
-            # same still, so render it once and reuse those bytes for all of this pair's slots;
-            # this also avoids the shimmer GMFSS can add on (near-)identical input.
-            dup = cur == prev
-            if not dup and _near_dup(i, I0, I1):
-                dup = True
-                neardups += 1
-            if dup:
-                dups += 1
-            # Emit this pair's slots on the half-step grid (_pair_fracs; --fps mode can give a
-            # pair zero slots). The frames for the last source frame are the held tail below.
-            fracs = _pair_fracs(i)
-            if fracs:
-                with amp():
-                    reuse = model.reuse(I0, I1, scale)
-                    if dup:
-                        held = to_bytes(model.inference(I0, I1, reuse, 0.5))
-                        for _ in fracs:
-                            last_out = held
-                            wq.put(held)
-                    elif _pair_is_cut(i, I0, I1, reuse):
-                        cuts += 1
-                        for out in _emit_cut(I0, I1, fracs):
-                            last_out = out
-                            wq.put(out)
-                    else:
-                        for fr in fracs:
-                            last_out = to_bytes(model.inference(I0, I1, reuse, fr))
-                            wq.put(last_out)
-            prev, I0 = cur, I1
-            i += 1
-            k += 1
-            if k % 10 == 0:
-                sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
+                    for fr in fracs:
+                        last_out = to_bytes(model.inference(I0, I1, reuse, fr))
+                        wq.put(last_out)
+        prev, I0 = cur, I1
+        i += 1
+        k += 1
+        if k % 10 == 0:
+            sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
     # Closing slot for the last source frame (i is now its index): its own time interval [i, i+1),
     # which has no frame after it to interpolate toward. Hold the last generated frame across it so
     # the output covers the full source duration and lands on exactly multi*frames (true doubling,
@@ -1528,6 +1301,4 @@ if _werr:
     raise _werr[0]          # surface a failed encode pipe as a nonzero exit
 _finalize_output()
 _live_flush()               # let the final live thumbnail land before exit
-_rt_note = f", {retimed} pairs retimed in {spans} spans" if DEJUDDER else ""
-sys.stderr.write(f"done {k} pairs ({dups} held as duplicates ({neardups} near){_rt_note}, "
-                 f"{cuts} cuts held) -> {out_path}\n")
+sys.stderr.write(f"done {k} pairs ({cuts} cuts held) -> {out_path}\n")

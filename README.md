@@ -543,53 +543,20 @@ For whoever picks this up.
   mid-action), which defeats the app's purpose, while a missed real cut merely morphs for one
   source-frame interval - brief at high output fps. So the default is now to always
   interpolate; pass `--scene-detect` for cut-heavy content where held boundaries matter more.
-- **Duplicate frame handling for anime (exact + near done).** GMFSS targets anime, which is drawn
-  on twos and threes, so many consecutive source frames repeat. Byte exact repeats have long been
-  detected and held; since 2026-07-02 repeats that differ only by compression noise (a lossy
-  re-encode makes held cels no longer byte identical) are held too. The detector averages the
-  SIGNED frame difference per 16 px block and takes the maximum block (`NEARDUP_TH` 0.012): random
-  noise cancels inside a block while real change, however small or local (a blink, a 1 px pan),
-  is spatially coherent and survives, where a plain mean-abs difference would drown a tiny mover
-  in its own noise floor. The threshold is a harm bound, not a noise/motion classifier (an
-  ultra-slow morph genuinely measures below dither noise, so the classes are not separable):
-  holding emits the pair midpoint, so worst-case error is half the pair difference, about 1.5
-  8-bit levels in the single most-changed block - at the source's own quantisation noise,
-  invisible either way. Measured: 13/13 noisy repeat pairs held on a duplicated-cels test clip
-  with zero false holds on a 1 px/frame pan, a 1 s fade, a 24 px blink toggle, and normal
-  content (real motion sits 3x..60x above the bound). The win is compute: a 16x render of
-  twos-cadence content went 65 s to 34 s (1.9x), since held pairs render once instead of 16
-  times. (Honesty note: measured within-pair shimmer of interpolating noise pairs was ~zero at
-  2x, so the quality argument is stability insurance, not a visible fix.) `--no-near-dup`
-  disables it; `SMV_SCENE_DEBUG=1` prints the per-pair block metric alongside the cut metrics.
-  The full de-judder this bullet used to leave open is **done (2026-07-03)** and **on by
-  default** (`--no-dejudder` opts out): a run of duplicates (one drawing, up to 4
-  frames - twos, threes, fours) and the next distinct frame are interpolated as a SINGLE span,
-  emitting the very same output slots at the very same times but with timesteps spread evenly
-  across the span, so the motion advances a constant amount per output frame instead of
-  freezing and jumping at the source's own cadence. Measured on a twos-cadence fixture (a box
-  moving 8 px per drawing, 2x): apparent per-frame motion goes from the classic 0/2/4/2 px
-  steps (the source judder, delta std 1.42) to ~2 px every single frame (std 0.46, no zero
-  frames, no spikes); threes content, `--fps` mode and noisy near-duplicate runs measure the
-  same evenness. Safeguards, each verified: runs longer than 4 frames are true stills and hold
-  exactly as before (a 12-frame still measured zero motion in both paths - an intentional hold
-  is never smeared into a slow morph, and the decision is sticky to the run's real end, so a
-  long still is never retimed from its middle); a scene cut detected on a span holds each side
-  with the sharp change on the very same output frame as the classic path (mean-luma trace
-  jumps 62 -> 174 in one step, no blend frames); frame count and duration are untouched by
-  construction (a retimed span emits the identical slot grid). `--no-dejudder` opts out for
-  anyone who wants the animator's deliberate twos/threes pacing preserved instead of uniform
-  motion; there is deliberately no GUI knob - the app exists to smooth, so smoothing the
-  duplicates is simply what a render does (it briefly shipped as an opt-in checkbox before
-  being made the default the same day). The cost of the default is small - much less than the
-  slot count suggests (measured only ~1.3x slower at 16x on twos content: one `reuse()`, the
-  expensive GMFlow half, is shared across each span where the per-pair path ran one per
-  pair). Mixed-cadence
-  shots (characters on twos and threes in one scene) never form global duplicate runs and
-  simply interpolate the classic way - the same graceful degradation MultiPassDedup documents;
-  DRBA's per-pixel Distance-Ratio-Map timestep control (which preserves the original pacing
-  rather than flattening it) remains the heavier alternative if pacing-preserving
-  interpolation is ever wanted. (The cut signal ended up flow-based rather than the
-  frame-difference idea sketched here earlier; see the scene change bullet.)
+- **Uniform interpolation, no duplicate holding or dejudder (2026-07-04).** Earlier builds
+  detected repeated cels (byte exact, plus near duplicates that differ only by compression
+  noise) and held them, and retimed short duplicate runs into even motion (dejudder). Both are
+  removed. Every source pair is now interpolated the same way on the `_pair_fracs` slot grid, so
+  the gap between any two consecutive source frames, whether real motion, a held cel or an exact
+  repeat, gets the same even smoothing, and the source's own frame timings are preserved by
+  construction (frame count, duration and A/V sync unchanged). The reason: on grainy or textured
+  stills the per block duplicate metric straddled its threshold. Film grain on high contrast art
+  measured right around the old 0.012 bound, so a genuinely held card fragmented unpredictably,
+  some frames held, some retimed, some interpolated, instead of smoothing cleanly. Interpolating
+  every pair removes that inconsistency and maximises smoothness, at the cost of the compute the
+  duplicate hold used to save (roughly 2x more inferences on twos cadence content). Hard cuts are
+  interpolated by default; `--scene-detect` still holds their boundaries (see the scene change
+  bullet).
 - **Sharper generated frames (free half done).** The free half is fixed: `to_tensor` and
   `to_bytes` now pad to the next multiple of 64 the model needs and crop the padding back,
   instead of resizing the whole frame up a fraction and back with bilinear. No real pixel is
@@ -890,7 +857,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--scene-detect] [--no-near-dup] [--no-dejudder] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--scene-detect] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -909,14 +876,10 @@ sources only; the output never drops below the source depth, and HDR and VVC are
 10-bit). `--scene-detect` enables hard-cut detection, holding detected cuts instead of interpolating
 them (OFF by default: real action content lands in the detector's gray zone and a false hold
 stutters the smoothing; see Scene change detection under What can be done next for the
-calibration numbers and the field data behind the flip).
-`--no-near-dup` disables near-duplicate holding (on by default: repeats that differ only by
-compression noise are held like exact duplicates; see Duplicate frame handling).
-`--no-dejudder` disables de-judder retiming (on by default: runs of duplicate frames - anime
-drawn on twos/threes - are retimed together with the next distinct frame as one interpolation
-span, spreading the real motion evenly across the output instead of holding then jumping;
-long stills still hold, and so do scene cuts when `--scene-detect` is on; see Duplicate frame
-handling for the measurements and safeguards). Disabling preserves the source's own cadence.
+calibration numbers and the field data behind the flip). Duplicate and near-duplicate frames
+are no longer held or retimed: every source pair is interpolated uniformly on the same slot
+grid (see Uniform interpolation under What can be done next), so the source timings are kept and
+near-identical drawings smooth the same way as real motion.
 `--restore` (off by default) runs Real-ESRGAN's anime-video model on every output frame to
 clean compression noise and redraw linework (a generative repaint; fine texture can flatten),
 before the upscale (without RTX VSR its 4x output directly
