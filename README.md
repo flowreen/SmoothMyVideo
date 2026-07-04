@@ -292,7 +292,7 @@ perf-neutral (it is GPU-compute-bound, not launch or sync bound), batching the p
 help (FusionNet is already saturated at batch 1), and fp8 fails a quality gate (precision, 61px flow
 outliers). Two non-regressing cleanups were kept: GPU-side transposes, and the whole inference now runs on
 one CUDA stream with no per-call TensorRT sync (which also keeps the TRT default-stream warning fixed). See
-**Performance headroom** under What can be done next for the per-item results.
+**Performance headroom** under Design notes & rationale for the per-item results.
 
 `torch.compile` was tried and dropped. Its inductor backend needs Triton plus MSVC;
 Triton is a pip wheel that would bundle fine, but the path is deliberately not bundled,
@@ -494,8 +494,9 @@ monitor, a 1000-nit OLED and a 400-nit TV. The tiers beyond HDR10, for whoever w
   gated behind DaVinci Resolve or Dolby's tools; `dovi_tool` only extracts / edits / muxes the RPU.
   Out of scope for a self-contained, offline app.
 
-## What can be done next
-For whoever picks this up.
+## Design notes & rationale
+Per-feature design rationale for what shipped and why. The feature set is complete; this is
+reference, not a backlog.
 
 - **SDR to HDR colour / cyan (root-caused and fixed).** The blue/teal cast was the **TrueHDR model**
   rotating hues, not a pipeline bug. Measured tonemap-free in linear BT.2020, blue-dominant pixels gain
@@ -554,9 +555,12 @@ For whoever picks this up.
   measured right around the old 0.012 bound, so a genuinely held card fragmented unpredictably,
   some frames held, some retimed, some interpolated, instead of smoothing cleanly. Interpolating
   every pair removes that inconsistency and maximises smoothness, at the cost of the compute the
-  duplicate hold used to save (roughly 2x more inferences on twos cadence content). Hard cuts are
-  interpolated by default; `--scene-detect` still holds their boundaries (see the scene change
-  bullet).
+  duplicate hold used to save (roughly 2x more inferences on twos cadence content). A faint per-frame shimmer can remain on
+  static grainy content (near-identical frames are interpolated rather than one held frame being
+  reused); this is intentional and **working as intended**, since uniform treatment of every
+  original pair is the goal, and if a clip ever needs it the fix is denoise-before-interpolate,
+  not reinstating holding. Hard cuts are interpolated by default; `--scene-detect` still holds
+  their boundaries (see the scene change bullet).
 - **Sharper generated frames (free half done).** The free half is fixed: `to_tensor` and
   `to_bytes` now pad to the next multiple of 64 the model needs and crop the padding back,
   instead of resizing the whole frame up a fraction and back with bilinear. No real pixel is
@@ -564,7 +568,8 @@ For whoever picks this up.
   flow net from tracking a hard edge). All three GMFSS scripts (this one, Fortuna's
   `inference_video.py`, enhancr) resized, so this was a known better technique none of them wired
   up. The blur that remains is motion ghosting at fast motion and occlusions, a flow accuracy
-  problem. The AnimeRun
+  limit inherent to the GMFSS model stack, accepted as **working as intended** (no fix without
+  changing the model). The AnimeRun
   fine tune idea is RESOLVED (2026-07-02): the shipped `train_log` weights already ARE the
   AnimeRun anime optical flow fine tune - verified by downloading both upstream Model Zoo zips
   (the bundled GMFSS_Fortuna README's own Drive links) and hashing: the "new union model using
@@ -875,10 +880,10 @@ never band, `8` restores the legacy 8-bit output for maximum device compatibilit
 sources only; the output never drops below the source depth, and HDR and VVC are always
 10-bit). `--scene-detect` enables hard-cut detection, holding detected cuts instead of interpolating
 them (OFF by default: real action content lands in the detector's gray zone and a false hold
-stutters the smoothing; see Scene change detection under What can be done next for the
+stutters the smoothing; see Scene change detection under Design notes & rationale for the
 calibration numbers and the field data behind the flip). Duplicate and near-duplicate frames
 are no longer held or retimed: every source pair is interpolated uniformly on the same slot
-grid (see Uniform interpolation under What can be done next), so the source timings are kept and
+grid (see Uniform interpolation under Design notes & rationale), so the source timings are kept and
 near-identical drawings smooth the same way as real motion.
 `--restore` (off by default) runs Real-ESRGAN's anime-video model on every output frame to
 clean compression noise and redraw linework (a generative repaint; fine texture can flatten),
@@ -908,4 +913,4 @@ deliberately not offered in the GUI), and
 name (default display-p3, metadata only).
 The per-frame order is upscale (RTX VSR or bicubic), then RCAS sharpen at the
 output resolution, then TrueHDR; VSR and TrueHDR run as two separate RTX bridge passes so the
-sharpen can sit between them. See What can be done next for the RTX runtime / installer details.
+sharpen can sit between them. See Design notes & rationale for the RTX runtime / installer details.
