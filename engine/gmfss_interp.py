@@ -36,21 +36,22 @@ generated frame. Duration therefore matches the source.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
-       [--out-bits {8,10}] [--no-scene-detect] [--no-near-dup] [--no-dejudder] [--restore]
+       [--out-bits {8,10}] [--scene-detect] [--no-near-dup] [--no-dejudder] [--restore]
        [--no-passthrough]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
        --no-interp skips interpolation entirely: the clip is only re-encoded at its source fps
        with --sharpen applied, for users who just want the sharpening and not the smoothing.
-       --no-scene-detect disables hard-cut detection (on by default: a true scene cut is held
-       across the boundary instead of interpolated, which would morph the two shots together;
-       fast pans are unaffected, see the scene cut detection block below).
+       --scene-detect enables hard-cut detection (a detected cut is held across the boundary
+       instead of interpolated). OFF by default: real action content lands in the detector's
+       gray zone and a false hold stutters the smoothing; see the scene cut detection block.
        --no-dejudder disables de-judder retiming. By default, runs of duplicate frames (anime
        drawn on twos/threes) are retimed together with the next distinct frame as ONE
        interpolation span, spreading the real motion evenly across the output (full de-judder)
-       instead of holding the duplicates and jumping; long stills and scene cuts still hold
-       (see the de-judder block below). Disabling preserves the source's own cadence.
+       instead of holding the duplicates and jumping; long stills still hold, and so do
+       detected cuts under --scene-detect (see the de-judder block below). Disabling preserves
+       the source's own cadence.
        --restore runs Real-ESRGAN's anime-video model (bundled realesr-animevideov3) on every
        output frame to clean noise and redraw linework (fine texture can flatten), before the
        upscale (without RTX VSR its 4x output directly feeds the upscale). Off by default;
@@ -153,15 +154,19 @@ ap.add_argument("--no-dejudder", action="store_true",
                      "distinct frame are interpolated as a single span, so the real motion "
                      "spreads evenly across the output instead of freezing and jumping at the "
                      "source's own cadence; longer runs are intentional stills and are held, "
-                     "and scene cuts are never retimed across. Disabling preserves the "
-                     "animator's twos/threes pacing (and the compute the duplicate hold saves).")
-ap.add_argument("--no-scene-detect", action="store_true",
-                help="disable hard-cut detection. By default the engine detects true scene cuts "
-                     "(via forward/backward flow consistency plus warp residual, reusing the flows "
-                     "GMFSS already computes) and holds the boundary frames across the cut instead "
-                     "of interpolating, which would morph one shot into the next as a smeared "
-                     "ghost. Fast pans and action are not affected: their flow is large but "
-                     "consistent, which is exactly what the check separates.")
+                     "and detected cuts are never retimed across when --scene-detect is on. "
+                     "Disabling preserves the animator's twos/threes pacing (and the compute "
+                     "the duplicate hold saves).")
+ap.add_argument("--scene-detect", action="store_true",
+                help="enable hard-cut detection: detected cuts (forward/backward flow "
+                     "consistency plus warp residual, from flows GMFSS already computes) are "
+                     "held across the boundary instead of interpolated, so two shots never "
+                     "morph into a smeared ghost. OFF by default (2026-07-04): real action "
+                     "content measured in the detector's gray zone (flashes, impact frames, "
+                     "strobing effects landed at occ 0.5-0.85, between the within-shot and "
+                     "true-cut calibration bands), and a FALSE hold visibly stutters the "
+                     "smoothing - worse for this app's purpose than morphing a real cut for "
+                     "one source-frame interval, which is brief at high output fps.")
 ap.add_argument("--out-bits", type=int, choices=[8, 10], default=10,
                 help="output bit depth. 10 (default): encode 10-bit (HEVC main10 / 10-bit AV1) even "
                      "from an 8-bit source - every emitted frame is computed in floating point, so "
@@ -213,7 +218,7 @@ args = ap.parse_args()
 inp = os.path.abspath(args.input)
 SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
-SCENE_DETECT = not args.no_scene_detect      # hold frames across true cuts instead of morphing
+SCENE_DETECT = args.scene_detect             # opt-in: hold frames across detected cuts (see help)
 NEAR_DUP = not args.no_near_dup              # hold noise-only pairs like exact duplicates
 DEJUDDER = not args.no_dejudder              # retime duplicate runs (twos/threes) into even motion
 DEJUDDER_CAP = 4    # longest duplicate run (source frames per drawing: twos/threes/fours) a span
@@ -705,9 +710,14 @@ def to_bytes(t):
     a = (t[0] * OUT_MAXV).round().clamp(0, OUT_MAXV).permute(1, 2, 0).contiguous().cpu().numpy()  # CHW->HWC on GPU
     return a.astype(OUT_NP_DT).tobytes()
 
-# --- scene cut detection --------------------------------------------------------------------
+# --- scene cut detection (OPT-IN --scene-detect since 2026-07-04) ----------------------------
 # Interpolating across a hard cut morphs one shot into the next (a smeared ghost frame), so cut
-# pairs hold the boundary frames instead. Detection reuses the flows model.reuse() has already
+# pairs hold the boundary frames instead - WHEN enabled. Off by default: field data from a real
+# action clip measured non-cut pairs (1-frame flashes read as consecutive-pair "cuts", impact
+# frames, strobing) at occ 0.51-0.84 / photo 0.09-0.35 - INSIDE the gap between the within-shot
+# and true-cut calibration bands below - and every false hold visibly stutters the smoothing,
+# which defeats the app's purpose; a missed real cut merely morphs for one source-frame
+# interval. Detection reuses the flows model.reuse() has already
 # computed, so it costs a few grid_samples per pair. A raw pixel difference cannot be the signal
 # here: a fast pan also produces a huge frame difference and would be falsely flagged, killing
 # interpolation exactly where it is most wanted. Two flow-based checks separate the cases, and

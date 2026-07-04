@@ -518,7 +518,8 @@ For whoever picks this up.
   ffmpeg (just an NVIDIA driver), extract, run `SmoothMyVideo.exe`, and test both a normal
   render and one with the **TensorRT** toggle on (the first TRT render at a given resolution
   spends a few minutes building engines, then caches them).
-- **Scene change detection (done 2026-07-02).** The engine no longer morphs one shot into the
+- **Scene change detection (done 2026-07-02; OPT-IN via `--scene-detect` since 2026-07-04).**
+  With the flag, the engine does not morph one shot into the
   next at a hard cut: cut pairs are detected and the boundary frames are held instead (slots
   before the mid point hold shot A, the rest hold shot B, so the cut lands sharp between two
   output frames). The held frames are rendered the way held duplicate cels already are (GMFSS
@@ -534,8 +535,14 @@ For whoever picks this up.
   still interpolates: the flow matches it, so the tween is a coherent zoom, not a smear. At the
   boundary the ghost is measurably gone (output frames match their own shot at MAD ~0.006 vs
   0.10..0.21 blends before). Cuts are logged to stderr and counted in the done line;
-  `--no-scene-detect` disables it, `SMV_SCENE_DEBUG=1` prints both metrics per pair. Still
-  open from this family: near-duplicate detection (see the next bullet).
+  `SMV_SCENE_DEBUG=1` prints both metrics per pair. **Why it became opt-in (2026-07-04):**
+  field data from a real action clip flagged 8 "cuts" in ~70 pairs at occ 0.51-0.84 /
+  photo 0.09-0.35 - inside the gap between the within-shot and true-cut calibration bands,
+  with the consecutive-pair signature of 1-frame flashes and impact frames rather than real
+  cuts. Every false hold pauses the smoothing for a source-frame interval (a visible stutter
+  mid-action), which defeats the app's purpose, while a missed real cut merely morphs for one
+  source-frame interval - brief at high output fps. So the default is now to always
+  interpolate; pass `--scene-detect` for cut-heavy content where held boundaries matter more.
 - **Duplicate frame handling for anime (exact + near done).** GMFSS targets anime, which is drawn
   on twos and threes, so many consecutive source frames repeat. Byte exact repeats have long been
   detected and held; since 2026-07-02 repeats that differ only by compression noise (a lossy
@@ -883,7 +890,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--no-scene-detect] [--no-near-dup] [--no-dejudder] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--scene-detect] [--no-near-dup] [--no-dejudder] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -899,15 +906,17 @@ just want the sharpening and not the smoothing. `--out-bits` sets the output bit
 `10` (the default) encodes 10-bit even from an 8-bit source so the float-precision frames
 never band, `8` restores the legacy 8-bit output for maximum device compatibility (8-bit
 sources only; the output never drops below the source depth, and HDR and VVC are always
-10-bit). `--no-scene-detect` disables hard-cut detection (on by default; see Scene change
-detection under What can be done next for how it works and the calibration numbers).
+10-bit). `--scene-detect` enables hard-cut detection, holding detected cuts instead of interpolating
+them (OFF by default: real action content lands in the detector's gray zone and a false hold
+stutters the smoothing; see Scene change detection under What can be done next for the
+calibration numbers and the field data behind the flip).
 `--no-near-dup` disables near-duplicate holding (on by default: repeats that differ only by
 compression noise are held like exact duplicates; see Duplicate frame handling).
 `--no-dejudder` disables de-judder retiming (on by default: runs of duplicate frames - anime
 drawn on twos/threes - are retimed together with the next distinct frame as one interpolation
 span, spreading the real motion evenly across the output instead of holding then jumping;
-long stills and scene cuts still hold; see Duplicate frame handling for the measurements and
-safeguards). Disabling preserves the source's own cadence.
+long stills still hold, and so do scene cuts when `--scene-detect` is on; see Duplicate frame
+handling for the measurements and safeguards). Disabling preserves the source's own cadence.
 `--restore` (off by default) runs Real-ESRGAN's anime-video model on every output frame to
 clean compression noise and redraw linework (a generative repaint; fine texture can flatten),
 before the upscale (without RTX VSR its 4x output directly

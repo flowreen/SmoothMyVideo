@@ -175,6 +175,10 @@ def build_or_load(name, export_module, example_inputs, input_names, output_names
     onnx_path = os.path.join(CACHE_DIR, tag + ".onnx")
     _log(f"[trt] building {name} {_shape_tag(example_inputs)} (one time for this resolution)...")
     t0 = time.time()
+    # Freshly constructed wrapper modules (e.g. _IFNetExport) default to training=True even
+    # when every weight inside is already eval, and the exporter checks (and warns on) the TOP
+    # module's flag. An export here is always for inference, so force eval unconditionally.
+    export_module.eval()
     with torch.autocast("cuda", dtype=torch.float16):
         # verbose=False drops the exporter's per-phase progress chatter (each phase printed
         # twice: a start line, then the same line again with a checkmark on completion) - the

@@ -259,8 +259,13 @@ function fileTag(){ return batchTotal > 1 ? 'File ' + (batchTotal - batch.length
 // and a timer ticks the displayed seconds down between frames so it never sits frozen. curDone/
 // curPct hold the last frame numbers so the timer can repaint the line with no new PROGRESS.
 let etaAnchor = 0, etaAnchorTime = 0, lastFps = 0, etaTimer = null, curDone = 0, curPct = 0;
-function fmtEta(s){ s=Math.max(0,Math.round(s)); const m=Math.floor(s/60), ss=s%60;
-  return m>0 ? m+'m '+String(ss).padStart(2,'0')+'s' : ss+'s'; }
+function fmtEta(s){ s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), ss=s%60;
+  return h>0 ? h+'h '+String(m).padStart(2,'0')+'m '+String(ss).padStart(2,'0')+'s'
+       : m>0 ? m+'m '+String(ss).padStart(2,'0')+'s' : ss+'s'; }
+const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function fmtFinish(s){ const d = new Date(Date.now() + Math.max(0,s)*1000);   // wall-clock end time
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+' '
+       + String(d.getDate()).padStart(2,'0')+'-'+MONTHS[d.getMonth()]+'-'+d.getFullYear(); }
 
 const $ = (id) => document.getElementById(id);
 // Stored-settings schema version: bump whenever a localStorage key or its scale/meaning changes,
@@ -279,7 +284,7 @@ function paint(){
   let speed = '   ·   measuring speed...';
   if(lastFps > 0){
     const remain = Math.max(0, etaAnchor - (Date.now()-etaAnchorTime)/1000);
-    speed = '   ·   '+Math.round(lastFps)+' fps   ·   ETA '+fmtEta(remain);
+    speed = '   ·   '+Math.round(lastFps)+' fps   ·   ETA '+fmtEta(remain)+'  ('+fmtFinish(remain)+')';
   }
   $('frames').textContent = 'Frames: '+Math.round(curDone*fpp)+' / '+totalGen+'  ('+Math.round(curPct)+'%)'+speed;
 }
