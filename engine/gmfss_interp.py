@@ -36,7 +36,8 @@ generated frame. Duration therefore matches the source.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
-       [--out-bits {8,10}] [--no-scene-detect] [--no-near-dup] [--no-dejudder] [--no-passthrough]
+       [--out-bits {8,10}] [--no-scene-detect] [--no-near-dup] [--no-dejudder] [--restore]
+       [--no-passthrough]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
@@ -50,6 +51,10 @@ Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--
        interpolation span, spreading the real motion evenly across the output (full de-judder)
        instead of holding the duplicates and jumping; long stills and scene cuts still hold
        (see the de-judder block below). Disabling preserves the source's own cadence.
+       --restore runs Real-ESRGAN's anime-video model (bundled realesr-animevideov3) on every
+       output frame to clean noise and redraw linework (fine texture can flatten), before the
+       upscale (without RTX VSR its 4x output directly feeds the upscale). Off by default;
+       works with --no-interp too.
        --upscale F spatially upscales every output frame before encode by an arbitrary factor
        (1.0 = off). With --rtx-vsr it runs NVIDIA RTX Video Super Resolution (real AI SR, any
        target resolution); otherwise a high-quality bicubic resize. Decode and interpolation
@@ -118,6 +123,17 @@ ap.add_argument("--codec", choices=["hevc", "av1", "vvc"], default="hevc",
                      "vvc: H.266 via CPU libvvenc (best compression, slow, limited player support; "
                      "always 10-bit). The NVENC choices fall back to CPU libsvtav1 when no usable "
                      "session exists; vvc falls back to HEVC if libvvenc is absent.")
+ap.add_argument("--restore", action="store_true",
+                help="AI detail restoration: run Real-ESRGAN's anime-video model "
+                     "(realesr-animevideov3, bundled - see realesr.py) on every output frame "
+                     "to clean compression noise and redraw the linework that interpolation "
+                     "and lossy sources soften (a generative repaint - fine texture can "
+                     "flatten). Runs before the upscale, so RTX VSR receives the "
+                     "restored frame; without RTX VSR the model's own 4x output directly "
+                     "feeds the upscale. Works with --no-interp too (restore without "
+                     "smoothing). Off by default; adds a second model pass per OUTPUT frame "
+                     "(TensorRT-cached; roughly +50%% wall on a 2x 1080p render, more at "
+                     "higher multipliers since every emitted frame pays it).")
 ap.add_argument("--no-passthrough", action="store_true",
                 help="disable track passthrough. By default EVERY audio track, subtitle track "
                      "(translations), chapter list and font attachment is copied into the output, "
@@ -460,6 +476,40 @@ if _need_vsr or _need_hdr:
         HDR_ACTIVE = False
     sys.stderr.flush()
 
+# Detail restoration (--restore): Real-ESRGAN's anime-video model reconstructs linework and
+# texture on every output frame - the "chain a restoration model after interpolation" option
+# from the README's sharpness bullet. The compact arch keeps every conv at the SOURCE
+# resolution (only the final PixelShuffle emits the 4x image), so the per-frame cost is small.
+# It runs BEFORE the upscale: RTX VSR then receives a restored, in-distribution frame, and
+# without RTX VSR the model's 4x output serves as the upscale source directly (see _restore).
+# Any load failure just drops the pass with a notice - never a dead render.
+RESTORE_ACTIVE = False
+_restore_net = None
+if args.restore:
+    try:
+        sys.path.insert(0, ENGINE_DIR)
+        import realesr
+        _restore_net = realesr.load(device)
+        RESTORE_ACTIVE = True
+        _restore_be = "eager fp16"
+        if not args.no_trt:
+            # Route the net through the same TRT engine cache as the GMFSS sub nets (build on
+            # first frame ~40 s, cached per resolution, eager fallback on any failure). The
+            # pass is real work either way - ~2.6 TFLOP per 1080p frame - measured on the dev
+            # laptop (power-capped RTX 5090 Laptop) at ~190 ms/frame TRT vs ~330 ms eager
+            # cudnn, i.e. about +50% wall on a 2x 1080p render; it scales with the OUTPUT
+            # frame count, so high multipliers pay it per emitted frame.
+            try:
+                import trt_runtime
+                _restore_net = trt_runtime.RestoreEngine(_restore_net, realesr.weights_hash())
+                _restore_be = "TensorRT"
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[restore] TensorRT unavailable, eager pass: {repr(e)[:160]}\n")
+        sys.stderr.write(f"detail restore ready (Real-ESRGAN animevideov3, {_restore_be})\n")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[restore] unavailable, skipping: {repr(e)[:200]}\n")
+    sys.stderr.flush()
+
 scale = args.scale
 tmp = max(64, int(64 / scale))
 ph = ((H - 1) // tmp + 1) * tmp
@@ -506,6 +556,25 @@ def _upscale(t, ow, oh):
             sys.stderr.flush()
             RTX_VSR_ACTIVE = False
     return F.interpolate(t, size=(oh, ow), mode="bicubic", align_corners=False).clamp(0.0, 1.0)
+
+def _restore(t):
+    """Real-ESRGAN animevideov3 on a [1,3,h,w] RGB float frame in [0,1] (explicit fp16 pass).
+
+    The net emits 4x; the result is resized (antialiased) to wherever the pipeline needs it
+    next: straight to the output size when this pass is also the upscaler (--upscale without
+    RTX VSR - one resize from the 4x reconstruction beats restore -> downscale -> bicubic
+    re-upscale), else back to the source size so RTX VSR upscales the restored frame. A
+    mid-run failure drops the pass for the rest of the clip; restore must never kill a render.
+    """
+    global RESTORE_ACTIVE
+    try:
+        out = _restore_net(t.half()).clamp(0.0, 1.0)     # fp16 4x reconstruction
+        oh, ow = (OUT_H, OUT_W) if (UPSCALE and not RTX_VSR_ACTIVE) else (H, W)
+        return realesr.fit(out, oh, ow).float()          # box/area/bicubic per target (shared w/ preview)
+    except Exception as e:  # noqa: BLE001 - degrade to the unrestored frame for the rest
+        sys.stderr.write(f"[restore] failed, dropping the pass: {repr(e)[:160]}\n"); sys.stderr.flush()
+        RESTORE_ACTIVE = False
+        return t
 
 # --- live output preview ----------------------------------------------------------------------
 # When SMV_LIVE_PREVIEW is set (the GUI passes a path under its userData dir), a small JPEG of
@@ -603,14 +672,19 @@ def _live_preview(t, hdr_packed=None):
 
 def to_bytes(t):
     t = t.float()[..., :H, :W]            # crop off the padding added in to_tensor
-    # Pipeline order, chosen for max quality (VSR -> RCAS -> TrueHDR):
+    # Pipeline order, chosen for max quality (restore -> VSR -> RCAS -> TrueHDR):
+    #   0. restore first (--restore): detail reconstruction at the source resolution, so the
+    #      upscaler receives a restored, in-distribution frame (see _restore; without RTX VSR
+    #      its 4x output IS the upscale source and the bicubic step below is skipped);
     #   1. upscale the clean interpolated frame (the AI upscaler gets an unsharpened, in-distribution
     #      input);
     #   2. sharpen at the OUTPUT resolution (RCAS crisps the final image instead of being blurred up
     #      by the upscaler);
     #   3. expand to HDR last (sharpening stays in SDR, where RCAS's luma weighting is valid).
     # VSR and TrueHDR are separate RTX passes (see rtxvideo.py) so RCAS can sit between them.
-    if UPSCALE:
+    if RESTORE_ACTIVE:
+        t = _restore(t)                   # may already land at OUT size (restore-as-upscaler)
+    if UPSCALE and t.shape[-1] != OUT_W:
         t = _upscale(t, OUT_W, OUT_H)     # RTX VSR (_RTX.run_vsr) or bicubic; -> OUT_W x OUT_H
     if SHARPEN > 0:
         t = _rcas(t, SHARPEN)             # FSR-style RCAS sharpen at the output res (GUI "FSR"); see _rcas
@@ -1073,8 +1147,9 @@ enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
 _sharp_note = f"  sharpen(rcas)={SHARPEN:g}" if SHARPEN > 0 else ""
 _up_note = f"  upscale={UPSCALE_F:g}x->{OUT_W}x{OUT_H}" if UPSCALE else ""
 _hdr_note = "  HDR10(TrueHDR,BT.2020 PQ)" if HDR_ACTIVE else ""
+_res_note = "  restore(animevideov3)" if RESTORE_ACTIVE else ""
 sys.stderr.write(f"encode: {venc} visually-lossless -> {out_pix}  "
-                 f"(source {SRC_CODEC or '?'} {SRC_BITS}bit {SRC_PIX}){_sharp_note}{_up_note}{_hdr_note}\n"); sys.stderr.flush()
+                 f"(source {SRC_CODEC or '?'} {SRC_BITS}bit {SRC_PIX}){_res_note}{_sharp_note}{_up_note}{_hdr_note}\n"); sys.stderr.flush()
 
 # Encode on a background thread so ffmpeg writes overlap the next frame's GPU work instead of
 # stalling the single pipe. One writer pulling a bounded FIFO preserves frame order, so the
@@ -1186,7 +1261,8 @@ if NO_INTERP:
             # Route through to_bytes (decode->tensor->process->bytes) when there is any per-frame
             # GPU work to do (sharpen and/or upscale); otherwise pass the raw frame straight to the
             # encoder as a plain re-encode.
-            wq.put(to_bytes(to_tensor(buf)) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE) else buf)
+            wq.put(to_bytes(to_tensor(buf))
+                   if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE or RESTORE_ACTIVE) else buf)
             k += 1
             if k % 10 == 0:
                 sys.stderr.write(f"PROGRESS {k}/{total_units}\n"); sys.stderr.flush()
@@ -1425,7 +1501,7 @@ try:
     # through (still routed through to_bytes when sharpening/upscaling changes its dims, or when
     # the pipe carries the output depth and the raw decode bytes would be the wrong size).
     if last_out is None:
-        wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE
+        wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE or RESTORE_ACTIVE
                                 or DEC_FMT != OUT_RAW_FMT) else prev)
     else:
         tail = (math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)) if FPS_MODE else args.multi

@@ -147,11 +147,13 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   backend by default.
 - `renderer/index.html` - the UI (select or drag in a video, an **Interpolate** master
   toggle, multiplier / fps / **match screen refresh rate**, an **FSR** sharpen toggle with
-  strength slider, output path with **Change...**, progress bar with frame counter and ETA,
+  strength slider, a **Restore** AI-detail toggle (see Sharper generated frames), output path
+  with **Change...**, progress bar with frame counter and ETA,
   Cancel, Open folder, Play video, log). Uses `require('electron')`; dropped files are resolved
   to paths with `webUtils.getPathForFile` (several picked or dropped files queue as a batch and
   render back to back), and the folder, multiplier, sharpen, interpolate and
-  match-screen settings are saved in `localStorage`.
+  match-screen settings are saved in `localStorage` (the Restore and RTX Dynamic Vibrance
+  toggles deliberately are NOT: both are per-session opt-ins that always start off).
 - `engine/gmfss_interp.py` - GMFSS pipe engine: ffmpeg decode into GMFSS into ffmpeg
   encode (audio copied), always encoding HEVC at 10 bit with the colour tags matched to the
   probed source and always targeting visually lossless (see Passthrough quality). Runs the
@@ -184,12 +186,15 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   static embeddings) and their license. Gitignored, see Setup.
 - `engine/GMFSS_Fortuna/` - GMFSS model code (inference chain only) plus `train_log/`
   weights (gitignored, see Setup).
+- `engine/realesr.py` - the `--restore` detail-restoration pass: Real-ESRGAN's SRVGGNetCompact
+  (vendored verbatim, BSD-3, license alongside) plus a loader for the bundled
+  `realesr-animevideov3.pth` weights (2.4 MB, gitignored, see Setup).
 - `engine/benchmark.py` - speed benchmark; appends a dated entry to `BENCHMARKS.md`.
 
 ## Setup (fresh clone)
-A fresh clone is missing three large, gitignored pieces: `engine/runtime`, `engine/bin`,
-and `engine/GMFSS_Fortuna/train_log`. The app needs all three to run, and `npm run dist`
-needs them present in order to bundle them.
+A fresh clone is missing four gitignored pieces: `engine/runtime`, `engine/bin`,
+`engine/GMFSS_Fortuna/train_log` and `engine/realesr-animevideov3.pth`. The app needs them
+to run, and `npm run dist` needs them present in order to bundle them.
 
 **1. GUI deps**
 ```
@@ -233,6 +238,11 @@ installed; it must be present for a portable `npm run dist`.
 **4. GMFSS weights into `engine/GMFSS_Fortuna/train_log`**
 The weights (feat, flownet, fusionnet, metric, rife pkl files) are gitignored because
 they are large. Restore them from the original GMFSS_Fortuna release.
+
+**5. Restore weights into `engine/`**
+Download `realesr-animevideov3.pth` (2.4 MB) from the Real-ESRGAN v0.2.5.0 GitHub release
+(https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth)
+into `engine\`. Without it the `--restore` pass just logs a notice and is skipped.
 
 ## Dev toolchain
 The development machine has Visual Studio 2019 Build Tools v142 (MSVC `cl.exe` 19.29) and the
@@ -587,9 +597,26 @@ For whoever picks this up.
   anime optical flow data fine-tune" is byte-identical to our five .pkl files, while the
   original union model differs in four of five (only rife.pkl shared). So there is no better
   drop-in weight set to swap to; the scene detection and dedup items (both now done) stop the
-  model interpolating where the flow is meaningless. The heavy
-  option, used in enhancr, is to chain a restoration or upscaling model (RealESRGAN, SCUNet) after
-  interpolation to re sharpen, at the cost of a second model per frame. The `scale` flag is
+  model interpolating where the flow is meaningless. The heavy option - chaining a restoration
+  model after interpolation, as enhancr does - is **done (2026-07-04)** as the opt-in
+  `--restore` flag / GUI **Restore** checkbox: Real-ESRGAN's official anime-video model
+  (`realesr-animevideov3`, 2.4 MB, bundled; vendored SRVGGNetCompact in `engine/realesr.py`,
+  BSD-3) cleans compression noise and generatively redraws the linework on every output frame
+  (not a mere filter - and not a texture builder either: on anime it tends to SMOOTH fine
+  texture, see the trade-offs below). It runs FIRST in the
+  per-frame chain (restore -> upscale -> RCAS -> HDR), so RTX VSR receives a restored,
+  in-distribution frame - and without RTX VSR the model's own 4x output directly feeds the
+  upscale (an `--upscale 2 --restore` render resizes the 4x reconstruction once instead of
+  restoring, downscaling and re-upscaling). Measured on the sample at 2x: variance-of-Laplacian
+  sharpness 2.2-2.4x the plain render's, with soft tween linework visibly rebuilt into clean
+  outlines. Honest trade-offs: the model REPAINTS the frame (local value changes of a few 8-bit
+  levels as it cleans haze and flattens some painterly texture - it targets cel-style anime),
+  and every output frame pays a second model pass. That pass is real work (~2.6 TFLOP per 1080p
+  frame), so it runs through the same per-resolution TensorRT engine cache as the GMFSS sub
+  nets (~40 s one-time build, eager fp16 fallback): roughly +50% wall on a 2x 1080p render,
+  proportionally more at higher multipliers since the cost scales with output frames, not
+  pairs. The before/after preview pane mirrors it exactly (shared `realesr.py`, eager - one
+  frame needs no engine). The `scale` flag is
   already at its sharp maximum (1.0); lowering it is what blurs.
 - **FSR-style sharpening with RCAS (done; on by default in the GUI).** The uniform look (every output
   frame generated on a half step grid, see Uniform look) trades a little global sharpness for
@@ -832,7 +859,9 @@ For whoever picks this up.
   coalesce instead of overlapping. The pane follows every HDR colour control live (2026-06-28) and,
   since 2026-07-02, the Upscale / RTX VSR setting too: the processed side runs upscale (RTX VSR, or
   bicubic when the runtime is absent), then RCAS at the output resolution, then HDR, exactly the
-  render's order, so the 1:1 zoom shows real output pixels. Nothing remains outstanding for the pane.
+  render's order, so the 1:1 zoom shows real output pixels; the 2026-07-04 Restore pass is
+  mirrored too (shared `realesr.py`, eager for the single frame). Nothing remains outstanding
+  for the pane.
 
 History (already done): the build was made portable by bundling a relocatable
 python-build-standalone runtime (replacing a non relocatable venv) and a bundled ffmpeg
@@ -854,7 +883,7 @@ so the installer target was dropped.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--no-interp] [--no-scene-detect] [--no-near-dup] [--no-dejudder] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--no-scene-detect] [--no-near-dup] [--no-dejudder] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 
 `--fps TARGET` overrides `<multi>` and resamples the timeline to any output fps (the model
@@ -879,6 +908,11 @@ drawn on twos/threes - are retimed together with the next distinct frame as one 
 span, spreading the real motion evenly across the output instead of holding then jumping;
 long stills and scene cuts still hold; see Duplicate frame handling for the measurements and
 safeguards). Disabling preserves the source's own cadence.
+`--restore` (off by default) runs Real-ESRGAN's anime-video model on every output frame to
+clean compression noise and redraw linework (a generative repaint; fine texture can flatten),
+before the upscale (without RTX VSR its 4x output directly
+feeds the upscale); works with `--no-interp` too (restoration without smoothing). See Sharper
+generated frames for the measurements and trade-offs.
 `--no-passthrough` disables track passthrough (on by default: all audio/subtitle tracks,
 chapters and fonts are copied, switching the default output to .mkv when the tracks need it;
 see the Tracks bullet under Passthrough quality).

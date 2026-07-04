@@ -29,6 +29,7 @@ engine/*.engine
 
 # large model weights (download separately, see README)
 engine/GMFSS_Fortuna/train_log/
+engine/realesr-animevideov3.pth
 
 # generated video outputs / scratch
 *.mp4

@@ -2,9 +2,10 @@
 
 Renders ONE source frame at the current spatial settings and writes <out>_original.png (the untouched
 source) and <out>_processed.png. The processed side applies the SAME passes in the SAME order as a full
-render (to_bytes in gmfss_interp.py): FSR RCAS sharpening first, in SDR (the shared rcas.py, the exact
-kernel the render uses), then RTX TrueHDR when --rtx-hdr. No interpolation,
-no encode, so the GUI can scrub settings and see the effect before a full render.
+render (to_bytes in gmfss_interp.py): AI detail restoration first when --restore (the shared
+realesr.py, eager - one frame needs no TRT engine), then the upscale, then FSR RCAS sharpening in SDR
+(the shared rcas.py, the exact kernel the render uses), then RTX TrueHDR when --rtx-hdr. No
+interpolation, no encode, so the GUI can scrub settings and see the effect before a full render.
 
 The HDR result is PQ/BT.2020, which a normal canvas cannot show, so it is tonemapped to sRGB for
 display: exposure is anchored to the SDR source (median luminance match), so midtones keep the source
@@ -148,6 +149,8 @@ def main():
                     help="output prefix; writes <out>_original.png and <out>_processed.png")
     ap.add_argument("--rtx-hdr", action="store_true", help="convert the processed frame to HDR (tonemapped)")
     ap.add_argument("--sharpen", type=float, default=0.0, help="FSR RCAS sharpen strength 0..1")
+    ap.add_argument("--restore", action="store_true",
+                    help="AI detail restoration (Real-ESRGAN animevideov3), like the render's --restore")
     ap.add_argument("--upscale", type=float, default=1.0,
                     help="spatial upscale factor for the processed side (1 = off, clamped to 8)")
     ap.add_argument("--rtx-vsr", action="store_true",
@@ -173,12 +176,13 @@ def main():
     if do_hdr and (ow > 8192 or oh > 8192):
         do_hdr = False   # mirror the engine: TrueHDR past 8192px oversubscribes VRAM (DPC-watchdog risk)
     vsr_used = False
+    restore_used = False
 
-    if strength > 0 or do_hdr or up > 1.0:
+    if strength > 0 or do_hdr or up > 1.0 or args.restore:
         import torch                       # heavy import, skipped entirely on the unchanged fast path
         from rcas import rcas              # the render engine's own FSR RCAS kernel
         need_vsr = up > 1.0 and args.rtx_vsr
-        dev = "cuda" if (do_hdr or need_vsr) else "cpu"
+        dev = "cuda" if (do_hdr or need_vsr or args.restore) else "cpu"
         t = torch.from_numpy(rgb_u8).to(dev).float().div(255.0).permute(2, 0, 1).unsqueeze(0).contiguous()
         rtx = None
         if need_vsr or do_hdr:
@@ -187,8 +191,20 @@ def main():
             except Exception:  # noqa: BLE001 - like the render: no bridge means bicubic + SDR
                 rtx, do_hdr, need_vsr = None, False, False
         try:
-            # Same order as a render (to_bytes): upscale, then RCAS at the OUTPUT resolution, then HDR.
-            if up > 1.0:
+            # Same order as a render (to_bytes): restore, upscale, RCAS at the OUTPUT resolution, HDR.
+            if args.restore:
+                try:
+                    import realesr
+                    net = realesr.load(torch.device("cuda"))
+                    r = net(t.half()).clamp(0.0, 1.0)          # fp16 4x reconstruction (eager: one frame)
+                    # Without VSR the reconstruction IS the upscale source, exactly like a render;
+                    # otherwise back to source size so VSR upscales the restored frame below.
+                    as_up = up > 1.0 and not need_vsr
+                    t = realesr.fit(r, oh if as_up else h0, ow if as_up else w0).float()
+                    restore_used = True
+                except Exception:  # noqa: BLE001 - degrade like the render: unrestored frame
+                    pass
+            if up > 1.0 and t.shape[-1] != ow:
                 if rtx is not None and need_vsr:
                     try:
                         t = rtx.run_vsr(t)
@@ -228,7 +244,8 @@ def main():
     cv2.imwrite(p_orig, cv2.cvtColor(orig_disp, cv2.COLOR_RGB2BGR))
     cv2.imwrite(p_proc, cv2.cvtColor(proc_disp, cv2.COLOR_RGB2BGR))
     sys.stdout.write(f"preview frame {idx}/{n} {ow}x{oh} hdr={int(do_hdr)} sharpen={strength:g} "
-                     f"srchdr={int(src_hdr)} up={up:g} vsr={int(vsr_used)} -> {p_orig} | {p_proc}\n")
+                     f"srchdr={int(src_hdr)} up={up:g} vsr={int(vsr_used)} "
+                     f"restore={int(restore_used)} -> {p_orig} | {p_proc}\n")
 
 
 if __name__ == "__main__":

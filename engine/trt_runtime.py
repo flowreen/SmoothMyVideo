@@ -15,12 +15,25 @@ wrappers with identical call signatures, so GMFSS_infer_u is untouched. Any expo
 or build failure falls back to the original eager module, so the app never breaks.
 """
 import hashlib
+import logging
 import os
 import sys
 import time
+import warnings
 
 import torch
 import torch.nn as nn
+
+# torch 2.12's dynamo exporter unpickles pytree TreeSpecs internally and trips torch's OWN
+# LeafSpec deprecation shim - a FutureWarning surfacing through copyreg once per one-time
+# engine build. Torch-internal, nothing this code calls; silence it so builds don't spam the
+# GUI log (same benign family as the documented torch.cuda.amp FutureWarnings).
+warnings.filterwarnings("ignore", message=r".*LeafSpec.*", category=FutureWarning)
+# The exporter also lazily imports torch.utils.flop_counter, whose import-time "triton not
+# found" logger warning is meaningless here (Triton is deliberately not installed on Windows,
+# see the README's torch.compile note). Raise that logger's threshold before the lazy import
+# fires; this module is imported ahead of every build, so it always lands in time.
+logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -163,9 +176,12 @@ def build_or_load(name, export_module, example_inputs, input_names, output_names
     _log(f"[trt] building {name} {_shape_tag(example_inputs)} (one time for this resolution)...")
     t0 = time.time()
     with torch.autocast("cuda", dtype=torch.float16):
+        # verbose=False drops the exporter's per-phase progress chatter (each phase printed
+        # twice: a start line, then the same line again with a checkmark on completion) - the
+        # "[trt] building..." line above is the user-facing signal for the one-time build.
         torch.onnx.export(export_module, tuple(example_inputs), onnx_path,
                           input_names=input_names, output_names=output_names,
-                          dynamo=True, opset_version=18)
+                          dynamo=True, opset_version=18, verbose=False)
     serialized = _build_serialized(onnx_path)
     with open(engine_path, "wb") as f:
         f.write(serialized)
@@ -276,6 +292,20 @@ class IFNetEngine(_Engine):
             _log(f"[trt] {self.name} fell back to eager: {repr(e)[:240]}")
             self.eager_only = True
             return self.eager(call_args[0], call_args[1], scale_list=[8, 4, 2, 1])
+
+
+class RestoreEngine(_Engine):
+    """TRT wrapper for the --restore Real-ESRGAN pass (realesr.py). The realesr weights hash
+    rides in the NAME (not the _w tag): a realesr weight swap changes the name and is a plain
+    cache miss (the old file lingers harmlessly, a few MB), while the global _w tag keeps the
+    startup GC from deleting these engines - it only ties them to the train_log fingerprint,
+    so a GMFSS weight swap also rebuilds them (seconds; the net is tiny)."""
+
+    def __init__(self, eager, whash):
+        super().__init__(f"restore_{whash}", eager, ["x"], ["y"])
+
+    def __call__(self, x):
+        return self._run(self.eager, (x,), (x,))
 
 
 def trtify(model):

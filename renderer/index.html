@@ -191,12 +191,19 @@
       </span>
       <span class="hint">crisper picture; runs after the upscale, before HDR</span>
     </div>
+    <div class="row">
+      <span class="k">Restore</span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="restore" style="width:auto;padding:0;accent-color:var(--green);"> AI detail
+      </label>
+      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; runs before the upscale; slower</span>
+    </div>
   </div>
 
   <div class="panel" id="previewpanel" style="display:none">
     <div class="row">
       <span class="k">Preview</span>
-      <span class="hint" id="hdrpreviewhint">your sharpen / HDR settings on a real frame · updates automatically</span>
+      <span class="hint" id="hdrpreviewhint">your restore / sharpen / HDR settings on a real frame · updates automatically</span>
     </div>
     <div id="hdrpreview" style="display:none;margin-top:6px">
       <div style="display:flex;align-items:center;gap:8px">
@@ -369,6 +376,15 @@ if(savedSharpVal !== null) $('sharpval').value = savedSharpVal;
 syncSharpen();
 $('sharpen').onchange = () => { localStorage.setItem('sharpenOn', $('sharpen').checked ? '1' : '0'); syncSharpen(); };
 $('sharpval').oninput = () => { localStorage.setItem('sharpenVal', $('sharpval').value); syncSharpen(); };
+
+// Restore: engine --restore. Real-ESRGAN's anime-video model cleans compression noise and
+// redraws linework on every output frame (before the upscale); fine texture can flatten - it
+// is a generative repaint, not a filter. Off by default: it changes the look, and every
+// emitted frame pays a second model pass.
+function restoreOn(){ return $('restore').checked; }
+// Restore ALWAYS starts off (user call 2026-07-04): an expensive, look-altering pass you opt
+// into per session, so its state is deliberately NOT persisted; old key retired.
+localStorage.removeItem('restoreOn');
 
 // Match screen refresh rate: when checked, the output target fps is the monitor's refresh rate
 // (rounded up, fetched from the main process) and the multiplier / fps inputs are overridden and
@@ -572,7 +588,7 @@ let prevBusy = false, prevPending = null;   // serialize renders; rapid setting 
 let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown / mid-render preview
 function prevSettingsSig(){                 // everything that changes what the processed pane shows
   const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
-  return [sharpStrength(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
+  return [sharpStrength(), restoreOn(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
           upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr)];
 }
 let lastPrevInput = null;                    // which video the shown original belongs to
@@ -594,7 +610,7 @@ async function loadPreview(frame){
     setSpin($('prevorigwrap'), $('prevorigspin'), true);
   }
   let r; try { r = await ipcRenderer.invoke('preview', Object.assign(
-    { input, frame: (frame == null ? 'mid' : frame), sharpen, hdr, nits: 1000,
+    { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr, nits: 1000,
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
       upscale: upFactor() || 0,
       rtxvsr: !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 0) }, hdrColorPayload())); }
@@ -613,16 +629,20 @@ async function loadPreview(frame){
   setPrevImg($('prevproc'), r.processed);
   lastPrevInput = input;
   lastPrevKey = JSON.stringify([input, prevIdx].concat(sig));
-  const active = hdr || sharpen > 0;
+  const upActive = upFactor() > 0;   // the processed side is upscaled too, so never call it unchanged
+  const active = hdr || sharpen > 0 || restoreOn() || upActive;
   const srcHdr = !!(info && info.srcHdr);
   $('prevoriglabel').textContent = srcHdr ? 'Original (HDR, tonemapped)' : 'Original';
+  const parts = []; if(restoreOn()) parts.push('Restore');
+  if(upActive) parts.push(($('rtxvsr').checked && rtxReady.vsr) ? 'VSR' : 'upscale');
+  if(sharpen > 0) parts.push('FSR'); if(hdr) parts.push('HDR');
   $('prevproclabel').textContent = !active ? 'Unchanged'
-    : 'Processed' + (hdr && sharpen > 0 ? ' (HDR + FSR)' : hdr ? ' (HDR, tonemapped)' : ' (FSR sharpen)');
+    : 'Processed (' + parts.join(' + ') + (hdr ? ', tonemapped' : '') + ')';
   $('prevlabel').textContent = 'frame ' + prevIdx + (prevTotal ? ' / ' + prevTotal : '');
   $('prevnote').textContent = (srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
-    : !active ? 'no FSR or RTX HDR enabled, the output will match the source'
+    : !active ? 'no Restore, FSR or RTX HDR enabled, the output will match the source'
     : hdr ? 'HDR is tonemapped to show on this SDR screen'
-    : 'FSR sharpening is subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
+    : 'detail changes are subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
 }
 function randFrame(){ return prevTotal > 1 ? Math.floor(Math.random() * prevTotal) : 'mid'; }
 function refreshPreviewIfOpen(){           // re-render the shown frame when sharpen / HDR changes
@@ -643,6 +663,7 @@ $('prevnext').onclick = async () => { await loadPreview(randFrame()); prevHist.p
 $('prevprev').onclick = async () => { if(prevHist.length > 1){ prevHist.pop(); updatePrevNav(); await loadPreview(prevHist[prevHist.length - 1]); } };
 $('sharpval').addEventListener('change', refreshPreviewIfOpen);
 $('sharpen').addEventListener('change', refreshPreviewIfOpen);
+$('restore').addEventListener('change', refreshPreviewIfOpen);
 
 // RTX HDR colour controls: Colour mode (Faithful = vivid 1.0, the accurate default; NVIDIA vivid =
 // the rtx mode where the Saturation slider behaves like real RTX TrueHDR but hue-corrected), plus a
@@ -682,14 +703,16 @@ function syncHdrColor(){
 // engine keeps the TrueHDR SDK scales (0..200, 100 neutral).
 function sdkCon(){ return 100 + (+$('hdrcon').value || 0); }
 function sdkSat(){ return 100 + (+$('hdrsat').value || 0); }
-const savedDynVib = localStorage.getItem('dynVib');       // vibrance on/off (gates its two sliders)
-if(savedDynVib === '1') $('hdrdynvib').checked = true;
+// Dynamic Vibrance ALWAYS starts off (user call 2026-07-04): it is a per-session opt-in
+// effect, so its on/off state is deliberately NOT persisted (the two slider values below
+// still are). The old 'dynVib' key is retired so no stale state lingers.
+localStorage.removeItem('dynVib');
 const savedHdrSat = localStorage.getItem('hdrSatApp');   // App scale -100..100 (older keys orphaned)
 if(savedHdrSat !== null) $('hdrsat').value = savedHdrSat;
 const savedHdrCon = localStorage.getItem('hdrCon'); if(savedHdrCon !== null) $('hdrcon').value = savedHdrCon;
 const savedHdrSB = localStorage.getItem('hdrSB'); if(savedHdrSB !== null) $('hdrsb').value = savedHdrSB;
 const savedHdrVib = localStorage.getItem('hdrVib'); if(savedHdrVib !== null) $('hdrvib').value = savedHdrVib;
-$('hdrdynvib').onchange = () => { localStorage.setItem('dynVib', $('hdrdynvib').checked ? '1' : '0'); syncHdrColor(); refreshPreviewIfOpen(); };
+$('hdrdynvib').onchange = () => { syncHdrColor(); refreshPreviewIfOpen(); };
 $('hdrsat').oninput = () => { localStorage.setItem('hdrSatApp', $('hdrsat').value); $('hdrsatnum').textContent = $('hdrsat').value; };
 $('hdrsat').addEventListener('change', refreshPreviewIfOpen);
 $('hdrcon').oninput = () => { localStorage.setItem('hdrCon', $('hdrcon').value); $('hdrconnum').textContent = $('hdrcon').value; };
@@ -715,7 +738,16 @@ function applyPrevZoom(){
 }
 function prevScrollSync(src, dst){
   if(prevSyncing) return; prevSyncing = true;
-  dst.scrollLeft = src.scrollLeft; dst.scrollTop = src.scrollTop;
+  // Proportional, not pixel-absolute: the two panes can hold different native sizes (an
+  // upscale or Restore preview's processed side is a larger image than the source), so only
+  // mirroring the scroll FRACTION keeps both panes on the same region of the scene. The <1px
+  // skip stops the async echo event from ping-ponging rounding jitter between the panes.
+  const fx = src.scrollLeft / Math.max(1, src.scrollWidth - src.clientWidth);
+  const fy = src.scrollTop / Math.max(1, src.scrollHeight - src.clientHeight);
+  const nl = fx * Math.max(0, dst.scrollWidth - dst.clientWidth);
+  const nt = fy * Math.max(0, dst.scrollHeight - dst.clientHeight);
+  if(Math.abs(dst.scrollLeft - nl) >= 1) dst.scrollLeft = nl;
+  if(Math.abs(dst.scrollTop - nt) >= 1) dst.scrollTop = nt;
   prevSyncing = false;
 }
 function setSpin(wrap, spin, on){
@@ -733,11 +765,19 @@ function repositionSpins(){          // keep a visible wheel glued to the viewpo
 }
 $('prevorigwrap').addEventListener('scroll', () => { prevScrollSync($('prevorigwrap'), $('prevprocwrap')); repositionSpins(); });
 $('prevprocwrap').addEventListener('scroll', () => { prevScrollSync($('prevprocwrap'), $('prevorigwrap')); repositionSpins(); });
-function togglePrevZoom(){
+function togglePrevZoom(e){
+  // Capture the clicked spot as a fraction of the displayed image BEFORE the zoom restyle
+  // changes the layout, then centre the 1:1 view on that spot (clicking the dragon's head
+  // zooms to the dragon's head, not the frame middle). The other pane follows via the
+  // proportional scroll sync, called directly so it lands this frame, not on the async event.
+  const img = e.currentTarget;
+  const fx = e.offsetX / Math.max(1, img.clientWidth);
+  const fy = e.offsetY / Math.max(1, img.clientHeight);
   prevZoom = !prevZoom; applyPrevZoom();
-  if(prevZoom){ const w = $('prevorigwrap');           // land in the middle of the frame, both panes
-    w.scrollLeft = ($('prevorig').scrollWidth - w.clientWidth) / 2;
-    w.scrollTop = ($('prevorig').scrollHeight - w.clientHeight) / 2; }
+  if(prevZoom){ const w = img.parentElement;
+    w.scrollLeft = fx * img.clientWidth - w.clientWidth / 2;
+    w.scrollTop = fy * img.clientHeight - w.clientHeight / 2;
+    prevScrollSync(w, w === $('prevorigwrap') ? $('prevprocwrap') : $('prevorigwrap')); }
   repositionSpins();
 }
 $('prevorig').onclick = togglePrevZoom;
@@ -784,8 +824,8 @@ $('go').onclick = () => {
   const rtxhdr = hdrOn();  // HDR only when its runtime is installed and the source is SDR
   // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
   // HDR is on. Bail only when nothing at all is enabled.
-  if(!interpOn() && sharpenStrength <= 0 && factor <= 0 && !rtxhdr){
-    alert('Nothing to do: turn on Interpolate, pick an Upscale resolution, enable FSR sharpening, or turn on RTX HDR (and install its runtime).');
+  if(!interpOn() && sharpenStrength <= 0 && factor <= 0 && !rtxhdr && !restoreOn()){
+    alert('Nothing to do: turn on Interpolate, pick an Upscale resolution, enable FSR sharpening or Restore, or turn on RTX HDR (and install its runtime).');
     return;
   }
   procStart = 0; baseK = 0; etaAnchor = 0; etaAnchorTime = 0; lastFps = 0; curDone = 0; curPct = 0;
@@ -799,9 +839,9 @@ $('go').onclick = () => {
   const srcFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
   totalGen = Math.max(1, Math.round(srcFrames*fpp));   // total frames the conversion will output
   cancelled = false;
-  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false;
+  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false;
   // What this run does, for the status / log (mainly relevant when interpolation is off).
-  const passes = []; if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
+  const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
   $('status').textContent = fileTag() + (interpOn() ? 'Warming up the model...' : offLabel);
   $('fill').style.width = '0%';
@@ -809,11 +849,13 @@ $('go').onclick = () => {
   const what = interpOn() ? (Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')) : 'no interpolation';
   const extra = (dims ? '  ·  '+(useRtxVsr ? 'RTX VSR' : 'bicubic')+' '+dims.w+'×'+dims.h : '')
               + (rtxhdr ? '  ·  RTX HDR' : '')
-              + (sharpenStrength>0 ? '  ·  FSR '+sharpenStrength : '');
+              + (sharpenStrength>0 ? '  ·  FSR '+sharpenStrength : '')
+              + (restoreOn() ? '  ·  Restore' : '');
   log('>> '+input+'  ->  '+what+extra+'\n');
   const payload = { input, multi:+$('multi').value, output: lastOut, interp: interpOn() };
   if(interpOn() && useFps) payload.fps = t;
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
+  if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
   payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)
   if(factor > 0) payload.upscale = factor;             // arbitrary upscale factor (target height / source)
   if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else bicubic)
@@ -873,7 +915,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
 ipcRenderer.on('engine-done', (_e, code) => {
   clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
   clearInterval(liveTimer); liveTimer = null; updateLive();   // final pull: the last written frame
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('interp').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('interp').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
     if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');

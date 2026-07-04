@@ -228,7 +228,7 @@ let current: ChildProcess | null = null;
 const LIVE_JPG = path.join(app.getPath('userData'), 'preview', 'live.jpg');
 ipcMain.handle('live-path', () => LIVE_JPG);
 
-ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; interp?: boolean; upscale?: number; rtxvsr?: boolean; rtxhdr?: boolean; codec?: string; hdrcolor?: string; hdrsat?: number; hdrcon?: number; hdrsb?: number; hdrvib?: number }) => {
+ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; restore?: boolean; interp?: boolean; upscale?: number; rtxvsr?: boolean; rtxhdr?: boolean; codec?: string; hdrcolor?: string; hdrsat?: number; hdrcon?: number; hdrsb?: number; hdrvib?: number }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
   // Output codec family (hevc default / av1 / vvc); the engine owns encoder pick + fallbacks.
   if (opts.codec && opts.codec !== 'hevc') args.push('--codec', opts.codec);
@@ -239,6 +239,9 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
   // FSR-style RCAS sharpening strength (GUI checkbox + slider). 0/omitted = off, leaving the
   // frames value-preserving; >0 enables the in-engine RCAS pass. Works with or without interp.
   if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
+  // AI detail restoration (GUI Restore checkbox): Real-ESRGAN animevideov3 on every output
+  // frame, before the upscale. Works with or without interpolation.
+  if (opts.restore) args.push('--restore');
   // Upscale factor (an arbitrary float, source height -> chosen target height), computed by the
   // renderer from the resolution selector. >1 enables the upscale pass. Without --rtx-vsr this is a
   // bicubic resize; with it, RTX Video Super Resolution (any target resolution, no integer-scale
@@ -294,13 +297,14 @@ ipcMain.on('cancel', () => {
 // Resolves with { error } instead when the frame or the RTX bridge is unavailable.
 ipcMain.handle('preview', (_e, opts: { input: string; frame?: number | string; sharpen?: number;
     hdr?: boolean; nits?: number; color?: string; saturation?: number; vibrance?: number; satboost?: number; contrast?: number;
-    upscale?: number; rtxvsr?: boolean }) => {
+    upscale?: number; rtxvsr?: boolean; restore?: boolean }) => {
   return new Promise((resolve) => {
     const dir = path.join(app.getPath('userData'), 'preview');
     try { fs.mkdirSync(dir, { recursive: true }); } catch { /* already exists */ }
     const prefix = path.join(dir, 'frame');
     const args = ['-u', PREVIEW_SCRIPT, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
     if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
+    if (opts.restore) args.push('--restore');
     if (opts.upscale && opts.upscale > 1) {
       args.push('--upscale', String(opts.upscale));
       if (opts.rtxvsr) args.push('--rtx-vsr');
