@@ -7,25 +7,34 @@
   :root { --green:#76b900; --panel:#2a2a2a; --bg:#1b1b1b; --text:#eaeaea; --sub:#9a9a9a; }
   * { box-sizing: border-box; }
   body { margin:0; padding:18px; background:var(--bg); color:var(--text);
-         font-family:'Segoe UI',sans-serif; }
+         font-family:'Segoe UI',sans-serif; font-size:16px; }   /* 16px floor for all text */
   h1 { margin:0; font-size:22px; }
-  .sub { color:var(--sub); font-size:12px; margin:2px 0 14px; }
+  .sub { color:var(--sub); font-size:16px; margin:2px 0 14px; }
   button { font:inherit; padding:7px 12px; border:0; border-radius:6px; cursor:pointer; }
   .panel { background:var(--panel); border-radius:8px; padding:12px 14px; margin:10px 0; }
   .row { display:flex; align-items:center; gap:10px; margin:6px 0; }
   .k { color:var(--sub); width:110px; } .v { font-family:Consolas,monospace; }
-  #go { background:var(--green); color:#0d0d0d; font-weight:700; font-size:15px; padding:10px 18px; }
+  #go { background:var(--green); color:#0d0d0d; font-weight:700; font-size:16px; padding:10px 18px; }
   #go:disabled { background:#444; color:#888; cursor:default; }
   select, input { font:inherit; background:#101010; color:var(--text); border:1px solid #444;
                   border-radius:5px; padding:5px 8px; }
   select:disabled, input:disabled { opacity:.45; cursor:not-allowed; }
-  #bar { height:18px; background:#101010; border-radius:9px; overflow:hidden; }
+  #bar { position:relative; height:28px; background:#101010; border-radius:14px; overflow:hidden; }
   #fill { height:100%; width:0; background:var(--green); transition:width .15s; }
-  #log { background:#101010; color:#ccc; font-family:Consolas,monospace; font-size:12px;
+  .preset { background:#222; color:var(--text); border:1px solid #3a3a3a; border-radius:5px;
+            padding:2px 8px; font-size:12px; cursor:pointer; }
+  .preset:hover:not(:disabled) { border-color:var(--green); }
+  .preset.active { background:var(--green); color:#0d0d0d; border-color:var(--green); font-weight:700; }
+  .preset:disabled { opacity:.4; cursor:default; }
+  /* Percentage painted on top of the fill, centred in the bar (taller bar so the larger text fits). */
+  #pct { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+         color:#fff; font-size:22px; font-weight:600; pointer-events:none;
+         text-shadow:0 1px 2px rgba(0,0,0,.6); }
+  #log { background:#101010; color:#ccc; font-family:Consolas,monospace; font-size:16px;
          height:150px; overflow:auto; white-space:pre-wrap; padding:8px; border-radius:6px; }
-  .hint { color:var(--sub); font-size:11px; }
+  .hint { color:var(--sub); font-size:16px; }
   body.drag { outline:3px dashed var(--green); outline-offset:-10px; }
-  button.mini { padding:3px 9px; font-size:12px; background:#3a3a3a; color:var(--text); }
+  button.mini { padding:3px 9px; font-size:16px; background:#3a3a3a; color:var(--text); }
   .spinwheel { width:34px; height:34px; border:3px solid rgba(255,255,255,.25);
                border-top-color:var(--green); border-radius:50%; animation:spin .8s linear infinite;
                filter:drop-shadow(0 0 2px rgba(0,0,0,.7)); }
@@ -58,19 +67,14 @@
       <span class="k">Interpolate</span>
       <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="interp" checked style="width:auto;padding:0;accent-color:var(--green);">
-        generate in-between frames for smoother motion (off = only sharpen the video)
+        generate in-between frames for smoother motion using the GMFSS AI model (off = only sharpen the video)
       </label>
     </div>
     <div class="row">
-      <span class="k">Multiplier</span>
-      <select id="multi">
-        <option value="2">2x</option>
-        <option value="4">4x</option>
-        <option value="8">8x</option>
-        <option value="16">16x</option>
-      </select>
-      <span class="hint">or fps</span>
-      <input id="fpsin" type="number" min="1" max="1000" step="0.001" style="width:80px">
+      <span class="k">Target FPS</span>
+      <input id="fpsin" type="number" min="1" max="2400" step="1" style="width:96px">
+      <span id="fpspresets" style="display:inline-flex;gap:5px;align-items:center"></span>
+      <span class="hint" id="multlabel"></span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -109,7 +113,8 @@
     </div>
     <div class="row"><span class="k">Saves to</span>
       <button id="changeout" class="mini" disabled>Change...</button>
-      <span class="v hint" id="out"></span></div>
+      <input id="out" class="v" type="text" spellcheck="false" disabled
+             placeholder="output file path" style="flex:1;min-width:0;font-size:16px"></div>
   </div>
 
   <div class="panel" id="rtxpanel">
@@ -240,20 +245,31 @@
     <span id="status" class="hint">Select a video to begin.</span>
   </div>
 
-  <div class="panel"><div id="bar"><div id="fill"></div></div>
+  <div class="panel"><div id="bar"><div id="fill"></div><div id="pct">0%</div></div>
     <div class="hint" id="frames" style="margin-top:6px"></div>
-    <img id="live" title="The frame being written right now" alt=""
-         style="display:none;margin-top:8px;max-width:100%;border-radius:4px"></div>
+    <div id="livewrap" style="display:none;margin-top:8px;align-items:flex-start;gap:8px">
+      <img id="live" title="The frame being written right now" alt=""
+           style="display:none;max-width:100%;border-radius:4px">
+      <button id="livetoggle" class="mini"
+              title="Show or hide the live preview of the frame being written. Hiding it stops the engine from producing it, freeing a little GPU/CPU each second; showing it starts producing it again.">Hide preview (frees resources)</button>
+    </div></div>
 
   <div id="log"></div>
 
 <script>
 const { ipcRenderer, shell, webUtils } = require('electron');
+// Announce every page load (app launch OR a reload). On a reload this lets main kill any engine
+// orphaned by the previous page - e.g. an accidental Ctrl+R mid-render - so the app comes up clean
+// instead of the refreshed UI racing a still-running engine (the 1%->15%->1% progress ping-pong).
+ipcRenderer.send('renderer-ready');
 const path = require('path');
-let info = null, input = null, lastOut = null, customOut = null, useFps = false, fpp = 1, totalGen = 1, procStart = 0, baseK = 0, cancelled = false;
+let info = null, input = null, lastOut = null, customOut = null, fpp = 1, totalGen = 1, procStart = 0, baseK = 0, cancelled = false;
 // Batch queue: inputs waiting after the current one. Filled by a multi-select pick or a multi-file
 // drop; consumed one at a time on engine-done (same settings for every file, default output names).
 let batch = [], batchTotal = 1, batchAuto = false;
+// #go doubles as the run's Pause/Resume toggle: 'idle' = "Smooth It!" (starts a run), 'running' =
+// "Pause" (holds generation), 'paused' = "Resume" (continues). engine-done resets it to 'idle'.
+let goMode = 'idle';
 function fileTag(){ return batchTotal > 1 ? 'File ' + (batchTotal - batch.length) + '/' + batchTotal + ' · ' : ''; }
 // ETA is a live countdown. Each PROGRESS frame re-anchors it to the average pace since warmup,
 // and a timer ticks the displayed seconds down between frames so it never sits frozen. curDone/
@@ -271,7 +287,7 @@ const $ = (id) => document.getElementById(id);
 // Stored-settings schema version: bump whenever a localStorage key or its scale/meaning changes,
 // and the first launch of the new build wipes every stored setting once, so stale keys can never
 // conflict with the new UI (e.g. the HDR slider rescales and key renames of 2026-07-02).
-const SETTINGS_VERSION = '2';
+const SETTINGS_VERSION = '3';   // 2026-07-06: multiplier dropdown replaced by a unified target-fps slider (new key fpsTarget)
 if(localStorage.getItem('settingsVersion') !== SETTINGS_VERSION){
   localStorage.clear();
   localStorage.setItem('settingsVersion', SETTINGS_VERSION);
@@ -286,29 +302,96 @@ function paint(){
     const remain = Math.max(0, etaAnchor - (Date.now()-etaAnchorTime)/1000);
     speed = '   ·   '+Math.round(lastFps)+' fps   ·   ETA '+fmtEta(remain)+'  ('+fmtFinish(remain)+')';
   }
-  $('frames').textContent = 'Frames: '+Math.round(curDone*fpp)+' / '+totalGen+'  ('+Math.round(curPct)+'%)'+speed;
+  $('frames').textContent = 'Frames: '+Math.round(curDone*fpp)+' / '+totalGen+speed;
 }
 function interpOn(){ return $('interp').checked; }
 function srcFps(){ const [n,d]=(info.fps||'24/1').split('/'); return (+n)/((+d)||1); }
-// With interpolation off the output keeps the source fps (we only sharpen), so the multiplier/
-// fps controls no longer drive the target rate or the 1:1 output-frame ratio.
+// Single control now: an integer TARGET FPS (slider + number box). The multiplier is DERIVED, not
+// chosen. targetFps is the box value; gridMulti() below picks the engine path from it.
 function targetFps(){ if(!interpOn()) return srcFps();
-  return useFps ? parseFloat($('fpsin').value) : Math.round(srcFps()*(+$('multi').value)); }
-function fpsValid(t){ if(!interpOn()) return true;
-  return useFps ? (t >= 1 && t <= 1000) : (t > 0); }
-function outRatio(){ if(!interpOn()) return 1;
-  return useFps ? targetFps()/srcFps() : (+$('multi').value); }
-function syncFpsField(){ if(info) $('fpsin').value = Math.round(srcFps()*(+$('multi').value)); }
+  const v = parseFloat($('fpsin').value); return (isNaN(v) || v <= 0) ? srcFps()*2 : v; }
+function sliderMin(){ return info ? Math.max(1, Math.round(srcFps())) : 1; }        // never target below the source rate
+function sliderMax(){ return info ? Math.round(srcFps()) * 100 : 2400; }             // up to 100x the (rounded) source rate, so 23.976 caps at 2400 not 2398
+// Decimals to display: match the source's natural precision (23.976 -> 3, 24 -> 0, 29.97 -> 2), taking
+// the MORE precise of source and monitor rate so screen-match values also render exactly (24 src +
+// 359.99 Hz -> 2). r_frame_rate is a rational (24000/1001), so read precision off a 3-dp rounding.
+function decimalsOf(x){ const s = (+x).toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  const i = s.indexOf('.'); return i < 0 ? 0 : s.length - 1 - i; }
+function targetDecimals(){ return info ? Math.max(decimalsOf(srcFps()), decimalsOf(screenHz)) : 0; }
+function fpsValid(t){ if(!interpOn()) return true; return t >= sliderMin() && t <= sliderMax(); }
+function outRatio(){ if(!interpOn()) return 1; return targetFps()/srcFps(); }
+// On-grid eligibility: if the integer target is an exact integer multiple of the (fractional) source
+// fps, run the GMFSS integer --multi path (real endpoints, exact for 23.976); else resample via --fps.
+// Returns the multiplier N (>=2) for the on-grid case, or 0 for the resample case. Uses the fractional
+// srcFps so 48 -> N=2 on a 23.976 source (round(23.976*2)=48).
+function gridMulti(){ if(!info) return 0; const s = srcFps(); const t = targetFps(); const N = Math.round(t/s);
+  return (N >= 2 && Math.abs(s*N - t) < 0.02) ? N : 0; }   // on-grid when the target is an exact multiple (tolerance covers the 3-dp display rounding)
+// Quick-pick multipliers, rendered as preset chips (they replaced the slider's magnets). The number
+// box is the exact target; a chip just sets the box to round(srcFps*k). All chip values are on-grid.
+const PRESET_MULTS = [2, 4, 8, 16, 32];
+// Push a target into the box (clamped, formatted to the source/monitor decimal count; the VALUE keeps
+// its exact fractional precision, e.g. 2x of 23.976 = 47.952), then reflect chip state.
+function setTarget(v){ v = Math.min(sliderMax(), Math.max(sliderMin(), v));
+  $('fpsin').max = sliderMax(); $('fpsin').value = v.toFixed(targetDecimals()); syncPresetState(); }
+// (Re)build the preset chips for the current source fps: label = "k×", title = the exact resulting fps.
+function buildPresets(){ const box = $('fpspresets'); box.innerHTML = ''; if(!info) return;
+  const s = srcFps();
+  PRESET_MULTS.forEach(k => { const fps = s*k; if(fps > sliderMax()) return;
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'preset';
+    b.dataset.mult = k; b.textContent = k + '×'; b.title = fps.toFixed(targetDecimals()) + ' fps';
+    b.onclick = () => { if(b.disabled) return; setTarget(fps); localStorage.setItem('fpsTarget', fps); refresh(); };
+    box.appendChild(b); });
+  syncPresetState(); }
+// Grey the chips when the target controls are locked, and highlight the one whose multiplier is active.
+function syncPresetState(){ if(!$('fpspresets')) return; const gm = gridMulti();
+  const dis = !interpOn() || $('screenfps').checked || goMode === 'running';
+  [...$('fpspresets').children].forEach(b => { b.disabled = dis;
+    b.classList.toggle('active', !dis && +b.dataset.mult === gm); }); }
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
   const d = upDims();                                   // upscale target ({w,h} or null); tag the new height
   const res = d ? '_' + d.h + 'p' : '';
   const ext = (info && info.needMkv) ? '.mkv' : '.mp4';   // subtitles/extra tracks ride in mkv
   return interpOn() ? (b + '_' + Math.round(targetFps()) + 'fps' + res + ext)
                     : (b + (d ? res : '_sharpened') + ext); }
+// A custom name that STILL CARRIES an auto tag (_<n>fps or _<n>p) stays in sync with the settings:
+// the user's folder, base words and extension are preserved, and the _<n>fps / _<n>p suffix is
+// regenerated from the current fps + upscale - so changing the fps updates the fps tag, and enabling
+// or changing the upscale resolution updates (or appends) the resolution tag, layered on top of the
+// user's edit. A name the user renamed with neither tag left is treated as fully custom and never rewritten.
+function retagCustom(name){
+  if(!/_\d+fps(?=[._]|$)|_\d+p(?=[._]|$)/.test(name)) return name;
+  const slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+  const dir = name.slice(0, slash + 1);                 // '' when there is no directory part
+  const rest = name.slice(slash + 1);
+  const dot = rest.lastIndexOf('.');
+  const ext = dot >= 1 ? rest.slice(dot) : '';          // keep the user's chosen extension
+  let base = dot >= 1 ? rest.slice(0, dot) : rest;
+  base = base.replace(/_\d+fps/g, '').replace(/_\d+p(?=_|$)/g, '').replace(/_sharpened/g, '');
+  const d = upDims();
+  const res = d ? '_' + d.h + 'p' : '';
+  const tags = interpOn() ? ('_' + Math.round(targetFps()) + 'fps' + res) : (d ? res : '_sharpened');
+  return dir + base + tags + ext;
+}
 function refresh(){ if(!input) return;
   const t = targetFps();
-  if(!fpsValid(t)){ $('out').textContent = 'enter an output fps between 1 and 1000'; lastOut = null; return; }
-  lastOut = customOut || outName(); $('out').textContent = lastOut; }
+  const N = gridMulti();
+  const r = t / srcFps();
+  $('multlabel').textContent = !interpOn() ? ''
+    : N ? '= ' + N + '× · on-grid'                                          // exact integer multiple
+    : Math.round(t) <= Math.round(srcFps()) ? '1× · no new frames'          // degenerate: output fps = source fps
+    : r < 9.95 ? r.toFixed(1) + '× · resampled'                             // small ratios shown honestly (1.5×, 2.5×)
+    : '≈' + Math.round(r) + '× · resampled';                               // large ratios: the fractional part is just noise
+  syncPresetState();
+  if(!fpsValid(t)){ $('out').value = ''; $('out').placeholder = 'target fps must be ' + sliderMin() + '-' + sliderMax(); lastOut = null; return; }
+  $('out').placeholder = 'output file path';
+  if(customOut) customOut = retagCustom(customOut);   // re-sync the _fps/_p tags in the user's name
+  lastOut = customOut || outName(); $('out').value = lastOut;
+  if(goMode === 'idle') $('out').disabled = false;   // editable while idle; startRun locks it
+}
+// Editing the output path inline: a non-empty value becomes the custom output (kept across setting
+// changes, like the Change... dialog); clearing it on blur reverts to the auto-generated name.
+$('out').oninput = () => { const v = $('out').value.trim(); customOut = v || null; lastOut = v || outName(); };
+$('out').onchange = () => { if(!$('out').value.trim()){ customOut = null; refresh(); } };
 
 async function loadVideo(f){
   if(!f) return false;
@@ -336,7 +419,7 @@ async function loadVideo(f){
                                             : '(convert SDR video to HDR)';
   $('info').style.display='block';
   $('res').textContent = s.width+' x '+s.height;
-  $('fps').textContent = srcFps().toFixed(3);
+  $('fps').textContent = srcFps().toFixed(decimalsOf(srcFps()));   // natural precision: 24 -> "24", 23.976 -> "23.976"
   const d=info.dur|0; $('dur').textContent = (d/3600|0)+':'+String((d%3600/60|0)).padStart(2,'0')+':'+String(d%60).padStart(2,'0');
   $('codec').textContent = (s.codec_name || '?')
     + (info.nAud > 1 || info.nSub ? '  ·  ' + info.nAud + ' audio · ' + info.nSub
@@ -358,12 +441,15 @@ function queueVideos(paths){
   loadVideo(list[0]);
 }
 $('pick').onclick = async () => { queueVideos(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
-$('multi').onchange = () => { localStorage.setItem('multi', $('multi').value); useFps = false; syncFpsField(); refresh(); };
-$('fpsin').oninput = () => { useFps = true; if(parseFloat($('fpsin').value) > 1000) $('fpsin').value = 1000; refresh(); };
-
-// Restore the last chosen multiplier from the previous session.
-const savedMulti = localStorage.getItem('multi');
-if(savedMulti && [...$('multi').options].some(o => o.value === savedMulti)) $('multi').value = savedMulti;
+// Number box is the exact target. While typing, only clamp the upper bound (so partial entries aren't
+// fought) and persist; the low-end clamp + two-decimal (.00) formatting happen on commit.
+$('fpsin').oninput = () => { let v = parseFloat($('fpsin').value); const mx = sliderMax(); if(v > mx){ v = mx; $('fpsin').value = mx; }
+  if(!isNaN(v)) localStorage.setItem('fpsTarget', v); refresh(); };
+// On commit (blur / Enter / spinner): clamp into range and re-render at the source/monitor decimal count.
+$('fpsin').onchange = () => { let v = parseFloat($('fpsin').value); if(isNaN(v)) return;
+  v = Math.min(sliderMax(), Math.max(sliderMin(), v));
+  $('fpsin').value = v.toFixed(targetDecimals()); localStorage.setItem('fpsTarget', v); refresh(); };
+// The persisted target (key fpsTarget) is restored per-video in applyScreenFps once the source fps is known.
 
 // Sharpen (CAS): a checkbox enables Contrast Adaptive Sharpening and reveals a 0..1 strength slider;
 // unchecking hides the slider and disables it. Default is on at full strength (1.0). The strength is
@@ -399,20 +485,22 @@ let screenHz = 60;
 function applyScreenFps(){
   const interp = interpOn();
   const on = interp && $('screenfps').checked;   // the screen-rate override only applies when interpolating
-  // Multiplier + fps are greyed when interpolation is off (no rate change) or when the
-  // screen-rate override owns the target fps.
-  $('multi').disabled = !interp || $('screenfps').checked;
+  // The target-fps box + preset chips are greyed when interpolation is off (no rate change) or when
+  // the screen-rate override owns the target (chip greying is handled by syncPresetState).
   $('fpsin').disabled = !interp || $('screenfps').checked;
-  if(on){ useFps = true; $('fpsin').value = screenHz; }
-  else if(interp){ useFps = false; syncFpsField(); }
-  else { useFps = false; }                        // interpolation off: target fps = source fps
+  if(info){
+    if(on) setTarget(screenHz);                   // match the monitor exactly (1000Hz on a 24 source = 41.67x -> --fps)
+    else if(interp){ const v = +localStorage.getItem('fpsTarget');   // restore the persisted target (survives run/reload); default 2x
+      setTarget(v >= sliderMin() ? v : srcFps()*2); }   // default 2x, kept exact (23.976 -> 47.952)
+    buildPresets();                               // chip labels depend on the source fps; rebuild per video
+  }
   refresh();
 }
 if(localStorage.getItem('screenfps') === '1') $('screenfps').checked = true;
 $('screenfps').onchange = () => { localStorage.setItem('screenfps', $('screenfps').checked ? '1' : '0'); applyScreenFps(); };
 ipcRenderer.invoke('refresh-rate').then(hz => {
   screenHz = (+hz) || 60; $('screenhz').textContent = screenHz;
-  if($('screenfps').checked) applyScreenFps();
+  if(info) applyScreenFps();   // monitor rate can add decimals (359.99 -> 2), so reformat the target box now that it's known
 });
 
 // Upscale-to-resolution: a target height chosen from the dropdown (or the Custom slider) drives an
@@ -572,8 +660,22 @@ function setPrevImg(el, file, mime){
 // produced (~1/s, SMV_LIVE_PREVIEW); poll it by mtime and show it under the progress bar.
 let livePath = null, liveTimer = null, liveM = 0;
 ipcRenderer.invoke('live-path').then(p => { livePath = p; });
+// Hide/Show toggle: the preview costs a little GPU/CPU per second, so hiding it tells the engine
+// (via main's live-off flag) to stop producing it, not just hides the image. Persisted.
+let liveHidden = localStorage.getItem('liveHidden') === '1';
+function applyLiveOff(){ ipcRenderer.send('live-off', liveHidden); }   // sync engine to the saved choice
+function syncLiveToggle(){
+  $('livetoggle').textContent = liveHidden ? 'Show preview' : 'Hide preview (frees resources)';
+  if(liveHidden) $('live').style.display = 'none';   // Show reveals again on the next written frame
+}
+$('livetoggle').onclick = () => {
+  liveHidden = !liveHidden;
+  localStorage.setItem('liveHidden', liveHidden ? '1' : '0');
+  syncLiveToggle(); applyLiveOff();
+};
+syncLiveToggle();
 function updateLive(){
-  if(!livePath) return;
+  if(!livePath || liveHidden) return;             // hidden: engine produces nothing, keep it hidden
   try {
     const m = _fs.statSync(livePath).mtimeMs;
     if(m === liveM) return;                       // nothing new yet
@@ -635,17 +737,21 @@ async function loadPreview(frame){
   lastPrevInput = input;
   lastPrevKey = JSON.stringify([input, prevIdx].concat(sig));
   const upActive = upFactor() > 0;   // the processed side is upscaled too, so never call it unchanged
+  const vsrOn = $('rtxvsr').checked && rtxReady.vsr;   // AI upscale vs the plain bicubic fallback
   const active = hdr || sharpen > 0 || restoreOn() || upActive;
+  // Plain bicubic upscale with no AI/enhancement pass: both panes are the same bicubic image, so say so.
+  const bicubicOnly = upActive && !vsrOn && !restoreOn() && sharpen <= 0 && !hdr;
   const srcHdr = !!(info && info.srcHdr);
   $('prevoriglabel').textContent = srcHdr ? 'Original (HDR, tonemapped)' : 'Original';
   const parts = []; if(restoreOn()) parts.push('Restore');
-  if(upActive) parts.push(($('rtxvsr').checked && rtxReady.vsr) ? 'VSR' : 'upscale');
+  if(upActive) parts.push(vsrOn ? 'VSR' : 'bicubic');
   if(sharpen > 0) parts.push('FSR'); if(hdr) parts.push('HDR');
   $('prevproclabel').textContent = !active ? 'Unchanged'
-    : 'Processed (' + parts.join(' + ') + (hdr ? ', tonemapped' : '') + ')';
+    : 'Processed (' + parts.join(' + ') + ')';
   $('prevlabel').textContent = 'frame ' + prevIdx + (prevTotal ? ' / ' + prevTotal : '');
   $('prevnote').textContent = (srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
     : !active ? 'no Restore, FSR or RTX HDR enabled, the output will match the source'
+    : bicubicOnly ? 'plain bicubic upscale, no AI detail added — enable RTX VSR for that (both panes match)'
     : hdr ? 'HDR is tonemapped to show on this SDR screen'
     : 'detail changes are subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
 }
@@ -818,10 +924,15 @@ document.addEventListener('drop', (e) => {
   }
 });
 
-$('go').onclick = () => {
+function startRun(){
   if(!input) return;
   const t = targetFps();
-  if(!fpsValid(t)){ alert('Enter an output fps between 1 and 1000.'); return; }
+  if(!fpsValid(t)){ alert('Enter a target fps between ' + sliderMin() + ' and ' + sliderMax() + '.'); return; }
+  // 1x (target fps == source fps) adds no frames - it just re-generates every frame as a midpoint tween
+  // (softer, half-frame shift), a strictly worse video. Block it with guidance instead of running it.
+  if(interpOn() && Math.round(t) <= Math.round(srcFps())){
+    alert('A 1× target adds no frames (output fps = source fps). Raise the target above ' + Math.round(srcFps())
+        + ' fps to smooth, or turn off Interpolate to just sharpen / re-encode.'); return; }
   const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
   const dims = upDims();                               // upscale target ({w,h} or null)
   const factor = upFactor();                           // arbitrary upscale factor (0 = off)
@@ -839,26 +950,35 @@ $('go').onclick = () => {
   // whatever is on disk now (a previous run's leftover) and hide the old image until a new write.
   try { liveM = _fs.statSync(livePath).mtimeMs; } catch { liveM = 0; }
   $('live').style.display = 'none';
+  // Reveal the live area (image appears on the first written frame) so its Hide/Show toggle is
+  // reachable for the whole run, and re-assert the engine-side on/off to match the saved choice.
+  $('livewrap').style.display = 'flex';
+  applyLiveOff();
   clearInterval(liveTimer); liveTimer = setInterval(updateLive, 1000);
   fpp = outRatio();                                    // output frames produced per source frame (1 when not interpolating)
   const srcFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
   totalGen = Math.max(1, Math.round(srcFrames*fpp));   // total frames the conversion will output
   cancelled = false;
-  $('go').disabled = true; $('pick').disabled = true; $('changeout').disabled = true; $('interp').disabled = true; $('multi').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false;
+  // #go stays enabled and becomes the Pause toggle for the duration of the run (see goMode).
+  goMode = 'running'; $('go').textContent = 'Pause';
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; syncPresetState();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
   $('status').textContent = fileTag() + (interpOn() ? 'Warming up the model...' : offLabel);
-  $('fill').style.width = '0%';
+  $('fill').style.width = '0%'; $('pct').textContent = '0%';
   $('frames').textContent = interpOn() ? 'Warming up (loading model, first frames)...' : offLabel;
-  const what = interpOn() ? (Math.round(t)+' fps'+(useFps ? '' : ' ('+$('multi').value+'x)')) : 'no interpolation';
+  const gm = gridMulti();
+  const rr = t/srcFps();
+  const ratioTxt = gm ? gm+'×, on-grid' : (rr < 9.95 ? rr.toFixed(1)+'×, resampled' : '≈'+Math.round(rr)+'×, resampled');
+  const what = interpOn() ? (t.toFixed(targetDecimals())+' fps ('+ratioTxt+')') : 'no interpolation';
   const extra = (dims ? '  ·  '+(useRtxVsr ? 'RTX VSR' : 'bicubic')+' '+dims.w+'×'+dims.h : '')
               + (rtxhdr ? '  ·  RTX HDR' : '')
               + (sharpenStrength>0 ? '  ·  FSR '+sharpenStrength : '')
               + (restoreOn() ? '  ·  Restore' : '');
   log('>> '+input+'  ->  '+what+extra+'\n');
-  const payload = { input, multi:+$('multi').value, output: lastOut, interp: interpOn() };
-  if(interpOn() && useFps) payload.fps = t;
+  const payload = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
+  if(interpOn() && !gm) payload.fps = t;                                             // resample only: non-integer-multiple target
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
   payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)
@@ -872,6 +992,26 @@ $('go').onclick = () => {
     payload.hdrsb = effSatBoost();                                 // vibrance uniform gain (0..1)
     payload.hdrvib = effVibrance(); }
   ipcRenderer.send('run', payload);
+}
+// #go dispatches on its current mode: start a fresh run when idle, otherwise toggle Pause/Resume.
+$('go').onclick = () => {
+  if(goMode === 'idle'){ startRun(); return; }
+  if(goMode === 'running'){
+    // Pause: the engine finishes the frames already queued to the encoder, then holds before the
+    // next source pair. Stop the ETA countdown (it would keep ticking down through the idle time).
+    goMode = 'paused'; $('go').textContent = 'Resume';
+    $('status').textContent = fileTag() + 'Paused — click Resume to continue.';
+    clearInterval(etaTimer); etaTimer = null;
+    ipcRenderer.send('pause');
+  } else { // paused -> resume
+    goMode = 'running'; $('go').textContent = 'Pause';
+    // Re-anchor the pace clock so the paused span doesn't drag the mean fps (and ETA) down; skip
+    // if warmup never finished (procStart still 0 — the first-frame handler will anchor instead).
+    if(procStart){ procStart = Date.now(); baseK = curDone; }
+    etaTimer = setInterval(paint, 500);
+    $('status').textContent = fileTag() + 'Smoothing on the GPU...';
+    ipcRenderer.send('resume');
+  }
 };
 $('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
 $('play').onclick = () => { if(lastOut) shell.openPath(lastOut); };   // system default player
@@ -892,6 +1032,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
     const frac = Math.min(1, Math.max(0, done/tot));
     const pct = 100*frac;                              // 0% at first generated frame -> 100% at last
     $('fill').style.width = pct+'%';
+    $('pct').textContent = Math.round(pct)+'%';          // the percentage now lives inside the bar
     curDone = done; curPct = pct;
     const now = Date.now();
     if(!procStart){
@@ -918,14 +1059,17 @@ ipcRenderer.on('engine-out', (_e, t) => {
   }
 });
 ipcRenderer.on('engine-done', (_e, code) => {
+  // Reset the Pause/Resume toggle back to a fresh "Smooth It!" first, so every exit path
+  // (done / cancelled / failed) restores it and the batch auto-advance below re-enters startRun.
+  goMode = 'idle'; $('go').textContent = 'Smooth It!';
   clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
   clearInterval(liveTimer); liveTimer = null; updateLive();   // final pull: the last written frame
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('interp').disabled=false; $('multi').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; $('interp').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
     if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');
     batch = []; batchTotal = 1; }
-  else if(code===0){ $('fill').style.width='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen+'  (100%)';
+  else if(code===0){ $('fill').style.width='100%'; $('pct').textContent='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen;
     $('status').textContent='Done!'; $('open').disabled=false; $('play').disabled=false; log('>> Saved: '+lastOut+'\n');
     if(batch.length){
       // Batch: load the next queued file and start it with the same settings. batchAuto suppresses

@@ -1,0 +1,8 @@
+EXPORTS
+rtxv_set_model_path
+rtx_video_api_cuda_create
+rtx_video_api_cuda_evaluate_deviceptr
+rtx_video_api_cuda_evaluate_vsr_deviceptr
+rtx_video_api_cuda_evaluate_thdr_deviceptr
+rtx_video_api_cuda_evaluate_hostptr
+rtx_video_api_cuda_shutdown

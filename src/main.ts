@@ -35,6 +35,16 @@ function createWindow() {
   });
   win.setMenuBarVisibility(false);
   win.loadFile(path.join(ROOT, 'renderer', 'index.html'));
+  // Guard against an accidental reload (Ctrl/Cmd+R, F5) WHILE the engine is running/paused: a reload
+  // wipes the renderer's job state but leaves the engine alive in this process, and the next run spawns
+  // a rival engine (both stream PROGRESS -> the bar ping-pongs 1%->15%->1%). Swallow the reload keys
+  // while a job is live so the render is preserved; the 'renderer-ready' handler is the fallback for
+  // any reload that arrives by another route (menu, devtools, programmatic).
+  win.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+    const key = (input.key || '').toLowerCase();
+    if (current && ((key === 'r' && (input.control || input.meta)) || key === 'f5')) event.preventDefault();
+  });
 }
 
 // Single instance only. A second launch shares this profile dir, and Chromium's disk/GPU cache and
@@ -88,11 +98,15 @@ ipcMain.handle('probe', async (_e, file: string) => {
 });
 
 ipcMain.handle('refresh-rate', () => {
-  // Refresh rate of the monitor the app window is on (fallback: primary), rounded up so a
-  // 59.94 / 143.9 Hz panel targets a clean 60 / 144. Feeds the renderer's "match screen" option.
+  // TRUE refresh rate of the monitor the app window is on (fallback: primary), kept FRACTIONAL so a
+  // 59.94 / 359.99 Hz panel feeds the renderer its exact rate - drives "match screen" and its decimal
+  // precision (see decimalsOf/targetDecimals in the renderer). Only float noise is trimmed to 3 dp.
+  // NOTE: on Windows the OS display API usually reports whole Hz, so this is commonly an integer anyway;
+  // a truly fractional rate would need a native DXGI/DWM query, which we don't do.
   try {
     const d = win ? screen.getDisplayMatching(win.getBounds()) : screen.getPrimaryDisplay();
-    return Math.ceil(d.displayFrequency || screen.getPrimaryDisplay().displayFrequency || 60);
+    const hz = d.displayFrequency || screen.getPrimaryDisplay().displayFrequency || 60;
+    return Math.round(hz * 1000) / 1000;
   } catch { return 60; }
 });
 
@@ -228,6 +242,33 @@ let current: ChildProcess | null = null;
 const LIVE_JPG = path.join(app.getPath('userData'), 'preview', 'live.jpg');
 ipcMain.handle('live-path', () => LIVE_JPG);
 
+// Cooperative pause flag: the engine (SMV_PAUSE_FILE) checks this file at each source-pair
+// boundary. Creating it holds generation after the queued frames finish encoding; removing it
+// resumes. The renderer's Pause/Resume button drives it via the 'pause'/'resume' IPC below.
+const PAUSE_FLAG = path.join(app.getPath('userData'), 'preview', 'pause.flag');
+const clearPause = () => { try { fs.unlinkSync(PAUSE_FLAG); } catch { /* not paused */ } };
+ipcMain.on('pause', () => { try { fs.writeFileSync(PAUSE_FLAG, ''); } catch { /* ignore */ } });
+ipcMain.on('resume', clearPause);
+// A fresh renderer page (app launch OR a reload) can't manage an engine started by the previous page.
+// If a reload slipped past the key guard in createWindow, that engine is orphaned - still streaming
+// PROGRESS - and the next run would race it (the 1%->15%->1% ping-pong). So on every renderer load,
+// kill any in-flight engine and clear the pause flag: the page comes up clean/idle. On first launch
+// current is null, so this is a harmless no-op that just clears any stale pause flag.
+ipcMain.on('renderer-ready', () => {
+  const c = current; current = null;
+  if (c && c.pid) { try { execFile('taskkill', ['/pid', String(c.pid), '/T', '/F'], () => {}); } catch { /* already gone */ } }
+  clearPause();
+});
+
+// Live-preview Hide toggle: the engine (SMV_LIVE_OFF_FILE) skips producing the thumbnail while this
+// file exists, so hiding it reclaims the per-second snapshot cost, not just the UI. The renderer
+// sends its persisted preference on toggle and at each run start.
+const LIVE_OFF_FLAG = path.join(app.getPath('userData'), 'preview', 'live_off.flag');
+ipcMain.on('live-off', (_e, off: boolean) => {
+  try { if (off) fs.writeFileSync(LIVE_OFF_FLAG, ''); else fs.unlinkSync(LIVE_OFF_FLAG); }
+  catch { /* already in the desired state */ }
+});
+
 ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?: number; sharpen?: number; restore?: boolean; interp?: boolean; upscale?: number; rtxvsr?: boolean; rtxhdr?: boolean; codec?: string; hdrcolor?: string; hdrsat?: number; hdrcon?: number; hdrsb?: number; hdrvib?: number }) => {
   const args = ['-u', ENGINE_SCRIPT, opts.input, String(opts.multi), opts.output];
   // Output codec family (hevc default / av1 / vvc); the engine owns encoder pick + fallbacks.
@@ -235,7 +276,9 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
   // Interpolation is the default; interp === false means the user only wants the sharpen pass,
   // so tell the engine to skip frame generation (and ignore any fps/multi) entirely.
   if (opts.interp === false) args.push('--no-interp');
-  else if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
+  else {
+    if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
+  }
   // FSR-style RCAS sharpening strength (GUI checkbox + slider). 0/omitted = off, leaving the
   // frames value-preserving; >0 enables the in-engine RCAS pass. Works with or without interp.
   if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
@@ -275,14 +318,28 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
   try { fs.mkdirSync(path.join(app.getPath('userData'), 'preview'), { recursive: true }); } catch { /* exists */ }
   const env = { ...process.env, PYTHONUTF8: '1',
     SMV_TRT_CACHE: path.join(app.getPath('userData'), 'trt_cache'),
-    SMV_LIVE_PREVIEW: LIVE_JPG };
+    SMV_LIVE_PREVIEW: LIVE_JPG,
+    SMV_PAUSE_FILE: PAUSE_FLAG,
+    SMV_LIVE_OFF_FILE: LIVE_OFF_FLAG };
+  clearPause();   // start unpaused: never inherit a stale flag from a previous (e.g. killed) run
   const proc = spawn(pyExe(), args, { cwd: ENGINE, env });
   current = proc;
-  const onData = (buf: Buffer) => e.sender.send('engine-out', buf.toString());
+  // The engine keeps emitting stdout/stderr (and eventually 'close') asynchronously. If the renderer
+  // window was closed mid-render, e.sender is destroyed and e.sender.send() throws "Object has been
+  // destroyed", which is an UNCAUGHT exception in the main process and kills the whole app. Guard every
+  // send: skip when the WebContents is gone, and try/catch as a backstop against a check/send race.
+  const send = (channel: string, ...payload: unknown[]) => {
+    try { if (!e.sender.isDestroyed()) e.sender.send(channel, ...payload); }
+    catch { /* renderer went away between the isDestroyed check and the send; nothing to update */ }
+  };
+  const onData = (buf: Buffer) => {
+    const txt = buf.toString();
+    if (txt) send('engine-out', txt);
+  };
   proc.stdout.on('data', onData);
   proc.stderr.on('data', onData);
-  proc.on('close', (code) => { current = null; e.sender.send('engine-done', code); });
-  proc.on('error', (err) => { current = null; e.sender.send('engine-out', 'spawn error: ' + err); e.sender.send('engine-done', -1); });
+  proc.on('close', (code) => { current = null; clearPause(); send('engine-done', code); });
+  proc.on('error', (err) => { current = null; clearPause(); send('engine-out', 'spawn error: ' + err); send('engine-done', -1); });
 });
 
 ipcMain.on('cancel', () => {

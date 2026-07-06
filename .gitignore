@@ -10,30 +10,19 @@ npm-debug.log*
 .idea/
 .vscode/
 
-# python engine
-engine/.venv/
-engine/runtime/
-engine/bin/
+# engine: generated, fetched, and non-redistributable files kept out of git (caches, the Python runtime, ffmpeg, NVIDIA DLLs)
 engine/**/__pycache__/
-
-# RTX Video runtime: NVIDIA's feature DLLs (nvngx_*.dll) are non-redistributable and the bridge
-# (rtxvideo_cuda.dll) is locally built; the whole folder is local-only (see engine/rtxvideo.py).
-engine/rtxvideo/
-engine/GMFSS_Fortuna/vid_out/
-
-# tensorrt engine cache + export artifacts (machine specific, built on first run)
+engine/bin/
+engine/rtxvideo/nvngx_truehdr.dll
+engine/rtxvideo/nvngx_vsr.dll
+engine/rtxvideo/build_src/*.obj
+engine/rtxvideo/build_src/*.lib
+engine/rtxvideo/build_src/*.exp
+engine/rtxvideo/build_src/rtxvideo_cuda.dll
+engine/runtime/
 engine/trt_cache/
-engine/*.onnx
-engine/*.onnx.data
-engine/*.engine
 
-# large model weights (download separately, see README)
-engine/GMFSS_Fortuna/train_log/
-engine/realesr-animevideov3.pth
-
-# generated video outputs / scratch
-*.mp4
-# ...but keep sample source clips, e.g. samples/gtest.mp4 (the 24fps example)
+# ...but keep sample source clips, e.g. samples/test.mp4 (the 24fps example)
 !samples/*.mp4
 # ...while still ignoring generated interpolation outputs in samples (e.g. *_48fps.mp4)
-samples/*fps.mp4
+samples/*fps*.mp4

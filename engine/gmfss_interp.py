@@ -15,40 +15,42 @@ lossless, and always uses the fastest backend the machine supports.
   and colour signalling are preserved either way; the output is 10 bit by default whatever the
   source depth (see --out-bits below), never less than the source.
 
-Uniform look (every frame generated): the output is fully smoothed. NO emitted frame is a source
-frame and none sits on a source timestamp. The output grid is shifted by half an output step, so
-every frame is an interior blend: timesteps 1/2M, 3/2M, ... (2M-1)/2M within each source pair for
-an integer multi M (symmetric around 0.5, spacing 1/M), and the analogous half step offset in
---fps mode. The first and last output frames are therefore generated too. This is deliberate. A
-passthrough interpolator interleaves byte exact source frames (sharp, full real detail) with the
-softer generated tweens, so on every Nth frame fine detail snaps in and out (sharp original, soft
-tween, sharp original ...), a periodic shimmer that breaks immersion. Note that running a source
-frame back through GMFSS at timestep 0 does NOT fix this: at t=0 the model reconstructs it about
-as sharply as the original (measured ~equal), so the pop survives. Keeping every output frame off
-the source grid is what makes the whole timeline one consistent softness. This mirrors the
-"generate every displayed frame, never pass a real one through" behaviour requested from Lossless
-Scaling. The cost: the true pixels that sat on the source grid are dropped, so the clip is
-uniformly a touch softer than a passthrough render (that uniformity is the goal). The output frame
-count is multi*frames (true doubling for 2x, etc., matching target fps tools like Topaz and the
-GUI's own total): every source frame gets multi output frames, and the last source frame's own
-time slot, which has no frame after it to interpolate toward, is filled by holding the last
-generated frame. Duration therefore matches the source.
+Uniform look, on the source grid (GMFSS integer --multi, the default GUI path): the FIRST and LAST
+output frames ARE the real source frames (there is nothing before frame 0 / after frame N-1 to
+interpolate from, so they are kept pristine), and every INTERIOR output frame is model-generated so
+the whole interior carries one consistent softness. The problem being solved is the passthrough
+shimmer: interleaving byte-exact source frames (sharp) with softer tweens makes fine detail snap in
+and out every Nth frame (sharp, soft, sharp ...), a periodic pop that breaks immersion (it is what
+RIFE/DAIN do). So no interior source frame is passed through pristine. The subtle case is the
+interior slot that lands ON a source timestamp t=k: it is NOT frame k pristine, and NOT frame k
+re-run through the model at t=0 (measured: t=0 reconstructs about as sharply as the original, so
+the pop survives) - it is the BRACKET MIDPOINT inference(f[k-1], f[k+1], 0.5), a genuine
+interpolation that lands at k's instant with the same generated softness as the tweens around it
+(it spans 2x the per-pair motion, so it is the interior's softest slot, but temporally correct and
+visually consistent - the design goal). The interior tweens sit at on-grid timesteps j/M within
+each source pair. Output frame count is multi*(N-1)+1 (2N-1 at 2x): the honest count for reaching
+the target fps with real endpoints, so a 2-frame clip at 2x is 3 frames (real, tween, real). This
+matches how RIFE/DAIN report 2N-1; duration is ~(M-1)/(M*fps) shorter than the source (the last
+frame has no slot after it to fill). See the on-grid loop near the bottom of this file.
+
+Legacy off-grid look (GMFSS --fps mode): here NO emitted frame sits on a source
+timestamp - the grid is shifted by half an output step (timesteps 1/2M, 3/2M ... (2M-1)/2M for
+integer M; the analogous offset in --fps mode), so every frame incl. the first/last is a generated
+interior blend and the last source frame's slot is filled by holding the last generated frame.
+Count is multi*frames (true doubling), duration matches the source. This is the older "generate
+every displayed frame, never pass a real one through" scheme (Lossless-Scaling style); the on-grid
+path above supersedes it for the common GMFSS multiplier case because real endpoints + correctly
+timed on-grid interior frames read as higher quality than an all-synthetic half-step-shifted grid.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
-       [--out-bits {8,10}] [--scene-detect] [--restore]
+       [--out-bits {8,10}] [--restore]
        [--no-passthrough]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
        --no-interp skips interpolation entirely: the clip is only re-encoded at its source fps
        with --sharpen applied, for users who just want the sharpening and not the smoothing.
-       --scene-detect enables hard-cut detection (a detected cut is held across the boundary
-       instead of interpolated). OFF by default: real action content lands in the detector's
-       gray zone and a false hold stutters the smoothing; see the scene cut detection block.
-       Every source pair is interpolated uniformly on the same output-slot grid, so
-       near-identical drawings (anime on twos/threes) get the same even motion as real motion
-       and the source's own frame timings are preserved exactly; nothing is held or retimed.
        --restore runs Real-ESRGAN's anime-video model (bundled realesr-animevideov3) on every
        output frame to clean noise and redraw linework (fine texture can flatten), before the
        upscale (without RTX VSR its 4x output directly feeds the upscale). Off by default;
@@ -138,16 +140,6 @@ ap.add_argument("--no-passthrough", action="store_true",
                      "and the container switches from mp4 to mkv automatically when the tracks "
                      "need it (styled ASS/PGS subtitles, exotic audio codecs). With this flag the "
                      "output is always mp4 with only the first audio track, the old behaviour.")
-ap.add_argument("--scene-detect", action="store_true",
-                help="enable hard-cut detection: detected cuts (forward/backward flow "
-                     "consistency plus warp residual, from flows GMFSS already computes) are "
-                     "held across the boundary instead of interpolated, so two shots never "
-                     "morph into a smeared ghost. OFF by default (2026-07-04): real action "
-                     "content measured in the detector's gray zone (flashes, impact frames, "
-                     "strobing effects landed at occ 0.5-0.85, between the within-shot and "
-                     "true-cut calibration bands), and a FALSE hold visibly stutters the "
-                     "smoothing - worse for this app's purpose than morphing a real cut for "
-                     "one source-frame interval, which is brief at high output fps.")
 ap.add_argument("--out-bits", type=int, choices=[8, 10], default=10,
                 help="output bit depth. 10 (default): encode 10-bit (HEVC main10 / 10-bit AV1) even "
                      "from an 8-bit source - every emitted frame is computed in floating point, so "
@@ -199,7 +191,6 @@ args = ap.parse_args()
 inp = os.path.abspath(args.input)
 SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
-SCENE_DETECT = args.scene_detect             # opt-in: hold frames across detected cuts (see help)
 PASSTHROUGH = not args.no_passthrough        # copy all audio/subtitle/chapter/font tracks through
 UPSCALE_F = max(1.0, min(16.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
                                              # RTX VSR has no integer-scale limit (probed clean to
@@ -570,6 +561,7 @@ def _restore(t):
 # show); an HDR SOURCE carried through gets the pane's self-anchored _tonemap_pq (raw PQ code
 # values would read flat and washed out). preview.py guards its main(), so it imports clean.
 LIVE_PREVIEW = os.environ.get("SMV_LIVE_PREVIEW")
+LIVE_OFF_FILE = os.environ.get("SMV_LIVE_OFF_FILE")   # GUI Hide button; present = skip generation
 _live_last = 0.0
 
 def _live_small(img):
@@ -637,6 +629,11 @@ def _live_preview(t, hdr_packed=None):
     if not LIVE_PREVIEW or time.time() - _live_last < 1.0:
         return
     _live_last = time.time()
+    # The GUI's Hide button drops SMV_LIVE_OFF_FILE to stop preview generation entirely (reclaim the
+    # snapshot cost), Show removes it. Checked AFTER the 1s gate + _live_last bump so the os.path.exists
+    # stat stays rate-limited to ~1/s; checking it before the bump would run it on every output frame.
+    if LIVE_OFF_FILE and os.path.exists(LIVE_OFF_FILE):
+        return
     try:
         if _live_q is None:
             _live_q = queue.Queue(maxsize=1)
@@ -651,6 +648,28 @@ def _live_preview(t, hdr_packed=None):
         pass               # worker still formatting the previous tick: skip this one
     except Exception:  # noqa: BLE001 - a thumbnail must never break the render
         pass
+
+# Cooperative pause: when SMV_PAUSE_FILE is set (the GUI passes a path under its userData dir),
+# the GUI creates that file to pause and deletes it to resume. Checked at the top of each
+# generation-loop iteration, so a pause takes effect at the next source-pair boundary: the frames
+# already handed to the encode queue (wq) keep draining to disk on the writer thread while this
+# call blocks, then generation stops before starting the next pair. Zero cost when the env var is
+# absent (CLI runs). The GUI's Pause/Resume button drives it; PAUSED/RESUMED land in the log.
+PAUSE_FILE = os.environ.get("SMV_PAUSE_FILE")
+_paused = False
+
+def _check_pause():
+    global _paused
+    if not PAUSE_FILE:
+        return
+    while os.path.exists(PAUSE_FILE):
+        if not _paused:
+            _paused = True
+            sys.stderr.write("PAUSED\n"); sys.stderr.flush()
+        time.sleep(0.2)
+    if _paused:
+        _paused = False
+        sys.stderr.write("RESUMED\n"); sys.stderr.flush()
 
 def to_bytes(t):
     t = t.float()[..., :H, :W]            # crop off the padding added in to_tensor
@@ -687,105 +706,7 @@ def to_bytes(t):
     a = (t[0] * OUT_MAXV).round().clamp(0, OUT_MAXV).permute(1, 2, 0).contiguous().cpu().numpy()  # CHW->HWC on GPU
     return a.astype(OUT_NP_DT).tobytes()
 
-# --- scene cut detection (OPT-IN --scene-detect since 2026-07-04) ----------------------------
-# Interpolating across a hard cut morphs one shot into the next (a smeared ghost frame), so cut
-# pairs hold the boundary frames instead - WHEN enabled. Off by default: field data from a real
-# action clip measured non-cut pairs (1-frame flashes read as consecutive-pair "cuts", impact
-# frames, strobing) at occ 0.51-0.84 / photo 0.09-0.35 - INSIDE the gap between the within-shot
-# and true-cut calibration bands below - and every false hold visibly stutters the smoothing,
-# which defeats the app's purpose; a missed real cut merely morphs for one source-frame
-# interval. Detection reuses the flows model.reuse() has already
-# computed, so it costs a few grid_samples per pair. A raw pixel difference cannot be the signal
-# here: a fast pan also produces a huge frame difference and would be falsely flagged, killing
-# interpolation exactly where it is most wanted. Two flow-based checks separate the cases, and
-# BOTH must fire (a false cut is worse than a missed one, which just keeps today's behaviour):
-#   occ   - forward/backward consistency: for real motion flow01(x) + flow10(x + flow01(x)) ~ 0;
-#           on a cut the two flows are unrelated, so most pixels fail the check. A pan fails only
-#           in its disocclusion band.
-#   photo - warp residual: reconstruct each frame from the other by backward-warping with the
-#           matching flow; on a cut even the best flow cannot make the content match.
-# Set SMV_SCENE_DEBUG=1 to log both metrics for every pair (used to calibrate the thresholds).
-# Calibration (2026-07-02, samples/test.mp4 family; SMV_SCENE_DEBUG sweeps):
-#   within-shot anime pairs      occ 0.042..0.063   photo 0.034..0.047
-#   fast pan 25 px/frame         occ 0.000          photo ~0.005
-#   whip pan 100 px/frame        occ 0.000          photo 0.006..0.022   (flow tracks it: no cut)
-#   animated gradient morph      occ <=0.063        photo 0.0002
-#   same-shot crop-zoom reframe  occ 0.196          photo 0.056          (a coherent zoom: leave it)
-#   true content cut             occ 1.000          photo 0.260          (fires)
-# The thresholds sit in that gap with ~8x margin on the false-positive side (occ) and 2..3x on
-# the detection side. Raising sensitivity enough to also catch the same-shot reframe would sit
-# only ~1.2x above normal-content photo noise, so borderline reframes deliberately interpolate
-# (GMFlow matches them and renders a coherent zoom, not a smear).
-SCENE_DEBUG = bool(os.environ.get("SMV_SCENE_DEBUG"))
-SCENE_OCC_TH = 0.5      # fraction of pixels failing the fwd/bwd consistency check
-SCENE_PHOTO_TH = 0.08   # mean abs warp-reconstruction error, [0,1] scale
-_scene_grid = None      # cached base pixel grid, [1,h,w,2]; flows keep one shape per run
-
-def _flow_grid(flow):
-    """grid_sample coordinates that sample position x + flow(x) (align_corners=True)."""
-    global _scene_grid
-    _, _, h, w = flow.shape
-    if _scene_grid is None or _scene_grid.shape[1:3] != (h, w):
-        gy, gx = torch.meshgrid(
-            torch.arange(h, device=flow.device, dtype=torch.float32),
-            torch.arange(w, device=flow.device, dtype=torch.float32), indexing="ij")
-        _scene_grid = torch.stack((gx, gy), dim=-1).unsqueeze(0)
-    g = _scene_grid + flow.permute(0, 2, 3, 1)
-    return torch.stack((g[..., 0] * (2.0 / (w - 1)) - 1.0,
-                        g[..., 1] * (2.0 / (h - 1)) - 1.0), dim=-1)
-
-def _cut_metrics(I0, I1, flow01, flow10):
-    """(occ, photo) for one pair; flows are the half-resolution ones out of model.reuse()."""
-    f01, f10 = flow01.float(), flow10.float()
-    g01, g10 = _flow_grid(f01), _flow_grid(f10)
-    f10w = F.grid_sample(f10, g01, mode="bilinear", padding_mode="border", align_corners=True)
-    res = (f01 + f10w).square().sum(1).sqrt()
-    mag = f01.square().sum(1).sqrt() + f10w.square().sum(1).sqrt()
-    # occlusion-style test: inconsistent if the residual exceeds 5% of the motion, floored at
-    # 1.5 half-res px so near-static content is not judged on sub-pixel noise
-    occ = (res > torch.clamp(0.05 * mag, min=1.5)).float().mean()
-    i0h = F.interpolate(I0, scale_factor=0.5, mode="bilinear", align_corners=False).float()
-    i1h = F.interpolate(I1, scale_factor=0.5, mode="bilinear", align_corners=False).float()
-    r1 = F.grid_sample(i0h, g10, mode="bilinear", padding_mode="border", align_corners=True)
-    r0 = F.grid_sample(i1h, g01, mode="bilinear", padding_mode="border", align_corners=True)
-    photo = 0.5 * ((r1 - i1h).abs().mean() + (r0 - i0h).abs().mean())
-    return occ.item(), photo.item()
-
-def _pair_is_cut(i, I0, I1, reuse):
-    """Decide whether source pair i is a hard cut (and log it); False when detection is off."""
-    if not SCENE_DETECT:
-        return False
-    occ, photo = _cut_metrics(I0, I1, reuse[0], reuse[1])
-    if SCENE_DEBUG:
-        sys.stderr.write(f"SCENE {i} occ={occ:.3f} photo={photo:.4f}\n"); sys.stderr.flush()
-    cut = occ > SCENE_OCC_TH and photo > SCENE_PHOTO_TH
-    if cut:
-        sys.stderr.write(f"cut detected at pair {i} (occ {occ:.2f}, photo {photo:.3f}): "
-                         "holding boundary frames instead of interpolating\n"); sys.stderr.flush()
-    return cut
-
-def _soft_still(I):
-    """One source frame rendered the way held duplicate cels already are: GMFSS on the (I, I)
-    pair at t=0.5. Emitting the raw source frame here would pop (sharp against the soft tweens
-    around it, see Uniform look); the model's own reconstruction keeps the clip's one look."""
-    r = model.reuse(I, I, scale)
-    return to_bytes(model.inference(I, I, r, 0.5))
-
-def _emit_cut(I0, I1, fracs):
-    """Frames for a cut pair: slots before the boundary (t<0.5) hold shot A's still, the rest
-    hold shot B's, so the cut lands sharp between two output frames instead of as a morph."""
-    a = b = None
-    outs = []
-    for fr in fracs:
-        if fr < 0.5:
-            if a is None:
-                a = _soft_still(I0)
-            outs.append(a)
-        else:
-            if b is None:
-                b = _soft_still(I1)
-            outs.append(b)
-    return outs
+# (scene-cut detection removed 2026-07-05 per request: the app always interpolates every pair)
 
 def _pair_fracs(p):
     """Output slot fractions within source pair interval [p, p+1), for both timing modes.
@@ -1210,6 +1131,7 @@ if NO_INTERP:
     k = 0
     try:
         while True:
+            _check_pause()      # block here (queued frames keep encoding) while the GUI holds Pause
             buf = rq.get()
             if buf is None:
                 break
@@ -1236,17 +1158,91 @@ if NO_INTERP:
                      f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n")
     sys.exit(0)
 
+# =============================================================================================
+# On-grid passthrough interpolation (GMFSS; integer --multi; not --fps). The
+# output timeline lands ON the source grid: EVERY real source frame passes through at its integer
+# timestamp (t=0,1,2,...,N-1) at full quality, and the M-1 generated tweens are inserted at the half
+# positions t=k+j/M between each consecutive pair. Total frames = multi*(N-1)+1 (2N-1 at 2x), the
+# honest on-grid count for reaching the target fps with real endpoints, so a 2-frame clip at 2x gives
+# 3 frames (real, tween, real), not 4. Duration is ~(M-1)/(M*fps) shorter than the source (the last
+# frame has no slot after it to fill), exactly how RIFE/DAIN report 2N-1.
+#
+# The interior frames that sit ON a source timestamp t=k are the REAL frame f[k], kept at full
+# quality. This is a deliberate choice (2026-07-05, user): a real frame can pop a little against the
+# softer tweens, but it is the max-quality frame we already have, and the alternatives that avoid the
+# pop are worse. A bracket inference(f[k-1], f[k+1], 0.5) skips f[k] entirely, so it smooths past f[k]'s
+# pose on non-linear motion (a wing at an extreme the neighbours do not bracket). Interpolating the two
+# neighbour tweens keeps f[k]'s motion but double-fades (generating between two already-generated
+# frames compounds GMFSS's softening). So we keep f[k].
+# Only --fps (arbitrary timeline, off the source grid) uses the legacy path below.
+if not FPS_MODE:
+    _MTW = [j / args.multi for j in range(1, args.multi)]   # interior tween fractions j/M, on-grid
+
+    def _gen_tweens(a, b, idx):
+        with amp():
+            reuse = model.reuse(a, b, scale)
+            return [to_bytes(model.inference(a, b, reuse, f)) for f in _MTW]
+
+    prev0 = rq.get()
+    if prev0 is None:
+        sys.exit("no frames decoded")
+    f_cur = to_tensor(prev0)  # f[0]
+    k = 0                     # pairs processed (PROGRESS counter, matches total_pairs)
+    last_out = None
+    try:
+        # Passthrough scheme: every REAL source frame is emitted at its integer timestamp at full
+        # quality, with the M-1 generated tweens inserted at the half positions between each pair. The
+        # real frames can pop a little against the softer tweens, but the alternatives lose quality: a
+        # bracket interp(f[k-1], f[k+1]) skips f[k] and can smooth past its pose, and interpolating two
+        # already-generated tweens double-fades. So we keep the frames we already have, at max quality.
+        last_out = to_bytes(f_cur)      # t=0 : real f[0]
+        wq.put(last_out)
+        while True:
+            _check_pause()      # block here (queued frames keep encoding) while the GUI holds Pause
+            cur = rq.get()
+            if cur is None:
+                break
+            f_next = to_tensor(cur)                    # f[k+1]
+            for tb in _gen_tweens(f_cur, f_next, k):   # tweens at t = k + j/M (strictly interior)
+                last_out = tb
+                wq.put(tb)
+            last_out = to_bytes(f_next)                # real f[k+1] at its integer timestamp t = k+1
+            wq.put(last_out)
+            f_cur = f_next
+            k += 1
+            if k % 10 == 0:
+                sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
+    finally:
+        wq.put(None)            # sentinel: let the writer drain its queue and exit
+        wt.join()
+        enc.stdin.close()
+        dec.stdout.close()
+        enc.wait()
+        dec.wait()
+    if _werr:
+        raise _werr[0]          # surface a failed encode pipe as a nonzero exit
+    _finalize_output()
+    _live_flush()               # let the final live thumbnail land before exit
+    sys.stderr.write(f"done {k} pairs -> {out_path}\n")
+    sys.exit(0)
+
+# ---------------------------------------------------------------------------------------------
+# Legacy off-grid path: --fps mode only (GMFSS). --fps resamples to an arbitrary target fps
+# whose output times do not line up on the source grid, so it keeps the offset scheme: every emitted
+# frame is an interior blend on the _pair_fracs offset grid (no frame on a source timestamp), and
+# the last source frame's slot is filled by holding the last generated frame. Integer --multi is
+# handled on-grid above. See _pair_fracs and the module docstring.
 prev = rq.get()
 if prev is None:
     sys.exit("no frames decoded")
 I0 = to_tensor(prev)
 k = 0
 i = 0
-cuts = 0                # hard cuts held instead of interpolated (see scene cut detection)
 last_out = None         # bytes of the most recent emitted frame, held across the final slot
 
 try:
     while True:
+        _check_pause()          # block here (queued frames keep encoding) while the GUI holds Pause
         cur = rq.get()
         if cur is None:
             break
@@ -1256,21 +1252,14 @@ try:
         # or exact repeats) get exactly the same even motion as real motion. Nothing is held or
         # retimed - the source's own frame timings are preserved by construction, and the gap
         # between every pair of consecutive source frames is smoothed the same way. (--fps mode
-        # can still leave a pair zero slots.) With --scene-detect a detected hard cut holds its
-        # boundary frames instead of morphing across it.
+        # can still leave a pair zero slots.)
         fracs = _pair_fracs(i)
         if fracs:
             with amp():
                 reuse = model.reuse(I0, I1, scale)
-                if _pair_is_cut(i, I0, I1, reuse):
-                    cuts += 1
-                    for out in _emit_cut(I0, I1, fracs):
-                        last_out = out
-                        wq.put(out)
-                else:
-                    for fr in fracs:
-                        last_out = to_bytes(model.inference(I0, I1, reuse, fr))
-                        wq.put(last_out)
+                for fr in fracs:
+                    last_out = to_bytes(model.inference(I0, I1, reuse, fr))
+                    wq.put(last_out)
         prev, I0 = cur, I1
         i += 1
         k += 1
@@ -1301,4 +1290,4 @@ if _werr:
     raise _werr[0]          # surface a failed encode pipe as a nonzero exit
 _finalize_output()
 _live_flush()               # let the final live thumbnail land before exit
-sys.stderr.write(f"done {k} pairs ({cuts} cuts held) -> {out_path}\n")
+sys.stderr.write(f"done {k} pairs -> {out_path}\n")

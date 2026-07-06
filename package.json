@@ -6,7 +6,7 @@
   "main": "dist/main.js",
   "scripts": {
     "start": "tsc && electron .",
-    "starti": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true })\" && npm install && npm start",
+    "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.js && npm start",
     "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && electron-builder"
   },
   "devDependencies": {
@@ -25,7 +25,7 @@
       {
         "from": "engine",
         "to": "engine",
-        "filter": ["**/*", "!**/__pycache__/**", "!GMFSS_Fortuna/vid_out/**", "!.venv/**",
+        "filter": ["**/*", "!**/__pycache__/**",
           "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine",
           "!trt_poc.py", "!trt_poc_gmflow.py", "!trt_integration_test.py", "!trt_dynamic_test.py",
           "!rtxvideo/**"]

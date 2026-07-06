@@ -240,6 +240,13 @@ def main():
     out_dir = os.path.dirname(os.path.abspath(args.out))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+    # Match the processed side's OUTPUT resolution so the before/after panes zoom 1:1 identically
+    # (same native pixel size -> same magnification, pixel-aligned). Bicubic - the SAME resampler the
+    # non-VSR upscale path uses (gmfss_interp _upscale) - so the original is the honest baseline: when
+    # VSR runs, the processed side is genuinely sharper; when it doesn't, both panes are the same
+    # bicubic image and the renderer labels it "plain bicubic upscale" rather than faking a difference.
+    if up > 1.0 and (orig_disp.shape[1] != ow or orig_disp.shape[0] != oh):
+        orig_disp = cv2.resize(orig_disp, (ow, oh), interpolation=cv2.INTER_CUBIC)
     p_orig, p_proc = args.out + "_original.png", args.out + "_processed.png"
     cv2.imwrite(p_orig, cv2.cvtColor(orig_disp, cv2.COLOR_RGB2BGR))
     cv2.imwrite(p_proc, cv2.cvtColor(proc_disp, cv2.COLOR_RGB2BGR))

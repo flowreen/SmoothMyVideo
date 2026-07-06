@@ -8,8 +8,7 @@ Built and tested on an RTX 5090 Laptop (Blackwell, sm_120).
 
 The model is GMFSS_Fortuna, a "union" interpolator: gmflow optical flow, an IFNet /
 RIFE refiner, plus MetricNet, FeatureNet, FusionNet and softsplat warping. It produces
-clean interpolated frames where the older NVIDIA optical flow path (FRUC) tore at high
-multipliers.
+clean interpolated frames even at high multipliers.
 
 ## Status (2026-06-25)
 
@@ -183,30 +182,49 @@ pip, and no ffmpeg installed (only the NVIDIA driver is assumed).
   with the full GPU stack installed (torch cu130 / CUDA 13, cupy-cuda13x, nvidia cu13 wheels). Gitignored, see Setup.
 - `engine/bin/` - bundled shared-build `ffmpeg.exe` + `ffprobe.exe` (built with `hevc_nvenc`)
   plus the FFmpeg DLLs both exes load (one copy of `avcodec` and friends instead of two
-  static embeddings) and their license. Gitignored, see Setup.
+  static embeddings) and their license. Committed to the repo (see Setup).
 - `engine/GMFSS_Fortuna/` - GMFSS model code (inference chain only) plus `train_log/`
-  weights (gitignored, see Setup).
+  weights (committed to the repo, see Setup).
 - `engine/realesr.py` - the `--restore` detail-restoration pass: Real-ESRGAN's SRVGGNetCompact
   (vendored verbatim, BSD-3, license alongside) plus a loader for the bundled
-  `realesr-animevideov3.pth` weights (2.4 MB, gitignored, see Setup).
-- `engine/benchmark.py` - speed benchmark; appends a dated entry to `BENCHMARKS.md`.
+  `realesr-animevideov3.pth` weights (2.4 MB, committed to the repo, see Setup).
 
 ## Setup (fresh clone)
-A fresh clone is missing four gitignored pieces: `engine/runtime`, `engine/bin`,
-`engine/GMFSS_Fortuna/train_log` and `engine/realesr-animevideov3.pth`. The app needs them
-to run, and `npm run dist` needs them present in order to bundle them.
+A fresh clone ships the GMFSS weights (`engine/GMFSS_Fortuna/train_log`) and the Restore weights
+(`engine/realesr-animevideov3.pth`) directly in git, so the clone already has them. Two pieces are
+fetched instead of committed: `engine/bin` (ffmpeg, ~137 MB) is downloaded by `scripts/fetch-ffmpeg.js`
+(the ffmpeg step below), and the 5.7 GB Python runtime (`engine/runtime`) is too large for git and is
+copied in by hand. Both must be present before `npm run dist` so it can bundle them.
 
-**1. GUI deps**
+**1. GUI deps + ffmpeg**
 ```
 npm install
+node scripts/fetch-ffmpeg.js
 ```
-If the Electron binary did not download (its postinstall is sometimes skipped):
+`npm install` gets the Electron/TypeScript deps; `scripts/fetch-ffmpeg.js` downloads the win64 LGPL
+shared ffmpeg from [BtbN FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) into
+`engine/bin`. The fetch is idempotent and non-fatal: if it is skipped or the machine is offline the
+app falls back to `ffmpeg` on PATH, or you can add it later with the GUI "Choose .zip" button. (Or run
+`npm run setup`, which wipes `node_modules`/`engine/bin`, reinstalls, fetches ffmpeg, and launches the
+app in one command.) If the
+Electron binary did not download (its postinstall is sometimes skipped):
 ```
 node node_modules/electron/install.js
 ```
 
-**2. Python runtime into `engine/runtime`**
-The bundled interpreter is a relocatable
+**2. Python runtime into `engine/runtime`** (the only gitignored piece)
+Pick whichever is easier:
+
+*Option A - copy it from a packaged build (easy, no pip).* The runtime is bundled inside every
+build, so if you have one, just copy the folder out:
+- from a local build: copy `release/win-unpacked/resources/engine/runtime` to `engine/runtime`;
+- from a release zip (`SmoothMyVideo-<version>-win.zip`, e.g. a published release): extract it
+  and copy its `resources/engine/runtime` folder to `engine/runtime`.
+
+That folder is the exact, ready-to-run interpreter (torch cu130 + cupy + TensorRT already
+installed), so there is nothing else to do.
+
+*Option B - build it from scratch.* The bundled interpreter is a relocatable
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases)
 CPython 3.14 (the `install_only` win64 build). Download it, unpack the tarball, and move
 its inner `python/` folder to `engine/runtime`. Then install the Blackwell **CUDA 13** GPU
@@ -226,23 +244,25 @@ Windows venv keeps its standard library in the base Python install, so it is not
 relocatable and breaks on a machine that lacks that exact Python. python-build-standalone
 is self contained, which is what makes the bundle portable.
 
-**3. ffmpeg into `engine/bin`**
-Download a shared Windows ffmpeg that includes `hevc_nvenc` (e.g.
-[BtbN FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases),
-`ffmpeg-master-latest-win64-lgpl-shared.zip`) and copy `bin\ffmpeg.exe`, `bin\ffprobe.exe`
-and all the `bin\*.dll` files into `engine\bin` (skip `ffplay.exe`). A static build's two
-exes also work but nearly triple the size. The app prefers these and only falls back to
-ffmpeg/ffprobe on PATH, so for local dev you can skip this if you already have ffmpeg
-installed; it must be present for a portable `npm run dist`.
-
-**4. GMFSS weights into `engine/GMFSS_Fortuna/train_log`**
-The weights (feat, flownet, fusionnet, metric, rife pkl files) are gitignored because
-they are large. Restore them from the original GMFSS_Fortuna release.
-
-**5. Restore weights into `engine/`**
-Download `realesr-animevideov3.pth` (2.4 MB) from the Real-ESRGAN v0.2.5.0 GitHub release
-(https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth)
-into `engine\`. Without it the `--restore` pass just logs a notice and is skipped.
+### Refreshing the bundled binaries
+The GMFSS + Restore weights below ship committed in the repo, so a fresh clone needs nothing for them;
+this is only for updating them. ffmpeg is the exception - it is fetched by `scripts/fetch-ffmpeg.js`, not committed:
+- **ffmpeg (`engine/bin`).** `scripts/fetch-ffmpeg.js` (run in Setup above, or by `npm run setup`)
+  downloads BtbN's win64 **LGPL SHARED** build (`ffmpeg-master-latest-win64-lgpl-shared.zip`) and
+  copies `ffmpeg.exe`, `ffprobe.exe` and the `*.dll` set into `engine\bin` (skipping `ffplay.exe`).
+  LGPL (no GPL x264/x265, keeps the redistribution promise) and shared (not the ~3x static build)
+  both matter. It skips when `engine/bin` already has ffmpeg, so to refresh, delete `engine/bin` and
+  re-run `node scripts/fetch-ffmpeg.js` (or `npm run setup`). To pin an exact build instead of BtbN's rolling `latest`, drop a matched
+  `ffmpeg.exe` + `ffprobe.exe` + `*.dll` set from one build in by hand (never mix DLLs across builds -
+  the exe links specific SONAME majors like `avcodec-63`). The app also falls back to ffmpeg/ffprobe
+  on PATH, so a quick local run works without `engine/bin` if ffmpeg is installed, but it must be
+  present for a portable `npm run dist`.
+- **GMFSS weights (`engine/GMFSS_Fortuna/train_log`).** The feat, flownet, fusionnet, metric and
+  rife pkl files, from the original GMFSS_Fortuna release.
+- **Restore weights (`engine/realesr-animevideov3.pth`, 2.4 MB).** From the Real-ESRGAN v0.2.5.0
+  GitHub release
+  (https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth).
+  Without it the `--restore` pass just logs a notice and is skipped.
 
 ## Dev toolchain
 The development machine has Visual Studio 2019 Build Tools v142 (MSVC `cl.exe` 19.29) and the
@@ -267,14 +287,6 @@ and a recipient still needs only the NVIDIA driver.
 ## Performance
 Precision is **fp16 only** (fp32 was removed: fp16 is visually lossless versus fp32,
 PSNR about 51 dB, and just slower). The fast path is **fp16 plus cupy softsplat**.
-
-Core inference at 1080p (warmup plus cuda.synchronize, excludes model load and ffmpeg I/O):
-- original fp32: about 357 ms per frame
-- fp16, pure torch softsplat: about 276 ms per frame
-- fp16 plus cupy softsplat: about 160 ms per frame, roughly 2.2x over the fp32 baseline
-
-A 360 frame clip at 16x lands around 17 minutes. Measure with `engine/benchmark.py`,
-which logs dated entries to `BENCHMARKS.md` so progress is tracked over time.
 
 **TensorRT (default; `--no-trt` forces eager).** Each of the five sub networks
 (FeatureNet, GMFlow, MetricNet, IFNet, FusionNet) is exported to ONNX under autocast and
@@ -311,50 +323,6 @@ but neither is worth shipping a compiler to every machine.
 ONNX translation on the dynamic path (the static export handles it fine). Dynamic engines
 are also documented as somewhat slower with more VRAM, so static per resolution engines,
 built on first use and cached, are the right call.
-
-## Benchmark vs other GMFSS engines (2026-06-19)
-Compared SmoothMyVideo against the three repos it draws from, to find per frame speedups
-that keep quality. All numbers are one session, one unified harness, GMFSS compute only at
-1080p fp16 on the RTX 5090 (warmup plus cuda.synchronize, excludes decode and encode):
-`reuse` is flow / feat / metric done once per source pair, `inference` is one interpolated
-frame, `pair@2x` is reuse plus one inference.
-
-| Engine | inference ms/frame | reuse ms | pair@2x ms | VRAM |
-| --- | --- | --- | --- | --- |
-| SMV (Fortuna union, fp16 eager) | 177 | 580 | 757 | 8.3 GB |
-| GMFSS_Fortuna (union, fp16) | 182 | 588 | 770 | 8.3 GB |
-| GMFSS_Fortuna (base, fp16) | 168 | 588 | 756 | 8.2 GB |
-| GMFSS_union (old arch, fp16) | 147 | 566 | 713 | 5.0 GB |
-| SMV (Fortuna union, TensorRT) | 101 | 270 | 370 | 1.3 GB |
-
-Recommendations, with the repo each came from:
-
-- **TensorRT is the per frame win, and it is the default backend in SMV.** This run measured
-  about 1.75x per interpolated frame and 2.05x per pair over fp16 eager, plus a new finding:
-  VRAM drops from 8.3 to 1.3 GB (about 6.5x), same union weights so no quality change.
-  Source: SMV `engine/trt_runtime.py`; the idea of running GMFSS on TensorRT comes from
-  **enhancr**, whose GMFSS path lowers the model with `torch_tensorrt`.
-- **Attack GMFlow next for 2x.** At 2x, reuse is most of the TensorRT time (about 270 of
-  370 ms) and reuse runs GMFlow twice (forward and backward flow), so GMFlow is the hotspot.
-  Source: observed here; matches the note above that GMFlow is the heavy net.
-- **Try a single combined engine, channels_last, and multi stream.** enhancr lowers the whole
-  GMFSS module to one `torch_tensorrt` engine, runs it in `channels_last`, and overlaps several
-  frames across CUDA streams (`num_streams`). SMV instead builds five separate subnet engines
-  and keeps softsplat eager (the cupy softsplat blocks a single ONNX export). Two cheap
-  experiments fall out: run the TensorRT engine I/O and eager glue in `channels_last`, and give
-  `TRTModule` a dedicated non default CUDA stream (TensorRT warns that the default stream forces
-  an extra sync every call). This is separate from the overlapped decode item below, which is
-  about ffmpeg I/O, not GPU parallelism. Source: **enhancr** `arch/vsgmfss_fortuna/__init__.py`.
-- **Lighter models are faster but cost quality (so out under no quality loss).** GMFSS base
-  drops the RIFE branch for about 8 percent faster inference (source: **GMFSS_Fortuna**,
-  `GMFSS_infer_b`), and the older **GMFSS_union** arch is about 17 percent faster at half the
-  VRAM. The union Fortuna model SMV ships is the quality pick; these are the speed floor for
-  reference.
-- **Do not chase an enhancr install.** enhancr is no longer distributable (its payload CDN is
-  dead; only a CPU torch lite build with no TensorRT survives on the Internet Archive) and
-  enhancr 0.9.9 is torch 2.1 plus TensorRT 8.6.1, which predate Blackwell `sm_120` and will not
-  run on this GPU. Its one speed advantage, TensorRT, is already covered by SMV's modern stack
-  (torch 2.12 `cu130`, TensorRT 11.1).
 
 ## Uniform look (no detail popping)
 A naive interpolator keeps the original frames and inserts generated tweens between them, so the
