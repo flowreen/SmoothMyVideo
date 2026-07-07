@@ -341,7 +341,7 @@ function gridMulti(){ if(!info) return 0; const s = srcFps(); const t = targetFp
   return (N >= 2 && Math.abs(s*N - t) < 0.02) ? N : 0; }   // on-grid when the target is an exact multiple (tolerance covers the 3-dp display rounding)
 // Quick-pick multipliers, rendered as preset chips (they replaced the slider's magnets). The number
 // box is the exact target; a chip just sets the box to round(srcFps*k). All chip values are on-grid.
-const PRESET_MULTS = [2, 4, 8, 16, 32];
+const PRESET_MULTS = [2, 3, 4, 5, 8, 16, 32];
 // Push a target into the box (clamped, formatted to the source/monitor decimal count; the VALUE keeps
 // its exact fractional precision, e.g. 2x of 23.976 = 47.952), then reflect chip state.
 function setTarget(v){ v = Math.min(sliderMax(), Math.max(sliderMin(), v));

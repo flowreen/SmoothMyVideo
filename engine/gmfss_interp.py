@@ -306,9 +306,9 @@ if TEN_BIT:
 else:
     DEC_FMT, NP_DT, MAXV, BPP = "rgb24", np.uint8, 255.0, 3
 if TEN_BIT_OUT:
-    OUT_RAW_FMT, OUT_NP_DT, OUT_MAXV = "rgb48le", np.uint16, 65535.0
+    OUT_RAW_FMT, OUT_MAXV, OUT_TORCH_DT = "rgb48le", 65535.0, torch.uint16
 else:
-    OUT_RAW_FMT, OUT_NP_DT, OUT_MAXV = "rgb24", np.uint8, 255.0
+    OUT_RAW_FMT, OUT_MAXV, OUT_TORCH_DT = "rgb24", 255.0, torch.uint8
 fsize = W * H * BPP
 # Output spatial resolution. Decode and GMFSS interpolation stay at the source W x H; each finished
 # frame is upscaled to OUT_W x OUT_H just before encode (in to_bytes), so only the encoder input
@@ -332,20 +332,6 @@ device = torch.device("cuda")
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
 
-def _add_cuda_dll_dirs():
-    # let cupy find NVRTC + its builtins DLL from the nvidia-*-cu12 wheels
-    for base in list(sys.path):
-        nv = os.path.join(base, "nvidia")
-        if not os.path.isdir(nv):
-            continue
-        for sub in os.listdir(nv):
-            b = os.path.join(nv, sub, "bin")
-            if os.path.isdir(b):
-                try:
-                    os.add_dll_directory(b)
-                except OSError:
-                    pass
-                os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
 if NO_INTERP:
     # Sharpen-only / re-encode: the GMFSS model and the TensorRT backend are never loaded, so
     # there is no warmup and no first-run engine build. Each frame just gets the RCAS pass.
@@ -353,7 +339,6 @@ if NO_INTERP:
     sys.stderr.write("no-interp mode: GMFSS interpolation disabled "
                      "(re-encode at source fps with optional FSR sharpen)\n"); sys.stderr.flush()
 else:
-    _add_cuda_dll_dirs()
     from model.GMFSS_infer_u import Model
     model = Model()
     if not hasattr(model, "version"):
@@ -695,26 +680,29 @@ def to_bytes(t):
     # Quantise at the OUTPUT depth (OUT_MAXV, 16 bit unless --out-bits 8 on an 8-bit source), not
     # the decode depth: this is where the float precision either survives into the 10-bit encode
     # or gets flattened to 8-bit steps.
-    a = (t[0] * OUT_MAXV).round().clamp(0, OUT_MAXV).permute(1, 2, 0).contiguous().cpu().numpy()  # CHW->HWC on GPU
-    return a.astype(OUT_NP_DT).tobytes()
+    # Cast to the integer output dtype ON the GPU (after round+clamp, so values are already exact
+    # integers in range and the truncating cast is lossless - bit-identical to the old CPU astype).
+    # This halves the device->host copy for the default 10-bit path (uint16, 2 bytes/channel, vs
+    # downloading float32 at 4) - e.g. ~12 MB not ~25 MB per 1080p frame, ~200 MB not ~400 at 8K -
+    # so the per-frame PCIe cost drops with resolution and output-frame count.
+    a = (t[0] * OUT_MAXV).round().clamp(0, OUT_MAXV).to(OUT_TORCH_DT) \
+        .permute(1, 2, 0).contiguous().cpu().numpy()   # CHW->HWC, quantise on GPU
+    return a.tobytes()
 
 # (scene-cut detection removed 2026-07-05 per request: the app always interpolates every pair)
 
 def _pair_fracs(p):
-    """Output slot fractions within source pair interval [p, p+1), for both timing modes.
+    """Output slot fractions within source pair interval [p, p+1), for --fps mode.
 
-    The grid is offset by half an output step so no slot lands on a source timestamp: multi
-    mode gives timesteps 1/2M, 3/2M ... (2M-1)/2M (symmetric around 0.5, spacing 1/M); --fps
-    mode gives the output times (j+0.5)/ratio that fall inside [p, p+1), which can be zero
-    slots for a pair when downsampling the timeline. Every emitted frame is therefore an
-    interior blend with the same softness as its neighbours, instead of a sharp source frame
-    that pops; see the module docstring (Uniform look)."""
-    if FPS_MODE:
-        lo = math.ceil(p * ratio - 0.5)
-        hi = math.ceil((p + 1) * ratio - 0.5)
-        return [(j + 0.5) / ratio - p for j in range(lo, hi)]
-    M = args.multi
-    return [(2 * j + 1) / (2 * M) for j in range(M)]
+    The grid is offset by half an output step so no slot lands on a source timestamp: the
+    output times (j+0.5)/ratio that fall inside [p, p+1), which can be zero slots for a pair
+    when downsampling the timeline. Every emitted frame is therefore an interior blend with
+    the same softness as its neighbours, instead of a sharp source frame that pops; see the
+    module docstring (Legacy off-grid look). Only --fps reaches this; integer --multi uses the
+    on-grid _MTW loop instead."""
+    lo = math.ceil(p * ratio - 0.5)
+    hi = math.ceil((p + 1) * ratio - 0.5)
+    return [(j + 0.5) / ratio - p for j in range(lo, hi)]
 
 def read_exact(stream, nbytes):
     buf = bytearray()
@@ -1102,6 +1090,30 @@ def _finalize_output():
                          f"the extra tracks) was kept at {_ENC_TARGET}\n"); sys.stderr.flush()
 
 
+def _drain_pipes():
+    """Teardown shared by all three render loops (runs in each loop's finally, so on error too):
+    flush the encode queue and close the pipes in order - writer sentinel, join the writer, close
+    the encode stdin, close the decode stdout, wait on both ffmpeg processes."""
+    wq.put(None)            # sentinel: let the writer drain its queue and exit
+    wt.join()
+    enc.stdin.close()
+    dec.stdout.close()
+    enc.wait()
+    dec.wait()
+
+
+def _finish(done_msg):
+    """Success tail shared by all three render loops: surface a failed encode pipe as a nonzero
+    exit, finalize the container (HDR10 boxes / MKV remux), flush the last live thumbnail, log the
+    done line and exit 0."""
+    if _werr:
+        raise _werr[0]          # surface a failed encode pipe as a nonzero exit
+    _finalize_output()
+    _live_flush()               # let the final live thumbnail land before exit
+    sys.stderr.write(done_msg); sys.stderr.flush()
+    sys.exit(0)
+
+
 # Run the whole interpolation/encode pipeline on one non-default CUDA stream so TRT, softsplat's cupy
 # kernel and the torch glue all share it: same-stream ordering then makes each op's output ready for the
 # next with no per-call host sync (the old per-engine synchronize in trt_runtime is gone), leaving just
@@ -1133,19 +1145,9 @@ if NO_INTERP:
             if k % 10 == 0:
                 sys.stderr.write(f"PROGRESS {k}/{total_units}\n"); sys.stderr.flush()
     finally:
-        wq.put(None)            # sentinel: let the writer drain its queue and exit
-        wt.join()
-        enc.stdin.close()
-        dec.stdout.close()
-        enc.wait()
-        dec.wait()
-    if _werr:
-        raise _werr[0]          # surface a failed encode pipe as a nonzero exit
-    _finalize_output()
-    _live_flush()               # let the final live thumbnail land before exit
-    sys.stderr.write(f"done {k} frames "
-                     f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n")
-    sys.exit(0)
+        _drain_pipes()
+    _finish(f"done {k} frames "
+            f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n")
 
 # =============================================================================================
 # On-grid passthrough interpolation (GMFSS; integer --multi; not --fps). The
@@ -1202,18 +1204,8 @@ if not FPS_MODE:
             if k % 10 == 0:
                 sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
     finally:
-        wq.put(None)            # sentinel: let the writer drain its queue and exit
-        wt.join()
-        enc.stdin.close()
-        dec.stdout.close()
-        enc.wait()
-        dec.wait()
-    if _werr:
-        raise _werr[0]          # surface a failed encode pipe as a nonzero exit
-    _finalize_output()
-    _live_flush()               # let the final live thumbnail land before exit
-    sys.stderr.write(f"done {k} pairs -> {out_path}\n")
-    sys.exit(0)
+        _drain_pipes()
+    _finish(f"done {k} pairs -> {out_path}\n")
 
 # ---------------------------------------------------------------------------------------------
 # Legacy off-grid path: --fps mode only (GMFSS). --fps resamples to an arbitrary target fps
@@ -1265,18 +1257,9 @@ try:
         wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE or RESTORE_ACTIVE
                                 or DEC_FMT != OUT_RAW_FMT) else prev)
     else:
-        tail = (math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)) if FPS_MODE else args.multi
+        tail = math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)  # this path is --fps only
         for _ in range(tail):
             wq.put(last_out)
 finally:
-    wq.put(None)            # sentinel: let the writer drain its queue and exit
-    wt.join()
-    enc.stdin.close()
-    dec.stdout.close()
-    enc.wait()
-    dec.wait()
-if _werr:
-    raise _werr[0]          # surface a failed encode pipe as a nonzero exit
-_finalize_output()
-_live_flush()               # let the final live thumbnail land before exit
-sys.stderr.write(f"done {k} pairs -> {out_path}\n")
+    _drain_pipes()
+_finish(f"done {k} pairs -> {out_path}\n")
