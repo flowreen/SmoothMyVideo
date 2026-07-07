@@ -21,6 +21,7 @@ engine/rtxvideo/build_src/*.exp
 engine/rtxvideo/build_src/rtxvideo_cuda.dll
 engine/runtime/
 engine/trt_cache/
+engine/dvtools/
 
 # ...but keep sample source clips, e.g. samples/test.mp4 (the 24fps example)
 !samples/*.mp4

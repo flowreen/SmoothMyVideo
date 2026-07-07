@@ -18,8 +18,9 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
   `engine/runtime/python.exe` and ffprobe as `engine/bin/ffprobe.exe` (both fall back to PATH); sets
   `PYTHONUTF8` and a writable `SMV_TRT_CACHE`.
 - **`renderer/index.html`** — the UI: select/drag a video, a target-fps control, an **FSR** sharpen
-  toggle, **Restore**, **Upscale**, a **Codec** selector, an opt-in **NVIDIA RTX** panel (VSR + HDR),
-  output path, progress + ETA, a batch queue, a live thumbnail, and a before/after preview pane. Electron
+  toggle, **Restore**, **Upscale**, a **Codec** selector, an opt-in **NVIDIA RTX** panel (VSR + HDR), a
+  **Dolby Vision** panel (Profile 8.1 export, one-tool install), output path, progress + ETA, a batch
+  queue, a live thumbnail, and a before/after preview pane. Electron
   `require` with `nodeIntegration`; most settings persist in `localStorage` (Restore and RTX Dynamic
   Vibrance deliberately don't — per-session opt-ins).
 - **`engine/gmfss_interp.py`** — the GMFSS pipe engine: ffmpeg decode → GMFSS → ffmpeg encode. TensorRT
@@ -34,7 +35,8 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
   DLLs are user-installed via the in-app NVIDIA RTX panel; the whole folder is gitignored / excluded from
   the zip, so RTX stays a local feature.
 - **`engine/realesr.py`** — the `--restore` Real-ESRGAN detail pass (vendored SRVGGNetCompact, BSD-3).
-- **`engine/hdr10_meta.py`** — pure-stdlib ISOBMFF injector for HDR10 static metadata (`mdcv`/`clli`).
+- **`engine/hdr10_meta.py`** — pure-stdlib ISOBMFF injector for HDR10 static metadata (`mdcv`/`clli`) and
+  the Dolby Vision configuration box (`dvvC`, via `inject_dv_config`); shared box-insertion surgery.
 - **`engine/preview.py`** — single-frame before/after preview (same passes, same order as a render).
 - **`engine/runtime/`** — bundled relocatable Python 3.14 (python-build-standalone) with the CUDA 13 GPU
   stack. Gitignored (see Setup).
@@ -89,7 +91,7 @@ portable bundle.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 - `<multi>` integer multiplier, or `--fps TARGET` to resample to any output fps (the model interpolates at
   arbitrary fractional timesteps; `<multi>` is required positionally but ignored when `--fps` is given).
@@ -101,6 +103,8 @@ engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--sca
 - `--rtx-hdr` SDR→HDR10 (BT.2020 PQ) via TrueHDR; `--hdr-nits` mastering peak (400..2000, default 1000);
   `--hdr-color` {`vivid` (default: source hue+chroma), `rtx` (SDK saturation, hue-corrected), `raw` (debug)};
   `--hdr-mastering-prim` sets the `mdcv` gamut by name.
+- `--dv` additionally exports a **Dolby Vision Profile 8.1** MP4 (needs `--rtx-hdr`, HEVC, MP4 out, and
+  user-installed `dovi_tool` in `engine/dvtools`). See the Dolby Vision section below; GPAC-free.
 - `--out-bits` {`10` default, `8` legacy}; `--codec` {`hevc` default, `av1`, `vvc`}; `--no-passthrough` first-audio-only.
 - Per-frame order: (restore →) upscale → RCAS sharpen → TrueHDR.
 
@@ -133,6 +137,25 @@ NVENC/HEVC can't encode, so the engine probes CPU encoders at the output size an
 dozens of large frames in flight). RTX HDR is a real HDR10 master: 10-bit BT.2020 PQ + injected
 mastering-display / content-light metadata, with source-faithful (cyan-free) colour rebuilt in ICtCp
 (TrueHDR itself rotates hues even at Saturation 0, so its chroma is dropped and the source's is transplanted).
+
+**Dolby Vision (`--dv`).** Layers a **Profile 8.1** RPU on top of the HDR10 render — HDR10-compatible, so
+non-DV players fall back to HDR10 (mdcv/clli) and DV displays read the dynamic metadata. **GPAC-free**: the
+one external tool is `dovi_tool` (open source, user-installed in `engine/dvtools` via the UI's "Dolby Vision"
+panel); the RPU is muxed by the bundled ffmpeg and the DV configuration box (`dvvC`) is written in-engine by
+`hdr10_meta.inject_dv_config` (same ISOBMFF surgery as the HDR10 boxes — the LGPL ffmpeg can't emit `dvvC`
+itself). Flow (`_dv_export` in gmfss_interp): during the HDR render `rtxvideo.run_hdr` accumulates **per-frame
+L1** (min/avg/max PQ brightness) — near-free, reusing the MaxCLL reduction, and only when `--dv` is set — then
+after encode: extract HEVC → `dovi_tool generate` (one L1 shot/frame) + `inject-rpu` → ffmpeg mux with the
+audio → inject `dvvC` + HDR10 fallback boxes. **B-frames are disabled (`-bf 0`) for DV renders**: dovi_tool
+needs an Annex-B elementary stream, and a raw-HEVC→MP4 copy assigns non-monotonic DTS with a reorder buffer
+and silently drops the tail frames; no B-frames ⇒ coding order = display order ⇒ exact remux + 1:1 RPU
+alignment. Requires HEVC + MP4 out; skipped with a notice otherwise. Best-effort — any failure keeps the
+HDR10 file. Legal note: `dvvC` is our own code writing a documented public box format (no Dolby/GPAC source,
+no patented processing), so the exposure is only the "Dolby Vision" **trademark** — the UI labels it
+"Profile 8.1 (experimental)", not "certified", credits dovi_tool, and carries a non-affiliation
+disclaimer (also in the README). Dolby and Dolby Vision are trademarks of Dolby Laboratories; this
+project is independent, not affiliated with or endorsed by Dolby, and bundles no Dolby software. The before/after preview does **not** change with `--dv`: the base pixels are
+identical HDR10; the DV difference is display-side tone-mapping we can't (and shouldn't) simulate.
 
 **Restore.** `--restore` runs Real-ESRGAN's anime-video model per output frame to clean compression noise
 and redraw linework (a generative repaint — it targets cel-style anime and can flatten fine texture).

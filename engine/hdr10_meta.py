@@ -115,49 +115,39 @@ def _mdcv_clli(primaries, white, max_nits, min_nits, maxcll, maxfall):
     return mdcv + clli
 
 
-def inject_hdr10(path, max_nits=1000, min_nits=0.0, maxcll=0, maxfall=0,
-                 colorspace=DEFAULT_COLORSPACE):
-    """Add mdcv + clli to the video sample entry of the MP4 at `path`, in place.
-
-    `colorspace` names the mastering-display gamut + white point (see MASTERING_COLORSPACES, e.g.
-    display-p3 / dci-p3 / bt2020 / bt709); an unrecognised name falls back to the default.
-    `min_nits` defaults to 0 - a perfect-black mastering reference, as OLED-graded HDR10 declares.
-    It is metadata only: actual black reproduction comes from the PQ stream, not from this field.
-    Returns True if written, False if skipped (already present, or the structure was not the
-    expected moov/trak/.../stsd shape). Raises only on real I/O errors.
-    """
-    primaries, white = MASTERING_COLORSPACES.get(colorspace, MASTERING_COLORSPACES[DEFAULT_COLORSPACE])
+def _insert_into_sample_entry(path, build_box, skip_types):
+    """Shared ISOBMFF surgery: append child box(es) to the video sample entry of the MP4 at `path`,
+    in place. `build_box()` returns the bytes to insert (called only when nothing in `skip_types` is
+    already present, so the operation is idempotent). Patches every stco/co64 chunk offset that points
+    past the insertion point and grows the sample entry + all ancestor boxes up to moov. Returns True
+    if written, False if skipped (already present, or not the expected moov/trak/.../stsd shape).
+    Raises only on real I/O errors."""
     with open(path, "rb") as f:
         buf = bytearray(f.read())
     n = len(buf)
-
     moov = _find(buf, 0, n, b"moov")
     if not moov:
         return False
-    _, moov_ps, moov_be = moov
-    trak = _video_trak(buf, moov_ps, moov_be)
+    trak = _video_trak(buf, moov[1], moov[2])
     if not trak:
         return False
-    _, trak_ps, trak_be = trak
-    mdia = _find(buf, trak_ps, trak_be, b"mdia")
+    mdia = _find(buf, trak[1], trak[2], b"mdia")
     minf = _find(buf, mdia[1], mdia[2], b"minf") if mdia else None
     stbl = _find(buf, minf[1], minf[2], b"stbl") if minf else None
     stsd = _find(buf, stbl[1], stbl[2], b"stsd") if stbl else None
     if not stsd:
         return False
     # stsd is a FullBox: 4 bytes version/flags + 4 bytes entry_count, then the sample entries.
-    entries_start = stsd[1] + 8
-    sample = next(_iter_boxes(buf, entries_start, stsd[2]), None)
+    sample = next(_iter_boxes(buf, stsd[1] + 8, stsd[2]), None)
     if not sample:
         return False
     _s_type, s_start, s_ps, s_end = sample
-    # Idempotent: skip if mdcv/clli already sit in the sample entry (children begin after the
-    # 78-byte VisualSampleEntry header).
+    # Idempotent: children begin after the 78-byte VisualSampleEntry header.
     for t, *_ in _iter_boxes(buf, s_ps + 78, s_end):
-        if t in (b"mdcv", b"clli"):
+        if t in skip_types:
             return False
 
-    new = _mdcv_clli(primaries, white, max_nits, min_nits, maxcll, maxfall)
+    new = build_box()
     delta = len(new)
     insert_at = s_end
 
@@ -190,6 +180,65 @@ def inject_hdr10(path, max_nits=1000, min_nits=0.0, maxcll=0, maxfall=0,
     with open(path, "wb") as f:
         f.write(buf)
     return True
+
+
+def inject_hdr10(path, max_nits=1000, min_nits=0.0, maxcll=0, maxfall=0,
+                 colorspace=DEFAULT_COLORSPACE):
+    """Add mdcv + clli to the video sample entry of the MP4 at `path`, in place.
+
+    `colorspace` names the mastering-display gamut + white point (see MASTERING_COLORSPACES, e.g.
+    display-p3 / dci-p3 / bt2020 / bt709); an unrecognised name falls back to the default.
+    `min_nits` defaults to 0 - a perfect-black mastering reference, as OLED-graded HDR10 declares.
+    It is metadata only: actual black reproduction comes from the PQ stream, not from this field.
+    Returns True if written, False if skipped (already present or unexpected structure).
+    """
+    primaries, white = MASTERING_COLORSPACES.get(colorspace, MASTERING_COLORSPACES[DEFAULT_COLORSPACE])
+    return _insert_into_sample_entry(
+        path, lambda: _mdcv_clli(primaries, white, max_nits, min_nits, maxcll, maxfall),
+        (b"mdcv", b"clli"))
+
+
+# --- Dolby Vision Profile 8.1 signaling (dvvC box) --------------------------------------------
+# A DV 8.1 stream is plain HDR10 (BT.2020 PQ) HEVC carrying a Dolby Vision RPU in-band (added to the
+# elementary stream by dovi_tool) plus this one small container box that tags the track as Dolby
+# Vision. Non-DV players ignore the box and the RPU and just play the HDR10 base; DV displays read
+# them. Writing it here (the same box surgery inject_hdr10 does) means the bundled LGPL ffmpeg - which
+# cannot emit a dvcC/dvvC box itself - is enough to mux Dolby Vision, so no GPAC/MP4Box is needed.
+# This is our own code writing a documented box format (Dolby's public ISOBMFF spec); it uses no
+# Dolby or GPAC source and performs no patented processing - it only tags an already-built stream.
+_DV_LEVEL_CAPS = [22118400, 27648000, 49766400, 62208000, 124416000, 199065600,
+                  248832000, 398131200, 497664000, 995328000, 1990656000]
+
+
+def dv_level(width, height, fps):
+    """Dolby Vision level from the luminance pixel rate (w*h*fps), per the DV ISOBMFF level table:
+    level 5 covers 1080p60, 9 covers 2160p60, 11+ the 8K tiers. Clamped to the top defined level."""
+    pps = width * height * max(1.0, float(fps))
+    for i, cap in enumerate(_DV_LEVEL_CAPS, 1):
+        if pps <= cap:
+            return i
+    return len(_DV_LEVEL_CAPS)
+
+
+def _dv_config_box(profile, level, bl_compat):
+    # DOVIDecoderConfigurationRecord: 2 version bytes, then a 48-bit packed field (7-bit profile,
+    # 6-bit level, rpu/el/bl present flags, 4-bit BL signal compatibility id, 28 reserved), then 16
+    # reserved bytes. rpu present + bl present, no enhancement layer = single-layer Profile 8.1.
+    bits = ((profile & 0x7F) << 41) | ((level & 0x3F) << 35) | (1 << 34) | (0 << 33) | (1 << 32) \
+        | ((bl_compat & 0xF) << 28)
+    rec = bytes([1, 0]) + bits.to_bytes(6, "big") + b"\x00" * 16
+    return struct.pack(">I", 8 + len(rec)) + b"dvvC" + rec
+
+
+def inject_dv_config(path, width, height, fps, profile=8, bl_compat=1):
+    """Stamp a Dolby Vision configuration box (dvvC) into the video sample entry of the MP4 at
+    `path`, in place, tagging a DV-injected HEVC (RPU already in-band) as Profile `profile` - default
+    8 with bl_compat 1 = the HDR10-compatible Profile 8.1. The dv_level is derived from
+    width*height*fps. Same box surgery as inject_hdr10; idempotent. Returns True if written, False if
+    skipped/unsupported. Verified: ffprobe reads the result as a DOVI configuration record."""
+    return _insert_into_sample_entry(
+        path, lambda: _dv_config_box(profile, dv_level(width, height, fps), bl_compat),
+        (b"dvvC", b"dvcC"))
 
 
 def _dump(path):

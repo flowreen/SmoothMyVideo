@@ -390,6 +390,102 @@ ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
   return r.canceled ? null : r.filePaths[0] || null;
 });
 
+// --- Dolby Vision export tool: readiness + install (mirrors the RTX flow) -------------------------
+// DV Profile 8.1 export layers a Dolby Vision RPU on top of the HDR10 render, then tags the MP4 with a
+// dvvC box the engine writes itself (see hdr10_meta.inject_dv_config) - so the bundled ffmpeg is enough
+// to mux DV and NO GPAC/MP4Box is needed. The one non-bundled piece is dovi_tool (open source, but
+// Dolby-adjacent enough that the user fetches it deliberately, like the NVIDIA DLLs); this app copies
+// dovi_tool.exe into engine/dvtools. "Ready" = dovi_tool present.
+const DV_DIR = path.join(ENGINE, 'dvtools');
+const DOVI_BIN = 'dovi_tool.exe';
+// The general releases page (newest at the top) so the user always grabs the latest build; the UI
+// names the exact Windows asset to pick.
+const DOVI_URL = 'https://github.com/quietvoid/dovi_tool/releases/';
+
+// Recursive case-insensitive search for a file by name under root (dovi_tool.exe can sit in a nested
+// folder inside its release zip).
+function findDvBin(root: string, name: string): string | null {
+  const want = name.toLowerCase();
+  const stack = [root];
+  while (stack.length) {
+    const d = stack.pop()!;
+    let ents: fs.Dirent[];
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of ents) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.name.toLowerCase() === want) return p;
+    }
+  }
+  return null;
+}
+
+// Copy dovi_tool.exe out of a chosen source (its release .zip, a folder, or the .exe directly) into
+// engine/dvtools. Zips are handled with Windows' bundled bsdtar.
+function installDv(source: string): { ok: boolean; error?: string; copied: string[] } {
+  try {
+    fs.mkdirSync(DV_DIR, { recursive: true });
+  } catch {
+    /* exists */
+  }
+  let searchDir = source;
+  let tmp: string | null = null;
+  try {
+    if (/\.zip$/i.test(source)) {
+      tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'smv-dv-'));
+      execFileSync(SYS_TAR, ['-xf', source, '-C', tmp]);
+      searchDir = tmp;
+    } else if (!fs.statSync(source).isDirectory()) {
+      searchDir = path.dirname(source); // a picked .exe: search its folder
+    }
+    const found = findDvBin(searchDir, DOVI_BIN);
+    if (!found) return { ok: false, error: 'dovi_tool.exe not found in the selection', copied: [] };
+    const dest = path.join(DV_DIR, DOVI_BIN);
+    try {
+      if (fileExists(dest)) fs.chmodSync(dest, 0o666);
+    } catch {
+      /* best effort */
+    }
+    fs.copyFileSync(found, dest);
+    return { ok: true, copied: [DOVI_BIN] };
+  } catch (e) {
+    return { ok: false, error: String(e), copied: [] };
+  } finally {
+    if (tmp)
+      try {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        /* temp cleanup best effort */
+      }
+  }
+}
+
+ipcMain.handle('dv-ready', () => {
+  const dovi = fileExists(path.join(DV_DIR, DOVI_BIN));
+  return { dovi, ready: dovi, dir: DV_DIR };
+});
+
+ipcMain.handle('dv-open-download', () => {
+  shell.openExternal(DOVI_URL);
+  return true;
+});
+
+ipcMain.handle('dv-install', (_e, source: string) => installDv(source));
+
+// Picker accepts dovi_tool's release .zip or dovi_tool.exe directly.
+ipcMain.handle('dv-choose', async () => {
+  const r = await dialog.showOpenDialog(win!, {
+    title: 'Select the dovi_tool release .zip (or dovi_tool.exe)',
+    properties: ['openFile'],
+    filters: [{ name: 'dovi_tool zip or exe', extensions: ['zip', 'exe'] }],
+  });
+  return r.canceled ? null : r.filePaths[0] || null;
+});
+
 let current: ChildProcess | null = null;
 // Long renders (16K, overnight batch) must survive display/system sleep, and their progress should show
 // on the taskbar even when the window is unfocused. Both are driven from the run lifecycle below.
@@ -481,6 +577,7 @@ ipcMain.on(
       upscale?: number;
       rtxvsr?: boolean;
       rtxhdr?: boolean;
+      dv?: boolean;
       codec?: string;
       hdrcolor?: string;
       hdrsat?: number;
@@ -529,6 +626,8 @@ ipcMain.on(
       if (opts.hdrsb && opts.hdrsb > 0) args.push('--hdr-satboost', String(opts.hdrsb));
       // RTX HDR tone curve (SDK 0..200, 100 = neutral; the GUI shows the App's -100..100 scale).
       if (typeof opts.hdrcon === 'number' && opts.hdrcon !== 100) args.push('--hdr-contrast', String(opts.hdrcon));
+      // Dolby Vision Profile 8.1 export on top of the HDR10 render (needs dovi_tool in engine/dvtools).
+      if (opts.dv) args.push('--dv');
     }
     // PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from crashing the engine
     // during first-run TRT builds; SMV_TRT_CACHE is a guaranteed writable cache location.

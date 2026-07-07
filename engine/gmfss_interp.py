@@ -116,6 +116,13 @@ ap.add_argument("--rtx-hdr", action="store_true",
                      "10-bit BT.2020 PQ. Combines with --upscale (the RTX bridge does VSR then "
                      "TrueHDR in one pass). Needs engine/rtxvideo; falls back to an SDR render if "
                      "the bridge is unavailable.")
+ap.add_argument("--dv", action="store_true",
+                help="also export a Dolby Vision Profile 8.1 MP4. Requires --rtx-hdr (the HDR10 render "
+                     "is the DV base layer), an MP4 output, and the bundled dovi_tool in "
+                     "engine/dvtools. Collects per-frame DV metadata (L1) from the HDR frames, builds "
+                     "the RPU with dovi_tool, muxes with the bundled ffmpeg and writes the DV "
+                     "configuration box in-engine (no GPAC/MP4Box). The base stays HDR10, so non-DV "
+                     "players fall back to HDR10. Skipped with a notice if any requirement is missing.")
 ap.add_argument("--codec", choices=["hevc", "av1", "vvc"], default="hevc",
                 help="output codec. hevc (default): hevc_nvenc, the smallest widely-supported "
                      "visually lossless choice. av1: av1_nvenc (RTX 40/50 hardware encode). "
@@ -192,6 +199,7 @@ UPSCALE_F = max(1.0, min(16.0, args.upscale)) # output spatial upscale factor (c
 UPSCALE = UPSCALE_F > 1.0
 RTX_VSR = args.rtx_vsr                        # use the RTX Video SDK (real RTX VSR) for --upscale
 RTX_HDR = args.rtx_hdr                         # convert the output to HDR10 via RTX Video TrueHDR
+DV_EXPORT = args.dv                            # also emit a Dolby Vision Profile 8.1 MP4 (needs --rtx-hdr)
 CODEC = args.codec                             # output codec family: hevc (default) / av1 / vvc
 HDR_NITS = max(400, min(2000, args.hdr_nits)) # HDR10 peak luminance (TrueHDR target + metadata)
 HDR_SAT = max(0, min(200, args.hdr_saturation))  # TrueHDR Saturation; default 0 = faithful to source
@@ -394,6 +402,12 @@ if RTX_HDR and SRC_HDR_IN:
                      "converts SDR only, skipping the HDR conversion (source HDR signalling is "
                      "carried through as-is)\n"); sys.stderr.flush()
     RTX_HDR = False
+# Dolby Vision export (--dv) sits on top of the HDR10 render: it needs the HDR path active, an MP4
+# output, and the user-installed dovi_tool. Decide up front whether to collect per-frame L1 metadata
+# during the render (RTXVideo collect_l1); the actual export runs after the encode in _dv_export.
+DOVI_EXE = os.path.join(ENGINE_DIR, "dvtools", "dovi_tool.exe")
+# DV Profile 8.1 is HEVC-only (the RPU rides in the HEVC bitstream), MP4-only, and needs dovi_tool.
+_want_dv = DV_EXPORT and CODEC == "hevc" and not OUT_IS_MKV and os.path.isfile(DOVI_EXE)
 _need_vsr = UPSCALE and RTX_VSR              # AI upscale via RTX VSR (else bicubic / no upscale)
 _need_hdr = RTX_HDR                          # SDR -> HDR10 via RTX TrueHDR
 RTX_VSR_ACTIVE = False                       # True once the RTX VSR pass is confirmed available
@@ -408,7 +422,7 @@ if _need_vsr or _need_hdr:
         _RTX = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=_need_vsr, hdr=_need_hdr,
                                  hdr_max_nits=HDR_NITS, hdr_contrast=HDR_CON, hdr_saturation=HDR_SAT,
                                  hdr_middlegray=HDR_MG, hdr_color=HDR_COLOR, hdr_vibrance=HDR_VIBRANCE,
-                                 hdr_satboost=HDR_SATBOOST)
+                                 hdr_satboost=HDR_SATBOOST, collect_l1=_want_dv)
         RTX_VSR_ACTIVE = _need_vsr
         HDR_ACTIVE = _need_hdr
         if _need_vsr:
@@ -425,6 +439,18 @@ if _need_vsr or _need_hdr:
         RTX_VSR_ACTIVE = False
         HDR_ACTIVE = False
     sys.stderr.flush()
+
+# Dolby Vision export is active only if the HDR path actually came up (collect_l1 was already gated on
+# an MP4 output + dovi_tool present). The export runs in _dv_export at finalize; note the state now.
+DV_ACTIVE = _want_dv and HDR_ACTIVE
+if DV_EXPORT and not DV_ACTIVE:
+    _why = ("output is MKV (DV export needs MP4)" if OUT_IS_MKV
+            else "dovi_tool not found in engine/dvtools" if not os.path.isfile(DOVI_EXE)
+            else "RTX HDR is not active")
+    sys.stderr.write(f"[dv] Dolby Vision export skipped: {_why}\n"); sys.stderr.flush()
+elif DV_ACTIVE:
+    sys.stderr.write("Dolby Vision Profile 8.1 export ON (per-frame L1; HDR10 base, dvvC in-engine, "
+                     "no GPAC)\n"); sys.stderr.flush()
 
 # Detail restoration (--restore): Real-ESRGAN's anime-video model reconstructs linework and
 # texture on every output frame - the "chain a restoration model after interpolation" option
@@ -868,6 +894,12 @@ if USE_NVENC:
              "-spatial-aq", "1", "-temporal-aq", "1"]
     if venc in ("h264_nvenc", "hevc_nvenc"):
         qargs += ["-qp_cb_offset", "-2", "-qp_cr_offset", "-2"]
+    if DV_ACTIVE:
+        # Dolby Vision export re-muxes the encoded HEVC through a raw elementary stream (dovi_tool
+        # needs Annex B), and a B-frame reorder buffer makes that raw->MP4 copy assign non-monotonic
+        # DTS and silently drop the tail frames. Coding order == display order with no B-frames, so
+        # the remux is exact and the per-frame RPU aligns 1:1. The size cost is small at our CQ.
+        qargs += ["-bf", "0"]
 elif venc == "libvvenc":
     # vvenc has no CRF; QP with its perceptual QP adaptation (qpa, on by default). QP 20 verified
     # VMAF 99.82 / 51.3 dB / SSIM 0.9966 on the 8K master, one QP of extra headroom over the old
@@ -1083,6 +1115,8 @@ def _finalize_output():
     MasteringMetadata/MaxCLL elements (verified value-exact), so nothing is lost."""
     if not HDR_MKV_2STAGE:
         _write_hdr10_metadata(out_path)
+        if DV_ACTIVE:
+            _dv_export(out_path)
         return
     _write_hdr10_metadata(_ENC_TARGET)
     cmd = [FFMPEG, "-v", "error", "-y", "-i", _ENC_TARGET, "-i", inp,
@@ -1095,6 +1129,62 @@ def _finalize_output():
     except Exception as e:  # noqa: BLE001 - keep the finished video rather than fail the render
         sys.stderr.write(f"final MKV remux failed ({e}); the HDR video (with metadata, without "
                          f"the extra tracks) was kept at {_ENC_TARGET}\n"); sys.stderr.flush()
+
+
+def _dv_export(mp4_path):
+    """Turn the finished HDR10 MP4 into a Dolby Vision Profile 8.1 MP4 in place, GPAC-free: dovi_tool
+    builds the RPU from the per-frame L1 collected during the render (dovi_tool handles B-frame
+    reordering), the bundled ffmpeg muxes it, and hdr10_meta writes the DV configuration box (dvvC)
+    plus the HDR10 fallback boxes ourselves. The base layer stays HDR10, so non-DV players fall back.
+    Best-effort: any failure keeps the finished HDR10 file."""
+    l1 = list(getattr(_RTX, "l1", []) or [])
+    if not l1:
+        sys.stderr.write("[dv] no per-frame metadata collected; kept the HDR10 file\n"); sys.stderr.flush()
+        return
+    base = mp4_path + ".dvwork"
+    hevc, rpu, dvhevc, cfg, tmp_out = (base + s for s in (".hevc", ".rpu", ".dv.hevc", ".json", ".mp4"))
+    cll = int(getattr(_RTX, "maxcll", 0) or 0)
+    fall = int(getattr(_RTX, "maxfall", 0) or 0)
+    _q = dict(check=True, creationflags=NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        import hdr10_meta
+        # 1. pull the HDR10 HEVC elementary stream out of the finished mp4
+        subprocess.run([FFMPEG, "-v", "error", "-y", "-i", mp4_path, "-map", "0:v:0", "-c", "copy",
+                        "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", hevc], **_q)
+        # 2. dovi_tool generate config: one L1 shot per output frame + L6 (mastering + measured light)
+        gen = {"cm_version": "V29", "length": len(l1),
+               "level6": {"max_display_mastering_luminance": HDR_NITS, "min_display_mastering_luminance": 1,
+                          "max_content_light_level": cll, "max_frame_average_light_level": fall},
+               "shots": [{"start": i, "duration": 1,
+                          "metadata_blocks": [{"Level1": {"min_pq": mn, "avg_pq": av, "max_pq": mx}}]}
+                         for i, (mn, av, mx) in enumerate(l1)]}
+        with open(cfg, "w") as f:
+            json.dump(gen, f)
+        # 3. build the RPU, then 4. inject it in-band into the elementary stream
+        subprocess.run([DOVI_EXE, "generate", "-j", cfg, "-o", rpu], **_q)
+        subprocess.run([DOVI_EXE, "inject-rpu", "-i", hevc, "--rpu-in", rpu, "-o", dvhevc], **_q)
+        # 5. remux the DV video with the original audio/subtitle tracks, re-tagging BT.2020 PQ
+        subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "hevc", "-r", rate_str, "-i", dvhevc,
+                        "-i", mp4_path, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-c", "copy",
+                        "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+                        "-color_range", "tv", "-tag:v", "hvc1", tmp_out],
+                       check=True, creationflags=NO_WINDOW)
+        # 6. stamp the DV configuration box (dvvC) + the HDR10 mastering/CLL fallback boxes ourselves
+        hdr10_meta.inject_dv_config(tmp_out, OUT_W, OUT_H, out_label)
+        hdr10_meta.inject_hdr10(tmp_out, max_nits=HDR_NITS, maxcll=cll, maxfall=fall,
+                                colorspace=HDR_MASTER_PRIM)
+        os.replace(tmp_out, mp4_path)
+        sys.stderr.write(f"Dolby Vision: Profile 8.1 written ({len(l1)} frames, per-frame L1; HDR10 "
+                         f"fallback) -> {mp4_path}\n"); sys.stderr.flush()
+    except Exception as e:  # noqa: BLE001 - never lose the HDR10 render over the DV step
+        sys.stderr.write(f"[dv] export failed ({repr(e)[:200]}); kept the HDR10 file at {mp4_path}\n")
+        sys.stderr.flush()
+    finally:
+        for p in (hevc, rpu, dvhevc, cfg, tmp_out):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def _drain_pipes():

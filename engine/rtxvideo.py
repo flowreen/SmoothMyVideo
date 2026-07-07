@@ -130,7 +130,8 @@ class RTXVideo:
 
     def __init__(self, width, height, out_w, out_h, vsr=True, hdr=False, vsr_quality=4,
                  hdr_max_nits=1000, hdr_contrast=100, hdr_saturation=0, hdr_middlegray=50,
-                 hdr_color="vivid", hdr_vibrance=0.0, hdr_satboost=0.0, rtx_dir=RTX_DIR):
+                 hdr_color="vivid", hdr_vibrance=0.0, hdr_satboost=0.0, collect_l1=False,
+                 rtx_dir=RTX_DIR):
         # Make sure torch's primary CUDA context exists and is current on this thread before the
         # bridge retains it (create is called with cuContext=NULL -> cuDevicePrimaryCtxRetain).
         torch.zeros(8, device="cuda")
@@ -159,6 +160,10 @@ class RTXVideo:
         # gmfss_interp / hdr10_meta), so one file tone-maps to any display without a per-monitor knob.
         self._cll = 0.0    # running MaxCLL  (brightest maxRGB pixel, nits) over all HDR frames
         self._fall = 0.0   # running MaxFALL (brightest frame-average maxRGB, nits)
+        # Per-frame Dolby Vision L1 (min/avg/max PQ brightness), collected only for the --dv export so
+        # a normal HDR render pays nothing. One triple is appended per run_hdr call, in output order.
+        self._collect_l1 = bool(collect_l1)
+        self._l1 = []
         self._thdr = _THDR(max(0, min(200, int(hdr_contrast))),
                            max(0, min(200, int(hdr_saturation))),
                            max(10, min(100, int(hdr_middlegray))),
@@ -295,15 +300,7 @@ class RTXVideo:
         ictcp = torch.stack([ic_f[0], ct, cp], 0)
         lms = _pq_to_linear(torch.einsum("ij,jhw->ihw", self._ictcp2lms, ictcp))
         out = torch.einsum("ij,jhw->ihw", self._lms2rgb, lms).clamp_(0.0, 1.0)   # linear BT.2020
-        try:                                                                # MaxCLL/FALL from corrected px
-            mx = out.max(0).values
-            self._cll = max(self._cll, float(mx.max().item()) * 10000.0)
-            self._fall = max(self._fall, float(mx.mean().item()) * 10000.0)
-        except Exception:  # noqa: BLE001
-            pass
-        code = _linear_to_pq(out).mul_(1023.0).round_().clamp_(0, 1023).to(torch.int64)
-        pk = (code[2] & 1023) | ((code[1] & 1023) << 10) | ((code[0] & 1023) << 20) | (3 << 30)
-        return pk.cpu().numpy().astype("<u4").tobytes()                      # [H,W] -> x2rgb10le bytes
+        return self._pack_out(out)
 
     def _rtx_correct(self, rgb, packed):
         """RTX-faithful HDR. Keeps the source hue but takes TrueHDR's chroma MAGNITUDE (driven by the SDK
@@ -336,6 +333,11 @@ class RTXVideo:
         ictcp = torch.stack([ic_f[0], ct, cp], 0)
         lms = _pq_to_linear(torch.einsum("ij,jhw->ihw", self._ictcp2lms, ictcp))
         out = torch.einsum("ij,jhw->ihw", self._lms2rgb, lms).clamp_(0.0, 1.0)   # linear BT.2020
+        return self._pack_out(out)
+
+    def _pack_out(self, out):
+        """Shared vivid/rtx tail: accumulate MaxCLL/MaxFALL (and DV L1 when collecting) from the
+        corrected linear BT.2020 frame `out` ([3,H,W]), then PQ-encode and pack to x2rgb10le bytes."""
         try:                                                                # MaxCLL/FALL from corrected px
             mx = out.max(0).values
             self._cll = max(self._cll, float(mx.max().item()) * 10000.0)
@@ -343,8 +345,21 @@ class RTXVideo:
         except Exception:  # noqa: BLE001
             pass
         code = _linear_to_pq(out).mul_(1023.0).round_().clamp_(0, 1023).to(torch.int64)
+        self._accum_l1(code.amax(0))                                        # DV L1 (maxRGB PQ); no-op unless --dv
         pk = (code[2] & 1023) | ((code[1] & 1023) << 10) | ((code[0] & 1023) << 20) | (3 << 30)
         return pk.cpu().numpy().astype("<u4").tobytes()                      # [H,W] -> x2rgb10le bytes
+
+    def _accum_l1(self, maxrgb10):
+        """Append one Dolby Vision L1 (per-frame min/avg/max brightness) from the frame's per-pixel
+        max-RGB PQ code (10-bit int tensor), scaled to the 12-bit values the DV RPU carries. No-op
+        unless created with collect_l1=True; one .tolist() sync per frame keeps the cost to ~one
+        reduction (negligible beside the TrueHDR inference)."""
+        if not self._collect_l1:
+            return
+        b = maxrgb10.float()
+        stats = torch.stack([b.amin(), b.mean(), b.amax()]).mul_(4095.0 / 1023.0)
+        mn, av, mx = stats.round_().clamp_(0, 4095).to(torch.int32).tolist()
+        self._l1.append((mn, av, mx))
 
     def _measure_light(self, packed):
         """Accumulate MaxCLL/MaxFALL from one packed 10-bit PQ frame ([H,W,4] uint8 ==
@@ -357,6 +372,7 @@ class RTXVideo:
             .pow_(1.0 / _PQ_M1).mul_(10000.0)                     # maxRGB luminance, nits
         self._cll = max(self._cll, float(nits.max().item()))
         self._fall = max(self._fall, float(nits.mean().item()))
+        self._accum_l1(code)                                      # raw mode: DV L1 from the same maxRGB PQ code
 
     @property
     def maxcll(self):
@@ -367,6 +383,12 @@ class RTXVideo:
     def maxfall(self):
         """Measured MaxFALL in nits (rounded up, clamped to the clli box's uint16), 0 if no frames."""
         return min(65535, int(math.ceil(self._fall)))
+
+    @property
+    def l1(self):
+        """Per-frame Dolby Vision L1 triples (min_pq, avg_pq, max_pq; 12-bit) in output-frame order,
+        one per run_hdr call; empty unless the instance was created with collect_l1=True."""
+        return self._l1
 
     def close(self):
         try:

@@ -30,6 +30,10 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   gradients (skies, glows) never band into visible steps.
 - 🎨 **Production-grade HDR10.** Real SDR→HDR10 conversion with proper mastering metadata
   (mastering-display + measured MaxCLL/MaxFALL) and faithful, cyan-free colour — not just a PQ tag.
+- 🌈 **Dolby Vision Profile 8.1 export (experimental).** Optionally add Profile 8.1 dynamic-HDR metadata on
+  top of the HDR10 render — HDR10-compatible, so non-DV players fall back to HDR10. Uses the
+  separately-installed open-source [dovi_tool](https://github.com/quietvoid/dovi_tool); no Dolby software
+  is bundled.
 - 🔍 **AI upscaling to 16K + detail restoration.** NVIDIA RTX Video Super Resolution plus a Real-ESRGAN
   restore pass, layered with the interpolation in a single render.
 - 💬 **Keeps every track.** All audio, subtitles/translations, chapters and font attachments are preserved
@@ -57,3 +61,10 @@ MetricNet, FeatureNet, FusionNet and softsplat warping — producing clean frame
 It runs fp16 with a cupy softsplat kernel and an optional TensorRT backend.
 
 📖 **Build it, hack on it, or read the design rationale → [DEVELOPMENT.md](DEVELOPMENT.md)**
+
+---
+
+<sub>Dolby and Dolby Vision are trademarks of Dolby Laboratories. SmoothMyVideo is an independent project and
+is not affiliated with, endorsed by, sponsored by, or certified by Dolby Laboratories. Dolby Vision Profile
+8.1 metadata is produced by the separately-installed, third-party open-source
+[dovi_tool](https://github.com/quietvoid/dovi_tool); no Dolby software is bundled or redistributed.</sub>
