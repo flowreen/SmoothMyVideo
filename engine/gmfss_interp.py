@@ -45,7 +45,6 @@ timed on-grid interior frames read as higher quality than an all-synthetic half-
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
        [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
        [--out-bits {8,10}] [--restore]
-       [--no-passthrough]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
@@ -134,12 +133,6 @@ ap.add_argument("--restore", action="store_true",
                      "smoothing). Off by default; adds a second model pass per OUTPUT frame "
                      "(TensorRT-cached; roughly +50%% wall on a 2x 1080p render, more at "
                      "higher multipliers since every emitted frame pays it).")
-ap.add_argument("--no-passthrough", action="store_true",
-                help="disable track passthrough. By default EVERY audio track, subtitle track "
-                     "(translations), chapter list and font attachment is copied into the output, "
-                     "and the container switches from mp4 to mkv automatically when the tracks "
-                     "need it (styled ASS/PGS subtitles, exotic audio codecs). With this flag the "
-                     "output is always mp4 with only the first audio track, the old behaviour.")
 ap.add_argument("--out-bits", type=int, choices=[8, 10], default=10,
                 help="output bit depth. 10 (default): encode 10-bit (HEVC main10 / 10-bit AV1) even "
                      "from an 8-bit source - every emitted frame is computed in floating point, so "
@@ -191,7 +184,6 @@ args = ap.parse_args()
 inp = os.path.abspath(args.input)
 SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
-PASSTHROUGH = not args.no_passthrough        # copy all audio/subtitle/chapter/font tracks through
 UPSCALE_F = max(1.0, min(16.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
                                              # RTX VSR has no integer-scale limit (probed clean to
                                              # 16K), so any factor is allowed up to a 16x sanity cap
@@ -272,9 +264,9 @@ else:
     rate_str = f"{num * args.multi}/{den}"
     out_label = int(round(src_fps * args.multi))
 # --- track passthrough (translations) --------------------------------------------------------
-# The output used to be mp4 with only the first audio track: every subtitle track, extra audio
-# language, chapter list and font attachment was silently dropped. With PASSTHROUGH (default)
-# they are all copied through. Container rule: mp4 cannot hold styled ASS/PGS subtitles or some
+# Older builds output mp4 with only the first audio track: every subtitle track, extra audio
+# language, chapter list and font attachment was silently dropped. Now they are all copied
+# through unconditionally. Container rule: mp4 cannot hold styled ASS/PGS subtitles or some
 # audio codecs, so the DEFAULT output name switches to .mkv whenever the source has subtitles or
 # mp4-incompatible audio; an EXPLICIT output path keeps its extension and the mapping adapts
 # (subtitles/exotic audio are dropped from an explicit .mp4, with a notice). mov_text subtitles
@@ -282,22 +274,21 @@ else:
 MP4_AUDIO_OK = {"aac", "ac3", "eac3", "mp3", "alac", "opus", "flac"}   # flac/opus verified in this build
 MKV_SUB_COPY_OK = {"ass", "ssa", "subrip", "srt", "hdmv_pgs_subtitle", "dvd_subtitle", "webvtt"}
 AUD_STREAMS, SUB_STREAMS, HAS_ATTACH = [], [], False   # (input-1 absolute index, codec) per stream
-if PASSTHROUGH:
-    try:
-        _ts = json.loads(subprocess.check_output(
-            [FFPROBE, "-v", "error", "-show_entries", "stream=index,codec_type,codec_name",
-             "-of", "json", inp], text=True, creationflags=NO_WINDOW)).get("streams", [])
-        for _s in _ts:
-            _ty, _c = _s.get("codec_type", ""), (_s.get("codec_name") or "").lower()
-            if _ty == "audio":
-                AUD_STREAMS.append((_s.get("index"), _c))
-            elif _ty == "subtitle":
-                SUB_STREAMS.append((_s.get("index"), _c))
-            elif _ty == "attachment":
-                HAS_ATTACH = True
-    except Exception:  # noqa: BLE001 - probe failure: behave like the legacy single-audio path
-        pass
-NEED_MKV = PASSTHROUGH and (bool(SUB_STREAMS) or any(c not in MP4_AUDIO_OK for _, c in AUD_STREAMS))
+try:
+    _ts = json.loads(subprocess.check_output(
+        [FFPROBE, "-v", "error", "-show_entries", "stream=index,codec_type,codec_name",
+         "-of", "json", inp], text=True, creationflags=NO_WINDOW)).get("streams", [])
+    for _s in _ts:
+        _ty, _c = _s.get("codec_type", ""), (_s.get("codec_name") or "").lower()
+        if _ty == "audio":
+            AUD_STREAMS.append((_s.get("index"), _c))
+        elif _ty == "subtitle":
+            SUB_STREAMS.append((_s.get("index"), _c))
+        elif _ty == "attachment":
+            HAS_ATTACH = True
+except Exception:  # noqa: BLE001 - probe failure: fall back to no extra tracks
+    pass
+NEED_MKV = bool(SUB_STREAMS) or any(c not in MP4_AUDIO_OK for _, c in AUD_STREAMS)
 out_path = os.path.abspath(args.output) if args.output else \
     os.path.splitext(inp)[0] + (("_sharpened" if NO_INTERP else f"_{out_label}fps")
                                 + (".mkv" if NEED_MKV else ".mp4"))
@@ -440,8 +431,9 @@ if _need_vsr or _need_hdr:
         if _need_hdr:
             _vib = f", vib {HDR_VIBRANCE:g}" if HDR_VIBRANCE > 0 else ""
             _sb = f", sb {HDR_SATBOOST:g}" if HDR_SATBOOST > 0 else ""
-            sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits, sat {HDR_SAT}, con {HDR_CON}, "
-                             f"mg {HDR_MG}, colour {HDR_COLOR}{_vib}{_sb}) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
+            sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits, con {HDR_CON}, sat {HDR_SAT} "
+                             f"[SDK 0-200, 100=neutral], mg {HDR_MG}, colour {HDR_COLOR}{_vib}{_sb}) "
+                             f"HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"[rtx] unavailable, falling back (bicubic upscale / SDR): {repr(e)[:200]}\n")
         _RTX = None
@@ -968,37 +960,34 @@ _TQ = ["-threads", "1", "-thread_queue_size", "1"] if (OUT_W > NVENC_MAX or OUT_
 # when an explicit .mp4 path overrode the mkv choice). Subtitles/fonts: mkv only, with
 # mov_text converted to SRT per stream. Chapters ride along in both containers.
 _maps, _drops = [], []
-if PASSTHROUGH:
-    if OUT_IS_MKV:
-        _maps += ["-map", "1:a?"]
-    else:
-        _good = [i for i, c in AUD_STREAMS if c in MP4_AUDIO_OK]
-        for _i in _good:
-            _maps += ["-map", f"1:{_i}"]
-        if len(_good) < len(AUD_STREAMS):
-            _drops.append(f"{len(AUD_STREAMS) - len(_good)} audio track(s) (codec not mp4-compatible)")
-    _maps += ["-c:a", "copy"]
-    if OUT_IS_MKV and SUB_STREAMS:
-        _maps += ["-map", "1:s?", "-c:s", "copy"]
-        for _j, (_i, _c) in enumerate(SUB_STREAMS):
-            if _c not in MKV_SUB_COPY_OK:
-                _maps += [f"-c:s:{_j}", "srt"]     # mov_text etc: mp4-native, transcode for mkv
-    elif SUB_STREAMS:
-        _drops.append(f"{len(SUB_STREAMS)} subtitle track(s) (mp4 output; use .mkv to keep them)")
-    if OUT_IS_MKV and HAS_ATTACH:
-        _maps += ["-map", "1:t?"]
-    _maps += ["-map_chapters", "1"]
-    _n_sub = len(SUB_STREAMS) if OUT_IS_MKV else 0
-    _n_aud = len(AUD_STREAMS) if OUT_IS_MKV else len([1 for _, c in AUD_STREAMS if c in MP4_AUDIO_OK])
-    if _n_aud > 1 or _n_sub or (OUT_IS_MKV and HAS_ATTACH):
-        sys.stderr.write(f"passthrough: {_n_aud} audio, {_n_sub} subtitle track(s)"
-                         f"{', fonts' if (OUT_IS_MKV and HAS_ATTACH) else ''}, chapters -> "
-                         f"{'mkv' if OUT_IS_MKV else 'mp4'}\n")
-    for _d in _drops:
-        sys.stderr.write(f"passthrough: dropping {_d}\n")
-    sys.stderr.flush()
+if OUT_IS_MKV:
+    _maps += ["-map", "1:a?"]
 else:
-    _maps = ["-map", "1:a:0?", "-c:a", "copy"]
+    _good = [i for i, c in AUD_STREAMS if c in MP4_AUDIO_OK]
+    for _i in _good:
+        _maps += ["-map", f"1:{_i}"]
+    if len(_good) < len(AUD_STREAMS):
+        _drops.append(f"{len(AUD_STREAMS) - len(_good)} audio track(s) (codec not mp4-compatible)")
+_maps += ["-c:a", "copy"]
+if OUT_IS_MKV and SUB_STREAMS:
+    _maps += ["-map", "1:s?", "-c:s", "copy"]
+    for _j, (_i, _c) in enumerate(SUB_STREAMS):
+        if _c not in MKV_SUB_COPY_OK:
+            _maps += [f"-c:s:{_j}", "srt"]     # mov_text etc: mp4-native, transcode for mkv
+elif SUB_STREAMS:
+    _drops.append(f"{len(SUB_STREAMS)} subtitle track(s) (mp4 output; use .mkv to keep them)")
+if OUT_IS_MKV and HAS_ATTACH:
+    _maps += ["-map", "1:t?"]
+_maps += ["-map_chapters", "1"]
+_n_sub = len(SUB_STREAMS) if OUT_IS_MKV else 0
+_n_aud = len(AUD_STREAMS) if OUT_IS_MKV else len([1 for _, c in AUD_STREAMS if c in MP4_AUDIO_OK])
+if _n_aud > 1 or _n_sub or (OUT_IS_MKV and HAS_ATTACH):
+    sys.stderr.write(f"passthrough: {_n_aud} audio, {_n_sub} subtitle track(s)"
+                     f"{', fonts' if (OUT_IS_MKV and HAS_ATTACH) else ''}, chapters -> "
+                     f"{'mkv' if OUT_IS_MKV else 'mp4'}\n")
+for _d in _drops:
+    sys.stderr.write(f"passthrough: dropping {_d}\n")
+sys.stderr.flush()
 # HDR into MKV runs TWO-STAGE so the HDR10 static metadata survives: the injector writes ISOBMFF
 # boxes (mp4-only), but ffmpeg's mov demuxer reads mdcv/clli into stream side data and the
 # Matroska muxer writes them as MKV's NATIVE MasteringMetadata/MaxCLL elements (verified: values

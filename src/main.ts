@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, screen, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, screen, shell, powerSaveBlocker, Notification } from 'electron';
 import { spawn, execFile, execFileSync, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -17,6 +17,18 @@ const PREVIEW_SCRIPT = path.join(ENGINE, 'preview.py');
 // Prefer ffprobe bundled at engine/bin (portable build); fall back to PATH for dev.
 const FFPROBE = fs.existsSync(path.join(ENGINE, 'bin', 'ffprobe.exe'))
   ? path.join(ENGINE, 'bin', 'ffprobe.exe') : 'ffprobe';
+// The real cold-start when a video is selected is the before/after PREVIEW: it spawns the bundled Python,
+// imports cv2 + torch, and creates a CUDA context (~6s cold, ~2s warm; ffprobe itself is ~0.07s and the
+// preview decodes with cv2, not ffmpeg). Warm that engine at launch, while the welcome screen is up, so
+// the first preview pays the warm ~2s instead of the cold ~6s. This pre-loads torch's DLLs into the OS
+// cache and initialises the CUDA driver/device, which a fresh preview process then skips. It cannot go
+// below the ~2s per-process CUDA context cost (that would need a persistent preview daemon). Best-effort.
+function warmPreviewEngine() {
+  try {
+    spawn(pyExe(), ['-c', 'import cv2, torch; torch.zeros(1, device="cuda" if torch.cuda.is_available() else "cpu")'],
+      { cwd: ENGINE, env: { ...process.env, PYTHONUTF8: '1' }, stdio: 'ignore' }).on('error', () => {});
+  } catch { /* best-effort */ }
+}
 
 function pyExe(): string {
   return fs.existsSync(RUNTIME_PY) ? RUNTIME_PY : 'python';
@@ -24,16 +36,41 @@ function pyExe(): string {
 
 let win: BrowserWindow | null = null;
 
+// Remember the window size between sessions (size only, NOT position, so a disconnected monitor can't
+// leave it opening off-screen). getNormalBounds() ignores a maximized/minimized state, so we store a
+// real restorable size. Falls back to a 900x1000 default (portrait: the UI is one tall column).
+const windowStateFile = () => path.join(app.getPath('userData'), 'window-state.json');
+function loadWindowSize(): { width: number; height: number; maximized: boolean } {
+  try {
+    const s = JSON.parse(fs.readFileSync(windowStateFile(), 'utf8'));
+    if (typeof s.width === 'number' && typeof s.height === 'number')
+      return { width: s.width, height: s.height, maximized: !!s.maximized };
+  } catch { /* no saved state yet */ }
+  return { width: 900, height: 1000, maximized: false };
+}
+function saveWindowSize(): void {
+  if (!win) return;
+  try {
+    const b = win.getNormalBounds();
+    fs.writeFileSync(windowStateFile(), JSON.stringify({ width: b.width, height: b.height, maximized: win.isMaximized() }));
+  } catch { /* best effort */ }
+}
+
 function createWindow() {
+  const st = loadWindowSize();
   win = new BrowserWindow({
-    width: 780,
-    height: 700,
+    width: st.width,
+    height: st.height,
+    minWidth: 680,
+    minHeight: 640,
     title: 'SmoothMyVideo',
     backgroundColor: '#1b1b1b',
     icon: path.join(ROOT, 'icon.ico'),
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
+  if (st.maximized) win.maximize();
   win.setMenuBarVisibility(false);
+  win.on('close', saveWindowSize);   // persist size on close so the next launch reopens at the same size
   win.loadFile(path.join(ROOT, 'renderer', 'index.html'));
   // Guard against an accidental reload (Ctrl/Cmd+R, F5) WHILE the engine is running/paused: a reload
   // wipes the renderer's job state but leaves the engine alive in this process, and the next run spawns
@@ -47,6 +84,11 @@ function createWindow() {
   });
 }
 
+// Windows keys the taskbar icon, grouping and notification identity to the AppUserModelID, NOT the window
+// icon. Without this the app inherits electron.exe's identity and shows the Electron logo in the taskbar
+// (and notifications read "electron.app..."). Match the packaged appId so dev and zip builds agree.
+app.setAppUserModelId('com.smoothmyvideo.app');
+
 // Single instance only. A second launch shares this profile dir, and Chromium's disk/GPU cache and
 // Local Storage locks (held by the first instance) make the second window come up empty ("Unable to
 // move the cache: Access is denied", "Gpu Cache Creation failed"); it would also fight the first
@@ -57,7 +99,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', () => {
     if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); }
   });
-  app.whenReady().then(createWindow);
+  app.whenReady().then(() => { createWindow(); warmPreviewEngine(); });
 }
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
@@ -236,6 +278,19 @@ ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
 });
 
 let current: ChildProcess | null = null;
+// Long renders (16K, overnight batch) must survive display/system sleep, and their progress should show
+// on the taskbar even when the window is unfocused. Both are driven from the run lifecycle below.
+let sleepBlocker: number | null = null;
+const keepAwake = (on: boolean) => {
+  if (on) {
+    if (sleepBlocker === null || !powerSaveBlocker.isStarted(sleepBlocker))
+      sleepBlocker = powerSaveBlocker.start('prevent-app-suspension');   // system stays awake; the display may still sleep
+  } else if (sleepBlocker !== null) {
+    if (powerSaveBlocker.isStarted(sleepBlocker)) powerSaveBlocker.stop(sleepBlocker);
+    sleepBlocker = null;
+  }
+};
+const taskbarProgress = (frac: number) => { try { win?.setProgressBar(frac); } catch { /* no window */ } };
 
 // Live progress thumbnail: the engine overwrites this JPEG about once a second during a render
 // (see SMV_LIVE_PREVIEW below); the renderer polls it by mtime and shows the frame being written.
@@ -324,6 +379,8 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
   clearPause();   // start unpaused: never inherit a stale flag from a previous (e.g. killed) run
   const proc = spawn(pyExe(), args, { cwd: ENGINE, env });
   current = proc;
+  keepAwake(true);
+  try { win?.setProgressBar(2, { mode: 'indeterminate' }); } catch { /* warm-up: activity shown before the first PROGRESS line */ }
   // The engine keeps emitting stdout/stderr (and eventually 'close') asynchronously. If the renderer
   // window was closed mid-render, e.sender is destroyed and e.sender.send() throws "Object has been
   // destroyed", which is an UNCAUGHT exception in the main process and kills the whole app. Guard every
@@ -334,17 +391,30 @@ ipcMain.on('run', (e, opts: { input: string; multi: number; output: string; fps?
   };
   const onData = (buf: Buffer) => {
     const txt = buf.toString();
+    // Drive the Windows taskbar progress from the engine's "PROGRESS k/total" lines (last one wins).
+    const hits = [...txt.matchAll(/PROGRESS (\d+)\/(\d+)/g)];
+    const last = hits[hits.length - 1];
+    if (last) { const tot = Number(last[2]); if (tot > 0) taskbarProgress(Number(last[1]) / tot); }
     if (txt) send('engine-out', txt);
   };
   proc.stdout.on('data', onData);
   proc.stderr.on('data', onData);
-  proc.on('close', (code) => { current = null; clearPause(); send('engine-done', code); });
-  proc.on('error', (err) => { current = null; clearPause(); send('engine-out', 'spawn error: ' + err); send('engine-done', -1); });
+  proc.on('close', (code) => { current = null; clearPause(); keepAwake(false); taskbarProgress(-1); send('engine-done', code); });
+  proc.on('error', (err) => { current = null; clearPause(); keepAwake(false); taskbarProgress(-1); send('engine-out', 'spawn error: ' + err); send('engine-done', -1); });
 });
 
 ipcMain.on('cancel', () => {
   const c = current;
   if (c && c.pid) { execFile('taskkill', ['/pid', String(c.pid), '/T', '/F'], () => {}); }
+});
+
+// The renderer fires this when a job (or the whole batch) finishes; show a native notification only when
+// the window is unfocused, so someone who tabbed away during a long render is told it is done.
+ipcMain.on('render-complete', (_e, body: string) => {
+  if (win && !win.isFocused() && Notification.isSupported()) {
+    try { new Notification({ title: 'SmoothMyVideo', body: body || 'Render complete' }).show(); }
+    catch { /* notifications unavailable on this system */ }
+  }
 });
 
 // Before/after preview: render ONE source frame at the current spatial settings (RTX HDR when opts.hdr,

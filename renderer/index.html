@@ -48,13 +48,22 @@
 </head>
 <body>
   <h1>SmoothMyVideo</h1>
-  <div class="sub">GMFSS frame interpolation on your GeForce. Offline · visually lossless · fastest backend chosen automatically.</div>
+  <div class="sub">Make any video buttery-smooth. AI adds in-between frames for a higher frame rate, right on your NVIDIA GPU. Offline · No quality loss · No account needed.</div>
 
   <div class="row">
     <button id="pick">Select video...</button>
     <span id="path" class="hint">No file selected. You can also drag a video onto the window.</span>
   </div>
 
+  <!-- Empty state: shown until a video is loaded (or an RTX install begins), then replaced by #workspace. -->
+  <div id="welcome" class="panel" style="text-align:center;padding:40px 20px">
+    <div style="font-size:15px;margin-bottom:8px">👋 Welcome to <b>SmoothMyVideo</b></div>
+    <div class="hint">Drop a video anywhere on this window — or click <b>Select video…</b> above — to get started.<br>
+      You'll get a smoother, higher-frame-rate copy saved right next to the original.</div>
+  </div>
+
+  <!-- Everything operational: hidden until there's something to act on (see showWorkspace). -->
+  <div id="workspace" style="display:none">
   <div class="panel" id="info" style="display:none">
     <div class="row"><span class="k">Resolution</span><span class="v" id="res">-</span></div>
     <div class="row"><span class="k">Source FPS</span><span class="v" id="fps">-</span></div>
@@ -255,6 +264,7 @@
     </div></div>
 
   <div id="log"></div>
+  </div><!-- /#workspace -->
 
 <script>
 const { ipcRenderer, shell, webUtils } = require('electron');
@@ -293,6 +303,9 @@ if(localStorage.getItem('settingsVersion') !== SETTINGS_VERSION){
   localStorage.setItem('settingsVersion', SETTINGS_VERSION);
 }
 function log(t){ $('log').textContent += t; $('log').scrollTop = $('log').scrollHeight; }
+// Reveal the operational UI (controls, preview, progress, log) the first time there is something to do -
+// a video is loaded, or an RTX install begins. Until then only the welcome/empty state is shown.
+function showWorkspace(){ $('welcome').style.display = 'none'; $('workspace').style.display = ''; }
 // Repaint the frames/speed/ETA line. Called on every PROGRESS frame and on each timer tick; the
 // tick recomputes the remaining seconds from the anchor so the ETA counts down between frames.
 function paint(){
@@ -417,6 +430,7 @@ async function loadVideo(f){
   $('rtxhdr').disabled = info.srcHdr;
   $('rtxhdrhint').textContent = info.srcHdr ? '(source is already HDR, carried through as-is)'
                                             : '(convert SDR video to HDR)';
+  showWorkspace();
   $('info').style.display='block';
   $('res').textContent = s.width+' x '+s.height;
   $('fps').textContent = srcFps().toFixed(decimalsOf(srcFps()));   // natural precision: 24 -> "24", 23.976 -> "23.976"
@@ -429,7 +443,10 @@ async function loadVideo(f){
   $('status').textContent = 'Ready. Pick a multiplier or fps, then click Smooth It!';
   applyScreenFps();      // re-asserts the interp / screen-rate state and recomputes the output name
   syncUpscale();         // recompute the upscale target + output dims for this video's resolution
-  if(!batchAuto) openPreviewForVideo(); // before/after preview; skipped when a batch auto-advances
+  // Let the info panel paint first so the drop feels instant, THEN start the (slower, cold-starts
+  // Python) preview. Without the defer, the preview kicks off in the same tick and the metadata can
+  // look frozen while it loads. Skipped when a batch auto-advances.
+  if(!batchAuto) setTimeout(openPreviewForVideo, 100);
   return true;
 }
 // One or more inputs: the first loads now, the rest queue for the same settings back to back.
@@ -691,7 +708,7 @@ function syncPreview(){            // the preview panel appears once a video is 
   $('previewpanel').style.display = input ? '' : 'none';
   syncHdrColor();                  // HDR colour controls track the HDR toggle / readiness / source
 }
-let prevBusy = false, prevPending = null;   // serialize renders; rapid setting changes coalesce
+let prevBusy = false, prevPending = null, previewLite = false;   // serialize renders. previewLite: skip heavy RTX passes on the auto-preview (set by openPreviewForVideo, one-shot)
 let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown / mid-render preview
 function prevSettingsSig(){                 // everything that changes what the processed pane shows
   const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
@@ -704,6 +721,11 @@ async function loadPreview(frame){
   if(prevBusy){ prevPending = (frame == null ? 'mid' : frame); return; }
   prevBusy = true;
   const hdr = hdrOn(), sharpen = sharpStrength(), sig = prevSettingsSig();
+  // The auto-preview on video load runs "lite": it skips the heavy RTX VSR + TrueHDR passes (the bulk of
+  // the ~5s cost), so the drop is fast. Adjusting any preview control renders the full RTX version.
+  const lite = previewLite; previewLite = false;
+  const useHdr = lite ? false : hdr;
+  const useVsr = lite ? false : !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 0);
   inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame)].concat(sig));
   $('hdrpreview').style.display = 'block';
   if($('prevproc').clientHeight < 40) $('prevprocwrap').style.minHeight = '120px';  // spinner space on first load
@@ -717,10 +739,10 @@ async function loadPreview(frame){
     setSpin($('prevorigwrap'), $('prevorigspin'), true);
   }
   let r; try { r = await ipcRenderer.invoke('preview', Object.assign(
-    { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr, nits: 1000,
+    { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr: useHdr, nits: 1000,
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
       upscale: upFactor() || 0,
-      rtxvsr: !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 0) }, hdrColorPayload())); }
+      rtxvsr: useVsr }, hdrColorPayload())); }
   catch(e){ r = { error: String(e) }; }
   setSpin($('prevprocwrap'), $('prevspin'), false);
   $('prevprocwrap').style.minHeight = '';
@@ -735,24 +757,26 @@ async function loadPreview(frame){
   setPrevImg($('prevorig'), r.original);
   setPrevImg($('prevproc'), r.processed);
   lastPrevInput = input;
-  lastPrevKey = JSON.stringify([input, prevIdx].concat(sig));
+  lastPrevKey = lite ? '' : JSON.stringify([input, prevIdx].concat(sig));   // lite skipped RTX: force a full re-render on the next adjustment
   const upActive = upFactor() > 0;   // the processed side is upscaled too, so never call it unchanged
-  const vsrOn = $('rtxvsr').checked && rtxReady.vsr;   // AI upscale vs the plain bicubic fallback
-  const active = hdr || sharpen > 0 || restoreOn() || upActive;
+  const vsrOn = useVsr;              // what the processed pane actually rendered (lite skips VSR)
+  const active = useHdr || sharpen > 0 || restoreOn() || upActive;
   // Plain bicubic upscale with no AI/enhancement pass: both panes are the same bicubic image, so say so.
-  const bicubicOnly = upActive && !vsrOn && !restoreOn() && sharpen <= 0 && !hdr;
+  const bicubicOnly = upActive && !vsrOn && !restoreOn() && sharpen <= 0 && !useHdr;
+  const rtxSkipped = lite && (hdr || ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 0));   // RTX on in settings but skipped for the fast auto-preview
   const srcHdr = !!(info && info.srcHdr);
   $('prevoriglabel').textContent = srcHdr ? 'Original (HDR, tonemapped)' : 'Original';
   const parts = []; if(restoreOn()) parts.push('Restore');
   if(upActive) parts.push(vsrOn ? 'VSR' : 'bicubic');
-  if(sharpen > 0) parts.push('FSR'); if(hdr) parts.push('HDR');
+  if(sharpen > 0) parts.push('FSR'); if(useHdr) parts.push('HDR');
   $('prevproclabel').textContent = !active ? 'Unchanged'
     : 'Processed (' + parts.join(' + ') + ')';
   $('prevlabel').textContent = 'frame ' + prevIdx + (prevTotal ? ' / ' + prevTotal : '');
-  $('prevnote').textContent = (srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
+  $('prevnote').textContent = (rtxSkipped ? 'RTX VSR/HDR skipped in this quick preview for speed; adjust an RTX control to preview them (they still apply to the export)'
+    : srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
     : !active ? 'no Restore, FSR or RTX HDR enabled, the output will match the source'
-    : bicubicOnly ? 'plain bicubic upscale, no AI detail added — enable RTX VSR for that (both panes match)'
-    : hdr ? 'HDR is tonemapped to show on this SDR screen'
+    : bicubicOnly ? 'plain bicubic upscale, no AI detail added (enable RTX VSR for that; both panes match)'
+    : useHdr ? 'HDR is tonemapped to show on this SDR screen'
     : 'detail changes are subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
 }
 function randFrame(){ return prevTotal > 1 ? Math.floor(Math.random() * prevTotal) : 'mid'; }
@@ -768,6 +792,7 @@ function refreshPreviewIfOpen(){           // re-render the shown frame when sha
 }
 function openPreviewForVideo(){            // auto-load the pane when a video is selected
   syncPreview(); prevHist = []; prevTotal = 0; prevIdx = 0; updatePrevNav();
+  previewLite = true;   // the auto-preview on load skips the heavy RTX VSR/HDR passes so the drop is fast
   loadPreview('mid').then(() => { if(prevTotal && !prevHist.length) prevHist = [prevIdx]; updatePrevNav(); });
 }
 $('prevnext').onclick = async () => { await loadPreview(randFrame()); prevHist.push(prevIdx); updatePrevNav(); };
@@ -916,6 +941,7 @@ document.addEventListener('drop', (e) => {
   const files = [...(e.dataTransfer.files || [])];
   if(!files.length) return;
   if(/\.zip$/i.test(files[0].name)){           // an RTX Video SDK .zip: install the runtime
+    showWorkspace();   // RTX install feedback lives in #workspace, so reveal it even before a video is loaded
     if($('rtxsetup').style.display === 'none') $('rtxsetup').style.display = 'block';   // reveal install feedback
     doInstall(webUtils.getPathForFile(files[0]));
   } else {
@@ -1079,7 +1105,10 @@ ipcRenderer.on('engine-done', (_e, code) => {
       loadVideo(next).then(ok => { batchAuto = false;
         if(ok) $('go').onclick();
         else { $('status').textContent = 'Batch stopped: could not read '+next; batch = []; batchTotal = 1; } });
-    } else if(batchTotal > 1){ $('status').textContent = 'Done! All '+batchTotal+' files processed.'; batchTotal = 1; } }
+    } else {   // nothing more queued: notify that this job (or the whole batch) finished
+      if(batchTotal > 1) $('status').textContent = 'Done! All '+batchTotal+' files processed.';
+      ipcRenderer.send('render-complete', batchTotal > 1 ? ('All '+batchTotal+' files done') : 'Render complete');
+      batchTotal = 1; } }
   else { $('status').textContent='Failed (exit '+code+'). See log.'; log('>> Failed (exit '+code+')\n');
     if(batch.length) log('>> Batch stopped ('+batch.length+' queued files not processed)\n');
     batch = []; batchTotal = 1; }
