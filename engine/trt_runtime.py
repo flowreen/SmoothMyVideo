@@ -1,7 +1,7 @@
 """
 TensorRT backend for the GMFSS sub networks.
 
-Strategy (validated in trt_poc.py / trt_poc_gmflow.py): each sub net is exported
+Strategy: each sub net is exported
 to ONNX under autocast(fp16) via the dynamo exporter (mixed fp16/fp32 matching the
 app's precision), then built into a strongly typed TRT engine. softsplat (cupy) and
 the F.interpolate glue stay in eager. Engines are built on first use for a given

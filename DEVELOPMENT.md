@@ -84,6 +84,8 @@ portable bundle.
   target → both `release/win-unpacked/` and `SmoothMyVideo-<version>-win.zip`, ~4 GB with TensorRT
   bundled). Recipients extract and run `SmoothMyVideo.exe`; nothing required on the target but the NVIDIA
   driver. (A zip, not an NSIS installer — `makensis` can't memory-map an archive this large.)
+- `npm run lint` — one command that does everything: Prettier formats `src/**/*.ts` (writes), then ESLint
+  lints `src`, then pyright lints `engine`. Stops at the first failure. See below.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
@@ -164,6 +166,28 @@ cleanups were kept: GPU-side transposes and a single shared CUDA stream with no 
 - **Runtime:** keep `engine/runtime` a relocatable python-build-standalone install, never a `venv`.
 - **Renderer:** uses `require('electron')` with `nodeIntegration`, so it can't run in a plain browser —
   launch via `npm start`, the shortcut, or the vbs.
+
+## Linting & formatting
+All dev-only, all in `node_modules` (never shipped — `dist` bundles only `dist/`, `renderer/`, and the
+`engine` extraResources, not `node_modules`). Deliberately a **light touch**: the engine Python and the
+renderer's inline JS are intentionally dense (long lines, `x; y` one-liners, load-bearing comments), so
+nothing reflows them — only `src/*.ts` is auto-formatted.
+- **Prettier** (`.prettierrc.json`) formats `src/**/*.ts` only. `.prettierignore` guards `engine/`,
+  `renderer/`, and build dirs so a stray `prettier .` can't reflow the hand-tuned files. Config matches the
+  existing style (single quotes, semicolons, 2-space, printWidth 120).
+- **ESLint** (`eslint.config.js`, flat config, `typescript-eslint` recommended) lints `src/**/*.ts` for real
+  bugs — scoped to `src`, engine/renderer excluded. CommonJS config on purpose (no `"type":"module"`).
+- **pyright** (`pyrightconfig.json`) lints `engine/*.py` as a **linter, not a type checker**:
+  `typeCheckingMode: "off"` so the dynamic torch/numpy/cupy code isn't buried in type noise — only
+  high-signal checks stay on (undefined names → error, unused imports/vars → warning). Vendored
+  `runtime/`, `GMFSS_Fortuna/`, `trt_cache/`, and the RTX bridge are excluded from checking (`extraPaths`
+  still resolves the GMFSS model + local engine modules). No Python-side install needed — pyright runs from
+  npm. Ruff is a fine stronger alternative if you later install it (`uv tool install ruff`), but pyright
+  keeps everything in the one `npm install`.
+
+Note: `npm install <pkg>` rewrites `package.json` and re-expands its inline arrays (e.g. the `build.filter`
+list) to one-per-line; a plain `npm install` / `npm ci` leaves formatting alone. Re-inline by hand if it
+bothers you.
 
 ## Dev toolchain
 The dev machine has VS 2019 Build Tools (MSVC `cl.exe` 19.29) + the Windows 10 SDK, enough to build the

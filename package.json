@@ -7,30 +7,42 @@
   "scripts": {
     "start": "tsc && electron .",
     "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.js && npm start",
-    "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && electron-builder"
+    "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && electron-builder",
+    "lint": "prettier --write \"src/**/*.ts\" && eslint \"src/**/*.ts\" && pyright"
   },
   "devDependencies": {
     "@types/node": "latest",
     "electron": "latest",
     "electron-builder": "latest",
-    "typescript": "latest"
+    "eslint": "^10.6.0",
+    "prettier": "^3.9.4",
+    "pyright": "^1.1.411",
+    "typescript": "latest",
+    "typescript-eslint": "^8.63.0"
   },
   "private": true,
   "build": {
     "appId": "com.smoothmyvideo.app",
     "productName": "SmoothMyVideo",
-    "directories": { "output": "release" },
-    "files": ["dist/**/*", "renderer/**/*", "icon.ico", "icon.png"],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "renderer/**/*",
+      "icon.ico",
+      "icon.png"
+    ],
     "extraResources": [
       {
         "from": "engine",
         "to": "engine",
-        "filter": ["**/*", "!**/__pycache__/**",
-          "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine",
-          "!trt_poc.py", "!trt_poc_gmflow.py", "!trt_integration_test.py", "!trt_dynamic_test.py",
-          "!rtxvideo/**"]
+        "filter": ["**/*", "!**/__pycache__/**", "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine", "!rtxvideo/**"]
       }
     ],
-    "win": { "target": "zip", "icon": "icon.ico" }
+    "win": {
+      "target": "zip",
+      "icon": "icon.ico"
+    }
   }
 }

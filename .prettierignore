@@ -1,0 +1,8 @@
+# Only src/*.ts is formatted (see the "format" script). Everything below is intentionally
+# hand-formatted or generated and must never be reflowed by a stray `prettier .`:
+node_modules
+dist
+release
+engine
+renderer
+package-lock.json

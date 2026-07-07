@@ -54,8 +54,6 @@ MASTERING_COLORSPACES = {
 }
 DEFAULT_COLORSPACE = "display-p3"
 
-_CONTAINERS = (b"moov", b"trak", b"mdia", b"minf", b"stbl")   # plain container boxes (8-byte header)
-
 
 def _iter_boxes(buf, start, end):
     """Yield (type, box_start, payload_start, box_end) for each box in [start, end)."""
@@ -152,7 +150,7 @@ def inject_hdr10(path, max_nits=1000, min_nits=0.0, maxcll=0, maxfall=0,
     sample = next(_iter_boxes(buf, entries_start, stsd[2]), None)
     if not sample:
         return False
-    s_type, s_start, s_ps, s_end = sample
+    _s_type, s_start, s_ps, s_end = sample
     # Idempotent: skip if mdcv/clli already sit in the sample entry (children begin after the
     # 78-byte VisualSampleEntry header).
     for t, *_ in _iter_boxes(buf, s_ps + 78, s_end):
@@ -166,7 +164,7 @@ def inject_hdr10(path, max_nits=1000, min_nits=0.0, maxcll=0, maxfall=0,
     # Patch chunk-offset tables first (positions are at their original offsets). Any offset that
     # points past the insertion point shifts by delta. moov-at-end: offsets are < insert_at, so
     # nothing moves; faststart (moov before mdat): offsets are >= insert_at and all shift.
-    for t, bs, ps, be in _iter_boxes(buf, stbl[1], stbl[2]):
+    for t, _bs, ps, _be in _iter_boxes(buf, stbl[1], stbl[2]):
         if t == b"stco":
             cnt = struct.unpack_from(">I", buf, ps + 4)[0]
             base = ps + 8
@@ -209,7 +207,7 @@ def _dump(path):
     stsd = _find(buf, stbl[1], stbl[2], b"stsd")
     sample = next(_iter_boxes(buf, stsd[1] + 8, stsd[2]))
     print("sample entry:", sample[0].decode(errors="replace"))
-    for t, bs, ps, be in _iter_boxes(buf, sample[2] + 78, sample[3]):
+    for t, _bs, ps, _be in _iter_boxes(buf, sample[2] + 78, sample[3]):
         if t == b"mdcv":
             vals = struct.unpack_from(">8H2I", buf, ps)
             print("  mdcv", vals)

@@ -705,13 +705,20 @@ def _pair_fracs(p):
     return [(j + 0.5) / ratio - p for j in range(lo, hi)]
 
 def read_exact(stream, nbytes):
-    buf = bytearray()
-    while len(buf) < nbytes:
-        chunk = stream.read(nbytes - len(buf))
-        if not chunk:
+    # Read one full raw frame into a single pre-allocated buffer with readinto (no per-chunk
+    # append + final bytes() copy - that was a whole extra frame-sized memcpy per frame, ~0.8 GB
+    # at 16K). The bytearray is bytes-like, so np.frombuffer (to_tensor) and enc.stdin.write (the
+    # plain-passthrough path) both take it directly, and each call allocates a fresh buffer so
+    # nothing downstream aliases. None on EOF (short/empty read before the frame completes).
+    buf = bytearray(nbytes)
+    mv = memoryview(buf)
+    off = 0
+    while off < nbytes:
+        n = stream.readinto(mv[off:])
+        if not n:
             return None
-        buf += chunk
-    return bytes(buf)
+        off += n
+    return buf
 
 dec = subprocess.Popen(
     [FFMPEG, "-v", "error", "-i", inp, "-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
