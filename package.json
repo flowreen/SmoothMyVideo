@@ -37,7 +37,7 @@
       {
         "from": "engine",
         "to": "engine",
-        "filter": ["**/*", "!**/__pycache__/**", "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine", "!rtxvideo/**"]
+        "filter": ["**/*", "!**/__pycache__/**", "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine", "!rtxvideo/**", "!dvtools/**"]
       }
     ],
     "win": {
