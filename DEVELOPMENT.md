@@ -60,8 +60,8 @@ present; the app falls back to PATH ffmpeg otherwise, or the GUI "Choose .zip" b
 binary didn't download: `node node_modules/electron/install.js`.
 
 **2. Python runtime → `engine/runtime`** (the only gitignored piece)
-- *Easy:* copy `resources/engine/runtime` out of any packaged build (local `release/win-unpacked/` or a
-  release zip), it's the ready-to-run interpreter, nothing else to do.
+- *Easy:* copy `resources/engine/runtime` out of any packaged build (extract a release zip), it's the
+  ready-to-run interpreter, nothing else to do.
 - *From scratch:* unpack a
   [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases) CPython 3.14
   `install_only` win64 build to `engine/runtime`, then:
@@ -83,10 +83,12 @@ portable bundle.
 
 ## Scripts
 - `npm start`, build (`tsc`) and launch.
-- `npm run dist`, the build command: wipes `release/`, compiles with `tsc`, runs electron-builder (zip
-  target → both `release/win-unpacked/` and `SmoothMyVideo-<version>-win.zip`, ~4 GB with TensorRT
-  bundled). Recipients extract and run `SmoothMyVideo.exe`; nothing required on the target but the NVIDIA
-  driver. (A zip, not an NSIS installer, `makensis` can't memory-map an archive this large.)
+- `npm run dist`, the build command: wipes `release/`, compiles with `tsc`, runs electron-builder, and
+  zips the result into `release/SmoothMyVideo-<version>-win.zip` (~4 GB with TensorRT bundled). The
+  multi-GB staging folder is deleted once the zip passes a size sanity check, so the zip is the only
+  artifact left; to inspect the unpacked app, extract the zip. Recipients extract and run
+  `SmoothMyVideo.exe`; nothing required on the target but the NVIDIA driver. (A zip, not an NSIS
+  installer, `makensis` can't memory-map an archive this large.)
 - `npm run lint`, one command that does everything: Prettier formats `src/**/*.ts` (writes), then ESLint
   lints `src`, then pyright lints `engine`. Stops at the first failure. See below.
 - `engine\runtime\python.exe scripts\smoke.py [--full] [--trt]`, the render smoke tests: real engine runs
@@ -267,6 +269,11 @@ nothing reflows them, only `src/*.ts` is auto-formatted.
 Note: `npm install <pkg>` rewrites `package.json` and re-expands its inline arrays (e.g. the `build.filter`
 list) to one-per-line; a plain `npm install` / `npm ci` leaves formatting alone. Re-inline by hand if it
 bothers you.
+
+Dev dependencies are pinned to caret majors (not `latest`) because `npm run setup` deletes the lockfile:
+with `latest`, a fresh setup after a major release would silently pull a breaking toolchain. In particular
+**TypeScript stays on `^6` until 7.1**: TS 7 (the Go-native compiler) changed the programmatic API and
+typescript-eslint support is slated for 7.1; the compile-speed win is irrelevant at this project's size.
 
 ## Dev toolchain
 The dev machine has VS 2019 Build Tools (MSVC `cl.exe` 19.29) + the Windows 10 SDK, enough to build the

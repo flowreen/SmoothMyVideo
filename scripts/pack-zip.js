@@ -27,6 +27,17 @@ fs.renameSync(unpacked, folder);
 
 const tar = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
 fs.rmSync(path.join(rel, zipName), { force: true });
-console.log(`packing ${zipName} (root folder: SmoothMyVideo/) — ~4 GB, this takes a minute...`);
+console.log(`packing ${zipName} (root folder: SmoothMyVideo/), ~4 GB, this takes a minute...`);
 execFileSync(tar, ['-a', '-cf', zipName, 'SmoothMyVideo'], { cwd: rel, stdio: 'inherit' });
-console.log(`done -> release/${zipName}  (contains SmoothMyVideo/, plus the unpacked app at release/SmoothMyVideo/)`);
+
+// The zip is the deliverable; the multi-GB staging folder would otherwise linger in release/
+// forever. Delete it only after sanity-checking that tar really produced a plausible archive
+// (execFileSync already threw on a nonzero exit, so this is belt and braces against a silent
+// truncation): anything under 1 GB cannot be a real bundle with the 5.7 GB runtime inside.
+const zipSize = fs.statSync(path.join(rel, zipName)).size;
+if (zipSize < 1e9) {
+  console.error(`zip is only ${(zipSize / 1e6).toFixed(0)} MB — keeping release/SmoothMyVideo/ for inspection`);
+  process.exit(1);
+}
+fs.rmSync(folder, { recursive: true, force: true });
+console.log(`done -> release/${zipName} (${(zipSize / 1e9).toFixed(2)} GB); staging folder cleaned up`);

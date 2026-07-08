@@ -11,14 +11,14 @@
     "lint": "prettier --write \"src/**/*.ts\" && eslint \"src/**/*.ts\" && pyright"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "electron": "latest",
-    "electron-builder": "latest",
-    "eslint": "latest",
-    "prettier": "latest",
-    "pyright": "latest",
-    "typescript": "latest",
-    "typescript-eslint": "latest"
+    "@types/node": "^26",
+    "electron": "^43",
+    "electron-builder": "^26",
+    "eslint": "^10",
+    "prettier": "^3",
+    "pyright": "^1.1",
+    "typescript": "^6",
+    "typescript-eslint": "^8"
   },
   "private": true,
   "build": {

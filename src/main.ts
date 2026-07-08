@@ -520,12 +520,16 @@ ipcMain.handle('dv-open-download', () => {
 
 ipcMain.handle('dv-install', (_e, source: string) => installBin(source, DOVI_BIN, DV_DIR));
 
-// Picker accepts dovi_tool's release .zip or dovi_tool.exe directly.
+// Picker: the UI only ever talks about the release .zip, so the default filter is zip-only; a bare
+// dovi_tool.exe is still accepted SILENTLY via the "All files" fallback (installBin handles both).
 ipcMain.handle('dv-choose', async () => {
   const r = await dialog.showOpenDialog(win!, {
-    title: 'Select the dovi_tool release .zip (or dovi_tool.exe)',
+    title: 'Select the dovi_tool release .zip',
     properties: ['openFile'],
-    filters: [{ name: 'dovi_tool zip or exe', extensions: ['zip', 'exe'] }],
+    filters: [
+      { name: 'Zip', extensions: ['zip'] },
+      { name: 'All files', extensions: ['*'] },
+    ],
   });
   return r.canceled ? null : r.filePaths[0] || null;
 });
@@ -549,12 +553,16 @@ ipcMain.handle('hp-open-download', () => {
 
 ipcMain.handle('hp-install', (_e, source: string) => installBin(source, HP_BIN, HP_DIR));
 
-// Picker accepts hdr10plus_tool's release .zip or hdr10plus_tool.exe directly.
+// Picker: zip-only default filter like the DV one; a bare hdr10plus_tool.exe still works
+// silently through "All files".
 ipcMain.handle('hp-choose', async () => {
   const r = await dialog.showOpenDialog(win!, {
-    title: 'Select the hdr10plus_tool release .zip (or hdr10plus_tool.exe)',
+    title: 'Select the hdr10plus_tool release .zip',
     properties: ['openFile'],
-    filters: [{ name: 'hdr10plus_tool zip or exe', extensions: ['zip', 'exe'] }],
+    filters: [
+      { name: 'Zip', extensions: ['zip'] },
+      { name: 'All files', extensions: ['*'] },
+    ],
   });
   return r.canceled ? null : r.filePaths[0] || null;
 });
