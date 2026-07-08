@@ -449,8 +449,8 @@ if DV_EXPORT and not DV_ACTIVE:
             else "RTX HDR is not active")
     sys.stderr.write(f"[dv] Dolby Vision export skipped: {_why}\n"); sys.stderr.flush()
 elif DV_ACTIVE:
-    sys.stderr.write("Dolby Vision Profile 8.1 export ON (per-frame L1; HDR10 base, dvvC in-engine, "
-                     "no GPAC)\n"); sys.stderr.flush()
+    sys.stderr.write("Dolby Vision Profile 8.1 export ON (plays as HDR10 where DV is unsupported)\n")
+    sys.stderr.flush()
 
 # Detail restoration (--restore): Real-ESRGAN's anime-video model reconstructs linework and
 # texture on every output frame - the "chain a restoration model after interpolation" option
@@ -1174,8 +1174,8 @@ def _dv_export(mp4_path):
         hdr10_meta.inject_hdr10(tmp_out, max_nits=HDR_NITS, maxcll=cll, maxfall=fall,
                                 colorspace=HDR_MASTER_PRIM)
         os.replace(tmp_out, mp4_path)
-        sys.stderr.write(f"Dolby Vision: Profile 8.1 written ({len(l1)} frames, per-frame L1; HDR10 "
-                         f"fallback) -> {mp4_path}\n"); sys.stderr.flush()
+        sys.stderr.write("Dolby Vision: Profile 8.1 written (HDR10-compatible)\n")
+        sys.stderr.flush()
     except Exception as e:  # noqa: BLE001 - never lose the HDR10 render over the DV step
         sys.stderr.write(f"[dv] export failed ({repr(e)[:200]}); kept the HDR10 file at {mp4_path}\n")
         sys.stderr.flush()
@@ -1199,14 +1199,18 @@ def _drain_pipes():
     dec.wait()
 
 
-def _finish(done_msg):
+def _finish(done_msg, out_frames=None):
     """Success tail shared by all three render loops: surface a failed encode pipe as a nonzero
     exit, finalize the container (HDR10 boxes / MKV remux), flush the last live thumbnail, log the
-    done line and exit 0."""
+    done line and exit 0. `out_frames` is the EXACT number of frames actually written (each loop
+    knows it); emitted as OUTFRAMES so the GUI's frame counter is right instead of estimating from
+    the container's (sometimes off-by-one) nb_frames."""
     if _werr:
         raise _werr[0]          # surface a failed encode pipe as a nonzero exit
     _finalize_output()
     _live_flush()               # let the final live thumbnail land before exit
+    if out_frames is not None:
+        sys.stderr.write(f"OUTFRAMES {out_frames}\n")
     sys.stderr.write(done_msg); sys.stderr.flush()
     sys.exit(0)
 
@@ -1244,7 +1248,7 @@ if NO_INTERP:
     finally:
         _drain_pipes()
     _finish(f"done {k} frames "
-            f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n")
+            f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n", out_frames=k)
 
 # =============================================================================================
 # On-grid passthrough interpolation (GMFSS; integer --multi; not --fps). The
@@ -1302,7 +1306,8 @@ if not FPS_MODE:
                 sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
     finally:
         _drain_pipes()
-    _finish(f"done {k} pairs -> {out_path}\n")
+    # On-grid output is the real first frame plus M tweens/real per processed pair: multi*k + 1.
+    _finish(f"done {k} pairs -> {out_path}\n", out_frames=args.multi * k + 1)
 
 # ---------------------------------------------------------------------------------------------
 # Legacy off-grid path: --fps mode only (GMFSS). --fps resamples to an arbitrary target fps
@@ -1316,6 +1321,7 @@ if prev is None:
 I0 = to_tensor(prev)
 k = 0
 i = 0
+nout = 0                # exact count of frames written, for the GUI's OUTFRAMES total
 last_out = None         # bytes of the most recent emitted frame, held across the final slot
 
 try:
@@ -1338,6 +1344,7 @@ try:
                 for fr in fracs:
                     last_out = to_bytes(model.inference(I0, I1, reuse, fr))
                     wq.put(last_out)
+        nout += len(fracs)
         prev, I0 = cur, I1
         i += 1
         k += 1
@@ -1353,10 +1360,12 @@ try:
     if last_out is None:
         wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE or RESTORE_ACTIVE
                                 or DEC_FMT != OUT_RAW_FMT) else prev)
+        nout += 1
     else:
         tail = math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)  # this path is --fps only
         for _ in range(tail):
             wq.put(last_out)
+        nout += tail
 finally:
     _drain_pipes()
-_finish(f"done {k} pairs -> {out_path}\n")
+_finish(f"done {k} pairs -> {out_path}\n", out_frames=nout)

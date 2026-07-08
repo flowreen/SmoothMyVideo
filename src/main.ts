@@ -76,7 +76,7 @@ function createWindow() {
     height: st.height,
     minWidth: 680,
     minHeight: 640,
-    title: 'SmoothMyVideo',
+    title: 'Smooth My Video',
     backgroundColor: '#1b1b1b',
     icon: path.join(ROOT, 'icon.ico'),
     webPreferences: { nodeIntegration: true, contextIsolation: false },
@@ -709,7 +709,7 @@ ipcMain.on('cancel', () => {
 ipcMain.on('render-complete', (_e, body: string) => {
   if (win && !win.isFocused() && Notification.isSupported()) {
     try {
-      new Notification({ title: 'SmoothMyVideo', body: body || 'Render complete' }).show();
+      new Notification({ title: 'Smooth My Video', body: body || 'Render complete' }).show();
     } catch {
       /* notifications unavailable on this system */
     }

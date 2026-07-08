@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8" />
-<title>SmoothMyVideo</title>
+<title>Smooth My Video</title>
 <style>
   :root { --green:#76b900; --panel:#2a2a2a; --bg:#1b1b1b; --text:#eaeaea; --sub:#9a9a9a; }
   * { box-sizing: border-box; }
@@ -21,11 +21,21 @@
   select:disabled, input:disabled { opacity:.45; cursor:not-allowed; }
   #bar { position:relative; height:28px; background:#101010; border-radius:14px; overflow:hidden; }
   #fill { height:100%; width:0; background:var(--green); transition:width .15s; }
-  .preset { background:#222; color:var(--text); border:1px solid #3a3a3a; border-radius:5px;
-            padding:2px 8px; font-size:12px; cursor:pointer; }
-  .preset:hover:not(:disabled) { border-color:var(--green); }
-  .preset.active { background:var(--green); color:#0d0d0d; border-color:var(--green); font-weight:700; }
-  .preset:disabled { opacity:.4; cursor:default; }
+  /* Linked multiplier / target-fps steppers (each: [-] value [unit] [+]). */
+  .stepper { display:inline-flex; align-items:stretch; height:30px; border:1px solid #3a3a3a;
+             border-radius:5px; overflow:hidden; vertical-align:middle; }
+  .stepper button, .stepper input, .stepper .mx { box-sizing:border-box; }
+  .stepper button { width:26px; background:#222; color:var(--text); border:0; border-radius:0;
+                    border-right:1px solid #3a3a3a; cursor:pointer; font-size:17px; line-height:1; padding:0; }
+  .stepper button:last-child { border-right:0; border-left:1px solid #3a3a3a; }
+  .stepper button:hover:not(:disabled) { background:#2a2a2a; color:var(--green); }
+  .stepper button:disabled { opacity:.4; cursor:default; }
+  .stepper input { border:0; background:#1a1a1a; color:var(--text); text-align:center; padding:0 2px; font-size:14px; }
+  .stepper input:disabled { opacity:.5; }
+  .stepper .mx { display:flex; align-items:center; padding:0 7px 0 3px; background:#1a1a1a; color:#888; font-size:13px; }
+  .stepper input::-webkit-inner-spin-button, .stepper input::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
+  #multin { width:54px; } #fpsin { width:84px; }
+  .eq { padding:0 9px; color:#888; }
   /* Percentage painted on top of the fill, centred in the bar (taller bar so the larger text fits). */
   #pct { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
          color:#fff; font-size:22px; font-weight:600; pointer-events:none;
@@ -47,7 +57,7 @@
 </style>
 </head>
 <body>
-  <h1>SmoothMyVideo</h1>
+  <h1>Smooth My Video</h1>
   <div class="sub">Make any video buttery-smooth. AI adds in-between frames for a higher frame rate, right on your NVIDIA GPU. Offline · No quality loss · No account needed.</div>
 
   <div class="row">
@@ -57,7 +67,7 @@
 
   <!-- Empty state: shown until a video is loaded (or an RTX install begins), then replaced by #workspace. -->
   <div id="welcome" class="panel" style="text-align:center;padding:40px 20px">
-    <div style="font-size:15px;margin-bottom:8px">👋 Welcome to <b>SmoothMyVideo</b></div>
+    <div style="font-size:15px;margin-bottom:8px">👋 Welcome to <b>Smooth My Video</b></div>
     <div class="hint">Drop a video anywhere on this window — or click <b>Select video…</b> above — to get started.<br>
       You'll get a smoother, higher-frame-rate copy saved right next to the original.</div>
   </div>
@@ -80,9 +90,20 @@
       </label>
     </div>
     <div class="row">
-      <span class="k">Target FPS</span>
-      <input id="fpsin" type="number" min="1" max="2400" step="1" style="width:96px">
-      <span id="fpspresets" style="display:inline-flex;gap:5px;align-items:center"></span>
+      <span class="k">Speed</span>
+      <span class="stepper" title="Frame-rate multiplier (steps of 1)">
+        <button type="button" id="multdn" tabindex="-1">−</button>
+        <input id="multin" type="number" min="2" step="1" value="2" aria-label="multiplier">
+        <span class="mx">×</span>
+        <button type="button" id="multup" tabindex="-1">+</button>
+      </span>
+      <span class="eq">=</span>
+      <span class="stepper" title="Target frames per second (steps of 1)">
+        <button type="button" id="fpsdn" tabindex="-1">−</button>
+        <input id="fpsin" type="number" min="1" max="2400" step="1" aria-label="target fps">
+        <span class="mx">fps</span>
+        <button type="button" id="fpsup" tabindex="-1">+</button>
+      </span>
       <span class="hint" id="multlabel"></span>
     </div>
     <div class="row">
@@ -344,12 +365,12 @@ function paint(){
 }
 function interpOn(){ return $('interp').checked; }
 function srcFps(){ const [n,d]=(info.fps||'24/1').split('/'); return (+n)/((+d)||1); }
-// Single control now: an integer TARGET FPS (slider + number box). The multiplier is DERIVED, not
-// chosen. targetFps is the box value; gridMulti() below picks the engine path from it.
+// TARGET FPS is authoritative (the #fpsin box); the multiplier stepper is a linked view of it (see
+// setTarget/syncTargetUI). targetFps is the box value; gridMulti() below picks the engine path from it.
 function targetFps(){ if(!interpOn()) return srcFps();
   const v = parseFloat($('fpsin').value); return (isNaN(v) || v <= 0) ? srcFps()*2 : v; }
 function sliderMin(){ return info ? Math.max(1, Math.round(srcFps())) : 1; }        // never target below the source rate
-function sliderMax(){ return info ? Math.round(srcFps()) * 100 : 2400; }             // up to 100x the (rounded) source rate, so 23.976 caps at 2400 not 2398
+function sliderMax(){ return info ? srcFps() * 100 : 2400; }   // hard cap at exactly 100x the EXACT source (24000/1001 -> 2397.602, kept on-grid; not a rounded 2400)
 // Decimals to display: match the source's natural precision (23.976 -> 3, 24 -> 0, 29.97 -> 2), taking
 // the MORE precise of source and monitor rate so screen-match values also render exactly (24 src +
 // 359.99 Hz -> 2). r_frame_rate is a rational (24000/1001), so read precision off a 3-dp rounding.
@@ -364,27 +385,45 @@ function outRatio(){ if(!interpOn()) return 1; return targetFps()/srcFps(); }
 // srcFps so 48 -> N=2 on a 23.976 source (round(23.976*2)=48).
 function gridMulti(){ if(!info) return 0; const s = srcFps(); const t = targetFps(); const N = Math.round(t/s);
   return (N >= 2 && Math.abs(s*N - t) < 0.02) ? N : 0; }   // on-grid when the target is an exact multiple (tolerance covers the 3-dp display rounding)
-// Quick-pick multipliers, rendered as preset chips (they replaced the slider's magnets). The number
-// box is the exact target; a chip just sets the box to round(srcFps*k). All chip values are on-grid.
-const PRESET_MULTS = [2, 3, 4, 5, 8, 16, 32];
-// Push a target into the box (clamped, formatted to the source/monitor decimal count; the VALUE keeps
-// its exact fractional precision, e.g. 2x of 23.976 = 47.952), then reflect chip state.
+// The multiplier and the target-fps box are two views of ONE value: targetFps() (the #fpsin box) stays
+// authoritative for the engine; the multiplier is targetFps/srcFps. Editing either updates the other.
+// Push a target into the fps box (clamped, formatted to the source/monitor decimal count; the VALUE
+// keeps its exact fractional precision, e.g. 2x of 23.976 = 47.952), then reflect it in the multiplier.
 function setTarget(v){ v = Math.min(sliderMax(), Math.max(sliderMin(), v));
-  $('fpsin').max = sliderMax(); $('fpsin').value = v.toFixed(targetDecimals()); syncPresetState(); }
-// (Re)build the preset chips for the current source fps: label = "k×", title = the exact resulting fps.
-function buildPresets(){ const box = $('fpspresets'); box.innerHTML = ''; if(!info) return;
-  const s = srcFps();
-  PRESET_MULTS.forEach(k => { const fps = s*k; if(fps > sliderMax()) return;
-    const b = document.createElement('button'); b.type = 'button'; b.className = 'preset';
-    b.dataset.mult = k; b.textContent = k + '×'; b.title = fps.toFixed(targetDecimals()) + ' fps';
-    b.onclick = () => { if(b.disabled) return; setTarget(fps); localStorage.setItem('fpsTarget', fps); refresh(); };
-    box.appendChild(b); });
-  syncPresetState(); }
-// Grey the chips when the target controls are locked, and highlight the one whose multiplier is active.
-function syncPresetState(){ if(!$('fpspresets')) return; const gm = gridMulti();
-  const dis = !interpOn() || $('screenfps').checked || goMode === 'running';
-  [...$('fpspresets').children].forEach(b => { b.disabled = dis;
-    b.classList.toggle('active', !dis && +b.dataset.mult === gm); }); }
+  $('fpsin').max = sliderMax(); $('fpsin').value = v.toFixed(targetDecimals());
+  $('fpsin').title = 'exact: ' + (+v.toFixed(4)) + ' fps';   // the box shows source-precision decimals; hover reveals the true value (e.g. 100x of 24000/1001 = 2397.6024)
+  syncTargetUI(); }
+// Canonical multiplier text for the current target: the exact integer when on-grid (2, 3, ...), else
+// the fractional ratio (e.g. 2.08 for a typed 50 fps on a 24 source, which the engine resamples).
+function multText(){ const gm = gridMulti(); return gm ? String(gm) : (targetFps()/srcFps()).toFixed(2); }
+// Reflect the target into the multiplier box and grey both steppers when the target is locked. Skip
+// rewriting #multin while it is focused, so a two-keystroke entry ("2" -> "20") isn't reset mid-type.
+function syncTargetUI(){ const dis = !interpOn() || $('screenfps').checked || goMode === 'running';
+  ['multin','multup','multdn','fpsup','fpsdn'].forEach(id => { const e = $(id); if(e) e.disabled = dis; });
+  if($('multin') && document.activeElement !== $('multin')) $('multin').value = multText(); }
+// Apply a multiplier k: the target becomes k x srcFps (exact, on-grid), clamped + persisted.
+function applyMult(k){ if(isNaN(k) || k < 1) return; setTarget(srcFps()*k);
+  localStorage.setItem('fpsTarget', parseFloat($('fpsin').value)); refresh(); }
+// Nudge the target fps by 1, snapping onto the integer grid first (47.952 -> 48 up / 47 down).
+function nudgeFps(d){ const t = targetFps(); const nt = d > 0 ? Math.floor(t + 1e-6) + 1 : Math.ceil(t - 1e-6) - 1;
+  setTarget(nt); localStorage.setItem('fpsTarget', parseFloat($('fpsin').value)); refresh(); }
+// Press-and-hold auto-repeat: one step on press, then repeat every 60ms after a 350ms hold. Each step
+// re-reads the current target, so holding + walks the value up (and stops at the clamp) instead of once.
+function holdRepeat(btn, fn){ let to, iv;
+  const stop = () => { clearTimeout(to); clearInterval(iv); };
+  const step = () => { if(btn.disabled){ stop(); return; } fn(); };
+  btn.addEventListener('mousedown', e => { if(btn.disabled) return; e.preventDefault(); step();
+    to = setTimeout(() => { iv = setInterval(step, 60); }, 350); });
+  ['mouseup', 'mouseleave'].forEach(ev => btn.addEventListener(ev, stop));
+}
+holdRepeat($('multup'), () => applyMult(Math.round(targetFps()/srcFps()) + 1));
+holdRepeat($('multdn'), () => applyMult(Math.max(2, Math.round(targetFps()/srcFps()) - 1)));
+holdRepeat($('fpsup'),  () => nudgeFps(+1));
+holdRepeat($('fpsdn'),  () => nudgeFps(-1));
+// Typing a multiplier drives the fps box live; on commit it snaps to canonical (integer when on-grid).
+$('multin').oninput = () => { const k = parseFloat($('multin').value); if(!isNaN(k) && k > 0) applyMult(k); };
+$('multin').onchange = () => { const k = parseFloat($('multin').value);
+  if(isNaN(k) || k < 1){ $('multin').value = multText(); return; } applyMult(k); $('multin').value = multText(); };
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
   const d = upDims();                                   // upscale target ({w,h} or null); tag the new height
   const res = d ? '_' + d.h + 'p' : '';
@@ -413,13 +452,11 @@ function retagCustom(name){
 function refresh(){ if(!input) return;
   const t = targetFps();
   const N = gridMulti();
-  const r = t / srcFps();
   $('multlabel').textContent = !interpOn() ? ''
-    : N ? '= ' + N + '× · on-grid'                                          // exact integer multiple
-    : Math.round(t) <= Math.round(srcFps()) ? '1× · no new frames'          // degenerate: output fps = source fps
-    : r < 9.95 ? r.toFixed(1) + '× · resampled'                             // small ratios shown honestly (1.5×, 2.5×)
-    : '≈' + Math.round(r) + '× · resampled';                               // large ratios: the fractional part is just noise
-  syncPresetState();
+    : N ? 'on-grid · real frames'                                           // exact integer multiple of the source
+    : Math.round(t) <= Math.round(srcFps()) ? 'no new frames'               // degenerate: output fps = source fps
+    : 'resampled';                                                          // non-integer multiple: engine uses --fps
+  syncTargetUI();
   if(!fpsValid(t)){ $('out').value = ''; $('out').placeholder = 'target fps must be ' + sliderMin() + '-' + sliderMax(); lastOut = null; return; }
   $('out').placeholder = 'output file path';
   if(customOut) customOut = retagCustom(customOut);   // re-sync the _fps/_p tags in the user's name
@@ -459,6 +496,7 @@ async function loadVideo(f){
   $('info').style.display='block';
   $('res').textContent = s.width+' x '+s.height;
   $('fps').textContent = srcFps().toFixed(decimalsOf(srcFps()));   // natural precision: 24 -> "24", 23.976 -> "23.976"
+  $('fps').title = (info.fps ? info.fps + ' = ' : '') + (+srcFps().toFixed(6)) + ' fps (shown rounded)';   // reveal the exact rational, e.g. 24000/1001 = 23.976024
   const d=info.dur|0; $('dur').textContent = (d/3600|0)+':'+String((d%3600/60|0)).padStart(2,'0')+':'+String(d%60).padStart(2,'0');
   $('codec').textContent = (s.codec_name || '?')
     + (info.nAud > 1 || info.nSub ? '  ·  ' + info.nAud + ' audio · ' + info.nSub
@@ -527,14 +565,13 @@ let screenHz = 60;
 function applyScreenFps(){
   const interp = interpOn();
   const on = interp && $('screenfps').checked;   // the screen-rate override only applies when interpolating
-  // The target-fps box + preset chips are greyed when interpolation is off (no rate change) or when
-  // the screen-rate override owns the target (chip greying is handled by syncPresetState).
+  // The fps box + multiplier stepper are greyed when interpolation is off (no rate change) or when
+  // the screen-rate override owns the target (stepper greying is handled by syncTargetUI).
   $('fpsin').disabled = !interp || $('screenfps').checked;
   if(info){
     if(on) setTarget(screenHz);                   // match the monitor exactly (1000Hz on a 24 source = 41.67x -> --fps)
     else if(interp){ const v = +localStorage.getItem('fpsTarget');   // restore the persisted target (survives run/reload); default 2x
       setTarget(v >= sliderMin() ? v : srcFps()*2); }   // default 2x, kept exact (23.976 -> 47.952)
-    buildPresets();                               // chip labels depend on the source fps; rebuild per video
   }
   refresh();
 }
@@ -786,7 +823,7 @@ function prevSettingsSig(){                 // everything that changes what the 
           upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr)];
 }
 let lastPrevInput = null;                    // which video the shown original belongs to
-async function loadPreview(frame){
+async function loadPreview(frame, bg){   // bg: background "refine" pass (the RTX auto-upgrade) - keep the shown image up, no blocking spinner
   if(!input) return;
   if(prevBusy){ prevPending = (frame == null ? 'mid' : frame); return; }
   prevBusy = true;
@@ -798,12 +835,16 @@ async function loadPreview(frame){
   const useVsr = lite ? false : !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 0);
   inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame)].concat(sig));
   $('hdrpreview').style.display = 'block';
-  if($('prevproc').clientHeight < 40) $('prevprocwrap').style.minHeight = '120px';  // spinner space on first load
-  setSpin($('prevprocwrap'), $('prevspin'), true);
+  // On a background refine the lite image is already on screen: leave it up and skip the blocking spinner,
+  // so the pane appears instantly and just sharpens to the RTX result when it lands. Otherwise show it.
+  if(!bg){
+    if($('prevproc').clientHeight < 40) $('prevprocwrap').style.minHeight = '120px';  // spinner space on first load
+    setSpin($('prevprocwrap'), $('prevspin'), true);
+  }
   // The original pane gets the wheel too, but only when the original is actually about to change:
-  // first load, a different video, or a frame step. Settings tweaks keep the same original frame.
-  const origChanging = !$('prevorig').dataset.url || lastPrevInput !== input
-    || (frame != null && frame !== 'mid' && frame !== prevIdx);
+  // first load, a different video, or a frame step. Settings tweaks (and background refines) keep the frame.
+  const origChanging = !bg && (!$('prevorig').dataset.url || lastPrevInput !== input
+    || (frame != null && frame !== 'mid' && frame !== prevIdx));
   if(origChanging){
     if($('prevorig').clientHeight < 40) $('prevorigwrap').style.minHeight = '120px';
     setSpin($('prevorigwrap'), $('prevorigspin'), true);
@@ -842,12 +883,18 @@ async function loadPreview(frame){
   $('prevproclabel').textContent = !active ? 'Unchanged'
     : 'Processed (' + parts.join(' + ') + ')';
   $('prevlabel').textContent = 'frame ' + prevIdx + (prevTotal ? ' / ' + prevTotal : '');
-  $('prevnote').textContent = (rtxSkipped ? 'RTX VSR/HDR skipped in this quick preview for speed; adjust an RTX control to preview them (they still apply to the export)'
+  $('prevnote').textContent = (rtxSkipped ? 'quick preview shown; refining to the full RTX VSR/HDR version…'
     : srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
     : !active ? 'no Restore, FSR or RTX HDR enabled, the output will match the source'
     : bicubicOnly ? 'plain bicubic upscale, no AI detail added (enable RTX VSR for that; both panes match)'
     : useHdr ? 'HDR is tonemapped to show on this SDR screen'
     : 'detail changes are subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
+  // Auto-upgrade: the quick preview skipped the slow RTX passes for an instant first paint. Now that it's
+  // on screen, render the full RTX (VSR/HDR) version of the SAME frame so the pane ends on the real result
+  // without the user needing to touch a control - their RTX picks persist across sessions, so many never
+  // would. One-shot (the follow-up render isn't lite, so rtxSkipped is false there and it can't loop);
+  // skipped if the user already queued another render, which supersedes it.
+  if(rtxSkipped && prevPending == null && !prevBusy) loadPreview(prevIdx, true);
 }
 function randFrame(){ return prevTotal > 1 ? Math.floor(Math.random() * prevTotal) : 'mid'; }
 function refreshPreviewIfOpen(){           // re-render the shown frame when sharpen / HDR changes
@@ -1065,7 +1112,7 @@ function startRun(){
   cancelled = false;
   // #go stays enabled and becomes the Pause toggle for the duration of the run (see goMode).
   goMode = 'running'; $('go').textContent = 'Pause';
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; syncPresetState();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -1128,6 +1175,10 @@ $('changeout').onclick = async () => {
 $('cancel').onclick = () => { cancelled = true; $('cancel').disabled = true; $('status').textContent = 'Cancelling...'; ipcRenderer.send('cancel'); };
 
 ipcRenderer.on('engine-out', (_e, t) => {
+  // The engine emits its EXACT output frame count as OUTFRAMES at the end; it's authoritative over the
+  // pre-render estimate (container nb_frames * ratio), which can be off by one when nb_frames misreports.
+  const of = /OUTFRAMES\s+(\d+)/.exec(t);
+  if(of) totalGen = +of[1] || totalGen;
   // A single stderr chunk can batch several PROGRESS lines; take the last so the bar and the
   // frame/elapsed feeding the ETA reflect the newest count, never a stale one from the batch.
   let m = null, g = /PROGRESS\s+(\d+)\/(\d+)/g, x;
@@ -1161,7 +1212,10 @@ ipcRenderer.on('engine-out', (_e, t) => {
     paint();
   } else {
     if(/\[trt\] building/.test(t)) $('status').textContent = 'Building TensorRT engines (one time for this resolution)...';
-    if(!/Optical Flow Grid Size/.test(t)) log(t);
+    // OUTFRAMES is machine-only, and the engine's "done ..." line duplicates the ">> Saved: <path>"
+    // the GUI prints on engine-done - strip both from the GUI log (they still show in CLI output).
+    const shown = t.replace(/OUTFRAMES\s+\d+\n?/g, '').replace(/^done \d+ (frames|pairs)[^\n]*\n?/gm, '');
+    if(shown.trim() && !/Optical Flow Grid Size/.test(shown)) log(shown);
   }
 });
 ipcRenderer.on('engine-done', (_e, code) => {
