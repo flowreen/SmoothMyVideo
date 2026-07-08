@@ -40,4 +40,15 @@ if (zipSize < 1e9) {
   process.exit(1);
 }
 fs.rmSync(folder, { recursive: true, force: true });
-console.log(`done -> release/${zipName} (${(zipSize / 1e9).toFixed(2)} GB); staging folder cleaned up`);
+
+// SHA-256 sidecar for the GitHub release page (the zip itself is too large for GitHub, so the
+// checksum file is what lets users verify the SourceForge download). Streamed: the zip is ~4 GB.
+const crypto = require('crypto');
+const hash = crypto.createHash('sha256');
+const stream = fs.createReadStream(path.join(rel, zipName));
+stream.on('data', (d) => hash.update(d));
+stream.on('end', () => {
+  const digest = hash.digest('hex');
+  fs.writeFileSync(path.join(rel, zipName + '.sha256'), `${digest} *${zipName}\n`);
+  console.log(`done -> release/${zipName} (${(zipSize / 1e9).toFixed(2)} GB) + .sha256; staging folder cleaned up`);
+});

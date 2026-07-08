@@ -11,6 +11,12 @@
 </p>
 
 <p align="center">
+  <a href="https://sourceforge.net/projects/smoothmyvideo/files/latest/download"><img src="https://img.shields.io/badge/download-windows%20x64-2ea44f" alt="Download for Windows"></a>
+  <a href="https://sourceforge.net/projects/smoothmyvideo/files/"><img src="https://img.shields.io/sourceforge/dt/smoothmyvideo" alt="Downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+</p>
+
+<p align="center">
   <img src="docs/demo-pan.gif" alt="Side by side: the same anime-style panning shot at 10 fps and interpolated to 50 fps" width="880"><br>
   <sub><b>The same shot, before and after.</b> Left: a classic anime-style pan at 10 fps, the cadence anime pans are actually drawn at. Right: the same clip interpolated 5&times; to 50 fps. Every original frame passes through untouched; the AI draws only the frames in between.</sub>
 </p>
@@ -78,9 +84,12 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 
 ## Get started
 
-- **Download & run:** grab the latest `SmoothMyVideo-<version>-win.zip`, extract it anywhere, and run
-  **`SmoothMyVideo.exe`** (or the Desktop / Start-menu shortcut). No install, no dependencies, just a
-  current NVIDIA driver. A sample clip ships in `samples/test.mp4`.
+- **Download & run:** grab the latest
+  [`SmoothMyVideo-<version>-win.zip`](https://sourceforge.net/projects/smoothmyvideo/files/latest/download),
+  extract it anywhere, and run **`SmoothMyVideo.exe`** (or the Desktop / Start-menu shortcut). No
+  install, no dependencies, just a current NVIDIA driver. A sample clip ships in `samples/test.mp4`.
+  Release notes and checksums live on the
+  [GitHub releases page](https://github.com/flowreen/SmoothMyVideo/releases).
 - **From source:** `npm start`. See **[DEVELOPMENT.md](DEVELOPMENT.md)** for the full setup.
 
 ## Under the hood
