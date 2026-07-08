@@ -44,6 +44,10 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   top of the HDR10 render, HDR10-compatible, so non-DV players fall back to HDR10. Uses the
   separately-installed open-source [dovi_tool](https://github.com/quietvoid/dovi_tool); no Dolby software
   is bundled.
+- ➕ **HDR10+ export (experimental).** Optionally embed HDR10+ (SMPTE ST 2094-40) dynamic-HDR metadata,
+  measured per frame from the actual render, also HDR10-compatible, and combinable with Dolby Vision.
+  Uses the separately-installed open-source
+  [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool).
 - 🔍 **AI upscaling to 16K + detail restoration.** NVIDIA RTX Video Super Resolution plus a Real-ESRGAN
   restore pass, layered with the interpolation in a single render.
 - 💬 **Keeps every track.** All audio, subtitles/translations, chapters and font attachments are preserved
@@ -84,4 +88,8 @@ agent, exactly how the rest of this app was built.
 <sub>Dolby and Dolby Vision are trademarks of Dolby Laboratories. Smooth My Video is an independent project and
 is not affiliated with, endorsed by, sponsored by, or certified by Dolby Laboratories. Dolby Vision Profile
 8.1 metadata is produced by the separately-installed, third-party open-source
-[dovi_tool](https://github.com/quietvoid/dovi_tool); no Dolby software is bundled or redistributed.</sub>
+[dovi_tool](https://github.com/quietvoid/dovi_tool); no Dolby software is bundled or redistributed.
+HDR10+ is a trademark of HDR10+ Technologies, LLC; Smooth My Video is likewise not affiliated with, endorsed
+by, or certified by HDR10+ Technologies. HDR10+ metadata is injected by the separately-installed, third-party
+open-source [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool); no HDR10+ LLC software is bundled
+or redistributed.</sub>

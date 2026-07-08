@@ -90,7 +90,13 @@ ap = argparse.ArgumentParser()
 ap.add_argument("input")
 ap.add_argument("multi", type=int)
 ap.add_argument("output", nargs="?", default=None)
-ap.add_argument("--scale", type=float, default=1.0)
+ap.add_argument("--scale", type=float, default=None,
+                help="optical-flow resolution factor (GMFlow already runs at half the source "
+                     "resolution; this scales it further, flow is upsampled back afterwards). "
+                     "Default: AUTO - 1.0 below 4K, 0.5 for 4K+ sources, where flow at quarter "
+                     "resolution still carries 1080p-class motion detail and roughly quarters the "
+                     "dominant GMFlow cost (the standard GMFSS practice for UHD). Pass an explicit "
+                     "value to override the auto rule.")
 ap.add_argument("--fps", type=float, default=None,
                 help="target output fps; overrides <multi> via timeline resampling")
 ap.add_argument("--no-trt", action="store_true",
@@ -123,6 +129,14 @@ ap.add_argument("--dv", action="store_true",
                      "the RPU with dovi_tool, muxes with the bundled ffmpeg and writes the DV "
                      "configuration box in-engine (no GPAC/MP4Box). The base stays HDR10, so non-DV "
                      "players fall back to HDR10. Skipped with a notice if any requirement is missing.")
+ap.add_argument("--hdr10plus", action="store_true",
+                help="also embed HDR10+ (SMPTE ST 2094-40) dynamic metadata into the HDR10 render. "
+                     "Requires --rtx-hdr, HEVC, an MP4 output, and the user-installed hdr10plus_tool "
+                     "in engine/hptools. Collects per-frame brightness statistics (maxSCL, average "
+                     "and a maxRGB percentile distribution) from the HDR frames and injects the SEI "
+                     "with hdr10plus_tool after the encode. The base stays HDR10, so players without "
+                     "HDR10+ fall back to HDR10; combinable with --dv (both metadata ride the same "
+                     "stream). Skipped with a notice if any requirement is missing.")
 ap.add_argument("--codec", choices=["hevc", "av1", "vvc"], default="hevc",
                 help="output codec. hevc (default): hevc_nvenc, the smallest widely-supported "
                      "visually lossless choice. av1: av1_nvenc (RTX 40/50 hardware encode). "
@@ -179,11 +193,14 @@ ap.add_argument("--hdr-color", choices=["vivid", "rtx", "raw"], default="vivid",
                      "with the cyan cast).")
 ap.add_argument("--hdr-vibrance", type=float, default=0.0,
                 help="Dynamic Vibrance Intensity for --rtx-hdr (vivid/rtx colour modes): boost muted "
-                     "colours without touching already-saturated ones or hue (applied in ICtCp). "
+                     "colours without touching already-saturated ones or hue (applied in ICtCp; the "
+                     "boost is luminance-coupled - full in midtones, eased in shadows/highlights - so "
+                     "bright lights stay light instead of turning neon). "
                      "0 (default) = off, 1 = full boost; inert in raw mode.")
 ap.add_argument("--hdr-satboost", type=float, default=0.0,
-                help="Dynamic Vibrance Saturation boost for --rtx-hdr: uniform extra saturation on top "
-                     "of the colour mode (0..1 = +0..100%%, hue-safe in ICtCp). Independent of "
+                help="Dynamic Vibrance Saturation boost for --rtx-hdr: extra saturation on top "
+                     "of the colour mode (0..1 = +0..100%%, hue-safe in ICtCp, luminance-coupled like "
+                     "--hdr-vibrance). Independent of "
                      "--hdr-saturation, which is RTX HDR's own TrueHDR knob, mirroring NVIDIA's two "
                      "separate filters. 0 (default) = off; inert in raw mode.")
 args = ap.parse_args()
@@ -200,6 +217,7 @@ UPSCALE = UPSCALE_F > 1.0
 RTX_VSR = args.rtx_vsr                        # use the RTX Video SDK (real RTX VSR) for --upscale
 RTX_HDR = args.rtx_hdr                         # convert the output to HDR10 via RTX Video TrueHDR
 DV_EXPORT = args.dv                            # also emit a Dolby Vision Profile 8.1 MP4 (needs --rtx-hdr)
+HP_EXPORT = args.hdr10plus                     # also embed HDR10+ dynamic metadata (needs --rtx-hdr)
 CODEC = args.codec                             # output codec family: hevc (default) / av1 / vvc
 HDR_NITS = max(400, min(2000, args.hdr_nits)) # HDR10 peak luminance (TrueHDR target + metadata)
 HDR_SAT = max(0, min(200, args.hdr_saturation))  # TrueHDR Saturation; default 0 = faithful to source
@@ -215,7 +233,7 @@ def probe(path):
     # absent or "unknown" rather than shifting column positions.
     out = subprocess.check_output(
         [FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries",
-         "stream=width,height,r_frame_rate,nb_frames,codec_name,pix_fmt,"
+         "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,codec_name,pix_fmt,"
          "bits_per_raw_sample,color_space,color_transfer,color_primaries,color_range",
          "-of", "json", path], text=True, creationflags=NO_WINDOW)
     st = (json.loads(out).get("streams") or [{}])[0]
@@ -225,6 +243,60 @@ def probe(path):
     return w, h, int(num), int(den or "1"), nb, st
 
 W, H, num, den, NB, ST = probe(inp)
+
+# VFR sources (phone recordings, screen captures, stream rips): r_frame_rate is the container's
+# NOMINAL rate - for VFR it is typically the maximum instantaneous rate (often the timebase, e.g.
+# 1000/1), not the real pace - while avg_frame_rate is total_frames/duration, the rate the stream
+# actually plays at. The raw decode pipe emits frames 1:1 with no timing, and the encoder re-times
+# them as CFR at multi*rate, so deriving the rate from a wild r_frame_rate would change the
+# duration and desync every passthrough audio track. Detect the mismatch and (a) take avg as the
+# source rate, (b) have ffmpeg dup/drop to a constant avg rate on decode (-fps_mode cfr) so the
+# frame stream matches that rate exactly. CFR sources: avg == r, nothing changes.
+VFR_DEC = []
+_an, _ad = (str(ST.get("avg_frame_rate") or "0/1").split("/") + ["1"])[:2]
+_an, _ad = int(_an or "0"), int(_ad or "1")
+if _an > 0 and _ad > 0 and num > 0 and abs(_an / _ad - num / den) / (num / den) > 0.005:
+    sys.stderr.write(f"VFR source: container rate {num}/{den} ({num / den:g} fps) but the stream "
+                     f"averages {_an}/{_ad} ({_an / _ad:g} fps); decoding at the constant average "
+                     "rate so duration and audio sync are preserved\n"); sys.stderr.flush()
+    num, den = _an, _ad
+    VFR_DEC = ["-fps_mode", "cfr", "-r", f"{num}/{den}"]
+
+
+def _power_notice():
+    """One-line heads-up when the GPU is power-limited (a laptop Silent/quiet profile): the
+    pipeline is GPU-compute-bound at 98-99% utilisation (measured 2026-07-08), so a 55 W cap on a
+    175 W part multiplies wall time directly - and the cap is invisible unless someone thinks to
+    check nvidia-smi. Reads the driver's power limits once at startup; best-effort (no nvidia-smi,
+    no NVIDIA GPU, or N/A fields all stay silent), never affects the render."""
+    try:
+        q = subprocess.check_output(["nvidia-smi", "-q", "-d", "POWER"], text=True,
+                                    creationflags=NO_WINDOW, timeout=5)
+        vals = {}
+        for line in q.splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                k, v = k.strip(), v.strip().split(" ")[0]
+                if k in ("Current Power Limit", "Default Power Limit", "Max Power Limit") \
+                        and k not in vals:
+                    try:
+                        vals[k] = float(v)
+                    except ValueError:
+                        pass
+        cur, dflt, mx = (vals.get(k) for k in
+                         ("Current Power Limit", "Default Power Limit", "Max Power Limit"))
+        if cur and dflt and cur < 0.9 * dflt:
+            sys.stderr.write(
+                f"note: GPU power limit is {cur:.0f} W (board default {dflt:.0f} W"
+                + (f", max {mx:.0f} W" if mx else "") + ") - a quiet/Silent power profile is "
+                "active, so this render runs proportionally slower; switch the Windows/vendor "
+                "power mode for full speed\n")
+            sys.stderr.flush()
+    except Exception:  # noqa: BLE001 - a missing/odd nvidia-smi must never break a render
+        pass
+
+
+_power_notice()
 
 # --- source characteristics, for matched "passthrough quality" encoding ---
 def _tag(key):
@@ -301,6 +373,12 @@ out_path = os.path.abspath(args.output) if args.output else \
     os.path.splitext(inp)[0] + (("_sharpened" if NO_INTERP else f"_{out_label}fps")
                                 + (".mkv" if NEED_MKV else ".mp4"))
 OUT_IS_MKV = out_path.lower().endswith(".mkv")
+# Render into a sibling ".part" file and promote it with os.replace only at success (_finish): a
+# cancelled/crashed/failed render leaves <name>.part.<ext> behind instead of a silently truncated
+# file at the final path, and an existing good file at out_path is never destroyed until the new
+# render actually completed. The GUI deletes the .part remnant after a Cancel.
+_ob, _oe = os.path.splitext(out_path)
+WORK_PATH = _ob + ".part" + _oe
 
 # Decode bit depth follows the source: 8 bit clips decode as rgb24 byte for byte; 10 bit and
 # up are carried as 16 bit rgb (rgb48le) so the model (fp16, which holds 10 bit precision)
@@ -408,6 +486,10 @@ if RTX_HDR and SRC_HDR_IN:
 DOVI_EXE = os.path.join(ENGINE_DIR, "dvtools", "dovi_tool.exe")
 # DV Profile 8.1 is HEVC-only (the RPU rides in the HEVC bitstream), MP4-only, and needs dovi_tool.
 _want_dv = DV_EXPORT and CODEC == "hevc" and not OUT_IS_MKV and os.path.isfile(DOVI_EXE)
+# HDR10+ (--hdr10plus) mirrors the DV gating: the ST 2094-40 SEI rides the HEVC stream, the export
+# re-muxes through an MP4, and the injector is the user-installed hdr10plus_tool (see _hp_export).
+HP_EXE = os.path.join(ENGINE_DIR, "hptools", "hdr10plus_tool.exe")
+_want_hp = HP_EXPORT and CODEC == "hevc" and not OUT_IS_MKV and os.path.isfile(HP_EXE)
 _need_vsr = UPSCALE and RTX_VSR              # AI upscale via RTX VSR (else bicubic / no upscale)
 _need_hdr = RTX_HDR                          # SDR -> HDR10 via RTX TrueHDR
 RTX_VSR_ACTIVE = False                       # True once the RTX VSR pass is confirmed available
@@ -422,7 +504,7 @@ if _need_vsr or _need_hdr:
         _RTX = rtxvideo.RTXVideo(W, H, OUT_W, OUT_H, vsr=_need_vsr, hdr=_need_hdr,
                                  hdr_max_nits=HDR_NITS, hdr_contrast=HDR_CON, hdr_saturation=HDR_SAT,
                                  hdr_middlegray=HDR_MG, hdr_color=HDR_COLOR, hdr_vibrance=HDR_VIBRANCE,
-                                 hdr_satboost=HDR_SATBOOST, collect_l1=_want_dv)
+                                 hdr_satboost=HDR_SATBOOST, collect_l1=_want_dv, collect_hp=_want_hp)
         RTX_VSR_ACTIVE = _need_vsr
         HDR_ACTIVE = _need_hdr
         if _need_vsr:
@@ -450,6 +532,16 @@ if DV_EXPORT and not DV_ACTIVE:
     sys.stderr.write(f"[dv] Dolby Vision export skipped: {_why}\n"); sys.stderr.flush()
 elif DV_ACTIVE:
     sys.stderr.write("Dolby Vision Profile 8.1 export ON (plays as HDR10 where DV is unsupported)\n")
+    sys.stderr.flush()
+# HDR10+ mirrors the DV activation rule (stats collection was gated the same way via collect_hp).
+HP_ACTIVE = _want_hp and HDR_ACTIVE
+if HP_EXPORT and not HP_ACTIVE:
+    _why = ("output is MKV (HDR10+ export needs MP4)" if OUT_IS_MKV
+            else "hdr10plus_tool not found in engine/hptools" if not os.path.isfile(HP_EXE)
+            else "RTX HDR is not active")
+    sys.stderr.write(f"[hdr10+] HDR10+ export skipped: {_why}\n"); sys.stderr.flush()
+elif HP_ACTIVE:
+    sys.stderr.write("HDR10+ dynamic metadata ON (plays as HDR10 where HDR10+ is unsupported)\n")
     sys.stderr.flush()
 
 # Detail restoration (--restore): Real-ESRGAN's anime-video model reconstructs linework and
@@ -486,7 +578,18 @@ if args.restore:
         sys.stderr.write(f"[restore] unavailable, skipping: {repr(e)[:200]}\n")
     sys.stderr.flush()
 
-scale = args.scale
+# Flow scale: GMFlow dominates the interpolation wall (~70% of a 2x pair, measured 2026-07-08) and
+# its cost grows with source area, so 4K+ sources default to computing flow at an extra 0.5 factor
+# (quarter resolution net of the built-in half, still 1080p-class motion detail at 4K - the
+# standard GMFSS/SVFI setting for UHD). Explicit --scale always wins; sub-4K sources stay at 1.0.
+if args.scale is not None:
+    scale = args.scale
+elif W * H >= 3840 * 2160:
+    scale = 0.5
+    sys.stderr.write("flow scale auto: 0.5 for this 4K+ source (motion estimated at quarter "
+                     "resolution, ~4x cheaper flow; override with --scale 1.0)\n"); sys.stderr.flush()
+else:
+    scale = 1.0
 tmp = max(64, int(64 / scale))
 ph = ((H - 1) // tmp + 1) * tmp
 pw = ((W - 1) // tmp + 1) * tmp
@@ -747,7 +850,7 @@ def read_exact(stream, nbytes):
     return buf
 
 dec = subprocess.Popen(
-    [FFMPEG, "-v", "error", "-i", inp, "-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
+    [FFMPEG, "-v", "error", "-i", inp] + VFR_DEC + ["-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
     stdout=subprocess.PIPE, creationflags=NO_WINDOW)
 
 # The output codec never echoes the source: the interpolated clip is a brand new artifact (many
@@ -894,11 +997,12 @@ if USE_NVENC:
              "-spatial-aq", "1", "-temporal-aq", "1"]
     if venc in ("h264_nvenc", "hevc_nvenc"):
         qargs += ["-qp_cb_offset", "-2", "-qp_cr_offset", "-2"]
-    if DV_ACTIVE:
-        # Dolby Vision export re-muxes the encoded HEVC through a raw elementary stream (dovi_tool
-        # needs Annex B), and a B-frame reorder buffer makes that raw->MP4 copy assign non-monotonic
-        # DTS and silently drop the tail frames. Coding order == display order with no B-frames, so
-        # the remux is exact and the per-frame RPU aligns 1:1. The size cost is small at our CQ.
+    if DV_ACTIVE or HP_ACTIVE:
+        # Dolby Vision / HDR10+ export re-muxes the encoded HEVC through a raw elementary stream
+        # (dovi_tool / hdr10plus_tool need Annex B), and a B-frame reorder buffer makes that
+        # raw->MP4 copy assign non-monotonic DTS and silently drop the tail frames. Coding order ==
+        # display order with no B-frames, so the remux is exact and the per-frame metadata aligns
+        # 1:1. The size cost is small at our CQ.
         qargs += ["-bf", "0"]
 elif venc == "libvvenc":
     # vvenc has no CRF; QP with its perceptual QP adaptation (qpa, on by default). QP 20 verified
@@ -1023,11 +1127,11 @@ sys.stderr.flush()
 # temp video plus the source's tracks into the final .mkv (see _finalize_output).
 HDR_MKV_2STAGE = HDR_ACTIVE and OUT_IS_MKV
 if HDR_MKV_2STAGE:
-    _ENC_TARGET = out_path + ".video.tmp.mp4"
+    _ENC_TARGET = WORK_PATH + ".video.tmp.mp4"
     _stage2_maps, _maps = _maps, []
     _in2 = []
 else:
-    _ENC_TARGET = out_path
+    _ENC_TARGET = WORK_PATH
     _stage2_maps = []
     _in2 = ["-i", inp]
 enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", ENC_IN_FMT,
@@ -1114,19 +1218,29 @@ def _finalize_output():
     into the final .mkv - ffmpeg maps the mdcv/clli boxes onto Matroska's native
     MasteringMetadata/MaxCLL elements (verified value-exact), so nothing is lost."""
     if not HDR_MKV_2STAGE:
-        _write_hdr10_metadata(out_path)
+        _write_hdr10_metadata(WORK_PATH)
+        # HDR10+ first, DV second: the HDR10+ SEI NALs ride inside the HEVC samples, so the DV
+        # export's extract -> inject-rpu -> remux passes them through untouched, while running DV
+        # first would have _hp_export's own extract/remux rebuild the container and drop the dvvC
+        # box _dv_export just wrote. This order needs no re-stamping.
+        if HP_ACTIVE:
+            _hp_export(WORK_PATH)
         if DV_ACTIVE:
-            _dv_export(out_path)
+            _dv_export(WORK_PATH)
         return
     _write_hdr10_metadata(_ENC_TARGET)
     cmd = [FFMPEG, "-v", "error", "-y", "-i", _ENC_TARGET, "-i", inp,
-           "-map", "0:v:0", "-c:v", "copy"] + _stage2_maps + [out_path]
+           "-map", "0:v:0", "-c:v", "copy"] + _stage2_maps + [WORK_PATH]
     try:
         subprocess.run(cmd, check=True, creationflags=NO_WINDOW)
         os.remove(_ENC_TARGET)
         sys.stderr.write("HDR10 metadata carried into the MKV as native MasteringMetadata/MaxCLL "
                          "elements\n"); sys.stderr.flush()
     except Exception as e:  # noqa: BLE001 - keep the finished video rather than fail the render
+        try:
+            os.remove(WORK_PATH)   # a half-written remux must never be promoted to out_path
+        except OSError:
+            pass
         sys.stderr.write(f"final MKV remux failed ({e}); the HDR video (with metadata, without "
                          f"the extra tracks) was kept at {_ENC_TARGET}\n"); sys.stderr.flush()
 
@@ -1187,6 +1301,77 @@ def _dv_export(mp4_path):
                 pass
 
 
+def _hp_export(mp4_path):
+    """Embed HDR10+ (SMPTE ST 2094-40) dynamic metadata into the finished HDR10 MP4 in place:
+    the per-frame brightness statistics collected during the render (RTXVideo collect_hp) become
+    the tool's metadata JSON, hdr10plus_tool interleaves the SEI into the extracted HEVC stream,
+    and the bundled ffmpeg re-muxes it with the audio. The SEI rides inside the samples, so no
+    container box is needed (unlike DV's dvvC) and a later DV export passes it through. The JSON
+    layout follows the format hdr10plus_tool itself extracts (Profile A, per-frame SceneInfo):
+    DistributionValues carries [1st pct, 99.98th pct, bright-pixel fraction, 25/50/75/90/95/99th
+    pct] - the slot-2 near-peak / slot-3 fraction convention observed in real HDR10+ masters -
+    with luminance values in 0.1-nit units. Best-effort: any failure keeps the HDR10 file."""
+    hp = list(getattr(_RTX, "hp", []) or [])
+    if not hp:
+        sys.stderr.write("[hdr10+] no per-frame metadata collected; kept the HDR10 file\n"); sys.stderr.flush()
+        return
+    base = mp4_path + ".hpwork"
+    hevc, hphevc, cfg, tmp_out = (base + s for s in (".hevc", ".hp.hevc", ".json", ".mp4"))
+    cll = int(getattr(_RTX, "maxcll", 0) or 0)
+    fall = int(getattr(_RTX, "maxfall", 0) or 0)
+    _q = dict(check=True, creationflags=NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        import hdr10_meta
+        # 1. pull the HDR10 HEVC elementary stream out of the finished mp4
+        subprocess.run([FFMPEG, "-v", "error", "-y", "-i", mp4_path, "-map", "0:v:0", "-c", "copy",
+                        "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", hevc], **_q)
+        # 2. build the metadata JSON: one SceneInfo entry per output frame (single scene, frame-
+        #    accurate statistics; TargetedSystemDisplayMaximumLuminance 0 = Profile A convention).
+        gen = {"JSONInfo": {"HDR10plusProfile": "A", "Version": "1.0"},
+               "SceneInfo": [
+                   {"LuminanceParameters": {
+                        "AverageRGB": f["avg"],
+                        "LuminanceDistributions": {
+                            "DistributionIndex": [1, 5, 10, 25, 50, 75, 90, 95, 99],
+                            "DistributionValues": f["dist"]},
+                        "MaxScl": f["maxscl"]},
+                    "NumberOfWindows": 1, "TargetedSystemDisplayMaximumLuminance": 0,
+                    "SceneFrameIndex": i, "SceneId": 0, "SequenceFrameIndex": i}
+                   for i, f in enumerate(hp)],
+               "SceneInfoSummary": {"SceneFirstFrameIndex": [0], "SceneFrameNumbers": [len(hp)]},
+               "ToolInfo": {"Tool": "SmoothMyVideo", "Version": "1.0"}}   # required by the parser
+        with open(cfg, "w") as f:
+            json.dump(gen, f)
+        # 3. interleave the ST 2094-40 SEI messages before each frame's slices. The tool's stderr
+        # is captured and surfaced on failure (a silent exit-1 here is undebuggable otherwise).
+        _r = subprocess.run([HP_EXE, "inject", "-i", hevc, "-j", cfg, "-o", hphevc],
+                            creationflags=NO_WINDOW, capture_output=True, text=True)
+        if _r.returncode != 0:
+            raise RuntimeError("hdr10plus_tool inject: "
+                               + ((_r.stderr or "") + (_r.stdout or "")).strip()[-300:])
+        # 4. remux with the original audio/subtitle tracks, re-tagging BT.2020 PQ, and re-stamp the
+        #    HDR10 static boxes (the remux rebuilds the container, dropping the injected ones)
+        subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "hevc", "-r", rate_str, "-i", hphevc,
+                        "-i", mp4_path, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-c", "copy",
+                        "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+                        "-color_range", "tv", "-tag:v", "hvc1", tmp_out],
+                       check=True, creationflags=NO_WINDOW)
+        hdr10_meta.inject_hdr10(tmp_out, max_nits=HDR_NITS, maxcll=cll, maxfall=fall,
+                                colorspace=HDR_MASTER_PRIM)
+        os.replace(tmp_out, mp4_path)
+        sys.stderr.write("HDR10+: dynamic metadata written (HDR10-compatible)\n")
+        sys.stderr.flush()
+    except Exception as e:  # noqa: BLE001 - never lose the HDR10 render over the HDR10+ step
+        sys.stderr.write(f"[hdr10+] export failed ({repr(e)[:200]}); kept the HDR10 file at {mp4_path}\n")
+        sys.stderr.flush()
+    finally:
+        for p in (hevc, hphevc, cfg, tmp_out):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def _drain_pipes():
     """Teardown shared by all three render loops (runs in each loop's finally, so on error too):
     flush the encode queue and close the pipes in order - writer sentinel, join the writer, close
@@ -1208,6 +1393,10 @@ def _finish(done_msg, out_frames=None):
     if _werr:
         raise _werr[0]          # surface a failed encode pipe as a nonzero exit
     _finalize_output()
+    # Promote the finished .part file to the real output name (see WORK_PATH). The 2-stage MKV
+    # remux failure path removes WORK_PATH and keeps its own temp, so promotion is conditional.
+    if os.path.exists(WORK_PATH):
+        os.replace(WORK_PATH, out_path)
     _live_flush()               # let the final live thumbnail land before exit
     if out_frames is not None:
         sys.stderr.write(f"OUTFRAMES {out_frames}\n")

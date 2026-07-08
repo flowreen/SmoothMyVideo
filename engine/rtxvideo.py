@@ -131,7 +131,7 @@ class RTXVideo:
     def __init__(self, width, height, out_w, out_h, vsr=True, hdr=False, vsr_quality=4,
                  hdr_max_nits=1000, hdr_contrast=100, hdr_saturation=0, hdr_middlegray=50,
                  hdr_color="vivid", hdr_vibrance=0.0, hdr_satboost=0.0, collect_l1=False,
-                 rtx_dir=RTX_DIR):
+                 collect_hp=False, rtx_dir=RTX_DIR):
         # Make sure torch's primary CUDA context exists and is current on this thread before the
         # bridge retains it (create is called with cuContext=NULL -> cuDevicePrimaryCtxRetain).
         torch.zeros(8, device="cuda")
@@ -164,6 +164,14 @@ class RTXVideo:
         # a normal HDR render pays nothing. One triple is appended per run_hdr call, in output order.
         self._collect_l1 = bool(collect_l1)
         self._l1 = []
+        # Per-frame HDR10+ (ST 2094-40) stats, collected only for --hdr10plus (see _accum_hp).
+        self._collect_hp = bool(collect_hp)
+        self._hp = []
+        if self._collect_hp:
+            # 10-bit PQ code -> display-linear LUT (1.0 == 10000 nits) for histogram-based stats,
+            # and the smallest PQ code brighter than 100 nits (the bright-pixel fraction threshold).
+            self._pq_lut = _pq_to_linear(torch.arange(1024, dtype=torch.float32, device="cuda") / 1023.0)
+            self._hp_bright_code = int((self._pq_lut > 0.01).nonzero()[0].item())
         self._thdr = _THDR(max(0, min(200, int(hdr_contrast))),
                            max(0, min(200, int(hdr_saturation))),
                            max(10, min(100, int(hdr_middlegray))),
@@ -196,9 +204,11 @@ class RTXVideo:
             # The Dynamic Vibrance analog on top of vivid/rtx (inert in raw mode), mirroring NVIDIA's
             # separate vibrance filter with its two controls: _vibrance (Intensity, 0..1) is a chroma
             # gain weighted toward LOW-chroma pixels (muted colours pop, saturated colours and skin
-            # stay put) and _satboost (Saturation boost, 0..1 = +0..100%) is a uniform chroma gain,
+            # stay put) and _satboost (Saturation boost, 0..1 = +0..100%) is a flat chroma gain,
             # independent of the TrueHDR SDK Saturation that RTX HDR's own slider drives. Both are
-            # hue-safe because Ct/Cp scale uniformly per pixel (see _vibrance_gain).
+            # hue-safe because Ct/Cp scale uniformly per pixel, and their combined boost is
+            # luminance-coupled (full midtones, eased shadows/highlights - see _vibrance_gain /
+            # _luma_weight; 0/0 stays an exact identity).
             self._color_mode = hdr_color if hdr_color in ("vivid", "rtx", "raw") else "vivid"
             self._vibrance = max(0.0, min(1.0, float(hdr_vibrance)))
             self._satboost = max(0.0, min(1.0, float(hdr_satboost)))
@@ -262,17 +272,36 @@ class RTXVideo:
             pass
         return self._hdr_out.cpu().numpy().tobytes()   # [oH,oW,4] packed 10:10:10:2 == x2rgb10le
 
-    def _vibrance_gain(self, ct, cp):
-        """The Dynamic Vibrance analog: scale Ct/Cp by the product of the uniform Saturation boost
-        (1 + _satboost) and the Intensity term, a gain weighted toward LOW-chroma pixels so muted
-        colours pop while already-saturated colours (and skin) stay put. The Intensity weight falls
-        linearly from full boost at zero chroma to none at _VIBRANCE_CREF, roughly the ICtCp chroma
-        of strongly saturated content. Per-pixel uniform Ct/Cp scaling preserves the hue angle, so
-        neither control can reintroduce a cast. No-op when both are 0."""
+    @staticmethod
+    def _luma_weight(i):
+        """Luminance coupling for the vibrance boosts, the piece Dolby's display management does
+        that a flat gain does not (their algorithm is licensed; this weight is built from open
+        appearance science). Colourfulness perception is luminance-coupled (the Hunt effect), so
+        TrueHDR-expanded highlights already read more saturated at the same chroma - a flat extra
+        gain turns bright lights neon - and deep shadows only amplify chroma noise. So the boost is
+        full in the midtones and eased out toward both ends: i is the ICtCp intensity (PQ-encoded,
+        0..1); smoothstep 0 -> 1 over PQ 0.10..0.25 (~0.3..5 nits, shadows keep clean blacks) and
+        1 -> 0.25 over PQ 0.50..0.75 (~92..1000 nits, highlights keep a quarter of the boost so
+        colour is not visibly stripped from bright regions). Weight 1 == the old flat behaviour."""
+        def _ss(x, lo, hi):
+            t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0)
+            return t * t * (3.0 - 2.0 * t)
+        return _ss(i, 0.10, 0.25) * (1.0 - 0.75 * _ss(i, 0.50, 0.75))
+
+    def _vibrance_gain(self, i, ct, cp):
+        """The Dynamic Vibrance analog: scale Ct/Cp by the uniform Saturation boost (1 + _satboost)
+        and the Intensity term, a gain weighted toward LOW-chroma pixels so muted colours pop while
+        already-saturated colours (and skin) stay put. The Intensity weight falls linearly from full
+        boost at zero chroma to none at _VIBRANCE_CREF, roughly the ICtCp chroma of strongly
+        saturated content. The combined boost is additionally luminance-coupled via _luma_weight(i)
+        (full in midtones, eased in shadows and highlights - see there). Per-pixel uniform Ct/Cp
+        scaling preserves the hue angle, so neither control can reintroduce a cast. No-op when both
+        are 0 (the zero-strength identity is unaffected by the luma weight)."""
         if self._vibrance <= 0.0 and self._satboost <= 0.0:
             return ct, cp
         c = torch.hypot(ct, cp)
         g = (1.0 + self._satboost) * (1.0 + self._vibrance * (1.0 - (c / _VIBRANCE_CREF).clamp(0.0, 1.0)))
+        g = 1.0 + self._luma_weight(i) * (g - 1.0)
         return ct * g, cp * g
 
     def _ictcp_correct(self, rgb, packed):
@@ -296,7 +325,7 @@ class RTXVideo:
             return torch.einsum("ij,jhw->ihw", self._lms2ictcp, _linear_to_pq(lms))
 
         ic_f = _to_ictcp(lin_f)                                             # I, Ct, Cp: source hue & sat @ TrueHDR luma
-        ct, cp = self._vibrance_gain(ic_f[1], ic_f[2])
+        ct, cp = self._vibrance_gain(ic_f[0], ic_f[1], ic_f[2])
         ictcp = torch.stack([ic_f[0], ct, cp], 0)
         lms = _pq_to_linear(torch.einsum("ij,jhw->ihw", self._ictcp2lms, ictcp))
         out = torch.einsum("ij,jhw->ihw", self._lms2rgb, lms).clamp_(0.0, 1.0)   # linear BT.2020
@@ -326,18 +355,30 @@ class RTXVideo:
         # desaturates below the colorimetric source), preserving the source hue ANGLE so the model's
         # cyan/teal rotation is gone while the SDK Saturation slider still edits saturation.
         ic_t = _to_ictcp(lin_t)                                     # TrueHDR's own ICtCp
-        mag_f = torch.hypot(ic_f[1], ic_f[2]).clamp_(min=1e-8)      # source chroma magnitude
-        mag = torch.maximum(torch.hypot(ic_t[1], ic_t[2]), mag_f)   # TrueHDR magnitude, floored at source
+        # The magnitude ratio is computed in fp32: under the engine's fp16 autocast the old
+        # clamp_(min=1e-8) was a NO-OP (1e-8 underflows to zero in half precision), so every
+        # zero-chroma pixel (blacks, pure grays) divided by 0 into NaN/Inf that quietly corrupted
+        # those pixels and the light-level stats. In fp32 the floor is real: exact-zero source
+        # chroma now yields ct = 0 * d = 0, a clean neutral pixel; all normal pixels are
+        # numerically unchanged.
+        mag_f = torch.hypot(ic_f[1], ic_f[2]).float().clamp_(min=1e-6)   # source chroma magnitude
+        mag = torch.maximum(torch.hypot(ic_t[1], ic_t[2]).float(), mag_f)  # TrueHDR mag, floored at source
         d = mag / mag_f
-        ct, cp = self._vibrance_gain(ic_f[1] * d, ic_f[2] * d)
+        ct, cp = self._vibrance_gain(ic_f[0], ic_f[1] * d, ic_f[2] * d)
         ictcp = torch.stack([ic_f[0], ct, cp], 0)
         lms = _pq_to_linear(torch.einsum("ij,jhw->ihw", self._ictcp2lms, ictcp))
         out = torch.einsum("ij,jhw->ihw", self._lms2rgb, lms).clamp_(0.0, 1.0)   # linear BT.2020
         return self._pack_out(out)
 
     def _pack_out(self, out):
-        """Shared vivid/rtx tail: accumulate MaxCLL/MaxFALL (and DV L1 when collecting) from the
-        corrected linear BT.2020 frame `out` ([3,H,W]), then PQ-encode and pack to x2rgb10le bytes."""
+        """Shared vivid/rtx tail: accumulate MaxCLL/MaxFALL (and DV L1 / HDR10+ stats when
+        collecting) from the corrected linear BT.2020 frame `out` ([3,H,W]), then PQ-encode and
+        pack to x2rgb10le bytes."""
+        # Belt and braces: a NaN survives every clamp on the way here and then poisons the packed
+        # pixels, MaxCLL and the DV/HDR10+ stats (a NaN->int64 cast is undefined and crashed the
+        # HDR10+ histogram with negative values). Whatever upstream slip produces one, a black
+        # pixel is the sane result.
+        out = out.nan_to_num_(0.0)
         try:                                                                # MaxCLL/FALL from corrected px
             mx = out.max(0).values
             self._cll = max(self._cll, float(mx.max().item()) * 10000.0)
@@ -346,8 +387,39 @@ class RTXVideo:
             pass
         code = _linear_to_pq(out).mul_(1023.0).round_().clamp_(0, 1023).to(torch.int64)
         self._accum_l1(code.amax(0))                                        # DV L1 (maxRGB PQ); no-op unless --dv
+        self._accum_hp(code)                                                # HDR10+ stats; no-op unless --hdr10plus
         pk = (code[2] & 1023) | ((code[1] & 1023) << 10) | ((code[0] & 1023) << 20) | (3 << 30)
         return pk.cpu().numpy().astype("<u4").tobytes()                      # [H,W] -> x2rgb10le bytes
+
+    def _accum_hp(self, code):
+        """Append one HDR10+ (ST 2094-40) per-frame stats record from the frame's 10-bit PQ codes
+        ([3,H,W] int, R/G/B order): per-channel MaxScl, average maxRGB and a maxRGB percentile
+        distribution, all computed exactly from a 1024-bin histogram of the PQ codes (the
+        quantisation is on the order of the SEI's own precision). Luminance values are in the
+        metadata's 0.1-nit units (display-linear * 100000); the distribution follows the layout
+        real HDR10+ masters carry - [p1, p99.98, bright fraction, p25, p50, p75, p90, p95, p99],
+        the fraction being the permille of pixels brighter than 100 nits. One small host sync per
+        frame, like _accum_l1. No-op unless created with collect_hp=True."""
+        if not self._collect_hp:
+            return
+        m = code.amax(0).flatten()
+        hist = torch.bincount(m, minlength=1024).float()
+        n = float(m.numel())
+        cum = torch.cumsum(hist, 0)
+        qs = torch.tensor([0.01, 0.9998, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99], device=code.device)
+        pcodes = torch.searchsorted(cum, qs * n).clamp_(0, 1023)   # smallest code with cum >= q*n
+        pvals = (self._pq_lut[pcodes] * 100000.0).round().to(torch.int32).tolist()
+        maxscl = (self._pq_lut[code.amax(dim=(1, 2)).clamp(0, 1023)] * 100000.0) \
+            .round().to(torch.int32).tolist()
+        # Pointwise mul + sum, NOT `hist @ lut`: the engine runs under fp16 autocast, which casts
+        # matmul operands - a frame's black-pixel count (millions) overflows fp16 to inf, and
+        # inf * lut[0]==0.0 is NaN. Pointwise ops keep the fp32 inputs' dtype.
+        avg = int(round(float((hist * self._pq_lut).sum()) / n * 100000.0))
+        bright = n - (float(cum[self._hp_bright_code - 1]) if self._hp_bright_code > 0 else 0.0)
+        p1, p9998, p25, p50, p75, p90, p95, p99 = pvals
+        self._hp.append({"avg": avg, "maxscl": maxscl,
+                         "dist": [p1, p9998, int(round(1000.0 * bright / n)),
+                                  p25, p50, p75, p90, p95, p99]})
 
     def _accum_l1(self, maxrgb10):
         """Append one Dolby Vision L1 (per-frame min/avg/max brightness) from the frame's per-pixel
@@ -366,6 +438,8 @@ class RTXVideo:
         little-endian 10:10:10:2, B in the low 10 bits). maxRGB per CTA-861.3: per-pixel max of the
         linear R/G/B in nits; MaxCLL is the peak over all pixels, MaxFALL the peak frame average."""
         u = packed.view(torch.int32).squeeze(-1)                  # [H,W], B|G<<10|R<<20|A<<30
+        if self._collect_hp:                                      # raw mode: HDR10+ stats need R,G,B planes
+            self._accum_hp(torch.stack([(u >> 20) & 1023, (u >> 10) & 1023, u & 1023], 0).to(torch.int64))
         code = torch.maximum(torch.maximum(u & 1023, (u >> 10) & 1023), (u >> 20) & 1023)
         ep = (code.to(torch.float32) / 1023.0).pow_(1.0 / _PQ_M2)  # PQ code' in [0,1]
         nits = ((ep - _PQ_C1).clamp_(min=0.0) / (_PQ_C2 - _PQ_C3 * ep).clamp_(min=1e-6)) \
@@ -389,6 +463,12 @@ class RTXVideo:
         """Per-frame Dolby Vision L1 triples (min_pq, avg_pq, max_pq; 12-bit) in output-frame order,
         one per run_hdr call; empty unless the instance was created with collect_l1=True."""
         return self._l1
+
+    @property
+    def hp(self):
+        """Per-frame HDR10+ stats dicts (avg / maxscl / dist, see _accum_hp) in output-frame order,
+        one per run_hdr call; empty unless the instance was created with collect_hp=True."""
+        return self._hp
 
     def close(self):
         try:

@@ -19,8 +19,9 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
   `PYTHONUTF8` and a writable `SMV_TRT_CACHE`.
 - **`renderer/index.html`**, the UI: select/drag a video, a target-fps control, an **FSR** sharpen
   toggle, **Restore**, **Upscale**, a **Codec** selector, an opt-in **NVIDIA RTX** panel (VSR + HDR), a
-  **Dolby Vision** panel (Profile 8.1 export, one-tool install), output path, progress + ETA, a batch
-  queue, a live thumbnail, and a before/after preview pane. Electron
+  **Dolby Vision** panel and an **HDR10+** panel (each a one-tool install), output path, progress + ETA,
+  a batch queue (crash-resumable, keeps going past failed files), a live thumbnail, a before/after
+  preview pane, and a launch-time new-release notice. Electron
   `require` with `nodeIntegration`; most settings persist in `localStorage` (Restore and RTX Dynamic
   Vibrance deliberately don't, per-session opt-ins).
 - **`engine/gmfss_interp.py`**, the GMFSS pipe engine: ffmpeg decode → GMFSS → ffmpeg encode. TensorRT
@@ -88,13 +89,24 @@ portable bundle.
   driver. (A zip, not an NSIS installer, `makensis` can't memory-map an archive this large.)
 - `npm run lint`, one command that does everything: Prettier formats `src/**/*.ts` (writes), then ESLint
   lints `src`, then pyright lints `engine`. Stops at the first failure. See below.
+- `engine\runtime\python.exe scripts\smoke.py [--full] [--trt]`, the render smoke tests: real engine runs
+  on `samples/test.mp4` asserting frame counts, VFR duration preservation, `.part` promotion and (with
+  `--full`, when their runtimes are installed) the HDR10 boxes, DV configuration record and HDR10+ SEI.
+  Run it after every engine change; eager renders are not bit-deterministic, so the checks are
+  structural, never checksums.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 - `<multi>` integer multiplier, or `--fps TARGET` to resample to any output fps (the model interpolates at
   arbitrary fractional timesteps; `<multi>` is required positionally but ignored when `--fps` is given).
+- `--scale F` optical-flow resolution factor (GMFlow already runs at half the source; this scales it
+  further). **Auto by default**: 1.0 below 4K, 0.5 for 4K+ sources. GMFlow's global attention grows
+  super-linearly with area and dominates the interpolation wall, so quarter-resolution flow at UHD
+  (still 1080p-class motion detail) makes a 4K render cost barely more than a 1080p one; verified
+  equal-or-slightly-better against ground truth (dropped-frame reconstruction: mean tween PSNR 28.3 vs
+  27.9 dB, same worst frame). Pass an explicit value to override.
 - `--sharpen S` (0..1) FSR-style RCAS on every output frame (bare `--sharpen` = 0.8; off unless given).
 - `--no-interp` re-encodes at source fps with sharpen only (no model/TRT loaded).
 - `--restore` runs the Real-ESRGAN detail pass per output frame, before the upscale (works with `--no-interp`).
@@ -105,6 +117,9 @@ engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--sca
   `--hdr-mastering-prim` sets the `mdcv` gamut by name.
 - `--dv` additionally exports a **Dolby Vision Profile 8.1** MP4 (needs `--rtx-hdr`, HEVC, MP4 out, and
   user-installed `dovi_tool` in `engine/dvtools`). See the Dolby Vision section below; GPAC-free.
+- `--hdr10plus` additionally embeds **HDR10+** (SMPTE ST 2094-40) dynamic metadata (needs `--rtx-hdr`,
+  HEVC, MP4 out, and user-installed `hdr10plus_tool` in `engine/hptools`); combinable with `--dv`. See
+  the HDR10+ section below.
 - `--out-bits` {`10` default, `8` legacy}; `--codec` {`hevc` default, `av1`, `vvc`}; `--no-passthrough` first-audio-only.
 - Per-frame order: (restore →) upscale → RCAS sharpen → TrueHDR.
 
@@ -156,6 +171,29 @@ no patented processing), so the exposure is only the "Dolby Vision" **trademark*
 disclaimer (also in the README). Dolby and Dolby Vision are trademarks of Dolby Laboratories; this
 project is independent, not affiliated with or endorsed by Dolby, and bundles no Dolby software. The before/after preview does **not** change with `--dv`: the base pixels are
 identical HDR10; the DV difference is display-side tone-mapping we can't (and shouldn't) simulate.
+
+**HDR10+ (`--hdr10plus`).** Embeds **SMPTE ST 2094-40** dynamic metadata into the HDR10 render, measured
+per frame during `rtxvideo.run_hdr` (per-channel MaxScl, average maxRGB and a maxRGB percentile
+distribution, computed from a 1024-bin histogram of the 10-bit PQ codes, near-free like the DV L1 pass;
+`collect_hp`). After encode, `_hp_export` extracts the HEVC, writes the metadata JSON in the layout
+`hdr10plus_tool` itself extracts from real masters (Profile A, per-frame SceneInfo; luminance in 0.1-nit
+units; DistributionValues = [p1, p99.98, bright-pixel fraction, p25..p99]), injects the SEI with the
+user-installed **hdr10plus_tool** (`engine/hptools`, same one-tool install flow as dovi_tool) and remuxes
+with the audio. The SEI rides inside the samples (no container box needed), so HDR10+ runs FIRST and a
+following DV export passes it through, which is why `--dv --hdr10plus` can coexist on one file. Same
+`-bf 0` rule as DV (exact raw-ES remux), MP4 + HEVC only, best-effort with HDR10 fallback. Trademark note:
+the app never claims certification; metadata is produced by the third-party open-source tool.
+
+**Failure-safe output (`.part`).** Every render writes to `<name>.part.<ext>` and promotes it with an
+atomic rename only at success, so a cancelled, crashed or failed render can never leave a silently
+truncated file at the final path or destroy an existing good file it was about to replace. The GUI
+deletes the `.part` remnant after a Cancel.
+
+**VFR sources.** When a source's average frame rate disagrees with its container rate (`avg_frame_rate`
+vs `r_frame_rate`, >0.5%), the stream is variable-frame-rate (phone clips, screen recordings) and the
+container rate is usually the useless max instantaneous rate; the engine then decodes at a constant
+average rate (`-fps_mode cfr`) and derives all output timing from it, so duration and audio sync are
+preserved (a notice is logged).
 
 **Restore.** `--restore` runs Real-ESRGAN's anime-video model per output frame to clean compression noise
 and redraw linework (a generative repaint, it targets cel-style anime and can flatten fine texture).

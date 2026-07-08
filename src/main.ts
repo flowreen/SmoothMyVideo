@@ -119,6 +119,7 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     createWindow();
     warmPreviewEngine();
+    checkForUpdate();
   });
 }
 app.on('window-all-closed', () => {
@@ -127,6 +128,44 @@ app.on('window-all-closed', () => {
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
+
+// --- Update check (best-effort, silent unless a newer release exists) ------------------------------
+// The app ships as a plain zip with no installer or auto-update channel, so users have no signal a
+// new build exists. Poke the GitHub releases API once per launch (deferred a few seconds so it never
+// competes with the preview-engine warmup) and tell the renderer when a newer tag is out - it shows a
+// one-line link, nothing more. Silent on ANY failure (offline, repo private, no releases yet, rate
+// limit); nothing is ever downloaded.
+const UPDATE_REPO = 'flowreen/SmoothMyVideo';
+function newerVersion(a: string, b: string): boolean {
+  // true when dotted-numeric a > b (non-numeric parts count as 0; length-agnostic)
+  const pa = a.split('.').map((x) => parseInt(x, 10) || 0);
+  const pb = b.split('.').map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+}
+function checkForUpdate(): void {
+  setTimeout(async () => {
+    try {
+      const res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
+        headers: { accept: 'application/vnd.github+json', 'user-agent': 'SmoothMyVideo' },
+      });
+      if (!res.ok) return;
+      const rel = (await res.json()) as { tag_name?: string; html_url?: string };
+      const latest = String(rel.tag_name || '').replace(/^v/i, '');
+      if (!latest || !newerVersion(latest, app.getVersion())) return;
+      const url = rel.html_url || `https://github.com/${UPDATE_REPO}/releases/`;
+      try {
+        if (win && !win.webContents.isDestroyed()) win.webContents.send('update-available', { version: latest, url });
+      } catch {
+        /* window gone */
+      }
+    } catch {
+      /* offline / API unreachable: stay silent */
+    }
+  }, 5000);
+}
 
 ipcMain.handle('pick-video', async (_e, defaultPath?: string) => {
   // Multi-select: several files become a batch queue in the renderer (processed back to back
@@ -424,11 +463,16 @@ function findDvBin(root: string, name: string): string | null {
   return null;
 }
 
-// Copy dovi_tool.exe out of a chosen source (its release .zip, a folder, or the .exe directly) into
-// engine/dvtools. Zips are handled with Windows' bundled bsdtar.
-function installDv(source: string): { ok: boolean; error?: string; copied: string[] } {
+// Copy a single tool .exe out of a chosen source (its release .zip, a folder, or the .exe directly)
+// into an engine subdir. Zips are handled with Windows' bundled bsdtar. Shared by the Dolby Vision
+// (dovi_tool) and HDR10+ (hdr10plus_tool) installers.
+function installBin(
+  source: string,
+  binName: string,
+  destDir: string,
+): { ok: boolean; error?: string; copied: string[] } {
   try {
-    fs.mkdirSync(DV_DIR, { recursive: true });
+    fs.mkdirSync(destDir, { recursive: true });
   } catch {
     /* exists */
   }
@@ -436,22 +480,22 @@ function installDv(source: string): { ok: boolean; error?: string; copied: strin
   let tmp: string | null = null;
   try {
     if (/\.zip$/i.test(source)) {
-      tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'smv-dv-'));
+      tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'smv-tool-'));
       execFileSync(SYS_TAR, ['-xf', source, '-C', tmp]);
       searchDir = tmp;
     } else if (!fs.statSync(source).isDirectory()) {
       searchDir = path.dirname(source); // a picked .exe: search its folder
     }
-    const found = findDvBin(searchDir, DOVI_BIN);
-    if (!found) return { ok: false, error: 'dovi_tool.exe not found in the selection', copied: [] };
-    const dest = path.join(DV_DIR, DOVI_BIN);
+    const found = findDvBin(searchDir, binName);
+    if (!found) return { ok: false, error: binName + ' not found in the selection', copied: [] };
+    const dest = path.join(destDir, binName);
     try {
       if (fileExists(dest)) fs.chmodSync(dest, 0o666);
     } catch {
       /* best effort */
     }
     fs.copyFileSync(found, dest);
-    return { ok: true, copied: [DOVI_BIN] };
+    return { ok: true, copied: [binName] };
   } catch (e) {
     return { ok: false, error: String(e), copied: [] };
   } finally {
@@ -474,7 +518,7 @@ ipcMain.handle('dv-open-download', () => {
   return true;
 });
 
-ipcMain.handle('dv-install', (_e, source: string) => installDv(source));
+ipcMain.handle('dv-install', (_e, source: string) => installBin(source, DOVI_BIN, DV_DIR));
 
 // Picker accepts dovi_tool's release .zip or dovi_tool.exe directly.
 ipcMain.handle('dv-choose', async () => {
@@ -486,7 +530,37 @@ ipcMain.handle('dv-choose', async () => {
   return r.canceled ? null : r.filePaths[0] || null;
 });
 
+// --- HDR10+ export tool: readiness + install (mirrors the Dolby Vision flow) ----------------------
+// HDR10+ export embeds ST 2094-40 dynamic metadata into the HDR10 render; the engine collects the
+// per-frame stats itself and the user-installed hdr10plus_tool injects the SEI (see _hp_export).
+const HP_DIR = path.join(ENGINE, 'hptools');
+const HP_BIN = 'hdr10plus_tool.exe';
+const HP_URL = 'https://github.com/quietvoid/hdr10plus_tool/releases/';
+
+ipcMain.handle('hp-ready', () => {
+  const ready = fileExists(path.join(HP_DIR, HP_BIN));
+  return { ready, dir: HP_DIR };
+});
+
+ipcMain.handle('hp-open-download', () => {
+  shell.openExternal(HP_URL);
+  return true;
+});
+
+ipcMain.handle('hp-install', (_e, source: string) => installBin(source, HP_BIN, HP_DIR));
+
+// Picker accepts hdr10plus_tool's release .zip or hdr10plus_tool.exe directly.
+ipcMain.handle('hp-choose', async () => {
+  const r = await dialog.showOpenDialog(win!, {
+    title: 'Select the hdr10plus_tool release .zip (or hdr10plus_tool.exe)',
+    properties: ['openFile'],
+    filters: [{ name: 'hdr10plus_tool zip or exe', extensions: ['zip', 'exe'] }],
+  });
+  return r.canceled ? null : r.filePaths[0] || null;
+});
+
 let current: ChildProcess | null = null;
+let currentOut: string | null = null; // output path of the in-flight run, for .part cleanup on Cancel
 // Long renders (16K, overnight batch) must survive display/system sleep, and their progress should show
 // on the taskbar even when the window is unfocused. Both are driven from the run lifecycle below.
 let sleepBlocker: number | null = null;
@@ -578,6 +652,7 @@ ipcMain.on(
       rtxvsr?: boolean;
       rtxhdr?: boolean;
       dv?: boolean;
+      hp?: boolean;
       codec?: string;
       hdrcolor?: string;
       hdrsat?: number;
@@ -628,6 +703,8 @@ ipcMain.on(
       if (typeof opts.hdrcon === 'number' && opts.hdrcon !== 100) args.push('--hdr-contrast', String(opts.hdrcon));
       // Dolby Vision Profile 8.1 export on top of the HDR10 render (needs dovi_tool in engine/dvtools).
       if (opts.dv) args.push('--dv');
+      // HDR10+ dynamic metadata on top of the HDR10 render (needs hdr10plus_tool in engine/hptools).
+      if (opts.hp) args.push('--hdr10plus');
     }
     // PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from crashing the engine
     // during first-run TRT builds; SMV_TRT_CACHE is a guaranteed writable cache location.
@@ -649,6 +726,7 @@ ipcMain.on(
     clearPause(); // start unpaused: never inherit a stale flag from a previous (e.g. killed) run
     const proc = spawn(pyExe(), args, { cwd: ENGINE, env });
     current = proc;
+    currentOut = opts.output || null;
     keepAwake(true);
     try {
       win?.setProgressBar(2, { mode: 'indeterminate' });
@@ -699,8 +777,26 @@ ipcMain.on(
 
 ipcMain.on('cancel', () => {
   const c = current;
+  const out = currentOut;
   if (c && c.pid) {
-    execFile('taskkill', ['/pid', String(c.pid), '/T', '/F'], () => {});
+    execFile('taskkill', ['/pid', String(c.pid), '/T', '/F'], () => {
+      // The engine renders into "<base>.part<ext>" and promotes it to the real name only at
+      // success, so a cancelled run leaves a dead .part remnant (plus the HDR-into-MKV stage
+      // temp). Delete them once the killed processes release their handles; best effort - a
+      // still-locked file just stays until the next run overwrites it.
+      if (!out) return;
+      const ext = path.extname(out);
+      const part = out.slice(0, out.length - ext.length) + '.part' + ext;
+      setTimeout(() => {
+        for (const p of [part, part + '.video.tmp.mp4']) {
+          try {
+            fs.unlinkSync(p);
+          } catch {
+            /* not there or still locked */
+          }
+        }
+      }, 1500);
+    });
   }
 });
 
