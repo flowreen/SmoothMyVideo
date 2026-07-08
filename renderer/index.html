@@ -61,7 +61,7 @@
   <div class="sub">Make any video buttery-smooth. AI adds in-between frames for a higher frame rate, right on your NVIDIA GPU. Offline · No quality loss · No account needed.</div>
   <!-- One-line update notice; hidden unless main's launch-time release check finds a newer build. -->
   <div id="update" class="hint" style="display:none;margin:2px 0 6px">
-    ⬆️ Version <span id="updatever"></span> is out — <a id="updatelink" href="#" style="color:var(--green)">get the new build</a>
+    ⬆️ Version <span id="updatever"></span> is out: <a id="updatelink" href="#" style="color:var(--green)">get the new build</a>
   </div>
 
   <div class="row">
@@ -72,7 +72,7 @@
   <!-- Empty state: shown until a video is loaded (or an RTX install begins), then replaced by #workspace. -->
   <div id="welcome" class="panel" style="text-align:center;padding:40px 20px">
     <div style="font-size:15px;margin-bottom:8px">👋 Welcome to <b>Smooth My Video</b></div>
-    <div class="hint">Drop a video anywhere on this window — or click <b>Select video…</b> above — to get started.<br>
+    <div class="hint">Drop a video anywhere on this window (or click <b>Select video…</b> above) to get started.<br>
       You'll get a smoother, higher-frame-rate copy saved right next to the original.</div>
   </div>
 
@@ -220,7 +220,7 @@
   <div class="panel" id="dvpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Dolby Vision</span>
-      <span class="hint">Opt-in export. Adds Profile 8.1 dynamic-HDR metadata on top of the HDR10 render (via the open-source dovi_tool). HDR10-compatible.</span>
+      <span class="hint">Opt-in export. Adds Profile 8.1 dynamic-HDR metadata on top of the HDR10 render (via the open-source dovi_tool). HDR10-compatible. Best for TVs and devices in the Dolby Vision ecosystem: LG, Sony, most streaming boxes. Samsung TVs don't support it.</span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -245,7 +245,7 @@
   <div class="panel" id="hppanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">HDR10+</span>
-      <span class="hint">Opt-in export. Embeds HDR10+ dynamic-HDR metadata (SMPTE ST 2094-40) into the HDR10 render (via the open-source hdr10plus_tool). HDR10-compatible.</span>
+      <span class="hint">Opt-in export. Embeds HDR10+ dynamic-HDR metadata (SMPTE ST 2094-40) into the HDR10 render (via the open-source hdr10plus_tool). HDR10-compatible. Best for Samsung TVs (which don't support Dolby Vision) and other HDR10+ displays; combinable with the Dolby Vision export: one file, every display picks what it understands.</span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -314,7 +314,7 @@
       </div>
       <div class="row" style="justify-content:center;gap:10px;margin-top:6px">
         <button id="prevprev" class="mini" style="visibility:hidden">&lsaquo; back</button>
-        <span class="v" id="prevlabel">frame &mdash;</span>
+        <span class="v" id="prevlabel">frame &hellip;</span>
         <button id="prevnext" class="mini">random frame &rsaquo;</button>
       </div>
       <div class="hint" id="prevnote" style="text-align:center;margin-top:4px"></div>
@@ -667,7 +667,7 @@ function syncUpscale(){
                 + (upBackendName() === 'bicubic' ? ' (turn on RTX VSR for AI)' : '')
                 + ((d.w > NVENC_MAX || d.h > NVENC_MAX) ? '  ·  CPU encode at this size (slower)' : '')
                 + ((d.w >= ENC_MAX || d.h >= ENC_MAX) ? '  ·  at the 16K encoder cap' : '');
-    else if(info) txt = 'source is already at/above that height — no upscale';
+    else if(info) txt = 'source is already at/above that height, no upscale';
     else txt = 'load a video to preview the result';
   }
   $('upinfo').textContent = txt;
@@ -777,7 +777,7 @@ async function checkDvReady(){
     // Name the exact Windows download, since the release page also lists macOS/Linux/ARM builds.
     $('dvsteps').innerHTML = line
       + '<br>Click <b>Get dovi_tool</b> and pick the <b>x64 Windows</b> build '
-      + '(<code>&hellip;x86_64-pc-windows-msvc.zip</code>), then <b>Choose&hellip;</b> that .zip — it installs automatically.';
+      + '(<code>&hellip;x86_64-pc-windows-msvc.zip</code>), then <b>Choose&hellip;</b> that .zip; it installs automatically.';
   }
   $('dvbtns').style.display = dvReady.ready ? 'none' : '';   // hide Get / Choose once dovi_tool is installed
   $('dvsetup').style.display = dvReady.ready ? 'none' : 'block';
@@ -822,7 +822,7 @@ async function checkHpReady(){
     // Name the exact Windows download, since the release page also lists macOS/Linux/ARM builds.
     $('hpsteps').innerHTML = line
       + '<br>Click <b>Get hdr10plus_tool</b> and pick the <b>x64 Windows</b> build '
-      + '(<code>&hellip;x86_64-pc-windows-msvc.zip</code>), then <b>Choose&hellip;</b> that .zip — it installs automatically.';
+      + '(<code>&hellip;x86_64-pc-windows-msvc.zip</code>), then <b>Choose&hellip;</b> that .zip; it installs automatically.';
   }
   $('hpbtns').style.display = hpReady.ready ? 'none' : '';   // hide Get / Choose once the tool is installed
   $('hpsetup').style.display = hpReady.ready ? 'none' : 'block';
@@ -1168,7 +1168,7 @@ try {
   const pend = JSON.parse(localStorage.getItem('batchPending') || 'null');
   localStorage.removeItem('batchPending');
   if(Array.isArray(pend) && pend.length && pend.every(p => typeof p === 'string')){
-    log('>> Restored ' + pend.length + ' unfinished file(s) from the last session — click Smooth It! to continue\n');
+    log('>> Restored ' + pend.length + ' unfinished file(s) from the last session; click Smooth It! to continue\n');
     queueVideos(pend);
   }
 } catch { /* no saved batch */ }
@@ -1253,13 +1253,13 @@ $('go').onclick = () => {
     // Pause: the engine finishes the frames already queued to the encoder, then holds before the
     // next source pair. Stop the ETA countdown (it would keep ticking down through the idle time).
     goMode = 'paused'; $('go').textContent = 'Resume';
-    $('status').textContent = fileTag() + 'Paused — click Resume to continue.';
+    $('status').textContent = fileTag() + 'Paused; click Resume to continue.';
     clearInterval(etaTimer); etaTimer = null;
     ipcRenderer.send('pause');
   } else { // paused -> resume
     goMode = 'running'; $('go').textContent = 'Pause';
     // Re-anchor the pace clock so the paused span doesn't drag the mean fps (and ETA) down; skip
-    // if warmup never finished (procStart still 0 — the first-frame handler will anchor instead).
+    // if warmup never finished (procStart still 0; the first-frame handler will anchor instead).
     if(procStart){ procStart = Date.now(); baseK = curDone; }
     etaTimer = setInterval(paint, 500);
     $('status').textContent = fileTag() + 'Smoothing on the GPU...';

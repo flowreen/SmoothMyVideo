@@ -229,6 +229,12 @@ nets doesn't help (FusionNet saturates at batch 1), and fp8 fails a quality gate
 overflows e4m3 → 61 px outliers). `torch.compile` and dynamic-shape engines were both ruled out (shipping a
 JIT compiler breaks the no-deps promise; `grid_sample` has no dynamic-ONNX path). Two non-regressing
 cleanups were kept: GPU-side transposes and a single shared CUDA stream with no per-call TRT sync.
+A 2026-07 re-audit confirmed the compute-bound conclusion and closed calibrated FP8 with data
+(FusionNet: no speedup; GMFlow: 1.3x but with disqualifying flow outliers). The two wins that DID
+land: flow is estimated at an automatic resolution-appropriate scale (4K renders near 1080p cost,
+see `--scale`), and the engine warns at startup when the GPU's power limit sits below its board
+default (a laptop Silent profile can cost 2-3x wall time; the pipeline is power-bound before it is
+anything else).
 
 ## Constraints
 - **CUDA 13 (Blackwell, sm_120):** torch is the cu130 build; cupy-cuda13x finds the runtime via

@@ -11,9 +11,14 @@
 </p>
 
 <p align="center">
-  <img src="docs/demo-rocket.gif" alt="Before and after: 360p 24 fps source versus 720p HDR 120 fps output" width="880"><br>
-  <sub><b>Everything at once.</b> Left: a synthetic 360p, 24 fps source. Right: the same clip with all three passes on, 2&times; RTX upscale to 720p, SDR&rarr;HDR10, and 24&rarr;120 fps interpolation, in a single render.</sub><br>
-  <sub><i>Shown as a tone-mapped SDR GIF at 50 fps; the render itself is HDR10 at 120 fps.</i></sub>
+  <img src="docs/demo-pan.gif" alt="Side by side: the same anime-style panning shot at 10 fps and interpolated to 50 fps" width="880"><br>
+  <sub><b>The same shot, before and after.</b> Left: a classic anime-style pan at 10 fps, the cadence anime pans are actually drawn at. Right: the same clip interpolated 5&times; to 50 fps. Every original frame passes through untouched; the AI draws only the frames in between.</sub>
+</p>
+
+<p align="center">
+  <img src="docs/demo-namakura.gif" alt="Before and after: a 1917 anime at 15 fps with heavy film grain versus the restored, upscaled, 50 fps render" width="760"><br>
+  <sub><b>It also brings 108-year-old anime back to life.</b> Left: <i>Namakura Gatana</i> (1917, public domain), 15 fps with a century of film grain. Right: the same frames after AI detail restoration, 2&times; RTX upscale and 15&rarr;50 fps interpolation, one render.</sub><br>
+  <sub><i>Source: the National Film Center scan, via the Internet Archive (Public Domain Mark).</i></sub>
 </p>
 
 > *Built because NVIDIA's RTX Video (AI upscaling + TrueHDR) is gorgeous but playback-only: it enhances
@@ -29,6 +34,10 @@ your monitor's refresh**), and click **Smooth It!**. Smooth My Video generates t
 with a GMFSS AI model on your GPU and writes a smoother, high-frame-rate copy right next to the
 original. In the same render it can also **upscale** (up to 16K), **sharpen**, **restore detail**, and
 convert **SDR → real HDR10**, while carrying over every audio track, subtitle, chapter and font.
+
+<p align="center">
+  <img src="docs/ui.png" alt="The Smooth My Video window: video info, target fps, upscale, codec, RTX and HDR panels, before/after preview" width="620">
+</p>
 
 Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a current driver.
 
@@ -56,9 +65,16 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   (VMAF ~99.8, SSIM ≥ 0.995), no fiddly quality knob to guess at.
 - 📦 **100% offline & self-contained.** Extract the zip and run, no Python, no pip, no ffmpeg to install,
   no account, no cloud upload. Only the NVIDIA driver is assumed. Free.
-- ⚡ **Fast.** fp16 with a TensorRT backend, built and cached per resolution, about 2.2× over the eager path.
-- 🎚️ **Plus the essentials:** FSR-style sharpening, a batch queue, a live before/after preview, and every
-  setting remembered between runs.
+- ⚡ **Fast.** fp16 with a TensorRT backend, built and cached per resolution; 4K sources interpolate at
+  nearly 1080p cost (motion is estimated at a resolution-appropriate scale, automatically). The app also
+  tells you when a laptop "Silent" power profile is throttling the GPU.
+- 🧺 **Set-and-forget batches.** Queue many files; a file that fails is noted and the rest keep rendering,
+  and a batch interrupted by a crash or restart is re-queued on the next launch.
+- 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
+  detected and timed correctly, so audio never drifts out of sync.
+- 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
+- 🎚️ **Plus the essentials:** FSR-style sharpening, a live before/after preview, every setting remembered
+  between runs, and a quiet one-line notice when a newer release is out (nothing auto-downloads).
 
 ## Get started
 
