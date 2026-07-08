@@ -13,8 +13,10 @@ metadata boxes, Dolby Vision configuration record and HDR10+ dynamic-metadata SE
 
 Pure stdlib; runs the engine CLI exactly like the GUI does. Cases whose runtime is not
 installed (RTX feature DLLs, dovi_tool, hdr10plus_tool) report SKIP, not FAIL. Exits
-nonzero if any case FAILs. Note: eager GMFSS is not bit-deterministic, so the assertions
-are structural (frame counts, duration, metadata presence), never checksums.
+nonzero if any case FAILs. Since 2026-07-09 the GMFSS path is fully deterministic
+(fixed-point softsplat + cudnn deterministic mode), so identical runs produce
+byte-identical files - the --full set asserts exactly that with an md5 case; the other
+assertions stay structural (frame counts, duration, metadata presence).
 """
 import argparse
 import json
@@ -234,8 +236,20 @@ def c_hp(tmp, trt):
     assert "SMPTE2094-40" in fsd or "HDR10+" in fsd, "HDR10+ dynamic metadata SEI missing"
 
 
+@case("determinism: two identical renders -> identical md5")
+def c_det(tmp, trt):
+    import hashlib
+    outs = []
+    for i in range(2):
+        out = os.path.join(tmp, f"s_det{i}.mp4")
+        rc, _ = render(SAMPLE, out, trt=trt)
+        assert rc == 0, "engine exit " + str(rc)
+        outs.append(hashlib.md5(open(out, "rb").read()).hexdigest())
+    assert outs[0] == outs[1], f"md5 mismatch: {outs[0]} vs {outs[1]}"
+
+
 QUICK = [c_2x, c_fps60, c_noint, c_vfr]
-FULL = [c_3x, c_5x, c_av1, c_vvc, c_hdr, c_dv, c_hp]
+FULL = [c_3x, c_5x, c_av1, c_vvc, c_hdr, c_dv, c_hp, c_det]
 
 
 def main():

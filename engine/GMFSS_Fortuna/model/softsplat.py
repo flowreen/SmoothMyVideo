@@ -275,18 +275,30 @@ def softsplat(tenIn:torch.Tensor, tenFlow:torch.Tensor, tenMetric:torch.Tensor, 
 
 
 class softsplat_func(torch.autograd.Function):
+    # DETERMINISM (SMV 2026-07-09): the forward splat accumulates via int64 FIXED-POINT atomics
+    # instead of the original float32 atomicAdd. Float addition is not associative, so the float
+    # atomics made every warp run-to-run nondeterministic (the ONLY nondeterministic stage in the
+    # whole GMFSS pipeline, measured); integer addition IS associative, so summing pre-rounded
+    # integer contributions is bit-exact regardless of thread scheduling. Each contribution is
+    # scaled by 2^26 in float32 and rounded once with llrintf - deterministic per pixel (float
+    # math is deterministic; only the ACCUMULATION order was not).
+    # Precision: quantum 2^-26 ~ 1.5e-8 absolute, on par with the float32 rounding it replaces;
+    # overflow headroom: even a pathological all-pixels-to-one-cell collapse stays < 2^63.
+    # The backward kernels keep float atomics: inference never calls them.
+    _SCALE = float(1 << 26)
+
     @staticmethod
     @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(self, tenIn, tenFlow):
-        tenOut = tenIn.new_zeros([tenIn.shape[0], tenIn.shape[1], tenIn.shape[2], tenIn.shape[3]])
+        tenAcc = tenIn.new_zeros([tenIn.shape[0], tenIn.shape[1], tenIn.shape[2], tenIn.shape[3]], dtype=torch.int64)
 
         if tenIn.is_cuda == True:
-            cuda_launch(cuda_kernel('softsplat_out', '''
-                extern "C" __global__ void __launch_bounds__(512) softsplat_out(
+            cuda_launch(cuda_kernel('softsplat_out_det', '''
+                extern "C" __global__ void __launch_bounds__(512) softsplat_out_det(
                     const int n,
                     const {{type}}* __restrict__ tenIn,
                     const {{type}}* __restrict__ tenFlow,
-                    {{type}}* __restrict__ tenOut
+                    long long* __restrict__ tenOut
                 ) { for (int intIndex = (blockIdx.x * blockDim.x) + threadIdx.x; intIndex < n; intIndex += blockDim.x * gridDim.x) {
                     const int intN = ( intIndex / SIZE_3(tenOut) / SIZE_2(tenOut) / SIZE_1(tenOut) ) % SIZE_0(tenOut);
                     const int intC = ( intIndex / SIZE_3(tenOut) / SIZE_2(tenOut)                  ) % SIZE_1(tenOut);
@@ -318,29 +330,29 @@ class softsplat_func(torch.autograd.Function):
                     {{type}} fltSoutheast = (fltX - ({{type}}) (intNorthwestX)) * (fltY - ({{type}}) (intNorthwestY));
 
                     if ((intNorthwestX >= 0) && (intNorthwestX < SIZE_3(tenOut)) && (intNorthwestY >= 0) && (intNorthwestY < SIZE_2(tenOut))) {
-                        atomicAdd(&tenOut[OFFSET_4(tenOut, intN, intC, intNorthwestY, intNorthwestX)], fltIn * fltNorthwest);
+                        atomicAdd((unsigned long long*) &tenOut[OFFSET_4(tenOut, intN, intC, intNorthwestY, intNorthwestX)], (unsigned long long) (long long) llrintf(fltIn * fltNorthwest * 67108864.0f));
                     }
 
                     if ((intNortheastX >= 0) && (intNortheastX < SIZE_3(tenOut)) && (intNortheastY >= 0) && (intNortheastY < SIZE_2(tenOut))) {
-                        atomicAdd(&tenOut[OFFSET_4(tenOut, intN, intC, intNortheastY, intNortheastX)], fltIn * fltNortheast);
+                        atomicAdd((unsigned long long*) &tenOut[OFFSET_4(tenOut, intN, intC, intNortheastY, intNortheastX)], (unsigned long long) (long long) llrintf(fltIn * fltNortheast * 67108864.0f));
                     }
 
                     if ((intSouthwestX >= 0) && (intSouthwestX < SIZE_3(tenOut)) && (intSouthwestY >= 0) && (intSouthwestY < SIZE_2(tenOut))) {
-                        atomicAdd(&tenOut[OFFSET_4(tenOut, intN, intC, intSouthwestY, intSouthwestX)], fltIn * fltSouthwest);
+                        atomicAdd((unsigned long long*) &tenOut[OFFSET_4(tenOut, intN, intC, intSouthwestY, intSouthwestX)], (unsigned long long) (long long) llrintf(fltIn * fltSouthwest * 67108864.0f));
                     }
 
                     if ((intSoutheastX >= 0) && (intSoutheastX < SIZE_3(tenOut)) && (intSoutheastY >= 0) && (intSoutheastY < SIZE_2(tenOut))) {
-                        atomicAdd(&tenOut[OFFSET_4(tenOut, intN, intC, intSoutheastY, intSoutheastX)], fltIn * fltSoutheast);
+                        atomicAdd((unsigned long long*) &tenOut[OFFSET_4(tenOut, intN, intC, intSoutheastY, intSoutheastX)], (unsigned long long) (long long) llrintf(fltIn * fltSoutheast * 67108864.0f));
                     }
                 } }
             ''', {
                 'tenIn': tenIn,
                 'tenFlow': tenFlow,
-                'tenOut': tenOut
+                'tenOut': tenAcc
             }))(
-                grid=tuple([int((tenOut.nelement() + 512 - 1) / 512), 1, 1]),
+                grid=tuple([int((tenAcc.nelement() + 512 - 1) / 512), 1, 1]),
                 block=tuple([512, 1, 1]),
-                args=[cuda_int32(tenOut.nelement()), tenIn.data_ptr(), tenFlow.data_ptr(), tenOut.data_ptr()],
+                args=[cuda_int32(tenAcc.nelement()), tenIn.data_ptr(), tenFlow.data_ptr(), tenAcc.data_ptr()],
                 stream=collections.namedtuple('Stream', 'ptr')(torch.cuda.current_stream().cuda_stream)
             )
 
@@ -348,6 +360,8 @@ class softsplat_func(torch.autograd.Function):
             assert(False)
 
         # end
+
+        tenOut = tenAcc.to(torch.float32).mul_(1.0 / softsplat_func._SCALE)
 
         self.save_for_backward(tenIn, tenFlow)
 

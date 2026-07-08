@@ -416,7 +416,14 @@ os.chdir(REPO)
 torch.set_grad_enabled(False)
 device = torch.device("cuda")
 torch.backends.cudnn.enabled = True
-torch.backends.cudnn.benchmark = True
+# Deterministic renders (2026-07-09): benchmark mode re-times conv algorithms per process, so two
+# processes could pick different reduction orders and produce (invisibly) different frames. With
+# it off + deterministic algorithm selection, and softsplat's fixed-point accumulation (the one
+# true nondeterminism source, see softsplat.py), identical runs produce byte-identical output
+# files on the GMFSS path - which is what lets smoke.py assert md5s. Perf measured neutral on the
+# eager path (the TRT default path never used cudnn autotuning anyway).
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 
 if NO_INTERP:
     # Sharpen-only / re-encode: the GMFSS model and the TensorRT backend are never loaded, so

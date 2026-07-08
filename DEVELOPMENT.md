@@ -203,6 +203,18 @@ and redraw linework (a generative repaint, it targets cel-style anime and can fl
 default at 1.0. It limits its lobe to the neighbour min/max (no overshoot/ringing), eases off in noisy
 regions, and applies one scalar per pixel to all channels (so it can't decorrelate them into colour speckle).
 
+**Deterministic renders.** The GMFSS path is bit-deterministic: the same command produces a
+byte-identical output file, run after run, on both the TensorRT and eager paths (verified by md5;
+`scripts/smoke.py --full` asserts it). Two changes made this true (2026-07-09): softsplat's forward
+splat accumulates in **int64 fixed point** (integer addition is associative, so thread scheduling
+can't reorder a float sum - this was the single nondeterministic stage, isolated by a per-stage
+bit-exactness probe), and `cudnn.benchmark` is off with deterministic algorithm selection (benchmark
+mode could pick different conv algorithms per process). Output differs from the old float-atomics
+kernel by ~1e-4 max (82 dB, the old kernel's own run-to-run jitter level). Cost: the int64
+accumulator doubles the splat's memory traffic - invisible at 2x, roughly +15% inference time at
+very high multipliers. The RTX passes (VSR/TrueHDR) are NVIDIA NGX black boxes with no determinism
+contract, so HDR/VSR renders are outside the byte-identical guarantee.
+
 **Preview / batch / live.** A before/after pane runs the same passes on a single frame (click for 1:1
 pixels); a batch queue renders picked/dropped files back to back; a ~1/s live thumbnail shows the graded
 output frame during a render (near-zero render cost, a producer/worker split keeps the render thread only
