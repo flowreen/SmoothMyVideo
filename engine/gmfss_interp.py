@@ -999,7 +999,22 @@ else:
 # small chroma QP boost. SVT-AV1 CPU fallback: CRF 20 (its visually lossless range) at
 # preset 8, fast enough not to starve the GPU frame pipe.
 if USE_NVENC:
-    cq = "22" if venc == "av1_nvenc" else "17"
+    # SMV_CQ overrides the tuned constant-quality value (hidden knob for measurement work like
+    # the 2026-07-03 codec tuning or the high-fps CQ experiment; not a user-facing setting).
+    cq = os.environ.get("SMV_CQ") or ("22" if venc == "av1_nvenc" else "17")
+    if out_label > 120 and not os.environ.get("SMV_CQ"):
+        # High-fps CQ relief (the NVENC mirror of the vvenc qpa rule below): at 120+ fps output
+        # every frame shows for <=8 ms and most frames are smooth interpolated tweens, so the
+        # 24fps-tuned CQ over-spends dramatically (a 360fps 1440p episode measured ~77 Mbps at
+        # the base CQ). +3 measured 2026-07-09 on a real anime slice (1440p 360fps HDR; the
+        # deterministic pipeline makes it a pure encoder A/B on identical frames): hevc 17->20 =
+        # -16% size at 55.2 dB avg / SSIM 0.9985 vs the base-CQ encode (the handful of 43 dB
+        # worst frames are structureless grain dither on one detail-heavy shot, verified
+        # invisible in a 6x-amplified still); av1 22->25 = -35% at 56.1 dB avg / worst 45.0 dB /
+        # SSIM 0.9987, zero frames below the worst-frame bar.
+        cq = str(int(cq) + 3)
+        sys.stderr.write(f"encode: high-fps CQ relief at {out_label} fps output (CQ {cq}; "
+                         "tween-dense streams over-spend at the base CQ)\n"); sys.stderr.flush()
     qargs = ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
              "-spatial-aq", "1", "-temporal-aq", "1"]
     if venc in ("h264_nvenc", "hevc_nvenc"):
@@ -1379,6 +1394,41 @@ def _hp_export(mp4_path):
                 pass
 
 
+_disk_warned = False
+
+
+def _progress(k, total):
+    """One PROGRESS heartbeat (the GUI parses `PROGRESS k/total`; emitted every 10 pairs/frames)
+    plus a `SIZE cur projected` line: the encoder's bytes so far and their linear projection to
+    100%, accurate to a few percent once a minute of content is in (CQ bitrate is stationary
+    enough per title). The GUI shows the projection next to the ETA - so a 10-hour render tells
+    you it will be ~13 GB in its first minutes, not at the end. A one-time warning fires when the
+    remaining bytes (doubled for the HDR-into-MKV two-stage, whose temp and final coexist) exceed
+    the free space on the output drive."""
+    global _disk_warned
+    sys.stderr.write(f"PROGRESS {k}/{total}\n")
+    frac = k / total if total else 0.0
+    if frac >= 0.01:
+        try:
+            cur = os.path.getsize(_ENC_TARGET)
+            proj = int(cur / frac)
+            sys.stderr.write(f"SIZE {cur} {proj}\n")
+            if not _disk_warned and frac >= 0.05:
+                _disk_warned = True
+                import shutil
+                free = shutil.disk_usage(os.path.dirname(out_path) or ".").free
+                need = (proj - cur) + (proj if HDR_MKV_2STAGE else 0) + (1 << 30)
+                if need > free:
+                    sys.stderr.write(
+                        f"warning: projected output ~{proj / 1e9:.1f} GB"
+                        + (" (x2 transiently for the HDR MKV remux)" if HDR_MKV_2STAGE else "")
+                        + f" but only {free / 1e9:.1f} GB free on the output drive - "
+                        "the render may fail; free up space or change the output location\n")
+        except OSError:
+            pass
+    sys.stderr.flush()
+
+
 def _drain_pipes():
     """Teardown shared by all three render loops (runs in each loop's finally, so on error too):
     flush the encode queue and close the pipes in order - writer sentinel, join the writer, close
@@ -1440,7 +1490,7 @@ if NO_INTERP:
                    if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE or RESTORE_ACTIVE) else buf)
             k += 1
             if k % 10 == 0:
-                sys.stderr.write(f"PROGRESS {k}/{total_units}\n"); sys.stderr.flush()
+                _progress(k, total_units)
     finally:
         _drain_pipes()
     _finish(f"done {k} frames "
@@ -1499,7 +1549,7 @@ if not FPS_MODE:
             f_cur = f_next
             k += 1
             if k % 10 == 0:
-                sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
+                _progress(k, total_pairs)
     finally:
         _drain_pipes()
     # On-grid output is the real first frame plus M tweens/real per processed pair: multi*k + 1.
@@ -1545,7 +1595,7 @@ try:
         i += 1
         k += 1
         if k % 10 == 0:
-            sys.stderr.write(f"PROGRESS {k}/{total_pairs}\n"); sys.stderr.flush()
+            _progress(k, total_pairs)
     # Closing slot for the last source frame (i is now its index): its own time interval [i, i+1),
     # which has no frame after it to interpolate toward. Hold the last generated frame across it so
     # the output covers the full source duration and lands on exactly multi*frames (true doubling,

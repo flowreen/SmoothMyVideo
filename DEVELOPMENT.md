@@ -146,7 +146,18 @@ via a two-stage finalize.
 **Encode quality.** NVENC constant-quality VBR (AQ + a small chroma-QP boost), tuned and verified against a
 lossless 8K master: HEVC **CQ 17** (VMAF 99.78 / 57.0 dB / SSIM 0.9986), AV1 **CQ 22**, VVC **QP 20**, all
 past the visually-lossless bar on mean and worst frame. vvenc's perceptual QP adaptation is switched off
-above 120 fps output (it inverts on wall-to-wall tween streams and bloats the file).
+above 120 fps output (it inverts on wall-to-wall tween streams and bloats the file). NVENC gets the mirror
+treatment, **high-fps CQ relief**: above 120 fps output the CQ rises by 3 (HEVC 17→20, AV1 22→25), because
+frames showing for ≤8 ms in tween-dense streams over-spend at the 24fps-tuned CQ (a 360fps 1440p episode
+measured ~77 Mbps without it). Measured on real anime with deterministic frames (a pure encoder A/B):
+HEVC −16% size at 55.2 dB avg / SSIM 0.9985 vs the base-CQ encode, AV1 −35% at 56.1 dB avg / worst 45.0 dB.
+The `SMV_CQ` env var overrides any CQ for measurement work.
+
+**Size projection + disk check.** During a render the engine emits `SIZE cur projected` beside each
+PROGRESS heartbeat (bytes written so far, linearly extrapolated), so the GUI shows the expected final size
+next to the ETA within the first minutes of a long render. A one-time warning fires early when the
+projection (doubled for the HDR-into-MKV two-stage, whose temp and final coexist) exceeds the free space
+on the output drive.
 
 **Upscale + RTX.** `--upscale` to any resolution up to 16K (RTX VSR, or bicubic fallback). Past 8192 px
 NVENC/HEVC can't encode, so the engine probes CPU encoders at the output size and auto-switches

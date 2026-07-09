@@ -365,7 +365,7 @@ function fileTag(){ return batchTotal > 1 ? 'File ' + (batchTotal - batch.length
 // ETA is a live countdown. Each PROGRESS frame re-anchors it to the average pace since warmup,
 // and a timer ticks the displayed seconds down between frames so it never sits frozen. curDone/
 // curPct hold the last frame numbers so the timer can repaint the line with no new PROGRESS.
-let etaAnchor = 0, etaAnchorTime = 0, lastFps = 0, etaTimer = null, curDone = 0, curPct = 0;
+let etaAnchor = 0, etaAnchorTime = 0, lastFps = 0, etaTimer = null, curDone = 0, curPct = 0, projBytes = 0;
 function fmtEta(s){ s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), ss=s%60;
   return h>0 ? h+'h '+String(m).padStart(2,'0')+'m '+String(ss).padStart(2,'0')+'s'
        : m>0 ? m+'m '+String(ss).padStart(2,'0')+'s' : ss+'s'; }
@@ -396,8 +396,12 @@ function paint(){
     const remain = Math.max(0, etaAnchor - (Date.now()-etaAnchorTime)/1000);
     speed = '   ·   '+Math.round(lastFps)+' fps   ·   ETA '+fmtEta(remain)+'  ('+fmtFinish(remain)+')';
   }
-  $('frames').textContent = 'Frames: '+Math.round(curDone*fpp)+' / '+totalGen+speed;
+  // Projected final size (engine SIZE lines: bytes so far, linearly extrapolated to 100%), so a
+  // long render reveals its disk cost in the first minutes instead of at the end.
+  const size = projBytes > 0 ? '   ·   ~'+fmtBytes(projBytes) : '';
+  $('frames').textContent = 'Frames: '+Math.round(curDone*fpp)+' / '+totalGen+speed+size;
 }
+function fmtBytes(b){ return b >= 1e9 ? (b/1e9).toFixed(b >= 1e10 ? 0 : 1)+' GB' : Math.round(b/1e6)+' MB'; }
 function interpOn(){ return $('interp').checked; }
 function srcFps(){ const [n,d]=(info.fps||'24/1').split('/'); return (+n)/((+d)||1); }
 // TARGET FPS is authoritative (the #fpsin box); the multiplier stepper is a linked view of it (see
@@ -497,6 +501,7 @@ function refresh(){ if(!input) return;
   if(customOut) customOut = retagCustom(customOut);   // re-sync the _fps/_p tags in the user's name
   lastOut = customOut || outName(); $('out').value = lastOut;
   if(goMode === 'idle') $('out').disabled = false;   // editable while idle; startRun locks it
+  updateDvHpHints();   // the DV/HDR10+ "skipped for MKV" hints track the resolved output name
 }
 // Editing the output path inline: a non-empty value becomes the custom output (kept across setting
 // changes, like the Change... dialog); clearing it on blur reverts to the auto-generated name.
@@ -762,8 +767,19 @@ let dvReady = { dovi:false, ready:false };
 function syncDv(){
   if($('dvexport').checked) checkDvReady();
   else $('dvsetup').style.display = 'none';
-  // DV rides on the HDR10 render, so flag when RTX HDR isn't on.
-  $('dvhint').textContent = $('rtxhdr').checked ? '(HDR10-compatible, falls back to HDR10)' : '(needs RTX HDR on)';
+  updateDvHpHints();
+}
+// Both dynamic-HDR exports ride on the HDR10 render AND need an MP4 container. When the loaded
+// video's tracks force MKV output (subtitles, exotic audio), the engine would skip them with only
+// a log notice at render time - so say it up front, next to the checkbox, the moment the output
+// name resolves to .mkv. Pure text updates (no IPC), safe to call from refresh() on every change.
+function updateDvHpHints(){
+  const mkv = (lastOut || '').toLowerCase().endsWith('.mkv');
+  const hint = (name) => !$('rtxhdr').checked ? '(needs RTX HDR on)'
+    : mkv ? '(skipped for this video: its tracks need MKV output, ' + name + ' needs MP4)'
+    : '(HDR10-compatible, falls back to HDR10)';
+  $('dvhint').textContent = hint('Dolby Vision');
+  $('hphint').textContent = hint('HDR10+');
 }
 async function checkDvReady(){
   $('dvstatus').textContent = 'checking...'; $('dvstatus').style.color = 'var(--sub)';
@@ -807,8 +823,7 @@ let hpReady = { ready:false };
 function syncHp(){
   if($('hpexport').checked) checkHpReady();
   else $('hpsetup').style.display = 'none';
-  // HDR10+ rides on the HDR10 render, so flag when RTX HDR isn't on.
-  $('hphint').textContent = $('rtxhdr').checked ? '(HDR10-compatible, falls back to HDR10)' : '(needs RTX HDR on)';
+  updateDvHpHints();
 }
 async function checkHpReady(){
   $('hpstatus').textContent = 'checking...'; $('hpstatus').style.color = 'var(--sub)';
@@ -1193,7 +1208,7 @@ function startRun(){
     alert('Nothing to do: turn on Interpolate, pick an Upscale resolution, enable FSR sharpening or Restore, or turn on RTX HDR (and install its runtime).');
     return;
   }
-  procStart = 0; baseK = 0; etaAnchor = 0; etaAnchorTime = 0; lastFps = 0; curDone = 0; curPct = 0;
+  procStart = 0; baseK = 0; etaAnchor = 0; etaAnchorTime = 0; lastFps = 0; curDone = 0; curPct = 0; projBytes = 0;
   clearInterval(etaTimer); etaTimer = setInterval(paint, 500);   // ticks the ETA down between frames
   // Live thumbnail: only frames written by THIS run may show, so anchor the mtime watermark to
   // whatever is on disk now (a previous run's leftover) and hide the old image until a new write.
@@ -1279,6 +1294,11 @@ ipcRenderer.on('engine-out', (_e, t) => {
   // pre-render estimate (container nb_frames * ratio), which can be off by one when nb_frames misreports.
   const of = /OUTFRAMES\s+(\d+)/.exec(t);
   if(of) totalGen = +of[1] || totalGen;
+  // SIZE lines carry (bytes so far, projected final bytes); like PROGRESS, a chunk can batch
+  // several, so keep the newest projection for the frames line.
+  let sm = null, sg = /SIZE\s+\d+\s+(\d+)/g, sx;
+  while((sx = sg.exec(t)) !== null) sm = sx;
+  if(sm) projBytes = +sm[1] || 0;
   // A single stderr chunk can batch several PROGRESS lines; take the last so the bar and the
   // frame/elapsed feeding the ETA reflect the newest count, never a stale one from the batch.
   let m = null, g = /PROGRESS\s+(\d+)\/(\d+)/g, x;
@@ -1314,7 +1334,8 @@ ipcRenderer.on('engine-out', (_e, t) => {
     if(/\[trt\] building/.test(t)) $('status').textContent = 'Building TensorRT engines (one time for this resolution)...';
     // OUTFRAMES is machine-only, and the engine's "done ..." line duplicates the ">> Saved: <path>"
     // the GUI prints on engine-done - strip both from the GUI log (they still show in CLI output).
-    const shown = t.replace(/OUTFRAMES\s+\d+\n?/g, '').replace(/^done \d+ (frames|pairs)[^\n]*\n?/gm, '');
+    const shown = t.replace(/OUTFRAMES\s+\d+\n?/g, '').replace(/SIZE\s+\d+\s+\d+\n?/g, '')
+      .replace(/^done \d+ (frames|pairs)[^\n]*\n?/gm, '');
     if(shown.trim() && !/Optical Flow Grid Size/.test(shown)) log(shown);
   }
 });
