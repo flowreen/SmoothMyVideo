@@ -40,6 +40,7 @@
         "filter": ["**/*", "!**/__pycache__/**", "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine", "!rtxvideo/nvngx_vsr.dll", "!rtxvideo/nvngx_truehdr.dll", "!rtxvideo/build_src/**", "!dvtools/**", "!hptools/**"]
       }
     ],
+    "extraFiles": ["LICENSE", "THIRD_PARTY_NOTICES.md"],
     "win": {
       "target": "dir",
       "icon": "icon.ico"
