@@ -259,6 +259,30 @@ anything else).
 - **Renderer:** uses `require('electron')` with `nodeIntegration`, so it can't run in a plain browser,
   launch via `npm start`, the shortcut, or the vbs.
 
+## Releasing
+
+The zip is ~4.4 GB, which exceeds GitHub's 2 GiB release-asset cap, so binaries live on SourceForge
+and GitHub carries the release page (notes + `.sha256`). The ceremony:
+
+1. Bump `version` in package.json, commit and push.
+2. `npm run dist` → `release/SmoothMyVideo-<v>-win.zip` + `.sha256` (staging folder auto-cleans).
+3. Upload to SourceForge (web UI caps at 500 MB, use SFTP):
+   `scp release/SmoothMyVideo-<v>-win.zip flowreen@frs.sourceforge.net:/home/frs/project/smoothmyvideo/<v>/`
+   then on the Files tab mark the new file as the default Windows download (the ⓘ icon).
+4. Tag `v<v>` on the release commit and push the tag (Sourcetree: right-click → Tag → "Push tag").
+5. Create the GitHub release for the tag: paste the notes, attach the `.sha256`.
+
+The tag is what installed copies compare against (`checkForUpdate` in main.ts), so publishing the
+GitHub release is what lights up the in-app "new version" notice for existing users. **Never re-upload
+different code under an existing version**: the version string is baked into the zip, the checksum
+stops matching, and same-version installs never see the update notice. Fix-ups ship as a patch version.
+
+**Retention policy: keep the latest and one previous zip on SourceForge; delete older ones.** The
+previous build is the rollback/diagnostic escape hatch when a new release misbehaves on some setup;
+anything older is disk hygiene. New users always get the newest build (the README button and
+SourceForge's default download resolve to it), and GitHub release pages (notes + checksums, a few KB)
+are kept forever so the changelog and hashes survive even for pruned binaries.
+
 ## Linting & formatting
 All dev-only, all in `node_modules` (never shipped, `dist` bundles only `dist/`, `renderer/`, and the
 `engine` extraResources, not `node_modules`). Deliberately a **light touch**: the engine Python and the

@@ -1158,7 +1158,16 @@ else:
     _in2 = ["-i", inp]
 enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", ENC_IN_FMT,
            "-s", f"{OUT_W}x{OUT_H}", "-r", rate_str] + _TQ + ["-i", "-"] + _in2 + \
-          ["-map", "0:v:0"] + _maps + ["-c:v", venc, "-vf", vf]
+          ["-map", "0:v:0"] + _maps + ["-c:v", venc, "-vf", vf] + \
+          ["-max_interleave_delta", "0"]
+# -max_interleave_delta 0 forces true packet-by-packet interleave when muxing our video with the
+# source's audio/subs. The default (10 s) lets the muxer write the passthrough tracks in ~10 s
+# bursts, which is invisible at normal bitrates but FATAL at high-fps rates: 10 s of 360 fps video
+# is ~100+ MB of audio-free data, mpv's demuxer queue (~150 MB) overflows hunting for the next
+# audio burst after a seek and declares the audio track EOF (sound dies until a from-zero restart;
+# diagnosed 2026-07-10 on a real 360 fps episode - '[mkv] Too many packets in the demuxer packet
+# queues ... audio/1: 0 packets'). Zero-delta buffering is bounded here because the video pipe is
+# the pacing stream.
 # VVC-in-MP4 muxing is gated behind -strict experimental on some ffmpeg versions; harmless otherwise.
 enc_cmd += qargs + prof + color + (["-strict", "experimental"] if venc == "libvvenc" else []) + [_ENC_TARGET]
 enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
@@ -1251,8 +1260,12 @@ def _finalize_output():
             _dv_export(WORK_PATH)
         return
     _write_hdr10_metadata(_ENC_TARGET)
+    # -max_interleave_delta 0: same interleave fix as enc_cmd (see there) - this remux merges the
+    # video-only temp with the source's tracks, exactly the two-input case that produced the
+    # audio-burst layout mpv chokes on at high fps.
     cmd = [FFMPEG, "-v", "error", "-y", "-i", _ENC_TARGET, "-i", inp,
-           "-map", "0:v:0", "-c:v", "copy"] + _stage2_maps + [WORK_PATH]
+           "-map", "0:v:0", "-c:v", "copy"] + _stage2_maps + \
+          ["-max_interleave_delta", "0", WORK_PATH]
     try:
         subprocess.run(cmd, check=True, creationflags=NO_WINDOW)
         os.remove(_ENC_TARGET)
@@ -1303,7 +1316,8 @@ def _dv_export(mp4_path):
         subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "hevc", "-r", rate_str, "-i", dvhevc,
                         "-i", mp4_path, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-c", "copy",
                         "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
-                        "-color_range", "tv", "-tag:v", "hvc1", tmp_out],
+                        "-color_range", "tv", "-tag:v", "hvc1",
+                        "-max_interleave_delta", "0", tmp_out],   # interleave fix, see enc_cmd
                        check=True, creationflags=NO_WINDOW)
         # 6. stamp the DV configuration box (dvvC) + the HDR10 mastering/CLL fallback boxes ourselves
         hdr10_meta.inject_dv_config(tmp_out, OUT_W, OUT_H, out_label)
@@ -1376,7 +1390,8 @@ def _hp_export(mp4_path):
         subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "hevc", "-r", rate_str, "-i", hphevc,
                         "-i", mp4_path, "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-c", "copy",
                         "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
-                        "-color_range", "tv", "-tag:v", "hvc1", tmp_out],
+                        "-color_range", "tv", "-tag:v", "hvc1",
+                        "-max_interleave_delta", "0", tmp_out],   # interleave fix, see enc_cmd
                        check=True, creationflags=NO_WINDOW)
         hdr10_meta.inject_hdr10(tmp_out, max_nits=HDR_NITS, maxcll=cll, maxfall=fall,
                                 colorspace=HDR_MASTER_PRIM)
@@ -1410,7 +1425,16 @@ def _progress(k, total):
     frac = k / total if total else 0.0
     if frac >= 0.01:
         try:
-            cur = os.path.getsize(_ENC_TARGET)
+            # Not os.path.getsize: on Windows the directory-entry size it reads is updated LAZILY
+            # while another process (the encoder) holds the file open, so it can report ~0 minutes
+            # into a render. Opening our own handle and seeking to the end forces the true current
+            # size. Below 1 MB the projection is still meaningless (header + first flush), skip it.
+            with open(_ENC_TARGET, "rb") as _f:
+                _f.seek(0, 2)
+                cur = _f.tell()
+            if cur < (1 << 20):
+                sys.stderr.flush()
+                return
             proj = int(cur / frac)
             sys.stderr.write(f"SIZE {cur} {proj}\n")
             if not _disk_warned and frac >= 0.05:
