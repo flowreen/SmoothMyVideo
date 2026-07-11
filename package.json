@@ -1,6 +1,6 @@
 {
   "name": "smoothmyvideo",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Desktop GUI for AI video frame interpolation (GMFSS), Python engine under the hood",
   "author": "Florin Nutiu",
   "main": "dist/main.js",
