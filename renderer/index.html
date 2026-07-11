@@ -323,7 +323,7 @@
 
   <div class="row">
     <button id="go" disabled>Smooth It!</button>
-    <button id="cancel" disabled>Cancel</button>
+    <button id="cancel" disabled title="Stops this render and deletes its progress. A cancelled render cannot be resumed - to continue later, use Pause or just close the app instead.">Cancel</button>
     <button id="open" disabled>Open folder</button>
     <button id="play" disabled>Play video</button>
     <span id="status" class="hint">Select a video to begin.</span>
@@ -502,6 +502,36 @@ function refresh(){ if(!input) return;
   lastOut = customOut || outName(); $('out').value = lastOut;
   if(goMode === 'idle') $('out').disabled = false;   // editable while idle; startRun locks it
   updateDvHpHints();   // the DV/HDR10+ "skipped for MKV" hints track the resolved output name
+  scheduleCheckResume();   // the Resume detection tracks the resolved output name too
+}
+// Crash/exit resume detection: an interrupted render leaves its stage-1 video + sidecar next to
+// the output (see the engine's resume block); when the resolved output name has one, #go becomes
+// "Resume" and the render continues where it left off (the engine re-validates the settings
+// signature itself, so a stale match here degrades to a fresh render with a log notice, never a
+// wrong file). Debounced: refresh() fires on every slider scrub.
+let resumeInfo = null, resumeTimer = null, resumeLoggedFor = null, resumeSeq = 0, resumeTipShown = false;
+function scheduleCheckResume(){ clearTimeout(resumeTimer); resumeTimer = setTimeout(checkResume, 150); }
+async function checkResume(){
+  const seq = ++resumeSeq;
+  let r = null;
+  try { if(input && lastOut) r = await ipcRenderer.invoke('check-resume', lastOut); } catch {}
+  if(seq !== resumeSeq) return;          // a newer check superseded this one mid-flight
+  resumeInfo = r;
+  if(goMode !== 'idle') return;          // never touch the button while it is the Pause toggle
+  $('go').textContent = resumeInfo ? 'Resume' : 'Smooth It!';
+  if(resumeInfo){
+    const pct = resumeInfo.total ? Math.round(100*resumeInfo.pair/resumeInfo.total) : 0;
+    $('go').title = 'Continues the interrupted render from where it left off (~'+pct+'% is already done). '
+                  + 'You can pause or close the app again at any time and resume later.';
+    $('status').textContent = 'Interrupted render found: click Resume to continue from ~'+pct+'%.';
+    if(resumeLoggedFor !== lastOut){
+      resumeLoggedFor = lastOut;
+      log('>> Interrupted render found for this file; it will resume from ~'+pct+'% instead of starting over\n');
+    }
+  } else {
+    if(resumeLoggedFor === lastOut) resumeLoggedFor = null;   // gone (e.g. cancelled): a future interruption logs anew
+    $('go').title = 'Starts the render. You can pause or even close the app mid-render - it resumes where it left off.';
+  }
 }
 // Editing the output path inline: a non-empty value becomes the custom output (kept across setting
 // changes, like the Change... dialog); clearing it on blur reverts to the auto-generated name.
@@ -682,12 +712,12 @@ function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.valu
   if(o) o.textContent = 'Match screen' + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
 // NOTE: the element id is outcodec, NOT codec - id "codec" is taken by the source-codec info span.
 // Per-choice guidance so the trade-off is clear without leaving the dropdown. Size claims are
-// from a real A/B at the engine's verified visually-lossless settings (2026-07-03 tuning:
-// HEVC CQ17 2.35 MB / AV1 CQ22 2.04 MB / VVC QP20 0.73 MB on the same interpolated sample).
+// from a real A/B at the engine's verified visually-lossless settings (2026-07-10 quality-first
+// tuning: on the 1080p sample HEVC CQ17-p7-ladder 2.25 MB / AV1 CQ22 2.17 MB / VVC QP17 0.98 MB).
 const CODEC_HINTS = {
   hevc: 'safest choice: TVs, phones, editors and players all take it; audio is copied',
   av1:  'same GPU speed and size class as HEVC (a bit smaller on normal content); royalty-free, plays in every modern browser, but devices from before ~2020 may not decode it',
-  vvc:  'smallest files of the three (down to a third of HEVC), but the CPU encode is slow and almost no player supports H.266 yet (archival)',
+  vvc:  'smallest files of the three (roughly half of HEVC), but the CPU encode is slow and almost no player supports H.266 yet (archival)',
 };
 function syncCodec(){ $('codechint').textContent = CODEC_HINTS[$('outcodec').value] || ''; }
 const savedCodec = localStorage.getItem('codec');
@@ -1183,7 +1213,7 @@ try {
   const pend = JSON.parse(localStorage.getItem('batchPending') || 'null');
   localStorage.removeItem('batchPending');
   if(Array.isArray(pend) && pend.length && pend.every(p => typeof p === 'string')){
-    log('>> Restored ' + pend.length + ' unfinished file(s) from the last session; click Smooth It! to continue\n');
+    log('>> Restored ' + pend.length + ' unfinished file(s) from the last session; an interrupted render resumes where it left off\n');
     queueVideos(pend);
   }
 } catch { /* no saved batch */ }
@@ -1225,6 +1255,11 @@ function startRun(){
   cancelled = false;
   // #go stays enabled and becomes the Pause toggle for the duration of the run (see goMode).
   goMode = 'running'; $('go').textContent = 'Pause';
+  $('go').title = 'Pauses the render. You can also just close the app - the render resumes where it left off next time.';
+  if(!resumeTipShown){
+    resumeTipShown = true;   // once per session; batch auto-advance re-enters startRun per file
+    log('>> Tip: you can Pause, or even close the app mid-render - the render resumes where it left off\n');
+  }
   $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
@@ -1268,11 +1303,13 @@ $('go').onclick = () => {
     // Pause: the engine finishes the frames already queued to the encoder, then holds before the
     // next source pair. Stop the ETA countdown (it would keep ticking down through the idle time).
     goMode = 'paused'; $('go').textContent = 'Resume';
-    $('status').textContent = fileTag() + 'Paused; click Resume to continue.';
+    $('go').title = 'Continues rendering now. Closing the app instead is also fine - the render resumes where it left off next time.';
+    $('status').textContent = fileTag() + 'Paused; click Resume to continue (or close the app and resume another time).';
     clearInterval(etaTimer); etaTimer = null;
     ipcRenderer.send('pause');
   } else { // paused -> resume
     goMode = 'running'; $('go').textContent = 'Pause';
+    $('go').title = 'Pauses the render. You can also just close the app - the render resumes where it left off next time.';
     // Re-anchor the pace clock so the paused span doesn't drag the mean fps (and ETA) down; skip
     // if warmup never finished (procStart still 0; the first-frame handler will anchor instead).
     if(procStart){ procStart = Date.now(); baseK = curDone; }
@@ -1287,7 +1324,13 @@ $('changeout').onclick = async () => {
   const chosen = await ipcRenderer.invoke('pick-output', customOut || outName());
   if(chosen){ customOut = chosen; refresh(); }
 };
-$('cancel').onclick = () => { cancelled = true; $('cancel').disabled = true; $('status').textContent = 'Cancelling...'; ipcRenderer.send('cancel'); };
+$('cancel').onclick = async () => {
+  cancelled = true; $('cancel').disabled = true; $('status').textContent = 'Cancelling...';
+  // invoke resolves only after main killed the engine AND deleted the .part/resume artifacts,
+  // so the probe below sees the truth (engine-done skips its own probe on a cancelled run).
+  try { await ipcRenderer.invoke('cancel'); } catch {}
+  scheduleCheckResume();
+};
 
 ipcRenderer.on('engine-out', (_e, t) => {
   // The engine emits its EXACT output frame count as OUTFRAMES at the end; it's authoritative over the
@@ -1351,7 +1394,7 @@ ipcRenderer.on('update-available', (_e, u) => {
 ipcRenderer.on('engine-done', (_e, code) => {
   // Reset the Pause/Resume toggle back to a fresh "Smooth It!" first, so every exit path
   // (done / cancelled / failed) restores it and the batch auto-advance below re-enters startRun.
-  goMode = 'idle'; $('go').textContent = 'Smooth It!';
+  goMode = 'idle'; $('go').textContent = 'Smooth It!'; $('go').title = '';   // checkResume below re-fills the tooltip
   clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
   clearInterval(liveTimer); liveTimer = null; updateLive();   // final pull: the last written frame
   $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; $('interp').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
@@ -1368,6 +1411,10 @@ ipcRenderer.on('engine-done', (_e, code) => {
     if(batch.length){ log('>> Continuing with the next queued file\n'); advanceBatch(); }
     else if(batchTotal > 1) finishBatch();
     else saveBatch(null); }
+  // A finished/failed run changes resumability; re-label #go. Cancelled runs are probed by the
+  // Cancel click handler instead, after main's artifact cleanup resolves (probing here would
+  // still see the resume files and wrongly announce "Interrupted render found").
+  if(!cancelled) scheduleCheckResume();
 });
 // Batch auto-advance: load the next queued file and start it with the same settings. batchAuto
 // suppresses the modal probe alert and the preview refresh while the queue advances unattended;

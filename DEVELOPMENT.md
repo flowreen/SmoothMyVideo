@@ -12,37 +12,37 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
 
 ## Architecture
 
-- **`src/main.ts`**, Electron main: window, open/save dialogs, ffprobe (`-of json`), spawns the engine,
+* **`src/main.ts`**, Electron main: window, open/save dialogs, ffprobe (`-of json`), spawns the engine,
   streams progress, tracks the child so **Cancel** can `taskkill /T /F` it. IPC for the monitor refresh
   rate (match-screen), screen size, and the single-frame preview. Resolves the interpreter as
   `engine/runtime/python.exe` and ffprobe as `engine/bin/ffprobe.exe` (both fall back to PATH); sets
   `PYTHONUTF8` and a writable `SMV_TRT_CACHE`.
-- **`renderer/index.html`**, the UI: select/drag a video, a target-fps control, an **FSR** sharpen
+* **`renderer/index.html`**, the UI: select/drag a video, a target-fps control, an **FSR** sharpen
   toggle, **Restore**, **Upscale**, a **Codec** selector, an opt-in **NVIDIA RTX** panel (VSR + HDR), a
   **Dolby Vision** panel and an **HDR10+** panel (each a one-tool install), output path, progress + ETA,
   a batch queue (crash-resumable, keeps going past failed files), a live thumbnail, a before/after
   preview pane, and a launch-time new-release notice. Electron
   `require` with `nodeIntegration`; most settings persist in `localStorage` (Restore and RTX Dynamic
   Vibrance deliberately don't, per-session opt-ins).
-- **`engine/gmfss_interp.py`**, the GMFSS pipe engine: ffmpeg decode → GMFSS → ffmpeg encode. TensorRT
+* **`engine/gmfss_interp.py`**, the GMFSS pipe engine: ffmpeg decode → GMFSS → ffmpeg encode. TensorRT
   backend by default (per-subnet eager fallback; `--no-trt`), NVENC with a CPU SVT-AV1 fallback, always
   fp16, always visually lossless, 10-bit by default. Prints `PROGRESS k/total` to stderr.
-- **`engine/trt_runtime.py`**, optional TensorRT backend. Swaps the five GMFSS sub-nets for strongly-typed
+* **`engine/trt_runtime.py`**, optional TensorRT backend. Swaps the five GMFSS sub-nets for strongly-typed
   fp16 engines; softsplat + the interpolate glue stay eager. Engines are cached per
   `(net, shapes, gpu, trt version, weights hash)`; the weights-hash in each filename makes the cache
   self-invalidating on a weight swap (stale engines deleted at next start).
-- **`engine/rtxvideo.py`** + **`engine/rtxvideo/`**, the RTX Video bridge (VSR + TrueHDR) over a small
+* **`engine/rtxvideo.py`** + **`engine/rtxvideo/`**, the RTX Video bridge (VSR + TrueHDR) over a small
   compiled CUDA DLL (`rtxvideo_cuda.dll`, sources in `build_src/`). The non-redistributable NGX feature
   DLLs are user-installed via the in-app NVIDIA RTX panel; the whole folder is gitignored / excluded from
   the zip, so RTX stays a local feature.
-- **`engine/realesr.py`**, the `--restore` Real-ESRGAN detail pass (vendored SRVGGNetCompact, BSD-3).
-- **`engine/hdr10_meta.py`**, pure-stdlib ISOBMFF injector for HDR10 static metadata (`mdcv`/`clli`) and
+* **`engine/realesr.py`**, the `--restore` Real-ESRGAN detail pass (vendored SRVGGNetCompact, BSD-3).
+* **`engine/hdr10_meta.py`**, pure-stdlib ISOBMFF injector for HDR10 static metadata (`mdcv`/`clli`) and
   the Dolby Vision configuration box (`dvvC`, via `inject_dv_config`); shared box-insertion surgery.
-- **`engine/preview.py`**, single-frame before/after preview (same passes, same order as a render).
-- **`engine/runtime/`**, bundled relocatable Python 3.14 (python-build-standalone) with the CUDA 13 GPU
+* **`engine/preview.py`**, single-frame before/after preview (same passes, same order as a render).
+* **`engine/runtime/`**, bundled relocatable Python 3.14 (python-build-standalone) with the CUDA 13 GPU
   stack. Gitignored (see Setup).
-- **`engine/bin/`**, bundled shared-build `ffmpeg.exe` + `ffprobe.exe` and their DLLs. Fetched, not committed.
-- **`engine/GMFSS_Fortuna/`** (model + `train_log/` weights) and **`engine/realesr-animevideov3.pth`**,
+* **`engine/bin/`**, bundled shared-build `ffmpeg.exe` + `ffprobe.exe` and their DLLs. Fetched, not committed.
+* **`engine/GMFSS_Fortuna/`** (model + `train_log/` weights) and **`engine/realesr-animevideov3.pth`**,
   committed to the repo.
 
 ## Setup (fresh clone)
@@ -60,9 +60,9 @@ present; the app falls back to PATH ffmpeg otherwise, or the GUI "Choose .zip" b
 binary didn't download: `node node_modules/electron/install.js`.
 
 **2. Python runtime → `engine/runtime`** (the only gitignored piece)
-- *Easy:* copy `resources/engine/runtime` out of any packaged build (extract a release zip), it's the
+* *Easy:* copy `resources/engine/runtime` out of any packaged build (extract a release zip), it's the
   ready-to-run interpreter, nothing else to do.
-- *From scratch:* unpack a
+* *From scratch:* unpack a
   [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases) CPython 3.14
   `install_only` win64 build to `engine/runtime`, then:
 ```
@@ -75,23 +75,23 @@ onnx/onnxscript. A `python -m venv` is **not** usable, a Windows venv isn't relo
 portable bundle.
 
 ### Refreshing bundled binaries
-- **ffmpeg:** delete `engine/bin` and re-run `node scripts/fetch-ffmpeg.js`. To pin an exact build, drop a
+* **ffmpeg:** delete `engine/bin` and re-run `node scripts/fetch-ffmpeg.js`. To pin an exact build, drop a
   matched `ffmpeg.exe` + `ffprobe.exe` + `*.dll` set in by hand, never mix DLLs across builds (the exe
   links specific SONAME majors like `avcodec-63`).
-- **Weights:** the GMFSS `train_log` pkls (from the GMFSS_Fortuna release) and `realesr-animevideov3.pth`
+* **Weights:** the GMFSS `train_log` pkls (from the GMFSS_Fortuna release) and `realesr-animevideov3.pth`
   (Real-ESRGAN v0.2.5.0). Both committed; this is only for updating them.
 
 ## Scripts
-- `npm start`, build (`tsc`) and launch.
-- `npm run dist`, the build command: wipes `release/`, compiles with `tsc`, runs electron-builder, and
+* `npm start`, build (`tsc`) and launch.
+* `npm run dist`, the build command: wipes `release/`, compiles with `tsc`, runs electron-builder, and
   zips the result into `release/SmoothMyVideo-<version>-win.zip` (~4 GB with TensorRT bundled). The
   multi-GB staging folder is deleted once the zip passes a size sanity check, so the zip is the only
   artifact left; to inspect the unpacked app, extract the zip. Recipients extract and run
   `SmoothMyVideo.exe`; nothing required on the target but the NVIDIA driver. (A zip, not an NSIS
   installer, `makensis` can't memory-map an archive this large.)
-- `npm run lint`, one command that does everything: Prettier formats `src/**/*.ts` (writes), then ESLint
+* `npm run lint`, one command that does everything: Prettier formats `src/**/*.ts` (writes), then ESLint
   lints `src`, then pyright lints `engine`. Stops at the first failure. See below.
-- `engine\runtime\python.exe scripts\smoke.py [--full] [--trt]`, the render smoke tests: real engine runs
+* `engine\runtime\python.exe scripts\smoke.py [--full] [--trt]`, the render smoke tests: real engine runs
   on `samples/test.mp4` asserting frame counts, VFR duration preservation, `.part` promotion and (with
   `--full`, when their runtimes are installed) the HDR10 boxes, DV configuration record and HDR10+ SEI.
   Run it after every engine change; eager renders are not bit-deterministic, so the checks are
@@ -101,29 +101,29 @@ portable bundle.
 ```
 engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
-- `<multi>` integer multiplier, or `--fps TARGET` to resample to any output fps (the model interpolates at
+* `<multi>` integer multiplier, or `--fps TARGET` to resample to any output fps (the model interpolates at
   arbitrary fractional timesteps; `<multi>` is required positionally but ignored when `--fps` is given).
-- `--scale F` optical-flow resolution factor (GMFlow already runs at half the source; this scales it
+* `--scale F` optical-flow resolution factor (GMFlow already runs at half the source; this scales it
   further). **Auto by default**: 1.0 below 4K, 0.5 for 4K+ sources. GMFlow's global attention grows
   super-linearly with area and dominates the interpolation wall, so quarter-resolution flow at UHD
   (still 1080p-class motion detail) makes a 4K render cost barely more than a 1080p one; verified
   equal-or-slightly-better against ground truth (dropped-frame reconstruction: mean tween PSNR 28.3 vs
   27.9 dB, same worst frame). Pass an explicit value to override.
-- `--sharpen S` (0..1) FSR-style RCAS on every output frame (bare `--sharpen` = 0.8; off unless given).
-- `--no-interp` re-encodes at source fps with sharpen only (no model/TRT loaded).
-- `--restore` runs the Real-ESRGAN detail pass per output frame, before the upscale (works with `--no-interp`).
-- `--upscale F` spatial upscale just before encode (bare = 1.5, clamp 16.0; above 8192 px auto-switches to
+* `--sharpen S` (0..1) FSR-style RCAS on every output frame (bare `--sharpen` = 0.8; off unless given).
+* `--no-interp` re-encodes at source fps with sharpen only (no model/TRT loaded).
+* `--restore` runs the Real-ESRGAN detail pass per output frame, before the upscale (works with `--no-interp`).
+* `--upscale F` spatial upscale just before encode (bare = 1.5, clamp 16.0; above 8192 px auto-switches to
   a CPU AV1/VVC encoder). `--rtx-vsr` uses RTX Video Super Resolution, else bicubic.
-- `--rtx-hdr` SDR→HDR10 (BT.2020 PQ) via TrueHDR; `--hdr-nits` mastering peak (400..2000, default 1000);
+* `--rtx-hdr` SDR→HDR10 (BT.2020 PQ) via TrueHDR; `--hdr-nits` mastering peak (400..2000, default 1000);
   `--hdr-color` {`vivid` (default: source hue+chroma), `rtx` (SDK saturation, hue-corrected), `raw` (debug)};
   `--hdr-mastering-prim` sets the `mdcv` gamut by name.
-- `--dv` additionally exports a **Dolby Vision Profile 8.1** MP4 (needs `--rtx-hdr`, HEVC, MP4 out, and
+* `--dv` additionally exports a **Dolby Vision Profile 8.1** MP4 (needs `--rtx-hdr`, HEVC, MP4 out, and
   user-installed `dovi_tool` in `engine/dvtools`). See the Dolby Vision section below; GPAC-free.
-- `--hdr10plus` additionally embeds **HDR10+** (SMPTE ST 2094-40) dynamic metadata (needs `--rtx-hdr`,
+* `--hdr10plus` additionally embeds **HDR10+** (SMPTE ST 2094-40) dynamic metadata (needs `--rtx-hdr`,
   HEVC, MP4 out, and user-installed `hdr10plus_tool` in `engine/hptools`); combinable with `--dv`. See
   the HDR10+ section below.
-- `--out-bits` {`10` default, `8` legacy}; `--codec` {`hevc` default, `av1`, `vvc`}; `--no-passthrough` first-audio-only.
-- Per-frame order: (restore →) upscale → RCAS sharpen → TrueHDR.
+* `--out-bits` {`10` default, `8` legacy}; `--codec` {`hevc` default, `av1`, `vvc`}; `--no-passthrough` first-audio-only.
+* Per-frame order: (restore →) upscale → RCAS sharpen → TrueHDR.
 
 ## How it works (key behaviour)
 
@@ -143,15 +143,22 @@ primaries/range) is carried through with `setparams`. Every audio, subtitle, cha
 copied (output auto-switches to `.mkv` when the tracks need it); HDR-into-MKV keeps the full HDR10 metadata
 via a two-stage finalize.
 
-**Encode quality.** NVENC constant-quality VBR (AQ + a small chroma-QP boost), tuned and verified against a
-lossless 8K master: HEVC **CQ 17** (VMAF 99.78 / 57.0 dB / SSIM 0.9986), AV1 **CQ 22**, VVC **QP 20**, all
-past the visually-lossless bar on mean and worst frame. vvenc's perceptual QP adaptation is switched off
-above 120 fps output (it inverts on wall-to-wall tween streams and bloats the file). NVENC gets the mirror
-treatment, **high-fps CQ relief**: above 120 fps output the CQ rises by 3 (HEVC 17→20, AV1 22→25), because
-frames showing for ≤8 ms in tween-dense streams over-spend at the 24fps-tuned CQ (a 360fps 1440p episode
-measured ~77 Mbps without it). Measured on real anime with deterministic frames (a pure encoder A/B):
-HEVC −16% size at 55.2 dB avg / SSIM 0.9985 vs the base-CQ encode, AV1 −35% at 56.1 dB avg / worst 45.0 dB.
-The `SMV_CQ` env var overrides any CQ for measurement work.
+**Encode quality.** Quality-first: professional-grade fidelity regardless of size, one standard at every
+frame rate (2026-07-10; the earlier high-fps CQ relief was removed under this policy). NVENC runs
+constant-quality VBR at max effort: **preset p7 + full-resolution multipass + rc-lookahead 1** (AQ + a
+small chroma-QP boost), with CQ values verified against a lossless 8K master: HEVC **CQ 17** (VMAF 99.78 /
+57.0 dB / SSIM 0.9986), AV1 **CQ 22**. The effort ladder is what moves quality now, CQ is saturated at max
+effort (HEVC CQ 14 to 21 encode byte-identically): measured on the 1080p sample, the ladder lifts HEVC from
+50.8 to 53.5 dB (worst frame 49.3→52.3) and AV1 from 51.2 to 53.1 dB at modest size cost. The gain needs
+multipass and lookahead *together* (either alone measures ≈0), and shallow beats deep: depths 1/2/4 encode
+byte-identically and measure ~1 dB *better* than 8 to 32 (deep queues enable B-frame restructuring that
+trades fidelity for size, the wrong trade here) while using a single lookahead slot of VRAM. Above 120 fps
+output the queue is dropped entirely (on tween-dense streams any lookahead measured −1 dB, so high-fps
+renders get better fidelity and zero lookahead VRAM at once). `tune uhq` was evaluated and rejected: its
+temporal filtering rewrites frame content.
+VVC runs **QP 17** with perceptual QP adaptation always off (QPA trades fidelity in "unnoticed" regions for
+size, and inverts outright on 120+ fps tween streams); the SVT-AV1 fallback runs **CRF 17 preset 6**. The
+`SMV_CQ` env var overrides any CQ for measurement work.
 
 **Size projection + disk check.** During a render the engine emits `SIZE cur projected` beside each
 PROGRESS heartbeat (bytes written so far, linearly extrapolated), so the GUI shows the expected final size
@@ -220,11 +227,11 @@ regions, and applies one scalar per pixel to all channels (so it can't decorrela
 byte-identical output file, run after run, on both the TensorRT and eager paths (verified by md5;
 `scripts/smoke.py --full` asserts it). Two changes made this true (2026-07-09): softsplat's forward
 splat accumulates in **int64 fixed point** (integer addition is associative, so thread scheduling
-can't reorder a float sum - this was the single nondeterministic stage, isolated by a per-stage
+can't reorder a float sum; this was the single nondeterministic stage, isolated by a per-stage
 bit-exactness probe), and `cudnn.benchmark` is off with deterministic algorithm selection (benchmark
 mode could pick different conv algorithms per process). Output differs from the old float-atomics
 kernel by ~1e-4 max (82 dB, the old kernel's own run-to-run jitter level). Cost: the int64
-accumulator doubles the splat's memory traffic - invisible at 2x, roughly +15% inference time at
+accumulator doubles the splat's memory traffic: invisible at 2x, roughly +15% inference time at
 very high multipliers. The RTX passes (VSR/TrueHDR) are NVIDIA NGX black boxes with no determinism
 contract, so HDR/VSR renders are outside the byte-identical guarantee.
 
@@ -250,13 +257,13 @@ default (a laptop Silent profile can cost 2-3x wall time; the pipeline is power-
 anything else).
 
 ## Constraints
-- **CUDA 13 (Blackwell, sm_120):** torch is the cu130 build; cupy-cuda13x finds the runtime via
+* **CUDA 13 (Blackwell, sm_120):** torch is the cu130 build; cupy-cuda13x finds the runtime via
   `cuda-pathfinder`, so the old `_add_cuda_dll_dirs` nvrtc shim is no longer load-bearing.
-- **RTX bridge:** keep the **cu12**-built `rtxvideo_cuda.dll` and ship `cudart64_12.dll` beside it, NGX's
+* **RTX bridge:** keep the **cu12**-built `rtxvideo_cuda.dll` and ship `cudart64_12.dll` beside it, NGX's
   static import lib is CUDA-12-ABI, so a bridge relinked against CUDA 13 crashes in `create()`
   (see `engine/rtxvideo/build_src/BUILD.md`).
-- **Runtime:** keep `engine/runtime` a relocatable python-build-standalone install, never a `venv`.
-- **Renderer:** uses `require('electron')` with `nodeIntegration`, so it can't run in a plain browser,
+* **Runtime:** keep `engine/runtime` a relocatable python-build-standalone install, never a `venv`.
+* **Renderer:** uses `require('electron')` with `nodeIntegration`, so it can't run in a plain browser,
   launch via `npm start`, the shortcut, or the vbs.
 
 ## Releasing
@@ -288,12 +295,12 @@ All dev-only, all in `node_modules` (never shipped, `dist` bundles only `dist/`,
 `engine` extraResources, not `node_modules`). Deliberately a **light touch**: the engine Python and the
 renderer's inline JS are intentionally dense (long lines, `x; y` one-liners, load-bearing comments), so
 nothing reflows them, only `src/*.ts` is auto-formatted.
-- **Prettier** (`.prettierrc.json`) formats `src/**/*.ts` only. `.prettierignore` guards `engine/`,
+* **Prettier** (`.prettierrc.json`) formats `src/**/*.ts` only. `.prettierignore` guards `engine/`,
   `renderer/`, and build dirs so a stray `prettier .` can't reflow the hand-tuned files. Config matches the
   existing style (single quotes, semicolons, 2-space, printWidth 120).
-- **ESLint** (`eslint.config.js`, flat config, `typescript-eslint` recommended) lints `src/**/*.ts` for real
+* **ESLint** (`eslint.config.js`, flat config, `typescript-eslint` recommended) lints `src/**/*.ts` for real
   bugs, scoped to `src`, engine/renderer excluded. CommonJS config on purpose (no `"type":"module"`).
-- **pyright** (`pyrightconfig.json`) lints `engine/*.py` as a **linter, not a type checker**:
+* **pyright** (`pyrightconfig.json`) lints `engine/*.py` as a **linter, not a type checker**:
   `typeCheckingMode: "off"` so the dynamic torch/numpy/cupy code isn't buried in type noise, only
   high-signal checks stay on (undefined names → error, unused imports/vars → warning). Vendored
   `runtime/`, `GMFSS_Fortuna/`, `trt_cache/`, and the RTX bridge are excluded from checking (`extraPaths`

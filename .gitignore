@@ -11,7 +11,7 @@ npm-debug.log*
 .vscode/
 
 # engine: generated, fetched, and non-redistributable files kept out of git (caches, the Python runtime, ffmpeg, NVIDIA DLLs)
-engine/**/__pycache__/
+__pycache__/
 engine/bin/
 engine/rtxvideo/nvngx_truehdr.dll
 engine/rtxvideo/nvngx_vsr.dll

@@ -49,48 +49,48 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 
 ## Why choose it
 
-- 🎞️ **Smooth *and* sharp.** Your real frames pass through at full quality with AI-generated frames woven
+* 🎞️ **Smooth *and* sharp.** Your real frames pass through at full quality with AI-generated frames woven
   in between, you get the higher frame rate without softening or reprocessing the original footage.
-- 🧊 **10-bit output by default.** Float-precision interpolated frames are written at 10-bit, so smooth
+* 🧊 **10-bit output by default.** Float-precision interpolated frames are written at 10-bit, so smooth
   gradients (skies, glows) never band into visible steps.
-- 🎨 **Production-grade HDR10.** Real SDR→HDR10 conversion with proper mastering metadata
+* 🎨 **Production-grade HDR10.** Real SDR→HDR10 conversion with proper mastering metadata
   (mastering-display + measured MaxCLL/MaxFALL) and faithful, cyan-free colour, not just a PQ tag.
-- 🌈 **Dolby Vision Profile 8.1 export (experimental).** Optionally add Profile 8.1 dynamic-HDR metadata on
+* 🌈 **Dolby Vision Profile 8.1 export (experimental).** Optionally add Profile 8.1 dynamic-HDR metadata on
   top of the HDR10 render, HDR10-compatible, so non-DV players fall back to HDR10. Uses the
   separately-installed open-source [dovi_tool](https://github.com/quietvoid/dovi_tool); no Dolby software
   is bundled.
-- ➕ **HDR10+ export (experimental).** Optionally embed HDR10+ (SMPTE ST 2094-40) dynamic-HDR metadata,
+* ➕ **HDR10+ export (experimental).** Optionally embed HDR10+ (SMPTE ST 2094-40) dynamic-HDR metadata,
   measured per frame from the actual render, also HDR10-compatible, and combinable with Dolby Vision.
   Uses the separately-installed open-source
   [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool).
-- 🔍 **AI upscaling to 16K + detail restoration.** NVIDIA RTX Video Super Resolution plus a Real-ESRGAN
+* 🔍 **AI upscaling to 16K + detail restoration.** NVIDIA RTX Video Super Resolution plus a Real-ESRGAN
   restore pass, layered with the interpolation in a single render.
-- 💬 **Keeps every track.** All audio, subtitles/translations, chapters and font attachments are preserved
+* 💬 **Keeps every track.** All audio, subtitles/translations, chapters and font attachments are preserved
   (auto-switches to `.mkv` when needed), nothing silently dropped.
-- 🗜️ **Visually lossless, small files.** HEVC / AV1 / H.266 encodes tuned against a lossless 8K master
-  (VMAF ~99.8, SSIM ≥ 0.995), no fiddly quality knob to guess at.
-- 📦 **100% offline & self-contained.** Extract the zip and run, no Python, no pip, no ffmpeg to install,
+* 🗜️ **Visually lossless.** HEVC / AV1 / H.266 encodes at maximum encoder effort, tuned and verified
+  against a lossless 8K master (VMAF ~99.8, SSIM ≥ 0.995), no fiddly quality knob to guess at.
+* 📦 **100% offline & self-contained.** Extract the zip and run, no Python, no pip, no ffmpeg to install,
   no account, no cloud upload. Only the NVIDIA driver is assumed. Free.
-- ⚡ **Fast.** fp16 with a TensorRT backend, built and cached per resolution; 4K sources interpolate at
+* ⚡ **Fast.** fp16 with a TensorRT backend, built and cached per resolution; 4K sources interpolate at
   nearly 1080p cost (motion is estimated at a resolution-appropriate scale, automatically). The app also
   tells you when a laptop "Silent" power profile is throttling the GPU.
-- 🧺 **Set-and-forget batches.** Queue many files; a file that fails is noted and the rest keep rendering,
+* 🧺 **Set-and-forget batches.** Queue many files; a file that fails is noted and the rest keep rendering,
   and a batch interrupted by a crash or restart is re-queued on the next launch.
-- 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
+* 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
   detected and timed correctly, so audio never drifts out of sync.
-- 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
-- 🎚️ **Plus the essentials:** FSR-style sharpening, a live before/after preview, every setting remembered
+* 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
+* 🎚️ **Plus the essentials:** FSR-style sharpening, a live before/after preview, every setting remembered
   between runs, and a quiet one-line notice when a newer release is out (nothing auto-downloads).
 
 ## Get started
 
-- **Download & run:** grab the latest
+* **Download & run:** grab the latest
   [`SmoothMyVideo-<version>-win.zip`](https://sourceforge.net/projects/smoothmyvideo/files/latest/download),
   extract it anywhere, and run **`SmoothMyVideo.exe`** (or the Desktop / Start-menu shortcut). No
   install, no dependencies, just a current NVIDIA driver. A sample clip ships in `samples/test.mp4`.
   Release notes and checksums live on the
   [GitHub releases page](https://github.com/flowreen/SmoothMyVideo/releases).
-- **From source:** `npm start`. See **[DEVELOPMENT.md](DEVELOPMENT.md)** for the full setup.
+* **From source:** `npm start`. See **[DEVELOPMENT.md](DEVELOPMENT.md)** for the full setup.
 
 ## Under the hood
 

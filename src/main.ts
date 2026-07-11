@@ -783,28 +783,63 @@ ipcMain.on(
   },
 );
 
-ipcMain.on('cancel', () => {
+// Awaited by the renderer: it re-probes resumability only after this resolves, so the
+// "Interrupted render found" hint can never race the cleanup below and flash on a cancel.
+ipcMain.handle('cancel', async () => {
   const c = current;
   const out = currentOut;
-  if (c && c.pid) {
-    execFile('taskkill', ['/pid', String(c.pid), '/T', '/F'], () => {
-      // The engine renders into "<base>.part<ext>" and promotes it to the real name only at
-      // success, so a cancelled run leaves a dead .part remnant (plus the HDR-into-MKV stage
-      // temp). Delete them once the killed processes release their handles; best effort - a
-      // still-locked file just stays until the next run overwrites it.
-      if (!out) return;
-      const ext = path.extname(out);
-      const part = out.slice(0, out.length - ext.length) + '.part' + ext;
-      setTimeout(() => {
-        for (const p of [part, part + '.video.tmp.mp4']) {
-          try {
-            fs.unlinkSync(p);
-          } catch {
-            /* not there or still locked */
-          }
-        }
-      }, 1500);
+  if (!c || !c.pid) return;
+  await new Promise<void>((res) => execFile('taskkill', ['/pid', String(c.pid), '/T', '/F'], () => res()));
+  // The engine renders into "<base>.part<ext>" and promotes it to the real name only at
+  // success, so a cancelled run leaves a dead .part remnant (plus the stage temps and the
+  // crash-resume artifacts - an explicit Cancel means the user is abandoning the render, so
+  // its resume assets go too; use Pause or just close the app to keep a render resumable).
+  // The killed processes release their handles asynchronously: retry for ~3s, then give up
+  // (a still-locked file just stays until the next run overwrites it).
+  if (!out) return;
+  const ext = path.extname(out);
+  const part = out.slice(0, out.length - ext.length) + '.part' + ext;
+  let remaining = [
+    '',
+    '.video.tmp.mp4',
+    '.video.mp4',
+    '.video2.mp4',
+    '.videofull.mp4',
+    '.salv.mp4',
+    '.salv2.mp4',
+    '.trim.mp4',
+    '.resume.json',
+    '.resume.json.tmp',
+    '.concat.txt',
+  ].map((s) => part + s);
+  for (let attempt = 0; attempt < 10 && remaining.length; attempt++) {
+    await new Promise((r) => setTimeout(r, 300));
+    remaining = remaining.filter((p) => {
+      try {
+        fs.unlinkSync(p);
+        return false;
+      } catch (e) {
+        return (e as NodeJS.ErrnoException).code !== 'ENOENT'; // locked: keep retrying
+      }
     });
+  }
+});
+
+// Crash/exit resume probe: given the intended FINAL output path, report whether a resumable
+// partial render sits next to it (the engine's stage-1 video + .resume.json sidecar; see the
+// resume block in gmfss_interp.py). The renderer uses this to flip Smooth It! to Resume and to
+// tell the user where the render will pick up. The engine itself re-validates the settings
+// signature, so a stale positive here just means the button said Resume and the run starts
+// fresh with a log notice - never a wrong render.
+ipcMain.handle('check-resume', (_e, out: string) => {
+  try {
+    const ext = path.extname(out);
+    const part = out.slice(0, out.length - ext.length) + '.part' + ext;
+    if (!fs.existsSync(part + '.video.mp4') && !fs.existsSync(part + '.video2.mp4')) return null;
+    const meta = JSON.parse(fs.readFileSync(part + '.resume.json', 'utf8'));
+    return { pair: Number(meta.pair) || 0, total: Number(meta.total) || 0 };
+  } catch {
+    return null; // no sidecar (or unreadable): not resumable
   }
 });
 

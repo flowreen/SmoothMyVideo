@@ -380,6 +380,89 @@ OUT_IS_MKV = out_path.lower().endswith(".mkv")
 _ob, _oe = os.path.splitext(out_path)
 WORK_PATH = _ob + ".part" + _oe
 
+# --- crash/exit resume ------------------------------------------------------------------------
+# Resumable renders (hevc/av1 families) encode the video ALONE into a FRAGMENTED-MP4 stage-1
+# file: unlike a plain mp4 (whose moov index is only written at the end, so a killed encoder
+# leaves an unreadable file), an fmp4 stays readable up to the last complete moof/mdat fragment,
+# and frag_keyframe puts those boundaries exactly on encoder keyframes. (Matroska would also
+# survive truncation but quantises timestamps to 1 ms, which jitters high-fps timing; fmp4
+# keeps the exact stream timescale.) A tiny sidecar json carries the settings signature (plus
+# the HDR light-level maxima, which live in engine state and would otherwise be lost). On the
+# next run with the SAME source and settings the engine salvages the partial video, trims it
+# back to the last encoder keyframe (a clean closed-GOP stream-copy cut), maps that
+# output-frame index back onto the source pair/slot grid (closed form in all three loop
+# modes), and continues from there; _finalize_output concatenates the banked prefix with the
+# continuation stream before the usual track remux. All codecs are resumable; vvc additionally
+# stays fragmented through every mp4 step (see FRAG_COPY below). The legacy direct-encode
+# paths survive only behind the SMV_NO_RESUME env opt-out.
+VID_PART = WORK_PATH + ".video.mp4"       # stage-1 video-only stream (the banked prefix on resume)
+VID_PART2 = WORK_PATH + ".video2.mp4"     # continuation stream written by a resumed run
+VID_FULL = WORK_PATH + ".videofull.mp4"   # concat of the two, made at finalize
+RESUME_JSON = WORK_PATH + ".resume.json"  # settings signature + HDR maxima sidecar
+RESUMABLE = not os.environ.get("SMV_NO_RESUME")
+FRAG_FLAGS = ["-movflags", "+frag_keyframe+empty_moov+default_base_moof"]
+# VVC must stay FRAGMENTED through every mp4 it touches: this ffmpeg's REGULAR-mp4 muxer mangles
+# vvc composition offsets on stream copy (a plain `-c copy` remux of a clean 96-frame vvc file
+# left only 73 decodable frames with negative/disordered pts; measured 2026-07-10), while
+# frag->frag and ->mkv copies roundtrip losslessly (the moof/trun offset path is correct, only
+# the ctts path is broken). So for vvc, every intermediate copy AND a final .mp4 target are
+# written fragmented (fmp4 = the CMAF/DASH layout; fine in modern players, and vvc playback is
+# specialist territory anyway). The HDR10 box injector was verified on fragmented mp4 too
+# (default_base_moof keeps moof/mdat offsets self-relative, so growing the init moov is safe).
+FRAG_COPY = args.codec == "vvc"
+RESUME_ACTIVE = False       # this run continues a previous partial render
+RESUME_OUT_BASE = 0         # output frames already banked in VID_PART
+RESUME_SKIP_SRC = 0         # source frames the decoder must skip
+RESUME_PAIR_SKIP = 0        # already-banked output slots of the first resumed pair
+RESUME_BASE_BYTES = 0       # size of the banked prefix, for the SIZE projection
+
+
+def _resume_sig():
+    """Settings signature guarding resume: every CLI arg plus the source file identity (and the
+    hidden SMV_CQ knob, which changes the bitstream). Any mismatch means the partial video was
+    rendered with different settings and must be discarded, not continued."""
+    import hashlib
+    d = dict(vars(args))
+    # Normalize the path args: the same file passed with different slash styles or casing (GUI vs
+    # shell) must not read as different settings.
+    d["input"] = os.path.normcase(os.path.abspath(args.input))
+    d["output"] = os.path.normcase(os.path.abspath(args.output)) if args.output else None
+    d["__src"] = [d["input"], os.path.getsize(inp), int(os.path.getmtime(inp))]
+    d["__cq"] = os.environ.get("SMV_CQ") or ""
+    return hashlib.sha1(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()
+
+
+RESUME_SIG = _resume_sig()
+
+
+def _resume_cleanup():
+    """Drop every resume artifact (stale settings, unusable salvage, or normal end-of-run)."""
+    for _p in (VID_PART, VID_PART2, VID_FULL, RESUME_JSON, WORK_PATH + ".concat.txt",
+               WORK_PATH + ".salv.mp4", WORK_PATH + ".salv2.mp4", WORK_PATH + ".trim.mp4"):
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
+
+
+def _write_resume_sidecar(pair, total):
+    """Refresh the resume sidecar: the settings signature (validated on the next run), the
+    chosen encoder (a continuation stream MUST come from the same encoder or the concat would
+    mix incompatible bitstreams), the pair counter (the GUI's "will resume from" hint), and the
+    HDR light-level running maxima (engine state that would die with the process). Atomic
+    replace so a kill mid-write can't leave a torn json."""
+    _rtx = globals().get("_RTX")
+    try:
+        _tmp = RESUME_JSON + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            json.dump({"sig": RESUME_SIG, "pair": pair, "total": total,
+                       "venc": globals().get("venc", ""),
+                       "maxcll": float(getattr(_rtx, "maxcll", 0) or 0),
+                       "maxfall": float(getattr(_rtx, "maxfall", 0) or 0)}, _f)
+        os.replace(_tmp, RESUME_JSON)
+    except OSError:
+        pass
+
 # Decode bit depth follows the source: 8 bit clips decode as rgb24 byte for byte; 10 bit and
 # up are carried as 16 bit rgb (rgb48le) so the model (fp16, which holds 10 bit precision)
 # never truncates them to 8 bit. The OUTPUT side is decoupled and defaults to 10 bit whatever
@@ -856,8 +939,268 @@ def read_exact(stream, nbytes):
         off += n
     return buf
 
+def _ff_copy(src, dst, extra=None):
+    """Error-tolerant video-only stream copy; returns True on success. Writes fragmented mp4
+    for vvc (see FRAG_COPY: the regular-mp4 copy path corrupts vvc)."""
+    frag = FRAG_FLAGS if (FRAG_COPY and dst.lower().endswith(".mp4")) else []
+    cmd = [FFMPEG, "-v", "error", "-y", "-err_detect", "ignore_err", "-i", src,
+           "-map", "0:v:0", "-c", "copy"] + (extra or []) + frag + [dst]
+    return subprocess.run(cmd, creationflags=NO_WINDOW,
+                          stderr=subprocess.DEVNULL).returncode == 0 and os.path.exists(dst)
+
+
+def _ff_packets(path):
+    """(pts list in FILE/decode order, keyframe packet indices, stream time_base as a float)
+    of the sole video stream."""
+    out = subprocess.check_output(
+        [FFPROBE, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "packet=pts,flags", "-show_entries", "stream=time_base",
+         "-of", "csv=p=0", path],
+        text=True, creationflags=NO_WINDOW)
+    pts, keys, tb = [], [], 0.0
+    for ln in out.splitlines():
+        f = ln.strip().split(",")
+        if not f or not f[0]:
+            continue
+        if "/" in f[0]:                       # the stream=time_base row, e.g. "1/60000"
+            _n, _d = f[0].split("/")
+            tb = int(_n) / max(1, int(_d))
+        elif f[0] != "N/A":
+            if len(f) > 1 and "K" in f[1]:
+                keys.append(len(pts))
+            pts.append(int(f[0]))
+    return pts, keys, tb
+
+
+def _decoded_count(path, start_time):
+    """How many frames actually DECODE from start_time to EOF (err_detect explode stops at the
+    first corrupt packet). Frames are counted as raw bytes on a tiny grayscale scale-down, so
+    the pipe cost is negligible while the decode still exercises every packet."""
+    r = subprocess.run(
+        [FFMPEG, "-v", "error", "-err_detect", "explode", "-ss", f"{start_time:.6f}",
+         "-i", path, "-map", "0:v:0", "-vf", "scale=64:36", "-f", "rawvideo",
+         "-pix_fmt", "gray", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    return len(r.stdout) // (64 * 36)
+
+
+def _clean_cut(pts, cap):
+    """Largest packet count c <= cap whose decode-order prefix displays gaplessly.
+
+    The stage-1 stream is CFR, so its pts form an arithmetic sequence; a prefix of c packets is
+    a valid stream cut iff it contains exactly display frames 0..c-1 (references always point
+    earlier in decode order, so decodability is free). With B-frames the decode order permutes
+    display order, hence the running-max test rather than per-packet equality. This needs no
+    keyframe at the cut: complete fragments (frag_keyframe flushes whole GOPs) pass wholesale,
+    and a torn tail fragment simply shrinks the prefix back to its last gapless point."""
+    if len(pts) < 2:
+        return 0
+    s = sorted(pts)
+    step = min(b - a for a, b in zip(s, s[1:]) if b > a)
+    base, runmax, best = s[0], -1, 0
+    for idx, p in enumerate(pts, 1):
+        runmax = max(runmax, p)
+        if runmax - base == (idx - 1) * step and idx <= cap:
+            best = idx
+    return best
+
+
+def _concat_copy(parts, dst):
+    """Stream-copy concat of same-parameter video parts (the banked prefix + continuation)."""
+    lst = WORK_PATH + ".concat.txt"
+    with open(lst, "w", encoding="utf-8") as f:
+        for p in parts:
+            f.write("file '" + os.path.abspath(p).replace("\\", "/").replace("'", "'\\''") + "'\n")
+    frag = FRAG_FLAGS if (FRAG_COPY and dst.lower().endswith(".mp4")) else []
+    cmd = [FFMPEG, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+           "-map", "0:v:0", "-c", "copy"] + frag + [dst]
+    ok = subprocess.run(cmd, creationflags=NO_WINDOW).returncode == 0 and os.path.exists(dst)
+    try:
+        os.remove(lst)
+    except OSError:
+        pass
+    return ok
+
+
+def _try_resume():
+    """Detect and prepare a resumable partial render. On success VID_PART holds a clean banked
+    prefix ending exactly at an encoder keyframe on the output grid, and the returned dict maps
+    that boundary back to (source pair, in-pair slot). Any doubt -> cleanup and render fresh."""
+    if not (RESUMABLE and os.path.exists(RESUME_JSON)
+            and (os.path.exists(VID_PART) or os.path.exists(VID_PART2))):
+        return None
+    try:
+        with open(RESUME_JSON, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        meta = {}
+    if meta.get("sig") != RESUME_SIG:
+        sys.stderr.write("resume: found a partial render from DIFFERENT settings/source; "
+                         "starting fresh\n"); sys.stderr.flush()
+        _resume_cleanup()
+        return None
+    if meta.get("venc") == "libvvenc":
+        # The banked prefix is a VVC bitstream even if args.codec says hevc/av1 (the encoder
+        # auto-switches to libvvenc past NVENC's 8192px ceiling and above libsvtav1's 240 fps
+        # cap). Every salvage/trim below is an mp4 stream copy, and the regular-mp4 muxer
+        # corrupts vvc composition offsets (see FRAG_COPY), so flip it before the first copy.
+        global FRAG_COPY
+        FRAG_COPY = True
+    try:
+        # A resumed run that itself crashed leaves prefix + continuation: merge them back into a
+        # single prefix first, so every crash depth reduces to the same single-file case.
+        if os.path.exists(VID_PART2):
+            salv2 = WORK_PATH + ".salv2.mp4"
+            if _ff_copy(VID_PART2, salv2):
+                if os.path.exists(VID_PART):
+                    if not _concat_copy([VID_PART, salv2], VID_FULL):
+                        raise RuntimeError("concat of previous resume parts failed")
+                    os.replace(VID_FULL, VID_PART)
+                    os.remove(salv2)
+                else:
+                    os.replace(salv2, VID_PART)
+            os.remove(VID_PART2)
+        salv = WORK_PATH + ".salv.mp4"
+        if not _ff_copy(VID_PART, salv):
+            raise RuntimeError("partial video unreadable")
+        pts, keys, tb = _ff_packets(salv)
+        nf = len(pts)
+        if not nf or not keys or not tb:
+            raise RuntimeError("no usable frames in the partial video")
+        # The killed encoder can leave its FINAL packet(s) with truncated data that the salvage
+        # copy passes through untouched (the sizes come from the moof, the bytes ran out
+        # mid-mdat), invisible to any container-level check. Decode-verify from the last
+        # keyframe (at most one GOP, cheap at any length) and only trust packets that decode.
+        good = keys[-1] + min(_decoded_count(salv, pts[keys[-1]] * tb), nf - keys[-1])
+        # Latest safe cut: a display-gapless decode prefix (see _clean_cut) of the verified
+        # packets, and early enough that the render loop still emits at least one more frame
+        # (the --fps tail hold needs a live last_out).
+        if NO_INTERP:
+            cap = NB
+        elif not FPS_MODE:
+            cap = 1 + args.multi * (total_pairs - 1)
+        else:
+            cap = max(0, math.ceil(total_pairs * ratio - 0.5) - 1)
+        c = _clean_cut(pts[:good], cap)
+        if c < 1:
+            raise RuntimeError("no usable frames in the partial video")
+        if c == nf:
+            os.replace(salv, VID_PART)
+        else:
+            trim = WORK_PATH + ".trim.mp4"
+            if not _ff_copy(salv, trim, ["-frames:v", str(c)]):
+                raise RuntimeError("trim to the cut point failed")
+            got = len(_ff_packets(trim)[0])
+            if got != c:
+                raise RuntimeError(f"trim produced {got} frames, wanted {c}")
+            os.replace(trim, VID_PART)
+            os.remove(salv)
+        # Map output-frame index c back onto the source grid (see each loop's emission scheme).
+        if NO_INTERP:
+            p, skip = c, 0
+        elif not FPS_MODE:
+            p, skip = (c - 1) // args.multi, (c - 1) % args.multi
+        else:
+            p = int((c + 0.5) / ratio)
+            while p > 0 and math.ceil(p * ratio - 0.5) > c:
+                p -= 1
+            while math.ceil((p + 1) * ratio - 0.5) <= c:
+                p += 1
+            skip = c - math.ceil(p * ratio - 0.5)
+        return {"c": c, "p": p, "skip": skip, "venc": meta.get("venc", ""),
+                "maxcll": float(meta.get("maxcll", 0) or 0),
+                "maxfall": float(meta.get("maxfall", 0) or 0)}
+    except Exception as e:  # noqa: BLE001 - a failed salvage must never block a fresh render
+        sys.stderr.write(f"resume: could not continue the partial render ({e}); "
+                         "starting fresh\n"); sys.stderr.flush()
+        _resume_cleanup()
+        return None
+
+
+RESUME_VENC = ""            # encoder that produced the banked prefix (must match this run's)
+RESUME_DVHP_NOTE = None     # set when a resumed run cannot carry DV/HDR10+ (stats rebuild failed)
+
+
+def _rebuild_hdr_stats(expect):
+    """Recompute the per-frame DV L1 / HDR10+ stats (and the light-level maxima) of the banked
+    prefix by decoding it back to the packed PQ RGB the measurements originally ran on. The
+    banked video IS the PQ frames (visually lossless encode), so feeding each decoded frame
+    through _RTX._measure_light rebuilds the in-RAM state the killed process took with it -
+    within encode/4:2:0 roundtrip noise, far inside the SEI's own precision. Returns the number
+    of frames measured (must equal the banked frame count for the exports to be usable)."""
+    fsz = OUT_W * OUT_H * 4
+    pr = subprocess.Popen(
+        [FFMPEG, "-v", "error", "-i", VID_PART, "-map", "0:v:0",
+         "-f", "rawvideo", "-pix_fmt", "x2rgb10le", "-"],
+        stdout=subprocess.PIPE, creationflags=NO_WINDOW)
+    n = 0
+    try:
+        while True:
+            buf = read_exact(pr.stdout, fsz)
+            if buf is None:
+                break
+            t = torch.from_numpy(np.frombuffer(buf, dtype=np.uint8).reshape(OUT_H, OUT_W, 4))
+            _RTX._measure_light(t.cuda() if torch.cuda.is_available() else t)
+            n += 1
+            if n % 2000 == 0:
+                sys.stderr.write(f"resume: rebuilding HDR dynamic-metadata stats "
+                                 f"{n}/{expect} frames\n"); sys.stderr.flush()
+    finally:
+        pr.stdout.close()
+        pr.wait()
+    return n
+
+
+_rz = _try_resume()
+if _rz:
+    RESUME_ACTIVE = True
+    RESUME_OUT_BASE = _rz["c"]
+    RESUME_SKIP_SRC = _rz["p"]
+    RESUME_PAIR_SKIP = _rz["skip"]
+    RESUME_VENC = _rz["venc"]
+    RESUME_BASE_BYTES = os.path.getsize(VID_PART)
+    if HDR_ACTIVE and _RTX is not None:
+        # The light-level maxima are running maxima over the whole render; re-seed the banked
+        # prefix's values (the private accumulators behind the read-only maxcll/maxfall
+        # properties, in nits) so the HDR10 metadata still covers part 1's frames.
+        _RTX._cll = max(getattr(_RTX, "_cll", 0.0), _rz["maxcll"])
+        _RTX._fall = max(getattr(_RTX, "_fall", 0.0), _rz["maxfall"])
+        if DV_ACTIVE or HP_ACTIVE:
+            # DV/HDR10+ need per-frame stats for EVERY output frame; part 1's died with its
+            # process, so rebuild them from the banked video itself before rendering part 2
+            # (the render loop appends part 2's stats after these, keeping frame order).
+            sys.stderr.write(f"resume: rebuilding Dolby Vision/HDR10+ per-frame stats from the "
+                             f"{RESUME_OUT_BASE} banked frames...\n"); sys.stderr.flush()
+            try:
+                _got = _rebuild_hdr_stats(RESUME_OUT_BASE)
+            except Exception as _e:  # noqa: BLE001 - never block the resume over the exports
+                _got = -1
+                sys.stderr.write(f"resume: stats rebuild error ({_e})\n"); sys.stderr.flush()
+            if _got != RESUME_OUT_BASE:
+                RESUME_DVHP_NOTE = (f"stats rebuild got {_got}/{RESUME_OUT_BASE} banked frames; "
+                                    "Dolby Vision / HDR10+ export will be skipped (the HDR10 "
+                                    "output itself is complete)")
+                sys.stderr.write(f"resume: {RESUME_DVHP_NOTE}\n"); sys.stderr.flush()
+    sys.stderr.write(f"resume: continuing the previous render from source frame "
+                     f"{RESUME_SKIP_SRC}/{NB or '?'} ({RESUME_OUT_BASE} output frames already "
+                     f"rendered, {RESUME_BASE_BYTES / 1e6:.0f} MB banked)\n")
+    # Jump the GUI's bar/taskbar to the banked position right away.
+    sys.stderr.write(f"PROGRESS {RESUME_SKIP_SRC}/{total_units}\n"); sys.stderr.flush()
+
+# Decoder-side skip for resume: on CFR sources drop the first p frames inside ffmpeg (select
+# runs pre-pipe, so skipped frames never cross the pipe); VFR sources are conformed to CFR by
+# VFR_DEC's fps_mode AFTER filtering, where a select would count the wrong (pre-conform) frames,
+# so they fall back to draining the pipe (exact, just slower).
+# setpts rebases the survivors to t=0: without it the post-select timestamp gap makes ffmpeg's
+# output vsync duplicate frames back up to the original count (measured: select alone re-emitted
+# all 383 frames of a 383-frame source instead of the requested 259).
+_DEC_SKIP = ["-vf", f"select=gte(n\\,{RESUME_SKIP_SRC}),setpts=PTS-STARTPTS"] \
+    if (RESUME_SKIP_SRC and not VFR_DEC) else []
+_PIPE_DISCARD = RESUME_SKIP_SRC if (RESUME_SKIP_SRC and VFR_DEC) else 0
+
 dec = subprocess.Popen(
-    [FFMPEG, "-v", "error", "-i", inp] + VFR_DEC + ["-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
+    [FFMPEG, "-v", "error", "-i", inp] + VFR_DEC + _DEC_SKIP
+    + ["-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
     stdout=subprocess.PIPE, creationflags=NO_WINDOW)
 
 # The output codec never echoes the source: the interpolated clip is a brand new artifact (many
@@ -970,6 +1313,32 @@ if USE_NVENC and not _enc_works(venc):
                      f"falling back to CPU libsvtav1\n"); sys.stderr.flush()
     venc = "libsvtav1"
     USE_NVENC = False
+if venc == "libsvtav1" and out_label > 240:
+    # SVT-AV1 hard-rejects high frame rates at encoder open ("Svt[error]: The maximum allowed
+    # frame rate is 240 fps", verified 2026-07-10 on a 360fps stream), so a >240 fps render on
+    # this path would die at the first frame. libvvenc has no such cap; switch if it exists.
+    if _enc_works("libvvenc", f"{OUT_W}x{OUT_H}", fast=True):
+        sys.stderr.write(f"libsvtav1 caps at 240 fps ({out_label} fps requested); "
+                         "encoding H.266/VVC instead\n"); sys.stderr.flush()
+        venc = "libvvenc"
+    else:
+        sys.exit(f"no available encoder can write {out_label} fps: libsvtav1 caps at 240 fps "
+                 "and libvvenc is unavailable. Lower the output multiplier/fps.")
+if RESUME_ACTIVE and RESUME_VENC and RESUME_VENC != venc:
+    # A continuation stream must come from the SAME encoder as the banked prefix: even within
+    # one codec family, different encoders write different sequence headers and the concat would
+    # mix incompatible bitstreams. This only happens when encoder availability changed between
+    # the runs (e.g. NVENC lost to a driver problem), so stop with instructions rather than
+    # silently produce a corrupt file or throw away hours of banked work.
+    sys.exit(f"resume: the interrupted render used {RESUME_VENC} but this run would encode with "
+             f"{venc} (encoder availability changed). Fix the encoder (e.g. the NVIDIA driver) "
+             f"to continue, or delete '{os.path.basename(VID_PART)}' and its .resume.json next "
+             "to the output to render fresh.")
+if venc == "libvvenc":
+    # venc is final here. FRAG_COPY was computed from args.codec, but the encoder auto-switches
+    # to libvvenc past NVENC's 8192px ceiling and above libsvtav1's 240 fps cap; the fragmented
+    # rule follows the BITSTREAM, not the requested codec (see the FRAG_COPY comment).
+    FRAG_COPY = True
 
 # Output pixel format: 10 bit by default (--out-bits), preserving 4:4:4 where the encoder
 # allows it. NVENC takes 10 bit as p010le (4:2:0) or yuv444p16le (4:4:4, rext profile; the
@@ -987,35 +1356,42 @@ elif TEN_BIT_OUT:
 else:
     out_pix = "yuv420p"
 
-# Always visually lossless, with the values VERIFIED against a lossless 8K master (2026-07-03;
-# exact args, frame-aligned VMAF/PSNR/SSIM). HEVC CQ 17 is the app's quality reference:
-# VMAF 99.78 / 57.0 dB / SSIM 0.9986. Note hevc_nvenc's CQ SATURATES on easy content: CQ 14-21
-# produced byte-identical bitstreams here (the mode's internal quality ceiling; response starts
-# at CQ 22 and the knob verifiably works at 30/40), so 17 sits ON the max-quality plateau with
-# ~4 steps of margin for harder content where the ceiling shifts. AV1's CQ scale is not HEVC's
-# and does NOT saturate there: CQ 22 still exceeds the reference on every metric
-# (99.84 / 58.2 / 0.9988) at 13% smaller files than the old over-provisioned CQ 20 (CQ 23 dips
-# just below the reference, so 22 it is; neighbors 21/23 both measured). NVENC runs AQ + a
-# small chroma QP boost. SVT-AV1 CPU fallback: CRF 20 (its visually lossless range) at
-# preset 8, fast enough not to starve the GPU frame pipe.
+# QUALITY-FIRST POLICY (2026-07-10, user decision: professional-grade fidelity regardless of
+# size, one standard at every frame rate). The CQ values are VERIFIED against a lossless 8K
+# master (2026-07-03; exact args, frame-aligned VMAF/PSNR/SSIM): HEVC CQ 17 = the app's quality
+# reference, VMAF 99.78 / 57.0 dB / SSIM 0.9986; AV1 CQ 22 exceeds it (99.84 / 58.2 / 0.9988).
+# CQ is a SATURATED knob at max effort (hevc CQ 14-21 byte-identical on easy content, and 14
+# vs 17 stayed byte-identical under the p7 ladder), so the remaining quality levers are the
+# effort/foresight flags, measured 2026-07-10 on the 1080p sample vs p5 single-pass:
+#   -preset p7 -multipass fullres -rc-lookahead 32: hevc 50.8->52.5 dB avg, worst frame
+#   49.3->51.6 dB, SSIM 0.9956->0.9968 at +7% size; av1 51.2->52.2 dB, worst 50.1->51.6,
+#   SSIM 0.9955->0.9962 at +2.6%. Throughput drops 480->154 fps (hevc, 1080p; av1 273) but
+#   GMFSS generates output frames far slower than that, so the pipeline bottleneck never moves.
+# -tune uhq was measured and REJECTED: its temporal filtering rewrites frame content (fidelity
+# DROPPED to 50.2 dB / SSIM 0.9946 while shrinking the file); it is a streaming-perception
+# tune, not a fidelity tune. The former high-fps CQ relief (+3 above 120 fps, a pure size
+# optimization measured 2026-07-09) was REMOVED under this policy: tween-dense streams now
+# spend whatever the base CQ costs (the known extreme: ~77 Mbps for 360fps 1440p).
+# NVENC runs AQ + a small chroma QP boost. SVT-AV1 CPU fallback: CRF 17 preset 6 (measured
+# 2026-07-10: 48.9 dB / SSIM 0.9932 vs 47.9 / 0.9916 for the old CRF 20 preset 8 at similar
+# size; 98 fps at 1080p, still far above what the interpolator can feed it).
 if USE_NVENC:
     # SMV_CQ overrides the tuned constant-quality value (hidden knob for measurement work like
-    # the 2026-07-03 codec tuning or the high-fps CQ experiment; not a user-facing setting).
+    # the 2026-07-03 codec tuning; not a user-facing setting).
     cq = os.environ.get("SMV_CQ") or ("22" if venc == "av1_nvenc" else "17")
-    if out_label > 120 and not os.environ.get("SMV_CQ"):
-        # High-fps CQ relief (the NVENC mirror of the vvenc qpa rule below): at 120+ fps output
-        # every frame shows for <=8 ms and most frames are smooth interpolated tweens, so the
-        # 24fps-tuned CQ over-spends dramatically (a 360fps 1440p episode measured ~77 Mbps at
-        # the base CQ). +3 measured 2026-07-09 on a real anime slice (1440p 360fps HDR; the
-        # deterministic pipeline makes it a pure encoder A/B on identical frames): hevc 17->20 =
-        # -16% size at 55.2 dB avg / SSIM 0.9985 vs the base-CQ encode (the handful of 43 dB
-        # worst frames are structureless grain dither on one detail-heavy shot, verified
-        # invisible in a 6x-amplified still); av1 22->25 = -35% at 56.1 dB avg / worst 45.0 dB /
-        # SSIM 0.9987, zero frames below the worst-frame bar.
-        cq = str(int(cq) + 3)
-        sys.stderr.write(f"encode: high-fps CQ relief at {out_label} fps output (CQ {cq}; "
-                         "tween-dense streams over-spend at the base CQ)\n"); sys.stderr.flush()
-    qargs = ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
+    # Lookahead depth, measured 2026-07-10 (md5 + frame-aligned PSNR, 24-frame sample AND a
+    # 5405-frame real clip). The fidelity gain needs lookahead AND multipass TOGETHER (either
+    # alone measures ~0 over the old p5 baseline; p7 adds +0.25 dB), and the DEPTH response is
+    # stepped, not monotonic: 1/2/4 encode byte-identically and measure BEST (hevc 53.5 dB avg
+    # / 52.3 worst; av1 53.1/52.5), 8/16/32 encode byte-identically at -1.1 dB (the deeper
+    # queue turns on B-frame restructuring that trades fidelity for size - the wrong trade
+    # here) while a depth-32 queue also costs real VRAM (~81 MB/slot at 8K = 2.6 GB measured).
+    # So: depth 1 = full gain, best fidelity, one ~5-81 MB slot. Above 120 fps output the sign
+    # FLIPS: on wall-to-wall tweens ANY lookahead measured -1 dB AND bigger files (la1==la8
+    # there), so high-fps renders drop the queue entirely.
+    la = "0" if out_label > 120 else "1"
+    qargs = ["-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
+             "-multipass", "fullres", "-rc-lookahead", la,
              "-spatial-aq", "1", "-temporal-aq", "1"]
     if venc in ("h264_nvenc", "hevc_nvenc"):
         qargs += ["-qp_cb_offset", "-2", "-qp_cr_offset", "-2"]
@@ -1027,28 +1403,29 @@ if USE_NVENC:
         # 1:1. The size cost is small at our CQ.
         qargs += ["-bf", "0"]
 elif venc == "libvvenc":
-    # vvenc has no CRF; QP with its perceptual QP adaptation (qpa, on by default). QP 20 verified
-    # VMAF 99.82 / 51.3 dB / SSIM 0.9966 on the 8K master, one QP of extra headroom over the old
-    # QP 21 (the thinnest margin of the three codecs) for ~5% size; still ~4.4x smaller than
-    # HEVC. The fast preset keeps 1080p from being glacial on the CPU.
-    qargs = ["-qp", "20", "-preset", "fast"]
-    if out_label > 120:
-        # QPA (perceptual QP adaptation) INVERTS on high-fps interpolated streams: on normal
-        # content it saves bits (raises QP where texture masks errors; 24fps 8K master: 1.9 MB
-        # with vs 2.6 MB without), but a 120+fps stream is wall-to-wall smooth tween frames, so
-        # QPA lowers QP everywhere and bloats the file (360fps: 3.2 MB with vs 1.7 MB without at
-        # 1080p; at 8K it even made VVC LARGER than HEVC). Both variants measure above the
-        # visually-lossless standards (VMAF 99.1-99.8, SSIM >= 0.9977), so switch it off where
-        # it hurts and keep it where it helps.
-        qargs += ["-qpa", "0"]
-        sys.stderr.write(f"vvenc: qpa off for {out_label} fps output (bit-saver inverts on "
-                         "high-fps tween streams)\n"); sys.stderr.flush()
+    # vvenc has no CRF; QP mode. QUALITY-FIRST 2026-07-10: QP 17 (was 20), measured on the
+    # 1080p sample: 49.6 dB / SSIM 0.9939 vs 47.9 / 0.9919 at QP 20, +1.8 dB for +47% size,
+    # still ~55% of the HEVC ladder's size (VVC was the thinnest-margin codec of the three,
+    # this buys it real headroom). Preset stays fast: a slower preset at fixed QP is a size
+    # optimizer, not a fidelity gain (medium measured SMALLER and slightly LOWER PSNR than
+    # fast at the same QP), so under quality-first the QP is the lever, not the preset.
+    # QPA (perceptual QP adaptation, vvenc default on) is now ALWAYS off: it deliberately
+    # spends fewer bits where it predicts the eye won't look (its ~27% size saving on normal
+    # content) and it INVERTS outright on 120+fps tween streams (measured 2026-07-03: bloats
+    # 360fps files, at 8K it made VVC larger than HEVC). A fidelity-first pipeline wants
+    # uniform quality, not psychovisual bit-robbing.
+    qargs = ["-qp", "17", "-preset", "fast", "-qpa", "0"]
     if OUT_W > NVENC_MAX or OUT_H > NVENC_MAX:
         # Ultra sizes: cap frame-level parallelism. Measured at 15360x8640 (24 frames): default
         # peaks ~34 GB RAM, maxparallelframes=2 peaks ~30 GB at the SAME wall time.
         qargs += ["-vvenc-params", "maxparallelframes=2"]
 else:
-    qargs = ["-crf", "20", "-preset", "8"]
+    # SVT-AV1 fallback, quality-first 2026-07-10: CRF 17 preset 6 beat the old CRF 20 preset 8
+    # on BOTH axes on the 1080p sample (48.9 dB / SSIM 0.9932 vs 47.9 / 0.9916, and preset 6 at
+    # CRF 17 came out SMALLER than preset 8 at the same CRF). Throughput measured 98 fps at
+    # 1080p (984-frame run) vs 140 for preset 8: both far above what GMFSS can feed it, so the
+    # "don't starve the frame pipe" constraint that justified preset 8 still holds with margin.
+    qargs = ["-crf", "17", "-preset", "6"]
 
 # HEVC profile follows the pixel format: main10 for 10-bit 4:2:0, rext (range extensions) for
 # 4:4:4 at 10 bit. Other encoders pick their profile from the input format on their own.
@@ -1148,7 +1525,15 @@ sys.stderr.flush()
 # not even chapters sneak in), the boxes are injected there, and stage 2 stream-copy remuxes the
 # temp video plus the source's tracks into the final .mkv (see _finalize_output).
 HDR_MKV_2STAGE = HDR_ACTIVE and OUT_IS_MKV
-if HDR_MKV_2STAGE:
+if RESUMABLE:
+    # Resumable renders always run two-stage: encode the video ALONE into a truncation-tolerant
+    # fragmented mp4 (the crash/exit resume asset - see the resume block), then _finalize_output
+    # remuxes it with the source's tracks (and the HDR10 boxes when HDR is on) into the real
+    # container. A resumed run appends into a separate continuation file, concatenated at finalize.
+    _ENC_TARGET = VID_PART2 if RESUME_ACTIVE else VID_PART
+    _stage2_maps, _maps = _maps, []
+    _in2 = []
+elif HDR_MKV_2STAGE:
     _ENC_TARGET = WORK_PATH + ".video.tmp.mp4"
     _stage2_maps, _maps = _maps, []
     _in2 = []
@@ -1169,8 +1554,17 @@ enc_cmd = [FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", ENC_IN_FMT
 # queues ... audio/1: 0 packets'). Zero-delta buffering is bounded here because the video pipe is
 # the pacing stream.
 # VVC-in-MP4 muxing is gated behind -strict experimental on some ffmpeg versions; harmless otherwise.
-enc_cmd += qargs + prof + color + (["-strict", "experimental"] if venc == "libvvenc" else []) + [_ENC_TARGET]
+# Resumable stage-1 files are FRAGMENTED mp4 (see the resume block): a killed encoder leaves all
+# complete moof/mdat fragments readable, and frag_keyframe puts those boundaries on encoder
+# keyframes - exactly the clean closed-GOP stream-copy cut points the resume trim needs.
+_frag = ["-movflags", "+frag_keyframe+empty_moov+default_base_moof"] if RESUMABLE else []
+enc_cmd += qargs + prof + color + (["-strict", "experimental"] if venc == "libvvenc" else []) \
+    + _frag + [_ENC_TARGET]
 enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
+if RESUMABLE:
+    # Sidecar from frame one (not just from the first heartbeat), so even a crash in the first
+    # seconds leaves a valid resume pair once a keyframe has been flushed.
+    _write_resume_sidecar(RESUME_SKIP_SRC, total_units)
 _sharp_note = f"  sharpen(rcas)={SHARPEN:g}" if SHARPEN > 0 else ""
 _up_note = f"  upscale={UPSCALE_F:g}x->{OUT_W}x{OUT_H}" if UPSCALE else ""
 _hdr_note = "  HDR10(TrueHDR,BT.2020 PQ)" if HDR_ACTIVE else ""
@@ -1242,42 +1636,101 @@ def _write_hdr10_metadata(target):
         sys.stderr.write(f"HDR10 metadata: skipped ({e})\n"); sys.stderr.flush()
 
 
-def _finalize_output():
-    """Finish the container. Plain renders: inject the HDR10 boxes into the mp4 when HDR is on.
-    HDR-into-MKV renders (HDR_MKV_2STAGE): the boxes are injected into the stage-1 video-only
-    temp mp4, then a stream-copy remux merges that video with the source's passthrough tracks
-    into the final .mkv - ffmpeg maps the mdcv/clli boxes onto Matroska's native
-    MasteringMetadata/MaxCLL elements (verified value-exact), so nothing is lost."""
-    if not HDR_MKV_2STAGE:
-        _write_hdr10_metadata(WORK_PATH)
-        # HDR10+ first, DV second: the HDR10+ SEI NALs ride inside the HEVC samples, so the DV
-        # export's extract -> inject-rpu -> remux passes them through untouched, while running DV
-        # first would have _hp_export's own extract/remux rebuild the container and drop the dvvC
-        # box _dv_export just wrote. This order needs no re-stamping.
-        if HP_ACTIVE:
-            _hp_export(WORK_PATH)
-        if DV_ACTIVE:
-            _dv_export(WORK_PATH)
-        return
-    _write_hdr10_metadata(_ENC_TARGET)
-    # -max_interleave_delta 0: same interleave fix as enc_cmd (see there) - this remux merges the
-    # video-only temp with the source's tracks, exactly the two-input case that produced the
-    # audio-burst layout mpv chokes on at high fps.
-    cmd = [FFMPEG, "-v", "error", "-y", "-i", _ENC_TARGET, "-i", inp,
+def _remux_tracks(vid_src, dst):
+    """Stream-copy remux of the finished video with the source's passthrough tracks.
+    -max_interleave_delta 0: same interleave fix as enc_cmd (see there) - this is exactly the
+    two-input mux that produced the audio-burst layout mpv chokes on at high fps.
+    A vvc video into an .mp4 destination is written FRAGMENTED (see FRAG_COPY: the regular-mp4
+    copy path corrupts vvc; fmp4 needs no faststart, its index is already up front)."""
+    frag = FRAG_FLAGS if (FRAG_COPY and dst.lower().endswith(".mp4")) else []
+    cmd = [FFMPEG, "-v", "error", "-y", "-i", vid_src, "-i", inp,
            "-map", "0:v:0", "-c:v", "copy"] + _stage2_maps + \
-          ["-max_interleave_delta", "0", WORK_PATH]
+          ["-max_interleave_delta", "0"] + frag + [dst]
+    subprocess.run(cmd, check=True, creationflags=NO_WINDOW)
+    if frag:
+        sys.stderr.write("vvc: final mp4 written fragmented (resume-safe layout; plays in "
+                         "modern players, streams without faststart)\n"); sys.stderr.flush()
+
+
+def _finalize_output():
+    """Finish the container.
+
+    Resumable renders (hevc/av1): the encoder wrote a video-only fragmented mp4 (plus a
+    continuation stream when this run resumed a previous one). Concat the parts, then remux
+    with the source's tracks into the real container - via a temp regular mp4 carrying the
+    injected HDR10 boxes when the final container is mkv (ffmpeg maps mdcv/clli onto Matroska's
+    native MasteringMetadata/MaxCLL elements, verified value-exact), or injecting straight into
+    the final mp4 otherwise. Resume artifacts are cleaned only on success, so a failed finalize
+    stays resumable.
+
+    Legacy path (vvc): plain renders inject the HDR10 boxes into the finished mp4; HDR-into-MKV
+    renders inject into the stage-1 temp mp4 and remux (the original HDR_MKV_2STAGE flow)."""
+    if not RESUMABLE:
+        if not HDR_MKV_2STAGE:
+            _write_hdr10_metadata(WORK_PATH)
+            if HP_ACTIVE:
+                _hp_export(WORK_PATH)
+            if DV_ACTIVE:
+                _dv_export(WORK_PATH)
+            return
+        _write_hdr10_metadata(_ENC_TARGET)
+        try:
+            _remux_tracks(_ENC_TARGET, WORK_PATH)
+            os.remove(_ENC_TARGET)
+            sys.stderr.write("HDR10 metadata carried into the MKV as native "
+                             "MasteringMetadata/MaxCLL elements\n"); sys.stderr.flush()
+        except Exception as e:  # noqa: BLE001 - keep the finished video rather than fail the render
+            try:
+                os.remove(WORK_PATH)   # a half-written remux must never be promoted to out_path
+            except OSError:
+                pass
+            sys.stderr.write(f"final MKV remux failed ({e}); the HDR video (with metadata, without "
+                             f"the extra tracks) was kept at {_ENC_TARGET}\n"); sys.stderr.flush()
+        return
+    vid = VID_PART
     try:
-        subprocess.run(cmd, check=True, creationflags=NO_WINDOW)
-        os.remove(_ENC_TARGET)
-        sys.stderr.write("HDR10 metadata carried into the MKV as native MasteringMetadata/MaxCLL "
-                         "elements\n"); sys.stderr.flush()
-    except Exception as e:  # noqa: BLE001 - keep the finished video rather than fail the render
+        if RESUME_ACTIVE:
+            if not _concat_copy([VID_PART, VID_PART2], VID_FULL):
+                raise RuntimeError("concat of the banked prefix + continuation failed")
+            vid = VID_FULL
+        if HDR_ACTIVE and OUT_IS_MKV:
+            # The HDR10 boxes are ISOBMFF: hop through an mp4 so the mkv remux maps them onto
+            # Matroska's native elements (the proven HDR_MKV_2STAGE route). Fragmented for vvc
+            # (FRAG_COPY; the injector was verified to work on fmp4 too).
+            tmp = WORK_PATH + ".video.tmp.mp4"
+            subprocess.run([FFMPEG, "-v", "error", "-y", "-i", vid, "-map", "0:v:0",
+                            "-c", "copy"] + (FRAG_FLAGS if FRAG_COPY else []) + [tmp],
+                           check=True, creationflags=NO_WINDOW)
+            _write_hdr10_metadata(tmp)
+            _remux_tracks(tmp, WORK_PATH)
+            os.remove(tmp)
+            sys.stderr.write("HDR10 metadata carried into the MKV as native "
+                             "MasteringMetadata/MaxCLL elements\n"); sys.stderr.flush()
+        else:
+            _remux_tracks(vid, WORK_PATH)
+            if HDR_ACTIVE:
+                _write_hdr10_metadata(WORK_PATH)
+                if RESUME_DVHP_NOTE and (HP_ACTIVE or DV_ACTIVE):
+                    # Normally a resumed run rebuilds the per-frame stats from the banked video
+                    # (see _rebuild_hdr_stats) and exports as usual; this only fires when that
+                    # rebuild failed or came up short.
+                    sys.stderr.write(f"resume: {RESUME_DVHP_NOTE}\n"); sys.stderr.flush()
+                else:
+                    # HDR10+ first, DV second: the HDR10+ SEI NALs ride inside the HEVC samples,
+                    # so the DV export's extract -> inject-rpu -> remux passes them through
+                    # untouched, while running DV first would drop the dvvC box. See _dv_export.
+                    if HP_ACTIVE:
+                        _hp_export(WORK_PATH)
+                    if DV_ACTIVE:
+                        _dv_export(WORK_PATH)
+        _resume_cleanup()
+    except Exception as e:  # noqa: BLE001 - keep the rendered video (and resumability) on failure
         try:
             os.remove(WORK_PATH)   # a half-written remux must never be promoted to out_path
         except OSError:
             pass
-        sys.stderr.write(f"final MKV remux failed ({e}); the HDR video (with metadata, without "
-                         f"the extra tracks) was kept at {_ENC_TARGET}\n"); sys.stderr.flush()
+        sys.stderr.write(f"final remux failed ({e}); the rendered video stream was kept at "
+                         f"{vid} and the render stays resumable\n"); sys.stderr.flush()
 
 
 def _dv_export(mp4_path):
@@ -1422,6 +1875,8 @@ def _progress(k, total):
     the free space on the output drive."""
     global _disk_warned
     sys.stderr.write(f"PROGRESS {k}/{total}\n")
+    if RESUMABLE:
+        _write_resume_sidecar(k, total)
     frac = k / total if total else 0.0
     if frac >= 0.01:
         try:
@@ -1432,6 +1887,9 @@ def _progress(k, total):
             with open(_ENC_TARGET, "rb") as _f:
                 _f.seek(0, 2)
                 cur = _f.tell()
+            # A resumed run only writes the continuation stream; count the banked prefix too so
+            # the projection covers the whole output.
+            cur += RESUME_BASE_BYTES
             if cur < (1 << 20):
                 sys.stderr.flush()
                 return
@@ -1441,7 +1899,9 @@ def _progress(k, total):
                 _disk_warned = True
                 import shutil
                 free = shutil.disk_usage(os.path.dirname(out_path) or ".").free
-                need = (proj - cur) + (proj if HDR_MKV_2STAGE else 0) + (1 << 30)
+                # Two-stage renders (all resumable ones, and HDR-into-MKV) transiently hold the
+                # video stream twice: the stage-1 file plus the remuxed final.
+                need = (proj - cur) + (proj if (HDR_MKV_2STAGE or RESUMABLE) else 0) + (1 << 30)
                 if need > free:
                     sys.stderr.write(
                         f"warning: projected output ~{proj / 1e9:.1f} GB"
@@ -1495,12 +1955,19 @@ torch.cuda.synchronize()
 _infer_stream = torch.cuda.Stream()
 torch.cuda.set_stream(_infer_stream)
 
+# Resume on a VFR source: the decoder could not pre-skip with a select filter (it would count
+# pre-conform frames; see _DEC_SKIP), so drain the already-conformed pipe here instead.
+for _ in range(_PIPE_DISCARD):
+    if rq.get() is None:
+        sys.exit("resume: the source ended before the resume point (source changed?); "
+                 "delete the .part files next to the output and render fresh")
+
 if NO_INTERP:
     # Sharpen-only pass: no interpolation, one output frame per source frame at the source fps.
     # Each decoded frame is RCAS-sharpened on the GPU when --sharpen > 0, or passed straight
     # through (a plain re-encode) when it is 0. Shares the same encode pipe/threads as the
     # interpolation path, so colour signalling, bit depth and audio are handled identically.
-    k = 0
+    k = RESUME_OUT_BASE            # frames banked by a resumed run (0 on a fresh one)
     try:
         while True:
             _check_pause()      # block here (queued frames keep encoding) while the GUI holds Pause
@@ -1540,34 +2007,40 @@ if NO_INTERP:
 if not FPS_MODE:
     _MTW = [j / args.multi for j in range(1, args.multi)]   # interior tween fractions j/M, on-grid
 
-    def _gen_tweens(a, b, idx):
+    def _gen_tweens(a, b, fracs):
         with amp():
             reuse = model.reuse(a, b, scale)
-            return [to_bytes(model.inference(a, b, reuse, f)) for f in _MTW]
+            return [to_bytes(model.inference(a, b, reuse, f)) for f in fracs]
 
     prev0 = rq.get()
     if prev0 is None:
         sys.exit("no frames decoded")
-    f_cur = to_tensor(prev0)  # f[0]
-    k = 0                     # pairs processed (PROGRESS counter, matches total_pairs)
+    f_cur = to_tensor(prev0)  # f[0] (f[p] when resuming: the decoder skipped to the resume pair)
+    k = RESUME_SKIP_SRC       # pairs processed (PROGRESS counter, matches total_pairs)
     last_out = None
+    # Resume lands mid-pair when the banked prefix's last keyframe does: the first resumed pair
+    # only re-generates its still-missing tween slots (never the banked ones).
+    _skip = RESUME_PAIR_SKIP
     try:
         # Passthrough scheme: every REAL source frame is emitted at its integer timestamp at full
         # quality, with the M-1 generated tweens inserted at the half positions between each pair. The
         # real frames can pop a little against the softer tweens, but the alternatives lose quality: a
         # bracket interp(f[k-1], f[k+1]) skips f[k] and can smooth past its pose, and interpolating two
         # already-generated tweens double-fades. So we keep the frames we already have, at max quality.
-        last_out = to_bytes(f_cur)      # t=0 : real f[0]
-        wq.put(last_out)
+        if not RESUME_ACTIVE:           # t=0 : real f[0] (banked already when resuming)
+            last_out = to_bytes(f_cur)
+            wq.put(last_out)
         while True:
             _check_pause()      # block here (queued frames keep encoding) while the GUI holds Pause
             cur = rq.get()
             if cur is None:
                 break
             f_next = to_tensor(cur)                    # f[k+1]
-            for tb in _gen_tweens(f_cur, f_next, k):   # tweens at t = k + j/M (strictly interior)
+            for tb in _gen_tweens(f_cur, f_next,       # tweens at t = k + j/M (strictly interior)
+                                  _MTW[_skip:] if _skip else _MTW):
                 last_out = tb
                 wq.put(tb)
+            _skip = 0
             last_out = to_bytes(f_next)                # real f[k+1] at its integer timestamp t = k+1
             wq.put(last_out)
             f_cur = f_next
@@ -1588,10 +2061,11 @@ if not FPS_MODE:
 prev = rq.get()
 if prev is None:
     sys.exit("no frames decoded")
-I0 = to_tensor(prev)
-k = 0
-i = 0
-nout = 0                # exact count of frames written, for the GUI's OUTFRAMES total
+I0 = to_tensor(prev)    # f[0] (f[p] when resuming: the decoder skipped to the resume pair)
+k = RESUME_SKIP_SRC
+i = RESUME_SKIP_SRC
+nout = RESUME_OUT_BASE  # exact count of frames written, for the GUI's OUTFRAMES total
+_skip = RESUME_PAIR_SKIP  # banked slots of the first resumed pair (resume lands mid-pair)
 last_out = None         # bytes of the most recent emitted frame, held across the final slot
 
 try:
@@ -1608,6 +2082,9 @@ try:
         # between every pair of consecutive source frames is smoothed the same way. (--fps mode
         # can still leave a pair zero slots.)
         fracs = _pair_fracs(i)
+        if _skip:
+            fracs = fracs[_skip:]
+            _skip = 0
         if fracs:
             with amp():
                 reuse = model.reuse(I0, I1, scale)
@@ -1628,9 +2105,13 @@ try:
     # through (still routed through to_bytes when sharpening/upscaling changes its dims, or when
     # the pipe carries the output depth and the raw decode bytes would be the wrong size).
     if last_out is None:
-        wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE or RESTORE_ACTIVE
-                                or DEC_FMT != OUT_RAW_FMT) else prev)
-        nout += 1
+        # Single decoded frame, no pair to interpolate: pass it through. Never on a resumed run
+        # (that frame is already banked; reaching here would mean the source delivered fewer
+        # frames than the original run saw, and emitting would duplicate a banked frame).
+        if not RESUME_ACTIVE:
+            wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE or RESTORE_ACTIVE
+                                    or DEC_FMT != OUT_RAW_FMT) else prev)
+            nout += 1
     else:
         tail = math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)  # this path is --fps only
         for _ in range(tail):
