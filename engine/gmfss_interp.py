@@ -620,11 +620,12 @@ if _need_vsr or _need_hdr:
             _vib = f", vib {HDR_VIBRANCE:g}" if HDR_VIBRANCE > 0 else ""
             _sb = f", sb {HDR_SATBOOST:g}" if HDR_SATBOOST > 0 else ""
             # Contrast/saturation are logged on the GUI slider scale (-100..100 = SDK-100) so the
-            # numbers match the sliders the user set, not the internal SDK 0..200 values.
+            # numbers match the sliders the user set, not the internal SDK 0..200 values. Just the
+            # selected settings, no commentary: the pure-conversion recipe (Contrast 0 +
+            # Saturation -100) lives on the visible hint rows under the GUI's RTX HDR sliders.
             sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits, contrast {HDR_CON - 100}, "
-                             f"saturation {HDR_SAT - 100}, mg {HDR_MG}, colour {HDR_COLOR}{_vib}{_sb}; "
-                             f"contrast 0 + saturation -100 = pure HDR conversion, no RTX HDR look "
-                             f"added) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
+                             f"saturation {HDR_SAT - 100}, mg {HDR_MG}, colour {HDR_COLOR}{_vib}{_sb}) "
+                             f"HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"[rtx] unavailable, falling back (bicubic upscale / SDR): {repr(e)[:200]}\n")
         _RTX = None

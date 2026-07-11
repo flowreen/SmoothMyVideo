@@ -170,39 +170,45 @@
         RTX HDR <span class="hint" id="rtxhdrhint">(convert SDR video to HDR)</span>
       </label>
       <span id="hdrtonewrap" style="display:none;align-items:center;gap:8px;">
-        <span class="hint" title="RTX HDR tone curve; 0 = NVIDIA default (no contrast change)">Contrast</span>
+        <span class="hint">Contrast</span>
         <input id="hdrcon" type="range" min="-100" max="100" step="5" value="0" class="defmark"
                style="width:100px;padding:0;border:0;accent-color:var(--green);">
         <span class="v" id="hdrconnum">0</span>
-        <span class="hint" style="margin-left:6px"
-              title="NVIDIA's saturation, hue-corrected; 0 = NVIDIA's RTX HDR look, -100 = true to source (with Contrast 0 that is a pure HDR conversion, nothing added)">Saturation</span>
+        <span class="hint" style="margin-left:6px">Saturation</span>
         <input id="hdrsat" type="range" min="-100" max="100" step="5" value="0" class="defmark"
                style="width:100px;padding:0;border:0;accent-color:var(--green);">
         <span class="v" id="hdrsatnum">0</span>
       </span>
     </div>
+    <div class="row" id="hdrpurewrap" style="display:none">
+      <span class="k"></span>
+      <span class="hint" style="line-height:1.5">(for NVIDIA's RTX HDR look: Contrast 0, Saturation 0)<br>
+        (for a pure HDR conversion that keeps the original look: Contrast 0, Saturation -100)</span>
+    </div>
     <div id="hdrcolorwrap" style="display:none">
       <div class="row" style="flex-wrap:wrap">
         <span class="k"></span>
-        <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;"
-               title="NVIDIA-style vibrance on top of RTX HDR: boosts colours hue-safely, muted ones most">
+        <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
           <input type="checkbox" id="hdrdynvib" style="width:auto;padding:0;accent-color:var(--green);">
           RTX Dynamic Vibrance
         </label>
-        <span id="hdrsbwrap" style="display:inline-flex;align-items:center;gap:8px;"
-              title="uniform extra saturation from the vibrance filter, independent of RTX HDR's Saturation; 0 = none">
+        <span id="hdrsbwrap" style="display:inline-flex;align-items:center;gap:8px;">
           <span class="hint">Saturation boost</span>
           <input id="hdrsb" type="range" min="0" max="100" step="5" value="50" class="defmark"
                  style="width:100px;padding:0;border:0;accent-color:var(--green);">
           <span class="v" id="hdrsbnum">50</span>
         </span>
-        <span id="hdrvibwrap" style="display:inline-flex;align-items:center;gap:8px;"
-              title="strength of the muted-colour boost; saturated colours and skin stay put">
+        <span id="hdrvibwrap" style="display:inline-flex;align-items:center;gap:8px;">
           <span class="hint">Intensity</span>
           <input id="hdrvib" type="range" min="0" max="100" step="5" value="50" class="defmark"
                  style="width:100px;padding:0;border:0;accent-color:var(--green);">
           <span class="v" id="hdrvibnum">50</span>
         </span>
+      </div>
+      <div class="row">
+        <span class="k"></span>
+        <span class="hint" style="line-height:1.5">(Saturation boost: adds saturation evenly to the whole image, 0 = none)<br>
+          (Intensity: how strongly muted colours are boosted, 0 = none; vivid colours and skin tones stay put)</span>
       </div>
     </div>
     <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -220,13 +226,13 @@
   <div class="panel" id="dvpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Dolby Vision</span>
-      <span class="hint">Opt-in export. Adds Profile 8.1 dynamic-HDR metadata on top of the HDR10 render (via the open-source dovi_tool). HDR10-compatible. Best for TVs and devices in the Dolby Vision ecosystem: LG, Sony, most streaming boxes. Samsung TVs don't support it.</span>
+      <span class="hint">Opt-in. Adds Profile 8.1 dynamic-HDR metadata on top of the HDR10 render (via the open-source dovi_tool); the video stays a normal HDR10 file everywhere else. Best for TVs and devices in the Dolby Vision ecosystem: LG, Sony, most streaming boxes. Samsung TVs don't support it.</span>
     </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="dvexport" style="width:auto;padding:0;accent-color:var(--green);">
-        Export Dolby Vision Profile 8.1 <span class="hint">(experimental)</span> <span class="hint" id="dvhint">(needs RTX HDR on)</span>
+        Add Dolby Vision metadata (Profile 8.1) <span class="hint">(experimental)</span> <span class="hint" id="dvhint">(needs RTX HDR on)</span>
       </label>
     </div>
     <div id="dvsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -245,13 +251,13 @@
   <div class="panel" id="hppanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">HDR10+</span>
-      <span class="hint">Opt-in export. Embeds HDR10+ dynamic-HDR metadata (SMPTE ST 2094-40) into the HDR10 render (via the open-source hdr10plus_tool). HDR10-compatible. Best for Samsung TVs (which don't support Dolby Vision) and other HDR10+ displays; combinable with the Dolby Vision export: one file, every display picks what it understands.</span>
+      <span class="hint">Opt-in. Adds HDR10+ dynamic-HDR metadata (SMPTE ST 2094-40) into the HDR10 render (via the open-source hdr10plus_tool); the video stays a normal HDR10 file everywhere else. Best for Samsung TVs (which don't support Dolby Vision) and other HDR10+ displays; combinable with Dolby Vision: one file, every display picks what it understands.</span>
     </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="hpexport" style="width:auto;padding:0;accent-color:var(--green);">
-        Export HDR10+ <span class="hint">(experimental)</span> <span class="hint" id="hphint">(needs RTX HDR on)</span>
+        Add HDR10+ metadata <span class="hint">(experimental)</span> <span class="hint" id="hphint">(needs RTX HDR on)</span>
       </label>
     </div>
     <div id="hpsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -323,7 +329,7 @@
 
   <div class="row">
     <button id="go" disabled>Smooth It!</button>
-    <button id="cancel" disabled title="Stops this render and deletes its progress. A cancelled render cannot be resumed - to continue later, use Pause or just close the app instead.">Cancel</button>
+    <button id="cancel" disabled title="Stops this render and deletes its progress. A cancelled render cannot be resumed. To continue later, use Pause or just close the app instead.">Cancel</button>
     <button id="open" disabled>Open folder</button>
     <button id="play" disabled>Play video</button>
     <span id="status" class="hint">Select a video to begin.</span>
@@ -1067,6 +1073,7 @@ function effSatBoost(){ return $('hdrdynvib').checked ? (+$('hdrsb').value || 0)
 function syncHdrColor(){
   const showHdr = $('rtxhdr').checked && rtxReady.hdr && !(info && info.srcHdr);
   $('hdrtonewrap').style.display = showHdr ? 'inline-flex' : 'none';  // RTX HDR's own Contrast + Saturation
+  $('hdrpurewrap').style.display = showHdr ? '' : 'none';   // the pure-conversion recipe under the sliders
   $('hdrcolorwrap').style.display = showHdr ? '' : 'none';
   // RTX HDR's sliders are always live; the Dynamic Vibrance sliders belong to that feature and sit
   // greyed out until it is switched on (unchecked = no vibrance, like the App).
@@ -1329,6 +1336,12 @@ $('changeout').onclick = async () => {
 };
 $('cancel').onclick = async () => {
   cancelled = true; $('cancel').disabled = true; $('status').textContent = 'Cancelling...';
+  // The bar and live thumbnail describe progress that is being deleted: reset them right away
+  // (engine-out drops any PROGRESS still flushing from the dying engine while cancelled, so
+  // nothing can repaint the bar between this reset and engine-done).
+  clearInterval(etaTimer); etaTimer = null;
+  $('fill').style.width = '0%'; $('pct').textContent = '0%'; $('frames').textContent = '';
+  $('livewrap').style.display = 'none'; $('live').style.display = 'none';
   // invoke resolves only after main killed the engine AND deleted the .part/resume artifacts,
   // so the probe below sees the truth (engine-done skips its own probe on a cancelled run).
   try { await ipcRenderer.invoke('cancel'); } catch {}
@@ -1349,7 +1362,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
   // frame/elapsed feeding the ETA reflect the newest count, never a stale one from the batch.
   let m = null, g = /PROGRESS\s+(\d+)\/(\d+)/g, x;
   while((x = g.exec(t)) !== null) m = x;
-  if(m){ const done=+m[1], tot=+m[2]||1;
+  if(m && !cancelled){ const done=+m[1], tot=+m[2]||1;
     // Clamp to [0,1]: a missing/zero denominator (e.g. an MKV with no nb_frames) would
     // otherwise make frac huge and send the bar past 100% (the runaway 9999999% bug).
     const frac = Math.min(1, Math.max(0, done/tot));
@@ -1376,7 +1389,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
       etaAnchorTime = now;
     }
     paint();
-  } else {
+  } else if(!m) {   // PROGRESS chunks are never logged; while cancelled they are dropped entirely
     if(/\[trt\] building/.test(t)) $('status').textContent = 'Building TensorRT engines (one time for this resolution)...';
     // OUTFRAMES is machine-only, and the engine's "done ..." line duplicates the ">> Saved: <path>"
     // the GUI prints on engine-done - strip both from the GUI log (they still show in CLI output).
@@ -1399,7 +1412,8 @@ ipcRenderer.on('engine-done', (_e, code) => {
   // (done / cancelled / failed) restores it and the batch auto-advance below re-enters startRun.
   goMode = 'idle'; $('go').textContent = 'Smooth It!'; $('go').title = '';   // checkResume below re-fills the tooltip
   clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
-  clearInterval(liveTimer); liveTimer = null; updateLive();   // final pull: the last written frame
+  // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
+  clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
   $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; $('interp').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');

@@ -7,7 +7,7 @@ Build instructions, architecture, the engine CLI, and design rationale. For the 
 
 Works end to end. The packaged build is fully self-contained: a recipient extracts the zip and runs
 `SmoothMyVideo.exe`, no Python, no pip, no ffmpeg, only the NVIDIA driver. Built and tested on an
-RTX 5090 Laptop (Blackwell, sm_120); the CUDA 13 stack (torch 2.12.1+cu130, cupy-cuda13x, TensorRT
+RTX 5090 Laptop (Blackwell, sm_120); the CUDA 13 stack (torch 2.13.0+cu130, cupy-cuda13x, TensorRT
 cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
 
 ## Architecture
@@ -66,7 +66,7 @@ binary didn't download: `node node_modules/electron/install.js`.
   [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases) CPython 3.14
   `install_only` win64 build to `engine/runtime`, then:
 ```
-engine\runtime\python.exe -m pip install torch==2.12.1 torchvision --index-url https://download.pytorch.org/whl/cu130
+engine\runtime\python.exe -m pip install torch==2.13.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 engine\runtime\python.exe -m pip install -r engine\requirements.txt
 ```
 `requirements.txt` pulls cupy-cuda13x, the **unsuffixed** `nvidia-cuda-nvrtc` / `nvidia-cuda-runtime` cu13

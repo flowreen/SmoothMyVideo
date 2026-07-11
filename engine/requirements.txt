@@ -1,5 +1,5 @@
 # 1) torch first (Blackwell cu130 wheel):
-#    engine\runtime\python.exe -m pip install torch==2.12.1 torchvision --index-url https://download.pytorch.org/whl/cu130
+#    engine\runtime\python.exe -m pip install torch==2.13.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 # 2) then: engine\runtime\python.exe -m pip install -r requirements.txt
 numpy
 opencv-python
