@@ -99,7 +99,7 @@ portable bundle.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--fruc] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 * `<multi>` integer multiplier, or `--fps TARGET` to resample to any output fps (the model interpolates at
   arbitrary fractional timesteps; `<multi>` is required positionally but ignored when `--fps` is given).
@@ -111,6 +111,11 @@ engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--sca
   27.9 dB, same worst frame). Pass an explicit value to override.
 * `--sharpen S` (0..1) FSR-style RCAS on every output frame (bare `--sharpen` = 0.8; off unless given).
 * `--no-interp` re-encodes at source fps with sharpen only (no model/TRT loaded).
+* `--fruc` "Nvidia Smooth Motion": interpolates on the OFA hardware via NVIDIA's NvOFFRUC library
+  instead of GMFSS (lower quality; ghosts on fast/large motion, inherent to the optical-flow model).
+  Needs `NvOFFRUC.dll` + `cudart64_110.dll` user-installed into `engine/nvoffruc` from the Optical
+  Flow SDK .zip (the GUI's Smooth Motion checkbox offers a one-time installer); GMFSS stays the
+  default and the quality path. `--fruc-native` is a debug variant (real frames + FRUC tweens).
 * `--restore` runs the Real-ESRGAN detail pass per output frame, before the upscale (works with `--no-interp`).
 * `--upscale F` spatial upscale just before encode (bare = 1.5, clamp 16.0; above 8192 px auto-switches to
   a CPU AV1/VVC encoder). `--rtx-vsr` uses RTX Video Super Resolution, else bicubic.
@@ -261,7 +266,7 @@ anything else).
   `cuda-pathfinder`, so the old `_add_cuda_dll_dirs` nvrtc shim is no longer load-bearing.
 * **RTX bridge:** keep the **cu12**-built `rtxvideo_cuda.dll` and ship `cudart64_12.dll` beside it, NGX's
   static import lib is CUDA-12-ABI, so a bridge relinked against CUDA 13 crashes in `create()`
-  (see `engine/rtxvideo/build_src/BUILD.md`).
+  (see "Building the native bridges" below).
 * **Runtime:** keep `engine/runtime` a relocatable python-build-standalone install, never a `venv`.
 * **Renderer:** uses `require('electron')` with `nodeIntegration`, so it can't run in a plain browser,
   launch via `npm start`, the shortcut, or the vbs.
@@ -272,10 +277,16 @@ The zip is ~4.4 GB, which exceeds GitHub's 2 GiB release-asset cap, so binaries 
 and GitHub carries the release page (notes + `.sha256`). The ceremony:
 
 1. Bump `version` in package.json, commit and push.
-2. `npm run dist` → `release/SmoothMyVideo-<v>-win.zip` + `.sha256` (staging folder auto-cleans).
-3. Upload to SourceForge (web UI caps at 500 MB, use SFTP):
+2. `npm run dist` → `release/SmoothMyVideo-<v>-win.zip` + `.sha256` (staging folder auto-cleans),
+   then `git archive --format=zip -o release/SmoothMyVideo-<v>-src.zip HEAD` for the source snapshot.
+3. Upload BOTH zips to SourceForge (web UI caps at 500 MB, use SFTP; create the `<v>` folder on the
+   Files tab first, scp does not mkdir):
    `scp release/SmoothMyVideo-<v>-win.zip flowreen@frs.sourceforge.net:/home/frs/project/smoothmyvideo/<v>/`
-   then on the Files tab mark the new file as the default Windows download (the ⓘ icon).
+   then on the Files tab mark the new win.zip as the default Windows download (the ⓘ icon).
+   The src.zip is not optional: SF hosting is "solely for Open Source software development" and a
+   binary-only project on a fresh account was removed without notice (2026-07-11, the original
+   1.0.0 project vanished 1-2 days after creation; recreated with MIT license category, GitHub
+   homepage, full description AND the source zip alongside the binary).
 4. Tag `v<v>` on the release commit and push the tag (Sourcetree: right-click → Tag → "Push tag").
 5. Create the GitHub release for the tag: paste the notes, attach the `.sha256`.
 
@@ -318,7 +329,141 @@ with `latest`, a fresh setup after a major release would silently pull a breakin
 typescript-eslint support is slated for 7.1; the compile-speed win is irrelevant at this project's size.
 
 ## Dev toolchain
-The dev machine has VS 2019 Build Tools (MSVC `cl.exe` 19.29) + the Windows 10 SDK, enough to build the
-RTX Video bridge, the NGX SDK's entry points live in a static import lib (`nvsdk_ngx_s.lib`), so ctypes
-alone can't reach them (recipe in `engine/rtxvideo/build_src/BUILD.md`). Nothing that needs MSVC is
-bundled; a recipient still needs only the NVIDIA driver.
+The dev machine has VS 2019 Build Tools (MSVC `cl.exe` 19.29) and VS 2026 Community (`cl.exe` 19.51) +
+the Windows 10 SDK, enough to build both native bridges below; the NGX SDK's entry points live in a
+static import lib (`nvsdk_ngx_s.lib`), so ctypes alone can't reach them (recipe in "Building the native
+bridges" below). Nothing that needs MSVC is bundled; a recipient still needs only the NVIDIA driver.
+
+## Building the native bridges
+
+The engine reaches both NVIDIA runtimes through small locally-built cdecl DLLs driven by ctypes. Their
+sources live in `engine/rtxvideo/build_src/` and `engine/nvoffruc/build_src/`; this section is the
+build documentation for both.
+
+### RTX Video bridge (`rtxvideo_cuda.dll`)
+
+A small CUDA bridge that lets `engine/rtxvideo.py` drive NVIDIA's RTX Video SDK (RTX VSR + TrueHDR).
+It statically links the SDK's `nvsdk_ngx_s.lib`, so the built DLL is **not redistributable**; only the
+sources are committed. You only need to rebuild it after updating the RTX Video SDK or moving to a
+different CUDA runtime.
+
+**Sources** (`engine/rtxvideo/build_src/`):
+* `rtx_video_api_cuda_impl.cpp` - the SDK's CUDA convenience layer (`samples/RTX_Video_API/`), copied
+  so its `#include "utils.h"` picks up our override below.
+* `utils.h` - overrides the SDK's hardcoded `APP_PATH` with an extern global so the model path can be
+  set at runtime (`g_rtxv_model_path`).
+* `rtxvideo_pathshim.cpp` - defines that global and exports `rtxv_set_model_path(const wchar_t*)`.
+* `rtxvideo.def` - the exported C symbols (extern "C", undecorated on x64).
+
+**Toolchain** (verified on this machine): MSVC v142 (VS2019 Build Tools, `cl.exe` 19.29) via
+`VC\Auxiliary\Build\vcvars64.bat`; RTX Video SDK at `D:\AIStuff\RTX_Video_SDK` (headers in `include/`,
+`nvsdk_ngx_s.lib` in `lib\Windows\x64`, feature DLLs in `bin\Windows\x64\rel`); CUDA headers/libs come
+from the bundled torch runtime wheel (no separate CUDA Toolkit needed):
+`engine\runtime\Lib\site-packages\nvidia\cuda_runtime\{include, lib\x64}`.
+
+**Recipe** - from an `x64 Native Tools` prompt (or after vcvars64.bat), in `engine/rtxvideo/build_src/`:
+
+```
+set SDK=D:\AIStuff\RTX_Video_SDK
+set RT=..\..\runtime\Lib\site-packages\nvidia\cuda_runtime
+cl /nologo /LD /EHsc /MT /DNDEBUG ^
+   /I"%SDK%\include" /I"%SDK%\samples\RTX_Video_API" /I"%RT%\include" ^
+   rtx_video_api_cuda_impl.cpp rtxvideo_pathshim.cpp ^
+   /Fe:rtxvideo_cuda.dll ^
+   /link /DEF:rtxvideo.def /LIBPATH:"%SDK%\lib\Windows\x64" /LIBPATH:"%RT%\lib\x64" ^
+   nvsdk_ngx_s.lib cuda.lib cudart.lib user32.lib shell32.lib advapi32.lib
+```
+
+Then copy `rtxvideo_cuda.dll` up into `engine/rtxvideo/` next to `nvngx_vsr.dll` + `nvngx_truehdr.dll`
+(NGX resolves the feature DLLs relative to the loading module, so co-location is what matters).
+
+Gotchas:
+* `/MT` (static CRT) is required - `nvsdk_ngx_s.lib` uses the static CRT; `/MD` gives LNK4098 +
+  unresolved CRT symbols.
+* `cudart.lib` is required (the NGX static lib references `cudaGetDevice`/`cudaGetDeviceProperties`
+  to map the CUDA device to an adapter LUID); `user32`/`shell32`/`advapi32` are also needed.
+* The feature DLLs (`nvngx_vsr.dll`, `nvngx_truehdr.dll`) are obtained from the RTX Video SDK and
+  placed in `engine/rtxvideo/` - in the app, the in-GUI "Install runtime" button does this.
+
+**CUDA 13 runtimes - do NOT rebuild this bridge against CUDA 13.** NVIDIA's `nvsdk_ngx_s.lib` is built
+for the **CUDA 12** runtime ABI: internally it calls `cudaGetDeviceProperties` with a CUDA 12-sized
+`cudaDeviceProp`. Link a CUDA 13 `cudart` and the runtime writes the larger CUDA 13 struct into that
+smaller buffer, overrunning the stack - the process dies with `0xC0000409` (STATUS_STACK_BUFFER_OVERRUN)
+inside NGX `create()`. Verified: a bridge relinked against `cudart64_13` (whether via the wheel's static
+`cudart.lib` or a synthesized dynamic import lib) loads fine but crashes in `create()`. We cannot
+recompile NVIDIA's lib. So to run under a **CUDA 13** runtime (torch `cu130` etc.), keep the **cu12
+bridge exactly as built** and just drop `cudart64_12.dll` next to it in `engine/rtxvideo/` (a cu13
+runtime ships only `cudart64_13.dll`, so the bridge's `cudart64_12` import would otherwise be
+unresolved). The bridge uses cu12 `cudart` for its read-only device-property / LUID query (matching
+NGX's ABI) while torch uses cu13 `cudart` separately; the CUDA **driver** context is shared (driver
+API, version agnostic), so VSR and TrueHDR run correctly. Validated end to end on torch 2.12.1+cu130 +
+cupy-cuda13x.
+
+### Nvidia Smooth Motion bridge (`nvoffruc_bridge.dll`)
+
+The bridge between the Python engine and NVIDIA's `NvOFFRUC.dll` (Optical Flow SDK FRUC), i.e. the
+"Nvidia Smooth Motion" interpolation model. Same idea as the RTX bridge: our source compiles to a small
+cdecl DLL that ctypes drives; the NVIDIA runtime DLLs stay user-installed.
+
+> This bridge contains source code provided by NVIDIA Corporation (it `#include`s the SDK's
+> `NvOFFRUC.h` and `SecureLibraryLoader.h` and follows the NvOFFRUCSample sequence). Ship the built
+> DLL, not the SDK.
+
+**Prerequisites:**
+* Visual Studio with the Desktop C++ workload. **No CUDA Toolkit is needed** - the bridge uses only the
+  CUDA *driver* API from `nvcuda.dll`, so it links only the Win32 crypto libs.
+* The **NVIDIA Optical Flow SDK** extracted somewhere (e.g. the `Optical_Flow_SDK_5.0.7` folder;
+  EULA-gated download from NVIDIA). We need its headers on the include path:
+  `<SDK>/NvOFFRUC/Interface` (`NvOFFRUC.h`) and `<SDK>/NvOFFRUC/NvOFFRUCSample/inc`
+  (`SecureLibraryLoader.h`).
+
+**Build** (x64 Native Tools Command Prompt, in `engine/nvoffruc/build_src/`):
+
+```bat
+set SDK=C:\path\to\Optical_Flow_SDK_5.0.7
+
+cl /LD /O2 /EHsc /std:c++17 nvoffruc_bridge.cpp ^
+   /I "%SDK%\NvOFFRUC\Interface" ^
+   /I "%SDK%\NvOFFRUC\NvOFFRUCSample\inc" ^
+   /Fe:nvoffruc_bridge.dll ^
+   /link crypt32.lib wintrust.lib
+```
+
+Verified to compile clean with VS2019 BuildTools (cl 19.29) and VS 2026 Community (cl 19.51).
+`SecureLibraryLoader.h` already `#pragma comment`s `crypt32`/`wintrust`; they are listed above too so
+the command is copy-pasteable. No CUDA include or link is needed.
+
+**Install** (runtime layout in `engine/nvoffruc/`) - three files sit together:
+* `nvoffruc_bridge.dll` - built above. It is ours, so it is **committed and shipped** in the package.
+* `NvOFFRUC.dll` - from `<SDK>/NvOFFRUC/NvOFFRUCSample/bin/win64/` (NVIDIA proprietary, user-installed
+  via the GUI "Choose .zip" step, not redistributed, gitignored).
+* `cudart64_110.dll` - from the same `bin/win64/` folder (NvOFFRUC.dll depends on it; also gitignored).
+
+`SecureLoadLibrary` resolves the bare name `NvOFFRUC.dll` against BOTH the working directory (its
+signature / `WinVerifyTrust` calls) and the DLL search path, so the bridge temporarily sets its own
+folder as the current directory (plus `SetDllDirectory`) around the load, then restores it. That is
+what makes the signed load and its `cudart64_110.dll` dependency resolve regardless of the process
+working directory. (Passing a full path instead does not work: the loader hardcodes the bare name.)
+
+**Hardware note:** the Optical Flow hardware (OFA) exists on Turing through **Blackwell**
+(RTX 20/30/40/50). Per the SDK's `Deprecation_Notices.pdf` (Jan 2026) the OFA is being removed on GPUs
+*after* Blackwell, where this bridge will not function. This is the inferior/faster model on purpose;
+GMFSS stays the default.
+
+**Sync fences (2026-07-11):** `nvoffruc_interpolate` calls `cuCtxSynchronize` twice: once at entry
+while the CALLER's context is still current (drains e.g. torch's kernels so the input surfaces are
+fully written before the bridge's `cuMemcpyDtoD` reads them) and once on its own context before
+returning (so the warp + out-copy have landed before the caller reads the output buffer). CUDA does not
+order one context's null stream against another context's streams, and without the fences every tween
+rendered under torch 2.13 was sliced at horizontal seams (torch 2.12 won the race by timing).
+Verified: 5 renders x 24 tweens all seam-free.
+
+**Debugging history** (kept because both cost real time): the original "access violation reading a
+device pointer" on the first `Process` was a POINTER-INDIRECTION bug - FRUC's `pFrame` and every
+registered `pArrResource` entry must be a `CUdeviceptr*` (the HOST address of the variable holding the
+device pointer, exactly as `NvOFFRUCSample` passes `&m_pRenderFrameCudaMemPtr[i]`), and
+`nCuSurfacePitch` must be `width*4`. And the priming `Process` call sets `bSkipWarp = 1` (a state-only
+feed of I0): without it the prime warps against stale state, polluting the temporal hints that FRUC's
+"bad quality → repeat a source frame" fallback depends on. FRUC's tearing on fast anime motion is
+inherent to the optical-flow model - it was verified against NVIDIA's own `NvOFFRUCSample` output; the
+RTX 5090 (Blackwell) runs the Feb-2023 `NvOFFRUC.dll` correctly once driven this way.

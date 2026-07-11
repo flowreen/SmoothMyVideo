@@ -257,6 +257,12 @@ ipcMain.handle('screen-size', () => {
 const RTX_DIR = path.join(ENGINE, 'rtxvideo');
 const RTX_FEATURE_DLLS = ['nvngx_vsr.dll', 'nvngx_truehdr.dll'];
 const RTX_SDK_URL = 'https://developer.nvidia.com/rtx-video-sdk/getting-started';
+// NvOFFRUC ("Nvidia Smooth Motion"): our bridge (nvoffruc_bridge.dll) is locally built and ships,
+// but NvOFFRUC.dll + cudart64_110.dll are NVIDIA proprietary and user-installed from the Optical
+// Flow SDK .zip - same EULA-gated, non-redistributable pattern as the RTX feature DLLs.
+const NVOFFRUC_DIR = path.join(ENGINE, 'nvoffruc');
+const NVOFFRUC_DLLS = ['NvOFFRUC.dll', 'cudart64_110.dll'];
+const OF_SDK_URL = 'https://developer.nvidia.com/opticalflow/download';
 const SYS_TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
 const fileExists = (p: string) => {
   try {
@@ -383,6 +389,47 @@ function installRtx(source: string): { ok: boolean; error?: string; copied: stri
   return { ok: true, copied };
 }
 
+// Copy NvOFFRUC.dll + cudart64_110.dll out of a chosen Optical Flow SDK .zip (or extracted folder)
+// into engine/nvoffruc, beside the locally built bridge. Mirrors installRtx.
+function installFruc(source: string): { ok: boolean; error?: string; copied: string[] } {
+  try { fs.mkdirSync(NVOFFRUC_DIR, { recursive: true }); } catch { /* exists */ }
+  let srcFiles: string[] = [];
+  try {
+    const found: string[] = [];
+    const walk = (d: string) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p); else if (NVOFFRUC_DLLS.includes(e.name)) found.push(p);
+    } };
+    if (/\.zip$/i.test(source)) {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'smv-fruc-'));
+      execFileSync(SYS_TAR, ['-xf', source, '-C', tmp, '*NvOFFRUC.dll', '*cudart64_110.dll']);
+      walk(tmp);
+    } else {
+      walk(source);
+    }
+    // The SDK ships win32 + win64 copies; take the x64 build (basename filter drops the __MACOSX ._ junk).
+    const pick = (n: string) => { const all = found.filter((f) => path.basename(f) === n);
+      return all.find((f) => /win64/i.test(f)) || all[0]; };
+    srcFiles = NVOFFRUC_DLLS.map(pick).filter((f): f is string => !!f);
+  } catch (e) { return { ok: false, error: String(e), copied: [] }; }
+  const present = srcFiles.filter(fileExists);
+  if (present.length < NVOFFRUC_DLLS.length)
+    return { ok: false, error: 'NvOFFRUC.dll / cudart64_110.dll not found in the selected Optical Flow SDK', copied: [] };
+  const copied: string[] = [];
+  try {
+    for (const f of present) {
+      const dest = path.join(NVOFFRUC_DIR, path.basename(f));
+      try { if (fileExists(dest)) fs.chmodSync(dest, 0o666); } catch { /* best effort */ }
+      fs.copyFileSync(f, dest);
+      copied.push(path.basename(f));
+    }
+  } catch (e) {
+    return { ok: false, error: 'Could not write the FRUC DLLs into engine/nvoffruc (' + String(e)
+      + '). If a render is running, stop it and try again.', copied };
+  }
+  return { ok: true, copied };
+}
+
 ipcMain.handle('rtx-ready', () => {
   const bridge = fileExists(path.join(RTX_DIR, 'rtxvideo_cuda.dll'));
   return {
@@ -426,6 +473,30 @@ ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
           filters: [{ name: 'Zip', extensions: ['zip'] }],
         },
   );
+  return r.canceled ? null : r.filePaths[0] || null;
+});
+
+// "Nvidia Smooth Motion" (NvOFFRUC) runtime: ready only when our bridge AND NvOFFRUC.dll are present.
+ipcMain.handle('fruc-ready', () => {
+  const bridge = fileExists(path.join(NVOFFRUC_DIR, 'nvoffruc_bridge.dll'));
+  const dll = fileExists(path.join(NVOFFRUC_DIR, 'NvOFFRUC.dll'));
+  return { ready: bridge && dll, bridge, dll, dir: NVOFFRUC_DIR };
+});
+ipcMain.handle('fruc-open-download', () => {
+  shell.openExternal(OF_SDK_URL);
+  return true;
+});
+ipcMain.handle('fruc-install', (_e, source?: string) => {
+  if (!source)
+    return { ok: false, error: 'No Optical Flow SDK selected. Use "Get from NVIDIA", then "Choose .zip".', copied: [] };
+  return installFruc(source);
+});
+ipcMain.handle('fruc-choose', async () => {
+  const r = await dialog.showOpenDialog(win!, {
+    title: 'Select the Optical Flow SDK .zip',
+    properties: ['openFile'],
+    filters: [{ name: 'Zip', extensions: ['zip'] }],
+  });
   return r.canceled ? null : r.filePaths[0] || null;
 });
 
@@ -656,6 +727,7 @@ ipcMain.on(
       sharpen?: number;
       restore?: boolean;
       interp?: boolean;
+      model?: string;
       upscale?: number;
       rtxvsr?: boolean;
       rtxhdr?: boolean;
@@ -676,6 +748,7 @@ ipcMain.on(
     // so tell the engine to skip frame generation (and ignore any fps/multi) entirely.
     if (opts.interp === false) args.push('--no-interp');
     else {
+      if (opts.model === 'fruc') args.push('--fruc'); // "Nvidia Smooth Motion" backend instead of GMFSS
       if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
     }
     // FSR-style RCAS sharpening strength (GUI checkbox + slider). 0/omitted = off, leaving the
@@ -763,9 +836,26 @@ ipcMain.on(
       }
       if (txt) send('engine-out', txt);
     };
-    proc.stdout.on('data', onData);
+    // NvOFFRUC.dll printfs "Optical Flow Grid Size: N" to stdout on handle create, and the text can
+    // arrive SPLIT across chunks (an orphan "4" once reached the log), so a per-chunk regex is not
+    // enough: line-buffer stdout, strip matching COMPLETE lines, and flush the tail on close. stderr
+    // (the engine's own output, incl. PROGRESS) stays unbuffered for realtime progress.
+    let outCarry = '';
+    const stripGridSize = (s: string) => s.replace(/^.*Optical Flow Grid Size:.*\r?\n?/gm, '');
+    const onStdout = (buf: Buffer) => {
+      outCarry += buf.toString();
+      const nl = outCarry.lastIndexOf('\n');
+      if (nl < 0) return;
+      const txt = stripGridSize(outCarry.slice(0, nl + 1));
+      outCarry = outCarry.slice(nl + 1);
+      if (txt) onData(Buffer.from(txt));
+    };
+    proc.stdout.on('data', onStdout);
     proc.stderr.on('data', onData);
     proc.on('close', (code) => {
+      const tail = stripGridSize(outCarry);
+      outCarry = '';
+      if (tail) send('engine-out', tail);
       current = null;
       clearPause();
       keepAwake(false);

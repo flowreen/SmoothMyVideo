@@ -13,6 +13,8 @@ npm-debug.log*
 # engine: generated, fetched, and non-redistributable files kept out of git (caches, the Python runtime, ffmpeg, NVIDIA DLLs)
 __pycache__/
 engine/bin/
+engine/nvoffruc/NvOFFRUC.dll
+engine/nvoffruc/cudart64_110.dll
 engine/rtxvideo/nvngx_truehdr.dll
 engine/rtxvideo/nvngx_vsr.dll
 engine/rtxvideo/build_src/*.obj

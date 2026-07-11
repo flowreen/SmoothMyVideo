@@ -151,6 +151,37 @@
              placeholder="output file path" style="flex:1;min-width:0;font-size:16px"></div>
   </div>
 
+  <div class="panel" id="modelpanel">
+    <div class="row" style="margin-bottom:2px">
+      <span class="k">Interpolation model</span>
+      <span class="hint">Which engine generates the in-between frames.</span>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="modelgmfss" checked
+               style="width:auto;padding:0;accent-color:var(--green);">
+        GMFSS <span class="hint">(AI, best quality, the default)</span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" id="modelfruclabel" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="modelfruc"
+               style="width:auto;padding:0;accent-color:var(--green);">
+        Nvidia Smooth Motion <span class="hint">(NVIDIA optical-flow hardware, lower quality than GMFSS)</span>
+      </label>
+    </div>
+    <div id="frucsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px"><span id="frucstatus" class="v">checking...</span></div>
+      <div class="hint" id="frucsteps" style="line-height:1.6;margin-bottom:8px"></div>
+      <div class="row" id="frucbtns" style="flex-wrap:wrap;gap:6px">
+        <button id="frucget" class="mini">Get from NVIDIA</button>
+        <button id="frucbrowsezip" class="mini">Choose .zip&hellip;</button>
+      </div>
+    </div>
+  </div>
+
   <div class="panel" id="rtxpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">NVIDIA RTX</span>
@@ -767,7 +798,7 @@ async function checkRtxReady(){
   } else {
     $('rtxstatus').textContent = '✗ NOT READY'; $('rtxstatus').style.color = '#e85c5c';
     const detail = rtxReady.bridge === false
-      ? 'The RTX bridge (rtxvideo_cuda.dll) is missing from engine/rtxvideo. Rebuild it (see build_src/BUILD.md).'
+      ? 'The RTX bridge (rtxvideo_cuda.dll) is missing from engine/rtxvideo. Rebuild it (see DEVELOPMENT.md, "Building the native bridges").'
       : 'Click <b>Get from NVIDIA</b>, then <b>Choose .zip&hellip;</b> and pick the downloaded RTX_Video_SDK&hellip;.zip. It installs automatically.';
     $('rtxsteps').innerHTML = lines.join('<br>') + '<br>' + detail;
   }
@@ -796,6 +827,68 @@ $('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').chec
 syncRtx();
 // Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
 ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); syncPreview(); });
+
+// Interpolation model: GMFSS (default) vs "Nvidia Smooth Motion" (NVIDIA Optical Flow FRUC). Two
+// checkboxes acting as an exclusive pair (user-chosen UX): ticking one clears the other, and
+// unticking the active one hands the choice back to its sibling, so exactly one model is always
+// selected. The FRUC runtime (NvOFFRUC.dll) is NVIDIA proprietary + user-installed from the Optical
+// Flow SDK .zip. The Smooth Motion checkbox is ALWAYS clickable (ticking it visibly clears GMFSS);
+// it just reveals a one-time installer when the runtime is missing, and a render only uses FRUC once
+// it is installed - otherwise it falls back to GMFSS (see modelIsFruc + the run payload gate below).
+let frucReady = false, frucBridge = false;
+function modelIsFruc(){ return $('modelfruc').checked && frucReady; }
+function frucSetupHtml(){
+  const detail = !frucBridge
+    ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
+    : 'Click <b>Get from NVIDIA</b>, then <b>Choose .zip&hellip;</b> and pick the downloaded Optical_Flow_SDK&hellip;.zip. It installs automatically. Until then GMFSS is used.';
+  return "Nvidia Smooth Motion uses NVIDIA's Optical Flow runtime (a one-time download, not bundled).<br>" + detail;
+}
+async function refreshFrucState(){
+  try { const r = await ipcRenderer.invoke('fruc-ready'); frucReady = !!(r && r.ready); frucBridge = !!(r && r.bridge); }
+  catch { frucReady = false; frucBridge = false; }
+}
+// Reflect the current model choice: show the installer only while Smooth Motion is chosen but missing.
+function syncModel(){
+  localStorage.setItem('interpModel', $('modelfruc').checked ? 'fruc' : 'gmfss');
+  if($('modelfruc').checked && !frucReady){
+    $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
+    $('frucsteps').innerHTML = frucSetupHtml();
+    $('frucbtns').style.display = '';
+    $('frucsetup').style.display = 'block';
+  } else {
+    $('frucsetup').style.display = 'none';
+  }
+}
+// Exclusive-pair behaviour: ticking a box clears its sibling; unticking the active box selects the
+// sibling instead (a model is always chosen, there is no "neither" state).
+function pickModel(box, other){
+  if(box.checked) other.checked = false;
+  else other.checked = true;
+  syncModel();
+}
+async function doFrucInstall(source){
+  $('frucsetup').style.display = 'block';
+  $('frucstatus').textContent = 'installing...'; $('frucstatus').style.color = 'var(--sub)';
+  let r = {}; try { r = await ipcRenderer.invoke('fruc-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
+  await refreshFrucState();
+  if(frucReady){ $('modelfruc').checked = true; $('modelgmfss').checked = false; localStorage.setItem('interpModel','fruc'); $('frucsetup').style.display = 'none'; }
+  else if(r.ok){   // NvOFFRUC.dll copied fine; readiness just needs the one-time bridge build
+    $('frucstatus').textContent = '✓ DLL installed'; $('frucstatus').style.color = 'var(--green)';
+    $('frucsteps').innerHTML = 'NvOFFRUC.dll installed. Last step: build <b>nvoffruc_bridge.dll</b> into '
+      + 'engine/nvoffruc once (see DEVELOPMENT.md, "Building the native bridges"). Until then GMFSS is used.';
+  } else {
+    $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
+    $('frucsteps').innerHTML = '✗ ' + (r.error || 'install failed') + '<br>' + frucSetupHtml();
+  }
+}
+$('frucget').onclick = () => ipcRenderer.invoke('fruc-open-download');
+$('frucbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('fruc-choose'); if(p) doFrucInstall(p); };  // selecting a .zip auto-installs
+$('modelgmfss').onchange = () => pickModel($('modelgmfss'), $('modelfruc'));
+$('modelfruc').onchange = () => pickModel($('modelfruc'), $('modelgmfss'));
+// On load: learn readiness, restore the saved choice, then reflect it (installer shows if Smooth
+// Motion is chosen but missing). Skipped while Interpolate is off: syncInterp() has cleared both
+// boxes and re-checking Interpolate restores the choice itself.
+refreshFrucState().then(() => { if(!interpOn()) return; if(localStorage.getItem('interpModel') === 'fruc'){ $('modelfruc').checked = true; $('modelgmfss').checked = false; } syncModel(); });
 
 // --- Dolby Vision export tools (mirrors the RTX library flow) ------------------------------------
 // DV 8.1 export needs ONE non-shippable open-source binary - dovi_tool - dropped into engine/dvtools;
@@ -1176,7 +1269,20 @@ $('prevproc').onclick = togglePrevZoom;
 // rate controls are greyed, the output keeps the source frame rate, and the engine skips the
 // model entirely. The on/off state persists between sessions; default on.
 function syncInterp(){
-  $('screenfps').disabled = !interpOn();
+  const on = interpOn();
+  $('screenfps').disabled = !on;
+  // No interpolation = no interpolation model: clear and grey BOTH model checkboxes while the
+  // master toggle is off (user-chosen UX: the panel visibly reflects that nothing will generate
+  // frames). Re-checking Interpolate restores the saved model choice from localStorage.
+  $('modelgmfss').disabled = $('modelfruc').disabled = !on;
+  if(!on){
+    $('modelgmfss').checked = false; $('modelfruc').checked = false;
+    $('frucsetup').style.display = 'none';
+  } else {
+    const fruc = localStorage.getItem('interpModel') === 'fruc';
+    $('modelfruc').checked = fruc; $('modelgmfss').checked = !fruc;
+    syncModel();
+  }
   applyScreenFps();      // recomputes multi/fpsin enable, the fps mode, and the output name
 }
 if(localStorage.getItem('interp') === '0') $('interp').checked = false;
@@ -1288,6 +1394,7 @@ function startRun(){
   log('>> '+input+'  ->  '+what+extra+'\n');
   const payload = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
   if(interpOn() && !gm) payload.fps = t;                                             // resample only: non-integer-multiple target
+  if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "Nvidia Smooth Motion" (NvOFFRUC) backend
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
   payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)

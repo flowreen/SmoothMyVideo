@@ -33,7 +33,7 @@ the target fps with real endpoints, so a 2-frame clip at 2x is 3 frames (real, t
 matches how RIFE/DAIN report 2N-1; duration is ~(M-1)/(M*fps) shorter than the source (the last
 frame has no slot after it to fill). See the on-grid loop near the bottom of this file.
 
-Legacy off-grid look (GMFSS --fps mode): here NO emitted frame sits on a source
+Legacy off-grid look (FRUC any mode, and GMFSS --fps mode): here NO emitted frame sits on a source
 timestamp - the grid is shifted by half an output step (timesteps 1/2M, 3/2M ... (2M-1)/2M for
 integer M; the analogous offset in --fps mode), so every frame incl. the first/last is a generated
 interior blend and the last source frame's slot is filled by holding the last generated frame.
@@ -43,13 +43,19 @@ path above supersedes it for the common GMFSS multiplier case because real endpo
 timed on-grid interior frames read as higher quality than an all-synthetic half-step-shifted grid.
 
 Usage: gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt]
-       [--sharpen S] [--no-interp] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
+       [--sharpen S] [--no-interp] [--fruc] [--upscale F] [--rtx-vsr] [--rtx-hdr] [--hdr-nits N]
        [--out-bits {8,10}] [--restore]
        --fps overrides <multi>, resampling the timeline to TARGET output fps.
        --sharpen S applies FSR-style RCAS sharpening (strength 0..1) to every output frame to
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
        --no-interp skips interpolation entirely: the clip is only re-encoded at its source fps
        with --sharpen applied, for users who just want the sharpening and not the smoothing.
+       --fruc uses NVIDIA Optical Flow FRUC (the "Nvidia Smooth Motion" model) instead of GMFSS:
+       hardware optical-flow interpolation, much faster but visibly lower quality (the inferior
+       option). Needs the engine/nvoffruc bridge + NvOFFRUC.dll; still honours --upscale/--rtx-hdr.
+       Every source pair is interpolated uniformly on the same output-slot grid, so
+       near-identical drawings (anime on twos/threes) get the same even motion as real motion
+       and the source's own frame timings are preserved exactly; nothing is held or retimed.
        --restore runs Real-ESRGAN's anime-video model (bundled realesr-animevideov3) on every
        output frame to clean noise and redraw linework (fine texture can flatten), before the
        upscale (without RTX VSR its 4x output directly feeds the upscale). Off by default;
@@ -203,11 +209,31 @@ ap.add_argument("--hdr-satboost", type=float, default=0.0,
                      "--hdr-vibrance). Independent of "
                      "--hdr-saturation, which is RTX HDR's own TrueHDR knob, mirroring NVIDIA's two "
                      "separate filters. 0 (default) = off; inert in raw mode.")
+ap.add_argument("--fruc", action="store_true",
+                help="'Nvidia Smooth Motion': hardware optical-flow interpolation via NVIDIA's NvOFFRUC "
+                     "library (the Optical Flow SDK's frame-rate up-conversion) instead of GMFSS - a "
+                     "lower-quality alternative that runs on the OFA hardware (speed is GPU/content "
+                     "dependent, not necessarily faster than the TensorRT GMFSS path). We feed it "
+                     "bisected frame pairs (recursive dyadic bisection + per-level OFA hint reset + a "
+                     "neighbourhood clamp) so it stays clean at 2x-16x. Needs a Turing..Blackwell GPU "
+                     "and NvOFFRUC.dll installed in engine/nvoffruc (from NVIDIA's Optical Flow SDK "
+                     ".zip). Ignores --no-trt; still honours --upscale/--rtx-hdr/"
+                     "--sharpen/--restore.")
+ap.add_argument("--fruc-native", action="store_true",
+                help="FRUC only: drive it in native passthrough mode (the way NvOFFRUCSample runs) - "
+                     "keep each real source frame and insert multi-1 FRUC tweens between reals, "
+                     "instead of the default uniform grid where every output frame is an off-grid "
+                     "tween. Reals stay pristine and the tweens are FRUC's best case (warps of real "
+                     "frames), which tears less on fast motion, at the cost of the mild sharp/soft "
+                     "shimmer the uniform grid avoids. Integer multipliers only; ignored in --fps mode "
+                     "and without --fruc.")
 args = ap.parse_args()
 
 inp = os.path.abspath(args.input)
 SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
+FRUC_MODE = args.fruc                        # NvOFFRUC ("Nvidia Smooth Motion") instead of GMFSS
+FRUC_NATIVE = bool(args.fruc_native)         # FRUC only: native passthrough (real frames + tweens)
 UPSCALE_F = max(1.0, min(16.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
                                              # RTX VSR has no integer-scale limit (probed clean to
                                              # 16K), so any factor is allowed up to a 16x sanity cap
@@ -531,6 +557,12 @@ if NO_INTERP:
     model = None
     sys.stderr.write("no-interp mode: GMFSS interpolation disabled "
                      "(re-encode at source fps with optional FSR sharpen)\n"); sys.stderr.flush()
+elif FRUC_MODE:
+    # "Nvidia Smooth Motion" backend (NVIDIA Optical Flow Accelerator): no GMFSS weights, no TensorRT.
+    # The OFA interpolator is created below, once the padded frame size (pw, ph) is known.
+    model = None
+    sys.stderr.write("Nvidia Smooth Motion backend (NVIDIA Optical Flow): GMFSS not loaded\n")
+    sys.stderr.flush()
 else:
     from model.GMFSS_infer_u import Model
     model = Model()
@@ -704,6 +736,25 @@ else:
 tmp = max(64, int(64 / scale))
 ph = ((H - 1) // tmp + 1) * tmp
 pw = ((W - 1) // tmp + 1) * tmp
+
+# "Nvidia Smooth Motion" interpolator, sized to the padded frame the loop passes it. Created here (not
+# at model-load) because the padded size is known only now. Backed by NVIDIA's NvOFFRUC library (the
+# Optical Flow SDK's frame-rate up-conversion: OFA flow -> warp+blend -> occlusion infill, all inside
+# NvOFFRUC.dll), driven through engine/nvoffruc. NvOFFRUC.dll + cudart64_110.dll are NVIDIA proprietary
+# and user-installed from the Optical Flow SDK .zip (see the GUI installer / README), not bundled; no
+# TensorRT. Each interpolated frame is a single raw NvOFFRUC warp at the requested timestep (no
+# bisection, no post-processing); on large motion NvOFFRUC ghosts, which is inherent to it (GMFSS is
+# the quality path).
+_ofa = None
+if FRUC_MODE and not NO_INTERP:
+    import nvoffruc
+    try:
+        _ofa = nvoffruc.NvOFFRUC(pw, ph)
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"Nvidia Smooth Motion (NvOFFRUC) unavailable: {e}. It needs a Turing..Blackwell GPU with "
+                 "the Optical Flow engine, and NvOFFRUC.dll installed in engine/nvoffruc (from NVIDIA's "
+                 "Optical Flow SDK .zip); or drop --fruc to use GMFSS.")
+    sys.stderr.write(f"Nvidia Smooth Motion ready (NvOFFRUC {pw}x{ph})\n"); sys.stderr.flush()
 
 def amp():
     return torch.autocast("cuda", dtype=torch.float16)
@@ -2009,7 +2060,7 @@ if NO_INTERP:
             f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n", out_frames=k)
 
 # =============================================================================================
-# On-grid passthrough interpolation (GMFSS; integer --multi; not --fps). The
+# On-grid passthrough interpolation (GMFSS or FRUC/Smooth Motion; integer --multi; not --fps). The
 # output timeline lands ON the source grid: EVERY real source frame passes through at its integer
 # timestamp (t=0,1,2,...,N-1) at full quality, and the M-1 generated tweens are inserted at the half
 # positions t=k+j/M between each consecutive pair. Total frames = multi*(N-1)+1 (2N-1 at 2x), the
@@ -2023,15 +2074,26 @@ if NO_INTERP:
 # pop are worse. A bracket inference(f[k-1], f[k+1], 0.5) skips f[k] entirely, so it smooths past f[k]'s
 # pose on non-linear motion (a wing at an extreme the neighbours do not bracket). Interpolating the two
 # neighbour tweens keeps f[k]'s motion but double-fades (generating between two already-generated
-# frames compounds GMFSS's softening). So we keep f[k].
-# Only --fps (arbitrary timeline, off the source grid) uses the legacy path below.
-if not FPS_MODE:
+# frames compounds GMFSS's softening) and outright collapses on NvOFFRUC. So both backends keep f[k].
+# Only --fps (arbitrary timeline, off the source grid) and --fruc-native use the legacy path below.
+if not FPS_MODE and not FRUC_NATIVE:
     _MTW = [j / args.multi for j in range(1, args.multi)]   # interior tween fractions j/M, on-grid
 
-    def _gen_tweens(a, b, fracs):
-        with amp():
-            reuse = model.reuse(a, b, scale)
-            return [to_bytes(model.inference(a, b, reuse, f)) for f in fracs]
+    if FRUC_MODE:
+        def _gen_tweens(a, b, fracs):
+            # NO reset() here: on-grid pairs are strictly consecutive (pair k+1 starts at pair k's
+            # end frame), so NvOFFRUC's temporal hints are always correct and the stream is fed the
+            # way NvOFFRUCSample feeds it. The per-pair reset the bisection era needed is not just
+            # unnecessary now - it BREAKS interpolation on current drivers: after a handle recreate,
+            # every warp collapses to an exact copy of I1 (verified 2026-07-11: create+interp = real
+            # midpoint at MAD 38/38 to the endpoints, any interp after reset() = I1 at MAD 0.0, old
+            # and new bridge alike). Do not reintroduce reset() in this streaming path.
+            return [to_bytes(_ofa.interpolate(a, b, f)) for f in fracs]
+    else:
+        def _gen_tweens(a, b, fracs):
+            with amp():
+                reuse = model.reuse(a, b, scale)
+                return [to_bytes(model.inference(a, b, reuse, f)) for f in fracs]
 
     prev0 = rq.get()
     if prev0 is None:
@@ -2071,14 +2133,15 @@ if not FPS_MODE:
     finally:
         _drain_pipes()
     # On-grid output is the real first frame plus M tweens/real per processed pair: multi*k + 1.
-    _finish(f"done {k} pairs -> {out_path}\n", out_frames=args.multi * k + 1)
+    _sm_note = f", NvOFFRUC ({getattr(_ofa, 'repeats', 0)} frame-repeats)" if _ofa is not None else ""
+    _finish(f"done {k} pairs{_sm_note} -> {out_path}\n", out_frames=args.multi * k + 1)
 
 # ---------------------------------------------------------------------------------------------
-# Legacy off-grid path: --fps mode only (GMFSS). --fps resamples to an arbitrary target fps
-# whose output times do not line up on the source grid, so it keeps the offset scheme: every emitted
-# frame is an interior blend on the _pair_fracs offset grid (no frame on a source timestamp), and
-# the last source frame's slot is filled by holding the last generated frame. Integer --multi is
-# handled on-grid above. See _pair_fracs and the module docstring.
+# Legacy off-grid path: --fps mode (GMFSS or FRUC) plus --fruc-native. --fps resamples to an
+# arbitrary target fps whose output times do not line up on the source grid, so it keeps the offset
+# scheme: every emitted frame is an interior blend on the _pair_fracs offset grid (no frame on a
+# source timestamp), and the last source frame's slot is filled by holding the last generated frame.
+# Integer --multi (both backends) is handled on-grid above. See _pair_fracs and the module docstring.
 prev = rq.get()
 if prev is None:
     sys.exit("no frames decoded")
@@ -2107,11 +2170,27 @@ try:
             fracs = fracs[_skip:]
             _skip = 0
         if fracs:
-            with amp():
-                reuse = model.reuse(I0, I1, scale)
-                for fr in fracs:
-                    last_out = to_bytes(model.inference(I0, I1, reuse, fr))
-                    wq.put(last_out)
+            if FRUC_MODE:
+                if FRUC_NATIVE and not FPS_MODE:
+                    # Native passthrough (debug flag): keep the pristine real frame at the slot start,
+                    # then insert multi-1 single raw NvOFFRUC tweens toward the next real frame.
+                    last_out = to_bytes(I0); wq.put(last_out)
+                    for j in range(1, args.multi):
+                        last_out = to_bytes(_ofa.interpolate(I0, I1, j / args.multi))
+                        wq.put(last_out)
+                else:
+                    # --fps mode: a single raw NvOFFRUC warp per output timestep (flow cached once per
+                    # source pair). FRUC integer --multi is handled on-grid above; this legacy path is
+                    # reached only for --fps and --fruc-native.
+                    for fr in fracs:
+                        last_out = to_bytes(_ofa.interpolate(I0, I1, fr))
+                        wq.put(last_out)
+            else:
+                with amp():
+                    reuse = model.reuse(I0, I1, scale)
+                    for fr in fracs:
+                        last_out = to_bytes(model.inference(I0, I1, reuse, fr))
+                        wq.put(last_out)
         nout += len(fracs)
         prev, I0 = cur, I1
         i += 1
@@ -2133,6 +2212,14 @@ try:
             wq.put(to_bytes(I0) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE or RESTORE_ACTIVE
                                     or DEC_FMT != OUT_RAW_FMT) else prev)
             nout += 1
+    elif FRUC_NATIVE and not FPS_MODE:
+        # Native passthrough closing slot: the last real frame stays pristine, held across its own
+        # interval so the output lands on exactly multi*frames (real + multi-1 holds).
+        real = to_bytes(I0)
+        for _ in range(args.multi):
+            last_out = real
+            wq.put(real)
+        nout += args.multi
     else:
         tail = math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)  # this path is --fps only
         for _ in range(tail):
@@ -2140,4 +2227,5 @@ try:
         nout += tail
 finally:
     _drain_pipes()
-_finish(f"done {k} pairs -> {out_path}\n", out_frames=nout)
+_sm_note = f", NvOFFRUC ({getattr(_ofa, 'repeats', 0)} frame-repeats)" if _ofa is not None else ""
+_finish(f"done {k} pairs{_sm_note} -> {out_path}\n", out_frames=nout)

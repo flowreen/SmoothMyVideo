@@ -79,6 +79,10 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 * 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
   detected and timed correctly, so audio never drifts out of sync.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
+* 🌀 **Optional Nvidia Smooth Motion model.** One checkbox switches the interpolation from the GMFSS AI
+  model to NVIDIA's hardware optical-flow FRUC (the same family as the driver-level Smooth Motion), for
+  when you want the NVIDIA look or a non-AI reference. Lower quality than GMFSS on fast motion; the
+  NVIDIA runtime is a one-time separate download (not bundled).
 * 🎚️ **Plus the essentials:** FSR-style sharpening, a live before/after preview, every setting remembered
   between runs, and a quiet one-line notice when a newer release is out (nothing auto-downloads).
 
