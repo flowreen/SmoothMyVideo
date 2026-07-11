@@ -337,9 +337,26 @@ if NO_INTERP:
     rate_str = f"{num}/{den}"
     out_label = int(round(src_fps))
 elif FPS_MODE:
-    ratio = args.fps / src_fps                 # output frames per source frame
-    rate_str = f"{args.fps:g}"
-    out_label = int(round(args.fps))
+    # --fps arrives as a decimal (the GUI's fps box), but decimals like 59.94 are the
+    # conventional SHORTHAND for exact NTSC rationals (60000/1001 = 59.9400599...). Encoding the
+    # literal decimal (2997/50) is a subtly wrong rate: ~1 frame of drift per 4.6 h against the
+    # copied audio. Snap the decimal to the rational it names - N/1 when it is an integer,
+    # N*1000/1001 when x1.001 lands on an integer (23.976, 29.97, 59.94, 119.88 ...) - and use
+    # that exact rate for the timeline ratio and the encoder. Anything else (a genuinely odd
+    # typed target) keeps the literal decimal.
+    tgt_num, tgt_den = None, None
+    if abs(args.fps - round(args.fps)) < 0.005:
+        tgt_num, tgt_den = int(round(args.fps)), 1
+    elif abs(args.fps * 1001 / 1000 - round(args.fps * 1001 / 1000)) < 0.005:
+        tgt_num, tgt_den = int(round(args.fps * 1001 / 1000)) * 1000, 1001
+    if tgt_num:
+        ratio = (tgt_num * den) / (tgt_den * num)  # output frames per source frame, exact
+        rate_str = f"{tgt_num}/{tgt_den}"
+        out_label = int(round(tgt_num / tgt_den))
+    else:
+        ratio = args.fps / src_fps                 # output frames per source frame
+        rate_str = f"{args.fps:g}"
+        out_label = int(round(args.fps))
 else:
     rate_str = f"{num * args.multi}/{den}"
     out_label = int(round(src_fps * args.multi))
@@ -602,9 +619,12 @@ if _need_vsr or _need_hdr:
         if _need_hdr:
             _vib = f", vib {HDR_VIBRANCE:g}" if HDR_VIBRANCE > 0 else ""
             _sb = f", sb {HDR_SATBOOST:g}" if HDR_SATBOOST > 0 else ""
-            sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits, con {HDR_CON}, sat {HDR_SAT} "
-                             f"[SDK 0-200, 100=neutral], mg {HDR_MG}, colour {HDR_COLOR}{_vib}{_sb}) "
-                             f"HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
+            # Contrast/saturation are logged on the GUI slider scale (-100..100 = SDK-100) so the
+            # numbers match the sliders the user set, not the internal SDK 0..200 values.
+            sys.stderr.write(f"RTX HDR ready (TrueHDR {HDR_NITS} nits, contrast {HDR_CON - 100}, "
+                             f"saturation {HDR_SAT - 100}, mg {HDR_MG}, colour {HDR_COLOR}{_vib}{_sb}; "
+                             f"contrast 0 + saturation -100 = pure HDR conversion, no RTX HDR look "
+                             f"added) HDR10 (BT.2020 PQ) @ {OUT_W}x{OUT_H}\n")
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"[rtx] unavailable, falling back (bicubic upscale / SDR): {repr(e)[:200]}\n")
         _RTX = None

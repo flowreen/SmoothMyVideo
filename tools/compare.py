@@ -20,6 +20,7 @@ not be colour-comparable; the script warns but still exports.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -83,7 +84,9 @@ def drawtext(label, fontsize, pq=False):
 
 
 def fps_label(v):
-    s = f"{v:.2f}".rstrip("0").rstrip(".")
+    # 3 decimals: the NTSC family needs them all (23.976, 59.94); 2 would round 23.976 up to
+    # the wrong-looking 23.98. Trailing zeros still trim (60 -> "60", 59.94 -> "59.94").
+    s = f"{v:.3f}".rstrip("0").rstrip(".")
     return f"{s} fps"
 
 
@@ -158,13 +161,28 @@ def run_encode(low, high, fc, out_path, encoder, total_frames):
     return proc.returncode
 
 
-def ask_for_video(what):
-    while True:
-        p = input(f"Drag the {what} video into this window and press Enter: ")
-        p = p.strip().strip('"').strip()
-        if p and os.path.isfile(p):
-            return p
-        print("  that's not a file, try again.")
+def ask_for_videos(count):
+    """Prompt until COUNT more existing files have been dragged in. A console
+    drag-drop pastes each file as a quoted path, and dragging several files at
+    once pastes them all on one line, so one answer can deliver both videos."""
+    got = []
+    while len(got) < count:
+        what = ("the other video" if count - len(got) == 1
+                else "both videos (together or one at a time)")
+        try:
+            line = input(f"Drag {what} into this window and press Enter: ")
+        except EOFError:
+            sys.exit("no console input available; pass the two videos as arguments.")
+        line = line.replace("﻿", "")   # stray BOM from odd shells/pipes
+        for p in (a or b for a, b in re.findall(r'"([^"]+)"|(\S+)', line)):
+            p = p.strip('"')                # bare tokens can carry stray quotes
+            if not os.path.isfile(p):
+                print(f"  that's not a file, skipped: {p}")
+            elif len(got) >= count:
+                print(f"  already have two videos, ignored: {os.path.basename(p)}")
+            else:
+                got.append(p)
+    return got
 
 
 def main():
@@ -183,10 +201,8 @@ def main():
         print(f"skipping (not a file): {bad}")
     if len(videos) > 2:
         sys.exit("give exactly TWO videos: the original and the smoothed render.")
-    if not videos:
-        videos.append(ask_for_video("first"))
-    if len(videos) == 1:
-        videos.append(ask_for_video("other"))
+    if len(videos) < 2:
+        videos += ask_for_videos(2 - len(videos))
 
     a, b = (probe(p) for p in videos)
     low, high = (a, b) if a["fps"] <= b["fps"] else (b, a)

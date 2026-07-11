@@ -24,7 +24,6 @@ engine/trt_cache/
 engine/dvtools/
 engine/hptools/
 
-# ...but keep sample source clips, e.g. samples/test.mp4 (the 24fps example)
-!samples/*.mp4
-# ...while still ignoring generated interpolation outputs in samples (e.g. *_48fps.mp4)
-samples/*fps*.mp4
+# samples: everything is local test material except the small 24fps example clip
+samples/*
+!samples/test.mp4

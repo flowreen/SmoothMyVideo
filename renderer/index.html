@@ -170,12 +170,12 @@
         RTX HDR <span class="hint" id="rtxhdrhint">(convert SDR video to HDR)</span>
       </label>
       <span id="hdrtonewrap" style="display:none;align-items:center;gap:8px;">
-        <span class="hint" title="RTX HDR tone curve; 0 = NVIDIA default">Contrast</span>
+        <span class="hint" title="RTX HDR tone curve; 0 = NVIDIA default (no contrast change)">Contrast</span>
         <input id="hdrcon" type="range" min="-100" max="100" step="5" value="0" class="defmark"
                style="width:100px;padding:0;border:0;accent-color:var(--green);">
         <span class="v" id="hdrconnum">0</span>
         <span class="hint" style="margin-left:6px"
-              title="NVIDIA's saturation, hue-corrected; 0 = NVIDIA default, -100 = true to source">Saturation</span>
+              title="NVIDIA's saturation, hue-corrected; 0 = NVIDIA's RTX HDR look, -100 = true to source (with Contrast 0 that is a pure HDR conversion, nothing added)">Saturation</span>
         <input id="hdrsat" type="range" min="-100" max="100" step="5" value="0" class="defmark"
                style="width:100px;padding:0;border:0;accent-color:var(--green);">
         <span class="v" id="hdrsatnum">0</span>
@@ -434,7 +434,10 @@ function setTarget(v){ v = Math.min(sliderMax(), Math.max(sliderMin(), v));
   syncTargetUI(); }
 // Canonical multiplier text for the current target: the exact integer when on-grid (2, 3, ...), else
 // the fractional ratio (e.g. 2.08 for a typed 50 fps on a 24 source, which the engine resamples).
-function multText(){ const gm = gridMulti(); return gm ? String(gm) : (targetFps()/srcFps()).toFixed(2); }
+// Trailing zero trimmed (2.5 stays "2.5", not "2.50"); a lone ".0" is kept so an off-grid ~2.0
+// never masquerades as the on-grid integer 2.
+function multText(){ const gm = gridMulti();
+  return gm ? String(gm) : (targetFps()/srcFps()).toFixed(2).replace(/0$/, ''); }
 // Reflect the target into the multiplier box and grey both steppers when the target is locked. Skip
 // rewriting #multin while it is focused, so a two-keystroke entry ("2" -> "20") isn't reset mid-type.
 function syncTargetUI(){ const dis = !interpOn() || $('screenfps').checked || goMode === 'running';
@@ -530,7 +533,7 @@ async function checkResume(){
     }
   } else {
     if(resumeLoggedFor === lastOut) resumeLoggedFor = null;   // gone (e.g. cancelled): a future interruption logs anew
-    $('go').title = 'Starts the render. You can pause or even close the app mid-render - it resumes where it left off.';
+    $('go').title = 'Starts the render. You can pause or even close the app mid-render: it resumes where it left off.';
   }
 }
 // Editing the output path inline: a non-empty value becomes the custom output (kept across setting
@@ -1258,7 +1261,7 @@ function startRun(){
   $('go').title = 'Pauses the render. You can also just close the app - the render resumes where it left off next time.';
   if(!resumeTipShown){
     resumeTipShown = true;   // once per session; batch auto-advance re-enters startRun per file
-    log('>> Tip: you can Pause, or even close the app mid-render - the render resumes where it left off\n');
+    log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
   }
   $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
