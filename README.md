@@ -42,7 +42,7 @@ original. In the same render it can also **upscale** (up to 16K), **sharpen**, *
 convert **SDR → real HDR10**, while carrying over every audio track, subtitle, chapter and font.
 
 <p align="center">
-  <img src="docs/ui.png" alt="The Smooth My Video window: video info, target fps, upscale, codec, RTX and HDR panels, before/after preview" width="620">
+  <img src="docs/ui.png" alt="The Smooth My Video window, top to bottom: video info, target fps matched to the monitor, upscale, codec, the five interpolation models, RTX, Dolby Vision and HDR10+ panels, sharpen/restore, and the before/after preview" width="620">
 </p>
 
 Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a current driver.
@@ -93,13 +93,13 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   interpolation model - the pick for filmed content. Its **Preserve anime pacing (DRBA)**
   sub-option keeps characters at their original animation cadence while camera pans smooth
   fully, for purists who want fluidity without "hollywoodizing" the animation.
-* 🌀 **Optional Nvidia Smooth Motion model.** One checkbox switches the interpolation from the GMFSS AI
+* 🌀 **Optional NVIDIA Smooth Motion model.** One checkbox switches the interpolation from the GMFSS AI
   model to NVIDIA's hardware optical-flow FRUC (the same family as the driver-level Smooth Motion), for
   when you want the NVIDIA look or a non-AI reference. Lower quality than GMFSS on fast motion; the
   NVIDIA runtime is a one-time separate download (not bundled).
 * 🌊 **Optional SVP model.** One more checkbox renders with the SmoothVideo Project's svpflow
   engine (the tech behind SVP's real-time playback smoothing), borrowed from your local SVP 4
-  installation, so SVP fans can bake their player's look into a file. Its **Nvidia Optical Flow**
+  installation, so SVP fans can bake their player's look into a file. Its **NVIDIA Optical Flow**
   sub-option (on by default) takes motion vectors from NVIDIA's hardware optical-flow unit;
   turning it off uses SVP's classic block-matching search instead. Requires SVP 4 installed
   (only its svpflow plugin DLLs are used; SVP's optional mpv player component is not needed).

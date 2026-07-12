@@ -88,8 +88,8 @@
   <div class="panel">
     <div class="row">
       <span class="k">Interpolate</span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="interp" checked style="width:auto;padding:0;accent-color:var(--green);">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="interp" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         generate in-between frames for smoother motion with the model chosen below (off = keep the source frames; sharpen, upscale, HDR and restore still apply)
       </label>
     </div>
@@ -112,8 +112,8 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="screenfps" style="width:auto;padding:0;accent-color:var(--green);">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="screenfps" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         match screen refresh rate (<span id="screenhz">?</span> Hz)
       </label>
     </div>
@@ -158,58 +158,58 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelgmfss" checked
-               style="width:auto;padding:0;accent-color:var(--green);">
-        GMFSS <span class="hint">(AI, best quality for anime, the default)</span>
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        GMFSS <span class="hint">(GMFlow with Softmax Splatting: AI, best quality for anime, the default)</span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelrife"
-               style="width:auto;padding:0;accent-color:var(--green);">
-        RIFE <span class="hint">(AI, best for live action)</span>
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        RIFE <span class="hint">(Real-Time Intermediate Flow Estimation: AI, best for live action, also carries the DRBA anime mode below; bundled)</span>
       </label>
     </div>
     <div class="row" id="rifedrbarow" style="display:none">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:22px;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-left:22px;">
         <input type="checkbox" id="rifedrba"
-               style="width:auto;padding:0;accent-color:var(--green);">
-        Preserve anime pacing (DRBA) <span class="hint">(characters keep their original cadence, camera pans smooth fully)</span>
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        DRBA <span class="hint">(Distance Ratio Based Adjuster: on = characters keep their original pace and crisp poses while camera pans smooth fully, off = plain RIFE, every frame pair interpolated uniformly)</span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modeldlss"
-               style="width:auto;padding:0;accent-color:var(--green);">
-        NVIDIA DLSS 4.5 <span class="hint">(Deep Learning Super Sampling&rsquo;s AI frame generation, from the game stack; whole 2&times;&ndash;6&times;; needs RTX 40/50, above 2&times; RTX 50 only)</span>
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(Deep Learning Super Sampling: AI frame generation from games; 2&times;&ndash;6&times;, needs RTX 40/50, RTX 50 above 2&times;)</span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modelfruclabel" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+      <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelfruc"
-               style="width:auto;padding:0;accent-color:var(--green);">
-        Nvidia Smooth Motion <span class="hint">(NVIDIA optical-flow hardware, lower quality than GMFSS)</span>
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        NVIDIA Smooth Motion <span class="hint">(NVIDIA optical-flow hardware, lower quality than GMFSS)</span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modelsvplabel" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+      <label class="hint" id="modelsvplabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelsvp"
-               style="width:auto;padding:0;accent-color:var(--green);">
-        SVP <span class="hint">(the Smooth Video Project engine, included mainly for its Nvidia Optical Flow mode below; needs SVP 4 installed)</span>
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        SVP <span class="hint">(the Smooth Video Project engine, included mainly for its NVIDIA Optical Flow mode below; needs SVP 4 installed)</span>
       </label>
     </div>
     <div class="row" id="svpnvofrow" style="display:none">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:22px;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-left:22px;">
         <input type="checkbox" id="svpnvof" checked
-               style="width:auto;padding:0;accent-color:var(--green);">
-        Nvidia Optical Flow <span class="hint">(on = motion vectors from NVIDIA's optical-flow hardware, off = SVP's own block-matching search)</span>
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        NVIDIA Optical Flow <span class="hint">(on = motion vectors from NVIDIA's optical-flow hardware, off = SVP's own block-matching search)</span>
       </label>
     </div>
     <div id="dlsssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -245,15 +245,15 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;accent-color:var(--green);">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         RTX Video Super Resolution <span class="hint">(AI for the upscale above)</span>
       </label>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="rtxhdr" style="width:auto;padding:0;accent-color:var(--green);">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="rtxhdr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         RTX HDR <span class="hint" id="rtxhdrhint">(convert SDR video to HDR)</span>
       </label>
       <span id="hdrtonewrap" style="display:none;align-items:center;gap:8px;">
@@ -275,8 +275,8 @@
     <div id="hdrcolorwrap" style="display:none">
       <div class="row" style="flex-wrap:wrap">
         <span class="k"></span>
-        <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="hdrdynvib" style="width:auto;padding:0;accent-color:var(--green);">
+        <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="hdrdynvib" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
           RTX Dynamic Vibrance
         </label>
         <span id="hdrsbwrap" style="display:inline-flex;align-items:center;gap:8px;">
@@ -317,8 +317,8 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="dvexport" style="width:auto;padding:0;accent-color:var(--green);">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="dvexport" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         Add Dolby Vision metadata (Profile 8.1) <span class="hint">(experimental)</span> <span class="hint" id="dvhint">(needs RTX HDR on)</span>
       </label>
     </div>
@@ -342,8 +342,8 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="hpexport" style="width:auto;padding:0;accent-color:var(--green);">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="hpexport" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         Add HDR10+ metadata <span class="hint">(experimental)</span> <span class="hint" id="hphint">(needs RTX HDR on)</span>
       </label>
     </div>
@@ -363,8 +363,8 @@
   <div class="panel">
     <div class="row">
       <span class="k">Sharpen</span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;accent-color:var(--green);"> FSR
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> FSR
       </label>
       <span id="sharpwrap" style="display:flex;align-items:center;gap:8px;">
         <input id="sharpval" type="range" min="0" max="1" step="0.05" value="1"
@@ -375,8 +375,8 @@
     </div>
     <div class="row">
       <span class="k">Restore</span>
-      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="restore" style="width:auto;padding:0;accent-color:var(--green);"> AI detail
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
       </label>
       <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; runs before the upscale; slower</span>
     </div>
@@ -435,11 +435,32 @@
   </div><!-- /#workspace -->
 
 <script>
-const { ipcRenderer, shell, webUtils } = require('electron');
+const { ipcRenderer, shell, webUtils, webFrame } = require('electron');
 // Announce every page load (app launch OR a reload). On a reload this lets main kill any engine
 // orphaned by the previous page - e.g. an accidental Ctrl+R mid-render - so the app comes up clean
 // instead of the refreshed UI racing a still-running engine (the 1%->15%->1% progress ping-pong).
 ipcRenderer.send('renderer-ready');
+
+// --- UI zoom: Ctrl+= / Ctrl+- / Ctrl+0 and Ctrl+scrollwheel, browser-style ------------------------
+// Chromium zoom levels: factor = 1.2^level; half-level steps ~= 10% per notch, clamped to a range
+// where the tall single-column layout stays usable. Persisted so the app reopens at the same zoom.
+function applyZoom(z){
+  z = Math.max(-4, Math.min(4, z));
+  webFrame.setZoomLevel(z);
+  localStorage.setItem('zoomLevel', String(z));
+}
+applyZoom(parseFloat(localStorage.getItem('zoomLevel')) || 0);
+window.addEventListener('keydown', (e) => {
+  if(!e.ctrlKey || e.altKey || e.metaKey) return;
+  if(e.key === '=' || e.key === '+'){ applyZoom(webFrame.getZoomLevel() + 0.5); e.preventDefault(); }
+  else if(e.key === '-'){ applyZoom(webFrame.getZoomLevel() - 0.5); e.preventDefault(); }
+  else if(e.key === '0'){ applyZoom(0); e.preventDefault(); }
+});
+window.addEventListener('wheel', (e) => {
+  if(!e.ctrlKey) return;
+  e.preventDefault();   // never page-scroll while zooming (needs the non-passive listener)
+  applyZoom(webFrame.getZoomLevel() + (e.deltaY < 0 ? 0.5 : -0.5));
+}, { passive: false });
 const path = require('path');
 let info = null, input = null, lastOut = null, customOut = null, fpp = 1, totalGen = 1, procStart = 0, baseK = 0, cancelled = false;
 // Batch queue: inputs waiting after the current one. Filled by a multi-select pick or a multi-file
@@ -913,7 +934,7 @@ syncRtx();
 // Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
 ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); syncPreview(); });
 
-// Interpolation model: GMFSS (default) vs "Nvidia Smooth Motion" (NVIDIA Optical Flow FRUC). Two
+// Interpolation model: GMFSS (default) vs "NVIDIA Smooth Motion" (NVIDIA Optical Flow FRUC). Two
 // checkboxes acting as an exclusive pair (user-chosen UX): ticking one clears the other, and
 // unticking the active one hands the choice back to its sibling, so exactly one model is always
 // selected. The FRUC runtime (NvOFFRUC.dll) is NVIDIA proprietary + user-installed from the Optical
@@ -928,7 +949,7 @@ function modelIsDlss(){ return $('modeldlss').checked && dlssReady; }
 function modelIsRife(){ return $('modelrife').checked; }
 // The DRBA sub-checkbox (default OFF) adds anime-pacing timing on top of the same RIFE weights.
 function modelIsRifeDrba(){ return modelIsRife() && $('rifedrba').checked; }
-// The Nvidia Optical Flow sub-checkbox (default ON) picks between the two SVP engine variants:
+// The NVIDIA Optical Flow sub-checkbox (default ON) picks between the two SVP engine variants:
 // on = svpflow's SmoothFps_NVOF (hardware motion vectors), off = SVP's own block-matching search.
 function modelIsSvpNvof(){ return modelIsSvp() && $('svpnvof').checked; }
 const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelsvp')];
@@ -936,7 +957,7 @@ function frucSetupHtml(){
   const detail = !frucBridge
     ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
     : 'Click <b>Get from NVIDIA</b>, then <b>Choose .zip&hellip;</b> and pick the downloaded Optical_Flow_SDK&hellip;.zip. It installs automatically. Until then GMFSS is used.';
-  return "Nvidia Smooth Motion uses NVIDIA's Optical Flow runtime (a one-time download, not bundled).<br>" + detail;
+  return "NVIDIA Smooth Motion uses NVIDIA's Optical Flow runtime (a one-time download, not bundled).<br>" + detail;
 }
 async function refreshFrucState(){
   try { const r = await ipcRenderer.invoke('fruc-ready'); frucReady = !!(r && r.ready); frucBridge = !!(r && r.bridge); }
@@ -1041,7 +1062,7 @@ $('svpnvof').onchange = () => localStorage.setItem('svpNvof', $('svpnvof').check
 // the boxes and re-checking Interpolate restores the choice itself.
 function restoreModelChoice(){
   let saved = localStorage.getItem('interpModel');
-  if(saved === 'svpnvof'){  // legacy two-checkbox era: "SVP + Nvidia motion" was its own model
+  if(saved === 'svpnvof'){  // legacy two-checkbox era: "SVP + NVIDIA motion" was its own model
     saved = 'svp'; localStorage.setItem('interpModel', 'svp'); localStorage.setItem('svpNvof', '1');
     $('svpnvof').checked = true;
   }
@@ -1588,7 +1609,7 @@ function startRun(){
   if(interpOn() && modelIsRifeDrba()) payload.model = 'rifedrba'; // RIFE with the DRBA sub-option on
   else if(interpOn() && modelIsRife()) payload.model = 'rife';     // plain RIFE (bundled, always ready)
   else if(interpOn() && modelIsDlss()) payload.model = 'dlssg';   // "DLSS 4.5" (Frame Generation) backend
-  else if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "Nvidia Smooth Motion" (NvOFFRUC) backend
+  else if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "NVIDIA Smooth Motion" (NvOFFRUC) backend
   else if(interpOn() && modelIsSvpNvof()) payload.model = 'svpnvof'; // SVP with its NVOF sub-option on (default)
   else if(interpOn() && modelIsSvp()) payload.model = 'svp'; // SVP with the NVOF sub-option off
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched

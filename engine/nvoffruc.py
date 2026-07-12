@@ -1,6 +1,6 @@
 """NVIDIA Optical Flow FRUC (NvOFFRUC) driven from Python via a small CUDA bridge DLL.
 
-This is the "Nvidia Smooth Motion" interpolation model: hardware optical-flow frame interpolation on
+This is the "NVIDIA Smooth Motion" interpolation model: hardware optical-flow frame interpolation on
 the OFA engine, offered as the deliberately inferior / faster alternative to GMFSS. It is the same
 class of technique as NVIDIA's driver-level Smooth Motion (OFA optical flow + blend), just exposed
 offline through the Optical Flow SDK's FRUC library.

@@ -50,7 +50,7 @@ Usage: render.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt
        offset the uniform-look softness; omit it (or 0) to leave the frames untouched.
        --no-interp skips interpolation entirely: the clip is only re-encoded at its source fps
        with --sharpen applied, for users who just want the sharpening and not the smoothing.
-       --fruc uses NVIDIA Optical Flow FRUC (the "Nvidia Smooth Motion" model) instead of GMFSS:
+       --fruc uses NVIDIA Optical Flow FRUC (the "NVIDIA Smooth Motion" model) instead of GMFSS:
        hardware optical-flow interpolation, much faster but visibly lower quality (the inferior
        option). Needs the engine/nvoffruc bridge + NvOFFRUC.dll; still honours --upscale/--rtx-hdr.
        Every source pair is interpolated uniformly on the same output-slot grid, so
@@ -210,7 +210,7 @@ ap.add_argument("--hdr-satboost", type=float, default=0.0,
                      "--hdr-saturation, which is RTX HDR's own TrueHDR knob, mirroring NVIDIA's two "
                      "separate filters. 0 (default) = off; inert in raw mode.")
 ap.add_argument("--fruc", action="store_true",
-                help="'Nvidia Smooth Motion': hardware optical-flow interpolation via NVIDIA's NvOFFRUC "
+                help="'NVIDIA Smooth Motion': hardware optical-flow interpolation via NVIDIA's NvOFFRUC "
                      "library (the Optical Flow SDK's frame-rate up-conversion) instead of GMFSS - a "
                      "lower-quality alternative that runs on the OFA hardware (speed is GPU/content "
                      "dependent, not necessarily faster than the TensorRT GMFSS path). We feed it "
@@ -243,7 +243,7 @@ ap.add_argument("--rife-drba", action="store_true",
                      "Renders on the uniform offset grid (every output frame is an interior "
                      "blend) for integer --multi too, since the adjusted timing IS the feature.")
 ap.add_argument("--svp", action="store_true",
-                help="The GUI's SVP model with its 'Nvidia Optical Flow' sub-option OFF: interpolate "
+                help="The GUI's SVP model with its 'NVIDIA Optical Flow' sub-option OFF: interpolate "
                      "with the Smooth Video Project's svpflow engine "
                      "(block-matching motion vectors + GPU frame rendering) instead of GMFSS, hosted "
                      "in the app's own bundled VapourSynth - SVP 4 only provides the two plugins64 "
@@ -255,7 +255,7 @@ ap.add_argument("--svp", action="store_true",
                      "interpolates at 16-bit 4:2:0 precision (vector search at 8-bit, mirroring "
                      "SVP's own scripts) and the output is always 10-bit (--out-bits 8 ignored).")
 ap.add_argument("--svp-nvof", action="store_true",
-                help="The GUI's SVP model with its 'Nvidia Optical Flow' sub-option ON (the GUI "
+                help="The GUI's SVP model with its 'NVIDIA Optical Flow' sub-option ON (the GUI "
                      "default): like --svp but the motion vectors come from "
                      "the NVIDIA Optical Flow hardware (svpflow's SmoothFps_NVOF) instead of SVP's "
                      "block-matching search; rendering is still SVP's. Needs SVP 4 plus a Turing or "
@@ -273,12 +273,12 @@ args = ap.parse_args()
 inp = os.path.abspath(args.input)
 SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output frame; 0 = off
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
-FRUC_MODE = args.fruc                        # NvOFFRUC ("Nvidia Smooth Motion") instead of GMFSS
+FRUC_MODE = args.fruc                        # NvOFFRUC ("NVIDIA Smooth Motion") instead of GMFSS
 FRUC_NATIVE = bool(args.fruc_native)         # FRUC only: native passthrough (real frames + tweens)
 DLSSG_MODE = args.dlssg                      # DLSS Frame Generation ("DLSS 4.5") instead of GMFSS
 RIFE_MODE = args.rife or args.rife_drba      # RIFE 4.26 instead of GMFSS
 DRBA_MODE = args.rife_drba                   # RIFE with DRBA timing (anime pacing preserved)
-SVP_NVOF = args.svp_nvof                     # "SVP + Nvidia motion": svpflow render, NVOF vectors
+SVP_NVOF = args.svp_nvof                     # "SVP + NVIDIA motion": svpflow render, NVOF vectors
 SVP_MODE = args.svp or SVP_NVOF              # either "SVP" model (svpflow) instead of GMFSS
 if sum((SVP_MODE, FRUC_MODE, DLSSG_MODE, RIFE_MODE)) > 1:
     sys.exit("--svp/--svp-nvof, --fruc, --dlssg and --rife/--rife-drba are mutually exclusive "
@@ -648,10 +648,10 @@ if NO_INTERP:
     sys.stderr.write("no-interp mode: GMFSS interpolation disabled "
                      "(re-encode at source fps with optional FSR sharpen)\n"); sys.stderr.flush()
 elif FRUC_MODE:
-    # "Nvidia Smooth Motion" backend (NVIDIA Optical Flow Accelerator): no GMFSS weights, no TensorRT.
+    # "NVIDIA Smooth Motion" backend (NVIDIA Optical Flow Accelerator): no GMFSS weights, no TensorRT.
     # The OFA interpolator is created below, once the padded frame size (pw, ph) is known.
     model = None
-    sys.stderr.write("Using the Nvidia Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n")
+    sys.stderr.write("Using the NVIDIA Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n")
     sys.stderr.flush()
 elif DLSSG_MODE:
     # "DLSS 4.5" backend (DLSS Frame Generation): no GMFSS weights, no TensorRT. The host process
@@ -859,7 +859,7 @@ pw = ((W - 1) // tmp + 1) * tmp
 if RIFE_MODE and model is not None:
     model.set_scale(scale)   # the auto rule above (0.5 for 4K+) applies to RIFE's flow too
 
-# "Nvidia Smooth Motion" interpolator, sized to the padded frame the loop passes it. Created here (not
+# "NVIDIA Smooth Motion" interpolator, sized to the padded frame the loop passes it. Created here (not
 # at model-load) because the padded size is known only now. Backed by NVIDIA's NvOFFRUC library (the
 # Optical Flow SDK's frame-rate up-conversion: OFA flow -> warp+blend -> occlusion infill, all inside
 # NvOFFRUC.dll), driven through engine/nvoffruc. NvOFFRUC.dll + cudart64_110.dll are NVIDIA proprietary
@@ -873,10 +873,10 @@ if FRUC_MODE and not NO_INTERP:
     try:
         _ofa = nvoffruc.NvOFFRUC(pw, ph)
     except Exception as e:  # noqa: BLE001
-        sys.exit(f"Nvidia Smooth Motion (NvOFFRUC) unavailable: {e}. It needs a Turing..Blackwell GPU with "
+        sys.exit(f"NVIDIA Smooth Motion (NvOFFRUC) unavailable: {e}. It needs a Turing..Blackwell GPU with "
                  "the Optical Flow engine, and NvOFFRUC.dll installed in engine/nvoffruc (from NVIDIA's "
                  "Optical Flow SDK .zip); or drop --fruc to use GMFSS.")
-    sys.stderr.write(f"Nvidia Smooth Motion ready (NvOFFRUC {pw}x{ph})\n"); sys.stderr.flush()
+    sys.stderr.write(f"NVIDIA Smooth Motion ready (NvOFFRUC {pw}x{ph})\n"); sys.stderr.flush()
 
 # "DLSS 4.5" interpolator: DLSS Frame Generation hosted by the bundled offline D3D12 presentation
 # loop (engine/dlssg/dlssg2f.exe, see engine/dlssg.py), sized to the padded frame like FRUC. The

@@ -40,7 +40,7 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
 * **`engine/svp_backend.py`**, the SVP model backend: generates the standalone VapourSynth host
   process that runs svpflow (SVP 4's plugin DLLs) at a max-quality offline profile and streams y4m
   back to the engine; also documents the profile derivation and the block-size caution.
-* **`engine/nvoffruc.py`** + **`engine/nvoffruc/`**, the "Nvidia Smooth Motion" ctypes bridge to
+* **`engine/nvoffruc.py`** + **`engine/nvoffruc/`**, the "NVIDIA Smooth Motion" ctypes bridge to
   NVIDIA's NvOFFRUC library (user-installed DLLs, same pattern as the RTX folder).
 * **`engine/dlssg.py`** + **`engine/dlssg/`**, the DLSS frame-generation bridge.
 * **`engine/rcas.py`**, the FSR RCAS sharpen kernel (shared by render and preview).
@@ -124,7 +124,7 @@ engine\runtime\python.exe engine\render.py <input> <multi> [output] [--scale 1.0
   27.9 dB, same worst frame). Pass an explicit value to override.
 * `--sharpen S` (0..1) FSR-style RCAS on every output frame (bare `--sharpen` = 0.8; off unless given).
 * `--no-interp` re-encodes at source fps with sharpen only (no model/TRT loaded).
-* `--fruc` "Nvidia Smooth Motion": interpolates on the OFA hardware via NVIDIA's NvOFFRUC library
+* `--fruc` "NVIDIA Smooth Motion": interpolates on the OFA hardware via NVIDIA's NvOFFRUC library
   instead of GMFSS (lower quality; ghosts on fast/large motion, inherent to the optical-flow model).
   Needs `NvOFFRUC.dll` + `cudart64_110.dll` user-installed into `engine/nvoffruc` from the Optical
   Flow SDK .zip (the GUI's Smooth Motion checkbox offers a one-time installer); GMFSS stays the
@@ -138,7 +138,7 @@ engine\runtime\python.exe engine\render.py <input> <multi> [output] [--scale 1.0
   closer to its original cadence, which also avoids forced-midpoint warping artifacts. Renders
   on the uniform offset grid for integer `--multi` too (the adjusted timing is the feature); the
   first window after a start or resume seam falls back to plain pair RIFE (deterministic).
-* `--svp` (the GUI's SVP model with its "Nvidia Optical Flow" sub-option off): interpolates with
+* `--svp` (the GUI's SVP model with its "NVIDIA Optical Flow" sub-option off): interpolates with
   the svpflow engine (block-matching vectors + GPU rendering) whose two plugin DLLs are
   borrowed from a local SVP 4 installation
   (`SMV_SVP_DIR` overrides the default `C:\Program Files (x86)\SVP 4`; SVPManager need not run,
@@ -160,7 +160,7 @@ engine\runtime\python.exe engine\render.py <input> <multi> [output] [--scale 1.0
   and the SVP output is always 10-bit, `--out-bits 8` included, so tween blends never band.
   Known v1 limits: chroma rides at 4:2:0 through svpflow, and the clip length is the
   container's frame count (a tail frame can repeat or drop on containers with wrong metadata).
-* `--svp-nvof` (the GUI's SVP model with "Nvidia Optical Flow" on, the GUI default): same SVP
+* `--svp-nvof` (the GUI's SVP model with "NVIDIA Optical Flow" on, the GUI default): same SVP
   pipeline, but the motion vectors come from the NVIDIA Optical Flow hardware (svpflow's
   `SmoothFps_NVOF`, fed a dense 4px-grid P8 vector clip exactly as SVP's own generator builds
   it) instead of SVP's block-matching search. Needs SVP 4 plus a Turing-or-newer NVIDIA GPU;
@@ -452,10 +452,10 @@ NGX's ABI) while torch uses cu13 `cudart` separately; the CUDA **driver** contex
 API, version agnostic), so VSR and TrueHDR run correctly. Validated end to end on torch 2.12.1+cu130 +
 cupy-cuda13x.
 
-### Nvidia Smooth Motion bridge (`nvoffruc_bridge.dll`)
+### NVIDIA Smooth Motion bridge (`nvoffruc_bridge.dll`)
 
 The bridge between the Python engine and NVIDIA's `NvOFFRUC.dll` (Optical Flow SDK FRUC), i.e. the
-"Nvidia Smooth Motion" interpolation model. Same idea as the RTX bridge: our source compiles to a small
+"NVIDIA Smooth Motion" interpolation model. Same idea as the RTX bridge: our source compiles to a small
 cdecl DLL that ctypes drives; the NVIDIA runtime DLLs stay user-installed.
 
 > This bridge contains source code provided by NVIDIA Corporation (it `#include`s the SDK's

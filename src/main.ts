@@ -210,16 +210,46 @@ ipcMain.handle('probe', async (_e, file: string) => {
   });
 });
 
-ipcMain.handle('refresh-rate', () => {
-  // TRUE refresh rate of the monitor the app window is on (fallback: primary), kept FRACTIONAL so a
-  // 59.94 / 359.99 Hz panel feeds the renderer its exact rate - drives "match screen" and its decimal
-  // precision (see decimalsOf/targetDecimals in the renderer). Only float noise is trimmed to 3 dp.
-  // NOTE: on Windows the OS display API usually reports whole Hz, so this is commonly an integer anyway;
-  // a truly fractional rate would need a native DXGI/DWM query, which we don't do.
+// TRUE refresh rate of the monitor the app window is on (fallback: primary), kept FRACTIONAL so a
+// 59.94 / 359.98 Hz panel feeds the renderer its exact rate - drives "match screen" and its decimal
+// precision (see decimalsOf/targetDecimals in the renderer). Electron's display.displayFrequency is
+// integer-only on Windows, so the exact rational comes from QueryDisplayConfig via the bundled
+// engine/exact_hz.ps1 helper (one "numerator denominator" line per active display path), matched to
+// the Electron display by nearest integer. Cached: the helper costs a PowerShell spawn (~0.5 s) and
+// rates only change on display mode switches.
+let exactHz: number[] = [];
+let exactHzAt = 0;
+function queryExactRates(): Promise<number[]> {
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(ENGINE, 'exact_hz.ps1')],
+      { timeout: 8000 },
+      (err, stdout) => {
+        if (err) return resolve([]);
+        resolve(
+          String(stdout)
+            .split(/\r?\n/)
+            .map((l) => {
+              const m = l.trim().match(/^(\d+) (\d+)$/);
+              return m ? Number(m[1]) / Number(m[2]) : 0;
+            })
+            .filter((v) => v > 1),
+        );
+      },
+    );
+  });
+}
+ipcMain.handle('refresh-rate', async () => {
   try {
     const d = win ? screen.getDisplayMatching(win.getBounds()) : screen.getPrimaryDisplay();
     const hz = d.displayFrequency || screen.getPrimaryDisplay().displayFrequency || 60;
-    return Math.round(hz * 1000) / 1000;
+    if (Date.now() - exactHzAt > 60000) {
+      exactHz = await queryExactRates();
+      exactHzAt = Date.now();
+    }
+    const exact = exactHz.find((r) => Math.abs(r - hz) < 1);
+    return Math.round((exact || hz) * 1000) / 1000;
   } catch {
     return 60;
   }
@@ -247,7 +277,7 @@ ipcMain.handle('screen-size', () => {
 const RTX_DIR = path.join(ENGINE, 'rtxvideo');
 const RTX_FEATURE_DLLS = ['nvngx_vsr.dll', 'nvngx_truehdr.dll'];
 const RTX_SDK_URL = 'https://developer.nvidia.com/rtx-video-sdk/getting-started';
-// NvOFFRUC ("Nvidia Smooth Motion"): our bridge (nvoffruc_bridge.dll) is locally built and ships,
+// NvOFFRUC ("NVIDIA Smooth Motion"): our bridge (nvoffruc_bridge.dll) is locally built and ships,
 // but NvOFFRUC.dll + cudart64_110.dll are NVIDIA proprietary and user-installed from the Optical
 // Flow SDK .zip - same EULA-gated, non-redistributable pattern as the RTX feature DLLs.
 const NVOFFRUC_DIR = path.join(ENGINE, 'nvoffruc');
@@ -527,7 +557,7 @@ ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
   return r.canceled ? null : r.filePaths[0] || null;
 });
 
-// "Nvidia Smooth Motion" (NvOFFRUC) runtime: ready only when our bridge AND NvOFFRUC.dll are present.
+// "NVIDIA Smooth Motion" (NvOFFRUC) runtime: ready only when our bridge AND NvOFFRUC.dll are present.
 // "DLSS 4.5" (DLSS Frame Generation): bundled, so this only guards against a broken install.
 ipcMain.handle('dlssg-ready', () => {
   const missing = DLSSG_FILES.filter((f) => !fileExists(path.join(DLSSG_DIR, f)));
@@ -843,9 +873,9 @@ ipcMain.on(
       if (opts.model === 'rife') args.push('--rife'); // RIFE 4.26 backend instead of GMFSS (bundled)
       if (opts.model === 'rifedrba') args.push('--rife-drba'); // RIFE with DRBA anime-pacing timing
       if (opts.model === 'dlssg') args.push('--dlssg'); // "DLSS 4.5" (Frame Generation) backend instead of GMFSS
-      if (opts.model === 'fruc') args.push('--fruc'); // "Nvidia Smooth Motion" backend instead of GMFSS
+      if (opts.model === 'fruc') args.push('--fruc'); // "NVIDIA Smooth Motion" backend instead of GMFSS
       if (opts.model === 'svp') args.push('--svp'); // "SVP" backend instead of GMFSS
-      if (opts.model === 'svpnvof') args.push('--svp-nvof'); // "SVP + Nvidia motion" (svpflow render, NVOF vectors)
+      if (opts.model === 'svpnvof') args.push('--svp-nvof'); // "SVP + NVIDIA motion" (svpflow render, NVOF vectors)
       if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
     }
     // FSR-style RCAS sharpening strength (GUI checkbox + slider). 0/omitted = off, leaving the
