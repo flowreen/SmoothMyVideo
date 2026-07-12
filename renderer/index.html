@@ -161,7 +161,23 @@
       <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelgmfss" checked
                style="width:auto;padding:0;accent-color:var(--green);">
-        GMFSS <span class="hint">(AI, best quality, the default)</span>
+        GMFSS <span class="hint">(AI, best quality for anime, the default)</span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="modelrife"
+               style="width:auto;padding:0;accent-color:var(--green);">
+        RIFE <span class="hint">(AI, best for live action)</span>
+      </label>
+    </div>
+    <div class="row" id="rifedrbarow" style="display:none">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:22px;">
+        <input type="checkbox" id="rifedrba"
+               style="width:auto;padding:0;accent-color:var(--green);">
+        Preserve anime pacing (DRBA) <span class="hint">(characters keep their original cadence, camera pans smooth fully)</span>
       </label>
     </div>
     <div class="row">
@@ -908,10 +924,14 @@ let frucReady = false, frucBridge = false, svpReady = false, dlssReady = false, 
 function modelIsFruc(){ return $('modelfruc').checked && frucReady; }
 function modelIsSvp(){ return $('modelsvp').checked && svpReady; }
 function modelIsDlss(){ return $('modeldlss').checked && dlssReady; }
+// RIFE ships bundled (weights vendored in engine/rife), so it is always ready.
+function modelIsRife(){ return $('modelrife').checked; }
+// The DRBA sub-checkbox (default OFF) adds anime-pacing timing on top of the same RIFE weights.
+function modelIsRifeDrba(){ return modelIsRife() && $('rifedrba').checked; }
 // The Nvidia Optical Flow sub-checkbox (default ON) picks between the two SVP engine variants:
 // on = svpflow's SmoothFps_NVOF (hardware motion vectors), off = SVP's own block-matching search.
 function modelIsSvpNvof(){ return modelIsSvp() && $('svpnvof').checked; }
-const MODEL_BOXES = () => [$('modelgmfss'), $('modeldlss'), $('modelfruc'), $('modelsvp')];
+const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelsvp')];
 function frucSetupHtml(){
   const detail = !frucBridge
     ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
@@ -933,7 +953,9 @@ async function refreshFrucState(){
 function syncModel(){
   localStorage.setItem('interpModel',
     $('modelsvp').checked ? 'svp' : $('modelfruc').checked ? 'fruc' :
-    $('modeldlss').checked ? 'dlssg' : 'gmfss');
+    $('modeldlss').checked ? 'dlssg' : $('modelrife').checked ? 'rife' : 'gmfss');
+  // The DRBA sub-option only makes sense while RIFE is the chosen model (always ready: bundled).
+  $('rifedrbarow').style.display = $('modelrife').checked ? '' : 'none';
   if($('modeldlss').checked && !dlssReady){
     $('dlsssteps').innerHTML = 'The bundled DLSS runtime is incomplete: <b>' + dlssMissing.join(', ')
       + '</b> missing from engine/dlssg. Reinstall the app (or rebuild per engine/dlssg/build_src/BUILD.md). '
@@ -1005,7 +1027,11 @@ $('svpbrowse').onclick = async () => {
     $('svpsteps').innerHTML = '&#10007; ' + r.error + '<br>' + SVP_STEPS_HTML;
   }
 };
-for(const b of ['modelgmfss','modeldlss','modelfruc','modelsvp']) $(b).onchange = () => pickModel($(b));
+for(const b of ['modelgmfss','modelrife','modeldlss','modelfruc','modelsvp']) $(b).onchange = () => pickModel($(b));
+// The DRBA sub-option persists on its own key (default OFF: max fluidity is the app's default
+// philosophy; DRBA deliberately keeps character cadence); toggling it never clears RIFE.
+$('rifedrba').checked = localStorage.getItem('rifeDrba') === '1';
+$('rifedrba').onchange = () => localStorage.setItem('rifeDrba', $('rifedrba').checked ? '1' : '0');
 // The NVOF sub-option persists on its own key (default ON); it is not part of the exclusive
 // model group, so toggling it never clears the SVP selection.
 $('svpnvof').checked = localStorage.getItem('svpNvof') !== '0';
@@ -1020,7 +1046,7 @@ function restoreModelChoice(){
     $('svpnvof').checked = true;
   }
   const box = saved === 'svp' ? 'modelsvp' : saved === 'fruc' ? 'modelfruc'
-            : saved === 'dlssg' ? 'modeldlss' : 'modelgmfss';
+            : saved === 'dlssg' ? 'modeldlss' : saved === 'rife' ? 'modelrife' : 'modelgmfss';
   for(const b of MODEL_BOXES()) b.checked = false;
   $(box).checked = true;
 }
@@ -1429,11 +1455,13 @@ function syncInterp(){
   // frames). Re-checking Interpolate restores the saved model choice from localStorage.
   for(const b of MODEL_BOXES()) b.disabled = !on;
   $('svpnvof').disabled = !on;
+  $('rifedrba').disabled = !on;
   if(!on){
     for(const b of MODEL_BOXES()) b.checked = false;
     $('frucsetup').style.display = 'none';
     $('svpsetup').style.display = 'none';
     $('svpnvofrow').style.display = 'none';
+    $('rifedrbarow').style.display = 'none';
   } else {
     restoreModelChoice();
     syncModel();
@@ -1557,7 +1585,9 @@ function startRun(){
   log('>> '+input+'  ->  '+what+extra+'\n');
   const payload = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
   if(interpOn() && !gm) payload.fps = t;                                             // resample only: non-integer-multiple target
-  if(interpOn() && modelIsDlss()) payload.model = 'dlssg';   // "DLSS 4.5" (Frame Generation) backend
+  if(interpOn() && modelIsRifeDrba()) payload.model = 'rifedrba'; // RIFE with the DRBA sub-option on
+  else if(interpOn() && modelIsRife()) payload.model = 'rife';     // plain RIFE (bundled, always ready)
+  else if(interpOn() && modelIsDlss()) payload.model = 'dlssg';   // "DLSS 4.5" (Frame Generation) backend
   else if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "Nvidia Smooth Motion" (NvOFFRUC) backend
   else if(interpOn() && modelIsSvpNvof()) payload.model = 'svpnvof'; // SVP with its NVOF sub-option on (default)
   else if(interpOn() && modelIsSvp()) payload.model = 'svp'; // SVP with the NVOF sub-option off

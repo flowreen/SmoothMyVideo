@@ -229,6 +229,19 @@ ap.add_argument("--dlssg", action="store_true",
                      "needs an RTX 50 GPU (RTX 40 does single frame generation only), plus a "
                      "recent driver and Windows HW-accelerated GPU scheduling. Still honours "
                      "--upscale/--rtx-hdr/--sharpen/--restore.")
+ap.add_argument("--rife", action="store_true",
+                help="'RIFE' (GUI model name): interpolate with RIFE 4.26 heavy instead of GMFSS - "
+                     "the strongest open general-purpose model, recommended for live action "
+                     "(GMFSS remains the anime specialist). Vendored under engine/rife (MIT, "
+                     "weights bundled); eager fp16, no TensorRT. Same on-grid/--fps timing, "
+                     "pause/resume and per-frame passes as GMFSS.")
+ap.add_argument("--rife-drba", action="store_true",
+                help="The GUI's RIFE model with its 'Preserve anime pacing (DRBA)' sub-option ON: "
+                     "RIFE tweens with DistanceRatioMap timing (routineLife1/DRBA) - linear motion "
+                     "(pans) smooths fully while nonlinear character motion keeps closer to its "
+                     "original cadence, which also avoids forced-midpoint warping artifacts. "
+                     "Renders on the uniform offset grid (every output frame is an interior "
+                     "blend) for integer --multi too, since the adjusted timing IS the feature.")
 ap.add_argument("--svp", action="store_true",
                 help="The GUI's SVP model with its 'Nvidia Optical Flow' sub-option OFF: interpolate "
                      "with the Smooth Video Project's svpflow engine "
@@ -263,10 +276,13 @@ NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame 
 FRUC_MODE = args.fruc                        # NvOFFRUC ("Nvidia Smooth Motion") instead of GMFSS
 FRUC_NATIVE = bool(args.fruc_native)         # FRUC only: native passthrough (real frames + tweens)
 DLSSG_MODE = args.dlssg                      # DLSS Frame Generation ("DLSS 4.5") instead of GMFSS
+RIFE_MODE = args.rife or args.rife_drba      # RIFE 4.26 instead of GMFSS
+DRBA_MODE = args.rife_drba                   # RIFE with DRBA timing (anime pacing preserved)
 SVP_NVOF = args.svp_nvof                     # "SVP + Nvidia motion": svpflow render, NVOF vectors
 SVP_MODE = args.svp or SVP_NVOF              # either "SVP" model (svpflow) instead of GMFSS
-if sum((SVP_MODE, FRUC_MODE, DLSSG_MODE)) > 1:
-    sys.exit("--svp/--svp-nvof, --fruc and --dlssg are mutually exclusive interpolation backends; pick one")
+if sum((SVP_MODE, FRUC_MODE, DLSSG_MODE, RIFE_MODE)) > 1:
+    sys.exit("--svp/--svp-nvof, --fruc, --dlssg and --rife/--rife-drba are mutually exclusive "
+             "interpolation backends; pick one")
 # SVP 4 installation the svpflow engine + its VapourSynth runtime are borrowed from. Only read at
 # render time; SVPManager does not need to run.
 SVP_DIR = os.environ.get("SMV_SVP_DIR", r"C:\Program Files (x86)\SVP 4")
@@ -585,6 +601,11 @@ if UPSCALE:
     OUT_W, OUT_H = (round(W * UPSCALE_F) // 2) * 2, (round(H * UPSCALE_F) // 2) * 2
 else:
     OUT_W, OUT_H = W, H
+if DRBA_MODE and not FPS_MODE:
+    # DRBA renders on the uniform offset grid even for integer --multi (the adjusted timing IS
+    # the feature; there is no meaning to "source frames pass through" when timesteps move).
+    # Giving _pair_fracs and the resume mapping a constant ratio makes both work unchanged.
+    ratio = float(args.multi)
 total_pairs = max(1, NB - 1) if NB else 0
 # SVP output rate as an exact fraction of the source rate (SmoothFps takes a relative num/den):
 # integer --multi is multi/1; --fps derives from the snapped target rational when available.
@@ -655,6 +676,12 @@ elif SVP_MODE:
     import svp_backend   # the VapourSynth host generator (engine/svp_backend.py)
     sys.stderr.write("Using the SVP backend for interpolation (svpflow"
                      + (", NVIDIA Optical Flow vectors" if SVP_NVOF else "") + ")\n")
+    sys.stderr.flush()
+elif RIFE_MODE:
+    import rife_backend
+    model = rife_backend.RIFE()   # flow scale is set once the auto scale rule below has run
+    sys.stderr.write("Using the RIFE backend for interpolation (4.26 heavy"
+                     + (", DRBA anime-pacing timing" if DRBA_MODE else "") + ")\n")
     sys.stderr.flush()
 else:
     from model.GMFSS_infer_u import Model
@@ -829,6 +856,8 @@ else:
 tmp = max(64, int(64 / scale))
 ph = ((H - 1) // tmp + 1) * tmp
 pw = ((W - 1) // tmp + 1) * tmp
+if RIFE_MODE and model is not None:
+    model.set_scale(scale)   # the auto rule above (0.5 for 4K+) applies to RIFE's flow too
 
 # "Nvidia Smooth Motion" interpolator, sized to the padded frame the loop passes it. Created here (not
 # at model-load) because the padded size is known only now. Backed by NVIDIA's NvOFFRUC library (the
@@ -1260,7 +1289,7 @@ def _try_resume():
             cap = max(0, total_units - 1)
         elif NO_INTERP:
             cap = NB
-        elif not FPS_MODE:
+        elif not FPS_MODE and not DRBA_MODE:
             cap = 1 + args.multi * (total_pairs - 1)
         else:
             cap = max(0, math.ceil(total_pairs * ratio - 0.5) - 1)
@@ -1283,7 +1312,7 @@ def _try_resume():
             p, skip = c, 0    # output-frame units: the host itself is trimmed to start at c
         elif NO_INTERP:
             p, skip = c, 0
-        elif not FPS_MODE:
+        elif not FPS_MODE and not DRBA_MODE:
             p, skip = (c - 1) // args.multi, (c - 1) % args.multi
         else:
             p = int((c + 0.5) / ratio)
@@ -2231,6 +2260,89 @@ if SVP_MODE:
         _drain_pipes()
     _finish(f"done {k} frames (SVP SmoothFps{'_NVOF' if SVP_NVOF else ''} "
             f"x{SVP_RATE_NUM}/{SVP_RATE_DEN}) -> {out_path}\n", out_frames=k)
+
+# =============================================================================================
+# DRBA window loop (--rife-drba): RIFE tweens with DistanceRatioMap timing. Each output frame
+# needs the flow context of THREE source frames around it, so the loop is windowed: the window
+# centred on source frame i emits the output times in [i-0.5, i+0.5) - the tail fracs (>= 0.5)
+# of pair i-1 plus the head fracs (< 0.5) of pair i, all interior blends on the uniform offset
+# grid (ratio = multi for integer --multi; the --fps ratio otherwise). The first window of a
+# run - and the first window after a resume seam - has no left context yet, so its few frames
+# fall back to plain pair RIFE (deterministic, seam-local). The last source frame's own
+# interval holds the final generated frame, exactly like the --fps loop's closing slot.
+if DRBA_MODE:
+    prev = rq.get()
+    if prev is None:
+        sys.exit("no frames decoded")
+    I1 = to_tensor(prev)        # centre frame of the current window (source index i)
+    I0 = None                   # left context; None at the head and at a resume seam
+    _reuse = None               # DRBA flow state chained between consecutive windows
+    i = RESUME_SKIP_SRC         # source index of I1
+    k = RESUME_SKIP_SRC         # processed-pairs counter for PROGRESS (matches total_pairs)
+    nout = RESUME_OUT_BASE
+    _pend = RESUME_PAIR_SKIP    # banked output slots of pair i (resume lands mid-pair)
+    _prev_tail = []             # pair i-1 fracs >= 0.5, owned by the CURRENT window
+    last_out = None
+    try:
+        while True:
+            _check_pause()      # block here (queued frames keep encoding) while the GUI holds Pause
+            cur = rq.get()
+            if cur is None:
+                break
+            I2 = to_tensor(cur)                       # source frame i+1
+            fr = _pair_fracs(i)
+            head = [f for f in fr if f < 0.5]         # this window's right part
+            tail = [f for f in fr if f >= 0.5]        # the NEXT window's left part
+            if _pend:                                 # resume: drop pair i's banked slots in order
+                d = min(_pend, len(head)); head = head[d:]; _pend -= d
+                d = min(_pend, len(tail)); tail = tail[d:]; _pend -= d
+            # DRBA ts = output-time offset from the centre + 1, so left fracs map to f and
+            # right fracs to 1 + f, covering [0.5, 1.5) in emission order.
+            ts = _prev_tail + [1 + f for f in head]
+            if ts:
+                if I0 is None:
+                    # head/seam window: no left flow context, plain pair RIFE (all ts >= 1 here:
+                    # a seam's left fracs are banked by construction, a head has none).
+                    with amp():
+                        r2 = model.reuse(I1, I2, scale)
+                        outs = [model.inference(I1, I2, r2, t - 1) for t in ts]
+                else:
+                    with amp():
+                        outs, _reuse = model.inference_ts_drba(I0, I1, I2, ts, _reuse, linear=True)
+                for o in outs:
+                    last_out = to_bytes(o)
+                    wq.put(last_out)
+                nout += len(ts)
+            _prev_tail = tail
+            I0, I1 = I1, I2
+            i += 1
+            k += 1
+            if k % 10 == 0:
+                _progress(k, total_pairs)
+        # Tail: the window centred on the LAST source frame only has its left part (there is no
+        # pair i); those times fall back to plain pair RIFE on (I0, I1), like upstream's tail.
+        if _prev_tail and I0 is not None:
+            with amp():
+                r2 = model.reuse(I0, I1, scale)
+                for f in _prev_tail:
+                    last_out = to_bytes(model.inference(I0, I1, r2, f))
+                    wq.put(last_out)
+                nout += len(_prev_tail)
+        # Closing slot for the last source frame's own interval [i, i+1): hold the last
+        # generated frame so the output covers the full source duration (soft, no pop).
+        if last_out is None:
+            if not RESUME_ACTIVE:
+                wq.put(to_bytes(I1) if (SHARPEN > 0 or UPSCALE or HDR_ACTIVE or RESTORE_ACTIVE
+                                        or DEC_FMT != OUT_RAW_FMT) else prev)
+                nout += 1
+        else:
+            _tail_n = math.ceil((i + 1) * ratio - 0.5) - math.ceil(i * ratio - 0.5)
+            for _ in range(_tail_n):
+                wq.put(last_out)
+            nout += _tail_n
+    finally:
+        _drain_pipes()
+    _finish(f"done {k} pairs (RIFE-DRBA) -> {out_path}\n", out_frames=nout)
 
 # =============================================================================================
 # On-grid passthrough interpolation (GMFSS or FRUC/Smooth Motion; integer --multi; not --fps). The

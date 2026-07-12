@@ -25,7 +25,7 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
   `require` with `nodeIntegration`; most settings persist in `localStorage` (Restore and RTX Dynamic
   Vibrance deliberately don't, per-session opt-ins).
 * **`engine/render.py`**, the render engine and model orchestrator: ffmpeg decode → the chosen
-  interpolation model (GMFSS default, FRUC, DLSS-FG or SVP) → per-frame passes → ffmpeg encode.
+  interpolation model (GMFSS default, RIFE/DRBA, FRUC, DLSS-FG or SVP) → per-frame passes → ffmpeg encode.
   TensorRT backend by default for GMFSS (per-subnet eager fallback; `--no-trt`), NVENC with a CPU
   SVT-AV1 fallback, always fp16, always visually lossless, 10-bit by default. Owns the shared
   plumbing every model uses: probe, track passthrough, pause, crash-resume, progress
@@ -34,6 +34,9 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
   fp16 engines; softsplat + the interpolate glue stay eager. Engines are cached per
   `(net, shapes, gpu, trt version, weights hash)`; the weights-hash in each filename makes the cache
   self-invalidating on a weight swap (stale engines deleted at next start).
+* **`engine/rife_backend.py`** + **`engine/rife/`**, the RIFE model backend: vendored
+  Practical-RIFE 4.26 heavy (MIT, weights bundled) exposing the same pair interface as GMFSS,
+  plus the DRBA triple interface (DistanceRatioMap timing) the engine's DRBA window loop drives.
 * **`engine/svp_backend.py`**, the SVP model backend: generates the standalone VapourSynth host
   process that runs svpflow (SVP 4's plugin DLLs) at a max-quality offline profile and streams y4m
   back to the engine; also documents the profile derivation and the block-size caution.
@@ -109,7 +112,7 @@ portable bundle.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\render.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--fruc] [--svp] [--svp-nvof] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\render.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--rife] [--rife-drba] [--fruc] [--svp] [--svp-nvof] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 * `<multi>` integer multiplier, or `--fps TARGET` to resample to any output fps (the model interpolates at
   arbitrary fractional timesteps; `<multi>` is required positionally but ignored when `--fps` is given).
@@ -126,6 +129,15 @@ engine\runtime\python.exe engine\render.py <input> <multi> [output] [--scale 1.0
   Needs `NvOFFRUC.dll` + `cudart64_110.dll` user-installed into `engine/nvoffruc` from the Optical
   Flow SDK .zip (the GUI's Smooth Motion checkbox offers a one-time installer); GMFSS stays the
   default and the quality path. `--fruc-native` is a debug variant (real frames + FRUC tweens).
+* `--rife` "RIFE": interpolates with Practical-RIFE 4.26 heavy (vendored under `engine/rife`,
+  MIT, weights bundled) instead of GMFSS - the strongest open general-purpose model, the
+  recommendation for live action (GMFSS stays the anime specialist). Same on-grid/--fps timing,
+  passes, pause and crash-resume as GMFSS; eager fp16, no TensorRT.
+* `--rife-drba` (the GUI's RIFE model with "Preserve anime pacing (DRBA)" on): RIFE tweens with
+  DistanceRatioMap timing (routineLife1/DRBA) - pans smooth fully while character motion keeps
+  closer to its original cadence, which also avoids forced-midpoint warping artifacts. Renders
+  on the uniform offset grid for integer `--multi` too (the adjusted timing is the feature); the
+  first window after a start or resume seam falls back to plain pair RIFE (deterministic).
 * `--svp` (the GUI's SVP model with its "Nvidia Optical Flow" sub-option off): interpolates with
   the svpflow engine (block-matching vectors + GPU rendering) whose two plugin DLLs are
   borrowed from a local SVP 4 installation

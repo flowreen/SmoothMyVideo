@@ -88,6 +88,11 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   (Super Resolution / Video HDR) processing a video playing in a browser preempts frame
   generation, so pause videos during a DLSS render (the render detects it and stops with a clear
   message rather than degrading; other models are unaffected).
+* 🎬 **A RIFE model for live action.** GMFSS is an anime specialist; one checkbox switches to
+  Practical-RIFE 4.26 (bundled, nothing to install), the strongest open general-purpose
+  interpolation model - the pick for filmed content. Its **Preserve anime pacing (DRBA)**
+  sub-option keeps characters at their original animation cadence while camera pans smooth
+  fully, for purists who want fluidity without "hollywoodizing" the animation.
 * 🌀 **Optional Nvidia Smooth Motion model.** One checkbox switches the interpolation from the GMFSS AI
   model to NVIDIA's hardware optical-flow FRUC (the same family as the driver-level Smooth Motion), for
   when you want the NVIDIA look or a non-AI reference. Lower quality than GMFSS on fast motion; the
