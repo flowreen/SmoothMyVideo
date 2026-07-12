@@ -83,6 +83,12 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   model to NVIDIA's hardware optical-flow FRUC (the same family as the driver-level Smooth Motion), for
   when you want the NVIDIA look or a non-AI reference. Lower quality than GMFSS on fast motion; the
   NVIDIA runtime is a one-time separate download (not bundled).
+* 🌊 **Optional SVP model.** One more checkbox renders with the SmoothVideo Project's svpflow
+  engine (the tech behind SVP's real-time playback smoothing), borrowed from your local SVP 4
+  installation, so SVP fans can bake their player's look into a file. Its **Nvidia Optical Flow**
+  sub-option (on by default) takes motion vectors from NVIDIA's hardware optical-flow unit;
+  turning it off uses SVP's classic block-matching search instead. Requires SVP 4 installed
+  (only its svpflow plugin DLLs are used; SVP's optional mpv player component is not needed).
 * 🎚️ **Plus the essentials:** FSR-style sharpening, a live before/after preview, every setting remembered
   between runs, and a quiet one-line notice when a newer release is out (nothing auto-downloads).
 

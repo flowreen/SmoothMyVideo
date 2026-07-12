@@ -20,3 +20,9 @@ nvidia-cuda-runtime
 tensorrt
 onnx
 onnxscript
+
+# SVP backend host: the engine itself hosts svpflow (SVP 4's plugins64 DLLs) in VapourSynth - no
+# SVP mpv needed. PINNED: svpflow uses the deprecated VS API3 and R77 still loads it but warns
+# "will be removed shortly"; never bump this without re-verifying an --svp render end to end.
+# The Windows wheel is cp312-abi3 (runs on 3.14) and self-contained (VS core inside the wheel).
+vapoursynth==77

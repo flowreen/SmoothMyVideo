@@ -1,4 +1,4 @@
-"""
+﻿"""
 GMFSS pipe interpolation engine for SmoothMyVideo.
 ffmpeg decode -> GMFSS anime union model -> ffmpeg encode (audio copied).
 Streams frames so there is no PNG folder. Prints "PROGRESS k/total" to stderr for the GUI.
@@ -74,6 +74,7 @@ import math
 import json
 import time
 import argparse
+import tempfile
 import subprocess
 import threading
 import queue
@@ -219,6 +220,24 @@ ap.add_argument("--fruc", action="store_true",
                      "and NvOFFRUC.dll installed in engine/nvoffruc (from NVIDIA's Optical Flow SDK "
                      ".zip). Ignores --no-trt; still honours --upscale/--rtx-hdr/"
                      "--sharpen/--restore.")
+ap.add_argument("--svp", action="store_true",
+                help="The GUI's SVP model with its 'Nvidia Optical Flow' sub-option OFF: interpolate "
+                     "with the Smooth Video Project's svpflow engine "
+                     "(block-matching motion vectors + GPU frame rendering) instead of GMFSS, hosted "
+                     "in the app's own bundled VapourSynth - SVP 4 only provides the two plugins64 "
+                     "svpflow DLLs (its optional mpv component is not needed, SVPManager need not "
+                     "run). Uses a max-quality offline profile (uniform interpolation of every "
+                     "pair, blend at scene cuts, shader 13 Standard, no artifact masking, finest "
+                     "8px vector grid, deepest search). Needs SVP 4 installed (or SMV_SVP_DIR); "
+                     "still honours --upscale/--rtx-hdr/--sharpen/--restore. The SVP pipeline "
+                     "interpolates at 16-bit 4:2:0 precision (vector search at 8-bit, mirroring "
+                     "SVP's own scripts) and the output is always 10-bit (--out-bits 8 ignored).")
+ap.add_argument("--svp-nvof", action="store_true",
+                help="The GUI's SVP model with its 'Nvidia Optical Flow' sub-option ON (the GUI "
+                     "default): like --svp but the motion vectors come from "
+                     "the NVIDIA Optical Flow hardware (svpflow's SmoothFps_NVOF) instead of SVP's "
+                     "block-matching search; rendering is still SVP's. Needs SVP 4 plus a Turing or "
+                     "newer NVIDIA GPU. Same profile parameters and constraints as --svp.")
 ap.add_argument("--fruc-native", action="store_true",
                 help="FRUC only: drive it in native passthrough mode (the way NvOFFRUCSample runs) - "
                      "keep each real source frame and insert multi-1 FRUC tweens between reals, "
@@ -234,6 +253,13 @@ SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output fra
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
 FRUC_MODE = args.fruc                        # NvOFFRUC ("Nvidia Smooth Motion") instead of GMFSS
 FRUC_NATIVE = bool(args.fruc_native)         # FRUC only: native passthrough (real frames + tweens)
+SVP_NVOF = args.svp_nvof                     # "SVP + Nvidia motion": svpflow render, NVOF vectors
+SVP_MODE = args.svp or SVP_NVOF              # either "SVP" model (svpflow) instead of GMFSS
+if SVP_MODE and FRUC_MODE:
+    sys.exit("--svp/--svp-nvof and --fruc are mutually exclusive interpolation backends; pick one")
+# SVP 4 installation the svpflow engine + its VapourSynth runtime are borrowed from. Only read at
+# render time; SVPManager does not need to run.
+SVP_DIR = os.environ.get("SMV_SVP_DIR", r"C:\Program Files (x86)\SVP 4")
 UPSCALE_F = max(1.0, min(16.0, args.upscale)) # output spatial upscale factor (clamped); 1.0 = off.
                                              # RTX VSR has no integer-scale limit (probed clean to
                                              # 16K), so any factor is allowed up to a 16x sanity cap
@@ -338,6 +364,8 @@ elif any(s in SRC_PIX for s in ("p10", "10le", "10be")):
     SRC_BITS = 10
 elif any(s in SRC_PIX for s in ("p12", "12le", "12be")):
     SRC_BITS = 12
+elif any(s in SRC_PIX for s in ("p16", "16le", "16be")):
+    SRC_BITS = 16   # archival ffv1/prores-raw class sources; carried by the same 16-bit pipe
 else:
     SRC_BITS = 8
 TEN_BIT = SRC_BITS >= 10
@@ -472,6 +500,7 @@ def _resume_sig():
     d["output"] = os.path.normcase(os.path.abspath(args.output)) if args.output else None
     d["__src"] = [d["input"], os.path.getsize(inp), int(os.path.getmtime(inp))]
     d["__cq"] = os.environ.get("SMV_CQ") or ""
+    d["__svp_algo"] = os.environ.get("SMV_SVP_ALGO") or ""   # different shader = different pixels
     return hashlib.sha1(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -513,10 +542,17 @@ def _write_resume_sidecar(pair, total):
 # to 8 bit would throw away real sub-8-bit precision the interpolation just created and band
 # the gradients. Frames leave to_bytes as 16 bit rgb whenever either side is >8 bit and the
 # encoder dithers down to its 10-bit format; --out-bits 8 restores the legacy 8-bit output.
-if TEN_BIT:
+# The SVP backend always runs the 16-bit pipe: its host renders SmoothFps at 16-bit precision
+# (see _svp_host_script) for every source, and an rgb24 pipe here would re-quantise those
+# tweens to 8 bit and band gradients - so SVP output is always 10-bit, --out-bits 8 included.
+if TEN_BIT or SVP_MODE:
     DEC_FMT, NP_DT, MAXV, BPP = "rgb48le", np.uint16, 65535.0, 6
 else:
     DEC_FMT, NP_DT, MAXV, BPP = "rgb24", np.uint8, 255.0, 3
+if SVP_MODE and not TEN_BIT_OUT:
+    TEN_BIT_OUT = True
+    sys.stderr.write("note: --out-bits 8 is ignored with the SVP model (its 16-bit interpolation "
+                     "would band if re-quantised); output stays 10-bit\n")
 if TEN_BIT_OUT:
     OUT_RAW_FMT, OUT_MAXV, OUT_TORCH_DT = "rgb48le", 65535.0, torch.uint16
 else:
@@ -533,9 +569,25 @@ if UPSCALE:
 else:
     OUT_W, OUT_H = W, H
 total_pairs = max(1, NB - 1) if NB else 0
+# SVP output rate as an exact fraction of the source rate (SmoothFps takes a relative num/den):
+# integer --multi is multi/1; --fps derives from the snapped target rational when available.
+if SVP_MODE:
+    if FPS_MODE:
+        if tgt_num:
+            from fractions import Fraction
+            _svp_fr = Fraction(tgt_num * den, tgt_den * num).limit_denominator(100000)
+            SVP_RATE_NUM, SVP_RATE_DEN = _svp_fr.numerator, _svp_fr.denominator
+        else:
+            from fractions import Fraction
+            _svp_fr = Fraction(args.fps / src_fps).limit_denominator(100000)
+            SVP_RATE_NUM, SVP_RATE_DEN = _svp_fr.numerator, _svp_fr.denominator
+    else:
+        SVP_RATE_NUM, SVP_RATE_DEN = args.multi, 1
 # Progress denominator: interpolation steps over source pairs (NB-1); the sharpen-only pass
-# instead processes one unit per source frame (NB).
-total_units = NB if NO_INTERP else total_pairs
+# processes one unit per source frame (NB); the SVP pass one unit per OUTPUT frame (its decode
+# stream arrives already interpolated at the target rate).
+total_units = (max(1, round(NB * SVP_RATE_NUM / SVP_RATE_DEN)) if SVP_MODE
+               else NB if NO_INTERP else total_pairs)
 
 sys.path.insert(0, REPO)
 os.chdir(REPO)
@@ -561,7 +613,24 @@ elif FRUC_MODE:
     # "Nvidia Smooth Motion" backend (NVIDIA Optical Flow Accelerator): no GMFSS weights, no TensorRT.
     # The OFA interpolator is created below, once the padded frame size (pw, ph) is known.
     model = None
-    sys.stderr.write("Nvidia Smooth Motion backend (NVIDIA Optical Flow): GMFSS not loaded\n")
+    sys.stderr.write("Using the Nvidia Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n")
+    sys.stderr.flush()
+elif SVP_MODE:
+    # The SVP backend (both GUI models): interpolation happens INSIDE the decode chain (our own
+    # VapourSynth host running SVP's svpflow plugins, see the dec spawn below), so no GMFSS
+    # weights and no TensorRT here; this process only applies the per-frame passes
+    # (RCAS/upscale/HDR/restore) and encodes.
+    model = None
+    for _p in ("plugins64\\svpflow1_vs.dll", "plugins64\\svpflow2_vs.dll"):
+        if not os.path.isfile(os.path.join(SVP_DIR, _p)):
+            sys.exit(f"SVP unavailable: {os.path.join(SVP_DIR, _p)} not found. "
+                     "Install SVP 4 (https://www.svp-team.com) or point SMV_SVP_DIR at it.")
+    import importlib.util as _ilu
+    if _ilu.find_spec("vapoursynth") is None:
+        sys.exit("SVP unavailable: the bundled runtime lacks the vapoursynth package "
+                 "(engine\\runtime\\python.exe -m pip install vapoursynth==77)")
+    sys.stderr.write("Using the SVP backend for interpolation (svpflow"
+                     + (", NVIDIA Optical Flow vectors" if SVP_NVOF else "") + ")\n")
     sys.stderr.flush()
 else:
     from model.GMFSS_infer_u import Model
@@ -1147,7 +1216,12 @@ def _try_resume():
         # Latest safe cut: a display-gapless decode prefix (see _clean_cut) of the verified
         # packets, and early enough that the render loop still emits at least one more frame
         # (the --fps tail hold needs a live last_out).
-        if NO_INTERP:
+        if SVP_MODE:
+            # 1:1 loop over the host's output frames; leave at least one frame to emit. total_units
+            # is an estimate on containers with wrong metadata - a cut past the host's real last
+            # frame makes the resumed host's Trim fail loudly rather than corrupt the output.
+            cap = max(0, total_units - 1)
+        elif NO_INTERP:
             cap = NB
         elif not FPS_MODE:
             cap = 1 + args.multi * (total_pairs - 1)
@@ -1168,7 +1242,9 @@ def _try_resume():
             os.replace(trim, VID_PART)
             os.remove(salv)
         # Map output-frame index c back onto the source grid (see each loop's emission scheme).
-        if NO_INTERP:
+        if SVP_MODE:
+            p, skip = c, 0    # output-frame units: the host itself is trimmed to start at c
+        elif NO_INTERP:
             p, skip = c, 0
         elif not FPS_MODE:
             p, skip = (c - 1) // args.multi, (c - 1) % args.multi
@@ -1253,8 +1329,10 @@ if _rz:
                                     "Dolby Vision / HDR10+ export will be skipped (the HDR10 "
                                     "output itself is complete)")
                 sys.stderr.write(f"resume: {RESUME_DVHP_NOTE}\n"); sys.stderr.flush()
-    sys.stderr.write(f"resume: continuing the previous render from source frame "
-                     f"{RESUME_SKIP_SRC}/{NB or '?'} ({RESUME_OUT_BASE} output frames already "
+    sys.stderr.write(f"resume: continuing the previous render from "
+                     + (f"output frame {RESUME_OUT_BASE}/{total_units}"
+                        if SVP_MODE else f"source frame {RESUME_SKIP_SRC}/{NB or '?'}")
+                     + f" ({RESUME_OUT_BASE} output frames already "
                      f"rendered, {RESUME_BASE_BYTES / 1e6:.0f} MB banked)\n")
     # Jump the GUI's bar/taskbar to the banked position right away.
     sys.stderr.write(f"PROGRESS {RESUME_SKIP_SRC}/{total_units}\n"); sys.stderr.flush()
@@ -1267,13 +1345,213 @@ if _rz:
 # output vsync duplicate frames back up to the original count (measured: select alone re-emitted
 # all 383 frames of a 383-frame source instead of the requested 259).
 _DEC_SKIP = ["-vf", f"select=gte(n\\,{RESUME_SKIP_SRC}),setpts=PTS-STARTPTS"] \
-    if (RESUME_SKIP_SRC and not VFR_DEC) else []
-_PIPE_DISCARD = RESUME_SKIP_SRC if (RESUME_SKIP_SRC and VFR_DEC) else 0
+    if (RESUME_SKIP_SRC and not VFR_DEC and not SVP_MODE) else []
+# SVP mode never skips on this side: the VapourSynth host itself is trimmed to the resume point,
+# so its stream already starts at the right output frame.
+_PIPE_DISCARD = RESUME_SKIP_SRC if (RESUME_SKIP_SRC and VFR_DEC and not SVP_MODE) else 0
 
-dec = subprocess.Popen(
-    [FFMPEG, "-v", "error", "-i", inp] + VFR_DEC + _DEC_SKIP
-    + ["-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
-    stdout=subprocess.PIPE, creationflags=NO_WINDOW)
+def _svp_gpuid():
+    """SVP's OpenCL device id for svpflow GPU rendering, read from the user's own SVP settings
+    (frc.cfg 'gpu': 11 = first NVIDIA, 21 = first Intel in SVP's numbering). SMV_SVP_GPUID
+    overrides; falls back to 11 (the value SVP uses for the primary NVIDIA GPU)."""
+    if os.environ.get("SMV_SVP_GPUID"):
+        return int(os.environ["SMV_SVP_GPUID"])
+    try:
+        import re as _re
+        cfg = os.path.join(os.environ.get("APPDATA", ""), "SVP4", "settings", "frc.cfg")
+        with open(cfg, encoding="utf-8") as _f:
+            m = _re.search(r'"gpu"\s*:\s*(\d+)\s*,', _f.read())
+        if m:
+            return int(m.group(1))
+    except Exception:  # noqa: BLE001 - missing/odd SVP settings: use the NVIDIA default
+        pass
+    return 11
+
+
+def _svp_host_script():
+    """Write the standalone VapourSynth host program for SVP interpolation and return its path.
+    A sibling process on this same runtime imports the bundled `vapoursynth` wheel (pinned in
+    requirements.txt - svpflow is a VS API3 plugin; re-verify a render before any bump),
+    decodes the source with the bundled ffmpeg, feeds svpflow through a sliding-window frame
+    cache (no VS source plugin needed) and writes y4m to stdout for the downstream conversion
+    ffmpeg. SVP 4 only provides the two plugins64 svpflow DLLs.
+    The svpflow parameter strings are a MAX-QUALITY OFFLINE profile (export quality regardless
+    of processing cost), each derived from SVP's own generate.js mappings: frames interpolation
+    mode "Uniform (max fluidity)" -> scene.limits {m1:0,m2:0} (every pair interpolated);
+    scene changes repeat-frame OFF -> scene.blend true (cuts blend instead of holding - the
+    only non-repeat option svpflow offers); shader "13. Standard" -> algo 13 (svpflow's
+    default); artifacts masking Disabled -> no mask.area; MV precision: half-pixel =
+    svpflow's maximum (pel 2 default) + search.type 2; MV grid smallest "6 px" -> block {w:8}
+    (finest vectors); search radius largest -> coarse.distance -12; wide search strongest ->
+    coarse.bad {sad:2000} (range stays svpflow's exhaustive default); decrease grid step ->
+    refine [{thsad:250}] (generate.js supports one level); NVOF variant: accuracy high =
+    default quality (the nvof.q key only exists to LOWER it) + "4 px" vector grid. The ONE
+    deviation: the rate is ours (a relative num/den so any source fps multiplies right; a
+    playback profile's fixed Hz target does not apply offline).
+    CAUTION (bisected offline, this hosting): block:{w:32} degenerates SmoothFps into holding
+    pairs as repeats instead of tweens (~20% alone, worse combined with other search knobs);
+    block w:8 and algo 2 are verified clean. Never reintroduce block:{w:32} offline."""
+    if NB <= 0:
+        sys.exit("SVP backend: the source frame count is unknown (no nb_frames and no container "
+                 "duration), and the VapourSynth host needs a fixed clip length")
+    gpuid = _svp_gpuid()
+    # SVP shader for SmoothFps rendering; 13 "Standard" is svpflow's default. SMV_SVP_ALGO is a
+    # debug/compare override (env-only). Note SmoothFps_NVOF ignores the "Complicated" shaders
+    # (>=21): they only take effect on the classic path.
+    algo = int(os.environ.get("SMV_SVP_ALGO", "13"))
+    # SVP itself hosts NVOF with a fixed 8 VS threads (the OFA hardware does the vector search);
+    # the classic path gets cpu+1 for the CPU block-matching.
+    threads = 8 if SVP_NVOF else (os.cpu_count() or 8) + 1
+    # Cache window for the host's frame feeder: comfortably above VS's concurrent request span,
+    # byte-capped for huge frames (a 16-bit 8K frame is ~100 MB) with the concurrency floor
+    # winning so requests can never outrun the window.
+    fsz = W * H * 3   # yuv420p16le bytes per frame: (W*H*3//2)*2
+    keep = max(threads + 8, min(2 * threads + 8, int(2.5e9 // fsz)))
+    plug = os.path.join(SVP_DIR, "plugins64")
+    if SVP_NVOF:
+        # NVOF variant (SmoothFps_NVOF): the vectors come from the NVIDIA Optical Flow hardware,
+        # fed a vector clip sized as generate.js does for nvof_grid "4 px" - the densest setting
+        # (vec clip = w//4*4 x h//4*4 P8, near full res). 4 is also the floor of generate.js's
+        # small-source shrink loop, so no shrink is needed.
+        grid = 4
+        interp = f"""vec8    = clip.resize.Bicubic(clip.width//{grid}*4, clip.height//{grid}*4,
+                             src_width=clip.width-(clip.width % {grid}),
+                             src_height=clip.height-(clip.height % {grid}), format=vs.YUV420P8)
+smooth  = core.svp2.SmoothFps_NVOF(clip, smoothfps_params, vec_src=vec8, src=clip, fps=src_fps)"""
+    else:
+        # Analysis runs on an 8-bit clip (svp1's input, as in SVP's own scripts); SmoothFps
+        # renders the 16-bit clip, so the tween precision is unaffected by the vector search.
+        interp = """clip8   = clip.resize.Point(format=vs.YUV420P8)
+sup     = core.svp1.Super(clip8, super_params)
+vectors = core.svp1.Analyse(sup["clip"], sup["data"], clip8, analyse_params)
+smooth  = core.svp2.SmoothFps(clip, sup["clip"], sup["data"], vectors["clip"], vectors["data"],
+                              smoothfps_params, src=clip, fps=src_fps)"""
+    # NVOF needs only svpflow2 (SVP's own generated script skips svpflow1 there too).
+    plugin_loads = f'core.std.LoadPlugin(r"{plug}\\svpflow2_vs.dll")' if SVP_NVOF else (
+        f'core.std.LoadPlugin(r"{plug}\\svpflow1_vs.dll")\n'
+        f'core.std.LoadPlugin(r"{plug}\\svpflow2_vs.dll")')
+    # Crash-resume: the banked prefix already holds the first RESUME_OUT_BASE output frames, so
+    # the host starts emitting at that index (VS renders on demand - the skipped output frames
+    # are never computed; the feeder just decodes past the unused source prefix once).
+    resume_trim = (f"smooth = smooth.std.Trim(first={RESUME_OUT_BASE})\n"
+                   if RESUME_OUT_BASE else "")
+    script = f"""# Generated by SmoothMyVideo (--svp{'-nvof' if SVP_NVOF else ''}); max-quality svpflow profile, see _svp_host_script.
+# Standalone VapourSynth host: bundled ffmpeg decode -> sliding-window frame cache -> svpflow
+# -> y4m on stdout.
+import subprocess, sys, threading
+import numpy as np
+import vapoursynth as vs
+
+W, H, N = {W}, {H}, {NB}
+YSZ, CSZ = W * H, (W // 2) * (H // 2)
+FSZ = (YSZ + 2 * CSZ) * 2   # yuv420p16le: 2 bytes per sample
+KEEP = {keep}    # cache window; comfortably above VS's concurrent request span
+NO_WINDOW = 0x08000000
+
+core = vs.core
+core.num_threads = {threads}
+{plugin_loads}
+
+# The source frames arrive as a sequential 16-bit yuv420 pipe (any source depth upshifts
+# losslessly; svpflow then renders SmoothFps at 16-bit precision so tween blends never band -
+# only the analysis/vector clips drop to 8-bit, exactly like SVP's own scripts). VS pulls
+# frames on demand (mildly out of order across worker threads), so serve them from a sliding
+# dict guarded by one lock: a request beyond what is read so far decodes up to it, EOF short
+# of N repeats the last real frame (the clip length is the container's own count; drift is a
+# frame or two at most).
+_dec = subprocess.Popen([{FFMPEG!r}, "-v", "error", "-i", {inp!r}] + {VFR_DEC!r}
+                        + ["-f", "rawvideo", "-pix_fmt", "yuv420p16le", "-"],
+                        stdout=subprocess.PIPE, creationflags=NO_WINDOW)
+_buf, _next, _eof, _last = {{}}, 0, False, None
+_lock = threading.Lock()
+
+def _read_exact():
+    data = b""
+    while len(data) < FSZ:
+        c = _dec.stdout.read(FSZ - len(data))
+        if not c:
+            return None
+        data += c
+    return data
+
+def _fill(n, f):
+    global _next, _eof, _last
+    with _lock:
+        while n >= _next and not _eof:
+            data = _read_exact()
+            if data is None:
+                _eof = True
+                if _next < N:
+                    sys.stderr.write(f"svp host: decode ended at frame {{_next}}/{{N}}; "
+                                     "repeating the last frame\\n"); sys.stderr.flush()
+                break
+            _buf[_next] = (np.frombuffer(data, np.uint16, YSZ).reshape(H, W),
+                           np.frombuffer(data, np.uint16, CSZ, YSZ * 2).reshape(H // 2, W // 2),
+                           np.frombuffer(data, np.uint16, CSZ, (YSZ + CSZ) * 2).reshape(H // 2, W // 2))
+            _last = _buf[_next]
+            _next += 1
+            for k in [k for k in _buf if k < _next - KEEP]:
+                del _buf[k]
+        planes = _buf.get(n) if n in _buf else (_last if n >= _next else None)
+        if planes is None:
+            raise RuntimeError(f"svp host: frame {{n}} left the cache window (KEEP={{KEEP}})")
+    fout = f.copy()
+    for p in range(3):
+        np.asarray(fout[p])[:] = planes[p]
+    return fout
+
+_blank = core.std.BlankClip(width=W, height=H, format=vs.YUV420P16, length=N,
+                            fpsnum={num}, fpsden={den})
+clip = _blank.std.ModifyFrame(clips=_blank, selector=_fill)
+super_params     = "{{scale:{{up:0}},gpu:1,rc:true}}"
+analyse_params   = "{{block:{{w:8}},main:{{search:{{type:2,coarse:{{distance:-12,bad:{{sad:2000}}}}}}}},refine:[{{thsad:250}}]}}"
+smoothfps_params = "{{gpuid:{gpuid},gpu_qn:2,rate:{{num:{SVP_RATE_NUM},den:{SVP_RATE_DEN}}},algo:{algo},scene:{{blend:true,limits:{{m1:0,m2:0}}}}}}"
+src_fps = {num} / {den}
+{interp}
+{resume_trim}smooth.output(sys.stdout.buffer, y4m=True)
+_dec.kill()
+"""
+    path = os.path.join(tempfile.gettempdir(), f"smv_svp_{os.getpid()}.py")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(script)
+    return path
+
+
+_svp_host = None
+_svp_hpy = None
+if SVP_MODE and not NO_INTERP:
+    # SVP decode chain: a sibling python on this same runtime hosts svpflow in the bundled
+    # VapourSynth (see _svp_host_script), interpolating to the target rate in-stream and
+    # emitting y4m on stdout; the bundled ffmpeg converts that to the raw DEC_FMT frames the
+    # reader thread expects. Downstream, every frame in rq is simply an already-interpolated
+    # output frame (the 1:1 SVP loop below).
+    _svp_hpy = _svp_host_script()
+    _svp_host = subprocess.Popen(
+        [sys.executable, _svp_hpy],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
+
+    def _svp_err_pump():
+        # Forward the host's stderr, dropping VapourSynth's "svpflow*.dll is using API3 which is
+        # deprecated" warning: the user can do nothing about it (the pinned vapoursynth==77 in
+        # requirements.txt is what manages that risk). The VS core prints it straight to fd 2,
+        # so it cannot be intercepted inside the host itself.
+        for _line in iter(_svp_host.stderr.readline, b""):
+            if b"is using API3 which is deprecated" in _line:
+                continue
+            sys.stderr.buffer.write(_line)
+            sys.stderr.flush()
+
+    threading.Thread(target=_svp_err_pump, daemon=True).start()
+    dec = subprocess.Popen(
+        [FFMPEG, "-v", "error", "-f", "yuv4mpegpipe", "-i", "-",
+         "-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
+        stdin=_svp_host.stdout, stdout=subprocess.PIPE, creationflags=NO_WINDOW)
+    _svp_host.stdout.close()    # our reference; the ffmpeg child holds its own handle
+else:
+    dec = subprocess.Popen(
+        [FFMPEG, "-v", "error", "-i", inp] + VFR_DEC + _DEC_SKIP
+        + ["-f", "rawvideo", "-pix_fmt", DEC_FMT, "-"],
+        stdout=subprocess.PIPE, creationflags=NO_WINDOW)
 
 # The output codec never echoes the source: the interpolated clip is a brand new artifact (many
 # times the source's frame count), so it gets a modern efficient codec. --codec picks the family:
@@ -1995,6 +2273,18 @@ def _drain_pipes():
     dec.stdout.close()
     enc.wait()
     dec.wait()
+    if _svp_host is not None:
+        # SVP chain: ffmpeg exiting closes the host's stdout pipe; give it a moment to notice the
+        # broken pipe and exit, then force it (its internal decode ffmpeg then exits on its own
+        # broken pipe once the host is gone).
+        try:
+            _svp_host.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _svp_host.kill()
+        try:
+            os.remove(_svp_hpy)
+        except OSError:
+            pass
 
 
 def _finish(done_msg, out_frames=None):
@@ -2058,6 +2348,28 @@ if NO_INTERP:
         _drain_pipes()
     _finish(f"done {k} frames "
             f"({'RCAS-sharpened' if SHARPEN > 0 else 're-encoded'}) -> {out_path}\n", out_frames=k)
+
+if SVP_MODE:
+    # SVP pass: the decode chain (the VapourSynth host + svpflow) already delivered the interpolated stream
+    # at the target rate, so this is a 1:1 loop over OUTPUT frames. ALWAYS route through to_bytes:
+    # the encoder was configured for the interpolation paths' OUT_RAW_FMT (raw pipe-through here
+    # halved the frame count - two rgb24 buffers per 10-bit frame), and this also gives SVP's
+    # 8-bit stream the engine's standard 10-bit output quantisation.
+    k = RESUME_OUT_BASE     # a resumed host is trimmed to start after the banked frames
+    try:
+        while True:
+            _check_pause()      # block here (queued frames keep encoding) while the GUI holds Pause
+            buf = rq.get()
+            if buf is None:
+                break
+            wq.put(to_bytes(to_tensor(buf)))
+            k += 1
+            if k % 10 == 0:
+                _progress(k, total_units)
+    finally:
+        _drain_pipes()
+    _finish(f"done {k} frames (SVP SmoothFps{'_NVOF' if SVP_NVOF else ''} "
+            f"x{SVP_RATE_NUM}/{SVP_RATE_DEN}) -> {out_path}\n", out_frames=k)
 
 # =============================================================================================
 # On-grid passthrough interpolation (GMFSS or FRUC/Smooth Motion; integer --multi; not --fps). The

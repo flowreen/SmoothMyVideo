@@ -99,7 +99,7 @@ portable bundle.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--fruc] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--fruc] [--svp] [--svp-nvof] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 * `<multi>` integer multiplier, or `--fps TARGET` to resample to any output fps (the model interpolates at
   arbitrary fractional timesteps; `<multi>` is required positionally but ignored when `--fps` is given).
@@ -116,6 +116,33 @@ engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--sca
   Needs `NvOFFRUC.dll` + `cudart64_110.dll` user-installed into `engine/nvoffruc` from the Optical
   Flow SDK .zip (the GUI's Smooth Motion checkbox offers a one-time installer); GMFSS stays the
   default and the quality path. `--fruc-native` is a debug variant (real frames + FRUC tweens).
+* `--svp` (the GUI's SVP model with its "Nvidia Optical Flow" sub-option off): interpolates with
+  the svpflow engine (block-matching vectors + GPU rendering) whose two plugin DLLs are
+  borrowed from a local SVP 4 installation
+  (`SMV_SVP_DIR` overrides the default `C:\Program Files (x86)\SVP 4`; SVPManager need not run,
+  and SVP's optional mpv component is NOT needed). The engine spawns a sibling python on the
+  bundled runtime that hosts svpflow in the runtime's own VapourSynth wheel (`vapoursynth==77`,
+  PINNED - svpflow is a deprecated-API3 plugin, re-verify a render before any bump): bundled
+  ffmpeg decodes the source, a sliding-window frame cache feeds the filter (no VS source plugin),
+  and the already-interpolated stream leaves as y4m; the bundled ffmpeg converts it to the raw
+  frames the engine expects, and the engine's per-frame passes + encode run unchanged (1:1 loop).
+  The three svpflow parameter strings are a max-quality offline profile derived from SVP's own
+  generate.js mappings: uniform interpolation (every pair, no adaptive holding), blend at scene
+  cuts instead of repeating, shader 13 "Standard", no artifact masking, finest 8px vector grid
+  with the largest search radius, strongest wide search and a refine pass (see
+  `_svp_host_script` in the engine, including the block:{w:32} caution); the GPU device id is
+  read from the user's own SVP settings (frc.cfg), and `SMV_SVP_ALGO` (env) overrides the
+  shader for comparisons. Pause and crash-resume work like the other models (a resumed run trims
+  the host to the banked output-frame count). SmoothFps renders at 16-bit 4:2:0 precision for
+  every source depth (only the vector-search clips drop to 8-bit, mirroring SVP's own scripts)
+  and the SVP output is always 10-bit, `--out-bits 8` included, so tween blends never band.
+  Known v1 limits: chroma rides at 4:2:0 through svpflow, and the clip length is the
+  container's frame count (a tail frame can repeat or drop on containers with wrong metadata).
+* `--svp-nvof` (the GUI's SVP model with "Nvidia Optical Flow" on, the GUI default): same SVP
+  pipeline, but the motion vectors come from the NVIDIA Optical Flow hardware (svpflow's
+  `SmoothFps_NVOF`, fed a dense 4px-grid P8 vector clip exactly as SVP's own generator builds
+  it) instead of SVP's block-matching search. Needs SVP 4 plus a Turing-or-newer NVIDIA GPU;
+  same parameters and limits as `--svp` (except shaders >=21, which `SmoothFps_NVOF` ignores).
 * `--restore` runs the Real-ESRGAN detail pass per output frame, before the upscale (works with `--no-interp`).
 * `--upscale F` spatial upscale just before encode (bare = 1.5, clamp 16.0; above 8192 px auto-switches to
   a CPU AV1/VVC encoder). `--rtx-vsr` uses RTX Video Super Resolution, else bicubic.

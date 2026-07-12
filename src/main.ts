@@ -20,22 +20,13 @@ const FFPROBE = fs.existsSync(path.join(ENGINE, 'bin', 'ffprobe.exe'))
   : 'ffprobe';
 // The real cold-start when a video is selected is the before/after PREVIEW: it spawns the bundled Python,
 // imports cv2 + torch, and creates a CUDA context (~6s cold, ~2s warm; ffprobe itself is ~0.07s and the
-// preview decodes with cv2, not ffmpeg). Warm that engine at launch, while the welcome screen is up, so
-// the first preview pays the warm ~2s instead of the cold ~6s. This pre-loads torch's DLLs into the OS
-// cache and initialises the CUDA driver/device, which a fresh preview process then skips. It cannot go
-// below the ~2s per-process CUDA context cost (that would need a persistent preview daemon). Best-effort.
-function warmPreviewEngine() {
-  try {
-    spawn(pyExe(), ['-c', 'import cv2, torch; torch.zeros(1, device="cuda" if torch.cuda.is_available() else "cpu")'], {
-      cwd: ENGINE,
-      env: { ...process.env, PYTHONUTF8: '1' },
-      stdio: 'ignore',
-    }).on('error', () => {});
-  } catch {
-    /* best-effort */
-  }
-}
-
+// preview decodes with cv2, not ffmpeg). We deliberately do NOT warm this at launch: on hybrid-GPU
+// laptops the CUDA-context creation saturates the RTX and stalls Chromium's GPU compositor for several
+// seconds, so a user who selects a file during that window sees the (instantly-probed, ~100ms) file
+// info fail to paint until the warmup finishes - the exact "video info loads slowly" symptom. The first
+// preview instead pays its own cold ~6s behind its own spinner, which never blocks the file info. The
+// preview spawn is also fenced behind a composited frame in the renderer (see loadVideo) so the info is
+// always on screen before that heavy Python starts.
 function pyExe(): string {
   return fs.existsSync(RUNTIME_PY) ? RUNTIME_PY : 'python';
 }
@@ -118,7 +109,6 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.whenReady().then(() => {
     createWindow();
-    warmPreviewEngine();
     checkForUpdate();
   });
 }
@@ -263,6 +253,28 @@ const RTX_SDK_URL = 'https://developer.nvidia.com/rtx-video-sdk/getting-started'
 const NVOFFRUC_DIR = path.join(ENGINE, 'nvoffruc');
 const NVOFFRUC_DLLS = ['NvOFFRUC.dll', 'cudart64_110.dll'];
 const OF_SDK_URL = 'https://developer.nvidia.com/opticalflow/download';
+// The "SVP" model: borrows ONLY the two svpflow plugin DLLs from a local SVP 4 installation
+// (nothing bundled from SVP, nothing installed by us; SVPManager need not run - the engine
+// hosts svpflow in the runtime's own bundled VapourSynth wheel). The engine accepts SMV_SVP_DIR to point
+// elsewhere; the render spawn passes svpDir() through it so readiness always agrees with the
+// render. When auto-detection fails the user can pick the install folder in the GUI
+// ('svp-choose'); a VALID pick persists in userData/svp_dir.txt and wins over the default
+// (a saved dir that stopped validating is ignored, falling back cleanly).
+const SVP_DEFAULT_DIR = process.env.SMV_SVP_DIR || 'C:\\Program Files (x86)\\SVP 4';
+const SVP_DIR_FILE = () => path.join(app.getPath('userData'), 'svp_dir.txt');
+const svpDirOk = (dir: string) =>
+  fileExists(path.join(dir, 'plugins64', 'svpflow1_vs.dll')) &&
+  fileExists(path.join(dir, 'plugins64', 'svpflow2_vs.dll'));
+function svpDir(): string {
+  try {
+    const saved = fs.readFileSync(SVP_DIR_FILE(), 'utf8').trim();
+    if (saved && svpDirOk(saved)) return saved;
+  } catch {
+    /* no saved choice */
+  }
+  return SVP_DEFAULT_DIR;
+}
+const SVP_URL = 'https://www.svp-team.com/get/';
 const SYS_TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
 const fileExists = (p: string) => {
   try {
@@ -392,14 +404,21 @@ function installRtx(source: string): { ok: boolean; error?: string; copied: stri
 // Copy NvOFFRUC.dll + cudart64_110.dll out of a chosen Optical Flow SDK .zip (or extracted folder)
 // into engine/nvoffruc, beside the locally built bridge. Mirrors installRtx.
 function installFruc(source: string): { ok: boolean; error?: string; copied: string[] } {
-  try { fs.mkdirSync(NVOFFRUC_DIR, { recursive: true }); } catch { /* exists */ }
+  try {
+    fs.mkdirSync(NVOFFRUC_DIR, { recursive: true });
+  } catch {
+    /* exists */
+  }
   let srcFiles: string[] = [];
   try {
     const found: string[] = [];
-    const walk = (d: string) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, e.name);
-      if (e.isDirectory()) walk(p); else if (NVOFFRUC_DLLS.includes(e.name)) found.push(p);
-    } };
+    const walk = (d: string) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (NVOFFRUC_DLLS.includes(e.name)) found.push(p);
+      }
+    };
     if (/\.zip$/i.test(source)) {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'smv-fruc-'));
       execFileSync(SYS_TAR, ['-xf', source, '-C', tmp, '*NvOFFRUC.dll', '*cudart64_110.dll']);
@@ -408,24 +427,42 @@ function installFruc(source: string): { ok: boolean; error?: string; copied: str
       walk(source);
     }
     // The SDK ships win32 + win64 copies; take the x64 build (basename filter drops the __MACOSX ._ junk).
-    const pick = (n: string) => { const all = found.filter((f) => path.basename(f) === n);
-      return all.find((f) => /win64/i.test(f)) || all[0]; };
+    const pick = (n: string) => {
+      const all = found.filter((f) => path.basename(f) === n);
+      return all.find((f) => /win64/i.test(f)) || all[0];
+    };
     srcFiles = NVOFFRUC_DLLS.map(pick).filter((f): f is string => !!f);
-  } catch (e) { return { ok: false, error: String(e), copied: [] }; }
+  } catch (e) {
+    return { ok: false, error: String(e), copied: [] };
+  }
   const present = srcFiles.filter(fileExists);
   if (present.length < NVOFFRUC_DLLS.length)
-    return { ok: false, error: 'NvOFFRUC.dll / cudart64_110.dll not found in the selected Optical Flow SDK', copied: [] };
+    return {
+      ok: false,
+      error: 'NvOFFRUC.dll / cudart64_110.dll not found in the selected Optical Flow SDK',
+      copied: [],
+    };
   const copied: string[] = [];
   try {
     for (const f of present) {
       const dest = path.join(NVOFFRUC_DIR, path.basename(f));
-      try { if (fileExists(dest)) fs.chmodSync(dest, 0o666); } catch { /* best effort */ }
+      try {
+        if (fileExists(dest)) fs.chmodSync(dest, 0o666);
+      } catch {
+        /* best effort */
+      }
       fs.copyFileSync(f, dest);
       copied.push(path.basename(f));
     }
   } catch (e) {
-    return { ok: false, error: 'Could not write the FRUC DLLs into engine/nvoffruc (' + String(e)
-      + '). If a render is running, stop it and try again.', copied };
+    return {
+      ok: false,
+      error:
+        'Could not write the FRUC DLLs into engine/nvoffruc (' +
+        String(e) +
+        '). If a render is running, stop it and try again.',
+      copied,
+    };
   }
   return { ok: true, copied };
 }
@@ -498,6 +535,42 @@ ipcMain.handle('fruc-choose', async () => {
     filters: [{ name: 'Zip', extensions: ['zip'] }],
   });
   return r.canceled ? null : r.filePaths[0] || null;
+});
+
+// "SVP" readiness: the local SVP 4 install only needs to provide the two svpflow plugin DLLs;
+// there is no install flow on our side, only a hint.
+ipcMain.handle('svp-ready', () => {
+  const dir = svpDir();
+  return { ready: svpDirOk(dir), dir };
+});
+ipcMain.handle('svp-open-download', () => {
+  shell.openExternal(SVP_URL);
+  return true;
+});
+// Manual fallback when auto-detection fails: the user picks the SVP 4 install folder (the one
+// holding plugins64). Forgiving one level: picking the folder ABOVE it also works (we look
+// for an "SVP 4" child). null = dialog cancelled; only a validated pick is persisted.
+ipcMain.handle('svp-choose', async () => {
+  const r = await dialog.showOpenDialog(win!, {
+    title: 'Select your SVP 4 installation folder',
+    defaultPath: SVP_DEFAULT_DIR,
+    properties: ['openDirectory'],
+  });
+  const picked = r.canceled ? null : r.filePaths[0] || null;
+  if (!picked) return null;
+  const candidates = [picked, path.join(picked, 'SVP 4')];
+  const dir = candidates.find(svpDirOk);
+  if (!dir)
+    return {
+      ok: false,
+      error: `${picked} does not look like an SVP 4 installation (plugins64\\svpflow DLLs not found).`,
+    };
+  try {
+    fs.writeFileSync(SVP_DIR_FILE(), dir, 'utf8');
+  } catch (e) {
+    return { ok: false, error: `Could not save the choice: ${String(e)}` };
+  }
+  return { ok: true, dir };
 });
 
 // --- Dolby Vision export tool: readiness + install (mirrors the RTX flow) -------------------------
@@ -749,6 +822,8 @@ ipcMain.on(
     if (opts.interp === false) args.push('--no-interp');
     else {
       if (opts.model === 'fruc') args.push('--fruc'); // "Nvidia Smooth Motion" backend instead of GMFSS
+      if (opts.model === 'svp') args.push('--svp'); // "SVP" backend instead of GMFSS
+      if (opts.model === 'svpnvof') args.push('--svp-nvof'); // "SVP + Nvidia motion" (svpflow render, NVOF vectors)
       if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
     }
     // FSR-style RCAS sharpening strength (GUI checkbox + slider). 0/omitted = off, leaving the
@@ -803,6 +878,7 @@ ipcMain.on(
       SMV_LIVE_PREVIEW: LIVE_JPG,
       SMV_PAUSE_FILE: PAUSE_FLAG,
       SMV_LIVE_OFF_FILE: LIVE_OFF_FLAG,
+      SMV_SVP_DIR: svpDir(), // the engine renders with the same SVP 4 dir readiness validated
     };
     clearPause(); // start unpaused: never inherit a stale flag from a previous (e.g. killed) run
     const proc = spawn(pyExe(), args, { cwd: ENGINE, env });

@@ -172,12 +172,40 @@
         Nvidia Smooth Motion <span class="hint">(NVIDIA optical-flow hardware, lower quality than GMFSS)</span>
       </label>
     </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" id="modelsvplabel" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="modelsvp"
+               style="width:auto;padding:0;accent-color:var(--green);">
+        SVP <span class="hint">(the Smooth Video Project engine; needs SVP 4 installed)</span>
+      </label>
+    </div>
+    <div class="row" id="svpnvofrow" style="display:none">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:22px;">
+        <input type="checkbox" id="svpnvof" checked
+               style="width:auto;padding:0;accent-color:var(--green);">
+        Nvidia Optical Flow <span class="hint">(hardware motion vectors instead of SVP's own search)</span>
+      </label>
+    </div>
     <div id="frucsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
       <div class="row" style="margin:0 0 6px"><span id="frucstatus" class="v">checking...</span></div>
       <div class="hint" id="frucsteps" style="line-height:1.6;margin-bottom:8px"></div>
       <div class="row" id="frucbtns" style="flex-wrap:wrap;gap:6px">
         <button id="frucget" class="mini">Get from NVIDIA</button>
         <button id="frucbrowsezip" class="mini">Choose .zip&hellip;</button>
+      </div>
+    </div>
+    <div id="svpsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px"><span id="svpstatus" class="v">&#10007; NOT READY</span></div>
+      <div class="hint" id="svpsteps" style="line-height:1.6;margin-bottom:8px">
+        Both SVP models render with the svpflow engine from a local
+        <b>SVP 4</b> installation (not bundled). Install SVP 4, then re-select this model.
+        Installed somewhere unusual? <b>Choose folder&hellip;</b> points the app at it.
+        Until then GMFSS is used.</div>
+      <div class="row" id="svpbtns" style="flex-wrap:wrap;gap:6px">
+        <button id="svpget" class="mini">Get SVP 4</button>
+        <button id="svpbrowse" class="mini">Choose folder&hellip;</button>
       </div>
     </div>
   </div>
@@ -503,12 +531,21 @@ holdRepeat($('fpsdn'),  () => nudgeFps(-1));
 $('multin').oninput = () => { const k = parseFloat($('multin').value); if(!isNaN(k) && k > 0) applyMult(k); };
 $('multin').onchange = () => { const k = parseFloat($('multin').value);
   if(isNaN(k) || k < 1){ $('multin').value = multText(); return; } applyMult(k); $('multin').value = multText(); };
+// Interp-off runs are named for the pass that actually runs (priority: restore > sharpen > HDR;
+// an upscale keeps its _<h>p tag instead, as before). The '_sharpened' fallback covers the
+// nothing-enabled combo, which startRun refuses to render anyway.
+function passTag(){
+  if(restoreOn()) return '_restored';
+  if($('sharpen').checked && (parseFloat($('sharpval').value) || 0) > 0) return '_sharpened';
+  if(hdrOn()) return '_hdr';
+  return '_sharpened';
+}
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
   const d = upDims();                                   // upscale target ({w,h} or null); tag the new height
   const res = d ? '_' + d.h + 'p' : '';
   const ext = (info && info.needMkv) ? '.mkv' : '.mp4';   // subtitles/extra tracks ride in mkv
   return interpOn() ? (b + '_' + Math.round(targetFps()) + 'fps' + res + ext)
-                    : (b + (d ? res : '_sharpened') + ext); }
+                    : (b + (d ? res : passTag()) + ext); }
 // A custom name that STILL CARRIES an auto tag (_<n>fps or _<n>p) stays in sync with the settings:
 // the user's folder, base words and extension are preserved, and the _<n>fps / _<n>p suffix is
 // regenerated from the current fps + upscale - so changing the fps updates the fps tag, and enabling
@@ -522,10 +559,11 @@ function retagCustom(name){
   const dot = rest.lastIndexOf('.');
   const ext = dot >= 1 ? rest.slice(dot) : '';          // keep the user's chosen extension
   let base = dot >= 1 ? rest.slice(0, dot) : rest;
-  base = base.replace(/_\d+fps/g, '').replace(/_\d+p(?=_|$)/g, '').replace(/_sharpened/g, '');
+  base = base.replace(/_\d+fps/g, '').replace(/_\d+p(?=_|$)/g, '')
+             .replace(/_sharpened|_restored|_hdr(?=_|$)/g, '');
   const d = upDims();
   const res = d ? '_' + d.h + 'p' : '';
-  const tags = interpOn() ? ('_' + Math.round(targetFps()) + 'fps' + res) : (d ? res : '_sharpened');
+  const tags = interpOn() ? ('_' + Math.round(targetFps()) + 'fps' + res) : (d ? res : passTag());
   return dir + base + tags + ext;
 }
 function refresh(){ if(!input) return;
@@ -616,10 +654,18 @@ async function loadVideo(f){
   $('status').textContent = 'Ready. Pick a multiplier or fps, then click Smooth It!';
   applyScreenFps();      // re-asserts the interp / screen-rate state and recomputes the output name
   syncUpscale();         // recompute the upscale target + output dims for this video's resolution
-  // Let the info panel paint first so the drop feels instant, THEN start the (slower, cold-starts
-  // Python) preview. Without the defer, the preview kicks off in the same tick and the metadata can
-  // look frozen while it loads. Skipped when a batch auto-advances.
-  if(!batchAuto) setTimeout(openPreviewForVideo, 100);
+  // The preview cold-starts Python + torch + a CUDA context (several seconds on the first video of a
+  // session), which SATURATES the GPU and stalls Chromium's compositor - so if it spawns before the
+  // file info has actually painted, the info (already probed in ~100ms, DOM updated synchronously
+  // above) can't reach the screen until that Python eases, which is the "video info loads slowly"
+  // bug. So: reveal the menu + file info now (showWorkspace above, synchronous), paint a loading
+  // wheel on the preview panes (showPreviewInitializing, synchronous), then wait for a REAL composited
+  // frame (two rAFs = one full paint) so the info is guaranteed on screen BEFORE the heavy preview
+  // Python starts. Skipped when a batch auto-advances (no per-item preview).
+  if(!batchAuto){
+    showPreviewInitializing();
+    requestAnimationFrame(() => requestAnimationFrame(openPreviewForVideo));
+  }
   return true;
 }
 // One or more inputs: the first loads now, the rest queue for the same settings back to back.
@@ -835,8 +881,13 @@ ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); s
 // Flow SDK .zip. The Smooth Motion checkbox is ALWAYS clickable (ticking it visibly clears GMFSS);
 // it just reveals a one-time installer when the runtime is missing, and a render only uses FRUC once
 // it is installed - otherwise it falls back to GMFSS (see modelIsFruc + the run payload gate below).
-let frucReady = false, frucBridge = false;
+let frucReady = false, frucBridge = false, svpReady = false;
 function modelIsFruc(){ return $('modelfruc').checked && frucReady; }
+function modelIsSvp(){ return $('modelsvp').checked && svpReady; }
+// The Nvidia Optical Flow sub-checkbox (default ON) picks between the two SVP engine variants:
+// on = svpflow's SmoothFps_NVOF (hardware motion vectors), off = SVP's own block-matching search.
+function modelIsSvpNvof(){ return modelIsSvp() && $('svpnvof').checked; }
+const MODEL_BOXES = () => [$('modelgmfss'), $('modelfruc'), $('modelsvp')];
 function frucSetupHtml(){
   const detail = !frucBridge
     ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
@@ -846,10 +897,14 @@ function frucSetupHtml(){
 async function refreshFrucState(){
   try { const r = await ipcRenderer.invoke('fruc-ready'); frucReady = !!(r && r.ready); frucBridge = !!(r && r.bridge); }
   catch { frucReady = false; frucBridge = false; }
+  try { const s = await ipcRenderer.invoke('svp-ready'); svpReady = !!(s && s.ready); }
+  catch { svpReady = false; }
 }
-// Reflect the current model choice: show the installer only while Smooth Motion is chosen but missing.
+// Reflect the current model choice: show a setup hint only while the chosen model's runtime is
+// missing (FRUC has a one-time DLL installer; SVP just needs SVP 4 installed on the machine).
 function syncModel(){
-  localStorage.setItem('interpModel', $('modelfruc').checked ? 'fruc' : 'gmfss');
+  localStorage.setItem('interpModel',
+    $('modelsvp').checked ? 'svp' : $('modelfruc').checked ? 'fruc' : 'gmfss');
   if($('modelfruc').checked && !frucReady){
     $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
     $('frucsteps').innerHTML = frucSetupHtml();
@@ -858,12 +913,18 @@ function syncModel(){
   } else {
     $('frucsetup').style.display = 'none';
   }
+  $('svpstatus').style.color = '#e85c5c';
+  const svpShow = ($('modelsvp').checked && !svpReady);
+  if(svpShow) $('svpsteps').innerHTML = SVP_STEPS_HTML;  // clears a stale picker error
+  $('svpsetup').style.display = svpShow ? 'block' : 'none';
+  // The SVP variant sub-option only makes sense once SVP is the chosen, working model.
+  $('svpnvofrow').style.display = ($('modelsvp').checked && svpReady) ? '' : 'none';
 }
-// Exclusive-pair behaviour: ticking a box clears its sibling; unticking the active box selects the
-// sibling instead (a model is always chosen, there is no "neither" state).
-function pickModel(box, other){
-  if(box.checked) other.checked = false;
-  else other.checked = true;
+// Exclusive-group behaviour: ticking a box clears the others; unticking the ACTIVE box falls back
+// to GMFSS (a model is always chosen, there is no "neither" state; unticking GMFSS re-checks it).
+function pickModel(box){
+  for(const b of MODEL_BOXES()) if(b !== box) b.checked = false;
+  if(!box.checked) $('modelgmfss').checked = true;
   syncModel();
 }
 async function doFrucInstall(source){
@@ -883,12 +944,41 @@ async function doFrucInstall(source){
 }
 $('frucget').onclick = () => ipcRenderer.invoke('fruc-open-download');
 $('frucbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('fruc-choose'); if(p) doFrucInstall(p); };  // selecting a .zip auto-installs
-$('modelgmfss').onchange = () => pickModel($('modelgmfss'), $('modelfruc'));
-$('modelfruc').onchange = () => pickModel($('modelfruc'), $('modelgmfss'));
-// On load: learn readiness, restore the saved choice, then reflect it (installer shows if Smooth
-// Motion is chosen but missing). Skipped while Interpolate is off: syncInterp() has cleared both
-// boxes and re-checking Interpolate restores the choice itself.
-refreshFrucState().then(() => { if(!interpOn()) return; if(localStorage.getItem('interpModel') === 'fruc'){ $('modelfruc').checked = true; $('modelgmfss').checked = false; } syncModel(); });
+$('svpget').onclick = () => ipcRenderer.invoke('svp-open-download');
+// Manual SVP 4 folder pick, for installs outside the default location. A valid pick persists in
+// the main process (userData/svp_dir.txt); on success the setup box simply disappears. On a bad
+// pick the error is shown ABOVE the standard instructions (mirrors the FRUC install error style).
+const SVP_STEPS_HTML = $('svpsteps').innerHTML;
+$('svpbrowse').onclick = async () => {
+  let r = null;
+  try { r = await ipcRenderer.invoke('svp-choose'); } catch(e){ r = { ok:false, error:String(e) }; }
+  if(!r) return;                                   // dialog cancelled, nothing changes
+  if(r.ok){
+    await refreshFrucState();                      // re-learns svpReady from the saved dir
+    syncModel();                                   // ready now -> hides the setup box
+  } else {
+    $('svpsteps').innerHTML = '&#10007; ' + r.error + '<br>' + SVP_STEPS_HTML;
+  }
+};
+for(const b of ['modelgmfss','modelfruc','modelsvp']) $(b).onchange = () => pickModel($(b));
+// The NVOF sub-option persists on its own key (default ON); it is not part of the exclusive
+// model group, so toggling it never clears the SVP selection.
+$('svpnvof').checked = localStorage.getItem('svpNvof') !== '0';
+$('svpnvof').onchange = () => localStorage.setItem('svpNvof', $('svpnvof').checked ? '1' : '0');
+// On load: learn readiness, restore the saved choice, then reflect it (a setup hint shows if the
+// chosen model's runtime is missing). Skipped while Interpolate is off: syncInterp() has cleared
+// the boxes and re-checking Interpolate restores the choice itself.
+function restoreModelChoice(){
+  let saved = localStorage.getItem('interpModel');
+  if(saved === 'svpnvof'){  // legacy two-checkbox era: "SVP + Nvidia motion" was its own model
+    saved = 'svp'; localStorage.setItem('interpModel', 'svp'); localStorage.setItem('svpNvof', '1');
+    $('svpnvof').checked = true;
+  }
+  const box = saved === 'svp' ? 'modelsvp' : saved === 'fruc' ? 'modelfruc' : 'modelgmfss';
+  for(const b of MODEL_BOXES()) b.checked = false;
+  $(box).checked = true;
+}
+refreshFrucState().then(() => { if(!interpOn()) return; restoreModelChoice(); syncModel(); });
 
 // --- Dolby Vision export tools (mirrors the RTX library flow) ------------------------------------
 // DV 8.1 export needs ONE non-shippable open-source binary - dovi_tool - dropped into engine/dvtools;
@@ -1134,6 +1224,19 @@ function refreshPreviewIfOpen(){           // re-render the shown frame when sha
   if(key === (prevBusy ? inflightPrevKey : lastPrevKey)) return;
   loadPreview(frame);
 }
+// Show the preview panel with a spinning wheel on both panes the INSTANT a video is selected, before
+// the slow preview render is even spawned, so the panel reads as "loading" rather than blank/crashed.
+// A neutral note replaces the usual result caption until the first frame lands.
+function showPreviewInitializing(){
+  syncPreview();                                  // reveal the preview panel
+  $('hdrpreview').style.display = 'block';
+  for(const [inner, wrap, spin] of [['prevorig','prevorigwrap','prevorigspin'],
+                                     ['prevproc','prevprocwrap','prevspin']]){
+    if($(inner).clientHeight < 40) $(wrap).style.minHeight = '120px';   // room for the wheel on first load
+    setSpin($(wrap), $(spin), true);
+  }
+  $('prevnote').textContent = 'Initializing preview…';
+}
 function openPreviewForVideo(){            // auto-load the pane when a video is selected
   syncPreview(); prevHist = []; prevTotal = 0; prevIdx = 0; updatePrevNav();
   previewLite = true;   // the auto-preview on load skips the heavy RTX VSR/HDR passes so the drop is fast
@@ -1144,6 +1247,10 @@ $('prevprev').onclick = async () => { if(prevHist.length > 1){ prevHist.pop(); u
 $('sharpval').addEventListener('change', refreshPreviewIfOpen);
 $('sharpen').addEventListener('change', refreshPreviewIfOpen);
 $('restore').addEventListener('change', refreshPreviewIfOpen);
+// The interp-off output name tags the active pass (_restored/_sharpened/_hdr), so it must
+// re-resolve when any of them toggles (refresh() is a no-op until a video is selected).
+for(const _id of ['sharpen', 'sharpval', 'restore', 'rtxhdr'])
+  $(_id).addEventListener('change', () => refresh());
 
 // RTX HDR colour controls: Colour mode (Faithful = vivid 1.0, the accurate default; NVIDIA vivid =
 // the rtx mode where the Saturation slider behaves like real RTX TrueHDR but hue-corrected), plus a
@@ -1271,16 +1378,18 @@ $('prevproc').onclick = togglePrevZoom;
 function syncInterp(){
   const on = interpOn();
   $('screenfps').disabled = !on;
-  // No interpolation = no interpolation model: clear and grey BOTH model checkboxes while the
+  // No interpolation = no interpolation model: clear and grey ALL model checkboxes while the
   // master toggle is off (user-chosen UX: the panel visibly reflects that nothing will generate
   // frames). Re-checking Interpolate restores the saved model choice from localStorage.
-  $('modelgmfss').disabled = $('modelfruc').disabled = !on;
+  for(const b of MODEL_BOXES()) b.disabled = !on;
+  $('svpnvof').disabled = !on;
   if(!on){
-    $('modelgmfss').checked = false; $('modelfruc').checked = false;
+    for(const b of MODEL_BOXES()) b.checked = false;
     $('frucsetup').style.display = 'none';
+    $('svpsetup').style.display = 'none';
+    $('svpnvofrow').style.display = 'none';
   } else {
-    const fruc = localStorage.getItem('interpModel') === 'fruc';
-    $('modelfruc').checked = fruc; $('modelgmfss').checked = !fruc;
+    restoreModelChoice();
     syncModel();
   }
   applyScreenFps();      // recomputes multi/fpsin enable, the fps mode, and the output name
@@ -1395,6 +1504,8 @@ function startRun(){
   const payload = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
   if(interpOn() && !gm) payload.fps = t;                                             // resample only: non-integer-multiple target
   if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "Nvidia Smooth Motion" (NvOFFRUC) backend
+  else if(interpOn() && modelIsSvpNvof()) payload.model = 'svpnvof'; // SVP with its NVOF sub-option on (default)
+  else if(interpOn() && modelIsSvp()) payload.model = 'svp'; // SVP with the NVOF sub-option off
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
   payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)
