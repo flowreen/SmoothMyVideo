@@ -12,7 +12,7 @@ const ENGINE = app.isPackaged ? path.join(process.resourcesPath, 'engine') : pat
 // Bundled, relocatable python-build-standalone runtime (full stdlib + torch/cupy stack).
 // Its python.exe sits at the runtime root, not under a Scripts/ subdir like a venv.
 const RUNTIME_PY = path.join(ENGINE, 'runtime', 'python.exe');
-const ENGINE_SCRIPT = path.join(ENGINE, 'gmfss_interp.py');
+const ENGINE_SCRIPT = path.join(ENGINE, 'render.py');
 const PREVIEW_SCRIPT = path.join(ENGINE, 'preview.py');
 // Prefer ffprobe bundled at engine/bin (portable build); fall back to PATH for dev.
 const FFPROBE = fs.existsSync(path.join(ENGINE, 'bin', 'ffprobe.exe'))
@@ -1013,7 +1013,7 @@ ipcMain.handle('cancel', async () => {
 
 // Crash/exit resume probe: given the intended FINAL output path, report whether a resumable
 // partial render sits next to it (the engine's stage-1 video + .resume.json sidecar; see the
-// resume block in gmfss_interp.py). The renderer uses this to flip Smooth It! to Resume and to
+// resume block in render.py). The renderer uses this to flip Smooth It! to Resume and to
 // tell the user where the render will pick up. The engine itself re-validates the settings
 // signature, so a stale positive here just means the button said Resume and the run starts
 // fresh with a log notice - never a wrong render.

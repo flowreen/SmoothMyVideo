@@ -2,7 +2,7 @@
 
 Renders ONE source frame at the current spatial settings and writes <out>_original.png (the untouched
 source) and <out>_processed.png. The processed side applies the SAME passes in the SAME order as a full
-render (to_bytes in gmfss_interp.py): AI detail restoration first when --restore (the shared
+render (to_bytes in render.py): AI detail restoration first when --restore (the shared
 realesr.py, eager - one frame needs no TRT engine), then the upscale, then FSR RCAS sharpening in SDR
 (the shared rcas.py, the exact kernel the render uses), then RTX TrueHDR when --rtx-hdr. No
 interpolation, no encode, so the GUI can scrub settings and see the effect before a full render.
@@ -242,7 +242,7 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
     # Match the processed side's OUTPUT resolution so the before/after panes zoom 1:1 identically
     # (same native pixel size -> same magnification, pixel-aligned). Bicubic - the SAME resampler the
-    # non-VSR upscale path uses (gmfss_interp _upscale) - so the original is the honest baseline: when
+    # non-VSR upscale path uses (render.py _upscale) - so the original is the honest baseline: when
     # VSR runs, the processed side is genuinely sharper; when it doesn't, both panes are the same
     # bicubic image and the renderer labels it "plain bicubic upscale" rather than faking a difference.
     if up > 1.0 and (orig_disp.shape[1] != ow or orig_disp.shape[0] != oh):

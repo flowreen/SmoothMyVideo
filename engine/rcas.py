@@ -1,6 +1,6 @@
 """AMD FidelityFX RCAS (Robust Contrast-Adaptive Sharpening), shared by the render engine
-(gmfss_interp.py, the GUI "FSR" toggle / --sharpen) and the single-frame preview (preview.py), so the
-preview shows exactly the sharpen a full render will apply. Moved verbatim out of gmfss_interp.py.
+(render.py, the GUI "FSR" toggle / --sharpen) and the single-frame preview (preview.py), so the
+preview shows exactly the sharpen a full render will apply. Moved verbatim out of render.py.
 """
 import torch
 from torch.nn import functional as F

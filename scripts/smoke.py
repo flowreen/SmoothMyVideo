@@ -29,7 +29,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENGINE = os.path.join(ROOT, "engine")
 PY = sys.executable
-SCRIPT = os.path.join(ENGINE, "gmfss_interp.py")
+SCRIPT = os.path.join(ENGINE, "render.py")
 SAMPLE = os.path.join(ROOT, "samples", "test.mp4")
 FFMPEG = os.path.join(ENGINE, "bin", "ffmpeg.exe")
 FFPROBE = os.path.join(ENGINE, "bin", "ffprobe.exe")

@@ -24,13 +24,23 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
   preview pane, and a launch-time new-release notice. Electron
   `require` with `nodeIntegration`; most settings persist in `localStorage` (Restore and RTX Dynamic
   Vibrance deliberately don't, per-session opt-ins).
-* **`engine/gmfss_interp.py`**, the GMFSS pipe engine: ffmpeg decode → GMFSS → ffmpeg encode. TensorRT
-  backend by default (per-subnet eager fallback; `--no-trt`), NVENC with a CPU SVT-AV1 fallback, always
-  fp16, always visually lossless, 10-bit by default. Prints `PROGRESS k/total` to stderr.
+* **`engine/render.py`**, the render engine and model orchestrator: ffmpeg decode → the chosen
+  interpolation model (GMFSS default, FRUC, DLSS-FG or SVP) → per-frame passes → ffmpeg encode.
+  TensorRT backend by default for GMFSS (per-subnet eager fallback; `--no-trt`), NVENC with a CPU
+  SVT-AV1 fallback, always fp16, always visually lossless, 10-bit by default. Owns the shared
+  plumbing every model uses: probe, track passthrough, pause, crash-resume, progress
+  (`PROGRESS k/total` on stderr), live thumbnail and the encoder selection.
 * **`engine/trt_runtime.py`**, optional TensorRT backend. Swaps the five GMFSS sub-nets for strongly-typed
   fp16 engines; softsplat + the interpolate glue stay eager. Engines are cached per
   `(net, shapes, gpu, trt version, weights hash)`; the weights-hash in each filename makes the cache
   self-invalidating on a weight swap (stale engines deleted at next start).
+* **`engine/svp_backend.py`**, the SVP model backend: generates the standalone VapourSynth host
+  process that runs svpflow (SVP 4's plugin DLLs) at a max-quality offline profile and streams y4m
+  back to the engine; also documents the profile derivation and the block-size caution.
+* **`engine/nvoffruc.py`** + **`engine/nvoffruc/`**, the "Nvidia Smooth Motion" ctypes bridge to
+  NVIDIA's NvOFFRUC library (user-installed DLLs, same pattern as the RTX folder).
+* **`engine/dlssg.py`** + **`engine/dlssg/`**, the DLSS frame-generation bridge.
+* **`engine/rcas.py`**, the FSR RCAS sharpen kernel (shared by render and preview).
 * **`engine/rtxvideo.py`** + **`engine/rtxvideo/`**, the RTX Video bridge (VSR + TrueHDR) over a small
   compiled CUDA DLL (`rtxvideo_cuda.dll`, sources in `build_src/`). The non-redistributable NGX feature
   DLLs are user-installed via the in-app NVIDIA RTX panel; the whole folder is gitignored / excluded from
@@ -99,7 +109,7 @@ portable bundle.
 
 ## Engine CLI (used by the GUI, also runnable directly)
 ```
-engine\runtime\python.exe engine\gmfss_interp.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--fruc] [--svp] [--svp-nvof] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+engine\runtime\python.exe engine\render.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--fruc] [--svp] [--svp-nvof] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
 ```
 * `<multi>` integer multiplier, or `--fps TARGET` to resample to any output fps (the model interpolates at
   arbitrary fractional timesteps; `<multi>` is required positionally but ignored when `--fps` is given).
@@ -210,7 +220,7 @@ non-DV players fall back to HDR10 (mdcv/clli) and DV displays read the dynamic m
 one external tool is `dovi_tool` (open source, user-installed in `engine/dvtools` via the UI's "Dolby Vision"
 panel); the RPU is muxed by the bundled ffmpeg and the DV configuration box (`dvvC`) is written in-engine by
 `hdr10_meta.inject_dv_config` (same ISOBMFF surgery as the HDR10 boxes, the LGPL ffmpeg can't emit `dvvC`
-itself). Flow (`_dv_export` in gmfss_interp): during the HDR render `rtxvideo.run_hdr` accumulates **per-frame
+itself). Flow (`_dv_export` in render.py): during the HDR render `rtxvideo.run_hdr` accumulates **per-frame
 L1** (min/avg/max PQ brightness), near-free, reusing the MaxCLL reduction, and only when `--dv` is set, then
 after encode: extract HEVC → `dovi_tool generate` (one L1 shot/frame) + `inject-rpu` → ffmpeg mux with the
 audio → inject `dvvC` + HDR10 fallback boxes. **B-frames are disabled (`-bf 0`) for DV renders**: dovi_tool

@@ -157,7 +157,7 @@ class RTXVideo:
         # so hdr_saturation defaults to 0 = faithful (matches the source's saturation); 100 is the vivid
         # look, in between trades them. MaxLuminance 400..2000 (def 1000) is the mastering peak the PQ
         # values are shaped to and is written into the HDR10 mastering-display metadata (see
-        # gmfss_interp / hdr10_meta), so one file tone-maps to any display without a per-monitor knob.
+        # render.py / hdr10_meta), so one file tone-maps to any display without a per-monitor knob.
         self._cll = 0.0    # running MaxCLL  (brightest maxRGB pixel, nits) over all HDR frames
         self._fall = 0.0   # running MaxFALL (brightest frame-average maxRGB, nits)
         # Per-frame Dolby Vision L1 (min/avg/max PQ brightness), collected only for the --dv export so
