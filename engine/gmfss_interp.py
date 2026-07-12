@@ -220,6 +220,16 @@ ap.add_argument("--fruc", action="store_true",
                      "and NvOFFRUC.dll installed in engine/nvoffruc (from NVIDIA's Optical Flow SDK "
                      ".zip). Ignores --no-trt; still honours --upscale/--rtx-hdr/"
                      "--sharpen/--restore.")
+ap.add_argument("--dlssg", action="store_true",
+                help="'DLSS 4.5': NVIDIA DLSS Frame Generation (Streamline sl.dlss_g) instead of "
+                     "GMFSS. DLSS-FG only exists inside a game's D3D12 presentation loop, so the "
+                     "bundled engine/dlssg/dlssg2f.exe hosts one offline: each source frame is "
+                     "presented to an offscreen swap chain and the AI-generated in-between frames "
+                     "are read back from it. Whole multipliers 2x-6x on the source grid only "
+                     "(multi-frame generation; no arbitrary-timestep API, so no --fps); above 2x "
+                     "needs an RTX 50 GPU (RTX 40 does single frame generation only), plus a "
+                     "recent driver and Windows HW-accelerated GPU scheduling. Still honours "
+                     "--upscale/--rtx-hdr/--sharpen/--restore.")
 ap.add_argument("--svp", action="store_true",
                 help="The GUI's SVP model with its 'Nvidia Optical Flow' sub-option OFF: interpolate "
                      "with the Smooth Video Project's svpflow engine "
@@ -253,10 +263,11 @@ SHARPEN = max(0.0, min(1.0, args.sharpen))   # RCAS strength on every output fra
 NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame generation
 FRUC_MODE = args.fruc                        # NvOFFRUC ("Nvidia Smooth Motion") instead of GMFSS
 FRUC_NATIVE = bool(args.fruc_native)         # FRUC only: native passthrough (real frames + tweens)
+DLSSG_MODE = args.dlssg                      # DLSS Frame Generation ("DLSS 4.5") instead of GMFSS
 SVP_NVOF = args.svp_nvof                     # "SVP + Nvidia motion": svpflow render, NVOF vectors
 SVP_MODE = args.svp or SVP_NVOF              # either "SVP" model (svpflow) instead of GMFSS
-if SVP_MODE and FRUC_MODE:
-    sys.exit("--svp/--svp-nvof and --fruc are mutually exclusive interpolation backends; pick one")
+if sum((SVP_MODE, FRUC_MODE, DLSSG_MODE)) > 1:
+    sys.exit("--svp/--svp-nvof, --fruc and --dlssg are mutually exclusive interpolation backends; pick one")
 # SVP 4 installation the svpflow engine + its VapourSynth runtime are borrowed from. Only read at
 # render time; SVPManager does not need to run.
 SVP_DIR = os.environ.get("SMV_SVP_DIR", r"C:\Program Files (x86)\SVP 4")
@@ -374,6 +385,13 @@ TEN_BIT_OUT = args.out_bits >= 10 or TEN_BIT   # 10-bit output (the default; --o
                                                # never drops below the source depth)
 CHROMA444 = "444" in SRC_PIX
 FPS_MODE = args.fps is not None and args.fps > 0
+if DLSSG_MODE and not NO_INTERP and (FPS_MODE or not 2 <= args.multi <= 6 or FRUC_NATIVE):
+    # DLSS-FG generates only the evenly spaced frames between two consecutive presents: 1..5 of
+    # them (multi-frame generation) = integer 2x..6x. There is no arbitrary-timestep API to
+    # resample with, so --fps and other multipliers are out. Per-GPU support (RTX 40 = 2x only,
+    # RTX 50 = up to 6x) is enforced by the host at render start with a clear error.
+    sys.exit("DLSS Frame Generation supports whole multipliers from 2x to 6x on the source grid "
+             "(no --fps resampling, no --fruc-native). Pick 2x-6x, or use GMFSS for anything else.")
 src_fps = num / den
 if not NB:
     # MKV and other streaming containers routinely report nb_frames as N/A. Without a
@@ -615,6 +633,12 @@ elif FRUC_MODE:
     model = None
     sys.stderr.write("Using the Nvidia Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n")
     sys.stderr.flush()
+elif DLSSG_MODE:
+    # "DLSS 4.5" backend (DLSS Frame Generation): no GMFSS weights, no TensorRT. The host process
+    # is spawned below, once the padded frame size (pw, ph) is known.
+    model = None
+    sys.stderr.write("Using the DLSS Frame Generation backend for interpolation (DLSS 4.5)\n")
+    sys.stderr.flush()
 elif SVP_MODE:
     # The SVP backend (both GUI models): interpolation happens INSIDE the decode chain (our own
     # VapourSynth host running SVP's svpflow plugins, see the dec spawn below), so no GMFSS
@@ -824,6 +848,19 @@ if FRUC_MODE and not NO_INTERP:
                  "the Optical Flow engine, and NvOFFRUC.dll installed in engine/nvoffruc (from NVIDIA's "
                  "Optical Flow SDK .zip); or drop --fruc to use GMFSS.")
     sys.stderr.write(f"Nvidia Smooth Motion ready (NvOFFRUC {pw}x{ph})\n"); sys.stderr.flush()
+
+# "DLSS 4.5" interpolator: DLSS Frame Generation hosted by the bundled offline D3D12 presentation
+# loop (engine/dlssg/dlssg2f.exe, see engine/dlssg.py), sized to the padded frame like FRUC. The
+# host quantises to the 8-bit RGBA swap chain DLSS-FG operates on (tween-only; real frames keep the
+# full pipe depth). 2x on-grid only, enforced at argument time above.
+_dlssg = None
+if DLSSG_MODE and not NO_INTERP:
+    import dlssg
+    try:
+        _dlssg = dlssg.DLSSG(pw, ph, args.multi - 1)   # multi-frame gen: N-1 tweens = Nx
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"DLSS Frame Generation unavailable: {e}")
+    sys.stderr.write(f"DLSS Frame Generation ready ({pw}x{ph}, {args.multi}x)\n"); sys.stderr.flush()
 
 def amp():
     return torch.autocast("cuda", dtype=torch.float16)
@@ -2401,6 +2438,15 @@ if not FPS_MODE and not FRUC_NATIVE:
             # midpoint at MAD 38/38 to the endpoints, any interp after reset() = I1 at MAD 0.0, old
             # and new bridge alike). Do not reintroduce reset() in this streaming path.
             return [to_bytes(_ofa.interpolate(a, b, f)) for f in fracs]
+    elif DLSSG_MODE:
+        def _gen_tweens(a, b, fracs):
+            # DLSS-FG multi-frame generation makes exactly the multi-1 evenly spaced tweens =
+            # _MTW's j/M fractions, in temporal order, for consecutively presented frames. On a
+            # resume that lands mid-pair fracs is the tail slice of _MTW; the pair is still fed
+            # to the host (its temporal stream must stay intact) and the banked tweens dropped.
+            tws = _dlssg.interpolate(a, b)
+            take = len(fracs)
+            return [to_bytes(t) for t in tws[len(tws) - take:]] if take else []
     else:
         def _gen_tweens(a, b, fracs):
             with amp():
@@ -2445,7 +2491,8 @@ if not FPS_MODE and not FRUC_NATIVE:
     finally:
         _drain_pipes()
     # On-grid output is the real first frame plus M tweens/real per processed pair: multi*k + 1.
-    _sm_note = f", NvOFFRUC ({getattr(_ofa, 'repeats', 0)} frame-repeats)" if _ofa is not None else ""
+    _sm_note = (f", NvOFFRUC ({getattr(_ofa, 'repeats', 0)} frame-repeats)" if _ofa is not None
+                else ", DLSS-FG" if _dlssg is not None else "")
     _finish(f"done {k} pairs{_sm_note} -> {out_path}\n", out_frames=args.multi * k + 1)
 
 # ---------------------------------------------------------------------------------------------

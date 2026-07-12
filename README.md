@@ -79,6 +79,15 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 * 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
   detected and timed correctly, so audio never drifts out of sync.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
+* ✨ **Optional DLSS 4.5 model.** One checkbox switches the interpolation to NVIDIA's DLSS Frame
+  Generation, the AI frame generation from their game stack, hosted offline by a bundled bare-bones
+  D3D12 presentation loop (DLSS-FG has no video API, so the app runs one for it). Fully bundled
+  (~10 MB, NVIDIA-redistributable Streamline runtime); whole multipliers 2×–6× on the source grid
+  (multi-frame generation; above 2× needs an RTX 50); needs an RTX 40/50 GPU, a recent driver and
+  Windows hardware-accelerated GPU scheduling. One caveat: NVIDIA's RTX Video enhancement
+  (Super Resolution / Video HDR) processing a video playing in a browser preempts frame
+  generation, so pause videos during a DLSS render (the render detects it and stops with a clear
+  message rather than degrading; other models are unaffected).
 * 🌀 **Optional Nvidia Smooth Motion model.** One checkbox switches the interpolation from the GMFSS AI
   model to NVIDIA's hardware optical-flow FRUC (the same family as the driver-level Smooth Motion), for
   when you want the NVIDIA look or a non-AI reference. Lower quality than GMFSS on fast motion; the

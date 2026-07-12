@@ -253,6 +253,20 @@ const RTX_SDK_URL = 'https://developer.nvidia.com/rtx-video-sdk/getting-started'
 const NVOFFRUC_DIR = path.join(ENGINE, 'nvoffruc');
 const NVOFFRUC_DLLS = ['NvOFFRUC.dll', 'cudart64_110.dll'];
 const OF_SDK_URL = 'https://developer.nvidia.com/opticalflow/download';
+// "DLSS 4.5" (DLSS Frame Generation): fully bundled, no installer - the offline host exe
+// (engine/dlssg/dlssg2f.exe, built from build_src) plus NVIDIA's redistributable Streamline
+// runtime (~10 MB, licenses alongside). Readiness = all files present (False means a broken
+// install); actual GPU/driver support surfaces as a clear engine error at render time.
+const DLSSG_DIR = path.join(ENGINE, 'dlssg');
+const DLSSG_FILES = [
+  'dlssg2f.exe',
+  'sl.interposer.dll',
+  'sl.common.dll',
+  'sl.dlss_g.dll',
+  'sl.pcl.dll',
+  'sl.reflex.dll',
+  'nvngx_dlssg.dll',
+];
 // The "SVP" model: borrows ONLY the two svpflow plugin DLLs from a local SVP 4 installation
 // (nothing bundled from SVP, nothing installed by us; SVPManager need not run - the engine
 // hosts svpflow in the runtime's own bundled VapourSynth wheel). The engine accepts SMV_SVP_DIR to point
@@ -514,6 +528,11 @@ ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
 });
 
 // "Nvidia Smooth Motion" (NvOFFRUC) runtime: ready only when our bridge AND NvOFFRUC.dll are present.
+// "DLSS 4.5" (DLSS Frame Generation): bundled, so this only guards against a broken install.
+ipcMain.handle('dlssg-ready', () => {
+  const missing = DLSSG_FILES.filter((f) => !fileExists(path.join(DLSSG_DIR, f)));
+  return { ready: missing.length === 0, missing, dir: DLSSG_DIR };
+});
 ipcMain.handle('fruc-ready', () => {
   const bridge = fileExists(path.join(NVOFFRUC_DIR, 'nvoffruc_bridge.dll'));
   const dll = fileExists(path.join(NVOFFRUC_DIR, 'NvOFFRUC.dll'));
@@ -821,6 +840,7 @@ ipcMain.on(
     // so tell the engine to skip frame generation (and ignore any fps/multi) entirely.
     if (opts.interp === false) args.push('--no-interp');
     else {
+      if (opts.model === 'dlssg') args.push('--dlssg'); // "DLSS 4.5" (Frame Generation) backend instead of GMFSS
       if (opts.model === 'fruc') args.push('--fruc'); // "Nvidia Smooth Motion" backend instead of GMFSS
       if (opts.model === 'svp') args.push('--svp'); // "SVP" backend instead of GMFSS
       if (opts.model === 'svpnvof') args.push('--svp-nvof'); // "SVP + Nvidia motion" (svpflow render, NVOF vectors)

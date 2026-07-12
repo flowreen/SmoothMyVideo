@@ -367,6 +367,10 @@ The engine reaches both NVIDIA runtimes through small locally-built cdecl DLLs d
 sources live in `engine/rtxvideo/build_src/` and `engine/nvoffruc/build_src/`; this section is the
 build documentation for both.
 
+(The DLSS 4.5 model's host, `engine/dlssg/dlssg2f.exe`, is a standalone exe rather than a ctypes
+bridge and has its own build doc at `engine/dlssg/build_src/BUILD.md`. Unlike the bridges here, both
+its exe and its Streamline runtime DLLs are redistributable and ship committed/bundled.)
+
 ### RTX Video bridge (`rtxvideo_cuda.dll`)
 
 A small CUDA bridge that lets `engine/rtxvideo.py` drive NVIDIA's RTX Video SDK (RTX VSR + TrueHDR).

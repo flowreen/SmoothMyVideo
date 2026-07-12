@@ -90,7 +90,7 @@
       <span class="k">Interpolate</span>
       <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="interp" checked style="width:auto;padding:0;accent-color:var(--green);">
-        generate in-between frames for smoother motion using the GMFSS AI model (off = only sharpen the video)
+        generate in-between frames for smoother motion with the model chosen below (off = keep the source frames; sharpen, upscale, HDR and restore still apply)
       </label>
     </div>
     <div class="row">
@@ -166,6 +166,14 @@
     </div>
     <div class="row">
       <span class="k"></span>
+      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="modeldlss"
+               style="width:auto;padding:0;accent-color:var(--green);">
+        NVIDIA DLSS 4.5 <span class="hint">(Deep Learning Super Sampling&rsquo;s AI frame generation, from the game stack; whole 2&times;&ndash;6&times;; needs RTX 40/50, above 2&times; RTX 50 only)</span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
       <label class="hint" id="modelfruclabel" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelfruc"
                style="width:auto;padding:0;accent-color:var(--green);">
@@ -177,7 +185,7 @@
       <label class="hint" id="modelsvplabel" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelsvp"
                style="width:auto;padding:0;accent-color:var(--green);">
-        SVP <span class="hint">(the Smooth Video Project engine; needs SVP 4 installed)</span>
+        SVP <span class="hint">(the Smooth Video Project engine, included mainly for its Nvidia Optical Flow mode below; needs SVP 4 installed)</span>
       </label>
     </div>
     <div class="row" id="svpnvofrow" style="display:none">
@@ -185,8 +193,12 @@
       <label class="hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:22px;">
         <input type="checkbox" id="svpnvof" checked
                style="width:auto;padding:0;accent-color:var(--green);">
-        Nvidia Optical Flow <span class="hint">(hardware motion vectors instead of SVP's own search)</span>
+        Nvidia Optical Flow <span class="hint">(on = motion vectors from NVIDIA's optical-flow hardware, off = SVP's own block-matching search)</span>
       </label>
+    </div>
+    <div id="dlsssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px"><span id="dlssstatus" class="v">&#10007; NOT READY</span></div>
+      <div class="hint" id="dlsssteps" style="line-height:1.6"></div>
     </div>
     <div id="frucsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
       <div class="row" style="margin:0 0 6px"><span id="frucstatus" class="v">checking...</span></div>
@@ -532,13 +544,15 @@ $('multin').oninput = () => { const k = parseFloat($('multin').value); if(!isNaN
 $('multin').onchange = () => { const k = parseFloat($('multin').value);
   if(isNaN(k) || k < 1){ $('multin').value = multText(); return; } applyMult(k); $('multin').value = multText(); };
 // Interp-off runs are named for the pass that actually runs (priority: restore > sharpen > HDR;
-// an upscale keeps its _<h>p tag instead, as before). The '_sharpened' fallback covers the
-// nothing-enabled combo, which startRun refuses to render anyway.
+// an upscale keeps its _<h>p tag instead, as before). The '_unchanged' fallback covers the
+// nothing-enabled combo, which is only ever a display placeholder: startRun refuses it with the
+// "Nothing to do" alert, so no file by that name is produced - the tag just tells the user the
+// current settings would change nothing, instead of claiming a sharpen that will not happen.
 function passTag(){
   if(restoreOn()) return '_restored';
   if($('sharpen').checked && (parseFloat($('sharpval').value) || 0) > 0) return '_sharpened';
   if(hdrOn()) return '_hdr';
-  return '_sharpened';
+  return '_unchanged';
 }
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
   const d = upDims();                                   // upscale target ({w,h} or null); tag the new height
@@ -560,7 +574,7 @@ function retagCustom(name){
   const ext = dot >= 1 ? rest.slice(dot) : '';          // keep the user's chosen extension
   let base = dot >= 1 ? rest.slice(0, dot) : rest;
   base = base.replace(/_\d+fps/g, '').replace(/_\d+p(?=_|$)/g, '')
-             .replace(/_sharpened|_restored|_hdr(?=_|$)/g, '');
+             .replace(/_sharpened|_restored|_unchanged|_hdr(?=_|$)/g, '');
   const d = upDims();
   const res = d ? '_' + d.h + 'p' : '';
   const tags = interpOn() ? ('_' + Math.round(targetFps()) + 'fps' + res) : (d ? res : passTag());
@@ -728,6 +742,15 @@ function applyScreenFps(){
     if(on) setTarget(screenHz);                   // match the monitor exactly (1000Hz on a 24 source = 41.67x -> --fps)
     else if(interp){ const v = +localStorage.getItem('fpsTarget');   // restore the persisted target (survives run/reload); default 2x
       setTarget(v >= sliderMin() ? v : srcFps()*2); }   // default 2x, kept exact (23.976 -> 47.952)
+    else {
+      // Interpolation off: the greyed box is a display, and the output rate IS the source rate, so
+      // show it (matching the 1.0x the multiplier view already shows) instead of the stale target.
+      // Written directly, not via setTarget: the clamp there would round 23.976 up to the 24 floor,
+      // and the persisted target must survive untouched for the restore branch above on re-enable.
+      $('fpsin').value = srcFps().toFixed(targetDecimals());
+      $('fpsin').title = 'output keeps the source frame rate while Interpolate is off';
+      syncTargetUI();
+    }
   }
   refresh();
 }
@@ -881,13 +904,14 @@ ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); s
 // Flow SDK .zip. The Smooth Motion checkbox is ALWAYS clickable (ticking it visibly clears GMFSS);
 // it just reveals a one-time installer when the runtime is missing, and a render only uses FRUC once
 // it is installed - otherwise it falls back to GMFSS (see modelIsFruc + the run payload gate below).
-let frucReady = false, frucBridge = false, svpReady = false;
+let frucReady = false, frucBridge = false, svpReady = false, dlssReady = false, dlssMissing = [];
 function modelIsFruc(){ return $('modelfruc').checked && frucReady; }
 function modelIsSvp(){ return $('modelsvp').checked && svpReady; }
+function modelIsDlss(){ return $('modeldlss').checked && dlssReady; }
 // The Nvidia Optical Flow sub-checkbox (default ON) picks between the two SVP engine variants:
 // on = svpflow's SmoothFps_NVOF (hardware motion vectors), off = SVP's own block-matching search.
 function modelIsSvpNvof(){ return modelIsSvp() && $('svpnvof').checked; }
-const MODEL_BOXES = () => [$('modelgmfss'), $('modelfruc'), $('modelsvp')];
+const MODEL_BOXES = () => [$('modelgmfss'), $('modeldlss'), $('modelfruc'), $('modelsvp')];
 function frucSetupHtml(){
   const detail = !frucBridge
     ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
@@ -899,12 +923,33 @@ async function refreshFrucState(){
   catch { frucReady = false; frucBridge = false; }
   try { const s = await ipcRenderer.invoke('svp-ready'); svpReady = !!(s && s.ready); }
   catch { svpReady = false; }
+  // DLSS ("DLSS 4.5" Frame Generation) ships bundled, so not-ready means files were deleted from
+  // engine/dlssg (a broken install); GPU/driver support is only knowable at render time.
+  try { const d = await ipcRenderer.invoke('dlssg-ready'); dlssReady = !!(d && d.ready); dlssMissing = (d && d.missing) || []; }
+  catch { dlssReady = false; dlssMissing = []; }
 }
 // Reflect the current model choice: show a setup hint only while the chosen model's runtime is
 // missing (FRUC has a one-time DLL installer; SVP just needs SVP 4 installed on the machine).
 function syncModel(){
   localStorage.setItem('interpModel',
-    $('modelsvp').checked ? 'svp' : $('modelfruc').checked ? 'fruc' : 'gmfss');
+    $('modelsvp').checked ? 'svp' : $('modelfruc').checked ? 'fruc' :
+    $('modeldlss').checked ? 'dlssg' : 'gmfss');
+  if($('modeldlss').checked && !dlssReady){
+    $('dlsssteps').innerHTML = 'The bundled DLSS runtime is incomplete: <b>' + dlssMissing.join(', ')
+      + '</b> missing from engine/dlssg. Reinstall the app (or rebuild per engine/dlssg/build_src/BUILD.md). '
+      + 'Until then GMFSS is used.';
+    $('dlsssetup').style.display = 'block';
+  } else {
+    $('dlsssetup').style.display = 'none';
+  }
+  // DLSS-FG has no arbitrary-timestep API: it makes only the evenly spaced frames between
+  // consecutive source frames, i.e. whole 2x-6x multipliers (multi-frame generation). Picking it
+  // with an off-grid or out-of-range target snaps to 2x (the steppers stay usable; a bad target
+  // is blocked with guidance at Smooth It! time).
+  if($('modeldlss').checked && dlssReady && info){
+    const gm = gridMulti();
+    if(gm < 2 || gm > 6) applyMult(2);
+  }
   if($('modelfruc').checked && !frucReady){
     $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
     $('frucsteps').innerHTML = frucSetupHtml();
@@ -960,7 +1005,7 @@ $('svpbrowse').onclick = async () => {
     $('svpsteps').innerHTML = '&#10007; ' + r.error + '<br>' + SVP_STEPS_HTML;
   }
 };
-for(const b of ['modelgmfss','modelfruc','modelsvp']) $(b).onchange = () => pickModel($(b));
+for(const b of ['modelgmfss','modeldlss','modelfruc','modelsvp']) $(b).onchange = () => pickModel($(b));
 // The NVOF sub-option persists on its own key (default ON); it is not part of the exclusive
 // model group, so toggling it never clears the SVP selection.
 $('svpnvof').checked = localStorage.getItem('svpNvof') !== '0';
@@ -974,7 +1019,8 @@ function restoreModelChoice(){
     saved = 'svp'; localStorage.setItem('interpModel', 'svp'); localStorage.setItem('svpNvof', '1');
     $('svpnvof').checked = true;
   }
-  const box = saved === 'svp' ? 'modelsvp' : saved === 'fruc' ? 'modelfruc' : 'modelgmfss';
+  const box = saved === 'svp' ? 'modelsvp' : saved === 'fruc' ? 'modelfruc'
+            : saved === 'dlssg' ? 'modeldlss' : 'modelgmfss';
   for(const b of MODEL_BOXES()) b.checked = false;
   $(box).checked = true;
 }
@@ -1452,6 +1498,14 @@ function startRun(){
   if(interpOn() && Math.round(t) <= Math.round(srcFps())){
     alert('A 1× target adds no frames (output fps = source fps). Raise the target above ' + Math.round(srcFps())
         + ' fps to smooth, or turn off Interpolate to just sharpen / re-encode.'); return; }
+  // DLSS-FG only generates the evenly spaced frames between consecutive frames: whole 2x-6x
+  // multipliers on the source grid (multi-frame generation). There is no timestep to ask for
+  // anything else, so block with guidance (mirrors the 1x block). The per-GPU ceiling (RTX 40 =
+  // 2x only) is enforced by the engine at render start with its own clear error.
+  if(interpOn() && modelIsDlss() && (gridMulti() < 2 || gridMulti() > 6)){
+    alert('DLSS 4.5 interpolates at whole multipliers from 2× to 6× of the source fps ('
+        + (2*srcFps()).toFixed(targetDecimals()) + '–' + (6*srcFps()).toFixed(targetDecimals())
+        + ' fps for this video). Pick one of those, or GMFSS for any other target.'); return; }
   const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
   const dims = upDims();                               // upscale target ({w,h} or null)
   const factor = upFactor();                           // arbitrary upscale factor (0 = off)
@@ -1503,7 +1557,8 @@ function startRun(){
   log('>> '+input+'  ->  '+what+extra+'\n');
   const payload = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
   if(interpOn() && !gm) payload.fps = t;                                             // resample only: non-integer-multiple target
-  if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "Nvidia Smooth Motion" (NvOFFRUC) backend
+  if(interpOn() && modelIsDlss()) payload.model = 'dlssg';   // "DLSS 4.5" (Frame Generation) backend
+  else if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "Nvidia Smooth Motion" (NvOFFRUC) backend
   else if(interpOn() && modelIsSvpNvof()) payload.model = 'svpnvof'; // SVP with its NVOF sub-option on (default)
   else if(interpOn() && modelIsSvp()) payload.model = 'svp'; // SVP with the NVOF sub-option off
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
