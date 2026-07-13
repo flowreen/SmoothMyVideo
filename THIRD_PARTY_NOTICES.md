@@ -32,7 +32,7 @@ third-party work.
 * **CPython** via python-build-standalone (PSF License and component licenses).
 * **PyTorch** (BSD-style), **CuPy** (MIT), **NumPy** (BSD), **OpenCV** (Apache-2.0),
   **ONNX / onnxscript** (Apache-2.0 / MIT).
-* **NVIDIA TensorRT, cuDNN, CUDA runtime libraries**: redistributed as permitted by the
+* **NVIDIA TensorRT for RTX, cuDNN, CUDA runtime libraries**: redistributed as permitted by the
   NVIDIA software license agreements covering runtime redistribution.
 
 ## Optional, user-installed (never bundled or redistributed)

@@ -1,11 +1,11 @@
 """
-TensorRT backend for the GMFSS sub networks.
+TensorRT for RTX (tensorrt_rtx) backend for the GMFSS sub networks.
 
 Strategy: each sub net is exported
 to ONNX under autocast(fp16) via the dynamo exporter (mixed fp16/fp32 matching the
 app's precision), then built into a strongly typed TRT engine. softsplat (cupy) and
 the F.interpolate glue stay in eager. Engines are built on first use for a given
-input resolution and cached on disk per (net, shapes, gpu, trt version, weights hash);
+input resolution and cached on disk per (net, shapes, trt version, weights hash);
 the weights fingerprint in the name means a train_log swap invalidates the cache
 automatically (stale engines are deleted at startup) instead of silently serving
 engines compiled from the old model.
@@ -41,7 +41,10 @@ try:
 except Exception:
     pass
 
-import tensorrt as trt
+# TensorRT for RTX (tensorrt_rtx): a compact, RTX-focused TensorRT build with hardware-agnostic AOT
+# engines and near-instant builds. If it fails to import, the ImportError propagates and the render.py
+# guard around "import trt_runtime" drops the whole pipeline to eager.
+import tensorrt_rtx as trt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.environ.get("SMV_TRT_CACHE") or os.path.join(HERE, "trt_cache")
@@ -52,9 +55,12 @@ _T2T = {trt.DataType.FLOAT: torch.float32, trt.DataType.HALF: torch.float16,
         trt.DataType.BOOL: torch.bool, trt.DataType.BF16: torch.bfloat16}
 
 
-def _gpu_tag():
-    name = torch.cuda.get_device_name().replace(" ", "")
-    return f"{name}-trt{trt.__version__}".replace(".", "_")
+def _trt_tag():
+    # TensorRT-RTX's serialized engine is the hardware-agnostic AOT blob (the GPU-specific kernels are
+    # JIT-compiled at load and cached separately - see the runtime cache below), so its filename needs
+    # only the TRT version, no GPU name: one built engine is reusable across any RTX GPU (and survives a
+    # card swap). The version still rides in the name, so a TRT-RTX upgrade is a clean rebuild.
+    return f"trt{trt.__version__}".replace(".", "_")
 
 
 def _weights_tag():
@@ -113,13 +119,61 @@ for _fn in os.listdir(CACHE_DIR):
         pass  # cache hygiene is best effort; a locked file just stays until next start
 
 
+# --- TensorRT-RTX device JIT cache (persisted across process starts) ------------------------------
+# TRT-RTX JIT-compiles the GPU-specific kernels when an engine is first loaded (the flip side of the
+# hardware-agnostic AOT engine above). Persisting that IRuntimeCache to disk lets later process starts
+# reuse the compiled kernels instead of recompiling. One shared cache for the whole process: loaded at
+# first use, set on every engine's execution context, rewritten at exit. Fully best-effort - any
+# failure falls back to a plain context, so a render never depends on it.
+_RTX_CACHE_PATH = os.path.join(CACHE_DIR, "rtx_runtime_jit.cache")
+_rtx_cache = None
+_rtx_cache_active = False
+
+
+def _make_exec_context(engine):
+    """Execution context for a deserialized engine, wiring the shared persisted JIT cache."""
+    global _rtx_cache, _rtx_cache_active
+    try:
+        rc = engine.create_runtime_config()
+        if _rtx_cache is None:
+            _rtx_cache = rc.create_runtime_cache()
+            if os.path.isfile(_RTX_CACHE_PATH):
+                try:
+                    with open(_RTX_CACHE_PATH, "rb") as f:
+                        _rtx_cache.deserialize(f.read())
+                except Exception:  # noqa: BLE001 - a corrupt/stale cache is just discarded
+                    _rtx_cache.reset()
+        rc.set_runtime_cache(_rtx_cache)
+        _rtx_cache_active = True
+        return engine.create_execution_context(rc)
+    except Exception as e:  # noqa: BLE001
+        _log(f"[trt] runtime JIT cache unavailable, plain context: {repr(e)[:120]}")
+        return engine.create_execution_context()
+
+
+def _save_rtx_cache():
+    if not _rtx_cache_active or _rtx_cache is None:
+        return
+    try:
+        tmp = _RTX_CACHE_PATH + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(bytes(_rtx_cache.serialize()))
+        os.replace(tmp, _RTX_CACHE_PATH)  # atomic; never leaves a half-written cache
+    except Exception:  # noqa: BLE001 - persistence is best effort
+        pass
+
+
+import atexit
+atexit.register(_save_rtx_cache)
+
+
 class TRTModule:
     """A built engine; binds torch cuda tensors zero copy and runs it."""
 
     def __init__(self, serialized):
         self.runtime = trt.Runtime(TRT_LOGGER)
         self.engine = self.runtime.deserialize_cuda_engine(serialized)
-        self.context = self.engine.create_execution_context()
+        self.context = _make_exec_context(self.engine)
         self.inputs, self.outputs = [], []
         for i in range(self.engine.num_io_tensors):
             n = self.engine.get_tensor_name(i)
@@ -167,7 +221,7 @@ def _build_serialized(onnx_path):
 def build_or_load(name, export_module, example_inputs, input_names, output_names):
     """Return a TRTModule for export_module at these input shapes, building and
     caching (autocast fp16 ONNX -> strongly typed engine) on a cache miss."""
-    tag = f"{name}_{_shape_tag(example_inputs)}_{_gpu_tag()}_{WEIGHTS_TAG}"
+    tag = f"{name}_{_shape_tag(example_inputs)}_{_trt_tag()}_{WEIGHTS_TAG}"
     engine_path = os.path.join(CACHE_DIR, tag + ".engine")
     if os.path.isfile(engine_path):
         with open(engine_path, "rb") as f:
@@ -319,7 +373,7 @@ def trtify(model):
     model.metricnet = MetricEngine(model.metricnet)
     model.ifnet = IFNetEngine(model.ifnet)
     model.fusionnet = FusionEngine(model.fusionnet)
-    _log("[trt] model wrapped with TensorRT engines (build on first frame)")
+    _log("[trt] model wrapped with TensorRT-RTX engines (build on first frame)")
     return model
 
 
@@ -406,5 +460,5 @@ class _RifeIFNetTRT:
 def rife_trtify(rife):
     """Swap the RIFE backend's ifnet for a TensorRT-backed wrapper (in place). Mirrors trtify()."""
     rife.ifnet = _RifeIFNetTRT(rife.ifnet, _rife_weights_tag())
-    _log("[trt] RIFE IFNet wrapped with TensorRT engine (build on first frame)")
+    _log("[trt] RIFE IFNet wrapped with TensorRT-RTX engine (build on first frame)")
     return rife

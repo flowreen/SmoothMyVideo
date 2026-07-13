@@ -7,8 +7,9 @@ Build instructions, architecture, the engine CLI, and design rationale. For the 
 
 Works end to end. The packaged build is fully self-contained: a recipient extracts the zip and runs
 `SmoothMyVideo.exe`, no Python, no pip, no ffmpeg, only the NVIDIA driver. Built and tested on an
-RTX 5090 Laptop (Blackwell, sm_120); the CUDA 13 stack (torch 2.13.0+cu130, cupy-cuda13x, TensorRT
-cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
+RTX 5090 Laptop (Blackwell, sm_120); the CUDA 13 stack (Python 3.13, torch 2.13.0+cu130, cupy-cuda13x,
+TensorRT for RTX `tensorrt_rtx`) is validated across eager, TensorRT-RTX, RTX VSR/HDR and all three
+codecs.
 
 ## Architecture
 
@@ -30,11 +31,13 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
   SVT-AV1 fallback, always fp16, always visually lossless, 10-bit by default. Owns the shared
   plumbing every model uses: probe, track passthrough, pause, crash-resume, progress
   (`PROGRESS k/total` on stderr), live thumbnail and the encoder selection.
-* **`engine/trt_runtime.py`**, optional TensorRT backend. Swaps the five GMFSS sub-nets for strongly-typed
+* **`engine/trt_runtime.py`**, the **TensorRT for RTX** (`tensorrt_rtx`) backend. If it can't import,
+  the render.py guard drops the whole pipeline to eager. Swaps the five GMFSS sub-nets for strongly-typed
   fp16 engines; softsplat + the interpolate glue stay eager. Also engines the RIFE IFNet forward
   (`rife_trtify`) and the `--restore` Real-ESRGAN pass, each keyed by its own weights hash. Engines
-  are cached per `(net, shapes, gpu, trt version, weights hash)`; the weights-hash in each filename
-  makes the cache self-invalidating on a weight swap (stale engines deleted at next start).
+  are cached per `(net, shapes, trt version, weights hash)` - no GPU in the key, since TRT-RTX's AOT
+  engine is hardware-agnostic (portable across RTX GPUs); the weights-hash in each filename makes the
+  cache self-invalidating on a weight swap (stale engines deleted at next start).
 * **`engine/rife_backend.py`** + **`engine/rife/`**, the RIFE model backend: vendored
   Practical-RIFE 4.26 heavy (MIT, weights bundled) exposing the same pair interface as GMFSS,
   plus the DRBA triple interface (DistanceRatioMap timing) the engine's DRBA window loop drives.
@@ -53,7 +56,7 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
 * **`engine/hdr10_meta.py`**, pure-stdlib ISOBMFF injector for HDR10 static metadata (`mdcv`/`clli`) and
   the Dolby Vision configuration box (`dvvC`, via `inject_dv_config`); shared box-insertion surgery.
 * **`engine/preview.py`**, single-frame before/after preview (same passes, same order as a render).
-* **`engine/runtime/`**, bundled relocatable Python 3.14 (python-build-standalone) with the CUDA 13 GPU
+* **`engine/runtime/`**, bundled relocatable Python 3.13 (python-build-standalone) with the CUDA 13 GPU
   stack. Gitignored (see Setup).
 * **`engine/bin/`**, bundled shared-build `ffmpeg.exe` + `ffprobe.exe` and their DLLs. Fetched, not committed.
 * **`engine/GMFSS_Fortuna/`** (model + `train_log/` weights) and **`engine/realesr-animevideov3.pth`**,
@@ -77,16 +80,16 @@ binary didn't download: `node node_modules/electron/install.js`.
 * *Easy:* copy `resources/engine/runtime` out of any packaged build (extract a release zip), it's the
   ready-to-run interpreter, nothing else to do.
 * *From scratch:* unpack a
-  [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases) CPython 3.14
+  [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases) CPython 3.13
   `install_only` win64 build to `engine/runtime`, then:
 ```
 engine\runtime\python.exe -m pip install torch==2.13.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 engine\runtime\python.exe -m pip install -r engine\requirements.txt
 ```
 `requirements.txt` pulls cupy-cuda13x, the **unsuffixed** `nvidia-cuda-nvrtc` / `nvidia-cuda-runtime` cu13
-wheels (the `-cu13` names are deprecated placeholders that fail to build), `tensorrt` (cu13), and
-onnx/onnxscript. A `python -m venv` is **not** usable, a Windows venv isn't relocatable and breaks the
-portable bundle.
+wheels (the `-cu13` names are deprecated placeholders that fail to build), **`tensorrt-rtx-cu13`**
+(TensorRT for RTX), and onnx/onnxscript. A `python -m venv` is **not** usable, a
+Windows venv isn't relocatable and breaks the portable bundle.
 
 ### Refreshing bundled binaries
 * **ffmpeg:** delete `engine/bin` and re-run `node scripts/fetch-ffmpeg.js`. To pin an exact build, drop a
@@ -98,7 +101,8 @@ portable bundle.
 ## Scripts
 * `npm start`, build (`tsc`) and launch.
 * `npm run dist`, the build command: wipes `release/`, compiles with `tsc`, runs electron-builder, and
-  zips the result into `release/SmoothMyVideo-<version>-win.zip` (~4 GB with TensorRT bundled). The
+  zips the result into `release/SmoothMyVideo-<version>-win.zip` (~3 GB with TensorRT for RTX bundled;
+  the compact RTX libs shrank this from ~4 GB). The
   multi-GB staging folder is deleted once the zip passes a size sanity check, so the zip is the only
   artifact left; to inspect the unpacked app, extract the zip. Recipients extract and run
   `SmoothMyVideo.exe`; nothing required on the target but the NVIDIA driver. (A zip, not an NSIS
@@ -316,11 +320,23 @@ The **RIFE** backend is engined the same way: its whole IFNet forward (including
 `grid_sample` warps) exports to one strongly-typed fp16 engine per resolution, while the cheap
 feature-head calls stay eager. Measured 1.54× end-to-end on a 60s 1080p 2× render (59s vs 90s
 eager), numerically matching the eager path (output-vs-output PSNR ~60 dB / SSIM 0.999). Like GMFSS
-it pays a one-time per-resolution build (~100s at 1080p), so `--no-trt` can win for a single one-off.
+it pays a one-time per-resolution build, so `--no-trt` can win for a single one-off.
+
+The engine backend is **TensorRT for RTX** (`tensorrt_rtx`) as of 2026-07. It does **not** change
+interpolation throughput - measured unchanged across four A/B runs on the 1080p 2× loop (within 0.4%;
+the pipeline is GPU-compute-bound regardless of the TRT build). What it changes is the first-render
+cost and footprint: the per-resolution engine build drops from ~75-100 s to ~1-11 s (hardware-agnostic
+AOT + a fast on-device JIT), the TensorRT libs shrink to ~0.2 GB (from ~2.2 GB), and the AOT engine is
+GPU-portable. `trt_runtime.py` drops to eager if `tensorrt_rtx` is absent.
 
 ## Constraints
 * **CUDA 13 (Blackwell, sm_120):** torch is the cu130 build; cupy-cuda13x finds the runtime via
-  `cuda-pathfinder`, so the old `_add_cuda_dll_dirs` nvrtc shim is no longer load-bearing.
+  `cuda-pathfinder`, so the old `_add_cuda_dll_dirs` nvrtc shim is no longer load-bearing. Note cupy's
+  NVRTC kernels only compile once **torch has been imported first** (it primes the CUDA DLL search path
+  for `nvrtc-builtins64_133.dll`); `render.py` already imports torch before cupy.
+* **Python 3.13:** the runtime is on 3.13, not 3.14 - `tensorrt_rtx` ships wheels only up to cp313. Every
+  other dep (torch cu130, cupy-cuda13x, VapourSynth 77, etc.) has cp313 wheels; the engine code uses no
+  3.14-only features. Revisit 3.14 only once NVIDIA publishes a cp314 `tensorrt_rtx` wheel.
 * **RTX bridge:** keep the **cu12**-built `rtxvideo_cuda.dll` and ship `cudart64_12.dll` beside it, NGX's
   static import lib is CUDA-12-ABI, so a bridge relinked against CUDA 13 crashes in `create()`
   (see "Building the native bridges" below).
