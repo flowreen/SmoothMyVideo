@@ -870,7 +870,7 @@ ipcMain.on(
     // so tell the engine to skip frame generation (and ignore any fps/multi) entirely.
     if (opts.interp === false) args.push('--no-interp');
     else {
-      if (opts.model === 'rife') args.push('--rife'); // RIFE 4.26 backend instead of GMFSS (bundled)
+      if (opts.model === 'rife') args.push('--rife'); // RIFE 4.26 heavy backend instead of GMFSS (bundled)
       if (opts.model === 'rifedrba') args.push('--rife-drba'); // RIFE with DRBA anime-pacing timing
       if (opts.model === 'dlssg') args.push('--dlssg'); // "DLSS 4.5" (Frame Generation) backend instead of GMFSS
       if (opts.model === 'fruc') args.push('--fruc'); // "NVIDIA Smooth Motion" backend instead of GMFSS

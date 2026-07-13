@@ -321,3 +321,90 @@ def trtify(model):
     model.fusionnet = FusionEngine(model.fusionnet)
     _log("[trt] model wrapped with TensorRT engines (build on first frame)")
     return model
+
+
+# --- RIFE 4.26 heavy backend (rife_backend.py) --------------------------------------------------
+# The RIFE IFNet_HDv3 is a different network from GMFSS's IFNet above, so it gets its own engine.
+# The full IFNet forward (five IFBlocks + the interleaved grid_sample warps) is the per-output-frame
+# cost and the only thing worth an engine; the backend's cheap encode()/block0() calls (feature
+# heads, reused per pair / per DRBA window) stay eager.
+
+def _rife_weights_tag():
+    """md5 of rife/flownet.pkl contents, baked into RIFE engine names so a checkpoint swap is a
+    plain cache miss (parallel to _weights_tag for GMFSS). Read lazily - only RIFE renders pay it."""
+    h = hashlib.md5()
+    with open(os.path.join(HERE, "rife", "flownet.pkl"), "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return "r" + h.hexdigest()[:10]
+
+
+class _RifeIFNetExport(nn.Module):
+    """RIFE IFNet full forward with scale_list baked; timestep and the two feature encodes (f0,f1)
+    are tensor inputs and the output is just the fused frame merged[4] (flow_list is dropped)."""
+
+    def __init__(self, ifnet, scale_list):
+        super().__init__()
+        self.ifnet = ifnet
+        self.scale_list = scale_list
+
+    def forward(self, x, timestep, f0, f1):
+        return self.ifnet(x, timestep=timestep, scale_list=self.scale_list, f0=f0, f1=f1)[0]
+
+
+class RifeIFNetEngine(_Engine):
+    """TRT wrapper for one RIFE IFNet forward. timestep rides as a (1,1,H,W) tensor so both the
+    scalar plain-RIFE path and DRBA's spatial DistanceRatioMap export to the same engine. The rife
+    checkpoint fingerprint plus the baked scale_list are in the NAME (scale_list is not part of the
+    shape key, and 4K's 0.5 flow scale changes it), so neither a weight swap nor a scale change can
+    serve a stale engine; the global _w tag still shields these from the startup GC."""
+
+    def __init__(self, ifnet, scale_list, whash):
+        scale_tag = "-".join(f"{s:g}" for s in scale_list)
+        eager = lambda x, ts, f0, f1: ifnet(  # noqa: E731 - eager fallback keeps the render alive
+            x, timestep=ts, scale_list=list(scale_list), f0=f0, f1=f1)[0]
+        super().__init__(f"rife_ifnet_{whash}_{scale_tag}", eager,
+                         ["x", "timestep", "f0", "f1"], ["merged"])
+        self.ifnet = ifnet
+        self.scale_list = list(scale_list)
+
+    def __call__(self, x, timestep, f0, f1):
+        export_mod = _RifeIFNetExport(self.ifnet, self.scale_list)
+        return self._run(export_mod, (x, timestep, f0, f1), (x, timestep, f0, f1))
+
+
+class _RifeIFNetTRT:
+    """Drop-in for rife.ifnet: routes the full forward through a per-resolution TRT engine while
+    encode()/block0() (the backend's reuse and calc_flow) stay on the eager module. timestep is
+    normalized to a (1,1,H,W) tensor so the scalar plain path and DRBA's DRM map share one engine.
+    Returns (merged, None) - the backend only ever reads [0]."""
+
+    def __init__(self, ifnet, whash):
+        self._ifnet = ifnet
+        self.encode = ifnet.encode      # feature head, cheap, called from reuse()/calc_flow()
+        self.block0 = ifnet.block0      # coarsest-level flow, cheap, DRBA calc_flow() only
+        self._whash = whash
+        self._engines = {}              # scale_list key -> RifeIFNetEngine
+
+    def __call__(self, x, timestep=0.5, scale_list=(8, 4, 2, 1), training=False,
+                 fastmode=True, ensemble=False, f0=None, f1=None):
+        # Only the standard inference call (both features precomputed) goes to TRT; anything else
+        # (training, or a first-frame call without cached encodes) stays exactly on the eager path.
+        if training or f0 is None or f1 is None:
+            return self._ifnet(x, timestep=timestep, scale_list=scale_list, training=training,
+                               fastmode=fastmode, ensemble=ensemble, f0=f0, f1=f1)
+        if not torch.is_tensor(timestep):
+            timestep = x[:, :1] * 0 + float(timestep)   # scalar t -> (1,1,H,W) map
+        key = tuple(scale_list)
+        eng = self._engines.get(key)
+        if eng is None:
+            eng = RifeIFNetEngine(self._ifnet, scale_list, self._whash)
+            self._engines[key] = eng
+        return eng(x, timestep, f0, f1), None
+
+
+def rife_trtify(rife):
+    """Swap the RIFE backend's ifnet for a TensorRT-backed wrapper (in place). Mirrors trtify()."""
+    rife.ifnet = _RifeIFNetTRT(rife.ifnet, _rife_weights_tag())
+    _log("[trt] RIFE IFNet wrapped with TensorRT engine (build on first frame)")
+    return rife

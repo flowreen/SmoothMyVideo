@@ -10,7 +10,7 @@ third-party work.
   vendored under `engine/GMFSS_Fortuna/`. MIT License, Copyright (c) 2023 98mxr; see
   `engine/GMFSS_Fortuna/LICENSE`. Upstream components it builds on: GMFlow (Apache-2.0,
   Haofei Xu et al.), RIFE/IFNet (MIT, hzwer et al.), softmax splatting (Simon Niklaus).
-* **DRBA / Practical-RIFE 4.26** (the RIFE interpolation model and its optional DRBA
+* **DRBA / Practical-RIFE 4.26 heavy** (the RIFE interpolation model and its optional DRBA
   anime-pacing timing: IFNet 4.26-heavy network + `flownet.pkl` weights, DistanceRatioMap
   adjuster, softmax splatting), vendored under `engine/rife/` + `engine/rife_backend.py` from
   routineLife1's DRBA repository. MIT License; see `engine/rife/DRBA-LICENSE.txt`. Upstream

@@ -31,9 +31,10 @@ cu13) is validated across eager, TensorRT, RTX VSR/HDR and all three codecs.
   plumbing every model uses: probe, track passthrough, pause, crash-resume, progress
   (`PROGRESS k/total` on stderr), live thumbnail and the encoder selection.
 * **`engine/trt_runtime.py`**, optional TensorRT backend. Swaps the five GMFSS sub-nets for strongly-typed
-  fp16 engines; softsplat + the interpolate glue stay eager. Engines are cached per
-  `(net, shapes, gpu, trt version, weights hash)`; the weights-hash in each filename makes the cache
-  self-invalidating on a weight swap (stale engines deleted at next start).
+  fp16 engines; softsplat + the interpolate glue stay eager. Also engines the RIFE IFNet forward
+  (`rife_trtify`) and the `--restore` Real-ESRGAN pass, each keyed by its own weights hash. Engines
+  are cached per `(net, shapes, gpu, trt version, weights hash)`; the weights-hash in each filename
+  makes the cache self-invalidating on a weight swap (stale engines deleted at next start).
 * **`engine/rife_backend.py`** + **`engine/rife/`**, the RIFE model backend: vendored
   Practical-RIFE 4.26 heavy (MIT, weights bundled) exposing the same pair interface as GMFSS,
   plus the DRBA triple interface (DistanceRatioMap timing) the engine's DRBA window loop drives.
@@ -132,7 +133,8 @@ engine\runtime\python.exe engine\render.py <input> <multi> [output] [--scale 1.0
 * `--rife` "RIFE": interpolates with Practical-RIFE 4.26 heavy (vendored under `engine/rife`,
   MIT, weights bundled) instead of GMFSS - the strongest open general-purpose model, the
   recommendation for live action (GMFSS stays the anime specialist). Same on-grid/--fps timing,
-  passes, pause and crash-resume as GMFSS; eager fp16, no TensorRT.
+  passes, pause and crash-resume as GMFSS; TensorRT-accelerated like GMFSS (the IFNet forward is
+  engined per resolution, `--no-trt` forces eager fp16).
 * `--rife-drba` (the GUI's RIFE model with "Preserve anime pacing (DRBA)" on): RIFE tweens with
   DistanceRatioMap timing (routineLife1/DRBA) - pans smooth fully while character motion keeps
   closer to its original cadence, which also avoids forced-midpoint warping artifacts. Renders
@@ -309,6 +311,12 @@ land: flow is estimated at an automatic resolution-appropriate scale (4K renders
 see `--scale`), and the engine warns at startup when the GPU's power limit sits below its board
 default (a laptop Silent profile can cost 2-3x wall time; the pipeline is power-bound before it is
 anything else).
+
+The **RIFE** backend is engined the same way: its whole IFNet forward (including the interleaved
+`grid_sample` warps) exports to one strongly-typed fp16 engine per resolution, while the cheap
+feature-head calls stay eager. Measured 1.54× end-to-end on a 60s 1080p 2× render (59s vs 90s
+eager), numerically matching the eager path (output-vs-output PSNR ~60 dB / SSIM 0.999). Like GMFSS
+it pays a one-time per-resolution build (~100s at 1080p), so `--no-trt` can win for a single one-off.
 
 ## Constraints
 * **CUDA 13 (Blackwell, sm_120):** torch is the cu130 build; cupy-cuda13x finds the runtime via

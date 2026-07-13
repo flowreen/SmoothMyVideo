@@ -233,8 +233,8 @@ ap.add_argument("--rife", action="store_true",
                 help="'RIFE' (GUI model name): interpolate with RIFE 4.26 heavy instead of GMFSS - "
                      "the strongest open general-purpose model, recommended for live action "
                      "(GMFSS remains the anime specialist). Vendored under engine/rife (MIT, "
-                     "weights bundled); eager fp16, no TensorRT. Same on-grid/--fps timing, "
-                     "pause/resume and per-frame passes as GMFSS.")
+                     "weights bundled); TensorRT-accelerated (--no-trt forces eager fp16). Same "
+                     "on-grid/--fps timing, pause/resume and per-frame passes as GMFSS.")
 ap.add_argument("--rife-drba", action="store_true",
                 help="The GUI's RIFE model with its 'Preserve anime pacing (DRBA)' sub-option ON: "
                      "RIFE tweens with DistanceRatioMap timing (routineLife1/DRBA) - linear motion "
@@ -276,7 +276,7 @@ NO_INTERP = args.no_interp                   # sharpen/re-encode only, no frame 
 FRUC_MODE = args.fruc                        # NvOFFRUC ("NVIDIA Smooth Motion") instead of GMFSS
 FRUC_NATIVE = bool(args.fruc_native)         # FRUC only: native passthrough (real frames + tweens)
 DLSSG_MODE = args.dlssg                      # DLSS Frame Generation ("DLSS 4.5") instead of GMFSS
-RIFE_MODE = args.rife or args.rife_drba      # RIFE 4.26 instead of GMFSS
+RIFE_MODE = args.rife or args.rife_drba      # RIFE 4.26 heavy instead of GMFSS
 DRBA_MODE = args.rife_drba                   # RIFE with DRBA timing (anime pacing preserved)
 SVP_NVOF = args.svp_nvof                     # "SVP + NVIDIA motion": svpflow render, NVOF vectors
 SVP_MODE = args.svp or SVP_NVOF              # either "SVP" model (svpflow) instead of GMFSS
@@ -699,7 +699,7 @@ else:
         # tensorrt at module load, so an environment without a working TensorRT is caught here
         # and the eager pipeline is used instead. trt_runtime lives next to this script.
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, ENGINE_DIR)
             import trt_runtime
             trt_runtime.trtify(model)
         except Exception as e:  # noqa: BLE001
@@ -858,6 +858,18 @@ ph = ((H - 1) // tmp + 1) * tmp
 pw = ((W - 1) // tmp + 1) * tmp
 if RIFE_MODE and model is not None:
     model.set_scale(scale)   # the auto rule above (0.5 for 4K+) applies to RIFE's flow too
+    if not args.no_trt:
+        # Route the per-frame IFNet forward through the TensorRT engine cache (built+cached per
+        # resolution on first frame, eager fallback on any build/run failure). Wrapped only now
+        # because the engine bakes the flow scale_list, which set_scale just fixed above; encode()
+        # and the DRBA calc_flow() stay eager (cheap feature heads). See trt_runtime.rife_trtify.
+        try:
+            sys.path.insert(0, ENGINE_DIR)
+            import trt_runtime
+            trt_runtime.rife_trtify(model)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[trt] unavailable, using eager RIFE pipeline: {repr(e)[:200]}\n")
+            sys.stderr.flush()
 
 # "NVIDIA Smooth Motion" interpolator, sized to the padded frame the loop passes it. Created here (not
 # at model-load) because the padded size is known only now. Backed by NVIDIA's NvOFFRUC library (the

@@ -89,8 +89,9 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   generation, so pause videos during a DLSS render (the render detects it and stops with a clear
   message rather than degrading; other models are unaffected).
 * 🎬 **A RIFE model for live action.** GMFSS is an anime specialist; one checkbox switches to
-  Practical-RIFE 4.26 (bundled, nothing to install), the strongest open general-purpose
-  interpolation model - the pick for filmed content. Its **Preserve anime pacing (DRBA)**
+  Practical-RIFE 4.26 heavy (bundled, nothing to install), the strongest open general-purpose
+  interpolation model - the pick for filmed content. TensorRT-accelerated like GMFSS. Its
+  **Preserve anime pacing (DRBA)**
   sub-option keeps characters at their original animation cadence while camera pans smooth
   fully, for purists who want fluidity without "hollywoodizing" the animation.
 * 🌀 **Optional NVIDIA Smooth Motion model.** One checkbox switches the interpolation from the GMFSS AI
