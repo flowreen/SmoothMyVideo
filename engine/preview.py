@@ -2,10 +2,12 @@
 
 Renders ONE source frame at the current spatial settings and writes <out>_original.png (the untouched
 source) and <out>_processed.png. The processed side applies the SAME passes in the SAME order as a full
-render (to_bytes in render.py): AI detail restoration first when --restore (the shared
-realesr.py, eager - one frame needs no TRT engine), then the upscale, then FSR RCAS sharpening in SDR
-(the shared rcas.py, the exact kernel the render uses), then RTX TrueHDR when --rtx-hdr. No
-interpolation, no encode, so the GUI can scrub settings and see the effect before a full render.
+render (to_bytes in render.py): AI detail restoration first when --restore (the shared realesr.py,
+through the SAME TensorRT-RTX RestoreEngine and on-disk engine cache as the render, so the pane is
+bit-exact to the final output and the per-resolution build is shared - eager fp16 fallback if TRT is
+unavailable), then the upscale, then FSR RCAS sharpening in SDR (the shared rcas.py, the exact kernel
+the render uses), then RTX TrueHDR when --rtx-hdr. No interpolation, no encode, so the GUI can scrub
+settings and see the effect before a full render.
 
 The HDR result is PQ/BT.2020, which a normal canvas cannot show, so it is tonemapped to sRGB for
 display: exposure is anchored to the SDR source (median luminance match), so midtones keep the source
@@ -196,7 +198,16 @@ def main():
                 try:
                     import realesr
                     net = realesr.load(torch.device("cuda"))
-                    r = net(t.half()).clamp(0.0, 1.0)          # fp16 4x reconstruction (eager: one frame)
+                    # Route restore through the render's shared TensorRT-RTX engine (same trt_cache, so
+                    # the pane is bit-exact to the final render and the per-resolution build is shared).
+                    # RestoreEngine keeps this eager net internally and falls back to it on any TRT
+                    # build/run failure; a missing TRT import just leaves the eager net in place.
+                    try:
+                        import trt_runtime
+                        net = trt_runtime.RestoreEngine(net, realesr.weights_hash())
+                    except Exception:  # noqa: BLE001 - no TRT available: eager fp16 restore
+                        pass
+                    r = net(t.half()).clamp(0.0, 1.0)          # fp16 4x reconstruction (shared TRT engine)
                     # Without VSR the reconstruction IS the upscale source, exactly like a render;
                     # otherwise back to source size so VSR upscales the restored frame below.
                     as_up = up > 1.0 and not need_vsr
