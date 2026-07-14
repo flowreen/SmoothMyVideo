@@ -543,7 +543,8 @@ RESUME_SIG = _resume_sig()
 def _resume_cleanup():
     """Drop every resume artifact (stale settings, unusable salvage, or normal end-of-run)."""
     for _p in (VID_PART, VID_PART2, VID_FULL, RESUME_JSON, WORK_PATH + ".concat.txt",
-               WORK_PATH + ".salv.mp4", WORK_PATH + ".salv2.mp4", WORK_PATH + ".trim.mp4"):
+               WORK_PATH + ".salv.mp4", WORK_PATH + ".salv2.mp4", WORK_PATH + ".trim.mp4",
+               _ob + (".preview.mkv" if OUT_IS_MKV else ".preview.mp4")):  # pause partial-preview
         try:
             os.remove(_p)
         except OSError:
@@ -1073,6 +1074,54 @@ def _live_preview(t, hdr_packed=None):
 PAUSE_FILE = os.environ.get("SMV_PAUSE_FILE")
 _paused = False
 
+def _emit_pause_preview():
+    """On pause, stream-copy the frames rendered so far + the source's audio/subtitle tracks (trimmed
+    to the partial's length) into a playable <output>.preview file, so the user can judge the
+    interpolation WITH sound and subtitles before deciding to resume or cancel. It runs only while the
+    render is idle (paused), so it is free; it only READS the truncation-tolerant fragmented encode
+    file and writes a SEPARATE preview, never touching the live encoder or the resume assets. Purely
+    best-effort - any failure just skips the preview. Only the resumable fragmented path (the default)
+    is safe to read mid-write, and there must be tracks worth adding (a soundless partial is no better
+    than opening the .part file). On success it logs 'PREVIEW_READY <path>' for the GUI."""
+    if not RESUMABLE or not _stage2_maps:
+        return   # never previewable: no resumable fragmented asset, or no audio/subtitle to add
+    ext = ".mkv" if OUT_IS_MKV else ".mp4"
+    prev, tmp, cat = _ob + ".preview" + ext, _ob + ".preview.building" + ext, None
+    try:
+        vid = _ENC_TARGET
+        if RESUME_ACTIVE:                      # video so far = banked prefix + this run's continuation
+            cat = _ob + ".preview.cat.mp4"
+            vid = cat if _concat_copy([VID_PART, VID_PART2], cat) else _ENC_TARGET
+        # The fragmented encode flushes to disk in ~MB chunks; in the first seconds of a render only
+        # the ftyp header (~28 bytes) has landed and there is no complete fragment to show yet. Report
+        # that as "pending" rather than handing ffmpeg an unreadable stub (which errors with "Invalid
+        # data"). Once a fragment has flushed the partial is readable even as the encoder appends more.
+        if not os.path.isfile(vid) or os.path.getsize(vid) < (1 << 18):   # < 256 KB: no fragment yet
+            sys.stderr.write("PREVIEW_PENDING too few frames rendered so far\n"); sys.stderr.flush()
+            return
+        frag = FRAG_FLAGS if (FRAG_COPY and tmp.lower().endswith(".mp4")) else []
+        r = subprocess.run([FFMPEG, "-v", "error", "-y", "-i", vid, "-i", inp, "-map", "0:v:0",
+                            "-c:v", "copy"] + _stage2_maps + ["-max_interleave_delta", "0", "-shortest"]
+                           + frag + [tmp], creationflags=NO_WINDOW,
+                           capture_output=True, text=True, errors="replace")
+        if r.returncode != 0 or not os.path.isfile(tmp):
+            raise RuntimeError((r.stderr or "").strip().replace("\n", " | ")[-200:] or f"exit {r.returncode}")
+        os.replace(tmp, prev)                  # atomic: the GUI never opens a half-written preview
+        sys.stderr.write(f"PREVIEW_READY {prev}\n"); sys.stderr.flush()
+    except Exception as e:  # noqa: BLE001 - a preview must never disturb a paused render
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        sys.stderr.write(f"[preview] partial preview skipped ({repr(e)[:200]})\n"); sys.stderr.flush()
+    finally:
+        if cat:
+            try:
+                os.remove(cat)
+            except OSError:
+                pass
+
+
 def _check_pause():
     global _paused
     if not PAUSE_FILE:
@@ -1081,6 +1130,7 @@ def _check_pause():
         if not _paused:
             _paused = True
             sys.stderr.write("PAUSED\n"); sys.stderr.flush()
+            _emit_pause_preview()   # partial playable preview (video-so-far + sound/subs), free while idle
         time.sleep(0.2)
     if _paused:
         _paused = False

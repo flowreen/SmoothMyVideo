@@ -419,6 +419,7 @@
     <button id="cancel" disabled title="Stops this render and deletes its progress. A cancelled render cannot be resumed. To continue later, use Pause or just close the app instead.">Cancel</button>
     <button id="open" disabled>Open folder</button>
     <button id="play" disabled>Play video</button>
+    <button id="playprev" disabled style="display:none" title="Play the part rendered so far, with sound and subtitles, so you can judge the result before continuing. Generated each time you Pause.">Play preview</button>
     <span id="status" class="hint">Select a video to begin.</span>
   </div>
 
@@ -463,6 +464,7 @@ window.addEventListener('wheel', (e) => {
 }, { passive: false });
 const path = require('path');
 let info = null, input = null, lastOut = null, customOut = null, fpp = 1, totalGen = 1, procStart = 0, baseK = 0, cancelled = false;
+let lastPreview = null;   // path of the latest pause-generated partial preview (PREVIEW_READY), or null
 // Batch queue: inputs waiting after the current one. Filled by a multi-select pick or a multi-file
 // drop; consumed one at a time on engine-done (same settings for every file, default output names).
 let batch = [], batchTotal = 1, batchAuto = false, batchFailed = [];
@@ -1588,7 +1590,7 @@ function startRun(){
     resumeTipShown = true;   // once per session; batch auto-advance re-enters startRun per file
     log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
   }
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; syncTargetUI();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -1643,6 +1645,9 @@ $('go').onclick = () => {
     ipcRenderer.send('pause');
   } else { // paused -> resume
     goMode = 'running'; $('go').textContent = 'Pause';
+    // The pause preview describes the paused-at point; once we resume it is stale, so hide it (the
+    // engine overwrites it on the next Pause and deletes it at finalize).
+    $('playprev').style.display = 'none'; $('playprev').disabled = true; lastPreview = null;
     $('go').title = 'Pauses the render. You can also just close the app - the render resumes where it left off next time.';
     // Re-anchor the pace clock so the paused span doesn't drag the mean fps (and ETA) down; skip
     // if warmup never finished (procStart still 0; the first-frame handler will anchor instead).
@@ -1654,6 +1659,7 @@ $('go').onclick = () => {
 };
 $('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
 $('play').onclick = () => { if(lastOut) shell.openPath(lastOut); };   // system default player
+$('playprev').onclick = () => { if(lastPreview) shell.openPath(lastPreview); };  // partial preview, sys player
 $('changeout').onclick = async () => {
   const chosen = await ipcRenderer.invoke('pick-output', customOut || outName());
   if(chosen){ customOut = chosen; refresh(); }
@@ -1673,6 +1679,18 @@ $('cancel').onclick = async () => {
 };
 
 ipcRenderer.on('engine-out', (_e, t) => {
+  // Pause partial-preview signals: on Pause the engine remuxes the frames rendered so far with the
+  // source's audio/subtitles into a playable file and logs PREVIEW_READY <path> (or PREVIEW_PENDING
+  // when too few frames have flushed yet). Surface a "Play preview" button so the user can judge the
+  // result with sound before resuming or cancelling.
+  const pr = /PREVIEW_READY\s+([^\r\n]+)/.exec(t);
+  if(pr){
+    lastPreview = pr[1].trim();
+    $('playprev').disabled = false; $('playprev').style.display = '';
+    $('status').textContent = fileTag() + 'Paused. A preview of the part rendered so far (with sound & subtitles) is ready - click "Play preview".';
+  } else if(/PREVIEW_PENDING/.test(t)){
+    $('status').textContent = fileTag() + 'Paused; preview not ready yet (too few frames rendered) - Resume, then Pause again a bit later.';
+  }
   // The engine emits its EXACT output frame count as OUTFRAMES at the end; it's authoritative over the
   // pre-render estimate (container nb_frames * ratio), which can be off by one when nb_frames misreports.
   const of = /OUTFRAMES\s+(\d+)/.exec(t);
@@ -1735,6 +1753,9 @@ ipcRenderer.on('engine-done', (_e, code) => {
   // Reset the Pause/Resume toggle back to a fresh "Smooth It!" first, so every exit path
   // (done / cancelled / failed) restores it and the batch auto-advance below re-enters startRun.
   goMode = 'idle'; $('go').textContent = 'Smooth It!'; $('go').title = '';   // checkResume below re-fills the tooltip
+  // The run ended (done/cancelled/failed): the engine deletes the partial preview at finalize, so hide
+  // the "Play preview" button - the finished "Play video" takes over on success.
+  $('playprev').style.display = 'none'; $('playprev').disabled = true; lastPreview = null;
   clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
   // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
   clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
