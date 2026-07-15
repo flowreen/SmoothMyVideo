@@ -465,6 +465,7 @@ window.addEventListener('wheel', (e) => {
 const path = require('path');
 let info = null, input = null, lastOut = null, customOut = null, fpp = 1, totalGen = 1, procStart = 0, baseK = 0, cancelled = false;
 let lastPreview = null;   // path of the latest pause-generated partial preview (PREVIEW_READY), or null
+let dlssPreempt = null;   // pct if DLSS-FG stopped on RTX Video preemption (a clean resumable stop), else null
 // Batch queue: inputs waiting after the current one. Filled by a multi-select pick or a multi-file
 // drop; consumed one at a time on engine-done (same settings for every file, default output names).
 let batch = [], batchTotal = 1, batchAuto = false, batchFailed = [];
@@ -1590,7 +1591,7 @@ function startRun(){
     resumeTipShown = true;   // once per session; batch auto-advance re-enters startRun per file
     log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
   }
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; syncTargetUI();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -1691,6 +1692,10 @@ ipcRenderer.on('engine-out', (_e, t) => {
   } else if(/PREVIEW_PENDING/.test(t)){
     $('status').textContent = fileTag() + 'Paused; preview not ready yet (too few frames rendered) - Resume, then Pause again a bit later.';
   }
+  // DLSS-FG was preempted (RTX Video enhancement) and stopped after its restarts, but banked a clean
+  // resumable checkpoint. Remember the % so engine-done presents it as a resumable stop, not a crash.
+  const dp = /DLSS_PREEMPTED\s+(\d+)/.exec(t);
+  if(dp) dlssPreempt = +dp[1];
   // The engine emits its EXACT output frame count as OUTFRAMES at the end; it's authoritative over the
   // pre-render estimate (container nb_frames * ratio), which can be off by one when nb_frames misreports.
   const of = /OUTFRAMES\s+(\d+)/.exec(t);
@@ -1767,6 +1772,15 @@ ipcRenderer.on('engine-done', (_e, code) => {
   else if(code===0){ $('fill').style.width='100%'; $('pct').textContent='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen;
     $('status').textContent='Done!'; $('open').disabled=false; $('play').disabled=false; log('>> Saved: '+lastOut+'\n');
     if(batch.length) advanceBatch(); else finishBatch(); }
+  else if(dlssPreempt !== null){
+    // Not a failure: DLSS-FG was preempted by RTX Video enhancement and stopped after its restarts,
+    // but the render banked a clean, fully-resumable checkpoint. Present it as a resumable stop; the
+    // checkResume below turns #go into "Resume" so the user closes the video and continues.
+    $('status').textContent = 'Stopped: DLSS was preempted (RTX Video). ~'+dlssPreempt+'% saved - close the video and click Resume.';
+    log('>> DLSS Frame Generation was preempted (RTX Video enhancement); ~'+dlssPreempt+'% saved and resumable. Close the interfering video, then Resume (or use GMFSS).\n');
+    if(batch.length){ log('>> Continuing with the next queued file\n'); advanceBatch(); }
+    else if(batchTotal > 1) finishBatch();
+    else saveBatch(null); }
   else { $('status').textContent='Failed (exit '+code+'). See log.'; log('>> Failed (exit '+code+')\n');
     // A failed file no longer kills the rest of an unattended batch: note it and keep going.
     if(batchTotal > 1) batchFailed.push(input);

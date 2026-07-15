@@ -484,6 +484,108 @@ OUT_IS_MKV = out_path.lower().endswith(".mkv")
 _ob, _oe = os.path.splitext(out_path)
 WORK_PATH = _ob + ".part" + _oe
 
+# --- DLSS + RTX Video: automatic two-pass -----------------------------------------------------
+# DLSS Frame Generation and the RTX Video SDK (RTX VSR / RTX TrueHDR) both seize the GPU's frame-
+# generation + display path - DLSS 4 drives it through hardware flip metering, which RTX Video
+# preempts machine-wide - so they cannot coexist in one process: run together, the DLSS-G host is
+# starved ("captured 0 generated frames") and never recovers. When a render asks for both, split it
+# into two conflict-free passes automatically: pass 1 interpolates with DLSS ALONE into a temporary
+# intermediate (target fps, source resolution, SDR); pass 2 runs the RTX Video + remaining per-frame
+# passes (upscale/VSR, TrueHDR, restore, sharpen, DV/HDR10+) over that intermediate with NO interp.
+# Each pass is an ordinary render.py run (we re-spawn ourselves), so resume, track passthrough (the
+# source's audio/subs ride through the intermediate) and HDR finalize keep working unchanged. The AI
+# compute is identical to a single pass; the only extra cost is the intermediate's encode + decode.
+if (DLSSG_MODE and (RTX_VSR or RTX_HDR) and not args.no_interp
+        and os.environ.get("SMV_TWOPASS_PHASE") is None):
+    import hashlib
+    # Fingerprint the pass-1 (interpolation) inputs into the intermediate's NAME: a re-render with the
+    # SAME source + interpolation settings reuses a completed intermediate, so a crash in pass 2 does
+    # NOT re-run the (long) pass 1; any change gives a different name, so a stale intermediate is never
+    # reused. render.py's own crash-resume still handles interruption WITHIN either pass. Because the
+    # engine writes the final file (os.replace) only at success, `os.path.isfile(_inter)` is exactly
+    # "pass 1 finished" - a mid-pass-1 kill leaves only its .part, not _inter.
+    try:
+        _st = os.stat(inp)
+        _fp = f"{inp}|{_st.st_mtime_ns}|{_st.st_size}|{args.multi}|{args.scale}|{CODEC}|{args.out_bits}"
+    except OSError:
+        _fp = f"{inp}|{args.multi}|{args.scale}|{CODEC}|{args.out_bits}"
+    _sig = hashlib.md5(_fp.encode("utf-8", "replace")).hexdigest()[:8]
+    _inter = _ob + f".dlss-interp-{_sig}.mkv"   # mkv so audio/subtitle tracks ride through to pass 2
+    _self = os.path.abspath(__file__)
+    _T1 = max(1, NB - 1)                # source pairs = pass-1 work units
+    _T2 = args.multi * _T1 + 1          # output frames = pass-2 work units, and the total the GUI shows
+    _g1 = int(0.6 * _T2)                # DLSS pass 1 gets ~60% of ONE unified bar; RTX pass 2 the rest
+
+    def _run_phase(argv, phase, gbase, gspan):
+        # Run a sub-pass and relay its stderr, but rewrite its `PROGRESS k/total` into ONE continuous
+        # 0..T2 scale spanning both passes, so the GUI shows a single smooth bar - no reset between
+        # passes, no "pass 1/2" labels. Per-pass SIZE/OUTFRAMES are dropped (they'd jitter the unified
+        # bar); every other line (DLSS/RTX status, PAUSED, PREVIEW_READY, errors) passes through as-is.
+        env = dict(os.environ, SMV_TWOPASS_PHASE=phase)
+        p = subprocess.Popen([sys.executable, _self] + argv, cwd=os.path.dirname(_self), env=env,
+                             stderr=subprocess.PIPE)
+        for _ln in iter(p.stderr.readline, b""):
+            if _ln.startswith(b"PROGRESS "):
+                try:
+                    _a, _b = _ln.split(b"/", 1)
+                    _k, _t = int(_a.split()[1]), int(_b.split()[0])
+                    _g = gbase + (gspan * _k // _t if _t else 0)
+                    sys.stderr.buffer.write(b"PROGRESS %d/%d\n" % (_g, _T2))
+                except Exception:  # noqa: BLE001 - malformed line: pass it through untouched
+                    sys.stderr.buffer.write(_ln)
+            elif _ln.startswith((b"SIZE ", b"OUTFRAMES ")):
+                continue
+            else:
+                sys.stderr.buffer.write(_ln)
+            sys.stderr.buffer.flush()
+        return p.wait()
+
+    _rc = 0
+    _skip1 = os.path.isfile(_inter)   # a completed intermediate from a prior run: reuse it, skip pass 1
+    if _skip1:
+        sys.stderr.write("reusing the interpolated intermediate from an earlier run\n"); sys.stderr.flush()
+    else:
+        # Pass 1: DLSS interpolation only (no upscale / VSR / HDR / restore / sharpen).
+        _p1 = [inp, str(args.multi), _inter, "--dlssg", "--codec", CODEC, "--out-bits", str(args.out_bits)]
+        if args.scale is not None:
+            _p1 += ["--scale", str(args.scale)]
+        _rc = _run_phase(_p1, "1", 0, _g1)
+
+    if _rc == 0:
+        # Pass 2: RTX Video + remaining per-frame passes over the intermediate, no interpolation.
+        _p2 = [_inter, "1", out_path, "--no-interp", "--codec", CODEC, "--out-bits", str(args.out_bits)]
+        if UPSCALE:
+            _p2 += ["--upscale", str(args.upscale)]
+        if RTX_VSR:
+            _p2 += ["--rtx-vsr"]
+        if RTX_HDR:
+            _p2 += ["--rtx-hdr",
+                    "--hdr-nits", str(args.hdr_nits), "--hdr-saturation", str(args.hdr_saturation),
+                    "--hdr-contrast", str(args.hdr_contrast), "--hdr-middlegray", str(args.hdr_middlegray),
+                    "--hdr-mastering-prim", args.hdr_mastering_prim, "--hdr-color", args.hdr_color,
+                    "--hdr-vibrance", str(args.hdr_vibrance), "--hdr-satboost", str(args.hdr_satboost)]
+        if args.restore:
+            _p2 += ["--restore"]
+        if SHARPEN > 0:
+            _p2 += ["--sharpen", str(args.sharpen)]
+        if args.dv:
+            _p2 += ["--dv"]
+        if args.hdr10plus:
+            _p2 += ["--hdr10plus"]
+        if args.no_trt:
+            _p2 += ["--no-trt"]
+        # pass 2 fills the rest of the bar, or the WHOLE bar if pass 1 was skipped (already done)
+        _rc = _run_phase(_p2, "2", 0 if _skip1 else _g1, _T2 if _skip1 else (_T2 - _g1))
+
+    if _rc == 0:                      # success: the final file is written, the intermediate is spent
+        try:
+            os.remove(_inter)
+        except OSError:
+            pass
+    # On failure the intermediate is kept on purpose: a COMPLETED one lets a resumed run skip pass 1
+    # (see the fingerprint note above); a mid-pass-1 kill leaves only pass 1's own .part, cleaned there.
+    sys.exit(_rc)
+
 # --- crash/exit resume ------------------------------------------------------------------------
 # Resumable renders (hevc/av1 families) encode the video ALONE into a FRAGMENTED-MP4 stage-1
 # file: unlike a plain mp4 (whose moov index is only written at the end, so a killed encoder
@@ -896,8 +998,13 @@ if FRUC_MODE and not NO_INTERP:
 # host quantises to the 8-bit RGBA swap chain DLSS-FG operates on (tween-only; real frames keep the
 # full pipe depth). 2x on-grid only, enforced at argument time above.
 _dlssg = None
+# Exception the render loop treats as a clean, fully-resumable stop rather than a crash: the DLSS host
+# gave up after its restarts (a persistent machine-wide preemption). Only meaningful in DLSS mode; the
+# empty tuple default makes `except _DLSSG_LOST` match nothing for every other backend.
+_DLSSG_LOST = ()
 if DLSSG_MODE and not NO_INTERP:
     import dlssg
+    _DLSSG_LOST = dlssg.DLSSHostLost
     try:
         _dlssg = dlssg.DLSSG(pw, ph, args.multi - 1)   # multi-frame gen: N-1 tweens = Nx
     except Exception as e:  # noqa: BLE001
@@ -1135,6 +1242,14 @@ def _check_pause():
     if _paused:
         _paused = False
         sys.stderr.write("RESUMED\n"); sys.stderr.flush()
+
+# Let the DLSS backend honor Pause even while it is stuck retrying a preempted host (the render is
+# blocked deep inside interpolate() then, so the main loop's _check_pause never runs): _pause_wait
+# holds the retry loop while paused, and _paused_now lets its watcher kill a stalled host promptly so
+# the hold takes effect within ~1 s instead of after the host's ~30 s internal retry.
+if _dlssg is not None:
+    _dlssg._pause_wait = _check_pause
+    _dlssg._paused_now = lambda: bool(PAUSE_FILE) and os.path.exists(PAUSE_FILE)
 
 def to_bytes(t):
     t = t.float()[..., :H, :W]            # crop off the padding added in to_tensor
@@ -2486,6 +2601,29 @@ if not FPS_MODE and not FRUC_NATIVE:
             k += 1
             if k % 10 == 0:
                 _progress(k, total_pairs)
+    except _DLSSG_LOST as e:  # noqa: F841
+        # DLSS-FG was preempted machine-wide (RTX Video enhancement) and could not recover through its
+        # restarts. This is NOT a corrupt failure: the finally below drains and finalizes the encoder,
+        # and the resume artifacts are kept (no _finish/_resume_cleanup runs), so the render is fully
+        # resumable from here - the completed frames are all on disk. Bank the exact progress for the
+        # GUI's resume %, emit a clear resumable-stop message (no traceback), and exit; on the next run
+        # (with the interfering video closed) Resume continues from the last keyframe.
+        if RESUMABLE:
+            _write_resume_sidecar(k, total_pairs)
+        try:
+            _dlssg.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _pct = round(100 * k / total_pairs) if total_pairs else 0
+        sys.stderr.write(
+            f"DLSS_PREEMPTED {_pct}\n"
+            f"DLSS Frame Generation was preempted (a video with NVIDIA RTX Video enhancement was most "
+            f"likely playing) and could not recover after {_dlssg._MAX_RESTARTS} restarts. Your "
+            f"progress (~{_pct}%) is saved and the render can be resumed: close that video, then click "
+            f"Resume to continue where it left off. (Or switch to GMFSS, which RTX Video does not "
+            f"affect.)\n")
+        sys.stderr.flush()
+        sys.exit(1)   # nonzero, but the finally finalizes a clean resumable file; no traceback
     finally:
         _drain_pipes()
     # On-grid output is the real first frame plus M tweens/real per processed pair: multi*k + 1.
