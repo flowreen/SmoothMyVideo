@@ -75,6 +75,11 @@ class DLSSG:
     # interfering video, the very next restart recovers and the render continues with no manual resume.
     _MAX_RESTARTS = 4
     _RESTART_DELAY = 3.0     # seconds between attempts: let the GPU/driver settle (and the user react)
+    # A preempted host stalls in its own futile soft-reset retries for ~30 s before exiting (only a
+    # fresh process can recover); don't sit through that - once a _recv has been blocked this long
+    # the watcher kills the host so the restart loop takes over. Normal frames arrive in well under
+    # a second even at 8K, so this never trips on a healthy render.
+    _STALL_TIMEOUT = 10.0
 
     def __init__(self, width, height, gen_frames=1, dlssg_dir=None):
         self._dir = dlssg_dir or DLSSG_DIR
@@ -91,10 +96,13 @@ class DLSSG:
         self._paused_now = None
         self._in_recv = False
         self._recv_since = 0.0
+        self._stalled = False
         self._closing = False
         self._spawn()
-        # Watcher so Pause is responsive even while blocked in a stalled _recv (the host's ~30 s internal
-        # retry): it kills the stuck host so _recv returns and interpolate() can hold at the pause.
+        # Watcher = the read timeout for the blocking _recv: it kills a stuck host so the read returns
+        # and interpolate()'s retry loop takes over - after 1 s when the user asked to pause (Pause stays
+        # responsive during a stall), after _STALL_TIMEOUT unconditionally (skip the host's ~30 s of
+        # futile internal retries).
         self._watcher = threading.Thread(target=self._pause_watch, name="dlssg-pause", daemon=True)
         self._watcher.start()
 
@@ -103,12 +111,15 @@ class DLSSG:
             time.sleep(0.3)
             try:
                 # Only when we are genuinely STUCK reading from a non-producing host (blocked > 1 s, so
-                # never a normal fast frame) AND the user asked to pause: kill it so the read unblocks and
-                # the retry loop holds at the pause instead of spinning through more restarts.
-                if (self._in_recv and self._paused_now is not None and self._paused_now()
-                        and (time.monotonic() - self._recv_since) > 1.0
-                        and self._proc.poll() is None):
-                    self._proc.kill()
+                # never a normal fast frame): kill it if the user asked to pause (the retry loop then
+                # holds at the pause instead of spinning through more restarts), or unconditionally once
+                # the stall outlives _STALL_TIMEOUT (a healthy host never goes silent that long).
+                if self._in_recv and self._proc.poll() is None:
+                    blocked = time.monotonic() - self._recv_since
+                    paused = self._paused_now is not None and self._paused_now()
+                    if blocked > self._STALL_TIMEOUT or (paused and blocked > 1.0):
+                        self._stalled = blocked > self._STALL_TIMEOUT
+                        self._proc.kill()
             except Exception:  # noqa: BLE001 - watcher is best-effort, never let it crash the render
                 pass
 
@@ -191,12 +202,15 @@ class DLSSG:
                 self._last = I1
                 return [self._recv() for _ in range(self.gen)]
             except (RuntimeError, BrokenPipeError, OSError) as e:
+                reason = (f"stalled >{self._STALL_TIMEOUT:.0f}s, killed" if self._stalled
+                          else repr(e)[:60])
+                self._stalled = False
                 if attempt >= self._MAX_RESTARTS:
                     # Give up as a DISTINCT, recognizable failure so the render can bank a clean
                     # resumable checkpoint instead of crashing (see render.py's DLSS-loop handler).
                     raise DLSSHostLost(str(e)) from e
                 sys.stderr.write(
-                    f"[dlss] frame-generation host stopped ({repr(e)[:60]}); restarting it "
+                    f"[dlss] frame-generation host stopped ({reason}); restarting it "
                     f"(attempt {attempt + 1}/{self._MAX_RESTARTS}). If a video with NVIDIA RTX Video "
                     "enhancement is playing, close it now and the render will recover on its own.\n")
                 sys.stderr.flush()

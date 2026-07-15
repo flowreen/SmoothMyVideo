@@ -86,8 +86,9 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   (multi-frame generation; above 2× needs an RTX 50); needs an RTX 40/50 GPU, a recent driver and
   Windows hardware-accelerated GPU scheduling. One caveat: NVIDIA's RTX Video enhancement
   (Super Resolution / Video HDR) processing a video playing in a browser preempts frame
-  generation, so pause videos during a DLSS render (the render detects it and stops with a clear
-  message rather than degrading; other models are unaffected).
+  generation. The render detects the stall within seconds and heals itself once the video is
+  closed or paused; if the interference persists it stops cleanly with progress saved, and
+  Resume continues from there (other models are unaffected).
 * 🎬 **A RIFE model for live action.** GMFSS is an anime specialist; one checkbox switches to
   Practical-RIFE 4.26 heavy (bundled, nothing to install), the strongest open general-purpose
   interpolation model - the pick for filmed content. TensorRT-accelerated like GMFSS. Its
