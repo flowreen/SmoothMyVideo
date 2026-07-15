@@ -8,17 +8,17 @@
     "start": "tsc && electron .",
     "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.js && npm start",
     "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && electron-builder && node scripts/pack-zip.js",
-    "lint": "prettier --write \"src/**/*.ts\" && eslint \"src/**/*.ts\" && pyright"
+    "lint": "prettier --write \"src/**/*.ts\" && tsc --noEmit && pyright",
+    "postinstall": "node scripts/dev-icon.js"
   },
   "devDependencies": {
     "@types/node": "^26",
     "electron": "^43",
     "electron-builder": "^26",
-    "eslint": "^10",
     "prettier": "^3",
     "pyright": "^1.1",
-    "typescript": "^6",
-    "typescript-eslint": "^8"
+    "rcedit": "^4",
+    "typescript": "^7"
   },
   "private": true,
   "build": {
@@ -37,7 +37,7 @@
       {
         "from": "engine",
         "to": "engine",
-        "filter": ["**/*", "!**/__pycache__/**", "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine", "!rtxvideo/nvngx_vsr.dll", "!rtxvideo/nvngx_truehdr.dll", "!rtxvideo/build_src/**", "!dlssg/build_src/**", "!nvoffruc/NvOFFRUC.dll", "!nvoffruc/cudart64_110.dll", "!dvtools/**", "!hptools/**"]
+        "filter": ["**/*", "!**/__pycache__/**", "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine", "!runtime_*_bak/**", "!trtrtx_bindings/*.obj", "!rtxvideo/nvngx_vsr.dll", "!rtxvideo/nvngx_truehdr.dll", "!rtxvideo/build_src/**", "!dlssg/build_src/**", "!nvoffruc/NvOFFRUC.dll", "!nvoffruc/cudart64_110.dll", "!dvtools/**", "!hptools/**"]
       }
     ],
     "extraFiles": ["LICENSE", "THIRD_PARTY_NOTICES.md"],

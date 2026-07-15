@@ -7,9 +7,9 @@ Build instructions, architecture, the engine CLI, and design rationale. For the 
 
 Works end to end. The packaged build is fully self-contained: a recipient extracts the zip and runs
 `SmoothMyVideo.exe`, no Python, no pip, no ffmpeg, only the NVIDIA driver. Built and tested on an
-RTX 5090 Laptop (Blackwell, sm_120); the CUDA 13 stack (Python 3.13, torch 2.13.0+cu130, cupy-cuda13x,
-TensorRT for RTX `tensorrt_rtx`) is validated across eager, TensorRT-RTX, RTX VSR/HDR and all three
-codecs.
+RTX 5090 Laptop (Blackwell, sm_120); the CUDA 13 stack (Python 3.14, torch 2.13.0+cu130, cupy-cuda13x,
+TensorRT for RTX `tensorrt_rtx` via our own cp314 bindings, see `engine/trtrtx_bindings/`) is validated
+across eager, TensorRT-RTX, RTX VSR/HDR and all three codecs.
 
 ## Architecture
 
@@ -56,8 +56,10 @@ codecs.
 * **`engine/hdr10_meta.py`**, pure-stdlib ISOBMFF injector for HDR10 static metadata (`mdcv`/`clli`) and
   the Dolby Vision configuration box (`dvvC`, via `inject_dv_config`); shared box-insertion surgery.
 * **`engine/preview.py`**, single-frame before/after preview (same passes, same order as a render).
-* **`engine/runtime/`**, bundled relocatable Python 3.13 (python-build-standalone) with the CUDA 13 GPU
+* **`engine/runtime/`**, bundled relocatable Python 3.14 (python-build-standalone) with the CUDA 13 GPU
   stack. Gitignored (see Setup).
+* **`engine/trtrtx_bindings/`**, our pybind11 cp314 build of the `tensorrt_rtx` Python module (NVIDIA
+  ships wheels only up to cp313); source + build script committed, the built `.pyd` lives in the runtime.
 * **`engine/bin/`**, bundled shared-build `ffmpeg.exe` + `ffprobe.exe` and their DLLs. Fetched, not committed.
 * **`engine/GMFSS_Fortuna/`** (model + `train_log/` weights) and **`engine/realesr-animevideov3.pth`**,
   committed to the repo.
@@ -80,16 +82,18 @@ binary didn't download: `node node_modules/electron/install.js`.
 * *Easy:* copy `resources/engine/runtime` out of any packaged build (extract a release zip), it's the
   ready-to-run interpreter, nothing else to do.
 * *From scratch:* unpack a
-  [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases) CPython 3.13
+  [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases) CPython 3.14
   `install_only` win64 build to `engine/runtime`, then:
 ```
 engine\runtime\python.exe -m pip install torch==2.13.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 engine\runtime\python.exe -m pip install -r engine\requirements.txt
+engine\trtrtx_bindings\build.cmd <extracted TensorRT-RTX SDK dir>
 ```
 `requirements.txt` pulls cupy-cuda13x, the **unsuffixed** `nvidia-cuda-nvrtc` / `nvidia-cuda-runtime` cu13
-wheels (the `-cu13` names are deprecated placeholders that fail to build), **`tensorrt-rtx-cu13`**
-(TensorRT for RTX), and onnx/onnxscript. A `python -m venv` is **not** usable, a
-Windows venv isn't relocatable and breaks the portable bundle.
+wheels (the `-cu13` names are deprecated placeholders that fail to build), and onnx/onnxscript. The
+`tensorrt_rtx` module is **not** pip-installable on 3.14 - the third line compiles our own bindings
+against the TensorRT-RTX SDK zip (see `engine/trtrtx_bindings/BUILD.md`). A `python -m venv` is **not**
+usable, a Windows venv isn't relocatable and breaks the portable bundle.
 
 ### Refreshing bundled binaries
 * **ffmpeg:** delete `engine/bin` and re-run `node scripts/fetch-ffmpeg.js`. To pin an exact build, drop a
@@ -107,8 +111,13 @@ Windows venv isn't relocatable and breaks the portable bundle.
   artifact left; to inspect the unpacked app, extract the zip. Recipients extract and run
   `SmoothMyVideo.exe`; nothing required on the target but the NVIDIA driver. (A zip, not an NSIS
   installer, `makensis` can't memory-map an archive this large.)
-* `npm run lint`, one command that does everything: Prettier formats `src/**/*.ts` (writes), then ESLint
-  lints `src`, then pyright lints `engine`. Stops at the first failure. See below.
+* `npm run lint`, one command that does everything: Prettier formats `src/**/*.ts` (writes), then
+  `tsc --noEmit` type-checks `src`, then pyright lints `engine`. Stops at the first failure. See below.
+* `postinstall` (automatic), runs `scripts/dev-icon.js`: stamps `icon.ico` into the dev
+  `node_modules/electron/dist/electron.exe` so `npm start` shows the app icon in the Windows taskbar
+  (the taskbar falls back to the process exe's icon in dev, which is otherwise the Electron logo; the
+  packaged exe was always right via electron-builder). If the icon still looks wrong after a stamp,
+  Explorer's icon cache is stale - it refreshes on the next explorer restart or reboot.
 * `engine\runtime\python.exe scripts\smoke.py [--full] [--trt]`, the render smoke tests: real engine runs
   on `samples/test.mp4` asserting frame counts, VFR duration preservation, `.part` promotion and (with
   `--full`, when their runtimes are installed) the HDR10 boxes, DV configuration record and HDR10+ SEI.
@@ -334,9 +343,11 @@ GPU-portable. `trt_runtime.py` drops to eager if `tensorrt_rtx` is absent.
   `cuda-pathfinder`, so the old `_add_cuda_dll_dirs` nvrtc shim is no longer load-bearing. Note cupy's
   NVRTC kernels only compile once **torch has been imported first** (it primes the CUDA DLL search path
   for `nvrtc-builtins64_133.dll`); `render.py` already imports torch before cupy.
-* **Python 3.13:** the runtime is on 3.13, not 3.14 - `tensorrt_rtx` ships wheels only up to cp313. Every
-  other dep (torch cu130, cupy-cuda13x, VapourSynth 77, etc.) has cp313 wheels; the engine code uses no
-  3.14-only features. Revisit 3.14 only once NVIDIA publishes a cp314 `tensorrt_rtx` wheel.
+* **Python 3.14 + custom `tensorrt_rtx` bindings:** NVIDIA ships `tensorrt_rtx` wheels only up to
+  cp313, so the module in the runtime is our own pybind11 build (`engine/trtrtx_bindings/`), covering
+  exactly the API surface `trt_runtime.py` uses. Extending `trt_runtime.py` to new `trt.*` calls means
+  extending `bindings.cpp` too. Swap back to the official `tensorrt-rtx-cu13` wheel once NVIDIA
+  publishes cp314 bindings.
 * **RTX bridge:** keep the **cu12**-built `rtxvideo_cuda.dll` and ship `cudart64_12.dll` beside it, NGX's
   static import lib is CUDA-12-ABI, so a bridge relinked against CUDA 13 crashes in `create()`
   (see "Building the native bridges" below).
@@ -382,8 +393,10 @@ nothing reflows them, only `src/*.ts` is auto-formatted.
 * **Prettier** (`.prettierrc.json`) formats `src/**/*.ts` only. `.prettierignore` guards `engine/`,
   `renderer/`, and build dirs so a stray `prettier .` can't reflow the hand-tuned files. Config matches the
   existing style (single quotes, semicolons, 2-space, printWidth 120).
-* **ESLint** (`eslint.config.js`, flat config, `typescript-eslint` recommended) lints `src/**/*.ts` for real
-  bugs, scoped to `src`, engine/renderer excluded. CommonJS config on purpose (no `"type":"module"`).
+* **tsc `--noEmit`** (in `npm run lint`) is the TypeScript bug gate: `strict` is on in `tsconfig.json` and
+  `src/` is a single procedural `main.ts`. ESLint/typescript-eslint were dropped 2026-07 to move to
+  TypeScript 7 (the Go-native compiler): typescript-eslint drives the old compiler's JS API and pinned
+  `typescript <6.1`. Re-adding a linter is worth revisiting if `src/` ever grows beyond the one file.
 * **pyright** (`pyrightconfig.json`) lints `engine/*.py` as a **linter, not a type checker**:
   `typeCheckingMode: "off"` so the dynamic torch/numpy/cupy code isn't buried in type noise, only
   high-signal checks stay on (undefined names → error, unused imports/vars → warning). Vendored
@@ -397,9 +410,8 @@ list) to one-per-line; a plain `npm install` / `npm ci` leaves formatting alone.
 bothers you.
 
 Dev dependencies are pinned to caret majors (not `latest`) because `npm run setup` deletes the lockfile:
-with `latest`, a fresh setup after a major release would silently pull a breaking toolchain. In particular
-**TypeScript stays on `^6` until 7.1**: TS 7 (the Go-native compiler) changed the programmatic API and
-typescript-eslint support is slated for 7.1; the compile-speed win is irrelevant at this project's size.
+with `latest`, a fresh setup after a major release would silently pull a breaking toolchain. TypeScript is
+on `^7` (the Go-native compiler) as of 2026-07; ESLint went away in the same move (see above).
 
 ## Dev toolchain
 The dev machine has VS 2019 Build Tools (MSVC `cl.exe` 19.29) and VS 2026 Community (`cl.exe` 19.51) +

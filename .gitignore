@@ -22,7 +22,11 @@ engine/rtxvideo/build_src/*.lib
 engine/rtxvideo/build_src/*.exp
 engine/rtxvideo/build_src/rtxvideo_cuda.dll
 engine/runtime/
+engine/runtime_*_bak/
 engine/trt_cache/
+engine/trtrtx_bindings/*.obj
+engine/trtrtx_bindings/*.lib
+engine/trtrtx_bindings/*.exp
 engine/dvtools/
 engine/hptools/
 
