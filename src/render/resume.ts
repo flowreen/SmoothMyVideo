@@ -63,7 +63,6 @@ const OPTS: Record<string, Spec> = {
   '--dv': { dest: 'dv', kind: 'bool', def: false },
   '--hdr10plus': { dest: 'hdr10plus', kind: 'bool', def: false },
   '--codec': { dest: 'codec', kind: 'str', def: 'hevc', choices: ['hevc', 'av1', 'vvc'] },
-  '--enc-speed': { dest: 'enc_speed', kind: 'str', def: 'quality', choices: ['quality', 'fast'] },
   '--restore': { dest: 'restore', kind: 'bool', def: false },
   '--dlssnr': { dest: 'dlssnr', kind: 'bool', def: false },
   '--nr-structure': { dest: 'nr_structure', kind: 'float', def: 1.0 },
@@ -166,8 +165,10 @@ function pyMtimeInt(p: string): number {
   return Math.trunc(Number(ns / 1000000000n) + Number(ns % 1000000000n) * 1e-9);
 }
 
-/** render.py _resume_sig: sha1 of json.dumps(vars(args) + the source identity + SMV_CQ,
- * sort_keys=True). A mismatch means the partial video came from other settings. */
+/** render.py _resume_sig: sha1 of json.dumps(vars(args) + the source identity + SMV_CQ + the
+ * effective NVENC split mode, sort_keys=True). A mismatch means the partial video came from other
+ * settings (a split-frame segment must never be concatenated onto an unsplit one; hashing the
+ * effective mode also keeps partials from the short-lived split default of 2026-09-25 apart). */
 export function resumeSig(ns: ArgNs, env: Env = process.env): string {
   const inp = path.win32.resolve(ns.input as string);
   const d: Record<string, string> = {};
@@ -177,6 +178,7 @@ export function resumeSig(ns: ArgNs, env: Env = process.env): string {
   d.output = ns.output ? pyJsonDumps(winNormAbs(ns.output as string)) : 'null';
   d.__src = `[${pyJsonDumps(input)}, ${fs.statSync(inp).size}, ${pyMtimeInt(inp)}]`;
   d.__cq = pyJsonDumps(env.SMV_CQ || '');
+  d.__split = pyJsonDumps(env.SMV_NVENC_SPLIT || '15');
   const keys = Object.keys(d).sort();
   const text = '{' + keys.map((k) => pyJsonDumps(k) + ': ' + d[k]).join(', ') + '}';
   return createHash('sha1').update(text, 'utf8').digest('hex');

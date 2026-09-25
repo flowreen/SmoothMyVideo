@@ -24,6 +24,7 @@ determinism case went with the python engine, priority 24 step 8).
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -244,13 +245,27 @@ def c_av1(tmp, trt):
     assert frames(out) == 49, f"frames {frames(out)} != 49"
 
 
-@case("--enc-speed fast --rife 2x -> 49 frames, p4 tier announced")
-def c_encfast(tmp, trt):
-    out = os.path.join(tmp, "s_encfast.mp4")
+def slices_per_frame(path):
+    """Slice segments per picture of an HEVC file (split-frame encoding writes one per strip)."""
+    r = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "debug", "-i", path, "-frames:v", "2", "-c", "copy",
+                        "-bsf:v", "trace_headers", "-f", "null", "-"], capture_output=True, text=True, errors="replace")
+    firsts = len(re.findall(r"first_slice_segment_in_pic_flag\s+\d+\s*=\s*1", r.stderr))
+    total = len(re.findall(r"first_slice_segment_in_pic_flag\s+\d+\s*=\s*[01]", r.stderr))
+    return total / firsts if firsts else 0
+
+
+@case("--enc-speed is refused (the Encoder speed selector was dropped 2026-09-25); --rife 2x -> 49 frames, ONE slice per frame (split-frame encoding stays off)")
+def c_encsplit(tmp, trt):
+    out = os.path.join(tmp, "s_encsplit.mp4")
     rc, err = render(SAMPLE, out, "--rife", "--enc-speed", "fast")
+    assert rc != 0, "an --enc-speed render must fail"
+    assert "unrecognized arguments: --enc-speed" in err, "the refusal line is missing"
+    rc, err = render(SAMPLE, out, "--rife")
     assert rc == 0, "engine exit " + str(rc)
     assert frames(out) == 49, f"frames {frames(out)} != 49"
-    assert "encoder speed: fast" in err, "fast tier line missing from stderr"
+    assert "split frame encoding" not in err, "a split-frame note appeared without SMV_NVENC_SPLIT"
+    spf = slices_per_frame(out)
+    assert spf == 1, f"{spf} slices per frame: split-frame encoding is on (it leaves a seam line)"
 
 
 @case("--codec vvc --no-interp -> 25 frames")
@@ -443,7 +458,7 @@ def c_live_rife(tmp, trt):
 
 
 QUICK = [c_2x, c_fps60, c_noint, c_blend, c_nvof, c_rife_flow, c_vfr, c_live_echo]
-FULL = [c_rife_native, c_5x, c_av1, c_encfast, c_vvc, c_hdr, c_dv, c_hp, c_dlss_twopass,
+FULL = [c_rife_native, c_5x, c_av1, c_encsplit, c_vvc, c_hdr, c_dv, c_hp, c_dlss_twopass,
         c_live_rife]
 
 

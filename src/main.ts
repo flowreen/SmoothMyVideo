@@ -16,6 +16,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
+import { checkEngineCache } from './render/cache';
 
 const ROOT = path.join(__dirname, '..');
 // When packaged, the engine ships as an unpacked extraResource (the host exe, its DLLs and
@@ -116,6 +117,9 @@ if (!app.requestSingleInstanceLock()) {
     }
   });
   app.whenReady().then(() => {
+    // a new TensorRT-RTX or ONNX graph revision empties the engine cache once, before any live
+    // session or render can load an engine built from the old graph (src/render/cache.ts)
+    console.log(checkEngineCache(ENGINE));
     createWindow();
     checkForUpdate();
   });
@@ -1399,7 +1403,6 @@ type RunOpts = {
   dv?: boolean;
   hp?: boolean;
   codec?: string;
-  encspeed?: string;
   flowscale?: number; // the Image scale % (historic name)
   hdrcolor?: string;
   hdrsat?: number;
@@ -1414,8 +1417,6 @@ function engineArgs(opts: RunOpts): string[] {
   const args = [opts.input, String(opts.multi), opts.output];
   // Output codec family (hevc default / av1 / vvc); the engine owns encoder pick + fallbacks.
   if (opts.codec && opts.codec !== 'hevc') args.push('--codec', opts.codec);
-  // NVENC effort tier (quality default / fast = preset p4, same multipass and CQ).
-  if (opts.encspeed === 'fast') args.push('--enc-speed', 'fast');
   // Interpolation is the default; interp === false means the user only wants the sharpen pass,
   // so tell the engine to skip frame generation (and ignore any fps/multi) entirely.
   if (opts.interp === false) args.push('--no-interp');

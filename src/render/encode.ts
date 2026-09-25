@@ -223,7 +223,6 @@ export function qualityArgs(
   venc: string,
   useNvenc: boolean,
   outLabel: number,
-  encSpeed: string,
   dvOrHp: boolean,
   ultra: boolean,
   env: Env = process.env,
@@ -239,10 +238,9 @@ export function qualityArgs(
     }
     const cq = env.SMV_CQ || (venc === 'av1_nvenc' ? '22' : '17');
     const la = outLabel > 120 ? '0' : '1';
-    const preset = encSpeed === 'fast' ? 'p4' : 'p7';
     qargs = [
       '-preset',
-      preset,
+      'p7',
       '-tune',
       'hq',
       '-rc',
@@ -260,7 +258,16 @@ export function qualityArgs(
       '-temporal-aq',
       '1',
     ];
-    if (encSpeed === 'fast') note = `encoder speed: fast (${venc} preset p4, multipass kept)\n`;
+    // Split-frame encoding stays OFF, pinned so no driver's `auto` can turn it on. Two strips were
+    // 1.15x (1080p) / 1.30x (4K) faster for RIFE 2x, but the strips are separate slices with the
+    // loop filter off across them, which leaves an unfiltered line at the same row of every frame
+    // (1080p: rows 575 / 576, +2 to 3 levels): the user rejected it as repeatable, identifiable
+    // corruption (2026-09-25, harness p34). SMV_NVENC_SPLIT overrides the mode for measurement only.
+    if (venc === 'hevc_nvenc' || venc === 'av1_nvenc') {
+      const split = env.SMV_NVENC_SPLIT || '15';
+      qargs.push('-split_encode_mode', split);
+      if (split !== '15') note = `encoder: ${venc} split frame encoding mode ${split} (SMV_NVENC_SPLIT)\n`;
+    }
     if (venc === 'h264_nvenc' || venc === 'hevc_nvenc') qargs.push('-qp_cb_offset', '-2', '-qp_cr_offset', '-2');
     if (dvOrHp) qargs.push('-bf', '0');
   } else if (venc === 'libvvenc') {
@@ -365,7 +372,6 @@ export interface EncodeInput {
   inp: string;
   venc: string;
   useNvenc: boolean;
-  encSpeed: string;
   hdrActive: boolean;
   chroma444: boolean;
   st: Stream;
@@ -390,7 +396,7 @@ export interface EncodeInput {
 export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   const outPix = outPixfmt(e.venc, e.useNvenc, e.hdrActive, e.chroma444);
   const ultra = e.outW > NVENC_MAX || e.outH > NVENC_MAX;
-  const [qargs, speedNote] = qualityArgs(e.venc, e.useNvenc, e.outLabel, e.encSpeed, e.dvOrHp, ultra, env);
+  const [qargs, speedNote] = qualityArgs(e.venc, e.useNvenc, e.outLabel, e.dvOrHp, ultra, env);
   const prof = profileArgs(e.venc, outPix);
   const [sp, color] = colorArgs(e.hdrActive, e.st);
   const vf = encodeVf(sp, outPix);

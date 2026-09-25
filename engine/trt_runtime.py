@@ -76,6 +76,54 @@ def _export_onnx(export_module, example_inputs, input_names, output_names, onnx_
                           dynamic_shapes=dynamic_shapes)
 
 
+def _fuse_prelu(onnx_path):
+    """Rewrite every PRelu into an exact form TensorRT-RTX fuses into the conv before it: it runs
+    PRelu as a separate elementwise kernel (22 % of fusionnet, 26 % of Restore) but fuses
+    LeakyRelu and Max. Scalar slope a: LeakyRelu(alpha=a); per-channel slopes all <= 1:
+    Max(x, x * a); any per-channel slope: Max(x, 0) + a * Min(x, 0). Each is exact for its case,
+    and the engines built from the rewrite give bit-identical output (priority 30 step 2,
+    D:\\AIStuff\\smv-live\\harness\\p30: Restore 1.30x, fusionnet 1.06x / 1.09x at 1080p / 4K).
+    Only the graph is rewritten; the external weight file stays as it is."""
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper
+
+    g = onnx.load(onnx_path, load_external_data=False)
+    if not any(n.op_type == "PRelu" for n in g.graph.node):
+        return
+    vals = {i.name: numpy_helper.to_array(i) for i in onnx.load(onnx_path).graph.initializer}
+    nodes = []
+    for nd in g.graph.node:
+        if nd.op_type != "PRelu":
+            nodes.append(nd)
+            continue
+        x, s, y = nd.input[0], nd.input[1], nd.output[0]
+        a = vals[s]
+        if a.size == 1:
+            nodes.append(helper.make_node("LeakyRelu", [x], [y], alpha=float(a.reshape(-1)[0]),
+                                          name=nd.name + "_lrelu"))
+        elif float(a.max()) <= 1.0:
+            nodes += [helper.make_node("Mul", [x, s], [y + "_ax"], name=nd.name + "_mul"),
+                      helper.make_node("Max", [x, y + "_ax"], [y], name=nd.name + "_max")]
+        else:
+            z = nd.name + "_zero"
+            g.graph.initializer.append(numpy_helper.from_array(np.zeros((1,), a.dtype), z))
+            nodes += [helper.make_node("Max", [x, z], [y + "_p"], name=nd.name + "_pos"),
+                      helper.make_node("Min", [x, z], [y + "_n"], name=nd.name + "_neg"),
+                      helper.make_node("Mul", [s, y + "_n"], [y + "_an"], name=nd.name + "_mul"),
+                      helper.make_node("Add", [y + "_p", y + "_an"], [y], name=nd.name + "_add")]
+    used = {i for n in nodes for i in n.input}
+    keep = [i for i in g.graph.initializer if i.name in used]
+    del g.graph.initializer[:]
+    g.graph.initializer.extend(keep)
+    del g.graph.node[:]
+    g.graph.node.extend(nodes)
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)   # by path: the external data resolves beside the file
+
+
 # --- size-free ONNX (2026-09-21) ----------------------------------------------------------------
 # The graphs below export ONCE with H / W symbolic (trt_lookup.onnx_path), and every engine size is
 # built from that file, pinned to the example shape exactly like a per-size export (one engine per
@@ -179,6 +227,7 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
                 raise RuntimeError(f"exporter renamed input {n} (graph has {sorted(got)})")
             if any(not isinstance(dims[a], str) or not dims[a] for a in d):
                 raise RuntimeError(f"exporter specialized an axis of {n}: {dims}")
+        _fuse_prelu(tmp)
         if os.path.isfile(tmp + ".data"):
             os.replace(tmp + ".data", path + ".data")
         os.replace(tmp, path)

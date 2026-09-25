@@ -514,19 +514,6 @@ const savedCodec = localStorage.getItem('codec');
 if(savedCodec && [...$('outcodec').options].some(o => o.value === savedCodec)) $('outcodec').value = savedCodec;
 $('outcodec').onchange = () => { localStorage.setItem('codec', $('outcodec').value); syncCodec(); };
 syncCodec();
-// Encoder speed tier (measured 2026-09-12, harness enc_fidelity.py on three clips): the encoder paces
-// RIFE at 720p / 1080p 2x and every 3x+ render, so a cheaper NVENC preset is the one offline speed
-// lever left there. fast = preset p4 with the same multipass and CQ: HEVC 2.2x (1080p) to 2.9x (4K) the
-// encode rate, AV1 1.3 to 1.4x, at the same file size, 0.1 to 0.5 dB lower PSNR (worst frame up to 0.7 dB).
-const ENCSPEED_HINTS = {
-  quality: 'preset p7 with full-resolution multipass, the verified visually lossless setting',
-  fast: 'preset p4, same multipass and CQ: HEVC encodes 2 to 3x faster, AV1 1.3x, same size, about 0.1 to 0.5 dB less; pays where the encoder is the pace (RIFE at 1080p, every 3x+ render), nothing on GMFSS; GPU codecs only',
-};
-function syncEncSpeed(){ $('encspeedhint').textContent = ENCSPEED_HINTS[$('encspeed').value] || ''; }
-const savedEncSpeed = localStorage.getItem('encspeed');
-if(savedEncSpeed && [...$('encspeed').options].some(o => o.value === savedEncSpeed)) $('encspeed').value = savedEncSpeed;
-$('encspeed').onchange = () => { localStorage.setItem('encspeed', $('encspeed').value); syncEncSpeed(); };
-syncEncSpeed();
 let savedUpres = localStorage.getItem('upres');
 if(savedUpres === '540'){ savedUpres = '480'; localStorage.setItem('upres', savedUpres); }   // 540p retired 2026-09-13 (user: no 540p anime exists), 480p took its slot
 if(savedUpres && [...$('upres').options].some(o => o.value === savedUpres)) $('upres').value = savedUpres;
@@ -589,6 +576,7 @@ async function doInstall(source){
 $('rtxget').onclick = () => ipcRenderer.invoke('rtx-open-download');
 $('rtxbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('rtx-choose','zip'); if(p) doInstall(p); };  // selecting a .zip auto-installs
 localStorage.removeItem('supersampleOn');   // retired 2026-07-18: supersample removed (measured imperceptible)
+localStorage.removeItem('encspeed');   // retired 2026-09-25: Encoder speed selector dropped (every render uses the Quality encoder)
 if(localStorage.getItem('rtxvsrOn') === '1') $('rtxvsr').checked = true;   // default OFF
 if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // default OFF
 $('rtxvsr').onchange = () => { localStorage.setItem('rtxvsrOn', $('rtxvsr').checked ? '1' : '0'); syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
@@ -1741,7 +1729,6 @@ function startRun(){
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
   if(nrOn()){ payload.dlssnr = true; payload.nrstructure = nrStructure(); payload.nrtone = nrTone(); payload.nrstyle = nrStyle(); }   // DLSS 5 (runtime installed)
   payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)
-  if($('encspeed').value === 'fast') payload.encspeed = 'fast';   // NVENC preset p4 tier (engine --enc-speed fast)
   if(factor > 0){
     payload.upscale = factor;                          // arbitrary upscale factor (target height / source)
   }

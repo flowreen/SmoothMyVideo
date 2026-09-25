@@ -147,7 +147,6 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     output: string | null;
     fps: number | null;
     codec: string;
-    enc_speed: string;
     multi: number;
   };
   const inp = path.win32.resolve(args.input);
@@ -426,7 +425,6 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       inp,
       venc,
       useNvenc,
-      encSpeed: args.enc_speed,
       hdrActive: HDR_ACTIVE,
       chroma444: CHROMA444,
       st: ST,

@@ -7,7 +7,8 @@
 // node tee would have to pipe it through this process, which blocks on the resident host's
 // control pipe, so a chatty child could stall).
 import * as fs from 'fs';
-import { pyArgv, renderRoute, SESSION_LOG, stamp } from './native';
+import { checkEngineCache } from './cache';
+import { engineDir, pyArgv, renderRoute, SESSION_LOG, stamp } from './native';
 
 const LOG_CAP = 8 * 1024 * 1024;
 
@@ -39,6 +40,8 @@ if (require.main === module) {
       }
     }
   };
+  const cache = checkEngineCache(engineDir());
+  if (log !== null && cache !== 'engine cache: current') fs.writeSync(log, cache + '\n');
   renderRoute(argv, say).then((code) => {
     process.exitCode = code;
   });

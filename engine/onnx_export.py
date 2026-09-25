@@ -183,10 +183,12 @@ def ship_tidy(done):
 def write_tags():
     """weights_tags.txt: the weight tags every engine name carries, for a shipped tree without the
     weight files (the dist leaves the .pkl / .pth out, priority 29; the ONNX carry the weights).
-    The host hashes the weight files when they exist (a dev tree) and reads this file otherwise."""
+    The host hashes the weight files when they exist (a dev tree) and reads this file otherwise.
+    `x` = trt_lookup.ONNX_REV (the host ignores it): the file is half of the engine cache stamp,
+    so a graph revision empties the cache once (src/render/cache.ts)."""
     p = os.path.join(trt_lookup.ONNX_DIR, "weights_tags.txt")
     txt = (f"w {trt_lookup.weights_tag()}\nr {trt_lookup.rife_weights_tag()}\n"
-           f"rest {realesr.weights_hash()}\n")
+           f"rest {realesr.weights_hash()}\nx {trt_lookup.ONNX_REV}\n")
     with open(p + ".tmp", "w", encoding="ascii", newline="\n") as fh:
         fh.write(txt)
     os.replace(p + ".tmp", p)

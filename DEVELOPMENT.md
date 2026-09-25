@@ -75,8 +75,9 @@ RTX VSR / HDR and all three codecs.
   TensorRT runtime it used to hold (`trtify`, `rife_trtify`, the per-size export, the strict mode)
   was removed in priority 27b with the python render routes. The native host builds the engines
   and caches them by name in `engine/trt_cache_safe_to_delete` (name = net, shapes, TRT version,
-  weights hash; no GPU in the key, TRT-RTX engines are portable). Nothing in that folder is ever
-  deleted by code; deleting it by hand is always safe, engines rebuild on demand. GUI and CLI
+  weights hash; no GPU in the key, TRT-RTX engines are portable). Code empties that folder only
+  when its stamp goes stale (a new TensorRT-RTX version, weight tags or ONNX revision; see the
+  size-free ONNX paragraph); deleting it by hand is always safe, engines rebuild on demand. GUI and CLI
   share it (`SMV_TRT_CACHE` overrides the location). An engine at a new size is built from the
   graph's SIZE-FREE ONNX in `engine/onnx` (every H / W symbolic, the engine still pinned to one
   size). The graphs: the RIFE IFNet classes, encode, block0, Restore and the five GMFSS nets. The
@@ -89,9 +90,18 @@ RTX VSR / HDR and all three codecs.
   `weights_tags.txt` records the weight tags. The dist leaves the `.pkl` / `.pth` weights out (the
   ONNX carry them): the host names engines from the weight files' hashes when they exist and from
   `weights_tags.txt` otherwise. Names: `<engine base>[_sl<scales>][_dt<dtypes>]_<weights tag>_x<ONNX_REV>.onnx`
-  (`trt_lookup.onnx_path`); bump `ONNX_REV` whenever an export path changes a graph, or stale
-  files keep being built from. Built from these files the engines are bit-identical to the
-  per-size ones, except gmflow_bidir (its size-free branch, see the GMFlow bullet below).
+  (`trt_lookup.onnx_path`); bump `ONNX_REV` (and the host's `kOnnxRev`) whenever an export path
+  changes a graph, or stale files keep being built from. `weights_tags.txt` carries the revision
+  too (`x <rev>`, the host ignores it), and the engine cache stamp is that file plus the
+  TensorRT-RTX version: at app start and CLI start `src/render/cache.ts` compares it with
+  `engine_stamp.txt` in the cache folder and, when it differs, empties the folder once (every
+  engine rebuilds at its size on first use), so no engine built from an older graph or runtime is
+  reused; engine names stay as they are. Rev 2: the export rewrites each
+  PRelu into an exact LeakyRelu / Max form (`trt_runtime._fuse_prelu`), which TensorRT-RTX fuses
+  into the conv before it (it runs PRelu as a separate kernel): Restore 1.30x, fusionnet 1.06x /
+  1.09x per call at 1080p / 4K, output bit-identical. Built from these files the engines are
+  bit-identical to the per-size ones, except gmflow_bidir (its size-free branch, see the GMFlow
+  bullet below).
   `SMV_ONNX_DIR` moves the folder.
 * `engine/trt_lookup.py`: the torch-free side of that cache: the naming helpers (the export
   imports them), the on-disk lookup of the pinned engine, the warm markers (`<jit cache>.warm`)
@@ -202,7 +212,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale F]
   [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--no-interp]
   [--rife] [--rife-drba] [--lsfg] [--nvof] [--fruc] [--dlssg]
-  [--upscale F] [--codec hevc|av1|vvc] [--enc-speed quality|fast] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus]
+  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus]
   [--hdr-color vivid|rtx|raw] [--hdr-saturation N] [--hdr-contrast N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
@@ -328,17 +338,17 @@ Output:
   lookahead queue is dropped (it measured worse on tween-dense streams). `tune uhq` rejected (its
   temporal filter rewrites content). VVC QP 17 with perceptual QP adaptation off; SVT-AV1 CRF 17
   preset 6. `SMV_CQ` overrides any CQ for measurement work.
-* `--enc-speed fast` (GUI "Encoder speed: Fast") swaps preset p7 for p4 and keeps the multipass and
-  CQ. Measured 2026-09-12 on three clips (fast 1080p, clean 1080p anime, 4K; harness
-  `enc_fidelity.py` in the live dev tree): HEVC 2.2x (1080p) to 2.9x (4K) the encode rate, AV1 1.3 to
-  1.4x (its multipass dominates), at the same file size for 0.1 to 0.5 dB average PSNR, up to 0.7 dB
-  on the worst frame. The multipass is the
-  fidelity carrier (dropping it costs 2.5 dB on the worst frame of clean anime) and p1 loses about
-  2 dB, so only p4 with multipass is offered. It pays where the encoder sets the pace: `hevc_nvenc`
-  at the quality tier tops out at about 197 / 101 / 27 fps at 720p / 1080p / 4K on the RTX 5090
-  laptop, so RIFE at 720p and 1080p 2x and every 3x+ render wait on it; GMFSS is model-bound and
-  gains nothing. AV1 at the same effort encodes 1.4 to 1.6x faster than HEVC. CPU encoders ignore
-  the tier.
+* HEVC and AV1 NVENC split-frame encoding is pinned OFF (`-split_encode_mode 15`; ffmpeg's `auto`
+  did not split at p7 either, but a driver could change that). Measured 2026-09-25 (harness `p34` in
+  the live dev tree): 2 strips encode 1.74x faster at 1080p and made RIFE 2x renders 1.15x (1080p) /
+  1.30x (4K) faster for -0.05 dB, but the strips are separate slices with the loop filter off
+  across them (`slice_loop_filter_across_slices_enabled_flag = 0`), so deblocking and SAO never
+  touch that edge: an unfiltered line at the same row of every frame (1080p: rows 575 / 576, +2 to
+  3 levels on the step there), visible on paused frames. Rejected as repeatable, identifiable
+  corruption; do not re-enable it. The smoke checks one slice per frame. `SMV_NVENC_SPLIT`
+  overrides the mode for measurement only and is part of the resume signature.
+* The Fast tier (`--enc-speed fast`, preset p4, GUI "Encoder speed") was dropped 2026-09-25; the
+  flag is refused.
 * Every audio, subtitle, chapter and font track is copied (`--no-passthrough` keeps first audio
   only); the output auto-switches to `.mkv` when the tracks need it, and HDR into MKV keeps the
   full metadata through a two-stage finalize. Source colour signalling rides through `setparams`.
@@ -953,6 +963,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NR_RESET_EVERY=1` | the offline native host's DLSS 5 resets its history on every frame (the live behaviour), for the route gate; never a product setting |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
 | `SMV_CQ` | override the encoder CQ for measurement |
+| `SMV_NVENC_SPLIT` | override the NVENC `-split_encode_mode` for measurement (default 15 = off; 2 = two strips, 0 = ffmpeg's auto); never a product setting (the split leaves a seam line) |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
 | `SMV_DLSSG_SWEEP=1` | the DLSS 4.5 host latches its buffer-sweep capture tier at startup instead of waiting for hardware flip metering, so the sweep path can be tested on demand |
 | `SMV_NO_STATIC_HOLD=1` | identical-pair passthrough off: a byte-identical pair is interpolated like any other (offline renders and the native hosts read it) |

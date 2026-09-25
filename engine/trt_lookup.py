@@ -94,9 +94,13 @@ def engine_name(name, shapes, input_names=None, dyn_batch=None):
 # W symbolic, generated from the committed weights by scripts/export-onnx.js (npm setup and dist)
 # and on the first miss, gitignored, shipped in the release zip. An engine at a new size is then a
 # build from this file (about 1 s) instead of a torch export (20 to 40 s). ONNX_REV is bumped when
-# an export path changes the graph, so a stale file is never built from.
+# an export path changes the graph, so a stale file is never built from; weights_tags.txt carries
+# it too (`x <rev>`), and a changed tags file makes the app / CLI empty the engine cache once
+# (src/render/cache.ts), so no engine built from an older graph is reused (user 2026-09-25: a
+# speedup is worth the rebuild). MUST equal the host's kOnnxRev. Rev 2: the PRelu rewrite
+# (trt_runtime._fuse_prelu).
 ONNX_DIR = os.environ.get("SMV_ONNX_DIR") or os.path.join(HERE, "onnx")
-ONNX_REV = 1
+ONNX_REV = 2
 
 
 def onnx_path(key):

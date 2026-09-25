@@ -2736,6 +2736,12 @@ static std::string lkG(double v)   // f"{v:g}"
 
 struct LkShape { const char* name; std::vector<int64_t> dims; };
 
+// MUST equal trt_lookup.ONNX_REV (a stale ONNX file is never used; rev 2 = the PRelu rewrite,
+// priority 30 step 2). Engines built from an older graph never survive a bump: the app and the
+// CLI empty the engine cache when its stamp (weights_tags.txt, which carries the rev, plus the
+// TensorRT-RTX version) no longer matches (src/render/cache.ts)
+static const int kOnnxRev = 2;
+
 // engine_name(): <base>_<shape per input joined by x, inputs by _>_<trt>_<w>, a dynamic batch
 // axis written lo"to"hi
 static std::string lkEngineName(const std::string& base, const std::vector<LkShape>& set,
@@ -3181,7 +3187,7 @@ static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& b
 // ported on purpose: python's eager-vs-TRT check of the encode engine (no torch here; the
 // size-free build is proven bit-exact against the per-size engines, gate_3b). After the build
 // the host lookup must hit, else python runs as before. RIFE / Frame Blend (3c-2a) first.
-static const int kOnnxRev = 1;   // MUST equal trt_lookup.ONNX_REV (a stale file is never used)
+// (kOnnxRev sits above lkEngineName: the engine names carry it too)
 
 class LkBuildLogger : public nvinfer1::ILogger
 {
