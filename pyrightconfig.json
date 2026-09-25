@@ -4,6 +4,7 @@
     "engine/runtime",
     "engine/GMFSS_Fortuna",
     "engine/trt_cache",
+    "engine/trt_cache_safe_to_delete",
     "engine/rtxvideo",
     "**/__pycache__"
   ],

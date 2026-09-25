@@ -52,11 +52,18 @@ def merge_splits(splits,
     return merge
 
 
+_norm_cache = {}  # device -> (mean, std); fresh CPU tensors per call break CUDA graph capture
+
+
 def normalize_img(img0, img1):
     # loaded images are in [0, 255]
     # normalize by ImageNet mean and std
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(img1.device)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(img1.device)
+    cached = _norm_cache.get(img1.device)
+    if cached is None:
+        cached = (torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(img1.device),
+                  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(img1.device))
+        _norm_cache[img1.device] = cached
+    mean, std = cached
     img0 = (img0 - mean) / std
     img1 = (img1 - mean) / std
 

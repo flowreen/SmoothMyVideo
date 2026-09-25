@@ -70,16 +70,33 @@ class Model:
         img1 = F.interpolate(img1, scale_factor = 0.5, mode="bilinear", align_corners=False)
 
         if scale != 1.0:
-            imgf0 = F.interpolate(img0, scale_factor = scale, mode="bilinear", align_corners=False)
-            imgf1 = F.interpolate(img1, scale_factor = scale, mode="bilinear", align_corners=False)
+            # Flow scale (SMV 2026-09-14): the flow input is resized to EXPLICIT /32-aligned
+            # dims, never by a scale factor. gmflow's attention splits accept only sizes whose
+            # /4 and /8 feature maps divide evenly (a factor of 0.5 on a 544-row half frame gave
+            # 272 = 8.5 x 32 and died on the split assert); multiples of 32 always pass. The
+            # vectors are rescaled back per axis below (channel 0 = x). Antialias on the
+            # shrink (same doctrine as SMV's live GMFSS backend).
+            fh = max(32, int(round(img0.shape[-2] * scale / 32)) * 32)
+            fw = max(32, int(round(img0.shape[-1] * scale / 32)) * 32)
+            imgf0 = F.interpolate(img0, size=(fh, fw), mode="bilinear", align_corners=False, antialias=True)
+            imgf1 = F.interpolate(img1, size=(fh, fw), mode="bilinear", align_corners=False, antialias=True)
         else:
             imgf0 = img0
             imgf1 = img1
-        flow01 = self.flownet(imgf0, imgf1)
-        flow10 = self.flownet(imgf1, imgf0)
+        # flownet.pair = both directions in one fused bidir call (TRT wrapper or the CUDA
+        # graph wrapper); a bare flownet falls back to the classic sequential two calls
+        pair = getattr(self.flownet, "pair", None)
+        if pair is not None:
+            flow01, flow10 = pair(imgf0, imgf1)
+        else:
+            flow01 = self.flownet(imgf0, imgf1)
+            flow10 = self.flownet(imgf1, imgf0)
         if scale != 1.0:
-            flow01 = F.interpolate(flow01, scale_factor = 1. / scale, mode="bilinear", align_corners=False) / scale
-            flow10 = F.interpolate(flow10, scale_factor = 1. / scale, mode="bilinear", align_corners=False) / scale
+            sy = img0.shape[-2] / flow01.shape[-2]
+            sx = img0.shape[-1] / flow01.shape[-1]
+            vec = torch.tensor([sx, sy], device=flow01.device, dtype=flow01.dtype).view(1, 2, 1, 1)
+            flow01 = F.interpolate(flow01, size=img0.shape[-2:], mode="bilinear", align_corners=False) * vec
+            flow10 = F.interpolate(flow10, size=img0.shape[-2:], mode="bilinear", align_corners=False) * vec
 
         metric0, metric1 = self.metricnet(img0, img1, flow01, flow10)
 

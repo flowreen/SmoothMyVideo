@@ -1,24 +1,24 @@
 {
   "name": "smoothmyvideo",
   "version": "1.0.3",
-  "description": "Desktop GUI for AI video frame interpolation (GMFSS), Python engine under the hood",
+  "description": "Desktop GUI for AI video frame interpolation (GMFSS), native TensorRT engine under the hood",
   "author": "Florin Nutiu",
   "main": "dist/main.js",
   "scripts": {
     "start": "tsc && electron .",
-    "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.js && npm start",
-    "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && electron-builder && node scripts/pack-zip.js",
+    "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.js && node scripts/stage-gpu-runtime.js && node scripts/export-onnx.js && npm start",
+    "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && node scripts/stage-gpu-runtime.js --required && node scripts/export-onnx.js --required && electron-builder && node scripts/pack-zip.js",
     "lint": "prettier --write \"src/**/*.ts\" && tsc --noEmit && pyright",
     "postinstall": "node scripts/dev-icon.js"
   },
   "devDependencies": {
-    "@types/node": "^26",
-    "electron": "^43",
-    "electron-builder": "^26",
-    "prettier": "^3",
-    "pyright": "^1.1",
-    "rcedit": "^4",
-    "typescript": "^7"
+    "@types/node": "^26.6.2",
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3",
+    "prettier": "^3.9.9",
+    "pyright": "^1.1.414",
+    "rcedit": "^5.0.2",
+    "typescript": "^7.0.2"
   },
   "private": true,
   "build": {
@@ -35,12 +35,45 @@
     ],
     "extraResources": [
       {
+        "from": "samples/example.mp4",
+        "to": "samples/example.mp4"
+      },
+      {
         "from": "engine",
         "to": "engine",
-        "filter": ["**/*", "!**/__pycache__/**", "!trt_cache/**", "!*.onnx", "!*.onnx.data", "!*.engine", "!runtime_*_bak/**", "!trtrtx_bindings/*.obj", "!rtxvideo/nvngx_vsr.dll", "!rtxvideo/nvngx_truehdr.dll", "!rtxvideo/build_src/**", "!dlssg/build_src/**", "!nvoffruc/NvOFFRUC.dll", "!nvoffruc/cudart64_110.dll", "!dvtools/**", "!hptools/**"]
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!runtime/**",
+          "!**/*.py",
+          "!requirements.txt",
+          "!trt_cache/**",
+          "!trt_cache_safe_to_delete/**",
+          "!*.onnx",
+          "!*.onnx.data",
+          "!onnx/tmp_*/**",
+          "!onnx/*.tmp",
+          "!**/*.pkl",
+          "!**/*.pth",
+          "!*.engine",
+          "!runtime_*_bak/**",
+          "!rtxvideo/nvngx_vsr.dll",
+          "!rtxvideo/nvngx_truehdr.dll",
+          "!dlssnr/nvngx_dlssnr.dll",
+          "!dlssnr/nvngx_dlss.dll",
+          "!**/build_src/**",
+          "!**/*.log",
+          "!nvoffruc/NvOFFRUC.dll",
+          "!nvoffruc/cudart64_110.dll",
+          "!dvtools/**",
+          "!hptools/**"
+        ]
       }
     ],
-    "extraFiles": ["LICENSE", "THIRD_PARTY_NOTICES.md"],
+    "extraFiles": [
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md"
+    ],
     "win": {
       "target": "dir",
       "icon": "icon.ico"

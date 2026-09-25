@@ -1,457 +1,995 @@
-# Smooth My Video: Technical & Developer Guide
+# Smooth My Video: Developer Guide
 
-Build instructions, architecture, the engine CLI, and design rationale. For the product overview see
-[README.md](README.md).
+How the project is put together, how to set it up from a clone, the engine CLI, Live mode, the
+build recipes for the native parts, and the rules that keep releases working. For the product
+overview see [README.md](README.md).
 
-## Status
+## Overview
 
-Works end to end. The packaged build is fully self-contained: a recipient extracts the zip and runs
-`SmoothMyVideo.exe`, no Python, no pip, no ffmpeg, only the NVIDIA driver. Built and tested on an
-RTX 5090 Laptop (Blackwell, sm_120); the CUDA 13 stack (Python 3.14, torch 2.13.0+cu130, cupy-cuda13x,
-TensorRT for RTX `tensorrt_rtx` via our own cp314 bindings, see `engine/trtrtx_bindings/`) is validated
-across eager, TensorRT-RTX, RTX VSR/HDR and all three codecs.
+An Electron + TypeScript GUI over one native host (`engine/live/smv-live.exe`, C++ on TensorRT for
+RTX and CUDA 13) that runs every offline render and Live session; a TypeScript orchestrator
+(`src/render`) probes, plans, encodes and resumes. No Python ships (priority 24, 2026-09-24): the
+engines are built by the host from size-free ONNX shipped in `engine/onnx`, which a DEV python
+(`engine/runtime`, torch cu130, never shipped) exports from the committed weights. The packaged
+build is self-contained: extract the zip, run `SmoothMyVideo.exe`, nothing else on the target but
+the NVIDIA driver. Built and tested on an RTX 5090 Laptop (Blackwell, sm_120) across TensorRT-RTX,
+RTX VSR / HDR and all three codecs.
 
-## Architecture
+## Project layout
 
-* **`src/main.ts`**, Electron main: window, open/save dialogs, ffprobe (`-of json`), spawns the engine,
-  streams progress, tracks the child so **Cancel** can `taskkill /T /F` it. IPC for the monitor refresh
-  rate (match-screen), screen size, and the single-frame preview. Resolves the interpreter as
-  `engine/runtime/python.exe` and ffprobe as `engine/bin/ffprobe.exe` (both fall back to PATH); sets
-  `PYTHONUTF8` and a writable `SMV_TRT_CACHE`.
-* **`renderer/index.html`**, the UI: select/drag a video, a target-fps control, an **FSR** sharpen
-  toggle, **Restore**, **Upscale**, a **Codec** selector, an opt-in **NVIDIA RTX** panel (VSR + HDR), a
-  **Dolby Vision** panel and an **HDR10+** panel (each a one-tool install), output path, progress + ETA,
-  a batch queue (crash-resumable, keeps going past failed files), a live thumbnail, a before/after
-  preview pane, and a launch-time new-release notice. Electron
-  `require` with `nodeIntegration`; most settings persist in `localStorage` (Restore and RTX Dynamic
-  Vibrance deliberately don't, per-session opt-ins).
-* **`engine/render.py`**, the render engine and model orchestrator: ffmpeg decode → the chosen
-  interpolation model (GMFSS default, RIFE/DRBA, FRUC, DLSS-FG or SVP) → per-frame passes → ffmpeg encode.
-  TensorRT backend by default for GMFSS (per-subnet eager fallback; `--no-trt`), NVENC with a CPU
-  SVT-AV1 fallback, always fp16, always visually lossless, 10-bit by default. Owns the shared
-  plumbing every model uses: probe, track passthrough, pause, crash-resume, progress
-  (`PROGRESS k/total` on stderr), live thumbnail and the encoder selection.
-* **`engine/trt_runtime.py`**, the **TensorRT for RTX** (`tensorrt_rtx`) backend. If it can't import,
-  the render.py guard drops the whole pipeline to eager. Swaps the five GMFSS sub-nets for strongly-typed
-  fp16 engines; softsplat + the interpolate glue stay eager. Also engines the RIFE IFNet forward
-  (`rife_trtify`) and the `--restore` Real-ESRGAN pass, each keyed by its own weights hash. Engines
-  are cached per `(net, shapes, trt version, weights hash)` - no GPU in the key, since TRT-RTX's AOT
-  engine is hardware-agnostic (portable across RTX GPUs); the weights-hash in each filename makes the
-  cache self-invalidating on a weight swap (stale engines deleted at next start).
-* **`engine/rife_backend.py`** + **`engine/rife/`**, the RIFE model backend: vendored
-  Practical-RIFE 4.26 heavy (MIT, weights bundled) exposing the same pair interface as GMFSS,
-  plus the DRBA triple interface (DistanceRatioMap timing) the engine's DRBA window loop drives.
-* **`engine/svp_backend.py`**, the SVP model backend: generates the standalone VapourSynth host
-  process that runs svpflow (SVP 4's plugin DLLs) at a max-quality offline profile and streams y4m
-  back to the engine; also documents the profile derivation and the block-size caution.
-* **`engine/nvoffruc.py`** + **`engine/nvoffruc/`**, the "NVIDIA Smooth Motion" ctypes bridge to
-  NVIDIA's NvOFFRUC library (user-installed DLLs, same pattern as the RTX folder).
-* **`engine/dlssg.py`** + **`engine/dlssg/`**, the DLSS frame-generation bridge.
-* **`engine/rcas.py`**, the FSR RCAS sharpen kernel (shared by render and preview).
-* **`engine/rtxvideo.py`** + **`engine/rtxvideo/`**, the RTX Video bridge (VSR + TrueHDR) over a small
-  compiled CUDA DLL (`rtxvideo_cuda.dll`, sources in `build_src/`). The non-redistributable NGX feature
-  DLLs are user-installed via the in-app NVIDIA RTX panel; the whole folder is gitignored / excluded from
-  the zip, so RTX stays a local feature.
-* **`engine/realesr.py`**, the `--restore` Real-ESRGAN detail pass (vendored SRVGGNetCompact, BSD-3).
-* **`engine/hdr10_meta.py`**, pure-stdlib ISOBMFF injector for HDR10 static metadata (`mdcv`/`clli`) and
-  the Dolby Vision configuration box (`dvvC`, via `inject_dv_config`); shared box-insertion surgery.
-* **`engine/preview.py`**, single-frame before/after preview (same passes, same order as a render).
-* **`engine/runtime/`**, bundled relocatable Python 3.14 (python-build-standalone) with the CUDA 13 GPU
-  stack. Gitignored (see Setup).
-* **`engine/trtrtx_bindings/`**, our pybind11 cp314 build of the `tensorrt_rtx` Python module (NVIDIA
-  ships wheels only up to cp313); source + build script committed, the built `.pyd` lives in the runtime.
-* **`engine/bin/`**, bundled shared-build `ffmpeg.exe` + `ffprobe.exe` and their DLLs. Fetched, not committed.
-* **`engine/GMFSS_Fortuna/`** (model + `train_log/` weights) and **`engine/realesr-animevideov3.pth`**,
-  committed to the repo.
+* `src/main.ts`: Electron main. Dialogs, ffprobe (`-of json`), spawns the render orchestrator
+  (`dist/render/cli.js` under the Electron binary with `ELECTRON_RUN_AS_NODE=1`, `SMV_ENGINE_DIR` =
+  the engine folder) and streams its progress, kills the child tree on Cancel, runs the before /
+  after preview (`dist/render/preview.js`, the same way), IPC for screen size / refresh rate, the
+  runtime installers (RTX, Smooth Motion, DLSS 5, Dolby Vision, HDR10+ tools) and the update check.
+  Resolves `engine/bin/ffprobe.exe` (PATH fallback). Compiled by `tsc`; edit the `.ts`,
+  never `dist/main.js`.
+* `src/render/`: the render orchestrator, moved from python to TypeScript (priority 24 step 6; the
+  python modules named below were deleted in step 8, their last versions are in git history).
+  `cli.ts` is the command line (render.py's argv, stderr protocol and exit codes, the session log);
+  `native.ts` renders every render (probe, plan, encoder, resume, the host one-shot or resident,
+  the finish) and the DLSS + RTX two-pass. Step 8 closed the routes the host never took: `--no-trt`
+  is gone, `--multi 1` with a model and no `--fps` is refused, and an image scale that would leave
+  the output smaller than the processed size (only below 64 px) folds the downscale instead. `probe.ts` and `plan.ts` are `render_probe.py` and
+  `render_plan.py` ported line by line (2026-09-24), `pyfmt.ts` reproduces python's rounding and
+  number formatting exactly (half-to-even on the double's exact value, `:g`, `.0f`, `str()` of a
+  float), so every note and pass argument reads the same. `encode.ts` is `render_encode.py`
+  (decode / encode argv, the encoder choice, the finish; the DV / HDR10+ exports and the resume
+  concat arrive as callables) and `hdr10meta.ts` is `hdr10_meta.py` (step 6b); `dvhp.ts` is the
+  Dolby Vision / HDR10+ export half of `render_encode.py` (step 6c: the scene-shot grouping, the
+  dovi_tool / hdr10plus_tool configs written as python's `json.dump` writes them). `resume.ts` is
+  render.py's resume / pause / progress half (step 6d-2: the argv parse and settings signature,
+  the sidecar, the salvage + gapless cut + source mapping, the native HDR statistics prefix, the
+  pause preview, the PROGRESS / SIZE heartbeat). `preview.ts` is the before / after pane (step 7,
+  `preview.py`'s arguments and stdout line): the frame from the render's own decode (seeked by
+  time, the downscale folded in like the render), the passes in the native host
+  (`smv-live.exe --offline --no-interp --frames 1`, `--nr-delta` for the DLSS 5 mask), then
+  `preview.py`'s display arithmetic in numpy's float32 (`Math.fround`: the PQ tonemaps, cv2's
+  cubic resize and INFERNO table for the mask) and the PNG files; `inferno.ts` is generated by
+  harness `p24s7\gen_inferno.py`. Gate: harness `p24s7\gate_7.py`. Equivalence
+  gates: harness `ts6a\gate_6a.py` (31,148 cases), `ts6b\gate_6b.py` (7,635 cases incl. real
+  injections and finishes, files byte-exact), `ts6c\gate_6c.py` (279 cases incl. every pq12
+  code and real dovi_tool / hdr10plus_tool runs, files byte-exact) and `ts6d2\gate_6d2.py` (9,130
+  cases against render.py's own functions incl. real salvage / trim / concat of torn part files and
+  pause previews, files byte-exact), all 0 differences.
+* `renderer/index.html` + `renderer/app.js`: the whole UI (markup and CSS in the HTML, a small
+  inline script that sets the mode class before the body renders) plus its progress / ETA / IPC
+  logic in `app.js`, loaded by a plain `<script src="app.js">` at the end of the body; both are
+  loaded directly by Electron (no build step: edit and relaunch). Panels sit in engine pass order and
+  are numbered by a CSS counter that skips hidden panels (`.panel.step`): Restore, Interpolate,
+  Upscale, DLSS 5, Sharpen, HDR, Dolby Vision, HDR10+, Output. A Video / Live switch
+  (`localStorage.uiMode`) puts `mode-video` or `mode-live` on `<html>`; `.vonly` and `.lonly`
+  elements show in one mode only. Settings persist in `localStorage` (Restore and Dynamic Vibrance
+  are per-session opt-ins by design). After any edit of either file run `python scripts/scan_index.py`
+  (duplicate ids, dangling `$()` refs from both files, every `<script src>` resolving, `node --check`
+  on the inline script and on `app.js`); a duplicate id once made the codec selection silently
+  never reach the engine. The renderer uses `require('electron')`, so it cannot run in a browser.
+* `engine/gpu_runtime/`: the CUDA 13 runtime + NVRTC and TensorRT-RTX (+ its ONNX parser) DLLs the
+  host loads, plus `tensorrt_rtx_version.txt` (the version baked into every engine name). Staged
+  from the dev python's wheels by `scripts/stage-gpu-runtime.js` (setup; required in dist),
+  gitignored, shipped.
+* DEV TOOLS (python, need `engine/runtime`, never shipped: the dist filter drops `runtime/**` and
+  every `*.py`): `engine/onnx_export.py` and what it imports, below.
+* `engine/trt_runtime.py`: the size-free ONNX export (dev tool): each graph's export module and
+  its engine contract (base name, input / output names, the dynamic batch range). The python
+  TensorRT runtime it used to hold (`trtify`, `rife_trtify`, the per-size export, the strict mode)
+  was removed in priority 27b with the python render routes. The native host builds the engines
+  and caches them by name in `engine/trt_cache_safe_to_delete` (name = net, shapes, TRT version,
+  weights hash; no GPU in the key, TRT-RTX engines are portable). Nothing in that folder is ever
+  deleted by code; deleting it by hand is always safe, engines rebuild on demand. GUI and CLI
+  share it (`SMV_TRT_CACHE` overrides the location). An engine at a new size is built from the
+  graph's SIZE-FREE ONNX in `engine/onnx` (every H / W symbolic, the engine still pinned to one
+  size). The graphs: the RIFE IFNet classes, encode, block0, Restore and the five GMFSS nets. The
+  files come from the committed weights (`engine/onnx_export.py`, run by `scripts/export-onnx.js` in `npm run setup`
+  and, required, in `npm run dist`; gitignored, shipped in the release); the host builds every
+  engine from them (the offline fixed-batch `_b{B}` classes from the `_bd8` graph, batch pinned).
+  After the exports the script tidies the folder for shipping: a graph it did not produce is
+  removed, identical external weight files are merged into one `weights_<md5>.data` that every
+  such graph points at (the RIFE family's 23 MB of weights once instead of eight times), and
+  `weights_tags.txt` records the weight tags. The dist leaves the `.pkl` / `.pth` weights out (the
+  ONNX carry them): the host names engines from the weight files' hashes when they exist and from
+  `weights_tags.txt` otherwise. Names: `<engine base>[_sl<scales>][_dt<dtypes>]_<weights tag>_x<ONNX_REV>.onnx`
+  (`trt_lookup.onnx_path`); bump `ONNX_REV` whenever an export path changes a graph, or stale
+  files keep being built from. Built from these files the engines are bit-identical to the
+  per-size ones, except gmflow_bidir (its size-free branch, see the GMFlow bullet below).
+  `SMV_ONNX_DIR` moves the folder.
+* `engine/trt_lookup.py`: the torch-free side of that cache: the naming helpers (the export
+  imports them), the on-disk lookup of the pinned engine, the warm markers (`<jit cache>.warm`)
+  the native handoffs use to skip the model load and warm-up once a shape was warmed, and the
+  "did not fit" markers (`<engine>.nofit`, written when the batched live class could not be
+  built for lack of GPU memory at a shape, e.g. 1472x2560 at scale 1.00): later starts at that
+  size skip the model load and the failing build and go straight to the unbatched engine.
+  A TRT-RTX bump or a weights change renames the engine and so retries the build.
+* `engine/rife_backend.py` + `engine/rife/`: vendored Practical-RIFE 4.26 heavy (MIT, weights
+  committed). Pair interface like GMFSS and the DRBA triple interface (the export's source).
+* `engine/nvoffruc/`: the "NVIDIA Smooth Motion" bridge to NvOFFRUC (user-installed DLLs), called
+  by the host.
+* `engine/dlssg/`: the DLSS 4.5 frame generation host (`dlssg2f.exe`, D3D12, Streamline runtime
+  bundled), driven by the native host.
+* `engine/dlssnr/`: the DLSS 5 Neural Rendering pass (`--dlssnr`). A pipe
+  server host (`dlssnr.exe` + the `nvngx.dll` caller shim, both built from `build_src/` and shipped)
+  around NGX feature 18. The runtime `nvngx_dlssnr.dll` is gitignored and never shipped: the DLSS 5
+  panel downloads the pinned community build (`DLSSNR_DL` in `src/main.ts`, one rhi-repo release
+  asset, the DLL's SHA256 checked before the copy) or installs a dropped copy (other builds install
+  with an "unverified" notice). `nvngx_dlss.dll` is optional (the NGX core only warns without it).
+* `engine/rtxvideo/`: RTX Video (VSR + TrueHDR) over the locally built `rtxvideo_cuda.dll`, called
+  by the host. The NGX feature DLLs are user-installed through the in-app RTX setup box; the
+  folder is gitignored and excluded from the zip.
+* `engine/realesr.py`: the `--restore` Real-ESRGAN model (vendored SRVGGNetCompact, BSD-3, weights
+  committed as `engine/realesr-animevideov3.pth`), the Restore ONNX's source (dev tool).
+* `engine/live/`: the native host (Live mode, see below, and every offline render). The python live
+  server (priority 22, 2026-09-21) and the python render engine (`render*.py`, `preview.py`,
+  `hdr10_meta.py`, `rcas.py`, `rtxvideo.py`, `dlssg.py`, `dlssnr.py`, `nvoffruc.py`; priority 24
+  step 8, 2026-09-24) were deleted; git history has them.
+* `engine/GMFSS_Fortuna/`: the GMFSS model and `train_log/` weights, committed (the weights' hash
+  names the engines, so they ship).
+* `engine/runtime/`: the DEV python 3.14 with torch and the CUDA 13 wheels, gitignored, never
+  shipped (see Setup).
+* `engine/bin/`: bundled `ffmpeg.exe` + `ffprobe.exe` + DLLs, fetched, not committed.
+* `engine/onnx/`: the size-free ONNX graphs engines are built from, generated, not committed.
+* `scripts/`: `fetch-ffmpeg.js`, `stage-gpu-runtime.js`, `export-onnx.js`, `dev-icon.js`,
+  `scan_index.py`, `smoke.py`.
+
+Doc policy: README.md and this file are the only docs. No per-component BUILD.md files (a
+provenance note beside vendored third-party headers, `engine/live/build_src/nvofa/README.md`, is
+not a doc in this sense).
 
 ## Setup (fresh clone)
 
-Weights ship in git. Two pieces are fetched/copied: `engine/bin` (ffmpeg, ~137 MB) and the ~5.7 GB
-`engine/runtime` (Python). Both must be present before `npm run dist`.
+Weights ship in git. Fetched or copied: `engine/bin` (ffmpeg, about 137 MB) and the DEV python
+`engine/runtime` (about 5.7 GB, never shipped); `engine/gpu_runtime` (about 345 MB) and
+`engine/onnx` are generated from it. All must exist before `npm run dist`.
 
-**1. Deps + ffmpeg**
-```
-npm install
-node scripts/fetch-ffmpeg.js
-```
-`fetch-ffmpeg.js` downloads the BtbN win64 **LGPL shared** ffmpeg into `engine/bin` (idempotent; skips if
-present; the app falls back to PATH ffmpeg otherwise, or the GUI "Choose .zip" button). If the Electron
-binary didn't download: `node node_modules/electron/install.js`.
+1. Dependencies and ffmpeg:
+   ```
+   npm install
+   node scripts/fetch-ffmpeg.js
+   ```
+   `fetch-ffmpeg.js` downloads the BtbN win64 LGPL shared build into `engine/bin` (idempotent). If
+   the Electron binary did not download: `node node_modules/electron/install.js`.
+2. The dev python into `engine/runtime` (release zips up to 1.0.3 carry a copy in
+   `resources/engine/runtime`; later ones ship none):
+   * Unpack a
+     [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases)
+     CPython 3.14 `install_only` win64 build to `engine/runtime`, then
+     ```
+     engine\runtime\python.exe -m pip install torch==2.14.0 torchvision --index-url https://download.pytorch.org/whl/cu130
+     engine\runtime\python.exe -m pip install -r engine\requirements.txt
+     ```
+     `requirements.txt` pulls cupy-cuda13x, the unsuffixed `nvidia-cuda-nvrtc` / `nvidia-cuda-runtime`
+     cu13 wheels (the `-cu13` names are dead placeholders), `tensorrt-rtx-cu13` (cp314 wheels exist
+     from 1.6.1.120 up, never pin below) and onnx / onnxscript. Never use a `venv`: a Windows venv is
+     not relocatable.
+3. `node scripts/stage-gpu-runtime.js` (the host's DLLs into `engine/gpu_runtime`) and
+   `node scripts/export-onnx.js` (the size-free ONNX into `engine/onnx`); `npm run setup` runs both.
 
-**2. Python runtime → `engine/runtime`** (the only gitignored piece)
-* *Easy:* copy `resources/engine/runtime` out of any packaged build (extract a release zip), it's the
-  ready-to-run interpreter, nothing else to do.
-* *From scratch:* unpack a
-  [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases) CPython 3.14
-  `install_only` win64 build to `engine/runtime`, then:
-```
-engine\runtime\python.exe -m pip install torch==2.13.0 torchvision --index-url https://download.pytorch.org/whl/cu130
-engine\runtime\python.exe -m pip install -r engine\requirements.txt
-engine\trtrtx_bindings\build.cmd <extracted TensorRT-RTX SDK dir>
-```
-`requirements.txt` pulls cupy-cuda13x, the **unsuffixed** `nvidia-cuda-nvrtc` / `nvidia-cuda-runtime` cu13
-wheels (the `-cu13` names are deprecated placeholders that fail to build), and onnx/onnxscript. The
-`tensorrt_rtx` module is **not** pip-installable on 3.14 - the third line compiles our own bindings
-against the TensorRT-RTX SDK zip (see `engine/trtrtx_bindings/BUILD.md`). A `python -m venv` is **not**
-usable, a Windows venv isn't relocatable and breaks the portable bundle.
-
-### Refreshing bundled binaries
-* **ffmpeg:** delete `engine/bin` and re-run `node scripts/fetch-ffmpeg.js`. To pin an exact build, drop a
-  matched `ffmpeg.exe` + `ffprobe.exe` + `*.dll` set in by hand, never mix DLLs across builds (the exe
-  links specific SONAME majors like `avcodec-63`).
-* **Weights:** the GMFSS `train_log` pkls (from the GMFSS_Fortuna release) and `realesr-animevideov3.pth`
-  (Real-ESRGAN v0.2.5.0). Both committed; this is only for updating them.
+Refreshing bundled binaries: for ffmpeg delete `engine/bin` and re-run the fetch script, or drop a
+matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across builds). Weights
+(GMFSS `train_log` pkls, `realesr-animevideov3.pth`) are committed; replace the files to update.
 
 ## Scripts
-* `npm start`, build (`tsc`) and launch.
-* `npm run dist`, the build command: wipes `release/`, compiles with `tsc`, runs electron-builder, and
-  zips the result into `release/SmoothMyVideo-<version>-win.zip` (~3 GB with TensorRT for RTX bundled;
-  the compact RTX libs shrank this from ~4 GB). The
-  multi-GB staging folder is deleted once the zip passes a size sanity check, so the zip is the only
-  artifact left; to inspect the unpacked app, extract the zip. Recipients extract and run
-  `SmoothMyVideo.exe`; nothing required on the target but the NVIDIA driver. (A zip, not an NSIS
-  installer, `makensis` can't memory-map an archive this large.)
-* `npm run lint`, one command that does everything: Prettier formats `src/**/*.ts` (writes), then
-  `tsc --noEmit` type-checks `src`, then pyright lints `engine`. Stops at the first failure. See below.
-* `postinstall` (automatic), runs `scripts/dev-icon.js`: stamps `icon.ico` into the dev
-  `node_modules/electron/dist/electron.exe` so `npm start` shows the app icon in the Windows taskbar
-  (the taskbar falls back to the process exe's icon in dev, which is otherwise the Electron logo; the
-  packaged exe was always right via electron-builder). If the icon still looks wrong after a stamp,
-  Explorer's icon cache is stale - it refreshes on the next explorer restart or reboot.
-* `engine\runtime\python.exe scripts\smoke.py [--full] [--trt]`, the render smoke tests: real engine runs
-  on `samples/test.mp4` asserting frame counts, VFR duration preservation, `.part` promotion and (with
-  `--full`, when their runtimes are installed) the HDR10 boxes, DV configuration record and HDR10+ SEI.
-  Run it after every engine change; eager renders are not bit-deterministic, so the checks are
-  structural, never checksums.
 
-## Engine CLI (used by the GUI, also runnable directly)
+* `npm start`: `tsc` then launch.
+* `npm run setup`: clean `node_modules` + `engine/bin`, `npm install`, fetch ffmpeg, stage
+  `engine/gpu_runtime` and export the size-free ONNX (both skipped with a warning when
+  `engine/runtime` is not there yet; run step 3 of Setup by hand after step 2), start. Never
+  name a wrapper script `install` / `preinstall` / `postinstall` (npm lifecycle names; a script named
+  `install` that runs `npm install` recurses).
+* `npm run dist`: wipes `release/`, compiles, stages `engine/gpu_runtime` and exports any missing
+  size-free ONNX into `engine/onnx` (both `--required`, a failure stops the build), runs
+  electron-builder and zips to `release/SmoothMyVideo-<version>-win.zip` (a zip, not an
+  installer, because `makensis` cannot memory-map an archive this large). The staging folder is
+  deleted after a size sanity check. `extraResources` copies `engine/**` minus `runtime/**`, every
+  `*.py` and the other filtered paths, so no stray folders may sit under `engine` at build time.
+* `npm run lint`: Prettier writes `src/**/*.ts`, then `tsc --noEmit`, then pyright on `engine`.
+  Stops at the first failure.
+* `postinstall` runs `scripts/dev-icon.js`, stamping `icon.ico` into the dev Electron exe so
+  `npm start` shows the app icon (a stale Explorer icon cache refreshes on the next reboot).
+* `python scripts\smoke.py [--full]` (any python 3, stdlib only): real renders through
+  `dist\render\cli.js` under the Electron binary in node mode (what the app runs) on
+  `samples/test.mp4` asserting frame counts, VFR duration, `.part` promotion, the Frame Blend
+  backend and, with `--full`, the HDR10 boxes, DV record, HDR10+ SEI, the DLSS-G + DLSS 5
+  two-pass split (SKIP without the runtimes) and the live echo / RIFE cases. Run after every
+  engine change (`npx tsc` first). Checks are structural (TensorRT-RTX output is not run-to-run
+  bit-stable, so no md5 case); `--trt` is accepted and ignored.
+* `python scripts/scan_index.py`: the renderer scan described above (`index.html` + `app.js`).
+
+## Engine CLI
+
+What the app runs (any node works; the app uses its own Electron binary with `ELECTRON_RUN_AS_NODE=1`):
+
 ```
-engine\runtime\python.exe engine\render.py <input> <multi> [output] [--scale 1.0] [--fps TARGET] [--no-trt] [--sharpen S] [--restore] [--no-interp] [--rife] [--rife-drba] [--fruc] [--svp] [--svp-nvof] [--no-passthrough] [--upscale F] [--codec hevc|av1|vvc] [--out-bits 8|10] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus] [--hdr-nits N] [--hdr-color vivid|rtx|raw] [--hdr-vibrance B] [--hdr-satboost S] [--hdr-mastering-prim display-p3|dci-p3|bt2020|bt709]
+node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale F]
+  [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--no-interp]
+  [--rife] [--rife-drba] [--lsfg] [--nvof] [--fruc] [--dlssg]
+  [--upscale F] [--codec hevc|av1|vvc] [--enc-speed quality|fast] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus]
+  [--hdr-color vivid|rtx|raw] [--hdr-saturation N] [--hdr-contrast N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
-* `<multi>` integer multiplier, or `--fps TARGET` to resample to any output fps (the model interpolates at
-  arbitrary fractional timesteps; `<multi>` is required positionally but ignored when `--fps` is given).
-* `--scale F` optical-flow resolution factor (GMFlow already runs at half the source; this scales it
-  further). **Auto by default**: 1.0 below 4K, 0.5 for 4K+ sources. GMFlow's global attention grows
-  super-linearly with area and dominates the interpolation wall, so quarter-resolution flow at UHD
-  (still 1080p-class motion detail) makes a 4K render cost barely more than a 1080p one; verified
-  equal-or-slightly-better against ground truth (dropped-frame reconstruction: mean tween PSNR 28.3 vs
-  27.9 dB, same worst frame). Pass an explicit value to override.
-* `--sharpen S` (0..1) FSR-style RCAS on every output frame (bare `--sharpen` = 0.8; off unless given).
-* `--no-interp` re-encodes at source fps with sharpen only (no model/TRT loaded).
-* `--fruc` "NVIDIA Smooth Motion": interpolates on the OFA hardware via NVIDIA's NvOFFRUC library
-  instead of GMFSS (lower quality; ghosts on fast/large motion, inherent to the optical-flow model).
-  Needs `NvOFFRUC.dll` + `cudart64_110.dll` user-installed into `engine/nvoffruc` from the Optical
-  Flow SDK .zip (the GUI's Smooth Motion checkbox offers a one-time installer); GMFSS stays the
-  default and the quality path. `--fruc-native` is a debug variant (real frames + FRUC tweens).
-* `--rife` "RIFE": interpolates with Practical-RIFE 4.26 heavy (vendored under `engine/rife`,
-  MIT, weights bundled) instead of GMFSS - the strongest open general-purpose model, the
-  recommendation for live action (GMFSS stays the anime specialist). Same on-grid/--fps timing,
-  passes, pause and crash-resume as GMFSS; TensorRT-accelerated like GMFSS (the IFNet forward is
-  engined per resolution, `--no-trt` forces eager fp16).
-* `--rife-drba` (the GUI's RIFE model with "Preserve anime pacing (DRBA)" on): RIFE tweens with
-  DistanceRatioMap timing (routineLife1/DRBA) - pans smooth fully while character motion keeps
-  closer to its original cadence, which also avoids forced-midpoint warping artifacts. Renders
-  on the uniform offset grid for integer `--multi` too (the adjusted timing is the feature); the
-  first window after a start or resume seam falls back to plain pair RIFE (deterministic).
-* `--svp` (the GUI's SVP model with its "NVIDIA Optical Flow" sub-option off): interpolates with
-  the svpflow engine (block-matching vectors + GPU rendering) whose two plugin DLLs are
-  borrowed from a local SVP 4 installation
-  (`SMV_SVP_DIR` overrides the default `C:\Program Files (x86)\SVP 4`; SVPManager need not run,
-  and SVP's optional mpv component is NOT needed). The engine spawns a sibling python on the
-  bundled runtime that hosts svpflow in the runtime's own VapourSynth wheel (`vapoursynth==77`,
-  PINNED - svpflow is a deprecated-API3 plugin, re-verify a render before any bump): bundled
-  ffmpeg decodes the source, a sliding-window frame cache feeds the filter (no VS source plugin),
-  and the already-interpolated stream leaves as y4m; the bundled ffmpeg converts it to the raw
-  frames the engine expects, and the engine's per-frame passes + encode run unchanged (1:1 loop).
-  The three svpflow parameter strings are a max-quality offline profile derived from SVP's own
-  generate.js mappings: uniform interpolation (every pair, no adaptive holding), blend at scene
-  cuts instead of repeating, shader 13 "Standard", no artifact masking, finest 8px vector grid
-  with the largest search radius, strongest wide search and a refine pass (see
-  `_svp_host_script` in the engine, including the block:{w:32} caution); the GPU device id is
-  read from the user's own SVP settings (frc.cfg), and `SMV_SVP_ALGO` (env) overrides the
-  shader for comparisons. Pause and crash-resume work like the other models (a resumed run trims
-  the host to the banked output-frame count). SmoothFps renders at 16-bit 4:2:0 precision for
-  every source depth (only the vector-search clips drop to 8-bit, mirroring SVP's own scripts)
-  and the SVP output is always 10-bit, `--out-bits 8` included, so tween blends never band.
-  Known v1 limits: chroma rides at 4:2:0 through svpflow, and the clip length is the
-  container's frame count (a tail frame can repeat or drop on containers with wrong metadata).
-* `--svp-nvof` (the GUI's SVP model with "NVIDIA Optical Flow" on, the GUI default): same SVP
-  pipeline, but the motion vectors come from the NVIDIA Optical Flow hardware (svpflow's
-  `SmoothFps_NVOF`, fed a dense 4px-grid P8 vector clip exactly as SVP's own generator builds
-  it) instead of SVP's block-matching search. Needs SVP 4 plus a Turing-or-newer NVIDIA GPU;
-  same parameters and limits as `--svp` (except shaders >=21, which `SmoothFps_NVOF` ignores).
-* `--restore` runs the Real-ESRGAN detail pass per output frame, before the upscale (works with `--no-interp`).
-* `--upscale F` spatial upscale just before encode (bare = 1.5, clamp 16.0; above 8192 px auto-switches to
-  a CPU AV1/VVC encoder). `--rtx-vsr` uses RTX Video Super Resolution, else bicubic.
-* `--rtx-hdr` SDR→HDR10 (BT.2020 PQ) via TrueHDR; `--hdr-nits` mastering peak (400..2000, default 1000);
-  `--hdr-color` {`vivid` (default: source hue+chroma), `rtx` (SDK saturation, hue-corrected), `raw` (debug)};
-  `--hdr-mastering-prim` sets the `mdcv` gamut by name.
-* `--dv` additionally exports a **Dolby Vision Profile 8.1** MP4 (needs `--rtx-hdr`, HEVC, MP4 out, and
-  user-installed `dovi_tool` in `engine/dvtools`). See the Dolby Vision section below; GPAC-free.
-* `--hdr10plus` additionally embeds **HDR10+** (SMPTE ST 2094-40) dynamic metadata (needs `--rtx-hdr`,
-  HEVC, MP4 out, and user-installed `hdr10plus_tool` in `engine/hptools`); combinable with `--dv`. See
-  the HDR10+ section below.
-* `--out-bits` {`10` default, `8` legacy}; `--codec` {`hevc` default, `av1`, `vvc`}; `--no-passthrough` first-audio-only.
-* Per-frame order: (restore →) upscale → RCAS sharpen → TrueHDR.
 
-## How it works (key behaviour)
+Timing:
+* `<multi>`: integer multiplier. `--fps TARGET` resamples to any output rate at fractional
+  timesteps (`<multi>` is still required positionally, then ignored).
+* Real source frames pass through on-grid at full quality; only the tweens are generated.
+* Identical-pair passthrough: a pair whose two decoded frames are BYTE IDENTICAL is passed
+  through instead of interpolated, because there is no motion in it to draw. The model is
+  skipped for that pair and every tween slot carries the real frame's own processed output, so
+  a paused source or a held cel comes back exactly instead of carrying the model's synthesis
+  noise. The test is exact equality on the decoded bytes (on the captured tensors live), never
+  a threshold: a pair that differs by a single bit (grain, encoder noise, a near-identical
+  drawing) is interpolated like real motion, and frame counts, timing and pacing are unchanged
+  either way, so the source's own timing is preserved as before. A render that held a pair
+  prints `static pairs held: N` on stderr at the end, the live host appends `static=N` to its
+  stats line;
+  `SMV_NO_STATIC_HOLD=1` disables the whole thing for measurement. DLSS 4.5 is the one model
+  without it: its host is stateful across pairs (skipping a send would desynchronise the frame
+  it interpolates from) and it already returns the held frame on an identical pair.
 
-**Interpolation.** On the default `--multi` path every real source frame passes through at its integer
-timestamp at full quality, and M-1 AI-generated tweens are inserted between each pair (`--fps` resamples to
-an arbitrary rate off the source grid). Keeping the real frames on-grid is deliberate (2026-07-05): a
-bracket blend `inference(f[k-1], f[k+1], 0.5)` would skip the real frame's pose, and interpolating two
-already-generated tweens would double-fade it, so the frames we already have are kept at max quality.
-Duplicate / near-duplicate frames are interpolated the same as real motion (no held cels), so the source's
-own frame timings are preserved exactly.
+Models (GMFSS is the default, the anime specialist):
+* `--rife`: Practical-RIFE 4.26 heavy, the recommendation for live action. TRT-engined like GMFSS.
+* `--rife-drba`: RIFE with DistanceRatioMap timing ("Preserve anime pacing"): pans smooth fully,
+  character motion keeps closer to its original cadence. Renders on the uniform grid for integer
+  multipliers too; the first window after a start or resume seam falls back to plain RIFE.
+* `--lsfg` "Frame Blend": the cheapest true interpolation. RIFE's IFNet pyramid gives the flow
+  and mask, and the two frames are warped and merged at the processed size, no refinement; it
+  runs on the plain RIFE engines. `--scale` shrinks the whole pipeline (Image scale).
+* `--nvof` "NVIDIA Optical Flow (direct)" (2026-09-21): the driver's optical-flow hardware through
+  `nvofapi64.dll` (System32, opened by full path, nothing bundled; the MIT interface headers are
+  vendored in `engine/live/build_src/nvofa`) run by `smv-live.exe` itself. One Execute per pair
+  gives both fields (grid 4, fast preset, gray8 luma of the two frames, temporal hints off), the
+  fields and the cost are upsampled bilinear, a metric `-0.1 * cost - 1.0 * |F01 + F10|` (forward
+  backward consistency) weighs the tween, a PULL warp with a confidence fallback (since the
+  2026-09-21 fix round, chosen by eye against SVP, Smooth Motion and GMFSS): the velocity of both
+  frames is splatted to time t (softmax by that metric, fixed point 2^40), its gaps are filled by
+  a push-pull pyramid, both frames are SAMPLED along it (weighted by time and by visibility), and
+  where the vectors are untrustworthy (log of the mean landing weight from -5 down to -9, the
+  mask blurred 6 px) the output fades to the plain blend, so failed vectors show as ghosting,
+  never as speckle (the first cut, a forward splat of the colours, shredded fast non-rigid
+  motion into speckle; every warp built on the same vectors did, the fallback is what fixed it).
+  NATIVE HOST ONLY, torch-free, no
+  engine to build: integer `<multi>`, Sharpen, the upscale (bicubic or RTX VSR, image scale
+  included), Restore, DLSS 5 and RTX HDR run in the host's pass chain (2026-09-22 / 09-23), the
+  `--fps` mode is refused with its reason
+  (`render_plan.nvof_refusal`), there is no python route. Identical pairs pass through held like
+  every model. Quality: clean on moderate motion, ghosting where fast non-rigid motion defeats
+  the vectors (record: SMV work order "Native NVOF model as a separate checkbox beside SVP";
+  kernels fp64-gated by the dev harness `nvof\warp\nvof_equiv.py` and `nvof_equiv_e.py`, the
+  product route checked against the harness by `product_vs_harness.py`). Plane order: the live
+  planes are (B, G, R), the offline route's (R, G, B); the luma kernel is told which.
+* `--fruc` "NVIDIA Smooth Motion": NvOFFRUC on the Optical Flow hardware (Turing through
+  Blackwell). Lower quality, ghosts on fast motion, inherent to the model. Needs `NvOFFRUC.dll` +
+  `cudart64_110.dll` in `engine/nvoffruc` from the Optical Flow SDK zip (the GUI installs them).
+* SVP (`--svp` / `--svp-nvof`, live `svp` / `svpnvof`, svpflow from a local SVP 4 install in the
+  runtime's VapourSynth) was REMOVED 2026-09-21 so the app no longer depends on SVP 4, SVP Manager
+  or VapourSynth; `--nvof` is its replacement. To bring it back, revert the commit "remove the SVP
+  models" (it restores the sources and the last `smv-live.exe` with SVP live), reinstall
+  `vapoursynth==79` into the runtime if it is gone, rebuild the live host and rerun the gates.
+* `--dlssg` "NVIDIA DLSS 4.5": DLSS Frame Generation through `dlssg2f.exe` (RTX 40 / 50). With
+  RTX passes or `--dlssnr` the render runs as two passes (frame generation first, then the
+  per-frame passes); `--scale` applies to pass 1 and the post-fold `--upscale` to pass 2.
 
-**Output.** Always visually lossless (no quality knob). HEVC by default (`hevc_nvenc`; CPU `libsvtav1`
-fallback with no NVENC), AV1 (`av1_nvenc`) or H.266/VVC (`libvvenc`, CPU) selectable. 10-bit by default
-whatever the source depth, so the float-precision interpolated frames never band gradients (a dark-gradient
-clip carries 281 luma levels at 10-bit vs 70 at 8-bit). Source colour signalling (matrix/transfer/
-primaries/range) is carried through with `setparams`. Every audio, subtitle, chapter and font track is
-copied (output auto-switches to `.mkv` when the tracks need it); HDR-into-MKV keeps the full HDR10 metadata
-via a two-stage finalize.
+Per-frame passes, in order: Restore, interpolate, upscale, DLSS 5, RCAS sharpen, TrueHDR.
+* The Flow scale control (`--flow-scale`, the motion estimation alone at 50 % / 25 %, 2026-09-14)
+  was REMOVED 2026-09-25: GMFSS at 25 % wobbled static frames (GMFlow at a 256x128 grid) and
+  lost small fast objects at 50 %; the flag is now refused. The re-add recipe, the pre-removal
+  file snapshot and the reverse patch are in `D:\AIStuff\smv-flowscale-removal\README.md`
+  (outside the repo).
+* `--scale F` (the Image scale slider): scales the whole pipeline. The decode-side downscale chain
+  shrinks the video (linear-light spline36 `zscale`), every model processes the small
+  frames, and the upscale pass restores the output size (RTX VSR eligible). Reduced sizes build
+  engines at small shapes; the stall watchdog is the net there.
+* `--restore`: Real-ESRGAN anime-video model per output frame, before the upscale (a generative
+  repaint; cleans compression noise, can flatten fine texture; about +50% wall at 2x 1080p).
+* `--upscale F`: bare = 1.5, clamp 1/16..16; above 8192 px auto-switches to a CPU AV1 / VVC encoder
+  with a fail-closed RAM preflight (true 16K needs about 54 GB free). `--rtx-vsr` uses RTX Video
+  Super Resolution for upscales, otherwise bicubic. Downscales (F below 1) are folded into the
+  decode, so the models run directly at the output size and the upscale pass becomes identity.
+* `--dlssnr`: DLSS 5 Neural Rendering per output frame at the output resolution, DLAA (scaling
+  ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
+  Default / Natural (default) / Cinematic looks (DLSSNR.Style; measured 2026-09-12: same cost, 0 is
+  the lightest touch, 1 the smoothest, 2 keeps the most detail; Intensity stays 1.0, the runtime
+  clamps it there and drifts below it). Needs the runtime in
+  `engine/dlssnr`, otherwise the frame passes through with a notice. About 10 ms per 1080p frame
+  on the RTX 5090 Laptop, about 25 ms with the pipe transport. A host that dies is restarted once,
+  then the pass is disabled for the rest of the render. Coexists with the RTX passes in one process.
+* `--sharpen S`: FSR RCAS at the output resolution (bare = 0.8; default 1.0 in the GUI). Lobe
+  limited to the neighbour min / max, one scalar per pixel for all channels, so no ringing or
+  colour speckle.
+* `--rtx-hdr`: SDR to HDR10 (BT.2020 PQ) through TrueHDR, fixed 1000-nit mastering peak, Display P3
+  `mdcv`, injected `mdcv` / `clli`. Colour is rebuilt in ICtCp from the source (TrueHDR rotates
+  hues even at Saturation 0, so its chroma is dropped and the source's transplanted). `--hdr-color`
+  `vivid` (default), `rtx` (SDK saturation, hue-corrected), `raw` (debug). `--hdr-saturation N`
+  (SDK 0..200, default 0 = matches the SDR source; the SDK's "neutral" 100 oversaturates),
+  `--hdr-contrast N` (0..200, default 100). Dynamic Vibrance: `--hdr-vibrance B` boosts muted
+  colours only, `--hdr-satboost S` (0..1) adds saturation on top; both hue-safe in ICtCp and
+  luminance-coupled.
+* `--dv`: adds a Dolby Vision Profile 8.1 RPU on top of the HDR10 render (HDR10-compatible
+  fallback). Needs `--rtx-hdr`, HEVC, MP4 out and `dovi_tool` in `engine/dvtools` (installed from
+  the GUI panel). Per-frame L1 is accumulated during the HDR render, then after encode: extract
+  HEVC, `dovi_tool generate` + `inject-rpu`, ffmpeg remux with audio, `dvvC` + HDR10 boxes written
+  in-engine. B-frames are disabled for DV renders (dovi_tool needs an Annex-B stream whose coding
+  order equals display order for an exact remux). Best-effort: any failure keeps the HDR10 file.
+  The preview does not change with `--dv` (the pixels are identical HDR10). Legal: `dvvC` is our
+  own code writing a public box format; the UI says "Profile 8.1 (experimental)", credits
+  dovi_tool and carries a non-affiliation disclaimer. Dolby and Dolby Vision are trademarks of
+  Dolby Laboratories; this project is independent and bundles no Dolby software.
+* `--hdr10plus`: SMPTE ST 2094-40 dynamic metadata measured per frame during the HDR render
+  (MaxScl, average maxRGB, a maxRGB percentile distribution from a 1024-bin PQ histogram), written
+  in the JSON layout `hdr10plus_tool` itself extracts, injected with the user-installed tool in
+  `engine/hptools`, remuxed with audio. Runs first so a following `--dv` passes the SEI through;
+  the two combine on one file. Same `-bf 0` rule, MP4 + HEVC only, HDR10 fallback.
+* `--no-interp`: re-encode at source fps with the passes only (no model loaded).
 
-**Encode quality.** Quality-first: professional-grade fidelity regardless of size, one standard at every
-frame rate (2026-07-10; the earlier high-fps CQ relief was removed under this policy). NVENC runs
-constant-quality VBR at max effort: **preset p7 + full-resolution multipass + rc-lookahead 1** (AQ + a
-small chroma-QP boost), with CQ values verified against a lossless 8K master: HEVC **CQ 17** (VMAF 99.78 /
-57.0 dB / SSIM 0.9986), AV1 **CQ 22**. The effort ladder is what moves quality now, CQ is saturated at max
-effort (HEVC CQ 14 to 21 encode byte-identically): measured on the 1080p sample, the ladder lifts HEVC from
-50.8 to 53.5 dB (worst frame 49.3→52.3) and AV1 from 51.2 to 53.1 dB at modest size cost. The gain needs
-multipass and lookahead *together* (either alone measures ≈0), and shallow beats deep: depths 1/2/4 encode
-byte-identically and measure ~1 dB *better* than 8 to 32 (deep queues enable B-frame restructuring that
-trades fidelity for size, the wrong trade here) while using a single lookahead slot of VRAM. Above 120 fps
-output the queue is dropped entirely (on tween-dense streams any lookahead measured −1 dB, so high-fps
-renders get better fidelity and zero lookahead VRAM at once). `tune uhq` was evaluated and rejected: its
-temporal filtering rewrites frame content.
-VVC runs **QP 17** with perceptual QP adaptation always off (QPA trades fidelity in "unnoticed" regions for
-size, and inverts outright on 120+ fps tween streams); the SVT-AV1 fallback runs **CRF 17 preset 6**. The
-`SMV_CQ` env var overrides any CQ for measurement work.
+Output:
+* Always 10-bit, always visually lossless, no quality knob. `--codec hevc` (default, `hevc_nvenc`,
+  CPU `libsvtav1` fallback without NVENC), `av1` (`av1_nvenc`), `vvc` (`libvvenc`, CPU).
+* NVENC: constant-quality VBR at max effort, preset p7, full-resolution multipass, rc-lookahead 1,
+  HEVC CQ 17, AV1 CQ 22 (verified against a lossless 8K master; CQ is saturated at max effort, the
+  effort ladder is what moves quality, and shallow lookahead beats deep). Above 120 fps output the
+  lookahead queue is dropped (it measured worse on tween-dense streams). `tune uhq` rejected (its
+  temporal filter rewrites content). VVC QP 17 with perceptual QP adaptation off; SVT-AV1 CRF 17
+  preset 6. `SMV_CQ` overrides any CQ for measurement work.
+* `--enc-speed fast` (GUI "Encoder speed: Fast") swaps preset p7 for p4 and keeps the multipass and
+  CQ. Measured 2026-09-12 on three clips (fast 1080p, clean 1080p anime, 4K; harness
+  `enc_fidelity.py` in the live dev tree): HEVC 2.2x (1080p) to 2.9x (4K) the encode rate, AV1 1.3 to
+  1.4x (its multipass dominates), at the same file size for 0.1 to 0.5 dB average PSNR, up to 0.7 dB
+  on the worst frame. The multipass is the
+  fidelity carrier (dropping it costs 2.5 dB on the worst frame of clean anime) and p1 loses about
+  2 dB, so only p4 with multipass is offered. It pays where the encoder sets the pace: `hevc_nvenc`
+  at the quality tier tops out at about 197 / 101 / 27 fps at 720p / 1080p / 4K on the RTX 5090
+  laptop, so RIFE at 720p and 1080p 2x and every 3x+ render wait on it; GMFSS is model-bound and
+  gains nothing. AV1 at the same effort encodes 1.4 to 1.6x faster than HEVC. CPU encoders ignore
+  the tier.
+* Every audio, subtitle, chapter and font track is copied (`--no-passthrough` keeps first audio
+  only); the output auto-switches to `.mkv` when the tracks need it, and HDR into MKV keeps the
+  full metadata through a two-stage finalize. Source colour signalling rides through `setparams`.
+* Renders write `<name>.part.<ext>` and promote by atomic rename at success, so a cancelled or
+  crashed render never leaves a truncated file or destroys the one it replaces.
+* VFR sources (average rate disagrees with the container rate by more than 0.5%) decode at the
+  constant average rate (`-fps_mode cfr`) so duration and audio sync hold; a notice is logged.
+* `SIZE cur projected` rides beside each PROGRESS heartbeat for the GUI's size estimate; a one-time
+  warning fires when the projection exceeds the free space on the output drive.
+* GMFSS renders are bit-deterministic on both the TRT and eager paths (softsplat accumulates in
+  int64 fixed point, cudnn benchmark off); `smoke.py --full` asserts it. The RTX passes are NGX
+  black boxes with no determinism contract, so HDR / VSR renders are outside that guarantee, and
+  TRT-path RIFE renders differ run to run at the PSNR level.
 
-**Size projection + disk check.** During a render the engine emits `SIZE cur projected` beside each
-PROGRESS heartbeat (bytes written so far, linearly extrapolated), so the GUI shows the expected final size
-next to the ETA within the first minutes of a long render. A one-time warning fires early when the
-projection (doubled for the HDR-into-MKV two-stage, whose temp and final coexist) exceeds the free space
-on the output drive.
+## Live mode
 
-**Upscale + RTX.** `--upscale` to any resolution up to 16K (RTX VSR, or bicubic fallback). Past 8192 px
-NVENC/HEVC can't encode, so the engine probes CPU encoders at the output size and auto-switches
-(SVT-AV1 → VVC), plus a **fail-closed RAM preflight** (true 16K needs ~54 GB free; the CPU encoders keep
-dozens of large frames in flight). RTX HDR is a real HDR10 master: 10-bit BT.2020 PQ + injected
-mastering-display / content-light metadata, with source-faithful (cyan-free) colour rebuilt in ICtCp
-(TrueHDR itself rotates hues even at Saturation 0, so its chroma is dropped and the source's is transplanted).
+`engine/live/smv-live.exe` (C++ / D3D12) captures a window or monitor with Windows.Graphics.Capture
+and presents interpolated output through a click-through topmost overlay placed over the target.
+Dev home for its source is a separate repo synced into `engine/live/build_src` (`smv-live.cpp` plus
+five `smv-live-*.inl` parts, see the build section below).
 
-**Dolby Vision (`--dv`).** Layers a **Profile 8.1** RPU on top of the HDR10 render, HDR10-compatible, so
-non-DV players fall back to HDR10 (mdcv/clli) and DV displays read the dynamic metadata. **GPAC-free**: the
-one external tool is `dovi_tool` (open source, user-installed in `engine/dvtools` via the UI's "Dolby Vision"
-panel); the RPU is muxed by the bundled ffmpeg and the DV configuration box (`dvvC`) is written in-engine by
-`hdr10_meta.inject_dv_config` (same ISOBMFF surgery as the HDR10 boxes, the LGPL ffmpeg can't emit `dvvC`
-itself). Flow (`_dv_export` in render.py): during the HDR render `rtxvideo.run_hdr` accumulates **per-frame
-L1** (min/avg/max PQ brightness), near-free, reusing the MaxCLL reduction, and only when `--dv` is set, then
-after encode: extract HEVC → `dovi_tool generate` (one L1 shot/frame) + `inject-rpu` → ffmpeg mux with the
-audio → inject `dvvC` + HDR10 fallback boxes. **B-frames are disabled (`-bf 0`) for DV renders**: dovi_tool
-needs an Annex-B elementary stream, and a raw-HEVC→MP4 copy assigns non-monotonic DTS with a reorder buffer
-and silently drops the tail frames; no B-frames ⇒ coding order = display order ⇒ exact remux + 1:1 RPU
-alignment. Requires HEVC + MP4 out; skipped with a notice otherwise. Best-effort, any failure keeps the
-HDR10 file. Legal note: `dvvC` is our own code writing a documented public box format (no Dolby/GPAC source,
-no patented processing), so the exposure is only the "Dolby Vision" **trademark**, the UI labels it
-"Profile 8.1 (experimental)", not "certified", credits dovi_tool, and carries a non-affiliation
-disclaimer (also in the README). Dolby and Dolby Vision are trademarks of Dolby Laboratories; this
-project is independent, not affiliated with or endorsed by Dolby, and bundles no Dolby software. The before/after preview does **not** change with `--dv`: the base pixels are
-identical HDR10; the DV difference is display-side tone-mapping we can't (and shouldn't) simulate.
+Backends: `dlssg` (Streamline DLSS Frame Generation, fixed 2x..6x, RTX 40 / 50, NVIDIA's pacer
+presents real + generated frames) or the native host (`rife`, `rifedrba`, `gmfss`, `blend`, `fruc`,
+`nvof`, `echo`), which runs every model inside the exe. Until priority 22 (2026-09-21) these were
+the "server route" through `engine/live_server.py` on the bundled runtime; that file and its python
+classes are DELETED (git history has them), and the paragraphs below that name `live_server.py` or
+a python class describe where the host's logic was ported from.
+`nvof` (NVIDIA Optical Flow direct, 2026-09-21) was the first model with no python class: the host
+answers its handoff with the geometry alone (`engine=nvof`, the Image scale applies, no pad), runs
+the Optical Flow session at the model size plus the splat kernels, and every live effect incl.
+Restore rides the shared store chain.
+`SMV_LIVE_NVOF_PROF=1` prints the pair's GPU time (luma + Execute + upsample + metric) and the mean
+tween GPU time every 64 pairs and at teardown.
+`rifedrba` is the DRBA sub-option live: the three-frame window needs the frame after the centre, so
+the picture trails the capture by exactly one source frame (handshake `lag=1`, folded into the
+latency stat), windows are cached by centre frame and chained like the offline loop, and the first
+groups fall back to plain pair RIFE, then to the lagged real frame, until the history holds four
+frames; HDR capable like rife. `rifedrba` runs in the native host like every
+live model: the handoff is the RIFE one plus
+`NATIVE-PATH block0=` / `block0jit=`, the `calc_flow` block0 as its own engine (timestep 0.5 and
+the first pyramid scale baked, fp32 in and out, validated against the eager block0 like the encode
+engine; a failure refuses the handoff), `engine=drba lag=1` on the ready line; the torch-free
+fast path finds it warm like the RIFE engines. The
+exe keeps a four-frame ring of padded frames and their encodes, builds the windows with block0
+plus four kernels (`k_drbaFlowSplat` / `k_drbaFlowNorm` = the rest of `calc_flow`,
+`k_drbaDrmSplat` / `k_drbaDrmNorm` = `calc_drm_rife(linear=True)`, fp64-gated), chains them like
+the python class, runs one IFNet enqueue per tween with its own DRM timestep map, holds the lagged
+pair on an exact static test and reports the one-capture lag in the latency stat. A handoff
+without the block0 engine or `lag=1` is refused. `blend` is Frame Blend's live twin (the RIFE
+engines under its own name). `fruc` is Smooth Motion's live twin: the NvOFFRUC bridge warps at
+any fraction of a pair, so it is adaptive like rife / gmfss (it takes the Image scale too); it is HDR
+capable like rife (the bridge quantises the PQ-encoded frames to 8-bit for the flow and the warp, so
+the tweens carry 8-bit PQ precision while the real frames stay full precision; the SDR capture of an
+HDR-presented window would be 2-3x over-bright instead), and a pair skipped by adaptive smoothness
+is fed to the bridge once (result dropped) so NVIDIA's temporal hints stay consecutive. The
+host answers its handoff with the geometry (Image scale, the /64 pad the bridge instance is
+sized to, `engine=fruc`) plus `NATIVE-PATH fruc=` (the `engine/nvoffruc` folder, or
+`SMV_NVOFFRUC_DIR`), and the exe loads `nvoffruc_bridge.dll` from there and drives the same flat C
+API the ctypes class uses: the model planes packed to BGRA8 by the VSR bridge's `k_packBgra`, one
+`nvoffruc_interpolate` per tween, `k_unpackBgra` back, the same skipped-pair priming. The host
+feeds FRUC true BGRA. A missing bridge / NvOFFRUC / cudart DLL refuses the session and names
+the file. `echo` is
+the effects-only route: no interpolation model ticked in the app sends
+it, the captured frames pass through at their own rate and the live effects (Restore, sharpen,
+Upscale to, RTX VSR, RTX HDR, DLSS 5) apply to each of them (with no effect on it is a bit-exact
+passthrough, the transport test).
 
-**HDR10+ (`--hdr10plus`).** Embeds **SMPTE ST 2094-40** dynamic metadata into the HDR10 render, measured
-per frame during `rtxvideo.run_hdr` (per-channel MaxScl, average maxRGB and a maxRGB percentile
-distribution, computed from a 1024-bin histogram of the 10-bit PQ codes, near-free like the DV L1 pass;
-`collect_hp`). After encode, `_hp_export` extracts the HEVC, writes the metadata JSON in the layout
-`hdr10plus_tool` itself extracts from real masters (Profile A, per-frame SceneInfo; luminance in 0.1-nit
-units; DistributionValues = [p1, p99.98, bright-pixel fraction, p25..p99]), injects the SEI with the
-user-installed **hdr10plus_tool** (`engine/hptools`, same one-tool install flow as dovi_tool) and remuxes
-with the audio. The SEI rides inside the samples (no container box needed), so HDR10+ runs FIRST and a
-following DV export passes it through, which is why `--dv --hdr10plus` can coexist on one file. Same
-`-bf 0` rule as DV (exact raw-ES remux), MP4 + HEVC only, best-effort with HDR10 fallback. Trademark note:
-the app never claims certification; metadata is produced by the third-party open-source tool.
+Live DLSS 5 (`--dlssnr --nr-structure F --nr-tone F --nr-style N`, since 2026-09-12): ONCE per captured frame
+in the SDR domain at the window size, before the image-scale resize and the model, so the
+generated frames inherit the pass (the TrueHDR-at-capture doctrine). NATIVE since the same
+evening: `smv-live.exe` links the NR core (`engine/dlssnr/build_src/nr_host.cpp`, `nr::Host::startupOn`
+on the exe's own D3D12 device) and runs the pass on the shared capture texture between the D3D11
+capture copy and the fence signal, so every server backend and the native RIFE host inherit it
+with no protocol change and the server is never told `--dlssnr`. Ordering is GPU-only (a second
+shared fence orders the D3D11 copy before the NR queue, which signals the capture fence with the
+same sequence number; D3D11 waits on that value before the next copy). SDR captures hand the
+sRGB-encoded values to the model unchanged; HDR captures use the `_nr_scrgb` math (scRGB normalised
+by the SDR reference white, inverse sRGB EOTF, model, sRGB EOTF back, pixels with any channel above
+SDR white untouched), then live TrueHDR expands the result as before. Exe log line
+`live DLSS 5 native: on, WxH per captured frame inside the overlay host, ...`. Measured 2026-09-12
+on the RTX 5090 laptop, RIFE native, target 60, 720p window (below GPU saturation, overlay
+parked): baseline latency ~24 ms, native pass ~26 ms, the python route ~45 ms; 1080p: native
+20.5 captured -> 55 presented at ~111 ms, the python route 21 -> 42 at ~196 ms (`harness\nr\nr_ab.ps1`,
+`nr_native.ps1`). Falls back to the PYTHON route (the offline `dlssnr.DLSSNR` host over pipes, D2H,
+eval, H2D, 34 ms per frame at 1080p, 17 ms at 720p) with one log line when the runtime is missing,
+the capture is above 3840x2160 (the largest size the host was probed at: 36.9 ms per eval, so a 4K
+window caps near 27 captured fps), the zero-copy capture is unavailable, or `SMV_LIVE_NR_NATIVE=0`
+(the A/B switch). The DLSS-G route
+never runs it (the NR host starves DLSS-G). KNOWN LIMIT: full-scale 1080p RIFE plus live RTX HDR plus DLSS 5 saturates this GPU and
+the native pipeline stalls into the watchdog instead of dropping frames; image scale 0.5 or a
+lower target runs clean.
 
-**Failure-safe output (`.part`).** Every render writes to `<name>.part.<ext>` and promotes it with an
-atomic rename only at success, so a cancelled, crashed or failed render can never leave a silently
-truncated file at the final path or destroy an existing good file it was about to replace. The GUI
-deletes the `.part` remnant after a Cancel.
+LIVE RUNS THE PASS NON-TEMPORALLY (2026-09-14): Reset is sent on EVERY evaluate, native route
+(`const bool reset = true` in `smv-live-capture.inl`) and python route alike (`dlssnr.DLSSNR(...,
+reset_every=True)`, which adds the host flag `--reset-every`; the host logs `resetEvery=1`). The
+feature reprojects its temporal history with motion vectors, depth and a per-frame jitter offset,
+and the host binds NONE of them ("MVec, Depth and ControlMask are deliberately not set" in
+`nr_host.cpp`), so kept history has nothing valid to reproject by and identical captured frames
+came back out different: on a PAUSED 2560x1440 mpv window, 14 of 58 presented frames differed from
+the one before, 95.6% of the pixels moved between two of them, and the dark areas swung 0.83% of
+their mean, which reads on screen as the dark parts sliding back and forth. With reset on every
+evaluate the pass is a pure function of the captured frame: the same measurement gives 0 of 58
+native, and python is stable from the third frame (one startup frame still differs, max pixel
+0.043 against 0.338 before). The control with `--dlssnr` off was bit-identical across all 59
+frames both times, so the drift was this pass alone. Harness: `harness\nr\nr_static_drift.ps1`
+(parked session + a probe of our own overlay) and `nr_drift_analyze.py` (per-frame difference,
+phase-correlation shift, dark-region mean). OFFLINE renders still accumulate (`render.py` builds
+the host without the flag): their frames always differ, so it has never shown there, and changing
+it would change shipped render output.
 
-**VFR sources.** When a source's average frame rate disagrees with its container rate (`avg_frame_rate`
-vs `r_frame_rate`, >0.5%), the stream is variable-frame-rate (phone clips, screen recordings) and the
-container rate is usually the useless max instantaneous rate; the engine then decodes at a constant
-average rate (`-fps_mode cfr`) and derives all output timing from it, so duration and audio sync are
-preserved (a notice is logged).
+CLI:
+```
+smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
+  --backend NAME --gen N --target FPS --scale 0.01..1 --fit fill|monitor --sharpen S --rtx-vsr --upscale H --restore
+  --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --rtx-hdr
+  --vsync --no-clickthrough --no-hud --no-adapt --park --native --resident --diag S
+smv-live.exe --list            capturable windows as 0xHWND<TAB>title
+smv-live.exe --testsrc [ms|cycle]   verification source (100 ms = 10 fps; 16 for perf; cycle ramps 10/30/60/30)
+smv-live.exe --synth           no-capture diagnostic
+```
+`--gen`: server backends 1..15, dlssg 1..5. `--fg` targets the current foreground window (the
+app's hotkey and countdown use it). Exit codes: 2 unsupported GPU, 3 multi-frame limit, 4 target
+resized or moved monitor (the app auto-restarts, cap 20), 5 `--fg` target not capturable, 6 stall
+(the watchdog killed a wedged server; the app revives the same config).
 
-**Restore.** `--restore` runs Real-ESRGAN's anime-video model per output frame to clean compression noise
-and redraw linework (a generative repaint, it targets cel-style anime and can flatten fine texture).
-~+50% wall at 2× 1080p; runs through the same per-resolution TensorRT cache as the GMFSS sub-nets.
+A resize is debounced: on the first size change the overlay hides and the HUD switches to the
+"loading ... model" note at once, the exit 4 comes only after the client size has held for 1 s
+(`SMV_LIVE_RESIZE_SETTLE_MS`), so a drag costs one engine build at the final size, not one per
+intermediate size. The same applies while the model is still loading (the load loop watches the
+client size). A session that ends during the native engine load (the hotkey toggled off, or that
+load-time resize) ends within milliseconds and leaves the python engine build running in the
+background: the engines still land in the cache, the resident host stays for it, and the next
+handoff waits for it (one builder at a time) instead of starting a second one.
 
-**FSR sharpen.** AMD FidelityFX **RCAS** at the output resolution crisps the softer generated tweens; on by
-default at 1.0. It limits its lobe to the neighbour min/max (no overshoot/ringing), eases off in noisy
-regions, and applies one scalar per pixel to all channels (so it can't decorrelate them into colour speckle).
+How the server route works:
+* Zero CPU touches between capture and present. The WGC frame is GPU-copied into a shared D3D11
+  texture + fence whose handles ride the child's command line (`--captex`); python imports both
+  through raw cudart and reads frames straight into CUDA. Results compose on the GPU (upscale,
+  RCAS, same order as a render) into a shared D3D12 buffer in VRAM (`--outbuf`) which the exe
+  presents from directly through a three-allocator ring. If the VRAM import is declined the slots
+  fall back to a host shared-memory mapping (`--shm`), which crosses PCIe twice per frame.
+* Slots stream individually: the exe sends per-group fractions, python answers a token per slot the
+  moment its copy lands, and the exe presents on arrival, paced from the capture cadence with a
+  minimum spacing of 0.95 refresh intervals (QPC waits, floor chained from the scheduled time). The
+  next pair is handed over mid-present, so the server never idles. Handshake acks (`captex=1`,
+  `outbuf=1`, `stream=1`) gate each optimization with full fallbacks.
+* Adaptive smoothness (default): output frames are generated at the target grid's timestamps, so
+  the presented rate pins to the target while the multiplier follows the content; the grid marches
+  on an EMA pair clock with a 1.5-step outlier snap for drops and seeks. `--no-adapt` = fixed
+  multiplier (what the smoke cases assert).
+* Slot sizing: the exe measures the source rate at startup and sizes the per-pair slot ring at
+  `ceil(target / source * 1.15) + 2`, clamped by the VRAM budget (logs MEMORY-CAPPED). The slot
+  count is a hard ceiling on the presented rate; the startup line reads `slots N (target T, source
+  S fps measured over X s)`.
+* HDR: on an HDR display every backend runs in HDR (`SMV_LIVE_HDR` overrides): FP16 scRGB
+  capture, R10G10B10A2 BT.2020 PQ present. Server backends convert in python, `dlssg` inside the
+  exe (DLSS-G requires RGB10 HDR10). The RTX HDR checkbox applies live too: the exe
+  forwards `--rtx-hdr` plus the colour knobs and the monitor's SDR reference white, and each real
+  frame is expanded with the same TrueHDR bridge and ICtCp correction as a file render. An
+  HDR-presenting source window clips at SDR white, so live RTX HDR is for SDR sources.
+* Mid-session Speed or Image scale changes send `lv-restart`: the exe is killed and respawned on
+  the same window (700 ms debounce, not counted against the restart cap). `src/main.ts` learns the
+  window handle from the exe's `target window: hwnd=0x... "title"` line, parsed from complete lines
+  only (a split stderr chunk once yielded a truncated handle and a respawn on a window that did not
+  exist). Hotkey (`--fg`) mode has no other source for the handle, so that line must never fail to
+  print: the title goes out as UTF-8 through `wideToUtf8` and `%s`, never `%ls` (the CRT formats
+  `%ls` through the C locale, `vsnprintf` returns -1 for a title carrying an en dash or a CJK
+  character and `logWrite` drops the whole line, which cost a hotkey session its resize revive on
+  2026-09-16). The same rule holds for every log line carrying a window title or a file path.
+* Image scale on live: `_img_dims` shrinks the model dims (even, 64 px floor), the capture is
+  downscaled on upload, and `_Fit` upscales the compose back to the canvas (VSR eligible).
+  Echo ignores the slider. A changed value restarts the session.
+* GUI: every interpolation checkbox works live since 2026-09-12 (DRBA as `rifedrba`, Smooth Motion
+  as `fruc`); nothing falls back silently any more.
 
-**Deterministic renders.** The GMFSS path is bit-deterministic: the same command produces a
-byte-identical output file, run after run, on both the TensorRT and eager paths (verified by md5;
-`scripts/smoke.py --full` asserts it). Two changes made this true (2026-07-09): softsplat's forward
-splat accumulates in **int64 fixed point** (integer addition is associative, so thread scheduling
-can't reorder a float sum; this was the single nondeterministic stage, isolated by a per-stage
-bit-exactness probe), and `cudnn.benchmark` is off with deterministic algorithm selection (benchmark
-mode could pick different conv algorithms per process). Output differs from the old float-atomics
-kernel by ~1e-4 max (82 dB, the old kernel's own run-to-run jitter level). Cost: the int64
-accumulator doubles the splat's memory traffic: invisible at 2x, roughly +15% inference time at
-very high multipliers. The RTX passes (VSR/TrueHDR) are NVIDIA NGX black boxes with no determinism
-contract, so HDR/VSR renders are outside the byte-identical guarantee.
+Offline native route (WO-32): a RIFE or Frame Blend x2 .. xN or `--fps` render and a `--no-interp` render run inside `smv-live.exe --offline`. Frame Blend runs
+on the plain RIFE engines with the same flags (the crossfade escape went with python in step 8); `--no-interp` passes
+the exe `--no-interp --cache DIR`, its no-engine mode (live's `echo`): every decoded frame is one
+real frame through the passes, or its bytes unchanged with none, PROGRESS counts frames
+(2026-09-23, harness `offline\gate_step3.py`). A GMFSS x2 .. xN render runs there too (`--gmfss`,
+2026-09-23): the live host's five-engine chain (`nativeGmfssPair` on every frame, the flow only
+for a pair that makes tweens, then `nativeGmfssTween` per tween), the engines found warm or built
+from `engine\onnx` by `lkOfflineGmfss` with the live names; real frames match python's route bit for bit, tweens within a 16-bit mean of about 15.
+DRBA (`--rife-drba`) runs there too (`--drba`, 2026-09-23): `render_loops.drba_loop`'s offset
+grid (every output interior, N x multi frames) on live's lag-1 windows (the history ring, the
+block0 engine `lkOfflineBlock0` finds or builds, the DRM kernels); pair (k-2, k-1) goes out once
+frame k is in, the first pair's f < 0.5 and the last pair's f >= 0.5 are plain pair RIFE, an
+identical pair holds its frame per side, the closing slot repeats the last output. Its distance
+to the fp32 eager render is within 5 % of python's route (harness `offline\gate_drba.py`).
+Smooth Motion (`--fruc`) runs there too (`--fruc`, 2026-09-24): live's nvoffruc bridge path
+(`lkOfflineFruc` checks the bridge folder, `SMV_NVOFFRUC_DIR` or `engine\nvoffruc`, and its three
+DLLs; `render.py` checks the same files by name and exits with the python route's message when
+one is missing), sized to the /64 pad of the source, every frame packed to true BGRA from the
+offline R, G, B planes, one bridge warp per tween, never a reset; an identical pair is held and
+not fed to NvOFFRUC, and the next pair gets no priming warp, python's call sequence (harness
+`offline\gate_fruc.py`). `--fps` mode runs there for every one of these models (2026-09-24):
+`render.py` hands `--fps-ratio` (its ratio as `repr`, so the host parses the same double) and the
+host renders `render_loops.fps_loop` (DRBA: `drba_loop`) on the same `_pair_fracs` grid in the
+same double arithmetic: every output an interior slot, zero or more per pair, one tween per
+enqueue (the unbatched RIFE class), no real frame passing through, a held pair's slots the frame
+itself, the closing slot repeating the last output (a source whose pairs made no slot sends its
+last frame once). RIFE and Frame Blend keep python's `t <= 0` rule (the left frame, no engine
+call), DRBA its `t == 1` rule (the centre frame); a pair without slots is not fed to NvOFFRUC
+and primes nothing (harness `offline\gate_fps.py`).
+DLSS 4.5 (`--dlssg`, x2 .. x6) runs there too (`--dlssg`, 2026-09-24): the host starts
+`engine\dlssg\dlssg2f.exe --server` itself (`SMV_DLSSG_DIR` overrides the folder; `render.py`
+checks the exe and the six Streamline / NGX DLLs by name first), the child inheriting only its
+three pipe ends and its stderr lines forwarded to the log; every frame goes to it as RGBA8 at
+the /64 pad (`k_packBgra` on the offline planes, `dlssg.py _send`'s rounding), each pair's
+generated frames come back through `k_unpackRgba` (x / 255, as `_recv`), real frames pass
+through as on every on-grid route, no identical-pair hold (`hold_ok` excludes DLSS). `dlssg.py`'s
+recovery rule moved with it: a transfer blocked over 10 s (1 s while paused) kills the child, a
+failed pair restarts it (3 s apart, re-primed with the left frame) up to 4 times, then the host
+exits 4 and `render.py` makes it python's resumable stop (the progress banked, `DLSS_PREEMPTED`,
+exit 1, the part files kept; exit 3 = the multiplier is beyond the GPU). Output matches the
+python route bit for bit (harness `offline\gate_dlssg.py`; the failure paths through a stub
+server, `offline\gate_dlssg_restart.py`). With an RTX pass or DLSS 5 the two-pass split stays,
+both passes now native.
+`render.py` keeps the
+probe, the ffmpeg decode and encode commands, PROGRESS / OUTFRAMES and the finalize, and the exe takes the decode pipe as stdin and feeds the encode
+pipe on stdout (pack-in, Head encode, batched IFNet, pack-out, `k_expand8to16` for real frames of
+8-bit sources). The exe finds, builds and warms its own engines (2026-09-22, `lkOfflineRife`):
+x2 = the unbatched IFNet, xN = the fixed batch class `_b{N-1}` built from the shipped `_bd8` ONNX
+with the batch axis pinned (bit-exact with the torch-exported `_b{B}` build, harness
+`offline\gate_b.py`), plus the Head encode engine, all at the /64 pad of the source; a build
+takes about 1 s per engine, a warm start reads the warm marker, a batched build that runs out of
+memory writes `.nofit` and falls back to the unbatched engine. A harness can still hand engines
+over with `--ifnet --encode --jit --ph --pw --batch`. The per-frame passes run in the exe
+too (2026-09-22, `nativeOfflineEmit`, python's render_passes order on every output frame: Restore,
+back to the working size when RTX VSR follows, else folded straight to the output size; the
+resize, RTX VSR or clamped bicubic, only ever an enlarge since a downscale folds into the decode;
+RCAS; then to_bytes' quantisation): `render.py` passes `--out-w --out-h --rtx-vsr --sharpen S
+--restore` and loads none of those passes itself, the host builds the Restore engine from
+`engine\onnx` when it is missing. The offline planes are R, G, B (live's are B, G, R), so VSR
+gets its own pack kernels. RTX HDR runs there too (2026-09-23, `nativeOfflineThdr`, python's
+`rtxvideo.run_hdr` last on every output frame at the output size, the vivid / rtx / raw colour
+modes and Dynamic Vibrance with live's kernel math): `render.py` passes `--out-pixfmt x2rgb10le
+--rtx-hdr` plus the colour knobs and `--hdr-stats <work>.hdrstats.json` (with `--hdr-dv` /
+`--hdr-hp` when the DV / HDR10+ export is on), decides HDR from the bridge files alone (importing
+`rtxvideo` would import torch), and hands the finalize the file's MaxCLL / MaxFALL, DV L1 triples
+and HDR10+ records in place of the `RTXVideo` object. The host computes them per frame on the GPU
+(`k_thdrOut`: a 1024-bin maxRGB code histogram, per-channel max codes, the linear maxRGB max and
+sum) and a failed TrueHDR eval fails the render, as python's does. Gate: harness
+`offline\gate_hdr.py` (real frames within one yuv code on under 2 % of samples = fp32 rounding
+order against torch). A render that used the RTX Video bridge ends the resident host after
+the item (NGX is single-instance per process; the next render spawns a fresh host). DLSS 5 runs
+there too (2026-09-23, `nativeOfflineNr`, after the resize and before RCAS like `render_passes`):
+`render.py` passes `--dlssnr --nr-structure --nr-tone --nr-style` when `nvngx.dll` and
+`nvngx_dlssnr.dll` are in `SMV_DLSSNR_DIR` / `engine\dlssnr` (importing `dlssnr` would import
+torch), and the host runs the NR core with `dlssnr.exe`'s own bring-up (`nr::Host::startup` on a
+private D3D12 device made from the System32 DLLs, not Streamline's interposer; `renderFrame`
+through its upload / readback staging) on one RGBA16F frame per output frame, `dlssnr.py`'s fp16
+clamp and rounding on the way in and out, Reset on the first frame only (offline accumulates,
+live does not). A held pair's slots carry the real frame's finished bytes without a second NR
+call (python's `out_cur`), with RTX HDR the frame's statistics record repeated. A runtime that
+cannot start drops the pass with `[dlss5] unavailable, skipping`, a failed evaluate drops it for
+the rest of the render; NGX prints to the process stdout, so a one-shot host moves its frame
+output to a private handle first; NGX has no teardown, so the host leaves through `ExitProcess`
+and a resident host ends after the item. `--nr-delta PATH` (2026-09-24, the preview's change
+mask) writes the pass's own change per pixel, the largest of `|after - before|` over R, G, B
+(`before` = its fp32 input, `after` = its clamped fp16 output, `preview.py`'s measure), as float32
+at the output size (the last frame's). Gate: harness `offline\gate_nr.py` (with Reset on every
+frame on both sides, `SMV_NR_RESET_EVERY=1` and a python wrapper, real frames bit-exact against
+`dlssnr.exe`; in the product's temporal mode too on the plain case). FIXED the same day on
+both routes: `renderFrame` mapped `RowPitch * rows` of the readback buffer, but a copyable
+footprint does not pad the LAST row, so every output width that is not a multiple of 32 failed
+its first frame ("readback Map failed") and the render ran on without DLSS 5 (the 854-wide
+smoke copy never applied it); the range is now `RowPitch * (rows - 1) + row bytes`, as
+DLSS5-NeuralScreen's readback does, and `dlssnr.exe` was rebuilt. Measured
+against the python route on the same renders (harness `offline\gate_passes.py`, lossless
+encodes): real frames equal or within 202 of 65535 on Sharpen, the upscale, VSR and Restore;
+python folds Restore's fp16 output in fp16 where the host folds in fp32 (mean 6.2, a harness
+wrapper forces python to fp32 for the comparison), and VSR spreads a single one-LSB input change
+over about 6% of its output, which bounds the Restore then VSR cases. This route is
+torch-free (2026-09-12): `render.py` binds `torch` and `torch.nn.functional` to a lazy proxy that
+imports on first attribute access, and every module-level torch touch (cudnn flags, the inference
+stream, `rcas` / `realesr`, the post-handoff `empty_cache`) is gated on `TORCH_FREE`, so a warm
+native render never pays the 1.4 s `import torch`: 5.8 s to 4.5 s per 720p job of 239 frames,
+`-X importtime` shows no torch module (harness `lazy_torch_measure.py`). Any other route imports
+torch where it always did; `SMV_TORCH_TRACE=1` prints the stack of the first touch. Resume and
+banking work on that route too (2026-09-24, priority 24 step 6d): the same fragmented part file,
+sidecar and `_try_resume` mapping as the python route; the decoder starts at the resume source
+frame and `render.py` tells the host `--resume-pair P --resume-out C --resume-drop D` (the render's
+index of its first decoded frame for the `--fps` grid and the closing slot; the banked output
+count for PROGRESS / OUTFRAMES; the outputs this run would repeat, dropped at each emission point
+before any pass: on-grid the pair's real frame plus its banked tween slots, `--fps` and DRBA the
+banked slots), plus `--skip-in N` when a VFR source cannot be pre-skipped by the decoder. An RTX HDR
+render passes `--hdr-frames <work>.hdrframes.txt`: the host appends and flushes one statistics
+line per output frame, so a resumed render reads the banked frames' MaxCLL / MaxFALL, DV L1 and
+HDR10+ records back from it (the python route decodes the banked video through its TrueHDR object
+instead). A resumed render matches the uninterrupted one frame for frame (harness
+`offline\gate_resume.py`: pause, kill, resume, resume again), except by design at the seam:
+DRBA's seam window is plain pair RIFE, FRUC and DLSS 4.5 restart their streams. The pause file
+works (`--pause-file`, the partial preview included). The GUI's progress thumbnail: with
+`SMV_LIVE_PREVIEW` set, native.ts passes `--thumb <png>.raw` (+ `--thumb-off` for the Hide flag);
+the writer thread drops a small copy of the frame it writes about once a second (at most 480 rows,
+2x2 taps per block, the output pixfmt) and logs `THUMB`, and native.ts turns it into the PNG
+(preview.ts's display math; a TrueHDR output is self-anchored). `SMV_OFFLINE_GRAPH=1` turns TensorRT-RTX graph capture
+on for it (off by default). Measured 2026-09-05 through render.py against the python route: per pair
++9% at 480p, +6% at 720p, +3% at 1080p, +16% at 4K, 2.3x at 120p, about 2.5 s more startup per render;
+real frames bit exact, tweens within the TensorRT class of the eager model.
 
-**Preview / batch / live.** A before/after pane runs the same passes on a single frame (click for 1:1
-pixels); a batch queue renders picked/dropped files back to back; a ~1/s live thumbnail shows the graded
-output frame during a render (near-zero render cost, a producer/worker split keeps the render thread only
-snapshotting).
+Resident offline host (2026-09-12): the exe of that route stays alive between renders as
+`smv-live.exe --offline --resident --pipe NAME` with the TensorRT runtime, the engines, the JIT cache
+and the kernel module loaded (the same per-process cache as the resident live host, about 300 MB of
+VRAM idle), so a later render of the same size and multiplier pays only the execution contexts
+instead of the process start plus the engine load. `render.py` finds the host through the control
+pipe `\\.\pipe\NAME` (the app sets `SMV_OFFLINE_HOST_PIPE` to one name per Electron process, a CLI
+run derives `smv-offline-<hash of the exe path>`), spawns it detached when there is none, sends one
+item as `start<TAB>--w<TAB>...` (the `--offline` flags minus `--offline`), waits for `offline pipes
+ready`, opens `\\.\pipe\NAME-in` as the decoder's stdout and `\\.\pipe\NAME-out` as the encoder's
+stdin, sends `go`, and reads every log line of the item (PROGRESS, OUTFRAMES, `offline host ready`,
+`resident engines reused, contexts recreated in X s`) until `offline done: exit N`. A render that
+takes any other route, a live session start and app exit send `quit` to an idle host (its VRAM goes
+to what starts); the host also quits itself after `SMV_OFFLINE_RESIDENT_IDLE_S` seconds idle
+(default 600). A busy host (another render on it, or a cancelled render's ffmpegs still draining)
+answers nothing: the render then runs a one-shot exe as before, and the host leaves on its idle
+limit. `SMV_OFFLINE_RESIDENT=0` keeps one exe per render; `SMV_OFFLINE_HOST_LOG=<file>` collects the
+host's own stderr (it has no console). `scripts/smoke.py` renders the RIFE native case twice and
+expects the second to reuse the host's engines, then quits the host at the end.
 
-## Performance
-fp16 + a cupy softsplat kernel is the base (~2.2× over the original fp32 path). The **TensorRT** backend
-(the five sub-nets as strongly-typed fp16 engines, built and cached per resolution on first use) adds
-~2.2× end to end, numerically matching. A 2026-06 code audit found the pipeline **GPU-compute-bound** at
-its practical limit on this hardware: I/O and host-sync changes are perf-neutral, batching the per-timestep
-nets doesn't help (FusionNet saturates at batch 1), and fp8 fails a quality gate (GMFlow's flow range
-overflows e4m3 → 61 px outliers). `torch.compile` and dynamic-shape engines were both ruled out (shipping a
-JIT compiler breaks the no-deps promise; `grid_sample` has no dynamic-ONNX path). Two non-regressing
-cleanups were kept: GPU-side transposes and a single shared CUDA stream with no per-call TRT sync.
-A 2026-07 re-audit confirmed the compute-bound conclusion and closed calibrated FP8 with data
-(FusionNet: no speedup; GMFlow: 1.3x but with disqualifying flow outliers). The two wins that DID
-land: flow is estimated at an automatic resolution-appropriate scale (4K renders near 1080p cost,
-see `--scale`), and the engine warns at startup when the GPU's power limit sits below its board
-default (a laptop Silent profile can cost 2-3x wall time; the pipeline is power-bound before it is
-anything else).
+Native host = the ONLY live route since 2026-09-21: every model except DLSS 4.5 (Streamline, its
+own path) runs inside the exe, the engine models through the TensorRT-RTX C++ runtime. No python
+process is part of a live session and `engine/live_server.py` is deleted; `--native` and
+`--python` are still accepted and ignored, and the live-only levers `SMV_LIVE_NATIVE`,
+`SMV_LIVE_TRT=0` and `SMV_NATIVE_LOOKUP` / `SMV_NATIVE_BUILD` no longer exist
+(`SMV_RIFE_BATCH` still acts on OFFLINE renders).
+A session the host cannot start ends on its reason line (log: `native host: <reason>`, then
+`this session cannot start in the native host`; the app keeps the reason on the status line); a
+refused native DLSS 5 pass (above 3840x2160, `SMV_LIVE_NR_NATIVE=0`, no zero-copy capture) runs
+the session WITHOUT DLSS 5 and logs `live DLSS 5 skipped for this session: <why>`.
 
-The **RIFE** backend is engined the same way: its whole IFNet forward (including the interleaved
-`grid_sample` warps) exports to one strongly-typed fp16 engine per resolution, while the cheap
-feature-head calls stay eager. Measured 1.54× end-to-end on a 60s 1080p 2× render (59s vs 90s
-eager), numerically matching the eager path (output-vs-output PSNR ~60 dB / SSIM 0.999). Like GMFSS
-it pays a one-time per-resolution build, so `--no-trt` can win for a single one-off.
+The engine handoff (`nativeHandoff` in `smv-live-native.inl`) gives a session its geometry and
+engine paths as `NATIVE-PATH` lines plus one `LIVE READY native=1` line (`SMV_HANDOFF_DUMP=1` logs
+them). `lkSession` derives everything both of its halves need from the session's arguments (the
+folders, the Image scale, the padded sizes, the GMFSS net table, the RIFE engine names),
+so the lookup and the build cannot disagree on a name:
+* The lookup (`nativeLocalHandoff`) is `engine/trt_lookup.py`'s naming, weights hashes and find
+  checks in C++ (the engine names are shared with offline renders). Engines that exist AND carry
+  the warm marker for the size answer at once (log: `warm engines found by the host, no python
+  process`); nvof, fruc and echo have no engine and answer with geometry only (fruc checks its
+  bridge folder and three DLLs). Live Restore adds the Real-ESRGAN engine at the model size plus
+  its `.jit`, for every backend.
+* On a miss the host BUILDS the engines (`nativeLocalBuild`, on a worker thread): from
+  `engine/onnx` with the old python builder's settings (strongly typed, optimization level 5,
+  workspace `SMV_TRT_WORKSPACE_GB` x the per-graph multiplier) through the delay-loaded ONNX parser, the
+  `.nofit` rule on an out-of-memory batched build, a warm-up of every batch size with a fresh
+  runtime cache (EAGER specialization), then the `.jit` and the warm key; the lookup must then
+  hit. It covers rife / blend, gmfss, rifedrba (the RIFE pair plus block0) and Restore (`restore_<hash>_dth`, fp16 input, no
+  warm marker). Output-identical to python's build from the same file (harness
+  `onnx\gate_3c2.py`, `onnx\gate_3c3a.py`). A session that ends mid-build leaves the build
+  running while the resident host stays alive; an engine file is written whole or not at all.
+* `smv-live.exe --lookup-probe <engine folder>/live_server.py <backend> <outW> <outH> <capW>
+  <capH> <image scale>` prints the lookup's lines (or `MISS`); the path is a marker
+  for the engine folder, the file need not exist. A change to the naming or the geometry is gated
+  by dumping the probe over a config matrix before and after (harness `onnx\probe_dump.py`).
 
-The engine backend is **TensorRT for RTX** (`tensorrt_rtx`) as of 2026-07. It does **not** change
-interpolation throughput - measured unchanged across four A/B runs on the 1080p 2× loop (within 0.4%;
-the pipeline is GPU-compute-bound regardless of the TRT build). What it changes is the first-render
-cost and footprint: the per-resolution engine build drops from ~75-100 s to ~1-11 s (hardware-agnostic
-AOT + a fast on-device JIT), the TensorRT libs shrink to ~0.2 GB (from ~2.2 GB), and the AOT engine is
-GPU-portable. `trt_runtime.py` drops to eager if `tensorrt_rtx` is absent.
+Everything but the output ring
+starts on its own thread before the source-rate measurement (it needs only the capture size):
+the runtime DLL load, the handoff (with the CUDA device init and the capture import in parallel
+on a helper thread), then the kernels, the buffers, the engine deserialize, the jit caches (the
+IFNet's and the encoder's, merged into one) and the execution contexts; the log lines are `engine handoff started during the source-rate
+measurement` and `early init done`, and the warm start measures ~2.55 s instead of ~3.1 s
+(the measurement is fully hidden, the remaining time is capture setup, the handoff and the
+engine load itself). With live RTX HDR on, the TrueHDR bridge setup and its warm-up eval
+(~0.6 s) run on a helper thread beside the engine load (HDR warm start ~2.8 s instead of
+~3.35 s). The compute thread then imports the output ring (sized from the measured slot
+count) and starts serving. A stop signals the stall watchdog's event, so `srv.stop()` no
+longer waits out the watchdog's one-second sleep (native-route stop ~0.08 s instead of ~1 s).
 
-## Constraints
-* **CUDA 13 (Blackwell, sm_120):** torch is the cu130 build; cupy-cuda13x finds the runtime via
-  `cuda-pathfinder`, so the old `_add_cuda_dll_dirs` nvrtc shim is no longer load-bearing. Note cupy's
-  NVRTC kernels only compile once **torch has been imported first** (it primes the CUDA DLL search path
-  for `nvrtc-builtins64_133.dll`); `render.py` already imports torch before cupy.
-* **Python 3.14 + custom `tensorrt_rtx` bindings:** NVIDIA ships `tensorrt_rtx` wheels only up to
-  cp313, so the module in the runtime is our own pybind11 build (`engine/trtrtx_bindings/`), covering
-  exactly the API surface `trt_runtime.py` uses. Extending `trt_runtime.py` to new `trt.*` calls means
-  extending `bindings.cpp` too. Swap back to the official `tensorrt-rtx-cu13` wheel once NVIDIA
-  publishes cp314 bindings.
-* **RTX bridge:** keep the **cu12**-built `rtxvideo_cuda.dll` and ship `cudart64_12.dll` beside it, NGX's
-  static import lib is CUDA-12-ABI, so a bridge relinked against CUDA 13 crashes in `create()`
-  (see "Building the native bridges" below).
-* **Runtime:** keep `engine/runtime` a relocatable python-build-standalone install, never a `venv`.
-* **Renderer:** uses `require('electron')` with `nodeIntegration`, so it can't run in a plain browser,
-  launch via `npm start`, the shortcut, or the vbs.
+Resident host (`--resident`, passed by the app on every server-backend session; `SMV_LIVE_RESIDENT=0` on the app
+restores one process per session): after a native RIFE session ends, the exe stays alive with the
+TensorRT runtime, both engines, the JIT cache and the kernel module loaded (about 270 MB of VRAM,
+the execution contexts and every buffer are freed) and reads one command per line from stdin:
+`start<TAB>--hwnd<TAB>0x...<TAB>--backend<TAB>rife ...` (the next session's arguments, tab separated,
+the same tokens the command line takes), `stop` (ends the running session, exit 0) and `quit`. Where
+a one-shot run exits, the resident host prints `live session ended: exit N, host resident (... kept,
+idle limit S s) target=0x...` and `main.ts` treats that line as the exit code (the exit 4 / 6 revive
+and the settings restart go through it too). The trailing `target=` field (present once a session
+resolved a window) is the revive's fallback source for the handle when no `target window:` line
+reached the app. The next session on the same window skips the python handoff entirely (`engine handoff
+skipped, same window as the resident session`) and recreates only the two execution contexts
+(`resident engines reused, contexts recreated in X s`); a different window size runs the handoff,
+drops the old pair (`resident engines released`) and loads the new one. Measured 2026-09-12 on the
+960x540 testsrc: native host ready 0.78 s from the `start` line against 2.55 s for a fresh process.
+The host exits on its own after a session it cannot keep (an error exit, DLSS-G, native DLSS 5, the
+TrueHDR bridge, no engines loaded), when stdin closes, and after `SMV_LIVE_RESIDENT_IDLE_S` seconds
+idle (default 600); the app quits it when another model starts or is selected in the panel and at
+app exit, and kills it when a `stop` gets no answer within 3 s (a stop during a cold engine build
+lands only when the session loop starts).
 
-## Releasing
+Resident python server (2026-09-13 to 2026-09-21, REMOVED with the python route in priority 22; kept as history): a GMFSS, blend, DRBA, FRUC or
+effects session on the resident host PARKS its `live_server.py` instead of ending it. The exe ends
+the session with the token `0xFFFFFFFF` on the server's stdin (not EOF); the server finishes the
+group in flight, releases its transport (the mapping, the capture and output imports, the NT
+handles), answers the same token on stdout, prints `live server parked (resident host)` and waits
+for one text line: `start<TAB>tokens` (the next session's command line after the script path, the
+exe duplicates the new capture, fence and output handles into it first) or `quit`. torch, the CUDA
+context and, when the backend arguments are unchanged (everything but gen and `--mult`), the loaded
+model stay: `resident backend reused` (measured 2026-09-13 on the 960x540 testsrc: GMFSS LIVE READY
+0.82 s from the `start` line against 3.8 s for a fresh server with warm engines); a different backend
+or effect set is rebuilt in the same process (`resident backend released`, about 1 s less than a
+fresh server, the torch import). The mapping name carries a per-session counter (`smvlive_<pid>_<n>`).
+A native RIFE start releases the parked server, a GMFSS / blend start releases parked native engines
+(user rule: nothing of another model idles in VRAM); RIFE with effects keeps the engines. Never
+parked: a session that exits the process anyway (native DLSS 5,
+the TrueHDR bridge), a stalled or failed session, the byte-path transport. A parked server after live
+RTX HDR takes only the identical session again (NGX is single-instance). The host prints what
+it keeps in the `live session ended` line (`engines`, `a running engine build`). The exe deserializes
+both engines, imports its own capture texture, fence and output ring into CUDA, JIT-builds five small
+kernels with NVRTC (cached as a cubin next to the TRT cache), and feeds the unchanged present loop.
+HDR and live RTX TrueHDR run natively too (the exe loads `engine/rtxvideo/rtxvideo_cuda.dll` by
+full path and drives the same C ABI `rtxvideo.py` uses). DLSS 5 runs natively too (on the capture
+texture, see the live DLSS 5 paragraph above). Sharpen and RTX VSR run natively too (2026-09-15):
+the slot store mirrors `live_server.py`'s compose order, RTX VSR through the same bridge entry
+point (`rtx_video_api_cuda_evaluate_vsr_deviceptr`, 8-bit in and out, model size to the presented
+size, one host-synchronous eval per presented frame, the same python rules: SDR sessions only, and
+only when the fit enlarges in both axes, else bicubic with a log line) or the bicubic fit into a
+planar staging frame, then `rcas.py` ported verbatim into the NVRTC kernels (`k_rcasOut` /
+`k_rcasOutHdr`) as the slot store; the log lines are `native: live sharpen: FSR RCAS S at the
+presented resolution`, `native: live upscale: RTX VSR WxH -> WxH` and `sharpen=native` / `vsr=native`
+on the `native host ready` line; the equivalence gate is `harness\eff\rcas_equiv.py` (the exe's
+kernel source compiled with cupy against torch bicubic + `rcas.py`: fit within 4e-7, stores off by
+one in 0.001% of bytes), the live gate `harness\eff\eff_native.py`. A downscaling fit (a window
+larger than the monitor in Fill screen) runs natively too (2026-09-15): `k_fitAaH` / `k_fitAaV` are
+torch's `interpolate(mode='bicubic', antialias=True)` as a separable pair into the staging frame
+(the PIL-style A = -0.5 kernel, support 2 x scale on a shrinking axis, window maths in double
+because an fp32 tap centre drifts 1e-4 at output index 2500), then the plain or the RCAS store
+1:1 from that frame; the log lines are `native: fit: WxH -> WxH, antialiased bicubic (downscale)`
+and `fit=native-aa`; gate `harness\eff\fitaa_equiv.py` (within 1e-6 of the fp64 filter; torch's
+own fp32 route sits up to 1.2e-4 from it) and the `fitdown_*` cases of `eff_native.py`. Upscale to
+runs natively too (2026-09-15): the host derives the internal render size from its own `--upscale H`
+exactly like `_Fit.__init__` (factor clamp 1/16..16, even dims, dropped when it equals the fit
+rect), resizes the model frame there first (RTX VSR when it enlarges and VSR is on, else the
+bicubic kernels, the antialiased pair when it shrinks) into a second planar frame, then fits that
+to the presented rect (the antialiased pair when the fit shrinks, else `sampleOut`'s bicubic in the
+slot store); real frames go through the store like the python route (no bit-exact passthrough with
+an effect on); the log lines are `native: live upscale to: model WxH -> WxH first, then 1:1|fit to
+WxH` and `upscale=native`; gate `harness\eff\upto_equiv.py` (the two-stage chain within 5e-5 of
+`_Fit._upscale` run in fp64, the stores off by one in under 1% of bytes, plus a 9596-height sweep of
+the size derivation against the python expression) and the `upto_*` cases of `eff_native.py`. Restore
+runs natively too (2026-09-15): `--restore` rides on the handoff line, so the python handoff builds and
+warms the Real-ESRGAN TensorRT engine into the shared cache and hands its path over like the IFNet's
+(`NATIVE-PATH restore=` / `rjit=`, the restore kernels merged into the shared jit cache); the host
+runs it on every presented frame first (`k_restIn` = torch `.half()` of the cropped model frame, one
+`enqueueV3`), then folds the 4x output to `_Fit._load_restore`'s target: back to the model size when
+RTX VSR follows (so VSR sees the restored frame), else straight to the internal render size or the fit
+rect (`k_restFoldH` / `k_restFoldV` = the antialiased pair with `out.clamp(0,1)` folded into the taps,
+or `k_restToF` + `k_fitPlanar` + `k_clamp01` when the target enlarges beyond 4x); the resident host keeps
+the restore engine beside the RIFE pair per path; the log lines are `native: live restore: Real-ESRGAN
+animevideov3 (TensorRT) at WxH -> WxH` and `restore=native`; an eager restore pass (`SMV_LIVE_TRT=0`)
+or an engine refusal mid-run drops the pass with one line (python's rule). Gate
+`harness\eff\restore_equiv.py` (the fold within 4e-7 of `realesr.fit` in fp64 on the shared engine
+output; python's own fp16 fold sits about 1e-3 from it) and the `restore_*` cases of `eff_native.py`.
+The session stays model-bound: measured before the port (`harness\eff\restore_share.py`), the python
+route's wall per group equalled its own GPU-event span at 1080p and 540p, so the port removes the
+python process, not milliseconds. Frame Blend and the effects-only route run natively too
+(2026-09-15): live `blend` is `live_server.py`'s Rife class under its own name (the same engines, the
+same handoff and fast start), and `echo` (no
+model ticked) runs the host's no-engine mode: the handoff answers with the geometry only (`engine=none`,
+`NATIVE-PATH cache=` for the kernel cubin, the Real-ESRGAN engine when Restore is on; without Restore
+it is torch-free on every start), no IFNet or encode engine is loaded, and every group stores its one
+real frame through the same effects chain (Identity's rule: an empty adaptive group presents nothing,
+any other group exactly one frame), `engine=none (effects only)` on the `native host ready` line. The
+Measured against the python route at 1080p 24 fps, target
+1000: identical picture (PSNR 72..78 dB SDR, 66 dB median HDR), +37% presented fps at image scale
+0.25, +13% at 0.40, 27..43% less process CPU.
 
-The zip is ~4.4 GB, which exceeds GitHub's 2 GiB release-asset cap, so binaries live on SourceForge
-and GitHub carries the release page (notes + `.sha256`). The ceremony:
+GMFSS on the native host is in progress (full native migration item 5). Sub-step 5a (2026-09-15)
+taught both handoffs the `gmfss` backend: `engine=gmfss` on the LIVE READY line, the five engines of
+`live_server.Gmfss` (feat_ext, the fused bidir GMFlow, metricnet, the GMFSS IFNet, fusionnet) as
+`NATIVE-PATH gfeat= gflow= gmetric= gifnet= gfusion=` plus their `<key>jit=` caches (merged into the
+host's shared cache), `trt_lookup.find_gmfss_engines` for the torch-free start (warm marker on the
+fusionnet jit). The host loads and warms the set (one enqueue per engine on zeros, the tensor contract
+logged per engine) and keeps it resident like the RIFE pair (one model set at a time: a switch frees
+the other). Sub-step 5b added the glue kernels to the host's
+NVRTC block (the 5c chain below launches them):
+`k_half` (the 2x2 box halves of both frames as adjacent planes), `k_pyr` (the per-pair flow and metric
+pyramids at 1/2 and 1/4), `k_splatSoft` (softsplat.py's int64 fixed-point forward with the 'soft'
+mode's `exp(s * Z)` products formed on the fly in fp32; the target position and the corner weights in
+double, since the fp32 `x + s * flow` python forms is one ulp = 6e-5 px off at x ~ 600..960) and
+`k_splatNorm` (the `acc / (accN + 1e-7)` tail into the fusionnet input planes). The gate is
+`harness\eff\gmfss_equiv.py`: the kernels compiled from the host source with cupy against the exact
+maths in fp64 on real-motion inputs through the real engines, plus a quantized-flow control where the
+accumulators must match softsplat.py's own kernel bit for bit.
 
-1. Bump `version` in package.json, commit and push.
-2. `npm run dist` → `release/SmoothMyVideo-<v>-win.zip` + `.sha256` (staging folder auto-cleans),
-   then `git archive --format=zip -o release/SmoothMyVideo-<v>-src.zip HEAD` for the source snapshot.
-3. Upload BOTH zips to SourceForge (web UI caps at 500 MB, use SFTP; create the `<v>` folder on the
-   Files tab first, scp does not mkdir):
-   `scp release/SmoothMyVideo-<v>-win.zip flowreen@frs.sourceforge.net:/home/frs/project/smoothmyvideo/<v>/`
-   then on the Files tab mark the new win.zip as the default Windows download (the ⓘ icon).
-   The src.zip is not optional: SF hosting is "solely for Open Source software development" and a
-   binary-only project on a fresh account was removed without notice (2026-07-11, the original
-   1.0.0 project vanished 1-2 days after creation; recreated with MIT license category, GitHub
-   homepage, full description AND the source zip alongside the binary).
-4. Tag `v<v>` on the release commit and push the tag (Sourcetree: right-click → Tag → "Push tag").
-5. Create the GitHub release for the tag: paste the notes, attach the `.sha256`.
+Sub-step 5c (2026-09-16) wired the chain and opened the route, so gmfss is a native backend like rife:
+the app passes `--native` on a GMFSS session (Smooth Motion has had its own `fruc` live backend
+since 2026-09-12, native since 2026-09-21), the sub-step 5a lever `SMV_LIVE_NATIVE_GMFSS` is
+gone, and `native host ready` reads `engine=gmfss`.
+`nativeGmfssSetup` reads the contract off the five engines (channel counts, dtypes, every shape) and
+allocates the chain's buffers from it, so a set that does not match is refused with the tensor named.
+`nativeGmfssPair` runs per group: feat_ext of the new frame (the previous group's output IS this
+pair's feat0, the same reuse the RIFE route does with the encode, so one feat_ext per group instead of
+python's two), then, when the group interpolates, `k_half` on both frames into one six-plane buffer,
+the bidir GMFlow, metricnet and `k_pyr` x4 (both flow directions in one launch, both metrics in
+another). `nativeGmfssTween` runs per tween: the two image splats into the fusionnet's `a` planes 0..2
+and 6..8, the GMFSS IFNet straight into planes 3..5, the six feature splats into `b` / `c` / `d`
+(a channel concat is adjacent planes, so nothing is copied), the fusionnet, and `k_restToF` as
+python's `clamp(out, 0, 1)`; the result rides the shared storeSlot chain, so Sharpen, RTX VSR,
+Upscale to, Restore, TrueHDR and the fit work exactly as on the RIFE route. The pyramids are built
+once per pair and the timestep is applied by the splat (`interp(t * flow) * 0.5` equals
+`t * (interp(flow) * 0.5)`). One accumulator buffer serves all eight splats (they are sequential on
+the one stream): `max(C) + 1` planes of the half, 276 MB at 960x540 and 986 MB at 1920x1080 for the
+whole chain. Gates: the seven `gmfss_*` cases in `harness\eff\eff_native.py` (plain, sharpen, Upscale
+to, RTX VSR, Restore, TrueHDR, plus the python control; all on the 10 fps testsrc, since a GMFSS group
+is 31 to 41 ms on both routes) and `harness\eff\gmfss_share.py`'s `*_nat` cases for the rate.
+Measured against the python route (parked 60 fps testsrc, consumed groups per second): 960x540 gen 1
+31.5 vs 30.0, gen 3 18.0 vs 15.8; 1920x1080 gen 1 6.8 vs 7.5, gen 3 4.5 vs 4.5. `SMV_LIVE_GMFSS_PROF=1`
+prints the per-phase CUDA-event breakdown every 32 groups (`feat_ext | half | flow | metric | pyr`,
+then the four tween phases) plus a `[gmfss-cpu]` line with the QueryPerformanceCounter enqueue cost of
+the pair block, of the gmflow enqueue inside it and of one tween (1080p gen 1, 2026-09-16: flow 86.3
+of a 92.9 ms pair, tween 38.5 ms of GPU for 0.17 ms of CPU, so no per-tween CUDA graph is needed);
+`SMV_LIVE_GMFSS_GRAPH=0` drops TRT-RTX's whole-graph strategy for the set (measured 2026-09-16
+on 1.6.1.120: no difference, the python route runs these engines without it too).
 
-The tag is what installed copies compare against (`checkForUpdate` in main.ts), so publishing the
-GitHub release is what lights up the in-app "new version" notice for existing users. **Never re-upload
-different code under an existing version**: the version string is baked into the zip, the checksum
-stops matching, and same-version installs never see the update notice. Fix-ups ship as a patch version.
+Sub-step 5d (2026-09-16) ran a Flow scale below 100 on the native GMFSS route (gmflow at a /32
+flow grid, `k_shrinkAaH` / `k_shrinkAaV` / `k_flowUp`); it left with the Flow scale control on
+2026-09-25. The GMFSS warm marker key keeps its `{ph}x{pw}|0x0` form (the `|0x0` was the flow
+grid at 100 %) so every warm marker written before still matches.
 
-**Retention policy: keep the latest and one previous zip on SourceForge; delete older ones.** The
-previous build is the rollback/diagnostic escape hatch when a new release misbehaves on some setup;
-anything older is disk hygiene. New users always get the newest build (the README button and
-SourceForge's default download resolve to it), and GitHub release pages (notes + checksums, a few KB)
-are kept forever so the changelog and hashes survive even for pruned binaries.
+Harness rules for unattended perf runs: `--park` (bypasses the alt-tab pause), `--no-hud`,
+`--no-adapt`; `-WindowStyle Hidden` only on the live process; the HUD and overlay are excluded
+from capture, so `--diag` GDI dumps see through them. Throttle equilibrium is noisy run to run:
+three runs per config, deltas under about 5% mean nothing. Never graph-capture a TRT enqueue.
 
-## Linting & formatting
-All dev-only, all in `node_modules` (never shipped, `dist` bundles only `dist/`, `renderer/`, and the
-`engine` extraResources, not `node_modules`). Deliberately a **light touch**: the engine Python and the
-renderer's inline JS are intentionally dense (long lines, `x; y` one-liners, load-bearing comments), so
-nothing reflows them, only `src/*.ts` is auto-formatted.
-* **Prettier** (`.prettierrc.json`) formats `src/**/*.ts` only. `.prettierignore` guards `engine/`,
-  `renderer/`, and build dirs so a stray `prettier .` can't reflow the hand-tuned files. Config matches the
-  existing style (single quotes, semicolons, 2-space, printWidth 120).
-* **tsc `--noEmit`** (in `npm run lint`) is the TypeScript bug gate: `strict` is on in `tsconfig.json` and
-  `src/` is a single procedural `main.ts`. ESLint/typescript-eslint were dropped 2026-07 to move to
-  TypeScript 7 (the Go-native compiler): typescript-eslint drives the old compiler's JS API and pinned
-  `typescript <6.1`. Re-adding a linter is worth revisiting if `src/` ever grows beyond the one file.
-* **pyright** (`pyrightconfig.json`) lints `engine/*.py` as a **linter, not a type checker**:
-  `typeCheckingMode: "off"` so the dynamic torch/numpy/cupy code isn't buried in type noise, only
-  high-signal checks stay on (undefined names → error, unused imports/vars → warning). Vendored
-  `runtime/`, `GMFSS_Fortuna/`, `trt_cache/`, and the RTX bridge are excluded from checking (`extraPaths`
-  still resolves the GMFSS model + local engine modules). No Python-side install needed, pyright runs from
-  npm. Ruff is a fine stronger alternative if you later install it (`uv tool install ruff`), but pyright
-  keeps everything in the one `npm install`.
+## Performance notes
 
-Note: `npm install <pkg>` rewrites `package.json` and re-expands its inline arrays (e.g. the `build.filter`
-list) to one-per-line; a plain `npm install` / `npm ci` leaves formatting alone. Re-inline by hand if it
-bothers you.
+* The offline pipeline is GPU-compute-bound on this hardware. I/O and host-sync changes are
+  perf-neutral, batching the per-timestep nets does not help, `torch.compile` is out (shipping a JIT
+  breaks the no-deps promise), calibrated FP8 is closed (FusionNet no speedup, GMFlow 1.3x with
+  disqualifying flow outliers). The engine warns at startup when the GPU power limit sits below the
+  board default (a laptop Silent profile costs 2..3x wall time).
+* TensorRT for RTX does not change interpolation throughput; it cuts the per-resolution engine
+  build from 75..100 s to 1..11 s and the libs from 2.2 GB to 0.2 GB. RIFE on TRT measured 1.54x
+  end to end at 1080p 2x (against the eager torch route, removed in step 8 with `--no-trt`).
+* Builder scratch ceiling 8 GB (`SMV_TRT_WORKSPACE_GB`, read by the host's builder).
+* One engine per resolution: every sub-net engine is pinned to the height and width that triggered
+  its build, so a new source or window size builds once (seconds to a minute per net) and is cached
+  forever. Only the live RIFE timestep batch axis is dynamic (1 to 8 tweens per enqueue, the range
+  is in the engine name). Dynamic-shape profiles were removed 2026-09-12: TensorRT sizes an
+  execution context for the profile MAXIMUM, which cost 8 GB of VRAM and a 3.5 s kernel-cache load
+  per 960x540 live session; the pinned engine takes 2 GB, loads in 1 s and presents 5 to 12% more
+  frames. One execution context serves every batch size (until 2026-09-13 the python live route,
+  since removed, loaded the same engine once per warmed batch size: eight contexts, 16 GB per RIFE
+  or Frame Blend session, 2.7 GB after its fix).
+* Flow always runs at the model's native half resolution, at every source size. The old flow
+  caps and auto-scaling were removed after an eyeball ladder showed reduced flow visibly degrades
+  2K / 4K motion; `--scale` is the one sanctioned speed lever.
+* GMFlow's per-pixel batched gemms are chunked at 61440 batches (`GEMM_BATCH_CHUNK` in
+  `matching.py`): CUDA caps `gridDim.z` at 65535 and TRT-RTX emits batched-gemm launches unguarded
+  past it, which made every enqueue fail from about 832x1472 up. Mathematically exact. A `gmflow`
+  engine cached by a pre-fix build shadows the fixed graph (names hash weights + shape, not the
+  graph); delete the cache folder to clear it. The EAGER path keeps that chunking; since
+  2026-09-21 the EXPORT path (`torch.compiler.is_compiling()`) writes both per-pixel products as
+  multiply + sum instead (no batched gemm, so no launch cap), the shifted-window rolls as explicit
+  slices, the window mask from arange comparisons and `normalize_coords` from scalar arithmetic,
+  so one ONNX with symbolic H / W can serve every size (the ONNX-in-exe work; a size-free graph
+  cannot hold a loop that unrolls by H * W). Measured against eager fp32 the new graph is closer
+  than the chunked one (mean 0.049 vs 0.057 px at 960x544), 1 to 8% faster, +3 to 5% engine
+  memory; a gmflow engine exported after this is not bit-identical to an older cached one.
+  `MetricNet.backwarp`'s export path builds its grid without `linspace` (whose length pins the
+  size) and splits every multiply from its add with a no-op `torch.maximum`: on the GPU TensorRT
+  would fuse them into one rounding where the per-size export's host-folded constant rounded
+  twice; split, the engine is bit-identical to the per-size one.
+* Bidirectional GMFlow: both flows from one call sharing the backbone, about 1.07x per pair. The
+  host runs only the `gmflow_bidir` graph; the sequential two-call fallback and its
+  `SMV_GMFLOW_BIDIR=0` lever went with the python route.
+* RIFE engines build at the true /64-padded shape. The 1152x640 safe-zone floor that the TRT-RTX
+  1.5 small-shape hang forced is off on 1.6.1 (bare-enqueue repros and live soaks clean);
+  `SMV_RIFE_SAFEPAD=1` (offline) and `SMV_LIVE_SAFEPAD=1` (live) restore it. Any TRT-RTX bump must
+  re-soak the small shapes before trusting the true-shape default.
+* TRT-RTX JIT kernels persist per engine as `<engine>.engine.jit` beside the engine. A shared cache
+  once grew to 325 MB and cost every TRT process about 16 s to load; `SMV_TRT_JIT_MAX_MB` (default
+  32, 0 = no cap) makes an oversized file start cold and be rewritten. The native live host
+  loads the IFNet's file and merges the encoder's into the same cache (the handoff's
+  `NATIVE-PATH ejit=` line); without the merge the encode context recompiled its kernels on
+  every first session of an engine pair (0.5 s of the warm start, measured 2026-09-14).
+* Live RIFE batching: the dynamic timestep axis enqueues a group at its true length
+  (`SMV_RIFE_BATCH` = 8 for the fixed B=8 engine, 1 for one enqueue per tween). TRT-RTX whole graph
+  capture is the live default (`SMV_TRT_GRAPH=0` disables; offline opt-in with `=1`); it cut live
+  enqueue CPU per tween by 49%. Gotcha kept from the dropped flow-warp class (2026-09-21, harness
+  `onnx\fwnan`): TRT-RTX 1.6.1.120 miscompiles an Expand of batch-1 inputs that feed both a
+  concat and a warp (wrong flow, stale-memory NaN slices); broadcast such inputs with a Tile
+  (`repeat`) on the export path. Plain RIFE's `_bd8` is not affected (1e-4 vs eager).
+* Cross-session fps comparisons lie (thermal drift): pair baseline and candidate back to back in
+  one session. A subset suite proves nothing about the regime it skips: ship loop, protocol or
+  batching changes only on the full smoke suite.
 
-Dev dependencies are pinned to caret majors (not `latest`) because `npm run setup` deletes the lockfile:
-with `latest`, a fresh setup after a major release would silently pull a breaking toolchain. TypeScript is
-on `^7` (the Go-native compiler) as of 2026-07; ESLint went away in the same move (see above).
+## Environment variables
 
-## Dev toolchain
-The dev machine has VS 2019 Build Tools (MSVC `cl.exe` 19.29) and VS 2026 Community (`cl.exe` 19.51) +
-the Windows 10 SDK, enough to build both native bridges below; the NGX SDK's entry points live in a
-static import lib (`nvsdk_ngx_s.lib`), so ctypes alone can't reach them (recipe in "Building the native
-bridges" below). Nothing that needs MSVC is bundled; a recipient still needs only the NVIDIA driver.
+All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 
-## Building the native bridges
+| Variable | Effect |
+|---|---|
+| `SMV_TRT_CACHE` | TRT engine cache location (default `engine/trt_cache_safe_to_delete`) |
+| `SMV_ONNX_DIR` | size-free ONNX folder (default `engine/onnx`) |
+| `SMV_TRT_WORKSPACE_GB` | builder scratch ceiling (default 8) |
+| `SMV_TRT_CACHE_KIND` | suffix for the JIT cache file (live sets `live`) |
+| `SMV_RIFE_SAFEPAD=1` / `SMV_LIVE_SAFEPAD=1` | restore the 1152x640 RIFE safe-zone pad |
+| `SMV_RIFE_FLOW_SCALE` | diagnostic live flow pyramid scale (power of two in 0.25..1.0, forces a cold engine) |
+| `SMV_RIFE_BATCH` | offline RIFE batching: unset dynamic, `8` fixed, `1` unbatched (live is always the dynamic class) |
+| `SMV_LIVE_XQPHASE=1`, `SMV_LIVE_XQ_CAPEV=1`, `SMV_LIVE_XQ_WAITCAP=1` | present-loop phase breakdown, event-driven capture probe, 1 ms wait cap (each about 0.4%) |
+| `SMV_LIVE_HDR` | force live HDR on or off |
+| `SMV_LIVE_RESIDENT=0` / `SMV_LIVE_RESIDENT_IDLE_S` | one `smv-live.exe` per live session instead of the resident host / the resident host's idle limit in seconds (default 600) |
+| `SMV_LIVE_TEARDOWN_TRACE=1` | one log line per session teardown stage (reader, present queue, server, capture, host); for a Stop that hangs |
+| `SMV_LIVE_RESIZE_SETTLE_MS` | how long the target's client size must hold before a resize ends the session with exit 4 (default 1000, 100..10000) |
+| `SMV_OFFLINE_GRAPH=1` | TensorRT-RTX graph capture on for offline renders (off by default) |
+| `SMV_OFFLINE_RESIDENT=0` / `SMV_OFFLINE_RESIDENT_IDLE_S` / `SMV_OFFLINE_HOST_PIPE` / `SMV_OFFLINE_HOST_LOG` | one exe per plain RIFE render instead of the resident offline host / its idle limit in seconds (default 600) / its pipe name (the app sets one per process) / a file for its stderr |
+| `SMV_HANDOFF_DUMP=1` | the live host logs every handoff line it answers |
+| `SMV_NR_NOHOOK=1`, `SMV_NR_SPOOF=<name>`, `SMV_NR_HOOKLOG=1` | DLSS 5 caller hook off / spoofed name / trace |
+| `SMV_NR_RESET_EVERY=1` | the offline native host's DLSS 5 resets its history on every frame (the live behaviour), for the route gate; never a product setting |
+| `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
+| `SMV_CQ` | override the encoder CQ for measurement |
+| `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
+| `SMV_DLSSG_SWEEP=1` | the DLSS 4.5 host latches its buffer-sweep capture tier at startup instead of waiting for hardware flip metering, so the sweep path can be tested on demand |
+| `SMV_NO_STATIC_HOLD=1` | identical-pair passthrough off: a byte-identical pair is interpolated like any other (offline renders and the native hosts read it) |
+| `SMV_NO_RESUME` | disable crash-resume |
+| `SMV_TRACE=1` | on-screen tracebacks instead of the one-line pointer |
+| `SMV_CU` | CUDA header / lib location for the live exe build |
 
-The engine reaches both NVIDIA runtimes through small locally-built cdecl DLLs driven by ctypes. Their
-sources live in `engine/rtxvideo/build_src/` and `engine/nvoffruc/build_src/`; this section is the
-build documentation for both.
+`SMV_PAUSE_FILE`, `SMV_LIVE_PREVIEW`, `SMV_LIVE_OFF_FILE` and `SMV_TWOPASS_PHASE` are internal
+plumbing the GUI or the engine sets for its own children.
 
-(The DLSS 4.5 model's host, `engine/dlssg/dlssg2f.exe`, is a standalone exe rather than a ctypes
-bridge and has its own build doc at `engine/dlssg/build_src/BUILD.md`. Unlike the bridges here, both
-its exe and its Streamline runtime DLLs are redistributable and ship committed/bundled.)
+## Logging
+
+`%TEMP%\smv-engine.log` is the one log: every render's full console output (including child
+ffmpeg), crash tracebacks, TRT diagnostics, live server crashes and the live session lines (tagged
+`[live]`), with per-run headers, truncated past 8 MB. The GUI shows one short error line pointing
+at it.
+
+## Building the native components
+
+Two ctypes bridges (`engine/rtxvideo/build_src/`, `engine/nvoffruc/build_src/`) and three D3D12
+hosts (`engine/dlssg`, `engine/dlssnr`, `engine/live`, each with a `build_src/build.bat` that
+prints the missing environment variable). Nothing that needs MSVC is bundled; a recipient needs only
+the driver. Toolchain on the dev machine: VS 2019 Build Tools (`cl` 19.29) and VS 2026 Community
+(`cl` 19.51) with a Windows SDK.
 
 ### RTX Video bridge (`rtxvideo_cuda.dll`)
 
-A small CUDA bridge that lets `engine/rtxvideo.py` drive NVIDIA's RTX Video SDK (RTX VSR + TrueHDR).
-It statically links the SDK's `nvsdk_ngx_s.lib`, so the built DLL is **not redistributable**; only the
-sources are committed. You only need to rebuild it after updating the RTX Video SDK or moving to a
-different CUDA runtime.
+Lets `engine/rtxvideo.py` drive the RTX Video SDK (VSR + TrueHDR). It statically links the SDK's
+`nvsdk_ngx_s.lib`, so the built DLL is not redistributable; only the sources are committed. Rebuild
+only after an SDK update.
 
-**Sources** (`engine/rtxvideo/build_src/`):
-* `rtx_video_api_cuda_impl.cpp` - the SDK's CUDA convenience layer (`samples/RTX_Video_API/`), copied
-  so its `#include "utils.h"` picks up our override below.
-* `utils.h` - overrides the SDK's hardcoded `APP_PATH` with an extern global so the model path can be
-  set at runtime (`g_rtxv_model_path`).
-* `rtxvideo_pathshim.cpp` - defines that global and exports `rtxv_set_model_path(const wchar_t*)`.
-* `rtxvideo.def` - the exported C symbols (extern "C", undecorated on x64).
+Sources: `rtx_video_api_cuda_impl.cpp` (the SDK's CUDA convenience layer, copied so its
+`#include "utils.h"` picks up our override), `utils.h` (replaces the hardcoded `APP_PATH` with an
+extern global), `rtxvideo_pathshim.cpp` (defines it, exports `rtxv_set_model_path`), `rtxvideo.def`.
 
-**Toolchain** (verified on this machine): MSVC v142 (VS2019 Build Tools, `cl.exe` 19.29) via
-`VC\Auxiliary\Build\vcvars64.bat`; RTX Video SDK at `D:\AIStuff\RTX_Video_SDK` (headers in `include/`,
-`nvsdk_ngx_s.lib` in `lib\Windows\x64`, feature DLLs in `bin\Windows\x64\rel`); CUDA headers/libs come
-from the bundled torch runtime wheel (no separate CUDA Toolkit needed):
-`engine\runtime\Lib\site-packages\nvidia\cuda_runtime\{include, lib\x64}`.
-
-**Recipe** - from an `x64 Native Tools` prompt (or after vcvars64.bat), in `engine/rtxvideo/build_src/`:
-
+From an x64 Native Tools prompt in `engine/rtxvideo/build_src/`, with the SDK at
+`D:\AIStuff\RTX_Video_SDK` and CUDA 12 headers / libs from a cu12 torch runtime wheel:
 ```
 set SDK=D:\AIStuff\RTX_Video_SDK
 set RT=..\..\runtime\Lib\site-packages\nvidia\cuda_runtime
@@ -462,97 +1000,212 @@ cl /nologo /LD /EHsc /MT /DNDEBUG ^
    /link /DEF:rtxvideo.def /LIBPATH:"%SDK%\lib\Windows\x64" /LIBPATH:"%RT%\lib\x64" ^
    nvsdk_ngx_s.lib cuda.lib cudart.lib user32.lib shell32.lib advapi32.lib
 ```
+Copy the DLL up into `engine/rtxvideo/` next to `nvngx_vsr.dll` + `nvngx_truehdr.dll` (NGX resolves
+the feature DLLs relative to the loading module).
 
-Then copy `rtxvideo_cuda.dll` up into `engine/rtxvideo/` next to `nvngx_vsr.dll` + `nvngx_truehdr.dll`
-(NGX resolves the feature DLLs relative to the loading module, so co-location is what matters).
-
-Gotchas:
-* `/MT` (static CRT) is required - `nvsdk_ngx_s.lib` uses the static CRT; `/MD` gives LNK4098 +
-  unresolved CRT symbols.
-* `cudart.lib` is required (the NGX static lib references `cudaGetDevice`/`cudaGetDeviceProperties`
-  to map the CUDA device to an adapter LUID); `user32`/`shell32`/`advapi32` are also needed.
-* The feature DLLs (`nvngx_vsr.dll`, `nvngx_truehdr.dll`) are obtained from the RTX Video SDK and
-  placed in `engine/rtxvideo/` - in the app, the in-GUI "Install runtime" button does this.
-
-**CUDA 13 runtimes - do NOT rebuild this bridge against CUDA 13.** NVIDIA's `nvsdk_ngx_s.lib` is built
-for the **CUDA 12** runtime ABI: internally it calls `cudaGetDeviceProperties` with a CUDA 12-sized
-`cudaDeviceProp`. Link a CUDA 13 `cudart` and the runtime writes the larger CUDA 13 struct into that
-smaller buffer, overrunning the stack - the process dies with `0xC0000409` (STATUS_STACK_BUFFER_OVERRUN)
-inside NGX `create()`. Verified: a bridge relinked against `cudart64_13` (whether via the wheel's static
-`cudart.lib` or a synthesized dynamic import lib) loads fine but crashes in `create()`. We cannot
-recompile NVIDIA's lib. So to run under a **CUDA 13** runtime (torch `cu130` etc.), keep the **cu12
-bridge exactly as built** and just drop `cudart64_12.dll` next to it in `engine/rtxvideo/` (a cu13
-runtime ships only `cudart64_13.dll`, so the bridge's `cudart64_12` import would otherwise be
-unresolved). The bridge uses cu12 `cudart` for its read-only device-property / LUID query (matching
-NGX's ABI) while torch uses cu13 `cudart` separately; the CUDA **driver** context is shared (driver
-API, version agnostic), so VSR and TrueHDR run correctly. Validated end to end on torch 2.12.1+cu130 +
-cupy-cuda13x.
+Rules: `/MT` is required (the NGX lib uses the static CRT). `cudart.lib`, `user32`, `shell32`,
+`advapi32` are all needed. **Never rebuild against CUDA 13**: `nvsdk_ngx_s.lib` calls
+`cudaGetDeviceProperties` with a CUDA 12 sized struct, a CUDA 13 cudart overruns it and the process
+dies with `0xC0000409` inside NGX `create()`. Keep the cu12 bridge as built and ship
+`cudart64_12.dll` beside it; torch uses cu13 cudart separately, the driver context is shared.
 
 ### NVIDIA Smooth Motion bridge (`nvoffruc_bridge.dll`)
 
-The bridge between the Python engine and NVIDIA's `NvOFFRUC.dll` (Optical Flow SDK FRUC), i.e. the
-"NVIDIA Smooth Motion" interpolation model. Same idea as the RTX bridge: our source compiles to a small
-cdecl DLL that ctypes drives; the NVIDIA runtime DLLs stay user-installed.
+The bridge to NVIDIA's `NvOFFRUC.dll` (Optical Flow SDK FRUC). It includes the SDK's `NvOFFRUC.h`
+and `SecureLibraryLoader.h` and follows the NvOFFRUCSample sequence, so ship the built DLL, not the
+SDK. No CUDA toolkit needed (driver API only). Prerequisites: the Optical Flow SDK
+(`Optical_Flow_SDK_5.0.7`, EULA-gated) extracted somewhere.
 
-> This bridge contains source code provided by NVIDIA Corporation (it `#include`s the SDK's
-> `NvOFFRUC.h` and `SecureLibraryLoader.h` and follows the NvOFFRUCSample sequence). Ship the built
-> DLL, not the SDK.
-
-**Prerequisites:**
-* Visual Studio with the Desktop C++ workload. **No CUDA Toolkit is needed** - the bridge uses only the
-  CUDA *driver* API from `nvcuda.dll`, so it links only the Win32 crypto libs.
-* The **NVIDIA Optical Flow SDK** extracted somewhere (e.g. the `Optical_Flow_SDK_5.0.7` folder;
-  EULA-gated download from NVIDIA). We need its headers on the include path:
-  `<SDK>/NvOFFRUC/Interface` (`NvOFFRUC.h`) and `<SDK>/NvOFFRUC/NvOFFRUCSample/inc`
-  (`SecureLibraryLoader.h`).
-
-**Build** (x64 Native Tools Command Prompt, in `engine/nvoffruc/build_src/`):
-
-```bat
+In `engine/nvoffruc/build_src/`:
+```
 set SDK=C:\path\to\Optical_Flow_SDK_5.0.7
-
 cl /LD /O2 /EHsc /std:c++17 nvoffruc_bridge.cpp ^
    /I "%SDK%\NvOFFRUC\Interface" ^
    /I "%SDK%\NvOFFRUC\NvOFFRUCSample\inc" ^
    /Fe:nvoffruc_bridge.dll ^
    /link crypt32.lib wintrust.lib
 ```
+Runtime layout in `engine/nvoffruc/`: `nvoffruc_bridge.dll` (ours, committed and shipped),
+`NvOFFRUC.dll` and `cudart64_110.dll` (from the SDK's `NvOFFRUCSample/bin/win64/`, user-installed
+through the GUI, gitignored).
 
-Verified to compile clean with VS2019 BuildTools (cl 19.29) and VS 2026 Community (cl 19.51).
-`SecureLibraryLoader.h` already `#pragma comment`s `crypt32`/`wintrust`; they are listed above too so
-the command is copy-pasteable. No CUDA include or link is needed.
+Rules kept from debugging: `SecureLoadLibrary` resolves the bare name against the working
+directory, so the bridge temporarily sets its own folder as the current directory around the load
+(a full path does not work). FRUC's `pFrame` and every registered resource must be a `CUdeviceptr*`
+(the host address of the variable holding the device pointer), pitch = `width*4`, and the priming
+`Process` call sets `bSkipWarp = 1`. `nvoffruc_interpolate` calls `cuCtxSynchronize` at entry on the
+caller's context and again on its own before returning: CUDA does not order one context's null
+stream against another's, and without both fences tweens were sliced at horizontal seams. The OFA
+hardware exists on Turing through Blackwell and is being removed after Blackwell per the SDK's
+deprecation notice.
 
-**Install** (runtime layout in `engine/nvoffruc/`) - three files sit together:
-* `nvoffruc_bridge.dll` - built above. It is ours, so it is **committed and shipped** in the package.
-* `NvOFFRUC.dll` - from `<SDK>/NvOFFRUC/NvOFFRUCSample/bin/win64/` (NVIDIA proprietary, user-installed
-  via the GUI "Choose .zip" step, not redistributed, gitignored).
-* `cudart64_110.dll` - from the same `bin/win64/` folder (NvOFFRUC.dll depends on it; also gitignored).
+### DLSS 4.5 Frame Generation host (`dlssg2f.exe`)
 
-`SecureLoadLibrary` resolves the bare name `NvOFFRUC.dll` against BOTH the working directory (its
-signature / `WinVerifyTrust` calls) and the DLL search path, so the bridge temporarily sets its own
-folder as the current directory (plus `SetDllDirectory`) around the load, then restores it. That is
-what makes the signed load and its `cudart64_110.dll` dependency resolve regardless of the process
-working directory. (Passing a full path instead does not work: the loader hardcodes the bare name.)
+An offline D3D12 presentation loop that lets DLSS-FG (a game-only SDK) interpolate two video
+frames. Built from `main.cpp`; ships prebuilt with NVIDIA's redistributable Streamline runtime
+(`sl.*.dll` + `nvngx_dlssg.dll` from the SDK's `bin/x64` production set, licenses alongside;
+the bundled runtime is Streamline 2.14.1 since 2026-09-15, the same set ships in `engine/live`).
 
-**Hardware note:** the Optical Flow hardware (OFA) exists on Turing through **Blackwell**
-(RTX 20/30/40/50). Per the SDK's `Deprecation_Notices.pdf` (Jan 2026) the OFA is being removed on GPUs
-*after* Blackwell, where this bridge will not function. This is the inferior/faster model on purpose;
-GMFSS stays the default.
+Requirements: Visual Studio 2022+ with the C++ workload, the NVIDIA Streamline SDK v2.14.1
+(https://github.com/NVIDIA-RTX/Streamline/releases, the `streamline-sdk-<tag>.zip` asset; 2.12.0
+builds too, but ship the runtime DLLs of the SDK you built against). In `engine/dlssg/build_src/`:
+```
+set SL_SDK=D:\path\to\extracted\streamline-sdk
+build.bat
+```
+It links `sl.interposer.lib` instead of `d3d12.lib` / `dxgi.lib` (that is how Streamline
+interposes; check with `dumpbin /dependents` that neither appears) and writes `..\dlssg2f.exe`.
 
-**Sync fences (2026-07-11):** `nvoffruc_interpolate` calls `cuCtxSynchronize` twice: once at entry
-while the CALLER's context is still current (drains e.g. torch's kernels so the input surfaces are
-fully written before the bridge's `cuMemcpyDtoD` reads them) and once on its own context before
-returning (so the warp + out-copy have landed before the caller reads the output buffer). CUDA does not
-order one context's null stream against another context's streams, and without the fences every tween
-rendered under torch 2.13 was sliced at horizontal seams (torch 2.12 won the race by timing).
-Verified: 5 renders x 24 tweens all seam-free.
+Rules: the swap chain must be created with `FRAME_LATENCY_WAITABLE_OBJECT | ALLOW_TEARING` or the
+first Present fails inside the SL hook. `eShowOnlyInterpolatedFrame` makes every native present a
+generated frame, read back from the native swap chain after polling `GetLastPresentCount`, so no
+window is on screen. DLSS-FG requires hardware-accelerated GPU scheduling and an RTX 40 / 50 GPU
+(exit code 2 otherwise).
 
-**Debugging history** (kept because both cost real time): the original "access violation reading a
-device pointer" on the first `Process` was a POINTER-INDIRECTION bug - FRUC's `pFrame` and every
-registered `pArrResource` entry must be a `CUdeviceptr*` (the HOST address of the variable holding the
-device pointer, exactly as `NvOFFRUCSample` passes `&m_pRenderFrameCudaMemPtr[i]`), and
-`nCuSurfacePitch` must be `width*4`. And the priming `Process` call sets `bSkipWarp = 1` (a state-only
-feed of I0): without it the prime warps against stale state, polluting the temporal hints that FRUC's
-"bad quality → repeat a source frame" fallback depends on. FRUC's tearing on fast anime motion is
-inherent to the optical-flow model - it was verified against NVIDIA's own `NvOFFRUCSample` output; the
-RTX 5090 (Blackwell) runs the Feb-2023 `NvOFFRUC.dll` correctly once driven this way.
+### DLSS 5 Neural Rendering host (`dlssnr.exe` + `nvngx.dll`)
+
+An offline D3D12 host that runs NGX feature 18 over video frames at DLAA quality. `nvngx.dll`
+beside it is the caller shim. Both build from `build_src/` and ship prebuilt. The runtime
+`nvngx_dlssnr.dll` is NVIDIA property, not redistributable and not published by NVIDIA; the user
+supplies it (exit code 2 with a reason when absent).
+
+Requirements: Visual Studio 2022+ with the C++ workload (verified with VS 2026 Community) and the
+public NVIDIA DLSS SDK for its NGX headers only (`%NGX_SDK%` = the folder containing
+`include\nvsdk_ngx.h`; on this machine `D:\AIStuff\dlss-5-video-player\external\DLSS`). In
+`engine/dlssnr/build_src/`:
+```
+set NGX_SDK=D:\path\to\DLSS
+build.bat
+```
+`build.bat` finds `vcvars64.bat` through `vswhere` when `cl` is not on the path, compiles `shim.cpp`
+to `..\nvngx.dll` and `main.cpp` + `nr_host.cpp` to `..\dlssnr.exe`, linking the real `d3d12.lib` /
+`dxgi.lib` (no Streamline on this route). `createDevice` resolves `CreateDXGIFactory2` and
+`D3D12CreateDevice` from the System32 DLLs by name anyway (2026-09-23): the same core is linked
+into `smv-live.exe`, where the plain imports resolve to Streamline's interposer, and its offline
+host calls `startup` too.
+
+Files: `nr_host.h` / `nr_host.cpp` (NGX bring-up, feature 18 creation, one evaluate per frame on
+FP16 colour and output textures; `startupOn` / `evaluateOn` run the same feature on a caller's
+D3D12 device and command list, which is how `smv-live.exe` hosts it, with `setModuleDir` pointing
+the snippet, the shim and the NGX log at `engine/dlssnr`), `main.cpp` (pipe server and the
+`--probe` mode), `shim.cpp` / `shim_abi.h` (the caller shim and its ABI).
+
+Why a DLL named `nvngx.dll`: the NR runtime validates its caller and refuses (`0xBAD00002`)
+unless the module calling its entry points is named `nvngx.dll`. The shim is a set of thin,
+feature-agnostic thunks; the host resolves the driver core's exports itself and passes each one
+in. On top of that the host patches `GetModuleFileName{W,A}` in the snippet's own import table so
+the snippet reads "nvngx.dll" (the same technique as the RenoDX add-on); `SMV_NR_NOHOOK=1`
+disables it, `SMV_NR_SPOOF` overrides the name, `SMV_NR_HOOKLOG=1` traces. The hook is still
+required on driver 617.14 (re-test with `SMV_NR_NOHOOK=1` after every driver update).
+
+Runtime lookup order for `nvngx_dlssnr.dll` and the driver core `_nvngx.dll`: the user drop beside
+the exe, then the active driver package from
+`HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\FullPath`, then a scan of
+`DriverStore\FileRepository\nv*.inf_amd64_*`. The registry step matters: old packages are not
+purged on a driver update and a name-order scan once loaded a stale core under a newer kernel
+driver.
+
+Runtime notes: transport is raw `R16G16B16A16_FLOAT`, one frame in, one out, strictly in order.
+`DLSSNR.Reset` is 1 on the first frame only (the runtime keeps temporal history). MVec, Depth and
+ControlMask are not set. Fixed internally: `Style` 1, `Hint.Render.Preset` 3, `Intensity` 1.0,
+`SkinStructureStrength` off; only structure and tone are user facing. One NGX user per process,
+so this host never shares a process with the RTX Video NGX session. The NGX core writes its own
+log beside the runtime (`engine/dlssnr/*.log`, gitignored).
+
+### Live mode host (`smv-live.exe`)
+
+A separate process from the Electron app on purpose: the backend needs its own clean D3D12 device
+and swap chain (Streamline interposes swap-chain creation, which must never touch Chromium's
+compositor), its own paced present loop, an overlay whose foreground activation gates frame
+generation, and crash isolation from the GUI.
+
+Built from `smv-live.cpp` plus the DLSS 5 core `../../dlssnr/build_src/nr_host.cpp` via `build.bat`
+in `engine/live/build_src/`. `smv-live.cpp` is one translation unit that `#include`s its five parts
+in order (`smv-live-host.inl` swap chain and overlay, `smv-live-capture.inl` WGC capture and the
+DLSS 5 hook, `smv-live-native.inl` the native model host, `smv-live-pipe.inl` the present loop's interface
+to it, `smv-live-loop.inl` window finding, HUD and the present loops; the file map is in its header
+comment); the parts are not standalone sources and `build.bat` compiles only `smv-live.cpp`. The
+NVIDIA Optical Flow interface headers (the nvof model) are vendored in `build_src/nvofa` (MIT, with
+their provenance README) and `build.bat` adds that include path itself:
+```
+set "SL_SDK=D:\path\to\extracted\streamline-sdk"
+set "TRT_RTX_SDK=D:\path\to\TensorRT-RTX-1.6.1.120"
+set "NGX_SDK=D:\path\to\DLSS"
+build.bat
+```
+Requirements: Visual Studio 2022+ with the C++ workload, the Streamline SDK v2.14.1 (see the DLSS-G
+host section above), a Windows 11
+SDK (for the C++/WinRT Windows.Graphics.Capture headers), the TensorRT-RTX SDK zip (login gated)
+extracted anywhere (only `include\` and `lib\tensorrt_rtx_1_6.lib` are used) and the public NVIDIA
+DLSS SDK for its NGX headers (`NGX_SDK`, the same variable the dlssnr host build uses; no `d3d12.lib`
+on purpose, `D3D12CreateDevice` must keep resolving from the Streamline interposer). No CUDA toolkit: the
+CUDA headers and import libs come from the app's own `engine\runtime\Lib\site-packages\nvidia\cu13`
+(`SMV_CU` overrides); that wheel lacks the internal `crt\` directory, so `cuda_shim\crt\host_defines.h`
+supplies the one header `cuda_runtime_api.h` opens with. Do not grow that shim; install the real
+headers if more is ever needed.
+
+Nothing added for the native host is a hard dependency: `tensorrt_rtx_1_6.dll` is delay loaded and
+the CUDA 13 libs are lazy loader stubs, opened by full path out of `engine\runtime` on the first
+native call (the log line `native: runtime folder ...` names the folder used). The exe ships
+prebuilt next to its own copy of the Streamline runtime.
+
+Rules (hard-won, do not regress):
+* Swap chain flags `FRAME_LATENCY_WAITABLE_OBJECT | ALLOW_TEARING`, or Streamline's pacer kills the
+  first Present.
+* Activation is load-bearing: DLSS-FG only generates while this process's window is the foreground
+  window. Create it `WS_POPUP | WS_VISIBLE`; `WS_EX_NOACTIVATE` or `SW_SHOWNOACTIVATE` leave the pacer
+  silently in passthrough. Because the exe is spawned by a background process, the exe force-takes
+  foreground with `AttachThreadInput` + `SetForegroundWindow` and logs whether it succeeded.
+* The capture D3D11 device must come from the real `d3d11.dll` (`LoadLibrary` + `GetProcAddress`):
+  the Streamline import lib redirects `D3D11CreateDevice` to its proxy, which breaks frame
+  generation.
+* Alt-tab pause: when neither the target nor the overlay holds foreground, or the target is
+  minimized, the overlay hides and processing stops; returning resumes it. The overlay carries
+  `WS_EX_TOOLWINDOW` (never in alt-tab), Esc only ends the session while engaged.
+
+## Constraints
+
+* CUDA 13 (Blackwell): torch is the cu130 build; cupy finds the runtime through `cuda-pathfinder`.
+  cupy's NVRTC kernels only compile once torch has been imported first (it primes the DLL search
+  path for `nvrtc-builtins64_133.dll`); `render.py` imports torch before cupy.
+* Python 3.14 + TensorRT-RTX: cp314 wheels exist from 1.6.1.120 up, never pin below.
+* The RTX bridge stays cu12-built with `cudart64_12.dll` beside it (see its build section).
+* `engine/runtime` stays a relocatable python-build-standalone install, never a venv.
+* The renderer cannot run in a plain browser; launch through `npm start`.
+
+## Linting and formatting
+
+Deliberately light: the engine Python and the renderer's inline JS are dense on purpose, so
+nothing reflows them; only `src/*.ts` is auto-formatted.
+* Prettier (`.prettierrc.json`, single quotes, semicolons, 2-space, printWidth 120) formats
+  `src/**/*.ts` only; `.prettierignore` guards `engine/`, `renderer/` and build dirs.
+* `tsc --noEmit` with `strict` on is the TypeScript bug gate. ESLint was dropped when moving to
+  TypeScript 7 (typescript-eslint pinned the old compiler).
+* pyright (`pyrightconfig.json`) runs as a linter, not a type checker (`typeCheckingMode: "off"`,
+  undefined names = error, unused imports / vars = warning). Vendored and cache dirs are excluded.
+
+`npm install <pkg>` re-expands `package.json`'s inline arrays to one per line; a plain `npm install`
+leaves formatting alone. Dev dependencies are pinned to caret majors because `npm run setup`
+deletes the lockfile.
+
+## Releasing
+
+The zip exceeds GitHub's 2 GiB release-asset cap, so binaries live on SourceForge and GitHub carries
+the release page (notes + `.sha256`).
+
+1. Bump `version` in `package.json`, commit, push.
+2. `npm run dist` (zip + `.sha256`), then
+   `git archive --format=zip -o release/SmoothMyVideo-<v>-src.zip HEAD`.
+3. Upload both zips to SourceForge over SFTP (the web UI caps at 500 MB; create the `<v>` folder on
+   the Files tab first, scp does not mkdir):
+   `scp release/SmoothMyVideo-<v>-win.zip flowreen@frs.sourceforge.net:/home/frs/project/smoothmyvideo/<v>/`
+   then mark the new win.zip as the default Windows download. The src zip is not optional:
+   SourceForge removed a binary-only project without notice once.
+4. Tag `v<v>` on the release commit and push the tag.
+5. Create the GitHub release for the tag: notes plus the `.sha256`.
+
+The tag is what installed copies compare against (`checkForUpdate` in `main.ts`), so publishing
+the GitHub release lights up the in-app notice. Never re-upload different code under an existing
+version (the version is baked into the zip, the checksum stops matching, same-version installs
+never see the notice); fix-ups ship as a patch version. Retention: keep the latest and one previous
+zip on SourceForge, delete older ones; GitHub release pages stay forever.

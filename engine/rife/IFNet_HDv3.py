@@ -82,14 +82,28 @@ class IFBlock(nn.Module):
         )
 
     def forward(self, x, flow=None, scale=1):
-        x = F.interpolate(x, scale_factor=1. / scale, mode="bilinear", align_corners=False)
+        # Resize by explicit integer size from the tensor's own shape, not float scale_factor:
+        # under a dynamic-shape ONNX export the float chain becomes TruncToInt(0.125*ToFloat(H))
+        # in the graph's dims, which TRT-RTX's Myelin rejects as a shape value, so ifnet could
+        # never build a dynamic engine. Every scale here is a power of 2 and H/W are padded
+        # divisible, so size= is bit-exact with scale_factor=; a non-pow2 scale (the app never
+        # sends one) still gets the equivalent floor()ed size.
+        s = float(scale)
+        h, w = x.shape[2], x.shape[3]
+        if s >= 1 and s == int(s):
+            dh, dw = h // int(s), w // int(s)
+        else:
+            inv = 1.0 / s
+            dh, dw = (h * int(inv), w * int(inv)) if inv == int(inv) else \
+                     (int(h * inv), int(w * inv))
+        x = F.interpolate(x, size=(dh, dw), mode="bilinear", align_corners=False)
         if flow is not None:
-            flow = F.interpolate(flow, scale_factor=1. / scale, mode="bilinear", align_corners=False) * 1. / scale
+            flow = F.interpolate(flow, size=(dh, dw), mode="bilinear", align_corners=False) * 1. / scale
             x = torch.cat((x, flow), 1)
         feat = self.conv0(x)
         feat = self.convblock(feat)
         tmp = self.lastconv(feat)
-        tmp = F.interpolate(tmp, scale_factor=scale, mode="bilinear", align_corners=False)
+        tmp = F.interpolate(tmp, size=(h, w), mode="bilinear", align_corners=False)
         flow = tmp[:, :4] * scale
         mask = tmp[:, 4:5]
         feat = tmp[:, 5:]

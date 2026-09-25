@@ -21,15 +21,29 @@ engine/rtxvideo/build_src/*.obj
 engine/rtxvideo/build_src/*.lib
 engine/rtxvideo/build_src/*.exp
 engine/rtxvideo/build_src/rtxvideo_cuda.dll
+engine/dlssnr/nvngx_dlssnr.dll
+engine/dlssnr/nvngx_dlss.dll
+engine/dlssnr/*.log
+engine/dlssnr/nvngx.exp
+engine/dlssnr/nvngx.lib
+engine/dlssnr/build_src/*.obj
+engine/dlssnr/build_src/*.lib
+engine/dlssnr/build_src/*.exp
 engine/runtime/
 engine/runtime_*_bak/
+engine/gpu_runtime/
 engine/trt_cache/
+engine/trt_cache_safe_to_delete/
+engine/onnx/
 engine/trtrtx_bindings/*.obj
 engine/trtrtx_bindings/*.lib
 engine/trtrtx_bindings/*.exp
 engine/dvtools/
 engine/hptools/
 
-# samples: everything is local test material except the small 24fps example clip
+# samples: everything is local test material except the two small committed clips
+# (test.mp4 = the 24fps test/CI clip, example.mp4 = the first-page example preview, shipped)
 samples/*
 !samples/test.mp4
+!samples/example.mp4
+engine/live/build_src/*.obj

@@ -1,0 +1,169 @@
+// nr_host.h - reusable DLSS 5 Neural Rendering core for SmoothMyVideo.
+//
+// Device-agnostic in the sense that the caller may hand in its own D3D12 device
+// (smv-live.exe, phase 2) or let the core create a private one (dlssnr.exe, the
+// offline pipe server). Everything DLSS 5 specific lives here; main.cpp is only
+// the pipe server around it.
+//
+// Nothing here is copied from any third party host. The NGX call order, the
+// parameter key strings and feature id 18 are facts recorded in
+// D:\AIStuff\lossless-scaling-analysis\DLSS5-NR-HOST-FACTS.md.
+#pragma once
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <d3d12.h>
+#include <wrl/client.h>
+
+#include <cstdint>
+#include <string>
+
+#include <nvsdk_ngx.h>
+#include <nvsdk_ngx_params.h>
+
+namespace nr {
+
+// NGX feature id of DLSS 5 Neural Rendering. Not in the public SDK headers.
+const int kFeatureId = 18;
+
+// The project id the NR snippet accepts. A plain Init_Ext session gets
+// CreateFeature(18) refused.
+extern const char* const kProjectId;
+
+// Fixed internally, not exposed in the GUI (WO-21 user scope): only structure
+// and tone are user facing.
+struct Settings
+{
+    float structure = 1.0f;   // DLSSNR.LocalStructureStrength, 0..2
+    float tone      = 1.0f;   // DLSSNR.LocalToneStrength, 0..2
+    float intensity = 1.0f;   // DLSSNR.Intensity, 0..2
+    int   style     = 1;      // DLSSNR.Style, 0 default / 1 natural / 2 cinematic
+    int   preset    = 3;      // DLSSNR.Hint.Render.Preset, 0..3
+};
+
+// Phase 0 probe knobs. The snippet validates its caller and the exact rule is
+// unknown, so every plausible route is reachable without a rebuild.
+struct Variant
+{
+    // Route the NGX entry points through the caller shim (a DLL named nvngx.dll)
+    // so the return address lands inside it. false = call the driver core direct.
+    bool useShim = true;
+    // Where the shim is loaded from: 0 = beside the exe, 1 = <exe>\caller\nvngx.dll,
+    // 2 = beside the snippet DLL.
+    int shimLocation = 0;
+    // true = Init_ProjectID (the documented working route), false = Init_Ext.
+    bool initProjectId = true;
+    // Argument order of the Init_ProjectID export, unverifiable from the public
+    // headers: 0 = (.., device, featureInfo, version), 1 = (.., device, version, featureInfo).
+    int initArgOrder = 1;     // 1 is the order that survives Init_ProjectID on 616.56 (order 0 faults inside the core, probe 2026-09-03)
+    // true = CreateFeature / EvaluateFeature / ReleaseFeature resolved from the NR
+    // snippet's OWN exports (it exports the whole NVSDK_NGX_D3D12_* API) after its
+    // own Init_Ext; false = through the driver core, whose feature table on 616.56
+    // refuses id 18 before touching any snippet (NGX log 2026-09-03).
+    bool viaSnippet = true;
+};
+
+class Host
+{
+public:
+    ~Host();
+
+    // Full bring-up: resolve the driver core and the NR snippet, create a D3D12
+    // device, init NGX, create feature 18 and the FP16 color/output textures.
+    // Returns 0 on success, 2 when the runtime is missing or the GPU/driver does
+    // not support it, 3 when CreateFeature(18) is refused. quietLog as in startupOn
+    // (smv-live.exe's offline host, priority 24 step 2d: the NGX chatter stays out of
+    // the render log, dlssnr.py drops it the same way).
+    int startup(uint32_t w, uint32_t h, const Settings& s, const Variant& v, std::string& err,
+                bool quietLog = false);
+
+    // Phase 2 (smv-live.exe, WO-42): the same bring-up on the CALLER's device and
+    // queue. The host owns the Color / Output textures and a private command list
+    // for CreateFeature; the caller records the per-frame work (see evaluateOn) on
+    // its own lists and never touches CPU staging. quietLog = no NGX log callback
+    // output on stderr (the driver core still writes its own nvngx.log in the
+    // module folder). Same return codes as startup.
+    int startupOn(ID3D12Device* device, ID3D12CommandQueue* queue, uint32_t w, uint32_t h,
+                  const Settings& s, const Variant& v, bool quietLog, std::string& err);
+
+    // Record the evaluate on the caller's OPEN command list. Contract at the call:
+    // color() in NON_PIXEL_SHADER_RESOURCE holding the frame, output() in
+    // UNORDERED_ACCESS; the result lands in output() in that state. The list's
+    // descriptor heaps, root signature and pipeline state are clobbered by NGX:
+    // re-bind them afterwards.
+    bool evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& err);
+    ID3D12Resource* color() const { return m_color.Get(); }
+    ID3D12Resource* output() const { return m_output.Get(); }
+
+    // One frame in, one frame out. src and dst are w*h*8 bytes of RGBA16F.
+    // reset must be true for the first frame of a stream and after any
+    // discontinuity; the runtime keeps temporal history otherwise.
+    bool renderFrame(const void* src, void* dst, bool reset, std::string& err);
+
+    // Last NGX result seen, for the probe table.
+    NVSDK_NGX_Result lastResult() const { return m_last; }
+    const std::wstring& corePath() const { return m_corePath; }
+    const std::wstring& snippetPath() const { return m_snippetPath; }
+    const std::wstring& shimPath() const { return m_shimPath; }
+
+    void shutdown();
+    void ngxShutdown();  // the NGX-only teardown, called under SEH by shutdown()
+
+    // Drop every reference WITHOUT any NGX call, for a host that leaves through ExitProcess:
+    // the NR snippet's release and shutdown chain faults (measured 2026-09-12 in smv-live.exe,
+    // "NGX teardown faulted" and then 0xC0000005 on the way out), and dlssnr.exe never calls it
+    // either. The OS reclaims the session. A later shutdown() or the destructor is a no-op.
+    void abandon();
+
+private:
+    bool resolveModules(const Variant& v, std::string& err);
+    bool createDevice(std::string& err);
+    bool createCommandObjects(std::string& err);
+    bool createResources(bool staging, std::string& err);
+    int  initNgx(std::string& err);
+    bool runCommandList(std::string& err);
+
+    bool m_external = false;   // startupOn: device and queue belong to the caller
+    bool m_quiet = false;      // no NGX log callback output
+
+    template <class T> using CP = Microsoft::WRL::ComPtr<T>;
+
+    uint32_t m_w = 0, m_h = 0;
+    Settings m_set;
+    Variant  m_var;
+
+    HMODULE m_core = nullptr;     // _nvngx.dll, the driver core
+    HMODULE m_snippet = nullptr;  // nvngx_dlssnr.dll, the NR layer
+    HMODULE m_shim = nullptr;     // nvngx.dll, our caller shim
+    std::wstring m_corePath, m_snippetPath, m_shimPath;
+
+    CP<ID3D12Device>              m_dev;
+    CP<ID3D12CommandQueue>        m_queue;
+    CP<ID3D12CommandAllocator>    m_alloc;
+    CP<ID3D12GraphicsCommandList> m_list;
+    CP<ID3D12Fence>               m_fence;
+    HANDLE   m_fenceEvent = nullptr;
+    uint64_t m_fenceValue = 0;
+
+    CP<ID3D12Resource> m_color;    // RGBA16F, NON_PIXEL_SHADER_RESOURCE
+    CP<ID3D12Resource> m_output;   // RGBA16F, UNORDERED_ACCESS
+    CP<ID3D12Resource> m_upload;   // CPU write, linear
+    CP<ID3D12Resource> m_readback; // CPU read, linear
+    uint64_t m_rowPitch = 0;       // aligned row pitch of the staging buffers
+
+    NVSDK_NGX_Parameter* m_params = nullptr;
+    NVSDK_NGX_Handle*    m_feature = nullptr;
+    NVSDK_NGX_Result     m_last = NVSDK_NGX_Result_Success;
+    bool m_ngxUp = false;
+};
+
+// Folder holding nvngx_dlssnr.dll, the caller shim nvngx.dll and the NGX log (the data path).
+// Default = the folder of the running exe (dlssnr.exe lives in engine\dlssnr). A host that
+// lives elsewhere (smv-live.exe in engine\live, phase 2) points this at engine\dlssnr before
+// startup. Empty or null restores the default.
+void setModuleDir(const wchar_t* dir);
+
+// Human readable NGX result, including the codes the public header names.
+std::string resultString(NVSDK_NGX_Result r);
+
+} // namespace nr

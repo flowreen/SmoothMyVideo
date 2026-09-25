@@ -1,9 +1,11 @@
-import torch
+﻿import torch
 import torch.nn.functional as F
 
 
 def coords_grid(b, h, w, homogeneous=False, device=None):
-    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")  # [H, W]
+    # build on the target device: CPU-alloc + .to() breaks CUDA graph capture
+    y, x = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device),
+                          indexing="ij")  # [H, W]
 
     stacks = [x, y]
 
@@ -32,9 +34,27 @@ def generate_window_grid(h_min, h_max, w_min, w_max, len_h, len_w, device=None):
     return grid
 
 
+_center_cache = {}  # (h, w, device) -> c; creating from Python floats is a CPU->GPU
+# copy either way, which breaks CUDA graph capture, so cache it (warmup populates)
+
+
 def normalize_coords(coords, h, w):
     # coords: [B, H, W, 2]
-    c = torch.Tensor([(w - 1) / 2., (h - 1) / 2.]).float().to(coords.device)
+    # FakeTensors (ONNX-export traces) bypass the cache: a cached fake poisons later real
+    # eager calls at the same shape (same class of bug as MetricNet.backwarp, 2026-08-28)
+    if torch.compiler.is_compiling():
+        # export path (SMV 2026-09-21, ONNX-in-exe): torch.tensor() from symbolic sizes would pin
+        # the size, so the same (coords - c) / c per channel from scalar arithmetic
+        cx, cy = (w - 1) / 2., (h - 1) / 2.
+        return torch.cat(((coords[..., 0:1] - cx) / cx, (coords[..., 1:2] - cy) / cy), -1)
+    if isinstance(coords, torch._subclasses.fake_tensor.FakeTensor):
+        c = torch.tensor([(w - 1) / 2., (h - 1) / 2.], dtype=torch.float32, device=coords.device)
+        return (coords - c) / c
+    key = (h, w, coords.device)
+    c = _center_cache.get(key)
+    if c is None:
+        c = torch.tensor([(w - 1) / 2., (h - 1) / 2.], dtype=torch.float32, device=coords.device)
+        _center_cache[key] = c
     return (coords - c) / c  # [-1, 1]
 
 
@@ -66,7 +86,7 @@ def flow_warp(feature, flow, mask=False, padding_mode='zeros'):
     b, c, h, w = feature.size()
     assert flow.size(1) == 2
 
-    grid = coords_grid(b, h, w).to(flow.device) + flow  # [B, 2, H, W]
+    grid = coords_grid(b, h, w, device=flow.device) + flow  # [B, 2, H, W]
 
     return bilinear_sample(feature, grid, padding_mode=padding_mode,
                            return_mask=mask)

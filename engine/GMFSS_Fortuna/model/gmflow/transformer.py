@@ -21,18 +21,28 @@ def generate_shift_window_attn_mask(input_resolution, window_size_h, window_size
     # Ref: https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
     # calculate attention mask for SW-MSA
     h, w = input_resolution
-    img_mask = torch.zeros((1, h, w, 1)).to(device)  # 1 H W 1
-    h_slices = (slice(0, -window_size_h),
-                slice(-window_size_h, -shift_size_h),
-                slice(-shift_size_h, None))
-    w_slices = (slice(0, -window_size_w),
-                slice(-window_size_w, -shift_size_w),
-                slice(-shift_size_w, None))
-    cnt = 0
-    for h in h_slices:
-        for w in w_slices:
-            img_mask[:, h, w, :] = cnt
-            cnt += 1
+    if torch.compiler.is_compiling():
+        # export path (SMV 2026-09-21, ONNX-in-exe): the same region ids 0..8 from arange
+        # comparisons (rows [0, h - wh) / [h - wh, h - sh) / [h - sh, h), columns alike), so a
+        # size-free export has no Python slice loop over the size; exact
+        rr = ((torch.arange(h, device=device) >= h - window_size_h).long()
+              + (torch.arange(h, device=device) >= h - shift_size_h).long())
+        cr = ((torch.arange(w, device=device) >= w - window_size_w).long()
+              + (torch.arange(w, device=device) >= w - shift_size_w).long())
+        img_mask = (rr[:, None] * 3 + cr[None, :]).float().view(1, h, w, 1)
+    else:
+        img_mask = torch.zeros((1, h, w, 1), device=device)  # 1 H W 1; CPU-alloc + .to() breaks CUDA graph capture
+        h_slices = (slice(0, -window_size_h),
+                    slice(-window_size_h, -shift_size_h),
+                    slice(-shift_size_h, None))
+        w_slices = (slice(0, -window_size_w),
+                    slice(-window_size_w, -shift_size_w),
+                    slice(-shift_size_w, None))
+        cnt = 0
+        for hs in h_slices:
+            for ws in w_slices:
+                img_mask[:, hs, ws, :] = cnt
+                cnt += 1
 
     mask_windows = split_feature(img_mask, num_splits=input_resolution[-1] // window_size_w, channel_last=True)
 
@@ -41,6 +51,23 @@ def generate_shift_window_attn_mask(input_resolution, window_size_h, window_size
     attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
 
     return attn_mask
+
+
+def _roll_hw(x, sh, sw, left):
+    """torch.roll over dims (1, 2) by (sh, sw), leftward (negative shifts) when `left`. On the
+    export path (SMV 2026-09-21, ONNX-in-exe) as explicit slices: onnxscript's roll takes only
+    constant shifts, a symbolic `% n` makes the size unbacked and a symbolic sign test would
+    guard, so the direction is a flag and 0 < shift < n is written out (exact data movement).
+    Eager keeps torch.roll."""
+    if not torch.compiler.is_compiling():
+        return torch.roll(x, shifts=(-sh, -sw) if left else (sh, sw), dims=(1, 2))
+    for s, d in ((sh, 1), (sw, 2)):
+        n = x.shape[d]
+        if left:
+            x = torch.cat((x.narrow(d, s, n - s), x.narrow(d, 0, s)), d)
+        else:
+            x = torch.cat((x.narrow(d, n - s, s), x.narrow(d, 0, n - s)), d)
+    return x
 
 
 def single_head_split_window_attention(q, k, v,
@@ -75,9 +102,9 @@ def single_head_split_window_attention(q, k, v,
         shift_size_h = window_size_h // 2
         shift_size_w = window_size_w // 2
 
-        q = torch.roll(q, shifts=(-shift_size_h, -shift_size_w), dims=(1, 2))
-        k = torch.roll(k, shifts=(-shift_size_h, -shift_size_w), dims=(1, 2))
-        v = torch.roll(v, shifts=(-shift_size_h, -shift_size_w), dims=(1, 2))
+        q = _roll_hw(q, shift_size_h, shift_size_w, True)
+        k = _roll_hw(k, shift_size_h, shift_size_w, True)
+        v = _roll_hw(v, shift_size_h, shift_size_w, True)
 
     q = split_feature(q, num_splits=num_splits, channel_last=True)  # [B*K*K, H/K, W/K, C]
     k = split_feature(k, num_splits=num_splits, channel_last=True)
@@ -98,7 +125,7 @@ def single_head_split_window_attention(q, k, v,
 
     # shift back
     if with_shift:
-        out = torch.roll(out, shifts=(shift_size_h, shift_size_w), dims=(1, 2))
+        out = _roll_hw(out, shift_size_h, shift_size_w, False)
 
     out = out.view(b, -1, c)
 
@@ -376,13 +403,30 @@ class FeatureFlowAttention(nn.Module):
     def forward_local_window_attn(self, feature0, flow,
                                   local_window_radius=1,
                                   ):
+        # per-pixel batched gemms chunked below 65535 batches: same TRT-RTX gridDim.z
+        # launch-cap bug as matching.local_correlation_softmax (see the note there)
+        from .matching import GEMM_BATCH_CHUNK
         assert flow.size(1) == 2
         assert local_window_radius > 0
 
         b, c, h, w = feature0.size()
+        if torch.compiler.is_compiling():
+            # export path (SMV 2026-09-21, ONNX-in-exe): the chunk loop below unrolls by H * W,
+            # which a size-free export cannot hold. The two per-pixel products (1 x C by C x k*k,
+            # then 1 x k*k by k*k x 2) as multiply + sum over one axis: no batched gemm, so no
+            # launch cap and nothing per size. A different summation order: equivalent, measured
+            # closer to eager fp32 than the chunked engine (harness\onnx\gmflow_check.py)
+            ks = 2 * local_window_radius + 1
+            q = self.q_proj(feature0.view(b, c, -1).permute(0, 2, 1)).permute(0, 2, 1)  # [B, C, H*W]
+            kp = self.k_proj(feature0.view(b, c, -1).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, c, h, w)
+            kw = F.unfold(kp, kernel_size=ks, padding=local_window_radius).view(b, c, ks * ks, h * w)
+            scores = (q.unsqueeze(2) * kw).sum(1) / (c ** 0.5)  # [B, k*k, H*W]
+            prob = torch.softmax(scores, dim=1)
+            fw = F.unfold(flow, kernel_size=ks, padding=local_window_radius).view(b, 2, ks * ks, h * w)
+            return (prob.unsqueeze(1) * fw).sum(2).view(b, 2, h, w).contiguous()  # [B, 2, H, W]
 
         feature0_reshape = self.q_proj(feature0.view(b, c, -1).permute(0, 2, 1)
-                                       ).reshape(b * h * w, 1, c)  # [B*H*W, 1, C]
+                                       ).reshape(b, h * w, 1, c)  # [B, H*W, 1, C]
 
         kernel_size = 2 * local_window_radius + 1
 
@@ -392,18 +436,23 @@ class FeatureFlowAttention(nn.Module):
                                    padding=local_window_radius)  # [B, C*(2R+1)^2), H*W]
 
         feature0_window = feature0_window.view(b, c, kernel_size ** 2, h, w).permute(
-            0, 3, 4, 1, 2).reshape(b * h * w, c, kernel_size ** 2)  # [B*H*W, C, (2R+1)^2]
+            0, 3, 4, 1, 2).reshape(b, h * w, c, kernel_size ** 2)  # [B, H*W, C, (2R+1)^2]
 
         flow_window = F.unfold(flow, kernel_size=kernel_size,
                                padding=local_window_radius)  # [B, 2*(2R+1)^2), H*W]
 
         flow_window = flow_window.view(b, 2, kernel_size ** 2, h, w).permute(
-            0, 3, 4, 2, 1).reshape(b * h * w, kernel_size ** 2, 2)  # [B*H*W, (2R+1)^2, 2]
+            0, 3, 4, 2, 1).reshape(b, h * w, kernel_size ** 2, 2)  # [B, H*W, (2R+1)^2, 2]
 
-        scores = torch.matmul(feature0_reshape, feature0_window) / (c ** 0.5)  # [B*H*W, 1, (2R+1)^2]
+        hw = h * w
+        step = max(1, GEMM_BATCH_CHUNK // b)
+        outs = []
+        for i in range(0, hw, step):
+            scores = torch.matmul(feature0_reshape[:, i:i + step],
+                                  feature0_window[:, i:i + step]) / (c ** 0.5)  # [B, chunk, 1, (2R+1)^2]
+            prob = torch.softmax(scores, dim=-1)
+            outs.append(torch.matmul(prob, flow_window[:, i:i + step]).squeeze(-2))  # [B, chunk, 2]
 
-        prob = torch.softmax(scores, dim=-1)
-
-        out = torch.matmul(prob, flow_window).view(b, h, w, 2).permute(0, 3, 1, 2).contiguous()  # [B, 2, H, W]
+        out = torch.cat(outs, dim=1).view(b, h, w, 2).permute(0, 3, 1, 2).contiguous()  # [B, 2, H, W]
 
         return out

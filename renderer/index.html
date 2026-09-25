@@ -13,15 +13,25 @@
   button { font:inherit; padding:7px 12px; border:0; border-radius:6px; cursor:pointer; }
   .panel { background:var(--panel); border-radius:8px; padding:12px 14px; margin:10px 0; }
   .row { display:flex; align-items:center; gap:10px; margin:6px 0; }
-  .k { color:var(--sub); width:110px; } .v { font-family:Consolas,monospace; }
+  .k { color:var(--sub); width:140px; } .v { font-family:Consolas,monospace; }
+  /* Pipeline order: numbered panels count only when rendered, so Live mode (which hides
+     the .vonly panels) renumbers itself with no gaps. */
+  #workspace { counter-reset: step; }
+  .panel.step { counter-increment: step; }
+  .panel.step > .row:first-child > .k::before { content: counter(step) " "; color:var(--green); font-family:Consolas,monospace; }
+  .panel.step > .row:first-child > .k { white-space:nowrap; }
   #go { background:var(--green); color:#0d0d0d; font-weight:700; font-size:16px; padding:10px 18px; }
   #go:disabled { background:#444; color:#888; cursor:default; }
   select, input { font:inherit; background:#101010; color:var(--text); border:1px solid #444;
                   border-radius:5px; padding:5px 8px; }
+  /* Sliders must not inherit the box padding/border above: Chromium paints the range track across
+     the whole box but confines the thumb travel and fill to the content area, so a padded slider
+     shows an unfilled stub of track past the thumb at both extremes (white gap at 100%). */
+  input[type=range] { padding:0; border:0; background-color:transparent; }
   select:disabled, input:disabled { opacity:.45; cursor:not-allowed; }
   #bar { position:relative; height:28px; background:#101010; border-radius:14px; overflow:hidden; }
   #fill { height:100%; width:0; background:var(--green); transition:width .15s; }
-  /* Linked multiplier / target-fps steppers (each: [-] value [unit] [+]). */
+  /* Target-fps stepper ([-] value [unit] [+]). */
   .stepper { display:inline-flex; align-items:stretch; height:30px; border:1px solid #3a3a3a;
              border-radius:5px; overflow:hidden; vertical-align:middle; }
   .stepper button, .stepper input, .stepper .mx { box-sizing:border-box; }
@@ -34,8 +44,30 @@
   .stepper input:disabled { opacity:.5; }
   .stepper .mx { display:flex; align-items:center; padding:0 7px 0 3px; background:#1a1a1a; color:#888; font-size:13px; }
   .stepper input::-webkit-inner-spin-button, .stepper input::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
-  #multin { width:54px; } #fpsin { width:84px; }
+  .roundbtn { width:26px; height:26px; padding:0; border:1px solid #3a3a3a; border-radius:50%; background:#222;
+    color:var(--text); font-size:15px; line-height:1; cursor:pointer; flex:0 0 auto; }
+  .roundbtn:hover:not(:disabled) { background:#2a2a2a; color:var(--green); border-color:var(--green); }
+  .roundbtn:disabled { opacity:.4; cursor:default; }
+  #fpsin { width:84px; }
   .eq { padding:0 9px; color:#888; }
+  /* Speed mode selector: one control, three mutually exclusive answers to "what output rate?" */
+  .seg { display:inline-flex; align-items:stretch; height:30px; border:1px solid #3a3a3a;
+         border-radius:6px; overflow:hidden; }
+  .seg button { background:#222; color:var(--text); border:0; border-right:1px solid #3a3a3a;
+                padding:0 12px; font-size:16px; line-height:1; cursor:pointer; }
+  .seg button:last-child { border-right:0; }
+  .seg button:hover:not(:disabled):not(.on) { background:#2a2a2a; color:var(--green); }
+  .seg button.on { background:var(--green); color:#0d0d0d; font-weight:600; }
+  .seg button:disabled { opacity:.4; cursor:default; }
+  /* Mode switch = the same segmented control, scaled up: it is the first choice on the page. */
+  .modeseg { height:36px; }
+  .modeseg button { font-size:18px; padding:0 18px; }
+  /* The two UI modes. Video mode hides every .lonly element, Live mode every .vonly one;
+     anything carrying neither class is shared and stays on screen in both. !important because
+     most of these panels are shown by JS inline styles (welcome, info, previewpanel, lvpanel,
+     workspace), and an inline display must never leak the other mode's UI back on screen. */
+  html.mode-live .vonly { display:none !important; }
+  html.mode-video .lonly { display:none !important; }
   /* Percentage painted on top of the fill, centred in the bar (taller bar so the larger text fits). */
   #pct { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
          color:#fff; font-size:22px; font-weight:600; pointer-events:none;
@@ -48,13 +80,29 @@
   .spinwheel { width:34px; height:34px; border:3px solid rgba(255,255,255,.25);
                border-top-color:var(--green); border-radius:50%; animation:spin .8s linear infinite;
                filter:drop-shadow(0 0 2px rgba(0,0,0,.7)); }
-  /* Small red tick marking the default position on a slider. All current defaults sit mid-scale,
-     so the tick is painted at 50%; a slider with an off-centre default would override
-     background-position inline. Fades with the control when disabled. */
-  input.defmark { background-color:transparent; background-image:linear-gradient(#e85c5c,#e85c5c);
-                  background-repeat:no-repeat; background-size:2px 12px; background-position:50% 50%; }
+  /* Small red tick marking the default position on a slider. Chromium no longer paints author
+     backgrounds on native range inputs (a background-image tick on the input itself silently
+     stopped rendering with an Electron upgrade), so the tick lives on a wrapper span around the
+     slider: layered UNDER it (isolation keeps the negative z-index inside the wrapper) and 2px
+     taller at each end, so it peeks out above and below the track wherever the thumb is. All
+     current defaults sit mid-scale; a slider with an off-centre default would override the left
+     offset inline. Fades with the control when disabled. */
+  .defmark { position:relative; display:inline-flex; align-items:center; isolation:isolate; }
+  .defmark::before { content:''; position:absolute; left:calc(var(--def, 50%) - 1px); top:-2px; bottom:-2px;
+                     width:2px; background:#e85c5c; z-index:-1; }
+  /* --def on the wrapper moves the tick for an off-centre default (the Image scale's 100% sits
+     at the right end, inset by the half thumb) */
+  .defmark:has(input:disabled)::before { opacity:.45; }
   @keyframes spin { to { transform:rotate(360deg); } }
 </style>
+<script>
+  // Set the UI mode class BEFORE the body renders, so launching in Live mode never flashes the
+  // video UI first. setMode() in the main script keeps this class and the stored key in sync.
+  try {
+    document.documentElement.className =
+      'mode-' + (localStorage.getItem('uiMode') === 'live' ? 'live' : 'video');
+  } catch (e) { document.documentElement.className = 'mode-video'; }
+</script>
 </head>
 <body>
   <h1>Smooth My Video</h1>
@@ -64,97 +112,103 @@
     ⬆️ Version <span id="updatever"></span> is out: <a id="updatelink" href="#" style="color:var(--green)">get the new build</a>
   </div>
 
+  <!-- MODE SWITCH. The app does two unrelated things (render a video file, and smooth a live
+       window in real time), and showing both entry points at once read as one confusing flow.
+       Each mode now shows only its own entry action (.vonly / .lonly); the interpolation model,
+       Speed, Image scale, RTX and Sharpen settings carry no class because both modes use them.
+       The choice persists in localStorage.uiMode and is painted by the head script. -->
   <div class="row">
+    <span class="seg modeseg" id="modeseg">
+      <button type="button" id="modevideo" title="Smooth a video file and save the result">Video</button>
+      <button type="button" id="modelive" title="Smooth any window on screen in real time">Live</button>
+    </span>
+  </div>
+
+  <div class="row vonly">
     <button id="pick">Select video...</button>
     <span id="path" class="hint">No file selected. You can also drag a video onto the window.</span>
   </div>
 
   <!-- Empty state: shown until a video is loaded (or an RTX install begins), then replaced by #workspace. -->
-  <div id="welcome" class="panel" style="text-align:center;padding:40px 20px">
+  <div id="welcome" class="panel vonly" style="text-align:center;padding:40px 20px">
     <div style="font-size:15px;margin-bottom:8px">👋 Welcome to <b>Smooth My Video</b></div>
     <div class="hint">Drop a video anywhere on this window (or click <b>Select video…</b> above) to get started.<br>
       You'll get a smoother, higher-frame-rate copy saved right next to the original.</div>
   </div>
 
+  <!-- Live mode: real-time frame generation over any window on screen (no file involved).
+       engine/live/smv-live.exe captures the picked window (Windows.Graphics.Capture) and covers
+       it with a click-through topmost overlay presenting interpolated output. Independent of the
+       file workflow below, so it lives OUTSIDE #workspace - and ABOVE it, so nobody has to
+       scroll to discover it. The output rate is INHERITED from the Speed selectors below
+       (RIFE/GMFSS resample adaptively to the fps target; DLSS 4.5 approximates it with
+       the nearest whole multiple of the captured window's rate, derived in the exe). -->
+  <div class="panel lonly" id="lvpanel" style="display:none">
+    <div class="row" style="margin-bottom:2px">
+      <span class="k">Live mode</span>
+      <span class="hint">Smooth <b>any window</b> in real time, no file needed: video player, browser, windowed game. Uses the <b>Interpolation model</b> and <b>Speed</b> target selected below - one choice drives both file renders and live smoothing (models without a live mode fall back automatically). Click <b>Smooth It Live!</b>, then during the countdown click the window you want smoothed - or press <b>`</b> (backtick) in any app to toggle it instantly (the key is reserved system-wide while this app runs). A green readout on the window shows source fps &rarr; smoothed fps and the delay. Windowed or borderless only; Esc (while watching), <b>`</b> or Stop ends it.</span>
+    </div>
+    <div class="row">
+      <button id="lvgo">Smooth It Live!</button>
+      <span class="hint" id="lvtarget"></span>
+      <span class="hint" id="lvstat"></span>
+    </div>
+    <div class="row">
+      <span class="k">Display</span>
+      <select id="lvfit" title="Where the smoothed output goes. Original size covers the window 1:1. Fill screen covers the whole monitor the window is currently on, upscaling the content with aspect ratio preserved (black bars as needed) - the classic way to watch a small player window big and smooth. Whole screen captures and smooths the entire monitor 1:1 (everything on it), and works with every model including DLSS 4.5.">
+        <option value="window">Original size</option>
+        <option value="fill">Fill screen</option>
+        <option value="monitor">Whole screen</option>
+      </select>
+      <span class="hint" id="lvfithint"></span>
+    </div>
+    <div class="row">
+      <span class="k">Extras</span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="lvhud" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        Show FPS meter
+      </label>
+      <label class="hint" id="lvhudlatlbl" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-left:14px;">
+        <input type="checkbox" id="lvhudlat" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        Show latency
+      </label>
+      <span class="hint" style="margin-left:14px">Hotkey</span>
+      <button id="lvkey" class="mini" title="The system-wide key that toggles Live mode on whatever window is in the foreground. Click, then press the new key or combo (Esc cancels). The key is reserved system-wide while this app runs.">`</button>
+      <span class="hint" id="lvkeyhint"></span>
+    </div>
+  </div>
+
+  <!-- Shown in Live mode only when main answered lv-ready = false (the bundled exe is missing). -->
+  <div class="panel hint lonly" id="lvunavail" style="display:none">
+    Live mode needs the bundled smv-live component (engine/live/smv-live.exe). This build does not
+    have it, so live smoothing is unavailable. Reinstalling the full app restores it.
+  </div>
+
   <!-- Everything operational: hidden until there's something to act on (see showWorkspace). -->
   <div id="workspace" style="display:none">
-  <div class="panel" id="info" style="display:none">
+  <div class="panel vonly" id="info" style="display:none">
     <div class="row"><span class="k">Resolution</span><span class="v" id="res">-</span></div>
     <div class="row"><span class="k">Source FPS</span><span class="v" id="fps">-</span></div>
     <div class="row"><span class="k">Duration</span><span class="v" id="dur">-</span></div>
     <div class="row"><span class="k">Codec</span><span class="v" id="codec">-</span></div>
   </div>
 
-  <div class="panel">
+  <div class="hint" style="margin:10px 0 0 4px">Numbered panels are the processing order: each frame goes through them top to bottom.</div>
+
+  <div class="panel step" id="restorepanel">
     <div class="row">
-      <span class="k">Interpolate</span>
+      <span class="k">Restore</span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="interp" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        generate in-between frames for smoother motion with the model chosen below (off = keep the source frames; sharpen, upscale, HDR and restore still apply)
+        <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
       </label>
+      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly">the first pass, before interpolation and the upscale; slower</span><span class="lonly">runs first on every presented frame; heavy: caps a live session near 15 to 20 fps at 1080p (about 35 at 720p), lower the Image scale or the window size; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
     </div>
-    <div class="row">
-      <span class="k">Speed</span>
-      <span class="stepper" title="Frame-rate multiplier (steps of 1)">
-        <button type="button" id="multdn" tabindex="-1">−</button>
-        <input id="multin" type="number" min="2" step="1" value="2" aria-label="multiplier">
-        <span class="mx">×</span>
-        <button type="button" id="multup" tabindex="-1">+</button>
-      </span>
-      <span class="eq">=</span>
-      <span class="stepper" title="Target frames per second (steps of 1)">
-        <button type="button" id="fpsdn" tabindex="-1">−</button>
-        <input id="fpsin" type="number" min="1" max="2400" step="1" aria-label="target fps">
-        <span class="mx">fps</span>
-        <button type="button" id="fpsup" tabindex="-1">+</button>
-      </span>
-      <span class="hint" id="multlabel"></span>
-    </div>
-    <div class="row">
-      <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="screenfps" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        match screen refresh rate (<span id="screenhz">?</span> Hz)
-      </label>
-    </div>
-    <div class="row">
-      <span class="k">Upscale to</span>
-      <select id="upres">
-        <option value="0">Off (keep source resolution)</option>
-        <option value="screen">Match screen</option>
-        <option value="1080">1080p &middot; Full HD</option>
-        <option value="1440">1440p &middot; 2K</option>
-        <option value="2160">2160p &middot; 4K</option>
-        <option value="4320">4320p &middot; 8K</option>
-        <option value="8640">8640p &middot; 16K</option>
-        <option value="custom">Custom height&hellip;</option>
-      </select>
-      <span id="upcustomwrap" style="display:none;align-items:center;gap:8px;">
-        <input id="upcustom" type="range" min="720" max="8640" step="2" value="2160"
-               style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
-        <span class="v" id="upcustomnum">2160p</span>
-      </span>
-      <span class="v hint" id="upinfo"></span>
-    </div>
-    <div class="row">
-      <span class="k">Codec</span>
-      <select id="outcodec">
-        <option value="hevc">HEVC &middot; H.265 &middot; GPU &middot; plays everywhere (recommended)</option>
-        <option value="av1">AV1 &middot; GPU &middot; royalty-free, best for web playback</option>
-        <option value="vvc">H.266 &middot; VVC &middot; CPU &middot; much smaller file, slow, few players</option>
-      </select>
-      <span class="hint" id="codechint"></span>
-    </div>
-    <div class="row"><span class="k">Saves to</span>
-      <button id="changeout" class="mini" disabled>Change...</button>
-      <input id="out" class="v" type="text" spellcheck="false" disabled
-             placeholder="output file path" style="flex:1;min-width:0;font-size:16px"></div>
   </div>
 
-  <div class="panel" id="modelpanel">
-    <div class="row" style="margin-bottom:2px">
-      <span class="k">Interpolation model</span>
-      <span class="hint">Which engine generates the in-between frames.</span>
+  <div class="panel step">
+    <div class="row">
+      <span class="k">Interpolate</span>
+      <span class="hint">generate in-between frames for smoother motion with the model chosen below (off = keep the source frames; every other panel still applies)</span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -185,7 +239,7 @@
       <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modeldlss"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(Deep Learning Super Sampling: AI frame generation from games; 2&times;&ndash;6&times;, needs RTX 40/50, RTX 50 above 2&times;)</span>
+        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(Deep Learning Super Sampling: AI frame generation from games; 2&times; to 6&times;, needs RTX 40/50, RTX 50 above 2&times;)</span>
       </label>
     </div>
     <div class="row">
@@ -198,18 +252,18 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modelsvplabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="modelsvp"
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="modelnvof"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        SVP <span class="hint">(the Smooth Video Project engine, included mainly for its NVIDIA Optical Flow mode below; needs SVP 4 installed)</span>
+        NVIDIA Optical Flow (direct) <span class="hint">(experimental: motion vectors from NVIDIA's optical-flow hardware, then both frames are pushed along them and merged; nothing to install; where very fast motion defeats the vectors it fades to a soft double image)</span>
       </label>
     </div>
-    <div class="row" id="svpnvofrow" style="display:none">
+    <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-left:22px;">
-        <input type="checkbox" id="svpnvof" checked
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="modellsfg"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA Optical Flow <span class="hint">(on = motion vectors from NVIDIA's optical-flow hardware, off = SVP's own block-matching search)</span>
+        Frame Blend <span class="hint">(the cheapest true interpolation: RIFE's motion flow, then the two frames are warped and merged, no refinement pass; the output stays sharp at the processed size)</span>
       </label>
     </div>
     <div id="dlsssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -224,31 +278,144 @@
         <button id="frucbrowsezip" class="mini">Choose .zip&hellip;</button>
       </div>
     </div>
-    <div id="svpsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
-      <div class="row" style="margin:0 0 6px"><span id="svpstatus" class="v">&#10007; NOT READY</span></div>
-      <div class="hint" id="svpsteps" style="line-height:1.6;margin-bottom:8px">
-        Both SVP models render with the svpflow engine from a local
-        <b>SVP 4</b> installation (not bundled). Install SVP 4, then re-select this model.
-        Installed somewhere unusual? <b>Choose folder&hellip;</b> points the app at it.
-        Until then GMFSS is used.</div>
-      <div class="row" id="svpbtns" style="flex-wrap:wrap;gap:6px">
-        <button id="svpget" class="mini">Get SVP 4</button>
-        <button id="svpbrowse" class="mini">Choose folder&hellip;</button>
-      </div>
+    <div class="row">
+      <span class="k">Speed</span>
+      <span class="seg" id="speedseg">
+        <button type="button" id="smfps" title="Output runs at this exact frame rate, whatever the source is (decimals allowed: 47.952 is exactly 2x a 23.976 source)">Target fps</button>
+        <button type="button" id="smscreen" title="Output matches this monitor's refresh rate">Match screen</button>
+      </span>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <span class="stepper" id="fpswrap" title="Target frames per second (steppers move by 1; type up to 3 decimals for an exact multiple of a fractional source rate)">
+        <button type="button" id="fpsdn" tabindex="-1">−</button>
+        <input id="fpsin" type="number" min="1" max="2400" step="0.001" aria-label="target fps">
+        <span class="mx">fps</span>
+        <button type="button" id="fpsup" tabindex="-1">+</button>
+      </span>
+      <button type="button" class="roundbtn" id="fpsround" style="display:none">≈</button>
+      <span class="hint" id="screenwrap">matching <span id="screenhz">?</span> Hz</span>
+      <span class="hint" id="ratehint"></span>
+    </div>
+    <div class="row">
+      <span class="k">Image scale</span>
+      <span class="defmark" style="flex:0 1 180px;--def:calc(100% - 8px)"><input id="lvflow" type="range" min="1" max="100" step="1" value="100" style="width:100%"
+             title="Resolution the video is PROCESSED at, as % of its size (default 100, the red mark). The whole pipeline runs on the smaller image and the result is upscaled back (RTX VSR when enabled), so the model parses far fewer pixels and uses far less VRAM. Lower = faster and a softer, blurrier picture (below 50% the fine detail is gone). Applies to live smoothing and file renders alike."></span>
+      <span class="v" id="lvflownum">100</span>
+      <span class="hint" id="lvflowhint"></span>
     </div>
   </div>
 
-  <div class="panel" id="rtxpanel">
+
+  <div class="panel step" id="uppanel">
     <div class="row" style="margin-bottom:2px">
-      <span class="k">NVIDIA RTX</span>
-      <span class="hint">Opt-in, off by default. Uses NVIDIA's own RTX Video models (one-time download).</span>
+      <span class="k">Upscale</span>
+      <span class="hint"><span class="vonly">resizes the frames to the output size after interpolation</span><span class="lonly">renders the smoothed picture at this size first, then fits it to the window or screen</span>; plain bicubic unless RTX Video Super Resolution is on</span>
+    </div>
+    <div class="row">
+      <span class="k">Size</span>
+      <select id="upres">
+        <option value="0">Off (keep source resolution)</option>
+        <option value="screen">Match screen</option>
+        <option value="480">480p &middot; SD</option>
+        <option value="720">720p &middot; HD</option>
+        <option value="1080">1080p &middot; Full HD</option>
+        <option value="1440">1440p &middot; 2K</option>
+        <option value="2160">2160p &middot; 4K</option>
+        <option value="4320">4320p &middot; 8K</option>
+        <option value="8640">8640p &middot; 16K</option>
+        <option value="custom">Custom height&hellip;</option>
+      </select>
+      <span id="upcustomwrap" style="display:none;align-items:center;gap:8px;">
+        <input id="upcustom" type="range" min="720" max="8640" step="2" value="2160"
+               style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
+        <span class="v" id="upcustomnum">2160p</span>
+      </span>
+      <span class="v hint" id="upinfo"></span>
     </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RTX Video Super Resolution <span class="hint">(AI for the upscale above)</span>
+        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler for the size above; off = plain bicubic; one-time runtime download)</span>
       </label>
+    </div>
+    <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px">
+        <span id="rtxstatus" class="v">checking...</span>
+      </div>
+      <div class="hint" id="rtxsteps" style="line-height:1.6;margin-bottom:8px"></div>
+      <div class="row" id="rtxbtns" style="flex-wrap:wrap;gap:6px">
+        <button id="rtxget" class="mini">Get from NVIDIA</button>
+        <button id="rtxbrowsezip" class="mini">Choose .zip&hellip;</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel step" id="nrpanel">
+    <div class="row" style="margin-bottom:2px">
+      <span class="k">DLSS 5</span>
+      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each frame at the output size, after the upscale and before sharpen and HDR.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame at the window size before the smoothing (the generated frames inherit it), inside the overlay host: about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (with RTX HDR on at full 1080p lower the Image scale; a 4K window costs about 37 ms per source frame); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
+    </div>
+    <div class="row" style="flex-wrap:wrap">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="dlssnr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        NVIDIA DLSS 5 <span class="hint" id="dlssnrhint">(Neural Rendering, DLAA quality; needs the runtime file you supply)</span>
+      </label>
+      <span id="nrwrap" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span class="hint">Style</span>
+        <span class="seg" id="nrstyleseg" style="height:26px">
+          <button type="button" data-style="0" title="NVIDIA's Default look: the lightest touch, closest to the source, no frame-to-frame smoothing">Default</button>
+          <button type="button" data-style="1" class="on" title="NVIDIA's Natural look: the smoothest, cleanest picture (the app's default)">Natural</button>
+          <button type="button" data-style="2" title="NVIDIA's Cinematic look: keeps the most line and texture detail">Cinematic</button>
+        </span>
+        <span class="hint" style="margin-left:6px">Structure Intensity</span>
+        <span class="defmark"><input id="nrstructure" type="range" min="0" max="2" step="0.05" value="1"
+               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
+        <span class="v" id="nrstructurenum">1.00</span>
+        <span class="hint" style="margin-left:6px">Tone Intensity</span>
+        <span class="defmark"><input id="nrtone" type="range" min="0" max="2" step="0.05" value="1"
+               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
+        <span class="v" id="nrtonenum">1.00</span>
+        <label class="hint vonly" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:6px"
+               title="Preview only: the Processed pane shows where the DLSS 5 pass changed pixels (bright = big change, dark = untouched) instead of the picture. The rendered video is not affected.">
+          <input type="checkbox" id="nrmask" style="width:auto;padding:0;accent-color:var(--green);">
+          Show changed pixels
+        </label>
+      </span>
+    </div>
+    <div id="dlssnrsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px">
+        <span id="dlssnrstatus" class="v">checking...</span>
+      </div>
+      <div class="hint" id="dlssnrsteps" style="line-height:1.6;margin-bottom:8px"></div>
+      <div class="row" id="dlssnrbtns" style="flex-wrap:wrap;gap:6px">
+        <button id="dlssnrdl" class="mini">Download the DLSS 5 runtime</button>
+        <button id="dlssnrbrowse" class="mini">Choose nvngx_dlssnr.dll&hellip;</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel step" id="sharpenpanel">
+    <div class="row">
+      <span class="k">Sharpen</span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> FSR
+      </label>
+      <span id="sharpwrap" style="display:flex;align-items:center;gap:8px;">
+        <input id="sharpval" type="range" min="0" max="1" step="0.05" value="1"
+               style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
+        <span class="v" id="sharpnum">1.00</span>
+      </span>
+      <span class="hint">crisper picture; runs after the upscale and DLSS 5, before HDR</span>
+    </div>
+  </div>
+
+  <div class="panel step" id="hdrpanel">
+    <div class="row" style="margin-bottom:2px">
+      <span class="k">HDR</span>
+      <span class="hint">Opt-in. NVIDIA RTX HDR converts the finished SDR picture to HDR10 as the last pass, with its colour controls (one-time runtime download)<span class="vonly">; Dolby Vision and HDR10+ below add metadata to that HDR10 file</span>.</span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
@@ -258,12 +425,12 @@
       </label>
       <span id="hdrtonewrap" style="display:none;align-items:center;gap:8px;">
         <span class="hint">Contrast</span>
-        <input id="hdrcon" type="range" min="-100" max="100" step="5" value="0" class="defmark"
-               style="width:100px;padding:0;border:0;accent-color:var(--green);">
+        <span class="defmark"><input id="hdrcon" type="range" min="-100" max="100" step="5" value="0"
+               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="hdrconnum">0</span>
         <span class="hint" style="margin-left:6px">Saturation</span>
-        <input id="hdrsat" type="range" min="-100" max="100" step="5" value="0" class="defmark"
-               style="width:100px;padding:0;border:0;accent-color:var(--green);">
+        <span class="defmark"><input id="hdrsat" type="range" min="-100" max="100" step="5" value="0"
+               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="hdrsatnum">0</span>
       </span>
     </div>
@@ -281,14 +448,14 @@
         </label>
         <span id="hdrsbwrap" style="display:inline-flex;align-items:center;gap:8px;">
           <span class="hint">Saturation boost</span>
-          <input id="hdrsb" type="range" min="0" max="100" step="5" value="50" class="defmark"
-                 style="width:100px;padding:0;border:0;accent-color:var(--green);">
+          <span class="defmark"><input id="hdrsb" type="range" min="0" max="100" step="5" value="50"
+                 style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
           <span class="v" id="hdrsbnum">50</span>
         </span>
         <span id="hdrvibwrap" style="display:inline-flex;align-items:center;gap:8px;">
           <span class="hint">Intensity</span>
-          <input id="hdrvib" type="range" min="0" max="100" step="5" value="50" class="defmark"
-                 style="width:100px;padding:0;border:0;accent-color:var(--green);">
+          <span class="defmark"><input id="hdrvib" type="range" min="0" max="100" step="5" value="50"
+                 style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
           <span class="v" id="hdrvibnum">50</span>
         </span>
       </div>
@@ -298,19 +465,9 @@
           (Intensity: how strongly muted colours are boosted, 0 = none; vivid colours and skin tones stay put)</span>
       </div>
     </div>
-    <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
-      <div class="row" style="margin:0 0 6px">
-        <span id="rtxstatus" class="v">checking...</span>
-      </div>
-      <div class="hint" id="rtxsteps" style="line-height:1.6;margin-bottom:8px"></div>
-      <div class="row" id="rtxbtns" style="flex-wrap:wrap;gap:6px">
-        <button id="rtxget" class="mini">Get from NVIDIA</button>
-        <button id="rtxbrowsezip" class="mini">Choose .zip&hellip;</button>
-      </div>
-    </div>
   </div>
 
-  <div class="panel" id="dvpanel">
+  <div class="panel vonly" id="dvpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Dolby Vision</span>
       <span class="hint">Opt-in. Adds Profile 8.1 dynamic-HDR metadata on top of the HDR10 render (via the open-source dovi_tool); the video stays a normal HDR10 file everywhere else. Best for TVs and devices in the Dolby Vision ecosystem: LG, Sony, most streaming boxes. Samsung TVs don't support it.</span>
@@ -335,7 +492,7 @@
     <div class="hint" style="margin-top:8px;line-height:1.5">Profile 8.1 metadata is generated by the third-party open-source dovi_tool. Not affiliated with, endorsed by, or certified by Dolby Laboratories; "Dolby" and "Dolby Vision" are their trademarks.</div>
   </div>
 
-  <div class="panel" id="hppanel">
+  <div class="panel vonly" id="hppanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">HDR10+</span>
       <span class="hint">Opt-in. Adds HDR10+ dynamic-HDR metadata (SMPTE ST 2094-40) into the HDR10 render (via the open-source hdr10plus_tool); the video stays a normal HDR10 file everywhere else. Best for Samsung TVs (which don't support Dolby Vision) and other HDR10+ displays; combinable with Dolby Vision: one file, every display picks what it understands.</span>
@@ -360,29 +517,35 @@
     <div class="hint" style="margin-top:8px;line-height:1.5">HDR10+ metadata is injected by the third-party open-source hdr10plus_tool. Not affiliated with, endorsed by, or certified by HDR10+ Technologies, LLC; "HDR10+" is their trademark.</div>
   </div>
 
-  <div class="panel">
-    <div class="row">
-      <span class="k">Sharpen</span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> FSR
-      </label>
-      <span id="sharpwrap" style="display:flex;align-items:center;gap:8px;">
-        <input id="sharpval" type="range" min="0" max="1" step="0.05" value="1"
-               style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
-        <span class="v" id="sharpnum">1.00</span>
-      </span>
-      <span class="hint">crisper picture; runs after the upscale, before HDR</span>
+  <div class="panel vonly step" id="outpanel">
+    <div class="row" style="margin-bottom:2px">
+      <span class="k">Output</span>
+      <span class="hint">the file written from the passes above</span>
     </div>
-    <div class="row">
-      <span class="k">Restore</span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
-      </label>
-      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; runs before the upscale; slower</span>
+    <div class="row vonly">
+      <span class="k">Codec</span>
+      <select id="outcodec">
+        <option value="hevc">HEVC &middot; H.265 &middot; GPU &middot; plays everywhere (recommended)</option>
+        <option value="av1">AV1 &middot; GPU &middot; royalty-free, best for web playback</option>
+        <option value="vvc">H.266 &middot; VVC &middot; CPU &middot; much smaller file, slow, few players</option>
+      </select>
+      <span class="hint" id="codechint"></span>
     </div>
+    <div class="row vonly">
+      <span class="k">Encoder speed</span>
+      <select id="encspeed">
+        <option value="quality">Quality &middot; maximum encoder effort (recommended)</option>
+        <option value="fast">Fast &middot; HEVC 2 to 3x the encode rate (AV1 1.3x), same file size</option>
+      </select>
+      <span class="hint" id="encspeedhint"></span>
+    </div>
+    <div class="row vonly" id="outrow"><span class="k">Saves to</span>
+      <button id="changeout" class="mini" disabled>Change...</button>
+      <input id="out" class="v" type="text" spellcheck="false" disabled
+             placeholder="output file path" style="flex:1;min-width:0;font-size:16px"></div>
   </div>
 
-  <div class="panel" id="previewpanel" style="display:none">
+  <div class="panel vonly" id="previewpanel" style="display:none">
     <div class="row">
       <span class="k">Preview</span>
       <span class="hint" id="hdrpreviewhint">your restore / sharpen / HDR settings on a real frame · updates automatically</span>
@@ -414,7 +577,7 @@
     </div>
   </div>
 
-  <div class="row">
+  <div class="row vonly">
     <button id="go" disabled>Smooth It!</button>
     <button id="cancel" disabled title="Stops this render and deletes its progress. A cancelled render cannot be resumed. To continue later, use Pause or just close the app instead.">Cancel</button>
     <button id="open" disabled>Open folder</button>
@@ -423,7 +586,7 @@
     <span id="status" class="hint">Select a video to begin.</span>
   </div>
 
-  <div class="panel"><div id="bar"><div id="fill"></div><div id="pct">0%</div></div>
+  <div class="panel vonly"><div id="bar"><div id="fill"></div><div id="pct">0%</div></div>
     <div class="hint" id="frames" style="margin-top:6px"></div>
     <div id="livewrap" style="display:none;margin-top:8px;align-items:flex-start;gap:8px">
       <img id="live" title="The frame being written right now" alt=""
@@ -432,1391 +595,9 @@
               title="Show or hide the live preview of the frame being written. Hiding it stops the engine from producing it, freeing a little GPU/CPU each second; showing it starts producing it again.">Hide preview (frees resources)</button>
     </div></div>
 
-  <div id="log"></div>
+  <div id="log" class="vonly"></div>
   </div><!-- /#workspace -->
 
-<script>
-const { ipcRenderer, shell, webUtils, webFrame } = require('electron');
-// Announce every page load (app launch OR a reload). On a reload this lets main kill any engine
-// orphaned by the previous page - e.g. an accidental Ctrl+R mid-render - so the app comes up clean
-// instead of the refreshed UI racing a still-running engine (the 1%->15%->1% progress ping-pong).
-ipcRenderer.send('renderer-ready');
-
-// --- UI zoom: Ctrl+= / Ctrl+- / Ctrl+0 and Ctrl+scrollwheel, browser-style ------------------------
-// Chromium zoom levels: factor = 1.2^level; half-level steps ~= 10% per notch, clamped to a range
-// where the tall single-column layout stays usable. Persisted so the app reopens at the same zoom.
-function applyZoom(z){
-  z = Math.max(-4, Math.min(4, z));
-  webFrame.setZoomLevel(z);
-  localStorage.setItem('zoomLevel', String(z));
-}
-applyZoom(parseFloat(localStorage.getItem('zoomLevel')) || 0);
-window.addEventListener('keydown', (e) => {
-  if(!e.ctrlKey || e.altKey || e.metaKey) return;
-  if(e.key === '=' || e.key === '+'){ applyZoom(webFrame.getZoomLevel() + 0.5); e.preventDefault(); }
-  else if(e.key === '-'){ applyZoom(webFrame.getZoomLevel() - 0.5); e.preventDefault(); }
-  else if(e.key === '0'){ applyZoom(0); e.preventDefault(); }
-});
-window.addEventListener('wheel', (e) => {
-  if(!e.ctrlKey) return;
-  e.preventDefault();   // never page-scroll while zooming (needs the non-passive listener)
-  applyZoom(webFrame.getZoomLevel() + (e.deltaY < 0 ? 0.5 : -0.5));
-}, { passive: false });
-const path = require('path');
-let info = null, input = null, lastOut = null, customOut = null, fpp = 1, totalGen = 1, procStart = 0, baseK = 0, cancelled = false;
-let lastPreview = null;   // path of the latest pause-generated partial preview (PREVIEW_READY), or null
-let dlssPreempt = null;   // pct if DLSS-FG stopped on RTX Video preemption (a clean resumable stop), else null
-// Batch queue: inputs waiting after the current one. Filled by a multi-select pick or a multi-file
-// drop; consumed one at a time on engine-done (same settings for every file, default output names).
-let batch = [], batchTotal = 1, batchAuto = false, batchFailed = [];
-// The unfinished inputs (current file first) are mirrored to localStorage while a run is live, so a
-// crash or accidental close mid-batch can be resumed: the next launch re-queues them (no auto-start).
-function saveBatch(list){ try {
-  if(list && list.length) localStorage.setItem('batchPending', JSON.stringify(list));
-  else localStorage.removeItem('batchPending');
-} catch {} }
-// #go doubles as the run's Pause/Resume toggle: 'idle' = "Smooth It!" (starts a run), 'running' =
-// "Pause" (holds generation), 'paused' = "Resume" (continues). engine-done resets it to 'idle'.
-let goMode = 'idle';
-function fileTag(){ return batchTotal > 1 ? 'File ' + (batchTotal - batch.length) + '/' + batchTotal + ' · ' : ''; }
-// ETA is a live countdown. Each PROGRESS frame re-anchors it to the average pace since warmup,
-// and a timer ticks the displayed seconds down between frames so it never sits frozen. curDone/
-// curPct hold the last frame numbers so the timer can repaint the line with no new PROGRESS.
-let etaAnchor = 0, etaAnchorTime = 0, lastFps = 0, etaTimer = null, curDone = 0, curPct = 0, projBytes = 0;
-function fmtEta(s){ s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), ss=s%60;
-  return h>0 ? h+'h '+String(m).padStart(2,'0')+'m '+String(ss).padStart(2,'0')+'s'
-       : m>0 ? m+'m '+String(ss).padStart(2,'0')+'s' : ss+'s'; }
-const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-function fmtFinish(s){ const d = new Date(Date.now() + Math.max(0,s)*1000);   // wall-clock end time
-  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+' '
-       + String(d.getDate()).padStart(2,'0')+'-'+MONTHS[d.getMonth()]+'-'+d.getFullYear(); }
-
-const $ = (id) => document.getElementById(id);
-// Stored-settings schema version: bump whenever a localStorage key or its scale/meaning changes,
-// and the first launch of the new build wipes every stored setting once, so stale keys can never
-// conflict with the new UI (e.g. the HDR slider rescales and key renames of 2026-07-02).
-const SETTINGS_VERSION = '3';   // 2026-07-06: multiplier dropdown replaced by a unified target-fps slider (new key fpsTarget)
-if(localStorage.getItem('settingsVersion') !== SETTINGS_VERSION){
-  localStorage.clear();
-  localStorage.setItem('settingsVersion', SETTINGS_VERSION);
-}
-function log(t){ $('log').textContent += t; $('log').scrollTop = $('log').scrollHeight; }
-// Reveal the operational UI (controls, preview, progress, log) the first time there is something to do -
-// a video is loaded, or an RTX install begins. Until then only the welcome/empty state is shown.
-function showWorkspace(){ $('welcome').style.display = 'none'; $('workspace').style.display = ''; }
-// Repaint the frames/speed/ETA line. Called on every PROGRESS frame and on each timer tick; the
-// tick recomputes the remaining seconds from the anchor so the ETA counts down between frames.
-function paint(){
-  if(!procStart) return;                              // still warming up: keep the warmup message
-  let speed = '   ·   measuring speed...';
-  if(lastFps > 0){
-    const remain = Math.max(0, etaAnchor - (Date.now()-etaAnchorTime)/1000);
-    speed = '   ·   '+Math.round(lastFps)+' fps   ·   ETA '+fmtEta(remain)+'  ('+fmtFinish(remain)+')';
-  }
-  // Projected final size (engine SIZE lines: bytes so far, linearly extrapolated to 100%), so a
-  // long render reveals its disk cost in the first minutes instead of at the end.
-  const size = projBytes > 0 ? '   ·   ~'+fmtBytes(projBytes) : '';
-  $('frames').textContent = 'Frames: '+Math.round(curDone*fpp)+' / '+totalGen+speed+size;
-}
-function fmtBytes(b){ return b >= 1e9 ? (b/1e9).toFixed(b >= 1e10 ? 0 : 1)+' GB' : Math.round(b/1e6)+' MB'; }
-function interpOn(){ return $('interp').checked; }
-function srcFps(){ const [n,d]=(info.fps||'24/1').split('/'); return (+n)/((+d)||1); }
-// TARGET FPS is authoritative (the #fpsin box); the multiplier stepper is a linked view of it (see
-// setTarget/syncTargetUI). targetFps is the box value; gridMulti() below picks the engine path from it.
-function targetFps(){ if(!interpOn()) return srcFps();
-  const v = parseFloat($('fpsin').value); return (isNaN(v) || v <= 0) ? srcFps()*2 : v; }
-function sliderMin(){ return info ? Math.max(1, Math.round(srcFps())) : 1; }        // never target below the source rate
-function sliderMax(){ return info ? srcFps() * 100 : 2400; }   // hard cap at exactly 100x the EXACT source (24000/1001 -> 2397.602, kept on-grid; not a rounded 2400)
-// Decimals to display: match the source's natural precision (23.976 -> 3, 24 -> 0, 29.97 -> 2), taking
-// the MORE precise of source and monitor rate so screen-match values also render exactly (24 src +
-// 359.99 Hz -> 2). r_frame_rate is a rational (24000/1001), so read precision off a 3-dp rounding.
-function decimalsOf(x){ const s = (+x).toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
-  const i = s.indexOf('.'); return i < 0 ? 0 : s.length - 1 - i; }
-function targetDecimals(){ return info ? Math.max(decimalsOf(srcFps()), decimalsOf(screenHz)) : 0; }
-function fpsValid(t){ if(!interpOn()) return true; return t >= sliderMin() && t <= sliderMax(); }
-function outRatio(){ if(!interpOn()) return 1; return targetFps()/srcFps(); }
-// On-grid eligibility: if the integer target is an exact integer multiple of the (fractional) source
-// fps, run the GMFSS integer --multi path (real endpoints, exact for 23.976); else resample via --fps.
-// Returns the multiplier N (>=2) for the on-grid case, or 0 for the resample case. Uses the fractional
-// srcFps so 48 -> N=2 on a 23.976 source (round(23.976*2)=48).
-function gridMulti(){ if(!info) return 0; const s = srcFps(); const t = targetFps(); const N = Math.round(t/s);
-  return (N >= 2 && Math.abs(s*N - t) < 0.02) ? N : 0; }   // on-grid when the target is an exact multiple (tolerance covers the 3-dp display rounding)
-// The multiplier and the target-fps box are two views of ONE value: targetFps() (the #fpsin box) stays
-// authoritative for the engine; the multiplier is targetFps/srcFps. Editing either updates the other.
-// Push a target into the fps box (clamped, formatted to the source/monitor decimal count; the VALUE
-// keeps its exact fractional precision, e.g. 2x of 23.976 = 47.952), then reflect it in the multiplier.
-function setTarget(v){ v = Math.min(sliderMax(), Math.max(sliderMin(), v));
-  $('fpsin').max = sliderMax(); $('fpsin').value = v.toFixed(targetDecimals());
-  $('fpsin').title = 'exact: ' + (+v.toFixed(4)) + ' fps';   // the box shows source-precision decimals; hover reveals the true value (e.g. 100x of 24000/1001 = 2397.6024)
-  syncTargetUI(); }
-// Canonical multiplier text for the current target: the exact integer when on-grid (2, 3, ...), else
-// the fractional ratio (e.g. 2.08 for a typed 50 fps on a 24 source, which the engine resamples).
-// Trailing zero trimmed (2.5 stays "2.5", not "2.50"); a lone ".0" is kept so an off-grid ~2.0
-// never masquerades as the on-grid integer 2.
-function multText(){ const gm = gridMulti();
-  return gm ? String(gm) : (targetFps()/srcFps()).toFixed(2).replace(/0$/, ''); }
-// Reflect the target into the multiplier box and grey both steppers when the target is locked. Skip
-// rewriting #multin while it is focused, so a two-keystroke entry ("2" -> "20") isn't reset mid-type.
-function syncTargetUI(){ const dis = !interpOn() || $('screenfps').checked || goMode === 'running';
-  ['multin','multup','multdn','fpsup','fpsdn'].forEach(id => { const e = $(id); if(e) e.disabled = dis; });
-  if($('multin') && document.activeElement !== $('multin')) $('multin').value = multText(); }
-// Apply a multiplier k: the target becomes k x srcFps (exact, on-grid), clamped + persisted.
-function applyMult(k){ if(isNaN(k) || k < 1) return; setTarget(srcFps()*k);
-  localStorage.setItem('fpsTarget', parseFloat($('fpsin').value)); refresh(); }
-// Nudge the target fps by 1, snapping onto the integer grid first (47.952 -> 48 up / 47 down).
-function nudgeFps(d){ const t = targetFps(); const nt = d > 0 ? Math.floor(t + 1e-6) + 1 : Math.ceil(t - 1e-6) - 1;
-  setTarget(nt); localStorage.setItem('fpsTarget', parseFloat($('fpsin').value)); refresh(); }
-// Press-and-hold auto-repeat: one step on press, then repeat every 60ms after a 350ms hold. Each step
-// re-reads the current target, so holding + walks the value up (and stops at the clamp) instead of once.
-function holdRepeat(btn, fn){ let to, iv;
-  const stop = () => { clearTimeout(to); clearInterval(iv); };
-  const step = () => { if(btn.disabled){ stop(); return; } fn(); };
-  btn.addEventListener('mousedown', e => { if(btn.disabled) return; e.preventDefault(); step();
-    to = setTimeout(() => { iv = setInterval(step, 60); }, 350); });
-  ['mouseup', 'mouseleave'].forEach(ev => btn.addEventListener(ev, stop));
-}
-holdRepeat($('multup'), () => applyMult(Math.round(targetFps()/srcFps()) + 1));
-holdRepeat($('multdn'), () => applyMult(Math.max(2, Math.round(targetFps()/srcFps()) - 1)));
-holdRepeat($('fpsup'),  () => nudgeFps(+1));
-holdRepeat($('fpsdn'),  () => nudgeFps(-1));
-// Typing a multiplier drives the fps box live; on commit it snaps to canonical (integer when on-grid).
-$('multin').oninput = () => { const k = parseFloat($('multin').value); if(!isNaN(k) && k > 0) applyMult(k); };
-$('multin').onchange = () => { const k = parseFloat($('multin').value);
-  if(isNaN(k) || k < 1){ $('multin').value = multText(); return; } applyMult(k); $('multin').value = multText(); };
-// Interp-off runs are named for the pass that actually runs (priority: restore > sharpen > HDR;
-// an upscale keeps its _<h>p tag instead, as before). The '_unchanged' fallback covers the
-// nothing-enabled combo, which is only ever a display placeholder: startRun refuses it with the
-// "Nothing to do" alert, so no file by that name is produced - the tag just tells the user the
-// current settings would change nothing, instead of claiming a sharpen that will not happen.
-function passTag(){
-  if(restoreOn()) return '_restored';
-  if($('sharpen').checked && (parseFloat($('sharpval').value) || 0) > 0) return '_sharpened';
-  if(hdrOn()) return '_hdr';
-  return '_unchanged';
-}
-function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
-  const d = upDims();                                   // upscale target ({w,h} or null); tag the new height
-  const res = d ? '_' + d.h + 'p' : '';
-  const ext = (info && info.needMkv) ? '.mkv' : '.mp4';   // subtitles/extra tracks ride in mkv
-  return interpOn() ? (b + '_' + Math.round(targetFps()) + 'fps' + res + ext)
-                    : (b + (d ? res : passTag()) + ext); }
-// A custom name that STILL CARRIES an auto tag (_<n>fps or _<n>p) stays in sync with the settings:
-// the user's folder, base words and extension are preserved, and the _<n>fps / _<n>p suffix is
-// regenerated from the current fps + upscale - so changing the fps updates the fps tag, and enabling
-// or changing the upscale resolution updates (or appends) the resolution tag, layered on top of the
-// user's edit. A name the user renamed with neither tag left is treated as fully custom and never rewritten.
-function retagCustom(name){
-  if(!/_\d+fps(?=[._]|$)|_\d+p(?=[._]|$)/.test(name)) return name;
-  const slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
-  const dir = name.slice(0, slash + 1);                 // '' when there is no directory part
-  const rest = name.slice(slash + 1);
-  const dot = rest.lastIndexOf('.');
-  const ext = dot >= 1 ? rest.slice(dot) : '';          // keep the user's chosen extension
-  let base = dot >= 1 ? rest.slice(0, dot) : rest;
-  base = base.replace(/_\d+fps/g, '').replace(/_\d+p(?=_|$)/g, '')
-             .replace(/_sharpened|_restored|_unchanged|_hdr(?=_|$)/g, '');
-  const d = upDims();
-  const res = d ? '_' + d.h + 'p' : '';
-  const tags = interpOn() ? ('_' + Math.round(targetFps()) + 'fps' + res) : (d ? res : passTag());
-  return dir + base + tags + ext;
-}
-function refresh(){ if(!input) return;
-  const t = targetFps();
-  const N = gridMulti();
-  $('multlabel').textContent = !interpOn() ? ''
-    : N ? 'on-grid · real frames'                                           // exact integer multiple of the source
-    : Math.round(t) <= Math.round(srcFps()) ? 'no new frames'               // degenerate: output fps = source fps
-    : 'resampled';                                                          // non-integer multiple: engine uses --fps
-  syncTargetUI();
-  if(!fpsValid(t)){ $('out').value = ''; $('out').placeholder = 'target fps must be ' + sliderMin() + '-' + sliderMax(); lastOut = null; return; }
-  $('out').placeholder = 'output file path';
-  if(customOut) customOut = retagCustom(customOut);   // re-sync the _fps/_p tags in the user's name
-  lastOut = customOut || outName(); $('out').value = lastOut;
-  if(goMode === 'idle') $('out').disabled = false;   // editable while idle; startRun locks it
-  updateDvHpHints();   // the DV/HDR10+ "skipped for MKV" hints track the resolved output name
-  scheduleCheckResume();   // the Resume detection tracks the resolved output name too
-}
-// Crash/exit resume detection: an interrupted render leaves its stage-1 video + sidecar next to
-// the output (see the engine's resume block); when the resolved output name has one, #go becomes
-// "Resume" and the render continues where it left off (the engine re-validates the settings
-// signature itself, so a stale match here degrades to a fresh render with a log notice, never a
-// wrong file). Debounced: refresh() fires on every slider scrub.
-let resumeInfo = null, resumeTimer = null, resumeLoggedFor = null, resumeSeq = 0, resumeTipShown = false;
-function scheduleCheckResume(){ clearTimeout(resumeTimer); resumeTimer = setTimeout(checkResume, 150); }
-async function checkResume(){
-  const seq = ++resumeSeq;
-  let r = null;
-  try { if(input && lastOut) r = await ipcRenderer.invoke('check-resume', lastOut); } catch {}
-  if(seq !== resumeSeq) return;          // a newer check superseded this one mid-flight
-  resumeInfo = r;
-  if(goMode !== 'idle') return;          // never touch the button while it is the Pause toggle
-  $('go').textContent = resumeInfo ? 'Resume' : 'Smooth It!';
-  if(resumeInfo){
-    const pct = resumeInfo.total ? Math.round(100*resumeInfo.pair/resumeInfo.total) : 0;
-    $('go').title = 'Continues the interrupted render from where it left off (~'+pct+'% is already done). '
-                  + 'You can pause or close the app again at any time and resume later.';
-    $('status').textContent = 'Interrupted render found: click Resume to continue from ~'+pct+'%.';
-    if(resumeLoggedFor !== lastOut){
-      resumeLoggedFor = lastOut;
-      log('>> Interrupted render found for this file; it will resume from ~'+pct+'% instead of starting over\n');
-    }
-  } else {
-    if(resumeLoggedFor === lastOut) resumeLoggedFor = null;   // gone (e.g. cancelled): a future interruption logs anew
-    $('go').title = 'Starts the render. You can pause or even close the app mid-render: it resumes where it left off.';
-  }
-}
-// Editing the output path inline: a non-empty value becomes the custom output (kept across setting
-// changes, like the Change... dialog); clearing it on blur reverts to the auto-generated name.
-$('out').oninput = () => { const v = $('out').value.trim(); customOut = v || null; lastOut = v || outName(); };
-$('out').onchange = () => { if(!$('out').value.trim()){ customOut = null; refresh(); } };
-
-async function loadVideo(f){
-  if(!f) return false;
-  input = f; customOut = null; $('path').textContent = f;
-  try { localStorage.setItem('dir', path.dirname(f)); } catch {}
-  const p = await ipcRenderer.invoke('probe', f);
-  // A modal alert would stall an unattended batch, so mid-batch probe failures go to the log.
-  if(p.error){ if(batchAuto) log('>> Could not read '+f+': '+p.error+'\n'); else alert('Could not read video: '+p.error); return false; }
-  const streams = p.streams || [];
-  const s = streams.find(x => x.codec_type === 'video') || streams[0] || {};
-  // Track passthrough: subtitles or mp4-incompatible audio push the output container to .mkv
-  // (mirrors the engine's own MP4_AUDIO_OK rule, so the name shown matches what it writes).
-  const MP4A = ['aac','ac3','eac3','mp3','alac','opus','flac'];
-  const auds = streams.filter(x => x.codec_type === 'audio');
-  const subs = streams.filter(x => x.codec_type === 'subtitle');
-  info = { fps: s.r_frame_rate, w: s.width, h: s.height, nb: +(s.nb_frames||0),
-           dur: +((p.format||{}).duration||0), codec: s.codec_name,
-           transfer: s.color_transfer || '',
-           nAud: auds.length, nSub: subs.length,
-           needMkv: subs.length > 0 || auds.some(a => !MP4A.includes((a.codec_name||'').toLowerCase())) };
-  info.srcHdr = info.transfer === 'smpte2084' || info.transfer === 'arib-std-b67';
-  // TrueHDR converts SDR only; for an HDR source the engine carries the HDR through untouched.
-  $('rtxhdr').disabled = info.srcHdr;
-  $('rtxhdrhint').textContent = info.srcHdr ? '(source is already HDR, carried through as-is)'
-                                            : '(convert SDR video to HDR)';
-  showWorkspace();
-  $('info').style.display='block';
-  $('res').textContent = s.width+' x '+s.height;
-  $('fps').textContent = srcFps().toFixed(decimalsOf(srcFps()));   // natural precision: 24 -> "24", 23.976 -> "23.976"
-  $('fps').title = (info.fps ? info.fps + ' = ' : '') + (+srcFps().toFixed(6)) + ' fps (shown rounded)';   // reveal the exact rational, e.g. 24000/1001 = 23.976024
-  const d=info.dur|0; $('dur').textContent = (d/3600|0)+':'+String((d%3600/60|0)).padStart(2,'0')+':'+String(d%60).padStart(2,'0');
-  $('codec').textContent = (s.codec_name || '?')
-    + (info.nAud > 1 || info.nSub ? '  ·  ' + info.nAud + ' audio · ' + info.nSub
-       + ' subtitle' + (info.nSub === 1 ? '' : 's') + ' (kept' + (info.needMkv ? ', MKV output)' : ')') : '');
-  $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true; $('play').disabled = true;
-  $('live').style.display = 'none';   // stale live thumbnail belongs to the previous video
-  $('status').textContent = 'Ready. Pick a multiplier or fps, then click Smooth It!';
-  applyScreenFps();      // re-asserts the interp / screen-rate state and recomputes the output name
-  syncUpscale();         // recompute the upscale target + output dims for this video's resolution
-  // The preview cold-starts Python + torch + a CUDA context (several seconds on the first video of a
-  // session), which SATURATES the GPU and stalls Chromium's compositor - so if it spawns before the
-  // file info has actually painted, the info (already probed in ~100ms, DOM updated synchronously
-  // above) can't reach the screen until that Python eases, which is the "video info loads slowly"
-  // bug. So: reveal the menu + file info now (showWorkspace above, synchronous), paint a loading
-  // wheel on the preview panes (showPreviewInitializing, synchronous), then wait for a REAL composited
-  // frame (two rAFs = one full paint) so the info is guaranteed on screen BEFORE the heavy preview
-  // Python starts. Skipped when a batch auto-advances (no per-item preview).
-  if(!batchAuto){
-    showPreviewInitializing();
-    requestAnimationFrame(() => requestAnimationFrame(openPreviewForVideo));
-  }
-  return true;
-}
-// One or more inputs: the first loads now, the rest queue for the same settings back to back.
-function queueVideos(paths){
-  const list = (paths || []).filter(Boolean);
-  if(!list.length) return;
-  batch = list.slice(1); batchTotal = list.length; batchFailed = [];
-  if(batchTotal > 1) log('>> Queued '+batchTotal+' files (same settings, default output names)\n');
-  loadVideo(list[0]);
-}
-$('pick').onclick = async () => { queueVideos(await ipcRenderer.invoke('pick-video', localStorage.getItem('dir') || undefined)); };
-// Number box is the exact target. While typing, only clamp the upper bound (so partial entries aren't
-// fought) and persist; the low-end clamp + two-decimal (.00) formatting happen on commit.
-$('fpsin').oninput = () => { let v = parseFloat($('fpsin').value); const mx = sliderMax(); if(v > mx){ v = mx; $('fpsin').value = mx; }
-  if(!isNaN(v)) localStorage.setItem('fpsTarget', v); refresh(); };
-// On commit (blur / Enter / spinner): clamp into range and re-render at the source/monitor decimal count.
-$('fpsin').onchange = () => { let v = parseFloat($('fpsin').value); if(isNaN(v)) return;
-  v = Math.min(sliderMax(), Math.max(sliderMin(), v));
-  $('fpsin').value = v.toFixed(targetDecimals()); localStorage.setItem('fpsTarget', v); refresh(); };
-// The persisted target (key fpsTarget) is restored per-video in applyScreenFps once the source fps is known.
-
-// Sharpen (CAS): a checkbox enables Contrast Adaptive Sharpening and reveals a 0..1 strength slider;
-// unchecking hides the slider and disables it. Default is on at full strength (1.0). The strength is
-// forwarded to the engine as --sharpen; both the on/off state and the value persist between sessions.
-function syncSharpen(){
-  const on = $('sharpen').checked;
-  $('sharpwrap').style.display = on ? 'flex' : 'none';
-  $('sharpnum').textContent = (+$('sharpval').value).toFixed(2);
-  syncPreview();        // show/hide the preview panel as sharpen turns on/off
-}
-const savedSharpOn = localStorage.getItem('sharpenOn');
-if(savedSharpOn !== null) $('sharpen').checked = savedSharpOn === '1';
-const savedSharpVal = localStorage.getItem('sharpenVal');
-if(savedSharpVal !== null) $('sharpval').value = savedSharpVal;
-syncSharpen();
-$('sharpen').onchange = () => { localStorage.setItem('sharpenOn', $('sharpen').checked ? '1' : '0'); syncSharpen(); };
-$('sharpval').oninput = () => { localStorage.setItem('sharpenVal', $('sharpval').value); syncSharpen(); };
-
-// Restore: engine --restore. Real-ESRGAN's anime-video model cleans compression noise and
-// redraws linework on every output frame (before the upscale); fine texture can flatten - it
-// is a generative repaint, not a filter. Off by default: it changes the look, and every
-// emitted frame pays a second model pass.
-function restoreOn(){ return $('restore').checked; }
-// Restore ALWAYS starts off (user call 2026-07-04): an expensive, look-altering pass you opt
-// into per session, so its state is deliberately NOT persisted; old key retired.
-localStorage.removeItem('restoreOn');
-
-// Match screen refresh rate: when checked, the output target fps is the monitor's refresh rate
-// (rounded up, fetched from the main process) and the multiplier / fps inputs are overridden and
-// greyed. The detected rate fills the label; the on/off state persists. applyScreenFps re-asserts
-// the override after a video loads or a run finishes, since both otherwise reset the fps mode.
-let screenHz = 60;
-function applyScreenFps(){
-  const interp = interpOn();
-  const on = interp && $('screenfps').checked;   // the screen-rate override only applies when interpolating
-  // The fps box + multiplier stepper are greyed when interpolation is off (no rate change) or when
-  // the screen-rate override owns the target (stepper greying is handled by syncTargetUI).
-  $('fpsin').disabled = !interp || $('screenfps').checked;
-  if(info){
-    if(on) setTarget(screenHz);                   // match the monitor exactly (1000Hz on a 24 source = 41.67x -> --fps)
-    else if(interp){ const v = +localStorage.getItem('fpsTarget');   // restore the persisted target (survives run/reload); default 2x
-      setTarget(v >= sliderMin() ? v : srcFps()*2); }   // default 2x, kept exact (23.976 -> 47.952)
-    else {
-      // Interpolation off: the greyed box is a display, and the output rate IS the source rate, so
-      // show it (matching the 1.0x the multiplier view already shows) instead of the stale target.
-      // Written directly, not via setTarget: the clamp there would round 23.976 up to the 24 floor,
-      // and the persisted target must survive untouched for the restore branch above on re-enable.
-      $('fpsin').value = srcFps().toFixed(targetDecimals());
-      $('fpsin').title = 'output keeps the source frame rate while Interpolate is off';
-      syncTargetUI();
-    }
-  }
-  refresh();
-}
-if(localStorage.getItem('screenfps') === '1') $('screenfps').checked = true;
-$('screenfps').onchange = () => { localStorage.setItem('screenfps', $('screenfps').checked ? '1' : '0'); applyScreenFps(); };
-ipcRenderer.invoke('refresh-rate').then(hz => {
-  screenHz = (+hz) || 60; $('screenhz').textContent = screenHz;
-  if(info) applyScreenFps();   // monitor rate can add decimals (359.99 -> 2), so reformat the target box now that it's known
-});
-
-// Upscale-to-resolution: a target height chosen from the dropdown (or the Custom slider) drives an
-// arbitrary upscale factor (targetHeight / sourceHeight), keeping the source aspect ratio. RTX VSR
-// (the #rtxvsr toggle, once its runtime is installed) does the upscale with NVIDIA AI; with it off or
-// absent the engine uses a bicubic resize. Off by default; the choice persists. Independent of
-// interpolation, so it also applies in sharpen-only mode. There is no integer-scale restriction (RTX
-// VSR was probed clean to 16K), but the output is bounded by two real limits: the encoders top out at
-// 16K (NVENC caps either dimension at 8192px, verified on the RTX 5090; past that the ENGINE switches
-// to a CPU encoder automatically - AV1 to ~12K, H.266/VVC to 16K, verified 15360x8640 - so the GUI
-// wall is VVC's), and the engine clamps the upscale factor to 16x. The custom-height slider and
-// upDims() honour both, so the long side never exceeds 15360px and the factor never exceeds 16x.
-const ENC_MAX = 15360;                           // 16K long side: the last encoder standing (libvvenc)
-const NVENC_MAX = 8192;                          // above this the engine encodes on the CPU (slower)
-const MAX_FACTOR = 16;                           // engine UPSCALE_F clamp (gmfss_interp.py)
-let screenW = 0, screenH = 0, rtxReady = { vsr:false, hdr:false, bridge:false };
-function upTargetH(){                            // chosen output height (0 = off)
-  const v = $('upres').value;
-  if(v === '0') return 0;
-  if(v === 'screen') return screenH || 0;
-  if(v === 'custom') return +$('upcustom').value || 0;
-  return +v || 0;
-}
-function upDims(){                               // {w,h} of the upscaled output (encoder/factor clamped), or null
-  if(!info || !info.h || !info.w) return null;
-  let th = upTargetH();
-  if(!th || th <= info.h) return null;          // upscale only; a target at/below the source is a no-op
-  th = Math.min(th, info.h * MAX_FACTOR, ENC_MAX);   // 8x engine factor cap, then the encoder long-side cap
-  let h = th - (th % 2);
-  let w = Math.round(info.w * h / info.h); w = w - (w % 2);
-  if(w > ENC_MAX){                              // wide aspect: width is the binding side, fit it to 8192px
-    h = Math.floor(ENC_MAX * info.h / info.w / 2) * 2;
-    w = Math.round(info.w * h / info.h); w = w - (w % 2);
-  }
-  return { w, h };
-}
-function upFactor(){ const d = upDims(); return d ? d.h / info.h : 0; }   // arbitrary factor (0 = off)
-function upBackendName(){ return ($('rtxvsr').checked && rtxReady.vsr) ? 'RTX VSR' : 'bicubic'; }
-function syncUpscale(){
-  $('upcustomwrap').style.display = $('upres').value === 'custom' ? 'inline-flex' : 'none';
-  if(info && info.w && info.h){                  // bound the custom slider to what this source + encoder can reach
-    const m = Math.max(720, Math.min(Math.floor(ENC_MAX * Math.min(1, info.h / info.w) / 2) * 2, info.h * MAX_FACTOR));
-    if(+$('upcustom').max !== m){ $('upcustom').max = m; if(+$('upcustom').value > m) $('upcustom').value = m; }
-  }
-  $('upcustomnum').textContent = (+$('upcustom').value) + 'p';
-  let txt = '';
-  if($('upres').value !== '0'){
-    const d = upDims();
-    if(d) txt = '→ ' + d.w + ' × ' + d.h + '  ·  ' + upBackendName()
-                + (upBackendName() === 'bicubic' ? ' (turn on RTX VSR for AI)' : '')
-                + ((d.w > NVENC_MAX || d.h > NVENC_MAX) ? '  ·  CPU encode at this size (slower)' : '')
-                + ((d.w >= ENC_MAX || d.h >= ENC_MAX) ? '  ·  at the 16K encoder cap' : '');
-    else if(info) txt = 'source is already at/above that height, no upscale';
-    else txt = 'load a video to preview the result';
-  }
-  $('upinfo').textContent = txt;
-  refresh();             // the target height is tagged into the output filename
-}
-function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.value === 'screen');
-  if(o) o.textContent = 'Match screen' + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
-// NOTE: the element id is outcodec, NOT codec - id "codec" is taken by the source-codec info span.
-// Per-choice guidance so the trade-off is clear without leaving the dropdown. Size claims are
-// from a real A/B at the engine's verified visually-lossless settings (2026-07-10 quality-first
-// tuning: on the 1080p sample HEVC CQ17-p7-ladder 2.25 MB / AV1 CQ22 2.17 MB / VVC QP17 0.98 MB).
-const CODEC_HINTS = {
-  hevc: 'safest choice: TVs, phones, editors and players all take it; audio is copied',
-  av1:  'same GPU speed and size class as HEVC (a bit smaller on normal content); royalty-free, plays in every modern browser, but devices from before ~2020 may not decode it',
-  vvc:  'smallest files of the three (roughly half of HEVC), but the CPU encode is slow and almost no player supports H.266 yet (archival)',
-};
-function syncCodec(){ $('codechint').textContent = CODEC_HINTS[$('outcodec').value] || ''; }
-const savedCodec = localStorage.getItem('codec');
-if(savedCodec && [...$('outcodec').options].some(o => o.value === savedCodec)) $('outcodec').value = savedCodec;
-$('outcodec').onchange = () => { localStorage.setItem('codec', $('outcodec').value); syncCodec(); };
-syncCodec();
-const savedUpres = localStorage.getItem('upres');
-if(savedUpres && [...$('upres').options].some(o => o.value === savedUpres)) $('upres').value = savedUpres;
-const savedUpcustom = localStorage.getItem('upcustom'); if(savedUpcustom) $('upcustom').value = savedUpcustom;
-$('upres').onchange = () => { localStorage.setItem('upres', $('upres').value); syncUpscale(); refreshPreviewIfOpen(); };
-$('upcustom').oninput = () => { localStorage.setItem('upcustom', $('upcustom').value); syncUpscale(); };
-$('upcustom').addEventListener('change', refreshPreviewIfOpen);
-ipcRenderer.invoke('screen-size').then(s => { screenW = (s&&s.width)||0; screenH = (s&&s.height)||0; setScreenOptLabel(); syncUpscale(); });
-
-// NVIDIA RTX (opt-in): real RTX Video Super Resolution + RTX HDR via the engine/rtxvideo CUDA bridge
-// + NVIDIA's feature DLLs. Both OFF by default. The feature DLLs are non-redistributable, so the app
-// can't bundle them; instead you pick the downloaded RTX Video SDK .zip and the app copies the two
-// DLLs into engine/rtxvideo for you. Readiness = the bridge + the feature's model DLL present.
-function syncRtx(){
-  const on = $('rtxvsr').checked || $('rtxhdr').checked;
-  // The setup box appears only when a requested feature's runtime is missing (or while installing);
-  // checkRtxReady() collapses it once the files are correctly installed so READY takes no screen space.
-  // With no feature requested there is nothing to set up, so hide it outright.
-  if(on) checkRtxReady();
-  else $('rtxsetup').style.display = 'none';
-}
-async function checkRtxReady(){
-  $('rtxstatus').textContent = 'checking...'; $('rtxstatus').style.color = 'var(--sub)';
-  try { rtxReady = await ipcRenderer.invoke('rtx-ready'); } catch { rtxReady = { vsr:false, hdr:false, bridge:false }; }
-  const needVsr = $('rtxvsr').checked, needHdr = $('rtxhdr').checked;
-  const ok = (!needVsr || rtxReady.vsr) && (!needHdr || rtxReady.hdr);
-  const lines = [];
-  if(needVsr) lines.push((rtxReady.vsr ? '✓' : '✗') + ' RTX Video Super Resolution');
-  if(needHdr) lines.push((rtxReady.hdr ? '✓' : '✗') + ' RTX HDR');
-  if(ok){
-    $('rtxstatus').textContent = '✓ READY'; $('rtxstatus').style.color = 'var(--green)';
-    $('rtxsteps').innerHTML = lines.join('<br>') + '<br>The RTX Video runtime is installed.';
-  } else {
-    $('rtxstatus').textContent = '✗ NOT READY'; $('rtxstatus').style.color = '#e85c5c';
-    const detail = rtxReady.bridge === false
-      ? 'The RTX bridge (rtxvideo_cuda.dll) is missing from engine/rtxvideo. Rebuild it (see DEVELOPMENT.md, "Building the native bridges").'
-      : 'Click <b>Get from NVIDIA</b>, then <b>Choose .zip&hellip;</b> and pick the downloaded RTX_Video_SDK&hellip;.zip. It installs automatically.';
-    $('rtxsteps').innerHTML = lines.join('<br>') + '<br>' + detail;
-  }
-  $('rtxbtns').style.display = ok ? 'none' : '';   // hide Get / Choose once the runtime is ready
-  // Collapse the whole setup box once the requested runtime is installed, so a READY state takes no
-  // screen space; it reappears only while something needed is still missing.
-  $('rtxsetup').style.display = ok ? 'none' : 'block';
-  syncUpscale();         // the upscale backend label depends on VSR readiness
-  refreshPreviewIfOpen(); // re-render the open preview now that HDR readiness is known
-}
-async function doInstall(source){
-  $('rtxsetup').style.display = 'block';   // show install progress (checkRtxReady collapses it again on success)
-  $('rtxstatus').textContent = 'installing...'; $('rtxstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('rtx-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('rtxsteps').innerHTML = '✗ ' + (r.error || 'install failed')
-      + '<br>Pick the downloaded RTX_Video_SDK&hellip;.zip again with <b>Choose .zip&hellip;</b>.';
-  await checkRtxReady();
-  if(!r.ok) $('rtxsetup').style.display = 'block';   // keep an install error visible even if no toggle needs the feature
-}
-$('rtxget').onclick = () => ipcRenderer.invoke('rtx-open-download');
-$('rtxbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('rtx-choose','zip'); if(p) doInstall(p); };  // selecting a .zip auto-installs
-if(localStorage.getItem('rtxvsrOn') === '1') $('rtxvsr').checked = true;   // default OFF
-if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // default OFF
-$('rtxvsr').onchange = () => { localStorage.setItem('rtxvsrOn', $('rtxvsr').checked ? '1' : '0'); syncRtx(); syncUpscale(); refreshPreviewIfOpen(); };
-$('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); refreshPreviewIfOpen(); };
-syncRtx();
-// Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
-ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); syncPreview(); });
-
-// Interpolation model: GMFSS (default) vs "NVIDIA Smooth Motion" (NVIDIA Optical Flow FRUC). Two
-// checkboxes acting as an exclusive pair (user-chosen UX): ticking one clears the other, and
-// unticking the active one hands the choice back to its sibling, so exactly one model is always
-// selected. The FRUC runtime (NvOFFRUC.dll) is NVIDIA proprietary + user-installed from the Optical
-// Flow SDK .zip. The Smooth Motion checkbox is ALWAYS clickable (ticking it visibly clears GMFSS);
-// it just reveals a one-time installer when the runtime is missing, and a render only uses FRUC once
-// it is installed - otherwise it falls back to GMFSS (see modelIsFruc + the run payload gate below).
-let frucReady = false, frucBridge = false, svpReady = false, dlssReady = false, dlssMissing = [];
-function modelIsFruc(){ return $('modelfruc').checked && frucReady; }
-function modelIsSvp(){ return $('modelsvp').checked && svpReady; }
-function modelIsDlss(){ return $('modeldlss').checked && dlssReady; }
-// RIFE ships bundled (weights vendored in engine/rife), so it is always ready.
-function modelIsRife(){ return $('modelrife').checked; }
-// The DRBA sub-checkbox (default OFF) adds anime-pacing timing on top of the same RIFE weights.
-function modelIsRifeDrba(){ return modelIsRife() && $('rifedrba').checked; }
-// The NVIDIA Optical Flow sub-checkbox (default ON) picks between the two SVP engine variants:
-// on = svpflow's SmoothFps_NVOF (hardware motion vectors), off = SVP's own block-matching search.
-function modelIsSvpNvof(){ return modelIsSvp() && $('svpnvof').checked; }
-const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelsvp')];
-function frucSetupHtml(){
-  const detail = !frucBridge
-    ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
-    : 'Click <b>Get from NVIDIA</b>, then <b>Choose .zip&hellip;</b> and pick the downloaded Optical_Flow_SDK&hellip;.zip. It installs automatically. Until then GMFSS is used.';
-  return "NVIDIA Smooth Motion uses NVIDIA's Optical Flow runtime (a one-time download, not bundled).<br>" + detail;
-}
-async function refreshFrucState(){
-  try { const r = await ipcRenderer.invoke('fruc-ready'); frucReady = !!(r && r.ready); frucBridge = !!(r && r.bridge); }
-  catch { frucReady = false; frucBridge = false; }
-  try { const s = await ipcRenderer.invoke('svp-ready'); svpReady = !!(s && s.ready); }
-  catch { svpReady = false; }
-  // DLSS ("DLSS 4.5" Frame Generation) ships bundled, so not-ready means files were deleted from
-  // engine/dlssg (a broken install); GPU/driver support is only knowable at render time.
-  try { const d = await ipcRenderer.invoke('dlssg-ready'); dlssReady = !!(d && d.ready); dlssMissing = (d && d.missing) || []; }
-  catch { dlssReady = false; dlssMissing = []; }
-}
-// Reflect the current model choice: show a setup hint only while the chosen model's runtime is
-// missing (FRUC has a one-time DLL installer; SVP just needs SVP 4 installed on the machine).
-function syncModel(){
-  localStorage.setItem('interpModel',
-    $('modelsvp').checked ? 'svp' : $('modelfruc').checked ? 'fruc' :
-    $('modeldlss').checked ? 'dlssg' : $('modelrife').checked ? 'rife' : 'gmfss');
-  // The DRBA sub-option only makes sense while RIFE is the chosen model (always ready: bundled).
-  $('rifedrbarow').style.display = $('modelrife').checked ? '' : 'none';
-  if($('modeldlss').checked && !dlssReady){
-    $('dlsssteps').innerHTML = 'The bundled DLSS runtime is incomplete: <b>' + dlssMissing.join(', ')
-      + '</b> missing from engine/dlssg. Reinstall the app (or rebuild per engine/dlssg/build_src/BUILD.md). '
-      + 'Until then GMFSS is used.';
-    $('dlsssetup').style.display = 'block';
-  } else {
-    $('dlsssetup').style.display = 'none';
-  }
-  // DLSS-FG has no arbitrary-timestep API: it makes only the evenly spaced frames between
-  // consecutive source frames, i.e. whole 2x-6x multipliers (multi-frame generation). Picking it
-  // with an off-grid or out-of-range target snaps to 2x (the steppers stay usable; a bad target
-  // is blocked with guidance at Smooth It! time).
-  if($('modeldlss').checked && dlssReady && info){
-    const gm = gridMulti();
-    if(gm < 2 || gm > 6) applyMult(2);
-  }
-  if($('modelfruc').checked && !frucReady){
-    $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
-    $('frucsteps').innerHTML = frucSetupHtml();
-    $('frucbtns').style.display = '';
-    $('frucsetup').style.display = 'block';
-  } else {
-    $('frucsetup').style.display = 'none';
-  }
-  $('svpstatus').style.color = '#e85c5c';
-  const svpShow = ($('modelsvp').checked && !svpReady);
-  if(svpShow) $('svpsteps').innerHTML = SVP_STEPS_HTML;  // clears a stale picker error
-  $('svpsetup').style.display = svpShow ? 'block' : 'none';
-  // The SVP variant sub-option only makes sense once SVP is the chosen, working model.
-  $('svpnvofrow').style.display = ($('modelsvp').checked && svpReady) ? '' : 'none';
-}
-// Exclusive-group behaviour: ticking a box clears the others; unticking the ACTIVE box falls back
-// to GMFSS (a model is always chosen, there is no "neither" state; unticking GMFSS re-checks it).
-function pickModel(box){
-  for(const b of MODEL_BOXES()) if(b !== box) b.checked = false;
-  if(!box.checked) $('modelgmfss').checked = true;
-  syncModel();
-}
-async function doFrucInstall(source){
-  $('frucsetup').style.display = 'block';
-  $('frucstatus').textContent = 'installing...'; $('frucstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('fruc-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  await refreshFrucState();
-  if(frucReady){ $('modelfruc').checked = true; $('modelgmfss').checked = false; localStorage.setItem('interpModel','fruc'); $('frucsetup').style.display = 'none'; }
-  else if(r.ok){   // NvOFFRUC.dll copied fine; readiness just needs the one-time bridge build
-    $('frucstatus').textContent = '✓ DLL installed'; $('frucstatus').style.color = 'var(--green)';
-    $('frucsteps').innerHTML = 'NvOFFRUC.dll installed. Last step: build <b>nvoffruc_bridge.dll</b> into '
-      + 'engine/nvoffruc once (see DEVELOPMENT.md, "Building the native bridges"). Until then GMFSS is used.';
-  } else {
-    $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
-    $('frucsteps').innerHTML = '✗ ' + (r.error || 'install failed') + '<br>' + frucSetupHtml();
-  }
-}
-$('frucget').onclick = () => ipcRenderer.invoke('fruc-open-download');
-$('frucbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('fruc-choose'); if(p) doFrucInstall(p); };  // selecting a .zip auto-installs
-$('svpget').onclick = () => ipcRenderer.invoke('svp-open-download');
-// Manual SVP 4 folder pick, for installs outside the default location. A valid pick persists in
-// the main process (userData/svp_dir.txt); on success the setup box simply disappears. On a bad
-// pick the error is shown ABOVE the standard instructions (mirrors the FRUC install error style).
-const SVP_STEPS_HTML = $('svpsteps').innerHTML;
-$('svpbrowse').onclick = async () => {
-  let r = null;
-  try { r = await ipcRenderer.invoke('svp-choose'); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r) return;                                   // dialog cancelled, nothing changes
-  if(r.ok){
-    await refreshFrucState();                      // re-learns svpReady from the saved dir
-    syncModel();                                   // ready now -> hides the setup box
-  } else {
-    $('svpsteps').innerHTML = '&#10007; ' + r.error + '<br>' + SVP_STEPS_HTML;
-  }
-};
-for(const b of ['modelgmfss','modelrife','modeldlss','modelfruc','modelsvp']) $(b).onchange = () => pickModel($(b));
-// The DRBA sub-option persists on its own key (default OFF: max fluidity is the app's default
-// philosophy; DRBA deliberately keeps character cadence); toggling it never clears RIFE.
-$('rifedrba').checked = localStorage.getItem('rifeDrba') === '1';
-$('rifedrba').onchange = () => localStorage.setItem('rifeDrba', $('rifedrba').checked ? '1' : '0');
-// The NVOF sub-option persists on its own key (default ON); it is not part of the exclusive
-// model group, so toggling it never clears the SVP selection.
-$('svpnvof').checked = localStorage.getItem('svpNvof') !== '0';
-$('svpnvof').onchange = () => localStorage.setItem('svpNvof', $('svpnvof').checked ? '1' : '0');
-// On load: learn readiness, restore the saved choice, then reflect it (a setup hint shows if the
-// chosen model's runtime is missing). Skipped while Interpolate is off: syncInterp() has cleared
-// the boxes and re-checking Interpolate restores the choice itself.
-function restoreModelChoice(){
-  let saved = localStorage.getItem('interpModel');
-  if(saved === 'svpnvof'){  // legacy two-checkbox era: "SVP + NVIDIA motion" was its own model
-    saved = 'svp'; localStorage.setItem('interpModel', 'svp'); localStorage.setItem('svpNvof', '1');
-    $('svpnvof').checked = true;
-  }
-  const box = saved === 'svp' ? 'modelsvp' : saved === 'fruc' ? 'modelfruc'
-            : saved === 'dlssg' ? 'modeldlss' : saved === 'rife' ? 'modelrife' : 'modelgmfss';
-  for(const b of MODEL_BOXES()) b.checked = false;
-  $(box).checked = true;
-}
-refreshFrucState().then(() => { if(!interpOn()) return; restoreModelChoice(); syncModel(); });
-
-// --- Dolby Vision export tools (mirrors the RTX library flow) ------------------------------------
-// DV 8.1 export needs ONE non-shippable open-source binary - dovi_tool - dropped into engine/dvtools;
-// the RPU it injects is muxed by the bundled ffmpeg and the DV signaling box is written by the engine
-// itself (hdr10_meta.inject_dv_config), so no GPAC/MP4Box is involved. The setup box appears when the
-// toggle is on and dovi_tool is missing, and collapses to nothing once it is installed (dv-ready).
-let dvReady = { dovi:false, ready:false };
-function syncDv(){
-  if($('dvexport').checked) checkDvReady();
-  else $('dvsetup').style.display = 'none';
-  updateDvHpHints();
-}
-// Both dynamic-HDR exports ride on the HDR10 render AND need an MP4 container. When the loaded
-// video's tracks force MKV output (subtitles, exotic audio), the engine would skip them with only
-// a log notice at render time - so say it up front, next to the checkbox, the moment the output
-// name resolves to .mkv. Pure text updates (no IPC), safe to call from refresh() on every change.
-function updateDvHpHints(){
-  const mkv = (lastOut || '').toLowerCase().endsWith('.mkv');
-  const hint = (name) => !$('rtxhdr').checked ? '(needs RTX HDR on)'
-    : mkv ? '(skipped for this video: its tracks need MKV output, ' + name + ' needs MP4)'
-    : '(HDR10-compatible, falls back to HDR10)';
-  $('dvhint').textContent = hint('Dolby Vision');
-  $('hphint').textContent = hint('HDR10+');
-}
-async function checkDvReady(){
-  $('dvstatus').textContent = 'checking...'; $('dvstatus').style.color = 'var(--sub)';
-  try { dvReady = await ipcRenderer.invoke('dv-ready'); } catch { dvReady = { dovi:false, ready:false }; }
-  const line = (dvReady.dovi ? '✓' : '✗') + ' dovi_tool (RPU generate + inject)';
-  if(dvReady.ready){
-    $('dvstatus').textContent = '✓ READY'; $('dvstatus').style.color = 'var(--green)';
-    $('dvsteps').innerHTML = line + '<br>The Dolby Vision export tool is installed.';
-  } else {
-    $('dvstatus').textContent = '✗ NOT READY'; $('dvstatus').style.color = '#e85c5c';
-    // Name the exact Windows download, since the release page also lists macOS/Linux/ARM builds.
-    $('dvsteps').innerHTML = line
-      + '<br>Click <b>Get dovi_tool</b> and pick the <b>x64 Windows</b> build '
-      + '(<code>&hellip;x86_64-pc-windows-msvc.zip</code>), then <b>Choose .zip&hellip;</b> and pick it; it installs automatically.';
-  }
-  $('dvbtns').style.display = dvReady.ready ? 'none' : '';   // hide Get / Choose once dovi_tool is installed
-  $('dvsetup').style.display = dvReady.ready ? 'none' : 'block';
-}
-async function doDvInstall(source){
-  $('dvsetup').style.display = 'block';
-  $('dvstatus').textContent = 'installing...'; $('dvstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('dv-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('dvsteps').innerHTML = '✗ ' + (r.error || 'install failed')
-      + '<br>Pick the dovi_tool&hellip;.zip again with <b>Choose .zip&hellip;</b>.';
-  await checkDvReady();
-  if(!r.ok) $('dvsetup').style.display = 'block';   // keep an install error visible
-}
-$('dvget').onclick = () => ipcRenderer.invoke('dv-open-download');
-$('dvbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('dv-choose'); if(p) doDvInstall(p); };   // selecting auto-installs
-if(localStorage.getItem('dvOn') === '1') $('dvexport').checked = true;   // default OFF
-$('dvexport').onchange = () => { localStorage.setItem('dvOn', $('dvexport').checked ? '1' : '0'); syncDv(); };
-$('rtxhdr').addEventListener('change', () => { if($('dvexport').checked) syncDv(); });   // hint tracks HDR state
-syncDv();
-
-// --- HDR10+ export tool (mirrors the Dolby Vision flow) ------------------------------------------
-// HDR10+ export needs ONE non-shippable open-source binary - hdr10plus_tool - dropped into
-// engine/hptools; the engine collects the per-frame brightness stats itself and the tool injects
-// the ST 2094-40 SEI (see _hp_export in the engine). The setup box appears when the toggle is on
-// and the tool is missing, and collapses once it is installed (hp-ready).
-let hpReady = { ready:false };
-function syncHp(){
-  if($('hpexport').checked) checkHpReady();
-  else $('hpsetup').style.display = 'none';
-  updateDvHpHints();
-}
-async function checkHpReady(){
-  $('hpstatus').textContent = 'checking...'; $('hpstatus').style.color = 'var(--sub)';
-  try { hpReady = await ipcRenderer.invoke('hp-ready'); } catch { hpReady = { ready:false }; }
-  const line = (hpReady.ready ? '✓' : '✗') + ' hdr10plus_tool (ST 2094-40 SEI inject)';
-  if(hpReady.ready){
-    $('hpstatus').textContent = '✓ READY'; $('hpstatus').style.color = 'var(--green)';
-    $('hpsteps').innerHTML = line + '<br>The HDR10+ export tool is installed.';
-  } else {
-    $('hpstatus').textContent = '✗ NOT READY'; $('hpstatus').style.color = '#e85c5c';
-    // Name the exact Windows download, since the release page also lists macOS/Linux/ARM builds.
-    $('hpsteps').innerHTML = line
-      + '<br>Click <b>Get hdr10plus_tool</b> and pick the <b>x64 Windows</b> build '
-      + '(<code>&hellip;x86_64-pc-windows-msvc.zip</code>), then <b>Choose .zip&hellip;</b> and pick it; it installs automatically.';
-  }
-  $('hpbtns').style.display = hpReady.ready ? 'none' : '';   // hide Get / Choose once the tool is installed
-  $('hpsetup').style.display = hpReady.ready ? 'none' : 'block';
-}
-async function doHpInstall(source){
-  $('hpsetup').style.display = 'block';
-  $('hpstatus').textContent = 'installing...'; $('hpstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('hp-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('hpsteps').innerHTML = '✗ ' + (r.error || 'install failed')
-      + '<br>Pick the hdr10plus_tool&hellip;.zip again with <b>Choose .zip&hellip;</b>.';
-  await checkHpReady();
-  if(!r.ok) $('hpsetup').style.display = 'block';   // keep an install error visible
-}
-$('hpget').onclick = () => ipcRenderer.invoke('hp-open-download');
-$('hpbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('hp-choose'); if(p) doHpInstall(p); };   // selecting auto-installs
-if(localStorage.getItem('hpOn') === '1') $('hpexport').checked = true;   // default OFF
-$('hpexport').onchange = () => { localStorage.setItem('hpOn', $('hpexport').checked ? '1' : '0'); syncHp(); };
-$('rtxhdr').addEventListener('change', () => { if($('hpexport').checked) syncHp(); });   // hint tracks HDR state
-syncHp();
-
-// Before/after preview (panel above Smooth It): render ONE frame at the current spatial settings via the
-// engine's preview.py and show original vs processed. It applies RTX HDR (when on + ready) and FSR/CAS
-// sharpen (when on), so the user can see how those settings change the picture before a full render.
-// Back / random-frame step through random positions across the clip. HDR is tonemapped to sRGB because
-// this canvas cannot show PQ. Images load as object URLs (nodeIntegration) to dodge file:// webSecurity,
-// and old URLs are revoked so memory does not grow.
-const _fs = require('fs');
-let prevTotal = 0, prevIdx = 0, prevHist = [];
-function sharpStrength(){ return $('sharpen').checked ? (parseFloat($('sharpval').value) || 0) : 0; }
-function hdrOn(){ return $('rtxhdr').checked && rtxReady.hdr && !(info && info.srcHdr); }
-function setPrevImg(el, file, mime){
-  const old = el.dataset.url; if(old){ try { URL.revokeObjectURL(old); } catch {} }
-  const url = URL.createObjectURL(new Blob([_fs.readFileSync(file)], { type: mime || 'image/png' }));
-  el.dataset.url = url; el.src = url;
-  el.style.visibility = '';        // imgs start hidden so the broken-image icon never shows pre-load
-}
-
-// Live progress thumbnail: during a render the engine drops a small JPEG of the frame it just
-// produced (~1/s, SMV_LIVE_PREVIEW); poll it by mtime and show it under the progress bar.
-let livePath = null, liveTimer = null, liveM = 0;
-ipcRenderer.invoke('live-path').then(p => { livePath = p; });
-// Hide/Show toggle: the preview costs a little GPU/CPU per second, so hiding it tells the engine
-// (via main's live-off flag) to stop producing it, not just hides the image. Persisted.
-let liveHidden = localStorage.getItem('liveHidden') === '1';
-function applyLiveOff(){ ipcRenderer.send('live-off', liveHidden); }   // sync engine to the saved choice
-function syncLiveToggle(){
-  $('livetoggle').textContent = liveHidden ? 'Show preview' : 'Hide preview (frees resources)';
-  if(liveHidden) $('live').style.display = 'none';   // Show reveals again on the next written frame
-}
-$('livetoggle').onclick = () => {
-  liveHidden = !liveHidden;
-  localStorage.setItem('liveHidden', liveHidden ? '1' : '0');
-  syncLiveToggle(); applyLiveOff();
-};
-syncLiveToggle();
-function updateLive(){
-  if(!livePath || liveHidden) return;             // hidden: engine produces nothing, keep it hidden
-  try {
-    const m = _fs.statSync(livePath).mtimeMs;
-    if(m === liveM) return;                       // nothing new yet
-    liveM = m;
-    setPrevImg($('live'), livePath, 'image/jpeg');
-    $('live').style.display = 'block';
-  } catch {}                                      // not written yet this run
-}
-function updatePrevNav(){          // back only makes sense once a second frame has been generated
-  $('prevprev').style.visibility = prevHist.length > 1 ? '' : 'hidden';
-}
-function syncPreview(){            // the preview panel appears once a video is loaded
-  $('previewpanel').style.display = input ? '' : 'none';
-  syncHdrColor();                  // HDR colour controls track the HDR toggle / readiness / source
-}
-let prevBusy = false, prevPending = null, previewLite = false;   // serialize renders. previewLite: skip heavy RTX passes on the auto-preview (set by openPreviewForVideo, one-shot)
-let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown / mid-render preview
-function prevSettingsSig(){                 // everything that changes what the processed pane shows
-  const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
-  return [sharpStrength(), restoreOn(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
-          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr)];
-}
-let lastPrevInput = null;                    // which video the shown original belongs to
-async function loadPreview(frame, bg){   // bg: background "refine" pass (the RTX auto-upgrade) - keep the shown image up, no blocking spinner
-  if(!input) return;
-  if(prevBusy){ prevPending = (frame == null ? 'mid' : frame); return; }
-  prevBusy = true;
-  const hdr = hdrOn(), sharpen = sharpStrength(), sig = prevSettingsSig();
-  // The auto-preview on video load runs "lite": it skips the heavy RTX VSR + TrueHDR passes (the bulk of
-  // the ~5s cost), so the drop is fast. Adjusting any preview control renders the full RTX version.
-  const lite = previewLite; previewLite = false;
-  const useHdr = lite ? false : hdr;
-  const useVsr = lite ? false : !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 0);
-  inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame)].concat(sig));
-  $('hdrpreview').style.display = 'block';
-  // On a background refine the lite image is already on screen: leave it up and skip the blocking spinner,
-  // so the pane appears instantly and just sharpens to the RTX result when it lands. Otherwise show it.
-  if(!bg){
-    if($('prevproc').clientHeight < 40) $('prevprocwrap').style.minHeight = '120px';  // spinner space on first load
-    setSpin($('prevprocwrap'), $('prevspin'), true);
-  }
-  // The original pane gets the wheel too, but only when the original is actually about to change:
-  // first load, a different video, or a frame step. Settings tweaks (and background refines) keep the frame.
-  const origChanging = !bg && (!$('prevorig').dataset.url || lastPrevInput !== input
-    || (frame != null && frame !== 'mid' && frame !== prevIdx));
-  if(origChanging){
-    if($('prevorig').clientHeight < 40) $('prevorigwrap').style.minHeight = '120px';
-    setSpin($('prevorigwrap'), $('prevorigspin'), true);
-  }
-  let r; try { r = await ipcRenderer.invoke('preview', Object.assign(
-    { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr: useHdr, nits: 1000,
-      vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
-      upscale: upFactor() || 0,
-      rtxvsr: useVsr }, hdrColorPayload())); }
-  catch(e){ r = { error: String(e) }; }
-  setSpin($('prevprocwrap'), $('prevspin'), false);
-  $('prevprocwrap').style.minHeight = '';
-  setSpin($('prevorigwrap'), $('prevorigspin'), false);
-  $('prevorigwrap').style.minHeight = '';
-  prevBusy = false;
-  if(prevPending != null){ const f = prevPending; prevPending = null; loadPreview(f); }
-  if(!r || r.error){ lastPrevKey = '';   // never dedupe-skip a retry after a failure
-    $('prevnote').textContent = 'preview unavailable: ' + ((r && r.error) || 'no result'); return; }
-  if(r.total) prevTotal = r.total;
-  if(typeof r.frame === 'number') prevIdx = r.frame;
-  setPrevImg($('prevorig'), r.original);
-  setPrevImg($('prevproc'), r.processed);
-  lastPrevInput = input;
-  lastPrevKey = lite ? '' : JSON.stringify([input, prevIdx].concat(sig));   // lite skipped RTX: force a full re-render on the next adjustment
-  const upActive = upFactor() > 0;   // the processed side is upscaled too, so never call it unchanged
-  const vsrOn = useVsr;              // what the processed pane actually rendered (lite skips VSR)
-  const active = useHdr || sharpen > 0 || restoreOn() || upActive;
-  // Plain bicubic upscale with no AI/enhancement pass: both panes are the same bicubic image, so say so.
-  const bicubicOnly = upActive && !vsrOn && !restoreOn() && sharpen <= 0 && !useHdr;
-  const rtxSkipped = lite && (hdr || ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 0));   // RTX on in settings but skipped for the fast auto-preview
-  const srcHdr = !!(info && info.srcHdr);
-  $('prevoriglabel').textContent = srcHdr ? 'Original (HDR, tonemapped)' : 'Original';
-  const parts = []; if(restoreOn()) parts.push('Restore');
-  if(upActive) parts.push(vsrOn ? 'VSR' : 'bicubic');
-  if(sharpen > 0) parts.push('FSR'); if(useHdr) parts.push('HDR');
-  $('prevproclabel').textContent = !active ? 'Unchanged'
-    : 'Processed (' + parts.join(' + ') + ')';
-  $('prevlabel').textContent = 'frame ' + prevIdx + (prevTotal ? ' / ' + prevTotal : '');
-  $('prevnote').textContent = (rtxSkipped ? 'quick preview shown; refining to the full RTX VSR/HDR version…'
-    : srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
-    : !active ? 'no Restore, FSR or RTX HDR enabled, the output will match the source'
-    : bicubicOnly ? 'plain bicubic upscale, no AI detail added (enable RTX VSR for that; both panes match)'
-    : useHdr ? 'HDR is tonemapped to show on this SDR screen'
-    : 'detail changes are subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
-  // Auto-upgrade: the quick preview skipped the slow RTX passes for an instant first paint. Now that it's
-  // on screen, render the full RTX (VSR/HDR) version of the SAME frame so the pane ends on the real result
-  // without the user needing to touch a control - their RTX picks persist across sessions, so many never
-  // would. One-shot (the follow-up render isn't lite, so rtxSkipped is false there and it can't loop);
-  // skipped if the user already queued another render, which supersedes it.
-  if(rtxSkipped && prevPending == null && !prevBusy) loadPreview(prevIdx, true);
-}
-function randFrame(){ return prevTotal > 1 ? Math.floor(Math.random() * prevTotal) : 'mid'; }
-function refreshPreviewIfOpen(){           // re-render the shown frame when sharpen / HDR changes
-  if(!input) return;
-  syncPreview();
-  const frame = prevHist.length ? prevHist[prevHist.length - 1] : 'mid';
-  const key = JSON.stringify([input, frame].concat(prevSettingsSig()));
-  // Skip when the effective settings already match what is shown (or what is mid-render), so the
-  // checkbox handler and checkRtxReady's async refresh don't double-render the same state.
-  if(key === (prevBusy ? inflightPrevKey : lastPrevKey)) return;
-  loadPreview(frame);
-}
-// Show the preview panel with a spinning wheel on both panes the INSTANT a video is selected, before
-// the slow preview render is even spawned, so the panel reads as "loading" rather than blank/crashed.
-// A neutral note replaces the usual result caption until the first frame lands.
-function showPreviewInitializing(){
-  syncPreview();                                  // reveal the preview panel
-  $('hdrpreview').style.display = 'block';
-  for(const [inner, wrap, spin] of [['prevorig','prevorigwrap','prevorigspin'],
-                                     ['prevproc','prevprocwrap','prevspin']]){
-    if($(inner).clientHeight < 40) $(wrap).style.minHeight = '120px';   // room for the wheel on first load
-    setSpin($(wrap), $(spin), true);
-  }
-  $('prevnote').textContent = 'Initializing preview…';
-}
-function openPreviewForVideo(){            // auto-load the pane when a video is selected
-  syncPreview(); prevHist = []; prevTotal = 0; prevIdx = 0; updatePrevNav();
-  previewLite = true;   // the auto-preview on load skips the heavy RTX VSR/HDR passes so the drop is fast
-  loadPreview('mid').then(() => { if(prevTotal && !prevHist.length) prevHist = [prevIdx]; updatePrevNav(); });
-}
-$('prevnext').onclick = async () => { await loadPreview(randFrame()); prevHist.push(prevIdx); updatePrevNav(); };
-$('prevprev').onclick = async () => { if(prevHist.length > 1){ prevHist.pop(); updatePrevNav(); await loadPreview(prevHist[prevHist.length - 1]); } };
-$('sharpval').addEventListener('change', refreshPreviewIfOpen);
-$('sharpen').addEventListener('change', refreshPreviewIfOpen);
-$('restore').addEventListener('change', refreshPreviewIfOpen);
-// The interp-off output name tags the active pass (_restored/_sharpened/_hdr), so it must
-// re-resolve when any of them toggles (refresh() is a no-op until a video is selected).
-for(const _id of ['sharpen', 'sharpval', 'restore', 'rtxhdr'])
-  $(_id).addEventListener('change', () => refresh());
-
-// RTX HDR colour controls: Colour mode (Faithful = vivid 1.0, the accurate default; NVIDIA vivid =
-// the rtx mode where the Saturation slider behaves like real RTX TrueHDR but hue-corrected), plus a
-// Vibrance boost for muted colours. The engine's raw mode (the unmodified model output, cyan cast
-// and all) is deliberately NOT offered here - it is a known-defective rendition kept at the CLI
-// (--hdr-color raw) as a debug/reference only.
-function hdrColorPayload(){
-  // The RTX HDR Saturation slider spans true-to-source (-100) to NVIDIA-max (+100), always
-  // hue-corrected: above -100 it drives NVIDIA's TrueHDR saturation via the rtx colour mode.
-  // At -100 (SDK 0) it routes to the exact source-chroma path: the rtx safety floor (per-pixel
-  // max against the source) would otherwise leave a small excess (~0.33/255 mean pixel diff).
-  const sat = sdkSat();
-  if(sat > 0) return { color: 'rtx', saturation: sat };
-  return { color: 'vivid', saturation: 0 };   // Saturation at -100 = true to source, exact
-}
-// The Dynamic Vibrance sliders belong to that feature: both are 0 when it is switched off, and
-// the feature at 0/0 is identity (NVIDIA convention, verified in the App).
-function effVibrance(){ return $('hdrdynvib').checked ? (+$('hdrvib').value || 0) / 100 : 0; }
-function effSatBoost(){ return $('hdrdynvib').checked ? (+$('hdrsb').value || 0) / 100 : 0; }
-function syncHdrColor(){
-  const showHdr = $('rtxhdr').checked && rtxReady.hdr && !(info && info.srcHdr);
-  $('hdrtonewrap').style.display = showHdr ? 'inline-flex' : 'none';  // RTX HDR's own Contrast + Saturation
-  $('hdrpurewrap').style.display = showHdr ? '' : 'none';   // the pure-conversion recipe under the sliders
-  $('hdrcolorwrap').style.display = showHdr ? '' : 'none';
-  // RTX HDR's sliders are always live; the Dynamic Vibrance sliders belong to that feature and sit
-  // greyed out until it is switched on (unchecked = no vibrance, like the App).
-  $('hdrcon').disabled = false;
-  $('hdrsat').disabled = false;
-  const on = $('hdrdynvib').checked;
-  $('hdrsb').disabled = !on;
-  $('hdrvib').disabled = !on;
-  $('hdrconnum').textContent = $('hdrcon').value;
-  $('hdrsatnum').textContent = $('hdrsat').value;
-  $('hdrsbnum').textContent = $('hdrsb').value;
-  $('hdrvibnum').textContent = $('hdrvib').value;
-}
-// Display scales mirror the NVIDIA App's RTX HDR filter (-100..100, 0 = NVIDIA default); the
-// engine keeps the TrueHDR SDK scales (0..200, 100 neutral).
-function sdkCon(){ return 100 + (+$('hdrcon').value || 0); }
-function sdkSat(){ return 100 + (+$('hdrsat').value || 0); }
-// Dynamic Vibrance ALWAYS starts off (user call 2026-07-04): it is a per-session opt-in
-// effect, so its on/off state is deliberately NOT persisted (the two slider values below
-// still are). The old 'dynVib' key is retired so no stale state lingers.
-localStorage.removeItem('dynVib');
-const savedHdrSat = localStorage.getItem('hdrSatApp');   // App scale -100..100 (older keys orphaned)
-if(savedHdrSat !== null) $('hdrsat').value = savedHdrSat;
-const savedHdrCon = localStorage.getItem('hdrCon'); if(savedHdrCon !== null) $('hdrcon').value = savedHdrCon;
-const savedHdrSB = localStorage.getItem('hdrSB'); if(savedHdrSB !== null) $('hdrsb').value = savedHdrSB;
-const savedHdrVib = localStorage.getItem('hdrVib'); if(savedHdrVib !== null) $('hdrvib').value = savedHdrVib;
-$('hdrdynvib').onchange = () => { syncHdrColor(); refreshPreviewIfOpen(); };
-$('hdrsat').oninput = () => { localStorage.setItem('hdrSatApp', $('hdrsat').value); $('hdrsatnum').textContent = $('hdrsat').value; };
-$('hdrsat').addEventListener('change', refreshPreviewIfOpen);
-$('hdrcon').oninput = () => { localStorage.setItem('hdrCon', $('hdrcon').value); $('hdrconnum').textContent = $('hdrcon').value; };
-$('hdrcon').addEventListener('change', refreshPreviewIfOpen);
-$('hdrsb').oninput = () => { localStorage.setItem('hdrSB', $('hdrsb').value); $('hdrsbnum').textContent = $('hdrsb').value; };
-$('hdrsb').addEventListener('change', refreshPreviewIfOpen);
-$('hdrvib').oninput = () => { localStorage.setItem('hdrVib', $('hdrvib').value); $('hdrvibnum').textContent = $('hdrvib').value; };
-$('hdrvib').addEventListener('change', refreshPreviewIfOpen);
-syncHdrColor();
-
-// 1:1 zoom: the pane shrinks 1080p+ frames ~6x, which visually erases sharpening, so clicking either
-// image toggles both to native pixels inside scrollable boxes with mirrored scrolling for A/B compare.
-let prevZoom = false, prevSyncing = false;
-function applyPrevZoom(){
-  for(const [w, i] of [['prevorigwrap', 'prevorig'], ['prevprocwrap', 'prevproc']]){
-    const wrap = $(w), img = $(i);
-    wrap.style.overflow = prevZoom ? 'auto' : 'hidden';
-    wrap.style.maxHeight = prevZoom ? '320px' : '';
-    img.style.width = prevZoom ? 'auto' : '100%';
-    img.style.maxWidth = prevZoom ? 'none' : '';
-    img.style.cursor = prevZoom ? 'zoom-out' : 'zoom-in';
-  }
-}
-function prevScrollSync(src, dst){
-  if(prevSyncing) return; prevSyncing = true;
-  // Proportional, not pixel-absolute: the two panes can hold different native sizes (an
-  // upscale or Restore preview's processed side is a larger image than the source), so only
-  // mirroring the scroll FRACTION keeps both panes on the same region of the scene. The <1px
-  // skip stops the async echo event from ping-ponging rounding jitter between the panes.
-  const fx = src.scrollLeft / Math.max(1, src.scrollWidth - src.clientWidth);
-  const fy = src.scrollTop / Math.max(1, src.scrollHeight - src.clientHeight);
-  const nl = fx * Math.max(0, dst.scrollWidth - dst.clientWidth);
-  const nt = fy * Math.max(0, dst.scrollHeight - dst.clientHeight);
-  if(Math.abs(dst.scrollLeft - nl) >= 1) dst.scrollLeft = nl;
-  if(Math.abs(dst.scrollTop - nt) >= 1) dst.scrollTop = nt;
-  prevSyncing = false;
-}
-function setSpin(wrap, spin, on){
-  // Sized/positioned to the VISIBLE window of the scroll box, so the wheel stays centred in view
-  // when the pane is zoomed 1:1 and scrolled (an inset-0 overlay would sit at the scroll origin).
-  if(!on){ spin.style.display = 'none'; return; }
-  spin.style.left = wrap.scrollLeft + 'px'; spin.style.top = wrap.scrollTop + 'px';
-  spin.style.width = wrap.clientWidth + 'px'; spin.style.height = wrap.clientHeight + 'px';
-  spin.style.display = 'flex';
-}
-function repositionSpins(){          // keep a visible wheel glued to the viewport while scrolling
-  for(const [w, s] of [['prevorigwrap', 'prevorigspin'], ['prevprocwrap', 'prevspin']]){
-    const spin = $(s); if(spin.style.display !== 'none') setSpin($(w), spin, true);
-  }
-}
-$('prevorigwrap').addEventListener('scroll', () => { prevScrollSync($('prevorigwrap'), $('prevprocwrap')); repositionSpins(); });
-$('prevprocwrap').addEventListener('scroll', () => { prevScrollSync($('prevprocwrap'), $('prevorigwrap')); repositionSpins(); });
-function togglePrevZoom(e){
-  // Capture the clicked spot as a fraction of the displayed image BEFORE the zoom restyle
-  // changes the layout, then centre the 1:1 view on that spot (clicking the dragon's head
-  // zooms to the dragon's head, not the frame middle). The other pane follows via the
-  // proportional scroll sync, called directly so it lands this frame, not on the async event.
-  const img = e.currentTarget;
-  const fx = e.offsetX / Math.max(1, img.clientWidth);
-  const fy = e.offsetY / Math.max(1, img.clientHeight);
-  prevZoom = !prevZoom; applyPrevZoom();
-  if(prevZoom){ const w = img.parentElement;
-    w.scrollLeft = fx * img.clientWidth - w.clientWidth / 2;
-    w.scrollTop = fy * img.clientHeight - w.clientHeight / 2;
-    prevScrollSync(w, w === $('prevorigwrap') ? $('prevprocwrap') : $('prevorigwrap')); }
-  repositionSpins();
-}
-$('prevorig').onclick = togglePrevZoom;
-$('prevproc').onclick = togglePrevZoom;
-
-// Interpolate: master toggle for GMFSS frame generation. Unchecked, the app only re-encodes the
-// video with the FSR sharpen applied (no in-between frames), so the multiplier, fps and screen-
-// rate controls are greyed, the output keeps the source frame rate, and the engine skips the
-// model entirely. The on/off state persists between sessions; default on.
-function syncInterp(){
-  const on = interpOn();
-  $('screenfps').disabled = !on;
-  // No interpolation = no interpolation model: clear and grey ALL model checkboxes while the
-  // master toggle is off (user-chosen UX: the panel visibly reflects that nothing will generate
-  // frames). Re-checking Interpolate restores the saved model choice from localStorage.
-  for(const b of MODEL_BOXES()) b.disabled = !on;
-  $('svpnvof').disabled = !on;
-  $('rifedrba').disabled = !on;
-  if(!on){
-    for(const b of MODEL_BOXES()) b.checked = false;
-    $('frucsetup').style.display = 'none';
-    $('svpsetup').style.display = 'none';
-    $('svpnvofrow').style.display = 'none';
-    $('rifedrbarow').style.display = 'none';
-  } else {
-    restoreModelChoice();
-    syncModel();
-  }
-  applyScreenFps();      // recomputes multi/fpsin enable, the fps mode, and the output name
-}
-if(localStorage.getItem('interp') === '0') $('interp').checked = false;
-$('interp').onchange = () => { localStorage.setItem('interp', $('interp').checked ? '1' : '0'); syncInterp(); };
-syncInterp();
-
-// Drop anything onto the window: a video loads for processing, a tool archive installs a library.
-// Routing by filename since all three installers take a .zip: an hdr10plus_tool release goes to the
-// HDR10+ installer, a dovi_tool release (its name, or a bare .exe) to the Dolby Vision installer;
-// any other .zip is treated as the RTX Video SDK. All drops are ignored while a job is running.
-document.addEventListener('dragover', (e) => { e.preventDefault(); if($('cancel').disabled) document.body.classList.add('drag'); });
-document.addEventListener('dragleave', (e) => { if(e.relatedTarget === null) document.body.classList.remove('drag'); });
-document.addEventListener('drop', (e) => {
-  e.preventDefault(); document.body.classList.remove('drag');
-  if(!$('cancel').disabled) return;            // a job is in progress
-  const files = [...(e.dataTransfer.files || [])];
-  if(!files.length) return;
-  const nm = files[0].name, p = webUtils.getPathForFile(files[0]);
-  if(/hdr10plus_tool/i.test(nm)){              // the hdr10plus_tool download: install into engine/hptools
-    showWorkspace();
-    $('hpexport').checked = true; localStorage.setItem('hpOn', '1');   // engage the HDR10+ panel so its setup box is coherent
-    $('hpsetup').style.display = 'block';       // reveal install feedback
-    doHpInstall(p);
-  } else if(/dovi_tool/i.test(nm) || /\.exe$/i.test(nm)){   // the dovi_tool download: install into engine/dvtools
-    showWorkspace();
-    $('dvexport').checked = true; localStorage.setItem('dvOn', '1');   // engage the DV panel so its setup box is coherent
-    $('dvsetup').style.display = 'block';       // reveal install feedback
-    doDvInstall(p);
-  } else if(/\.zip$/i.test(nm)){               // otherwise a .zip is the RTX Video SDK: install the RTX runtime
-    showWorkspace();   // RTX install feedback lives in #workspace, so reveal it even before a video is loaded
-    if($('rtxsetup').style.display === 'none') $('rtxsetup').style.display = 'block';   // reveal install feedback
-    doInstall(p);
-  } else {
-    // Anything else: load it as a video; several dropped files become a batch queue.
-    queueVideos(files.map(f => webUtils.getPathForFile(f)));
-  }
-});
-
-// Resume an interrupted batch: if the previous session died mid-run (crash, forced close), its
-// unfinished inputs are still in localStorage (saveBatch). Re-queue them now - the first file loads
-// and the rest wait - but do NOT auto-start; the user clicks Smooth It! when ready. The key is
-// cleared immediately so a failure during this restore can't loop; startRun re-saves it.
-try {
-  const pend = JSON.parse(localStorage.getItem('batchPending') || 'null');
-  localStorage.removeItem('batchPending');
-  if(Array.isArray(pend) && pend.length && pend.every(p => typeof p === 'string')){
-    log('>> Restored ' + pend.length + ' unfinished file(s) from the last session; an interrupted render resumes where it left off\n');
-    queueVideos(pend);
-  }
-} catch { /* no saved batch */ }
-
-function startRun(){
-  if(!input) return;
-  const t = targetFps();
-  if(!fpsValid(t)){ alert('Enter a target fps between ' + sliderMin() + ' and ' + sliderMax() + '.'); return; }
-  // 1x (target fps == source fps) adds no frames - it just re-generates every frame as a midpoint tween
-  // (softer, half-frame shift), a strictly worse video. Block it with guidance instead of running it.
-  if(interpOn() && Math.round(t) <= Math.round(srcFps())){
-    alert('A 1× target adds no frames (output fps = source fps). Raise the target above ' + Math.round(srcFps())
-        + ' fps to smooth, or turn off Interpolate to just sharpen / re-encode.'); return; }
-  // DLSS-FG only generates the evenly spaced frames between consecutive frames: whole 2x-6x
-  // multipliers on the source grid (multi-frame generation). There is no timestep to ask for
-  // anything else, so block with guidance (mirrors the 1x block). The per-GPU ceiling (RTX 40 =
-  // 2x only) is enforced by the engine at render start with its own clear error.
-  if(interpOn() && modelIsDlss() && (gridMulti() < 2 || gridMulti() > 6)){
-    alert('DLSS 4.5 interpolates at whole multipliers from 2× to 6× of the source fps ('
-        + (2*srcFps()).toFixed(targetDecimals()) + '–' + (6*srcFps()).toFixed(targetDecimals())
-        + ' fps for this video). Pick one of those, or GMFSS for any other target.'); return; }
-  const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
-  const dims = upDims();                               // upscale target ({w,h} or null)
-  const factor = upFactor();                           // arbitrary upscale factor (0 = off)
-  const useRtxVsr = factor > 0 && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale, else bicubic
-  const rtxhdr = hdrOn();  // HDR only when its runtime is installed and the source is SDR
-  // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
-  // HDR is on. Bail only when nothing at all is enabled.
-  if(!interpOn() && sharpenStrength <= 0 && factor <= 0 && !rtxhdr && !restoreOn()){
-    alert('Nothing to do: turn on Interpolate, pick an Upscale resolution, enable FSR sharpening or Restore, or turn on RTX HDR (and install its runtime).');
-    return;
-  }
-  procStart = 0; baseK = 0; etaAnchor = 0; etaAnchorTime = 0; lastFps = 0; curDone = 0; curPct = 0; projBytes = 0;
-  clearInterval(etaTimer); etaTimer = setInterval(paint, 500);   // ticks the ETA down between frames
-  // Live thumbnail: only frames written by THIS run may show, so anchor the mtime watermark to
-  // whatever is on disk now (a previous run's leftover) and hide the old image until a new write.
-  try { liveM = _fs.statSync(livePath).mtimeMs; } catch { liveM = 0; }
-  $('live').style.display = 'none';
-  // Reveal the live area (image appears on the first written frame) so its Hide/Show toggle is
-  // reachable for the whole run, and re-assert the engine-side on/off to match the saved choice.
-  $('livewrap').style.display = 'flex';
-  applyLiveOff();
-  clearInterval(liveTimer); liveTimer = setInterval(updateLive, 1000);
-  fpp = outRatio();                                    // output frames produced per source frame (1 when not interpolating)
-  const srcFrames = info.nb || Math.round(info.dur*srcFps()) || 1;
-  totalGen = Math.max(1, Math.round(srcFrames*fpp));   // total frames the conversion will output
-  cancelled = false;
-  // #go stays enabled and becomes the Pause toggle for the duration of the run (see goMode).
-  goMode = 'running'; $('go').textContent = 'Pause';
-  $('go').title = 'Pauses the render. You can also just close the app - the render resumes where it left off next time.';
-  if(!resumeTipShown){
-    resumeTipShown = true;   // once per session; batch auto-advance re-enters startRun per file
-    log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
-  }
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; $('interp').disabled = true; $('fpsin').disabled = true; $('screenfps').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
-  // What this run does, for the status / log (mainly relevant when interpolation is off).
-  const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push('upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
-  const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
-  $('status').textContent = fileTag() + (interpOn() ? 'Warming up the model...' : offLabel);
-  $('fill').style.width = '0%'; $('pct').textContent = '0%';
-  $('frames').textContent = interpOn() ? 'Warming up (loading model, first frames)...' : offLabel;
-  const gm = gridMulti();
-  const rr = t/srcFps();
-  const ratioTxt = gm ? gm+'×, on-grid' : (rr < 9.95 ? rr.toFixed(1)+'×, resampled' : '≈'+Math.round(rr)+'×, resampled');
-  const what = interpOn() ? (t.toFixed(targetDecimals())+' fps ('+ratioTxt+')') : 'no interpolation';
-  const extra = (dims ? '  ·  '+(useRtxVsr ? 'RTX VSR' : 'bicubic')+' '+dims.w+'×'+dims.h : '')
-              + (rtxhdr ? '  ·  RTX HDR' : '')
-              + (sharpenStrength>0 ? '  ·  FSR '+sharpenStrength : '')
-              + (restoreOn() ? '  ·  Restore' : '');
-  log('>> '+input+'  ->  '+what+extra+'\n');
-  const payload = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
-  if(interpOn() && !gm) payload.fps = t;                                             // resample only: non-integer-multiple target
-  if(interpOn() && modelIsRifeDrba()) payload.model = 'rifedrba'; // RIFE with the DRBA sub-option on
-  else if(interpOn() && modelIsRife()) payload.model = 'rife';     // plain RIFE (bundled, always ready)
-  else if(interpOn() && modelIsDlss()) payload.model = 'dlssg';   // "DLSS 4.5" (Frame Generation) backend
-  else if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "NVIDIA Smooth Motion" (NvOFFRUC) backend
-  else if(interpOn() && modelIsSvpNvof()) payload.model = 'svpnvof'; // SVP with its NVOF sub-option on (default)
-  else if(interpOn() && modelIsSvp()) payload.model = 'svp'; // SVP with the NVOF sub-option off
-  payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
-  if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
-  payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)
-  if(factor > 0) payload.upscale = factor;             // arbitrary upscale factor (target height / source)
-  if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else bicubic)
-  if(rtxhdr){ payload.rtxhdr = true;     // HDR10; engine masters at a fixed 1000-nit peak
-    const hp = hdrColorPayload();        // zero-strength Dynamic Vibrance routes to the source path
-    payload.hdrcolor = hp.color;                                   // vivid (default) / rtx
-    payload.hdrsat = hp.saturation;                                // SDK Saturation (rtx mode)
-    payload.hdrcon = sdkCon();                                     // SDK Contrast (100 = neutral)
-    payload.hdrsb = effSatBoost();                                 // vibrance uniform gain (0..1)
-    payload.hdrvib = effVibrance();
-    if($('dvexport').checked && dvReady.ready) payload.dv = true;   // also export Dolby Vision 8.1 (needs HDR)
-    if($('hpexport').checked && hpReady.ready) payload.hp = true;   // also embed HDR10+ metadata (needs HDR)
-  }
-  saveBatch([input, ...batch]);   // survives a crash/close: the next launch re-queues these files
-  ipcRenderer.send('run', payload);
-}
-// #go dispatches on its current mode: start a fresh run when idle, otherwise toggle Pause/Resume.
-$('go').onclick = () => {
-  if(goMode === 'idle'){ startRun(); return; }
-  if(goMode === 'running'){
-    // Pause: the engine finishes the frames already queued to the encoder, then holds before the
-    // next source pair. Stop the ETA countdown (it would keep ticking down through the idle time).
-    goMode = 'paused'; $('go').textContent = 'Resume';
-    $('go').title = 'Continues rendering now. Closing the app instead is also fine - the render resumes where it left off next time.';
-    $('status').textContent = fileTag() + 'Paused; click Resume to continue (or close the app and resume another time).';
-    clearInterval(etaTimer); etaTimer = null;
-    ipcRenderer.send('pause');
-  } else { // paused -> resume
-    goMode = 'running'; $('go').textContent = 'Pause';
-    // The pause preview describes the paused-at point; once we resume it is stale, so hide it (the
-    // engine overwrites it on the next Pause and deletes it at finalize).
-    $('playprev').style.display = 'none'; $('playprev').disabled = true; lastPreview = null;
-    $('go').title = 'Pauses the render. You can also just close the app - the render resumes where it left off next time.';
-    // Re-anchor the pace clock so the paused span doesn't drag the mean fps (and ETA) down; skip
-    // if warmup never finished (procStart still 0; the first-frame handler will anchor instead).
-    if(procStart){ procStart = Date.now(); baseK = curDone; }
-    etaTimer = setInterval(paint, 500);
-    $('status').textContent = fileTag() + 'Smoothing on the GPU...';
-    ipcRenderer.send('resume');
-  }
-};
-$('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
-$('play').onclick = () => { if(lastOut) shell.openPath(lastOut); };   // system default player
-$('playprev').onclick = () => { if(lastPreview) shell.openPath(lastPreview); };  // partial preview, sys player
-$('changeout').onclick = async () => {
-  const chosen = await ipcRenderer.invoke('pick-output', customOut || outName());
-  if(chosen){ customOut = chosen; refresh(); }
-};
-$('cancel').onclick = async () => {
-  cancelled = true; $('cancel').disabled = true; $('status').textContent = 'Cancelling...';
-  // The bar and live thumbnail describe progress that is being deleted: reset them right away
-  // (engine-out drops any PROGRESS still flushing from the dying engine while cancelled, so
-  // nothing can repaint the bar between this reset and engine-done).
-  clearInterval(etaTimer); etaTimer = null;
-  $('fill').style.width = '0%'; $('pct').textContent = '0%'; $('frames').textContent = '';
-  $('livewrap').style.display = 'none'; $('live').style.display = 'none';
-  // invoke resolves only after main killed the engine AND deleted the .part/resume artifacts,
-  // so the probe below sees the truth (engine-done skips its own probe on a cancelled run).
-  try { await ipcRenderer.invoke('cancel'); } catch {}
-  scheduleCheckResume();
-};
-
-ipcRenderer.on('engine-out', (_e, t) => {
-  // Pause partial-preview signals: on Pause the engine remuxes the frames rendered so far with the
-  // source's audio/subtitles into a playable file and logs PREVIEW_READY <path> (or PREVIEW_PENDING
-  // when too few frames have flushed yet). Surface a "Play preview" button so the user can judge the
-  // result with sound before resuming or cancelling.
-  const pr = /PREVIEW_READY\s+([^\r\n]+)/.exec(t);
-  if(pr){
-    lastPreview = pr[1].trim();
-    $('playprev').disabled = false; $('playprev').style.display = '';
-    $('status').textContent = fileTag() + 'Paused. A preview of the part rendered so far (with sound & subtitles) is ready - click "Play preview".';
-  } else if(/PREVIEW_PENDING/.test(t)){
-    $('status').textContent = fileTag() + 'Paused; preview not ready yet (too few frames rendered) - Resume, then Pause again a bit later.';
-  }
-  // DLSS-FG was preempted (RTX Video enhancement) and stopped after its restarts, but banked a clean
-  // resumable checkpoint. Remember the % so engine-done presents it as a resumable stop, not a crash.
-  const dp = /DLSS_PREEMPTED\s+(\d+)/.exec(t);
-  if(dp) dlssPreempt = +dp[1];
-  // The engine emits its EXACT output frame count as OUTFRAMES at the end; it's authoritative over the
-  // pre-render estimate (container nb_frames * ratio), which can be off by one when nb_frames misreports.
-  const of = /OUTFRAMES\s+(\d+)/.exec(t);
-  if(of) totalGen = +of[1] || totalGen;
-  // SIZE lines carry (bytes so far, projected final bytes); like PROGRESS, a chunk can batch
-  // several, so keep the newest projection for the frames line.
-  let sm = null, sg = /SIZE\s+\d+\s+(\d+)/g, sx;
-  while((sx = sg.exec(t)) !== null) sm = sx;
-  if(sm) projBytes = +sm[1] || 0;
-  // A single stderr chunk can batch several PROGRESS lines; take the last so the bar and the
-  // frame/elapsed feeding the ETA reflect the newest count, never a stale one from the batch.
-  let m = null, g = /PROGRESS\s+(\d+)\/(\d+)/g, x;
-  while((x = g.exec(t)) !== null) m = x;
-  if(m && !cancelled){ const done=+m[1], tot=+m[2]||1;
-    // Clamp to [0,1]: a missing/zero denominator (e.g. an MKV with no nb_frames) would
-    // otherwise make frac huge and send the bar past 100% (the runaway 9999999% bug).
-    const frac = Math.min(1, Math.max(0, done/tot));
-    const pct = 100*frac;                              // 0% at first generated frame -> 100% at last
-    $('fill').style.width = pct+'%';
-    $('pct').textContent = Math.round(pct)+'%';          // the percentage now lives inside the bar
-    curDone = done; curPct = pct;
-    const now = Date.now();
-    if(!procStart){
-      // First generated frame is in, so warmup (model load + first inference) is over. Anchor the
-      // clock here so the average pace excludes that one-time startup cost and this first frame.
-      procStart = now; baseK = done;
-      $('status').textContent = fileTag() + 'Smoothing on the GPU...';
-      paint();
-      return;
-    }
-    // ETA from the mean pace over EVERY frame since warmup (not a trailing window): all frames
-    // generated since the anchor over all time since the anchor. Steady and self-correcting as the
-    // run goes on; the 0.5s timer counts the displayed seconds down between PROGRESS frames.
-    const elapsed = (now-procStart)/1000, generated = done-baseK;
-    if(elapsed > 0 && generated > 0){
-      lastFps = generated*fpp/elapsed;                 // mean output frames/sec across the whole run
-      etaAnchor = lastFps > 0 ? (tot-done)*fpp/lastFps : 0;
-      etaAnchorTime = now;
-    }
-    paint();
-  } else if(!m) {   // PROGRESS chunks are never logged; while cancelled they are dropped entirely
-    if(/\[trt\] building/.test(t)) $('status').textContent = 'Building TensorRT engines (one time for this resolution)...';
-    // OUTFRAMES is machine-only, and the engine's "done ..." line duplicates the ">> Saved: <path>"
-    // the GUI prints on engine-done - strip both from the GUI log (they still show in CLI output).
-    const shown = t.replace(/OUTFRAMES\s+\d+\n?/g, '').replace(/SIZE\s+\d+\s+\d+\n?/g, '')
-      .replace(/^done \d+ (frames|pairs)[^\n]*\n?/gm, '');
-    if(shown.trim() && !/Optical Flow Grid Size/.test(shown)) log(shown);
-  }
-});
-// Launch-time update notice (main's checkForUpdate): a one-line link under the subtitle; the check
-// is silent unless a newer GitHub release exists, so this stays hidden for up-to-date installs.
-ipcRenderer.on('update-available', (_e, u) => {
-  if(!u || !u.version) return;
-  $('updatever').textContent = u.version;
-  $('updatelink').onclick = (ev) => { ev.preventDefault(); shell.openExternal(u.url); };
-  $('update').style.display = 'block';
-});
-
-ipcRenderer.on('engine-done', (_e, code) => {
-  // Reset the Pause/Resume toggle back to a fresh "Smooth It!" first, so every exit path
-  // (done / cancelled / failed) restores it and the batch auto-advance below re-enters startRun.
-  goMode = 'idle'; $('go').textContent = 'Smooth It!'; $('go').title = '';   // checkResume below re-fills the tooltip
-  // The run ended (done/cancelled/failed): the engine deletes the partial preview at finalize, so hide
-  // the "Play preview" button - the finished "Play video" takes over on success.
-  $('playprev').style.display = 'none'; $('playprev').disabled = true; lastPreview = null;
-  clearInterval(etaTimer); etaTimer = null;            // stop the ETA countdown
-  // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
-  clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; $('interp').disabled=false; $('fpsin').disabled=false; $('screenfps').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
-  syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
-  if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
-    if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');
-    batch = []; batchTotal = 1; batchFailed = []; saveBatch(null); }
-  else if(code===0){ $('fill').style.width='100%'; $('pct').textContent='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen;
-    $('status').textContent='Done!'; $('open').disabled=false; $('play').disabled=false; log('>> Saved: '+lastOut+'\n');
-    if(batch.length) advanceBatch(); else finishBatch(); }
-  else if(dlssPreempt !== null){
-    // Not a failure: DLSS-FG was preempted by RTX Video enhancement and stopped after its restarts,
-    // but the render banked a clean, fully-resumable checkpoint. Present it as a resumable stop; the
-    // checkResume below turns #go into "Resume" so the user closes the video and continues.
-    $('status').textContent = 'Stopped: DLSS was preempted (RTX Video). ~'+dlssPreempt+'% saved - close the video and click Resume.';
-    log('>> DLSS Frame Generation was preempted (RTX Video enhancement); ~'+dlssPreempt+'% saved and resumable. Close the interfering video, then Resume (or use GMFSS).\n');
-    if(batch.length){ log('>> Continuing with the next queued file\n'); advanceBatch(); }
-    else if(batchTotal > 1) finishBatch();
-    else saveBatch(null); }
-  else { $('status').textContent='Failed (exit '+code+'). See log.'; log('>> Failed (exit '+code+')\n');
-    // A failed file no longer kills the rest of an unattended batch: note it and keep going.
-    if(batchTotal > 1) batchFailed.push(input);
-    if(batch.length){ log('>> Continuing with the next queued file\n'); advanceBatch(); }
-    else if(batchTotal > 1) finishBatch();
-    else saveBatch(null); }
-  // A finished/failed run changes resumability; re-label #go. Cancelled runs are probed by the
-  // Cancel click handler instead, after main's artifact cleanup resolves (probing here would
-  // still see the resume files and wrongly announce "Interrupted render found").
-  if(!cancelled) scheduleCheckResume();
-});
-// Batch auto-advance: load the next queued file and start it with the same settings. batchAuto
-// suppresses the modal probe alert and the preview refresh while the queue advances unattended;
-// an unreadable file counts as failed and the queue keeps moving.
-function advanceBatch(){
-  const next = batch.shift();
-  saveBatch([next, ...batch]);
-  batchAuto = true;
-  loadVideo(next).then(ok => { batchAuto = false;
-    if(ok) $('go').onclick();
-    else { batchFailed.push(next);
-      if(batch.length) advanceBatch(); else finishBatch(); } });
-}
-// Whole queue drained: per-batch summary (incl. failures), native notification, reset + unpersist.
-function finishBatch(){
-  const fails = batchFailed.length;
-  if(batchTotal > 1){
-    $('status').textContent = 'Done! ' + (batchTotal - fails) + '/' + batchTotal + ' files processed'
-      + (fails ? ', ' + fails + ' failed (see log)' : '.');
-    if(fails) log('>> Failed files:\n' + batchFailed.map(f => '>>   ' + f).join('\n') + '\n');
-  }
-  ipcRenderer.send('render-complete', batchTotal > 1
-    ? ((batchTotal - fails) + '/' + batchTotal + ' files done' + (fails ? ', ' + fails + ' failed' : ''))
-    : 'Render complete');
-  batchTotal = 1; batchFailed = []; saveBatch(null);
-}
-</script>
+<script src="app.js"></script>
 </body>
 </html>

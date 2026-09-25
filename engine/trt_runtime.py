@@ -1,20 +1,15 @@
 """
-TensorRT for RTX (tensorrt_rtx) backend for the GMFSS sub networks.
+The size-free ONNX export of every graph the native host builds TensorRT-RTX engines from (a dev
+tool, run by engine/onnx_export.py; never shipped).
 
-Strategy: each sub net is exported
-to ONNX under autocast(fp16) via the dynamo exporter (mixed fp16/fp32 matching the
-app's precision), then built into a strongly typed TRT engine. softsplat (cupy) and
-the F.interpolate glue stay in eager. Engines are built on first use for a given
-input resolution and cached on disk per (net, shapes, trt version, weights hash);
-the weights fingerprint in the name means a train_log swap invalidates the cache
-automatically (stale engines are deleted at startup) instead of silently serving
-engines compiled from the old model.
-
-trtify(model) swaps model.feat_ext / flownet / metricnet / ifnet / fusionnet for
-wrappers with identical call signatures, so GMFSS_infer_u is untouched. Any export
-or build failure falls back to the original eager module, so the app never breaks.
+Each graph is exported under autocast(fp16) via the dynamo exporter (mixed fp16/fp32 matching the
+app's precision) with H and W symbolic, once for every size; the host builds one engine per
+resolution from that file (H and W pinned, only the live RIFE timestep batch axis dynamic). The
+engine classes below carry only what the export needs from each graph: the engine base name, the
+input / output names and the dynamic batch range. The python TensorRT runtime that used to run
+these engines (TRTModule, build_or_load, trtify, rife_trtify, the JIT cache and the strict mode)
+was removed with the python render routes (priority 27b, 2026-09-24).
 """
-import hashlib
 import logging
 import os
 import sys
@@ -41,49 +36,8 @@ try:
 except Exception:
     pass
 
-# TensorRT for RTX (tensorrt_rtx): a compact, RTX-focused TensorRT build with hardware-agnostic AOT
-# engines and near-instant builds. If it fails to import, the ImportError propagates and the render.py
-# guard around "import trt_runtime" drops the whole pipeline to eager.
-import tensorrt_rtx as trt
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.environ.get("SMV_TRT_CACHE") or os.path.join(HERE, "trt_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-_T2T = {trt.DataType.FLOAT: torch.float32, trt.DataType.HALF: torch.float16,
-        trt.DataType.INT32: torch.int32, trt.DataType.INT64: torch.int64,
-        trt.DataType.BOOL: torch.bool, trt.DataType.BF16: torch.bfloat16}
-
-
-def _trt_tag():
-    # TensorRT-RTX's serialized engine is the hardware-agnostic AOT blob (the GPU-specific kernels are
-    # JIT-compiled at load and cached separately - see the runtime cache below), so its filename needs
-    # only the TRT version, no GPU name: one built engine is reusable across any RTX GPU (and survives a
-    # card swap). The version still rides in the name, so a TRT-RTX upgrade is a clean rebuild.
-    return f"trt{trt.__version__}".replace(".", "_")
-
-
-def _weights_tag():
-    """Fingerprint of the train_log weights, baked into every engine filename so a compiled
-    engine can never outlive the weights it was exported from: swapped .pkl files change the
-    tag, which is a cache miss (fresh build) plus garbage collection of the stale engines
-    below. Hashes the file CONTENTS, not mtimes - a fresh unzip/copy of identical weights
-    must not throw away ~6 min of builds per resolution. The ~75 MB read costs ~0.2 s once
-    per engine start, and the same files are about to be loaded by torch anyway."""
-    h = hashlib.md5()
-    wdir = os.path.join(HERE, "GMFSS_Fortuna", "train_log")
-    for n in sorted(os.listdir(wdir)):
-        if n.endswith(".pkl"):
-            with open(os.path.join(wdir, n), "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):
-                    h.update(chunk)
-    return "w" + h.hexdigest()[:10]
-
-
-
-
-def _shape_tag(tensors):
-    return "_".join("x".join(map(str, t.shape)) for t in tensors)
+# Cache naming (weights fingerprints, the ONNX paths) lives in the torch-free trt_lookup module.
+import trt_lookup
 
 
 def _log(msg):
@@ -91,225 +45,202 @@ def _log(msg):
     sys.stderr.flush()
 
 
-WEIGHTS_TAG = _weights_tag()
-
-# Reconcile the cache with the current weights, once per engine start:
-#   - engines named for a DIFFERENT weights fingerprint are stale by definition: delete them
-#     (this is the "force delete the ancient engines" step - without it a weight swap would
-#     silently keep serving the old model, because build_or_load finds engines by name and
-#     never consults the .pkl files again);
-#   - engines from before fingerprinting (no _w suffix) are migrated by RENAME to the current
-#     tag instead of deleted: every historical build came from the only weights this app has
-#     ever shipped (hash-verified against upstream), so they are known good and rebuilding
-#     them would cost ~6 min per resolution for nothing;
-#   - stray .onnx/.onnx.data intermediates (a crashed build) are junk either way.
-for _fn in os.listdir(CACHE_DIR):
-    _p = os.path.join(CACHE_DIR, _fn)
-    try:
-        if _fn.endswith((".onnx", ".onnx.data")):
-            os.remove(_p)
-        elif _fn.endswith(".engine") and f"_{WEIGHTS_TAG}" not in _fn:
-            if "_w" not in _fn:  # pre-fingerprint name: adopt it for the current weights
-                os.rename(_p, _p[:-len(".engine")] + f"_{WEIGHTS_TAG}.engine")
-                _log(f"[trt] adopted cached engine for current weights: {_fn}")
-            else:                # fingerprinted for other weights: stale, remove
-                os.remove(_p)
-                _log(f"[trt] removed stale engine (weights changed): {_fn}")
-    except OSError:
-        pass  # cache hygiene is best effort; a locked file just stays until next start
-
-
-# --- TensorRT-RTX device JIT cache (persisted across process starts) ------------------------------
-# TRT-RTX JIT-compiles the GPU-specific kernels when an engine is first loaded (the flip side of the
-# hardware-agnostic AOT engine above). Persisting that IRuntimeCache to disk lets later process starts
-# reuse the compiled kernels instead of recompiling. One shared cache for the whole process: loaded at
-# first use, set on every engine's execution context, rewritten at exit. Fully best-effort - any
-# failure falls back to a plain context, so a render never depends on it.
-_RTX_CACHE_PATH = os.path.join(CACHE_DIR, "rtx_runtime_jit.cache")
-_rtx_cache = None
-_rtx_cache_active = False
-
-
-def _make_exec_context(engine):
-    """Execution context for a deserialized engine, wiring the shared persisted JIT cache."""
-    global _rtx_cache, _rtx_cache_active
-    try:
-        rc = engine.create_runtime_config()
-        if _rtx_cache is None:
-            _rtx_cache = rc.create_runtime_cache()
-            if os.path.isfile(_RTX_CACHE_PATH):
-                try:
-                    with open(_RTX_CACHE_PATH, "rb") as f:
-                        _rtx_cache.deserialize(f.read())
-                except Exception:  # noqa: BLE001 - a corrupt/stale cache is just discarded
-                    _rtx_cache.reset()
-        rc.set_runtime_cache(_rtx_cache)
-        _rtx_cache_active = True
-        return engine.create_execution_context(rc)
-    except Exception as e:  # noqa: BLE001
-        _log(f"[trt] runtime JIT cache unavailable, plain context: {repr(e)[:120]}")
-        return engine.create_execution_context()
-
-
-def _save_rtx_cache():
-    if not _rtx_cache_active or _rtx_cache is None:
-        return
-    try:
-        tmp = _RTX_CACHE_PATH + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(bytes(_rtx_cache.serialize()))
-        os.replace(tmp, _RTX_CACHE_PATH)  # atomic; never leaves a half-written cache
-    except Exception:  # noqa: BLE001 - persistence is best effort
-        pass
-
-
-import atexit
-atexit.register(_save_rtx_cache)
-
-
-class TRTModule:
-    """A built engine; binds torch cuda tensors zero copy and runs it."""
-
-    def __init__(self, serialized):
-        self.runtime = trt.Runtime(TRT_LOGGER)
-        self.engine = self.runtime.deserialize_cuda_engine(serialized)
-        self.context = _make_exec_context(self.engine)
-        self.inputs, self.outputs = [], []
-        for i in range(self.engine.num_io_tensors):
-            n = self.engine.get_tensor_name(i)
-            spec = (n, _T2T[self.engine.get_tensor_dtype(n)], tuple(self.engine.get_tensor_shape(n)))
-            if self.engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT:
-                self.inputs.append(spec)
-            else:
-                self.outputs.append(spec)
-
-    def __call__(self, *args):
-        held = []  # keep cast/contiguous temporaries alive through execution
-        for (n, d, s), a in zip(self.inputs, args):
-            a = a.to(d).contiguous()
-            held.append(a)
-            self.context.set_input_shape(n, s)
-            self.context.set_tensor_address(n, a.data_ptr())
-        outs = []
-        for n, d, s in self.outputs:
-            o = torch.empty(s, dtype=d, device="cuda")  # fresh each call; outputs may persist
-            outs.append(o)
-            self.context.set_tensor_address(n, o.data_ptr())
-        # Enqueue on the caller's current stream and do NOT host-sync. The whole pipeline (this engine,
-        # softsplat's cupy kernel, and the torch glue) runs on one shared stream the caller sets, so
-        # same-stream ordering makes the outputs ready for the next op with no per-call GPU drain. The
-        # caller using a non-default stream is also what keeps TensorRT's default-stream warning away.
-        self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-        return outs[0] if len(outs) == 1 else tuple(outs)
-
-
-def _build_serialized(onnx_path):
-    builder = trt.Builder(TRT_LOGGER)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
-    parser = trt.OnnxParser(network, TRT_LOGGER)
-    if not parser.parse_from_file(onnx_path):  # resolves external .onnx.data weights
-        errs = "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors))
-        raise RuntimeError("onnx parse failed: " + errs)
-    config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 6 << 30)
-    ser = builder.build_serialized_network(network, config)
-    if ser is None:
-        raise RuntimeError("build_serialized_network returned None")
-    return bytes(ser)
-
-
-def build_or_load(name, export_module, example_inputs, input_names, output_names):
-    """Return a TRTModule for export_module at these input shapes, building and
-    caching (autocast fp16 ONNX -> strongly typed engine) on a cache miss."""
-    tag = f"{name}_{_shape_tag(example_inputs)}_{_trt_tag()}_{WEIGHTS_TAG}"
-    engine_path = os.path.join(CACHE_DIR, tag + ".engine")
-    if os.path.isfile(engine_path):
-        with open(engine_path, "rb") as f:
-            return TRTModule(f.read())
-    onnx_path = os.path.join(CACHE_DIR, tag + ".onnx")
-    _log(f"[trt] building {name} {_shape_tag(example_inputs)} (one time for this resolution)...")
-    t0 = time.time()
-    # Freshly constructed wrapper modules (e.g. _IFNetExport) default to training=True even
-    # when every weight inside is already eval, and the exporter checks (and warns on) the TOP
-    # module's flag. An export here is always for inference, so force eval unconditionally.
-    export_module.eval()
-    with torch.autocast("cuda", dtype=torch.float16):
-        # verbose=False drops the exporter's per-phase progress chatter (each phase printed
-        # twice: a start line, then the same line again with a checkmark on completion) - the
-        # "[trt] building..." line above is the user-facing signal for the one-time build.
-        torch.onnx.export(export_module, tuple(example_inputs), onnx_path,
-                          input_names=input_names, output_names=output_names,
-                          dynamo=True, opset_version=18, verbose=False)
-    serialized = _build_serialized(onnx_path)
-    with open(engine_path, "wb") as f:
-        f.write(serialized)
-    _log(f"[trt] {name} built in {time.time() - t0:.0f}s")
-    for p in (onnx_path, onnx_path + ".data"):  # engine is self contained; drop the onnx
+def _rm(*paths):
+    for p in paths:
         try:
             os.remove(p)
         except OSError:
             pass
-    return TRTModule(serialized)
+
+
+def _export_onnx(export_module, example_inputs, input_names, output_names, onnx_path,
+                 dynamic_shapes=None):
+    # Freshly constructed wrapper modules (e.g. _IFNetExport) default to training=True even
+    # when every weight inside is already eval, and the exporter checks (and warns on) the TOP
+    # module's flag. An export here is always for inference, so force eval unconditionally.
+    export_module.eval()
+    # cudnn OFF for the trace: after a failed dynamic export earlier in the process (e.g.
+    # gmflow_bidir on this stack), grid_sampler decomposition starts picking
+    # aten.cudnn_grid_sampler, which has no fake-tensor support, and every later export of a
+    # grid_sample-using net (metricnet's backwarp) dies with ConversionError/PassError.
+    # Disabling cudnn for the export forces the exportable grid_sampler_2d choice; the built
+    # engine and the eager nets are untouched. Repro: smv-live\harness\probe_metricnet_export3/5.
+    with torch.backends.cudnn.flags(enabled=False), \
+            torch.autocast("cuda", dtype=torch.float16):
+        # verbose=False drops the exporter's per-phase progress chatter (each phase printed
+        # twice: a start line, then the same line again with a checkmark on completion) - the
+        # "[trt] exporting..." line is the user-facing signal for the one-time export.
+        torch.onnx.export(export_module, tuple(example_inputs), onnx_path,
+                          input_names=input_names, output_names=output_names,
+                          dynamo=True, opset_version=18, verbose=False,
+                          dynamic_shapes=dynamic_shapes)
+
+
+# --- size-free ONNX (2026-09-21) ----------------------------------------------------------------
+# The graphs below export ONCE with H / W symbolic (trt_lookup.onnx_path), and every engine size is
+# built from that file, pinned to the example shape exactly like a per-size export (one engine per
+# resolution still holds, the profile pins every axis but the declared batch range). Proven in the
+# WO "ONNX-in-exe engine build": built from these files, 8 graphs are bit-exact with the per-size
+# engines; gmflow_bidir runs its size-free branch (multiply + sum local ops) and is equivalent or
+# better (closer to eager fp32). Unit = the alignment of the FIRST input's H and W (the /64 frame
+# pad, 32 for GMFSS's half-size nets, 1 for Restore at the model size); every other input's
+# spatial dims are an integer multiple of the same symbols. Any other name or an unaligned or
+# oversized example does not qualify (ensure_onnx returns None).
+_SIZE_FREE_UNIT = {"featurenet": 64, "gmflow_bidir": 32, "metricnet": 32, "ifnet": 32,
+                   "fusionnet": 32}
+_SIZE_FREE_PREFIX = (("rife_ifnet_", 64), ("rife_encode_", 64), ("rife_block0_", 64),
+                     ("restore_", 1))
+_SIZE_FREE_MAX = (4352, 7680)   # H, W: an 8K frame padded to /64
+
+
+def _size_free_unit(name):
+    for pre, unit in _SIZE_FREE_PREFIX:
+        if name.startswith(pre):
+            return unit
+    return _SIZE_FREE_UNIT.get(name)
+
+
+def _export_key(name, export_module, example_inputs):
+    """The ONNX key: the engine base name, plus what that name leaves out but the graph bakes in:
+    the GMFSS IFNet's scale_list (its engine is named plain `ifnet`) and the input dtypes (a
+    strongly typed engine takes its input types from the ONNX; `_dt` + one letter per input
+    only when an input is not fp32, e.g. Restore's fp16 `_dth`)."""
+    key = name
+    if isinstance(export_module, _IFNetExport):
+        key += "_sl" + "-".join(f"{s:g}" for s in export_module.scale_list)
+    dts = "".join({torch.float32: "f", torch.float16: "h"}.get(t.dtype, "x") for t in example_inputs)
+    if dts.strip("f"):
+        key += "_dt" + dts
+    return key
+
+
+def _size_free_shapes(name, example_inputs, input_names, dyn_batch):
+    """torch.export dynamic_shapes for the size-free export, or None when this graph / example
+    does not qualify."""
+    unit = _size_free_unit(name)
+    if unit is None:
+        return None
+    h0, w0 = int(example_inputs[0].shape[2]), int(example_inputs[0].shape[3])
+    lo = 16 if unit == 1 else 1
+    mh, mw = _SIZE_FREE_MAX[0] // unit, _SIZE_FREE_MAX[1] // unit
+    if h0 % unit or w0 % unit or not (lo <= h0 // unit <= mh and lo <= w0 // unit <= mw):
+        return None
+    D = torch.export.Dim
+    sh, sw = D("sh", min=lo, max=mh), D("sw", min=lo, max=mw)
+    b = None
+    ds = []
+    for n, t in zip(input_names, example_inputs):
+        d = {}
+        if t.dim() != 4:
+            return None
+        hi, wi = int(t.shape[2]), int(t.shape[3])
+        if (hi, wi) != (1, 1):
+            if (hi * unit) % h0 or (wi * unit) % w0:
+                return None
+            d[2], d[3] = (hi * unit // h0) * sh, (wi * unit // w0) * sw
+        if dyn_batch and n in dyn_batch:
+            if b is None:
+                b = D("b", min=dyn_batch[n][0], max=dyn_batch[n][2])
+            d[0] = b
+        ds.append(d)
+    return tuple(ds)
+
+
+def _size_free_onnx(key, name, export_module, example_inputs, input_names, output_names,
+                    dyn_batch):
+    """Path of this graph's size-free ONNX, exported now when missing; None when the graph or
+    example does not qualify. The export lands in a per-process temp folder and is moved in only
+    once complete (weights first), so a concurrent process never builds from half a file."""
+    # qualify the example FIRST, also when the file exists: TensorRT reads an axis named
+    # `64*sh` as plain -1 and builds any size from it, so only this check keeps an unaligned
+    # example (the export's divisibility assumption broken) out
+    ds = _size_free_shapes(name, example_inputs, input_names, dyn_batch)
+    if ds is None:
+        return None
+    path = trt_lookup.onnx_path(key)
+    if os.path.isfile(path):
+        return path
+    tmpdir = os.path.join(trt_lookup.ONNX_DIR, f"tmp_{os.getpid()}")
+    os.makedirs(tmpdir, exist_ok=True)
+    tmp = os.path.join(tmpdir, os.path.basename(path))
+    try:
+        _log(f"[trt] exporting the size-free {name} graph (one time for every size)...")
+        t0 = time.time()
+        _export_onnx(export_module, example_inputs, input_names, output_names, tmp,
+                     dynamic_shapes=ds)
+        import onnx
+
+        got = {i.name: [d.dim_param if d.HasField("dim_param") else d.dim_value
+                        for d in i.type.tensor_type.shape.dim]
+               for i in onnx.load(tmp, load_external_data=False).graph.input}
+        for n, d in zip(input_names, ds):
+            dims = got.get(n)
+            if dims is None:
+                raise RuntimeError(f"exporter renamed input {n} (graph has {sorted(got)})")
+            if any(not isinstance(dims[a], str) or not dims[a] for a in d):
+                raise RuntimeError(f"exporter specialized an axis of {n}: {dims}")
+        if os.path.isfile(tmp + ".data"):
+            os.replace(tmp + ".data", path + ".data")
+        os.replace(tmp, path)
+        _log(f"[trt] size-free {name} graph exported in {time.time() - t0:.0f}s")
+        return path
+    finally:
+        _rm(tmp, tmp + ".data")
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
+def ensure_onnx(name, export_module, example_inputs, input_names, output_names, dyn_batch=None):
+    """Export this graph's size-free ONNX if it qualifies and is missing (scripts/export-onnx.js
+    through engine/onnx_export.py); returns the path or None. Raises on a failed export."""
+    return _size_free_onnx(_export_key(name, export_module, example_inputs), name, export_module,
+                           example_inputs, input_names, output_names, dyn_batch)
 
 
 class _Engine:
-    """Caches built TRTModules per input shape; falls back to eager on failure."""
+    """One graph's engine contract: the base name the host's engine and ONNX names start from,
+    the input / output tensor names, and the dynamic batch range ({input name: (min, opt, max)}
+    for the live RIFE class, None for every other graph)."""
 
-    def __init__(self, name, eager, input_names, output_names):
+    def __init__(self, name, input_names, output_names):
         self.name = name
-        self.eager = eager
         self.input_names = input_names
         self.output_names = output_names
-        self.cache = {}
-        self.eager_only = False
-
-    def _run(self, export_module, tensors, call_args):
-        if self.eager_only:
-            return self.eager(*call_args)
-        try:
-            key = _shape_tag(tensors)
-            mod = self.cache.get(key)
-            if mod is None:
-                mod = build_or_load(self.name, export_module, tensors,
-                                    self.input_names, self.output_names)
-                self.cache[key] = mod
-            return mod(*tensors)
-        except Exception as e:  # noqa: BLE001
-            _log(f"[trt] {self.name} fell back to eager: {repr(e)[:240]}")
-            self.eager_only = True
-            return self.eager(*call_args)
+        self.dyn_batch = None
 
 
 class FeatEngine(_Engine):
-    def __init__(self, eager):
-        super().__init__("featurenet", eager, ["x"], ["f1", "f2", "f3"])
-
-    def __call__(self, x):
-        return self._run(self.eager, (x,), (x,))
+    def __init__(self):
+        super().__init__("featurenet", ["x"], ["f1", "f2", "f3"])
 
 
-class FlowEngine(_Engine):
-    def __init__(self, eager):
-        super().__init__("gmflow", eager, ["img0", "img1"], ["flow"])
+class _BidirFlowExport(nn.Module):
+    """gmflow with pred_bidir_flow=True baked: one call returns both flow directions
+    stacked on the batch dim ([2,2,H,W]); the backbone runs once for both."""
 
-    def __call__(self, i0, i1):
-        return self._run(self.eager, (i0, i1), (i0, i1))
+    def __init__(self, flownet):
+        super().__init__()
+        self.flownet = flownet
+
+    def forward(self, img0, img1):
+        return self.flownet(img0, img1, pred_bidir_flow=True)
+
+
+class BidirFlowEngine(_Engine):
+    def __init__(self):
+        super().__init__("gmflow_bidir", ["img0", "img1"], ["flow"])
 
 
 class MetricEngine(_Engine):
-    def __init__(self, eager):
-        super().__init__("metricnet", eager, ["i0", "i1", "f01", "f10"], ["m0", "m1"])
-
-    def __call__(self, i0, i1, f01, f10):
-        return self._run(self.eager, (i0, i1, f01, f10), (i0, i1, f01, f10))
+    def __init__(self):
+        super().__init__("metricnet", ["i0", "i1", "f01", "f10"], ["m0", "m1"])
 
 
 class FusionEngine(_Engine):
-    def __init__(self, eager):
-        super().__init__("fusionnet", eager, ["a", "b", "c", "d"], ["out"])
-
-    def __call__(self, a, b, c, d):
-        return self._run(self.eager, (a, b, c, d), (a, b, c, d))
+    def __init__(self):
+        super().__init__("fusionnet", ["a", "b", "c", "d"], ["out"])
 
 
 class _IFNetExport(nn.Module):
@@ -325,72 +256,22 @@ class _IFNetExport(nn.Module):
 
 
 class IFNetEngine(_Engine):
-    def __init__(self, eager):
-        super().__init__("ifnet", eager, ["x", "timestep"], ["merged"])
-
-    def __call__(self, x, timestep, scale_list=(8, 4, 2, 1)):
-        if self.eager_only:
-            return self.eager(x, timestep, scale_list=list(scale_list))
-        ts = x.new_full((1, 1, 1, 1), float(timestep))
-        export_mod = _IFNetExport(self.eager, list(scale_list))
-        return self._run(export_mod, (x, ts), (x, timestep))
-
-    def _run(self, export_module, tensors, call_args):  # eager fallback needs the kwarg
-        if self.eager_only:
-            return self.eager(call_args[0], call_args[1], scale_list=[8, 4, 2, 1])
-        try:
-            key = _shape_tag(tensors)
-            mod = self.cache.get(key)
-            if mod is None:
-                mod = build_or_load(self.name, export_module, tensors,
-                                    self.input_names, self.output_names)
-                self.cache[key] = mod
-            return mod(*tensors)
-        except Exception as e:  # noqa: BLE001
-            _log(f"[trt] {self.name} fell back to eager: {repr(e)[:240]}")
-            self.eager_only = True
-            return self.eager(call_args[0], call_args[1], scale_list=[8, 4, 2, 1])
+    def __init__(self):
+        super().__init__("ifnet", ["x", "timestep"], ["merged"])
 
 
 class RestoreEngine(_Engine):
-    """TRT wrapper for the --restore Real-ESRGAN pass (realesr.py). The realesr weights hash
-    rides in the NAME (not the _w tag): a realesr weight swap changes the name and is a plain
-    cache miss (the old file lingers harmlessly, a few MB), while the global _w tag keeps the
-    startup GC from deleting these engines - it only ties them to the train_log fingerprint,
-    so a GMFSS weight swap also rebuilds them (seconds; the net is tiny)."""
+    """The --restore Real-ESRGAN pass (realesr.py). The realesr weights hash rides in the NAME
+    (not the _w tag): a realesr weight swap changes the name and is a plain cache miss."""
 
-    def __init__(self, eager, whash):
-        super().__init__(f"restore_{whash}", eager, ["x"], ["y"])
-
-    def __call__(self, x):
-        return self._run(self.eager, (x,), (x,))
+    def __init__(self, whash):
+        super().__init__(f"restore_{whash}", ["x"], ["y"])
 
 
-def trtify(model):
-    """Swap a loaded GMFSS Model's sub nets for TRT wrappers (in place)."""
-    model.feat_ext = FeatEngine(model.feat_ext)
-    model.flownet = FlowEngine(model.flownet)
-    model.metricnet = MetricEngine(model.metricnet)
-    model.ifnet = IFNetEngine(model.ifnet)
-    model.fusionnet = FusionEngine(model.fusionnet)
-    _log("[trt] model wrapped with TensorRT-RTX engines (build on first frame)")
-    return model
-
-
-# --- RIFE 4.26 heavy backend (rife_backend.py) --------------------------------------------------
-# The RIFE IFNet_HDv3 is a different network from GMFSS's IFNet above, so it gets its own engine.
-# The full IFNet forward (five IFBlocks + the interleaved grid_sample warps) is the per-output-frame
-# cost and the only thing worth an engine; the backend's cheap encode()/block0() calls (feature
-# heads, reused per pair / per DRBA window) stay eager.
-
-def _rife_weights_tag():
-    """md5 of rife/flownet.pkl contents, baked into RIFE engine names so a checkpoint swap is a
-    plain cache miss (parallel to _weights_tag for GMFSS). Read lazily - only RIFE renders pay it."""
-    h = hashlib.md5()
-    with open(os.path.join(HERE, "rife", "flownet.pkl"), "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return "r" + h.hexdigest()[:10]
+# --- RIFE 4.26 (rife_backend.py) ----------------------------------------------------------------
+# The RIFE IFNet_HDv3 is a different network from GMFSS's IFNet above, so it gets its own graphs:
+# the full IFNet forward (five IFBlocks + the interleaved grid_sample warps), the feature Head
+# (encode) and DRBA's block0 flow.
 
 
 class _RifeIFNetExport(nn.Module):
@@ -406,59 +287,99 @@ class _RifeIFNetExport(nn.Module):
         return self.ifnet(x, timestep=timestep, scale_list=self.scale_list, f0=f0, f1=f1)[0]
 
 
+def _rife_ifnet_base(ifnet, scale_list, whash):
+    """The rife checkpoint fingerprint plus the baked scale_list are in the NAME (4K's 0.5 flow
+    scale changes it)."""
+    scale_tag = "-".join(f"{s:g}" for s in scale_list)
+    return f"rife_ifnet_{whash}_{scale_tag}"
+
+
 class RifeIFNetEngine(_Engine):
-    """TRT wrapper for one RIFE IFNet forward. timestep rides as a (1,1,H,W) tensor so both the
-    scalar plain-RIFE path and DRBA's spatial DistanceRatioMap export to the same engine. The rife
-    checkpoint fingerprint plus the baked scale_list are in the NAME (scale_list is not part of the
-    shape key, and 4K's 0.5 flow scale changes it), so neither a weight swap nor a scale change can
-    serve a stale engine; the global _w tag still shields these from the startup GC."""
+    """One RIFE IFNet forward (the unbatched class). timestep rides as a (1,1,H,W) tensor so both
+    the scalar plain-RIFE path and DRBA's spatial DistanceRatioMap run the same engine."""
 
     def __init__(self, ifnet, scale_list, whash):
-        scale_tag = "-".join(f"{s:g}" for s in scale_list)
-        eager = lambda x, ts, f0, f1: ifnet(  # noqa: E731 - eager fallback keeps the render alive
-            x, timestep=ts, scale_list=list(scale_list), f0=f0, f1=f1)[0]
-        super().__init__(f"rife_ifnet_{whash}_{scale_tag}", eager,
+        super().__init__(_rife_ifnet_base(ifnet, scale_list, whash),
                          ["x", "timestep", "f0", "f1"], ["merged"])
+
+
+class _RifeIFNetBatchExport(nn.Module):
+    """Same forward as _RifeIFNetExport, but up to B timesteps in ONE call: the timestep input
+    carries the batch ((B,1,H,W), a dynamic axis) and the pair-constant inputs (x, f0, f1) stay
+    batch-1 and are EXPANDED inside the graph, so the caller uploads one pair's data no matter
+    how many tweens it asks for."""
+
+    def __init__(self, ifnet, scale_list):
+        super().__init__()
         self.ifnet = ifnet
-        self.scale_list = list(scale_list)
+        self.scale_list = scale_list
 
-    def __call__(self, x, timestep, f0, f1):
-        export_mod = _RifeIFNetExport(self.ifnet, self.scale_list)
-        return self._run(export_mod, (x, timestep, f0, f1), (x, timestep, f0, f1))
-
-
-class _RifeIFNetTRT:
-    """Drop-in for rife.ifnet: routes the full forward through a per-resolution TRT engine while
-    encode()/block0() (the backend's reuse and calc_flow) stay on the eager module. timestep is
-    normalized to a (1,1,H,W) tensor so the scalar plain path and DRBA's DRM map share one engine.
-    Returns (merged, None) - the backend only ever reads [0]."""
-
-    def __init__(self, ifnet, whash):
-        self._ifnet = ifnet
-        self.encode = ifnet.encode      # feature head, cheap, called from reuse()/calc_flow()
-        self.block0 = ifnet.block0      # coarsest-level flow, cheap, DRBA calc_flow() only
-        self._whash = whash
-        self._engines = {}              # scale_list key -> RifeIFNetEngine
-
-    def __call__(self, x, timestep=0.5, scale_list=(8, 4, 2, 1), training=False,
-                 fastmode=True, ensemble=False, f0=None, f1=None):
-        # Only the standard inference call (both features precomputed) goes to TRT; anything else
-        # (training, or a first-frame call without cached encodes) stays exactly on the eager path.
-        if training or f0 is None or f1 is None:
-            return self._ifnet(x, timestep=timestep, scale_list=scale_list, training=training,
-                               fastmode=fastmode, ensemble=ensemble, f0=f0, f1=f1)
-        if not torch.is_tensor(timestep):
-            timestep = x[:, :1] * 0 + float(timestep)   # scalar t -> (1,1,H,W) map
-        key = tuple(scale_list)
-        eng = self._engines.get(key)
-        if eng is None:
-            eng = RifeIFNetEngine(self._ifnet, scale_list, self._whash)
-            self._engines[key] = eng
-        return eng(x, timestep, f0, f1), None
+    def forward(self, x, timestep, f0, f1):
+        b = timestep.shape[0]
+        if getattr(self.ifnet, "batch_broadcast", False):
+            # WO-22: the net expands the SMALL tensors itself, after the downsample, so the
+            # pair constant full resolution downsample runs once instead of once per tween.
+            return self.ifnet(x, timestep=timestep, scale_list=self.scale_list,
+                              f0=f0, f1=f1)[0]
+        return self.ifnet(x.expand(b, -1, -1, -1), timestep=timestep,
+                          scale_list=self.scale_list,
+                          f0=f0.expand(b, -1, -1, -1),
+                          f1=f1.expand(b, -1, -1, -1))[0]
 
 
-def rife_trtify(rife):
-    """Swap the RIFE backend's ifnet for a TensorRT-backed wrapper (in place). Mirrors trtify()."""
-    rife.ifnet = _RifeIFNetTRT(rife.ifnet, _rife_weights_tag())
-    _log("[trt] RIFE IFNet wrapped with TensorRT-RTX engine (build on first frame)")
-    return rife
+class RifeIFNetBatchEngine(_Engine):
+    """1 to b tweens of one pair per enqueue (the live `_bd{b}` class; the host builds the offline
+    fixed-batch `_b{B}` engines from the same graph). `_bd{b}` in the name keeps it apart from the
+    unbatched class."""
+
+    def __init__(self, ifnet, scale_list, whash, b):
+        super().__init__(_rife_ifnet_base(ifnet, scale_list, whash) + f"_bd{b}",
+                         ["x", "timestep", "f0", "f1"], ["merged"])
+        # (min, opt, max) on the batch axis. opt = b: the full batch is the throughput case
+        # worth tuning for.
+        self.dyn_batch = {"timestep": (1, b, b)}
+
+
+class _RifeEncodeExport(nn.Module):
+    """The IFNet feature Head as its own graph: one padded frame in, its 16-channel encode out."""
+
+    def __init__(self, head):
+        super().__init__()
+        self.head = head
+
+    def forward(self, img):
+        return self.head(img)
+
+
+class RifeEncodeEngine(_Engine):
+    """The RIFE IFNet Head (f0/f1). The name carries the rife checkpoint fingerprint exactly like
+    the IFNet engines."""
+
+    def __init__(self, whash):
+        super().__init__(f"rife_encode_{whash}", ["img"], ["feat"])
+
+
+class _RifeBlock0Export(nn.Module):
+    """DRBA's coarsest-level flow as its own graph (2026-09-21): exactly
+    rife_backend.RIFE.calc_flow's block0 call, timestep 0.5 and scale_list[0] baked, the
+    4-channel flow (0->0.5 | 1->0.5, full size) out. The avg splats after it are the host's
+    kernels, so the graph stops at the flow."""
+
+    def __init__(self, block0, scale):
+        super().__init__()
+        self.block0 = block0
+        self.scale = scale
+
+    def forward(self, img0, img1, f0, f1):
+        ts = img0[:, :1] * 0 + 0.5
+        flow, _, _ = self.block0(torch.cat((img0, img1, f0, f1, ts), 1), None, scale=self.scale)
+        return flow.float()   # the native host's contract: fp32 in, fp32 out
+
+
+class RifeBlock0Engine(_Engine):
+    """DRBA's block0 flow (calc_flow). The name carries the rife checkpoint fingerprint and the
+    baked scale (trt_lookup.rife_block0_base is the one naming rule)."""
+
+    def __init__(self, scale, whash):
+        super().__init__(trt_lookup.rife_block0_base(scale, whash),
+                         ["img0", "img1", "f0", "f1"], ["flow"])

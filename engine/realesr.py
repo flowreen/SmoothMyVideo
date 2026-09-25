@@ -21,7 +21,7 @@ WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "realesr-anim
 
 def weights_hash():
     """Short content fingerprint of the bundled weights, for the TRT engine cache name (a
-    weight swap must be a cache miss, mirroring trt_runtime's WEIGHTS_TAG scheme)."""
+    weight swap must be a cache miss, mirroring trt_lookup.weights_tag)."""
     import hashlib
     h = hashlib.md5()
     with open(WEIGHTS, "rb") as f:
@@ -96,17 +96,19 @@ class SRVGGNetCompact(nn.Module):
 
 
 def fit(out, oh, ow):
-    """Resize the net's 4x output to (oh, ow): box filter for exact integer downscales (the
-    correct antialias for them, and cheapest), area for other downscales, bicubic only when
-    upscaling past 4x. Shared by the render engine (_restore) and the preview pane so the
-    pane shows exactly what a render produces."""
+    """Resize the net's 4x output to (oh, ow). Downscales are antialiased bicubic (upgraded
+    2026-08-28 from box/area as part of the replace-all-downscales pass: a windowed kernel
+    with a prefilter keeps more detail than a box at the same alias safety; the render's
+    PRIMARY output downscale is folded into the decode as linear-light spline36, this torch
+    path covers what remains: restore's 4x fold-down, the preview pane). Upscales stay plain clamped bicubic (linear-light helps a shrink but worsens
+    ringing on an enlarge; the AI upgrade for upscales is RTX VSR). Shared by the render
+    engine (_restore/_upscale) and the preview pane."""
     h, w = out.shape[-2], out.shape[-1]
     if (oh, ow) == (h, w):
         return out
-    if oh < h and h % oh == 0 and w % ow == 0 and h // oh == w // ow:
-        return F.avg_pool2d(out, h // oh)
     if oh < h:
-        return F.interpolate(out, size=(oh, ow), mode="area")
+        return F.interpolate(out, size=(oh, ow), mode="bicubic",
+                             align_corners=False, antialias=True).clamp(0.0, 1.0)
     return F.interpolate(out, size=(oh, ow), mode="bicubic", align_corners=False).clamp(0.0, 1.0)
 
 

@@ -703,6 +703,17 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
     {
         return diffSamples(a, b) == 0;
     };
+    // sampled flat-colour test: a cleared swap chain buffer reads uniform on every sample
+    auto uniformImage = [&](const uint8_t* f) -> bool
+    {
+        const size_t px = (size_t)W * H;
+        for (size_t i = 0; i < px; i += 397)
+        {
+            const size_t o = i * 4;
+            if (f[o] != f[0] || f[o + 1] != f[1] || f[o + 2] != f[2]) return false;
+        }
+        return true;
+    };
 
     // DLSS-G reset: off (applied by a sacrificial present - options only take effect AT a
     // present), back on, re-warm on the previous frame, drain. This recovers the pacer after an
@@ -731,6 +742,17 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
     uint64_t resets = 0;
     bool first = true;
     bool metered = false;   // sticky: hardware flip metering detected, capture by buffer sweep
+    // SMV_DLSSG_SWEEP=1 latches the sweep tier at startup (hidden knob for measurement work: the
+    // tier otherwise latches only when the fast tier misses its window, which no test can force).
+    {
+        char buf[8] = { 0 };
+        DWORD n = GetEnvironmentVariableA("SMV_DLSSG_SWEEP", buf, (DWORD)sizeof(buf));
+        if (n == 1 && buf[0] == '1')
+        {
+            metered = true;
+            LOG("SMV_DLSSG_SWEEP=1: buffer-sweep capture latched from the start\n");
+        }
+    }
     std::vector<std::vector<uint8_t>> preSig(host.nativeBufCount);
     std::vector<uint8_t> sweepScratch(frameBytes);
     ULONGLONG lastPresentTick = 0;
@@ -786,6 +808,7 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
         //     signatures from before the present to reject stale frames, and distance-to-A
         //     ordering for multi-frame generation (it grows monotonically with the timestep).
         const bool pairStatic = sameImage(prevFrame.data(), inFrame.data());
+        const bool inputUniform = uniformImage(inFrame.data());
         std::vector<std::vector<uint8_t>> raw;
         bool good = false;
 
@@ -850,12 +873,21 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
                     {
                         if (!host.copyNativeBuffer(i, sweepScratch.data())) continue;
                         const uint8_t* f = sweepScratch.data();
-                        if (!pairStatic && (sameImage(f, inFrame.data()) || sameImage(f, prevFrame.data())))
-                            continue;
-                        if (metered && !preSig[i].empty())
+                        // a flat buffer is a cleared one, never a generated frame of a picture that is not flat itself: a restarted host has no pre present signature to reject it with and once shipped two black tweens
+                        if (!inputUniform && uniformImage(f)) continue;
+                        if (pairStatic)
                         {
-                            takeSig(f, sig);
-                            if (sig == preSig[i]) continue;   // unchanged since before the present: stale
+                            // static pair: the generated frames equal the input (measured, see the static-pair WO entry) and a buffer that already held the input can never look fresh by signature, so any buffer equal to the input is a correct frame and a buffer holding the previous pair's tween is not
+                            if (!sameImage(f, inFrame.data())) continue;
+                        }
+                        else
+                        {
+                            if (sameImage(f, inFrame.data()) || sameImage(f, prevFrame.data())) continue;
+                            if (metered && !preSig[i].empty())
+                            {
+                                takeSig(f, sig);
+                                if (sig == preSig[i]) continue;   // unchanged since before the present: stale
+                            }
                         }
                         cand.push_back(sweepScratch);
                     }

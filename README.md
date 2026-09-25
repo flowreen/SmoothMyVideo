@@ -38,11 +38,21 @@
 Pick a video (or drag it in), choose a **target frame rate** (double it, 4×, 8× and up, or **match
 your monitor's refresh**), and click **Smooth It!**. Smooth My Video generates the in-between frames
 with a GMFSS AI model on your GPU and writes a smoother, high-frame-rate copy right next to the
-original. In the same render it can also **upscale** (up to 16K), **sharpen**, **restore detail**, and
+original. In the same render it can also **upscale** (up to 16K) or downscale (480p/720p for small,
+fast-to-encode files), **sharpen**, **restore detail**, and
 convert **SDR → real HDR10**, while carrying over every audio track, subtitle, chapter and font.
 
+It also does this **live**: Live mode smooths any window on your screen in real time (a video
+player, a browser, a windowed game) with no file and no waiting, Lossless-Scaling-style. A
+**Video / Live** switch at the top of the window picks between the two, so
+each mode shows only its own controls plus the settings both share.
+
 <p align="center">
-  <img src="docs/ui.png" alt="The Smooth My Video window, top to bottom: video info, target fps matched to the monitor, upscale, codec, the five interpolation models, RTX, Dolby Vision and HDR10+ panels, sharpen/restore, and the before/after preview" width="620">
+  <img src="docs/ui.png" alt="The Smooth My Video window in Video mode: the Video / Live switch, Select video, then the numbered panels in processing order (Restore, Interpolate with the Speed target and image scale, Upscale, DLSS 5, Sharpen, HDR with Dolby Vision and HDR10+, Output) and the before/after preview" width="620">
+</p>
+
+<p align="center">
+  <img src="docs/ui-live.png" alt="The same window in Live mode: the Video / Live switch, the Smooth It Live button with its display and hotkey options, and the shared Restore, interpolation model, Speed, image scale, Upscale, DLSS 5, sharpen and RTX HDR settings" width="620">
 </p>
 
 Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a current driver.
@@ -51,6 +61,8 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 
 * 🎞️ **Smooth *and* sharp.** Your real frames pass through at full quality with AI-generated frames woven
   in between, you get the higher frame rate without softening or reprocessing the original footage.
+  When two frames in a row are exactly identical (a paused picture, a held drawing), that pair is
+  passed through as it is instead of being redrawn, so a still image stays perfectly still.
 * 🧊 **10-bit output by default.** Float-precision interpolated frames are written at 10-bit, so smooth
   gradients (skies, glows) never band into visible steps.
 * 🎨 **Production-grade HDR10.** Real SDR→HDR10 conversion with proper mastering metadata
@@ -68,7 +80,9 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 * 💬 **Keeps every track.** All audio, subtitles/translations, chapters and font attachments are preserved
   (auto-switches to `.mkv` when needed), nothing silently dropped.
 * 🗜️ **Visually lossless.** HEVC / AV1 / H.266 encodes at maximum encoder effort, tuned and verified
-  against a lossless 8K master (VMAF ~99.8, SSIM ≥ 0.995), no fiddly quality knob to guess at.
+  against a lossless 8K master (VMAF ~99.8, SSIM ≥ 0.995), no fiddly quality knob to guess at. One
+  optional "Fast" encoder tier (HEVC 2 to 3x the encode rate at the same file size, about 0.1 to 0.5 dB)
+  for the renders where the GPU encoder, not the AI model, sets the pace.
 * 📦 **100% offline & self-contained.** Extract the zip and run, no Python, no pip, no ffmpeg to install,
   no account, no cloud upload. Only the NVIDIA driver is assumed. Free.
 * ⚡ **Fast.** fp16 with a TensorRT backend, built and cached per resolution; 4K sources interpolate at
@@ -79,6 +93,18 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 * 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
   detected and timed correctly, so audio never drifts out of sync.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
+* 🧠 **Optional NVIDIA DLSS 5 pass.** One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every
+  output frame at DLAA quality (full resolution in, full resolution out), with NVIDIA's three
+  looks as a **Style** selector (Default, Natural, Cinematic) and its two global controls,
+  **Structure Intensity** and **Tone Intensity**, as sliders. The host is bundled; the
+  Neural Rendering runtime (`nvngx_dlssnr.dll`) is not included, and NVIDIA publishes no download
+  for it (it only ships inside NBA 2K27), so the app offers a one-click **Download the DLSS 5
+  runtime** button that fetches the community RTX 40 + 50 build every DLSS 5 tool uses
+  ([rhi-repo](https://github.com/RankFTW/rhi-repo/releases) on GitHub), verifies its SHA256 and
+  installs it. Already have the file? Drop it on the window instead. It applies in Live mode too
+  (once per captured frame, before the smoothing, inside the overlay host itself, so a 1080p
+  window keeps its smoothing rate; SDR windows, or the SDR range of any window on an HDR display). In the preview, **Show changed pixels** turns the Processed
+  pane into a heat map of where the pass changed the picture (bright = large change, dark = untouched).
 * ✨ **Optional DLSS 4.5 model.** One checkbox switches the interpolation to NVIDIA's DLSS Frame
   Generation, the AI frame generation from their game stack, hosted offline by a bundled bare-bones
   D3D12 presentation loop (DLSS-FG has no video API, so the app runs one for it). Fully bundled
@@ -89,22 +115,52 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   generation. The render detects the stall within seconds and heals itself once the video is
   closed or paused; if the interference persists it stops cleanly with progress saved, and
   Resume continues from there (other models are unaffected).
+* 🔴 **Live mode: real-time frame generation on any window.** The Lossless-Scaling-style feature,
+  built in and free: press **`** (backtick) in any app and the window you're in goes live behind a
+  click-through overlay showing DLSS Frame Generation output at 2×–6×, in real time; press **`**
+  again to stop (the key is reserved system-wide while the app runs). Or pick the window from a
+  list and click **Go Live**. No file, no render, no waiting; Stop (or Esc on the overlay) ends it.
+  Same requirements as the DLSS 4.5 model (RTX 40/50, above 2× needs an RTX 50; the RIFE and GMFSS
+  live models run on any RTX); windowed or borderless windows only (exclusive fullscreen
+  can't be captured). Changing the Speed target or the Image scale while a session is running restarts it a moment
+  later with the new setting, on the same window. Switching to another app pauses the smoothing
+  and hides the overlay; returning to your window resumes it. The Display selector can also fill the screen (upscaled, aspect kept)
+  or smooth the **whole monitor** at once (everything on it, works with every model including
+  DLSS 4.5). With the RIFE, GMFSS or NVIDIA Smooth Motion model the smoothing is **adaptive**: the output locks to
+  your fps target (the same Speed setting file renders use) and the multiplier follows the
+  content, so a game dropping from 30 to 10 fps keeps playing at the same smooth rate on
+  screen. Your Sharpen, Upscale to and Restore settings apply live too (the picture is rendered at the
+  chosen height first, then fitted to the window or screen; Restore redraws every presented frame and
+  is heavy, expect about 15 to 20 fps at 1080p), and Fill screen upscales with RTX VSR when
+  it's enabled. Untick every interpolation model and Live applies just those effects to the
+  window at its own frame rate (useful for the growing set of apps that only need the
+  picture cleaned or expanded). A small
+  green readout in the corner shows the source fps, the smoothed fps, and roughly how far the
+  picture runs behind reality (about a source frame; made for watching, not for competitive
+  play). With the RIFE model the interpolation runs inside the overlay itself instead of a
+  separate engine process, which cuts latency and about a third of the processor use and, at
+  the image scales most people run, raises the smoothed frame rate; the separate engine
+  process steps in automatically whenever the overlay cannot run it. Plain RIFE file renders use
+  the same engine host too.
 * 🎬 **A RIFE model for live action.** GMFSS is an anime specialist; one checkbox switches to
   Practical-RIFE 4.26 heavy (bundled, nothing to install), the strongest open general-purpose
   interpolation model - the pick for filmed content. TensorRT-accelerated like GMFSS. Its
   **Preserve anime pacing (DRBA)**
   sub-option keeps characters at their original animation cadence while camera pans smooth
-  fully, for purists who want fluidity without "hollywoodizing" the animation.
+  fully, for purists who want fluidity without "hollywoodizing" the animation. It works in Live
+  mode too, at the cost of one source frame of extra delay (it needs the next frame before it can
+  place the ones around the current one).
 * 🌀 **Optional NVIDIA Smooth Motion model.** One checkbox switches the interpolation from the GMFSS AI
   model to NVIDIA's hardware optical-flow FRUC (the same family as the driver-level Smooth Motion), for
   when you want the NVIDIA look or a non-AI reference. Lower quality than GMFSS on fast motion; the
   NVIDIA runtime is a one-time separate download (not bundled).
-* 🌊 **Optional SVP model.** One more checkbox renders with the SmoothVideo Project's svpflow
-  engine (the tech behind SVP's real-time playback smoothing), borrowed from your local SVP 4
-  installation, so SVP fans can bake their player's look into a file. Its **NVIDIA Optical Flow**
-  sub-option (on by default) takes motion vectors from NVIDIA's hardware optical-flow unit;
-  turning it off uses SVP's classic block-matching search instead. Requires SVP 4 installed
-  (only its svpflow plugin DLLs are used; SVP's optional mpv player component is not needed).
+* 🧪 **Experimental: NVIDIA Optical Flow (direct).** One more checkbox runs NVIDIA's hardware
+  optical-flow unit straight from the app, nothing to install (the NVIDIA driver
+  provides it), live and for file renders. Fast, and clean on moderate motion; where very fast
+  or twisting motion defeats the hardware's vectors it fades to a soft double image instead of
+  breaking up. File renders with it take a
+  whole multiplier and no Sharpen, Upscale, Image scale, RTX HDR, Restore or DLSS 5 yet (it tells
+  you when a setting is in the way); live takes every effect.
 * 🎚️ **Plus the essentials:** FSR-style sharpening, a live before/after preview, every setting remembered
   between runs, and a quiet one-line notice when a newer release is out (nothing auto-downloads).
 
@@ -120,10 +176,11 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 
 ## Under the hood
 
-The UI is Electron + TypeScript; the interpolation runs in a Python **GMFSS_Fortuna** engine spawned as a
-subprocess. GMFSS_Fortuna is a "union" interpolator, GMFlow optical flow, an IFNet/RIFE refiner, plus
-MetricNet, FeatureNet, FusionNet and softsplat warping, producing clean frames even at high multipliers.
-It runs fp16 with a cupy softsplat kernel and an optional TensorRT backend.
+The UI is Electron + TypeScript; every render and Live session runs in one native host (`smv-live.exe`,
+C++ on TensorRT for RTX and CUDA), driven by a TypeScript orchestrator that handles probing, encoding and
+resume. No Python ships. The default model, **GMFSS_Fortuna**, is a "union" interpolator, GMFlow optical
+flow, an IFNet/RIFE refiner, plus MetricNet, FeatureNet, FusionNet and softsplat warping, producing clean
+frames even at high multipliers.
 
 📖 **Build it, hack on it, or read the design rationale → [DEVELOPMENT.md](DEVELOPMENT.md)**
 
@@ -143,4 +200,5 @@ is not affiliated with, endorsed by, sponsored by, or certified by Dolby Laborat
 HDR10+ is a trademark of HDR10+ Technologies, LLC; Smooth My Video is likewise not affiliated with, endorsed
 by, or certified by HDR10+ Technologies. HDR10+ metadata is injected by the separately-installed, third-party
 open-source [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool); no HDR10+ LLC software is bundled
-or redistributed.</sub>
+or redistributed. The bundled example clip is from
+[Big Buck Bunny](https://peach.blender.org/), © Blender Foundation, licensed CC-BY 3.0.</sub>

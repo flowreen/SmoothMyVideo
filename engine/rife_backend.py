@@ -50,9 +50,13 @@ class RIFE:
 
     # --- plain pair interface (matches the GMFSS wrapper the render loops call) ---------------
     @torch.inference_mode()
-    def reuse(self, a, b, scale=None):
-        # per-pair feature encodes; IFNet accepts them precomputed (the DRBA path relies on it)
-        return self.ifnet.encode(a[:, :3]), self.ifnet.encode(b[:, :3])
+    def reuse(self, a, b, scale=None, f0=None):
+        # per-pair feature encodes; IFNet accepts them precomputed (the DRBA path relies on it).
+        # f0 lets a caller hand back the encode it already has for `a`. On the on-grid loop the
+        # pairs are strictly consecutive, so pair k's b-side encode IS pair k+1's a-side encode
+        # and recomputing it is pure waste; encode() is a pure function of the frame, so passing
+        # the cached tensor is exact, not an approximation.
+        return (self.ifnet.encode(a[:, :3]) if f0 is None else f0), self.ifnet.encode(b[:, :3])
 
     @torch.inference_mode()
     @torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu")
@@ -64,6 +68,25 @@ class RIFE:
         f0, f1 = reuse if reuse is not None else (None, None)
         return self.ifnet(torch.cat((a, b), 1), timestep=t,
                           scale_list=self.scale_list, f0=f0, f1=f1)[0]
+
+    @torch.inference_mode()
+    @torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu")
+    def inference_batch(self, a, b, reuse, ts):
+        """B tweens of ONE pair in one call: returns (B,3,H,W) in the order of `ts`.
+
+        Only the TRT wrapper can actually batch (it owns a batch engine, fixed-B offline and
+        dynamic-B live, and expands the pair-constant inputs inside the graph so one upload
+        serves every tween); the eager IFNet would have to broadcast a
+        batch-1 x against a batch-B timestep, so there it is just the sequential loop. Callers
+        get identical results either way, which keeps the eager/TRT escape hatches honest."""
+        f0, f1 = reuse if reuse is not None else (None, None)
+        x = torch.cat((a, b), 1)
+        if getattr(self.ifnet, "batch_ok", False) and f0 is not None and f1 is not None:
+            base = x[:, :1] * 0
+            stack = torch.cat([base + float(t) for t in ts], 0)   # (B,1,H,W) timestep maps
+            return self.ifnet(x, timestep=stack, scale_list=self.scale_list, f0=f0, f1=f1)[0]
+        return torch.cat([self.ifnet(x, timestep=float(t), scale_list=self.scale_list,
+                                     f0=f0, f1=f1)[0] for t in ts], 0)
 
     # --- DRBA triple interface (adapted from upstream models/rife.py, MIT) --------------------
     def calc_flow(self, a, b, f0=None, f1=None):

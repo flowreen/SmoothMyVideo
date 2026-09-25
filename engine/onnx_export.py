@@ -1,0 +1,197 @@
+"""Export the size-free ONNX of every live graph into engine/onnx (trt_lookup.onnx_path), so an
+engine at a new window size is a build from that file instead of a torch export. Run by
+scripts/export-onnx.js (npm setup and dist); every file already present is skipped, so a rerun is
+cheap. Graphs: the RIFE IFNet (live `_bd8` and the
+unbatched class) and its encode, plain and as the flow-warp class at k 1 (Frame Blend), 2 and 4,
+DRBA's block0, Restore, and the five GMFSS nets. The host builds the offline fixed-batch RIFE
+classes (`_b{B}`) from `_bd8`. Then ship_tidy() and write_tags() (priority 29).
+Usage: runtime python engine/onnx_export.py"""
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "GMFSS_Fortuna"))
+
+import torch  # noqa: E402
+
+import realesr  # noqa: E402
+import trt_lookup  # noqa: E402
+import trt_runtime as tr  # noqa: E402
+from rife_backend import RIFE  # noqa: E402
+
+PH, PW = 576, 960   # any /64 size inside the symbolic range works as the example
+
+
+def main():
+    t0 = time.time()
+    torch.cuda.set_stream(torch.cuda.Stream())
+    g = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.rand((1, 3, PH, PW), device="cuda", generator=g)
+    b = torch.rand((1, 3, PH, PW), device="cuda", generator=g)
+    x = torch.cat((a, b), 1)
+    rh = trt_lookup.rife_weights_tag()
+    done = []
+
+    def ensure(eng, export_module, ins):
+        p = tr.ensure_onnx(eng.name, export_module, ins, eng.input_names, eng.output_names,
+                           eng.dyn_batch)
+        if p is None:
+            raise RuntimeError(f"{eng.name}: this graph does not qualify for a size-free export")
+        done.append(os.path.basename(p))
+
+    # RIFE (plain RIFE, Frame Blend and DRBA share these graphs). The flow-warp class of the
+    # Flow scale control (`_fweht{k}`) was dropped 2026-09-25 with the control
+    # (D:\AIStuff\smv-flowscale-removal\README.md)
+    rife = RIFE()
+    net, sl = rife.ifnet, list(rife.scale_list)
+    with torch.inference_mode():
+        f0, f1 = net.encode(a).float(), net.encode(b).float()
+    ts = torch.cat([x[:, :1] * 0 + t for t in (0.25, 0.5, 0.75)], 0)
+    e = tr.RifeIFNetBatchEngine(net, sl, rh, 8)
+    ensure(e, tr._RifeIFNetBatchExport(net, sl), (x, ts, f0, f1))
+    e = tr.RifeEncodeEngine(rh)
+    ensure(e, tr._RifeEncodeExport(net.encode), (a,))
+    # the unbatched class: the `.nofit` fallback and the offline single-tween calls
+    e = tr.RifeIFNetEngine(net, sl, rh)
+    ensure(e, tr._RifeIFNetExport(net, sl), (x, x[:, :1] * 0 + 0.5, f0, f1))
+    e = tr.RifeBlock0Engine(float(sl[0]), rh)
+    ensure(e, tr._RifeBlock0Export(net.block0, float(sl[0])), (a, b, f0, f1))
+    del rife, net
+
+    # Restore: fp16 at the model size (the caller halves the frame)
+    rnet = realesr.load("cuda")
+    ensure(tr.RestoreEngine(realesr.weights_hash()), rnet, (a.half(),))
+    del rnet
+
+    # GMFSS: the exact tensors an eager reuse + inference hands each sub net (forward pre-hooks)
+    cwd = os.getcwd()
+    os.chdir(os.path.join(HERE, "GMFSS_Fortuna"))
+    try:
+        from model.GMFSS_infer_u import Model
+
+        gm = Model()
+        gm.load_model("train_log", -1)
+        gm.eval()
+        gm.device()
+    finally:
+        os.chdir(cwd)
+    rec = {}
+    hooks = []
+    for nm in ("feat_ext", "flownet", "metricnet", "ifnet", "fusionnet"):
+        def pre(mod, args, nm=nm):
+            rec.setdefault(nm, tuple(q.detach().clone() if torch.is_tensor(q) else q for q in args))
+        hooks.append(getattr(gm, nm).register_forward_pre_hook(pre))
+    with torch.inference_mode():
+        gm.inference(a, b, gm.reuse(a, b, 1.0), 0.5)
+    for hk in hooks:
+        hk.remove()
+    ensure(tr.FeatEngine(), gm.feat_ext, rec["feat_ext"][:1])
+    ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
+    ensure(tr.MetricEngine(), gm.metricnet, rec["metricnet"][:4])
+    xi, tsv = rec["ifnet"][0], rec["ifnet"][1]
+    ensure(tr.IFNetEngine(), tr._IFNetExport(gm.ifnet, [8, 4, 2, 1]),
+           (xi, xi.new_full((1, 1, 1, 1), float(tsv))))
+    ensure(tr.FusionEngine(), gm.fusionnet, rec["fusionnet"][:4])
+    print(f"size-free ONNX ready in {trt_lookup.ONNX_DIR}: {len(done)} graphs, "
+          f"{time.time() - t0:.0f} s", flush=True)
+    ship_tidy(done)
+    write_tags()
+
+
+def ship_tidy(done):
+    """The shipped folder holds exactly these graphs, each weight blob once (priority 29): (1) an
+    .onnx this export does not produce is removed with its .data (the python route's offline
+    `_b{B}` classes: the host builds those engines from `_bd8`); (2) external data files with the
+    same bytes are merged into one `weights_<md5 12>.data` and every graph's `location` points at
+    it (the offsets stay valid: same bytes, same layout); the RIFE family carried one 23 MB blob
+    twelve times. (3) a .data no kept graph references is removed. Idempotent: a merged folder has
+    nothing left to merge. The TensorRT parser resolves `location` next to the .onnx it parses."""
+    import hashlib
+
+    import onnx
+    from onnx.external_data_helper import _get_all_tensors
+
+    d = trt_lookup.ONNX_DIR
+    keep = set(done)
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".onnx") and f not in keep:
+            for p in (os.path.join(d, f), os.path.join(d, f + ".data")):
+                if os.path.isfile(p):
+                    os.remove(p)
+            print(f"removed {f}: not produced by this export", flush=True)
+    models, users = {}, {}
+    for f in sorted(keep):
+        m = onnx.load(os.path.join(d, f), load_external_data=False)
+        models[f] = m
+        for t in _get_all_tensors(m):
+            for kv in t.external_data:
+                if kv.key == "location":
+                    users.setdefault(kv.value, set()).add(f)
+
+    def md5(p):
+        h = hashlib.md5()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    groups = {}
+    for loc in sorted(users):
+        groups.setdefault(md5(os.path.join(d, loc)), []).append(loc)
+    saved = 0
+    for h, locs in groups.items():
+        if len(locs) < 2:
+            continue
+        shared = f"weights_{h[:12]}.data"
+        sp = os.path.join(d, shared)
+        if not os.path.isfile(sp):
+            src = next(l for l in locs if l != shared)
+            tmp = sp + ".tmp"
+            with open(os.path.join(d, src), "rb") as a, open(tmp, "wb") as b:
+                for chunk in iter(lambda: a.read(1 << 20), b""):
+                    b.write(chunk)
+            os.replace(tmp, sp)
+        for loc in locs:
+            if loc == shared:
+                continue
+            for f in sorted(users[loc]):
+                m = models[f]
+                for t in _get_all_tensors(m):
+                    for kv in t.external_data:
+                        if kv.key == "location" and kv.value == loc:
+                            kv.value = shared
+                tmp = os.path.join(d, f + ".tmp")
+                with open(tmp, "wb") as fh:
+                    fh.write(m.SerializeToString())
+                os.replace(tmp, os.path.join(d, f))
+                users.setdefault(shared, set()).add(f)
+            saved += os.path.getsize(os.path.join(d, loc))
+            os.remove(os.path.join(d, loc))
+            del users[loc]
+        print(f"merged {len(locs)} identical weight files into {shared}", flush=True)
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".data") and f not in users:
+            saved += os.path.getsize(os.path.join(d, f))
+            os.remove(os.path.join(d, f))
+            print(f"removed {f}: no graph references it", flush=True)
+    total = sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d))
+    print(f"ONNX folder {total / 1e6:.0f} MB ({saved / 1e6:.0f} MB of duplicates removed)", flush=True)
+
+
+def write_tags():
+    """weights_tags.txt: the weight tags every engine name carries, for a shipped tree without the
+    weight files (the dist leaves the .pkl / .pth out, priority 29; the ONNX carry the weights).
+    The host hashes the weight files when they exist (a dev tree) and reads this file otherwise."""
+    p = os.path.join(trt_lookup.ONNX_DIR, "weights_tags.txt")
+    txt = (f"w {trt_lookup.weights_tag()}\nr {trt_lookup.rife_weights_tag()}\n"
+           f"rest {realesr.weights_hash()}\n")
+    with open(p + ".tmp", "w", encoding="ascii", newline="\n") as fh:
+        fh.write(txt)
+    os.replace(p + ".tmp", p)
+    print("weights_tags.txt: " + txt.replace("\n", "  ").strip(), flush=True)
+
+
+if __name__ == "__main__":
+    main()

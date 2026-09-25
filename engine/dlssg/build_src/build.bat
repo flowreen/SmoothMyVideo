@@ -1,14 +1,25 @@
 @echo off
 setlocal
 if "%SL_SDK%"=="" (
-  echo Set SL_SDK to the extracted Streamline SDK first, see BUILD.md
+  echo Set SL_SDK to the extracted Streamline SDK first, see DEVELOPMENT.md
   exit /b 1
 )
 where cl >nul 2>nul
-if errorlevel 1 (
-  for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSDIR=%%i
-  call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+if not errorlevel 1 goto compile
+rem no parens block here: the ^) in "Program Files (x86)" would close it early (same as the live host's build.bat)
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (
+  echo vswhere.exe not found, run from a VS x64 developer prompt instead
+  exit /b 1
 )
+set VSDIR=
+for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -property installationPath`) do set "VSDIR=%%i"
+if "%VSDIR%"=="" (
+  echo vswhere found no Visual Studio installation
+  exit /b 1
+)
+call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+:compile
 cd /d %~dp0
 cl /nologo /std:c++17 /EHsc /O2 /W3 main.cpp /I "%SL_SDK%\include" ^
    /link /LIBPATH:"%SL_SDK%\lib\x64" sl.interposer.lib user32.lib gdi32.lib ole32.lib windowscodecs.lib dxguid.lib ^
