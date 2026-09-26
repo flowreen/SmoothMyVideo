@@ -1775,6 +1775,16 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             // GMFSS: the pair ran above, then one chain per tween into dGmF (clamped fp32).
             // fruc: the pair ran above, then one bridge warp per tween into dFrOut (x / 255).
             if (nr.nvof && !nativeNvofPair(nr, nr.dX, dCur)) { io.setFail("nvof pair failed"); failed = true; break; }
+            if (nr.fruc && nT - (std::min)(dropLeft, nT) > 1)
+            {
+                // the tweens the loop below generates (resume drops the first dropLeft), in its
+                // order and with its exact t, for the parallel FRUC instances
+                double tw[64];
+                uint32_t n = 0;
+                for (int j = (std::min)(dropLeft, nT); j < nT && n < 64; j++)
+                    tw[n++] = fpsMode ? fr[j] : (double)((float)(j + 1) / (float)multi);
+                nativeFrucPlan(nr, tw, n);
+            }
             for (int j = 0; j < nT && !failed; j++)
             {
                 // resume: the banked slots are never generated (python's fracs[skip:]); DLSS 4.5

@@ -761,39 +761,91 @@ __global__ void k_pyr(const void* __restrict__ src, int srcHalf, int C, int sw, 
 
 // one source pixel of (w, h): C planes of `in` (fp16 features or the fp32 image half), the flow
 // (2, h, w) fp32 (plane 0 = x), the metric (1, h, w) (fp16 from the engine, fp32 from k_pyr),
-// both scaled by s, splatted into C + 1 int64 planes (zeroed by the caller; plane C = exp(Z))
+// both scaled by s, splatted into C + 1 int64 planes (zeroed by the caller; plane C = exp(Z)).
+// Neighbour combine (priority 30 lever 4): products bound for the SAME target pixel are summed
+// before one atomic. Horizontal: lane i's NW / SW corner is lane i - 1's NE / SE corner (same
+// target coordinates) -> lane i adds both, lane i - 1 skips (warp shuffle). Vertical: the
+// thread one block row below whose NW / NE corners are my SW / SE corners takes my bottom row
+// (shared memory) and I skip it. Integer adds mod 2^64 are order-free, so the accumulators stay
+// bit-identical; smooth flow drops from 4 to ~1 atomic per pixel and channel. Keyed on the
+// target coordinates, not on the thread layout, so any block shape is correct; the host
+// launches 32 x 8 (one warp = 32 consecutive x of one row). The block must be a multiple of 32
+// threads and at most 256. No early return: every thread joins the shuffles and barriers.
+// Gate: harness\p36\splat_bench.py (accumulators equal to the pre-combine kernel bit for bit).
 __global__ void k_splatSoft(const void* __restrict__ in, int inHalf, int C,
                             const float* __restrict__ flow, const void* __restrict__ metric,
                             int metricHalf, float s, int w, int h, long long* __restrict__ acc)
 {
+    __shared__ int shX[256], shY[256], shA[256];
+    __shared__ unsigned long long shV[2][2][256];     // [channel parity][SW, SE][thread]
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-    const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const unsigned lane = (unsigned)tid & 31u;
+    const size_t plane = (size_t)w * h;
+    bool act = x < w && y < h;
+    const size_t o = act ? (size_t)y * w + x : 0;
     // the target position and the four corner weights in DOUBLE: python's fp32 `x + s * flow`
     // carries a 6e-5 px error at x ~ 600..960 (one fp32 ulp), which the harness measured as
     // up to 8.7e-4 of the normalized output where the weight sum is small; the double position
     // tracks the exact splat and the weights round once to fp32 for the fixed-point product
     // (third occurrence of the tap-centre lesson, 2026-09-15)
-    const double fx = (double)x + (double)s * (double)flow[o];
-    const double fy = (double)y + (double)s * (double)flow[plane + o];
-    if (!isfinite(fx) || !isfinite(fy)) return;
-    const float e = expf(__fmul_rn(s, gmTap(metric, metricHalf, o)));
-    const int nwX = (int)floor(fx), nwY = (int)floor(fy);
+    double fx = 0.0, fy = 0.0;
+    if (act)
+    {
+        fx = (double)x + (double)s * (double)flow[o];
+        fy = (double)y + (double)s * (double)flow[plane + o];
+        act = isfinite(fx) && isfinite(fy);
+    }
+    const float e = act ? expf(__fmul_rn(s, gmTap(metric, metricHalf, o))) : 0.0f;
+    const int nwX = act ? (int)floor(fx) : 0, nwY = act ? (int)floor(fy) : 0;
     const double dx = fx - (double)nwX, dy = fy - (double)nwY;
     const float wNW = (float)((1.0 - dx) * (1.0 - dy)), wNE = (float)(dx * (1.0 - dy));
     const float wSW = (float)((1.0 - dx) * dy), wSE = (float)(dx * dy);
-    const bool okW = nwX >= 0 && nwX < w, okE = nwX + 1 >= 0 && nwX + 1 < w;
+    const bool okW = act && nwX >= 0 && nwX < w, okE = act && nwX + 1 >= 0 && nwX + 1 < w;
     const bool okN = nwY >= 0 && nwY < h, okS = nwY + 1 >= 0 && nwY + 1 < h;
     const long long oNW = (long long)nwY * w + nwX;   // only dereferenced behind the ok flags
+    // take: my NW / SW corners are lane - 1's NE / SE corners (same pixels, so the same ok
+    // flags); give: lane + 1 takes mine
+    const int pX = __shfl_up_sync(0xffffffffu, nwX, 1), pY = __shfl_up_sync(0xffffffffu, nwY, 1);
+    const int pAct = __shfl_up_sync(0xffffffffu, act ? 1 : 0, 1);
+    const bool take = act && lane > 0 && pAct && pX + 1 == nwX && pY == nwY;
+    const bool give = __shfl_down_sync(0xffffffffu, take ? 1 : 0, 1) && lane < 31;
+    // vtake: my NW / NE corners are the SW / SE corners of the thread one block row above;
+    // vgive: the thread below takes my bottom row (the same test from both ends)
+    shX[tid] = nwX;
+    shY[tid] = nwY;
+    shA[tid] = act ? 1 : 0;
+    __syncthreads();
+    const int up = tid - (int)blockDim.x, dn = tid + (int)blockDim.x;
+    const int nT = (int)(blockDim.x * blockDim.y);
+    const bool vtake = act && up >= 0 && shA[up] && shX[up] == nwX && shY[up] + 1 == nwY;
+    const bool vgive = act && dn < nT && shA[dn] && shX[dn] == nwX && shY[dn] == nwY + 1;
     for (int c = 0; c <= C; c++)
     {
-        const float v = c < C ? __fmul_rn(gmTap(in, inHalf, (size_t)c * plane + o), e) : e;
+        const float v = !act ? 0.0f : c < C ? __fmul_rn(gmTap(in, inHalf, (size_t)c * plane + o), e) : e;
+        unsigned long long qNW = (unsigned long long)(long long)llrintf(v * wNW * 67108864.0f);
+        unsigned long long qNE = (unsigned long long)(long long)llrintf(v * wNE * 67108864.0f);
+        const unsigned long long qSW = (unsigned long long)(long long)llrintf(v * wSW * 67108864.0f);
+        const unsigned long long qSE = (unsigned long long)(long long)llrintf(v * wSE * 67108864.0f);
+        // bottom row, combined across the row first: my SW pixel also holds lane - 1's SE
+        const unsigned long long lSE = __shfl_up_sync(0xffffffffu, qSE, 1);
+        const unsigned long long sSW = take ? qSW + lSE : qSW, sSE = give ? 0ull : qSE;
+        const int b = c & 1;
+        shV[b][0][tid] = sSW;
+        shV[b][1][tid] = sSE;
+        __syncthreads();
+        // top row: add the row above's bottom row, then combine across the row
+        if (vtake) { qNW += shV[b][0][up]; qNE += shV[b][1][up]; }
+        const unsigned long long lNE = __shfl_up_sync(0xffffffffu, qNE, 1);
         unsigned long long* p = (unsigned long long*)(acc + (size_t)c * plane);
-        if (okN && okW) atomicAdd(p + oNW, (unsigned long long)(long long)llrintf(v * wNW * 67108864.0f));
-        if (okN && okE) atomicAdd(p + oNW + 1, (unsigned long long)(long long)llrintf(v * wNE * 67108864.0f));
-        if (okS && okW) atomicAdd(p + oNW + w, (unsigned long long)(long long)llrintf(v * wSW * 67108864.0f));
-        if (okS && okE) atomicAdd(p + oNW + w + 1, (unsigned long long)(long long)llrintf(v * wSE * 67108864.0f));
+        if (okN && okW) atomicAdd(p + oNW, take ? qNW + lNE : qNW);
+        if (okN && okE && !give) atomicAdd(p + oNW + 1, qNE);
+        if (!vgive)
+        {
+            if (okS && okW) atomicAdd(p + oNW + w, sSW);
+            if (okS && okE && !give) atomicAdd(p + oNW + w + 1, sSE);
+        }
     }
 }
 
@@ -2255,12 +2307,21 @@ struct NativeRife
     float* dFrOut = nullptr;         // (3, ph, pw): the tween, the layout storeSlot reads
     int frPrev = -1, frLast = -1;    // surfaces: the previous frame, the last tweened pair's end
     int frA = -1, frB = -1;          // this group's pair
-    // the feed-once bridge (nvoffruc_step): the surface whose frame FRUC was fed last (-1 = none,
-    // or that surface was repacked since), and whether the pair's next tween is its first
-    int frFed = -1;
-    bool frFirst = false;
+    // the feed-once bridge (nvoffruc_step), per FRUC instance: the surface whose frame it was fed
+    // last (-1 = none, or that surface was repacked since), whether the pair's next tween on it is
+    // its first, and how many calls it has served
+    int frFed[4] = { -1, -1, -1, -1 };
+    bool frFirst[4] = {};
+    uint64_t frCalls[4] = {};
     bool frCreated = false;
     uint64_t frPrimed = 0, frRepeats = 0, frTweens = 0;
+    // parallel instances (memory priority 32b, bridge nvoffruc_step_i): tween k of a pair's plan
+    // runs on instance k % frInst, a round of frInst tweens at a time; instance 0 on the compute
+    // thread, the others on their own workers (g_frW), each into its own BGRA8 output
+    int frInst = 1, frInstMax = 1;
+    uint8_t* dFrOutBI[4] = {};       // [0] = dFrOutB
+    double frPlan[64] = {};
+    uint32_t frPlanN = 0, frPlanK = 0;
     // RIFE with DRBA timing (rifedrba, 2026-09-21, memory priority 21 (b) step 3): the RIFE
     // handoff plus `NATIVE-PATH block0=` (calc_flow's block0 as its own engine) and `engine=drba
     // lag=1`. live_server.RifeDrba natively: a four-frame history of padded frames and their
@@ -4779,8 +4840,9 @@ static void nativeNvofFree(NativeRife& nr)
 // NVIDIA Smooth Motion (fruc, 2026-09-21, memory priority 21): the shipped nvoffruc_bridge.dll,
 // loaded once per process by full path from the folder the handoff named (NvOFFRUC.dll and its
 // cudart64_110.dll are user-installed beside it; the bridge loads NvOFFRUC.dll signature-checked
-// itself). Its state is process-global (one FRUC instance), so a session creates it at setup
-// and destroys it in nativeFree. The bridge runs FRUC in its own CUDA context and brackets
+// itself). Its state is process-global (up to four FRUC instances since priority 32b), so a
+// session creates instance 0 at setup, the others at the first pair that needs them, and
+// destroys them all in nativeFree. The bridge runs each FRUC instance in its own CUDA context and brackets
 // every call with cuCtxSynchronize on the caller's context (its SYNC FENCE notes), so the
 // packs queued on nr.stream have landed when it copies, and its output has landed on return.
 struct FrucBridge
@@ -4793,8 +4855,52 @@ struct FrucBridge
     // last, feed cur only, 2 = the same pair again; an older bridge lacks it (interpolate then)
     int (*step)(void*, void*, void*, double, int, int*) = nullptr;
     void (*destroy)() = nullptr;
+    // the instance calls (bridge of priority 32b): up to 4 FRUC instances in the one module, each
+    // with its own context; absent = an older bridge = one instance
+    int (*createI)(int, unsigned, unsigned) = nullptr;
+    int (*stepI)(int, void*, void*, void*, double, int, int*) = nullptr;
 };
 static FrucBridge g_fruc;
+
+// one worker per extra instance (1..3): the compute thread hands it one step at a time and
+// collects the result in tween order. The worker binds the host's device first, so the bridge's
+// entry fence (cuCtxSynchronize on the caller's context) covers the host's packs and unpacks.
+struct FrucWorker
+{
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    bool job = false, done = true, quit = false;
+    void* a = nullptr; void* b = nullptr; void* out = nullptr;
+    double t = 0.0;
+    int mode = 0, rc = 0, rep = 0;
+    std::string err;
+};
+// never destroyed: no std::thread destructor runs at process exit (nativeFrucFree joins them)
+static FrucWorker* const g_frW = new FrucWorker[4];
+
+static void frucWorkerLoop(int i, int dev)
+{
+    FrucWorker& w = g_frW[i];
+    const bool bound = cudaSetDevice(dev) == cudaSuccess && cudaFree(nullptr) == cudaSuccess;
+    std::unique_lock<std::mutex> lk(w.m);
+    for (;;)
+    {
+        w.cv.wait(lk, [&] { return w.job || w.quit; });
+        if (w.quit) return;
+        w.job = false;
+        void* a = w.a; void* b = w.b; void* out = w.out;
+        const double t = w.t;
+        const int mode = w.mode;
+        lk.unlock();
+        int rep = 0;
+        const int rc = bound ? g_fruc.stepI(i, a, b, out, t, mode, &rep) : -100;
+        std::string err = rc == -100 ? std::string("worker CUDA bind failed") : (rc ? g_fruc.lastError() : "");
+        lk.lock();
+        w.rc = rc; w.rep = rep; w.err = std::move(err); w.done = true;
+        w.cv.notify_all();
+    }
+}
 
 static bool nativeFrucLoad(const std::string& dir)
 {
@@ -4808,6 +4914,9 @@ static bool nativeFrucLoad(const std::string& dir)
     g_fruc.interpolate = (int (*)(void*, void*, void*, double, int*))GetProcAddress(m, "nvoffruc_interpolate");
     g_fruc.destroy = (void (*)())GetProcAddress(m, "nvoffruc_destroy");
     g_fruc.step = (int (*)(void*, void*, void*, double, int, int*))GetProcAddress(m, "nvoffruc_step");
+    g_fruc.createI = (int (*)(int, unsigned, unsigned))GetProcAddress(m, "nvoffruc_create_i");
+    g_fruc.stepI = (int (*)(int, void*, void*, void*, double, int, int*))GetProcAddress(m, "nvoffruc_step_i");
+    if (!g_fruc.step) g_fruc.createI = nullptr, g_fruc.stepI = nullptr;
     if (!g_fruc.lastError || !g_fruc.create || !g_fruc.interpolate || !g_fruc.destroy)
     { LOG("native: fruc: nvoffruc_bridge.dll lacks an expected export\n"); FreeLibrary(m); return false; }
     g_fruc.mod = m;
@@ -4829,11 +4938,85 @@ static bool nativeFrucSetup(NativeRife& nr)
     for (auto& s : nr.dFrSurf) NCHK(cudaMalloc((void**)&s, bytes), "alloc fruc surface");
     NCHK(cudaMalloc((void**)&nr.dFrOutB, bytes), "alloc fruc output");
     NCHK(cudaMalloc((void**)&nr.dFrOut, 3 * plane * sizeof(float)), "alloc fruc tween");
-    nr.frPrev = nr.frLast = nr.frA = nr.frB = nr.frFed = -1;
-    nr.frFirst = false;
-    LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA%s\n",
-        nr.pw, nr.ph, nr.w, nr.h, g_fruc.step ? ", feed-once" : "");
+    nr.frPrev = nr.frLast = nr.frA = nr.frB = -1;
+    for (int i = 0; i < 4; i++) { nr.frFed[i] = -1; nr.frFirst[i] = false; nr.frCalls[i] = 0; }
+    nr.dFrOutBI[0] = nr.dFrOutB;
+    nr.frInst = 1;
+    nr.frPlanN = nr.frPlanK = 0;
+    // parallel instances: live 4, offline 1 (offline FRUC is paced by the encoder, where the
+    // instances measured 0.99x / ~0.94x at x3 / x5 1080p, WO Step 4); SMV_FRUC_INSTANCES overrides
+    // both (1 = the one-instance path); the extra ones are created by the first pair whose plan
+    // needs them (nativeFrucGrow)
+    nr.frInstMax = 1;
+    if (g_fruc.stepI)
+    {
+        nr.frInstMax = g_offline ? 1 : 4;
+        char ev[8] = {};
+        if (GetEnvironmentVariableA("SMV_FRUC_INSTANCES", ev, sizeof(ev)) > 0)
+            nr.frInstMax = (std::max)(1, (std::min)(4, atoi(ev)));
+    }
+    LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA%s, up to %d instance%s\n",
+        nr.pw, nr.ph, nr.w, nr.h, g_fruc.step ? ", feed-once" : "", nr.frInstMax, nr.frInstMax > 1 ? "s" : "");
     return true;
+}
+
+// the extra FRUC instances up to `want` (instance 0 is the session's own), each with its output
+// buffer and its worker; a failed create (VRAM, most likely) keeps the instances made so far
+static void nativeFrucGrow(NativeRife& nr, int want)
+{
+    const int64_t t0 = nowQpc100();
+    const int had = nr.frInst;
+    const size_t bytes = (size_t)nr.pw * nr.ph * 4;
+    // SMV_FRUC_INST_FAILAT=i (harness lever): instance i fails to create, the trigger of the
+    // fallback below
+    char ev[8] = {};
+    const int failAt = GetEnvironmentVariableA("SMV_FRUC_INST_FAILAT", ev, sizeof(ev)) > 0 ? atoi(ev) : -1;
+    while (nr.frInst < want)
+    {
+        const int i = nr.frInst;
+        const int rc = i == failAt ? -99 : g_fruc.createI(i, (unsigned)nr.pw, (unsigned)nr.ph);
+        if (rc != 0 || cudaMalloc((void**)&nr.dFrOutBI[i], bytes) != cudaSuccess)
+        {
+            LOG("native: fruc: instance %d not created (%s, rc %d), staying at %d\n",
+                i, rc == -99 ? "SMV_FRUC_INST_FAILAT" : rc ? g_fruc.lastError() : "output alloc failed", rc, nr.frInst);
+            if (nr.dFrOutBI[i]) { cudaFree(nr.dFrOutBI[i]); nr.dFrOutBI[i] = nullptr; }
+            nr.frInstMax = nr.frInst;
+            break;
+        }
+        FrucWorker& w = g_frW[i];
+        w.job = w.quit = false;
+        w.done = true;
+        w.th = std::thread(frucWorkerLoop, i, nr.dev);
+        nr.frInst++;
+    }
+    if (nr.frInst > had)
+        LOG("native: fruc: %d instances (%d new in %.0f ms)\n", nr.frInst, nr.frInst - had,
+            (double)(nowQpc100() - t0) / 10000.0);
+}
+
+// wait until every worker is idle (a round the caller abandoned, a session's end)
+static void nativeFrucDrain(NativeRife& nr)
+{
+    for (int i = 1; i < nr.frInst; i++)
+    {
+        FrucWorker& w = g_frW[i];
+        std::unique_lock<std::mutex> lk(w.m);
+        w.cv.wait(lk, [&] { return w.done; });
+    }
+}
+
+// the pair's tweens in the order the caller asks for them (every nativeFrucTween call then takes
+// the next one); fewer than two, or one instance, = the one-instance path
+static void nativeFrucPlan(NativeRife& nr, const double* ts, uint32_t n)
+{
+    nativeFrucDrain(nr);
+    nr.frPlanN = nr.frPlanK = 0;
+    if (nr.frInstMax < 2 || n < 2 || n > 64) return;
+    const int want = (std::min)((int)n, nr.frInstMax);
+    if (want > nr.frInst) nativeFrucGrow(nr, want);
+    if (nr.frInst < 2) return;
+    memcpy(nr.frPlan, ts, n * sizeof(double));
+    nr.frPlanN = n;
 }
 
 // the pair: the new frame packed into a surface that holds neither the previous frame nor the
@@ -4842,6 +5025,7 @@ static bool nativeFrucSetup(NativeRife& nr)
 // skipped pair (last end, previous frame), so the OFA hints stay consecutive
 static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
 {
+    nativeFrucDrain(nr);   // no worker still reads a surface this pair may repack
     int n = 0;
     while (n == nr.frPrev || n == nr.frLast) n++;
     int ps = nr.ph * nr.pw;
@@ -4850,16 +5034,17 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
     if (cuLaunchKernel(nr.planesRgb ? nr.fPackBgraRgb : nr.fPackBgra, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0,
                        (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
     { nr.die("packBgra (fruc) launch failed"); return false; }
-    if (n == nr.frFed) nr.frFed = -1;   // the frame FRUC was fed last is gone from its surface
+    for (int& f : nr.frFed) if (f == n) f = -1;   // the frame FRUC was fed last is gone from its surface
     nr.frA = nr.frPrev;
     nr.frB = n;
     nr.frPrev = n;
+    nr.frPlanN = nr.frPlanK = 0;   // the caller plans this pair's tweens after this (nativeFrucPlan)
     if (!nTween || nr.frA < 0) return true;
     if (g_fruc.step)
     {
-        // feed-once bridge: no priming warp; the pair's first tween says whether FRUC was fed
-        // frA last (mode 1) or must prime it (mode 0), the other tweens reuse the pair (mode 2)
-        nr.frFirst = true;
+        // feed-once bridge: no priming warp; an instance's first tween of the pair says whether
+        // it was fed frA last (mode 1) or must prime it (mode 0), its other tweens reuse the pair (mode 2)
+        for (bool& f : nr.frFirst) f = true;
         nr.frLast = nr.frB;
         return true;
     }
@@ -4876,25 +5061,82 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
 
 // one tween at t into dFrOut (3, ph, pw), python's Fruc._infer + NvOFFRUC.interpolate (a
 // double, the bridge's own type: offline --fps hands python's double fraction over unrounded)
+// the feed-once mode of instance i's next call on this pair; a mode 0 after the instance's first
+// call is a pair that does not continue the one it was fed last (a repack of the fed surface
+// clears frFed, so frFed alone would miss those primes)
+static int nativeFrucMode(NativeRife& nr, int i)
+{
+    const int mode = !nr.frFirst[i] ? 2 : (nr.frFed[i] >= 0 && nr.frFed[i] == nr.frA) ? 1 : 0;
+    if (mode == 0 && nr.frCalls[i] > 0) nr.frPrimed++;
+    return mode;
+}
+
+static void nativeFrucFedOk(NativeRife& nr, int i)
+{
+    nr.frFirst[i] = false;
+    nr.frFed[i] = nr.frB;
+    nr.frCalls[i]++;
+}
+
 static bool nativeFrucTween(NativeRife& nr, double t)
 {
     int rep = 0;
     int rc;
-    if (g_fruc.step)
+    uint8_t* outB = nr.dFrOutB;
+    if (nr.frPlanK < nr.frPlanN && nr.frPlan[nr.frPlanK] != t)
     {
-        const int mode = !nr.frFirst ? 2 : (nr.frFed >= 0 && nr.frFed == nr.frA) ? 1 : 0;
-        // a pair that does not continue the last fed one (after the session's first tween: a
-        // repack of the fed surface clears frFed, so frFed alone would miss those primes)
-        if (mode == 0 && nr.frTweens > 0) nr.frPrimed++;
-        rc = g_fruc.step(nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrOutB, t, mode, &rep);
-        if (rc == 0) { nr.frFirst = false; nr.frFed = nr.frB; }
+        // the caller asked for a tween its plan did not name: finish what runs, then one instance
+        LOG("native: fruc: tween %.4f is not the planned %.4f, one instance for the rest of the pair\n",
+            t, nr.frPlan[nr.frPlanK]);
+        nativeFrucDrain(nr);
+        nr.frPlanN = nr.frPlanK = 0;
+    }
+    if (nr.frPlanK < nr.frPlanN)
+    {
+        // parallel instances: tween k runs on instance k % frInst; the first tween of a round
+        // hands the round's others to their workers and runs its own here, the others collect
+        const uint32_t k = nr.frPlanK++;
+        const int inst = (int)(k % (uint32_t)nr.frInst);
+        if (inst == 0)
+        {
+            for (uint32_t j = k + 1; j < nr.frPlanN && j < k + (uint32_t)nr.frInst; j++)
+            {
+                const int wi = (int)(j - k);
+                FrucWorker& w = g_frW[wi];
+                std::lock_guard<std::mutex> lk(w.m);
+                w.a = nr.dFrSurf[nr.frA]; w.b = nr.dFrSurf[nr.frB]; w.out = nr.dFrOutBI[wi];
+                w.t = nr.frPlan[j];
+                w.mode = nativeFrucMode(nr, wi);
+                w.done = false; w.job = true;
+                w.cv.notify_all();
+            }
+            rc = g_fruc.stepI(0, nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrOutB, t, nativeFrucMode(nr, 0), &rep);
+            if (rc == 0) nativeFrucFedOk(nr, 0);
+            else LOG("native: fruc: interpolate failed: %s (rc %d)\n", g_fruc.lastError(), rc);
+        }
+        else
+        {
+            FrucWorker& w = g_frW[inst];
+            std::unique_lock<std::mutex> lk(w.m);
+            w.cv.wait(lk, [&] { return w.done; });
+            rc = w.rc; rep = w.rep;
+            if (rc == 0) nativeFrucFedOk(nr, inst);
+            else LOG("native: fruc: interpolate (instance %d) failed: %s (rc %d)\n", inst, w.err.c_str(), rc);
+            outB = nr.dFrOutBI[inst];
+        }
+        if (rc != 0) { nativeFrucDrain(nr); nr.die("fruc interpolate failed"); return false; }
+    }
+    else if (g_fruc.step)
+    {
+        rc = g_fruc.step(nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrOutB, t, nativeFrucMode(nr, 0), &rep);
+        if (rc == 0) nativeFrucFedOk(nr, 0);
     }
     else
         rc = g_fruc.interpolate(nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrOutB, t, &rep);
     if (rc != 0) { LOG("native: fruc: interpolate failed: %s (rc %d)\n", g_fruc.lastError(), rc); nr.die("fruc interpolate failed"); return false; }
     if (rep) nr.frRepeats++;
     nr.frTweens++;
-    void* a[] = { &nr.dFrOutB, &nr.pw, &nr.ph, &nr.dFrOut };
+    void* a[] = { &outB, &nr.pw, &nr.ph, &nr.dFrOut };
     if (cuLaunchKernel(nr.planesRgb ? nr.fUnpackBgraRgb : nr.fUnpackBgra, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0,
                        (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
     { nr.die("unpackBgra (fruc) launch failed"); return false; }
@@ -4903,13 +5145,26 @@ static bool nativeFrucTween(NativeRife& nr, double t)
 
 static void nativeFrucFree(NativeRife& nr)
 {
+    nativeFrucDrain(nr);
+    for (int i = 1; i < 4; i++)
+    {
+        FrucWorker& w = g_frW[i];
+        if (!w.th.joinable()) continue;
+        { std::lock_guard<std::mutex> lk(w.m); w.quit = true; w.cv.notify_all(); }
+        w.th.join();
+    }
     if (nr.frCreated)
     {
-        LOG("native: fruc session: %llu tweens, %llu primed pairs, %llu frame repeats\n",
-            (unsigned long long)nr.frTweens, (unsigned long long)nr.frPrimed, (unsigned long long)nr.frRepeats);
-        g_fruc.destroy();
+        LOG("native: fruc session: %llu tweens, %llu primed pairs, %llu frame repeats, %d instance%s\n",
+            (unsigned long long)nr.frTweens, (unsigned long long)nr.frPrimed, (unsigned long long)nr.frRepeats,
+            nr.frInst, nr.frInst > 1 ? "s" : "");
+        g_fruc.destroy();   // every instance
         nr.frCreated = false;
     }
+    for (int i = 1; i < 4; i++) if (nr.dFrOutBI[i]) { cudaFree(nr.dFrOutBI[i]); nr.dFrOutBI[i] = nullptr; }
+    nr.dFrOutBI[0] = nullptr;
+    nr.frInst = 1;
+    nr.frPlanN = nr.frPlanK = 0;
     for (auto& s : nr.dFrSurf) if (s) { cudaFree(s); s = nullptr; }
     if (nr.dFrOutB) { cudaFree(nr.dFrOutB); nr.dFrOutB = nullptr; }
     if (nr.dFrOut) { cudaFree(nr.dFrOut); nr.dFrOut = nullptr; }
@@ -5643,8 +5898,10 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         if (cudaMemsetAsync(nr.dGmAcc, 0, (size_t)(C + 1) * (size_t)n * sizeof(long long), st) != cudaSuccess)
         { nr.die("gmfss accumulator clear failed"); return false; }
         void* a[] = { &in, &ih, &cc, (void*)&flow, &metric, &mh, &s, &ww, &hh2, (void*)&nr.dGmAcc };
-        if (cuLaunchKernel(nr.fSplatSoft, (w + 15) / 16, (h + 15) / 16, 1,
-                           16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+        // 32 x 8: one warp = 32 consecutive x of a row, which k_splatSoft's neighbour combine
+        // pairs (any shape of <= 256 threads, a multiple of 32, gives the same accumulators)
+        if (cuLaunchKernel(nr.fSplatSoft, (w + 31) / 32, (h + 7) / 8, 1,
+                           32, 8, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
         { nr.die("gmfss splatSoft launch failed"); return false; }
         void* b[] = { (void*)&nr.dGmAcc, &cc, &ni, (void*)&dst, &zero };
         if (cuLaunchKernel(nr.fSplatNorm, (ni + 255) / 256, 1, 1, 256, 1, 1, 0,
@@ -6445,6 +6702,14 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         // Smooth Motion: every frame is packed (the next pair's start), the bridge itself
         // runs per tween below; an identical pair got nTween = 0 above and never reaches FRUC
         if (!nativeFrucPair(nr, dCur, nTween)) return false;
+        if (nTween > 1)
+        {
+            // the tweens in slot order, for the parallel instances
+            double tw[64];
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < nfr && n < 64; i++) if (fr[i] < 0.999f) tw[n++] = fr[i];
+            nativeFrucPlan(nr, tw, n);
+        }
     }
     else if (nr.drba)
     {

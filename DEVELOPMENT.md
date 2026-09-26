@@ -408,7 +408,8 @@ host answers its handoff with the geometry (Image scale, the /64 pad the bridge 
 sized to, `engine=fruc`) plus `NATIVE-PATH fruc=` (the `engine/nvoffruc` folder, or
 `SMV_NVOFFRUC_DIR`), and the exe loads `nvoffruc_bridge.dll` from there and drives the same flat C
 API the ctypes class uses: the model planes packed to BGRA8 by the VSR bridge's `k_packBgra`, one
-`nvoffruc_interpolate` per tween, `k_unpackBgra` back, the same skipped-pair priming. The host
+bridge step per tween (feed-once, up to four FRUC instances in parallel, see the bridge section),
+`k_unpackBgra` back, the same skipped-pair priming. The host
 feeds FRUC true BGRA. A missing bridge / NvOFFRUC / cudart DLL refuses the session and names
 the file. `echo` is
 the effects-only route: no interpolation model ticked in the app sends
@@ -829,7 +830,10 @@ NVRTC block (the 5c chain below launches them):
 `k_half` (the 2x2 box halves of both frames as adjacent planes), `k_pyr` (the per-pair flow and metric
 pyramids at 1/2 and 1/4), `k_splatSoft` (softsplat.py's int64 fixed-point forward with the 'soft'
 mode's `exp(s * Z)` products formed on the fly in fp32; the target position and the corner weights in
-double, since the fp32 `x + s * flow` python forms is one ulp = 6e-5 px off at x ~ 600..960) and
+double, since the fp32 `x + s * flow` python forms is one ulp = 6e-5 px off at x ~ 600..960; since
+2026-09-26 products bound for the same target pixel are summed across neighbouring threads, a warp
+shuffle along the row and shared memory down the 32 x 8 block, before one int64 atomic, which keeps
+the accumulators bit-identical and cut the feature splats ~20 %, gate `harness\p36\splat_bench.py`) and
 `k_splatNorm` (the `acc / (accN + 1e-7)` tail into the fusionnet input planes). The gate is
 `harness\eff\gmfss_equiv.py`: the kernels compiled from the host source with cupy against the exact
 maths in fp64 on real-motion inputs through the real engines, plus a quantized-flow control where the
@@ -962,6 +966,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NR_NOHOOK=1`, `SMV_NR_SPOOF=<name>`, `SMV_NR_HOOKLOG=1` | DLSS 5 caller hook off / spoofed name / trace |
 | `SMV_NR_RESET_EVERY=1` | the offline native host's DLSS 5 resets its history on every frame (the live behaviour), for the route gate; never a product setting |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
+| `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most parallel FRUC instances (1..4, default 4 live, 1 offline; 1 = one instance) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_CQ` | override the encoder CQ for measurement |
 | `SMV_NVENC_SPLIT` | override the NVENC `-split_encode_mode` for measurement (default 15 = off; 2 = two strips, 0 = ffmpeg's auto); never a product setting (the split leaves a seam line) |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
@@ -1054,6 +1059,19 @@ overwritten. The host picks the mode per tween (`frFed`, `frFirst` in `smv-live-
 bridge without `nvoffruc_step` falls back to `nvoffruc_interpolate`, which feeds both frames per
 tween (the priming call costs a full optical flow). Measured at 2560x1472: 1.51x the tweens per
 second at one tween per pair, 1.95x at four, pixels inside NvOFFRUC's run-to-run noise.
+
+Instances (2026-09-26): the bridge holds up to four FRUC instances, each with its own CUDA context,
+surfaces and NvOFFRUC handle (`nvoffruc_create_i`, `nvoffruc_step_i`, `nvoffruc_destroy_i`; the
+classic exports drive instance 0, `nvoffruc_destroy` frees them all; the last error is per thread).
+The host plans each pair's tweens (`nativeFrucPlan`) and runs tween k on instance k % n, a round of
+n at a time: instance 0 on the compute thread, the others on one worker thread each, outputs stored
+in tween order. So each instance sees every pair once and stays in feed-once mode 1. n = the pair's
+tween count, at most 4 on live and 1 offline (offline FRUC is paced by the encoder: four instances
+measured 0.99x at x3 and about 0.94x at x5 on 1080p there); `SMV_FRUC_INSTANCES` overrides both
+(1 = the one-instance path); the extra
+instances are created at the first pair that needs them, and a failed create keeps the ones made so
+far. Measured at 2560x1472 with four tweens per pair: 58.9 tweens per second on one instance, 68.3 /
+82.2 / 87.0 on two / three / four; each instance costs about 600 MB of VRAM at that size.
 
 Rules kept from debugging: FRUC's `pFrame` and every registered resource must be a `CUdeviceptr*`
 (the host address of the variable holding the device pointer), pitch = `width*4`, and the priming
