@@ -2255,6 +2255,10 @@ struct NativeRife
     float* dFrOut = nullptr;         // (3, ph, pw): the tween, the layout storeSlot reads
     int frPrev = -1, frLast = -1;    // surfaces: the previous frame, the last tweened pair's end
     int frA = -1, frB = -1;          // this group's pair
+    // the feed-once bridge (nvoffruc_step): the surface whose frame FRUC was fed last (-1 = none,
+    // or that surface was repacked since), and whether the pair's next tween is its first
+    int frFed = -1;
+    bool frFirst = false;
     bool frCreated = false;
     uint64_t frPrimed = 0, frRepeats = 0, frTweens = 0;
     // RIFE with DRBA timing (rifedrba, 2026-09-21, memory priority 21 (b) step 3): the RIFE
@@ -4785,6 +4789,9 @@ struct FrucBridge
     const char* (*lastError)() = nullptr;
     int (*create)(unsigned, unsigned) = nullptr;
     int (*interpolate)(void*, void*, void*, double, int*) = nullptr;
+    // the feed-once call (bridge 2026-09-26): mode 0 = prime prev + feed cur, 1 = prev was fed
+    // last, feed cur only, 2 = the same pair again; an older bridge lacks it (interpolate then)
+    int (*step)(void*, void*, void*, double, int, int*) = nullptr;
     void (*destroy)() = nullptr;
 };
 static FrucBridge g_fruc;
@@ -4800,6 +4807,7 @@ static bool nativeFrucLoad(const std::string& dir)
     g_fruc.create = (int (*)(unsigned, unsigned))GetProcAddress(m, "nvoffruc_create");
     g_fruc.interpolate = (int (*)(void*, void*, void*, double, int*))GetProcAddress(m, "nvoffruc_interpolate");
     g_fruc.destroy = (void (*)())GetProcAddress(m, "nvoffruc_destroy");
+    g_fruc.step = (int (*)(void*, void*, void*, double, int, int*))GetProcAddress(m, "nvoffruc_step");
     if (!g_fruc.lastError || !g_fruc.create || !g_fruc.interpolate || !g_fruc.destroy)
     { LOG("native: fruc: nvoffruc_bridge.dll lacks an expected export\n"); FreeLibrary(m); return false; }
     g_fruc.mod = m;
@@ -4821,9 +4829,10 @@ static bool nativeFrucSetup(NativeRife& nr)
     for (auto& s : nr.dFrSurf) NCHK(cudaMalloc((void**)&s, bytes), "alloc fruc surface");
     NCHK(cudaMalloc((void**)&nr.dFrOutB, bytes), "alloc fruc output");
     NCHK(cudaMalloc((void**)&nr.dFrOut, 3 * plane * sizeof(float)), "alloc fruc tween");
-    nr.frPrev = nr.frLast = nr.frA = nr.frB = -1;
-    LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA\n",
-        nr.pw, nr.ph, nr.w, nr.h);
+    nr.frPrev = nr.frLast = nr.frA = nr.frB = nr.frFed = -1;
+    nr.frFirst = false;
+    LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA%s\n",
+        nr.pw, nr.ph, nr.w, nr.h, g_fruc.step ? ", feed-once" : "");
     return true;
 }
 
@@ -4841,10 +4850,19 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
     if (cuLaunchKernel(nr.planesRgb ? nr.fPackBgraRgb : nr.fPackBgra, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0,
                        (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
     { nr.die("packBgra (fruc) launch failed"); return false; }
+    if (n == nr.frFed) nr.frFed = -1;   // the frame FRUC was fed last is gone from its surface
     nr.frA = nr.frPrev;
     nr.frB = n;
     nr.frPrev = n;
     if (!nTween || nr.frA < 0) return true;
+    if (g_fruc.step)
+    {
+        // feed-once bridge: no priming warp; the pair's first tween says whether FRUC was fed
+        // frA last (mode 1) or must prime it (mode 0), the other tweens reuse the pair (mode 2)
+        nr.frFirst = true;
+        nr.frLast = nr.frB;
+        return true;
+    }
     if (nr.frLast >= 0 && nr.frLast != nr.frA)
     {
         int rep = 0;
@@ -4861,7 +4879,18 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
 static bool nativeFrucTween(NativeRife& nr, double t)
 {
     int rep = 0;
-    const int rc = g_fruc.interpolate(nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrOutB, t, &rep);
+    int rc;
+    if (g_fruc.step)
+    {
+        const int mode = !nr.frFirst ? 2 : (nr.frFed >= 0 && nr.frFed == nr.frA) ? 1 : 0;
+        // a pair that does not continue the last fed one (after the session's first tween: a
+        // repack of the fed surface clears frFed, so frFed alone would miss those primes)
+        if (mode == 0 && nr.frTweens > 0) nr.frPrimed++;
+        rc = g_fruc.step(nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrOutB, t, mode, &rep);
+        if (rc == 0) { nr.frFirst = false; nr.frFed = nr.frB; }
+    }
+    else
+        rc = g_fruc.interpolate(nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrOutB, t, &rep);
     if (rc != 0) { LOG("native: fruc: interpolate failed: %s (rc %d)\n", g_fruc.lastError(), rc); nr.die("fruc interpolate failed"); return false; }
     if (rep) nr.frRepeats++;
     nr.frTweens++;

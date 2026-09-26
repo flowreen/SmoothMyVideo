@@ -8,8 +8,8 @@
 // This software contains source code provided by NVIDIA Corporation.
 //
 // Derivative of the NvOFFRUCSample, reduced to the CUDA path and exposed as a flat cdecl C API for
-// ctypes, mirroring engine/rtxvideo/build_src. It loads NvOFFRUC.dll through the SDK's
-// signature-checked SecureLoadLibrary (never a plain LoadLibrary).
+// ctypes, mirroring engine/rtxvideo/build_src. It loads NvOFFRUC.dll from its own folder only after
+// an Authenticode check that NVIDIA signed it (signed_by_nvidia; never a plain LoadLibrary).
 //
 // NO CUDA TOOLKIT NEEDED TO BUILD. The bridge uses only the CUDA *driver* API from nvcuda.dll (the
 // always-present driver). Like the SDK sample, it creates its OWN CUDA context (cuCtxCreate) and runs
@@ -28,13 +28,15 @@
 // Build: see DEVELOPMENT.md, "Building the native bridges".
 
 #include <windows.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
 #include <string>
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
 
-#include "NvOFFRUC.h"            // SDK: NvOFFRUC/Interface/NvOFFRUC.h
-#include "SecureLibraryLoader.h" // SDK: NvOFFRUC/NvOFFRUCSample/inc/SecureLibraryLoader.h (header-only)
+#include "NvOFFRUC.h"            // SDK: NvOFFRUC/Interface/NvOFFRUC.h (EULA: never commit it)
 
 // ---- NvOFFRUC.dll entry points ---------------------------------------------------------------
 static HINSTANCE g_hDLL = nullptr;
@@ -73,6 +75,12 @@ static unsigned long long g_prev = 0, g_cur = 0, g_out = 0;
 static unsigned g_w = 0, g_h = 0;
 static size_t   g_bytes = 0;
 static double   g_ts = 0.0;
+// nvoffruc_step's feed state: which input surface (0 = g_prev, 1 = g_cur) holds the frame FRUC was
+// fed last (-1 = none since create / reset), its timestamp and the one fed before it. The two
+// input surfaces alternate, so the previous frame is never overwritten while FRUC can still read it.
+static int      g_last = -1;
+static double   g_lastTs = 0.0, g_prevTs = 0.0;
+static unsigned long long* in_surf(int i) { return i ? &g_cur : &g_prev; }
 
 static char g_err[512] = {0};
 static void set_err(const char* m) { strncpy_s(g_err, sizeof(g_err), m ? m : "", _TRUNCATE); }
@@ -89,17 +97,55 @@ static std::wstring self_dir() {
     return slash == std::wstring::npos ? std::wstring(L".") : s.substr(0, slash);
 }
 
-// SecureLibraryLoader resolves the bare name "NvOFFRUC.dll" against the current working directory
-// (its signature / WinVerifyTrust calls) AND the DLL search path, so make our folder the CWD for the
-// call and restore it. (SetDllDirectory alone failed with CRYPT_E_NO_MATCH.)
+// true when the file carries a valid Authenticode signature (WinVerifyTrust) whose signer
+// certificate names "NVIDIA Corporation" (the SDK's SecureLibraryLoader.h did the same check; its
+// header is not needed any more since 2026-09-26)
+static bool signed_by_nvidia(const std::wstring& path) {
+    WINTRUST_FILE_INFO fi; memset(&fi, 0, sizeof(fi));
+    fi.cbStruct = sizeof(fi); fi.pcwszFilePath = path.c_str();
+    WINTRUST_DATA wd; memset(&wd, 0, sizeof(wd));
+    wd.cbStruct = sizeof(wd); wd.dwUIChoice = WTD_UI_NONE; wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE; wd.pFile = &fi; wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    const LONG trust = WinVerifyTrust(nullptr, &action, &wd);
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &action, &wd);
+    if (trust != ERROR_SUCCESS) return false;
+
+    HCERTSTORE store = nullptr; HCRYPTMSG msg = nullptr;
+    if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, path.c_str(), CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                          CERT_QUERY_FORMAT_FLAG_BINARY, 0, nullptr, nullptr, nullptr, &store, &msg, nullptr))
+        return false;
+    bool ok = false;
+    DWORD n = 0;
+    if (CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &n) && n) {
+        std::string buf(n, '\0');
+        auto* si = reinterpret_cast<CMSG_SIGNER_INFO*>(&buf[0]);
+        if (CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, si, &n)) {
+            CERT_INFO ci; memset(&ci, 0, sizeof(ci));
+            ci.Issuer = si->Issuer; ci.SerialNumber = si->SerialNumber;
+            PCCERT_CONTEXT cert = CertFindCertificateInStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+                                                             CERT_FIND_SUBJECT_CERT, &ci, nullptr);
+            if (cert) {
+                wchar_t name[256] = {0};
+                CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name, 256);
+                ok = wcscmp(name, L"NVIDIA Corporation") == 0;
+                CertFreeCertificateContext(cert);
+            }
+        }
+    }
+    CryptMsgClose(msg);
+    CertCloseStore(store, 0);
+    return ok;
+}
+
+// NvOFFRUC.dll from our own folder only, by full path, after the signature check; the altered
+// search path lets it find its cudart64_110.dll beside it
 static void secure_load(HINSTANCE* out) {
-    const std::wstring dir = self_dir();
-    wchar_t saved[MAX_PATH] = {0};
-    DWORD n = GetCurrentDirectoryW(MAX_PATH, saved);
-    SetDllDirectoryW(dir.c_str());
-    SetCurrentDirectoryW(dir.c_str());
-    SecureLoadLibrary(const_cast<LPWSTR>(L"NvOFFRUC.dll"), out);
-    if (n > 0 && n < MAX_PATH) SetCurrentDirectoryW(saved);
+    *out = nullptr;
+    const std::wstring path = self_dir() + L"\\NvOFFRUC.dll";
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES || !signed_by_nvidia(path)) return;
+    *out = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 }
 
 static bool load_dll() {
@@ -197,6 +243,74 @@ __declspec(dllexport) int nvoffruc_create(unsigned width, unsigned height) {
 
     cuCtxSetCurrentFn(g_prevctx);                      // restore torch's context
     g_ts = 0.0;
+    g_last = -1;
+    return 0;
+}
+
+// one Process call on FRUC's context (current): frame surface `s` at timestamp `ts`, output at `tOut`
+static int process_one(unsigned long long* s, double ts, bool skipWarp, double tOut, bool* repeated) {
+    NvOFFRUC_PROCESS_IN_PARAMS  in;  memset(&in, 0, sizeof(in));
+    NvOFFRUC_PROCESS_OUT_PARAMS out; memset(&out, 0, sizeof(out));
+    in.stFrameDataInput.pFrame = (void*)s; in.stFrameDataInput.nTimeStamp = ts;
+    in.stFrameDataInput.nCuSurfacePitch = size_t(g_w) * 4;
+    in.bSkipWarp = skipWarp ? 1 : 0;
+    out.stFrameDataOutput.pFrame = (void*)&g_out; out.stFrameDataOutput.nTimeStamp = tOut;
+    out.stFrameDataOutput.nCuSurfacePitch = size_t(g_w) * 4;
+    out.stFrameDataOutput.bHasFrameRepetitionOccurred = (void*)repeated;
+    NvOFFRUC_STATUS st = NvOFFRUC_SUCCESS;
+    const int ex = safe_process(&in, &out, &st);
+    if (ex) { set_errf("NvOFFRUCProcess crashed - access violation", ex); return -30; }
+    if (st != NvOFFRUC_SUCCESS) { set_errf("NvOFFRUCProcess failed", (long)st); return -3; }
+    return 0;
+}
+
+// FEED-ONCE tweens (2026-09-26, the Smooth Motion live 2x cap): nvoffruc_interpolate re-feeds BOTH
+// frames per tween (a bSkipWarp prime costs a full optical flow, as much as the warp: 15.1 vs 14.6
+// ms at 2560x1472), so k tweens on a pair cost 2k Process calls. Here the caller says what FRUC
+// already has:
+//   mode 0: prev is not the frame fed last: prime prev (bSkipWarp), then feed cur (2 calls)
+//   mode 1: prev IS the frame fed last (a continuous stream): feed cur only (1 call)
+//   mode 2: another tween of the pair fed last: cur again at its SAME timestamp, only the output
+//           timestamp moves (1 call, no copy in; its tweens match the re-feed way within
+//           NvOFFRUC's run-to-run noise, harness\p35\fruc_direct.py)
+// t in (0, 1) between prev and cur. The caller's prevPtr / curPtr must hold the frames it names.
+__declspec(dllexport) int nvoffruc_step(void* prevPtr, void* curPtr, void* outPtr, double t, int mode,
+                                        int* frameRepeated) {
+    if (!g_hFRUC) { set_err("nvoffruc_step before nvoffruc_create"); return -1; }
+    if (mode < 0 || mode > 2) { set_err("nvoffruc_step: unknown mode"); return -1; }
+    if (mode != 0 && g_last < 0) { set_err("nvoffruc_step: mode 1 / 2 with nothing fed yet"); return -1; }
+    cuCtxSynchronizeFn();   // SYNC FENCE (in), as in nvoffruc_interpolate
+    enter_ctx();
+    bool repeated = false;
+    int rc = 0;
+    if (mode == 0) {
+        const int a = 0, b = 1;
+        const double ts = g_ts;
+        if (cuMemcpyDtoDFn(*in_surf(a), (unsigned long long)(uintptr_t)prevPtr, g_bytes) != 0 ||
+            cuMemcpyDtoDFn(*in_surf(b), (unsigned long long)(uintptr_t)curPtr, g_bytes) != 0) {
+            set_err("cuMemcpyDtoD of input frames failed"); leave_ctx(); return -2;
+        }
+        rc = process_one(in_surf(a), ts, true, ts, &repeated);
+        if (!rc) rc = process_one(in_surf(b), ts + 1.0, false, ts + t, &repeated);
+        g_prevTs = ts; g_lastTs = ts + 1.0; g_last = b;
+    } else if (mode == 1) {
+        const int b = 1 - g_last;
+        if (cuMemcpyDtoDFn(*in_surf(b), (unsigned long long)(uintptr_t)curPtr, g_bytes) != 0) {
+            set_err("cuMemcpyDtoD of the input frame failed"); leave_ctx(); return -2;
+        }
+        rc = process_one(in_surf(b), g_lastTs + 1.0, false, g_lastTs + t, &repeated);
+        g_prevTs = g_lastTs; g_lastTs += 1.0; g_last = b;
+    } else {
+        rc = process_one(in_surf(g_last), g_lastTs, false, g_prevTs + t, &repeated);
+    }
+    if (rc) { leave_ctx(); return rc; }
+    g_ts = g_lastTs + 1.0;
+    if (cuMemcpyDtoDFn((unsigned long long)(uintptr_t)outPtr, g_out, g_bytes) != 0) {
+        set_err("cuMemcpyDtoD of interpolated frame out failed"); leave_ctx(); return -5;
+    }
+    if (frameRepeated) *frameRepeated = repeated ? 1 : 0;
+    cuCtxSynchronizeFn();   // SYNC FENCE (out)
+    leave_ctx();
     return 0;
 }
 
@@ -257,6 +371,7 @@ __declspec(dllexport) int nvoffruc_interpolate(void* prevPtr, void* curPtr, void
 
     if (frameRepeated) *frameRepeated = repeated ? 1 : 0;
     g_ts = tsCur + 1.0;
+    g_prevTs = tsPrev; g_lastTs = tsCur; g_last = 1;   // g_cur was fed last (nvoffruc_step's state)
     (void)rc;
     // SYNC FENCE (out): Process + the out-copy above are queued on THIS context's null stream and are
     // not ordered against the caller reading outPtr from its own context. Block until they land, so
@@ -297,6 +412,7 @@ __declspec(dllexport) int nvoffruc_reset() {
     s = pRegister(g_hFRUC, &rp);
     if (s != NvOFFRUC_SUCCESS) { set_errf("nvoffruc_reset: NvOFFRUCRegisterResource failed", (long)s); leave_ctx(); return -2; }
     g_ts = 0.0;
+    g_last = -1;
     leave_ctx();
     return 0;
 }

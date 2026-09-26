@@ -1022,17 +1022,17 @@ dies with `0xC0000409` inside NGX `create()`. Keep the cu12 bridge as built and 
 
 ### NVIDIA Smooth Motion bridge (`nvoffruc_bridge.dll`)
 
-The bridge to NVIDIA's `NvOFFRUC.dll` (Optical Flow SDK FRUC). It includes the SDK's `NvOFFRUC.h`
-and `SecureLibraryLoader.h` and follows the NvOFFRUCSample sequence, so ship the built DLL, not the
-SDK. No CUDA toolkit needed (driver API only). Prerequisites: the Optical Flow SDK
-(`Optical_Flow_SDK_5.0.7`, EULA-gated) extracted somewhere.
+The bridge to NVIDIA's `NvOFFRUC.dll` (Optical Flow SDK FRUC). It includes only the SDK's
+`NvOFFRUC.h` (EULA, never commit it), so ship the built DLL, not the SDK. No CUDA toolkit needed
+(driver API only). Prerequisites: `NvOFFRUC.h` from the Optical Flow SDK
+(`Optical_Flow_SDK_5.0.7`, EULA-gated, `NvOFFRUC/Interface/`); the 2026-09-26 build used a
+C-compatible copy of that header (`bHasFrameRepetitionOccurred` as `void*`).
 
 In `engine/nvoffruc/build_src/`:
 ```
-set SDK=C:\path\to\Optical_Flow_SDK_5.0.7
+set HDR=C:\path\to\folder\holding\NvOFFRUC.h
 cl /LD /O2 /EHsc /std:c++17 nvoffruc_bridge.cpp ^
-   /I "%SDK%\NvOFFRUC\Interface" ^
-   /I "%SDK%\NvOFFRUC\NvOFFRUCSample\inc" ^
+   /I "%HDR%" ^
    /Fe:nvoffruc_bridge.dll ^
    /link crypt32.lib wintrust.lib
 ```
@@ -1040,13 +1040,27 @@ Runtime layout in `engine/nvoffruc/`: `nvoffruc_bridge.dll` (ours, committed and
 `NvOFFRUC.dll` and `cudart64_110.dll` (from the SDK's `NvOFFRUCSample/bin/win64/`, user-installed
 through the GUI, gitignored).
 
-Rules kept from debugging: `SecureLoadLibrary` resolves the bare name against the working
-directory, so the bridge temporarily sets its own folder as the current directory around the load
-(a full path does not work). FRUC's `pFrame` and every registered resource must be a `CUdeviceptr*`
+Loading: the bridge replaces the SDK's `SecureLibraryLoader.h` with its own check. It loads
+`NvOFFRUC.dll` only from its own folder, by full path, after `WinVerifyTrust` accepts the embedded
+Authenticode signature and the signer certificate's name is `NVIDIA Corporation`. An unsigned,
+foreign-signed or missing file makes `nvoffruc_probe` return 0 and `nvoffruc_create` return -1
+("... not NVIDIA-signed").
+
+Feed once (2026-09-26): `nvoffruc_step(prev, cur, out, t, mode, &rep)` feeds each source frame to
+FRUC once. Mode 0 primes `prev` (`bSkipWarp = 1`) and feeds `cur`; mode 1 feeds `cur` only (FRUC
+was fed `prev` last); mode 2 asks the same pair again for another `t` by feeding `cur` again at its
+same timestamp. Its two input surfaces alternate, so the frame FRUC was fed last is never
+overwritten. The host picks the mode per tween (`frFed`, `frFirst` in `smv-live-native.inl`); a
+bridge without `nvoffruc_step` falls back to `nvoffruc_interpolate`, which feeds both frames per
+tween (the priming call costs a full optical flow). Measured at 2560x1472: 1.51x the tweens per
+second at one tween per pair, 1.95x at four, pixels inside NvOFFRUC's run-to-run noise.
+
+Rules kept from debugging: FRUC's `pFrame` and every registered resource must be a `CUdeviceptr*`
 (the host address of the variable holding the device pointer), pitch = `width*4`, and the priming
-`Process` call sets `bSkipWarp = 1`. `nvoffruc_interpolate` calls `cuCtxSynchronize` at entry on the
-caller's context and again on its own before returning: CUDA does not order one context's null
-stream against another's, and without both fences tweens were sliced at horizontal seams. The OFA
+`Process` call sets `bSkipWarp = 1`. `nvoffruc_interpolate` and `nvoffruc_step` call
+`cuCtxSynchronize` at entry on the caller's context and again on their own before returning: CUDA
+does not order one context's null stream against another's, and without both fences tweens were
+sliced at horizontal seams. The OFA
 hardware exists on Turing through Blackwell and is being removed after Blackwell per the SDK's
 deprecation notice.
 
