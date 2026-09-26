@@ -4,7 +4,7 @@ scripts/export-onnx.js (npm setup and dist); every file already present is skipp
 cheap. Graphs: the RIFE IFNet (live `_bd8` and the
 unbatched class) and its encode, plain and as the flow-warp class at k 1 (Frame Blend), 2 and 4,
 DRBA's block0, Restore, and the five GMFSS nets. The host builds the offline fixed-batch RIFE
-classes (`_b{B}`) from `_bd8`. Then ship_tidy() and write_tags() (priority 29).
+classes (`_b{B}`) from `_bd8`. Then ship_tidy() and write_tags().
 Usage: runtime python engine/onnx_export.py"""
 import os
 import sys
@@ -41,9 +41,7 @@ def main():
             raise RuntimeError(f"{eng.name}: this graph does not qualify for a size-free export")
         done.append(os.path.basename(p))
 
-    # RIFE (plain RIFE, Frame Blend and DRBA share these graphs). The flow-warp class of the
-    # Flow scale control (`_fweht{k}`) was dropped 2026-09-25 with the control
-    # (D:\AIStuff\smv-flowscale-removal\README.md)
+    # RIFE (plain RIFE, Frame Blend and DRBA share these graphs)
     rife = RIFE()
     net, sl = rife.ifnet, list(rife.scale_list)
     with torch.inference_mode():
@@ -101,7 +99,7 @@ def main():
 
 
 def ship_tidy(done):
-    """The shipped folder holds exactly these graphs, each weight blob once (priority 29): (1) an
+    """The shipped folder holds exactly these graphs, each weight blob once: (1) an
     .onnx this export does not produce is removed with its .data (the python route's offline
     `_b{B}` classes: the host builds those engines from `_bd8`); (2) external data files with the
     same bytes are merged into one `weights_<md5 12>.data` and every graph's `location` points at
@@ -182,7 +180,7 @@ def ship_tidy(done):
 
 def write_tags():
     """weights_tags.txt: the weight tags every engine name carries, for a shipped tree without the
-    weight files (the dist leaves the .pkl / .pth out, priority 29; the ONNX carry the weights).
+    weight files (the dist leaves the .pkl / .pth out; the ONNX carry the weights).
     The host hashes the weight files when they exist (a dev tree) and reads this file otherwise.
     `x` = trt_lookup.ONNX_REV (the host ignores it): the file is half of the engine cache stamp,
     so a graph revision empties the cache once (src/render/cache.ts)."""

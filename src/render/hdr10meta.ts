@@ -1,5 +1,5 @@
 // HDR10 static metadata (mdcv + clli) and the Dolby Vision configuration box (dvvC) injected
-// into an MP4's video sample entry (priority 24 step 6b): engine/hdr10_meta.py ported line by
+// into an MP4's video sample entry: engine/hdr10_meta.py ported line by
 // line, the module docstring there carries the reasoning (why the LGPL ffmpeg cannot write
 // these, the box layouts, the moov-tail-only rewrite, idempotence). All fields big-endian.
 import * as fs from 'fs';

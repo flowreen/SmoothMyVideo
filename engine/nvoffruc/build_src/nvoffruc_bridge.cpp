@@ -22,10 +22,10 @@
 // dereferences pFrame host-side at Process, so a raw device value AV'd. The dedicated context is kept
 // only because it mirrors the sample and is harmless.) FRUC carries its own cudart64_110.dll.
 //
-// INSTANCES (2026-09-26, memory priority 32b): up to kMaxInst FRUC instances live in this one
-// module, each with its own CUDA context, surfaces and NvOFFRUC handle, so callers on different
-// threads run them concurrently (the live host gives each tween index of a group its own instance:
-// 1.48x tweens / s with four at 2560x1472, harness\p35\ab_inst.out). The classic exports drive
+// INSTANCES: up to kMaxInst FRUC instances live in this one module, each with its own CUDA
+// context, surfaces and NvOFFRUC handle, so callers on different threads run them concurrently
+// (the host runs each level of a pair's midpoint tree, or each tween index of a group, on its own
+// instance). The classic exports drive
 // instance 0; the _i exports name the instance. One instance is only ever called from one thread
 // at a time; the last error is per thread.
 //
@@ -110,8 +110,8 @@ static std::wstring self_dir() {
 }
 
 // true when the file carries a valid Authenticode signature (WinVerifyTrust) whose signer
-// certificate names "NVIDIA Corporation" (the SDK's SecureLibraryLoader.h did the same check; its
-// header is not needed any more since 2026-09-26)
+// certificate names "NVIDIA Corporation" (the SDK's SecureLibraryLoader.h does the same check;
+// this bridge does not need that header)
 static bool signed_by_nvidia(const std::wstring& path) {
     WINTRUST_FILE_INFO fi; memset(&fi, 0, sizeof(fi));
     fi.cbStruct = sizeof(fi); fi.pcwszFilePath = path.c_str();
@@ -265,7 +265,7 @@ static int process_one(Inst& s, unsigned long long* f, double ts, bool skipWarp,
     return 0;
 }
 
-// FEED-ONCE tweens (2026-09-26, the Smooth Motion live 2x cap): nvoffruc_interpolate re-feeds BOTH
+// FEED-ONCE tweens: nvoffruc_interpolate re-feeds BOTH
 // frames per tween (a bSkipWarp prime costs a full optical flow, as much as the warp: 15.1 vs 14.6
 // ms at 2560x1472), so k tweens on a pair cost 2k Process calls. Here the caller says what FRUC
 // already has:

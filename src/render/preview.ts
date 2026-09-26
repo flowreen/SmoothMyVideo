@@ -1,4 +1,4 @@
-// The before/after preview (priority 24 step 7): engine/preview.py's job without python. ONE
+// The before/after preview: engine/preview.py's job without python. ONE
 // source frame at the current spatial settings -> <out>_original.png and <out>_processed.png
 // (+ <out>_nrmask.png), and preview.py's one stdout line. The frame comes from the render's own
 // decode (ffmpeg at the render's pixel format, the downscale folded in exactly as the render
@@ -438,7 +438,7 @@ export function writePng(file: string, rgb: Buffer, w: number, h: number): void 
 }
 
 /** The DLSS 5 change mask: the processed pane dimmed to grey under a heat map of the change. */
-/** The render's progress thumbnail (priority 26, render.py _live_preview's formatting worker): the
+/** The render's progress thumbnail (render.py _live_preview's formatting worker): the
  * host's "SMVT" dump (smv-live.exe --thumb: uint32 w, h, fmt 0 rgb24 / 1 rgb48le / 2 x2rgb10le,
  * then the samples) to the GUI's PNG, tmp then replace. SDR as is; a PQ source carried through
  * gets the pane's self-anchored _tonemap_pq; a TrueHDR output the same self-anchored exposure

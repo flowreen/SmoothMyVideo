@@ -244,18 +244,18 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="modelfruc"
-               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA Smooth Motion <span class="hint">(NVIDIA optical-flow hardware, lower quality than GMFSS)</span>
-      </label>
-    </div>
-    <div class="row">
-      <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelnvof"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         NVIDIA Optical Flow (direct) <span class="hint">(experimental: motion vectors from NVIDIA's optical-flow hardware, then both frames are pushed along them and merged; nothing to install; where very fast motion defeats the vectors it fades to a soft double image)</span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="modelfruc"
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        NVIDIA Smooth Motion <span class="hint">(NVIDIA optical-flow hardware, the lowest quality of the models)</span>
       </label>
     </div>
     <div class="row">

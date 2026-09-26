@@ -1,4 +1,4 @@
-// Resume, pause preview and progress (priority 24 step 6d-2): render.py's crash / exit resume
+// Resume, pause preview and progress: render.py's crash / exit resume
 // helpers ported line by line, the comments there carry the reasoning (the fragmented stage-1
 // file, the settings signature, the salvage + decode-verified gapless cut, the output-index to
 // source-grid mapping, the native host's per-frame HDR statistics prefix, the pause preview, the
@@ -167,8 +167,8 @@ function pyMtimeInt(p: string): number {
 
 /** render.py _resume_sig: sha1 of json.dumps(vars(args) + the source identity + SMV_CQ + the
  * effective NVENC split mode, sort_keys=True). A mismatch means the partial video came from other
- * settings (a split-frame segment must never be concatenated onto an unsplit one; hashing the
- * effective mode also keeps partials from the short-lived split default of 2026-09-25 apart). */
+ * settings (a split-frame segment must never be concatenated onto an unsplit one, so the
+ * effective mode is hashed). */
 export function resumeSig(ns: ArgNs, env: Env = process.env): string {
   const inp = path.win32.resolve(ns.input as string);
   const d: Record<string, string> = {};
@@ -342,7 +342,7 @@ function fragFor(c: FfCtx, dst: string): string[] {
 }
 
 /** render.py _ff_copy: error-tolerant video-only stream copy; true on success. +discardcorrupt drops
- * the torn tail packet the demuxer flags corrupt (priority 27): av1 muxing chokes on its cut OBU and
+ * the torn tail packet the demuxer flags corrupt: av1 muxing chokes on its cut OBU and
  * leaves an mp4 with no moov while ffmpeg exits 0, so a killed AV1 render never resumed; hevc
  * decoded around it (at most one decodable packet is dropped now, one frame re-rendered). */
 export function ffCopy(c: FfCtx, src: string, dst: string, extra: string[] = []): boolean {

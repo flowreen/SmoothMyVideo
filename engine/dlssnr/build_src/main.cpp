@@ -43,7 +43,7 @@
 #define LOG(...) do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while (0)
 
 // stdout carries the binary frame protocol, but the NGX core prints status lines of its
-// own to the process stdout (seen 2026-09-03: "[ngx::util::openLogFileInPath] Logging to
+// own to the process stdout (e.g. "[ngx::util::openLogFileInPath] Logging to
 // requested file ... enabled successfully" ahead of the READY line, which corrupts the
 // stream). So the ORIGINAL stdout is kept as a private handle for the protocol and the
 // process stdout (the Win32 std handle AND CRT fd 1) is pointed at stderr before any NGX
@@ -103,7 +103,7 @@ int main(int argc, char** argv)
     // --reset-every: void the feature's temporal history on EVERY evaluate, making the pass a
     // pure function of the frame handed in. The live routes ask for it because this host binds
     // no motion vectors, depth or jitter (see nr_host.cpp), so kept history has nothing valid
-    // to reproject by and identical frames come back out different (2026-09-14).
+    // to reproject by and identical frames come back out different.
     bool resetEvery = false;
     uint32_t w = 1920, h = 1080;
     int frames = 10;

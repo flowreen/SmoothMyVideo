@@ -408,8 +408,8 @@ since 2026-09-26 with the hole test on the integer weight accumulator), chains t
 the python class, runs one IFNet enqueue per tween with its own DRM timestep map, holds the lagged
 pair on an exact static test and reports the one-capture lag in the latency stat. A handoff
 without the block0 engine or `lag=1` is refused. `blend` is Frame Blend's live twin (the RIFE
-engines under its own name). `fruc` is Smooth Motion's live twin: the NvOFFRUC bridge warps at
-any fraction of a pair, so it is adaptive like rife / gmfss (it takes the Image scale too); it is HDR
+engines under its own name). `fruc` is Smooth Motion's live twin: every fraction of a pair takes the
+nearest node of the pair's midpoint tree (quarters live, see the bridge section), so it is adaptive like rife / gmfss (it takes the Image scale too); it is HDR
 capable like rife (the bridge quantises the PQ-encoded frames to 8-bit for the flow and the warp, so
 the tweens carry 8-bit PQ precision while the real frames stay full precision; the SDR capture of an
 HDR-presented window would be 2-3x over-bright instead), and a pair skipped by adaptive smoothness
@@ -553,7 +553,7 @@ Smooth Motion (`--fruc`) runs there too (`--fruc`, 2026-09-24): live's nvoffruc 
 (`lkOfflineFruc` checks the bridge folder, `SMV_NVOFFRUC_DIR` or `engine\nvoffruc`, and its three
 DLLs; `render.py` checks the same files by name and exits with the python route's message when
 one is missing), sized to the /64 pad of the source, every frame packed to true BGRA from the
-offline R, G, B planes, one bridge warp per tween, never a reset; an identical pair is held and
+offline R, G, B planes, the pair's midpoint tree (one bridge call per node), never a reset; an identical pair is held and
 not fed to NvOFFRUC, and the next pair gets no priming warp, python's call sequence (harness
 `offline\gate_fruc.py`). `--fps` mode runs there for every one of these models (2026-09-24):
 `render.py` hands `--fps-ratio` (its ratio as `repr`, so the host parses the same double) and the
@@ -988,7 +988,8 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NR_NOHOOK=1`, `SMV_NR_SPOOF=<name>`, `SMV_NR_HOOKLOG=1` | DLSS 5 caller hook off / spoofed name / trace |
 | `SMV_NR_RESET_EVERY=1` | the offline native host's DLSS 5 resets its history on every frame (the live behaviour), for the route gate; never a product setting |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
-| `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most parallel FRUC instances (1..4, default 4 live, 1 offline; 1 = one instance) / the instance index whose create fails, the trigger of the fallback (route gate only) |
+| `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
+| `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..4, default 3 offline, 2 live) |
 | `SMV_CQ` | override the encoder CQ for measurement |
 | `SMV_NVENC_SPLIT` | override the NVENC `-split_encode_mode` for measurement (default 15 = off; 2 = two strips, 0 = ffmpeg's auto); never a product setting (the split leaves a seam line) |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
@@ -1094,6 +1095,25 @@ measured 0.99x at x3 and about 0.94x at x5 on 1080p there); `SMV_FRUC_INSTANCES`
 instances are created at the first pair that needs them, and a failed create keeps the ones made so
 far. Measured at 2560x1472 with four tweens per pair: 58.9 tweens per second on one instance, 68.3 /
 82.2 / 87.0 on two / three / four; each instance costs about 600 MB of VRAM at that size.
+
+Recursive midpoints (2026-09-26, the default; `SMV_FRUC_MIDPOINTS=0` keeps the direct-t scheme of
+the two paragraphs above): NvOFFRUC damages content that does not move at every t other than 0.5,
+also when driven exactly as NVIDIA documents it (one `Process` per new frame, ARGB or NV12): every t
+below 0.5 returns one damaged image, every t above it another, so held anime frames jittered at x3
+and up. The host asks FRUC for midpoints only. Each tween is node k / 2^L of the pair's midpoint
+tree, a node is FRUC at t = 0.5 between its two parents, and level L runs on instance L - 1. The
+host computes the pair's whole tree to its depth, level by level, left to right
+(`nativeFrucNode`), so level L's instance sees one continuous stream of new frames (A, 2 / 2^L,
+4 / 2^L .. B) and stays in mode 1. Never compute a node alone: its instance then needs a prime
+whose optical flow spans the skipped nodes, NvOFFRUC seeds the next flow from it, and those nodes
+came out damaged (up to 28 % of a held frame). Depth: the smallest that holds every t as a node
+(offline x2 / x4 / x8 / x16 = 1 / 2 / 3 / 4 levels = 1 / 3 / 7 / 15 calls per pair); a t that is no
+node takes the nearest node at depth `SMV_FRUC_DEPTH` (default 3 offline, 2 live; live caps every
+depth there, its tweens must fit one source frame, so x5 live shows the nodes 0.25 / 0.5 / 0.5 /
+0.75). Measured on a 1440p anime clip, share of channels more than 8 levels outside a held pair's
+two real frames: 0.60 % -> 0.016 % at x4, 0.90 % -> 0.015 % at x5 (RIFE 0.009 %, NVOF 0.007 %);
+FRUC time per pair offline x4 35.8 -> 41.7 ms, x5 47.0 -> 94.6 ms; motion looks like the direct-t
+scheme's.
 
 Rules kept from debugging: FRUC's `pFrame` and every registered resource must be a `CUdeviceptr*`
 (the host address of the variable holding the device pointer), pitch = `width*4`, and the priming

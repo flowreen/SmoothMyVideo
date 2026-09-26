@@ -25,7 +25,7 @@ if "%VSDIR%"=="" (
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 :compile
 cd /d %~dp0
-rem WO-15 native RIFE host. TRT_RTX_SDK = the extracted TensorRT-RTX SDK (include\ + lib\).
+rem smv-live.exe, the native host. TRT_RTX_SDK = the extracted TensorRT-RTX SDK (include\ + lib\).
 rem SMV_CU = the CUDA headers and import libs that already ship in the app's python runtime;
 rem it defaults to this checkout's own engine\runtime, so a plain build needs neither a CUDA
 rem toolkit nor any absolute path. cuda_shim supplies the one internal header the runtime wheel
@@ -38,7 +38,7 @@ if "%TRT_RTX_SDK%"=="" (
 if "%TRT_RTX_SDK:~-1%"==" " set "TRT_RTX_SDK=%TRT_RTX_SDK:~0,-1%"
 if "%TRT_RTX_SDK:~-1%"==" " goto trimtrt
 if "%SMV_CU%"=="" set "SMV_CU=%~dp0..\..\runtime\Lib\site-packages\nvidia\cu13"
-rem WO-42: the DLSS 5 Neural Rendering core (engine\dlssnr\build_src\nr_host.cpp) is compiled
+rem The DLSS 5 Neural Rendering core (engine\dlssnr\build_src\nr_host.cpp) is compiled
 rem into the exe; NGX_SDK = the public NVIDIA DLSS SDK folder holding include\nvsdk_ngx.h, the
 rem same variable the dlssnr build uses (see DEVELOPMENT.md). Build time only, nothing shipped.
 if "%NGX_SDK%"=="" (

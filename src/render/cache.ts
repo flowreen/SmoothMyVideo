@@ -1,5 +1,4 @@
-// The engine cache stamp (priority 30 step 2, user 2026-09-25 "can first app run on a new version
-// empty the folder automatically?"). Engines are found by NAME (net, shapes, TensorRT-RTX version,
+// The engine cache stamp. Engines are found by NAME (net, shapes, TensorRT-RTX version,
 // weight tags) and the name does not say which ONNX graph an engine was built from, so after an
 // export change (trt_lookup.ONNX_REV, e.g. rev 2's PRelu rewrite) the old engines would keep being
 // reused. The stamp = the TensorRT-RTX version the host loads + onnx/weights_tags.txt (the weight

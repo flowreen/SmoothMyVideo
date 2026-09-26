@@ -96,9 +96,9 @@ class SRVGGNetCompact(nn.Module):
 
 
 def fit(out, oh, ow):
-    """Resize the net's 4x output to (oh, ow). Downscales are antialiased bicubic (upgraded
-    2026-08-28 from box/area as part of the replace-all-downscales pass: a windowed kernel
-    with a prefilter keeps more detail than a box at the same alias safety; the render's
+    """Resize the net's 4x output to (oh, ow). Downscales are antialiased bicubic (a windowed
+    kernel with a prefilter keeps more detail than a box / area filter at the same alias
+    safety; the render's
     PRIMARY output downscale is folded into the decode as linear-light spline36, this torch
     path covers what remains: restore's 4x fold-down, the preview pane). Upscales stay plain clamped bicubic (linear-light helps a shrink but worsens
     ringing on an enlarge; the AI upgrade for upscales is RTX VSR). Shared by the render

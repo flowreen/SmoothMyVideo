@@ -206,8 +206,8 @@ static bool findInDriverStore(const wchar_t* fileName, std::wstring& out)
 // The ACTIVE driver package. NGX itself resolves the core through the kernel driver
 // (QueryAdapterInfo); the installer mirrors that package path into this registry value.
 // Several nv*.inf_amd64_* packages can sit in the DriverStore at once (old drivers are
-// not purged on update), and a plain name-order scan picked a stale one (2026-09-04: the
-// 616.56 core loaded under the 616.64 kernel driver), so this comes first.
+// not purged on update), and a plain name-order scan picked a stale one (the 616.56 core
+// loaded under the 616.64 kernel driver), so this comes first.
 static bool ngxCoreFromRegistry(const wchar_t* fileName, std::wstring& out)
 {
     wchar_t buf[MAX_PATH * 2] = {};
@@ -291,7 +291,7 @@ bool Host::resolveModules(const Variant& v, std::string& err)
 bool Host::createDevice(std::string& err)
 {
     // Both entry points from the System32 DLLs by name: linked into smv-live.exe (its offline
-    // host, priority 24 step 2d) the plain imports resolve to Streamline's sl.interposer, which
+    // host) the plain imports resolve to Streamline's sl.interposer, which
     // that route never initialises (the WGC capture device follows the same rule).
     wchar_t sys[MAX_PATH]{};
     GetSystemDirectoryW(sys, MAX_PATH);
@@ -671,8 +671,8 @@ bool Host::renderFrame(const void* src, void* dst, bool reset, std::string& err)
 
     // A copyable footprint pads every row to 256 bytes EXCEPT the last, so the buffer is
     // RowPitch * (h - 1) + w * 8 bytes: mapping RowPitch * h reaches past its end and Map fails
-    // for every width that is not a multiple of 32 (2026-09-23; the render then ran without
-    // DLSS 5; the same finding and fix as DLSS5-NeuralScreen's readback).
+    // for every width that is not a multiple of 32 (the render then ran without DLSS 5; the
+    // same finding and fix as DLSS5-NeuralScreen's readback).
     D3D12_RANGE all = { 0, (SIZE_T)((size_t)m_rowPitch * (m_h - 1) + srcRow) };
     void* rd = nullptr;
     if (FAILED(m_readback->Map(0, &all, &rd))) { err = "readback Map failed"; return false; }

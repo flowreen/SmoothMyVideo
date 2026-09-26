@@ -1,4 +1,4 @@
-// `node dist/render/cli.js <render.py's arguments>` (priority 24 step 6e): the render's command
+// `node dist/render/cli.js <render.py's arguments>`: the render's command
 // line, speaking render.py's stderr protocol and exit codes; every render runs in this process
 // (native.ts) on the native host.
 // Like render.py it appends its session to THE log (%TEMP%\smv-engine.log, truncated past 8 MB):

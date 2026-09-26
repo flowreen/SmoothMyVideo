@@ -1,9 +1,9 @@
-// The encoder (priority 24 step 6b): engine/render_encode.py ported line by line, the comments
+// The encoder: engine/render_encode.py ported line by line, the comments
 // there carry the reasoning (the codec ladder, the CPU fallbacks and the RAM preflight, the
 // quality-first flags, the colour signalling, the track passthrough, the two-stage HDR / resume
 // finish). Every function is fed the decisions the orchestrator already made and returns a record
 // or an argv; the ones that talk while they work take its `say` / `fatal` callables. The DV and
-// HDR10+ exports (step 6c) and the resume concat / cleanup (step 6d) arrive as callables in the
+// HDR10+ exports and the resume concat / cleanup arrive as callables in the
 // Finalize record. Child processes run synchronously with no console window, as in python.
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
@@ -261,8 +261,8 @@ export function qualityArgs(
     // Split-frame encoding stays OFF, pinned so no driver's `auto` can turn it on. Two strips were
     // 1.15x (1080p) / 1.30x (4K) faster for RIFE 2x, but the strips are separate slices with the
     // loop filter off across them, which leaves an unfiltered line at the same row of every frame
-    // (1080p: rows 575 / 576, +2 to 3 levels): the user rejected it as repeatable, identifiable
-    // corruption (2026-09-25, harness p34). SMV_NVENC_SPLIT overrides the mode for measurement only.
+    // (1080p: rows 575 / 576, +2 to 3 levels), a repeatable, identifiable artifact, so splitting
+    // stays off. SMV_NVENC_SPLIT overrides the mode for measurement only.
     if (venc === 'hevc_nvenc' || venc === 'av1_nvenc') {
       const split = env.SMV_NVENC_SPLIT || '15';
       qargs.push('-split_encode_mode', split);
@@ -533,7 +533,7 @@ export function remuxTracks(
 }
 
 /** Everything the finish reads, captured by the orchestrator at call time (render_encode.Finalize).
- * hpExport / dvExport = the HDR10+ and DV exports of the finished work path (step 6c). */
+ * hpExport / dvExport = the HDR10+ and DV exports of the finished work path. */
 export interface Finalize {
   ffmpeg: string;
   inp: string;

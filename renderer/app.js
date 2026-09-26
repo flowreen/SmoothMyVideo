@@ -57,8 +57,8 @@ function fmtFinish(s){ const d = new Date(Date.now() + Math.max(0,s)*1000);   //
 const $ = (id) => document.getElementById(id);
 // Stored-settings schema version: bump whenever a localStorage key or its scale/meaning changes,
 // and the first launch of the new build wipes every stored setting once, so stale keys can never
-// conflict with the new UI (e.g. the HDR slider rescales and key renames of 2026-07-02).
-const SETTINGS_VERSION = '3';   // 2026-07-06: multiplier dropdown replaced by a unified target-fps slider (new key fpsTarget)
+// conflict with the new UI (e.g. an HDR slider rescale or a key rename).
+const SETTINGS_VERSION = '3';   // 3 = the unified target-fps slider (key fpsTarget) replaced the multiplier dropdown
 if(localStorage.getItem('settingsVersion') !== SETTINGS_VERSION){
   localStorage.clear();
   localStorage.setItem('settingsVersion', SETTINGS_VERSION);
@@ -132,8 +132,7 @@ function srcFps(){ const [n,d]=(((info && info.fps) || '24/1')).split('/'); retu
 //   fps    - absolute: this exact rate, whatever the source is (up to 3 decimals, so an exact
 //            multiple of a fractional source stays on-grid: 47.952 = 2x of 23.976)
 //   screen - absolute: the monitor's refresh rate
-// (A relative Multiplier mode existed until 2026-08-25; removed as redundant: the fps box
-// expresses any multiple, and fixed-timing live models now derive their whole multiplier
+// (No relative Multiplier mode: the fps box expresses any multiple, and fixed-timing live models now derive their whole multiplier
 // from the target themselves.)
 const SPEED_DEF_FPS = 60;
 function speedMode(){ return localStorage.getItem('speedMode') === 'screen' ? 'screen' : 'fps'; }
@@ -262,7 +261,7 @@ function refresh(){ if(!input) return;
     : 'resampled';                                                          // non-integer multiple: engine uses --fps
   // The hint carries the derived other side of the relationship: the implied ratio to the source.
   // Hidden while the bundled example is loaded: its 30 fps would leak into the UI as "4x of 30"
-  // and read as the app's choice (the same coupling WO-3 hides the example metadata rows for).
+  // and read as the app's choice (the same coupling that hides the example's metadata rows).
   const derived = ratioText() + '× of ' + (+srcFps().toFixed(targetDecimals())) + ' fps';
   $('ratehint').textContent = !interpOn() || isExample ? '' : derived + ' · ' + kind;
   syncTargetUI();
@@ -405,7 +404,7 @@ $('sharpval').oninput = () => { localStorage.setItem('sharpenVal', $('sharpval')
 // is a generative repaint, not a filter. Off by default: it changes the look, and every
 // emitted frame pays a second model pass.
 function restoreOn(){ return $('restore').checked; }
-// Restore ALWAYS starts off (user call 2026-07-04): an expensive, look-altering pass you opt
+// Restore ALWAYS starts off: an expensive, look-altering pass you opt
 // into per session, so its state is deliberately NOT persisted; old key retired.
 localStorage.removeItem('restoreOn');
 
@@ -426,7 +425,7 @@ if(localStorage.getItem('speedMode') === null){
   if(old > 0 && localStorage.getItem('speedFps') === null) localStorage.setItem('speedFps', String(Math.round(old)));
   localStorage.setItem('speedMode', localStorage.getItem('screenfps') === '1' ? 'screen' : 'fps');
 }
-// Multiplier mode removed 2026-08-25: a persisted 'mult' choice becomes the fps default
+// A persisted 'mult' choice (the old Multiplier mode) becomes the fps default
 // (translating beats a SETTINGS_VERSION bump, which would wipe every unrelated preference).
 if(localStorage.getItem('speedMode') === 'mult') localStorage.setItem('speedMode', 'fps');
 localStorage.removeItem('speedMult');
@@ -487,8 +486,8 @@ function syncUpscale(){
     txt = th ? '→ rendered at ' + th + 'p first, then fitted to the window or screen' : '';
   } else if($('upres').value !== '0'){
     const d = upDims();
-    // Just the resulting dimensions plus encoder-relevant warnings; resampler names were
-    // dropped 2026-08-28 (user: keep it simple, the engine always picks the best resize).
+    // Just the resulting dimensions plus encoder-relevant warnings; no resampler names (the
+    // engine always picks the best resize).
     if(d) txt = '→ ' + d.w + ' × ' + d.h
                 + ((d.w > NVENC_MAX || d.h > NVENC_MAX) ? '  ·  CPU encode at this size (slower)' : '')
                 + ((d.w >= ENC_MAX || d.h >= ENC_MAX) ? '  ·  at the 16K encoder cap' : '');
@@ -502,7 +501,7 @@ function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.valu
   if(o) o.textContent = 'Match screen' + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
 // NOTE: the element id is outcodec, NOT codec - id "codec" is taken by the source-codec info span.
 // Per-choice guidance so the trade-off is clear without leaving the dropdown. Size claims are
-// from a real A/B at the engine's verified visually-lossless settings (2026-07-10 quality-first
+// from a real A/B at the engine's verified visually-lossless settings (the quality-first
 // tuning: on the 1080p sample HEVC CQ17-p7-ladder 2.25 MB / AV1 CQ22 2.17 MB / VVC QP17 0.98 MB).
 const CODEC_HINTS = {
   hevc: 'safest choice: TVs, phones, editors and players all take it; audio is copied',
@@ -515,7 +514,7 @@ if(savedCodec && [...$('outcodec').options].some(o => o.value === savedCodec)) $
 $('outcodec').onchange = () => { localStorage.setItem('codec', $('outcodec').value); syncCodec(); };
 syncCodec();
 let savedUpres = localStorage.getItem('upres');
-if(savedUpres === '540'){ savedUpres = '480'; localStorage.setItem('upres', savedUpres); }   // 540p retired 2026-09-13 (user: no 540p anime exists), 480p took its slot
+if(savedUpres === '540'){ savedUpres = '480'; localStorage.setItem('upres', savedUpres); }   // 540p retired (no 540p anime exists), 480p took its slot
 if(savedUpres && [...$('upres').options].some(o => o.value === savedUpres)) $('upres').value = savedUpres;
 const savedUpcustom = localStorage.getItem('upcustom'); if(savedUpcustom) $('upcustom').value = savedUpcustom;
 $('upres').onchange = () => { localStorage.setItem('upres', $('upres').value); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
@@ -575,8 +574,8 @@ async function doInstall(source){
 }
 $('rtxget').onclick = () => ipcRenderer.invoke('rtx-open-download');
 $('rtxbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('rtx-choose','zip'); if(p) doInstall(p); };  // selecting a .zip auto-installs
-localStorage.removeItem('supersampleOn');   // retired 2026-07-18: supersample removed (measured imperceptible)
-localStorage.removeItem('encspeed');   // retired 2026-09-25: Encoder speed selector dropped (every render uses the Quality encoder)
+localStorage.removeItem('supersampleOn');   // retired: supersample removed (measured imperceptible)
+localStorage.removeItem('encspeed');   // retired: no Encoder speed selector (every render uses the Quality encoder)
 if(localStorage.getItem('rtxvsrOn') === '1') $('rtxvsr').checked = true;   // default OFF
 if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // default OFF
 $('rtxvsr').onchange = () => { localStorage.setItem('rtxvsrOn', $('rtxvsr').checked ? '1' : '0'); syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
@@ -587,8 +586,8 @@ ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); s
   // Live's VSR default depends on rtxReady, which just arrived: re-send + refresh the fill hint
   try{ lvModelUi(); lvSendOpts(); }catch{} });
 
-// NVIDIA DLSS 5 (Neural Rendering; opt-in; both modes since 2026-09-12: renders run it per output
-// frame, Live once per captured frame before the smoothing, python route, lvSendOpts carries it):
+// NVIDIA DLSS 5 (Neural Rendering; opt-in; both modes: renders run it per output frame, Live
+// once per captured frame before the smoothing, lvSendOpts carries it):
 // a DLAA-class per-frame pass at the output resolution, hosted by engine/dlssnr/dlssnr.exe (ships)
 // plus the NR runtime nvngx_dlssnr.dll, which the app never ships (NVIDIA offers no public download,
 // the only NVIDIA copy is inside NBA 2K27): one click downloads the community build every DLSS 5 tool
@@ -635,7 +634,7 @@ async function checkDlssnrReady(){
   refresh();                // so does the interp-off output name (_dlss5 needs nrOn())
   // the Live hint and the live options read nrOn() = ticked AND ready: a tick (or the boot
   // restore) made before this async answer lands computed them as off, so re-run them now
-  // (found by the WO-41 GUI gate: the fit hint stayed stale after the tick)
+  // (otherwise the fit hint stays stale after the tick)
   try{ lvModelUi(); lvSendOpts(); }catch{}
 }
 function dlssnrInstallNote(r){   // one line about what got installed (known build or not)
@@ -706,10 +705,10 @@ function modelIsDlss(){ return $('modeldlss').checked && dlssReady; }
 function modelIsRife(){ return $('modelrife').checked; }
 // The DRBA sub-checkbox (default OFF) adds anime-pacing timing on top of the same RIFE weights.
 function modelIsRifeDrba(){ return modelIsRife() && $('rifedrba').checked; }
-// Frame Blend (engine --lsfg, WO-19 flow-warp) uses the bundled RIFE weights, so it is always
+// Frame Blend (engine --lsfg, flow-warp) uses the bundled RIFE weights, so it is always
 // ready: nothing to install, no GPU feature check.
 function modelIsLsfg(){ return $('modellsfg').checked; }
-// NVIDIA Optical Flow (direct), 2026-09-21: the driver's optical-flow hardware run by
+// NVIDIA Optical Flow (direct): the driver's optical-flow hardware run by
 // smv-live.exe itself (engine --nvof, live backend nvof), so it is always ready like Frame Blend.
 function modelIsNvof(){ return $('modelnvof').checked; }
 const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelnvof'), $('modellsfg')];
@@ -806,7 +805,7 @@ function restoreModelChoice(){
     saved = 'none'; localStorage.setItem('interpModel', 'none');
     localStorage.removeItem('interp');
   }
-  localStorage.removeItem('svpNvof');   // the SVP models were removed 2026-09-21
+  localStorage.removeItem('svpNvof');   // retired: the SVP models are gone
   if(saved === 'svp' || saved === 'svpnvof'){  // the default model takes over
     saved = 'gmfss'; localStorage.setItem('interpModel', 'gmfss');
   }
@@ -850,12 +849,12 @@ function liveModelInfo(){
   // multiplier of the captured window's own rate (derived in the exe from the target) - DLSS-G
   // by design (Streamline, capped at 6x)
   if(modelIsDlss()) return { model:'dlssg', name:'DLSS 4.5', note:'', fixed:true };
-  // DRBA live (2026-09-12): the server's rifedrba backend renders the three-frame window, so
-  // the picture trails the capture by one source frame (python route, no native host)
+  // DRBA live: the rifedrba backend renders the three-frame window, so the picture trails
+  // the capture by one source frame
   if(modelIsRifeDrba()) return { model:'rifedrba', name:'RIFE (DRBA)', note:'adds one source frame of delay' };
   if(modelIsRife()) return { model:'rife', name:'RIFE', note:'' };
-  // Smooth Motion live (2026-09-12): the NvOFFRUC bridge warps at any fraction, so the server's
-  // fruc backend is adaptive like rife/gmfss; HDR-capable like rife (the bridge warps 8-bit PQ
+  // Smooth Motion live: every fraction takes the nearest node of the pair's midpoint tree, so
+  // the fruc backend is adaptive like rife/gmfss; HDR-capable like rife (the bridge warps 8-bit PQ
   // for the tweens, the real frames keep full precision)
   if(modelIsFruc()) return { model:'fruc', name:'Smooth Motion', note:'tweens at 8-bit precision' };
   // Frame Blend is adaptive like rife/gmfss (no fixed flag): the server backend resamples
@@ -863,25 +862,23 @@ function liveModelInfo(){
   if(modelIsLsfg()) return { model:'blend', name:'Frame Blend', note:'flow at the Image scale, full resolution warps' };
   // NVIDIA Optical Flow (direct): adaptive like rife (the splat takes any fraction), native only
   if(modelIsNvof()) return { model:'nvof', name:'NVIDIA Optical Flow', note:'' };
-  // nothing ticked = interpolation off (same meaning as file renders since 2026-07-18): the
-  // server's echo backend passes the captured frames through at their own rate and applies the
-  // live effects (Restore, Sharpen, Upscale to, RTX VSR, RTX HDR). User order 2026-09-12: "we
-  // want user to be able to apply the effects without interpolating".
+  // nothing ticked = interpolation off (same meaning as file renders): the echo backend passes
+  // the captured frames through at their own rate and applies the live effects (Restore,
+  // Sharpen, Upscale to, RTX VSR, RTX HDR), so the effects work without interpolating.
   if(!interpOn()) return { model:'echo', name:'No interpolation', note:'', effectsOnly:true };
   return { model:'gmfss', name:'GMFSS', note:'' };
 }
-// WO-7 upscaler policy: live FILL upscales with RTX VSR BY DEFAULT when its runtime is
+// Upscaler policy: live FILL upscales with RTX VSR BY DEFAULT when its runtime is
 // present (live output is ephemeral, so a better silent default is fine). The shared RTX VSR
 // checkbox stays the opt-out: explicitly unchecked ('0') means bicubic everywhere. FILE
 // renders remain strict opt-in (checkbox checked) so render output never changes silently.
 function liveVsrOn(){ return !!(rtxReady.vsr && localStorage.getItem('rtxvsrOn') !== '0'); }
-// Live TrueHDR (WO-8 Phase 4): STRICT opt-in via the shared RTX HDR checkbox (a TrueHDR
+// Live TrueHDR: STRICT opt-in via the shared RTX HDR checkbox (a TrueHDR
 // expansion is a deliberate look change, so live matches file renders, not the VSR silent
 // default). Applies to the server models on HDR screens; the exe drops it elsewhere. No
 // srcHdr gate here: live has no loaded file, the source is whatever window gets captured.
 function liveHdrOn(){ return !!(rtxReady.hdr && $('rtxhdr').checked); }
-// The exe's loading note / HUD names what is actually ticked (user 2026-09-25: "can we have
-// instead message of what is actually checked?"): the model, then the live effects the server
+// The exe's loading note / HUD names what is actually ticked: the model, then the live effects the server
 // models apply (DLSS 4.5 takes none), e.g. "GMFSS + DLSS 5" or "DLSS 5 + Sharpen".
 function liveLoadLabel(mi){
   const parts = mi.effectsOnly ? [] : [mi.name];
@@ -951,8 +948,7 @@ function lvModelUi(){
   const mi = liveModelInfo();
   const m = mi.model;
   const server = m !== 'dlssg';       // everything but DLSS-G runs through the server
-  // models with an Image scale input: the whole pipeline runs at the reduced size (blend too
-  // since the two sliders split on 2026-09-14; before that blend read this one as its flow scale)
+  // models with an Image scale input: the whole pipeline runs at the reduced size (blend too)
   const hasFlow = m === 'rife' || m === 'rifedrba' || m === 'gmfss' || m === 'blend' || m === 'fruc' || m === 'nvof';
   // stays enabled while live runs: moving it relaunches the session with the new scale
   $('lvflow').disabled = !hasFlow;
@@ -1008,7 +1004,7 @@ $('lvflow').oninput = () => {
     }, 700);
   }
 };
-// WO-17: the fps target is a spawn-time argument (--target, and the exe derives the slot
+// The fps target is a spawn-time argument (--target, and the exe derives the slot
 // count from it), so a Speed change during a running session takes the same relaunch path as
 // the Image scale slider: 700 ms debounce, 'lv-restart', same target window. Only a real
 // change of the EFFECTIVE target (what main.ts would pass) restarts anything.
@@ -1041,7 +1037,7 @@ function lvHudLatUi(){
 }
 $('lvhud').onchange = () => { localStorage.setItem('lvHud', $('lvhud').checked ? '1' : '0'); lvHudLatUi(); lvSendOpts(); };
 $('lvhudlat').onchange = () => { localStorage.setItem('lvHudLat', $('lvhudlat').checked ? '1' : '0'); lvSendOpts(); };
-localStorage.removeItem('lvNative');   // retired 2026-09-05: the RIFE live route always runs inside smv-live.exe (WO-31)
+localStorage.removeItem('lvNative');   // retired: the RIFE live route always runs inside smv-live.exe
 lvHudLatUi();
 // Hotkey recorder: click the button, press the new key or combo; Esc cancels. Electron
 // accelerator strings ("`", "F9", "Ctrl+Alt+S"); main answers whether registration
@@ -1139,7 +1135,7 @@ ipcRenderer.on('lv-started', () => {
   setMode('live');   // the ` hotkey can start a session with no renderer involvement
 
   lvState = 'running'; lvStopReq = false; lvRefused = false; lvUi();
-  try{ lvSpawnTarget = lvEffTarget(); }catch{}   // WO-17: what --target this session carries
+  try{ lvSpawnTarget = lvEffTarget(); }catch{}   // what --target this session carries
   $('lvstat').textContent = 'starting…';
 });
 ipcRenderer.on('lv-done', (_e, code) => {
@@ -1161,7 +1157,7 @@ ipcRenderer.on('lv-done', (_e, code) => {
       const fl = +localStorage.getItem('lvFlow');
       if(fl >= 1 && fl <= 100) $('lvflow').value = fl;
       localStorage.removeItem('lvFlowPreset');   // retired: the 540/720 presets moved to the Upscale to selector
-      localStorage.removeItem('lvFscale');       // retired 2026-09-25: the Flow scale control was dropped
+      localStorage.removeItem('lvFscale');       // retired: the Flow scale control is gone
       const ft = localStorage.getItem('lvFit');
       if(ft && [...$('lvfit').options].some(o => o.value === ft)) $('lvfit').value = ft;
       lvModelUi();
@@ -1500,7 +1496,7 @@ function syncHdrColor(){
 // engine keeps the TrueHDR SDK scales (0..200, 100 neutral).
 function sdkCon(){ return 100 + (+$('hdrcon').value || 0); }
 function sdkSat(){ return 100 + (+$('hdrsat').value || 0); }
-// Dynamic Vibrance ALWAYS starts off (user call 2026-07-04): it is a per-session opt-in
+// Dynamic Vibrance ALWAYS starts off: it is a per-session opt-in
 // effect, so its on/off state is deliberately NOT persisted (the two slider values below
 // still are). The old 'dynVib' key is retired so no stale state lingers.
 localStorage.removeItem('dynVib');
@@ -1745,7 +1741,7 @@ function startRun(){
   }
   // Image scale slider (shared with Live): the engine processes the whole video at the
   // reduced size and its upscale pass restores the output size (GMFSS default, RIFE, DRBA,
-  // Frame Blend since the two sliders split on 2026-09-14).
+  // Frame Blend).
   const flowPct = +$('lvflow').value;
   if(interpOn() && flowPct < 100 && (!payload.model || payload.model === 'rife' || payload.model === 'rifedrba'
                                      || payload.model === 'lsfg'))

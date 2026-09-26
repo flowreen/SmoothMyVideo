@@ -2543,6 +2543,21 @@ struct NativeRife
     uint8_t* dFrOutBI[4] = {};       // [0] = dFrOutB
     double frPlan[64] = {};
     uint32_t frPlanN = 0, frPlanK = 0;
+    // recursive midpoints (priority 34, 2026-09-26): NvOFFRUC damages content that does not move
+    // at every t != 0.5, even called exactly as NVIDIA documents it (WO "[Smooth Motion jitters on
+    // consecutive identical frames]"), so every tween is node k / 2^L of the pair's midpoint tree:
+    // FRUC at t = 0.5 between the node's two parents, level L on instance L - 1, which then sees
+    // one continuous stream of new frames (NVIDIA's one call per new frame). A t that is no node
+    // takes the nearest node of depth frMpCap. SMV_FRUC_MIDPOINTS=0 = the direct-t scheme above.
+    bool frMp = false;
+    int frMpCap = 2;                 // offline 3, live 2 (cost); SMV_FRUC_DEPTH=1..4 overrides both
+    int frMpL = 0;                   // this pair's depth, 0 = not chosen yet
+    bool frMpBuilt = false;          // this pair's whole tree to frMpL is computed
+    uint64_t frSerial = 0;           // frames packed this session: the node keys
+    uint8_t* dFrNode[16] = {};       // BGRA8 pw x ph: node j / 16 of this pair (j = 1..15)
+    bool frNodeOk[16] = {};
+    uint64_t frLastKey[4] = {};      // per instance: the key of the frame it was fed last, 0 = none
+    uint64_t frNodeCalls = 0;
     // RIFE with DRBA timing (rifedrba, 2026-09-21, memory priority 21 (b) step 3): the RIFE
     // handoff plus `NATIVE-PATH block0=` (calc_flow's block0 as its own engine) and `engine=drba
     // lag=1`. live_server.RifeDrba natively: a four-frame history of padded frames and their
@@ -5181,16 +5196,33 @@ static bool nativeFrucSetup(NativeRife& nr)
     // instances measured 0.99x / ~0.94x at x3 / x5 1080p, WO Step 4); SMV_FRUC_INSTANCES overrides
     // both (1 = the one-instance path); the extra ones are created by the first pair whose plan
     // needs them (nativeFrucGrow)
+    // recursive midpoints: the default wherever the bridge has the instance calls (a level per
+    // instance, so up to 4 on either route); SMV_FRUC_MIDPOINTS=0 keeps the direct-t scheme,
+    // SMV_FRUC_DEPTH=1..4 the depth cap
+    nr.frMp = false;
     nr.frInstMax = 1;
     if (g_fruc.stepI)
     {
-        nr.frInstMax = g_offline ? 1 : 4;
         char ev[8] = {};
+        nr.frMp = !(GetEnvironmentVariableA("SMV_FRUC_MIDPOINTS", ev, sizeof(ev)) > 0 && ev[0] == '0');
+        nr.frMpCap = g_offline ? 3 : 2;
+        if (GetEnvironmentVariableA("SMV_FRUC_DEPTH", ev, sizeof(ev)) > 0)
+            nr.frMpCap = (std::max)(1, (std::min)(4, atoi(ev)));
+        nr.frInstMax = (g_offline && !nr.frMp) ? 1 : 4;
         if (GetEnvironmentVariableA("SMV_FRUC_INSTANCES", ev, sizeof(ev)) > 0)
             nr.frInstMax = (std::max)(1, (std::min)(4, atoi(ev)));
     }
-    LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA%s, up to %d instance%s\n",
-        nr.pw, nr.ph, nr.w, nr.h, g_fruc.step ? ", feed-once" : "", nr.frInstMax, nr.frInstMax > 1 ? "s" : "");
+    nr.frMpL = 0;
+    nr.frSerial = 0;
+    nr.frNodeCalls = 0;
+    for (bool& ok : nr.frNodeOk) ok = false;
+    for (uint64_t& k : nr.frLastKey) k = 0;
+    if (nr.frMp)
+        LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA, feed-once, recursive midpoints (depth cap %d)\n",
+            nr.pw, nr.ph, nr.w, nr.h, nr.frMpCap);
+    else
+        LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA%s, up to %d instance%s\n",
+            nr.pw, nr.ph, nr.w, nr.h, g_fruc.step ? ", feed-once" : "", nr.frInstMax, nr.frInstMax > 1 ? "s" : "");
     return true;
 }
 
@@ -5239,10 +5271,36 @@ static void nativeFrucDrain(NativeRife& nr)
     }
 }
 
+// the depth of a pair's midpoint tree: the smallest L that holds every t as a node k / 2^L (an
+// offline x2 / x4 / x8 / x16 is exact); a t that is no node within the limit takes frMpCap (its
+// nearest node there). Live caps every depth at frMpCap: its tweens must fit one source frame
+static int nativeFrucDepth(const NativeRife& nr, const double* ts, uint32_t n)
+{
+    const int lim = g_offline ? 4 : nr.frMpCap;
+    int L = 1;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        int d = 1;
+        for (; d <= lim; d++)
+        {
+            const double x = ts[i] * (double)(1 << d);
+            if (fabs(x - floor(x + 0.5)) < 1e-4) break;
+        }
+        L = (std::max)(L, d <= lim ? d : nr.frMpCap);
+    }
+    return (std::min)(L, 4);
+}
+
 // the pair's tweens in the order the caller asks for them (every nativeFrucTween call then takes
 // the next one); fewer than two, or one instance, = the one-instance path
 static void nativeFrucPlan(NativeRife& nr, const double* ts, uint32_t n)
 {
+    if (nr.frMp)
+    {
+        // recursive midpoints: only the pair's depth; the first nativeFrucTween builds the tree
+        nr.frMpL = nativeFrucDepth(nr, ts, n);
+        return;
+    }
     nativeFrucDrain(nr);
     nr.frPlanN = nr.frPlanK = 0;
     if (nr.frInstMax < 2 || n < 2 || n > 64) return;
@@ -5273,6 +5331,11 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
     nr.frB = n;
     nr.frPrev = n;
     nr.frPlanN = nr.frPlanK = 0;   // the caller plans this pair's tweens after this (nativeFrucPlan)
+    // recursive midpoints: this frame's serial names it in the node keys; the pair's tree starts empty
+    nr.frSerial++;
+    nr.frMpL = 0;
+    nr.frMpBuilt = false;
+    for (bool& ok : nr.frNodeOk) ok = false;
     if (!nTween || nr.frA < 0) return true;
     if (g_fruc.step)
     {
@@ -5312,8 +5375,82 @@ static void nativeFrucFedOk(NativeRife& nr, int i)
     nr.frCalls[i]++;
 }
 
+// recursive midpoints: the key of node k / 2^L of this pair (k = 0 / 2^L = the pair's first /
+// second frame): a real frame = its serial, an interior node = the pair's first serial and its
+// position on the 16-grid; an instance fed the left parent of a node last feeds only the right one
+static uint64_t nativeFrucKey(const NativeRife& nr, int k, int L)
+{
+    while (L > 0 && !(k & 1)) { k >>= 1; L--; }
+    const uint64_t a = nr.frSerial - 1;
+    if (L == 0) return (k ? nr.frSerial : a) * 16 + 1;
+    return a * 16 + ((uint64_t)k << (4 - L)) + 1;
+}
+
+// node k / 2^L of this pair's midpoint tree, once per pair: FRUC at t = 0.5 between the node's two
+// parents (computed first) on instance L - 1, mode 1 when that instance was fed the left parent
+// last, else mode 0 (prime the left parent, feed the right one)
+static uint8_t* nativeFrucNode(NativeRife& nr, int k, int L)
+{
+    while (L > 0 && !(k & 1)) { k >>= 1; L--; }
+    if (L == 0) return nr.dFrSurf[k ? nr.frB : nr.frA];
+    const int p = k << (4 - L);
+    if (nr.frNodeOk[p]) return nr.dFrNode[p];
+    uint8_t* left = nativeFrucNode(nr, k - 1, L);
+    uint8_t* right = left ? nativeFrucNode(nr, k + 1, L) : nullptr;
+    if (!right) return nullptr;
+    if (!nr.dFrNode[p] && cudaMalloc((void**)&nr.dFrNode[p], (size_t)nr.pw * nr.ph * 4) != cudaSuccess)
+    { nr.dFrNode[p] = nullptr; nr.die("fruc midpoint buffer alloc failed"); return nullptr; }
+    const int i = L - 1;
+    const int mode = nr.frLastKey[i] == nativeFrucKey(nr, k - 1, L) ? 1 : 0;
+    if (mode == 0 && nr.frCalls[i] > 0) nr.frPrimed++;
+    int rep = 0;
+    const int rc = g_fruc.stepI(i, left, right, nr.dFrNode[p], 0.5, mode, &rep);
+    if (rc != 0)
+    {
+        LOG("native: fruc: midpoint %d/%d on instance %d failed: %s (rc %d)\n", k, 1 << L, i, g_fruc.lastError(), rc);
+        nr.die("fruc midpoint failed");
+        return nullptr;
+    }
+    nr.frLastKey[i] = nativeFrucKey(nr, k + 1, L);
+    nr.frCalls[i]++;
+    nr.frNodeCalls++;
+    if (rep) nr.frRepeats++;
+    nr.frNodeOk[p] = true;
+    return nr.dFrNode[p];
+}
+
 static bool nativeFrucTween(NativeRife& nr, double t)
 {
+    if (nr.frMp)
+    {
+        // recursive midpoints: the pair's WHOLE tree to its depth first, level by level, left to
+        // right, so level L's instance sees the continuous stream A, 2 / 2^L, 4 / 2^L .. B of new
+        // frames. A node computed alone needs a prime whose optical flow spans the skipped nodes,
+        // NvOFFRUC seeds the next flow from it, and that damaged every such node (up to 28 % of a
+        // held frame, WO Step 3). Then the nearest node (never an end frame); a failed instance
+        // create caps the depth at the instances made
+        if (!nr.frMpL) nr.frMpL = nativeFrucDepth(nr, &t, 1);
+        // a failed create lowers frInstMax (nativeFrucGrow), so it is not retried every pair
+        if (nr.frInst < nr.frMpL && nr.frInst < nr.frInstMax) nativeFrucGrow(nr, (std::min)(nr.frMpL, nr.frInstMax));
+        if (nr.frInst < nr.frMpL) nr.frMpL = nr.frInst;
+        if (!nr.frMpBuilt)
+        {
+            for (int l = 1; l <= nr.frMpL; l++)
+                for (int k = 1; k < (1 << l); k += 2)
+                    if (!nativeFrucNode(nr, k, l)) return false;
+            nr.frMpBuilt = true;
+        }
+        const int den = 1 << nr.frMpL;
+        const int k = (std::max)(1, (std::min)(den - 1, (int)floor(t * den + 0.5)));
+        uint8_t* node = nativeFrucNode(nr, k, nr.frMpL);
+        if (!node) return false;
+        nr.frTweens++;
+        void* a[] = { &node, &nr.pw, &nr.ph, &nr.dFrOut };
+        if (cuLaunchKernel(nr.planesRgb ? nr.fUnpackBgraRgb : nr.fUnpackBgra, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0,
+                           (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
+        { nr.die("unpackBgra (fruc) launch failed"); return false; }
+        return true;
+    }
     int rep = 0;
     int rc;
     uint8_t* outB = nr.dFrOutB;
@@ -5389,9 +5526,11 @@ static void nativeFrucFree(NativeRife& nr)
     }
     if (nr.frCreated)
     {
-        LOG("native: fruc session: %llu tweens, %llu primed pairs, %llu frame repeats, %d instance%s\n",
+        char mp[64] = "";
+        if (nr.frMp) snprintf(mp, sizeof(mp), ", %llu midpoint calls", (unsigned long long)nr.frNodeCalls);
+        LOG("native: fruc session: %llu tweens, %llu primed pairs, %llu frame repeats%s, %d instance%s\n",
             (unsigned long long)nr.frTweens, (unsigned long long)nr.frPrimed, (unsigned long long)nr.frRepeats,
-            nr.frInst, nr.frInst > 1 ? "s" : "");
+            mp, nr.frInst, nr.frInst > 1 ? "s" : "");
         g_fruc.destroy();   // every instance
         nr.frCreated = false;
     }
@@ -5400,6 +5539,8 @@ static void nativeFrucFree(NativeRife& nr)
     nr.frInst = 1;
     nr.frPlanN = nr.frPlanK = 0;
     for (auto& s : nr.dFrSurf) if (s) { cudaFree(s); s = nullptr; }
+    for (auto& s : nr.dFrNode) if (s) { cudaFree(s); s = nullptr; }
+    for (bool& ok : nr.frNodeOk) ok = false;
     if (nr.dFrOutB) { cudaFree(nr.dFrOutB); nr.dFrOutB = nullptr; }
     if (nr.dFrOut) { cudaFree(nr.dFrOut); nr.dFrOut = nullptr; }
 }

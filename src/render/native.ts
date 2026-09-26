@@ -1,8 +1,8 @@
-// The offline render (priority 24 step 6e-1, the only route since step 8): ported from render.py,
+// The offline render: ported from render.py,
 // every stderr line as render.py wrote it. This process probes, plans, picks the encoder, resumes,
 // spawns the decoder / encoder and the host (smv-live.exe --offline, one-shot or the resident host
 // behind its named pipe), relays the host's lines and finishes the container; no frame passes
-// through it (only the progress thumbnail's small dump, thumbPng). The DLSS + RTX two-pass (step 6e-2) runs its two phases through renderRoute.
+// through it (only the progress thumbnail's small dump, thumbPng). The DLSS + RTX two-pass runs its two phases through renderRoute.
 import { ChildProcess, spawn, spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import * as fs from 'fs';
@@ -530,7 +530,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   }
   const PAUSE_FILE = env.SMV_PAUSE_FILE;
   if (PAUSE_FILE) nargs.push('--pause-file', PAUSE_FILE);
-  // the GUI's progress thumbnail (priority 26): the host dumps a small frame about once a second
+  // the GUI's progress thumbnail: the host dumps a small frame about once a second
   // and says THUMB, onLine turns it into the PNG the renderer polls; no env var = no cost (CLI)
   const LIVE = env.SMV_LIVE_PREVIEW || '',
     THUMB_RAW = LIVE + '.raw';

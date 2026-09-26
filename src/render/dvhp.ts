@@ -1,4 +1,4 @@
-// Dolby Vision Profile 8.1 and HDR10+ exports of a finished HDR10 MP4 (priority 24 step 6c):
+// Dolby Vision Profile 8.1 and HDR10+ exports of a finished HDR10 MP4:
 // render_encode.py's dv_export / hp_export and their scene-shot grouping ported line by line, the
 // comments there carry the reasoning (one metadata block per SHOT, the L1 / SceneInfo layouts,
 // HDR10+ before DV, why the remux re-stamps the HDR10 boxes). Both are best-effort: any failure is

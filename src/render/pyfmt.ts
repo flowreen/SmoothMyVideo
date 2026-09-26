@@ -1,6 +1,5 @@
-// Python's number rounding and formatting, reproduced exactly (priority 24 step 6a: the render
-// orchestrator moves from engine/render_*.py to TypeScript, and every stderr note and pass
-// argument it builds must read the same). JavaScript differs from python on all of them:
+// Python's number rounding and formatting, reproduced exactly (the TypeScript render writes every
+// stderr note and pass argument exactly as the python render did). JavaScript differs from python on all of them:
 // Math.round and toFixed round a tie away from zero where python rounds half to even on the
 // double's EXACT value, `f"{x:g}"` switches to exponent form at other thresholds than
 // toPrecision, and `str(2.0)` is "2.0" where String(2.0) is "2". So the value is expanded to

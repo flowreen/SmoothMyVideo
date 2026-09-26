@@ -1,4 +1,4 @@
-// The source probe (priority 24 step 6a): engine/render_probe.py ported line by line, the
+// The source probe: engine/render_probe.py ported line by line, the
 // comments there carry the reasoning. Pure functions over the ffprobe stream record or the
 // input path; the callers write every stderr line themselves. ffprobe runs synchronously, as
 // in python (subprocess.check_output), with no console window.

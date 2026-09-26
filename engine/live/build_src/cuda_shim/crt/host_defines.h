@@ -1,4 +1,4 @@
-/* WO-15 build shim.
+/* Build shim.
  *
  * The CUDA 13 runtime WHEEL that ships inside engine\runtime carries the public CUDA headers
  * but not the internal crt\ subdirectory, and cuda_runtime_api.h opens with

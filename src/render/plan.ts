@@ -1,4 +1,4 @@
-// The render plan (priority 24 step 6a): engine/render_plan.py ported line by line, the
+// The render plan: engine/render_plan.py ported line by line, the
 // comments there carry the reasoning (the image scale / downscale fold, the output size, the
 // native offline eligibility, the DLSS + RTX Video two-pass split). Pure functions; the callers
 // write every stderr line and run the passes.

@@ -6,9 +6,8 @@ Each graph is exported under autocast(fp16) via the dynamo exporter (mixed fp16/
 app's precision) with H and W symbolic, once for every size; the host builds one engine per
 resolution from that file (H and W pinned, only the live RIFE timestep batch axis dynamic). The
 engine classes below carry only what the export needs from each graph: the engine base name, the
-input / output names and the dynamic batch range. The python TensorRT runtime that used to run
-these engines (TRTModule, build_or_load, trtify, rife_trtify, the JIT cache and the strict mode)
-was removed with the python render routes (priority 27b, 2026-09-24).
+input / output names and the dynamic batch range. The engines are built and run by the native
+host (smv-live.exe); nothing here builds or runs them.
 """
 import logging
 import os
@@ -81,8 +80,8 @@ def _fuse_prelu(onnx_path):
     PRelu as a separate elementwise kernel (22 % of fusionnet, 26 % of Restore) but fuses
     LeakyRelu and Max. Scalar slope a: LeakyRelu(alpha=a); per-channel slopes all <= 1:
     Max(x, x * a); any per-channel slope: Max(x, 0) + a * Min(x, 0). Each is exact for its case,
-    and the engines built from the rewrite give bit-identical output (priority 30 step 2,
-    D:\\AIStuff\\smv-live\\harness\\p30: Restore 1.30x, fusionnet 1.06x / 1.09x at 1080p / 4K).
+    and the engines built from the rewrite give bit-identical output (Restore 1.30x, fusionnet
+    1.06x / 1.09x faster at 1080p / 4K).
     Only the graph is rewritten; the external weight file stays as it is."""
     import numpy as np
     import onnx
@@ -128,8 +127,8 @@ def _half_features(onnx_path, name):
     """RIFE IFNet / block0: take the feature encodes f0 / f1 as fp16 inputs and widen them inside
     the graph. The encode engine outputs fp16, so the host used to widen it to fp32 (k_h2f) only
     for the engine to read it back; fp16 -> fp32 is exact, so the graph sees the same values and
-    the engines give bit-identical output (priority 30 lever 5a, D:\\AIStuff\\smv-live\\harness\\p37:
-    the live batched IFNet at 1472x2560 1.020x, plus the host's widen pass). Graph only."""
+    the engines give bit-identical output (the live batched IFNet at 1472x2560 1.020x faster, and
+    the host's widen pass is gone). Graph only."""
     import onnx
     from onnx import helper, TensorProto
 
@@ -154,11 +153,11 @@ def _half_features(onnx_path, name):
     onnx.checker.check_model(onnx_path)
 
 
-# --- size-free ONNX (2026-09-21) ----------------------------------------------------------------
+# --- size-free ONNX -----------------------------------------------------------------------------
 # The graphs below export ONCE with H / W symbolic (trt_lookup.onnx_path), and every engine size is
 # built from that file, pinned to the example shape exactly like a per-size export (one engine per
-# resolution still holds, the profile pins every axis but the declared batch range). Proven in the
-# WO "ONNX-in-exe engine build": built from these files, 8 graphs are bit-exact with the per-size
+# resolution still holds, the profile pins every axis but the declared batch range). Built from
+# these files, 8 graphs are bit-exact with the per-size
 # engines; gmflow_bidir runs its size-free branch (multiply + sum local ops) and is equivalent or
 # better (closer to eager fp32). Unit = the alignment of the FIRST input's H and W (the /64 frame
 # pad, 32 for GMFSS's half-size nets, 1 for Restore at the model size); every other input's
@@ -397,7 +396,7 @@ class _RifeIFNetBatchExport(nn.Module):
     def forward(self, x, timestep, f0, f1):
         b = timestep.shape[0]
         if getattr(self.ifnet, "batch_broadcast", False):
-            # WO-22: the net expands the SMALL tensors itself, after the downsample, so the
+            # the net expands the SMALL tensors itself, after the downsample, so the
             # pair constant full resolution downsample runs once instead of once per tween.
             return self.ifnet(x, timestep=timestep, scale_list=self.scale_list,
                               f0=f0, f1=f1)[0]
@@ -440,7 +439,7 @@ class RifeEncodeEngine(_Engine):
 
 
 class _RifeBlock0Export(nn.Module):
-    """DRBA's coarsest-level flow as its own graph (2026-09-21): exactly
+    """DRBA's coarsest-level flow as its own graph: exactly
     rife_backend.RIFE.calc_flow's block0 call, timestep 0.5 and scale_list[0] baked, the
     4-channel flow (0->0.5 | 1->0.5, full size) out. The avg splats after it are the host's
     kernels, so the graph stops at the flow."""

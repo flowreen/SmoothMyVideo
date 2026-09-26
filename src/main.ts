@@ -23,8 +23,7 @@ const ROOT = path.join(__dirname, '..');
 // the ONNX must be real files on disk, not inside app.asar). The renderer and icon stay
 // under ROOT (Electron reads those from the asar fine).
 const ENGINE = app.isPackaged ? path.join(process.resourcesPath, 'engine') : path.join(ROOT, 'engine');
-// The render orchestrator (priority 24 step 6e) and the before/after preview (step 7), compiled next
-// to this file.
+// The render orchestrator and the before/after preview, compiled next to this file.
 const RENDER_CLI = path.join(__dirname, 'render', 'cli.js');
 const PREVIEW_CLI = path.join(__dirname, 'render', 'preview.js');
 // Prefer ffprobe bundled at engine/bin (portable build); fall back to PATH for dev.
@@ -318,15 +317,14 @@ const DLSSG_FILES = [
 // every DLSS 5 tool pulls from (RankFTW/rhi-repo release assets, the RenoDX author's RTX 40 + 50
 // rebuild), pinned to one asset and verified twice (zip SHA256 from the GitHub API digest, then the
 // DLL inside), or the user drops a copy in, like the RTX Video and NvOFFRUC DLLs. nvngx_dlss.dll is
-// the DLSS SR runtime; the NGX core only warns when it is absent (probe verified 2026-09-04), so it
+// the DLSS SR runtime; the NGX core only warns when it is absent (probe-verified), so it
 // is copied when found beside a dropped runtime, reported, never required.
 const DLSSNR_DIR = path.join(ENGINE, 'dlssnr');
 const DLSSNR_HOST = ['dlssnr.exe', 'nvngx.dll'];
 const DLSSNR_RUNTIME = 'nvngx_dlssnr.dll';
 const DLSSNR_SR = 'nvngx_dlss.dll';
-// The one-click source: the most-downloaded rhi-repo asset (133k downloads on 2026-09-04), and the
-// ONE hash this app holds: the SHA256 of the nvngx_dlssnr.dll inside it (probe-verified on the host
-// 2026-09-04). The download refuses to install any other DLL; a dropped file with another hash still
+// The one-click source: the most-downloaded rhi-repo asset, and the ONE hash this app holds: the
+// SHA256 of the nvngx_dlssnr.dll inside it (probe-verified on the host). The download refuses to install any other DLL; a dropped file with another hash still
 // installs, the UI just says it is unverified. Bump tag, asset and hash together when moving to a
 // newer build (the zip's own digest is at https://api.github.com/repos/RankFTW/rhi-repo/releases).
 const DLSSNR_DL = {
@@ -703,7 +701,7 @@ ipcMain.handle('dlssnr-choose', async () => {
 // force-activates its own window at start.
 const LIVE_DIR = path.join(ENGINE, 'live');
 const LIVE_EXE = path.join(LIVE_DIR, 'smv-live.exe');
-// Resident offline host (2026-09-12): the render (src/render/native.ts) keeps `smv-live.exe --offline
+// Resident offline host: the render (src/render/native.ts) keeps `smv-live.exe --offline
 // --resident` alive between renders (engines loaded, about 300 MB of VRAM idle) and finds it through
 // this named pipe, one per app process. The render spawns it detached; this process quits it when a live session starts and at app exit
 // (a busy host ignores the request and leaves on its own idle limit).
@@ -721,7 +719,7 @@ function offlineHostQuit() {
   }
 }
 
-// THE merged log (one file for everything since 2026-08-29): the render (src/render/cli.ts) tees
+// THE merged log (one file for everything): the render (src/render/cli.ts) tees
 // its lines to the same literal path, so live session lines land chronologically
 // between render runs. Append-only; cli.ts owns the size cap.
 const SMV_LOG = path.join(os.tmpdir(), 'smv-engine.log');
@@ -741,7 +739,7 @@ function liveLog(text: string) {
 let liveProc: ChildProcess | null = null;
 let liveStopping = false;
 let liveRestartPending = false; // renderer asked to relaunch the session with new settings
-// Resident host (2026-09-12): every server-backend session runs `smv-live.exe --resident`,
+// Resident host: every server-backend session runs `smv-live.exe --resident`,
 // which keeps the process alive after the session with what the session loaded: the TensorRT
 // engines (about 300 MB of VRAM for RIFE, the next session of that model starts in well under
 // a second instead of 2.5 s). Sessions then start and stop over the
@@ -775,7 +773,7 @@ let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inhe
 let liveNrStructure = 1; // DLSS 5 Structure Intensity 0..2
 let liveNrTone = 1; // DLSS 5 Tone Intensity 0..2
 let liveNrStyle = 1; // DLSS 5 Style: 0 Default, 1 Natural, 2 Cinematic
-let liveRtxHdr = false; // live TrueHDR (WO-8 Phase 4), inherited from the RTX HDR checkbox
+let liveRtxHdr = false; // live TrueHDR, inherited from the RTX HDR checkbox
 let liveHdrColor = 'vivid'; // RTX HDR colour mode + tone knobs, inherited from the HDR sliders
 let liveHdrSat = 0; // SDK Saturation (drives the rtx colour mode)
 let liveHdrCon = 100; // SDK Contrast (100 = neutral)
@@ -906,16 +904,16 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     // live effects, inherited from the file-render Sharpen / RTX VSR settings
     const sharp = Math.min(1, Math.max(0, Number(liveSharpen) || 0));
     if (sharp > 0) args.push('--sharpen', sharp.toFixed(2));
-    // "Upscale to" (2026-09-12 live parity): the server resizes the model frame to this height
+    // "Upscale to": the server resizes the model frame to this height
     // first (VSR when enlarging), then fits it to the canvas; so VSR can now engage outside
     // fill mode too. Without it an upscale exists only in fill mode.
     const upH = Math.max(0, Math.round(Number(liveUpH) || 0));
     if (upH > 0) args.push('--upscale', String(upH));
     if (liveVsr && (liveFit === 'fill' || upH > 0)) args.push('--rtx-vsr');
-    // Restore (2026-09-12 live parity): Real-ESRGAN first on every presented frame; costs most
+    // Restore: Real-ESRGAN first on every presented frame; costs most
     // of a 1080p frame budget, the panel hint says so
     if (liveRestore) args.push('--restore');
-    // NVIDIA DLSS 5 (2026-09-12 live parity): Neural Rendering once per captured frame inside
+    // NVIDIA DLSS 5: Neural Rendering once per captured frame inside
     // the exe (SDR domain, before the model; the tweens inherit it); a session whose pass cannot
     // run goes on without it and logs why. Only sent when the runtime is installed (the
     // renderer gates on dlssnr-ready).
@@ -929,7 +927,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
         '--nr-style',
         String(liveNrStyle),
       );
-    // live TrueHDR (WO-8 Phase 4): SDR window expanded to HDR out, inherited from the RTX HDR
+    // live TrueHDR: SDR window expanded to HDR out, inherited from the RTX HDR
     // controls; the exe forwards these to the server only when its HDR live mode is on
     if (liveRtxHdr) {
       args.push('--rtx-hdr');
@@ -944,15 +942,14 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     args.push('--target', target);
   }
   const flow = Math.min(100, Math.max(1, Number(liveFlow) || 100));
-  // IMAGE scale (whole pipeline at reduced size, upscaled back); wire flag renamed from the
-  // historic --flow-scale 2026-08-28
+  // IMAGE scale (whole pipeline at reduced size, upscaled back)
   if (liveModel !== 'dlssg' && flow < 100) args.push('--scale', (flow / 100).toFixed(2));
   if (liveModel !== 'dlssg' && liveFit === 'fill') args.push('--fit', 'fill');
   if (liveFit === 'monitor') args.push('--fit', 'monitor'); // whole-screen: all models incl. dlssg
   if (!liveHud) args.push('--no-hud');
   else if (!liveHudLat) args.push('--no-hud-latency'); // meter on, latency segment hidden
-  // Every server backend runs inside smv-live.exe (its native host), the only live route since
-  // 2026-09-21; a session the host cannot run ends with its reason on the status line.
+  // Every server backend runs inside smv-live.exe (its native host), the only live route; a
+  // session the host cannot run ends with its reason on the status line.
   // resident host: every server backend has something worth keeping (the native engines); the
   // exe itself exits after a session it cannot stay resident for. SMV_LIVE_RESIDENT=0 restores
   // one process per session (A/B harness).
@@ -994,8 +991,8 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
       if (e && liveProc === p) {
         // hotkey mode (--fg) has no hwnd of its own: it learns the target from the exe's
         // "target window:" line, so a session that never printed one left the exit 4 / 6
-        // revive with nothing to revive (a GMFSS session died on a resize that way,
-        // 2026-09-16: the title carried an en dash and the line was dropped). The exe
+        // revive with nothing to revive (a GMFSS session died on a resize that way: the
+        // title carried an en dash and the line was dropped). The exe
         // repeats the resolved target on this line, so take it from there as the fallback.
         if (!liveResolved) {
           const h = /target=0x0*([0-9a-fA-F]+)/.exec(line);
@@ -1070,8 +1067,8 @@ ipcMain.handle('lv-list', () => {
 ipcMain.on('lv-start-fg', () => startLiveSession(null));
 // end the running session: "stop" on the resident host (it ends the session and stays), a
 // kill otherwise; the grace timer kills a host whose "ended" line never comes (the native
-// engine load polls the stop since 2026-09-16, a python-route cold build still lands it only
-// when the main loop starts, the kill keeps Stop instant). A stop already pending keeps its
+// engine load polls the stop; the kill keeps Stop instant for a stage that does not). A stop
+// already pending keeps its
 // timer: a hotkey pressed every 2 s used to re-arm the grace each time, so the kill never
 // fired and the panel sat on "loading the model" for the whole build.
 function liveEndSession() {
@@ -1425,12 +1422,12 @@ function engineArgs(opts: RunOpts): string[] {
     if (opts.model === 'rifedrba') args.push('--rife-drba'); // RIFE with DRBA anime-pacing timing
     if (opts.model === 'dlssg') args.push('--dlssg'); // "DLSS 4.5" (Frame Generation) backend instead of GMFSS
     if (opts.model === 'fruc') args.push('--fruc'); // "NVIDIA Smooth Motion" backend instead of GMFSS
-    if (opts.model === 'lsfg') args.push('--lsfg'); // Frame Blend: flow-warp interpolation (WO-19)
+    if (opts.model === 'lsfg') args.push('--lsfg'); // Frame Blend: flow-warp interpolation
     if (opts.model === 'nvof') args.push('--nvof'); // NVIDIA Optical Flow: hardware flow + splat, native host only
     if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
     // Scale slider (shared with Live): the whole pipeline runs at this fraction of the
-    // source size and the upscale pass restores the output size (image scale, replaced
-    // the flow-only semantics 2026-08-27 after the user's A/B). Omitted = full size.
+    // source size and the upscale pass restores the output size (image scale). Omitted = full
+    // size.
     if (opts.flowscale && opts.flowscale > 0 && opts.flowscale < 100)
       args.push('--scale', (opts.flowscale / 100).toFixed(2));
   }
@@ -1489,9 +1486,9 @@ function engineArgs(opts: RunOpts): string[] {
 
 // The engine's environment. PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from
 // crashing the engine during first-run TRT builds. The TRT cache deliberately gets NO override
-// here (user policy 2026-08-28): GUI and CLI runs share the one in-app cache next to the engine
-// (engine/trt_cache_safe_to_delete); the old AppData override split the caches, so GUI renders
-// rebuilt engines the CLI cache already had. SMV_LIVE_PREVIEW makes the render drop a small PNG
+// here: GUI and CLI runs share the one in-app cache next to the engine
+// (engine/trt_cache_safe_to_delete); a separate AppData cache would split them, so GUI renders
+// would rebuild engines the CLI cache already has. SMV_LIVE_PREVIEW makes the render drop a small PNG
 // of the frame being written about once a second; the renderer polls it for the live progress
 // thumbnail.
 function engineEnv(): NodeJS.ProcessEnv {
@@ -1563,7 +1560,7 @@ ipcMain.on('run', (e, opts: RunOpts) => {
   const args = engineArgs(opts);
   const env = engineEnv();
   clearPause(); // start unpaused: never inherit a stale flag from a previous (e.g. killed) run
-  // The render orchestrator is TypeScript (priority 24 step 6e): this Electron binary run as plain
+  // The render orchestrator is TypeScript: this Electron binary run as plain
   // node on dist/render/cli.js, which speaks render.py's stderr protocol and exit codes and runs
   // every render on the native host. SMV_ENGINE_DIR = the engine folder
   // (packaged: resources/engine, outside the asar the script is read from).
@@ -1667,7 +1664,7 @@ ipcMain.on('render-complete', (_e, body: string) => {
 
 // Before/after preview: render ONE source frame at the current spatial settings (RTX HDR when opts.hdr,
 // FSR/CAS sharpen when opts.sharpen > 0; no interpolation, no encode) and hand back the two PNG paths
-// for the renderer's side-by-side pane. render/preview.js (priority 24 step 7: the render's decode and
+// for the renderer's side-by-side pane. render/preview.js (the render's decode and
 // the native host's pass chain, no python) writes <prefix>_original.png and _processed.png; a
 // fixed prefix is reused each call (the renderer cache-busts its img src) so previews never pile up.
 // Resolves with { error } instead when the frame or the RTX bridge is unavailable.

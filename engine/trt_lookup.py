@@ -2,14 +2,13 @@
 ONNX paths, the JIT cache paths and the warm markers, used by onnx_export.py and trt_runtime.py
 (the size-free ONNX export) and by the harness gates.
 
-The native host (smv-live.exe) finds, builds and warms its own engines for live and, since
-2026-09-22, for the offline RIFE route (smv-live-native.inl: lkSession, lkOfflineRife); it
-reads the same names and the WARM MARKER (<jit cache>.warm, one "HxW" key per line) it writes
-after a warm-up. clear_warm drops that marker; the python runtime called it whenever it discarded
-a JIT cache file, until priority 27b removed that runtime (2026-09-24).
+The native host (smv-live.exe) finds, builds and warms its own engines for live and offline
+(smv-live-native.inl: lkSession, lkOfflineRife); it reads the same names and the WARM MARKER
+(<jit cache>.warm, one "HxW" key per line) it writes after a warm-up. clear_warm drops that
+marker.
 
-Never import torch here: a name lookup must not pay the torch import (the original caller,
-render.py's torch-free native route, was deleted in step 8; harness gates import it too). Nothing here
+Never import torch here: a name lookup must not pay the torch import (test harnesses import this
+module too). Nothing here
 writes to stdout. The naming and the hashes have a C++ twin in
 engine/live/build_src/smv-live-native.inl: a change to a name here needs the same change there.
 """
@@ -17,9 +16,9 @@ import hashlib
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# The folder NAME is the documentation (user policy 2026-08-28): everything in it is a rebuildable
-# compilation cache, nothing is ever auto-deleted, and the user reclaims the disk by deleting the
-# folder whenever they want. It lives inside the app's own folders, never under AppData.
+# The folder NAME is the documentation: everything in it is a rebuildable compilation cache (the
+# app empties it only when the engine stamp changes, src/render/cache.ts), and the user reclaims the
+# disk by deleting the folder whenever they want. It lives inside the app's own folders, never under AppData.
 CACHE_DIR = os.environ.get("SMV_TRT_CACHE") or os.path.join(HERE, "trt_cache_safe_to_delete")
 RTX_CACHE_KIND = os.environ.get("SMV_TRT_CACHE_KIND", "").strip()
 
@@ -73,9 +72,9 @@ def rife_weights_tag():
 
 def engine_name(name, shapes, input_names=None, dyn_batch=None):
     """Cache name of the engine the host builds for this sub net at these example shapes:
-    every input's shape, H and W pinned (one engine per resolution since 2026-09-12, the
-    dynamic-shape profiles are gone: their execution context reserved memory for the profile
-    MAXIMUM, 8 GB for a 960x540 live session, and their kernel cache grew with every size).
+    every input's shape, H and W pinned (one engine per resolution: a dynamic-shape profile's
+    execution context reserves memory for the profile MAXIMUM, 8 GB for a 960x540 live session,
+    and its kernel cache grows with every size).
     An input whose batch axis is dynamic (the live RIFE timestep stack, dyn_batch = {input:
     (min, opt, max)}) writes its range as "1to8" in place of the example batch, so no session's
     first group size leaks into the name and the fixed-batch classes can never collide."""
@@ -90,14 +89,14 @@ def engine_name(name, shapes, input_names=None, dyn_batch=None):
     return f"{name}_{'_'.join(parts)}_{trt_tag()}_{weights_tag()}"
 
 
-# Size-free ONNX graphs (2026-09-21): one file per live graph with every H /
+# Size-free ONNX graphs: one file per live graph with every H /
 # W symbolic, generated from the committed weights by scripts/export-onnx.js (npm setup and dist)
 # and on the first miss, gitignored, shipped in the release zip. An engine at a new size is then a
 # build from this file (about 1 s) instead of a torch export (20 to 40 s). ONNX_REV is bumped when
 # an export path changes the graph, so a stale file is never built from; weights_tags.txt carries
 # it too (`x <rev>`), and a changed tags file makes the app / CLI empty the engine cache once
-# (src/render/cache.ts), so no engine built from an older graph is reused (user 2026-09-25: a
-# speedup is worth the rebuild). MUST equal the host's kOnnxRev. Rev 2: the PRelu rewrite
+# (src/render/cache.ts), so no engine built from an older graph is reused. MUST equal the host's
+# kOnnxRev. Rev 2: the PRelu rewrite
 # (trt_runtime._fuse_prelu). Rev 3: RIFE IFNet / block0 take f0 / f1 in fp16
 # (trt_runtime._half_features).
 ONNX_DIR = os.environ.get("SMV_ONNX_DIR") or os.path.join(HERE, "onnx")

@@ -18,8 +18,7 @@ hdr10plus_tool, engine/live) report SKIP, not FAIL. The live cases drive
 engine/live/smv-live.exe against its --testsrc window (parked + --no-hud, nothing appears on
 screen) and assert the handshake, the zero-copy transports and the stats line shape. Exits
 nonzero if any case FAILs. Assertions are structural (frame counts, duration, metadata
-presence): TensorRT-RTX output is not run-to-run bit-stable, so there is no md5 case (the eager
-determinism case went with the python engine, priority 24 step 8).
+presence): TensorRT-RTX output is not run-to-run bit-stable, so there is no md5 case.
 """
 import argparse
 import json
@@ -153,7 +152,7 @@ def c_noint(tmp, trt):
 
 @case("--lsfg (Frame Blend) 2x -> 49 frames")
 def c_blend(tmp, trt):
-    # the flow-warp Frame Blend path (WO-19): RIFE's flow at the blend scale, full-resolution
+    # the flow-warp Frame Blend path: RIFE's flow at the blend scale, full-resolution
     # warps
     out = os.path.join(tmp, "s_blend.mp4")
     rc, err = render(SAMPLE, out, "--lsfg")
@@ -165,7 +164,7 @@ def c_blend(tmp, trt):
 
 @case("--nvof (NVIDIA Optical Flow) 2x -> 49 frames, native host, identical pair held")
 def c_nvof(tmp, trt):
-    # the NVIDIA Optical Flow model (2026-09-21): native host only, torch-free, no engines;
+    # the NVIDIA Optical Flow model: native host only, torch-free, no engines;
     # the sample's frames 0 and 1 are byte identical, so one pair must pass through held
     out = os.path.join(tmp, "s_nvof.mp4")
     rc, err = render(SAMPLE, out, "--nvof")
@@ -178,12 +177,11 @@ def c_nvof(tmp, trt):
     assert "static pairs held: 1" in err, "the identical head pair was not held"
 
 
-@case("--flow-scale is refused (the Flow scale control was dropped 2026-09-25)")
+@case("--flow-scale is refused (the Flow scale control is gone)")
 def c_rife_flow(tmp, trt):
-    # the Flow scale control ran the motion estimation smaller (RIFE 2026-09-14, GMFSS 5d); the
-    # user dropped it 2026-09-25 after GMFSS at 25 % wobbled static frames and lost small fast
-    # objects at 50 % (re-add: D:\AIStuff\smv-flowscale-removal\README.md). The flag must be
-    # refused, never silently ignored.
+    # the Flow scale control ran the motion estimation smaller; it was removed because GMFSS at
+    # 25 % wobbled static frames and lost small fast objects at 50 %. The flag must be refused,
+    # never silently ignored.
     out = os.path.join(tmp, "s_rife_flow.mp4")
     rc, err = render(SAMPLE, out, "--rife", "--flow-scale", "0.5")
     assert rc != 0, "a --flow-scale render must fail"
@@ -212,7 +210,7 @@ def c_vfr(tmp, trt):
 
 
 # --------------------------------------------------------------------------- --full extras
-@case("rife 2x -> 49 frames through the native offline host (WO-32)")
+@case("rife 2x -> 49 frames through the native offline host")
 def c_rife_native(tmp, trt):
     # the plain RIFE render runs inside smv-live.exe --offline
     out = os.path.join(tmp, "s_rife_native.mp4")
@@ -220,7 +218,7 @@ def c_rife_native(tmp, trt):
     assert rc == 0, "engine exit " + str(rc)
     assert frames(out) == 49, f"frames {frames(out)} != 49"
     assert "done 24 pairs (native host)" in err, "native host not used"
-    # the resident offline host (2026-09-12): the second render of the same size and
+    # the resident offline host: the second render of the same size and
     # multiplier must land on the host the first one left behind, engines reused
     assert "resident host on" in err, "first render did not use the resident offline host"
     rc, err = render(SAMPLE, out, "--rife")
@@ -254,7 +252,7 @@ def slices_per_frame(path):
     return total / firsts if firsts else 0
 
 
-@case("--enc-speed is refused (the Encoder speed selector was dropped 2026-09-25); --rife 2x -> 49 frames, ONE slice per frame (split-frame encoding stays off)")
+@case("--enc-speed is refused (the Encoder speed selector is gone); --rife 2x -> 49 frames, ONE slice per frame (split-frame encoding stays off)")
 def c_encsplit(tmp, trt):
     out = os.path.join(tmp, "s_encsplit.mp4")
     rc, err = render(SAMPLE, out, "--rife", "--enc-speed", "fast")
@@ -361,8 +359,8 @@ def _live_ticks(err):
     """The stats lines that actually captured frames (over 2 fps: the 60 fps testsrc reads
     30 or more, the static-hold refresh reads exactly 1.0). A tick at or near 0 captured fps
     is the testsrc window not being delivered by WGC (its start can come seconds late, and a
-    user alt-tabbing at the PC while the case runs covers it, seen 2026-09-15 with one frame
-    in the first tick and none after); such ticks say nothing about the route and are skipped."""
+    user alt-tabbing at the PC while the case runs covers it, e.g. one frame in the first tick
+    and none after); such ticks say nothing about the route and are skipped."""
     import re
     out = []
     for ln in err.splitlines():
@@ -400,7 +398,7 @@ def _live_session(backend, gen, seconds, ticks=3):
                     # `seconds` is a CAP, not a sleep: startup (engine load, JIT cache) eats
                     # ~20 s before the first stats tick and the first tick is the warm-up one
                     # (ratio 2.9, a drop), so we stop as soon as `ticks` stats lines exist.
-                    # Measured 2026-09-02: a flat 20 s sleep saw only the warm-up tick and
+                    # Measured: a flat 20 s sleep saw only the warm-up tick and
                     # failed the rife ratio; ticks 2..20 of a 60 s run were all 3.00 +- 0.05.
                     deadline = time.time() + seconds
                     while time.time() < deadline and lv.poll() is None:
@@ -430,7 +428,7 @@ def c_live_echo(tmp, trt):
     import re
     err = _live_session("echo", 1, 90, ticks=2)
     assert "LIVE READY" in err, "no LIVE READY handshake: " + err[-300:]
-    # the native host is the only live route (2026-09-21): its no-engine mode, answered by the
+    # the native host is the only live route: its no-engine mode, answered by the
     # host's own lookup
     assert "engine=none (effects only)" in err, "echo not on the native host: " + err[-300:]
     assert "no python process" in err, "the handoff started python: " + err[-300:]
@@ -467,7 +465,7 @@ def small_sample(tmp):
     timestamps, so the rate probe and the VFR case read it like the original), audio copied: every case costs
     about a quarter of the pixels while the frame count (25), the rate, the audio track and the
     byte-identical first pair (the static-hold cases) stay. 480p is the floor: TensorRT-RTX
-    below 480p needs the user's confirmation first (the 2026-09-05 TDR rule)."""
+    below 480p needs the user's confirmation first (a GPU TDR once followed such runs)."""
     out = os.path.join(tmp, "test_480.mp4")
     subprocess.run([FFMPEG, "-v", "error", "-y", "-i", SAMPLE, "-map", "0", "-vf", "scale=854:480",
                     "-c:v", "hevc_nvenc", "-tune", "lossless", "-pix_fmt", "yuv420p",

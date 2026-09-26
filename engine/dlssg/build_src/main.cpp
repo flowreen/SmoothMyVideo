@@ -508,7 +508,7 @@ struct Host
         // NOTE: do NOT tag kBufferTypeBackbuffer here, even with a null resource "just to silence
         // the extent warning": the tag flips sl.dlss_g into its subrect present path and the real
         // frame ends up in the native swap chain right behind the generated one, so the readback
-        // returns the REAL frame (tween == right endpoint, verified 2026-07-12). The extent
+        // returns the REAL frame (tween == right endpoint, verified). The extent
         // warning it would silence is benign and filtered in slLog instead.
         sl::ResourceTag tags[] = {
             sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &fullExtent),

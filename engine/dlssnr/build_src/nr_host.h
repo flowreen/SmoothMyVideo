@@ -1,13 +1,12 @@
 // nr_host.h - reusable DLSS 5 Neural Rendering core for SmoothMyVideo.
 //
 // Device-agnostic in the sense that the caller may hand in its own D3D12 device
-// (smv-live.exe, phase 2) or let the core create a private one (dlssnr.exe, the
-// offline pipe server). Everything DLSS 5 specific lives here; main.cpp is only
-// the pipe server around it.
+// (smv-live.exe) or let the core create a private one (dlssnr.exe, the offline
+// pipe server). Everything DLSS 5 specific lives here; main.cpp is only the pipe
+// server around it.
 //
 // Nothing here is copied from any third party host. The NGX call order, the
-// parameter key strings and feature id 18 are facts recorded in
-// D:\AIStuff\lossless-scaling-analysis\DLSS5-NR-HOST-FACTS.md.
+// parameter key strings and feature id 18 were established by probing the runtime.
 #pragma once
 
 #define WIN32_LEAN_AND_MEAN
@@ -30,8 +29,7 @@ const int kFeatureId = 18;
 // CreateFeature(18) refused.
 extern const char* const kProjectId;
 
-// Fixed internally, not exposed in the GUI (WO-21 user scope): only structure
-// and tone are user facing.
+// Fixed internally, not exposed in the GUI: only structure and tone are user facing.
 struct Settings
 {
     float structure = 1.0f;   // DLSSNR.LocalStructureStrength, 0..2
@@ -55,11 +53,11 @@ struct Variant
     bool initProjectId = true;
     // Argument order of the Init_ProjectID export, unverifiable from the public
     // headers: 0 = (.., device, featureInfo, version), 1 = (.., device, version, featureInfo).
-    int initArgOrder = 1;     // 1 is the order that survives Init_ProjectID on 616.56 (order 0 faults inside the core, probe 2026-09-03)
+    int initArgOrder = 1;     // 1 is the order that survives Init_ProjectID on 616.56 (order 0 faults inside the core)
     // true = CreateFeature / EvaluateFeature / ReleaseFeature resolved from the NR
     // snippet's OWN exports (it exports the whole NVSDK_NGX_D3D12_* API) after its
     // own Init_Ext; false = through the driver core, whose feature table on 616.56
-    // refuses id 18 before touching any snippet (NGX log 2026-09-03).
+    // refuses id 18 before touching any snippet (per the NGX log).
     bool viaSnippet = true;
 };
 
@@ -72,12 +70,12 @@ public:
     // device, init NGX, create feature 18 and the FP16 color/output textures.
     // Returns 0 on success, 2 when the runtime is missing or the GPU/driver does
     // not support it, 3 when CreateFeature(18) is refused. quietLog as in startupOn
-    // (smv-live.exe's offline host, priority 24 step 2d: the NGX chatter stays out of
+    // (smv-live.exe's offline host: the NGX chatter stays out of
     // the render log, dlssnr.py drops it the same way).
     int startup(uint32_t w, uint32_t h, const Settings& s, const Variant& v, std::string& err,
                 bool quietLog = false);
 
-    // Phase 2 (smv-live.exe, WO-42): the same bring-up on the CALLER's device and
+    // Hosted in smv-live.exe: the same bring-up on the CALLER's device and
     // queue. The host owns the Color / Output textures and a private command list
     // for CreateFeature; the caller records the per-frame work (see evaluateOn) on
     // its own lists and never touches CPU staging. quietLog = no NGX log callback
@@ -110,7 +108,7 @@ public:
     void ngxShutdown();  // the NGX-only teardown, called under SEH by shutdown()
 
     // Drop every reference WITHOUT any NGX call, for a host that leaves through ExitProcess:
-    // the NR snippet's release and shutdown chain faults (measured 2026-09-12 in smv-live.exe,
+    // the NR snippet's release and shutdown chain faults (measured in smv-live.exe,
     // "NGX teardown faulted" and then 0xC0000005 on the way out), and dlssnr.exe never calls it
     // either. The OS reclaims the session. A later shutdown() or the destructor is a no-op.
     void abandon();
