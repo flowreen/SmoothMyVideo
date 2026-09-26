@@ -99,7 +99,12 @@ RTX VSR / HDR and all three codecs.
   reused; engine names stay as they are. Rev 2: the export rewrites each
   PRelu into an exact LeakyRelu / Max form (`trt_runtime._fuse_prelu`), which TensorRT-RTX fuses
   into the conv before it (it runs PRelu as a separate kernel): Restore 1.30x, fusionnet 1.06x /
-  1.09x per call at 1080p / 4K, output bit-identical. Built from these files the engines are
+  1.09x per call at 1080p / 4K, output bit-identical. Rev 3: the RIFE IFNet and block0 graphs
+  take the feature encodes `f0` / `f1` in fp16 and widen them inside the graph
+  (`trt_runtime._half_features`), so the host feeds the encode engine's fp16 output as it is
+  instead of widening it with `k_h2f` (the host reads the dtype off the engine and refuses a
+  block0 or encode engine that does not match): live batched IFNet 1.02x per call at 1440p,
+  output bit-identical. Built from these files the engines are
   bit-identical to the per-size ones, except gmflow_bidir (its size-free branch, see the GMFlow
   bullet below).
   `SMV_ONNX_DIR` moves the folder.
@@ -262,8 +267,12 @@ Models (GMFSS is the default, the anime specialist):
   (`render_plan.nvof_refusal`), there is no python route. Identical pairs pass through held like
   every model. Quality: clean on moderate motion, ghosting where fast non-rigid motion defeats
   the vectors (record: SMV work order "Native NVOF model as a separate checkbox beside SVP";
-  kernels fp64-gated by the dev harness `nvof\warp\nvof_equiv.py` and `nvof_equiv_e.py`, the
-  product route checked against the harness by `product_vs_harness.py`). Plane order: the live
+  kernels gated against float64 references by the dev harness `nvof\warp\nvof_equiv.py` and
+  `nvof_equiv_e.py`, the
+  product route checked against the harness by `product_vs_harness.py`; the mask blur computes
+  its Gaussian weights once per block into shared memory, 8x faster at 1080p; all fp32 since
+  2026-09-26, the glue kernels 2.8x faster per tween and 10x per pair than in fp64, the tween
+  ~149 dB from the fp64 result, the luma rounded exactly like it). Plane order: the live
   planes are (B, G, R), the offline route's (R, G, B); the luma kernel is told which.
 * `--fruc` "NVIDIA Smooth Motion": NvOFFRUC on the Optical Flow hardware (Turing through
   Blackwell). Lower quality, ghosts on fast motion, inherent to the model. Needs `NvOFFRUC.dll` +
@@ -394,7 +403,8 @@ engine; a failure refuses the handoff), `engine=drba lag=1` on the ready line; t
 fast path finds it warm like the RIFE engines. The
 exe keeps a four-frame ring of padded frames and their encodes, builds the windows with block0
 plus four kernels (`k_drbaFlowSplat` / `k_drbaFlowNorm` = the rest of `calc_flow`,
-`k_drbaDrmSplat` / `k_drbaDrmNorm` = `calc_drm_rife(linear=True)`, fp64-gated), chains them like
+`k_drbaDrmSplat` / `k_drbaDrmNorm` = `calc_drm_rife(linear=True)`, gated against float64; fp32
+since 2026-09-26 with the hole test on the integer weight accumulator), chains them like
 the python class, runs one IFNet enqueue per tween with its own DRM timestep map, holds the lagged
 pair on an exact static test and reports the one-capture lag in the latency stat. A handoff
 without the block0 engine or `lag=1` is refused. `blend` is Frame Blend's live twin (the RIFE
@@ -761,6 +771,12 @@ RTX HDR takes only the identical session again (NGX is single-instance). The hos
 it keeps in the `live session ended` line (`engines`, `a running engine build`). The exe deserializes
 both engines, imports its own capture texture, fence and output ring into CUDA, JIT-builds five small
 kernels with NVRTC (cached as a cubin next to the TRT cache), and feeds the unchanged present loop.
+No kernel in that NVRTC block uses fp64 (2026-09-26; GeForce GPUs run it at a small fraction of the
+fp32 rate): accuracy that once needed double comes from integer tap maths (resampling centres and
+windows are ratios of the frame sizes), exact fp32 landing products (`land`: floor plus the fraction
+of an FMA-exact product, never an fp32 absolute coordinate) and hole / mask decisions read on the
+int64 accumulators; the header comment of the block lists them, and the `.f64` line count of its PTX
+must stay 0 (dev harness `p41\variant.py`).
 HDR and live RTX TrueHDR run natively too (the exe loads `engine/rtxvideo/rtxvideo_cuda.dll` by
 full path and drives the same C ABI `rtxvideo.py` uses). DLSS 5 runs natively too (on the capture
 texture, see the live DLSS 5 paragraph above). Sharpen and RTX VSR run natively too (2026-09-15):
@@ -776,8 +792,13 @@ kernel source compiled with cupy against torch bicubic + `rcas.py`: fit within 4
 one in 0.001% of bytes), the live gate `harness\eff\eff_native.py`. A downscaling fit (a window
 larger than the monitor in Fill screen) runs natively too (2026-09-15): `k_fitAaH` / `k_fitAaV` are
 torch's `interpolate(mode='bicubic', antialias=True)` as a separable pair into the staging frame
-(the PIL-style A = -0.5 kernel, support 2 x scale on a shrinking axis, window maths in double
-because an fp32 tap centre drifts 1e-4 at output index 2500), then the plain or the RCAS store
+(the PIL-style A = -0.5 kernel, support 2 x scale on a shrinking axis, window maths exact in
+integers, since the centre and every tap argument are ratios of the frame sizes, rounded once to
+fp32, because an fp32 tap centre drifts 1e-4 at output index 2500 (double until 2026-09-26, the
+integer form bit-identical to it); the window and the tap weights
+depend only on the output index, so each block computes them once into shared memory, and the
+bicubic slot fit, the Restore fold and `k_nvofUp` do the same with their taps: about 3.5x faster
+than per pixel), then the plain or the RCAS store
 1:1 from that frame; the log lines are `native: fit: WxH -> WxH, antialiased bicubic (downscale)`
 and `fit=native-aa`; gate `harness\eff\fitaa_equiv.py` (within 1e-6 of the fp64 filter; torch's
 own fp32 route sits up to 1.2e-4 from it) and the `fitdown_*` cases of `eff_native.py`. Upscale to
@@ -829,8 +850,9 @@ the other). Sub-step 5b added the glue kernels to the host's
 NVRTC block (the 5c chain below launches them):
 `k_half` (the 2x2 box halves of both frames as adjacent planes), `k_pyr` (the per-pair flow and metric
 pyramids at 1/2 and 1/4), `k_splatSoft` (softsplat.py's int64 fixed-point forward with the 'soft'
-mode's `exp(s * Z)` products formed on the fly in fp32; the target position and the corner weights in
-double, since the fp32 `x + s * flow` python forms is one ulp = 6e-5 px off at x ~ 600..960; since
+mode's `exp(s * Z)` products formed on the fly in fp32; the target cell and the corner weights from
+`land` (double until 2026-09-26), since the fp32 `x + s * flow` python forms is one ulp = 6e-5 px off
+at x ~ 600..960; since
 2026-09-26 products bound for the same target pixel are summed across neighbouring threads, a warp
 shuffle along the row and shared memory down the 32 x 8 block, before one int64 atomic, which keeps
 the accumulators bit-identical and cut the feature splats ~20 %, gate `harness\p36\splat_bench.py`) and

@@ -1602,10 +1602,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nvinfer1::Dims4 din{ 1, 3, nr.ph, nr.pw };
             if (!nr.ctxEnc->setInputShape("img", din)) { io.setFail("encode setInputShape rejected"); failed = true; break; }
             nr.ctxEnc->setTensorAddress("img", dCur);
-            void* encOut = nr.encHalf ? (void*)nr.dEncHalf : (void*)nr.dF[nr.fCur];
+            // fp16 features (ONNX rev 3): the encode writes dF directly, no widen pass
+            const bool widen = nr.encHalf && !nr.featHalf;
+            void* encOut = widen ? (void*)nr.dEncHalf : (void*)nr.dF[nr.fCur];
             nr.ctxEnc->setTensorAddress("feat", encOut);
             if (!nr.ctxEnc->enqueueV3(st)) { io.setFail("encode enqueueV3 returned false"); failed = true; break; }
-            if (nr.encHalf)
+            if (widen)
             {
                 int n = (int)(16 * plane);
                 void* a[] = { &nr.dEncHalf, &nr.dF[nr.fCur], &n };

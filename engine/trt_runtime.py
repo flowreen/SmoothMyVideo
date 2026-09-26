@@ -124,6 +124,36 @@ def _fuse_prelu(onnx_path):
     onnx.checker.check_model(onnx_path)   # by path: the external data resolves beside the file
 
 
+def _half_features(onnx_path, name):
+    """RIFE IFNet / block0: take the feature encodes f0 / f1 as fp16 inputs and widen them inside
+    the graph. The encode engine outputs fp16, so the host used to widen it to fp32 (k_h2f) only
+    for the engine to read it back; fp16 -> fp32 is exact, so the graph sees the same values and
+    the engines give bit-identical output (priority 30 lever 5a, D:\\AIStuff\\smv-live\\harness\\p37:
+    the live batched IFNet at 1472x2560 1.020x, plus the host's widen pass). Graph only."""
+    import onnx
+    from onnx import helper, TensorProto
+
+    if not name.startswith(("rife_ifnet_", "rife_block0_")):
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    feats = [i for i in g.graph.input if i.name in ("f0", "f1")]
+    if len(feats) != 2 or any(i.type.tensor_type.elem_type != TensorProto.FLOAT for i in feats):
+        raise RuntimeError(f"{name}: expected fp32 inputs f0 / f1")
+    for inp in feats:
+        wide = inp.name + "_f32"
+        for nd in g.graph.node:
+            for k, x in enumerate(nd.input):
+                if x == inp.name:
+                    nd.input[k] = wide
+        g.graph.node.insert(0, helper.make_node("Cast", [inp.name], [wide], to=TensorProto.FLOAT,
+                                                name=inp.name + "_widen"))
+        inp.type.tensor_type.elem_type = TensorProto.FLOAT16
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
 # --- size-free ONNX (2026-09-21) ----------------------------------------------------------------
 # The graphs below export ONCE with H / W symbolic (trt_lookup.onnx_path), and every engine size is
 # built from that file, pinned to the example shape exactly like a per-size export (one engine per
@@ -228,6 +258,7 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
             if any(not isinstance(dims[a], str) or not dims[a] for a in d):
                 raise RuntimeError(f"exporter specialized an axis of {n}: {dims}")
         _fuse_prelu(tmp)
+        _half_features(tmp, name)
         if os.path.isfile(tmp + ".data"):
             os.replace(tmp + ".data", path + ".data")
         os.replace(tmp, path)

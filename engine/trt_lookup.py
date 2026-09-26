@@ -98,9 +98,10 @@ def engine_name(name, shapes, input_names=None, dyn_batch=None):
 # it too (`x <rev>`), and a changed tags file makes the app / CLI empty the engine cache once
 # (src/render/cache.ts), so no engine built from an older graph is reused (user 2026-09-25: a
 # speedup is worth the rebuild). MUST equal the host's kOnnxRev. Rev 2: the PRelu rewrite
-# (trt_runtime._fuse_prelu).
+# (trt_runtime._fuse_prelu). Rev 3: RIFE IFNet / block0 take f0 / f1 in fp16
+# (trt_runtime._half_features).
 ONNX_DIR = os.environ.get("SMV_ONNX_DIR") or os.path.join(HERE, "onnx")
-ONNX_REV = 2
+ONNX_REV = 3
 
 
 def onnx_path(key):

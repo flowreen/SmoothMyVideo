@@ -66,6 +66,44 @@ __device__ __forceinline__ float cc2(float x, float A)
     return ((A * x - 5.0f * A) * x + 8.0f * A) * x - 4.0f * A;
 }
 
+// ---- no fp64 in these kernels (2026-09-26, priority 30, user order "drop fp64"; consumer GPUs
+// run fp64 at a small fraction of fp32). Where the fp64 era needed double for accuracy, fp32
+// keeps it by construction: tap centres are integer ratios (outTap, aaWindow, nvUpTap), a
+// landing point is the pixel plus the floor and the exact fraction of its offset (land, nvAxis),
+// a hole or mask decision reads the integer accumulator (DRBA_HOLE, k_velNorm), and the one
+// rounding that feeds a discontinuous consumer (k_nvofLuma -> the Optical Flow Accelerator)
+// carries its error in a second float.
+// a * b = p + e and a + b = s + e EXACTLY in fp32 (FMA TwoProduct, Knuth TwoSum; the _rn
+// intrinsics keep the compiler from contracting the rounded product or sum into an FMA)
+__device__ __forceinline__ void ffMul(float a, float b, float& p, float& e)
+{
+    p = __fmul_rn(a, b);
+    e = fmaf(a, b, -p);
+}
+__device__ __forceinline__ void ffAdd(float a, float b, float& s, float& e)
+{
+    s = __fadd_rn(a, b);
+    const float bb = __fsub_rn(s, a);
+    e = __fadd_rn(__fsub_rn(a, __fsub_rn(s, bb)), __fsub_rn(b, bb));
+}
+// the landing of pixel x moved by a * b px: the cell n and the bilinear fraction l in [0, 1],
+// from the EXACT product p + e: n = x + floor(p), l = (p - floor(p)) + e (p - floor(p) is exact
+// outside (-1, 0), within 6e-8 inside), so l is within one fp32 ulp of the fp64 form's x + a * b;
+// an fp32 x + a * b carries one ulp of x (1.2e-4 px at x ~ 2000) and the rounded product alone
+// 1.7e-5 px at 280 px, which DRBA's timestep map read as 1e-4 (harness\p41). false (and no
+// landing) for a product of 1e8 px or more or a non-finite one.
+__device__ __forceinline__ bool land(int x, float a, float b, int& n, float& l)
+{
+    float p, e;
+    ffMul(a, b, p, e);
+    if (!(fabsf(p) < 1e8f)) { n = 0; l = 0.0f; return false; }
+    const float fl = floorf(p);
+    n = x + (int)fl;
+    l = (p - fl) + e;
+    if (l < 0.0f) { l += 1.0f; n--; }
+    return true;
+}
+
 // scale == 1.0 fast path: BGRA8 -> planar float [0,1], replicate-padded to (ph, pw).
 __global__ void k_packInDirect(const unsigned char* __restrict__ src, int cw, int ch,
                                float* __restrict__ dst, int ph, int pw, int planeStride)
@@ -258,9 +296,42 @@ __global__ void k_h2f(const unsigned short* __restrict__ src, float* __restrict_
 // model size, else upscale (bicubic, torch's align_corners=false form, A = -0.75, edges
 // clamped). The SDR and HDR slot packers below share this sampler and differ only in the
 // store.
+// One axis's tap, EXACT in integers (2026-09-26, no fp64 in the kernels, user order): the centre
+// in / out * (o + 0.5) - 0.5 = ((2o + 1) in - out) / (2 out), so the cell is an integer floor
+// division and the fraction is rounded ONCE to fp32. torch's fp32 kernel computes scale * (o +
+// 0.5) - 0.5 in float and drifts 1e-4 from its own fp64 result by output index 2500 (2026-09-15,
+// Upscale to gate); the integer form tracks the filter like the double form it replaced, which
+// rounded the same fraction to fp32 once.
+__device__ __forceinline__ void outTap(int o, int in, int out, int& i, float& t)
+{
+    const long long num = (2LL * o + 1) * in - out, den = 2LL * out;
+    long long q = num / den, rem = num - q * den;
+    if (rem < 0) { q--; rem += den; }   // floor: the numerator is negative at o = 0 when enlarging
+    i = (int)q;
+    t = (float)rem / (float)den;
+}
+
+// The taps depend on ox alone (x) or oy alone (y), so each block computes them ONCE (2026-09-26,
+// priority 30 lever 10): lane t fills column t and row t of the block with outTap, the pixels
+// read them (the per-pixel form of the fp64 era cost a double divide per pixel, 0.33 ms per
+// 2560x1440 slot, harness\p38). false = the 1:1 copy or a block side above kOutSide (the
+// per-pixel form).
+#define kOutSide 32
+struct OutTab { int ix[kOutSide], iy[kOutSide]; float tx[kOutSide], ty[kOutSide]; };
+__device__ __forceinline__ bool outTabFill(OutTab& T, int w, int h, int dw, int dh)
+{
+    if ((dw == w && dh == h) || blockDim.x > kOutSide || blockDim.y > kOutSide) return false;
+    const int t = threadIdx.y * blockDim.x + threadIdx.x;
+    if (t < blockDim.x) outTap(blockIdx.x * blockDim.x + t, w, dw, T.ix[t], T.tx[t]);
+    if (t < blockDim.y) outTap(blockIdx.y * blockDim.y + t, h, dh, T.iy[t], T.ty[t]);
+    __syncthreads();
+    return true;
+}
+
+// T = the block's filled table, or nullptr for the per-pixel taps
 __device__ __forceinline__ void sampleOut(const float* __restrict__ src, int planeStride,
                                           int rowStride, int w, int h, int ox, int oy,
-                                          int dw, int dh, float c[3])
+                                          int dw, int dh, const OutTab* T, float c[3])
 {
     if (dw == w && dh == h)
     {
@@ -270,15 +341,18 @@ __device__ __forceinline__ void sampleOut(const float* __restrict__ src, int pla
         c[2] = src[2 * planeStride + o];
         return;
     }
-    // the tap centre in DOUBLE (2026-09-15, Upscale to gate): torch's fp32 kernel computes
-    // scale * (o + 0.5) - 0.5 in float and drifts 1e-4 from its own fp64 result by output
-    // index 2500, so an fp32 centre here tracked the fp32 drift, not the filter; same rule as
-    // aaWindow below, two double ops per pixel
-    const double rx = (double)w / (double)dw * (ox + 0.5) - 0.5;
-    const double ry = (double)h / (double)dh * (oy + 0.5) - 0.5;
-    const double fxd = floor(rx), fyd = floor(ry);
-    const float tx = (float)(rx - fxd), ty = (float)(ry - fyd);
-    const int ix = (int)fxd, iy = (int)fyd;
+    int ix, iy;
+    float tx, ty;
+    if (T)
+    {
+        ix = T->ix[threadIdx.x]; tx = T->tx[threadIdx.x];
+        iy = T->iy[threadIdx.y]; ty = T->ty[threadIdx.y];
+    }
+    else
+    {
+        outTap(ox, w, dw, ix, tx);
+        outTap(oy, h, dh, iy, ty);
+    }
     const float A = -0.75f;
     float wx[4], wy[4];
     wx[0] = cc2(tx + 1.0f, A); wx[1] = cc1(tx, A);
@@ -312,11 +386,13 @@ __global__ void k_packOut(const float* __restrict__ src, int planeStride, int ro
                           int w, int h, unsigned char* __restrict__ dst, int pitch,
                           int x0, int y0, int dw, int dh)
 {
+    __shared__ OutTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool tab = outTabFill(T, w, h, dw, dh);
     if (ox >= dw || oy >= dh) return;
     float c[3];
-    sampleOut(src, planeStride, rowStride, w, h, ox, oy, dw, dh, c);
+    sampleOut(src, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
     unsigned char* p = dst + (size_t)(y0 + oy) * pitch + (size_t)(x0 + ox) * 4;
     for (int ci = 0; ci < 3; ci++)
     {
@@ -333,11 +409,13 @@ __global__ void k_packOutHdr(const float* __restrict__ src, int planeStride, int
                              int w, int h, unsigned char* __restrict__ dst, int pitch,
                              int x0, int y0, int dw, int dh)
 {
+    __shared__ OutTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool tab = outTabFill(T, w, h, dw, dh);
     if (ox >= dw || oy >= dh) return;
     float c[3];
-    sampleOut(src, planeStride, rowStride, w, h, ox, oy, dw, dh, c);
+    sampleOut(src, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
     unsigned int q[3];
     for (int ci = 0; ci < 3; ci++)
     {
@@ -443,11 +521,13 @@ __global__ void k_unpackRgba(const unsigned char* __restrict__ src, int dw, int 
 __global__ void k_fitPlanar(const float* __restrict__ src, int planeStride, int rowStride,
                             int w, int h, float* __restrict__ dst, int dw, int dh)
 {
+    __shared__ OutTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool tab = outTabFill(T, w, h, dw, dh);
     if (ox >= dw || oy >= dh) return;
     float c[3];
-    sampleOut(src, planeStride, rowStride, w, h, ox, oy, dw, dh, c);
+    sampleOut(src, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
     const size_t plane = (size_t)dw * dh;
     const size_t o = (size_t)oy * dw + ox;
     dst[o] = c[0];
@@ -471,38 +551,76 @@ __device__ __forceinline__ float bcaa(float x)
     return 0.0f;
 }
 
-// one axis: the tap window [mn, mx) of output index o, its centre and the tap rescale. In
-// DOUBLE: an fp32 centre at output index 2500 carries a 1e-4 error, which is exactly how far
-// torch's own fp32 CUDA kernel drifts from its fp64 result on a near-1:1 fit (2576 -> 2560:
-// 6.9e-5, 2026-09-15 probe); this pair tracks the exact filter instead, a few double ops per
-// tap against the memory traffic.
-__device__ __forceinline__ void aaWindow(int o, int in, int out, double& center, double& inv,
-                                         int& mn, int& mx)
+// one axis: the tap window [mn, mx) of output index o, EXACT in integers (2026-09-26, no fp64 in
+// the kernels): with scale = in / out, the centre in (2o + 1) / (2 out) and the window ends
+// centre -+ support + 0.5 (support 2 scale shrinking, 2 enlarging) are ratios over 2 out, and
+// every tap argument (j - centre + 0.5) / max(scale, 1) = ((2j + 1) out - (2o + 1) in) /
+// (2 max(in, out)) is one ratio of integers rounded ONCE to fp32 (aaArg). An fp32 centre at
+// output index 2500 carries a 1e-4 error, exactly how far torch's own fp32 CUDA kernel drifts
+// from its fp64 result on a near-1:1 fit (2576 -> 2560: 6.9e-5, 2026-09-15 probe); the integer
+// form tracks the exact filter like the double form it replaced.
+__device__ __forceinline__ void aaWindow(int o, int in, int out, int& mn, int& mx)
 {
-    const double scale = (double)in / (double)out;
-    const double support = scale >= 1.0 ? 2.0 * scale : 2.0;
-    inv = scale >= 1.0 ? 1.0 / scale : 1.0;
-    center = scale * (o + 0.5);
-    mn = (int)(center - support + 0.5);
-    if (mn < 0) mn = 0;
-    mx = (int)(center + support + 0.5);
+    const long long c2 = (2LL * o + 1) * in, den = 2LL * out;
+    const long long s2 = in >= out ? 4LL * in : 4LL * out;   // support * 2 out
+    const long long lo = c2 - s2 + out, hi = c2 + s2 + out;  // (centre -+ support + 0.5) * 2 out
+    mn = lo > 0 ? (int)(lo / den) : 0;
+    mx = (int)(hi / den);
     if (mx > in) mx = in;
+}
+__device__ __forceinline__ float aaArg(int j, int o, int in, int out)
+{
+    return (float)((2LL * j + 1) * out - (2LL * o + 1) * in) / (float)(2 * (in >= out ? in : out));
+}
+
+// The window and the tap weights depend on the output index alone, so each block computes them
+// ONCE (2026-09-26, priority 30 lever 10): lane t of the block runs aaWindow and the weight
+// expression of the per-pixel loop for output index o0 + t (column t of an H pass, row t of a V
+// pass) into shared memory, the pixels read them (the per-pixel form of the fp64 era spent a
+// double divide per pixel and three double ops per tap, 0.66 ms of a 4K -> 1080p Restore fold's
+// H pass, harness\p38). aaTabOk false (a shrink beyond ~15x, or a block side above kAaSide) =
+// the per-pixel form.
+#define kAaSide 32
+#define kAaMaxTaps 64
+struct AaTab { float wt[kAaSide * kAaMaxTaps]; int mn[kAaSide], mx[kAaSide]; };
+__device__ __forceinline__ bool aaTabOk(int in, int out, int side)
+{
+    // mx - mn <= 2 * support + 1: 4 * in / out + 1 when shrinking, 5 when enlarging
+    return side <= kAaSide && (in <= out || 4LL * in <= (long long)(kAaMaxTaps - 2) * out);
+}
+__device__ __forceinline__ void aaTabFill(AaTab& T, int o0, int side, int in, int out)
+{
+    const int t = threadIdx.y * blockDim.x + threadIdx.x;
+    if (t < side && o0 + t < out)
+    {
+        int mn, mx;
+        aaWindow(o0 + t, in, out, mn, mx);
+        T.mn[t] = mn;
+        T.mx[t] = mx;
+        for (int j = mn; j < mx; j++)
+            T.wt[t * kAaMaxTaps + (j - mn)] = bcaa(aaArg(j, o0 + t, in, out));
+    }
+    __syncthreads();
 }
 
 // horizontal pass: the model pad cropped to (w, h) -> tmp (3, h, dw)
 __global__ void k_fitAaH(const float* __restrict__ src, int planeStride, int rowStride,
                          int w, int h, float* __restrict__ tmp, int dw)
 {
+    __shared__ AaTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool tab = aaTabOk(w, dw, blockDim.x);
+    if (tab) aaTabFill(T, blockIdx.x * blockDim.x, blockDim.x, w, dw);
     if (ox >= dw || y >= h) return;
-    double center, inv;
     int mn, mx;
-    aaWindow(ox, w, dw, center, inv, mn, mx);
+    if (tab) { mn = T.mn[threadIdx.x]; mx = T.mx[threadIdx.x]; }
+    else aaWindow(ox, w, dw, mn, mx);
+    const float* tw = T.wt + threadIdx.x * kAaMaxTaps;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, wsum = 0.0f;
     for (int j = mn; j < mx; j++)
     {
-        const float wt = bcaa((float)((j - center + 0.5) * inv));
+        const float wt = tab ? tw[j - mn] : bcaa(aaArg(j, ox, w, dw));
         const size_t o = (size_t)y * rowStride + j;
         a0 += wt * src[o];
         a1 += wt * src[planeStride + o];
@@ -521,17 +639,21 @@ __global__ void k_fitAaH(const float* __restrict__ src, int planeStride, int row
 __global__ void k_fitAaV(const float* __restrict__ tmp, int dw, int h,
                          float* __restrict__ dst, int dh)
 {
+    __shared__ AaTab T;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool tab = aaTabOk(h, dh, blockDim.y);
+    if (tab) aaTabFill(T, blockIdx.y * blockDim.y, blockDim.y, h, dh);
     if (x >= dw || oy >= dh) return;
-    double center, inv;
     int mn, mx;
-    aaWindow(oy, h, dh, center, inv, mn, mx);
+    if (tab) { mn = T.mn[threadIdx.y]; mx = T.mx[threadIdx.y]; }
+    else aaWindow(oy, h, dh, mn, mx);
+    const float* tw = T.wt + threadIdx.y * kAaMaxTaps;
     const size_t splane = (size_t)h * dw;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, wsum = 0.0f;
     for (int j = mn; j < mx; j++)
     {
-        const float wt = bcaa((float)((j - center + 0.5) * inv));
+        const float wt = tab ? tw[j - mn] : bcaa(aaArg(j, oy, h, dh));
         const size_t o = (size_t)j * dw + x;
         a0 += wt * tmp[o];
         a1 += wt * tmp[splane + o];
@@ -583,16 +705,20 @@ __global__ void k_restIn(const float* __restrict__ src, int planeStride, int row
 __global__ void k_restFoldH(const void* __restrict__ src, int half, int planeStride, int rowStride,
                             int w, int h, float* __restrict__ tmp, int dw)
 {
+    __shared__ AaTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool tab = aaTabOk(w, dw, blockDim.x);
+    if (tab) aaTabFill(T, blockIdx.x * blockDim.x, blockDim.x, w, dw);
     if (ox >= dw || y >= h) return;
-    double center, inv;
     int mn, mx;
-    aaWindow(ox, w, dw, center, inv, mn, mx);
+    if (tab) { mn = T.mn[threadIdx.x]; mx = T.mx[threadIdx.x]; }
+    else aaWindow(ox, w, dw, mn, mx);
+    const float* tw = T.wt + threadIdx.x * kAaMaxTaps;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, wsum = 0.0f;
     for (int j = mn; j < mx; j++)
     {
-        const float wt = bcaa((float)((j - center + 0.5) * inv));
+        const float wt = tab ? tw[j - mn] : bcaa(aaArg(j, ox, w, dw));
         const size_t o = (size_t)y * rowStride + j;
         a0 += wt * restTap(src, half, o);
         a1 += wt * restTap(src, half, planeStride + o);
@@ -611,17 +737,21 @@ __global__ void k_restFoldH(const void* __restrict__ src, int half, int planeStr
 __global__ void k_restFoldV(const float* __restrict__ tmp, int dw, int h,
                             float* __restrict__ dst, int dh)
 {
+    __shared__ AaTab T;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool tab = aaTabOk(h, dh, blockDim.y);
+    if (tab) aaTabFill(T, blockIdx.y * blockDim.y, blockDim.y, h, dh);
     if (x >= dw || oy >= dh) return;
-    double center, inv;
     int mn, mx;
-    aaWindow(oy, h, dh, center, inv, mn, mx);
+    if (tab) { mn = T.mn[threadIdx.y]; mx = T.mx[threadIdx.y]; }
+    else aaWindow(oy, h, dh, mn, mx);
+    const float* tw = T.wt + threadIdx.y * kAaMaxTaps;
     const size_t splane = (size_t)h * dw;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, wsum = 0.0f;
     for (int j = mn; j < mx; j++)
     {
-        const float wt = bcaa((float)((j - center + 0.5) * inv));
+        const float wt = tab ? tw[j - mn] : bcaa(aaArg(j, oy, h, dh));
         const size_t o = (size_t)j * dw + x;
         a0 += wt * tmp[o];
         a1 += wt * tmp[splane + o];
@@ -702,11 +832,12 @@ __global__ void k_clamp01(float* __restrict__ p, int n)
 //               'soft' mode's cat(in * exp(Z), exp(Z)) computed on the fly in fp32: Z = s *
 //               metric, the flow = s * flow, s = t for the 0 -> 1 splat, 1 - t for the 1 -> 0
 //               splat. Same four corner weights, same `llrintf(v * w * 2^26)` product order,
-//               same int64 atomics; the position and the weights are formed in double (below),
-//               so the accumulators match python's kernel bit for bit only where the position
-//               is exactly representable (the harness's quantized-flow control) and sit nearer
-//               the exact splat than python everywhere else; python also takes exp and the
-//               product in fp16 under autocast (~1e-3 off fp64), this kernel in fp32.
+//               same int64 atomics; the cell and the weights come from the offset s * flow
+//               (floor + exact fraction, below), so the accumulators match python's kernel bit
+//               for bit only where the position is exactly representable (the harness's
+//               quantized-flow control) and sit nearer the exact splat than python's fp32
+//               `x + s * flow` everywhere else; python also takes exp and the product in fp16
+//               under autocast (~1e-3 off fp64), this kernel in fp32.
 //   k_splatNorm python's tail: acc.to(float32) * 2^-26 per plane, out = v / (vN + 1e-7),
 //               written as C planes of the target (the fusionnet input planes: a channel concat
 //               is adjacent planes, so no cat).
@@ -785,23 +916,20 @@ __global__ void k_splatSoft(const void* __restrict__ in, int inHalf, int C,
     const size_t plane = (size_t)w * h;
     bool act = x < w && y < h;
     const size_t o = act ? (size_t)y * w + x : 0;
-    // the target position and the four corner weights in DOUBLE: python's fp32 `x + s * flow`
-    // carries a 6e-5 px error at x ~ 600..960 (one fp32 ulp), which the harness measured as
-    // up to 8.7e-4 of the normalized output where the weight sum is small; the double position
-    // tracks the exact splat and the weights round once to fp32 for the fixed-point product
-    // (third occurrence of the tap-centre lesson, 2026-09-15)
-    double fx = 0.0, fy = 0.0;
+    // the target cell and the corner weights from land(), never an fp32 absolute position:
+    // python's fp32 `x + s * flow` carries a 6e-5 px error at x ~ 600..960 (one fp32 ulp), which
+    // the harness measured as up to 8.7e-4 of the normalized output where the weight sum is small
+    // (2026-09-15)
+    int nwX = 0, nwY = 0;
+    float dx = 0.0f, dy = 0.0f;
     if (act)
     {
-        fx = (double)x + (double)s * (double)flow[o];
-        fy = (double)y + (double)s * (double)flow[plane + o];
-        act = isfinite(fx) && isfinite(fy);
+        act = land(x, s, flow[o], nwX, dx) && land(y, s, flow[plane + o], nwY, dy);
+        if (!act) { nwX = 0; nwY = 0; dx = 0.0f; dy = 0.0f; }
     }
     const float e = act ? expf(__fmul_rn(s, gmTap(metric, metricHalf, o))) : 0.0f;
-    const int nwX = act ? (int)floor(fx) : 0, nwY = act ? (int)floor(fy) : 0;
-    const double dx = fx - (double)nwX, dy = fy - (double)nwY;
-    const float wNW = (float)((1.0 - dx) * (1.0 - dy)), wNE = (float)(dx * (1.0 - dy));
-    const float wSW = (float)((1.0 - dx) * dy), wSE = (float)(dx * dy);
+    const float wNW = (1.0f - dx) * (1.0f - dy), wNE = dx * (1.0f - dy);
+    const float wSW = (1.0f - dx) * dy, wSE = dx * dy;
     const bool okW = act && nwX >= 0 && nwX < w, okE = act && nwX + 1 >= 0 && nwX + 1 < w;
     const bool okN = nwY >= 0 && nwY < h, okS = nwY + 1 >= 0 && nwY + 1 < h;
     const long long oNW = (long long)nwY * w + nwX;   // only dereferenced behind the ok flags
@@ -1227,12 +1355,13 @@ __global__ void k_pqLut(float* __restrict__ dst)
 // _measure_light in raw mode). Per frame: hist[1024] = the maxRGB 10-bit code histogram (DV L1,
 // HDR10+ percentiles and average), misc[0..2] = the per-channel max code (HDR10+ MaxScl),
 // misc[3] = the float bits of the brightest maxRGB value (never negative, so the bits order like
-// the floats) and vSum its sum: the corrected linear maxRGB in vivid / rtx (MaxCLL / MaxFALL
-// = * 10000), the maxRGB nits in raw. The block stages the histogram in shared memory.
+// the floats) and vSum its sum (int64, 2^24 fixed point): the corrected linear maxRGB in vivid /
+// rtx (MaxCLL / MaxFALL = * 10000), the maxRGB nits in raw. The block stages the histogram in
+// shared memory.
 __global__ void k_thdrOut(const unsigned int* __restrict__ thdrOut, const float* __restrict__ srcG,
                           int dw, int dh, int mode, float vib, float sb, unsigned int* __restrict__ dst,
                           unsigned int* __restrict__ hist, unsigned int* __restrict__ misc,
-                          double* __restrict__ vSum)
+                          unsigned long long* __restrict__ vSum)
 {
     __shared__ unsigned int sh[1024];
     __shared__ unsigned int shMax[4];
@@ -1243,7 +1372,8 @@ __global__ void k_thdrOut(const unsigned int* __restrict__ thdrOut, const float*
     __syncthreads();
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    double vv = 0.0;
+    long long vv = 0;   // vSum in 2^24 fixed point (no fp64; integer adds are order-free, so the
+                        // sum is deterministic): nits <= 10000 in raw mode, 8K frame < 2^63
     if (x < dw && y < dh)
     {
         const size_t plane = (size_t)dh * dw;
@@ -1279,10 +1409,10 @@ __global__ void k_thdrOut(const unsigned int* __restrict__ thdrOut, const float*
         atomicMax(&shMax[1], q[1]);
         atomicMax(&shMax[2], q[2]);
         atomicMax(&shMax[3], __float_as_uint(val));
-        vv = (double)val;
+        vv = llrintf(val * 16777216.0f);
     }
     for (int off = 16; off > 0; off >>= 1) vv += __shfl_down_sync(0xffffffffu, vv, off);
-    if ((tid & 31) == 0 && vv != 0.0) atomicAdd(vSum, vv);
+    if ((tid & 31) == 0 && vv != 0) atomicAdd(vSum, (unsigned long long)vv);
     __syncthreads();
     for (int i = tid; i < 1024; i += nt)
         if (sh[i]) atomicAdd(&hist[i], sh[i]);
@@ -1377,38 +1507,57 @@ __global__ void k_packOutRaw8(const float* __restrict__ src, int planeStride, in
 // fp32 planes addressed by (planeStride, rowStride) like the host's padded model planes, a flow
 // or metric plane is contiguous (w, h).
 //   k_nvofLuma      the model planes (0..1) -> GRAYSCALE8 NVOF input, BT.709 luma, x255,
-//                   rounded half to even, in double (so the fp64 reference matches exactly).
+//                   rounded half to even.
 //   k_nvofUp        one direction: the interleaved short2 field (raw / 32 = input px, NO rescale)
 //                   and its uint8 cost, bilinear from the cell grid to (w, h). Source index from
 //                   the GRID, (x + 0.5) / grid - 0.5 (a cell covers grid x grid px), clamped at 0,
-//                   the far tap held at the last cell, like k_flowUp; centre and lambdas DOUBLE.
+//                   the far tap held at the last cell, like k_flowUp; the taps exact in integers.
 //   k_nvofMetric    Z = -a * cost - b * |F(x) + G(x + F(x))|, G = the other direction sampled
 //                   bilinear at the landing point (border clamped): forward-backward consistency,
-//                   large where the pixel is occluded in the other frame. Position in double.
-//   k_splatNvof     k_splatSoft with the flow scale and the weight split: position x + s * F in
-//                   double, e = expf(Z + bias) (bias = log of the time weight, 1 - t for frame 0,
-//                   t for frame 1), the same four corner weights and int64 atomics (2^40, below).
+//                   large where the pixel is occluded in the other frame.
+//   k_splatNvof     k_splatSoft with the flow scale and the weight split: landing x + s * F,
+//                   e = expf(Z + bias) (bias = log of the time weight, 1 - t for frame 0, t for
+//                   frame 1), the same four corner weights and int64 atomics (2^40, below).
 //   k_splatNvofNorm acc -> the tween; where the plain coverage is below `hole` (nothing landed),
 //                   the plain blend (1 - t) I0 + t I1, and the hole is counted.
+// All fp32 since 2026-09-26 (user order: no fp64 in the kernels; the fp64 form cost 2 to 3 ms per
+// 1080p tween plus 1.4 ms per pair, harness\p38 / p41): a splat lands by land(), a sample by
+// nvAxis (the pixel plus the floor and the fraction of its offset), never at an fp32 absolute
+// coordinate (one ulp at x ~ 2000 is 1.2e-4 px); the k_nvofUp taps are integer ratios, exact at
+// the power-of-two grids; k_nvofLuma rounds exactly like the fp64 form.
 // fixed point of the splat accumulators: 2^40, not k_splatSoft's 2^26. e = exp(Z + bias) <= 1
 // and Z is clamped at -16, so a contribution is at most 2^40 and at least ~1.2e5 units (2^26
 // would leave ~7 units there, a 13% colour quantization exactly in the occluded regions); even a
 // thousand contributions per pixel stay under 2^50 of the int64 range
 #define NV_FIX 1099511627776.0f
 
-__device__ __forceinline__ double nvLerp2(const float* __restrict__ p, int w, int h, double fx, double fy)
+// one axis of a bilinear tap at pixel x plus the offset u px, the point clamped into [0, n - 1]:
+// the cell from floor(u) and the weight from its exact fraction (x + u in fp32 would carry one
+// ulp of x); an offset beyond +-(n + 1) clamps to the edge anyway, so it is limited first and the
+// int conversion cannot overflow (a NaN offset lands on the low edge)
+__device__ __forceinline__ void nvAxis(int x, float u, int n, int& x0, int& x1, float& l)
 {
-    // bilinear with the sample point clamped into [0, w - 1] x [0, h - 1]
-    if (fx < 0.0) fx = 0.0;
-    if (fy < 0.0) fy = 0.0;
-    if (fx > (double)(w - 1)) fx = (double)(w - 1);
-    if (fy > (double)(h - 1)) fy = (double)(h - 1);
-    const int x0 = (int)fx, y0 = (int)fy;
-    const int x1 = x0 < w - 1 ? x0 + 1 : x0, y1 = y0 < h - 1 ? y0 + 1 : y0;
-    const double lx = fx - (double)x0, ly = fy - (double)y0;
-    const double a = (1.0 - lx) * (double)p[(size_t)y0 * w + x0] + lx * (double)p[(size_t)y0 * w + x1];
-    const double b = (1.0 - lx) * (double)p[(size_t)y1 * w + x0] + lx * (double)p[(size_t)y1 * w + x1];
-    return (1.0 - ly) * a + ly * b;
+    u = fminf(fmaxf(u, -(float)(n + 1)), (float)(n + 1));
+    const float fl = floorf(u);
+    x0 = x + (int)fl;
+    l = u - fl;
+    if (x0 < 0) { x0 = 0; l = 0.0f; }
+    else if (x0 >= n - 1) { x0 = n - 1; l = 0.0f; }
+    x1 = x0 < n - 1 ? x0 + 1 : x0;
+}
+struct NvTap { int x0, x1, y0, y1; float lx, ly; };
+__device__ __forceinline__ NvTap nvTap(int x, int y, float ux, float uy, int w, int h)
+{
+    NvTap T;
+    nvAxis(x, ux, w, T.x0, T.x1, T.lx);
+    nvAxis(y, uy, h, T.y0, T.y1, T.ly);
+    return T;
+}
+__device__ __forceinline__ float nvLerp(const float* __restrict__ p, int rowStride, const NvTap& T)
+{
+    const float a = (1.0f - T.lx) * p[(size_t)T.y0 * rowStride + T.x0] + T.lx * p[(size_t)T.y0 * rowStride + T.x1];
+    const float b = (1.0f - T.lx) * p[(size_t)T.y1 * rowStride + T.x0] + T.lx * p[(size_t)T.y1 * rowStride + T.x1];
+    return (1.0f - T.ly) * a + T.ly * b;
 }
 
 extern "C" __global__ void k_nvofLuma(const float* __restrict__ src, int planeStride, int rowStride,
@@ -1420,10 +1569,46 @@ extern "C" __global__ void k_nvofLuma(const float* __restrict__ src, int planeSt
     const size_t o = (size_t)y * rowStride + x;
     // planeStride is SIGNED: the live host's planes are (B, G, R), so it passes the R plane with
     // a negative stride and the BT.709 weights still meet R, G, B in this order
-    double v = 0.2126 * (double)src[o] + 0.7152 * (double)src[(long long)planeStride + (long long)o]
-             + 0.0722 * (double)src[2 * (long long)planeStride + (long long)o];
-    v = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
-    dst[(size_t)y * pitch + x] = (unsigned char)rint(v * 255.0);
+    // rounded EXACTLY as the fp64 form rounded clip(v, 0, 1) * 255 (2026-09-26, no fp64): the
+    // constants, products and sums carry their fp32 rounding error as a second float (ffMul /
+    // ffAdd), so the value is known to ~1e-12 and the rounding takes the same side of every x.5 the
+    // double sum took. A plain fp32 sum sits up to ~2.5e-5 off at 255 and moved up to 127 codes of
+    // a 1080p frame by one (harness\p41 nvof_equiv); these codes feed the Optical Flow
+    // Accelerator, whose block matching can turn one moved code into another vector.
+    const float s[3] = { src[o], src[(long long)planeStride + (long long)o],
+                         src[2 * (long long)planeStride + (long long)o] };
+    const float kh[3] = { 0.2126f, 0.7152f, 0.0722f };                 // the double constants =
+    const float kl[3] = { 7.247925e-09f, -6.9618227e-09f, -2.861023e-10f };  // kh + kl (1e-16)
+    float H = 0.0f, L = 0.0f, p, e, t, f;
+    for (int c = 0; c < 3; c++)
+    {
+        ffMul(s[c], kh[c], p, e);
+        ffAdd(H, p, t, f);
+        H = t;
+        L += f + e + s[c] * kl[c];
+    }
+    ffAdd(H, L, t, f);
+    ffMul(t, 255.0f, p, e);
+    ffAdd(p, e + f * 255.0f, H, L);
+    int code = (int)rintf(H);           // half to even on H; H + L decides an exact H tie
+    const float d = H - (float)code;    // exact
+    if (d == 0.5f && L > 0.0f) code++;
+    else if (d == -0.5f && L < 0.0f) code--;
+    dst[(size_t)y * pitch + x] = (unsigned char)(code < 0 ? 0 : (code > 255 ? 255 : code));
+}
+
+// one axis of k_nvofUp: the grid cell i0 / i1 and the lerp weight l of pixel o, f = (o + 0.5) /
+// grid - 0.5 = (2o + 1 - grid) / (2 grid) clamped at 0, in integers; l = the remainder over
+// 2 grid, exact in fp32 (and the lerps below exact) at the power-of-two grids
+__device__ __forceinline__ void nvUpTap(int o, int grid, int g, int& i0, int& i1, float& l)
+{
+    const int num = 2 * o + 1 - grid, den = 2 * grid;
+    int i = num > 0 ? num / den : 0;
+    if (i > g - 1) i = g - 1;
+    const int rem = num > 0 ? num - i * den : 0;
+    l = rem >= den ? 1.0f : (float)rem / (float)den;
+    i0 = i;
+    i1 = i < g - 1 ? i + 1 : i;
 }
 
 // vec: gw x gh short2 (x, y) with a row pitch of vecPitch BYTES; cost: gw x gh uint8, costPitch
@@ -1433,33 +1618,49 @@ extern "C" __global__ void k_nvofUp(const short* __restrict__ vec, int vecPitch,
                                     int gw, int gh, int grid, int w, int h,
                                     float* __restrict__ flow, float* __restrict__ costOut)
 {
+    // the taps depend on x alone (x0, x1, lx) or y alone (y0, y1, ly), so lane t of the block
+    // fills column t and row t ONCE with nvUpTap (2026-09-26, priority 30 lever 10), the pixels
+    // read them; a block side above 32 = per pixel
+    __shared__ int sX0[32], sX1[32], sY0[32], sY1[32];
+    __shared__ float sLx[32], sLy[32];
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool tab = blockDim.x <= 32 && blockDim.y <= 32;
+    if (tab)
+    {
+        const int t = threadIdx.y * blockDim.x + threadIdx.x;
+        if (t < blockDim.x) nvUpTap(blockIdx.x * blockDim.x + t, grid, gw, sX0[t], sX1[t], sLx[t]);
+        if (t < blockDim.y) nvUpTap(blockIdx.y * blockDim.y + t, grid, gh, sY0[t], sY1[t], sLy[t]);
+        __syncthreads();
+    }
     if (x >= w || y >= h) return;
-    double fx = ((double)x + 0.5) / (double)grid - 0.5;
-    double fy = ((double)y + 0.5) / (double)grid - 0.5;
-    if (fx < 0.0) fx = 0.0;
-    if (fy < 0.0) fy = 0.0;
-    int x0 = (int)fx, y0 = (int)fy;
-    if (x0 > gw - 1) x0 = gw - 1;
-    if (y0 > gh - 1) y0 = gh - 1;
-    const double lx = fx - (double)x0 > 1.0 ? 1.0 : fx - (double)x0;
-    const double ly = fy - (double)y0 > 1.0 ? 1.0 : fy - (double)y0;
-    const int x1 = x0 < gw - 1 ? x0 + 1 : x0, y1 = y0 < gh - 1 ? y0 + 1 : y0;
+    int x0, x1, y0, y1;
+    float lx, ly;
+    if (tab)
+    {
+        x0 = sX0[threadIdx.x]; x1 = sX1[threadIdx.x]; lx = sLx[threadIdx.x];
+        y0 = sY0[threadIdx.y]; y1 = sY1[threadIdx.y]; ly = sLy[threadIdx.y];
+    }
+    else
+    {
+        nvUpTap(x, grid, gw, x0, x1, lx);
+        nvUpTap(y, grid, gh, y0, y1, ly);
+    }
+    // exact in fp32 at grid <= 8: the weights carry at most 4 fraction bits, the shorts 15 bits
     const short* r0 = (const short*)((const char*)vec + (size_t)y0 * vecPitch);
     const short* r1 = (const short*)((const char*)vec + (size_t)y1 * vecPitch);
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
     for (int c = 0; c < 2; c++)
     {
-        const double a = (1.0 - lx) * (double)r0[2 * x0 + c] + lx * (double)r0[2 * x1 + c];
-        const double b = (1.0 - lx) * (double)r1[2 * x0 + c] + lx * (double)r1[2 * x1 + c];
-        flow[(size_t)c * plane + o] = (float)(((1.0 - ly) * a + ly * b) * (1.0 / 32.0));
+        const float a = (1.0f - lx) * (float)r0[2 * x0 + c] + lx * (float)r0[2 * x1 + c];
+        const float b = (1.0f - lx) * (float)r1[2 * x0 + c] + lx * (float)r1[2 * x1 + c];
+        flow[(size_t)c * plane + o] = ((1.0f - ly) * a + ly * b) * (1.0f / 32.0f);
     }
     const unsigned char* c0 = cost + (size_t)y0 * costPitch;
     const unsigned char* c1 = cost + (size_t)y1 * costPitch;
-    const double a = (1.0 - lx) * (double)c0[x0] + lx * (double)c0[x1];
-    const double b = (1.0 - lx) * (double)c1[x0] + lx * (double)c1[x1];
-    costOut[o] = (float)((1.0 - ly) * a + ly * b);
+    const float a = (1.0f - lx) * (float)c0[x0] + lx * (float)c0[x1];
+    const float b = (1.0f - lx) * (float)c1[x0] + lx * (float)c1[x1];
+    costOut[o] = (1.0f - ly) * a + ly * b;
 }
 
 // fA / costA: this direction (2 + 1 planes), fB: the other direction (2 planes); Z out (1 plane)
@@ -1471,14 +1672,14 @@ extern "C" __global__ void k_nvofMetric(const float* __restrict__ fA, const floa
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
-    const double ux = (double)fA[o], uy = (double)fA[plane + o];
-    const double px = (double)x + ux, py = (double)y + uy;
-    const double dx = ux + nvLerp2(fB, w, h, px, py);
-    const double dy = uy + nvLerp2(fB + plane, w, h, px, py);
+    const float ux = fA[o], uy = fA[plane + o];
+    const NvTap T = nvTap(x, y, ux, uy, w, h);
+    const float dx = ux + nvLerp(fB, w, T);
+    const float dy = uy + nvLerp(fB + plane, w, T);
     // clamped at -16: a landing whose every candidate is bad keeps a weight (exp(-16) * NV_FIX
     // ~ 1.2e5 units) instead of vanishing; beyond a gap of 16 the softmax is winner-take-all anyway
-    const double z = -(double)a * (double)costA[o] - (double)b * sqrt(dx * dx + dy * dy);
-    Z[o] = (float)(z < -16.0 ? -16.0 : z);
+    const float z = -a * costA[o] - b * sqrtf(dx * dx + dy * dy);
+    Z[o] = z < -16.0f ? -16.0f : z;
 }
 
 // one source pixel: 3 image planes (planeStride, rowStride), flow (2, h, w), Z (1, h, w); splat
@@ -1493,14 +1694,12 @@ extern "C" __global__ void k_splatNvof(const float* __restrict__ img, int planeS
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
-    const double fx = (double)x + (double)s * (double)flow[o];
-    const double fy = (double)y + (double)s * (double)flow[plane + o];
-    if (!isfinite(fx) || !isfinite(fy)) return;
+    int nwX, nwY;
+    float dx, dy;
+    if (!land(x, s, flow[o], nwX, dx) || !land(y, s, flow[plane + o], nwY, dy)) return;
     const float e = expf(__fadd_rn(Z[o], bias));
-    const int nwX = (int)floor(fx), nwY = (int)floor(fy);
-    const double dx = fx - (double)nwX, dy = fy - (double)nwY;
-    const float wNW = (float)((1.0 - dx) * (1.0 - dy)), wNE = (float)(dx * (1.0 - dy));
-    const float wSW = (float)((1.0 - dx) * dy), wSE = (float)(dx * dy);
+    const float wNW = (1.0f - dx) * (1.0f - dy), wNE = dx * (1.0f - dy);
+    const float wSW = (1.0f - dx) * dy, wSE = dx * dy;
     const bool okW = nwX >= 0 && nwX < w, okE = nwX + 1 >= 0 && nwX + 1 < w;
     const bool okN = nwY >= 0 && nwY < h, okS = nwY + 1 >= 0 && nwY + 1 < h;
     const long long oNW = (long long)nwY * w + nwX;   // only dereferenced behind the ok flags
@@ -1566,25 +1765,23 @@ extern "C" __global__ void k_splatVel(const float* __restrict__ flow, const floa
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
-    const double fx = (double)x + (double)s * (double)flow[o];
-    const double fy = (double)y + (double)s * (double)flow[plane + o];
-    if (!isfinite(fx) || !isfinite(fy)) return;
-    const double e = exp((double)Z[o] + (double)bias);
-    const double vx = (double)sign * (double)flow[o], vy = (double)sign * (double)flow[plane + o];
-    const int nwX = (int)floor(fx), nwY = (int)floor(fy);
-    const double dx = fx - (double)nwX, dy = fy - (double)nwY;
-    const double wt[4] = { (1.0 - dx) * (1.0 - dy), dx * (1.0 - dy), (1.0 - dx) * dy, dx * dy };
+    int nwX, nwY;
+    float dx, dy;
+    if (!land(x, s, flow[o], nwX, dx) || !land(y, s, flow[plane + o], nwY, dy)) return;
+    const float e = expf(Z[o] + bias);
+    const float vx = sign * flow[o], vy = sign * flow[plane + o];
+    const float wt[4] = { (1.0f - dx) * (1.0f - dy), dx * (1.0f - dy), (1.0f - dx) * dy, dx * dy };
     const int ox[4] = { 0, 1, 0, 1 }, oy[4] = { 0, 0, 1, 1 };
     for (int k = 0; k < 4; k++)
     {
         const int tx = nwX + ox[k], ty = nwY + oy[k];
         if (tx < 0 || tx >= w || ty < 0 || ty >= h) continue;
         const size_t t = (size_t)ty * w + tx;
-        const double we = e * wt[k];
-        atomicAdd((unsigned long long*)acc + t, (unsigned long long)llrint(vx * we * (double)NV_FIX));
-        atomicAdd((unsigned long long*)acc + plane + t, (unsigned long long)llrint(vy * we * (double)NV_FIX));
-        atomicAdd((unsigned long long*)acc + 2 * plane + t, (unsigned long long)llrint(we * (double)NV_FIX));
-        atomicAdd((unsigned long long*)acc + (size_t)covPlane * plane + t, (unsigned long long)llrint(wt[k] * (double)NV_FIX));
+        const float we = e * wt[k];
+        atomicAdd((unsigned long long*)acc + t, (unsigned long long)llrintf(vx * we * NV_FIX));
+        atomicAdd((unsigned long long*)acc + plane + t, (unsigned long long)llrintf(vy * we * NV_FIX));
+        atomicAdd((unsigned long long*)acc + 2 * plane + t, (unsigned long long)llrintf(we * NV_FIX));
+        atomicAdd((unsigned long long*)acc + (size_t)covPlane * plane + t, (unsigned long long)llrintf(wt[k] * NV_FIX));
     }
 }
 
@@ -1597,30 +1794,33 @@ extern "C" __global__ void k_velNorm(const long long* __restrict__ acc, int w, i
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
-    const double inv = 1.0 / (double)NV_FIX;
-    const double vxe = (double)acc[o] * inv, vye = (double)acc[plane + o] * inv;
-    const double e = (double)acc[2 * plane + o] * inv;
-    const double c0 = (double)acc[3 * plane + o] * inv, c1 = (double)acc[4 * plane + o] * inv;
+    const float inv = 1.0f / NV_FIX;
+    const float vxe = (float)acc[o] * inv, vye = (float)acc[plane + o] * inv;
+    const float e = (float)acc[2 * plane + o] * inv;
+    const long long a0 = acc[3 * plane + o], a1 = acc[4 * plane + o];
+    const float c0 = (float)a0 * inv, c1 = (float)a1 * inv;
     // the velocity only where the weight sum is resolvable: a landing whose weight rounded to 0
     // in the fixed point while its velocity product did not would divide to infinity (and the
     // push-pull turns inf * 0 into NaN); a real landing weighs at least ~5e-8 (Z clamp -16, time
     // weight >= 0.25 at the grids used), so 1e-10 drops only corner crumbs and makes them holes
-    const bool okE = e > 1e-10;
-    double conf = okE ? c0 + c1 : 0.0;
-    conf = conf < 0.0 ? 0.0 : (conf > 1.0 ? 1.0 : conf);
-    n0[o] = okE ? (float)(vxe / e * conf) : 0.0f;
-    n0[plane + o] = okE ? (float)(vye / e * conf) : 0.0f;
-    d0[o] = (float)conf;
-    vis[o] = (float)(c0 < 0.0 ? 0.0 : (c0 > 1.0 ? 1.0 : c0));
-    vis[plane + o] = (float)(c1 < 0.0 ? 0.0 : (c1 > 1.0 ? 1.0 : c1));
-    double den = c0 * (1.0 - (double)t) + c1 * (double)t;
-    den = den > 1e-12 ? den : 1e-12;
-    double q = e / den;
-    q = q > 1e-30 ? q : 1e-30;
-    double m = (log(q) - (double)lo) / ((double)hi - (double)lo);
-    m = m < 0.0 ? 0.0 : (m > 1.0 ? 1.0 : m);
-    if (c0 + c1 < 0.05) m = 0.0;
-    mraw[o] = (float)m;
+    // (e is exact in fp32 up to 2^24 units and 1e-10 * 2^40 = 109.95, so the test decides exactly
+    // like the fp64 form did)
+    const bool okE = e > 1e-10f;
+    float conf = okE ? c0 + c1 : 0.0f;
+    conf = conf < 0.0f ? 0.0f : (conf > 1.0f ? 1.0f : conf);
+    n0[o] = okE ? vxe / e * conf : 0.0f;
+    n0[plane + o] = okE ? vye / e * conf : 0.0f;
+    d0[o] = conf;
+    vis[o] = c0 < 0.0f ? 0.0f : (c0 > 1.0f ? 1.0f : c0);
+    vis[plane + o] = c1 < 0.0f ? 0.0f : (c1 > 1.0f ? 1.0f : c1);
+    float den = c0 * (1.0f - t) + c1 * t;
+    den = den > 1e-12f ? den : 1e-12f;
+    float q = e / den;
+    q = q > 1e-30f ? q : 1e-30f;
+    float m = (logf(q) - lo) / (hi - lo);
+    m = m < 0.0f ? 0.0f : (m > 1.0f ? 1.0f : m);
+    if (20LL * (a0 + a1) < (1LL << 40)) m = 0.0f;   // c0 + c1 < 0.05, exact on the integers
+    mraw[o] = m;
 }
 
 // push-pull, down: level (w, h) -> (w2, h2) = ceil halves, 2x2 sums (zero outside the level)
@@ -1631,16 +1831,16 @@ extern "C" __global__ void k_ppDown(const float* __restrict__ n, const float* __
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w2 || y >= h2) return;
     const size_t plane = (size_t)w * h, plane2 = (size_t)w2 * h2, o2 = (size_t)y * w2 + x;
-    double a = 0.0, b = 0.0, c = 0.0;
+    float a = 0.0f, b = 0.0f, c = 0.0f;
     for (int dy = 0; dy < 2; dy++)
         for (int dx = 0; dx < 2; dx++)
         {
             const int sx = 2 * x + dx, sy = 2 * y + dy;
             if (sx >= w || sy >= h) continue;
             const size_t o = (size_t)sy * w + sx;
-            a += (double)n[o]; b += (double)n[plane + o]; c += (double)d[o];
+            a += n[o]; b += n[plane + o]; c += d[o];
         }
-    n2[o2] = (float)a; n2[plane2 + o2] = (float)b; d2[o2] = (float)c;
+    n2[o2] = a; n2[plane2 + o2] = b; d2[o2] = c;
 }
 
 // push-pull, the coarsest level: out = n / max(d, 1e-12)
@@ -1651,9 +1851,9 @@ extern "C" __global__ void k_ppTop(const float* __restrict__ n, const float* __r
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
-    const double dd = (double)d[o] > 1e-12 ? (double)d[o] : 1e-12;
-    out[o] = (float)((double)n[o] / dd);
-    out[plane + o] = (float)((double)n[plane + o] / dd);
+    const float dd = d[o] > 1e-12f ? d[o] : 1e-12f;
+    out[o] = n[o] / dd;
+    out[plane + o] = n[plane + o] / dd;
 }
 
 // push-pull, up: out = own * a + coarse(x / 2, y / 2) * (1 - a), own = n / max(d, 1e-12), a = clip(d)
@@ -1665,57 +1865,66 @@ extern "C" __global__ void k_ppUp(const float* __restrict__ n, const float* __re
     if (x >= w || y >= h) return;
     const size_t plane = (size_t)w * h, plane2 = (size_t)w2 * h2, o = (size_t)y * w + x;
     const size_t oc = (size_t)(y >> 1) * w2 + (x >> 1);
-    const double dv = (double)d[o];
-    const double dd = dv > 1e-12 ? dv : 1e-12;
-    const double a = dv < 0.0 ? 0.0 : (dv > 1.0 ? 1.0 : dv);
-    out[o] = (float)((double)n[o] / dd * a + (double)coarse[oc] * (1.0 - a));
-    out[plane + o] = (float)((double)n[plane + o] / dd * a + (double)coarse[plane2 + oc] * (1.0 - a));
+    const float dv = d[o];
+    const float dd = dv > 1e-12f ? dv : 1e-12f;
+    const float a = dv < 0.0f ? 0.0f : (dv > 1.0f ? 1.0f : dv);
+    out[o] = n[o] / dd * a + coarse[oc] * (1.0f - a);
+    out[plane + o] = n[plane + o] / dd * a + coarse[plane2 + oc] * (1.0f - a);
 }
 
 // Gaussian blur, one axis (dir 0 = x, 1 = y), radius r = int(4 sigma + 0.5), reflect edges
-// (scipy's mode 'reflect': d c b a | a b c d), weights exp(-x^2 / (2 sigma^2)) normalised
+// (scipy's mode 'reflect': d c b a | a b c d), weights exp(-x^2 / (2 sigma^2)) normalised.
+// The weights and their sum depend only on k, so each block computes them ONCE into shared
+// memory (the sum in k order, as the per-pixel form adds them), then every pixel accumulates in
+// fp32 (the fp64 era's per-pixel double exp cost 15 ms of a 1080p tween, the double accumulation
+// 1.3 ms more, harness\p38 / p41). A radius above kBlurMaxR keeps the per-pixel form.
+#define kBlurMaxR 64
 extern "C" __global__ void k_blur1(const float* __restrict__ src, int w, int h, float sigma, int dir,
                                    float* __restrict__ dst)
 {
+    __shared__ float wtab[2 * kBlurMaxR + 1];
+    __shared__ float wsum;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int r = (int)(4.0f * sigma + 0.5f);
+    const bool tab = r <= kBlurMaxR;
+    const float g = -0.5f / (sigma * sigma);
+    if (tab)
+    {
+        const int tid = threadIdx.y * blockDim.x + threadIdx.x, nt = blockDim.x * blockDim.y;
+        for (int k = tid; k <= 2 * r; k += nt)
+            wtab[k] = expf(g * (float)((k - r) * (k - r)));
+        __syncthreads();
+        if (tid == 0)
+        {
+            float ws = 0.0f;
+            for (int k = 0; k <= 2 * r; k++) ws += wtab[k];
+            wsum = ws;
+        }
+        __syncthreads();
+    }
     if (x >= w || y >= h) return;
-    const int r = (int)(4.0 * (double)sigma + 0.5);
     const int n = dir ? h : w;
     const int c = dir ? y : x;
-    double acc = 0.0, ws = 0.0;
+    float acc = 0.0f, ws = 0.0f;
     for (int k = -r; k <= r; k++)
     {
         int i = c + k;
         // reflect about the edge sample boundary, repeated for kernels wider than the axis
         while (i < 0 || i >= n) i = i < 0 ? -i - 1 : 2 * n - i - 1;
-        const double wk = exp(-0.5 * (double)k * (double)k / ((double)sigma * (double)sigma));
-        acc += wk * (double)(dir ? src[(size_t)i * w + x] : src[(size_t)y * w + i]);
-        ws += wk;
+        const float wk = tab ? wtab[k + r] : expf(g * (float)(k * k));
+        acc += wk * (dir ? src[(size_t)i * w + x] : src[(size_t)y * w + i]);
+        if (!tab) ws += wk;
     }
-    dst[(size_t)y * w + x] = (float)(acc / ws);
-}
-
-__device__ __forceinline__ double nvSample(const float* __restrict__ p, int rowStride, int w, int h,
-                                           double fx, double fy)
-{
-    // bilinear at (fx, fy) with the point clamped into the frame (map_coordinates mode nearest);
-    // a non-finite point samples the origin instead of indexing out of bounds
-    if (!isfinite(fx) || !isfinite(fy)) { fx = 0.0; fy = 0.0; }
-    if (fx < 0.0) fx = 0.0;
-    if (fy < 0.0) fy = 0.0;
-    if (fx > (double)(w - 1)) fx = (double)(w - 1);
-    if (fy > (double)(h - 1)) fy = (double)(h - 1);
-    const int x0 = (int)fx, y0 = (int)fy;
-    const int x1 = x0 < w - 1 ? x0 + 1 : x0, y1 = y0 < h - 1 ? y0 + 1 : y0;
-    const double lx = fx - (double)x0, ly = fy - (double)y0;
-    const double a = (1.0 - lx) * (double)p[(size_t)y0 * rowStride + x0] + lx * (double)p[(size_t)y0 * rowStride + x1];
-    const double b = (1.0 - lx) * (double)p[(size_t)y1 * rowStride + x0] + lx * (double)p[(size_t)y1 * rowStride + x1];
-    return (1.0 - ly) * a + ly * b;
+    dst[(size_t)y * w + x] = acc / (tab ? wsum : ws);
 }
 
 // the tween: V (2 planes, filled), vis (2 planes), m (the blurred mask), both frames at
-// (planeStride, rowStride); out = m * warp + (1 - m) * blend into dst at the same strides
+// (planeStride, rowStride); out = m * warp + (1 - m) * blend into dst at the same strides.
+// Frame 0 is sampled bilinear at x - t V, frame 1 at x + (1 - t) V, each point clamped into the
+// frame (map_coordinates mode nearest) and taken as the pixel plus its offset (nvTap); a
+// non-finite V samples the origin instead of indexing out of bounds. The taps serve all three
+// channels.
 extern "C" __global__ void k_nvofCompose(const float* __restrict__ i0, const float* __restrict__ i1,
                                          int planeStride, int rowStride, const float* __restrict__ V,
                                          const float* __restrict__ vis, const float* __restrict__ m,
@@ -1725,19 +1934,21 @@ extern "C" __global__ void k_nvofCompose(const float* __restrict__ i0, const flo
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x, io = (size_t)y * rowStride + x;
-    const double td = (double)t;
-    const double vx = (double)V[o], vy = (double)V[plane + o];
-    const double w0 = (1.0 - td) * ((double)vis[o] + 1e-3), w1 = td * ((double)vis[plane + o] + 1e-3);
-    const double mm = (double)m[o];
+    const float vx = V[o], vy = V[plane + o];
+    const bool fin = isfinite(vx) && isfinite(vy);
+    const NvTap T0 = fin ? nvTap(x, y, -t * vx, -t * vy, w, h) : nvTap(0, 0, 0.0f, 0.0f, w, h);
+    const NvTap T1 = fin ? nvTap(x, y, (1.0f - t) * vx, (1.0f - t) * vy, w, h) : nvTap(0, 0, 0.0f, 0.0f, w, h);
+    const float w0 = (1.0f - t) * (vis[o] + 1e-3f), w1 = t * (vis[plane + o] + 1e-3f);
+    const float mm = m[o];
     for (int c = 0; c < 3; c++)
     {
         const float* p0 = i0 + (size_t)c * planeStride;
         const float* p1 = i1 + (size_t)c * planeStride;
-        const double c0 = nvSample(p0, rowStride, w, h, (double)x - td * vx, (double)y - td * vy);
-        const double c1 = nvSample(p1, rowStride, w, h, (double)x + (1.0 - td) * vx, (double)y + (1.0 - td) * vy);
-        const double warp = (w0 * c0 + w1 * c1) / (w0 + w1);
-        const double blend = (1.0 - td) * (double)p0[io] + td * (double)p1[io];
-        dst[(size_t)c * planeStride + io] = (float)(mm * warp + (1.0 - mm) * blend);
+        const float c0 = nvLerp(p0, rowStride, T0);
+        const float c1 = nvLerp(p1, rowStride, T1);
+        const float warp = (w0 * c0 + w1 * c1) / (w0 + w1);
+        const float blend = (1.0f - t) * p0[io] + t * p1[io];
+        dst[(size_t)c * planeStride + io] = mm * warp + (1.0f - mm) * blend;
     }
 }
 
@@ -1755,20 +1966,28 @@ extern "C" __global__ void k_nvofCompose(const float* __restrict__ i0, const flo
 // same weights, so its mask is w / (w + 1e-7) and a hole is where that is < 0.999. Accumulators are
 // int64 fixed point at 2^32 (the GMFSS pattern, order-independent, deterministic); a value that
 // lands inside the frame is bounded by its own displacement (|v| <= max(W, H) + 1 for the flow
-// splat, <= 2 for the DRM), so 2^32 leaves 1e5 overlapping sources of headroom at 8K. Positions,
-// corner weights and every normalisation are DOUBLE, rounded once to fp32 at the store
-// ([[gate-kernel-port-against-fp64]]). Planes are contiguous (w * h each), fp32.
+// splat, <= 2 for the DRM), so 2^32 leaves 1e5 overlapping sources of headroom at 8K. All fp32
+// since 2026-09-26 (user order: no fp64 in the kernels; fp64 cost 0.7 ms of the DRBA glue,
+// harness\p38): a landing is land()'s (the pixel plus the floor and the exact fraction of the
+// offset), and the hole test runs on the integer weight accumulator (DRBA_HOLE), so it takes
+// exactly the fp64 form's decisions (an fp32 ratio flipped rare pixels between the fill and the
+// splat: the 0.053 timestep jump of the harness\p38 probe). Planes are contiguous (w * h each).
 // Gate: harness\drba\drba_equiv.py (fp64 references on real block0 flows).
 
-#define DRBA_FIX 4294967296.0
+#define DRBA_FIX 4294967296.0f
+// hole = w / (w + 1e-7) < 0.999 = w < 9.99e-5 = acc < 9.99e-5 * 2^32 = 429067.23
+#define DRBA_HOLE 429068LL
 
+// the value(s) v of pixel (x, y) splatted at (x + ax * m, y + ay * m) (land) into nv value planes +
+// the weight plane
 __device__ __forceinline__ void drbaSplat4(unsigned long long* p, size_t plane, int nv,
-                                           const double* v, double fx, double fy, int w, int h)
+                                           const float* v, int x, int y, float ax, float ay, float m,
+                                           int w, int h)
 {
-    if (!isfinite(fx) || !isfinite(fy)) return;
-    const int nwX = (int)floor(fx), nwY = (int)floor(fy);
-    const double dx = fx - (double)nwX, dy = fy - (double)nwY;
-    const double wt[4] = {(1.0 - dx) * (1.0 - dy), dx * (1.0 - dy), (1.0 - dx) * dy, dx * dy};
+    int nwX, nwY;
+    float dx, dy;
+    if (!land(x, ax, m, nwX, dx) || !land(y, ay, m, nwY, dy)) return;
+    const float wt[4] = {(1.0f - dx) * (1.0f - dy), dx * (1.0f - dy), (1.0f - dx) * dy, dx * dy};
     const int cx[4] = {nwX, nwX + 1, nwX, nwX + 1}, cy[4] = {nwY, nwY, nwY + 1, nwY + 1};
     for (int k = 0; k < 4; k++)
     {
@@ -1776,8 +1995,8 @@ __device__ __forceinline__ void drbaSplat4(unsigned long long* p, size_t plane, 
         const size_t o = (size_t)cy[k] * w + cx[k];
         for (int c = 0; c < nv; c++)
             atomicAdd(p + (size_t)c * plane + o,
-                      (unsigned long long)(long long)llrint(v[c] * wt[k] * DRBA_FIX));
-        atomicAdd(p + (size_t)nv * plane + o, (unsigned long long)(long long)llrint(wt[k] * DRBA_FIX));
+                      (unsigned long long)(long long)llrintf(v[c] * wt[k] * DRBA_FIX));
+        atomicAdd(p + (size_t)nv * plane + o, (unsigned long long)(long long)llrintf(wt[k] * DRBA_FIX));
     }
 }
 
@@ -1791,9 +2010,9 @@ extern "C" __global__ void k_drbaFlowSplat(const float* __restrict__ flow, int w
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
     for (int j = 0; j < 2; j++)
     {
-        const double v[2] = {(double)flow[(2 * j) * plane + o], (double)flow[(2 * j + 1) * plane + o]};
+        const float v[2] = {flow[(2 * j) * plane + o], flow[(2 * j + 1) * plane + o]};
         drbaSplat4((unsigned long long*)(acc + (size_t)(3 * j) * plane), plane, 2, v,
-                   (double)x + v[0], (double)y + v[1], w, h);
+                   x, y, v[0], v[1], 1.0f, w, h);
     }
 }
 
@@ -1804,24 +2023,25 @@ extern "C" __global__ void k_drbaFlowNorm(const long long* __restrict__ acc, int
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t plane = (size_t)w * h;
     if (i >= (int)plane) return;
-    const double fill = 2.0 * (double)(w > h ? w : h);
+    const float fill = 2.0f * (float)(w > h ? w : h);
     for (int j = 0; j < 2; j++)
     {
-        const double wsum = (double)acc[(size_t)(3 * j + 2) * plane + i] / DRBA_FIX;
-        const bool hole = wsum / (wsum + 1e-7) < 0.999;
+        const long long aw = acc[(size_t)(3 * j + 2) * plane + i];
+        const bool hole = aw < DRBA_HOLE;
+        const float wsum = (float)aw / DRBA_FIX;
         for (int c = 0; c < 2; c++)
-            out[(size_t)(2 * j + c) * plane + i] = hole ? (float)fill
-                : (float)(-2.0 * ((double)acc[(size_t)(3 * j + c) * plane + i] / DRBA_FIX) / (wsum + 1e-7));
+            out[(size_t)(2 * j + c) * plane + i] = hole ? fill
+                : -2.0f * ((float)acc[(size_t)(3 * j + c) * plane + i] / DRBA_FIX) / (wsum + 1e-7f);
     }
 }
 
 // the unaligned DRM value at one pixel: side < 0 -> drm12 * tt * 2, side > 0 -> drm10 * tt * 2
-__device__ __forceinline__ double drbaDrmUn(const float* f10, const float* f12, size_t plane,
-                                            size_t o, int side, double tt)
+__device__ __forceinline__ float drbaDrmUn(const float* f10, const float* f12, size_t plane,
+                                           size_t o, int side, float tt)
 {
-    const double u0 = f10[o], v0 = f10[plane + o], u2 = f12[o], v2 = f12[plane + o];
-    const double d10 = sqrt(u0 * u0 + v0 * v0) + 1e-4, d12 = sqrt(u2 * u2 + v2 * v2) + 1e-4;
-    return (side < 0 ? d12 : d10) / (d10 + d12) * tt * 2.0;
+    const float u0 = f10[o], v0 = f10[plane + o], u2 = f12[o], v2 = f12[plane + o];
+    const float d10 = sqrtf(u0 * u0 + v0 * v0) + 1e-4f, d12 = sqrtf(u2 * u2 + v2 * v2) + 1e-4f;
+    return (side < 0 ? d12 : d10) / (d10 + d12) * tt * 2.0f;
 }
 
 // f10, f12 (2 planes each, calc_flow's flow05 * 2) -> acc (2 int64 planes, zeroed): drm, weight
@@ -1832,11 +2052,10 @@ extern "C" __global__ void k_drbaDrmSplat(const float* __restrict__ f10, const f
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
-    const double d = drbaDrmUn(f10, f12, plane, o, side, (double)tt);
+    const float d = drbaDrmUn(f10, f12, plane, o, side, tt);
     const float* fa = side < 0 ? f10 : f12;
-    const double v[1] = {d};
-    drbaSplat4((unsigned long long*)acc, plane, 1, v, (double)x + (double)fa[o] * d,
-               (double)y + (double)fa[plane + o] * d, w, h);
+    const float v[1] = {d};
+    drbaSplat4((unsigned long long*)acc, plane, 1, v, x, y, fa[o], fa[plane + o], d, w, h);
 }
 
 // acc (2 planes) -> the (1, H, W) timestep map for the IFNet
@@ -1847,9 +2066,10 @@ extern "C" __global__ void k_drbaDrmNorm(const long long* __restrict__ acc, cons
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t plane = (size_t)w * h;
     if (i >= (int)plane) return;
-    const double wsum = (double)acc[plane + i] / DRBA_FIX;
-    out[i] = wsum / (wsum + 1e-7) < 0.999 ? (float)drbaDrmUn(f10, f12, plane, i, side, (double)tt)
-                                          : (float)(((double)acc[i] / DRBA_FIX) / (wsum + 1e-7));
+    const long long aw = acc[plane + i];
+    const float wsum = (float)aw / DRBA_FIX;
+    out[i] = aw < DRBA_HOLE ? drbaDrmUn(f10, f12, plane, i, side, tt)
+                            : ((float)acc[i] / DRBA_FIX) / (wsum + 1e-7f);
 }
 
 }
@@ -1952,7 +2172,7 @@ static bool rtxBridgeLoad()
 
 // priority 24 step 2c: offline TrueHDR's light statistics, python's RTXVideo _cll / _fall / _l1
 // / _hp (rtxvideo.py _pack_out, _measure_light, _accum_l1, _accum_hp), accumulated per output
-// frame from k_thdrOut's block (hist[1024] u32, misc[4] u32, vSum double) and written as one
+// frame from k_thdrOut's block (hist[1024] u32, misc[4] u32, vSum int64 2^24 fixed point) and written as one
 // JSON file render.py reads at the finalize: maxcll / maxfall always, the Dolby Vision L1
 // triples and the HDR10+ records when asked for (--hdr-dv / --hdr-hp).
 static const size_t kThdrStatsBytes = 1024 * 4 + 4 * 4 + 8;
@@ -1999,8 +2219,9 @@ struct ThdrAcc
     {
         const uint32_t* hist = (const uint32_t*)s;
         const uint32_t* misc = hist + 1024;
-        double vSum = 0.0;
-        memcpy(&vSum, s + 1024 * 4 + 16, 8);
+        long long vFix = 0;
+        memcpy(&vFix, s + 1024 * 4 + 16, 8);
+        const double vSum = (double)vFix * (1.0 / 16777216.0);
         float vMax = 0.0f;
         memcpy(&vMax, &misc[3], 4);
         // _pack_out: float(mx.max()) * 10000 and float(mx.mean()) * 10000 (the mean is fp32 in
@@ -2337,7 +2558,7 @@ struct NativeRife
     nvinfer1::IExecutionContext* ctxB0 = nullptr;
     uint32_t drFid = 0;              // frames pushed this session; frame id i sits in ring slot i & 3
     float* dDrI[4] = {};             // (3, ph, pw) the padded frames
-    float* dDrF[4] = {};             // (16, ph, pw) their encodes, fp32
+    float* dDrF[4] = {};             // (16, ph, pw) their encodes, fp32 (fp16 in place when featHalf)
     float* dDrX[2] = {};             // (6, ph, pw) IFNet x: [0] = [k-1, k-2] (side -1), [1] = [k-2, k-1]
     uint32_t drXFor[2] = {};         // the newest frame id each x was built for (0 = none)
     struct DrWin { uint32_t c; float* f10; float* r; };   // r = (4, ph, pw): flow12 | flow21
@@ -2412,6 +2633,7 @@ struct NativeRife
     nvinfer1::IExecutionContext* ctxIf = nullptr;
     nvinfer1::IExecutionContext* ctxEnc = nullptr;
     bool encHalf = true;
+    bool featHalf = false;      // IFNet / block0 take f0 / f1 in fp16: the encode writes dF directly
 
     // ---- CUDA
     cudaStream_t stream = nullptr;
@@ -2571,6 +2793,7 @@ struct NativeResident
     nvinfer1::IRuntimeCache* jit = nullptr;
     CUmodule cuMod = nullptr;
     bool encHalf = true;
+    bool featHalf = false;
     int dev = 0;
     // memoised handoff: the python command line minus gen (the fast path ignores gen and the
     // cold path builds the fixed 1to8 class regardless) and the facts it answered with
@@ -2805,7 +3028,7 @@ struct LkShape { const char* name; std::vector<int64_t> dims; };
 // priority 30 step 2). Engines built from an older graph never survive a bump: the app and the
 // CLI empty the engine cache when its stamp (weights_tags.txt, which carries the rev, plus the
 // TensorRT-RTX version) no longer matches (src/render/cache.ts)
-static const int kOnnxRev = 2;
+static const int kOnnxRev = 3;   // 3: RIFE IFNet / block0 take f0 / f1 in fp16 (priority 30 lever 5a)
 
 // engine_name(): <base>_<shape per input joined by x, inputs by _>_<trt>_<w>, a dynamic batch
 // axis written lo"to"hi
@@ -2908,9 +3131,20 @@ static bool lkFind(nvinfer1::IRuntime* rt, const std::string& cacheDir, const st
     return true;
 }
 
-static bool lkAllFp32(const LkIo& io)
+// the RIFE IFNet / block0 class: fp32 everywhere except the feature encodes f0 / f1, fp32 up to
+// ONNX rev 2 and fp16 since rev 3 (both the same; nativeTrtInit pairs them with the encode output)
+static bool lkRifeIo(const LkIo& io)
 {
-    for (auto& p : io.ins) if (p.second != "fp32") return false;
+    std::string fd;
+    for (auto& p : io.ins)
+    {
+        if (p.first == "f0" || p.first == "f1")
+        {
+            if ((p.second != "fp32" && p.second != "fp16") || (!fd.empty() && fd != p.second)) return false;
+            fd = p.second;
+        }
+        else if (p.second != "fp32") return false;
+    }
     for (auto& p : io.outs) if (p.second != "fp32") return false;
     return true;
 }
@@ -3163,7 +3397,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     std::string ipath, epath;
     LkIo iio, eio;
     if (!lkFind(rt, cacheDir, base, sets, batch ? "timestep" : nullptr, 1, batch, t, ipath, iio)) return false;
-    if (!lkAllFp32(iio)) return false;
+    if (!lkRifeIo(iio)) return false;
     const std::string ijit = lkJit(ipath);
     if (!lkWarm(ijit, s.warmKey)) return false;
     if (!lkFind(rt, cacheDir, lkEncodeBase(s, t), { { { "img", { 1, 3, ph, pw } } } }, nullptr, 0, 0, t, epath, eio))
@@ -3174,7 +3408,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
         LkIo bio;
         if (!lkFind(rt, cacheDir, lkBlock0Base(s, t), { lkBlock0Set(s) }, nullptr, 0, 0, t, bpath, bio))
             return false;
-        if (!lkAllFp32(bio)) return false;
+        if (!lkRifeIo(bio)) return false;
         bjit = lkJit(bpath);
         if (!lkWarm(bjit, s.warmKey)) return false;
     }
@@ -3683,7 +3917,7 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, O
     if (st) cudaStreamDestroy(st);
     if (!ok) { LOG("offline: engine build for %dx%d failed\n", s.pw, s.ph); return false; }
     LkIo iio, eio;
-    if (!lkFind(rt, s.cacheDir, base, { set }, nullptr, 0, 0, t, o.ifnet, iio) || !lkAllFp32(iio)
+    if (!lkFind(rt, s.cacheDir, base, { set }, nullptr, 0, 0, t, o.ifnet, iio) || !lkRifeIo(iio)
         || !lkFind(rt, s.cacheDir, ebase, { eset }, nullptr, 0, 0, t, o.encode, eio))
     { LOG("offline: the engines at %dx%d do not match their class (delete them from the cache to rebuild)\n", s.pw, s.ph); return false; }
     o.jit = lkJit(o.ifnet);
@@ -3773,7 +4007,7 @@ static bool lkOfflineBlock0(const std::wstring& script, int w, int h, std::strin
         if (!ok) { LOG("offline: DRBA block0 engine build for %dx%d failed%s\n", s.pw, s.ph, oom ? " (out of memory)" : ""); return false; }
     }
     LkIo io;
-    if (!lkFind(rt, s.cacheDir, base, { set }, nullptr, 0, 0, t, path, io) || !lkAllFp32(io))
+    if (!lkFind(rt, s.cacheDir, base, { set }, nullptr, 0, 0, t, path, io) || !lkRifeIo(io))
     { LOG("offline: the DRBA block0 engine at %dx%d does not match its class\n", s.pw, s.ph); return false; }
     jit = lkJit(path);
     LOG("offline: DRBA block0 engine for %dx%d %s\n", s.pw, s.ph, warm ? "warm" : "built by the host");
@@ -5526,9 +5760,13 @@ static bool nativeTrtInit(NativeRife& nr)
             if (!nr.engB0) return false;
             if (g_resident) { g_res.engB0 = nr.engB0; g_res.block0Path = nr.block0Path; }
         }
-        for (const char* n : { "img0", "img1", "f0", "f1", "flow" })
+        for (const char* n : { "img0", "img1", "flow" })
             if (dt(nr.engB0, n) != nvinfer1::DataType::kFLOAT)
             { LOG("native: block0 tensor %s is not fp32\n", n); return false; }
+        // block0 reads the same encode ring as the IFNet: its f0 / f1 dtype must match
+        const auto bfd = nr.featHalf ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kFLOAT;
+        if (dt(nr.engB0, "f0") != bfd || dt(nr.engB0, "f1") != bfd)
+        { LOG("native: block0 f0 / f1 dtype differs from the IFNet's\n"); return false; }
         return nativeWarmEngine(nr, nr.engB0, nr.ctxB0, "block0", "drba");
     };
     // GMFSS (sub-steps 5a / 5c): the five-engine set, resident like the pair (the same paths =
@@ -5597,6 +5835,7 @@ static bool nativeTrtInit(NativeRife& nr)
         nr.engEnc = g_res.engEnc;
         nr.jit = g_res.jit;
         nr.encHalf = g_res.encHalf;
+        nr.featHalf = g_res.featHalf;
         // no-engine mode: the resident holds no pair (both paths empty on both sides), only
         // the runtime, the jit cache and, per path, the restore engine
         if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
@@ -5645,14 +5884,22 @@ static bool nativeTrtInit(NativeRife& nr)
     if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
     {
         // dtype contract, read off the engines rather than trusted from the handoff line
-        const char* need[] = { "x", "timestep", "f0", "f1", "merged" };
+        const char* need[] = { "x", "timestep", "merged" };
         for (const char* n : need)
             if (dt(nr.engIf, n) != nvinfer1::DataType::kFLOAT)
             { LOG("native: IFNet tensor %s is not fp32, phase 1 only handles fp32\n", n); return false; }
+        // f0 / f1: fp32 (ONNX rev <= 2) or fp16 (rev 3, the encode output fed as is)
+        const auto fd = dt(nr.engIf, "f0");
+        if (dt(nr.engIf, "f1") != fd
+            || (fd != nvinfer1::DataType::kFLOAT && fd != nvinfer1::DataType::kHALF))
+        { LOG("native: IFNet f0 / f1 dtype unsupported\n"); return false; }
+        nr.featHalf = fd == nvinfer1::DataType::kHALF;
         const auto ed = dt(nr.engEnc, "feat");
         if (ed == nvinfer1::DataType::kHALF) nr.encHalf = true;
         else if (ed == nvinfer1::DataType::kFLOAT) nr.encHalf = false;
         else { LOG("native: encode output dtype unsupported\n"); return false; }
+        if (nr.featHalf && !nr.encHalf)
+        { LOG("native: IFNet takes fp16 features but the encode engine outputs fp32\n"); return false; }
         if (dt(nr.engEnc, "img") != nvinfer1::DataType::kFLOAT)
         { LOG("native: encode input is not fp32\n"); return false; }
     }
@@ -5665,6 +5912,7 @@ static bool nativeTrtInit(NativeRife& nr)
         g_res.engRest = nr.engRest;
         g_res.jit = nr.jit;
         g_res.encHalf = nr.encHalf;
+        g_res.featHalf = nr.featHalf;
         g_res.dev = nr.dev;
         g_res.ifnetPath = nr.ifnetPath;
         g_res.encodePath = nr.encodePath;
@@ -6030,9 +6278,11 @@ static bool nativeDrbaPush(NativeRife& nr, const float* dCur)
     if (!nr.ctxEnc->setInputShape("img", din))
     { nr.die("encode setInputShape rejected (shape outside the engine profile)"); return false; }
     nr.ctxEnc->setTensorAddress("img", dst);
-    nr.ctxEnc->setTensorAddress("feat", nr.encHalf ? (void*)nr.dEncHalf : (void*)enc);
+    // fp16 features: the encode writes the ring slot directly (read as fp16 by block0 / IFNet)
+    const bool widen = nr.encHalf && !nr.featHalf;
+    nr.ctxEnc->setTensorAddress("feat", widen ? (void*)nr.dEncHalf : (void*)enc);
     if (!nr.ctxEnc->enqueueV3(st)) { nr.die("encode enqueueV3 returned false"); return false; }
-    if (nr.encHalf)
+    if (widen)
     {
         int n = (int)(16 * plane);
         void* a[] = { &nr.dEncHalf, &enc, &n };
@@ -6722,10 +6972,12 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (!nr.ctxEnc->setInputShape("img", din))
         { nr.die("encode setInputShape rejected (shape outside the engine profile)"); return false; }
         nr.ctxEnc->setTensorAddress("img", dCur);
-        void* encOut = nr.encHalf ? (void*)nr.dEncHalf : (void*)nr.dF[nr.fCur];
+        // fp16 features (ONNX rev 3): the encode writes dF directly, no widen pass
+        const bool widen = nr.encHalf && !nr.featHalf;
+        void* encOut = widen ? (void*)nr.dEncHalf : (void*)nr.dF[nr.fCur];
         nr.ctxEnc->setTensorAddress("feat", encOut);
         if (!nr.ctxEnc->enqueueV3(st)) { nr.die("encode enqueueV3 returned false"); return false; }
-        if (nr.encHalf)
+        if (widen)
         {
             int n = (int)(16 * plane);
             void* a[] = { &nr.dEncHalf, &nr.dF[nr.fCur], &n };
