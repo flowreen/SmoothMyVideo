@@ -167,7 +167,7 @@ struct Host
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;
     uint64_t fenceValue = 0;
-    // WO-9: fence value signalled by the LAST streaming present out of each double-buffer
+    // Fence value signalled by the LAST streaming present out of each double-buffer
     // half. The cross-group present queue replaces the per-group waitQueue barrier with a
     // non-blocking completed-value check against this (python may not rewrite a half while
     // presents from it are still executing).
@@ -379,9 +379,9 @@ struct Host
         {
             scNative = sc;   // no SL proxy in the way: the swap chain IS the native one
         }
-        // WO-8: declare the color space explicitly rather than letting DXGI infer it. SDR = G22/P709
+        // Declare the color space explicitly rather than letting DXGI infer it. SDR = G22/P709
         // (correct intent for the 8-bit present, removes the HDR-desktop ambiguity); HDR = G2084/P2020
-        // (PQ) so DWM composites our R10G10B10A2 buffer as HDR. Phase 3: on the SL route set it on
+        // (PQ) so DWM composites our R10G10B10A2 buffer as HDR. On the SL route set it on
         // the PROXY swapchain too - the interposer only learns the colorspace from calls it can
         // hook, and DLSS-G with an R10A2 backbuffer but no declared HDR10 colorspace silently
         // passes through (measured: status=0 yet actuallyPresented stuck at 1 until this call).
@@ -408,9 +408,9 @@ struct Host
 
     int init()
     {
-        // WO-8: HDR presents R10G10B10A2 (PQ, still 4 bytes/px) on a G2084 swapchain, BOTH
+        // HDR presents R10G10B10A2 (PQ, still 4 bytes/px) on a G2084 swapchain, BOTH
         // routes: DLSS-G mandates exactly RGB10 + BT.2100 PQ for HDR (SL guide 11.0, FP16
-        // scRGB explicitly unsupported), so Phase 3 rides the same format as the server route.
+        // scRGB explicitly unsupported), so the DLSS-G route rides the same format as the server route.
         texFmt = g_hdr ? DXGI_FORMAT_R10G10B10A2_UNORM
                        : (useSL ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM);
         WNDCLASSW wc{};
@@ -421,7 +421,7 @@ struct Host
         RegisterClassW(&wc);
         // click-through: WS_EX_TRANSPARENT + WS_EX_LAYERED at full alpha lets input fall
         // through to the real window underneath while DWM still composits our presents.
-        // ACTIVATION IS LOAD-BEARING (bisected 2026-07-15): DLSS-G only engages when this
+        // ACTIVATION IS LOAD-BEARING (bisected): DLSS-G only engages when this
         // window has been activated (foreground). WS_EX_NOACTIVATE or SW_SHOWNOACTIVATE both
         // leave the pacer in passthrough (numFramesActuallyPresented=1) with zero errors, so
         // the window is created WS_VISIBLE (which activates it) and never with NOACTIVATE.

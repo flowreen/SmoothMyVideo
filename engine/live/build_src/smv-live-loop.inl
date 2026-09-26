@@ -65,7 +65,7 @@ static bool frameBounds(HWND h, RECT& r)
     return SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)));
 }
 
-// WO-8 Phase 0: is Windows HDR ("Use HDR") active on the display the target window sits on? The
+// Is Windows HDR ("Use HDR") active on the display the target window sits on? The
 // output reports G2084 (PQ) as its current color space when HDR is on. Used to warn that today's
 // 8-bit SDR capture clips HDR content, and later to switch on the HDR live pipeline.
 static bool monitorIsHDR(HWND target)
@@ -91,7 +91,7 @@ static bool monitorIsHDR(HWND target)
     return false;
 }
 
-// WO-8 Phase 4: the SDR reference white (nits) of the display the target sits on - the level DWM
+// The SDR reference white (nits) of the display the target sits on - the level DWM
 // composes SDR window content at inside an HDR desktop's scRGB FP16 capture ("SDR content
 // brightness" slider; SDRWhiteLevel is fixed point, nits = level / 1000 * 80). The server divides
 // the capture by it so TrueHDR sees a proper [0,1] SDR frame. Falls back to 240 (this dev box's
@@ -163,7 +163,7 @@ struct Hud
     {
         if (!hwnd) return;
         // \u2192 = the arrow; ESCAPED on purpose: a raw UTF-8 literal in this file compiles
-        // as ANSI mojibake unless the build adds /utf-8 (user saw "weird letters" 2026-07-16)
+        // as ANSI mojibake unless the build adds /utf-8 (it showed as "weird letters")
         // --no-hud-latency hides the latency segment only; the fps segment is governed by
         // --no-hud (whole readout). DLSS-G never reaches here with a latency to show (SL
         // paces internally and the caller passes its handoff figure), so that path is
@@ -186,7 +186,7 @@ struct Hud
         FillRect(dc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
         HGDIOBJ of = SelectObject(dc, font);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(255, 255, 255));   // full white (user: easier to read than the green)
+        SetTextColor(dc, RGB(255, 255, 255));   // full white: easier to read than green
         r.left += 4;
         DrawTextW(dc, text, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, of);
@@ -324,17 +324,14 @@ static int runSynth(int genFrames, bool vsync)
     return 0;
 }
 
-// RESIZE DEBOUNCE (2026-09-16, user: "1 second of not resizing a window, then it switches to
-// initializing the next model size", "the overlay must instantly change to loading model"):
-// a session used to end (exit 4, the app revives it) on the FIRST >2 px size change, so a
-// drag resize became a chain of engine builds at whatever intermediate size the window had
-// 400 ms later, each blocking the host for up to a minute. Now the stale overlay hides at
-// once, the HUD shows the loading note at once, and the session ends only after the client
+// RESIZE DEBOUNCE: ending the session (exit 4, the app revives it) on the FIRST >2 px size
+// change would turn a drag resize into a chain of engine builds at whatever intermediate size
+// the window had 400 ms later, each blocking the host for up to a minute. So the stale overlay
+// hides at once, the HUD shows the loading note at once, and the session ends only after the client
 // size has held for SMV_LIVE_RESIZE_SETTLE_MS (default 1000). Returns early when the window
 // closes or the session is ending anyway (stdin "stop"). g_monitor sessions never get here
 // (monitor capture has no window size).
-// What the loading note names (2026-09-25, user: "can we have instead message of what is actually
-// checked?"): the GUI's --label lists the ticked model and live effects ("GMFSS + DLSS 5",
+// What the loading note names: the GUI's --label lists the ticked model and live effects ("GMFSS + DLSS 5",
 // "DLSS 5 + Sharpen") and is shown as is; a run without a label names the backend.
 static std::wstring loadingWhat()
 {
@@ -394,24 +391,23 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
     }
     if (!target) { LOG("no visible window matching \"%s\"\n", wideToUtf8(needle ? needle : L"").c_str()); return 1; }
     g_targetHwnd = target;   // the resident "live session ended" line reports it (the app's revive)
-    // WO-8: resolve HDR live mode. Env SMV_LIVE_HDR overrides detection (1 = force on, 0 = force
+    // Resolve HDR live mode. Env SMV_LIVE_HDR overrides detection (1 = force on, 0 = force
     // off); otherwise HDR runs when the display has Windows HDR on AND the mode supports it.
     // The native identity echo stays SDR. Re-evaluated per session (the exit-4 restart re-enters
     // here). When HDR is on but this mode can't use it, fall back to the
-    // SDR-clips-HDR notice from Phase 0.
+    // SDR-clips-HDR notice.
     {
         const bool hdrDisplay = monitorIsHDR(target);
         wchar_t ov[8]{};
-        // WO-8 Phase 2: rife/gmfss run on PQ and compose R10A2, so HDR reaches them (plus the
-        // echo identity path). Since 2026-08-27 fill is HDR-capable too: the server rescales on the PQ
+        // rife/gmfss run on PQ and compose R10A2, so HDR reaches them (plus the
+        // echo identity path). Fill is HDR-capable too: the server rescales on the PQ
         // tensors and letterboxes into the R10A2 canvas (RTX VSR demoted to bicubic there,
         // server-side log line). SMV_LIVE_HDR forces the mode for testing. "blend" (the LSFG
         // comparison baseline) composes the exact same PQ R10A2 path as rife/gmfss and exists
-        // precisely for HDR A-B comparisons, so it is HDR-capable too. Phase 3 (2026-08-27):
+        // precisely for HDR A-B comparisons, so it is HDR-capable too.
         // DLSS-G is HDR-capable through the exe-side pack (kHdrPackCS): SL mandates RGB10 + PQ
         // for HDR, the capture converts before present, SL interpolates on the PQ backbuffers.
-        // "fruc" (Smooth Motion, 2026-09-12 user report "looks really white" on the HDR desktop):
-        // the server feeds the NvOFFRUC bridge the PQ-encoded frames like rife, the bridge
+        // "fruc" (Smooth Motion): the server feeds the NvOFFRUC bridge the PQ-encoded frames like rife, the bridge
         // quantises them to 8-bit BGRA for the flow and the warp, so only the TWEENS carry 8-bit
         // PQ precision (the real frames stay full precision); far better than the SDR capture
         // of an HDR-presented window, which is 2-3x over-bright and clipped (below).
@@ -420,10 +416,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
              (g_serverBackend == L"echo" || g_serverBackend == L"rife" || g_serverBackend == L"gmfss"
               || g_serverBackend == L"blend" || g_serverBackend == L"nvof" || g_serverBackend == L"rifedrba"
               || g_serverBackend == L"fruc"));
-        // AUTO since 2026-08-15: HDR runs whenever the display has Windows HDR on and the mode
-        // supports it. The "purple screen" that kept this opt-in was root-caused to the model-load
-        // passthrough presenting raw FP16 capture bytes into the R10A2 swap chain (a startup
-        // transient, now suppressed below); the steady-state present itself probes value-exact.
+        // AUTO: HDR runs whenever the display has Windows HDR on and the mode supports it. A
+        // "purple screen" at the start was the model-load passthrough presenting raw FP16 capture
+        // bytes into the R10A2 swap chain (a startup transient, suppressed below); the
+        // steady-state present itself probes value-exact.
         // Without HDR, the 8-bit capture of an HDR-presented source re-lifts to desktop SDR white
         // (measured 2-3x over-bright + 240-nit clip), so auto-on is the safe default. SMV_LIVE_HDR
         // still overrides both ways: 1 forces on (testing), 0 forces off (escape hatch).
@@ -432,8 +428,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             g_hdr = (ov[0] == L'1') && hdrCapable;
         if (g_hdr)
             LOG("HDR live mode ON: FP16 scRGB capture -> BT.2020 PQ, R10G10B10A2 present (G2084)\n");
-        // WO-8 Phase 4: TrueHDR needs the HDR live pipeline (server backends only; the exe-side
-        // DLSS-G pack has no python server to run the bridge in). Resolve the target monitor's
+        // TrueHDR needs the HDR live pipeline (server backends only; not the exe-side DLSS-G
+        // pack). Resolve the target monitor's
         // SDR white here, while the target is known.
         if (g_rtxHdr && g_hdr && g_backend == BK_SERVER)
         {
@@ -444,7 +440,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         else if (g_rtxHdr)
             LOG("RTX HDR live skipped (needs an HDR display and a server model: RIFE/GMFSS/Frame Blend)\n");
         else if (g_dlssnr && g_hdr && g_backend == BK_SERVER)
-            g_sdrWhite = sdrWhiteNits(target);   // WO-42: the SDR range the NR pass works on
+            g_sdrWhite = sdrWhiteNits(target);   // the SDR range the NR pass works on
         if (!g_hdr && hdrDisplay)
             LOG("NOTICE: Windows HDR is ON for this display. This model captures 8-bit SDR for now, "
                 "so HDR highlights will look over-bright/clipped. HDR live support is in progress for "
@@ -482,8 +478,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
 
         static Capture cap; // static: outlives this scope, single instance per process
         cap.swizzle = host.useSL;   // DLSS-G keeps RGBA; server/identity routes stay BGRA
-        // WO-8 Phase 3: dlssg in HDR packs scRGB -> R10A2 PQ in the exe (no python server on
-        // this route); swizzle is bypassed there. Must be set before init() (it sizes the chain
+        // dlssg in HDR packs scRGB -> R10A2 PQ in the exe; swizzle is bypassed there. Must be set before init() (it sizes the chain
         // and can clear g_hdr on setup failure, before anything else reads it).
         cap.hdrPack = g_hdr && host.useSL;
         int rc = cap.init(target, a.Get());
@@ -525,7 +520,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         {
             W = capW;
             H = capH;
-            // WO-2: overlay covers the CLIENT area (cap cropped the title bar out of the capture),
+            // The overlay covers the CLIENT area (cap cropped the title bar out of the capture),
             // so the real title bar stays visible above it.
             host.posX = cap.clientScreenX;
             host.posY = cap.clientScreenY;
@@ -537,7 +532,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         if (host.minWH && (W < host.minWH || H < host.minWH))
             LOG("WARNING: %ux%u is below the DLSS-G minimum extent %u, FG may refuse\n", W, H, host.minWH);
 
-        // WO-42: the DLSS 5 pass inside this process, on the shared capture texture. Server
+        // The DLSS 5 pass inside this process, on the shared capture texture. Server
         // backends only (never DLSS-G: the NR host starves it), and only with the zero-copy
         // capture (the pass lives on that texture). Every refusal logs one line and the
         // session runs without DLSS 5.
@@ -607,7 +602,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                                    cap.hTex, cap.hFence, &host);
             // SOURCE-RATE MEASUREMENT, before the server spawns. Two consumers:
             //  * fixed mode (--no-adapt with a --target and no --gen): seeds the whole
-            //    multiplier from the fps target. WO-6 drift
+            //    multiplier from the fps target. Drift
             //    tracking re-derives it in the stats tick; each group's ladder carries it.
             //  * adaptive mode: sizes the SLOT CEILING. A pair can only reach the target
             //    if it carries ceil(target/source) slots, so the slot count is derived
@@ -671,7 +666,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (base <= 0) { base = 24.0; LOG("source rate unmeasurable (static/paused?), assuming ~24 fps\n"); }
                 // +1 slot of headroom: the pair clock jitters, so a pair occasionally holds
                 // one more grid point than the nominal ratio. Clamped ONLY by memory.
-                // WO-18: the slot count is the HARD ceiling on the presented rate (a pair can
+                // The slot count is the HARD ceiling on the presented rate (a pair can
                 // hold at most `slots` grid points, so the session tops out at base * slots).
                 // The old ceil(target/base)+1 sat right on that ceiling, and `base` is a 2 s
                 // one-shot measurement: reading a 23.976 fps source as 25.8 gave 40 slots and
@@ -702,7 +697,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         slotCap, mSlotBytes / 1048576.0);
                 }
             }
-            // WO-6: a derived fixed multiplier is drift-tracked (re-derived in the stats tick),
+            // A derived fixed multiplier is drift-tracked (re-derived in the stats tick),
             // so size the server at the slot CEILING and let each group's ladder carry the
             // current value. An explicit --gen (harness/perf use) keeps the exact classic spawn.
             const bool fixedDerived = g_noAdapt && g_targetFps > 0 && !g_genExplicit;
@@ -714,7 +709,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // it finished - which reads as "it never turned on" (while DLSS-G, no server, feels
             // instant). Load on a BACKGROUND thread and present the raw captured frames meanwhile,
             // so the overlay is visibly LIVE from the first second; it just isn't smoothed yet.
-            // WO-10: the cross-group queue is the only consumer of the capture-release
+            // The cross-group queue is the only consumer of the capture-release
             // token. Decide here, before the spawn: the route's other conditions (shm,
             // streaming) are answered by the same handshake, and an unused --caprel simply
             // comes back as caprel=0.
@@ -757,7 +752,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         hud.move(ox + 16, oy + 16);
                     }
                 }
-                // a resize during the model load (2026-09-16): the loader cannot see it (the
+                // a resize during the model load: the loader cannot see it (the
                 // engine handoff only polls the flag), so watch the client size here; once it
                 // settles the session ends with exit 4 like a mid-session resize, the app
                 // revives it at the new size and the build in flight finishes in the background
@@ -1027,7 +1022,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         double nextIdleTick = 0;         // next idle re-present deadline, nowMs domain (0 = live)
         ULONGLONG lastRefreshTick = GetTickCount64();   // last target-refresh request
         // hold rate = the mode's cadence CAPPED AT 10 FPS (Lossless Scaling parity on static
-        // frames; user decision 2026-08-15). The cap also keeps the beat well above Windows'
+        // frames). The cap also keeps the beat well above Windows'
         // ~15.6ms timer quantization, which ate a 33ms cadence down to 22 of 30 fps (Win11
         // ignores timeBeginPeriod for windowless/occluded processes, so precise sub-50ms
         // sleeps are not reliably available here).
@@ -1068,7 +1063,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             {
                 // 0.95x: a full-refresh floor leaves ZERO slack when the output target equals
                 // the panel rate (16 slots x 2.78ms = 44.5ms vs a 41.7ms pair at 24->360,
-                // measured 2026-08-29: capture starved at 22.8fps). 5% under-spacing keeps
+                // measured: capture starved at 22.8fps). 5% under-spacing keeps
                 // the no-two-per-refresh intent in practice while giving the chain headroom.
                 // ABOVE-REFRESH TARGETS: the no-two-per-refresh intent is unreachable by
                 // definition once the requested output rate exceeds the panel mode (a 1000fps
@@ -1131,7 +1126,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // panel/VRR refresh cadence (measured +-4ms), which makes pair spans bimodal
             // (~37/46ms on a 41.7ms source) - the long half then overflows the slot ceiling
             // and degrades to the ladder, skipping its grid share and capping output at
-            // ~330 of a 360 target (measured 2026-08-29). The grid marches on an EMA clock
+            // ~330 of a 360 target (measured). The grid marches on an EMA clock
             // instead (the source's true cadence is uniform); the /8 pull bounds drift and
             // a 1.5-step error snaps on real cadence changes (drops, seeks, pauses).
             if (adaptTarget > 0 && emaDt > 0)
@@ -1264,14 +1259,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 panelHz, dwmHz, dispFps, host.prBunch / secs, stc);
             return ratio;
         };
-        // ================= WO-9: CROSS-GROUP PRESENT QUEUE (every streaming server) =======
-        // The per-group loop below was group-serial for a streaming server too: it read
-        // group k's tokens inside a nested loop, drained ALL of its presents with
-        // waitQueue(), and only then looked at group k+1. An early-arriving pair therefore
-        // presented its first slot 20-28ms late, which was 100% of the measured 35-40ms
-        // hitches (memory item 1b). That streaming branch and its SMV_LIVE_XQ=0 escape were
-        // deleted 2026-09-13 (todo cleanup 9f); the loop below serves only the direct
-        // routes (DLSS-G, identity).
+        // ================= CROSS-GROUP PRESENT QUEUE (every streaming server) =============
+        // A group-serial loop (group k's tokens read in a nested loop, ALL of its presents
+        // drained with waitQueue(), only then group k+1) presents an early-arriving pair's
+        // first slot 20-28ms late, which was 100% of the measured 35-40ms hitches. The
+        // per-group loop below serves only the direct routes (DLSS-G, identity).
         // This path keeps the protocol, the pacing formula and the floor rule and replaces
         // the structure: a reader thread owns the token stream, tokens land in ONE FIFO of
         // presentable slots that spans groups, and the barrier becomes a non-blocking
@@ -1291,7 +1283,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 int64_t sentTs;
                 ULONGLONG sentTick;
                 bool opened;    // first slot token or end marker came back
-                bool capRel;    // WO-10: python released the shared capture texture
+                bool capRel;    // the server released the shared capture texture
             };
             struct XqSlot
             {
@@ -1303,7 +1295,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             std::deque<XqGroup> pend;    // sent, not yet closed by an end marker
             std::deque<XqSlot> fifo;     // presentable slots, spanning groups
             std::deque<uint32_t> rq;     // raw tokens from the reader thread
-            // WO-10 capture-release token: not a valid slot index, high bit clear so it is
+            // The capture-release token: not a valid slot index, high bit clear so it is
             // never mistaken for an end marker.
             const uint32_t kCapRelTok = 0x7FFFFFFFu;
             std::mutex rqM;
@@ -1312,7 +1304,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const double kXqDropRate = 3.0;    // drops/s tolerated before throttling
             const double kXqCleanMs = 1000.0;  // clean time needed before a step up
             uint64_t halfDefer = 0, gateCDefer = 0, halfPend = 0;
-            // WO-10 phase instrumentation (SMV_LIVE_XQPHASE=1, off by default). Per-iteration
+            // Phase instrumentation (SMV_LIVE_XQPHASE=1, off by default). Per-iteration
             // QPC accumulators for every named phase of this loop, printed on the 2s tick as
             // microseconds per PRESENT. Covers the whole loop body: pump, token drain, the
             // present scheduler, housekeeping, the gate checks, the capture probe call, the
@@ -1322,7 +1314,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 wchar_t pv[8]{};
                 if (GetEnvironmentVariableW(L"SMV_LIVE_XQPHASE", pv, 8) && pv[0] == L'1') phOn = true;
             }
-            // WO-10 cut escapes, one env lever each so every cut can be A/B'd on its own.
+            // Cut escapes, one env lever each so every cut can be A/B'd on its own.
             // SMV_LIVE_XQ_CAPEV: drive the capture probe from the frame pool's FrameArrived
             //   flag instead of calling TryGetNextFrame on every iteration. The loop also WAKES
             //   on the arrival event, so a frame is drained as promptly as it was before (more
@@ -1352,7 +1344,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 phT = t;
             };
             // SMV_LIVE_XQLATE=1: diagnostic escape to a LATENESS over-budget signal (how far
-            // a group's last slot presented past its unfloored deadline). Measured 2026-09-02:
+            // a group's last slot presented past its unfloored deadline). Measured:
             // it over-fires, because with the present floor in play the floored chain pushes
             // the last slot past its unfloored deadline on nearly every group, so the throttle
             // ratchets down to ~320 of 1000 (383 fps avg vs 810-932 with the classic signal).
@@ -1362,7 +1354,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 wchar_t lv[8]{};
                 if (GetEnvironmentVariableW(L"SMV_LIVE_XQLATE", lv, 8) && lv[0] == L'1') xqLate = true;
             }
-            // WO-10 F5: the group-close instant is ALWAYS a present time (the group's last
+            // The group-close instant is ALWAYS a present time (the group's last
             // slot). The end-marker branch used to fall back to nowMs() whenever the group had
             // no slot left in the FIFO, mixing token-arrival times into a series compared
             // against emaDt; these carry the present clock into that branch.
@@ -1376,7 +1368,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 {
                     uint32_t v = 0;
                     if (!srv.readFullRaw(&v, 4)) { InterlockedExchange(&rDead, 1); SetEvent(tokEvt); return; }
-                    // WO-10 F3: teardown sets rDead and aborts the host's waits; check it after
+                    // Teardown sets rDead and aborts the host's waits; check it after
                     // every read so a token that lands during teardown cannot restart the wait
                     if (InterlockedCompareExchange(&rDead, 0, 0)) return;
                     { std::lock_guard<std::mutex> lk(rqM); rq.push_back(v); }
@@ -1431,7 +1423,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             {
                 if (!(adaptTarget > 0 && !hidden && !nextIdleTick && emaDt > 0))
                 {
-                    // WO-10 F4: an alt-tab pause or a static hold invalidates the whole control
+                    // An alt-tab pause or a static hold invalidates the whole control
                     // window, not just its start time. Leaving thrWinT0 and the counters alone
                     // made the first group after a 15s resume close a 15s "window" and step the
                     // target on evidence gathered before the pause.
@@ -1451,7 +1443,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (tn - thrWinT0 < kThrWinMs) return;
                 const double winS = (tn - thrWinT0) / 1000.0;
                 const double dropRate = (double)(cap.dropped - thrDropBase) / winS;
-                // NEW PATH TUNING 2026-09-02 (classic loop constants untouched). With gate C
+                // Queue path tuning. With gate C
                 // bounding the queue, a superseded capture frame is normal at-capacity
                 // behaviour here (the exe DEFERRED a send on purpose), so the classic
                 // 1 drop/s rule fires on noise; and with the 3s recovery a single early down
@@ -1511,7 +1503,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (pend.empty()) { LOG("live server protocol error (token with no open group)\n"); rc2 = 1; break; }
                     if (v == kCapRelTok)
                     {
-                        // WO-10: capture released. Python is single threaded and strictly
+                        // Capture released. The server is single threaded and strictly
                         // group ordered, so this belongs to the oldest group that has not
                         // been released yet. It is NOT a slot and does not open the group.
                         for (auto& gg : pend)
@@ -1647,7 +1639,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // GATE A, part 1: the last present out of the half we are about to hand to
                 // python has completed on the GPU.
                 const bool gateA = host.fence->GetCompletedValue() >= host.halfFence[nextSet];
-                // GATE A, part 2 (WO-10): that half must also hold no slot the FIFO has not
+                // GATE A, part 2: that half must also hold no slot the FIFO has not
                 // presented yet. Parts 1 and C alone leave a hole - a half whose presents all
                 // completed can still own queued, unpresented slots, and python would
                 // overwrite them mid-queue.
@@ -1726,8 +1718,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // ---- (v) static-source hold (see the block comment above the loop). Once
                 // armed (nextIdleTick > 0) it keeps beating through its own 1 Hz refresh
                 // frames: gating it only on 300ms of silence left a 300ms hole after every
-                // refresh, 1 real + 7 held = 8 of the 10 fps cap ("1/8 instead of 1/10",
-                // 2026-09-14). Real cadence (<300ms apart) clears nextIdleTick at the send.
+                // refresh, 1 real + 7 held = 8 of the 10 fps cap ("1/8 instead of 1/10").
+                // Real cadence (<300ms apart) clears nextIdleTick at the send.
                 if (!hidden && (nextIdleTick > 0 || GetTickCount64() - lastPresentTick > 300))
                 {
                     const ULONGLONG now3 = GetTickCount64();
@@ -1924,7 +1916,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         if (frameBounds(target, r) && (r.left != fb.left || r.top != fb.top))
                         {
                             fb = r;
-                            // WO-2: overlay tracks the CLIENT origin (frame origin + constant crop
+                            // The overlay tracks the CLIENT origin (frame origin + constant crop
                             // offset), so it keeps covering the client area as the window moves.
                             const int ox = r.left + cap.cropX;
                             const int oy = r.top + cap.cropY;
@@ -2041,7 +2033,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     }
                     fgWantPrev = want;
                 }
-                // WO-6, the server half: same drift tracking for the fixed-ladder server route.
+                // The same drift tracking for the fixed-ladder server route.
                 // The server is sized at the 16x ceiling and each group's ladder carries the
                 // current multiplier, so retargeting is just resizing the ladder. Streaming only (the batch fallback has no per-group
                 // ladder); capFps > 3 skips static holds, whose ~0 rate would derive the cap.
@@ -2090,7 +2082,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         if (diagH) { WaitForSingleObject(diagH, 12000); CloseHandle(diagH); }
         if (g_teardownTrace) LOG("teardown: hud gone, stopping the server\n");
         if (g_backend == BK_SERVER) srv.stop();
-        if (g_liveNr) { g_liveNr->shutdown(); g_liveNr = nullptr; }   // WO-42: before the capture and the device go
+        if (g_liveNr) { g_liveNr->shutdown(); g_liveNr = nullptr; }   // before the capture and the device go
         if (g_teardownTrace) LOG("teardown: server stopped, stopping the capture\n");
         cap.stop();
         if (g_teardownTrace) LOG("teardown: capture stopped, shutting the host down\n");
@@ -2098,8 +2090,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         if (g_teardownTrace) LOG("teardown: host down\n");
         if (host.useSL) slShutdown();
         timeEndPeriod(1);
-        // WO-42: with the NR snippet loaded, the process-exit teardown after main returns
-        // faults (0xC0000005 on a clean "target window closed" exit, measured 2026-09-12;
+        // With the NR snippet loaded, the process-exit teardown after main returns
+        // faults (0xC0000005 on a clean "target window closed" exit;
         // the offline dlssnr.exe leaves through ExitProcess for the same reason), which would
         // also replace the exit codes the app acts on (4 resize restart, 6 stall revive).
         if (g_nrAttempted) { fflush(stderr); ExitProcess((UINT)rc2); }

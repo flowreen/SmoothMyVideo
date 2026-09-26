@@ -877,7 +877,7 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
                         if (!inputUniform && uniformImage(f)) continue;
                         if (pairStatic)
                         {
-                            // static pair: the generated frames equal the input (measured, see the static-pair WO entry) and a buffer that already held the input can never look fresh by signature, so any buffer equal to the input is a correct frame and a buffer holding the previous pair's tween is not
+                            // static pair: the generated frames equal the input (measured) and a buffer that already held the input can never look fresh by signature, so any buffer equal to the input is a correct frame and a buffer holding the previous pair's tween is not
                             if (!sameImage(f, inFrame.data())) continue;
                         }
                         else

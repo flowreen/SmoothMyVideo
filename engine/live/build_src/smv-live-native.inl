@@ -4,9 +4,9 @@
 // Every live model runs INSIDE this process: the TensorRT-RTX C++ runtime for the engine
 // models (the host looks its engines up by name and builds missing ones from engine\onnx), the
 // driver's Optical Flow API for nvof, the shipped bridge DLL for fruc. No python process is
-// part of a live session. The python live server this host replaced (engine/live_server.py,
-// deleted 2026-09-21, in the git history) is where most of the math below was ported from;
-// comments that name its classes and functions record that origin.
+// part of a live session. The python live server this host replaced (engine/live_server.py, in
+// the git history) is where most of the math below was ported from; comments that name its
+// classes and functions record that origin.
 //
 // NativeRife sits behind the PipeServer boundary: writeFull() hands it one group message per
 // captured frame ([u32 N][N f32 fractions]) and readFullRaw() hands back the tokens the
@@ -31,7 +31,7 @@
 #include <cuda_d3d11_interop.h>
 #include <nvrtc.h>
 #include <NvInferRuntime.h>
-#include <NvInfer.h>              // the builder: engines built from engine\onnx (ONNX-in-exe 3c-2)
+#include <NvInfer.h>              // the builder: engines built from engine\onnx
 #include <NvOnnxParser.h>         // tensorrt_onnxparser_rtx_1_6.dll, delay-loaded like the runtime
 #include "nvOpticalFlowCuda.h"   // the nvof model: MIT interface headers in build_src\nvofa
 
@@ -66,9 +66,8 @@ __device__ __forceinline__ float cc2(float x, float A)
     return ((A * x - 5.0f * A) * x + 8.0f * A) * x - 4.0f * A;
 }
 
-// ---- no fp64 in these kernels (2026-09-26, priority 30, user order "drop fp64"; consumer GPUs
-// run fp64 at a small fraction of fp32). Where the fp64 era needed double for accuracy, fp32
-// keeps it by construction: tap centres are integer ratios (outTap, aaWindow, nvUpTap), a
+// ---- no fp64 in these kernels (consumer GPUs run fp64 at a small fraction of fp32). Where
+// accuracy would call for double, fp32 keeps it by construction: tap centres are integer ratios (outTap, aaWindow, nvUpTap), a
 // landing point is the pixel plus the floor and the exact fraction of its offset (land, nvAxis),
 // a hole or mask decision reads the integer accumulator (DRBA_HOLE, k_velNorm), and the one
 // rounding that feeds a discontinuous consumer (k_nvofLuma -> the Optical Flow Accelerator)
@@ -90,8 +89,8 @@ __device__ __forceinline__ void ffAdd(float a, float b, float& s, float& e)
 // from the EXACT product p + e: n = x + floor(p), l = (p - floor(p)) + e (p - floor(p) is exact
 // outside (-1, 0), within 6e-8 inside), so l is within one fp32 ulp of the fp64 form's x + a * b;
 // an fp32 x + a * b carries one ulp of x (1.2e-4 px at x ~ 2000) and the rounded product alone
-// 1.7e-5 px at 280 px, which DRBA's timestep map read as 1e-4 (harness\p41). false (and no
-// landing) for a product of 1e8 px or more or a non-finite one.
+// 1.7e-5 px at 280 px, which DRBA's timestep map read as 1e-4. false (and no landing) for a
+// product of 1e8 px or more or a non-finite one.
 __device__ __forceinline__ bool land(int x, float a, float b, int& n, float& l)
 {
     float p, e;
@@ -191,7 +190,7 @@ __global__ void k_resizeV(const float* __restrict__ tmp, int w, int ch,
     dst[2 * planeStride + o] = a2 * n;
 }
 
-// ---- WO-15 phase 2, HDR. Verbatim math of live_server.py _scrgb_to_pq2020 (~48-64) and
+// ---- HDR. Verbatim math of live_server.py _scrgb_to_pq2020 (~48-64) and
 // _pack_r10a2 (~66-73): the BT.2087 709 to 2020 matrix runs FIRST, the >= 0 clamp is AFTER it
 // (negative scRGB is valid wide-gamut colour that only goes out of range once in BT.2020),
 // scRGB 1.0 = 80 nits against PQ 1.0 = 10000, then the ST 2084 inverse EOTF. The capture
@@ -233,7 +232,7 @@ __global__ void k_packInDirectHdr(const unsigned short* __restrict__ src, int cw
 }
 
 // HDR, image scale under 1.00: convert the WHOLE capture to planar PQ first, because python
-// rescales ON PQ (the WO-8 fill rule), then the shared resize pair runs on those values.
+// rescales ON PQ (the HDR fill rule), then the shared resize pair runs on those values.
 __global__ void k_pqPlanar(const unsigned short* __restrict__ src, int cw, int ch,
                            float* __restrict__ dst)
 {
@@ -296,12 +295,11 @@ __global__ void k_h2f(const unsigned short* __restrict__ src, float* __restrict_
 // model size, else upscale (bicubic, torch's align_corners=false form, A = -0.75, edges
 // clamped). The SDR and HDR slot packers below share this sampler and differ only in the
 // store.
-// One axis's tap, EXACT in integers (2026-09-26, no fp64 in the kernels, user order): the centre
+// One axis's tap, EXACT in integers (no fp64 in the kernels): the centre
 // in / out * (o + 0.5) - 0.5 = ((2o + 1) in - out) / (2 out), so the cell is an integer floor
 // division and the fraction is rounded ONCE to fp32. torch's fp32 kernel computes scale * (o +
-// 0.5) - 0.5 in float and drifts 1e-4 from its own fp64 result by output index 2500 (2026-09-15,
-// Upscale to gate); the integer form tracks the filter like the double form it replaced, which
-// rounded the same fraction to fp32 once.
+// 0.5) - 0.5 in float and drifts 1e-4 from its own fp64 result by output index 2500; the
+// integer form tracks the filter like a double form that rounds the same fraction to fp32 once.
 __device__ __forceinline__ void outTap(int o, int in, int out, int& i, float& t)
 {
     const long long num = (2LL * o + 1) * in - out, den = 2LL * out;
@@ -311,11 +309,10 @@ __device__ __forceinline__ void outTap(int o, int in, int out, int& i, float& t)
     t = (float)rem / (float)den;
 }
 
-// The taps depend on ox alone (x) or oy alone (y), so each block computes them ONCE (2026-09-26,
-// priority 30 lever 10): lane t fills column t and row t of the block with outTap, the pixels
-// read them (the per-pixel form of the fp64 era cost a double divide per pixel, 0.33 ms per
-// 2560x1440 slot, harness\p38). false = the 1:1 copy or a block side above kOutSide (the
-// per-pixel form).
+// The taps depend on ox alone (x) or oy alone (y), so each block computes them ONCE: lane t
+// fills column t and row t of the block with outTap, the pixels read them (per pixel, every
+// pixel would repeat its column's and its row's divides). false = the 1:1 copy or a block
+// side above kOutSide (the per-pixel form).
 #define kOutSide 32
 struct OutTab { int ix[kOutSide], iy[kOutSide]; float tx[kOutSide], ty[kOutSide]; };
 __device__ __forceinline__ bool outTabFill(OutTab& T, int w, int h, int dw, int dh)
@@ -428,7 +425,7 @@ __global__ void k_packOutHdr(const float* __restrict__ src, int planeStride, int
     *p = q[0] | (q[1] << 10) | (q[2] << 20) | (3u << 30);
 }
 
-// ---- live Sharpen and RTX VSR inside the native host (2026-09-15) --------------------------
+// ---- live Sharpen and RTX VSR inside the native host ---------------------------------------
 // Both effects run at the PRESENTED size, after the fit, exactly like live_server.py's compose
 // (upscale, then RCAS): the fit lands in a planar staging frame at dw x dh (k_fitPlanar, or
 // the VSR bridge output unpacked by k_unpackBgra), and k_rcasOut / k_rcasOutHdr apply rcas.py
@@ -501,7 +498,7 @@ __global__ void k_unpackBgraRgb(const unsigned char* __restrict__ src, int dw, i
     dst[2 * plane + o] = p[0] / 255.0f;
 }
 
-// RGBA8 back to the offline (R, G, B) planes (priority 24 step 5): a DLSS 4.5 host frame,
+// RGBA8 back to the offline (R, G, B) planes: a DLSS 4.5 host frame,
 // dlssg.py _recv (uint8 / 255.0, a division, as python; k_unpackBgra multiplies)
 __global__ void k_unpackRgba(const unsigned char* __restrict__ src, int dw, int dh,
                              float* __restrict__ dst)
@@ -535,7 +532,7 @@ __global__ void k_fitPlanar(const float* __restrict__ src, int planeStride, int 
     dst[2 * plane + o] = c[2];
 }
 
-// ---- the downscaling fit (2026-09-15, full native migration item 1) ------------------------
+// ---- the downscaling fit --------------------------------------------------------------------
 // torch F.interpolate(mode='bicubic', antialias=True, align_corners=False) as a separable
 // pair into the planar staging frame. Weight construction is torch's _compute_weights_aa
 // with its bicubic_filter (A = -0.5, the PIL-compatible kernel, NOT sampleOut's -0.75): a
@@ -551,14 +548,14 @@ __device__ __forceinline__ float bcaa(float x)
     return 0.0f;
 }
 
-// one axis: the tap window [mn, mx) of output index o, EXACT in integers (2026-09-26, no fp64 in
-// the kernels): with scale = in / out, the centre in (2o + 1) / (2 out) and the window ends
+// one axis: the tap window [mn, mx) of output index o, EXACT in integers (no fp64 in the
+// kernels): with scale = in / out, the centre in (2o + 1) / (2 out) and the window ends
 // centre -+ support + 0.5 (support 2 scale shrinking, 2 enlarging) are ratios over 2 out, and
 // every tap argument (j - centre + 0.5) / max(scale, 1) = ((2j + 1) out - (2o + 1) in) /
 // (2 max(in, out)) is one ratio of integers rounded ONCE to fp32 (aaArg). An fp32 centre at
 // output index 2500 carries a 1e-4 error, exactly how far torch's own fp32 CUDA kernel drifts
-// from its fp64 result on a near-1:1 fit (2576 -> 2560: 6.9e-5, 2026-09-15 probe); the integer
-// form tracks the exact filter like the double form it replaced.
+// from its fp64 result on a near-1:1 fit (2576 -> 2560: 6.9e-5); the integer form tracks the
+// exact filter like a double form would.
 __device__ __forceinline__ void aaWindow(int o, int in, int out, int& mn, int& mx)
 {
     const long long c2 = (2LL * o + 1) * in, den = 2LL * out;
@@ -574,12 +571,10 @@ __device__ __forceinline__ float aaArg(int j, int o, int in, int out)
 }
 
 // The window and the tap weights depend on the output index alone, so each block computes them
-// ONCE (2026-09-26, priority 30 lever 10): lane t of the block runs aaWindow and the weight
-// expression of the per-pixel loop for output index o0 + t (column t of an H pass, row t of a V
-// pass) into shared memory, the pixels read them (the per-pixel form of the fp64 era spent a
-// double divide per pixel and three double ops per tap, 0.66 ms of a 4K -> 1080p Restore fold's
-// H pass, harness\p38). aaTabOk false (a shrink beyond ~15x, or a block side above kAaSide) =
-// the per-pixel form.
+// ONCE: lane t of the block runs aaWindow and the weight expression of the per-pixel loop for
+// output index o0 + t (column t of an H pass, row t of a V pass) into shared memory, the pixels
+// read them (per pixel, every pixel would repeat its column's or its row's window and weights).
+// aaTabOk false (a shrink beyond ~15x, or a block side above kAaSide) = the per-pixel form.
 #define kAaSide 32
 #define kAaMaxTaps 64
 struct AaTab { float wt[kAaSide * kAaMaxTaps]; int mn[kAaSide], mx[kAaSide]; };
@@ -668,7 +663,7 @@ __global__ void k_fitAaV(const float* __restrict__ tmp, int dw, int h,
     dst[2 * plane + o] = a2 * n;
 }
 
-// ---- live Restore (2026-09-15, full native migration item 3) -------------------------------
+// ---- live Restore ---------------------------------------------------------------------------
 // live_server._Fit._restore: the Real-ESRGAN TensorRT engine (x = the model frame as fp16
 // NCHW [1,3,h,w], y = its 4x reconstruction [1,3,4h,4w]) then realesr.fit to the restore
 // target: `out.clamp(0,1)` first, an antialiased bicubic when the target height shrinks
@@ -698,6 +693,14 @@ __global__ void k_restIn(const float* __restrict__ src, int planeStride, int row
     dst[o] = f2h(src[s]);
     dst[plane + o] = f2h(src[planeStride + s]);
     dst[2 * plane + o] = f2h(src[2 * planeStride + s]);
+}
+
+// fp32 -> fp16 element for element, round to nearest even: the frames the RIFE engines take in
+// fp16 (the IFNet's x, the encode's img)
+__global__ void k_f2h(const float* __restrict__ src, unsigned short* __restrict__ dst, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = f2h(src[i]);
 }
 
 // the shrinking fold, horizontal pass: the 4x output (fp16 or fp32 planar, clamped per tap)
@@ -774,7 +777,7 @@ __global__ void k_restToF(const void* __restrict__ src, int half, int n, float* 
     if (i < n) dst[i] = restTap(src, half, (size_t)i);
 }
 
-// offline DLSS 5 (priority 24 step 2d): dlssnr.py process() around the NR host's RGBA16F
+// offline DLSS 5: dlssnr.py process() around the NR host's RGBA16F
 // frame. In: the planar (R, G, B) output-size frame, clamp(0, 1).to(float16) (round to
 // nearest even, torch's cast) plus alpha 1.0. Out: the first three channels, .float().clamp(0,
 // 1), back to tight planar.
@@ -812,9 +815,9 @@ __global__ void k_clamp01(float* __restrict__ p, int n)
     if (i < n) { const float v = p[i]; p[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 }
 
-// ---- live GMFSS glue (2026-09-15, full native migration item 5 sub-step 5b) ---------------
-// The eager glue of GMFSS_infer_u.Model.inference() as four kernels; no chain calls them yet
-// (sub-step 5c). Every buffer is planar NCHW with N = 1, contiguous unless a stride is passed.
+// ---- live GMFSS glue ------------------------------------------------------------------------
+// The eager glue of GMFSS_infer_u.Model.inference() as four kernels (the chain in
+// nativeGmfssPair / nativeGmfssTween calls them). Every buffer is planar NCHW with N = 1, contiguous unless a stride is passed.
 //   k_half      F.interpolate(x, scale_factor=0.5, mode='bilinear', align_corners=False) on an
 //               even-sized frame = the 2x2 box (torch's lambdas are exactly 0.5, and scaling by
 //               a power of two is exact, so the sum order below reproduces torch's fp32 result
@@ -841,7 +844,7 @@ __global__ void k_clamp01(float* __restrict__ p, int n)
 //   k_splatNorm python's tail: acc.to(float32) * 2^-26 per plane, out = v / (vN + 1e-7),
 //               written as C planes of the target (the fusionnet input planes: a channel concat
 //               is adjacent planes, so no cat).
-// Gate: harness\eff\gmfss_equiv.py (fp64 references, real-motion inputs through the engines).
+// Checked against fp64 references on real-motion inputs through the engines.
 __device__ __forceinline__ float gmTap(const void* __restrict__ src, int half, size_t o)
 {
     return half ? h2f(((const unsigned short*)src)[o]) : ((const float*)src)[o];
@@ -893,7 +896,7 @@ __global__ void k_pyr(const void* __restrict__ src, int srcHalf, int C, int sw, 
 // one source pixel of (w, h): C planes of `in` (fp16 features or the fp32 image half), the flow
 // (2, h, w) fp32 (plane 0 = x), the metric (1, h, w) (fp16 from the engine, fp32 from k_pyr),
 // both scaled by s, splatted into C + 1 int64 planes (zeroed by the caller; plane C = exp(Z)).
-// Neighbour combine (priority 30 lever 4): products bound for the SAME target pixel are summed
+// Neighbour combine: products bound for the SAME target pixel are summed
 // before one atomic. Horizontal: lane i's NW / SW corner is lane i - 1's NE / SE corner (same
 // target coordinates) -> lane i adds both, lane i - 1 skips (warp shuffle). Vertical: the
 // thread one block row below whose NW / NE corners are my SW / SE corners takes my bottom row
@@ -902,7 +905,7 @@ __global__ void k_pyr(const void* __restrict__ src, int srcHalf, int C, int sw, 
 // target coordinates, not on the thread layout, so any block shape is correct; the host
 // launches 32 x 8 (one warp = 32 consecutive x of one row). The block must be a multiple of 32
 // threads and at most 256. No early return: every thread joins the shuffles and barriers.
-// Gate: harness\p36\splat_bench.py (accumulators equal to the pre-combine kernel bit for bit).
+// Checked: the accumulators equal a one-atomic-per-corner splat's bit for bit.
 __global__ void k_splatSoft(const void* __restrict__ in, int inHalf, int C,
                             const float* __restrict__ flow, const void* __restrict__ metric,
                             int metricHalf, float s, int w, int h, long long* __restrict__ acc)
@@ -918,8 +921,7 @@ __global__ void k_splatSoft(const void* __restrict__ in, int inHalf, int C,
     const size_t o = act ? (size_t)y * w + x : 0;
     // the target cell and the corner weights from land(), never an fp32 absolute position:
     // python's fp32 `x + s * flow` carries a 6e-5 px error at x ~ 600..960 (one fp32 ulp), which
-    // the harness measured as up to 8.7e-4 of the normalized output where the weight sum is small
-    // (2026-09-15)
+    // measures up to 8.7e-4 of the normalized output where the weight sum is small
     int nwX = 0, nwY = 0;
     float dx = 0.0f, dy = 0.0f;
     if (act)
@@ -1072,7 +1074,7 @@ __global__ void k_rcasOutHdr(const float* __restrict__ src, int dw, int dh, floa
     *p = q[0] | (q[1] << 10) | (q[2] << 20) | (3u << 30);
 }
 
-// RCAS on the staging frame, then the offline raw store (priority 24 step 2): tight rgb48le
+// RCAS on the staging frame, then the offline raw store: tight rgb48le
 // (out16) or rgb24 at dw x dh, render.py to_bytes' rounding (k_packOutRaw16 / 8's)
 __global__ void k_rcasOutRaw(const float* __restrict__ src, int dw, int dh, float con,
                              unsigned char* __restrict__ dst, int out16)
@@ -1089,7 +1091,7 @@ __global__ void k_rcasOutRaw(const float* __restrict__ src, int dw, int dh, floa
         for (int ci = 0; ci < 3; ci++) dst[o + ci] = (unsigned char)(int)rintf(c[ci] * 255.0f);
 }
 
-// ---- WO-23: live RTX TrueHDR inside the native host ---------------------------------------
+// ---- live RTX TrueHDR inside the native host ----------------------------------------------
 // Verbatim math of live_server.py _cap_to_pq2020 (~88) and rtxvideo.py _eval_thdr (~248),
 // run_hdr_pq (~280), _ictcp_linear (~330), _rtx_linear (~355), _vibrance_gain and
 // _luma_weight. TrueHDR runs ONCE PER REAL FRAME at capture resolution; the PQ result is
@@ -1269,7 +1271,7 @@ __device__ __forceinline__ void thdr_linear(unsigned int u, float s0, float s1, 
     }
 }
 
-// step 5 of the WO: unpack the bridge output (10:10:10:2, B in the LOW 10 bits), apply the
+// Unpack the bridge output (10:10:10:2, B in the LOW 10 bits), apply the
 // colour mode against the unquantised source, and write planar PQ at capture resolution.
 // mode 0 = vivid (_ictcp_linear), 1 = rtx (_rtx_linear), 2 = raw.
 __global__ void k_thdrColor(const unsigned int* __restrict__ thdrOut,
@@ -1300,7 +1302,7 @@ __global__ void k_thdrColor(const unsigned int* __restrict__ thdrOut,
     dst[2 * plane + o] = p2;
 }
 
-// ---- priority 24 step 2c: offline RTX TrueHDR (rtxvideo.run_hdr on every output frame) ----
+// ---- offline RTX TrueHDR (rtxvideo.run_hdr on every output frame) -------------------------
 // The output-size SDR frame after the pass chain -> the bridge's BGRA8 input (_eval_thdr: clamp,
 // * 255, round) and the unquantised planar source the colour step reads (R, G, B, tight).
 __device__ __forceinline__ void thdr_in_store(float r, float g, float b, size_t o, size_t plane,
@@ -1419,7 +1421,7 @@ __global__ void k_thdrOut(const unsigned int* __restrict__ thdrOut, const float*
     if (tid < 4 && shMax[tid]) atomicMax(&misc[tid], shMax[tid]);
 }
 
-// WO-32 offline render: raw interleaved RGB frames (rgb48le or rgb24, the decoder pipe format
+// Offline render: raw interleaved RGB frames (rgb48le or rgb24, the decoder pipe format
 // render.py uses) <-> the model's planar fp32 [0,1] with replicate pad, channel order R,G,B exactly
 // as render.py's to_tensor / to_bytes (the live route packs BGRA8 and is a different contract).
 __global__ void k_packInRaw16(const unsigned short* __restrict__ src, int w, int h,
@@ -1497,12 +1499,11 @@ __global__ void k_packOutRaw8(const float* __restrict__ src, int planeStride, in
     }
 }
 
-// ---- native NVOF model glue (2026-09-21, memory priority 20 step 2) -------------------------
+// ---- native NVOF model glue -----------------------------------------------------------------
 // The tween maths of the NVOF model: the NVIDIA Optical Flow Accelerator gives both flow fields
 // of a pair in ONE Execute (grid 4, S10.5 vectors in INPUT pixels, uint8 cost per cell), these
 // kernels turn them into tweens by a bidirectional softmax FORWARD splat (the GMFSS glue without
-// the networks). Step 2 compiles this text through NVRTC in harness\nvof\warp (cupy), step 3
-// pastes it into smv-live-native.inl unchanged (gate: harness\nvof\warp\nvof_equiv.py).
+// the networks), gated against a float64 reference implementation.
 // Every buffer is planar with N = 1; an image is 3
 // fp32 planes addressed by (planeStride, rowStride) like the host's padded model planes, a flow
 // or metric plane is contiguous (w, h).
@@ -1520,8 +1521,7 @@ __global__ void k_packOutRaw8(const float* __restrict__ src, int planeStride, in
 //                   frame 1), the same four corner weights and int64 atomics (2^40, below).
 //   k_splatNvofNorm acc -> the tween; where the plain coverage is below `hole` (nothing landed),
 //                   the plain blend (1 - t) I0 + t I1, and the hole is counted.
-// All fp32 since 2026-09-26 (user order: no fp64 in the kernels; the fp64 form cost 2 to 3 ms per
-// 1080p tween plus 1.4 ms per pair, harness\p38 / p41): a splat lands by land(), a sample by
+// All fp32 (fp64 cost 2 to 3 ms per 1080p tween plus 1.4 ms per pair): a splat lands by land(), a sample by
 // nvAxis (the pixel plus the floor and the fraction of its offset), never at an fp32 absolute
 // coordinate (one ulp at x ~ 2000 is 1.2e-4 px); the k_nvofUp taps are integer ratios, exact at
 // the power-of-two grids; k_nvofLuma rounds exactly like the fp64 form.
@@ -1568,13 +1568,13 @@ extern "C" __global__ void k_nvofLuma(const float* __restrict__ src, int planeSt
     if (x >= w || y >= h) return;
     const size_t o = (size_t)y * rowStride + x;
     // planeStride is SIGNED: the live host's planes are (B, G, R), so it passes the R plane with
-    // a negative stride and the BT.709 weights still meet R, G, B in this order
-    // rounded EXACTLY as the fp64 form rounded clip(v, 0, 1) * 255 (2026-09-26, no fp64): the
-    // constants, products and sums carry their fp32 rounding error as a second float (ffMul /
-    // ffAdd), so the value is known to ~1e-12 and the rounding takes the same side of every x.5 the
-    // double sum took. A plain fp32 sum sits up to ~2.5e-5 off at 255 and moved up to 127 codes of
-    // a 1080p frame by one (harness\p41 nvof_equiv); these codes feed the Optical Flow
-    // Accelerator, whose block matching can turn one moved code into another vector.
+    // a negative stride and the BT.709 weights still meet R, G, B in this order. The luma is
+    // rounded EXACTLY as an fp64 clip(v, 0, 1) * 255 would round: the constants, products and
+    // sums carry their fp32 rounding error as a second float (ffMul / ffAdd), so the value is
+    // known to ~1e-12 and the rounding takes the same side of every x.5 an fp64 sum takes. A
+    // plain fp32 sum sits up to ~2.5e-5 off at 255 and moves up to 127 codes of a 1080p frame by
+    // one; these codes feed the Optical Flow Accelerator, whose block matching can turn one
+    // moved code into another vector.
     const float s[3] = { src[o], src[(long long)planeStride + (long long)o],
                          src[2 * (long long)planeStride + (long long)o] };
     const float kh[3] = { 0.2126f, 0.7152f, 0.0722f };                 // the double constants =
@@ -1619,7 +1619,7 @@ extern "C" __global__ void k_nvofUp(const short* __restrict__ vec, int vecPitch,
                                     float* __restrict__ flow, float* __restrict__ costOut)
 {
     // the taps depend on x alone (x0, x1, lx) or y alone (y0, y1, ly), so lane t of the block
-    // fills column t and row t ONCE with nvUpTap (2026-09-26, priority 30 lever 10), the pixels
+    // fills column t and row t ONCE with nvUpTap, the pixels
     // read them; a block side above 32 = per pixel
     __shared__ int sX0[32], sX1[32], sY0[32], sY1[32];
     __shared__ float sLx[32], sLy[32];
@@ -1742,8 +1742,8 @@ extern "C" __global__ void k_splatNvofNorm(const long long* __restrict__ acc, in
         dst[(size_t)c * planeStride + io] = __fdiv_rn((float)acc[(size_t)c * plane + o] * (1.0f / NV_FIX), norm);
 }
 
-// ---- the PULL warp with a confidence fallback (2026-09-21 fix round, variant E2; the product
-// since then, the forward splat above stays for the fp64 gate's history) ---------------------
+// ---- the PULL warp with a confidence fallback (the tween the product runs; the forward splat
+// above is not launched) ----------------------------------------------------------------------
 // Per tween: (1) k_splatVel splats the VELOCITY (frame 0 -> 1 px) of both frames to time t with
 // the softmax weights exp(Z + bias): frame 0 along t * F01 (velocity F01), frame 1 along
 // (1 - t) * F10 (velocity -F10), each frame's plain coverage in its own plane (acc planes: vx e,
@@ -1756,7 +1756,7 @@ extern "C" __global__ void k_splatNvofNorm(const long long* __restrict__ acc, in
 // scipy's gaussian_filter) so it carries no speckle of its own. (5) k_nvofCompose samples
 // frame 0 at x - t V and frame 1 at x + (1 - t) V (bilinear, clamped), weighs them by time and
 // visibility, and mixes the result with the plain blend by the mask: failed vectors become
-// ghosting, never speckle. Gate: harness\nvof\warp\nvof_equiv_e.py against variants.variant_e.
+// ghosting, never speckle. Checked against a reference implementation of the same tween.
 extern "C" __global__ void k_splatVel(const float* __restrict__ flow, const float* __restrict__ Z,
                                       float s, float bias, float sign, int covPlane, int w, int h,
                                       long long* __restrict__ acc)
@@ -1875,9 +1875,9 @@ extern "C" __global__ void k_ppUp(const float* __restrict__ n, const float* __re
 // Gaussian blur, one axis (dir 0 = x, 1 = y), radius r = int(4 sigma + 0.5), reflect edges
 // (scipy's mode 'reflect': d c b a | a b c d), weights exp(-x^2 / (2 sigma^2)) normalised.
 // The weights and their sum depend only on k, so each block computes them ONCE into shared
-// memory (the sum in k order, as the per-pixel form adds them), then every pixel accumulates in
-// fp32 (the fp64 era's per-pixel double exp cost 15 ms of a 1080p tween, the double accumulation
-// 1.3 ms more, harness\p38 / p41). A radius above kBlurMaxR keeps the per-pixel form.
+// memory (the sum in k order, as the per-pixel form adds them) instead of 2r + 1 exps per
+// pixel, then every pixel accumulates in fp32. A radius above kBlurMaxR keeps the per-pixel
+// form.
 #define kBlurMaxR 64
 extern "C" __global__ void k_blur1(const float* __restrict__ src, int w, int h, float sigma, int dir,
                                    float* __restrict__ dst)
@@ -1952,8 +1952,8 @@ extern "C" __global__ void k_nvofCompose(const float* __restrict__ i0, const flo
     }
 }
 
-// ---- native DRBA glue (priority 21 (b) step 2, 2026-09-21) ---------------------------------
-// The two python pieces around the IFNet that DRBA adds on live (live_server.RifeDrba):
+// ---- native DRBA glue -----------------------------------------------------------------------
+// The two pieces DRBA adds around the IFNet, ported from the python reference:
 //   rife_backend.RIFE.calc_flow's tail: block0's flow (4 planes, 0->0.5 | 1->0.5) splatted by
 //     itself with softsplat 'avg', negated, holes (splatted ones < 0.999) filled with
 //     max(H, W), times 2 = flow05 * 2 | flow15 * 2.
@@ -1967,12 +1967,11 @@ extern "C" __global__ void k_nvofCompose(const float* __restrict__ i0, const flo
 // int64 fixed point at 2^32 (the GMFSS pattern, order-independent, deterministic); a value that
 // lands inside the frame is bounded by its own displacement (|v| <= max(W, H) + 1 for the flow
 // splat, <= 2 for the DRM), so 2^32 leaves 1e5 overlapping sources of headroom at 8K. All fp32
-// since 2026-09-26 (user order: no fp64 in the kernels; fp64 cost 0.7 ms of the DRBA glue,
-// harness\p38): a landing is land()'s (the pixel plus the floor and the exact fraction of the
-// offset), and the hole test runs on the integer weight accumulator (DRBA_HOLE), so it takes
-// exactly the fp64 form's decisions (an fp32 ratio flipped rare pixels between the fill and the
-// splat: the 0.053 timestep jump of the harness\p38 probe). Planes are contiguous (w * h each).
-// Gate: harness\drba\drba_equiv.py (fp64 references on real block0 flows).
+// (fp64 cost 0.7 ms of the DRBA glue): a landing is land()'s (the pixel plus the floor and the
+// exact fraction of the offset), and the hole test runs on the integer weight accumulator
+// (DRBA_HOLE), so it takes exactly the fp64 form's decisions (an fp32 ratio test flips rare
+// pixels between the fill and the splat, which jumps their timestep). Planes are contiguous
+// (w * h each). Checked against fp64 references on real block0 flows.
 
 #define DRBA_FIX 4294967296.0f
 // hole = w / (w + 1e-7) < 0.999 = w < 9.99e-5 = acc < 9.99e-5 * 2^32 = 429067.23
@@ -2104,7 +2103,7 @@ struct NvrtcApi
 static std::wstring g_nativeRuntimeDir;   // engine\gpu_runtime: the CUDA 13 + TensorRT-RTX DLLs
 static std::wstring g_nativeEngineDir;    // ...\engine itself, the parent of the folders above
 
-// ---- WO-23: the RTX Video SDK CUDA bridge (engine\rtxvideo\rtxvideo_cuda.dll) -------------
+// ---- the RTX Video SDK CUDA bridge (engine\rtxvideo\rtxvideo_cuda.dll) --------------------
 // The TrueHDR bridge is NOT an NGX D3D11 bridge: it is a plain C ABI over CUDA device
 // pointers, the same DLL and the same entry points rtxvideo.py drives. The NGX feature DLLs
 // (nvngx_truehdr.dll, nvngx_vsr.dll) resolve relative to the LOADING module's directory, so
@@ -2124,7 +2123,7 @@ struct RtxBridge
     PFN_rtxvSetModelPath setModelPath = nullptr;
     PFN_rtxCreate create = nullptr;
     PFN_rtxEvalThdr evalThdr = nullptr;
-    PFN_rtxEvalVsr evalVsr = nullptr;   // live RTX VSR (2026-09-15): 8-bit BGRA in and out
+    PFN_rtxEvalVsr evalVsr = nullptr;   // live RTX VSR: 8-bit BGRA in and out
     PFN_rtxShutdown shutdown = nullptr;
     bool created = false;
     std::wstring dir;
@@ -2170,7 +2169,7 @@ static bool rtxBridgeLoad()
     return true;
 }
 
-// priority 24 step 2c: offline TrueHDR's light statistics, python's RTXVideo _cll / _fall / _l1
+// Offline TrueHDR's light statistics, python's RTXVideo _cll / _fall / _l1
 // / _hp (rtxvideo.py _pack_out, _measure_light, _accum_l1, _accum_hp), accumulated per output
 // frame from k_thdrOut's block (hist[1024] u32, misc[4] u32, vSum int64 2^24 fixed point) and written as one
 // JSON file render.py reads at the finalize: maxcll / maxfall always, the Dolby Vision L1
@@ -2187,7 +2186,7 @@ struct ThdrAcc
     bool wantL1 = false, wantHp = false;
     std::vector<ThdrL1> l1;
     std::vector<ThdrHp> hp;
-    // --hdr-frames (priority 24 step 6d): one line per output frame, appended and flushed as the
+    // --hdr-frames: one line per output frame, appended and flushed as the
     // record lands, "<frame MaxCLL> <frame MaxFALL>[ L <l1 x3>][ H <avg> <maxscl x3> <dist x9>]":
     // a killed render keeps every record of the frames it wrote, and a resumed render reads the
     // banked prefix back from it instead of decoding the banked video (python's _rebuild_hdr_stats)
@@ -2285,7 +2284,7 @@ struct ThdrAcc
         writeLine(fc, fa);
     }
 
-    // a held slot that carries the previous frame's finished bytes (DLSS 5 on, step 2d): the
+    // a held slot that carries the previous frame's finished bytes (DLSS 5 on): the
     // same picture, so the same record (MaxCLL / MaxFALL are unchanged by a repeat)
     void repeat()
     {
@@ -2387,7 +2386,7 @@ static bool nativeLoadDlls(const std::wstring& scriptPath)
             return false;
         }
     }
-    // the ONNX parser (ONNX-in-exe 3c-2): optional, without it a cold size cannot build
+    // the ONNX parser: optional, without it a cold size cannot build
     g_onnxParserOk = LoadLibraryExW((trtBin + L"\\tensorrt_onnxparser_rtx_1_6.dll").c_str(), nullptr,
                                     LOAD_WITH_ALTERED_SEARCH_PATH) != nullptr;
     if (!g_onnxParserOk) LOG("native: ONNX parser not loadable, a window size without warm engines cannot start\n");
@@ -2424,9 +2423,9 @@ struct NativeRife
     int dw = 0, dh = 0, x0 = 0, y0 = 0;
     int batchMax = 1;
     bool identity = false;
-    bool hdr = false;           // WO-15 phase 2: FP16 scRGB capture in, PQ R10A2 ring out
+    bool hdr = false;           // FP16 scRGB capture in, PQ R10A2 ring out
     int dev = 0;                // the CUDA device of the capture adapter (bound per thread)
-    // WO-23: live RTX TrueHDR through the CUDA bridge, once per real frame at capture size
+    // live RTX TrueHDR through the CUDA bridge, once per real frame at capture size
     bool rtxHdr = false;        // the session asked for it and the bridge loaded
     bool rtxFailed = false;     // a mid-run eval failed: faithful PQ for the rest of the run
     RtxThdrSetting thdr{};      // Contrast, Saturation, MiddleGray 50, MaxLuminance 1000
@@ -2435,7 +2434,7 @@ struct NativeRife
     float rtxVib = 0.0f, rtxSb = 0.0f;
     double thdrMs = 0.0, thdrMaxMs = 0.0;   // host-side eval cost, reported at teardown
     uint64_t thdrN = 0;
-    // live Sharpen and RTX VSR (2026-09-15), the app's --sharpen / --rtx-vsr on this route
+    // live Sharpen and RTX VSR, the app's --sharpen / --rtx-vsr on this route
     float sharpen = 0.0f;       // RCAS strength 0..1 at the presented size (0 = off)
     bool vsrWant = false;       // --rtx-vsr on an SDR session with the bridge and its DLL present
     bool vsr = false;           // ...and the fit enlarges in both axes (decided after the handoff)
@@ -2443,16 +2442,16 @@ struct NativeRife
     RtxVsrSetting vsrSet{ 4 };
     double vsrMs = 0.0, vsrMaxMs = 0.0;
     uint64_t vsrN = 0;
-    // the downscaling fit (2026-09-15): python's antialiased bicubic pair into the staging frame
+    // the downscaling fit: python's antialiased bicubic pair into the staging frame
     bool fitAa = false;         // the fit to (dw, dh) shrinks its source height (python's antialias rule)
-    // Upscale to (2026-09-15, full native migration item 2): the app's --upscale H = the
+    // Upscale to: the app's --upscale H = the
     // INTERNAL render size (uw, uh), derived like _Fit.__init__ from the exe's own flag. The
     // model frame goes there first (RTX VSR when it enlarges, else bicubic, antialiased when
     // it shrinks), then the fit to (dw, dh) like any frame. 0 = off (also when it equals the
     // fit rect: one resize, not two, the python rule).
     int uw = 0, uh = 0;
     bool upAa = false;          // the first resize shrinks the height (uh < h)
-    // live Restore (2026-09-15, full native migration item 3): the python handoff builds the
+    // live Restore: the handoff builds the
     // Real-ESRGAN TensorRT engine into the shared cache and hands its path over like the
     // IFNet's; the host runs it on every presented frame before the upscale, then folds the 4x
     // output to the first resize target (_Fit._load_restore's restore_target rule: back to the
@@ -2460,7 +2459,7 @@ struct NativeRife
     // rect). A mid-run failure drops the pass for the rest of the session with one line.
     std::string restorePath, rjitPath;
     bool restore = false;       // the handoff named an engine (the session asked for it)
-    // no-engine mode (2026-09-15, full native migration item 4): the effects-only route (the
+    // no-engine mode: the effects-only route (the
     // app's `echo` backend, no model ticked) runs here too. The handoff answers with the
     // geometry only (`engine=none`, plus the restore engine when asked for): no IFNet, no
     // encode, no tween; every group stores its one real frame through the same effects
@@ -2468,13 +2467,12 @@ struct NativeRife
     // from `NATIVE-PATH cache=` since no jit path names it.
     bool noEngine = false;
     std::string cachePath;
-    // GMFSS (full native migration item 5, sub-steps 5a to 5c, 2026-09-15): the handoff answers
+    // GMFSS: the handoff answers
     // `engine=gmfss` with the five engines of live_server.Gmfss (feat_ext at the padded size,
     // the fused bidir GMFlow, metricnet, the GMFSS IFNet and fusionnet at the half) and their
     // jit caches; this host loads, warms and keeps the set resident (one model set at a time)
-    // and since sub-step 5c runs the chain itself (nativeGmfssPair / nativeGmfssTween, the
-    // glue kernels of 5b), so gmfss is a native backend like rife. (Sub-step 5d's Flow scale
-    // below 100, gmflow at a /32 flow grid, was dropped with the control 2026-09-25.)
+    // and runs the chain itself (nativeGmfssPair / nativeGmfssTween with the glue kernels
+    // above), so gmfss is a native backend like rife.
     bool gmfss = false;
     int hh = 0, hw = 0;                          // the half frame (the fusion grid)
     std::string gmPath[5], gmJit[5];
@@ -2503,8 +2501,8 @@ struct NativeRife
     float* dGmF = nullptr;           // that output clamped to fp32: what storeSlot consumes
     // SMV_LIVE_GMFSS_PROF=1: per-phase CUDA-event breakdown of the chain, printed every 32
     // groups (the native answer to the python route's [timing] line; nine spans, the tween ones
-    // measured on the group's FIRST tween). Sub-step 5e split the old pair span into half |
-    // flow | metric | pyr and added the CPU (QPC) enqueue spans beside the GPU ones: the pair
+    // measured on the group's FIRST tween). The pair span splits into half | flow | metric |
+    // pyr, with the CPU (QPC) enqueue spans beside the GPU ones: the pair
     // block, the gmflow enqueue inside it, and every tween. The exe runs a group ahead of the
     // GPU, so those CPU numbers are launch cost, not the GPU pace.
     bool gmProf = false, gmProfTween = false;
@@ -2513,7 +2511,7 @@ struct NativeRife
     uint32_t gmProfN = 0;
     double gmCpuPair = 0.0, gmCpuFlow = 0.0, gmCpuTween = 0.0;
     uint32_t gmCpuPairN = 0, gmCpuTweenN = 0;
-    // NVIDIA Smooth Motion (fruc, 2026-09-21, memory priority 21): the handoff answers
+    // NVIDIA Smooth Motion (fruc): the handoff answers
     // `engine=fruc` with the /64 padded geometry and `NATIVE-PATH fruc=` (the folder holding the
     // shipped nvoffruc_bridge.dll beside the user-installed NvOFFRUC.dll + cudart64_110.dll);
     // this host drives that bridge's flat C API exactly as live_server.py's Fruc class does
@@ -2521,7 +2519,7 @@ struct NativeRife
     // one bridge call per tween, the BGRA8 result unpacked (k_unpackBgra). The planes go in as
     // stored, so FRUC sees true BGRA on live (python's SDR route swaps R and B into it).
     bool fruc = false;
-    bool dlssg = false;              // offline DLSS 4.5 (priority 24 step 5): no IFNet, a child server
+    bool dlssg = false;              // offline DLSS 4.5: no IFNet, a child server
     std::string frucDir;             // the bridge folder the handoff named
     uint8_t* dFrSurf[3] = {};        // BGRA8 pw x ph: the packed frames, rotated per group
     uint8_t* dFrOutB = nullptr;      // BGRA8 pw x ph: the bridge's output
@@ -2536,16 +2534,16 @@ struct NativeRife
     uint64_t frCalls[4] = {};
     bool frCreated = false;
     uint64_t frPrimed = 0, frRepeats = 0, frTweens = 0;
-    // parallel instances (memory priority 32b, bridge nvoffruc_step_i): tween k of a pair's plan
+    // parallel instances (the direct-t scheme, bridge nvoffruc_step_i): tween k of a pair's plan
     // runs on instance k % frInst, a round of frInst tweens at a time; instance 0 on the compute
     // thread, the others on their own workers (g_frW), each into its own BGRA8 output
     int frInst = 1, frInstMax = 1;
     uint8_t* dFrOutBI[4] = {};       // [0] = dFrOutB
     double frPlan[64] = {};
     uint32_t frPlanN = 0, frPlanK = 0;
-    // recursive midpoints (priority 34, 2026-09-26): NvOFFRUC damages content that does not move
-    // at every t != 0.5, even called exactly as NVIDIA documents it (WO "[Smooth Motion jitters on
-    // consecutive identical frames]"), so every tween is node k / 2^L of the pair's midpoint tree:
+    // recursive midpoints (the default): NvOFFRUC damages content that does not move at every
+    // t != 0.5, even called exactly as NVIDIA documents it, so every tween is node k / 2^L of the
+    // pair's midpoint tree:
     // FRUC at t = 0.5 between the node's two parents, level L on instance L - 1, which then sees
     // one continuous stream of new frames (NVIDIA's one call per new frame). A t that is no node
     // takes the nearest node of depth frMpCap. SMV_FRUC_MIDPOINTS=0 = the direct-t scheme above.
@@ -2558,14 +2556,14 @@ struct NativeRife
     bool frNodeOk[16] = {};
     uint64_t frLastKey[4] = {};      // per instance: the key of the frame it was fed last, 0 = none
     uint64_t frNodeCalls = 0;
-    // RIFE with DRBA timing (rifedrba, 2026-09-21, memory priority 21 (b) step 3): the RIFE
+    // RIFE with DRBA timing (rifedrba): the RIFE
     // handoff plus `NATIVE-PATH block0=` (calc_flow's block0 as its own engine) and `engine=drba
     // lag=1`. live_server.RifeDrba natively: a four-frame history of padded frames and their
     // encodes, windows centred on a frame id (two kept, chained: a window's left flow is the
     // previous window's right one, reversed), the lag-1 group (every slot shows time (k-2) + f,
     // the real slot is frame k-1), one IFNet enqueue per tween with its own DRM timestep map
-    // (the step 2 kernels k_drbaFlowSplat / FlowNorm / DrmSplat / DrmNorm, fp64-gated by
-    // harness\drba\drba_equiv.py), the head fallback (plain pair RIFE on the lagged pair).
+    // (the kernels k_drbaFlowSplat / FlowNorm / DrmSplat / DrmNorm above, gated against a float64
+    // reference), the head fallback (plain pair RIFE on the lagged pair).
     bool drba = false;
     std::string block0Path, block0Jit;
     nvinfer1::ICudaEngine* engB0 = nullptr;
@@ -2575,6 +2573,7 @@ struct NativeRife
     float* dDrI[4] = {};             // (3, ph, pw) the padded frames
     float* dDrF[4] = {};             // (16, ph, pw) their encodes, fp32 (fp16 in place when featHalf)
     float* dDrX[2] = {};             // (6, ph, pw) IFNet x: [0] = [k-1, k-2] (side -1), [1] = [k-2, k-1]
+                                     // (fp16 in place when xHalf)
     uint32_t drXFor[2] = {};         // the newest frame id each x was built for (0 = none)
     struct DrWin { uint32_t c; float* f10; float* r; };   // r = (4, ph, pw): flow12 | flow21
     DrWin drWin[2] = {};             // c = 0: empty
@@ -2582,19 +2581,18 @@ struct NativeRife
     float* dDrFlowN = nullptr;       // (4, ph, pw) a non-chained left flow's FlowNorm output
     long long* dDrAcc = nullptr;     // (6, ph, pw) the splat accumulator
     uint64_t drTweens = 0, drHeads = 0, drBlock0 = 0;
-    // NVIDIA Optical Flow model (2026-09-21, memory priority 20 step 3): the handoff answers
+    // NVIDIA Optical Flow model: the handoff answers
     // `engine=nvof` with the geometry only (like echo, no TensorRT engine at all); this host runs
     // the Optical Flow Accelerator itself through the driver's nvofapi64.dll (grid 4, fast,
     // BOTH directions in one Execute, gray8 of the two model frames at the true w x h) and the
-    // glue kernels k_nvofLuma / k_nvofUp / k_nvofMetric (fp64-gated by
-    // harness\nvof\warp\nvof_equiv.py; k_splatNvof / k_splatNvofNorm in the kernel text are
-    // the forward-splat tween the E2 tween below replaced, kept only because the text is
-    // shared byte for byte with that harness).
+    // glue kernels k_nvofLuma / k_nvofUp / k_nvofMetric (checked against fp64 references;
+    // k_splatNvof / k_splatNvofNorm in the kernel text are a forward-splat tween with no host
+    // launch, kept because the kernel text is shared byte for byte with that check).
     bool nvof = false;
     // plane order of the model planes: live capture packs (B, G, R) (BGRA textures), the OFFLINE
     // route's k_packInRaw8 / 16 pack the decoder's rgb24 / rgb48 as (R, G, B); k_nvofLuma needs
     // R, G, B, so it gets the R plane with a negative stride on live and plain planes offline
-    // (found 2026-09-21: offline renders ran with red and blue weights swapped until then)
+    // (the wrong order swaps the red and blue luma weights)
     bool planesRgb = false;
     NvOFHandle ofH = nullptr;
     NvOFGPUBufferHandle ofIn[2] = {}, ofOut[2] = {}, ofCost[2] = {};   // [0] forward, [1] backward
@@ -2610,7 +2608,7 @@ struct NativeRife
     cudaEvent_t nvEv[2] = {};
     double nvPairMs = 0.0, nvTweenMs = 0.0;
     uint32_t nvPairN = 0, nvTweenN = 0;
-    // the E2 tween (2026-09-21 fix round): the pull warp + confidence fallback. The velocity
+    // the tween: the pull warp + confidence fallback. The velocity
     // at time t (n / d = the push-pull level 0 inputs), the two visibilities, the raw and the
     // blurred fallback mask, the blur's pass, and the push-pull pyramid levels 1.. (n, d, out)
     float* dNvN0 = nullptr;          // (2, h, w) velocity * confidence
@@ -2649,6 +2647,9 @@ struct NativeRife
     nvinfer1::IExecutionContext* ctxEnc = nullptr;
     bool encHalf = true;
     bool featHalf = false;      // IFNet / block0 take f0 / f1 in fp16: the encode writes dF directly
+    // the IFNet's x / the encode's img in fp16 (read off each engine on its own, so a cache that
+    // mixes the two revisions still works: the encode features are the same either way)
+    bool xHalf = false, imgHalf = false;
 
     // ---- CUDA
     cudaStream_t stream = nullptr;
@@ -2660,17 +2661,17 @@ struct NativeRife
     uint8_t* dCap = nullptr;
     float* dTmp = nullptr;
     float* dCapF = nullptr;     // HDR + image scale under 1: planar PQ at capture resolution
-    uint8_t* dThdrIn = nullptr;   // WO-23: BGRA8 bridge input, pitch 4*cw
-    uint32_t* dThdrOut = nullptr; // WO-23: packed 10:10:10:2 bridge output, B in the low bits
-    float* dSrcG = nullptr;       // WO-23: the unquantised sRGB-encoded source, planar fp32
-    // priority 24 step 2c: offline TrueHDR at the output size dw x dh (the three buffers above,
+    uint8_t* dThdrIn = nullptr;   // BGRA8 bridge input, pitch 4*cw
+    uint32_t* dThdrOut = nullptr; // packed 10:10:10:2 bridge output, B in the low bits
+    float* dSrcG = nullptr;       // the unquantised sRGB-encoded source, planar fp32
+    // offline TrueHDR at the output size dw x dh (the three buffers above,
     // sized dw x dh there) and its per-frame statistics block, read back one frame late
     uint8_t* dThdrStats = nullptr;   // k_thdrOut's hist / misc / vSum (kThdrStatsBytes)
     uint8_t* hThdrStats = nullptr;   // its pinned copy, valid after the next stream sync
     bool thdrStatsPending = false;
     ThdrAcc* thdrAcc = nullptr;      // the render's accumulators (runOfflineSession owns them)
     uint32_t thdrRepeat = 0;         // held slots that reuse the pending frame's record (DLSS 5)
-    // priority 24 step 2d: offline DLSS 5, the NR core on its own D3D12 device (dlssnr.exe's
+    // offline DLSS 5: the NR core on its own D3D12 device (dlssnr.exe's
     // startup + renderFrame), one RGBA16F frame at dw x dh through pinned host staging
     nr::Host* nrHost = nullptr;      // null = DLSS 5 off or unavailable for this render
     bool nrFailed = false;           // an evaluate failed: off for the rest of the render
@@ -2689,6 +2690,8 @@ struct NativeRife
     uint8_t* dVsrIn = nullptr;    // VSR: tight BGRA8 at the model size w x h
     uint8_t* dVsrOut = nullptr;   // VSR: tight BGRA8 at the presented size dw x dh
     float* dX = nullptr;        // (1,6,ph,pw): prev in planes 0..2, cur in 3..5
+    uint16_t* dXh = nullptr;    // dX in fp16 for the RIFE engines that take fp16 frames (xHalf /
+                                // imgHalf); DRBA uses its cur half for the encode only
     float* dF[2]{};             // f_prev / f_cur, (1,16,ph,pw)
     uint16_t* dEncHalf = nullptr;
     float* dT = nullptr;        // (B,1,ph,pw)
@@ -2699,10 +2702,10 @@ struct NativeRife
 
     CUmodule cuMod = nullptr;
     CUfunction fPackInDirect = nullptr, fResizeH = nullptr, fResizeV = nullptr,
-               fH2f = nullptr, fPackOut = nullptr;
+               fH2f = nullptr, fF2h = nullptr, fPackOut = nullptr;
     CUfunction fPackInDirectHdr = nullptr, fPqPlanar = nullptr, fResizeHf = nullptr,
                fPackOutHdr = nullptr;
-    CUfunction fSdrEncode = nullptr, fThdrColor = nullptr;   // WO-23
+    CUfunction fSdrEncode = nullptr, fThdrColor = nullptr;   // live TrueHDR
     CUfunction fThdrIn = nullptr, fRcasThdrIn = nullptr, fThdrOut = nullptr, fPqLut = nullptr;   // offline TrueHDR
     CUfunction fPackBgra = nullptr, fUnpackBgra = nullptr, fFitPlanar = nullptr,   // sharpen / VSR
                fRcasOut = nullptr, fRcasOutHdr = nullptr, fRcasOutRaw = nullptr,
@@ -2714,11 +2717,11 @@ struct NativeRife
     CUfunction fNrIn = nullptr, fNrOut = nullptr;                       // offline DLSS 5
     CUfunction fHalf = nullptr, fPyr = nullptr, fSplatSoft = nullptr,   // live GMFSS glue (5b)
                fSplatNorm = nullptr;
-    CUfunction fPackInRaw16 = nullptr, fPackInRaw8 = nullptr,           // WO-32 offline
+    CUfunction fPackInRaw16 = nullptr, fPackInRaw8 = nullptr,           // offline
                fPackOutRaw16 = nullptr, fPackOutRaw8 = nullptr, fExpand8to16 = nullptr;
     CUfunction fPairDiff = nullptr;                                     // identical-pair test
     CUfunction fNvofLuma = nullptr, fNvofUp = nullptr, fNvofMetric = nullptr;   // the nvof model
-    CUfunction fSplatVel = nullptr, fVelNorm = nullptr, fPpDown = nullptr,     // its E2 tween
+    CUfunction fSplatVel = nullptr, fVelNorm = nullptr, fPpDown = nullptr,     // its pull-warp tween
                fPpTop = nullptr, fPpUp = nullptr, fBlur1 = nullptr, fNvofCompose = nullptr;
     CUfunction fDrFlowSplat = nullptr, fDrFlowNorm = nullptr,               // native DRBA
                fDrDrmSplat = nullptr, fDrDrmNorm = nullptr;
@@ -2788,9 +2791,9 @@ struct NativeRife
 };
 // ---- part 2: handoff, engine load, kernels, buffers, the compute thread -------------------
 
-// What a --resident process keeps between sessions (memory priority 7): the TensorRT runtime,
-// the two deserialized engines, the JIT kernel cache and the NVRTC kernel module, plus the
-// last successful handoff's facts so the same window starts without a python process at all.
+// What a --resident process keeps between sessions: the TensorRT runtime, the two deserialized
+// engines, the JIT kernel cache and the NVRTC kernel module, plus the last successful
+// handoff's facts so the same window starts again without a new handoff.
 // Everything else in NativeRife (stream, execution contexts, buffers, imports, events) is per
 // session. Sessions are strictly sequential (the previous compute thread is joined before
 // the next early thread starts), so no lock guards this.
@@ -2803,12 +2806,13 @@ struct NativeResident
     nvinfer1::ICudaEngine* engRest = nullptr;   // live Restore: kept beside the pair, per path
     std::string block0Path;                     // native DRBA: kept beside the pair, per path
     nvinfer1::ICudaEngine* engB0 = nullptr;
-    std::string gmPath[5];                      // the GMFSS set (sub-step 5a), exclusive with the pair
+    std::string gmPath[5];                      // the GMFSS set, exclusive with the pair
     nvinfer1::ICudaEngine* engGm[5] = {};
     nvinfer1::IRuntimeCache* jit = nullptr;
     CUmodule cuMod = nullptr;
     bool encHalf = true;
     bool featHalf = false;
+    bool xHalf = false, imgHalf = false;
     int dev = 0;
     // memoised handoff: the python command line minus gen (the fast path ignores gen and the
     // cold path builds the fixed 1to8 class regardless) and the facts it answered with
@@ -2821,8 +2825,8 @@ static NativeResident g_res;
 // drop the resident engine pair (a different pair is needed for a new window size). The
 // kernel module and the memoised handoff are engine independent and stay: the session that
 // calls this already adopted the module in nativeBuildKernels and stored the new handoff
-// facts (unloading the module here broke the first kernel launch of session 3 in the
-// 2026-09-12 harness run). The calling thread must have the device bound.
+// facts (unloading the module here broke the first kernel launch of a later session). The
+// calling thread must have the device bound.
 static void residentFreeEngines()
 {
     if (!g_res.rt) return;
@@ -2875,7 +2879,7 @@ static bool nativeBackendOk(const std::wstring& backend)
 static const char* const kGmKey[5] = { "gfeat", "gflow", "gmetric", "gifnet", "gfusion" };
 static const char* const kGmName[5] = { "feat_ext", "gmflow_bidir", "metricnet", "ifnet", "fusionnet" };
 
-// Upscale to (2026-09-15, full native migration item 2): _Fit.__init__'s derivation of the
+// Upscale to: _Fit.__init__'s derivation of the
 // internal render size from the exe's own --upscale H and the handoff geometry: the factor
 // up_h / h clamped to 1/16..16 (render.py's UPSCALE_F clamp), even dims, dropped when it
 // equals the fit rect (one resize, not two). Python rounds half to even and this rounds half
@@ -2998,7 +3002,7 @@ static const LookupTags& lkTags(const std::wstring& engDir)
     // the Restore engine's name part: md5[:8] of the bundled Real-ESRGAN weights (optional)
     const std::string rs = lkMd5Files({ engDir + L"\\realesr-animevideov3.pth" });
     t.rest = rs.size() >= 8 ? rs.substr(0, 8) : std::string();
-    // a shipped tree carries no weight files (the ONNX hold the weights, priority 29): the tags
+    // a shipped tree carries no weight files (the ONNX hold the weights): the tags
     // onnx_export.py wrote next to the ONNX ("w <tag>", "r <tag>", "rest <tag>"); a tag whose
     // weight file exists is always the hash above, so a dev tree never reads a stale file
     if (t.w.empty() || t.r.empty() || t.rest.empty())
@@ -3039,11 +3043,12 @@ static std::string lkG(double v)   // f"{v:g}"
 
 struct LkShape { const char* name; std::vector<int64_t> dims; };
 
-// MUST equal trt_lookup.ONNX_REV (a stale ONNX file is never used; rev 2 = the PRelu rewrite,
-// priority 30 step 2). Engines built from an older graph never survive a bump: the app and the
+// MUST equal trt_lookup.ONNX_REV (a stale ONNX file is never used; rev 2 = the PRelu rewrite).
+// Engines built from an older graph never survive a bump: the app and the
 // CLI empty the engine cache when its stamp (weights_tags.txt, which carries the rev, plus the
 // TensorRT-RTX version) no longer matches (src/render/cache.ts)
-static const int kOnnxRev = 3;   // 3: RIFE IFNet / block0 take f0 / f1 in fp16 (priority 30 lever 5a)
+static const int kOnnxRev = 4;   // 3: RIFE IFNet / block0 take f0 / f1 in fp16; 4: the IFNet's x
+                                 // and the encode's img in fp16
 
 // engine_name(): <base>_<shape per input joined by x, inputs by _>_<trt>_<w>, a dynamic batch
 // axis written lo"to"hi
@@ -3147,8 +3152,9 @@ static bool lkFind(nvinfer1::IRuntime* rt, const std::string& cacheDir, const st
 }
 
 // the RIFE IFNet / block0 class: fp32 everywhere except the feature encodes f0 / f1, fp32 up to
-// ONNX rev 2 and fp16 since rev 3 (both the same; nativeTrtInit pairs them with the encode output)
-static bool lkRifeIo(const LkIo& io)
+// ONNX rev 2 and fp16 since rev 3 (both the same; nativeTrtInit pairs them with the encode output),
+// and the IFNet's frame pair x, fp16 since rev 4 (block0's frames stay fp32)
+static bool lkRifeIo(const LkIo& io, bool ifnet)
 {
     std::string fd;
     for (auto& p : io.ins)
@@ -3157,6 +3163,10 @@ static bool lkRifeIo(const LkIo& io)
         {
             if ((p.second != "fp32" && p.second != "fp16") || (!fd.empty() && fd != p.second)) return false;
             fd = p.second;
+        }
+        else if (ifnet && p.first == "x")
+        {
+            if (p.second != "fp32" && p.second != "fp16") return false;
         }
         else if (p.second != "fp32") return false;
     }
@@ -3251,8 +3261,8 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
             { "gfusion", "fusionnet", "fusionnet", 1, { { "a", { 1, 9, hh, hw } }, { "b", { 1, 128, hh, hw } },
                                                         { "c", { 1, 256, hh / 2, hw / 2 } }, { "d", { 1, 384, hh / 4, hw / 4 } } } },
         };
-        // on the fusionnet jit; the `|0x0` tail was the flow grid of the dropped Flow scale,
-        // kept so every warm marker written before 2026-09-25 still matches
+        // on the fusionnet jit; the `|0x0` tail is a legacy flow-grid field, kept so existing
+        // warm markers still match
         sprintf_s(key, "%dx%d|0x0", s.ph, s.pw);
         s.warmKey = key;
         return true;
@@ -3412,7 +3422,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     std::string ipath, epath;
     LkIo iio, eio;
     if (!lkFind(rt, cacheDir, base, sets, batch ? "timestep" : nullptr, 1, batch, t, ipath, iio)) return false;
-    if (!lkRifeIo(iio)) return false;
+    if (!lkRifeIo(iio, true)) return false;
     const std::string ijit = lkJit(ipath);
     if (!lkWarm(ijit, s.warmKey)) return false;
     if (!lkFind(rt, cacheDir, lkEncodeBase(s, t), { { { "img", { 1, 3, ph, pw } } } }, nullptr, 0, 0, t, epath, eio))
@@ -3423,7 +3433,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
         LkIo bio;
         if (!lkFind(rt, cacheDir, lkBlock0Base(s, t), { lkBlock0Set(s) }, nullptr, 0, 0, t, bpath, bio))
             return false;
-        if (!lkRifeIo(bio)) return false;
+        if (!lkRifeIo(bio, false)) return false;
         bjit = lkJit(bpath);
         if (!lkWarm(bjit, s.warmKey)) return false;
     }
@@ -3488,10 +3498,9 @@ static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& b
     return true;
 }
 
-// ---- cold engine build inside the host (ONNX-in-exe step 3c-2, 2026-09-21) ------------------
-// A window size with no warm engines used to need python for the model load, the torch export,
-// the build and the warm-up. With the size-free ONNX in engine\onnx (step 3b) the host builds
-// them itself with the settings of the python builder (removed in 27b) (strongly typed, workspace
+// ---- cold engine build inside the host ------------------------------------------------------
+// A window size with no warm engines: the host builds them itself from the size-free ONNX in
+// engine\onnx (strongly typed, workspace
 // SMV_TRT_WORKSPACE_GB (8) x the per-graph multiplier, optimization level 5, one profile pinning
 // every input to its shape, only a declared batch axis spanning), writes the engine file only
 // after it deserializes, then warms every shape the session will run with a FRESH runtime cache
@@ -3839,7 +3848,7 @@ static bool nativeLocalBuild(const std::wstring& script, const std::wstring& bac
 
 // the Real-ESRGAN Restore engine at the model size w x h (restore_<hash>_dth: fp16 input) from
 // engine\onnx when it is missing, warmed once so its .jit exists; the live cold build and the
-// offline host (priority 24 step 2) share it. true = both files exist, paths in rpath / rjit.
+// offline host share it. true = both files exist, paths in rpath / rjit.
 static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int w, int h,
                             std::string& rpath, std::string& rjit)
 {
@@ -3864,13 +3873,12 @@ static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int 
     return done;
 }
 
-// ---- offline RIFE engines (priority 24 step 1, 2026-09-22) ----------------------------------
-// The offline host finds, builds and warms its own IFNet + Head engines (render.py used to load
-// the model, build and warm them with torch and hand the paths over). The classes are the ones
+// ---- offline RIFE engines -------------------------------------------------------------------
+// The offline host finds, builds and warms its own IFNet + Head engines. The classes are the ones
 // trt_lookup._rife_ifnet_spec names for offline: x2 = the unbatched IFNet, xN = the FIXED batch
 // class `_b{N-1}` (every group exactly full), pinned to the /64 pad of the source. The per-B
 // ONNX never ships, so a fixed class is built from the shipped `_bd8` graph with its batch axis
-// pinned to B (harness\offline\gate_b.py: bit-exact with python's own `_b{B}` build). A batched
+// pinned to B (bit-exact with an engine built from a per-B `_b{B}` export). A batched
 // build that runs out of memory is marked `.nofit` and the unbatched engine serves, as live.
 struct OfflineEngines { std::string ifnet, encode, jit; int ph = 0, pw = 0, batch = 1; };
 
@@ -3932,7 +3940,7 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, O
     if (st) cudaStreamDestroy(st);
     if (!ok) { LOG("offline: engine build for %dx%d failed\n", s.pw, s.ph); return false; }
     LkIo iio, eio;
-    if (!lkFind(rt, s.cacheDir, base, { set }, nullptr, 0, 0, t, o.ifnet, iio) || !lkRifeIo(iio)
+    if (!lkFind(rt, s.cacheDir, base, { set }, nullptr, 0, 0, t, o.ifnet, iio) || !lkRifeIo(iio, true)
         || !lkFind(rt, s.cacheDir, ebase, { eset }, nullptr, 0, 0, t, o.encode, eio))
     { LOG("offline: the engines at %dx%d do not match their class (delete them from the cache to rebuild)\n", s.pw, s.ph); return false; }
     o.jit = lkJit(o.ifnet);
@@ -3945,7 +3953,7 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, O
     return true;
 }
 
-// ---- offline GMFSS engines (priority 24 step 3b, 2026-09-23) --------------------------------
+// ---- offline GMFSS engines ------------------------------------------------------------------
 // The live host's five-engine set (lkSession "gmfss": featurenet at the /64 pad, the fused bidir
 // gmflow, metricnet, the GMFSS IFNet and fusionnet at the half), found warm or built and warmed from engine\onnx exactly as
 // lkBuildBackend does for live, then handed to nr like the live handoff's NATIVE-PATH lines.
@@ -3995,7 +4003,7 @@ static bool lkOfflineGmfss(const std::wstring& script, int w, int h, NativeRife&
     return true;
 }
 
-// ---- offline DRBA block0 engine (priority 24 step 3c, 2026-09-23) ---------------------------
+// ---- offline DRBA block0 engine -------------------------------------------------------------
 // DRBA's calc_flow engine (lkBlock0Base / lkBlock0Set, the live names) at the /64 pad of the
 // source, warm or built + warmed from engine\onnx; the IFNet and encode come from lkOfflineRife
 // (x2 = the unbatched class: DRBA enqueues one tween at a time with its own DRM map).
@@ -4022,16 +4030,15 @@ static bool lkOfflineBlock0(const std::wstring& script, int w, int h, std::strin
         if (!ok) { LOG("offline: DRBA block0 engine build for %dx%d failed%s\n", s.pw, s.ph, oom ? " (out of memory)" : ""); return false; }
     }
     LkIo io;
-    if (!lkFind(rt, s.cacheDir, base, { set }, nullptr, 0, 0, t, path, io) || !lkRifeIo(io))
+    if (!lkFind(rt, s.cacheDir, base, { set }, nullptr, 0, 0, t, path, io) || !lkRifeIo(io, false))
     { LOG("offline: the DRBA block0 engine at %dx%d does not match its class\n", s.pw, s.ph); return false; }
     jit = lkJit(path);
     LOG("offline: DRBA block0 engine for %dx%d %s\n", s.pw, s.ph, warm ? "warm" : "built by the host");
     return true;
 }
 
-// ---- offline Smooth Motion (priority 24 step 3d, 2026-09-24) ---------------------------------
-// no engine: the bridge folder the live handoff names (SMV_NVOFFRUC_DIR as nvoffruc.py reads it,
-// else engine\nvoffruc) with its three DLLs; nativeFrucSetup loads the bridge from it
+// ---- offline Smooth Motion ------------------------------------------------------------------
+// no engine: the bridge folder the live handoff names (SMV_NVOFFRUC_DIR, else engine\nvoffruc) with its three DLLs; nativeFrucSetup loads the bridge from it
 static bool lkOfflineFruc(const std::wstring& script, std::string& dir)
 {
     dir = lkEnv("SMV_NVOFFRUC_DIR");
@@ -4053,7 +4060,7 @@ static bool lkOfflineFruc(const std::wstring& script, std::string& dir)
 // A build whose session was ended meanwhile (the hotkey toggled off, or the target window
 // resized during the load) keeps running while the resident host stays alive
 // (residentMain's stay rule counts it): its engines land in the cache, so the next start at
-// that size is warm (user: "we don't need to kill previous sizes buildup"). A host that
+// that size is warm. A host that
 // exits anyway ends the build with it; engine files are written whole or not at all
 // (lkWriteFile). One builder at a time: a new handoff waits for a running one first.
 struct BgHandoff
@@ -4213,7 +4220,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     nr.fruc = all.find(" engine=fruc") != std::string::npos;
     if (nr.fruc && (nr.cachePath.empty() || nr.frucDir.empty()))
     { LOG("native: fruc handoff named no cache or bridge folder\n"); return false; }
-    // GMFSS (sub-step 5a): five engine paths, the half-frame grid, the cache folder for the
+    // GMFSS: five engine paths, the half-frame grid, the cache folder for the
     // kernel cubin (no RIFE jit path names it)
     nr.gmfss = all.find(" engine=gmfss") != std::string::npos;
     if (nr.gmfss)
@@ -4232,10 +4239,10 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     { LOG("native: drba handoff named no block0 engine or no lag=1\n"); return false; }
     const int outW = num("outw", 0), outH = num("outh", 0);
     nr.identity = (outW == nr.w && outH == nr.h);
-    // the downscaling fit (2026-09-15): python antialiases whenever the fit height shrinks
+    // the downscaling fit: python antialiases whenever the fit height shrinks
     // (_Fit._upscale: antialias = dh < h); decided here so the early helper knows to run
     // nativeRtxInit (its staging buffers) before any effect flag is looked at. Upscale to
-    // (item 2) re-derives it against the internal render size in nativeDeriveUpscale.
+    // re-derives it against the internal render size in nativeDeriveUpscale.
     nr.fitAa = nr.dh < nr.h;
     nr.hdr = g_hdr;
     nativeDeriveUpscale(nr);
@@ -4244,12 +4251,11 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     { LOG("native: handoff line incomplete\n"); return false; }
     if (num("effects", 0))
     { LOG("native: live effects are on, phase 1 has no sharpen or VSR path\n"); return false; }
-    // live Restore (2026-09-15): the session asked for it, so the handoff must have named the
-    // engine (an eager restore pass, SMV_LIVE_TRT=0, stays a python-route session)
+    // live Restore: the session asked for it, so the handoff must have named the engine
     nr.restore = !nr.restorePath.empty();
     if (g_restore && !nr.restore)
     { LOG("native: Restore is on but the handoff named no restore engine\n"); return false; }
-    // a downscaling fit runs natively since 2026-09-15 (k_fitAaH / k_fitAaV, nativeRtxInit)
+    // a downscaling fit runs natively (k_fitAaH / k_fitAaV, nativeRtxInit)
     if ((uint32_t)nr.cw != capW || (uint32_t)nr.ch != capH)
     { LOG("native: handoff capture size %dx%d != %ux%u\n", nr.cw, nr.ch, capW, capH); return false; }
     if (g_resident)
@@ -4304,31 +4310,30 @@ static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng,
                 (int)nr.jit->deserialize(cb.data(), cb.size()), cb.size());
         // python keeps one cache file per engine, so the encoder's kernels sit in its own
         // .jit; merged into this cache the encode context takes 7 ms instead of recompiling
-        // them for 0.5 s on every first session of a pair (2026-09-14, harness\r9g)
+        // them for 0.5 s on every first session of a pair
         if (nr.jit && !nr.ejitPath.empty() && nativeReadFile(nr.ejitPath, cb))
             LOG("native: encode jit cache merged -> %d (%zu bytes)\n",
                 (int)nr.jit->deserialize(cb.data(), cb.size()), cb.size());
-        // the restore engine's kernels too (live Restore, 2026-09-15), same reason
+        // the restore engine's kernels too (live Restore), same reason
         if (nr.jit && !nr.rjitPath.empty() && nativeReadFile(nr.rjitPath, cb))
             LOG("native: restore jit cache merged -> %d (%zu bytes)\n",
                 (int)nr.jit->deserialize(cb.data(), cb.size()), cb.size());
-        // native DRBA's block0 engine (priority 21 (b)), same reason
+        // native DRBA's block0 engine, same reason
         if (nr.jit && !nr.block0Jit.empty() && nativeReadFile(nr.block0Jit, cb))
             LOG("native: block0 jit cache merged -> %d (%zu bytes)\n",
                 (int)nr.jit->deserialize(cb.data(), cb.size()), cb.size());
-        // the GMFSS set's five caches (sub-step 5a), one file per engine on the python side
+        // the GMFSS set's five caches, one file per engine
         for (int i = 0; i < 5; i++)
             if (nr.jit && !nr.gmJit[i].empty() && nativeReadFile(nr.gmJit[i], cb))
                 LOG("native: gmfss %s jit cache merged -> %d (%zu bytes)\n", kGmName[i],
                     (int)nr.jit->deserialize(cb.data(), cb.size()), cb.size());
     }
     if (nr.jit) cfg->setRuntimeCache(*nr.jit);
-    // WO-32: offline keeps TRT-RTX's graph capture OFF by default (P2: flat above 480p, one
-    // cudaErrorInvalidValue in ten runs, the unproven TDR link); SMV_OFFLINE_GRAPH=1 turns it on
+    // offline keeps TRT-RTX's graph capture OFF by default (no gain above 480p, one
+    // cudaErrorInvalidValue in ten runs, a possible GPU TDR link); SMV_OFFLINE_GRAPH=1 turns it on
     bool wantGraph = !g_offline || g_offlineGraph;
     // SMV_LIVE_GMFSS_GRAPH=0: the GMFSS session's contexts without the whole-graph strategy
-    // (a sub-step 5c diagnostic; the python route runs these five engines with it off and
-    // wraps GMFlow in a torch CUDA graph instead)
+    // (a diagnostic)
     if (nr.gmfss)
     {
         wchar_t v[8]{};
@@ -4366,12 +4371,13 @@ static nvinfer1::ICudaEngine* nativeLoadEngine(NativeRife& nr, const std::string
 }
 
 // NVRTC once, then the cubin is cached on disk next to the TRT cache, keyed by source hash and
-// device arch (no nvcc anywhere, per the WO).
+// device arch (no nvcc anywhere).
 static bool nativeBindKernels(NativeRife& nr)
 {
     struct { CUfunction* fn; const char* nm; } fns[] = {
         { &nr.fPackInDirect, "k_packInDirect" }, { &nr.fResizeH, "k_resizeH" },
-        { &nr.fResizeV, "k_resizeV" }, { &nr.fH2f, "k_h2f" }, { &nr.fPackOut, "k_packOut" },
+        { &nr.fResizeV, "k_resizeV" }, { &nr.fH2f, "k_h2f" }, { &nr.fF2h, "k_f2h" },
+        { &nr.fPackOut, "k_packOut" },
         { &nr.fPackInDirectHdr, "k_packInDirectHdr" }, { &nr.fPqPlanar, "k_pqPlanar" },
         { &nr.fResizeHf, "k_resizeHf" }, { &nr.fPackOutHdr, "k_packOutHdr" },
         { &nr.fSdrEncode, "k_sdrEncode" }, { &nr.fThdrColor, "k_thdrColor" },
@@ -4512,7 +4518,7 @@ static bool inv3d(const double* m, float* out)
     return true;
 }
 
-// The native init is split in three (startup step 2, 2026-09-12) so that everything except
+// The native init is split in three so that everything except
 // the output ring can run BEFORE the source-rate measurement (the ring is sized from the
 // measured slot count):
 //  * nativeCudaDeviceInit: device, context, stream, capture texture + fence import. Depends on
@@ -4547,7 +4553,7 @@ static bool nativeCudaDeviceInit(NativeRife& nr, IDXGIAdapter1* adapter, HANDLE 
     cudaExternalMemoryHandleDesc md{};
     md.type = cudaExternalMemoryHandleTypeD3D11Resource;
     md.handle.win32.handle = hTex;
-    // WO-8 capture format: BGRA8 in SDR, R16G16B16A16_FLOAT scRGB in HDR (8 bytes per pixel)
+    // Capture format: BGRA8 in SDR, R16G16B16A16_FLOAT scRGB in HDR (8 bytes per pixel)
     const int capBpp = hdr ? 8 : 4;
     md.size = (size_t)capW * capH * capBpp;
     md.flags = cudaExternalMemoryDedicated;
@@ -4613,15 +4619,15 @@ static bool nativeCudaInitLate(NativeRife& nr, HANDLE hOutBuf, uint64_t outBytes
     return true;
 }
 
-// WO-23 live TrueHDR setup: the bridge buffers, the ICtCp matrices, the NGX feature and its
+// Live TrueHDR setup: the bridge buffers, the ICtCp matrices, the NGX feature and its
 // warm-up eval (~0.6 s). Needs the capture size, the stream and the kernel module only, so the
-// early thread runs it on a helper beside the engine load (todo 9d, 2026-09-13); the non-early
+// early thread runs it on a helper beside the engine load; the non-early
 // compute thread runs it after the engine load. The caller's thread must have bound the device.
 static bool nativeRtxInit(NativeRife& nr)
 {
-    // live Sharpen and RTX VSR (2026-09-15): the fit is known now, so the python rule "VSR
+    // live Sharpen and RTX VSR: the fit is known now, so the python rule "VSR
     // only when the resize enlarges in both axes" (_Fit._setup_resize) decides here
-    // Upscale to (item 2): the first resize target is the internal render size when set, else
+    // Upscale to: the first resize target is the internal render size when set, else
     // the fit rect (_Fit._setup_resize); VSR and the aa rule read that target
     const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
     if (nr.vsrWant)
@@ -4637,7 +4643,7 @@ static bool nativeRtxInit(NativeRife& nr)
         LOG("native: live upscale to: model %dx%d -> %dx%d first, then %s to %dx%d\n",
             nr.w, nr.h, nr.uw, nr.uh, nr.identity ? "1:1" : "fit", nr.dw, nr.dh);
     }
-    // the downscaling fit (2026-09-15, nr.fitAa decided in the handoff parse): the horizontal
+    // the downscaling fit (nr.fitAa decided in the handoff parse): the horizontal
     // pass buffer and the staging frame, the same log line as python's `fit:` one; its source
     // is the internal render frame under Upscale to
     if (nr.fitAa)
@@ -4650,7 +4656,7 @@ static bool nativeRtxInit(NativeRife& nr)
         NCHK(cudaMalloc((void**)&nr.dPres, (size_t)3 * nr.dw * nr.dh * sizeof(float)), "alloc fit staging");
     if (nr.sharpen > 0.0f)
         LOG("native: live sharpen: FSR RCAS %.2f at the presented resolution\n", nr.sharpen);
-    // live Restore (2026-09-15): the fold target is _Fit._load_restore's restore_target: back
+    // live Restore: the fold target is _Fit._load_restore's restore_target: back
     // to the model size when an RTX VSR instance follows (so VSR sees the restored frame),
     // else the first resize target directly (restore-as-upscaler, one resize)
     if (nr.restore)
@@ -4667,8 +4673,8 @@ static bool nativeRtxInit(NativeRife& nr)
         NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)nr.w * nr.h * 4), "alloc VSR input");
         NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)tw * th * 4), "alloc VSR output");
     }
-    // live TrueHDR runs once per captured frame at the capture size, offline (priority 24
-    // step 2c) on every output frame at the output size, last (rtxvideo.run_hdr)
+    // live TrueHDR runs once per captured frame at the capture size, offline on every output
+    // frame at the output size, last (rtxvideo.run_hdr)
     const int hw = g_offline ? nr.dw : nr.cw, hh = g_offline ? nr.dh : nr.ch;
     if (nr.rtxHdr)
     {
@@ -4763,19 +4769,19 @@ static bool nativeRtxInit(NativeRife& nr)
     return true;
 }
 
-// ---- the nvof model (2026-09-21, memory priority 20 step 3) --------------------------------
+// ---- the nvof model -------------------------------------------------------------------------
 // The NVIDIA Optical Flow Accelerator through the driver's nvofapi64.dll (System32, opened by
 // full path, never bundled; the process keeps it loaded once opened). One session per NativeRife
 // at the true model size w x h: grid 4, preset fast, BOTH directions in one Execute, output cost
 // on, temporal hints off (a paused or seeked source is not a continuous sequence). The defaults
-// below are the step 2 sweep's pick (WO block "Step 2 results": the metric weights barely move
-// the result, gray input was best on the in-range clip). Every failure here is a REFUSAL.
+// below are a sweep's pick (the metric weights barely move the result, gray input was best on
+// the in-range clip). Every failure here is a REFUSAL.
 static NV_OF_CUDA_API_FUNCTION_LIST g_nvofApi{};
 static bool g_nvofLoaded = false;
 static const float kNvofA = 0.1f, kNvofB = 1.0f;
-// the E2 tween's fallback: log of the mean landing weight at or above kNvofHi keeps the warp,
+// the pull-warp tween's fallback: log of the mean landing weight at or above kNvofHi keeps the warp,
 // at or below kNvofLo takes the plain blend (linear between), the mask blurred by kNvofSigma px
-// (the fix round's E2 pick, WO block "Fix round", 2026-09-21)
+// (picked by eye)
 static const float kNvofLo = -9.0f, kNvofHi = -5.0f, kNvofSigma = 6.0f;
 static const int kNvofGrid = 4;
 
@@ -4844,7 +4850,7 @@ static bool nativeNvofSetup(NativeRife& nr)
     ip.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
     s = g_nvofApi.nvOFInit(nr.ofH, &ip);
     if (s != NV_OF_SUCCESS) { LOG("native: nvof: nvOFInit %dx%d grid %d refused (status %d)\n", nr.w, nr.h, kNvofGrid, (int)s); return false; }
-    // the output grid is ceil(size / grid): verified at 1914x1078 -> 479x270 (step 2)
+    // the output grid is ceil(size / grid): verified at 1914x1078 -> 479x270
     nr.ofGw = (nr.w + kNvofGrid - 1) / kNvofGrid;
     nr.ofGh = (nr.h + kNvofGrid - 1) / kNvofGrid;
     for (int k = 0; k < 2; k++)
@@ -4870,7 +4876,7 @@ static bool nativeNvofSetup(NativeRife& nr)
         NCHK(cudaMalloc((void**)&nr.dNvZ[k], mp * sizeof(float)), "alloc nvof metric");
     }
     NCHK(cudaMalloc((void**)&nr.dNvAcc, 5 * mp * sizeof(long long)), "alloc nvof accumulator");
-    // the E2 tween's planes and the push-pull pyramid (levels halve, ceil, until the short
+    // the pull-warp tween's planes and the push-pull pyramid (levels halve, ceil, until the short
     // side is 1 px; level 0 is dNvN0 / dNvD0 in, dNvV out)
     NCHK(cudaMalloc((void**)&nr.dNvN0, 2 * mp * sizeof(float)), "alloc nvof velocity");
     NCHK(cudaMalloc((void**)&nr.dNvD0, mp * sizeof(float)), "alloc nvof confidence");
@@ -4969,7 +4975,7 @@ static bool nativeNvofPair(NativeRife& nr, const float* dPrev, const float* dCur
     return true;
 }
 
-// one tween at t into dNvOut, the E2 chain (2026-09-21 fix round, gate nvof_equiv_e.py): the
+// one tween at t into dNvOut, the pull-warp chain: the
 // velocity of both frames splatted to time t, its gaps push-pull filled, both frames SAMPLED
 // along it, and where the vectors are untrustworthy (the blurred fallback mask) the plain blend
 // instead: failed vectors show as ghosting, never as speckle
@@ -5086,10 +5092,10 @@ static void nativeNvofFree(NativeRife& nr)
     for (auto& e : nr.nvEv) if (e) { cudaEventDestroy(e); e = nullptr; }
 }
 
-// NVIDIA Smooth Motion (fruc, 2026-09-21, memory priority 21): the shipped nvoffruc_bridge.dll,
+// NVIDIA Smooth Motion (fruc): the shipped nvoffruc_bridge.dll,
 // loaded once per process by full path from the folder the handoff named (NvOFFRUC.dll and its
 // cudart64_110.dll are user-installed beside it; the bridge loads NvOFFRUC.dll signature-checked
-// itself). Its state is process-global (up to four FRUC instances since priority 32b), so a
+// itself). Its state is process-global (up to four FRUC instances), so a
 // session creates instance 0 at setup, the others at the first pair that needs them, and
 // destroys them all in nativeFree. The bridge runs each FRUC instance in its own CUDA context and brackets
 // every call with cuCtxSynchronize on the caller's context (its SYNC FENCE notes), so the
@@ -5100,11 +5106,11 @@ struct FrucBridge
     const char* (*lastError)() = nullptr;
     int (*create)(unsigned, unsigned) = nullptr;
     int (*interpolate)(void*, void*, void*, double, int*) = nullptr;
-    // the feed-once call (bridge 2026-09-26): mode 0 = prime prev + feed cur, 1 = prev was fed
+    // the feed-once call: mode 0 = prime prev + feed cur, 1 = prev was fed
     // last, feed cur only, 2 = the same pair again; an older bridge lacks it (interpolate then)
     int (*step)(void*, void*, void*, double, int, int*) = nullptr;
     void (*destroy)() = nullptr;
-    // the instance calls (bridge of priority 32b): up to 4 FRUC instances in the one module, each
+    // the instance calls: up to 4 FRUC instances in the one module, each
     // with its own context; absent = an older bridge = one instance
     int (*createI)(int, unsigned, unsigned) = nullptr;
     int (*stepI)(int, void*, void*, void*, double, int, int*) = nullptr;
@@ -5192,13 +5198,12 @@ static bool nativeFrucSetup(NativeRife& nr)
     nr.dFrOutBI[0] = nr.dFrOutB;
     nr.frInst = 1;
     nr.frPlanN = nr.frPlanK = 0;
-    // parallel instances: live 4, offline 1 (offline FRUC is paced by the encoder, where the
-    // instances measured 0.99x / ~0.94x at x3 / x5 1080p, WO Step 4); SMV_FRUC_INSTANCES overrides
-    // both (1 = the one-instance path); the extra ones are created by the first pair whose plan
-    // needs them (nativeFrucGrow)
-    // recursive midpoints: the default wherever the bridge has the instance calls (a level per
-    // instance, so up to 4 on either route); SMV_FRUC_MIDPOINTS=0 keeps the direct-t scheme,
-    // SMV_FRUC_DEPTH=1..4 the depth cap
+    // recursive midpoints are the default wherever the bridge has the instance calls, one
+    // instance per tree level, up to 4 on either route; SMV_FRUC_MIDPOINTS=0 keeps the direct-t
+    // scheme (parallel instances up to 4 live, 1 offline: offline FRUC is paced by the encoder,
+    // where they measured 0.99x / ~0.94x at x3 / x5 1080p), SMV_FRUC_DEPTH=1..4 the depth cap.
+    // SMV_FRUC_INSTANCES caps the instances on either scheme (1 = one instance); the extra ones
+    // are created by the first pair that needs them (nativeFrucGrow)
     nr.frMp = false;
     nr.frInstMax = 1;
     if (g_fruc.stepI)
@@ -5427,7 +5432,7 @@ static bool nativeFrucTween(NativeRife& nr, double t)
         // right, so level L's instance sees the continuous stream A, 2 / 2^L, 4 / 2^L .. B of new
         // frames. A node computed alone needs a prime whose optical flow spans the skipped nodes,
         // NvOFFRUC seeds the next flow from it, and that damaged every such node (up to 28 % of a
-        // held frame, WO Step 3). Then the nearest node (never an end frame); a failed instance
+        // held frame). Then the nearest node (never an end frame); a failed instance
         // create caps the depth at the instances made
         if (!nr.frMpL) nr.frMpL = nativeFrucDepth(nr, &t, 1);
         // a failed create lowers frInstMax (nativeFrucGrow), so it is not retried every pair
@@ -5564,6 +5569,7 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
         NCHK(cudaMalloc((void**)&nr.dF[0], 16 * plane * sizeof(float)), "alloc f0");
         NCHK(cudaMalloc((void**)&nr.dF[1], 16 * plane * sizeof(float)), "alloc f1");
         NCHK(cudaMalloc((void**)&nr.dEncHalf, 16 * plane * sizeof(uint16_t)), "alloc encode out");
+        NCHK(cudaMalloc((void**)&nr.dXh, 6 * plane * sizeof(uint16_t)), "alloc x fp16");
         NCHK(cudaMalloc((void**)&nr.dT, (size_t)nr.batchMax * plane * sizeof(float)), "alloc timestep");
         NCHK(cudaMalloc((void**)&nr.dMerged, (size_t)nr.batchMax * 3 * plane * sizeof(float)), "alloc merged");
     }
@@ -5572,6 +5578,7 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     if (nr.drba)
     {
         NCHK(cudaMalloc((void**)&nr.dEncHalf, 16 * plane * sizeof(uint16_t)), "alloc encode out");
+        NCHK(cudaMalloc((void**)&nr.dXh, 6 * plane * sizeof(uint16_t)), "alloc x fp16");
         NCHK(cudaMalloc((void**)&nr.dT, plane * sizeof(float)), "alloc timestep");
         NCHK(cudaMalloc((void**)&nr.dMerged, 3 * plane * sizeof(float)), "alloc merged");
         for (int i = 0; i < 4; i++)
@@ -5589,7 +5596,7 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
         NCHK(cudaMalloc((void**)&nr.dDrFlowN, 4 * plane * sizeof(float)), "alloc drba flow");
         NCHK(cudaMalloc((void**)&nr.dDrAcc, 6 * plane * sizeof(long long)), "alloc drba accumulator");
     }
-    // live Restore (2026-09-15): the engine's x / y (sized for fp32 so either dtype fits), the
+    // live Restore: the engine's x / y (sized for fp32 so either dtype fits), the
     // fold's horizontal pass at the 4x height and the widest possible target, and the fold
     // back to the model size for the VSR-follows case; the enlarging fold's fp32 copy is
     // allocated in nativeRtxInit once the target is known (rare: Upscale to above 4x)
@@ -5603,7 +5610,7 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
         NCHK(cudaMalloc((void**)&nr.dRestTmp, (size_t)3 * 4 * nr.h * maxTw * sizeof(float)), "alloc restore fold pass");
         NCHK(cudaMalloc((void**)&nr.dRest, 3 * mp * sizeof(float)), "alloc restore model-size frame");
     }
-    // WO-23: with live TrueHDR the PQ frame always exists at capture resolution first, so
+    // With live TrueHDR the PQ frame always exists at capture resolution first, so
     // the resize pair runs at EVERY image scale (at 1.00 the triangle filter sits on identity
     // positions and is an exact copy) and both staging planes are needed even at scale 1.00.
     if (nr.w != nr.cw || nr.h != nr.ch || nr.rtxHdr)
@@ -5632,13 +5639,13 @@ static std::wstring nativeCacheDir(const NativeRife& nr)
     return sl == std::wstring::npos ? std::wstring(L".") : w.substr(0, sl);
 }
 
-// WO-23: live RTX TrueHDR runs in this process now. Everything comes from the exe's own
+// Live RTX TrueHDR runs in this process. Everything comes from the exe's own
 // globals, parsed from the app's RTX HDR controls, so no new flag exists. Runs after
 // nativeLoadDlls (the bridge folder is derived from the runtime folder found there).
 static bool nativeConfigHdr(NativeRife& nr)
 {
-    // live Sharpen and RTX VSR (2026-09-15) read the same globals the python route gets;
-    // VSR follows the python rules: SDR only (WO-8: demoted to bicubic in HDR), the bridge
+    // live Sharpen and RTX VSR read the exe's own globals; VSR follows the python rules: SDR
+    // only (demoted to bicubic in HDR), the bridge
     // and nvngx_vsr.dll present (else bicubic, never a route change), and the fit must
     // enlarge (decided in nativeRtxInit once the handoff geometry is known)
     nr.sharpen = (float)(g_sharpen < 0.0 ? 0.0 : (g_sharpen > 1.0 ? 1.0 : g_sharpen));
@@ -5674,9 +5681,9 @@ static bool nativeConfigHdr(NativeRife& nr)
     return true;
 }
 
-// GMFSS sub-step 5a: one warm enqueue of an engine on zeroed scratch buffers sized from its own
-// tensor shapes (every GMFSS engine is H/W pinned, so the shapes are static), which also logs
-// the tensor contract the chain of sub-step 5c will bind to. Buffers are freed again here.
+// GMFSS: one warm enqueue of an engine on zeroed scratch buffers sized from its own tensor
+// shapes (every GMFSS engine is H/W pinned, so the shapes are static), which also logs the
+// tensor contract the chain binds to. Buffers are freed again here.
 static const char* trtDtypeName(nvinfer1::DataType t)
 {
     switch (t)
@@ -5741,8 +5748,8 @@ static bool nativeWarmEngine(NativeRife& nr, nvinfer1::ICudaEngine* eng,
     return ok;
 }
 
-// GMFSS sub-step 5c: the chain's contract and its buffers. Every channel count and dtype is
-// READ OFF THE ENGINES (the 5a rule: the handoff line never types them), then one pair's and
+// GMFSS: the chain's contract and its buffers. Every channel count and dtype is
+// READ OFF THE ENGINES (the handoff line never types them), then one pair's and
 // one tween's planar buffers are allocated from it. Runs inside nativeTrtInit right after the
 // five warm-ups, so a mismatch refuses the session before any group. The accumulator is one
 // buffer for all eight splats (they are strictly sequential on the one stream): the widest is
@@ -5851,9 +5858,9 @@ static bool nativeGmfssSetup(NativeRife& nr)
 static bool nativeTrtInit(NativeRife& nr)
 {
     // resident host: the same engine pair stays loaded across sessions, only the two
-    // execution contexts are recreated (measured 2026-09-12: engine deserialize 0.10 s +
+    // execution contexts are recreated (measured: engine deserialize 0.10 s +
     // jit cache 1.0 to 3.5 s per start against 0.3 to 0.8 s for the contexts alone)
-    // live Restore (2026-09-15): the Real-ESRGAN engine loads beside the pair when the handoff
+    // live Restore: the Real-ESRGAN engine loads beside the pair when the handoff
     // named one, its dtypes read off the engine (x / y are fp16 as python exports the .half()
     // net; fp32 is accepted too), and one warm enqueue on zeros so the first presented frame
     // pays no kernel specialisation (the merged jit cache makes that cheap)
@@ -5879,7 +5886,7 @@ static bool nativeTrtInit(NativeRife& nr)
         NCHK(cudaStreamSynchronize(nr.stream), "restore warm-up sync");
         return true;
     };
-    // native DRBA (priority 21 (b)): the block0 engine loads beside the pair like the restore
+    // native DRBA: the block0 engine loads beside the pair like the restore
     // engine (resident per path; any session without DRBA drops it, nothing of another route
     // idles in VRAM), its fp32 contract read off the engine, one warm enqueue on zeros
     auto block0Ready = [&]() -> bool
@@ -5910,7 +5917,7 @@ static bool nativeTrtInit(NativeRife& nr)
         { LOG("native: block0 f0 / f1 dtype differs from the IFNet's\n"); return false; }
         return nativeWarmEngine(nr, nr.engB0, nr.ctxB0, "block0", "drba");
     };
-    // GMFSS (sub-steps 5a / 5c): the five-engine set, resident like the pair (the same paths =
+    // GMFSS: the five-engine set, resident like the pair (the same paths =
     // reuse, contexts recreated; anything else frees whatever set was resident and loads this
     // one), each engine warmed once on zeros; the restore engine is per session here. The warm
     // enqueue also leaves every static input shape set on the context, which is why the chain
@@ -5977,6 +5984,8 @@ static bool nativeTrtInit(NativeRife& nr)
         nr.jit = g_res.jit;
         nr.encHalf = g_res.encHalf;
         nr.featHalf = g_res.featHalf;
+        nr.xHalf = g_res.xHalf;
+        nr.imgHalf = g_res.imgHalf;
         // no-engine mode: the resident holds no pair (both paths empty on both sides), only
         // the runtime, the jit cache and, per path, the restore engine
         if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
@@ -6025,10 +6034,15 @@ static bool nativeTrtInit(NativeRife& nr)
     if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
     {
         // dtype contract, read off the engines rather than trusted from the handoff line
-        const char* need[] = { "x", "timestep", "merged" };
+        const char* need[] = { "timestep", "merged" };
         for (const char* n : need)
             if (dt(nr.engIf, n) != nvinfer1::DataType::kFLOAT)
-            { LOG("native: IFNet tensor %s is not fp32, phase 1 only handles fp32\n", n); return false; }
+            { LOG("native: IFNet tensor %s is not fp32\n", n); return false; }
+        // x: fp32 (ONNX rev <= 3) or fp16 (rev 4, bound to the fp16 copy of the frame pair)
+        const auto xd = dt(nr.engIf, "x");
+        if (xd != nvinfer1::DataType::kFLOAT && xd != nvinfer1::DataType::kHALF)
+        { LOG("native: IFNet x dtype unsupported\n"); return false; }
+        nr.xHalf = xd == nvinfer1::DataType::kHALF;
         // f0 / f1: fp32 (ONNX rev <= 2) or fp16 (rev 3, the encode output fed as is)
         const auto fd = dt(nr.engIf, "f0");
         if (dt(nr.engIf, "f1") != fd
@@ -6041,8 +6055,11 @@ static bool nativeTrtInit(NativeRife& nr)
         else { LOG("native: encode output dtype unsupported\n"); return false; }
         if (nr.featHalf && !nr.encHalf)
         { LOG("native: IFNet takes fp16 features but the encode engine outputs fp32\n"); return false; }
-        if (dt(nr.engEnc, "img") != nvinfer1::DataType::kFLOAT)
-        { LOG("native: encode input is not fp32\n"); return false; }
+        // img: fp32 (ONNX rev <= 3) or fp16 (rev 4); either pairs with either x
+        const auto id = dt(nr.engEnc, "img");
+        if (id != nvinfer1::DataType::kFLOAT && id != nvinfer1::DataType::kHALF)
+        { LOG("native: encode input dtype unsupported\n"); return false; }
+        nr.imgHalf = id == nvinfer1::DataType::kHALF;
     }
     if (!restoreReady() || !block0Ready()) return false;
     if (g_resident)
@@ -6054,6 +6071,8 @@ static bool nativeTrtInit(NativeRife& nr)
         g_res.jit = nr.jit;
         g_res.encHalf = nr.encHalf;
         g_res.featHalf = nr.featHalf;
+        g_res.xHalf = nr.xHalf;
+        g_res.imgHalf = nr.imgHalf;
         g_res.dev = nr.dev;
         g_res.ifnetPath = nr.ifnetPath;
         g_res.encodePath = nr.encodePath;
@@ -6068,7 +6087,7 @@ static void nativeFree(NativeRife& nr)
     if (nr.stream) cudaStreamSynchronize(nr.stream);
     nativeNvofFree(nr);   // the Optical Flow session and its buffers (nvof sessions only)
     nativeFrucFree(nr);   // the bridge's FRUC instance and its surfaces (fruc sessions only)
-    // WO-23: release the TrueHDR feature on the compute thread, before the CUDA teardown
+    // release the TrueHDR feature on the compute thread, before the CUDA teardown
     if (nr.thdrN && !g_offline)   // offline logs its own line with the light levels
         LOG("native: TrueHDR eval %.2f ms mean, %.2f ms max, over %llu real frames\n",
             nr.thdrMs / (double)nr.thdrN, nr.thdrMaxMs, (unsigned long long)nr.thdrN);
@@ -6131,7 +6150,7 @@ static void nativeFree(NativeRife& nr)
     if (nr.semCap) { cudaDestroyExternalSemaphore(nr.semCap); nr.semCap = nullptr; }
     if (nr.emCap) { cudaDestroyExternalMemory(nr.emCap); nr.emCap = nullptr; }
     if (nr.emOut) { cudaDestroyExternalMemory(nr.emOut); nr.emOut = nullptr; }
-    for (void* p : { (void*)nr.dCap, (void*)nr.dX, (void*)nr.dF[0], (void*)nr.dF[1],
+    for (void* p : { (void*)nr.dCap, (void*)nr.dX, (void*)nr.dXh, (void*)nr.dF[0], (void*)nr.dF[1],
                      (void*)nr.dEncHalf, (void*)nr.dT, (void*)nr.dMerged, (void*)nr.dTmp,
                      (void*)nr.dCapF, (void*)nr.dThdrIn, (void*)nr.dThdrOut, (void*)nr.dSrcG,
                      (void*)nr.dPres, (void*)nr.dVsrIn, (void*)nr.dVsrOut, (void*)nr.dFitTmp,
@@ -6144,7 +6163,7 @@ static void nativeFree(NativeRife& nr)
     nr.dStaticFlag = nullptr;
     nr.dThdrStats = nullptr;
     nr.thdrStatsPending = false;
-    // the GMFSS chain's buffers (sub-step 5c): per session like every other model buffer, so a
+    // the GMFSS chain's buffers: per session like every other model buffer, so a
     // backend switch on the resident host gives the VRAM back even though the engines stay
     for (void* p : { nr.dGmFeat[0][0], nr.dGmFeat[0][1], nr.dGmFeat[0][2],
                      nr.dGmFeat[1][0], nr.dGmFeat[1][1], nr.dGmFeat[1][2],
@@ -6159,7 +6178,7 @@ static void nativeFree(NativeRife& nr)
     nr.dGmFlowP[0] = nr.dGmFlowP[1] = nullptr; nr.dGmMetP[0] = nr.dGmMetP[1] = nullptr;
     nr.dGmAcc = nullptr; nr.dGmFa = nullptr; nr.dGmFb = nullptr; nr.dGmFc = nullptr;
     nr.dGmFd = nullptr; nr.dGmT = nullptr; nr.dGmOut = nullptr; nr.dGmF = nullptr;
-    nr.dCap = nullptr; nr.dX = nullptr; nr.dF[0] = nr.dF[1] = nullptr;
+    nr.dCap = nullptr; nr.dX = nullptr; nr.dXh = nullptr; nr.dF[0] = nr.dF[1] = nullptr;
     nr.dEncHalf = nullptr; nr.dT = nullptr; nr.dMerged = nullptr; nr.dTmp = nullptr;
     nr.dCapF = nullptr; nr.dThdrIn = nullptr; nr.dThdrOut = nullptr; nr.dSrcG = nullptr;
     nr.dPres = nullptr; nr.dVsrIn = nullptr; nr.dVsrOut = nullptr; nr.dFitTmp = nullptr;
@@ -6170,10 +6189,10 @@ static void nativeFree(NativeRife& nr)
     if (nr.stream) { cudaStreamDestroy(nr.stream); nr.stream = nullptr; }
 }
 
-// ---- the GMFSS chain (2026-09-15, full native migration item 5 sub-step 5c) ----------------
+// ---- the GMFSS chain ------------------------------------------------------------------------
 // GMFSS_infer_u.Model.reuse() and .inference() as native launches on the group's stream: the
-// five engines of sub-step 5a and the glue kernels of 5b (k_half / k_pyr / k_splatSoft /
-// k_splatNorm, gated against fp64 by harness\eff\gmfss_equiv.py). Two differences from
+// five engines and the glue kernels (k_half / k_pyr / k_splatSoft / k_splatNorm, gated against a
+// float64 reference). Two differences from
 // live_server.Gmfss, both exact:
 //   * feat_ext runs ONCE per group (on the new frame) and the previous group's output is this
 //     pair's feat0: the same reuse the native RIFE route does with the encode (feat_ext is a
@@ -6193,7 +6212,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     int mHalf = nr.gmMetricHalf ? 1 : 0;
     float s05 = 0.5f, s025 = 0.25f, s1 = 1.0f;
     nr.gmProfTween = false;
-    // sub-step 5e: the CPU cost of enqueueing this pair block (QPC, 100 ns units), taken only
+    // the CPU cost of enqueueing this pair block (QPC, 100 ns units), taken only
     // on a pair that really runs the flow so the average is over comparable groups
     const bool profPair = nr.gmProf && needFlow;
     const int64_t cpu0 = profPair ? nowQpc100() : 0;
@@ -6305,7 +6324,7 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     float* flow0 = nr.dGmFlow;
     float* flow1 = nr.dGmFlow + 2 * hp;
     const bool prof = nr.gmProf && !nr.gmProfTween;   // the group's first tween carries the profile
-    // sub-step 5e: the CPU enqueue span of EVERY tween (the ~20 launches below), the number the
+    // the CPU enqueue span of EVERY tween (the ~20 launches below), the number the
     // per-tween CUDA graph decision rests on
     const int64_t cpu0 = nr.gmProf ? nowQpc100() : 0;
     if (prof) { nr.gmProfTween = true; cudaEventRecord(nr.gmEv[6], st); }
@@ -6359,7 +6378,7 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
 
 // SMV_LIVE_GMFSS_PROF=1: the nine spans of the group just finished (the stream is synced by the
 // caller's final drain), averaged and printed every 32 groups, plus the CPU enqueue averages
-// (sub-step 5e: the pair block, the gmflow enqueue inside it, and one tween)
+// (the pair block, the gmflow enqueue inside it, and one tween)
 static void nativeGmfssProfile(NativeRife& nr)
 {
     static const int kSpan[9][2] = { { 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 4 }, { 4, 5 },
@@ -6390,7 +6409,7 @@ static void nativeGmfssProfile(NativeRife& nr)
 // one group. Mirrors live_server.py's process_shm step for step: capture wait and read, the
 // capture-release announcement, the pair encode, the tween chunks through the dynamic-batch
 // engine, one pack-out per slot with its own event, then the bare end marker.
-// ---- native DRBA (2026-09-21, memory priority 21 (b) step 3) ------------------------------
+// ---- native DRBA ----------------------------------------------------------------------------
 // live_server.RifeDrba as native launches on the group's stream. Frame ids count from 1 per
 // session (drFid = the newest, python's k); id i sits in ring slot i & 3, four kept like
 // python's hist. Every frame is encoded once when pushed (encode is a pure function of the
@@ -6402,6 +6421,14 @@ static void nativeGmfssProfile(NativeRife& nr)
 // -1 (x = [k-1, k-2], tt = 1 - f), f < 0.5 from window k - 2 side +1 (x = [k-2, k-1], tt = f);
 // the head (three frames) runs plain pair RIFE on (k-2, k-1), fewer frames hold the lagged real
 // frame k - 1.
+// fp32 -> fp16 of n elements on the host's stream (the frames of the RIFE engines that take fp16)
+static bool nativeF2h(NativeRife& nr, const float* src, uint16_t* dst, size_t n, cudaStream_t st)
+{
+    int k = (int)n;
+    void* a[] = { &src, &dst, &k };
+    return cuLaunchKernel(nr.fF2h, (k + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) == CUDA_SUCCESS;
+}
+
 static float* drbaFrame(NativeRife& nr, uint32_t id) { return nr.dDrI[id & 3]; }
 static float* drbaEnc(NativeRife& nr, uint32_t id) { return nr.dDrF[id & 3]; }
 
@@ -6418,7 +6445,11 @@ static bool nativeDrbaPush(NativeRife& nr, const float* dCur)
     nvinfer1::Dims4 din{ 1, 3, nr.ph, nr.pw };
     if (!nr.ctxEnc->setInputShape("img", din))
     { nr.die("encode setInputShape rejected (shape outside the engine profile)"); return false; }
-    nr.ctxEnc->setTensorAddress("img", dst);
+    // an fp16 encode input reads an fp16 copy of the new frame (the fp16 x copy's cur half,
+    // unused otherwise on this route)
+    uint16_t* img16 = nr.dXh + 3 * plane;
+    if (nr.imgHalf && !nativeF2h(nr, dCur, img16, 3 * plane, st)) { nr.die("f2h launch failed"); return false; }
+    nr.ctxEnc->setTensorAddress("img", nr.imgHalf ? (void*)img16 : (void*)dst);
     // fp16 features: the encode writes the ring slot directly (read as fp16 by block0 / IFNet)
     const bool widen = nr.encHalf && !nr.featHalf;
     nr.ctxEnc->setTensorAddress("feat", widen ? (void*)nr.dEncHalf : (void*)enc);
@@ -6434,7 +6465,7 @@ static bool nativeDrbaPush(NativeRife& nr, const float* dCur)
     return true;
 }
 
-// calc_flow(frame a, frame b): block0 on the pair, then its tail (the step 2 kernels) into out
+// calc_flow(frame a, frame b): block0 on the pair, then its tail (the DRBA glue kernels) into out
 // (4 planes: flow05 * 2 | flow15 * 2)
 static bool nativeDrbaFlow(NativeRife& nr, uint32_t a, uint32_t b, float* out)
 {
@@ -6497,8 +6528,8 @@ static NativeRife::DrWin* nativeDrbaWindow(NativeRife& nr, uint32_t c)
 
 // one tween of the group at fraction f into dMerged; held = python's None (the slot shows the
 // lagged real frame). nHist = frames in the history (python's len(hist), at most 4). plain =
-// plain pair RIFE on (k-2, k-1) at t = f whatever f is (the offline tail window, priority 24
-// step 3c: render_loops.drba_loop's last window has no right frame).
+// plain pair RIFE on (k-2, k-1) at t = f whatever f is (the offline tail window:
+// render_loops.drba_loop's last window has no right frame).
 static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool plain = false)
 {
     cudaStream_t st = nr.stream;
@@ -6526,10 +6557,18 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
     const uint32_t i1 = side < 0 ? k - 1 : k - 2, i0 = side < 0 ? k - 2 : k - 1;
     if (nr.drXFor[xi] != k)
     {
-        if (cudaMemcpyAsync(nr.dDrX[xi], drbaFrame(nr, i1), 3 * plane * sizeof(float),
-                            cudaMemcpyDeviceToDevice, st) != cudaSuccess
-            || cudaMemcpyAsync(nr.dDrX[xi] + 3 * plane, drbaFrame(nr, i0), 3 * plane * sizeof(float),
-                               cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+        if (nr.xHalf)
+        {
+            // the IFNet takes x in fp16: the two ring frames narrowed into dDrX (fp32-sized)
+            uint16_t* x16 = (uint16_t*)nr.dDrX[xi];
+            if (!nativeF2h(nr, drbaFrame(nr, i1), x16, 3 * plane, st)
+                || !nativeF2h(nr, drbaFrame(nr, i0), x16 + 3 * plane, 3 * plane, st))
+            { nr.die("drba x f2h failed"); return false; }
+        }
+        else if (cudaMemcpyAsync(nr.dDrX[xi], drbaFrame(nr, i1), 3 * plane * sizeof(float),
+                                 cudaMemcpyDeviceToDevice, st) != cudaSuccess
+                 || cudaMemcpyAsync(nr.dDrX[xi] + 3 * plane, drbaFrame(nr, i0), 3 * plane * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, st) != cudaSuccess)
         { nr.die("drba x copy failed"); return false; }
         nr.drXFor[xi] = k;
     }
@@ -6571,7 +6610,7 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
     return true;
 }
 
-// Restore (live 2026-09-15, offline 2026-09-22): _Fit._restore / render_passes.restore on one
+// Restore (live and offline): _Fit._restore / render_passes.restore on one
 // model-size planar source, the result folded into dst (tw x th). false = a launch failed (die
 // was called); an engine enqueue refusal drops the pass for the rest of the session instead
 // (python's rule), the caller then continues with the unrestored source.
@@ -6633,7 +6672,7 @@ static bool nativeRestoreRun(NativeRife& nr, const float* s, int ps_, int rs_, f
     return true;
 }
 
-// Offline TrueHDR (priority 24 step 2c): the previous frame's statistics block reaches the
+// Offline TrueHDR: the previous frame's statistics block reaches the
 // accumulators once the stream is known idle (the TrueHDR sync below, or the render's end).
 static void nativeOfflineThdrDrain(NativeRife& nr)
 {
@@ -6654,7 +6693,7 @@ static void nativeOfflineThdrRepeat(NativeRife& nr)
 
 static float halfToFloat(uint16_t h);   // main.cpp, after the parts
 
-// --nr-delta PATH (priority 24 step 7, the preview's change mask, preview.py's _on_nr): the
+// --nr-delta PATH (the preview's change mask): the
 // largest channel change of the DLSS 5 pass per pixel, |after - before| with `before` the pass's
 // fp32 input planes (tight, tw x th each) and `after` its fp16 output clamped to 0..1 like
 // k_nrOut, tw x th float32, rewritten per frame (the last frame's). A failed write costs only
@@ -6681,13 +6720,12 @@ static void nativeOfflineNrDelta(const NativeRife& nr, const std::vector<float>&
     if (f) fclose(f);
 }
 
-// Offline DLSS 5 (priority 24 step 2d): dlssnr.py process() on one output-size frame, planar
-// (R, G, B) with its strides, into nr.dPres (tight, dw x dh). The NR core runs dlssnr.exe's
-// own path in this process (startup on a private D3D12 device, renderFrame through its
-// upload / readback staging, Reset on the first frame only: offline accumulates, live does
-// not). An evaluate that fails turns the pass off for the rest of the render with a line and
-// leaves dPres untouched (nr.nrFailed); python restarts its host once first, this process
-// cannot (NGX has no teardown), so it goes straight to python's second-failure rule.
+// Offline DLSS 5 on one output-size frame, planar (R, G, B) with its strides, into nr.dPres
+// (tight, dw x dh). The NR core runs dlssnr.exe's own path in this process (startup on a
+// private D3D12 device, renderFrame through its upload / readback staging, Reset on the first
+// frame only: offline accumulates, live does not). An evaluate that fails turns the pass off
+// for the rest of the render with a line and leaves dPres untouched (nr.nrFailed); there is no
+// retry: NGX has no teardown, so the NR core cannot restart in this process.
 static bool nativeOfflineNr(NativeRife& nr, const float* src, int ps, int rs)
 {
     cudaStream_t st = nr.stream;
@@ -6772,15 +6810,14 @@ static bool nativeOfflineThdr(NativeRife& nr, uint8_t* dO)
     return true;
 }
 
-// The offline pass chain (priority 24 step 2, 2026-09-22): render_passes.Passes.run on one
-// planar model-size frame (ps / rs strides, nr.w x nr.h), then to_bytes' quantisation, into
-// dO as tight rgb48le (out16) or rgb24 at the output size nr.dw x nr.dh. Order as python:
-// Restore (back to the model size when RTX VSR follows, else folded straight to the output
-// size), the resize (RTX VSR when it runs, else clamped bicubic; offline only enlarges, the
-// downscale is folded into the decode), DLSS 5 (step 2d, nativeOfflineNr), RCAS last. With RTX HDR (step 2c) the SDR result goes
-// through nativeOfflineThdr instead of the quantisation and dO holds x2rgb10le words. A pass
-// that fails is dropped for the rest of the render with a line, as python does. false = a
-// launch failed.
+// The offline pass chain on one planar model-size frame (ps / rs strides, nr.w x nr.h), then
+// the quantisation, into dO as tight rgb48le (out16) or rgb24 at the output size nr.dw x nr.dh.
+// Order: Restore (back to the model size when RTX VSR follows, else folded straight to the
+// output size), the resize (RTX VSR when it runs, else clamped bicubic; offline only enlarges,
+// the downscale is folded into the decode), DLSS 5 (nativeOfflineNr), RCAS last. With RTX HDR
+// the SDR result goes through nativeOfflineThdr instead of the quantisation and dO holds
+// x2rgb10le words. A pass that fails is dropped for the rest of the render with a line.
+// false = a launch failed.
 static bool nativeOfflineEmit(NativeRife& nr, const float* src, int ps, int rs, uint8_t* dO, bool out16)
 {
     cudaStream_t st = nr.stream;
@@ -6926,11 +6963,17 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // (3) the previous cur becomes prev, in place, then pack the new frame into the cur half
     // (native DRBA keeps its own history ring, so it skips the prev copy)
     if (nr.havePrev && !nr.noEngine && !nr.drba)
+    {
         cudaMemcpyAsync(nr.dX, nr.dX + 3 * plane, 3 * plane * sizeof(float),
                         cudaMemcpyDeviceToDevice, st);
+        // the fp16 copy an fp16-x IFNet reads keeps the same two frames
+        if (nr.xHalf)
+            cudaMemcpyAsync(nr.dXh, nr.dXh + 3 * plane, 3 * plane * sizeof(uint16_t),
+                            cudaMemcpyDeviceToDevice, st);
+    }
     float* dCur = nr.dX + 3 * plane;
-    // WO-23: live RTX TrueHDR runs ONCE PER REAL FRAME at capture resolution, mirroring
-    // _cap_to_pq2020. capEv was recorded above, before this, so the exe's capture texture is
+    // live RTX TrueHDR runs ONCE PER REAL FRAME at capture resolution, never per tween. capEv
+    // was recorded above, before this, so the exe's capture texture is
     // released exactly as early as on every other route even though the bridge's own
     // cuMemcpy2D calls are host synchronous.
     bool rtxThis = nr.rtxHdr && !nr.rtxFailed && g_rtxb.created;
@@ -7002,8 +7045,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         {
             if (nr.hdr)
             {
-                // convert the whole capture to PQ first, then resize ON PQ (the WO-8 fill rule
-                // python follows: rescale-on-PQ, never rescale scRGB and convert after)
+                // convert the whole capture to PQ first, then resize ON PQ (the fill rule:
+                // rescale on PQ, never rescale scRGB and convert after)
                 void* a0[] = { &nr.dCap, &nr.cw, &nr.ch, &nr.dCapF };
                 if (cuLaunchKernel(nr.fPqPlanar, (nr.cw + 15) / 16, (nr.ch + 15) / 16, 1,
                                    16, 16, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
@@ -7040,7 +7083,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     uint32_t nTween = 0;
     for (uint32_t i = 0; i < nfr; i++) if (fr[i] < 0.999f) nTween++;
     if (!nr.havePrev) nTween = 0;   // first pair: nothing to interpolate toward
-    // IDENTICAL PAIR (2026-09-16): the two packed inputs are compared element by element on
+    // IDENTICAL PAIR: the two packed inputs are compared element by element on
     // the device and the flag is read back once. Equal = no motion exists in this pair, so the
     // tween work is dropped (exactly the tween-less group the adaptive ladder already
     // produces: the per-frame chain state, the encode or feat_ext, still runs for the next
@@ -7077,7 +7120,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     nr.fCur ^= 1;
     if (nr.gmfss)
     {
-        // GMFSS (sub-step 5c): feat_ext of the new frame, then the halves, the bidir flow,
+        // GMFSS: feat_ext of the new frame, then the halves, the bidir flow,
         // the metrics and the two pyramid levels when this group interpolates
         if (!nativeGmfssPair(nr, nr.dX, dCur, nTween > 0)) return false;
     }
@@ -7112,7 +7155,12 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         nvinfer1::Dims4 din{ 1, 3, nr.ph, nr.pw };
         if (!nr.ctxEnc->setInputShape("img", din))
         { nr.die("encode setInputShape rejected (shape outside the engine profile)"); return false; }
-        nr.ctxEnc->setTensorAddress("img", dCur);
+        // fp16 frames (ONNX rev 4): the new frame into the fp16 copy's cur half, read by an
+        // fp16-x IFNet and / or an fp16-img encode (every new frame, static pairs too)
+        uint16_t* cur16 = nr.dXh + 3 * plane;
+        if ((nr.xHalf || nr.imgHalf) && !nativeF2h(nr, dCur, cur16, 3 * plane, st))
+        { nr.die("f2h launch failed"); return false; }
+        nr.ctxEnc->setTensorAddress("img", nr.imgHalf ? (void*)cur16 : (void*)dCur);
         // fp16 features (ONNX rev 3): the encode writes dF directly, no widen pass
         const bool widen = nr.encHalf && !nr.featHalf;
         void* encOut = widen ? (void*)nr.dEncHalf : (void*)nr.dF[nr.fCur];
@@ -7146,13 +7194,12 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     bool fail = false;
 
     // one presented frame from a model-size planar source into its slot. Without effects the
-    // slot packer does the fit and the store in one kernel. With live effects (2026-09-15) it
-    // mirrors live_server.py compose: RTX VSR (the bridge, model size -> presented size,
-    // 8-bit in and out, host-synchronous like every bridge call) or the bicubic fit into the
-    // planar staging frame, then RCAS in the slot store. A VSR eval failure demotes the rest
-    // of the run to bicubic with one line, exactly like the python route's `self.vsr = None`.
-    // A DOWNSCALING fit (2026-09-15) takes the staging frame too: the antialiased pair lands
-    // there and the plain packer stores it 1:1 when no sharpen follows.
+    // slot packer does the fit and the store in one kernel. With live effects: RTX VSR (the
+    // bridge, model size -> presented size, 8-bit in and out, host-synchronous like every
+    // bridge call) or the bicubic fit into the planar staging frame, then RCAS in the slot
+    // store. A VSR eval failure demotes the rest of the run to bicubic with one line. A
+    // DOWNSCALING fit takes the staging frame too: the antialiased pair lands there and the
+    // plain packer stores it 1:1 when no sharpen follows.
     auto packFrom = [&](const float* src, int ps, int rs, int sw, int sh, uint8_t* slot,
                         const char* what) -> bool
     {
@@ -7190,10 +7237,9 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         { nr.die("fitPlanar launch failed"); return false; }
         return true;
     };
-    // live Restore (2026-09-15, item 3): _Fit._restore on one model-size planar source, the
-    // result folded into dst (tw x th). false = a launch failed (die was called); an engine
-    // enqueue refusal drops the pass for the rest of the session instead (python's rule), the
-    // caller then continues with the unrestored source.
+    // live Restore on one model-size planar source, the result folded into dst (tw x th).
+    // false = a launch failed (die was called); an engine enqueue refusal drops the pass for
+    // the rest of the session instead, the caller then continues with the unrestored source.
     auto runRestore = [&](const float* s, int ps_, int rs_, float* dst, int tw, int th) -> bool
     { return nativeRestoreRun(nr, s, ps_, rs_, dst, tw, th); };
     auto storeSlot = [&](const float* src, uint8_t* slot, const char* what) -> bool
@@ -7202,7 +7248,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         const bool vsrNow = nr.vsr && !nr.vsrFailed && g_rtxb.created;
         const bool restNow = nr.restore && nr.ctxRest && !nr.restFailed;
         if (!vsrNow && nr.sharpen <= 0.0f && !nr.fitAa && !nr.uw && !restNow) return plainPack(src, slot, what);
-        // Upscale to (item 2): the first resize lands in the internal render frame (uw x uh)
+        // Upscale to: the first resize lands in the internal render frame (uw x uh)
         // instead of the staging frame, then the fit takes it to (dw, dh) below
         const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
         float* stage = nr.uw ? nr.dUp : nr.dPres;
@@ -7309,12 +7355,12 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     != cudaSuccess)
                 { nr.die("held slot copy failed"); fail = true; break; }
             }
-            // the passthrough keys on identity AND no effect (the WO-35 / WO-37 lesson): with
+            // the passthrough keys on identity AND no effect, never on geometry alone: with
             // sharpen, Upscale to or Restore on, real frames go through the store like every other frame
             // (never on DRBA: its real frame is the lagged k - 1, not this capture)
             else if (nr.identity && !nr.drba && !nr.hdr && nr.sharpen <= 0.0f && !nr.uw && !nr.restore)
             {
-                // bit-exact passthrough, the python route's raw-frame path
+                // bit-exact passthrough of the raw capture
                 if (cudaMemcpy2DAsync(slot, nr.pitch, nr.dCap, (size_t)nr.cw * 4,
                                       (size_t)nr.cw * 4, nr.ch, cudaMemcpyDeviceToDevice, st)
                     != cudaSuccess)
@@ -7362,7 +7408,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         {
             if (twDone >= chunkBase + chunkLen)
             {
-                // next chunk of tweens: no padding, exactly the WO-13 dynamic-batch contract
+                // next chunk of tweens: no padding, the engine's batch axis is dynamic
                 chunkBase = twDone;
                 chunkLen = nTween - chunkBase;
                 if (chunkLen > (uint32_t)nr.batchMax) chunkLen = (uint32_t)nr.batchMax;
@@ -7392,7 +7438,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dtst)
                     || !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
                 { nr.die("IFNet setInputShape rejected (shape outside the engine profile)"); fail = true; break; }
-                nr.ctxIf->setTensorAddress("x", nr.dX);
+                nr.ctxIf->setTensorAddress("x", nr.xHalf ? (void*)nr.dXh : (void*)nr.dX);
                 nr.ctxIf->setTensorAddress("timestep", nr.dT);
                 nr.ctxIf->setTensorAddress("f0", nr.dF[nr.fCur ^ 1]);
                 nr.ctxIf->setTensorAddress("f1", nr.dF[nr.fCur]);

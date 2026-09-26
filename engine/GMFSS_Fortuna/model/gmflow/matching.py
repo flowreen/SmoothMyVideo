@@ -63,11 +63,11 @@ def local_correlation_softmax(feature0, feature1, local_radius,
     sample_coords = coords.unsqueeze(-2) + window_grid  # [B, H*W, (2R+1)^2, 2]
 
     if torch.compiler.is_compiling():
-        # export path (SMV 2026-09-21, ONNX-in-exe): the chunk loop below unrolls by H * W,
+        # export path (SMV): the chunk loop below unrolls by H * W,
         # which a size-free export cannot hold. The same math on the whole grid, the two
         # per-pixel products as multiply + sum over one axis (no batched gemm, so no launch cap);
         # a different summation order: equivalent, measured closer to eager fp32 than the
-        # chunked engine (harness\onnx\gmflow_check.py)
+        # chunked engine
         valid = ((sample_coords[:, :, :, 0] >= 0) & (sample_coords[:, :, :, 0] < w)
                  & (sample_coords[:, :, :, 1] >= 0) & (sample_coords[:, :, :, 1] < h))
         window_feature = F.grid_sample(feature1, normalize_coords(sample_coords, h, w),

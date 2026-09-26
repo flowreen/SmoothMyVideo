@@ -273,7 +273,7 @@ static int process_one(Inst& s, unsigned long long* f, double ts, bool skipWarp,
 //   mode 1: prev IS the frame fed last (a continuous stream): feed cur only (1 call)
 //   mode 2: another tween of the pair fed last: cur again at its SAME timestamp, only the output
 //           timestamp moves (1 call, no copy in; its tweens match the re-feed way within
-//           NvOFFRUC's run-to-run noise, harness\p35\fruc_direct.py)
+//           NvOFFRUC's run-to-run noise)
 // t in (0, 1) between prev and cur. The caller's prevPtr / curPtr must hold the frames it names.
 static int step_inst(Inst& s, void* prevPtr, void* curPtr, void* outPtr, double t, int mode, int* frameRepeated) {
     if (!s.fruc) { set_err("nvoffruc_step before nvoffruc_create"); return -1; }

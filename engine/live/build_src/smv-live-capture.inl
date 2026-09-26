@@ -1,7 +1,7 @@
 // part of smv-live.cpp (unity include, see the file map there); not a standalone translation unit
 // ---------------------------------------------------------------- WGC capture
 
-// WO-8 Phase 3: the DLSS-G route in HDR mode. SL's DLSS-G mandates a UINT10/RGB10 backbuffer
+// The DLSS-G route in HDR mode. SL's DLSS-G mandates a UINT10/RGB10 backbuffer
 // in HDR10/BT.2100 PQ and explicitly rejects FP16 scRGB (ProgrammingGuideDLSS_G.md 11.0), which
 // is exactly the server route's present format - but dlssg has no python server to convert, so
 // the exe does it: this compute shader is the verbatim math of live_server.py's
@@ -28,7 +28,7 @@ static const char kHdrPackCS[] =
 "    dst[id.xy] = q.x | (q.y << 10) | (q.z << 20) | (3u << 30);\n"
 "}\n";
 
-// WO-42 hooks into the capture (defined after LiveNr below): the NR pass reads and rewrites the
+// DLSS 5 NR hooks into the capture (defined after LiveNr below): the NR pass reads and rewrites the
 // shared capture texture between the D3D11 copy and the fence signal.
 struct Capture;
 static void liveNrPreCopy(Capture& cap);
@@ -46,7 +46,7 @@ struct Capture
     volatile LONG arrived = 0;   // set by FrameArrived, cleared by whoever drains next
     volatile LONG closed = 0;
     uint32_t cw = 0, ch = 0; // CLIENT size = staging/sharedTex size = what the pipeline sees
-    // WO-2: the WGC frame pool captures the WHOLE window (frame bounds), including the title bar
+    // The WGC frame pool captures the WHOLE window (frame bounds), including the title bar
     // and borders. fullW/fullH are that captured size; cropX/cropY + cw/ch select the CLIENT area
     // out of it, so the non-client chrome never reaches the model or the overlay. clientScreenX/Y
     // is the client-area origin in screen coords (where the window-mode overlay must sit).
@@ -54,7 +54,7 @@ struct Capture
     int cropX = 0, cropY = 0;       // client-area offset inside the captured frame
     int clientScreenX = 0, clientScreenY = 0;
     bool swizzle = false;    // DLSS-G route only: convert BGRA -> RGBA on readback
-    // WO-8 Phase 3 (dlssg HDR): CPU-route conversion chain, FP16 scRGB -> packed R10A2 PQ on
+    // dlssg HDR: CPU-route conversion chain, FP16 scRGB -> packed R10A2 PQ on
     // the capture GPU before readback (kHdrPackCS above). Set BEFORE init(); readback stays
     // 4 B/px so presentFrame and every buffer size are unchanged. swizzle is ignored on this
     // path (the pack writes the R10A2 bit layout directly).
@@ -71,7 +71,7 @@ struct Capture
                              // superseded ones included = the true source cadence. Pacing
                              // must read THIS, not processed-frame intervals: a loop paced
                              // by its own processing rate feeds back into itself and locks
-                             // capture into subharmonic plateaus (measured 2026-08-25).
+                             // capture into subharmonic plateaus (measured).
     int64_t lastArrTs = 0;   // SystemRelativeTime of the previously delivered frame
     // Zero-copy capture interop (server route): frames are GPU-copied into a SHARED texture
     // the python server imports as CUDA external memory, with a shared D3D11 fence for
@@ -110,9 +110,9 @@ struct Capture
         LOG("capture interop: shared texture + fence ready\n");
     }
 
-    // WO-8 Phase 3: compile the pack shader and create the conversion chain (cw x ch known by
+    // dlssg HDR: compile the pack shader and create the conversion chain (cw x ch known by
     // now). Failure is graceful: caller clears g_hdr and the session runs SDR with the clip
-    // notice, exactly like a pre-Phase-3 build.
+    // notice.
     bool initHdrPack()
     {
         ComPtr<ID3DBlob> cs, err;
@@ -201,7 +201,7 @@ struct Capture
         ch = fullH;
         cropX = cropY = 0;
         clientScreenX = clientScreenY = 0;
-        // WO-2: for a window target, crop the capture to the client area (drop the title bar and
+        // For a window target, crop the capture to the client area (drop the title bar and
         // borders). The captured frame's (0,0) is the DWM extended frame-bounds origin; the client
         // area starts below the caption. The process is per-monitor-DPI-aware (set at startup), so
         // every rect below is in physical pixels and no scaling is needed. Monitor capture has no
@@ -233,7 +233,7 @@ struct Capture
             }
         }
 
-        // WO-8 Phase 3: dlssg HDR converts in the exe. Must happen before the pool creation
+        // dlssg HDR converts in the exe. Must happen before the pool creation
         // below (its format reads g_hdr) so a failed setup can drop the session to SDR.
         if (hdrPack && !initHdrPack())
         {
@@ -242,7 +242,7 @@ struct Capture
             g_hdr = false;
         }
 
-        // WO-8: HDR mode captures FP16 scRGB (linear, 709 primaries, 1.0 = 80 nits); the server
+        // HDR mode captures FP16 scRGB (linear, 709 primaries, 1.0 = 80 nits); the server
         // re-encodes to BT.2020 PQ. SDR stays 8-bit BGRA.
         pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
             rtDev, g_hdr ? wgdx::DirectXPixelFormat::R16G16B16A16Float
@@ -295,7 +295,7 @@ struct Capture
         if (!frame) return -3;
 
         auto csz = frame.ContentSize();
-        // WO-2: the pool still captures the whole window, so compare against the full size, not
+        // The pool still captures the whole window, so compare against the full size, not
         // the cropped client size. A real resize triggers the exit-4 restart, which recomputes
         // the crop from fresh rects.
         if ((uint32_t)csz.Width != fullW || (uint32_t)csz.Height != fullH)
@@ -321,7 +321,7 @@ struct Capture
     }
 
     // WGC emits frames only when the source PRESENTS, so a static window (paused video) goes
-    // silent forever - measured on paused mpv 2026-08-15: no initial frame, and neither pool
+    // silent forever - measured on a paused mpv: no initial frame, and neither pool
     // Recreate() nor a full capture-session restart delivers anything (both tried; --probe
     // hangs frameless on such a window too). The only working lever is making the TARGET
     // present once: InvalidateRect makes it repaint on its next message-loop pass, and that
@@ -335,7 +335,7 @@ struct Capture
         if (targetWnd) InvalidateRect(targetWnd, nullptr, FALSE);
     }
 
-    // WO-2: copy the client sub-region of the full-window capture into dst (a cw x ch resource).
+    // Copy the client sub-region of the full-window capture into dst (a cw x ch resource).
     // No crop (borderless / fullscreen / monitor) falls back to the plain full copy.
     void copyCropped(ID3D11Resource* dst, ID3D11Texture2D* src)
     {
@@ -359,7 +359,7 @@ struct Capture
         int rc = drainNewest(frame, tex);
         if (rc == -3) return 0;
         if (rc) return rc;
-        liveNrPreCopy(*this);   // WO-42: the previous frame's NR list must be done with the texture
+        liveNrPreCopy(*this);   // the previous frame's NR list must be done with the texture
         copyCropped(sharedTex.Get(), tex.get());
         frame.Close();
         return 1;
@@ -368,7 +368,7 @@ struct Capture
     // interop path: order the shared-texture copy against python's CUDA reads
     void signalFence(uint64_t v)
     {
-        // WO-42: with the NR pass on, the NR queue signals this value after rewriting the texture
+        // With the NR pass on, the NR queue signals this value after rewriting the texture
         if (liveNrSignal(*this, v)) return;
         ctx4->Signal(sharedFence.Get(), v);
         ctx11->Flush();   // the immediate context may defer submission; python is waiting
@@ -387,7 +387,7 @@ struct Capture
         if (rc == -3) return 0;
         if (rc) return rc;
 
-        // WO-8 Phase 3 (dlssg HDR): pack scRGB FP16 -> R10A2 PQ on the GPU, read back 4 B/px.
+        // dlssg HDR: pack scRGB FP16 -> R10A2 PQ on the GPU, read back 4 B/px.
         // The R32_UINT staging bytes ARE the R10G10B10A2_UNORM bit pattern presentFrame uploads.
         if (hdrPack)
         {
@@ -450,14 +450,13 @@ struct Capture
     }
 };
 
-// ---------------------------------------------------------------- WO-42: DLSS 5 NR in the exe
+// ---------------------------------------------------------------- DLSS 5 NR in the exe
 //
 // The Neural Rendering pass (NGX feature 18, engine\dlssnr\build_src\nr_host.cpp) runs INSIDE
 // this process on the shared capture texture, between the D3D11 capture copy and the fence
-// signal both consumers wait on (python's CUDA import on the server route, the native RIFE
-// host's semaphore), so every backend inherits it once per captured frame with no protocol
-// change. The python route over pipes measured 34 to 36 ms per frame at 1080p; the NGX
-// evaluate itself is about 10 ms (WO-41, WO-42 coexistence probe). Ordering is GPU-only:
+// signal the native host waits on (its semaphore), so every backend inherits it once per
+// captured frame with no protocol change. A route over pipes measured 34 to 36 ms per frame
+// at 1080p; the NGX evaluate itself is about 10 ms. Ordering is GPU-only:
 // D3D11 signals inFence with the frame's seq after its copy, the NR queue waits on it,
 // records the three steps and signals the capture fence with the same seq; D3D11 waits on
 // that value before the next copy. Colour: SDR captures (B8G8R8A8) hand the sRGB-encoded
@@ -467,8 +466,8 @@ struct Capture
 // original values). The shared texture is COMMON at every list boundary (the cross-API rule);
 // NGX clobbers the list's heaps, root signature and PSO, so they are re-bound after the
 // evaluate. Coexistence with the native TrueHDR bridge (rtxvideo NGX over CUDA) in one
-// process was measured before this was written (harness\nr\coexist_probe.cpp, both orders,
-// every eval Success); the DLSS-G route stays excluded (the NR host starves DLSS-G, WO-21).
+// process is measured (both orders, every eval Success); the DLSS-G route stays excluded (the
+// NR host starves DLSS-G).
 static const char kLiveNrCS[] =
 "cbuffer C : register(b0) { float sdrWhite; uint hdr; uint w; uint h; };\n"
 "Texture2D<float4> src : register(t0);\n"
@@ -697,8 +696,8 @@ struct LiveNr
             return drop("command list Reset failed");
         // Reset on EVERY evaluate: the pass is non-temporal on live. This host binds no motion
         // vectors, depth or jitter, so kept history had nothing valid to reproject by and a
-        // frozen source came back out different frame to frame (2026-09-14; the measurements
-        // and the harness are in DEVELOPMENT.md, "LIVE RUNS THE PASS NON-TEMPORALLY").
+        // frozen source came back out different frame to frame (the measurements are in
+        // DEVELOPMENT.md, "LIVE RUNS THE PASS NON-TEMPORALLY").
         const bool reset = true;
         struct { float sdrWhite; uint32_t hdr, w, h; } consts{ sdrWhite, hdr ? 1u : 0u, w, h };
         ID3D12DescriptorHeap* heaps[] = { heap.Get() };

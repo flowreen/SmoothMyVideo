@@ -22,7 +22,7 @@ def generate_shift_window_attn_mask(input_resolution, window_size_h, window_size
     # calculate attention mask for SW-MSA
     h, w = input_resolution
     if torch.compiler.is_compiling():
-        # export path (SMV 2026-09-21, ONNX-in-exe): the same region ids 0..8 from arange
+        # export path (SMV): the same region ids 0..8 from arange
         # comparisons (rows [0, h - wh) / [h - wh, h - sh) / [h - sh, h), columns alike), so a
         # size-free export has no Python slice loop over the size; exact
         rr = ((torch.arange(h, device=device) >= h - window_size_h).long()
@@ -55,7 +55,7 @@ def generate_shift_window_attn_mask(input_resolution, window_size_h, window_size
 
 def _roll_hw(x, sh, sw, left):
     """torch.roll over dims (1, 2) by (sh, sw), leftward (negative shifts) when `left`. On the
-    export path (SMV 2026-09-21, ONNX-in-exe) as explicit slices: onnxscript's roll takes only
+    export path (SMV) as explicit slices: onnxscript's roll takes only
     constant shifts, a symbolic `% n` makes the size unbacked and a symbolic sign test would
     guard, so the direction is a flag and 0 < shift < n is written out (exact data movement).
     Eager keeps torch.roll."""
@@ -411,11 +411,11 @@ class FeatureFlowAttention(nn.Module):
 
         b, c, h, w = feature0.size()
         if torch.compiler.is_compiling():
-            # export path (SMV 2026-09-21, ONNX-in-exe): the chunk loop below unrolls by H * W,
+            # export path (SMV): the chunk loop below unrolls by H * W,
             # which a size-free export cannot hold. The two per-pixel products (1 x C by C x k*k,
             # then 1 x k*k by k*k x 2) as multiply + sum over one axis: no batched gemm, so no
             # launch cap and nothing per size. A different summation order: equivalent, measured
-            # closer to eager fp32 than the chunked engine (harness\onnx\gmflow_check.py)
+            # closer to eager fp32 than the chunked engine
             ks = 2 * local_window_radius + 1
             q = self.q_proj(feature0.view(b, c, -1).permute(0, 2, 1)).permute(0, 2, 1)  # [B, C, H*W]
             kp = self.k_proj(feature0.view(b, c, -1).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, c, h, w)

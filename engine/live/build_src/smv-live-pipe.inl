@@ -29,7 +29,7 @@ struct PipeServer
     volatile LONG stalled = 0;            // the watchdog ended a stalled host (TRT shape-bug class)
     NativeRife* nr = nullptr;
     void nativeAbort() { if (nr) nr->die("shutting down"); }
-    // Startup steps 1b and 2 (2026-09-12): everything the native host needs except the output
+    // Early start: everything the native host needs except the output
     // ring depends on the capture size only, never on the measured source rate, so runLive
     // starts it here BEFORE its source-rate measurement (0.5 to 0.7 s) instead of after it:
     // the DLL load, the engine handoff (with the CUDA device init and the capture import in

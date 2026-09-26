@@ -39,7 +39,7 @@ struct Settings
     int   preset    = 3;      // DLSSNR.Hint.Render.Preset, 0..3
 };
 
-// Phase 0 probe knobs. The snippet validates its caller and the exact rule is
+// Probe knobs. The snippet validates its caller and the exact rule is
 // unknown, so every plausible route is reachable without a rebuild.
 struct Variant
 {

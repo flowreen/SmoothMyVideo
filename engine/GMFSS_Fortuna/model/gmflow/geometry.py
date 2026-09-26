@@ -41,9 +41,9 @@ _center_cache = {}  # (h, w, device) -> c; creating from Python floats is a CPU-
 def normalize_coords(coords, h, w):
     # coords: [B, H, W, 2]
     # FakeTensors (ONNX-export traces) bypass the cache: a cached fake poisons later real
-    # eager calls at the same shape (same class of bug as MetricNet.backwarp, 2026-08-28)
+    # eager calls at the same shape (same class of bug as MetricNet.backwarp)
     if torch.compiler.is_compiling():
-        # export path (SMV 2026-09-21, ONNX-in-exe): torch.tensor() from symbolic sizes would pin
+        # export path (SMV): torch.tensor() from symbolic sizes would pin
         # the size, so the same (coords - c) / c per channel from scalar arithmetic
         cx, cy = (w - 1) / 2., (h - 1) / 2.
         return torch.cat(((coords[..., 0:1] - cx) / cx, (coords[..., 1:2] - cy) / cy), -1)

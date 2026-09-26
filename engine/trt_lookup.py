@@ -98,9 +98,10 @@ def engine_name(name, shapes, input_names=None, dyn_batch=None):
 # (src/render/cache.ts), so no engine built from an older graph is reused. MUST equal the host's
 # kOnnxRev. Rev 2: the PRelu rewrite
 # (trt_runtime._fuse_prelu). Rev 3: RIFE IFNet / block0 take f0 / f1 in fp16
-# (trt_runtime._half_features).
+# (trt_runtime._half_features). Rev 4: the RIFE IFNet's x and the encode's img in fp16
+# (trt_runtime._half_frames).
 ONNX_DIR = os.environ.get("SMV_ONNX_DIR") or os.path.join(HERE, "onnx")
-ONNX_REV = 3
+ONNX_REV = 4
 
 
 def onnx_path(key):

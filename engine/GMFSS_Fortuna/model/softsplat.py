@@ -275,7 +275,7 @@ def softsplat(tenIn:torch.Tensor, tenFlow:torch.Tensor, tenMetric:torch.Tensor, 
 
 
 class softsplat_func(torch.autograd.Function):
-    # DETERMINISM (SMV 2026-07-09): the forward splat accumulates via int64 FIXED-POINT atomics
+    # DETERMINISM (SMV): the forward splat accumulates via int64 FIXED-POINT atomics
     # instead of the original float32 atomicAdd. Float addition is not associative, so the float
     # atomics made every warp run-to-run nondeterministic (the ONLY nondeterministic stage in the
     # whole GMFSS pipeline, measured); integer addition IS associative, so summing pre-rounded

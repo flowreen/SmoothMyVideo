@@ -70,7 +70,7 @@ class Model:
         img1 = F.interpolate(img1, scale_factor = 0.5, mode="bilinear", align_corners=False)
 
         if scale != 1.0:
-            # Flow scale (SMV 2026-09-14): the flow input is resized to EXPLICIT /32-aligned
+            # Flow scale (SMV): the flow input is resized to EXPLICIT /32-aligned
             # dims, never by a scale factor. gmflow's attention splits accept only sizes whose
             # /4 and /8 feature maps divide evenly (a factor of 0.5 on a 544-row half frame gave
             # 272 = 8.5 x 32 and died on the split assert); multiples of 32 always pass. The

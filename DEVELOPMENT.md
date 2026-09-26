@@ -104,7 +104,12 @@ RTX VSR / HDR and all three codecs.
   (`trt_runtime._half_features`), so the host feeds the encode engine's fp16 output as it is
   instead of widening it with `k_h2f` (the host reads the dtype off the engine and refuses a
   block0 or encode engine that does not match): live batched IFNet 1.02x per call at 1440p,
-  output bit-identical. Built from these files the engines are
+  output bit-identical. Rev 4: the RIFE IFNet takes its frame pair `x` and the encode its `img`
+  in fp16 (`trt_runtime._half_frames`); the host keeps the fp32 frames for everything else and
+  fills an fp16 copy for these engines once per frame (`k_f2h`), reading each engine's dtype on
+  its own, so either revision of either engine works. The IFNet runs 1.05x faster per call at
+  1080p; the tweens change slightly (the fp16 rounding reaches the flow, 56 to 65 dB on anime),
+  the real frames do not. Built from these files the engines are
   bit-identical to the per-size ones, except gmflow_bidir (its size-free branch, see the GMFlow
   bullet below).
   `SMV_ONNX_DIR` moves the folder.

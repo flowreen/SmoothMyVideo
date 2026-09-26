@@ -63,7 +63,7 @@ def _export_onnx(export_module, example_inputs, input_names, output_names, onnx_
     # aten.cudnn_grid_sampler, which has no fake-tensor support, and every later export of a
     # grid_sample-using net (metricnet's backwarp) dies with ConversionError/PassError.
     # Disabling cudnn for the export forces the exportable grid_sampler_2d choice; the built
-    # engine and the eager nets are untouched. Repro: smv-live\harness\probe_metricnet_export3/5.
+    # engine and the eager nets are untouched.
     with torch.backends.cudnn.flags(enabled=False), \
             torch.autocast("cuda", dtype=torch.float16):
         # verbose=False drops the exporter's per-phase progress chatter (each phase printed
@@ -147,6 +147,52 @@ def _half_features(onnx_path, name):
         g.graph.node.insert(0, helper.make_node("Cast", [inp.name], [wide], to=TensorProto.FLOAT,
                                                 name=inp.name + "_widen"))
         inp.type.tensor_type.elem_type = TensorProto.FLOAT16
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
+def _half_frames(onnx_path, name):
+    """RIFE IFNet x / the encode's img: take the frames as fp16 inputs. The IFNet widens x inside
+    the graph (its warps still run fp32, on the fp16-rounded pixels); the encode's first node
+    casts img to fp16 anyway, so that Cast goes and its features stay identical. The host fills an
+    fp16 copy of the frame pair once per frame and the IFNet reads half the bytes (1.05x per call
+    at 1080p). Not bit-identical: the rounding reaches the flow (tweens 56 to 65 dB against fp32
+    frames on anime, every real frame unchanged). Graph only."""
+    import onnx
+    from onnx import helper, TensorProto
+
+    if name.startswith("rife_ifnet_"):
+        key = "x"
+    elif name.startswith("rife_encode_"):
+        key = "img"
+    else:
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    inp = [i for i in g.graph.input if i.name == key]
+    if len(inp) != 1 or inp[0].type.tensor_type.elem_type != TensorProto.FLOAT:
+        raise RuntimeError(f"{name}: expected an fp32 input {key}")
+    inp = inp[0]
+    readers = [nd for nd in g.graph.node if key in nd.input]
+    narrow = (len(readers) == 1 and readers[0].op_type == "Cast"
+              and [a.i for a in readers[0].attribute if a.name == "to"] == [TensorProto.FLOAT16])
+    if narrow:
+        old = readers[0].output[0]
+        g.graph.node.remove(readers[0])
+        for nd in g.graph.node:
+            for k, x in enumerate(nd.input):
+                if x == old:
+                    nd.input[k] = key
+    else:
+        wide = key + "_f32"
+        for nd in readers:
+            for k, x in enumerate(nd.input):
+                if x == key:
+                    nd.input[k] = wide
+        g.graph.node.insert(0, helper.make_node("Cast", [key], [wide], to=TensorProto.FLOAT,
+                                                name=key + "_widen"))
+    inp.type.tensor_type.elem_type = TensorProto.FLOAT16
     with open(onnx_path + ".tmp", "wb") as fh:
         fh.write(g.SerializeToString())
     os.replace(onnx_path + ".tmp", onnx_path)
@@ -258,6 +304,7 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
                 raise RuntimeError(f"exporter specialized an axis of {n}: {dims}")
         _fuse_prelu(tmp)
         _half_features(tmp, name)
+        _half_frames(tmp, name)
         if os.path.isfile(tmp + ".data"):
             os.replace(tmp + ".data", path + ".data")
         os.replace(tmp, path)

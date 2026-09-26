@@ -10,13 +10,13 @@ backwarp_tenGrid = {}
 
 
 def _grid_axis(n, device):
-    # SMV 2026-09-21 (ONNX-in-exe): torch.linspace(-1, 1, n) for a SIZE-FREE export. linspace's
+    # SMV: torch.linspace(-1, 1, n) for a SIZE-FREE export. linspace's
     # length specializes under torch.export, so the export path spells out onnxscript's own
     # aten_linspace (step = 2 / (n - 1) in fp32, split at i < n / 2) with n taken off the arange.
     # The torch.maximum no-ops sit between every multiply and its add: in a size-free graph this
     # runs on the GPU, where TensorRT would fuse multiply-add into one rounding, while the
     # per-size export's host-folded constant rounded twice; split, the engine is bit-exact with
-    # the per-size one (harness\onnx\all_graphs.py, metricnet 480x288 + 960x544).
+    # the per-size one (checked on metricnet at 480x288 and 960x544).
     i = torch.arange(n, device=device, dtype=torch.float32)
     steps_f = i[-1:] + 1.0
     sm1 = steps_f - 1.0
@@ -29,7 +29,7 @@ def _grid_axis(n, device):
 
 def backwarp(tenIn, tenflow):
     if torch.compiler.is_compiling():
-        # the export path (SMV 2026-09-21): the grid without linspace, see _grid_axis
+        # the export path (SMV): the grid without linspace, see _grid_axis
         h, w = tenflow.shape[2], tenflow.shape[3]
         hor = _grid_axis(w, tenflow.device).view(1, 1, 1, w).expand(tenflow.shape[0], -1, h, -1)
         ver = _grid_axis(h, tenflow.device).view(1, 1, h, 1).expand(tenflow.shape[0], -1, -1, w)
@@ -37,7 +37,7 @@ def backwarp(tenIn, tenflow):
         tenflow = torch.cat([tenflow[:, 0:1, :, :] / ((tenIn.shape[3] - 1.0) / 2.0), tenflow[:, 1:2, :, :] / ((tenIn.shape[2] - 1.0) / 2.0)], 1)
         return torch.nn.functional.grid_sample(input=tenIn, grid=(grid + tenflow).permute(0, 2, 3, 1), mode='bilinear', padding_mode='zeros', align_corners=True)
     # ONNX-export traces run this with FakeTensors; caching one poisons the dict for every
-    # later export AND the real eager path at the same shape (SMV fix 2026-08-28), so fakes
+    # later export AND the real eager path at the same shape (SMV fix), so fakes
     # bypass the cache entirely.
     fake = isinstance(tenflow, torch._subclasses.fake_tensor.FakeTensor)
     grid = None if fake else backwarp_tenGrid.get(str(tenflow.shape))

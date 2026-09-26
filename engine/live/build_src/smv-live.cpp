@@ -37,9 +37,9 @@
 #include <d3d12.h>
 #include <d3d11_4.h>           // ID3D11Device5/Fence/DeviceContext4 (shared-fence capture interop)
 #include <dxgi1_4.h>
-#include <dxgi1_6.h>          // IDXGIOutput6 / DXGI_OUTPUT_DESC1 for HDR display detection (WO-8)
-#include <d3dcompiler.h>      // D3DCompile for the dlssg HDR pack shader (WO-8 Phase 3)
-#include "nr_host.h"          // WO-42: the DLSS 5 Neural Rendering core, run inside this process
+#include <dxgi1_6.h>          // IDXGIOutput6 / DXGI_OUTPUT_DESC1 for HDR display detection
+#include <d3dcompiler.h>      // D3DCompile for the dlssg HDR pack shader
+#include "nr_host.h"          // the DLSS 5 Neural Rendering core, run inside this process
 #include <dwmapi.h>
 #include <timeapi.h>
 #include <shlwapi.h>
@@ -97,8 +97,8 @@ static uint32_t H = 1080;
 // backend-agnostic server route). BK_SERVER = a model backend (rife, blend, gmfss, nvof, fruc,
 // rifedrba, echo) run by the in-process native host (smv-live-native.inl); it returns N output
 // frames per input and this host paces their presentation across the measured capture
-// interval. The python live server that first filled this role (engine/live_server.py) was
-// deleted 2026-09-21; comments that name its functions record where the math was ported from.
+// interval. Comments that name functions of engine/live_server.py (the python server this host
+// replaced) record where the math was ported from.
 enum Backend { BK_DLSSG, BK_IDENTITY, BK_SERVER };
 static Backend g_backend = BK_DLSSG;
 static std::wstring g_serverBackend;   // BK_SERVER: the backend name (--backend)
@@ -107,10 +107,10 @@ static std::wstring g_modelLabel;      // user-facing model name for the loading
                                        // falls back to the raw backend name when absent)
 static std::wstring g_modelNote;       // substitution note appended to the loading log line
                                        // (e.g. Smooth Motion having no live mode runs GMFSS)
-static bool g_capRel = false;          // WO-10: request the capture-release token (xq route)
-static bool g_offline = false;         // WO-32: --offline render mode (stdin frames in, stdout out)
-static bool g_offlineGraph = false;    // WO-32: SMV_OFFLINE_GRAPH=1
-// IDENTICAL-PAIR PASSTHROUGH (2026-09-16): two BYTE IDENTICAL frames in a row have no motion
+static bool g_capRel = false;          // request the capture-release token (xq route)
+static bool g_offline = false;         // --offline render mode (stdin frames in, stdout out)
+static bool g_offlineGraph = false;    // SMV_OFFLINE_GRAPH=1
+// IDENTICAL-PAIR PASSTHROUGH: two BYTE IDENTICAL frames in a row have no motion
 // between them, so the model is skipped for that pair and every tween slot presents the real
 // frame itself (a paused source or a static scene then stops shimmering). Exact equality only,
 // never a tolerance and never a near-identical gate. SMV_NO_STATIC_HOLD=1 turns it off for
@@ -127,7 +127,7 @@ static std::wstring engineScript(const std::wstring& exeDir)
 {
     return g_script.empty() ? exeDir + L"\\..\\live_server.py" : g_script;
 }
-static double g_flowScale = 1.0;       // IMAGE scale (--scale; was --img-scale/--flow-scale, renamed 2026-08-28):
+static double g_flowScale = 1.0;       // IMAGE scale (--scale):
                                        // whole model pipeline at this fraction, fit upscales back
 static bool g_noHud = false;           // --no-hud: suppress the on-screen fps/latency readout
 static bool g_noHudLat = false;        // --no-hud-latency: keep the readout, drop the "~X ms behind" part
@@ -142,12 +142,12 @@ static bool g_dlssnr = false;          // --dlssnr: forwarded to the server (DLS
 static double g_nrStructure = 1.0;     // --nr-structure F (0..2, the DLSS 5 Structure Intensity)
 static double g_nrTone = 1.0;          // --nr-tone F (0..2, the DLSS 5 Tone Intensity)
 static int g_nrStyle = 1;              // --nr-style N (DLSSNR.Style: 0 Default, 1 Natural, 2 Cinematic)
-static bool g_nrNative = false;        // WO-42: the pass runs inside this exe on the shared capture
+static bool g_nrNative = false;        // DLSS 5 NR runs inside this exe on the shared capture
                                        // texture (LiveNr below); the server is then NOT told --dlssnr
-static bool g_nrAttempted = false;     // WO-42: NGX was initialised in this process (even if it then
+static bool g_nrAttempted = false;     // NGX was initialised in this process (even if it then
                                        // refused): leave through ExitProcess, see the end of run()
-// WO-8 Phase 4: live TrueHDR (SDR window -> HDR out). Forwarded to the server only when the HDR
-// live mode is on (server backends; DLSS-G has no python server).
+// Live TrueHDR (SDR window -> HDR out). Applied only when the HDR live mode is on (server
+// backends; not DLSS-G).
 static bool g_rtxHdr = false;          // --rtx-hdr
 static wchar_t g_hdrColor[8] = L"vivid"; // --hdr-color vivid|rtx|raw
 static int g_hdrSat = 0;               // --hdr-saturation (SDK 0..200; drives the rtx mode)
@@ -189,12 +189,12 @@ static bool g_monitor = false;         // --fit monitor: capture the target's WH
 static bool g_fill = false;            // --fit fill: fullscreen overlay on the target's monitor,
                                        // content aspect-fit upscaled by the server (server backends
                                        // only; DLSS-G owns its pipeline and cannot be resized yet)
-// WO-8 Phase 1: HDR live mode. When the target's display has Windows HDR on and we run a server
+// HDR live mode. When the target's display has Windows HDR on and we run a server
 // backend, capture FP16 scRGB, the server converts to BT.2020 PQ [0,1], and everything downstream
-// (canvas, shm, present) stays 4 bytes/px as R10G10B10A2 on a PQ (G2084) swapchain. SDR is byte-
-// identical to before. SMV_LIVE_HDR overrides detection: 1 = force on, 0 = force off (test lever).
+// (canvas, shm, present) stays 4 bytes/px as R10G10B10A2 on a PQ (G2084) swapchain. SDR is
+// unaffected. SMV_LIVE_HDR overrides detection: 1 = force on, 0 = force off (test lever).
 static bool g_hdr = false;
-// Resident live host (memory priority 7, 2026-09-12): --resident keeps this process alive
+// Resident live host: --resident keeps this process alive
 // between sessions with the TensorRT runtime, the two RIFE engines, the JIT cache and the
 // kernel module loaded (about 300 MB of VRAM idle) and recreates only the per-session state
 // (capture, overlay, execution contexts, buffers). Sessions start and stop over stdin lines
@@ -207,8 +207,8 @@ static bool g_sessionClean = false;            // runLive left through its full 
 static bool g_rtxUsed = false;                 // the TrueHDR bridge (single-instance NGX) ran here
 static bool g_teardownTrace = false;           // SMV_LIVE_TEARDOWN_TRACE=1: one line per teardown stage
 
-// Every log line goes to stderr; the resident offline host (go-order item 4, 2026-09-12) also
-// writes it to the control pipe of the render.py it is serving (g_logPipe set for the item), so
+// Every log line goes to stderr; the resident offline host also
+// writes it to the control pipe of the render it is serving (g_logPipe set for the item), so
 // PROGRESS / OUTFRAMES and the rest reach the GUI exactly as they did through the one-shot exe's
 // stderr. One mutex: the reader, writer and compute threads all log.
 static HANDLE g_logPipe = nullptr;
@@ -248,7 +248,7 @@ static void logWrite(const char* fmt, ...)
 // through the C locale (this exe never calls setlocale), so vsnprintf returns -1 and logWrite
 // above DROPS THE WHOLE LINE as soon as one wide character has no representation there: a
 // window title carrying an en dash or a CJK character silently cost us the "target window:"
-// line, and with it the app's hotkey-mode revive after a resize (2026-09-16). So convert to
+// line, and with it the app's hotkey-mode revive after a resize. So convert to
 // UTF-8 and print "%s"; never "%ls" for text the user can influence.
 static std::string wideToUtf8(const std::wstring& s)
 {
@@ -411,7 +411,7 @@ static float halfToFloat(uint16_t h)
     return out;
 }
 
-// WO-8 diagnostic: capture ANY window as FP16 scRGB and report what it actually contains, per
+// HDR diagnostic: capture ANY window as FP16 scRGB and report what it actually contains, per
 // channel, plus sample pixels. GDI dumps and screenshots cannot read HDR (they clip to 8-bit SDR),
 // so this is the only way to see the real values - including by pointing it at OUR OWN overlay to
 // check whether the HDR present is correct instead of guessing from how it looks.
@@ -500,7 +500,7 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 }
 
 
-// ---- WO-32: offline RIFE render through this host ------------------------------------------
+// ---- offline render through this host --------------------------------------------------------
 // smv-live.exe --offline --w W --h H --multi N [--frames T] [--pixfmt rgb48le|rgb24]
 //               [--python p] [--script s] [--progress-every K] [--pause-file P]
 //               [--ifnet E --encode E --jit J --ph N --pw N --batch B]
@@ -537,7 +537,7 @@ struct OfflineIo
     uint64_t outBase = 0;            // --resume-out: the banked output frames, so PROGRESS / OUTFRAMES count the whole render
     uint64_t skipIn = 0;             // --skip-in: input frames the reader discards before the first real one
     HANDLE hStdin = nullptr, hStdout = nullptr;
-    // --thumb PATH (priority 26): the GUI's render progress thumbnail, render.py's _live_preview.
+    // --thumb PATH: the GUI's render progress thumbnail, render.py's _live_preview.
     // About once a second the writer drops a small copy of the frame it is writing (the output
     // pixfmt kept, the TS side tonemaps and encodes it) and logs THUMB; --thumb-off FILE present =
     // the GUI's Hide, nothing is made. outFmt: 0 rgb24, 1 rgb48le, 2 x2rgb10le
@@ -718,7 +718,7 @@ static void offlineWriter(OfflineIo* io)
     LOG("OUTFRAMES %llu\n", (unsigned long long)(io->outBase + io->framesOut));
 }
 
-// ---- priority 24 step 5: DLSS 4.5 = engine\dlssg\dlssg2f.exe --server as this process's child --
+// ---- DLSS 4.5 = engine\dlssg\dlssg2f.exe --server as this process's child ---------------------
 // dlssg.py's DLSSG class in C++: raw RGBA8 frames at the padded size on the child's stdin, after
 // the first one the gen generated frames of every pair on its stdout; its stderr lines are
 // forwarded to the log. A read that blocks over 10 s (or over 1 s while the GUI holds Pause)
@@ -935,7 +935,7 @@ struct OfflineArgs
     bool fruc = false;          // --fruc: Nvidia Smooth Motion (live's nvoffruc bridge path, no engine)
     double fpsRatio = 0.0;      // --fps-ratio R: --fps mode, render.py's ratio (repr, so the same double)
     bool dlssg = false;         // --dlssg: DLSS 4.5, the dlssg2f.exe --server child (DgChild), 2x..6x
-    // resume (priority 24 step 6d): render.py's _try_resume mapping. The decoder already skipped
+    // resume: render.py's _try_resume mapping. The decoder already skipped
     // to source frame P, so this run's pair i is the render's pair P + i (the --fps grid, the
     // closing slot); its first D outputs are banked already and are dropped BEFORE any pass (no
     // DLSS 5 history, no statistics record), exactly python's resume_active / skip / pend rule
@@ -945,7 +945,7 @@ struct OfflineArgs
     int resumeDrop = 0;         // --resume-drop D
     uint64_t skipIn = 0;        // --skip-in N: input frames to discard first (a resumed VFR source, render.py's _PIPE_DISCARD)
     std::wstring hdrFramesW;   // --hdr-frames PATH: one statistics line per output frame, appended + flushed (the resume prefix)
-    std::wstring nrDeltaW;     // --nr-delta PATH: DLSS 5's per-pixel change, float32 (the preview's mask, step 7)
+    std::wstring nrDeltaW;     // --nr-delta PATH: DLSS 5's per-pixel change, float32 (the preview's mask)
     std::wstring thumbW, thumbOffW;   // --thumb PATH / --thumb-off FILE: the GUI's progress thumbnail (OfflineIo)
 };
 
@@ -1000,13 +1000,13 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
         else if (wcscmp(argv[i], L"--resume-drop") == 0 && i + 1 < argc) oa.resumeDrop = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--skip-in") == 0 && i + 1 < argc) oa.skipIn = (uint64_t)_wtoi64(argv[++i]);
         else if (wcscmp(argv[i], L"--hdr-frames") == 0 && i + 1 < argc) oa.hdrFramesW = argv[++i];
-        // the per-frame passes (priority 24 step 2): render_passes' order on every output frame
+        // the per-frame passes: render_passes' order on every output frame
         else if (wcscmp(argv[i], L"--out-w") == 0 && i + 1 < argc) oa.outW = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--out-h") == 0 && i + 1 < argc) oa.outH = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--sharpen") == 0 && i + 1 < argc) g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0) g_rtxVsr = true;
         else if (wcscmp(argv[i], L"--restore") == 0) g_restore = true;
-        // RTX HDR (priority 24 step 2c): TrueHDR last on every output frame, x2rgb10le out
+        // RTX HDR: TrueHDR last on every output frame, x2rgb10le out
         else if (wcscmp(argv[i], L"--rtx-hdr") == 0) g_rtxHdr = true;
         else if (wcscmp(argv[i], L"--hdr-color") == 0 && i + 1 < argc) wcsncpy_s(g_hdrColor, argv[++i], _TRUNCATE);
         else if (wcscmp(argv[i], L"--hdr-saturation") == 0 && i + 1 < argc) g_hdrSat = _wtoi(argv[++i]);
@@ -1016,7 +1016,7 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
         else if (wcscmp(argv[i], L"--hdr-stats") == 0 && i + 1 < argc) oa.hdrStatsW = argv[++i];
         else if (wcscmp(argv[i], L"--hdr-dv") == 0) oa.hdrDv = true;
         else if (wcscmp(argv[i], L"--hdr-hp") == 0) oa.hdrHp = true;
-        // DLSS 5 (priority 24 step 2d): after the resize, before RCAS, on every output frame
+        // DLSS 5: after the resize, before RCAS, on every output frame
         else if (wcscmp(argv[i], L"--dlssnr") == 0) g_dlssnr = true;
         else if (wcscmp(argv[i], L"--nr-structure") == 0 && i + 1 < argc) g_nrStructure = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-tone") == 0 && i + 1 < argc) g_nrTone = _wtof(argv[++i]);
@@ -1064,7 +1064,7 @@ static int runOffline(int argc, wchar_t** argv)
 static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, bool namedPipes)
 {
     int w = oa.w, h = oa.h;   // not const: kernel argument arrays take their addresses as void*
-    // --fps mode (priority 24 step 4): render_loops.fps_loop / drba_loop at render.py's ratio,
+    // --fps mode: render_loops.fps_loop / drba_loop at render.py's ratio,
     // every output an interior slot of _pair_fracs, no real frame passes through; one tween
     // per enqueue (python's per-tween inference), so the RIFE class is the unbatched x2
     const bool fpsMode = oa.fpsRatio > 0.0;
@@ -1095,12 +1095,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     if (!nativeLoadDlls(script)) { LOG("offline: runtime DLLs unavailable\n"); return 2; }
     // RIFE: the IFNet + Head engines at the true /64 pad of the source size (out = capture =
     // source, no fit, no effects), found or built by the host (lkOfflineRife) unless a harness
-    // hands paths over. The nvof model (2026-09-21) needs neither: the source size IS the model
+    // hands paths over. The nvof model needs neither: the source size IS the model
     // size (the Optical Flow engine takes any size from 32x32, no pad), one tween at a time.
     OfflineEngines oe;
     if (oa.gmfss)
     {
-        // GMFSS (step 3b): the five engines at the /64 pad of the source, found or built by
+        // GMFSS: the five engines at the /64 pad of the source, found or built by
         // the host; one tween at a time like nvof (live's chain has no timestep batch)
         if (!lkOfflineGmfss(script, w, h, nr)) return 2;
         nr.w = w; nr.h = h; nr.cw = w; nr.ch = h; nr.dw = w; nr.dh = h;
@@ -1108,7 +1108,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     else if (oa.fruc)
     {
-        // Smooth Motion (step 3d): live's bridge path at the /64 pad of the source (render.py
+        // Smooth Motion: live's bridge path at the /64 pad of the source (render.py
         // sizes NvOFFRUC to pw x ph the same way), true BGRA from the (R, G, B) planes
         if (!lkOfflineFruc(script, nr.frucDir)) return 2;
         nr.fruc = true;
@@ -1119,7 +1119,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     else if (oa.dlssg)
     {
-        // DLSS 4.5 (step 5): the server sized to the /64 pad of the source (render.py's pw x ph,
+        // DLSS 4.5: the server sized to the /64 pad of the source (render.py's pw x ph,
         // dlssg.py sends the padded frame), RGBA8 from the (R, G, B) planes, no engine
         nr.dlssg = true;
         nr.planesRgb = true;
@@ -1129,7 +1129,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     else if (!oa.nvof && !oa.echo && ifnetW.empty())
     {
-        // DRBA (step 3c): the unbatched IFNet (one tween per enqueue, its own DRM timestep map)
+        // DRBA: the unbatched IFNet (one tween per enqueue, its own DRM timestep map)
         // plus the block0 flow engine
         if (!lkOfflineRife(script, w, h, oa.drba ? 2 : multi, oe)) return 2;
         if (oa.drba)
@@ -1146,7 +1146,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     else if (oa.nvof || oa.echo)
     {
-        // --no-interp (step 3, 2026-09-23) = live's echo: the no-engine mode, the same geometry
+        // --no-interp = live's echo: the no-engine mode, the same geometry
         nr.nvof = oa.nvof;
         nr.noEngine = oa.echo;
         nr.planesRgb = true;   // k_packInRaw8 / 16 pack the decoder's rgb as (R, G, B)
@@ -1165,13 +1165,13 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         if (nr.ph < 16 || nr.pw < 16 || nr.encodePath.empty())
         { LOG("offline: --ifnet needs --encode, --ph and --pw\n"); return 1; }
     }
-    // the per-frame passes (priority 24 step 2): render.py's output size (only an enlarge: a
+    // the per-frame passes: render.py's output size (only an enlarge: a
     // downscale folds into the decode), Sharpen, RTX VSR and Restore, on every output frame
     const int outW = oa.outW > 0 ? oa.outW : w, outH = oa.outH > 0 ? oa.outH : h;
     if (outW < w || outH < h)
     { LOG("offline: --out-w / --out-h below the working size (a downscale folds into the decode)\n"); return 1; }
     nr.dw = outW; nr.dh = outH;
-    // RTX HDR (step 2c) needs the x2rgb10le encode pipe and the other way round
+    // RTX HDR needs the x2rgb10le encode pipe and the other way round
     if (g_rtxHdr != oa.outX2)
     { LOG("offline: --rtx-hdr and --out-pixfmt x2rgb10le go together\n"); return 1; }
     const bool passes = g_sharpen > 0.0 || g_restore || outW != w || outH != h || g_rtxHdr || g_dlssnr;
@@ -1243,6 +1243,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     if (!cm((void**)&nr.dX, 6 * plane * sizeof(float), "x")
         || (!nr.nvof && !nr.noEngine && !nr.gmfss && !nr.fruc && !oa.dlssg && (!cm((void**)&nr.dF[0], 16 * plane * sizeof(float), "f0")
             || !cm((void**)&nr.dF[1], 16 * plane * sizeof(float), "f1") || !cm((void**)&nr.dEncHalf, 16 * plane * sizeof(uint16_t), "enc")
+            || !cm((void**)&nr.dXh, 6 * plane * sizeof(uint16_t), "x fp16")
             || !cm((void**)&nr.dT, (size_t)batchMax * plane * sizeof(float), "timestep")
             || !cm((void**)&nr.dMerged, (size_t)batchMax * 3 * plane * sizeof(float), "merged")))
         || !cm((void**)&dRaw[0], frameBytes, "raw0") || !cm((void**)&dRaw[1], frameBytes, "raw1")
@@ -1292,7 +1293,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     if (g_dlssnr)
     {
-        // DLSS 5 (priority 24 step 2d): the NR core with dlssnr.exe's own bring-up (a private
+        // DLSS 5: the NR core with dlssnr.exe's own bring-up (a private
         // D3D12 device, CPU staging) at the output size. render.py's rule: a runtime that
         // cannot start drops the pass with a notice, never the render. NGX prints to the
         // process stdout, which is the encode pipe on a one-shot run: keep a private handle
@@ -1378,7 +1379,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         cudaEventCreateWithFlags(&io.outEv[i], cudaEventDisableTiming);
         io.outFree.push_back(i);
     }
-    // DLSS 4.5 (step 5): the RGBA8 staging (device + pinned: the two latest frames and the pair's
+    // DLSS 4.5: the RGBA8 staging (device + pinned: the two latest frames and the pair's
     // generated frames), then the server itself; its handshake decides "up" vs "unsupported"
     DgChild dgc;
     uint8_t* dDgRgba = nullptr;
@@ -1477,7 +1478,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         LOG("offline: resumed at source frame %llu, %llu output frames banked, dropping the first %d\n",
             (unsigned long long)pairBase, (unsigned long long)oa.resumeOut, dropLeft);
     uint64_t nFrames = 0;
-    // ---- DRBA (priority 24 step 3c): render_loops.drba_loop on live's lag-1 windows ----------
+    // ---- DRBA: render_loops.drba_loop on live's lag-1 windows --------------------------------
     // Every output sits on the uniform offset grid f = (j + 0.5) / multi of its pair; no real
     // frame passes through. Pair (k-2, k-1) goes out once frame k is in the ring (live's group
     // order: f < 0.5 from window k-2 side +1, f >= 0.5 from window k-1 side -1, the first pair's
@@ -1586,7 +1587,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         { std::lock_guard<std::mutex> lk(io.m); io.inState[slot] = 2; }
         nFrames++;
         if (havePrev)
+        {
             cudaMemcpyAsync(nr.dX, nr.dX + 3 * plane, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st);
+            // the fp16 copy an fp16-x IFNet reads keeps the same two frames (DRBA builds its own x)
+            if (nr.xHalf && !nr.drba)
+                cudaMemcpyAsync(nr.dXh, nr.dXh + 3 * plane, 3 * plane * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st);
+        }
         float* dCur = nr.dX + 3 * plane;
         {
             void* a[] = { &dR, &w, &h, &dCur, &nr.ph, &nr.pw, (void*)&ps };
@@ -1601,7 +1607,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         {
             nvinfer1::Dims4 din{ 1, 3, nr.ph, nr.pw };
             if (!nr.ctxEnc->setInputShape("img", din)) { io.setFail("encode setInputShape rejected"); failed = true; break; }
-            nr.ctxEnc->setTensorAddress("img", dCur);
+            // fp16 frames (ONNX rev 4): the new frame into the fp16 copy's cur half, read by an
+            // fp16-x IFNet and / or an fp16-img encode
+            uint16_t* cur16 = nr.dXh + 3 * plane;
+            if ((nr.xHalf || nr.imgHalf) && !nativeF2h(nr, dCur, cur16, 3 * plane, st))
+            { io.setFail("f2h launch failed"); failed = true; break; }
+            nr.ctxEnc->setTensorAddress("img", nr.imgHalf ? (void*)cur16 : (void*)dCur);
             // fp16 features (ONNX rev 3): the encode writes dF directly, no widen pass
             const bool widen = nr.encHalf && !nr.featHalf;
             void* encOut = widen ? (void*)nr.dEncHalf : (void*)nr.dF[nr.fCur];
@@ -1615,7 +1626,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 { io.setFail("h2f launch failed"); failed = true; break; }
             }
         }
-        // IDENTICAL PAIR (2026-09-16): the two packed inputs compared element by element on the
+        // IDENTICAL PAIR: the two packed inputs compared element by element on the
         // device, the flag read back once per pair. Equal = there is no motion in this pair, so
         // the engine is skipped and every tween slot carries the real frame's own output bytes
         // (the Head encode above still ran, so the next pair's chain state is unchanged). Exact
@@ -1862,7 +1873,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dtst)
                         || !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
                     { io.setFail("IFNet setInputShape rejected"); failed = true; break; }
-                    nr.ctxIf->setTensorAddress("x", nr.dX);
+                    nr.ctxIf->setTensorAddress("x", nr.xHalf ? (void*)nr.dXh : (void*)nr.dX);
                     nr.ctxIf->setTensorAddress("timestep", nr.dT);
                     nr.ctxIf->setTensorAddress("f0", nr.dF[nr.fCur ^ 1]);
                     nr.ctxIf->setTensorAddress("f1", nr.dF[nr.fCur]);
@@ -2111,7 +2122,7 @@ int wmain(int argc, wchar_t** argv)
     // --lookup-probe script backend outW outH capW capH imgScale: print the handoff lines the
     // host's own warm engine lookup answers, or `MISS`; stdout only. A debug entry point: a
     // change to the lookup's naming or geometry is gated by dumping this over a config matrix
-    // before and after (the Flow scale argument went with the control, 2026-09-25)
+    // before and after
     if (argc >= 9 && wcscmp(argv[1], L"--lookup-probe") == 0)
     {
         W = (uint32_t)_wtoi(argv[4]); H = (uint32_t)_wtoi(argv[5]);
@@ -2139,7 +2150,7 @@ int wmain(int argc, wchar_t** argv)
         wchar_t gv[8]{};
         g_offlineGraph = GetEnvironmentVariableW(L"SMV_OFFLINE_GRAPH", gv, 8) && gv[0] == L'1';
         const int orc = runOffline(argc, argv);
-        // DLSS 5 ran here (step 2d): NGX's process-detach teardown faults after main returns,
+        // DLSS 5 ran here: NGX's process-detach teardown faults after main returns,
         // so leave the way dlssnr.exe and the live host do
         if (g_nrAttempted) { fflush(stderr); ExitProcess((UINT)orc); }
         return orc;
@@ -2300,7 +2311,7 @@ static int runLiveArgs(LiveArgs& la)
     return runLive(la.needle, la.targetOverride, la.genFrames, la.vsync, la.clickthrough, la.diagSecs, la.park);
 }
 
-// ---------------------------------------------------------------- resident host (memory priority 7)
+// ---------------------------------------------------------------- resident host
 //
 // --resident: after a session ends the process stays alive with the engines loaded (g_res)
 // and reads one command per line from stdin:
@@ -2395,7 +2406,7 @@ static int residentMain(LiveArgs first)
         // the session's target rides along: hotkey (--fg) mode is the only mode where the app
         // does not already know the hwnd, and its exit 4 (resize) / exit 6 (stall) revive needs
         // it. The "target window:" line above carries it too, this one is the belt: a session
-        // that ends without that line still revives (2026-09-16).
+        // that ends without that line still revives.
         char tgt[40] = "";
         if (g_targetHwnd) snprintf(tgt, sizeof tgt, " target=0x%p", (void*)g_targetHwnd);
         LOG("live session ended: exit %d, host resident (%s%s kept, idle limit %d s)%s\n", rc,
@@ -2441,7 +2452,7 @@ static int residentMain(LiveArgs first)
     }
 }
 
-// ---------------------------------------------------------------- resident offline host (go-order item 4)
+// ---------------------------------------------------------------- resident offline host
 //
 // smv-live.exe --offline --resident --pipe NAME [--script s --python p]: the offline render host
 // stays alive between queue items with the TensorRT runtime, the engines, the JIT cache and the
@@ -2588,7 +2599,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             // the RTX Video bridge (VSR) is single-instance NGX and cannot come back in this
             // process once shut down: the next render spawns a fresh host (the live rule)
             if (g_rtxUsed) { LOG("offline host: the RTX Video bridge ran here, exiting after this item\n"); quit = true; }
-            // DLSS 5 (step 2d): NGX has no teardown and a second feature in this process is
+            // DLSS 5: NGX has no teardown and a second feature in this process is
             // unproven, so the host ends and leaves through ExitProcess (wmain)
             if (g_nrAttempted) { LOG("offline host: DLSS 5 ran here, exiting after this item\n"); quit = true; }
         }
