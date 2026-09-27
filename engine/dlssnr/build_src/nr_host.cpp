@@ -682,6 +682,125 @@ bool Host::renderFrame(const void* src, void* dst, bool reset, std::string& err)
     return true;
 }
 
+LUID Host::adapterLuid() const
+{
+    LUID l = {};
+    if (m_dev) l = m_dev->GetAdapterLuid();
+    return l;
+}
+
+void Host::closeSharedHandles()
+{
+    for (HANDLE* h : { &m_shInH, &m_shOutH, &m_shFenceH })
+        if (*h) { CloseHandle(*h); *h = nullptr; }
+}
+
+bool Host::startShared(std::string& err)
+{
+    if (m_external || !m_dev || !m_color) { err = "the shared handoff needs the host's own device"; return false; }
+    const D3D12_RESOURCE_DESC td = m_color->GetDesc();
+    UINT64 total = 0;
+    m_dev->GetCopyableFootprints(&td, 0, 1, 0, nullptr, nullptr, nullptr, &total);
+
+    D3D12_HEAP_PROPERTIES def = {}; def.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // Shared resources start in COMMON: a buffer promotes to COPY_SOURCE / COPY_DEST implicitly
+    // and decays back to COMMON when its list completes, the state CUDA reads and writes it in.
+    if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_SHARED, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                              nullptr, IID_PPV_ARGS(&m_shIn)))
+        || FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_SHARED, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                                 nullptr, IID_PPV_ARGS(&m_shOut))))
+    { err = "shared buffer creation failed"; return false; }
+    if (FAILED(m_dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&m_shFence))))
+    { err = "shared fence creation failed"; return false; }
+    if (FAILED(m_dev->CreateSharedHandle(m_shIn.Get(), nullptr, GENERIC_ALL, nullptr, &m_shInH))
+        || FAILED(m_dev->CreateSharedHandle(m_shOut.Get(), nullptr, GENERIC_ALL, nullptr, &m_shOutH))
+        || FAILED(m_dev->CreateSharedHandle(m_shFence.Get(), nullptr, GENERIC_ALL, nullptr, &m_shFenceH)))
+    { closeSharedHandles(); err = "shared handle creation failed"; return false; }
+    for (int k = 0; k < kSharedLists; ++k)
+    {
+        if (FAILED(m_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_shAlloc[k])))
+            || FAILED(m_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_shAlloc[k].Get(), nullptr,
+                                               IID_PPV_ARGS(&m_shList[k]))))
+        { closeSharedHandles(); err = "shared command list creation failed"; return false; }
+        m_shList[k]->Close();
+        m_shDone[k] = 0;
+    }
+    m_shNext = 0;
+    m_shBytes = total;
+    return true;
+}
+
+bool Host::submitShared(bool reset, uint64_t waitValue, uint64_t signalValue, std::string& err)
+{
+    if (!m_shBytes) { err = "the shared handoff is not started"; return false; }
+    const int k = m_shNext;
+    m_shNext = (k + 1) % kSharedLists;
+    // This allocator's previous list must have run. The caller's stream signals every value the
+    // queue waits for before it asks for the next frame, so this only waits out GPU work.
+    if (m_shFence->GetCompletedValue() < m_shDone[k])
+    {
+        if (FAILED(m_shFence->SetEventOnCompletion(m_shDone[k], m_fenceEvent))
+            || WaitForSingleObject(m_fenceEvent, 10000) != WAIT_OBJECT_0)
+        { err = "an earlier DLSS 5 frame did not finish within 10 s"; return false; }
+    }
+    ID3D12CommandAllocator* alloc = m_shAlloc[k].Get();
+    ID3D12GraphicsCommandList* list = m_shList[k].Get();
+    if (FAILED(alloc->Reset()) || FAILED(list->Reset(alloc, nullptr)))
+    { err = "command list Reset failed"; return false; }
+
+    D3D12_TEXTURE_COPY_LOCATION tex = {};
+    tex.pResource = m_color.Get();
+    tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    tex.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION buf = {};
+    buf.pResource = m_shIn.Get();
+    buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    buf.PlacedFootprint.Offset = 0;
+    buf.PlacedFootprint.Footprint.Format = kFmt;
+    buf.PlacedFootprint.Footprint.Width = m_w;
+    buf.PlacedFootprint.Footprint.Height = m_h;
+    buf.PlacedFootprint.Footprint.Depth = 1;
+    buf.PlacedFootprint.Footprint.RowPitch = (UINT)m_rowPitch;
+
+    D3D12_RESOURCE_BARRIER b = transition(m_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                          D3D12_RESOURCE_STATE_COPY_DEST);
+    list->ResourceBarrier(1, &b);
+    list->CopyTextureRegion(&tex, 0, 0, 0, &buf, nullptr);
+    b = transition(m_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(1, &b);
+
+    if (!evaluateOn(list, reset, err))
+    {
+        list->Close();
+        return false;
+    }
+
+    b = transition(m_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION outTex = tex;
+    outTex.pResource = m_output.Get();
+    D3D12_TEXTURE_COPY_LOCATION outBuf = buf;
+    outBuf.pResource = m_shOut.Get();
+    list->CopyTextureRegion(&outBuf, 0, 0, 0, &outTex, nullptr);
+    b = transition(m_output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->ResourceBarrier(1, &b);
+    if (FAILED(list->Close())) { err = "command list Close failed"; return false; }
+
+    if (FAILED(m_queue->Wait(m_shFence.Get(), waitValue))) { err = "queue Wait failed"; return false; }
+    ID3D12CommandList* lists[] = { list };
+    m_queue->ExecuteCommandLists(1, lists);
+    if (FAILED(m_queue->Signal(m_shFence.Get(), signalValue))) { err = "queue Signal failed"; return false; }
+    m_shDone[k] = signalValue;
+    return true;
+}
+
 // NGX teardown on a HALF-initialized session (snippet Init_Ext failed after the
 // core session came up) faults inside the driver. The process is exiting anyway,
 // so guard the NGX calls with SEH: on a fault, skip to releasing the D3D objects
@@ -691,6 +810,9 @@ static void guardedNgxShutdown(Host* self);
 void Host::shutdown()
 {
     guardedNgxShutdown(this);
+    for (int k = 0; k < kSharedLists; ++k) { m_shList[k].Reset(); m_shAlloc[k].Reset(); }
+    m_shIn.Reset(); m_shOut.Reset(); m_shFence.Reset(); m_shBytes = 0;
+    closeSharedHandles();
     m_readback.Reset(); m_upload.Reset(); m_output.Reset(); m_color.Reset();
     // on a caller device the queue and device references are just dropped
     m_list.Reset(); m_alloc.Reset(); m_queue.Reset(); m_fence.Reset(); m_dev.Reset();
@@ -704,6 +826,9 @@ void Host::abandon()
     m_feature = nullptr;
     m_params = nullptr;
     m_ngxUp = false;
+    for (int k = 0; k < kSharedLists; ++k) { m_shList[k].Reset(); m_shAlloc[k].Reset(); }
+    m_shIn.Reset(); m_shOut.Reset(); m_shFence.Reset(); m_shBytes = 0;
+    closeSharedHandles();
     m_readback.Reset(); m_upload.Reset(); m_output.Reset(); m_color.Reset();
     m_list.Reset(); m_alloc.Reset(); m_queue.Reset(); m_fence.Reset(); m_dev.Reset();
     if (m_fenceEvent) { CloseHandle(m_fenceEvent); m_fenceEvent = nullptr; }

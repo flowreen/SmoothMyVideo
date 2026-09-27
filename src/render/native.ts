@@ -2,7 +2,7 @@
 // every stderr line as render.py wrote it. This process probes, plans, picks the encoder, resumes,
 // spawns the decoder / encoder and the host (smv-live.exe --offline, one-shot or the resident host
 // behind its named pipe), relays the host's lines and finishes the container; no frame passes
-// through it (only the progress thumbnail's small dump, thumbPng). The DLSS + RTX two-pass runs its two phases through renderRoute.
+// through it (only the progress thumbnail's small dump, thumbPng).
 import { ChildProcess, spawn, spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import * as fs from 'fs';
@@ -22,7 +22,7 @@ import {
   pyReprStr,
   Say,
 } from './encode';
-import { isGmfss, nvofRefusal, outputSize, RenderArgs, scalePlan, TwoPass, twopassNeeded, twopassPlan } from './plan';
+import { isGmfss, nvofRefusal, outputSize, RenderArgs, scalePlan } from './plan';
 import { thumbPng } from './preview';
 import { frameCount, needMkv, outputRate, probe, probeTracks, sourceBits, tag, vfrConform } from './probe';
 import { pyFixed, pyFloatRepr, pyG, pyRound } from './pyfmt';
@@ -178,7 +178,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     HDR_SATBOOST = clamp(args.hdr_satboost, 0.0, 1.0);
 
   let { w: W, h: H, num, den, nb: NB, st: ST } = probe(FFPROBE, inp);
-  const plan = scalePlan(ST, W, H, UPSCALE_F, args.scale, env.SMV_TWOPASS_PHASE === '1');
+  const plan = scalePlan(ST, W, H, UPSCALE_F, args.scale);
   [W, H, UPSCALE_F, UPSCALE] = [plan.w, plan.h, plan.upscaleF, plan.upscale];
   const IMG_SCALE_VF = plan.vf;
   if (plan.note) say(plan.note);
@@ -220,11 +220,6 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const oe = path.win32.extname(outPath);
   const ob = outPath.slice(0, outPath.length - oe.length);
   const WORK_PATH = ob + '.part' + oe;
-
-  if (twopassNeeded(DLSSG_MODE, RTX_VSR, RTX_HDR, args.dlssnr, NO_INTERP, env)) {
-    const tp = twopassPlan(args, inp, ob, outPath, CODEC, NB, SHARPEN, IMG_SCALE_VF, UPSCALE, UPSCALE_F);
-    return await twoPass(tp, say, env);
-  }
 
   const NATIVE_EXE = path.join(ENGINE, 'live', 'smv-live.exe');
   if (NVOF_MODE) {
@@ -493,6 +488,9 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   }
   if (SHARPEN > 0) nargs.push('--sharpen', pyG(SHARPEN));
   if (args.restore) nargs.push('--restore');
+  // NVIDIA order: the host runs Restore and the upscale on the decoded frame, then DLSS 5 and the
+  // model at the output size (up to 3840x2160; above it the host keeps the speed-first order)
+  if (args.nvidia_order) nargs.push('--nvidia-order');
   if (nr)
     nargs.push(
       '--dlssnr',
@@ -866,53 +864,6 @@ function powerNotice(say: Say): void {
   } catch {
     /* a missing / odd nvidia-smi never breaks a render */
   }
-}
-
-/** A say that cuts its text into whole lines for `line` (a partial tail waits for the rest). */
-function lineSay(line: (ln: string) => void): Say {
-  let acc = '';
-  return (s: string) => {
-    acc += s;
-    let i: number;
-    while ((i = acc.indexOf('\n')) >= 0) {
-      line(acc.slice(0, i + 1));
-      acc = acc.slice(i + 1);
-    }
-  };
-}
-
-/** render.py's DLSS + RTX two-pass: pass 1 (DLSS interpolation into the intermediate), then pass 2
- * (the RTX / per-frame passes over it), their PROGRESS folded into one 0..T2 bar, SIZE / OUTFRAMES
- * dropped, every other line relayed; a completed intermediate skips pass 1. */
-async function twoPass(tp: TwoPass, say: Say, env: NodeJS.ProcessEnv): Promise<number> {
-  const phase = (argv: string[], ph: string, gbase: number, gspan: number): Promise<number> => {
-    const relay = lineSay((ln) => {
-      if (ln.startsWith('PROGRESS ')) {
-        const m = /^PROGRESS\s+(\S+?)\/(\S+)/.exec(ln.replace(/\s+$/, ''));
-        const k = m ? Number(m[1]) : NaN,
-          t = m ? Number(m[2]) : NaN;
-        if (Number.isInteger(k) && Number.isInteger(t)) {
-          say(`PROGRESS ${gbase + (t ? Math.floor((gspan * k) / t) : 0)}/${tp.t2}\n`);
-          return;
-        }
-        say(ln);
-      } else if (!ln.startsWith('SIZE ') && !ln.startsWith('OUTFRAMES ')) say(ln);
-    });
-    return renderRoute(argv, relay, { ...env, SMV_TWOPASS_PHASE: ph });
-  };
-  let rc = 0;
-  const skip1 = isFile(tp.inter);
-  if (skip1) say('reusing the interpolated intermediate from an earlier run\n');
-  else rc = await phase(tp.pass1, '1', 0, tp.g1);
-  if (rc === 0) rc = await phase(tp.pass2, '2', skip1 ? 0 : tp.g1, skip1 ? tp.t2 : tp.t2 - tp.g1);
-  if (rc === 0) {
-    try {
-      fs.unlinkSync(tp.inter);
-    } catch {
-      /* except OSError: pass */
-    }
-  }
-  return rc;
 }
 
 export const SESSION_LOG = path.join(os.tmpdir(), 'smv-engine.log');

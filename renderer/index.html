@@ -68,6 +68,8 @@
      workspace), and an inline display must never leak the other mode's UI back on screen. */
   html.mode-live .vonly { display:none !important; }
   html.mode-video .lonly { display:none !important; }
+  /* the pass hints that change with the Order checkbox (NVIDIA order: body.nvorder) */
+  body.nvorder .nvo-off, body:not(.nvorder) .nvo-on { display:none !important; }
   /* Percentage painted on top of the fill, centred in the bar (taller bar so the larger text fits). */
   #pct { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
          color:#fff; font-size:22px; font-weight:600; pointer-events:none;
@@ -195,20 +197,65 @@
 
   <div class="hint" style="margin:10px 0 0 4px">Numbered panels are the processing order: each frame goes through them top to bottom.</div>
 
-  <div class="panel step" id="restorepanel">
+  <div class="panel vonly" id="orderpanel">
     <div class="row">
-      <span class="k">Restore</span>
+      <span class="k">Order</span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
+        <input type="checkbox" id="nvorder" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        NVIDIA order <span class="hint">(Restore and the upscale first, then DLSS 5 and the interpolation at the output size, the order NVIDIA uses in games; slower, since the interpolation runs on the bigger frames; outputs above 4K keep the default order; off = the faster default order)</span>
       </label>
-      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly">the first pass, before interpolation and the upscale; slower</span><span class="lonly">runs first on every presented frame; heavy: caps a live session near 15 to 20 fps at 1080p (about 35 at 720p), lower the Image scale or the window size; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
     </div>
   </div>
 
-  <div class="panel step">
+  <div class="panel step" id="nrpanel">
+    <div class="row" style="margin-bottom:2px">
+      <span class="k">DLSS 5</span>
+      <span class="hint">Opt-in. <span class="vonly"><span class="nvo-off">NVIDIA's Neural Rendering redraws each source frame first, before the interpolation (NVIDIA's order: frame generation runs on its output), so the generated frames inherit it.</span><span class="nvo-on">NVIDIA's Neural Rendering redraws each source frame after Restore and the upscale, at the output size, before the interpolation (frame generation runs on its output), so the generated frames inherit it.</span></span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame at the window size before the smoothing (the generated frames inherit it), inside the overlay host: about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (with RTX HDR on at full 1080p lower the Image scale; a 4K window costs about 37 ms per source frame); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
+    </div>
+    <div class="row" style="flex-wrap:wrap">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="dlssnr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        NVIDIA DLSS 5 <span class="hint" id="dlssnrhint">(Neural Rendering, DLAA quality; needs the runtime file you supply)</span>
+      </label>
+      <span id="nrwrap" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span class="hint">Style</span>
+        <span class="seg" id="nrstyleseg" style="height:26px">
+          <button type="button" data-style="0" title="NVIDIA's Default look: the lightest touch, closest to the source, no frame-to-frame smoothing">Default</button>
+          <button type="button" data-style="1" class="on" title="NVIDIA's Natural look: the smoothest, cleanest picture (the app's default)">Natural</button>
+          <button type="button" data-style="2" title="NVIDIA's Cinematic look: keeps the most line and texture detail">Cinematic</button>
+        </span>
+        <span class="hint" style="margin-left:6px">Structure Intensity</span>
+        <span class="defmark"><input id="nrstructure" type="range" min="0" max="2" step="0.05" value="1"
+               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
+        <span class="v" id="nrstructurenum">1.00</span>
+        <span class="hint" style="margin-left:6px">Tone Intensity</span>
+        <span class="defmark"><input id="nrtone" type="range" min="0" max="2" step="0.05" value="1"
+               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
+        <span class="v" id="nrtonenum">1.00</span>
+        <label class="hint vonly" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:6px"
+               title="Preview only: the Processed pane shows where the DLSS 5 pass changed pixels (bright = big change, dark = untouched) instead of the picture. The rendered video is not affected.">
+          <input type="checkbox" id="nrmask" style="width:auto;padding:0;accent-color:var(--green);">
+          Show changed pixels
+        </label>
+      </span>
+    </div>
+    <div id="dlssnrsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px">
+        <span id="dlssnrstatus" class="v">checking...</span>
+      </div>
+      <div class="hint" id="dlssnrsteps" style="line-height:1.6;margin-bottom:8px"></div>
+      <div class="row" id="dlssnrbtns" style="flex-wrap:wrap;gap:6px">
+        <button id="dlssnrdl" class="mini">Download the DLSS 5 runtime</button>
+        <button id="dlssnrbrowse" class="mini">Choose nvngx_dlssnr.dll&hellip;</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel step" id="interppanel">
     <div class="row">
       <span class="k">Interpolate</span>
-      <span class="hint">generate in-between frames for smoother motion with the model chosen below (off = keep the source frames; every other panel still applies)</span>
+      <span class="hint">generate in-between frames for smoother motion with the model chosen below (off = keep the source frames; every other panel still applies)<span class="vonly nvo-on">; runs at the output size in the NVIDIA order</span></span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -306,11 +353,20 @@
     </div>
   </div>
 
+  <div class="panel step" id="restorepanel">
+    <div class="row">
+      <span class="k">Restore</span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
+      </label>
+      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly"><span class="nvo-off">runs on every output frame, the generated ones too, after the interpolation and before the upscale; slower</span><span class="nvo-on">runs first, once on each source frame, before the upscale</span></span><span class="lonly">runs on every presented frame, after the smoothing and before the upscale; heavy: caps a live session near 15 to 20 fps at 1080p (about 35 at 720p), lower the Image scale or the window size; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
+    </div>
+  </div>
 
   <div class="panel step" id="uppanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Upscale</span>
-      <span class="hint"><span class="vonly">resizes the frames to the output size after interpolation</span><span class="lonly">renders the smoothed picture at this size first, then fits it to the window or screen</span>; plain bicubic unless RTX Video Super Resolution is on</span>
+      <span class="hint"><span class="vonly"><span class="nvo-off">resizes the frames to the output size after interpolation</span><span class="nvo-on">resizes each source frame to the output size after Restore, before DLSS 5 and the interpolation</span></span><span class="lonly">renders the smoothed picture at this size first, then fits it to the window or screen</span>; plain bicubic unless RTX Video Super Resolution is on</span>
     </div>
     <div class="row">
       <span class="k">Size</span>
@@ -352,51 +408,6 @@
     </div>
   </div>
 
-  <div class="panel step" id="nrpanel">
-    <div class="row" style="margin-bottom:2px">
-      <span class="k">DLSS 5</span>
-      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each frame at the output size, after the upscale and before sharpen and HDR.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame at the window size before the smoothing (the generated frames inherit it), inside the overlay host: about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (with RTX HDR on at full 1080p lower the Image scale; a 4K window costs about 37 ms per source frame); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
-    </div>
-    <div class="row" style="flex-wrap:wrap">
-      <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="dlssnr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA DLSS 5 <span class="hint" id="dlssnrhint">(Neural Rendering, DLAA quality; needs the runtime file you supply)</span>
-      </label>
-      <span id="nrwrap" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
-        <span class="hint">Style</span>
-        <span class="seg" id="nrstyleseg" style="height:26px">
-          <button type="button" data-style="0" title="NVIDIA's Default look: the lightest touch, closest to the source, no frame-to-frame smoothing">Default</button>
-          <button type="button" data-style="1" class="on" title="NVIDIA's Natural look: the smoothest, cleanest picture (the app's default)">Natural</button>
-          <button type="button" data-style="2" title="NVIDIA's Cinematic look: keeps the most line and texture detail">Cinematic</button>
-        </span>
-        <span class="hint" style="margin-left:6px">Structure Intensity</span>
-        <span class="defmark"><input id="nrstructure" type="range" min="0" max="2" step="0.05" value="1"
-               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
-        <span class="v" id="nrstructurenum">1.00</span>
-        <span class="hint" style="margin-left:6px">Tone Intensity</span>
-        <span class="defmark"><input id="nrtone" type="range" min="0" max="2" step="0.05" value="1"
-               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
-        <span class="v" id="nrtonenum">1.00</span>
-        <label class="hint vonly" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:6px"
-               title="Preview only: the Processed pane shows where the DLSS 5 pass changed pixels (bright = big change, dark = untouched) instead of the picture. The rendered video is not affected.">
-          <input type="checkbox" id="nrmask" style="width:auto;padding:0;accent-color:var(--green);">
-          Show changed pixels
-        </label>
-      </span>
-    </div>
-    <div id="dlssnrsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
-      <div class="row" style="margin:0 0 6px">
-        <span id="dlssnrstatus" class="v">checking...</span>
-      </div>
-      <div class="hint" id="dlssnrsteps" style="line-height:1.6;margin-bottom:8px"></div>
-      <div class="row" id="dlssnrbtns" style="flex-wrap:wrap;gap:6px">
-        <button id="dlssnrdl" class="mini">Download the DLSS 5 runtime</button>
-        <button id="dlssnrbrowse" class="mini">Choose nvngx_dlssnr.dll&hellip;</button>
-      </div>
-    </div>
-  </div>
-
   <div class="panel step" id="sharpenpanel">
     <div class="row">
       <span class="k">Sharpen</span>
@@ -408,14 +419,14 @@
                style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
         <span class="v" id="sharpnum">1.00</span>
       </span>
-      <span class="hint">crisper picture; runs after the upscale and DLSS 5, before HDR</span>
+      <span class="hint">crisper picture; runs after the upscale<span class="vonly">, before HDR</span></span>
     </div>
   </div>
 
   <div class="panel step" id="hdrpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">HDR</span>
-      <span class="hint">Opt-in. NVIDIA RTX HDR converts the finished SDR picture to HDR10 as the last pass, with its colour controls (one-time runtime download)<span class="vonly">; Dolby Vision and HDR10+ below add metadata to that HDR10 file</span>.</span>
+      <span class="hint">Opt-in. NVIDIA RTX HDR converts <span class="vonly">the finished SDR picture to HDR10 as the last pass</span><span class="lonly">each captured frame to HDR right after DLSS 5, before the smoothing (the generated frames inherit it)</span>, with its colour controls (one-time runtime download)<span class="vonly">; Dolby Vision and HDR10+ below add metadata to that HDR10 file</span>.</span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>

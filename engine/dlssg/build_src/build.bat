@@ -22,6 +22,6 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 :compile
 cd /d %~dp0
 cl /nologo /std:c++17 /EHsc /O2 /W3 main.cpp /I "%SL_SDK%\include" ^
-   /link /LIBPATH:"%SL_SDK%\lib\x64" sl.interposer.lib user32.lib gdi32.lib ole32.lib windowscodecs.lib dxguid.lib ^
+   /link /LIBPATH:"%SL_SDK%\lib\x64" sl.interposer.lib user32.lib gdi32.lib ole32.lib windowscodecs.lib dxguid.lib Psapi.lib ^
    /SUBSYSTEM:CONSOLE /OUT:..\dlssg2f.exe
 exit /b %errorlevel%

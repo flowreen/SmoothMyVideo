@@ -98,6 +98,26 @@ public:
     // discontinuity; the runtime keeps temporal history otherwise.
     bool renderFrame(const void* src, void* dst, bool reset, std::string& err);
 
+    // Zero-copy handoff for a caller that renders with CUDA on the same GPU, after startup():
+    // two shared DEFAULT-heap buffers carry the frame in and out in the copy footprint layout
+    // (rowPitch() bytes per row, sharedBytes() in all) and a shared fence orders the caller's
+    // work and the evaluate on the GPU, so no frame crosses the CPU. false = a resource or a
+    // handle could not be made (err says which); renderFrame stays usable either way.
+    bool startShared(std::string& err);
+    HANDLE sharedInHandle() const { return m_shInH; }
+    HANDLE sharedOutHandle() const { return m_shOutH; }
+    HANDLE sharedFenceHandle() const { return m_shFenceH; }
+    uint64_t sharedBytes() const { return m_shBytes; }
+    uint64_t rowPitch() const { return m_rowPitch; }
+    LUID adapterLuid() const;
+
+    // One frame through the shared buffers: the queue waits until the fence reaches waitValue
+    // (the caller signals it once the input buffer holds the frame), copies it into Color,
+    // evaluates, copies Output into the output buffer and signals signalValue. Returns without
+    // waiting for the GPU; a command allocator still in flight is waited for, so at most
+    // kSharedLists frames are queued.
+    bool submitShared(bool reset, uint64_t waitValue, uint64_t signalValue, std::string& err);
+
     // Last NGX result seen, for the probe table.
     NVSDK_NGX_Result lastResult() const { return m_last; }
     const std::wstring& corePath() const { return m_corePath; }
@@ -148,6 +168,18 @@ private:
     CP<ID3D12Resource> m_upload;   // CPU write, linear
     CP<ID3D12Resource> m_readback; // CPU read, linear
     uint64_t m_rowPitch = 0;       // aligned row pitch of the staging buffers
+
+    static const int kSharedLists = 2;
+    CP<ID3D12Resource> m_shIn;     // shared input buffer, COMMON between lists
+    CP<ID3D12Resource> m_shOut;    // shared output buffer, COMMON between lists
+    CP<ID3D12Fence>    m_shFence;  // shared with the caller's CUDA stream
+    HANDLE   m_shInH = nullptr, m_shOutH = nullptr, m_shFenceH = nullptr;
+    uint64_t m_shBytes = 0;
+    CP<ID3D12CommandAllocator>    m_shAlloc[kSharedLists];
+    CP<ID3D12GraphicsCommandList> m_shList[kSharedLists];
+    uint64_t m_shDone[kSharedLists] = {};   // fence value that frees each allocator
+    int      m_shNext = 0;
+    void closeSharedHandles();
 
     NVSDK_NGX_Parameter* m_params = nullptr;
     NVSDK_NGX_Handle*    m_feature = nullptr;

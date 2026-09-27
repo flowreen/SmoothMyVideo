@@ -28,7 +28,7 @@ RTX VSR / HDR and all three codecs.
   python modules named below were deleted in step 8, their last versions are in git history).
   `cli.ts` is the command line (render.py's argv, stderr protocol and exit codes, the session log);
   `native.ts` renders every render (probe, plan, encoder, resume, the host one-shot or resident,
-  the finish) and the DLSS + RTX two-pass. Step 8 closed the routes the host never took: `--no-trt`
+  the finish). Step 8 closed the routes the host never took: `--no-trt`
   is gone, `--multi 1` with a model and no `--fps` is refused, and an image scale that would leave
   the output smaller than the processed size (only below 64 px) folds the downscale instead. `probe.ts` and `plan.ts` are `render_probe.py` and
   `render_plan.py` ported line by line (2026-09-24), `pyfmt.ts` reproduces python's rounding and
@@ -109,7 +109,11 @@ RTX VSR / HDR and all three codecs.
   fills an fp16 copy for these engines once per frame (`k_f2h`), reading each engine's dtype on
   its own, so either revision of either engine works. The IFNet runs 1.05x faster per call at
   1080p; the tweens change slightly (the fp16 rounding reaches the flow, 56 to 65 dB on anime),
-  the real frames do not. Built from these files the engines are
+  the real frames do not. Rev 5: the RIFE IFNet hands its tween `merged` out in fp16
+  (`trt_runtime._half_output`, one Cast after the fp32 blend), and every host reader of a tween
+  (the packs, the fits, Restore, RTX VSR, TrueHDR) takes it as it is through a half flag beside
+  the source pointer, so no pass widens it; each tween is the fp32 one rounded to fp16 (at most 1
+  code at 8 and 10 bits). Built from these files the engines are
   bit-identical to the per-size ones, except gmflow_bidir (its size-free branch, see the GMFlow
   bullet below).
   `SMV_ONNX_DIR` moves the folder.
@@ -208,8 +212,8 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
 * `python scripts\smoke.py [--full]` (any python 3, stdlib only): real renders through
   `dist\render\cli.js` under the Electron binary in node mode (what the app runs) on
   `samples/test.mp4` asserting frame counts, VFR duration, `.part` promotion, the Frame Blend
-  backend and, with `--full`, the HDR10 boxes, DV record, HDR10+ SEI, the DLSS-G + DLSS 5
-  two-pass split (SKIP without the runtimes) and the live echo / RIFE cases. Run after every
+  backend and, with `--full`, the HDR10 boxes, DV record, HDR10+ SEI, DLSS-G with DLSS 5 in
+  one render (SKIP without the runtimes) and the live echo / RIFE cases. Run after every
   engine change (`npx tsc` first). Checks are structural (TensorRT-RTX output is not run-to-run
   bit-stable, so no md5 case); `--trt` is accepted and ignored.
 * `python scripts/scan_index.py`: the renderer scan described above (`index.html` + `app.js`).
@@ -220,7 +224,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 
 ```
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale F]
-  [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--no-interp]
+  [--sharpen S] [--restore] [--nvidia-order] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--no-interp]
   [--rife] [--rife-drba] [--lsfg] [--nvof] [--fruc] [--dlssg]
   [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus]
   [--hdr-color vivid|rtx|raw] [--hdr-saturation N] [--hdr-contrast N] [--hdr-vibrance B] [--hdr-satboost S]
@@ -287,11 +291,12 @@ Models (GMFSS is the default, the anime specialist):
   or VapourSynth; `--nvof` is its replacement. To bring it back, revert the commit "remove the SVP
   models" (it restores the sources and the last `smv-live.exe` with SVP live), reinstall
   `vapoursynth==79` into the runtime if it is gone, rebuild the live host and rerun the gates.
-* `--dlssg` "NVIDIA DLSS 4.5": DLSS Frame Generation through `dlssg2f.exe` (RTX 40 / 50). With
-  RTX passes or `--dlssnr` the render runs as two passes (frame generation first, then the
-  per-frame passes); `--scale` applies to pass 1 and the post-fold `--upscale` to pass 2.
+* `--dlssg` "NVIDIA DLSS 4.5": DLSS Frame Generation through `dlssg2f.exe` (RTX 40 / 50), in the
+  same render as every other pass: DLSS 5 before it, RTX VSR / TrueHDR on its output.
 
-Per-frame passes, in order: Restore, interpolate, upscale, DLSS 5, RCAS sharpen, TrueHDR.
+Passes, in order: DLSS 5 (once per source frame, before the interpolation), interpolate, then on
+every output frame Restore, upscale, RCAS sharpen, TrueHDR (live runs TrueHDR on each captured
+frame right after DLSS 5).
 * The Flow scale control (`--flow-scale`, the motion estimation alone at 50 % / 25 %, 2026-09-14)
   was REMOVED 2026-09-25: GMFSS at 25 % wobbled static frames (GMFlow at a 256x128 grid) and
   lost small fast objects at 50 %; the flag is now refused. The re-add recipe, the pre-removal
@@ -303,11 +308,20 @@ Per-frame passes, in order: Restore, interpolate, upscale, DLSS 5, RCAS sharpen,
   engines at small shapes; the stall watchdog is the net there.
 * `--restore`: Real-ESRGAN anime-video model per output frame, before the upscale (a generative
   repaint; cleans compression noise, can flatten fine texture; about +50% wall at 2x 1080p).
+* `--nvidia-order` (the GUI's Order checkbox, default off): NVIDIA's game order instead of the
+  faster default. The host packs each decoded frame at its own size, runs Restore and the upscale
+  (RTX VSR or bicubic, or Restore's own fold) on it first, pads the result into the model frame,
+  and then runs DLSS 5 and the interpolation at the OUTPUT size (every model buffer, engine and the
+  DLSS 5 host follow the output size; the emit skips Restore and the resize). Without Restore or an
+  upscale nothing moves; an output above 3840x2160 keeps the default order with a line (the model
+  at the output size is out of reach there). Slower by the ratio of the model's cost at the two
+  sizes.
 * `--upscale F`: bare = 1.5, clamp 1/16..16; above 8192 px auto-switches to a CPU AV1 / VVC encoder
   with a fail-closed RAM preflight (true 16K needs about 54 GB free). `--rtx-vsr` uses RTX Video
   Super Resolution for upscales, otherwise bicubic. Downscales (F below 1) are folded into the
   decode, so the models run directly at the output size and the upscale pass becomes identity.
-* `--dlssnr`: DLSS 5 Neural Rendering per output frame at the output resolution, DLAA (scaling
+* `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame before the interpolation (at the
+  output resolution after the upscale with `--nvidia-order`), DLAA (scaling
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
   Default / Natural (default) / Cinematic looks (DLSSNR.Style; measured 2026-09-12: same cost, 0 is
   the lightest touch, 1 the smoothest, 2 keeps the most detail; Intensity stays 1.0, the runtime
@@ -581,8 +595,8 @@ failed pair restarts it (3 s apart, re-primed with the left frame) up to 4 times
 exits 4 and `render.py` makes it python's resumable stop (the progress banked, `DLSS_PREEMPTED`,
 exit 1, the part files kept; exit 3 = the multiplier is beyond the GPU). Output matches the
 python route bit for bit (harness `offline\gate_dlssg.py`; the failure paths through a stub
-server, `offline\gate_dlssg_restart.py`). With an RTX pass or DLSS 5 the two-pass split stays,
-both passes now native.
+server, `offline\gate_dlssg_restart.py`). RTX passes and DLSS 5 run in the same host as the
+frame generation.
 `render.py` keeps the
 probe, the ffmpeg decode and encode commands, PROGRESS / OUTFRAMES and the finalize, and the exe takes the decode pipe as stdin and feeds the encode
 pipe on stdout (pack-in, Head encode, batched IFNet, pack-out, `k_expand8to16` for real frames of
@@ -611,14 +625,28 @@ sum) and a failed TrueHDR eval fails the render, as python's does. Gate: harness
 `offline\gate_hdr.py` (real frames within one yuv code on under 2 % of samples = fp32 rounding
 order against torch). A render that used the RTX Video bridge ends the resident host after
 the item (NGX is single-instance per process; the next render spawns a fresh host). DLSS 5 runs
-there too (2026-09-23, `nativeOfflineNr`, after the resize and before RCAS like `render_passes`):
+there too (`nativeOfflineNr`, once per decoded frame at its size, BEFORE the interpolation, so every
+model and every output frame reads DLSS 5 output: NVIDIA's order, frame generation after DLSS 5, the
+same place live runs it):
 `render.py` passes `--dlssnr --nr-structure --nr-tone --nr-style` when `nvngx.dll` and
 `nvngx_dlssnr.dll` are in `SMV_DLSSNR_DIR` / `engine\dlssnr` (importing `dlssnr` would import
 torch), and the host runs the NR core with `dlssnr.exe`'s own bring-up (`nr::Host::startup` on a
-private D3D12 device made from the System32 DLLs, not Streamline's interposer; `renderFrame`
-through its upload / readback staging) on one RGBA16F frame per output frame, `dlssnr.py`'s fp16
-clamp and rounding on the way in and out, Reset on the first frame only (offline accumulates,
-live does not). A held pair's slots carry the real frame's finished bytes without a second NR
+private D3D12 device made from the System32 DLLs, not Streamline's interposer) on one RGBA16F
+frame per decoded frame, in place on the padded model input (the pad refilled from the edge like
+the decode's pack), `dlssnr.py`'s fp16 clamp and rounding on the way in and out, Reset on the
+first frame only (offline accumulates, live does not). The identical-pair test compares the
+decoded frames before the pass rewrites them: the pass keeps history, so two identical frames can
+come back a fraction of a level apart. The frame crosses zero-copy:
+`nr::Host::startShared` makes two shared D3D12 buffers in the copy footprint layout and a shared
+fence, the host imports them into CUDA (same adapter LUID required), the stream writes the input
+buffer and signals an odd fence value, the NR queue waits for it on the GPU, copies, evaluates,
+writes the output buffer and signals the next even value, and the stream waits for that before it
+reads the result (`submitShared`: no CPU wait, no host copy, two command lists in flight).
+`SMV_NR_STAGED=1` and the preview's `--nr-delta` (it needs the host copies) keep `renderFrame`
+through its upload / readback staging; a handoff that cannot start falls back to it with an
+`offline: DLSS 5 zero-copy handoff unavailable` line (no `[dlss5]` tag: the pass still runs). The
+ready line names the route (`zero-copy` / `CPU staging`), and the end-of-render DLSS 5 line reports
+the host's submit time on the zero-copy route (the GPU work runs asynchronously). A held pair's slots carry the real frame's finished bytes without a second NR
 call (python's `out_cur`), with RTX HDR the frame's statistics record repeated. A runtime that
 cannot start drops the pass with `[dlss5] unavailable, skipping`, a failed evaluate drops it for
 the rest of the render; NGX prints to the process stdout, so a one-shot host moves its frame
@@ -626,7 +654,7 @@ output to a private handle first; NGX has no teardown, so the host leaves throug
 and a resident host ends after the item. `--nr-delta PATH` (2026-09-24, the preview's change
 mask) writes the pass's own change per pixel, the largest of `|after - before|` over R, G, B
 (`before` = its fp32 input, `after` = its clamped fp16 output, `preview.py`'s measure), as float32
-at the output size (the last frame's). Gate: harness `offline\gate_nr.py` (with Reset on every
+at the decoded size (the last frame's; the preview scales it to its output size). Gate: harness `offline\gate_nr.py` (with Reset on every
 frame on both sides, `SMV_NR_RESET_EVERY=1` and a python wrapper, real frames bit-exact against
 `dlssnr.exe`; in the product's temporal mode too on the plain case). FIXED the same day on
 both routes: `renderFrame` mapped `RowPitch * rows` of the readback buffer, but a copyable
@@ -992,6 +1020,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_HANDOFF_DUMP=1` | the live host logs every handoff line it answers |
 | `SMV_NR_NOHOOK=1`, `SMV_NR_SPOOF=<name>`, `SMV_NR_HOOKLOG=1` | DLSS 5 caller hook off / spoofed name / trace |
 | `SMV_NR_RESET_EVERY=1` | the offline native host's DLSS 5 resets its history on every frame (the live behaviour), for the route gate; never a product setting |
+| `SMV_NR_STAGED=1` | the offline native host's DLSS 5 hands its frames over through CPU staging (`renderFrame`) instead of the zero-copy shared buffers; the route A/B and the fallback's trigger test, never a product setting |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..4, default 3 offline, 2 live) |
@@ -999,12 +1028,13 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NVENC_SPLIT` | override the NVENC `-split_encode_mode` for measurement (default 15 = off; 2 = two strips, 0 = ffmpeg's auto); never a product setting (the split leaves a seam line) |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
 | `SMV_DLSSG_SWEEP=1` | the DLSS 4.5 host latches its buffer-sweep capture tier at startup instead of waiting for hardware flip metering, so the sweep path can be tested on demand |
+| `SMV_DLSSG_FOCUS_SHIM=0` | the DLSS 4.5 host's focus shim off: by default `dlssg2f` points the Streamline modules' `GetForegroundWindow` imports at its own off-screen window, because Streamline 2.14 pauses frame generation whenever another window has focus (a render then stopped with `DLSS_PREEMPTED` while the user worked in another window); the A/B and trigger test only, never a product setting |
 | `SMV_NO_STATIC_HOLD=1` | identical-pair passthrough off: a byte-identical pair is interpolated like any other (offline renders and the native hosts read it) |
 | `SMV_NO_RESUME` | disable crash-resume |
 | `SMV_TRACE=1` | on-screen tracebacks instead of the one-line pointer |
 | `SMV_CU` | CUDA header / lib location for the live exe build |
 
-`SMV_PAUSE_FILE`, `SMV_LIVE_PREVIEW`, `SMV_LIVE_OFF_FILE` and `SMV_TWOPASS_PHASE` are internal
+`SMV_PAUSE_FILE`, `SMV_LIVE_PREVIEW` and `SMV_LIVE_OFF_FILE` are internal
 plumbing the GUI or the engine sets for its own children.
 
 ## Logging

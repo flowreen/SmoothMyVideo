@@ -79,6 +79,7 @@ const OPTS: Record<string, Spec> = {
   '--rife-drba': { dest: 'rife_drba', kind: 'bool', def: false },
   '--lsfg': { dest: 'lsfg', kind: 'bool', def: false },
   '--nvof': { dest: 'nvof', kind: 'bool', def: false },
+  '--nvidia-order': { dest: 'nvidia_order', kind: 'bool', def: false },
 };
 const POS: Spec[] = [
   { dest: 'input', kind: 'str', def: null },

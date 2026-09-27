@@ -199,6 +199,31 @@ def _half_frames(onnx_path, name):
     onnx.checker.check_model(onnx_path)
 
 
+def _half_output(onnx_path, name):
+    """RIFE IFNet: hand the tween `merged` out as fp16. The graph blends it in fp32 (the two warps
+    times the mask), so one Cast narrows it at the end: the engine writes half the bytes and the
+    host's tween readers take it as it is. Each value moves by at most half an fp16 step (the tween
+    is the fp32 one rounded to fp16: at most 1 code at 8 and 10 bits). Graph only."""
+    import onnx
+    from onnx import helper, TensorProto
+
+    if not name.startswith("rife_ifnet_"):
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    out = [o for o in g.graph.output if o.name == "merged"]
+    prod = [nd for nd in g.graph.node if "merged" in nd.output]
+    if len(out) != 1 or len(prod) != 1 or out[0].type.tensor_type.elem_type != TensorProto.FLOAT:
+        raise RuntimeError(f"{name}: expected one fp32 output merged")
+    prod[0].output[list(prod[0].output).index("merged")] = "merged_f32"
+    g.graph.node.append(helper.make_node("Cast", ["merged_f32"], ["merged"], to=TensorProto.FLOAT16,
+                                         name="merged_narrow"))
+    out[0].type.tensor_type.elem_type = TensorProto.FLOAT16
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
 # --- size-free ONNX -----------------------------------------------------------------------------
 # The graphs below export ONCE with H / W symbolic (trt_lookup.onnx_path), and every engine size is
 # built from that file, pinned to the example shape exactly like a per-size export (one engine per
@@ -305,6 +330,7 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
         _fuse_prelu(tmp)
         _half_features(tmp, name)
         _half_frames(tmp, name)
+        _half_output(tmp, name)
         if os.path.isfile(tmp + ".data"):
             os.replace(tmp + ".data", path + ".data")
         os.replace(tmp, path)

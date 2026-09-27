@@ -65,6 +65,24 @@ static bool frameBounds(HWND h, RECT& r)
     return SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)));
 }
 
+// The live pause: the overlay sits topmost over the player, so it hides (and the smoothing pauses)
+// when the player is minimized or on another virtual desktop, or when the window in front covers
+// part of it; a window in front elsewhere (another monitor, beside the player) leaves the
+// smoothing running. A frame that cannot be read pauses, as a foreground change always did.
+static bool livePauseWanted(HWND target, HWND overlay)
+{
+    if (IsIconic(target)) return true;
+    BOOL cloaked = FALSE;
+    DwmGetWindowAttribute(target, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    if (cloaked) return true;
+    const HWND fg = GetAncestor(GetForegroundWindow(), GA_ROOT);
+    if (!fg || fg == target || fg == overlay) return false;
+    if (!IsWindowVisible(fg) || IsIconic(fg)) return false;
+    RECT a{}, b{}, c{};
+    if (!frameBounds(target, a) || !frameBounds(fg, b)) return true;
+    return IntersectRect(&c, &a, &b) != 0;
+}
+
 // Is Windows HDR ("Use HDR") active on the display the target window sits on? The
 // output reports G2084 (PQ) as its current color space when HDR is on. Used to warn that today's
 // 8-bit SDR capture clips HDR content, and later to switch on the HDR live pipeline.
@@ -1595,14 +1613,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (!host.park && !g_monitor && now - lastPosTick > 250)
                 {
                     lastPosTick = now;
-                    HWND fgRoot = GetAncestor(GetForegroundWindow(), GA_ROOT);
-                    const bool wantHidden = IsIconic(target) || (fgRoot != target && fgRoot != host.hwnd);
+                    const bool wantHidden = livePauseWanted(target, host.hwnd);
                     if (wantHidden != hidden)
                     {
                         hidden = wantHidden;
                         ShowWindow(host.hwnd, hidden ? SW_HIDE : SW_SHOWNA);
                         hud.show(!hidden);
-                        LOG(hidden ? "paused (focus elsewhere)\n" : "resumed\n");
+                        LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
                         xqPrevGroupMs = 0;   // the throttle reference does not survive a pause
                     }
                     if (!hidden)
@@ -1879,20 +1896,21 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if (!host.park && !g_monitor && now - lastPosTick > 250)   // monitor mode: no pause/tracking
             {
                 lastPosTick = now;
-                // Alt-tab pause: when the user is in some OTHER app (neither the target nor the
-                // overlay holds foreground) or the target is minimized, hide the overlay and stop
-                // processing. Returning to the target resumes; for DLSS-G the overlay re-takes
-                // foreground (the click-through overlay can never be clicked back into focus) and
-                // the >700ms input-gap reset re-warms the pacer automatically.
-                HWND fgRoot = GetAncestor(GetForegroundWindow(), GA_ROOT);
-                const bool wantHidden = IsIconic(target) || (fgRoot != target && fgRoot != host.hwnd);
+                // The pause (livePauseWanted): the player minimized or covered by the window in
+                // front hides the overlay and stops processing; a window in front elsewhere does
+                // not. On a resume with the player itself in front, DLSS-G's overlay re-takes the
+                // foreground (the click-through overlay can never be clicked back into focus; the
+                // >700ms input-gap reset re-warms the pacer); a resume while the user works in
+                // another window leaves their focus alone.
+                const bool wantHidden = livePauseWanted(target, host.hwnd);
                 if (wantHidden != hidden)
                 {
                     hidden = wantHidden;
                     ShowWindow(host.hwnd, hidden ? SW_HIDE : SW_SHOWNA);
                     hud.show(!hidden);
-                    LOG(hidden ? "paused (focus elsewhere)\n" : "resumed\n");
-                    if (!hidden && host.useSL) host.takeForeground();
+                    LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
+                    if (!hidden && host.useSL && GetAncestor(GetForegroundWindow(), GA_ROOT) == target)
+                        host.takeForeground();
                 }
                 if (!hidden)
                 {

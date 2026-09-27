@@ -1388,6 +1388,7 @@ type RunOpts = {
   fps?: number;
   sharpen?: number;
   restore?: boolean;
+  nvorder?: boolean;
   dlssnr?: boolean;
   nrstructure?: number;
   nrtone?: number;
@@ -1435,11 +1436,15 @@ function engineArgs(opts: RunOpts): string[] {
   // frames value-preserving; >0 enables the in-engine RCAS pass. Works with or without interp.
   if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
   // AI detail restoration (GUI Restore checkbox): Real-ESRGAN animevideov3 on every output
-  // frame, before the upscale. Works with or without interpolation.
+  // frame, before the upscale (in the NVIDIA order once per source frame, first). Works with or
+  // without interpolation.
   if (opts.restore) args.push('--restore');
-  // NVIDIA DLSS 5 Neural Rendering (GUI checkbox + the two sliders): a DLAA-class pass on every
-  // output frame at the output resolution, after the upscale. The renderer only sends it when the
-  // user-supplied runtime is installed (dlssnr-ready).
+  // NVIDIA order (GUI Order checkbox): Restore and the upscale on each source frame first, then
+  // DLSS 5 and the interpolation at the output size (the engine keeps the default order above 4K)
+  if (opts.nvorder) args.push('--nvidia-order');
+  // NVIDIA DLSS 5 Neural Rendering (GUI checkbox + the two sliders): a DLAA-class pass once per
+  // source frame, before the interpolation (in the NVIDIA order after the upscale, at the output
+  // size). The renderer only sends it when the user-supplied runtime is installed (dlssnr-ready).
   if (opts.dlssnr)
     args.push(
       '--dlssnr',
@@ -1685,6 +1690,7 @@ ipcMain.handle(
       upscale?: number;
       rtxvsr?: boolean;
       restore?: boolean;
+      nvorder?: boolean;
       dlssnr?: boolean;
       nrstructure?: number;
       nrtone?: number;
@@ -1703,6 +1709,7 @@ ipcMain.handle(
       const args = [PREVIEW_CLI, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
       if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
       if (opts.restore) args.push('--restore');
+      if (opts.nvorder) args.push('--nvidia-order');
       if (opts.dlssnr)
         args.push(
           '--dlssnr',

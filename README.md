@@ -94,7 +94,10 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   detected and timed correctly, so audio never drifts out of sync.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
 * 🧠 **Optional NVIDIA DLSS 5 pass.** One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every
-  output frame at DLAA quality (full resolution in, full resolution out), with NVIDIA's three
+  source frame before the smoothing, the order NVIDIA uses in games (frame generation after DLSS 5;
+  the **NVIDIA order** checkbox also moves Restore and the upscale in front of it, so DLSS 5 and the
+  interpolation run at the output size, as in games: slower, outputs up to 4K),
+  at DLAA quality (full resolution in, full resolution out), with NVIDIA's three
   looks as a **Style** selector (Default, Natural, Cinematic) and its two global controls,
   **Structure Intensity** and **Tone Intensity**, as sliders. The host is bundled; the
   Neural Rendering runtime (`nvngx_dlssnr.dll`) is not included, and NVIDIA publishes no download

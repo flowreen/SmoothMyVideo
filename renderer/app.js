@@ -78,6 +78,10 @@ function setMode(m){
   $('modelive').classList.toggle('on', uiMode === 'live');
   try { localStorage.setItem('uiMode', uiMode); } catch {}
   lvUnavailUi();
+  // the numbered panels follow the processing order, which differs in one place: live runs RTX HDR
+  // on each captured frame right after DLSS 5, before the smoothing; a file render runs it last
+  if(uiMode === 'live') $('nrpanel').after($('hdrpanel')); else $('sharpenpanel').after($('hdrpanel'));
+  applyOrder();   // the Order checkbox (file renders only)
 }
 // Switching mid-job would hide the running thing, so both buttons grey out while a live session
 // or a file render is going (called from lvUi and from the run start/end enable sweeps).
@@ -407,6 +411,21 @@ function restoreOn(){ return $('restore').checked; }
 // Restore ALWAYS starts off: an expensive, look-altering pass you opt
 // into per session, so its state is deliberately NOT persisted; old key retired.
 localStorage.removeItem('restoreOn');
+
+// Order: engine --nvidia-order (file renders). NVIDIA's game order runs Restore and the upscale on
+// each source frame first, then DLSS 5 and the interpolation at the output size (slower: the model
+// works on the bigger frames); off = the faster default order. The numbered panels follow the
+// order that is picked, and the pass hints switch with it (body.nvorder).
+function nvOrderOn(){ return uiMode === 'video' && $('nvorder').checked; }
+function applyOrder(){
+  const nvo = nvOrderOn();
+  document.body.classList.toggle('nvorder', nvo);
+  if(nvo){ $('nrpanel').before($('restorepanel')); $('nrpanel').before($('uppanel')); }
+  else { $('interppanel').after($('restorepanel')); $('restorepanel').after($('uppanel')); }
+}
+if(localStorage.getItem('nvorderOn') === '1') $('nvorder').checked = true;   // default OFF
+$('nvorder').onchange = () => { localStorage.setItem('nvorderOn', $('nvorder').checked ? '1' : '0'); applyOrder(); refreshPreviewIfOpen(); };
+applyOrder();
 
 // "Match screen" is now one of the three Speed modes rather than an override checkbox, so there is
 // nothing to re-assert after a video loads: the mode and its value are the user's, independent of
@@ -1336,7 +1355,8 @@ let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown 
 function prevSettingsSig(){                 // everything that changes what the processed pane shows
   const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
   return [sharpStrength(), restoreOn(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
-          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), nrOn(), nrStructure(), nrTone(), nrStyle(), nrMaskOn()];
+          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), nrOn(), nrStructure(), nrTone(), nrStyle(), nrMaskOn(),
+          nvOrderOn()];
 }
 let lastPrevInput = null;                    // which video the shown original belongs to
 async function loadPreview(frame, bg){   // bg: background "refine" pass (the RTX auto-upgrade) - keep the shown image up, no blocking spinner
@@ -1370,7 +1390,8 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
     { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr: useHdr,
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
       upscale: upFactor() || 0,
-      rtxvsr: useVsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle() }, hdrColorPayload())); }
+      rtxvsr: useVsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(),
+      nvorder: nvOrderOn() }, hdrColorPayload())); }
   catch(e){ r = { error: String(e) }; }
   setSpin($('prevprocwrap'), $('prevspin'), false);
   $('prevprocwrap').style.minHeight = '';
@@ -1697,7 +1718,7 @@ function startRun(){
     log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
   }
   modeBtnUi(true);
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('nvorder').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push(factor < 1 ? 'downscaling' : 'upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -1723,6 +1744,7 @@ function startRun(){
   else if(interpOn() && modelIsNvof()) payload.model = 'nvof'; // NVIDIA Optical Flow (direct), engine --nvof
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
+  if(nvOrderOn()) payload.nvorder = true;   // NVIDIA order: Restore and the upscale before DLSS 5 and the model
   if(nrOn()){ payload.dlssnr = true; payload.nrstructure = nrStructure(); payload.nrtone = nrTone(); payload.nrstyle = nrStyle(); }   // DLSS 5 (runtime installed)
   payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)
   if(factor > 0){
@@ -1881,7 +1903,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
   clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
   modeBtnUi(lvState !== 'idle');
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('nvorder').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
     if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');

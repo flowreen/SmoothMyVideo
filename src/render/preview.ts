@@ -3,8 +3,9 @@
 // (+ <out>_nrmask.png), and preview.py's one stdout line. The frame comes from the render's own
 // decode (ffmpeg at the render's pixel format, the downscale folded in exactly as the render
 // folds it), the processed side runs the render's own pass chain in the native host
-// (smv-live.exe --offline --no-interp, one frame: restore -> upscale / RTX VSR -> DLSS 5 -> RCAS
-// -> TrueHDR), so the pane is the render's frame. This process only converts for display: the
+// (smv-live.exe --offline --no-interp, one frame: DLSS 5 -> restore -> upscale / RTX VSR -> RCAS
+// -> TrueHDR, or with --nvidia-order restore -> upscale / RTX VSR -> DLSS 5 -> RCAS -> TrueHDR),
+// so the pane is the render's frame. This process only converts for display: the
 // PQ tonemaps, the 1:1 resize of the original pane, the DLSS 5 change mask and the PNG files;
 // that arithmetic follows preview.py's numpy float32 (Math.fround), whose comments carry the
 // reasoning. Two deliberate changes: the frame is decoded by ffmpeg like the render (preview.py
@@ -29,6 +30,7 @@ export interface PreviewArgs {
   rtx_hdr: boolean;
   sharpen: number;
   restore: boolean;
+  nvidia_order: boolean;
   upscale: number;
   rtx_vsr: boolean;
   dlssnr: boolean;
@@ -52,6 +54,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     rtx_hdr: false,
     sharpen: 0,
     restore: false,
+    nvidia_order: false,
     upscale: 1,
     rtx_vsr: false,
     dlssnr: false,
@@ -75,6 +78,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
   const flags: Record<string, keyof PreviewArgs> = {
     '--rtx-hdr': 'rtx_hdr',
     '--restore': 'restore',
+    '--nvidia-order': 'nvidia_order',
     '--rtx-vsr': 'rtx_vsr',
     '--dlssnr': 'dlssnr',
     '--nr-mask': 'nr_mask',
@@ -470,6 +474,28 @@ export function thumbPng(raw: string, png: string, srcPq: boolean): void {
   }
 }
 
+/** The DLSS 5 change map scaled from the decoded size to the processed pane: bilinear with
+ * half-pixel centres. */
+function scaleMap(m: Float32Array, w: number, h: number, ow: number, oh: number): Float32Array {
+  const out = new Float32Array(ow * oh);
+  for (let y = 0; y < oh; y++) {
+    const fy = Math.min(Math.max(((y + 0.5) * h) / oh - 0.5, 0), h - 1);
+    const y0 = Math.floor(fy),
+      y1 = Math.min(y0 + 1, h - 1),
+      wy = fy - y0;
+    for (let x = 0; x < ow; x++) {
+      const fx = Math.min(Math.max(((x + 0.5) * w) / ow - 0.5, 0), w - 1);
+      const x0 = Math.floor(fx),
+        x1 = Math.min(x0 + 1, w - 1),
+        wx = fx - x0;
+      const top = m[y0 * w + x0] + (m[y0 * w + x1] - m[y0 * w + x0]) * wx;
+      const bot = m[y1 * w + x0] + (m[y1 * w + x1] - m[y1 * w + x0]) * wx;
+      out[y * ow + x] = top + (bot - top) * wy;
+    }
+  }
+  return out;
+}
+
 function nrMask(delta: Float32Array, proc: Buffer): { png: Buffer; touched: number; mean: number } {
   const out = Buffer.alloc(proc.length),
     g45 = f(0.45);
@@ -507,7 +533,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   const srcHdr = transfer === 'smpte2084' || transfer === 'arib-std-b67';
   let doHdr = a.rtx_hdr && !srcHdr;
   const up = a.upscale <= 0 ? 1.0 : clamp(a.upscale, 1.0 / 16, 16.0);
-  const plan = scalePlan(pr.st, pr.w, pr.h, up, null, false);
+  const plan = scalePlan(pr.st, pr.w, pr.h, up, null);
   const W = plan.w,
     H = plan.h;
   const [OW, OH] = outputSize(W, H, plan.upscaleF, plan.upscale);
@@ -590,6 +616,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
     }
     if (strength > 0) args.push('--sharpen', pyG(strength));
     if (a.restore) args.push('--restore');
+    if (a.nvidia_order) args.push('--nvidia-order');
     const deltaFile = path.resolve(a.out) + '_nrdelta.f32';
     if (nrOn) {
       args.push(
@@ -639,7 +666,12 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
       try {
         const b = fs.readFileSync(deltaFile);
         fs.unlinkSync(deltaFile);
-        if (b.length === OW * OH * 4) delta = new Float32Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.length));
+        // DLSS 5 runs on the decoded frame (the map is W x H), or in the NVIDIA order after the
+        // upscale (OW x OH; the host keeps the default order above 4K, so the size tells which)
+        if (b.length === W * H * 4 || b.length === OW * OH * 4) {
+          const m = new Float32Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.length));
+          delta = m.length === OW * OH ? m : scaleMap(m, W, H, OW, OH);
+        }
       } catch {
         /* no map: the pane shows the processed picture as usual */
       }

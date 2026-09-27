@@ -332,24 +332,26 @@ def _dlssnr_ready():
                for n in ("dlssnr.exe", "nvngx.dll", "nvngx_dlssnr.dll"))
 
 
-@case("--dlssg --dlssnr 2x -> 49 frames through the automatic two-pass split")
-def c_dlss_twopass(tmp, trt):
-    # DLSS-G plus a second NGX user (here DLSS 5) splits into pass 1 (frame generation into an
-    # intermediate) and pass 2 (the per-frame passes over it); the intermediate is spent on
-    # success. The relayed stderr carries both passes' backend lines.
+@case("--dlssg --dlssnr 2x -> 49 frames in one render, DLSS 5 before the frame generation")
+def c_dlss_onepass(tmp, trt):
+    # DLSS-G and DLSS 5 share one host: DLSS 5 runs on each decoded frame, the frame generation
+    # on its output, no intermediate file. DLSS-G pauses while its window is not focused
+    # (Streamline 2.14), so this case fails if the desktop is used during it.
     if not os.path.isfile(os.path.join(ENGINE, "dlssg", "dlssg2f.exe")):
         return "SKIP (DLSS-G host not present)"
     if not _dlssnr_ready():
         return "SKIP (DLSS 5 runtime not installed)"
-    out = os.path.join(tmp, "s_dlss2p.mp4")
+    out = os.path.join(tmp, "s_dlss1p.mp4")
     rc, err = render(SAMPLE, out, "--dlssg", "--dlssnr")
     assert rc == 0, "engine exit " + str(rc) + ": " + err[-300:]
     expect_part_promoted(out)
     assert frames(out) == 49, f"frames {frames(out)} != 49"
-    assert "Using the DLSS Frame Generation backend" in err, "pass 1 DLSS-G line missing from stderr"
-    assert "DLSS 5 Neural Rendering ready" in err, "pass 2 DLSS 5 line missing from stderr"
+    assert "Using the DLSS Frame Generation backend" in err, "DLSS-G line missing from stderr"
+    assert re.search(r"DLSS 5 Neural Rendering ready \([^)]*before the interpolation", err), \
+        "DLSS 5 ready line (before the interpolation) missing from stderr"
+    assert "model dlss 4.5, dlss 5" in err, "the host ready line does not carry both passes"
     left = [n for n in os.listdir(tmp) if ".dlss-interp-" in n]
-    assert not left, "intermediate not spent: " + ", ".join(left)
+    assert not left, "an intermediate was written: " + ", ".join(left)
 
 
 LIVE_EXE = os.path.join(ENGINE, "live", "smv-live.exe")
@@ -456,7 +458,7 @@ def c_live_rife(tmp, trt):
 
 
 QUICK = [c_2x, c_fps60, c_noint, c_blend, c_nvof, c_rife_flow, c_vfr, c_live_echo]
-FULL = [c_rife_native, c_5x, c_av1, c_encsplit, c_vvc, c_hdr, c_dv, c_hp, c_dlss_twopass,
+FULL = [c_rife_native, c_5x, c_av1, c_encsplit, c_vvc, c_hdr, c_dv, c_hp, c_dlss_onepass,
         c_live_rife]
 
 
@@ -477,7 +479,7 @@ def main():
     global SAMPLE
     ap = argparse.ArgumentParser(description="SMV engine smoke tests (real renders)")
     ap.add_argument("--full", action="store_true",
-                    help="also run 5x, av1/vvc, HDR, DV, HDR10+, the DLSS two-pass split")
+                    help="also run 5x, av1/vvc, HDR, DV, HDR10+, DLSS 4.5 with DLSS 5 in one render")
     ap.add_argument("--trt", action="store_true", help="ignored (every render runs on TensorRT-RTX)")
     ap.add_argument("--keep", action="store_true", help="keep the rendered outputs")
     args = ap.parse_args()

@@ -325,17 +325,24 @@ __device__ __forceinline__ bool outTabFill(OutTab& T, int w, int h, int dw, int 
     return true;
 }
 
+// one element of a planar source that is fp32, or fp16 (half != 0: the IFNet's tweens, read as
+// the engine wrote them, so no pass widens them first)
+__device__ __forceinline__ float ldS(const void* __restrict__ src, int half, size_t o)
+{
+    return half ? h2f(((const unsigned short*)src)[o]) : ((const float*)src)[o];
+}
+
 // T = the block's filled table, or nullptr for the per-pixel taps
-__device__ __forceinline__ void sampleOut(const float* __restrict__ src, int planeStride,
+__device__ __forceinline__ void sampleOut(const void* __restrict__ src, int half, int planeStride,
                                           int rowStride, int w, int h, int ox, int oy,
                                           int dw, int dh, const OutTab* T, float c[3])
 {
     if (dw == w && dh == h)
     {
         const size_t o = (size_t)oy * rowStride + ox;
-        c[0] = src[o];
-        c[1] = src[planeStride + o];
-        c[2] = src[2 * planeStride + o];
+        c[0] = ldS(src, half, o);
+        c[1] = ldS(src, half, planeStride + o);
+        c[2] = ldS(src, half, 2 * planeStride + o);
         return;
     }
     int ix, iy;
@@ -358,7 +365,7 @@ __device__ __forceinline__ void sampleOut(const float* __restrict__ src, int pla
     wy[2] = cc1(1.0f - ty, A); wy[3] = cc2(2.0f - ty, A);
     for (int ci = 0; ci < 3; ci++)
     {
-        const float* pl = src + (size_t)ci * planeStride;
+        const size_t pl = (size_t)ci * planeStride;
         float acc = 0.0f;
         for (int j = 0; j < 4; j++)
         {
@@ -369,7 +376,7 @@ __device__ __forceinline__ void sampleOut(const float* __restrict__ src, int pla
             {
                 int xx = ix - 1 + i;
                 xx = xx < 0 ? 0 : (xx > w - 1 ? w - 1 : xx);
-                row += wx[i] * pl[(size_t)yy * rowStride + xx];
+                row += wx[i] * ldS(src, half, pl + (size_t)yy * rowStride + xx);
             }
             acc += wy[j] * row;
         }
@@ -379,7 +386,7 @@ __device__ __forceinline__ void sampleOut(const float* __restrict__ src, int pla
 
 // one output slot: sampleOut, clamp, round, and write BGRA8 into the content rect of a
 // pitched ring slot.
-__global__ void k_packOut(const float* __restrict__ src, int planeStride, int rowStride,
+__global__ void k_packOut(const void* __restrict__ src, int half, int planeStride, int rowStride,
                           int w, int h, unsigned char* __restrict__ dst, int pitch,
                           int x0, int y0, int dw, int dh)
 {
@@ -389,7 +396,7 @@ __global__ void k_packOut(const float* __restrict__ src, int planeStride, int ro
     const bool tab = outTabFill(T, w, h, dw, dh);
     if (ox >= dw || oy >= dh) return;
     float c[3];
-    sampleOut(src, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
+    sampleOut(src, half, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
     unsigned char* p = dst + (size_t)(y0 + oy) * pitch + (size_t)(x0 + ox) * 4;
     for (int ci = 0; ci < 3; ci++)
     {
@@ -402,7 +409,7 @@ __global__ void k_packOut(const float* __restrict__ src, int planeStride, int ro
 
 // HDR output slot: the same sampleOut and clamp, but the canvas is R10G10B10A2 packed into
 // int32 with A = 3, exactly what _pack_r10a2 produces and what the R10A2 present reads back.
-__global__ void k_packOutHdr(const float* __restrict__ src, int planeStride, int rowStride,
+__global__ void k_packOutHdr(const void* __restrict__ src, int half, int planeStride, int rowStride,
                              int w, int h, unsigned char* __restrict__ dst, int pitch,
                              int x0, int y0, int dw, int dh)
 {
@@ -412,7 +419,7 @@ __global__ void k_packOutHdr(const float* __restrict__ src, int planeStride, int
     const bool tab = outTabFill(T, w, h, dw, dh);
     if (ox >= dw || oy >= dh) return;
     float c[3];
-    sampleOut(src, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
+    sampleOut(src, half, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
     unsigned int q[3];
     for (int ci = 0; ci < 3; ci++)
     {
@@ -433,7 +440,7 @@ __global__ void k_packOutHdr(const float* __restrict__ src, int planeStride, int
 
 // crop the model pad and quantise to tight BGRA8 at the model size: the VSR bridge input,
 // rtxvideo.py run_vsr (round(x * 255), B G R A = 255)
-__global__ void k_packBgra(const float* __restrict__ src, int planeStride, int rowStride,
+__global__ void k_packBgra(const void* __restrict__ src, int half, int planeStride, int rowStride,
                            int w, int h, unsigned char* __restrict__ dst)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -443,7 +450,7 @@ __global__ void k_packBgra(const float* __restrict__ src, int planeStride, int r
     unsigned char* p = dst + ((size_t)y * w + x) * 4;
     for (int ci = 0; ci < 3; ci++)
     {
-        float v = src[(size_t)ci * planeStride + o];
+        float v = ldS(src, half, (size_t)ci * planeStride + o);
         v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
         p[ci] = (unsigned char)(int)rintf(v * 255.0f);
     }
@@ -468,7 +475,7 @@ __global__ void k_unpackBgra(const unsigned char* __restrict__ src, int dw, int 
 // the OFFLINE route's planes are (R, G, B) (the decoder's rgb, k_packInRaw8 / 16), not the live
 // (B, G, R): the VSR bridge input and output as rtxvideo.py run_vsr packs and unpacks them
 // (R, G, B planes into B G R A bytes, back with a true / 255)
-__global__ void k_packBgraRgb(const float* __restrict__ src, int planeStride, int rowStride,
+__global__ void k_packBgraRgb(const void* __restrict__ src, int half, int planeStride, int rowStride,
                               int w, int h, unsigned char* __restrict__ dst)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -478,7 +485,7 @@ __global__ void k_packBgraRgb(const float* __restrict__ src, int planeStride, in
     unsigned char* p = dst + ((size_t)y * w + x) * 4;
     for (int ci = 0; ci < 3; ci++)
     {
-        float v = src[(size_t)ci * planeStride + o];
+        float v = ldS(src, half, (size_t)ci * planeStride + o);
         v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
         p[2 - ci] = (unsigned char)(int)rintf(v * 255.0f);
     }
@@ -515,7 +522,7 @@ __global__ void k_unpackRgba(const unsigned char* __restrict__ src, int dw, int 
 }
 
 // the bicubic fit into the planar staging frame (the RCAS input when VSR is off)
-__global__ void k_fitPlanar(const float* __restrict__ src, int planeStride, int rowStride,
+__global__ void k_fitPlanar(const void* __restrict__ src, int half, int planeStride, int rowStride,
                             int w, int h, float* __restrict__ dst, int dw, int dh)
 {
     __shared__ OutTab T;
@@ -524,12 +531,28 @@ __global__ void k_fitPlanar(const float* __restrict__ src, int planeStride, int 
     const bool tab = outTabFill(T, w, h, dw, dh);
     if (ox >= dw || oy >= dh) return;
     float c[3];
-    sampleOut(src, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
+    sampleOut(src, half, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
     const size_t plane = (size_t)dw * dh;
     const size_t o = (size_t)oy * dw + ox;
     dst[o] = c[0];
     dst[plane + o] = c[1];
     dst[2 * plane + o] = c[2];
+}
+
+// a planar frame (w x h, planes ps apart, rows rs apart) into the padded model frame (pw x ph,
+// planes dps apart) with the edge replicated as the packers pad it: the NVIDIA order's frame,
+// upscaled before the model
+__global__ void k_padPlanar(const float* __restrict__ src, int ps, int rs, int w, int h,
+                            float* __restrict__ dst, int pw, int ph, int dps)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= pw || y >= ph) return;
+    const int sx = x < w ? x : w - 1, sy = y < h ? y : h - 1;
+    const size_t s = (size_t)sy * rs + sx, o = (size_t)y * pw + x;
+    dst[o] = src[s];
+    dst[(size_t)dps + o] = src[(size_t)ps + s];
+    dst[2 * (size_t)dps + o] = src[2 * (size_t)ps + s];
 }
 
 // ---- the downscaling fit --------------------------------------------------------------------
@@ -599,7 +622,7 @@ __device__ __forceinline__ void aaTabFill(AaTab& T, int o0, int side, int in, in
 }
 
 // horizontal pass: the model pad cropped to (w, h) -> tmp (3, h, dw)
-__global__ void k_fitAaH(const float* __restrict__ src, int planeStride, int rowStride,
+__global__ void k_fitAaH(const void* __restrict__ src, int half, int planeStride, int rowStride,
                          int w, int h, float* __restrict__ tmp, int dw)
 {
     __shared__ AaTab T;
@@ -617,9 +640,9 @@ __global__ void k_fitAaH(const float* __restrict__ src, int planeStride, int row
     {
         const float wt = tab ? tw[j - mn] : bcaa(aaArg(j, ox, w, dw));
         const size_t o = (size_t)y * rowStride + j;
-        a0 += wt * src[o];
-        a1 += wt * src[planeStride + o];
-        a2 += wt * src[2 * planeStride + o];
+        a0 += wt * ldS(src, half, o);
+        a1 += wt * ldS(src, half, planeStride + o);
+        a2 += wt * ldS(src, half, 2 * planeStride + o);
         wsum += wt;
     }
     const float n = wsum != 0.0f ? 1.0f / wsum : 1.0f;   // torch normalises unless the sum is 0
@@ -681,8 +704,9 @@ __device__ __forceinline__ float restTap(const void* __restrict__ src, int half,
     return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
-// the engine input: the model pad cropped to (w, h), fp32 planar -> fp16 NCHW (torch .half())
-__global__ void k_restIn(const float* __restrict__ src, int planeStride, int rowStride,
+// the engine input: the model pad cropped to (w, h), fp32 (or fp16) planar -> fp16 NCHW (torch
+// .half(); an fp16 source passes through unchanged)
+__global__ void k_restIn(const void* __restrict__ src, int half, int planeStride, int rowStride,
                          int w, int h, unsigned short* __restrict__ dst)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -690,9 +714,9 @@ __global__ void k_restIn(const float* __restrict__ src, int planeStride, int row
     if (x >= w || y >= h) return;
     const size_t o = (size_t)y * w + x, plane = (size_t)w * h;
     const size_t s = (size_t)y * rowStride + x;
-    dst[o] = f2h(src[s]);
-    dst[plane + o] = f2h(src[planeStride + s]);
-    dst[2 * plane + o] = f2h(src[2 * planeStride + s]);
+    dst[o] = f2h(ldS(src, half, s));
+    dst[plane + o] = f2h(ldS(src, half, planeStride + s));
+    dst[2 * plane + o] = f2h(ldS(src, half, 2 * planeStride + s));
 }
 
 // fp32 -> fp16 element for element, round to nearest even: the frames the RIFE engines take in
@@ -777,10 +801,11 @@ __global__ void k_restToF(const void* __restrict__ src, int half, int n, float* 
     if (i < n) dst[i] = restTap(src, half, (size_t)i);
 }
 
-// offline DLSS 5: dlssnr.py process() around the NR host's RGBA16F
-// frame. In: the planar (R, G, B) output-size frame, clamp(0, 1).to(float16) (round to
-// nearest even, torch's cast) plus alpha 1.0. Out: the first three channels, .float().clamp(0,
-// 1), back to tight planar.
+// offline DLSS 5: dlssnr.py process() around the NR host's RGBA16F frame. In: the dw x dh
+// picture of a planar (R, G, B) frame, clamp(0, 1).to(float16) (round to nearest even, torch's
+// cast) plus alpha 1.0. Out: the first three channels, .float().clamp(0, 1), written back over
+// the whole pw x ph padded frame with the edge replicated into the pad, as k_packInRaw8 / 16
+// pad a decoded frame.
 __global__ void k_nrIn(const float* __restrict__ src, int planeStride, int rowStride, int dw, int dh,
                        unsigned short* __restrict__ dst)
 {
@@ -796,16 +821,20 @@ __global__ void k_nrIn(const float* __restrict__ src, int planeStride, int rowSt
     }
     d[3] = 0x3C00;
 }
-__global__ void k_nrOut(const unsigned short* __restrict__ src, int dw, int dh, float* __restrict__ dst)
+__global__ void k_nrOut(const unsigned short* __restrict__ src, int dw, int dh,
+                        float* __restrict__ dst, int ph, int pw, int planeStride)
 {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= dw || y >= dh) return;
-    const size_t o = (size_t)y * dw + x;
+    const int ox = blockIdx.x * blockDim.x + threadIdx.x;
+    const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (ox >= pw || oy >= ph) return;
+    const int sx = ox < dw ? ox : dw - 1;
+    const int sy = oy < dh ? oy : dh - 1;
+    const unsigned short* p = src + ((size_t)sy * dw + sx) * 4;
+    const int o = oy * pw + ox;
     for (int c = 0; c < 3; c++)
     {
-        const float v = h2f(src[o * 4 + c]);
-        dst[(size_t)c * dw * dh + o] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        const float v = h2f(p[c]);
+        dst[(size_t)c * planeStride + o] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     }
 }
 
@@ -1323,14 +1352,15 @@ __device__ __forceinline__ void thdr_in_store(float r, float g, float b, size_t 
 }
 
 // the frame straight from the model or the staging buffer (planar with its own strides)
-__global__ void k_thdrIn(const float* __restrict__ src, int planeStride, int rowStride, int dw, int dh,
+__global__ void k_thdrIn(const void* __restrict__ src, int half, int planeStride, int rowStride, int dw, int dh,
                          unsigned char* __restrict__ bgra, float* __restrict__ dstG)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= dw || y >= dh) return;
     const size_t i = (size_t)y * rowStride + x;
-    thdr_in_store(src[i], src[(size_t)planeStride + i], src[2 * (size_t)planeStride + i],
+    thdr_in_store(ldS(src, half, i), ldS(src, half, (size_t)planeStride + i),
+                  ldS(src, half, 2 * (size_t)planeStride + i),
                   (size_t)y * dw + x, (size_t)dw * dh, bgra, dstG);
 }
 
@@ -1453,7 +1483,7 @@ __global__ void k_packInRaw8(const unsigned char* __restrict__ src, int w, int h
     dst[2 * planeStride + o] = p[2] * (1.0f / 255.0f);
 }
 // crop the pad, clamp, round to the pipe depth (to_bytes: clamp(0,1) * maxv, round, uint)
-__global__ void k_packOutRaw16(const float* __restrict__ src, int planeStride, int rowStride,
+__global__ void k_packOutRaw16(const void* __restrict__ src, int half, int planeStride, int rowStride,
                                int w, int h, unsigned short* __restrict__ dst)
 {
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1463,7 +1493,7 @@ __global__ void k_packOutRaw16(const float* __restrict__ src, int planeStride, i
     unsigned short* p = dst + ((size_t)oy * w + ox) * 3;
     for (int ci = 0; ci < 3; ci++)
     {
-        float v = src[(size_t)ci * planeStride + o];
+        float v = ldS(src, half, (size_t)ci * planeStride + o);
         v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
         p[ci] = (unsigned short)(int)rintf(v * 65535.0f);
     }
@@ -1483,7 +1513,7 @@ __global__ void k_pairDiff(const float* __restrict__ a, const float* __restrict_
     if (i >= n || *flag) return;
     if (a[i] != b[i]) *flag = 1;
 }
-__global__ void k_packOutRaw8(const float* __restrict__ src, int planeStride, int rowStride,
+__global__ void k_packOutRaw8(const void* __restrict__ src, int half, int planeStride, int rowStride,
                               int w, int h, unsigned char* __restrict__ dst)
 {
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1493,7 +1523,7 @@ __global__ void k_packOutRaw8(const float* __restrict__ src, int planeStride, in
     unsigned char* p = dst + ((size_t)oy * w + ox) * 3;
     for (int ci = 0; ci < 3; ci++)
     {
-        float v = src[(size_t)ci * planeStride + o];
+        float v = ldS(src, half, (size_t)ci * planeStride + o);
         v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
         p[ci] = (unsigned char)(int)rintf(v * 255.0f);
     }
@@ -2626,7 +2656,7 @@ struct NativeRife
     nvinfer1::ICudaEngine* engRest = nullptr;
     nvinfer1::IRuntimeConfig* cfgRest = nullptr;
     nvinfer1::IExecutionContext* ctxRest = nullptr;
-    void* dRestIn = nullptr;      // x: NCHW at the model size, fp16 (or fp32)
+    void* dRestIn = nullptr;      // x: NCHW at the source size (srcW x srcH), fp16 (or fp32)
     void* dRestOut = nullptr;     // y: NCHW 4x, the engine's dtype
     float* dRestTmp = nullptr;    // the fold's horizontal pass, planar fp32 at (4h) x max target width
     float* dRestF = nullptr;      // the enlarging fold only: y as clamped fp32 planar
@@ -2650,6 +2680,9 @@ struct NativeRife
     // the IFNet's x / the encode's img in fp16 (read off each engine on its own, so a cache that
     // mixes the two revisions still works: the encode features are the same either way)
     bool xHalf = false, imgHalf = false;
+    // the IFNet writes its tweens (merged) in fp16: every reader of a tween gets half = 1, and
+    // dMerged, allocated at the fp32 size, holds them at half the stride (mergedAt)
+    bool outHalf = false;
 
     // ---- CUDA
     cudaStream_t stream = nullptr;
@@ -2671,23 +2704,43 @@ struct NativeRife
     bool thdrStatsPending = false;
     ThdrAcc* thdrAcc = nullptr;      // the render's accumulators (runOfflineSession owns them)
     uint32_t thdrRepeat = 0;         // held slots that reuse the pending frame's record (DLSS 5)
-    // offline DLSS 5: the NR core on its own D3D12 device (dlssnr.exe's
-    // startup + renderFrame), one RGBA16F frame at dw x dh through pinned host staging
+    // offline DLSS 5: the NR core on its own D3D12 device, one RGBA16F frame at nrW x nrH, the
+    // decoded frame before the interpolation (nativeOfflineNr). Zero-copy by default: the frame
+    // moves through the core's two shared D3D12 buffers, which the stream writes and reads
+    // directly, and the core's shared fence orders both sides on the GPU. CPU staging
+    // (SMV_NR_STAGED=1, the preview's change map, or a handoff that cannot start): dlssnr.exe's
+    // renderFrame through pinned host copies.
     nr::Host* nrHost = nullptr;      // null = DLSS 5 off or unavailable for this render
     bool nrFailed = false;           // an evaluate failed: off for the rest of the render
     bool nrFirst = true;             // the stream's first frame evaluates with Reset
     bool nrResetEvery = false;       // SMV_NR_RESET_EVERY=1: every frame (the equivalence gate's lever)
+    bool nrZeroCopy = false;         // the shared-buffer route is up
+    int nrW = 0, nrH = 0;            // the decoded picture's size, the size DLSS 5 runs at
+    float* dRawPrev = nullptr;       // the previous decoded frame, packed: the identical-pair test's
+                                     // reference once DLSS 5 has rewritten the frames in dX
     uint16_t* dNrIo = nullptr;       // device RGBA16F, both directions
-    uint16_t* hNrIn = nullptr;       // pinned host copies handed to renderFrame
+    uint16_t* hNrIn = nullptr;       // pinned host copies handed to renderFrame (CPU staging)
     uint16_t* hNrOut = nullptr;
+    uint8_t* dNrShIn = nullptr;      // zero-copy: the core's shared buffers, rows nrPitch bytes apart
+    uint8_t* dNrShOut = nullptr;
+    size_t nrPitch = 0;
+    cudaExternalMemory_t emNrIn = nullptr, emNrOut = nullptr;
+    cudaExternalSemaphore_t semNr = nullptr;   // the core's shared fence
+    uint64_t nrFenceV = 0;           // last value put on it: odd = the stream's, even = the queue's
     std::wstring nrDeltaPath;        // --nr-delta PATH: the pass's change map (the preview's mask)
     double nrMs = 0.0, nrMaxMs = 0.0;
     uint64_t nrN = 0;
+    // NVIDIA order (offline): Restore and the upscale run on the decoded frame (the pre-model
+    // SOURCE, sw x sh, in dSrcPl) before DLSS 5 and the model, which then run at the output
+    // size; sw / sh = 0 = the source is the model frame (the speed-first order, and live)
+    int sw = 0, sh = 0;
+    bool nvPre = false;
+    float* dSrcPl = nullptr;      // NVIDIA order: the decoded frame, planar fp32 at sw x sh
     float* dPres = nullptr;       // sharpen / fitAa: the fitted frame, planar fp32 at dw x dh
     float* dFitTmp = nullptr;     // fitAa: the horizontal pass, planar fp32 at dw x (uh or h)
     float* dUp = nullptr;         // Upscale to: the internal render frame, planar fp32 at uw x uh
     float* dUpTmp = nullptr;      // upAa: the horizontal pass of the first resize, planar fp32 at uw x h
-    uint8_t* dVsrIn = nullptr;    // VSR: tight BGRA8 at the model size w x h
+    uint8_t* dVsrIn = nullptr;    // VSR: tight BGRA8 at the source size (srcW x srcH)
     uint8_t* dVsrOut = nullptr;   // VSR: tight BGRA8 at the presented size dw x dh
     float* dX = nullptr;        // (1,6,ph,pw): prev in planes 0..2, cur in 3..5
     uint16_t* dXh = nullptr;    // dX in fp16 for the RIFE engines that take fp16 frames (xHalf /
@@ -2714,6 +2767,7 @@ struct NativeRife
     CUfunction fFitAaH = nullptr, fFitAaV = nullptr;                    // the downscaling fit
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr,   // live Restore
                fRestToF = nullptr, fClamp01 = nullptr;
+    CUfunction fPadPlanar = nullptr;                                    // NVIDIA order's model frame
     CUfunction fNrIn = nullptr, fNrOut = nullptr;                       // offline DLSS 5
     CUfunction fHalf = nullptr, fPyr = nullptr, fSplatSoft = nullptr,   // live GMFSS glue (5b)
                fSplatNorm = nullptr;
@@ -2812,7 +2866,7 @@ struct NativeResident
     CUmodule cuMod = nullptr;
     bool encHalf = true;
     bool featHalf = false;
-    bool xHalf = false, imgHalf = false;
+    bool xHalf = false, imgHalf = false, outHalf = false;
     int dev = 0;
     // memoised handoff: the python command line minus gen (the fast path ignores gen and the
     // cold path builds the fixed 1to8 class regardless) and the facts it answered with
@@ -3047,8 +3101,8 @@ struct LkShape { const char* name; std::vector<int64_t> dims; };
 // Engines built from an older graph never survive a bump: the app and the
 // CLI empty the engine cache when its stamp (weights_tags.txt, which carries the rev, plus the
 // TensorRT-RTX version) no longer matches (src/render/cache.ts)
-static const int kOnnxRev = 4;   // 3: RIFE IFNet / block0 take f0 / f1 in fp16; 4: the IFNet's x
-                                 // and the encode's img in fp16
+static const int kOnnxRev = 5;   // 3: RIFE IFNet / block0 take f0 / f1 in fp16; 4: the IFNet's x
+                                 // and the encode's img in fp16; 5: the IFNet's merged in fp16
 
 // engine_name(): <base>_<shape per input joined by x, inputs by _>_<trt>_<w>, a dynamic batch
 // axis written lo"to"hi
@@ -3153,7 +3207,8 @@ static bool lkFind(nvinfer1::IRuntime* rt, const std::string& cacheDir, const st
 
 // the RIFE IFNet / block0 class: fp32 everywhere except the feature encodes f0 / f1, fp32 up to
 // ONNX rev 2 and fp16 since rev 3 (both the same; nativeTrtInit pairs them with the encode output),
-// and the IFNet's frame pair x, fp16 since rev 4 (block0's frames stay fp32)
+// the IFNet's frame pair x, fp16 since rev 4, and the IFNet's tween merged, fp16 since rev 5
+// (block0's frames and flow stay fp32)
 static bool lkRifeIo(const LkIo& io, bool ifnet)
 {
     std::string fd;
@@ -3170,7 +3225,8 @@ static bool lkRifeIo(const LkIo& io, bool ifnet)
         }
         else if (p.second != "fp32") return false;
     }
-    for (auto& p : io.outs) if (p.second != "fp32") return false;
+    for (auto& p : io.outs)
+        if (p.second != "fp32" && !(ifnet && p.first == "merged" && p.second == "fp16")) return false;
     return true;
 }
 
@@ -4390,7 +4446,7 @@ static bool nativeBindKernels(NativeRife& nr)
         { &nr.fUnpackRgba, "k_unpackRgba" },
         { &nr.fFitAaH, "k_fitAaH" }, { &nr.fFitAaV, "k_fitAaV" },
         { &nr.fRestIn, "k_restIn" }, { &nr.fRestFoldH, "k_restFoldH" }, { &nr.fRestFoldV, "k_restFoldV" },
-        { &nr.fRestToF, "k_restToF" }, { &nr.fClamp01, "k_clamp01" },
+        { &nr.fRestToF, "k_restToF" }, { &nr.fClamp01, "k_clamp01" }, { &nr.fPadPlanar, "k_padPlanar" },
         { &nr.fNrIn, "k_nrIn" }, { &nr.fNrOut, "k_nrOut" },
         { &nr.fHalf, "k_half" }, { &nr.fPyr, "k_pyr" },
         { &nr.fSplatSoft, "k_splatSoft" }, { &nr.fSplatNorm, "k_splatNorm" },
@@ -4623,6 +4679,10 @@ static bool nativeCudaInitLate(NativeRife& nr, HANDLE hOutBuf, uint64_t outBytes
 // warm-up eval (~0.6 s). Needs the capture size, the stream and the kernel module only, so the
 // early thread runs it on a helper beside the engine load; the non-early
 // compute thread runs it after the engine load. The caller's thread must have bound the device.
+// the frame Restore and the first resize read: the model frame, or in NVIDIA order the decoded one
+static int srcW(const NativeRife& nr) { return nr.sw ? nr.sw : nr.w; }
+static int srcH(const NativeRife& nr) { return nr.sh ? nr.sh : nr.h; }
+
 static bool nativeRtxInit(NativeRife& nr)
 {
     // live Sharpen and RTX VSR: the fit is known now, so the python rule "VSR
@@ -4630,9 +4690,10 @@ static bool nativeRtxInit(NativeRife& nr)
     // Upscale to: the first resize target is the internal render size when set, else
     // the fit rect (_Fit._setup_resize); VSR and the aa rule read that target
     const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
+    const int sw = srcW(nr), sh = srcH(nr);
     if (nr.vsrWant)
     {
-        if (tw > nr.w && th > nr.h) nr.vsr = true;
+        if (tw > sw && th > sh) nr.vsr = true;
         else LOG("native: live RTX VSR skipped (upscales only; this resize does not enlarge), bicubic\n");
     }
     if (nr.uw)
@@ -4657,20 +4718,20 @@ static bool nativeRtxInit(NativeRife& nr)
     if (nr.sharpen > 0.0f)
         LOG("native: live sharpen: FSR RCAS %.2f at the presented resolution\n", nr.sharpen);
     // live Restore: the fold target is _Fit._load_restore's restore_target: back
-    // to the model size when an RTX VSR instance follows (so VSR sees the restored frame),
+    // to the source size when an RTX VSR instance follows (so VSR sees the restored frame),
     // else the first resize target directly (restore-as-upscaler, one resize)
     if (nr.restore)
     {
-        nr.restTw = nr.vsr ? nr.w : tw;
-        nr.restTh = nr.vsr ? nr.h : th;
-        if (nr.restTh > 4 * nr.h)
-            NCHK(cudaMalloc((void**)&nr.dRestF, (size_t)3 * 16 * nr.w * nr.h * sizeof(float)), "alloc restore fp32 output");
+        nr.restTw = nr.vsr ? sw : tw;
+        nr.restTh = nr.vsr ? sh : th;
+        if (nr.restTh > 4 * sh)
+            NCHK(cudaMalloc((void**)&nr.dRestF, (size_t)3 * 16 * sw * sh * sizeof(float)), "alloc restore fp32 output");
         LOG("native: live restore: Real-ESRGAN animevideov3 (TensorRT) at %dx%d -> %dx%d\n",
-            nr.w, nr.h, nr.restTw, nr.restTh);
+            sw, sh, nr.restTw, nr.restTh);
     }
     if (nr.vsr)
     {
-        NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)nr.w * nr.h * 4), "alloc VSR input");
+        NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)sw * sh * 4), "alloc VSR input");
         NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)tw * th * 4), "alloc VSR output");
     }
     // live TrueHDR runs once per captured frame at the capture size, offline on every output
@@ -4737,15 +4798,15 @@ static bool nativeRtxInit(NativeRife& nr)
     {
         // warm-up eval on an opaque black frame, so the first presented frame pays nothing
         if (cuMemsetD32Async((CUdeviceptr)nr.dVsrIn, 0xFF000000u,
-                             (size_t)nr.w * nr.h, (CUstream)nr.stream) != CUDA_SUCCESS)
+                             (size_t)sw * sh, (CUstream)nr.stream) != CUDA_SUCCESS)
         { LOG("native: RTX VSR warm-up clear failed\n"); return false; }
         NCHK(cudaStreamSynchronize(nr.stream), "VSR warm-up stream sync");
-        const RtxRect ri{ 0, 0, (uint32_t)nr.w, (uint32_t)nr.h };
+        const RtxRect ri{ 0, 0, (uint32_t)sw, (uint32_t)sh };
         const RtxRect ro{ 0, 0, (uint32_t)tw, (uint32_t)th };
         if (g_rtxb.evalVsr(nr.dVsrIn, nr.dVsrOut, ri, ro, &nr.vsrSet) != 1u)
         { LOG("native: the RTX VSR warm-up eval failed\n"); return false; }
         NCHK(cudaDeviceSynchronize(), "VSR warm-up eval sync");
-        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d\n", nr.w, nr.h, tw, th);
+        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d\n", sw, sh, tw, th);
     }
     if (nr.rtxHdr)
     {
@@ -5325,8 +5386,8 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
     nativeFrucDrain(nr);   // no worker still reads a surface this pair may repack
     int n = 0;
     while (n == nr.frPrev || n == nr.frLast) n++;
-    int ps = nr.ph * nr.pw;
-    void* a[] = { (void*)&dCur, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.dFrSurf[n] };
+    int ps = nr.ph * nr.pw, f32 = 0;
+    void* a[] = { (void*)&dCur, &f32, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.dFrSurf[n] };
     // true BGRA from either plane order: live (B, G, R), offline (R, G, B) (nvoffruc.py _pack)
     if (cuLaunchKernel(nr.planesRgb ? nr.fPackBgraRgb : nr.fPackBgra, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0,
                        (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
@@ -5876,8 +5937,8 @@ static bool nativeTrtInit(NativeRife& nr)
         else if (yd == nvinfer1::DataType::kFLOAT) nr.restHalfOut = false;
         else { LOG("native: restore engine output dtype unsupported\n"); return false; }
         if (!nr.dRestIn || !nr.dRestOut) { LOG("native: restore buffers missing\n"); return false; }
-        NCHK(cudaMemsetAsync(nr.dRestIn, 0, (size_t)3 * nr.w * nr.h * 4, nr.stream), "restore warm-up clear");
-        nvinfer1::Dims4 din{ 1, 3, nr.h, nr.w };
+        NCHK(cudaMemsetAsync(nr.dRestIn, 0, (size_t)3 * srcW(nr) * srcH(nr) * 4, nr.stream), "restore warm-up clear");
+        nvinfer1::Dims4 din{ 1, 3, srcH(nr), srcW(nr) };
         if (!nr.ctxRest->setInputShape("x", din))
         { LOG("native: restore setInputShape rejected (engine built for another size)\n"); return false; }
         nr.ctxRest->setTensorAddress("x", nr.dRestIn);
@@ -5986,6 +6047,7 @@ static bool nativeTrtInit(NativeRife& nr)
         nr.featHalf = g_res.featHalf;
         nr.xHalf = g_res.xHalf;
         nr.imgHalf = g_res.imgHalf;
+        nr.outHalf = g_res.outHalf;
         // no-engine mode: the resident holds no pair (both paths empty on both sides), only
         // the runtime, the jit cache and, per path, the restore engine
         if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
@@ -6034,10 +6096,13 @@ static bool nativeTrtInit(NativeRife& nr)
     if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
     {
         // dtype contract, read off the engines rather than trusted from the handoff line
-        const char* need[] = { "timestep", "merged" };
-        for (const char* n : need)
-            if (dt(nr.engIf, n) != nvinfer1::DataType::kFLOAT)
-            { LOG("native: IFNet tensor %s is not fp32\n", n); return false; }
+        if (dt(nr.engIf, "timestep") != nvinfer1::DataType::kFLOAT)
+        { LOG("native: IFNet tensor timestep is not fp32\n"); return false; }
+        // merged: fp32 (ONNX rev <= 4) or fp16 (rev 5, every tween reader takes it as it is)
+        const auto md = dt(nr.engIf, "merged");
+        if (md != nvinfer1::DataType::kFLOAT && md != nvinfer1::DataType::kHALF)
+        { LOG("native: IFNet merged dtype unsupported\n"); return false; }
+        nr.outHalf = md == nvinfer1::DataType::kHALF;
         // x: fp32 (ONNX rev <= 3) or fp16 (rev 4, bound to the fp16 copy of the frame pair)
         const auto xd = dt(nr.engIf, "x");
         if (xd != nvinfer1::DataType::kFLOAT && xd != nvinfer1::DataType::kHALF)
@@ -6073,6 +6138,7 @@ static bool nativeTrtInit(NativeRife& nr)
         g_res.featHalf = nr.featHalf;
         g_res.xHalf = nr.xHalf;
         g_res.imgHalf = nr.imgHalf;
+        g_res.outHalf = nr.outHalf;
         g_res.dev = nr.dev;
         g_res.ifnetPath = nr.ifnetPath;
         g_res.encodePath = nr.encodePath;
@@ -6153,7 +6219,7 @@ static void nativeFree(NativeRife& nr)
     for (void* p : { (void*)nr.dCap, (void*)nr.dX, (void*)nr.dXh, (void*)nr.dF[0], (void*)nr.dF[1],
                      (void*)nr.dEncHalf, (void*)nr.dT, (void*)nr.dMerged, (void*)nr.dTmp,
                      (void*)nr.dCapF, (void*)nr.dThdrIn, (void*)nr.dThdrOut, (void*)nr.dSrcG,
-                     (void*)nr.dPres, (void*)nr.dVsrIn, (void*)nr.dVsrOut, (void*)nr.dFitTmp,
+                     (void*)nr.dPres, (void*)nr.dSrcPl, (void*)nr.dVsrIn, (void*)nr.dVsrOut, (void*)nr.dFitTmp,
                      (void*)nr.dUp, (void*)nr.dUpTmp, nr.dRestIn, nr.dRestOut,
                      (void*)nr.dRestTmp, (void*)nr.dRestF, (void*)nr.dRest,
                      (void*)nr.dStaticFlag, (void*)nr.dThdrStats })
@@ -6181,7 +6247,7 @@ static void nativeFree(NativeRife& nr)
     nr.dCap = nullptr; nr.dX = nullptr; nr.dXh = nullptr; nr.dF[0] = nr.dF[1] = nullptr;
     nr.dEncHalf = nullptr; nr.dT = nullptr; nr.dMerged = nullptr; nr.dTmp = nullptr;
     nr.dCapF = nullptr; nr.dThdrIn = nullptr; nr.dThdrOut = nullptr; nr.dSrcG = nullptr;
-    nr.dPres = nullptr; nr.dVsrIn = nullptr; nr.dVsrOut = nullptr; nr.dFitTmp = nullptr;
+    nr.dPres = nullptr; nr.dSrcPl = nullptr; nr.dVsrIn = nullptr; nr.dVsrOut = nullptr; nr.dFitTmp = nullptr;
     nr.dUp = nullptr; nr.dUpTmp = nullptr;
     nr.dRestIn = nullptr; nr.dRestOut = nullptr; nr.dRestTmp = nullptr; nr.dRestF = nullptr; nr.dRest = nullptr;
     if (nr.cuMod && nr.cuMod != g_res.cuMod) cuModuleUnload(nr.cuMod);
@@ -6610,29 +6676,47 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
     return true;
 }
 
+// tween k of the IFNet's output batch (3 planes of `plane` elements each, fp32 or fp16 by outHalf)
+static const void* mergedAt(const NativeRife& nr, size_t k, size_t plane)
+{
+    const size_t n = k * 3 * plane;
+    return nr.outHalf ? (const void*)((const uint16_t*)nr.dMerged + n) : (const void*)(nr.dMerged + n);
+}
+
 // Restore (live and offline): _Fit._restore / render_passes.restore on one
-// model-size planar source, the result folded into dst (tw x th). false = a launch failed (die
-// was called); an engine enqueue refusal drops the pass for the rest of the session instead
-// (python's rule), the caller then continues with the unrestored source.
-static bool nativeRestoreRun(NativeRife& nr, const float* s, int ps_, int rs_, float* dst, int tw, int th)
+// source-size planar frame (srcW x srcH: the model frame, or in NVIDIA order the decoded one;
+// fp16 when sHalf: a tween as the IFNet wrote it), the result folded into dst (tw x th).
+// false = a launch failed (die was called); an engine enqueue refusal drops the pass for the rest
+// of the session instead (python's rule), the caller then continues with the unrestored source.
+static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, float* dst, int tw, int th,
+                             int sHalf = 0)
 {
     cudaStream_t st = nr.stream;
+    int sw = srcW(nr), sh = srcH(nr);
     if (nr.restHalfIn)
     {
-        void* a[] = { (void*)&s, &ps_, &rs_, &nr.w, &nr.h, &nr.dRestIn };
-        if (cuLaunchKernel(nr.fRestIn, (nr.w + 15) / 16, (nr.h + 15) / 16, 1,
+        void* a[] = { (void*)&s, &sHalf, &ps_, &rs_, &sw, &sh, &nr.dRestIn };
+        if (cuLaunchKernel(nr.fRestIn, (sw + 15) / 16, (sh + 15) / 16, 1,
                            16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
         { nr.die("restIn launch failed"); return false; }
+    }
+    else if (sHalf)
+    {
+        // an fp32 engine input from an fp16 source: the 1:1 fit is the widening crop copy
+        void* a[] = { (void*)&s, &sHalf, &ps_, &rs_, &sw, &sh, &nr.dRestIn, &sw, &sh };
+        if (cuLaunchKernel(nr.fFitPlanar, (sw + 15) / 16, (sh + 15) / 16, 1,
+                           16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+        { nr.die("restore input widen failed"); return false; }
     }
     else
     {
         for (int c = 0; c < 3; c++)
-            if (cudaMemcpy2DAsync((float*)nr.dRestIn + (size_t)c * nr.w * nr.h, (size_t)nr.w * 4,
-                                  s + (size_t)c * ps_, (size_t)rs_ * 4, (size_t)nr.w * 4, nr.h,
+            if (cudaMemcpy2DAsync((float*)nr.dRestIn + (size_t)c * sw * sh, (size_t)sw * 4,
+                                  (const float*)s + (size_t)c * ps_, (size_t)rs_ * 4, (size_t)sw * 4, sh,
                                   cudaMemcpyDeviceToDevice, st) != cudaSuccess)
             { nr.die("restore input copy failed"); return false; }
     }
-    nvinfer1::Dims4 din{ 1, 3, nr.h, nr.w };
+    nvinfer1::Dims4 din{ 1, 3, sh, sw };
     nr.ctxRest->setTensorAddress("x", nr.dRestIn);
     nr.ctxRest->setTensorAddress("y", nr.dRestOut);
     if (!nr.ctxRest->setInputShape("x", din) || !nr.ctxRest->enqueueV3(st))
@@ -6641,7 +6725,7 @@ static bool nativeRestoreRun(NativeRife& nr, const float* s, int ps_, int rs_, f
         nr.restFailed = true;
         return true;
     }
-    int half = nr.restHalfOut ? 1 : 0, w4 = 4 * nr.w, h4 = 4 * nr.h, ps4 = w4 * h4;
+    int half = nr.restHalfOut ? 1 : 0, w4 = 4 * sw, h4 = 4 * sh, ps4 = w4 * h4;
     if (th <= h4)
     {
         // realesr.fit: the antialiased pair when the target height shrinks (an exact copy
@@ -6657,11 +6741,11 @@ static bool nativeRestoreRun(NativeRife& nr, const float* s, int ps_, int rs_, f
         return true;
     }
     // an enlarging target (above 4x): plain bicubic from the clamped fp32 copy
-    int n = 3 * ps4;
+    int n = 3 * ps4, f32 = 0;
     void* a0[] = { &nr.dRestOut, &half, &n, &nr.dRestF };
     if (cuLaunchKernel(nr.fRestToF, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
     { nr.die("restToF launch failed"); return false; }
-    void* a1[] = { &nr.dRestF, &ps4, &w4, &w4, &h4, &dst, &tw, &th };
+    void* a1[] = { &nr.dRestF, &f32, &ps4, &w4, &w4, &h4, &dst, &tw, &th };
     if (cuLaunchKernel(nr.fFitPlanar, (tw + 15) / 16, (th + 15) / 16, 1,
                        16, 16, 1, 0, (CUstream)st, a1, nullptr) != CUDA_SUCCESS)
     { nr.die("fitPlanar (restore) launch failed"); return false; }
@@ -6720,18 +6804,103 @@ static void nativeOfflineNrDelta(const NativeRife& nr, const std::vector<float>&
     if (f) fclose(f);
 }
 
-// Offline DLSS 5 on one output-size frame, planar (R, G, B) with its strides, into nr.dPres
-// (tight, dw x dh). The NR core runs dlssnr.exe's own path in this process (startup on a
-// private D3D12 device, renderFrame through its upload / readback staging, Reset on the first
-// frame only: offline accumulates, live does not). An evaluate that fails turns the pass off
-// for the rest of the render with a line and leaves dPres untouched (nr.nrFailed); there is no
-// retry: NGX has no teardown, so the NR core cannot restart in this process.
-static bool nativeOfflineNr(NativeRife& nr, const float* src, int ps, int rs)
+// The zero-copy imports of the offline DLSS 5 handoff, released in the order CUDA asks for (the
+// mapped buffers first). The caller has drained the stream.
+static void nativeNrReleaseImports(NativeRife& nr)
+{
+    if (nr.dNrShIn) { cudaFree(nr.dNrShIn); nr.dNrShIn = nullptr; }
+    if (nr.dNrShOut) { cudaFree(nr.dNrShOut); nr.dNrShOut = nullptr; }
+    if (nr.semNr) { cudaDestroyExternalSemaphore(nr.semNr); nr.semNr = nullptr; }
+    if (nr.emNrIn) { cudaDestroyExternalMemory(nr.emNrIn); nr.emNrIn = nullptr; }
+    if (nr.emNrOut) { cudaDestroyExternalMemory(nr.emNrOut); nr.emNrOut = nullptr; }
+}
+
+// Zero-copy offline DLSS 5: import the NR core's shared buffers and fence (nr::Host::startShared)
+// into this CUDA context. Refused when the core's D3D12 adapter is not the current CUDA device;
+// the caller then keeps the CPU staging route.
+static bool nativeNrImport(NativeRife& nr, nr::Host& host, std::string& err)
+{
+    int dev = 0;
+    cudaDeviceProp prop{};
+    const LUID luid = host.adapterLuid();
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess
+        || memcmp(prop.luid, &luid, sizeof(luid)) != 0)
+    { err = "the NR device is not the CUDA device"; return false; }
+    cudaExternalMemoryHandleDesc md{};
+    md.type = cudaExternalMemoryHandleTypeD3D12Resource;
+    md.size = host.sharedBytes();
+    md.flags = cudaExternalMemoryDedicated;
+    md.handle.win32.handle = host.sharedInHandle();
+    if (cudaImportExternalMemory(&nr.emNrIn, &md) != cudaSuccess) { err = "input buffer import failed"; return false; }
+    md.handle.win32.handle = host.sharedOutHandle();
+    if (cudaImportExternalMemory(&nr.emNrOut, &md) != cudaSuccess) { err = "output buffer import failed"; return false; }
+    cudaExternalMemoryBufferDesc bd{};
+    bd.offset = 0;
+    bd.size = host.sharedBytes();
+    bd.flags = 0;
+    if (cudaExternalMemoryGetMappedBuffer((void**)&nr.dNrShIn, nr.emNrIn, &bd) != cudaSuccess
+        || cudaExternalMemoryGetMappedBuffer((void**)&nr.dNrShOut, nr.emNrOut, &bd) != cudaSuccess)
+    { err = "shared buffer mapping failed"; return false; }
+    cudaExternalSemaphoreHandleDesc sd{};
+    sd.type = cudaExternalSemaphoreHandleTypeD3D12Fence;
+    sd.handle.win32.handle = host.sharedFenceHandle();
+    if (cudaImportExternalSemaphore(&nr.semNr, &sd) != cudaSuccess) { err = "fence import failed"; return false; }
+    nr.nrPitch = (size_t)host.rowPitch();
+    return true;
+}
+
+// Offline DLSS 5 on one decoded frame, in place, before anything reads it: the padded planar
+// (R, G, B) model-input frame (pw x ph, plane stride ps) whose top-left nrW x nrH is the picture.
+// Every model and every output frame then reads DLSS 5 output: NVIDIA's order, DLSS 5 on the
+// rendered frame and frame generation after it (live runs it the same way, once per captured
+// frame). Reset on the first frame only (offline accumulates, live does not).
+// Zero-copy: k_nrIn's frame goes into the core's shared input buffer at its row pitch, the stream
+// signals an odd fence value, the core's queue waits for it, evaluates, writes the shared output
+// buffer and signals the next even value, and the stream waits for that before k_nrOut reads the
+// result: no CPU wait. CPU staging: dlssnr.exe's renderFrame through its upload / readback
+// buffers. An evaluate that fails turns the pass off for the rest of the render with a line and
+// leaves the frame untouched (nr.nrFailed); there is no retry: NGX has no teardown, so the NR core
+// cannot restart in this process.
+static bool nativeOfflineNr(NativeRife& nr, float* frame, int pw, int ph, int ps)
 {
     cudaStream_t st = nr.stream;
-    int tw = nr.dw, th = nr.dh;
+    int tw = nr.nrW, th = nr.nrH;
     const size_t bytes = (size_t)tw * th * 8;
-    void* a[] = { (void*)&src, &ps, &rs, &tw, &th, &nr.dNrIo };
+    const float* src = frame;
+    void* a[] = { (void*)&src, &ps, &pw, &tw, &th, &nr.dNrIo };
+    void* b[] = { &nr.dNrIo, &tw, &th, &frame, &ph, &pw, &ps };
+    const unsigned gx = (unsigned)(pw + 15) / 16, gy = (unsigned)(ph + 15) / 16;
+    if (nr.nrZeroCopy)
+    {
+        const size_t row = (size_t)tw * 8;
+        cudaExternalSemaphoreSignalParams sp{};
+        sp.params.fence.value = ++nr.nrFenceV;
+        if (cuLaunchKernel(nr.fNrIn, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS
+            || cudaMemcpy2DAsync(nr.dNrShIn, nr.nrPitch, nr.dNrIo, row, row, th, cudaMemcpyDeviceToDevice, st) != cudaSuccess
+            || cudaSignalExternalSemaphoresAsync(&nr.semNr, &sp, 1, st) != cudaSuccess)
+        { nr.die("DLSS 5 input handoff failed"); return false; }
+        const uint64_t ready = ++nr.nrFenceV;
+        const int64_t t0 = nowQpc100();
+        std::string err;
+        if (!nr.nrHost->submitShared(nr.nrFirst || nr.nrResetEvery, sp.params.fence.value, ready, err))
+        {
+            LOG("[dlss5] %s; DLSS 5 disabled for the rest of this render\n", err.c_str());
+            nr.nrFailed = true;
+            return true;
+        }
+        const double ms = (double)(nowQpc100() - t0) / 10000.0;
+        nr.nrMs += ms;
+        nr.nrN++;
+        if (ms > nr.nrMaxMs) nr.nrMaxMs = ms;
+        nr.nrFirst = false;
+        cudaExternalSemaphoreWaitParams wp{};
+        wp.params.fence.value = ready;
+        if (cudaWaitExternalSemaphoresAsync(&nr.semNr, &wp, 1, st) != cudaSuccess
+            || cudaMemcpy2DAsync(nr.dNrIo, row, nr.dNrShOut, nr.nrPitch, row, th, cudaMemcpyDeviceToDevice, st) != cudaSuccess
+            || cuLaunchKernel(nr.fNrOut, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS)
+        { nr.die("DLSS 5 output handoff failed"); return false; }
+        return true;
+    }
     if (cuLaunchKernel(nr.fNrIn, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS
         || cudaMemcpyAsync(nr.hNrIn, nr.dNrIo, bytes, cudaMemcpyDeviceToHost, st) != cudaSuccess
         || cudaStreamSynchronize(st) != cudaSuccess)
@@ -6742,7 +6911,7 @@ static bool nativeOfflineNr(NativeRife& nr, const float* src, int ps, int rs)
         before.resize((size_t)3 * tw * th);
         for (int c = 0; c < 3 && !before.empty(); c++)
             if (cudaMemcpy2D(before.data() + (size_t)c * tw * th, (size_t)tw * sizeof(float), src + (size_t)c * ps,
-                             (size_t)rs * sizeof(float), (size_t)tw * sizeof(float), th, cudaMemcpyDeviceToHost) != cudaSuccess)
+                             (size_t)pw * sizeof(float), (size_t)tw * sizeof(float), th, cudaMemcpyDeviceToHost) != cudaSuccess)
             {
                 LOG("offline: the DLSS 5 change map input download failed, no map\n");
                 before.clear();
@@ -6762,9 +6931,8 @@ static bool nativeOfflineNr(NativeRife& nr, const float* src, int ps, int rs)
     if (ms > nr.nrMaxMs) nr.nrMaxMs = ms;
     nr.nrFirst = false;
     if (!before.empty()) nativeOfflineNrDelta(nr, before, tw, th);
-    void* b[] = { &nr.dNrIo, &tw, &th, &nr.dPres };
     if (cudaMemcpyAsync(nr.dNrIo, nr.hNrOut, bytes, cudaMemcpyHostToDevice, st) != cudaSuccess
-        || cuLaunchKernel(nr.fNrOut, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS)
+        || cuLaunchKernel(nr.fNrOut, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS)
     { nr.die("DLSS 5 output staging failed"); return false; }
     return true;
 }
@@ -6810,31 +6978,30 @@ static bool nativeOfflineThdr(NativeRife& nr, uint8_t* dO)
     return true;
 }
 
-// The offline pass chain on one planar model-size frame (ps / rs strides, nr.w x nr.h), then
-// the quantisation, into dO as tight rgb48le (out16) or rgb24 at the output size nr.dw x nr.dh.
-// Order: Restore (back to the model size when RTX VSR follows, else folded straight to the
-// output size), the resize (RTX VSR when it runs, else clamped bicubic; offline only enlarges,
-// the downscale is folded into the decode), DLSS 5 (nativeOfflineNr), RCAS last. With RTX HDR
-// the SDR result goes through nativeOfflineThdr instead of the quantisation and dO holds
-// x2rgb10le words. A pass that fails is dropped for the rest of the render with a line.
-// false = a launch failed.
-static bool nativeOfflineEmit(NativeRife& nr, const float* src, int ps, int rs, uint8_t* dO, bool out16)
+// The first half of the offline passes on one planar source frame (ps / rs strides, srcW x
+// srcH: the model output in the speed-first order, the decoded frame before the model in
+// NVIDIA order): Restore (back to the source size when RTX VSR follows, else folded straight to
+// the output size), then the resize (RTX VSR when it runs, else clamped bicubic; offline only
+// enlarges, the downscale is folded into the decode). staged = nr.dPres holds the output-size
+// frame; src / ps / rs / srcHalf follow a Restore that hands on its fp32 frame. false = a launch
+// failed.
+static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& rs, int& srcHalf, bool& staged)
 {
     cudaStream_t st = nr.stream;
-    const int tw = nr.dw, th = nr.dh;
-    const bool resize = tw != nr.w || th != nr.h;
+    int tw = nr.dw, th = nr.dh, sw = srcW(nr), sh = srcH(nr);
+    const bool resize = tw != sw || th != sh;
     const bool vsrNow = nr.vsr && !nr.vsrFailed && g_rtxb.created;
-    bool staged = false;   // nr.dPres holds the output-size frame
+    staged = false;
     if (nr.restore && nr.ctxRest && !nr.restFailed)
     {
         if (vsrNow)
         {
-            if (!nativeRestoreRun(nr, src, ps, rs, nr.dRest, nr.w, nr.h)) return false;
-            if (!nr.restFailed) { src = nr.dRest; ps = nr.w * nr.h; rs = nr.w; }
+            if (!nativeRestoreRun(nr, src, ps, rs, nr.dRest, sw, sh, srcHalf)) return false;
+            if (!nr.restFailed) { src = nr.dRest; ps = sw * sh; rs = sw; srcHalf = 0; }
         }
         else
         {
-            if (!nativeRestoreRun(nr, src, ps, rs, nr.dPres, tw, th)) return false;
+            if (!nativeRestoreRun(nr, src, ps, rs, nr.dPres, tw, th, srcHalf)) return false;
             staged = !nr.restFailed;
         }
     }
@@ -6843,13 +7010,13 @@ static bool nativeOfflineEmit(NativeRife& nr, const float* src, int ps, int rs, 
         bool haveVsr = false;
         if (vsrNow)
         {
-            void* a[] = { (void*)&src, (void*)&ps, (void*)&rs, &nr.w, &nr.h, &nr.dVsrIn };
-            if (cuLaunchKernel(nr.fPackBgraRgb, (nr.w + 15) / 16, (nr.h + 15) / 16, 1,
+            void* a[] = { (void*)&src, &srcHalf, (void*)&ps, (void*)&rs, &sw, &sh, &nr.dVsrIn };
+            if (cuLaunchKernel(nr.fPackBgraRgb, (sw + 15) / 16, (sh + 15) / 16, 1,
                                16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             { nr.die("packBgraRgb launch failed"); return false; }
             // the bridge copies ride the legacy default stream (rtxvideo.py run_vsr)
             if (cudaStreamSynchronize(st) != cudaSuccess) { nr.die("VSR input sync failed"); return false; }
-            const RtxRect ri{ 0, 0, (uint32_t)nr.w, (uint32_t)nr.h };
+            const RtxRect ri{ 0, 0, (uint32_t)sw, (uint32_t)sh };
             const RtxRect ro{ 0, 0, (uint32_t)tw, (uint32_t)th };
             const unsigned int rv = g_rtxb.evalVsr(nr.dVsrIn, nr.dVsrOut, ri, ro, &nr.vsrSet);
             if (cudaDeviceSynchronize() != cudaSuccess) { nr.die("VSR eval sync failed"); return false; }
@@ -6869,7 +7036,7 @@ static bool nativeOfflineEmit(NativeRife& nr, const float* src, int ps, int rs, 
         }
         else
         {
-            void* a[] = { (void*)&src, (void*)&ps, (void*)&rs, &nr.w, &nr.h, &nr.dPres, (void*)&tw, (void*)&th };
+            void* a[] = { (void*)&src, &srcHalf, (void*)&ps, (void*)&rs, &sw, &sh, &nr.dPres, (void*)&tw, (void*)&th };
             if (cuLaunchKernel(nr.fFitPlanar, (tw + 15) / 16, (th + 15) / 16, 1,
                                16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             { nr.die("fitPlanar launch failed"); return false; }
@@ -6880,19 +7047,56 @@ static bool nativeOfflineEmit(NativeRife& nr, const float* src, int ps, int rs, 
         }
         staged = true;
     }
-    if (nr.nrHost && !nr.nrFailed)
-    {
-        // DLSS 5 at the output size, after the resize and before RCAS (render_passes.run)
-        const float* nin = staged ? nr.dPres : src;
-        if (!nativeOfflineNr(nr, nin, staged ? tw * th : ps, staged ? tw : rs)) return false;
-        if (!nr.nrFailed) staged = true;
-    }
+    return true;
+}
+
+// NVIDIA order, before DLSS 5 and the model: the decoded frame in nr.dSrcPl (srcW x srcH)
+// through Restore and RTX VSR / bicubic to the output size, which is the model size here, then
+// into the model frame dCur (pw x ph, planes dps apart) with the packers' replicate pad
+static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
+{
+    const void* src = nr.dSrcPl;
+    int ps = srcW(nr) * srcH(nr), rs = srcW(nr), half = 0;
+    bool staged = false;
+    if (!nativeOfflineStage(nr, src, ps, rs, half, staged)) return false;
+    // unstaged = no resize and Restore dropped: the source already has the model size
+    const float* from = staged ? nr.dPres : (const float*)src;
+    int fps = staged ? nr.dw * nr.dh : ps, frs = staged ? nr.dw : rs;
+    void* a[] = { &from, &fps, &frs, &nr.w, &nr.h, &dCur, &nr.pw, &nr.ph, &dps };
+    if (cuLaunchKernel(nr.fPadPlanar, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1,
+                       16, 16, 1, 0, (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
+    { nr.die("padPlanar launch failed"); return false; }
+    return true;
+}
+
+// The offline pass chain on one planar model-size frame (ps / rs strides, nr.w x nr.h), then
+// the quantisation, into dO as tight rgb48le (out16) or rgb24 at the output size nr.dw x nr.dh:
+// nativeOfflineStage (Restore and the resize; skipped in NVIDIA order, which ran it before the
+// model), then RCAS (DLSS 5 already ran on the decoded frame, before the interpolation:
+// nativeOfflineNr). With RTX HDR the SDR result goes through nativeOfflineThdr instead of the
+// quantisation and dO holds x2rgb10le words. A pass that fails is dropped for the rest of the
+// render with a line. false = a launch failed.
+static bool nativeOfflineEmit(NativeRife& nr, const void* src, int ps, int rs, uint8_t* dO, bool out16,
+                              int srcHalf = 0)
+{
+    cudaStream_t st = nr.stream;
+    const int tw = nr.dw, th = nr.dh;
+    bool staged = false;   // nr.dPres holds the output-size frame
+    if (!nr.nvPre && !nativeOfflineStage(nr, src, ps, rs, srcHalf, staged)) return false;
     if (nr.sharpen > 0.0f)
     {
         // RCAS reads a tight dw x dh frame: an unresized, unrestored source is copied in first
-        if (!staged)
+        // (an fp16 one widened by the 1:1 fit)
+        if (!staged && srcHalf)
+        {
+            void* a[] = { (void*)&src, &srcHalf, (void*)&ps, (void*)&rs, (void*)&tw, (void*)&th, &nr.dPres, (void*)&tw, (void*)&th };
+            if (cuLaunchKernel(nr.fFitPlanar, (tw + 15) / 16, (th + 15) / 16, 1,
+                               16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+            { nr.die("sharpen input widen failed"); return false; }
+        }
+        else if (!staged)
             for (int c = 0; c < 3; c++)
-                if (cudaMemcpy2DAsync(nr.dPres + (size_t)c * tw * th, (size_t)tw * 4, src + (size_t)c * ps,
+                if (cudaMemcpy2DAsync(nr.dPres + (size_t)c * tw * th, (size_t)tw * 4, (const float*)src + (size_t)c * ps,
                                       (size_t)rs * 4, (size_t)tw * 4, th, cudaMemcpyDeviceToDevice, st) != cudaSuccess)
                 { nr.die("sharpen input copy failed"); return false; }
         if (nr.rtxHdr)
@@ -6911,17 +7115,17 @@ static bool nativeOfflineEmit(NativeRife& nr, const float* src, int ps, int rs, 
         { nr.die("rcasOutRaw launch failed"); return false; }
         return true;
     }
-    const float* fin = staged ? nr.dPres : src;
-    int fps = staged ? tw * th : ps, frs = staged ? tw : rs;
+    const void* fin = staged ? (const void*)nr.dPres : src;
+    int fps = staged ? tw * th : ps, frs = staged ? tw : rs, fhalf = staged ? 0 : srcHalf;
     if (nr.rtxHdr)
     {
-        void* a[] = { (void*)&fin, &fps, &frs, (void*)&tw, (void*)&th, &nr.dThdrIn, &nr.dSrcG };
+        void* a[] = { (void*)&fin, &fhalf, &fps, &frs, (void*)&tw, (void*)&th, &nr.dThdrIn, &nr.dSrcG };
         if (cuLaunchKernel(nr.fThdrIn, (tw + 15) / 16, (th + 15) / 16, 1,
                            16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
         { nr.die("thdrIn launch failed"); return false; }
         return nativeOfflineThdr(nr, dO);
     }
-    void* a[] = { (void*)&fin, &fps, &frs, (void*)&tw, (void*)&th, &dO };
+    void* a[] = { (void*)&fin, &fhalf, &fps, &frs, (void*)&tw, (void*)&th, &dO };
     if (cuLaunchKernel(out16 ? nr.fPackOutRaw16 : nr.fPackOutRaw8, (tw + 15) / 16, (th + 15) / 16, 1,
                        16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
     { nr.die("packOutRaw (passes) launch failed"); return false; }
@@ -7200,10 +7404,11 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // store. A VSR eval failure demotes the rest of the run to bicubic with one line. A
     // DOWNSCALING fit takes the staging frame too: the antialiased pair lands there and the
     // plain packer stores it 1:1 when no sharpen follows.
-    auto packFrom = [&](const float* src, int ps, int rs, int sw, int sh, uint8_t* slot,
-                        const char* what) -> bool
+    // (half != 0 on any of these = an fp16 source: a tween as the IFNet wrote it)
+    auto packFrom = [&](const void* src, int ps, int rs, int sw, int sh, uint8_t* slot,
+                        const char* what, int half = 0) -> bool
     {
-        void* a[] = { (void*)&src, (void*)&ps, (void*)&rs, &sw, &sh, &slot,
+        void* a[] = { (void*)&src, &half, (void*)&ps, (void*)&rs, &sw, &sh, &slot,
                       (void*)&pitchI, &nr.x0, &nr.y0, &nr.dw, &nr.dh };
         if (cuLaunchKernel(nr.hdr ? nr.fPackOutHdr : nr.fPackOut,
                            (nr.dw + 15) / 16, (nr.dh + 15) / 16, 1,
@@ -7211,17 +7416,17 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         { nr.die(what); return false; }
         return true;
     };
-    auto plainPack = [&](const float* src, uint8_t* slot, const char* what) -> bool
-    { return packFrom(src, (int)plane, nr.pw, nr.w, nr.h, slot, what); };
+    auto plainPack = [&](const void* src, uint8_t* slot, const char* what, int half = 0) -> bool
+    { return packFrom(src, (int)plane, nr.pw, nr.w, nr.h, slot, what, half); };
     // one resize of a planar source (ps / rs / sw x sh) into a planar target tw x th: the
     // antialiased pair through tmp (3, sh, tw) when aa, else sampleOut's bicubic (an
     // enlarging or 1:1 resize, torch's antialias=False path)
-    auto resizePlanar = [&](const float* src, int ps, int rs, int sw, int sh, bool aa,
-                            float* tmp, float* dst, int tw, int th) -> bool
+    auto resizePlanar = [&](const void* src, int ps, int rs, int sw, int sh, bool aa,
+                            float* tmp, float* dst, int tw, int th, int half = 0) -> bool
     {
         if (aa)
         {
-            void* ah[] = { (void*)&src, &ps, &rs, &sw, &sh, &tmp, &tw };
+            void* ah[] = { (void*)&src, &half, &ps, &rs, &sw, &sh, &tmp, &tw };
             if (cuLaunchKernel(nr.fFitAaH, (tw + 15) / 16, (sh + 15) / 16, 1,
                                16, 16, 1, 0, (CUstream)st, ah, nullptr) != CUDA_SUCCESS)
             { nr.die("fitAaH launch failed"); return false; }
@@ -7231,7 +7436,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             { nr.die("fitAaV launch failed"); return false; }
             return true;
         }
-        void* a[] = { (void*)&src, &ps, &rs, &sw, &sh, &dst, &tw, &th };
+        void* a[] = { (void*)&src, &half, &ps, &rs, &sw, &sh, &dst, &tw, &th };
         if (cuLaunchKernel(nr.fFitPlanar, (tw + 15) / 16, (th + 15) / 16, 1,
                            16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
         { nr.die("fitPlanar launch failed"); return false; }
@@ -7240,14 +7445,14 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // live Restore on one model-size planar source, the result folded into dst (tw x th).
     // false = a launch failed (die was called); an engine enqueue refusal drops the pass for
     // the rest of the session instead, the caller then continues with the unrestored source.
-    auto runRestore = [&](const float* s, int ps_, int rs_, float* dst, int tw, int th) -> bool
-    { return nativeRestoreRun(nr, s, ps_, rs_, dst, tw, th); };
-    auto storeSlot = [&](const float* src, uint8_t* slot, const char* what) -> bool
+    auto runRestore = [&](const void* s, int ps_, int rs_, float* dst, int tw, int th, int half = 0) -> bool
+    { return nativeRestoreRun(nr, s, ps_, rs_, dst, tw, th, half); };
+    auto storeSlot = [&](const void* src, uint8_t* slot, const char* what, int half = 0) -> bool
     {
         int ps = (int)plane, rs = nr.pw;
         const bool vsrNow = nr.vsr && !nr.vsrFailed && g_rtxb.created;
         const bool restNow = nr.restore && nr.ctxRest && !nr.restFailed;
-        if (!vsrNow && nr.sharpen <= 0.0f && !nr.fitAa && !nr.uw && !restNow) return plainPack(src, slot, what);
+        if (!vsrNow && nr.sharpen <= 0.0f && !nr.fitAa && !nr.uw && !restNow) return plainPack(src, slot, what, half);
         // Upscale to: the first resize lands in the internal render frame (uw x uh)
         // instead of the staging frame, then the fit takes it to (dw, dh) below
         const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
@@ -7261,18 +7466,18 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         {
             if (vsrNow)
             {
-                if (!runRestore(src, ps, rs, nr.dRest, nr.w, nr.h)) return false;
-                if (!nr.restFailed) { src = nr.dRest; ps = nr.w * nr.h; rs = nr.w; }
+                if (!runRestore(src, ps, rs, nr.dRest, nr.w, nr.h, half)) return false;
+                if (!nr.restFailed) { src = nr.dRest; ps = nr.w * nr.h; rs = nr.w; half = 0; }
             }
             else
             {
-                if (!runRestore(src, ps, rs, stage, tw, th)) return false;
+                if (!runRestore(src, ps, rs, stage, tw, th, half)) return false;
                 staged = !nr.restFailed;
             }
         }
         if (vsrNow)
         {
-            void* a[] = { (void*)&src, (void*)&ps, (void*)&rs, &nr.w, &nr.h, &nr.dVsrIn };
+            void* a[] = { (void*)&src, &half, (void*)&ps, (void*)&rs, &nr.w, &nr.h, &nr.dVsrIn };
             if (cuLaunchKernel(nr.fPackBgra, (nr.w + 15) / 16, (nr.h + 15) / 16, 1,
                                16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             { nr.die("packBgra launch failed"); return false; }
@@ -7294,7 +7499,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 LOG("native: RTX VSR eval failed (rc %u), bicubic for the rest of the run\n", rv);
                 nr.vsrFailed = true;
                 if (nr.sharpen <= 0.0f && !nr.uw)   // VSR = enlarging fit (from the restored frame when on)
-                    return packFrom(src, ps, rs, nr.w, nr.h, slot, what);
+                    return packFrom(src, ps, rs, nr.w, nr.h, slot, what, half);
             }
         }
         if (haveVsr && nr.sharpen <= 0.0f && !nr.uw)
@@ -7316,7 +7521,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             { nr.die("unpackBgra launch failed"); return false; }
         }
         else if (!staged && !resizePlanar(src, ps, rs, nr.w, nr.h, nr.uw ? nr.upAa : nr.fitAa,
-                                          nr.uw ? nr.dUpTmp : nr.dFitTmp, stage, tw, th))
+                                          nr.uw ? nr.dUpTmp : nr.dFitTmp, stage, tw, th, half))
             return false;
         if (nr.uw)
         {
@@ -7377,7 +7582,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             // lagged real frame where python's group holds (a head without enough history)
             bool held = false;
             if (!nativeDrbaTween(nr, fr[i], drHist, held)) { fail = true; break; }
-            if (!storeSlot(held ? drLag : nr.dMerged, slot, "packOut (drba) launch failed")) { fail = true; break; }
+            if (!storeSlot(held ? (const void*)drLag : mergedAt(nr, 0, plane), slot, "packOut (drba) launch failed",
+                           held ? 0 : (int)nr.outHalf)) { fail = true; break; }
             if (!held) twDone++;
         }
         else if (nr.gmfss)
@@ -7447,8 +7653,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 { nr.die("IFNet enqueueV3 returned false (outputs would be garbage)"); fail = true; break; }
             }
             const uint32_t off = twDone - chunkBase;
-            const float* src = nr.dMerged + (size_t)off * 3 * plane;
-            if (!storeSlot(src, slot, "packOut launch failed")) { fail = true; break; }
+            if (!storeSlot(mergedAt(nr, off, plane), slot, "packOut launch failed", (int)nr.outHalf)) { fail = true; break; }
             twDone++;
         }
         cudaEventRecord(nr.slotEv[i], st);
