@@ -838,6 +838,51 @@ __global__ void k_nrOut(const unsigned short* __restrict__ src, int dw, int dh,
     }
 }
 
+// offline DLSS 5 motion (DLSSNR.MVec): the Optical Flow field current -> previous of the NR input
+// frames (px, two w x h planes, k_nvofUp's output) as R16G16_FLOAT texels, rows dstPitch bytes
+// apart. A vector is kept only where it explains its 5x5 window of the current frame better than
+// no motion by more than margin (the summed 8-bit luma error: the previous frame bilinear at the
+// moved position against the same window unmoved, border clamped); an estimated field reports
+// small vectors on still content and grain, and DLSS 5 would pull its history along them. Zero
+// elsewhere: what a still pixel gets from a game engine. The moved tap is the pixel plus the
+// floor and the exact fraction of the vector, never an fp32 absolute coordinate.
+__global__ void k_nrMv(const float* __restrict__ flow, const unsigned char* __restrict__ cur,
+                       const unsigned char* __restrict__ prev, int lumaPitch, int w, int h,
+                       float margin, unsigned int* __restrict__ dst, int dstPitch)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t o = (size_t)y * w + x;
+    const float u = flow[o], v = flow[(size_t)w * h + o];
+    unsigned int out = 0;
+    if (u != 0.0f || v != 0.0f)
+    {
+        const float fu = floorf(u), fv = floorf(v);
+        const int iu = (int)fu, iv = (int)fv;
+        const float lx = u - fu, ly = v - fv;
+        float e0 = 0.0f, e1 = 0.0f;
+        for (int dy = -2; dy <= 2; dy++)
+        {
+            const int yy = min(max(y + dy, 0), h - 1);
+            const size_t r0 = (size_t)min(max(yy + iv, 0), h - 1) * lumaPitch;
+            const size_t r1 = (size_t)min(max(yy + iv + 1, 0), h - 1) * lumaPitch;
+            for (int dx = -2; dx <= 2; dx++)
+            {
+                const int xx = min(max(x + dx, 0), w - 1);
+                const int x0 = min(max(xx + iu, 0), w - 1), x1 = min(max(xx + iu + 1, 0), w - 1);
+                const float c = (float)cur[(size_t)yy * lumaPitch + xx];
+                const float a = (1.0f - lx) * (float)prev[r0 + x0] + lx * (float)prev[r0 + x1];
+                const float b = (1.0f - lx) * (float)prev[r1 + x0] + lx * (float)prev[r1 + x1];
+                e0 += fabsf(c - (float)prev[(size_t)yy * lumaPitch + xx]);
+                e1 += fabsf(c - ((1.0f - ly) * a + ly * b));
+            }
+        }
+        if (e1 + margin < e0) out = (unsigned int)f2h(u) | ((unsigned int)f2h(v) << 16);
+    }
+    dst[(size_t)y * (dstPitch >> 2) + x] = out;
+}
+
 __global__ void k_clamp01(float* __restrict__ p, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2727,6 +2772,20 @@ struct NativeRife
     cudaExternalMemory_t emNrIn = nullptr, emNrOut = nullptr;
     cudaExternalSemaphore_t semNr = nullptr;   // the core's shared fence
     uint64_t nrFenceV = 0;           // last value put on it: odd = the stream's, even = the queue's
+    // DLSS 5 motion (zero-copy route, nativeNrMotion): its own Optical Flow session at nrW x nrH on
+    // the NR input frames, current -> previous, into the core's shared motion buffer (DLSSNR.MVec).
+    // Off = SMV_NR_MV=0 or CPU staging: the pass then gets no motion
+    bool nrMotion = false;
+    NvOFHandle nrOfH = nullptr;
+    NvOFGPUBufferHandle nrOfIn[2] = {}, nrOfOut = nullptr, nrOfCost = nullptr;
+    CUdeviceptr nrOfInP[2] = {}, nrOfOutP = 0, nrOfCostP = 0;
+    uint32_t nrOfInPitch = 0, nrOfOutPitch = 0, nrOfCostPitch = 0;
+    int nrOfGw = 0, nrOfGh = 0;
+    int nrOfCur = 0;                 // the input slot this frame's luma goes into (they alternate)
+    float* dNrFlow = nullptr;        // (3, nrH, nrW): the field in px (2 planes) + its cost
+    uint8_t* dNrShMv = nullptr;      // the core's shared motion buffer, rows nrMvPitch bytes apart
+    size_t nrMvPitch = 0;
+    cudaExternalMemory_t emNrMv = nullptr;
     std::wstring nrDeltaPath;        // --nr-delta PATH: the pass's change map (the preview's mask)
     double nrMs = 0.0, nrMaxMs = 0.0;
     uint64_t nrN = 0;
@@ -2768,7 +2827,7 @@ struct NativeRife
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr,   // live Restore
                fRestToF = nullptr, fClamp01 = nullptr;
     CUfunction fPadPlanar = nullptr;                                    // NVIDIA order's model frame
-    CUfunction fNrIn = nullptr, fNrOut = nullptr;                       // offline DLSS 5
+    CUfunction fNrIn = nullptr, fNrOut = nullptr, fNrMv = nullptr;      // offline DLSS 5
     CUfunction fHalf = nullptr, fPyr = nullptr, fSplatSoft = nullptr,   // live GMFSS glue (5b)
                fSplatNorm = nullptr;
     CUfunction fPackInRaw16 = nullptr, fPackInRaw8 = nullptr,           // offline
@@ -4447,7 +4506,7 @@ static bool nativeBindKernels(NativeRife& nr)
         { &nr.fFitAaH, "k_fitAaH" }, { &nr.fFitAaV, "k_fitAaV" },
         { &nr.fRestIn, "k_restIn" }, { &nr.fRestFoldH, "k_restFoldH" }, { &nr.fRestFoldV, "k_restFoldV" },
         { &nr.fRestToF, "k_restToF" }, { &nr.fClamp01, "k_clamp01" }, { &nr.fPadPlanar, "k_padPlanar" },
-        { &nr.fNrIn, "k_nrIn" }, { &nr.fNrOut, "k_nrOut" },
+        { &nr.fNrIn, "k_nrIn" }, { &nr.fNrOut, "k_nrOut" }, { &nr.fNrMv, "k_nrMv" },
         { &nr.fHalf, "k_half" }, { &nr.fPyr, "k_pyr" },
         { &nr.fSplatSoft, "k_splatSoft" }, { &nr.fSplatNorm, "k_splatNorm" },
         { &nr.fPackInRaw16, "k_packInRaw16" }, { &nr.fPackInRaw8, "k_packInRaw8" },
@@ -4866,16 +4925,16 @@ static bool nativeNvofLoad()
     return true;
 }
 
-static bool nativeNvofBuf(NativeRife& nr, uint32_t w, uint32_t h, NV_OF_BUFFER_USAGE usage,
-                          NV_OF_BUFFER_FORMAT fmt, NvOFGPUBufferHandle& hb, CUdeviceptr& ptr,
-                          uint32_t& pitch, const char* what)
+static bool nativeNvofBufOn(NvOFHandle ofh, uint32_t w, uint32_t h, NV_OF_BUFFER_USAGE usage,
+                            NV_OF_BUFFER_FORMAT fmt, NvOFGPUBufferHandle& hb, CUdeviceptr& ptr,
+                            uint32_t& pitch, const char* what)
 {
     NV_OF_BUFFER_DESCRIPTOR d{};
     d.width = w;
     d.height = h;
     d.bufferUsage = usage;
     d.bufferFormat = fmt;
-    NV_OF_STATUS s = g_nvofApi.nvOFCreateGPUBufferCuda(nr.ofH, &d, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &hb);
+    NV_OF_STATUS s = g_nvofApi.nvOFCreateGPUBufferCuda(ofh, &d, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &hb);
     if (s != NV_OF_SUCCESS) { LOG("native: nvof: %s buffer creation failed (status %d)\n", what, (int)s); return false; }
     ptr = g_nvofApi.nvOFGPUBufferGetCUdeviceptr(hb);
     NV_OF_CUDA_BUFFER_STRIDE_INFO si{};
@@ -4883,6 +4942,12 @@ static bool nativeNvofBuf(NativeRife& nr, uint32_t w, uint32_t h, NV_OF_BUFFER_U
     if (s != NV_OF_SUCCESS || !ptr) { LOG("native: nvof: %s buffer stride query failed (status %d)\n", what, (int)s); return false; }
     pitch = si.strideInfo[0].strideXInBytes;
     return true;
+}
+static bool nativeNvofBuf(NativeRife& nr, uint32_t w, uint32_t h, NV_OF_BUFFER_USAGE usage,
+                          NV_OF_BUFFER_FORMAT fmt, NvOFGPUBufferHandle& hb, CUdeviceptr& ptr,
+                          uint32_t& pitch, const char* what)
+{
+    return nativeNvofBufOn(nr.ofH, w, h, usage, fmt, hb, ptr, pitch, what);
 }
 
 // the session and the glue buffers; the calling thread has the device bound
@@ -6810,9 +6875,11 @@ static void nativeNrReleaseImports(NativeRife& nr)
 {
     if (nr.dNrShIn) { cudaFree(nr.dNrShIn); nr.dNrShIn = nullptr; }
     if (nr.dNrShOut) { cudaFree(nr.dNrShOut); nr.dNrShOut = nullptr; }
+    if (nr.dNrShMv) { cudaFree(nr.dNrShMv); nr.dNrShMv = nullptr; }
     if (nr.semNr) { cudaDestroyExternalSemaphore(nr.semNr); nr.semNr = nullptr; }
     if (nr.emNrIn) { cudaDestroyExternalMemory(nr.emNrIn); nr.emNrIn = nullptr; }
     if (nr.emNrOut) { cudaDestroyExternalMemory(nr.emNrOut); nr.emNrOut = nullptr; }
+    if (nr.emNrMv) { cudaDestroyExternalMemory(nr.emNrMv); nr.emNrMv = nullptr; }
 }
 
 // Zero-copy offline DLSS 5: import the NR core's shared buffers and fence (nr::Host::startShared)
@@ -6846,6 +6913,122 @@ static bool nativeNrImport(NativeRife& nr, nr::Host& host, std::string& err)
     sd.handle.win32.handle = host.sharedFenceHandle();
     if (cudaImportExternalSemaphore(&nr.semNr, &sd) != cudaSuccess) { err = "fence import failed"; return false; }
     nr.nrPitch = (size_t)host.rowPitch();
+    if (host.sharedMvHandle())
+    {
+        md.size = host.sharedMvBytes();
+        md.handle.win32.handle = host.sharedMvHandle();
+        bd.size = host.sharedMvBytes();
+        if (cudaImportExternalMemory(&nr.emNrMv, &md) != cudaSuccess
+            || cudaExternalMemoryGetMappedBuffer((void**)&nr.dNrShMv, nr.emNrMv, &bd) != cudaSuccess)
+        { err = "motion buffer import failed"; return false; }
+        nr.nrMvPitch = (size_t)host.mvRowPitch();
+    }
+    return true;
+}
+
+// DLSS 5 motion, set up once the shared buffers are imported: an Optical Flow session at the NR
+// size (forward only: the current frame is the input, the previous one the reference), its two
+// luma slots, the field and cost buffers, and the upsampled field. false = no motion for this
+// render (the caller says why and frees what was made).
+static bool nativeNrMotionSetup(NativeRife& nr, std::string& err)
+{
+    const int w = nr.nrW, h = nr.nrH;
+    if (!nr.dNrShMv) { err = "the core shares no motion buffer"; return false; }
+    if (!nativeNvofLoad()) { err = "the Optical Flow runtime is unavailable"; return false; }
+    if (w < 32 || h < 32) { err = "below the Optical Flow minimum 32x32"; return false; }
+    CUcontext ctx = nullptr;
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || !ctx) { err = "no current CUDA context"; return false; }
+    if (g_nvofApi.nvCreateOpticalFlowCuda(ctx, &nr.nrOfH) != NV_OF_SUCCESS)
+    { nr.nrOfH = nullptr; err = "nvCreateOpticalFlowCuda failed"; return false; }
+    NV_OF_INIT_PARAMS ip{};
+    ip.width = (uint32_t)w;
+    ip.height = (uint32_t)h;
+    ip.outGridSize = (NV_OF_OUTPUT_VECTOR_GRID_SIZE)kNvofGrid;
+    ip.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
+    ip.mode = NV_OF_MODE_OPTICALFLOW;
+    ip.perfLevel = NV_OF_PERF_LEVEL_FAST;
+    ip.enableExternalHints = NV_OF_FALSE;
+    ip.enableOutputCost = NV_OF_TRUE;
+    ip.disparityRange = NV_OF_STEREO_DISPARITY_RANGE_UNDEFINED;
+    ip.enableRoi = NV_OF_FALSE;
+    ip.predDirection = NV_OF_PRED_DIRECTION_FORWARD;
+    ip.enableGlobalFlow = NV_OF_FALSE;
+    ip.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
+    if (g_nvofApi.nvOFInit(nr.nrOfH, &ip) != NV_OF_SUCCESS) { err = "nvOFInit refused the NR size"; return false; }
+    nr.nrOfGw = (w + kNvofGrid - 1) / kNvofGrid;
+    nr.nrOfGh = (h + kNvofGrid - 1) / kNvofGrid;
+    uint32_t p1 = 0;
+    if (!nativeNvofBufOn(nr.nrOfH, w, h, NV_OF_BUFFER_USAGE_INPUT, NV_OF_BUFFER_FORMAT_GRAYSCALE8,
+                         nr.nrOfIn[0], nr.nrOfInP[0], nr.nrOfInPitch, "dlss5 input")
+        || !nativeNvofBufOn(nr.nrOfH, w, h, NV_OF_BUFFER_USAGE_INPUT, NV_OF_BUFFER_FORMAT_GRAYSCALE8,
+                            nr.nrOfIn[1], nr.nrOfInP[1], p1, "dlss5 input")
+        || !nativeNvofBufOn(nr.nrOfH, nr.nrOfGw, nr.nrOfGh, NV_OF_BUFFER_USAGE_OUTPUT, NV_OF_BUFFER_FORMAT_SHORT2,
+                            nr.nrOfOut, nr.nrOfOutP, nr.nrOfOutPitch, "dlss5 flow")
+        || !nativeNvofBufOn(nr.nrOfH, nr.nrOfGw, nr.nrOfGh, NV_OF_BUFFER_USAGE_COST, NV_OF_BUFFER_FORMAT_UINT8,
+                            nr.nrOfCost, nr.nrOfCostP, nr.nrOfCostPitch, "dlss5 cost"))
+    { err = "Optical Flow buffer creation failed"; return false; }
+    if (p1 != nr.nrOfInPitch) { err = "the two luma slots differ in pitch"; return false; }
+    if (g_nvofApi.nvOFSetIOCudaStreams(nr.nrOfH, (CUstream)nr.stream, (CUstream)nr.stream) != NV_OF_SUCCESS)
+    { err = "nvOFSetIOCudaStreams failed"; return false; }
+    if (cudaMalloc((void**)&nr.dNrFlow, 3 * (size_t)w * h * sizeof(float)) != cudaSuccess)
+    { nr.dNrFlow = nullptr; err = "motion field allocation failed"; return false; }
+    nr.nrOfCur = 0;
+    nr.nrMotion = true;
+    return true;
+}
+
+// Everything nativeNrMotionSetup made; the caller has drained the stream.
+static void nativeNrMotionFree(NativeRife& nr)
+{
+    for (NvOFGPUBufferHandle* b : { &nr.nrOfIn[0], &nr.nrOfIn[1], &nr.nrOfOut, &nr.nrOfCost })
+        if (*b) { g_nvofApi.nvOFDestroyGPUBufferCuda(*b); *b = nullptr; }
+    if (nr.nrOfH) { g_nvofApi.nvOFDestroy(nr.nrOfH); nr.nrOfH = nullptr; }
+    if (nr.dNrFlow) { cudaFree(nr.dNrFlow); nr.dNrFlow = nullptr; }
+    nr.nrMotion = false;
+}
+
+// the motion field of one frame for DLSS 5 (zero-copy route, before the input fence): the frame's
+// BT.709 luma into this frame's slot; from the second frame on NVOFA current -> previous, upsampled
+// (k_nvofUp) and validated (k_nrMv) into the core's shared motion buffer; the stream's first frame
+// (a Reset) gets a zero field. The slots alternate, so the previous frame's luma stays in place.
+static const float kNrMvMargin = 25.0f;   // one 8-bit level per pixel of the 5x5 window (k_nrMv)
+static bool nativeNrMotion(NativeRife& nr, const float* frame, int pw, int ps)
+{
+    cudaStream_t st = nr.stream;
+    int w = nr.nrW, h = nr.nrH;
+    const int cur = nr.nrOfCur, prev = cur ^ 1;
+    nr.nrOfCur = prev;
+    int nps = ps, lpitch = (int)nr.nrOfInPitch;
+    CUdeviceptr lc = nr.nrOfInP[cur], lp = nr.nrOfInP[prev];
+    void* a[] = { (void*)&frame, &nps, &pw, &w, &h, &lc, &lpitch };   // offline planes are (R, G, B)
+    if (cuLaunchKernel(nr.fNvofLuma, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+    { nr.die("DLSS 5 motion: luma launch failed"); return false; }
+    if (nr.nrFirst || nr.nrResetEvery)
+    {
+        if (cudaMemset2DAsync(nr.dNrShMv, nr.nrMvPitch, 0, (size_t)w * 4, h, st) != cudaSuccess)
+        { nr.die("DLSS 5 motion: clear failed"); return false; }
+        return true;
+    }
+    NV_OF_EXECUTE_INPUT_PARAMS ei{};
+    ei.inputFrame = nr.nrOfIn[cur];        // the forward field of the current frame points into
+    ei.referenceFrame = nr.nrOfIn[prev];   // the previous one: current -> previous, as DLSS 5 reads it
+    ei.disableTemporalHints = NV_OF_TRUE;
+    NV_OF_EXECUTE_OUTPUT_PARAMS eo{};
+    eo.outputBuffer = nr.nrOfOut;
+    eo.outputCostBuffer = nr.nrOfCost;
+    const NV_OF_STATUS s = g_nvofApi.nvOFExecute(nr.nrOfH, &ei, &eo);
+    if (s != NV_OF_SUCCESS)
+    { LOG("native: DLSS 5 motion: nvOFExecute failed (status %d)\n", (int)s); nr.die("DLSS 5 motion: execute failed"); return false; }
+    int grid = kNvofGrid, vp = (int)nr.nrOfOutPitch, cp = (int)nr.nrOfCostPitch, mp = (int)nr.nrMvPitch;
+    CUdeviceptr v = nr.nrOfOutP, c = nr.nrOfCostP;
+    float* flow = nr.dNrFlow;
+    float* cost = nr.dNrFlow + 2 * (size_t)w * h;
+    float margin = kNrMvMargin;
+    void* b[] = { &v, &vp, &c, &cp, &nr.nrOfGw, &nr.nrOfGh, &grid, &w, &h, &flow, &cost };
+    void* m[] = { &flow, &lc, &lp, &lpitch, &w, &h, &margin, &nr.dNrShMv, &mp };
+    if (cuLaunchKernel(nr.fNvofUp, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS
+        || cuLaunchKernel(nr.fNrMv, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, m, nullptr) != CUDA_SUCCESS)
+    { nr.die("DLSS 5 motion: field launch failed"); return false; }
     return true;
 }
 
@@ -6873,6 +7056,7 @@ static bool nativeOfflineNr(NativeRife& nr, float* frame, int pw, int ph, int ps
     if (nr.nrZeroCopy)
     {
         const size_t row = (size_t)tw * 8;
+        if (nr.nrMotion && !nativeNrMotion(nr, frame, pw, ps)) return false;
         cudaExternalSemaphoreSignalParams sp{};
         sp.params.fence.value = ++nr.nrFenceV;
         if (cuLaunchKernel(nr.fNrIn, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS

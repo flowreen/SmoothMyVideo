@@ -37,6 +37,7 @@ export interface PreviewArgs {
   nr_structure: number;
   nr_tone: number;
   nr_style: number;
+  nr_passes: number;
   nr_mask: boolean;
   hdr_color: string;
   hdr_vibrance: number;
@@ -61,6 +62,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     nr_structure: 1,
     nr_tone: 1,
     nr_style: 1,
+    nr_passes: 1,
     nr_mask: false,
     hdr_color: 'vivid',
     hdr_vibrance: 0,
@@ -93,6 +95,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
   };
   const ints: Record<string, keyof PreviewArgs> = {
     '--nr-style': 'nr_style',
+    '--nr-passes': 'nr_passes',
     '--hdr-saturation': 'hdr_saturation',
     '--hdr-contrast': 'hdr_contrast',
   };
@@ -120,6 +123,8 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
   if (!a.out) throw new Error('the following arguments are required: --out');
   if (![0, 1, 2].includes(a.nr_style))
     throw new Error(`argument --nr-style: invalid choice: ${a.nr_style} (choose from 0, 1, 2)`);
+  if (!(a.nr_passes >= 1 && a.nr_passes <= 10))
+    throw new Error(`argument --nr-passes: invalid choice: ${a.nr_passes} (choose from 1 to 10)`);
   if (!['vivid', 'rtx', 'raw'].includes(a.hdr_color)) {
     throw new Error(`argument --hdr-color: invalid choice: '${a.hdr_color}' (choose from 'vivid', 'rtx', 'raw')`);
   }
@@ -628,6 +633,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         '--nr-style',
         String(a.nr_style),
       );
+      if (a.nr_passes > 1) args.push('--nr-passes', String(a.nr_passes));
       if (a.nr_mask) {
         try {
           fs.unlinkSync(deltaFile);

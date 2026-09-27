@@ -233,6 +233,12 @@
         <span class="defmark"><input id="nrtone" type="range" min="0" max="2" step="0.05" value="1"
                style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="nrtonenum">1.00</span>
+        <span class="hint" style="margin-left:6px"
+              title="DLSS 5 runs this many times on every frame, each pass on the previous pass's result and with its own history (NVIDIA's network chained). More passes strengthen the effect and cost that many times the DLSS 5 time and video memory.">Passes</span>
+        <span class="defmark" style="--def:8px"><input id="nrpasses" type="range" min="1" max="10" step="1" value="1"
+               title="DLSS 5 runs this many times on every frame, each pass on the previous pass's result and with its own history (NVIDIA's network chained). More passes strengthen the effect and cost that many times the DLSS 5 time and video memory."
+               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
+        <span class="v" id="nrpassesnum">1</span>
         <label class="hint vonly" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:6px"
                title="Preview only: the Processed pane shows where the DLSS 5 pass changed pixels (bright = big change, dark = untouched) instead of the picture. The rendered video is not affected.">
           <input type="checkbox" id="nrmask" style="width:auto;padding:0;accent-color:var(--green);">

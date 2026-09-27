@@ -584,9 +584,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             {
                 g_liveNr = &liveNr;
                 g_nrNative = true;
-                LOG("live DLSS 5 native: on, %ux%u per captured frame inside the overlay host, structure %.2f tone %.2f style %d, %s\n",
-                    capW, capH, g_nrStructure, g_nrTone, g_nrStyle,
+                LOG("live DLSS 5 native: on, %ux%u per captured frame inside the overlay host, structure %.2f tone %.2f style %d, passes %d, %s\n",
+                    capW, capH, g_nrStructure, g_nrTone, g_nrStyle, liveNr.host.passes(),
                     g_hdr ? "SDR range of the window (HDR highlights untouched)" : "SDR window");
+                const int nrWant = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
+                if (liveNr.host.passes() < nrWant)
+                    LOG("live DLSS 5 native: %d of %d passes (%s)\n", liveNr.host.passes(), nrWant,
+                        liveNr.host.passNote().c_str());
                 if (g_hdr) LOG("live DLSS 5 native: SDR reference white %.0f nits\n", g_sdrWhite);
             }
             else

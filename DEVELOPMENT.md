@@ -475,8 +475,8 @@ LIVE RUNS THE PASS NON-TEMPORALLY (2026-09-14): Reset is sent on EVERY evaluate,
 (`const bool reset = true` in `smv-live-capture.inl`) and python route alike (`dlssnr.DLSSNR(...,
 reset_every=True)`, which adds the host flag `--reset-every`; the host logs `resetEvery=1`). The
 feature reprojects its temporal history with motion vectors, depth and a per-frame jitter offset,
-and the host binds NONE of them ("MVec, Depth and ControlMask are deliberately not set" in
-`nr_host.cpp`), so kept history has nothing valid to reproject by and identical captured frames
+and the live route binds NONE of them (`nr::Settings::motion` is off there; only the offline
+zero-copy route feeds `MVec`), so kept history has nothing valid to reproject by and identical captured frames
 came back out different: on a PAUSED 2560x1440 mpv window, 14 of 58 presented frames differed from
 the one before, 95.6% of the pixels moved between two of them, and the dark areas swung 0.83% of
 their mean, which reads on screen as the dark parts sliding back and forth. With reset on every
@@ -642,6 +642,19 @@ fence, the host imports them into CUDA (same adapter LUID required), the stream 
 buffer and signals an odd fence value, the NR queue waits for it on the GPU, copies, evaluates,
 writes the output buffer and signals the next even value, and the stream waits for that before it
 reads the result (`submitShared`: no CPU wait, no host copy, two command lists in flight).
+Motion vectors and the auto mask (2026-09-27): the runtime is conditioned on current -> previous
+motion and every reference host feeds it (NeuralScreen, 2600th's player, OptiScaler), so on the
+zero-copy route the host runs its own Optical Flow session at the NR size on the NR input frames
+(forward, grid 4, the current frame as input and the previous one as reference), upsamples the
+field (`k_nvofUp`) and keeps a vector only where it explains its 5x5 window better than no motion
+by one 8-bit level per pixel (`k_nrMv`: zero on still content and grain, what a game gives a
+still pixel), then writes it as `R16G16_FLOAT` pixels into a third shared buffer that the core
+copies into `DLSSNR.MVec` (bound at create, `MVecScale` 1) before each evaluate; the first frame
+(the Reset) gets zeros. History is never reset at scene cuts (the detectors fire on grain and fast
+action: NeuralScreen's reset 42 of 120 frames of a fast anime clip). `DLSSNR.UseAutoMask` is 1, as
+in every reference host. Proof of the contract: this core handed NeuralScreen's own motion fields
+and resets reproduces NeuralScreen within 1 code (harness p51). CPU staging passes no motion (the
+ready line says `no motion vectors`); `SMV_NR_MV=0` / `SMV_NR_AUTOMASK=0` turn either off.
 `SMV_NR_STAGED=1` and the preview's `--nr-delta` (it needs the host copies) keep `renderFrame`
 through its upload / readback staging; a handoff that cannot start falls back to it with an
 `offline: DLSS 5 zero-copy handoff unavailable` line (no `[dlss5]` tag: the pass still runs). The
@@ -1021,6 +1034,8 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NR_NOHOOK=1`, `SMV_NR_SPOOF=<name>`, `SMV_NR_HOOKLOG=1` | DLSS 5 caller hook off / spoofed name / trace |
 | `SMV_NR_RESET_EVERY=1` | the offline native host's DLSS 5 resets its history on every frame (the live behaviour), for the route gate; never a product setting |
 | `SMV_NR_STAGED=1` | the offline native host's DLSS 5 hands its frames over through CPU staging (`renderFrame`) instead of the zero-copy shared buffers; the route A/B and the fallback's trigger test, never a product setting |
+| `SMV_NR_MV=0` | the offline native host's DLSS 5 gets no motion vectors (the pre-2026-09-27 pass); a measurement lever, never a product setting |
+| `SMV_NR_AUTOMASK=0` | DLSS 5 runs with `DLSSNR.UseAutoMask` 0 (both routes, read by the NR core); a measurement lever, never a product setting |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..4, default 3 offline, 2 live) |
@@ -1226,9 +1241,11 @@ purged on a driver update and a name-order scan once loaded a stale core under a
 driver.
 
 Runtime notes: transport is raw `R16G16B16A16_FLOAT`, one frame in, one out, strictly in order.
-`DLSSNR.Reset` is 1 on the first frame only (the runtime keeps temporal history). MVec, Depth and
-ControlMask are not set. Fixed internally: `Style` 1, `Hint.Render.Preset` 3, `Intensity` 1.0,
-`SkinStructureStrength` off; only structure and tone are user facing. One NGX user per process,
+`DLSSNR.Reset` is 1 on the first frame only (the runtime keeps temporal history). `MVec` is the
+offline zero-copy route's Optical Flow field (`Settings::motion`, the offline DLSS 5 paragraph
+above); Depth and ControlMask are not set. Fixed internally: `Hint.Render.Preset` 3, `Intensity`
+1.0, `UseAutoMask` 1, `SkinStructureStrength` -1 (the model's own default); style, structure and
+tone are user facing. One NGX user per process,
 so this host never shares a process with the RTX Video NGX session. The NGX core writes its own
 log beside the runtime (`engine/dlssnr/*.log`, gitignored).
 

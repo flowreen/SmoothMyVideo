@@ -37,7 +37,17 @@ struct Settings
     float intensity = 1.0f;   // DLSSNR.Intensity, 0..2
     int   style     = 1;      // DLSSNR.Style, 0 default / 1 natural / 2 cinematic
     int   preset    = 3;      // DLSSNR.Hint.Render.Preset, 0..3
+    int   automask  = 1;      // DLSSNR.UseAutoMask, as every reference host sets it (SMV_NR_AUTOMASK=0 = off)
+    // DLSSNR.MVec: a per-frame R16G16_FLOAT motion field (current -> previous, px) that the caller
+    // writes into the shared motion buffer (startShared); without it the runtime gets no motion
+    bool  motion    = false;
+    // the pass run 1..kMaxPasses times in a chain on every frame: pass k's output is pass k + 1's
+    // input, each pass its OWN feature and history (one feature called twice a frame would see two
+    // evaluations with no motion between them), all fed the same motion field
+    int   passes    = 1;
 };
+
+const int kMaxPasses = 10;
 
 // Probe knobs. The snippet validates its caller and the exact rule is
 // unknown, so every plausible route is reachable without a rebuild.
@@ -109,6 +119,11 @@ public:
     HANDLE sharedFenceHandle() const { return m_shFenceH; }
     uint64_t sharedBytes() const { return m_shBytes; }
     uint64_t rowPitch() const { return m_rowPitch; }
+    // Settings::motion: a third shared buffer, the motion field in the MVec texture's copy
+    // footprint (mvRowPitch() bytes per row, R16G16_FLOAT), copied into MVec before each evaluate
+    HANDLE sharedMvHandle() const { return m_shMvH; }
+    uint64_t sharedMvBytes() const { return m_shMvBytes; }
+    uint64_t mvRowPitch() const { return m_mvPitch; }
     LUID adapterLuid() const;
 
     // One frame through the shared buffers: the queue waits until the fence reaches waitValue
@@ -117,6 +132,11 @@ public:
     // waiting for the GPU; a command allocator still in flight is waited for, so at most
     // kSharedLists frames are queued.
     bool submitShared(bool reset, uint64_t waitValue, uint64_t signalValue, std::string& err);
+
+    // The passes actually built (Settings::passes, fewer when a later feature could not be created:
+    // passNote() says why).
+    int passes() const { return m_passes; }
+    const std::string& passNote() const { return m_passNote; }
 
     // Last NGX result seen, for the probe table.
     NVSDK_NGX_Result lastResult() const { return m_last; }
@@ -168,23 +188,32 @@ private:
     CP<ID3D12Resource> m_upload;   // CPU write, linear
     CP<ID3D12Resource> m_readback; // CPU read, linear
     uint64_t m_rowPitch = 0;       // aligned row pitch of the staging buffers
+    CP<ID3D12Resource> m_mv;       // Settings::motion: R16G16_FLOAT, NON_PIXEL_SHADER_RESOURCE (DLSSNR.MVec)
+    uint64_t m_mvPitch = 0;        // its copy footprint row pitch
 
     static const int kSharedLists = 2;
     CP<ID3D12Resource> m_shIn;     // shared input buffer, COMMON between lists
     CP<ID3D12Resource> m_shOut;    // shared output buffer, COMMON between lists
     CP<ID3D12Fence>    m_shFence;  // shared with the caller's CUDA stream
-    HANDLE   m_shInH = nullptr, m_shOutH = nullptr, m_shFenceH = nullptr;
-    uint64_t m_shBytes = 0;
+    CP<ID3D12Resource> m_shMv;     // Settings::motion: the shared motion buffer, COMMON between lists
+    HANDLE   m_shInH = nullptr, m_shOutH = nullptr, m_shFenceH = nullptr, m_shMvH = nullptr;
+    uint64_t m_shBytes = 0, m_shMvBytes = 0;
     CP<ID3D12CommandAllocator>    m_shAlloc[kSharedLists];
     CP<ID3D12GraphicsCommandList> m_shList[kSharedLists];
     uint64_t m_shDone[kSharedLists] = {};   // fence value that frees each allocator
     int      m_shNext = 0;
     void closeSharedHandles();
 
-    NVSDK_NGX_Parameter* m_params = nullptr;
-    NVSDK_NGX_Handle*    m_feature = nullptr;
+    NVSDK_NGX_Parameter* m_params = nullptr;   // pass 0 (m_pparams[0])
+    NVSDK_NGX_Handle*    m_feature = nullptr;  // pass 0 (m_pfeature[0])
+    NVSDK_NGX_Parameter* m_pparams[kMaxPasses] = {};
+    NVSDK_NGX_Handle*    m_pfeature[kMaxPasses] = {};
+    CP<ID3D12Resource>   m_passOut[kMaxPasses - 1];   // pass k's output = pass k + 1's input (UAV between frames)
+    int m_passes = 1;
+    std::string m_passNote;
     NVSDK_NGX_Result     m_last = NVSDK_NGX_Result_Success;
     bool m_ngxUp = false;
+    void setPassParams(int k, int last);   // the create-time keys of pass k (of 0..last) on m_pparams[k]
 };
 
 // Folder holding nvngx_dlssnr.dll, the caller shim nvngx.dll and the NGX log (the data path).

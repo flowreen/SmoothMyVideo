@@ -620,6 +620,7 @@ function nrOn(){ return $('dlssnr').checked && !!dlssnrReady.ready; }
 function nrStructure(){ return parseFloat($('nrstructure').value) || 0; }
 function nrTone(){ return parseFloat($('nrtone').value) || 0; }
 function nrStyle(){ const b = $('nrstyleseg').querySelector('button.on'); return b ? parseInt(b.dataset.style, 10) : 1; }   // DLSSNR.Style 0/1/2
+function nrPasses(){ const v = parseInt($('nrpasses').value, 10); return v >= 1 && v <= 10 ? v : 1; }   // DLSS 5 chained 1..10 times per frame
 function nrMaskOn(){ return nrOn() && $('nrmask').checked; }   // preview-only heat map of the DLSS 5 change
 function syncDlssnr(){
   const on = $('dlssnr').checked;
@@ -706,6 +707,11 @@ for(const [id, key] of [['nrstructure', 'nrStructure'], ['nrtone', 'nrTone']]){
 $('nrstyleseg').onclick = e => { const b = e.target.closest('button'); if(!b || b.disabled) return;
   for(const x of $('nrstyleseg').querySelectorAll('button')) x.classList.toggle('on', x === b);
   localStorage.setItem('nrStyle', b.dataset.style); refreshPreviewIfOpen(); try{ lvSendOpts(); }catch{} };
+{ const saved = localStorage.getItem('nrPasses');   // Passes slider 1..10: persisted, default 1
+  if(saved !== null && +saved >= 1 && +saved <= 10) $('nrpasses').value = saved;
+  $('nrpassesnum').textContent = $('nrpasses').value; }
+$('nrpasses').oninput = () => { localStorage.setItem('nrPasses', $('nrpasses').value); $('nrpassesnum').textContent = $('nrpasses').value; };
+$('nrpasses').addEventListener('change', () => { refreshPreviewIfOpen(); try{ lvSendOpts(); }catch{} });
 if(localStorage.getItem('nrMask') === '1') $('nrmask').checked = true;   // default OFF
 $('nrmask').onchange = () => { localStorage.setItem('nrMask', $('nrmask').checked ? '1' : '0'); refreshPreviewIfOpen(); };
 syncDlssnr();
@@ -934,7 +940,7 @@ function lvSendOpts(){
     // Restore (AI detail): Real-ESRGAN first on every presented frame, python route only
     restore: restoreOn(),
     // NVIDIA DLSS 5: Neural Rendering once per captured frame (runtime installed), python route
-    dlssnr: nrOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(),
+    dlssnr: nrOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses(),
     // live TrueHDR (SDR window -> HDR out) + the RTX HDR tone/colour knobs it inherits
     rtxhdr: liveHdrOn(),
     hdrcolor: hp.color,
@@ -1355,7 +1361,7 @@ let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown 
 function prevSettingsSig(){                 // everything that changes what the processed pane shows
   const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
   return [sharpStrength(), restoreOn(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
-          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), nrOn(), nrStructure(), nrTone(), nrStyle(), nrMaskOn(),
+          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), nrOn(), nrStructure(), nrTone(), nrStyle(), nrPasses(), nrMaskOn(),
           nvOrderOn()];
 }
 let lastPrevInput = null;                    // which video the shown original belongs to
@@ -1390,7 +1396,7 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
     { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr: useHdr,
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
       upscale: upFactor() || 0,
-      rtxvsr: useVsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(),
+      rtxvsr: useVsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses(),
       nvorder: nvOrderOn() }, hdrColorPayload())); }
   catch(e){ r = { error: String(e) }; }
   setSpin($('prevprocwrap'), $('prevspin'), false);
@@ -1718,7 +1724,7 @@ function startRun(){
     log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
   }
   modeBtnUi(true);
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('nvorder').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('nvorder').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push(factor < 1 ? 'downscaling' : 'upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -1745,7 +1751,7 @@ function startRun(){
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
   if(nvOrderOn()) payload.nvorder = true;   // NVIDIA order: Restore and the upscale before DLSS 5 and the model
-  if(nrOn()){ payload.dlssnr = true; payload.nrstructure = nrStructure(); payload.nrtone = nrTone(); payload.nrstyle = nrStyle(); }   // DLSS 5 (runtime installed)
+  if(nrOn()){ payload.dlssnr = true; payload.nrstructure = nrStructure(); payload.nrtone = nrTone(); payload.nrstyle = nrStyle(); payload.nrpasses = nrPasses(); }   // DLSS 5 (runtime installed)
   payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)
   if(factor > 0){
     payload.upscale = factor;                          // arbitrary upscale factor (target height / source)
@@ -1903,7 +1909,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
   clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
   modeBtnUi(lvState !== 'idle');
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('nvorder').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('nvorder').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
     if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');

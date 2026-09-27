@@ -773,6 +773,7 @@ let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inhe
 let liveNrStructure = 1; // DLSS 5 Structure Intensity 0..2
 let liveNrTone = 1; // DLSS 5 Tone Intensity 0..2
 let liveNrStyle = 1; // DLSS 5 Style: 0 Default, 1 Natural, 2 Cinematic
+let liveNrPasses = 1; // DLSS 5 passes, 1..10 (chained per frame)
 let liveRtxHdr = false; // live TrueHDR, inherited from the RTX HDR checkbox
 let liveHdrColor = 'vivid'; // RTX HDR colour mode + tone knobs, inherited from the HDR sliders
 let liveHdrSat = 0; // SDK Saturation (drives the rtx colour mode)
@@ -927,6 +928,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
         '--nr-style',
         String(liveNrStyle),
       );
+    if (liveDlssnr && liveNrPasses > 1) args.push('--nr-passes', String(liveNrPasses));
     // live TrueHDR: SDR window expanded to HDR out, inherited from the RTX HDR
     // controls; the exe forwards these to the server only when its HDR live mode is on
     if (liveRtxHdr) {
@@ -1122,6 +1124,7 @@ ipcMain.on(
       nrstructure?: number;
       nrtone?: number;
       nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
+      nrpasses?: number; // DLSS 5 passes 1..10
       rtxhdr?: boolean;
       hdrcolor?: string;
       hdrsat?: number;
@@ -1146,6 +1149,7 @@ ipcMain.on(
     liveNrStructure = opts.nrstructure ?? 1;
     liveNrTone = opts.nrtone ?? 1;
     liveNrStyle = opts.nrstyle ?? 1;
+    liveNrPasses = Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)));
     liveRtxHdr = !!opts.rtxhdr;
     liveHdrColor = opts.hdrcolor ?? 'vivid';
     liveHdrSat = opts.hdrsat ?? 0;
@@ -1393,6 +1397,7 @@ type RunOpts = {
   nrstructure?: number;
   nrtone?: number;
   nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
+  nrpasses?: number; // DLSS 5 passes 1..10
   interp?: boolean;
   model?: string;
   upscale?: number;
@@ -1455,6 +1460,8 @@ function engineArgs(opts: RunOpts): string[] {
       '--nr-style',
       String(opts.nrstyle ?? 1),
     );
+  if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
+    args.push('--nr-passes', String(Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
   // Resize factor (an arbitrary float, source height -> chosen target height), computed by the
   // renderer from the resolution selector. >1 enables the upscale pass; <1 is a downscale the
   // engine FOLDS into the decode (whole pipeline runs at the output size - also what keeps 4K
@@ -1695,6 +1702,7 @@ ipcMain.handle(
       nrstructure?: number;
       nrtone?: number;
       nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
+      nrpasses?: number; // DLSS 5 passes 1..10
       nrmask?: boolean;
     },
   ) => {
@@ -1720,6 +1728,8 @@ ipcMain.handle(
           '--nr-style',
           String(opts.nrstyle ?? 1),
         );
+      if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
+        args.push('--nr-passes', String(Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
       if (opts.dlssnr && opts.nrmask) args.push('--nr-mask'); // heat map of the DLSS 5 change, <prefix>_nrmask.png
       if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) {
         args.push('--upscale', String(opts.upscale));

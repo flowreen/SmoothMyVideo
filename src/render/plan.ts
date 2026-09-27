@@ -33,6 +33,7 @@ export interface RenderArgs {
   nr_structure: number; // float
   nr_tone: number; // float
   nr_style: number; // int
+  nr_passes: number; // int, 1..10: DLSS 5 chained per frame
 }
 
 export interface ScalePlan {

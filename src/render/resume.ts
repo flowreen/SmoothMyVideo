@@ -68,6 +68,7 @@ const OPTS: Record<string, Spec> = {
   '--nr-structure': { dest: 'nr_structure', kind: 'float', def: 1.0 },
   '--nr-tone': { dest: 'nr_tone', kind: 'float', def: 1.0 },
   '--nr-style': { dest: 'nr_style', kind: 'int', def: 1, choices: [0, 1, 2] },
+  '--nr-passes': { dest: 'nr_passes', kind: 'int', def: 1, choices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] },
   '--hdr-saturation': { dest: 'hdr_saturation', kind: 'int', def: 0 },
   '--hdr-contrast': { dest: 'hdr_contrast', kind: 'int', def: 100 },
   '--hdr-color': { dest: 'hdr_color', kind: 'str', def: 'vivid', choices: ['vivid', 'rtx', 'raw'] },

@@ -365,6 +365,26 @@ bool Host::createResources(bool staging, std::string& err)
     if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_output))))
     { err = "CreateCommittedResource(output) failed"; return false; }
+    // the chain's intermediate frames: pass k writes m_passOut[k], pass k + 1 reads it
+    const int wanted = m_set.passes < 1 ? 1 : (m_set.passes > kMaxPasses ? kMaxPasses : m_set.passes);
+    for (int k = 0; k + 1 < wanted; ++k)
+        if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_passOut[k]))))
+        { err = "CreateCommittedResource(pass output) failed"; return false; }
+
+    if (m_set.motion)
+    {
+        // DLSSNR.MVec, bound at create; a committed DEFAULT-heap texture starts zeroed (no motion)
+        D3D12_RESOURCE_DESC md = td;
+        md.Format = DXGI_FORMAT_R16G16_FLOAT;
+        md.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &md,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&m_mv))))
+        { err = "CreateCommittedResource(motion) failed"; return false; }
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT mfp = {};
+        m_dev->GetCopyableFootprints(&md, 0, 1, 0, &mfp, nullptr, nullptr, nullptr);
+        m_mvPitch = mfp.Footprint.RowPitch;
+    }
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
     UINT64 total = 0;
@@ -532,57 +552,98 @@ int Host::initNgx(std::string& err)
     if (m_last != NVSDK_NGX_Result_Success || !m_params)
     { err = "AllocateParameters failed: " + resultString(m_last); return 2; }
 
-    // Minimum resource and parameter set for feature 18 (DLAA style, ratio 1.0).
-    m_params->Set("DLSSNR.ScalingRatio", 1.0f);
-    m_params->Set("DLSSNR.Width",  (unsigned int)m_w);
-    m_params->Set("DLSSNR.Height", (unsigned int)m_h);
-    m_params->Set("DLSSNR.Color",      m_color.Get());
-    m_params->Set("DLSSNR.Output",     m_output.Get());
-    m_params->Set("DLSSNR.Backbuffer", m_output.Get());
-    m_params->Set("DLSSNR.ColorSubrectBaseX", (unsigned int)0);
-    m_params->Set("DLSSNR.ColorSubrectBaseY", (unsigned int)0);
-    m_params->Set("DLSSNR.ColorSubrectWidth", (unsigned int)m_w);
-    m_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)m_h);
-    m_params->Set("DLSSNR.OutputSubrectBaseX", (unsigned int)0);
-    m_params->Set("DLSSNR.OutputSubrectBaseY", (unsigned int)0);
-    m_params->Set("DLSSNR.OutputSubrectWidth", (unsigned int)m_w);
-    m_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)m_h);
-    m_params->Set("DLSSNR.Reset", 1);
-    m_params->Set("DLSSNR.Enabled", 1);
-    m_params->Set("DLSSNR.UICorrection", 0);
-    m_params->Set("DLSSNR.DepthInverted", 1);
-    m_params->Set("DLSSNR.UseAutoMask", (unsigned int)0);
-    m_params->Set("DLSSNR.MVecScaleX", 1.0f);
-    m_params->Set("DLSSNR.MVecScaleY", 1.0f);
-    m_params->Set("DLSSNR.Style", m_set.style);
-    m_params->Set("DLSSNR.Hint.Render.Preset", m_set.preset);
-    m_params->Set("DLSSNR.Intensity", m_set.intensity);
-    m_params->Set("DLSSNR.LocalStructureStrength", m_set.structure);
-    m_params->Set("DLSSNR.LocalToneStrength", m_set.tone);
-    m_params->Set("DLSSNR.SkinStructureStrength", -1.0f);
-    // MVec, Depth and ControlMask are deliberately not set.
+    const int wanted = m_set.passes < 1 ? 1 : (m_set.passes > kMaxPasses ? kMaxPasses : m_set.passes);
+    m_pparams[0] = m_params;
+    setPassParams(0, wanted - 1);
 
     if (FAILED(m_alloc->Reset()) || FAILED(m_list->Reset(m_alloc.Get(), nullptr)))
     { err = "command list Reset failed"; return 2; }
 
-    if (m_shim)
+    PFN_ShimCreate sCreate = m_shim ? (PFN_ShimCreate)GetProcAddress(m_shim, "DLSSNR_CallCreate") : nullptr;
+    if (m_shim && !sCreate) { err = "caller shim is missing DLSSNR_CallCreate"; return 2; }
+    auto create = [&](NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** f)
     {
-        PFN_ShimCreate sCreate = (PFN_ShimCreate)GetProcAddress(m_shim, "DLSSNR_CallCreate");
-        if (!sCreate) { err = "caller shim is missing DLSSNR_CallCreate"; return 2; }
-        m_last = sCreate(pCreate, m_list.Get(), kFeatureId, m_params, &m_feature);
-    }
-    else
-    {
-        m_last = ((PFN_NGX_CreateFeature)pCreate)(m_list.Get(), (NVSDK_NGX_Feature)kFeatureId, m_params, &m_feature);
-    }
+        return sCreate ? sCreate(pCreate, m_list.Get(), kFeatureId, p, f)
+                       : ((PFN_NGX_CreateFeature)pCreate)(m_list.Get(), (NVSDK_NGX_Feature)kFeatureId, p, f);
+    };
+    m_last = create(m_params, &m_feature);
     if (m_last != NVSDK_NGX_Result_Success || !m_feature)
     {
         m_list->Close();
         err = "CreateFeature(18) refused: " + resultString(m_last);
         return 3;
     }
+    m_pfeature[0] = m_feature;
+    // passes 2..wanted: their own parameter block and feature; one that cannot be made ends the
+    // chain at the passes built so far (the rest of the render runs them, passNote says why)
+    m_passes = 1;
+    m_passNote.clear();
+    for (int k = 1; k < wanted; ++k)
+    {
+        NVSDK_NGX_Parameter* p = nullptr;
+        NVSDK_NGX_Result r = m_shim ? sAlloc(pAlloc, &p) : ((PFN_NGX_AllocParams)pAlloc)(&p);
+        if (r != NVSDK_NGX_Result_Success || !p)
+        { m_passNote = "pass " + std::to_string(k + 1) + " AllocateParameters " + resultString(r); break; }
+        m_pparams[k] = p;
+        setPassParams(k, wanted - 1);
+        NVSDK_NGX_Handle* f = nullptr;
+        r = create(p, &f);
+        if (r != NVSDK_NGX_Result_Success || !f)
+        { m_passNote = "pass " + std::to_string(k + 1) + " CreateFeature " + resultString(r); break; }
+        m_pfeature[k] = f;
+        m_passes = k + 1;
+    }
     if (!runCommandList(err)) return 2;
     return 0;
+}
+
+// Minimum resource and parameter set for feature 18 (DLAA style, ratio 1.0), pass k of the chain
+// 0..last: pass 0 reads Color, pass k reads pass k - 1's output, the last one writes Output
+// (evaluateOn re-binds both per frame, so a chain cut short still ends in Output).
+void Host::setPassParams(int k, int last)
+{
+    NVSDK_NGX_Parameter* p = m_pparams[k];
+    ID3D12Resource* in = k == 0 ? m_color.Get() : m_passOut[k - 1].Get();
+    ID3D12Resource* out = k == last ? m_output.Get() : m_passOut[k].Get();
+    p->Set("DLSSNR.ScalingRatio", 1.0f);
+    p->Set("DLSSNR.Width",  (unsigned int)m_w);
+    p->Set("DLSSNR.Height", (unsigned int)m_h);
+    p->Set("DLSSNR.Color",      in);
+    p->Set("DLSSNR.Output",     out);
+    p->Set("DLSSNR.Backbuffer", out);
+    p->Set("DLSSNR.ColorSubrectBaseX", (unsigned int)0);
+    p->Set("DLSSNR.ColorSubrectBaseY", (unsigned int)0);
+    p->Set("DLSSNR.ColorSubrectWidth", (unsigned int)m_w);
+    p->Set("DLSSNR.ColorSubrectHeight", (unsigned int)m_h);
+    p->Set("DLSSNR.OutputSubrectBaseX", (unsigned int)0);
+    p->Set("DLSSNR.OutputSubrectBaseY", (unsigned int)0);
+    p->Set("DLSSNR.OutputSubrectWidth", (unsigned int)m_w);
+    p->Set("DLSSNR.OutputSubrectHeight", (unsigned int)m_h);
+    p->Set("DLSSNR.Reset", 1);
+    p->Set("DLSSNR.Enabled", 1);
+    p->Set("DLSSNR.UICorrection", 0);
+    p->Set("DLSSNR.DepthInverted", 1);
+    const char* am = getenv("SMV_NR_AUTOMASK");   // measurement lever: 0 = the mask off
+    p->Set("DLSSNR.UseAutoMask", (unsigned int)((am && am[0] == '0') ? 0 : m_set.automask));
+    p->Set("DLSSNR.MVecScaleX", 1.0f);
+    p->Set("DLSSNR.MVecScaleY", 1.0f);
+    if (m_mv)
+    {
+        // pixels, current -> previous, the full frame (MVecScale 1 at DLAA); every pass follows the
+        // same picture motion
+        p->Set("DLSSNR.MVec", m_mv.Get());
+        p->Set("DLSSNR.MVecSubrectBaseX", (unsigned int)0);
+        p->Set("DLSSNR.MVecSubrectBaseY", (unsigned int)0);
+        p->Set("DLSSNR.MVecSubrectWidth", (unsigned int)m_w);
+        p->Set("DLSSNR.MVecSubrectHeight", (unsigned int)m_h);
+    }
+    p->Set("DLSSNR.Style", m_set.style);
+    p->Set("DLSSNR.Hint.Render.Preset", m_set.preset);
+    p->Set("DLSSNR.Intensity", m_set.intensity);
+    p->Set("DLSSNR.LocalStructureStrength", m_set.structure);
+    p->Set("DLSSNR.LocalToneStrength", m_set.tone);
+    p->Set("DLSSNR.SkinStructureStrength", -1.0f);
+    // Depth and ControlMask are deliberately not set (video has no depth); MVec only with Settings::motion.
 }
 
 bool Host::evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& err)
@@ -594,17 +655,40 @@ bool Host::evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& 
     if (!pEval || (m_shim && !sEval)) { err = "EvaluateFeature entry point missing"; return false; }
     if (!m_feature || !m_params) { err = "feature not created"; return false; }
 
-    m_params->Set("DLSSNR.Reset", reset ? 1 : 0);
-    m_params->Set("DLSSNR.Intensity", m_set.intensity);
-    m_params->Set("DLSSNR.LocalStructureStrength", m_set.structure);
-    m_params->Set("DLSSNR.LocalToneStrength", m_set.tone);
-
-    m_last = m_shim ? sEval(pEval, list, m_feature, m_params)
-                    : ((PFN_NGX_EvaluateFeature)pEval)(list, m_feature, m_params, nullptr);
-    if (m_last != NVSDK_NGX_Result_Success)
+    // the chain: pass k reads pass k - 1's output (UAV while written, a shader resource while read,
+    // back to UAV for the next frame's write), the last pass writes Output
+    for (int k = 0; k < m_passes; ++k)
     {
-        err = "EvaluateFeature failed: " + resultString(m_last);
-        return false;
+        NVSDK_NGX_Parameter* p = m_pparams[k];
+        ID3D12Resource* in = k == 0 ? m_color.Get() : m_passOut[k - 1].Get();
+        ID3D12Resource* out = k == m_passes - 1 ? m_output.Get() : m_passOut[k].Get();
+        if (k > 0)
+        {
+            const D3D12_RESOURCE_BARRIER b = transition(in, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &b);
+        }
+        p->Set("DLSSNR.Color", in);
+        p->Set("DLSSNR.Output", out);
+        p->Set("DLSSNR.Backbuffer", out);
+        p->Set("DLSSNR.Reset", reset ? 1 : 0);
+        p->Set("DLSSNR.Intensity", m_set.intensity);
+        p->Set("DLSSNR.LocalStructureStrength", m_set.structure);
+        p->Set("DLSSNR.LocalToneStrength", m_set.tone);
+        m_last = m_shim ? sEval(pEval, list, m_pfeature[k], p)
+                        : ((PFN_NGX_EvaluateFeature)pEval)(list, m_pfeature[k], p, nullptr);
+        if (m_last != NVSDK_NGX_Result_Success)
+        {
+            err = std::string("EvaluateFeature failed")
+                  + (m_passes > 1 ? " (pass " + std::to_string(k + 1) + ")" : std::string()) + ": " + resultString(m_last);
+            return false;
+        }
+        if (k > 0)
+        {
+            const D3D12_RESOURCE_BARRIER b = transition(in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list->ResourceBarrier(1, &b);
+        }
     }
     return true;
 }
@@ -691,7 +775,7 @@ LUID Host::adapterLuid() const
 
 void Host::closeSharedHandles()
 {
-    for (HANDLE* h : { &m_shInH, &m_shOutH, &m_shFenceH })
+    for (HANDLE* h : { &m_shInH, &m_shOutH, &m_shFenceH, &m_shMvH })
         if (*h) { CloseHandle(*h); *h = nullptr; }
 }
 
@@ -723,6 +807,19 @@ bool Host::startShared(std::string& err)
         || FAILED(m_dev->CreateSharedHandle(m_shOut.Get(), nullptr, GENERIC_ALL, nullptr, &m_shOutH))
         || FAILED(m_dev->CreateSharedHandle(m_shFence.Get(), nullptr, GENERIC_ALL, nullptr, &m_shFenceH)))
     { closeSharedHandles(); err = "shared handle creation failed"; return false; }
+    if (m_mv)
+    {
+        const D3D12_RESOURCE_DESC md = m_mv->GetDesc();
+        UINT64 mtotal = 0;
+        m_dev->GetCopyableFootprints(&md, 0, 1, 0, nullptr, nullptr, nullptr, &mtotal);
+        D3D12_RESOURCE_DESC mb = bd;
+        mb.Width = mtotal;
+        if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_SHARED, &mb, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, IID_PPV_ARGS(&m_shMv)))
+            || FAILED(m_dev->CreateSharedHandle(m_shMv.Get(), nullptr, GENERIC_ALL, nullptr, &m_shMvH)))
+        { closeSharedHandles(); err = "shared motion buffer creation failed"; return false; }
+        m_shMvBytes = mtotal;
+    }
     for (int k = 0; k < kSharedLists; ++k)
     {
         if (FAILED(m_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_shAlloc[k])))
@@ -775,6 +872,21 @@ bool Host::submitShared(bool reset, uint64_t waitValue, uint64_t signalValue, st
     list->CopyTextureRegion(&tex, 0, 0, 0, &buf, nullptr);
     b = transition(m_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     list->ResourceBarrier(1, &b);
+    if (m_shMv)
+    {
+        // this frame's motion field, written by the caller before the fence value the queue waits for
+        D3D12_TEXTURE_COPY_LOCATION mTex = tex;
+        mTex.pResource = m_mv.Get();
+        D3D12_TEXTURE_COPY_LOCATION mBuf = buf;
+        mBuf.pResource = m_shMv.Get();
+        mBuf.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
+        mBuf.PlacedFootprint.Footprint.RowPitch = (UINT)m_mvPitch;
+        b = transition(m_mv.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->ResourceBarrier(1, &b);
+        list->CopyTextureRegion(&mTex, 0, 0, 0, &mBuf, nullptr);
+        b = transition(m_mv.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(1, &b);
+    }
 
     if (!evaluateOn(list, reset, err))
     {
@@ -810,10 +922,11 @@ static void guardedNgxShutdown(Host* self);
 void Host::shutdown()
 {
     guardedNgxShutdown(this);
+    for (int k = 0; k + 1 < kMaxPasses; ++k) m_passOut[k].Reset();
     for (int k = 0; k < kSharedLists; ++k) { m_shList[k].Reset(); m_shAlloc[k].Reset(); }
-    m_shIn.Reset(); m_shOut.Reset(); m_shFence.Reset(); m_shBytes = 0;
+    m_shIn.Reset(); m_shOut.Reset(); m_shFence.Reset(); m_shMv.Reset(); m_shBytes = 0; m_shMvBytes = 0;
     closeSharedHandles();
-    m_readback.Reset(); m_upload.Reset(); m_output.Reset(); m_color.Reset();
+    m_readback.Reset(); m_upload.Reset(); m_output.Reset(); m_color.Reset(); m_mv.Reset();
     // on a caller device the queue and device references are just dropped
     m_list.Reset(); m_alloc.Reset(); m_queue.Reset(); m_fence.Reset(); m_dev.Reset();
     if (m_fenceEvent) { CloseHandle(m_fenceEvent); m_fenceEvent = nullptr; }
@@ -825,17 +938,43 @@ void Host::abandon()
 {
     m_feature = nullptr;
     m_params = nullptr;
+    for (int k = 0; k < kMaxPasses; ++k) { m_pfeature[k] = nullptr; m_pparams[k] = nullptr; }
+    for (int k = 0; k + 1 < kMaxPasses; ++k) m_passOut[k].Reset();
+    m_passes = 1;
     m_ngxUp = false;
     for (int k = 0; k < kSharedLists; ++k) { m_shList[k].Reset(); m_shAlloc[k].Reset(); }
-    m_shIn.Reset(); m_shOut.Reset(); m_shFence.Reset(); m_shBytes = 0;
+    m_shIn.Reset(); m_shOut.Reset(); m_shFence.Reset(); m_shMv.Reset(); m_shBytes = 0; m_shMvBytes = 0;
     closeSharedHandles();
-    m_readback.Reset(); m_upload.Reset(); m_output.Reset(); m_color.Reset();
+    m_readback.Reset(); m_upload.Reset(); m_output.Reset(); m_color.Reset(); m_mv.Reset();
     m_list.Reset(); m_alloc.Reset(); m_queue.Reset(); m_fence.Reset(); m_dev.Reset();
     if (m_fenceEvent) { CloseHandle(m_fenceEvent); m_fenceEvent = nullptr; }
 }
 
 void Host::ngxShutdown()
 {
+    // passes 2..: their features and parameter blocks first (pass 0 = m_feature / m_params below)
+    for (int k = 1; k < kMaxPasses && m_core; ++k)
+    {
+        if (m_pfeature[k])
+        {
+            void* pRelease = (void*)GetProcAddress(m_var.viaSnippet ? m_snippet : m_core, "NVSDK_NGX_D3D12_ReleaseFeature");
+            PFN_ShimRelease sRel = m_shim ? (PFN_ShimRelease)GetProcAddress(m_shim, "DLSSNR_CallRelease") : nullptr;
+            if (pRelease)
+            {
+                if (sRel) sRel(pRelease, m_pfeature[k]);
+                else ((PFN_NGX_ReleaseFeature)pRelease)(m_pfeature[k]);
+            }
+            m_pfeature[k] = nullptr;
+        }
+        if (m_pparams[k])
+        {
+            PFN_NGX_DestroyParams destroy = (PFN_NGX_DestroyParams)GetProcAddress(m_core, "NVSDK_NGX_D3D12_DestroyParameters");
+            if (destroy) destroy(m_pparams[k]);
+            m_pparams[k] = nullptr;
+        }
+    }
+    m_pfeature[0] = nullptr;
+    m_pparams[0] = nullptr;
     if (m_core && m_feature)
     {
         void* pRelease = (void*)GetProcAddress(m_var.viaSnippet ? m_snippet : m_core, "NVSDK_NGX_D3D12_ReleaseFeature");

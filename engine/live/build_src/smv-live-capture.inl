@@ -593,6 +593,7 @@ struct LiveNr
         set.structure = (float)g_nrStructure;
         set.tone = (float)g_nrTone;
         set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 1;
+        set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
         nr::Variant var;
         if (host.startupOn(dev.Get(), queue.Get(), w, h, set, var, true, err) != 0) return false;
         ComPtr<ID3DBlob> csIn, csOut, e;

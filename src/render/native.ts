@@ -346,7 +346,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
         : 'RTX HDR is not active';
     say(`[hdr10+] HDR10+ export skipped: ${why}\n`);
   } else if (HP_ACTIVE) say('HDR10+ dynamic metadata ON (plays as HDR10 where HDR10+ is unsupported)\n');
-  let nr: { structure: number; tone: number; style: number } | null = null;
+  let nr: { structure: number; tone: number; style: number; passes: number } | null = null;
   if (args.dlssnr) {
     const nrDir = env.SMV_DLSSNR_DIR || path.join(ENGINE, 'dlssnr');
     const miss = ['nvngx.dll', 'nvngx_dlssnr.dll'].filter((f) => !isFile(path.join(nrDir, f)));
@@ -356,6 +356,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
         structure: clamp(args.nr_structure, 0.0, 2.0),
         tone: clamp(args.nr_tone, 0.0, 2.0),
         style: [0, 1, 2].includes(args.nr_style) ? args.nr_style : 1,
+        passes: Math.min(10, Math.max(1, Math.round(args.nr_passes ?? 1))),
       };
   }
 
@@ -501,6 +502,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       '--nr-style',
       String(nr.style),
     );
+  if (nr && nr.passes > 1) nargs.push('--nr-passes', String(nr.passes));
   const hdrStats = WORK_PATH + '.hdrstats.json';
   if (HDR_ACTIVE) {
     nargs.push(

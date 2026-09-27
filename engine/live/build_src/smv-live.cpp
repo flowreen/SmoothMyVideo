@@ -146,6 +146,7 @@ static bool g_dlssnr = false;          // --dlssnr: forwarded to the server (DLS
 static double g_nrStructure = 1.0;     // --nr-structure F (0..2, the DLSS 5 Structure Intensity)
 static double g_nrTone = 1.0;          // --nr-tone F (0..2, the DLSS 5 Tone Intensity)
 static int g_nrStyle = 1;              // --nr-style N (DLSSNR.Style: 0 Default, 1 Natural, 2 Cinematic)
+static int g_nrPasses = 1;             // --nr-passes N (1..nr::kMaxPasses: DLSS 5 chained N times per frame)
 static bool g_nrNative = false;        // DLSS 5 NR runs inside this exe on the shared capture
                                        // texture (LiveNr below); the server is then NOT told --dlssnr
 static bool g_nrAttempted = false;     // NGX was initialised in this process (even if it then
@@ -361,7 +362,7 @@ static LRESULT CALLBACK testWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
-static int runTestSrc()
+static int runTestSrc(bool onScreen)
 {
     WNDCLASSW wc{};
     wc.lpfnWndProc = testWndProc;
@@ -371,8 +372,14 @@ static int runTestSrc()
     RegisterClassW(&wc);
     RECT r{ 0, 0, 960, 540 };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    // parked by default so a test run shows nothing on the user's screen: ONE client pixel on the
+    // primary monitor's bottom-right corner (a window with no client pixel on the desktop is not
+    // composed, and a capture of it gets no frames; r's negative left / top are the frame, the
+    // invisible resize border included); --onscreen keeps it visible
+    int x = 80, y = 80;
+    if (!onScreen) { x = GetSystemMetrics(SM_CXSCREEN) - 1 + r.left; y = GetSystemMetrics(SM_CYSCREEN) - 1 + r.top; }
     HWND h = CreateWindowExW(0, L"smvlivetestsrc", L"SMV Live TestSrc", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                             80, 80, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+                             x, y, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
     if (!h) { LOG("CreateWindow failed\n"); return 1; }
     SetTimer(h, 1, g_tsInterval, nullptr);
     LOG("TESTSRC READY interval=%ums\n", g_tsInterval);
@@ -1026,6 +1033,7 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
         else if (wcscmp(argv[i], L"--nr-structure") == 0 && i + 1 < argc) g_nrStructure = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-tone") == 0 && i + 1 < argc) g_nrTone = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-style") == 0 && i + 1 < argc) g_nrStyle = _wtoi(argv[++i]);
+        else if (wcscmp(argv[i], L"--nr-passes") == 0 && i + 1 < argc) g_nrPasses = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-delta") == 0 && i + 1 < argc) oa.nrDeltaW = argv[++i];
         else if (wcscmp(argv[i], L"--thumb") == 0 && i + 1 < argc) oa.thumbW = argv[++i];
         else if (wcscmp(argv[i], L"--thumb-off") == 0 && i + 1 < argc) oa.thumbOffW = argv[++i];
@@ -1351,6 +1359,16 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         set.structure = (float)(g_nrStructure < 0.0 ? 0.0 : (g_nrStructure > 2.0 ? 2.0 : g_nrStructure));
         set.tone = (float)(g_nrTone < 0.0 ? 0.0 : (g_nrTone > 2.0 ? 2.0 : g_nrTone));
         set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 1;
+        set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
+        // Zero-copy unless the preview's change map needs the host copies or SMV_NR_STAGED=1
+        // asks for CPU staging (the route A/B and the fallback's trigger test). DLSS 5 gets motion
+        // vectors on the zero-copy route only (the core binds DLSSNR.MVec at create);
+        // SMV_NR_MV=0 = none (a measurement lever), SMV_NR_AUTOMASK=0 = the mask off (read by the core)
+        wchar_t sg[8]{}, mvv[8]{}, amv[8]{};
+        const bool staged = !oa.nrDeltaW.empty()
+                            || (GetEnvironmentVariableW(L"SMV_NR_STAGED", sg, 8) && sg[0] == L'1');
+        set.motion = !staged && !(GetEnvironmentVariableW(L"SMV_NR_MV", mvv, 8) && mvv[0] == L'0');
+        const bool autoMask = !(GetEnvironmentVariableW(L"SMV_NR_AUTOMASK", amv, 8) && amv[0] == L'0');
         nr::Variant var;
         std::string err;
         g_nrAttempted = true;
@@ -1374,13 +1392,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             // pure function of its input, so a route gate can compare it frame by frame
             wchar_t re[8]{};
             nr.nrResetEvery = GetEnvironmentVariableW(L"SMV_NR_RESET_EVERY", re, 8) && re[0] == L'1';
-            // Zero-copy unless the preview's change map needs the host copies or SMV_NR_STAGED=1
-            // asks for CPU staging (the route A/B and the fallback's trigger test). A handoff that
-            // cannot start falls back to staging with a line; the pass still runs, so the line
-            // carries no [dlss5] tag (the preview reads that tag as "DLSS 5 not applied").
-            wchar_t sg[8]{};
-            const bool staged = !nr.nrDeltaPath.empty()
-                                || (GetEnvironmentVariableW(L"SMV_NR_STAGED", sg, 8) && sg[0] == L'1');
+            // A handoff that cannot start falls back to staging with a line; the pass still runs, so
+            // the line carries no [dlss5] tag (the preview reads that tag as "DLSS 5 not applied").
+            // Motion that cannot start leaves the shared field at zero (no motion) with a line.
             if (!staged)
             {
                 std::string zerr;
@@ -1390,15 +1404,24 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     nativeNrReleaseImports(nr);
                     LOG("offline: DLSS 5 zero-copy handoff unavailable (%s), CPU staging\n", zerr.c_str());
                 }
+                else if (set.motion && !nativeNrMotionSetup(nr, zerr))
+                {
+                    nativeNrMotionFree(nr);
+                    if (nr.dNrShMv) cudaMemset2DAsync(nr.dNrShMv, nr.nrMvPitch, 0, (size_t)w * 4, h, nr.stream);
+                    LOG("offline: DLSS 5 motion vectors unavailable (%s), none\n", zerr.c_str());
+                }
             }
             if (!nr.nrZeroCopy
                 && (cudaHostAlloc((void**)&nr.hNrIn, (size_t)w * h * 8, cudaHostAllocDefault) != cudaSuccess
                     || cudaHostAlloc((void**)&nr.hNrOut, (size_t)w * h * 8, cudaHostAllocDefault) != cudaSuccess))
             { LOG("offline: DLSS 5 buffers failed\n"); return 2; }
             LOG("DLSS 5 Neural Rendering ready (DLAA, structure %.2f, tone %.2f, style %d, %s, before the "
-                "interpolation%s) @ %dx%d\n",
+                "interpolation%s%s, passes %d%s) @ %dx%d\n",
                 set.structure, set.tone, set.style, nr.nrZeroCopy ? "zero-copy" : "CPU staging",
-                nr.nrResetEvery ? ", SMV_NR_RESET_EVERY" : "", w, h);
+                nr.nrMotion ? ", motion vectors" : ", no motion vectors", autoMask ? ", auto mask" : "",
+                host->passes(), nr.nrResetEvery ? ", SMV_NR_RESET_EVERY" : "", w, h);
+            if (host->passes() < set.passes)
+                LOG("offline: DLSS 5 runs %d of %d passes (%s)\n", host->passes(), set.passes, host->passNote().c_str());
         }
     }
 
@@ -2140,6 +2163,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nr.nrN ? nr.nrMs / (double)nr.nrN : 0.0, nr.nrMaxMs, (unsigned long long)nr.nrN,
             nr.nrZeroCopy ? "host submit, zero-copy" : "render and staging");
         cudaDeviceSynchronize();   // the last fence wait has run before its semaphore goes
+        nativeNrMotionFree(nr);
         nativeNrReleaseImports(nr);
         nr.nrHost->abandon();   // no NGX release chain (it faults); the process exits after this item
         cudaFree(nr.dNrIo); cudaFree(nr.dRawPrev); cudaFreeHost(nr.hNrIn); cudaFreeHost(nr.hNrOut);
@@ -2189,15 +2213,20 @@ int wmain(int argc, wchar_t** argv)
 
     if (argc >= 2 && wcscmp(argv[1], L"--testsrc") == 0)
     {
-        if (argc >= 3 && wcscmp(argv[2], L"cycle") == 0)
+        bool onScreen = false;
+        for (int i = 2; i < argc; i++)
         {
-            g_tsCycling = true;
-            g_tsCycleTick = GetTickCount64();
-            g_tsInterval = g_tsCycle[0];
+            if (wcscmp(argv[i], L"--onscreen") == 0) onScreen = true;
+            else if (wcscmp(argv[i], L"cycle") == 0)
+            {
+                g_tsCycling = true;
+                g_tsCycleTick = GetTickCount64();
+                g_tsInterval = g_tsCycle[0];
+            }
+            else g_tsInterval = (UINT)_wtoi(argv[i]);
         }
-        else if (argc >= 3) g_tsInterval = (UINT)_wtoi(argv[2]);
         if (g_tsInterval < 5 || g_tsInterval > 2000) g_tsInterval = 100;
-        return runTestSrc();
+        return runTestSrc(onScreen);
     }
 
     if (argc >= 2 && wcscmp(argv[1], L"--synth") == 0)
@@ -2265,7 +2294,7 @@ int wmain(int argc, wchar_t** argv)
         "       smv-live.exe --hwnd 0xHWND [same flags]\n"
         "       smv-live.exe --fg [--exclude 0xHWND] [same flags]   (overlay the foreground window)\n"
         "       smv-live.exe --list\n"
-        "       smv-live.exe --testsrc [ms]\n");
+        "       smv-live.exe --testsrc [ms|cycle] [--onscreen]   (parked with 1 px on the desktop unless --onscreen)\n");
     return 1;
 }
 
@@ -2283,7 +2312,7 @@ static void resetSessionGlobals()
     g_flowScale = 1.0;
     g_noHud = g_noHudLat = false;
     g_sharpen = 0.0; g_rtxVsr = false; g_upscaleH = 0; g_restore = false;
-    g_dlssnr = false; g_nrStructure = 1.0; g_nrTone = 1.0; g_nrStyle = 1; g_nrNative = false;
+    g_dlssnr = false; g_nrStructure = 1.0; g_nrTone = 1.0; g_nrStyle = 1; g_nrPasses = 1; g_nrNative = false;
     g_rtxHdr = false; wcscpy_s(g_hdrColor, L"vivid"); g_hdrSat = 0; g_hdrCon = 100;
     g_hdrVib = 0.0; g_hdrSb = 0.0; g_sdrWhite = 240.0;
     g_vramBytes = 0;
@@ -2346,6 +2375,7 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
         else if (wcscmp(argv[i], L"--nr-structure") == 0 && i + 1 < argc) g_nrStructure = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-tone") == 0 && i + 1 < argc) g_nrTone = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-style") == 0 && i + 1 < argc) g_nrStyle = _wtoi(argv[++i]);
+        else if (wcscmp(argv[i], L"--nr-passes") == 0 && i + 1 < argc) g_nrPasses = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-hdr") == 0) g_rtxHdr = true;
         else if (wcscmp(argv[i], L"--hdr-color") == 0 && i + 1 < argc) wcsncpy_s(g_hdrColor, argv[++i], _TRUNCATE);
         else if (wcscmp(argv[i], L"--hdr-saturation") == 0 && i + 1 < argc) g_hdrSat = _wtoi(argv[++i]);
@@ -2652,7 +2682,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_nvOrder = false;
             g_rtxHdr = false; wcscpy_s(g_hdrColor, L"vivid"); g_hdrSat = 0; g_hdrCon = 100;
             g_hdrVib = 0.0; g_hdrSb = 0.0;
-            g_dlssnr = false; g_nrStructure = 1.0; g_nrTone = 1.0; g_nrStyle = 1;
+            g_dlssnr = false; g_nrStructure = 1.0; g_nrTone = 1.0; g_nrStyle = 1; g_nrPasses = 1;
             g_logPipe = ctl;     // from here every log line reaches the client too
             OfflineArgs oa;
             int irc = parseOfflineArgs((int)av.size(), av.data(), 2, oa);
