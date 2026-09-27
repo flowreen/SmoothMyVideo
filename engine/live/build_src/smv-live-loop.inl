@@ -596,10 +596,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 g_nrNative = true;
                 wchar_t am[8]{};   // the core reads the same lever (nr_host.cpp)
                 const bool maskOff = GetEnvironmentVariableW(L"SMV_NR_AUTOMASK", am, 8) && am[0] == L'0';
-                LOG("live DLSS 5 native: on, %ux%u per captured frame inside the overlay host, structure %.2f tone %.2f style %d, passes %d, %s, %s, %s\n",
+                LOG("live DLSS 5 native: on, %ux%u per captured frame inside the overlay host, structure %.2f tone %.2f style %d, passes %d, %s, %s, %s%s\n",
                     capW, capH, g_nrStructure, g_nrTone, g_nrStyle, liveNr.host.passes(), liveNr.mvNote.c_str(),
                     maskOff ? "no auto mask (SMV_NR_AUTOMASK=0)" : "auto mask",
-                    g_hdr ? "SDR range of the window (HDR highlights untouched)" : "SDR window");
+                    g_hdr ? "SDR range of the window (HDR highlights untouched)" : "SDR window",
+                    liveNr.reuse ? ", identical frames reuse the last output" : "");
                 const int nrWant = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
                 if (liveNr.host.passes() < nrWant)
                     LOG("live DLSS 5 native: %d of %d passes (%s)\n", liveNr.host.passes(), nrWant,

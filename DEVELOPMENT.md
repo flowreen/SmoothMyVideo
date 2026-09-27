@@ -223,8 +223,8 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
 What the app runs (any node works; the app uses its own Electron binary with `ELECTRON_RUN_AS_NODE=1`):
 
 ```
-node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale F]
-  [--sharpen S] [--restore] [--nvidia-order] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--no-interp]
+node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
+  [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--no-interp]
   [--rife] [--rife-drba] [--lsfg] [--nvof] [--fruc] [--dlssg]
   [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus]
   [--hdr-color vivid|rtx|raw] [--hdr-saturation N] [--hdr-contrast N] [--hdr-vibrance B] [--hdr-satboost S]
@@ -255,7 +255,7 @@ Models (GMFSS is the default, the anime specialist):
   multipliers too; the first window after a start or resume seam falls back to plain RIFE.
 * `--lsfg` "Frame Blend": the cheapest true interpolation. RIFE's IFNet pyramid gives the flow
   and mask, and the two frames are warped and merged at the processed size, no refinement; it
-  runs on the plain RIFE engines. `--scale` shrinks the whole pipeline (Image scale).
+  runs on the plain RIFE engines. `--scale` sets the working size it runs at (the DLSS mode).
 * `--nvof` "NVIDIA Optical Flow (direct)" (2026-09-21): the driver's optical-flow hardware through
   `nvofapi64.dll` (System32, opened by full path, nothing bundled; the MIT interface headers are
   vendored in `engine/live/build_src/nvofa`) run by `smv-live.exe` itself. One Execute per pair
@@ -294,34 +294,39 @@ Models (GMFSS is the default, the anime specialist):
 * `--dlssg` "NVIDIA DLSS 4.5": DLSS Frame Generation through `dlssg2f.exe` (RTX 40 / 50), in the
   same render as every other pass: DLSS 5 before it, RTX VSR / TrueHDR on its output.
 
-Passes, in order: DLSS 5 (once per source frame, before the interpolation), interpolate, then on
-every output frame Restore, upscale, RCAS sharpen, TrueHDR (live runs TrueHDR on each captured
-frame right after DLSS 5).
+Passes, in NVIDIA's order (file renders; the only order): on each source frame Restore, the resize
+to the working size (the DLSS mode's share of the output) and DLSS 5; the interpolation at the
+working size; then on every output frame the final resize to the output, RCAS sharpen, TrueHDR.
+Live still runs DLSS 5 and TrueHDR on each captured frame first and Restore and the upscale after
+the smoothing.
 * The Flow scale control (`--flow-scale`, the motion estimation alone at 50 % / 25 %, 2026-09-14)
   was REMOVED 2026-09-25: GMFSS at 25 % wobbled static frames (GMFlow at a 256x128 grid) and
   lost small fast objects at 50 %; the flag is now refused. The re-add recipe, the pre-removal
   file snapshot and the reverse patch are in `D:\AIStuff\smv-flowscale-removal\README.md`
   (outside the repo).
-* `--scale F` (the Image scale slider): scales the whole pipeline. The decode-side downscale chain
-  shrinks the video (linear-light spline36 `zscale`), every model processes the small
-  frames, and the upscale pass restores the output size (RTX VSR eligible). Reduced sizes build
-  engines at small shapes; the stall watchdog is the net there.
-* `--restore`: Real-ESRGAN anime-video model per output frame, before the upscale (a generative
-  repaint; cleans compression noise, can flatten fine texture; about +50% wall at 2x 1080p).
-* `--nvidia-order` (the GUI's Order checkbox, default off): NVIDIA's game order instead of the
-  faster default. The host packs each decoded frame at its own size, runs Restore and the upscale
-  (RTX VSR or bicubic, or Restore's own fold) on it first, pads the result into the model frame,
-  and then runs DLSS 5 and the interpolation at the OUTPUT size (every model buffer, engine and the
-  DLSS 5 host follow the output size; the emit skips Restore and the resize). Without Restore or an
-  upscale nothing moves; an output above 3840x2160 keeps the default order with a line (the model
-  at the output size is out of reach there). Slower by the ratio of the model's cost at the two
-  sizes.
-* `--upscale F`: bare = 1.5, clamp 1/16..16; above 8192 px auto-switches to a CPU AV1 / VVC encoder
-  with a fail-closed RAM preflight (true 16K needs about 54 GB free). `--rtx-vsr` uses RTX Video
-  Super Resolution for upscales, otherwise bicubic. Downscales (F below 1) are folded into the
-  decode, so the models run directly at the output size and the upscale pass becomes identity.
-* `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame before the interpolation (at the
-  output resolution after the upscale with `--nvidia-order`), DLAA (scaling
+* `--scale MODE|F` (the GUI's DLSS mode): the WORKING size, NVIDIA's DLSS modes as the share of the
+  output per axis: `dlaa` 1 (the default, the output itself), `quality` 1 / 1.5, `balanced`
+  1 / 1.724, `performance` 1 / 2, `ultra` 1 / 3, `auto` by the output's pixel count (below 1080p
+  DLAA, up to 1440p Quality, up to 4K Performance, above Ultra Performance), or any number in (0, 1]
+  (the GUI's Custom offers 33..100 %). `plan.ts` `workPlan` computes it once (even, at least 64,
+  capped at 3840x2160 keeping the aspect: the interpolation's reach) and prints `DLSS mode ...:
+  working size WxH for the WxH output`. A working size below the source folds the downscale into
+  the decode (linear-light spline36 `zscale`); otherwise the host gets `--work-w W --work-h H` (sent
+  when it differs from the decode or with Restore): it packs each decoded frame at its own size,
+  runs Restore and the resize to the working size on it (RTX VSR or bicubic, or Restore's own
+  fold), pads the result into the model frame, runs DLSS 5 and the model there (every model buffer,
+  engine and the DLSS 5 host follow the working size), and the emit's final resize takes each
+  output frame to the output size. RTX VSR is ONE bridge instance, so it takes the final resize when
+  that enlarges, else the pre-model one; the other enlarging resize is bicubic.
+* `--restore`: Real-ESRGAN anime-video model once per source frame, first (a generative repaint;
+  cleans compression noise, can flatten fine texture), folded straight to the working size, or
+  back to the source size when RTX VSR runs the resize after it.
+* `--upscale F`: the output size; bare = 1.5, clamp 1/16..16; above 8192 px auto-switches to a CPU
+  AV1 / VVC encoder with a fail-closed RAM preflight (true 16K needs about 54 GB free).
+  `--rtx-vsr` uses RTX Video Super Resolution for an enlarging resize, otherwise bicubic. Downscales
+  (F below 1) are folded into the decode.
+* `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame at the working size, after Restore and
+  the resize, before the interpolation, DLAA (scaling
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
   Default / Natural (default) / Cinematic looks (DLSSNR.Style; measured 2026-09-12: same cost, 0 is
   the lightest touch, 1 the smoothest, 2 keeps the most detail; Intensity stays 1.0, the runtime
@@ -484,7 +489,12 @@ straight into the core's `MVec` texture (`Settings::motionUav`), then evaluates.
 rule) or a resize. The ready line says `motion vectors (NVOFA grid 4), history kept` or
 `no motion vectors (why), every frame a Reset`; a runtime `nvOFExecute` failure switches the
 session to the latter with one line. `SMV_NR_MV=0` or `SMV_NR_RESET_EVERY=1` = the previous pass,
-a Reset on every evaluate. Checked with `harness\p53\mv_check.py` (`SMV_LIVE_NR_MVDUMP` dumps of a
+a Reset on every evaluate. A capture identical to the last evaluated one (a paused video, a held
+picture) is compared on the NR queue first (`csCmp`, every channel exactly, the answer read back:
+one CPU wait per captured frame) and gets the last output copied back with no evaluate, so a still
+source stays exactly still (re-evaluated with history kept it would be re-shaded a code or two on
+every refresh); the ready line ends `identical frames reuse the last output`, the teardown counts
+the reused captures, `SMV_NR_REUSE=0` evaluates every capture. Checked with `harness\p53\mv_check.py` (`SMV_LIVE_NR_MVDUMP` dumps of a
 parked `--testsrc 100 --pan` texture moving 4 px per tick: 99.92 % of the field within 0.25 px of
 (-4, 0), mean -3.996 px, HDR and SDR capture; the square source: the vectors land in the square's
 previous position, the background exactly zero).
@@ -645,7 +655,11 @@ frame per decoded frame, in place on the padded model input (the pad refilled fr
 the decode's pack), `dlssnr.py`'s fp16 clamp and rounding on the way in and out, Reset on the
 first frame only (offline accumulates, live does not). The identical-pair test compares the
 decoded frames before the pass rewrites them: the pass keeps history, so two identical frames can
-come back a fraction of a level apart. The frame crosses zero-copy:
+come back a fraction of a level apart. So a decoded frame byte-identical to the previous one (the
+decoder's bytes, `k_rawDiff`) takes the previous frame's DLSS 5 output with no evaluate and skips
+the pack and NVIDIA order's stage: a paused or held picture stays exactly still, and that test also
+decides the identical pair (`SMV_NR_REUSE=0` evaluates every frame; the summary line counts the
+reused frames). The frame crosses zero-copy:
 `nr::Host::startShared` makes two shared D3D12 buffers in the copy footprint layout and a shared
 fence, the host imports them into CUDA (same adapter LUID required), the stream writes the input
 buffer and signals an odd fence value, the NR queue waits for it on the GPU, copies, evaluates,
@@ -1044,6 +1058,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NR_RESET_EVERY=1` | DLSS 5 resets its history on every frame and gets no motion vectors (both routes; the pre-2026-09-27 live pass), for A/Bs and the route gate; never a product setting |
 | `SMV_NR_STAGED=1` | the offline native host's DLSS 5 hands its frames over through CPU staging (`renderFrame`) instead of the zero-copy shared buffers; the route A/B and the fallback's trigger test, never a product setting |
 | `SMV_NR_MV=0` | DLSS 5 gets no motion vectors (both routes; offline: the pre-2026-09-27 pass, live: every frame a Reset); a measurement lever, never a product setting |
+| `SMV_NR_REUSE=0` | DLSS 5 evaluates every frame, also one identical to the previous one (both routes; by default an identical frame reuses the last output, so a paused picture stays still); the A/B and trigger-test lever, never a product setting |
 | `SMV_LIVE_NR_MVDUMP=<prefix>` | live DLSS 5 writes the motion field and the luma of captured frames 30..37 as raw files, `<prefix>_f<n>_<w>x<h>_mv.f16` (R16G16_FLOAT px, current -> previous) and `_luma.u8`; diagnostics (`harness\p53\mv_check.py`) |
 | `SMV_NR_AUTOMASK=0` | DLSS 5 runs with `DLSSNR.UseAutoMask` 0 (both routes, read by the NR core); a measurement lever, never a product setting |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |

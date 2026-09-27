@@ -53,7 +53,9 @@ interface Spec {
 
 /** render.py's argparse options in declaration order (flag -> dest, type, default, const). */
 const OPTS: Record<string, Spec> = {
-  '--scale': { dest: 'scale', kind: 'float', def: null },
+  // the DLSS mode (auto, dlaa, quality, balanced, performance, ultra) or a number in (0, 1]: the
+  // working size's share of the output (plan.ts workPlan checks it)
+  '--scale': { dest: 'work_scale', kind: 'str', def: null },
   '--fps': { dest: 'fps', kind: 'float', def: null },
   '--sharpen': { dest: 'sharpen', kind: 'float', def: 0.0, nargsOpt: 0.8 },
   '--no-interp': { dest: 'no_interp', kind: 'bool', def: false },
@@ -80,7 +82,6 @@ const OPTS: Record<string, Spec> = {
   '--rife-drba': { dest: 'rife_drba', kind: 'bool', def: false },
   '--lsfg': { dest: 'lsfg', kind: 'bool', def: false },
   '--nvof': { dest: 'nvof', kind: 'bool', def: false },
-  '--nvidia-order': { dest: 'nvidia_order', kind: 'bool', def: false },
 };
 const POS: Spec[] = [
   { dest: 'input', kind: 'str', def: null },

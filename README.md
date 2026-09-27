@@ -93,13 +93,20 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 * 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
   detected and timed correctly, so audio never drifts out of sync.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
+* 🎛️ **NVIDIA's DLSS modes for speed.** File renders run in the order NVIDIA uses in games:
+  Restore and the resize first, then DLSS 5 and the interpolation at the **working size**, then one
+  final resize to your output (RTX Video Super Resolution when it's on). The **DLSS mode** picks
+  the working size as NVIDIA does, a share of the output: DLAA (the default, the output size
+  itself), Quality, Balanced, Performance, Ultra Performance, Auto (NVIDIA's pick for the output
+  size) or a Custom 33 to 100%. The lower modes are much faster and a little softer; Performance
+  for a 1080p to 4K upscale works at the source's own 1080p.
 * 🧠 **Optional NVIDIA DLSS 5 pass.** One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every
-  source frame before the smoothing, the order NVIDIA uses in games (frame generation after DLSS 5;
-  the **NVIDIA order** checkbox also moves Restore and the upscale in front of it, so DLSS 5 and the
-  interpolation run at the output size, as in games: slower, outputs up to 4K),
-  at DLAA quality (full resolution in, full resolution out), fed the way game integrations
+  source frame before the smoothing, the order NVIDIA uses in games (after Restore and the resize,
+  at the working size, frame generation after DLSS 5),
+  at DLAA quality (its full resolution in, full resolution out), fed the way game integrations
   feed it (NVIDIA's automatic mask and motion vectors from NVIDIA's Optical Flow hardware, in file
-  renders and live, so its history follows the picture), with NVIDIA's three
+  renders and live, so its history follows the picture, and a paused or held picture stays
+  perfectly still), with NVIDIA's three
   looks as a **Style** selector (Default, Natural, Cinematic) and its two global controls,
   **Structure Intensity** and **Tone Intensity**, as sliders. The host is bundled; the
   Neural Rendering runtime (`nvngx_dlssnr.dll`) is not included, and NVIDIA publishes no download
@@ -127,7 +134,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   list and click **Go Live**. No file, no render, no waiting; Stop (or Esc on the overlay) ends it.
   Same requirements as the DLSS 4.5 model (RTX 40/50, above 2× needs an RTX 50; the RIFE and GMFSS
   live models run on any RTX); windowed or borderless windows only (exclusive fullscreen
-  can't be captured). Changing the Speed target or the Image scale while a session is running restarts it a moment
+  can't be captured). Changing the Speed target or the DLSS mode while a session is running restarts it a moment
   later with the new setting, on the same window. Switching to another app pauses the smoothing
   and hides the overlay; returning to your window resumes it. The Display selector can also fill the screen (upscaled, aspect kept)
   or smooth the **whole monitor** at once (everything on it, works with every model including
@@ -144,7 +151,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   picture runs behind reality (about a source frame; made for watching, not for competitive
   play). With the RIFE model the interpolation runs inside the overlay itself instead of a
   separate engine process, which cuts latency and about a third of the processor use and, at
-  the image scales most people run, raises the smoothed frame rate; the separate engine
+  the working sizes most people run, raises the smoothed frame rate; the separate engine
   process steps in automatically whenever the overlay cannot run it. Plain RIFE file renders use
   the same engine host too.
 * 🎬 **A RIFE model for live action.** GMFSS is an anime specialist; one checkbox switches to
@@ -164,7 +171,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   provides it), live and for file renders. Fast, and clean on moderate motion; where very fast
   or twisting motion defeats the hardware's vectors it fades to a soft double image instead of
   breaking up. File renders with it take a
-  whole multiplier and no Sharpen, Upscale, Image scale, RTX HDR, Restore or DLSS 5 yet (it tells
+  whole multiplier and no Sharpen, Upscale, DLSS mode, RTX HDR, Restore or DLSS 5 yet (it tells
   you when a setting is in the way); live takes every effect.
 * 🎚️ **Plus the essentials:** FSR-style sharpening, a live before/after preview, every setting remembered
   between runs, and a quiet one-line notice when a newer release is out (nothing auto-downloads).

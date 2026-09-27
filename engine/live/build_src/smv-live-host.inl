@@ -472,6 +472,7 @@ struct Host
                 LOG("DLSS-G ready: SL %u.%u.%u, NGX model %u.%u.%u\n",
                     ver.versionSL.major, ver.versionSL.minor, ver.versionSL.build,
                     ver.versionNGX.major, ver.versionNGX.minor, ver.versionNGX.build);
+            installFocusShim(hwnd);
         }
 
         D3D12_COMMAND_QUEUE_DESC qd{};

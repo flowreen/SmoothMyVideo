@@ -68,8 +68,6 @@
      workspace), and an inline display must never leak the other mode's UI back on screen. */
   html.mode-live .vonly { display:none !important; }
   html.mode-video .lonly { display:none !important; }
-  /* the pass hints that change with the Order checkbox (NVIDIA order: body.nvorder) */
-  body.nvorder .nvo-off, body:not(.nvorder) .nvo-on { display:none !important; }
   /* Percentage painted on top of the fill, centred in the bar (taller bar so the larger text fits). */
   #pct { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
          color:#fff; font-size:22px; font-weight:600; pointer-events:none;
@@ -92,8 +90,8 @@
   .defmark { position:relative; display:inline-flex; align-items:center; isolation:isolate; }
   .defmark::before { content:''; position:absolute; left:calc(var(--def, 50%) - 1px); top:-2px; bottom:-2px;
                      width:2px; background:#e85c5c; z-index:-1; }
-  /* --def on the wrapper moves the tick for an off-centre default (the Image scale's 100% sits
-     at the right end, inset by the half thumb) */
+  /* --def on the wrapper moves the tick for an off-centre default (the DLSS mode's Custom 100%
+     sits at the right end, inset by the half thumb) */
   .defmark:has(input:disabled)::before { opacity:.45; }
   @keyframes spin { to { transform:rotate(360deg); } }
 </style>
@@ -197,20 +195,10 @@
 
   <div class="hint" style="margin:10px 0 0 4px">Numbered panels are the processing order: each frame goes through them top to bottom.</div>
 
-  <div class="panel vonly" id="orderpanel">
-    <div class="row">
-      <span class="k">Order</span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="nvorder" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA order <span class="hint">(Restore and the upscale first, then DLSS 5 and the interpolation at the output size, the order NVIDIA uses in games; slower, since the interpolation runs on the bigger frames; outputs above 4K keep the default order; off = the faster default order)</span>
-      </label>
-    </div>
-  </div>
-
   <div class="panel step" id="nrpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">DLSS 5</span>
-      <span class="hint">Opt-in. <span class="vonly"><span class="nvo-off">NVIDIA's Neural Rendering redraws each source frame first, before the interpolation (NVIDIA's order: frame generation runs on its output), so the generated frames inherit it.</span><span class="nvo-on">NVIDIA's Neural Rendering redraws each source frame after Restore and the upscale, at the output size, before the interpolation (frame generation runs on its output), so the generated frames inherit it.</span></span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame at the window size before the smoothing (the generated frames inherit it), inside the overlay host: about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (with RTX HDR on at full 1080p lower the Image scale; a 4K window costs about 37 ms per source frame); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
+      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each source frame after Restore and the resize to the working size (the DLSS mode), before the interpolation (NVIDIA's order: frame generation runs on its output), so the generated frames inherit it.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame at the window size before the smoothing (the generated frames inherit it), inside the overlay host: about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (with RTX HDR on at full 1080p lower the Image scale; a 4K window costs about 37 ms per source frame); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
@@ -261,7 +249,7 @@
   <div class="panel step" id="interppanel">
     <div class="row">
       <span class="k">Interpolate</span>
-      <span class="hint">generate in-between frames for smoother motion with the model chosen below (off = keep the source frames; every other panel still applies)<span class="vonly nvo-on">; runs at the output size in the NVIDIA order</span></span>
+      <span class="hint">generate in-between frames for smoother motion with the model chosen below (off = keep the source frames; every other panel still applies)<span class="vonly">; runs at the working size (the DLSS mode)</span></span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -350,13 +338,6 @@
       <span class="hint" id="screenwrap">matching <span id="screenhz">?</span> Hz</span>
       <span class="hint" id="ratehint"></span>
     </div>
-    <div class="row">
-      <span class="k">Image scale</span>
-      <span class="defmark" style="flex:0 1 180px;--def:calc(100% - 8px)"><input id="lvflow" type="range" min="1" max="100" step="1" value="100" style="width:100%"
-             title="Resolution the video is PROCESSED at, as % of its size (default 100, the red mark). The whole pipeline runs on the smaller image and the result is upscaled back (RTX VSR when enabled), so the model parses far fewer pixels and uses far less VRAM. Lower = faster and a softer, blurrier picture (below 50% the fine detail is gone). Applies to live smoothing and file renders alike."></span>
-      <span class="v" id="lvflownum">100</span>
-      <span class="hint" id="lvflowhint"></span>
-    </div>
   </div>
 
   <div class="panel step" id="restorepanel">
@@ -365,14 +346,14 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
       </label>
-      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly"><span class="nvo-off">runs on every output frame, the generated ones too, after the interpolation and before the upscale; slower</span><span class="nvo-on">runs first, once on each source frame, before the upscale</span></span><span class="lonly">runs on every presented frame, after the smoothing and before the upscale; heavy: caps a live session near 15 to 20 fps at 1080p (about 35 at 720p), lower the Image scale or the window size; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
+      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly">runs first, once on each source frame, before the resize to the working size</span><span class="lonly">runs on every presented frame, after the smoothing and before the upscale; heavy: caps a live session near 15 to 20 fps at 1080p (about 35 at 720p), lower the Image scale or the window size; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
     </div>
   </div>
 
   <div class="panel step" id="uppanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Upscale</span>
-      <span class="hint"><span class="vonly"><span class="nvo-off">resizes the frames to the output size after interpolation</span><span class="nvo-on">resizes each source frame to the output size after Restore, before DLSS 5 and the interpolation</span></span><span class="lonly">renders the smoothed picture at this size first, then fits it to the window or screen</span>; plain bicubic unless RTX Video Super Resolution is on</span>
+      <span class="hint"><span class="vonly">the output size: each source frame is resized to the working size (the DLSS mode's share of it) after Restore, before DLSS 5 and the interpolation, and the result to the output size after the interpolation</span><span class="lonly">renders the smoothed picture at this size first, then fits it to the window or screen</span>; plain bicubic unless RTX Video Super Resolution is on</span>
     </div>
     <div class="row">
       <span class="k">Size</span>
@@ -395,11 +376,28 @@
       </span>
       <span class="v hint" id="upinfo"></span>
     </div>
+    <div class="row" style="flex-wrap:wrap">
+      <span class="k">DLSS mode</span>
+      <select id="dlssmode" title="The working size, NVIDIA's DLSS modes: Restore's output, DLSS 5 and the interpolation run at this share of the output size, and the result is resized to the output after the interpolation (RTX VSR when it is on). DLAA (the default) works at the output size itself; the lower modes are faster and softer.">
+        <option value="auto">Auto</option>
+        <option value="quality">Quality (67%)</option>
+        <option value="balanced">Balanced (58%)</option>
+        <option value="performance">Performance (50%)</option>
+        <option value="ultra">Ultra Performance (33%)</option>
+        <option value="dlaa" selected>DLAA (100%)</option>
+        <option value="custom">Custom&hellip;</option>
+      </select>
+      <span id="dlsscustomwrap" style="display:none;align-items:center;gap:8px;">
+        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlsscustom" type="range" min="33" max="100" step="1" value="100" style="width:150px" aria-label="custom working size"></span>
+        <span class="v" id="dlsscustomnum">100%</span>
+      </span>
+      <span class="hint" id="dlssmodehint"></span>
+    </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler for the size above; off = plain bicubic; one-time runtime download)</span>
+        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler for the enlarging resize: the working size up to the output, else the source up to the working size; off = plain bicubic; one-time runtime download)</span>
       </label>
     </div>
     <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">

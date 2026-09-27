@@ -1558,6 +1558,23 @@ __global__ void k_pairDiff(const float* __restrict__ a, const float* __restrict_
     if (i >= n || *flag) return;
     if (a[i] != b[i]) *flag = 1;
 }
+// DLSS 5 reuse test: two decoded frames as the decoder handed them over, byte for byte, 16 bytes
+// per thread (cudaMalloc buffers are 256-byte aligned); any difference sets the flag, same
+// early-out contract as k_pairDiff
+__global__ void k_rawDiff(const unsigned char* __restrict__ a, const unsigned char* __restrict__ b,
+                          long long n, int* __restrict__ flag)
+{
+    const long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 16;
+    if (i >= n || *flag) return;
+    if (i + 16 <= n)
+    {
+        const uint4 x = *(const uint4*)(a + i), y = *(const uint4*)(b + i);
+        if (x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w) *flag = 1;
+        return;
+    }
+    for (long long k = i; k < n; k++)
+        if (a[k] != b[k]) { *flag = 1; return; }
+}
 __global__ void k_packOutRaw8(const void* __restrict__ src, int half, int planeStride, int rowStride,
                               int w, int h, unsigned char* __restrict__ dst)
 {
@@ -2759,6 +2776,8 @@ struct NativeRife
     bool nrFailed = false;           // an evaluate failed: off for the rest of the render
     bool nrFirst = true;             // the stream's first frame evaluates with Reset
     bool nrResetEvery = false;       // SMV_NR_RESET_EVERY=1: every frame (the equivalence gate's lever)
+    bool nrReuse = false;            // a decoded frame identical to the previous one takes its DLSS 5 output
+    uint64_t nrReused = 0;           // frames that did, this render
     bool nrZeroCopy = false;         // the shared-buffer route is up
     int nrW = 0, nrH = 0;            // the decoded picture's size, the size DLSS 5 runs at
     float* dRawPrev = nullptr;       // the previous decoded frame, packed: the identical-pair test's
@@ -2789,11 +2808,13 @@ struct NativeRife
     std::wstring nrDeltaPath;        // --nr-delta PATH: the pass's change map (the preview's mask)
     double nrMs = 0.0, nrMaxMs = 0.0;
     uint64_t nrN = 0;
-    // NVIDIA order (offline): Restore and the upscale run on the decoded frame (the pre-model
-    // SOURCE, sw x sh, in dSrcPl) before DLSS 5 and the model, which then run at the output
-    // size; sw / sh = 0 = the source is the model frame (the speed-first order, and live)
+    // NVIDIA order (offline): Restore and the resize run on the decoded frame (the pre-model
+    // SOURCE, sw x sh, in dSrcPl) before DLSS 5 and the model, which then run at the working
+    // size w x h, and the emit's final resize takes it to dw x dh; sw / sh = 0 = the source is the
+    // model frame (no working size, and live)
     int sw = 0, sh = 0;
     bool nvPre = false;
+    bool vsrPost = false;         // NVIDIA order: RTX VSR runs the final resize (it enlarges), not the first
     float* dSrcPl = nullptr;      // NVIDIA order: the decoded frame, planar fp32 at sw x sh
     float* dPres = nullptr;       // sharpen / fitAa: the fitted frame, planar fp32 at dw x dh
     float* dFitTmp = nullptr;     // fitAa: the horizontal pass, planar fp32 at dw x (uh or h)
@@ -2832,7 +2853,7 @@ struct NativeRife
                fSplatNorm = nullptr;
     CUfunction fPackInRaw16 = nullptr, fPackInRaw8 = nullptr,           // offline
                fPackOutRaw16 = nullptr, fPackOutRaw8 = nullptr, fExpand8to16 = nullptr;
-    CUfunction fPairDiff = nullptr;                                     // identical-pair test
+    CUfunction fPairDiff = nullptr, fRawDiff = nullptr;                 // identical-pair test, DLSS 5 reuse test
     CUfunction fNvofLuma = nullptr, fNvofUp = nullptr, fNvofMetric = nullptr;   // the nvof model
     CUfunction fSplatVel = nullptr, fVelNorm = nullptr, fPpDown = nullptr,     // its pull-warp tween
                fPpTop = nullptr, fPpUp = nullptr, fBlur1 = nullptr, fNvofCompose = nullptr;
@@ -4511,7 +4532,7 @@ static bool nativeBindKernels(NativeRife& nr)
         { &nr.fSplatSoft, "k_splatSoft" }, { &nr.fSplatNorm, "k_splatNorm" },
         { &nr.fPackInRaw16, "k_packInRaw16" }, { &nr.fPackInRaw8, "k_packInRaw8" },
         { &nr.fPackOutRaw16, "k_packOutRaw16" }, { &nr.fPackOutRaw8, "k_packOutRaw8" },
-        { &nr.fExpand8to16, "k_expand8to16" }, { &nr.fPairDiff, "k_pairDiff" },
+        { &nr.fExpand8to16, "k_expand8to16" }, { &nr.fPairDiff, "k_pairDiff" }, { &nr.fRawDiff, "k_rawDiff" },
         { &nr.fNvofLuma, "k_nvofLuma" }, { &nr.fNvofUp, "k_nvofUp" },
         { &nr.fNvofMetric, "k_nvofMetric" },
         { &nr.fSplatVel, "k_splatVel" }, { &nr.fVelNorm, "k_velNorm" }, { &nr.fPpDown, "k_ppDown" },
@@ -4750,9 +4771,20 @@ static bool nativeRtxInit(NativeRife& nr)
     // the fit rect (_Fit._setup_resize); VSR and the aa rule read that target
     const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
     const int sw = srcW(nr), sh = srcH(nr);
+    // the resize RTX VSR runs (vw x vh -> vtw x vth): the first one; offline in NVIDIA order there
+    // are two, the pre-model one (the decoded frame to the working size) and the final one (the
+    // working size to the output): VSR is ONE bridge instance, so it takes the final one when that
+    // enlarges, else the pre-model one, and the other stays bicubic
+    int vw = sw, vh = sh, vtw = tw, vth = th;
+    if (g_offline && nr.nvPre)
+    {
+        nr.vsrPost = nr.dw > nr.w && nr.dh > nr.h;
+        if (nr.vsrPost) { vw = nr.w; vh = nr.h; }
+        else { vtw = nr.w; vth = nr.h; }
+    }
     if (nr.vsrWant)
     {
-        if (tw > sw && th > sh) nr.vsr = true;
+        if (vtw > vw && vth > vh) nr.vsr = true;
         else LOG("native: live RTX VSR skipped (upscales only; this resize does not enlarge), bicubic\n");
     }
     if (nr.uw)
@@ -4781,8 +4813,11 @@ static bool nativeRtxInit(NativeRife& nr)
     // else the first resize target directly (restore-as-upscaler, one resize)
     if (nr.restore)
     {
-        nr.restTw = nr.vsr ? sw : tw;
-        nr.restTh = nr.vsr ? sh : th;
+        // NVIDIA order: Restore runs before the model, so its target is the working size, or the
+        // source when VSR runs the pre-model resize
+        const bool vsrAfter = nr.vsr && !nr.vsrPost;
+        nr.restTw = vsrAfter ? sw : (g_offline && nr.nvPre ? nr.w : tw);
+        nr.restTh = vsrAfter ? sh : (g_offline && nr.nvPre ? nr.h : th);
         if (nr.restTh > 4 * sh)
             NCHK(cudaMalloc((void**)&nr.dRestF, (size_t)3 * 16 * sw * sh * sizeof(float)), "alloc restore fp32 output");
         LOG("native: live restore: Real-ESRGAN animevideov3 (TensorRT) at %dx%d -> %dx%d\n",
@@ -4790,8 +4825,8 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     if (nr.vsr)
     {
-        NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)sw * sh * 4), "alloc VSR input");
-        NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)tw * th * 4), "alloc VSR output");
+        NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)vw * vh * 4), "alloc VSR input");
+        NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)vtw * vth * 4), "alloc VSR output");
     }
     // live TrueHDR runs once per captured frame at the capture size, offline on every output
     // frame at the output size, last (rtxvideo.run_hdr)
@@ -4857,15 +4892,15 @@ static bool nativeRtxInit(NativeRife& nr)
     {
         // warm-up eval on an opaque black frame, so the first presented frame pays nothing
         if (cuMemsetD32Async((CUdeviceptr)nr.dVsrIn, 0xFF000000u,
-                             (size_t)sw * sh, (CUstream)nr.stream) != CUDA_SUCCESS)
+                             (size_t)vw * vh, (CUstream)nr.stream) != CUDA_SUCCESS)
         { LOG("native: RTX VSR warm-up clear failed\n"); return false; }
         NCHK(cudaStreamSynchronize(nr.stream), "VSR warm-up stream sync");
-        const RtxRect ri{ 0, 0, (uint32_t)sw, (uint32_t)sh };
-        const RtxRect ro{ 0, 0, (uint32_t)tw, (uint32_t)th };
+        const RtxRect ri{ 0, 0, (uint32_t)vw, (uint32_t)vh };
+        const RtxRect ro{ 0, 0, (uint32_t)vtw, (uint32_t)vth };
         if (g_rtxb.evalVsr(nr.dVsrIn, nr.dVsrOut, ri, ro, &nr.vsrSet) != 1u)
         { LOG("native: the RTX VSR warm-up eval failed\n"); return false; }
         NCHK(cudaDeviceSynchronize(), "VSR warm-up eval sync");
-        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d\n", sw, sh, tw, th);
+        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d\n", vw, vh, vtw, vth);
     }
     if (nr.rtxHdr)
     {
@@ -7162,21 +7197,22 @@ static bool nativeOfflineThdr(NativeRife& nr, uint8_t* dO)
     return true;
 }
 
-// The first half of the offline passes on one planar source frame (ps / rs strides, srcW x
-// srcH: the model output in the speed-first order, the decoded frame before the model in
-// NVIDIA order): Restore (back to the source size when RTX VSR follows, else folded straight to
-// the output size), then the resize (RTX VSR when it runs, else clamped bicubic; offline only
-// enlarges, the downscale is folded into the decode). staged = nr.dPres holds the output-size
-// frame; src / ps / rs / srcHalf follow a Restore that hands on its fp32 frame. false = a launch
-// failed.
-static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& rs, int& srcHalf, bool& staged)
+// One offline resize stage on a planar frame of sw x sh (ps / rs strides) to tw x th: Restore
+// first when withRestore (back to the source size when RTX VSR follows, else folded straight to
+// the target), then the resize (RTX VSR when this stage owns it, else clamped bicubic; offline
+// only enlarges, a downscale is folded into the decode). The stages: without a working size the
+// model output to the output size; in NVIDIA order the decoded frame to the working size before
+// the model, and the final resize (no Restore) from the working size to the output after it.
+// staged = nr.dPres holds the tw x th frame; src / ps / rs / srcHalf follow a Restore that hands on
+// its fp32 frame. false = a launch failed.
+static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& rs, int& srcHalf, bool& staged,
+                               int sw, int sh, int tw, int th, bool withRestore, bool vsrHere)
 {
     cudaStream_t st = nr.stream;
-    int tw = nr.dw, th = nr.dh, sw = srcW(nr), sh = srcH(nr);
     const bool resize = tw != sw || th != sh;
-    const bool vsrNow = nr.vsr && !nr.vsrFailed && g_rtxb.created;
+    const bool vsrNow = vsrHere && nr.vsr && !nr.vsrFailed && g_rtxb.created;
     staged = false;
-    if (nr.restore && nr.ctxRest && !nr.restFailed)
+    if (withRestore && nr.restore && nr.ctxRest && !nr.restFailed)
     {
         if (vsrNow)
         {
@@ -7235,17 +7271,18 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
 }
 
 // NVIDIA order, before DLSS 5 and the model: the decoded frame in nr.dSrcPl (srcW x srcH)
-// through Restore and RTX VSR / bicubic to the output size, which is the model size here, then
-// into the model frame dCur (pw x ph, planes dps apart) with the packers' replicate pad
+// through Restore and RTX VSR / bicubic to the working size, which is the model size, then into
+// the model frame dCur (pw x ph, planes dps apart) with the packers' replicate pad
 static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
 {
     const void* src = nr.dSrcPl;
     int ps = srcW(nr) * srcH(nr), rs = srcW(nr), half = 0;
     bool staged = false;
-    if (!nativeOfflineStage(nr, src, ps, rs, half, staged)) return false;
+    if (!nativeOfflineStage(nr, src, ps, rs, half, staged, srcW(nr), srcH(nr), nr.w, nr.h, true, !nr.vsrPost))
+        return false;
     // unstaged = no resize and Restore dropped: the source already has the model size
     const float* from = staged ? nr.dPres : (const float*)src;
-    int fps = staged ? nr.dw * nr.dh : ps, frs = staged ? nr.dw : rs;
+    int fps = staged ? nr.w * nr.h : ps, frs = staged ? nr.w : rs;
     void* a[] = { &from, &fps, &frs, &nr.w, &nr.h, &dCur, &nr.pw, &nr.ph, &dps };
     if (cuLaunchKernel(nr.fPadPlanar, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1,
                        16, 16, 1, 0, (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
@@ -7255,18 +7292,24 @@ static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
 
 // The offline pass chain on one planar model-size frame (ps / rs strides, nr.w x nr.h), then
 // the quantisation, into dO as tight rgb48le (out16) or rgb24 at the output size nr.dw x nr.dh:
-// nativeOfflineStage (Restore and the resize; skipped in NVIDIA order, which ran it before the
-// model), then RCAS (DLSS 5 already ran on the decoded frame, before the interpolation:
-// nativeOfflineNr). With RTX HDR the SDR result goes through nativeOfflineThdr instead of the
-// quantisation and dO holds x2rgb10le words. A pass that fails is dropped for the rest of the
-// render with a line. false = a launch failed.
+// nativeOfflineStage (Restore and the resize; in NVIDIA order Restore ran before the model and
+// only the final resize from the working size is left), then RCAS (DLSS 5 already ran on the
+// decoded frame, before the interpolation: nativeOfflineNr). With RTX HDR the SDR result goes
+// through nativeOfflineThdr instead of the quantisation and dO holds x2rgb10le words. A pass that
+// fails is dropped for the rest of the render with a line. false = a launch failed.
 static bool nativeOfflineEmit(NativeRife& nr, const void* src, int ps, int rs, uint8_t* dO, bool out16,
                               int srcHalf = 0)
 {
     cudaStream_t st = nr.stream;
     const int tw = nr.dw, th = nr.dh;
     bool staged = false;   // nr.dPres holds the output-size frame
-    if (!nr.nvPre && !nativeOfflineStage(nr, src, ps, rs, srcHalf, staged)) return false;
+    if (!nr.nvPre)
+    {
+        if (!nativeOfflineStage(nr, src, ps, rs, srcHalf, staged, srcW(nr), srcH(nr), tw, th, true, true)) return false;
+    }
+    else if ((nr.w != tw || nr.h != th)
+             && !nativeOfflineStage(nr, src, ps, rs, srcHalf, staged, nr.w, nr.h, tw, th, false, nr.vsrPost))
+        return false;
     if (nr.sharpen > 0.0f)
     {
         // RCAS reads a tight dw x dh frame: an unresized, unrestored source is copied in first

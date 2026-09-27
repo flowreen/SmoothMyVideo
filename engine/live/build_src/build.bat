@@ -57,7 +57,7 @@ rem driver-installed and opened at run time by full path, nothing to link or shi
 rem No d3d12.lib on purpose: D3D12CreateDevice must keep resolving from sl.interposer.lib.
 cl /nologo /std:c++20 /EHsc /permissive- /O2 /W3 smv-live.cpp "%NRSRC%\nr_host.cpp" ^
    /I "%SL_SDK%\include" /I "%TRT_RTX_SDK%\include" /I "%SMV_CU%\include" /I cuda_shim ^
-   /I "%NRSRC%" /I "%NGX_SDK%\include" /I nvofa ^
+   /I "%NRSRC%" /I "%~dp0..\..\dlssg\build_src" /I "%NGX_SDK%\include" /I nvofa ^
    /link /LIBPATH:"%SL_SDK%\lib\x64" /LIBPATH:"%TRT_RTX_SDK%\lib" /LIBPATH:"%SMV_CU%\lib\x64" ^
    sl.interposer.lib tensorrt_rtx_1_6.lib tensorrt_onnxparser_rtx_1_6.lib cudart.lib cuda.lib delayimp.lib ^
    user32.lib gdi32.lib ole32.lib windowscodecs.lib dxguid.lib advapi32.lib ^

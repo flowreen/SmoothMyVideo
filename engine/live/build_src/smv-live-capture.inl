@@ -513,6 +513,21 @@ static const char kLiveNrCS[] =
 "    else dst[id.xy] = float4(g, o.a);\n"
 "}\n";
 
+// Identical-frame reuse: the capture against the last evaluated one (prev), every channel exactly
+// (UNORM and FP16 loads map one to one onto their codes); any difference stores this frame's tag,
+// so the flag never needs clearing and a stale value can never read as "differs".
+static const char kLiveNrCmpCS[] =
+"cbuffer C : register(b0) { uint tag; uint pad; uint w; uint h; };\n"
+"Texture2D<float4> cur : register(t0);\n"
+"Texture2D<float4> prev : register(t1);\n"
+"RWByteAddressBuffer flag : register(u0);\n"
+"[numthreads(8,8,1)]\n"
+"void csCmp(uint3 id : SV_DispatchThreadID)\n"
+"{\n"
+"    if (id.x >= w || id.y >= h) return;\n"
+"    if (any(cur[id.xy] != prev[id.xy])) flag.Store(0, tag);\n"
+"}\n";
+
 // Live DLSS 5 motion (DLSSNR.MVec), the live form of the offline k_nvofLuma / k_nvofUp / k_nrMv.
 // csLuma: the BT.709 luma (8-bit codes) of the colour csIn hands DLSS 5, into an R8 texture that
 // is copied into this frame's Optical Flow input slot. csMv, after NVOFA (current -> previous,
@@ -670,6 +685,17 @@ struct LiveNr
     std::wstring dumpPrefix;
     ComPtr<ID3D12Resource> mvRb, lumaRb;
     uint64_t mvRbPitch = 0, lumaRbPitch = 0;
+    // Identical frames (a paused or held picture): the capture is compared on this queue with the
+    // last evaluated one and the answer read back; equal = the last output goes back into the
+    // shared texture with no evaluate, so the picture stays exactly still (the kept history would
+    // re-shade it a code or two every refresh). SMV_NR_REUSE=0 = every frame evaluated
+    bool reuse = false;
+    bool havePrev = false;                       // prevTex holds this stream's last evaluated capture
+    ComPtr<ID3D12Resource> prevTex;              // capture format, COMMON between uses
+    ComPtr<ID3D12Resource> cmpBuf, cmpRb;        // the difference tag (raw UAV) and its readback
+    ComPtr<ID3D12PipelineState> psoCmp;
+    uint32_t cmpTag = 0;
+    uint64_t reused = 0;
 
     static D3D12_RESOURCE_BARRIER tr(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
     {
@@ -768,10 +794,11 @@ struct LiveNr
         // descriptors: set A (csIn) = shared SRV, null SRV, Color UAV; set B (csOut) = shared
         // SRV, Output SRV, outTex UAV; with motion, set L (csLuma, rs) at 6 = shared SRV, null SRV,
         // luma UAV, and sets M0 / M1 (csMv, rsMv) at 9 / 13 = flow SRV, this frame's slot SRV, the
-        // other slot SRV, MVec UAV (M0 when slot 0 holds this frame, M1 when slot 1 does)
+        // other slot SRV, MVec UAV (M0 when slot 0 holds this frame, M1 when slot 1 does); with
+        // reuse, set C (csCmp, rs) at 17 = shared SRV, prevTex SRV, the tag buffer's raw UAV
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 17;
+        hd.NumDescriptors = 20;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)))) { err = "descriptor heap creation failed"; return false; }
         descSize = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -807,7 +834,69 @@ struct LiveNr
             }
             dumpInit();
         }
+        {
+            wchar_t rv[8]{};
+            havePrev = false;
+            cmpTag = 0;
+            reused = 0;
+            reuse = !(GetEnvironmentVariableW(L"SMV_NR_REUSE", rv, 8) && rv[0] == L'0');
+            if (reuse && !reuseInit(capFmt, at(17)))
+            {
+                reuse = false;
+                LOG("live DLSS 5 native: identical-frame reuse unavailable, every frame evaluated\n");
+            }
+        }
         active = true;
+        return true;
+    }
+
+    // the reuse resources: prevTex, the tag buffer and its readback, csCmp; the descriptors from d
+    bool reuseInit(DXGI_FORMAT capFmt, D3D12_CPU_DESCRIPTOR_HANDLE d)
+    {
+        D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w; rd.Height = h;
+        rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = capFmt;
+        rd.SampleDesc = { 1, 0 };
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                nullptr, IID_PPV_ARGS(&prevTex))))
+            return false;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = 256; bd.Height = 1;
+        bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN;
+        bd.SampleDesc = { 1, 0 };
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                                nullptr, IID_PPV_ARGS(&cmpBuf))))
+            return false;
+        D3D12_HEAP_PROPERTIES rp{ D3D12_HEAP_TYPE_READBACK };
+        bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(dev->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                nullptr, IID_PPV_ARGS(&cmpRb))))
+            return false;
+        ComPtr<ID3DBlob> cs, e;
+        if (FAILED(D3DCompile(kLiveNrCmpCS, sizeof(kLiveNrCmpCS) - 1, nullptr, nullptr, nullptr, "csCmp", "cs_5_0", 0, 0, &cs, &e)))
+            return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.Get();
+        pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&psoCmp)))) return false;
+        dev->CreateShaderResourceView(shared12.Get(), nullptr, d);
+        d.ptr += descSize;
+        dev->CreateShaderResourceView(prevTex.Get(), nullptr, d);
+        d.ptr += descSize;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.FirstElement = 0;
+        ud.Buffer.NumElements = 64;
+        ud.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        dev->CreateUnorderedAccessView(cmpBuf.Get(), nullptr, &ud, d);
         return true;
     }
 
@@ -1074,6 +1163,74 @@ struct LiveNr
         D3D12_RESOURCE_BARRIER b[4];
         // every list reads the captured frame: the queue waits for the D3D11 copy first
         queue->Wait(inFence12.Get(), seq);
+        // identical to the last evaluated capture: the last output goes back, no evaluate
+        if (reuse && havePrev && !fresh)
+        {
+            if (!++cmpTag) ++cmpTag;   // never 0: the buffers start zeroed
+            struct { uint32_t tag, pad, w, h; } cc{ cmpTag, 0u, w, h };
+            b[0] = tr(shared12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            b[1] = tr(prevTex.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            b[2] = tr(cmpBuf.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list->ResourceBarrier(3, b);
+            bind(list.Get(), rs.Get(), psoCmp.Get(), 17, 4, &cc);
+            list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            b[0] = tr(shared12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            b[1] = tr(prevTex.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            b[2] = tr(cmpBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(3, b);
+            list->CopyBufferRegion(cmpRb.Get(), 0, cmpBuf.Get(), 0, 4);
+            b[0] = tr(cmpBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(1, b);
+            if (FAILED(list->Close())) return drop("command list Close failed");
+            ID3D12CommandList* cmp[] = { list.Get() };
+            queue->ExecuteCommandLists(1, cmp);
+            queue->Signal(done.Get(), ++doneValue);
+            done->SetEventOnCompletion(doneValue, doneEvent);
+            if (WaitForSingleObject(doneEvent, 5000) != WAIT_OBJECT_0)
+                return drop("the identical-frame test did not complete within 5 s");
+            uint32_t got = 0;
+            void* p = nullptr;
+            D3D12_RANGE rr{ 0, 4 };
+            if (FAILED(cmpRb->Map(0, &rr, &p))) return drop("the identical-frame readback failed");
+            memcpy(&got, p, 4);
+            D3D12_RANGE none{ 0, 0 };
+            cmpRb->Unmap(0, &none);
+            if (FAILED(list->Reset(alloc, nullptr))) return drop("command list Reset failed");
+            if (got != cmpTag)
+            {
+                b[0] = tr(outTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                b[1] = tr(shared12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                list->ResourceBarrier(2, b);
+                list->CopyResource(shared12.Get(), outTex.Get());
+                b[0] = tr(outTex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                b[1] = tr(shared12.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+                list->ResourceBarrier(2, b);
+                if (FAILED(list->Close())) return drop("command list Close failed");
+                ID3D12CommandList* back[] = { list.Get() };
+                queue->ExecuteCommandLists(1, back);
+                queue->Signal(capFence12.Get(), seq);
+                allocFence[allocIdx] = ++doneValue;
+                queue->Signal(done.Get(), doneValue);
+                allocIdx ^= 1;
+                lastSeq = seq;
+                frames++;
+                reused++;
+                recMs += (nowQpc100() - t0) / 1e4;
+                return true;
+            }
+        }
+        // this capture is the next frame's reference
+        if (reuse)
+        {
+            b[0] = tr(shared12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            b[1] = tr(prevTex.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->ResourceBarrier(2, b);
+            list->CopyResource(prevTex.Get(), shared12.Get());
+            b[0] = tr(shared12.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            b[1] = tr(prevTex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(2, b);
+            havePrev = true;
+        }
         // The motion field (DLSSNR.MVec): a first list writes this frame's luma into its Optical
         // Flow slot; from a stream's second frame on NVOFA (current -> previous) runs between the
         // two lists and the second turns its grid into the field before the evaluate. History is
@@ -1213,6 +1370,9 @@ struct LiveNr
         if (frames)
             LOG("live DLSS 5 native: %llu captured frames, %.2f ms CPU per frame to record and submit\n",
                 (unsigned long long)frames, recMs / (double)frames);
+        if (reused)
+            LOG("live DLSS 5 native: %llu captured frames identical to the previous one reused the last output\n",
+                (unsigned long long)reused);
         // no NGX release chain: it faults (measured), the process leaves through ExitProcess
         // (run() below) and the OS reclaims the session, exactly like dlssnr.exe
         host.abandon();

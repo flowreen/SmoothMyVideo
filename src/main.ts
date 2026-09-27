@@ -1392,7 +1392,8 @@ type RunOpts = {
   fps?: number;
   sharpen?: number;
   restore?: boolean;
-  nvorder?: boolean;
+  dlssmode?: string; // the DLSS mode (dlssScaleArg)
+  dlsscustom?: number; // Custom: the working size in % of the output
   dlssnr?: boolean;
   nrstructure?: number;
   nrtone?: number;
@@ -1406,13 +1407,22 @@ type RunOpts = {
   dv?: boolean;
   hp?: boolean;
   codec?: string;
-  flowscale?: number; // the Image scale % (historic name)
   hdrcolor?: string;
   hdrsat?: number;
   hdrcon?: number;
   hdrsb?: number;
   hdrvib?: number;
 };
+
+// The GUI's DLSS mode as the CLI's --scale value: auto / quality / balanced / performance / ultra
+// by name, Custom as the working size's share of the output (33..100 %); null = DLAA, the default.
+function dlssScaleArg(mode?: string, custom?: number): string | null {
+  if (mode === 'custom') {
+    const pct = Math.min(100, Math.max(33, Math.round(custom ?? 100)));
+    return pct >= 100 ? null : (pct / 100).toFixed(2);
+  }
+  return mode && ['auto', 'quality', 'balanced', 'performance', 'ultra'].includes(mode) ? mode : null;
+}
 
 // The render command line for one request (pure: the GUI state in, render.py's argv out; the TS
 // orchestrator dist/render/cli.js takes the same argv).
@@ -1431,25 +1441,20 @@ function engineArgs(opts: RunOpts): string[] {
     if (opts.model === 'lsfg') args.push('--lsfg'); // Frame Blend: flow-warp interpolation
     if (opts.model === 'nvof') args.push('--nvof'); // NVIDIA Optical Flow: hardware flow + splat, native host only
     if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
-    // Scale slider (shared with Live): the whole pipeline runs at this fraction of the
-    // source size and the upscale pass restores the output size (image scale). Omitted = full
-    // size.
-    if (opts.flowscale && opts.flowscale > 0 && opts.flowscale < 100)
-      args.push('--scale', (opts.flowscale / 100).toFixed(2));
   }
+  // DLSS mode (the mode selector): the working size Restore's output, DLSS 5 and the model run at,
+  // NVIDIA's share of the output (plan.ts workPlan); DLAA, the default, is the output itself
+  const scaleArg = dlssScaleArg(opts.dlssmode, opts.dlsscustom);
+  if (scaleArg) args.push('--scale', scaleArg);
   // FSR-style RCAS sharpening strength (GUI checkbox + slider). 0/omitted = off, leaving the
   // frames value-preserving; >0 enables the in-engine RCAS pass. Works with or without interp.
   if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
-  // AI detail restoration (GUI Restore checkbox): Real-ESRGAN animevideov3 on every output
-  // frame, before the upscale (in the NVIDIA order once per source frame, first). Works with or
-  // without interpolation.
+  // AI detail restoration (GUI Restore checkbox): Real-ESRGAN animevideov3 once per source frame,
+  // first (it folds straight to the working size). Works with or without interpolation.
   if (opts.restore) args.push('--restore');
-  // NVIDIA order (GUI Order checkbox): Restore and the upscale on each source frame first, then
-  // DLSS 5 and the interpolation at the output size (the engine keeps the default order above 4K)
-  if (opts.nvorder) args.push('--nvidia-order');
-  // NVIDIA DLSS 5 Neural Rendering (GUI checkbox + the two sliders): a DLAA-class pass once per
-  // source frame, before the interpolation (in the NVIDIA order after the upscale, at the output
-  // size). The renderer only sends it when the user-supplied runtime is installed (dlssnr-ready).
+  // NVIDIA DLSS 5 Neural Rendering (GUI checkbox + the two sliders): once per source frame at the
+  // working size, after Restore and the resize, before the interpolation (NVIDIA's order). The
+  // renderer only sends it when the user-supplied runtime is installed (dlssnr-ready).
   if (opts.dlssnr)
     args.push(
       '--dlssnr',
@@ -1468,10 +1473,11 @@ function engineArgs(opts: RunOpts): string[] {
   // sources inside TRT-safe flow shapes, so dropping it here re-breaks 4K GMFSS renders).
   // Without --rtx-vsr an upscale is a bicubic resize; with it, RTX Video Super Resolution.
   if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) args.push('--upscale', String(opts.upscale));
-  // RTX VSR: use the real RTX Video SDK (the engine/rtxvideo CUDA bridge) for the upscale step.
-  // Only meaningful alongside --upscale (it supplies the target resolution). Falls back to bicubic
-  // if the bridge or RTX Video runtime is unavailable.
-  if (opts.rtxvsr && opts.upscale && opts.upscale > 1) args.push('--rtx-vsr');
+  // RTX VSR: the real RTX Video SDK (the engine/rtxvideo CUDA bridge) for an enlarging resize: the
+  // final one from the working size (a mode below DLAA or an upscale), else the one before the
+  // model; the plan skips it when nothing enlarges. Falls back to bicubic if the bridge or the RTX
+  // Video runtime is unavailable.
+  if (opts.rtxvsr) args.push('--rtx-vsr');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
   // on, the RTX bridge does VSR then TrueHDR in one pass). The engine masters at a fixed 1000-nit
   // peak and writes the HDR10 metadata, so there is no per-display nits knob; it falls back to an
@@ -1697,7 +1703,8 @@ ipcMain.handle(
       upscale?: number;
       rtxvsr?: boolean;
       restore?: boolean;
-      nvorder?: boolean;
+      dlssmode?: string; // the DLSS mode (dlssScaleArg)
+      dlsscustom?: number; // Custom: the working size in % of the output
       dlssnr?: boolean;
       nrstructure?: number;
       nrtone?: number;
@@ -1717,7 +1724,8 @@ ipcMain.handle(
       const args = [PREVIEW_CLI, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
       if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
       if (opts.restore) args.push('--restore');
-      if (opts.nvorder) args.push('--nvidia-order');
+      const pScale = dlssScaleArg(opts.dlssmode, opts.dlsscustom);
+      if (pScale) args.push('--scale', pScale);
       if (opts.dlssnr)
         args.push(
           '--dlssnr',
@@ -1731,10 +1739,8 @@ ipcMain.handle(
       if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
         args.push('--nr-passes', String(Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
       if (opts.dlssnr && opts.nrmask) args.push('--nr-mask'); // heat map of the DLSS 5 change, <prefix>_nrmask.png
-      if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) {
-        args.push('--upscale', String(opts.upscale));
-        if (opts.rtxvsr && opts.upscale > 1) args.push('--rtx-vsr'); // VSR upscales only
-      }
+      if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) args.push('--upscale', String(opts.upscale));
+      if (opts.rtxvsr) args.push('--rtx-vsr'); // the plan runs it on an enlarging resize only
       if (opts.hdr)
         args.push(
           '--rtx-hdr',

@@ -3,9 +3,9 @@
 // (+ <out>_nrmask.png), and preview.py's one stdout line. The frame comes from the render's own
 // decode (ffmpeg at the render's pixel format, the downscale folded in exactly as the render
 // folds it), the processed side runs the render's own pass chain in the native host
-// (smv-live.exe --offline --no-interp, one frame: DLSS 5 -> restore -> upscale / RTX VSR -> RCAS
-// -> TrueHDR, or with --nvidia-order restore -> upscale / RTX VSR -> DLSS 5 -> RCAS -> TrueHDR),
-// so the pane is the render's frame. This process only converts for display: the
+// (smv-live.exe --offline --no-interp, one frame, NVIDIA's order at the render's working size:
+// restore -> resize to the working size -> DLSS 5 -> the final resize / RTX VSR -> RCAS ->
+// TrueHDR), so the pane is the render's frame. This process only converts for display: the
 // PQ tonemaps, the 1:1 resize of the original pane, the DLSS 5 change mask and the PNG files;
 // that arithmetic follows preview.py's numpy float32 (Math.fround), whose comments carry the
 // reasoning. Two deliberate changes: the frame is decoded by ffmpeg like the render (preview.py
@@ -17,7 +17,7 @@ import * as path from 'path';
 import * as zlib from 'zlib';
 import { INFERNO } from './inferno';
 import { engineDir, tool } from './native';
-import { outputSize, scalePlan } from './plan';
+import { workPlan } from './plan';
 import { frameCount, probe, sourceBits, vfrConform } from './probe';
 import { pyFixed, pyG } from './pyfmt';
 
@@ -30,7 +30,7 @@ export interface PreviewArgs {
   rtx_hdr: boolean;
   sharpen: number;
   restore: boolean;
-  nvidia_order: boolean;
+  scale: string | null; // --scale: the render's DLSS mode or working-size share
   upscale: number;
   rtx_vsr: boolean;
   dlssnr: boolean;
@@ -55,7 +55,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     rtx_hdr: false,
     sharpen: 0,
     restore: false,
-    nvidia_order: false,
+    scale: null,
     upscale: 1,
     rtx_vsr: false,
     dlssnr: false,
@@ -80,7 +80,6 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
   const flags: Record<string, keyof PreviewArgs> = {
     '--rtx-hdr': 'rtx_hdr',
     '--restore': 'restore',
-    '--nvidia-order': 'nvidia_order',
     '--rtx-vsr': 'rtx_vsr',
     '--dlssnr': 'dlssnr',
     '--nr-mask': 'nr_mask',
@@ -106,11 +105,12 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     if (k in flags) rec[flags[k]] = true;
     else if (k in floats) rec[floats[k]] = num(k, argv[++i]);
     else if (k in ints) rec[ints[k]] = num(k, argv[++i], true);
-    else if (k === '--frame' || k === '--out' || k === '--hdr-color') {
+    else if (k === '--frame' || k === '--out' || k === '--hdr-color' || k === '--scale') {
       const v = argv[++i];
       if (v === undefined) throw new Error(`argument ${k}: expected one argument`);
       if (k === '--frame') a.frame = v;
       else if (k === '--out') a.out = v;
+      else if (k === '--scale') a.scale = v;
       else a.hdr_color = v;
     } else if (k.startsWith('-') && k.length > 1) throw new Error(`unrecognized arguments: ${k}`);
     else pos.push(k);
@@ -538,17 +538,20 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   const srcHdr = transfer === 'smpte2084' || transfer === 'arib-std-b67';
   let doHdr = a.rtx_hdr && !srcHdr;
   const up = a.upscale <= 0 ? 1.0 : clamp(a.upscale, 1.0 / 16, 16.0);
-  const plan = scalePlan(pr.st, pr.w, pr.h, up, null);
+  const plan = workPlan(pr.st, pr.w, pr.h, up, a.scale);
+  if (typeof plan === 'string') throw new Error(plan);
   const W = plan.w,
     H = plan.h;
-  const [OW, OH] = outputSize(W, H, plan.upscaleF, plan.upscale);
+  const [OW, OH] = [plan.outW, plan.outH];
+  const [WW, WH] = [plan.workW, plan.workH];
   if (doHdr && (OW > 8192 || OH > 8192)) doHdr = false;
   const bits: 8 | 16 = sourceBits(pr.st, String(pr.st.pix_fmt || 'yuv420p')) >= 10 ? 16 : 8;
   const DEC_FMT = bits === 16 ? 'rgb48le' : 'rgb24',
     bpp = bits === 16 ? 6 : 3;
 
-  // the frame: the render's decode (its pixel format and downscale fold), seeked to idx
-  const decode = async (at: number) => {
+  // the frame: the render's decode (its pixel format and downscale fold), seeked to idx; the
+  // original pane decodes without the fold (vf empty, the source size)
+  const decode = async (at: number, vf: string[] = plan.vf, dw: number = W, dh: number = H) => {
     const ss = at > 0 ? ['-ss', String(Math.max(0, ((at - 0.5) * vfr.den) / vfr.num))] : [];
     const r = await run(
       FFMPEG,
@@ -561,7 +564,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         '-an',
         '-sn',
         '-dn',
-        ...(plan.vf.length ? ['-vf', plan.vf.join(',')] : []),
+        ...(vf.length ? ['-vf', vf.join(',')] : []),
         '-frames:v',
         '1',
         '-f',
@@ -573,11 +576,19 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
       null,
       ENGINE,
     );
-    return r.out.length >= W * H * bpp ? r.out.subarray(0, W * H * bpp) : null;
+    return r.out.length >= dw * dh * bpp ? r.out.subarray(0, dw * dh * bpp) : null;
   };
-  const px = (await decode(idx)) ?? (idx > 0 ? await decode(0) : null); // a missed seek: frame 0, like preview.py
+  let at = idx;
+  let px = await decode(at);
+  if (!px && idx > 0) px = await decode((at = 0)); // a missed seek: frame 0, like preview.py
   if (!px) throw new Error('could not read a frame from ' + a.input);
   const orig: Frame = { w: W, h: H, bits, px };
+  // the before pane: the source itself when the working size folds the decode
+  let before: Frame = orig;
+  if (plan.vf.length) {
+    const full = await decode(at, [], pr.w, pr.h);
+    if (full) before = { w: pr.w, h: pr.h, bits, px: full };
+  }
 
   let vsrUsed = false,
     restoreUsed = false,
@@ -585,7 +596,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   let proc: Frame | null = null,
     hdrWords: Buffer | null = null,
     delta: Float32Array | null = null;
-  let needVsr = plan.upscale && OW > W && a.rtx_vsr;
+  let needVsr = OW > W && OH > H && a.rtx_vsr;
   const rtxDir = env.SMV_RTXVIDEO_DIR || path.join(ENGINE, 'rtxvideo');
   if ((needVsr || doHdr) && !['rtxvideo_cuda.dll', 'nvngx_truehdr.dll'].every((d) => isFile(path.join(rtxDir, d)))) {
     needVsr = false; // like preview.py: no RTX Video bridge means bicubic + SDR
@@ -621,7 +632,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
     }
     if (strength > 0) args.push('--sharpen', pyG(strength));
     if (a.restore) args.push('--restore');
-    if (a.nvidia_order) args.push('--nvidia-order');
+    if (WW !== W || WH !== H || a.restore) args.push('--work-w', String(WW), '--work-h', String(WH));
     const deltaFile = path.resolve(a.out) + '_nrdelta.f32';
     if (nrOn) {
       args.push(
@@ -672,11 +683,10 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
       try {
         const b = fs.readFileSync(deltaFile);
         fs.unlinkSync(deltaFile);
-        // DLSS 5 runs on the decoded frame (the map is W x H), or in the NVIDIA order after the
-        // upscale (OW x OH; the host keeps the default order above 4K, so the size tells which)
-        if (b.length === W * H * 4 || b.length === OW * OH * 4) {
+        // DLSS 5 runs at the working size (the map is WW x WH)
+        if (b.length === WW * WH * 4) {
           const m = new Float32Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.length));
-          delta = m.length === OW * OH ? m : scaleMap(m, W, H, OW, OH);
+          delta = WW === OW && WH === OH ? m : scaleMap(m, WW, WH, OW, OH);
         }
       } catch {
         /* no map: the pane shows the processed picture as usual */
@@ -686,9 +696,9 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
 
   // display conversion (preview.py: a PQ source gets the self-anchored tonemap on both panes)
   const pq = transfer === 'smpte2084';
-  let origDisp = pq ? tonemapPq(orig) : toU8(orig);
-  const procDisp = hdrWords ? tonemapHdr(hdrWords, OW, OH, orig) : pq ? tonemapPq(proc!) : toU8(proc!);
-  if (OW !== W || OH !== H) origDisp = resizeCubic(origDisp, W, H, OW, OH); // 1:1 zoom with the processed pane
+  let origDisp = pq ? tonemapPq(before) : toU8(before);
+  const procDisp = hdrWords ? tonemapHdr(hdrWords, OW, OH, before) : pq ? tonemapPq(proc!) : toU8(proc!);
+  if (OW !== before.w || OH !== before.h) origDisp = resizeCubic(origDisp, before.w, before.h, OW, OH); // 1:1 zoom with the processed pane
   const outDir = path.dirname(path.resolve(a.out));
   if (outDir) fs.mkdirSync(outDir, { recursive: true });
   const pOrig = a.out + '_original.png',

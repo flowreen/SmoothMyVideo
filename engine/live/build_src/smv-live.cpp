@@ -138,10 +138,6 @@ static int g_upscaleH = 0;             // --upscale H: forwarded to the server (
                                        // height as the internal render size before the fit)
 static bool g_restore = false;         // --restore: forwarded to the server (Real-ESRGAN first on
                                        // every composed frame, the app's Restore checkbox)
-static bool g_nvOrder = false;         // --nvidia-order (offline): Restore and the upscale on the
-                                       // decoded frame, then DLSS 5 and the interpolation at the
-                                       // output size (the app's NVIDIA order checkbox); off = the
-                                       // speed-first order
 static bool g_dlssnr = false;          // --dlssnr: forwarded to the server (DLSS 5 Neural Rendering
                                        // once per captured frame, the app's NVIDIA DLSS 5 checkbox)
 static double g_nrStructure = 1.0;     // --nr-structure F (0..2, the DLSS 5 Structure Intensity)
@@ -296,6 +292,7 @@ static void slLog(sl::LogType type, const char* msg)
     LOG("[SL%d] %s", (int)type, msg);
 }
 
+#include "sl_focus_shim.h"
 #include "smv-live-host.inl"
 #include "smv-live-capture.inl"
 #include "smv-live-native.inl"
@@ -371,8 +368,8 @@ static void tsPaint(HDC dc, const RECT& cr)
 
 // The parked test source is a layered popup that hands DWM its whole frame on every tick: GDI
 // painting is clipped to the part of a window that lies on the desktop, so a parked painted window
-// showed one pixel and the capture got a white frame (measured 2026-09-27, harness p53). The
-// frame follows the client size, so a harness may resize the window.
+// showed one pixel and the capture got a white frame. The frame follows the client size, so a
+// harness may resize the window.
 static bool g_tsLayered = false;
 static void tsUpdateLayered(HWND h)
 {
@@ -1023,6 +1020,7 @@ struct OfflineArgs
     bool nvof = false;          // --nvof: the NVIDIA Optical Flow model (no engines, no handoff)
     std::wstring cacheW;        // --cache DIR: the kernel cubin folder when no jit path names one
     int outW = 0, outH = 0;     // --out-w / --out-h: the output size (render.py's OUT_W x OUT_H), 0 = w x h
+    int workW = 0, workH = 0;   // --work-w / --work-h: the working size (the DLSS mode x the output), 0 = none
     bool outX2 = false;         // --out-pixfmt x2rgb10le: the RTX HDR encode pipe (needs --rtx-hdr)
     std::wstring hdrStatsW;     // --hdr-stats PATH: the light statistics JSON render.py reads at the finalize
     bool hdrDv = false, hdrHp = false;   // --hdr-dv / --hdr-hp: add the DV L1 / HDR10+ per-frame records
@@ -1100,10 +1098,11 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
         // the per-frame passes: render_passes' order on every output frame
         else if (wcscmp(argv[i], L"--out-w") == 0 && i + 1 < argc) oa.outW = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--out-h") == 0 && i + 1 < argc) oa.outH = _wtoi(argv[++i]);
+        else if (wcscmp(argv[i], L"--work-w") == 0 && i + 1 < argc) oa.workW = _wtoi(argv[++i]);
+        else if (wcscmp(argv[i], L"--work-h") == 0 && i + 1 < argc) oa.workH = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--sharpen") == 0 && i + 1 < argc) g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0) g_rtxVsr = true;
         else if (wcscmp(argv[i], L"--restore") == 0) g_restore = true;
-        else if (wcscmp(argv[i], L"--nvidia-order") == 0) g_nvOrder = true;
         // RTX HDR: TrueHDR last on every output frame, x2rgb10le out
         else if (wcscmp(argv[i], L"--rtx-hdr") == 0) g_rtxHdr = true;
         else if (wcscmp(argv[i], L"--hdr-color") == 0 && i + 1 < argc) wcsncpy_s(g_hdrColor, argv[++i], _TRUNCATE);
@@ -1163,24 +1162,30 @@ static int runOffline(int argc, wchar_t** argv)
 static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, bool namedPipes)
 {
     int w = oa.w, h = oa.h;   // not const: kernel argument arrays take their addresses as void*
-    // NVIDIA order: the decoded frame (srcW x srcH) goes through Restore and the upscale first,
-    // so the model, DLSS 5 included, works at the output size (w x h from here on); above 4K the
-    // interpolation at the output size is out of reach and the speed-first order stays
+    // NVIDIA's order at the working size (--work-w / --work-h, the DLSS mode x the output): the
+    // decoded frame (srcW x srcH) goes through Restore and the resize to the working size first, the
+    // model and DLSS 5 run at it (w x h from here on), the emit's final resize takes it to the output.
+    // Without the flags the decoded size is the working size and Restore runs in the emit.
     int srcW = w, srcH = h;
     bool nvPre = false;
-    if (g_nvOrder)
+    if (oa.workW > 0 && oa.workH > 0)
     {
         const int ow = oa.outW > 0 ? oa.outW : w, oh = oa.outH > 0 ? oa.outH : h;
-        if ((long long)ow * oh > 3840LL * 2160)
-            LOG("offline: NVIDIA order runs the interpolation at the output size, at most 3840x2160: "
-                "%dx%d keeps the speed-first order\n", ow, oh);
-        else if (g_restore || ow != w || oh != h)
+        if ((long long)oa.workW * oa.workH > 3840LL * 2160)
+        { LOG("offline: the working size %dx%d is above 3840x2160, the interpolation's reach\n", oa.workW, oa.workH); return 1; }
+        if (oa.workW < w || oa.workH < h || oa.workW > ow || oa.workH > oh)
+        {
+            LOG("offline: the working size %dx%d must lie between the decoded %dx%d and the output %dx%d (a "
+                "downscale folds into the decode)\n", oa.workW, oa.workH, w, h, ow, oh);
+            return 1;
+        }
+        if (g_restore || oa.workW != w || oa.workH != h)
         {
             nvPre = true;
-            w = ow;
-            h = oh;
-            LOG("offline: NVIDIA order: Restore and the upscale on the decoded %dx%d first, DLSS 5 and "
-                "the interpolation at %dx%d\n", srcW, srcH, w, h);
+            w = oa.workW;
+            h = oa.workH;
+            LOG("offline: NVIDIA order: Restore and the resize on the decoded %dx%d first, DLSS 5 and the "
+                "interpolation at %dx%d%s\n", srcW, srcH, w, h, (w != ow || h != oh) ? ", then the final resize" : "");
         }
     }
     // --fps mode: render_loops.fps_loop / drba_loop at render.py's ratio,
@@ -1478,6 +1483,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             // pure function of its input, so a route gate can compare it frame by frame
             wchar_t re[8]{};
             nr.nrResetEvery = GetEnvironmentVariableW(L"SMV_NR_RESET_EVERY", re, 8) && re[0] == L'1';
+            // a decoded frame byte-identical to the previous one takes the previous frame's output
+            // instead of an evaluate, so a paused or held picture stays exactly still (the kept
+            // history would re-shade it a code or two every frame); SMV_NR_REUSE=0 = every frame
+            // evaluated
+            wchar_t ru[8]{};
+            nr.nrReuse = !(GetEnvironmentVariableW(L"SMV_NR_REUSE", ru, 8) && ru[0] == L'0');
             // A handoff that cannot start falls back to staging with a line; the pass still runs, so
             // the line carries no [dlss5] tag (the preview reads that tag as "DLSS 5 not applied").
             // Motion that cannot start leaves the shared field at zero (no motion) with a line.
@@ -1502,10 +1513,11 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     || cudaHostAlloc((void**)&nr.hNrOut, (size_t)w * h * 8, cudaHostAllocDefault) != cudaSuccess))
             { LOG("offline: DLSS 5 buffers failed\n"); return 2; }
             LOG("DLSS 5 Neural Rendering ready (DLAA, structure %.2f, tone %.2f, style %d, %s, before the "
-                "interpolation%s%s, passes %d%s) @ %dx%d\n",
+                "interpolation%s%s, passes %d%s%s) @ %dx%d\n",
                 set.structure, set.tone, set.style, nr.nrZeroCopy ? "zero-copy" : "CPU staging",
                 nr.nrMotion ? ", motion vectors" : ", no motion vectors", autoMask ? ", auto mask" : "",
-                host->passes(), nr.nrResetEvery ? ", SMV_NR_RESET_EVERY" : "", w, h);
+                host->passes(), nr.nrResetEvery ? ", SMV_NR_RESET_EVERY" : "",
+                nr.nrReuse ? ", identical frames reuse the last output" : "", w, h);
             if (host->passes() < set.passes)
                 LOG("offline: DLSS 5 runs %d of %d passes (%s)\n", host->passes(), set.passes, host->passNote().c_str());
         }
@@ -1759,7 +1771,32 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 cudaMemcpyAsync(nr.dXh, nr.dXh + 3 * plane, 3 * plane * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st);
         }
         float* dCur = nr.dX + 3 * plane;
-        if (nvPre)
+        // DLSS 5 reuse: the decoded bytes against the previous frame's (dRaw alternates, so the other
+        // buffer still holds them). Identical = this frame takes the previous frame's DLSS 5 output
+        // and skips the pack, NVIDIA order's stage and the evaluate: a pair route's shift above left
+        // that output in dX; --no-interp forms no pairs and never shifts, so it is still in dCur
+        const bool nrOn = nr.nrHost && !nr.nrFailed;
+        bool nrSame = false, nrTested = false;
+        if (nrOn && nr.nrReuse && i > 0 && !nr.nrFirst)
+        {
+            const long long nb = (long long)frameBytes;
+            const uint8_t* dPrevRaw = dRaw[(i - 1) & 1];
+            void* ad[] = { (void*)&dPrevRaw, &dR, (void*)&nb, &nr.dStaticFlag };
+            const unsigned blocks = (unsigned)((nb + 16LL * 256 - 1) / (16LL * 256));
+            if (cudaMemsetAsync(nr.dStaticFlag, 0, sizeof(int), st) != cudaSuccess
+                || cuLaunchKernel(nr.fRawDiff, blocks, 1, 1, 256, 1, 1, 0, (CUstream)st, ad, nullptr) != CUDA_SUCCESS
+                || cudaMemcpyAsync(nr.hStaticFlag, nr.dStaticFlag, sizeof(int), cudaMemcpyDeviceToHost, st) != cudaSuccess
+                || cudaStreamSynchronize(st) != cudaSuccess)
+            { io.setFail("DLSS 5 reuse test failed"); failed = true; break; }
+            nrSame = *nr.hStaticFlag == 0;
+            nrTested = true;
+            if (nrSame && havePrev
+                && cudaMemcpyAsync(dCur, nr.dX, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+            { io.setFail("DLSS 5 reuse copy failed"); failed = true; break; }
+        }
+        if (nrSame)
+            nr.nrReused++;
+        else if (nvPre)
         {
             // NVIDIA order: the decoded frame at its own size, then Restore / RTX VSR / bicubic
             // to the model (output) size, into dCur with the pad
@@ -1795,13 +1832,15 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         };
         const bool testPair = havePrev && g_staticHold && nr.fPairDiff && !oa.dlssg;   // DLSS 4.5 never holds (hold_ok)
         bool pairStatic = false, pairTested = false;
+        // the reuse test above compared the decoded frames already: it decides the pair too
+        if (nrTested && testPair) { pairStatic = nrSame; pairTested = true; }
         // DLSS 5 on the decoded frame, in place, before anything reads it (the Head encode, the
         // pair's model, the emit): NVIDIA's order, frame generation after DLSS 5. The pair test
         // compares the decoded frames first: the pass keeps history, so two identical frames can
         // come back a fraction of a level apart.
-        if (nr.nrHost && !nr.nrFailed)
+        if (nrOn && !nrSame)
         {
-            if (testPair)
+            if (testPair && !pairTested)
             {
                 if (!identicalPair(nr.dRawPrev, pairStatic)) { io.setFail("identical-pair test failed"); failed = true; break; }
                 pairTested = true;
@@ -2248,6 +2287,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         LOG("offline: DLSS 5 %.2f ms mean, %.2f ms max over %llu frames (%s)\n",
             nr.nrN ? nr.nrMs / (double)nr.nrN : 0.0, nr.nrMaxMs, (unsigned long long)nr.nrN,
             nr.nrZeroCopy ? "host submit, zero-copy" : "render and staging");
+        if (nr.nrReused)
+            LOG("offline: DLSS 5 reused its last output on %llu frames identical to the previous one\n",
+                (unsigned long long)nr.nrReused);
         cudaDeviceSynchronize();   // the last fence wait has run before its semaphore goes
         nativeNrMotionFree(nr);
         nativeNrReleaseImports(nr);
@@ -2767,7 +2809,6 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_sharpen = 0.0;
             g_rtxVsr = false;
             g_restore = false;
-            g_nvOrder = false;
             g_rtxHdr = false; wcscpy_s(g_hdrColor, L"vivid"); g_hdrSat = 0; g_hdrCon = 100;
             g_hdrVib = 0.0; g_hdrSb = 0.0;
             g_dlssnr = false; g_nrStructure = 1.0; g_nrTone = 1.0; g_nrStyle = 1; g_nrPasses = 1;

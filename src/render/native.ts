@@ -22,7 +22,7 @@ import {
   pyReprStr,
   Say,
 } from './encode';
-import { isGmfss, nvofRefusal, outputSize, RenderArgs, scalePlan } from './plan';
+import { isGmfss, nvofRefusal, RenderArgs, workPlan } from './plan';
 import { thumbPng } from './preview';
 import { frameCount, needMkv, outputRate, probe, probeTracks, sourceBits, tag, vfrConform } from './probe';
 import { pyFixed, pyFloatRepr, pyG, pyRound } from './pyfmt';
@@ -178,10 +178,15 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     HDR_SATBOOST = clamp(args.hdr_satboost, 0.0, 1.0);
 
   let { w: W, h: H, num, den, nb: NB, st: ST } = probe(FFPROBE, inp);
-  const plan = scalePlan(ST, W, H, UPSCALE_F, args.scale);
-  [W, H, UPSCALE_F, UPSCALE] = [plan.w, plan.h, plan.upscaleF, plan.upscale];
+  // NVIDIA's order: W x H = the decode, WORK = the DLSS mode x the output (DLSS 5 and the model)
+  const plan = workPlan(ST, W, H, UPSCALE_F, args.work_scale);
+  if (typeof plan === 'string') throw new RenderExit(plan);
+  [W, H] = [plan.w, plan.h];
+  const [WORK_W, WORK_H] = [plan.workW, plan.workH];
+  UPSCALE = plan.outW !== W || plan.outH !== H;
+  UPSCALE_F = plan.outH / H;
   const IMG_SCALE_VF = plan.vf;
-  if (plan.note) say(plan.note);
+  say(plan.note);
   const vfr = vfrConform(ST, num, den);
   [num, den] = [vfr.num, vfr.den];
   const VFR_DEC = vfr.flags;
@@ -233,12 +238,12 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const sig = resumeSig(ns, env);
   const DEC_FMT = TEN_BIT ? 'rgb48le' : 'rgb24';
   const OUT_RAW_FMT = 'rgb48le';
-  const [OUT_W, OUT_H] = outputSize(W, H, UPSCALE_F, UPSCALE);
+  const [OUT_W, OUT_H] = [plan.outW, plan.outH];
   if (DRBA_MODE && !FPS_MODE) ratio = args.multi;
   const totalPairs = NB ? Math.max(1, NB - 1) : 0;
   const totalUnits = NO_INTERP ? NB : totalPairs;
   const REPO = path.join(ENGINE, 'GMFSS_Fortuna'); // render.py chdirs here: the children's cwd
-  // (the host only enlarges: scalePlan never leaves the output smaller than the processed size)
+  // (the host only enlarges: workPlan's decode is never larger than the working size or the output)
   const kind = NVOF_MODE
     ? 'nvof'
     : NO_INTERP
@@ -489,9 +494,10 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   }
   if (SHARPEN > 0) nargs.push('--sharpen', pyG(SHARPEN));
   if (args.restore) nargs.push('--restore');
-  // NVIDIA order: the host runs Restore and the upscale on the decoded frame, then DLSS 5 and the
-  // model at the output size (up to 3840x2160; above it the host keeps the speed-first order)
-  if (args.nvidia_order) nargs.push('--nvidia-order');
+  // the working size: the host runs Restore and the resize to it on the decoded frame, DLSS 5 and
+  // the model at it, then the final resize to the output (sent only when it changes something, so
+  // an older host stays usable for a same-size render)
+  if (WORK_W !== W || WORK_H !== H || args.restore) nargs.push('--work-w', String(WORK_W), '--work-h', String(WORK_H));
   if (nr)
     nargs.push(
       '--dlssnr',
