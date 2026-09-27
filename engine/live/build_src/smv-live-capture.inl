@@ -303,6 +303,21 @@ struct Capture
             // >2px change = a real resize (1px wobble happens during DWM animations)
             if (abs(csz.Width - (int)fullW) > 2 || abs(csz.Height - (int)fullH) > 2)
             {
+                // Not a resize: a minimized player hands out a caption-sized frame (183x34 on this
+                // desktop) and the first frame after the restore can still carry it, while the
+                // window keeps its size. Dropped, so a restore resumes the session (the pause
+                // rule) instead of restarting it.
+                RECT wb{};
+                if (!g_monitor && targetWnd
+                    && (IsIconic(targetWnd)
+                        || (SUCCEEDED(DwmGetWindowAttribute(targetWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &wb, sizeof(wb)))
+                            && abs((int)(wb.right - wb.left) - (int)fullW) <= 2
+                            && abs((int)(wb.bottom - wb.top) - (int)fullH) <= 2)))
+                {
+                    frame.Close();
+                    frame = nullptr;
+                    return -3;
+                }
                 LOG("target window resized (%dx%d -> %ux%u)\n", csz.Width, csz.Height, fullW, fullH);
                 frame.Close();
                 frame = nullptr;
@@ -498,6 +513,112 @@ static const char kLiveNrCS[] =
 "    else dst[id.xy] = float4(g, o.a);\n"
 "}\n";
 
+// Live DLSS 5 motion (DLSSNR.MVec), the live form of the offline k_nvofLuma / k_nvofUp / k_nrMv.
+// csLuma: the BT.709 luma (8-bit codes) of the colour csIn hands DLSS 5, into an R8 texture that
+// is copied into this frame's Optical Flow input slot. csMv, after NVOFA (current -> previous,
+// grid 4): the grid field bilinear to every pixel (integer-ratio taps, exact at grid 4, raw / 32
+// = px), then a vector is kept only where it explains its 5x5 luma window better than no motion
+// by more than margin (the previous frame bilinear at the moved position, the tap = the pixel
+// plus the floor and the exact fraction of the vector, border clamped); zero elsewhere, what a
+// still pixel gets from a game engine. zero = the whole field zero (a stream's first frame).
+static const char kLiveNrLumaCS[] =
+"cbuffer C : register(b0) { float sdrWhite; uint hdr; uint w; uint h; };\n"
+"Texture2D<float4> src : register(t0);\n"
+"RWTexture2D<float> luma : register(u0);\n"
+"float3 oetf(float3 c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(max(c, 1e-6), 1.0 / 2.4) - 0.055; }\n"
+"[numthreads(8,8,1)]\n"
+"void csLuma(uint3 id : SV_DispatchThreadID)\n"
+"{\n"
+"    if (id.x >= w || id.y >= h) return;\n"
+"    float3 c = src[id.xy].rgb;\n"
+"    if (hdr) c = oetf(saturate(c / sdrWhite));\n"
+"    luma[id.xy] = round(saturate(dot(float3(0.2126, 0.7152, 0.0722), c)) * 255.0) / 255.0;\n"
+"}\n";
+
+static const char kLiveNrMvCS[] =
+"cbuffer C : register(b0) { uint w; uint h; uint gw; uint gh; uint grid; uint zero; float margin; uint pad; };\n"
+"Texture2D<int2> flow : register(t0);\n"
+"Texture2D<float> lumCur : register(t1);\n"
+"Texture2D<float> lumPrev : register(t2);\n"
+"RWTexture2D<float2> mv : register(u0);\n"
+"void upTap(int o, int g, out int i0, out int i1, out float l)\n"
+"{\n"
+"    const int num = 2 * o + 1 - (int)grid, den = 2 * (int)grid;\n"
+"    int i = num > 0 ? num / den : 0;\n"
+"    if (i > g - 1) i = g - 1;\n"
+"    const int rem = num > 0 ? num - i * den : 0;\n"
+"    l = rem >= den ? 1.0 : (float)rem / (float)den;\n"
+"    i0 = i;\n"
+"    i1 = i < g - 1 ? i + 1 : i;\n"
+"}\n"
+"float code(Texture2D<float> t, int x, int y) { return floor(t.Load(int3(x, y, 0)) * 255.0 + 0.5); }\n"
+"[numthreads(8,8,1)]\n"
+"void csMv(uint3 id : SV_DispatchThreadID)\n"
+"{\n"
+"    if (id.x >= w || id.y >= h) return;\n"
+"    const int x = (int)id.x, y = (int)id.y, W = (int)w, H = (int)h;\n"
+"    float2 o = float2(0.0, 0.0);\n"
+"    if (!zero)\n"
+"    {\n"
+"        int x0, x1, y0, y1;\n"
+"        float lx, ly;\n"
+"        upTap(x, (int)gw, x0, x1, lx);\n"
+"        upTap(y, (int)gh, y0, y1, ly);\n"
+"        const float2 a = (1.0 - lx) * (float2)flow.Load(int3(x0, y0, 0)) + lx * (float2)flow.Load(int3(x1, y0, 0));\n"
+"        const float2 b = (1.0 - lx) * (float2)flow.Load(int3(x0, y1, 0)) + lx * (float2)flow.Load(int3(x1, y1, 0));\n"
+"        const float2 f = ((1.0 - ly) * a + ly * b) * (1.0 / 32.0);\n"
+"        if (f.x != 0.0 || f.y != 0.0)\n"
+"        {\n"
+"            const float fu = floor(f.x), fv = floor(f.y);\n"
+"            const int iu = (int)fu, iv = (int)fv;\n"
+"            const float kx = f.x - fu, ky = f.y - fv;\n"
+"            float e0 = 0.0, e1 = 0.0;\n"
+"            for (int dy = -2; dy <= 2; dy++)\n"
+"            {\n"
+"                const int yy = clamp(y + dy, 0, H - 1);\n"
+"                const int r0 = clamp(yy + iv, 0, H - 1), r1 = clamp(yy + iv + 1, 0, H - 1);\n"
+"                for (int dx = -2; dx <= 2; dx++)\n"
+"                {\n"
+"                    const int xx = clamp(x + dx, 0, W - 1);\n"
+"                    const int c0 = clamp(xx + iu, 0, W - 1), c1 = clamp(xx + iu + 1, 0, W - 1);\n"
+"                    const float c = code(lumCur, xx, yy);\n"
+"                    const float pa = (1.0 - kx) * code(lumPrev, c0, r0) + kx * code(lumPrev, c1, r0);\n"
+"                    const float pb = (1.0 - kx) * code(lumPrev, c0, r1) + kx * code(lumPrev, c1, r1);\n"
+"                    e0 += abs(c - code(lumPrev, xx, yy));\n"
+"                    e1 += abs(c - ((1.0 - ky) * pa + ky * pb));\n"
+"                }\n"
+"            }\n"
+"            if (e1 + margin < e0) o = f;\n"
+"        }\n"
+"    }\n"
+"    mv[id.xy] = o;\n"
+"}\n";
+
+// the D3D12 Optical Flow entry points, loaded once per process from the driver's nvofapi64.dll
+static NV_OF_D3D12_API_FUNCTION_LIST g_nrOf{};
+static bool nrOfLoad(std::string& why)
+{
+    static bool loaded = false;
+    if (loaded) return true;
+    wchar_t sys[MAX_PATH]{};
+    const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+    if (!n || n >= MAX_PATH) { why = "the system folder is unknown"; return false; }
+    HMODULE m = LoadLibraryExW((std::wstring(sys) + L"\\nvofapi64.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!m) { why = "nvofapi64.dll is not in the system folder"; return false; }
+    typedef NV_OF_STATUS(NVOFAPI* PFN_Create)(uint32_t, NV_OF_D3D12_API_FUNCTION_LIST*);
+    auto create = (PFN_Create)GetProcAddress(m, "NvOFAPICreateInstanceD3D12");
+    if (!create) { why = "nvofapi64.dll exports no D3D12 interface"; return false; }
+    if (create(NV_OF_API_VERSION, &g_nrOf) != NV_OF_SUCCESS || !g_nrOf.nvCreateOpticalFlowD3D12 || !g_nrOf.nvOFInit
+        || !g_nrOf.nvOFRegisterResourceD3D12 || !g_nrOf.nvOFUnregisterResourceD3D12 || !g_nrOf.nvOFExecuteD3D12
+        || !g_nrOf.nvOFDestroy)
+    { why = "the driver refused the Optical Flow SDK 5 D3D12 interface"; return false; }
+    loaded = true;
+    return true;
+}
+
+// kNrMvMargin of the offline route (native.inl): one 8-bit level per pixel of the 5x5 window
+static const float kLiveNrMvMargin = 25.0f;
+
 struct LiveNr
 {
     bool active = false;
@@ -527,6 +648,28 @@ struct LiveNr
     uint64_t lastSeq = 0;                        // last seq the NR queue signalled
     uint64_t frames = 0;
     double recMs = 0;                            // CPU ms spent recording and submitting
+    // DLSS 5 motion vectors (DLSSNR.MVec): an Optical Flow session on this device, current ->
+    // previous for every frame; with them DLSS 5 keeps its history from a stream's second frame on
+    bool motion = false;
+    bool fresh = true;                           // the next frame starts a stream: a Reset, a zero field
+    std::string mvNote;                          // the ready line's motion part
+    NvOFHandle of = nullptr;
+    NvOFGPUBufferHandle ofBuf[3]{};              // the two luma slots and the flow grid, registered
+    ComPtr<ID3D12Resource> lumaTex;              // R8 UAV: csLuma's target, copied into a slot
+    ComPtr<ID3D12Resource> slot[2];              // R8 Optical Flow inputs, COMMON between uses
+    ComPtr<ID3D12Resource> flowTex;              // R16G16_SINT grid field, COMMON between uses
+    ComPtr<ID3D12Fence> ofIn, ofOut;             // NR queue -> Optical Flow -> NR queue
+    uint64_t ofInValue = 0, ofOutValue = 0;
+    UINT cur = 0;                                // the slot this frame's luma goes into
+    uint32_t gw = 0, gh = 0;
+    ComPtr<ID3D12GraphicsCommandList> list2;     // the evaluate list when a luma list runs first
+    ComPtr<ID3D12RootSignature> rsMv;
+    ComPtr<ID3D12PipelineState> psoLuma, psoMv;
+    // SMV_LIVE_NR_MVDUMP=<path prefix> (diagnostics): the field and the luma of frames 30..37 as raw
+    // files, <prefix>_f<n>_<w>x<h>_mv.f16 (R16G16_FLOAT px, current -> previous) and _luma.u8
+    std::wstring dumpPrefix;
+    ComPtr<ID3D12Resource> mvRb, lumaRb;
+    uint64_t mvRbPitch = 0, lumaRbPitch = 0;
 
     static D3D12_RESOURCE_BARRIER tr(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
     {
@@ -586,6 +729,30 @@ struct LiveNr
                                                     nullptr, IID_PPV_ARGS(&outTex))))
             { err = "write-back texture creation failed"; return false; }
         }
+        ComPtr<ID3DBlob> csIn, csOut, e;
+        if (FAILED(D3DCompile(kLiveNrCS, sizeof(kLiveNrCS) - 1, nullptr, nullptr, nullptr, "csIn", "cs_5_0", 0, 0, &csIn, &e))
+            || FAILED(D3DCompile(kLiveNrCS, sizeof(kLiveNrCS) - 1, nullptr, nullptr, nullptr, "csOut", "cs_5_0", 0, 0, &csOut, &e)))
+        { err = std::string("shader compile failed: ") + (e ? (const char*)e->GetBufferPointer() : "?"); return false; }
+        // root signature: b0 = 4 root constants, one table = t0..t1 + u0
+        if (!rootSig(4, 2, rs)) { err = "root signature creation failed"; return false; }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.Get();
+        pd.CS = { csIn->GetBufferPointer(), csIn->GetBufferSize() };
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&psoIn)))) { err = "csIn pipeline state failed"; return false; }
+        pd.CS = { csOut->GetBufferPointer(), csOut->GetBufferSize() };
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&psoOut)))) { err = "csOut pipeline state failed"; return false; }
+        // the motion field, set up BEFORE the feature (it binds MVec at create); without it the pass
+        // runs as it always did, every frame a Reset
+        {
+            std::string why;
+            motion = motionInit(why);
+            if (!motion)
+            {
+                motionFree();
+                mvNote = "no motion vectors (" + why + "), every frame a Reset";
+            }
+            else mvNote = "motion vectors (NVOFA grid 4), history kept";
+        }
         // the feature on this device (Color and Output are owned by the host); quiet NGX log
         // (the core still writes engine\dlssnr\nvngx.log), the two "dlssnr:" lines stay
         nr::setModuleDir(nrDir.c_str());
@@ -594,52 +761,17 @@ struct LiveNr
         set.tone = (float)g_nrTone;
         set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 1;
         set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
+        set.motion = motion;
+        set.motionUav = motion;   // csMv writes MVec in place
         nr::Variant var;
         if (host.startupOn(dev.Get(), queue.Get(), w, h, set, var, true, err) != 0) return false;
-        ComPtr<ID3DBlob> csIn, csOut, e;
-        if (FAILED(D3DCompile(kLiveNrCS, sizeof(kLiveNrCS) - 1, nullptr, nullptr, nullptr, "csIn", "cs_5_0", 0, 0, &csIn, &e))
-            || FAILED(D3DCompile(kLiveNrCS, sizeof(kLiveNrCS) - 1, nullptr, nullptr, nullptr, "csOut", "cs_5_0", 0, 0, &csOut, &e)))
-        { err = std::string("shader compile failed: ") + (e ? (const char*)e->GetBufferPointer() : "?"); return false; }
-        // root signature: b0 = 4 root constants, one table = t0..t1 + u0. Serialized through
-        // d3d12.dll by name: the exe links no d3d12.lib (D3D12CreateDevice must keep coming
-        // from sl.interposer.lib).
-        D3D12_DESCRIPTOR_RANGE ranges[2]{};
-        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 2;
-        ranges[0].OffsetInDescriptorsFromTableStart = 0;
-        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 1;
-        ranges[1].OffsetInDescriptorsFromTableStart = 2;
-        D3D12_ROOT_PARAMETER params[2]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.Num32BitValues = 4;
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable.NumDescriptorRanges = 2;
-        params[1].DescriptorTable.pDescriptorRanges = ranges;
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 2;
-        rsd.pParameters = params;
-        typedef HRESULT (WINAPI* PFN_Serialize)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
-        HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
-        if (!d3d12) d3d12 = LoadLibraryW(L"d3d12.dll");
-        auto serialize = d3d12 ? (PFN_Serialize)GetProcAddress(d3d12, "D3D12SerializeRootSignature") : nullptr;
-        ComPtr<ID3DBlob> sig;
-        if (!serialize || FAILED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &e))
-            || FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&rs))))
-        { err = "root signature creation failed"; return false; }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = rs.Get();
-        pd.CS = { csIn->GetBufferPointer(), csIn->GetBufferSize() };
-        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&psoIn)))) { err = "csIn pipeline state failed"; return false; }
-        pd.CS = { csOut->GetBufferPointer(), csOut->GetBufferSize() };
-        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&psoOut)))) { err = "csOut pipeline state failed"; return false; }
         // descriptors: set A (csIn) = shared SRV, null SRV, Color UAV; set B (csOut) = shared
-        // SRV, Output SRV, outTex UAV
+        // SRV, Output SRV, outTex UAV; with motion, set L (csLuma, rs) at 6 = shared SRV, null SRV,
+        // luma UAV, and sets M0 / M1 (csMv, rsMv) at 9 / 13 = flow SRV, this frame's slot SRV, the
+        // other slot SRV, MVec UAV (M0 when slot 0 holds this frame, M1 when slot 1 does)
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 6;
+        hd.NumDescriptors = 17;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)))) { err = "descriptor heap creation failed"; return false; }
         descSize = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -660,8 +792,238 @@ struct LiveNr
         dev->CreateShaderResourceView(shared12.Get(), nullptr, at(3));
         dev->CreateShaderResourceView(host.output(), nullptr, at(4));
         dev->CreateUnorderedAccessView(outTex.Get(), nullptr, nullptr, at(5));
+        if (motion)
+        {
+            dev->CreateShaderResourceView(shared12.Get(), nullptr, at(6));
+            dev->CreateShaderResourceView(nullptr, &nullSrv, at(7));
+            dev->CreateUnorderedAccessView(lumaTex.Get(), nullptr, nullptr, at(8));
+            for (UINT k = 0; k < 2; k++)
+            {
+                const UINT base = 9 + 4 * k;
+                dev->CreateShaderResourceView(flowTex.Get(), nullptr, at(base));
+                dev->CreateShaderResourceView(slot[k].Get(), nullptr, at(base + 1));
+                dev->CreateShaderResourceView(slot[k ^ 1].Get(), nullptr, at(base + 2));
+                dev->CreateUnorderedAccessView(host.motion(), nullptr, nullptr, at(base + 3));
+            }
+            dumpInit();
+        }
         active = true;
         return true;
+    }
+
+    // a compute root signature: b0 = nConst root constants, one table = nSrv SRVs from t0 + one UAV
+    // at u0. Serialized through d3d12.dll by name: the exe links no d3d12.lib (D3D12CreateDevice
+    // must keep coming from sl.interposer.lib).
+    bool rootSig(UINT nConst, UINT nSrv, ComPtr<ID3D12RootSignature>& out)
+    {
+        D3D12_DESCRIPTOR_RANGE ranges[2]{};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = nSrv;
+        ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 1;
+        ranges[1].OffsetInDescriptorsFromTableStart = nSrv;
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.Num32BitValues = nConst;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 2;
+        params[1].DescriptorTable.pDescriptorRanges = ranges;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2;
+        rsd.pParameters = params;
+        typedef HRESULT (WINAPI* PFN_Serialize)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
+        HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+        if (!d3d12) d3d12 = LoadLibraryW(L"d3d12.dll");
+        auto serialize = d3d12 ? (PFN_Serialize)GetProcAddress(d3d12, "D3D12SerializeRootSignature") : nullptr;
+        ComPtr<ID3DBlob> sig, e;
+        return serialize && SUCCEEDED(serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &e))
+            && SUCCEEDED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&out)));
+    }
+
+    // The Optical Flow session for DLSS 5's motion vectors: FORWARD only (the current frame is the
+    // input, the previous one the reference), grid 4, FAST, no cost, 8-bit luma, like the offline
+    // route's; its two luma slots, the grid texture, the shaders and the second list. false = no
+    // motion for this session (why says it; the caller frees what was made).
+    bool motionInit(std::string& why)
+    {
+        fresh = true;
+        cur = 0;
+        ofInValue = ofOutValue = 0;
+        wchar_t ev[8]{};
+        if (GetEnvironmentVariableW(L"SMV_NR_MV", ev, 8) && ev[0] == L'0') { why = "SMV_NR_MV=0"; return false; }
+        if (GetEnvironmentVariableW(L"SMV_NR_RESET_EVERY", ev, 8) && ev[0] == L'1') { why = "SMV_NR_RESET_EVERY=1"; return false; }
+        if (w < 32 || h < 32) { why = "below the Optical Flow minimum 32x32"; return false; }
+        if (!nrOfLoad(why)) return false;
+        if (g_nrOf.nvCreateOpticalFlowD3D12(dev.Get(), &of) != NV_OF_SUCCESS) { of = nullptr; why = "nvCreateOpticalFlowD3D12 failed"; return false; }
+        NV_OF_INIT_PARAMS ip{};
+        ip.width = w;
+        ip.height = h;
+        ip.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
+        ip.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
+        ip.mode = NV_OF_MODE_OPTICALFLOW;
+        ip.perfLevel = NV_OF_PERF_LEVEL_FAST;
+        ip.enableExternalHints = NV_OF_FALSE;
+        ip.enableOutputCost = NV_OF_FALSE;
+        ip.disparityRange = NV_OF_STEREO_DISPARITY_RANGE_UNDEFINED;
+        ip.enableRoi = NV_OF_FALSE;
+        ip.predDirection = NV_OF_PRED_DIRECTION_FORWARD;
+        ip.enableGlobalFlow = NV_OF_FALSE;
+        ip.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
+        if (g_nrOf.nvOFInit(of, &ip) != NV_OF_SUCCESS) { why = "nvOFInit refused " + std::to_string(w) + "x" + std::to_string(h); return false; }
+        gw = (w + 3) / 4;
+        gh = (h + 3) / 4;
+        auto tex = [&](uint32_t tw, uint32_t th, DXGI_FORMAT f, bool uav, D3D12_RESOURCE_STATES st, ComPtr<ID3D12Resource>& out)
+        {
+            D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_DEFAULT };
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width = tw; rd.Height = th;
+            rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = f;
+            rd.SampleDesc = { 1, 0 };
+            rd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+            return SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr, IID_PPV_ARGS(&out)));
+        };
+        if (!tex(w, h, DXGI_FORMAT_R8_UNORM, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, lumaTex)
+            || !tex(w, h, DXGI_FORMAT_R8_UNORM, false, D3D12_RESOURCE_STATE_COMMON, slot[0])
+            || !tex(w, h, DXGI_FORMAT_R8_UNORM, false, D3D12_RESOURCE_STATE_COMMON, slot[1])
+            || !tex(gw, gh, DXGI_FORMAT_R16G16_SINT, true, D3D12_RESOURCE_STATE_COMMON, flowTex))
+        { why = "motion texture creation failed"; return false; }
+        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ofIn)))
+            || FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ofOut))))
+        { why = "motion fence creation failed"; return false; }
+        ID3D12Resource* regs[3] = { slot[0].Get(), slot[1].Get(), flowTex.Get() };
+        for (int i = 0; i < 3; i++)
+        {
+            NV_OF_REGISTER_RESOURCE_PARAMS_D3D12 rp{};
+            rp.resource = regs[i];
+            rp.inputFencePoint = { ofIn.Get(), ofInValue };
+            rp.hOFGpuBuffer = &ofBuf[i];
+            rp.outputFencePoint = { ofOut.Get(), ++ofOutValue };
+            if (g_nrOf.nvOFRegisterResourceD3D12(of, &rp) != NV_OF_SUCCESS)
+            { ofBuf[i] = nullptr; why = "Optical Flow buffer registration failed"; return false; }
+            if (ofOut->GetCompletedValue() < ofOutValue)
+            {
+                ofOut->SetEventOnCompletion(ofOutValue, doneEvent);
+                if (WaitForSingleObject(doneEvent, 5000) != WAIT_OBJECT_0)
+                { why = "Optical Flow buffer registration did not complete within 5 s"; return false; }
+            }
+        }
+        ComPtr<ID3DBlob> csL, csM, e;
+        if (FAILED(D3DCompile(kLiveNrLumaCS, sizeof(kLiveNrLumaCS) - 1, nullptr, nullptr, nullptr, "csLuma", "cs_5_0", 0, 0, &csL, &e))
+            || FAILED(D3DCompile(kLiveNrMvCS, sizeof(kLiveNrMvCS) - 1, nullptr, nullptr, nullptr, "csMv", "cs_5_0", 0, 0, &csM, &e)))
+        { why = std::string("motion shader compile failed: ") + (e ? (const char*)e->GetBufferPointer() : "?"); return false; }
+        // csMv: b0 = 8 root constants, one table = t0..t2 + u0
+        if (!rootSig(8, 3, rsMv)) { why = "motion root signature creation failed"; return false; }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = rs.Get();
+        pd.CS = { csL->GetBufferPointer(), csL->GetBufferSize() };
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&psoLuma)))) { why = "csLuma pipeline state failed"; return false; }
+        pd.pRootSignature = rsMv.Get();
+        pd.CS = { csM->GetBufferPointer(), csM->GetBufferSize() };
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&psoMv)))) { why = "csMv pipeline state failed"; return false; }
+        if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocs[0].Get(), nullptr, IID_PPV_ARGS(&list2))))
+        { why = "CreateCommandList failed"; return false; }
+        list2->Close();
+        return true;
+    }
+
+    // everything motionInit and dumpInit made; the queue is drained (or never ran)
+    void motionFree()
+    {
+        for (NvOFGPUBufferHandle& hb : ofBuf)
+            if (hb)
+            {
+                NV_OF_UNREGISTER_RESOURCE_PARAMS_D3D12 up{};
+                up.hOFGpuBuffer = hb;
+                g_nrOf.nvOFUnregisterResourceD3D12(&up);
+                hb = nullptr;
+            }
+        if (of) { g_nrOf.nvOFDestroy(of); of = nullptr; }
+        lumaTex.Reset(); slot[0].Reset(); slot[1].Reset(); flowTex.Reset();
+        ofIn.Reset(); ofOut.Reset();
+        list2.Reset(); rsMv.Reset(); psoLuma.Reset(); psoMv.Reset();
+        mvRb.Reset(); lumaRb.Reset();
+        dumpPrefix.clear();
+        motion = false;
+    }
+
+    // SMV_LIVE_NR_MVDUMP (diagnostics): readback buffers for the field and the luma
+    void dumpInit()
+    {
+        wchar_t p[MAX_PATH]{};
+        dumpPrefix.clear();
+        if (!GetEnvironmentVariableW(L"SMV_LIVE_NR_MVDUMP", p, MAX_PATH) || !p[0]) return;
+        auto rb = [&](DXGI_FORMAT f, uint64_t& pitch, ComPtr<ID3D12Resource>& out)
+        {
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = w; td.Height = h;
+            td.DepthOrArraySize = 1; td.MipLevels = 1;
+            td.Format = f;
+            td.SampleDesc = { 1, 0 };
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+            UINT64 total = 0;
+            dev->GetCopyableFootprints(&td, 0, 1, 0, &fp, nullptr, nullptr, &total);
+            pitch = fp.Footprint.RowPitch;
+            D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_READBACK };
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = total; bd.Height = 1;
+            bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+            bd.Format = DXGI_FORMAT_UNKNOWN;
+            bd.SampleDesc = { 1, 0 };
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            return SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                          nullptr, IID_PPV_ARGS(&out)));
+        };
+        if (rb(DXGI_FORMAT_R16G16_FLOAT, mvRbPitch, mvRb) && rb(DXGI_FORMAT_R8_UNORM, lumaRbPitch, lumaRb)) dumpPrefix = p;
+        else LOG("live DLSS 5 native: SMV_LIVE_NR_MVDUMP readback buffers failed, no dump\n");
+    }
+
+    void dumpCopy(ID3D12GraphicsCommandList* l, ID3D12Resource* src, ID3D12Resource* rbuf, DXGI_FORMAT f, uint64_t pitch)
+    {
+        D3D12_TEXTURE_COPY_LOCATION s{}, d{};
+        s.pResource = src;
+        s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        d.pResource = rbuf;
+        d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        d.PlacedFootprint.Footprint.Format = f;
+        d.PlacedFootprint.Footprint.Width = w;
+        d.PlacedFootprint.Footprint.Height = h;
+        d.PlacedFootprint.Footprint.Depth = 1;
+        d.PlacedFootprint.Footprint.RowPitch = (UINT)pitch;
+        l->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+    }
+
+    // after the frame's lists were submitted: wait for them, write the two files (tight rows)
+    void dumpWrite(uint64_t n)
+    {
+        if (done->GetCompletedValue() < doneValue)
+        {
+            done->SetEventOnCompletion(doneValue, doneEvent);
+            WaitForSingleObject(doneEvent, 5000);
+        }
+        auto put = [&](ID3D12Resource* rbuf, uint64_t pitch, uint32_t bpp, const wchar_t* tag)
+        {
+            void* p = nullptr;
+            if (FAILED(rbuf->Map(0, nullptr, &p))) return;
+            const std::wstring f = dumpPrefix + L"_f" + std::to_wstring(n) + L"_" + std::to_wstring(w) + L"x"
+                                   + std::to_wstring(h) + tag;
+            FILE* fp = _wfopen(f.c_str(), L"wb");
+            if (fp)
+            {
+                for (uint32_t y = 0; y < h; y++) fwrite((const uint8_t*)p + y * pitch, bpp, w, fp);
+                fclose(fp);
+            }
+            D3D12_RANGE none{ 0, 0 };
+            rbuf->Unmap(0, &none);
+        };
+        put(mvRb.Get(), mvRbPitch, 4, L"_mv.f16");
+        put(lumaRb.Get(), lumaRbPitch, 1, L"_luma.u8");
     }
 
     // Before the D3D11 copy into the shared texture: the previous frame's NR list reads and
@@ -693,60 +1055,144 @@ struct LiveNr
             if (WaitForSingleObject(doneEvent, 5000) != WAIT_OBJECT_0)
                 return drop("the previous NR list did not complete within 5 s");
         }
-        if (FAILED(allocs[allocIdx]->Reset()) || FAILED(list->Reset(allocs[allocIdx].Get(), nullptr)))
+        ID3D12CommandAllocator* alloc = allocs[allocIdx].Get();
+        if (FAILED(alloc->Reset()) || FAILED(list->Reset(alloc, nullptr)))
             return drop("command list Reset failed");
-        // Reset on EVERY evaluate: the pass is non-temporal on live. This host binds no motion
-        // vectors, depth or jitter, so kept history had nothing valid to reproject by and a
-        // frozen source came back out different frame to frame (the measurements are in
-        // DEVELOPMENT.md, "LIVE RUNS THE PASS NON-TEMPORALLY").
-        const bool reset = true;
         struct { float sdrWhite; uint32_t hdr, w, h; } consts{ sdrWhite, hdr ? 1u : 0u, w, h };
         ID3D12DescriptorHeap* heaps[] = { heap.Get() };
-        auto bind = [&](ID3D12PipelineState* pso, UINT set)
+        auto bind = [&](ID3D12GraphicsCommandList* l, ID3D12RootSignature* r, ID3D12PipelineState* pso,
+                        UINT first, UINT nConst, const void* c)
         {
             D3D12_GPU_DESCRIPTOR_HANDLE g = heap->GetGPUDescriptorHandleForHeapStart();
-            g.ptr += (UINT64)set * 3 * descSize;
-            list->SetDescriptorHeaps(1, heaps);
-            list->SetComputeRootSignature(rs.Get());
-            list->SetPipelineState(pso);
-            list->SetComputeRoot32BitConstants(0, 4, &consts, 0);
-            list->SetComputeRootDescriptorTable(1, g);
+            g.ptr += (UINT64)first * descSize;
+            l->SetDescriptorHeaps(1, heaps);
+            l->SetComputeRootSignature(r);
+            l->SetPipelineState(pso);
+            l->SetComputeRoot32BitConstants(0, nConst, c, 0);
+            l->SetComputeRootDescriptorTable(1, g);
         };
-        D3D12_RESOURCE_BARRIER b[3];
+        D3D12_RESOURCE_BARRIER b[4];
+        // every list reads the captured frame: the queue waits for the D3D11 copy first
+        queue->Wait(inFence12.Get(), seq);
+        // The motion field (DLSSNR.MVec): a first list writes this frame's luma into its Optical
+        // Flow slot; from a stream's second frame on NVOFA (current -> previous) runs between the
+        // two lists and the second turns its grid into the field before the evaluate. History is
+        // kept only with that field (a Reset on a stream's first frame; a stream starts at the
+        // session start and after a pause). Without motion vectors every evaluate is a Reset:
+        // kept history had nothing valid to reproject by and a frozen source came back out
+        // different frame to frame (DEVELOPMENT.md, "LIVE RUNS THE PASS NON-TEMPORALLY").
+        bool flowOk = false;
+        const bool dumpNow = motion && !dumpPrefix.empty() && frames >= 30 && frames < 38;
+        ID3D12GraphicsCommandList* ev = list.Get();
+        if (motion)
+        {
+            b[0] = tr(shared12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, b);
+            bind(list.Get(), rs.Get(), psoLuma.Get(), 6, 4, &consts);
+            list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            b[0] = tr(lumaTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            b[1] = tr(slot[cur].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            b[2] = tr(shared12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(3, b);
+            list->CopyResource(slot[cur].Get(), lumaTex.Get());
+            b[0] = tr(lumaTex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            b[1] = tr(slot[cur].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            list->ResourceBarrier(2, b);
+            if (FAILED(list->Close())) return drop("command list Close failed");
+            ID3D12CommandList* first[] = { list.Get() };
+            queue->ExecuteCommandLists(1, first);
+            if (!fresh)
+            {
+                queue->Signal(ofIn.Get(), ++ofInValue);
+                NV_OF_FENCE_POINT ready{ ofIn.Get(), ofInValue }, flowDone{ ofOut.Get(), ofOutValue + 1 };
+                NV_OF_EXECUTE_INPUT_PARAMS_D3D12 ei{};
+                ei.inputFrame = ofBuf[cur];          // the forward field of the current frame points
+                ei.referenceFrame = ofBuf[cur ^ 1];  // into the previous one: current -> previous
+                ei.disableTemporalHints = NV_OF_TRUE;
+                ei.numFencePoints = 1;
+                ei.fencePoint = &ready;
+                NV_OF_EXECUTE_OUTPUT_PARAMS_D3D12 eo{};
+                eo.outputBuffer = ofBuf[2];
+                eo.fencePoint = &flowDone;
+                const NV_OF_STATUS s = g_nrOf.nvOFExecuteD3D12(of, &ei, &eo);
+                if (s == NV_OF_SUCCESS)
+                {
+                    queue->Wait(ofOut.Get(), ++ofOutValue);
+                    flowOk = true;
+                }
+                else
+                {
+                    // this frame's field goes to zero below and the pass runs as without motion
+                    LOG("live DLSS 5 native: nvOFExecute failed (status %d), no motion vectors for the rest of this session, every frame a Reset\n", (int)s);
+                    motion = false;
+                }
+            }
+            if (FAILED(list2->Reset(alloc, nullptr))) return drop("command list Reset failed");
+            ev = list2.Get();
+            // the field: NVOFA's grid validated, or zero (a stream's first frame, the motion just off)
+            struct { uint32_t w, h, gw, gh, grid, zero; float margin; uint32_t pad; }
+                mc{ w, h, gw, gh, 4u, flowOk ? 0u : 1u, kLiveNrMvMargin, 0u };
+            b[0] = tr(flowTex.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            b[1] = tr(slot[0].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            b[2] = tr(slot[1].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            b[3] = tr(host.motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            ev->ResourceBarrier(4, b);
+            bind(ev, rsMv.Get(), psoMv.Get(), cur ? 13 : 9, 8, &mc);
+            ev->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            b[0] = tr(flowTex.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            b[1] = tr(slot[0].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            b[2] = tr(slot[1].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            b[3] = tr(host.motion(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            ev->ResourceBarrier(4, b);
+            if (dumpNow)
+            {
+                b[0] = tr(host.motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                b[1] = tr(slot[cur].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                ev->ResourceBarrier(2, b);
+                dumpCopy(ev, host.motion(), mvRb.Get(), DXGI_FORMAT_R16G16_FLOAT, mvRbPitch);
+                dumpCopy(ev, slot[cur].Get(), lumaRb.Get(), DXGI_FORMAT_R8_UNORM, lumaRbPitch);
+                b[0] = tr(host.motion(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                b[1] = tr(slot[cur].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                ev->ResourceBarrier(2, b);
+            }
+        }
+        const bool reset = !flowOk;
         b[0] = tr(shared12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         b[1] = tr(host.color(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        list->ResourceBarrier(2, b);
-        bind(psoIn.Get(), 0);
-        list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        ev->ResourceBarrier(2, b);
+        bind(ev, rs.Get(), psoIn.Get(), 0, 4, &consts);
+        ev->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
         b[0] = tr(host.color(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        list->ResourceBarrier(1, b);
+        ev->ResourceBarrier(1, b);
         std::string err;
-        if (!host.evaluateOn(list.Get(), reset, err))
+        if (!host.evaluateOn(ev, reset, err))
         {
-            list->Close();
+            ev->Close();
             return drop(err.c_str());
         }
         b[0] = tr(host.output(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        list->ResourceBarrier(1, b);
-        bind(psoOut.Get(), 1);
-        list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        ev->ResourceBarrier(1, b);
+        bind(ev, rs.Get(), psoOut.Get(), 3, 4, &consts);
+        ev->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
         b[0] = tr(outTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         b[1] = tr(shared12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->ResourceBarrier(2, b);
-        list->CopyResource(shared12.Get(), outTex.Get());
+        ev->ResourceBarrier(2, b);
+        ev->CopyResource(shared12.Get(), outTex.Get());
         b[0] = tr(outTex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         b[1] = tr(shared12.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         b[2] = tr(host.output(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        list->ResourceBarrier(3, b);
-        if (FAILED(list->Close())) return drop("command list Close failed");
-        queue->Wait(inFence12.Get(), seq);
-        ID3D12CommandList* lists[] = { list.Get() };
+        ev->ResourceBarrier(3, b);
+        if (FAILED(ev->Close())) return drop("command list Close failed");
+        ID3D12CommandList* lists[] = { ev };
         queue->ExecuteCommandLists(1, lists);
         queue->Signal(capFence12.Get(), seq);
         allocFence[allocIdx] = ++doneValue;
         queue->Signal(done.Get(), doneValue);
+        if (dumpNow) dumpWrite(frames);
         allocIdx ^= 1;
         lastSeq = seq;
+        cur ^= 1;       // this frame's slot is the next frame's reference
+        fresh = false;
         frames++;
         recMs += (nowQpc100() - t0) / 1e4;
         return true;
@@ -763,6 +1209,7 @@ struct LiveNr
                 WaitForSingleObject(doneEvent, 5000);
             }
         }
+        motionFree();
         if (frames)
             LOG("live DLSS 5 native: %llu captured frames, %.2f ms CPU per frame to record and submit\n",
                 (unsigned long long)frames, recMs / (double)frames);

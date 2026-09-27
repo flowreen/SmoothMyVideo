@@ -356,7 +356,10 @@ static std::wstring loadingWhat()
     if (!g_modelLabel.empty()) return g_modelLabel;
     return (g_serverBackend.empty() ? std::wstring(L"DLSS 4.5") : g_serverBackend) + L" model";
 }
-static void resizeSettle(HWND target, Host& host, const Capture& cap, Hud& hud, bool hidden)
+// Waits until the target's client size holds still. true = it came back to the captured size (a
+// transient: the restore animation after a minimize hands out a frame of another size), the
+// session continues with the overlay shown again; false = a real resize, the caller restarts.
+static bool resizeSettle(HWND target, Host& host, const Capture& cap, Hud& hud, bool hidden)
 {
     static DWORD settleMs = 0;
     if (!settleMs)
@@ -391,6 +394,13 @@ static void resizeSettle(HWND target, Host& host, const Capture& cap, Hud& hud, 
     }
     LOG("target window size settled at %ldx%ld after %llu ms\n", last.right, last.bottom,
         (unsigned long long)(GetTickCount64() - t0));
+    if (IsWindow(target) && !g_stopReq.load() && last.right == (LONG)cap.cw && last.bottom == (LONG)cap.ch)
+    {
+        LOG("target window back at its captured size, the session continues\n");
+        if (!hidden) ShowWindow(host.hwnd, SW_SHOWNA);
+        return true;
+    }
+    return false;
 }
 
 static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bool vsync, bool clickthrough, int diagSecs, bool park)
@@ -584,8 +594,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             {
                 g_liveNr = &liveNr;
                 g_nrNative = true;
-                LOG("live DLSS 5 native: on, %ux%u per captured frame inside the overlay host, structure %.2f tone %.2f style %d, passes %d, %s\n",
-                    capW, capH, g_nrStructure, g_nrTone, g_nrStyle, liveNr.host.passes(),
+                wchar_t am[8]{};   // the core reads the same lever (nr_host.cpp)
+                const bool maskOff = GetEnvironmentVariableW(L"SMV_NR_AUTOMASK", am, 8) && am[0] == L'0';
+                LOG("live DLSS 5 native: on, %ux%u per captured frame inside the overlay host, structure %.2f tone %.2f style %d, passes %d, %s, %s, %s\n",
+                    capW, capH, g_nrStructure, g_nrTone, g_nrStyle, liveNr.host.passes(), liveNr.mvNote.c_str(),
+                    maskOff ? "no auto mask (SMV_NR_AUTOMASK=0)" : "auto mask",
                     g_hdr ? "SDR range of the window (HDR highlights untouched)" : "SDR window");
                 const int nrWant = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
                 if (liveNr.host.passes() < nrWant)
@@ -1625,6 +1638,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         hud.show(!hidden);
                         LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
                         xqPrevGroupMs = 0;   // the throttle reference does not survive a pause
+                        if (g_liveNr) g_liveNr->fresh = true;   // DLSS 5: a new stream after the gap
                     }
                     if (!hidden)
                     {
@@ -1698,9 +1712,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     phProbeN++;
                     phEnd(phProbe);
                     if (g2 == -1) { LOG("capture readback failed\n"); rc2 = 1; break; }
-                    if (g2 == -2)
+                    if (g2 == -2 && (g_monitor || !resizeSettle(target, host, cap, hud, hidden)))
                     {
-                        if (!g_monitor) resizeSettle(target, host, cap, hud, hidden);
                         LOG("restart smv-live after resizing the target window\n"); rc2 = 4; break;
                     }
                     if (g2 == 1)
@@ -1954,9 +1967,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             int got = gpuCap ? cap.latestFrameGpu() : cap.latestFrame(buf.data());
             if (g_verbose) LOG("[loop] latest=%d\n", got);
             if (got == -1) { LOG("capture readback failed\n"); rc2 = 1; break; }
-            if (got == -2)
+            if (got == -2 && (g_monitor || !resizeSettle(target, host, cap, hud, hidden)))
             {
-                if (!g_monitor) resizeSettle(target, host, cap, hud, hidden);
                 LOG("restart smv-live after resizing the target window\n"); rc2 = 4; break;
             }
             // paused (alt-tab): frames are drained but not processed (the overlay is hidden)

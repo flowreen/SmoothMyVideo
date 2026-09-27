@@ -41,6 +41,9 @@ struct Settings
     // DLSSNR.MVec: a per-frame R16G16_FLOAT motion field (current -> previous, px) that the caller
     // writes into the shared motion buffer (startShared); without it the runtime gets no motion
     bool  motion    = false;
+    // the MVec texture can also be a UAV: a caller on the same device writes the field with a
+    // compute pass (motion()) instead of the shared buffer (smv-live.exe's live pass)
+    bool  motionUav = false;
     // the pass run 1..kMaxPasses times in a chain on every frame: pass k's output is pass k + 1's
     // input, each pass its OWN feature and history (one feature called twice a frame would see two
     // evaluations with no motion between them), all fed the same motion field
@@ -102,6 +105,8 @@ public:
     bool evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& err);
     ID3D12Resource* color() const { return m_color.Get(); }
     ID3D12Resource* output() const { return m_output.Get(); }
+    // Settings::motion: the MVec texture (R16G16_FLOAT, NON_PIXEL_SHADER_RESOURCE at the evaluate)
+    ID3D12Resource* motion() const { return m_mv.Get(); }
 
     // One frame in, one frame out. src and dst are w*h*8 bytes of RGBA16F.
     // reset must be true for the first frame of a stream and after any

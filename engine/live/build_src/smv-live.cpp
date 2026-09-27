@@ -40,6 +40,7 @@
 #include <dxgi1_6.h>          // IDXGIOutput6 / DXGI_OUTPUT_DESC1 for HDR display detection
 #include <d3dcompiler.h>      // D3DCompile for the dlssg HDR pack shader
 #include "nr_host.h"          // the DLSS 5 Neural Rendering core, run inside this process
+#include "nvOpticalFlowD3D12.h"   // live DLSS 5 motion vectors: MIT interface header in build_src\nvofa
 #include <dwmapi.h>
 #include <timeapi.h>
 #include <shlwapi.h>
@@ -312,13 +313,95 @@ static bool g_tsCycling = false;
 static int g_tsCycleIdx = 0;
 static ULONGLONG g_tsCycleTick = 0;
 
+// --pan: a grey value-noise texture (8 px lattice, bilinear) moving right by 4 px per tick, a
+// known-motion source: every pixel's motion current -> previous is exactly (-4, 0) px per tick
+static bool g_tsPan = false;
+static uint32_t g_tsTick = 0;
+static uint32_t tsHash(int x, int y)
+{
+    uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return h ^ (h >> 16);
+}
+static void tsPanFill(uint32_t* px, int w, int h, int shift)
+{
+    for (int y = 0; y < h; y++)
+    {
+        const int cy = y >> 3, fy = y & 7;
+        for (int x = 0; x < w; x++)
+        {
+            const int u = x - shift;   // C++20: >> and & on a negative int = floor and remainder
+            const int cx = u >> 3, fx = u & 7;
+            const int a = (int)(tsHash(cx, cy) & 255) * (8 - fx) + (int)(tsHash(cx + 1, cy) & 255) * fx;
+            const int b = (int)(tsHash(cx, cy + 1) & 255) * (8 - fx) + (int)(tsHash(cx + 1, cy + 1) & 255) * fx;
+            const uint32_t g = 40u + (uint32_t)(((a * (8 - fy) + b * fy) * 175) / (64 * 255));
+            px[(size_t)y * w + x] = g * 0x010101u;
+        }
+    }
+}
+
+// one test frame into dc: the dark background and the 80 px red square jumping in 120 px steps
+// (interpolation midpoints, ~60 px offsets, cannot occur in the source), or the --pan texture
+static void tsPaint(HDC dc, const RECT& cr)
+{
+    if (g_tsPan)
+    {
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = cr.right;
+        bi.bmiHeader.biHeight = -cr.bottom;   // top-down rows
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        std::vector<uint32_t> px((size_t)cr.right * cr.bottom);
+        tsPanFill(px.data(), cr.right, cr.bottom, (int)(g_tsTick * 4));
+        SetDIBitsToDevice(dc, 0, 0, cr.right, cr.bottom, 0, 0, 0, cr.bottom, px.data(), &bi, DIB_RGB_COLORS);
+        return;
+    }
+    HBRUSH bg = CreateSolidBrush(RGB(24, 24, 24));
+    FillRect(dc, &cr, bg);
+    DeleteObject(bg);
+    RECT sq{ 40 + g_tsStep * 120, (cr.bottom - 80) / 2, 0, 0 };
+    sq.right = sq.left + 80;
+    sq.bottom = sq.top + 80;
+    HBRUSH red = CreateSolidBrush(RGB(230, 40, 40));
+    FillRect(dc, &sq, red);
+    DeleteObject(red);
+}
+
+// The parked test source is a layered popup that hands DWM its whole frame on every tick: GDI
+// painting is clipped to the part of a window that lies on the desktop, so a parked painted window
+// showed one pixel and the capture got a white frame (measured 2026-09-27, harness p53). The
+// frame follows the client size, so a harness may resize the window.
+static bool g_tsLayered = false;
+static void tsUpdateLayered(HWND h)
+{
+    RECT cr;
+    GetClientRect(h, &cr);
+    if (cr.right <= 0 || cr.bottom <= 0) return;
+    HDC screen = GetDC(nullptr);
+    HDC mdc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, cr.right, cr.bottom);
+    HGDIOBJ old = SelectObject(mdc, bmp);
+    tsPaint(mdc, cr);
+    POINT src{ 0, 0 };
+    SIZE sz{ cr.right, cr.bottom };
+    UpdateLayeredWindow(h, screen, nullptr, &sz, mdc, &src, 0, nullptr, ULW_OPAQUE);
+    SelectObject(mdc, old);
+    DeleteObject(bmp);
+    DeleteDC(mdc);
+    ReleaseDC(nullptr, screen);
+}
+
 static LRESULT CALLBACK testWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m)
     {
     case WM_TIMER:
         g_tsStep = (g_tsStep + 1) % 7;
-        InvalidateRect(h, nullptr, FALSE);
+        g_tsTick++;
+        if (g_tsLayered) tsUpdateLayered(h);
+        else InvalidateRect(h, nullptr, FALSE);
         if (g_tsCycling && GetTickCount64() - g_tsCycleTick > 12000)
         {
             g_tsCycleTick = GetTickCount64();
@@ -335,17 +418,7 @@ static LRESULT CALLBACK testWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         HDC mdc = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
         HGDIOBJ old = SelectObject(mdc, bmp);
-        HBRUSH bg = CreateSolidBrush(RGB(24, 24, 24));
-        FillRect(mdc, &cr, bg);
-        DeleteObject(bg);
-        // 80px red square jumping in 120px steps: interpolation midpoints (~60px offsets)
-        // cannot occur in the source
-        RECT sq{ 40 + g_tsStep * 120, (cr.bottom - 80) / 2, 0, 0 };
-        sq.right = sq.left + 80;
-        sq.bottom = sq.top + 80;
-        HBRUSH red = CreateSolidBrush(RGB(230, 40, 40));
-        FillRect(mdc, &sq, red);
-        DeleteObject(red);
+        tsPaint(mdc, cr);
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mdc, 0, 0, SRCCOPY);
         SelectObject(mdc, old);
         DeleteObject(bmp);
@@ -372,14 +445,27 @@ static int runTestSrc(bool onScreen)
     RegisterClassW(&wc);
     RECT r{ 0, 0, 960, 540 };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    // parked by default so a test run shows nothing on the user's screen: ONE client pixel on the
-    // primary monitor's bottom-right corner (a window with no client pixel on the desktop is not
-    // composed, and a capture of it gets no frames; r's negative left / top are the frame, the
-    // invisible resize border included); --onscreen keeps it visible
-    int x = 80, y = 80;
-    if (!onScreen) { x = GetSystemMetrics(SM_CXSCREEN) - 1 + r.left; y = GetSystemMetrics(SM_CYSCREEN) - 1 + r.top; }
-    HWND h = CreateWindowExW(0, L"smvlivetestsrc", L"SMV Live TestSrc", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                             x, y, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    // parked by default so a test run shows nothing on the user's screen: a borderless layered
+    // popup with ONE pixel on the primary monitor's bottom-right corner (a window with no pixel on
+    // the desktop is not composed, and a capture of it gets no frames), under the taskbar, never
+    // activated (a new window took the keyboard focus from the user, p53) and so without a taskbar
+    // button a click could minimize. --onscreen = the old framed window at (80, 80)
+    HWND h = nullptr;
+    if (onScreen)
+        h = CreateWindowExW(0, L"smvlivetestsrc", L"SMV Live TestSrc", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                            80, 80, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    else
+    {
+        g_tsLayered = true;
+        h = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE, L"smvlivetestsrc", L"SMV Live TestSrc", WS_POPUP,
+                            GetSystemMetrics(SM_CXSCREEN) - 1, GetSystemMetrics(SM_CYSCREEN) - 1, 960, 540,
+                            nullptr, nullptr, wc.hInstance, nullptr);
+        if (h)
+        {
+            tsUpdateLayered(h);   // a layered window shows nothing before its first update
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+    }
     if (!h) { LOG("CreateWindow failed\n"); return 1; }
     SetTimer(h, 1, g_tsInterval, nullptr);
     LOG("TESTSRC READY interval=%ums\n", g_tsInterval);
@@ -2217,6 +2303,7 @@ int wmain(int argc, wchar_t** argv)
         for (int i = 2; i < argc; i++)
         {
             if (wcscmp(argv[i], L"--onscreen") == 0) onScreen = true;
+            else if (wcscmp(argv[i], L"--pan") == 0) g_tsPan = true;
             else if (wcscmp(argv[i], L"cycle") == 0)
             {
                 g_tsCycling = true;
@@ -2294,7 +2381,8 @@ int wmain(int argc, wchar_t** argv)
         "       smv-live.exe --hwnd 0xHWND [same flags]\n"
         "       smv-live.exe --fg [--exclude 0xHWND] [same flags]   (overlay the foreground window)\n"
         "       smv-live.exe --list\n"
-        "       smv-live.exe --testsrc [ms|cycle] [--onscreen]   (parked with 1 px on the desktop unless --onscreen)\n");
+        "       smv-live.exe --testsrc [ms|cycle] [--pan] [--onscreen]   (parked with 1 px on the desktop unless\n"
+        "                    --onscreen; --pan = a texture moving 4 px right per tick instead of the square)\n");
     return 1;
 }
 

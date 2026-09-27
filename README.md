@@ -98,8 +98,8 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   the **NVIDIA order** checkbox also moves Restore and the upscale in front of it, so DLSS 5 and the
   interpolation run at the output size, as in games: slower, outputs up to 4K),
   at DLAA quality (full resolution in, full resolution out), fed the way game integrations
-  feed it (NVIDIA's automatic mask; in file renders also motion vectors from NVIDIA's Optical Flow
-  hardware, so its history follows the picture), with NVIDIA's three
+  feed it (NVIDIA's automatic mask and motion vectors from NVIDIA's Optical Flow hardware, in file
+  renders and live, so its history follows the picture), with NVIDIA's three
   looks as a **Style** selector (Default, Natural, Cinematic) and its two global controls,
   **Structure Intensity** and **Tone Intensity**, as sliders. The host is bundled; the
   Neural Rendering runtime (`nvngx_dlssnr.dll`) is not included, and NVIDIA publishes no download

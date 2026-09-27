@@ -471,23 +471,29 @@ never runs it (the NR host starves DLSS-G). KNOWN LIMIT: full-scale 1080p RIFE p
 the native pipeline stalls into the watchdog instead of dropping frames; image scale 0.5 or a
 lower target runs clean.
 
-LIVE RUNS THE PASS NON-TEMPORALLY (2026-09-14): Reset is sent on EVERY evaluate, native route
-(`const bool reset = true` in `smv-live-capture.inl`) and python route alike (`dlssnr.DLSSNR(...,
-reset_every=True)`, which adds the host flag `--reset-every`; the host logs `resetEvery=1`). The
-feature reprojects its temporal history with motion vectors, depth and a per-frame jitter offset,
-and the live route binds NONE of them (`nr::Settings::motion` is off there; only the offline
-zero-copy route feeds `MVec`), so kept history has nothing valid to reproject by and identical captured frames
-came back out different: on a PAUSED 2560x1440 mpv window, 14 of 58 presented frames differed from
-the one before, 95.6% of the pixels moved between two of them, and the dark areas swung 0.83% of
-their mean, which reads on screen as the dark parts sliding back and forth. With reset on every
-evaluate the pass is a pure function of the captured frame: the same measurement gives 0 of 58
-native, and python is stable from the third frame (one startup frame still differs, max pixel
-0.043 against 0.338 before). The control with `--dlssnr` off was bit-identical across all 59
-frames both times, so the drift was this pass alone. Harness: `harness\nr\nr_static_drift.ps1`
-(parked session + a probe of our own overlay) and `nr_drift_analyze.py` (per-frame difference,
-phase-correlation shift, dark-region mean). OFFLINE renders still accumulate (`render.py` builds
-the host without the flag): their frames always differ, so it has never shown there, and changing
-it would change shipped render output.
+LIVE KEEPS DLSS 5'S HISTORY WITH MOTION VECTORS (2026-09-27): `LiveNr` (`smv-live-capture.inl`) runs
+an Optical Flow session on the NR queue's D3D12 device (`nvOpticalFlowD3D12.h`, MIT, in
+`build_src\nvofa`; grid 4, FAST, forward only, no cost, 8-bit luma, like the offline route's). Per
+captured frame a first command list writes the BT.709 luma of the colour DLSS 5 is handed (`csLuma`)
+into one of two R8 input slots; from a stream's second frame on NVOFA runs current -> previous
+between the lists (fences in and out), and the second list turns its grid into the field (`csMv`,
+the HLSL form of the offline `k_nvofUp` + `k_nrMv`: bilinear integer-ratio taps, raw / 32 = px, a
+vector kept only where it explains its 5x5 luma window better than no motion by 25 codes) written
+straight into the core's `MVec` texture (`Settings::motionUav`), then evaluates. `DLSSNR.Reset` is
+1 only on a stream's first frame: the session start and the first frame after a pause (the pause
+rule) or a resize. The ready line says `motion vectors (NVOFA grid 4), history kept` or
+`no motion vectors (why), every frame a Reset`; a runtime `nvOFExecute` failure switches the
+session to the latter with one line. `SMV_NR_MV=0` or `SMV_NR_RESET_EVERY=1` = the previous pass,
+a Reset on every evaluate. Checked with `harness\p53\mv_check.py` (`SMV_LIVE_NR_MVDUMP` dumps of a
+parked `--testsrc 100 --pan` texture moving 4 px per tick: 99.92 % of the field within 0.25 px of
+(-4, 0), mean -3.996 px, HDR and SDR capture; the square source: the vectors land in the square's
+previous position, the background exactly zero).
+Why history needs the vectors (2026-09-14, the reason the pass reset every frame until 2026-09-27):
+with history and NO `MVec` bound, identical captured frames came back out different (a PAUSED
+2560x1440 mpv window: 14 of 58 presented frames differed, the dark areas swung 0.83 % of their
+mean); a Reset on every evaluate made the pass a pure function of the frame (0 of 58). Harness:
+`harness\nr\nr_static_drift.ps1` (parked session + a probe of our own overlay) and
+`nr_drift_analyze.py` (per-frame difference, phase-correlation shift, dark-region mean).
 
 CLI:
 ```
@@ -496,7 +502,10 @@ smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --native --resident --diag S
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
-smv-live.exe --testsrc [ms|cycle]   verification source (100 ms = 10 fps; 16 for perf; cycle ramps 10/30/60/30)
+smv-live.exe --testsrc [ms|cycle] [--pan] [--onscreen]   verification source (100 ms = 10 fps; 16 for perf; cycle ramps
+               10/30/60/30); parked by default: a layered popup with one pixel on the primary monitor's last pixel
+               that hands DWM its whole frame (a painted window off the desktop is clipped to the visible pixel);
+               --pan = a texture moving 4 px right per tick (known motion); --onscreen = a framed window at (80, 80)
 smv-live.exe --synth           no-capture diagnostic
 ```
 `--gen`: server backends 1..15, dlssg 1..5. `--fg` targets the current foreground window (the
@@ -1027,14 +1036,15 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_LIVE_HDR` | force live HDR on or off |
 | `SMV_LIVE_RESIDENT=0` / `SMV_LIVE_RESIDENT_IDLE_S` | one `smv-live.exe` per live session instead of the resident host / the resident host's idle limit in seconds (default 600) |
 | `SMV_LIVE_TEARDOWN_TRACE=1` | one log line per session teardown stage (reader, present queue, server, capture, host); for a Stop that hangs |
-| `SMV_LIVE_RESIZE_SETTLE_MS` | how long the target's client size must hold before a resize ends the session with exit 4 (default 1000, 100..10000) |
+| `SMV_LIVE_RESIZE_SETTLE_MS` | how long the target's client size must hold before a resize ends the session with exit 4 (default 1000, 100..10000); a window that settles back at the captured size keeps the session (the restore animation after a minimize hands out one frame of another size) |
 | `SMV_OFFLINE_GRAPH=1` | TensorRT-RTX graph capture on for offline renders (off by default) |
 | `SMV_OFFLINE_RESIDENT=0` / `SMV_OFFLINE_RESIDENT_IDLE_S` / `SMV_OFFLINE_HOST_PIPE` / `SMV_OFFLINE_HOST_LOG` | one exe per plain RIFE render instead of the resident offline host / its idle limit in seconds (default 600) / its pipe name (the app sets one per process) / a file for its stderr |
 | `SMV_HANDOFF_DUMP=1` | the live host logs every handoff line it answers |
 | `SMV_NR_NOHOOK=1`, `SMV_NR_SPOOF=<name>`, `SMV_NR_HOOKLOG=1` | DLSS 5 caller hook off / spoofed name / trace |
-| `SMV_NR_RESET_EVERY=1` | the offline native host's DLSS 5 resets its history on every frame (the live behaviour), for the route gate; never a product setting |
+| `SMV_NR_RESET_EVERY=1` | DLSS 5 resets its history on every frame and gets no motion vectors (both routes; the pre-2026-09-27 live pass), for A/Bs and the route gate; never a product setting |
 | `SMV_NR_STAGED=1` | the offline native host's DLSS 5 hands its frames over through CPU staging (`renderFrame`) instead of the zero-copy shared buffers; the route A/B and the fallback's trigger test, never a product setting |
-| `SMV_NR_MV=0` | the offline native host's DLSS 5 gets no motion vectors (the pre-2026-09-27 pass); a measurement lever, never a product setting |
+| `SMV_NR_MV=0` | DLSS 5 gets no motion vectors (both routes; offline: the pre-2026-09-27 pass, live: every frame a Reset); a measurement lever, never a product setting |
+| `SMV_LIVE_NR_MVDUMP=<prefix>` | live DLSS 5 writes the motion field and the luma of captured frames 30..37 as raw files, `<prefix>_f<n>_<w>x<h>_mv.f16` (R16G16_FLOAT px, current -> previous) and `_luma.u8`; diagnostics (`harness\p53\mv_check.py`) |
 | `SMV_NR_AUTOMASK=0` | DLSS 5 runs with `DLSSNR.UseAutoMask` 0 (both routes, read by the NR core); a measurement lever, never a product setting |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
@@ -1242,8 +1252,8 @@ driver.
 
 Runtime notes: transport is raw `R16G16B16A16_FLOAT`, one frame in, one out, strictly in order.
 `DLSSNR.Reset` is 1 on the first frame only (the runtime keeps temporal history). `MVec` is the
-offline zero-copy route's Optical Flow field (`Settings::motion`, the offline DLSS 5 paragraph
-above); Depth and ControlMask are not set. Fixed internally: `Hint.Render.Preset` 3, `Intensity`
+Optical Flow field of the offline zero-copy route and of live (`Settings::motion`, the offline DLSS 5
+paragraph and the live one above); Depth and ControlMask are not set. Fixed internally: `Hint.Render.Preset` 3, `Intensity`
 1.0, `UseAutoMask` 1, `SkinStructureStrength` -1 (the model's own default); style, structure and
 tone are user facing. One NGX user per process,
 so this host never shares a process with the RTX Video NGX session. The NGX core writes its own

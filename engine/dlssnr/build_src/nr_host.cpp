@@ -377,7 +377,7 @@ bool Host::createResources(bool staging, std::string& err)
         // DLSSNR.MVec, bound at create; a committed DEFAULT-heap texture starts zeroed (no motion)
         D3D12_RESOURCE_DESC md = td;
         md.Format = DXGI_FORMAT_R16G16_FLOAT;
-        md.Flags = D3D12_RESOURCE_FLAG_NONE;
+        md.Flags = m_set.motionUav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
         if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &md,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&m_mv))))
         { err = "CreateCommittedResource(motion) failed"; return false; }
