@@ -259,6 +259,471 @@ struct Hud
     }
 };
 
+// ---------------------------------------------------------------- Fill: the mouse on the stretched picture
+
+// Fill stretches a smaller window over its monitor through a click-through overlay, so a click lands on whatever sits
+// under that screen point, not on the matching point of the window. The model Magpie and Lossless Scaling use: while
+// the cursor is on the picture, the REAL cursor sits at the matching point of the window's client area (clicks,
+// drags, hover and raw input all reach the window natively), the OS cursor is hidden, a copy is drawn at the picture
+// point in a separate click-through window (nothing is stamped into the frames, the HUD's rule) and the pointer speed
+// is divided by the stretch so the copy moves at the usual speed. A window above the overlay at the picture point,
+// the target covered at its point, a hidden overlay (pause, resize), leaving through a monitor edge with a neighbour
+// and the session end hand the real cursor back at the picture point with the speed restored. The original speed and
+// the clip are kept in a marker file until they are restored: the next session, or `--restore-mouse` (the app runs it
+// after killing the host), restores them after a crash or a kill.
+static std::wstring fillMouseMarker()
+{
+    wchar_t tmp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tmp);
+    return std::wstring(tmp) + L"smv-live-mouse.txt";
+}
+
+using ShowSystemCursorFn = BOOL(WINAPI*)(BOOL);
+static void showSystemCursor(bool show)
+{
+    static ShowSystemCursorFn fn = [] {
+        ShowSystemCursorFn f = nullptr;
+        if (HMODULE user = GetModuleHandleW(L"user32.dll"))
+            f = (ShowSystemCursorFn)(void*)GetProcAddress(user, "ShowSystemCursor");
+        if (!f)
+            if (HMODULE mag = LoadLibraryW(L"Magnification.dll"))
+                f = (ShowSystemCursorFn)(void*)GetProcAddress(mag, "MagShowSystemCursor");
+        return f;
+    }();
+    if (fn)
+        fn(show ? TRUE : FALSE);
+}
+
+// The restore after a session that could not run its own: the speed from the marker, the clip when it is still ours,
+// the OS cursor shown (a no-op when the hidden state ended with the process). true = a marker was found.
+static bool fillMouseRestore()
+{
+    const std::wstring path = fillMouseMarker();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"r") || !f)
+        return false;
+    int speed = 0;
+    RECT clip{};
+    const int n =
+        fscanf_s(f, "speed %d clip %ld %ld %ld %ld", &speed, &clip.left, &clip.top, &clip.right, &clip.bottom);
+    fclose(f);
+    if (n >= 1 && speed >= 1 && speed <= 20)
+        SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (void*)(intptr_t)speed, 0);
+    RECT cur{};
+    // the marker's clip, or the 1x1 clip of a teleport the kill landed in
+    if (GetClipCursor(&cur) &&
+        ((n == 5 && EqualRect(&cur, &clip)) || (cur.right - cur.left == 1 && cur.bottom - cur.top == 1)))
+        ClipCursor(nullptr);
+    showSystemCursor(true);
+    DeleteFileW(path.c_str());
+    LOG("mouse restored after a session that did not end cleanly (pointer speed %d%s)\n", speed,
+        n == 5 ? ", its clip released when still set" : "");
+    return true;
+}
+
+struct FillMouse
+{
+    HWND target = nullptr, overlay = nullptr;
+    RECT mon{}, pic{}; // the Fill monitor and the picture rect on it (screen, physical pixels)
+    std::thread th;
+    std::atomic<bool> quit{false};
+
+    // cursor thread state
+    bool in = false;
+    HWND wnd = nullptr; // the drawn copy
+    HCURSOR shape = nullptr;
+    int hotX = 0, hotY = 0;
+    bool shown = false;
+    int origSpeed = 0;
+    RECT clip{};
+    RECT client{}; // the target's client rect at the last poll (screen)
+    POINT lastP{-1, -1};
+    int scaleSpeed = 0;
+
+    void start(HWND t, HWND ov, const RECT& m, const RECT& p)
+    {
+        target = t;
+        overlay = ov;
+        mon = m;
+        pic = p;
+        th = std::thread([this] { run(); });
+    }
+    void stop()
+    {
+        if (!th.joinable())
+            return;
+        quit.store(true);
+        th.join();
+    }
+    ~FillMouse()
+    {
+        stop();
+    }
+
+    // Magpie's mapping: first pixel to first pixel, last to last
+    static int mapAxis(int v, int a0, int aLen, int b0, int bLen)
+    {
+        if (aLen <= 1)
+            return b0;
+        return b0 + (int)std::lround((double)(v - a0) * (bLen - 1) / (aLen - 1));
+    }
+    POINT toWindow(POINT p) const
+    {
+        return {mapAxis(p.x, pic.left, pic.right - pic.left, client.left, client.right - client.left),
+                mapAxis(p.y, pic.top, pic.bottom - pic.top, client.top, client.bottom - client.top)};
+    }
+    // a point outside the client rect keeps its offset unscaled past the picture's edge (leaving the picture)
+    POINT toPicture(POINT q) const
+    {
+        POINT c{std::clamp(q.x, client.left, client.right - 1), std::clamp(q.y, client.top, client.bottom - 1)};
+        POINT p{mapAxis(c.x, client.left, client.right - client.left, pic.left, pic.right - pic.left),
+                mapAxis(c.y, client.top, client.bottom - client.top, pic.top, pic.bottom - pic.top)};
+        p.x += q.x - c.x;
+        p.y += q.y - c.y;
+        return p;
+    }
+
+    bool clientRect(RECT& r) const
+    {
+        RECT c{};
+        POINT o{0, 0};
+        if (!GetClientRect(target, &c) || !ClientToScreen(target, &o) || c.right <= 0 || c.bottom <= 0)
+            return false;
+        r = {o.x, o.y, o.x + c.right, o.y + c.bottom};
+        return true;
+    }
+
+    // the target is on top at q: its own popups (menus, tooltips) count as the target
+    bool targetAt(POINT q) const
+    {
+        const HWND h = topAt(q, nullptr);
+        if (h == target)
+            return true;
+        DWORD a = 0, b = 0;
+        GetWindowThreadProcessId(h, &a);
+        GetWindowThreadProcessId(target, &b);
+        return h && a == b;
+    }
+
+    // the first window at a screen point from the top of the z-order, skipping hidden, cloaked and click-through
+    // windows and this process's own (the overlay is click-through too, so it is named: stopAt)
+    static HWND topAt(POINT p, HWND stopAt)
+    {
+        const DWORD own = GetCurrentProcessId();
+        for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT))
+        {
+            if (h == stopAt)
+                return h;
+            if (!IsWindowVisible(h) || IsIconic(h))
+                continue;
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid == own || (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TRANSPARENT))
+                continue;
+            BOOL cloaked = FALSE;
+            DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+            if (cloaked)
+                continue;
+            RECT r{};
+            if (!frameBounds(h, r) && !GetWindowRect(h, &r))
+                continue;
+            if (PtInRect(&r, p))
+                return h;
+        }
+        return nullptr;
+    }
+
+    // a neighbouring monitor past one edge of the Fill monitor (three probes along the edge)
+    bool neighbour(int side) const
+    {
+        const LONG xs[3] = {mon.left, (mon.left + mon.right) / 2, mon.right - 1};
+        const LONG ys[3] = {mon.top, (mon.top + mon.bottom) / 2, mon.bottom - 1};
+        for (int i = 0; i < 3; i++)
+        {
+            const POINT q = side == 0   ? POINT{mon.left - 1, ys[i]}
+                            : side == 1 ? POINT{mon.right, ys[i]}
+                            : side == 2 ? POINT{xs[i], mon.top - 1}
+                                        : POINT{xs[i], mon.bottom};
+            if (MonitorFromPoint(q, MONITOR_DEFAULTTONULL))
+                return true;
+        }
+        return false;
+    }
+
+    // the clip while the cursor is in: the client rect, open towards a neighbouring monitor
+    RECT captureClip() const
+    {
+        RECT r = client;
+        const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (neighbour(0))
+            r.left = vx;
+        if (neighbour(1))
+            r.right = vx + vw;
+        if (neighbour(2))
+            r.top = vy;
+        if (neighbour(3))
+            r.bottom = vy + vh;
+        return r;
+    }
+
+    void writeMarker() const
+    {
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, fillMouseMarker().c_str(), L"w") || !f)
+            return;
+        fprintf(f, "speed %d clip %ld %ld %ld %ld\n", origSpeed, clip.left, clip.top, clip.right, clip.bottom);
+        fclose(f);
+    }
+
+    void setClip(const RECT& r)
+    {
+        RECT cur{};
+        if (GetClipCursor(&cur) && EqualRect(&cur, &r) && EqualRect(&clip, &r))
+            return; // each ClipCursor sends the foreground window a WM_MOUSEMOVE: only on a change
+        clip = r;
+        ClipCursor(&r);
+        writeMarker();
+    }
+
+    // SetCursorPos through a 1x1 clip first, as Magpie does: queued hardware input can otherwise undo the move;
+    // `after` = the clip left in place (nullptr = none)
+    static void moveCursor(POINT p, const RECT* after)
+    {
+        const RECT one{p.x, p.y, p.x + 1, p.y + 1};
+        ClipCursor(&one);
+        SetCursorPos(p.x, p.y);
+        Sleep(8);
+        ClipCursor(after);
+    }
+
+    // the pointer speed that keeps the copy at the usual speed (Magpie's formula: the speed over the stretch with
+    // "Enhance pointer precision" on, else the nearest step of Windows' 20-step multiplier table)
+    int scaledSpeed(int orig) const
+    {
+        const double s = ((double)(pic.right - pic.left) / (client.right - client.left) +
+                          (double)(pic.bottom - pic.top) / (client.bottom - client.top)) /
+                         2;
+        int accel[3]{};
+        SystemParametersInfoW(SPI_GETMOUSE, 0, accel, 0);
+        if (accel[2])
+            return std::clamp((int)std::lround(orig / s), 1, 20);
+        static const double kMul[20] = {0.03125, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0,
+                                        1.25,    1.5,    1.75,  2.0,  2.25,  2.5, 2.75,  3.0,  3.25,  3.5};
+        const double want = kMul[std::clamp(orig, 1, 20) - 1] / s;
+        int best = 1;
+        for (int i = 2; i <= 20; i++)
+            if (std::fabs(kMul[i - 1] - want) < std::fabs(kMul[best - 1] - want))
+                best = i;
+        return best;
+    }
+
+    void enter(POINT p)
+    {
+        const POINT q = toWindow(p);
+        SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &origSpeed, 0);
+        clip = RECT{};
+        writeMarker(); // the original speed is on disk before it changes
+        scaleSpeed = scaledSpeed(origSpeed);
+        SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (void*)(intptr_t)scaleSpeed, 0);
+        showSystemCursor(false);
+        const RECT c = captureClip();
+        moveCursor(q, &c);
+        clip = c;
+        writeMarker();
+        in = true;
+        lastP = {-1, -1};
+    }
+
+    // the real cursor goes to p when a monitor is there (the clip is always ours while in: setClip reasserts it)
+    void leave(POINT p)
+    {
+        in = false;
+        if (MonitorFromPoint(p, MONITOR_DEFAULTTONULL))
+            moveCursor(p, nullptr);
+        else
+            ClipCursor(nullptr);
+        clip = RECT{};
+        SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (void*)(intptr_t)origSpeed, 0);
+        showSystemCursor(true);
+        DeleteFileW(fillMouseMarker().c_str());
+        if (wnd)
+            ShowWindow(wnd, SW_HIDE);
+        shown = false;
+    }
+
+    // the copy's image: DrawIconEx on black and on white gives the alpha (255 - (white - black)) and the
+    // premultiplied colour (the black draw); an inverting pixel (white draw darker) is drawn opaque white
+    void setShape(HCURSOR c)
+    {
+        shape = c;
+        ICONINFO ii{};
+        if (!GetIconInfo(c, &ii))
+            return;
+        BITMAP bm{};
+        GetObjectW(ii.hbmColor ? ii.hbmColor : ii.hbmMask, sizeof(bm), &bm);
+        const int w = bm.bmWidth, h = ii.hbmColor ? bm.bmHeight : bm.bmHeight / 2;
+        hotX = (int)ii.xHotspot;
+        hotY = (int)ii.yHotspot;
+        if (ii.hbmColor)
+            DeleteObject(ii.hbmColor);
+        if (ii.hbmMask)
+            DeleteObject(ii.hbmMask);
+        if (w <= 0 || h <= 0)
+            return;
+        BITMAPINFO bi{};
+        bi.bmiHeader = {sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB, (DWORD)w * (DWORD)h * 4};
+        const size_t n = bi.bmiHeader.biSizeImage / 4;
+        HDC screen = GetDC(nullptr);
+        HDC dcs[3]{};
+        HBITMAP bmps[3]{};
+        uint32_t* px[3]{};
+        bool ok = screen != nullptr;
+        for (int i = 0; i < 3 && ok; i++)
+        {
+            dcs[i] = CreateCompatibleDC(screen);
+            bmps[i] = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void**)&px[i], nullptr, 0);
+            ok = dcs[i] && bmps[i] && px[i];
+            if (ok)
+                SelectObject(dcs[i], bmps[i]);
+        }
+        if (ok)
+        {
+            for (size_t i = 0; i < n; i++)
+            {
+                px[0][i] = 0x00000000;
+                px[1][i] = 0x00FFFFFF;
+            }
+            DrawIconEx(dcs[0], 0, 0, c, w, h, 0, nullptr, DI_NORMAL);
+            DrawIconEx(dcs[1], 0, 0, c, w, h, 0, nullptr, DI_NORMAL);
+            GdiFlush();
+            for (size_t i = 0; i < n; i++)
+            {
+                const uint32_t b = px[0][i] & 0xFFFFFF, wt = px[1][i] & 0xFFFFFF;
+                const int bg = (int)((b >> 8) & 0xFF), wg = (int)((wt >> 8) & 0xFF);
+                const int a = 255 - (wg - bg);
+                px[2][i] = a > 255 ? 0xFFFFFFFFu : ((uint32_t)std::clamp(a, 0, 255) << 24) | b;
+            }
+            POINT src{0, 0};
+            SIZE sz{w, h};
+            BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            UpdateLayeredWindow(wnd, screen, nullptr, &sz, dcs[2], &src, 0, &bf, ULW_ALPHA);
+        }
+        for (int i = 0; i < 3; i++)
+        {
+            if (dcs[i])
+                DeleteDC(dcs[i]);
+            if (bmps[i])
+                DeleteObject(bmps[i]);
+        }
+        if (screen)
+            ReleaseDC(nullptr, screen);
+    }
+
+    void draw(POINT p, const CURSORINFO& ci)
+    {
+        const bool visible = (ci.flags & CURSOR_SHOWING) && ci.hCursor;
+        if (!visible)
+        {
+            if (shown)
+                ShowWindow(wnd, SW_HIDE);
+            shown = false;
+            return;
+        }
+        if (ci.hCursor != shape)
+        {
+            setShape(ci.hCursor);
+            lastP = {-1, -1};
+        }
+        if (p.x != lastP.x || p.y != lastP.y || !shown)
+        {
+            SetWindowPos(wnd, HWND_TOPMOST, p.x - hotX, p.y - hotY, 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE | (shown ? 0 : SWP_SHOWWINDOW));
+            lastP = p;
+            shown = true;
+        }
+    }
+
+    void run()
+    {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"smvlivecursor";
+        RegisterClassW(&wc);
+        wnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                              L"smvlivecursor", L"", WS_POPUP, 0, 0, 32, 32, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!wnd)
+        {
+            LOG("Fill mouse: cursor window creation failed, clicks stay unmapped\n");
+            return;
+        }
+        LOG("Fill mouse: clicks on the picture reach the window (the cursor is drawn, pointer speed follows the "
+            "stretch)\n");
+        POINT p{};
+        ULONGLONG zTick = 0; // the z-order checks run every 16 ms, the cursor every 1 ms
+        while (!quit.load())
+        {
+            MSG m;
+            while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE))
+                DispatchMessageW(&m);
+            Sleep(1);
+            CURSORINFO ci{sizeof(ci)};
+            if (!GetCursorInfo(&ci))
+                continue;
+            const bool alive = IsWindow(target) && IsWindowVisible(overlay) && clientRect(client);
+            const bool held =
+                (GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) | GetAsyncKeyState(VK_MBUTTON)) < 0;
+            const ULONGLONG now = GetTickCount64();
+            const bool zCheck = now - zTick >= 16;
+            if (zCheck)
+                zTick = now;
+            if (!in)
+            {
+                p = ci.ptScreenPos;
+                if (alive && !held && zCheck && PtInRect(&pic, p) && topAt(p, overlay) == overlay &&
+                    targetAt(toWindow(p)))
+                    enter(p);
+                continue;
+            }
+            const POINT q = ci.ptScreenPos;
+            p = toPicture(q);
+            if (!alive)
+            {
+                leave(p);
+                continue;
+            }
+            if (!PtInRect(&pic, p))
+            {
+                // out through an open side: onto a black bar or a neighbouring monitor; else (the clip was down for a
+                // moment) back inside
+                if (!held && MonitorFromPoint(p, MONITOR_DEFAULTTONULL))
+                {
+                    leave(p);
+                    continue;
+                }
+                const POINT c{std::clamp(q.x, client.left, client.right - 1),
+                              std::clamp(q.y, client.top, client.bottom - 1)};
+                moveCursor(c, &clip);
+                p = toPicture(c);
+            }
+            else if (!held && zCheck && (topAt(p, overlay) != overlay || !targetAt(q)))
+            {
+                leave(p); // a window above the overlay at p (the Start menu, a toast), or the target covered at q
+                continue;
+            }
+            setClip(captureClip()); // the OS drops the clip at every foreground change
+            draw(p, ci);
+            if (zCheck && shown)
+                SetWindowPos(wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        if (in)
+            leave(p);
+        DestroyWindow(wnd);
+        wnd = nullptr;
+    }
+};
+
 // ---------------------------------------------------------------- diag dump thread
 
 struct DiagCtx
@@ -457,9 +922,24 @@ static bool resizeSettle(HWND target, Host& host, const Capture& cap, Hud& hud, 
         LOG("target window back at its captured size, the session continues\n");
         if (!hidden)
             ShowWindow(host.hwnd, SW_SHOWNA);
+        if (g_fill)
+            hud.move(host.posX + 16, host.posY + 16); // back on the screen-wide overlay
         return true;
     }
     return false;
+}
+
+// A resize that did not settle back ends the session: exit 4 (the app revives it at the new size), or exit 7
+// when the window closed during the settle (a player that shrinks while it closes).
+static int endAfterResize(HWND target)
+{
+    if (!g_monitor && !IsWindow(target))
+    {
+        LOG("target window closed\n");
+        return 7;
+    }
+    LOG("restart smv-live after resizing the target window\n");
+    return 4;
 }
 
 static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bool vsync, bool clickthrough,
@@ -467,15 +947,20 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
 {
     CHECK_HR(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic)));
     timeBeginPeriod(1);
+    fillMouseRestore(); // a Fill session that was killed or crashed left the pointer speed changed
 
     HWND target = targetOverride ? targetOverride : findTargetWindow(needle);
     if (targetOverride)
     {
         wchar_t title[512]{};
+        // exit 7 = the captured window is gone: the app's revive and settings restart reuse the handle,
+        // and a player that shrinks while it closes (mpv leaving fullscreen) ends its last session with
+        // a resize (exit 4) just before its window goes
         if (!IsWindow(target) || !IsWindowVisible(target))
         {
-            LOG("hwnd 0x%p is not a visible window\n", (void*)target);
-            return 1;
+            LOG("target window closed (hwnd 0x%p %s)\n", (void*)target,
+                IsWindow(target) ? "is hidden" : "no longer exists");
+            return 7;
         }
         GetWindowTextW(target, title, 512);
         // UTF-8 for the same reason as in enumProc above (the app parses this line)
@@ -587,6 +1072,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // and can clear g_hdr on setup failure, before anything else reads it).
         cap.hdrPack = g_hdr && host.useSL;
         int rc = cap.init(target, a.Get());
+        if (rc && !g_monitor && !IsWindow(target))
+        {
+            LOG("target window closed\n");
+            return 7;
+        }
         if (rc)
             return rc;
         if (g_backend == BK_SERVER)
@@ -665,9 +1155,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // during the cold model build: the passthrough overlay looks identical to the source
         // until smoothing starts, so without a visible cue the long first build still reads as
         // "nothing happened". WS_EX_NOACTIVATE keeps it clear of DLSS-G's foreground gate.
+        // Fill presents nothing until the first served group, so its note starts at the window's corner and
+        // moves to the screen's once the overlay runs.
         Hud hud;
+        FillMouse fillMouse; // started once the overlay runs (Fill only), stopped before the teardown
         if (!g_noHud && !park)
-            hud.create(host.posX + 16, host.posY + 16);
+            hud.create((g_fill ? cap.clientScreenX : host.posX) + 16, (g_fill ? cap.clientScreenY : host.posY) + 16);
 
         PipeServer srv;
         if (g_backend == BK_SERVER)
@@ -827,13 +1320,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             bool announced = false;
             ULONGLONG loadPosTick = 0;
             ULONGLONG loadSizeTick = 0;
+            bool loadGone = false; // the window closed during that resize: exit 7, never revived
             while (srvRc.load(std::memory_order_acquire) < 0)
             {
                 pumpMessages();
                 // window tracking during the cold model build: the main loop's 250ms tracker
                 // only starts after the server is up, so dragging the target here left the
                 // passthrough overlay and the "loading ... model" note stuck at the old spot
-                if (!host.park && !g_monitor && !g_fill && GetTickCount64() - loadPosTick > 250)
+                if (!host.park && !g_monitor && GetTickCount64() - loadPosTick > 250)
                 {
                     loadPosTick = GetTickCount64();
                     RECT r{};
@@ -842,7 +1336,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         fb = r;
                         const int ox = r.left + cap.cropX;
                         const int oy = r.top + cap.cropY;
-                        SetWindowPos(host.hwnd, HWND_TOPMOST, ox, oy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                        if (!g_fill) // Fill's overlay covers the monitor: only its note follows the window
+                            SetWindowPos(host.hwnd, HWND_TOPMOST, ox, oy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
                         hud.move(ox + 16, oy + 16);
                     }
                 }
@@ -860,6 +1355,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         LOG("target window resized during the model load (%ux%u -> %ldx%ld)\n", capW, capH, cr.right,
                             cr.bottom);
                         resizeSettle(target, host, cap, hud, false);
+                        loadGone = !IsWindow(target);
                         g_resizeReq.store(true);
                     }
                 }
@@ -897,9 +1393,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // the session ended during the model load (hotkey off, or the resize above):
                 // leave through the same teardown order as the loop's exit path so the resident
                 // host stays and an engine build left running in the background survives
-                const int rcLoad = g_resizeReq.load() ? 4 : 0;
-                LOG(rcLoad == 4 ? "target window resized during the model load, restarting\n"
-                                : "stop requested during the model load, ending the session\n");
+                const int rcLoad = loadGone ? 7 : (g_resizeReq.load() ? 4 : 0);
+                LOG(rcLoad == 7   ? "target window closed during the model load\n"
+                    : rcLoad == 4 ? "target window resized during the model load, restarting\n"
+                                  : "stop requested during the model load, ending the session\n");
                 hud.destroy();
                 srv.stop();
                 cap.stop();
@@ -1103,6 +1600,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // the first served group arrives within one round trip anyway)
             memcpy(lastBuf.data(), buf.data(), capBytes);
             LOG("live overlay running (Esc to stop)\n");
+            if (g_fill)
+                hud.move(host.posX + 16, host.posY + 16);
+            if (g_fill && !park && !g_noFillMouse)
+            {
+                int dw = 0, dh = 0, x0 = 0, y0 = 0;
+                lkFitRect((int)capW, (int)capH, (int)W, (int)H, dw, dh, x0, y0);
+                fillMouse.start(target, host.hwnd, mon,
+                                RECT{mon.left + x0, mon.top + y0, mon.left + x0 + dw, mon.top + y0 + dh});
+            }
         }
 
         volatile LONG running = 1;
@@ -1661,6 +2167,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (cap.closed || (!g_monitor && !IsWindow(target)))
                 {
                     LOG(g_monitor ? "capture closed\n" : "target window closed\n");
+                    if (!g_monitor)
+                        rc2 = 7;
                     break;
                 }
                 phEnd(phPump);
@@ -1918,8 +2426,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     }
                     if (g2 == -2 && (g_monitor || !resizeSettle(target, host, cap, hud, hidden)))
                     {
-                        LOG("restart smv-live after resizing the target window\n");
-                        rc2 = 4;
+                        rc2 = endAfterResize(target);
                         break;
                     }
                     if (g2 == 1)
@@ -2160,6 +2667,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (cap.closed || (!g_monitor && !IsWindow(target)))
                 {
                     LOG(g_monitor ? "capture closed\n" : "target window closed\n");
+                    if (!g_monitor)
+                        rc2 = 7;
                     break;
                 }
 
@@ -2226,8 +2735,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 }
                 if (got == -2 && (g_monitor || !resizeSettle(target, host, cap, hud, hidden)))
                 {
-                    LOG("restart smv-live after resizing the target window\n");
-                    rc2 = 4;
+                    rc2 = endAfterResize(target);
                     break;
                 }
                 // paused (alt-tab): frames are drained but not processed (the overlay is hidden)
@@ -2387,6 +2895,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             }
 
         running = 0;
+        fillMouse.stop(); // hands the cursor and the pointer speed back before the overlay goes
         if (host.prHistNAll > 20)
         {
             double avg = 0, l1 = 0, l01 = 0;

@@ -518,10 +518,14 @@ function syncUpscale(){
 // the same table: DLAA 1, Quality 1 / 1.5, Balanced 1 / 1.724, Performance 1 / 2, Ultra
 // Performance 1 / 3, Auto by the output's pixel count, Custom 1..100 %, at least 64 px a side).
 // Restore's output, DLSS 5 and the interpolation run at it; the final resize takes it to
-// the output. Persisted, DLAA (the output itself) by default. Live runs the same order but takes the
-// share of the window, not of the presented size (Auto = 100 %).
+// the output. Persisted, DLAA (the output itself) by default. Live takes the share of what it presents
+// (the window, or the screen in Fill) and the host resolves Auto by that size.
 var dlssUiReady = false;   // var: setMode runs before this block and must skip the sync
 const DLSS_MODES = { dlaa: 1, quality: 1 / 1.5, balanced: 1 / 1.724, performance: 1 / 2, ultra: 1 / 3 };
+// the slider (always shown) holds the share in use in whole percent, as the option labels round it;
+// dragging it onto one of these picks that mode (its exact share), any other value is Custom
+const DLSS_PCT = { dlaa: 100, quality: 67, balanced: 58, performance: 50, ultra: 33 };
+function dlssModeForPct(v){ return Object.keys(DLSS_PCT).find(k => DLSS_PCT[k] === v) || 'custom'; }
 function dlssMode(){ return $('dlssmode').value; }
 function dlssCustom(){ return +$('dlsscustom').value; }
 function dlssAuto(w, h){ const px = w * h; return px < 1920 * 1080 ? 'dlaa' : px <= 2560 * 1440 ? 'quality' : px <= 3840 * 2160 ? 'performance' : 'ultra'; }
@@ -544,20 +548,22 @@ function workDims(o){
 // a resize enlarges somewhere (RTX VSR has work): an upscale, or a mode below the output size
 function dlssBelowOutput(){ const o = outDims(); return !!o && dlssFactor(o.w, o.h) < 1; }
 function syncDlssMode(){
-  $('dlsscustomwrap').style.display = dlssMode() === 'custom' ? 'inline-flex' : 'none';
-  $('dlsscustomnum').textContent = dlssCustom() + '%';
   const o = uiMode === 'video' ? outDims() : null;
+  // a named mode puts the slider on its share, Auto on its pick for a known output; Auto without one (live
+  // resolves it by the presented size at the start, or no file yet) dims the slider, Custom keeps its value
+  const pick = dlssMode() === 'auto' ? (o ? dlssAuto(o.w, o.h) : null) : dlssMode();
+  if(pick && pick !== 'custom') $('dlsscustom').value = DLSS_PCT[pick];
+  $('dlsscustomwrap').style.opacity = dlssMode() === 'auto' && !o ? '0.5' : '';
+  $('dlsscustomnum').textContent = dlssCustom() + '%';
   let t;
   if(o){
     const d = workDims(o);
     t = 'works at ' + d.w + ' × ' + d.h + (d.w === o.w && d.h === o.h ? ', the output size' : ' for the ' + o.w + ' × ' + o.h + ' output')
         + (dlssMode() === 'auto' ? ' (Auto: ' + $('dlssmode').querySelector('option[value="' + dlssAuto(o.w, o.h) + '"]').textContent + ')' : '');
-  } else t = uiMode === 'live' ? 'live: Restore\'s output, DLSS 5 and the smoothing run at this share of the window size, then fit it back (Auto = 100%)'
+  } else t = uiMode === 'live' ? 'live: Restore, DLSS 5 and the smoothing run at this share of the presented size (the window, or the screen in Fill; Auto picks by it), then the fit'
                               : 'Restore, DLSS 5 and the interpolation run at this share of the output size';
   $('dlssmodehint').textContent = t;
 }
-// live's working size in % of the window (Auto = 100 %)
-function liveFlowPct(){ return Math.round(dlssFactor(0, 0) * 100); }
 {
   const m = localStorage.getItem('dlssMode');
   if(m && [...$('dlssmode').options].some(o => o.value === m)) $('dlssmode').value = m;
@@ -580,7 +586,7 @@ function dlssChanged(){
   }, 1000);
 }
 $('dlssmode').onchange = dlssChanged;
-$('dlsscustom').oninput = dlssChanged;
+$('dlsscustom').oninput = () => { $('dlssmode').value = dlssModeForPct(dlssCustom()); dlssChanged(); };
 dlssUiReady = true;
 syncDlssMode();
 function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.value === 'screen');
@@ -993,11 +999,11 @@ function lvSendOpts(){
     model: mi.model,
     label: liveLoadLabel(mi),   // what is ticked, for the exe's loading note + substitution note
     note: mi.note,    // message/HUD (the raw backend id reads as the wrong model)
-    flow: liveFlowPct(),
+    dlssmode: dlssMode(), dlsscustom: dlssCustom(),   // the working size's share of the presented size
     fit: $('lvfit').value,
     target: liveTargetFps(),
-    // live effects: sharpen inherits the file-render setting; VSR defaults ON for the live
-    // fill upscale (liveVsrOn above; the server ignores it outside fill / on non-enlarging fits)
+    // live effects: sharpen inherits the file-render setting; RTX VSR (liveVsrOn above) takes the live
+    // resize that enlarges, the host picks it (none enlarges = skipped)
     sharpen: $('sharpen').checked ? parseFloat($('sharpval').value) || 0 : 0,
     rtxvsr: liveVsrOn(),
     // "Upscale to" height (0 = off): live renders the model frame at that size first (VSR
@@ -1212,6 +1218,7 @@ ipcRenderer.on('lv-done', (_e, code) => {
   if(!lvRefused){   // a refusal reason stays on the line: an exit code adds nothing to it
     if(lvStopReq || code === 0 || code === null) $('lvstat').textContent = 'stopped';
     else if(code === 5) $('lvstat').textContent = 'no smoothable window was focused - click the window you want smoothed during the countdown';
+    else if(code === 7) $('lvstat').textContent = 'stopped: the window was closed';
     else $('lvstat').textContent += '  (live mode ended, exit ' + code + ')';
   }
   lvStopReq = false;

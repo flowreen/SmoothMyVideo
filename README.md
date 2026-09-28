@@ -48,11 +48,11 @@ player, a browser, a windowed game) with no file and no waiting, Lossless-Scalin
 each mode shows only its own controls plus the settings both share.
 
 <p align="center">
-  <img src="docs/ui.png" alt="The Smooth My Video window in Video mode: the Video / Live switch, Select video, then the numbered panels in processing order (Restore, Interpolate with the Speed target and image scale, Upscale, DLSS 5, Sharpen, HDR with Dolby Vision and HDR10+, Output) and the before/after preview" width="620">
+  <img src="docs/ui.png" alt="The Smooth My Video window in Video mode: the Video / Live switch, Select video, then the numbered panels in processing order (Restore, Upscale with the DLSS mode and its slider at 100 %, DLSS 5, Sharpen, HDR with Dolby Vision and HDR10+, Interpolate with the Speed target, Output) and the before/after preview" width="620">
 </p>
 
 <p align="center">
-  <img src="docs/ui-live.png" alt="The same window in Live mode: the Video / Live switch, the Smooth It Live button with its display and hotkey options, and the shared Restore, interpolation model, Speed, image scale, Upscale, DLSS 5, sharpen and RTX HDR settings" width="620">
+  <img src="docs/ui-live.png" alt="The same window in Live mode: the Video / Live switch, the Smooth It Live button with its display, FPS meter and hotkey options, and the shared numbered panels (Restore, Upscale with the DLSS mode and its slider, DLSS 5, Sharpen, RTX HDR, Interpolate with the Speed target)" width="620">
 </p>
 
 Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a current driver.
@@ -98,8 +98,12 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   final resize to your output (RTX Video Super Resolution when it's on). The **DLSS mode** picks
   the working size as NVIDIA does, a share of the output: DLAA (the default, the output size
   itself), Quality, Balanced, Performance, Ultra Performance, Auto (NVIDIA's pick for the output
-  size) or a Custom 1 to 100%. The lower modes are much faster and a little softer; Performance
-  for a 1080p to 4K upscale works at the source's own 1080p.
+  size) or Custom. The slider beside it shows the share from 1 to 100% and starts at 100% (DLAA);
+  dragging it onto a mode's share picks that mode, any other value is Custom. The lower modes are
+  much faster and a little softer; Performance
+  for a 1080p to 4K upscale works at the source's own 1080p. Live picks its working size the same
+  way from what it shows (the window, or the whole screen in Fill), so Fill at DLAA smooths at the
+  screen's size and the lower modes are its speed lever.
 * 🧠 **Optional NVIDIA DLSS 5 pass.** One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every
   source frame before the smoothing, the order NVIDIA uses in games (after Restore and the resize,
   at the working size, frame generation after DLSS 5),
@@ -136,7 +140,9 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   live models run on any RTX); windowed or borderless windows only (exclusive fullscreen
   can't be captured). Changing the Speed target or the DLSS mode while a session is running restarts it a moment
   later with the new setting, on the same window. Switching to another app pauses the smoothing
-  and hides the overlay; returning to your window resumes it. The Display selector can also fill the screen (upscaled, aspect kept)
+  and hides the overlay; returning to your window resumes it. The Display selector can also fill the screen (upscaled, aspect kept;
+  clicks on the stretched picture reach the matching spot of your window: while the cursor is on the picture, SMV draws it
+  and slows the pointer by the stretch, and gives the normal pointer back when the cursor leaves the picture or Live stops)
   or smooth the **whole monitor** at once (everything on it, works with every model including
   DLSS 4.5). With the RIFE, GMFSS or NVIDIA Smooth Motion model the smoothing is **adaptive**: the output locks to
   your fps target (the same Speed setting file renders use) and the multiplier follows the

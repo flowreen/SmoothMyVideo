@@ -132,10 +132,28 @@ static std::wstring engineScript(const std::wstring& exeDir)
 {
     return g_script.empty() ? exeDir + L"\\..\\live_server.py" : g_script;
 }
-static double g_flowScale = 1.0;               // IMAGE scale (--scale):
-                                               // whole model pipeline at this fraction, fit upscales back
+static double g_flowScale = 1.0; // --scale F: live, the working size as this share of the
+                                 // presented size (tests, the app's Custom)
+static int g_dlssMode = 0;       // --scale MODE: NVIDIA's DLSS mode instead, 1 + its index in
+                                 // kDlssModeName (0 = none: g_flowScale)
+static const wchar_t* const kDlssModeName[6] = {L"auto", L"dlaa", L"quality", L"balanced", L"performance", L"ultra"};
+// --scale's value: a DLSS mode name, or a share 0.01..1; false = neither
+static bool parseLiveScale(const wchar_t* v)
+{
+    for (int m = 0; m < 6; m++)
+        if (_wcsicmp(v, kDlssModeName[m]) == 0)
+        {
+            g_dlssMode = m + 1;
+            g_flowScale = 1.0;
+            return true;
+        }
+    g_dlssMode = 0;
+    g_flowScale = _wtof(v);
+    return g_flowScale >= 0.01 && g_flowScale <= 1.0;
+}
 static bool g_noHud = false;                   // --no-hud: suppress the on-screen fps/latency readout
 static bool g_noHudLat = false;                // --no-hud-latency: keep the readout, drop the "~X ms behind" part
+static bool g_noFillMouse = false;             // --no-fill-mouse: Fill leaves the mouse alone (FillMouse)
 static double g_sharpen = 0.0;                 // --sharpen S: forwarded to the server (live RCAS)
 static bool g_rtxVsr = false;                  // --rtx-vsr: forwarded to the server (VSR fill upscaler)
 static int g_upscaleH = 0;                     // --upscale H: forwarded to the server (the app's "Upscale to"
@@ -3130,6 +3148,14 @@ int wmain(int argc, wchar_t** argv)
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CHECK_HR(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
 
+    // the app runs this after it killed a live host (or saw it crash) while Fill held the mouse
+    if (argc >= 2 && wcscmp(argv[1], L"--restore-mouse") == 0)
+    {
+        if (!fillMouseRestore())
+            LOG("restore-mouse: nothing to restore\n");
+        return 0;
+    }
+
     if (argc >= 2 && wcscmp(argv[1], L"--testsrc") == 0)
     {
         bool onScreen = false;
@@ -3175,7 +3201,8 @@ int wmain(int argc, wchar_t** argv)
     {
         W = (uint32_t)_wtoi(argv[4]);
         H = (uint32_t)_wtoi(argv[5]);
-        g_flowScale = _wtof(argv[8]);
+        if (!parseLiveScale(argv[8]))
+            g_flowScale = 1.0;
         std::vector<std::string> lines;
         const bool ok = nativeLocalHandoff(argv[2], argv[3], (uint32_t)_wtoi(argv[6]), (uint32_t)_wtoi(argv[7]), lines);
         for (const auto& l : lines)
@@ -3225,10 +3252,11 @@ int wmain(int argc, wchar_t** argv)
     }
 
     LOG("usage: smv-live.exe --live \"title substring\" [--gen N] [--vsync] [--no-clickthrough]\n"
-        "                          [--no-hud | --no-hud-latency] [--diag S] [--resident]\n"
+        "                          [--no-hud | --no-hud-latency] [--diag S] [--resident] [--no-fill-mouse]\n"
         "       smv-live.exe --hwnd 0xHWND [same flags]\n"
         "       smv-live.exe --fg [--exclude 0xHWND] [same flags]   (overlay the foreground window)\n"
         "       smv-live.exe --list\n"
+        "       smv-live.exe --restore-mouse   (the pointer speed and clip a killed Fill session held)\n"
         "       smv-live.exe --testsrc [ms|cycle] [--pan] [--onscreen]   (parked with 1 px on the desktop unless\n"
         "                    --onscreen; --pan = a texture moving 4 px right per tick instead of the square)\n");
     return 1;
@@ -3249,7 +3277,9 @@ static void resetSessionGlobals()
     g_capRel = false;
     g_script.clear();
     g_flowScale = 1.0;
+    g_dlssMode = 0;
     g_noHud = g_noHudLat = false;
+    g_noFillMouse = false;
     g_sharpen = 0.0;
     g_rtxVsr = false;
     g_upscaleH = 0;
@@ -3323,6 +3353,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_resident = true;
         else if (wcscmp(argv[i], L"--no-hud") == 0)
             g_noHud = true;
+        else if (wcscmp(argv[i], L"--no-fill-mouse") == 0)
+            g_noFillMouse = true;
         else if (wcscmp(argv[i], L"--no-hud-latency") == 0)
             g_noHudLat = true;
         else if (wcscmp(argv[i], L"--no-adapt") == 0)
@@ -3386,10 +3418,9 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_hdrSb = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--scale") == 0 && i + 1 < argc)
         {
-            g_flowScale = _wtof(argv[++i]);
-            if (g_flowScale < 0.01 || g_flowScale > 1.0)
+            if (!parseLiveScale(argv[++i]))
             {
-                LOG("--scale must be 0.01..1.0\n");
+                LOG("--scale must be 0.01..1.0 or a DLSS mode (auto, dlaa, quality, balanced, performance, ultra)\n");
                 return 1;
             }
         }
@@ -3558,13 +3589,14 @@ static int residentMain(LiveArgs first)
         g_resizeReq.store(false);
         g_sessionClean = false;
         const int rc = runLiveArgs(la);
-        // exit 5 (hotkey pressed inside the app itself) never started anything, stay for it too.
-        // What the host holds: the engines (g_res), or an engine build a session left running
-        // in the background.
+        // exit 7 = the captured window closed, a clean end like a stop. Exit 5 (hotkey pressed inside
+        // the app itself) and an exit 7 before the teardown (the window was gone at the start) never
+        // started anything, stay for them too. What the host holds: the engines (g_res), or an engine
+        // build a session left running in the background.
         const bool held = g_res.rt || nativeBuildPending();
-        const bool stay =
-            (g_sessionClean && (rc == 0 || rc == 4) && held && !g_nrAttempted && !g_rtxUsed && g_backend != BK_DLSSG) ||
-            (rc == 5 && held);
+        const bool stay = (g_sessionClean && (rc == 0 || rc == 4 || rc == 7) && held && !g_nrAttempted && !g_rtxUsed &&
+                           g_backend != BK_DLSSG) ||
+                          ((rc == 5 || (rc == 7 && !g_sessionClean)) && held);
         if (!stay)
         {
             freeAll();
@@ -3768,6 +3800,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             for (auto& t : toks)
                 av.push_back(&t[0]);
             g_flowScale = 1.0; // the globals an item's flags may set, which must not carry over
+            g_dlssMode = 0;
             g_sharpen = 0.0;
             g_rtxVsr = false;
             g_restore = false;

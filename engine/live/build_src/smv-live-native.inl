@@ -96,7 +96,7 @@ __device__ __forceinline__ float rsInv(int o, int in, int out, int mn, int fs)
     for (int k = 0; k < fs; k++) s += lanczos3(rsArg(mn + k, o, in, out));
     return 1.0f / s;
 }
-// One axis of a separable pass (the shrinking fit, Restore's fold, the live capture shrink): the
+// One axis of a separable pass (the shrinking fit, Restore's fold, the live capture resize): the
 // taps depend on the output index alone, so each block computes them ONCE into shared memory,
 // every thread of the block sharing the work: entry (lane, tap) holds the tap's mirrored source
 // index and its weight, tap-major so a warp reads them without bank conflicts, then one thread per
@@ -185,8 +185,8 @@ __global__ void k_packInDirect(const unsigned char* __restrict__ src, int cw, in
     dst[2 * planeStride + o] = p[2] * (1.0f / 255.0f);
 }
 
-// the live capture shrink, horizontal pass: BGRA8 (cw x ch) -> planar float (3, ch, w), Lanczos3
-// with the placement above (this pass only ever shrinks)
+// the live capture resize to the working size, horizontal pass: BGRA8 (cw x ch) -> planar float (3, ch, w),
+// Lanczos3 with the placement above (it shrinks, or enlarges when the working size exceeds the capture)
 __global__ void k_resizeH(const unsigned char* __restrict__ src, int cw, int ch,
                           float* __restrict__ tmp, int w)
 {
@@ -308,7 +308,7 @@ __global__ void k_pqPlanar(const unsigned short* __restrict__ src, int cw, int c
     dst[2 * plane + o] = c;
 }
 
-// the horizontal shrink of an ALREADY planar float source (the HDR input path); the same taps as
+// the horizontal pass of an ALREADY planar float source (the HDR input path); the same taps as
 // k_resizeH, which reads BGRA8 instead.
 __global__ void k_resizeHf(const float* __restrict__ src, int cw, int ch,
                            float* __restrict__ tmp, int w)
@@ -3043,6 +3043,7 @@ struct NativeRife
     int sw = 0, sh = 0;
     bool nvPre = false;
     bool vsrPost = false; // NVIDIA order: RTX VSR runs the final resize (it enlarges), not the first
+    bool vsrPre = false;  // live: RTX VSR runs the capture -> working-size resize before the model, not the fit
     bool restPre =
         false; // live NVIDIA order: Restore on the captured frame, folded to the model size, before the model
     float* dSrcPl = nullptr;    // NVIDIA order: the decoded frame, planar fp32 at sw x sh
@@ -3689,11 +3690,13 @@ struct LkSession
 {
     std::string backend, engDir, cacheDir;
     std::wstring engDirW;
-    double imgScale = 1.0; // the Image scale as the app passes it (%.2f)
-    int cw = 0, ch = 0;    // the capture
-    int mw = 0, mh = 0;    // the model frame: Image scale, even dims, 64 px floor
-    int ph = 0, pw = 0;    // the /64 pad (SMV_LIVE_SAFEPAD=1 on the RIFE family)
-    std::string warmKey;   // the line a warmed .jit.warm marker carries
+    double imgScale = 1.0;    // live: the share the working size came from (the DLSS mode's, or --scale's)
+    int cw = 0, ch = 0;       // the capture
+    int presW = 0, presH = 0; // live: the presented rect (the capture aspect-fit into the canvas)
+    int mode = 0;             // live: the DLSS mode the size came from (1 + kDlssModeName index, 0 = a share)
+    int mw = 0, mh = 0;       // the model frame = the working size (live: liveWorkSize)
+    int ph = 0, pw = 0;       // the /64 pad (SMV_LIVE_SAFEPAD=1 on the RIFE family)
+    std::string warmKey;      // the line a warmed .jit.warm marker carries
     // gmfss: the half size, the five nets
     int hh = 0, hw = 0;
     std::vector<LkGmNet> gm;
@@ -3721,6 +3724,70 @@ static void ensureDirW(const std::wstring& dir)
         LOG("cache: cannot create %ls (error %lu)\n", dir.c_str(), GetLastError());
 }
 
+// the rect a w x h frame takes in the outW x outH canvas: aspect-fit, even, centred (_Fit's fit rect)
+static void lkFitRect(int w, int h, int outW, int outH, int& dw, int& dh, int& x0, int& y0)
+{
+    if (outW == w && outH == h)
+    {
+        dw = w;
+        dh = h;
+        x0 = 0;
+        y0 = 0;
+        return;
+    }
+    const double s = (std::min)((double)outW / w, (double)outH / h);
+    dw = (std::max)(2, lkRound(w * s) & ~1);
+    dh = (std::max)(2, lkRound(h * s) & ~1);
+    x0 = (outW - dw) / 2;
+    y0 = (outH - dh) / 2; // python // on non-negative values
+}
+
+// NVIDIA's DLSS modes as plan.ts has them (DLSS_MODES, autoMode): the working size's share of the output per
+// kDlssModeName entry, and Auto's pick by the output's pixel count (below 1920x1080 DLAA, up to 2560x1440
+// Quality, up to 3840x2160 Performance, else Ultra Performance), as 1 + the kDlssModeName index
+static const double kDlssModeShare[6] = {1.0, 1.0, 1.0 / 1.5, 1.0 / 1.724, 1.0 / 2, 1.0 / 3};
+static int liveAutoMode(int w, int h)
+{
+    const double px = (double)w * h;
+    return px < 1920.0 * 1080 ? 2 : (px <= 2560.0 * 1440 ? 3 : (px <= 3840.0 * 2160 ? 5 : 6));
+}
+
+// Live's working size in NVIDIA's order (Restore, the resize, DLSS 5, FSR, RTX HDR and the model run at it, the fit
+// takes it to the canvas after the model): the DLSS mode's share of the PRESENTED rect (the capture aspect-fit into
+// the canvas W x H: the window itself, or the Fill rect), even, at least 64 px and at most the presented rect a
+// side, capped at 3840x2160 keeping the aspect (offline's workPlan). DLAA = the presented rect itself (in window
+// mode the capture, odd sizes kept); Auto picks the mode by the presented pixel count; mode = the mode it came
+// from (1 + the kDlssModeName index), 0 = --scale's share.
+static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int& mw, int& mh)
+{
+    const int outW = W ? (int)W : cw, outH = W ? (int)H : ch;
+    int x0, y0;
+    lkFitRect(cw, ch, outW, outH, presW, presH, x0, y0);
+    mode = g_dlssMode == 1 ? liveAutoMode(presW, presH) : g_dlssMode;
+    double f = 1.0;
+    if (mode)
+        f = kDlssModeShare[mode - 1];
+    else
+    {
+        char sb[32];
+        sprintf_s(sb, "%.2f", g_flowScale);
+        f = (std::max)(0.01, (std::min)(1.0, strtod(sb, nullptr)));
+    }
+    mw = presW;
+    mh = presH;
+    if (f < 1.0)
+    {
+        mw = (std::min)(presW, (std::max)(64, lkRound(presW * f) & ~1));
+        mh = (std::min)(presH, (std::max)(64, lkRound(presH * f) & ~1));
+    }
+    if ((double)mw * mh > 3840.0 * 2160)
+    {
+        const double k = std::sqrt(3840.0 * 2160 / ((double)mw * mh));
+        mw = (int)std::floor(mw * k) & ~1;
+        mh = (int)std::floor(mh * k) & ~1;
+    }
+}
+
 static bool lkSession(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH,
                       LkSession& s)
 {
@@ -3737,17 +3804,28 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
     const std::string envCache = lkEnv("SMV_TRT_CACHE");
     s.cacheDir = envCache.empty() ? s.engDir + "\\trt_cache_safe_to_delete" : envCache;
     ensureDirW(utf8ToWide(s.cacheDir));
-    char sb[32];
-    sprintf_s(sb, "%.2f", g_flowScale);
-    s.imgScale = (std::max)(0.01, (std::min)(1.0, strtod(sb, nullptr)));
     s.cw = (int)capW;
     s.ch = (int)capH;
-    s.mw = s.cw;
-    s.mh = s.ch;
-    if (s.imgScale < 1.0)
+    if (g_offline)
     {
-        s.mw = (std::max)(64, lkRound(s.cw * s.imgScale) & ~1);
-        s.mh = (std::max)(64, lkRound(s.ch * s.imgScale) & ~1);
+        // the offline host names its model size as the capture
+        char sb[32];
+        sprintf_s(sb, "%.2f", g_flowScale);
+        s.imgScale = (std::max)(0.01, (std::min)(1.0, strtod(sb, nullptr)));
+        s.mw = s.cw;
+        s.mh = s.ch;
+        if (s.imgScale < 1.0)
+        {
+            s.mw = (std::max)(64, lkRound(s.cw * s.imgScale) & ~1);
+            s.mh = (std::max)(64, lkRound(s.ch * s.imgScale) & ~1);
+        }
+    }
+    else
+    {
+        liveWorkSize(s.cw, s.ch, s.presW, s.presH, s.mode, s.mw, s.mh);
+        char sb[32];
+        sprintf_s(sb, "%.2f", g_flowScale);
+        s.imgScale = s.mode ? kDlssModeShare[s.mode - 1] : (std::max)(0.01, (std::min)(1.0, strtod(sb, nullptr)));
     }
     s.ph = (s.mh + 63) / 64 * 64;
     s.pw = (s.mw + 63) / 64 * 64;
@@ -3855,19 +3933,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     const int cw = s.cw, ch = s.ch, mw = s.mw, mh = s.mh;
     const int outW = W ? (int)W : cw, outH = W ? (int)H : ch;
     auto fitRect = [&](int w, int h, int& dw, int& dh, int& x0, int& y0) {
-        if (outW == w && outH == h)
-        {
-            dw = w;
-            dh = h;
-            x0 = 0;
-            y0 = 0;
-            return;
-        }
-        const double s = (std::min)((double)outW / w, (double)outH / h);
-        dw = (std::max)(2, lkRound(w * s) & ~1);
-        dh = (std::max)(2, lkRound(h * s) & ~1);
-        x0 = (outW - dw) / 2;
-        y0 = (outH - dh) / 2; // python // on non-negative values
+        lkFitRect(w, h, outW, outH, dw, dh, x0, y0);
     };
     auto geo = [&](int ph, int pw, int w, int h, int dw, int dh, int x0, int y0) -> std::string {
         char b[512];
@@ -3877,11 +3943,12 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     };
     if (backend == "echo")
     {
+        // the effects run at the working size like the models' (no /64 pad: no engine reads the frame)
         int dw, dh, x0, y0;
-        fitRect(cw, ch, dw, dh, x0, y0);
+        fitRect(mw, mh, dw, dh, x0, y0);
         lines.push_back("NATIVE-PATH cache=" + cacheDir);
-        lines.push_back("LIVE READY native=1 " + geo(ch, cw, cw, ch, dw, dh, x0, y0) +
-                        " scale=1.0000 batch=0 batchpad=0 effects=0 restore=0 engine=none fast=1");
+        lines.push_back("LIVE READY native=1 " + geo(mh, mw, mw, mh, dw, dh, x0, y0) + " scale=" + lkF4(imgScale) +
+                        " batch=0 batchpad=0 effects=0 restore=0 engine=none fast=1");
         return true;
     }
     if (geoOnly)
@@ -4844,12 +4911,12 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
                           NativeRife& nr)
 {
     // resident host: the same window as the previous session (same overlay size, capture
-    // size, image scale and HDR mode) gets the previous answer without a lookup, as long as
+    // size, DLSS mode or share and HDR mode) gets the previous answer without a lookup, as long as
     // the engine files still exist (the user may empty the cache folder by hand);
     // live Restore rides in the key: its engine path is a fact of a restore session only
     wchar_t key[1024];
-    swprintf_s(key, L"%s|%s|%.2f|%u|%u|%u|%u|%d|%d", script.c_str(), backend.c_str(), g_flowScale, W, H, capW, capH,
-               g_hdr ? 1 : 0, g_restore ? 1 : 0);
+    swprintf_s(key, L"%s|%s|%.2f|%d|%u|%u|%u|%u|%d|%d", script.c_str(), backend.c_str(), g_flowScale, g_dlssMode, W, H,
+               capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0);
     bool factsOk = g_resident && g_res.haveFacts && g_res.handoffKey == key;
     if (factsOk)
     {
@@ -5638,9 +5705,18 @@ static bool nativeRtxInit(NativeRife& nr)
     // the resize RTX VSR runs (vw x vh -> vtw x vth): the first one; offline in NVIDIA order there
     // are two, the pre-model one (the decoded frame to the working size) and the final one (the
     // working size to the output): VSR is ONE bridge instance, so it takes the final one when that
-    // enlarges, else the pre-model one, and the other is Lanczos3. Live VSR resizes the model frame
-    // (Restore, when on, reads the capture but has already folded it to the model size)
+    // enlarges, else the pre-model one, and the other is Lanczos3. Live has the same two: the capture
+    // to the working size before the model, and the fit after it
     int vw = g_offline ? sw : nr.w, vh = g_offline ? sh : nr.h, vtw = tw, vth = th;
+    nr.vsrPre = false;
+    if (!g_offline && nr.vsrWant && !(tw > nr.w && th > nr.h) && nr.w > nr.cw && nr.h > nr.ch)
+    {
+        nr.vsrPre = true;
+        vw = nr.cw;
+        vh = nr.ch;
+        vtw = nr.w;
+        vth = nr.h;
+    }
     if (g_offline && nr.nvPre)
     {
         // with RTX HDR the frames after the model are PQ and RTX VSR takes SDR only (NVIDIA: TrueHDR after
@@ -5670,6 +5746,7 @@ static bool nativeRtxInit(NativeRife& nr)
         else
             LOG("native: live RTX VSR skipped (upscales only; this resize does not enlarge), Lanczos3\n");
     }
+    nr.vsrPre = nr.vsrPre && nr.vsr;
     if (nr.uw)
     {
         NCHK(cudaMalloc((void**)&nr.dUp, (size_t)3 * nr.uw * nr.uh * sizeof(float)), "alloc internal render frame");
@@ -5688,8 +5765,14 @@ static bool nativeRtxInit(NativeRife& nr)
         LOG("native: fit: %dx%d -> %dx%d, Lanczos3 (%s)\n", nr.uw ? nr.uw : nr.w, fh, nr.dw, nr.dh,
             nr.dh < fh ? "downscale" : "upscale");
     }
-    if (nr.sharpen > 0.0f || nr.fitAa || (nr.restore && !nr.restPre))
-        NCHK(cudaMalloc((void**)&nr.dPres, (size_t)3 * nr.dw * nr.dh * sizeof(float)), "alloc fit staging");
+    // the fit's staging frame; with RTX VSR before the model it first stages the working-size frame, from the
+    // capture's planes
+    if (nr.sharpen > 0.0f || nr.fitAa || (nr.restore && !nr.restPre) || nr.vsrPre)
+        NCHK(cudaMalloc((void**)&nr.dPres,
+                        (size_t)3 * (std::max)(nr.dw * nr.dh, nr.vsrPre ? nr.w * nr.h : 0) * sizeof(float)),
+             "alloc fit staging");
+    if (nr.vsrPre && !nr.dCapF)
+        NCHK(cudaMalloc((void**)&nr.dCapF, (size_t)3 * nr.ch * nr.cw * sizeof(float)), "alloc capture planes");
     if (nr.sharpen > 0.0f || nr.rtxHdr)
     {
         NCHK(cudaMalloc((void**)&nr.dShIn, (size_t)3 * nr.w * nr.h * sizeof(float)), "alloc after-DLSS 5 input");
@@ -5700,12 +5783,12 @@ static bool nativeRtxInit(NativeRife& nr)
             nr.w, nr.h);
     // Restore's fold target (_Fit._load_restore's restore_target). NVIDIA order (offline with a
     // working size, and live) runs Restore before the model: the target is the working / model size,
-    // or offline the source when VSR runs the pre-model resize right after it. Offline without a
+    // or the source (the capture live) when VSR runs the pre-model resize right after it. Offline without a
     // working size restores the model output: back to its size when VSR follows (so VSR sees the
     // restored frame), else the first resize target directly (restore-as-upscaler, one resize)
     if (nr.restore)
     {
-        const bool vsrAfter = nr.vsr && !nr.vsrPost && !nr.restPre;
+        const bool vsrAfter = nr.vsr && (g_offline ? !nr.vsrPost : nr.vsrPre);
         const bool toModel = (g_offline && nr.nvPre) || nr.restPre;
         nr.restTw = vsrAfter ? sw : (toModel ? nr.w : tw);
         nr.restTh = vsrAfter ? sh : (toModel ? nr.h : th);
@@ -5720,9 +5803,11 @@ static bool nativeRtxInit(NativeRife& nr)
         NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)vtw * vth * 4), "alloc VSR output");
     }
     // RTX TrueHDR runs once per real frame at the working size, after Restore, DLSS 5 and FSR and before the
-    // model (nativePreModelPost); its buffers take the largest frame of the route (the capture live, the
-    // output offline), and live they first carry the capture's SDR planes (k_sdrEncode)
-    const int hw = g_offline ? nr.dw : nr.cw, hh = g_offline ? nr.dh : nr.ch;
+    // model (nativePreModelPost); its buffers take the largest frame of the route (live the capture or the working
+    // size, whichever is bigger; the output offline), and live they first carry the capture's SDR planes
+    // (k_sdrEncode)
+    const bool workBig = !g_offline && (size_t)nr.w * nr.h > (size_t)nr.cw * nr.ch;
+    const int hw = g_offline ? nr.dw : (workBig ? nr.w : nr.cw), hh = g_offline ? nr.dh : (workBig ? nr.h : nr.ch);
     if (nr.rtxHdr)
     {
         NCHK(cudaMalloc((void**)&nr.dThdrIn, (size_t)hw * hh * 4), "alloc TrueHDR input");
@@ -5811,7 +5896,8 @@ static bool nativeRtxInit(NativeRife& nr)
             return false;
         }
         NCHK(cudaDeviceSynchronize(), "VSR warm-up eval sync");
-        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d\n", vw, vh, vtw, vth);
+        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d%s\n", vw, vh, vtw, vth,
+            nr.vsrPre ? ", the captured frame before the model" : "");
     }
     if (nr.rtxHdr)
     {
@@ -6891,6 +6977,20 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
 {
     if (!nativeBuildKernels(nr, cacheDir))
         return false;
+    // the live working size the handoff sized the model frame with (liveWorkSize), and where it came from
+    if (!g_offline)
+    {
+        int presW, presH, mode, mw, mh;
+        liveWorkSize(nr.cw, nr.ch, presW, presH, mode, mw, mh);
+        const int shown = mode ? mode : (g_flowScale >= 0.995 ? 2 : 0); // no --scale = DLAA
+        char how[64];
+        if (shown)
+            sprintf_s(how, "DLSS mode %ls%s", kDlssModeName[shown - 1], g_dlssMode == 1 ? " (Auto)" : "");
+        else
+            sprintf_s(how, "%.2f", g_flowScale);
+        LOG("native: live working size %dx%d = %s of the %dx%d presented, capture %dx%d\n", nr.w, nr.h, how, presW,
+            presH, nr.cw, nr.ch);
+    }
     // live in NVIDIA's order: Restore reads the captured frame (its engine has the capture size) and folds it to
     // the model size before the model runs, so srcW / srcH name the capture from here on (the Restore warm-up
     // in nativeTrtInit and its target in nativeRtxInit read them, possibly on two threads)
@@ -6946,7 +7046,7 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     // live Restore: the engine's x / y at its input size, the captured frame (sized for fp32 so
     // either dtype fits), the fold's horizontal pass at the 4x height and the model-size target,
     // and the folded model-size frame; the enlarging fold's fp32 copy is allocated in
-    // nativeRtxInit once the target is known (never live: the model size is at most the capture)
+    // nativeRtxInit once the target is known (live: a working size above 4x the capture)
     if (nr.restore)
     {
         const size_t mp = (size_t)nr.w * nr.h, sp = (size_t)srcW(nr) * srcH(nr);
@@ -7632,8 +7732,9 @@ static void nativeFree(NativeRife& nr)
         LOG("native: TrueHDR eval %.2f ms mean, %.2f ms max, over %llu real frames\n", nr.thdrMs / (double)nr.thdrN,
             nr.thdrMaxMs, (unsigned long long)nr.thdrN);
     if (nr.vsrN)
-        LOG("native: RTX VSR eval %.2f ms mean, %.2f ms max, over %llu presented frames\n", nr.vsrMs / (double)nr.vsrN,
-            nr.vsrMaxMs, (unsigned long long)nr.vsrN);
+        LOG("native: RTX VSR eval %.2f ms mean, %.2f ms max, over %llu %s frames\n", nr.vsrMs / (double)nr.vsrN,
+            nr.vsrMaxMs, (unsigned long long)nr.vsrN,
+            g_offline ? (nr.nvPre && !nr.vsrPost ? "decoded" : "output") : (nr.vsrPre ? "captured" : "presented"));
     if (nr.liveNr)
         LOG("native: live DLSS 5 %.2f ms mean, %.2f ms max over %llu captured frames (host submit, zero-copy), "
             "its last output reused on %llu identical captures\n",
@@ -9314,12 +9415,18 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
             }
             const RtxRect ri{0, 0, (uint32_t)sw, (uint32_t)sh};
             const RtxRect ro{0, 0, (uint32_t)tw, (uint32_t)th};
+            const int64_t t0 = nowQpc100();
             const unsigned int rv = g_rtxb.evalVsr(nr.dVsrIn, nr.dVsrOut, ri, ro, &nr.vsrSet);
             if (cudaDeviceSynchronize() != cudaSuccess)
             {
                 nr.die("VSR eval sync failed");
                 return false;
             }
+            const double ms = (nowQpc100() - t0) / 1e4;
+            nr.vsrMs += ms;
+            nr.vsrN++;
+            if (ms > nr.vsrMaxMs)
+                nr.vsrMaxMs = ms;
             if (rv == 1u)
                 haveVsr = true;
             else
@@ -9530,12 +9637,46 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             return false;
         }
     }
+    // RTX VSR before the model (the working size above the capture while the fit after the model does not
+    // enlarge): the capture's planes through Restore (folded back to the capture size) and VSR to the working
+    // size, offline's pre-model stage; it reads (R, G, B), so the live (B, G, R) planes go in with a negative
+    // stride and come back into the model frame the same way. It replaces Restore and the resize below; after
+    // a VSR failure those run instead.
+    bool restored = false;
+    if (!nrSame && nr.vsrPre && !nr.vsrFailed && !sdrPre)
+    {
+        const int cps = nr.cw * nr.ch;
+        void* ap[] = {&nr.dCap, &nr.cw, &nr.ch, &nr.dCapF, &nr.ch, &nr.cw, (void*)&cps};
+        if (cuLaunchKernel(nr.fPackInDirect, (nr.cw + 15) / 16, (nr.ch + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ap,
+                           nullptr) != CUDA_SUCCESS)
+        {
+            nr.die("capture planes (RTX VSR) launch failed");
+            return false;
+        }
+        const void* src = nr.dCapF + 2 * (size_t)cps;
+        int ps = -cps, rs = nr.cw, half = 0;
+        bool staged = false;
+        if (!nativeOfflineStage(nr, src, ps, rs, half, staged, nr.cw, nr.ch, nr.w, nr.h, true, true))
+            return false;
+        if (staged)
+        {
+            const float* from = nr.dPres + 2 * (size_t)nr.w * nr.h;
+            int fps = -(nr.w * nr.h), dps = (int)plane;
+            void* a[] = {&from, &fps, &nr.w, &nr.w, &nr.h, &dCur, &nr.pw, &nr.ph, &dps};
+            if (cuLaunchKernel(nr.fPadPlanar, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+                               nullptr) != CUDA_SUCCESS)
+            {
+                nr.die("padPlanar (RTX VSR) launch failed");
+                return false;
+            }
+            restored = true;
+        }
+    }
     // Restore in NVIDIA's order: once per captured frame, on the capture itself (its SDR planes when
     // RTX HDR converts later), folded straight to the model size and into the model frame with the packers'
     // replicate pad, so every model reads restored frames; it replaces the resize below. When the
     // engine refuses, the pass is dropped for the session and the resize below runs instead.
-    bool restored = false;
-    if (!nrSame && nr.restPre && nr.ctxRest && !nr.restFailed)
+    if (!restored && !nrSame && nr.restPre && nr.ctxRest && !nr.restFailed)
     {
         const int cps = nr.cw * nr.ch;
         if (!sdrPre)
@@ -9896,7 +10037,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // captured frame): RTX VSR or the Lanczos3 resize, Upscale to
     auto storeSlot = [&](const void* src, uint8_t* slot, const char* what, int half = 0) -> bool {
         int ps = (int)plane, rs = nr.pw;
-        const bool vsrNow = nr.vsr && !nr.vsrFailed && g_rtxb.created;
+        const bool vsrNow = nr.vsr && !nr.vsrPre && !nr.vsrFailed && g_rtxb.created;
         if (!vsrNow && !nr.fitAa && !nr.uw)
             return plainPack(src, slot, what, half);
         if (!vsrNow && nr.fitAa && !nr.uw)
@@ -10003,8 +10144,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             // the passthrough keys on identity AND no effect, never on geometry alone: with
             // sharpen or Upscale to on, real frames go through the store like every other frame, and
             // with Restore or DLSS 5 on the real frame is the one they wrote in dCur, not the raw
-            // capture (never on DRBA: its real frame is the lagged k - 1, not this capture)
-            else if (nr.identity && !nr.drba && !nr.hdr && nr.sharpen <= 0.0f && !nr.uw && !nr.restore && !nr.liveNr)
+            // capture (never on DRBA: its real frame is the lagged k - 1, not this capture). The model
+            // frame must also BE the capture: a working size above it (Fill) equals the canvas too
+            else if (nr.identity && nr.w == nr.cw && nr.h == nr.ch && !nr.drba && !nr.hdr && nr.sharpen <= 0.0f &&
+                     !nr.uw && !nr.restore && !nr.liveNr)
             {
                 // bit-exact passthrough of the raw capture
                 if (cudaMemcpy2DAsync(slot, nr.pitch, nr.dCap, (size_t)nr.cw * 4, (size_t)nr.cw * 4, nr.ch,

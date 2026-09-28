@@ -761,12 +761,14 @@ let liveModel = 'dlssg'; // mirrored from the renderer's Live settings (lv-opts)
 // and countdown paths spawn with whatever the panel currently shows
 let liveLabel = ''; // user-facing effective-model name for the exe's loading message/HUD
 let liveNote = ''; // substitution note (e.g. Smooth Motion live runs GMFSS), same destination
-let liveFlow = 100; // Image scale % (server backends only; dlssg has no such input)
+let liveDlssMode = 'dlaa'; // the DLSS mode (dlssScaleArg): the working size's share of the presented size
+// (server backends only; dlssg has no such input)
+let liveDlssCustom = 100; // Custom: that share in %
 let liveFit = 'window'; // 'window' = 1:1 overlay, 'fill' = the target's monitor upscaled (server
 // only), 'monitor' = whole-screen capture 1:1 (every model incl. dlssg)
 let liveTarget = 60; // adaptive output fps target, inherited from the renderer's Speed selectors
 let liveSharpen = 0; // live RCAS strength, inherited from the Sharpen controls (0 = off)
-let liveVsr = false; // RTX VSR as the live fill upscaler, inherited from the RTX VSR checkbox
+let liveVsr = false; // RTX VSR as the live upscaler, inherited from the RTX VSR checkbox
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
 let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inherited from the NVIDIA DLSS 5 checkbox
@@ -852,7 +854,7 @@ function onLiveSessionEnd(code: number | null) {
   const resolved = liveResolved;
   const restarts = liveRestarts;
   const busy = () => liveProc !== null && !liveIdle;
-  // settings restart (renderer 'lv-restart', e.g. the Image scale slider moved mid-run):
+  // settings restart (renderer 'lv-restart', e.g. the DLSS mode changed mid-run):
   // relaunch the SAME target with the CURRENT lv-opts mirror; not counted against the cap
   if (liveRestartPending && !liveStopping && resolved) {
     liveRestartPending = false;
@@ -910,7 +912,9 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     // fill mode too. Without it an upscale exists only in fill mode.
     const upH = Math.max(0, Math.round(Number(liveUpH) || 0));
     if (upH > 0) args.push('--upscale', String(upH));
-    if (liveVsr && (liveFit === 'fill' || upH > 0)) args.push('--rtx-vsr');
+    // the host gives RTX VSR the one resize that enlarges (the fit after the model, else the capture to the
+    // working size before it) and skips it with a line when neither does
+    if (liveVsr) args.push('--rtx-vsr');
     // Restore: Real-ESRGAN first on every presented frame; costs most
     // of a 1080p frame budget, the panel hint says so
     if (liveRestore) args.push('--restore');
@@ -943,9 +947,10 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     // and the measured capture rate at runtime (capped at 6x by the model)
     args.push('--target', target);
   }
-  const flow = Math.min(100, Math.max(1, Number(liveFlow) || 100));
-  // IMAGE scale (whole pipeline at reduced size, upscaled back)
-  if (liveModel !== 'dlssg' && flow < 100) args.push('--scale', (flow / 100).toFixed(2));
+  // the DLSS mode: the working size as its share of the presented size (the window, or the Fill rect); the
+  // host resolves Auto by that size, and no flag = DLAA (the presented size itself)
+  const scaleArg = dlssScaleArg(liveDlssMode, liveDlssCustom);
+  if (liveModel !== 'dlssg' && scaleArg) args.push('--scale', scaleArg);
   if (liveModel !== 'dlssg' && liveFit === 'fill') args.push('--fit', 'fill');
   if (liveFit === 'monitor') args.push('--fit', 'monitor'); // whole-screen: all models incl. dlssg
   if (!liveHud) args.push('--no-hud');
@@ -1010,6 +1015,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     sendLive('lv-out', t);
   });
   p.on('close', (code) => {
+    liveRestoreMouse(false);
     if (liveProc !== p) return; // an idle host quit by liveQuitIdle, already forgotten
     const wasIdle = liveIdle;
     liveProc = null;
@@ -1098,7 +1104,7 @@ function liveEndSession() {
   }
 }
 
-// relaunch a running session so spawn-time settings (Image scale) take effect; no-op when idle
+// relaunch a running session so spawn-time settings (the DLSS mode) take effect; no-op when idle
 ipcMain.on('lv-restart', () => {
   if (liveProc && !liveIdle && !liveStopping) {
     liveRestartPending = true;
@@ -1113,7 +1119,8 @@ ipcMain.on(
       model: string;
       label?: string;
       note?: string;
-      flow: number;
+      dlssmode?: string; // the DLSS mode (dlssScaleArg)
+      dlsscustom?: number; // Custom: the working size in % of the presented size
       fit: string;
       target?: number;
       sharpen?: number;
@@ -1138,7 +1145,8 @@ ipcMain.on(
     liveModel = opts.model;
     liveLabel = opts.label ?? '';
     liveNote = opts.note ?? '';
-    liveFlow = opts.flow;
+    liveDlssMode = opts.dlssmode ?? 'dlaa';
+    liveDlssCustom = opts.dlsscustom ?? 100;
     liveFit = opts.fit;
     if (opts.target !== undefined) liveTarget = opts.target;
     liveSharpen = opts.sharpen ?? 0;
@@ -1187,6 +1195,21 @@ ipcMain.handle('lv-hotkey', (_e, acc: string) => registerLiveHotkey(String(acc |
 app.whenReady().then(() => registerLiveHotkey('`'));
 app.on('will-quit', () => globalShortcut.unregisterAll());
 
+// Fill's mouse mapping (the exe's FillMouse) holds the pointer speed and a cursor clip while the cursor is on the
+// stretched picture and keeps them in this marker until it gives them back: a host that was killed (the stop grace,
+// the app quitting) or crashed cannot, so the exe's --restore-mouse does it (GetTempPath's order: TMP, then TEMP)
+const LIVE_MOUSE_MARKER = path.join(process.env.TMP || process.env.TEMP || os.tmpdir(), 'smv-live-mouse.txt');
+function liveRestoreMouse(sync: boolean) {
+  if (!fileExists(LIVE_MOUSE_MARKER)) return;
+  liveLog('restoring the pointer speed and clip a killed Fill session held');
+  try {
+    if (sync) execFileSync(LIVE_EXE, ['--restore-mouse'], { cwd: LIVE_DIR, timeout: 5000 });
+    else execFile(LIVE_EXE, ['--restore-mouse'], { cwd: LIVE_DIR, timeout: 5000 }, () => {});
+  } catch {
+    /* the next live session restores it */
+  }
+}
+
 // hard = the app is leaving: kill outright (no "stop" grace, the overlay must not outlive the GUI)
 function stopLive(hard = false) {
   liveStopping = true;
@@ -1197,6 +1220,7 @@ function stopLive(hard = false) {
     } catch {
       /* already gone */
     }
+    liveRestoreMouse(true);
     return;
   }
   if (liveIdle) liveQuitIdle();

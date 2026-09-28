@@ -198,7 +198,7 @@
   <div class="panel step" id="nrpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">DLSS 5</span>
-      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each source frame after Restore and the resize to the working size (the DLSS mode), before the interpolation (NVIDIA's order: frame generation runs on its output), so the generated frames inherit it.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame after Restore and the resize to the working size (the DLSS mode's share of the window), before the smoothing (NVIDIA's order: the generated frames inherit it): about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (a 4K window costs about 37 ms per source frame, a lower DLSS mode less); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
+      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each source frame after Restore and the resize to the working size (the DLSS mode), before the interpolation (NVIDIA's order: frame generation runs on its output), so the generated frames inherit it.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame after Restore and the resize to the working size (the DLSS mode's share of the presented size: the window, or the screen in Fill), before the smoothing (NVIDIA's order: the generated frames inherit it): about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (a 4K window costs about 37 ms per source frame, a lower DLSS mode less); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
@@ -385,10 +385,10 @@
         <option value="performance">Performance (50%)</option>
         <option value="ultra">Ultra Performance (33%)</option>
         <option value="dlaa" selected>DLAA (100%, default)</option>
-        <option value="custom">Custom&hellip;</option>
+        <option value="custom">Custom</option>
       </select>
-      <span id="dlsscustomwrap" style="display:none;align-items:center;gap:8px;">
-        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlsscustom" type="range" min="1" max="100" step="1" value="100" style="width:150px" aria-label="custom working size"></span>
+      <span id="dlsscustomwrap" style="display:inline-flex;align-items:center;gap:8px;">
+        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlsscustom" type="range" min="1" max="100" step="1" value="100" style="width:150px" aria-label="working size share" title="The working size's share of the output, 1 to 100% (100% = DLAA, the default). Dragging it picks the matching mode: 67% Quality, 58% Balanced, 50% Performance, 33% Ultra Performance, any other value Custom."></span>
         <span class="v" id="dlsscustomnum">100%</span>
       </span>
       <span class="hint" id="dlssmodehint"></span>

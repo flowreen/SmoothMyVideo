@@ -296,7 +296,7 @@ Models (GMFSS is the default, the anime specialist):
   same render as every other pass: DLSS 5 before it, RTX VSR / TrueHDR on its output.
 
 Passes, in NVIDIA's order (the only order, both modes): on each source or captured frame Restore, the
-resize to the working size (the DLSS mode's share of the output, live of the window), DLSS 5, FSR's
+resize to the working size (the DLSS mode's share of the output, live of the presented size), DLSS 5, FSR's
 RCAS sharpen and RTX TrueHDR (SDR to HDR10); then the interpolation at the working size on those
 finished frames, so frame generation comes last and the generated frames inherit the sharpen and the
 HDR; then on every output or presented frame the final resize. RTX VSR takes SDR only, so with RTX HDR
@@ -313,7 +313,8 @@ post-processing after the upscaler (NIS).
   output per axis: `dlaa` 1 (the default, the output itself), `quality` 1 / 1.5, `balanced`
   1 / 1.724, `performance` 1 / 2, `ultra` 1 / 3, `auto` by the output's pixel count (below 1080p
   DLAA, up to 1440p Quality, up to 4K Performance, above Ultra Performance), or any number in (0, 1]
-  (the GUI's Custom offers 1..100 %). `plan.ts` `workPlan` computes it once (even, at least 64,
+  (the GUI's slider, always shown, offers 1..100 % and picks the mode whose rounded share it lands
+  on: 100 / 67 / 58 / 50 / 33, else Custom). `plan.ts` `workPlan` computes it once (even, at least 64,
   capped at 3840x2160 keeping the aspect: the interpolation's reach) and prints `DLSS mode ...:
   working size WxH for the WxH output`. A working size below the source folds the downscale into
   the decode (linear-light Lanczos3 `zscale`); otherwise the host gets `--work-w W --work-h H` (sent
@@ -496,10 +497,12 @@ mean); a Reset on every evaluate made the pass a pure function of the frame (0 o
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME --gen N --target FPS --scale 0.01..1 --fit fill|monitor --sharpen S --rtx-vsr --upscale H --restore
+  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --rtx-hdr
-  --vsync --no-clickthrough --no-hud --no-adapt --park --native --resident --diag S
+  --vsync --no-clickthrough --no-hud --no-adapt --park --native --resident --diag S --no-fill-mouse
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
+smv-live.exe --restore-mouse   gives back the pointer speed and clip a killed or crashed Fill session held (main.ts
+               runs it when %TMP%\smv-live-mouse.txt outlives the host; every live session start does the same)
 smv-live.exe --testsrc [ms|cycle] [--pan] [--onscreen]   verification source (100 ms = 10 fps; 16 for perf; cycle ramps
                10/30/60/30); parked by default: a layered popup with one pixel on the primary monitor's last pixel
                that hands DWM its whole frame (a painted window off the desktop is clipped to the visible pixel);
@@ -509,7 +512,21 @@ smv-live.exe --synth           no-capture diagnostic
 `--gen`: server backends 1..15, dlssg 1..5. `--fg` targets the current foreground window (the
 app's hotkey and countdown use it). Exit codes: 2 unsupported GPU, 3 multi-frame limit, 4 target
 resized or moved monitor (the app auto-restarts, cap 20), 5 `--fg` target not capturable, 6 stall
-(the watchdog killed a wedged server; the app revives the same config).
+(the watchdog killed a wedged server; the app revives the same config), 7 the target window closed
+(mid-session, during a resize, or already gone or hidden when a revive or settings restart starts on
+its handle; the app shows "stopped: the window was closed" and never revives it).
+
+Fill and the mouse (`FillMouse` in smv-live-loop.inl, Magpie's and Lossless Scaling's model): the overlay is
+click-through and the window under it is smaller, so while the cursor is on the picture a thread (1 ms poll, the
+z-order checks every 16 ms) keeps the REAL cursor at the matching point of the window's client area (a 1x1 clip,
+then the client rect as the clip, open towards a neighbouring monitor), hides the OS cursor (user32's
+`ShowSystemCursor`), draws a copy at the picture point in its own click-through window (the HUD's rule: nothing in
+the frames; hidden while the window hides its cursor) and divides the pointer speed by the stretch
+(`SPI_SETMOUSESPEED`, not saved to the profile). It hands everything back at the picture point when the overlay
+hides (pause, resize), a window lies above the overlay at the picture point (the Start menu) or covers the window at
+its point (the window's own popups count as the window), the cursor leaves through a side with a monitor beyond, and
+at the session end. `%TMP%\smv-live-mouse.txt` holds the original speed and the clip while they are changed:
+`--restore-mouse` and every live session start restore them after a kill or a crash. `--no-fill-mouse` = off.
 
 A resize is debounced: on the first size change the overlay hides and the HUD switches to the
 "loading ... model" note at once, the exit 4 comes only after the client size has held for 1 s
@@ -546,7 +563,7 @@ How the server route works:
   forwards `--rtx-hdr` plus the colour knobs and the monitor's SDR reference white, and each real
   frame is expanded with the same TrueHDR bridge and ICtCp correction as a file render. An
   HDR-presenting source window clips at SDR white, so live RTX HDR is for SDR sources.
-* Mid-session Speed or Image scale changes send `lv-restart`: the exe is killed and respawned on
+* Mid-session Speed or DLSS mode changes send `lv-restart`: the exe is killed and respawned on
   the same window (700 ms debounce, not counted against the restart cap). `src/main.ts` learns the
   window handle from the exe's `target window: hwnd=0x... "title"` line, parsed from complete lines
   only (a split stderr chunk once yielded a truncated handle and a respawn on a window that did not
@@ -555,9 +572,16 @@ How the server route works:
   `%ls` through the C locale, `vsnprintf` returns -1 for a title carrying an en dash or a CJK
   character and `logWrite` drops the whole line, which cost a hotkey session its resize revive on
   2026-09-16). The same rule holds for every log line carrying a window title or a file path.
-* Image scale on live: `_img_dims` shrinks the model dims (even, 64 px floor), the capture is
-  downscaled on upload, and `_Fit` upscales the compose back to the canvas (VSR eligible).
-  Echo ignores the slider. A changed value restarts the session.
+* The DLSS mode on live (`--scale MODE|F`, the host's `liveWorkSize`): the working size is the mode's
+  share of the PRESENTED rect (the capture aspect-fit into the overlay: the window itself, or the Fill
+  rect), even, at least 64 px and at most the presented rect a side, capped at 3840x2160 keeping the
+  aspect; Auto picks the mode by the presented pixel count (plan.ts's table); DLAA = the presented rect
+  (window mode: the capture, odd sizes kept). Restore, the resize to it (Lanczos3 either way; Fill at
+  DLAA enlarges here), DLSS 5, FSR, RTX HDR and the model run at it, the fit takes it to the canvas;
+  echo follows it too. RTX VSR takes ONE resize: the fit when it enlarges, else the capture to the
+  working size before the model (offline's pre-model stage, Restore folded back to the capture size
+  first); `native: live working size WxH = DLSS mode M of the WxH presented, capture WxH` names it. A
+  changed mode restarts the session.
 * GUI: every interpolation checkbox works live since 2026-09-12 (DRBA as `rifedrba`, Smooth Motion
   as `fruc`); nothing falls back silently any more.
 
