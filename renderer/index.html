@@ -198,7 +198,7 @@
   <div class="panel step" id="nrpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">DLSS 5</span>
-      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each source frame after Restore and the resize to the working size (the DLSS mode), before the interpolation (NVIDIA's order: frame generation runs on its output), so the generated frames inherit it.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame at the window size before the smoothing (the generated frames inherit it), inside the overlay host: about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (with RTX HDR on at full 1080p lower the Image scale; a 4K window costs about 37 ms per source frame); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
+      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each source frame after Restore and the resize to the working size (the DLSS mode), before the interpolation (NVIDIA's order: frame generation runs on its output), so the generated frames inherit it.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame after Restore and the resize to the working size (the DLSS mode's share of the window), before the smoothing (NVIDIA's order: the generated frames inherit it): about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (a 4K window costs about 37 ms per source frame, a lower DLSS mode less); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
@@ -346,14 +346,14 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
       </label>
-      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly">runs first, once on each source frame, before the resize to the working size</span><span class="lonly">runs on every presented frame, after the smoothing and before the upscale; heavy: caps a live session near 15 to 20 fps at 1080p (about 35 at 720p), lower the Image scale or the window size; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
+      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly">runs first, once on each source frame, before the resize to the working size</span><span class="lonly">runs once on each captured frame, before the resize to the working size, DLSS 5 and the smoothing (NVIDIA's order: the generated frames inherit it); a model pass per captured frame, so a large window can lower the frame rate; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
     </div>
   </div>
 
   <div class="panel step" id="uppanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Upscale</span>
-      <span class="hint"><span class="vonly">the output size: each source frame is resized to the working size (the DLSS mode's share of it) after Restore, before DLSS 5 and the interpolation, and the result to the output size after the interpolation</span><span class="lonly">renders the smoothed picture at this size first, then fits it to the window or screen</span>; plain bicubic unless RTX Video Super Resolution is on</span>
+      <span class="hint"><span class="vonly">the output size: each source frame is resized to the working size (the DLSS mode's share of it) after Restore, before DLSS 5 and the interpolation, and the result to the output size after the interpolation</span><span class="lonly">renders the smoothed picture at this size first, then fits it to the window or screen</span>; Lanczos3 unless RTX Video Super Resolution is on</span>
     </div>
     <div class="row">
       <span class="k">Size</span>
@@ -378,17 +378,17 @@
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k">DLSS mode</span>
-      <select id="dlssmode" title="The working size, NVIDIA's DLSS modes: Restore's output, DLSS 5 and the interpolation run at this share of the output size, and the result is resized to the output after the interpolation (RTX VSR when it is on). DLAA (the default) works at the output size itself; the lower modes are faster and softer.">
+      <select id="dlssmode" title="The working size, NVIDIA's DLSS modes: Restore's output, DLSS 5, FSR, RTX HDR and the interpolation run at this share of the output size, and the result is resized to the output after the interpolation (RTX VSR when it is on; with RTX HDR the resize after it is Lanczos3, as VSR takes SDR only). DLAA (the default) works at the output size itself; the lower modes are faster and softer.">
         <option value="auto">Auto</option>
         <option value="quality">Quality (67%)</option>
         <option value="balanced">Balanced (58%)</option>
         <option value="performance">Performance (50%)</option>
         <option value="ultra">Ultra Performance (33%)</option>
-        <option value="dlaa" selected>DLAA (100%)</option>
+        <option value="dlaa" selected>DLAA (100%, default)</option>
         <option value="custom">Custom&hellip;</option>
       </select>
       <span id="dlsscustomwrap" style="display:none;align-items:center;gap:8px;">
-        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlsscustom" type="range" min="33" max="100" step="1" value="100" style="width:150px" aria-label="custom working size"></span>
+        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlsscustom" type="range" min="1" max="100" step="1" value="100" style="width:150px" aria-label="custom working size"></span>
         <span class="v" id="dlsscustomnum">100%</span>
       </span>
       <span class="hint" id="dlssmodehint"></span>
@@ -397,7 +397,7 @@
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler for the enlarging resize: the working size up to the output, else the source up to the working size; off = plain bicubic; one-time runtime download)</span>
+        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler for the enlarging resize: the working size up to the output, else the source up to the working size; off = Lanczos3; one-time runtime download)</span>
       </label>
     </div>
     <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -423,14 +423,14 @@
                style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
         <span class="v" id="sharpnum">1.00</span>
       </span>
-      <span class="hint">crisper picture; runs after the upscale<span class="vonly">, before HDR</span></span>
+      <span class="hint">crisper picture; runs after DLSS 5, before RTX HDR and the interpolation</span>
     </div>
   </div>
 
   <div class="panel step" id="hdrpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">HDR</span>
-      <span class="hint">Opt-in. NVIDIA RTX HDR converts <span class="vonly">the finished SDR picture to HDR10 as the last pass</span><span class="lonly">each captured frame to HDR right after DLSS 5, before the smoothing (the generated frames inherit it)</span>, with its colour controls (one-time runtime download)<span class="vonly">; Dolby Vision and HDR10+ below add metadata to that HDR10 file</span>.</span>
+      <span class="hint">Opt-in. NVIDIA RTX HDR converts each <span class="vonly">source</span><span class="lonly">captured</span> frame to HDR after Restore, DLSS 5 and FSR, before the interpolation (the generated frames inherit it), with its colour controls (one-time runtime download)<span class="vonly">; Dolby Vision and HDR10+ below add metadata to that HDR10 file</span>.</span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>

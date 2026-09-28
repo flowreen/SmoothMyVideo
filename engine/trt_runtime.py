@@ -9,6 +9,7 @@ engine classes below carry only what the export needs from each graph: the engin
 input / output names and the dynamic batch range. The engines are built and run by the native
 host (smv-live.exe); nothing here builds or runs them.
 """
+import io
 import logging
 import os
 import sys
@@ -30,8 +31,9 @@ warnings.filterwarnings("ignore", message=r".*LeafSpec.*", category=FutureWarnin
 logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    for _stream in (sys.stdout, sys.stderr):
+        if isinstance(_stream, io.TextIOWrapper):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 

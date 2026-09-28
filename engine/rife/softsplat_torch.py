@@ -18,7 +18,7 @@ torch.set_grad_enabled(False)
 
 @torch.inference_mode()
 def softsplat(
-        tenIn: torch.Tensor, tenFlow: torch.Tensor, tenMetric: torch.Tensor, strMode: str
+        tenIn: torch.Tensor, tenFlow: torch.Tensor, tenMetric: torch.Tensor | None, strMode: str
 ):
     mode_parts = strMode.split("-")
     mode_main = mode_parts[0]
@@ -30,20 +30,14 @@ def softsplat(
     if mode_main in ["linear", "soft"]:
         assert tenMetric is not None
 
-    mode_to_operation = {
-        "avg": lambda: torch.cat(
-            [
-                tenIn,
-                tenIn.new_ones([tenIn.shape[0], 1, tenIn.shape[2], tenIn.shape[3]]),
-            ],
-            1,
-        ),
-        "linear": lambda: torch.cat([tenIn * tenMetric, tenMetric], 1),
-        "soft": lambda: torch.cat([tenIn * tenMetric.exp(), tenMetric.exp()], 1),
-    }
-
-    if mode_main in mode_to_operation:
-        tenIn = mode_to_operation[mode_main]()
+    if mode_main == "avg":
+        tenIn = torch.cat([tenIn, tenIn.new_ones([tenIn.shape[0], 1, tenIn.shape[2], tenIn.shape[3]])], 1)
+    elif mode_main == "linear":
+        assert tenMetric is not None
+        tenIn = torch.cat([tenIn * tenMetric, tenMetric], 1)
+    elif mode_main == "soft":
+        assert tenMetric is not None
+        tenIn = torch.cat([tenIn * tenMetric.exp(), tenMetric.exp()], 1)
 
     tenOut = softsplat_func.apply(tenIn, tenFlow)
 

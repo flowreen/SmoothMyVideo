@@ -139,6 +139,7 @@ def run_encode(low, high, fc, out_path, encoder, total_frames):
            *vargs, "-c:a", "aac", "-b:a", "192k", "-shortest",
            "-movflags", "+faststart", "-progress", "pipe:1", out_path]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
     start, frame, fps = time.time(), 0, 0.0
     for line in proc.stdout:
         key, _, val = line.strip().partition("=")

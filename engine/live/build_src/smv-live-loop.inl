@@ -4,15 +4,20 @@
 // shared capture-candidate filter: visible, titled, not ours, not cloaked, not a toolwindow
 static bool candidateWindow(HWND h, DWORD ownPid, wchar_t* title, int cch)
 {
-    if (!IsWindowVisible(h)) return false;
+    if (!IsWindowVisible(h))
+        return false;
     DWORD pid = 0;
     GetWindowThreadProcessId(h, &pid);
-    if (pid == ownPid) return false;
+    if (pid == ownPid)
+        return false;
     BOOL cloaked = FALSE;
     DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-    if (cloaked) return false;
-    if (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return false;
-    if (!GetWindowTextW(h, title, cch) || !title[0]) return false;
+    if (cloaked)
+        return false;
+    if (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
+        return false;
+    if (!GetWindowTextW(h, title, cch) || !title[0])
+        return false;
     return true;
 }
 
@@ -27,8 +32,10 @@ static BOOL CALLBACK enumProc(HWND h, LPARAM lp)
 {
     FindCtx* c = (FindCtx*)lp;
     wchar_t title[512];
-    if (!candidateWindow(h, c->ownPid, title, 512)) return TRUE;
-    if (!StrStrIW(title, c->needle)) return TRUE;
+    if (!candidateWindow(h, c->ownPid, title, 512))
+        return TRUE;
+    if (!StrStrIW(title, c->needle))
+        return TRUE;
     c->found = h;
     // UTF-8, never "%ls": the app parses the hwnd out of this line (hotkey mode has no other
     // source for it) and a title the C locale cannot convert would drop the whole line
@@ -38,7 +45,7 @@ static BOOL CALLBACK enumProc(HWND h, LPARAM lp)
 
 static HWND findTargetWindow(const wchar_t* needle)
 {
-    FindCtx c{ needle, GetCurrentProcessId(), nullptr };
+    FindCtx c{needle, GetCurrentProcessId(), nullptr};
     EnumWindows(enumProc, (LPARAM)&c);
     return c.found;
 }
@@ -54,7 +61,11 @@ static BOOL CALLBACK enumListProc(HWND h, LPARAM lp)
 // picker support: print "0xHWND<TAB>title" per capturable window to stdout (UTF-8)
 static int runList()
 {
-    _setmode(_fileno(stdout), _O_U8TEXT);
+    if (_setmode(_fileno(stdout), _O_U8TEXT) == -1)
+    {
+        LOG("list: stdout mode change failed\n");
+        return 1;
+    }
     EnumWindows(enumListProc, (LPARAM)GetCurrentProcessId());
     fflush(stdout);
     return 0;
@@ -71,15 +82,20 @@ static bool frameBounds(HWND h, RECT& r)
 // smoothing running. A frame that cannot be read pauses, as a foreground change always did.
 static bool livePauseWanted(HWND target, HWND overlay)
 {
-    if (IsIconic(target)) return true;
+    if (IsIconic(target))
+        return true;
     BOOL cloaked = FALSE;
     DwmGetWindowAttribute(target, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-    if (cloaked) return true;
+    if (cloaked)
+        return true;
     const HWND fg = GetAncestor(GetForegroundWindow(), GA_ROOT);
-    if (!fg || fg == target || fg == overlay) return false;
-    if (!IsWindowVisible(fg) || IsIconic(fg)) return false;
+    if (!fg || fg == target || fg == overlay)
+        return false;
+    if (!IsWindowVisible(fg) || IsIconic(fg))
+        return false;
     RECT a{}, b{}, c{};
-    if (!frameBounds(target, a) || !frameBounds(fg, b)) return true;
+    if (!frameBounds(target, a) || !frameBounds(fg, b))
+        return true;
     return IntersectRect(&c, &a, &b) != 0;
 }
 
@@ -90,7 +106,8 @@ static bool monitorIsHDR(HWND target)
 {
     HMONITOR hmon = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
     ComPtr<IDXGIFactory1> f;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) return false;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f))))
+        return false;
     ComPtr<IDXGIAdapter1> a;
     for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++, a.Reset())
     {
@@ -98,7 +115,8 @@ static bool monitorIsHDR(HWND target)
         for (UINT j = 0; a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; j++, o.Reset())
         {
             DXGI_OUTPUT_DESC od{};
-            if (FAILED(o->GetDesc(&od)) || od.Monitor != hmon) continue;
+            if (FAILED(o->GetDesc(&od)) || od.Monitor != hmon)
+                continue;
             ComPtr<IDXGIOutput6> o6;
             DXGI_OUTPUT_DESC1 od1{};
             if (SUCCEEDED(o.As(&o6)) && SUCCEEDED(o6->GetDesc1(&od1)))
@@ -119,7 +137,8 @@ static double sdrWhiteNits(HWND target)
     HMONITOR hmon = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(hmon, &mi)) return 240.0;
+    if (!GetMonitorInfoW(hmon, &mi))
+        return 240.0;
     UINT32 nPath = 0, nMode = 0;
     if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPath, &nMode) != ERROR_SUCCESS)
         return 240.0;
@@ -130,13 +149,15 @@ static double sdrWhiteNits(HWND target)
     for (UINT32 i = 0; i < nPath; i++)
     {
         DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
-        src.header = { DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(src),
-                       paths[i].sourceInfo.adapterId, paths[i].sourceInfo.id };
-        if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS) continue;
-        if (wcscmp(src.viewGdiDeviceName, mi.szDevice) != 0) continue;
+        src.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(src), paths[i].sourceInfo.adapterId,
+                      paths[i].sourceInfo.id};
+        if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS)
+            continue;
+        if (wcscmp(src.viewGdiDeviceName, mi.szDevice) != 0)
+            continue;
         DISPLAYCONFIG_SDR_WHITE_LEVEL wl{};
-        wl.header = { DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, sizeof(wl),
-                      paths[i].targetInfo.adapterId, paths[i].targetInfo.id };
+        wl.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, sizeof(wl), paths[i].targetInfo.adapterId,
+                     paths[i].targetInfo.id};
         if (DisplayConfigGetDeviceInfo(&wl.header) == ERROR_SUCCESS && wl.SDRWhiteLevel > 0)
             return wl.SDRWhiteLevel * 80.0 / 1000.0;
     }
@@ -166,20 +187,24 @@ struct Hud
         RegisterClassW(&wc);
         hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
                                L"smvlivehud", L"", WS_POPUP, x, y, 620, 36, nullptr, nullptr, wc.hInstance, nullptr);
-        if (!hwnd) { LOG("HUD window creation failed (continuing without)\n"); return; }
+        if (!hwnd)
+        {
+            LOG("HUD window creation failed (continuing without)\n");
+            return;
+        }
         SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
-        SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);   // best effort
-        font = CreateFontW(-24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                           DEFAULT_PITCH, L"Segoe UI");
-        wcscpy_s(text, L"\u2026");   // ellipsis until the first stats window lands (escaped: see update())
+        SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE); // best effort
+        font = CreateFontW(-24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        wcscpy_s(text, L"\u2026"); // ellipsis until the first stats window lands (escaped: see update())
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         paint();
     }
 
     void update(double inFps, double outFps, double latMs)
     {
-        if (!hwnd) return;
+        if (!hwnd)
+            return;
         // \u2192 = the arrow; ESCAPED on purpose: a raw UTF-8 literal in this file compiles
         // as ANSI mojibake unless the build adds /utf-8 (it showed as "weird letters")
         // --no-hud-latency hides the latency segment only; the fps segment is governed by
@@ -190,35 +215,46 @@ struct Hud
             swprintf_s(text, L"%.0f fps \u2192 %.0f fps   ~%.0f ms behind", inFps, outFps, latMs);
         else
             swprintf_s(text, L"%.0f fps \u2192 %.0f fps", inFps, outFps);
-        // re-assert the top of the TOPMOST band: the overlay's activation raises it above us
+        // re-assert the top of the TOPMOST band: the overlay's HWND_TOPMOST moves raise it above us
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         paint();
     }
 
     void paint()
     {
-        if (!hwnd) return;
+        if (!hwnd)
+            return;
         HDC dc = GetDC(hwnd);
         RECT r;
         GetClientRect(hwnd, &r);
         FillRect(dc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
         HGDIOBJ of = SelectObject(dc, font);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(255, 255, 255));   // full white: easier to read than green
+        SetTextColor(dc, RGB(255, 255, 255)); // full white: easier to read than green
         r.left += 4;
         DrawTextW(dc, text, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, of);
         ReleaseDC(hwnd, dc);
     }
 
-    void show(bool visible) { if (hwnd) ShowWindow(hwnd, visible ? SW_SHOWNOACTIVATE : SW_HIDE); }
-    void move(int x, int y) { if (hwnd) SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE); }
+    void show(bool visible)
+    {
+        if (hwnd)
+            ShowWindow(hwnd, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    }
+    void move(int x, int y)
+    {
+        if (hwnd)
+            SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 
     void destroy()
     {
-        if (hwnd) DestroyWindow(hwnd);
+        if (hwnd)
+            DestroyWindow(hwnd);
         hwnd = nullptr;
-        if (font) DeleteObject(font);
+        if (font)
+            DeleteObject(font);
         font = nullptr;
     }
 };
@@ -235,7 +271,7 @@ struct DiagCtx
 static DWORD WINAPI diagThread(LPVOID p)
 {
     DiagCtx* d = (DiagCtx*)p;
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const uint32_t w = d->rect.right - d->rect.left;
     const uint32_t h = d->rect.bottom - d->rect.top;
     ULONGLONG end = GetTickCount64() + (ULONGLONG)d->seconds * 1000;
@@ -243,12 +279,13 @@ static DWORD WINAPI diagThread(LPVOID p)
     while (*d->running && GetTickCount64() < end && i < 250)
     {
         wchar_t name[64];
-        swprintf_s(name, L"live_diag_%03d.png", i++);   // cwd-relative (bin/ in dev, engine/live shipped)
+        swprintf_s(name, L"live_diag_%03d.png", i++); // cwd-relative (bin/ in dev, engine/live shipped)
         captureScreen(d->rect.left, d->rect.top, w, h, name);
         Sleep(40);
     }
     LOG("diag: wrote %d overlay dumps\n", i);
-    CoUninitialize();
+    if (SUCCEEDED(coHr))
+        CoUninitialize();
     return 0;
 }
 
@@ -260,8 +297,8 @@ static int slInitCommon()
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     static std::wstring exeDir(exePath);
     exeDir.resize(exeDir.find_last_of(L'\\'));
-    static const wchar_t* pluginPaths[] = { exeDir.c_str() };
-    static sl::Feature features[] = { sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
+    static const wchar_t* pluginPaths[] = {exeDir.c_str()};
+    static sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
 
     g_verbose = GetEnvironmentVariableW(L"DLSSG_VERBOSE", nullptr, 0) != 0;
     sl::Preferences pref{};
@@ -285,31 +322,39 @@ static int slInitCommon()
 // identical host/present path. Isolates whether in-process WGC breaks the DLSS-G pacer.
 static int runSynth(int genFrames, bool vsync)
 {
-    W = 960; H = 540;
+    W = 960;
+    H = 540;
     Host host;
     host.genFrames = genFrames;
     host.syncInterval = vsync ? 1 : 0;
     host.park = true;
     int rc = host.init();
-    if (rc) return rc;
+    if (rc)
+        return rc;
 
     const size_t frameBytes = (size_t)W * H * 4;
     std::vector<uint8_t> buf(frameBytes);
-    auto paint = [&](int step)
-    {
+    auto paint = [&](int step) {
         memset(buf.data(), 24, frameBytes);
         int x0 = 40 + step * 120;
         for (uint32_t y = 230; y < 310; y++)
             for (int x = x0; x < x0 + 80; x++)
             {
                 uint8_t* p = buf.data() + ((size_t)y * W + x) * 4;
-                p[0] = 230; p[1] = 40; p[2] = 40; p[3] = 255;
+                p[0] = 230;
+                p[1] = 40;
+                p[2] = 40;
+                p[3] = 255;
             }
     };
 
     paint(0);
     for (int i = 0; i < 3; i++)
-        if (!host.presentFrame(buf.data())) { LOG("warmup present failed\n"); return 1; }
+        if (!host.presentFrame(buf.data()))
+        {
+            LOG("warmup present failed\n");
+            return 1;
+        }
     sl::DLSSGState st{};
     slDLSSGGetState(host.vp, st, nullptr);
     LOG("synth warmup: status=%d\n", (int)st.status);
@@ -321,22 +366,26 @@ static int runSynth(int genFrames, bool vsync)
     for (int i = 1; GetTickCount64() - t0 < 12000; i++)
     {
         paint(i % 7);
-        if (!host.presentFrame(buf.data())) { LOG("presentFrame failed\n"); return 1; }
+        if (!host.presentFrame(buf.data()))
+        {
+            LOG("presentFrame failed\n");
+            return 1;
+        }
         presented++;
         if (presented % 60 == 0)
         {
             UINT c = 0;
             host.scNative->GetLastPresentCount(&c);
             slDLSSGGetState(host.vp, st, nullptr);
-            LOG("synth: %d app presents -> %u native presents (ratio %.2f) actuallyPresented=%u\n",
-                presented, c - base, (double)(c - base) / presented, st.numFramesActuallyPresented);
+            LOG("synth: %d app presents -> %u native presents (ratio %.2f) actuallyPresented=%u\n", presented, c - base,
+                (double)(c - base) / presented, st.numFramesActuallyPresented);
         }
         Sleep(33);
     }
     UINT c = 0;
     host.scNative->GetLastPresentCount(&c);
-    LOG("synth done: %d app presents -> %u native presents (ratio %.2f)\n",
-        presented, c - base, (double)(c - base) / presented);
+    LOG("synth done: %d app presents -> %u native presents (ratio %.2f)\n", presented, c - base,
+        (double)(c - base) / presented);
     host.shutdown();
     slShutdown();
     return 0;
@@ -353,7 +402,8 @@ static int runSynth(int genFrames, bool vsync)
 // "DLSS 5 + Sharpen") and is shown as is; a run without a label names the backend.
 static std::wstring loadingWhat()
 {
-    if (!g_modelLabel.empty()) return g_modelLabel;
+    if (!g_modelLabel.empty())
+        return g_modelLabel;
     return (g_serverBackend.empty() ? std::wstring(L"DLSS 4.5") : g_serverBackend) + L" model";
 }
 // Waits until the target's client size holds still. true = it came back to the captured size (a
@@ -366,9 +416,10 @@ static bool resizeSettle(HWND target, Host& host, const Capture& cap, Hud& hud, 
     {
         wchar_t sv[16]{};
         settleMs = GetEnvironmentVariableW(L"SMV_LIVE_RESIZE_SETTLE_MS", sv, 16) ? (DWORD)_wtoi(sv) : 0;
-        if (settleMs < 100 || settleMs > 10000) settleMs = 1000;
+        if (settleMs < 100 || settleMs > 10000)
+            settleMs = 1000;
     }
-    ShowWindow(host.hwnd, SW_HIDE);   // the old-size frames no longer cover the window
+    ShowWindow(host.hwnd, SW_HIDE); // the old-size frames no longer cover the window
     if (hud.hwnd)
     {
         _snwprintf_s(hud.text, _TRUNCATE, L"SMV Live: loading %ls...", loadingWhat().c_str());
@@ -384,26 +435,35 @@ static bool resizeSettle(HWND target, Host& host, const Capture& cap, Hud& hud, 
     {
         pumpMessages();
         Sleep(50);
-        if (!IsWindow(target) || g_stopReq.load()) break;
+        if (!IsWindow(target) || g_stopReq.load())
+            break;
         RECT r{};
         GetClientRect(target, &r);
-        if (r.right != last.right || r.bottom != last.bottom) { last = r; stable = GetTickCount64(); }
-        else if (GetTickCount64() - stable >= settleMs) break;
-        RECT fb{};   // the note follows the window while it is dragged
-        if (frameBounds(target, fb)) hud.move(fb.left + cap.cropX + 16, fb.top + cap.cropY + 16);
+        if (r.right != last.right || r.bottom != last.bottom)
+        {
+            last = r;
+            stable = GetTickCount64();
+        }
+        else if (GetTickCount64() - stable >= settleMs)
+            break;
+        RECT fb{}; // the note follows the window while it is dragged
+        if (frameBounds(target, fb))
+            hud.move(fb.left + cap.cropX + 16, fb.top + cap.cropY + 16);
     }
     LOG("target window size settled at %ldx%ld after %llu ms\n", last.right, last.bottom,
         (unsigned long long)(GetTickCount64() - t0));
     if (IsWindow(target) && !g_stopReq.load() && last.right == (LONG)cap.cw && last.bottom == (LONG)cap.ch)
     {
         LOG("target window back at its captured size, the session continues\n");
-        if (!hidden) ShowWindow(host.hwnd, SW_SHOWNA);
+        if (!hidden)
+            ShowWindow(host.hwnd, SW_SHOWNA);
         return true;
     }
     return false;
 }
 
-static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bool vsync, bool clickthrough, int diagSecs, bool park)
+static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bool vsync, bool clickthrough,
+                   int diagSecs, bool park)
 {
     CHECK_HR(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic)));
     timeBeginPeriod(1);
@@ -412,13 +472,21 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
     if (targetOverride)
     {
         wchar_t title[512]{};
-        if (!IsWindow(target) || !IsWindowVisible(target)) { LOG("hwnd 0x%p is not a visible window\n", (void*)target); return 1; }
+        if (!IsWindow(target) || !IsWindowVisible(target))
+        {
+            LOG("hwnd 0x%p is not a visible window\n", (void*)target);
+            return 1;
+        }
         GetWindowTextW(target, title, 512);
         // UTF-8 for the same reason as in enumProc above (the app parses this line)
         LOG("target window: hwnd=0x%p \"%s\"\n", (void*)target, wideToUtf8(title).c_str());
     }
-    if (!target) { LOG("no visible window matching \"%s\"\n", wideToUtf8(needle ? needle : L"").c_str()); return 1; }
-    g_targetHwnd = target;   // the resident "live session ended" line reports it (the app's revive)
+    if (!target)
+    {
+        LOG("no visible window matching \"%s\"\n", wideToUtf8(needle ? needle : L"").c_str());
+        return 1;
+    }
+    g_targetHwnd = target; // the resident "live session ended" line reports it (the app's revive)
     // Resolve HDR live mode. Env SMV_LIVE_HDR overrides detection (1 = force on, 0 = force
     // off); otherwise HDR runs when the display has Windows HDR on AND the mode supports it.
     // The native identity echo stays SDR. Re-evaluated per session (the exit-4 restart re-enters
@@ -429,8 +497,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         wchar_t ov[8]{};
         // rife/gmfss run on PQ and compose R10A2, so HDR reaches them (plus the
         // echo identity path). Fill is HDR-capable too: the server rescales on the PQ
-        // tensors and letterboxes into the R10A2 canvas (RTX VSR demoted to bicubic there,
-        // server-side log line). SMV_LIVE_HDR forces the mode for testing. "blend" (the LSFG
+        // tensors and letterboxes into the R10A2 canvas (RTX VSR demoted to Lanczos3 there,
+        // with a log line). SMV_LIVE_HDR forces the mode for testing. "blend" (the LSFG
         // comparison baseline) composes the exact same PQ R10A2 path as rife/gmfss and exists
         // precisely for HDR A-B comparisons, so it is HDR-capable too.
         // DLSS-G is HDR-capable through the exe-side pack (kHdrPackCS): SL mandates RGB10 + PQ
@@ -439,11 +507,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // quantises them to 8-bit BGRA for the flow and the warp, so only the TWEENS carry 8-bit
         // PQ precision (the real frames stay full precision); far better than the SDR capture
         // of an HDR-presented window, which is 2-3x over-bright and clipped (below).
-        const bool hdrCapable = g_backend == BK_DLSSG ||
+        const bool hdrCapable =
+            g_backend == BK_DLSSG ||
             (g_backend == BK_SERVER &&
-             (g_serverBackend == L"echo" || g_serverBackend == L"rife" || g_serverBackend == L"gmfss"
-              || g_serverBackend == L"blend" || g_serverBackend == L"nvof" || g_serverBackend == L"rifedrba"
-              || g_serverBackend == L"fruc"));
+             (g_serverBackend == L"echo" || g_serverBackend == L"rife" || g_serverBackend == L"gmfss" ||
+              g_serverBackend == L"blend" || g_serverBackend == L"nvof" || g_serverBackend == L"rifedrba" ||
+              g_serverBackend == L"fruc"));
         // AUTO: HDR runs whenever the display has Windows HDR on and the mode supports it. A
         // "purple screen" at the start was the model-load passthrough presenting raw FP16 capture
         // bytes into the R10A2 swap chain (a startup transient, suppressed below); the
@@ -462,13 +531,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         if (g_rtxHdr && g_hdr && g_backend == BK_SERVER)
         {
             g_sdrWhite = sdrWhiteNits(target);
-            LOG("RTX HDR live: TrueHDR expansion on (colour %ls, SDR white %.0f nits)\n",
-                g_hdrColor, g_sdrWhite);
+            LOG("RTX HDR live: TrueHDR expansion on (colour %ls, SDR white %.0f nits)\n", g_hdrColor, g_sdrWhite);
         }
         else if (g_rtxHdr)
             LOG("RTX HDR live skipped (needs an HDR display and a server model: RIFE/GMFSS/Frame Blend)\n");
         else if (g_dlssnr && g_hdr && g_backend == BK_SERVER)
-            g_sdrWhite = sdrWhiteNits(target);   // the SDR range the NR pass works on
+            g_sdrWhite = sdrWhiteNits(target); // the SDR range the NR pass works on
         if (!g_hdr && hdrDisplay)
             LOG("NOTICE: Windows HDR is ON for this display. This model captures 8-bit SDR for now, "
                 "so HDR highlights will look over-bright/clipped. HDR live support is in progress for "
@@ -476,7 +544,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 "player tonemap to SDR.\n");
     }
     RECT fb{};
-    if (!frameBounds(target, fb)) { LOG("DwmGetWindowAttribute failed\n"); return 1; }
+    if (!frameBounds(target, fb))
+    {
+        LOG("DwmGetWindowAttribute failed\n");
+        return 1;
+    }
 
     // capture first: the frame pool size defines the swap chain size
     Host host;
@@ -498,20 +570,27 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++)
         {
             a->GetDesc1(&ad);
-            if (ad.VendorId == 0x10DE) break;
+            if (ad.VendorId == 0x10DE)
+                break;
             a.Reset();
         }
-        if (!a) { LOG("no NVIDIA adapter found\n"); return 1; }
-        g_vramBytes = ad.DedicatedVideoMemory;   // the slot-count memory budget (slotBudget)
+        if (!a)
+        {
+            LOG("no NVIDIA adapter found\n");
+            return 1;
+        }
+        g_vramBytes = ad.DedicatedVideoMemory; // the slot-count memory budget (slotBudget)
 
-        static Capture cap; // static: outlives this scope, single instance per process
-        cap.swizzle = host.useSL;   // DLSS-G keeps RGBA; server/identity routes stay BGRA
+        static Capture cap;       // static: outlives this scope, single instance per process
+        cap.swizzle = host.useSL; // DLSS-G keeps RGBA; server/identity routes stay BGRA
         // dlssg in HDR packs scRGB -> R10A2 PQ in the exe; swizzle is bypassed there. Must be set before init() (it sizes the chain
         // and can clear g_hdr on setup failure, before anything else reads it).
         cap.hdrPack = g_hdr && host.useSL;
         int rc = cap.init(target, a.Get());
-        if (rc) return rc;
-        if (g_backend == BK_SERVER) cap.initInterop();   // zero-copy capture for the python server
+        if (rc)
+            return rc;
+        if (g_backend == BK_SERVER)
+            cap.initInterop(); // zero-copy capture for the python server
         const uint32_t capW = cap.cw, capH = cap.ch;
         RECT mon{};
         if (g_monitor)
@@ -519,30 +598,30 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // whole-screen mode: capture IS the monitor, overlay covers it 1:1 (capture size ==
             // presented size, so every backend works, including DLSS-G)
             HMONITOR hm = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
-            MONITORINFO mi{ sizeof(mi) };
+            MONITORINFO mi{sizeof(mi)};
             GetMonitorInfoW(hm, &mi);
             mon = mi.rcMonitor;
             W = capW;
             H = capH;
             host.posX = mon.left;
             host.posY = mon.top;
-            LOG("whole screen: capturing the monitor %ux%u at (%ld,%ld), gen=%d (%dx)\n",
-                W, H, mon.left, mon.top, genFrames, genFrames + 1);
+            LOG("whole screen: capturing the monitor %ux%u at (%ld,%ld), gen=%d (%dx)\n", W, H, mon.left, mon.top,
+                genFrames, genFrames + 1);
         }
         else if (g_fill)
         {
             // fullscreen on the monitor the target window currently occupies: the overlay takes
             // the monitor's size and the SERVER upscales content into it (aspect-fit letterbox)
             HMONITOR hm = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
-            MONITORINFO mi{ sizeof(mi) };
+            MONITORINFO mi{sizeof(mi)};
             GetMonitorInfoW(hm, &mi);
             mon = mi.rcMonitor;
             W = (uint32_t)(mon.right - mon.left);
             H = (uint32_t)(mon.bottom - mon.top);
             host.posX = mon.left;
             host.posY = mon.top;
-            LOG("fill screen: capture %ux%u -> monitor %ux%u at (%ld,%ld), gen=%d (%dx)\n",
-                capW, capH, W, H, mon.left, mon.top, genFrames, genFrames + 1);
+            LOG("fill screen: capture %ux%u -> monitor %ux%u at (%ld,%ld), gen=%d (%dx)\n", capW, capH, W, H, mon.left,
+                mon.top, genFrames, genFrames + 1);
         }
         else
         {
@@ -552,67 +631,33 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // so the real title bar stays visible above it.
             host.posX = cap.clientScreenX;
             host.posY = cap.clientScreenY;
-            LOG("capturing %ux%u at (%ld,%ld), gen=%d (%dx)\n", W, H, (long)cap.clientScreenX, (long)cap.clientScreenY, genFrames, genFrames + 1);
+            LOG("capturing %ux%u at (%ld,%ld), gen=%d (%dx)\n", W, H, (long)cap.clientScreenX, (long)cap.clientScreenY,
+                genFrames, genFrames + 1);
         }
 
         rc = host.init();
-        if (rc) return rc;
+        if (rc)
+            return rc;
         if (host.minWH && (W < host.minWH || H < host.minWH))
             LOG("WARNING: %ux%u is below the DLSS-G minimum extent %u, FG may refuse\n", W, H, host.minWH);
 
-        // The DLSS 5 pass inside this process, on the shared capture texture. Server
-        // backends only (never DLSS-G: the NR host starves it), and only with the zero-copy
-        // capture (the pass lives on that texture). Every refusal logs one line and the
-        // session runs without DLSS 5.
-        static LiveNr liveNr;
+        // The DLSS 5 pass inside this process. Server backends only (never DLSS-G: the NR host
+        // starves it). NVIDIA's order: the native host runs it on the model frame after Restore and
+        // the resize (nativeLiveNrInit logs its line once the model size is known, or why the
+        // session runs without it).
         if (g_dlssnr && g_backend == BK_SERVER)
         {
-            std::string why;
             wchar_t nv[8]{};
             if (GetEnvironmentVariableW(L"SMV_LIVE_NR_NATIVE", nv, 8) && nv[0] == L'0')
-                why = "SMV_LIVE_NR_NATIVE=0 turns the pass off";
-            else if (!cap.interop)
-                why = "no zero-copy capture interop";
-            else if ((uint64_t)capW * capH > 3840ull * 2160ull)
-                why = "the capture is above 3840x2160, the largest size the DLSS 5 host was probed at (36.9 ms per eval there)";
-            else
             {
-                wchar_t exePath[MAX_PATH]{};
-                GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-                std::wstring nrDir(exePath);
-                nrDir.resize(nrDir.find_last_of(L'\\'));
-                nrDir += L"\\..\\dlssnr";   // shipped layout: engine\live\smv-live.exe beside engine\dlssnr
-                wchar_t ov[MAX_PATH]{};
-                if (GetEnvironmentVariableW(L"SMV_DLSSNR_DIR", ov, MAX_PATH) && ov[0]) nrDir = ov;
-                wchar_t full[MAX_PATH]{};
-                if (GetFullPathNameW(nrDir.c_str(), MAX_PATH, full, nullptr)) nrDir = full;
-                g_nrAttempted = true;
-                if (!liveNr.init(host, cap, nrDir, why))
-                    liveNr.shutdown();
-            }
-            if (liveNr.active)
-            {
-                g_liveNr = &liveNr;
-                g_nrNative = true;
-                wchar_t am[8]{};   // the core reads the same lever (nr_host.cpp)
-                const bool maskOff = GetEnvironmentVariableW(L"SMV_NR_AUTOMASK", am, 8) && am[0] == L'0';
-                LOG("live DLSS 5 native: on, %ux%u per captured frame inside the overlay host, structure %.2f tone %.2f style %d, passes %d, %s, %s, %s%s\n",
-                    capW, capH, g_nrStructure, g_nrTone, g_nrStyle, liveNr.host.passes(), liveNr.mvNote.c_str(),
-                    maskOff ? "no auto mask (SMV_NR_AUTOMASK=0)" : "auto mask",
-                    g_hdr ? "SDR range of the window (HDR highlights untouched)" : "SDR window",
-                    liveNr.reuse ? ", identical frames reuse the last output" : "");
-                const int nrWant = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
-                if (liveNr.host.passes() < nrWant)
-                    LOG("live DLSS 5 native: %d of %d passes (%s)\n", liveNr.host.passes(), nrWant,
-                        liveNr.host.passNote().c_str());
-                if (g_hdr) LOG("live DLSS 5 native: SDR reference white %.0f nits\n", g_sdrWhite);
-            }
-            else
-            {
-                // the session runs WITHOUT DLSS 5 and says why, instead of refusing the whole
-                // session (the one product case is a capture above 3840x2160)
-                LOG("live DLSS 5 skipped for this session: %s\n", why.c_str());
+                LOG("live DLSS 5 skipped for this session: SMV_LIVE_NR_NATIVE=0 turns the pass off\n");
                 g_dlssnr = false;
+            }
+            else
+            {
+                g_liveNrCuda = true;
+                g_nrNative = true;
+                g_nrAttempted = true;
             }
         }
 
@@ -621,7 +666,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // until smoothing starts, so without a visible cue the long first build still reads as
         // "nothing happened". WS_EX_NOACTIVATE keeps it clear of DLSS-G's foreground gate.
         Hud hud;
-        if (!g_noHud && !park) hud.create(host.posX + 16, host.posY + 16);
+        if (!g_noHud && !park)
+            hud.create(host.posX + 16, host.posY + 16);
 
         PipeServer srv;
         if (g_backend == BK_SERVER)
@@ -634,8 +680,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // the native host is the only route for every server backend (a session it cannot
             // run ends on its reason line). Its DLL load and engine handoff overlap the
             // source-rate measurement below (they depend on the capture size only)
-            srv.beginNativeHandoff(script, g_serverBackend, genFrames, capW, capH,
-                                   cap.hTex, cap.hFence, &host);
+            srv.beginNativeHandoff(script, g_serverBackend, capW, capH, cap.hTex, cap.hFence, &host);
             // SOURCE-RATE MEASUREMENT, before the server spawns. Two consumers:
             //  * fixed mode (--no-adapt with a --target and no --gen): seeds the whole
             //    multiplier from the fps target. Drift
@@ -652,12 +697,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const int slotCap = slotBudget(mSlotBytes);
             if (genFrames > slotCap - 1)
             {
-                LOG("--gen %d needs %.1f GB of slots, clamping to %d (memory budget)\n",
-                    genFrames, 2.0 * (genFrames + 1) * mSlotBytes / 1073741824.0, slotCap - 1);
+                LOG("--gen %d needs %.1f GB of slots, clamping to %d (memory budget)\n", genFrames,
+                    2.0 * (genFrames + 1) * mSlotBytes / 1073741824.0, slotCap - 1);
                 genFrames = slotCap - 1;
             }
             const bool derive = g_targetFps > 0 && !g_genExplicit;
-            int ceilGen = genFrames;   // slots-1 the server graph is built at
+            int ceilGen = genFrames; // slots-1 the server graph is built at
             if (derive)
             {
                 double base = 0, measSec = 0;
@@ -674,7 +719,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     while (nowQpc100() / 1e4 - tD < 250.0)
                     {
                         pumpMessages();
-                        if (pull() <= 0) Sleep(5);
+                        if (pull() <= 0)
+                            Sleep(5);
                     }
                     const double t0 = nowQpc100() / 1e4;
                     double tPrev = 0, tFirst = 0, tLast = 0;
@@ -688,18 +734,27 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             const double tn = nowQpc100() / 1e4;
                             if (tPrev && tn - tPrev < 300.0)
                             {
-                                if (!tFirst) tFirst = tPrev;
+                                if (!tFirst)
+                                    tFirst = tPrev;
                                 tLast = tn;
                                 intervals++;
                             }
                             tPrev = tn;
-                            if (canPass) host.presentFrame(mbuf.data());
+                            if (canPass)
+                                host.presentFrame(mbuf.data());
                         }
                     }
                     if (intervals >= 4 && tLast > tFirst)
-                    { base = 1000.0 * intervals / (tLast - tFirst); measSec = (tLast - tFirst) / 1000.0; }
+                    {
+                        base = 1000.0 * intervals / (tLast - tFirst);
+                        measSec = (tLast - tFirst) / 1000.0;
+                    }
                 }
-                if (base <= 0) { base = 24.0; LOG("source rate unmeasurable (static/paused?), assuming ~24 fps\n"); }
+                if (base <= 0)
+                {
+                    base = 24.0;
+                    LOG("source rate unmeasurable (static/paused?), assuming ~24 fps\n");
+                }
                 // +1 slot of headroom: the pair clock jitters, so a pair occasionally holds
                 // one more grid point than the nominal ratio. Clamped ONLY by memory.
                 // The slot count is the HARD ceiling on the presented rate (a pair can
@@ -710,26 +765,29 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // mode now sizes with 15% headroom on the measurement plus 2 spare slots.
                 // Fixed mode keeps the classic count (its multiplier is drift-tracked).
                 const int slotsFixed = (int)ceil((double)g_targetFps / base) + 1;
-                int slots = g_noAdapt ? slotsFixed
-                                      : (int)ceil((double)g_targetFps / base * 1.15) + 2;
-                if (slots < 2) slots = 2;
+                int slots = g_noAdapt ? slotsFixed : (int)ceil((double)g_targetFps / base * 1.15) + 2;
+                if (slots < 2)
+                    slots = 2;
                 bool capped = false;
-                if (slots > slotCap) { slots = slotCap; capped = true; }
+                if (slots > slotCap)
+                {
+                    slots = slotCap;
+                    capped = true;
+                }
                 ceilGen = slots - 1;
                 if (g_noAdapt)
                 {
                     int want = (int)((double)g_targetFps / base + 0.5) - 1;
                     genFrames = want < 1 ? 1 : want > ceilGen ? ceilGen : want;
-                    LOG("measured ~%.1f fps source, target %d fps: fixed %dx (drift-tracked)\n",
-                        base, g_targetFps, genFrames + 1);
+                    LOG("measured ~%.1f fps source, target %d fps: fixed %dx (drift-tracked)\n", base, g_targetFps,
+                        genFrames + 1);
                 }
                 else
                 {
                     genFrames = ceilGen;
                     LOG("slots %d (target %d, source %.1f fps measured over %.2f s)%s "
                         "(memory cap %d slots at %.1f MB/slot)\n",
-                        slots, g_targetFps, base, measSec,
-                        capped ? " (MEMORY-CAPPED, target unreachable)" : "",
+                        slots, g_targetFps, base, measSec, capped ? " (MEMORY-CAPPED, target unreachable)" : "",
                         slotCap, mSlotBytes / 1048576.0);
                 }
             }
@@ -750,10 +808,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // streaming) are answered by the same handshake, and an unused --caprel simply
             // comes back as caprel=0.
             g_capRel = g_backend == BK_SERVER && !host.useSL;
-            std::atomic<int> srvRc{ -1 };   // -1 loading, 0 ready, 1 failed
+            std::atomic<int> srvRc{-1}; // -1 loading, 0 ready, 1 failed
             std::thread loader([&] {
-                srvRc.store(srv.start(script, g_serverBackend,
-                                      spawnGen, capW, capH, cap.hTex, cap.hFence, &host) ? 1 : 0);
+                srvRc.store(srv.start(script, g_serverBackend, spawnGen, capW, capH, cap.hTex, cap.hFence, &host) ? 1
+                                                                                                                  : 0);
             });
             // 1:1 passthrough is only meaningful when capture and presented sizes match (window /
             // whole-screen modes); fill mode upscales inside the server, so there is nothing to
@@ -796,11 +854,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 {
                     loadSizeTick = GetTickCount64();
                     RECT cr{};
-                    if (IsWindow(target) && GetClientRect(target, &cr)
-                        && (abs(cr.right - (int)capW) > 2 || abs(cr.bottom - (int)capH) > 2))
+                    if (IsWindow(target) && GetClientRect(target, &cr) &&
+                        (abs(cr.right - (int)capW) > 2 || abs(cr.bottom - (int)capH) > 2))
                     {
-                        LOG("target window resized during the model load (%ux%u -> %ldx%ld)\n",
-                            capW, capH, cr.right, cr.bottom);
+                        LOG("target window resized during the model load (%ux%u -> %ldx%ld)\n", capW, capH, cr.right,
+                            cr.bottom);
                         resizeSettle(target, host, cap, hud, false);
                         g_resizeReq.store(true);
                     }
@@ -819,8 +877,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (g_modelNote.empty())
                         LOG("loading %ls (first build at this resolution can take up to a minute)...\n", nm);
                     else
-                        LOG("loading %ls (%ls; first build at this resolution can take up to a minute)...\n",
-                            nm, g_modelNote.c_str());
+                        LOG("loading %ls (%ls; first build at this resolution can take up to a minute)...\n", nm,
+                            g_modelNote.c_str());
                     if (hud.hwnd)
                         _snwprintf_s(hud.text, _TRUNCATE, L"SMV Live: loading %ls...", nm);
                     announced = true;
@@ -844,16 +902,24 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                                 : "stop requested during the model load, ending the session\n");
                 hud.destroy();
                 srv.stop();
-                if (g_liveNr) { g_liveNr->shutdown(); g_liveNr = nullptr; }
                 cap.stop();
                 host.shutdown();
-                if (host.useSL) slShutdown();
+                if (host.useSL)
+                    slShutdown();
                 timeEndPeriod(1);
-                if (g_nrAttempted) { fflush(stderr); ExitProcess((UINT)rcLoad); }
+                if (g_nrAttempted)
+                {
+                    fflush(stderr);
+                    ExitProcess((UINT)rcLoad);
+                }
                 g_sessionClean = true;
                 return rcLoad;
             }
-            if (srvRc.load() != 0) { LOG("live server failed to start\n"); return 1; }
+            if (srvRc.load() != 0)
+            {
+                LOG("live server failed to start\n");
+                return 1;
+            }
             if (srv.outbufAck && host.outBuf)
                 LOG("present path: direct from VRAM (shared output buffer)\n");
             // a started host always holds the zero-copy capture import (nativeRefusal)
@@ -864,11 +930,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             cap.requestRefresh();
         }
 
-        const size_t capBytes = (size_t)capW * capH * 4;   // capture-size frames (server input)
-        const size_t outBytes = (size_t)W * H * 4;         // presented frames (server output)
+        const size_t capBytes = (size_t)capW * capH * 4; // capture-size frames (server input)
         std::vector<uint8_t> buf(capBytes), lastBuf(capBytes);
-        uint32_t shmSeq = 0;                       // shm-mode: frame token sequence
-        double statLatSum = 0;                     // capture->present latency accumulation (ms)
+        uint32_t shmSeq = 0;   // shm-mode: frame token sequence
+        double statLatSum = 0; // capture->present latency accumulation (ms)
         uint64_t statLatN = 0;
         // ADAPTIVE SMOOTHNESS (server route, streaming only), Lossless-Scaling-style TARGET
         // mode: output frames are generated AT THE TARGET GRID's timestamps (the overlay
@@ -879,10 +944,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // slot CEILING per pair (it sizes the shm sets): a base below target/(gen+1) tops out
         // at the ceiling instead. Fixed mode (--no-adapt) keeps uniform fractions + the real
         // frame, byte-identical to the classic behavior.
-        double adaptTarget = 0;                    // resolved target output fps (0 = fixed mode)
-        double gridStep = 0;                       // target grid period in 100ns units
-        int64_t nextGrid = 0;                      // next un-emitted grid timestamp (capture domain)
-        int64_t prevSentTs = 0;                    // capture ts of the previously sent frame
+        double adaptTarget = 0; // resolved target output fps (0 = fixed mode)
+        double gridStep = 0;    // target grid period in 100ns units
+        int64_t nextGrid = 0;   // next un-emitted grid timestamp (capture domain)
+        int64_t prevSentTs = 0; // capture ts of the previously sent frame
         if (g_backend == BK_SERVER && !g_noAdapt)
         {
             adaptTarget = g_targetFps;
@@ -899,8 +964,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if (adaptTarget > 0)
             {
                 gridStep = 1e7 / adaptTarget;
-                LOG("adaptive smoothness: target %.0f fps (fractional resample, up to %dx per pair)\n",
-                    adaptTarget, genFrames + 1);
+                LOG("adaptive smoothness: target %.0f fps (fractional resample, up to %dx per pair)\n", adaptTarget,
+                    genFrames + 1);
             }
         }
         // DYNAMIC OUTPUT THROTTLE (the "consume every source frame" loop). The slot ceiling
@@ -920,58 +985,64 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // Multiplicative decrease / small additive-ish increase with a clean-time gate is the
         // standard anti-oscillation shape: a single bad group costs 10%, and winning it back
         // takes a full clean window, so the loop settles instead of pumping.
-        double effTarget = adaptTarget;   // throttled output target (<= adaptTarget)
-        uint64_t thrDropBase = 0;         // cap.dropped at the previous evaluation
-        double thrCleanMs = 0;            // accumulated clean-group time toward a step up
+        double effTarget = adaptTarget; // throttled output target (<= adaptTarget)
+        uint64_t thrDropBase = 0;       // cap.dropped at the previous evaluation
+        double thrCleanMs = 0;          // accumulated clean-group time toward a step up
         double thrLastLog = 0;
-        double thrWinT0 = 0;              // control-window start (ms); 0 = not started
+        double thrWinT0 = 0; // control-window start (ms); 0 = not started
         uint32_t thrGroups = 0, thrOverruns = 0;
-        const double kThrWinMs = 500;     // control window: long enough to measure a drop RATE
-        const double kThrDown = 0.95;     // step down per bad window (every 500ms at worst)
-        const double kThrUp = 1.05;       // step up per clean window (every 3s at best)
-        const double kThrCleanMs = 3000;  // sustained headroom needed before stepping up
-        const double kThrDropRate = 1.0;  // drops/s tolerated before throttling (compositor noise)
-        double emaDt = 0;                          // smoothed capture interval (ms), paces the group
+        const double kThrWinMs = 500; // control window: long enough to measure a drop RATE
+        const double kThrDown = 0.95; // step down per bad window (every 500ms at worst)
+        const double kThrUp = 1.05;   // step up per clean window (every 3s at best)
+        double emaDt = 0;             // smoothed capture interval (ms), paces the group
         ULONGLONG lastArrival = 0;
-        int idleSlotIdx = -1;                      // last presented slot, re-presentable while the
-        uint32_t idleSlotSet = 0;                  // source is static (python only rewrites a half
-                                                   // when a NEW group lands, so the content is stable)
-        auto slotOffset = [&](uint32_t set, uint32_t i) -> size_t
-        {
+        int idleSlotIdx = -1;     // last presented slot, re-presentable while the
+        uint32_t idleSlotSet = 0; // source is static (python only rewrites a half
+                                  // when a NEW group lands, so the content is stable)
+        auto slotOffset = [&](uint32_t set, uint32_t i) -> size_t {
             return srv.shmInBytes + ((size_t)set * srv.shmSlots + i) * srv.shmSlot;
         };
         // present one output slot GPU-direct from the shared VRAM ring (slots never touch host
         // memory)
-        auto presentSlotFrom = [&](uint32_t set, uint32_t i) -> bool
-        {
+        auto presentSlotFrom = [&](uint32_t set, uint32_t i) -> bool {
             return host.presentTail(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, srv.shmPitch);
         };
 
-        auto drainQuiet = [&]()
-        {
+        auto drainQuiet = [&]() {
             UINT stable = 0;
             int quietMs = 0;
             while (quietMs < 100)
             {
                 UINT c = 0;
                 host.scNative->GetLastPresentCount(&c);
-                if (c == stable) { Sleep(5); quietMs += 5; }
-                else { stable = c; quietMs = 0; }
+                if (c == stable)
+                {
+                    Sleep(5);
+                    quietMs += 5;
+                }
+                else
+                {
+                    stable = c;
+                    quietMs = 0;
+                }
             }
         };
-        auto resetFG = [&]() -> bool
-        {
+        auto resetFG = [&]() -> bool {
             sl::DLSSGOptions off{};
             off.mode = sl::DLSSGMode::eOff;
             off.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
-            if (slDLSSGSetOptions(host.vp, off) != sl::Result::eOk) return false;
-            if (!host.presentFrame(lastBuf.data())) return false;
+            if (slDLSSGSetOptions(host.vp, off) != sl::Result::eOk)
+                return false;
+            if (!host.presentFrame(lastBuf.data()))
+                return false;
             sl::DLSSGOptions on{};
             on.mode = sl::DLSSGMode::eOn;
             on.numFramesToGenerate = (uint32_t)genFrames;
-            if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk) return false;
+            if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
+                return false;
             for (int i = 0; i < 2; i++)
-                if (!host.presentFrame(lastBuf.data())) return false;
+                if (!host.presentFrame(lastBuf.data()))
+                    return false;
             drainQuiet();
             return true;
         };
@@ -984,13 +1055,25 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             {
                 WaitForSingleObject(cap.evt, 100);
                 got = cap.latestFrame(buf.data());
-                if (got < 0) { LOG("capture failed during warmup\n"); return 1; }
+                if (got < 0)
+                {
+                    LOG("capture failed during warmup\n");
+                    return 1;
+                }
             }
-            if (!got) { LOG("no frames captured in 5s (window occluded by exclusive fullscreen?)\n"); return 1; }
+            if (!got)
+            {
+                LOG("no frames captured in 5s (window occluded by exclusive fullscreen?)\n");
+                return 1;
+            }
             if (host.useSL)
             {
                 for (int i = 0; i < 3; i++)
-                    if (!host.presentFrame(buf.data())) { LOG("warmup present failed\n"); return 1; }
+                    if (!host.presentFrame(buf.data()))
+                    {
+                        LOG("warmup present failed\n");
+                        return 1;
+                    }
                 sl::DLSSGState st{};
                 if (slDLSSGGetState(host.vp, st, nullptr) == sl::Result::eOk)
                 {
@@ -1010,7 +1093,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             }
             else if (g_backend == BK_IDENTITY)
             {
-                if (!host.presentFrame(buf.data())) { LOG("first present failed\n"); return 1; }
+                if (!host.presentFrame(buf.data()))
+                {
+                    LOG("first present failed\n");
+                    return 1;
+                }
             }
             // server backends: no pre-present (capture and output sizes differ under --fit fill;
             // the first served group arrives within one round trip anyway)
@@ -1025,7 +1112,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         {
             RECT wr{};
             GetWindowRect(host.hwnd, &wr);
-            dctx = { wr, diagSecs, &running };
+            dctx = {wr, diagSecs, &running};
             diagH = CreateThread(nullptr, 0, diagThread, &dctx, 0, nullptr);
         }
 
@@ -1035,11 +1122,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         ULONGLONG lastPosTick = 0;
         UINT statPresentBase = 0;
         host.scNative->GetLastPresentCount(&statPresentBase);
-        uint64_t statDropBase = 0;         // cap.dropped at the last stats tick
+        uint64_t statDropBase = 0; // cap.dropped at the last stats tick
         uint64_t statCaptured = 0;
         bool ratioWarned = false;
-        int fgWantPrev = -1;   // DLSS-G target derivation: last derived gen (hysteresis, see stats)
-        int fixWantPrev = -1;  // fixed-ladder server derivation: same two-window hysteresis
+        int fgWantPrev = -1;  // DLSS-G target derivation: last derived gen (hysteresis, see stats)
+        int fixWantPrev = -1; // fixed-ladder server derivation: same two-window hysteresis
         bool hidden = false;
         int rc2 = 0;
         // STATIC-SOURCE HOLD (server route): a paused video emits no WGC frames, so the session
@@ -1055,15 +1142,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // a seek/frame-step while paused reaches the screen within a second.
         // QPC-based ms clock for the hold cadence (GetTickCount64 ticks at ~15.6ms)
         auto nowMs = [] { return nowQpc100() / 10000.0; };
-        double nextIdleTick = 0;         // next idle re-present deadline, nowMs domain (0 = live)
-        ULONGLONG lastRefreshTick = GetTickCount64();   // last target-refresh request
+        double nextIdleTick = 0;                      // next idle re-present deadline, nowMs domain (0 = live)
+        ULONGLONG lastRefreshTick = GetTickCount64(); // last target-refresh request
         // hold rate = the mode's cadence CAPPED AT 10 FPS (Lossless Scaling parity on static
         // frames). The cap also keeps the beat well above Windows'
         // ~15.6ms timer quantization, which ate a 33ms cadence down to 22 of 30 fps (Win11
         // ignores timeBeginPeriod for windowless/occluded processes, so precise sub-50ms
         // sleeps are not reliably available here).
         double idleStepMs = adaptTarget > 0 ? gridStep / 10000.0 : 1000.0 / (genFrames + 1);
-        if (idleStepMs < 100.0) idleStepMs = 100.0;
+        if (idleStepMs < 100.0)
+            idleStepMs = 100.0;
         // PRESENT-PACING SMOOTHING (the 360Hz vsync cross-check follow-up): the old pacing
         // computed targets in the GetTickCount64 domain (~15.6ms ticks) and presented
         // back-to-back after any sleep overshoot, so about half of all presents landed
@@ -1076,11 +1164,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // arrival-cadence emaDt fix removed. Waits run on a high-resolution waitable
         // timer with a short spin tail (Sleep granularity is what caused the overshoot).
         double minSpaceMs = 0;
-        double panelHzMode = 0;   // panel refresh from the display MODE (not the measured one)
+        double panelHzMode = 0; // panel refresh from the display MODE (not the measured one)
         // the floor follows the rate we actually sustain; recomputed on every throttle step
-        auto refloor = [&]
-        {
-            if (panelHzMode <= 1.0) return;
+        auto refloor = [&] {
+            if (panelHzMode <= 1.0)
+                return;
             // The floor is 0.95x the LONGER of the panel refresh period and the effective
             // output period. Dropping the panel term once the user's target is above the
             // refresh rate was tried and is unstable: a lower effective rate then means a
@@ -1115,30 +1203,30 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // the group across the pair instead.
                 panelHzMode = (double)dm.dmDisplayFrequency;
                 refloor();
-                LOG("present pacing: floor %.3fms (panel mode %u Hz, target %.0f fps%s)\n",
-                    minSpaceMs, dm.dmDisplayFrequency, adaptTarget,
+                LOG("present pacing: floor %.3fms (panel mode %u Hz, target %.0f fps%s)\n", minSpaceMs,
+                    dm.dmDisplayFrequency, adaptTarget,
                     adaptTarget > panelHzMode ? ", above panel: presents run tear-allowed past refresh" : "");
             }
         }
-        HANDLE paceTimer = CreateWaitableTimerExW(nullptr, nullptr,
-            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        auto waitUntilMs = [&](double tMs)
-        {
+        HANDLE paceTimer =
+            CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        auto waitUntilMs = [&](double tMs) {
             for (;;)
             {
                 const double rem = tMs - nowMs();
-                if (rem <= 0.03) return;
+                if (rem <= 0.03)
+                    return;
                 if (paceTimer && rem > 0.6)
                 {
                     LARGE_INTEGER due;
-                    due.QuadPart = -(LONGLONG)((rem - 0.3) * 10000.0);   // relative, 100ns units
+                    due.QuadPart = -(LONGLONG)((rem - 0.3) * 10000.0); // relative, 100ns units
                     if (SetWaitableTimer(paceTimer, &due, 0, nullptr, nullptr, FALSE))
                     {
                         WaitForSingleObject(paceTimer, (DWORD)rem + 2);
                         continue;
                     }
                 }
-                YieldProcessor();   // sub-0.6ms tail: spin
+                YieldProcessor(); // sub-0.6ms tail: spin
             }
         };
         // SMV_LIVE_TIMING=1: per-group exe-side breakdown (streaming route), printed with
@@ -1146,18 +1234,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const bool tmOn = GetEnvironmentVariableW(L"SMV_LIVE_TIMING", nullptr, 0) != 0;
         double tmEma = 0, tmNfr = 0, tmInPair = 0;
         uint32_t tmN = 0, tmDegrade = 0;
-        double lastPresSched = 0;   // previous present's SCHEDULED time (the floor chain anchor)
-        double hitchPrev = 0;       // hitch trace (SMV_LIVE_HITCH=1, see the present queue)
+        double lastPresSched = 0; // previous present's SCHEDULED time (the floor chain anchor)
+        double hitchPrev = 0;     // hitch trace (SMV_LIVE_HITCH=1, see the present queue)
         const bool hitchOn = GetEnvironmentVariableW(L"SMV_LIVE_HITCH", nullptr, 0) != 0;
-        int64_t smoothTs = 0;   // EMA-smoothed pair clock (see sendPairStream)
+        int64_t smoothTs = 0; // EMA-smoothed pair clock (see sendPairStream)
         // one streaming pair handoff: bump seq, publish the frame (fence or shm copy), build
         // the fraction list, write the message. Returns nfr, or UINT32_MAX on a write failure.
         // fraction message: one f32 per slot the server was actually sized for (shmSlots),
         // so the drift tracker can raise the ladder up to the ceiling without overrunning it
-        std::vector<uint8_t> msgBuf(4 + 4 * (size_t)(srv.shmSlots ? srv.shmSlots
-                                                                  : (uint32_t)genFrames + 1));
-        auto sendPairStream = [&](int64_t sentTs) -> uint32_t
-        {
+        std::vector<uint8_t> msgBuf(4 + 4 * (size_t)(srv.shmSlots ? srv.shmSlots : (uint32_t)genFrames + 1));
+        auto sendPairStream = [&](int64_t sentTs) -> uint32_t {
             // SMOOTHED PAIR CLOCK for the adaptive grid: WGC delivery times quantize to the
             // panel/VRR refresh cadence (measured +-4ms), which makes pair spans bimodal
             // (~37/46ms on a 41.7ms source) - the long half then overflows the slot ceiling
@@ -1186,7 +1272,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             uint32_t nfr = 0;
             if (shmSeq == 1)
             {
-                fr[nfr++] = 1.0f;   // very first frame: nothing to interpolate yet
+                fr[nfr++] = 1.0f; // very first frame: nothing to interpolate yet
             }
             else if (nextIdleTick)
             {
@@ -1200,9 +1286,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             else if (adaptTarget > 0)
             {
                 const int64_t span = sentTs - prevSentTs;
-                if (!nextGrid) nextGrid = prevSentTs + (int64_t)gridStep;
-                const uint32_t inPair = span > 0 && nextGrid <= sentTs
-                    ? (uint32_t)((sentTs - nextGrid) / (int64_t)gridStep) + 1 : 0;
+                if (!nextGrid)
+                    nextGrid = prevSentTs + (int64_t)gridStep;
+                const uint32_t inPair =
+                    span > 0 && nextGrid <= sentTs ? (uint32_t)((sentTs - nextGrid) / (int64_t)gridStep) + 1 : 0;
                 tmInPair += inPair;
                 if (inPair > srv.shmSlots)
                 {
@@ -1210,9 +1297,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     // slot ceiling reached (base far below target): the first-N
                     // grid times would bunch at the pair's start, so this pair
                     // degrades to the evenly-spread classic ladder instead
-                    for (int k = 1; k <= genFrames; k++) fr[nfr++] = (float)k / (float)(genFrames + 1);
+                    for (int k = 1; k <= genFrames; k++)
+                        fr[nfr++] = (float)k / (float)(genFrames + 1);
                     fr[nfr++] = 1.0f;
-                    while (nextGrid <= sentTs) nextGrid += (int64_t)gridStep;
+                    while (nextGrid <= sentTs)
+                        nextGrid += (int64_t)gridStep;
                 }
                 else
                 {
@@ -1225,11 +1314,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             }
             else
             {
-                for (int k = 1; k <= genFrames; k++) fr[nfr++] = (float)k / (float)(genFrames + 1);
-                fr[nfr++] = 1.0f;   // the real frame, bit-exact passthrough
+                for (int k = 1; k <= genFrames; k++)
+                    fr[nfr++] = (float)k / (float)(genFrames + 1);
+                fr[nfr++] = 1.0f; // the real frame, bit-exact passthrough
             }
             memcpy(msg, &nfr, 4);
-            if (!srv.writeFull(msg, 4 + 4 * nfr)) return UINT32_MAX;
+            if (!srv.writeFull(msg, 4 + 4 * nfr))
+                return UINT32_MAX;
             prevSentTs = sentTs;
             return nfr;
         };
@@ -1243,13 +1334,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // 0.0 until two valid samples or when stats go disjoint, e.g. right after a mode
         // change), it feeds refreshQpc100 for prBunch; disp = presents DWM displayed per
         // second (PresentCount only advances for those), the vsync cross-check.
-        auto logLiveStats = [&](double capFps, double outFps, double latAvg, double secs,
-                                const sl::DLSSGState* st)
-        {
+        auto logLiveStats = [&](double capFps, double outFps, double latAvg, double secs, const sl::DLSSGState* st) {
             const double ratio = capFps > 0 ? outFps / capFps : 0.0;
-            const double tgt = g_backend == BK_IDENTITY ? 1.0
+            const double tgt = g_backend == BK_IDENTITY           ? 1.0
                                : (host.useSL || adaptTarget <= 0) ? (double)(genFrames + 1)
-                               : (capFps > 0 ? effTarget / capFps : 0.0);
+                                                                  : (capFps > 0 ? effTarget / capFps : 0.0);
             const double prTot = host.prN ? host.prMsTot / host.prN : 0.0;
             const double prWait = host.prN ? host.prMsWait / host.prN : 0.0;
             const double prFlip = host.prN ? host.prMsFlip / host.prN : 0.0;
@@ -1257,13 +1346,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             DXGI_FRAME_STATISTICS fs{};
             if (SUCCEEDED(host.scNative->GetFrameStatistics(&fs)) && fs.SyncQPCTime.QuadPart)
             {
-                if (host.fsValid && fs.SyncRefreshCount > host.fsPrev.SyncRefreshCount
-                    && fs.SyncQPCTime.QuadPart > host.fsPrev.SyncQPCTime.QuadPart)
+                if (host.fsValid && fs.SyncRefreshCount > host.fsPrev.SyncRefreshCount &&
+                    fs.SyncQPCTime.QuadPart > host.fsPrev.SyncQPCTime.QuadPart)
                 {
                     const double dq = (double)(fs.SyncQPCTime.QuadPart - host.fsPrev.SyncQPCTime.QuadPart);
                     panelHz = (double)(fs.SyncRefreshCount - host.fsPrev.SyncRefreshCount) * qpcFreq() / dq;
                     dispFps = (double)(fs.PresentCount - host.fsPrev.PresentCount) * qpcFreq() / dq;
-                    if (panelHz > 1.0) host.refreshQpc100 = (int64_t)(1e7 / panelHz);
+                    if (panelHz > 1.0)
+                        host.refreshQpc100 = (int64_t)(1e7 / panelHz);
                 }
                 host.fsPrev = fs;
                 host.fsValid = true;
@@ -1274,13 +1364,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) && ti.qpcVBlank)
             {
                 if (host.dwmPrevQpc && ti.qpcVBlank > host.dwmPrevQpc)
-                    dwmHz = (double)(ti.cRefresh - host.dwmPrevRefresh) * qpcFreq()
-                            / (double)(ti.qpcVBlank - host.dwmPrevQpc);
+                    dwmHz = (double)(ti.cRefresh - host.dwmPrevRefresh) * qpcFreq() /
+                            (double)(ti.qpcVBlank - host.dwmPrevQpc);
                 host.dwmPrevRefresh = ti.cRefresh;
                 host.dwmPrevQpc = ti.qpcVBlank;
             }
             char slf[64] = "";
-            if (st) sprintf_s(slf, " status=%d actuallyPresented=%u", (int)st->status, st->numFramesActuallyPresented);
+            if (st)
+                sprintf_s(slf, " status=%d actuallyPresented=%u", (int)st->status, st->numFramesActuallyPresented);
             // identical-pair passthrough: the native host's held count, APPENDED (the GUI and
             // scripts/smoke.py read the fields before it). The python live server reports its
             // own count on its own line: this counter only sees the in-process host.
@@ -1290,9 +1381,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             LOG("live: %.1f captured fps -> %.1f presented fps (ratio %.2f, target %.1f) "
                 "%s ~%.0fms%s present %.2fms (wait %.2f flip %.2f) drop %.1f "
                 "panel %.1fHz dwm %.1fHz disp %.1f/s bunch %.1f/s%s\n",
-                capFps, outFps, ratio, tgt, host.useSL ? "handoff" : "latency", latAvg, slf,
-                prTot, prWait, prFlip, (cap.dropped - statDropBase) / secs,
-                panelHz, dwmHz, dispFps, host.prBunch / secs, stc);
+                capFps, outFps, ratio, tgt, host.useSL ? "handoff" : "latency", latAvg, slf, prTot, prWait, prFlip,
+                (cap.dropped - statDropBase) / secs, panelHz, dwmHz, dispFps, host.prBunch / secs, stc);
             return ratio;
         };
         // ================= CROSS-GROUP PRESENT QUEUE (every streaming server) =============
@@ -1307,9 +1397,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // that a new frame may only be drained once the last sent group has been OPENED by
         // the host (GATE B: its first token or end marker came back, so the host has acquired
         // the previous capture).
-        const bool xqRoute = g_backend == BK_SERVER;   // every model server runs the queue
-        LOG("present queue: xq=%d (%s)\n", xqRoute ? 1 : 0,
-            xqRoute ? "cross-group queue" : "direct present");
+        const bool xqRoute = g_backend == BK_SERVER; // every model server runs the queue
+        LOG("present queue: xq=%d (%s)\n", xqRoute ? 1 : 0, xqRoute ? "cross-group queue" : "direct present");
         if (xqRoute)
         {
             struct XqGroup
@@ -1318,8 +1407,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 double arrMs, spanMs;
                 int64_t sentTs;
                 ULONGLONG sentTick;
-                bool opened;    // first slot token or end marker came back
-                bool capRel;    // the server released the shared capture texture
+                bool opened; // first slot token or end marker came back
+                bool capRel; // the server released the shared capture texture
             };
             struct XqSlot
             {
@@ -1328,17 +1417,17 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 int64_t sentTs;
                 bool lastOfGroup;
             };
-            std::deque<XqGroup> pend;    // sent, not yet closed by an end marker
-            std::deque<XqSlot> fifo;     // presentable slots, spanning groups
-            std::deque<uint32_t> rq;     // raw tokens from the reader thread
+            std::deque<XqGroup> pend; // sent, not yet closed by an end marker
+            std::deque<XqSlot> fifo;  // presentable slots, spanning groups
+            std::deque<uint32_t> rq;  // raw tokens from the reader thread
             // The capture-release token: not a valid slot index, high bit clear so it is
             // never mistaken for an end marker.
             const uint32_t kCapRelTok = 0x7FFFFFFFu;
             std::mutex rqM;
-            volatile LONG rDead = 0;
+            std::atomic<bool> rDead{false};
             HANDLE tokEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            const double kXqDropRate = 3.0;    // drops/s tolerated before throttling
-            const double kXqCleanMs = 1000.0;  // clean time needed before a step up
+            const double kXqDropRate = 3.0;   // drops/s tolerated before throttling
+            const double kXqCleanMs = 1000.0; // clean time needed before a step up
             uint64_t halfDefer = 0, gateCDefer = 0, halfPend = 0;
             // Phase instrumentation (SMV_LIVE_XQPHASE=1, off by default). Per-iteration
             // QPC accumulators for every named phase of this loop, printed on the 2s tick as
@@ -1348,7 +1437,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             bool phOn = false;
             {
                 wchar_t pv[8]{};
-                if (GetEnvironmentVariableW(L"SMV_LIVE_XQPHASE", pv, 8) && pv[0] == L'1') phOn = true;
+                if (GetEnvironmentVariableW(L"SMV_LIVE_XQPHASE", pv, 8) && pv[0] == L'1')
+                    phOn = true;
             }
             // Cut escapes, one env lever each so every cut can be A/B'd on its own.
             // SMV_LIVE_XQ_CAPEV: drive the capture probe from the frame pool's FrameArrived
@@ -1359,22 +1449,22 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             //   semantics are untouched: the flag only decides WHETHER to call drainNewest.
             // SMV_LIVE_XQ_WAITCAP: cap the wait at 1ms even while the FIFO holds slots, so the
             //   capture probe keeps running during a group's present span.
-            auto envOn = [](const wchar_t* nm, bool dflt)
-            {
+            auto envOn = [](const wchar_t* nm, bool dflt) {
                 wchar_t v[8]{};
-                if (!GetEnvironmentVariableW(nm, v, 8)) return dflt;
+                if (!GetEnvironmentVariableW(nm, v, 8))
+                    return dflt;
                 return v[0] != L'0';
             };
             const bool capEv = envOn(L"SMV_LIVE_XQ_CAPEV", false);
             const bool waitCap = envOn(L"SMV_LIVE_XQ_WAITCAP", false);
             double lastProbeMs = 0;
-            double phPump = 0, phDrain = 0, phPres = 0, phHouse = 0, phGate = 0,
-                   phProbe = 0, phSend = 0, phHold = 0, phStats = 0, phWaitK = 0, phWaitS = 0;
+            double phPump = 0, phDrain = 0, phPres = 0, phHouse = 0, phGate = 0, phProbe = 0, phSend = 0, phHold = 0,
+                   phStats = 0, phWaitK = 0, phWaitS = 0;
             uint64_t phIter = 0, phPresN = 0, phProbeN = 0;
             int64_t phT = 0;
-            auto phEnd = [&](double& acc)
-            {
-                if (!phOn) return;
+            auto phEnd = [&](double& acc) {
+                if (!phOn)
+                    return;
                 const int64_t t = nowQpc100();
                 acc += (t - phT) / 1e4;
                 phT = t;
@@ -1388,59 +1478,76 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             bool xqLate = false;
             {
                 wchar_t lv[8]{};
-                if (GetEnvironmentVariableW(L"SMV_LIVE_XQLATE", lv, 8) && lv[0] == L'1') xqLate = true;
+                if (GetEnvironmentVariableW(L"SMV_LIVE_XQLATE", lv, 8) && lv[0] == L'1')
+                    xqLate = true;
             }
             // The group-close instant is ALWAYS a present time (the group's last
             // slot). The end-marker branch used to fall back to nowMs() whenever the group had
             // no slot left in the FIFO, mixing token-arrival times into a series compared
             // against emaDt; these carry the present clock into that branch.
             double xqLastPresMs = 0, xqLastLateMs = 0;
-            uint32_t lastNfr = 0;        // slots the most recently sent group asked for
-            double xqPrevGroupMs = 0;    // last present time of the previous group (throttle)
+            uint32_t lastNfr = 0;     // slots the most recently sent group asked for
+            double xqPrevGroupMs = 0; // last present time of the previous group (throttle)
             double hitchArrPrev = 0;
-            std::thread rdTh([&]
-            {
+            std::thread rdTh([&] {
                 for (;;)
                 {
                     uint32_t v = 0;
-                    if (!srv.readFullRaw(&v, 4)) { InterlockedExchange(&rDead, 1); SetEvent(tokEvt); return; }
+                    if (!srv.readFullRaw(&v, 4))
+                    {
+                        rDead.store(true);
+                        SetEvent(tokEvt);
+                        return;
+                    }
                     // Teardown sets rDead and aborts the host's waits; check it after
                     // every read so a token that lands during teardown cannot restart the wait
-                    if (InterlockedCompareExchange(&rDead, 0, 0)) return;
-                    { std::lock_guard<std::mutex> lk(rqM); rq.push_back(v); }
+                    if (rDead.load())
+                        return;
+                    {
+                        std::lock_guard<std::mutex> lk(rqM);
+                        rq.push_back(v);
+                    }
                     SetEvent(tokEvt);
                 }
             });
             // wait until tMs, but wake early on a token (waitUntilMs's timer + spin tail)
-            auto xqWait = [&](double tMs)
-            {
+            auto xqWait = [&](double tMs) {
                 const int64_t w0 = phOn ? nowQpc100() : 0;
                 double kern = 0;
                 // the spin tail is measured as (total in here) minus (time inside the kernel
                 // wait), so the YieldProcessor loop itself is not instrumented per spin
-                auto fin = [&]
-                {
-                    if (!phOn) return;
+                auto fin = [&] {
+                    if (!phOn)
+                        return;
                     phWaitK += kern;
                     phWaitS += (nowQpc100() - w0) / 1e4 - kern;
                 };
                 for (;;)
                 {
                     const double rem = tMs - nowMs();
-                    if (rem <= 0.03) { fin(); return; }
+                    if (rem <= 0.03)
+                    {
+                        fin();
+                        return;
+                    }
                     if (paceTimer && rem > 0.6)
                     {
                         LARGE_INTEGER due;
                         due.QuadPart = -(LONGLONG)((rem - 0.3) * 10000.0);
                         if (SetWaitableTimer(paceTimer, &due, 0, nullptr, nullptr, FALSE))
                         {
-                            HANDLE hs[3] = { paceTimer, tokEvt, cap.evt };
+                            HANDLE hs[3] = {paceTimer, tokEvt, cap.evt};
                             const DWORD nh = capEv ? 3 : 2;
                             const int64_t k0 = phOn ? nowQpc100() : 0;
                             const DWORD w = WaitForMultipleObjects(nh, hs, FALSE, (DWORD)rem + 2);
-                            if (phOn) kern += (nowQpc100() - k0) / 1e4;
+                            if (phOn)
+                                kern += (nowQpc100() - k0) / 1e4;
                             if (w == WAIT_OBJECT_0 + 1 || w == WAIT_OBJECT_0 + 2)
-                            { CancelWaitableTimer(paceTimer); fin(); return; }
+                            {
+                                CancelWaitableTimer(paceTimer);
+                                fin();
+                                return;
+                            }
                             continue;
                         }
                     }
@@ -1455,8 +1562,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // existed. The LATENESS signal (how far the group's last slot presented past
             // its unfloored deadline) survives only as the SMV_LIVE_XQLATE=1 diagnostic
             // escape above, because it over-fires under the present floor.
-            auto xqThrottle = [&](double tn, double lateMs)
-            {
+            auto xqThrottle = [&](double tn, double lateMs) {
                 if (!(adaptTarget > 0 && !hidden && !nextIdleTick && emaDt > 0))
                 {
                     // An alt-tab pause or a static hold invalidates the whole control
@@ -1472,11 +1578,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 }
                 const double groupMs = xqPrevGroupMs > 0 ? tn - xqPrevGroupMs : 0;
                 xqPrevGroupMs = tn;
-                if (groupMs <= 0) return;
+                if (groupMs <= 0)
+                    return;
                 thrGroups++;
-                if (xqLate ? (lateMs > emaDt * 0.15) : (groupMs > emaDt * 1.15)) thrOverruns++;
-                if (!thrWinT0) { thrWinT0 = tn; thrDropBase = cap.dropped; return; }
-                if (tn - thrWinT0 < kThrWinMs) return;
+                if (xqLate ? (lateMs > emaDt * 0.15) : (groupMs > emaDt * 1.15))
+                    thrOverruns++;
+                if (!thrWinT0)
+                {
+                    thrWinT0 = tn;
+                    thrDropBase = cap.dropped;
+                    return;
+                }
+                if (tn - thrWinT0 < kThrWinMs)
+                    return;
                 const double winS = (tn - thrWinT0) / 1000.0;
                 const double dropRate = (double)(cap.dropped - thrDropBase) / winS;
                 // Queue path tuning. With gate C
@@ -1493,15 +1607,22 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     thrCleanMs = 0;
                     next = effTarget * kThrDown;
                     const double floorT = 2000.0 / emaDt;
-                    if (next < floorT) next = floorT;
+                    if (next < floorT)
+                        next = floorT;
                 }
                 else
                 {
                     thrCleanMs += tn - thrWinT0;
-                    if (thrCleanMs >= kXqCleanMs) { thrCleanMs = 0; next = effTarget * kThrUp; }
+                    if (thrCleanMs >= kXqCleanMs)
+                    {
+                        thrCleanMs = 0;
+                        next = effTarget * kThrUp;
+                    }
                 }
-                if (next > adaptTarget) next = adaptTarget;
-                if (next < 1.0) next = 1.0;
+                if (next > adaptTarget)
+                    next = adaptTarget;
+                if (next < 1.0)
+                    next = 1.0;
                 if (next != effTarget)
                 {
                     effTarget = next;
@@ -1521,12 +1642,27 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             };
             for (;;)
             {
-                if (phOn) { phIter++; phT = nowQpc100(); }
+                if (phOn)
+                {
+                    phIter++;
+                    phT = nowQpc100();
+                }
                 pumpMessages();
-                if (!hidden && (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) { LOG("Esc pressed, exiting\n"); break; }
-                if (g_stopReq.load()) { LOG("stop requested, ending the session\n"); break; }
+                if (!hidden && (GetAsyncKeyState(VK_ESCAPE) & 0x8000))
+                {
+                    LOG("Esc pressed, exiting\n");
+                    break;
+                }
+                if (g_stopReq.load())
+                {
+                    LOG("stop requested, ending the session\n");
+                    break;
+                }
                 if (cap.closed || (!g_monitor && !IsWindow(target)))
-                { LOG(g_monitor ? "capture closed\n" : "target window closed\n"); break; }
+                {
+                    LOG(g_monitor ? "capture closed\n" : "target window closed\n");
+                    break;
+                }
                 phEnd(phPump);
 
                 // ---- (i) tokens -> group FIFO
@@ -1534,16 +1670,34 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 {
                     uint32_t v = 0;
                     bool have = false;
-                    { std::lock_guard<std::mutex> lk(rqM); if (!rq.empty()) { v = rq.front(); rq.pop_front(); have = true; } }
-                    if (!have) break;
-                    if (pend.empty()) { LOG("live server protocol error (token with no open group)\n"); rc2 = 1; break; }
+                    {
+                        std::lock_guard<std::mutex> lk(rqM);
+                        if (!rq.empty())
+                        {
+                            v = rq.front();
+                            rq.pop_front();
+                            have = true;
+                        }
+                    }
+                    if (!have)
+                        break;
+                    if (pend.empty())
+                    {
+                        LOG("live server protocol error (token with no open group)\n");
+                        rc2 = 1;
+                        break;
+                    }
                     if (v == kCapRelTok)
                     {
                         // Capture released. The server is single threaded and strictly
                         // group ordered, so this belongs to the oldest group that has not
                         // been released yet. It is NOT a slot and does not open the group.
                         for (auto& gg : pend)
-                            if (!gg.capRel) { gg.capRel = true; break; }
+                            if (!gg.capRel)
+                            {
+                                gg.capRel = true;
+                                break;
+                            }
                         continue;
                     }
                     XqGroup& g = pend.front();
@@ -1557,21 +1711,40 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         pend.pop_front();
                         bool tagged = false;
                         for (auto it = fifo.rbegin(); it != fifo.rend(); ++it)
-                            if (it->groupSeq == seq) { it->lastOfGroup = true; tagged = true; break; }
-                        if (!tagged) xqThrottle(xqLastPresMs > 0 ? xqLastPresMs : nowMs(), xqLastLateMs);
+                            if (it->groupSeq == seq)
+                            {
+                                it->lastOfGroup = true;
+                                tagged = true;
+                                break;
+                            }
+                        if (!tagged)
+                            xqThrottle(xqLastPresMs > 0 ? xqLastPresMs : nowMs(), xqLastLateMs);
                         continue;
                     }
                     const uint32_t idx = raw - 1;
-                    if (idx >= g.nfr) { LOG("live server protocol error (slot index)\n"); rc2 = 1; break; }
-                    XqSlot s{ g.set, idx, g.nfr, g.seq,
-                              g.arrMs + g.spanMs * (idx + 1) / (g.expect + 1), g.arrMs, g.sentTs, false };
-                    if (last) { s.lastOfGroup = true; pend.pop_front(); }
+                    if (idx >= g.nfr)
+                    {
+                        LOG("live server protocol error (slot index)\n");
+                        rc2 = 1;
+                        break;
+                    }
+                    XqSlot s{g.set,   idx,      g.nfr, g.seq, g.arrMs + g.spanMs * (idx + 1) / (g.expect + 1),
+                             g.arrMs, g.sentTs, false};
+                    if (last)
+                    {
+                        s.lastOfGroup = true;
+                        pend.pop_front();
+                    }
                     fifo.push_back(s);
                 }
-                if (rc2) break;
+                if (rc2)
+                    break;
                 bool rqEmpty = false;
-                { std::lock_guard<std::mutex> lk(rqM); rqEmpty = rq.empty(); }
-                if (rqEmpty && InterlockedCompareExchange(&rDead, 0, 0))
+                {
+                    std::lock_guard<std::mutex> lk(rqM);
+                    rqEmpty = rq.empty();
+                }
+                if (rqEmpty && rDead.load())
                 {
                     LOG(srv.stalled ? "exiting for safe-mode restart\n" : "live server protocol error\n");
                     rc2 = srv.stalled ? 6 : 1;
@@ -1579,8 +1752,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 }
                 // Stall watchdog on this path (see readFullRaw): ioSince always equals the
                 // send time of the OLDEST outstanding group, or 0 when none is outstanding.
-                InterlockedExchange64(&srv.ioSince,
-                                      pend.empty() ? 0 : (LONGLONG)pend.front().sentTick);
+                InterlockedExchange64(&srv.ioSince, pend.empty() ? 0 : (LONGLONG)pend.front().sentTick);
                 phEnd(phDrain);
 
                 // ---- (ii) present every slot that is due
@@ -1588,42 +1760,57 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 while (!fifo.empty() && !rc2)
                 {
                     XqSlot& s = fifo.front();
-                    double target = s.target;
+                    double dueMs = s.target;
                     if (minSpaceMs > 0)
                     {
-                        const double prev = lastPresSched > 0
-                            ? lastPresSched
-                            : (host.prLastQpc100 ? host.prLastQpc100 / 10000.0 : 0);
+                        const double prev =
+                            lastPresSched > 0 ? lastPresSched : (host.prLastQpc100 ? host.prLastQpc100 / 10000.0 : 0);
                         const double floorMs = prev + minSpaceMs;
-                        if (prev > 0 && floorMs > target) target = floorMs;
+                        if (prev > 0 && floorMs > dueMs)
+                            dueMs = floorMs;
                     }
                     const double tNow = nowMs();
-                    if (tNow < target) { nextDue = target; break; }
-                    lastPresSched = (tNow - target <= 0.5) ? target : tNow;
-                    if (!presentSlotFrom(s.set, s.idx)) { LOG("presentFrame failed\n"); rc2 = 1; break; }
+                    if (tNow < dueMs)
+                    {
+                        nextDue = dueMs;
+                        break;
+                    }
+                    lastPresSched = (tNow - dueMs <= 0.5) ? dueMs : tNow;
+                    if (!presentSlotFrom(s.set, s.idx))
+                    {
+                        LOG("presentFrame failed\n");
+                        rc2 = 1;
+                        break;
+                    }
                     phPresN++;
-                    host.halfFence[s.set] = host.fenceValue;   // GATE A reference for this half
+                    host.halfFence[s.set] = host.fenceValue; // GATE A reference for this half
                     idleSlotSet = s.set;
                     idleSlotIdx = (int)s.idx;
                     const double pNow = nowMs();
-                    if (s.sentTs) { statLatSum += (nowQpc100() - s.sentTs) / 10000.0 + srv.contentLag * emaDt; statLatN++; }
+                    if (s.sentTs)
+                    {
+                        statLatSum += (nowQpc100() - s.sentTs) / 10000.0 + srv.contentLag * emaDt;
+                        statLatN++;
+                    }
                     if (hitchOn)
                     {
                         if (hitchPrev > 0 && pNow - hitchPrev > 8.0)
                             LOG("[hitch] gap %.1fms | slot %u/%u | sinceArr %.1f | "
                                 "late %.2f | slotWait %.1f | arrGap %.1f | ema %.1f | eff %.0f\n",
-                                pNow - hitchPrev, s.idx + 1, s.nfr, pNow - s.arrMs,
-                                pNow - target, 0.0, s.arrMs - hitchArrPrev, emaDt, effTarget);
+                                pNow - hitchPrev, s.idx + 1, s.nfr, pNow - s.arrMs, pNow - dueMs, 0.0,
+                                s.arrMs - hitchArrPrev, emaDt, effTarget);
                         hitchPrev = pNow;
                     }
                     const bool wasLast = s.lastOfGroup;
-                    const double lateMs = tNow - s.target;   // vs the UNFLOORED deadline
-                    xqLastPresMs = pNow;                     // F5: the one group-close clock
+                    const double lateMs = tNow - s.target; // vs the UNFLOORED deadline
+                    xqLastPresMs = pNow;                   // F5: the one group-close clock
                     xqLastLateMs = lateMs;
                     fifo.pop_front();
-                    if (wasLast) xqThrottle(pNow, lateMs);
+                    if (wasLast)
+                        xqThrottle(pNow, lateMs);
                 }
-                if (rc2) break;
+                if (rc2)
+                    break;
                 phEnd(phPres);
 
                 // ---- (iii) housekeeping (nothing is due right now)
@@ -1638,19 +1825,24 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         ShowWindow(host.hwnd, hidden ? SW_HIDE : SW_SHOWNA);
                         hud.show(!hidden);
                         LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
-                        xqPrevGroupMs = 0;   // the throttle reference does not survive a pause
-                        if (g_liveNr) g_liveNr->fresh = true;   // DLSS 5: a new stream after the gap
+                        xqPrevGroupMs = 0; // the throttle reference does not survive a pause
+                        if (g_liveNrCuda)
+                            g_liveNrReset.store(true); // DLSS 5: a new stream after the gap
                     }
                     if (!hidden)
                     {
                         if (g_fill)
                         {
                             HMONITOR hm = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
-                            MONITORINFO mi{ sizeof(mi) };
+                            MONITORINFO mi{sizeof(mi)};
                             GetMonitorInfoW(hm, &mi);
                             if (mi.rcMonitor.left != mon.left || mi.rcMonitor.top != mon.top ||
                                 mi.rcMonitor.right != mon.right || mi.rcMonitor.bottom != mon.bottom)
-                            { LOG("target moved to another monitor\n"); rc2 = 4; break; }
+                            {
+                                LOG("target moved to another monitor\n");
+                                rc2 = 4;
+                                break;
+                            }
                         }
                         else
                         {
@@ -1681,19 +1873,25 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // overwrite them mid-queue.
                 bool halfBusy = false;
                 for (const auto& fs : fifo)
-                    if (fs.set == nextSet) { halfBusy = true; break; }
+                    if (fs.set == nextSet)
+                    {
+                        halfBusy = true;
+                        break;
+                    }
                 // GATE B: python has released the shared capture texture for the last group we
                 // sent. The capture-release token says that directly; without it (a server that
                 // did not ack caprel) we fall back to the old proxy, the group being OPENED.
-                const bool gateB = pend.empty()
-                                   || (srv.capRelAck ? pend.back().capRel : pend.back().opened);
+                const bool gateB = pend.empty() || (srv.capRelAck ? pend.back().capRel : pend.back().opened);
                 // GATE C: never queue more than one full group of unpresented slots. The
                 // per-group barrier used to be the backpressure; without a cap the FIFO
                 // keeps whatever backlog it accumulates and latency grows without bound.
                 const bool gateC = lastNfr == 0 || fifo.size() <= lastNfr;
-                if (!gateA) halfDefer++;
-                if (halfBusy) halfPend++;
-                if (!gateC) gateCDefer++;
+                if (!gateA)
+                    halfDefer++;
+                if (halfBusy)
+                    halfPend++;
+                if (!gateC)
+                    gateCDefer++;
                 // XQ_CAPEV: skip the TryGetNextFrame call unless the pool signalled an arrival
                 // (or the 8ms safety net is due). The flag is cleared only when the probe
                 // actually runs, so an arrival that lands while the gates are shut is drained
@@ -1702,9 +1900,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (capEv)
                 {
                     const double tp = nowMs();
-                    wantProbe = InterlockedExchange(&cap.arrived, 0) != 0
-                                || lastProbeMs == 0 || tp - lastProbeMs > 8.0;
-                    if (wantProbe) lastProbeMs = tp;
+                    wantProbe = InterlockedExchange(&cap.arrived, 0) != 0 || lastProbeMs == 0 || tp - lastProbeMs > 8.0;
+                    if (wantProbe)
+                        lastProbeMs = tp;
                 }
                 phEnd(phGate);
                 if (gateA && !halfBusy && gateB && gateC && wantProbe)
@@ -1712,18 +1910,27 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     const int g2 = gpuCap ? cap.latestFrameGpu() : cap.latestFrame(buf.data());
                     phProbeN++;
                     phEnd(phProbe);
-                    if (g2 == -1) { LOG("capture readback failed\n"); rc2 = 1; break; }
+                    if (g2 == -1)
+                    {
+                        LOG("capture readback failed\n");
+                        rc2 = 1;
+                        break;
+                    }
                     if (g2 == -2 && (g_monitor || !resizeSettle(target, host, cap, hud, hidden)))
                     {
-                        LOG("restart smv-live after resizing the target window\n"); rc2 = 4; break;
+                        LOG("restart smv-live after resizing the target window\n");
+                        rc2 = 4;
+                        break;
                     }
                     if (g2 == 1)
                     {
-                        if (cap.emaArrMs > 0) emaDt = cap.emaArrMs;
+                        if (cap.emaArrMs > 0)
+                            emaDt = cap.emaArrMs;
                         else if (lastArrival && GetTickCount64() > lastArrival)
                         {
                             const double d = (double)(GetTickCount64() - lastArrival);
-                            if (d < 300.0) emaDt = emaDt > 0 ? emaDt * 0.8 + d * 0.2 : d;
+                            if (d < 300.0)
+                                emaDt = emaDt > 0 ? emaDt * 0.8 + d * 0.2 : d;
                         }
                         lastArrival = GetTickCount64();
                         // hidden (alt-tab): frames are drained but NOT sent, exactly as today
@@ -1732,19 +1939,32 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             const double arrMs = nowMs();
                             const int64_t sentTs = cap.lastFrameTs;
                             const uint32_t nfr = sendPairStream(sentTs);
-                            if (nfr == UINT32_MAX) { LOG("live server write failed\n"); rc2 = 1; break; }
+                            if (nfr == UINT32_MAX)
+                            {
+                                LOG("live server write failed\n");
+                                rc2 = 1;
+                                break;
+                            }
                             const ULONGLONG sendTick = GetTickCount64();
-                            if (pend.empty()) InterlockedExchange64(&srv.ioSince, (LONGLONG)sendTick);
-                            pend.push_back(XqGroup{ shmSeq, (uint32_t)(shmSeq % 2), nfr ? nfr : 1, nfr,
-                                                    arrMs, emaDt, sentTs, sendTick, false, false });
+                            if (pend.empty())
+                                InterlockedExchange64(&srv.ioSince, (LONGLONG)sendTick);
+                            pend.push_back(XqGroup{shmSeq, (uint32_t)(shmSeq % 2), nfr ? nfr : 1, nfr, arrMs, emaDt,
+                                                   sentTs, sendTick, false, false});
                             hitchArrPrev = arrMs;
                             lastNfr = nfr ? nfr : 1;
-                            if (tmOn) { tmEma += emaDt; tmNfr += nfr; tmN++; }
+                            if (tmOn)
+                            {
+                                tmEma += emaDt;
+                                tmNfr += nfr;
+                                tmN++;
+                            }
                             const ULONGLONG prevProcTick = lastPresentTick;
                             lastPresentTick = GetTickCount64();
                             statCaptured++;
-                            if (lastPresentTick - prevProcTick < 300) nextIdleTick = 0;
-                            else if (nextIdleTick > 0) nextIdleTick = nowMs() + idleStepMs;
+                            if (lastPresentTick - prevProcTick < 300)
+                                nextIdleTick = 0;
+                            else if (nextIdleTick > 0)
+                                nextIdleTick = nowMs() + idleStepMs;
                         }
                     }
                     phEnd(phSend);
@@ -1762,19 +1982,29 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     {
                         lastRefreshTick = now3;
                         cap.requestRefresh();
-                        if (nextIdleTick > 0) nextIdleTick = nowMs() + idleStepMs;
+                        if (nextIdleTick > 0)
+                            nextIdleTick = nowMs() + idleStepMs;
                     }
                     if (idleSlotIdx >= 0)
                     {
                         const double nowQ = nowMs();
-                        if (nextIdleTick <= 0) { nextIdleTick = nowQ + idleStepMs; xqPrevGroupMs = 0; }
+                        if (nextIdleTick <= 0)
+                        {
+                            nextIdleTick = nowQ + idleStepMs;
+                            xqPrevGroupMs = 0;
+                        }
                         else if (nowQ >= nextIdleTick)
                         {
                             if (!presentSlotFrom(idleSlotSet, (uint32_t)idleSlotIdx))
-                            { LOG("presentFrame failed\n"); rc2 = 1; break; }
+                            {
+                                LOG("presentFrame failed\n");
+                                rc2 = 1;
+                                break;
+                            }
                             host.halfFence[idleSlotSet] = host.fenceValue;
                             nextIdleTick += idleStepMs;
-                            if (nextIdleTick <= nowQ) nextIdleTick = nowQ + idleStepMs;
+                            if (nextIdleTick <= nowQ)
+                                nextIdleTick = nowQ + idleStepMs;
                         }
                     }
                 }
@@ -1794,15 +2024,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     logLiveStats(capFps, outFps, latAvg, secs, nullptr);
                     {
                         uint64_t hn = 0;
-                        for (int i = 0; i < Host::kHistN; i++) hn += host.prHist[i];
+                        for (int i = 0; i < Host::kHistN; i++)
+                            hn += host.prHist[i];
                         if (hn > 20)
                         {
-                            double a = 0, l1 = 0, l01 = 0;
-                            Host::histStats(host.prHist, hn, a, l1, l01);
+                            double avg = 0, l1 = 0, l01 = 0;
+                            Host::histStats(host.prHist, hn, avg, l1, l01);
                             LOG("live pacing: present spacing %.0f fps avg | 1%% low %.0f | 0.1%% low %.0f "
                                 "(%llu presents, effective target %.0f of %.0f) xq=1 halfdefer %llu "
                                 "halfpend %llu gatec %llu caprel %d\n",
-                                a, l1, l01, (unsigned long long)hn, effTarget, adaptTarget,
+                                avg, l1, l01, (unsigned long long)hn, effTarget, adaptTarget,
                                 (unsigned long long)halfDefer, (unsigned long long)halfPend,
                                 (unsigned long long)gateCDefer, srv.capRelAck ? 1 : 0);
                         }
@@ -1814,16 +2045,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         LOG("[xq-phase] us/present over %llu presents (%llu iters, %llu probes): "
                             "pump %.0f drain %.0f present %.0f house %.0f gate %.0f probe %.0f "
                             "send %.0f hold %.0f stats %.0f waitK %.0f waitSpin %.0f | sum %.0f\n",
-                            (unsigned long long)phPresN, (unsigned long long)phIter,
-                            (unsigned long long)phProbeN,
-                            phPump * 1000 / d, phDrain * 1000 / d, phPres * 1000 / d,
-                            phHouse * 1000 / d, phGate * 1000 / d, phProbe * 1000 / d,
-                            phSend * 1000 / d, phHold * 1000 / d, phStats * 1000 / d,
-                            phWaitK * 1000 / d, phWaitS * 1000 / d,
-                            (phPump + phDrain + phPres + phHouse + phGate + phProbe + phSend
-                             + phHold + phStats + phWaitK + phWaitS) * 1000 / d);
-                        phPump = phDrain = phPres = phHouse = phGate = phProbe = phSend
-                            = phHold = phStats = phWaitK = phWaitS = 0;
+                            (unsigned long long)phPresN, (unsigned long long)phIter, (unsigned long long)phProbeN,
+                            phPump * 1000 / d, phDrain * 1000 / d, phPres * 1000 / d, phHouse * 1000 / d,
+                            phGate * 1000 / d, phProbe * 1000 / d, phSend * 1000 / d, phHold * 1000 / d,
+                            phStats * 1000 / d, phWaitK * 1000 / d, phWaitS * 1000 / d,
+                            (phPump + phDrain + phPres + phHouse + phGate + phProbe + phSend + phHold + phStats +
+                             phWaitK + phWaitS) *
+                                1000 / d);
+                        phPump = phDrain = phPres = phHouse = phGate = phProbe = phSend = phHold = phStats = phWaitK =
+                            phWaitS = 0;
                         phIter = phPresN = phProbeN = 0;
                     }
                     if (tmOn && tmN)
@@ -1833,10 +2063,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         // fields are the pair clock, the requested slots and the queue state.
                         LOG("[exe-timing] xq: emaDt %.1fms | nfr %.2f | inPair %.2f | degrades %u "
                             "| shmSlots %u | pend %u fifo %u | halfdefer %llu (avg over %u groups)\n",
-                            tmEma / tmN, tmNfr / tmN, tmInPair / tmN, tmDegrade, srv.shmSlots,
-                            (unsigned)pend.size(), (unsigned)fifo.size(),
-                            (unsigned long long)halfDefer, tmN);
-                        tmEma = tmNfr = tmInPair = 0; tmN = 0; tmDegrade = 0;
+                            tmEma / tmN, tmNfr / tmN, tmInPair / tmN, tmDegrade, srv.shmSlots, (unsigned)pend.size(),
+                            (unsigned)fifo.size(), (unsigned long long)halfDefer, tmN);
+                        tmEma = tmNfr = tmInPair = 0;
+                        tmN = 0;
+                        tmDegrade = 0;
                     }
                     statDropBase = cap.dropped;
                     host.prMsTot = host.prMsWait = host.prMsFlip = 0;
@@ -1848,16 +2079,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (g_noAdapt && g_targetFps > 0 && !g_genExplicit && capFps > 3.0)
                     {
                         int want = (int)((double)g_targetFps / capFps + 0.5) - 1;
-                        if (want < 1) want = 1;
+                        if (want < 1)
+                            want = 1;
                         const int wantCap = srv.shmSlots ? (int)srv.shmSlots - 1 : genFrames;
-                        if (want > wantCap) want = wantCap;
+                        if (want > wantCap)
+                            want = wantCap;
                         if (want != genFrames && want == fixWantPrev)
                         {
-                            LOG("target %d fps at ~%.1f captured: switching fixed multiplier to %dx\n",
-                                g_targetFps, capFps, want + 1);
+                            LOG("target %d fps at ~%.1f captured: switching fixed multiplier to %dx\n", g_targetFps,
+                                capFps, want + 1);
                             genFrames = want;
                             idleStepMs = 1000.0 / (genFrames + 1);
-                            if (idleStepMs < 100.0) idleStepMs = 100.0;
+                            if (idleStepMs < 100.0)
+                                idleStepMs = 100.0;
                         }
                         fixWantPrev = want;
                     }
@@ -1869,8 +2103,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
 
                 // ---- (vii) wait: the next present deadline, a token, or 1ms of capture polling
                 double dl = nowMs() + 1.0;
-                if (nextDue > 0 && nextDue < dl) dl = nextDue;
-                if (!waitCap && !fifo.empty() && nextDue > 0) dl = nextDue;
+                if (nextDue > 0 && nextDue < dl)
+                    dl = nextDue;
+                if (!waitCap && !fifo.empty() && nextDue > 0)
+                    dl = nextDue;
                 xqWait(dl);
             }
             // Reader teardown. The reader waits on the host's token condition, never on I/O:
@@ -1878,260 +2114,320 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // read fails whether the reader was already waiting or had not entered the read yet
             // (a stop on the first loop iteration). The thread captures this stack frame by
             // reference, so detaching is never an option: it must be joined.
-            if (g_teardownTrace) LOG("teardown: loop left (rc2=%d), stopping the token reader\n", rc2);
-            InterlockedExchange(&rDead, 1);
+            if (g_teardownTrace)
+                LOG("teardown: loop left (rc2=%d), stopping the token reader\n", rc2);
+            rDead.store(true);
             srv.nativeAbort();
             if (WaitForSingleObject(rdTh.native_handle(), 3000) != WAIT_OBJECT_0)
                 LOG("note: token reader did not exit within 3 s, joining\n");
-            if (rdTh.joinable()) rdTh.join();
+            if (rdTh.joinable())
+                rdTh.join();
             CloseHandle(tokEvt);
-            if (g_teardownTrace) LOG("teardown: token reader joined, draining the present queue\n");
-            host.waitQueue();   // one final drain before the shared slots go away
-            if (g_teardownTrace) LOG("teardown: present queue drained\n");
+            if (g_teardownTrace)
+                LOG("teardown: token reader joined, draining the present queue\n");
+            host.waitQueue(); // one final drain before the shared slots go away
+            if (g_teardownTrace)
+                LOG("teardown: present queue drained\n");
         }
         else
-        for (;;)
-        {
-            DWORD waitMs = 50;
-            if (nextIdleTick > 0)   // idle cadence can be finer than 50ms (e.g. 33ms at target 30)
+            for (;;)
             {
-                const double d = nextIdleTick - nowMs();
-                waitMs = d > 1.0 ? (DWORD)d : 1;
-                if (waitMs > 50) waitMs = 50;
-            }
-            WaitForSingleObject(cap.evt, waitMs);
-            pumpMessages();
-
-            // Esc is read globally (GetAsyncKeyState): only honor it while engaged, else typing
-            // Esc in an unrelated app would kill a paused session
-            if (!hidden && (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) { LOG("Esc pressed, exiting\n"); break; }
-            if (g_stopReq.load()) { LOG("stop requested, ending the session\n"); break; }
-            // monitor mode: the target window only seeded the monitor choice; its lifetime and
-            // focus are irrelevant (whole-screen smoothing keeps running until Esc/hotkey/Stop)
-            if (cap.closed || (!g_monitor && !IsWindow(target))) { LOG(g_monitor ? "capture closed\n" : "target window closed\n"); break; }
-
-            ULONGLONG now = GetTickCount64();
-            if (!host.park && !g_monitor && now - lastPosTick > 250)   // monitor mode: no pause/tracking
-            {
-                lastPosTick = now;
-                // The pause (livePauseWanted): the player minimized or covered by the window in
-                // front hides the overlay and stops processing; a window in front elsewhere does
-                // not. On a resume with the player itself in front, DLSS-G's overlay re-takes the
-                // foreground (the click-through overlay can never be clicked back into focus; the
-                // >700ms input-gap reset re-warms the pacer); a resume while the user works in
-                // another window leaves their focus alone.
-                const bool wantHidden = livePauseWanted(target, host.hwnd);
-                if (wantHidden != hidden)
+                DWORD waitMs = 50;
+                if (nextIdleTick > 0) // idle cadence can be finer than 50ms (e.g. 33ms at target 30)
                 {
-                    hidden = wantHidden;
-                    ShowWindow(host.hwnd, hidden ? SW_HIDE : SW_SHOWNA);
-                    hud.show(!hidden);
-                    LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
-                    if (!hidden && host.useSL && GetAncestor(GetForegroundWindow(), GA_ROOT) == target)
-                        host.takeForeground();
+                    const double d = nextIdleTick - nowMs();
+                    waitMs = d > 1.0 ? (DWORD)d : 1;
+                    if (waitMs > 50)
+                        waitMs = 50;
                 }
-                if (!hidden)
+                WaitForSingleObject(cap.evt, waitMs);
+                pumpMessages();
+
+                // Esc is read globally (GetAsyncKeyState): only honor it while engaged, else typing
+                // Esc in an unrelated app would kill a paused session
+                if (!hidden && (GetAsyncKeyState(VK_ESCAPE) & 0x8000))
                 {
-                    if (g_fill)
+                    LOG("Esc pressed, exiting\n");
+                    break;
+                }
+                if (g_stopReq.load())
+                {
+                    LOG("stop requested, ending the session\n");
+                    break;
+                }
+                // monitor mode: the target window only seeded the monitor choice; its lifetime and
+                // focus are irrelevant (whole-screen smoothing keeps running until Esc/hotkey/Stop)
+                if (cap.closed || (!g_monitor && !IsWindow(target)))
+                {
+                    LOG(g_monitor ? "capture closed\n" : "target window closed\n");
+                    break;
+                }
+
+                ULONGLONG now = GetTickCount64();
+                if (!host.park && !g_monitor && now - lastPosTick > 250) // monitor mode: no pause/tracking
+                {
+                    lastPosTick = now;
+                    // The pause (livePauseWanted): the player minimized or covered by the window in
+                    // front hides the overlay and stops processing; a window in front elsewhere does
+                    // not. A resume shows the overlay without activating it (SW_SHOWNA): the focus
+                    // stays wherever the user put it.
+                    const bool wantHidden = livePauseWanted(target, host.hwnd);
+                    if (wantHidden != hidden)
                     {
-                        // fullscreen overlays don't track the window; they track its MONITOR
-                        HMONITOR hm = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
-                        MONITORINFO mi{ sizeof(mi) };
-                        GetMonitorInfoW(hm, &mi);
-                        if (mi.rcMonitor.left != mon.left || mi.rcMonitor.top != mon.top ||
-                            mi.rcMonitor.right != mon.right || mi.rcMonitor.bottom != mon.bottom)
+                        hidden = wantHidden;
+                        ShowWindow(host.hwnd, hidden ? SW_HIDE : SW_SHOWNA);
+                        hud.show(!hidden);
+                        LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
+                    }
+                    if (!hidden)
+                    {
+                        if (g_fill)
                         {
-                            LOG("target moved to another monitor\n");
-                            rc2 = 4;   // the app restarts the overlay onto the new monitor
+                            // fullscreen overlays don't track the window; they track its MONITOR
+                            HMONITOR hm = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
+                            MONITORINFO mi{sizeof(mi)};
+                            GetMonitorInfoW(hm, &mi);
+                            if (mi.rcMonitor.left != mon.left || mi.rcMonitor.top != mon.top ||
+                                mi.rcMonitor.right != mon.right || mi.rcMonitor.bottom != mon.bottom)
+                            {
+                                LOG("target moved to another monitor\n");
+                                rc2 = 4; // the app restarts the overlay onto the new monitor
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            RECT r{};
+                            if (frameBounds(target, r) && (r.left != fb.left || r.top != fb.top))
+                            {
+                                fb = r;
+                                // The overlay tracks the CLIENT origin (frame origin + constant crop
+                                // offset), so it keeps covering the client area as the window moves.
+                                const int ox = r.left + cap.cropX;
+                                const int oy = r.top + cap.cropY;
+                                SetWindowPos(host.hwnd, HWND_TOPMOST, ox, oy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                                hud.move(ox + 16, oy + 16);
+                            }
+                        }
+                    }
+                }
+
+                if (g_verbose)
+                    LOG("[loop] top hidden=%d\n", (int)hidden);
+                const bool gpuCap = cap.interop && srv.captexAck; // zero-copy capture active
+                int got = gpuCap ? cap.latestFrameGpu() : cap.latestFrame(buf.data());
+                if (g_verbose)
+                    LOG("[loop] latest=%d\n", got);
+                if (got == -1)
+                {
+                    LOG("capture readback failed\n");
+                    rc2 = 1;
+                    break;
+                }
+                if (got == -2 && (g_monitor || !resizeSettle(target, host, cap, hud, hidden)))
+                {
+                    LOG("restart smv-live after resizing the target window\n");
+                    rc2 = 4;
+                    break;
+                }
+                // paused (alt-tab): frames are drained but not processed (the overlay is hidden)
+                if (got == 1 && !hidden)
+                {
+                    // a long input gap (paused video, idle desktop) poisons the DLSS-G pacer: re-warm
+                    if (host.useSL && now - lastPresentTick > 700)
+                    {
+                        LOG("input gap %llums, resetting DLSS-G\n", (unsigned long long)(now - lastPresentTick));
+                        if (!resetFG())
+                        {
+                            LOG("DLSS-G reset failed\n");
+                            rc2 = 1;
                             break;
                         }
                     }
-                    else
+                    if (!host.presentFrame(buf.data()))
                     {
-                        RECT r{};
-                        if (frameBounds(target, r) && (r.left != fb.left || r.top != fb.top))
+                        LOG("presentFrame failed\n");
+                        rc2 = 1;
+                        break;
+                    }
+                    // direct routes (dlssg/identity): latency of the frame just presented
+                    statLatSum += (nowQpc100() - cap.lastFrameTs) / 10000.0;
+                    statLatN++;
+                    if (!gpuCap)
+                        memcpy(lastBuf.data(), buf.data(), capBytes); // lastBuf = SL-reset fodder only
+                    const ULONGLONG prevProcTick = lastPresentTick;
+                    lastPresentTick = GetTickCount64();
+                    statCaptured++;
+                    // leave the static-source hold only when REAL cadence resumed (<300ms between
+                    // frames); the hold's own 1 Hz refresh frames keep the idle cadence running,
+                    // else every refresh costs a 300ms re-arm gap (~measured 25 of 30 fps held).
+                    // A refresh frame's real-slot present consumes the current beat (without this
+                    // the hold ran one present/s hot: 3.0 instead of 2.0 at 2x).
+                    if (lastPresentTick - prevProcTick < 300)
+                        nextIdleTick = 0;
+                    else if (nextIdleTick > 0)
+                        nextIdleTick = nowMs() + idleStepMs;
+                }
+
+                if (now - lastStatTick >= 2000)
+                {
+                    UINT c = 0;
+                    host.scNative->GetLastPresentCount(&c);
+                    double secs = (now - lastStatTick) / 1000.0;
+                    // SOURCE CADENCE, not consumed cadence: cap.dropped counts frames WGC
+                    // delivered that the loop superseded before it could use them, so
+                    // captured + dropped is the rate the target app actually produces. The
+                    // consumed count alone sags with our own group cost (a 24fps source read
+                    // 9.6 at gen 47 while mpv kept presenting 24), which made the "in" number
+                    // look like the source had slowed down. This one field feeds the stats
+                    // line, the on-screen HUD and the GUI's lvstat, so they all agree.
+                    const double dropWin = (double)(cap.dropped - statDropBase);
+                    double capFps = (statCaptured + dropWin) / secs;
+                    double outFps = (c - statPresentBase) / secs;
+                    sl::DLSSGState st{};
+                    if (host.useSL)
+                        slDLSSGGetState(host.vp, st, nullptr);
+                    // server/identity: true capture->present latency (we present every slot).
+                    // DLSS-G: only the capture->SL-handoff is visible to us.
+                    const double latAvg = statLatN ? statLatSum / statLatN : 0.0;
+                    const double ratio = logLiveStats(capFps, outFps, latAvg, secs, host.useSL ? &st : nullptr);
+                    {
+                        uint64_t hn = 0;
+                        for (int i = 0; i < Host::kHistN; i++)
+                            hn += host.prHist[i];
+                        if (hn > 20)
                         {
-                            fb = r;
-                            // The overlay tracks the CLIENT origin (frame origin + constant crop
-                            // offset), so it keeps covering the client area as the window moves.
-                            const int ox = r.left + cap.cropX;
-                            const int oy = r.top + cap.cropY;
-                            SetWindowPos(host.hwnd, HWND_TOPMOST, ox, oy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-                            hud.move(ox + 16, oy + 16);
+                            double avg = 0, l1 = 0, l01 = 0;
+                            Host::histStats(host.prHist, hn, avg, l1, l01);
+                            // NOT "live: " - scripts/smoke.py reads the LAST line with that exact
+                            // prefix as the captured/presented stats line
+                            LOG("live pacing: present spacing %.0f fps avg | 1%% low %.0f | 0.1%% low %.0f "
+                                "(%llu presents, effective target %.0f of %.0f)\n",
+                                avg, l1, l01, (unsigned long long)hn, effTarget, adaptTarget);
                         }
+                        memset(host.prHist, 0, sizeof(host.prHist));
                     }
-                }
-            }
-
-            if (g_verbose) LOG("[loop] top hidden=%d\n", (int)hidden);
-            const bool gpuCap = cap.interop && srv.captexAck;   // zero-copy capture active
-            int got = gpuCap ? cap.latestFrameGpu() : cap.latestFrame(buf.data());
-            if (g_verbose) LOG("[loop] latest=%d\n", got);
-            if (got == -1) { LOG("capture readback failed\n"); rc2 = 1; break; }
-            if (got == -2 && (g_monitor || !resizeSettle(target, host, cap, hud, hidden)))
-            {
-                LOG("restart smv-live after resizing the target window\n"); rc2 = 4; break;
-            }
-            // paused (alt-tab): frames are drained but not processed (the overlay is hidden)
-            if (got == 1 && !hidden)
-            {
-                // a long input gap (paused video, idle desktop) poisons the DLSS-G pacer: re-warm
-                if (host.useSL && now - lastPresentTick > 700)
-                {
-                    LOG("input gap %llums, resetting DLSS-G\n", (unsigned long long)(now - lastPresentTick));
-                    if (!resetFG()) { LOG("DLSS-G reset failed\n"); rc2 = 1; break; }
-                }
-                if (!host.presentFrame(buf.data())) { LOG("presentFrame failed\n"); rc2 = 1; break; }
-                // direct routes (dlssg/identity): latency of the frame just presented
-                statLatSum += (nowQpc100() - cap.lastFrameTs) / 10000.0;
-                statLatN++;
-                if (!gpuCap) memcpy(lastBuf.data(), buf.data(), capBytes);   // lastBuf = SL-reset fodder only
-                const ULONGLONG prevProcTick = lastPresentTick;
-                lastPresentTick = GetTickCount64();
-                statCaptured++;
-                // leave the static-source hold only when REAL cadence resumed (<300ms between
-                // frames); the hold's own 1 Hz refresh frames keep the idle cadence running,
-                // else every refresh costs a 300ms re-arm gap (~measured 25 of 30 fps held).
-                // A refresh frame's real-slot present consumes the current beat (without this
-                // the hold ran one present/s hot: 3.0 instead of 2.0 at 2x).
-                if (lastPresentTick - prevProcTick < 300) nextIdleTick = 0;
-                else if (nextIdleTick > 0) nextIdleTick = nowMs() + idleStepMs;
-            }
-
-            if (now - lastStatTick >= 2000)
-            {
-                UINT c = 0;
-                host.scNative->GetLastPresentCount(&c);
-                double secs = (now - lastStatTick) / 1000.0;
-                // SOURCE CADENCE, not consumed cadence: cap.dropped counts frames WGC
-                // delivered that the loop superseded before it could use them, so
-                // captured + dropped is the rate the target app actually produces. The
-                // consumed count alone sags with our own group cost (a 24fps source read
-                // 9.6 at gen 47 while mpv kept presenting 24), which made the "in" number
-                // look like the source had slowed down. This one field feeds the stats
-                // line, the on-screen HUD and the GUI's lvstat, so they all agree.
-                const double dropWin = (double)(cap.dropped - statDropBase);
-                double capFps = (statCaptured + dropWin) / secs;
-                double outFps = (c - statPresentBase) / secs;
-                sl::DLSSGState st{};
-                if (host.useSL) slDLSSGGetState(host.vp, st, nullptr);
-                // server/identity: true capture->present latency (we present every slot).
-                // DLSS-G: only the capture->SL-handoff is visible to us.
-                const double latAvg = statLatN ? statLatSum / statLatN : 0.0;
-                const double ratio = logLiveStats(capFps, outFps, latAvg, secs, host.useSL ? &st : nullptr);
-                {
-                    uint64_t hn = 0;
-                    for (int i = 0; i < Host::kHistN; i++) hn += host.prHist[i];
-                    if (hn > 20)
+                    statDropBase = cap.dropped;
+                    host.prMsTot = host.prMsWait = host.prMsFlip = 0;
+                    host.prN = 0;
+                    host.prBunch = 0;
+                    // HUD estimate: server routes show the measured number; DLSS-G shows the
+                    // handoff plus one capture interval (the inherent interpolation delay SL
+                    // adds while it waits for the next real frame to interpolate toward).
+                    hud.update(capFps, outFps, host.useSL && capFps > 0.5 ? latAvg + 1000.0 / capFps : latAvg);
+                    statLatSum = 0;
+                    statLatN = 0;
+                    // (adaptive smoothness needs no controller here: the target grid IS the
+                    // policy - every stats window simply reflects however many grid frames the
+                    // source pairs produced. cap.dropped remains available for diagnostics.)
+                    // Multiplier-free targeting for DLSS-G: with no multiplier knob left, derive the
+                    // generated-frame count from the fps target and the measured capture rate, capped
+                    // by the model (numFramesToGenerateMax, 5 on current NGX). Applied through the
+                    // existing off/on re-warm, and only after the same value is derived twice in a row
+                    // (2s stats windows), so a momentary rate wobble cannot thrash the FG pipeline.
+                    if (host.useSL && g_targetFps > 0 && !g_genExplicit && capFps > 3.0)
                     {
-                        double a = 0, l1 = 0, l01 = 0;
-                        Host::histStats(host.prHist, hn, a, l1, l01);
-                        // NOT "live: " - scripts/smoke.py reads the LAST line with that exact
-                        // prefix as the captured/presented stats line
-                        LOG("live pacing: present spacing %.0f fps avg | 1%% low %.0f | 0.1%% low %.0f "
-                            "(%llu presents, effective target %.0f of %.0f)\n",
-                            a, l1, l01, (unsigned long long)hn, effTarget, adaptTarget);
+                        const int capMax = host.maxGen ? (int)(host.maxGen < 5 ? host.maxGen : 5) : 5;
+                        int want = (int)((double)g_targetFps / capFps + 0.5) - 1;
+                        if (want < 1)
+                            want = 1;
+                        if (want > capMax)
+                            want = capMax;
+                        if (want != genFrames && want == fgWantPrev)
+                        {
+                            LOG("target %d fps at ~%.1f captured: switching DLSS-G to %dx\n", g_targetFps, capFps,
+                                want + 1);
+                            genFrames = want;
+                            if (!resetFG())
+                            {
+                                LOG("DLSS-G reset failed\n");
+                                rc2 = 1;
+                                break;
+                            }
+                        }
+                        fgWantPrev = want;
                     }
-                    memset(host.prHist, 0, sizeof(host.prHist));
-                }
-                statDropBase = cap.dropped;
-                host.prMsTot = host.prMsWait = host.prMsFlip = 0;
-                host.prN = 0;
-                host.prBunch = 0;
-                // HUD estimate: server routes show the measured number; DLSS-G shows the
-                // handoff plus one capture interval (the inherent interpolation delay SL
-                // adds while it waits for the next real frame to interpolate toward).
-                hud.update(capFps, outFps,
-                           host.useSL && capFps > 0.5 ? latAvg + 1000.0 / capFps : latAvg);
-                statLatSum = 0;
-                statLatN = 0;
-                // (adaptive smoothness needs no controller here: the target grid IS the
-                // policy - every stats window simply reflects however many grid frames the
-                // source pairs produced. cap.dropped remains available for diagnostics.)
-                // Multiplier-free targeting for DLSS-G: with no multiplier knob left, derive the
-                // generated-frame count from the fps target and the measured capture rate, capped
-                // by the model (numFramesToGenerateMax, 5 on current NGX). Applied through the
-                // existing off/on re-warm, and only after the same value is derived twice in a row
-                // (2s stats windows), so a momentary rate wobble cannot thrash the FG pipeline.
-                if (host.useSL && g_targetFps > 0 && !g_genExplicit && capFps > 3.0)
-                {
-                    const int capMax = host.maxGen ? (int)(host.maxGen < 5 ? host.maxGen : 5) : 5;
-                    int want = (int)((double)g_targetFps / capFps + 0.5) - 1;
-                    if (want < 1) want = 1;
-                    if (want > capMax) want = capMax;
-                    if (want != genFrames && want == fgWantPrev)
+                    // The same drift tracking for the fixed-ladder server route.
+                    // The server is sized at the 16x ceiling and each group's ladder carries the
+                    // current multiplier, so retargeting is just resizing the ladder. Streaming only (the batch fallback has no per-group
+                    // ladder); capFps > 3 skips static holds, whose ~0 rate would derive the cap.
+                    if (g_backend == BK_SERVER && g_noAdapt && g_targetFps > 0 && !g_genExplicit && srv.streamAck &&
+                        capFps > 3.0)
                     {
-                        LOG("target %d fps at ~%.1f captured: switching DLSS-G to %dx\n",
-                            g_targetFps, capFps, want + 1);
-                        genFrames = want;
-                        if (!resetFG()) { LOG("DLSS-G reset failed\n"); rc2 = 1; break; }
+                        int want = (int)((double)g_targetFps / capFps + 0.5) - 1;
+                        if (want < 1)
+                            want = 1;
+                        // ceiling = the slots the server was actually sized for
+                        const int wantCap = srv.shmSlots ? (int)srv.shmSlots - 1 : genFrames;
+                        if (want > wantCap)
+                            want = wantCap;
+                        if (want != genFrames && want == fixWantPrev)
+                        {
+                            LOG("target %d fps at ~%.1f captured: switching fixed multiplier to %dx\n", g_targetFps,
+                                capFps, want + 1);
+                            genFrames = want;
+                            idleStepMs = 1000.0 / (genFrames + 1);
+                            if (idleStepMs < 100.0)
+                                idleStepMs = 100.0;
+                        }
+                        fixWantPrev = want;
                     }
-                    fgWantPrev = want;
-                }
-                // The same drift tracking for the fixed-ladder server route.
-                // The server is sized at the 16x ceiling and each group's ladder carries the
-                // current multiplier, so retargeting is just resizing the ladder. Streaming only (the batch fallback has no per-group
-                // ladder); capFps > 3 skips static holds, whose ~0 rate would derive the cap.
-                if (g_backend == BK_SERVER && g_noAdapt && g_targetFps > 0 && !g_genExplicit
-                    && srv.streamAck && capFps > 3.0)
-                {
-                    int want = (int)((double)g_targetFps / capFps + 0.5) - 1;
-                    if (want < 1) want = 1;
-                    // ceiling = the slots the server was actually sized for
-                    const int wantCap = srv.shmSlots ? (int)srv.shmSlots - 1 : genFrames;
-                    if (want > wantCap) want = wantCap;
-                    if (want != genFrames && want == fixWantPrev)
+                    if (host.useSL && !ratioWarned && capFps > 3.0 && ratio < 1.2)
                     {
-                        LOG("target %d fps at ~%.1f captured: switching fixed multiplier to %dx\n",
-                            g_targetFps, capFps, want + 1);
-                        genFrames = want;
-                        idleStepMs = 1000.0 / (genFrames + 1);
-                        if (idleStepMs < 100.0) idleStepMs = 100.0;
+                        ratioWarned = true;
+                        LOG("NOTE: presented/captured ratio is ~1x. Either the driver is using hardware "
+                            "flip metering (presents not counted, FG may still be fine - check visually) "
+                            "or FG is preempted (RTX Video enhancement on a playing browser video is a "
+                            "known machine-wide preemptor on this hardware).\n");
                     }
-                    fixWantPrev = want;
+                    lastStatTick = now;
+                    statPresentBase = c;
+                    statCaptured = 0;
                 }
-                if (host.useSL && !ratioWarned && capFps > 3.0 && ratio < 1.2)
-                {
-                    ratioWarned = true;
-                    LOG("NOTE: presented/captured ratio is ~1x. Either the driver is using hardware "
-                        "flip metering (presents not counted, FG may still be fine - check visually) "
-                        "or FG is preempted (RTX Video enhancement on a playing browser video is a "
-                        "known machine-wide preemptor on this hardware).\n");
-                }
-                lastStatTick = now;
-                statPresentBase = c;
-                statCaptured = 0;
             }
-        }
 
         running = 0;
         if (host.prHistNAll > 20)
         {
-            double a = 0, l1 = 0, l01 = 0;
-            Host::histStats(host.prHistAll, host.prHistNAll, a, l1, l01);
+            double avg = 0, l1 = 0, l01 = 0;
+            Host::histStats(host.prHistAll, host.prHistNAll, avg, l1, l01);
             LOG("live SUMMARY: %.1f fps avg presented | 1%% low %.1f | 0.1%% low %.1f "
-                "over %llu presents\n", a, l1, l01, (unsigned long long)host.prHistNAll);
+                "over %llu presents\n",
+                avg, l1, l01, (unsigned long long)host.prHistNAll);
         }
-        if (paceTimer) CloseHandle(paceTimer);
+        if (paceTimer)
+            CloseHandle(paceTimer);
         hud.destroy();
-        if (diagH) { WaitForSingleObject(diagH, 12000); CloseHandle(diagH); }
-        if (g_teardownTrace) LOG("teardown: hud gone, stopping the server\n");
-        if (g_backend == BK_SERVER) srv.stop();
-        if (g_liveNr) { g_liveNr->shutdown(); g_liveNr = nullptr; }   // before the capture and the device go
-        if (g_teardownTrace) LOG("teardown: server stopped, stopping the capture\n");
+        if (diagH)
+        {
+            WaitForSingleObject(diagH, 12000);
+            CloseHandle(diagH);
+        }
+        if (g_teardownTrace)
+            LOG("teardown: hud gone, stopping the server\n");
+        if (g_backend == BK_SERVER)
+            srv.stop();
+        if (g_teardownTrace)
+            LOG("teardown: server stopped, stopping the capture\n");
         cap.stop();
-        if (g_teardownTrace) LOG("teardown: capture stopped, shutting the host down\n");
+        if (g_teardownTrace)
+            LOG("teardown: capture stopped, shutting the host down\n");
         host.shutdown();
-        if (g_teardownTrace) LOG("teardown: host down\n");
-        if (host.useSL) slShutdown();
+        if (g_teardownTrace)
+            LOG("teardown: host down\n");
+        if (host.useSL)
+            slShutdown();
         timeEndPeriod(1);
         // With the NR snippet loaded, the process-exit teardown after main returns
         // faults (0xC0000005 on a clean "target window closed" exit;
         // the offline dlssnr.exe leaves through ExitProcess for the same reason), which would
         // also replace the exit codes the app acts on (4 resize restart, 6 stall revive).
-        if (g_nrAttempted) { fflush(stderr); ExitProcess((UINT)rc2); }
-        g_sessionClean = true;   // resident host: only this exit path may keep the process
+        if (g_nrAttempted)
+        {
+            fflush(stderr);
+            ExitProcess((UINT)rc2);
+        }
+        g_sessionClean = true; // resident host: only this exit path may keep the process
         return rc2;
     }
 }
-

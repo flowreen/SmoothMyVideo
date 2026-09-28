@@ -231,11 +231,14 @@ def cuda_kernel(strFunction: str, strKernel: str, objVariables: typing.Dict):
 @cupy.memoize(for_each_device=True)
 def cuda_launch(strKey: str):
     if 'CUDA_HOME' not in os.environ:
-        os.environ['CUDA_HOME'] = cupy.cuda.get_cuda_path()
+        cuda_path = cupy.cuda.get_cuda_path()
+        if cuda_path is None:
+            raise RuntimeError('CUDA_HOME is not set and cupy finds no CUDA toolkit')
+        os.environ['CUDA_HOME'] = cuda_path
     # end
 
     return cupy.RawModule(code=objCudacache[strKey]['strKernel'], options=(
-        '-I ' + os.environ.get('CUDA_HOME'), '-I ' + os.environ.get('CUDA_HOME') + '/include')).get_function(
+        '-I ' + os.environ['CUDA_HOME'], '-I ' + os.environ['CUDA_HOME'] + '/include')).get_function(
         objCudacache[strKey]['strFunction'])
 
 
@@ -248,7 +251,10 @@ def cuda_launch(strKey: str):
 def softsplat(tenIn, tenFlow, tenMetric, strMode: str):
     output_dtype = tenIn.dtype
 
-    tenIn, tenFlow, tenMetric = [x.float() if x is not None else None for x in [tenIn, tenFlow, tenMetric]]
+    tenIn = tenIn.float()
+    tenFlow = tenFlow.float()
+    if tenMetric is not None:
+        tenMetric = tenMetric.float()
 
     assert (strMode.split('-')[0] in ['sum', 'avg', 'linear', 'soft'])
 
@@ -261,9 +267,11 @@ def softsplat(tenIn, tenFlow, tenMetric, strMode: str):
         tenIn = torch.cat([tenIn, tenIn.new_ones([tenIn.shape[0], 1, tenIn.shape[2], tenIn.shape[3]])], 1)
 
     elif strMode.split('-')[0] == 'linear':
+        assert tenMetric is not None
         tenIn = torch.cat([tenIn * tenMetric, tenMetric], 1)
 
     elif strMode.split('-')[0] == 'soft':
+        assert tenMetric is not None
         tenIn = torch.cat([tenIn * tenMetric.exp(), tenMetric.exp()], 1)
 
     # end
@@ -299,7 +307,7 @@ def softsplat(tenIn, tenFlow, tenMetric, strMode: str):
 class softsplat_func(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
-    def forward(self, tenIn, tenFlow):
+    def forward(ctx, tenIn, tenFlow):
         tenOut = tenIn.new_zeros([tenIn.shape[0], tenIn.shape[1], tenIn.shape[2], tenIn.shape[3]])
 
         if tenIn.is_cuda == True:
@@ -371,7 +379,7 @@ class softsplat_func(torch.autograd.Function):
 
         # end
 
-        self.save_for_backward(tenIn, tenFlow)
+        ctx.save_for_backward(tenIn, tenFlow)
 
         return tenOut
 
@@ -379,16 +387,16 @@ class softsplat_func(torch.autograd.Function):
 
     @staticmethod
     @torch.amp.custom_bwd(device_type='cuda')
-    def backward(self, tenOutgrad):
-        tenIn, tenFlow = self.saved_tensors
+    def backward(ctx, tenOutgrad):  # pyright: ignore[reportIncompatibleMethodOverride]  (torch's one-output idiom)
+        tenIn, tenFlow = ctx.saved_tensors
 
         tenOutgrad = tenOutgrad.contiguous();
         assert (tenOutgrad.is_cuda == True)
 
         tenIngrad = tenIn.new_zeros([tenIn.shape[0], tenIn.shape[1], tenIn.shape[2], tenIn.shape[3]]) if \
-            self.needs_input_grad[0] == True else None
+            ctx.needs_input_grad[0] == True else None
         tenFlowgrad = tenFlow.new_zeros([tenFlow.shape[0], tenFlow.shape[1], tenFlow.shape[2], tenFlow.shape[3]]) if \
-            self.needs_input_grad[1] == True else None
+            ctx.needs_input_grad[1] == True else None
 
         if tenIngrad is not None:
             cuda_launch(cuda_kernel('softsplat_ingrad', '''

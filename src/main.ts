@@ -1418,7 +1418,7 @@ type RunOpts = {
 // by name, Custom as the working size's share of the output (33..100 %); null = DLAA, the default.
 function dlssScaleArg(mode?: string, custom?: number): string | null {
   if (mode === 'custom') {
-    const pct = Math.min(100, Math.max(33, Math.round(custom ?? 100)));
+    const pct = Math.min(100, Math.max(1, Math.round(custom ?? 100)));
     return pct >= 100 ? null : (pct / 100).toFixed(2);
   }
   return mode && ['auto', 'quality', 'balanced', 'performance', 'ultra'].includes(mode) ? mode : null;
@@ -1471,11 +1471,11 @@ function engineArgs(opts: RunOpts): string[] {
   // renderer from the resolution selector. >1 enables the upscale pass; <1 is a downscale the
   // engine FOLDS into the decode (whole pipeline runs at the output size - also what keeps 4K
   // sources inside TRT-safe flow shapes, so dropping it here re-breaks 4K GMFSS renders).
-  // Without --rtx-vsr an upscale is a bicubic resize; with it, RTX Video Super Resolution.
+  // Without --rtx-vsr an upscale is a Lanczos3 resize; with it, RTX Video Super Resolution.
   if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) args.push('--upscale', String(opts.upscale));
   // RTX VSR: the real RTX Video SDK (the engine/rtxvideo CUDA bridge) for an enlarging resize: the
   // final one from the working size (a mode below DLAA or an upscale), else the one before the
-  // model; the plan skips it when nothing enlarges. Falls back to bicubic if the bridge or the RTX
+  // model; the plan skips it when nothing enlarges. Falls back to Lanczos3 if the bridge or the RTX
   // Video runtime is unavailable.
   if (opts.rtxvsr) args.push('--rtx-vsr');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are

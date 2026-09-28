@@ -126,7 +126,7 @@ def expect_part_promoted(out):
 @case("2x on-grid -> 49 frames")
 def c_2x(tmp, trt):
     out = os.path.join(tmp, "s_2x.mp4")
-    rc, log = render(SAMPLE, out)
+    rc, _ = render(SAMPLE, out)
     assert rc == 0, "engine exit " + str(rc)
     expect_part_promoted(out)
     assert frames(out) == 49, f"frames {frames(out)} != 49"
@@ -135,7 +135,7 @@ def c_2x(tmp, trt):
 @case("--fps 60 -> 63 frames")
 def c_fps60(tmp, trt):
     out = os.path.join(tmp, "s_60.mp4")
-    rc, log = render(SAMPLE, out, "--fps", "60")
+    rc, _ = render(SAMPLE, out, "--fps", "60")
     assert rc == 0, "engine exit " + str(rc)
     expect_part_promoted(out)
     assert frames(out) == 63, f"frames {frames(out)} != 63"
@@ -144,7 +144,7 @@ def c_fps60(tmp, trt):
 @case("--no-interp -> 25 frames")
 def c_noint(tmp, trt):
     out = os.path.join(tmp, "s_ni.mp4")
-    rc, log = render(SAMPLE, out, "--no-interp")
+    rc, _ = render(SAMPLE, out, "--no-interp")
     assert rc == 0, "engine exit " + str(rc)
     expect_part_promoted(out)
     assert frames(out) == 25, f"frames {frames(out)} != 25"
@@ -285,7 +285,7 @@ def c_hdr(tmp, trt):
     if not _rtx_ready():
         return "SKIP (RTX runtime not installed)"
     out = os.path.join(tmp, "s_hdr.mp4")
-    rc, log = render(SAMPLE, out, "--rtx-hdr", "--no-interp")
+    rc, _ = render(SAMPLE, out, "--rtx-hdr", "--no-interp")
     assert rc == 0, "engine exit " + str(rc)
     assert frames(out) == 25, f"frames {frames(out)} != 25"
     j = probe_json(out, "-select_streams", "v:0", "-show_entries", "stream=color_transfer")
@@ -302,7 +302,7 @@ def c_dv(tmp, trt):
     if not os.path.isfile(os.path.join(ENGINE, "dvtools", "dovi_tool.exe")):
         return "SKIP (dovi_tool not installed)"
     out = os.path.join(tmp, "s_dv.mp4")
-    rc, log = render(SAMPLE, out, "--rtx-hdr", "--dv", "--no-interp")
+    rc, _ = render(SAMPLE, out, "--rtx-hdr", "--dv", "--no-interp")
     assert rc == 0, "engine exit " + str(rc)
     assert frames(out) == 25, f"frames {frames(out)} != 25"
     assert any("DOVI" in s for s in stream_side_data(out)), "DOVI configuration record missing"

@@ -193,7 +193,7 @@ export function needMkv(aud: Track[], sub: Track[]): boolean {
   return sub.length > 0 || aud.some(([, c]) => !MP4_AUDIO_OK.has(c));
 }
 
-// decode-side downscale: the linear-light spline36 chain, reasoning on render_probe.py
+// decode-side downscale: the linear-light Lanczos3 chain (the kernel of the host's own resizes)
 export const ZSC_TRC: Record<string, string> = {
   bt709: '709',
   smpte170m: '601',
@@ -210,7 +210,7 @@ const UNTAGGED = ['', 'unknown', 'unspecified'];
 
 /** The -vf chain for a decode-side downscale of a w x h source to dw x dh. */
 export function dscaleVf(st: Stream, w: number, h: number, dw: number, dh: number): string[] {
-  const fallback = [`scale=${dw}:${dh}:flags=spline+accurate_rnd+full_chroma_int+full_chroma_inp`];
+  const fallback = [`scale=${dw}:${dh}:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp`];
   const pixfmt = String(st.pix_fmt || '');
   if (['rgb', 'bgr', 'gbr', 'gray', 'pal', 'ya', 'monob', 'monow'].some((p) => pixfmt.startsWith(p))) return fallback;
   const trcIn = String(st.color_transfer || '');
@@ -228,7 +228,7 @@ export function dscaleVf(st: Stream, w: number, h: number, dw: number, dh: numbe
   return (sp.length ? [`setparams=${sp.join(':')}`] : []).concat([
     'zscale=transfer=linear',
     'format=gbrpf32le',
-    `zscale=w=${dw}:h=${dh}:filter=spline36`,
+    `zscale=w=${dw}:h=${dh}:filter=lanczos:param_a=3`,
     `zscale=transfer=${trc}`,
   ]);
 }

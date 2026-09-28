@@ -86,7 +86,7 @@ export interface WorkPlan {
 /** NVIDIA's order for a w x h source: the output (the --upscale factor, clamped), the working size =
  * the DLSS mode (--scale) x the output (even, at least 64, at most WORK_MAX_PX keeping the aspect),
  * and the decode (a working size below the source folds the downscale into the decode, linear-light
- * spline36). A string = why --scale is refused. */
+ * Lanczos3). A string = why --scale is refused. */
 export function workPlan(st: Stream, w: number, h: number, upscaleF: number, scale: string | null): WorkPlan | string {
   const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0);
   const wf = workFactor(scale, ow, oh);
@@ -110,7 +110,7 @@ export function workPlan(st: Stream, w: number, h: number, upscaleF: number, sca
   }
   const note =
     `DLSS mode ${wf.mode}: working size ${ww}x${wh} for the ${ow}x${oh} output (source ${w}x${h}` +
-    (vf.length ? ', the downscale folded into the decode, linear-light spline36' : '') +
+    (vf.length ? ', the downscale folded into the decode, linear-light Lanczos3' : '') +
     (capped ? "; capped at 3840x2160, the interpolation's reach" : '') +
     ')\n';
   return { w: dw, h: dh, workW: ww, workH: wh, outW: ow, outH: oh, vf, note };

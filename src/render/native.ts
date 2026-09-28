@@ -242,7 +242,6 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (DRBA_MODE && !FPS_MODE) ratio = args.multi;
   const totalPairs = NB ? Math.max(1, NB - 1) : 0;
   const totalUnits = NO_INTERP ? NB : totalPairs;
-  const REPO = path.join(ENGINE, 'GMFSS_Fortuna'); // render.py chdirs here: the children's cwd
   // (the host only enlarges: workPlan's decode is never larger than the working size or the output)
   const kind = NVOF_MODE
     ? 'nvof'
@@ -322,7 +321,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     const rtxDir = env.SMV_RTXVIDEO_DIR || path.join(ENGINE, 'rtxvideo');
     const miss = ['rtxvideo_cuda.dll', 'nvngx_truehdr.dll'].filter((f) => !isFile(path.join(rtxDir, f)));
     if (miss.length)
-      say(`[rtx] unavailable, falling back (bicubic upscale / SDR): ${miss.join(', ')} not in ${rtxDir}\n`);
+      say(`[rtx] unavailable, falling back (Lanczos3 upscale / SDR): ${miss.join(', ')} not in ${rtxDir}\n`);
     else {
       HDR_ACTIVE = true;
       const vib = HDR_VIBRANCE > 0 ? `, vib ${pyG(HDR_VIBRANCE)}` : '';
@@ -599,7 +598,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     } else if (ln) say('[native] ' + ln + '\n');
   };
   const decCmd = decodeCmd(FFMPEG, inp, VFR_DEC, decFilters, DEC_FMT);
-  const spawnOpts = { cwd: REPO, windowsHide: true };
+  const spawnOpts = { cwd: ENGINE, windowsHide: true };
 
   // the resident host (render.py _native_resident_render), else one exe for this render
   let nrc: number | null = null;

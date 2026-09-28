@@ -8,7 +8,7 @@
     "start": "tsc && electron .",
     "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.js && node scripts/stage-gpu-runtime.js && node scripts/export-onnx.js && npm start",
     "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && node scripts/stage-gpu-runtime.js --required && node scripts/export-onnx.js --required && electron-builder && node scripts/pack-zip.js",
-    "lint": "prettier --write \"src/**/*.ts\" && tsc --noEmit && pyright",
+    "lint": "prettier --write \"src/**/*.ts\" \"scripts/*.js\" && tsc --noEmit && pyright && node scripts/clang-format.js",
     "postinstall": "node scripts/dev-icon.js"
   },
   "devDependencies": {

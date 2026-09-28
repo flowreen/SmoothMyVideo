@@ -54,7 +54,8 @@ function run() {
     execFileSync(TAR, ['-xf', zip, '-C', tmp], { stdio: 'inherit' });
 
     // BtbN packs everything under one top folder: <name>/bin/{ffmpeg.exe,ffprobe.exe,*.dll,...}
-    const binDir = fs.readdirSync(tmp, { withFileTypes: true })
+    const binDir = fs
+      .readdirSync(tmp, { withFileTypes: true })
       .filter((e) => e.isDirectory())
       .map((e) => path.join(tmp, e.name, 'bin'))
       .find((b) => fs.existsSync(b));
@@ -68,7 +69,11 @@ function run() {
       if (low === 'ffplay.exe') continue;
       if (!low.endsWith('.exe') && !low.endsWith('.dll')) continue;
       const dst = path.join(ENGINE_BIN, name);
-      try { if (fs.existsSync(dst)) fs.chmodSync(dst, 0o666); } catch { /* best effort */ }
+      try {
+        if (fs.existsSync(dst)) fs.chmodSync(dst, 0o666);
+      } catch {
+        /* best effort */
+      }
       fs.copyFileSync(path.join(binDir, name), dst);
       copied++;
     }
@@ -77,7 +82,10 @@ function run() {
     const top = path.dirname(binDir);
     for (const lic of ['LICENSE.txt', 'LICENSE']) {
       const src = path.join(top, lic);
-      if (fs.existsSync(src)) { fs.copyFileSync(src, path.join(ENGINE_BIN, 'FFMPEG-LICENSE.txt')); break; }
+      if (fs.existsSync(src)) {
+        fs.copyFileSync(src, path.join(ENGINE_BIN, 'FFMPEG-LICENSE.txt'));
+        break;
+      }
     }
     if (!here('ffmpeg.exe') || !here('ffprobe.exe')) {
       throw new Error('ffmpeg.exe / ffprobe.exe missing after copy');
@@ -89,7 +97,11 @@ function run() {
     console.warn('[fetch-ffmpeg] or add it later via the GUI "Choose .zip" button or README "Setup".');
     console.warn('[fetch-ffmpeg] Direct source: ' + FFMPEG_URL);
   } finally {
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
   }
 }
 

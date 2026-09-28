@@ -599,7 +599,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   let needVsr = OW > W && OH > H && a.rtx_vsr;
   const rtxDir = env.SMV_RTXVIDEO_DIR || path.join(ENGINE, 'rtxvideo');
   if ((needVsr || doHdr) && !['rtxvideo_cuda.dll', 'nvngx_truehdr.dll'].every((d) => isFile(path.join(rtxDir, d)))) {
-    needVsr = false; // like preview.py: no RTX Video bridge means bicubic + SDR
+    needVsr = false; // no RTX Video bridge means Lanczos3 + SDR
     doHdr = false;
   }
   const nrDir = env.SMV_DLSSNR_DIR || path.join(ENGINE, 'dlssnr');
@@ -669,7 +669,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         pyG(clamp(a.hdr_satboost, 0.0, 1.0)),
       );
     }
-    const r = await run(path.join(ENGINE, 'live', 'smv-live.exe'), args, px, path.join(ENGINE, 'GMFSS_Fortuna'));
+    const r = await run(path.join(ENGINE, 'live', 'smv-live.exe'), args, px, ENGINE);
     const outBytes = OW * OH * (doHdr ? 4 : bpp);
     if (r.rc !== 0 || r.out.length < outBytes) {
       throw new Error(`the native host failed (exit ${r.rc}): ` + r.err.trim().split(/\r?\n/).slice(-4).join(' | '));

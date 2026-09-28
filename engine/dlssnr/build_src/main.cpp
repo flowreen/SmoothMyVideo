@@ -40,7 +40,12 @@
 
 #include "nr_host.h"
 
-#define LOG(...) do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while (0)
+#define LOG(...)                                                                                                       \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        fprintf(stderr, __VA_ARGS__);                                                                                  \
+        fflush(stderr);                                                                                                \
+    } while (0)
 
 // stdout carries the binary frame protocol, but the NGX core prints status lines of its
 // own to the process stdout (e.g. "[ngx::util::openLogFileInPath] Logging to
@@ -52,8 +57,8 @@
 static HANDLE g_out = INVALID_HANDLE_VALUE;
 static void detachStdout()
 {
-    DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_OUTPUT_HANDLE), GetCurrentProcess(),
-                    &g_out, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_OUTPUT_HANDLE), GetCurrentProcess(), &g_out, 0, FALSE,
+                    DUPLICATE_SAME_ACCESS);
     fflush(stdout);
     SetStdHandle(STD_OUTPUT_HANDLE, GetStdHandle(STD_ERROR_HANDLE));
     _dup2(_fileno(stderr), _fileno(stdout));
@@ -65,15 +70,18 @@ static bool outWrite(const void* p, size_t n)
     {
         DWORD wrote = 0;
         const DWORD chunk = (DWORD)(n > (1u << 30) ? (1u << 30) : n);
-        if (!WriteFile(g_out, b, chunk, &wrote, nullptr) || wrote == 0) return false;
-        b += wrote; n -= wrote;
+        if (!WriteFile(g_out, b, chunk, &wrote, nullptr) || wrote == 0)
+            return false;
+        b += wrote;
+        n -= wrote;
     }
     return true;
 }
 static bool outPrintf(const char* fmt, ...)
 {
     char buf[512];
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     const int n = vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     return n > 0 && outWrite(buf, (size_t)n);
@@ -81,12 +89,15 @@ static bool outPrintf(const char* fmt, ...)
 
 static uint16_t floatToHalf(float f)
 {
-    uint32_t x; memcpy(&x, &f, 4);
+    uint32_t x;
+    memcpy(&x, &f, 4);
     uint32_t sign = (x >> 16) & 0x8000u;
-    int32_t  exp  = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    int32_t exp = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
     uint32_t mant = x & 0x7FFFFFu;
-    if (exp <= 0) return (uint16_t)sign;
-    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
+    if (exp <= 0)
+        return (uint16_t)sign;
+    if (exp >= 31)
+        return (uint16_t)(sign | 0x7C00u);
     return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
 }
 
@@ -113,7 +124,10 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
-        auto needNum = [&](float& dst) { if (i + 1 < argc) dst = (float)atof(argv[++i]); };
+        auto needNum = [&](float& dst) {
+            if (i + 1 < argc)
+                dst = (float)atof(argv[++i]);
+        };
         if (a == "--server" && i + 2 < argc)
         {
             server = true;
@@ -129,28 +143,54 @@ int main(int argc, char** argv)
                 h = (uint32_t)strtoul(argv[++i], nullptr, 10);
             }
         }
-        else if (a == "--frames" && i + 1 < argc) frames = atoi(argv[++i]);
-        else if (a == "--reset-every") resetEvery = true;
-        else if (a == "--structure") needNum(set.structure);
-        else if (a == "--tone") needNum(set.tone);
-        else if (a == "--intensity") needNum(set.intensity);
-        else if (a == "--style" && i + 1 < argc) set.style = atoi(argv[++i]);
-        else if (a == "--preset" && i + 1 < argc) set.preset = atoi(argv[++i]);
-        else if (a == "--shim") var.useShim = true;
-        else if (a == "--no-shim") var.useShim = false;
-        else if (a == "--shim-loc" && i + 1 < argc) var.shimLocation = atoi(argv[++i]);
-        else if (a == "--init-order" && i + 1 < argc) var.initArgOrder = atoi(argv[++i]);
-        else if (a == "--no-projectid") var.initProjectId = false;
-        else if (a == "--via-core") var.viaSnippet = false;
-        else { LOG("dlssnr: unknown argument %s\n", a.c_str()); usage(); return 1; }
+        else if (a == "--frames" && i + 1 < argc)
+            frames = atoi(argv[++i]);
+        else if (a == "--reset-every")
+            resetEvery = true;
+        else if (a == "--structure")
+            needNum(set.structure);
+        else if (a == "--tone")
+            needNum(set.tone);
+        else if (a == "--intensity")
+            needNum(set.intensity);
+        else if (a == "--style" && i + 1 < argc)
+            set.style = atoi(argv[++i]);
+        else if (a == "--preset" && i + 1 < argc)
+            set.preset = atoi(argv[++i]);
+        else if (a == "--shim")
+            var.useShim = true;
+        else if (a == "--no-shim")
+            var.useShim = false;
+        else if (a == "--shim-loc" && i + 1 < argc)
+            var.shimLocation = atoi(argv[++i]);
+        else if (a == "--init-order" && i + 1 < argc)
+            var.initArgOrder = atoi(argv[++i]);
+        else if (a == "--no-projectid")
+            var.initProjectId = false;
+        else if (a == "--via-core")
+            var.viaSnippet = false;
+        else
+        {
+            LOG("dlssnr: unknown argument %s\n", a.c_str());
+            usage();
+            return 1;
+        }
     }
-    if (!server && !probe) { usage(); return 1; }
-    if (w == 0 || h == 0 || frames <= 0) { usage(); return 1; }
-    detachStdout();   // before the first NGX module loads, see g_out
+    if (!server && !probe)
+    {
+        usage();
+        return 1;
+    }
+    if (w == 0 || h == 0 || frames <= 0)
+    {
+        usage();
+        return 1;
+    }
+    detachStdout(); // before the first NGX module loads, see g_out
 
     LOG("dlssnr: %ux%u structure=%.2f tone=%.2f style=%d preset=%d shim=%d shimLoc=%d initOrder=%d projectId=%d resetEvery=%d\n",
-        w, h, set.structure, set.tone, set.style, set.preset,
-        (int)var.useShim, var.shimLocation, var.initArgOrder, (int)var.initProjectId, (int)resetEvery);
+        w, h, set.structure, set.tone, set.style, set.preset, (int)var.useShim, var.shimLocation, var.initArgOrder,
+        (int)var.initProjectId, (int)resetEvery);
 
     nr::Host host;
     std::string err;
@@ -162,9 +202,9 @@ int main(int argc, char** argv)
     {
         LOG("dlssnr: startup failed (%s)\n", err.c_str());
         if (probe)
-            outPrintf("PROBE shim=%d shimLoc=%d initOrder=%d projectId=%d ngx=%s exit=%d reason=%s\n",
-                   (int)var.useShim, var.shimLocation, var.initArgOrder, (int)var.initProjectId,
-                   nr::resultString(host.lastResult()).c_str(), rc, err.c_str());
+            outPrintf("PROBE shim=%d shimLoc=%d initOrder=%d projectId=%d ngx=%s exit=%d reason=%s\n", (int)var.useShim,
+                      var.shimLocation, var.initArgOrder, (int)var.initProjectId,
+                      nr::resultString(host.lastResult()).c_str(), rc, err.c_str());
         return rc;
     }
 
@@ -192,10 +232,11 @@ int main(int argc, char** argv)
         if (!host.renderFrame(in.data(), out.data(), true, err))
         {
             LOG("dlssnr: warm-up evaluate failed (%s)\n", err.c_str());
-            outPrintf("PROBE shim=%d shimLoc=%d initOrder=%d projectId=%d result=%s exit=2\n",
-                   (int)var.useShim, var.shimLocation, var.initArgOrder, (int)var.initProjectId,
-                   nr::resultString(host.lastResult()).c_str());
-            fflush(stdout); ExitProcess(2);
+            outPrintf("PROBE shim=%d shimLoc=%d initOrder=%d projectId=%d result=%s exit=2\n", (int)var.useShim,
+                      var.shimLocation, var.initArgOrder, (int)var.initProjectId,
+                      nr::resultString(host.lastResult()).c_str());
+            fflush(stdout);
+            ExitProcess(2);
         }
         LARGE_INTEGER freq, t0, t1;
         QueryPerformanceFrequency(&freq);
@@ -204,21 +245,23 @@ int main(int argc, char** argv)
             if (!host.renderFrame(in.data(), out.data(), false, err))
             {
                 LOG("dlssnr: evaluate failed at frame %d (%s)\n", i, err.c_str());
-                outPrintf("PROBE shim=%d shimLoc=%d initOrder=%d projectId=%d result=%s exit=2\n",
-                       (int)var.useShim, var.shimLocation, var.initArgOrder, (int)var.initProjectId,
-                       nr::resultString(host.lastResult()).c_str());
-                fflush(stdout); ExitProcess(2);
+                outPrintf("PROBE shim=%d shimLoc=%d initOrder=%d projectId=%d result=%s exit=2\n", (int)var.useShim,
+                          var.shimLocation, var.initArgOrder, (int)var.initProjectId,
+                          nr::resultString(host.lastResult()).c_str());
+                fflush(stdout);
+                ExitProcess(2);
             }
         QueryPerformanceCounter(&t1);
         const double ms = 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart / frames;
 
         // Did the runtime actually change the frame?
         double diff = 0.0;
-        for (size_t i = 0; i < frameBytes; ++i) diff += abs((int)out[i] - (int)in[i]);
+        for (size_t i = 0; i < frameBytes; ++i)
+            diff += abs((int)out[i] - (int)in[i]);
         outPrintf("PROBE shim=%d shimLoc=%d initOrder=%d projectId=%d result=Success exit=0 "
-               "size=%ux%u ms_per_eval=%.3f byte_diff_mean=%.4f\n",
-               (int)var.useShim, var.shimLocation, var.initArgOrder, (int)var.initProjectId,
-               w, h, ms, diff / (double)frameBytes);
+                  "size=%ux%u ms_per_eval=%.3f byte_diff_mean=%.4f\n",
+                  (int)var.useShim, var.shimLocation, var.initArgOrder, (int)var.initProjectId, w, h, ms,
+                  diff / (double)frameBytes);
         fflush(stdout);
         // NGX has no clean unload; its own process-detach teardown faults after
         // main returns (misleading exit 127). The probe is done, so exit now.
@@ -228,7 +271,11 @@ int main(int argc, char** argv)
     // Streaming server. stdin is binary; the frames go out on the private g_out handle
     // (the original stdout, see detachStdout), never through the CRT stdout.
     _setmode(_fileno(stdin), _O_BINARY);
-    if (!outPrintf("DLSSNR READY w=%u h=%u\n", w, h)) { LOG("dlssnr: stdout write failed\n"); return 1; }
+    if (!outPrintf("DLSSNR READY w=%u h=%u\n", w, h))
+    {
+        LOG("dlssnr: stdout write failed\n");
+        return 1;
+    }
 
     bool first = true;
     for (;;)
@@ -237,11 +284,17 @@ int main(int argc, char** argv)
         while (got < frameBytes)
         {
             const size_t n = fread(in.data() + got, 1, frameBytes - got, stdin);
-            if (n == 0) break;
+            if (n == 0)
+                break;
             got += n;
         }
-        if (got == 0) break;                 // clean EOF between frames
-        if (got < frameBytes) { LOG("dlssnr: short frame (%zu of %zu bytes)\n", got, frameBytes); return 1; }
+        if (got == 0)
+            break; // clean EOF between frames
+        if (got < frameBytes)
+        {
+            LOG("dlssnr: short frame (%zu of %zu bytes)\n", got, frameBytes);
+            return 1;
+        }
 
         if (!host.renderFrame(in.data(), out.data(), first || resetEvery, err))
         {
@@ -249,9 +302,14 @@ int main(int argc, char** argv)
             return 2;
         }
         first = false;
-        if (!outWrite(out.data(), frameBytes)) { LOG("dlssnr: stdout write failed\n"); return 1; }
+        if (!outWrite(out.data(), frameBytes))
+        {
+            LOG("dlssnr: stdout write failed\n");
+            return 1;
+        }
     }
     LOG("dlssnr: stdin EOF, exiting\n");
-    fflush(stdout); ExitProcess(0);  // skip NGX process-detach teardown fault
+    fflush(stdout);
+    ExitProcess(0); // skip NGX process-detach teardown fault
     return 0;
 }

@@ -98,7 +98,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   final resize to your output (RTX Video Super Resolution when it's on). The **DLSS mode** picks
   the working size as NVIDIA does, a share of the output: DLAA (the default, the output size
   itself), Quality, Balanced, Performance, Ultra Performance, Auto (NVIDIA's pick for the output
-  size) or a Custom 33 to 100%. The lower modes are much faster and a little softer; Performance
+  size) or a Custom 1 to 100%. The lower modes are much faster and a little softer; Performance
   for a 1080p to 4K upscale works at the source's own 1080p.
 * 🧠 **Optional NVIDIA DLSS 5 pass.** One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every
   source frame before the smoothing, the order NVIDIA uses in games (after Restore and the resize,
@@ -142,8 +142,8 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   your fps target (the same Speed setting file renders use) and the multiplier follows the
   content, so a game dropping from 30 to 10 fps keeps playing at the same smooth rate on
   screen. Your Sharpen, Upscale to and Restore settings apply live too (the picture is rendered at the
-  chosen height first, then fitted to the window or screen; Restore redraws every presented frame and
-  is heavy, expect about 15 to 20 fps at 1080p), and Fill screen upscales with RTX VSR when
+  chosen height first, then fitted to the window or screen; Restore, DLSS 5, Sharpen and RTX HDR work on
+  each captured frame before the smoothing, once per captured frame, in NVIDIA's order), and Fill screen upscales with RTX VSR when
   it's enabled. Untick every interpolation model and Live applies just those effects to the
   window at its own frame rate (useful for the growing set of apps that only need the
   picture cleaned or expanded). A small

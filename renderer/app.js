@@ -78,10 +78,8 @@ function setMode(m){
   $('modelive').classList.toggle('on', uiMode === 'live');
   try { localStorage.setItem('uiMode', uiMode); } catch {}
   lvUnavailUi();
-  // the numbered panels follow the processing order, which differs in one place: live runs RTX HDR
-  // on each captured frame right after DLSS 5, before the smoothing; a file render runs it last
-  if(uiMode === 'live') $('nrpanel').after($('hdrpanel')); else $('sharpenpanel').after($('hdrpanel'));
-  applyOrder();   // file renders follow NVIDIA's order, live its own
+  // the numbered panels follow the processing order, NVIDIA's, the same in both modes
+  applyOrder();
   if(dlssUiReady) syncDlssMode();
 }
 // Switching mid-job would hide the running thing, so both buttons grey out while a live session
@@ -413,12 +411,14 @@ function restoreOn(){ return $('restore').checked; }
 // into per session, so its state is deliberately NOT persisted; old key retired.
 localStorage.removeItem('restoreOn');
 
-// File renders run NVIDIA's order: Restore and the resize to the working size (the DLSS mode) on
-// each source frame first, then DLSS 5 and the interpolation, then the final resize to the output;
-// live still resizes after the smoothing. The numbered panels follow the mode's order.
+// NVIDIA's order in both modes: on each source or captured frame Restore and the resize to the
+// working size (the DLSS mode), DLSS 5, FSR and RTX HDR (with the Dolby Vision and HDR10+ metadata of
+// a file render), then the interpolation (frame generation last), then the final resize to the output.
+// The numbered panels follow it.
 function applyOrder(){
-  if(uiMode === 'video'){ $('nrpanel').before($('restorepanel')); $('nrpanel').before($('uppanel')); }
-  else { $('interppanel').after($('restorepanel')); $('restorepanel').after($('uppanel')); }
+  $('nrpanel').before($('restorepanel')); $('nrpanel').before($('uppanel'));
+  $('nrpanel').after($('sharpenpanel')); $('sharpenpanel').after($('hdrpanel'));
+  $('hdrpanel').after($('dvpanel')); $('dvpanel').after($('hppanel')); $('hppanel').after($('interppanel'));
 }
 localStorage.removeItem('nvorderOn');   // retired: NVIDIA's order is the only order
 applyOrder();
@@ -454,7 +454,7 @@ ipcRenderer.invoke('refresh-rate').then(hz => {
 // Upscale-to-resolution: a target height chosen from the dropdown (or the Custom slider) drives an
 // arbitrary upscale factor (targetHeight / sourceHeight), keeping the source aspect ratio. RTX VSR
 // (the #rtxvsr toggle, once its runtime is installed) does the upscale with NVIDIA AI; with it off or
-// absent the engine uses a bicubic resize. Off by default; the choice persists. Independent of
+// absent the engine uses a Lanczos3 resize. On by default; the choice persists. Independent of
 // interpolation, so it also applies in sharpen-only mode. There is no integer-scale restriction (RTX
 // VSR was probed clean to 16K), but the output is bounded by two real limits: the encoders top out at
 // 16K (NVENC caps either dimension at 8192px, verified on the RTX 5090; past that the ENGINE switches
@@ -516,10 +516,10 @@ function syncUpscale(){
 
 // DLSS mode: the working size's share of the output (NVIDIA's DLSS modes; plan.ts workPlan holds
 // the same table: DLAA 1, Quality 1 / 1.5, Balanced 1 / 1.724, Performance 1 / 2, Ultra
-// Performance 1 / 3, Auto by the output's pixel count, Custom 33..100 % like the NVIDIA app's
-// override). Restore's output, DLSS 5 and the interpolation run at it; the final resize takes it to
-// the output. Persisted, DLAA (the output itself) by default. Live keeps its own meaning until it
-// follows NVIDIA's order: the smoothing runs at this share of the window (Auto = 100 %).
+// Performance 1 / 3, Auto by the output's pixel count, Custom 1..100 %, at least 64 px a side).
+// Restore's output, DLSS 5 and the interpolation run at it; the final resize takes it to
+// the output. Persisted, DLAA (the output itself) by default. Live runs the same order but takes the
+// share of the window, not of the presented size (Auto = 100 %).
 var dlssUiReady = false;   // var: setMode runs before this block and must skip the sync
 const DLSS_MODES = { dlaa: 1, quality: 1 / 1.5, balanced: 1 / 1.724, performance: 1 / 2, ultra: 1 / 3 };
 function dlssMode(){ return $('dlssmode').value; }
@@ -552,17 +552,17 @@ function syncDlssMode(){
     const d = workDims(o);
     t = 'works at ' + d.w + ' × ' + d.h + (d.w === o.w && d.h === o.h ? ', the output size' : ' for the ' + o.w + ' × ' + o.h + ' output')
         + (dlssMode() === 'auto' ? ' (Auto: ' + $('dlssmode').querySelector('option[value="' + dlssAuto(o.w, o.h) + '"]').textContent + ')' : '');
-  } else t = uiMode === 'live' ? 'live: the smoothing runs at this share of the window size, then fits it back (Auto = 100%)'
+  } else t = uiMode === 'live' ? 'live: Restore\'s output, DLSS 5 and the smoothing run at this share of the window size, then fit it back (Auto = 100%)'
                               : 'Restore, DLSS 5 and the interpolation run at this share of the output size';
   $('dlssmodehint').textContent = t;
 }
-// live's image scale in % (the old meaning, until live follows NVIDIA's order)
+// live's working size in % of the window (Auto = 100 %)
 function liveFlowPct(){ return Math.round(dlssFactor(0, 0) * 100); }
 {
   const m = localStorage.getItem('dlssMode');
   if(m && [...$('dlssmode').options].some(o => o.value === m)) $('dlssmode').value = m;
   const c = +localStorage.getItem('dlssCustom');
-  if(c >= 33 && c <= 100) $('dlsscustom').value = c;
+  if(c >= 1 && c <= 100) $('dlsscustom').value = c;
   localStorage.removeItem('lvFlow');   // retired: the Image scale slider became the DLSS mode
 }
 // a value that holds 1 s starts the fresh build: the preview's refresh and a running live
@@ -608,8 +608,8 @@ $('upcustom').oninput = () => { localStorage.setItem('upcustom', $('upcustom').v
 $('upcustom').addEventListener('change', refreshPreviewIfOpen);
 ipcRenderer.invoke('screen-size').then(s => { screenW = (s&&s.width)||0; screenH = (s&&s.height)||0; setScreenOptLabel(); syncUpscale(); });
 
-// NVIDIA RTX (opt-in): real RTX Video Super Resolution + RTX HDR via the engine/rtxvideo CUDA bridge
-// + NVIDIA's feature DLLs. Both OFF by default. The feature DLLs are non-redistributable, so the app
+// NVIDIA RTX: real RTX Video Super Resolution (ON by default) + RTX HDR (OFF by default) via the
+// engine/rtxvideo CUDA bridge + NVIDIA's feature DLLs. The feature DLLs are non-redistributable, so the app
 // can't bundle them; instead you pick the downloaded RTX Video SDK .zip and the app copies the two
 // DLLs into engine/rtxvideo for you. Readiness = the bridge + the feature's model DLL present.
 function syncRtx(){
@@ -662,9 +662,10 @@ $('rtxget').onclick = () => ipcRenderer.invoke('rtx-open-download');
 $('rtxbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('rtx-choose','zip'); if(p) doInstall(p); };  // selecting a .zip auto-installs
 localStorage.removeItem('supersampleOn');   // retired: supersample removed (measured imperceptible)
 localStorage.removeItem('encspeed');   // retired: no Encoder speed selector (every render uses the Quality encoder)
-if(localStorage.getItem('rtxvsrOn') === '1') $('rtxvsr').checked = true;   // default OFF
+localStorage.removeItem('rtxvsrOn');   // retired: its stored choice was made while RTX VSR defaulted off
+$('rtxvsr').checked = localStorage.getItem('vsrOn') !== '0';   // default ON: RTX VSR upscales unless unticked
 if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // default OFF
-$('rtxvsr').onchange = () => { localStorage.setItem('rtxvsrOn', $('rtxvsr').checked ? '1' : '0'); syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
+$('rtxvsr').onchange = () => { localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0'); syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 $('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 syncRtx();
 // Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
@@ -960,11 +961,9 @@ function liveModelInfo(){
   if(!interpOn()) return { model:'echo', name:'No interpolation', note:'', effectsOnly:true };
   return { model:'gmfss', name:'GMFSS', note:'' };
 }
-// Upscaler policy: live FILL upscales with RTX VSR BY DEFAULT when its runtime is
-// present (live output is ephemeral, so a better silent default is fine). The shared RTX VSR
-// checkbox stays the opt-out: explicitly unchecked ('0') means bicubic everywhere. FILE
-// renders remain strict opt-in (checkbox checked) so render output never changes silently.
-function liveVsrOn(){ return !!(rtxReady.vsr && localStorage.getItem('rtxvsrOn') !== '0'); }
+// Upscaler policy: live FILL and file renders upscale with RTX VSR by default when its runtime is
+// present; the shared RTX VSR checkbox is the opt-out (unticked = Lanczos3 everywhere).
+function liveVsrOn(){ return !!(rtxReady.vsr && $('rtxvsr').checked); }
 // Live TrueHDR: STRICT opt-in via the shared RTX HDR checkbox (a TrueHDR
 // expansion is a deliberate look change, so live matches file renders, not the VSR silent
 // default). Applies to the server models on HDR screens; the exe drops it elsewhere. No
@@ -1458,8 +1457,8 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
   const upActive = upFactor() > 0;   // the processed side is upscaled too, so never call it unchanged
   const vsrOn = useVsr;              // what the processed pane actually rendered (lite skips VSR)
   const active = useHdr || sharpen > 0 || restoreOn() || upActive || useNr;
-  // Plain bicubic upscale with no AI/enhancement pass: both panes are the same bicubic image, so say so.
-  const bicubicOnly = upActive && !vsrOn && !restoreOn() && sharpen <= 0 && !useHdr && !useNr;
+  // Plain Lanczos3 resize with no AI/enhancement pass: both panes are the same resized image, so say so.
+  const plainOnly = upActive && !vsrOn && !restoreOn() && sharpen <= 0 && !useHdr && !useNr;
   const rtxSkipped = lite && (hdr || nrOn() || ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1));   // RTX / DLSS 5 on in settings but skipped for the fast auto-preview
   const srcHdr = !!(info && info.srcHdr);
   $('prevoriglabel').textContent = srcHdr ? 'Original (HDR, tonemapped)' : 'Original';
@@ -1475,7 +1474,7 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
     : rtxSkipped ? 'quick preview shown; refining to the full RTX VSR/HDR/DLSS 5 version…'
     : srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
     : !active ? 'no Restore, FSR, DLSS 5 or RTX HDR enabled, the output will match the source'
-    : bicubicOnly ? (upFactor() < 1 ? 'plain downscale, both panes match (RTX VSR is for upscaling)'
+    : plainOnly ? (upFactor() < 1 ? 'plain downscale, both panes match (RTX VSR is for upscaling)'
                                     : 'plain upscale, no AI detail added (enable RTX VSR for that; both panes match)')
     : useHdr ? 'HDR is tonemapped to show on this SDR screen'
     : 'detail changes are subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
@@ -1734,7 +1733,7 @@ function startRun(){
   const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
   const dims = upDims();                               // resize target ({w,h} or null)
   const factor = upFactor();                           // arbitrary resize factor (0 = off, <1 downscales)
-  const useRtxVsr = (factor > 1 || dlssBelowOutput()) && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale of an enlarging resize, else bicubic
+  const useRtxVsr = (factor > 1 || dlssBelowOutput()) && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale of an enlarging resize, else Lanczos3
   const rtxhdr = hdrOn();  // HDR only when its runtime is installed and the source is SDR
   // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
   // HDR is on. Bail only when nothing at all is enabled.
@@ -1796,7 +1795,7 @@ function startRun(){
   if(factor > 0){
     payload.upscale = factor;                          // arbitrary upscale factor (target height / source)
   }
-  if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else bicubic)
+  if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else Lanczos3)
   if(rtxhdr){ payload.rtxhdr = true;     // HDR10; engine masters at a fixed 1000-nit peak
     const hp = hdrColorPayload();        // zero-strength Dynamic Vibrance routes to the source path
     payload.hdrcolor = hp.color;                                   // vivid (default) / rtx

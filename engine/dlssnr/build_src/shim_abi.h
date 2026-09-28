@@ -26,16 +26,14 @@ typedef NVSDK_NGX_Result (*PFN_NGX_InitProjectID_B)(const char* projectId, NVSDK
                                                     const char* engineVersion, const wchar_t* dataPath,
                                                     ID3D12Device* device, NVSDK_NGX_Version sdkVersion,
                                                     const NVSDK_NGX_FeatureCommonInfo* featureInfo);
-typedef NVSDK_NGX_Result (*PFN_NGX_InitExt)(unsigned long long appId, const wchar_t* dataPath,
-                                            ID3D12Device* device, NVSDK_NGX_Version sdkVersion,
-                                            const NVSDK_NGX_Parameter* params);
+typedef NVSDK_NGX_Result (*PFN_NGX_InitExt)(unsigned long long appId, const wchar_t* dataPath, ID3D12Device* device,
+                                            NVSDK_NGX_Version sdkVersion, const NVSDK_NGX_Parameter* params);
 typedef NVSDK_NGX_Result (*PFN_NGX_AllocParams)(NVSDK_NGX_Parameter** outParams);
 typedef NVSDK_NGX_Result (*PFN_NGX_DestroyParams)(NVSDK_NGX_Parameter* params);
 typedef NVSDK_NGX_Result (*PFN_NGX_CapParams)(NVSDK_NGX_Parameter** outParams);
 typedef NVSDK_NGX_Result (*PFN_NGX_CreateFeature)(ID3D12GraphicsCommandList* list, NVSDK_NGX_Feature featureId,
                                                   NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** outHandle);
-typedef NVSDK_NGX_Result (*PFN_NGX_EvaluateFeature)(ID3D12GraphicsCommandList* list,
-                                                    const NVSDK_NGX_Handle* handle,
+typedef NVSDK_NGX_Result (*PFN_NGX_EvaluateFeature)(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle,
                                                     const NVSDK_NGX_Parameter* params,
                                                     PFN_NVSDK_NGX_ProgressCallback_C callback);
 typedef NVSDK_NGX_Result (*PFN_NGX_ReleaseFeature)(NVSDK_NGX_Handle* handle);
@@ -59,15 +57,13 @@ SMV_SHIM_API NVSDK_NGX_Result DLSSNR_CallAllocParams(void* fn, NVSDK_NGX_Paramet
 SMV_SHIM_API NVSDK_NGX_Result DLSSNR_CallCreate(void* fn, ID3D12GraphicsCommandList* list, int featureId,
                                                 NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** outHandle);
 SMV_SHIM_API NVSDK_NGX_Result DLSSNR_CallEvaluate(void* fn, ID3D12GraphicsCommandList* list,
-                                                  const NVSDK_NGX_Handle* handle,
-                                                  const NVSDK_NGX_Parameter* params);
+                                                  const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params);
 SMV_SHIM_API NVSDK_NGX_Result DLSSNR_CallRelease(void* fn, NVSDK_NGX_Handle* handle);
 SMV_SHIM_API NVSDK_NGX_Result DLSSNR_CallShutdown(void* fn, ID3D12Device* device);
 
 // Signatures of the shim exports, for GetProcAddress on the host side.
-typedef NVSDK_NGX_Result (*PFN_ShimInit)(void*, int, const char*, NVSDK_NGX_EngineType, const char*,
-                                         const wchar_t*, ID3D12Device*, const NVSDK_NGX_FeatureCommonInfo*,
-                                         NVSDK_NGX_Version);
+typedef NVSDK_NGX_Result (*PFN_ShimInit)(void*, int, const char*, NVSDK_NGX_EngineType, const char*, const wchar_t*,
+                                         ID3D12Device*, const NVSDK_NGX_FeatureCommonInfo*, NVSDK_NGX_Version);
 typedef NVSDK_NGX_Result (*PFN_ShimInitExt)(void*, unsigned long long, const wchar_t*, ID3D12Device*,
                                             NVSDK_NGX_Version);
 typedef NVSDK_NGX_Result (*PFN_ShimAllocParams)(void*, NVSDK_NGX_Parameter**);

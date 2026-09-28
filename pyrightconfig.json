@@ -1,5 +1,5 @@
 {
-  "include": ["engine"],
+  "include": ["engine", "scripts", "tools"],
   "exclude": [
     "engine/runtime",
     "engine/GMFSS_Fortuna",
@@ -8,12 +8,11 @@
     "engine/rtxvideo",
     "**/__pycache__"
   ],
-  "extraPaths": ["engine", "engine/GMFSS_Fortuna"],
+  "extraPaths": ["engine", "engine/GMFSS_Fortuna", "engine/runtime/Lib/site-packages"],
   "pythonVersion": "3.14",
-  "typeCheckingMode": "off",
+  "typeCheckingMode": "standard",
   "reportMissingImports": "none",
   "reportMissingModuleSource": "none",
-  "reportUndefinedVariable": "error",
   "reportUnusedImport": "warning",
   "reportUnusedVariable": "warning"
 }

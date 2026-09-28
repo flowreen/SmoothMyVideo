@@ -42,7 +42,8 @@ function stage() {
     [trt, 'tensorrt_onnxparser_rtx_1_6.dll'],
   ];
   const missing = want.filter(([d, n]) => !fs.existsSync(path.join(d, n))).map(([, n]) => n);
-  if (missing.length || !builtins.length) return fail(`missing in the wheels: ${missing.join(', ') || 'nvrtc-builtins64_*.dll'}`);
+  if (missing.length || !builtins.length)
+    return fail(`missing in the wheels: ${missing.join(', ') || 'nvrtc-builtins64_*.dll'}`);
   fs.mkdirSync(OUT, { recursive: true });
   const keep = new Set(want.map(([, n]) => n.toLowerCase()));
   for (const n of fs.readdirSync(OUT)) {
@@ -50,10 +51,12 @@ function stage() {
   }
   let copied = 0;
   for (const [d, n] of want) {
-    const src = path.join(d, n), dst = path.join(OUT, n);
+    const src = path.join(d, n),
+      dst = path.join(OUT, n);
     if (fs.existsSync(dst)) {
       // size AND mtime (copyFileSync keeps it): a CUDA patch bump can keep a DLL's size
-      const a = fs.statSync(src), b = fs.statSync(dst);
+      const a = fs.statSync(src),
+        b = fs.statSync(dst);
       if (a.size === b.size && a.mtimeMs === b.mtimeMs) continue;
     }
     fs.copyFileSync(src, dst);
@@ -61,7 +64,9 @@ function stage() {
   }
   const version = info.slice('tensorrt_rtx_cu13-'.length, -'.dist-info'.length);
   fs.writeFileSync(path.join(OUT, 'tensorrt_rtx_version.txt'), version + '\n');
-  console.log(`[stage-gpu-runtime] ${want.length} DLLs in engine/gpu_runtime (${copied} copied), TensorRT-RTX ${version}`);
+  console.log(
+    `[stage-gpu-runtime] ${want.length} DLLs in engine/gpu_runtime (${copied} copied), TensorRT-RTX ${version}`,
+  );
 }
 
 if (process.platform !== 'win32') fail('not Windows (this build is win64 only)');
