@@ -1645,7 +1645,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // SMV_RIFE_TWO_DOMAIN=0: the IFNet reads the pictures. DRBA: the unbatched IFNet (one tween per
         // enqueue, its own DRM timestep map) plus the block0 flow engine, at the same frame
         const bool two = lkEnv("SMV_RIFE_TWO_DOMAIN") != "0";
-        if (!lkOfflineRife(script, two ? srcW : w, two ? srcH : h, oa.drba ? 2 : multi, oe))
+        if (!lkOfflineRife(script, two ? srcW : w, two ? srcH : h, oa.drba ? 2 : multi, oe,
+                           nativeOfflineNeed(two ? srcW : w, two ? srcH : h, w, h, srcW, srcH)))
             return 2;
         if (oa.drba)
         {
@@ -1927,7 +1928,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         set.tone = (float)(g_nrTone < 0.0 ? 0.0 : (g_nrTone > 2.0 ? 2.0 : g_nrTone));
         set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 1;
         set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
-        set.memoryRoom = nativeVideoMemoryRoom(); // the passes that fit in the free video memory
         // Zero-copy unless the preview's change map needs the host copies or SMV_NR_STAGED=1
         // asks for CPU staging (the route A/B and the fallback's trigger test). DLSS 5 gets motion
         // vectors on the zero-copy route only (the core binds DLSSNR.MVec at create);

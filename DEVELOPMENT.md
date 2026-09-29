@@ -153,9 +153,9 @@ RTX VSR / HDR and all three codecs.
 * `engine/trt_lookup.py`: the torch-free side of that cache: the naming helpers (the export
   imports them), the on-disk lookup of the pinned engine, the warm markers (`<jit cache>.warm`)
   the native handoffs use to skip the model load and warm-up once a shape was warmed, and the
-  "did not fit" markers (`<engine>.nofit`, written when the batched live class could not be
-  built for lack of GPU memory at a shape, e.g. 1472x2560 at scale 1.00): later starts at that
-  size skip the model load and the failing build and go straight to the unbatched engine.
+  "did not fit" markers (`<engine>.nofit`, written when a batched class could not be built for
+  lack of GPU memory at a shape): later runs at that size skip the failing build and go straight
+  to the unbatched engine.
   A TRT-RTX bump or a weights change renames the engine and so retries the build.
 * `engine/rife_backend.py` + `engine/rife/`: vendored Practical-RIFE 4.26 heavy (MIT, weights
   committed). Pair interface like GMFSS and the DRBA triple interface (the export's source).
@@ -763,22 +763,25 @@ white 203 nits` (or HLG).
 Without it the pass would read PQ / HLG codes as SDR gamma, a flat grey picture. Gates
 `harness\offline_hdr_nr` (`nr_hdr_gate.py` against fp64; `hdr_nr_ab.py`: SDR renders bit-identical,
 the SDR range at the pass's own noise floor against DLSS 5 on the same picture in SDR).
-Video memory: DLSS 5 is built last, after the engines and buffers, and only as many passes as fit in
-what the GPU has free (`nativeVideoMemoryRoom`: the driver's own figure for every process,
+Video memory: DLSS 5 always builds the passes the user asked for (a pass costs about 933 MiB at 4K,
+360 at 1080p, 186 at 480p: nr_host.h `kPassBase` / `kPassMp`), and the interpolation fits around
+them in what the GPU has free (`nativeVideoMemoryRoom`: the driver's own figure for every process,
 `NvAPI_GPU_GetMemoryInfoEx`'s `curAvailableDedicatedVideoMemory`, the number `nvidia-smi` shows, less
 a reserve of 4 % of the card, 512 MiB at least; `cudaMemGetInfo` and the DXGI budget describe this
-process alone: with 15 GB held by another process a second process still read 23 GB free). The NR
-core prices a pass as the one built before it took (`Settings::memoryRoom`, 933 MiB at 4K, 360 at
-1080p, 186 at 480p) plus what the first frames add, and ends the chain there: `DLSS 5 runs M of N
-passes (video memory: ...)`, a chain that equals a clean M-pass render frame for frame. Memory past
-the limit would not fail: Windows moves what does not fit into system memory, which slows the render
-and every other app on the GPU (measured at 4K, 10 passes, 15 GB held by a second process: the cap
-built 4 passes and the render ran 3.3x faster, the other process read its memory in 29 ms where it
-took 578 ms without the cap). Every session, with or without DLSS 5, also reads the driver's count of
-allocations moved out of video memory at its start and after its first frames, and says `video memory
-ran out: ...` once when it rose. Gate `harness\nr_memory_note\cap_gate.py`. Live RIFE and Frame
-Blend size their batch before those passes are built and leave them their share (Live RIFE batching,
-below).
+process alone: with 15 GB held by another process a second process still read 23 GB free). Memory
+past the limit does not fail: Windows moves what does not fit into system memory, which slows the
+render and every other app on the GPU (measured at 4K, 10 passes, 15 GB held by a second process:
+all 10 passes ran, 3.2x slower than on a free GPU, and the second process read its memory in 578 ms
+instead of 19). Every session, with or without DLSS 5, reads the driver's count of allocations moved
+out of video memory at its start and after its first frames, and says `video memory ran out: ...`
+once when it rose. Gate `harness\nr_memory_note\cap_gate.py`. Live runs one in-between frame a call
+(the unbatched IFNet, below). An offline RIFE-family render takes its fixed batched class only when the class's extra timesteps
+(411 MiB a padded megapixel each: activations and tween buffers) fit in the free video memory beside the
+render's other needs (`nativeOfflineNeed`: the render with one tween a call, 276 MiB + 645 a padded
+megapixel measured at 480p and 1080p, DLSS 5's requested passes, RTX HDR, RTX VSR, Restore); else it runs
+the unbatched engine, the same frames in more calls, and says `offline: video memory: the model runs 1 of
+N in-between frames a call ...`. So the batch gives way to DLSS 5's passes. Gate
+`harness\vram_estimate\offline_batch_gate.py OLD_ENGINE NEW_ENGINE`.
 `SMV_NR_STAGED=1` and the preview's `--nr-delta` (it needs the host copies) keep `renderFrame`
 through its upload / readback staging; a handoff that cannot start falls back to it with an
 `offline: DLSS 5 zero-copy handoff unavailable` line (no `[dlss5]` tag: the pass still runs). The
@@ -857,7 +860,7 @@ own path) runs inside the exe, the engine models through the TensorRT-RTX C++ ru
 process is part of a live session and `engine/live_server.py` is deleted; `--native` and
 `--python` are still accepted and ignored, and the live-only levers `SMV_LIVE_NATIVE`,
 `SMV_LIVE_TRT=0` and `SMV_NATIVE_LOOKUP` / `SMV_NATIVE_BUILD` no longer exist
-(`SMV_RIFE_BATCH` still acts, on both routes).
+(`SMV_RIFE_BATCH` still acts offline).
 A session the host cannot start ends on its reason line (log: `native host: <reason>`, then
 `this session cannot start in the native host`; the app keeps the reason on the status line); a
 refused native DLSS 5 pass (above 3840x2160, `SMV_LIVE_NR_NATIVE=0`, no zero-copy capture) runs
@@ -876,9 +879,8 @@ so the lookup and the build cannot disagree on a name:
   reads the captured frame) plus its `.jit`, for every backend.
 * On a miss the host BUILDS the engines (`nativeLocalBuild`, on a worker thread): from
   `engine/onnx` with the old python builder's settings (strongly typed, optimization level 5,
-  workspace `SMV_TRT_WORKSPACE_GB` x the per-graph multiplier) through the delay-loaded ONNX parser, the
-  `.nofit` rule on an out-of-memory batched build, a warm-up of every batch size with a fresh
-  runtime cache (EAGER specialization), then the `.jit` and the warm key; the lookup must then
+  workspace `SMV_TRT_WORKSPACE_GB` x the per-graph multiplier) through the delay-loaded ONNX parser, a
+  warm-up with a fresh runtime cache (EAGER specialization), then the `.jit` and the warm key; the lookup must then
   hit. It covers rife / blend, gmfss, rifedrba (the RIFE pair plus block0) and Restore (`restore_<hash>_dth`, fp16 input, no
   warm marker). Output-identical to python's build from the same file (harness
   `onnx\gate_3c2.py`, `onnx\gate_3c3a.py`). A session that ends mid-build leaves the build
@@ -1123,19 +1125,15 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   loads the IFNet's file and merges the encoder's into the same cache (the handoff's
   `NATIVE-PATH ejit=` line); without the merge the encode context recompiled its kernels on
   every first session of an engine pair (0.5 s of the warm start, measured 2026-09-14).
-* Live RIFE batching: the dynamic timestep axis enqueues a group at its true length, up to 8
-  timesteps a call. The IFNet context takes its activations from the host (`kUSER_MANAGED`,
-  `nativeIfnetMemory`), sized with `updateDeviceMemorySizeForShapes` for the batches the session
-  runs: DRBA one timestep a call (199 MiB instead of batch 8's 1589 MiB at 896x512), RIFE and Frame
-  Blend up to 8, lowered to the largest batch whose activations (433 MiB a padded megapixel per
-  timestep: batch 8 is about 7 GB at 1080p) and tween buffers fit in the free video memory beside
-  what RTX HDR, RTX VSR and DLSS 5's passes take after it (`nativeLaterNeed`): a smaller batch only
-  runs more calls, a cut DLSS 5 pass would change the picture. The log says `video memory: the model
-  runs N of up to 8 in-between frames a call ...` when it lowered the batch; `SMV_RIFE_BATCH=N` caps
-  it at N. A context sized for batch b computes a batch of b bit for bit as TensorRT's own allocation
-  does; a smaller batch picks other kernels (the tweens move by rounding: 0.01 dB on the known pan).
-  Gates `harness\vram_estimate` (engine_mem.py, session_mem.py), `live_two_domain\live_pan.py
-  --gen 3`, `drba\drba_resident.py`. TRT-RTX whole graph
+* Live RIFE, Frame Blend and DRBA run the unbatched IFNet engine, one in-between frame a call
+  (the class offline runs for a single tween). Measured on the RTX 5090 laptop (harness
+  `vram_estimate`: batch_speed.py, session_mem.py): at 1920x1088 a frame takes 10.8 ms where the
+  batched class (a timestep axis of 1 to 8) took 11.3 to 11.9 at any batch, and a parked 1080p
+  session presented 79.5 to 83.5 fps holding 2169 MiB at 32 to 62 ms latency where the batched
+  class presented 74.5 to 78.5 holding 8871 MiB at 55 to 130 ms; at 960x576 and below a batch of 5
+  to 8 is a few percent faster a frame (896x512: 2.36 ms against 2.46), but doubles the latency (41
+  against 18 ms) and holds 1488 MiB more. Gates `live_two_domain\live_pan.py --gen 3`,
+  `drba\drba_resident.py`. TRT-RTX whole graph
   capture is the live default (`SMV_TRT_GRAPH=0` disables; offline opt-in with `=1`); it cut live
   enqueue CPU per tween by 49%. Gotcha kept from the dropped flow-warp class (2026-09-21, harness
   `onnx\fwnan`): TRT-RTX 1.6.1.120 miscompiles an Expand of batch-1 inputs that feed both a
@@ -1157,7 +1155,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_TRT_CACHE_KIND` | suffix for the JIT cache file (live sets `live`) |
 | `SMV_RIFE_SAFEPAD=1` / `SMV_LIVE_SAFEPAD=1` | restore the 1152x640 RIFE safe-zone pad |
 | `SMV_RIFE_FLOW_SCALE` | diagnostic live flow pyramid scale (power of two in 0.25..1.0, forces a cold engine) |
-| `SMV_RIFE_BATCH` | RIFE batching: offline `1` = the unbatched engine (else the fixed class of the multiplier); live `N` = at most N timesteps a call |
+| `SMV_RIFE_BATCH` | offline RIFE batching: `1` = the unbatched engine (else the fixed class of the multiplier, or the unbatched engine when that class does not fit in the free video memory) |
 | `SMV_LIVE_XQPHASE=1`, `SMV_LIVE_XQ_CAPEV=1`, `SMV_LIVE_XQ_WAITCAP=1` | present-loop phase breakdown, event-driven capture probe, 1 ms wait cap (each about 0.4%) |
 | `SMV_LIVE_HDR` | force live HDR on or off |
 | `SMV_LIVE_RESIDENT=0` / `SMV_LIVE_RESIDENT_IDLE_S` | one `smv-live.exe` per live session instead of the resident host / the resident host's idle limit in seconds (default 600) |
@@ -1172,7 +1170,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NR_MV=0` | DLSS 5 gets no motion vectors (both routes; offline: the pre-2026-09-27 pass, live: every frame a Reset); a measurement lever, never a product setting |
 | `SMV_NR_REUSE=0` | DLSS 5 evaluates every frame, also one identical to the previous one (both routes; by default an identical frame reuses the last output, so a paused picture stays still); the A/B and trigger-test lever, never a product setting |
 | `SMV_NR_AUTOMASK=0` | DLSS 5 runs with `DLSSNR.UseAutoMask` 0 (both routes, read by the NR core); a measurement lever, never a product setting |
-| `SMV_VRAM_CAP=0` | no video memory limit: DLSS 5 builds every pass asked for and live RIFE / Frame Blend keep their batch of up to 8, whatever the GPU has free (both routes); the A/B lever of the cap, never a product setting |
+| `SMV_VRAM_CAP=0` | no video memory limit: offline RIFE / Frame Blend keep the fixed class of the multiplier, whatever the GPU has free; the A/B lever of the cap, never a product setting |
 | `SMV_VRAM_MIB=<MiB>` | the GPU's memory as the app's memory checks see it, the free memory shrinks with it (both routes): a smaller card's trigger test of the cap and of the `video memory ran out` line on a card everything fits in |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |

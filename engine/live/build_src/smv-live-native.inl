@@ -3139,9 +3139,6 @@ struct NativeRife
     nvinfer1::IRuntimeCache* jit = nullptr;
     nvinfer1::IExecutionContext* ctxIf = nullptr;
     nvinfer1::IExecutionContext* ctxEnc = nullptr;
-    // the IFNet context's activations when the host sizes them (an engine with a timestep batch axis: the
-    // batches the session runs, nativeIfnetMemory), freed after the context
-    void* dIfMem = nullptr;
     bool encHalf = true;
     bool featHalf = false; // IFNet / block0 take f0 / f1 in fp16: the encode writes dF directly
     // the IFNet's x / the encode's img in fp16 (read off each engine on its own, so a cache that
@@ -3400,7 +3397,7 @@ struct NativeResident
     bool xHalf = false, imgHalf = false, outHalf = false, tHalf = false;
     int dev = 0;
     // memoised handoff: nativeHandoff's session key (gen left out: the fast path ignores gen and
-    // the cold path builds the fixed 1to8 class regardless) and the facts it answered with
+    // the cold path builds the same engines whatever the gen) and the facts it answered with
     std::wstring handoffKey;
     NativeRife facts;
     bool haveFacts = false;
@@ -4253,26 +4250,14 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
                         tail);
         return true;
     }
-    // rife / blend / rifedrba: the batched class (a timestep batch of 1 to 8, `_bd8`) unless a
-    // build marked it "did not fit" at this size, then the unbatched one
+    // rife / blend / rifedrba: the unbatched IFNet, one in-between frame a call (the class offline runs
+    // for a single tween): faster than the batched class at 1080p, within a few percent of it at 540p and
+    // below, at a fraction of its video memory and without the wait for a batch before a pair's first frame
     const bool drba = s.drba;
-    int batch = 8;
-    std::string base = lkIfnetBase(s, t) + "_bd8";
-    std::vector<std::vector<LkShape>> sets = {lkIfnetSet(s, 8), lkIfnetSet(s, 1)};
-    {
-        const std::string p = cacheDir + "\\" + lkEngineName(base, sets[0], "timestep", 1, 8, t) + ".engine";
-        if (!lkFile(p) && lkFile(p + ".nofit"))
-        {
-            LOG("native: batched engine marked \"did not fit\" at %dx%d, looking up the unbatched engine\n", s.ipw,
-                s.iph);
-            batch = 0;
-            base = lkIfnetBase(s, t);
-            sets = {lkIfnetSet(s, 1)};
-        }
-    }
+    const int batch = 0;
     std::string ipath, epath;
     LkIo iio, eio;
-    if (!lkFind(rt, cacheDir, base, sets, batch ? "timestep" : nullptr, 1, batch, t, ipath, iio))
+    if (!lkFind(rt, cacheDir, lkIfnetBase(s, t), {lkIfnetSet(s, 1)}, nullptr, 1, batch, t, ipath, iio))
         return false;
     if (!lkRifeIo(iio, true))
         return false;
@@ -4695,49 +4680,26 @@ static bool lkEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTag
     return lkWarmEngine(rt, path, warmSets, warmKey, st, oom);
 }
 
-// the RIFE family: the IFNet (the batched class first, the unbatched one when it did not fit),
-// the encoder, and DRBA's block0 flow engine
+// the RIFE family: the unbatched IFNet, the encoder, and DRBA's block0 flow engine
 static bool lkBuildRife(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTags& t, cudaStream_t st)
 {
-    auto path = [&](const std::string& base, const std::vector<LkShape>& set, bool dyn) {
-        return s.cacheDir + "\\" + lkEngineName(base, set, dyn ? "timestep" : nullptr, dyn ? 1 : 0, dyn ? 8 : 0, t) +
-               ".engine";
+    auto path = [&](const std::string& base, const std::vector<LkShape>& set) {
+        return s.cacheDir + "\\" + lkEngineName(base, set, nullptr, 0, 0, t) + ".engine";
     };
     bool oom = false;
     const std::string ibase = lkIfnetBase(s, t);
-    const std::vector<LkShape> bset = lkIfnetSet(s, 8), uset = lkIfnetSet(s, 1);
-    const std::string bpath = path(ibase + "_bd8", bset, true);
-    bool batched = !lkFile(bpath + ".nofit") || lkFile(bpath);
-    if (batched)
-    {
-        std::vector<std::vector<LkShape>> sets;
-        for (int b : {8, 1, 2, 3, 4, 5, 6, 7})
-            sets.push_back(lkIfnetSet(s, b)); // the warm order: B, then 1..B-1
-        if (!lkEnsure(rt, s, t, bpath, ibase + "_bd8", bset, "timestep", 1, 8, 1, sets, s.warmKey, st, &oom))
-        {
-            if (!oom)
-                return false;
-            batched = false;
-            char why[160];
-            sprintf_s(why, "%dx%d: the batched engine did not fit (host build)\n", s.ipw, s.iph);
-            if (!lkWriteFile(bpath + ".nofit", why, strlen(why)))
-                LOG("native: cannot write %s.nofit, the next start retries the batched build\n", bpath.c_str());
-            LOG("native: batched engine did not fit at %dx%d, marked; building the unbatched engine\n", s.ipw, s.iph);
-        }
-    }
-    if (!batched &&
-        !lkEnsure(rt, s, t, path(ibase, uset, false), ibase, uset, nullptr, 0, 0, 1, {uset}, s.warmKey, st, &oom))
+    const std::vector<LkShape> uset = lkIfnetSet(s, 1);
+    if (!lkEnsure(rt, s, t, path(ibase, uset), ibase, uset, nullptr, 0, 0, 1, {uset}, s.warmKey, st, &oom))
         return false;
     const std::vector<LkShape> eset = {{"img", {1, 3, s.iph, s.ipw}}};
     const std::string ebase = lkEncodeBase(s, t);
-    if (!lkEnsure(rt, s, t, path(ebase, eset, false), ebase, eset, nullptr, 0, 0, 1, {eset}, std::string(), st, &oom))
+    if (!lkEnsure(rt, s, t, path(ebase, eset), ebase, eset, nullptr, 0, 0, 1, {eset}, std::string(), st, &oom))
         return false;
     if (s.drba)
     {
         const std::vector<LkShape> b0set = lkBlock0Set(s);
         const std::string b0base = lkBlock0Base(s, t);
-        if (!lkEnsure(rt, s, t, path(b0base, b0set, false), b0base, b0set, nullptr, 0, 0, 1, {b0set}, s.warmKey, st,
-                      &oom))
+        if (!lkEnsure(rt, s, t, path(b0base, b0set), b0base, b0set, nullptr, 0, 0, 1, {b0set}, s.warmKey, st, &oom))
             return false;
     }
     return true;
@@ -4850,20 +4812,29 @@ static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int 
     return done;
 }
 
+static uint64_t nativeVideoMemoryRoom();
+
 // ---- offline RIFE engines -------------------------------------------------------------------
 // The offline host finds, builds and warms its own IFNet + Head engines. The classes are the ones
 // trt_lookup._rife_ifnet_spec names for offline: x2 = the unbatched IFNet, xN = the FIXED batch
 // class `_b{N-1}` (every group exactly full), pinned to the /64 pad of the source. The per-B
 // ONNX never ships, so a fixed class is built from the shipped `_bd8` graph with its batch axis
 // pinned to B (bit-exact with an engine built from a per-B `_b{B}` export). A batched
-// build that runs out of memory is marked `.nofit` and the unbatched engine serves, as live.
+// build that runs out of memory is marked `.nofit` and the unbatched engine serves.
+// The batched class is also taken only while its extra timesteps fit in the free video memory
+// beside the render's other needs (others, nativeOfflineNeed): the unbatched engine makes the
+// same in-between frames in more calls, where a spill into system memory slows the whole PC.
 struct OfflineEngines
 {
     std::string ifnet, encode, jit;
     int ph = 0, pw = 0, batch = 1;
 };
 
-static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, OfflineEngines& o)
+// What each timestep of a batched IFNet class takes beyond the first, in MiB a padded megapixel:
+// its activations (387) and tween buffers (offline x4 renders: 189 / 857 MiB at 854x480 / 1920x1080)
+constexpr double kIfnetStepMp = 411.0;
+
+static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, OfflineEngines& o, uint64_t others = 0)
 {
     LkSession s;
     if (!lkSession(script, L"rife", (uint32_t)w, (uint32_t)h, s))
@@ -4901,7 +4872,20 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, O
     };
     cudaStream_t st = nullptr;
     const std::string ibase = lkIfnetBase(s, t);
-    const int B = lkEnv("SMV_RIFE_BATCH") == "1" ? 1 : multi - 1;
+    int B = lkEnv("SMV_RIFE_BATCH") == "1" ? 1 : multi - 1;
+    const uint64_t room = B > 1 && others ? nativeVideoMemoryRoom() : 0;
+    if (room)
+    {
+        const double mib = 1048576.0;
+        const uint64_t extra = (uint64_t)((B - 1) * kIfnetStepMp * s.pw * s.ph / 1e6 * mib);
+        if (others + extra > room)
+        {
+            LOG("offline: video memory: the model runs 1 of %d in-between frames a call; a batch of %d needs about "
+                "%.0f MiB more, %.0f MiB are free beside the render's other %.0f MiB\n",
+                B, B, extra / mib, room > others ? (room - others) / mib : 0.0, others / mib);
+            B = 1;
+        }
+    }
     bool ok = false, oom = false;
     std::string base = ibase;
     std::vector<LkShape> set = lkIfnetSet(s, 1);
@@ -5491,11 +5475,9 @@ static bool nativeReadFile(const std::string& path, std::vector<char>& out)
 
 // runtime config with the SHARED JIT cache and the engine's own whole-graph capture strategy,
 // then the execution context (the per-session part: a context is sized for the engine's
-// maximum shape, 1.6 GB for the live IFNet class at 480p, and is what the resident host drops
-// between sessions; the engine itself stays). userMem: the context takes its activations from
-// the caller (setDeviceMemoryV2 before the first enqueue), sized for the shapes it will run
+// maximum shape and is what the resident host drops between sessions; the engine itself stays)
 static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfer1::IRuntimeConfig** cfgOut,
-                              nvinfer1::IExecutionContext** ctxOut, bool userMem = false)
+                              nvinfer1::IExecutionContext** ctxOut)
 {
     nvinfer1::IRuntimeConfig* cfg = eng->createRuntimeConfig();
     if (!cfg)
@@ -5503,8 +5485,6 @@ static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfe
         LOG("native: createRuntimeConfig failed\n");
         return false;
     }
-    if (userMem)
-        cfg->setExecutionContextAllocationStrategy(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
     if (!nr.jit)
     {
         nr.jit = cfg->createRuntimeCache();
@@ -5559,30 +5539,10 @@ static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfe
     return true;
 }
 
-// A timestep batch axis (the live IFNet class `_bd8`): its context takes caller-sized activations,
-// nativeIfnetMemory sizes them for the batches the session runs
-static bool nativeBatchAxis(nvinfer1::ICudaEngine* eng)
-{
-    if (!eng || eng->getNbOptimizationProfiles() < 1)
-        return false;
-    for (int i = 0; i < eng->getNbIOTensors(); i++)
-    {
-        const char* n = eng->getIOTensorName(i);
-        if (strcmp(n, "timestep") != 0 || eng->getTensorIOMode(n) != nvinfer1::TensorIOMode::kINPUT)
-            continue;
-        const nvinfer1::Dims lo = eng->getProfileShape(n, 0, nvinfer1::OptProfileSelector::kMIN);
-        const nvinfer1::Dims hi = eng->getProfileShape(n, 0, nvinfer1::OptProfileSelector::kMAX);
-        return lo.nbDims > 0 && hi.nbDims == lo.nbDims && lo.d[0] < hi.d[0];
-    }
-    return false;
-}
-
 // exact sequence from NATIVE-HOST-API-MAP.md (a): validity pre-check, deserialize, then the
-// config + context through nativeMakeContext (userMemIfBatched: caller-sized activations for an
-// engine with a timestep batch axis).
+// config + context through nativeMakeContext.
 static nvinfer1::ICudaEngine* nativeLoadEngine(NativeRife& nr, const std::string& path,
-                                               nvinfer1::IRuntimeConfig** cfgOut, nvinfer1::IExecutionContext** ctxOut,
-                                               bool userMemIfBatched = false)
+                                               nvinfer1::IRuntimeConfig** cfgOut, nvinfer1::IExecutionContext** ctxOut)
 {
     std::vector<char> blob;
     if (!nativeReadFile(path, blob))
@@ -5606,7 +5566,7 @@ static nvinfer1::ICudaEngine* nativeLoadEngine(NativeRife& nr, const std::string
         LOG("native: deserializeCudaEngine failed for %s\n", path.c_str());
         return nullptr;
     }
-    if (!nativeMakeContext(nr, eng, cfgOut, ctxOut, userMemIfBatched && nativeBatchAxis(eng)))
+    if (!nativeMakeContext(nr, eng, cfgOut, ctxOut))
     {
         delete eng;
         return nullptr;
@@ -7734,101 +7694,37 @@ static bool nativeTweenBuffers(NativeRife& nr)
     return true;
 }
 
-static uint64_t nativeVideoMemoryRoom();
-
 // RTX HDR's and RTX VSR's video memory in MiB, by the megapixels of the model frame they take in (the
 // bridge's NGX features and their frames, a quarter on top of the measured: a live session's own
 // dedicated memory with and without the feature, 82 / 226 MiB for RTX HDR at 854x480 / 1920x1080,
 // 174 / 524 MiB for RTX VSR from those into a 2560x1440 Fill)
 constexpr double kRtxHdrBase = 58.0, kRtxHdrMp = 109.0, kRtxVsrBase = 109.0, kRtxVsrMp = 264.0;
 
-// What the passes built after the IFNet take on a live session, in bytes: RTX HDR and RTX VSR
-// (nativeRtxInit), then DLSS 5's passes (nativeLiveNrInit, priced as nr_host prices its chain), so the
-// IFNet's batch gives way before DLSS 5 cuts a pass: a smaller batch only runs more calls
-static uint64_t nativeLaterNeed(const NativeRife& nr)
+// Restore's video memory in MiB a megapixel of the decoded frame (its engine 145 MiB at 854x480, a quarter on top)
+constexpr double kRestoreMp = 445.0;
+
+// What an offline RIFE-family render takes besides its IFNet's extra timesteps, in bytes, before any engine or
+// buffer exists (lkOfflineRife's batch choice): the render with one tween a call (276 MiB + 427 a padded megapixel of
+// the IFNet frame, its activations and the encoder, + 218 a padded megapixel of the pictures at the working size; 572
+// / 1624 MiB measured at 854x480 / 1920x1080), DLSS 5's passes at the working size (nr_host's per-pass constants), RTX HDR,
+// RTX VSR and Restore. ifw x ifh = the IFNet's frame, w x h = the working size, sw x sh = the decoded frame.
+static uint64_t nativeOfflineNeed(int ifw, int ifh, int w, int h, int sw, int sh)
 {
-    const double mib = 1048576.0, mp = (double)nr.w * nr.h / 1e6;
-    double need = 0.0;
-    if (nr.rtxHdr)
-        need += kRtxHdrBase + kRtxHdrMp * mp;
-    if (nr.vsrWant)
-    {
-        const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
-        if ((tw > nr.w && th > nr.h) || (nr.w > nr.cw && nr.h > nr.ch))
-            need += kRtxVsrBase + kRtxVsrMp * mp;
-    }
-    if (g_liveNrCuda && (uint64_t)nr.w * nr.h <= 3840ull * 2160ull)
+    auto padMp = [](int a, int b) { return (double)((a + 63) / 64 * 64) * ((b + 63) / 64 * 64) / 1e6; };
+    const double mib = 1048576.0, mp = (double)w * h / 1e6;
+    double need = 276.0 + 427.0 * padMp(ifw, ifh) + 218.0 * padMp(w, h);
+    if (g_dlssnr)
     {
         const int p = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
         need += p * (nr::kPassBase + nr::kPassMp * mp) + nr::kAfterBase + nr::kAfterMp * mp + nr::kFrameMp * mp * p;
     }
+    if (g_rtxHdr)
+        need += kRtxHdrBase + kRtxHdrMp * mp;
+    if (g_rtxVsr)
+        need += kRtxVsrBase + kRtxVsrMp * mp;
+    if (g_restore)
+        need += kRestoreMp * (double)sw * sh / 1e6;
     return (uint64_t)(need * mib);
-}
-
-// The live IFNet's activations, for an engine with a timestep batch axis (the context was made with
-// caller-sized memory): sized for the batches the session runs, one timestep for DRBA, up to batchMax
-// for RIFE and Frame Blend, lowered to the largest batch whose activations and tween buffers fit in the
-// free video memory beside the passes built after it. A batch computes the same tweens in either size of
-// memory; a smaller batch runs more calls a group, its kernels differing by rounding (0.01 dB, a pan).
-static bool nativeIfnetMemory(NativeRife& nr)
-{
-    if (!nr.ctxIf || !nativeBatchAxis(nr.engIf))
-        return true;
-    int top = nr.drba ? 1 : (nr.batchMax < 1 ? 1 : (nr.batchMax > 8 ? 8 : nr.batchMax));
-    // SMV_RIFE_BATCH=N: at most N timesteps a call (a measurement lever; offline, 1 = the unbatched engine)
-    const int lever = atoi(lkEnv("SMV_RIFE_BATCH").c_str());
-    if (lever >= 1 && lever < top)
-        top = lever;
-    auto shapes = [&](int b) -> bool {
-        for (const char* n : {"x", "timestep", "f0", "f1"})
-        {
-            nvinfer1::Dims d = nr.engIf->getProfileShape(n, 0, nvinfer1::OptProfileSelector::kMAX);
-            if (!strcmp(n, "timestep"))
-                d.d[0] = b;
-            if (!nr.ctxIf->setInputShape(n, d))
-                return false;
-        }
-        return true;
-    };
-    // nativeTweenBuffers' allocations for batch b (DRBA's are one timestep whatever the batch)
-    const size_t plane = (size_t)nr.ph * nr.pw, mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
-    auto buffers = [&](int b) -> uint64_t {
-        const size_t n = nr.drba ? 1 : (size_t)b;
-        return n * (mplane * ((nr.tHalf ? 2 : 4) + 8 + 2) + plane * 6);
-    };
-    uint64_t act[9] = {};
-    for (int b = 1; b <= top; b++)
-    {
-        act[b] = shapes(b) ? nr.ctxIf->updateDeviceMemorySizeForShapes() : 0;
-        if (!act[b])
-        {
-            LOG("native: the IFNet's activation size for %d timesteps is unknown\n", b);
-            return false;
-        }
-    }
-    int b = top;
-    const uint64_t room = nativeVideoMemoryRoom(), later = room ? nativeLaterNeed(nr) : 0;
-    if (room)
-        while (b > 1 && act[b] + buffers(b) + later > room)
-            b--;
-    if (!shapes(b))
-        return false;
-    const size_t bytes = nr.ctxIf->updateDeviceMemorySizeForShapes();
-    NCHK(cudaMalloc(&nr.dIfMem, bytes), "alloc IFNet activations");
-    nr.ctxIf->setDeviceMemoryV2(nr.dIfMem, (int64_t)bytes);
-    const double mib = 1048576.0;
-    const uint64_t full = (uint64_t)nr.engIf->getDeviceMemorySizeV2();
-    if (nr.drba)
-        LOG("native: DRBA's IFNet runs one timestep a call: its activations take %.0f MiB, not the %.0f MiB of "
-            "its engine's largest batch\n",
-            bytes / mib, full / mib);
-    else if (b < top)
-        LOG("native: video memory: the model runs %d of up to %d in-between frames a call (about %.0f MiB); %d need "
-            "about %.0f MiB, %.0f MiB are free beside the passes built next\n",
-            b, top, (act[b] + buffers(b)) / mib, top, (act[top] + buffers(top)) / mib,
-            (room > later ? room - later : 0) / mib);
-    nr.batchMax = b;
-    return true;
 }
 
 // k_motionIn's HDR curve, in units of SDR white: the SDR range passes exactly (what an SDR source
@@ -8059,11 +7955,11 @@ static bool nativeTrtInit(NativeRife& nr)
         // the runtime, the jit cache and, per path, the restore engine
         if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
         {
-            if (!nativeMakeContext(nr, nr.engIf, &nr.cfgIf, &nr.ctxIf, nativeBatchAxis(nr.engIf)))
+            if (!nativeMakeContext(nr, nr.engIf, &nr.cfgIf, &nr.ctxIf))
                 return false;
             if (!nativeMakeContext(nr, nr.engEnc, &nr.cfgEnc, &nr.ctxEnc))
                 return false;
-            if (!nativeIfnetMemory(nr) || !nativeTweenBuffers(nr))
+            if (!nativeTweenBuffers(nr))
                 return false;
         }
         // the restore engine follows its own path: kept when the same one is asked for again,
@@ -8106,7 +8002,7 @@ static bool nativeTrtInit(NativeRife& nr)
     }
     if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
     {
-        nr.engIf = nativeLoadEngine(nr, nr.ifnetPath, &nr.cfgIf, &nr.ctxIf, true);
+        nr.engIf = nativeLoadEngine(nr, nr.ifnetPath, &nr.cfgIf, &nr.ctxIf);
         if (!nr.engIf)
             return false;
         nr.engEnc = nativeLoadEngine(nr, nr.encodePath, &nr.cfgEnc, &nr.ctxEnc);
@@ -8178,7 +8074,7 @@ static bool nativeTrtInit(NativeRife& nr)
             return false;
         }
         nr.imgHalf = id == nvinfer1::DataType::kHALF;
-        if (!nativeIfnetMemory(nr) || !nativeTweenBuffers(nr))
+        if (!nativeTweenBuffers(nr))
             return false;
     }
     // RIFE's two domains live: the motion frames are fp16, the engines must take fp16 frames
@@ -8247,11 +8143,6 @@ static void nativeFree(NativeRife& nr)
     {
         delete nr.ctxIf;
         nr.ctxIf = nullptr;
-    }
-    if (nr.dIfMem)
-    {
-        cudaFree(nr.dIfMem);
-        nr.dIfMem = nullptr;
     }
     if (nr.ctxEnc)
     {
@@ -9827,7 +9718,6 @@ static bool nativeLiveNrInit(NativeRife& nr)
     set.tone = (float)(g_nrTone < 0.0 ? 0.0 : (g_nrTone > 2.0 ? 2.0 : g_nrTone));
     set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 1;
     set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
-    set.memoryRoom = nativeVideoMemoryRoom(); // the passes that fit in the free video memory
     // SMV_NR_MV=0 = no motion (a measurement lever); without motion every frame is a Reset, since kept
     // history with no motion slides; SMV_NR_AUTOMASK=0 = the mask off (read by the core)
     wchar_t mvv[8]{}, amv[8]{}, ru[8]{}, re[8]{};
@@ -10982,7 +10872,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         {
             if (twDone >= chunkBase + chunkLen)
             {
-                // next chunk of tweens: no padding, the engine's batch axis is dynamic
+                // next chunk of tweens, up to the engine's batch (1 for the unbatched class; offline's
+                // fixed class takes a whole group)
                 chunkBase = twDone;
                 chunkLen = nTween - chunkBase;
                 if (chunkLen > (uint32_t)nr.batchMax)

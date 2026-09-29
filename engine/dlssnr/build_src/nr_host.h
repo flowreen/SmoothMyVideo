@@ -46,10 +46,6 @@ struct Settings
     // input, each pass its OWN feature and history (one feature called twice a frame would see two
     // evaluations with no motion between them), all fed the same motion field
     int passes = 1;
-    // the video memory the chain may take, in bytes (0 = no limit): a pass after the first is built
-    // only while the chain with it fits, so the chain ends at the passes that fit (passNote says so)
-    // instead of spilling into system memory
-    uint64_t memoryRoom = 0;
 };
 
 const int kMaxPasses = 10;
@@ -150,11 +146,6 @@ class Host
     }
     LUID adapterLuid() const;
 
-    // The video memory this process has committed on the core's adapter, in bytes (the part Windows
-    // moved to system memory because it did not fit counts too). false = the adapter does not
-    // report it.
-    bool videoMemory(uint64_t& held) const;
-
     // One frame through the shared buffers: the queue waits until the fence reaches waitValue
     // (the caller signals it once the input buffer holds the frame), copies it into Color,
     // evaluates, copies Output into the output buffer and signals signalValue. Returns without
@@ -229,8 +220,6 @@ class Host
     std::wstring m_corePath, m_snippetPath, m_shimPath;
 
     CP<ID3D12Device> m_dev;
-    CP<IDXGIAdapter3> m_adapter; // the device's adapter (videoMemory)
-    uint64_t m_heldStart = 0;    // videoMemory's held before the core's first resource
     CP<ID3D12CommandQueue> m_queue;
     CP<ID3D12CommandAllocator> m_alloc;
     CP<ID3D12GraphicsCommandList> m_list;
