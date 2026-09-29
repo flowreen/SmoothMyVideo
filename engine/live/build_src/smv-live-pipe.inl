@@ -69,6 +69,8 @@ struct PipeServer
             // the cudart import library is a lazy loader stub that opens the DLL by name on the
             // first call, so every CUDA call sits behind nativeLoadDlls
             bool ok = nativeLoadDlls(script) && nativeConfigHdr(*early);
+            if (ok)
+                nativeVideoMemoryMark();
             bool devOk = false;
             std::thread devTh;
             if (ok)

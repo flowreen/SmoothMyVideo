@@ -159,8 +159,8 @@ const char* const kProjectId = "53f803cc-a12f-4d69-90d5-19b7599cad19";
 
 static const DXGI_FORMAT kFmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-// Direct (no shim) route: the call originates inside dlssnr.exe. Kept so the
-// phase 0 probe can show whether the caller validation is real.
+// Direct (no shim) route (Variant::useShim false): the call originates inside the host exe,
+// the control case for the runtime's caller validation.
 static NVSDK_NGX_Result directInit(void* fn, int argOrder, const char* projectId, NVSDK_NGX_EngineType engineType,
                                    const char* engineVersion, const wchar_t* dataPath, ID3D12Device* device,
                                    const NVSDK_NGX_FeatureCommonInfo* featureInfo, NVSDK_NGX_Version sdkVersion)
@@ -458,6 +458,7 @@ bool Host::createDevice(std::string& err)
         err = m_wantAdapter ? "no D3D12 adapter matches the CUDA device" : "no D3D12 capable adapter";
         return false;
     }
+    adapter.As(&m_adapter);
 
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -640,6 +641,8 @@ int Host::startup(uint32_t w, uint32_t h, const Settings& s, const Variant& v, s
         return 2;
     if (!createDevice(err))
         return 2;
+    if (!videoMemory(m_heldStart))
+        m_heldStart = 0;
     if (!createCommandObjects(err))
         return 2;
     if (!createResources(err))
@@ -782,6 +785,11 @@ int Host::initNgx(std::string& err)
         return sCreate ? sCreate(pCreate, m_list.Get(), kFeatureId, p, f)
                        : ((PFN_NGX_CreateFeature)pCreate)(m_list.Get(), (NVSDK_NGX_Feature)kFeatureId, p, f);
     };
+    // Settings::memoryRoom: the chain is counted against it as it is built, from the process's video
+    // memory (prev = before the pass built last, so held - prev is what that pass took; every pass
+    // of a chain takes the same)
+    uint64_t held = 0, prev = 0;
+    const bool roomed = m_set.memoryRoom > 0 && videoMemory(prev);
     m_last = create(m_params, &m_feature);
     if (m_last != NVSDK_NGX_Result_Success || !m_feature)
     {
@@ -796,6 +804,26 @@ int Host::initNgx(std::string& err)
     m_passNote.clear();
     for (int k = 1; k < wanted; ++k)
     {
+        if (roomed && videoMemory(held))
+        {
+            // a chain of k + 1 passes: what the core holds now plus one more pass, less the frames
+            // between the passes a chain that ends there gives back; after the creation the
+            // caller's handoff and motion buffers and the first frames add kAfter* and each pass
+            // kFrameMp a megapixel
+            const double mp = (double)m_w * m_h / 1e6, mib = 1048576.0;
+            const double back = (double)(wanted - 2 - k > 0 ? wanted - 2 - k : 0) * (double)m_w * m_h * 8.0;
+            const double need = (double)(held - m_heldStart) + (double)(held - prev) - back +
+                                (kAfterBase + kAfterMp * mp + kFrameMp * mp * (k + 1)) * mib;
+            if (need > (double)m_set.memoryRoom)
+            {
+                char b[160];
+                snprintf(b, sizeof(b), "video memory: %d passes need about %.0f MiB, %.0f MiB are free", k + 1,
+                         need / mib, (double)m_set.memoryRoom / mib);
+                m_passNote = b;
+                break;
+            }
+            prev = held;
+        }
         NVSDK_NGX_Parameter* p = nullptr;
         NVSDK_NGX_Result r = m_shim ? sAlloc(pAlloc, &p) : ((PFN_NGX_AllocParams)pAlloc)(&p);
         if (r != NVSDK_NGX_Result_Success || !p)
@@ -815,6 +843,10 @@ int Host::initNgx(std::string& err)
         m_pfeature[k] = f;
         m_passes = k + 1;
     }
+    // a chain cut short: the frames between the passes that were not built go (the last built pass
+    // keeps the one it was created with)
+    for (int k = m_passes; k + 1 < kMaxPasses; ++k)
+        m_passOut[k].Reset();
     if (!runCommandList(err))
         return 2;
     return 0;
@@ -1014,6 +1046,15 @@ LUID Host::adapterLuid() const
     if (m_dev)
         l = m_dev->GetAdapterLuid();
     return l;
+}
+
+bool Host::videoMemory(uint64_t& held) const
+{
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (!m_adapter || FAILED(m_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        return false;
+    held = info.CurrentUsage;
+    return true;
 }
 
 void Host::closeSharedHandles()
@@ -1240,6 +1281,7 @@ void Host::shutdown()
     m_alloc.Reset();
     m_queue.Reset();
     m_fence.Reset();
+    m_adapter.Reset();
     m_dev.Reset();
     if (m_fenceEvent)
     {
@@ -1284,6 +1326,7 @@ void Host::abandon()
     m_alloc.Reset();
     m_queue.Reset();
     m_fence.Reset();
+    m_adapter.Reset();
     m_dev.Reset();
     if (m_fenceEvent)
     {

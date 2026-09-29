@@ -83,6 +83,7 @@
 #include <sl_dlss_g.h>
 #include <sl_reflex.h>
 #include <sl_pcl.h>
+#include <nvapi.h> // the GPU's free video memory as its driver counts it (nativeVideoMemory)
 
 using Microsoft::WRL::ComPtr;
 namespace wgc = winrt::Windows::Graphics::Capture;
@@ -126,7 +127,7 @@ static std::wstring g_script;     // --script: any path inside the engine folder
 
 // The host finds the runtime DLLs, the engine cache, engine\onnx and the weights relative to
 // the engine folder, which it takes as the folder of this path. The file name is never opened:
-// it is the python live server's script path that callers (render.py, harnesses) still pass.
+// callers (src/render, harnesses) pass engine/live_server.py, the old live server's path.
 // Shipped layout: engine\live\smv-live.exe, so the default is one level up.
 static std::wstring engineScript(const std::wstring& exeDir)
 {
@@ -168,7 +169,7 @@ static int g_nrStyle = 1;                      // --nr-style N (DLSSNR.Style: 0 
 static int g_nrPasses = 1;                     // --nr-passes N (1..nr::kMaxPasses: DLSS 5 chained N times per frame)
 static bool g_nrNative = false;                // DLSS 5 NR runs inside this exe (the native host's pass); the
                                                // server is then NOT told --dlssnr
-static bool g_liveNrCuda = false;              // live DLSS 5 in NVIDIA's order: the native host runs it on the
+static bool g_liveNrCuda = false;              // live DLSS 5: the native host runs it on the
                                                // model frame after Restore and the resize (nativeLiveNrInit)
 static std::atomic<bool> g_liveNrReset{false}; // the overlay was hidden: the next evaluate starts a new stream
 static bool g_nrAttempted = false;             // NGX was initialised in this process (even if it then
@@ -720,11 +721,11 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 //               (no --ifnet = the host finds or builds the engines itself, lkOfflineRife)
 //               the per-frame passes: [--out-w W --out-h H] [--restore] [--rtx-vsr]
 //               [--dlssnr --nr-structure F --nr-tone F --nr-style N [--nr-delta PATH]] [--sharpen S] [--rtx-hdr ...]
-// Raw frames in on stdin (W*H*bpp each, the decoder pipe render.py already runs), raw frames out on
+// Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
 // stdout in the same pixfmt (the encoder pipe). Real frames go out from the host buffer they came
 // in (bit exact); the N-1 tweens of every pair run pack-in, Head encode, batched IFNet, pack-out and
 // a pinned download on the compute stream. stderr carries the log plus the PROGRESS k/total and
-// OUTFRAMES n lines render.py forwards to the GUI. Python never sees a pixel on this route.
+// OUTFRAMES n lines src/render forwards to the GUI.
 struct OfflineIo
 {
     size_t frameBytes = 0, frameBytesOut = 0;
@@ -1293,6 +1294,7 @@ struct OfflineArgs
     std::wstring
         hdrFramesW; // --hdr-frames PATH: one statistics line per output frame, appended + flushed (the resume prefix)
     std::wstring nrDeltaW;          // --nr-delta PATH: DLSS 5's per-pixel change, float32 (the preview's mask)
+    int srcHdr = 0;                 // --src-hdr pq|hlg: the source is HDR video (1 PQ, 2 HLG), 0 = SDR
     std::wstring thumbW, thumbOffW; // --thumb PATH / --thumb-off FILE: the GUI's progress thumbnail (OfflineIo)
 };
 
@@ -1393,7 +1395,7 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.skipIn = (uint64_t)_wtoi64(argv[++i]);
         else if (wcscmp(argv[i], L"--hdr-frames") == 0 && i + 1 < argc)
             oa.hdrFramesW = argv[++i];
-        // the passes, NVIDIA's order: Restore, the resize, DLSS 5, FSR, RTX HDR, the model, the final resize
+        // the passes in order: Restore, the resize, DLSS 5, FSR, RTX HDR, the model, the final resize
         else if (wcscmp(argv[i], L"--out-w") == 0 && i + 1 < argc)
             oa.outW = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--out-h") == 0 && i + 1 < argc)
@@ -1440,6 +1442,17 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_nrPasses = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-delta") == 0 && i + 1 < argc)
             oa.nrDeltaW = argv[++i];
+        // the source's HDR transfer from the probe: DLSS 5 then sees its SDR range, as live's HDR does
+        else if (wcscmp(argv[i], L"--src-hdr") == 0 && i + 1 < argc)
+        {
+            const wchar_t* v = argv[++i];
+            oa.srcHdr = wcscmp(v, L"pq") == 0 ? 1 : (wcscmp(v, L"hlg") == 0 ? 2 : -1);
+            if (oa.srcHdr < 0)
+            {
+                LOG("offline: --src-hdr takes pq or hlg\n");
+                return 1;
+            }
+        }
         else if (wcscmp(argv[i], L"--thumb") == 0 && i + 1 < argc)
             oa.thumbW = argv[++i];
         else if (wcscmp(argv[i], L"--thumb-off") == 0 && i + 1 < argc)
@@ -1506,7 +1519,7 @@ static int runOffline(int argc, wchar_t** argv)
 static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, bool namedPipes)
 {
     int w = oa.w, h = oa.h; // not const: kernel argument arrays take their addresses as void*
-    // NVIDIA's order at the working size (--work-w / --work-h, the DLSS mode x the output): the
+    // The passes at the working size (--work-w / --work-h, the DLSS mode x the output): the
     // decoded frame (srcW x srcH) goes through Restore and the resize to the working size first, the
     // model and DLSS 5 run at it (w x h from here on), the emit's final resize takes it to the output.
     // Without the flags the decoded size is the working size and Restore runs in the emit.
@@ -1532,7 +1545,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nvPre = true;
             w = oa.workW;
             h = oa.workH;
-            LOG("offline: NVIDIA order: Restore and the resize on the decoded %dx%d first, DLSS 5 and the "
+            LOG("offline: Restore and the resize on the decoded %dx%d first, DLSS 5 and the "
                 "interpolation at %dx%d%s\n",
                 srcW, srcH, w, h, (w != ow || h != oh) ? ", then the final resize" : "");
         }
@@ -1626,13 +1639,17 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     else if (!oa.nvof && !oa.echo && ifnetW.empty())
     {
-        // DRBA: the unbatched IFNet (one tween per enqueue, its own DRM timestep map)
-        // plus the block0 flow engine
-        if (!lkOfflineRife(script, w, h, oa.drba ? 2 : multi, oe))
+        // RIFE's two domains: the IFNet finds the motion on the finished picture in SDR sRGB at the
+        // decoded size (the PQ encoding and an enlarge cost RIFE its motion, measured on an exact pan)
+        // and its last step, the warp + blend, runs on the pictures at the working size.
+        // SMV_RIFE_TWO_DOMAIN=0: the IFNet reads the pictures. DRBA: the unbatched IFNet (one tween per
+        // enqueue, its own DRM timestep map) plus the block0 flow engine, at the same frame
+        const bool two = lkEnv("SMV_RIFE_TWO_DOMAIN") != "0";
+        if (!lkOfflineRife(script, two ? srcW : w, two ? srcH : h, oa.drba ? 2 : multi, oe))
             return 2;
         if (oa.drba)
         {
-            if (!lkOfflineBlock0(script, w, h, nr.block0Path, nr.block0Jit))
+            if (!lkOfflineBlock0(script, two ? srcW : w, two ? srcH : h, nr.block0Path, nr.block0Jit))
                 return 2;
             nr.drba = true;
         }
@@ -1641,6 +1658,18 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.jitPath = oe.jit;
         nr.ph = oe.ph;
         nr.pw = oe.pw;
+        if (two)
+        {
+            nr.mph = oe.ph;
+            nr.mpw = oe.pw;
+            nr.mw = srcW;
+            nr.mh = srcH;
+            if (w != srcW || h != srcH)
+            {
+                nr.ph = (h + 63) / 64 * 64; // the pictures at the working size
+                nr.pw = (w + 63) / 64 * 64;
+            }
+        }
         nr.w = w;
         nr.h = h;
         nr.cw = w;
@@ -1704,7 +1733,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         LOG("offline: --rtx-hdr and --out-pixfmt x2rgb10le go together\n");
         return 1;
     }
-    // (NVIDIA order: every frame through the passes; the raw-copy real frames would be source-size)
+    // (every frame goes through the passes; the raw-copy real frames would be source-size)
     const bool passes = g_sharpen > 0.0 || g_restore || outW != w || outH != h || g_rtxHdr || g_dlssnr || nvPre;
     if (passes && !nativeConfigHdr(nr))
         return 2; // the sharpen strength and RTX VSR's availability (g_hdr is off)
@@ -1761,6 +1790,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     const int64_t tStart = nowQpc100();
 
     // CUDA: device 0, one non-blocking compute stream, the kernels, the model buffers
+    nativeVideoMemoryMark();
     if (cudaSetDevice(0) != cudaSuccess || cudaFree(nullptr) != cudaSuccess)
     {
         LOG("offline: CUDA init failed\n");
@@ -1789,14 +1819,18 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         return true;
     };
+    // the IFNet's timestep and tween buffers follow once the engine's dtypes are known
+    // (nativeTrtInit's nativeTweenBuffers)
+    // the model's frame: the pictures' own (ph x pw), or RIFE's motion frame at the decoded size (mph x mpw,
+    // never larger: the working size is at least the decoded one), which the IFNet reads instead of dX / dXh
+    const size_t mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
     if (!cm((void**)&nr.dX, 6 * plane * sizeof(float), "x") ||
-        (!nr.nvof && !nr.noEngine && !nr.gmfss && !nr.fruc && !oa.dlssg &&
-         (!cm((void**)&nr.dF[0], 16 * plane * sizeof(float), "f0") ||
-          !cm((void**)&nr.dF[1], 16 * plane * sizeof(float), "f1") ||
-          !cm((void**)&nr.dEncHalf, 16 * plane * sizeof(uint16_t), "enc") ||
-          !cm((void**)&nr.dXh, 6 * plane * sizeof(uint16_t), "x fp16") ||
-          !cm((void**)&nr.dT, (size_t)batchMax * plane * sizeof(float), "timestep") ||
-          !cm((void**)&nr.dMerged, (size_t)batchMax * 3 * plane * sizeof(float), "merged"))) ||
+        (!nr.nvof && !nr.noEngine && !nr.gmfss && !nr.fruc && !oa.dlssg && !nr.drba &&
+         (!cm((void**)&nr.dF[0], 16 * mplane * sizeof(float), "f0") ||
+          !cm((void**)&nr.dF[1], 16 * mplane * sizeof(float), "f1") ||
+          !cm((void**)&nr.dEncHalf, 16 * mplane * sizeof(uint16_t), "enc") ||
+          (nr.mph ? !cm((void**)&nr.dM, 6 * mplane * sizeof(uint16_t), "motion frames")
+                  : !cm((void**)&nr.dXh, 6 * plane * sizeof(uint16_t), "x fp16")))) ||
         !cm((void**)&dRaw[0], frameBytes, "raw0") || !cm((void**)&dRaw[1], frameBytes, "raw1") ||
         !cm((void**)&dOutRaw, (size_t)(batchMax + 1) * frameBytesOut, "rawout") ||
         !cm((void**)&nr.dStaticFlag, sizeof(int), "static flag"))
@@ -1806,24 +1840,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         LOG("offline: pinned static flag alloc failed\n");
         return 2;
     }
-    if (nr.drba)
-    {
-        // live's DRBA history: four padded frames and their encodes, the two x buffers, two
-        // windows (flow10 | flow12 + flow21), the block0 flow and its splat accumulator
-        for (int i = 0; i < 4; i++)
-            if (!cm((void**)&nr.dDrI[i], 3 * plane * sizeof(float), "drba frame ring") ||
-                !cm((void**)&nr.dDrF[i], 16 * plane * sizeof(float), "drba encode ring"))
-                return 2;
-        for (int i = 0; i < 2; i++)
-            if (!cm((void**)&nr.dDrX[i], 6 * plane * sizeof(float), "drba x") ||
-                !cm((void**)&nr.drWin[i].f10, 2 * plane * sizeof(float), "drba window") ||
-                !cm((void**)&nr.drWin[i].r, 4 * plane * sizeof(float), "drba window"))
-                return 2;
-        if (!cm((void**)&nr.dDrFlow, 4 * plane * sizeof(float), "drba flow") ||
-            !cm((void**)&nr.dDrFlowN, 4 * plane * sizeof(float), "drba flow") ||
-            !cm((void**)&nr.dDrAcc, 6 * plane * sizeof(long long), "drba accumulator"))
-            return 2;
-    }
+    // live's DRBA history: four padded frames and their encodes, the two x buffers, two windows
+    // (flow10 | flow12 + flow21), the block0 flow and its splat accumulator
+    if (nr.drba && !nativeDrbaAlloc(nr))
+        return 2;
     if (nr.restore)
     {
         // the Restore engine's x / y (sized for fp32, either dtype fits), the fold's horizontal
@@ -1844,6 +1864,18 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         return 2; // the bridge's FRUC instance and surfaces
     if ((!(nr.nvof || nr.noEngine || nr.fruc || oa.dlssg) || nr.restore) && !nativeTrtInit(nr))
         return 2;
+    if (nr.mph)
+    {
+        if (!nr.xHalf || !nr.imgHalf)
+        {
+            LOG("offline: RIFE's motion frames are fp16 but the engines take fp32 frames (an ONNX before rev 4)\n");
+            return 2;
+        }
+        LOG("offline: RIFE finds the motion on the picture at the decoded %dx%d%s, its warp + blend runs on the "
+            "%dx%d pictures\n",
+            srcW, srcH, oa.srcHdr == 1 ? " (PQ read as SDR sRGB)" : (oa.srcHdr == 2 ? " (HLG read as SDR sRGB)" : ""),
+            w, h);
+    }
     if (passes)
     {
         // the staging frame, the VSR bridge and its warm-up, the Restore fold target (the live
@@ -1853,17 +1885,17 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         if (!nr.dPres && !cm((void**)&nr.dPres, (size_t)3 * outW * outH * sizeof(float), "pass staging"))
             return 2;
     }
-    if (nvPre && !cm((void**)&nr.dSrcPl, (size_t)3 * srcW * srcH * sizeof(float), "NVIDIA order source frame"))
+    if (nvPre && !cm((void**)&nr.dSrcPl, (size_t)3 * srcW * srcH * sizeof(float), "decoded source frame"))
         return 2;
     if (g_dlssnr)
     {
-        // DLSS 5: the NR core with dlssnr.exe's own bring-up (a private D3D12 device) at the
+        // DLSS 5: the NR core with its own bring-up (a private D3D12 device) at the
         // decoded picture's size w x h: it runs once per decoded frame, before the interpolation
-        // (nativeNrFrame from the frame loop). render.py's rule: a runtime that
+        // (nativeNrFrame from the frame loop). A runtime that
         // cannot start drops the pass with a notice, never the render. NGX prints to the
         // process stdout, which is the encode pipe on a one-shot run: keep a private handle
-        // for the frames and point stdout at stderr before any NGX module loads (dlssnr.exe
-        // detachStdout). NGX has no teardown, so this process leaves through ExitProcess and
+        // for the frames and point stdout at stderr before any NGX module loads.
+        // NGX has no teardown, so this process leaves through ExitProcess and
         // a resident host ends after the item (g_nrAttempted).
         if (!namedPipes)
         {
@@ -1895,6 +1927,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         set.tone = (float)(g_nrTone < 0.0 ? 0.0 : (g_nrTone > 2.0 ? 2.0 : g_nrTone));
         set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 1;
         set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
+        set.memoryRoom = nativeVideoMemoryRoom(); // the passes that fit in the free video memory
         // Zero-copy unless the preview's change map needs the host copies or SMV_NR_STAGED=1
         // asks for CPU staging (the route A/B and the fallback's trigger test). DLSS 5 gets motion
         // vectors on the zero-copy route only (the core binds DLSSNR.MVec at create);
@@ -1927,6 +1960,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nr.nrW = w;
             nr.nrH = h;
             nr.nrDeltaPath = oa.nrDeltaW;
+            // HDR video: the pass sees the SDR range around BT.2408's reference white (203 nits, 75 %
+            // HLG) through live's HDR math, and a brighter pixel keeps its light above white on top of
+            // the pass's result
+            nr.nrSrcHdr = oa.srcHdr;
+            if (oa.srcHdr)
+                nr.nrSdrWhite = 203.0f / 80.0f;
             // measurement lever, never a product setting: Reset on every frame makes the pass a
             // pure function of its input, so a route gate can compare it frame by frame
             wchar_t re[8]{};
@@ -1965,11 +2004,15 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 return 2;
             }
             LOG("DLSS 5 Neural Rendering ready (DLAA, structure %.2f, tone %.2f, style %d, %s, before the "
-                "interpolation%s%s, passes %d%s%s) @ %dx%d\n",
+                "interpolation%s%s, passes %d%s%s%s) @ %dx%d\n",
                 set.structure, set.tone, set.style, nr.nrZeroCopy ? "zero-copy" : "CPU staging",
                 nr.nrMotion ? ", motion vectors" : ", no motion vectors", autoMask ? ", auto mask" : "", host->passes(),
                 nr.nrResetEvery ? ", SMV_NR_RESET_EVERY" : "",
-                nr.nrReuse ? ", identical frames reuse the last output" : "", w, h);
+                nr.nrReuse ? ", identical frames reuse the last output" : "",
+                oa.srcHdr == 2   ? ", HLG video: its SDR range through the pass, white 203 nits"
+                : oa.srcHdr == 1 ? ", PQ video: its SDR range through the pass, white 203 nits"
+                                 : "",
+                w, h);
             if (host->passes() < set.passes)
                 LOG("offline: DLSS 5 runs %d of %d passes (%s)\n", host->passes(), set.passes,
                     host->passNote().c_str());
@@ -2246,6 +2289,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     };
     for (uint64_t i = 0; !failed; i++)
     {
+        if (i == 3)
+            nativeVideoMemoryNote(); // the first frames are through every pass
         // cooperative pause, render.py's contract: the GUI creates the file to pause and
         // deletes it to resume; checked at the pair boundary, queued output keeps draining
         if (!pauseFile.empty())
@@ -2293,14 +2338,17 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         if (havePrev)
         {
             cudaMemcpyAsync(nr.dX, nr.dX + 3 * plane, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st);
-            // the fp16 copy an fp16-x IFNet reads keeps the same two frames (DRBA builds its own x)
-            if (nr.xHalf && !nr.drba)
+            // the frames the IFNet reads keep the same two frames: the motion frames, or the fp16
+            // copy an fp16-x IFNet reads (DRBA builds its own x from its ring)
+            if (nr.mph && !nr.drba)
+                cudaMemcpyAsync(nr.dM, nr.dM + 3 * mplane, 3 * mplane * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st);
+            else if (nr.xHalf && !nr.drba)
                 cudaMemcpyAsync(nr.dXh, nr.dXh + 3 * plane, 3 * plane * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st);
         }
         float* dCur = nr.dX + 3 * plane;
         // DLSS 5 reuse: the decoded bytes against the previous frame's (dRaw alternates, so the other
         // buffer still holds them). Identical = this frame takes the previous frame's DLSS 5 output
-        // and skips the pack, NVIDIA order's stage and the evaluate: a pair route's shift above left
+        // and skips the pack, the pre-model stage and the evaluate: a pair route's shift above left
         // that output in dX; --no-interp forms no pairs and never shifts, so it is still in dCur
         const bool nrOn = nr.nrHost && !nr.nrFailed;
         bool nrSame = false, nrTested = false;
@@ -2323,7 +2371,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nrSame = *nr.hStaticFlag == 0;
             nrTested = true;
             if (nrSame && havePrev &&
-                cudaMemcpyAsync(dCur, nr.dX, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+                (cudaMemcpyAsync(dCur, nr.dX, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
+                 (nr.mph && !nr.drba &&
+                  cudaMemcpyAsync(nr.dM + 3 * mplane, nr.dM, 3 * mplane * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
+                                  st) != cudaSuccess)))
             {
                 io.setFail("DLSS 5 reuse copy failed");
                 failed = true;
@@ -2334,7 +2385,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nr.nrReused++;
         else if (nvPre)
         {
-            // NVIDIA order: the decoded frame at its own size, then Restore / RTX VSR / Lanczos3
+            // the decoded frame at its own size, then Restore / RTX VSR / Lanczos3
             // to the model (output) size, into dCur with the pad
             int sps = srcW * srcH;
             void* a[] = {&dR, &srcW, &srcH, &nr.dSrcPl, &srcH, &srcW, &sps};
@@ -2347,7 +2398,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             }
             if (!nativeOfflinePreModel(nr, dCur, ps))
             {
-                io.setFail("NVIDIA order passes failed");
+                io.setFail("pre-model passes failed");
                 failed = true;
                 break;
             }
@@ -2387,7 +2438,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             pairTested = true;
         }
         // DLSS 5 on the decoded frame, in place, before anything reads it (the Head encode, the
-        // pair's model, the emit): NVIDIA's order, frame generation after DLSS 5. The pair test
+        // pair's model, the emit): frame generation after DLSS 5. The pair test
         // compares the decoded frames first: the pass keeps history, so two identical frames can
         // come back a fraction of a level apart.
         if (nrOn && !nrSame)
@@ -2416,6 +2467,46 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 break;
             }
         }
+        // RIFE's motion frame: the finished picture as the IFNet would have read it, minus what costs
+        // RIFE its motion (measured on an exact pan): the PQ encoding (read as SDR sRGB) and an enlarge
+        // (Lanczos3 back to the decoded size, into dSrcPl, which the pre-model stage no longer needs),
+        // padded to the model's frame. Taken after FSR, or before the post with RTX HDR (FSR is fused
+        // into TrueHDR's input there). A reused frame copied it above.
+        auto motionFrame = [&]() -> bool {
+            const float* msrc = dCur;
+            int sps = (int)plane, srs = nr.pw, sw = w, sh = h;
+            if (w != srcW || h != srcH)
+            {
+                int zero = 0, tps = srcW * srcH, n = 3 * srcW * srcH;
+                void* a[] = {(void*)&dCur, &zero, (void*)&ps, &nr.pw, &w, &h, &nr.dSrcPl, &srcW, &srcH};
+                void* b[] = {&nr.dSrcPl, &n};
+                if (cuLaunchKernel(nr.fFitPlanar, (srcW + 15) / 16, (srcH + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+                                   nullptr) != CUDA_SUCCESS ||
+                    cuLaunchKernel(nr.fClamp01, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, b, nullptr) !=
+                        CUDA_SUCCESS)
+                    return false;
+                msrc = nr.dSrcPl;
+                sps = tps;
+                srs = srcW;
+                sw = srcW;
+                sh = srcH;
+            }
+            int dps = (int)mplane, mode = oa.srcHdr;
+            float white = 203.0f / 80.0f; // BT.2408's reference white in scRGB units
+            float knee = kMotionKnee, head = kMotionHead;
+            uint16_t* mdst = nr.drba ? drbaMotionNext(nr) : nr.dM + 3 * mplane;
+            void* a[] = {(void*)&msrc, &sps,    &srs,    &sw,   &sh,    &mdst, &dps,
+                         &nr.mpw,      &nr.mpw, &nr.mph, &mode, &white, &knee, &head};
+            return cuLaunchKernel(nr.fMotionIn, (nr.mpw + 15) / 16, (nr.mph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st,
+                                  a, nullptr) == CUDA_SUCCESS;
+        };
+        const bool motionHere = nr.mph && !nrSame;
+        if (motionHere && nr.rtxHdr && !motionFrame())
+        {
+            io.setFail("motion frame launch failed");
+            failed = true;
+            break;
+        }
         // FSR and RTX TrueHDR after DLSS 5, once per decoded frame before anything reads it (NVIDIA's
         // order: post-processing and the HDR conversion before frame generation)
         if (!nrSame && !nativePreModelPost(nr, dCur, ps, nr.rtxHdr))
@@ -2424,12 +2515,18 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             failed = true;
             break;
         }
+        if (motionHere && !nr.rtxHdr && !motionFrame())
+        {
+            io.setFail("motion frame launch failed");
+            failed = true;
+            break;
+        }
         // Head encode of the new frame; the previous frame's encode is reused (exact). The nvof
         // model has no per-frame state: both frames go to gray8 per pair below.
         nr.fCur ^= 1;
         if (!nr.nvof && !nr.noEngine && !nr.gmfss && !nr.drba && !nr.fruc && !oa.dlssg)
         {
-            nvinfer1::Dims4 din{1, 3, nr.ph, nr.pw};
+            nvinfer1::Dims4 din{1, 3, nr.mph ? nr.mph : nr.ph, nr.mph ? nr.mpw : nr.pw};
             if (!nr.ctxEnc->setInputShape("img", din))
             {
                 io.setFail("encode setInputShape rejected");
@@ -2437,9 +2534,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 break;
             }
             // fp16 frames (ONNX rev 4): the new frame into the fp16 copy's cur half, read by an
-            // fp16-x IFNet and / or an fp16-img encode
-            uint16_t* cur16 = nr.dXh + 3 * plane;
-            if ((nr.xHalf || nr.imgHalf) && !nativeF2h(nr, dCur, cur16, 3 * plane, st))
+            // fp16-x IFNet and / or an fp16-img encode; RIFE's two domains: the motion frame
+            uint16_t* cur16 = nr.mph ? nr.dM + 3 * mplane : nr.dXh + 3 * plane;
+            if (!nr.mph && (nr.xHalf || nr.imgHalf) && !nativeF2h(nr, dCur, cur16, 3 * plane, st))
             {
                 io.setFail("f2h launch failed");
                 failed = true;
@@ -2458,7 +2555,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             }
             if (widen)
             {
-                int n = (int)(16 * plane);
+                int n = (int)(16 * mplane);
                 void* a[] = {&nr.dEncHalf, &nr.dF[nr.fCur], &n};
                 if (cuLaunchKernel(nr.fH2f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) !=
                     CUDA_SUCCESS)
@@ -2549,7 +2646,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             // the frame and its encode into the ring, then the lagged pair (its identical-pair
             // test is the previous iteration's); no real frame goes out, so the input slot is
             // released here (the reader syncs its H2D event before reusing it)
-            if (!nativeDrbaPush(nr, dCur))
+            if (!nativeDrbaPush(nr, dCur, nrSame))
             {
                 io.setFail("drba push failed");
                 failed = true;
@@ -2797,10 +2894,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 for (int j = 0; j < len && !left; j++)
                 {
                     const float t = fpsMode ? (float)fr[base + j] : (float)(base + j + 1) / (float)multi;
-                    unsigned int bits;
-                    memcpy(&bits, &t, 4);
-                    if (cuMemsetD32Async((CUdeviceptr)(nr.dT + (size_t)j * plane), bits, plane, (CUstream)st) !=
-                        CUDA_SUCCESS)
+                    if (!nativeFillT(nr, (size_t)j, t, mplane, st))
                     {
                         io.setFail("timestep fill failed");
                         failed = true;
@@ -2811,9 +2905,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     break;
                 if (!left)
                 {
-                    nvinfer1::Dims4 dx{1, 6, nr.ph, nr.pw};
-                    nvinfer1::Dims4 dtst{len, 1, nr.ph, nr.pw};
-                    nvinfer1::Dims4 df{1, 16, nr.ph, nr.pw};
+                    const int modelH = nr.mph ? nr.mph : nr.ph, modelW = nr.mph ? nr.mpw : nr.pw;
+                    nvinfer1::Dims4 dx{1, 6, modelH, modelW};
+                    nvinfer1::Dims4 dtst{len, 1, modelH, modelW};
+                    nvinfer1::Dims4 df{1, 16, modelH, modelW};
                     if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dtst) ||
                         !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
                     {
@@ -2821,14 +2916,26 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                         failed = true;
                         break;
                     }
-                    nr.ctxIf->setTensorAddress("x", nr.xHalf ? (void*)nr.dXh : (void*)nr.dX);
+                    const void* xin =
+                        nr.mph ? (const void*)nr.dM : (nr.xHalf ? (const void*)nr.dXh : (const void*)nr.dX);
+                    nr.ctxIf->setTensorAddress("x", const_cast<void*>(xin));
                     nr.ctxIf->setTensorAddress("timestep", nr.dT);
                     nr.ctxIf->setTensorAddress("f0", nr.dF[nr.fCur ^ 1]);
                     nr.ctxIf->setTensorAddress("f1", nr.dF[nr.fCur]);
-                    nr.ctxIf->setTensorAddress("merged", nr.dMerged);
+                    nr.ctxIf->setTensorAddress("flow", nr.dFlow);
+                    nr.ctxIf->setTensorAddress("mask", nr.dMask);
                     if (!nr.ctxIf->enqueueV3(st))
                     {
                         io.setFail("IFNet enqueueV3 returned false");
+                        failed = true;
+                        break;
+                    }
+                    // the tweens: RIFE's last step on the pictures (RIFE's two domains: dX at the working
+                    // size, whatever the passes before made of them), else on the frames the IFNet read
+                    const bool picHalf = !nr.mph && nr.xHalf;
+                    if (!nativeRifeBlend(nr, picHalf ? (const void*)nr.dXh : (const void*)nr.dX, (int)picHalf, len, st))
+                    {
+                        io.setFail("rifeBlend launch failed");
                         failed = true;
                         break;
                     }
@@ -3070,6 +3177,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             ok = false;
         }
     }
+    nativeVideoMemoryNote(); // a render of three frames or fewer
     if (nr.nrHost)
     {
         LOG("offline: DLSS 5 %.2f ms mean, %.2f ms max over %llu frames (%s)\n",
@@ -3229,7 +3337,7 @@ int wmain(int argc, wchar_t** argv)
         g_offlineGraph = GetEnvironmentVariableW(L"SMV_OFFLINE_GRAPH", gv, 8) && gv[0] == L'1';
         const int orc = runOffline(argc, argv);
         // DLSS 5 ran here: NGX's process-detach teardown faults after main returns,
-        // so leave the way dlssnr.exe and the live host do
+        // so leave the way the live host does
         if (g_nrAttempted)
         {
             fflush(stderr);

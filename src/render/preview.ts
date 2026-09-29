@@ -3,7 +3,7 @@
 // (+ <out>_nrmask.png), and preview.py's one stdout line. The frame comes from the render's own
 // decode (ffmpeg at the render's pixel format, the downscale folded in exactly as the render
 // folds it), the processed side runs the render's own pass chain in the native host
-// (smv-live.exe --offline --no-interp, one frame, NVIDIA's order at the render's working size:
+// (smv-live.exe --offline --no-interp, one frame at the render's working size:
 // restore -> resize to the working size -> DLSS 5 -> the final resize / RTX VSR -> RCAS ->
 // TrueHDR), so the pane is the render's frame. This process only converts for display: the
 // PQ tonemaps, the 1:1 resize of the original pane, the DLSS 5 change mask and the PNG files;
@@ -18,7 +18,7 @@ import * as zlib from 'zlib';
 import { INFERNO } from './inferno';
 import { engineDir, tool } from './native';
 import { workPlan } from './plan';
-import { frameCount, probe, sourceBits, vfrConform } from './probe';
+import { decodeRgbVf, frameCount, probe, sourceBits, SWS_ACCURATE, vfrConform } from './probe';
 import { pyFixed, pyG } from './pyfmt';
 
 const f = Math.fround;
@@ -549,10 +549,11 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   const DEC_FMT = bits === 16 ? 'rgb48le' : 'rgb24',
     bpp = bits === 16 ? 6 : 3;
 
-  // the frame: the render's decode (its pixel format and downscale fold), seeked to idx; the
-  // original pane decodes without the fold (vf empty, the source size)
-  const decode = async (at: number, vf: string[] = plan.vf, dw: number = W, dh: number = H) => {
+  // the frame: the render's decode (its pixel format, colour conversion and downscale fold), seeked to
+  // idx; the original pane decodes without the fold (vf empty, the source size)
+  const decode = async (at: number, fold: string[] = plan.vf, dw: number = W, dh: number = H) => {
     const ss = at > 0 ? ['-ss', String(Math.max(0, ((at - 0.5) * vfr.den) / vfr.num))] : [];
+    const vf = fold.length ? fold : decodeRgbVf(pr.st, dw, dh);
     const r = await run(
       FFMPEG,
       [
@@ -561,6 +562,8 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         ...ss,
         '-i',
         inp,
+        '-sws_flags',
+        SWS_ACCURATE,
         '-an',
         '-sn',
         '-dn',
@@ -645,6 +648,8 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         String(a.nr_style),
       );
       if (a.nr_passes > 1) args.push('--nr-passes', String(a.nr_passes));
+      // HDR video (PQ or HLG): DLSS 5 sees its SDR range, as Live does on an HDR desktop
+      if (srcHdr) args.push('--src-hdr', transfer === 'arib-std-b67' ? 'hlg' : 'pq');
       if (a.nr_mask) {
         try {
           fs.unlinkSync(deltaFile);

@@ -198,7 +198,7 @@
   <div class="panel step" id="nrpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">DLSS 5</span>
-      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each source frame after Restore and the resize to the working size (the DLSS mode), before the interpolation (NVIDIA's order: frame generation runs on its output), so the generated frames inherit it.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame after Restore and the resize to the working size (the DLSS mode's share of the presented size: the window, or the screen in Fill), before the smoothing (NVIDIA's order: the generated frames inherit it): about 10 ms per source frame at 1080p, so a 24 to 30 fps window keeps its smoothing rate (a 4K window costs about 37 ms per source frame, a lower DLSS mode less); on an HDR display it works on the window's SDR range (HDR highlights above SDR white pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
+      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each source frame with more photoreal light and surfaces (the Style and intensities below set how much), after Restore and the resize to the working size (the DLSS mode), before the interpolation, so the generated frames inherit it.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame with more photoreal light and surfaces (the Style and intensities below set how much), after Restore and the resize to the working size (the DLSS mode's share of the window, or of the screen in Fill), before the smoothing, so the generated frames inherit it; on an HDR display it works on the window's SDR range (HDR highlights pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
@@ -264,7 +264,7 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelrife"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RIFE <span class="hint">(Real-Time Intermediate Flow Estimation: AI, best for live action, also carries the DRBA anime mode below; bundled)</span>
+        RIFE <span class="hint">(Real-Time Intermediate Flow Estimation: AI, best for live action, also carries the DRBA anime mode below)</span>
       </label>
     </div>
     <div class="row" id="rifedrbarow" style="display:none">
@@ -288,7 +288,7 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelnvof"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA Optical Flow (direct) <span class="hint">(experimental: motion vectors from NVIDIA's optical-flow hardware, then both frames are pushed along them and merged; nothing to install; where very fast motion defeats the vectors it fades to a soft double image)</span>
+        NVIDIA Optical Flow <span class="hint">(NVIDIA optical-flow hardware, nothing to install; very fast motion turns into a soft double image)</span>
       </label>
     </div>
     <div class="row">
@@ -296,7 +296,7 @@
       <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelfruc"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA Smooth Motion <span class="hint">(NVIDIA optical-flow hardware, the lowest quality of the models)</span>
+        NVIDIA Smooth Motion <span class="hint">(NVIDIA optical-flow hardware; the lowest quality of the models, and non-deterministic)</span>
       </label>
     </div>
     <div class="row">
@@ -304,7 +304,7 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modellsfg"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Frame Blend <span class="hint">(the cheapest true interpolation: RIFE's motion flow, then the two frames are warped and merged, no refinement pass; the output stays sharp at the processed size)</span>
+        Frame Blend <span class="hint">(AI interpolation: both frames warped along the motion and merged)</span>
       </label>
     </div>
     <div id="dlsssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -346,7 +346,7 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
       </label>
-      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly">runs first, once on each source frame, before the resize to the working size</span><span class="lonly">runs once on each captured frame, before the resize to the working size, DLSS 5 and the smoothing (NVIDIA's order: the generated frames inherit it); a model pass per captured frame, so a large window can lower the frame rate; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
+      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly">runs first, once on each source frame, before the resize to the working size</span><span class="lonly">runs once on each captured frame, before the resize to the working size, DLSS 5 and the smoothing (the generated frames inherit it); a model pass per captured frame, so a large window can lower the frame rate; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
     </div>
   </div>
 
@@ -491,7 +491,7 @@
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="dvexport" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Add Dolby Vision metadata (Profile 8.1) <span class="hint">(experimental)</span> <span class="hint" id="dvhint">(needs RTX HDR on)</span>
+        Add Dolby Vision metadata (Profile 8.1) <span class="hint" id="dvhint">(needs RTX HDR on)</span>
       </label>
     </div>
     <div id="dvsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -516,7 +516,7 @@
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="hpexport" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Add HDR10+ metadata <span class="hint">(experimental)</span> <span class="hint" id="hphint">(needs RTX HDR on)</span>
+        Add HDR10+ metadata <span class="hint" id="hphint">(needs RTX HDR on)</span>
       </label>
     </div>
     <div id="hpsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -542,7 +542,7 @@
       <select id="outcodec">
         <option value="hevc">HEVC &middot; H.265 &middot; GPU &middot; plays everywhere (recommended)</option>
         <option value="av1">AV1 &middot; GPU &middot; royalty-free, best for web playback</option>
-        <option value="vvc">H.266 &middot; VVC &middot; CPU &middot; much smaller file, slow, few players</option>
+        <option value="vvc">H.266 &middot; VVC &middot; CPU &middot; much smaller file, slow</option>
       </select>
       <span class="hint" id="codechint"></span>
     </div>

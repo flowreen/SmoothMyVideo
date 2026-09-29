@@ -83,7 +83,7 @@ export interface WorkPlan {
   note: string;
 }
 
-/** NVIDIA's order for a w x h source: the output (the --upscale factor, clamped), the working size =
+/** The pass sizes for a w x h source: the output (the --upscale factor, clamped), the working size =
  * the DLSS mode (--scale) x the output (even, at least 64, at most WORK_MAX_PX keeping the aspect),
  * and the decode (a working size below the source folds the downscale into the decode, linear-light
  * Lanczos3). A string = why --scale is refused. */

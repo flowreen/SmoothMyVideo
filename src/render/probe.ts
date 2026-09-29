@@ -208,6 +208,44 @@ export const ZSC_TRC: Record<string, string> = {
 };
 const UNTAGGED = ['', 'unknown', 'unspecified'];
 
+// The colour conversions run through zimg (zscale): exact matrix and range math and Lanczos3 chroma, where
+// swscale's default conversions read an 8-bit source 0.9 to 1.5 codes dark, a 10-bit one 0.4, and write the
+// encoder's 10-bit luma 1.2 codes bright. swscale keeps what zimg does not take (RGB, palette and gray sources,
+// alpha, semi-planar formats, other matrices), with its accurate rounding.
+export const SWS_ACCURATE = 'accurate_rnd+full_chroma_int+full_chroma_inp+bitexact';
+/** zimg's names of the YUV matrices both conversions take. */
+export const ZSC_MATRIX: Record<string, string> = {
+  bt709: '709',
+  smpte170m: '170m',
+  bt470bg: '470bg',
+  bt2020nc: '2020_ncl',
+};
+
+/** The matrix of an untagged w x h picture, as players assume it: BT.709 from HD up, BT.601 below. */
+export function sizeMatrix(w: number, h: number): string {
+  return Math.min(w, h) >= 600 || Math.max(w, h) >= 1024 ? 'bt709' : 'smpte170m';
+}
+
+/** The planar RGB format the decode's zimg conversion ends in (the pack to rgb24 / rgb48le follows). */
+function planarRgb(st: Stream): string {
+  return sourceBits(st, String(st.pix_fmt || 'yuv420p')) >= 10 ? 'gbrp16le' : 'gbrp';
+}
+
+/** The -vf chain of a decode at the source size: planar YUV to RGB through zimg. Empty = swscale converts (a
+ * source that is not planar YUV without alpha, or a matrix outside ZSC_MATRIX). */
+export function decodeRgbVf(st: Stream, w: number, h: number): string[] {
+  if (!/^yuvj?4[0-4]{2}p(\d+(le|be))?$/.test(String(st.pix_fmt || ''))) return [];
+  const sp: string[] = [];
+  const cs = String(st.color_space || '');
+  if (UNTAGGED.includes(cs)) sp.push('colorspace=' + sizeMatrix(w, h));
+  else if (!Object.prototype.hasOwnProperty.call(ZSC_MATRIX, cs)) return [];
+  if (UNTAGGED.includes(String(st.color_range || ''))) sp.push('range=tv');
+  return (sp.length ? [`setparams=${sp.join(':')}`] : []).concat([
+    'zscale=filter=lanczos:dither=none',
+    `format=${planarRgb(st)}`,
+  ]);
+}
+
 /** The -vf chain for a decode-side downscale of a w x h source to dw x dh. */
 export function dscaleVf(st: Stream, w: number, h: number, dw: number, dh: number): string[] {
   const fallback = [`scale=${dw}:${dh}:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp`];
@@ -216,19 +254,21 @@ export function dscaleVf(st: Stream, w: number, h: number, dw: number, dh: numbe
   const trcIn = String(st.color_transfer || '');
   let trc: string | undefined = Object.prototype.hasOwnProperty.call(ZSC_TRC, trcIn) ? ZSC_TRC[trcIn] : undefined;
   if (trc === undefined && !UNTAGGED.includes(trcIn)) return fallback;
-  const hd = Math.min(w, h) >= 600 || Math.max(w, h) >= 1024;
   const sp: string[] = [];
-  if (UNTAGGED.includes(String(st.color_space || ''))) sp.push('colorspace=' + (hd ? 'bt709' : 'smpte170m'));
+  if (UNTAGGED.includes(String(st.color_space || ''))) sp.push('colorspace=' + sizeMatrix(w, h));
   if (trc === undefined) {
     trc = '709';
     sp.push('color_trc=bt709');
   }
-  if (UNTAGGED.includes(String(st.color_primaries || ''))) sp.push('color_primaries=' + (hd ? 'bt709' : 'smpte170m'));
+  if (UNTAGGED.includes(String(st.color_primaries || ''))) sp.push('color_primaries=' + sizeMatrix(w, h));
   if (UNTAGGED.includes(String(st.color_range || ''))) sp.push('range=tv');
+  // the last zimg step also rounds the float planes to the integers the pipe carries (swscale's pack of
+  // float planes is 0.36 codes bright at 8 bits)
   return (sp.length ? [`setparams=${sp.join(':')}`] : []).concat([
     'zscale=transfer=linear',
     'format=gbrpf32le',
     `zscale=w=${dw}:h=${dh}:filter=lanczos:param_a=3`,
-    `zscale=transfer=${trc}`,
+    `zscale=transfer=${trc}:dither=none`,
+    `format=${planarRgb(st)}`,
   ]);
 }

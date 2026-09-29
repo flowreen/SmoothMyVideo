@@ -67,11 +67,11 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   gradients (skies, glows) never band into visible steps.
 * 🎨 **Production-grade HDR10.** Real SDR→HDR10 conversion with proper mastering metadata
   (mastering-display + measured MaxCLL/MaxFALL) and faithful, cyan-free colour, not just a PQ tag.
-* 🌈 **Dolby Vision Profile 8.1 export (experimental).** Optionally add Profile 8.1 dynamic-HDR metadata on
+* 🌈 **Dolby Vision Profile 8.1 export.** Optionally add Profile 8.1 dynamic-HDR metadata on
   top of the HDR10 render, HDR10-compatible, so non-DV players fall back to HDR10. Uses the
   separately-installed open-source [dovi_tool](https://github.com/quietvoid/dovi_tool); no Dolby software
   is bundled.
-* ➕ **HDR10+ export (experimental).** Optionally embed HDR10+ (SMPTE ST 2094-40) dynamic-HDR metadata,
+* ➕ **HDR10+ export.** Optionally embed HDR10+ (SMPTE ST 2094-40) dynamic-HDR metadata,
   measured per frame from the actual render, also HDR10-compatible, and combinable with Dolby Vision.
   Uses the separately-installed open-source
   [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool).
@@ -93,8 +93,9 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 * 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
   detected and timed correctly, so audio never drifts out of sync.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
-* 🎛️ **NVIDIA's DLSS modes for speed.** File renders run in the order NVIDIA uses in games:
-  Restore and the resize first, then DLSS 5 and the interpolation at the **working size**, then one
+  The one exception is the NVIDIA Smooth Motion model, which is non-deterministic.
+* 🎛️ **NVIDIA's DLSS modes for speed.** File renders run Restore and the resize first, then DLSS 5
+  and the interpolation at the **working size**, then one
   final resize to your output (RTX Video Super Resolution when it's on). The **DLSS mode** picks
   the working size as NVIDIA does, a share of the output: DLAA (the default, the output size
   itself), Quality, Balanced, Performance, Ultra Performance, Auto (NVIDIA's pick for the output
@@ -105,8 +106,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   way from what it shows (the window, or the whole screen in Fill), so Fill at DLAA smooths at the
   screen's size and the lower modes are its speed lever.
 * 🧠 **Optional NVIDIA DLSS 5 pass.** One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every
-  source frame before the smoothing, the order NVIDIA uses in games (after Restore and the resize,
-  at the working size, frame generation after DLSS 5),
+  source frame before the smoothing (after Restore and the resize, at the working size),
   at DLAA quality (its full resolution in, full resolution out), fed the way game integrations
   feed it (NVIDIA's automatic mask and motion vectors from NVIDIA's Optical Flow hardware, in file
   renders and live, so its history follows the picture, and a paused or held picture stays
@@ -149,7 +149,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   content, so a game dropping from 30 to 10 fps keeps playing at the same smooth rate on
   screen. Your Sharpen, Upscale to and Restore settings apply live too (the picture is rendered at the
   chosen height first, then fitted to the window or screen; Restore, DLSS 5, Sharpen and RTX HDR work on
-  each captured frame before the smoothing, once per captured frame, in NVIDIA's order), and Fill screen upscales with RTX VSR when
+  each captured frame before the smoothing, once per captured frame), and Fill screen upscales with RTX VSR when
   it's enabled. Untick every interpolation model and Live applies just those effects to the
   window at its own frame rate (useful for the growing set of apps that only need the
   picture cleaned or expanded). A small
@@ -170,9 +170,9 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   place the ones around the current one).
 * 🌀 **Optional NVIDIA Smooth Motion model.** One checkbox switches the interpolation from the GMFSS AI
   model to NVIDIA's hardware optical-flow FRUC (the same family as the driver-level Smooth Motion), for
-  when you want the NVIDIA look or a non-AI reference. Lower quality than GMFSS on fast motion; the
-  NVIDIA runtime is a one-time separate download (not bundled).
-* 🧪 **Experimental: NVIDIA Optical Flow (direct).** One more checkbox runs NVIDIA's hardware
+  when you want the NVIDIA look or a non-AI reference. The lowest quality of the models, and
+  non-deterministic; the NVIDIA runtime is a one-time separate download (not bundled).
+* 🧭 **NVIDIA Optical Flow.** One more checkbox runs NVIDIA's hardware
   optical-flow unit straight from the app, nothing to install (the NVIDIA driver
   provides it), live and for file renders. Fast, and clean on moderate motion; where very fast
   or twisting motion defeats the hardware's vectors it fades to a soft double image instead of

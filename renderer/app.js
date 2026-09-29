@@ -411,7 +411,7 @@ function restoreOn(){ return $('restore').checked; }
 // into per session, so its state is deliberately NOT persisted; old key retired.
 localStorage.removeItem('restoreOn');
 
-// NVIDIA's order in both modes: on each source or captured frame Restore and the resize to the
+// The pass order in both modes: on each source or captured frame Restore and the resize to the
 // working size (the DLSS mode), DLSS 5, FSR and RTX HDR (with the Dolby Vision and HDR10+ metadata of
 // a file render), then the interpolation (frame generation last), then the final resize to the output.
 // The numbered panels follow it.
@@ -420,7 +420,7 @@ function applyOrder(){
   $('nrpanel').after($('sharpenpanel')); $('sharpenpanel').after($('hdrpanel'));
   $('hdrpanel').after($('dvpanel')); $('dvpanel').after($('hppanel')); $('hppanel').after($('interppanel'));
 }
-localStorage.removeItem('nvorderOn');   // retired: NVIDIA's order is the only order
+localStorage.removeItem('nvorderOn');   // retired: the pass order is no longer a setting
 applyOrder();
 
 // "Match screen" is now one of the three Speed modes rather than an override checkbox, so there is
@@ -598,7 +598,7 @@ function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.valu
 const CODEC_HINTS = {
   hevc: 'safest choice: TVs, phones, editors and players all take it; audio is copied',
   av1:  'encodes 1.4 to 1.6x faster than HEVC on the same GPU at higher fidelity; similar size on clean anime, up to 2.5x larger on fast noisy content; royalty-free, plays in every modern browser, but devices from before ~2020 may not decode it',
-  vvc:  'smallest files of the three (roughly half of HEVC), but the CPU encode is slow and almost no player supports H.266 yet (archival)',
+  vvc:  'smallest files of the three (roughly half of HEVC), but the CPU encode is slow and H.266 plays in few places yet: mpv, MPC-HC, MPC-BE and VLC 4 open it, VLC 3, browsers, Windows\' own player and most phones and TVs do not',
 };
 function syncCodec(){ $('codechint').textContent = CODEC_HINTS[$('outcodec').value] || ''; }
 const savedCodec = localStorage.getItem('codec');
@@ -681,12 +681,13 @@ ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); s
 
 // NVIDIA DLSS 5 (Neural Rendering; opt-in; both modes: renders run it per output frame, Live
 // once per captured frame before the smoothing, lvSendOpts carries it):
-// a DLAA-class per-frame pass at the output resolution, hosted by engine/dlssnr/dlssnr.exe (ships)
+// a DLAA-class per-frame pass at the output resolution, run by the native host through the caller
+// shim engine/dlssnr/nvngx.dll (ships)
 // plus the NR runtime nvngx_dlssnr.dll, which the app never ships (NVIDIA offers no public download,
 // the only NVIDIA copy is inside NBA 2K27): one click downloads the community build every DLSS 5 tool
 // uses (rhi-repo on GitHub, checksum-verified twice in main), or the user drops a copy in, like the
 // RTX Video / NvOFFRUC DLLs.
-// Readiness = host + runtime present (dlssnr-ready). The two sliders are NVIDIA's global developer
+// Readiness = the shim + runtime present (dlssnr-ready). The two sliders are NVIDIA's global developer
 // controls, Structure Intensity and Tone Intensity (0..2, default 1.00); the pass always runs at
 // DLAA quality (no quality selector, by decision).
 let dlssnrReady = { ready:false };
@@ -706,7 +707,7 @@ async function checkDlssnrReady(){
   $('dlssnrstatus').textContent = 'checking...'; $('dlssnrstatus').style.color = 'var(--sub)';
   try { dlssnrReady = await ipcRenderer.invoke('dlssnr-ready'); } catch { dlssnrReady = { ready:false }; }
   const r = dlssnrReady;
-  const lines = [(r.host ? '✓' : '✗') + ' DLSS 5 host (dlssnr.exe + nvngx.dll, bundled)',
+  const lines = [(r.host ? '✓' : '✗') + ' DLSS 5 bridge (nvngx.dll, bundled)',
                  (r.runtime ? '✓' : '✗') + ' ' + (r.file || 'nvngx_dlssnr.dll') + ' (the Neural Rendering runtime, not included)',
                  (r.sr ? '✓' : '○') + ' ' + (r.srFile || 'nvngx_dlss.dll') + ' (DLSS SR runtime from the same pack, optional)'];
   if(r.ready){
@@ -715,7 +716,7 @@ async function checkDlssnrReady(){
   } else {
     $('dlssnrstatus').textContent = '✗ NOT READY'; $('dlssnrstatus').style.color = '#e85c5c';
     const detail = r.host === false
-      ? 'The DLSS 5 host (dlssnr.exe / nvngx.dll) is missing from engine/dlssnr. Rebuild it (see DEVELOPMENT.md, "Building the native bridges").'
+      ? 'The DLSS 5 bridge (nvngx.dll) is missing from engine/dlssnr. Rebuild it (see DEVELOPMENT.md, "Building the native components").'
       : 'NVIDIA does not publish <code>nvngx_dlssnr.dll</code> (no SDK, no driver copy, no NVIDIA App override); it only ships inside NBA 2K27. '
         + '<b>Download the DLSS 5 runtime</b> fetches the community build every DLSS 5 tool uses (' + ((r.download && r.download.mb) || 111) + ' MB zip from '
         + '<a href="#" onclick="ipcRenderer.invoke(\'dlssnr-open-download\');return false;">rhi-repo on GitHub</a>, RTX 40 + 50), verifies its checksum and installs it. '
@@ -807,7 +808,7 @@ function modelIsRifeDrba(){ return modelIsRife() && $('rifedrba').checked; }
 // Frame Blend (engine --lsfg, flow-warp) uses the bundled RIFE weights, so it is always
 // ready: nothing to install, no GPU feature check.
 function modelIsLsfg(){ return $('modellsfg').checked; }
-// NVIDIA Optical Flow (direct): the driver's optical-flow hardware run by
+// NVIDIA Optical Flow: the driver's optical-flow hardware run by
 // smv-live.exe itself (engine --nvof, live backend nvof), so it is always ready like Frame Blend.
 function modelIsNvof(){ return $('modelnvof').checked; }
 const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelnvof'), $('modellsfg')];
@@ -959,7 +960,7 @@ function liveModelInfo(){
   // Frame Blend is adaptive like rife/gmfss (no fixed flag): the server backend resamples
   // to the fps target the same way, which is what makes it a like-for-like pacing comparison.
   if(modelIsLsfg()) return { model:'blend', name:'Frame Blend', note:'flow at the Image scale, full resolution warps' };
-  // NVIDIA Optical Flow (direct): adaptive like rife (the splat takes any fraction), native only
+  // NVIDIA Optical Flow: adaptive like rife (the splat takes any fraction), native only
   if(modelIsNvof()) return { model:'nvof', name:'NVIDIA Optical Flow', note:'' };
   // nothing ticked = interpolation off (same meaning as file renders): the echo backend passes
   // the captured frames through at their own rate and applies the live effects (Restore,
@@ -1794,7 +1795,7 @@ function startRun(){
   else if(interpOn() && modelIsDlss()) payload.model = 'dlssg';   // "DLSS 4.5" (Frame Generation) backend
   else if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "NVIDIA Smooth Motion" (NvOFFRUC) backend
   else if(interpOn() && modelIsLsfg()) payload.model = 'lsfg'; // Frame Blend (flow-warp, engine --lsfg)
-  else if(interpOn() && modelIsNvof()) payload.model = 'nvof'; // NVIDIA Optical Flow (direct), engine --nvof
+  else if(interpOn() && modelIsNvof()) payload.model = 'nvof'; // NVIDIA Optical Flow, engine --nvof
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
   if(nrOn()){ payload.dlssnr = true; payload.nrstructure = nrStructure(); payload.nrtone = nrTone(); payload.nrstyle = nrStyle(); payload.nrpasses = nrPasses(); }   // DLSS 5 (runtime installed)

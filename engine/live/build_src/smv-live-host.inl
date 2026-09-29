@@ -188,7 +188,7 @@ struct Host
     uint64_t fenceValue = 0;
     // Fence value signalled by the LAST streaming present out of each double-buffer
     // half. The cross-group present queue replaces the per-group waitQueue barrier with a
-    // non-blocking completed-value check against this (python may not rewrite a half while
+    // non-blocking completed-value check against this (the server may not rewrite a half while
     // presents from it are still executing).
     uint64_t halfFence[2]{};
     HANDLE fenceEvent{};
@@ -211,11 +211,11 @@ struct Host
     // CopyTextureRegion reads output slots straight from shared memory (no upload memcpy).
     ComPtr<ID3D12Heap> shmHeap;
     ComPtr<ID3D12Resource> shmBuf;
-    // Faster direct-present path: a SHARED committed buffer in VRAM the python server
+    // Faster direct-present path: a SHARED committed buffer in VRAM the server
     // imports as CUDA external memory and writes output slots into (same layout as the shm
     // out-region, minus the in-region offset). The shm route crosses PCIe twice per
     // presented frame (server D2H, then the copy engine pulls host memory back); this one
-    // never leaves the GPU. shm remains the fallback whenever python declines the import.
+    // never leaves the GPU. shm remains the fallback whenever the server declines the import.
     ComPtr<ID3D12Resource> outBuf;
     HANDLE hOutBuf = nullptr; // inheritable NT handle value (rides the cmdline)
     uint64_t outBufBytes = 0;
@@ -655,7 +655,7 @@ struct Host
     // GPU path: present an output slot DIRECTLY from the shared-memory heap - the copy engine
     // reads the slot over PCIe, no CPU touch. These presents are PIPELINED (up to 3 in
     // flight); the caller drains with waitQueue() once per GROUP before reading the reply,
-    // which also closes the cross-group slot-overwrite window (python never rewrites a
+    // which also closes the cross-group slot-overwrite window (the server never rewrites a
     // double-buffer half until one full group later).
     bool presentShm(UINT64 offset, UINT pitch)
     {

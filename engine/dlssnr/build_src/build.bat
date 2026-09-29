@@ -15,15 +15,10 @@ if errorlevel 1 (
 )
 cd /d %~dp0
 
-echo [1/2] caller shim -^> ..\nvngx.dll
+rem the NR core (nr_host.cpp) is compiled into smv-live.exe by engine\live\build_src\build.bat
+echo caller shim -^> ..\nvngx.dll
 cl /nologo /std:c++17 /EHsc /O2 /W3 /LD shim.cpp /I "%NGX_SDK%\include" ^
    /Fo.\ /Fe..\nvngx.dll || exit /b 1
-
-echo [2/2] host -^> ..\dlssnr.exe
-cl /nologo /std:c++17 /EHsc /O2 /W3 main.cpp nr_host.cpp /I "%NGX_SDK%\include" ^
-   /Fo.\ ^
-   /link d3d12.lib dxgi.lib dxguid.lib user32.lib ^
-   /SUBSYSTEM:CONSOLE /OUT:..\dlssnr.exe || exit /b 1
 
 del /q *.obj *.exp 2>nul
 del /q "..\nvngx.exp" "..\nvngx.lib" 2>nul

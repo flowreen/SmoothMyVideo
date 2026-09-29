@@ -9,7 +9,7 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import { injectHdr10 } from './hdr10meta';
-import { MP4_AUDIO_OK, MKV_SUB_COPY_OK, Stream, tag, Track } from './probe';
+import { MP4_AUDIO_OK, MKV_SUB_COPY_OK, sizeMatrix, Stream, SWS_ACCURATE, tag, Track, ZSC_MATRIX } from './probe';
 import { pyFixed } from './pyfmt';
 
 export type Env = Record<string, string | undefined>;
@@ -84,7 +84,8 @@ export function decodeFilters(resumeSkip: number, vfrDec: string[], imgScaleVf: 
   return [filters.concat(imgScaleVf), resumeSkip && vfr ? resumeSkip : 0];
 }
 
-/** The raw-frame decoder argv (stdout = the frame pipe). */
+/** The raw-frame decoder argv (stdout = the frame pipe); -sws_flags = accurate rounding for the conversions
+ * swscale still does (the pack to the pipe's format, a source zimg does not take). */
 export function decodeCmd(ffmpeg: string, inp: string, vfrDec: string[], filters: string[], decFmt: string): string[] {
   return [
     ffmpeg,
@@ -92,6 +93,8 @@ export function decodeCmd(ffmpeg: string, inp: string, vfrDec: string[], filters
     'error',
     '-i',
     inp,
+    '-sws_flags',
+    SWS_ACCURATE,
     ...vfrDec,
     ...(filters.length ? ['-vf', filters.join(',')] : []),
     '-f',
@@ -209,11 +212,12 @@ export function chooseEncoder(
   return [venc, useNvenc];
 }
 
-/** Output pixel format: always 10 bit, 4:4:4 kept where the encoder allows it. */
+/** Output pixel format: always 10 bit, 4:4:4 kept where the encoder allows it (NVENC takes its 10 bits in the
+ * high bits of 16, as p010le does: handed 16-bit samples it drops the low six, half a code dark on every plane). */
 export function outPixfmt(venc: string, useNvenc: boolean, hdrActive: boolean, chroma444: boolean): string {
   if (venc === 'libvvenc') return 'yuv420p10le';
   if (hdrActive) return useNvenc ? 'p010le' : 'yuv420p10le';
-  if (chroma444 && (venc === 'h264_nvenc' || venc === 'hevc_nvenc')) return 'yuv444p16le';
+  if (chroma444 && (venc === 'h264_nvenc' || venc === 'hevc_nvenc')) return 'yuv444p10msble';
   return useNvenc ? 'p010le' : 'yuv420p10le';
 }
 
@@ -281,39 +285,75 @@ export function qualityArgs(
 
 /** The HEVC profile follows the pixel format; other encoders pick their own. */
 export function profileArgs(venc: string, outPix: string): string[] {
-  if (venc === 'hevc_nvenc' && outPix === 'yuv444p16le') return ['-profile:v', 'rext'];
+  if (venc === 'hevc_nvenc' && outPix === 'yuv444p10msble') return ['-profile:v', 'rext'];
   if (venc === 'hevc_nvenc' && outPix === 'p010le') return ['-profile:v', 'main10'];
   return [];
 }
 
-/** [setparams fields, -color_* flags]: the source signalling carried through, or HDR10 forced. */
-export function colorArgs(hdrActive: boolean, st: Stream): [string[], string[]] {
+/** True for a source with no YUV matrix of its own: an RGB, palette or gray pixel format, or the gbr matrix. */
+export function rgbSource(st: Stream): boolean {
+  return String(st.color_space || '') === 'gbr' || /rgb|bgr|gbr|^pal|^gray|^ya|^mono/.test(String(st.pix_fmt || ''));
+}
+
+/** True for a source whose every pixel has its own colour (4:4:4 YUV, RGB, a palette): the output keeps 4:4:4
+ * where the encoder allows it. */
+export function fullChroma(st: Stream): boolean {
+  const pix = String(st.pix_fmt || '');
+  return pix.includes('444') || String(st.color_space || '') === 'gbr' || /rgb|bgr|gbr|^pal/.test(pix);
+}
+
+/** [setparams fields, -color_* flags, the matrix the encoder's conversion uses]: the source signalling carried
+ * through, or HDR10 forced. An RGB source has no YUV matrix or range to carry: the YUV output takes BT.709 (BT.601
+ * below HD, the size rule of an untagged decode) at TV range. An untagged YUV source converts with the matrix
+ * players assume for the output's size, and the conversion names it on the output. */
+export function colorArgs(hdrActive: boolean, st: Stream, outW: number, outH: number): [string[], string[], string] {
   if (hdrActive) {
     return [
       ['range=tv', 'colorspace=bt2020nc', 'color_trc=smpte2084', 'color_primaries=bt2020'],
       ['-color_range', 'tv', '-colorspace', 'bt2020nc', '-color_trc', 'smpte2084', '-color_primaries', 'bt2020'],
+      'bt2020nc',
     ];
   }
+  const rgb = rgbSource(st);
   const sp: string[] = [],
     color: string[] = [];
+  let matrix = sizeMatrix(outW, outH);
   for (const [spOpt, flag, key] of [
     ['range', '-color_range', 'color_range'],
     ['colorspace', '-colorspace', 'color_space'],
     ['color_trc', '-color_trc', 'color_transfer'],
     ['color_primaries', '-color_primaries', 'color_primaries'],
   ]) {
-    const v = tag(st, key);
+    let v = tag(st, key);
+    if (rgb && key === 'color_space') v = matrix;
+    else if (rgb && key === 'color_range') v = 'tv';
     if (v) {
       sp.push(`${spOpt}=${v}`);
       color.push(flag, String(v));
+      if (key === 'color_space') matrix = String(v);
     }
   }
-  return [sp, color];
+  return [sp, color, matrix];
 }
 
-/** The encode -vf: the colour-tag passthrough and the pixel format. */
-export function encodeVf(sp: string[], outPix: string): string {
-  return (sp.length ? ['setparams=' + sp.join(':')] : []).concat([`format=${outPix}`]).join(',');
+/** The encode -vf: the colour tags, the host's RGB frames (encInFmt) to YUV through zimg with the output's matrix
+ * and range (chroma subsampled with Lanczos3), the encoder's pixel format. A matrix outside ZSC_MATRIX or another
+ * input format leaves the conversion to swscale. */
+export function encodeVf(sp: string[], outPix: string, encInFmt = '', matrix = ''): string {
+  const tags = sp.length ? ['setparams=' + sp.join(':')] : [];
+  const planarIn = ({ rgb24: 'gbrp', rgb48le: 'gbrp16le', x2rgb10le: 'gbrp10le' } as Record<string, string>)[encInFmt];
+  if (!planarIn || !Object.prototype.hasOwnProperty.call(ZSC_MATRIX, matrix))
+    return tags.concat([`format=${outPix}`]).join(',');
+  const range = sp.includes('range=pc') ? 'full' : 'limited';
+  const planarOut = outPix.startsWith('yuv444') ? 'yuv444p10le' : 'yuv420p10le';
+  return tags
+    .concat([
+      `format=${planarIn}`,
+      `zscale=matrix=${ZSC_MATRIX[matrix]}:range=${range}:filter=lanczos:dither=none`,
+      `format=${planarOut}`,
+    ])
+    .concat(planarOut === outPix ? [] : [`format=${outPix}`])
+    .join(',');
 }
 
 /** [the passthrough -map argv, the stderr notes]. */
@@ -398,8 +438,8 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   const ultra = e.outW > NVENC_MAX || e.outH > NVENC_MAX;
   const [qargs, speedNote] = qualityArgs(e.venc, e.useNvenc, e.outLabel, e.dvOrHp, ultra, env);
   const prof = profileArgs(e.venc, outPix);
-  const [sp, color] = colorArgs(e.hdrActive, e.st);
-  const vf = encodeVf(sp, outPix);
+  const [sp, color, matrix] = colorArgs(e.hdrActive, e.st, e.outW, e.outH);
+  const vf = encodeVf(sp, outPix, e.encInFmt, matrix);
   const tq = ultra ? ['-threads', '1', '-thread_queue_size', '1'] : [];
   let [maps, trackNotes] = trackMaps(e.outIsMkv, e.aud, e.sub, e.hasAttach);
   const notes = (speedNote ? [speedNote] : []).concat(trackNotes);
@@ -440,6 +480,8 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
     ...maps,
     '-c:v',
     e.venc,
+    '-sws_flags',
+    SWS_ACCURATE,
     '-vf',
     vf,
     '-max_interleave_delta',

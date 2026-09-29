@@ -16,6 +16,7 @@ import {
   decodeFilters,
   encodePlan,
   finalizeOutput,
+  fullChroma,
   HdrStats,
   HpFrame,
   pyErrText,
@@ -24,7 +25,7 @@ import {
 } from './encode';
 import { isGmfss, nvofRefusal, RenderArgs, workPlan } from './plan';
 import { thumbPng } from './preview';
-import { frameCount, needMkv, outputRate, probe, probeTracks, sourceBits, tag, vfrConform } from './probe';
+import { decodeRgbVf, frameCount, needMkv, outputRate, probe, probeTracks, sourceBits, tag, vfrConform } from './probe';
 import { pyFixed, pyFloatRepr, pyG, pyRound } from './pyfmt';
 import {
   applyResume,
@@ -178,7 +179,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     HDR_SATBOOST = clamp(args.hdr_satboost, 0.0, 1.0);
 
   let { w: W, h: H, num, den, nb: NB, st: ST } = probe(FFPROBE, inp);
-  // NVIDIA's order: W x H = the decode, WORK = the DLSS mode x the output (DLSS 5 and the model)
+  // W x H = the decode, WORK = the DLSS mode x the output (DLSS 5 and the model)
   const plan = workPlan(ST, W, H, UPSCALE_F, args.work_scale);
   if (typeof plan === 'string') throw new RenderExit(plan);
   [W, H] = [plan.w, plan.h];
@@ -197,7 +198,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const SRC_PIX = String(ST.pix_fmt || 'yuv420p');
   const SRC_BITS = sourceBits(ST, SRC_PIX);
   const TEN_BIT = SRC_BITS >= 10;
-  const CHROMA444 = SRC_PIX.includes('444');
+  const CHROMA444 = fullChroma(ST);
   const FPS_MODE = args.fps !== null && args.fps > 0;
   if (DLSSG_MODE && !NO_INTERP && (FPS_MODE || !(args.multi >= 2 && args.multi <= 6))) {
     throw new RenderExit(
@@ -229,7 +230,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const NATIVE_EXE = path.join(ENGINE, 'live', 'smv-live.exe');
   if (NVOF_MODE) {
     const why = nvofRefusal(args, FPS_MODE);
-    if (why) throw new RenderExit('NVIDIA Optical Flow (direct): ' + why);
+    if (why) throw new RenderExit('NVIDIA Optical Flow: ' + why);
   }
   if (!isFile(NATIVE_EXE)) throw new RenderExit(`the render host ${NATIVE_EXE} is missing; reinstall SmoothMyVideo`);
   let fragCopy = CODEC === 'vvc';
@@ -288,7 +289,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     say('no-interp mode: GMFSS interpolation disabled (re-encode at source fps with optional FSR sharpen)\n');
   else if (FRUC_MODE) say('Using the NVIDIA Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n');
   else if (DLSSG_MODE) say('Using the DLSS Frame Generation backend for interpolation (DLSS 4.5)\n');
-  else if (NVOF_MODE) say('Using the NVIDIA Optical Flow (direct) backend for interpolation (native host)\n');
+  else if (NVOF_MODE) say('Using the NVIDIA Optical Flow backend for interpolation (native host)\n');
   else if (RIFE_MODE) say('Using the RIFE backend for interpolation (4.26 heavy, native host)\n');
   else if (LSFG_MODE) say('Using the Frame Blend backend for interpolation (RIFE 4.26 heavy flow, native host)\n');
   if (kind === 'gmfss') say('Using the GMFSS backend for interpolation (native host)\n');
@@ -396,7 +397,12 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     hdrPrefix = hp.prefix;
     if (hp.note) dvhpNote = hp.note;
   }
-  const [decFilters, pipeDiscard] = decodeFilters(R.skipSrc, VFR_DEC, IMG_SCALE_VF);
+  // the decode's colour conversion: inside the downscale's chain, else its own (zimg, empty = swscale's)
+  const [decFilters, pipeDiscard] = decodeFilters(
+    R.skipSrc,
+    VFR_DEC,
+    IMG_SCALE_VF.length ? IMG_SCALE_VF : decodeRgbVf(ST, W, H),
+  );
 
   // the encoder
   const fatal = (m: string): never => {
@@ -508,6 +514,9 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       String(nr.style),
     );
   if (nr && nr.passes > 1) nargs.push('--nr-passes', String(nr.passes));
+  // HDR video (PQ or HLG): DLSS 5 sees its SDR range, as Live does on an HDR desktop, and RIFE finds
+  // the motion on the same SDR view of the decoded picture
+  if (SRC_HDR_IN) nargs.push('--src-hdr', String(tag(ST, 'color_transfer') || '') === 'arib-std-b67' ? 'hlg' : 'pq');
   const hdrStats = WORK_PATH + '.hdrstats.json';
   if (HDR_ACTIVE) {
     nargs.push(

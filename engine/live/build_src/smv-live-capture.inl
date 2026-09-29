@@ -3,9 +3,9 @@
 
 // The DLSS-G route in HDR mode. SL's DLSS-G mandates a UINT10/RGB10 backbuffer
 // in HDR10/BT.2100 PQ and explicitly rejects FP16 scRGB (ProgrammingGuideDLSS_G.md 11.0), which
-// is exactly the server route's present format - but dlssg has no python server to convert, so
-// the exe does it: this compute shader is the verbatim math of live_server.py's
-// _scrgb_to_pq2020 + _pack_r10a2 (709->2020 matrix FIRST, clamp AFTER it - negative scRGB is
+// is exactly the server route's present format - but the DLSS-G route has no model host to
+// convert, so the exe does it: this compute shader is the same math as the native kernels'
+// scrgb_to_pq2020 + R10G10B10A2 pack (709->2020 matrix FIRST, clamp AFTER it - negative scRGB is
 // valid wide gamut - scRGB 1.0 = 80 nits over PQ 10000, A = 3). Output is R32_UINT (manual bit
 // pack, typed-UAV support guaranteed) whose bit pattern IS R10G10B10A2_UNORM.
 static const char kHdrPackCS[] = "Texture2D<float4> src : register(t0);\n"
@@ -67,7 +67,7 @@ struct Capture
                              // capture into subharmonic plateaus (measured).
     int64_t lastArrTs = 0;   // SystemRelativeTime of the previously delivered frame
     // Zero-copy capture interop (server route): frames are GPU-copied into a SHARED texture
-    // the python server imports as CUDA external memory, with a shared D3D11 fence for
+    // the server imports as CUDA external memory, with a shared D3D11 fence for
     // ordering. Capture never touches the CPU: no staging Map, no shm memcpy, no H2D upload.
     ComPtr<ID3D11Texture2D> sharedTex;
     ComPtr<ID3D11Fence> sharedFence;
@@ -425,7 +425,7 @@ struct Capture
         }
     }
 
-    // interop path: newest frame -> sharedTex, GPU copy only (python reads it via CUDA after
+    // interop path: newest frame -> sharedTex, GPU copy only (the server reads it via CUDA after
     // the fence signal). Same return codes as latestFrame.
     int latestFrameGpu()
     {
@@ -441,11 +441,11 @@ struct Capture
         return 1;
     }
 
-    // interop path: order the shared-texture copy against python's CUDA reads
+    // interop path: order the shared-texture copy against the server's CUDA reads
     void signalFence(uint64_t v)
     {
         ctx4->Signal(sharedFence.Get(), v);
-        ctx11->Flush(); // the immediate context may defer submission; python is waiting
+        ctx11->Flush(); // the immediate context may defer submission; the server is waiting
     }
 
     // CPU path: drain + staging readback into out (tight cw*4 rows). The frame stays BGRA
@@ -523,8 +523,8 @@ struct Capture
         if (evt)
             CloseHandle(evt);
         evt = nullptr;
-        // the shared NT handles of the interop texture and fence (every importer released
-        // them already: the native host in nativeFree, the python child at its exit)
+        // the shared NT handles of the interop texture and fence (the native host released
+        // its imports already, in nativeFree)
         if (hTex)
         {
             CloseHandle(hTex);

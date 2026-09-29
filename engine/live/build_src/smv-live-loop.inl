@@ -1020,8 +1020,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         }
         else if (g_rtxHdr)
             LOG("RTX HDR live skipped (needs an HDR display and a server model: RIFE/GMFSS/Frame Blend)\n");
-        else if (g_dlssnr && g_hdr && g_backend == BK_SERVER)
-            g_sdrWhite = sdrWhiteNits(target); // the SDR range the NR pass works on
+        else if (g_hdr && g_backend == BK_SERVER)
+            g_sdrWhite = sdrWhiteNits(target); // the SDR range DLSS 5 and RIFE's motion frame work on
         if (!g_hdr && hdrDisplay)
             LOG("NOTICE: Windows HDR is ON for this display. This model captures 8-bit SDR for now, "
                 "so HDR highlights will look over-bright/clipped. HDR live support is in progress for "
@@ -1080,7 +1080,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         if (rc)
             return rc;
         if (g_backend == BK_SERVER)
-            cap.initInterop(); // zero-copy capture for the python server
+            cap.initInterop(); // zero-copy capture for the server
         const uint32_t capW = cap.cw, capH = cap.ch;
         RECT mon{};
         if (g_monitor)
@@ -1132,7 +1132,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             LOG("WARNING: %ux%u is below the DLSS-G minimum extent %u, FG may refuse\n", W, H, host.minWH);
 
         // The DLSS 5 pass inside this process. Server backends only (never DLSS-G: the NR host
-        // starves it). NVIDIA's order: the native host runs it on the model frame after Restore and
+        // starves it). The native host runs it on the model frame after Restore and
         // the resize (nativeLiveNrInit logs its line once the model size is known, or why the
         // session runs without it).
         if (g_dlssnr && g_backend == BK_SERVER)
@@ -1343,8 +1343,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 }
                 // a resize during the model load: the loader cannot see it (the
                 // engine handoff only polls the flag), so watch the client size here; once it
-                // settles the session ends with exit 4 like a mid-session resize, the app
-                // revives it at the new size and the build in flight finishes in the background
+                // settles at a new size the session ends with exit 4 like a mid-session resize, the
+                // app revives it at the new size and the build in flight finishes in the background
                 if (!g_monitor && !g_resizeReq.load() && GetTickCount64() - loadSizeTick > 250)
                 {
                     loadSizeTick = GetTickCount64();
@@ -1354,9 +1354,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     {
                         LOG("target window resized during the model load (%ux%u -> %ldx%ld)\n", capW, capH, cr.right,
                             cr.bottom);
-                        resizeSettle(target, host, cap, hud, false);
-                        loadGone = !IsWindow(target);
-                        g_resizeReq.store(true);
+                        if (resizeSettle(target, host, cap, hud, false))
+                        {
+                            // back at the captured size (a transient): the load goes on, and Fill's
+                            // loading note returns to the window (the settle put it on the overlay)
+                            RECT r{};
+                            if (g_fill && !host.park && frameBounds(target, r))
+                                hud.move(r.left + cap.cropX + 16, r.top + cap.cropY + 16);
+                        }
+                        else
+                        {
+                            loadGone = !IsWindow(target);
+                            g_resizeReq.store(true);
+                        }
                     }
                 }
                 if (canPassthrough && !g_resizeReq.load() && cap.latestFrame(loadBuf.data()) > 0)
@@ -1494,7 +1504,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         double emaDt = 0;             // smoothed capture interval (ms), paces the group
         ULONGLONG lastArrival = 0;
         int idleSlotIdx = -1;     // last presented slot, re-presentable while the
-        uint32_t idleSlotSet = 0; // source is static (python only rewrites a half
+        uint32_t idleSlotSet = 0; // source is static (the server only rewrites a half
                                   // when a NEW group lands, so the content is stable)
         auto slotOffset = [&](uint32_t set, uint32_t i) -> size_t {
             return srv.shmInBytes + ((size_t)set * srv.shmSlots + i) * srv.shmSlot;
@@ -1879,8 +1889,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if (st)
                 sprintf_s(slf, " status=%d actuallyPresented=%u", (int)st->status, st->numFramesActuallyPresented);
             // identical-pair passthrough: the native host's held count, APPENDED (the GUI and
-            // scripts/smoke.py read the fields before it). The python live server reports its
-            // own count on its own line: this counter only sees the in-process host.
+            // scripts/smoke.py read the fields before it).
             char stc[32] = "";
             if (g_staticHold)
                 sprintf_s(stc, " static=%llu", (unsigned long long)g_staticHeld);
@@ -2373,11 +2382,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 const bool gpuCap = cap.interop && srv.captexAck;
                 const uint32_t nextSet = (uint32_t)((shmSeq + 1) % 2);
                 // GATE A, part 1: the last present out of the half we are about to hand to
-                // python has completed on the GPU.
+                // the server has completed on the GPU.
                 const bool gateA = host.fence->GetCompletedValue() >= host.halfFence[nextSet];
                 // GATE A, part 2: that half must also hold no slot the FIFO has not
                 // presented yet. Parts 1 and C alone leave a hole - a half whose presents all
-                // completed can still own queued, unpresented slots, and python would
+                // completed can still own queued, unpresented slots, and the server would
                 // overwrite them mid-queue.
                 bool halfBusy = false;
                 for (const auto& fs : fifo)
@@ -2386,7 +2395,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         halfBusy = true;
                         break;
                     }
-                // GATE B: python has released the shared capture texture for the last group we
+                // GATE B: the server has released the shared capture texture for the last group we
                 // sent. The capture-release token says that directly; without it (a server that
                 // did not ack caprel) we fall back to the old proxy, the group being OPENED.
                 const bool gateB = pend.empty() || (srv.capRelAck ? pend.back().capRel : pend.back().opened);
@@ -2929,7 +2938,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         timeEndPeriod(1);
         // With the NR snippet loaded, the process-exit teardown after main returns
         // faults (0xC0000005 on a clean "target window closed" exit;
-        // the offline dlssnr.exe leaves through ExitProcess for the same reason), which would
+        // the offline host leaves through ExitProcess for the same reason), which would
         // also replace the exit codes the app acts on (4 resize restart, 6 stall revive).
         if (g_nrAttempted)
         {

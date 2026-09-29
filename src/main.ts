@@ -310,8 +310,8 @@ const DLSSG_FILES = [
   'sl.reflex.dll',
   'nvngx_dlssg.dll',
 ];
-// "NVIDIA DLSS 5" (Neural Rendering): the host (engine/dlssnr/dlssnr.exe + its nvngx.dll caller
-// shim, built from build_src) ships, but the NR runtime nvngx_dlssnr.dll is NOT shipped: NVIDIA
+// "NVIDIA DLSS 5" (Neural Rendering): the caller shim engine/dlssnr/nvngx.dll (built from build_src;
+// the native host loads the runtime through it) ships, but the NR runtime nvngx_dlssnr.dll is NOT shipped: NVIDIA
 // publishes no download (no SDK, no driver copy, no NVIDIA App override as of 2026-09), the only
 // NVIDIA copy sits inside NBA 2K27. So the app offers a one-click download of the community build
 // every DLSS 5 tool pulls from (RankFTW/rhi-repo release assets, the RenoDX author's RTX 40 + 50
@@ -320,7 +320,7 @@ const DLSSG_FILES = [
 // the DLSS SR runtime; the NGX core only warns when it is absent (probe-verified), so it
 // is copied when found beside a dropped runtime, reported, never required.
 const DLSSNR_DIR = path.join(ENGINE, 'dlssnr');
-const DLSSNR_HOST = ['dlssnr.exe', 'nvngx.dll'];
+const DLSSNR_HOST = ['nvngx.dll'];
 const DLSSNR_RUNTIME = 'nvngx_dlssnr.dll';
 const DLSSNR_SR = 'nvngx_dlss.dll';
 // The one-click source: the most-downloaded rhi-repo asset, and the ONE hash this app holds: the
@@ -578,7 +578,7 @@ ipcMain.handle('dlssg-ready', () => {
   return { ready: missing.length === 0, missing, dir: DLSSG_DIR };
 });
 
-// "NVIDIA DLSS 5" (Neural Rendering): ready when the shipped host files AND the user-supplied
+// "NVIDIA DLSS 5" (Neural Rendering): ready when the shipped caller shim AND the user-supplied
 // runtime are present in engine/dlssnr (see the DLSSNR_* constants).
 ipcMain.handle('dlssnr-ready', () => {
   const host = DLSSNR_HOST.every((f) => fileExists(path.join(DLSSNR_DIR, f)));
@@ -1477,7 +1477,7 @@ function engineArgs(opts: RunOpts): string[] {
   // first (it folds straight to the working size). Works with or without interpolation.
   if (opts.restore) args.push('--restore');
   // NVIDIA DLSS 5 Neural Rendering (GUI checkbox + the two sliders): once per source frame at the
-  // working size, after Restore and the resize, before the interpolation (NVIDIA's order). The
+  // working size, after Restore and the resize, before the interpolation. The
   // renderer only sends it when the user-supplied runtime is installed (dlssnr-ready).
   if (opts.dlssnr)
     args.push(

@@ -110,10 +110,43 @@ RTX VSR / HDR and all three codecs.
   its own, so either revision of either engine works. The IFNet runs 1.05x faster per call at
   1080p; the tweens change slightly (the fp16 rounding reaches the flow, 56 to 65 dB on anime),
   the real frames do not. Rev 5: the RIFE IFNet hands its tween `merged` out in fp16
-  (`trt_runtime._half_output`, one Cast after the fp32 blend), and every host reader of a tween
+  (one Cast after the fp32 blend), and every host reader of a tween
   (the packs, the fits, Restore, RTX VSR, TrueHDR) takes it as it is through a half flag beside
   the source pointer, so no pass widens it; each tween is the fp32 one rounded to fp16 (at most 1
-  code at 8 and 10 bits). Built from these files the engines are
+  code at 8 and 10 bits). Rev 6: the RIFE IFNet takes its `timestep` in fp16
+  (`trt_runtime._half_timestep`, one Cast in front of its readers); the host fills the constant
+  planes in fp16 (`nativeFillT`, rounded to nearest even like the graph's own cast), DRBA's map
+  kernel writes fp16 (`k_drbaDrmNorm`'s half flag), and the timestep and tween buffers are sized by
+  the engine's dtypes after the load (`nativeTweenBuffers`). RIFE and Frame Blend tweens stay
+  bit-identical, DRBA's move by up to 31 codes on thin moving edges (55.7 dB at the worst frame),
+  and a live 1080p session holds 126 MiB less. Rev 7: the RIFE IFNet hands out its final `flow`
+  and blend `mask` (fp16, the tensors its own last warp read, `trt_runtime._half_flow_mask`)
+  instead of `merged`, and the host makes each tween with RIFE's own last step (`k_rifeBlend`:
+  both frames warped along their flow with grid_sample's bilinear border tap, blended by the
+  mask), so one flow can warp other pictures of the pair. Offline RIFE (and Frame Blend, which
+  renders as RIFE) runs the IFNet on a motion frame (`k_motionIn`): the finished picture after
+  Restore, DLSS 5 and FSR as SDR sRGB (an HDR source's PQ / HLG light over SDR white: the SDR
+  range exactly, the light above white rolled off toward 5 x white in extended sRGB, where
+  highlight texture keeps its motion; `--src-hdr` comes with every HDR source) at the decoded
+  size (a larger working size is shrunk back with Lanczos3), then blends the pictures at the working
+  size, TrueHDR included. On an exact pan this removes the motion loss of PQ input (4.6 dB),
+  RTX HDR (2.7 dB) and an enlarged working size (5 to 8 dB), and a sharpened picture keeps its
+  flow; `SMV_RIFE_TWO_DOMAIN=0` runs the IFNet on the pictures as before. Live RIFE and Frame
+  Blend do the same: the motion frame is the finished picture at the working size, or at the
+  capture size when the working size enlarges it (Fill at DLAA), the HDR desktop's PQ read as SDR
+  sRGB over the desktop's SDR white (with RTX HDR: the SDR picture before TrueHDR), so the live
+  IFNet and encode engines are built at the motion frame's size (`mph` / `mpw` / `motw` / `moth`
+  on the LIVE READY line). RIFE (DRBA) does the same on both routes: its ring keeps each frame's
+  motion frame beside the picture, the encodes, block0 and its flows, the windows and the DRM
+  timestep map live at the motion frame (block0 takes fp32 frames: the two motion frames widened
+  per call), and the blend warps the pictures; on exact pans DRBA gains 3.8 to 4.7 dB on PQ, 2.4
+  to 2.8 with RTX HDR and 3.5 to 6.1 at a 2x working size, SDR at the picture's size stays within
+  76 dB of the one-domain tweens (`harness\drba_two_domain\drba_pan.py`). A picture with heavy
+  highlights (a third of its pixels above SDR white) ties: the roll-off keeps 0.3 to 2.2 dB less
+  motion above white than PQ codes do, and 0.5 to 0.8 dB more below it. Against rev 6's
+  engines the tweens move by up to 7 codes at 8 bits on edges (62.9 dB at the worst tween):
+  rev 6 rounded the normalised flow and 1 - mask to fp16 inside its warp, the host's tap does
+  not. Built from these files the engines are
   bit-identical to the per-size ones, except gmflow_bidir (its size-free branch, see the GMFlow
   bullet below).
   `SMV_ONNX_DIR` moves the folder.
@@ -130,9 +163,9 @@ RTX VSR / HDR and all three codecs.
   by the host.
 * `engine/dlssg/`: the DLSS 4.5 frame generation host (`dlssg2f.exe`, D3D12, Streamline runtime
   bundled), driven by the native host.
-* `engine/dlssnr/`: the DLSS 5 Neural Rendering pass (`--dlssnr`). A pipe
-  server host (`dlssnr.exe` + the `nvngx.dll` caller shim, both built from `build_src/` and shipped)
-  around NGX feature 18. The runtime `nvngx_dlssnr.dll` is gitignored and never shipped: the DLSS 5
+* `engine/dlssnr/`: the DLSS 5 Neural Rendering pass (`--dlssnr`): the NR core around NGX feature
+  18 (`build_src/nr_host.*`, compiled into the native host) and the `nvngx.dll` caller shim it
+  loads (built from `build_src/`, shipped). The runtime `nvngx_dlssnr.dll` is gitignored and never shipped: the DLSS 5
   panel downloads the pinned community build (`DLSSNR_DL` in `src/main.ts`, one rhi-repo release
   asset, the DLL's SHA256 checked before the copy) or installs a dropped copy (other builds install
   with an "unverified" notice). `nvngx_dlss.dll` is optional (the NGX core only warns without it).
@@ -215,8 +248,9 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
   `samples/test.mp4` asserting frame counts, VFR duration, `.part` promotion, the Frame Blend
   backend and, with `--full`, the HDR10 boxes, DV record, HDR10+ SEI, DLSS-G with DLSS 5 in
   one render (SKIP without the runtimes) and the live echo / RIFE cases. Run after every
-  engine change (`npx tsc` first). Checks are structural (TensorRT-RTX output is not run-to-run
-  bit-stable, so no md5 case); `--trt` is accepted and ignored.
+  engine change (`npx tsc` first). Checks are structural, plus one frame-md5 check with `--full`:
+  the resident host's second RIFE render must decode to the first one's frames; `--trt` is accepted
+  and ignored.
 * `python scripts/scan_index.py`: the renderer scan described above (`index.html` + `app.js`).
 
 ## Engine CLI
@@ -257,7 +291,7 @@ Models (GMFSS is the default, the anime specialist):
 * `--lsfg` "Frame Blend": the cheapest true interpolation. RIFE's IFNet pyramid gives the flow
   and mask, and the two frames are warped and merged at the processed size, no refinement; it
   runs on the plain RIFE engines. `--scale` sets the working size it runs at (the DLSS mode).
-* `--nvof` "NVIDIA Optical Flow (direct)" (2026-09-21): the driver's optical-flow hardware through
+* `--nvof` "NVIDIA Optical Flow" (2026-09-21): the driver's optical-flow hardware through
   `nvofapi64.dll` (System32, opened by full path, nothing bundled; the MIT interface headers are
   vendored in `engine/live/build_src/nvofa`) run by `smv-live.exe` itself. One Execute per pair
   gives both fields (grid 4, fast preset, gray8 luma of the two frames, temporal hints off), the
@@ -295,7 +329,7 @@ Models (GMFSS is the default, the anime specialist):
 * `--dlssg` "NVIDIA DLSS 4.5": DLSS Frame Generation through `dlssg2f.exe` (RTX 40 / 50), in the
   same render as every other pass: DLSS 5 before it, RTX VSR / TrueHDR on its output.
 
-Passes, in NVIDIA's order (the only order, both modes): on each source or captured frame Restore, the
+Passes, in this order (both modes): on each source or captured frame Restore, the
 resize to the working size (the DLSS mode's share of the output, live of the presented size), DLSS 5, FSR's
 RCAS sharpen and RTX TrueHDR (SDR to HDR10); then the interpolation at the working size on those
 finished frames, so frame generation comes last and the generated frames inherit the sharpen and the
@@ -362,7 +396,7 @@ post-processing after the upscaler (NIS).
   in-engine. B-frames are disabled for DV renders (dovi_tool needs an Annex-B stream whose coding
   order equals display order for an exact remux). Best-effort: any failure keeps the HDR10 file.
   The preview does not change with `--dv` (the pixels are identical HDR10). Legal: `dvvC` is our
-  own code writing a public box format; the UI says "Profile 8.1 (experimental)", credits
+  own code writing a public box format; the UI says "Profile 8.1", credits
   dovi_tool and carries a non-affiliation disclaimer. Dolby and Dolby Vision are trademarks of
   Dolby Laboratories; this project is independent and bundles no Dolby software.
 * `--hdr10plus`: SMPTE ST 2094-40 dynamic metadata measured per frame during the HDR render
@@ -372,9 +406,29 @@ post-processing after the upscaler (NIS).
   the two combine on one file. Same `-bf 0` rule, MP4 + HEVC only, HDR10 fallback.
 * `--no-interp`: re-encode at source fps with the passes only (no model loaded).
 
+Colour conversions (`probe.ts` `decodeRgbVf` / `dscaleVf`, `encode.ts` `encodeVf`): the decode's
+YUV -> RGB and the encoder's RGB -> YUV run through zimg (`zscale`, exact matrix and range math,
+Lanczos3 chroma, rounding without dither), the pack between planar and packed samples stays
+swscale's. swscale's default conversions read an 8-bit source 0.9 to 1.5 codes dark and wrote the
+encoder's luma 1.2 ten-bit codes bright; its accurate flags (`-sws_flags`, on both commands for
+what it still converts) fix the 8-bit decode only. Through the product, real frames against the
+source's own planes (`harness\decode_encode_accuracy\colour_gate.py`, lossless encodes): luma bias
+-4.55 -> -0.07 ten-bit codes and 46.5 -> 60.1 dB on an 8-bit source (the product encoder: 46.5 ->
+50.2 dB), the decode-side downscale +1.18 -> -0.08, a full-range source -3.5 -> -0.09; what is left
+is the floor of any RGB pipeline (RGB cannot hold every YUV code). zimg takes planar YUV without
+alpha in BT.709, BT.601 (smpte170m, bt470bg) and BT.2020 non-constant; any other source keeps
+swscale. An untagged source converts with the matrix players assume for its size (BT.709 from HD up,
+BT.601 below), the output with the one of its own size, which the conversion then names on the
+output (transfer and primaries stay untagged); before, an untagged HD source ran through BT.601
+both ways. The decode costs 3 to 7 % more than swscale's default (4K: 10.8 -> 11.1 ms a frame).
+
 Output:
 * Always 10-bit, always visually lossless, no quality knob. `--codec hevc` (default, `hevc_nvenc`,
   CPU `libsvtav1` fallback without NVENC), `av1` (`av1_nvenc`), `vvc` (`libvvenc`, CPU).
+* 4:4:4 is kept where the encoder allows it (HEVC through NVENC, `yuv444p10msble`: its ten bits in
+  the high bits of 16, as `p010le`; handed 16-bit samples NVENC dropped the low six, half a code
+  dark on every plane): a 4:4:4 YUV source and an RGB or palette source, whose every pixel has its
+  own colour (an RGB source: 50.2 -> 65.2 dB against its own frames). AV1 and VVC write 4:2:0.
 * NVENC: constant-quality VBR at max effort, preset p7, full-resolution multipass, rc-lookahead 1,
   HEVC CQ 17, AV1 CQ 22 (verified against a lossless 8K master; CQ is saturated at max effort, the
   effort ladder is what moves quality, and shallow lookahead beats deep). Above 120 fps output the
@@ -394,17 +448,22 @@ Output:
   flag is refused.
 * Every audio, subtitle, chapter and font track is copied (`--no-passthrough` keeps first audio
   only); the output auto-switches to `.mkv` when the tracks need it, and HDR into MKV keeps the
-  full metadata through a two-stage finalize. Source colour signalling rides through `setparams`.
+  full metadata through a two-stage finalize. Source colour signalling rides through `setparams`;
+  an RGB source (RGB, palette or gray pixels, or the `gbr` matrix) has no YUV matrix to carry, so
+  its YUV output takes BT.709 (BT.601 below HD) at TV range and the encoder converts with it.
 * Renders write `<name>.part.<ext>` and promote by atomic rename at success, so a cancelled or
   crashed render never leaves a truncated file or destroys the one it replaces.
 * VFR sources (average rate disagrees with the container rate by more than 0.5%) decode at the
   constant average rate (`-fps_mode cfr`) so duration and audio sync hold; a notice is logged.
 * `SIZE cur projected` rides beside each PROGRESS heartbeat for the GUI's size estimate; a one-time
   warning fires when the projection exceeds the free space on the output drive.
-* GMFSS renders are bit-deterministic on both the TRT and eager paths (softsplat accumulates in
-  int64 fixed point, cudnn benchmark off); `smoke.py --full` asserts it. The RTX passes are NGX
-  black boxes with no determinism contract, so HDR / VSR renders are outside that guarantee, and
-  TRT-path RIFE renders differ run to run at the PSNR level.
+* Renders are deterministic: the same file with the same settings decodes to the same frames run
+  after run, in separate processes or through the resident host, and the product encoder then writes
+  byte-identical files. That holds for every model on the fixed-shape TensorRT-RTX engines, the host
+  kernels (the splats accumulate in int64 fixed point), the NGX passes (DLSS 5, RTX VSR, RTX HDR),
+  with TensorRT-RTX graph capture on or off. The exception is `--fruc`: NvOFFRUC changes about 1 in 5
+  generated frames very slightly from run to run, inside NVIDIA's library (serialising every CUDA
+  launch does not change it). `smoke.py --full` asserts the RIFE case.
 
 ## Live mode
 
@@ -461,8 +520,8 @@ it, the captured frames pass through at their own rate and the live effects (Res
 Upscale to, RTX VSR, RTX HDR, DLSS 5) apply to each of them (with no effect on it is a bit-exact
 passthrough, the transport test).
 
-Live DLSS 5 (`--dlssnr --nr-structure F --nr-tone F --nr-style N`): ONCE per captured frame in
-NVIDIA's order, on the model frame after Restore and the resize to the working size and before the
+Live DLSS 5 (`--dlssnr --nr-structure F --nr-tone F --nr-style N`): ONCE per captured frame,
+on the model frame after Restore and the resize to the working size and before the
 model, so the generated frames inherit the pass. The native host runs it with the offline route's
 core, handoff and motion (`nativeLiveNrInit`, `nativeNrFrame`): the NR core
 (`engine/dlssnr/build_src/nr_host.cpp`, `nr::Host::startup` on a private D3D12 device on the adapter
@@ -472,14 +531,17 @@ current -> previous, the offline `k_nvofUp` + `k_nrMv` field); the server is nev
 `DLSSNR.Reset` is 1 only on a stream's first frame: the session start and the first frame after a
 pause. SDR planes (B, G, R) reach the model as R, G, B (`k_nrIn` / `k_nrOut` take the R plane with a
 negative plane stride); HDR planes (PQ BT.2020) go through `k_nrInPq` / `k_nrOutPq`, the `_nr_scrgb`
-math (scRGB normalised by the SDR reference white, inverse sRGB EOTF, model, sRGB EOTF back, pixels
-with any channel above SDR white untouched; gate `harness\live_nvidia_order\nr_pq_gate.py` against
-fp64). With RTX HDR on, TrueHDR converts after the pass (NVIDIA's order), so the pass works on the
+math (scRGB normalised by the SDR reference white and clamped there, inverse sRGB EOTF, model, sRGB
+EOTF back, plus each channel's light above SDR white: the SDR range gets the pass's result exactly as
+an SDR picture would, and a highlight keeps its light above white on top of the edited picture under
+it, so the output follows the source continuously across SDR white at any number of passes; gates
+`harness\live_nvidia_order\nr_pq_gate.py` against fp64, `harness\nr_white_residual` for the
+highlights). With RTX HDR on, TrueHDR converts after the pass, so the pass works on the
 capture's SDR range (`k_sdrEncode`'s planes) with no PQ math; the PQ path is for HDR windows.
 A capture byte-identical to the previous one (`k_rawDiff`, one readback per captured frame) takes the
 last output and skips Restore, the resize, the evaluate, FSR and TrueHDR, so a paused picture stays
 exactly still. Exe log line `live DLSS 5 native: on, WxH per captured frame on the model frame after
-Restore and the resize (NVIDIA order), ...`; the teardown prints the evaluate cost and the reused
+Restore and the resize, zero-copy, ...`; the teardown prints the evaluate cost and the reused
 captures. A core that cannot start, a model frame above 3840x2160 (the largest size the core was
 probed at: 36.9 ms per evaluate) or `SMV_LIVE_NR_NATIVE=0` skips the pass with one line and the
 session runs. The DLSS-G route never runs it (the NR host starves DLSS-G). KNOWN LIMIT (measured
@@ -657,11 +719,11 @@ sum) and a failed TrueHDR eval fails the render, as python's does. Gate: harness
 order against torch). A render that used the RTX Video bridge ends the resident host after
 the item (NGX is single-instance per process; the next render spawns a fresh host). DLSS 5 runs
 there too (`nativeOfflineNr`, once per decoded frame at its size, BEFORE the interpolation, so every
-model and every output frame reads DLSS 5 output: NVIDIA's order, frame generation after DLSS 5, the
+model and every output frame reads DLSS 5 output: frame generation after DLSS 5, the
 same place live runs it):
 `render.py` passes `--dlssnr --nr-structure --nr-tone --nr-style` when `nvngx.dll` and
 `nvngx_dlssnr.dll` are in `SMV_DLSSNR_DIR` / `engine\dlssnr` (importing `dlssnr` would import
-torch), and the host runs the NR core with `dlssnr.exe`'s own bring-up (`nr::Host::startup` on a
+torch), and the host runs the NR core with its own bring-up (`nr::Host::startup` on a
 private D3D12 device made from the System32 DLLs, not Streamline's interposer) on one RGBA16F
 frame per decoded frame, in place on the padded model input (the pad refilled from the edge like
 the decode's pack), `dlssnr.py`'s fp16 clamp and rounding on the way in and out, Reset on the
@@ -669,7 +731,7 @@ first frame only (offline accumulates, live does not). The identical-pair test c
 decoded frames before the pass rewrites them: the pass keeps history, so two identical frames can
 come back a fraction of a level apart. So a decoded frame byte-identical to the previous one (the
 decoder's bytes, `k_rawDiff`) takes the previous frame's DLSS 5 output with no evaluate and skips
-the pack and NVIDIA order's stage: a paused or held picture stays exactly still, and that test also
+the pack and the pre-model stage: a paused or held picture stays exactly still, and that test also
 decides the identical pair (`SMV_NR_REUSE=0` evaluates every frame; the summary line counts the
 reused frames). The frame crosses zero-copy:
 `nr::Host::startShared` makes two shared D3D12 buffers in the copy footprint layout and a shared
@@ -690,6 +752,33 @@ action: NeuralScreen's reset 42 of 120 frames of a fast anime clip). `DLSSNR.Use
 in every reference host. Proof of the contract: this core handed NeuralScreen's own motion fields
 and resets reproduces NeuralScreen within 1 code (harness neuralscreen_compare). CPU staging passes no motion (the
 ready line says `no motion vectors`); `SMV_NR_MV=0` / `SMV_NR_AUTOMASK=0` turn either off.
+HDR video (PQ or HLG: `--src-hdr pq|hlg`, which the render and the preview pass from the probe) takes
+Live's HDR math around the pass, `k_nrInPq` / `k_nrOutPq` (`hlg` = 1: BT.2100's reference display,
+1000 nits, system gamma 1.2): the SDR range under BT.2408's reference white (203 nits, 75 % HLG) goes
+through and a brighter pixel keeps its light above white on top of the pass's result, as on Live, on
+both the zero-copy and the staging route (at the product level: `harness\nr_white_residual`: the SDR
+range byte-identical to the band it replaced, a glow ramp's largest step at 10 passes 0.177 -> 0.012 x
+white = the 10-bit source's own step); the ready line adds `PQ video: its SDR range through the pass,
+white 203 nits` (or HLG).
+Without it the pass would read PQ / HLG codes as SDR gamma, a flat grey picture. Gates
+`harness\offline_hdr_nr` (`nr_hdr_gate.py` against fp64; `hdr_nr_ab.py`: SDR renders bit-identical,
+the SDR range at the pass's own noise floor against DLSS 5 on the same picture in SDR).
+Video memory: DLSS 5 is built last, after the engines and buffers, and only as many passes as fit in
+what the GPU has free (`nativeVideoMemoryRoom`: the driver's own figure for every process,
+`NvAPI_GPU_GetMemoryInfoEx`'s `curAvailableDedicatedVideoMemory`, the number `nvidia-smi` shows, less
+a reserve of 4 % of the card, 512 MiB at least; `cudaMemGetInfo` and the DXGI budget describe this
+process alone: with 15 GB held by another process a second process still read 23 GB free). The NR
+core prices a pass as the one built before it took (`Settings::memoryRoom`, 933 MiB at 4K, 360 at
+1080p, 186 at 480p) plus what the first frames add, and ends the chain there: `DLSS 5 runs M of N
+passes (video memory: ...)`, a chain that equals a clean M-pass render frame for frame. Memory past
+the limit would not fail: Windows moves what does not fit into system memory, which slows the render
+and every other app on the GPU (measured at 4K, 10 passes, 15 GB held by a second process: the cap
+built 4 passes and the render ran 3.3x faster, the other process read its memory in 29 ms where it
+took 578 ms without the cap). Every session, with or without DLSS 5, also reads the driver's count of
+allocations moved out of video memory at its start and after its first frames, and says `video memory
+ran out: ...` once when it rose. Gate `harness\nr_memory_note\cap_gate.py`. Live RIFE and Frame
+Blend size their batch before those passes are built and leave them their share (Live RIFE batching,
+below).
 `SMV_NR_STAGED=1` and the preview's `--nr-delta` (it needs the host copies) keep `renderFrame`
 through its upload / readback staging; a handoff that cannot start falls back to it with an
 `offline: DLSS 5 zero-copy handoff unavailable` line (no `[dlss5]` tag: the pass still runs). The
@@ -701,7 +790,8 @@ the rest of the render; NGX prints to the process stdout, so a one-shot host mov
 output to a private handle first; NGX has no teardown, so the host leaves through `ExitProcess`
 and a resident host ends after the item. `--nr-delta PATH` (2026-09-24, the preview's change
 mask) writes the pass's own change per pixel, the largest of `|after - before|` over R, G, B
-(`before` = its fp32 input, `after` = its clamped fp16 output, `preview.py`'s measure), as float32
+(`before` = its fp32 input, `after` = its clamped fp16 output, `preview.py`'s measure; on HDR video
+both are the frame's own PQ / HLG codes before and after the pass), as float32
 at the decoded size (the last frame's; the preview scales it to its output size). Gate: harness `offline\gate_nr.py` (with Reset on every
 frame on both sides, `SMV_NR_RESET_EVERY=1` and a python wrapper, real frames bit-exact against
 `dlssnr.exe`; in the product's temporal mode too on the plain case). FIXED the same day on
@@ -767,7 +857,7 @@ own path) runs inside the exe, the engine models through the TensorRT-RTX C++ ru
 process is part of a live session and `engine/live_server.py` is deleted; `--native` and
 `--python` are still accepted and ignored, and the live-only levers `SMV_LIVE_NATIVE`,
 `SMV_LIVE_TRT=0` and `SMV_NATIVE_LOOKUP` / `SMV_NATIVE_BUILD` no longer exist
-(`SMV_RIFE_BATCH` still acts on OFFLINE renders).
+(`SMV_RIFE_BATCH` still acts, on both routes).
 A session the host cannot start ends on its reason line (log: `native host: <reason>`, then
 `this session cannot start in the native host`; the app keeps the reason on the status line); a
 refused native DLSS 5 pass (above 3840x2160, `SMV_LIVE_NR_NATIVE=0`, no zero-copy capture) runs
@@ -895,8 +985,8 @@ the size derivation against the python expression) and the `upto_*` cases of `ef
 runs natively too (2026-09-15): `--restore` rides on the handoff line, so the python handoff builds and
 warms the Real-ESRGAN TensorRT engine into the shared cache and hands its path over like the IFNet's
 (`NATIVE-PATH restore=` / `rjit=`, the restore kernels merged into the shared jit cache); the host
-runs it once per captured frame before the model (NVIDIA's order: on the capture itself, TrueHDR's
-result when that runs; `k_restIn` = torch `.half()` of the frame, one `enqueueV3`, the engine at the
+runs it once per captured frame before the model (on the capture itself, as SDR planes when RTX
+HDR is on: TrueHDR runs later, after Restore, DLSS 5 and FSR; `k_restIn` = torch `.half()` of the frame, one `enqueueV3`, the engine at the
 capture size), then folds the 4x output straight to the model size into the model frame, in place of
 the capture shrink, so every model, DLSS 5 and every presented frame read restored frames (`k_restFoldH` / `k_restFoldV` = the antialiased pair with `out.clamp(0,1)` folded into the taps,
 or `k_restToF` + `k_fitPlanar` + `k_clamp01` when the target enlarges beyond 4x); the resident host keeps
@@ -1033,8 +1123,19 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   loads the IFNet's file and merges the encoder's into the same cache (the handoff's
   `NATIVE-PATH ejit=` line); without the merge the encode context recompiled its kernels on
   every first session of an engine pair (0.5 s of the warm start, measured 2026-09-14).
-* Live RIFE batching: the dynamic timestep axis enqueues a group at its true length
-  (`SMV_RIFE_BATCH` = 8 for the fixed B=8 engine, 1 for one enqueue per tween). TRT-RTX whole graph
+* Live RIFE batching: the dynamic timestep axis enqueues a group at its true length, up to 8
+  timesteps a call. The IFNet context takes its activations from the host (`kUSER_MANAGED`,
+  `nativeIfnetMemory`), sized with `updateDeviceMemorySizeForShapes` for the batches the session
+  runs: DRBA one timestep a call (199 MiB instead of batch 8's 1589 MiB at 896x512), RIFE and Frame
+  Blend up to 8, lowered to the largest batch whose activations (433 MiB a padded megapixel per
+  timestep: batch 8 is about 7 GB at 1080p) and tween buffers fit in the free video memory beside
+  what RTX HDR, RTX VSR and DLSS 5's passes take after it (`nativeLaterNeed`): a smaller batch only
+  runs more calls, a cut DLSS 5 pass would change the picture. The log says `video memory: the model
+  runs N of up to 8 in-between frames a call ...` when it lowered the batch; `SMV_RIFE_BATCH=N` caps
+  it at N. A context sized for batch b computes a batch of b bit for bit as TensorRT's own allocation
+  does; a smaller batch picks other kernels (the tweens move by rounding: 0.01 dB on the known pan).
+  Gates `harness\vram_estimate` (engine_mem.py, session_mem.py), `live_two_domain\live_pan.py
+  --gen 3`, `drba\drba_resident.py`. TRT-RTX whole graph
   capture is the live default (`SMV_TRT_GRAPH=0` disables; offline opt-in with `=1`); it cut live
   enqueue CPU per tween by 49%. Gotcha kept from the dropped flow-warp class (2026-09-21, harness
   `onnx\fwnan`): TRT-RTX 1.6.1.120 miscompiles an Expand of batch-1 inputs that feed both a
@@ -1056,7 +1157,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_TRT_CACHE_KIND` | suffix for the JIT cache file (live sets `live`) |
 | `SMV_RIFE_SAFEPAD=1` / `SMV_LIVE_SAFEPAD=1` | restore the 1152x640 RIFE safe-zone pad |
 | `SMV_RIFE_FLOW_SCALE` | diagnostic live flow pyramid scale (power of two in 0.25..1.0, forces a cold engine) |
-| `SMV_RIFE_BATCH` | offline RIFE batching: unset dynamic, `8` fixed, `1` unbatched (live is always the dynamic class) |
+| `SMV_RIFE_BATCH` | RIFE batching: offline `1` = the unbatched engine (else the fixed class of the multiplier); live `N` = at most N timesteps a call |
 | `SMV_LIVE_XQPHASE=1`, `SMV_LIVE_XQ_CAPEV=1`, `SMV_LIVE_XQ_WAITCAP=1` | present-loop phase breakdown, event-driven capture probe, 1 ms wait cap (each about 0.4%) |
 | `SMV_LIVE_HDR` | force live HDR on or off |
 | `SMV_LIVE_RESIDENT=0` / `SMV_LIVE_RESIDENT_IDLE_S` | one `smv-live.exe` per live session instead of the resident host / the resident host's idle limit in seconds (default 600) |
@@ -1071,6 +1172,8 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NR_MV=0` | DLSS 5 gets no motion vectors (both routes; offline: the pre-2026-09-27 pass, live: every frame a Reset); a measurement lever, never a product setting |
 | `SMV_NR_REUSE=0` | DLSS 5 evaluates every frame, also one identical to the previous one (both routes; by default an identical frame reuses the last output, so a paused picture stays still); the A/B and trigger-test lever, never a product setting |
 | `SMV_NR_AUTOMASK=0` | DLSS 5 runs with `DLSSNR.UseAutoMask` 0 (both routes, read by the NR core); a measurement lever, never a product setting |
+| `SMV_VRAM_CAP=0` | no video memory limit: DLSS 5 builds every pass asked for and live RIFE / Frame Blend keep their batch of up to 8, whatever the GPU has free (both routes); the A/B lever of the cap, never a product setting |
+| `SMV_VRAM_MIB=<MiB>` | the GPU's memory as the app's memory checks see it, the free memory shrinks with it (both routes): a smaller card's trigger test of the cap and of the `video memory ran out` line on a card everything fits in |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..4, default 3 offline, 2 live) |
@@ -1232,12 +1335,14 @@ generated frame, read back from the native swap chain after polling `GetLastPres
 window is on screen. DLSS-FG requires hardware-accelerated GPU scheduling and an RTX 40 / 50 GPU
 (exit code 2 otherwise).
 
-### DLSS 5 Neural Rendering host (`dlssnr.exe` + `nvngx.dll`)
+### DLSS 5 Neural Rendering core and caller shim (`nvngx.dll`)
 
-An offline D3D12 host that runs NGX feature 18 over video frames at DLAA quality. `nvngx.dll`
-beside it is the caller shim. Both build from `build_src/` and ship prebuilt. The runtime
-`nvngx_dlssnr.dll` is NVIDIA property, not redistributable and not published by NVIDIA; the user
-supplies it (exit code 2 with a reason when absent).
+The NR core runs NGX feature 18 over video frames at DLAA quality on its own D3D12 device;
+`smv-live.exe` compiles it in (`engine/live/build_src/build.bat` takes `nr_host.cpp` from here).
+`nvngx.dll` in `engine/dlssnr` is the caller shim the core loads; it builds from `build_src/` and
+ships prebuilt. The runtime `nvngx_dlssnr.dll` is NVIDIA property, not redistributable and not
+published by NVIDIA; the user supplies it (without it a render drops the pass with a
+`[dlss5] unavailable` line).
 
 Requirements: Visual Studio 2022+ with the C++ workload (verified with VS 2026 Community) and the
 public NVIDIA DLSS SDK for its NGX headers only (`%NGX_SDK%` = the folder containing
@@ -1247,19 +1352,16 @@ public NVIDIA DLSS SDK for its NGX headers only (`%NGX_SDK%` = the folder contai
 set NGX_SDK=D:\path\to\DLSS
 build.bat
 ```
-`build.bat` finds `vcvars64.bat` through `vswhere` when `cl` is not on the path, compiles `shim.cpp`
-to `..\nvngx.dll` and `main.cpp` + `nr_host.cpp` to `..\dlssnr.exe`, linking the real `d3d12.lib` /
-`dxgi.lib` (no Streamline on this route). `createDevice` resolves `CreateDXGIFactory2` and
-`D3D12CreateDevice` from the System32 DLLs by name anyway (2026-09-23): the same core is linked
-into `smv-live.exe`, where the plain imports resolve to Streamline's interposer, and its offline
-host calls `startup` too.
+`build.bat` finds `vcvars64.bat` through `vswhere` when `cl` is not on the path and compiles
+`shim.cpp` to `..\nvngx.dll`. `createDevice` resolves `CreateDXGIFactory2` and
+`D3D12CreateDevice` from the System32 DLLs by name: in `smv-live.exe` the plain imports resolve
+to Streamline's interposer.
 
 Files: `nr_host.h` / `nr_host.cpp` (NGX bring-up on the core's own D3D12 device, feature 18
 creation, one evaluate per frame on FP16 colour and output textures, fed through CPU staging
 (`renderFrame`) or the zero-copy shared buffers `smv-live.exe` uses (`startShared` /
 `submitShared`), with `setModuleDir` pointing the snippet, the shim and the NGX log at
-`engine/dlssnr`), `main.cpp` (pipe server and the
-`--probe` mode), `shim.cpp` / `shim_abi.h` (the caller shim and its ABI).
+`engine/dlssnr`), `shim.cpp` / `shim_abi.h` (the caller shim and its ABI).
 
 Why a DLL named `nvngx.dll`: the NR runtime validates its caller and refuses (`0xBAD00002`)
 unless the module calling its entry points is named `nvngx.dll`. The shim is a set of thin,
@@ -1311,7 +1413,9 @@ host section above), a Windows 11
 SDK (for the C++/WinRT Windows.Graphics.Capture headers), the TensorRT-RTX SDK zip (login gated)
 extracted anywhere (only `include\` and `lib\tensorrt_rtx_1_6.lib` are used) and the public NVIDIA
 DLSS SDK for its NGX headers (`NGX_SDK`, the same variable the dlssnr host build uses; no `d3d12.lib`
-on purpose, `D3D12CreateDevice` must keep resolving from the Streamline interposer). No CUDA toolkit: the
+on purpose, `D3D12CreateDevice` must keep resolving from the Streamline interposer). NVAPI (the free
+video memory) comes with the Streamline SDK: `build.bat` takes the MIT headers and `nvapi64.lib` from
+`%SL_SDK%\external\nvapi`; the lib opens the driver's own `nvapi64.dll` at run time. No CUDA toolkit: the
 CUDA headers and import libs come from the app's own `engine\runtime\Lib\site-packages\nvidia\cu13`
 (`SMV_CU` overrides); that wheel lacks the internal `crt\` directory, so `cuda_shim\crt\host_defines.h`
 supplies the one header `cuda_runtime_api.h` opens with. Do not grow that shim; install the real
@@ -1366,7 +1470,7 @@ reformatted.
   their order, string literals are never split and comments never re-wrapped, so a pass changes
   whitespace only) formats our own C++ through `scripts/clang-format.js` (`--check` = report only;
   extra file arguments are formatted too): the native host (`engine/live/build_src`), the DLSS 5 core
-  and the dlssnr tool (`engine/dlssnr/build_src`), the DLSS 4.5 host's `main.cpp` and the FRUC bridge.
+  and its caller shim (`engine/dlssnr/build_src`), the DLSS 4.5 host's `main.cpp` and the FRUC bridge.
   Left as they are: the vendored NVIDIA headers (`nvofa`, `cuda_shim`), the RTX Video SDK bridge
   sources and `sl_focus_shim.h`. It uses the clang-format that ships with Visual Studio 2026 (the
   "C++ Clang tools for Windows" component, found through vswhere); `CLANG_FORMAT` overrides it.

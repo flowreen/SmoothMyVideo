@@ -99,10 +99,11 @@ def engine_name(name, shapes, input_names=None, dyn_batch=None):
 # kOnnxRev. Rev 2: the PRelu rewrite
 # (trt_runtime._fuse_prelu). Rev 3: RIFE IFNet / block0 take f0 / f1 in fp16
 # (trt_runtime._half_features). Rev 4: the RIFE IFNet's x and the encode's img in fp16
-# (trt_runtime._half_frames). Rev 5: the RIFE IFNet's output merged in fp16
-# (trt_runtime._half_output).
+# (trt_runtime._half_frames). Rev 5: the RIFE IFNet's output merged in fp16. Rev 6: the RIFE IFNet's
+# timestep in fp16 (trt_runtime._half_timestep). Rev 7: the RIFE IFNet hands out its final flow and
+# blend mask in fp16 instead of the tween merged; the host warps and blends (trt_runtime._half_flow_mask).
 ONNX_DIR = os.environ.get("SMV_ONNX_DIR") or os.path.join(HERE, "onnx")
-ONNX_REV = 5
+ONNX_REV = 7
 
 
 def onnx_path(key):

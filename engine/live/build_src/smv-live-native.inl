@@ -290,8 +290,8 @@ __global__ void k_packInDirectHdr(const unsigned short* __restrict__ src, int cw
     dst[2 * planeStride + o] = c;
 }
 
-// HDR, image scale under 1.00: convert the WHOLE capture to planar PQ first, because python
-// rescales ON PQ (the HDR fill rule), then the shared resize pair runs on those values.
+// HDR, image scale under 1.00: convert the WHOLE capture to planar PQ first, because the HDR
+// fill rule rescales ON PQ, then the shared resize pair runs on those values.
 __global__ void k_pqPlanar(const unsigned short* __restrict__ src, int cw, int ch,
                            float* __restrict__ dst)
 {
@@ -635,7 +635,7 @@ __global__ void k_fitPlanar(const void* __restrict__ src, int half, int planeStr
 }
 
 // a planar frame (w x h, planes ps apart, rows rs apart) into the padded model frame (pw x ph,
-// planes dps apart) with the edge replicated as the packers pad it: the NVIDIA order's frame,
+// planes dps apart) with the edge replicated as the packers pad it: the decoded frame,
 // upscaled before the model
 __global__ void k_padPlanar(const float* __restrict__ src, int ps, int rs, int w, int h,
                             float* __restrict__ dst, int pw, int ph, int dps)
@@ -928,13 +928,16 @@ __global__ void k_nrOut(const unsigned short* __restrict__ src, int dw, int dh,
     }
 }
 
-// Live DLSS 5 on HDR planes (PQ BT.2020, (R, G, B)): only the SDR range of the window goes
-// through the pass. In: back to scRGB (the ST 2084 EOTF, 10000 / 80, the
-// inverse of scrgb_to_pq2020's BT.2087 matrix), normalised by the SDR reference white (scRGB
-// units), clamped to 0..1, the sRGB inverse EOTF: the SDR range of the window. Out: the model's
-// result through the sRGB EOTF times the SDR white back to PQ, except where any channel of the
-// frame was above SDR white: those pixels keep their original value (the HDR highlights the pass
-// never saw). In place, the edge replicated into the pad as k_nrOut does.
+// DLSS 5 on HDR planes (PQ BT.2020, or HLG BT.2020 when hlg; (R, G, B)): live's HDR capture and
+// offline HDR video. Only the SDR range of the picture goes through the pass. In: back to scRGB (the
+// ST 2084 EOTF, 10000 / 80, the inverse of scrgb_to_pq2020's BT.2087 matrix; HLG: hlg2020_to_scrgb),
+// normalised by the SDR reference white (scRGB units), clamped to 0..1, the sRGB inverse EOTF: the
+// SDR range of the picture. Out: the model's result through the sRGB EOTF times the SDR white, plus
+// each channel's light above SDR white (the part the clamp kept from the pass), back to PQ (or HLG).
+// So the SDR range gets the pass's result as an SDR picture would, and a highlight keeps its light
+// above white on top of the edited picture under it: the output follows the source continuously
+// across SDR white, whatever the size of the edit. In place, the edge replicated into the pad as
+// k_nrOut does.
 __device__ __forceinline__ void pq2020_to_scrgb(float p0, float p1, float p2, float& r, float& g, float& b)
 {
     const float M1 = 0.1593017578125f, M2 = 78.84375f;
@@ -951,19 +954,64 @@ __device__ __forceinline__ void pq2020_to_scrgb(float p0, float p1, float p2, fl
     g = -0.12456141f * l[0] + 1.13296051f * l[1] - 0.00839911f * l[2];  // 4-digit matrix above
     b = -0.01816769f * l[0] - 0.10056060f * l[1] + 1.11872828f * l[2];
 }
+// HLG on BT.2100's reference display (1000 nits peak, system gamma 1.2), so 75 % HLG = 203 nits,
+// BT.2408's reference white. In: the inverse OETF (scene light), the OOTF on the scene luminance,
+// the BT.2020 -> 709 matrix of pq2020_to_scrgb, scRGB units. Out: the reverse (the 4-digit matrix,
+// the inverse OOTF on the display luminance, the OETF).
+__device__ __forceinline__ void hlg2020_to_scrgb(float e0, float e1, float e2, float& r, float& g, float& b)
+{
+    const float A = 0.17883277f, B = 0.28466892f, C = 0.55991073f;
+    const float e[3] = { e0, e1, e2 };
+    float s[3];
+    for (int c = 0; c < 3; c++)
+    {
+        const float v = e[c] < 0.0f ? 0.0f : (e[c] > 1.0f ? 1.0f : e[c]);
+        s[c] = v <= 0.5f ? v * v / 3.0f : (expf((v - C) / A) + B) / 12.0f;
+    }
+    const float ys = 0.2627f * s[0] + 0.6780f * s[1] + 0.0593f * s[2];
+    const float k = ys > 0.0f ? (1000.0f / 80.0f) * powf(ys, 0.2f) : 0.0f;
+    const float l[3] = { s[0] * k, s[1] * k, s[2] * k };
+    r = 1.66051121f * l[0] - 0.58771059f * l[1] - 0.07280062f * l[2];
+    g = -0.12456141f * l[0] + 1.13296051f * l[1] - 0.00839911f * l[2];
+    b = -0.01816769f * l[0] - 0.10056060f * l[1] + 1.11872828f * l[2];
+}
+__device__ __forceinline__ void scrgb_to_hlg2020(float r, float g, float b, float& o0, float& o1, float& o2)
+{
+    const float A = 0.17883277f, B = 0.28466892f, C = 0.55991073f;
+    float l[3] = { 0.6274f * r + 0.3293f * g + 0.0433f * b, 0.0691f * r + 0.9195f * g + 0.0114f * b,
+                   0.0164f * r + 0.0880f * g + 0.8956f * b };
+    for (int c = 0; c < 3; c++)
+        l[c] = (l[c] < 0.0f ? 0.0f : l[c]) * (80.0f / 1000.0f);
+    const float yd = 0.2627f * l[0] + 0.6780f * l[1] + 0.0593f * l[2];
+    const float k = yd > 0.0f ? powf(yd, -0.2f / 1.2f) : 0.0f;
+    float o[3];
+    for (int c = 0; c < 3; c++)
+    {
+        const float s = l[c] * k > 1.0f ? 1.0f : l[c] * k;
+        o[c] = s <= 1.0f / 12.0f ? sqrtf(3.0f * s) : A * logf(12.0f * s - B) + C;
+    }
+    o0 = o[0];
+    o1 = o[1];
+    o2 = o[2];
+}
+__device__ __forceinline__ void hdr2020_to_scrgb(float p0, float p1, float p2, int hlg, float& r, float& g, float& b)
+{
+    if (hlg) hlg2020_to_scrgb(p0, p1, p2, r, g, b);
+    else pq2020_to_scrgb(p0, p1, p2, r, g, b);
+}
 __device__ __forceinline__ float srgbOetf(float c)
 { return c <= 0.0031308f ? c * 12.92f : 1.055f * powf(c > 1e-6f ? c : 1e-6f, 1.0f / 2.4f) - 0.055f; }
 __device__ __forceinline__ float srgbEotf(float g)
 { return g <= 0.04045f ? g / 12.92f : powf((g + 0.055f) / 1.055f, 2.4f); }
 __global__ void k_nrInPq(const float* __restrict__ src, int planeStride, int rowStride, int dw, int dh,
-                         float sdrWhite, unsigned short* __restrict__ dst)
+                         float sdrWhite, unsigned short* __restrict__ dst, int hlg)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= dw || y >= dh) return;
     const long long i = (long long)y * rowStride + x;
     float v[3];
-    pq2020_to_scrgb(src[i], src[(long long)planeStride + i], src[2LL * planeStride + i], v[0], v[1], v[2]);
+    hdr2020_to_scrgb(src[i], src[(long long)planeStride + i], src[2LL * planeStride + i], hlg, v[0], v[1], v[2]);
     unsigned short* d = dst + ((size_t)y * dw + x) * 4;
     for (int c = 0; c < 3; c++)
     {
@@ -973,15 +1021,14 @@ __global__ void k_nrInPq(const float* __restrict__ src, int planeStride, int row
     d[3] = 0x3C00;
 }
 __global__ void k_nrOutPq(const unsigned short* __restrict__ src, int dw, int dh, float sdrWhite,
-                          float* __restrict__ dst, int ph, int pw, int planeStride)
+                          float* __restrict__ dst, int ph, int pw, int planeStride, int hlg)
 {
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
     if (ox >= pw || oy >= ph) return;
     const long long o = (long long)oy * pw + ox;
-    float r, g, b;
-    pq2020_to_scrgb(dst[o], dst[(long long)planeStride + o], dst[2LL * planeStride + o], r, g, b);
-    if (r > sdrWhite || g > sdrWhite || b > sdrWhite) return;   // a highlight: kept as it is
+    float in[3];
+    hdr2020_to_scrgb(dst[o], dst[(long long)planeStride + o], dst[2LL * planeStride + o], hlg, in[0], in[1], in[2]);
     const int sx = ox < dw ? ox : dw - 1;
     const int sy = oy < dh ? oy : dh - 1;
     const unsigned short* p = src + ((size_t)sy * dw + sx) * 4;
@@ -990,9 +1037,11 @@ __global__ void k_nrOutPq(const unsigned short* __restrict__ src, int dw, int dh
     {
         const float v = h2f(p[c]);
         q[c] = srgbEotf(v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v)) * sdrWhite;
+        if (in[c] > sdrWhite) q[c] += in[c] - sdrWhite;   // the light above SDR white the pass never saw
     }
     float a0, a1, a2;
-    scrgb_to_pq2020(q[0], q[1], q[2], a0, a1, a2);
+    if (hlg) scrgb_to_hlg2020(q[0], q[1], q[2], a0, a1, a2);
+    else scrgb_to_pq2020(q[0], q[1], q[2], a0, a1, a2);
     dst[o] = a0;
     dst[(long long)planeStride + o] = a1;
     dst[2LL * planeStride + o] = a2;
@@ -1297,7 +1346,7 @@ __device__ __forceinline__ void rcasPixel(const float* __restrict__ src, int dw,
 }
 
 // FSR's RCAS on a tight planar frame into another (dw x dh each): the sharpen after DLSS 5 at the
-// working size, before RTX HDR and the model (NVIDIA's order: post-processing before frame generation)
+// working size, before RTX HDR and the model (post-processing before frame generation)
 __global__ void k_rcasPlanar(const float* __restrict__ src, int dw, int dh, float con, float* __restrict__ dst)
 {
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1782,6 +1831,126 @@ __device__ __forceinline__ float nvLerp(const float* __restrict__ p, int rowStri
     const float a = (1.0f - T.lx) * p[(size_t)T.y0 * rowStride + T.x0] + T.lx * p[(size_t)T.y0 * rowStride + T.x1];
     const float b = (1.0f - T.lx) * p[(size_t)T.y1 * rowStride + T.x0] + T.lx * p[(size_t)T.y1 * rowStride + T.x1];
     return (1.0f - T.ly) * a + T.ly * b;
+}
+
+// ---- RIFE: the IFNet hands out its final flow and blend mask, the host makes the tween ---------
+// The motion frame the IFNet and its encode read: a planar source (fp32 codes, sw x sh) padded to
+// dpw x dph by replicating the edge, fp16 out (k_f2h's rounding). mode 0 = the codes as they are
+// (an SDR picture: bit for bit what k_f2h makes of it); 1 PQ / 2 HLG = the BT.2020 codes as BT.709
+// light over SDR white in sRGB, the encoding RIFE was trained on: below the knee exactly an SDR
+// source's values, above it the largest channel rolls off toward knee + head (knee + head e / (e +
+// head) for the excess e, slope 1 at the knee, every channel scaled alike so the hue stays; head 0 =
+// a clip at the knee).
+__global__ void k_motionIn(const float* __restrict__ src, int sps, int srs, int sw, int sh,
+                           unsigned short* __restrict__ dst, int dps, int drs, int dpw, int dph, int mode,
+                           float sdrWhite, float knee, float head)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dpw || y >= dph) return;
+    const size_t s = (size_t)(y < sh ? y : sh - 1) * srs + (x < sw ? x : sw - 1);
+    const size_t d = (size_t)y * drs + x;
+    float v[3] = { src[s], src[(size_t)sps + s], src[2 * (size_t)sps + s] };
+    if (mode)
+    {
+        float l[3], m = 0.0f;
+        hdr2020_to_scrgb(v[0], v[1], v[2], mode == 2, l[0], l[1], l[2]);
+        for (int c = 0; c < 3; c++)
+        {
+            l[c] = l[c] > 0.0f ? l[c] / sdrWhite : 0.0f;
+            m = fmaxf(m, l[c]);
+        }
+        const float e = m - knee;
+        const float k = e > 0.0f ? (knee + head * e / (e + head)) / m : 1.0f;
+        for (int c = 0; c < 3; c++)
+            v[c] = srgbOetf(l[c] * k);
+    }
+    dst[d] = f2h(v[0]);
+    dst[(size_t)dps + d] = f2h(v[1]);
+    dst[2 * (size_t)dps + d] = f2h(v[2]);
+}
+
+// RIFE's last step (IFNet_HDv3's merged[4]): tween = warp(frame 0, flow 0->t) x mask + warp(frame 1,
+// flow 1->t) x (1 - mask), warp = grid_sample(bilinear, border, align_corners=True) = a bilinear tap
+// at x + f clamped into [0, cw - 1] x [0, ch - 1] (nvTap). Per batch entry blockIdx.z: the flow (4
+// fp16 planes: 0->t x, y, 1->t x, y) and the mask (1 fp16 plane) at the model's frame (fw x fh
+// content, plane stride mps, row stride mrs). A picture of another size reads them the way RIFE's
+// scale mode resizes a flow (bilinear, align_corners=False: the output pixel centre at (x + 0.5) fw /
+// w - 0.5 in the model's frame, clamped at 0, as an exact integer ratio; the flow times w / fw and
+// h / fh). The pictures: frame 0 in planes 0..2, frame 1 in 3..5 (plane stride pps, row stride prs,
+// fp32 or fp16 by half); the tween: 3 fp16 planes per batch entry at the pictures' layout.
+__device__ __forceinline__ float rbLerp(const void* __restrict__ p, int half, size_t base, int rs, const NvTap& T)
+{
+    const float a = (1.0f - T.lx) * ldS(p, half, base + (size_t)T.y0 * rs + T.x0) +
+                    T.lx * ldS(p, half, base + (size_t)T.y0 * rs + T.x1);
+    const float b = (1.0f - T.lx) * ldS(p, half, base + (size_t)T.y1 * rs + T.x0) +
+                    T.lx * ldS(p, half, base + (size_t)T.y1 * rs + T.x1);
+    return (1.0f - T.ly) * a + T.ly * b;
+}
+__device__ __forceinline__ void rbAxis(int x, int w, int fw, int& a0, int& a1, float& l)
+{
+    const long long num = (2LL * x + 1) * fw - w, den = 2LL * w;
+    a0 = 0;
+    l = 0.0f;
+    if (num > 0)
+    {
+        a0 = (int)(num / den);
+        l = (float)(num % den) / (float)den;
+    }
+    if (a0 >= fw - 1)
+    {
+        a0 = fw - 1;
+        l = 0.0f;
+    }
+    a1 = a0 < fw - 1 ? a0 + 1 : a0;
+}
+__device__ __forceinline__ float rbBil(const unsigned short* __restrict__ p, size_t o00, size_t o01, size_t o10,
+                                       size_t o11, float lx, float ly)
+{
+    return (1.0f - ly) * ((1.0f - lx) * h2f(p[o00]) + lx * h2f(p[o01])) +
+           ly * ((1.0f - lx) * h2f(p[o10]) + lx * h2f(p[o11]));
+}
+__global__ void k_rifeBlend(const void* __restrict__ pic, int half, int pps, int prs, int w, int h, int cw, int ch,
+                            const unsigned short* __restrict__ flow, const unsigned short* __restrict__ mask,
+                            int mps, int mrs, int fw, int fh, unsigned short* __restrict__ out)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t z = blockIdx.z;
+    const unsigned short* F = flow + z * 4 * (size_t)mps;
+    const unsigned short* M = mask + z * (size_t)mps;
+    float f[4], m;
+    if (fw == w && fh == h)
+    {
+        const size_t o = (size_t)y * mrs + x;
+        for (int c = 0; c < 4; c++)
+            f[c] = h2f(F[c * (size_t)mps + o]);
+        m = h2f(M[o]);
+    }
+    else
+    {
+        int x0, x1, y0, y1;
+        float lx, ly;
+        rbAxis(x, w, fw, x0, x1, lx);
+        rbAxis(y, h, fh, y0, y1, ly);
+        const size_t o00 = (size_t)y0 * mrs + x0, o01 = (size_t)y0 * mrs + x1;
+        const size_t o10 = (size_t)y1 * mrs + x0, o11 = (size_t)y1 * mrs + x1;
+        const float sx = (float)w / (float)fw, sy = (float)h / (float)fh;
+        for (int c = 0; c < 4; c++)
+            f[c] = rbBil(F + c * (size_t)mps, o00, o01, o10, o11, lx, ly) * ((c & 1) ? sy : sx);
+        m = rbBil(M, o00, o01, o10, o11, lx, ly);
+    }
+    const NvTap T0 = nvTap(x, y, f[0], f[1], cw, ch);
+    const NvTap T1 = nvTap(x, y, f[2], f[3], cw, ch);
+    unsigned short* O = out + z * 3 * (size_t)pps;
+    const size_t o = (size_t)y * prs + x;
+    for (int c = 0; c < 3; c++)
+    {
+        const float a = rbLerp(pic, half, (size_t)c * pps, prs, T0);
+        const float b = rbLerp(pic, half, (size_t)(3 + c) * pps, prs, T1);
+        O[(size_t)c * pps + o] = f2h(a * m + b * (1.0f - m));
+    }
 }
 
 extern "C" __global__ void k_nvofLuma(const float* __restrict__ src, int planeStride, int rowStride,
@@ -2281,18 +2450,28 @@ extern "C" __global__ void k_drbaDrmSplat(const float* __restrict__ f10, const f
     drbaSplat4((unsigned long long*)acc, plane, 1, v, x, y, fa[o], fa[plane + o], d, w, h);
 }
 
-// acc (2 planes) -> the (1, H, W) timestep map for the IFNet
+// acc (2 planes) -> the (1, H, W) timestep map for the IFNet, in the engine's timestep dtype: fp32,
+// or fp16 when half (rounded to nearest even, f2h's cvt; this block also compiles on its own in the
+// harness, without f2h)
 extern "C" __global__ void k_drbaDrmNorm(const long long* __restrict__ acc, const float* __restrict__ f10,
                                          const float* __restrict__ f12, int side, float tt, int w, int h,
-                                         float* __restrict__ out)
+                                         void* __restrict__ out, int half)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t plane = (size_t)w * h;
     if (i >= (int)plane) return;
     const long long aw = acc[plane + i];
     const float wsum = (float)aw / DRBA_FIX;
-    out[i] = aw < DRBA_HOLE ? drbaDrmUn(f10, f12, plane, i, side, tt)
-                            : ((float)acc[i] / DRBA_FIX) / (wsum + 1e-7f);
+    const float v = aw < DRBA_HOLE ? drbaDrmUn(f10, f12, plane, i, side, tt)
+                                   : ((float)acc[i] / DRBA_FIX) / (wsum + 1e-7f);
+    if (half)
+    {
+        unsigned short hv;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(v));
+        ((unsigned short*)out)[i] = hv;
+    }
+    else
+        ((float*)out)[i] = v;
 }
 
 }
@@ -2346,7 +2525,7 @@ struct RtxThdrSetting
 struct RtxVsrSetting
 {
     uint32_t QualityLevel;
-}; // 0 bicubic .. 4 Ultra, python always 4
+}; // 0 bicubic .. 4 Ultra; the host always asks for 4 (vsrSet)
 typedef void (*PFN_rtxvSetModelPath)(const wchar_t*);
 typedef unsigned int (*PFN_rtxCreate)(void*, void*, int, unsigned int, unsigned int);
 typedef unsigned int (*PFN_rtxEvalThdr)(void*, void*, RtxRect, RtxRect, RtxThdrSetting*);
@@ -2862,27 +3041,33 @@ struct NativeRife
     // the real slot is frame k-1), one IFNet enqueue per tween with its own DRM timestep map
     // (the kernels k_drbaFlowSplat / FlowNorm / DrmSplat / DrmNorm above, gated against a float64
     // reference), the head fallback (plain pair RIFE on the lagged pair).
+    // RIFE's two domains (mph set): the ring keeps each frame's motion frame beside the picture, and
+    // the encodes, block0 and its flows, the windows, the DRM map and the IFNet's x live at the
+    // motion frame (M x N = mph x mpw, else the pictures' ph x pw); k_rifeBlend warps the pictures.
     bool drba = false;
     std::string block0Path, block0Jit;
     nvinfer1::ICudaEngine* engB0 = nullptr;
     nvinfer1::IRuntimeConfig* cfgB0 = nullptr;
     nvinfer1::IExecutionContext* ctxB0 = nullptr;
     uint32_t drFid = 0;      // frames pushed this session; frame id i sits in ring slot i & 3
-    float* dDrI[4] = {};     // (3, ph, pw) the padded frames
-    float* dDrF[4] = {};     // (16, ph, pw) their encodes, fp32 (fp16 in place when featHalf)
-    float* dDrX[2] = {};     // (6, ph, pw) IFNet x: [0] = [k-1, k-2] (side -1), [1] = [k-2, k-1]
-                             // (fp16 in place when xHalf)
+    float* dDrI[4] = {};     // (3, ph, pw) the padded frames (the pictures)
+    uint16_t* dDrM[4] = {};  // two domains: (3, M, N) fp16, their motion frames
+    float* dDrF[4] = {};     // (16, M, N) their encodes, fp32 (fp16 in place when featHalf)
+    float* dDrX[2] = {};     // (6, ph, pw) the frame pair: [0] = [k-1, k-2] (side -1), [1] = [k-2, k-1]; the
+                             // IFNet's x (fp16 in place when xHalf), in two domains the pictures (fp32)
+    uint16_t* dDrMX[2] = {}; // two domains: (6, M, N) fp16, the IFNet's x (the motion frames of that pair)
+    float* dDrB0 = nullptr;  // two domains: (6, M, N) block0's frame pair, the motion frames in fp32
     uint32_t drXFor[2] = {}; // the newest frame id each x was built for (0 = none)
     struct DrWin
     {
         uint32_t c;
         float* f10;
         float* r;
-    }; // r = (4, ph, pw): flow12 | flow21
+    }; // r = (4, M, N): flow12 | flow21
     DrWin drWin[2] = {};         // c = 0: empty
-    float* dDrFlow = nullptr;    // (4, ph, pw) block0's output
-    float* dDrFlowN = nullptr;   // (4, ph, pw) a non-chained left flow's FlowNorm output
-    long long* dDrAcc = nullptr; // (6, ph, pw) the splat accumulator
+    float* dDrFlow = nullptr;    // (4, M, N) block0's output
+    float* dDrFlowN = nullptr;   // (4, M, N) a non-chained left flow's FlowNorm output
+    long long* dDrAcc = nullptr; // (6, M, N) the splat accumulator
     uint64_t drTweens = 0, drHeads = 0, drBlock0 = 0;
     // NVIDIA Optical Flow model: the handoff answers
     // `engine=nvof` with the geometry only (like echo, no TensorRT engine at all); this host runs
@@ -2954,14 +3139,18 @@ struct NativeRife
     nvinfer1::IRuntimeCache* jit = nullptr;
     nvinfer1::IExecutionContext* ctxIf = nullptr;
     nvinfer1::IExecutionContext* ctxEnc = nullptr;
+    // the IFNet context's activations when the host sizes them (an engine with a timestep batch axis: the
+    // batches the session runs, nativeIfnetMemory), freed after the context
+    void* dIfMem = nullptr;
     bool encHalf = true;
     bool featHalf = false; // IFNet / block0 take f0 / f1 in fp16: the encode writes dF directly
     // the IFNet's x / the encode's img in fp16 (read off each engine on its own, so a cache that
     // mixes the two revisions still works: the encode features are the same either way)
     bool xHalf = false, imgHalf = false;
-    // the IFNet writes its tweens (merged) in fp16: every reader of a tween gets half = 1, and
-    // dMerged, allocated at the fp32 size, holds them at half the stride (mergedAt)
+    // the tweens (merged, k_rifeBlend's) are fp16: every reader of a tween gets half = 1 (mergedAt)
     bool outHalf = false;
+    // the IFNet takes its timestep in fp16: the constant fills and DRBA's map are written in fp16
+    bool tHalf = false;
 
     // ---- CUDA
     cudaStream_t stream = nullptr;
@@ -2989,7 +3178,7 @@ struct NativeRife
     // decoded frame before the interpolation (nativeNrFrame). Zero-copy by default: the frame
     // moves through the core's two shared D3D12 buffers, which the stream writes and reads
     // directly, and the core's shared fence orders both sides on the GPU. CPU staging
-    // (SMV_NR_STAGED=1, the preview's change map, or a handoff that cannot start): dlssnr.exe's
+    // (SMV_NR_STAGED=1, the preview's change map, or a handoff that cannot start): the core's
     // renderFrame through pinned host copies.
     nr::Host* nrHost = nullptr; // null = DLSS 5 off or unavailable for this render
     bool nrFailed = false;      // an evaluate failed: off for the rest of the render
@@ -3027,7 +3216,7 @@ struct NativeRife
     std::wstring nrDeltaPath; // --nr-delta PATH: the pass's change map (the preview's mask)
     double nrMs = 0.0, nrMaxMs = 0.0;
     uint64_t nrN = 0;
-    // live DLSS 5 in NVIDIA's order: the same core, handoff and motion once per captured frame on the
+    // live DLSS 5: the same core, handoff and motion once per captured frame on the
     // model frame after Restore / the resize (nativeLiveNrInit, nativeGroup); a capture byte-identical
     // to the previous one takes dNrLast instead of an evaluate
     bool liveNr = false;
@@ -3035,18 +3224,18 @@ struct NativeRife
     float* dNrLast = nullptr;    // the last evaluated model frame, 3 padded planes
     uint8_t* dCapPrev = nullptr; // the previous raw capture, the reuse test's reference
     float nrSdrWhite = 3.0f;     // HDR: the SDR reference white in scRGB units (nits / 80)
+    int nrSrcHdr = 0;            // offline: HDR video (1 PQ, 2 HLG), the pass sees its SDR range
     bool nrSdrIn = false;        // live: DLSS 5's input is SDR this frame (RTX HDR converts after it)
-    // NVIDIA order (offline): Restore and the resize run on the decoded frame (the pre-model
+    // offline: Restore and the resize run on the decoded frame (the pre-model
     // SOURCE, sw x sh, in dSrcPl) before DLSS 5 and the model, which then run at the working
     // size w x h, and the emit's final resize takes it to dw x dh; sw / sh = 0 = the source is the
     // model frame (no working size, and live)
     int sw = 0, sh = 0;
     bool nvPre = false;
-    bool vsrPost = false; // NVIDIA order: RTX VSR runs the final resize (it enlarges), not the first
-    bool vsrPre = false;  // live: RTX VSR runs the capture -> working-size resize before the model, not the fit
-    bool restPre =
-        false; // live NVIDIA order: Restore on the captured frame, folded to the model size, before the model
-    float* dSrcPl = nullptr;    // NVIDIA order: the decoded frame, planar fp32 at sw x sh
+    bool vsrPost = false;       // RTX VSR runs the final resize (it enlarges), not the first
+    bool vsrPre = false;        // live: RTX VSR runs the capture -> working-size resize before the model, not the fit
+    bool restPre = false;       // live: Restore on the captured frame, folded to the model size, before the model
+    float* dSrcPl = nullptr;    // the decoded frame, planar fp32 at sw x sh
     float* dPres = nullptr;     // sharpen / fitAa: the fitted frame, planar fp32 at dw x dh
     float* dFitTmp = nullptr;   // fitAa: the horizontal pass, planar fp32 at dw x (uh or h)
     float* dUp = nullptr;       // Upscale to: the internal render frame, planar fp32 at uw x uh
@@ -3058,8 +3247,20 @@ struct NativeRife
                                 // imgHalf); DRBA uses its cur half for the encode only
     float* dF[2]{};             // f_prev / f_cur, (1,16,ph,pw)
     uint16_t* dEncHalf = nullptr;
-    float* dT = nullptr;      // (B,1,ph,pw)
-    float* dMerged = nullptr; // (B,3,ph,pw)
+    // the IFNet's timestep, flow and mask and the tweens, allocated once the engine's dtypes are
+    // known (nativeTweenBuffers)
+    void* dT = nullptr;        // (B,1,mph,mpw), fp32 or fp16 by tHalf
+    uint16_t* dFlow = nullptr; // (B,4,mph,mpw) fp16: the IFNet's final flow 0->t | 1->t
+    uint16_t* dMask = nullptr; // (B,1,mph,mpw) fp16: its blend mask
+    float* dMerged = nullptr;  // (B,3,ph,pw) fp16: the tweens k_rifeBlend makes from them (mergedAt)
+    // RIFE's two domains (offline RIFE / Frame Blend, live RIFE / Frame Blend): the IFNet and its
+    // encode run on the motion frames dM, the finished picture in SDR sRGB at the decoded size
+    // (offline) or at the working size, the capture size when the working size enlarges it (live)
+    // (mw x mh, padded to mph x mpw), and k_rifeBlend applies their flow and mask to the pictures dX
+    // at the working size. mph = 0: the model's frame is the picture's (ph x pw), the IFNet reads dX / dXh.
+    int mph = 0, mpw = 0, mw = 0, mh = 0;
+    uint16_t* dM = nullptr; // (1,6,mph,mpw) fp16: prev in planes 0..2, cur in 3..5
+    float* dMFit = nullptr; // live: the working-size picture shrunk to mw x mh (3 fp32 planes)
     int fCur = 0;
     cudaEvent_t capEv = nullptr;
     std::vector<cudaEvent_t> slotEv;
@@ -3079,7 +3280,7 @@ struct NativeRife
     CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                   // its vertical pass + the slot store
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr, // live Restore
         fRestToF = nullptr, fClamp01 = nullptr;
-    CUfunction fPadPlanar = nullptr;                                  // NVIDIA order's model frame
+    CUfunction fPadPlanar = nullptr;                                  // the decoded frame into the model frame
     CUfunction fNrIn = nullptr, fNrOut = nullptr, fNrMv = nullptr;    // DLSS 5
     CUfunction fNrInPq = nullptr, fNrOutPq = nullptr;                 // live DLSS 5 on HDR (PQ) planes
     CUfunction fHalf = nullptr, fPyr = nullptr, fSplatSoft = nullptr, // live GMFSS glue (5b)
@@ -3092,9 +3293,10 @@ struct NativeRife
         fPpTop = nullptr, fPpUp = nullptr, fBlur1 = nullptr, fNvofCompose = nullptr;
     CUfunction fDrFlowSplat = nullptr, fDrFlowNorm = nullptr, // native DRBA
         fDrDrmSplat = nullptr, fDrDrmNorm = nullptr;
-    int* dStaticFlag = nullptr; // device flag k_pairDiff sets when the pair differs
-    int* hStaticFlag = nullptr; // pinned readback of it, one int per group
-    uint64_t staticN = 0;       // identical pairs held this session
+    CUfunction fMotionIn = nullptr, fRifeBlend = nullptr; // RIFE's motion frame, its last step (the tween)
+    int* dStaticFlag = nullptr;                           // device flag k_pairDiff sets when the pair differs
+    int* hStaticFlag = nullptr;                           // pinned readback of it, one int per group
+    uint64_t staticN = 0;                                 // identical pairs held this session
 
     // ---- protocol plumbing
     std::mutex mMsg, mTok;
@@ -3195,10 +3397,10 @@ struct NativeResident
     CUmodule cuMod = nullptr;
     bool encHalf = true;
     bool featHalf = false;
-    bool xHalf = false, imgHalf = false, outHalf = false;
+    bool xHalf = false, imgHalf = false, outHalf = false, tHalf = false;
     int dev = 0;
-    // memoised handoff: the python command line minus gen (the fast path ignores gen and the
-    // cold path builds the fixed 1to8 class regardless) and the facts it answered with
+    // memoised handoff: nativeHandoff's session key (gen left out: the fast path ignores gen and
+    // the cold path builds the fixed 1to8 class regardless) and the facts it answered with
     std::wstring handoffKey;
     NativeRife facts;
     bool haveFacts = false;
@@ -3322,8 +3524,8 @@ static void nativeDeriveUpscale(NativeRife& nr)
 }
 
 // ---- warm engine lookup ---------------------------------------------------------------------
-// trt_lookup.py's naming and find_* checks in C++ (engine names are shared with the offline
-// python renders, so the two must agree): when a previous session built AND warmed the engines
+// trt_lookup.py's naming and find_* checks in C++ (trt_lookup.engine_name stays the naming
+// reference of the dev tools, so the two must agree): when a previous session built AND warmed the engines
 // for this window, the lookup answers the handoff as NATIVE-PATH lines plus one LIVE READY line,
 // the format nativeHandoff parses. A miss returns false and nativeHandoff builds the engines.
 struct LookupTags
@@ -3341,7 +3543,7 @@ static std::string lkEnv(const char* name)
     return std::string(buf);
 }
 
-// SMV_HANDOFF_DUMP=1: log every handoff line (python's and the host's own) as `handoff-line ...`
+// SMV_HANDOFF_DUMP=1: log every handoff line the host produces as `handoff-line ...`
 static const bool g_handoffDump = lkEnv("SMV_HANDOFF_DUMP") == "1";
 
 // md5 of the concatenated file contents, first 10 hex digits (trt_lookup._md5_files)
@@ -3495,8 +3697,11 @@ struct LkShape
 // Engines built from an older graph never survive a bump: the app and the
 // CLI empty the engine cache when its stamp (weights_tags.txt, which carries the rev, plus the
 // TensorRT-RTX version) no longer matches (src/render/cache.ts)
-static const int kOnnxRev = 5; // 3: RIFE IFNet / block0 take f0 / f1 in fp16; 4: the IFNet's x
-                               // and the encode's img in fp16; 5: the IFNet's merged in fp16
+static const int kOnnxRev = 7; // 3: RIFE IFNet / block0 take f0 / f1 in fp16; 4: the IFNet's x
+                               // and the encode's img in fp16; 5: the IFNet's merged in fp16;
+                               // 6: the IFNet's timestep in fp16; 7: the IFNet hands out its
+                               // final flow and blend mask (fp16) instead of merged
+                               // (k_rifeBlend makes the tween)
 
 // engine_name(): <base>_<shape per input joined by x, inputs by _>_<trt>_<w>, a dynamic batch
 // axis written lo"to"hi
@@ -3630,8 +3835,8 @@ static bool lkFind(nvinfer1::IRuntime* rt, const std::string& cacheDir, const st
 
 // the RIFE IFNet / block0 class: fp32 everywhere except the feature encodes f0 / f1, fp32 up to
 // ONNX rev 2 and fp16 since rev 3 (both the same; nativeTrtInit pairs them with the encode output),
-// the IFNet's frame pair x, fp16 since rev 4, and the IFNet's tween merged, fp16 since rev 5
-// (block0's frames and flow stay fp32)
+// the IFNet's frame pair x, fp16 since rev 4, the IFNet's timestep, fp16 since rev 6, and its
+// outputs flow / mask, fp16 since rev 7 (block0's frames and flow stay fp32)
 static bool lkRifeIo(const LkIo& io, bool ifnet)
 {
     std::string fd;
@@ -3643,7 +3848,7 @@ static bool lkRifeIo(const LkIo& io, bool ifnet)
                 return false;
             fd = p.second;
         }
-        else if (ifnet && p.first == "x")
+        else if (ifnet && (p.first == "x" || p.first == "timestep"))
         {
             if (p.second != "fp32" && p.second != "fp16")
                 return false;
@@ -3652,7 +3857,7 @@ static bool lkRifeIo(const LkIo& io, bool ifnet)
             return false;
     }
     for (auto& p : io.outs)
-        if (p.second != "fp32" && !(ifnet && p.first == "merged" && p.second == "fp16"))
+        if (p.second != "fp32" && !(ifnet && (p.first == "flow" || p.first == "mask") && p.second == "fp16"))
             return false;
     return true;
 }
@@ -3705,6 +3910,9 @@ struct LkSession
     double fs = 1.0;           // SMV_RIFE_FLOW_SCALE snapped to a power-of-two rung
     std::string scaleTag;      // name part: the scale list
     std::vector<int64_t> x, f; // the IFNet's frame pair and feature shapes
+    // live rife / blend: RIFE's motion frame (mmw x mmh, padded mph x mpw), the frame the IFNet and
+    // its encode run at (iph x ipw = the motion pad, else the pictures' pad)
+    int mmw = 0, mmh = 0, mph = 0, mpw = 0, iph = 0, ipw = 0;
 };
 
 // Create a folder and its missing parents. Users delete engine\trt_cache_safe_to_delete whenever
@@ -3752,7 +3960,7 @@ static int liveAutoMode(int w, int h)
     return px < 1920.0 * 1080 ? 2 : (px <= 2560.0 * 1440 ? 3 : (px <= 3840.0 * 2160 ? 5 : 6));
 }
 
-// Live's working size in NVIDIA's order (Restore, the resize, DLSS 5, FSR, RTX HDR and the model run at it, the fit
+// Live's working size (Restore, the resize, DLSS 5, FSR, RTX HDR and the model run at it, the fit
 // takes it to the canvas after the model): the DLSS mode's share of the PRESENTED rect (the capture aspect-fit into
 // the canvas W x H: the window itself, or the Fill rect), even, at least 64 px and at most the presented rect a
 // side, capped at 3840x2160 keeping the aspect (offline's workPlan). DLAA = the presented rect itself (in window
@@ -3866,15 +4074,37 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
     s.fs =
         (std::min)(1.0,
                    (std::max)(0.25, std::pow(2.0, std::nearbyint(std::log2((std::min)(1.0, (std::max)(0.25, s.fs)))))));
-    if (lkEnv(g_offline ? "SMV_RIFE_SAFEPAD" : "SMV_LIVE_SAFEPAD") == "1")
+    const bool safePad = lkEnv(g_offline ? "SMV_RIFE_SAFEPAD" : "SMV_LIVE_SAFEPAD") == "1";
+    if (safePad)
     {
         s.pw = (std::max)(s.pw, 1152);
         s.ph = (std::max)(s.ph, 640);
     }
+    s.iph = s.ph;
+    s.ipw = s.pw;
+    // RIFE's two domains live (rife / blend / rifedrba): the IFNet, its encode and DRBA's block0 find
+    // the motion on the finished picture at the working size, or at the capture size when the working
+    // size enlarges it (Fill at DLAA: an enlarged picture costs RIFE its motion); the warp + blend runs
+    // on the pictures at the working size. SMV_RIFE_TWO_DOMAIN=0: the IFNet reads the pictures.
+    if (!g_offline && (s.backend == "rife" || s.backend == "blend" || s.drba) && lkEnv("SMV_RIFE_TWO_DOMAIN") != "0")
+    {
+        const bool up = s.mw > s.cw || s.mh > s.ch;
+        s.mmw = up ? s.cw : s.mw;
+        s.mmh = up ? s.ch : s.mh;
+        s.mph = (s.mmh + 63) / 64 * 64;
+        s.mpw = (s.mmw + 63) / 64 * 64;
+        if (safePad)
+        {
+            s.mpw = (std::max)(s.mpw, 1152);
+            s.mph = (std::max)(s.mph, 640);
+        }
+        s.iph = s.mph;
+        s.ipw = s.mpw;
+    }
     s.scaleTag = lkG(16 / s.fs) + "-" + lkG(8 / s.fs) + "-" + lkG(4 / s.fs) + "-" + lkG(2 / s.fs) + "-" + lkG(1 / s.fs);
-    s.x = {1, 6, s.ph, s.pw};
-    s.f = {1, 16, s.ph, s.pw};
-    sprintf_s(key, "%dx%d", s.ph, s.pw);
+    s.x = {1, 6, s.iph, s.ipw};
+    s.f = {1, 16, s.iph, s.ipw};
+    sprintf_s(key, "%dx%d", s.iph, s.ipw);
     s.warmKey = key;
     return true;
 }
@@ -3896,11 +4126,11 @@ static std::string lkBlock0Base(const LkSession& s, const LookupTags& t)
 // the IFNet input set at a timestep batch b
 static std::vector<LkShape> lkIfnetSet(const LkSession& s, int b)
 {
-    return {{"x", s.x}, {"timestep", {b, 1, s.ph, s.pw}}, {"f0", s.f}, {"f1", s.f}};
+    return {{"x", s.x}, {"timestep", {b, 1, s.iph, s.ipw}}, {"f0", s.f}, {"f1", s.f}};
 }
 static std::vector<LkShape> lkBlock0Set(const LkSession& s)
 {
-    const std::vector<int64_t> x = {1, 3, s.ph, s.pw}, f = {1, 16, s.ph, s.pw};
+    const std::vector<int64_t> x = {1, 3, s.iph, s.ipw}, f = {1, 16, s.iph, s.ipw};
     return {{"img0", x}, {"img1", x}, {"f0", f}, {"f1", f}};
 }
 
@@ -4033,7 +4263,8 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
         const std::string p = cacheDir + "\\" + lkEngineName(base, sets[0], "timestep", 1, 8, t) + ".engine";
         if (!lkFile(p) && lkFile(p + ".nofit"))
         {
-            LOG("native: batched engine marked \"did not fit\" at %dx%d, looking up the unbatched engine\n", pw, ph);
+            LOG("native: batched engine marked \"did not fit\" at %dx%d, looking up the unbatched engine\n", s.ipw,
+                s.iph);
             batch = 0;
             base = lkIfnetBase(s, t);
             sets = {lkIfnetSet(s, 1)};
@@ -4048,7 +4279,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     const std::string ijit = lkJit(ipath);
     if (!lkWarm(ijit, s.warmKey))
         return false;
-    if (!lkFind(rt, cacheDir, lkEncodeBase(s, t), {{{"img", {1, 3, ph, pw}}}}, nullptr, 0, 0, t, epath, eio))
+    if (!lkFind(rt, cacheDir, lkEncodeBase(s, t), {{{"img", {1, 3, s.iph, s.ipw}}}}, nullptr, 0, 0, t, epath, eio))
         return false;
     std::string bpath, bjit;
     if (drba)
@@ -4075,12 +4306,14 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     lines.push_back("NATIVE-PATH ejit=" + lkJit(epath));
     const std::string en = eio.outs.empty() ? "?" : eio.outs[0].first, ein = eio.ins.empty() ? "?" : eio.ins[0].first;
     const std::string ed = eio.outs.empty() ? "?" : eio.outs[0].second, eid = eio.ins.empty() ? "?" : eio.ins[0].second;
-    char tail[512];
+    char tail[512], motion[96] = "";
+    if (s.mph)
+        sprintf_s(motion, " mph=%d mpw=%d motw=%d moth=%d", s.mph, s.mpw, s.mmw, s.mmh);
     sprintf_s(
         tail,
-        " batch=%d batchpad=%d xdtype=%s tdtype=%s fdtype=%s outdtype=%s ename=%s einame=%s edtype=%s eidtype=%s effects=0 fast=1%s",
+        " batch=%d batchpad=%d xdtype=%s tdtype=%s fdtype=%s outdtype=%s ename=%s einame=%s edtype=%s eidtype=%s effects=0 fast=1%s%s",
         batch, 0, lkDt(iio, true, "x").c_str(), lkDt(iio, true, "timestep").c_str(), lkDt(iio, true, "f0").c_str(),
-        lkDt(iio, false, "merged").c_str(), en.c_str(), ein.c_str(), ed.c_str(), eid.c_str(),
+        lkDt(iio, false, "flow").c_str(), en.c_str(), ein.c_str(), ed.c_str(), eid.c_str(), motion,
         drba ? " engine=drba lag=1" : "");
     lines.push_back("LIVE READY native=1 " + geo(ph, pw, mw, mh, dw, dh, x0, y0) + " scale=" + lkF4(imgScale) + tail);
     return true;
@@ -4123,7 +4356,7 @@ static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& b
         lines.clear();
         return false;
     }
-    // Restore reads the captured frame (NVIDIA order), so its engine has the capture size
+    // Restore reads the captured frame, so its engine has the capture size
     const std::string rpath = lkRestorePath(s.cacheDir, t, (int)capW, (int)capH);
     const std::string rjit = lkJit(rpath);
     if (!lkFile(rpath) || !lkFile(rjit))
@@ -4146,11 +4379,8 @@ static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& b
 // every input to its shape, only a declared batch axis spanning), writes the engine file only
 // after it deserializes, then warms every shape the session will run with a FRESH runtime cache
 // (EAGER specialization, so the saved kernels are the specialized ones) and writes that cache as
-// the engine's .jit and the warm key, exactly the files python's slow handoff leaves. Built from
-// the same file, python and this builder give output-identical engines (bd8_triage.out). Not
-// ported on purpose: python's eager-vs-TRT check of the encode engine (no torch here; the
-// size-free build is proven bit-exact against the per-size engines, gate_3b). After the build
-// the host lookup must hit, else python runs as before. RIFE / Frame Blend (3c-2a) first.
+// the engine's .jit and the warm key. After the build the host lookup runs again and must
+// hit.
 // (kOnnxRev sits above lkEngineName: the engine names carry it too)
 
 class LkBuildLogger : public nvinfer1::ILogger
@@ -4489,16 +4719,16 @@ static bool lkBuildRife(nvinfer1::IRuntime* rt, const LkSession& s, const Lookup
                 return false;
             batched = false;
             char why[160];
-            sprintf_s(why, "%dx%d: the batched engine did not fit (host build)\n", s.pw, s.ph);
+            sprintf_s(why, "%dx%d: the batched engine did not fit (host build)\n", s.ipw, s.iph);
             if (!lkWriteFile(bpath + ".nofit", why, strlen(why)))
                 LOG("native: cannot write %s.nofit, the next start retries the batched build\n", bpath.c_str());
-            LOG("native: batched engine did not fit at %dx%d, marked; building the unbatched engine\n", s.pw, s.ph);
+            LOG("native: batched engine did not fit at %dx%d, marked; building the unbatched engine\n", s.ipw, s.iph);
         }
     }
     if (!batched &&
         !lkEnsure(rt, s, t, path(ibase, uset, false), ibase, uset, nullptr, 0, 0, 1, {uset}, s.warmKey, st, &oom))
         return false;
-    const std::vector<LkShape> eset = {{"img", {1, 3, s.ph, s.pw}}};
+    const std::vector<LkShape> eset = {{"img", {1, 3, s.iph, s.ipw}}};
     const std::string ebase = lkEncodeBase(s, t);
     if (!lkEnsure(rt, s, t, path(ebase, eset, false), ebase, eset, nullptr, 0, 0, 1, {eset}, std::string(), st, &oom))
         return false;
@@ -4967,6 +5197,10 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         nr.dh = f.dh;
         nr.x0 = f.x0;
         nr.y0 = f.y0;
+        nr.mph = f.mph;
+        nr.mpw = f.mpw;
+        nr.mw = f.mw;
+        nr.mh = f.mh;
         nr.batchMax = f.batchMax;
         nr.identity = f.identity;
         nr.fitAa = f.fitAa;
@@ -5097,6 +5331,16 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     nr.dh = num("dh", 0);
     nr.x0 = num("x0", 0);
     nr.y0 = num("y0", 0);
+    // RIFE's two domains: the motion frame's pad and content size (absent = the IFNet reads the pictures)
+    nr.mph = num("mph", 0);
+    nr.mpw = num("mpw", 0);
+    nr.mw = num("motw", 0);
+    nr.mh = num("moth", 0);
+    if (nr.mph && (nr.mpw <= 0 || nr.mw <= 0 || nr.mh <= 0 || nr.mw > nr.mpw || nr.mh > nr.mph))
+    {
+        LOG("native: handoff line names an incomplete motion frame (mph / mpw / motw / moth)\n");
+        return false;
+    }
     nr.batchMax = num("batch", 0);
     if (nr.batchMax < 1)
         nr.batchMax = 1;
@@ -5218,6 +5462,10 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         f.dh = nr.dh;
         f.x0 = nr.x0;
         f.y0 = nr.y0;
+        f.mph = nr.mph;
+        f.mpw = nr.mpw;
+        f.mw = nr.mw;
+        f.mh = nr.mh;
         f.batchMax = nr.batchMax;
         f.identity = nr.identity;
         f.fitAa = nr.fitAa;
@@ -5243,10 +5491,11 @@ static bool nativeReadFile(const std::string& path, std::vector<char>& out)
 
 // runtime config with the SHARED JIT cache and the engine's own whole-graph capture strategy,
 // then the execution context (the per-session part: a context is sized for the engine's
-// maximum shape, 2 GB for the live IFNet class, and is what the resident host drops between
-// sessions; the engine itself stays)
+// maximum shape, 1.6 GB for the live IFNet class at 480p, and is what the resident host drops
+// between sessions; the engine itself stays). userMem: the context takes its activations from
+// the caller (setDeviceMemoryV2 before the first enqueue), sized for the shapes it will run
 static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfer1::IRuntimeConfig** cfgOut,
-                              nvinfer1::IExecutionContext** ctxOut)
+                              nvinfer1::IExecutionContext** ctxOut, bool userMem = false)
 {
     nvinfer1::IRuntimeConfig* cfg = eng->createRuntimeConfig();
     if (!cfg)
@@ -5254,6 +5503,8 @@ static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfe
         LOG("native: createRuntimeConfig failed\n");
         return false;
     }
+    if (userMem)
+        cfg->setExecutionContextAllocationStrategy(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
     if (!nr.jit)
     {
         nr.jit = cfg->createRuntimeCache();
@@ -5261,7 +5512,7 @@ static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfe
         if (nr.jit && !nr.jitPath.empty() && nativeReadFile(nr.jitPath, cb))
             LOG("native: jit cache deserialize -> %d (%zu bytes)\n", (int)nr.jit->deserialize(cb.data(), cb.size()),
                 cb.size());
-        // python keeps one cache file per engine, so the encoder's kernels sit in its own
+        // every engine keeps its own cache file, so the encoder's kernels sit in its own
         // .jit; merged into this cache the encode context takes 7 ms instead of recompiling
         // them for 0.5 s on every first session of a pair
         if (nr.jit && !nr.ejitPath.empty() && nativeReadFile(nr.ejitPath, cb))
@@ -5308,10 +5559,30 @@ static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfe
     return true;
 }
 
+// A timestep batch axis (the live IFNet class `_bd8`): its context takes caller-sized activations,
+// nativeIfnetMemory sizes them for the batches the session runs
+static bool nativeBatchAxis(nvinfer1::ICudaEngine* eng)
+{
+    if (!eng || eng->getNbOptimizationProfiles() < 1)
+        return false;
+    for (int i = 0; i < eng->getNbIOTensors(); i++)
+    {
+        const char* n = eng->getIOTensorName(i);
+        if (strcmp(n, "timestep") != 0 || eng->getTensorIOMode(n) != nvinfer1::TensorIOMode::kINPUT)
+            continue;
+        const nvinfer1::Dims lo = eng->getProfileShape(n, 0, nvinfer1::OptProfileSelector::kMIN);
+        const nvinfer1::Dims hi = eng->getProfileShape(n, 0, nvinfer1::OptProfileSelector::kMAX);
+        return lo.nbDims > 0 && hi.nbDims == lo.nbDims && lo.d[0] < hi.d[0];
+    }
+    return false;
+}
+
 // exact sequence from NATIVE-HOST-API-MAP.md (a): validity pre-check, deserialize, then the
-// config + context through nativeMakeContext.
+// config + context through nativeMakeContext (userMemIfBatched: caller-sized activations for an
+// engine with a timestep batch axis).
 static nvinfer1::ICudaEngine* nativeLoadEngine(NativeRife& nr, const std::string& path,
-                                               nvinfer1::IRuntimeConfig** cfgOut, nvinfer1::IExecutionContext** ctxOut)
+                                               nvinfer1::IRuntimeConfig** cfgOut, nvinfer1::IExecutionContext** ctxOut,
+                                               bool userMemIfBatched = false)
 {
     std::vector<char> blob;
     if (!nativeReadFile(path, blob))
@@ -5335,7 +5606,7 @@ static nvinfer1::ICudaEngine* nativeLoadEngine(NativeRife& nr, const std::string
         LOG("native: deserializeCudaEngine failed for %s\n", path.c_str());
         return nullptr;
     }
-    if (!nativeMakeContext(nr, eng, cfgOut, ctxOut))
+    if (!nativeMakeContext(nr, eng, cfgOut, ctxOut, userMemIfBatched && nativeBatchAxis(eng)))
     {
         delete eng;
         return nullptr;
@@ -5416,6 +5687,8 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fDrFlowNorm, "k_drbaFlowNorm"},
         {&nr.fDrDrmSplat, "k_drbaDrmSplat"},
         {&nr.fDrDrmNorm, "k_drbaDrmNorm"},
+        {&nr.fMotionIn, "k_motionIn"},
+        {&nr.fRifeBlend, "k_rifeBlend"},
     };
     for (auto& e : fns)
         if (cuModuleGetFunction(e.fn, nr.cuMod, e.nm) != CUDA_SUCCESS)
@@ -5582,7 +5855,7 @@ static bool inv3d(const double* m, float* out)
 // the output ring can run BEFORE the source-rate measurement (the ring is sized from the
 // measured slot count):
 //  * nativeCudaDeviceInit: device, context, stream, capture texture + fence import. Depends on
-//    the capture size only, so the early thread runs it in parallel with the python handoff
+//    the capture size only, so the early thread runs it in parallel with the engine handoff
 //    (it writes only dev / stream / emCap / capMip / capArr / semCap, the handoff writes the
 //    geometry fields; distinct members, no race).
 //  * nativeCudaInitEarly: kernels and the model buffers (needs the handoff geometry).
@@ -5684,7 +5957,7 @@ static bool nativeCudaInitLate(NativeRife& nr, HANDLE hOutBuf, uint64_t outBytes
 // warm-up eval (~0.6 s). Needs the capture size, the stream and the kernel module only, so the
 // early thread runs it on a helper beside the engine load; the non-early
 // compute thread runs it after the engine load. The caller's thread must have bound the device.
-// the frame Restore and the first resize read: the model frame, or in NVIDIA order the decoded one
+// the frame Restore and the first resize read: the model frame, or with a working size the decoded one
 static int srcW(const NativeRife& nr)
 {
     return nr.sw ? nr.sw : nr.w;
@@ -5696,13 +5969,13 @@ static int srcH(const NativeRife& nr)
 
 static bool nativeRtxInit(NativeRife& nr)
 {
-    // live Sharpen and RTX VSR: the fit is known now, so the python rule "VSR
+    // live Sharpen and RTX VSR: the fit is known now, so the rule "VSR
     // only when the resize enlarges in both axes" (_Fit._setup_resize) decides here
     // Upscale to: the first resize target is the internal render size when set, else
     // the fit rect (_Fit._setup_resize); VSR and the aa rule read that target
     const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
     const int sw = srcW(nr), sh = srcH(nr);
-    // the resize RTX VSR runs (vw x vh -> vtw x vth): the first one; offline in NVIDIA order there
+    // the resize RTX VSR runs (vw x vh -> vtw x vth): the first one; offline with a working size there
     // are two, the pre-model one (the decoded frame to the working size) and the final one (the
     // working size to the output): VSR is ONE bridge instance, so it takes the final one when that
     // enlarges, else the pre-model one, and the other is Lanczos3. Live has the same two: the capture
@@ -5781,8 +6054,8 @@ static bool nativeRtxInit(NativeRife& nr)
     if (nr.sharpen > 0.0f)
         LOG("native: sharpen: FSR RCAS %.2f at %dx%d, after DLSS 5 and before RTX HDR and the model\n", nr.sharpen,
             nr.w, nr.h);
-    // Restore's fold target (_Fit._load_restore's restore_target). NVIDIA order (offline with a
-    // working size, and live) runs Restore before the model: the target is the working / model size,
+    // Restore's fold target (_Fit._load_restore's restore_target). Offline with a
+    // working size, and live, Restore runs before the model: the target is the working / model size,
     // or the source (the capture live) when VSR runs the pre-model resize right after it. Offline without a
     // working size restores the model output: back to its size when VSR follows (so VSR sees the
     // restored frame), else the first resize target directly (restore-as-upscaler, one resize)
@@ -6973,6 +7246,39 @@ static void nativeFrucFree(NativeRife& nr)
     }
 }
 
+// native DRBA's buffers (both routes): the ring of pictures at the pictures' pad, everything the
+// motion search uses at the model's frame (RIFE's two domains: the motion frame, where the ring also
+// keeps the motion frames, the IFNet's x and block0's fp32 frame pair; else the pictures' pad, the
+// encode's fp16 frame in dXh's cur half)
+static bool nativeDrbaAlloc(NativeRife& nr)
+{
+    const size_t plane = (size_t)nr.ph * nr.pw, mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
+    NCHK(cudaMalloc((void**)&nr.dEncHalf, 16 * mplane * sizeof(uint16_t)), "alloc encode out");
+    if (!nr.mph)
+        NCHK(cudaMalloc((void**)&nr.dXh, 6 * plane * sizeof(uint16_t)), "alloc x fp16");
+    else
+        NCHK(cudaMalloc((void**)&nr.dDrB0, 6 * mplane * sizeof(float)), "alloc drba block0 frames");
+    for (int i = 0; i < 4; i++)
+    {
+        NCHK(cudaMalloc((void**)&nr.dDrI[i], 3 * plane * sizeof(float)), "alloc drba frame ring");
+        NCHK(cudaMalloc((void**)&nr.dDrF[i], 16 * mplane * sizeof(float)), "alloc drba encode ring");
+        if (nr.mph)
+            NCHK(cudaMalloc((void**)&nr.dDrM[i], 3 * mplane * sizeof(uint16_t)), "alloc drba motion ring");
+    }
+    for (int i = 0; i < 2; i++)
+    {
+        NCHK(cudaMalloc((void**)&nr.dDrX[i], 6 * plane * sizeof(float)), "alloc drba x");
+        if (nr.mph)
+            NCHK(cudaMalloc((void**)&nr.dDrMX[i], 6 * mplane * sizeof(uint16_t)), "alloc drba motion x");
+        NCHK(cudaMalloc((void**)&nr.drWin[i].f10, 2 * mplane * sizeof(float)), "alloc drba window");
+        NCHK(cudaMalloc((void**)&nr.drWin[i].r, 4 * mplane * sizeof(float)), "alloc drba window");
+    }
+    NCHK(cudaMalloc((void**)&nr.dDrFlow, 4 * mplane * sizeof(float)), "alloc drba flow");
+    NCHK(cudaMalloc((void**)&nr.dDrFlowN, 4 * mplane * sizeof(float)), "alloc drba flow");
+    NCHK(cudaMalloc((void**)&nr.dDrAcc, 6 * mplane * sizeof(long long)), "alloc drba accumulator");
+    return true;
+}
+
 static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
 {
     if (!nativeBuildKernels(nr, cacheDir))
@@ -6991,7 +7297,7 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
         LOG("native: live working size %dx%d = %s of the %dx%d presented, capture %dx%d\n", nr.w, nr.h, how, presW,
             presH, nr.cw, nr.ch);
     }
-    // live in NVIDIA's order: Restore reads the captured frame (its engine has the capture size) and folds it to
+    // live: Restore reads the captured frame (its engine has the capture size) and folds it to
     // the model size before the model runs, so srcW / srcH name the capture from here on (the Restore warm-up
     // in nativeTrtInit and its target in nativeRtxInit read them, possibly on two threads)
     if (nr.restore)
@@ -7010,38 +7316,30 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     NCHK(cudaHostAlloc((void**)&nr.hStaticFlag, sizeof(int), cudaHostAllocDefault), "alloc static flag readback");
     // no-engine mode: the packed frame (the cur half of x) is the whole model side; a GMFSS
     // session shares only dX (its chain's own buffers are sized off the engines in
-    // nativeGmfssSetup), so neither needs the RIFE encode / timestep / merged buffers
+    // nativeGmfssSetup), so neither needs the RIFE encode buffers (the timestep and merged
+    // buffers follow the engine's dtypes: nativeTweenBuffers)
+    // RIFE's two domains: the features and the motion frames (instead of the fp16 copy of x) at the
+    // motion frame, plus the shrink of an enlarged working-size picture back to it
     if (!nr.noEngine && !nr.gmfss && !nr.nvof && !nr.fruc && !nr.drba)
     {
-        NCHK(cudaMalloc((void**)&nr.dF[0], 16 * plane * sizeof(float)), "alloc f0");
-        NCHK(cudaMalloc((void**)&nr.dF[1], 16 * plane * sizeof(float)), "alloc f1");
-        NCHK(cudaMalloc((void**)&nr.dEncHalf, 16 * plane * sizeof(uint16_t)), "alloc encode out");
-        NCHK(cudaMalloc((void**)&nr.dXh, 6 * plane * sizeof(uint16_t)), "alloc x fp16");
-        NCHK(cudaMalloc((void**)&nr.dT, (size_t)nr.batchMax * plane * sizeof(float)), "alloc timestep");
-        NCHK(cudaMalloc((void**)&nr.dMerged, (size_t)nr.batchMax * 3 * plane * sizeof(float)), "alloc merged");
+        const size_t mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
+        NCHK(cudaMalloc((void**)&nr.dF[0], 16 * mplane * sizeof(float)), "alloc f0");
+        NCHK(cudaMalloc((void**)&nr.dF[1], 16 * mplane * sizeof(float)), "alloc f1");
+        NCHK(cudaMalloc((void**)&nr.dEncHalf, 16 * mplane * sizeof(uint16_t)), "alloc encode out");
+        if (nr.mph)
+            NCHK(cudaMalloc((void**)&nr.dM, 6 * mplane * sizeof(uint16_t)), "alloc motion frames");
+        else
+            NCHK(cudaMalloc((void**)&nr.dXh, 6 * plane * sizeof(uint16_t)), "alloc x fp16");
+        if (nr.mph && (nr.mw != nr.w || nr.mh != nr.h))
+            NCHK(cudaMalloc((void**)&nr.dMFit, (size_t)3 * nr.mw * nr.mh * sizeof(float)), "alloc motion fit");
     }
-    // native DRBA: one tween per IFNet enqueue (its own DRM map), so a batch-1 timestep and
-    // merged; the history ring of padded frames and encodes replaces f0 / f1
+    // native DRBA: the history ring of padded frames and encodes replaces f0 / f1
     if (nr.drba)
     {
-        NCHK(cudaMalloc((void**)&nr.dEncHalf, 16 * plane * sizeof(uint16_t)), "alloc encode out");
-        NCHK(cudaMalloc((void**)&nr.dXh, 6 * plane * sizeof(uint16_t)), "alloc x fp16");
-        NCHK(cudaMalloc((void**)&nr.dT, plane * sizeof(float)), "alloc timestep");
-        NCHK(cudaMalloc((void**)&nr.dMerged, 3 * plane * sizeof(float)), "alloc merged");
-        for (int i = 0; i < 4; i++)
-        {
-            NCHK(cudaMalloc((void**)&nr.dDrI[i], 3 * plane * sizeof(float)), "alloc drba frame ring");
-            NCHK(cudaMalloc((void**)&nr.dDrF[i], 16 * plane * sizeof(float)), "alloc drba encode ring");
-        }
-        for (int i = 0; i < 2; i++)
-        {
-            NCHK(cudaMalloc((void**)&nr.dDrX[i], 6 * plane * sizeof(float)), "alloc drba x");
-            NCHK(cudaMalloc((void**)&nr.drWin[i].f10, 2 * plane * sizeof(float)), "alloc drba window");
-            NCHK(cudaMalloc((void**)&nr.drWin[i].r, 4 * plane * sizeof(float)), "alloc drba window");
-        }
-        NCHK(cudaMalloc((void**)&nr.dDrFlow, 4 * plane * sizeof(float)), "alloc drba flow");
-        NCHK(cudaMalloc((void**)&nr.dDrFlowN, 4 * plane * sizeof(float)), "alloc drba flow");
-        NCHK(cudaMalloc((void**)&nr.dDrAcc, 6 * plane * sizeof(long long)), "alloc drba accumulator");
+        if (!nativeDrbaAlloc(nr))
+            return false;
+        if (nr.mph && (nr.mw != nr.w || nr.mh != nr.h))
+            NCHK(cudaMalloc((void**)&nr.dMFit, (size_t)3 * nr.mw * nr.mh * sizeof(float)), "alloc motion fit");
     }
     // live Restore: the engine's x / y at its input size, the captured frame (sized for fp32 so
     // either dtype fits), the fold's horizontal pass at the 4x height and the model-size target,
@@ -7381,6 +7679,182 @@ static bool nativeGmfssSetup(NativeRife& nr)
     return true;
 }
 
+// fp32 -> fp16 bits rounded to nearest even, the value the graph's own Cast (and f2h's cvt.rn) gives:
+// the constant timestep fills of an fp16 timestep (subnormal halves and the overflow to infinity included)
+static uint16_t halfBitsRne(float f)
+{
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    const uint32_t s = (x >> 16) & 0x8000u, a = x & 0x7fffffffu;
+    if (a > 0x7f800000u)
+        return (uint16_t)(s | 0x7e00u); // NaN
+    if (a >= 0x477ff000u)
+        return (uint16_t)(s | 0x7c00u); // 65520 and up round to infinity
+    if (a < 0x38800000u)
+    {
+        // below 2^-14: a subnormal half, in units of 2^-24; up to 2^-25 rounds to zero (the tie to
+        // the even zero)
+        if (a <= 0x33000000u)
+            return (uint16_t)s;
+        const uint32_t m = 0x800000u | (a & 0x7fffffu), sh = 126u - (a >> 23);
+        const uint32_t rem = m & ((1u << sh) - 1u), halfway = 1u << (sh - 1u);
+        uint32_t h = m >> sh;
+        if (rem > halfway || (rem == halfway && (h & 1u)))
+            h++;
+        return (uint16_t)(s | h);
+    }
+    // a normal half: the exponent rebiased (127 -> 15), the 13 dropped bits rounded to nearest even
+    // (a carry out of the mantissa steps the exponent, which is the right result)
+    const uint32_t r = a - 0x38000000u;
+    return (uint16_t)(s | ((r + 0x0fffu + ((r >> 13) & 1u)) >> 13));
+}
+
+// timestep plane j of the IFNet's batch: a constant map of t in the engine's timestep dtype
+static bool nativeFillT(NativeRife& nr, size_t j, float t, size_t plane, cudaStream_t st)
+{
+    if (nr.tHalf)
+        return cuMemsetD16Async((CUdeviceptr)((uint16_t*)nr.dT + j * plane), halfBitsRne(t), plane, (CUstream)st) ==
+               CUDA_SUCCESS;
+    unsigned int bits;
+    memcpy(&bits, &t, 4);
+    return cuMemsetD32Async((CUdeviceptr)((float*)nr.dT + j * plane), bits, plane, (CUstream)st) == CUDA_SUCCESS;
+}
+
+// the IFNet's timestep, flow and mask at the model's frame (the timestep sized by the dtype read
+// off the engine) and the tweens k_rifeBlend writes at the pictures' layout: batchMax entries each
+// (DRBA: one, every tween is its own enqueue with its own map)
+static bool nativeTweenBuffers(NativeRife& nr)
+{
+    const size_t plane = (size_t)nr.ph * nr.pw, b = nr.drba ? 1 : (size_t)(nr.batchMax < 1 ? 1 : nr.batchMax);
+    const size_t mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
+    NCHK(cudaMalloc(&nr.dT, b * mplane * (nr.tHalf ? sizeof(uint16_t) : sizeof(float))), "alloc timestep");
+    NCHK(cudaMalloc((void**)&nr.dFlow, b * 4 * mplane * sizeof(uint16_t)), "alloc flow");
+    NCHK(cudaMalloc((void**)&nr.dMask, b * mplane * sizeof(uint16_t)), "alloc mask");
+    NCHK(cudaMalloc((void**)&nr.dMerged, b * 3 * plane * sizeof(uint16_t)), "alloc tweens");
+    return true;
+}
+
+static uint64_t nativeVideoMemoryRoom();
+
+// RTX HDR's and RTX VSR's video memory in MiB, by the megapixels of the model frame they take in (the
+// bridge's NGX features and their frames, a quarter on top of the measured: a live session's own
+// dedicated memory with and without the feature, 82 / 226 MiB for RTX HDR at 854x480 / 1920x1080,
+// 174 / 524 MiB for RTX VSR from those into a 2560x1440 Fill)
+constexpr double kRtxHdrBase = 58.0, kRtxHdrMp = 109.0, kRtxVsrBase = 109.0, kRtxVsrMp = 264.0;
+
+// What the passes built after the IFNet take on a live session, in bytes: RTX HDR and RTX VSR
+// (nativeRtxInit), then DLSS 5's passes (nativeLiveNrInit, priced as nr_host prices its chain), so the
+// IFNet's batch gives way before DLSS 5 cuts a pass: a smaller batch only runs more calls
+static uint64_t nativeLaterNeed(const NativeRife& nr)
+{
+    const double mib = 1048576.0, mp = (double)nr.w * nr.h / 1e6;
+    double need = 0.0;
+    if (nr.rtxHdr)
+        need += kRtxHdrBase + kRtxHdrMp * mp;
+    if (nr.vsrWant)
+    {
+        const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
+        if ((tw > nr.w && th > nr.h) || (nr.w > nr.cw && nr.h > nr.ch))
+            need += kRtxVsrBase + kRtxVsrMp * mp;
+    }
+    if (g_liveNrCuda && (uint64_t)nr.w * nr.h <= 3840ull * 2160ull)
+    {
+        const int p = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
+        need += p * (nr::kPassBase + nr::kPassMp * mp) + nr::kAfterBase + nr::kAfterMp * mp + nr::kFrameMp * mp * p;
+    }
+    return (uint64_t)(need * mib);
+}
+
+// The live IFNet's activations, for an engine with a timestep batch axis (the context was made with
+// caller-sized memory): sized for the batches the session runs, one timestep for DRBA, up to batchMax
+// for RIFE and Frame Blend, lowered to the largest batch whose activations and tween buffers fit in the
+// free video memory beside the passes built after it. A batch computes the same tweens in either size of
+// memory; a smaller batch runs more calls a group, its kernels differing by rounding (0.01 dB, a pan).
+static bool nativeIfnetMemory(NativeRife& nr)
+{
+    if (!nr.ctxIf || !nativeBatchAxis(nr.engIf))
+        return true;
+    int top = nr.drba ? 1 : (nr.batchMax < 1 ? 1 : (nr.batchMax > 8 ? 8 : nr.batchMax));
+    // SMV_RIFE_BATCH=N: at most N timesteps a call (a measurement lever; offline, 1 = the unbatched engine)
+    const int lever = atoi(lkEnv("SMV_RIFE_BATCH").c_str());
+    if (lever >= 1 && lever < top)
+        top = lever;
+    auto shapes = [&](int b) -> bool {
+        for (const char* n : {"x", "timestep", "f0", "f1"})
+        {
+            nvinfer1::Dims d = nr.engIf->getProfileShape(n, 0, nvinfer1::OptProfileSelector::kMAX);
+            if (!strcmp(n, "timestep"))
+                d.d[0] = b;
+            if (!nr.ctxIf->setInputShape(n, d))
+                return false;
+        }
+        return true;
+    };
+    // nativeTweenBuffers' allocations for batch b (DRBA's are one timestep whatever the batch)
+    const size_t plane = (size_t)nr.ph * nr.pw, mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
+    auto buffers = [&](int b) -> uint64_t {
+        const size_t n = nr.drba ? 1 : (size_t)b;
+        return n * (mplane * ((nr.tHalf ? 2 : 4) + 8 + 2) + plane * 6);
+    };
+    uint64_t act[9] = {};
+    for (int b = 1; b <= top; b++)
+    {
+        act[b] = shapes(b) ? nr.ctxIf->updateDeviceMemorySizeForShapes() : 0;
+        if (!act[b])
+        {
+            LOG("native: the IFNet's activation size for %d timesteps is unknown\n", b);
+            return false;
+        }
+    }
+    int b = top;
+    const uint64_t room = nativeVideoMemoryRoom(), later = room ? nativeLaterNeed(nr) : 0;
+    if (room)
+        while (b > 1 && act[b] + buffers(b) + later > room)
+            b--;
+    if (!shapes(b))
+        return false;
+    const size_t bytes = nr.ctxIf->updateDeviceMemorySizeForShapes();
+    NCHK(cudaMalloc(&nr.dIfMem, bytes), "alloc IFNet activations");
+    nr.ctxIf->setDeviceMemoryV2(nr.dIfMem, (int64_t)bytes);
+    const double mib = 1048576.0;
+    const uint64_t full = (uint64_t)nr.engIf->getDeviceMemorySizeV2();
+    if (nr.drba)
+        LOG("native: DRBA's IFNet runs one timestep a call: its activations take %.0f MiB, not the %.0f MiB of "
+            "its engine's largest batch\n",
+            bytes / mib, full / mib);
+    else if (b < top)
+        LOG("native: video memory: the model runs %d of up to %d in-between frames a call (about %.0f MiB); %d need "
+            "about %.0f MiB, %.0f MiB are free beside the passes built next\n",
+            b, top, (act[b] + buffers(b)) / mib, top, (act[top] + buffers(top)) / mib,
+            (room > later ? room - later : 0) / mib);
+    nr.batchMax = b;
+    return true;
+}
+
+// k_motionIn's HDR curve, in units of SDR white: the SDR range passes exactly (what an SDR source
+// hands RIFE) and the light above white rolls off toward 5 x white, so highlight texture keeps the
+// contrast RIFE's motion search needs while the values stay near the range it was trained on
+// (measured on exact pans: highlights squeezed toward 1.0 lose their motion, unbounded light takes
+// RIFE out of its range; a head of 3 to 4 x white measured best)
+constexpr float kMotionKnee = 1.0f, kMotionHead = 4.0f;
+
+// RIFE's last step (k_rifeBlend) for the n tweens of the last IFNet enqueue, into dMerged: pic =
+// frame 0 in planes 0..2 and frame 1 in 3..5 at the pictures' layout (ph x pw), fp32 or fp16 by
+// half. The model's frame is the pictures' (the engine's own x: the engine's warp clamps at its
+// padded frame) unless mph is set (RIFE's two domains: the flow is read at the picture size and a
+// tap clamps at the picture's content).
+static bool nativeRifeBlend(NativeRife& nr, const void* pic, int half, int n, cudaStream_t st)
+{
+    int pps = nr.ph * nr.pw, prs = nr.pw, w = nr.w, h = nr.h;
+    int mps = nr.mph ? nr.mph * nr.mpw : pps, mrs = nr.mph ? nr.mpw : nr.pw;
+    int fw = nr.mph ? nr.mw : w, fh = nr.mph ? nr.mh : h;
+    int cw = (fw == w && fh == h) ? nr.pw : w, ch = (fw == w && fh == h) ? nr.ph : h;
+    void* a[] = {(void*)&pic, &half,     &pps, &prs, &w,  &h,  &cw,        &ch,
+                 &nr.dFlow,   &nr.dMask, &mps, &mrs, &fw, &fh, &nr.dMerged};
+    return cuLaunchKernel(nr.fRifeBlend, (w + 15) / 16, (h + 15) / 16, (unsigned)n, 16, 16, 1, 0, (CUstream)st, a,
+                          nullptr) == CUDA_SUCCESS;
+}
+
 static bool nativeTrtInit(NativeRife& nr)
 {
     // resident host: the same engine pair stays loaded across sessions, only the two
@@ -7580,13 +8054,16 @@ static bool nativeTrtInit(NativeRife& nr)
         nr.xHalf = g_res.xHalf;
         nr.imgHalf = g_res.imgHalf;
         nr.outHalf = g_res.outHalf;
+        nr.tHalf = g_res.tHalf;
         // no-engine mode: the resident holds no pair (both paths empty on both sides), only
         // the runtime, the jit cache and, per path, the restore engine
         if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
         {
-            if (!nativeMakeContext(nr, nr.engIf, &nr.cfgIf, &nr.ctxIf))
+            if (!nativeMakeContext(nr, nr.engIf, &nr.cfgIf, &nr.ctxIf, nativeBatchAxis(nr.engIf)))
                 return false;
             if (!nativeMakeContext(nr, nr.engEnc, &nr.cfgEnc, &nr.ctxEnc))
+                return false;
+            if (!nativeIfnetMemory(nr) || !nativeTweenBuffers(nr))
                 return false;
         }
         // the restore engine follows its own path: kept when the same one is asked for again,
@@ -7629,7 +8106,7 @@ static bool nativeTrtInit(NativeRife& nr)
     }
     if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
     {
-        nr.engIf = nativeLoadEngine(nr, nr.ifnetPath, &nr.cfgIf, &nr.ctxIf);
+        nr.engIf = nativeLoadEngine(nr, nr.ifnetPath, &nr.cfgIf, &nr.ctxIf, true);
         if (!nr.engIf)
             return false;
         nr.engEnc = nativeLoadEngine(nr, nr.encodePath, &nr.cfgEnc, &nr.ctxEnc);
@@ -7645,19 +8122,23 @@ static bool nativeTrtInit(NativeRife& nr)
     if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
     {
         // dtype contract, read off the engines rather than trusted from the handoff line
-        if (dt(nr.engIf, "timestep") != nvinfer1::DataType::kFLOAT)
+        // timestep: fp32 (ONNX rev <= 5) or fp16 (rev 6, the constant fills and DRBA's map written in fp16)
+        const auto td = dt(nr.engIf, "timestep");
+        if (td != nvinfer1::DataType::kFLOAT && td != nvinfer1::DataType::kHALF)
         {
-            LOG("native: IFNet tensor timestep is not fp32\n");
+            LOG("native: IFNet timestep dtype unsupported\n");
             return false;
         }
-        // merged: fp32 (ONNX rev <= 4) or fp16 (rev 5, every tween reader takes it as it is)
-        const auto md = dt(nr.engIf, "merged");
-        if (md != nvinfer1::DataType::kFLOAT && md != nvinfer1::DataType::kHALF)
+        nr.tHalf = td == nvinfer1::DataType::kHALF;
+        // flow / mask (ONNX rev 7): fp16, the tween is k_rifeBlend's (every tween reader takes fp16);
+        // an engine without them was built from an older graph (a missing name reads as fp32)
+        if (dt(nr.engIf, "flow") != nvinfer1::DataType::kHALF || dt(nr.engIf, "mask") != nvinfer1::DataType::kHALF)
         {
-            LOG("native: IFNet merged dtype unsupported\n");
+            LOG("native: the IFNet engine hands out no fp16 flow / mask (built from an ONNX before rev 7): empty "
+                "the engine cache\n");
             return false;
         }
-        nr.outHalf = md == nvinfer1::DataType::kHALF;
+        nr.outHalf = true;
         // x: fp32 (ONNX rev <= 3) or fp16 (rev 4, bound to the fp16 copy of the frame pair)
         const auto xd = dt(nr.engIf, "x");
         if (xd != nvinfer1::DataType::kFLOAT && xd != nvinfer1::DataType::kHALF)
@@ -7697,6 +8178,22 @@ static bool nativeTrtInit(NativeRife& nr)
             return false;
         }
         nr.imgHalf = id == nvinfer1::DataType::kHALF;
+        if (!nativeIfnetMemory(nr) || !nativeTweenBuffers(nr))
+            return false;
+    }
+    // RIFE's two domains live: the motion frames are fp16, the engines must take fp16 frames
+    if (!g_offline && nr.mph)
+    {
+        if (!nr.xHalf || !nr.imgHalf)
+        {
+            LOG("native: RIFE's motion frames are fp16 but the engines take fp32 frames (an ONNX before rev 4)\n");
+            return false;
+        }
+        LOG("native: RIFE finds the motion on the picture at %dx%d%s, its warp + blend runs on the %dx%d pictures\n",
+            nr.mw, nr.mh,
+            nr.hdr ? (nr.rtxHdr ? " (the SDR picture before RTX HDR)" : " (the HDR desktop's PQ read as SDR sRGB)")
+                   : "",
+            nr.w, nr.h);
     }
     if (!restoreReady() || !block0Ready())
         return false;
@@ -7712,6 +8209,7 @@ static bool nativeTrtInit(NativeRife& nr)
         g_res.xHalf = nr.xHalf;
         g_res.imgHalf = nr.imgHalf;
         g_res.outHalf = nr.outHalf;
+        g_res.tHalf = nr.tHalf;
         g_res.dev = nr.dev;
         g_res.ifnetPath = nr.ifnetPath;
         g_res.encodePath = nr.encodePath;
@@ -7749,6 +8247,11 @@ static void nativeFree(NativeRife& nr)
     {
         delete nr.ctxIf;
         nr.ctxIf = nullptr;
+    }
+    if (nr.dIfMem)
+    {
+        cudaFree(nr.dIfMem);
+        nr.dIfMem = nullptr;
     }
     if (nr.ctxEnc)
     {
@@ -7794,15 +8297,22 @@ static void nativeFree(NativeRife& nr)
     if (nr.drTweens || nr.drHeads)
         LOG("native: drba %llu tweens (%llu head pairs), %llu block0 runs\n", (unsigned long long)nr.drTweens,
             (unsigned long long)nr.drHeads, (unsigned long long)nr.drBlock0);
-    for (void* p : {(void*)nr.dDrI[0], (void*)nr.dDrI[1], (void*)nr.dDrI[2], (void*)nr.dDrI[3], (void*)nr.dDrF[0],
-                    (void*)nr.dDrF[1], (void*)nr.dDrF[2], (void*)nr.dDrF[3], (void*)nr.dDrX[0], (void*)nr.dDrX[1],
-                    (void*)nr.drWin[0].f10, (void*)nr.drWin[0].r, (void*)nr.drWin[1].f10, (void*)nr.drWin[1].r,
-                    (void*)nr.dDrFlow, (void*)nr.dDrFlowN, (void*)nr.dDrAcc})
+    for (void* p :
+         {(void*)nr.dDrI[0],      (void*)nr.dDrI[1],    (void*)nr.dDrI[2],      (void*)nr.dDrI[3],    (void*)nr.dDrF[0],
+          (void*)nr.dDrF[1],      (void*)nr.dDrF[2],    (void*)nr.dDrF[3],      (void*)nr.dDrX[0],    (void*)nr.dDrX[1],
+          (void*)nr.drWin[0].f10, (void*)nr.drWin[0].r, (void*)nr.drWin[1].f10, (void*)nr.drWin[1].r, (void*)nr.dDrFlow,
+          (void*)nr.dDrFlowN,     (void*)nr.dDrAcc,     (void*)nr.dDrM[0],      (void*)nr.dDrM[1],    (void*)nr.dDrM[2],
+          (void*)nr.dDrM[3],      (void*)nr.dDrMX[0],   (void*)nr.dDrMX[1],     (void*)nr.dDrB0})
         if (p)
             cudaFree(p);
     for (int i = 0; i < 4; i++)
+    {
         nr.dDrI[i] = nr.dDrF[i] = nullptr;
+        nr.dDrM[i] = nullptr;
+    }
     nr.dDrX[0] = nr.dDrX[1] = nullptr;
+    nr.dDrMX[0] = nr.dDrMX[1] = nullptr;
+    nr.dDrB0 = nullptr;
     for (auto& wn : nr.drWin)
         wn = NativeRife::DrWin{};
     nr.dDrFlow = nr.dDrFlowN = nullptr;
@@ -7880,6 +8390,11 @@ static void nativeFree(NativeRife& nr)
         cudaDestroyExternalMemory(nr.emOut);
         nr.emOut = nullptr;
     }
+    for (void* p : {(void*)nr.dFlow, (void*)nr.dMask, (void*)nr.dM, (void*)nr.dMFit})
+        if (p)
+            cudaFree(p);
+    nr.dFlow = nr.dMask = nr.dM = nullptr;
+    nr.dMFit = nullptr;
     for (void* p : {(void*)nr.dCap,    (void*)nr.dX,          (void*)nr.dXh,        (void*)nr.dF[0],
                     (void*)nr.dF[1],   (void*)nr.dEncHalf,    (void*)nr.dT,         (void*)nr.dMerged,
                     (void*)nr.dTmp,    (void*)nr.dCapF,       (void*)nr.dThdrIn,    (void*)nr.dThdrOut,
@@ -8272,30 +8787,53 @@ static float* drbaEnc(NativeRife& nr, uint32_t id)
 {
     return nr.dDrF[id & 3];
 }
+static uint16_t* drbaMotion(NativeRife& nr, uint32_t id)
+{
+    return nr.dDrM[id & 3];
+}
+// two domains: where k_motionIn writes the motion frame of the frame the next push takes
+static uint16_t* drbaMotionNext(NativeRife& nr)
+{
+    return drbaMotion(nr, nr.drFid + 1);
+}
+// the model's frame: RIFE's motion frame in two domains, else the pictures' pad
+static int drbaMh(const NativeRife& nr)
+{
+    return nr.mph ? nr.mph : nr.ph;
+}
+static int drbaMw(const NativeRife& nr)
+{
+    return nr.mph ? nr.mpw : nr.pw;
+}
 
-// the new packed frame into the ring, and its encode beside it
-static bool nativeDrbaPush(NativeRife& nr, const float* dCur)
+// the new packed frame into the ring, and its encode beside it. Two domains: its motion frame sits in
+// the ring already (drbaMotionNext), the encode reads that; same = a frame that reuses the previous
+// frame's picture takes the previous motion frame too.
+static bool nativeDrbaPush(NativeRife& nr, const float* dCur, bool same = false)
 {
     cudaStream_t st = nr.stream;
-    const size_t plane = (size_t)nr.ph * nr.pw;
+    const size_t plane = (size_t)nr.ph * nr.pw, mplane = (size_t)drbaMh(nr) * drbaMw(nr);
     const uint32_t id = ++nr.drFid;
     float* dst = drbaFrame(nr, id);
     float* enc = drbaEnc(nr, id);
-    if (cudaMemcpyAsync(dst, dCur, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+    if (cudaMemcpyAsync(dst, dCur, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
+        (nr.mph && same && id > 1 &&
+         cudaMemcpyAsync(drbaMotion(nr, id), drbaMotion(nr, id - 1), 3 * mplane * sizeof(uint16_t),
+                         cudaMemcpyDeviceToDevice, st) != cudaSuccess))
     {
         nr.die("drba frame ring copy failed");
         return false;
     }
-    nvinfer1::Dims4 din{1, 3, nr.ph, nr.pw};
+    nvinfer1::Dims4 din{1, 3, drbaMh(nr), drbaMw(nr)};
     if (!nr.ctxEnc->setInputShape("img", din))
     {
         nr.die("encode setInputShape rejected (shape outside the engine profile)");
         return false;
     }
-    // an fp16 encode input reads an fp16 copy of the new frame (the fp16 x copy's cur half,
-    // unused otherwise on this route)
-    uint16_t* img16 = nr.dXh + 3 * plane;
-    if (nr.imgHalf && !nativeF2h(nr, dCur, img16, 3 * plane, st))
+    // an fp16 encode input reads the motion frame, or an fp16 copy of the new frame (the fp16 x
+    // copy's cur half, unused otherwise on this route)
+    uint16_t* img16 = nr.mph ? drbaMotion(nr, id) : nr.dXh + 3 * plane;
+    if (!nr.mph && nr.imgHalf && !nativeF2h(nr, dCur, img16, 3 * plane, st))
     {
         nr.die("f2h launch failed");
         return false;
@@ -8311,7 +8849,7 @@ static bool nativeDrbaPush(NativeRife& nr, const float* dCur)
     }
     if (widen)
     {
-        int n = (int)(16 * plane);
+        int n = (int)(16 * mplane);
         void* a[] = {&nr.dEncHalf, &enc, &n};
         if (cuLaunchKernel(nr.fH2f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
         {
@@ -8323,20 +8861,38 @@ static bool nativeDrbaPush(NativeRife& nr, const float* dCur)
 }
 
 // calc_flow(frame a, frame b): block0 on the pair, then its tail (the DRBA glue kernels) into out
-// (4 planes: flow05 * 2 | flow15 * 2)
+// (4 planes: flow05 * 2 | flow15 * 2). Two domains: block0 takes fp32 frames, so the two motion
+// frames are widened into dDrB0 first.
 static bool nativeDrbaFlow(NativeRife& nr, uint32_t a, uint32_t b, float* out)
 {
     cudaStream_t st = nr.stream;
-    const size_t plane = (size_t)nr.ph * nr.pw;
-    nvinfer1::Dims4 di{1, 3, nr.ph, nr.pw}, df{1, 16, nr.ph, nr.pw};
+    int mw = drbaMw(nr), mh = drbaMh(nr);
+    const size_t plane = (size_t)mh * mw;
+    nvinfer1::Dims4 di{1, 3, mh, mw}, df{1, 16, mh, mw};
     if (!nr.ctxB0->setInputShape("img0", di) || !nr.ctxB0->setInputShape("img1", di) ||
         !nr.ctxB0->setInputShape("f0", df) || !nr.ctxB0->setInputShape("f1", df))
     {
         nr.die("block0 setInputShape rejected");
         return false;
     }
-    nr.ctxB0->setTensorAddress("img0", drbaFrame(nr, a));
-    nr.ctxB0->setTensorAddress("img1", drbaFrame(nr, b));
+    float *img0 = drbaFrame(nr, a), *img1 = drbaFrame(nr, b);
+    if (nr.mph)
+    {
+        img0 = nr.dDrB0;
+        img1 = nr.dDrB0 + 3 * plane;
+        int n = (int)(3 * plane);
+        const uint16_t *m0 = drbaMotion(nr, a), *m1 = drbaMotion(nr, b);
+        void* a0[] = {(void*)&m0, &img0, &n};
+        void* a1[] = {(void*)&m1, &img1, &n};
+        if (cuLaunchKernel(nr.fH2f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS ||
+            cuLaunchKernel(nr.fH2f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a1, nullptr) != CUDA_SUCCESS)
+        {
+            nr.die("block0 frame h2f launch failed");
+            return false;
+        }
+    }
+    nr.ctxB0->setTensorAddress("img0", img0);
+    nr.ctxB0->setTensorAddress("img1", img1);
     nr.ctxB0->setTensorAddress("f0", drbaEnc(nr, a));
     nr.ctxB0->setTensorAddress("f1", drbaEnc(nr, b));
     nr.ctxB0->setTensorAddress("flow", nr.dDrFlow);
@@ -8350,15 +8906,15 @@ static bool nativeDrbaFlow(NativeRife& nr, uint32_t a, uint32_t b, float* out)
         nr.die("drba accumulator clear failed");
         return false;
     }
-    void* as[] = {&nr.dDrFlow, &nr.pw, &nr.ph, &nr.dDrAcc};
-    if (cuLaunchKernel(nr.fDrFlowSplat, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, as,
-                       nullptr) != CUDA_SUCCESS)
+    void* as[] = {&nr.dDrFlow, &mw, &mh, &nr.dDrAcc};
+    if (cuLaunchKernel(nr.fDrFlowSplat, (mw + 15) / 16, (mh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, as, nullptr) !=
+        CUDA_SUCCESS)
     {
         nr.die("drbaFlowSplat launch failed");
         return false;
     }
     const int n = (int)plane;
-    void* an[] = {&nr.dDrAcc, &nr.pw, &nr.ph, &out};
+    void* an[] = {&nr.dDrAcc, &mw, &mh, &out};
     if (cuLaunchKernel(nr.fDrFlowNorm, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, an, nullptr) != CUDA_SUCCESS)
     {
         nr.die("drbaFlowNorm launch failed");
@@ -8374,7 +8930,7 @@ static NativeRife::DrWin* nativeDrbaWindow(NativeRife& nr, uint32_t c)
     for (auto& wn : nr.drWin)
         if (wn.c == c)
             return &wn;
-    const size_t plane = (size_t)nr.ph * nr.pw;
+    const size_t plane = (size_t)drbaMh(nr) * drbaMw(nr);
     // keep the left neighbour (the chain), else a right one (python keeps every window >= c - 1;
     // the group builds k - 2 before k - 1 because the exe's fractions ascend, so both fit)
     const int s = (c > 1 && nr.drWin[0].c == c - 1)   ? 1
@@ -8417,7 +8973,8 @@ static NativeRife::DrWin* nativeDrbaWindow(NativeRife& nr, uint32_t c)
 static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool plain = false)
 {
     cudaStream_t st = nr.stream;
-    const size_t plane = (size_t)nr.ph * nr.pw;
+    int mw = drbaMw(nr), mh = drbaMh(nr);
+    const size_t plane = (size_t)nr.ph * nr.pw, mplane = (size_t)mh * mw;
     const uint32_t k = nr.drFid;
     held = false;
     NativeRife::DrWin* wn = nullptr;
@@ -8453,7 +9010,23 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
     const uint32_t i1 = side < 0 ? k - 1 : k - 2, i0 = side < 0 ? k - 2 : k - 1;
     if (nr.drXFor[xi] != k)
     {
-        if (nr.xHalf)
+        if (nr.mph)
+        {
+            // two domains: the pair's motion frames for the IFNet, its pictures for the blend
+            if (cudaMemcpyAsync(nr.dDrMX[xi], drbaMotion(nr, i1), 3 * mplane * sizeof(uint16_t),
+                                cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
+                cudaMemcpyAsync(nr.dDrMX[xi] + 3 * mplane, drbaMotion(nr, i0), 3 * mplane * sizeof(uint16_t),
+                                cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
+                cudaMemcpyAsync(nr.dDrX[xi], drbaFrame(nr, i1), 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice,
+                                st) != cudaSuccess ||
+                cudaMemcpyAsync(nr.dDrX[xi] + 3 * plane, drbaFrame(nr, i0), 3 * plane * sizeof(float),
+                                cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+            {
+                nr.die("drba x copy failed");
+                return false;
+            }
+        }
+        else if (nr.xHalf)
         {
             // the IFNet takes x in fp16: the two ring frames narrowed into dDrX (fp32-sized)
             uint16_t* x16 = (uint16_t*)nr.dDrX[xi];
@@ -8477,9 +9050,7 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
     if (!wn)
     {
         // the head: plain pair RIFE at t = f, a constant timestep map (python: base + float(t))
-        unsigned int bits;
-        memcpy(&bits, &f, 4);
-        if (cuMemsetD32Async((CUdeviceptr)nr.dT, bits, plane, (CUstream)st) != CUDA_SUCCESS)
+        if (!nativeFillT(nr, 0, f, mplane, st))
         {
             nr.die("timestep fill failed");
             return false;
@@ -8488,20 +9059,20 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
     }
     else
     {
-        if (cudaMemsetAsync(nr.dDrAcc, 0, 2 * plane * sizeof(long long), st) != cudaSuccess)
+        if (cudaMemsetAsync(nr.dDrAcc, 0, 2 * mplane * sizeof(long long), st) != cudaSuccess)
         {
             nr.die("drba accumulator clear failed");
             return false;
         }
-        void* as[] = {&wn->f10, &wn->r, &side, &tt, &nr.pw, &nr.ph, &nr.dDrAcc};
-        if (cuLaunchKernel(nr.fDrDrmSplat, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, as,
+        void* as[] = {&wn->f10, &wn->r, &side, &tt, &mw, &mh, &nr.dDrAcc};
+        if (cuLaunchKernel(nr.fDrDrmSplat, (mw + 15) / 16, (mh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, as,
                            nullptr) != CUDA_SUCCESS)
         {
             nr.die("drbaDrmSplat launch failed");
             return false;
         }
-        const int n = (int)plane;
-        void* an[] = {&nr.dDrAcc, &wn->f10, &wn->r, &side, &tt, &nr.pw, &nr.ph, &nr.dT};
+        const int n = (int)mplane, th = nr.tHalf ? 1 : 0;
+        void* an[] = {&nr.dDrAcc, &wn->f10, &wn->r, &side, &tt, &mw, &mh, &nr.dT, (void*)&th};
         if (cuLaunchKernel(nr.fDrDrmNorm, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, an, nullptr) !=
             CUDA_SUCCESS)
         {
@@ -8509,28 +9080,35 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
             return false;
         }
     }
-    nvinfer1::Dims4 dx{1, 6, nr.ph, nr.pw}, dts{1, 1, nr.ph, nr.pw}, df{1, 16, nr.ph, nr.pw};
+    nvinfer1::Dims4 dx{1, 6, mh, mw}, dts{1, 1, mh, mw}, df{1, 16, mh, mw};
     if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dts) ||
         !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
     {
         nr.die("IFNet setInputShape rejected (shape outside the engine profile)");
         return false;
     }
-    nr.ctxIf->setTensorAddress("x", nr.dDrX[xi]);
+    nr.ctxIf->setTensorAddress("x", nr.mph ? (void*)nr.dDrMX[xi] : (void*)nr.dDrX[xi]);
     nr.ctxIf->setTensorAddress("timestep", nr.dT);
     nr.ctxIf->setTensorAddress("f0", drbaEnc(nr, i1));
     nr.ctxIf->setTensorAddress("f1", drbaEnc(nr, i0));
-    nr.ctxIf->setTensorAddress("merged", nr.dMerged);
+    nr.ctxIf->setTensorAddress("flow", nr.dFlow);
+    nr.ctxIf->setTensorAddress("mask", nr.dMask);
     if (!nr.ctxIf->enqueueV3(st))
     {
         nr.die("IFNet enqueueV3 returned false (outputs would be garbage)");
+        return false;
+    }
+    // the tween: RIFE's last step on the frames this enqueue read, in two domains on their pictures
+    if (!nativeRifeBlend(nr, nr.dDrX[xi], nr.mph ? 0 : (int)nr.xHalf, 1, st))
+    {
+        nr.die("rifeBlend launch failed");
         return false;
     }
     nr.drTweens++;
     return true;
 }
 
-// tween k of the IFNet's output batch (3 planes of `plane` elements each, fp32 or fp16 by outHalf)
+// tween k of the last batch (k_rifeBlend's, 3 planes of `plane` elements each, fp16: outHalf)
 static const void* mergedAt(const NativeRife& nr, size_t k, size_t plane)
 {
     const size_t n = k * 3 * plane;
@@ -8538,8 +9116,8 @@ static const void* mergedAt(const NativeRife& nr, size_t k, size_t plane)
 }
 
 // Restore (live and offline): _Fit._restore / render_passes.restore on one
-// source-size planar frame (srcW x srcH: live the captured frame, offline the decoded one in
-// NVIDIA order, else the model frame; fp16 when sHalf: a tween as the IFNet wrote it), the
+// source-size planar frame (srcW x srcH: live the captured frame, offline the decoded one with
+// a working size, else the model frame; fp16 when sHalf: a tween as the IFNet wrote it), the
 // result folded into dst (tw x th).
 // false = a launch failed (die was called); an engine enqueue refusal drops the pass for the rest
 // of the session instead (python's rule), the caller then continues with the unrestored source.
@@ -8663,9 +9241,10 @@ static float halfToFloat(uint16_t h); // main.cpp, after the parts
 // --nr-delta PATH (the preview's change mask): the
 // largest channel change of the DLSS 5 pass per pixel, |after - before| with `before` the pass's
 // fp32 input planes (tight, tw x th each) and `after` its fp16 output clamped to 0..1 like
-// k_nrOut, tw x th float32, rewritten per frame (the last frame's). A failed write costs only
-// the mask.
-static void nativeOfflineNrDelta(const NativeRife& nr, const std::vector<float>& before, int tw, int th)
+// k_nrOut, or the given planes (HDR video: the frame after k_nrOutPq), tw x th float32, rewritten
+// per frame (the last frame's). A failed write costs only the mask.
+static void nativeOfflineNrDelta(const NativeRife& nr, const std::vector<float>& before, int tw, int th,
+                                 const std::vector<float>* after = nullptr)
 {
     const size_t n = (size_t)tw * th;
     std::vector<float> d(n);
@@ -8674,8 +9253,9 @@ static void nativeOfflineNrDelta(const NativeRife& nr, const std::vector<float>&
         float m = 0.0f;
         for (int c = 0; c < 3; c++)
         {
-            float a = halfToFloat(nr.hNrOut[o * 4 + c]);
-            a = a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+            float a = after ? (*after)[c * n + o] : halfToFloat(nr.hNrOut[o * 4 + c]);
+            if (!after)
+                a = a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
             const float v = fabsf(a - before[c * n + o]);
             if (v > m)
                 m = v;
@@ -8986,16 +9566,109 @@ static bool nativeNrMotion(NativeRife& nr, const float* frame, int pw, int ps)
 // DLSS 5 on one frame, in place, before anything reads it: the padded planar model-input frame
 // (pw x ph, plane stride ps) whose top-left nrW x nrH is the picture; offline a decoded frame,
 // live a captured one after Restore and the resize (planes (B, G, R) in SDR, PQ (R, G, B) in
-// HDR). Every model and every output frame then reads DLSS 5 output: NVIDIA's order, DLSS 5 on
+// HDR). Every model and every output frame then reads DLSS 5 output: DLSS 5 on
 // the rendered frame and frame generation after it. Reset on the stream's first frame (live: and
 // after a pause).
 // Zero-copy: k_nrIn's frame goes into the core's shared input buffer at its row pitch, the stream
 // signals an odd fence value, the core's queue waits for it, evaluates, writes the shared output
 // buffer and signals the next even value, and the stream waits for that before k_nrOut reads the
-// result: no CPU wait. CPU staging: dlssnr.exe's renderFrame through its upload / readback
+// result: no CPU wait. CPU staging: the core's renderFrame through its upload / readback
 // buffers. An evaluate that fails turns the pass off for the rest of the render with a line and
 // leaves the frame untouched (nr.nrFailed); there is no retry: NGX has no teardown, so the NR core
 // cannot restart in this process.
+// SMV_VRAM_MIB: the GPU's memory as the app's memory checks see it, in MiB (a smaller card's trigger test on a
+// card everything fits in); 0 = the GPU's own
+static uint64_t nativeVideoCardLever()
+{
+    const std::string lever = lkEnv("SMV_VRAM_MIB");
+    const long long mib = lever.empty() ? 0 : atoll(lever.c_str());
+    return mib > 0 ? (uint64_t)mib << 20 : 0;
+}
+
+// The GPU's video memory as its driver counts it, every process included (NvAPI_GPU_GetMemoryInfoEx, the figures
+// nvidia-smi shows; cudaMemGetInfo and the DXGI budget describe this process alone): cardB = its size, freeB = what
+// is free right now, moved = how many allocations the driver has moved out of video memory to make room since the
+// system started. The GPU is the CUDA device's (matched by its adapter LUID), the first NVIDIA one when that cannot
+// be told. SMV_VRAM_MIB shrinks the card and the free memory with it. false = the driver does not say.
+static bool nativeVideoMemory(uint64_t& freeB, uint64_t& cardB, uint64_t* moved = nullptr)
+{
+    static const NvPhysicalGpuHandle gpu = [] {
+        NvPhysicalGpuHandle all[NVAPI_MAX_PHYSICAL_GPUS] = {};
+        NvU32 n = 0;
+        if (NvAPI_Initialize() != NVAPI_OK || NvAPI_EnumPhysicalGPUs(all, &n) != NVAPI_OK || !n)
+            return (NvPhysicalGpuHandle) nullptr;
+        LUID want{};
+        if (n > 1 && nativeCudaLuid(want))
+            for (NvU32 i = 0; i < n; i++)
+            {
+                NvLogicalGpuHandle lg = nullptr;
+                LUID id{};
+                NV_LOGICAL_GPU_DATA d = {};
+                d.version = NV_LOGICAL_GPU_DATA_VER;
+                d.pOSAdapterId = &id;
+                if (NvAPI_GetLogicalGPUFromPhysicalGPU(all[i], &lg) == NVAPI_OK &&
+                    NvAPI_GPU_GetLogicalGpuInfo(lg, &d) == NVAPI_OK && memcmp(&id, &want, sizeof(id)) == 0)
+                    return all[i];
+            }
+        return all[0];
+    }();
+    NV_GPU_MEMORY_INFO_EX m = {};
+    m.version = NV_GPU_MEMORY_INFO_EX_VER;
+    if (!gpu || NvAPI_GPU_GetMemoryInfoEx(gpu, &m) != NVAPI_OK || !m.dedicatedVideoMemory)
+        return false;
+    cardB = m.dedicatedVideoMemory;
+    freeB = m.curAvailableDedicatedVideoMemory;
+    const uint64_t lever = nativeVideoCardLever();
+    if (lever && lever < cardB)
+    {
+        freeB = freeB > cardB - lever ? freeB - (cardB - lever) : 0;
+        cardB = lever;
+    }
+    if (moved)
+        *moved = m.dedicatedVideoMemoryEvictionCount;
+    return true;
+}
+
+// The video memory a session may still take, in bytes: what is free right now less a reserve of 4 % of the card
+// (512 MiB at least) for what the desktop and other apps take next. Memory past it would not fail: Windows moves
+// what does not fit into system memory, which slows the session and every other app on the GPU. 0 = no limit
+// (SMV_VRAM_CAP=0, or the driver does not report its memory); 1 = nothing is free.
+static uint64_t nativeVideoMemoryRoom()
+{
+    uint64_t freeB = 0, cardB = 0;
+    if (lkEnv("SMV_VRAM_CAP") == "0" || !nativeVideoMemory(freeB, cardB))
+        return 0;
+    const uint64_t reserve = (std::max)((uint64_t)512 << 20, cardB / 25);
+    return freeB > reserve ? freeB - reserve : 1;
+}
+
+// A session's video memory check, for every route: nativeVideoMemoryMark at its start (before the engines and
+// buffers), nativeVideoMemoryNote once its first frames are out. One line when the driver moved allocations out of
+// video memory meanwhile: the session did not fit in what was free, so part of it, or of another app, now lives in
+// system memory and runs slower there (the pixels are the same).
+static uint64_t g_vramMoved = 0, g_vramFree = 0;
+static bool g_vramMarked = false;
+static void nativeVideoMemoryMark()
+{
+    uint64_t cardB = 0;
+    g_vramMarked = nativeVideoMemory(g_vramFree, cardB, &g_vramMoved);
+}
+static void nativeVideoMemoryNote()
+{
+    uint64_t freeB = 0, cardB = 0, moved = 0;
+    if (!g_vramMarked || !nativeVideoMemory(freeB, cardB, &moved))
+        return;
+    g_vramMarked = false;
+    const double gb = 1024.0 * 1024.0 * 1024.0;
+    if (moved > g_vramMoved || (nativeVideoCardLever() && !freeB))
+        LOG("%s: video memory ran out: %.1f GB of the GPU's %.1f GB were free when this %s started and it needs "
+            "more, so the driver moved memory out to system memory, which slows it and other apps down (the pixels "
+            "stay the same); a smaller picture, a lower DLSS mode, fewer DLSS 5 passes or closing other apps leave "
+            "more room\n",
+            g_offline ? "offline" : "native", (double)g_vramFree / gb, (double)cardB / gb,
+            g_offline ? "render" : "session");
+}
+
 static bool nativeNrFrame(NativeRife& nr, float* frame, int pw, int ph, int ps)
 {
     cudaStream_t st = nr.stream;
@@ -9003,15 +9676,17 @@ static bool nativeNrFrame(NativeRife& nr, float* frame, int pw, int ph, int ps)
     const size_t bytes = (size_t)tw * th * 8;
     // the model meets (R, G, B): live SDR planes are (B, G, R), so the R plane with a negative stride;
     // live HDR planes are PQ, so the SDR-range math runs around the pass (k_nrInPq / k_nrOutPq), unless
-    // RTX HDR converts after the pass (nrSdrIn: the planes are the capture's SDR range already)
-    const bool rgb = nr.planesRgb || nr.hdr, pq = nr.liveNr && nr.hdr && !nr.nrSdrIn;
+    // RTX HDR converts after the pass (nrSdrIn: the planes are the capture's SDR range already); offline
+    // HDR video (PQ or HLG codes) takes the same math
+    const bool rgb = nr.planesRgb || nr.hdr, pq = (nr.liveNr && nr.hdr && !nr.nrSdrIn) || nr.nrSrcHdr != 0;
+    int hlg = nr.nrSrcHdr == 2 ? 1 : 0;
     float* r0 = frame + (rgb ? 0 : 2 * (size_t)ps);
     const float* src = r0;
     int sps = rgb ? ps : -ps;
     void* a[] = {(void*)&src, &sps, &pw, &tw, &th, &nr.dNrIo};
     void* b[] = {&nr.dNrIo, &tw, &th, &r0, &ph, &pw, &sps};
-    void* aq[] = {(void*)&src, &sps, &pw, &tw, &th, &nr.nrSdrWhite, &nr.dNrIo};
-    void* bq[] = {&nr.dNrIo, &tw, &th, &nr.nrSdrWhite, &r0, &ph, &pw, &sps};
+    void* aq[] = {(void*)&src, &sps, &pw, &tw, &th, &nr.nrSdrWhite, &nr.dNrIo, &hlg};
+    void* bq[] = {&nr.dNrIo, &tw, &th, &nr.nrSdrWhite, &r0, &ph, &pw, &sps, &hlg};
     const unsigned gx = (unsigned)(pw + 15) / 16, gy = (unsigned)(ph + 15) / 16;
     if (nr.nrZeroCopy)
     {
@@ -9057,8 +9732,8 @@ static bool nativeNrFrame(NativeRife& nr, float* frame, int pw, int ph, int ps)
         }
         return true;
     }
-    if (cuLaunchKernel(nr.fNrIn, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
-            CUDA_SUCCESS ||
+    if (cuLaunchKernel(pq ? nr.fNrInPq : nr.fNrIn, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st,
+                       pq ? aq : a, nullptr) != CUDA_SUCCESS ||
         cudaMemcpyAsync(nr.hNrIn, nr.dNrIo, bytes, cudaMemcpyDeviceToHost, st) != cudaSuccess ||
         cudaStreamSynchronize(st) != cudaSuccess)
     {
@@ -9092,18 +9767,33 @@ static bool nativeNrFrame(NativeRife& nr, float* frame, int pw, int ph, int ps)
     if (ms > nr.nrMaxMs)
         nr.nrMaxMs = ms;
     nr.nrFirst = false;
-    if (!before.empty())
+    if (!before.empty() && !pq)
         nativeOfflineNrDelta(nr, before, tw, th);
     if (cudaMemcpyAsync(nr.dNrIo, nr.hNrOut, bytes, cudaMemcpyHostToDevice, st) != cudaSuccess ||
-        cuLaunchKernel(nr.fNrOut, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS)
+        cuLaunchKernel(pq ? nr.fNrOutPq : nr.fNrOut, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, pq ? bq : b, nullptr) !=
+            CUDA_SUCCESS)
     {
         nr.die("DLSS 5 output staging failed");
         return false;
     }
+    // HDR video: the change map compares the frame's own codes before and after the pass
+    if (!before.empty() && pq)
+    {
+        std::vector<float> after((size_t)3 * tw * th);
+        bool ok = cudaStreamSynchronize(st) == cudaSuccess;
+        for (int c = 0; c < 3 && ok; c++)
+            ok = cudaMemcpy2D(after.data() + (size_t)c * tw * th, (size_t)tw * sizeof(float), src + (size_t)c * ps,
+                              (size_t)pw * sizeof(float), (size_t)tw * sizeof(float), th,
+                              cudaMemcpyDeviceToHost) == cudaSuccess;
+        if (ok)
+            nativeOfflineNrDelta(nr, before, tw, th, &after);
+        else
+            LOG("offline: the DLSS 5 change map output download failed, no map\n");
+    }
     return true;
 }
 
-// Live DLSS 5 in NVIDIA's order: the NR core brought up as offline does it (a private D3D12 device on
+// Live DLSS 5: the NR core brought up as offline does it (a private D3D12 device on
 // the CUDA device's adapter) at the model size, with the zero-copy handoff and the CUDA Optical Flow
 // motion; nativeGroup runs it once per captured frame on the model frame after Restore and the
 // resize. A core that cannot start skips the pass for the session with a line and the session
@@ -9137,6 +9827,7 @@ static bool nativeLiveNrInit(NativeRife& nr)
     set.tone = (float)(g_nrTone < 0.0 ? 0.0 : (g_nrTone > 2.0 ? 2.0 : g_nrTone));
     set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 1;
     set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
+    set.memoryRoom = nativeVideoMemoryRoom(); // the passes that fit in the free video memory
     // SMV_NR_MV=0 = no motion (a measurement lever); without motion every frame is a Reset, since kept
     // history with no motion slides; SMV_NR_AUTOMASK=0 = the mask off (read by the core)
     wchar_t mvv[8]{}, amv[8]{}, ru[8]{}, re[8]{};
@@ -9179,14 +9870,14 @@ static bool nativeLiveNrInit(NativeRife& nr)
     nr.nrSdrWhite = (float)(g_sdrWhite / 80.0);
     nr.nrFirst = true;
     nr.liveNr = true;
-    LOG("live DLSS 5 native: on, %dx%d per captured frame on the model frame after Restore and the resize "
-        "(NVIDIA order), zero-copy, structure %.2f tone %.2f style %d, passes %d, %s, %s, %s%s\n",
+    LOG("live DLSS 5 native: on, %dx%d per captured frame on the model frame after Restore and the resize, "
+        "zero-copy, structure %.2f tone %.2f style %d, passes %d, %s, %s, %s%s\n",
         w, h, set.structure, set.tone, set.style, host->passes(),
         nr.nrMotion ? "motion vectors (NVOFA grid 4), history kept"
                     : (set.motion ? "no motion vectors, every frame a Reset"
                                   : "no motion vectors (SMV_NR_MV=0), every frame a Reset"),
         autoMask ? "auto mask" : "no auto mask (SMV_NR_AUTOMASK=0)",
-        nr.hdr ? "SDR range of the window (HDR highlights untouched)" : "SDR window",
+        nr.hdr ? "SDR range of the window (HDR highlights keep their light above white)" : "SDR window",
         nr.nrReuse ? ", identical frames reuse the last output" : "");
     if (host->passes() < set.passes)
         LOG("live DLSS 5 native: %d of %d passes (%s)\n", host->passes(), set.passes, host->passNote().c_str());
@@ -9195,7 +9886,7 @@ static bool nativeLiveNrInit(NativeRife& nr)
     return true;
 }
 
-// NVIDIA's order after DLSS 5, once per real frame on the model frame dCur (pw x ph, planes dps apart, nr.w x nr.h
+// After DLSS 5, once per real frame on the model frame dCur (pw x ph, planes dps apart, nr.w x nr.h
 // used) before any model reads it: FSR's RCAS (post-processing at the working size), then RTX TrueHDR (SDR -> PQ
 // BT.2020, after RTX VSR and every SDR pass), so the model interpolates the finished frames (frame generation last).
 // thdr = TrueHDR runs this frame. A failed TrueHDR eval fails an offline render; live it turns the pass off for the
@@ -9363,7 +10054,7 @@ static bool nativeOfflinePqOut(NativeRife& nr, const void* src, int half, int ps
 // first when withRestore (back to the source size when RTX VSR follows, else folded straight to
 // the target), then the resize (RTX VSR when this stage owns it, else clamped Lanczos3; offline
 // only enlarges, a downscale is folded into the decode). The stages: without a working size the
-// model output to the output size; in NVIDIA order the decoded frame to the working size before
+// model output to the output size; with one the decoded frame to the working size before
 // the model, and the final resize (no Restore) from the working size to the output after it.
 // staged = nr.dPres holds the tw x th frame; src / ps / rs / srcHalf follow a Restore that hands on
 // its fp32 frame. false = a launch failed.
@@ -9468,7 +10159,7 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
     return true;
 }
 
-// NVIDIA order, before DLSS 5 and the model: the decoded frame in nr.dSrcPl (srcW x srcH)
+// Before DLSS 5 and the model: the decoded frame in nr.dSrcPl (srcW x srcH)
 // through Restore and RTX VSR / Lanczos3 to the working size, which is the model size, then into
 // the model frame dCur (pw x ph, planes dps apart) with the packers' replicate pad
 static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
@@ -9493,7 +10184,7 @@ static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
 
 // The offline pass chain on one planar model-size frame (ps / rs strides, nr.w x nr.h), then
 // the quantisation, into dO as tight rgb48le (out16) or rgb24 at the output size nr.dw x nr.dh:
-// nativeOfflineStage (Restore and the resize; in NVIDIA order Restore ran before the model and
+// nativeOfflineStage (Restore and the resize; with a working size Restore ran before the model and
 // only the final resize from the working size is left). DLSS 5, FSR and RTX TrueHDR already ran on
 // the decoded frame before the interpolation (nativeNrFrame, nativePreModelPost): with RTX HDR the
 // frame is PQ, the resize is Lanczos3 (RTX VSR takes SDR only) and nativeOfflinePqOut writes the
@@ -9573,11 +10264,15 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
 
     // (3) the previous cur becomes prev, in place, then pack the new frame into the cur half
     // (native DRBA keeps its own history ring, so it skips the prev copy)
+    const size_t mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
     if (nr.havePrev && !nr.noEngine && !nr.drba)
     {
         cudaMemcpyAsync(nr.dX, nr.dX + 3 * plane, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st);
-        // the fp16 copy an fp16-x IFNet reads keeps the same two frames
-        if (nr.xHalf)
+        // the frames the IFNet reads keep the same two frames: the motion frames, or the fp16 copy an
+        // fp16-x IFNet reads
+        if (nr.mph)
+            cudaMemcpyAsync(nr.dM, nr.dM + 3 * mplane, 3 * mplane * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st);
+        else if (nr.xHalf)
             cudaMemcpyAsync(nr.dXh, nr.dXh + 3 * plane, 3 * plane * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st);
     }
     float* dCur = nr.dX + 3 * plane;
@@ -9612,8 +10307,13 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
         if (nrSame)
         {
+            // the motion frame of an identical capture is the previous one (the shift put it in the prev
+            // half; DRBA's push copies it inside its ring)
             if (cudaMemcpyAsync(dCur, nr.dNrLast, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) !=
-                cudaSuccess)
+                    cudaSuccess ||
+                (nr.mph && nr.havePrev && !nr.drba &&
+                 cudaMemcpyAsync(nr.dM + 3 * mplane, nr.dM, 3 * mplane * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
+                                 st) != cudaSuccess))
             {
                 nr.die("DLSS 5 reuse copy failed");
                 return false;
@@ -9622,7 +10322,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
     }
     // live with RTX HDR: Restore, the resize and DLSS 5 work on the SDR picture and RTX TrueHDR converts it
-    // after them (nativePreModelPost), NVIDIA's order. The capture's SDR range as planes (R, G, B, sRGB-encoded
+    // after them (nativePreModelPost). The capture's SDR range as planes (R, G, B, sRGB-encoded
     // against the SDR reference white) in dSrcG; without RTX HDR, or once it failed, the chain works on PQ from
     // the capture on.
     const bool sdrPre = !nrSame && nr.rtxHdr && !nr.rtxFailed && g_rtxb.created;
@@ -9672,7 +10372,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             restored = true;
         }
     }
-    // Restore in NVIDIA's order: once per captured frame, on the capture itself (its SDR planes when
+    // Restore: once per captured frame, on the capture itself (its SDR planes when
     // RTX HDR converts later), folded straight to the model size and into the model frame with the packers'
     // replicate pad, so every model reads restored frames; it replaces the resize below. When the
     // engine refuses, the pass is dropped for the session and the resize below runs instead.
@@ -9777,13 +10477,56 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             }
         }
     }
-    // DLSS 5 in NVIDIA's order: once per captured frame on the model frame, after Restore and the
+    // DLSS 5: once per captured frame on the model frame, after Restore and the
     // resize and before any model reads it; then FSR and RTX TrueHDR (nativePreModelPost), and the
     // frame the model reads is kept for the reuse above
     if (nr.liveNr && !nr.nrFailed && !nrSame && !nativeNrFrame(nr, dCur, nr.pw, nr.ph, (int)plane))
         return false;
+    // RIFE's motion frame (two domains): the finished picture as the IFNet would have read it, minus
+    // what costs RIFE its motion: the HDR desktop's PQ encoding (read as SDR sRGB over the desktop's
+    // SDR white) and an enlarge (Lanczos3 back to the capture size), padded to the motion frame. Taken
+    // after FSR, or before the post with RTX HDR (the picture is still SDR there, FSR is fused into
+    // TrueHDR's input). An identical capture copied it above.
+    auto motionFrame = [&]() -> bool {
+        const float* msrc = dCur;
+        int sps = (int)plane, srs = nr.pw, sw = nr.w, sh = nr.h;
+        if (nr.dMFit)
+        {
+            int zero = 0, n = 3 * nr.mw * nr.mh;
+            void* a[] = {(void*)&dCur, &zero, &sps, &nr.pw, &nr.w, &nr.h, &nr.dMFit, &nr.mw, &nr.mh};
+            void* b[] = {&nr.dMFit, &n};
+            if (cuLaunchKernel(nr.fFitPlanar, (nr.mw + 15) / 16, (nr.mh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+                               nullptr) != CUDA_SUCCESS ||
+                cuLaunchKernel(nr.fClamp01, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, b, nullptr) !=
+                    CUDA_SUCCESS)
+                return false;
+            msrc = nr.dMFit;
+            sps = nr.mw * nr.mh;
+            srs = nr.mw;
+            sw = nr.mw;
+            sh = nr.mh;
+        }
+        int dps = (int)mplane, mode = nr.hdr && !sdrPre ? 1 : 0;
+        float white = (float)(g_sdrWhite / 80.0), knee = kMotionKnee, head = kMotionHead;
+        uint16_t* mdst = nr.drba ? drbaMotionNext(nr) : nr.dM + 3 * mplane;
+        void* a[] = {(void*)&msrc, &sps,    &srs,    &sw,   &sh,    &mdst, &dps,
+                     &nr.mpw,      &nr.mpw, &nr.mph, &mode, &white, &knee, &head};
+        return cuLaunchKernel(nr.fMotionIn, (nr.mpw + 15) / 16, (nr.mph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+                              nullptr) == CUDA_SUCCESS;
+    };
+    const bool motionHere = nr.mph && !nrSame;
+    if (motionHere && sdrPre && !motionFrame())
+    {
+        nr.die("motion frame launch failed");
+        return false;
+    }
     if (!nrSame && !nativePreModelPost(nr, dCur, (int)plane, sdrPre))
         return false;
+    if (motionHere && !sdrPre && !motionFrame())
+    {
+        nr.die("motion frame launch failed");
+        return false;
+    }
     if (nr.liveNr && !nr.nrFailed && !nrSame)
     {
         if (cudaMemcpyAsync(nr.dNrLast, dCur, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess)
@@ -9801,7 +10544,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     float* drLag = dCur;
     if (nr.drba)
     {
-        if (!nativeDrbaPush(nr, dCur))
+        if (!nativeDrbaPush(nr, dCur, nrSame))
             return false;
         drHist = nr.drFid < 4 ? (int)nr.drFid : 4;
         if (drHist >= 2)
@@ -9900,16 +10643,17 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     }
     else if (!nr.noEngine)
     {
-        nvinfer1::Dims4 din{1, 3, nr.ph, nr.pw};
+        nvinfer1::Dims4 din{1, 3, nr.mph ? nr.mph : nr.ph, nr.mph ? nr.mpw : nr.pw};
         if (!nr.ctxEnc->setInputShape("img", din))
         {
             nr.die("encode setInputShape rejected (shape outside the engine profile)");
             return false;
         }
         // fp16 frames (ONNX rev 4): the new frame into the fp16 copy's cur half, read by an
-        // fp16-x IFNet and / or an fp16-img encode (every new frame, static pairs too)
-        uint16_t* cur16 = nr.dXh + 3 * plane;
-        if ((nr.xHalf || nr.imgHalf) && !nativeF2h(nr, dCur, cur16, 3 * plane, st))
+        // fp16-x IFNet and / or an fp16-img encode (every new frame, static pairs too); RIFE's two
+        // domains: the motion frame
+        uint16_t* cur16 = nr.mph ? nr.dM + 3 * mplane : nr.dXh + 3 * plane;
+        if (!nr.mph && (nr.xHalf || nr.imgHalf) && !nativeF2h(nr, dCur, cur16, 3 * plane, st))
         {
             nr.die("f2h launch failed");
             return false;
@@ -9926,7 +10670,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
         if (widen)
         {
-            int n = (int)(16 * plane);
+            int n = (int)(16 * mplane);
             void* a[] = {&nr.dEncHalf, &nr.dF[nr.fCur], &n};
             if (cuLaunchKernel(nr.fH2f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
@@ -10259,10 +11003,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 }
                 for (uint32_t j = 0; j < chunkLen; j++)
                 {
-                    unsigned int bits;
-                    memcpy(&bits, &ts[j], 4);
-                    if (cuMemsetD32Async((CUdeviceptr)(nr.dT + (size_t)j * plane), bits, plane, (CUstream)st) !=
-                        CUDA_SUCCESS)
+                    if (!nativeFillT(nr, j, ts[j], mplane, st))
                     {
                         nr.die("timestep fill failed");
                         fail = true;
@@ -10271,9 +11012,11 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 }
                 if (fail)
                     break;
-                nvinfer1::Dims4 dx{1, 6, nr.ph, nr.pw};
-                nvinfer1::Dims4 dtst{(int)chunkLen, 1, nr.ph, nr.pw};
-                nvinfer1::Dims4 df{1, 16, nr.ph, nr.pw};
+                // the IFNet's frame: the motion frame (two domains), else the pictures' pad
+                const int iph = nr.mph ? nr.mph : nr.ph, ipw = nr.mph ? nr.mpw : nr.pw;
+                nvinfer1::Dims4 dx{1, 6, iph, ipw};
+                nvinfer1::Dims4 dtst{(int)chunkLen, 1, iph, ipw};
+                nvinfer1::Dims4 df{1, 16, iph, ipw};
                 if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dtst) ||
                     !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
                 {
@@ -10281,14 +11024,25 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     fail = true;
                     break;
                 }
-                nr.ctxIf->setTensorAddress("x", nr.xHalf ? (void*)nr.dXh : (void*)nr.dX);
+                nr.ctxIf->setTensorAddress("x", nr.mph ? (void*)nr.dM : nr.xHalf ? (void*)nr.dXh : (void*)nr.dX);
                 nr.ctxIf->setTensorAddress("timestep", nr.dT);
                 nr.ctxIf->setTensorAddress("f0", nr.dF[nr.fCur ^ 1]);
                 nr.ctxIf->setTensorAddress("f1", nr.dF[nr.fCur]);
-                nr.ctxIf->setTensorAddress("merged", nr.dMerged);
+                nr.ctxIf->setTensorAddress("flow", nr.dFlow);
+                nr.ctxIf->setTensorAddress("mask", nr.dMask);
                 if (!nr.ctxIf->enqueueV3(st))
                 {
                     nr.die("IFNet enqueueV3 returned false (outputs would be garbage)");
+                    fail = true;
+                    break;
+                }
+                // the chunk's tweens: RIFE's last step on the frames this enqueue read, or on the fp32
+                // pictures at the working size (two domains)
+                const bool picHalf = !nr.mph && nr.xHalf;
+                if (!nativeRifeBlend(nr, picHalf ? (const void*)nr.dXh : (const void*)nr.dX, (int)picHalf,
+                                     (int)chunkLen, st))
+                {
+                    nr.die("rifeBlend launch failed");
                     fail = true;
                     break;
                 }
@@ -10311,6 +11065,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         nativeGmfssProfile(nr);
     nr.pushTok(0x80000000u); // bare end marker closes the group
     nr.havePrev = true;
+    nativeVideoMemoryNote(); // once a session, after its first group
     return true;
 }
 // ---- part 4: the compute thread and the public entry point --------------------------------
@@ -10321,6 +11076,8 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
     NativeRife& nr = *nrp;
     // earlyDone: PipeServer::beginNativeHandoff built everything but the output ring on its
     // own thread; this thread only binds the same device and finishes the ring
+    if (!earlyDone)
+        nativeVideoMemoryMark();
     bool ok = earlyDone ? nativeBindDevice(nr)
                         : nativeCudaDeviceInit(nr, adapter, hTex, hFence, (uint32_t)nr.cw, (uint32_t)nr.ch, nr.hdr) &&
                               nativeCudaInitEarly(nr, nativeCacheDir(nr)) && nativeTrtInit(nr) && nativeRtxInit(nr) &&

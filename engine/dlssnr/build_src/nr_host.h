@@ -1,8 +1,8 @@
 // nr_host.h - reusable DLSS 5 Neural Rendering core for SmoothMyVideo.
 //
 // The core creates its own D3D12 device: smv-live.exe hands the frames over through
-// shared buffers (startShared), dlssnr.exe through CPU staging (renderFrame).
-// Everything DLSS 5 specific lives here; main.cpp is only the pipe server around it.
+// shared buffers (startShared) or through CPU staging (renderFrame).
+// Everything DLSS 5 specific lives here.
 //
 // Nothing here is copied from any third party host. The NGX call order, the
 // parameter key strings and feature id 18 were established by probing the runtime.
@@ -11,6 +11,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <cstdint>
@@ -45,9 +46,24 @@ struct Settings
     // input, each pass its OWN feature and history (one feature called twice a frame would see two
     // evaluations with no motion between them), all fed the same motion field
     int passes = 1;
+    // the video memory the chain may take, in bytes (0 = no limit): a pass after the first is built
+    // only while the chain with it fits, so the chain ends at the passes that fit (passNote says so)
+    // instead of spilling into system memory
+    uint64_t memoryRoom = 0;
 };
 
 const int kMaxPasses = 10;
+
+// What a chain needs beyond the creation of its passes, in MiB: the caller's handoff and motion
+// buffers and the first frames' one-time share (kAfterBase + kAfterMp a megapixel), and each pass's
+// working memory (kFrameMp a megapixel). Measured on nvngx_dlssnr 310.8 at 854x480, 1920x1080 and
+// 3840x2160 with 1 and 4 passes (123 / 253 / 745 and 7 / 34 / 128 MiB), a quarter on top.
+const double kAfterBase = 128.0, kAfterMp = 96.0, kFrameMp = 20.0;
+
+// What each pass takes at its creation, in MiB: kPassBase + kPassMp a megapixel (186 / 360 / 496 / 933
+// MiB at 854x480 / 1920x1080 / 2560x1440 / 3840x2160 on nvngx_dlssnr 310.8). A caller that sizes its
+// own memory before the chain exists prices the chain with these and the shares above.
+const double kPassBase = 147.0, kPassMp = 95.0;
 
 // Probe knobs. The snippet validates its caller and the exact rule is
 // unknown, so every plausible route is reachable without a rebuild.
@@ -134,6 +150,11 @@ class Host
     }
     LUID adapterLuid() const;
 
+    // The video memory this process has committed on the core's adapter, in bytes (the part Windows
+    // moved to system memory because it did not fit counts too). false = the adapter does not
+    // report it.
+    bool videoMemory(uint64_t& held) const;
+
     // One frame through the shared buffers: the queue waits until the fence reaches waitValue
     // (the caller signals it once the input buffer holds the frame), copies it into Color,
     // evaluates, copies Output into the output buffer and signals signalValue. Returns without
@@ -175,8 +196,8 @@ class Host
 
     // Drop every reference WITHOUT any NGX call, for a host that leaves through ExitProcess:
     // the NR snippet's release and shutdown chain faults (measured in smv-live.exe,
-    // "NGX teardown faulted" and then 0xC0000005 on the way out), and dlssnr.exe never calls it
-    // either. The OS reclaims the session. A later shutdown() or the destructor is a no-op.
+    // "NGX teardown faulted" and then 0xC0000005 on the way out). The OS reclaims
+    // the session. A later shutdown() or the destructor is a no-op.
     void abandon();
 
   private:
@@ -208,6 +229,8 @@ class Host
     std::wstring m_corePath, m_snippetPath, m_shimPath;
 
     CP<ID3D12Device> m_dev;
+    CP<IDXGIAdapter3> m_adapter; // the device's adapter (videoMemory)
+    uint64_t m_heldStart = 0;    // videoMemory's held before the core's first resource
     CP<ID3D12CommandQueue> m_queue;
     CP<ID3D12CommandAllocator> m_alloc;
     CP<ID3D12GraphicsCommandList> m_list;
@@ -249,9 +272,8 @@ class Host
 };
 
 // Folder holding nvngx_dlssnr.dll, the caller shim nvngx.dll and the NGX log (the data path).
-// Default = the folder of the running exe (dlssnr.exe lives in engine\dlssnr). A host that
-// lives elsewhere (smv-live.exe in engine\live, phase 2) points this at engine\dlssnr before
-// startup. Empty or null restores the default.
+// Default = the folder of the running exe; smv-live.exe (in engine\live) points this at
+// engine\dlssnr before startup. Empty or null restores the default.
 void setModuleDir(const wchar_t* dir);
 
 // Human readable NGX result, including the codes the public header names.

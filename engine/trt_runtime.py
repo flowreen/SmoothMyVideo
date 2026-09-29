@@ -201,25 +201,62 @@ def _half_frames(onnx_path, name):
     onnx.checker.check_model(onnx_path)
 
 
-def _half_output(onnx_path, name):
-    """RIFE IFNet: hand the tween `merged` out as fp16. The graph blends it in fp32 (the two warps
-    times the mask), so one Cast narrows it at the end: the engine writes half the bytes and the
-    host's tween readers take it as it is. Each value moves by at most half an fp16 step (the tween
-    is the fp32 one rounded to fp16: at most 1 code at 8 and 10 bits). Graph only."""
+def _half_flow_mask(onnx_path, name):
+    """RIFE IFNet: hand the final flow and the blend mask out as fp16. An output the graph already
+    makes in fp16 stays as it is; an fp32 one gets one Cast at the end, and any reader inside the
+    graph keeps the fp32 tensor. Graph only."""
     import onnx
     from onnx import helper, TensorProto
 
     if not name.startswith("rife_ifnet_"):
         return
     g = onnx.load(onnx_path, load_external_data=False)
-    out = [o for o in g.graph.output if o.name == "merged"]
-    prod = [nd for nd in g.graph.node if "merged" in nd.output]
-    if len(out) != 1 or len(prod) != 1 or out[0].type.tensor_type.elem_type != TensorProto.FLOAT:
-        raise RuntimeError(f"{name}: expected one fp32 output merged")
-    prod[0].output[list(prod[0].output).index("merged")] = "merged_f32"
-    g.graph.node.append(helper.make_node("Cast", ["merged_f32"], ["merged"], to=TensorProto.FLOAT16,
-                                         name="merged_narrow"))
-    out[0].type.tensor_type.elem_type = TensorProto.FLOAT16
+    for key in ("flow", "mask"):
+        out = [o for o in g.graph.output if o.name == key]
+        prod = [nd for nd in g.graph.node if key in nd.output]
+        if len(out) != 1 or len(prod) != 1:
+            raise RuntimeError(f"{name}: expected one output {key}")
+        et = out[0].type.tensor_type.elem_type
+        if et == TensorProto.FLOAT16:
+            continue
+        if et != TensorProto.FLOAT:
+            raise RuntimeError(f"{name}: output {key} is neither fp32 nor fp16")
+        prod[0].output[list(prod[0].output).index(key)] = key + "_f32"
+        for nd in g.graph.node:
+            for k, x in enumerate(nd.input):
+                if x == key:
+                    nd.input[k] = key + "_f32"
+        g.graph.node.append(helper.make_node("Cast", [key + "_f32"], [key], to=TensorProto.FLOAT16,
+                                             name=key + "_narrow"))
+        out[0].type.tensor_type.elem_type = TensorProto.FLOAT16
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
+def _half_timestep(onnx_path, name):
+    """RIFE IFNet: take the timestep as an fp16 input and widen it inside the graph. Every timestep
+    path resizes it in fp32 and narrows it to fp16 before a conv, so a constant t (RIFE, Frame Blend)
+    gives the same tweens bit for bit; DRBA's spatial map is rounded to fp16 before those resizes
+    (its tweens move by up to 31 codes at 8 bits on thin moving edges, 55.7 dB at the worst frame).
+    The host fills half the bytes and the timestep buffer halves. Graph only."""
+    import onnx
+    from onnx import helper, TensorProto
+
+    if not name.startswith("rife_ifnet_"):
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    inp = [i for i in g.graph.input if i.name == "timestep"]
+    if len(inp) != 1 or inp[0].type.tensor_type.elem_type != TensorProto.FLOAT:
+        raise RuntimeError(f"{name}: expected an fp32 input timestep")
+    for nd in g.graph.node:
+        for k, x in enumerate(nd.input):
+            if x == "timestep":
+                nd.input[k] = "timestep_f32"
+    g.graph.node.insert(0, helper.make_node("Cast", ["timestep"], ["timestep_f32"], to=TensorProto.FLOAT,
+                                            name="timestep_widen"))
+    inp[0].type.tensor_type.elem_type = TensorProto.FLOAT16
     with open(onnx_path + ".tmp", "wb") as fh:
         fh.write(g.SerializeToString())
     os.replace(onnx_path + ".tmp", onnx_path)
@@ -332,7 +369,8 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
         _fuse_prelu(tmp)
         _half_features(tmp, name)
         _half_frames(tmp, name)
-        _half_output(tmp, name)
+        _half_flow_mask(tmp, name)
+        _half_timestep(tmp, name)
         if os.path.isfile(tmp + ".data"):
             os.replace(tmp + ".data", path + ".data")
         os.replace(tmp, path)
@@ -429,8 +467,11 @@ class RestoreEngine(_Engine):
 
 
 class _RifeIFNetExport(nn.Module):
-    """RIFE IFNet full forward with scale_list baked; timestep and the two feature encodes (f0,f1)
-    are tensor inputs and the output is just the fused frame merged[4] (flow_list is dropped)."""
+    """RIFE IFNet forward with scale_list baked; timestep and the two feature encodes (f0,f1) are
+    tensor inputs. Outputs: the final flow (0->t | 1->t) and the blend mask; the host makes the
+    tween with RIFE's own last step (warp each frame along its flow, blend by the mask), on the
+    frames the flow came from or on other pictures of the same pair (flow_list's coarser levels
+    and the fused frame are dropped)."""
 
     def __init__(self, ifnet, scale_list):
         super().__init__()
@@ -438,7 +479,9 @@ class _RifeIFNetExport(nn.Module):
         self.scale_list = scale_list
 
     def forward(self, x, timestep, f0, f1):
-        return self.ifnet(x, timestep=timestep, scale_list=self.scale_list, f0=f0, f1=f1)[0]
+        _, flows, mask = self.ifnet(x, timestep=timestep, scale_list=self.scale_list, f0=f0, f1=f1,
+                                    return_mask=True)
+        return flows[-1], mask
 
 
 def _rife_ifnet_base(ifnet, scale_list, whash):
@@ -454,7 +497,7 @@ class RifeIFNetEngine(_Engine):
 
     def __init__(self, ifnet, scale_list, whash):
         super().__init__(_rife_ifnet_base(ifnet, scale_list, whash),
-                         ["x", "timestep", "f0", "f1"], ["merged"])
+                         ["x", "timestep", "f0", "f1"], ["flow", "mask"])
 
 
 class _RifeIFNetBatchExport(nn.Module):
@@ -473,12 +516,14 @@ class _RifeIFNetBatchExport(nn.Module):
         if getattr(self.ifnet, "batch_broadcast", False):
             # the net expands the SMALL tensors itself, after the downsample, so the
             # pair constant full resolution downsample runs once instead of once per tween.
-            return self.ifnet(x, timestep=timestep, scale_list=self.scale_list,
-                              f0=f0, f1=f1)[0]
-        return self.ifnet(x.expand(b, -1, -1, -1), timestep=timestep,
-                          scale_list=self.scale_list,
-                          f0=f0.expand(b, -1, -1, -1),
-                          f1=f1.expand(b, -1, -1, -1))[0]
+            _, flows, mask = self.ifnet(x, timestep=timestep, scale_list=self.scale_list,
+                                        f0=f0, f1=f1, return_mask=True)
+        else:
+            _, flows, mask = self.ifnet(x.expand(b, -1, -1, -1), timestep=timestep,
+                                        scale_list=self.scale_list,
+                                        f0=f0.expand(b, -1, -1, -1),
+                                        f1=f1.expand(b, -1, -1, -1), return_mask=True)
+        return flows[-1], mask
 
 
 class RifeIFNetBatchEngine(_Engine):
@@ -488,7 +533,7 @@ class RifeIFNetBatchEngine(_Engine):
 
     def __init__(self, ifnet, scale_list, whash, b):
         super().__init__(_rife_ifnet_base(ifnet, scale_list, whash) + f"_bd{b}",
-                         ["x", "timestep", "f0", "f1"], ["merged"])
+                         ["x", "timestep", "f0", "f1"], ["flow", "mask"])
         # (min, opt, max) on the batch axis. opt = b: the full batch is the throughput case
         # worth tuning for.
         self.dyn_batch = {"timestep": (1, b, b)}

@@ -18,7 +18,8 @@ hdr10plus_tool, engine/live) report SKIP, not FAIL. The live cases drive
 engine/live/smv-live.exe against its --testsrc window (parked + --no-hud, nothing appears on
 screen) and assert the handshake, the zero-copy transports and the stats line shape. Exits
 nonzero if any case FAILs. Assertions are structural (frame counts, duration, metadata
-presence): TensorRT-RTX output is not run-to-run bit-stable, so there is no md5 case.
+presence), plus one frame-md5 check: the resident host's second RIFE render must decode to the
+first one's frames (fixed-shape TensorRT-RTX engines and NVENC are run-to-run stable).
 """
 import argparse
 import json
@@ -52,6 +53,12 @@ def frames(path):
     j = probe_json(path, "-count_frames", "-select_streams", "v:0",
                    "-show_entries", "stream=nb_read_frames")
     return int(j["streams"][0]["nb_read_frames"])
+
+
+def frame_md5s(path):
+    out = subprocess.check_output([FFMPEG, "-v", "error", "-i", path, "-map", "0:v:0", "-f", "framemd5", "-"],
+                                  text=True)
+    return [ln.rsplit(",", 1)[-1].strip() for ln in out.splitlines() if ln and not ln.startswith("#")]
 
 
 def duration(path):
@@ -172,7 +179,7 @@ def c_nvof(tmp, trt):
     assert rc == 0, "engine exit " + str(rc)
     expect_part_promoted(out)
     assert frames(out) == 49, f"frames {frames(out)} != 49"
-    assert "Using the NVIDIA Optical Flow (direct) backend" in err, "nvof backend line missing"
+    assert "Using the NVIDIA Optical Flow backend" in err, "nvof backend line missing"
     assert "model nvof" in err, "the native host did not run the nvof model"
     assert "static pairs held: 1" in err, "the identical head pair was not held"
 
@@ -210,7 +217,7 @@ def c_vfr(tmp, trt):
 
 
 # --------------------------------------------------------------------------- --full extras
-@case("rife 2x -> 49 frames through the native offline host")
+@case("rife 2x -> 49 frames through the native offline host, the resident second render frame-identical")
 def c_rife_native(tmp, trt):
     # the plain RIFE render runs inside smv-live.exe --offline
     out = os.path.join(tmp, "s_rife_native.mp4")
@@ -221,10 +228,15 @@ def c_rife_native(tmp, trt):
     # the resident offline host: the second render of the same size and
     # multiplier must land on the host the first one left behind, engines reused
     assert "resident host on" in err, "first render did not use the resident offline host"
-    rc, err = render(SAMPLE, out, "--rife")
+    out2 = os.path.join(tmp, "s_rife_native2.mp4")
+    rc, err = render(SAMPLE, out2, "--rife")
     assert rc == 0, "engine exit " + str(rc) + " (second render)"
-    assert frames(out) == 49, f"frames {frames(out)} != 49 (second render)"
+    assert frames(out2) == 49, f"frames {frames(out2)} != 49 (second render)"
     assert "resident engines reused" in err, "second render did not reuse the resident engines"
+    # the same render twice decodes to the same frames: the engines and the encoder are run-to-run stable
+    a, b = frame_md5s(out), frame_md5s(out2)
+    same = sum(1 for x, y in zip(a, b) if x == y)
+    assert len(a) == len(b) == 49 and same == 49, f"second render differs: {same} of {len(a)} frames identical"
 
 
 @case("5x on-grid -> 121 frames")
@@ -329,7 +341,7 @@ def c_hp(tmp, trt):
 def _dlssnr_ready():
     d = os.path.join(ENGINE, "dlssnr")
     return all(os.path.isfile(os.path.join(d, n))
-               for n in ("dlssnr.exe", "nvngx.dll", "nvngx_dlssnr.dll"))
+               for n in ("nvngx.dll", "nvngx_dlssnr.dll"))
 
 
 @case("--dlssg --dlssnr 2x -> 49 frames in one render, DLSS 5 before the frame generation")
@@ -466,8 +478,7 @@ def small_sample(tmp):
     """samples/test.mp4 (1920x1080) scaled to 854x480, NVENC lossless in MP4 (the source's
     timestamps, so the rate probe and the VFR case read it like the original), audio copied: every case costs
     about a quarter of the pixels while the frame count (25), the rate, the audio track and the
-    byte-identical first pair (the static-hold cases) stay. 480p is the floor: TensorRT-RTX
-    below 480p needs the user's confirmation first (a GPU TDR once followed such runs)."""
+    byte-identical first pair (the static-hold cases) stay."""
     out = os.path.join(tmp, "test_480.mp4")
     subprocess.run([FFMPEG, "-v", "error", "-y", "-i", SAMPLE, "-map", "0", "-vf", "scale=854:480",
                     "-c:v", "hevc_nvenc", "-tune", "lossless", "-pix_fmt", "yuv420p",

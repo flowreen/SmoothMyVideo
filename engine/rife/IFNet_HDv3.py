@@ -137,7 +137,8 @@ class IFNet(nn.Module):
         )
         '''
 
-    def forward(self, x, timestep=0.5, scale_list=[8, 4, 2, 1], training=False, fastmode=True, ensemble=False, f0=None, f1=None):
+    def forward(self, x, timestep=0.5, scale_list=[8, 4, 2, 1], training=False, fastmode=True, ensemble=False, f0=None, f1=None,
+                return_mask=False):
         channel = x.shape[1] // 2
         img0 = x[:, :channel]
         img1 = x[:, channel:]
@@ -190,4 +191,8 @@ class IFNet(nn.Module):
             res = tmp[:, :3] * 2 - 1
             merged[4] = torch.clamp(merged[4] + res, 0, 1)
             '''
+        if return_mask:
+            # the tween is exactly warp(img0, flow[:, :2]) * mask + warp(img1, flow[:, 2:4]) * (1 - mask), so a caller
+            # holding the final flow and this mask can apply the same blend to other pictures of the same two frames
+            return merged[4], flow_list, mask
         return merged[4], flow_list

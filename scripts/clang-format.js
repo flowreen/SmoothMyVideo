@@ -18,7 +18,6 @@ const FILES = [
     .map((f) => `${LIVE}/${f}`),
   'engine/dlssnr/build_src/nr_host.cpp',
   'engine/dlssnr/build_src/nr_host.h',
-  'engine/dlssnr/build_src/main.cpp',
   'engine/dlssnr/build_src/shim.cpp',
   'engine/dlssnr/build_src/shim_abi.h',
   'engine/dlssg/build_src/main.cpp',

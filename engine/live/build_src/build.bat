@@ -55,10 +55,13 @@ rem so the exe still starts on a machine that has none of them and no non-native
 rem nvofa\ = the MIT NVIDIA Optical Flow interface headers (the nvof model); nvofapi64.dll is
 rem driver-installed and opened at run time by full path, nothing to link or ship.
 rem No d3d12.lib on purpose: D3D12CreateDevice must keep resolving from sl.interposer.lib.
+rem NVAPI (the free video memory, NvAPI_GPU_GetMemoryInfoEx) = the MIT headers and static lib inside the
+rem Streamline SDK (external\nvapi); the lib opens the driver's own nvapi64.dll at run time, nothing to ship.
 cl /nologo /std:c++20 /EHsc /permissive- /O2 /W3 smv-live.cpp "%NRSRC%\nr_host.cpp" ^
-   /I "%SL_SDK%\include" /I "%TRT_RTX_SDK%\include" /I "%SMV_CU%\include" /I cuda_shim ^
+   /I "%SL_SDK%\include" /I "%SL_SDK%\external\nvapi" /I "%TRT_RTX_SDK%\include" /I "%SMV_CU%\include" /I cuda_shim ^
    /I "%NRSRC%" /I "%~dp0..\..\dlssg\build_src" /I "%NGX_SDK%\include" /I nvofa ^
-   /link /LIBPATH:"%SL_SDK%\lib\x64" /LIBPATH:"%TRT_RTX_SDK%\lib" /LIBPATH:"%SMV_CU%\lib\x64" ^
+   /link /LIBPATH:"%SL_SDK%\lib\x64" /LIBPATH:"%SL_SDK%\external\nvapi\amd64" /LIBPATH:"%TRT_RTX_SDK%\lib" ^
+   /LIBPATH:"%SMV_CU%\lib\x64" nvapi64.lib ^
    sl.interposer.lib tensorrt_rtx_1_6.lib tensorrt_onnxparser_rtx_1_6.lib cudart.lib cuda.lib delayimp.lib ^
    user32.lib gdi32.lib ole32.lib windowscodecs.lib dxguid.lib advapi32.lib ^
    d3d11.lib d3dcompiler.lib dwmapi.lib shlwapi.lib winmm.lib windowsapp.lib ^
