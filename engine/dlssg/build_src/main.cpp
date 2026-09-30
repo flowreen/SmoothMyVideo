@@ -12,11 +12,16 @@
 //   dlssg2f.exe frameA.png frameB.png out.png [--gdi]
 //       single pair -> interpolated PNG (native readback; --gdi = legacy screen
 //       capture used to validate the readback path, needs the window on-screen)
-//   dlssg2f.exe --server W H [--gen N] [--wait ms] [--onscreen]
+//   dlssg2f.exe --server W H [--gen N] [--wait ms] [--onscreen] [--hdr10]
 //       streaming: raw RGBA8 frames (W*H*4) on stdin; for every frame after the
 //       first, the N (default 1, max 5) DLSS-G frames generated between it and
 //       its predecessor - evenly spaced, in temporal order - are written to
 //       stdout as raw RGBA8 (multi-frame generation: N=1 is 2x, N=5 is 6x).
+//       --hdr10: HDR10 frames both ways instead (PQ BT.2020 as R10G10B10A2 words,
+//       still W*H*4 bytes), presented the way the DLSS-G guide asks for HDR
+//       (section 11.0): an R10G10B10A2 swap chain with the G2084 / P2020 colour
+//       space. The handshake then ends in " hdr10=1"; a swap chain that refuses
+//       that colour space exits 5 before the handshake.
 //       All logging goes to stderr; stdout is binary-only. EOF on stdin exits.
 //       This is the SmoothMyVideo backend.
 
@@ -293,6 +298,13 @@ struct Host
     UINT syncInterval = 0;    // Present sync interval (1 = vsync-paced FG)
     uint32_t maxGen = 0;      // device limit reported by the SDK (0 = not yet known)
     UINT presentSnapshot = 0; // native present count taken just before each proxy Present
+    bool hdr10 = false;       // --hdr10: R10G10B10A2 frames on a G2084 / P2020 swap chain
+    bool hdr10Refused = false;
+
+    DXGI_FORMAT frameFormat() const
+    {
+        return hdr10 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
 
     bool waitQueue()
     {
@@ -313,7 +325,7 @@ struct Host
         DXGI_SWAP_CHAIN_DESC1 scd{};
         scd.Width = W;
         scd.Height = H;
-        scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        scd.Format = frameFormat();
         scd.SampleDesc = {1, 0};
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         scd.BufferCount = 3;
@@ -334,11 +346,27 @@ struct Host
             return false;
         if (FAILED(nativeUnk.As(&scNative)))
             return false;
+        if (hdr10)
+        {
+            // declared on the proxy chain too: the interposer only learns the colour space from a call it hooks, and
+            // an R10G10B10A2 chain without the HDR10 colour space passes through ungenerated (measured on the live host)
+            const DXGI_COLOR_SPACE_TYPE cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            UINT support = 0;
+            if (GetEnvironmentVariableW(L"SMV_DLSSG_REFUSE_HDR10", nullptr, 0) ||
+                FAILED(scNative->CheckColorSpaceSupport(cs, &support)) ||
+                !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) || FAILED(scNative->SetColorSpace1(cs)) ||
+                FAILED(sc->SetColorSpace1(cs)))
+            {
+                hdr10Refused = true;
+                return false;
+            }
+        }
         DXGI_SWAP_CHAIN_DESC1 nd{};
         scNative->GetDesc1(&nd);
         nativeBufCount = nd.BufferCount;
         if (logIt)
-            LOG("native swap chain: %ux%u fmt=%d buffers=%u\n", nd.Width, nd.Height, (int)nd.Format, nativeBufCount);
+            LOG("native swap chain: %ux%u fmt=%d buffers=%u%s\n", nd.Width, nd.Height, (int)nd.Format, nativeBufCount,
+                hdr10 ? ", HDR10 (G2084 / P2020)" : "");
         return true;
     }
 
@@ -403,7 +431,12 @@ struct Host
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         CHECK_HR(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
         if (!createSwapchain(true))
-            return 1;
+        {
+            if (!hdr10Refused)
+                return 1;
+            LOG("the swap chain refused the HDR10 colour space (G2084 / P2020)\n");
+            return 5;
+        }
 
         sl::ReflexOptions ro{};
         ro.mode = sl::ReflexMode::eLowLatency;
@@ -467,7 +500,7 @@ struct Host
             return SUCCEEDED(
                 device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&buf)));
         };
-        if (!makeTex(DXGI_FORMAT_R8G8B8A8_UNORM, texFrame) || !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth) ||
+        if (!makeTex(frameFormat(), texFrame) || !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth) ||
             !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec) ||
             !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadBuf) ||
             !makeBuf(D3D12_HEAP_TYPE_READBACK, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_COPY_DEST, readbackBuf))
@@ -530,7 +563,7 @@ struct Host
         return 0;
     }
 
-    // upload an RGBA8 frame and present it through DLSS-G
+    // upload a frame (RGBA8, or R10G10B10A2 with --hdr10) and present it through DLSS-G
     bool presentFrame(const uint8_t* rgba)
     {
         pumpMessages();
@@ -559,7 +592,7 @@ struct Host
         list->Reset(alloc.Get(), nullptr);
         D3D12_TEXTURE_COPY_LOCATION dl{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         D3D12_TEXTURE_COPY_LOCATION sl_{uploadBuf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-        sl_.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, rowPitch};
+        sl_.PlacedFootprint.Footprint = {frameFormat(), W, H, 1, rowPitch};
         list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
 
         D3D12_RESOURCE_BARRIER b{};
@@ -645,7 +678,7 @@ struct Host
         list->ResourceBarrier(1, &b);
         D3D12_TEXTURE_COPY_LOCATION src{buf.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         D3D12_TEXTURE_COPY_LOCATION dst{readbackBuf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-        dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 1, rowPitch};
+        dst.PlacedFootprint.Footprint = {frameFormat(), W, H, 1, rowPitch};
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -744,12 +777,13 @@ static int slInitCommon()
     return 0;
 }
 
-static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
+static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen, bool hdr10)
 {
     Host host;
     host.waitMs = waitMs;
     host.genFrames = genFrames;
     host.syncInterval = vsync ? 1 : 0;
+    host.hdr10 = hdr10;
     int rc = host.init(onscreen);
     if (rc)
         return rc;
@@ -758,7 +792,7 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
     _setmode(_fileno(stdout), _O_BINARY);
 
     // handshake so the driving process can distinguish "up" from "unsupported"
-    fprintf(stdout, "DLSSG READY gen=%d max=%u\n", genFrames, host.maxGen);
+    fprintf(stdout, "DLSSG READY gen=%d max=%u%s\n", genFrames, host.maxGen, host.hdr10 ? " hdr10=1" : "");
     fflush(stdout);
 
     const size_t frameBytes = (size_t)W * H * 4;
@@ -802,17 +836,21 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
         return true;
     };
 
+    // a sampled pixel's colour bits, the alpha bits masked off: RGBA8's three bytes or R10G10B10A2's three fields
+    const uint32_t rgbMask = host.hdr10 ? 0x3FFFFFFFu : 0x00FFFFFFu;
+    auto rgbAt = [&](const uint8_t* f, size_t i) -> uint32_t {
+        uint32_t v;
+        memcpy(&v, f + i * 4, 4);
+        return v & rgbMask;
+    };
     // sampled RGB equality (alpha skipped): true when two frames carry identical image content.
     // Used to detect the pacer presenting the REAL frame instead of a generated one.
     auto diffSamples = [&](const uint8_t* a, const uint8_t* b) -> int {
         const size_t px = (size_t)W * H;
         int n = 0;
         for (size_t i = 0; i < px; i += 397)
-        {
-            const size_t o = i * 4;
-            if (a[o] != b[o] || a[o + 1] != b[o + 1] || a[o + 2] != b[o + 2])
+            if (rgbAt(a, i) != rgbAt(b, i))
                 n++;
-        }
         return n;
     };
     auto sameImage = [&](const uint8_t* a, const uint8_t* b) -> bool { return diffSamples(a, b) == 0; };
@@ -820,11 +858,8 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
     auto uniformImage = [&](const uint8_t* f) -> bool {
         const size_t px = (size_t)W * H;
         for (size_t i = 0; i < px; i += 397)
-        {
-            const size_t o = i * 4;
-            if (f[o] != f[0] || f[o + 1] != f[1] || f[o + 2] != f[2])
+            if (rgbAt(f, i) != rgbAt(f, 0))
                 return false;
-        }
         return true;
     };
 
@@ -869,7 +904,7 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
             LOG("SMV_DLSSG_SWEEP=1: buffer-sweep capture latched from the start\n");
         }
     }
-    std::vector<std::vector<uint8_t>> preSig(host.nativeBufCount);
+    std::vector<std::vector<uint32_t>> preSig(host.nativeBufCount);
     std::vector<uint8_t> sweepScratch(frameBytes);
     ULONGLONG lastPresentTick = 0;
     while (readFull(inFrame.data(), frameBytes))
@@ -936,16 +971,11 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
         std::vector<std::vector<uint8_t>> raw;
         bool good = false;
 
-        auto takeSig = [&](const uint8_t* f, std::vector<uint8_t>& sig) {
+        auto takeSig = [&](const uint8_t* f, std::vector<uint32_t>& sig) {
             sig.clear();
             const size_t px = (size_t)W * H;
             for (size_t i = 0; i < px; i += 397)
-            {
-                const size_t o = i * 4;
-                sig.push_back(f[o]);
-                sig.push_back(f[o + 1]);
-                sig.push_back(f[o + 2]);
-            }
+                sig.push_back(rgbAt(f, i));
         };
         if (metered)
         {
@@ -1006,7 +1036,7 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
                     nextSweep = GetTickCount64() + 50;
                     // sweep every native buffer; fresh non-copies are this pair's generated frames
                     std::vector<std::vector<uint8_t>> cand;
-                    std::vector<uint8_t> sig;
+                    std::vector<uint32_t> sig;
                     for (UINT i = 0; i < host.nativeBufCount; i++)
                     {
                         if (!host.copyNativeBuffer(i, sweepScratch.data()))
@@ -1062,7 +1092,7 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen)
                 LOG("captured %d generated frame(s) of %d (plus %zu real presents) within 1s\n", filled, genFrames,
                     raw.size() - filled);
                 // post-mortem: what is in each native buffer right now?
-                std::vector<uint8_t> sig;
+                std::vector<uint32_t> sig;
                 for (UINT i = 0; i < host.nativeBufCount; i++)
                 {
                     if (!host.copyNativeBuffer(i, sweepScratch.data()))
@@ -1245,6 +1275,7 @@ int wmain(int argc, wchar_t** argv)
         int genFrames = 1;
         bool vsync = true; // vsync pacing measured far more reliable for the capture (see BUILD.md)
         bool onscreen = false;
+        bool hdr10 = false;
         for (int i = 4; i < argc; i++)
         {
             if (wcscmp(argv[i], L"--wait") == 0 && i + 1 < argc)
@@ -1257,6 +1288,8 @@ int wmain(int argc, wchar_t** argv)
                 vsync = false;
             else if (wcscmp(argv[i], L"--onscreen") == 0)
                 onscreen = true;
+            else if (wcscmp(argv[i], L"--hdr10") == 0)
+                hdr10 = true;
         }
         if (genFrames < 1 || genFrames > 5)
         {
@@ -1265,7 +1298,7 @@ int wmain(int argc, wchar_t** argv)
         }
         if (slInitCommon())
             return 1;
-        return runServer(waitMs, genFrames, vsync, onscreen);
+        return runServer(waitMs, genFrames, vsync, onscreen, hdr10);
     }
 
     if (argc >= 4)
@@ -1277,6 +1310,6 @@ int wmain(int argc, wchar_t** argv)
     }
 
     LOG("usage: dlssg2f.exe frameA.png frameB.png out.png [--gdi]\n"
-        "       dlssg2f.exe --server W H [--gen N] [--wait ms] [--onscreen]\n");
+        "       dlssg2f.exe --server W H [--gen N] [--wait ms] [--onscreen] [--hdr10]\n");
     return 1;
 }

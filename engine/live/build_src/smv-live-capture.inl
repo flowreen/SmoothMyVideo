@@ -66,6 +66,17 @@ struct Capture
                              // by its own processing rate feeds back into itself and locks
                              // capture into subharmonic plateaus (measured).
     int64_t lastArrTs = 0;   // SystemRelativeTime of the previously delivered frame
+    int64_t arrGap = 0;      // 100 ns between the two newest arrivals (the source's own cadence, however slow the
+                             // pipeline runs: the static-source hold keys on it)
+    // The pool has two buffers and WGC discards, uncounted, every frame that arrives while both
+    // are held. So FrameArrived takes each frame off the pool at once (takeFrames) and keeps only
+    // the newest here until drainNewest hands it out: a host slower than the source then sees
+    // every arrival, `dropped` counts the superseded ones and emaArrMs reads the source's cadence
+    // (with the pool alone, a host at 3.5 pairs a second read a 24 fps source as 3.5 fps and 1
+    // drop a second, and its throttle never fired).
+    SRWLOCK lk = SRWLOCK_INIT;
+    wgc::Direct3D11CaptureFrame held{nullptr};
+    bool stopping = false; // set under lk by stop(): a late FrameArrived leaves the pool alone
     // Zero-copy capture interop (server route): frames are GPU-copied into a SHARED texture
     // the server imports as CUDA external memory, with a shared D3D11 fence for
     // ordering. Capture never touches the CPU: no staging Map, no shm memcpy, no H2D upload.
@@ -170,7 +181,10 @@ struct Capture
         dropped = 0;
         emaArrMs = 0;
         lastArrTs = 0;
+        arrGap = 0;
         lastFrameTs = 0;
+        held = nullptr;
+        stopping = false;
         interop = false;
         sharedTex.Reset();
         sharedFence.Reset();
@@ -318,6 +332,7 @@ struct Capture
             SetEvent(evt);
         });
         pool.FrameArrived([this](auto&&, auto&&) {
+            takeFrames();
             InterlockedExchange(&arrived, 1);
             SetEvent(evt);
         });
@@ -325,11 +340,22 @@ struct Capture
         return 0;
     }
 
-    // drain the pool to the newest frame; -3 = none pending, -2 = resized, -1 = failure,
-    // else 0 and `tex` holds the frame texture (caller must Close `frame`)
-    int drainNewest(wgc::Direct3D11CaptureFrame& frame, winrt::com_ptr<ID3D11Texture2D>& tex)
+    // the source's own cadence, however slow the pipeline runs: its two newest frames under 300 ms apart, and
+    // nothing from it for 300 ms (the static-source hold; false before its first frame)
+    bool sourceCadence() const
     {
-        for (;;)
+        return arrGap > 0 && arrGap < 3000000;
+    }
+    bool sourceQuiet() const
+    {
+        return lastArrTs && nowQpc100() - lastArrTs > 3000000;
+    }
+
+    // every frame on the pool into `held`, the newest kept (FrameArrived's thread and drainNewest)
+    void takeFrames()
+    {
+        AcquireSRWLockExclusive(&lk);
+        while (!stopping)
         {
             auto f = pool.TryGetNextFrame();
             if (!f)
@@ -342,14 +368,35 @@ struct Capture
                 if (d < 300.0)
                     emaArrMs = emaArrMs > 0 ? emaArrMs * 0.8 + d * 0.2 : d;
             }
+            arrGap = lastArrTs && ts > lastArrTs ? ts - lastArrTs : 0;
             lastArrTs = ts;
+            if (held)
+            {
+                held.Close();
+                dropped++;
+            } // superseded = the pipeline fell behind
+            held = f;
+        }
+        ReleaseSRWLockExclusive(&lk);
+    }
+
+    // hand out the newest frame; -3 = none pending, -2 = resized, -1 = failure,
+    // else 0 and `tex` holds the frame texture (caller must Close `frame`)
+    int drainNewest(wgc::Direct3D11CaptureFrame& frame, winrt::com_ptr<ID3D11Texture2D>& tex)
+    {
+        takeFrames();
+        AcquireSRWLockExclusive(&lk);
+        if (held)
+        {
             if (frame)
             {
                 frame.Close();
                 dropped++;
-            } // superseded = the pipeline fell behind
-            frame = f;
+            }
+            frame = held;
+            held = nullptr;
         }
+        ReleaseSRWLockExclusive(&lk);
         if (!frame)
             return -3;
 
@@ -516,6 +563,12 @@ struct Capture
 
     void stop()
     {
+        AcquireSRWLockExclusive(&lk);
+        stopping = true;
+        if (held)
+            held.Close();
+        held = nullptr;
+        ReleaseSRWLockExclusive(&lk);
         if (session)
             session.Close();
         if (pool)

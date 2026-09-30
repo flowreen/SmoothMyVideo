@@ -763,6 +763,8 @@ let liveLabel = ''; // user-facing effective-model name for the exe's loading me
 let liveNote = ''; // substitution note (e.g. Smooth Motion live runs GMFSS), same destination
 let liveDlssMode = 'dlaa'; // the DLSS mode (dlssScaleArg): the working size's share of the presented size
 // (server backends only; dlssg has no such input)
+let liveAutoFloor = ''; // Auto's GPU-time step: the mode the host named with its exit 8 ("live: Auto next MODE"),
+// passed as --auto-floor on the revive; a user start or a settings change clears it
 let liveDlssCustom = 100; // Custom: that share in %
 let liveFit = 'window'; // 'window' = 1:1 overlay, 'fill' = the target's monitor upscaled (server
 // only), 'monitor' = whole-screen capture 1:1 (every model incl. dlssg)
@@ -784,6 +786,7 @@ let liveHdrVib = 0; // Dynamic Vibrance intensity 0..1 (per-session opt-in, like
 let liveHdrSb = 0; // Dynamic Vibrance saturation boost 0..1
 let liveHud = true; // on-screen fps/latency readout (panel checkbox; off -> --no-hud)
 let liveHudLat = true; // latency segment of that readout (off -> --no-hud-latency)
+let liveGpuFit = true; // "Fit to the GPU" (off -> --no-gpu-fit: the target holds, no video memory fit)
 
 // Live events go to the main window (not a captured e.sender): the ` hotkey starts sessions
 // with no IPC event at all, and the panel must reflect those too.
@@ -867,9 +870,10 @@ function onLiveSessionEnd(code: number | null) {
   // exit 4 = target window resized (the overlay cannot resize in place); exit 6 = the stall
   // watchdog killed a wedged enhancement engine. Both revive the SAME session with the SAME
   // configuration: a mid-session downgrade (e.g. to the eager model path) would read as
-  // "it suddenly got slow" to the user, worse than a brief hiccup at full speed. Bounded by
-  // the shared restart cap (interactive resizing alone can fire many restarts).
-  if ((code === 4 || code === 6) && !liveStopping && restarts < 20 && resolved) {
+  // "it suddenly got slow" to the user, worse than a brief hiccup at full speed. Exit 8 = Auto's
+  // GPU-time step: the same session at the mode the host named (liveAutoFloor, --auto-floor).
+  // Bounded by the shared restart cap (interactive resizing alone can fire many restarts).
+  if ((code === 4 || code === 6 || code === 8) && !liveStopping && restarts < 20 && resolved) {
     liveLog(`session exit ${code}, reviving (restart ${restarts + 1})`);
     if (code === 6) sendLive('lv-out', 'live engine stalled, reviving the session\n');
     setTimeout(() => {
@@ -892,7 +896,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   // ONE knob: the fps target from the Speed selectors. Adaptive models resample to it; fixed
   // pipelines (DLSS 4.5) approximate it in the exe with the nearest whole multiple of the
   // captured window's measured rate, capped by the model (no --gen: the exe derives it).
-  const target = String(Math.min(1000, Math.max(10, Math.round(Number(liveTarget) || 60))));
+  const target = String(Math.min(10000, Math.max(10, Math.round(Number(liveTarget) || 60))));
   if (liveModel && liveModel !== 'dlssg') {
     args.push('--backend', liveModel);
     // user-facing name + substitution note for the exe's loading message/HUD (the raw
@@ -951,10 +955,12 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   // host resolves Auto by that size, and no flag = DLAA (the presented size itself)
   const scaleArg = dlssScaleArg(liveDlssMode, liveDlssCustom);
   if (liveModel !== 'dlssg' && scaleArg) args.push('--scale', scaleArg);
+  if (liveModel !== 'dlssg' && scaleArg === 'auto' && liveAutoFloor) args.push('--auto-floor', liveAutoFloor);
   if (liveModel !== 'dlssg' && liveFit === 'fill') args.push('--fit', 'fill');
   if (liveFit === 'monitor') args.push('--fit', 'monitor'); // whole-screen: all models incl. dlssg
   if (!liveHud) args.push('--no-hud');
   else if (!liveHudLat) args.push('--no-hud-latency'); // meter on, latency segment hidden
+  if (!liveGpuFit) args.push('--no-gpu-fit');
   // Every server backend runs inside smv-live.exe (its native host), the only live route; a
   // session the host cannot run ends with its reason on the status line.
   // resident host: every server backend has something worth keeping (the native engines); the
@@ -994,6 +1000,8 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     for (const line of lines) {
       const m = /target window: hwnd=0x0*([0-9a-fA-F]+)/.exec(line);
       if (m && liveProc === p && !liveIdle) liveResolved = '0x' + m[1].toLowerCase();
+      const af = /^live: Auto next (\w+):/.exec(line);
+      if (af && liveProc === p) liveAutoFloor = af[1];
       const e = LIVE_ENDED_RE.exec(line);
       if (e && liveProc === p) {
         // hotkey mode (--fg) has no hwnd of its own: it learns the target from the exe's
@@ -1072,7 +1080,10 @@ ipcMain.handle('lv-list', () => {
 
 // the Smooth It Live! button: after the renderer's countdown, target the foreground window
 // (the user clicked the window they want during the countdown; --exclude keeps SMV itself out)
-ipcMain.on('lv-start-fg', () => startLiveSession(null));
+ipcMain.on('lv-start-fg', () => {
+  liveAutoFloor = '';
+  startLiveSession(null);
+});
 // end the running session: "stop" on the resident host (it ends the session and stays), a
 // kill otherwise; the grace timer kills a host whose "ended" line never comes (the native
 // engine load polls the stop; the kill keeps Stop instant for a stage that does not). A stop
@@ -1140,9 +1151,11 @@ ipcMain.on(
       hdrsb?: number;
       hud?: boolean;
       hudlat?: boolean;
+      gpufit?: boolean;
     },
   ) => {
     liveModel = opts.model;
+    liveAutoFloor = ''; // a new configuration: Auto's GPU-time step starts over
     liveLabel = opts.label ?? '';
     liveNote = opts.note ?? '';
     liveDlssMode = opts.dlssmode ?? 'dlaa';
@@ -1166,6 +1179,7 @@ ipcMain.on(
     liveHdrSb = opts.hdrsb ?? 0;
     liveHud = opts.hud !== false;
     liveHudLat = opts.hudlat !== false;
+    liveGpuFit = opts.gpufit !== false;
     // the panel moved to another model: whatever the idle resident host keeps loaded (its
     // engines) goes right away (user rule: a model must not hold VRAM
     // through a session of another model)
@@ -1180,7 +1194,10 @@ ipcMain.on(
 let liveHotkey = '';
 function liveToggle() {
   if (liveProc && !liveIdle) stopLive();
-  else startLiveSession(null);
+  else {
+    liveAutoFloor = '';
+    startLiveSession(null);
+  }
 }
 function registerLiveHotkey(acc: string): boolean {
   if (!fileExists(LIVE_EXE)) return false;
@@ -1431,6 +1448,7 @@ type RunOpts = {
   dv?: boolean;
   hp?: boolean;
   codec?: string;
+  nogpufit?: boolean;
   hdrcolor?: string;
   hdrsat?: number;
   hdrcon?: number;
@@ -1502,6 +1520,8 @@ function engineArgs(opts: RunOpts): string[] {
   // model; the plan skips it when nothing enlarges. Falls back to Lanczos3 if the bridge or the RTX
   // Video runtime is unavailable.
   if (opts.rtxvsr) args.push('--rtx-vsr');
+  // "Fit to the GPU" off: no video memory fit (the batch and Auto's working size stay as planned, slower when memory runs short)
+  if (opts.nogpufit) args.push('--no-gpu-fit');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
   // on, the RTX bridge does VSR then TrueHDR in one pass). The engine masters at a fixed 1000-nit
   // peak and writes the HDR10 metadata, so there is no per-display nits knob; it falls back to an

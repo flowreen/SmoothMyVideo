@@ -189,6 +189,19 @@ struct PipeServer
         shmPitch = (W * 4 + 255) & ~255u;
         shmSlot = ((size_t)shmPitch * H + 511) & ~(size_t)511;
         shmSlots = (uint32_t)gen + 1;
+        // the ring holds only the slots the free video memory has room for beside what the first pairs still take
+        // (nativeRingFit): fewer slots lower the output's ceiling, a captured frame yields at most `slots` frames; the
+        // early thread built everything else, so what NVAPI calls free now is the ring's room
+        uint64_t ringB = 0;
+        const uint32_t fit = early ? nativeRingFit(*nr, shmSlot, ringB) : 0;
+        if (fit && fit < shmSlots)
+        {
+            LOG("native: video memory: the output ring holds %u output frames per source frame instead of %u (%u "
+                "need about %.0f MiB, %.0f MiB are free beside the session), so the output tops out at %ux the "
+                "source's frame rate\n",
+                fit, shmSlots, shmSlots, 2.0 * shmSlots * shmSlot / 1048576.0, ringB / 1048576.0, fit);
+            shmSlots = fit;
+        }
         const uint64_t obBytes = (2ull * shmSlots * shmSlot + 0xFFFFull) & ~0xFFFFull;
         if (!h12->createOutBuf(obBytes))
         {

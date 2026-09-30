@@ -137,6 +137,10 @@ static double g_flowScale = 1.0; // --scale F: live, the working size as this sh
                                  // presented size (tests, the app's Custom)
 static int g_dlssMode = 0;       // --scale MODE: NVIDIA's DLSS mode instead, 1 + its index in
                                  // kDlssModeName (0 = none: g_flowScale)
+static int g_liveAutoFit = 0;    // live Auto: the mode the free video memory fits, picked once a session
+                                 // before anything loads (liveAutoFitMemory); 0 = Auto's own pick
+static int g_liveAutoFloor = 0;  // --auto-floor MODE: live Auto runs this mode or a smaller one (the app passes
+                                 // the mode an exit 8 named, the GPU-time step); 0 = none
 static const wchar_t* const kDlssModeName[6] = {L"auto", L"dlaa", L"quality", L"balanced", L"performance", L"ultra"};
 // --scale's value: a DLSS mode name, or a share 0.01..1; false = neither
 static bool parseLiveScale(const wchar_t* v)
@@ -189,16 +193,16 @@ static double g_sdrWhite = 240.0;        // SDR reference white (nits) of the ta
 // never a fixed number: it is derived at runtime as ceil(target / measured source fps)
 // plus a margin (serverGenForTarget below). There is deliberately NO fps constant anywhere
 // in this file - a 10000fps target must fail on physics (present + inference cost), not on
-// a literal. The only ceiling is the MEMORY one: each slot costs pitch*H bytes twice over
-// (the shared-VRAM out buffer and its pagefile-backed shm fallback mapping), so the slot
-// count is capped by a fraction of the adapter's dedicated VRAM, computed from the real
-// slot size. slotBudget() returns that cap in SLOTS.
+// a literal. The only ceilings are MEMORY ones: each slot costs pitch*H bytes twice over
+// (the output ring holds two sets of slots, the host writes one while the loop presents the
+// other), so the slot count is capped here by a fraction of the adapter's dedicated VRAM,
+// computed from the real slot size (slotBudget() returns that cap in SLOTS), and again by
+// the free video memory when the host creates the ring (nativeRingFit).
 static uint64_t g_vramBytes = 0; // adapter DedicatedVideoMemory, filled at adapter pick
 static int slotBudget(size_t slotBytes)
 {
-    // a quarter of dedicated VRAM for the double-buffered out buffer (and the same size
-    // again as a pagefile-backed shm mapping, which is the fallback route, not concurrent
-    // VRAM). Floor of 2 slots so a tiny/unknown adapter still runs.
+    // a quarter of dedicated VRAM for the double-buffered output ring. Floor of 2 slots so a
+    // tiny/unknown adapter still runs.
     const uint64_t budget = (g_vramBytes ? g_vramBytes : (2ull << 30)) / 4;
     if (!slotBytes)
         return 2;
@@ -210,6 +214,8 @@ static int slotBudget(size_t slotBytes)
     return (int)n;
 }
 static bool g_noAdapt = false;     // --no-adapt: disable adaptive smoothness (benchmarks)
+static bool g_noGpuFit = false;    // --no-gpu-fit (the GUI's "Fit to the GPU" off): no video memory fit on either route
+                                   // (nativeVideoMemoryRoom), live holds its target (no throttle, no Auto step)
 static bool g_genExplicit = false; // --gen given on the CLI: never derive it from the target
 static int g_targetFps = 0;        // --target N: adaptive output target; 0 = the overlay
                                    // monitor's refresh rate
@@ -1016,16 +1022,18 @@ static void offlineWriter(OfflineIo* io)
 }
 
 // ---- DLSS 4.5 = engine\dlssg\dlssg2f.exe --server as this process's child ---------------------
-// dlssg.py's DLSSG class in C++: raw RGBA8 frames at the padded size on the child's stdin, after
-// the first one the gen generated frames of every pair on its stdout; its stderr lines are
-// forwarded to the log. A read that blocks over 10 s (or over 1 s while the GUI holds Pause)
-// kills the child (the watchdog = python's _pause_watch), and a failed pair restarts it and
-// re-primes with the pair's left frame, up to 4 times (python's _MAX_RESTARTS, 3 s apart).
+// dlssg.py's DLSSG class in C++: raw RGBA8 frames at the padded size on the child's stdin (hdr10:
+// R10G10B10A2 words of PQ BT.2020, --hdr10), after the first one the gen generated frames of every
+// pair on its stdout; its stderr lines are forwarded to the log. A read that blocks over 10 s (or
+// over 1 s while the GUI holds Pause) kills the child (the watchdog = python's _pause_watch), and a
+// failed pair restarts it and re-primes with the pair's left frame, up to 4 times (python's
+// _MAX_RESTARTS, 3 s apart).
 struct DgChild
 {
     std::wstring dir, pauseFile;
     int w = 0, h = 0, gen = 1;
     unsigned maxGen = 0;
+    bool hdr10 = false; // every spawn asks for --hdr10 and its handshake must confirm it
     HANDLE hProc = nullptr, hIn = nullptr, hOut = nullptr, hErr = nullptr;
     std::thread errPump, watch;
     std::mutex m;                       // guards hProc against the watchdog
@@ -1073,7 +1081,8 @@ static void dgEnd(DgChild& c, bool kill)
     }
 }
 
-// start the server and read its handshake; 0 = up, else the child's exit code (-1 = no process)
+// start the server and read its handshake; 0 = up, else the child's exit code (-1 = no process,
+// -2 = up without the HDR10 mode it was asked for, ended)
 static int dgSpawn(DgChild& c)
 {
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
@@ -1105,7 +1114,7 @@ static int dgSpawn(DgChild& c)
     si.lpAttributeList = attrs;
     const std::wstring exe = c.dir + L"\\dlssg2f.exe";
     std::wstring cmd = L"\"" + exe + L"\" --server " + std::to_wstring(c.w) + L" " + std::to_wstring(c.h) + L" --gen " +
-                       std::to_wstring(c.gen);
+                       std::to_wstring(c.gen) + (c.hdr10 ? L" --hdr10" : L"");
     PROCESS_INFORMATION pi{};
     ok = ok &&
          CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
@@ -1162,7 +1171,10 @@ static int dgSpawn(DgChild& c)
     {
         const size_t mp = line.find("max=");
         c.maxGen = mp == std::string::npos ? 0u : (unsigned)strtoul(line.c_str() + mp + 4, nullptr, 10);
-        return 0;
+        if (!c.hdr10 || line.find(" hdr10=1") != std::string::npos)
+            return 0;
+        dgEnd(c, true); // an older dlssg2f.exe ignores --hdr10 and would read the words as RGBA8
+        return -2;
     }
     DWORD rc = 1;
     WaitForSingleObject(pi.hProcess, 5000);
@@ -1296,6 +1308,7 @@ struct OfflineArgs
     std::wstring nrDeltaW;          // --nr-delta PATH: DLSS 5's per-pixel change, float32 (the preview's mask)
     int srcHdr = 0;                 // --src-hdr pq|hlg: the source is HDR video (1 PQ, 2 HLG), 0 = SDR
     std::wstring thumbW, thumbOffW; // --thumb PATH / --thumb-off FILE: the GUI's progress thumbnail (OfflineIo)
+    std::wstring fitWork;           // --fit-work LIST: offline Auto's candidates, priced and answered (offlineFitWork)
 };
 
 // argv[first..] are the flags after --offline; 0 = parsed, else the exit code
@@ -1404,6 +1417,10 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.workW = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--work-h") == 0 && i + 1 < argc)
             oa.workH = _wtoi(argv[++i]);
+        else if (wcscmp(argv[i], L"--fit-work") == 0 && i + 1 < argc)
+            oa.fitWork = argv[++i];
+        else if (wcscmp(argv[i], L"--no-gpu-fit") == 0)
+            g_noGpuFit = true;
         else if (wcscmp(argv[i], L"--sharpen") == 0 && i + 1 < argc)
             g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0)
@@ -1494,12 +1511,88 @@ static bool offlineArgsValid(const OfflineArgs& oa)
 static int offlineResidentMain(const OfflineArgs& base);
 static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, bool namedPipes);
 
+// --fit-work WW:WH:DW:DH,...: offline Auto's working size by the free video memory, asked before the render plans its
+// decode (a working size below the source is folded into the decode). The candidates come in order, Auto's pick
+// first, each a working size and the decode it needs. The price per model, in MiB (the process's own memory over x2
+// renders at 854x480 and 1920x1080 with the working size at the decode, a quarter on top): RIFE and Frame Blend
+// nativeOfflineRifeMiB (the IFNet at the decode), DRBA 310 + 1028 a padded megapixel, GMFSS 462 + 2446, Smooth Motion
+// 461 + 182, NVIDIA Optical Flow 233 + 179, no interpolation 225 + 41; the output's buffers beyond the working size, 25
+// a megapixel (1920x1080 and 3840x2160 outputs of a 960x540 render); the passes around the model
+// (nativeOfflineEffectsMiB). Prints `OFFLINE FIT i ROOM NEED0 NEEDi` in MiB: the first candidate that fits
+// nativeVideoMemoryRoom(), the last when none does, 0 without a room figure. No render and no CUDA.
+static int offlineFitWork(const OfflineArgs& oa)
+{
+    struct Cand
+    {
+        int ww, wh, dw, dh;
+    };
+    std::vector<Cand> cands;
+    for (const wchar_t* p = oa.fitWork.c_str(); p && *p;)
+    {
+        Cand k{};
+        if (swscanf_s(p, L"%d:%d:%d:%d", &k.ww, &k.wh, &k.dw, &k.dh) != 4 || k.ww < 16 || k.wh < 16 || k.dw < 16 ||
+            k.dh < 16)
+        {
+            LOG("offline: --fit-work takes WW:WH:DW:DH,... (each candidate's working size and decode)\n");
+            return 1;
+        }
+        cands.push_back(k);
+        p = wcschr(p, L',');
+        if (p)
+            ++p;
+    }
+    if (cands.empty())
+    {
+        LOG("offline: --fit-work names no candidate\n");
+        return 1;
+    }
+    const bool two = lkEnv("SMV_RIFE_TWO_DOMAIN") != "0";
+    auto needMiB = [&](const Cand& k) {
+        const double work = padMp64(k.ww, k.wh);
+        double model;
+        if (oa.gmfss)
+            model = 462.0 + 2446.0 * work;
+        else if (oa.fruc)
+            model = 461.0 + 182.0 * work;
+        else if (oa.nvof)
+            model = 233.0 + 179.0 * work;
+        else if (oa.echo)
+            model = 225.0 + 41.0 * work;
+        else if (oa.drba)
+            model = 310.0 + 1028.0 * (std::max)(work, two ? padMp64(k.dw, k.dh) : work);
+        else
+            model = nativeOfflineRifeMiB(two ? k.dw : k.ww, two ? k.dh : k.wh, k.ww, k.wh);
+        const int ow = oa.outW ? oa.outW : k.ww, oh = oa.outH ? oa.outH : k.wh;
+        const double outMore = (std::max)(0.0, ((double)ow * oh - (double)k.ww * k.wh) / 1e6);
+        return 1.25 * (model + 25.0 * outMore) + nativeOfflineEffectsMiB(k.ww, k.wh, k.dw, k.dh);
+    };
+    g_vramNoCuda = true;
+    const uint64_t roomB = nativeVideoMemoryRoom();
+    const double room = roomB > 1 ? roomB / 1048576.0 : 0.0;
+    size_t pick = 0;
+    if (roomB)
+    {
+        pick = cands.size() - 1;
+        for (size_t i = 0; i < cands.size(); i++)
+            if (needMiB(cands[i]) <= room)
+            {
+                pick = i;
+                break;
+            }
+    }
+    printf("OFFLINE FIT %zu %.0f %.0f %.0f\n", pick, room, needMiB(cands[0]), needMiB(cands[pick]));
+    fflush(stdout);
+    return 0;
+}
+
 static int runOffline(int argc, wchar_t** argv)
 {
     OfflineArgs oa;
     const int prc = parseOfflineArgs(argc, argv, 2, oa);
     if (prc)
         return prc;
+    if (!oa.fitWork.empty())
+        return offlineFitWork(oa);
     if (oa.resident)
     {
         if (oa.pipeName.empty())
@@ -1857,6 +1950,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             !cm((void**)&nr.dRest, 3 * mp * sizeof(float), "restore source-size frame"))
             return 2;
     }
+    // GMFSS and Restore on HDR video read it as SDR sRGB around BT.2408's reference white: Restore the decoded
+    // frames, GMFSS the model frames (also PQ after RTX HDR's TrueHDR on an SDR source)
+    nativeHdrModelSetup(nr, oa.srcHdr, oa.srcHdr ? oa.srcHdr : (nr.rtxHdr ? 1 : 0), 203.0f / 80.0f);
     // nvof: the Optical Flow session instead of the engines (every failure is a refusal line);
     // the TensorRT side still loads for Restore
     if (nr.nvof && !nativeNvofSetup(nr))
@@ -2071,6 +2167,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     uint8_t* hDgIn[2]{};
     uint8_t* hDgOut = nullptr;
     const size_t dgBytes = (size_t)nr.pw * nr.ph * 4;
+    int dgHlg = oa.srcHdr == 2 ? 1 : 0; // HDR10 frames: the HLG picture goes as PQ and comes back as HLG
     if (oa.dlssg)
     {
         if (!cm((void**)&dDgRgba, dgBytes, "dlss frame") ||
@@ -2093,7 +2190,17 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         dgc.h = nr.ph;
         dgc.gen = multi - 1;
         dgc.pauseFile = pauseFile;
-        const int spawnRc = dgSpawn(dgc);
+        // HDR planes (PQ or HLG video, RTX HDR's PQ) go as HDR10, the DLSS-G guide's HDR input; SMV_DLSSG_HDR10=0 =
+        // RGBA8 of the codes
+        dgc.hdr10 = (oa.srcHdr || nr.rtxHdr) && lkEnv("SMV_DLSSG_HDR10") != "0";
+        int spawnRc = dgSpawn(dgc);
+        if (dgc.hdr10 && (spawnRc == 5 || spawnRc == -2))
+        {
+            LOG("DLSS 4.5: %s, 8-bit frames\n",
+                spawnRc == 5 ? "the swap chain refused the HDR10 colour space" : "this dlssg2f.exe has no HDR10 mode");
+            dgc.hdr10 = false;
+            spawnRc = dgSpawn(dgc);
+        }
         if (spawnRc == 3 || (spawnRc == 0 && dgc.maxGen && (unsigned)dgc.gen > dgc.maxGen))
         {
             if (spawnRc == 0)
@@ -2111,9 +2218,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             return 2;
         }
         dgc.watch = std::thread(dgWatch, &dgc);
-        LOG("DLSS Frame Generation ready (%dx%d, %dx, server max %u)\n", nr.pw, nr.ph, multi, dgc.maxGen);
+        LOG("DLSS Frame Generation ready (%dx%d, %dx, server max %u%s)\n", nr.pw, nr.ph, multi, dgc.maxGen,
+            dgc.hdr10 ? (dgHlg ? ", HDR10 frames, the HLG picture as PQ" : ", HDR10 frames") : "");
     }
-    LOG("offline host ready: %dx%d %s in, %dx%d %s out, x%d, padded %dx%d, batch max %d, graph %s%s%s%s%s%s%s, %.2f s to ready\n",
+    if (g_noGpuFit)
+        LOG("offline: GPU fit off (--no-gpu-fit): no video memory fit\n");
+    LOG("offline host ready:%dx%d %s in, %dx%d %s out, x%d, padded %dx%d, batch max %d, graph %s%s%s%s%s%s%s, %.2f s to ready\n",
         w, h, fmt16 ? "rgb48le" : "rgb24", outW, outH, oa.outX2 ? "x2rgb10le" : (outIs16 ? "rgb48le" : "rgb24"), multi,
         nr.pw, nr.ph, batchMax, g_offlineGraph ? "on" : "off",
         nr.nvof ? ", model nvof"
@@ -2613,14 +2723,15 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         if (oa.dlssg)
         {
-            // DLSS 4.5: every frame to RGBA8 at the padded size (dlssg.py _send), then for a pair
-            // the server's generated frames (dlssg.py interpolate; the sync also retires the last
+            // DLSS 4.5: every frame to RGBA8 (hdr10: R10G10B10A2) at the padded size (dlssg.py _send), then
+            // for a pair the server's generated frames (dlssg.py interpolate; the sync also retires the last
             // pair's uploads from hDgOut before it is refilled)
             uint8_t* hCur = hDgIn[i & 1];
             int f32 = 0;
             void* a[] = {&dCur, &f32, (void*)&ps, (void*)&rs, &nr.pw, &nr.ph, &dDgRgba};
-            if (cuLaunchKernel(nr.fPackBgra, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
-                               nullptr) != CUDA_SUCCESS ||
+            void* a10[] = {&dCur, &f32, (void*)&ps, (void*)&rs, &nr.pw, &nr.ph, &dgHlg, &dDgRgba};
+            if (cuLaunchKernel(dgc.hdr10 ? nr.fPackR10 : nr.fPackBgra, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16,
+                               1, 0, (CUstream)st, dgc.hdr10 ? a10 : a, nullptr) != CUDA_SUCCESS ||
                 cudaMemcpyAsync(hCur, dDgRgba, dgBytes, cudaMemcpyDeviceToHost, st) != cudaSuccess ||
                 cudaStreamSynchronize(st) != cudaSuccess)
             {
@@ -2810,12 +2921,13 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 const float t = fpsMode ? (float)fr[j] : (float)(j + 1) / (float)multi;
                 if (oa.dlssg)
                 {
-                    // DLSS 4.5: the pair's j-th generated frame, RGBA8 back to the planes
+                    // DLSS 4.5: the pair's j-th generated frame, RGBA8 (hdr10: R10G10B10A2) back to the planes
                     void* au[] = {&dDgRgba, &nr.pw, &nr.ph, &dDgF};
+                    void* au10[] = {&dDgRgba, &nr.pw, &nr.ph, &dgHlg, &dDgF};
                     if (cudaMemcpyAsync(dDgRgba, hDgOut + (size_t)j * dgBytes, dgBytes, cudaMemcpyHostToDevice, st) !=
                             cudaSuccess ||
-                        cuLaunchKernel(nr.fUnpackRgba, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0,
-                                       (CUstream)st, au, nullptr) != CUDA_SUCCESS)
+                        cuLaunchKernel(dgc.hdr10 ? nr.fUnpackR10 : nr.fUnpackRgba, (nr.pw + 15) / 16, (nr.ph + 15) / 16,
+                                       1, 16, 16, 1, 0, (CUstream)st, dgc.hdr10 ? au10 : au, nullptr) != CUDA_SUCCESS)
                     {
                         io.setFail("dlss tween upload failed");
                         failed = true;
@@ -3386,6 +3498,8 @@ static void resetSessionGlobals()
     g_script.clear();
     g_flowScale = 1.0;
     g_dlssMode = 0;
+    g_liveAutoFit = 0;
+    g_liveAutoFloor = 0;
     g_noHud = g_noHudLat = false;
     g_noFillMouse = false;
     g_sharpen = 0.0;
@@ -3409,6 +3523,7 @@ static void resetSessionGlobals()
     g_sdrWhite = 240.0;
     g_vramBytes = 0;
     g_noAdapt = false;
+    g_noGpuFit = false;
     g_genExplicit = false;
     g_targetFps = 0;
     g_monitor = false;
@@ -3467,6 +3582,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_noHudLat = true;
         else if (wcscmp(argv[i], L"--no-adapt") == 0)
             g_noAdapt = true;
+        else if (wcscmp(argv[i], L"--no-gpu-fit") == 0)
+            g_noGpuFit = true;
         else if (wcscmp(argv[i], L"--target") == 0 && i + 1 < argc)
             g_targetFps = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--diag") == 0 && i + 1 < argc)
@@ -3529,6 +3646,18 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             if (!parseLiveScale(argv[++i]))
             {
                 LOG("--scale must be 0.01..1.0 or a DLSS mode (auto, dlaa, quality, balanced, performance, ultra)\n");
+                return 1;
+            }
+        }
+        else if (wcscmp(argv[i], L"--auto-floor") == 0 && i + 1 < argc)
+        {
+            ++i;
+            for (int m = 2; m <= 6; m++)
+                if (_wcsicmp(argv[i], kDlssModeName[m - 1]) == 0)
+                    g_liveAutoFloor = m;
+            if (!g_liveAutoFloor)
+            {
+                LOG("--auto-floor must be a DLSS mode (dlaa, quality, balanced, performance, ultra)\n");
                 return 1;
             }
         }
@@ -3697,13 +3826,14 @@ static int residentMain(LiveArgs first)
         g_resizeReq.store(false);
         g_sessionClean = false;
         const int rc = runLiveArgs(la);
-        // exit 7 = the captured window closed, a clean end like a stop. Exit 5 (hotkey pressed inside
+        // exit 7 = the captured window closed, a clean end like a stop; exit 8 = Auto's GPU-time step (the app
+        // starts the session again at the mode it names, like a resize's exit 4). Exit 5 (hotkey pressed inside
         // the app itself) and an exit 7 before the teardown (the window was gone at the start) never
         // started anything, stay for them too. What the host holds: the engines (g_res), or an engine
         // build a session left running in the background.
         const bool held = g_res.rt || nativeBuildPending();
-        const bool stay = (g_sessionClean && (rc == 0 || rc == 4 || rc == 7) && held && !g_nrAttempted && !g_rtxUsed &&
-                           g_backend != BK_DLSSG) ||
+        const bool stay = (g_sessionClean && (rc == 0 || rc == 4 || rc == 7 || rc == 8) && held && !g_nrAttempted &&
+                           !g_rtxUsed && g_backend != BK_DLSSG) ||
                           ((rc == 5 || (rc == 7 && !g_sessionClean)) && held);
         if (!stay)
         {
@@ -3923,6 +4053,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_nrTone = 1.0;
             g_nrStyle = 1;
             g_nrPasses = 1;
+            g_noGpuFit = false;
             g_logPipe = ctl; // from here every log line reaches the client too
             OfflineArgs oa;
             int irc = parseOfflineArgs((int)av.size(), av.data(), 2, oa);

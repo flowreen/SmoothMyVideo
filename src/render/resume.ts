@@ -66,6 +66,7 @@ const OPTS: Record<string, Spec> = {
   '--hdr10plus': { dest: 'hdr10plus', kind: 'bool', def: false },
   '--codec': { dest: 'codec', kind: 'str', def: 'hevc', choices: ['hevc', 'av1', 'vvc'] },
   '--restore': { dest: 'restore', kind: 'bool', def: false },
+  '--no-gpu-fit': { dest: 'no_gpu_fit', kind: 'bool', def: false },
   '--dlssnr': { dest: 'dlssnr', kind: 'bool', def: false },
   '--nr-structure': { dest: 'nr_structure', kind: 'float', def: 1.0 },
   '--nr-tone': { dest: 'nr_tone', kind: 'float', def: 1.0 },
@@ -175,7 +176,8 @@ function pyMtimeInt(p: string): number {
 export function resumeSig(ns: ArgNs, env: Env = process.env): string {
   const inp = path.win32.resolve(ns.input as string);
   const d: Record<string, string> = {};
-  for (const [k, v] of Object.entries(ns)) d[k] = argJson(k, v);
+  // no_gpu_fit changes no pixel by itself (a working size the fit lowers is signed as work_fit)
+  for (const [k, v] of Object.entries(ns)) if (k !== 'no_gpu_fit') d[k] = argJson(k, v);
   const input = winNormAbs(ns.input as string);
   d.input = pyJsonDumps(input);
   d.output = ns.output ? pyJsonDumps(winNormAbs(ns.output as string)) : 'null';

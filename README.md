@@ -147,7 +147,11 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   DLSS 4.5). With the RIFE, GMFSS or NVIDIA Smooth Motion model the smoothing is **adaptive**: the output locks to
   your fps target (the same Speed setting file renders use) and the multiplier follows the
   content, so a game dropping from 30 to 10 fps keeps playing at the same smooth rate on
-  screen. Your Sharpen, Upscale to and Restore settings apply live too (the picture is rendered at the
+  screen. The target goes up to 10000 fps; with **Fit to the GPU** ticked (the default) Live lowers the smoothing
+  to what your GPU keeps up with, down to the source's own rate with every effect still on, then (DLSS mode Auto)
+  the working size, so every source frame is shown with little delay. Unticked, everything runs as set and a
+  target the GPU can't reach skips source frames. File renders always keep their exact fps; unticked, they just
+  run slower when video memory runs short. Your Sharpen, Upscale to and Restore settings apply live too (the picture is rendered at the
   chosen height first, then fitted to the window or screen; Restore, DLSS 5, Sharpen and RTX HDR work on
   each captured frame before the smoothing, once per captured frame), and Fill screen upscales with RTX VSR when
   it's enabled. Untick every interpolation model and Live applies just those effects to the

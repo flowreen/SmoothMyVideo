@@ -138,13 +138,14 @@ function srcFps(){ const [n,d]=(((info && info.fps) || '24/1')).split('/'); retu
 // (No relative Multiplier mode: the fps box expresses any multiple, and fixed-timing live models now derive their whole multiplier
 // from the target themselves.)
 const SPEED_DEF_FPS = 60;
+const FPS_TOP = 10000;   // the fps box's top = Live's cap whatever file is loaded; a file render clamps its own target to sliderMax
 function speedMode(){ return localStorage.getItem('speedMode') === 'screen' ? 'screen' : 'fps'; }
 function curFps(){ const v = +localStorage.getItem('speedFps'); return v > 0 ? v : SPEED_DEF_FPS; }
 // The effective target the ENGINE renders to. Every existing consumer (gridMulti, outRatio,
 // fpsValid, outName, the run payload) reads this one function, so the mode change stays contained.
 function targetFps(){
   if(!interpOn()) return srcFps();          // nothing ticked = output keeps the source rate
-  return speedMode() === 'screen' ? screenHz : curFps();
+  return speedMode() === 'screen' ? screenHz : Math.min(curFps(), Math.floor(sliderMax() * 1000) / 1000);
 }
 function sliderMin(){ return info ? Math.max(1, Math.round(srcFps())) : 1; }        // never target below the source rate
 function sliderMax(){ return info ? srcFps() * 100 : 2400; }   // hard cap at exactly 100x the EXACT source (24000/1001 -> 2397.602, kept on-grid; not a rounded 2400)
@@ -164,11 +165,10 @@ function gridMulti(){ if(!info) return 0; const s = srcFps(); const t = targetFp
   return (N >= 2 && Math.abs(s*N - t) < 0.02) ? N : 0; }   // on-grid when the target is an exact multiple (tolerance covers the 3-dp display rounding)
 // 3-decimal precision, so an exact multiple of a fractional source rate is expressible
 // (47.952 = 2x of 23.976 stays on the integer --multi path).
-// The top clamps to 100x the loaded source (sliderMax, floored to 3 dp so 9999 lands exactly on-grid:
-// 2397.602 on a 23.976 source), 2400 with no video.
+// The box tops at FPS_TOP; a file render's target (targetFps) clamps to 100x the loaded source (sliderMax,
+// floored to 3 dp so it lands exactly on-grid: 2397.602 on a 23.976 source), 2400 with no video.
 function setFps(v){ if(isNaN(v)) return;
-  const top = Math.floor(sliderMax() * 1000) / 1000;
-  localStorage.setItem('speedFps', String(Math.min(top, Math.max(1, Math.round(v * 1000) / 1000))));
+  localStorage.setItem('speedFps', String(Math.min(FPS_TOP, Math.max(1, Math.round(v * 1000) / 1000))));
   syncTargetUI(); refresh(); try{ lvSendOpts(); lvTargetChanged(); }catch{} }
 function setSpeedMode(m){ localStorage.setItem('speedMode', m);
   syncTargetUI(); refresh(); try{ lvSendOpts(); lvTargetChanged(); }catch{} }
@@ -1023,6 +1023,7 @@ function lvSendOpts(){
     hdrsb: effSatBoost(),
     hud: $('lvhud').checked,
     hudlat: $('lvhudlat').checked,
+    gpufit: $('gpufit').checked,
   });
   const load = mi.model === 'rife' ? 'starts in ~3s, under 1s again while its engines stay loaded (first time at a new window size ~45s)'
     : mi.model === 'rifedrba' ? 'starts in ~3s (first time at a new window size ~55s)'
@@ -1082,7 +1083,7 @@ function lvDisarm(){
 // count from it), so a Speed change during a running session relaunches the session like a DLSS
 // mode change: a 700 ms debounce, 'lv-restart', same target window. Only a real
 // change of the EFFECTIVE target (what main.ts would pass) restarts anything.
-function lvEffTarget(){ return Math.min(1000, Math.max(10, Math.round(liveTargetFps()))); }
+function lvEffTarget(){ return Math.min(FPS_TOP, Math.max(10, Math.round(liveTargetFps()))); }
 let lvSpawnTarget = 0;      // effective target the running session was spawned with
 let lvTargetRestartT = null;
 function lvTargetChanged(){
@@ -1111,6 +1112,10 @@ function lvHudLatUi(){
 }
 $('lvhud').onchange = () => { localStorage.setItem('lvHud', $('lvhud').checked ? '1' : '0'); lvHudLatUi(); lvSendOpts(); };
 $('lvhudlat').onchange = () => { localStorage.setItem('lvHudLat', $('lvhudlat').checked ? '1' : '0'); lvSendOpts(); };
+// "Fit to the GPU" (default ON): a spawn-time flag on both routes (off = --no-gpu-fit), so a running Live session restarts
+if(localStorage.getItem('gpuFit') === '0') $('gpufit').checked = false;
+$('gpufit').onchange = () => { localStorage.setItem('gpuFit', $('gpufit').checked ? '1' : '0'); lvSendOpts();
+  if(lvState === 'running') ipcRenderer.send('lv-restart'); };
 localStorage.removeItem('lvNative');   // retired: the RIFE live route always runs inside smv-live.exe
 lvHudLatUi();
 // Hotkey recorder: click the button, press the new key or combo; Esc cancels. Electron
@@ -1772,7 +1777,7 @@ function startRun(){
     log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
   }
   modeBtnUi(true);
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlsscustom').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlsscustom').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push(factor < 1 ? 'downscaling' : 'upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -1804,6 +1809,7 @@ function startRun(){
     payload.upscale = factor;                          // arbitrary upscale factor (target height / source)
   }
   if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else Lanczos3)
+  if(!$('gpufit').checked) payload.nogpufit = true;    // no video memory fit: the same fps, slower when memory runs short
   if(rtxhdr){ payload.rtxhdr = true;     // HDR10; engine masters at a fixed 1000-nit peak
     const hp = hdrColorPayload();        // zero-strength Dynamic Vibrance routes to the source path
     payload.hdrcolor = hp.color;                                   // vivid (default) / rtx
@@ -1953,7 +1959,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
   clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
   modeBtnUi(lvState !== 'idle');
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlsscustom').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlsscustom').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
     if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');

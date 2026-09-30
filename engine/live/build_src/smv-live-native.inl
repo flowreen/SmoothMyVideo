@@ -1390,6 +1390,84 @@ __device__ __forceinline__ float pq_oetf(float lin)
     return powf((C1 + C2 * lm) / (1.0f + C3 * lm), M2);
 }
 
+// ---- offline DLSS 4.5 in HDR10: the DLSS-G guide's HDR input (section 11.0), R10G10B10A2 words of PQ BT.2020 (the
+// dlssg2f --hdr10 frames). An HLG picture goes as PQ on BT.2100's reference display (1000 nits peak, system gamma 1.2:
+// the OOTF on the scene luminance, as hlg2020_to_scrgb) and comes back through the exact inverse (the inverse OOTF on
+// the display luminance, as scrgb_to_hlg2020), both per channel in BT.2020.
+__device__ __forceinline__ void hlg2020_to_pq2020(float e0, float e1, float e2, float& p0, float& p1, float& p2)
+{
+    const float A = 0.17883277f, B = 0.28466892f, C = 0.55991073f;
+    const float e[3] = { e0, e1, e2 };
+    float s[3];
+    for (int c = 0; c < 3; c++)
+    {
+        const float v = e[c] < 0.0f ? 0.0f : (e[c] > 1.0f ? 1.0f : e[c]);
+        s[c] = v <= 0.5f ? v * v / 3.0f : (expf((v - C) / A) + B) / 12.0f;
+    }
+    const float ys = 0.2627f * s[0] + 0.6780f * s[1] + 0.0593f * s[2];
+    const float k = ys > 0.0f ? 0.1f * powf(ys, 0.2f) : 0.0f; // 1000 nits = 0.1 of PQ's 10000
+    p0 = pq_oetf(s[0] * k);
+    p1 = pq_oetf(s[1] * k);
+    p2 = pq_oetf(s[2] * k);
+}
+__device__ __forceinline__ void pq2020_to_hlg2020(float p0, float p1, float p2, float& e0, float& e1, float& e2)
+{
+    const float A = 0.17883277f, B = 0.28466892f, C = 0.55991073f;
+    const float l[3] = { pq_eotf(p0) * 10.0f, pq_eotf(p1) * 10.0f, pq_eotf(p2) * 10.0f }; // units of 1000 nits
+    const float yd = 0.2627f * l[0] + 0.6780f * l[1] + 0.0593f * l[2];
+    const float k = yd > 0.0f ? powf(yd, -0.2f / 1.2f) : 0.0f;
+    float o[3];
+    for (int c = 0; c < 3; c++)
+    {
+        const float s = l[c] * k > 1.0f ? 1.0f : l[c] * k;
+        o[c] = s <= 1.0f / 12.0f ? sqrtf(3.0f * s) : A * logf(12.0f * s - B) + C;
+    }
+    e0 = o[0];
+    e1 = o[1];
+    e2 = o[2];
+}
+
+// the model frame ((R, G, B) planes, fp32 or half) to tight R10G10B10A2 words at the padded size: round(x * 1023) per
+// field, alpha 3 (an HLG picture as PQ first)
+__global__ void k_packR10(const void* __restrict__ src, int half, int planeStride, int rowStride, int w, int h,
+                          int hlg, unsigned int* __restrict__ dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t o = (size_t)y * rowStride + x;
+    float v[3];
+    for (int ci = 0; ci < 3; ci++)
+        v[ci] = ldS(src, half, (size_t)ci * planeStride + o);
+    if (hlg) hlg2020_to_pq2020(v[0], v[1], v[2], v[0], v[1], v[2]);
+    unsigned int word = 3u << 30;
+    for (int ci = 0; ci < 3; ci++)
+    {
+        const float c = v[ci] < 0.0f ? 0.0f : (v[ci] > 1.0f ? 1.0f : v[ci]);
+        word |= (unsigned int)rintf(c * 1023.0f) << (10 * ci);
+    }
+    dst[(size_t)y * w + x] = word;
+}
+
+// a DLSS 4.5 host frame in HDR10 back to the offline (R, G, B) planes: each 10-bit code / 1023 (an HLG picture back
+// from PQ)
+__global__ void k_unpackR10(const unsigned int* __restrict__ src, int dw, int dh, int hlg, float* __restrict__ dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dw || y >= dh) return;
+    const size_t plane = (size_t)dw * dh;
+    const size_t o = (size_t)y * dw + x;
+    const unsigned int word = src[o];
+    float v[3];
+    for (int ci = 0; ci < 3; ci++)
+        v[ci] = (float)((word >> (10 * ci)) & 1023u) / 1023.0f;
+    if (hlg) pq2020_to_hlg2020(v[0], v[1], v[2], v[0], v[1], v[2]);
+    dst[o] = v[0];
+    dst[plane + o] = v[1];
+    dst[2 * plane + o] = v[2];
+}
+
 // the two numerically inverted matrices (python inverts in float64 then casts to fp32); the
 // host computes them in double at init and uploads them here.
 __device__ float g_ictcp2lms[9];
@@ -1868,6 +1946,156 @@ __global__ void k_motionIn(const float* __restrict__ src, int sps, int srs, int 
     dst[d] = f2h(v[0]);
     dst[(size_t)dps + d] = f2h(v[1]);
     dst[2 * (size_t)dps + d] = f2h(v[2]);
+}
+
+// ---- GMFSS and Restore on HDR planes: the SDR view at the model boundary ---------------------------
+// Both synthesise pixels (GMFSS the tweens, Restore the frame) and were trained on SDR sRGB pictures: on PQ codes they
+// fall short of their SDR quality, and any value outside 0..1 breaks their synthesis (highlights, wide gamut; both
+// measured). hdrToModel = a pixel of HDR planes (PQ BT.2020, or HLG when mode 2) as its BT.709 light over SDR white in
+// sRGB, what an SDR source hands a model: the largest channel's light above the knee rolled off toward knee + head
+// (knee + head e / (e + head), every channel scaled alike; head 0 = scaled to the knee), light below 0 (a colour
+// outside BT.709) clipped. Restore reads it with head 0 and gets back what it never held (k_hdrRestOut); GMFSS reads it
+// on frame pairs inside the SDR range (k_hdrRange) and comes back through the sRGB EOTF (k_hdrFromSdr), otherwise only
+// its motion nets read it (k_motionIn's curve) and the rest read the pictures. The real frames never pass the map.
+__device__ __forceinline__ void hdrToModel(float v[3], int mode, float white, float knee, float head)
+{
+    float l[3], m = 0.0f;
+    hdr2020_to_scrgb(v[0], v[1], v[2], mode == 2, l[0], l[1], l[2]);
+    for (int c = 0; c < 3; c++)
+    {
+        l[c] /= white;
+        m = fmaxf(m, l[c]);
+    }
+    const float e = m - knee;
+    const float k = e > 0.0f ? (knee + head * e / (e + head)) / m : 1.0f;
+    for (int c = 0; c < 3; c++)
+        v[c] = srgbOetf(fmaxf(l[c] * k, 0.0f));
+}
+// a planar HDR frame (fp32, or fp16 when half; w x h, planes sps apart, rows srs apart) -> its SDR view, fp32 or
+// fp16 (dstHalf, k_f2h's rounding), planes dps apart, rows drs apart
+__global__ void k_hdrEnc(const void* __restrict__ src, int half, int sps, int srs, int w, int h, void* __restrict__ dst,
+                         int dstHalf, int dps, int drs, int mode, float white, float knee, float head)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t s = (size_t)y * srs + x, d = (size_t)y * drs + x;
+    float v[3] = { ldS(src, half, s), ldS(src, half, (size_t)sps + s), ldS(src, half, 2 * (size_t)sps + s) };
+    hdrToModel(v, mode, white, knee, head);
+    for (int c = 0; c < 3; c++)
+    {
+        const size_t o = (size_t)c * dps + d;
+        if (dstHalf) ((unsigned short*)dst)[o] = f2h(v[c]);
+        else ((float*)dst)[o] = v[c];
+    }
+}
+// the SDR view's way back (a GMFSS tween of an SDR pair, fp32 or fp16 when half): clamp(0, 1) as the SDR route, the
+// sRGB EOTF, times white, to the BT.2020 codes, fp32 planar
+__global__ void k_hdrFromSdr(const void* __restrict__ src, int half, int sps, int srs, int w, int h,
+                             float* __restrict__ dst, int dps, int drs, int mode, float white)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t s = (size_t)y * srs + x, d = (size_t)y * drs + x;
+    float q[3];
+    for (int c = 0; c < 3; c++)
+    {
+        const float v = ldS(src, half, (size_t)c * sps + s);
+        q[c] = srgbEotf(v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v)) * white;
+    }
+    if (mode == 2) scrgb_to_hlg2020(q[0], q[1], q[2], q[0], q[1], q[2]);
+    else scrgb_to_pq2020(q[0], q[1], q[2], q[0], q[1], q[2]);
+    dst[d] = q[0];
+    dst[(size_t)dps + d] = q[1];
+    dst[2 * (size_t)dps + d] = q[2];
+}
+// whether a frame of HDR planes stays inside the SDR range: a pixel whose BT.709 light over SDR white is above 1 + tol
+// or below -tol sets *flag, one atomic per block (GMFSS's SDR pairs)
+__global__ void k_hdrRange(const float* __restrict__ src, int sps, int srs, int w, int h, int mode, float white,
+                           float tol, int* __restrict__ flag)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int out = 0;
+    if (x < w && y < h)
+    {
+        const size_t s = (size_t)y * srs + x;
+        float l[3];
+        hdr2020_to_scrgb(src[s], src[(size_t)sps + s], src[2 * (size_t)sps + s], mode == 2, l[0], l[1], l[2]);
+        out = fmaxf(l[0], fmaxf(l[1], l[2])) > (1.0f + tol) * white || fminf(l[0], fminf(l[1], l[2])) < -tol * white;
+    }
+    if (__syncthreads_or(out) && threadIdx.x == 0 && threadIdx.y == 0)
+        atomicOr(flag, 1);
+}
+// FRUC reads 8-bit BGRA only: on a pair inside the SDR range (k_hdrRange) it gets the frames' SDR view (hdrToModel,
+// knee 1, head 0), 256 codes for the SDR range where the 8-bit HDR codes spend ~148 on it; fp32 (R, G, B) planes, w x h,
+// planes sps apart, rows srs apart, into true BGRA8 with k_packBgraRgb's rounding
+__global__ void k_packBgraSdr(const float* __restrict__ src, int sps, int srs, int w, int h, int mode, float white,
+                              unsigned char* __restrict__ dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t s = (size_t)y * srs + x;
+    float v[3] = { src[s], src[(size_t)sps + s], src[2 * (size_t)sps + s] };
+    hdrToModel(v, mode, white, 1.0f, 0.0f);
+    unsigned char* p = dst + ((size_t)y * w + x) * 4;
+    for (int ci = 0; ci < 3; ci++)
+    {
+        const float c = v[ci] < 0.0f ? 0.0f : (v[ci] > 1.0f ? 1.0f : v[ci]);
+        p[2 - ci] = (unsigned char)(int)rintf(c * 255.0f);
+    }
+    p[3] = 255;
+}
+// such a pair's tween (true BGRA8 of the SDR view) back to the HDR codes, fp32 (R, G, B) planes dw x dh: k_unpackBgraRgb's
+// / 255, then k_hdrFromSdr's way (the sRGB EOTF, times white, to the BT.2020 codes)
+__global__ void k_unpackBgraSdr(const unsigned char* __restrict__ src, int dw, int dh, int mode, float white,
+                                float* __restrict__ dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dw || y >= dh) return;
+    const size_t plane = (size_t)dw * dh;
+    const size_t o = (size_t)y * dw + x;
+    const unsigned char* p = src + o * 4;
+    float q[3] = { srgbEotf(p[2] / 255.0f) * white, srgbEotf(p[1] / 255.0f) * white, srgbEotf(p[0] / 255.0f) * white };
+    if (mode == 2) scrgb_to_hlg2020(q[0], q[1], q[2], q[0], q[1], q[2]);
+    else scrgb_to_pq2020(q[0], q[1], q[2], q[0], q[1], q[2]);
+    dst[o] = q[0];
+    dst[plane + o] = q[1];
+    dst[2 * plane + o] = q[2];
+}
+// Restore on HDR planes reads the frame's SDR view (hdrToModel, knee 1, head 0: the SDR range exactly, a brighter pixel
+// scaled to white with its hue); the way back = the restored view (sRGB codes, the fold's 0..1) through the sRGB EOTF
+// plus the light the view never held (ref's light minus its view: above white, below 0), times white, to the BT.2020
+// codes (DLSS 5's way on HDR). ref = the HDR frame at the restored size; in place when rest is dst.
+__global__ void k_hdrRestOut(const float* rest, int rps, int rrs, const void* __restrict__ ref, int half, int fps,
+                             int frs, int w, int h, float* dst, int dps, int drs, int mode, float white)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t r = (size_t)y * rrs + x, f = (size_t)y * frs + x, d = (size_t)y * drs + x;
+    float l[3], q[3], m = 0.0f;
+    hdr2020_to_scrgb(ldS(ref, half, f), ldS(ref, half, (size_t)fps + f), ldS(ref, half, 2 * (size_t)fps + f), mode == 2,
+                     l[0], l[1], l[2]);
+    for (int c = 0; c < 3; c++)
+    {
+        l[c] /= white;
+        m = fmaxf(m, l[c]);
+    }
+    const float k = m > 1.0f ? 1.0f / m : 1.0f;
+    for (int c = 0; c < 3; c++)
+    {
+        const float v = rest[(size_t)c * rps + r];
+        q[c] = (srgbEotf(v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v)) + l[c] - fmaxf(l[c] * k, 0.0f)) * white;
+    }
+    if (mode == 2) scrgb_to_hlg2020(q[0], q[1], q[2], q[0], q[1], q[2]);
+    else scrgb_to_pq2020(q[0], q[1], q[2], q[0], q[1], q[2]);
+    dst[d] = q[0];
+    dst[(size_t)dps + d] = q[1];
+    dst[2 * (size_t)dps + d] = q[2];
 }
 
 // RIFE's last step (IFNet_HDv3's merged[4]): tween = warp(frame 0, flow 0->t) x mask + warp(frame 1,
@@ -2976,6 +3204,16 @@ struct NativeRife
     float* dGmT = nullptr;       // the timestep, one device float (ifnet's 1x1x1x1 input)
     void* dGmOut = nullptr;      // the fusionnet output (3, ph, pw) in the engine's dtype
     float* dGmF = nullptr;       // that output clamped to fp32: what storeSlot consumes
+    // HDR planes (nativeGmfssPair): the SDR view of one padded frame (hdrToModel, the scratch), the motion view's
+    // halves gmflow and metricnet read on a pair outside the SDR range, the range flag (device, pinned host copy);
+    // per feature slot: its frame stays inside the SDR range, its features came from the SDR view; the pair's mode
+    float* dGmEnc = nullptr;
+    float* dGmHalfM = nullptr;
+    int* dGmRange = nullptr;
+    int* hGmRange = nullptr;
+    bool gmSdrPairs = true; // SMV_GMFSS_SDR_PAIRS=0: every pair the way outside the SDR range
+    bool gmFrameSdr[2] = {}, gmFeatSdr[2] = {}, gmPairSdr = false;
+    int gmModeLogs = 0; // the mode lines this session printed (the first pair's and up to 3 switches)
     // SMV_LIVE_GMFSS_PROF=1: per-phase CUDA-event breakdown of the chain, printed every 32
     // groups (the native answer to the python route's [timing] line; nine spans, the tween ones
     // measured on the group's FIRST tween). The pair span splits into half | flow | metric |
@@ -3033,6 +3271,14 @@ struct NativeRife
     bool frNodeOk[16] = {};
     uint64_t frLastKey[4] = {}; // per instance: the key of the frame it was fed last, 0 = none
     uint64_t frNodeCalls = 0;
+    // HDR planes (encPost): a pair whose two frames stay inside the SDR range goes to FRUC as their SDR view
+    // (k_packBgraSdr) and its tweens come back through k_unpackBgraSdr; any other pair as the 8-bit HDR codes. Per
+    // surface: its frame inside the range, whether it holds the SDR view. SMV_FRUC_SDR_PAIRS=0 = every pair as the codes
+    bool frSdrOn = false, frPairSdr = false;
+    bool frIn[3] = {}, frSurfSdr[3] = {};
+    int* dFrRange = nullptr;
+    int* hFrRange = nullptr;
+    int frModeLogs = 0;
     // RIFE with DRBA timing (rifedrba): the RIFE
     // handoff plus `NATIVE-PATH block0=` (calc_flow's block0 as its own engine) and `engine=drba
     // lag=1`. live_server.RifeDrba natively: a four-frame history of padded frames and their
@@ -3125,6 +3371,7 @@ struct NativeRife
     float* dRestTmp = nullptr; // the fold's horizontal pass, planar fp32 at (4h) x max target width
     float* dRestF = nullptr;   // the enlarging fold only: y as clamped fp32 planar
     float* dRest = nullptr;    // the fold back to the model size (VSR follows), planar fp32 w x h
+    float* dRestRem = nullptr; // HDR planes: the source fitted to Restore's target (k_hdrRestOut's remainder)
 
     // ---- ring geometry (mirrors the exe's own slot layout)
     uint32_t slots = 0, pitch = 0;
@@ -3222,7 +3469,12 @@ struct NativeRife
     uint8_t* dCapPrev = nullptr; // the previous raw capture, the reuse test's reference
     float nrSdrWhite = 3.0f;     // HDR: the SDR reference white in scRGB units (nits / 80)
     int nrSrcHdr = 0;            // offline: HDR video (1 PQ, 2 HLG), the pass sees its SDR range
-    bool nrSdrIn = false;        // live: DLSS 5's input is SDR this frame (RTX HDR converts after it)
+    // GMFSS and Restore on HDR planes (hdrToModel): the decoded frame's encoding (offline Restore reads it; 1 PQ,
+    // 2 HLG, 0 SDR planes or off) and the model frames' (after RTX HDR: GMFSS, offline Restore after the model, live
+    // Restore on PQ), the SDR white in scRGB units
+    int encPre = 0, encPost = 0;
+    float encWhite = 203.0f / 80.0f;
+    bool nrSdrIn = false; // live: DLSS 5's input is SDR this frame (RTX HDR converts after it)
     // offline: Restore and the resize run on the decoded frame (the pre-model
     // SOURCE, sw x sh, in dSrcPl) before DLSS 5 and the model, which then run at the working
     // size w x h, and the emit's final resize takes it to dw x dh; sw / sh = 0 = the source is the
@@ -3261,6 +3513,22 @@ struct NativeRife
     int fCur = 0;
     cudaEvent_t capEv = nullptr;
     std::vector<cudaEvent_t> slotEv;
+    // live: a captured frame's own passes timed on the GPU (the capture read through FSR / RTX HDR and the motion
+    // frame; pfEv[1] = where the part at the working size starts, after Restore / the resize), smoothed, in
+    // microseconds for the present loop's Auto step (it reads them at its stats tick)
+    cudaEvent_t pfEv[3] = {};
+    bool pfArmed = false;
+    double pfAllMs = 0.0, pfWorkMs = 0.0;
+    std::atomic<uint32_t> pfAllUs{0}, pfWorkUs{0};
+    // live: a group's own GPU time for the present loop's throttle, from pfEv[0] (the capture read): grEv[0] where the
+    // slots start (after the pair's model work), grEv[1] after the last slot. Smoothed per kind of group, in
+    // microseconds: gIntUs = the work before the slots of a group with tweens, gTweenUs = one tween with its store,
+    // gBaseUs = a whole group without a tween (the real frame alone)
+    cudaEvent_t grEv[2] = {};
+    bool grArmed = false;
+    uint32_t grTween = 0;
+    double gIntMs = 0.0, gTweenMs = 0.0, gBaseMs = 0.0;
+    std::atomic<uint32_t> gIntUs{0}, gTweenUs{0}, gBaseUs{0};
 
     CUmodule cuMod = nullptr;
     CUfunction fPackInDirect = nullptr, fResizeH = nullptr, fResizeV = nullptr, fH2f = nullptr, fF2h = nullptr,
@@ -3272,7 +3540,7 @@ struct NativeRife
     CUfunction fPackBgra = nullptr, fUnpackBgra = nullptr, fFitPlanar = nullptr,             // sharpen / VSR
         fRcasPlanar = nullptr, fPackBgraRgb = nullptr,
                fUnpackBgraRgb = nullptr,                                      // offline (R, G, B) planes
-        fUnpackRgba = nullptr;                                                // offline DLSS 4.5 frames
+        fUnpackRgba = nullptr, fPackR10 = nullptr, fUnpackR10 = nullptr;      // offline DLSS 4.5 frames
     CUfunction fFitAaH = nullptr, fFitAaV = nullptr;                          // the separable fit
     CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                   // its vertical pass + the slot store
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr, // live Restore
@@ -3291,9 +3559,12 @@ struct NativeRife
     CUfunction fDrFlowSplat = nullptr, fDrFlowNorm = nullptr, // native DRBA
         fDrDrmSplat = nullptr, fDrDrmNorm = nullptr;
     CUfunction fMotionIn = nullptr, fRifeBlend = nullptr; // RIFE's motion frame, its last step (the tween)
-    int* dStaticFlag = nullptr;                           // device flag k_pairDiff sets when the pair differs
-    int* hStaticFlag = nullptr;                           // pinned readback of it, one int per group
-    uint64_t staticN = 0;                                 // identical pairs held this session
+    CUfunction fHdrEnc = nullptr, fHdrFromSdr = nullptr, fHdrRange = nullptr; // GMFSS / Restore on HDR planes
+    CUfunction fPackBgraSdr = nullptr, fUnpackBgraSdr = nullptr;              // FRUC's SDR pairs on HDR planes
+    CUfunction fHdrRestOut = nullptr;                                         // Restore's way back on HDR planes
+    int* dStaticFlag = nullptr; // device flag k_pairDiff sets when the pair differs
+    int* hStaticFlag = nullptr; // pinned readback of it, one int per group
+    uint64_t staticN = 0;       // identical pairs held this session
 
     // ---- protocol plumbing
     std::mutex mMsg, mTok;
@@ -3961,14 +4232,12 @@ static int liveAutoMode(int w, int h)
 // takes it to the canvas after the model): the DLSS mode's share of the PRESENTED rect (the capture aspect-fit into
 // the canvas W x H: the window itself, or the Fill rect), even, at least 64 px and at most the presented rect a
 // side, capped at 3840x2160 keeping the aspect (offline's workPlan). DLAA = the presented rect itself (in window
-// mode the capture, odd sizes kept); Auto picks the mode by the presented pixel count; mode = the mode it came
-// from (1 + the kDlssModeName index), 0 = --scale's share.
-static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int& mw, int& mh)
+// mode the capture, odd sizes kept). liveWorkSizeFor = the size a mode gives the presented presW x presH (mode = 1 +
+// the kDlssModeName index, 0 = --scale's share); liveWorkSize = the session's: Auto picks the mode by the presented
+// pixel count, no larger than the GPU-time step's --auto-floor, or takes the one the free video memory fits
+// (g_liveAutoFit, picked once a session before anything loads), and says which mode it came from.
+static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh)
 {
-    const int outW = W ? (int)W : cw, outH = W ? (int)H : ch;
-    int x0, y0;
-    lkFitRect(cw, ch, outW, outH, presW, presH, x0, y0);
-    mode = g_dlssMode == 1 ? liveAutoMode(presW, presH) : g_dlssMode;
     double f = 1.0;
     if (mode)
         f = kDlssModeShare[mode - 1];
@@ -3991,6 +4260,15 @@ static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int&
         mw = (int)std::floor(mw * k) & ~1;
         mh = (int)std::floor(mh * k) & ~1;
     }
+}
+static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int& mw, int& mh)
+{
+    const int outW = W ? (int)W : cw, outH = W ? (int)H : ch;
+    int x0, y0;
+    lkFitRect(cw, ch, outW, outH, presW, presH, x0, y0);
+    mode = g_dlssMode == 1 ? (g_liveAutoFit ? g_liveAutoFit : (std::max)(liveAutoMode(presW, presH), g_liveAutoFloor))
+                           : g_dlssMode;
+    liveWorkSizeFor(mode, presW, presH, mw, mh);
 }
 
 static bool lkSession(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH,
@@ -5125,12 +5403,12 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
                           NativeRife& nr)
 {
     // resident host: the same window as the previous session (same overlay size, capture
-    // size, DLSS mode or share and HDR mode) gets the previous answer without a lookup, as long as
-    // the engine files still exist (the user may empty the cache folder by hand);
+    // size, DLSS mode or share, Auto's memory pick and floor and HDR mode) gets the previous answer without a lookup,
+    // as long as the engine files still exist (the user may empty the cache folder by hand);
     // live Restore rides in the key: its engine path is a fact of a restore session only
     wchar_t key[1024];
-    swprintf_s(key, L"%s|%s|%.2f|%d|%u|%u|%u|%u|%d|%d", script.c_str(), backend.c_str(), g_flowScale, g_dlssMode, W, H,
-               capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0);
+    swprintf_s(key, L"%s|%s|%.2f|%d|%d|%d|%u|%u|%u|%u|%d|%d", script.c_str(), backend.c_str(), g_flowScale, g_dlssMode,
+               g_liveAutoFit, g_liveAutoFloor, W, H, capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0);
     bool factsOk = g_resident && g_res.haveFacts && g_res.handoffKey == key;
     if (factsOk)
     {
@@ -5607,6 +5885,8 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fPackBgraRgb, "k_packBgraRgb"},
         {&nr.fUnpackBgraRgb, "k_unpackBgraRgb"},
         {&nr.fUnpackRgba, "k_unpackRgba"},
+        {&nr.fPackR10, "k_packR10"},
+        {&nr.fUnpackR10, "k_unpackR10"},
         {&nr.fFitAaH, "k_fitAaH"},
         {&nr.fFitAaV, "k_fitAaV"},
         {&nr.fPackOutV, "k_packOutV"},
@@ -5649,6 +5929,12 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fDrDrmNorm, "k_drbaDrmNorm"},
         {&nr.fMotionIn, "k_motionIn"},
         {&nr.fRifeBlend, "k_rifeBlend"},
+        {&nr.fHdrEnc, "k_hdrEnc"},
+        {&nr.fHdrFromSdr, "k_hdrFromSdr"},
+        {&nr.fHdrRange, "k_hdrRange"},
+        {&nr.fPackBgraSdr, "k_packBgraSdr"},
+        {&nr.fUnpackBgraSdr, "k_unpackBgraSdr"},
+        {&nr.fHdrRestOut, "k_hdrRestOut"},
     };
     for (auto& e : fns)
         if (cuModuleGetFunction(e.fn, nr.cuMod, e.nm) != CUDA_SUCCESS)
@@ -6027,6 +6313,10 @@ static bool nativeRtxInit(NativeRife& nr)
         nr.restTh = vsrAfter ? sh : (toModel ? nr.h : th);
         if (nr.restTh > 4 * sh)
             NCHK(cudaMalloc((void**)&nr.dRestF, (size_t)3 * 16 * sw * sh * sizeof(float)), "alloc restore fp32 output");
+        // HDR planes: the source fitted to the target, the remainder Restore's way back adds (nativeHdrRestOut)
+        if ((nr.encPre || nr.encPost) && (nr.restTw != sw || nr.restTh != sh))
+            NCHK(cudaMalloc((void**)&nr.dRestRem, (size_t)3 * nr.restTw * nr.restTh * sizeof(float)),
+                 "alloc restore HDR fit");
         LOG("native: live restore: Real-ESRGAN animevideov3 (TensorRT) at %dx%d -> %dx%d%s\n", sw, sh, nr.restTw,
             nr.restTh, nr.restPre ? ", on the captured frame before the model" : "");
     }
@@ -6737,6 +7027,19 @@ static bool nativeFrucSetup(NativeRife& nr)
         NCHK(cudaMalloc((void**)&s, bytes), "alloc fruc surface");
     NCHK(cudaMalloc((void**)&nr.dFrOutB, bytes), "alloc fruc output");
     NCHK(cudaMalloc((void**)&nr.dFrOut, 3 * plane * sizeof(float)), "alloc fruc tween");
+    {
+        char ev[8] = {};
+        nr.frSdrOn = nr.encPost && !(GetEnvironmentVariableA("SMV_FRUC_SDR_PAIRS", ev, sizeof(ev)) > 0 && ev[0] == '0');
+    }
+    if (nr.frSdrOn)
+    {
+        NCHK(cudaMalloc((void**)&nr.dFrRange, sizeof(int)), "alloc fruc range flag");
+        NCHK(cudaHostAlloc((void**)&nr.hFrRange, sizeof(int), cudaHostAllocDefault), "alloc fruc range readback");
+    }
+    for (int i = 0; i < 3; i++)
+        nr.frIn[i] = nr.frSurfSdr[i] = false;
+    nr.frPairSdr = false;
+    nr.frModeLogs = 0;
     nr.frPrev = nr.frLast = nr.frA = nr.frB = -1;
     for (int i = 0; i < 4; i++)
     {
@@ -6779,6 +7082,11 @@ static bool nativeFrucSetup(NativeRife& nr)
     else
         LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA%s, up to %d instance%s\n",
             nr.pw, nr.ph, nr.w, nr.h, g_fruc.step ? ", feed-once" : "", nr.frInstMax, nr.frInstMax > 1 ? "s" : "");
+    if (nr.encPost)
+        LOG("native: fruc: HDR planes: %s\n",
+            nr.frSdrOn
+                ? "frame pairs inside the SDR range go to FRUC as their SDR view, any other pair as the 8-bit HDR codes"
+                : "every pair as the 8-bit HDR codes (SMV_FRUC_SDR_PAIRS=0)");
     return true;
 }
 
@@ -6882,24 +7190,72 @@ static void nativeFrucPlan(NativeRife& nr, const double* ts, uint32_t n)
 // last tweened pair's end. python's Fruc._reuse, only when this group has tweens: a pair that
 // does not continue the last interpolated one first gets one dropped warp at 0.5 of the
 // skipped pair (last end, previous frame), so the OFA hints stay consecutive
+// one frame's planes into surface n: the SDR view (sdr, k_packBgraSdr) or the planes as stored (true BGRA from either
+// plane order: live SDR (B, G, R), offline and live HDR (R, G, B))
+static bool nativeFrucPack(NativeRife& nr, const float* src, int n, bool sdr)
+{
+    int ps = nr.ph * nr.pw, f32 = 0;
+    void* a[] = {(void*)&src, &f32, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.dFrSurf[n]};
+    void* b[] = {(void*)&src, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &nr.dFrSurf[n]};
+    const CUfunction f = sdr ? nr.fPackBgraSdr : ((nr.planesRgb || nr.hdr) ? nr.fPackBgraRgb : nr.fPackBgra);
+    if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, sdr ? b : a,
+                       nullptr) != CUDA_SUCCESS)
+    {
+        nr.die("packBgra (fruc) launch failed");
+        return false;
+    }
+    nr.frSurfSdr[n] = sdr;
+    for (int& fed : nr.frFed)
+        if (fed == n)
+            fed = -1; // the frame FRUC was fed last is gone from its surface
+    return true;
+}
+
 static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
 {
     nativeFrucDrain(nr); // no worker still reads a surface this pair may repack
     int n = 0;
     while (n == nr.frPrev || n == nr.frLast)
         n++;
-    int ps = nr.ph * nr.pw, f32 = 0;
-    void* a[] = {(void*)&dCur, &f32, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.dFrSurf[n]};
-    // true BGRA from either plane order: live SDR (B, G, R), offline and live HDR (R, G, B)
-    if (cuLaunchKernel((nr.planesRgb || nr.hdr) ? nr.fPackBgraRgb : nr.fPackBgra, (nr.pw + 15) / 16, (nr.ph + 15) / 16,
-                       1, 16, 16, 1, 0, (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
+    // HDR planes: the new frame's range (one flag read back); the pair takes the SDR view only when both frames stay
+    // inside the SDR range. A previous frame's surface in the other encoding is packed again from its planes (nr.dX)
+    // and every instance primes it again (its node key would still match)
+    bool in = false;
+    if (nr.frSdrOn)
     {
-        nr.die("packBgra (fruc) launch failed");
-        return false;
+        cudaStream_t st = nr.stream;
+        int ps = nr.ph * nr.pw;
+        float tol = 2e-3f;
+        void* ar[] = {(void*)&dCur, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &tol, (void*)&nr.dFrRange};
+        if (cudaMemsetAsync(nr.dFrRange, 0, sizeof(int), st) != cudaSuccess ||
+            cuLaunchKernel(nr.fHdrRange, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ar,
+                           nullptr) != CUDA_SUCCESS ||
+            cudaMemcpyAsync(nr.hFrRange, nr.dFrRange, sizeof(int), cudaMemcpyDeviceToHost, st) != cudaSuccess ||
+            cudaStreamSynchronize(st) != cudaSuccess)
+        {
+            nr.die("fruc range test failed");
+            return false;
+        }
+        in = *nr.hFrRange == 0;
     }
-    for (int& f : nr.frFed)
-        if (f == n)
-            f = -1; // the frame FRUC was fed last is gone from its surface
+    const bool sdr = in && (nr.frPrev < 0 || nr.frIn[nr.frPrev]);
+    if (!nativeFrucPack(nr, dCur, n, sdr))
+        return false;
+    nr.frIn[n] = in;
+    if (nr.frPrev >= 0 && nr.frSurfSdr[nr.frPrev] != sdr)
+    {
+        if (!nativeFrucPack(nr, nr.dX, nr.frPrev, sdr))
+            return false;
+        for (uint64_t& k : nr.frLastKey)
+            k = 0;
+    }
+    if (nr.frSdrOn && nTween && nr.frPrev >= 0 && nr.frModeLogs < 4 && (nr.frModeLogs == 0 || sdr != nr.frPairSdr))
+    {
+        LOG("native: fruc: %s\n", sdr ? "frame pairs inside the SDR range, their SDR view"
+                                      : "a frame pair outside the SDR range, the 8-bit HDR codes");
+        nr.frModeLogs++;
+    }
+    nr.frPairSdr = sdr;
     nr.frA = nr.frPrev;
     nr.frB = n;
     nr.frPrev = n;
@@ -7019,6 +7375,23 @@ static uint8_t* nativeFrucNode(NativeRife& nr, int k, int L)
     return nr.dFrNode[p];
 }
 
+// a FRUC output (true BGRA8) into dFrOut (3, ph, pw) in the frames' plane order; an SDR pair's tween back to the HDR
+// codes (k_unpackBgraSdr)
+static bool nativeFrucUnpack(NativeRife& nr, uint8_t* src)
+{
+    void* a[] = {&src, &nr.pw, &nr.ph, &nr.dFrOut};
+    void* b[] = {&src, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &nr.dFrOut};
+    const CUfunction f =
+        nr.frPairSdr ? nr.fUnpackBgraSdr : ((nr.planesRgb || nr.hdr) ? nr.fUnpackBgraRgb : nr.fUnpackBgra);
+    if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream,
+                       nr.frPairSdr ? b : a, nullptr) != CUDA_SUCCESS)
+    {
+        nr.die("unpackBgra (fruc) launch failed");
+        return false;
+    }
+    return true;
+}
+
 static bool nativeFrucTween(NativeRife& nr, double t)
 {
     if (nr.frMp)
@@ -7050,13 +7423,8 @@ static bool nativeFrucTween(NativeRife& nr, double t)
         if (!node)
             return false;
         nr.frTweens++;
-        void* a[] = {&node, &nr.pw, &nr.ph, &nr.dFrOut};
-        if (cuLaunchKernel((nr.planesRgb || nr.hdr) ? nr.fUnpackBgraRgb : nr.fUnpackBgra, (nr.pw + 15) / 16,
-                           (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
-        {
-            nr.die("unpackBgra (fruc) launch failed");
+        if (!nativeFrucUnpack(nr, node))
             return false;
-        }
         return true;
     }
     int rep = 0;
@@ -7135,14 +7503,7 @@ static bool nativeFrucTween(NativeRife& nr, double t)
     if (rep)
         nr.frRepeats++;
     nr.frTweens++;
-    void* a[] = {&outB, &nr.pw, &nr.ph, &nr.dFrOut};
-    if (cuLaunchKernel((nr.planesRgb || nr.hdr) ? nr.fUnpackBgraRgb : nr.fUnpackBgra, (nr.pw + 15) / 16,
-                       (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, a, nullptr) != CUDA_SUCCESS)
-    {
-        nr.die("unpackBgra (fruc) launch failed");
-        return false;
-    }
-    return true;
+    return nativeFrucUnpack(nr, outB);
 }
 
 static void nativeFrucFree(NativeRife& nr)
@@ -7204,6 +7565,17 @@ static void nativeFrucFree(NativeRife& nr)
         cudaFree(nr.dFrOut);
         nr.dFrOut = nullptr;
     }
+    if (nr.dFrRange)
+    {
+        cudaFree(nr.dFrRange);
+        nr.dFrRange = nullptr;
+    }
+    if (nr.hFrRange)
+    {
+        cudaFreeHost(nr.hFrRange);
+        nr.hFrRange = nullptr;
+    }
+    nr.frSdrOn = nr.frPairSdr = false;
 }
 
 // native DRBA's buffers (both routes): the ring of pictures at the pictures' pad, everything the
@@ -7239,10 +7611,15 @@ static bool nativeDrbaAlloc(NativeRife& nr)
     return true;
 }
 
+static void nativeHdrModelSetup(NativeRife& nr, int pre, int post, float white);
 static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
 {
     if (!nativeBuildKernels(nr, cacheDir))
         return false;
+    // live: GMFSS and Restore read the HDR desktop's PQ planes as SDR sRGB over its SDR white, decided before
+    // the engines and the RTX Video setup (a helper thread) size their buffers; offline sets it from the source
+    if (!g_offline)
+        nativeHdrModelSetup(nr, nr.hdr ? 1 : 0, nr.hdr ? 1 : 0, (float)(g_sdrWhite / 80.0));
     // the live working size the handoff sized the model frame with (liveWorkSize), and where it came from
     if (!g_offline)
     {
@@ -7328,6 +7705,13 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     if (nr.restPre && !nr.dCapF)
         NCHK(cudaMalloc((void**)&nr.dCapF, (size_t)3 * nr.ch * nr.cw * sizeof(float)), "alloc capture planes");
     NCHK(cudaEventCreateWithFlags(&nr.capEv, cudaEventDisableTiming), "create capture event");
+    if (!g_offline)
+    {
+        for (cudaEvent_t& e : nr.pfEv)
+            NCHK(cudaEventCreate(&e), "create frame timing event");
+        for (cudaEvent_t& e : nr.grEv)
+            NCHK(cudaEventCreate(&e), "create group timing event");
+    }
     // the nvof model: the Optical Flow session and the glue buffers (the kernels are bound above)
     if (nr.nvof && !nativeNvofSetup(nr))
         return false;
@@ -7627,6 +8011,15 @@ static bool nativeGmfssSetup(NativeRife& nr)
     NCHK(cudaMalloc((void**)&nr.dGmT, sizeof(float)), "alloc gmfss timestep");
     NCHK(cudaMalloc(&nr.dGmOut, 3 * plane * oe), "alloc gmfss fusion out");
     NCHK(cudaMalloc((void**)&nr.dGmF, 3 * plane * sizeof(float)), "alloc gmfss model frame");
+    if (nr.encPost)
+    {
+        NCHK(cudaMalloc((void**)&nr.dGmEnc, 3 * plane * sizeof(float)), "alloc gmfss SDR view");
+        NCHK(cudaMalloc((void**)&nr.dGmHalfM, 6 * hp * sizeof(float)), "alloc gmfss motion halves");
+        NCHK(cudaMalloc((void**)&nr.dGmRange, sizeof(int)), "alloc gmfss range flag");
+        NCHK(cudaHostAlloc((void**)&nr.hGmRange, sizeof(int), cudaHostAllocDefault), "alloc gmfss range readback");
+        nr.gmFrameSdr[0] = nr.gmFrameSdr[1] = nr.gmFeatSdr[0] = nr.gmFeatSdr[1] = nr.gmPairSdr = false;
+        nr.gmModeLogs = 0;
+    }
     cudaMemGetInfo(&freeA, &totB);
     LOG("native: gmfss chain: half %dx%d, features %d/%d/%d %s, metric %s, out %s, accumulator"
         " %zu planes, buffers %.0f MB\n",
@@ -7703,16 +8096,26 @@ constexpr double kRtxHdrBase = 58.0, kRtxHdrMp = 109.0, kRtxVsrBase = 109.0, kRt
 // Restore's video memory in MiB a megapixel of the decoded frame (its engine 145 MiB at 854x480, a quarter on top)
 constexpr double kRestoreMp = 445.0;
 
-// What an offline RIFE-family render takes besides its IFNet's extra timesteps, in bytes, before any engine or
-// buffer exists (lkOfflineRife's batch choice): the render with one tween a call (276 MiB + 427 a padded megapixel of
-// the IFNet frame, its activations and the encoder, + 218 a padded megapixel of the pictures at the working size; 572
-// / 1624 MiB measured at 854x480 / 1920x1080), DLSS 5's passes at the working size (nr_host's per-pass constants), RTX HDR,
-// RTX VSR and Restore. ifw x ifh = the IFNet's frame, w x h = the working size, sw x sh = the decoded frame.
-static uint64_t nativeOfflineNeed(int ifw, int ifh, int w, int h, int sw, int sh)
+// megapixels of a frame padded to 64 a side (the engines' and the model buffers' shape)
+static double padMp64(int a, int b)
 {
-    auto padMp = [](int a, int b) { return (double)((a + 63) / 64 * 64) * ((b + 63) / 64 * 64) / 1e6; };
-    const double mib = 1048576.0, mp = (double)w * h / 1e6;
-    double need = 276.0 + 427.0 * padMp(ifw, ifh) + 218.0 * padMp(w, h);
+    return (double)((a + 63) / 64 * 64) * ((b + 63) / 64 * 64) / 1e6;
+}
+
+// An offline RIFE-family render with one tween a call, in MiB: 276 + 427 a padded megapixel of the IFNet frame (its
+// activations and the encoder) + 218 a padded megapixel of the pictures at the working size (572 / 1624 MiB measured
+// at 854x480 / 1920x1080). ifw x ifh = the IFNet's frame, w x h = the working size.
+static double nativeOfflineRifeMiB(int ifw, int ifh, int w, int h)
+{
+    return 276.0 + 427.0 * padMp64(ifw, ifh) + 218.0 * padMp64(w, h);
+}
+
+// The passes around an offline model, in MiB: DLSS 5's at the working size w x h (nr_host's per-pass constants), RTX
+// HDR, RTX VSR, and Restore at the decoded frame sw x sh.
+static double nativeOfflineEffectsMiB(int w, int h, int sw, int sh)
+{
+    const double mp = (double)w * h / 1e6;
+    double need = 0.0;
     if (g_dlssnr)
     {
         const int p = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
@@ -7724,7 +8127,15 @@ static uint64_t nativeOfflineNeed(int ifw, int ifh, int w, int h, int sw, int sh
         need += kRtxVsrBase + kRtxVsrMp * mp;
     if (g_restore)
         need += kRestoreMp * (double)sw * sh / 1e6;
-    return (uint64_t)(need * mib);
+    return need;
+}
+
+// What an offline RIFE-family render takes besides its IFNet's extra timesteps, in bytes, before any engine or
+// buffer exists (lkOfflineRife's batch choice): the render with one tween a call and the passes around it.
+// ifw x ifh = the IFNet's frame, w x h = the working size, sw x sh = the decoded frame.
+static uint64_t nativeOfflineNeed(int ifw, int ifh, int w, int h, int sw, int sh)
+{
+    return (uint64_t)((nativeOfflineRifeMiB(ifw, ifh, w, h) + nativeOfflineEffectsMiB(w, h, sw, sh)) * 1048576.0);
 }
 
 // k_motionIn's HDR curve, in units of SDR white: the SDR range passes exactly (what an SDR source
@@ -7733,6 +8144,41 @@ static uint64_t nativeOfflineNeed(int ifw, int ifh, int w, int h, int sw, int sh
 // (measured on exact pans: highlights squeezed toward 1.0 lose their motion, unbounded light takes
 // RIFE out of its range; a head of 3 to 4 x white measured best)
 constexpr float kMotionKnee = 1.0f, kMotionHead = 4.0f;
+
+// GMFSS and Restore on HDR planes (hdrToModel, the kernels' comment): pre = the decoded frame's encoding, post = the
+// model frames' (1 PQ, 2 HLG, 0 SDR planes), white = SDR white in scRGB units. SMV_HDR_MODEL_ENC=0 = both read the HDR
+// codes as they are; SMV_GMFSS_SDR_PAIRS=0 = GMFSS treats every pair as one outside the SDR range.
+static void nativeHdrModelSetup(NativeRife& nr, int pre, int post, float white)
+{
+    wchar_t v[8]{};
+    const bool off = GetEnvironmentVariableW(L"SMV_HDR_MODEL_ENC", v, 8) && v[0] == L'0';
+    nr.encPre = off ? 0 : pre;
+    nr.encPost = off ? 0 : post;
+    nr.encWhite = white;
+    nr.gmSdrPairs = !(GetEnvironmentVariableW(L"SMV_GMFSS_SDR_PAIRS", v, 8) && v[0] == L'0');
+    if (nr.encPre || nr.encPost)
+        LOG("native: HDR planes: Restore reads their SDR view over %.0f nits and gets back the light outside it; %s\n",
+            white * 80.0,
+            nr.gmSdrPairs ? "GMFSS reads it on frame pairs inside the SDR range, its motion nets on any other pair"
+                          : "GMFSS's motion nets read it on every pair (SMV_GMFSS_SDR_PAIRS=0)");
+}
+
+// one planar frame (w x h, strides in elements) into its SDR view (fp32, or fp16 when dstHalf; hdrToModel's knee and
+// head given), and a GMFSS tween of an SDR pair back to the HDR codes, on the render stream; false = the launch failed
+static bool nativeHdrEnc(NativeRife& nr, const void* src, int half, int sps, int srs, int w, int h, void* dst,
+                         int dstHalf, int dps, int drs, int mode, float knee, float head)
+{
+    void* a[] = {(void*)&src, &half, &sps, &srs, &w, &h, &dst, &dstHalf, &dps, &drs, &mode, &nr.encWhite, &knee, &head};
+    return cuLaunchKernel(nr.fHdrEnc, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, a, nullptr) ==
+           CUDA_SUCCESS;
+}
+static bool nativeHdrFromSdr(NativeRife& nr, const void* src, int half, int sps, int srs, int w, int h, float* dst,
+                             int dps, int drs, int mode)
+{
+    void* a[] = {(void*)&src, &half, &sps, &srs, &w, &h, (void*)&dst, &dps, &drs, &mode, &nr.encWhite};
+    return cuLaunchKernel(nr.fHdrFromSdr, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, a,
+                          nullptr) == CUDA_SUCCESS;
+}
 
 // RIFE's last step (k_rifeBlend) for the n tweens of the last IFNet enqueue, into dMerged: pic =
 // frame 0 in planes 0..2 and frame 1 in 3..5 at the pictures' layout (ph x pw), fp32 or fp16 by
@@ -8253,6 +8699,20 @@ static void nativeFree(NativeRife& nr)
         cudaEventDestroy(nr.capEv);
         nr.capEv = nullptr;
     }
+    for (cudaEvent_t& e : nr.pfEv)
+        if (e)
+        {
+            cudaEventDestroy(e);
+            e = nullptr;
+        }
+    nr.pfArmed = false;
+    for (cudaEvent_t& e : nr.grEv)
+        if (e)
+        {
+            cudaEventDestroy(e);
+            e = nullptr;
+        }
+    nr.grArmed = false;
     // PG p.124: mappings must go before the external memory objects, and every outstanding
     // wait must have completed before the semaphore is destroyed (the stream sync above).
     if (nr.dOutRing)
@@ -8281,11 +8741,11 @@ static void nativeFree(NativeRife& nr)
         cudaDestroyExternalMemory(nr.emOut);
         nr.emOut = nullptr;
     }
-    for (void* p : {(void*)nr.dFlow, (void*)nr.dMask, (void*)nr.dM, (void*)nr.dMFit})
+    for (void* p : {(void*)nr.dFlow, (void*)nr.dMask, (void*)nr.dM, (void*)nr.dMFit, (void*)nr.dRestRem})
         if (p)
             cudaFree(p);
     nr.dFlow = nr.dMask = nr.dM = nullptr;
-    nr.dMFit = nullptr;
+    nr.dMFit = nr.dRestRem = nullptr;
     for (void* p : {(void*)nr.dCap,    (void*)nr.dX,          (void*)nr.dXh,        (void*)nr.dF[0],
                     (void*)nr.dF[1],   (void*)nr.dEncHalf,    (void*)nr.dT,         (void*)nr.dMerged,
                     (void*)nr.dTmp,    (void*)nr.dCapF,       (void*)nr.dThdrIn,    (void*)nr.dThdrOut,
@@ -8312,13 +8772,17 @@ static void nativeFree(NativeRife& nr)
     // the GMFSS chain's buffers: per session like every other model buffer, so a
     // backend switch on the resident host gives the VRAM back even though the engines stay
     for (void* p :
-         {nr.dGmFeat[0][0],      nr.dGmFeat[0][1],     nr.dGmFeat[0][2],     nr.dGmFeat[1][0], nr.dGmFeat[1][1],
-          nr.dGmFeat[1][2],      (void*)nr.dGmHalf,    (void*)nr.dGmFlow,    nr.dGmMetric,     (void*)nr.dGmFlowP[0],
-          (void*)nr.dGmFlowP[1], (void*)nr.dGmMetP[0], (void*)nr.dGmMetP[1], (void*)nr.dGmAcc, (void*)nr.dGmFa,
-          (void*)nr.dGmFb,       (void*)nr.dGmFc,      (void*)nr.dGmFd,      (void*)nr.dGmT,   nr.dGmOut,
-          (void*)nr.dGmF})
+         {nr.dGmFeat[0][0],      nr.dGmFeat[0][1],     nr.dGmFeat[0][2],     nr.dGmFeat[1][0],  nr.dGmFeat[1][1],
+          nr.dGmFeat[1][2],      (void*)nr.dGmHalf,    (void*)nr.dGmFlow,    nr.dGmMetric,      (void*)nr.dGmFlowP[0],
+          (void*)nr.dGmFlowP[1], (void*)nr.dGmMetP[0], (void*)nr.dGmMetP[1], (void*)nr.dGmAcc,  (void*)nr.dGmFa,
+          (void*)nr.dGmFb,       (void*)nr.dGmFc,      (void*)nr.dGmFd,      (void*)nr.dGmT,    nr.dGmOut,
+          (void*)nr.dGmF,        (void*)nr.dGmEnc,     (void*)nr.dGmHalfM,   (void*)nr.dGmRange})
         if (p)
             cudaFree(p);
+    if (nr.hGmRange)
+        cudaFreeHost(nr.hGmRange);
+    nr.hGmRange = nullptr;
+    nr.dGmRange = nullptr;
     for (int s = 0; s < 2; s++)
         for (int l = 0; l < 3; l++)
             nr.dGmFeat[s][l] = nullptr;
@@ -8335,6 +8799,8 @@ static void nativeFree(NativeRife& nr)
     nr.dGmT = nullptr;
     nr.dGmOut = nullptr;
     nr.dGmF = nullptr;
+    nr.dGmEnc = nullptr;
+    nr.dGmHalfM = nullptr;
     nr.dCap = nullptr;
     nr.dX = nullptr;
     nr.dXh = nullptr;
@@ -8400,42 +8866,103 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     const int64_t cpu0 = profPair ? nowQpc100() : 0;
     if (profPair)
         cudaEventRecord(nr.gmEv[0], st);
-    // feat_ext of the NEW frame, into the set the NEXT pair will read as feat0
+    // feat_ext of the NEW frame, into the set the NEXT pair will read as feat0. HDR planes (the kernels' comment): a
+    // pair whose two frames stay inside the SDR range (k_hdrRange, read back here) runs every net on the SDR view
+    // (hdrToModel, knee 1, head 0: an SDR source's values) through one scratch frame, its tweens come back through
+    // k_hdrFromSdr; any other pair runs on the pictures with gmflow and metricnet on the motion view (k_motionIn's
+    // curve). A previous frame's features taken in the other mode are taken again in this pair's.
     nr.gmCur ^= 1;
     void** fs = nr.dGmFeat[nr.gmCur];
-    nvinfer1::IExecutionContext* ctx = nr.ctxGm[0];
-    ctx->setTensorAddress("x", dCur);
-    ctx->setTensorAddress("f1", fs[0]);
-    ctx->setTensorAddress("f2", fs[1]);
-    ctx->setTensorAddress("f3", fs[2]);
-    if (!ctx->enqueueV3(st))
+    bool sdr = false;
+    if (nr.encPost && nr.gmSdrPairs)
+    {
+        float tol = 2e-3f;
+        void* ar[] = {(void*)&dCur, &ps, &rs, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &tol, (void*)&nr.dGmRange};
+        if (cudaMemsetAsync(nr.dGmRange, 0, sizeof(int), st) != cudaSuccess ||
+            cuLaunchKernel(nr.fHdrRange, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ar,
+                           nullptr) != CUDA_SUCCESS ||
+            cudaMemcpyAsync(nr.hGmRange, nr.dGmRange, sizeof(int), cudaMemcpyDeviceToHost, st) != cudaSuccess ||
+            cudaStreamSynchronize(st) != cudaSuccess)
+        {
+            nr.die("gmfss range test failed");
+            return false;
+        }
+        nr.gmFrameSdr[nr.gmCur] = *nr.hGmRange == 0;
+        sdr = nr.gmFrameSdr[nr.gmCur] && nr.gmFrameSdr[nr.gmCur ^ 1];
+        if (needFlow && nr.gmModeLogs < 4 && (nr.gmModeLogs == 0 || sdr != nr.gmPairSdr))
+        {
+            LOG("native: gmfss: %s\n", sdr ? "frame pairs inside the SDR range, every net on their SDR view"
+                                           : "a frame pair outside the SDR range, the motion nets on the motion view");
+            nr.gmModeLogs++;
+        }
+    }
+    nr.gmPairSdr = sdr;
+    // one frame's SDR view into the scratch (head 0 for an SDR pair, k_motionIn's head for the motion nets)
+    auto view = [&](float* src, float head) {
+        return nativeHdrEnc(nr, src, 0, ps, rs, nr.pw, nr.ph, nr.dGmEnc, 0, ps, rs, nr.encPost, kMotionKnee, head);
+    };
+    auto featExt = [&](float* x, void** f) {
+        nvinfer1::IExecutionContext* c = nr.ctxGm[0];
+        c->setTensorAddress("x", x);
+        c->setTensorAddress("f1", f[0]);
+        c->setTensorAddress("f2", f[1]);
+        c->setTensorAddress("f3", f[2]);
+        return c->enqueueV3(st);
+    };
+    float* xCur = sdr ? nr.dGmEnc : dCur;
+    if (sdr && !view(dCur, 0.0f))
+    {
+        nr.die("gmfss SDR view launch failed");
+        return false;
+    }
+    if (!featExt(xCur, fs))
     {
         nr.die("gmfss feat_ext enqueueV3 returned false");
         return false;
     }
+    nr.gmFeatSdr[nr.gmCur] = sdr;
     if (!needFlow)
         return true; // no tween in this group: python skips reuse() as well
     if (profPair)
         cudaEventRecord(nr.gmEv[1], st);
     // both halves into one (6, hh, hw) buffer: the ifnet's x as it is, gmflow's and
-    // metricnet's inputs and the two image splats by pointer offset
+    // metricnet's inputs and the two image splats by pointer offset (an SDR pair: the new frame's view first, then
+    // the previous frame's takes the scratch for its half and, when they came from the pictures, its features)
     float* h0 = nr.dGmHalf;
     float* h1 = nr.dGmHalf + 3 * hp;
-    void* a0[] = {(void*)&dPrev, &zero, &ps, &rs, &three, &nr.hw, &nr.hh, (void*)&h0, &zero};
-    void* a1[] = {(void*)&dCur, &zero, &ps, &rs, &three, &nr.hw, &nr.hh, (void*)&h1, &zero};
-    for (void** a : {a0, a1})
-        if (cuLaunchKernel(nr.fHalf, (nr.hw + 15) / 16, (nr.hh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
-            CUDA_SUCCESS)
-        {
-            nr.die("gmfss half launch failed");
-            return false;
-        }
+    float* x0 = sdr ? nr.dGmEnc : dPrev;
+    void* a0[] = {(void*)&x0, &zero, &ps, &rs, &three, &nr.hw, &nr.hh, (void*)&h0, &zero};
+    void* a1[] = {(void*)&xCur, &zero, &ps, &rs, &three, &nr.hw, &nr.hh, (void*)&h1, &zero};
+    auto halfOf = [&](void** a) {
+        return cuLaunchKernel(nr.fHalf, (nr.hw + 15) / 16, (nr.hh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+                              nullptr) == CUDA_SUCCESS;
+    };
+    const bool refeat = nr.gmFeatSdr[nr.gmCur ^ 1] != sdr;
+    if (!halfOf(a1) || (sdr && !view(dPrev, 0.0f)) || !halfOf(a0) || (refeat && !featExt(x0, nr.dGmFeat[nr.gmCur ^ 1])))
+    {
+        nr.die("gmfss half launch failed");
+        return false;
+    }
+    nr.gmFeatSdr[nr.gmCur ^ 1] = sdr;
+    // the motion nets: an SDR pair's halves, else (HDR planes) the motion view's
+    const bool mview = nr.encPost && !sdr;
+    float* mv0 = mview ? nr.dGmHalfM : h0;
+    float* mv1 = mview ? nr.dGmHalfM + 3 * hp : h1;
+    float* e = nr.dGmEnc;
+    void* am0[] = {(void*)&e, &zero, &ps, &rs, &three, &nr.hw, &nr.hh, (void*)&mv0, &zero};
+    void* am1[] = {(void*)&e, &zero, &ps, &rs, &three, &nr.hw, &nr.hh, (void*)&mv1, &zero};
+    if (mview && (!view(dCur, kMotionHead) || !halfOf(am1) || !view(dPrev, kMotionHead) || !halfOf(am0)))
+    {
+        nr.die("gmfss motion halves launch failed");
+        return false;
+    }
+    nvinfer1::IExecutionContext* ctx = nullptr;
     if (profPair)
         cudaEventRecord(nr.gmEv[2], st);
     // the fused bidir GMFlow (one call, both directions) and metricnet on the same halves
     ctx = nr.ctxGm[1];
-    ctx->setTensorAddress("img0", h0);
-    ctx->setTensorAddress("img1", h1);
+    ctx->setTensorAddress("img0", mv0);
+    ctx->setTensorAddress("img1", mv1);
     ctx->setTensorAddress("flow", nr.dGmFlow);
     const int64_t cpuF0 = profPair ? nowQpc100() : 0;
     if (!ctx->enqueueV3(st))
@@ -8450,8 +8977,8 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     float* f10 = nr.dGmFlow + 2 * hp;
     void* m1 = (uint8_t*)nr.dGmMetric + hp * (nr.gmMetricHalf ? 2 : 4);
     ctx = nr.ctxGm[2];
-    ctx->setTensorAddress("i0", h0);
-    ctx->setTensorAddress("i1", h1);
+    ctx->setTensorAddress("i0", mv0);
+    ctx->setTensorAddress("i1", mv1);
     ctx->setTensorAddress("f01", nr.dGmFlow);
     ctx->setTensorAddress("f10", f10);
     ctx->setTensorAddress("m0", nr.dGmMetric);
@@ -8598,10 +9125,13 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         nr.die("gmfss fusionnet enqueueV3 returned false");
         return false;
     }
-    // python's torch.clamp(out, 0, 1) on the fp16 engine output: k_restToF is exactly that
-    int n = (int)(3 * plane), half = nr.gmOutHalf ? 1 : 0;
+    // python's torch.clamp(out, 0, 1) on the fp16 engine output: k_restToF is exactly that; an SDR pair's tween
+    // (the SDR view) goes back to the HDR codes in the same step (k_hdrFromSdr)
+    int n = (int)(3 * plane), half = nr.gmOutHalf ? 1 : 0, ps = (int)plane;
     void* ac[] = {(void*)&nr.dGmOut, &half, &n, (void*)&nr.dGmF};
-    if (cuLaunchKernel(nr.fRestToF, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, ac, nullptr) != CUDA_SUCCESS)
+    if (nr.gmPairSdr ? !nativeHdrFromSdr(nr, nr.dGmOut, half, ps, nr.pw, nr.pw, nr.ph, nr.dGmF, ps, nr.pw, nr.encPost)
+                     : cuLaunchKernel(nr.fRestToF, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, ac, nullptr) !=
+                           CUDA_SUCCESS)
     {
         nr.die("gmfss clamp launch failed");
         return false;
@@ -9010,13 +9540,63 @@ static const void* mergedAt(const NativeRife& nr, size_t k, size_t plane)
 // source-size planar frame (srcW x srcH: live the captured frame, offline the decoded one with
 // a working size, else the model frame; fp16 when sHalf: a tween as the IFNet wrote it), the
 // result folded into dst (tw x th).
+// Restore's way back on HDR planes (k_hdrRestOut, in place on dst, tw x th): the remainder comes from the source
+// (sw x sh, planes ps_ apart, rows rs_ apart, fp16 when sHalf), fitted to the target first when the sizes differ
+static bool nativeHdrRestOut(NativeRife& nr, float* dst, int tw, int th, const void* s, int sHalf, int ps_, int rs_,
+                             int sw, int sh, int mode)
+{
+    cudaStream_t st = nr.stream;
+    const void* ref = s;
+    int half = sHalf, fps = ps_, frs = rs_, rps = tw * th;
+    if (tw != sw || th != sh)
+    {
+        if (!nr.dRestRem)
+        {
+            nr.die("restore HDR fit buffer missing");
+            return false;
+        }
+        void* a[] = {(void*)&s, &sHalf, &ps_, &rs_, &sw, &sh, &nr.dRestRem, &tw, &th};
+        if (cuLaunchKernel(nr.fFitPlanar, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
+            CUDA_SUCCESS)
+        {
+            nr.die("restore HDR fit launch failed");
+            return false;
+        }
+        ref = nr.dRestRem;
+        half = 0;
+        fps = rps;
+        frs = tw;
+    }
+    void* a[] = {(void*)&dst, &rps, &tw,         (void*)&ref, &half, &fps,  &frs,
+                 &tw,         &th,  (void*)&dst, &rps,        &tw,   &mode, &nr.encWhite};
+    if (cuLaunchKernel(nr.fHdrRestOut, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
+        CUDA_SUCCESS)
+    {
+        nr.die("restore HDR codes launch failed");
+        return false;
+    }
+    return true;
+}
+
 // false = a launch failed (die was called); an engine enqueue refusal drops the pass for the rest
 // of the session instead (python's rule), the caller then continues with the unrestored source.
-static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, float* dst, int tw, int th, int sHalf = 0)
+// HDR planes (enc 1 PQ, 2 HLG): the engine reads the frame's SDR view (hdrToModel, knee 1, head 0, the sign
+// clipped), the fold is the SDR one, and k_hdrRestOut adds back the light the view never held.
+static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, float* dst, int tw, int th, int sHalf = 0,
+                             int enc = 0)
 {
     cudaStream_t st = nr.stream;
     int sw = srcW(nr), sh = srcH(nr);
-    if (nr.restHalfIn)
+    if (enc)
+    {
+        if (!nativeHdrEnc(nr, s, sHalf, ps_, rs_, sw, sh, nr.dRestIn, nr.restHalfIn ? 1 : 0, sw * sh, sw, enc, 1.0f,
+                          0.0f))
+        {
+            nr.die("restore model values launch failed");
+            return false;
+        }
+    }
+    else if (nr.restHalfIn)
     {
         void* a[] = {(void*)&s, &sHalf, &ps_, &rs_, &sw, &sh, &nr.dRestIn};
         if (cuLaunchKernel(nr.fRestIn, (sw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
@@ -9076,7 +9656,7 @@ static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, fl
             nr.die("restFoldV launch failed");
             return false;
         }
-        return true;
+        return !enc || nativeHdrRestOut(nr, dst, tw, th, s, sHalf, ps_, rs_, sw, sh, enc);
     }
     // an enlarging target (above 4x): sampleOut's Lanczos3 from the clamped fp32 copy
     int n = 3 * ps4, f32 = 0;
@@ -9100,7 +9680,7 @@ static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, fl
         nr.die("clamp01 launch failed");
         return false;
     }
-    return true;
+    return !enc || nativeHdrRestOut(nr, dst, tw, th, s, sHalf, ps_, rs_, sw, sh, enc);
 }
 
 // Offline TrueHDR: the previous frame's statistics block reaches the
@@ -9480,7 +10060,9 @@ static uint64_t nativeVideoCardLever()
 // nvidia-smi shows; cudaMemGetInfo and the DXGI budget describe this process alone): cardB = its size, freeB = what
 // is free right now, moved = how many allocations the driver has moved out of video memory to make room since the
 // system started. The GPU is the CUDA device's (matched by its adapter LUID), the first NVIDIA one when that cannot
-// be told. SMV_VRAM_MIB shrinks the card and the free memory with it. false = the driver does not say.
+// be told or the CUDA runtime is not loaded (g_vramNoCuda: offline Auto's fit query). SMV_VRAM_MIB shrinks the card
+// and the free memory with it. false = the driver does not say.
+static bool g_vramNoCuda = false;
 static bool nativeVideoMemory(uint64_t& freeB, uint64_t& cardB, uint64_t* moved = nullptr)
 {
     static const NvPhysicalGpuHandle gpu = [] {
@@ -9489,7 +10071,7 @@ static bool nativeVideoMemory(uint64_t& freeB, uint64_t& cardB, uint64_t* moved 
         if (NvAPI_Initialize() != NVAPI_OK || NvAPI_EnumPhysicalGPUs(all, &n) != NVAPI_OK || !n)
             return (NvPhysicalGpuHandle) nullptr;
         LUID want{};
-        if (n > 1 && nativeCudaLuid(want))
+        if (n > 1 && !g_vramNoCuda && nativeCudaLuid(want))
             for (NvU32 i = 0; i < n; i++)
             {
                 NvLogicalGpuHandle lg = nullptr;
@@ -9523,14 +10105,142 @@ static bool nativeVideoMemory(uint64_t& freeB, uint64_t& cardB, uint64_t* moved 
 // The video memory a session may still take, in bytes: what is free right now less a reserve of 4 % of the card
 // (512 MiB at least) for what the desktop and other apps take next. Memory past it would not fail: Windows moves
 // what does not fit into system memory, which slows the session and every other app on the GPU. 0 = no limit
-// (SMV_VRAM_CAP=0, or the driver does not report its memory); 1 = nothing is free.
+// (--no-gpu-fit, SMV_VRAM_CAP=0, or the driver does not report its memory); 1 = nothing is free.
 static uint64_t nativeVideoMemoryRoom()
 {
     uint64_t freeB = 0, cardB = 0;
-    if (lkEnv("SMV_VRAM_CAP") == "0" || !nativeVideoMemory(freeB, cardB))
+    if (g_noGpuFit || lkEnv("SMV_VRAM_CAP") == "0" || !nativeVideoMemory(freeB, cardB))
         return 0;
     const uint64_t reserve = (std::max)((uint64_t)512 << 20, cardB / 25);
     return freeB > reserve ? freeB - reserve : 1;
+}
+
+// What a live session still takes after its output ring, in bytes. The ring is its last allocation (the engines,
+// contexts, RTX Video and DLSS 5's passes exist by then), so only what the first frames create comes after it
+// (NVAPI's free figure from the ring's creation to the steady session, a quarter on top of the measured): DLSS 5's
+// first frames, 120 MiB + 16.6 a megapixel a pass (157 / 226 / 465 MiB at 1920x1080 with 1 / 3 / 10 passes, 139 / 190
+// at 854x480 with 3 / 10: its per-size buffers exist before the ring on this route, so nr_host's kAfterMp is not
+// added), and FRUC's NvOFFRUC buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel of the model
+// frame (296 / 521 MiB at 896x512 / 1920x1088); the other routes add nothing the reserve does not cover.
+constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 290.0, kFrucLateMp = 173.0;
+static uint64_t nativeLiveLateNeed(const NativeRife& nr)
+{
+    const double mib = 1048576.0;
+    double need = 0.0;
+    if (nr.liveNr && nr.nrHost)
+    {
+        const double mp = (double)nr.nrW * nr.nrH / 1e6;
+        const int p = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
+        need += kNrLiveLateBase + nr::kFrameMp * mp * p;
+    }
+    if (nr.fruc)
+        need += kFrucLateBase + kFrucLateMp * (double)nr.pw * nr.ph / 1e6;
+    return (uint64_t)(need * mib);
+}
+
+// The output ring's slots the free video memory holds: the room less what the session takes after the ring, over the
+// ring's two sets of slotBytes; 2 at least (the session then runs anyway, and says `video memory ran out` when the
+// driver moves memory out). ringB = the bytes the ring may take. 0 = no limit (SMV_VRAM_CAP=0, or the driver does not
+// report its memory).
+static uint32_t nativeRingFit(const NativeRife& nr, size_t slotBytes, uint64_t& ringB)
+{
+    ringB = 0;
+    const uint64_t room = nativeVideoMemoryRoom();
+    if (!room || !slotBytes)
+        return 0;
+    const uint64_t late = nativeLiveLateNeed(nr);
+    ringB = room > late ? room - late : 0;
+    const uint64_t n = ringB / (2ull * slotBytes);
+    return (uint32_t)(n < 2 ? 2 : (n > 4096 ? 4096 : n));
+}
+
+// A live session's video memory at the working size mw x mh before anything loads, in bytes. The model's share per
+// backend (the CUDA context, the runtime, the kernels, the engines and every buffer: a base, a padded megapixel of the
+// working size and a megapixel of the capture; NVAPI's free figure from the session's start to its steady state at
+// 854x480 and 1920x1080, and at 960x540 of a 1920x1080 capture for the capture's share, a quarter on top), DLSS 5's
+// passes (nr_host's creation and first-frame shares plus this route's own buffers, kNrLiveMp: within 2 % of the
+// measured 1526 / 828 MiB for 3 passes at 1920x1080 / 960x540), RTX HDR, RTX VSR, Restore at the capture, and the
+// output ring's 2 slots (the ring gives way down to them, nativeRingFit).
+struct LiveModelMem
+{
+    const char* backend;
+    double base, padMp, capMp;
+};
+static const LiveModelMem kLiveModelMem[] = {
+    {"rife", 345, 723, 103}, {"blend", 345, 723, 103}, {"rifedrba", 388, 1203, 103}, {"gmfss", 339, 3064, 103},
+    {"nvof", 297, 116, 103}, {"fruc", 577, 122, 103},  {"echo", 282, 0, 48}};
+constexpr double kNrLiveMp = 30.0;
+static uint64_t nativeLiveNeed(const std::string& backend, int cw, int ch, int mw, int mh)
+{
+    const double mib = 1048576.0, mp = (double)mw * mh / 1e6, capMp = (double)cw * ch / 1e6;
+    const double padMp = (double)((mw + 63) / 64 * 64) * ((mh + 63) / 64 * 64) / 1e6;
+    const LiveModelMem* m = &kLiveModelMem[0];
+    for (const LiveModelMem& e : kLiveModelMem)
+        if (backend == e.backend)
+            m = &e;
+    double need = m->base + m->padMp * padMp + m->capMp * capMp;
+    if (g_liveNrCuda)
+    {
+        const int p = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
+        need += p * (nr::kPassBase + nr::kPassMp * mp) + nr::kAfterBase + nr::kAfterMp * mp + nr::kFrameMp * mp * p +
+                kNrLiveMp * mp;
+    }
+    if (g_rtxHdr && g_hdr) // RTX HDR runs on an HDR desktop only, RTX VSR on SDR only (nativeConfigHdr)
+        need += kRtxHdrBase + kRtxHdrMp * (std::max)(mp, capMp);
+    if (g_rtxVsr && !g_hdr)
+        need += kRtxVsrBase + kRtxVsrMp * mp;
+    if (g_restore)
+        need += kRestoreMp * capMp;
+    const double slot = (double)(((size_t)((W * 4 + 255) & ~255u) * H + 511) & ~(size_t)511);
+    return (uint64_t)(need * mib + 4.0 * slot);
+}
+
+// Live Auto's working size by the free video memory (DLSS 5's passes are never cut; Auto may lower its working size):
+// Auto's own pick while the session fits, else the largest lower mode that fits, Ultra Performance when none does
+// (the session then runs anyway and says `video memory ran out` if the driver moves memory out). Picked ONCE a
+// session, before anything loads: every lkSession of the session reads it through liveWorkSize, so the lookups, the
+// builds and the resident handoff key agree. 0 = Auto's own pick (it fits, Auto is off, or there is no room figure:
+// SMV_VRAM_CAP=0 or no driver figure).
+static int liveAutoFitMemory(uint32_t capW, uint32_t capH, const std::wstring& backendW)
+{
+    if (g_dlssMode != 1)
+        return 0;
+    const uint64_t room = nativeVideoMemoryRoom();
+    if (!room)
+        return 0;
+    const int cw = (int)capW, ch = (int)capH;
+    int presW, presH, x0, y0;
+    lkFitRect(cw, ch, W ? (int)W : cw, W ? (int)H : ch, presW, presH, x0, y0);
+    const int pick = (std::max)(liveAutoMode(presW, presH), g_liveAutoFloor);
+    if (pick < 2 || pick > 6)
+        return 0;
+    const std::string backend = wideToUtf8(backendW);
+    int pickW = 0, pickH = 0;
+    uint64_t pickNeed = 0;
+    for (int m = pick; m <= 6; m++)
+    {
+        int mw, mh;
+        liveWorkSizeFor(m, presW, presH, mw, mh);
+        const uint64_t need = nativeLiveNeed(backend, cw, ch, mw, mh);
+        if (m == pick)
+        {
+            pickW = mw;
+            pickH = mh;
+            pickNeed = need;
+        }
+        if (need > room && m < 6)
+            continue;
+        if (m == pick)
+            return 0;
+        const double mib = 1048576.0;
+        LOG("native: video memory: Auto runs %ls (%dx%d) instead of %ls (%dx%d): %ls needs about %.0f MiB, %.0f MiB "
+            "are free%s\n",
+            kDlssModeName[m - 1], mw, mh, kDlssModeName[pick - 1], pickW, pickH, kDlssModeName[pick - 1],
+            pickNeed / mib, room == 1 ? 0.0 : room / mib,
+            need > room ? " (it does not fit at any mode: the session runs anyway)" : "");
+        return m;
+    }
+    return 0;
 }
 
 // A session's video memory check, for every route: nativeVideoMemoryMark at its start (before the engines and
@@ -9947,9 +10657,9 @@ static bool nativeOfflinePqOut(NativeRife& nr, const void* src, int half, int ps
 // model output to the output size; with one the decoded frame to the working size before
 // the model, and the final resize (no Restore) from the working size to the output after it.
 // staged = nr.dPres holds the tw x th frame; src / ps / rs / srcHalf follow a Restore that hands on
-// its fp32 frame. false = a launch failed.
+// its fp32 frame; enc = the frame's HDR encoding for Restore (nativeRestoreRun). false = a launch failed.
 static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& rs, int& srcHalf, bool& staged, int sw,
-                               int sh, int tw, int th, bool withRestore, bool vsrHere)
+                               int sh, int tw, int th, bool withRestore, bool vsrHere, int enc = 0)
 {
     cudaStream_t st = nr.stream;
     const bool resize = tw != sw || th != sh;
@@ -9959,7 +10669,7 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
     {
         if (vsrNow)
         {
-            if (!nativeRestoreRun(nr, src, ps, rs, nr.dRest, sw, sh, srcHalf))
+            if (!nativeRestoreRun(nr, src, ps, rs, nr.dRest, sw, sh, srcHalf, enc))
                 return false;
             if (!nr.restFailed)
             {
@@ -9971,7 +10681,7 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
         }
         else
         {
-            if (!nativeRestoreRun(nr, src, ps, rs, nr.dPres, tw, th, srcHalf))
+            if (!nativeRestoreRun(nr, src, ps, rs, nr.dPres, tw, th, srcHalf, enc))
                 return false;
             staged = !nr.restFailed;
         }
@@ -10057,7 +10767,8 @@ static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
     const void* src = nr.dSrcPl;
     int ps = srcW(nr) * srcH(nr), rs = srcW(nr), half = 0;
     bool staged = false;
-    if (!nativeOfflineStage(nr, src, ps, rs, half, staged, srcW(nr), srcH(nr), nr.w, nr.h, true, !nr.vsrPost))
+    if (!nativeOfflineStage(nr, src, ps, rs, half, staged, srcW(nr), srcH(nr), nr.w, nr.h, true, !nr.vsrPost,
+                            nr.encPre))
         return false;
     // unstaged = no resize and Restore dropped: the source already has the model size
     const float* from = staged ? nr.dPres : (const float*)src;
@@ -10087,7 +10798,8 @@ static bool nativeOfflineEmit(NativeRife& nr, const void* src, int ps, int rs, u
     bool staged = false; // nr.dPres holds the output-size frame
     if (!nr.nvPre)
     {
-        if (!nativeOfflineStage(nr, src, ps, rs, srcHalf, staged, srcW(nr), srcH(nr), tw, th, true, !nr.rtxHdr))
+        if (!nativeOfflineStage(nr, src, ps, rs, srcHalf, staged, srcW(nr), srcH(nr), tw, th, true, !nr.rtxHdr,
+                                nr.encPost))
             return false;
     }
     else if ((nr.w != tw || nr.h != th) &&
@@ -10133,6 +10845,45 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     const size_t plane = (size_t)nr.ph * nr.pw;
     cudaStream_t st = nr.stream;
 
+    // the previous captured frame's own passes, once the GPU is past them (a frame that reused the last DLSS 5
+    // output ran none and is not counted)
+    if (nr.pfArmed && cudaEventQuery(nr.pfEv[2]) == cudaSuccess)
+    {
+        float all = 0.0f, work = 0.0f;
+        if (cudaEventElapsedTime(&all, nr.pfEv[0], nr.pfEv[2]) == cudaSuccess &&
+            cudaEventElapsedTime(&work, nr.pfEv[1], nr.pfEv[2]) == cudaSuccess)
+        {
+            nr.pfAllMs = nr.pfAllMs > 0.0 ? nr.pfAllMs * 0.8 + all * 0.2 : all;
+            nr.pfWorkMs = nr.pfWorkMs > 0.0 ? nr.pfWorkMs * 0.8 + work * 0.2 : work;
+            nr.pfAllUs.store((uint32_t)(nr.pfAllMs * 1000.0));
+            nr.pfWorkUs.store((uint32_t)(nr.pfWorkMs * 1000.0));
+        }
+    }
+    nr.pfArmed = false;
+    // the previous group's own GPU time (the group ended in drainReady(true), so its events are done)
+    if (nr.grArmed && cudaEventQuery(nr.grEv[1]) == cudaSuccess)
+    {
+        float pre = 0.0f, slots = 0.0f;
+        if (cudaEventElapsedTime(&pre, nr.pfEv[0], nr.grEv[0]) == cudaSuccess &&
+            cudaEventElapsedTime(&slots, nr.grEv[0], nr.grEv[1]) == cudaSuccess)
+        {
+            auto ema = [](double& v, double x) { v = v > 0.0 ? v * 0.8 + x * 0.2 : x; };
+            if (nr.grTween)
+            {
+                ema(nr.gIntMs, pre);
+                ema(nr.gTweenMs, slots / nr.grTween);
+                nr.gIntUs.store((uint32_t)(nr.gIntMs * 1000.0));
+                nr.gTweenUs.store((uint32_t)(nr.gTweenMs * 1000.0));
+            }
+            else
+            {
+                ema(nr.gBaseMs, pre + slots);
+                nr.gBaseUs.store((uint32_t)(nr.gBaseMs * 1000.0));
+            }
+        }
+    }
+    nr.grArmed = false;
+
     // (1) the exe signalled the capture fence with this sequence number before writing us
     cudaExternalSemaphoreWaitParams wp{};
     wp.params.fence.value = nr.seq;
@@ -10141,6 +10892,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         nr.die("wait external semaphore failed");
         return false;
     }
+    if (nr.pfEv[0])
+        cudaEventRecord(nr.pfEv[0], st);
     // (2) read the shared capture texture; the event marks the exe's texture as free again
     const size_t capRow = (size_t)nr.cw * (nr.hdr ? 8 : 4);
     if (cudaMemcpy2DFromArrayAsync(nr.dCap, capRow, nr.capArr, 0, 0, capRow, nr.ch, cudaMemcpyDeviceToDevice, st) !=
@@ -10286,7 +11039,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         const bool rgbIn = nr.planesRgb || nr.hdr;
         float* capPl = sdrPre ? nr.dSrcG : nr.dCapF;
         if (!nativeRestoreRun(nr, rgbIn ? capPl : capPl + 2 * (size_t)cps, rgbIn ? cps : -cps, nr.cw, nr.dRest, nr.w,
-                              nr.h))
+                              nr.h, 0, sdrPre ? 0 : nr.encPost))
             return false;
         if (!nr.restFailed)
         {
@@ -10370,6 +11123,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // DLSS 5: once per captured frame on the model frame, after Restore and the
     // resize and before any model reads it; then FSR and RTX TrueHDR (nativePreModelPost), and the
     // frame the model reads is kept for the reuse above
+    if (nr.pfEv[1])
+        cudaEventRecord(nr.pfEv[1], st);
     if (nr.liveNr && !nr.nrFailed && !nrSame && !nativeNrFrame(nr, dCur, nr.pw, nr.ph, (int)plane))
         return false;
     // RIFE's motion frame (two domains): the finished picture as the IFNet would have read it, minus
@@ -10425,6 +11180,11 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             return false;
         }
         nr.nrHaveLast = true;
+    }
+    if (nr.pfEv[2] && !nrSame)
+    {
+        cudaEventRecord(nr.pfEv[2], st);
+        nr.pfArmed = true;
     }
 
     // native DRBA: the new frame and its encode into the history ring; the group then shows
@@ -10571,6 +11331,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     }
 
     // (5) slots. Tokens go out in slot-index order, exactly like _drain_ready.
+    if (nr.grEv[0])
+        cudaEventRecord(nr.grEv[0], st);
     const int pitchI = (int)nr.pitch;
     uint32_t sent = 0;
     auto drainReady = [&](bool block) {
@@ -10951,6 +11713,13 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     }
     if (fail)
         return false;
+    // the first group has no pair and a group with no slot stores nothing: their times say nothing about either kind
+    if (nr.grEv[1] && nr.havePrev && nfr)
+    {
+        cudaEventRecord(nr.grEv[1], st);
+        nr.grArmed = true;
+        nr.grTween = twDone;
+    }
     drainReady(true); // sync the stragglers, exactly like _finish
     if (nr.gmProf && nr.gmProfTween)
         nativeGmfssProfile(nr);

@@ -260,7 +260,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 ```
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--no-interp]
-  [--rife] [--rife-drba] [--lsfg] [--nvof] [--fruc] [--dlssg]
+  [--rife] [--rife-drba] [--lsfg] [--nvof] [--fruc] [--dlssg] [--no-gpu-fit]
   [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus]
   [--hdr-color vivid|rtx|raw] [--hdr-saturation N] [--hdr-contrast N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
@@ -284,6 +284,19 @@ Timing:
   it interpolates from) and it already returns the held frame on an identical pair.
 
 Models (GMFSS is the default, the anime specialist):
+* GMFSS on HDR planes (HDR video, the HDR desktop, RTX HDR's output): every value outside 0..1 breaks
+  its synthesis (read as extended sRGB, highlights lost 5 to 11 dB and wide gamut 8 dB on exact
+  pans), and on PQ codes it falls short of its SDR quality, so the host decides per frame pair
+  (`k_hdrRange`, one readback per frame): a pair whose two frames stay inside the SDR range (no
+  pixel's BT.709 light above SDR white or below 0) runs every GMFSS net on the SDR view
+  (`k_hdrEnc`: the light over SDR white as sRGB, an SDR source's values) and its tweens come
+  back through the sRGB EOTF (`k_hdrFromSdr`); any other pair runs on the pictures with gmflow
+  and metricnet on the motion view (RIFE's `k_motionIn` curve), and a previous frame's features
+  taken in the other mode are taken again. An SDR picture carried as PQ or HLG now interpolates
+  exactly as the SDR frames do (exact pans: +0.5 to 0.8 dB, the gap closed; real fast motion:
+  49.8 dB against the SDR route's tweens, was 31.2 with double exposures); highlight and
+  wide-gamut pictures keep their tweens within 0.05 dB (`harness\gmfss_restore_hdr`).
+  `SMV_HDR_MODEL_ENC=0` keeps the codes, `SMV_GMFSS_SDR_PAIRS=0` runs every pair the second way.
 * `--rife`: Practical-RIFE 4.26 heavy, the recommendation for live action. TRT-engined like GMFSS.
 * `--rife-drba`: RIFE with DistanceRatioMap timing ("Preserve anime pacing"): pans smooth fully,
   character motion keeps closer to its original cadence. Renders on the uniform grid for integer
@@ -321,6 +334,22 @@ Models (GMFSS is the default, the anime specialist):
 * `--fruc` "NVIDIA Smooth Motion": NvOFFRUC on the Optical Flow hardware (Turing through
   Blackwell). Lower quality, ghosts on fast motion, inherent to the model. Needs `NvOFFRUC.dll` +
   `cudart64_110.dll` in `engine/nvoffruc` from the Optical Flow SDK zip (the GUI installs them).
+  NvOFFRUC reads 8-bit BGRA only, so on HDR planes (PQ / HLG video, RTX HDR's PQ, the HDR desktop
+  live) the host decides per frame pair (`k_hdrRange`, one readback per frame): a pair whose two
+  frames stay inside the SDR range goes in as its SDR view (`k_packBgraSdr`: the light over SDR
+  white as sRGB, 256 codes for the SDR range where 8-bit PQ spends about 148 on it) and its
+  tweens come back through the sRGB EOTF (`k_unpackBgraSdr`); any other pair goes in as the
+  8-bit HDR codes (every other 8-bit encoding measured, HLG and sRGB / PQ hybrids, lost 1.5 to
+  45 dB on highlights). A previous frame packed the other way is packed again from its planes
+  and every FRUC instance primes it. An SDR picture carried as PQ or HLG now interpolates exactly
+  as the SDR frames do (exact pans against the truth in 16-bit codes: 58.9 dB, the 8-bit PQ
+  ceiling, to 108 / 125 dB = the SDR route plus the 16-bit rounding); highlight pairs are
+  unchanged (`harness\fruc_hdr_domain`). What stays inside the range: the HDR desktop's SDR
+  windows live, and in HDR10 files the darker scenes; SDR content that reaches white in a real
+  10-bit file decodes above it (1.04 x at 4:4:4, up to 1.65 / 3.2 x after the 4:2:0 chroma
+  upsample of a lossless / lossy file) and keeps the codes, and so does any pair after Sharpen,
+  whose RCAS on PQ planes lifts SDR content up to 2.16 x white at 1. GMFSS's SDR pairs use the
+  same test. `SMV_FRUC_SDR_PAIRS=0` = every pair as the codes.
 * SVP (`--svp` / `--svp-nvof`, live `svp` / `svpnvof`, svpflow from a local SVP 4 install in the
   runtime's VapourSynth) was REMOVED 2026-09-21 so the app no longer depends on SVP 4, SVP Manager
   or VapourSynth; `--nvof` is its replacement. To bring it back, revert the commit "remove the SVP
@@ -346,7 +375,9 @@ post-processing after the upscaler (NIS).
 * `--scale MODE|F` (the GUI's DLSS mode): the WORKING size, NVIDIA's DLSS modes as the share of the
   output per axis: `dlaa` 1 (the default, the output itself), `quality` 1 / 1.5, `balanced`
   1 / 1.724, `performance` 1 / 2, `ultra` 1 / 3, `auto` by the output's pixel count (below 1080p
-  DLAA, up to 1440p Quality, up to 4K Performance, above Ultra Performance), or any number in (0, 1]
+  DLAA, up to 1440p Quality, up to 4K Performance, above Ultra Performance; lowered further while the
+  render would not fit in the free video memory, native.ts `autoFit` with the host's `--fit-work`, see
+  Video memory), or any number in (0, 1]
   (the GUI's slider, always shown, offers 1..100 % and picks the mode whose rounded share it lands
   on: 100 / 67 / 58 / 50 / 33, else Custom). `plan.ts` `workPlan` computes it once (even, at least 64,
   capped at 3840x2160 keeping the aspect: the interpolation's reach) and prints `DLSS mode ...:
@@ -362,7 +393,12 @@ post-processing after the upscaler (NIS).
   the ratio, mirrored edges, normalised taps), the same kernel as the decode-side shrink.
 * `--restore`: Real-ESRGAN anime-video model once per source frame, first (a generative repaint;
   cleans compression noise, can flatten fine texture), folded straight to the working size, or
-  back to the source size when RTX VSR runs the resize after it.
+  back to the source size when RTX VSR runs the resize after it. On HDR planes (both routes) it
+  reads the frame's SDR view (`k_hdrEnc`, a brighter pixel scaled to white with its hue) and
+  `k_hdrRestOut` adds back the light the view never held (the source fitted to the target when
+  the size changes), DLSS 5's way: the SDR range comes out as from an SDR source (87 dB against
+  Restore on the SDR frames, was 43 on the PQ codes, which also lifted highlights by 12 to 16 %),
+  highlights and wide gamut keep their light.
 * `--upscale F`: the output size; bare = 1.5, clamp 1/16..16; above 8192 px auto-switches to a CPU
   AV1 / VVC encoder with a fail-closed RAM preflight (true 16K needs about 54 GB free).
   `--rtx-vsr` uses RTX Video Super Resolution for an enlarging resize (the GUI ticks it by
@@ -503,8 +539,9 @@ pair on an exact static test and reports the one-capture lag in the latency stat
 without the block0 engine or `lag=1` is refused. `blend` is Frame Blend's live twin (the RIFE
 engines under its own name). `fruc` is Smooth Motion's live twin: every fraction of a pair takes the
 nearest node of the pair's midpoint tree (quarters live, see the bridge section), so it is adaptive like rife / gmfss (it takes the Image scale too); it is HDR
-capable like rife (the bridge quantises the PQ-encoded frames to 8-bit for the flow and the warp, so
-the tweens carry 8-bit PQ precision while the real frames stay full precision; the SDR capture of an
+capable like rife (a frame pair inside the SDR range goes to the bridge as its SDR view, any other
+pair as the PQ codes quantised to 8-bit for the flow and the warp, so only those tweens carry 8-bit PQ
+precision while the real frames stay full precision; see `--fruc` above; the SDR capture of an
 HDR-presented window would be 2-3x over-bright instead), and a pair skipped by adaptive smoothness
 is fed to the bridge once (result dropped) so NVIDIA's temporal hints stay consecutive. The
 host answers its handoff with the geometry (Image scale, the /64 pad the bridge instance is
@@ -559,9 +596,9 @@ mean); a Reset on every evaluate made the pass a pure function of the frame (0 o
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr --upscale H --restore
+  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --auto-floor MODE --fit fill|monitor --sharpen S --rtx-vsr --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --rtx-hdr
-  --vsync --no-clickthrough --no-hud --no-adapt --park --native --resident --diag S --no-fill-mouse
+  --vsync --no-clickthrough --no-hud --no-adapt --park --native --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
 smv-live.exe --restore-mouse   gives back the pointer speed and clip a killed or crashed Fill session held (main.ts
                runs it when %TMP%\smv-live-mouse.txt outlives the host; every live session start does the same)
@@ -576,7 +613,44 @@ app's hotkey and countdown use it). Exit codes: 2 unsupported GPU, 3 multi-frame
 resized or moved monitor (the app auto-restarts, cap 20), 5 `--fg` target not capturable, 6 stall
 (the watchdog killed a wedged server; the app revives the same config), 7 the target window closed
 (mid-session, during a resize, or already gone or hidden when a revive or settings restart starts on
-its handle; the app shows "stopped: the window was closed" and never revives it).
+its handle; the app shows "stopped: the window was closed" and never revives it), 8 Auto's GPU-time step
+(below; the app revives the same session with `--auto-floor MODE`, the mode the host named).
+
+Auto's GPU-time step: the host times each captured frame's own passes on the GPU (CUDA events on the host's stream
+from the capture read to the end of FSR / RTX HDR and the motion frame, the part after Restore / the resize apart;
+both smoothed, frames that reuse the last DLSS 5 output skipped; the throttle's tween-less group time when larger).
+At the 2 s stats tick, on Auto only, with the throttle at its floor (below; a fixed multiplier has no throttle):
+three ticks in a row where that time is over the throttle's budget of the time between captured frames (then no fps
+keeps the source's pace) and the mode below is predicted at least a tenth faster (the part at the working size scales with
+its pixels) end the session with exit 8 and `live: Auto next MODE: a captured frame's own passes take X ms of the Y ms
+between captured frames at MODE (WxH), about Z ms at MODE (WxH); the session starts again there`; main.ts reads the
+mode off that line (`liveAutoFloor`) and passes `--auto-floor MODE` on the revive (Auto then picks that mode or a
+smaller one: the resident key carries it). Five minutes (150 ticks) with the mode above predicted under 60 % of the
+interval step back up, only from a floor the step set, never over a memory fit. A user start or a settings change
+clears the floor; a fixed mode never steps; the first two ticks are the warm-up. Exit 8 keeps a resident host like
+exit 4. Gate `harness\live_auto_worksize\auto_step_gate.py ENGINE_DIR` (a driver standing in for main.ts).
+
+The throttle (server backends, adaptive; "Fit to the GPU", one controller with Auto's step above). The capture takes
+every frame off WGC's two-buffer pool the moment it arrives (`Capture::takeFrames` on FrameArrived) and keeps the
+newest for the loop, so a loop slower than the source still sees each arrival: `cap.dropped` counts the superseded
+ones and `emaArrMs` reads the source's cadence (with the pool alone WGC discarded what did not fit, uncounted, and a
+GMFSS session at target 1000 read a 24 fps source as 3.5 fps with 1 drop a second while it showed ~1 s old
+pictures). The host times every group on the GPU (`grEv`, from the capture read: `gIntUs` = the work before the
+slots of a group with tweens, the frame's passes and the pair's model work; `gTweenUs` = one tween with its store;
+`gBaseUs` = a whole group without a tween). Every 500 ms window the loop (`xqThrottle`) computes the tweens a pair
+affords within the budget, m = (budget x the source's interval - the work before the slots) / one tween; the grid
+makes every presented frame a tween, so the target is m per source frame, capped by the user's target and the ring's
+slots. Under one tween a pair the target is the FLOOR (`thrFloor`): each pair sends its real frame alone, every
+effect still on. The budget starts at 95 % of the interval (the user: "95% is safe"); drops above 3 a second smoothed
+over ~2 s, outside the 2 s after a move of the target, take a tenth off it, and 5 clean seconds give 2 points back
+(other work on the GPU, a bridge's own context outside the timed stream). At the floor one window re-times a tween
+after 4 s, doubling to 60 s. A target above the panel starts at the panel's rate until the first group is timed.
+The static-source hold keys on the source's arrivals (`sourceQuiet` / `sourceCadence`), not on the loop's sends.
+`--no-gpu-fit` (the GUI's "Fit to the GPU" unticked, main.ts `liveGpuFit`) holds the user's target (no throttle, no
+Auto step) and drops every video memory fit (`nativeVideoMemoryRoom` answers "no limit": the ring, Auto's memory
+fit), logging `GPU fit off (--no-gpu-fit)`. Gate `harness\live_capture_drops\drops_ab.py OLD_EXE NEW_EXE [case ...]`
+(a parked 2560x1440 mpv looping a 23.976 fps clip; GMFSS + Sharpen + RTX HDR, Fill, Auto at the targets 60 / 1000 /
+10000, every other backend at 1000, `autostep` = GMFSS + DLSS 5 x10 reaching Auto's step, `nofit1000` = the flag).
 
 Fill and the mouse (`FillMouse` in smv-live-loop.inl, Magpie's and Lossless Scaling's model): the overlay is
 click-through and the window under it is smaller, so while the cursor is on the picture a thread (1 ms poll, the
@@ -637,7 +711,15 @@ How the server route works:
 * The DLSS mode on live (`--scale MODE|F`, the host's `liveWorkSize`): the working size is the mode's
   share of the PRESENTED rect (the capture aspect-fit into the overlay: the window itself, or the Fill
   rect), even, at least 64 px and at most the presented rect a side, capped at 3840x2160 keeping the
-  aspect; Auto picks the mode by the presented pixel count (plan.ts's table); DLAA = the presented rect
+  aspect; Auto picks the mode by the presented pixel count (plan.ts's table), then lowers it while the
+  session would not fit in the free video memory (`liveAutoFitMemory`, once a session before anything
+  loads, so every lookup and the resident handoff key agree: `nativeLiveNeed` prices the model per
+  backend, a base + a padded megapixel of the working size + a megapixel of the capture, measured by
+  NVAPI from the session's start to its steady state, a quarter on top, plus DLSS 5's passes, RTX
+  HDR / VSR, Restore and the output ring's 2 slots; Ultra Performance when none fits, the session runs
+  anyway) and says `native: video memory: Auto runs M (WxH) instead of M (WxH): M needs about X MiB, Y
+  MiB are free`; a fixed mode is never changed; gates `harness\live_auto_worksize\auto_fit_gate.py`
+  and `auto_resident.py` (`session_need.py` = the measurement); DLAA = the presented rect
   (window mode: the capture, odd sizes kept). Restore, the resize to it (Lanczos3 either way; Fill at
   DLAA enlarges here), DLSS 5, FSR, RTX HDR and the model run at it, the fit takes it to the canvas;
   echo follows it too. RTX VSR takes ONE resize: the fit when it enlarges, else the capture to the
@@ -690,6 +772,14 @@ exit 1, the part files kept; exit 3 = the multiplier is beyond the GPU). Output 
 python route bit for bit (harness `offline\gate_dlssg.py`; the failure paths through a stub
 server, `offline\gate_dlssg_restart.py`). RTX passes and DLSS 5 run in the same host as the
 frame generation.
+HDR planes (PQ or HLG video, RTX HDR's PQ output) go to it as HDR10, the input the DLSS-G guide asks
+for (its section 11.0): the host starts `dlssg2f.exe --server ... --hdr10`, which presents R10G10B10A2
+on a swap chain with the G2084 / P2020 colour space and confirms with ` hdr10=1` in its handshake;
+`k_packR10` packs the planes into 10-bit words (HLG as PQ on BT.2100's 1000-nit reference display,
+system gamma 1.2) and `k_unpackR10` reads the generated frames back (x / 1023, HLG through the exact
+inverse). Before, HDR went as 8-bit codes labelled SDR: an exact pan's PQ tweens sat 1.8 dB under the
+SDR route's, now 0.1 dB (harness `dlssg_hdr10`). A swap chain that refuses the colour space (`dlssg2f`
+exit 5) or a `dlssg2f` without the mode makes the host start it again on 8-bit frames, with a log line.
 `render.py` keeps the
 probe, the ffmpeg decode and encode commands, PROGRESS / OUTFRAMES and the finalize, and the exe takes the decode pipe as stdin and feeds the encode
 pipe on stdout (pack-in, Head encode, batched IFNet, pack-out, `k_expand8to16` for real frames of
@@ -775,7 +865,31 @@ all 10 passes ran, 3.2x slower than on a free GPU, and the second process read i
 instead of 19). Every session, with or without DLSS 5, reads the driver's count of allocations moved
 out of video memory at its start and after its first frames, and says `video memory ran out: ...`
 once when it rose. Gate `harness\nr_memory_note\cap_gate.py`. Live runs one in-between frame a call
-(the unbatched IFNet, below). An offline RIFE-family render takes its fixed batched class only when the class's extra timesteps
+(the unbatched IFNet, below). Live's output ring (two sets of slots, each an output frame; the slots = the
+frames a captured frame yields, from the fps target) is a session's last allocation: it takes a quarter of
+the card at most, and only the slots the free video memory holds beside what the first frames still add
+(`nativeRingFit`, `nativeLiveLateNeed`: DLSS 5's first frames, 120 MiB + 16.6 a megapixel a pass, and FRUC's
+buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel, measured by NVAPI from the
+ring to the steady session, a quarter on top; the other routes add nothing after it). Fewer slots lower
+only the output's ceiling (at most `slots` frames a captured frame) and the host says `native: video
+memory: the output ring holds N output frames per source frame instead of M ...`; 2 at least. Gate
+`harness\live_ring_memory\ring_gate.py OLD_ENGINE NEW_ENGINE` (`ring_mem.py` = the measurement). On
+Auto, live's working size is fitted to the free video memory at the session's start (the DLSS mode
+bullet under Live). Offline Auto does the same before the render plans its decode (a working size below
+the source is folded into the decode, so the host cannot choose it later): native.ts `autoFit` asks
+`smv-live.exe --offline ... --fit-work WW:WH:DW:DH,...` (Auto's pick and every DLSS mode below it, plan.ts
+`autoCandidates`; no render, no CUDA), which prices each (per model: RIFE / Frame Blend `nativeOfflineRifeMiB`,
+DRBA 310 + 1028 MiB a padded megapixel, GMFSS 462 + 2446, Smooth Motion 461 + 182, NVIDIA Optical Flow 233 +
+179, no interpolation 225 + 41, measured over x2 renders at 854x480 and 1920x1080, plus 25 MiB a megapixel of
+the output beyond the working size, all a quarter on top, and `nativeOfflineEffectsMiB`) and prints `OFFLINE
+FIT i ROOM NEED0 NEEDi`; the plan note then reads `DLSS mode Auto (M; the free video memory fits it: P needs
+about X MiB, Y MiB are free)`. A partial render keeps the mode it was made with: the resume signature carries
+`work_fit` only when the fit lowered the mode, and autoFit reuses the candidate whose signature matches the
+sidecar (`DLSS mode Auto (M, as the partial render it resumes)`). DLSS 4.5 and the preview keep Auto's own
+pick (the preview runs no model to price). Gate `harness\live_auto_worksize\offline_fit_gate.py ENGINE_DIR`.
+`--no-gpu-fit` (the GUI's "Fit to the GPU" unticked; the render CLI, the fit query and the host) turns every offline
+memory fit off: Auto keeps its own pick, the batched class its multiplier; the fps is the same either way, a render
+that does not fit only runs slower. It is not part of the resume signature (a lowered mode is, as `work_fit`). An offline RIFE-family render takes its fixed batched class only when the class's extra timesteps
 (411 MiB a padded megapixel each: activations and tween buffers) fit in the free video memory beside the
 render's other needs (`nativeOfflineNeed`: the render with one tween a call, 276 MiB + 645 a padded
 megapixel measured at 480p and 1080p, DLSS 5's requested passes, RTX HDR, RTX VSR, Restore); else it runs
@@ -900,7 +1014,7 @@ measurement` and `early init done`, and the warm start measures ~2.55 s instead 
 engine load itself). With live RTX HDR on, the TrueHDR bridge setup and its warm-up eval
 (~0.6 s) run on a helper thread beside the engine load (HDR warm start ~2.8 s instead of
 ~3.35 s). The compute thread then imports the output ring (sized from the measured slot
-count) and starts serving. A stop signals the stall watchdog's event, so `srv.stop()` no
+count, fitted to the free video memory) and starts serving. A stop signals the stall watchdog's event, so `srv.stop()` no
 longer waits out the watchdog's one-second sleep (native-route stop ~0.08 s instead of ~1 s).
 
 Resident host (`--resident`, passed by the app on every server-backend session; `SMV_LIVE_RESIDENT=0` on the app
@@ -1170,15 +1284,19 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NR_MV=0` | DLSS 5 gets no motion vectors (both routes; offline: the pre-2026-09-27 pass, live: every frame a Reset); a measurement lever, never a product setting |
 | `SMV_NR_REUSE=0` | DLSS 5 evaluates every frame, also one identical to the previous one (both routes; by default an identical frame reuses the last output, so a paused picture stays still); the A/B and trigger-test lever, never a product setting |
 | `SMV_NR_AUTOMASK=0` | DLSS 5 runs with `DLSSNR.UseAutoMask` 0 (both routes, read by the NR core); a measurement lever, never a product setting |
-| `SMV_VRAM_CAP=0` | no video memory limit: offline RIFE / Frame Blend keep the fixed class of the multiplier, whatever the GPU has free; the A/B lever of the cap, never a product setting |
+| `SMV_VRAM_CAP=0` | no video memory limit: offline RIFE / Frame Blend keep the fixed class of the multiplier, live's output ring the slots the fps target asks for (a quarter of the card at most) and live Auto its own pick, whatever the GPU has free; the A/B lever of the cap, never a product setting (the product's switch is `--no-gpu-fit`) |
+| `SMV_HDR_MODEL_ENC=0` / `SMV_GMFSS_SDR_PAIRS=0` | on HDR planes GMFSS and Restore read the PQ / HLG codes as they are instead of their SDR view / GMFSS runs every frame pair as one outside the SDR range (the pictures, the motion nets on the motion view); A/B levers, never product settings |
 | `SMV_VRAM_MIB=<MiB>` | the GPU's memory as the app's memory checks see it, the free memory shrinks with it (both routes): a smaller card's trigger test of the cap and of the `video memory ran out` line on a card everything fits in |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
+| `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..4, default 3 offline, 2 live) |
 | `SMV_CQ` | override the encoder CQ for measurement |
 | `SMV_NVENC_SPLIT` | override the NVENC `-split_encode_mode` for measurement (default 15 = off; 2 = two strips, 0 = ffmpeg's auto); never a product setting (the split leaves a seam line) |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
 | `SMV_DLSSG_SWEEP=1` | the DLSS 4.5 host latches its buffer-sweep capture tier at startup instead of waiting for hardware flip metering, so the sweep path can be tested on demand |
+| `SMV_DLSSG_HDR10=0` | DLSS 4.5 gets HDR planes as 8-bit codes on an RGBA8 swap chain (labelled SDR) instead of HDR10; an A/B lever, never a product setting |
+| `SMV_DLSSG_REFUSE_HDR10=1` | the DLSS 4.5 host treats the HDR10 colour space as refused (exit 5): the trigger test of the host's 8-bit fallback |
 | `SMV_DLSSG_FOCUS_SHIM=0` | the DLSS 4.5 host's focus shim off: by default `dlssg2f` points the Streamline modules' `GetForegroundWindow` imports at its own off-screen window, because Streamline 2.14 pauses frame generation whenever another window has focus (a render then stopped with `DLSS_PREEMPTED` while the user worked in another window); the A/B and trigger test only, never a product setting |
 | `SMV_NO_STATIC_HOLD=1` | identical-pair passthrough off: a byte-identical pair is interpolated like any other (offline renders and the native hosts read it) |
 | `SMV_NO_RESUME` | disable crash-resume |
@@ -1331,7 +1449,10 @@ Rules: the swap chain must be created with `FRAME_LATENCY_WAITABLE_OBJECT | ALLO
 first Present fails inside the SL hook. `eShowOnlyInterpolatedFrame` makes every native present a
 generated frame, read back from the native swap chain after polling `GetLastPresentCount`, so no
 window is on screen. DLSS-FG requires hardware-accelerated GPU scheduling and an RTX 40 / 50 GPU
-(exit code 2 otherwise).
+(exit code 2 otherwise). With `--hdr10` (HDR video) the swap chain is R10G10B10A2 and the G2084 / P2020
+colour space is set on the native AND the proxy chain: the interposer learns it only from calls it
+hooks, and an R10G10B10A2 chain without it passes through ungenerated (exit code 5 when the swap
+chain refuses the colour space).
 
 ### DLSS 5 Neural Rendering core and caller shim (`nvngx.dll`)
 

@@ -176,7 +176,9 @@ struct Hud
 {
     HWND hwnd = nullptr;
     HFONT font = nullptr;
-    wchar_t text[128]{};
+    wchar_t text[256]{};
+    wchar_t sized[256]{}; // the text the window was last sized for
+    int textH = 0;        // that text's height as drawn, one line or more
 
     void create(int x, int y)
     {
@@ -220,10 +222,34 @@ struct Hud
         paint();
     }
 
+    // The window follows its text: one line as wide as the text, up to the right edge of the monitor's work area, and
+    // more lines past it, so a loading note that names several effects shows whole
+    void fit()
+    {
+        if (!wcscmp(text, sized))
+            return;
+        wcscpy_s(sized, text);
+        RECT w{};
+        GetWindowRect(hwnd, &w);
+        MONITORINFO mi{sizeof(mi)};
+        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        const int room = (std::max)(200, (int)(mi.rcWork.right - w.left) - 16);
+        RECT r{0, 0, room - 8, 0};
+        HDC dc = GetDC(hwnd);
+        HGDIOBJ of = SelectObject(dc, font);
+        DrawTextW(dc, text, -1, &r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+        SelectObject(dc, of);
+        ReleaseDC(hwnd, dc);
+        textH = (int)(r.bottom - r.top);
+        SetWindowPos(hwnd, nullptr, 0, 0, (int)(r.right - r.left) + 8, (std::max)(36, textH + 4),
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
     void paint()
     {
         if (!hwnd)
             return;
+        fit();
         HDC dc = GetDC(hwnd);
         RECT r;
         GetClientRect(hwnd, &r);
@@ -232,7 +258,8 @@ struct Hud
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255)); // full white: easier to read than green
         r.left += 4;
-        DrawTextW(dc, text, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        r.top = (r.bottom - textH) / 2; // centred: one line in the window's 36 px, more lines in their own height
+        DrawTextW(dc, text, -1, &r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
         SelectObject(dc, of);
         ReleaseDC(hwnd, dc);
     }
@@ -244,8 +271,10 @@ struct Hud
     }
     void move(int x, int y)
     {
-        if (hwnd)
-            SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        if (!hwnd)
+            return;
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        sized[0] = 0; // the room to the monitor's edge changed: the next paint sizes the window again
     }
 
     void destroy()
@@ -1172,7 +1201,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const std::wstring script = engineScript(exeDir);
             // the native host is the only route for every server backend (a session it cannot
             // run ends on its reason line). Its DLL load and engine handoff overlap the
-            // source-rate measurement below (they depend on the capture size only)
+            // source-rate measurement below (they depend on the capture size only). Auto's
+            // working size is fitted to the free video memory first, once: every lookup reads it
+            g_liveAutoFit = liveAutoFitMemory(capW, capH, g_serverBackend);
             srv.beginNativeHandoff(script, g_serverBackend, capW, capH, cap.hTex, cap.hFence, &host);
             // SOURCE-RATE MEASUREMENT, before the server spawns. Two consumers:
             //  * fixed mode (--no-adapt with a --target and no --gen): seeds the whole
@@ -1427,6 +1458,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 LOG("live server failed to start\n");
                 return 1;
             }
+            // the host may hold fewer slots than asked (its ring fits the free video memory): the ladders and the
+            // drift tracker stay inside them
+            if (srv.shmSlots && genFrames > (int)srv.shmSlots - 1)
+                genFrames = (int)srv.shmSlots - 1;
             if (srv.outbufAck && host.outBuf)
                 LOG("present path: direct from VRAM (shared output buffer)\n");
             // a started host always holds the zero-copy capture import (nativeRefusal)
@@ -1474,33 +1509,26 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 LOG("adaptive smoothness: target %.0f fps (fractional resample, up to %dx per pair)\n", adaptTarget,
                     genFrames + 1);
             }
+            if (g_noGpuFit)
+                LOG("GPU fit off (--no-gpu-fit): the target holds, no video memory fit\n");
         }
-        // DYNAMIC OUTPUT THROTTLE (the "consume every source frame" loop). The slot ceiling
-        // alone lets the pipeline ask for more tweens per pair than it can actually produce
-        // inside one pair interval; the loop then falls behind, WGC frames get superseded
-        // (Capture.dropped climbs) and latency parks at whatever the group overrun is - the
-        // 24fps source read as 9.6 consumed with ~190ms latency at 42 slots. So the grid
-        // marches on an EFFECTIVE target that floats below the user's: step DOWN fast when
-        // we are the bottleneck, back UP slowly when there is sustained headroom. The user's
-        // target is what is displayed and the ceiling we recover toward; the effective rate
-        // is what the hardware can sustain, exactly like in-game frame generation.
-        // Signals (both per group, no extra measurement cost):
-        //   * cap.dropped advanced over the group = a source frame was superseded, hard
-        //     evidence that we did not keep up;
-        //   * group wall time > the pair interval = we are over budget even if the drop has
-        //     not landed yet (faster to react, and it catches the first overrun).
-        // Multiplicative decrease / small additive-ish increase with a clean-time gate is the
-        // standard anti-oscillation shape: a single bad group costs 10%, and winning it back
-        // takes a full clean window, so the loop settles instead of pumping.
-        double effTarget = adaptTarget; // throttled output target (<= adaptTarget)
-        uint64_t thrDropBase = 0;       // cap.dropped at the previous evaluation
-        double thrCleanMs = 0;          // accumulated clean-group time toward a step up
+        // THE THROTTLE ("Fit to the GPU", one controller with Auto's GPU-time step): the grid marches on an EFFECTIVE
+        // target below the user's, computed from the host's own GPU time per group so every source frame is taken
+        // (xqThrottle); at its floor, the source's rate, the pairs carry their real frame alone, and only Auto's
+        // working-size step goes further.
+        int autoTicks = 0, autoSlow = 0, autoClean = 0; // Auto's GPU-time step, counted in stats ticks
+        double effTarget = adaptTarget;                 // throttled output target (<= adaptTarget)
+        uint64_t thrDropBase = 0;                       // cap.dropped at the window start
+        double thrCleanMs = 0;                          // drop-free time toward a budget step up
         double thrLastLog = 0;
-        double thrWinT0 = 0; // control-window start (ms); 0 = not started
-        uint32_t thrGroups = 0, thrOverruns = 0;
+        double thrWinT0 = 0;     // control-window start (ms); 0 = not started
+        double thrBudget = 0.95; // the share of the source's interval a group's GPU work may take
+        double thrProbeGapMs = 4000.0, thrProbeLast = 0; // at the floor: the next tween re-measure (4 .. 60 s)
+        bool thrProbing = false;
+        bool thrFloor = false; // the throttle's floor: every pair carries its real frame alone (sendPairStream)
+        double thrDropEma = 0; // drops a second, smoothed over the 500 ms windows (~2 s)
+        double thrMoveT = 0;   // when the target last moved: drops within 2 s of it are the move's, not the budget's
         const double kThrWinMs = 500; // control window: long enough to measure a drop RATE
-        const double kThrDown = 0.95; // step down per bad window (every 500ms at worst)
-        const double kThrUp = 1.05;   // step up per clean window (every 3s at best)
         double emaDt = 0;             // smoothed capture interval (ms), paces the group
         ULONGLONG lastArrival = 0;
         int idleSlotIdx = -1;     // last presented slot, re-presentable while the
@@ -1718,6 +1746,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // with a 1000fps floor). Sizing it from the rate we actually sustain spreads
                 // the group across the pair instead.
                 panelHzMode = (double)dm.dmDisplayFrequency;
+                // a target above the panel starts at the panel's rate until the throttle has timed a group: starting at
+                // 10000 asked GMFSS for the whole slot ladder a pair (213 tweens, seconds a group)
+                if (adaptTarget > panelHzMode && !g_noGpuFit)
+                {
+                    effTarget = panelHzMode;
+                    gridStep = 1e7 / effTarget;
+                }
                 refloor();
                 LOG("present pacing: floor %.3fms (panel mode %u Hz, target %.0f fps%s)\n", minSpaceMs,
                     dm.dmDisplayFrequency, adaptTarget,
@@ -1796,6 +1831,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // (tweens of an identical pair are identical; the idle cadence
                 // supplies the output rate). nextGrid re-seeds on the next
                 // real pair - an invisible phase reset on identical content.
+                fr[nfr++] = 1.0f;
+                nextGrid = 0;
+            }
+            else if (adaptTarget > 0 && emaDt > 0 && (thrFloor || effTarget * emaDt <= 1050.0))
+            {
+                // the throttle's floor, or a target at the source's rate: the real frame alone (the grid would put
+                // one tween per pair at a fixed phase in its place, a model call for no added frame)
                 fr[nfr++] = 1.0f;
                 nextGrid = 0;
             }
@@ -1941,8 +1983,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             std::mutex rqM;
             std::atomic<bool> rDead{false};
             HANDLE tokEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            const double kXqDropRate = 3.0;   // drops/s tolerated before throttling
-            const double kXqCleanMs = 1000.0; // clean time needed before a step up
+            const double kXqDropRate = 3.0; // drops/s tolerated before the budget shrinks
             uint64_t halfDefer = 0, gateCDefer = 0, halfPend = 0;
             // Phase instrumentation (SMV_LIVE_XQPHASE=1, off by default). Per-iteration
             // QPC accumulators for every named phase of this loop, printed on the 2s tick as
@@ -1984,25 +2025,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 acc += (t - phT) / 1e4;
                 phT = t;
             };
-            // SMV_LIVE_XQLATE=1: diagnostic escape to a LATENESS over-budget signal (how far
-            // a group's last slot presented past its unfloored deadline). Measured:
-            // it over-fires, because with the present floor in play the floored chain pushes
-            // the last slot past its unfloored deadline on nearly every group, so the throttle
-            // ratchets down to ~320 of 1000 (383 fps avg vs 810-932 with the classic signal).
-            // DEFAULT = the classic group-share signal; gate C is what bounds the queue.
-            bool xqLate = false;
-            {
-                wchar_t lv[8]{};
-                if (GetEnvironmentVariableW(L"SMV_LIVE_XQLATE", lv, 8) && lv[0] == L'1')
-                    xqLate = true;
-            }
-            // The group-close instant is ALWAYS a present time (the group's last
-            // slot). The end-marker branch used to fall back to nowMs() whenever the group had
-            // no slot left in the FIFO, mixing token-arrival times into a series compared
-            // against emaDt; these carry the present clock into that branch.
-            double xqLastPresMs = 0, xqLastLateMs = 0;
-            uint32_t lastNfr = 0;     // slots the most recently sent group asked for
-            double xqPrevGroupMs = 0; // last present time of the previous group (throttle)
+            // The group-close instant is ALWAYS a present time (the group's last slot); the end-marker branch carries
+            // the present clock when the group had no slot left in the FIFO.
+            double xqLastPresMs = 0;
+            uint32_t lastNfr = 0; // slots the most recently sent group asked for
             double hitchArrPrev = 0;
             std::thread rdTh([&] {
                 for (;;)
@@ -2069,35 +2095,25 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     YieldProcessor();
                 }
             };
-            // THROTTLE STEP, one evaluation per group as its last slot presents. The rules
-            // are the classic ones (group share of the timeline > emaDt * 1.15 = over budget,
-            // plus the drop-rate rule), and GATE C is what keeps the queue bounded at
-            // saturation: the earlier "queue random-walks into a permanent backlog" finding
-            // (latency 149 to 1863ms over 60s at target 1000) was measured BEFORE gate C
-            // existed. The LATENESS signal (how far the group's last slot presented past
-            // its unfloored deadline) survives only as the SMV_LIVE_XQLATE=1 diagnostic
-            // escape above, because it over-fires under the present floor.
-            auto xqThrottle = [&](double tn, double lateMs) {
-                if (!(adaptTarget > 0 && !hidden && !nextIdleTick && emaDt > 0))
+            // THE THROTTLE, one evaluation per 500 ms window as a group's last slot presents. The host times every
+            // group on the GPU (gIntUs = the work before the slots of a group with tweens: the frame's own passes and
+            // the pair's model work; gTweenUs = one tween with its store). A group must finish within thrBudget of the
+            // source's interval for the next source frame to be taken, so the pair affords m = (budget - that work) /
+            // one tween; the grid makes every presented frame a tween, so the target is m per source frame (capped by
+            // the user's target and the ring's slots), and under one tween a pair it is the source's own rate: the
+            // real frames alone (thrFloor, read by sendPairStream and Auto's step). The drops keep the budget honest
+            // (other work on the GPU, a bridge's own context outside the timed stream): drops above kXqDropRate a
+            // second, smoothed over ~2 s, take a tenth off it, 5 clean seconds give 2 points back. At the floor the
+            // tween is re-timed by one window up after 4 s, doubling to 60 s while it keeps answering "the floor". A
+            // pause or a static hold starts the window over; before any tween is timed the start target stands.
+            auto xqThrottle = [&](double tn) {
+                if (g_noGpuFit || !(adaptTarget > 0 && !hidden && !nextIdleTick && emaDt > 0))
                 {
-                    // An alt-tab pause or a static hold invalidates the whole control
-                    // window, not just its start time. Leaving thrWinT0 and the counters alone
-                    // made the first group after a 15s resume close a 15s "window" and step the
-                    // target on evidence gathered before the pause.
-                    xqPrevGroupMs = tn;
                     thrWinT0 = 0;
-                    thrGroups = thrOverruns = 0;
                     thrCleanMs = 0;
                     thrDropBase = cap.dropped;
                     return;
                 }
-                const double groupMs = xqPrevGroupMs > 0 ? tn - xqPrevGroupMs : 0;
-                xqPrevGroupMs = tn;
-                if (groupMs <= 0)
-                    return;
-                thrGroups++;
-                if (xqLate ? (lateMs > emaDt * 0.15) : (groupMs > emaDt * 1.15))
-                    thrOverruns++;
                 if (!thrWinT0)
                 {
                     thrWinT0 = tn;
@@ -2108,52 +2124,77 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     return;
                 const double winS = (tn - thrWinT0) / 1000.0;
                 const double dropRate = (double)(cap.dropped - thrDropBase) / winS;
-                // Queue path tuning. With gate C
-                // bounding the queue, a superseded capture frame is normal at-capacity
-                // behaviour here (the exe DEFERRED a send on purpose), so the classic
-                // 1 drop/s rule fires on noise; and with the 3s recovery a single early down
-                // step stranded effTarget at 340 for longer than a whole run. Drop rule at
-                // 3/s, recovery after 1 clean second. Down factor, floor and the
-                // majority-over-budget rule are unchanged.
-                const bool bad = dropRate > kXqDropRate || thrOverruns * 2 > thrGroups;
-                double next = effTarget;
-                if (bad)
+                thrDropEma = thrDropEma * 0.75 + dropRate * 0.25;
+                if (thrProbing || tn - thrMoveT < 2000.0)
+                    thrDropEma = 0;
+                if (thrDropEma > kXqDropRate)
                 {
                     thrCleanMs = 0;
-                    next = effTarget * kThrDown;
-                    const double floorT = 2000.0 / emaDt;
-                    if (next < floorT)
-                        next = floorT;
+                    thrDropEma = 0; // one cut per spell: the next needs ~2 s of fresh drops
+                    thrBudget = (std::max)(0.3, thrBudget * 0.9);
                 }
-                else
+                else if (dropRate > kXqDropRate)
+                    thrCleanMs = 0;
+                else if ((thrCleanMs += tn - thrWinT0) >= 5000.0)
                 {
-                    thrCleanMs += tn - thrWinT0;
-                    if (thrCleanMs >= kXqCleanMs)
+                    thrCleanMs = 0;
+                    thrBudget = (std::min)(0.95, thrBudget + 0.02);
+                }
+                const double srcFps = 1000.0 / emaDt;
+                const double pre = srv.nr ? srv.nr->gIntUs.load() / 1000.0 : 0.0;
+                const double tw = srv.nr ? srv.nr->gTweenUs.load() / 1000.0 : 0.0;
+                double next = effTarget, m = 0.0;
+                if (pre > 0.0 && tw > 0.0)
+                {
+                    m = (emaDt * thrBudget - pre) / tw;
+                    next = m >= 1.0 ? m * srcFps : srcFps;
+                    const bool floor = m < 1.0;
+                    thrFloor = floor;
+                    if (thrProbing)
                     {
-                        thrCleanMs = 0;
-                        next = effTarget * kThrUp;
+                        thrProbing = false; // the window just timed fresh tweens: the model above read them
+                        thrProbeGapMs = floor ? (std::min)(60000.0, thrProbeGapMs * 2.0) : 4000.0;
+                        thrProbeLast = tn;
+                    }
+                    else if (!floor)
+                    {
+                        thrProbeGapMs = 4000.0;
+                        thrProbeLast = 0;
+                    }
+                    else if (!thrProbeLast)
+                        thrProbeLast = tn;
+                    else if (tn - thrProbeLast >= thrProbeGapMs)
+                    {
+                        next = srcFps * 1.1;
+                        thrProbing = true;
+                        thrFloor = false;
                     }
                 }
+                const double ceilT = (srv.shmSlots > 1 ? srv.shmSlots - 1 : 1) * srcFps;
+                if (next > ceilT)
+                    next = ceilT;
                 if (next > adaptTarget)
                     next = adaptTarget;
                 if (next < 1.0)
                     next = 1.0;
-                if (next != effTarget)
+                if (fabs(next - effTarget) > effTarget * 0.03)
                 {
+                    if (!thrFloor || next > effTarget)
+                        thrMoveT = tn;
                     effTarget = next;
                     gridStep = 1e7 / effTarget;
                     refloor();
                     if (tn - thrLastLog > 2000.0)
                     {
                         thrLastLog = tn;
-                        LOG("throttle: effective target %.0f fps of %.0f "
-                            "(drops %.1f/s, %u/%u groups over the %.1fms pair)\n",
-                            effTarget, adaptTarget, dropRate, thrOverruns, thrGroups, emaDt);
+                        LOG("throttle: target %.0f fps of %.0f (%.1f ms before the slots + %.1f ms a tween of the %.1f "
+                            "ms between source frames at %.0f %%: %.1f tweens a pair%s; drops %.1f/s)\n",
+                            effTarget, adaptTarget, pre, tw, emaDt, thrBudget * 100.0, m,
+                            thrProbing ? ", re-timing a tween" : "", dropRate);
                     }
                 }
                 thrWinT0 = tn;
                 thrDropBase = cap.dropped;
-                thrGroups = thrOverruns = 0;
             };
             for (;;)
             {
@@ -2235,7 +2276,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                                 break;
                             }
                         if (!tagged)
-                            xqThrottle(xqLastPresMs > 0 ? xqLastPresMs : nowMs(), xqLastLateMs);
+                            xqThrottle(xqLastPresMs > 0 ? xqLastPresMs : nowMs());
                         continue;
                     }
                     const uint32_t idx = raw - 1;
@@ -2319,12 +2360,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         hitchPrev = pNow;
                     }
                     const bool wasLast = s.lastOfGroup;
-                    const double lateMs = tNow - s.target; // vs the UNFLOORED deadline
-                    xqLastPresMs = pNow;                   // F5: the one group-close clock
-                    xqLastLateMs = lateMs;
+                    xqLastPresMs = pNow; // F5: the one group-close clock
                     fifo.pop_front();
                     if (wasLast)
-                        xqThrottle(pNow, lateMs);
+                        xqThrottle(pNow);
                 }
                 if (rc2)
                     break;
@@ -2342,7 +2381,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         ShowWindow(host.hwnd, hidden ? SW_HIDE : SW_SHOWNA);
                         hud.show(!hidden);
                         LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
-                        xqPrevGroupMs = 0; // the throttle reference does not survive a pause
                         if (g_liveNrCuda)
                             g_liveNrReset.store(true); // DLSS 5: a new stream after the gap
                     }
@@ -2477,7 +2515,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             const ULONGLONG prevProcTick = lastPresentTick;
                             lastPresentTick = GetTickCount64();
                             statCaptured++;
-                            if (lastPresentTick - prevProcTick < 300)
+                            // the SOURCE's cadence, not our sends: a pipeline slower than 300 ms a group
+                            // read a playing video as paused, and the hold then kept the throttle off
+                            if (cap.lastArrTs ? cap.sourceCadence() : lastPresentTick - prevProcTick < 300)
                                 nextIdleTick = 0;
                             else if (nextIdleTick > 0)
                                 nextIdleTick = nowMs() + idleStepMs;
@@ -2491,7 +2531,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // frames: gating it only on 300ms of silence left a 300ms hole after every
                 // refresh, 1 real + 7 held = 8 of the 10 fps cap ("1/8 instead of 1/10").
                 // Real cadence (<300ms apart) clears nextIdleTick at the send.
-                if (!hidden && (nextIdleTick > 0 || GetTickCount64() - lastPresentTick > 300))
+                if (!hidden && (nextIdleTick > 0 ||
+                                (cap.lastArrTs ? cap.sourceQuiet() : GetTickCount64() - lastPresentTick > 300)))
                 {
                     const ULONGLONG now3 = GetTickCount64();
                     if (now3 - lastRefreshTick >= 1000)
@@ -2507,7 +2548,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         if (nextIdleTick <= 0)
                         {
                             nextIdleTick = nowQ + idleStepMs;
-                            xqPrevGroupMs = 0;
                         }
                         else if (nowQ >= nextIdleTick)
                         {
@@ -2610,6 +2650,49 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                                 idleStepMs = 100.0;
                         }
                         fixWantPrev = want;
+                    }
+                    // Auto's working size against the GPU time, the throttle's next lever: at its floor (the real
+                    // frames alone; a fixed multiplier has no throttle) a captured frame's own work (its passes:
+                    // Restore, the resize, DLSS 5, FSR, RTX HDR, and the model's per-frame state and the store: the
+                    // host's tween-less group) that takes more than the throttle's budget of the time between
+                    // captured frames means no fps keeps the source's pace, a smaller working size does. Three ticks
+                    // in a row over it, with the mode below predicted at least a tenth faster (the part after
+                    // Restore / the resize scales with the working size's pixels), end the session with exit 8
+                    // naming that mode, and the app starts it again there (--auto-floor). Five minutes with the mode
+                    // above predicted under 60 % of the interval step back up, only from a floor this step set
+                    // (never below a memory fit). The first two ticks are the warm-up.
+                    if (g_dlssMode == 1 && !g_noGpuFit && srv.nr && emaDt > 0 && ++autoTicks > 2)
+                    {
+                        const double work = srv.nr->pfWorkUs.load() / 1000.0;
+                        const double all = (std::max)(srv.nr->pfAllUs.load(), srv.nr->gBaseUs.load()) / 1000.0;
+                        const bool atFloor = thrFloor || effTarget * emaDt <= 1050.0;
+                        int presW, presH, mode, mw, mh, nw = 0, nh = 0;
+                        liveWorkSize((int)capW, (int)capH, presW, presH, mode, mw, mh);
+                        auto predict = [&](int m) {
+                            liveWorkSizeFor(m, presW, presH, nw, nh);
+                            return all - work + work * ((double)nw * nh) / ((double)mw * mh);
+                        };
+                        const bool known = mode >= 2 && mode <= 6 && all > 0.0;
+                        autoSlow =
+                            known && atFloor && all > emaDt * thrBudget && mode < 6 && predict(mode + 1) < all * 0.9
+                                ? autoSlow + 1
+                                : 0;
+                        autoClean = known && !g_liveAutoFit && mode > (std::max)(2, liveAutoMode(presW, presH)) &&
+                                            predict(mode - 1) < emaDt * 0.6
+                                        ? autoClean + 1
+                                        : 0;
+                        const int next = autoSlow >= 3 ? mode + 1 : (autoClean >= 150 ? mode - 1 : 0);
+                        if (known && next >= 2 && next <= 6)
+                        {
+                            const double pred = predict(next);
+                            LOG("live: Auto next %ls: a captured frame's own passes take %.1f ms of the %.1f ms between "
+                                "captured frames at %ls (%dx%d), about %.1f ms at %ls (%dx%d); the session starts again "
+                                "there\n",
+                                kDlssModeName[next - 1], all, emaDt, kDlssModeName[mode - 1], mw, mh, pred,
+                                kDlssModeName[next - 1], nw, nh);
+                            rc2 = 8;
+                            break;
+                        }
                     }
                     lastStatTick = now;
                     statPresentBase = c;

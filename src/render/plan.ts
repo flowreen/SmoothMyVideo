@@ -21,6 +21,7 @@ export interface RenderArgs {
   rtx_vsr: boolean;
   rtx_hdr: boolean;
   restore: boolean;
+  no_gpu_fit: boolean; // --no-gpu-fit: no video memory fit (the host's batch and Auto's working size)
   dlssnr: boolean;
   dv: boolean;
   hdr10plus: boolean;
@@ -114,6 +115,19 @@ export function workPlan(st: Stream, w: number, h: number, upscaleF: number, sca
     (capped ? "; capped at 3840x2160, the interpolation's reach" : '') +
     ')\n';
   return { w: dw, h: dh, workW: ww, workH: wh, outW: ow, outH: oh, vf, note };
+}
+
+/** Auto's candidates for its video memory fit, its own pick first: the plan of every DLSS mode from that pick down to
+ * Ultra Performance (the render host prices them, --fit-work). */
+export function autoCandidates(st: Stream, w: number, h: number, upscaleF: number): { mode: string; plan: WorkPlan }[] {
+  const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0);
+  const order = Object.keys(DLSS_MODES);
+  const out: { mode: string; plan: WorkPlan }[] = [];
+  for (const m of order.slice(order.indexOf(autoMode(ow, oh)))) {
+    const p = workPlan(st, w, h, upscaleF, m);
+    if (typeof p !== 'string') out.push({ mode: m, plan: p });
+  }
+  return out;
 }
 
 /** The output resolution: the factor on both dimensions, each rounded down to even. */

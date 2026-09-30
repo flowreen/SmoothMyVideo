@@ -23,12 +23,24 @@ import {
   pyReprStr,
   Say,
 } from './encode';
-import { isGmfss, nvofRefusal, RenderArgs, workPlan } from './plan';
+import { autoCandidates, isGmfss, nvofRefusal, RenderArgs, WorkPlan, workPlan } from './plan';
 import { thumbPng } from './preview';
-import { decodeRgbVf, frameCount, needMkv, outputRate, probe, probeTracks, sourceBits, tag, vfrConform } from './probe';
+import {
+  decodeRgbVf,
+  frameCount,
+  needMkv,
+  outputRate,
+  probe,
+  probeTracks,
+  sourceBits,
+  Stream,
+  tag,
+  vfrConform,
+} from './probe';
 import { pyFixed, pyFloatRepr, pyG, pyRound } from './pyfmt';
 import {
   applyResume,
+  ArgNs,
   concatCopy,
   emitPausePreview,
   nativeHdrPrefix,
@@ -136,6 +148,76 @@ function* fdLines(fd: number): Generator<string> {
   }
 }
 
+/** Offline Auto's working size by the free video memory. A working size below the source is folded into the decode,
+ * so the host is asked before the render plans (`--offline --fit-work`: it prices Auto's pick and every DLSS mode below
+ * it, the model, the passes around it and the output's buffers, against NVAPI's free figure less a reserve, and names
+ * the first that fits). A partial render keeps the mode its resume signature was made with: the signature carries
+ * work_fit only when the fit lowered the mode, so every other render keeps its signature. A mode other than Auto, or
+ * DLSS 4.5 (hostArgs null), gets the plan as asked; a string = why --scale is refused. */
+export function autoFit(o: {
+  exe: string;
+  st: Stream;
+  w: number;
+  h: number;
+  upscaleF: number;
+  scale: string | null;
+  hostArgs: string[] | null; // the model and the passes the host prices
+  ns: ArgNs;
+  resumeJson: string | null; // null = no resume
+  env: NodeJS.ProcessEnv;
+  say: Say;
+}): { plan: WorkPlan; sigNs: ArgNs } | string {
+  const base = workPlan(o.st, o.w, o.h, o.upscaleF, o.scale);
+  if (typeof base === 'string') return base;
+  const cands = autoCandidates(o.st, o.w, o.h, o.upscaleF);
+  if (
+    String(o.scale ?? '')
+      .trim()
+      .toLowerCase() !== 'auto' ||
+    !o.hostArgs ||
+    cands.length < 2
+  )
+    return { plan: base, sigNs: o.ns };
+  const lowered = (i: number, why: string) => ({
+    plan: { ...cands[i].plan, note: cands[i].plan.note.replace(/^DLSS mode \w+:/, `DLSS mode Auto (${why}):`) },
+    sigNs: { ...o.ns, work_fit: cands[i].mode },
+  });
+  if (o.resumeJson && fs.existsSync(o.resumeJson)) {
+    let sig: unknown = null;
+    try {
+      sig = JSON.parse(fs.readFileSync(o.resumeJson, 'utf8'))?.sig;
+    } catch {
+      sig = null;
+    }
+    if (sig === resumeSig(o.ns, o.env)) return { plan: base, sigNs: o.ns };
+    for (let i = 1; i < cands.length; i++)
+      if (sig === resumeSig({ ...o.ns, work_fit: cands[i].mode }, o.env))
+        return lowered(i, `${cands[i].mode}, as the partial render it resumes`);
+  }
+  const list = cands.map((c) => `${c.plan.workW}:${c.plan.workH}:${c.plan.w}:${c.plan.h}`).join(',');
+  const out = ['--out-w', String(base.outW), '--out-h', String(base.outH)];
+  const r = spawnSync(o.exe, ['--offline', ...o.hostArgs, ...out, '--fit-work', list], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 20000,
+    env: o.env,
+  });
+  const m = /OFFLINE FIT (\d+) (\d+) (\d+) (\d+)/.exec(r.stdout || '');
+  if (!m) {
+    o.say('offline Auto: the video memory fit did not answer, Auto keeps its own pick\n');
+    return { plan: base, sigNs: o.ns };
+  }
+  const i = Math.min(cands.length - 1, parseInt(m[1], 10));
+  if (i === 0) return { plan: base, sigNs: o.ns };
+  const room = parseInt(m[2], 10),
+    needI = parseInt(m[4], 10);
+  return lowered(
+    i,
+    `${cands[i].mode}; the free video memory fits it: ${cands[0].mode} needs about ${m[3]} MiB, ${room} MiB are free` +
+      (needI > room ? ', it does not fit at any mode: the render runs anyway' : ''),
+  );
+}
+
 /** One render: resolves to the exit code; throws RenderExit for sys.exit. `say` writes one stderr
  * text. */
 async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Promise<number> {
@@ -179,15 +261,6 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     HDR_SATBOOST = clamp(args.hdr_satboost, 0.0, 1.0);
 
   let { w: W, h: H, num, den, nb: NB, st: ST } = probe(FFPROBE, inp);
-  // W x H = the decode, WORK = the DLSS mode x the output (DLSS 5 and the model)
-  const plan = workPlan(ST, W, H, UPSCALE_F, args.work_scale);
-  if (typeof plan === 'string') throw new RenderExit(plan);
-  [W, H] = [plan.w, plan.h];
-  const [WORK_W, WORK_H] = [plan.workW, plan.workH];
-  UPSCALE = plan.outW !== W || plan.outH !== H;
-  UPSCALE_F = plan.outH / H;
-  const IMG_SCALE_VF = plan.vf;
-  say(plan.note);
   const vfr = vfrConform(ST, num, den);
   [num, den] = [vfr.num, vfr.den];
   const VFR_DEC = vfr.flags;
@@ -236,10 +309,8 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   let fragCopy = CODEC === 'vvc';
   const P = partsOf(WORK_PATH, ob, OUT_IS_MKV);
   const RESUMABLE = !env.SMV_NO_RESUME;
-  const sig = resumeSig(ns, env);
   const DEC_FMT = TEN_BIT ? 'rgb48le' : 'rgb24';
   const OUT_RAW_FMT = 'rgb48le';
-  const [OUT_W, OUT_H] = [plan.outW, plan.outH];
   if (DRBA_MODE && !FPS_MODE) ratio = args.multi;
   const totalPairs = NB ? Math.max(1, NB - 1) : 0;
   const totalUnits = NO_INTERP ? NB : totalPairs;
@@ -257,6 +328,46 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
             : DLSSG_MODE
               ? 'dlssg'
               : 'rife';
+  // W x H = the decode, WORK = the DLSS mode x the output (DLSS 5 and the model); on Auto the working size fits the
+  // free video memory (autoFit), a resumed render keeps the mode it was made with
+  const fitArgs =
+    kind === 'dlssg'
+      ? null
+      : [
+          '--multi',
+          String(Math.trunc(args.multi)),
+          ...(kind === 'rife' ? [] : [kind === 'echo' ? '--no-interp' : '--' + kind]),
+          ...(args.dlssnr
+            ? ['--dlssnr', '--nr-passes', String(Math.min(10, Math.max(1, Math.round(args.nr_passes ?? 1))))]
+            : []),
+          ...(RTX_HDR ? ['--rtx-hdr'] : []),
+          ...(RTX_VSR ? ['--rtx-vsr'] : []),
+          ...(args.restore ? ['--restore'] : []),
+          ...(args.no_gpu_fit ? ['--no-gpu-fit'] : []),
+        ];
+  const fit = autoFit({
+    exe: NATIVE_EXE,
+    st: ST,
+    w: W,
+    h: H,
+    upscaleF: UPSCALE_F,
+    scale: args.work_scale,
+    hostArgs: fitArgs,
+    ns,
+    resumeJson: RESUMABLE ? P.resumeJson : null,
+    env,
+    say,
+  });
+  if (typeof fit === 'string') throw new RenderExit(fit);
+  const plan = fit.plan;
+  [W, H] = [plan.w, plan.h];
+  const [WORK_W, WORK_H] = [plan.workW, plan.workH];
+  UPSCALE = plan.outW !== W || plan.outH !== H;
+  UPSCALE_F = plan.outH / H;
+  const IMG_SCALE_VF = plan.vf;
+  say(plan.note);
+  const sig = resumeSig(fit.sigNs, env);
+  const [OUT_W, OUT_H] = [plan.outW, plan.outH];
   if (kind === 'fruc') {
     const frdir = env.SMV_NVOFFRUC_DIR || path.join(ENGINE, 'nvoffruc');
     const miss = ['nvoffruc_bridge.dll', 'NvOFFRUC.dll', 'cudart64_110.dll'].filter(
@@ -499,6 +610,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   }
   if (SHARPEN > 0) nargs.push('--sharpen', pyG(SHARPEN));
   if (args.restore) nargs.push('--restore');
+  if (args.no_gpu_fit) nargs.push('--no-gpu-fit');
   // the working size: the host runs Restore and the resize to it on the decoded frame, DLSS 5 and
   // the model at it, then the final resize to the output (sent only when it changes something, so
   // an older host stays usable for a same-size render)

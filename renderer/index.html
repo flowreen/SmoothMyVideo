@@ -330,13 +330,20 @@
       <span class="k"></span>
       <span class="stepper" id="fpswrap" title="Target frames per second (steppers move by 1; type up to 3 decimals for an exact multiple of a fractional source rate)">
         <button type="button" id="fpsdn" tabindex="-1">−</button>
-        <input id="fpsin" type="number" min="1" max="2400" step="0.001" aria-label="target fps">
+        <input id="fpsin" type="number" min="1" max="10000" step="0.001" aria-label="target fps">
         <span class="mx">fps</span>
         <button type="button" id="fpsup" tabindex="-1">+</button>
       </span>
       <button type="button" class="roundbtn" id="fpsround" style="display:none">≈</button>
       <span class="hint" id="screenwrap">matching <span id="screenhz">?</span> Hz</span>
       <span class="hint" id="ratehint"></span>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="On (default): when the GPU or its video memory runs short, Live lowers the smoothing, down to the source's own rate with every effect still on, then (DLSS mode Auto) the working size, so every source frame is shown with little latency; a file render uses less video memory at a time. A file keeps its exact fps either way. Off: everything runs as set; Live may skip source frames and lag, and memory beyond the card spills into system memory, slowing the PC.">
+        <input type="checkbox" id="gpufit" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        Fit to the GPU
+      </label>
     </div>
   </div>
 
