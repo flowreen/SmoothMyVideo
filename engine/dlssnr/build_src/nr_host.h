@@ -61,28 +61,6 @@ const double kAfterBase = 128.0, kAfterMp = 96.0, kFrameMp = 20.0;
 // own memory before the chain exists prices the chain with these and the shares above.
 const double kPassBase = 147.0, kPassMp = 95.0;
 
-// Probe knobs. The snippet validates its caller and the exact rule is
-// unknown, so every plausible route is reachable without a rebuild.
-struct Variant
-{
-    // Route the NGX entry points through the caller shim (a DLL named nvngx.dll)
-    // so the return address lands inside it. false = call the driver core direct.
-    bool useShim = true;
-    // Where the shim is loaded from: 0 = beside the exe, 1 = <exe>\caller\nvngx.dll,
-    // 2 = beside the snippet DLL.
-    int shimLocation = 0;
-    // true = Init_ProjectID (the documented working route), false = Init_Ext.
-    bool initProjectId = true;
-    // Argument order of the Init_ProjectID export, unverifiable from the public
-    // headers: 0 = (.., device, featureInfo, version), 1 = (.., device, version, featureInfo).
-    int initArgOrder = 1; // 1 is the order that survives Init_ProjectID on 616.56 (order 0 faults inside the core)
-    // true = CreateFeature / EvaluateFeature / ReleaseFeature resolved from the NR
-    // snippet's OWN exports (it exports the whole NVSDK_NGX_D3D12_* API) after its
-    // own Init_Ext; false = through the driver core, whose feature table on 616.56
-    // refuses id 18 before touching any snippet (per the NGX log).
-    bool viaSnippet = true;
-};
-
 class Host
 {
   public:
@@ -96,7 +74,7 @@ class Host
     // writes its own nvngx.log in the module folder). adapter = the LUID of the adapter to create
     // the device on (the caller's CUDA device, so the zero-copy handoff shares one GPU), else the
     // first hardware adapter, which is not the NVIDIA one when another GPU drives the main display.
-    int startup(uint32_t w, uint32_t h, const Settings& s, const Variant& v, std::string& err, bool quietLog = false,
+    int startup(uint32_t w, uint32_t h, const Settings& s, std::string& err, bool quietLog = false,
                 const LUID* adapter = nullptr);
 
     // One frame in, one frame out. src and dst are w*h*8 bytes of RGBA16F.
@@ -164,24 +142,6 @@ class Host
         return m_passNote;
     }
 
-    // Last NGX result seen, for the probe table.
-    NVSDK_NGX_Result lastResult() const
-    {
-        return m_last;
-    }
-    const std::wstring& corePath() const
-    {
-        return m_corePath;
-    }
-    const std::wstring& snippetPath() const
-    {
-        return m_snippetPath;
-    }
-    const std::wstring& shimPath() const
-    {
-        return m_shimPath;
-    }
-
     void shutdown();
     void ngxShutdown(); // the NGX-only teardown, called under SEH by shutdown()
 
@@ -192,7 +152,7 @@ class Host
     void abandon();
 
   private:
-    bool resolveModules(const Variant& v, std::string& err);
+    bool resolveModules(std::string& err);
     bool createDevice(std::string& err);
     bool createCommandObjects(std::string& err);
     bool createResources(std::string& err);
@@ -212,12 +172,11 @@ class Host
 
     uint32_t m_w = 0, m_h = 0;
     Settings m_set;
-    Variant m_var;
 
     HMODULE m_core = nullptr;    // _nvngx.dll, the driver core
     HMODULE m_snippet = nullptr; // nvngx_dlssnr.dll, the NR layer
     HMODULE m_shim = nullptr;    // nvngx.dll, our caller shim
-    std::wstring m_corePath, m_snippetPath, m_shimPath;
+    std::wstring m_corePath, m_snippetPath;
 
     CP<ID3D12Device> m_dev;
     CP<ID3D12CommandQueue> m_queue;

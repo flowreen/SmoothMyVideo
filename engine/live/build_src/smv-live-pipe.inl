@@ -87,8 +87,9 @@ struct PipeServer
             // retains the primary context, which the helper binds on itself)
             bool thdrOk = true;
             std::thread thdrTh;
+            // (a capture resize of HDR planes needs it too: its SDR-view buffer and range flag)
             if (ok && (early->rtxHdr || early->vsrWant || early->sharpen > 0.0f || early->fitAa || early->uw > 0 ||
-                       early->restore))
+                       early->restore || (early->encPost && (early->w != early->cw || early->h != early->ch))))
                 thdrTh = std::thread([&] { thdrOk = nativeBindDevice(*early) && nativeRtxInit(*early); });
             ok = ok && nativeTrtInit(*early);
             if (thdrTh.joinable())
@@ -222,7 +223,6 @@ struct PipeServer
                 h12->hOutBuf = nullptr;
             }
             h12->outBuf.Reset();
-            h12->outBufBytes = 0;
             shmInBytes = shmSlot = 0;
             shmSlots = shmPitch = 0;
             return 1;

@@ -16,7 +16,7 @@
 // Driver core export prototypes, resolved by the host with GetProcAddress on
 // _nvngx.dll. The public NGX headers only declare the SDK side wrappers, so the
 // exported Init_ProjectID argument order cannot be checked at compile time; both
-// plausible orders are declared and the variant switch picks one.
+// plausible orders are declared and nr_host.cpp passes the one that works (kInitArgOrder).
 typedef NVSDK_NGX_Result (*PFN_NGX_InitProjectID_A)(const char* projectId, NVSDK_NGX_EngineType engineType,
                                                     const char* engineVersion, const wchar_t* dataPath,
                                                     ID3D12Device* device,
@@ -64,8 +64,6 @@ SMV_SHIM_API NVSDK_NGX_Result DLSSNR_CallShutdown(void* fn, ID3D12Device* device
 // Signatures of the shim exports, for GetProcAddress on the host side.
 typedef NVSDK_NGX_Result (*PFN_ShimInit)(void*, int, const char*, NVSDK_NGX_EngineType, const char*, const wchar_t*,
                                          ID3D12Device*, const NVSDK_NGX_FeatureCommonInfo*, NVSDK_NGX_Version);
-typedef NVSDK_NGX_Result (*PFN_ShimInitExt)(void*, unsigned long long, const wchar_t*, ID3D12Device*,
-                                            NVSDK_NGX_Version);
 typedef NVSDK_NGX_Result (*PFN_ShimAllocParams)(void*, NVSDK_NGX_Parameter**);
 typedef NVSDK_NGX_Result (*PFN_ShimCreate)(void*, ID3D12GraphicsCommandList*, int, NVSDK_NGX_Parameter*,
                                            NVSDK_NGX_Handle**);

@@ -1192,6 +1192,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             hud.create((g_fill ? cap.clientScreenX : host.posX) + 16, (g_fill ? cap.clientScreenY : host.posY) + 16);
 
         PipeServer srv;
+        double srcMeasFps = 0; // the source rate measured before the server spawns (0 = not measured)
         if (g_backend == BK_SERVER)
         {
             wchar_t exePath[MAX_PATH];
@@ -1279,6 +1280,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     base = 24.0;
                     LOG("source rate unmeasurable (static/paused?), assuming ~24 fps\n");
                 }
+                srcMeasFps = base;
                 // +1 slot of headroom: the pair clock jitters, so a pair occasionally holds
                 // one more grid point than the nominal ratio. Clamped ONLY by memory.
                 // The slot count is the HARD ceiling on the presented rate (a pair can
@@ -1327,11 +1329,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // it finished - which reads as "it never turned on" (while DLSS-G, no server, feels
             // instant). Load on a BACKGROUND thread and present the raw captured frames meanwhile,
             // so the overlay is visibly LIVE from the first second; it just isn't smoothed yet.
-            // The cross-group queue is the only consumer of the capture-release
-            // token. Decide here, before the spawn: the route's other conditions (shm,
-            // streaming) are answered by the same handshake, and an unused --caprel simply
-            // comes back as caprel=0.
-            g_capRel = g_backend == BK_SERVER && !host.useSL;
             std::atomic<int> srvRc{-1}; // -1 loading, 0 ready, 1 failed
             std::thread loader([&] {
                 srvRc.store(srv.start(script, g_serverBackend, spawnGen, capW, capH, cap.hTex, cap.hFence, &host) ? 1
@@ -1746,12 +1743,17 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // with a 1000fps floor). Sizing it from the rate we actually sustain spreads
                 // the group across the pair instead.
                 panelHzMode = (double)dm.dmDisplayFrequency;
-                // a target above the panel starts at the panel's rate until the throttle has timed a group: starting at
-                // 10000 asked GMFSS for the whole slot ladder a pair (213 tweens, seconds a group)
-                if (adaptTarget > panelHzMode && !g_noGpuFit)
+                // until the throttle has timed a group the target starts at one tween a pair (twice the source rate
+                // measured before the spawn), never above the panel's rate or the user's target: a start the GPU
+                // cannot afford fills the queue (the panel's rate = ~15 tweens a pair of 1440p RIFE, ~240 ms a group),
+                // and the drops while that backlog drains outlast the move's 2 s window and cut the budget for about a
+                // minute; 10000 asked GMFSS for the whole slot ladder a pair (213 tweens, seconds a group)
+                const double startT = srcMeasFps > 0 ? (std::min)(panelHzMode, 2.0 * srcMeasFps) : panelHzMode;
+                if (adaptTarget > startT && !g_noGpuFit)
                 {
-                    effTarget = panelHzMode;
+                    effTarget = startT;
                     gridStep = 1e7 / effTarget;
+                    LOG("throttle: starting at %.0f fps until a group is timed\n", effTarget);
                 }
                 refloor();
                 LOG("present pacing: floor %.3fms (panel mode %u Hz, target %.0f fps%s)\n", minSpaceMs,
@@ -1997,8 +1999,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     phOn = true;
             }
             // Cut escapes, one env lever each so every cut can be A/B'd on its own.
-            // SMV_LIVE_XQ_CAPEV: drive the capture probe from the frame pool's FrameArrived
-            //   flag instead of calling TryGetNextFrame on every iteration. The loop also WAKES
+            // SMV_LIVE_XQ_CAPEV (on by default, =0 = a probe every iteration): drive the capture probe from the
+            //   frame pool's FrameArrived flag instead of calling TryGetNextFrame on every iteration. The loop also WAKES
             //   on the arrival event, so a frame is drained as promptly as it was before (more
             //   promptly while slots are pending, see XQ_WAITCAP), and a hard 8ms safety net
             //   probes anyway so a lost event can never strand the session. Newest-wins drain
@@ -2011,7 +2013,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     return dflt;
                 return v[0] != L'0';
             };
-            const bool capEv = envOn(L"SMV_LIVE_XQ_CAPEV", false);
+            const bool capEv = envOn(L"SMV_LIVE_XQ_CAPEV", true);
             const bool waitCap = envOn(L"SMV_LIVE_XQ_WAITCAP", false);
             double lastProbeMs = 0;
             double phPump = 0, phDrain = 0, phPres = 0, phHouse = 0, phGate = 0, phProbe = 0, phSend = 0, phHold = 0,
@@ -2448,11 +2450,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (!gateC)
                     gateCDefer++;
                 // XQ_CAPEV: skip the TryGetNextFrame call unless the pool signalled an arrival
-                // (or the 8ms safety net is due). The flag is cleared only when the probe
-                // actually runs, so an arrival that lands while the gates are shut is drained
-                // as soon as they open, exactly as before.
-                bool wantProbe = true;
-                if (capEv)
+                // (or the 8ms safety net is due). The flag is read and cleared only while the gates
+                // are open, so an arrival that lands while they are shut is drained as soon as they
+                // open, exactly as with the probe on every iteration.
+                bool wantProbe = gateA && !halfBusy && gateB && gateC;
+                if (capEv && wantProbe)
                 {
                     const double tp = nowMs();
                     wantProbe = InterlockedExchange(&cap.arrived, 0) != 0 || lastProbeMs == 0 || tp - lastProbeMs > 8.0;
@@ -2460,7 +2462,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         lastProbeMs = tp;
                 }
                 phEnd(phGate);
-                if (gateA && !halfBusy && gateB && gateC && wantProbe)
+                if (wantProbe)
                 {
                     const int g2 = gpuCap ? cap.latestFrameGpu() : cap.latestFrame(buf.data());
                     phProbeN++;

@@ -113,7 +113,6 @@ static std::wstring g_modelLabel;    // user-facing model name for the loading m
                                      // falls back to the raw backend name when absent)
 static std::wstring g_modelNote;     // substitution note appended to the loading log line
                                      // (e.g. Smooth Motion having no live mode runs GMFSS)
-static bool g_capRel = false;        // request the capture-release token (xq route)
 static bool g_offline = false;       // --offline render mode (stdin frames in, stdout out)
 static bool g_offlineGraph = false;  // SMV_OFFLINE_GRAPH=1
 // IDENTICAL-PAIR PASSTHROUGH: two BYTE IDENTICAL frames in a row have no motion
@@ -720,7 +719,7 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 
 // ---- offline render through this host --------------------------------------------------------
 // smv-live.exe --offline --w W --h H --multi N [--frames T] [--pixfmt rgb48le|rgb24]
-//               [--python p] [--script s] [--progress-every K] [--pause-file P]
+//               [--script s] [--pause-file P]
 //               [--ifnet E --encode E --jit J --ph N --pw N --batch B]
 //               [--nvof | --no-interp | --gmfss | --drba | --fruc] [--cache DIR] (--no-interp = no model, --multi ignored)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
@@ -732,6 +731,8 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 // in (bit exact); the N-1 tweens of every pair run pack-in, Head encode, batched IFNet, pack-out and
 // a pinned download on the compute stream. stderr carries the log plus the PROGRESS k/total and
 // OUTFRAMES n lines src/render forwards to the GUI.
+static const uint64_t kProgressEvery = 10; // the offline host logs a PROGRESS line every 10 pairs
+
 struct OfflineIo
 {
     size_t frameBytes = 0, frameBytesOut = 0;
@@ -751,7 +752,6 @@ struct OfflineIo
     std::condition_variable cv;
     bool readerEof = false, fail = false;
     uint64_t framesIn = 0, framesOut = 0, totalFrames = 0, lastPairs = 0;
-    int progressEvery = 10;
     int multi = 2;
     bool frameUnits = false; // --no-interp: PROGRESS counts frames over --frames (render.py's NB)
     double fpsRatio = 0.0;   // --fps mode: pairs close on render.py's _pair_fracs grid, not per multi
@@ -1003,17 +1003,16 @@ static void offlineWriter(OfflineIo* io)
         {
             const uint64_t outN = io->outBase + io->framesOut;
             uint64_t pairs = io->frameUnits ? outN : (outN ? (outN - 1) / (uint64_t)io->multi : 0);
-            bool due = pairs % (uint64_t)(io->progressEvery > 0 ? io->progressEvery : 1) == 0;
+            bool due = pairs % kProgressEvery == 0;
             if (io->fpsRatio > 0.0)
             {
                 while ((!total || io->fpsPairs < total) &&
                        (uint64_t)std::ceil((double)(io->fpsPairs + 1) * io->fpsRatio - 0.5) <= outN)
                     io->fpsPairs++;
                 pairs = io->fpsPairs;
-                due = io->progressEvery > 0 &&
-                      pairs / (uint64_t)io->progressEvery != io->lastPairs / (uint64_t)io->progressEvery;
+                due = pairs / kProgressEvery != io->lastPairs / kProgressEvery;
             }
-            if (pairs && pairs != io->lastPairs && io->progressEvery > 0 && due)
+            if (pairs && pairs != io->lastPairs && due)
                 LOG("PROGRESS %llu/%llu\n", (unsigned long long)pairs, (unsigned long long)(total ? total : pairs));
             io->lastPairs = pairs;
         }
@@ -1276,7 +1275,6 @@ struct OfflineArgs
     uint64_t frames = 0;
     bool fmt16 = true; // input pipe format (render.py's DEC_FMT)
     int out16 = -1;    // output pipe format, -1 = same as input
-    int progressEvery = 10;
     std::wstring ifnetW, encodeW, jitW, pauseFile;
     int phArg = 0, pwArg = 0, batchArg = 0;
     bool resident = false;             // --resident: stay alive between renders (offlineResidentMain)
@@ -1324,8 +1322,6 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.multi = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--frames") == 0 && i + 1 < argc)
             oa.frames = (uint64_t)_wtoi64(argv[++i]);
-        else if (wcscmp(argv[i], L"--progress-every") == 0 && i + 1 < argc)
-            oa.progressEvery = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--pixfmt") == 0 && i + 1 < argc)
         {
             ++i;
@@ -1354,12 +1350,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
                 return 1;
             }
         }
-        else if (wcscmp(argv[i], L"--python") == 0 && i + 1 < argc)
-            ++i; // accepted and ignored: no python process is ever started
         else if (wcscmp(argv[i], L"--script") == 0 && i + 1 < argc)
             g_script = argv[++i];
-        else if (wcscmp(argv[i], L"--scale") == 0 && i + 1 < argc)
-            g_flowScale = _wtof(argv[++i]);
         // engine paths handed over (the harnesses; render.py lets the host find or build them)
         else if (wcscmp(argv[i], L"--ifnet") == 0 && i + 1 < argc)
             oa.ifnetW = argv[++i];
@@ -1515,7 +1507,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
 // decode (a working size below the source is folded into the decode). The candidates come in order, Auto's pick
 // first, each a working size and the decode it needs. The price per model, in MiB (the process's own memory over x2
 // renders at 854x480 and 1920x1080 with the working size at the decode, a quarter on top): RIFE and Frame Blend
-// nativeOfflineRifeMiB (the IFNet at the decode), DRBA 310 + 1028 a padded megapixel, GMFSS 462 + 2446, Smooth Motion
+// nativeOfflineRifeMiB (the IFNet at the decode), DRBA 310 + 1034 a padded megapixel (1028 measured with the tween
+// stored in fp16, + 6 for its fp32 store), GMFSS 462 + 2446, Smooth Motion
 // 461 + 182, NVIDIA Optical Flow 233 + 179, no interpolation 225 + 41; the output's buffers beyond the working size, 25
 // a megapixel (1920x1080 and 3840x2160 outputs of a 960x540 render); the passes around the model
 // (nativeOfflineEffectsMiB). Prints `OFFLINE FIT i ROOM NEED0 NEEDi` in MiB: the first candidate that fits
@@ -1559,7 +1552,7 @@ static int offlineFitWork(const OfflineArgs& oa)
         else if (oa.echo)
             model = 225.0 + 41.0 * work;
         else if (oa.drba)
-            model = 310.0 + 1028.0 * (std::max)(work, two ? padMp64(k.dw, k.dh) : work);
+            model = 310.0 + 1034.0 * (std::max)(work, two ? padMp64(k.dw, k.dh) : work);
         else
             model = nativeOfflineRifeMiB(two ? k.dw : k.ww, two ? k.dh : k.wh, k.ww, k.wh);
         const int ow = oa.outW ? oa.outW : k.ww, oh = oa.outH ? oa.outH : k.wh;
@@ -1652,7 +1645,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     const uint64_t frames = oa.frames;
     const bool fmt16 = oa.fmt16;
     const int out16 = oa.out16;
-    const int progressEvery = oa.progressEvery;
     const std::wstring& ifnetW = oa.ifnetW;
     const std::wstring& encodeW = oa.encodeW;
     const std::wstring& jitW = oa.jitW;
@@ -1662,8 +1654,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     g_hdr = false;
     W = (uint32_t)w;
     H = (uint32_t)h;
-    if (g_flowScale < 0.01 || g_flowScale > 1.0)
-        g_flowScale = 1.0;
 
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
@@ -1739,7 +1729,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // enqueue, its own DRM timestep map) plus the block0 flow engine, at the same frame
         const bool two = lkEnv("SMV_RIFE_TWO_DOMAIN") != "0";
         if (!lkOfflineRife(script, two ? srcW : w, two ? srcH : h, oa.drba ? 2 : multi, oe,
-                           nativeOfflineNeed(two ? srcW : w, two ? srcH : h, w, h, srcW, srcH)))
+                           nativeOfflineNeed(two ? srcW : w, two ? srcH : h, w, h, srcW, srcH), w, h))
             return 2;
         if (oa.drba)
         {
@@ -2032,13 +2022,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         const bool staged = !oa.nrDeltaW.empty() || (GetEnvironmentVariableW(L"SMV_NR_STAGED", sg, 8) && sg[0] == L'1');
         set.motion = !staged && !(GetEnvironmentVariableW(L"SMV_NR_MV", mvv, 8) && mvv[0] == L'0');
         const bool autoMask = !(GetEnvironmentVariableW(L"SMV_NR_AUTOMASK", amv, 8) && amv[0] == L'0');
-        nr::Variant var;
         std::string err;
         g_nrAttempted = true;
         nr::Host* host = new nr::Host();
         LUID cudaLuid{}; // the core's device on the CUDA GPU's adapter, whatever GPU drives the display
         const bool haveLuid = nativeCudaLuid(cudaLuid);
-        const int nrc = host->startup((uint32_t)w, (uint32_t)h, set, var, err, true, haveLuid ? &cudaLuid : nullptr);
+        const int nrc = host->startup((uint32_t)w, (uint32_t)h, set, err, true, haveLuid ? &cudaLuid : nullptr);
         if (nrc != 0)
         {
             LOG("[dlss5] unavailable, skipping: %s (exit %d)\n", err.c_str(), nrc);
@@ -2121,7 +2110,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     io.nIn = 4;
     io.nOut = (batchMax < 8 ? batchMax : 8) + 2;
     io.totalFrames = frames;
-    io.progressEvery = progressEvery;
     io.multi = multi;
     io.frameUnits = oa.echo;
     io.fpsRatio = fpsMode ? ratio : 0.0;
@@ -2331,8 +2319,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                               0, (CUstream)nr.stream, a, nullptr) == CUDA_SUCCESS;
     };
     // pair (drFid - 2, drFid - 1); tailPlain = its f >= 0.5 as plain pair RIFE (the EOF window).
-    // --fps: the pair's _pair_fracs (0-based pair drFid - 3); a slot at f = 0 is python's t == 1
-    // (inference_ts_drba, or the head window's inference at t - 1 = 0): the pair's left frame
+    // --fps: the pair's _pair_fracs (0-based pair drFid - 3); a slot at f = 0 is DRBA's t == 1
+    // (the window's centre frame, or the head window's t - 1 = 0): the pair's left frame
     auto drPair = [&](bool held, bool tailPlain) -> bool {
         const int nHist = nr.drFid >= 4 ? 4 : (int)nr.drFid;
         int heldSide = -1; // the side whose held frame sits in dHeldOut
@@ -2603,10 +2591,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             }
             int dps = (int)mplane, mode = oa.srcHdr;
             float white = 203.0f / 80.0f; // BT.2408's reference white in scRGB units
-            float knee = kMotionKnee, head = kMotionHead;
+            float knee = kMotionPqKnee, cap = kMotionPqCap;
             uint16_t* mdst = nr.drba ? drbaMotionNext(nr) : nr.dM + 3 * mplane;
             void* a[] = {(void*)&msrc, &sps,    &srs,    &sw,   &sh,    &mdst, &dps,
-                         &nr.mpw,      &nr.mpw, &nr.mph, &mode, &white, &knee, &head};
+                         &nr.mpw,      &nr.mpw, &nr.mph, &mode, &white, &knee, &cap};
             return cuLaunchKernel(nr.fMotionIn, (nr.mpw + 15) / 16, (nr.mph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st,
                                   a, nullptr) == CUDA_SUCCESS;
         };
@@ -2643,7 +2631,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 failed = true;
                 break;
             }
-            // fp16 frames (ONNX rev 4): the new frame into the fp16 copy's cur half, read by an
+            // fp16 frames: the new frame into the fp16 copy's cur half, read by an
             // fp16-x IFNet and / or an fp16-img encode; RIFE's two domains: the motion frame
             uint16_t* cur16 = nr.mph ? nr.dM + 3 * mplane : nr.dXh + 3 * plane;
             if (!nr.mph && (nr.xHalf || nr.imgHalf) && !nativeF2h(nr, dCur, cur16, 3 * plane, st))
@@ -2653,7 +2641,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 break;
             }
             nr.ctxEnc->setTensorAddress("img", nr.imgHalf ? (void*)cur16 : (void*)dCur);
-            // fp16 features (ONNX rev 3): the encode writes dF directly, no widen pass
+            // fp16 features: the encode writes dF directly, no widen pass
             const bool widen = nr.encHalf && !nr.featHalf;
             void* encOut = widen ? (void*)nr.dEncHalf : (void*)nr.dF[nr.fCur];
             nr.ctxEnc->setTensorAddress("feat", encOut);
@@ -2997,7 +2985,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         {
             // the N-1 interior tweens at k/N, in chunks of at most batchMax through the batched
             // engine; --fps: the pair's slots one per enqueue, and a slot at t <= 0 is the left
-            // frame itself with no engine call (rife_backend.inference returns a)
+            // frame itself with no engine call (RIFE's t <= 0 rule)
             const int bm = fpsMode ? 1 : batchMax;
             for (int base = 0; base < nT && !failed; base += bm)
             {
@@ -3494,7 +3482,6 @@ static void resetSessionGlobals()
     g_serverBackend.clear();
     g_modelLabel.clear();
     g_modelNote.clear();
-    g_capRel = false;
     g_script.clear();
     g_flowScale = 1.0;
     g_dlssMode = 0;
@@ -3569,9 +3556,6 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             la.clickthrough = false;
         else if (wcscmp(argv[i], L"--park") == 0)
             la.park = true;
-        else if (wcscmp(argv[i], L"--native") == 0)
-        {
-        } // accepted and ignored: the native host is the only route
         else if (wcscmp(argv[i], L"--resident") == 0)
             g_resident = true;
         else if (wcscmp(argv[i], L"--no-hud") == 0)
@@ -3603,8 +3587,6 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
                 g_serverBackend = argv[i];
             } // resolved by live_server.py
         }
-        else if (wcscmp(argv[i], L"--python") == 0 && i + 1 < argc)
-            ++i; // accepted and ignored: no python process is ever started
         else if (wcscmp(argv[i], L"--script") == 0 && i + 1 < argc)
             g_script = argv[++i];
         else if (wcscmp(argv[i], L"--label") == 0 && i + 1 < argc)
@@ -3906,7 +3888,7 @@ static int residentMain(LiveArgs first)
 
 // ---------------------------------------------------------------- resident offline host
 //
-// smv-live.exe --offline --resident --pipe NAME [--script s --python p]: the offline render host
+// smv-live.exe --offline --resident --pipe NAME [--script s]: the offline render host
 // stays alive between queue items with the TensorRT runtime, the engines, the JIT cache and the
 // kernel module loaded (g_res, the live resident host's cache), so a later render of the same
 // size and multiplier pays only the execution contexts instead of the process start plus the
@@ -4037,8 +4019,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             std::vector<wchar_t*> av;
             for (auto& t : toks)
                 av.push_back(&t[0]);
-            g_flowScale = 1.0; // the globals an item's flags may set, which must not carry over
-            g_dlssMode = 0;
+            g_dlssMode = 0; // the globals an item's flags may set, which must not carry over
             g_sharpen = 0.0;
             g_rtxVsr = false;
             g_restore = false;

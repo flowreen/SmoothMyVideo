@@ -47,12 +47,12 @@ def main():
     with torch.inference_mode():
         f0, f1 = net.encode(a).float(), net.encode(b).float()
     ts = torch.cat([x[:, :1] * 0 + t for t in (0.25, 0.5, 0.75)], 0)
-    e = tr.RifeIFNetBatchEngine(net, sl, rh, 8)
+    e = tr.RifeIFNetBatchEngine(sl, rh, 8)
     ensure(e, tr._RifeIFNetBatchExport(net, sl), (x, ts, f0, f1))
     e = tr.RifeEncodeEngine(rh)
     ensure(e, tr._RifeEncodeExport(net.encode), (a,))
     # the unbatched class: the `.nofit` fallback and the offline single-tween calls
-    e = tr.RifeIFNetEngine(net, sl, rh)
+    e = tr.RifeIFNetEngine(sl, rh)
     ensure(e, tr._RifeIFNetExport(net, sl), (x, x[:, :1] * 0 + 0.5, f0, f1))
     e = tr.RifeBlock0Engine(float(sl[0]), rh)
     ensure(e, tr._RifeBlock0Export(net.block0, float(sl[0])), (a, b, f0, f1))

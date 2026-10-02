@@ -144,6 +144,12 @@ public:
     // at the output resolution. VSR: 8-bit RGBA in (inputRect) -> 8-bit RGBA out (outputRect).
     // TrueHDR: 8-bit RGBA in -> packed 10:10:10:2 out, both at the same (output) rect.
     API_BOOL evaluate_vsr_deviceptr(void* cuDeviceptr_Input, void* cuDeviceptr_Output, API_RECT inputRect, API_RECT outputRect, API_VSR_Setting* pVSRSetting);
+    // The same VSR eval without blocking the calling thread: the copies run asynchronously on the feature's stream,
+    // ordered against the caller's stream by two events (the caller's work before the call, then the caller's stream
+    // waits for the output copy), so the caller keeps enqueuing while VSR runs.
+    API_BOOL evaluate_vsr_deviceptr_async(void* cuDeviceptr_Input, void* cuDeviceptr_Output, API_RECT inputRect, API_RECT outputRect, API_VSR_Setting* pVSRSetting, void* cuStream_Caller);
+    CUevent                     m_vsrEvIn                   = nullptr;
+    CUevent                     m_vsrEvOut                  = nullptr;
     API_BOOL evaluate_thdr_deviceptr(void* cuDeviceptr_Input, void* cuDeviceptr_Output, API_RECT inputRect, API_RECT outputRect, API_THDR_Setting* pTHDRSetting);
     void shutdown();
 };
@@ -570,6 +576,52 @@ API_BOOL cuda_api_impl::evaluate_vsr_deviceptr(void* cuDeviceptr_Input, void* cu
     return res;
 }
 
+API_BOOL cuda_api_impl::evaluate_vsr_deviceptr_async(void* cuDeviceptr_Input, void* cuDeviceptr_Output, API_RECT inputRect, API_RECT outputRect, API_VSR_Setting* pVSRSetting, void* cuStream_Caller)
+{
+    if (!m_VSRFeature) return API_BOOL_FAIL;
+    const CUstream caller = (CUstream)cuStream_Caller;
+    // a size change reallocates the persistent arrays: drain the copies still in flight on them first
+    if (m_vsrSrcArr && ((size_t)inputRect.right != m_vsrSrcW || (size_t)inputRect.bottom != m_vsrSrcH ||
+                        (size_t)outputRect.right != m_vsrDstW || (size_t)outputRect.bottom != m_vsrDstH))
+        CUDADRV_CHECK(cuStreamSynchronize(nullptr));
+    ensure_src_tex(m_vsrSrcArr, m_vsrSrcTex, m_vsrSrcW, m_vsrSrcH, inputRect.right, inputRect.bottom);
+    ensure_dst_surf(m_vsrDstArr, m_vsrDstSurf, m_vsrDstW, m_vsrDstH, outputRect.right, outputRect.bottom,
+                    CU_AD_FORMAT_UNSIGNED_INT8);
+    if (!m_vsrEvIn) CUDADRV_CHECK(cuEventCreate(&m_vsrEvIn, CU_EVENT_DISABLE_TIMING));
+    if (!m_vsrEvOut) CUDADRV_CHECK(cuEventCreate(&m_vsrEvOut, CU_EVENT_DISABLE_TIMING));
+    CUDADRV_CHECK(cuEventRecord(m_vsrEvIn, caller));
+    CUDADRV_CHECK(cuStreamWaitEvent(nullptr, m_vsrEvIn, 0));
+    {
+        CUDA_MEMCPY2D copyParam = {};
+        copyParam.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+        copyParam.dstArray      = m_vsrSrcArr;
+        copyParam.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copyParam.srcDevice     = (CUdeviceptr)cuDeviceptr_Input;
+        copyParam.srcPitch      = m_vsrSrcW * 4;
+        copyParam.WidthInBytes  = m_vsrSrcW * 4;
+        copyParam.Height        = m_vsrSrcH;
+        CUDADRV_CHECK(cuMemcpy2DAsync(&copyParam, nullptr));
+    }
+    API_THDR_Setting dummyTHDR = { 100, 100, 50, 1000 };
+    API_BOOL res = evaluate((uint64_t)m_vsrSrcTex, (uint64_t)m_vsrDstSurf, inputRect, outputRect,
+                            pVSRSetting, &dummyTHDR, true, false);
+    if (res == API_BOOL_SUCCESS)
+    {
+        CUDA_MEMCPY2D copyParam = {};
+        copyParam.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        copyParam.dstDevice     = (CUdeviceptr)cuDeviceptr_Output;
+        copyParam.dstPitch      = m_vsrDstW * 4;
+        copyParam.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+        copyParam.srcArray      = m_vsrDstArr;
+        copyParam.WidthInBytes  = m_vsrDstW * 4;
+        copyParam.Height        = m_vsrDstH;
+        CUDADRV_CHECK(cuMemcpy2DAsync(&copyParam, nullptr));
+    }
+    CUDADRV_CHECK(cuEventRecord(m_vsrEvOut, nullptr));
+    CUDADRV_CHECK(cuStreamWaitEvent(caller, m_vsrEvOut, 0));
+    return res;
+}
+
 // TrueHDR-only deviceptr eval: 8-bit RGBA in -> packed 10:10:10:2 out, both at (outputRect == inputRect).
 API_BOOL cuda_api_impl::evaluate_thdr_deviceptr(void* cuDeviceptr_Input, void* cuDeviceptr_Output, API_RECT inputRect, API_RECT outputRect, API_THDR_Setting* pTHDRSetting)
 {
@@ -617,6 +669,10 @@ void cuda_api_impl::shutdown()
     {
         CHECK_NGX(NVSDK_NGX_CUDA_ReleaseFeature(m_VSRFeature));
     }
+    if (m_vsrEvIn)
+        CUDADRV_CHECK(cuEventDestroy(m_vsrEvIn));
+    if (m_vsrEvOut)
+        CUDADRV_CHECK(cuEventDestroy(m_vsrEvOut));
     if (m_cuContext)
     {
         CUDADRV_CHECK(cuDevicePrimaryCtxRelease(m_cuDevice));
@@ -706,6 +762,15 @@ extern "C" API_BOOL rtx_video_api_cuda_evaluate_vsr_deviceptr(void* cuDeviceptr_
 {
     if (!p_cuda_api_impl) return API_BOOL_FAIL;
     return p_cuda_api_impl->evaluate_vsr_deviceptr(cuDeviceptr_Input, cuDeviceptr_Output, inputRect, outputRect, pVSRSetting);
+}
+
+#if !defined(_WIN32)
+__attribute__((visibility("default")))
+#endif
+extern "C" API_BOOL rtx_video_api_cuda_evaluate_vsr_deviceptr_async(void* cuDeviceptr_Input, void* cuDeviceptr_Output, API_RECT inputRect, API_RECT outputRect, API_VSR_Setting* pVSRSetting, void* cuStream_Caller)
+{
+    if (!p_cuda_api_impl) return API_BOOL_FAIL;
+    return p_cuda_api_impl->evaluate_vsr_deviceptr_async(cuDeviceptr_Input, cuDeviceptr_Output, inputRect, outputRect, pVSRSetting, cuStream_Caller);
 }
 
 #if !defined(_WIN32)

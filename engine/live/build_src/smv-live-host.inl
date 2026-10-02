@@ -176,7 +176,7 @@ struct Host
     ComPtr<ID3D12Resource> texMvec;
     ComPtr<ID3D12Resource> uploadBuf;
     UINT rowPitch = 0;
-    // Ring of 3 allocators so shm-heap presents can be PIPELINED (recorded while earlier
+    // Ring of 3 allocators so the slot-buffer presents can be PIPELINED (recorded while earlier
     // presents still execute); allocFence[i] gates reuse of allocs[i]. alloc stays an alias
     // of allocs[0] for the fully-synchronous init-time uploads.
     ComPtr<ID3D12CommandAllocator> allocs[3];
@@ -207,18 +207,10 @@ struct Host
     // Frame/swapchain pixel format. Server/identity routes run BGRA end-to-end (WGC's native
     // order, no CPU swizzle anywhere); the DLSS-G route keeps its verified RGBA pipeline.
     DXGI_FORMAT texFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-    // Direct-present path: the server's shared-memory mapping opened as a D3D12 heap, so
-    // CopyTextureRegion reads output slots straight from shared memory (no upload memcpy).
-    ComPtr<ID3D12Heap> shmHeap;
-    ComPtr<ID3D12Resource> shmBuf;
-    // Faster direct-present path: a SHARED committed buffer in VRAM the server
-    // imports as CUDA external memory and writes output slots into (same layout as the shm
-    // out-region, minus the in-region offset). The shm route crosses PCIe twice per
-    // presented frame (server D2H, then the copy engine pulls host memory back); this one
-    // never leaves the GPU. shm remains the fallback whenever the server declines the import.
+    // Direct-present path: a SHARED committed buffer in VRAM the server imports as CUDA external
+    // memory and writes output slots into, so a presented frame never leaves the GPU.
     ComPtr<ID3D12Resource> outBuf;
     HANDLE hOutBuf = nullptr; // inheritable NT handle value (rides the cmdline)
-    uint64_t outBufBytes = 0;
     // Per-present cost instrumentation (read + reset by run()'s 2s stats tick): wall ms
     // inside presentTail, split into the allocator-fence backpressure wait and the DXGI
     // Present call itself. Isolates the HDR high-gen capture starve (presents saturating
@@ -314,35 +306,6 @@ struct Host
         if (FAILED(device->CreateSharedHandle(outBuf.Get(), &sa, GENERIC_ALL, nullptr, &hOutBuf)))
         {
             outBuf.Reset();
-            return false;
-        }
-        outBufBytes = bytes;
-        return true;
-    }
-
-    bool attachShm(uint8_t* base, size_t total)
-    {
-        D3D12_FEATURE_DATA_EXISTING_HEAPS eh{};
-        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &eh, sizeof(eh))) || !eh.Supported)
-            return false;
-        ComPtr<ID3D12Device3> dev3;
-        if (FAILED(device.As(&dev3)))
-            return false;
-        if (FAILED(dev3->OpenExistingHeapFromAddress(base, IID_PPV_ARGS(&shmHeap))))
-            return false;
-        D3D12_RESOURCE_DESC bd{};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = total;
-        bd.Height = 1;
-        bd.DepthOrArraySize = 1;
-        bd.MipLevels = 1;
-        bd.SampleDesc = {1, 0};
-        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER; // required for existing-heap buffers
-        if (FAILED(device->CreatePlacedResource(shmHeap.Get(), 0, &bd, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
-                                                IID_PPV_ARGS(&shmBuf))))
-        {
-            shmHeap.Reset();
             return false;
         }
         return true;
@@ -652,16 +615,6 @@ struct Host
         return presentTail(uploadBuf.Get(), 0, rowPitch);
     }
 
-    // GPU path: present an output slot DIRECTLY from the shared-memory heap - the copy engine
-    // reads the slot over PCIe, no CPU touch. These presents are PIPELINED (up to 3 in
-    // flight); the caller drains with waitQueue() once per GROUP before reading the reply,
-    // which also closes the cross-group slot-overwrite window (the server never rewrites a
-    // double-buffer half until one full group later).
-    bool presentShm(UINT64 offset, UINT pitch)
-    {
-        return presentTail(shmBuf.Get(), offset, pitch);
-    }
-
     bool presentTail(ID3D12Resource* src, UINT64 srcOffset, UINT srcPitch)
     {
         const int64_t t0 = nowQpc100();
@@ -675,11 +628,10 @@ struct Host
     {
         pumpMessages();
 
-        // Pipelining applies ONLY to slot-buffer sources (shm heap or shared VRAM buffer):
-        // the slot memory is stable until the next group. The CPU path reuses uploadBuf
-        // immediately after returning and the SL route owns its own pacing, so both stay
-        // fully synchronous.
-        const bool pipelined = !useSL && ((shmBuf && src == shmBuf.Get()) || (outBuf && src == outBuf.Get()));
+        // Pipelining applies ONLY to the shared VRAM slot buffer: the slot memory is stable until
+        // the next group. The CPU path reuses uploadBuf immediately after returning and the SL
+        // route owns its own pacing, so both stay fully synchronous.
+        const bool pipelined = !useSL && outBuf && src == outBuf.Get();
         const UINT ai = allocIdx;
         allocIdx = (allocIdx + 1) % 3;
         if (allocFence[ai] && fence->GetCompletedValue() < allocFence[ai])

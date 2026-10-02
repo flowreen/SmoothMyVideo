@@ -5,7 +5,7 @@
 // or an argv; the ones that talk while they work take its `say` / `fatal` callables. The DV and
 // HDR10+ exports and the resume concat / cleanup arrive as callables in the
 // Finalize record. Child processes run synchronously with no console window, as in python.
-import { spawnSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import { injectHdr10 } from './hdr10meta';
@@ -106,8 +106,8 @@ export function decodeCmd(ffmpeg: string, inp: string, vfrDec: string[], filters
 }
 
 // --- the encoder ------------------------------------------------------------------------------
-/** Real availability check: open the encoder on one black frame of `size`. */
-export function encWorks(ffmpeg: string, name: string, size = '256x256', fast = false): boolean {
+/** encWorks's ffmpeg arguments: one black frame of `size` through the encoder into the null muxer. */
+function encWorksArgs(name: string, size: string, fast: boolean): string[] {
   const args = [
     '-hide_banner',
     '-v',
@@ -124,12 +124,42 @@ export function encWorks(ffmpeg: string, name: string, size = '256x256', fast = 
     if (name === 'libsvtav1') args.push('-preset', '12');
     else if (name === 'libvvenc') args.push('-preset', 'faster');
   }
+  return args.concat(['-c:v', name, '-f', 'null', '-']);
+}
+
+/** Real availability check: open the encoder on one black frame of `size`. */
+export function encWorks(ffmpeg: string, name: string, size = '256x256', fast = false): boolean {
   try {
-    const r = spawnSync(ffmpeg, args.concat(['-c:v', name, '-f', 'null', '-']), { windowsHide: true, stdio: 'ignore' });
+    const r = spawnSync(ffmpeg, encWorksArgs(name, size, fast), { windowsHide: true, stdio: 'ignore' });
     return !r.error && r.status === 0;
   } catch {
     return false;
   }
+}
+
+/** encWorks at the default size, started now and answered when its ffmpeg exits: the route starts it before
+ * the probes, so the check's ~0.2 s runs beside them instead of after. */
+export function encWorksAsync(ffmpeg: string, name: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn(ffmpeg, encWorksArgs(name, '256x256', false), { windowsHide: true, stdio: 'ignore' });
+      p.once('error', () => resolve(false));
+      p.once('exit', (code) => resolve(code === 0));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/** chooseEncoder's `works` with one answer known: `name` at the default size and mode returns `ok`, every
+ * other check runs encWorks. */
+export function presetWorks(name: string, ok: boolean): typeof encWorks {
+  return (ffmpeg, n, size, fast) => (n === name && size === undefined && !fast ? ok : encWorks(ffmpeg, n, size, fast));
+}
+
+/** The encoder a codec asks for first (chooseEncoder's start, before the size and availability fallbacks). */
+export function codecEncoder(codec: string): string {
+  return ({ av1: 'av1_nvenc', vvc: 'libvvenc' } as Record<string, string>)[codec] ?? 'hevc_nvenc';
 }
 
 /** Available physical RAM in GB (libuv reads GlobalMemoryStatusEx ullAvailPhys, as python did). */
@@ -156,7 +186,7 @@ export function chooseEncoder(
   works: typeof encWorks = encWorks,
   ram: typeof availRamGb = availRamGb,
 ): [string, boolean] {
-  let venc = ({ av1: 'av1_nvenc', vvc: 'libvvenc' } as Record<string, string>)[codec] ?? 'hevc_nvenc';
+  let venc = codecEncoder(codec);
   if (outW > NVENC_MAX || outH > NVENC_MAX) {
     const order = codec === 'vvc' || outW * outH > 90_000_000 ? ['libvvenc', 'libsvtav1'] : ['libsvtav1', 'libvvenc'];
     say(

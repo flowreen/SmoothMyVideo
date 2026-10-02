@@ -358,54 +358,6 @@ const fileExists = (p: string) => {
   }
 };
 
-// A directory "has the runtime" when both feature DLLs sit in it. The SDK keeps them under
-// bin/Windows/x64/rel, so probe the dir itself, that subpath, and one level of child dirs.
-function findFeatureDllDir(root: string): string | null {
-  if (!root) return null;
-  const rel = path.join('bin', 'Windows', 'x64', 'rel');
-  const hasBoth = (d: string) => RTX_FEATURE_DLLS.every((n) => fileExists(path.join(d, n)));
-  const seeds = [root, path.join(root, rel)];
-  try {
-    for (const e of fs.readdirSync(root, { withFileTypes: true }))
-      if (e.isDirectory()) seeds.push(path.join(root, e.name), path.join(root, e.name, rel));
-  } catch {
-    /* unreadable root */
-  }
-  return seeds.find(hasBoth) || null;
-}
-
-// Look in the usual download spots for an extracted SDK folder or a recognizable SDK .zip.
-function scanForSdk(): { folder: string | null; zip: string | null } {
-  const roots: string[] = [];
-  for (const k of ['downloads', 'desktop', 'home'] as const) {
-    try {
-      roots.push(app.getPath(k));
-    } catch {
-      /* none */
-    }
-  }
-  let folder: string | null = null;
-  for (const r of roots) {
-    folder = findFeatureDllDir(r);
-    if (folder) break;
-  }
-  let zip: string | null = null;
-  for (const r of roots) {
-    try {
-      const hit = fs
-        .readdirSync(r, { withFileTypes: true })
-        .find((e) => e.isFile() && /\.zip$/i.test(e.name) && /rtx.*video.*sdk/i.test(e.name));
-      if (hit) {
-        zip = path.join(r, hit.name);
-        break;
-      }
-    } catch {
-      /* unreadable root */
-    }
-  }
-  return { folder, zip };
-}
-
 type InstallResult = { ok: boolean; error?: string; copied: string[] };
 
 // Every file under root whose name matches one of `names` (case-insensitive; a release zip can
@@ -540,34 +492,16 @@ ipcMain.handle('rtx-open-download', () => {
   return true;
 });
 
-// Install from a given source (the picked .zip), or auto-detect one when none is passed.
-ipcMain.handle('rtx-install', (_e, source?: string) => {
-  let src = source;
-  if (!src) {
-    const s = scanForSdk();
-    src = s.folder || s.zip || undefined;
-  }
-  if (!src)
-    return {
-      ok: false,
-      error: 'No RTX Video SDK found in Downloads/Desktop. Use "Get from NVIDIA", then "Choose..."',
-      copied: [],
-    };
-  return installRtx(src);
-});
+// Install from the picked or dropped .zip.
+ipcMain.handle('rtx-install', (_e, source: string) => installRtx(source));
 
-// Manual picker fallback: a folder (extracted SDK) or a .zip.
-ipcMain.handle('rtx-choose', async (_e, mode: 'dir' | 'zip') => {
-  const r = await dialog.showOpenDialog(
-    win!,
-    mode === 'dir'
-      ? { title: 'Select the extracted RTX Video SDK folder', properties: ['openDirectory'] }
-      : {
-          title: 'Select the RTX Video SDK .zip',
-          properties: ['openFile'],
-          filters: [{ name: 'Zip', extensions: ['zip'] }],
-        },
-  );
+// Manual picker: the RTX Video SDK .zip.
+ipcMain.handle('rtx-choose', async () => {
+  const r = await dialog.showOpenDialog(win!, {
+    title: 'Select the RTX Video SDK .zip',
+    properties: ['openFile'],
+    filters: [{ name: 'Zip', extensions: ['zip'] }],
+  });
   return r.canceled ? null : r.filePaths[0] || null;
 });
 
@@ -1056,27 +990,6 @@ const EXAMPLE_MP4 = app.isPackaged
   ? path.join(process.resourcesPath, 'samples', 'example.mp4')
   : path.join(ROOT, 'samples', 'example.mp4');
 ipcMain.handle('example-path', () => (fileExists(EXAMPLE_MP4) ? EXAMPLE_MP4 : null));
-
-// window picker: parse the exe's "0xHWND<TAB>title" UTF-8 lines
-ipcMain.handle('lv-list', () => {
-  return new Promise<{ hwnd: string; title: string }[]>((resolve) => {
-    const p = spawn(LIVE_EXE, ['--list'], { cwd: LIVE_DIR });
-    let out = '';
-    p.stdout.on('data', (b: Buffer) => (out += b.toString('utf8')));
-    p.on('close', () =>
-      resolve(
-        out
-          .split(/\r?\n/)
-          .map((l) => {
-            const t = l.indexOf('\t');
-            return t > 0 ? { hwnd: l.slice(0, t), title: l.slice(t + 1) } : null;
-          })
-          .filter((w): w is { hwnd: string; title: string } => w !== null),
-      ),
-    );
-    p.on('error', () => resolve([]));
-  });
-});
 
 // the Smooth It Live! button: after the renderer's countdown, target the foreground window
 // (the user clicked the window they want during the countdown; --exclude keeps SMV itself out)

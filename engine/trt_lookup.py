@@ -1,11 +1,9 @@
-"""Torch-free TensorRT-RTX cache naming: the engine names, the weights and TRT tags, the size-free
-ONNX paths, the JIT cache paths and the warm markers, used by onnx_export.py and trt_runtime.py
-(the size-free ONNX export) and by the harness gates.
+"""Torch-free TensorRT-RTX cache naming: the engine names, the weights and TRT tags and the size-free
+ONNX paths, used by onnx_export.py and trt_runtime.py (the size-free ONNX export) and by the harness
+gates.
 
 The native host (smv-live.exe) finds, builds and warms its own engines for live and offline
-(smv-live-native.inl: lkSession, lkOfflineRife); it reads the same names and the WARM MARKER
-(<jit cache>.warm, one "HxW" key per line) it writes after a warm-up. clear_warm drops that
-marker.
+(smv-live-native.inl: lkSession, lkOfflineRife); it reads the same names.
 
 Never import torch here: a name lookup must not pay the torch import (test harnesses import this
 module too). Nothing here
@@ -20,7 +18,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # app empties it only when the engine stamp changes, src/render/cache.ts), and the user reclaims the
 # disk by deleting the folder whenever they want. It lives inside the app's own folders, never under AppData.
 CACHE_DIR = os.environ.get("SMV_TRT_CACHE") or os.path.join(HERE, "trt_cache_safe_to_delete")
-RTX_CACHE_KIND = os.environ.get("SMV_TRT_CACHE_KIND", "").strip()
 
 _tags = {}
 
@@ -96,43 +93,15 @@ def engine_name(name, shapes, input_names=None, dyn_batch=None):
 # an export path changes the graph, so a stale file is never built from; weights_tags.txt carries
 # it too (`x <rev>`), and a changed tags file makes the app / CLI empty the engine cache once
 # (src/render/cache.ts), so no engine built from an older graph is reused. MUST equal the host's
-# kOnnxRev. Rev 2: the PRelu rewrite
-# (trt_runtime._fuse_prelu). Rev 3: RIFE IFNet / block0 take f0 / f1 in fp16
-# (trt_runtime._half_features). Rev 4: the RIFE IFNet's x and the encode's img in fp16
-# (trt_runtime._half_frames). Rev 5: the RIFE IFNet's output merged in fp16. Rev 6: the RIFE IFNet's
-# timestep in fp16 (trt_runtime._half_timestep). Rev 7: the RIFE IFNet hands out its final flow and
-# blend mask in fp16 instead of the tween merged; the host warps and blends (trt_runtime._half_flow_mask).
+# kOnnxRev. The graph passes the current revision applies are the trt_runtime functions the export calls.
 ONNX_DIR = os.environ.get("SMV_ONNX_DIR") or os.path.join(HERE, "onnx")
-ONNX_REV = 7
+ONNX_REV = 13
 
 
 def onnx_path(key):
     """The size-free ONNX of a graph: key = the engine's base name (plus the export tag of a class
     whose baked arguments are not in that name), then the weights and export revision tags."""
     return os.path.join(ONNX_DIR, f"{key}_{weights_tag()}_x{ONNX_REV}.onnx")
-
-
-def jit_cache_path(engine_path):
-    """The JIT cache file of an engine file; None for an engine that never got a path."""
-    if not engine_path:
-        return None
-    return engine_path + (f".{RTX_CACHE_KIND}" if RTX_CACHE_KIND else "") + ".jit"
-
-
-# --- warm markers -------------------------------------------------------------------------------
-
-def warm_marker_path(jit_path):
-    return jit_path + ".warm" if jit_path else None
-
-
-def clear_warm(jit_path):
-    """The JIT cache file is about to be rebuilt from scratch: nothing in it is warm any more."""
-    p = warm_marker_path(jit_path)
-    if p and os.path.isfile(p):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
 
 
 def rife_scale_tag(flow_scale):

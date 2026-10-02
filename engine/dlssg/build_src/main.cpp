@@ -8,11 +8,8 @@
 // generated in-between frame reaches the (native) swap chain, where we read it
 // back from the last-presented buffer.
 //
-// Modes:
-//   dlssg2f.exe frameA.png frameB.png out.png [--gdi]
-//       single pair -> interpolated PNG (native readback; --gdi = legacy screen
-//       capture used to validate the readback path, needs the window on-screen)
-//   dlssg2f.exe --server W H [--gen N] [--wait ms] [--onscreen] [--hdr10]
+// Usage:
+//   dlssg2f.exe --server W H [--gen N] [--hdr10]
 //       streaming: raw RGBA8 frames (W*H*4) on stdin; for every frame after the
 //       first, the N (default 1, max 5) DLSS-G frames generated between it and
 //       its predecessor - evenly spaced, in temporal order - are written to
@@ -30,7 +27,6 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <dxgidebug.h>
-#include <wincodec.h>
 #include <Psapi.h>
 #include <wrl/client.h>
 #include <io.h>
@@ -109,88 +105,6 @@ static void slLog(sl::LogType type, const char* msg)
 }
 
 #include "sl_focus_shim.h"
-
-// ---------------------------------------------------------------- WIC helpers
-
-static ComPtr<IWICImagingFactory> g_wic;
-
-static bool loadPngRGBA(const wchar_t* path, std::vector<uint8_t>& out)
-{
-    ComPtr<IWICBitmapDecoder> dec;
-    if (FAILED(g_wic->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)))
-        return false;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    if (FAILED(dec->GetFrame(0, &frame)))
-        return false;
-    UINT fw = 0, fh = 0;
-    frame->GetSize(&fw, &fh);
-    if (fw != W || fh != H)
-    {
-        LOG("frame is %ux%u, expected %ux%u\n", fw, fh, W, H);
-        return false;
-    }
-    ComPtr<IWICBitmapSource> conv;
-    if (FAILED(WICConvertBitmapSource(GUID_WICPixelFormat32bppRGBA, frame.Get(), &conv)))
-        return false;
-    out.resize((size_t)W * H * 4);
-    return SUCCEEDED(conv->CopyPixels(nullptr, W * 4, (UINT)out.size(), out.data()));
-}
-
-static bool savePng(const wchar_t* path, const uint8_t* px, uint32_t w, uint32_t h, bool bgra)
-{
-    ComPtr<IWICStream> stream;
-    if (FAILED(g_wic->CreateStream(&stream)))
-        return false;
-    if (FAILED(stream->InitializeFromFilename(path, GENERIC_WRITE)))
-        return false;
-    ComPtr<IWICBitmapEncoder> enc;
-    if (FAILED(g_wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)))
-        return false;
-    if (FAILED(enc->Initialize(stream.Get(), WICBitmapEncoderNoCache)))
-        return false;
-    ComPtr<IWICBitmapFrameEncode> frame;
-    if (FAILED(enc->CreateNewFrame(&frame, nullptr)))
-        return false;
-    if (FAILED(frame->Initialize(nullptr)))
-        return false;
-    if (FAILED(frame->SetSize(w, h)))
-        return false;
-    WICPixelFormatGUID fmt = bgra ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat32bppRGBA;
-    if (FAILED(frame->SetPixelFormat(&fmt)))
-        return false;
-    if (FAILED(frame->WritePixels(h, w * 4, w * h * 4, (BYTE*)px)))
-        return false;
-    if (FAILED(frame->Commit()))
-        return false;
-    return SUCCEEDED(enc->Commit());
-}
-
-// GDI screen capture of a rect (DWM-composited). Validation-only path.
-static bool captureScreen(int x, int y, uint32_t w, uint32_t h, const wchar_t* path)
-{
-    HDC sdc = GetDC(nullptr);
-    HDC mdc = CreateCompatibleDC(sdc);
-    HBITMAP bmp = CreateCompatibleBitmap(sdc, w, h);
-    HGDIOBJ old = SelectObject(mdc, bmp);
-    BitBlt(mdc, 0, 0, w, h, sdc, x, y, SRCCOPY | CAPTUREBLT);
-    SelectObject(mdc, old);
-
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = (LONG)w;
-    bi.bmiHeader.biHeight = -(LONG)h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    std::vector<uint8_t> px((size_t)w * h * 4);
-    int got = GetDIBits(mdc, bmp, 0, h, px.data(), &bi, DIB_RGB_COLORS);
-    DeleteObject(bmp);
-    DeleteDC(mdc);
-    ReleaseDC(nullptr, sdc);
-    if (got == 0)
-        return false;
-    return savePng(path, px.data(), w, h, true);
-}
 
 // ---------------------------------------------------------------- D3D helpers
 
@@ -295,7 +209,7 @@ struct Host
     uint32_t frameIndex = 1;
     int waitMs = 5;           // settle after a native present is observed
     int genFrames = 1;        // generated frames per source frame (numFramesToGenerate)
-    UINT syncInterval = 0;    // Present sync interval (1 = vsync-paced FG)
+    UINT syncInterval = 1;    // Present sync interval: vsync-paced FG, measured far more reliable for the capture
     uint32_t maxGen = 0;      // device limit reported by the SDK (0 = not yet known)
     UINT presentSnapshot = 0; // native present count taken just before each proxy Present
     bool hdr10 = false;       // --hdr10: R10G10B10A2 frames on a G2084 / P2020 swap chain
@@ -370,19 +284,18 @@ struct Host
         return true;
     }
 
-    int init(bool onscreen)
+    int init()
     {
         // window: swap chain needs an HWND, but with native readback it never
-        // has to be visible on the desktop, so park it far offscreen by default
+        // has to be visible on the desktop, so park it far offscreen
         WNDCLASSW wc{};
         wc.lpfnWndProc = wndProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = L"dlssg2f";
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
         RegisterClassW(&wc);
-        int px = onscreen ? 0 : -32000, py = onscreen ? 0 : -32000;
-        hwnd = CreateWindowExW(onscreen ? WS_EX_TOPMOST : WS_EX_TOOLWINDOW, L"dlssg2f", L"dlssg2f",
-                               WS_POPUP | WS_VISIBLE, px, py, W, H, nullptr, nullptr, wc.hInstance, nullptr);
+        hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"dlssg2f", L"dlssg2f", WS_POPUP | WS_VISIBLE, -32000, -32000, W, H,
+                               nullptr, nullptr, wc.hInstance, nullptr);
         if (!hwnd)
         {
             LOG("CreateWindow failed\n");
@@ -777,14 +690,12 @@ static int slInitCommon()
     return 0;
 }
 
-static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen, bool hdr10)
+static int runServer(int genFrames, bool hdr10)
 {
     Host host;
-    host.waitMs = waitMs;
     host.genFrames = genFrames;
-    host.syncInterval = vsync ? 1 : 0;
     host.hdr10 = hdr10;
-    int rc = host.init(onscreen);
+    int rc = host.init();
     if (rc)
         return rc;
 
@@ -1138,124 +1049,6 @@ static int runServer(int waitMs, int genFrames, bool vsync, bool onscreen, bool 
     return 0;
 }
 
-static int runSingleShot(const wchar_t* pathA, const wchar_t* pathB, const wchar_t* pathOut, bool gdi)
-{
-    CHECK_HR(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic)));
-
-    Host host;
-    int rc = host.init(gdi); // GDI validation needs the window on-screen
-    if (rc)
-        return rc;
-
-    std::vector<uint8_t> imgA, imgB;
-    if (!loadPngRGBA(pathA, imgA) || !loadPngRGBA(pathB, imgB))
-    {
-        LOG("png load failed\n");
-        return 1;
-    }
-
-    for (int i = 0; i < 3; i++)
-        if (!host.presentFrame(imgA.data()))
-        {
-            LOG("warmup present failed\n");
-            return 1;
-        }
-
-    sl::DLSSGState st{};
-    if (slDLSSGGetState(host.vp, st, nullptr) == sl::Result::eOk)
-        LOG("DLSS-G status=%d minWH=%u maxGen=%u\n", (int)st.status, st.minWidthOrHeight, st.numFramesToGenerateMax);
-    if (st.status != sl::DLSSGStatus::eOk)
-    {
-        LOG("DLSS-G runtime status NOT ok\n");
-        return 1;
-    }
-
-    if (!host.presentFrame(imgB.data()))
-    {
-        LOG("B present failed\n");
-        return 1;
-    }
-
-    if (GetEnvironmentVariableW(L"DLSSG_DUMPBUFS", nullptr, 0))
-    {
-        // diagnostic: dump every native buffer after the pair present, to learn where generated
-        // frames live when the driver's hardware flip queue bypasses countable DXGI presents
-        Sleep(200);
-        std::vector<uint8_t> buf((size_t)W * H * 4);
-        for (UINT i = 0; i < host.nativeBufCount; i++)
-        {
-            if (!host.copyNativeBuffer(i, buf.data()))
-            {
-                LOG("buffer %u copy failed\n", i);
-                continue;
-            }
-            for (size_t p = 0; p < buf.size(); p += 4)
-                std::swap(buf[p], buf[p + 2]);
-            wchar_t name[64];
-            swprintf_s(name, L"out_buf%u.png", i);
-            savePng(name, buf.data(), W, H, true);
-        }
-        LOG("dumped %u native buffers\n", host.nativeBufCount);
-    }
-
-    bool ok = false;
-    if (gdi)
-    {
-        Sleep(250);
-        RECT wr{};
-        GetWindowRect(host.hwnd, &wr);
-        ok = captureScreen(wr.left, wr.top, W, H, pathOut);
-    }
-    else
-    {
-        auto sameImage = [&](const uint8_t* a, const uint8_t* b) -> bool {
-            for (size_t i = 0; i < (size_t)W * H; i += 397)
-            {
-                const size_t o = i * 4;
-                if (a[o] != b[o] || a[o + 1] != b[o + 1] || a[o + 2] != b[o + 2])
-                    return false;
-            }
-            return true;
-        };
-        std::vector<uint8_t> out((size_t)W * H * 4);
-        std::vector<std::vector<uint8_t>> raw;
-        host.pollSeen = host.presentSnapshot;
-        size_t scanned = 0;
-        const ULONGLONG deadline = GetTickCount64() + 1000;
-        while (!ok && GetTickCount64() < deadline)
-        {
-            int added = host.pollNewPresents(raw);
-            if (added < 0)
-                break;
-            for (; scanned < raw.size() && !ok; scanned++)
-            {
-                const uint8_t* f = raw[scanned].data();
-                if (sameImage(f, imgA.data()) || sameImage(f, imgB.data()))
-                    continue;
-                memcpy(out.data(), f, out.size());
-                ok = true;
-            }
-            if (added == 0)
-                Sleep(1);
-        }
-        // WIC's PNG encoder negotiates to BGRA regardless of the requested format, so swizzle
-        for (size_t i = 0; ok && i < out.size(); i += 4)
-            std::swap(out[i], out[i + 2]);
-        if (ok)
-            ok = savePng(pathOut, out.data(), W, H, true);
-    }
-    if (!ok)
-    {
-        LOG("capture failed\n");
-        return 1;
-    }
-    LOG("wrote %ls (%s)\n", pathOut, gdi ? "gdi" : "native readback");
-
-    host.shutdown();
-    slShutdown();
-    return 0;
-}
-
 int wmain(int argc, wchar_t** argv)
 {
     setvbuf(stderr, nullptr, _IONBF, 0);
@@ -1271,23 +1064,12 @@ int wmain(int argc, wchar_t** argv)
             LOG("bad size %ux%u\n", W, H);
             return 1;
         }
-        int waitMs = 5;
         int genFrames = 1;
-        bool vsync = true; // vsync pacing measured far more reliable for the capture (see BUILD.md)
-        bool onscreen = false;
         bool hdr10 = false;
         for (int i = 4; i < argc; i++)
         {
-            if (wcscmp(argv[i], L"--wait") == 0 && i + 1 < argc)
-                waitMs = _wtoi(argv[++i]);
-            else if (wcscmp(argv[i], L"--gen") == 0 && i + 1 < argc)
+            if (wcscmp(argv[i], L"--gen") == 0 && i + 1 < argc)
                 genFrames = _wtoi(argv[++i]);
-            else if (wcscmp(argv[i], L"--vsync") == 0)
-                vsync = true;
-            else if (wcscmp(argv[i], L"--no-vsync") == 0)
-                vsync = false;
-            else if (wcscmp(argv[i], L"--onscreen") == 0)
-                onscreen = true;
             else if (wcscmp(argv[i], L"--hdr10") == 0)
                 hdr10 = true;
         }
@@ -1298,18 +1080,9 @@ int wmain(int argc, wchar_t** argv)
         }
         if (slInitCommon())
             return 1;
-        return runServer(waitMs, genFrames, vsync, onscreen, hdr10);
+        return runServer(genFrames, hdr10);
     }
 
-    if (argc >= 4)
-    {
-        bool gdi = (argc >= 5 && wcscmp(argv[4], L"--gdi") == 0);
-        if (slInitCommon())
-            return 1;
-        return runSingleShot(argv[1], argv[2], argv[3], gdi);
-    }
-
-    LOG("usage: dlssg2f.exe frameA.png frameB.png out.png [--gdi]\n"
-        "       dlssg2f.exe --server W H [--gen N] [--wait ms] [--onscreen] [--hdr10]\n");
+    LOG("usage: dlssg2f.exe --server W H [--gen N] [--hdr10]\n");
     return 1;
 }

@@ -159,18 +159,10 @@ const char* const kProjectId = "53f803cc-a12f-4d69-90d5-19b7599cad19";
 
 static const DXGI_FORMAT kFmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-// Direct (no shim) route (Variant::useShim false): the call originates inside the host exe,
-// the control case for the runtime's caller validation.
-static NVSDK_NGX_Result directInit(void* fn, int argOrder, const char* projectId, NVSDK_NGX_EngineType engineType,
-                                   const char* engineVersion, const wchar_t* dataPath, ID3D12Device* device,
-                                   const NVSDK_NGX_FeatureCommonInfo* featureInfo, NVSDK_NGX_Version sdkVersion)
-{
-    if (argOrder == 0)
-        return ((PFN_NGX_InitProjectID_A)fn)(projectId, engineType, engineVersion, dataPath, device, featureInfo,
-                                             sdkVersion);
-    return ((PFN_NGX_InitProjectID_B)fn)(projectId, engineType, engineVersion, dataPath, device, sdkVersion,
-                                         featureInfo);
-}
+// Argument order of the driver core's Init_ProjectID export, which the public headers do not
+// pin down: 1 = (.., device, version, featureInfo), the order that survives on 616.56 (order 0,
+// (.., device, featureInfo, version), faults inside the core).
+static const int kInitArgOrder = 1;
 
 std::string resultString(NVSDK_NGX_Result r)
 {
@@ -328,7 +320,7 @@ Host::~Host()
     shutdown();
 }
 
-bool Host::resolveModules(const Variant& v, std::string& err)
+bool Host::resolveModules(std::string& err)
 {
     const std::wstring dir = moduleDir();
 
@@ -378,33 +370,21 @@ bool Host::resolveModules(const Variant& v, std::string& err)
         return false;
     }
 
-    // 3. the caller shim, only when this variant routes through it.
-    if (v.useShim)
+    // 3. the caller shim beside the exe (a DLL named nvngx.dll): every NGX entry point is called
+    // through it, so the return address the runtime validates lands inside it.
+    const std::wstring shim = dir + L"\\nvngx.dll";
+    if (!fileExists(shim))
     {
-        std::wstring shim;
-        if (v.shimLocation == 1)
-            shim = dir + L"\\caller\\nvngx.dll";
-        else if (v.shimLocation == 2)
-        {
-            std::wstring sd = m_snippetPath.substr(0, m_snippetPath.find_last_of(L"\\/"));
-            shim = sd + L"\\nvngx.dll";
-        }
-        else
-            shim = dir + L"\\nvngx.dll";
-        if (!fileExists(shim))
-        {
-            err = "caller shim nvngx.dll not found for this variant";
-            return false;
-        }
-        m_shimPath = shim;
-        m_shim = LoadLibraryW(shim.c_str());
-        if (!m_shim)
-        {
-            char b[128];
-            snprintf(b, sizeof(b), "LoadLibrary nvngx.dll (shim) failed, GetLastError=%lu", GetLastError());
-            err = b;
-            return false;
-        }
+        err = "caller shim nvngx.dll not found beside the host";
+        return false;
+    }
+    m_shim = LoadLibraryW(shim.c_str());
+    if (!m_shim)
+    {
+        char b[128];
+        snprintf(b, sizeof(b), "LoadLibrary nvngx.dll (shim) failed, GetLastError=%lu", GetLastError());
+        err = b;
+        return false;
     }
     return true;
 }
@@ -624,19 +604,17 @@ bool Host::runCommandList(std::string& err)
     return true;
 }
 
-int Host::startup(uint32_t w, uint32_t h, const Settings& s, const Variant& v, std::string& err, bool quietLog,
-                  const LUID* adapter)
+int Host::startup(uint32_t w, uint32_t h, const Settings& s, std::string& err, bool quietLog, const LUID* adapter)
 {
     m_w = w;
     m_h = h;
     m_set = s;
-    m_var = v;
     m_quiet = quietLog;
     m_wantAdapter = adapter != nullptr;
     if (adapter)
         m_wantLuid = *adapter;
 
-    if (!resolveModules(v, err))
+    if (!resolveModules(err))
         return 2;
     if (!createDevice(err))
         return 2;
@@ -649,42 +627,33 @@ int Host::startup(uint32_t w, uint32_t h, const Settings& s, const Variant& v, s
 
 int Host::initNgx(std::string& err)
 {
-    const Variant& v = m_var;
-
     // Driver core entry points.
-    void* pInit =
-        (void*)GetProcAddress(m_core, v.initProjectId ? "NVSDK_NGX_D3D12_Init_ProjectID" : "NVSDK_NGX_D3D12_Init_Ext");
+    void* pInit = (void*)GetProcAddress(m_core, "NVSDK_NGX_D3D12_Init_ProjectID");
     void* pAlloc = (void*)GetProcAddress(m_core, "NVSDK_NGX_D3D12_AllocateParameters");
-    // Feature entry points: from the NR snippet itself (default, it exports the whole
-    // NVSDK_NGX_D3D12_* API and the driver core's feature table does not know id 18)
-    // or from the driver core (--via-core, the original phase 0 route).
-    HMODULE feat = v.viaSnippet ? m_snippet : m_core;
-    void* pCreate = (void*)GetProcAddress(feat, "NVSDK_NGX_D3D12_CreateFeature");
-    void* pEval = (void*)GetProcAddress(feat, "NVSDK_NGX_D3D12_EvaluateFeature_C");
+    // Feature entry points: from the NR snippet itself (it exports the whole NVSDK_NGX_D3D12_* API
+    // and the driver core's feature table refuses id 18 before touching any snippet).
+    void* pCreate = (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_CreateFeature");
+    void* pEval = (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_EvaluateFeature_C");
     if (!pEval)
-        pEval = (void*)GetProcAddress(feat, "NVSDK_NGX_D3D12_EvaluateFeature");
-    void* pRelease = (void*)GetProcAddress(feat, "NVSDK_NGX_D3D12_ReleaseFeature");
+        pEval = (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_EvaluateFeature");
+    void* pRelease = (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_ReleaseFeature");
     if (!pInit || !pAlloc || !pCreate || !pEval || !pRelease)
     {
-        err =
-            std::string(v.viaSnippet ? "nvngx_dlssnr.dll" : "_nvngx.dll") + " is missing one of the D3D12 NGX exports";
+        err = "nvngx_dlssnr.dll or _nvngx.dll is missing one of the D3D12 NGX exports";
         return 2;
     }
 
-    // Shim entry points, when this variant routes through nvngx.dll.
-    PFN_ShimInit sInit = nullptr;
-    PFN_ShimInitExt sInitE = nullptr;
-    PFN_ShimAllocParams sAlloc = nullptr;
-    if (m_shim)
+    // Shim entry points (nvngx.dll).
+    typedef NVSDK_NGX_Result (*PFN_ShimInitExtF)(void*, unsigned long long, const wchar_t*, ID3D12Device*, unsigned int,
+                                                 const NVSDK_NGX_FeatureCommonInfo*);
+    auto sInit = (PFN_ShimInit)GetProcAddress(m_shim, "DLSSNR_CallInit");
+    auto sAlloc = (PFN_ShimAllocParams)GetProcAddress(m_shim, "DLSSNR_CallAllocParams");
+    auto sInitF = (PFN_ShimInitExtF)GetProcAddress(m_shim, "DLSSNR_CallInitExtF");
+    auto sCreate = (PFN_ShimCreate)GetProcAddress(m_shim, "DLSSNR_CallCreate");
+    if (!sInit || !sAlloc || !sInitF || !sCreate)
     {
-        sInit = (PFN_ShimInit)GetProcAddress(m_shim, "DLSSNR_CallInit");
-        sInitE = (PFN_ShimInitExt)GetProcAddress(m_shim, "DLSSNR_CallInitExt");
-        sAlloc = (PFN_ShimAllocParams)GetProcAddress(m_shim, "DLSSNR_CallAllocParams");
-        if (!sInit || !sInitE || !sAlloc)
-        {
-            err = "caller shim is missing an export";
-            return 2;
-        }
+        err = "caller shim is missing an export";
+        return 2;
     }
 
     // The snippet's own folder is offered to NGX as an extra search path, the
@@ -707,19 +676,8 @@ int Host::initNgx(std::string& err)
 
     std::wstring dataPath = moduleDir();
 
-    if (v.initProjectId)
-    {
-        m_last = m_shim ? sInit(pInit, v.initArgOrder, kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "0.1",
-                                dataPath.c_str(), m_dev.Get(), &fci, NVSDK_NGX_Version_API)
-                        : directInit(pInit, v.initArgOrder, kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "0.1",
-                                     dataPath.c_str(), m_dev.Get(), &fci, NVSDK_NGX_Version_API);
-    }
-    else
-    {
-        m_last = m_shim ? sInitE(pInit, 0x53f803ccull, dataPath.c_str(), m_dev.Get(), NVSDK_NGX_Version_API)
-                        : ((PFN_NGX_InitExt)pInit)(0x53f803ccull, dataPath.c_str(), m_dev.Get(), NVSDK_NGX_Version_API,
-                                                   nullptr);
-    }
+    m_last = sInit(pInit, kInitArgOrder, kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "0.1", dataPath.c_str(), m_dev.Get(),
+                   &fci, NVSDK_NGX_Version_API);
     if (m_last != NVSDK_NGX_Result_Success)
     {
         err = "NGX init failed: " + resultString(m_last);
@@ -727,35 +685,25 @@ int Host::initNgx(std::string& err)
     }
     m_ngxUp = true;
 
-    if (v.viaSnippet)
+    // The snippet keeps its own device and data path: initialise it through its
+    // own Init_Ext export before creating the feature on it (the core session
+    // above still provides AllocateParameters and the caller module context).
+    // App id = the cms id the core mapped for the project id (0x0876232C, log line
+    // "MapProjectId: Found cms id 876232c"), version 0x15, and the FeatureCommonInfo
+    // as the fifth argument, exactly the reference sequence; its result is logged
+    // only, the reference does not gate creation on it either.
+    void* pSnipInit = (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_Init_Ext");
+    if (!pSnipInit)
     {
-        // The snippet keeps its own device and data path: initialise it through its
-        // own Init_Ext export before creating the feature on it (the core session
-        // above still provides AllocateParameters and the caller module context).
-        // App id = the cms id the core mapped for the project id (0x0876232C, log line
-        // "MapProjectId: Found cms id 876232c"), version 0x15, and the FeatureCommonInfo
-        // as the fifth argument, exactly the reference sequence; its result is logged
-        // only, the reference does not gate creation on it either.
-        void* pSnipInit = (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_Init_Ext");
-        if (!pSnipInit)
-        {
-            err = "nvngx_dlssnr.dll has no NVSDK_NGX_D3D12_Init_Ext";
-            return 2;
-        }
-        const unsigned long long kCmsAppId = 141959980ull;
-        typedef NVSDK_NGX_Result (*PFN_SnipInitExt)(unsigned long long, const wchar_t*, ID3D12Device*, unsigned int,
-                                                    const NVSDK_NGX_FeatureCommonInfo*);
-        typedef NVSDK_NGX_Result (*PFN_ShimInitExtF)(void*, unsigned long long, const wchar_t*, ID3D12Device*,
-                                                     unsigned int, const NVSDK_NGX_FeatureCommonInfo*);
-        NVSDK_NGX_Result rs = m_shim
-                                  ? ((PFN_ShimInitExtF)GetProcAddress(m_shim, "DLSSNR_CallInitExtF"))(
-                                        pSnipInit, kCmsAppId, dataPath.c_str(), m_dev.Get(), 0x15, &fci)
-                                  : ((PFN_SnipInitExt)pSnipInit)(kCmsAppId, dataPath.c_str(), m_dev.Get(), 0x15, &fci);
-        fprintf(stderr, "dlssnr: snippet Init_Ext -> %s\n", resultString(rs).c_str());
-        fflush(stderr);
+        err = "nvngx_dlssnr.dll has no NVSDK_NGX_D3D12_Init_Ext";
+        return 2;
     }
+    const unsigned long long kCmsAppId = 141959980ull;
+    const NVSDK_NGX_Result rs = sInitF(pSnipInit, kCmsAppId, dataPath.c_str(), m_dev.Get(), 0x15, &fci);
+    fprintf(stderr, "dlssnr: snippet Init_Ext -> %s\n", resultString(rs).c_str());
+    fflush(stderr);
 
-    m_last = m_shim ? sAlloc(pAlloc, &m_params) : ((PFN_NGX_AllocParams)pAlloc)(&m_params);
+    m_last = sAlloc(pAlloc, &m_params);
     if (m_last != NVSDK_NGX_Result_Success || !m_params)
     {
         err = "AllocateParameters failed: " + resultString(m_last);
@@ -772,15 +720,8 @@ int Host::initNgx(std::string& err)
         return 2;
     }
 
-    PFN_ShimCreate sCreate = m_shim ? (PFN_ShimCreate)GetProcAddress(m_shim, "DLSSNR_CallCreate") : nullptr;
-    if (m_shim && !sCreate)
-    {
-        err = "caller shim is missing DLSSNR_CallCreate";
-        return 2;
-    }
     auto create = [&](NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** f) {
-        return sCreate ? sCreate(pCreate, m_list.Get(), kFeatureId, p, f)
-                       : ((PFN_NGX_CreateFeature)pCreate)(m_list.Get(), (NVSDK_NGX_Feature)kFeatureId, p, f);
+        return sCreate(pCreate, m_list.Get(), kFeatureId, p, f);
     };
     m_last = create(m_params, &m_feature);
     if (m_last != NVSDK_NGX_Result_Success || !m_feature)
@@ -797,7 +738,7 @@ int Host::initNgx(std::string& err)
     for (int k = 1; k < wanted; ++k)
     {
         NVSDK_NGX_Parameter* p = nullptr;
-        NVSDK_NGX_Result r = m_shim ? sAlloc(pAlloc, &p) : ((PFN_NGX_AllocParams)pAlloc)(&p);
+        NVSDK_NGX_Result r = sAlloc(pAlloc, &p);
         if (r != NVSDK_NGX_Result_Success || !p)
         {
             m_passNote = "pass " + std::to_string(k + 1) + " AllocateParameters " + resultString(r);
@@ -875,12 +816,11 @@ void Host::setPassParams(int k, int last)
 
 bool Host::evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& err)
 {
-    HMODULE feat = m_var.viaSnippet ? m_snippet : m_core;
-    void* pEval = (void*)GetProcAddress(feat, "NVSDK_NGX_D3D12_EvaluateFeature_C");
+    void* pEval = (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_EvaluateFeature_C");
     if (!pEval)
-        pEval = (void*)GetProcAddress(feat, "NVSDK_NGX_D3D12_EvaluateFeature");
-    PFN_ShimEvaluate sEval = m_shim ? (PFN_ShimEvaluate)GetProcAddress(m_shim, "DLSSNR_CallEvaluate") : nullptr;
-    if (!pEval || (m_shim && !sEval))
+        pEval = (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_EvaluateFeature");
+    auto sEval = m_shim ? (PFN_ShimEvaluate)GetProcAddress(m_shim, "DLSSNR_CallEvaluate") : nullptr;
+    if (!pEval || !sEval)
     {
         err = "EvaluateFeature entry point missing";
         return false;
@@ -911,8 +851,7 @@ bool Host::evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& 
         p->Set("DLSSNR.Intensity", m_set.intensity);
         p->Set("DLSSNR.LocalStructureStrength", m_set.structure);
         p->Set("DLSSNR.LocalToneStrength", m_set.tone);
-        m_last = m_shim ? sEval(pEval, list, m_pfeature[k], p)
-                        : ((PFN_NGX_EvaluateFeature)pEval)(list, m_pfeature[k], p, nullptr);
+        m_last = sEval(pEval, list, m_pfeature[k], p);
         if (m_last != NVSDK_NGX_Result_Success)
         {
             err = std::string("EvaluateFeature failed") +
@@ -1298,21 +1237,16 @@ void Host::abandon()
 
 void Host::ngxShutdown()
 {
+    // Every feature and the NGX session exist only after the shim loaded (startup refuses without it).
+    void* pRelease = m_snippet ? (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_ReleaseFeature") : nullptr;
+    auto sRel = m_shim ? (PFN_ShimRelease)GetProcAddress(m_shim, "DLSSNR_CallRelease") : nullptr;
     // passes 2..: their features and parameter blocks first (pass 0 = m_feature / m_params below)
     for (int k = 1; k < kMaxPasses && m_core; ++k)
     {
         if (m_pfeature[k])
         {
-            void* pRelease =
-                (void*)GetProcAddress(m_var.viaSnippet ? m_snippet : m_core, "NVSDK_NGX_D3D12_ReleaseFeature");
-            PFN_ShimRelease sRel = m_shim ? (PFN_ShimRelease)GetProcAddress(m_shim, "DLSSNR_CallRelease") : nullptr;
-            if (pRelease)
-            {
-                if (sRel)
-                    sRel(pRelease, m_pfeature[k]);
-                else
-                    ((PFN_NGX_ReleaseFeature)pRelease)(m_pfeature[k]);
-            }
+            if (pRelease && sRel)
+                sRel(pRelease, m_pfeature[k]);
             m_pfeature[k] = nullptr;
         }
         if (m_pparams[k])
@@ -1328,15 +1262,8 @@ void Host::ngxShutdown()
     m_pparams[0] = nullptr;
     if (m_core && m_feature)
     {
-        void* pRelease = (void*)GetProcAddress(m_var.viaSnippet ? m_snippet : m_core, "NVSDK_NGX_D3D12_ReleaseFeature");
-        PFN_ShimRelease sRel = m_shim ? (PFN_ShimRelease)GetProcAddress(m_shim, "DLSSNR_CallRelease") : nullptr;
-        if (pRelease)
-        {
-            if (sRel)
-                sRel(pRelease, m_feature);
-            else
-                ((PFN_NGX_ReleaseFeature)pRelease)(m_feature);
-        }
+        if (pRelease && sRel)
+            sRel(pRelease, m_feature);
         m_feature = nullptr;
     }
     if (m_core && m_params)
@@ -1350,14 +1277,9 @@ void Host::ngxShutdown()
     if (m_core && m_ngxUp)
     {
         void* pShut = (void*)GetProcAddress(m_core, "NVSDK_NGX_D3D12_Shutdown1");
-        PFN_ShimShutdown sShut = m_shim ? (PFN_ShimShutdown)GetProcAddress(m_shim, "DLSSNR_CallShutdown") : nullptr;
-        if (pShut)
-        {
-            if (sShut)
-                sShut(pShut, m_dev.Get());
-            else
-                ((PFN_NGX_Shutdown1)pShut)(m_dev.Get());
-        }
+        auto sShut = m_shim ? (PFN_ShimShutdown)GetProcAddress(m_shim, "DLSSNR_CallShutdown") : nullptr;
+        if (pShut && sShut)
+            sShut(pShut, m_dev.Get());
         m_ngxUp = false;
     }
 }

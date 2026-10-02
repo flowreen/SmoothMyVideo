@@ -12,13 +12,16 @@ import * as readline from 'readline';
 import { dvExport, hpExport } from './dvhp';
 import {
   chooseEncoder,
+  codecEncoder,
   decodeCmd,
   decodeFilters,
   encodePlan,
+  encWorksAsync,
   finalizeOutput,
   fullChroma,
   HdrStats,
   HpFrame,
+  presetWorks,
   pyErrText,
   pyReprStr,
   Say,
@@ -260,12 +263,17 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const HDR_VIBRANCE = clamp(args.hdr_vibrance, 0.0, 1.0),
     HDR_SATBOOST = clamp(args.hdr_satboost, 0.0, 1.0);
 
+  // the encoder check and the power query are whole child processes (~0.2 s and ~0.09 s): both run beside the probes
+  const ENC_FIRST = codecEncoder(CODEC);
+  const encFirstOk = encWorksAsync(FFMPEG, ENC_FIRST);
+  const power = powerQuery();
+
   let { w: W, h: H, num, den, nb: NB, st: ST } = probe(FFPROBE, inp);
   const vfr = vfrConform(ST, num, den);
   [num, den] = [vfr.num, vfr.den];
   const VFR_DEC = vfr.flags;
   if (vfr.note) say(vfr.note);
-  powerNotice(say);
+  powerNotice(await power, say);
 
   const SRC_CODEC = String(ST.codec_name || '').toLowerCase();
   const SRC_PIX = String(ST.pix_fmt || 'yuv420p');
@@ -529,6 +537,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     path.win32.basename(P.vidPart),
     say,
     fatal,
+    presetWorks(ENC_FIRST, await encFirstOk),
   );
   if (venc === 'libvvenc') fragCopy = true;
   const ENC_IN_FMT = HDR_ACTIVE
@@ -955,13 +964,35 @@ async function residentRender(
   }
 }
 
-/** render.py _power_notice: one line when the GPU runs under a reduced power limit. */
-function powerNotice(say: Say): void {
+/** nvidia-smi's POWER report, or null when it is missing, fails or takes over 5 s. */
+function powerQuery(): Promise<string | null> {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn('nvidia-smi', ['-q', '-d', 'POWER'], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      const timer = setTimeout(() => p.kill(), 5000);
+      let out = '';
+      p.stdout!.setEncoding('utf8');
+      p.stdout!.on('data', (d: string) => (out += d));
+      p.once('error', () => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+      p.once('close', (code) => {
+        clearTimeout(timer);
+        resolve(code === 0 ? out : null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/** render.py _power_notice: one line when the GPU runs under a reduced power limit (`report` = powerQuery's). */
+export function powerNotice(report: string | null, say: Say): void {
+  if (report === null) return;
   try {
-    const r = spawnSync('nvidia-smi', ['-q', '-d', 'POWER'], { windowsHide: true, timeout: 5000, encoding: 'utf8' });
-    if (r.error || r.status !== 0) return;
     const vals: Record<string, number> = {};
-    for (const line of r.stdout.split(/\r\n|\r|\n/)) {
+    for (const line of report.split(/\r\n|\r|\n/)) {
       const i = line.indexOf(':');
       if (i < 0) continue;
       const k = line.slice(0, i).trim(),

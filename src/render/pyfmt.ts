@@ -41,11 +41,6 @@ export function pyRound(x: number): number {
   return x < 0 ? -q : q;
 }
 
-/** python int(x) for a float: truncation toward zero. */
-export function pyInt(x: number): number {
-  return Math.trunc(x);
-}
-
 /** python format(x, `.{d}f`). */
 export function pyFixed(x: number, d: number): string {
   const { int, scale } = exactDecimal(x);

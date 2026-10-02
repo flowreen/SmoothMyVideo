@@ -1,8 +1,8 @@
 // The engine cache stamp. Engines are found by NAME (net, shapes, TensorRT-RTX version,
 // weight tags) and the name does not say which ONNX graph an engine was built from, so after an
-// export change (trt_lookup.ONNX_REV, e.g. rev 2's PRelu rewrite) the old engines would keep being
+// export change (trt_lookup.ONNX_REV: any change that alters a graph) the old engines would keep being
 // reused. The stamp = the TensorRT-RTX version the host loads + onnx/weights_tags.txt (the weight
-// tags and, since rev 2, the `x <rev>` line); when it differs from the one stored in the cache
+// tags and the `x <rev>` line); when it differs from the one stored in the cache
 // folder, the folder is emptied once (every engine rebuilds at its size on first use) and the new
 // stamp is written. Runs at app start and CLI start, before anything spawns the host.
 import * as fs from 'fs';

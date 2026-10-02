@@ -203,7 +203,6 @@ function roundMulti(){ if(!info || gridMulti()) return 0;
   return fpsValid(roundFps(N)) ? N : 0; }
 function roundFps(N){ return Math.round(srcFps() * N * 1000) / 1000; }   // setFps's 3-dp rounding
 $('fpsround').onclick = () => { const N = roundMulti(); if(N) setFps(srcFps() * N); };
-function nudgeFps(d){ setFps(curFps() + d); }
 // Press-and-hold auto-repeat: one step on press, then repeat every 60ms after a 350ms hold. Each step
 // re-reads the current target, so holding + walks the value up (and stops at the clamp) instead of once.
 function holdRepeat(btn, fn){ let to, iv;
@@ -429,22 +428,6 @@ applyOrder();
 // model change) and simply re-renders the Speed row.
 let screenHz = 60;
 function applyScreenFps(){ syncTargetUI(); refresh(); }
-// One-time migration off the old scheme (fpsTarget = an ABSOLUTE target derived from whichever video
-// was loaded, plus a separate screenfps checkbox). Translating beats bumping SETTINGS_VERSION, which
-// would wipe every unrelated preference.
-if(localStorage.getItem('speedMode') === null){
-  // Only an explicit screen-match choice carries over as a MODE. The old fpsTarget was DERIVED from
-  // whichever video was loaded (2x of the 30 fps sample clip = 60), so promoting it to an absolute
-  // target would perpetuate the exact coupling this replaces. Keep it only as the fps box's seed.
-  const old = +localStorage.getItem('fpsTarget');
-  if(old > 0 && localStorage.getItem('speedFps') === null) localStorage.setItem('speedFps', String(Math.round(old)));
-  localStorage.setItem('speedMode', localStorage.getItem('screenfps') === '1' ? 'screen' : 'fps');
-}
-// A persisted 'mult' choice (the old Multiplier mode) becomes the fps default
-// (translating beats a SETTINGS_VERSION bump, which would wipe every unrelated preference).
-if(localStorage.getItem('speedMode') === 'mult') localStorage.setItem('speedMode', 'fps');
-localStorage.removeItem('speedMult');
-localStorage.removeItem('screenfps'); localStorage.removeItem('fpsTarget');
 ipcRenderer.invoke('refresh-rate').then(hz => {
   screenHz = (+hz) || 60; $('screenhz').textContent = screenHz;
   if(info) applyScreenFps();   // monitor rate can add decimals (359.99 -> 2), so reformat the target box now that it's known
@@ -665,7 +648,7 @@ async function doInstall(source){
   if(!r.ok) $('rtxsetup').style.display = 'block';   // keep an install error visible even if no toggle needs the feature
 }
 $('rtxget').onclick = () => ipcRenderer.invoke('rtx-open-download');
-$('rtxbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('rtx-choose','zip'); if(p) doInstall(p); };  // selecting a .zip auto-installs
+$('rtxbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('rtx-choose'); if(p) doInstall(p); };  // selecting a .zip auto-installs
 localStorage.removeItem('supersampleOn');   // retired: supersample removed (measured imperceptible)
 localStorage.removeItem('encspeed');   // retired: no Encoder speed selector (every render uses the Quality encoder)
 localStorage.removeItem('rtxvsrOn');   // retired: its stored choice was made while RTX VSR defaulted off
@@ -897,18 +880,7 @@ $('rifedrba').onchange = () => { localStorage.setItem('rifeDrba', $('rifedrba').
 // chosen model's runtime is missing). Skipped while Interpolate is off: syncInterp() has cleared
 // the boxes and re-checking Interpolate restores the choice itself.
 function restoreModelChoice(){
-  let saved = localStorage.getItem('interpModel');
-  // Migration from the separate-Interpolate-checkbox era: interp='0' meant "no interpolation", which
-  // is now expressed as no model ticked. Translate it once instead of bumping SETTINGS_VERSION,
-  // which would wipe every other saved preference.
-  if(localStorage.getItem('interp') === '0'){
-    saved = 'none'; localStorage.setItem('interpModel', 'none');
-    localStorage.removeItem('interp');
-  }
-  localStorage.removeItem('svpNvof');   // retired: the SVP models are gone
-  if(saved === 'svp' || saved === 'svpnvof'){  // the default model takes over
-    saved = 'gmfss'; localStorage.setItem('interpModel', 'gmfss');
-  }
+  const saved = localStorage.getItem('interpModel');
   if(saved === 'none'){     // interpolation off: leave the whole group unticked
     for(const b of MODEL_BOXES()) b.checked = false;
     return;
