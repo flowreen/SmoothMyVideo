@@ -15,10 +15,12 @@ export interface RenderArgs {
   rife_drba: boolean;
   lsfg: boolean;
   fruc: boolean;
+  fsrfg: boolean;
   dlssg: boolean;
   nvof: boolean;
   no_interp: boolean;
   rtx_vsr: boolean;
+  fsr_upscale: boolean; // --fsr-upscale: AMD FSR 3.1 in RTX VSR's resize (the two exclude each other)
   rtx_hdr: boolean;
   restore: boolean;
   no_gpu_fit: boolean; // --no-gpu-fit: no video memory fit (the host's batch and Auto's working size)
@@ -170,7 +172,16 @@ export function outputSize(w: number, h: number, upscaleF: number, upscale: bool
 
 /** GMFSS is the default model: no other model flag and frames are generated. */
 export function isGmfss(args: RenderArgs): boolean {
-  return !(args.rife || args.rife_drba || args.lsfg || args.fruc || args.dlssg || args.nvof || args.no_interp);
+  return !(
+    args.rife ||
+    args.rife_drba ||
+    args.lsfg ||
+    args.fruc ||
+    args.fsrfg ||
+    args.dlssg ||
+    args.nvof ||
+    args.no_interp
+  );
 }
 
 /** Why an --nvof render cannot run, or null. */

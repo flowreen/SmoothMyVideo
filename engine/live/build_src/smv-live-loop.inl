@@ -1020,13 +1020,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // "fruc" (Smooth Motion): the server feeds the NvOFFRUC bridge the PQ-encoded frames like rife, the bridge
         // quantises them to 8-bit BGRA for the flow and the warp, so only the TWEENS carry 8-bit
         // PQ precision (the real frames stay full precision); far better than the SDR capture
-        // of an HDR-presented window, which is 2-3x over-bright and clipped (below).
+        // of an HDR-presented window, which is 2-3x over-bright and clipped (below). "fsrfg" (AMD FSR frame
+        // generation) takes FRUC's HDR rule at fp16 (nativeFsrfgPair).
         const bool hdrCapable =
             g_backend == BK_DLSSG ||
             (g_backend == BK_SERVER &&
              (g_serverBackend == L"echo" || g_serverBackend == L"rife" || g_serverBackend == L"gmfss" ||
               g_serverBackend == L"blend" || g_serverBackend == L"nvof" || g_serverBackend == L"rifedrba" ||
-              g_serverBackend == L"fruc"));
+              g_serverBackend == L"fruc" || g_serverBackend == L"fsrfg"));
         // AUTO: HDR runs whenever the display has Windows HDR on and the mode supports it. A
         // "purple screen" at the start was the model-load passthrough presenting raw FP16 capture
         // bytes into the R10A2 swap chain (a startup transient, suppressed below); the
@@ -1866,14 +1867,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const double userCap = adaptTarget * lockDtMs / 1000.0;
             const double ceiling = srv.shmSlots ? srv.shmSlots : genFrames + 1;
             auto fits = [&](uint32_t m) { return m >= 2 && m <= ceiling && m <= userCap * 1.03 && m - 1 <= r * 1.03; };
-            // FRUC's midpoint tree computes exact phases only at its nodes k / 2^L (L <= frMpCap): any other ladder
-            // or grid phase snaps to the nearest node and costs the whole tree (3 calls a pair at depth 2), so a
-            // tween's cost and the throttle's answer swing with the mode. Its ladders are the powers of two up to
-            // 2^frMpCap, the largest that fits; a step up needs 3 % headroom.
+            // FRUC's midpoint tree computes exact phases only at its nodes k / 2^L (L <= 4, one bridge instance a
+            // level): any other ladder or grid phase snaps to the nearest node and costs the whole tree (3 calls a
+            // pair at depth 2), so a tween's cost and the throttle's answer swing with the mode. Its ladders are the
+            // powers of two up to x16 (fewer when an instance could not be made), the largest that fits; a step up
+            // needs 3 % headroom.
             if (srv.nr && srv.nr->fruc && srv.nr->frMp)
             {
                 uint32_t best = 0;
-                for (uint32_t m = 2; m <= (1u << srv.nr->frMpCap); m *= 2)
+                const int levels = (std::min)(4, srv.nr->frInstMax);
+                for (uint32_t m = 2; m <= (1u << levels); m *= 2)
                     if (fits(m) && (m <= lockLogged || m - 1 <= r * 0.97))
                         best = m;
                 return gridLock ? best : 0;

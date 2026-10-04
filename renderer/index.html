@@ -255,7 +255,7 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA Optical Flow API 5.0, run by the driver on the GPU's optical-flow engine">
         <input type="checkbox" id="modelnvof"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA Optical Flow <span class="hint">(NVIDIA's optical-flow hardware, nothing to install; very fast motion goes soft)</span>
+        NVIDIA Optical Flow <span class="hint">(NVIDIA's optical-flow hardware; very fast motion goes soft)</span>
       </label>
     </div>
     <div class="row">
@@ -296,6 +296,14 @@
         <input type="checkbox" id="modelfruc"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         NVIDIA Smooth Motion <span class="hint">(NVIDIA's optical-flow hardware; the lowest quality, varies run to run)</span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" id="modelfsrfglabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 3.1.6 frame generation (FidelityFX SDK 2.3.0)">
+        <input type="checkbox" id="modelfsrfg"
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        <span style="white-space:nowrap;">AMD FSR 3.1</span> <span class="hint">(frame generation from games; varies run to run)</span>
       </label>
     </div>
     <div id="dlsssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -392,7 +400,14 @@
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA RTX Video Super Resolution 1.6.0 (RTX Video SDK)">
         <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill or a DLSS mode below DLAA enlarges</span>; off = Lanczos3)</span>
+        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill or a DLSS mode below DLAA enlarges</span>)</span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" id="fsruplabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 3.1.5 upscaling (FidelityFX SDK 2.3.0)">
+        <input type="checkbox" id="fsrup" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        <span style="white-space:nowrap;">AMD FSR 3.1</span> <span class="hint">(AMD's upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill or a DLSS mode below DLAA enlarges</span>)</span>
       </label>
     </div>
     <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">

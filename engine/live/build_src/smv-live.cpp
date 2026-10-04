@@ -96,7 +96,7 @@ static uint32_t H = 1080;
 // chain, its pacer presents generated frames, needs RTX 40/50 + foreground). BK_IDENTITY =
 // no Streamline at all: captured frames are presented directly (the SL-free base of the
 // backend-agnostic server route). BK_SERVER = a model backend (rife, blend, gmfss, nvof, fruc,
-// rifedrba, echo) run by the in-process native host (smv-live-native.inl); it returns N output
+// fsrfg, rifedrba, echo) run by the in-process native host (smv-live-native.inl); it returns N output
 // frames per input and this host paces their presentation across the measured capture
 // interval. Comments that name functions of engine/live_server.py (the python server this host
 // replaced) record where the math was ported from.
@@ -162,6 +162,7 @@ static bool g_noHudLat = false;                // --no-hud-latency: keep the rea
 static bool g_noFillMouse = false;             // --no-fill-mouse: Fill leaves the mouse alone (FillMouse)
 static double g_sharpen = 0.0;                 // --sharpen S: Adaptive Sharpen strength 0..2 (both routes)
 static bool g_rtxVsr = false;                  // --rtx-vsr: forwarded to the server (VSR fill upscaler)
+static bool g_fsrUp = false;                   // --fsr-upscale: AMD FSR upscaling in RTX VSR's resize (both routes)
 static int g_upscaleH = 0;                     // --upscale H: forwarded to the server (the app's "Upscale to"
                                                // height as the internal render size before the fit)
 static bool g_restore = false;                 // --restore: forwarded to the server (Real-ESRGAN first on
@@ -723,10 +724,11 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 // smv-live.exe --offline --w W --h H --multi N [--frames T] [--pixfmt rgb48le|rgb24]
 //               [--script s] [--pause-file P]
 //               [--ifnet E --encode E --jit J --ph N --pw N --batch B]
-//               [--nvof | --no-interp | --gmfss | --drba | --fruc] [--cache DIR] (--no-interp = no model, --multi ignored)
+//               [--nvof | --no-interp | --gmfss | --drba | --fruc | --fsrfg] [--cache DIR] (--no-interp = no model,
+//               --multi ignored)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
 //               (no --ifnet = the host finds or builds the engines itself, lkOfflineRife)
-//               the per-frame passes: [--out-w W --out-h H] [--restore] [--rtx-vsr]
+//               the per-frame passes: [--out-w W --out-h H] [--restore] [--rtx-vsr | --fsr-upscale]
 //               [--dlssnr --nr-structure F --nr-tone F --nr-style N [--nr-delta PATH]] [--sharpen S] [--rtx-hdr ...]
 // Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
 // stdout in the same pixfmt (the encoder pipe). Real frames go out from the host buffer they came
@@ -1292,6 +1294,7 @@ struct OfflineArgs
     bool gmfss = false;                // --gmfss: the GMFSS model (live's engine set and chain, lkOfflineGmfss)
     bool drba = false;                 // --drba: RIFE with DRBA timing (live's lag-1 windows, drba_loop's grid)
     bool fruc = false;                 // --fruc: Nvidia Smooth Motion (live's nvoffruc bridge path, no engine)
+    bool fsrfg = false;                // --fsrfg: AMD FSR frame generation (FRUC's route, our smv_fsrfg_bridge.dll)
     double fpsRatio = 0.0;             // --fps-ratio R: --fps mode, render.py's ratio (repr, so the same double)
     bool dlssg = false;                // --dlssg: DLSS 4.5, the dlssg2f.exe --server child (DgChild), 2x..6x
     // resume: render.py's _try_resume mapping. The decoder already skipped
@@ -1383,6 +1386,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.drba = true;
         else if (wcscmp(argv[i], L"--fruc") == 0)
             oa.fruc = true;
+        else if (wcscmp(argv[i], L"--fsrfg") == 0)
+            oa.fsrfg = true;
         else if (wcscmp(argv[i], L"--dlssg") == 0)
             oa.dlssg = true;
         else if (wcscmp(argv[i], L"--fps-ratio") == 0 && i + 1 < argc)
@@ -1419,6 +1424,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0)
             g_rtxVsr = true;
+        else if (wcscmp(argv[i], L"--fsr-upscale") == 0)
+            g_fsrUp = true;
         else if (wcscmp(argv[i], L"--restore") == 0)
             g_restore = true;
         // RTX HDR: TrueHDR once per decoded frame after DLSS 5 and Sharpen, before the model; x2rgb10le out
@@ -1484,9 +1491,9 @@ static bool offlineArgsValid(const OfflineArgs& oa)
         LOG("offline: need --w --h (>= 16) and --multi 2..65 (or --no-interp or --fps-ratio)\n");
         return false;
     }
-    if ((int)oa.echo + (int)oa.nvof + (int)oa.gmfss + (int)oa.drba + (int)oa.fruc + (int)oa.dlssg > 1)
+    if ((int)oa.echo + (int)oa.nvof + (int)oa.gmfss + (int)oa.drba + (int)oa.fruc + (int)oa.fsrfg + (int)oa.dlssg > 1)
     {
-        LOG("offline: --no-interp, --nvof, --gmfss, --drba, --fruc and --dlssg exclude each other\n");
+        LOG("offline: --no-interp, --nvof, --gmfss, --drba, --fruc, --fsrfg and --dlssg exclude each other\n");
         return false;
     }
     if (oa.fpsRatio != 0.0 && (oa.echo || oa.nvof || oa.dlssg || !(oa.fpsRatio > 0.0 && oa.fpsRatio <= 1000.0)))
@@ -1511,7 +1518,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
 // renders at 854x480 and 1920x1080 with the working size at the decode, a quarter on top): RIFE and Frame Blend
 // nativeOfflineRifeMiB (the IFNet at the decode), DRBA 310 + 1034 a padded megapixel (1028 measured with the tween
 // stored in fp16, + 6 for its fp32 store), GMFSS 393 + 1623, Smooth Motion
-// 461 + 182, NVIDIA Optical Flow 233 + 179, no interpolation 225 + 41; the output's buffers beyond the working size, 25
+// 461 + 182, AMD FSR frame generation 259 + 368 and 18 + 163 a tree level beyond the first, NVIDIA Optical Flow 233 +
+// 179, no interpolation 225 + 41; the output's buffers beyond the working size, 25
 // a megapixel (1920x1080 and 3840x2160 outputs of a 960x540 render); the passes around the model
 // (nativeOfflineEffectsMiB). Prints `OFFLINE FIT i ROOM NEED0 NEEDi` in MiB: the first candidate that fits
 // nativeVideoMemoryRoom(), the last when none does, 0 without a room figure. No render and no CUDA.
@@ -1549,6 +1557,16 @@ static int offlineFitWork(const OfflineArgs& oa)
             model = 393.0 + 1623.0 * work;
         else if (oa.fruc)
             model = 461.0 + 182.0 * work;
+        else if (oa.fsrfg)
+        {
+            // one bridge instance a level of the pair's midpoint tree (nativeFrucDepth: x2 / x4 / x8 / x16 = 1 / 2 / 3
+            // / 4 levels, any other multiple and --fps 3); measured over x2 / x4 renders at 854x480 and 1708x960
+            const int m = oa.multi;
+            const int levels = oa.fpsRatio == 0.0 && m >= 2 && (m & (m - 1)) == 0
+                                   ? (m >= 16 ? 4 : (m >= 8 ? 3 : (m >= 4 ? 2 : 1)))
+                                   : 3;
+            model = 259.0 + 368.0 * work + (levels - 1) * (18.0 + 163.0 * work);
+        }
         else if (oa.nvof)
             model = 233.0 + 179.0 * work;
         else if (oa.echo)
@@ -1697,6 +1715,24 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.fruc = true;
         nr.ph = (h + 63) / 64 * 64;
         nr.pw = (w + 63) / 64 * 64;
+        nr.w = w;
+        nr.h = h;
+        nr.cw = w;
+        nr.ch = h;
+        nr.dw = w;
+        nr.dh = h;
+        nr.batchMax = 1;
+    }
+    else if (oa.fsrfg)
+    {
+        // AMD FSR frame generation: FRUC's route with its own bridge (NativeRife's fsrfg notes), unpadded: FSR and the
+        // Optical Flow engine take any size from 32x32
+        if (!lkOfflineFsrfg(script, nr.frucDir))
+            return 2;
+        nr.fruc = true;
+        nr.fsrfg = true;
+        nr.ph = h;
+        nr.pw = w;
         nr.w = w;
         nr.h = h;
         nr.cw = w;
@@ -1973,6 +2009,13 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     if (nvPre && !cm((void**)&nr.dSrcPl, (size_t)3 * srcW * srcH * sizeof(float), "decoded source frame"))
         return 2;
+    if (g_dlssnr && (w < kNrMinWorkW || h < kNrMinWorkH))
+    {
+        LOG("[dlss5] unavailable, skipping: the frame %dx%d is below DLSS 5's minimum, %d px wide and %d high (a "
+            "smaller frame resets the GPU)\n",
+            w, h, kNrMinWorkW, kNrMinWorkH);
+        g_dlssnr = false;
+    }
     if (g_dlssnr)
     {
         // DLSS 5: the NR core with its own bring-up (a private D3D12 device) at the
@@ -2214,12 +2257,14 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         w, h, fmt16 ? "rgb48le" : "rgb24", outW, outH, oa.outX2 ? "x2rgb10le" : (outIs16 ? "rgb48le" : "rgb24"), multi,
         nr.pw, nr.ph, batchMax, g_offlineGraph ? "on" : "off",
         nr.nvof ? ", model nvof"
-                : (nr.noEngine
-                       ? ", engine=none (effects only)"
-                       : (nr.gmfss ? ", model gmfss"
-                                   : (nr.drba ? ", model rife drba"
-                                              : (nr.fruc ? ", model fruc" : (oa.dlssg ? ", model dlss 4.5" : ""))))),
-        nr.restore ? ", restore" : "", nr.vsr ? ", rtx vsr" : ((outW != w || outH != h) ? ", lanczos3 upscale" : ""),
+                : (nr.noEngine ? ", engine=none (effects only)"
+                               : (nr.gmfss ? ", model gmfss"
+                                           : (nr.drba ? ", model rife drba"
+                                                      : (nr.fruc ? (nr.fsrfg ? ", model fsrfg" : ", model fruc")
+                                                                 : (oa.dlssg ? ", model dlss 4.5" : ""))))),
+        nr.restore ? ", restore" : "",
+        nr.vsr ? (nr.fsrUp ? ", amd fsr upscale" : ", rtx vsr")
+               : ((outW != w || outH != h) ? ", lanczos3 upscale" : ""),
         nr.nrHost ? ", dlss 5" : "", nr.sharpen > 0.0f ? ", sharpen" : "", nr.rtxHdr ? ", rtx hdr" : "",
         (double)(nowQpc100() - tStart) / 1e7);
     if (fpsMode)
@@ -3491,6 +3536,7 @@ static void resetSessionGlobals()
     g_noFillMouse = false;
     g_sharpen = 0.0;
     g_rtxVsr = false;
+    g_fsrUp = false;
     g_upscaleH = 0;
     g_restore = false;
     g_dlssnr = false;
@@ -3597,6 +3643,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0)
             g_rtxVsr = true;
+        else if (wcscmp(argv[i], L"--fsr-upscale") == 0)
+            g_fsrUp = true;
         else if (wcscmp(argv[i], L"--upscale") == 0 && i + 1 < argc)
             g_upscaleH = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--restore") == 0)
@@ -4034,6 +4082,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_dlssMode = 0; // the globals an item's flags may set, which must not carry over
             g_sharpen = 0.0;
             g_rtxVsr = false;
+            g_fsrUp = false;
             g_restore = false;
             g_rtxHdr = false;
             wcscpy_s(g_hdrColor, L"vivid");

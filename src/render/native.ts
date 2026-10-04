@@ -241,20 +241,22 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const SHARPEN = clamp(args.sharpen, 0.0, 2.0);
   const NO_INTERP = args.no_interp,
     FRUC_MODE = args.fruc,
+    FSRFG_MODE = args.fsrfg,
     DLSSG_MODE = args.dlssg;
   const RIFE_MODE = args.rife || args.rife_drba,
     DRBA_MODE = args.rife_drba,
     LSFG_MODE = args.lsfg;
   const NVOF_MODE = args.nvof;
-  if ([FRUC_MODE, DLSSG_MODE, RIFE_MODE, LSFG_MODE, NVOF_MODE].filter(Boolean).length > 1) {
+  if ([FRUC_MODE, FSRFG_MODE, DLSSG_MODE, RIFE_MODE, LSFG_MODE, NVOF_MODE].filter(Boolean).length > 1) {
     throw new RenderExit(
-      '--fruc, --dlssg, --rife/--rife-drba, --lsfg and --nvof are ' +
+      '--fruc, --fsrfg, --dlssg, --rife/--rife-drba, --lsfg and --nvof are ' +
         'mutually exclusive interpolation backends; pick one',
     );
   }
   let UPSCALE_F = args.upscale <= 0 ? 1.0 : clamp(args.upscale, 1.0 / 16, 16.0);
   let UPSCALE = UPSCALE_F !== 1.0;
   const RTX_VSR = args.rtx_vsr;
+  const FSR_UP = args.fsr_upscale && !RTX_VSR;
   let RTX_HDR = args.rtx_hdr;
   const DV_EXPORT = args.dv,
     HP_EXPORT = args.hdr10plus,
@@ -335,9 +337,11 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
           ? 'drba'
           : FRUC_MODE
             ? 'fruc'
-            : DLSSG_MODE
-              ? 'dlssg'
-              : 'rife';
+            : FSRFG_MODE
+              ? 'fsrfg'
+              : DLSSG_MODE
+                ? 'dlssg'
+                : 'rife';
   // W x H = the decode, WORK = the DLSS mode x the output (DLSS 5 and the model); on Auto the working size fits the
   // free video memory (autoFit), a resumed render keeps the mode it was made with
   const fitArgs =
@@ -352,6 +356,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
             : []),
           ...(RTX_HDR ? ['--rtx-hdr'] : []),
           ...(RTX_VSR ? ['--rtx-vsr'] : []),
+          ...(FSR_UP ? ['--fsr-upscale'] : []),
           ...(args.restore ? ['--restore'] : []),
           ...(args.no_gpu_fit ? ['--no-gpu-fit'] : []),
         ];
@@ -392,6 +397,10 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
           'to use GMFSS.',
       );
     }
+  } else if (kind === 'fsrfg') {
+    const fgdir = env.SMV_FSRFG_DIR || path.join(ENGINE, 'fsrfg');
+    if (!isFile(path.join(fgdir, 'smv_fsrfg_bridge.dll')))
+      throw new RenderExit(`AMD FSR frame generation unavailable: smv_fsrfg_bridge.dll not found in ${fgdir}`);
   } else if (kind === 'dlssg') {
     const dgdir = env.SMV_DLSSG_DIR || path.join(ENGINE, 'dlssg');
     const miss = [
@@ -410,6 +419,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (NO_INTERP)
     say('no-interp mode: GMFSS interpolation disabled (re-encode at source fps with optional Adaptive Sharpen)\n');
   else if (FRUC_MODE) say('Using the NVIDIA Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n');
+  else if (FSRFG_MODE) say('Using the AMD FSR frame generation backend for interpolation (FSR 3.1.6, native host)\n');
   else if (DLSSG_MODE) say('Using the DLSS Frame Generation backend for interpolation (DLSS 4.5)\n');
   else if (NVOF_MODE) say('Using the NVIDIA Optical Flow backend for interpolation (native host)\n');
   else if (RIFE_MODE) say('Using the RIFE backend for interpolation (4.26 heavy, native host)\n');
@@ -614,11 +624,13 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (kind === 'gmfss') nargs.push('--gmfss');
   if (kind === 'drba') nargs.push('--drba');
   if (kind === 'fruc') nargs.push('--fruc');
+  if (kind === 'fsrfg') nargs.push('--fsrfg');
   if (kind === 'dlssg') nargs.push('--dlssg');
   if (FPS_MODE && !NO_INTERP) nargs.push('--fps-ratio', pyFloatRepr(ratio as number));
   if (OUT_W !== W || OUT_H !== H) {
     nargs.push('--out-w', String(OUT_W), '--out-h', String(OUT_H));
     if (RTX_VSR) nargs.push('--rtx-vsr');
+    if (FSR_UP) nargs.push('--fsr-upscale');
   }
   if (SHARPEN > 0) nargs.push('--sharpen', pyG(SHARPEN));
   if (args.restore) nargs.push('--restore');

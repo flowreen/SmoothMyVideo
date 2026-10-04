@@ -246,6 +246,10 @@ RTX VSR / HDR and all three codecs.
   harness gates.
 * `engine/nvoffruc/`: the "NVIDIA Smooth Motion" bridge to NvOFFRUC (user-installed DLLs), called
   by the host.
+* `engine/fsrfg/`: the AMD FSR frame generation bridge (`smv_fsrfg_bridge.dll`: FSR 3.1.6 built from
+  AMD's MIT source with our bridge, committed and shipped; the recipe in `build_src/`), called by the host.
+* `engine/fsrup/`: the AMD FSR upscaling bridge (`smv_fsrup_bridge.dll`, ours) beside AMD's signed
+  FidelityFX loader + upscaler DLLs (MIT), all committed and shipped; the recipe in `build_src/`.
 * `engine/dlssg/`: the DLSS 4.5 frame generation host (`dlssg2f.exe`, D3D12, Streamline runtime
   bundled), driven by the native host.
 * `engine/dlssnr/`: the DLSS 5 Neural Rendering pass (`--dlssnr`): the NR core around NGX feature
@@ -347,8 +351,8 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 ```
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..10] [--no-interp]
-  [--rife] [--rife-drba] [--lsfg] [--nvof] [--fruc] [--dlssg] [--no-gpu-fit]
-  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr] [--rtx-hdr] [--dv] [--hdr10plus]
+  [--rife] [--rife-drba] [--lsfg] [--nvof] [--fruc] [--fsrfg] [--dlssg] [--no-gpu-fit]
+  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr | --fsr-upscale] [--rtx-hdr] [--dv] [--hdr10plus]
   [--hdr-color vivid|rtx|raw] [--hdr-saturation N] [--hdr-contrast N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
@@ -438,6 +442,21 @@ Models (GMFSS is the default, the anime specialist):
   size keep SDR content inside the range (both edit its SDR view, see `--sharpen` and the Passes
   paragraph below). GMFSS's SDR pairs use the same test. `SMV_FRUC_SDR_PAIRS=0` = every pair as
   the codes.
+* `--fsrfg` "AMD FSR frame generation": AMD's FSR 3.1.6 frame generation (the analytic one; FSR FG 4's
+  ML model needs an AMD 9000 series GPU), built from source with its optical flow's scene-change reset
+  removed (a detected cut made it copy the next frame in place of a tween; video gives FSR no cut
+  signal, and a repeated frame is a hold), in our `engine/fsrfg/smv_fsrfg_bridge.dll`. It runs on
+  Smooth Motion's route: one tween at t = 0.5 per call, so every tween is a node of the pair's
+  midpoint tree, level L on bridge instance L - 1, each instance fed one continuous stream (instance
+  0 every real frame in order, tweens or not; the stream's first frame resets it, a gap re-feeds the
+  missing frame without a reset: after a reset FSR's next 10 tweens follow the vectors alone). Its
+  motion vectors are NVIDIA optical flow (both directions, fast, grid 1 or 4 where 1 is refused,
+  ABGR8): the previous frame is the input, this one the reference, the backward field = FSR's
+  current -> previous convention; depth is a constant 0.5. Frames go to the bridge as RGBA16F
+  through D3D12 buffers shared with CUDA and one shared fence (GPU-side waits, no CPU copy). HDR
+  planes follow Smooth Motion's SDR-pair rule at fp16 (`SMV_FSRFG_SDR_PAIRS=0` = every pair as the
+  codes). Tears at occlusions on fast pans much like Smooth Motion; not run-to-run stable (AMD's own
+  DLL changes about 3 % of a 1080p tween's pixels between two runs, 42 dB).
 * SVP (`--svp` / `--svp-nvof`, live `svp` / `svpnvof`, svpflow from a local SVP 4 install in the
   runtime's VapourSynth) was REMOVED 2026-09-21 so the app no longer depends on SVP 4, SVP Manager
   or VapourSynth; `--nvof` is its replacement. To bring it back, revert the commit "remove the SVP
@@ -504,7 +523,14 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
 * `--upscale F`: the output size; bare = 1.5, clamp 1/16..16; above 8192 px auto-switches to a CPU
   AV1 / VVC encoder with a fail-closed RAM preflight (true 16K needs about 54 GB free).
   `--rtx-vsr` uses RTX Video Super Resolution for an enlarging resize (the GUI ticks it by
-  default), otherwise Lanczos3. Downscales
+  default), otherwise Lanczos3. `--fsr-upscale` puts AMD FSR 3.1.5 in that same resize instead (the two
+  exclude each other; with both, RTX VSR keeps it and the host says so): AMD's signed FidelityFX loader +
+  upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, every frame of that resize's stream in order
+  (the first resets), its motion vectors from NVIDIA optical flow (the FSR FG route's: both directions,
+  fast, grid 1), a constant depth, no jitter; RTX VSR's rules hold (SDR only, enlarging only, one resize).
+  AMD's FSR 3.1.5 is deterministic: the host's frames equal AMD's own run on the same frames byte for byte
+  (harness `fsr_framegen\host\fsrup_gate.py`). On the measured anime clips (480p -> 1080p) it scored below
+  Lanczos3 and RTX VSR on LPIPS (Tsuihou 0.176 vs 0.169 / 0.124, dragon 0.134 vs 0.116 / 0.120). Downscales
   (F below 1) are folded into the decode.
 * `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame at the working size, after Restore and
   the resize, before the interpolation, DLAA (scaling
@@ -515,6 +541,11 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   `engine/dlssnr`, otherwise the frame passes through with a notice. About 10 ms per 1080p frame
   on the RTX 5090 Laptop, about 25 ms with the pipe transport. A host that dies is restarted once,
   then the pass is disabled for the rest of the render. Coexists with the RTX passes in one process.
+  A frame below 128 px wide or 64 px high runs without DLSS 5 on both routes (`[dlss5] unavailable,
+  skipping: the frame WxH is below DLSS 5's minimum` / `live DLSS 5 skipped for this session: ...`):
+  DLSS 5's GPU work never completes on a 64 px wide frame (a TDR, a black screen). The working-size
+  floor raises a DLSS mode's share to 128 px wide, but never above the frame itself (a tiny video or
+  window); gate `harness\dlss5_tiny_frame`.
 * `--sharpen S`: Adaptive Sharpen at the working size after DLSS 5, before RTX HDR and the model,
   strength S in 0..2 (`curve_height`; bare = 1.0, the author's default and the GUI's; 0.3 to 2.0 is
   the author's reasonable range). bacondither's DX11 two-pass HQ version (2021-09-10,
@@ -611,9 +642,10 @@ Output:
   after run, in separate processes or through the resident host, and the product encoder then writes
   byte-identical files. That holds for every model on the fixed-shape TensorRT-RTX engines, the host
   kernels (the splats accumulate in int64 fixed point), the NGX passes (DLSS 5, RTX VSR, RTX HDR),
-  with TensorRT-RTX graph capture on or off. The exception is `--fruc`: NvOFFRUC changes about 1 in 5
+  with TensorRT-RTX graph capture on or off. The exceptions are `--fruc`: NvOFFRUC changes about 1 in 5
   generated frames very slightly from run to run, inside NVIDIA's library (serialising every CUDA
-  launch does not change it). `smoke.py --full` asserts the RIFE case.
+  launch does not change it), and `--fsrfg`: FSR frame generation changes about 3 % of a tween's pixels
+  from run to run, AMD's signed DLL as much as our build. `smoke.py --full` asserts the RIFE case.
 
 ## Live mode
 
@@ -624,7 +656,7 @@ five `smv-live-*.inl` parts, see the build section below).
 
 Backends: `dlssg` (Streamline DLSS Frame Generation, fixed 2x..6x, RTX 40 / 50, NVIDIA's pacer
 presents real + generated frames) or the native host (`rife`, `rifedrba`, `gmfss`, `blend`, `fruc`,
-`nvof`, `echo`), which runs every model inside the exe. Until priority 22 (2026-09-21) these were
+`fsrfg`, `nvof`, `echo`), which runs every model inside the exe. Until priority 22 (2026-09-21) these were
 the "server route" through `engine/live_server.py` on the bundled runtime; that file and its python
 classes are DELETED (git history has them), and the paragraphs below that name `live_server.py` or
 a python class describe where the host's logic was ported from.
@@ -652,7 +684,7 @@ the python class, runs one IFNet enqueue per tween with its own DRM timestep map
 pair on an exact static test and reports the one-capture lag in the latency stat. A handoff
 without the block0 engine or `lag=1` is refused. `blend` is Frame Blend's live twin (the RIFE
 engines under its own name). `fruc` is Smooth Motion's live twin: every fraction of a pair takes the
-nearest node of the pair's midpoint tree (quarters live, see the bridge section), so it is adaptive like rife / gmfss (it takes the Image scale too); it is HDR
+nearest node of the pair's midpoint tree (exact up to sixteenths, see the bridge section), so it is adaptive like rife / gmfss (it takes the Image scale too); it is HDR
 capable like rife (a frame pair inside the SDR range goes to the bridge as its SDR view, any other
 pair as the PQ codes quantised to 8-bit for the flow and the warp, so only those tweens carry 8-bit PQ
 precision while the real frames stay full precision; see `--fruc` above; the SDR capture of an
@@ -664,7 +696,10 @@ sized to, `engine=fruc`) plus `NATIVE-PATH fruc=` (the `engine/nvoffruc` folder,
 API the ctypes class uses: the (R, G, B) model planes packed to true BGRA8 by the VSR bridge's
 `k_packBgraRgb`, one bridge step per tween (feed-once, up to four FRUC instances in parallel, see the
 bridge section), `k_unpackBgraRgb` back, the same skipped-pair priming. A missing bridge / NvOFFRUC / cudart DLL refuses the session and names
-the file. `echo` is
+the file. `fsrfg` is AMD FSR frame generation's live twin on Smooth Motion's route (its ladders, x2 to
+x16, see `--fsrfg` above): the handoff answers with the unpadded geometry, `engine=fsrfg` and `NATIVE-PATH
+fsrfg=` (`engine/fsrfg`, or `SMV_FSRFG_DIR`); a missing `smv_fsrfg_bridge.dll` refuses the session and names
+the folder. `echo` is
 the effects-only route: no interpolation model ticked in the app sends
 it, the captured frames pass through at their own rate and the live effects (Restore, sharpen,
 Upscale to, RTX VSR, RTX HDR, DLSS 5) apply to each of them (with no effect on it is a bit-exact
@@ -709,7 +744,7 @@ mean); a Reset on every evaluate made the pass a pure function of the frame (0 o
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --auto-floor MODE --fit fill|monitor --sharpen S --rtx-vsr --upscale H --restore
+  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --auto-floor MODE --fit fill|monitor --sharpen S --rtx-vsr | --fsr-upscale --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --nr-passes 1..10 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
@@ -824,9 +859,10 @@ How the server route works:
   ladder instead: M - 1 tweens at k / M plus the real frame as it is, more frames for no more work.
   The grid stays for a target between two multiples that binds. Smooth Motion (FRUC) is exact only
   at its midpoint tree's nodes k / 2^L (any other phase snaps to the nearest node and costs the
-  whole tree), so it runs only the x2 / x4 ladders, the largest that fits (a step up needs 3 %
-  headroom), and the grid only when not even x2 fits: a 60 target on a 24 fps source presents a
-  steady 48. `--no-adapt` = fixed multiplier (what the smoke cases assert).
+  whole tree), so it runs only the x2 / x4 / x8 / x16 ladders (one bridge instance a tree level),
+  the largest that fits (a step up needs 3 % headroom), and the grid only when not even x2 fits: a
+  60 target on a 24 fps source presents a steady 48, a 10000 target x16's 384 when the GPU affords
+  15 tweens a pair. AMD FSR frame generation takes the same ladders. `--no-adapt` = fixed multiplier (what the smoke cases assert).
 * Slot sizing: the exe measures the source rate at startup and sizes the per-pair slot ring at
   `ceil(target / source * 1.15) + 2`, clamped by the VRAM budget (logs MEMORY-CAPPED). The slot
   count is a hard ceiling on the presented rate; the startup line reads `slots N (target T, source
@@ -887,7 +923,10 @@ DLLs; `native.ts` checks the same files by name and refuses the render with a me
 missing one), sized to the /64 pad of the source, every frame packed to true BGRA from the
 R, G, B planes, the pair's midpoint tree (one bridge call per node), never a reset; an identical pair is held and
 not fed to NvOFFRUC, and the next pair gets no priming warp, python's call sequence (harness
-`offline\gate_fruc.py`). `--fps` mode runs there for every one of these models (2026-09-24):
+`offline\gate_fruc.py`). AMD FSR frame generation (`--fsrfg`) takes the same route with its own bridge
+(`lkOfflineFsrfg`: `SMV_FSRFG_DIR` or `engine\fsrfg`), unpadded, every frame fed (harness
+`fsr_framegen\host\host_gate.py`: against AMD's frame generation driven directly on the same frames and
+vectors, inside FSR's own run-to-run spread). `--fps` mode runs there for every one of these models (2026-09-24):
 `native.ts` hands `--fps-ratio` (its ratio as python's `repr`, so the host parses the same double) and the
 host renders `render_loops.fps_loop` (DRBA: `drba_loop`) on the same `_pair_fracs` grid in the
 same double arithmetic: every output an interior slot, zero or more per pair, one tween per
@@ -1005,7 +1044,11 @@ frames a captured frame yields, from the fps target) is a session's last allocat
 the card at most, and only the slots the free video memory holds beside what the first frames still add
 (`nativeRingFit`, `nativeLiveLateNeed`: DLSS 5's first frames, 120 MiB + 16.6 a megapixel a pass, and FRUC's
 buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel, measured by NVAPI from the
-ring to the steady session, a quarter on top; the other routes add nothing after it). Fewer slots lower
+ring to the steady session, a quarter on top; AMD FSR frame generation's second midpoint instance and its
+node frames, 35 MiB + 255 a megapixel, the process's own memory at x4 against x2, a quarter on top; when
+the slots reach x8 / x16, their third and fourth tree levels on top, the process's own memory over x4, a
+quarter on top: Smooth Motion 277 + 300 / 549 + 742 a padded megapixel, AMD FSR frame generation
+37 + 333 / 82 + 820 a megapixel; the other routes add nothing after it). Fewer slots lower
 only the output's ceiling (at most `slots` frames a captured frame) and the host says `native: video
 memory: the output ring holds N output frames per source frame instead of M ...`; 2 at least. Gate
 `harness\live_ring_memory\ring_gate.py OLD_ENGINE NEW_ENGINE` (`ring_mem.py` = the measurement). On
@@ -1014,8 +1057,9 @@ bullet under Live). Offline Auto does the same before the render plans its decod
 the source is folded into the decode, so the host cannot choose it later): native.ts `autoFit` asks
 `smv-live.exe --offline ... --fit-work WW:WH:DW:DH,...` (Auto's pick and every DLSS mode below it, plan.ts
 `autoCandidates`; no render, no CUDA), which prices each (per model: RIFE / Frame Blend `nativeOfflineRifeMiB`,
-DRBA 310 + 1028 MiB a padded megapixel, GMFSS 462 + 2446, Smooth Motion 461 + 182, NVIDIA Optical Flow 233 +
-179, no interpolation 225 + 41, measured over x2 renders at 854x480 and 1920x1080, plus 25 MiB a megapixel of
+DRBA 310 + 1028 MiB a padded megapixel, GMFSS 462 + 2446, Smooth Motion 461 + 182, AMD FSR frame generation
+259 + 368 and 18 + 163 for each midpoint-tree level beyond the first (x4 = 2 levels, x8 = 3, other multiples and
+`--fps` 3), NVIDIA Optical Flow 233 + 179, no interpolation 225 + 41, measured over x2 renders at 854x480 and 1920x1080, plus 25 MiB a megapixel of
 the output beyond the working size, all a quarter on top, and `nativeOfflineEffectsMiB`) and prints `OFFLINE
 FIT i ROOM NEED0 NEEDi`; the plan note then reads `DLSS mode Auto (M; the free video memory fits it: P needs
 about X MiB, Y MiB are free)`. A partial render keeps the mode it was made with: the resume signature carries
@@ -1460,10 +1504,11 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_CAP_DIRECT=0` | live: the 1:1 pack (`k_packInMotion`) reads a copy of the capture instead of the capture texture itself, the same bytes with one more copy a frame; the host logs `the 1:1 pack reads a copy of the capture (SMV_CAP_DIRECT=0)` (the same line names a capture array that gets no texture object); A/B lever, never a product setting |
 | `SMV_VSR_SYNC=1` | RTX VSR runs through the bridge's blocking export (a drain of the stream before each call, a device-wide sync after it) instead of the event-ordered one, and the host times each call (`RTX VSR eval N ms mean`); the same path an older bridge without the async export takes; A/B lever, never a product setting |
 | `SMV_VRAM_MIB=<MiB>` | the GPU's memory as the app's memory checks see it, the free memory shrinks with it (both routes): a smaller card's trigger test of the cap and of the `video memory ran out` line on a card everything fits in |
-| `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
+| `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_FSRFG_DIR`, `SMV_FSRUP_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
+| `SMV_FSRFG_SDR_PAIRS=0` | on HDR planes AMD FSR frame generation gets every frame pair as the HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
-| `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..4, default 3 offline, 2 live) |
+| `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..4, default 3 offline, 2 live; exact nodes go to depth 4 either way) |
 | `SMV_CQ` | override the encoder CQ for measurement |
 | `SMV_NVENC_SPLIT` | override the NVENC `-split_encode_mode` for measurement (default 15 = off; 2 = two strips, 0 = ffmpeg's auto); never a product setting (the split leaves a seam line) |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
@@ -1488,7 +1533,8 @@ at it.
 
 ## Building the native components
 
-Two ctypes bridges (`engine/rtxvideo/build_src/`, `engine/nvoffruc/build_src/`) and three D3D12
+Two ctypes bridges (`engine/rtxvideo/build_src/`, `engine/nvoffruc/build_src/`), the FSR frame
+generation and upscaling bridges (`engine/fsrfg/build_src/build.py`, `engine/fsrup/build_src/build.py`) and three D3D12
 hosts (`engine/dlssg`, `engine/dlssnr`, `engine/live`, each with a `build_src/build.bat` that
 prints the missing environment variable). Nothing that needs MSVC is bundled; a recipient needs only
 the driver. Toolchain on the dev machine: VS 2019 Build Tools (`cl` 19.29) and VS 2026 Community
@@ -1589,10 +1635,11 @@ host computes the pair's whole tree to its depth, level by level, left to right
 4 / 2^L .. B) and stays in mode 1. Never compute a node alone: its instance then needs a prime
 whose optical flow spans the skipped nodes, NvOFFRUC seeds the next flow from it, and those nodes
 came out damaged (up to 28 % of a held frame). Depth: the smallest that holds every t as a node
-(offline x2 / x4 / x8 / x16 = 1 / 2 / 3 / 4 levels = 1 / 3 / 7 / 15 calls per pair); a t that is no
-node takes the nearest node at depth `SMV_FRUC_DEPTH` (default 3 offline, 2 live; live caps every
-depth there, its tweens must fit one source frame, so x5 live shows the nodes 0.25 / 0.5 / 0.5 /
-0.75). Measured on a 1440p anime clip, share of channels more than 8 levels outside a held pair's
+(x2 / x4 / x8 / x16 = 1 / 2 / 3 / 4 levels = 1 / 3 / 7 / 15 calls per pair, on both routes); a
+pair with a t that is no node takes the nearest nodes at depth `SMV_FRUC_DEPTH` (default 3
+offline, 2 live, so x5 live shows the nodes 0.25 / 0.5 / 0.5 / 0.75; offline a deeper exact t in
+the same pair deepens it, live never: a grid phase that lands on a deep node by chance would cost
+the whole deep tree for the pair's few snapped tweens). Measured on a 1440p anime clip, share of channels more than 8 levels outside a held pair's
 two real frames: 0.60 % -> 0.016 % at x4, 0.90 % -> 0.015 % at x5 (RIFE 0.009 %, NVOF 0.007 %);
 FRUC time per pair offline x4 35.8 -> 41.7 ms, x5 47.0 -> 94.6 ms; motion looks like the direct-t
 scheme's.
@@ -1605,6 +1652,61 @@ does not order one context's null stream against another's, and without both fen
 sliced at horizontal seams. The OFA
 hardware exists on Turing through Blackwell and is being removed after Blackwell per the SDK's
 deprecation notice.
+
+### AMD FSR frame generation bridge (`smv_fsrfg_bridge.dll`)
+
+AMD's FSR 3.1.6 frame generation from the FSR SDK v2.3.0 source plus `fsrfg_bridge.cpp`, in one DLL
+(committed and shipped; MIT, see THIRD_PARTY_NOTICES.md). Prerequisites: the FSR SDK v2.3.0
+(github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, release v2.3.0; `Kits/FidelityFX` is all the build
+reads), the shader compiler `FidelityFX_SC.exe` with `dxcompiler.dll` + `dxil.dll` from the FidelityFX SDK
+v1.1.4 tools (MIT; AMD's v2.x tree does not publish it), Visual Studio 2026 with the C++ workload, python.
+In `engine/fsrfg/build_src/`:
+
+```
+set FSR_SDK=C:\path\to\FidelityFX-SDK-v2.3.0
+set FFX_SC_DIR=C:\path\to\folder\with\FidelityFX_SC.exe
+python build.py
+```
+
+It copies the sources into `build_src\work` (gitignored; FidelityFX_SC found none of its includes with
+them under `%TEMP%`), removes the scene-change reset (`ffx_frameinterpolation_setup.h`: `if(Reset() ||
+HasSceneChanged())` -> `if(Reset())`), writes the two pieces AMD does not publish (the driver-provider
+header as a stub that never offers a provider, and the DLL's provider list: only the FSR 3 frame
+generation), applies four build fixes (no AGS, no PIX, `ffx_message.cpp`'s missing include, the shader
+tool's missing `entryName`: every pass compiles with `-E CS`), compiles 18 passes x 4 permutation sets
+and links `..\smv_fsrfg_bridge.dll`. The unchanged source matches AMD's signed DLL inside its own
+run-to-run spread (FSR FG is not run-to-run stable: two runs of AMD's DLL differ on about 2 % of a 1080p
+tween's pixels).
+
+C API (`fsrfg_bridge.cpp`, nvoffruc_bridge's shape): `fsrfg_create_i(i, w, h, luidLow, luidHigh, fmt,
+FsrfgShared*)` makes instance i (up to 4) on the D3D12 adapter with the CUDA device's LUID and returns
+NT handles of three shared COMMON buffers (the frame, RG16F vectors, the generated frame, with their row
+pitches) and a shared fence; `fsrfg_frame_i(i, wait, signal, reset, frameTimeMs)`: the bridge's queue
+waits for `wait`, copies the buffers into its textures, runs configure, prepare V2 (constant depth 0.5)
+and generate, copies the generated frame out and signals `signal` (non-blocking but for its two-list
+ring; no FSR shader reads the frame time); `fsrfg_destroy_i` / `fsrfg_destroy`; `fsrfg_last_error`.
+fmt 0 = RGBA8, 1 = RGBA16F (the host's). The host imports the handles as CUDA external memory and an
+external semaphore (stream signal odd, stream wait even).
+
+### AMD FSR upscaling bridge (`smv_fsrup_bridge.dll`)
+
+Our C API over AMD's signed FidelityFX loader + upscaler (FSR SDK v2.3.0, `Kits/FidelityFX/signedbin`, both in the
+SDK licence's MIT list), which ship beside it in `engine/fsrup`. In `engine/fsrup/build_src/`:
+
+```
+set FSR_SDK=C:\path\to\FidelityFX-SDK-v2.3.0
+python build.py
+```
+
+It compiles `fsrup_bridge.cpp` against the SDK's `api/include` and `upscalers/include` into `..\smv_fsrup_bridge.dll`
+and copies the two signed DLLs beside it. The bridge loads AMD's upscaler DLL by full path before the loader (the
+loader opens it by name, which the exe's folder would not resolve), then the loader. `fsrup_create(w, h, ow, oh,
+luidLow, luidHigh, want, FsrupShared*)`: a D3D12 device on the adapter with the CUDA device's LUID, the first upscaler
+version whose name starts with `want` (the host asks for "3.1"; on NVIDIA AMD's DLL offers 3.1.5 and 2.3.4), three
+shared COMMON buffers (RGBA8 frame, RG16F vectors, RGBA8 result) and a shared fence as NT handles; `fsrup_frame(wait,
+signal, reset, frameTimeMs)`: the queue waits, copies, upscales (non-linear sRGB, constant depth 0.5, no jitter,
+sharpening off), copies the result out and signals; `fsrup_destroy`, `fsrup_last_error`. The host feeds it RTX VSR's
+BGRA8 buffers through two byte-swap kernels and computes the vectors with the FSR FG route's Optical Flow session.
 
 ### DLSS 4.5 Frame Generation host (`dlssg2f.exe`)
 

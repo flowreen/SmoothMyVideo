@@ -22,6 +22,8 @@ const FILES = [
   'engine/dlssnr/build_src/shim_abi.h',
   'engine/dlssg/build_src/main.cpp',
   'engine/nvoffruc/build_src/nvoffruc_bridge.cpp',
+  'engine/fsrfg/build_src/fsrfg_bridge.cpp',
+  'engine/fsrup/build_src/fsrup_bridge.cpp',
 ];
 
 function findClangFormat() {

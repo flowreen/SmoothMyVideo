@@ -48,7 +48,7 @@ struct PipeServer
     static const char* nativeRefusal(const std::wstring& backend, HANDLE capTex, HANDLE capFence, Host* h12)
     {
         if (g_backend != BK_SERVER || !nativeBackendOk(backend))
-            return "the native host runs rife, blend, gmfss, nvof, fruc, rifedrba and echo only";
+            return "the native host runs rife, blend, gmfss, nvof, fruc, fsrfg, rifedrba and echo only";
         if (g_dlssnr && !g_nrNative)
             return "DLSS 5 is on without its native pass";
         if (!h12 || !capTex || !capFence)
@@ -194,7 +194,7 @@ struct PipeServer
         // (nativeRingFit): fewer slots lower the output's ceiling, a captured frame yields at most `slots` frames; the
         // early thread built everything else, so what NVAPI calls free now is the ring's room
         uint64_t ringB = 0;
-        const uint32_t fit = early ? nativeRingFit(*nr, shmSlot, ringB) : 0;
+        const uint32_t fit = early ? nativeRingFit(*nr, shmSlot, shmSlots, ringB) : 0;
         if (fit && fit < shmSlots)
         {
             LOG("native: video memory: the output ring holds %u output frames per source frame instead of %u (%u "

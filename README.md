@@ -76,7 +76,8 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   Uses the separately-installed open-source
   [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool).
 * 🔍 **AI upscaling to 16K + detail restoration.** NVIDIA RTX Video Super Resolution plus a Real-ESRGAN
-  restore pass, layered with the interpolation in a single render.
+  restore pass, layered with the interpolation in a single render. AMD FSR 3.1 upscaling is built in as the
+  alternative to RTX VSR (tick one or the other; neither = a classic Lanczos resize).
 * 💬 **Keeps every track.** All audio, subtitles/translations, chapters and font attachments are preserved
   (auto-switches to `.mkv` when needed), nothing silently dropped.
 * 🗜️ **Visually lossless.** HEVC / AV1 / H.266 encodes at maximum encoder effort, tuned and verified
@@ -93,7 +94,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 * 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
   detected and timed correctly, so audio never drifts out of sync.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
-  The one exception is the NVIDIA Smooth Motion model, which is non-deterministic.
+  The exceptions are the NVIDIA Smooth Motion and AMD FSR 3.1 models, which are non-deterministic.
 * 🎛️ **One size control per mode.** File renders pick the output **Size** and run every pass at it
   (Restore and the resize first, then DLSS 5 and the interpolation; RTX Video Super Resolution
   enlarges when the Size is above the source). Live's size is what **Display** shows (the window, or
@@ -140,7 +141,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   whole monitor at once (everything on it, works with every model including DLSS 4.5). **Original size** smooths only
   the window, and **Fill screen** fills the screen with it (upscaled, aspect kept;
   clicks on the stretched picture reach the matching spot of your window: while the cursor is on the picture, SMV draws it
-  and slows the pointer by the stretch, and gives the normal pointer back when the cursor leaves the picture or Live stops). With the RIFE, GMFSS or NVIDIA Smooth Motion model the smoothing is **adaptive**: the output locks to
+  and slows the pointer by the stretch, and gives the normal pointer back when the cursor leaves the picture or Live stops). With the RIFE, GMFSS, NVIDIA Smooth Motion or AMD FSR 3.1 model the smoothing is **adaptive**: the output locks to
   your fps target (the same Speed setting file renders use) and the multiplier follows the
   content, so a game dropping from 30 to 10 fps keeps playing at the same smooth rate on
   screen. The target goes up to 10000 fps; with **Fit to the GPU** ticked (the default) Live lowers the smoothing
@@ -173,6 +174,10 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   model to NVIDIA's hardware optical-flow FRUC (the same family as the driver-level Smooth Motion), for
   when you want the NVIDIA look or a non-AI reference. The lowest quality of the models, and
   non-deterministic; the NVIDIA runtime is a one-time separate download (not bundled).
+* 🔺 **AMD FSR 3.1 frame generation.** One more checkbox runs AMD's FSR 3.1 frame generation (built into
+  the app from AMD's open source, nothing to install), steered by NVIDIA's optical flow, live and for
+  file renders. It never repeats a frame in place of a new one; like Smooth Motion it tears at
+  edges on very fast pans, and it is non-deterministic.
 * 🧭 **NVIDIA Optical Flow.** One more checkbox runs NVIDIA's hardware
   optical-flow unit straight from the app, nothing to install (the NVIDIA driver
   provides it), live and for file renders. Fast, and clean on moderate motion; where very fast

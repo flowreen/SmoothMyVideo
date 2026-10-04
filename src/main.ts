@@ -703,6 +703,7 @@ let liveFit = 'monitor'; // 'monitor' = whole-screen capture 1:1 (every model in
 let liveTarget = 60; // adaptive output fps target, inherited from the renderer's Speed selectors
 let liveSharpen = 0; // live Adaptive Sharpen strength 0..2, inherited from the Sharpen controls (0 = off)
 let liveVsr = false; // RTX VSR as the live upscaler, inherited from the RTX VSR checkbox
+let liveFsrUp = false; // AMD FSR 3.1 as the live upscaler instead (its checkbox; the two exclude each other)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
 let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inherited from the NVIDIA DLSS 5 checkbox
@@ -852,6 +853,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   // the host gives RTX VSR the one resize that enlarges (the fit after the model, else the capture to the
   // working size before it) and skips it with a line when neither does
   if (liveVsr) args.push('--rtx-vsr');
+  else if (liveFsrUp) args.push('--fsr-upscale');
   // Restore: Real-ESRGAN first on every presented frame; costs most
   // of a 1080p frame budget, the panel hint says so
   if (liveRestore) args.push('--restore');
@@ -1030,6 +1032,7 @@ ipcMain.on(
       target?: number;
       sharpen?: number;
       rtxvsr?: boolean;
+      fsrup?: boolean;
       uph?: number;
       restore?: boolean;
       dlssnr?: boolean;
@@ -1056,6 +1059,7 @@ ipcMain.on(
     if (opts.target !== undefined) liveTarget = opts.target;
     liveSharpen = opts.sharpen ?? 0;
     liveVsr = !!opts.rtxvsr;
+    liveFsrUp = !!opts.fsrup;
     liveUpH = opts.uph ?? 0;
     liveRestore = !!opts.restore;
     liveDlssnr = !!opts.dlssnr;
@@ -1332,6 +1336,7 @@ type RunOpts = {
   model?: string;
   upscale?: number;
   rtxvsr?: boolean;
+  fsrup?: boolean;
   rtxhdr?: boolean;
   dv?: boolean;
   hp?: boolean;
@@ -1366,6 +1371,7 @@ function engineArgs(opts: RunOpts): string[] {
     if (opts.model === 'rifedrba') args.push('--rife-drba'); // RIFE with DRBA anime-pacing timing
     if (opts.model === 'dlssg') args.push('--dlssg'); // "DLSS 4.5" (Frame Generation) backend instead of GMFSS
     if (opts.model === 'fruc') args.push('--fruc'); // "NVIDIA Smooth Motion" backend instead of GMFSS
+    if (opts.model === 'fsrfg') args.push('--fsrfg'); // AMD FSR frame generation (our bundled bridge)
     if (opts.model === 'lsfg') args.push('--lsfg'); // Frame Blend: flow-warp interpolation
     if (opts.model === 'nvof') args.push('--nvof'); // NVIDIA Optical Flow: hardware flow + splat, native host only
     if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
@@ -1404,8 +1410,9 @@ function engineArgs(opts: RunOpts): string[] {
   // RTX VSR: the real RTX Video SDK (the engine/rtxvideo CUDA bridge) for an enlarging resize: the
   // final one from the working size (a mode below DLAA or an upscale), else the one before the
   // model; the plan skips it when nothing enlarges. Falls back to Lanczos3 if the bridge or the RTX
-  // Video runtime is unavailable.
+  // Video runtime is unavailable. AMD FSR 3.1 (bundled) takes the same resize when its box is ticked instead.
   if (opts.rtxvsr) args.push('--rtx-vsr');
+  else if (opts.fsrup) args.push('--fsr-upscale');
   // "Fit to the GPU" off: no video memory fit (the batch and Auto's working size stay as planned, slower when memory runs short)
   if (opts.nogpufit) args.push('--no-gpu-fit');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
@@ -1632,6 +1639,7 @@ ipcMain.handle(
       contrast?: number;
       upscale?: number;
       rtxvsr?: boolean;
+      fsrup?: boolean;
       restore?: boolean;
       dlssmode?: string; // the DLSS mode (dlssScaleArg)
       dlssnr?: boolean;
@@ -1669,7 +1677,9 @@ ipcMain.handle(
         args.push('--nr-passes', String(Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
       if (opts.dlssnr && opts.nrmask) args.push('--nr-mask'); // heat map of the DLSS 5 change, <prefix>_nrmask.png
       if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) args.push('--upscale', String(opts.upscale));
-      if (opts.rtxvsr) args.push('--rtx-vsr'); // the plan runs it on an enlarging resize only
+      if (opts.rtxvsr)
+        args.push('--rtx-vsr'); // the plan runs it on an enlarging resize only
+      else if (opts.fsrup) args.push('--fsr-upscale');
       if (opts.hdr)
         args.push(
           '--rtx-hdr',

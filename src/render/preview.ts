@@ -34,6 +34,7 @@ export interface PreviewArgs {
   scale: string | null; // --scale: the render's DLSS mode or working-size share
   upscale: number;
   rtx_vsr: boolean;
+  fsr_upscale: boolean;
   dlssnr: boolean;
   nr_structure: number;
   nr_tone: number;
@@ -59,6 +60,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     scale: null,
     upscale: 1,
     rtx_vsr: false,
+    fsr_upscale: false,
     dlssnr: false,
     nr_structure: 1,
     nr_tone: 1,
@@ -82,6 +84,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--rtx-hdr': 'rtx_hdr',
     '--restore': 'restore',
     '--rtx-vsr': 'rtx_vsr',
+    '--fsr-upscale': 'fsr_upscale',
     '--dlssnr': 'dlssnr',
     '--nr-mask': 'nr_mask',
   };
@@ -633,6 +636,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
     if (OW !== W || OH !== H) {
       args.push('--out-w', String(OW), '--out-h', String(OH));
       if (needVsr) args.push('--rtx-vsr');
+      else if (a.fsr_upscale && OW > W && OH > H) args.push('--fsr-upscale');
     }
     if (strength > 0) args.push('--sharpen', pyG(strength));
     if (a.restore) args.push('--restore');

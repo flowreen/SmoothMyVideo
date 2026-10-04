@@ -121,7 +121,7 @@ function fmtBytes(b){ return b >= 1e9 ? (b/1e9).toFixed(b >= 1e10 ? 0 : 1)+' GB'
 // the Speed controls. Ids are inlined rather than using MODEL_BOXES() so this stays callable before
 // that const is initialised.
 function interpOn(){
-  return ['modelgmfss','modelrife','modeldlss','modelfruc','modelnvof']
+  return ['modelgmfss','modelrife','modeldlss','modelfruc','modelfsrfg','modelnvof']
     .some(id => { const e = $(id); return !!e && e.checked; });
 }
 function srcFps(){ const [n,d]=(((info && info.fps) || '24/1')).split('/'); return (+n)/((+d)||1); }
@@ -609,7 +609,13 @@ localStorage.removeItem('encspeed');   // retired: no Encoder speed selector (ev
 localStorage.removeItem('rtxvsrOn');   // retired: its stored choice was made while RTX VSR defaulted off
 $('rtxvsr').checked = localStorage.getItem('vsrOn') !== '0';   // default ON: RTX VSR upscales unless unticked
 if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // default OFF
-$('rtxvsr').onchange = () => { localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0'); syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
+// AMD FSR 3.1 upscaling: bundled (engine/fsrup), so always ready; RTX VSR and it exclude each other (ticking one clears
+// the other), neither ticked = Lanczos3
+$('fsrup').checked = localStorage.getItem('fsrupOn') === '1';   // default OFF: RTX VSR is the default upscaler
+if($('fsrup').checked) $('rtxvsr').checked = false;
+function fsrUpOn(){ return $('fsrup').checked && !$('rtxvsr').checked; }
+$('rtxvsr').onchange = () => { localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0'); if($('rtxvsr').checked && $('fsrup').checked){ $('fsrup').checked = false; localStorage.setItem('fsrupOn', '0'); } syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
+$('fsrup').onchange = () => { localStorage.setItem('fsrupOn', $('fsrup').checked ? '1' : '0'); if($('fsrup').checked && $('rtxvsr').checked){ $('rtxvsr').checked = false; localStorage.setItem('vsrOn', '0'); } syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 $('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 syncRtx();
 // Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
@@ -746,7 +752,9 @@ function modelIsRifeDrba(){ return modelIsRife() && $('rifedrba').checked; }
 // NVIDIA Optical Flow: the driver's optical-flow hardware run by
 // smv-live.exe itself (engine --nvof, live backend nvof), so it is always ready like RIFE.
 function modelIsNvof(){ return $('modelnvof').checked; }
-const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelnvof')];
+// AMD FSR frame generation: our bridge ships in engine/fsrfg (engine --fsrfg, live backend fsrfg), always ready
+function modelIsFsrfg(){ return $('modelfsrfg').checked; }
+const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelfsrfg'), $('modelnvof')];
 function frucSetupHtml(){
   const detail = !frucBridge
     ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
@@ -766,7 +774,7 @@ async function refreshFrucState(){
 function syncModel(){
   localStorage.setItem('interpModel',
     !interpOn() ? 'none' :                          // nothing ticked = interpolation off, remembered
-    $('modelfruc').checked ? 'fruc' :
+    $('modelfruc').checked ? 'fruc' : $('modelfsrfg').checked ? 'fsrfg' :
     $('modeldlss').checked ? 'dlssg' : $('modelrife').checked ? 'rife' :
     $('modelnvof').checked ? 'nvof' : 'gmfss');
   // The DRBA sub-option only makes sense while RIFE is the chosen model (always ready: bundled).
@@ -822,7 +830,7 @@ async function doFrucInstall(source){
 }
 $('frucget').onclick = () => ipcRenderer.invoke('fruc-open-download');
 $('frucbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('fruc-choose'); if(p) doFrucInstall(p); };  // selecting a .zip auto-installs
-for(const b of ['modelgmfss','modelrife','modeldlss','modelfruc','modelnvof']) $(b).onchange = () => pickModel($(b));
+for(const b of ['modelgmfss','modelrife','modeldlss','modelfruc','modelfsrfg','modelnvof']) $(b).onchange = () => pickModel($(b));
 // The DRBA sub-option persists on its own key (default OFF: max fluidity is the app's default
 // philosophy; DRBA deliberately keeps character cadence); toggling it never clears RIFE.
 $('rifedrba').checked = localStorage.getItem('rifeDrba') === '1';
@@ -837,7 +845,7 @@ function restoreModelChoice(){
     return;
   }
   // a saved Frame Blend ('lsfg') opens as RIFE: it rendered as RIFE (the same engines, the same frames)
-  const box = saved === 'fruc' ? 'modelfruc'
+  const box = saved === 'fruc' ? 'modelfruc' : saved === 'fsrfg' ? 'modelfsrfg'
             : saved === 'dlssg' ? 'modeldlss' : saved === 'rife' || saved === 'lsfg' ? 'modelrife'
             : saved === 'nvof' ? 'modelnvof' : 'modelgmfss';
   for(const b of MODEL_BOXES()) b.checked = false;
@@ -881,6 +889,8 @@ function liveModelInfo(){
   // the fruc backend is adaptive like rife/gmfss; HDR-capable like rife (the bridge warps 8-bit PQ
   // for the tweens, the real frames keep full precision)
   if(modelIsFruc()) return { model:'fruc', name:'Smooth Motion', note:'tweens at 8-bit precision' };
+  // AMD FSR frame generation live: Smooth Motion's route (the nearest node of the pair's midpoint tree), its own bridge
+  if(modelIsFsrfg()) return { model:'fsrfg', name:'AMD FSR 3.1', note:'' };
   // NVIDIA Optical Flow: adaptive like rife (the splat takes any fraction), native only
   if(modelIsNvof()) return { model:'nvof', name:'NVIDIA Optical Flow', note:'' };
   // nothing ticked = interpolation off (same meaning as file renders): the echo backend passes
@@ -924,6 +934,7 @@ function lvSendOpts(){
     // resize that enlarges, the host picks it (none enlarges = skipped)
     sharpen: $('sharpen').checked ? parseFloat($('sharpval').value) || 0 : 0,
     rtxvsr: liveVsrOn(),
+    fsrup: fsrUpOn(),   // AMD FSR 3.1 takes the same resize when ticked instead of RTX VSR
     // no "Upscale to": Live's size is what Display presents (the window or the screen), the DLSS mode its speed
     // Restore (AI detail): Real-ESRGAN first on every presented frame, python route only
     restore: restoreOn(),
@@ -943,7 +954,7 @@ function lvSendOpts(){
   const load = mi.model === 'rife' ? 'starts in ~3s (~45s the first time at a new window size)'
     : mi.model === 'rifedrba' ? 'starts in ~3s (~55s the first time at a new window size)'
     : mi.model === 'gmfss' ? 'loads in ~4s (~30s the first time at a new window size)'
-    : mi.model === 'nvof' ? 'starts in a few seconds' : '';
+    : mi.model === 'nvof' || mi.model === 'fsrfg' ? 'starts in a few seconds' : '';
   // A fixed model cannot hit an arbitrary target exactly: it picks the nearest whole multiple
   // of the captured window's own rate, so say that instead of promising the exact number.
   const lvT = liveTargetFps();
@@ -967,7 +978,7 @@ function lvModelUi(){
   const effTxt = [resTxt, nrTxt].filter(Boolean).join(' · ');
   $('lvfithint').textContent =
     $('lvfit').value === 'fill' ? 'enlarges the window to fill its monitor, aspect kept · '
-                                  + (liveVsrOn() ? 'RTX VSR upscale' : 'upscale')
+                                  + (liveVsrOn() ? 'RTX VSR upscale' : fsrUpOn() ? 'AMD FSR upscale' : 'upscale')
                                   + (effTxt ? ' · ' + effTxt : '')
     : $('lvfit').value === 'monitor' ? 'smooths everything on the monitor the window is on'
                                        + (effTxt ? ' · ' + effTxt : '')
@@ -1317,7 +1328,7 @@ let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown 
 function prevSettingsSig(){                 // everything that changes what the processed pane shows
   const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
   return [sharpStrength(), restoreOn(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
-          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), nrOn(), nrStructure(), nrTone(), nrStyle(), nrPasses(), nrMaskOn(),
+          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), fsrUpOn(), nrOn(), nrStructure(), nrTone(), nrStyle(), nrPasses(), nrMaskOn(),
           dlssMode()];
 }
 let lastPrevInput = null;                    // which video the shown original belongs to
@@ -1331,6 +1342,7 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
   const lite = previewLite; previewLite = false;
   const useHdr = lite ? false : hdr;
   const useVsr = lite ? false : !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1);   // VSR enlarges only
+  const useFsr = lite ? false : fsrUpOn() && upFactor() > 1;   // AMD FSR 3.1 the same way
   const useNr = lite ? false : nrOn();     // DLSS 5: its host takes seconds to start, so the lite pass skips it too
   inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame)].concat(sig));
   $('hdrpreview').style.display = 'block';
@@ -1352,7 +1364,7 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
     { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr: useHdr,
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
       upscale: upFactor() || 0,
-      rtxvsr: useVsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
+      rtxvsr: useVsr, fsrup: useFsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
       hdrColorPayload())); }
   catch(e){ r = { error: String(e) }; }
   setSpin($('prevprocwrap'), $('prevspin'), false);
@@ -1374,12 +1386,12 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
   const vsrOn = useVsr;              // what the processed pane actually rendered (lite skips VSR)
   const active = useHdr || sharpen > 0 || restoreOn() || upActive || useNr;
   // Plain Lanczos3 resize with no AI/enhancement pass: both panes are the same resized image, so say so.
-  const plainOnly = upActive && !vsrOn && !restoreOn() && sharpen <= 0 && !useHdr && !useNr;
-  const rtxSkipped = lite && (hdr || nrOn() || ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1));   // RTX / DLSS 5 on in settings but skipped for the fast auto-preview
+  const plainOnly = upActive && !vsrOn && !useFsr && !restoreOn() && sharpen <= 0 && !useHdr && !useNr;
+  const rtxSkipped = lite && (hdr || nrOn() || ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1) || (fsrUpOn() && upFactor() > 1));   // RTX / FSR / DLSS 5 on in settings but skipped for the fast auto-preview
   const srcHdr = !!(info && info.srcHdr);
   $('prevoriglabel').textContent = srcHdr ? 'Original (HDR, tonemapped)' : 'Original';
   const parts = []; if(restoreOn()) parts.push('Restore');
-  if(upActive) parts.push(vsrOn ? 'VSR' : upFactor() < 1 ? 'downscale' : 'upscale');
+  if(upActive) parts.push(vsrOn ? 'VSR' : useFsr ? 'FSR' : upFactor() < 1 ? 'downscale' : 'upscale');
   if(useNr) parts.push('DLSS 5');
   if(sharpen > 0) parts.push('Sharpen'); if(useHdr) parts.push('HDR');
   $('prevproclabel').textContent = !active ? 'Unchanged'
@@ -1650,6 +1662,7 @@ function startRun(){
   const dims = upDims();                               // resize target ({w,h} or null)
   const factor = upFactor();                           // arbitrary resize factor (0 = off, <1 downscales)
   const useRtxVsr = factor > 1 && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale of an enlarging resize, else Lanczos3
+  const useFsrUp = factor > 1 && fsrUpOn();            // AMD FSR 3.1 instead of RTX VSR when ticked
   const rtxhdr = hdrOn();  // HDR only when its runtime is installed and the source is SDR
   // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
   // HDR is on. Bail only when nothing at all is enabled.
@@ -1680,7 +1693,7 @@ function startRun(){
     log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
   }
   modeBtnUi(true);
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlssrange').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlssrange').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('fsrup').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push(factor < 1 ? 'downscaling' : 'upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -1703,6 +1716,7 @@ function startRun(){
   else if(interpOn() && modelIsDlss()) payload.model = 'dlssg';   // "DLSS 4.5" (Frame Generation) backend
   else if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "NVIDIA Smooth Motion" (NvOFFRUC) backend
   else if(interpOn() && modelIsNvof()) payload.model = 'nvof'; // NVIDIA Optical Flow, engine --nvof
+  else if(interpOn() && modelIsFsrfg()) payload.model = 'fsrfg'; // AMD FSR frame generation, engine --fsrfg
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
   if(nrOn()){ payload.dlssnr = true; payload.nrstructure = nrStructure(); payload.nrtone = nrTone(); payload.nrstyle = nrStyle(); payload.nrpasses = nrPasses(); }   // DLSS 5 (runtime installed)
@@ -1711,6 +1725,7 @@ function startRun(){
     payload.upscale = factor;                          // arbitrary upscale factor (target height / source)
   }
   if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else Lanczos3)
+  if(useFsrUp) payload.fsrup = true;                   // AMD FSR 3.1 upscaling (engine/fsrup)
   if(!$('gpufit').checked) payload.nogpufit = true;    // no video memory fit: the same fps, slower when memory runs short
   if(rtxhdr){ payload.rtxhdr = true;     // HDR10; engine masters at a fixed 1000-nit peak
     const hp = hdrColorPayload();        // zero-strength Dynamic Vibrance routes to the source path
@@ -1858,7 +1873,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
   clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
   modeBtnUi(lvState !== 'idle');
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlssrange').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlssrange').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('fsrup').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
     if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');

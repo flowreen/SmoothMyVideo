@@ -45,6 +45,30 @@ third-party work.
   > THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
   > (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
   > THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+* **AMD FidelityFX SDK v2.3.0: FSR 3.1.6 frame generation and FSR upscaling** (the AMD FSR 3.1 model and the
+  AMD FSR 3.1 upscaler): AMD's MIT-licensed sources (the FSR 3 frame generation and its optical flow, the FidelityFX
+  API and DX12 backend) compiled with one change (the optical flow's scene-change reset removed) and our bridge into
+  `engine/fsrfg/smv_fsrfg_bridge.dll` (the recipe: `engine/fsrfg/build_src/`; the shader compiler FidelityFX_SC and
+  DXC from the FidelityFX SDK v1.1.4 are build tools only, not shipped), and AMD's signed binaries
+  `amd_fidelityfx_loader_dx12.dll` and `amd_fidelityfx_upscaler_dx12.dll`, redistributed unmodified in
+  `engine/fsrup/` beside our `smv_fsrup_bridge.dll` (the recipe: `engine/fsrup/build_src/`). Every one of these files
+  is listed in the MIT section of the SDK's `Kits/FidelityFX/docs/license.md`. MIT License:
+
+  > Copyright (C) Advanced Micro Devices, Inc.
+  >
+  > Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+  > documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+  > the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  > permit persons to whom the Software is furnished to do so, subject to the following conditions:
+  >
+  > The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+  > the Software.
+  >
+  > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+  > THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  > AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  > TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  > SOFTWARE.
 * **NVIDIA RTX Video SDK sample code**: the compiled bridge `engine/rtxvideo/rtxvideo_cuda.dll`
   is built from NVIDIA's SDK convenience layer (sources in `engine/rtxvideo/build_src/`),
   used under the NVIDIA RTX Video SDK license. The SDK's AI feature models (`nvngx_vsr.dll`,
