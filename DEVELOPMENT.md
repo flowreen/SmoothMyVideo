@@ -479,8 +479,9 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   DLAA, up to 1440p Quality, up to 4K Performance, above Ultra Performance; lowered further while the
   render would not fit in the free video memory, native.ts `autoFit` with the host's `--fit-work`, see
   Video memory), or any number in (0, 1]
-  (the GUI's slider, always shown, offers 1..100 % and picks the mode whose rounded share it lands
-  on: 100 / 67 / 58 / 50 / 33, else Custom). `plan.ts` `workPlan` computes it once (even, at least 64,
+  (the GUI's Live slider offers 1..100 % in 1 % steps: on a mode's rounded share, 100 / 67 / 58 / 50
+  / 33, it sends that mode, anywhere else that share, which the dropdown shows as a hidden, unpickable
+  `Custom (N%)` entry; main.ts `dlssScaleArg`). `plan.ts` `workPlan` computes it once (even, at least 64,
   capped at 3840x2160 keeping the aspect: the interpolation's reach) and prints `DLSS mode ...:
   working size WxH for the WxH output`. A working size below the source folds the downscale into
   the decode (linear-light Lanczos3 `zscale`); otherwise the host gets `--work-w W --work-h H` (sent
@@ -720,6 +721,16 @@ smv-live.exe --testsrc [ms|cycle] [--pan] [--onscreen]   verification source (10
                --pan = a texture moving 4 px right per tick (known motion); --onscreen = a framed window at (80, 80)
 smv-live.exe --synth           no-capture diagnostic
 ```
+DLSS-G (the default backend, no `--backend`) with any effect (`--sharpen` > 0, `--restore`, `--dlssnr`, `--rtx-hdr`,
+`--fit fill`, `--upscale`, a `--scale` below DLAA; `--rtx-vsr` alone has no resize to work on) runs as `g_fgOver`: the
+echo route (`engine=none`, one slot) runs the effects on every captured frame through the cross-group queue, and each
+slot goes to Streamline the moment it is ready (no pacing clock: DLSS-G paces its own output) through the proxy swap
+chain in the server's slot format (BGRA8 SDR, R10G10B10A2 PQ HDR; DLSS-G takes any UNORM colour format). DLSS-G's count
+is the whole multiple of the measured rate nearest the target (drift-tracked on the stats tick, re-armed off / on with
+one passthrough present, and after a 700 ms input gap); the stats line carries DLSS-G's `status` / `actuallyPresented`
+and the latency is the Streamline handoff. Plain DLSS-G (no effect) keeps its direct present route. Gates
+`harness\dlssg_effects\run_cases.py` (parked routes per effect; the user's focus shim lets a parked overlay generate)
+and `colour_check.py` (the red square stays red, and DLSS-G + Sharpen's real frames are exact twins of echo + Sharpen).
 `--gen`: server backends 1..15, dlssg 1..5. `--fg` targets the current foreground window (the
 app's hotkey and countdown use it). Exit codes: 2 unsupported GPU, 3 multi-frame limit, 4 target
 resized or moved monitor (the app auto-restarts, cap 20), 5 `--fg` target not capturable, 6 stall
@@ -1360,6 +1371,16 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   or the motion view) and runs the backbone on the new frame into slot 1; a call without a pair
   makes the next pair take both. Not bit-identical (batch-1 fp16 kernels): tweens vs fp32 59.08 /
   52.78 dB against the whole backbone's 59.03 / 53.27; 1080p x2 x0.969 a pair.
+* GMFlow's two attentions whose value is 2 channels (the global matching: the softmax over every
+  token pair times the pixel grid, both directions; the flow propagation: the same with the flow)
+  run in 8 row blocks (`trt_runtime.gmflow_attention_blocks`: Slice the rows, MatMul, Div, Softmax,
+  MatMul, Concat; the second matching direction is the second frame's rows against the first's), so
+  the token x token matrix never exists: at the 4K DLAA half (32,640 tokens) `gmflow_bidir_a`'s
+  TensorRT context falls from 10.5 GB to 5.6 GB, which keeps 4K GMFSS inside a 24 GB card. A row's
+  softmax reads only that row: bit-identical at the 1080p half; at the 4K and live 1440p halves
+  TensorRT picks other kernels around them, as close to an fp32 reference as the unblocked graph
+  (4K global matching mean error 0.0589 / 0.105 / 1.004 grid units on three pairs either way).
+  Speed: 1080p half x0.992, live 1440p half x1.008 (both inside the spreads), 4K half x0.888.
 * fusionnet takes the splatted feature levels `b` / `c` / `d` in fp16: in the graph each one's only
   reader is a Cast to fp16, so the export drops it (`trt_runtime._fusion_fp16_inputs`) and
   `k_splatNorm` stores fp16, rounding to nearest even as the Cast did; `a` stays fp32 (the GMFSS

@@ -697,9 +697,9 @@ let liveModel = 'dlssg'; // mirrored from the renderer's Live settings (lv-opts)
 let liveLabel = ''; // user-facing effective-model name for the exe's loading message/HUD
 let liveNote = ''; // substitution note (e.g. Smooth Motion live runs GMFSS), same destination
 let liveDlssMode = 'dlaa'; // the DLSS mode (dlssScaleArg): the working size's share of the presented size
-// (server backends only; dlssg has no such input)
-let liveFit = 'window'; // 'window' = 1:1 overlay, 'fill' = the target's monitor upscaled (server
-// only), 'monitor' = whole-screen capture 1:1 (every model incl. dlssg)
+// (every backend; below DLAA, DLSS 4.5 runs on the echo route's frames)
+let liveFit = 'monitor'; // 'monitor' = whole-screen capture 1:1 (every model incl. dlssg; the default),
+// 'window' = 1:1 overlay, 'fill' = the target's monitor upscaled (server only)
 let liveTarget = 60; // adaptive output fps target, inherited from the renderer's Speed selectors
 let liveSharpen = 0; // live Adaptive Sharpen strength 0..2, inherited from the Sharpen controls (0 = off)
 let liveVsr = false; // RTX VSR as the live upscaler, inherited from the RTX VSR checkbox
@@ -829,65 +829,61 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   // pipelines (DLSS 4.5) approximate it in the exe with the nearest whole multiple of the
   // captured window's measured rate, capped by the model (no --gen: the exe derives it).
   const target = String(Math.min(10000, Math.max(10, Math.round(Number(liveTarget) || 60))));
-  if (liveModel && liveModel !== 'dlssg') {
-    args.push('--backend', liveModel);
-    // user-facing name + substitution note for the exe's loading message/HUD (the raw
-    // backend id read as the wrong model when live substitutes, e.g. Smooth Motion -> GMFSS)
-    if (liveLabel) args.push('--label', liveLabel);
-    if (liveNote) args.push('--note', liveNote);
-    // RIFE/GMFSS/blend resample adaptively to the fps target inherited from the Speed
-    // selectors. No --gen: with only a target the exe derives the slot count per pair from
-    // the measured source rate (ceil(target/source)+1, VRAM-clamped), so high targets are
-    // not capped by a fixed 16-slot ceiling.
-    args.push('--target', target);
-    // live effects, inherited from the file-render Sharpen / RTX VSR settings
-    const sharp = Math.min(2, Math.max(0, Number(liveSharpen) || 0));
-    if (sharp > 0) args.push('--sharpen', sharp.toFixed(2));
-    // "Upscale to": the server resizes the model frame to this height
-    // first (VSR when enlarging), then fits it to the canvas; so VSR can now engage outside
-    // fill mode too. Without it an upscale exists only in fill mode.
-    const upH = Math.max(0, Math.round(Number(liveUpH) || 0));
-    if (upH > 0) args.push('--upscale', String(upH));
-    // the host gives RTX VSR the one resize that enlarges (the fit after the model, else the capture to the
-    // working size before it) and skips it with a line when neither does
-    if (liveVsr) args.push('--rtx-vsr');
-    // Restore: Real-ESRGAN first on every presented frame; costs most
-    // of a 1080p frame budget, the panel hint says so
-    if (liveRestore) args.push('--restore');
-    // NVIDIA DLSS 5: Neural Rendering once per captured frame inside
-    // the exe (SDR domain, before the model; the tweens inherit it); a session whose pass cannot
-    // run goes on without it and logs why. Only sent when the runtime is installed (the
-    // renderer gates on dlssnr-ready).
-    if (liveDlssnr)
-      args.push(
-        '--dlssnr',
-        '--nr-structure',
-        String(liveNrStructure),
-        '--nr-tone',
-        String(liveNrTone),
-        '--nr-style',
-        String(liveNrStyle),
-      );
-    if (liveDlssnr && liveNrPasses > 1) args.push('--nr-passes', String(liveNrPasses));
-    // live TrueHDR: SDR window expanded to HDR out, inherited from the RTX HDR
-    // controls; the exe forwards these to the server only when its HDR live mode is on
-    if (liveRtxHdr) {
-      args.push('--rtx-hdr');
-      if (liveHdrColor !== 'vivid') args.push('--hdr-color', liveHdrColor, '--hdr-saturation', String(liveHdrSat));
-      if (liveHdrCon !== 100) args.push('--hdr-contrast', String(liveHdrCon));
-      if (liveHdrVib > 0) args.push('--hdr-vibrance', String(liveHdrVib));
-      if (liveHdrSb > 0) args.push('--hdr-satboost', String(liveHdrSb));
-    }
-  } else {
-    // DLSS 4.5 generates whole in-between frames: the exe derives the count from the target
-    // and the measured capture rate at runtime (capped at 6x by the model)
-    args.push('--target', target);
+  // DLSS 4.5 is the exe's default backend (no --backend); with any effect below the exe runs the effects on every
+  // captured frame and DLSS 4.5 generates from those frames
+  if (liveModel && liveModel !== 'dlssg') args.push('--backend', liveModel);
+  // user-facing name + substitution note for the exe's loading message/HUD (the raw
+  // backend id read as the wrong model when live substitutes, e.g. Smooth Motion -> GMFSS)
+  if (liveLabel) args.push('--label', liveLabel);
+  if (liveNote) args.push('--note', liveNote);
+  // RIFE/GMFSS resample adaptively to the fps target inherited from the Speed selectors. No --gen: with only a
+  // target the exe derives the slot count per pair from the measured source rate (ceil(target/source)+1,
+  // VRAM-clamped), so high targets are not capped by a fixed 16-slot ceiling; DLSS 4.5 takes the whole multiple
+  // of the measured rate nearest the target (capped at 6x by the model)
+  args.push('--target', target);
+  // live effects, inherited from the file-render Sharpen / RTX VSR settings
+  const sharp = Math.min(2, Math.max(0, Number(liveSharpen) || 0));
+  if (sharp > 0) args.push('--sharpen', sharp.toFixed(2));
+  // "Upscale to": the server resizes the model frame to this height
+  // first (VSR when enlarging), then fits it to the canvas; so VSR can now engage outside
+  // fill mode too. Without it an upscale exists only in fill mode.
+  const upH = Math.max(0, Math.round(Number(liveUpH) || 0));
+  if (upH > 0) args.push('--upscale', String(upH));
+  // the host gives RTX VSR the one resize that enlarges (the fit after the model, else the capture to the
+  // working size before it) and skips it with a line when neither does
+  if (liveVsr) args.push('--rtx-vsr');
+  // Restore: Real-ESRGAN first on every presented frame; costs most
+  // of a 1080p frame budget, the panel hint says so
+  if (liveRestore) args.push('--restore');
+  // NVIDIA DLSS 5: Neural Rendering once per captured frame inside
+  // the exe (SDR domain, before the model; the tweens inherit it); a session whose pass cannot
+  // run goes on without it and logs why. Only sent when the runtime is installed (the
+  // renderer gates on dlssnr-ready).
+  if (liveDlssnr)
+    args.push(
+      '--dlssnr',
+      '--nr-structure',
+      String(liveNrStructure),
+      '--nr-tone',
+      String(liveNrTone),
+      '--nr-style',
+      String(liveNrStyle),
+    );
+  if (liveDlssnr && liveNrPasses > 1) args.push('--nr-passes', String(liveNrPasses));
+  // live TrueHDR: SDR window expanded to HDR out, inherited from the RTX HDR
+  // controls; the exe forwards these to the server only when its HDR live mode is on
+  if (liveRtxHdr) {
+    args.push('--rtx-hdr');
+    if (liveHdrColor !== 'vivid') args.push('--hdr-color', liveHdrColor, '--hdr-saturation', String(liveHdrSat));
+    if (liveHdrCon !== 100) args.push('--hdr-contrast', String(liveHdrCon));
+    if (liveHdrVib > 0) args.push('--hdr-vibrance', String(liveHdrVib));
+    if (liveHdrSb > 0) args.push('--hdr-satboost', String(liveHdrSb));
   }
   // the DLSS mode: the working size as its share of the presented size (the window, or the Fill rect); no
   // flag = DLAA (the presented size itself)
   const scaleArg = dlssScaleArg(liveDlssMode);
-  if (liveModel !== 'dlssg' && scaleArg) args.push('--scale', scaleArg);
-  if (liveModel !== 'dlssg' && liveFit === 'fill') args.push('--fit', 'fill');
+  if (scaleArg) args.push('--scale', scaleArg);
+  if (liveFit === 'fill') args.push('--fit', 'fill');
   if (liveFit === 'monitor') args.push('--fit', 'monitor'); // whole-screen: all models incl. dlssg
   if (!liveHud) args.push('--no-hud');
   else if (!liveHudLat) args.push('--no-hud-latency'); // meter on, latency segment hidden
@@ -1348,10 +1344,12 @@ type RunOpts = {
   hdrvib?: number;
 };
 
-// The GUI's DLSS mode as the CLI's --scale value: quality / balanced / performance / ultra by name;
-// null = DLAA, the default.
+// The GUI's DLSS mode as the CLI's --scale value: quality / balanced / performance / ultra by name, a
+// whole percent 1..99 (the slider between the modes) as its share; null = DLAA, the default.
 function dlssScaleArg(mode?: string): string | null {
-  return mode && ['quality', 'balanced', 'performance', 'ultra'].includes(mode) ? mode : null;
+  if (mode && ['quality', 'balanced', 'performance', 'ultra'].includes(mode)) return mode;
+  const pct = mode && /^\d+$/.test(mode) ? Number(mode) : 0;
+  return pct >= 1 && pct <= 99 ? (pct / 100).toFixed(2) : null;
 }
 
 // The render command line for one request (pure: the GUI state in, render.py's argv out; the TS

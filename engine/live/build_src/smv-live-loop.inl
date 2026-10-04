@@ -1066,7 +1066,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
 
     // capture first: the frame pool size defines the swap chain size
     Host host;
-    host.useSL = (g_backend == BK_DLSSG);
+    host.useSL = (g_backend == BK_DLSSG || g_fgOver);
+    if (g_fgOver)
+        LOG("DLSS-G with effects: the echo route runs them on every captured frame, DLSS-G generates from its "
+            "frames\n");
     host.genFrames = genFrames;
     host.syncInterval = vsync ? 1 : 0;
     host.clickthrough = clickthrough;
@@ -1095,11 +1098,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         }
         g_vramBytes = ad.DedicatedVideoMemory; // the slot-count memory budget (slotBudget)
 
-        static Capture cap;       // static: outlives this scope, single instance per process
-        cap.swizzle = host.useSL; // DLSS-G keeps RGBA; server/identity routes stay BGRA
+        static Capture cap; // static: outlives this scope, single instance per process
+        // DLSS-G keeps RGBA; server/identity routes stay BGRA, and so does DLSS-G over the echo route (it presents
+        // the server's slots)
+        cap.swizzle = host.useSL && !g_fgOver;
         // dlssg in HDR packs scRGB -> R10A2 PQ in the exe; swizzle is bypassed there. Must be set before init() (it sizes the chain
         // and can clear g_hdr on setup failure, before anything else reads it).
-        cap.hdrPack = g_hdr && host.useSL;
+        cap.hdrPack = g_hdr && host.useSL && !g_fgOver;
         int rc = cap.init(target, a.Get());
         if (rc && !g_monitor && !IsWindow(target))
         {
@@ -1160,8 +1165,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         if (host.minWH && (W < host.minWH || H < host.minWH))
             LOG("WARNING: %ux%u is below the DLSS-G minimum extent %u, FG may refuse\n", W, H, host.minWH);
 
-        // The DLSS 5 pass inside this process. Server backends only (never DLSS-G: the NR host
-        // starves it). The native host runs it on the model frame after Restore and
+        // The DLSS 5 pass inside this process. Server backends only (DLSS-G with effects runs it on the echo
+        // route). The native host runs it on the model frame after Restore and
         // the resize (nativeLiveNrInit logs its line once the model size is known, or why the
         // session runs without it).
         if (g_dlssnr && g_backend == BK_SERVER)
@@ -1305,8 +1310,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 {
                     int want = (int)((double)g_targetFps / base + 0.5) - 1;
                     genFrames = want < 1 ? 1 : want > ceilGen ? ceilGen : want;
-                    LOG("measured ~%.1f fps source, target %d fps: fixed %dx (drift-tracked)\n", base, g_targetFps,
-                        genFrames + 1);
+                    if (!g_fgOver) // DLSS-G over echo logs its own multiple below
+                        LOG("measured ~%.1f fps source, target %d fps: fixed %dx (drift-tracked)\n", base, g_targetFps,
+                            genFrames + 1);
                 }
                 else
                 {
@@ -1317,10 +1323,29 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         slotCap, mSlotBytes / 1048576.0);
                 }
             }
+            if (g_fgOver)
+            {
+                // DLSS-G makes the in-between frames: the whole multiple of the measured rate nearest the target
+                // (the model caps it), set before the first served frame; the echo route holds one slot
+                if (derive)
+                {
+                    const int capMax = host.maxGen ? (int)(host.maxGen < 5 ? host.maxGen : 5) : 5;
+                    int want = (int)((double)g_targetFps / srcMeasFps + 0.5) - 1;
+                    want = want < 1 ? 1 : want > capMax ? capMax : want;
+                    sl::DLSSGOptions on{};
+                    on.mode = sl::DLSSGMode::eOn;
+                    on.numFramesToGenerate = (uint32_t)want;
+                    if (slDLSSGSetOptions(host.vp, on) == sl::Result::eOk)
+                        host.genFrames = want;
+                    LOG("measured ~%.1f fps source, target %d fps: DLSS-G %dx\n", srcMeasFps, g_targetFps,
+                        host.genFrames + 1);
+                }
+                genFrames = ceilGen = 0;
+            }
             // A derived fixed multiplier is drift-tracked (re-derived in the stats tick),
             // so size the server at the slot CEILING and let each group's ladder carry the
             // current value. An explicit --gen (harness/perf use) keeps the exact classic spawn.
-            const bool fixedDerived = g_noAdapt && g_targetFps > 0 && !g_genExplicit;
+            const bool fixedDerived = g_noAdapt && g_targetFps > 0 && !g_genExplicit && !g_fgOver;
             const int spawnGen = fixedDerived ? ceilGen : genFrames;
             // The backend's model + TRT engines can take tens of seconds to build the FIRST time
             // at a new resolution (a fullscreen capture is often a never-before-built size:
@@ -1534,9 +1559,38 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         auto slotOffset = [&](uint32_t set, uint32_t i) -> size_t {
             return srv.shmInBytes + ((size_t)set * srv.shmSlots + i) * srv.shmSlot;
         };
+        // DLSS-G over the echo route: off for one passthrough present of this slot, then on at `gen` generated frames
+        // (a new count, or the re-warm after an input gap: a long gap poisons the DLSS-G pacer, see resetFG)
+        ULONGLONG fgLastPresent = 0;
+        auto fgRewarm = [&](uint32_t set, uint32_t i, int gen) -> bool {
+            sl::DLSSGOptions off{};
+            off.mode = sl::DLSSGMode::eOff;
+            off.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+            if (slDLSSGSetOptions(host.vp, off) != sl::Result::eOk ||
+                !host.presentTail(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, srv.shmPitch))
+                return false;
+            sl::DLSSGOptions on{};
+            on.mode = sl::DLSSGMode::eOn;
+            on.numFramesToGenerate = (uint32_t)gen;
+            if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
+                return false;
+            host.genFrames = gen;
+            return true;
+        };
         // present one output slot GPU-direct from the shared VRAM ring (slots never touch host
         // memory)
         auto presentSlotFrom = [&](uint32_t set, uint32_t i) -> bool {
+            if (g_fgOver)
+            {
+                const ULONGLONG t = GetTickCount64();
+                if (fgLastPresent && t - fgLastPresent > 700)
+                {
+                    LOG("input gap %llums, resetting DLSS-G\n", (unsigned long long)(t - fgLastPresent));
+                    if (!fgRewarm(set, i, host.genFrames))
+                        return false;
+                }
+                fgLastPresent = t;
+            }
             return host.presentTail(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, srv.shmPitch);
         };
 
@@ -1598,7 +1652,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 LOG("no frames captured in 5s (window occluded by exclusive fullscreen?)\n");
                 return 1;
             }
-            if (host.useSL)
+            if (host.useSL && !g_fgOver) // DLSS-G over echo presents the server's frames only (FP16 under HDR)
             {
                 for (int i = 0; i < 3; i++)
                     if (!host.presentFrame(buf.data()))
@@ -1690,7 +1744,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // ~15.6ms timer quantization, which ate a 33ms cadence down to 22 of 30 fps (Win11
         // ignores timeBeginPeriod for windowless/occluded processes, so precise sub-50ms
         // sleeps are not reliably available here).
-        double idleStepMs = adaptTarget > 0 ? gridStep / 10000.0 : 1000.0 / (genFrames + 1);
+        // (DLSS-G over the echo route: the floor, so a held frame reaches DLSS-G well inside its 700 ms gap)
+        double idleStepMs = g_fgOver ? 100.0 : adaptTarget > 0 ? gridStep / 10000.0 : 1000.0 / (genFrames + 1);
         if (idleStepMs < 100.0)
             idleStepMs = 100.0;
         // PRESENT-PACING SMOOTHING (the 360Hz vsync cross-check follow-up): the old pacing
@@ -1864,9 +1919,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             uint8_t* msg = msgBuf.data();
             float* fr = (float*)(msg + 4);
             uint32_t nfr = 0;
-            if (shmSeq == 1)
+            if (shmSeq == 1 || g_fgOver)
             {
-                fr[nfr++] = 1.0f; // very first frame: nothing to interpolate yet
+                fr[nfr++] = 1.0f; // very first frame: nothing to interpolate yet (DLSS-G over echo: every frame)
             }
             else if (nextIdleTick)
             {
@@ -1969,6 +2024,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         auto logLiveStats = [&](double capFps, double outFps, double latAvg, double secs, const sl::DLSSGState* st) {
             const double ratio = capFps > 0 ? outFps / capFps : 0.0;
             const double tgt = g_backend == BK_IDENTITY           ? 1.0
+                               : g_fgOver                         ? (double)(host.genFrames + 1)
                                : (host.useSL || adaptTarget <= 0) ? (double)(genFrames + 1)
                                                                   : (capFps > 0 ? effTarget / capFps : 0.0);
             const double prTot = host.prN ? host.prMsTot / host.prN : 0.0;
@@ -2411,7 +2467,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 while (!fifo.empty() && !rc2)
                 {
                     XqSlot& s = fifo.front();
-                    double dueMs = s.target;
+                    // DLSS-G over echo: a real frame goes to DLSS-G the moment it is ready, as on the direct route
+                    // (DLSS-G paces its own output)
+                    double dueMs = g_fgOver ? 0.0 : s.target;
                     if (minSpaceMs > 0)
                     {
                         const double prev =
@@ -2670,7 +2728,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     const double capFps = (statCaptured + dropWin) / secs;
                     const double outFps = (c - statPresentBase) / secs;
                     const double latAvg = statLatN ? statLatSum / statLatN : 0.0;
-                    logLiveStats(capFps, outFps, latAvg, secs, nullptr);
+                    sl::DLSSGState fgSt{};
+                    if (g_fgOver)
+                        slDLSSGGetState(host.vp, fgSt, nullptr);
+                    logLiveStats(capFps, outFps, latAvg, secs, g_fgOver ? &fgSt : nullptr);
                     {
                         uint64_t hn = 0;
                         for (int i = 0; i < Host::kHistN; i++)
@@ -2722,10 +2783,31 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     host.prMsTot = host.prMsWait = host.prMsFlip = 0;
                     host.prN = 0;
                     host.prBunch = 0;
-                    hud.update(capFps, outFps, latAvg);
+                    // DLSS-G over echo: the handoff plus one capture interval, as on the direct DLSS-G route
+                    hud.update(capFps, outFps, g_fgOver && capFps > 0.5 ? latAvg + 1000.0 / capFps : latAvg);
                     statLatSum = 0;
                     statLatN = 0;
-                    if (g_noAdapt && g_targetFps > 0 && !g_genExplicit && capFps > 3.0)
+                    // DLSS-G over echo: its generated-frame count follows the target the way the direct route's does
+                    // (two equal 2 s derivations in a row before a switch)
+                    if (g_fgOver && g_targetFps > 0 && !g_genExplicit && capFps > 3.0 && idleSlotIdx >= 0)
+                    {
+                        const int capMax = host.maxGen ? (int)(host.maxGen < 5 ? host.maxGen : 5) : 5;
+                        int want = (int)((double)g_targetFps / capFps + 0.5) - 1;
+                        want = want < 1 ? 1 : want > capMax ? capMax : want;
+                        if (want != host.genFrames && want == fixWantPrev)
+                        {
+                            LOG("target %d fps at ~%.1f captured: switching DLSS-G to %dx\n", g_targetFps, capFps,
+                                want + 1);
+                            if (!fgRewarm(idleSlotSet, (uint32_t)idleSlotIdx, want))
+                            {
+                                LOG("DLSS-G reset failed\n");
+                                rc2 = 1;
+                                break;
+                            }
+                        }
+                        fixWantPrev = want;
+                    }
+                    if (g_noAdapt && !g_fgOver && g_targetFps > 0 && !g_genExplicit && capFps > 3.0)
                     {
                         int want = (int)((double)g_targetFps / capFps + 0.5) - 1;
                         if (want < 1)
@@ -2746,7 +2828,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     }
                     // Auto's working size against the GPU time, the throttle's next lever: at its floor (the real
                     // frames alone; a fixed multiplier has no throttle) a captured frame's own work (its passes:
-                    // Restore, the resize, DLSS 5, FSR, RTX HDR, and the model's per-frame state and the store: the
+                    // Restore, the resize, DLSS 5, Sharpen, RTX HDR, and the model's per-frame state and the store: the
                     // host's tween-less group) that takes more than the throttle's budget of the time between
                     // captured frames means no fps keeps the source's pace, a smaller working size does. Three ticks
                     // in a row over it, with the mode below predicted at least a tenth faster (the part after

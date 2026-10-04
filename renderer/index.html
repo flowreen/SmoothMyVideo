@@ -68,8 +68,6 @@
      workspace), and an inline display must never leak the other mode's UI back on screen. */
   html.mode-live .vonly { display:none !important; }
   html.mode-video .lonly { display:none !important; }
-  /* Live with NVIDIA DLSS 4.5: its own pipeline takes none of these panels (syncDlssgLock) */
-  .dlssglocked { opacity:.45; pointer-events:none; }
   /* Percentage painted on top of the fill, centred in the bar (taller bar so the larger text fits). */
   #pct { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
          color:#fff; font-size:22px; font-weight:600; pointer-events:none;
@@ -157,10 +155,10 @@
     </div>
     <div class="row">
       <span class="k">Display</span>
-      <select id="lvfit" title="Original size: the window as it is. Fill screen: the window enlarged to its whole monitor, aspect kept. Whole screen: everything on the monitor, with every model (DLSS 4.5 too).">
+      <select id="lvfit" title="Whole screen: everything on the monitor, with every model (DLSS 4.5 too). Original size: the window as it is. Fill screen: the window enlarged to its whole monitor, aspect kept.">
+        <option value="monitor">Whole screen</option>
         <option value="window">Original size</option>
         <option value="fill">Fill screen</option>
-        <option value="monitor">Whole screen</option>
       </select>
       <span class="hint" id="lvfithint"></span>
     </div>
@@ -203,9 +201,9 @@
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS 5 Neural Rendering 310.8.SF-v2">
         <input type="checkbox" id="dlssnr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA DLSS 5 <span class="hint" id="dlssnrhint">(Neural Rendering at full resolution; needs the runtime file you supply)</span>
+        NVIDIA DLSS 5 <span class="hint" id="dlssnrhint">(Neural Rendering at full resolution)</span>
       </label>
       <span id="nrwrap" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
         <span class="hint">Style</span>
@@ -254,7 +252,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA Optical Flow API 5.0, run by the driver on the GPU's optical-flow engine">
         <input type="checkbox" id="modelnvof"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         NVIDIA Optical Flow <span class="hint">(NVIDIA's optical-flow hardware, nothing to install; very fast motion goes soft)</span>
@@ -262,7 +260,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: GMFSS_Fortuna, union model">
         <input type="checkbox" id="modelgmfss" checked
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         GMFSS <span class="hint">(GMFlow with Softmax Splatting: AI, best quality for anime, the default)</span>
@@ -270,7 +268,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: Practical-RIFE 4.26 heavy">
         <input type="checkbox" id="modelrife"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         RIFE <span class="hint">(Real-Time Intermediate Flow Estimation: AI, fast, best for live action)</span>
@@ -278,7 +276,7 @@
     </div>
     <div class="row" id="rifedrbarow" style="display:none">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-left:22px;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-left:22px;" title="Version: DRBA (routineLife1, 2025) on Practical-RIFE 4.26 heavy">
         <input type="checkbox" id="rifedrba"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         DRBA <span class="hint">(anime pacing: characters keep their own timing and crisp poses while camera pans smooth fully)</span>
@@ -286,7 +284,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS frame generation 310.9.1 through Streamline 2.14.1">
         <input type="checkbox" id="modeldlss"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(AI frame generation from games; 2&times; to 6&times;; RTX 40/50, above 2&times; RTX 50)</span>
@@ -294,7 +292,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+      <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA NvOFFRUC from the Optical Flow SDK 5.0.7">
         <input type="checkbox" id="modelfruc"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         NVIDIA Smooth Motion <span class="hint">(NVIDIA's optical-flow hardware; the lowest quality, varies run to run)</span>
@@ -333,7 +331,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="On (default): when the GPU or its memory runs short, Live smooths less (down to the source rate, then Auto's size) so every frame still shows; file renders keep their exact fps. Off: everything runs as set; Live may skip frames.">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="On (default): targets the highest frame rate your GPU can hold, at the lowest latency. When the GPU or its memory runs short, Live makes fewer in-between frames (down to the source rate) so every frame still shows; file renders keep their exact fps. Off: everything runs as set; Live may skip frames.">
         <input type="checkbox" id="gpufit" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         Fit to the GPU
       </label>
@@ -343,7 +341,7 @@
   <div class="panel step" id="restorepanel">
     <div class="row">
       <span class="k">Restore</span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: Real-ESRGAN realesr-animevideov3">
         <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
       </label>
       <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN, anime); can flatten fine texture<span class="lonly">; heavy: a large window can lower the frame rate</span></span>
@@ -383,17 +381,18 @@
         <option value="balanced">Balanced (58%)</option>
         <option value="performance">Performance (50%)</option>
         <option value="ultra">Ultra Performance (33%)</option>
+        <option value="custom" id="dlsscustomopt" hidden>Custom</option>
       </select>
       <span id="dlssrangewrap" style="display:inline-flex;align-items:center;gap:8px;">
-        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlssrange" type="range" min="0" max="4" step="1" value="4" style="width:150px" aria-label="DLSS mode" title="The DLSS mode as a slider: Ultra Performance (33%) on the left to DLAA (100%) on the right."></span>
+        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlssrange" type="range" min="1" max="100" step="1" value="100" style="width:150px" aria-label="DLSS mode" title="The working size's share, 1% to 100% (DLAA); the DLSS modes sit at 33, 50, 58 and 67%. A very small size is raised to 64 px on its short side (128 px wide with DLSS 5)."></span>
         <span class="v" id="dlssrangenum">100%</span>
       </span>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA RTX Video Super Resolution 1.6.0 (RTX Video SDK)">
         <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill or a DLSS mode below DLAA enlarges</span>; off = Lanczos3; one-time download)</span>
+        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill or a DLSS mode below DLAA enlarges</span>; off = Lanczos3)</span>
       </label>
     </div>
     <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -411,26 +410,25 @@
   <div class="panel step" id="sharpenpanel">
     <div class="row">
       <span class="k">Sharpen</span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> Adaptive
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: Adaptive Sharpen by bacondither, the DX11 two-pass HQ version of 2021-09-10">
+        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> Adaptive (crisper picture)
       </label>
       <span id="sharpwrap" style="display:flex;align-items:center;gap:8px;">
-        <input id="sharpval" type="range" min="0" max="2" step="0.05" value="1"
-               style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
+        <span class="defmark"><input id="sharpval" type="range" min="0" max="2" step="0.05" value="1"
+               style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);"></span>
         <span class="v" id="sharpnum">1.00</span>
       </span>
-      <span class="hint">crisper picture</span>
     </div>
   </div>
 
   <div class="panel step" id="hdrpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">HDR</span>
-      <span class="hint">Opt-in. NVIDIA RTX HDR turns SDR into HDR, with its colour controls (one-time download)<span class="vonly">; Dolby Vision and HDR10+ below can add metadata to it</span>.</span>
+      <span class="hint">Opt-in. NVIDIA RTX HDR turns SDR into HDR, with its colour controls<span class="vonly">; Dolby Vision and HDR10+ below can add metadata to it</span>.</span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA RTX HDR (TrueHDR) 1.1.0 (RTX Video SDK)">
         <input type="checkbox" id="rtxhdr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         RTX HDR <span class="hint" id="rtxhdrhint">(convert SDR video to HDR)</span>
       </label>

@@ -389,8 +389,10 @@ struct Host
         // HDR presents R10G10B10A2 (PQ, still 4 bytes/px) on a G2084 swapchain, BOTH
         // routes: DLSS-G mandates exactly RGB10 + BT.2100 PQ for HDR (SL guide 11.0, FP16
         // scRGB explicitly unsupported), so the DLSS-G route rides the same format as the server route.
-        texFmt =
-            g_hdr ? DXGI_FORMAT_R10G10B10A2_UNORM : (useSL ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM);
+        // DLSS-G over the echo route presents the server's BGRA slots (DLSS-G takes any UNORM colour format)
+        texFmt = g_hdr                  ? DXGI_FORMAT_R10G10B10A2_UNORM
+                 : (useSL && !g_fgOver) ? DXGI_FORMAT_R8G8B8A8_UNORM
+                                        : DXGI_FORMAT_B8G8R8A8_UNORM;
         WNDCLASSW wc{};
         wc.lpfnWndProc = wndProc;
         wc.hInstance = GetModuleHandleW(nullptr);

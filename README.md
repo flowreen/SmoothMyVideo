@@ -99,8 +99,8 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   enlarges when the Size is above the source). Live's size is what **Display** shows (the window, or
   the screen), and its **DLSS mode** is its speed lever, NVIDIA's share of that size: DLAA (the
   default, the full size), Quality (67%), Balanced (58%), Performance (50%) or Ultra Performance
-  (33%), from the dropdown or its slider; the lower modes are much faster and a little
-  softer, and the fit to the window or screen enlarges the result.
+  (33%) from the dropdown, or any share down to 1% with its slider (the dropdown then reads Custom);
+  lower is much faster and softer, and the fit to the window or screen enlarges the result.
 * 🧠 **Optional NVIDIA DLSS 5 pass.** One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every
   source frame before the smoothing (after Restore and the resize, at the output size; in Live at
   its DLSS mode's size), at full resolution (its own size in, the same size out), fed the way game integrations
@@ -136,11 +136,11 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   live models run on any RTX); windowed or borderless windows only (exclusive fullscreen
   can't be captured). Changing the Speed target or the DLSS mode while a session is running restarts it a moment
   later with the new setting, on the same window. Switching to another app pauses the smoothing
-  and hides the overlay; returning to your window resumes it. The Display selector can also fill the screen (upscaled, aspect kept;
+  and hides the overlay; returning to your window resumes it. The Display selector starts on **Whole screen**: the
+  whole monitor at once (everything on it, works with every model including DLSS 4.5). **Original size** smooths only
+  the window, and **Fill screen** fills the screen with it (upscaled, aspect kept;
   clicks on the stretched picture reach the matching spot of your window: while the cursor is on the picture, SMV draws it
-  and slows the pointer by the stretch, and gives the normal pointer back when the cursor leaves the picture or Live stops)
-  or smooth the **whole monitor** at once (everything on it, works with every model including
-  DLSS 4.5). With the RIFE, GMFSS or NVIDIA Smooth Motion model the smoothing is **adaptive**: the output locks to
+  and slows the pointer by the stretch, and gives the normal pointer back when the cursor leaves the picture or Live stops). With the RIFE, GMFSS or NVIDIA Smooth Motion model the smoothing is **adaptive**: the output locks to
   your fps target (the same Speed setting file renders use) and the multiplier follows the
   content, so a game dropping from 30 to 10 fps keeps playing at the same smooth rate on
   screen. The target goes up to 10000 fps; with **Fit to the GPU** ticked (the default) Live lowers the smoothing
@@ -149,8 +149,9 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   target the GPU can't reach skips source frames. File renders always keep their exact fps; unticked, they just
   run slower when video memory runs short. Your Sharpen and Restore settings apply live too (Restore,
   DLSS 5, Sharpen and RTX HDR work on each captured frame before the smoothing, once per captured frame),
-  and Fill screen upscales with RTX VSR when it's enabled. With NVIDIA DLSS 4.5 as the live model those
-  effects, the DLSS mode and Fill do not apply (it runs its own pipeline), and their panels grey out. Untick every interpolation model and Live applies just those effects to the
+  and Fill screen upscales with RTX VSR when it's enabled. With NVIDIA DLSS 4.5 as the live model they apply
+  too, with the DLSS mode and Fill: the effects run on each captured frame and DLSS 4.5 generates its frames from
+  the result. Untick every interpolation model and Live applies just those effects to the
   window at its own frame rate (useful for the growing set of apps that only need the
   picture cleaned or expanded). A small
   green readout in the corner shows the source fps, the smoothed fps, and roughly how far the

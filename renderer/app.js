@@ -80,7 +80,6 @@ function setMode(m){
   // the numbered panels follow the processing order, NVIDIA's, the same in both modes
   applyOrder();
   if(dlssUiReady) syncDlssMode();
-  try { syncDlssgLock(); } catch {}   // before the model boxes exist (the first setMode) lvModelUi runs it later
 }
 // Switching mid-job would hide the running thing, so both buttons grey out while a live session
 // or a file render is going (called from lvUi and from the run start/end enable sweeps).
@@ -489,18 +488,23 @@ function syncUpscale(){
 var dlssUiReady = false;   // var: setMode runs before this block and must skip the sync
 // a mode's share in whole percent, as the option labels round it
 const DLSS_PCT = { dlaa: 100, quality: 67, balanced: 58, performance: 50, ultra: 33 };
-// the slider's stops left to right (its value = the index), DLAA at the right end under the default mark
-const DLSS_STOPS = ['ultra', 'performance', 'balanced', 'quality', 'dlaa'];
-function dlssMode(){ return $('dlssmode').value; }
+// the slider = the share in whole percent, 1..100 (DLAA at the right end under the default mark): on a mode's
+// percent it is that mode (NVIDIA's exact share), anywhere else that percent (the host's --scale 0.01..1), shown in
+// the select as Custom (a hidden option: the select picks only the five modes)
+function dlssPct(){ return +$('dlssrange').value; }
+function dlssMode(){ return Object.keys(DLSS_PCT).find(m => DLSS_PCT[m] === dlssPct()) || String(dlssPct()); }
 function syncDlssMode(){
-  $('dlssrange').value = DLSS_STOPS.indexOf(dlssMode());
-  $('dlssrangenum').textContent = DLSS_PCT[dlssMode()] + '%';
+  const m = dlssMode();
+  if(Object.hasOwn(DLSS_PCT, m)) $('dlssmode').value = m;
+  else { $('dlsscustomopt').textContent = `Custom (${m}%)`; $('dlssmode').value = 'custom'; }
+  $('dlssrangenum').textContent = dlssPct() + '%';
 }
 {
-  // a saved Auto or Custom (both retired) is no option any more: the select keeps DLAA
+  // a saved mode or percent; a saved Auto or the old Custom (both retired) opens as DLAA
   const m = localStorage.getItem('dlssMode');
-  if(m && [...$('dlssmode').options].some(o => o.value === m)) $('dlssmode').value = m;
-  localStorage.removeItem('dlssCustom');   // retired with Custom
+  if(Object.hasOwn(DLSS_PCT, m)) $('dlssrange').value = DLSS_PCT[m];
+  else if(/^\d+$/.test(m || '') && +m >= 1 && +m <= 100) $('dlssrange').value = m;
+  localStorage.removeItem('dlssCustom');   // the old Custom's own key: the percent is the saved mode now
   localStorage.removeItem('lvFlow');   // retired: the Image scale slider became the DLSS mode
 }
 // a value that holds 1 s starts the fresh build: the preview's refresh and a running live
@@ -516,8 +520,8 @@ function dlssChanged(){
     if(lvState === 'running') ipcRenderer.send('lv-restart');
   }, 1000);
 }
-$('dlssmode').onchange = dlssChanged;
-$('dlssrange').oninput = () => { $('dlssmode').value = DLSS_STOPS[+$('dlssrange').value]; dlssChanged(); };   // a drag picks the mode
+$('dlssmode').onchange = () => { $('dlssrange').value = DLSS_PCT[$('dlssmode').value]; dlssChanged(); };
+$('dlssrange').oninput = dlssChanged;   // a drag stops anywhere from 1 to 100 %
 dlssUiReady = true;
 syncDlssMode();
 function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.value === 'screen');
@@ -890,19 +894,17 @@ function liveModelInfo(){
 function liveVsrOn(){ return !!(rtxReady.vsr && $('rtxvsr').checked); }
 // Live TrueHDR: STRICT opt-in via the shared RTX HDR checkbox (a TrueHDR
 // expansion is a deliberate look change, so live matches file renders, not the VSR silent
-// default). Applies to the server models on HDR screens; the exe drops it elsewhere. No
+// default). Applies to every model on HDR screens; the exe drops it elsewhere. No
 // srcHdr gate here: live has no loaded file, the source is whatever window gets captured.
 function liveHdrOn(){ return !!(rtxReady.hdr && $('rtxhdr').checked); }
-// The exe's loading note / HUD names what is actually ticked: the model, then the live effects the server
-// models apply (DLSS 4.5 takes none), e.g. "GMFSS + DLSS 5" or "DLSS 5 + Sharpen".
+// The exe's loading note / HUD names what is actually ticked: the model, then the live effects it applies,
+// e.g. "GMFSS + DLSS 5" or "DLSS 5 + Sharpen".
 function liveLoadLabel(mi){
   const parts = mi.effectsOnly ? [] : [mi.name];
-  if(mi.model !== 'dlssg'){
-    if(restoreOn()) parts.push('Restore');
-    if(nrOn()) parts.push('DLSS 5');
-    if($('sharpen').checked && (parseFloat($('sharpval').value) || 0) > 0) parts.push('Sharpen');
-    if(liveHdrOn()) parts.push('RTX HDR');
-  }
+  if(restoreOn()) parts.push('Restore');
+  if(nrOn()) parts.push('DLSS 5');
+  if($('sharpen').checked && (parseFloat($('sharpval').value) || 0) > 0) parts.push('Sharpen');
+  if(liveHdrOn()) parts.push('RTX HDR');
   return parts.length ? parts.join(' + ') : 'passthrough (nothing ticked)';
 }
 function lvSendOpts(){
@@ -948,31 +950,20 @@ function lvSendOpts(){
   $('lvtarget').textContent = mi.name
     + (mi.effectsOnly ? ' · effects only (Restore, Sharpen, RTX VSR, RTX HDR) at the source rate, capped by the ' + lvT + ' fps Speed setting; tick a model to smooth'
        : mi.fixed ? ' · nearest whole multiple of the captured rate to ' + lvT + ' fps'
-                  + (mi.model === 'dlssg' ? ' (up to 6x); it runs its own pipeline, so the greyed-out panels do not apply' : '')
+                  + (mi.model === 'dlssg' ? ' (up to 6x)' : '')
        : ' · targets ' + lvT + ' fps (the Speed setting below)')
     + (load ? ' · ' + load : '')
-    + (liveHdrOn() && ['rife', 'rifedrba', 'gmfss', 'nvof'].includes(mi.model) ? ' · RTX HDR (on HDR screens)' : '')
+    + (liveHdrOn() && ['rife', 'rifedrba', 'gmfss', 'nvof', 'dlssg'].includes(mi.model) ? ' · RTX HDR (on HDR screens)' : '')
     + (mi.note ? ' · ' + mi.note : '') + '  ·  ';
 }
-// Live with NVIDIA DLSS 4.5: main.ts sends it only the target, so these panels do nothing there and grey out
-function syncDlssgLock(){
-  const lock = uiMode === 'live' && liveModelInfo().model === 'dlssg';
-  for(const id of ['restorepanel', 'uppanel', 'nrpanel', 'sharpenpanel', 'hdrpanel']) $(id).classList.toggle('dlssglocked', lock);
-}
 function lvModelUi(){
-  syncDlssgLock();
-  const mi = liveModelInfo();
-  const m = mi.model;
-  const server = m !== 'dlssg';       // everything but DLSS-G runs through the server
-  // Fill screen needs the server route (the upscale runs there); Whole screen (monitor
-  // capture, 1:1) works with EVERY model incl. DLSS-G. For dlssg the select stays enabled
-  // but a fill selection is bounced back to window with a hint.
+  // every display mode works with every model (DLSS 4.5 with an effect, Fill included, runs the effects route
+  // before its frame generation)
   $('lvfit').disabled = lvState === 'running';
-  if(!server && $('lvfit').value === 'fill') $('lvfit').value = 'window';
-  // Restore applies live too (server models, python route); named here like Upscale to
-  const resTxt = server && restoreOn() ? 'Restore (AI detail) first, heavy' : '';
-  // DLSS 5 applies live too (server models, python route): once per captured frame
-  const nrTxt = server && nrOn() ? 'DLSS 5 on every captured frame' : '';
+  // Restore applies live too; named here like Upscale to
+  const resTxt = restoreOn() ? 'Restore (AI detail) first, heavy' : '';
+  // DLSS 5 applies live too: once per captured frame
+  const nrTxt = nrOn() ? 'DLSS 5 on every captured frame' : '';
   const effTxt = [resTxt, nrTxt].filter(Boolean).join(' · ');
   $('lvfithint').textContent =
     $('lvfit').value === 'fill' ? 'enlarges the window to fill its monitor, aspect kept · '
@@ -980,7 +971,7 @@ function lvModelUi(){
                                   + (effTxt ? ' · ' + effTxt : '')
     : $('lvfit').value === 'monitor' ? 'smooths everything on the monitor the window is on'
                                        + (effTxt ? ' · ' + effTxt : '')
-    : !server ? 'Fill screen needs the RIFE or GMFSS model' : effTxt;
+    : effTxt;
 }
 function lvUi(){
   const b = $('lvgo');

@@ -6,7 +6,7 @@ already present is skipped, so a rerun is cheap; a changed stamp removes the fol
 exports every one again. Graphs: the RIFE IFNet (live `_bd8` and the
 unbatched class) and its encode, plain and as the flow-warp class at k 1 (Frame Blend), 2 and 4,
 DRBA's block0, Restore, and the GMFSS nets (gmflow_bidir as its backbone and two halves, trt_runtime.gmflow_split +
-gmflow_backbone_cut). The host
+gmflow_backbone_cut, the first half's two N x N attentions in row blocks by gmflow_attention_blocks). The host
 builds the offline fixed-batch RIFE
 classes (`_b{B}`) from `_bd8`. Then ship_tidy() and write_tags().
 Usage: runtime python engine/onnx_export.py"""
@@ -102,6 +102,7 @@ def main():
         ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
         a_path, _ = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()))
         tr.gmflow_backbone_cut(a_path)
+        tr.gmflow_attention_blocks(a_path)
     done.extend(os.path.basename(p) for p in parts)
     ensure(tr.MetricEngine(), gm.metricnet, rec["metricnet"][:4])
     xi, tsv = rec["ifnet"][0], rec["ifnet"][1]

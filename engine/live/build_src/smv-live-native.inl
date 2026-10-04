@@ -4159,7 +4159,7 @@ struct NativeRife
     int fCur = 0;
     cudaEvent_t capEv = nullptr;
     std::vector<cudaEvent_t> slotEv;
-    // live: a captured frame's own passes timed on the GPU (the capture read through FSR / RTX HDR and the motion
+    // live: a captured frame's own passes timed on the GPU (the capture read through Sharpen / RTX HDR and the motion
     // frame; pfEv[1] = where the part at the working size starts, after Restore / the resize), smoothed, in
     // microseconds for the present loop's Auto step (it reads them at its stats tick)
     cudaEvent_t pfEv[3] = {};
@@ -4892,7 +4892,7 @@ static int liveAutoMode(int w, int h)
 // 64 px high one): with DLSS 5 on, a working size below the presented rect is at least this wide
 static const int kNrMinWorkW = 128;
 
-// Live's working size (Restore, the resize, DLSS 5, FSR, RTX HDR and the model run at it, the fit
+// Live's working size (Restore, the resize, DLSS 5, Sharpen, RTX HDR and the model run at it, the fit
 // takes it to the canvas after the model): the DLSS mode's share of the PRESENTED rect (the capture aspect-fit into
 // the canvas W x H: the window itself, or the Fill rect), even, at most the presented rect a side, the share raised
 // (aspect kept) until the shorter side is 64 px and, with DLSS 5, the width kNrMinWorkW (*raised: 1 = the 64 px
@@ -7108,7 +7108,7 @@ static bool nativeRtxInit(NativeRife& nr)
         NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)vw * vh * 4), "alloc VSR input");
         NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)vtw * vth * 4), "alloc VSR output");
     }
-    // RTX TrueHDR runs once per real frame at the working size, after Restore, DLSS 5 and FSR and before the
+    // RTX TrueHDR runs once per real frame at the working size, after Restore, DLSS 5 and Sharpen and before the
     // model (nativePreModelPost); its buffers take the largest frame of the route (live the capture or the working
     // size, whichever is bigger; the output offline), and live they first carry the capture's SDR planes
     // (k_sdrEncode)
@@ -7223,11 +7223,11 @@ static bool nativeRtxInit(NativeRife& nr)
         }
         NCHK(cudaDeviceSynchronize(), "warm-up eval sync");
         if (g_offline)
-            LOG("native: RTX TrueHDR on: %dx%d per decoded frame, after Restore, DLSS 5 and FSR and before the "
+            LOG("native: RTX TrueHDR on: %dx%d per decoded frame, after Restore, DLSS 5 and Sharpen and before the "
                 "model, colour %ls, contrast %u saturation %u, %u nits\n",
                 nr.w, nr.h, g_hdrColor, nr.thdr.Contrast, nr.thdr.Saturation, nr.thdr.MaxLuminance);
         else
-            LOG("native: live RTX TrueHDR on: %dx%d per real frame, after Restore, DLSS 5 and FSR and before the "
+            LOG("native: live RTX TrueHDR on: %dx%d per real frame, after Restore, DLSS 5 and Sharpen and before the "
                 "model, colour %ls, SDR white %.0f nits, contrast %u saturation %u\n",
                 nr.w, nr.h, g_hdrColor, nr.sdrScale * 80.0f, nr.thdr.Contrast, nr.thdr.Saturation);
     }
@@ -11980,7 +11980,7 @@ static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
 // The offline pass chain on one planar model-size frame (ps / rs strides, nr.w x nr.h), then
 // the quantisation, into dO as tight rgb48le (out16) or rgb24 at the output size nr.dw x nr.dh:
 // nativeOfflineStage (Restore and the resize; with a working size Restore ran before the model and
-// only the final resize from the working size is left). DLSS 5, FSR and RTX TrueHDR already ran on
+// only the final resize from the working size is left). DLSS 5, Sharpen and RTX TrueHDR already ran on
 // the decoded frame before the interpolation (nativeNrFrame, nativePreModelPost): with RTX HDR the
 // frame is PQ, the resize is Lanczos3 (RTX VSR takes SDR only) and nativeOfflinePqOut writes the
 // x2rgb10le words and the frame's statistics. A pass that fails is dropped for the rest of the render
@@ -12088,7 +12088,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     }
     if (nr.pfEv[0])
         cudaEventRecord(nr.pfEv[0], st);
-    // the 1:1 frame with nothing between the pack and the motion frame (no DLSS 5, no FSR, no RTX HDR, no Restore, no
+    // the 1:1 frame with nothing between the pack and the motion frame (no DLSS 5, no Sharpen, no RTX HDR, no Restore, no
     // RTX VSR before the model): k_packInMotion packs it, makes its motion frame and, when the identical-pair test below
     // runs on this pair, that test too; through nr.capTex it reads the capture array itself
     const bool packMotion = !(nr.rtxHdr && !nr.rtxFailed && g_rtxb.created) && !(nr.vsrPre && !nr.vsrFailed) &&
@@ -12395,7 +12395,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
     }
     // DLSS 5: once per captured frame on the model frame, after Restore and the
-    // resize and before any model reads it; then FSR and RTX TrueHDR (nativePreModelPost), and the
+    // resize and before any model reads it; then Sharpen and RTX TrueHDR (nativePreModelPost), and the
     // frame the model reads is kept for the reuse above
     if (nr.pfEv[1])
         cudaEventRecord(nr.pfEv[1], st);
@@ -12404,8 +12404,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // RIFE's motion frame (two domains): the finished picture as the IFNet would have read it, minus
     // what costs RIFE its motion: the HDR desktop's PQ encoding (read as SDR sRGB over the desktop's
     // SDR white) and an enlarge (Lanczos3 back to the capture size), padded to the motion frame. Taken
-    // after FSR, or before the post with RTX HDR (the picture is still SDR there, FSR is fused into
-    // TrueHDR's input). An identical capture copied it above.
+    // after Sharpen, or before the post with RTX HDR (the picture is still SDR there, Sharpen is fused
+    // into TrueHDR's input). An identical capture copied it above.
     auto motionFrame = [&]() -> bool {
         const float* msrc = dCur;
         int sps = (int)plane, srs = nr.pw, sw = nr.w, sh = nr.h;
@@ -12768,7 +12768,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
         return true;
     };
-    // one output slot's chain after the model (Restore, DLSS 5, FSR and RTX HDR already ran on the
+    // one output slot's chain after the model (Restore, DLSS 5, Sharpen and RTX HDR already ran on the
     // captured frame): RTX VSR or the Lanczos3 resize, Upscale to
     auto storeSlot = [&](const void* src, uint8_t* slot, const char* what, int half = 0) -> bool {
         int ps = (int)plane, rs = nr.pw;

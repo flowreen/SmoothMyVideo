@@ -108,6 +108,8 @@ enum Backend
 };
 static Backend g_backend = BK_DLSSG;
 static std::wstring g_serverBackend; // BK_SERVER: the backend name (--backend)
+static bool g_fgOver = false;        // DLSS-G with an effect: the echo route (BK_SERVER) runs the effects on every
+                                     // captured frame and DLSS-G presents those frames (parseLiveArgs)
 static std::wstring g_modelLabel;    // user-facing model name for the loading message/HUD
                                      // (the GUI's effective-model label, e.g. "RIFE (DRBA)";
                                      // falls back to the raw backend name when absent)
@@ -223,8 +225,8 @@ static bool g_monitor = false;     // --fit monitor: capture the target's WHOLE 
                                    // size, so even DLSS-G works; the overlay is excluded from
                                    // its own capture via WDA_EXCLUDEFROMCAPTURE)
 static bool g_fill = false;        // --fit fill: fullscreen overlay on the target's monitor,
-                                   // content aspect-fit upscaled by the server (server backends
-                                   // only; DLSS-G owns its pipeline and cannot be resized yet)
+                                   // content aspect-fit upscaled by the server (server backends,
+                                   // DLSS-G through the echo route: g_fgOver)
 // HDR live mode. When the target's display has Windows HDR on and we run a server
 // backend, capture FP16 scRGB, the server converts to BT.2020 PQ [0,1], and everything downstream
 // (canvas, shm, present) stays 4 bytes/px as R10G10B10A2 on a PQ (G2084) swapchain. SDR is
@@ -1400,7 +1402,7 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.skipIn = (uint64_t)_wtoi64(argv[++i]);
         else if (wcscmp(argv[i], L"--hdr-frames") == 0 && i + 1 < argc)
             oa.hdrFramesW = argv[++i];
-        // the passes in order: Restore, the resize, DLSS 5, FSR, RTX HDR, the model, the final resize
+        // the passes in order: Restore, the resize, DLSS 5, Sharpen, RTX HDR, the model, the final resize
         else if (wcscmp(argv[i], L"--out-w") == 0 && i + 1 < argc)
             oa.outW = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--out-h") == 0 && i + 1 < argc)
@@ -1419,7 +1421,7 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_rtxVsr = true;
         else if (wcscmp(argv[i], L"--restore") == 0)
             g_restore = true;
-        // RTX HDR: TrueHDR once per decoded frame after DLSS 5 and FSR, before the model; x2rgb10le out
+        // RTX HDR: TrueHDR once per decoded frame after DLSS 5 and Sharpen, before the model; x2rgb10le out
         else if (wcscmp(argv[i], L"--rtx-hdr") == 0)
             g_rtxHdr = true;
         else if (wcscmp(argv[i], L"--hdr-color") == 0 && i + 1 < argc)
@@ -1438,7 +1440,7 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.hdrDv = true;
         else if (wcscmp(argv[i], L"--hdr-hp") == 0)
             oa.hdrHp = true;
-        // DLSS 5: once per decoded frame after Restore and the resize, before FSR and RTX HDR
+        // DLSS 5: once per decoded frame after Restore and the resize, before Sharpen and RTX HDR
         else if (wcscmp(argv[i], L"--dlssnr") == 0)
             g_dlssnr = true;
         else if (wcscmp(argv[i], L"--nr-structure") == 0 && i + 1 < argc)
@@ -2565,8 +2567,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // RIFE's motion frame: the finished picture as the IFNet would have read it, minus what costs
         // RIFE its motion (measured on an exact pan): the PQ encoding (read as SDR sRGB) and an enlarge
         // (Lanczos3 back to the decoded size, into dSrcPl, which the pre-model stage no longer needs),
-        // padded to the model's frame. Taken after FSR, or before the post with RTX HDR (FSR is fused
-        // into TrueHDR's input there). A reused frame copied it above.
+        // padded to the model's frame. Taken after Sharpen, or before the post with RTX HDR (Sharpen is
+        // fused into TrueHDR's input there). A reused frame copied it above.
         auto motionFrame = [&]() -> bool {
             const float* msrc = dCur;
             int sps = (int)plane, srs = nr.pw, sw = w, sh = h;
@@ -2602,11 +2604,11 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             failed = true;
             break;
         }
-        // FSR and RTX TrueHDR after DLSS 5, once per decoded frame before anything reads it (NVIDIA's
+        // Sharpen and RTX TrueHDR after DLSS 5, once per decoded frame before anything reads it (NVIDIA's
         // order: post-processing and the HDR conversion before frame generation)
         if (!nrSame && !nativePreModelPost(nr, dCur, ps, nr.rtxHdr))
         {
-            io.setFail("FSR / RTX HDR before the model failed");
+            io.setFail("Sharpen / RTX HDR before the model failed");
             failed = true;
             break;
         }
@@ -3477,6 +3479,7 @@ static void resetSessionGlobals()
     H = 1080;
     g_backend = BK_DLSSG;
     g_serverBackend.clear();
+    g_fgOver = false;
     g_modelLabel.clear();
     g_modelNote.clear();
     g_script.clear();
@@ -3656,16 +3659,28 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             }
         }
     }
+    // DLSS-G with any effect (Sharpen, Restore, DLSS 5, RTX HDR, Fill, Upscale to, a DLSS mode below DLAA): the echo
+    // route runs that chain once per captured frame and DLSS-G generates from its frames. RTX VSR alone has no resize
+    // to work on, so it does not count.
+    const bool belowDlaa = g_dlssMode == 1 || g_dlssMode > 2 || (g_dlssMode == 0 && g_flowScale < 1.0);
+    if (g_backend == BK_DLSSG &&
+        (g_sharpen > 0 || g_restore || g_dlssnr || g_rtxHdr || g_fill || g_upscaleH > 0 || belowDlaa))
+    {
+        g_fgOver = true;
+        g_backend = BK_SERVER;
+        g_serverBackend = L"echo";
+        g_noAdapt = true; // one real frame a group; DLSS-G makes the in-between frames
+    }
     if (g_fill && g_backend != BK_SERVER)
     {
-        LOG("--fit fill needs a server backend (e.g. --backend rife); DLSS-G cannot be resized\n");
+        LOG("--fit fill needs a server backend (e.g. --backend rife) or an effect; plain DLSS-G cannot be resized\n");
         return 1;
     }
     // Server backends stream per-slot and size shm/outbuf from gen, so their only limit is
     // the MEMORY budget - which needs the presented resolution and so cannot be known here;
     // runLive clamps an oversized --gen once the slot size is known. DLSS-G is model-capped
     // at 5 generated frames (numFramesToGenerateMax); identity has no reason to go higher.
-    const int genCap = (g_backend == BK_SERVER) ? INT_MAX : 5;
+    const int genCap = (g_backend == BK_SERVER && !g_fgOver) ? INT_MAX : 5;
     if (genFrames < 1 || genFrames > genCap)
     {
         LOG("--gen must be 1..%d for this backend (got %d)\n", genCap, genFrames);
@@ -3697,7 +3712,7 @@ static int runLiveArgs(LiveArgs& la)
         }
         la.targetOverride = fg;
     }
-    if (g_backend == BK_DLSSG && slInitCommon())
+    if ((g_backend == BK_DLSSG || g_fgOver) && slInitCommon())
         return 1;
     return runLive(la.needle, la.targetOverride, la.genFrames, la.vsync, la.clickthrough, la.diagSecs, la.park);
 }
@@ -3812,7 +3827,7 @@ static int residentMain(LiveArgs first)
         // build a session left running in the background.
         const bool held = g_res.rt || nativeBuildPending();
         const bool stay = (g_sessionClean && (rc == 0 || rc == 4 || rc == 7 || rc == 8) && held && !g_nrAttempted &&
-                           !g_rtxUsed && g_backend != BK_DLSSG) ||
+                           !g_rtxUsed && g_backend != BK_DLSSG && !g_fgOver) ||
                           ((rc == 5 || (rc == 7 && !g_sessionClean)) && held);
         if (!stay)
         {

@@ -1229,6 +1229,130 @@ def gmflow_backbone_cut(a_path):
     return paths[0]
 
 
+def gmflow_attention_blocks(a_path, k=8):
+    """gmflow_bidir_a's two attentions with a 2-channel value (the global matching: Softmax over Concat(X, X^T),
+    X = Reshape(Div(Reshape(MatMul(f0, f1)))), times the pixel grid; the flow propagation: Softmax(Div(MatMul(q, k^T)))
+    times the flow) computed in K row blocks: Slice(rows) -> MatMul -> Div -> Softmax -> MatMul -> Concat, so the
+    N x N matrix never exists (N = 32,640 tokens at the 4K half: two [2, N, N] fp16 matrices of ~4.3 GB each set the
+    engine's context, 10.5 GB -> 5.6 GB at K 8). Each row's softmax reads only that row, so the math is the same;
+    the global matching's second direction is f1's rows against f0^T. Block step = ceil(N / K) from the graph's own
+    Shape, size-free. Found by structure (gmflow's transformer heads carry 128-channel values); any other count
+    refuses. Rewrites a_path in place."""
+    import onnx
+    from onnx import TensorProto, helper, shape_inference
+
+    m = onnx.load(a_path, load_external_data=False)
+    g = m.graph
+    vi = {v.name: v.type.tensor_type.shape for v in shape_inference.infer_shapes(m).graph.value_info}
+    prod = {o: n for n in g.node for o in n.output}
+    cons = {}
+    for n in g.node:
+        for x in n.input:
+            cons.setdefault(x, []).append(n)
+
+    def two_channel(t):
+        s = vi.get(t)
+        return s is not None and len(s.dim) > 0 and s.dim[-1].dim_value == 2
+
+    chains = {"prop": [], "global": []}
+    for sm in (n for n in g.node if n.op_type == "Softmax"):
+        users = cons.get(sm.output[0], [])
+        if len(users) != 1 or users[0].op_type != "MatMul" or not two_channel(users[0].input[1]):
+            continue
+        mm_v = users[0]
+        src = prod[sm.input[0]]
+        if src.op_type == "Div" and prod[src.input[0]].op_type == "MatMul":
+            mm = prod[src.input[0]]
+            chains["prop"].append(({mm.name, src.name, sm.name, mm_v.name}, mm.input[0], mm.input[1],
+                                   mm_v.input[1], src.input[1], mm_v.output[0]))
+        elif src.op_type == "Concat" and len(src.input) == 2:
+            x, xt = src.input
+            r2 = prod[x]
+            if r2.op_type != "Reshape" or prod[xt].op_type != "Transpose" or prod[xt].input[0] != x:
+                continue
+            div = prod[r2.input[0]]
+            if div.op_type != "Div":
+                continue
+            r1 = prod[div.input[0]]
+            if r1.op_type != "Reshape":
+                continue
+            mm = prod[r1.input[0]]
+            if mm.op_type == "MatMul":
+                chains["global"].append(({mm.name, r1.name, div.name, r2.name, prod[xt].name, src.name, sm.name,
+                                          mm_v.name}, mm.input[0], mm.input[1], mm_v.input[1], div.input[1],
+                                         mm_v.output[0]))
+    for kind, found in chains.items():
+        if len(found) != 1:
+            raise RuntimeError(f"gmflow_bidir_a: {len(found)} {kind} attentions with a 2-channel value, expected 1")
+
+    consts = {}
+
+    def const(vals):
+        name = "attn_blocks_c" + "_".join(str(v) for v in vals)
+        if name not in consts:
+            consts[name] = helper.make_tensor(name, TensorProto.INT64, [len(vals)], vals)
+        return name
+
+    nodes = []
+    made = [0]   # names stay unique across both chains (nodes is emptied after each splice)
+
+    def node(op, inputs, **attrs):
+        out = f"attn_blocks_{made[0]}"
+        made[0] += 1
+        nodes.append(helper.make_node(op, inputs, [out], name=out, **attrs))
+        return out
+
+    def blocks(q, kt, v, scale):
+        """Concat over q's rows (axis 1) of Softmax(q_rows @ kt / scale) @ v, K blocks"""
+        dim = node("Gather", [node("Shape", [q]), const([1])], axis=0)
+        step = node("Div", [node("Add", [dim, const([k - 1])]), const([k])])
+        parts = []
+        for i in range(k):
+            rows = node("Slice", [q, node("Mul", [step, const([i])]), node("Mul", [step, const([i + 1])]),
+                                  const([1])])
+            p = node("Softmax", [node("Div", [node("MatMul", [rows, kt]), scale])], axis=-1)
+            parts.append(node("MatMul", [p, v]))
+        return node("Concat", parts, axis=1)
+
+    def splice(drop, out):
+        nodes[-1].output[0] = out
+        last = max(i for i, n in enumerate(g.node) if n.name in drop)
+        kept = [n for n in g.node if n.name not in drop]
+        pos = sum(1 for n in g.node[:last] if n.name not in drop)
+        del g.node[:]
+        g.node.extend(kept[:pos] + nodes + kept[pos:])
+        nodes.clear()
+
+    drop, q, kt, v, scale, out = chains["prop"][0]
+    blocks(q, kt, v, scale)
+    splice(drop, out)
+    drop, f0, f1, v, scale, out = chains["global"][0]   # f0 tokens [1, N, C], f1 channels [1, C, N], grid [2, N, 2]
+    d0 = blocks(f0, f1, node("Slice", [v, const([0]), const([1]), const([0])]), scale)
+    d1 = blocks(node("Transpose", [f1], perm=[0, 2, 1]), node("Transpose", [f0], perm=[0, 2, 1]),
+                node("Slice", [v, const([1]), const([2]), const([0])]), scale)
+    node("Concat", [d0, d1], axis=0)
+    splice(drop, out)
+    g.initializer.extend(consts.values())
+    need = {o.name for o in g.output}   # drop what no output reads any more (the views' shape helpers)
+    keep = []
+    for n in reversed(g.node):
+        if any(o in need for o in n.output):
+            keep.append(n)
+            need.update(x for x in n.input if x)
+    del g.node[:]
+    g.node.extend(reversed(keep))
+    live = {x for n in g.node for x in list(n.input) + list(n.output)}
+    vis = [v for v in g.value_info if v.name in live]
+    del g.value_info[:]
+    g.value_info.extend(vis)
+    tmp = a_path + ".tmp.onnx"
+    with open(tmp, "wb") as fh:
+        fh.write(m.SerializeToString())
+    onnx.checker.check_model(tmp)
+    os.replace(tmp, a_path)
+    _log(f"[trt] gmflow's two N x N attentions in {k} row blocks: {os.path.basename(a_path)}")
+
+
 # --- size-free ONNX -----------------------------------------------------------------------------
 # The graphs below export ONCE with H / W symbolic (trt_lookup.onnx_path), and every engine size is
 # built from that file, pinned to the example shape exactly like a per-size export (one engine per
