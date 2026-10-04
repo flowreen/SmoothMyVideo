@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://sourceforge.net/projects/smoothmyvideo/files/latest/download"><img src="https://img.shields.io/badge/download-windows%20x64-2ea44f" alt="Download for Windows"></a>
-  <a href="https://sourceforge.net/projects/smoothmyvideo/files/"><img src="https://img.shields.io/sourceforge/dt/smoothmyvideo" alt="Downloads"></a>
+  <a href="https://github.com/flowreen/SmoothMyVideo/releases/latest"><img src="https://img.shields.io/badge/download-windows%20x64-2ea44f" alt="Download for Windows"></a>
+  <a href="https://github.com/flowreen/SmoothMyVideo/releases"><img src="https://img.shields.io/github/downloads/flowreen/SmoothMyVideo/total" alt="Downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
@@ -38,8 +38,8 @@
 Pick a video (or drag it in), choose a **target frame rate** (double it, 4×, 8× and up, or **match
 your monitor's refresh**), and click **Smooth It!**. Smooth My Video generates the in-between frames
 with a GMFSS AI model on your GPU and writes a smoother, high-frame-rate copy right next to the
-original. In the same render it can also **upscale** (up to 16K) or downscale (480p/720p for small,
-fast-to-encode files), **sharpen**, **restore detail**, and
+original. In the same render it can also **upscale** (up to 16K) or downscale (720p, or a custom height down to 240p,
+for small, fast-to-encode files), **sharpen**, **restore detail**, and
 convert **SDR → real HDR10**, while carrying over every audio track, subtitle, chapter and font.
 
 It also does this **live**: Live mode smooths any window on your screen in real time (a video
@@ -48,11 +48,11 @@ player, a browser, a windowed game) with no file and no waiting, Lossless-Scalin
 each mode shows only its own controls plus the settings both share.
 
 <p align="center">
-  <img src="docs/ui.png" alt="The Smooth My Video window in Video mode: the Video / Live switch, Select video, then the numbered panels in processing order (Restore, Upscale with the DLSS mode and its slider at 100 %, DLSS 5, Sharpen, HDR with Dolby Vision and HDR10+, Interpolate with the Speed target, Output) and the before/after preview" width="620">
+  <img src="docs/ui.png" alt="The Smooth My Video window in Video mode: the Video / Live switch, Select video, then the numbered panels in processing order (Restore, Upscale with the output Size, DLSS 5, Sharpen, HDR with Dolby Vision and HDR10+, Interpolate with the Speed target, Output)" width="620">
 </p>
 
 <p align="center">
-  <img src="docs/ui-live.png" alt="The same window in Live mode: the Video / Live switch, the Smooth It Live button with its display, FPS meter and hotkey options, and the shared numbered panels (Restore, Upscale with the DLSS mode and its slider, DLSS 5, Sharpen, RTX HDR, Interpolate with the Speed target)" width="620">
+  <img src="docs/ui-live.png" alt="The same window in Live mode: the Video / Live switch, the Smooth It Live button with its display, FPS meter and hotkey options, and the shared numbered panels (Restore, Upscale with the DLSS mode, DLSS 5, Sharpen, RTX HDR, Interpolate with the Speed target)" width="620">
 </p>
 
 Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a current driver.
@@ -94,20 +94,16 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   detected and timed correctly, so audio never drifts out of sync.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
   The one exception is the NVIDIA Smooth Motion model, which is non-deterministic.
-* 🎛️ **NVIDIA's DLSS modes for speed.** File renders run Restore and the resize first, then DLSS 5
-  and the interpolation at the **working size**, then one
-  final resize to your output (RTX Video Super Resolution when it's on). The **DLSS mode** picks
-  the working size as NVIDIA does, a share of the output: DLAA (the default, the output size
-  itself), Quality, Balanced, Performance, Ultra Performance, Auto (NVIDIA's pick for the output
-  size) or Custom. The slider beside it shows the share from 1 to 100% and starts at 100% (DLAA);
-  dragging it onto a mode's share picks that mode, any other value is Custom. The lower modes are
-  much faster and a little softer; Performance
-  for a 1080p to 4K upscale works at the source's own 1080p. Live picks its working size the same
-  way from what it shows (the window, or the whole screen in Fill), so Fill at DLAA smooths at the
-  screen's size and the lower modes are its speed lever.
+* 🎛️ **One size control per mode.** File renders pick the output **Size** and run every pass at it
+  (Restore and the resize first, then DLSS 5 and the interpolation; RTX Video Super Resolution
+  enlarges when the Size is above the source). Live's size is what **Display** shows (the window, or
+  the screen), and its **DLSS mode** is its speed lever, NVIDIA's share of that size: DLAA (the
+  default, the full size), Quality (67%), Balanced (58%), Performance (50%) or Ultra Performance
+  (33%), from the dropdown or its slider; the lower modes are much faster and a little
+  softer, and the fit to the window or screen enlarges the result.
 * 🧠 **Optional NVIDIA DLSS 5 pass.** One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every
-  source frame before the smoothing (after Restore and the resize, at the working size),
-  at DLAA quality (its full resolution in, full resolution out), fed the way game integrations
+  source frame before the smoothing (after Restore and the resize, at the output size; in Live at
+  its DLSS mode's size), at full resolution (its own size in, the same size out), fed the way game integrations
   feed it (NVIDIA's automatic mask and motion vectors from NVIDIA's Optical Flow hardware, in file
   renders and live, so its history follows the picture, and a paused or held picture stays
   perfectly still), with NVIDIA's three
@@ -148,13 +144,13 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   your fps target (the same Speed setting file renders use) and the multiplier follows the
   content, so a game dropping from 30 to 10 fps keeps playing at the same smooth rate on
   screen. The target goes up to 10000 fps; with **Fit to the GPU** ticked (the default) Live lowers the smoothing
-  to what your GPU keeps up with, down to the source's own rate with every effect still on, then (DLSS mode Auto)
-  the working size, so every source frame is shown with little delay. Unticked, everything runs as set and a
+  to what your GPU keeps up with, down to the source's own rate with every effect still on, so every source frame
+  is shown with little delay. Unticked, everything runs as set and a
   target the GPU can't reach skips source frames. File renders always keep their exact fps; unticked, they just
-  run slower when video memory runs short. Your Sharpen, Upscale to and Restore settings apply live too (the picture is rendered at the
-  chosen height first, then fitted to the window or screen; Restore, DLSS 5, Sharpen and RTX HDR work on
-  each captured frame before the smoothing, once per captured frame), and Fill screen upscales with RTX VSR when
-  it's enabled. Untick every interpolation model and Live applies just those effects to the
+  run slower when video memory runs short. Your Sharpen and Restore settings apply live too (Restore,
+  DLSS 5, Sharpen and RTX HDR work on each captured frame before the smoothing, once per captured frame),
+  and Fill screen upscales with RTX VSR when it's enabled. With NVIDIA DLSS 4.5 as the live model those
+  effects, the DLSS mode and Fill do not apply (it runs its own pipeline), and their panels grey out. Untick every interpolation model and Live applies just those effects to the
   window at its own frame rate (useful for the growing set of apps that only need the
   picture cleaned or expanded). A small
   green readout in the corner shows the source fps, the smoothed fps, and roughly how far the
@@ -183,17 +179,19 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   breaking up. File renders with it take a
   whole multiplier and no Sharpen, Upscale, DLSS mode, RTX HDR, Restore or DLSS 5 yet (it tells
   you when a setting is in the way); live takes every effect.
-* 🎚️ **Plus the essentials:** FSR-style sharpening, a live before/after preview, every setting remembered
+* 🎚️ **Plus the essentials:** Adaptive Sharpen (bacondither's two-pass HQ sharpener, strength 0 to 2), a live
+  before/after preview, every setting remembered
   between runs, and a quiet one-line notice when a newer release is out (nothing auto-downloads).
 
 ## Get started
 
-* **Download & run:** grab the latest
-  [`SmoothMyVideo-<version>-win.zip`](https://sourceforge.net/projects/smoothmyvideo/files/latest/download),
-  extract it anywhere, and run **`SmoothMyVideo.exe`** (or the Desktop / Start-menu shortcut). No
-  install, no dependencies, just a current NVIDIA driver. A sample clip ships in `samples/test.mp4`.
-  Release notes and checksums live on the
-  [GitHub releases page](https://github.com/flowreen/SmoothMyVideo/releases).
+* **Download & run:** grab `SmoothMyVideo-<version>-win.7z` from the
+  [latest release](https://github.com/flowreen/SmoothMyVideo/releases/latest) (its `.sha256` and the
+  release notes sit beside it), extract it anywhere (Windows 11 23H2 and later open `.7z` in File
+  Explorer; on older Windows use [7-Zip](https://www.7-zip.org/) or NanaZip), and run
+  **`SmoothMyVideo.exe`** (or the Desktop /
+  Start-menu shortcut). No install, no dependencies, just a current NVIDIA driver. A sample clip ships in
+  `samples/test.mp4`.
 * **From source:** `npm start`. See **[DEVELOPMENT.md](DEVELOPMENT.md)** for the full setup.
 
 ## Under the hood
@@ -222,5 +220,4 @@ is not affiliated with, endorsed by, sponsored by, or certified by Dolby Laborat
 HDR10+ is a trademark of HDR10+ Technologies, LLC; Smooth My Video is likewise not affiliated with, endorsed
 by, or certified by HDR10+ Technologies. HDR10+ metadata is injected by the separately-installed, third-party
 open-source [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool); no HDR10+ LLC software is bundled
-or redistributed. The bundled example clip is from
-[Big Buck Bunny](https://peach.blender.org/), © Blender Foundation, licensed CC-BY 3.0.</sub>
+or redistributed.</sub>

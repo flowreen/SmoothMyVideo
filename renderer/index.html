@@ -68,6 +68,8 @@
      workspace), and an inline display must never leak the other mode's UI back on screen. */
   html.mode-live .vonly { display:none !important; }
   html.mode-video .lonly { display:none !important; }
+  /* Live with NVIDIA DLSS 4.5: its own pipeline takes none of these panels (syncDlssgLock) */
+  .dlssglocked { opacity:.45; pointer-events:none; }
   /* Percentage painted on top of the fill, centred in the bar (taller bar so the larger text fits). */
   #pct { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
          color:#fff; font-size:22px; font-weight:600; pointer-events:none;
@@ -90,7 +92,7 @@
   .defmark { position:relative; display:inline-flex; align-items:center; isolation:isolate; }
   .defmark::before { content:''; position:absolute; left:calc(var(--def, 50%) - 1px); top:-2px; bottom:-2px;
                      width:2px; background:#e85c5c; z-index:-1; }
-  /* --def on the wrapper moves the tick for an off-centre default (the DLSS mode's Custom 100%
+  /* --def on the wrapper moves the tick for an off-centre default (the DLSS mode slider's DLAA
      sits at the right end, inset by the half thumb) */
   .defmark:has(input:disabled)::before { opacity:.45; }
   @keyframes spin { to { transform:rotate(360deg); } }
@@ -132,8 +134,8 @@
   <!-- Empty state: shown until a video is loaded (or an RTX install begins), then replaced by #workspace. -->
   <div id="welcome" class="panel vonly" style="text-align:center;padding:40px 20px">
     <div style="font-size:15px;margin-bottom:8px">👋 Welcome to <b>Smooth My Video</b></div>
-    <div class="hint">Drop a video anywhere on this window (or click <b>Select video…</b> above) to get started.<br>
-      You'll get a smoother, higher-frame-rate copy saved right next to the original.</div>
+    <div class="hint">Drop a video on this window or click <b>Select video…</b> above.<br>
+      You get a smoother, higher-frame-rate copy next to the original.</div>
   </div>
 
   <!-- Live mode: real-time frame generation over any window on screen (no file involved).
@@ -146,7 +148,7 @@
   <div class="panel lonly" id="lvpanel" style="display:none">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Live mode</span>
-      <span class="hint">Smooth <b>any window</b> in real time, no file needed: video player, browser, windowed game. Uses the <b>Interpolation model</b> and <b>Speed</b> target selected below - one choice drives both file renders and live smoothing (models without a live mode fall back automatically). Click <b>Smooth It Live!</b>, then during the countdown click the window you want smoothed - or press <b>`</b> (backtick) in any app to toggle it instantly (the key is reserved system-wide while this app runs). A green readout on the window shows source fps &rarr; smoothed fps and the delay. Windowed or borderless only; Esc (while watching), <b>`</b> or Stop ends it.</span>
+      <span class="hint">Smooth <b>any window</b> live: a video player, a browser, a windowed game, with the model and Speed below. Click <b>Smooth It Live!</b>, then the window during the countdown, or press <b>`</b> in any app. Windowed or borderless only; Esc, <b>`</b> or Stop ends it.</span>
     </div>
     <div class="row">
       <button id="lvgo">Smooth It Live!</button>
@@ -155,7 +157,7 @@
     </div>
     <div class="row">
       <span class="k">Display</span>
-      <select id="lvfit" title="Where the smoothed output goes. Original size covers the window 1:1. Fill screen covers the whole monitor the window is currently on, upscaling the content with aspect ratio preserved (black bars as needed) - the classic way to watch a small player window big and smooth. Whole screen captures and smooths the entire monitor 1:1 (everything on it), and works with every model including DLSS 4.5.">
+      <select id="lvfit" title="Original size: the window as it is. Fill screen: the window enlarged to its whole monitor, aspect kept. Whole screen: everything on the monitor, with every model (DLSS 4.5 too).">
         <option value="window">Original size</option>
         <option value="fill">Fill screen</option>
         <option value="monitor">Whole screen</option>
@@ -173,15 +175,14 @@
         Show latency
       </label>
       <span class="hint" style="margin-left:14px">Hotkey</span>
-      <button id="lvkey" class="mini" title="The system-wide key that toggles Live mode on whatever window is in the foreground. Click, then press the new key or combo (Esc cancels). The key is reserved system-wide while this app runs.">`</button>
+      <button id="lvkey" class="mini" title="Toggles Live on the window in front, from any app (reserved while SMV runs). Click, then press a key or combo; Esc cancels.">`</button>
       <span class="hint" id="lvkeyhint"></span>
     </div>
   </div>
 
   <!-- Shown in Live mode only when main answered lv-ready = false (the bundled exe is missing). -->
   <div class="panel hint lonly" id="lvunavail" style="display:none">
-    Live mode needs the bundled smv-live component (engine/live/smv-live.exe). This build does not
-    have it, so live smoothing is unavailable. Reinstalling the full app restores it.
+    Live needs engine/live/smv-live.exe, which this build lacks. Reinstalling the full app restores it.
   </div>
 
   <!-- Everything operational: hidden until there's something to act on (see showWorkspace). -->
@@ -198,13 +199,13 @@
   <div class="panel step" id="nrpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">DLSS 5</span>
-      <span class="hint">Opt-in. <span class="vonly">NVIDIA's Neural Rendering redraws each source frame with more photoreal light and surfaces (the Style and intensities below set how much), after Restore and the resize to the working size (the DLSS mode), before the interpolation, so the generated frames inherit it.</span><span class="lonly">NVIDIA's Neural Rendering redraws each captured frame with more photoreal light and surfaces (the Style and intensities below set how much), after Restore and the resize to the working size (the DLSS mode's share of the window, or of the screen in Fill), before the smoothing, so the generated frames inherit it; on an HDR display it works on the window's SDR range (HDR highlights pass through untouched); ignored when the live model is NVIDIA DLSS 4.5.</span></span>
+      <span class="hint">Opt-in. NVIDIA's Neural Rendering redraws each frame with more photoreal light and surfaces; the generated frames inherit it<span class="lonly">. On an HDR screen it works on the window's SDR range</span>.</span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="dlssnr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA DLSS 5 <span class="hint" id="dlssnrhint">(Neural Rendering, DLAA quality; needs the runtime file you supply)</span>
+        NVIDIA DLSS 5 <span class="hint" id="dlssnrhint">(Neural Rendering at full resolution; needs the runtime file you supply)</span>
       </label>
       <span id="nrwrap" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
         <span class="hint">Style</span>
@@ -222,13 +223,13 @@
                style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="nrtonenum">1.00</span>
         <span class="hint" style="margin-left:6px"
-              title="DLSS 5 runs this many times on every frame, each pass on the previous pass's result and with its own history (NVIDIA's network chained). More passes strengthen the effect and cost that many times the DLSS 5 time and video memory.">Passes</span>
+              title="Runs DLSS 5 this many times a frame, each pass on the last one's result: a stronger effect at that many times the time and video memory.">Passes</span>
         <span class="defmark" style="--def:8px"><input id="nrpasses" type="range" min="1" max="10" step="1" value="1"
-               title="DLSS 5 runs this many times on every frame, each pass on the previous pass's result and with its own history (NVIDIA's network chained). More passes strengthen the effect and cost that many times the DLSS 5 time and video memory."
+               title="Runs DLSS 5 this many times a frame, each pass on the last one's result: a stronger effect at that many times the time and video memory."
                style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="nrpassesnum">1</span>
         <label class="hint vonly" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:6px"
-               title="Preview only: the Processed pane shows where the DLSS 5 pass changed pixels (bright = big change, dark = untouched) instead of the picture. The rendered video is not affected.">
+               title="Preview only: shows where DLSS 5 changed the picture (bright = a big change). The render is unaffected.">
           <input type="checkbox" id="nrmask" style="width:auto;padding:0;accent-color:var(--green);">
           Show changed pixels
         </label>
@@ -249,7 +250,15 @@
   <div class="panel step" id="interppanel">
     <div class="row">
       <span class="k">Interpolate</span>
-      <span class="hint">generate in-between frames for smoother motion with the model chosen below (off = keep the source frames; every other panel still applies)<span class="vonly">; runs at the working size (the DLSS mode)</span></span>
+      <span class="hint">in-between frames from the model below; none ticked = the source frames, the other panels still apply</span>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="modelnvof"
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        NVIDIA Optical Flow <span class="hint">(NVIDIA's optical-flow hardware, nothing to install; very fast motion goes soft)</span>
+      </label>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -264,7 +273,7 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelrife"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RIFE <span class="hint">(Real-Time Intermediate Flow Estimation: AI, best for live action, also carries the DRBA anime mode below)</span>
+        RIFE <span class="hint">(Real-Time Intermediate Flow Estimation: AI, fast, best for live action)</span>
       </label>
     </div>
     <div class="row" id="rifedrbarow" style="display:none">
@@ -272,7 +281,7 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-left:22px;">
         <input type="checkbox" id="rifedrba"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        DRBA <span class="hint">(Distance Ratio Based Adjuster: on = characters keep their original pace and crisp poses while camera pans smooth fully, off = plain RIFE, every frame pair interpolated uniformly)</span>
+        DRBA <span class="hint">(anime pacing: characters keep their own timing and crisp poses while camera pans smooth fully)</span>
       </label>
     </div>
     <div class="row">
@@ -280,15 +289,7 @@
       <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modeldlss"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(Deep Learning Super Sampling: AI frame generation from games; 2&times; to 6&times;, needs RTX 40/50, RTX 50 above 2&times;)</span>
-      </label>
-    </div>
-    <div class="row">
-      <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="modelnvof"
-               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA Optical Flow <span class="hint">(NVIDIA optical-flow hardware, nothing to install; very fast motion turns into a soft double image)</span>
+        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(AI frame generation from games; 2&times; to 6&times;; RTX 40/50, above 2&times; RTX 50)</span>
       </label>
     </div>
     <div class="row">
@@ -296,15 +297,7 @@
       <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="modelfruc"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA Smooth Motion <span class="hint">(NVIDIA optical-flow hardware; the lowest quality of the models, and non-deterministic)</span>
-      </label>
-    </div>
-    <div class="row">
-      <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="modellsfg"
-               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Frame Blend <span class="hint">(AI interpolation: both frames warped along the motion and merged)</span>
+        NVIDIA Smooth Motion <span class="hint">(NVIDIA's optical-flow hardware; the lowest quality, varies run to run)</span>
       </label>
     </div>
     <div id="dlsssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -323,7 +316,7 @@
       <span class="k">Speed</span>
       <span class="seg" id="speedseg">
         <button type="button" id="smfps" title="Output runs at this exact frame rate, whatever the source is (decimals allowed: 47.952 is exactly 2x a 23.976 source)">Target fps</button>
-        <button type="button" id="smscreen" title="Output matches this monitor's refresh rate">Match screen</button>
+        <button type="button" id="smscreen" title="Output matches this monitor's refresh rate">Screen refresh rate</button>
       </span>
     </div>
     <div class="row">
@@ -340,7 +333,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="On (default): when the GPU or its video memory runs short, Live lowers the smoothing, down to the source's own rate with every effect still on, then (DLSS mode Auto) the working size, so every source frame is shown with little latency; a file render uses less video memory at a time. A file keeps its exact fps either way. Off: everything runs as set; Live may skip source frames and lag, and memory beyond the card spills into system memory, slowing the PC.">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="On (default): when the GPU or its memory runs short, Live smooths less (down to the source rate, then Auto's size) so every frame still shows; file renders keep their exact fps. Off: everything runs as set; Live may skip frames.">
         <input type="checkbox" id="gpufit" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         Fit to the GPU
       </label>
@@ -353,21 +346,20 @@
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
       </label>
-      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN anime); can flatten fine texture; <span class="vonly">runs first, once on each source frame, before the resize to the working size</span><span class="lonly">runs once on each captured frame, before the resize to the working size, DLSS 5 and the smoothing (the generated frames inherit it); a model pass per captured frame, so a large window can lower the frame rate; ignored when the live model is NVIDIA DLSS 4.5 (that route runs inside the overlay host and has no effects pass)</span></span>
+      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN, anime); can flatten fine texture<span class="lonly">; heavy: a large window can lower the frame rate</span></span>
     </div>
   </div>
 
   <div class="panel step" id="uppanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Upscale</span>
-      <span class="hint"><span class="vonly">the output size: each source frame is resized to the working size (the DLSS mode's share of it) after Restore, before DLSS 5 and the interpolation, and the result to the output size after the interpolation</span><span class="lonly">renders the smoothed picture at this size first, then fits it to the window or screen</span>; Lanczos3 unless RTX Video Super Resolution is on</span>
+      <span class="hint"><span class="vonly">the output size; DLSS 5 and the interpolation run at it</span><span class="lonly">Live's size is what Display shows; the DLSS mode below is its speed</span></span>
     </div>
-    <div class="row">
+    <div class="row vonly">
       <span class="k">Size</span>
       <select id="upres">
         <option value="0">Off (keep source resolution)</option>
-        <option value="screen">Match screen</option>
-        <option value="480">480p &middot; SD</option>
+        <option value="screen">Screen resolution</option>
         <option value="720">720p &middot; HD</option>
         <option value="1080">1080p &middot; Full HD</option>
         <option value="1440">1440p &middot; 2K</option>
@@ -377,34 +369,31 @@
         <option value="custom">Custom height&hellip;</option>
       </select>
       <span id="upcustomwrap" style="display:none;align-items:center;gap:8px;">
-        <input id="upcustom" type="range" min="720" max="8640" step="2" value="2160"
+        <input id="upcustom" type="range" min="240" max="8640" step="2" value="2160"
                style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
         <span class="v" id="upcustomnum">2160p</span>
       </span>
       <span class="v hint" id="upinfo"></span>
     </div>
-    <div class="row" style="flex-wrap:wrap">
+    <div class="row lonly" style="flex-wrap:wrap">
       <span class="k">DLSS mode</span>
-      <select id="dlssmode" title="The working size, NVIDIA's DLSS modes: Restore's output, DLSS 5, FSR, RTX HDR and the interpolation run at this share of the output size, and the result is resized to the output after the interpolation (RTX VSR when it is on; with RTX HDR the resize after it is Lanczos3, as VSR takes SDR only). DLAA (the default) works at the output size itself; the lower modes are faster and softer.">
-        <option value="auto">Auto</option>
+      <select id="dlssmode" title="Live's speed: every pass runs at this share of the window or screen, then the result is enlarged to fit. DLAA = the full size; lower = faster and softer.">
+        <option value="dlaa" selected>DLAA (100%)</option>
         <option value="quality">Quality (67%)</option>
         <option value="balanced">Balanced (58%)</option>
         <option value="performance">Performance (50%)</option>
         <option value="ultra">Ultra Performance (33%)</option>
-        <option value="dlaa" selected>DLAA (100%, default)</option>
-        <option value="custom">Custom</option>
       </select>
-      <span id="dlsscustomwrap" style="display:inline-flex;align-items:center;gap:8px;">
-        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlsscustom" type="range" min="1" max="100" step="1" value="100" style="width:150px" aria-label="working size share" title="The working size's share of the output, 1 to 100% (100% = DLAA, the default). Dragging it picks the matching mode: 67% Quality, 58% Balanced, 50% Performance, 33% Ultra Performance, any other value Custom."></span>
-        <span class="v" id="dlsscustomnum">100%</span>
+      <span id="dlssrangewrap" style="display:inline-flex;align-items:center;gap:8px;">
+        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlssrange" type="range" min="0" max="4" step="1" value="4" style="width:150px" aria-label="DLSS mode" title="The DLSS mode as a slider: Ultra Performance (33%) on the left to DLAA (100%) on the right."></span>
+        <span class="v" id="dlssrangenum">100%</span>
       </span>
-      <span class="hint" id="dlssmodehint"></span>
     </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler for the enlarging resize: the working size up to the output, else the source up to the working size; off = Lanczos3; one-time runtime download)</span>
+        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill or a DLSS mode below DLAA enlarges</span>; off = Lanczos3; one-time download)</span>
       </label>
     </div>
     <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -423,21 +412,21 @@
     <div class="row">
       <span class="k">Sharpen</span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
-        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> FSR
+        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> Adaptive
       </label>
       <span id="sharpwrap" style="display:flex;align-items:center;gap:8px;">
-        <input id="sharpval" type="range" min="0" max="1" step="0.05" value="1"
+        <input id="sharpval" type="range" min="0" max="2" step="0.05" value="1"
                style="width:150px;padding:0;border:0;background:transparent;accent-color:var(--green);">
         <span class="v" id="sharpnum">1.00</span>
       </span>
-      <span class="hint">crisper picture; runs after DLSS 5, before RTX HDR and the interpolation</span>
+      <span class="hint">crisper picture</span>
     </div>
   </div>
 
   <div class="panel step" id="hdrpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">HDR</span>
-      <span class="hint">Opt-in. NVIDIA RTX HDR converts each <span class="vonly">source</span><span class="lonly">captured</span> frame to HDR after Restore, DLSS 5 and FSR, before the interpolation (the generated frames inherit it), with its colour controls (one-time runtime download)<span class="vonly">; Dolby Vision and HDR10+ below add metadata to that HDR10 file</span>.</span>
+      <span class="hint">Opt-in. NVIDIA RTX HDR turns SDR into HDR, with its colour controls (one-time download)<span class="vonly">; Dolby Vision and HDR10+ below can add metadata to it</span>.</span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
@@ -458,8 +447,7 @@
     </div>
     <div class="row" id="hdrpurewrap" style="display:none">
       <span class="k"></span>
-      <span class="hint" style="line-height:1.5">(for NVIDIA's RTX HDR look: Contrast 0, Saturation 0)<br>
-        (for a pure HDR conversion that keeps the original look: Contrast 0, Saturation -100)</span>
+      <span class="hint" style="line-height:1.5">(NVIDIA's RTX HDR look: Contrast 0, Saturation 0; the source's own look: Saturation -100)</span>
     </div>
     <div id="hdrcolorwrap" style="display:none">
       <div class="row" style="flex-wrap:wrap">
@@ -483,8 +471,7 @@
       </div>
       <div class="row">
         <span class="k"></span>
-        <span class="hint" style="line-height:1.5">(Saturation boost: adds saturation evenly to the whole image, 0 = none)<br>
-          (Intensity: how strongly muted colours are boosted, 0 = none; vivid colours and skin tones stay put)</span>
+        <span class="hint" style="line-height:1.5">(Saturation boost: the whole image evenly; Intensity: muted colours only, vivid colours and skin stay)</span>
       </div>
     </div>
   </div>
@@ -492,7 +479,7 @@
   <div class="panel vonly" id="dvpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Dolby Vision</span>
-      <span class="hint">Opt-in. Adds Profile 8.1 dynamic-HDR metadata on top of the HDR10 render (via the open-source dovi_tool); the video stays a normal HDR10 file everywhere else. Best for TVs and devices in the Dolby Vision ecosystem: LG, Sony, most streaming boxes. Samsung TVs don't support it.</span>
+      <span class="hint">Opt-in. Adds Profile 8.1 metadata to the HDR10 render (open-source dovi_tool); still plain HDR10 elsewhere. For LG, Sony and most streaming boxes; not Samsung TVs.</span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -517,7 +504,7 @@
   <div class="panel vonly" id="hppanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">HDR10+</span>
-      <span class="hint">Opt-in. Adds HDR10+ dynamic-HDR metadata (SMPTE ST 2094-40) into the HDR10 render (via the open-source hdr10plus_tool); the video stays a normal HDR10 file everywhere else. Best for Samsung TVs (which don't support Dolby Vision) and other HDR10+ displays; combinable with Dolby Vision: one file, every display picks what it understands.</span>
+      <span class="hint">Opt-in. Adds HDR10+ metadata (SMPTE ST 2094-40) to the HDR10 render (open-source hdr10plus_tool); still plain HDR10 elsewhere. For Samsung and other HDR10+ TVs; works beside Dolby Vision in one file.</span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -593,10 +580,10 @@
 
   <div class="row vonly">
     <button id="go" disabled>Smooth It!</button>
-    <button id="cancel" disabled title="Stops this render and deletes its progress. A cancelled render cannot be resumed. To continue later, use Pause or just close the app instead.">Cancel</button>
+    <button id="cancel" disabled title="Stops this render and deletes its progress (no resume). To continue later, Pause or close the app instead.">Cancel</button>
     <button id="open" disabled>Open folder</button>
     <button id="play" disabled>Play video</button>
-    <button id="playprev" disabled style="display:none" title="Play the part rendered so far, with sound and subtitles, so you can judge the result before continuing. Generated each time you Pause.">Play preview</button>
+    <button id="playprev" disabled style="display:none" title="Plays what is rendered so far, with sound and subtitles; made each time you Pause.">Play preview</button>
     <span id="status" class="hint">Select a video to begin.</span>
   </div>
 
@@ -606,7 +593,7 @@
       <img id="live" title="The frame being written right now" alt=""
            style="display:none;max-width:100%;border-radius:4px">
       <button id="livetoggle" class="mini"
-              title="Show or hide the live preview of the frame being written. Hiding it stops the engine from producing it, freeing a little GPU/CPU each second; showing it starts producing it again.">Hide preview (frees resources)</button>
+              title="Shows or hides the frame being written; hidden, the engine stops making it (a little less GPU and CPU).">Hide preview (frees resources)</button>
     </div></div>
 
   <div id="log" class="vonly"></div>

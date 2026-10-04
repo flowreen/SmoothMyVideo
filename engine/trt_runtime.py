@@ -755,6 +755,196 @@ def _last_block_conv_split(onnx_path, name):
     onnx.checker.check_model(onnx_path)
 
 
+def _block3_conv_split(onnx_path, name):
+    """RIFE IFNet: block 3's first conv (52 -> 32 channels, 3x3, stride 2) reads its input in parts, as the last
+    block's does. Its input is Concat(Concat(the seven resized parts: picture warps 3 + 3, feature warps 16 + 16,
+    timestep 1, mask 1, features 8), the resized flow 4) at half the size, read only by this conv; the two 16-channel
+    feature warps each get a conv over their slice of the weight, the other 20 channels one more over a 20-channel
+    concat, and Adds join them (the bias on the first). The weight is an fp32 initializer behind a Cast to fp16, so
+    each slice keeps a Cast of its own. The IFNet runs about 1.8 % faster per call at 1080p and 1.9 % at 4K (nothing
+    measurable at 480p). NOT bit-identical (the fp16 sum runs in another order): the tweens move by 63 to 65 dB against the unsplit
+    conv's and stay as close to an fp32 IFNet as before (53 to 57 dB pooled on RIFE x2 / x4, Frame Blend and DRBA). The
+    graph's shape annotations (value_info) are dropped, the parser infers them. The three weight slices are written
+    into the graph (about 60 KB)."""
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper
+
+    if not name.startswith("rife_ifnet_"):
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    typed = onnx.shape_inference.infer_shapes(g).graph
+    shp = {v.name: [d.dim_value or d.dim_param for d in v.type.tensor_type.shape.dim]
+           for v in list(typed.value_info) + list(typed.input)}
+    nodes = list(g.graph.node)
+    prod = {o: nd for nd in nodes for o in nd.output}
+    cons = {}
+    for nd in nodes:
+        for x in nd.input:
+            cons.setdefault(x, []).append(nd)
+    init = {i.name: i for i in g.graph.initializer}
+    base = os.path.dirname(onnx_path)
+
+    def const(t):
+        if t in init:
+            return numpy_helper.to_array(init[t], base_dir=base)
+        nd = prod.get(t)
+        return numpy_helper.to_array(nd.attribute[0].t) if nd is not None and nd.op_type == "Constant" else None
+
+    def chan(x):
+        c = shp.get(x, [0, 0])[1]
+        if isinstance(c, int) and c > 0:
+            return c
+        rs = prod.get(x)   # a Resize keeps the channels; the `_bd8` class's sizes lead with a Shape
+        if rs is None or rs.op_type != "Resize" or len(rs.input) != 4:
+            raise RuntimeError(f"{name}: no channel count for {x}")
+        c = shp.get(rs.input[0], [0, 0])[1]
+        if isinstance(c, int) and c > 0:
+            return c
+        sizes = prod.get(rs.input[3])
+        lead = const(sizes.input[0]) if sizes is not None and sizes.op_type == "Concat" else None
+        if lead is None or len(lead) != 2:
+            raise RuntimeError(f"{name}: no channel count for {x}")
+        return int(lead[1])
+
+    cts = [i for i, nd in enumerate(nodes) if nd.op_type == "ConvTranspose"]
+    if len(cts) < 3:
+        raise RuntimeError(f"{name}: expected a transposed conv per block")
+    conv = next((nd for nd in nodes[cts[2] + 1:] if nd.op_type == "Conv"), None)
+    if conv is None:
+        raise RuntimeError(f"{name}: no conv after block 3's transposed conv")
+    outer = prod.get(conv.input[0])
+    if (outer is None or outer.op_type != "Concat" or helper.get_attribute_value(outer.attribute[0]) != 1
+            or cons[conv.input[0]] != [conv] or len(conv.input) != 3):
+        raise RuntimeError(f"{name}: expected block 3's first conv (with a bias) as the only reader of a channel concat")
+    gone = [conv, outer]
+    parts = []
+    for x in outer.input:
+        inner = prod.get(x)
+        if inner is not None and inner.op_type == "Concat" and cons[x] == [outer]:
+            if helper.get_attribute_value(inner.attribute[0]) != 1:
+                raise RuntimeError(f"{name}: {inner.name} is not a channel concat")
+            gone.append(inner)
+            parts += list(inner.input)
+        else:
+            parts.append(x)
+    chans = [chan(p) for p in parts]
+    cast = prod.get(conv.input[1])
+    if cast is None or cast.op_type != "Cast" or cast.input[0] not in init:
+        raise RuntimeError(f"{name}: expected block 3's weight as an initializer behind a Cast")
+    wt = numpy_helper.to_array(init[cast.input[0]], base_dir=base)
+    if chans != [3, 3, 16, 16, 1, 1, 8, 4] or wt.shape[1] != 52:
+        raise RuntimeError(f"{name}: block 3's input parts {chans} / weight {list(wt.shape)} are not the expected 52")
+    groups = [[i] for i, c in enumerate(chans) if c >= 16] + [[i for i, c in enumerate(chans) if c < 16]]
+    offs = np.cumsum([0] + chans)
+    new, new_init = [], []
+    total = ""
+    for k, grp in enumerate(groups):
+        xin = parts[grp[0]]
+        if len(grp) > 1:
+            xin = f"fb3_cat{k}"
+            new.append(helper.make_node("Concat", [parts[i] for i in grp], [xin], axis=1, name=xin))
+        w = np.concatenate([wt[:, offs[i]:offs[i + 1]] for i in grp], axis=1)
+        new_init.append(numpy_helper.from_array(np.ascontiguousarray(w), f"fb3_w{k}"))
+        wc = helper.make_node("Cast", [f"fb3_w{k}"], [f"fb3_w{k}h"], name=f"fb3_cast{k}")
+        wc.attribute.extend(cast.attribute)
+        new.append(wc)
+        out = f"fb3_conv{k}"
+        c = helper.make_node("Conv", [xin, f"fb3_w{k}h"] + ([conv.input[2]] if k == 0 else []), [out], name=out)
+        c.attribute.extend(conv.attribute)
+        new.append(c)
+        if k > 0:
+            s = conv.output[0] if k == len(groups) - 1 else f"fb3_sum{k}"
+            new.append(helper.make_node("Add", [total, out], [s], name=f"fb3_sum{k}"))
+            out = s
+        total = out
+    keep = []
+    for nd in nodes:
+        if nd is conv:
+            keep += new
+        elif nd not in gone:
+            keep.append(nd)
+    outs = {o.name for o in g.graph.output}
+    while True:   # the old weight Cast nothing reads any more
+        used = {x for nd in keep for x in nd.input} | outs
+        alive = [nd for nd in keep if any(o in used for o in nd.output)]
+        if len(alive) == len(keep):
+            break
+        keep = alive
+    removed = {o for nd in gone for o in nd.output} - {o for nd in new for o in nd.output}
+    if [x for nd in keep for x in nd.input if x in removed]:
+        raise RuntimeError(f"{name}: a node still reads block 3's old input")
+    used = {x for nd in keep for x in nd.input}
+    inits = [i for i in g.graph.initializer if i.name in used] + new_init
+    del g.graph.node[:]
+    g.graph.node.extend(keep)
+    del g.graph.initializer[:]
+    g.graph.initializer.extend(inits)
+    del g.graph.value_info[:]
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
+def _blocks12_flat_concat(onnx_path, name):
+    """RIFE IFNet: blocks 1 and 2's first conv reads one channel Concat of its eight parts instead of a Concat of the
+    seven resized parts nested in a Concat with the resized flow. The parts and their order stay, so the conv reads
+    the same tensor and the engines give bit-identical output; one Concat a block fewer for the builder to fuse (its
+    speed sits inside the noise at 240p to 4K). Block b's conv = the first Conv after the b-th transposed conv. Graph
+    only."""
+    import onnx
+    from onnx import helper
+
+    if not name.startswith("rife_ifnet_"):
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    nodes = list(g.graph.node)
+    prod = {o: nd for nd in nodes for o in nd.output}
+    cons = {}
+    for nd in nodes:
+        for x in nd.input:
+            cons.setdefault(x, []).append(nd)
+    cts = [i for i, nd in enumerate(nodes) if nd.op_type == "ConvTranspose"]
+    if len(cts) < 2:
+        raise RuntimeError(f"{name}: expected a transposed conv per block")
+    replace, gone = {}, []
+    for b in (1, 2):
+        conv = next((nd for nd in nodes[cts[b - 1] + 1:] if nd.op_type == "Conv"), None)
+        if conv is None:
+            raise RuntimeError(f"{name}: no conv after block {b}'s transposed conv")
+        outer = prod.get(conv.input[0])
+        if (outer is None or outer.op_type != "Concat" or helper.get_attribute_value(outer.attribute[0]) != 1
+                or cons[conv.input[0]] != [conv]):
+            raise RuntimeError(f"{name}: block {b}'s first conv does not read a channel concat of its own")
+        parts, inner_n = [], 0
+        for x in outer.input:
+            inner = prod.get(x)
+            if inner is not None and inner.op_type == "Concat" and cons[x] == [outer]:
+                if helper.get_attribute_value(inner.attribute[0]) != 1:
+                    raise RuntimeError(f"{name}: {inner.name} is not a channel concat")
+                gone.append(inner)
+                parts += list(inner.input)
+                inner_n += 1
+            else:
+                parts.append(x)
+        if inner_n != 1 or len(parts) != 8:
+            raise RuntimeError(f"{name}: block {b}: expected one nested concat and 8 parts ({inner_n}, {len(parts)})")
+        replace[id(outer)] = helper.make_node("Concat", parts, list(outer.output), axis=1, name=f"fb{b}_cat")
+    keep = []
+    for nd in nodes:
+        if id(nd) in replace:
+            keep.append(replace[id(nd)])
+        elif all(nd is not x for x in gone):
+            keep.append(nd)
+    del g.graph.node[:]
+    g.graph.node.extend(keep)
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
 def _encode_subpixel(onnx_path, name):
     """RIFE encode: its last layer, a transposed conv (4x4, stride 2, pad 1) from half the frame
     size to the full size, becomes its sub-pixel form: one Conv (3x3, pad 1) with four times the
@@ -821,6 +1011,222 @@ def _encode_subpixel(onnx_path, name):
         fh.write(g.SerializeToString())
     os.replace(onnx_path + ".tmp", onnx_path)
     onnx.checker.check_model(onnx_path)
+
+
+def _fusion_fp16_inputs(onnx_path, name):
+    """GMFSS fusionnet: take the splatted feature levels b / c / d as fp16 inputs. Each one's only
+    reader is a Cast to fp16, so that Cast goes; the host's splat normalization rounds to nearest
+    even as the Cast did, the engine gives bit-identical output and reads half the bytes (fusionnet
+    at the 1080p half 0.96x the time). `a` stays fp32: the GMFSS IFNet writes its middle planes in
+    fp32. Graph only."""
+    import onnx
+    from onnx import TensorProto
+
+    if name != "fusionnet":
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    for key in ("b", "c", "d"):
+        inp = [i for i in g.graph.input if i.name == key]
+        if len(inp) != 1 or inp[0].type.tensor_type.elem_type != TensorProto.FLOAT:
+            raise RuntimeError(f"{name}: expected an fp32 input {key}")
+        readers = [nd for nd in g.graph.node if key in nd.input]
+        if (len(readers) != 1 or readers[0].op_type != "Cast"
+                or [a.i for a in readers[0].attribute if a.name == "to"] != [TensorProto.FLOAT16]):
+            raise RuntimeError(f"{name}: {key} is not read by exactly one Cast to fp16")
+        old = readers[0].output[0]
+        g.graph.node.remove(readers[0])
+        for nd in g.graph.node:
+            for k, x in enumerate(nd.input):
+                if x == old:
+                    nd.input[k] = key
+        inp[0].type.tensor_type.elem_type = TensorProto.FLOAT16
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
+# the host's names for what crosses the gmflow split, in its order (smv-live kGmA after q, f, coords)
+_GMFLOW_CROSS = ("win", "valid", "flow0", "feat", "flow1")
+
+
+def gmflow_split(full_path):
+    """gmflow_bidir as two graphs around its quarter-scale local correlation, which the host computes between them
+    (k_localCorr: never the [2, 128, HW, 81] fp32 product the graph writes and sums back, ~11 % of a call at 960x544).
+    The correlation = the one ReduceSum of Mul(GridSample(f, coords), q). A = img0, img1 -> q [2, HW, 128] and
+    f [2, H, W, 128] channels-last (one coalesced read a tap), coords [2, HW, K, 2], then every tensor made before
+    the correlation and read after it that derives from the frames (Shape included) and is not an integer shape
+    vector (B recomputes those from its own img0 / img1 inputs, and weight-only tensors from its initializers),
+    renamed by role: valid = the bool one, feat = the 128-channel map, win = the [2, HW, K, 2] window, flow0 = the
+    [2, 2, H, W] one derived from the frames' values, flow1 = the one made from the frame size alone. B = corr
+    [2, HW, K] + those + img0 / img1 -> flow. The exporter's own names change from export to export, so the cut is
+    found by structure and any other shape refuses. Writes trt_lookup.onnx_path("gmflow_bidir_a" / "_b") with their
+    own weights; returns both paths."""
+    import onnx
+    from onnx import helper, shape_inference, TensorProto
+
+    m = onnx.load(full_path)
+    g = m.graph
+    prod = {o: n for n in g.node for o in n.output}
+    found = []
+    for n in g.node:
+        mul = prod.get(n.input[0]) if n.op_type == "ReduceSum" else None
+        if mul is None or mul.op_type != "Mul":
+            continue
+        gs = [prod[x] for x in mul.input if x in prod and prod[x].op_type == "GridSample"]
+        if len(gs) == 1:
+            found.append((n, mul, gs[0]))
+    if len(found) != 1:
+        raise RuntimeError(f"gmflow_bidir: {len(found)} local correlations (ReduceSum of GridSample x q), expected 1")
+    rs, mul, gs = found[0]
+    q = next(x for x in mul.input if x != gs.output[0])
+    f, coords = gs.input[0], gs.input[1]
+    inf = shape_inference.infer_shapes(m)
+    vi = {v.name: v.type.tensor_type for v in list(inf.graph.value_info) + list(inf.graph.output)}
+
+    def kind(x):
+        t = vi[x]
+        return t.elem_type, [d.dim_value if d.HasField("dim_value") else None for d in t.shape.dim]
+
+    data, vals = {i.name for i in g.input}, {i.name for i in g.input}
+    for n in g.node:   # an exported graph is topologically sorted
+        if any(x in data for x in n.input):
+            data.update(n.output)
+        if n.op_type not in ("Shape", "Size") and any(x in vals for x in n.input):
+            vals.update(n.output)
+    at = {o: i for i, n in enumerate(g.node) for o in n.output}
+    c = at[rs.output[0]]
+    cross = []
+    for n in list(g.node)[c + 1:]:
+        for x in n.input:
+            if x in data and x in at and at[x] < c and x not in cross:
+                dt, dims = kind(x)
+                if not (dt in (TensorProto.INT64, TensorProto.INT32) and len(dims) <= 1):
+                    cross.append(x)
+    if set(cross) & {q, f, coords}:
+        raise RuntimeError("gmflow_bidir: a correlation input is read after the correlation too")
+    cross.sort(key=lambda x: at[x])
+    names, flows = {}, []
+    for x in cross:
+        dt, dims = kind(x)
+        if dt == TensorProto.BOOL and len(dims) == 3:
+            role = "valid"
+        elif dt == TensorProto.FLOAT and len(dims) == 4 and dims[1] == 128:
+            role = "feat"
+        elif dt == TensorProto.FLOAT and len(dims) == 4 and dims[0] == 2 and dims[3] == 2:
+            role = "win"
+        elif dt == TensorProto.FLOAT and len(dims) == 4 and dims[:2] == [2, 2]:
+            flows.append(x)
+            continue
+        else:
+            raise RuntimeError(f"gmflow_bidir: crossing tensor {x} ({dims}, dtype {dt}) has no role in the split")
+        if role in names.values():
+            raise RuntimeError(f"gmflow_bidir: two crossing tensors read as {role}")
+        names[x] = role
+    if len(flows) != 2 or len(names) != 3 or sum(x in vals for x in flows) != 1:
+        raise RuntimeError(f"gmflow_bidir: crossing tensors {cross} do not match the split contract")
+    f0 = flows[0] if flows[0] in vals else flows[1]
+    names[f0], names[flows[1] if f0 == flows[0] else flows[0]] = "flow0", "flow1"
+    cross.sort(key=lambda x: _GMFLOW_CROSS.index(names[x]))
+    ex = onnx.utils.Extractor(m)
+    a = ex.extract_model(["img0", "img1"], [q, f, coords] + cross)
+    b = ex.extract_model([rs.output[0]] + cross + ["img0", "img1"], ["flow"])
+    ga = a.graph
+    ga.initializer.append(helper.make_tensor("cl_qshape", TensorProto.INT64, [3], [0, 0, -1]))
+    ga.node.extend([helper.make_node("Reshape", [q, "cl_qshape"], ["cl_q3"], name="cl_q3"),
+                    helper.make_node("Transpose", ["cl_q3"], ["q"], name="cl_qt", perm=[0, 2, 1]),
+                    helper.make_node("Transpose", [f], ["f"], name="cl_ft", perm=[0, 2, 3, 1])])
+    outs = list(ga.output)
+    del ga.output[:]
+    ga.output.extend([helper.make_tensor_value_info("q", TensorProto.FLOAT, [2, "hw4", 128]),
+                      helper.make_tensor_value_info("f", TensorProto.FLOAT, [2, "h4", "w4", 128])] + outs[2:])
+    paths = []
+    for mm, key, mapping in ((a, "gmflow_bidir_a", {coords: "coords", **names}),
+                             (b, "gmflow_bidir_b", {rs.output[0]: "corr", **names})):
+        for n in mm.graph.node:
+            n.input[:] = [mapping.get(x, x) for x in n.input]
+            n.output[:] = [mapping.get(x, x) for x in n.output]
+        for v in list(mm.graph.input) + list(mm.graph.output) + list(mm.graph.value_info):
+            v.name = mapping.get(v.name, v.name)
+        path = trt_lookup.onnx_path(key)
+        tmp = path + ".tmp.onnx"
+        onnx.save(mm, tmp, save_as_external_data=True, location=os.path.basename(path) + ".data")
+        onnx.checker.check_model(tmp)
+        # the weights file is named for the final graph, so only the graph moves
+        os.replace(tmp, path)
+        paths.append(path)
+    _log(f"[trt] gmflow_bidir split into {os.path.basename(paths[0])} + {os.path.basename(paths[1])}")
+    return paths
+
+
+def gmflow_backbone_cut(a_path):
+    """gmflow_bidir_a's CNN backbone as its own graph for ONE frame, so the host computes each frame's maps once (the
+    previous frame's come from the last pair) instead of both frames' every pair. Found by structure: the maps = the
+    inputs of the two batch Splits (axis 0, two ways) fed straight by a Conv, named map4 / map8 by their size; the
+    batch = the one axis-0 Concat of a tensor that depends on img0 alone and one on img1 alone (the normalized frames).
+    gmflow_backbone = that Concat replaced by its img0 branch, img0 -> map4, map8 [1, C, H, W]; gmflow_bidir_a is
+    rewritten to take map4, map8 [2, C, H, W] (+ img0 / img1, read for shapes). Not bit-identical to the batch-2
+    backbone (other fp16 kernels at batch 1): GMFSS tweens vs an fp32 reference stay at the whole graph's level.
+    Writes trt_lookup.onnx_path("gmflow_backbone") and a_path in place; returns the backbone's path."""
+    import onnx
+    from onnx import helper, shape_inference
+
+    a = onnx.load(a_path)
+    g = a.graph
+    prod = {o: n for n in g.node for o in n.output}
+
+    def attr(n, k, d=None):
+        for x in n.attribute:
+            if x.name == k:
+                return helper.get_attribute_value(x)
+        return d
+
+    splits = [n for n in g.node if n.op_type == "Split" and attr(n, "axis", 0) == 0 and len(n.output) == 2
+              and n.input[0] in prod and prod[n.input[0]].op_type == "Conv"]
+    if len(splits) != 2:
+        raise RuntimeError(f"gmflow_bidir_a: {len(splits)} Conv-fed batch Splits, expected the backbone's 2")
+    maps = [s.input[0] for s in splits]
+    deps = {i.name: {i.name} for i in g.input}
+    for n in g.node:   # an exported graph is topologically sorted
+        d = set().union(*(deps.get(x, set()) for x in n.input))
+        for o in n.output:
+            deps[o] = d
+    cats = [n for n in g.node if n.op_type == "Concat" and attr(n, "axis") == 0 and len(n.input) == 2
+            and deps.get(n.input[0]) == {"img0"} and deps.get(n.input[1]) == {"img1"}]
+    if len(cats) != 1:
+        raise RuntimeError(f"gmflow_bidir_a: {len(cats)} frame batch Concats, expected 1")
+    vi = {v.name: v.type.tensor_type for v in shape_inference.infer_shapes(a).graph.value_info}
+    lead = {x: vi[x].shape.dim[2].dim_param.split("*")[0] for x in maps}   # '8*s8' (1/4) vs '4*s8' (1/8)
+    if not all(v.isdigit() for v in lead.values()) or len(set(lead.values())) != 2:
+        raise RuntimeError(f"gmflow_bidir_a: the backbone maps' heights {lead} do not tell the two scales apart")
+    maps.sort(key=lambda x: -int(lead[x]))
+    outs = [o.name for o in g.output]
+    ex = onnx.utils.Extractor(a)
+    rest = ex.extract_model(maps + ["img0", "img1"], outs)
+    bone = ex.extract_model(["img0", "img1"], maps)
+    cat = next(n for n in bone.graph.node if n.output[0] == cats[0].output[0])
+    at = list(bone.graph.node).index(cat)
+    bone.graph.node.remove(cat)
+    bone.graph.node.insert(at, helper.make_node("Identity", [cat.input[0]], [cat.output[0]], name="one_frame"))
+    del bone.graph.value_info[:]
+    for o in bone.graph.output:
+        o.type.tensor_type.shape.dim[0].dim_value = 1
+    bone = onnx.utils.Extractor(bone).extract_model(["img0"], maps)
+    names = {maps[0]: "map4", maps[1]: "map8"}
+    paths = []
+    for mm, path in ((bone, trt_lookup.onnx_path("gmflow_backbone")), (rest, a_path)):
+        for n in mm.graph.node:
+            n.input[:] = [names.get(x, x) for x in n.input]
+            n.output[:] = [names.get(x, x) for x in n.output]
+        for v in list(mm.graph.input) + list(mm.graph.output) + list(mm.graph.value_info):
+            v.name = names.get(v.name, v.name)
+        tmp = path + ".tmp.onnx"
+        onnx.save(mm, tmp, save_as_external_data=True, location=os.path.basename(path) + ".data")
+        onnx.checker.check_model(tmp)
+        os.replace(tmp, path)
+        paths.append(path)
+    _log(f"[trt] gmflow's backbone cut out as {os.path.basename(paths[0])}")
+    return paths[0]
 
 
 # --- size-free ONNX -----------------------------------------------------------------------------
@@ -936,7 +1342,10 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
         _blockin_resize_parts(tmp, name)
         _last_block_prune(tmp, name)
         _last_block_conv_split(tmp, name)
+        _block3_conv_split(tmp, name)
+        _blocks12_flat_concat(tmp, name)
         _encode_subpixel(tmp, name)
+        _fusion_fp16_inputs(tmp, name)
         if os.path.isfile(tmp + ".data"):
             os.replace(tmp + ".data", path + ".data")
         os.replace(tmp, path)

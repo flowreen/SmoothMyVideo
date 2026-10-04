@@ -4,7 +4,7 @@
 // decode (ffmpeg at the render's pixel format, the downscale folded in exactly as the render
 // folds it), the processed side runs the render's own pass chain in the native host
 // (smv-live.exe --offline --no-interp, one frame at the render's working size:
-// restore -> resize to the working size -> DLSS 5 -> the final resize / RTX VSR -> RCAS ->
+// restore -> resize to the working size -> DLSS 5 -> the final resize / RTX VSR -> Adaptive Sharpen ->
 // TrueHDR), so the pane is the render's frame. This process only converts for display: the
 // PQ tonemaps, the 1:1 resize of the original pane, the DLSS 5 change mask and the PNG files;
 // that arithmetic follows preview.py's numpy float32 (Math.fround), whose comments carry the
@@ -16,6 +16,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { INFERNO } from './inferno';
+import { engineCacheDir } from './cache';
 import { engineDir, tool } from './native';
 import { workPlan } from './plan';
 import { decodeRgbVf, frameCount, probe, sourceBits, SWS_ACCURATE, vfrConform } from './probe';
@@ -526,7 +527,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   const FFMPEG = tool(ENGINE, 'ffmpeg'),
     FFPROBE = tool(ENGINE, 'ffprobe');
   const inp = path.win32.resolve(a.input);
-  const strength = clamp(a.sharpen, 0.0, 1.0);
+  const strength = clamp(a.sharpen, 0.0, 2.0);
   const pr = probe(FFPROBE, inp);
   const vfr = vfrConform(pr.st, pr.num, pr.den);
   const n = frameCount(FFPROBE, inp, pr.nb, vfr.num / vfr.den);
@@ -538,7 +539,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   const srcHdr = transfer === 'smpte2084' || transfer === 'arib-std-b67';
   let doHdr = a.rtx_hdr && !srcHdr;
   const up = a.upscale <= 0 ? 1.0 : clamp(a.upscale, 1.0 / 16, 16.0);
-  const plan = workPlan(pr.st, pr.w, pr.h, up, a.scale);
+  const plan = workPlan(pr.st, pr.w, pr.h, up, a.scale, !!a.dlssnr);
   if (typeof plan === 'string') throw new Error(plan);
   const W = plan.w,
     H = plan.h;
@@ -608,7 +609,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   const nrDir = env.SMV_DLSSNR_DIR || path.join(ENGINE, 'dlssnr');
   const nrOn = a.dlssnr && ['nvngx.dll', 'nvngx_dlssnr.dll'].every((d) => isFile(path.join(nrDir, d)));
   if (strength > 0 || a.restore || OW !== W || OH !== H || doHdr || nrOn) {
-    const cacheDir = env.SMV_TRT_CACHE || path.join(ENGINE, 'trt_cache_safe_to_delete');
+    const cacheDir = engineCacheDir(ENGINE, env);
     fs.mkdirSync(cacheDir, { recursive: true });
     const outFmt = doHdr ? 'x2rgb10le' : DEC_FMT;
     const args = [

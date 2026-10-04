@@ -495,9 +495,9 @@ struct Capture
         ctx11->Flush(); // the immediate context may defer submission; the server is waiting
     }
 
-    // CPU path: drain + staging readback into out (tight cw*4 rows). The frame stays BGRA
-    // end-to-end on the server/identity routes (interpolation is channel-agnostic and the
-    // present textures are B8G8R8A8, so nothing ever swizzles); only the DLSS-G route sets
+    // CPU path: drain + staging readback into out (tight cw*4 rows). The bytes stay BGRA on the
+    // server/identity routes (the native packers read them as (R, G, B) planes and the slot
+    // stores write BGRA back for the B8G8R8A8 present textures); only the DLSS-G route sets
     // `swizzle` to keep its verified RGBA pipeline byte-identical. Returns
     // 1 = got a frame, 0 = none pending, -1 = failure, -2 = content resized.
     int latestFrame(uint8_t* out)

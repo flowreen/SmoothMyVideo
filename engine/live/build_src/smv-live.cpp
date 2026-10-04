@@ -158,7 +158,7 @@ static bool parseLiveScale(const wchar_t* v)
 static bool g_noHud = false;                   // --no-hud: suppress the on-screen fps/latency readout
 static bool g_noHudLat = false;                // --no-hud-latency: keep the readout, drop the "~X ms behind" part
 static bool g_noFillMouse = false;             // --no-fill-mouse: Fill leaves the mouse alone (FillMouse)
-static double g_sharpen = 0.0;                 // --sharpen S: forwarded to the server (live RCAS)
+static double g_sharpen = 0.0;                 // --sharpen S: Adaptive Sharpen strength 0..2 (both routes)
 static bool g_rtxVsr = false;                  // --rtx-vsr: forwarded to the server (VSR fill upscaler)
 static int g_upscaleH = 0;                     // --upscale H: forwarded to the server (the app's "Upscale to"
                                                // height as the internal render size before the fit)
@@ -1287,7 +1287,7 @@ struct OfflineArgs
     std::wstring hdrStatsW;            // --hdr-stats PATH: the light statistics JSON render.py reads at the finalize
     bool hdrDv = false, hdrHp = false; // --hdr-dv / --hdr-hp: add the DV L1 / HDR10+ per-frame records
     bool echo = false;                 // --no-interp: no model, every frame a real frame (live's echo, noEngine)
-    bool gmfss = false;                // --gmfss: the GMFSS model (live's five-engine chain, lkOfflineGmfss)
+    bool gmfss = false;                // --gmfss: the GMFSS model (live's engine set and chain, lkOfflineGmfss)
     bool drba = false;                 // --drba: RIFE with DRBA timing (live's lag-1 windows, drba_loop's grid)
     bool fruc = false;                 // --fruc: Nvidia Smooth Motion (live's nvoffruc bridge path, no engine)
     double fpsRatio = 0.0;             // --fps-ratio R: --fps mode, render.py's ratio (repr, so the same double)
@@ -1508,7 +1508,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
 // first, each a working size and the decode it needs. The price per model, in MiB (the process's own memory over x2
 // renders at 854x480 and 1920x1080 with the working size at the decode, a quarter on top): RIFE and Frame Blend
 // nativeOfflineRifeMiB (the IFNet at the decode), DRBA 310 + 1034 a padded megapixel (1028 measured with the tween
-// stored in fp16, + 6 for its fp32 store), GMFSS 462 + 2446, Smooth Motion
+// stored in fp16, + 6 for its fp32 store), GMFSS 393 + 1623, Smooth Motion
 // 461 + 182, NVIDIA Optical Flow 233 + 179, no interpolation 225 + 41; the output's buffers beyond the working size, 25
 // a megapixel (1920x1080 and 3840x2160 outputs of a 960x540 render); the passes around the model
 // (nativeOfflineEffectsMiB). Prints `OFFLINE FIT i ROOM NEED0 NEEDi` in MiB: the first candidate that fits
@@ -1544,7 +1544,7 @@ static int offlineFitWork(const OfflineArgs& oa)
         const double work = padMp64(k.ww, k.wh);
         double model;
         if (oa.gmfss)
-            model = 462.0 + 2446.0 * work;
+            model = 393.0 + 1623.0 * work;
         else if (oa.fruc)
             model = 461.0 + 182.0 * work;
         else if (oa.nvof)
@@ -1693,7 +1693,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         if (!lkOfflineFruc(script, nr.frucDir))
             return 2;
         nr.fruc = true;
-        nr.planesRgb = true;
         nr.ph = (h + 63) / 64 * 64;
         nr.pw = (w + 63) / 64 * 64;
         nr.w = w;
@@ -1709,7 +1708,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // DLSS 4.5: the server sized to the /64 pad of the source (render.py's pw x ph,
         // dlssg.py sends the padded frame), RGBA8 from the (R, G, B) planes, no engine
         nr.dlssg = true;
-        nr.planesRgb = true;
         nr.ph = (h + 63) / 64 * 64;
         nr.pw = (w + 63) / 64 * 64;
         nr.w = w;
@@ -1767,7 +1765,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // --no-interp = live's echo: the no-engine mode, the same geometry
         nr.nvof = oa.nvof;
         nr.noEngine = oa.echo;
-        nr.planesRgb = true; // k_packInRaw8 / 16 pack the decoder's rgb as (R, G, B)
         nr.ph = h;
         nr.pw = w;
         nr.w = w;

@@ -37,8 +37,8 @@
 
 // ---- the two device kernels, JIT-compiled by NVRTC at first native start ------------------
 // Half-to-float is done with the PTX instruction rather than cuda_fp16.h so the kernel source
-// needs no include path at all. Channel order is (B,G,R) end to end, exactly as the python
-// route sees it (_CapTex hands the model a BGRA texture and permutes the first three planes).
+// needs no include path at all. The planes are (R, G, B) on every route: the live SDR packers
+// read the BGRA capture bytes in reverse and its slot stores write them back as BGRA.
 static const char kNativeKernels[] = R"CUDASRC(
 extern "C" {
 
@@ -176,7 +176,7 @@ __device__ __forceinline__ bool land(int x, float a, float b, int& n, float& l)
     return true;
 }
 
-// scale == 1.0 fast path: BGRA8 -> planar float [0,1], replicate-padded to (ph, pw).
+// scale == 1.0 fast path: BGRA8 -> planar (R, G, B) float [0,1], replicate-padded to (ph, pw).
 __global__ void k_packInDirect(const unsigned char* __restrict__ src, int cw, int ch,
                                float* __restrict__ dst, int ph, int pw, int planeStride)
 {
@@ -187,12 +187,12 @@ __global__ void k_packInDirect(const unsigned char* __restrict__ src, int cw, in
     const int sy = oy < ch ? oy : ch - 1;
     const unsigned char* p = src + ((size_t)sy * cw + sx) * 4;
     const int o = oy * pw + ox;
-    dst[o] = p[0] * (1.0f / 255.0f);
+    dst[o] = p[2] * (1.0f / 255.0f);
     dst[planeStride + o] = p[1] * (1.0f / 255.0f);
-    dst[2 * planeStride + o] = p[2] * (1.0f / 255.0f);
+    dst[2 * planeStride + o] = p[0] * (1.0f / 255.0f);
 }
 
-// the live capture resize to the working size, horizontal pass: BGRA8 (cw x ch) -> planar float (3, ch, w),
+// the live capture resize to the working size, horizontal pass: BGRA8 (cw x ch) -> planar (R, G, B) float (3, ch, w),
 // Lanczos3 with the placement above (it shrinks, or enlarges when the working size exceeds the capture)
 __global__ void k_resizeH(const unsigned char* __restrict__ src, int cw, int ch,
                           float* __restrict__ tmp, int w)
@@ -218,9 +218,9 @@ __global__ void k_resizeH(const unsigned char* __restrict__ src, int cw, int ch,
     }
     const size_t plane = (size_t)ch * w;
     const size_t o = (size_t)sy * w + ox;
-    tmp[o] = a0 * (1.0f / 255.0f);
+    tmp[o] = a2 * (1.0f / 255.0f);
     tmp[plane + o] = a1 * (1.0f / 255.0f);
-    tmp[2 * plane + o] = a2 * (1.0f / 255.0f);
+    tmp[2 * plane + o] = a0 * (1.0f / 255.0f);
 }
 
 // vertical pass plus the replicate pad, writing straight into the (3, ph, pw) model half; Lanczos3
@@ -260,8 +260,8 @@ __global__ void k_resizeV(const float* __restrict__ tmp, int w, int ch,
 // _pack_r10a2 (~66-73): the BT.2087 709 to 2020 matrix runs FIRST, the >= 0 clamp is AFTER it
 // (negative scRGB is valid wide-gamut colour that only goes out of range once in BT.2020),
 // scRGB 1.0 = 80 nits against PQ 1.0 = 10000, then the ST 2084 inverse EOTF. The capture
-// texture is R16G16B16A16_FLOAT so the channels really are (R,G,B) here, unlike the SDR path
-// where the BGRA order rides through untouched.
+// texture is R16G16B16A16_FLOAT, so the channels come in as (R,G,B); the SDR packers read
+// the BGRA bytes in reverse for the same plane order.
 __device__ __forceinline__ void scrgb_to_pq2020(float r, float g, float b,
                                                 float& o0, float& o1, float& o2)
 {
@@ -486,8 +486,8 @@ __device__ __forceinline__ void sampleOut(const void* __restrict__ src, int half
     c[2] = a2;
 }
 
-// one output slot: sampleOut, clamp, round, and write BGRA8 into the content rect of a
-// pitched ring slot.
+// one output slot: sampleOut, clamp, round, and write the (R, G, B) planes as BGRA8 into the
+// content rect of a pitched ring slot.
 __global__ void k_packOut(const void* __restrict__ src, int half, int planeStride, int rowStride,
                           int w, int h, unsigned char* __restrict__ dst, int pitch,
                           int x0, int y0, int dw, int dh)
@@ -504,7 +504,7 @@ __global__ void k_packOut(const void* __restrict__ src, int half, int planeStrid
     {
         float v = c[ci];
         v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-        p[ci] = (unsigned char)(int)rintf(v * 255.0f);
+        p[2 - ci] = (unsigned char)(int)rintf(v * 255.0f);
     }
     p[3] = 255;
 }
@@ -536,12 +536,12 @@ __global__ void k_packOutHdr(const void* __restrict__ src, int half, int planeSt
 
 // ---- live Sharpen and RTX VSR inside the native host ---------------------------------------
 // Both effects run at the PRESENTED size, after the fit, exactly like live_server.py's compose
-// (upscale, then RCAS): the fit lands in a planar staging frame at dw x dh (k_fitPlanar, or
-// the VSR bridge output unpacked by k_unpackBgra), and k_rcasOut / k_rcasOutHdr apply rcas.py
+// (upscale, then the sharpen): the fit lands in a planar staging frame at dw x dh (k_fitPlanar, or
+// the VSR bridge output unpacked by k_unpackBgraRgb), and the sharpen kernels apply Adaptive Sharpen
 // on it while doing the slot store that k_packOut / k_packOutHdr do without effects.
 
-// crop the model pad and quantise to tight BGRA8 at the model size: the VSR bridge input,
-// rtxvideo.py run_vsr (round(x * 255), B G R A = 255)
+// crop the model pad and quantise to tight 8-bit pixels at the model size, plane c into byte c,
+// alpha 255: the (R, G, B) planes as the offline DLSS 4.5 host's RGBA8 frame
 __global__ void k_packBgra(const void* __restrict__ src, int half, int planeStride, int rowStride,
                            int w, int h, unsigned char* __restrict__ dst)
 {
@@ -559,24 +559,8 @@ __global__ void k_packBgra(const void* __restrict__ src, int half, int planeStri
     p[3] = 255;
 }
 
-// the VSR bridge output (tight BGRA8 at the presented size) back to planar float [0,1]
-__global__ void k_unpackBgra(const unsigned char* __restrict__ src, int dw, int dh,
-                             float* __restrict__ dst)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= dw || y >= dh) return;
-    const size_t plane = (size_t)dw * dh;
-    const size_t o = (size_t)y * dw + x;
-    const unsigned char* p = src + o * 4;
-    dst[o] = p[0] * (1.0f / 255.0f);
-    dst[plane + o] = p[1] * (1.0f / 255.0f);
-    dst[2 * plane + o] = p[2] * (1.0f / 255.0f);
-}
-
-// the OFFLINE route's planes are (R, G, B) (the decoder's rgb, k_packInRaw8 / 16), not the live
-// (B, G, R): the VSR bridge input and output as rtxvideo.py run_vsr packs and unpacks them
-// (R, G, B planes into B G R A bytes, back with a true / 255)
+// the (R, G, B) planes of either route as the B G R A bytes of the VSR bridge and NvOFFRUC, and
+// back, as rtxvideo.py run_vsr packs and unpacks them (back with a true / 255)
 __global__ void k_packBgraRgb(const void* __restrict__ src, int half, int planeStride, int rowStride,
                               int w, int h, unsigned char* __restrict__ dst)
 {
@@ -608,7 +592,7 @@ __global__ void k_unpackBgraRgb(const unsigned char* __restrict__ src, int dw, i
 }
 
 // RGBA8 back to the offline (R, G, B) planes: a DLSS 4.5 host frame,
-// dlssg.py _recv (uint8 / 255.0, a division, as python; k_unpackBgra multiplies)
+// dlssg.py _recv (uint8 / 255.0, a division, as python and k_unpackBgraRgb)
 __global__ void k_unpackRgba(const unsigned char* __restrict__ src, int dw, int dh,
                              float* __restrict__ dst)
 {
@@ -623,7 +607,7 @@ __global__ void k_unpackRgba(const unsigned char* __restrict__ src, int dw, int 
     dst[2 * plane + o] = p[2] / 255.0f;
 }
 
-// sampleOut's fit into the planar staging frame (the RCAS input when VSR is off)
+// sampleOut's fit into the planar staging frame (the sharpen input when VSR is off)
 __global__ void k_fitPlanar(const void* __restrict__ src, int half, int planeStride, int rowStride,
                             int w, int h, float* __restrict__ dst, int dw, int dh)
 {
@@ -756,7 +740,7 @@ __global__ void k_packOutV(const float* __restrict__ tmp, int dw, int h, unsigne
     {
         float v = c[ci];
         v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-        p[ci] = (unsigned char)(int)rintf(v * 255.0f);
+        p[2 - ci] = (unsigned char)(int)rintf(v * 255.0f);
     }
     p[3] = 255;
 }
@@ -855,7 +839,7 @@ __global__ void k_packOutTile(const void* __restrict__ src, int half, int planeS
         {
             float v = c[ci];
             v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-            p[ci] = (unsigned char)(int)rintf(v * 255.0f);
+            p[2 - ci] = (unsigned char)(int)rintf(v * 255.0f);
         }
         p[3] = 255;
         return;
@@ -1114,8 +1098,6 @@ __global__ void k_restToF(const void* __restrict__ src, int half, int n, float* 
 // cast) plus alpha 1.0. Out: the first three channels, .float().clamp(0, 1), written back over
 // the whole pw x ph padded frame with the edge replicated into the pad, as k_packInRaw8 / 16
 // pad a decoded frame.
-// planeStride is SIGNED in both (k_nvofLuma's rule): live SDR planes are (B, G, R), so the caller
-// passes the R plane with a negative stride and the model still meets R, G, B.
 __global__ void k_nrIn(const float* __restrict__ src, int planeStride, int rowStride, int dw, int dh,
                        unsigned short* __restrict__ dst)
 {
@@ -1515,65 +1497,231 @@ __global__ void k_splatNorm(const long long* __restrict__ acc, int C, int n,
                 __fdiv_rn((float)acc[(size_t)c * n + i] * (1.0f / 67108864.0f), norm));
 }
 
-// rcas.py verbatim on one pixel of the planar staging frame: replicate-padded cross taps,
-// green-weighted luma (symmetric in the two chroma planes, so BGR planes need no swap), one
-// lobe per pixel (the max over the three channels), clamped to [-RCAS_LIMIT, 0] and scaled
-// by the strength and the noise term.
-__device__ __forceinline__ void rcasPixel(const float* __restrict__ src, int dw, int dh,
-                                          int x, int y, float con, float out[3])
+// Adaptive Sharpen: bacondither's DX11 2-pass HQ (version 2021-09-10, quality_mode 1; Copyright (c) 2015-2021,
+// bacondither, BSD-2-Clause, see THIRD_PARTY_NOTICES.md). Both passes run in one kernel per 16 x 16 block through
+// shared memory: the colour tile with a 5 px border, then the edge (pass 1) and the luma of every position pass 2
+// reads (a 3 px border), each computed once. Taps clamp to the frame like the shader's texture reads, so an edge read
+// past the border is the border pixel's edge. The edge is kept raw (the shader's + 2.0 alpha offset only kept its
+// texture value positive), the bounds-check debug guard is left out, the result is clamped to 0..1.
+// curve = the strength (curve_height; 1 = the author's default). Launch with 16 x 16 blocks.
+#define AS_T 16
+#define AS_C (AS_T + 10)
+#define AS_E (AS_T + 6)
+
+struct AsTile
 {
-    const size_t plane = (size_t)dw * dh;
-    const int xl = x > 0 ? x - 1 : 0, xr = x < dw - 1 ? x + 1 : dw - 1;
-    const int yu = y > 0 ? y - 1 : 0, yd = y < dh - 1 ? y + 1 : dh - 1;
-    float b[3], d[3], e[3], f[3], hh[3];
-    for (int ci = 0; ci < 3; ci++)
-    {
-        const float* pl = src + (size_t)ci * plane;
-        b[ci] = pl[(size_t)yu * dw + x];
-        d[ci] = pl[(size_t)y * dw + xl];
-        e[ci] = pl[(size_t)y * dw + x];
-        f[ci] = pl[(size_t)y * dw + xr];
-        hh[ci] = pl[(size_t)yd * dw + x];
-    }
-    const float bL = b[1] + 0.5f * (b[0] + b[2]);
-    const float dL = d[1] + 0.5f * (d[0] + d[2]);
-    const float eL = e[1] + 0.5f * (e[0] + e[2]);
-    const float fL = f[1] + 0.5f * (f[0] + f[2]);
-    const float hL = hh[1] + 0.5f * (hh[0] + hh[2]);
-    const float mx = fmaxf(fmaxf(fmaxf(bL, dL), fmaxf(fL, hL)), eL);
-    const float mn = fminf(fminf(fminf(bL, dL), fminf(fL, hL)), eL);
-    float nz = fabsf(0.25f * (bL + dL + fL + hL) - eL) / ((mx - mn) + 1e-4f);
-    nz = nz < 0.0f ? 0.0f : (nz > 1.0f ? 1.0f : nz);
-    nz = -0.5f * nz + 1.0f;
-    float lobe = -3.0e38f;
-    for (int ci = 0; ci < 3; ci++)
-    {
-        const float mn4 = fminf(fminf(b[ci], d[ci]), fminf(f[ci], hh[ci]));
-        const float mx4 = fmaxf(fmaxf(b[ci], d[ci]), fmaxf(f[ci], hh[ci]));
-        const float hitMin = mn4 / (4.0f * mx4 + 1e-4f);
-        const float hitMax = (1.0f - mx4) / (4.0f * mn4 - 4.0f - 1e-4f);
-        lobe = fmaxf(lobe, fmaxf(-hitMin, hitMax));
-    }
-    const float RCAS_LIMIT = 0.1875f - 1e-6f;
-    lobe = lobe > 0.0f ? 0.0f : lobe;
-    lobe = lobe < -RCAS_LIMIT ? -RCAS_LIMIT : lobe;
-    lobe = lobe * con * nz;
-    for (int ci = 0; ci < 3; ci++)
-    {
-        float v = (e[ci] + lobe * (b[ci] + d[ci] + f[ci] + hh[ci])) / (1.0f + 4.0f * lobe);
-        out[ci] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-    }
+    float c[3][AS_C][AS_C];
+    float e[AS_E][AS_E];
+    float l[AS_E][AS_E];
+};
+
+__device__ __forceinline__ float asSat(float x)
+{
+    return fminf(fmaxf(x, 0.0f), 1.0f);
 }
 
-// FSR's RCAS on a tight planar frame into another (dw x dh each): the sharpen after DLSS 5 at the
-// working size, before RTX HDR and the model (post-processing before frame generation)
-__global__ void k_rcasPlanar(const float* __restrict__ src, int dw, int dh, float con, float* __restrict__ dst)
+// the math uses the GPU's fast exp / pow / divide / sqrt: within 1 code of the precise form on 0.001 % of the samples,
+// about 1.8x faster
+__device__ __forceinline__ float asSqrtA(float x)
 {
-    const int ox = blockIdx.x * blockDim.x + threadIdx.x;
-    const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    float r;
+    asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+__device__ __forceinline__ float asSmooth(float e0, float e1, float x)
+{
+    const float t = asSat(__fdividef(x - e0, e1 - e0));
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__device__ __forceinline__ float asSoftLim(float v, float s)
+{
+    const float z = __expf(__fdividef(2.0f * fminf(fabsf(v), s * 24.0f), s));
+    return __fdividef(z - 1.0f, z + 1.0f) * s;
+}
+
+__device__ __forceinline__ float asWpmean(float a, float b, float w)
+{
+    return __powf(w * __powf(fabsf(a), 0.7f) + fabsf(1.0f - w) * __powf(fabsf(b), 0.7f), 1.0f / 0.7f);
+}
+
+// every thread of the block: the colour tile, then pass 1's edge and the luma at each position pass 2 reads
+__device__ void asLoad(AsTile& s, const float* __restrict__ src, int dw, int dh)
+{
+    const int x0 = blockIdx.x * AS_T, y0 = blockIdx.y * AS_T;
+    const int tid = threadIdx.y * AS_T + threadIdx.x;
+    const size_t plane = (size_t)dw * dh;
+    for (int i = tid; i < AS_C * AS_C; i += AS_T * AS_T)
+    {
+        const int ty = i / AS_C, tx = i - ty * AS_C;
+        const int gx = min(max(x0 - 5 + tx, 0), dw - 1), gy = min(max(y0 - 5 + ty, 0), dh - 1);
+        const size_t o = (size_t)gy * dw + gx;
+        s.c[0][ty][tx] = src[o];
+        s.c[1][ty][tx] = src[plane + o];
+        s.c[2][ty][tx] = src[2 * plane + o];
+    }
+    __syncthreads();
+    // pass 1 taps:  [ 9 ] / [ 1 2 3 ] / [ 10 4 0 5 11 ] / [ 6 7 8 ] / [ 12 ]
+    const int px[13] = {0, -1, 0, 1, -1, 1, -1, 0, 1, 0, -2, 2, 0};
+    const int py[13] = {0, -1, -1, -1, 0, 0, 1, 1, 1, -2, 0, 0, 2};
+    for (int i = tid; i < AS_E * AS_E; i += AS_T * AS_T)
+    {
+        const int ty = i / AS_E, tx = i - ty * AS_E;
+        const int cx = min(max(x0 - 3 + tx, 0), dw - 1), cy = min(max(y0 - 3 + ty, 0), dh - 1);
+        float c[13][3];
+#pragma unroll
+        for (int k = 0; k < 13; k++)
+        {
+            const int sx = min(max(cx + px[k], 0), dw - 1) - (x0 - 5);
+            const int sy = min(max(cy + py[k], 0), dh - 1) - (y0 - 5);
+#pragma unroll
+            for (int ch = 0; ch < 3; ch++)
+                c[k][ch] = asSat(s.c[ch][sy][sx]);
+        }
+        float ev[3], bsum = 0.0f;
+#pragma unroll
+        for (int ch = 0; ch < 3; ch++)
+        {
+            const float bl = (2.0f * (c[2][ch] + c[4][ch] + c[5][ch] + c[7][ch]) +
+                              (c[1][ch] + c[3][ch] + c[6][ch] + c[8][ch]) + 4.0f * c[0][ch]) /
+                             16.0f;
+            bsum += bl;
+            ev[ch] = 1.38f * fabsf(bl - c[0][ch]) +
+                     1.15f * (fabsf(bl - c[2][ch]) + fabsf(bl - c[4][ch]) + fabsf(bl - c[5][ch]) + fabsf(bl - c[7][ch])) +
+                     0.92f * (fabsf(bl - c[1][ch]) + fabsf(bl - c[3][ch]) + fabsf(bl - c[6][ch]) + fabsf(bl - c[8][ch])) +
+                     0.23f * (fabsf(bl - c[9][ch]) + fabsf(bl - c[10][ch]) + fabsf(bl - c[11][ch]) + fabsf(bl - c[12][ch]));
+        }
+        const float c_comp = asSat(4.0f / 15.0f + 0.9f * exp2f(bsum * (-37.0f / 15.0f)));
+        s.e[ty][tx] = asSqrtA(ev[0] * ev[0] + ev[1] * ev[1] + ev[2] * ev[2]) * c_comp;
+        // CtL: pass 2 reads the colour unclamped, then clamps c * |c|
+        const int lx = cx - (x0 - 5), ly = cy - (y0 - 5);
+        const float r = s.c[0][ly][lx], g = s.c[1][ly][lx], b = s.c[2][ly][lx];
+        s.l[ty][tx] = asSqrtA(0.2558f * asSat(r * fabsf(r)) + 0.6511f * asSat(g * fabsf(g)) + 0.0931f * asSat(b * fabsf(b)));
+    }
+    __syncthreads();
+}
+
+// pass 2 for the block's pixel (tx, ty)
+__device__ void asPixel(const AsTile& s, int tx, int ty, float curve, float out[3])
+{
+    // [ 22 ] / [ 24 9 23 ] / [ 21 1 2 3 18 ] / [ 19 10 4 0 5 11 16 ] / [ 20 6 7 8 17 ] / [ 15 12 14 ] / [ 13 ]
+    const int px[25] = {0, -1, 0, 1, -1, 1, -1, 0, 1, 0, -2, 2, 0, 0, 1, -1, 3, 2, 2, -3, -2, -2, 0, 1, -1};
+    const int py[25] = {0, -1, -1, -1, 0, 0, 1, 1, 1, -2, 0, 0, 2, 3, 2, 2, 0, 1, -1, 0, 1, -1, -3, -2, -2};
+    float e[25], L[25];
+#pragma unroll
+    for (int k = 0; k < 25; k++)
+    {
+        e[k] = s.e[ty + 3 + py[k]][tx + 3 + px[k]];
+        L[k] = s.l[ty + 3 + py[k]][tx + 3 + px[k]];
+    }
+    float c0[3];
+#pragma unroll
+    for (int ch = 0; ch < 3; ch++)
+        c0[ch] = asSat(s.c[ch][ty + 5][tx + 5]);
+    const float c0_Y = L[0]; // CtL of the clamped centre = CtL of the raw one
+    const float c_edge = e[0];
+    float maxedge = e[0];
+#pragma unroll
+    for (int k = 1; k < 13; k++)
+        maxedge = fmaxf(maxedge, e[k]);
+    const float den = fabsf(maxedge) + 0.03f;
+#define AS_SOFT_IF(a, b, c) asSat(__fdividef((a) + (b) + (c) + 0.056f, den) - 0.85f)
+    const float sbe = AS_SOFT_IF(e[2], e[9], e[22]) * AS_SOFT_IF(e[7], e[12], e[13]) +
+                      AS_SOFT_IF(e[4], e[10], e[19]) * AS_SOFT_IF(e[5], e[11], e[16]) +
+                      AS_SOFT_IF(e[1], e[24], e[21]) * AS_SOFT_IF(e[8], e[14], e[17]) +
+                      AS_SOFT_IF(e[3], e[23], e[18]) * AS_SOFT_IF(e[6], e[20], e[15]);
+#undef AS_SOFT_IF
+    const float kcs = asSmooth(2.0f, 3.1f, sbe);
+    const float cs_x = 0.167f + (0.334f - 0.167f) * kcs, cs_y = 0.250f + (0.500f - 0.250f) * kcs;
+    const float sw = asSmooth(0.3f, 0.8f, c_edge);
+    float dW0 = 0.5f + (0.86602540378f - 0.5f) * sw;
+    float dW2 = 1.41421356237f + (0.54772255751f - 1.41421356237f) * sw;
+    dW0 *= dW0;
+    dW2 *= dW2;
+    const float dW1 = 1.0f;
+    const float mdiff_c0 =
+        0.02f + 3.0f * (fabsf(L[0] - L[2]) + fabsf(L[0] - L[4]) + fabsf(L[0] - L[5]) + fabsf(L[0] - L[7]) +
+                        0.25f * (fabsf(L[0] - L[1]) + fabsf(L[0] - L[3]) + fabsf(L[0] - L[6]) + fabsf(L[0] - L[8])));
+#define AS_MDIFF(a, b, c, d, e_, f, g)                                                                             \
+    (fabsf(L[g] - L[a]) + fabsf(L[g] - L[b]) + fabsf(L[g] - L[c]) + fabsf(L[g] - L[d]) +                           \
+     0.5f * (fabsf(L[g] - L[e_]) + fabsf(L[g] - L[f])))
+    float w[12] = {fminf(__fdividef(mdiff_c0, AS_MDIFF(24, 21, 2, 4, 9, 10, 1)), dW1),  dW0,
+                   fminf(__fdividef(mdiff_c0, AS_MDIFF(23, 18, 5, 2, 9, 11, 3)), dW1),  dW0,
+                   dW0,
+                   fminf(__fdividef(mdiff_c0, AS_MDIFF(4, 20, 15, 7, 10, 12, 6)), dW1),  dW0,
+                   fminf(__fdividef(mdiff_c0, AS_MDIFF(5, 7, 17, 14, 12, 11, 8)), dW1),
+                   fminf(__fdividef(mdiff_c0, AS_MDIFF(2, 24, 23, 22, 1, 3, 9)), dW2),
+                   fminf(__fdividef(mdiff_c0, AS_MDIFF(20, 19, 21, 4, 1, 6, 10)), dW2),
+                   fminf(__fdividef(mdiff_c0, AS_MDIFF(17, 5, 18, 16, 3, 8, 11)), dW2),
+                   fminf(__fdividef(mdiff_c0, AS_MDIFF(13, 15, 7, 14, 6, 8, 12)), dW2)};
+#undef AS_MDIFF
+    w[0] = (fmaxf(fmaxf((w[8] + w[9]) / 4.0f, w[0]), 0.25f) + w[0]) / 2.0f;
+    w[2] = (fmaxf(fmaxf((w[8] + w[10]) / 4.0f, w[2]), 0.25f) + w[2]) / 2.0f;
+    w[5] = (fmaxf(fmaxf((w[9] + w[11]) / 4.0f, w[5]), 0.25f) + w[5]) / 2.0f;
+    w[7] = (fmaxf(fmaxf((w[10] + w[11]) / 4.0f, w[7]), 0.25f) + w[7]) / 2.0f;
+    float lowthrsum = 0.0f, weightsum = 0.0f, neg_laplace = 0.0f;
+#pragma unroll
+    for (int p = 0; p < 12; p++)
+    {
+        const float t = asSat(__fdividef(e[p + 1] - 0.01f, 0.09f));
+        const float lowthr = t * t * (2.97f - 1.98f * t) + 0.01f;
+        neg_laplace += __powf(fabsf(L[p + 1]) + 0.06f, 2.4f) * (fabsf(w[p]) * lowthr);
+        weightsum += fabsf(w[p]) * lowthr;
+        lowthrsum += __fdividef(lowthr, 12.0f);
+    }
+    neg_laplace = asSat(__powf(__fdividef(neg_laplace, weightsum), 1.0f / 2.4f) - 0.06f);
+    const float sharpen_val = __fdividef(curve, curve * 0.5f * __powf(fabsf(c_edge), 3.5f) + 0.625f);
+    float sharpdiff = (c0_Y - neg_laplace) * (lowthrsum * sharpen_val + 0.01f);
+    // the local near min and max: the shader's partial sort, 3 iterations
+#pragma unroll
+    for (int it = 0; it < 3; it++)
+    {
+#pragma unroll
+        for (int i = it; i < 24 - it; i += 2)
+        {
+            const float a = L[i], b = L[i + 1];
+            L[i] = fminf(a, b);
+            L[i + 1] = fmaxf(a, b);
+        }
+#pragma unroll
+        for (int ii = 24 - it; ii > it; ii -= 2)
+        {
+            float a = L[it], b = L[ii];
+            L[it] = fminf(a, b);
+            L[ii] = fmaxf(a, b);
+            a = L[24 - it];
+            b = L[ii - 1];
+            L[24 - it] = fmaxf(a, b);
+            L[ii - 1] = fminf(a, b);
+        }
+    }
+    const float nmax = (fmaxf(L[22] + L[23] * 2.0f, c0_Y * 3.0f) + L[24]) / 4.0f;
+    const float nmin = (fminf(L[2] + L[1] * 2.0f, c0_Y * 3.0f) + L[0]) / 4.0f;
+    const float min_dist = fminf(fabsf(nmax - c0_Y), fabsf(c0_Y - nmin));
+    float pn_x = fminf(0.003f + min_dist, 1.0001f - c0_Y), pn_y = fminf(0.009f + min_dist, 0.0001f + c0_Y);
+    pn_x = fminf(pn_x, 0.1f * (1.0f - 0.056f) + pn_x * 0.056f);
+    pn_y = fminf(pn_y, 0.1f * (1.0f - 0.056f) + pn_y * 0.056f);
+    const float pos = fmaxf(sharpdiff, 0.0f), neg = fminf(sharpdiff, 0.0f);
+    sharpdiff = asWpmean(pos, asSoftLim(pos, pn_x), cs_x) - asWpmean(neg, asSoftLim(neg, pn_y), cs_y);
+    const float sharpdiff_lim = asSat(c0_Y + sharpdiff) - c0_Y;
+    const float satmul = __fdividef(c0_Y + fmaxf(sharpdiff_lim * 0.9f, sharpdiff_lim) * 1.03f + 0.03f, c0_Y + 0.03f);
+    const float base = c0_Y + (sharpdiff_lim * 3.0f + sharpdiff) / 4.0f;
+#pragma unroll
+    for (int ch = 0; ch < 3; ch++)
+        out[ch] = asSat(base + (c0[ch] - c0_Y) * satmul);
+}
+
+// Adaptive Sharpen on a tight planar frame into another (dw x dh each): the sharpen after DLSS 5 at the
+// working size, before RTX HDR and the model (post-processing before frame generation); 16 x 16 blocks
+__global__ void k_sharpPlanar(const float* __restrict__ src, int dw, int dh, float curve, float* __restrict__ dst)
+{
+    __shared__ AsTile s;
+    asLoad(s, src, dw, dh);
+    const int ox = blockIdx.x * AS_T + threadIdx.x, oy = blockIdx.y * AS_T + threadIdx.y;
     if (ox >= dw || oy >= dh) return;
     float c[3];
-    rcasPixel(src, dw, dh, ox, oy, con, c);
+    asPixel(s, threadIdx.x, threadIdx.y, curve, c);
     const size_t plane = (size_t)dw * dh, o = (size_t)oy * dw + ox;
     dst[o] = c[0];
     dst[plane + o] = c[1];
@@ -1902,15 +2050,16 @@ __global__ void k_thdrIn(const void* __restrict__ src, int half, int planeStride
                   (size_t)y * dw + x, (size_t)dw * dh, bgra, dstG);
 }
 
-// RCAS on the staging frame first (render_passes: RCAS is the last SDR pass before TrueHDR)
-__global__ void k_rcasThdrIn(const float* __restrict__ src, int dw, int dh, float con,
-                             unsigned char* __restrict__ bgra, float* __restrict__ dstG)
+// Adaptive Sharpen on the staging frame first (the last SDR pass before TrueHDR); 16 x 16 blocks
+__global__ void k_sharpThdrIn(const float* __restrict__ src, int dw, int dh, float curve,
+                              unsigned char* __restrict__ bgra, float* __restrict__ dstG)
 {
-    const int ox = blockIdx.x * blockDim.x + threadIdx.x;
-    const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    __shared__ AsTile s;
+    asLoad(s, src, dw, dh);
+    const int ox = blockIdx.x * AS_T + threadIdx.x, oy = blockIdx.y * AS_T + threadIdx.y;
     if (ox >= dw || oy >= dh) return;
     float c[3];
-    rcasPixel(src, dw, dh, ox, oy, con, c);
+    asPixel(s, threadIdx.x, threadIdx.y, curve, c);
     thdr_in_store(c[0], c[1], c[2], (size_t)oy * dw + ox, (size_t)dw * dh, bgra, dstG);
 }
 
@@ -2209,7 +2358,7 @@ __global__ void k_packInMotion(const void* __restrict__ src, unsigned long long 
             asm("tex.2d.v4.u32.f32 {%0, %1, %2, %3}, [%4, {%5, %6}];"
                 : "=r"(q[0]), "=r"(q[1]), "=r"(q[2]), "=r"(q[3]) : "l"(tex), "f"(fx), "f"(fy));
             for (int c = 0; c < 3; c++)
-                v[c] = q[c] * (1.0f / 255.0f);
+                v[c] = q[2 - c] * (1.0f / 255.0f);
             if (raw && ox < cw && oy < ch)
                 raw[(size_t)oy * cw + ox] = q[0] | q[1] << 8 | q[2] << 16 | q[3] << 24;
         }
@@ -2223,7 +2372,7 @@ __global__ void k_packInMotion(const void* __restrict__ src, unsigned long long 
     {
         const unsigned char* p = (const unsigned char*)src + s;
         for (int c = 0; c < 3; c++)
-            v[c] = p[c] * (1.0f / 255.0f);
+            v[c] = p[2 - c] * (1.0f / 255.0f);
     }
     const size_t o = (size_t)oy * pw + ox;
     for (int c = 0; c < 3; c++)
@@ -2528,7 +2677,7 @@ __global__ void k_rifeBlendOut(const void* __restrict__ pic, int sw, int half, i
             word |= q << (10 * c);
         }
         else
-            p[c] = (unsigned char)(int)rintf(v * 255.0f);
+            p[2 - c] = (unsigned char)(int)rintf(v * 255.0f);
     }
     if (hdr)
         *(unsigned int*)p = word;
@@ -2564,7 +2713,7 @@ __global__ void k_rifeBlendOut32(const void* __restrict__ pic, int sw, int pps, 
             word |= q << (10 * c);
         }
         else
-            p[c] = (unsigned char)(int)rintf(v * 255.0f);
+            p[2 - c] = (unsigned char)(int)rintf(v * 255.0f);
     }
     if (hdr)
         *(unsigned int*)p = word;
@@ -2579,8 +2728,7 @@ extern "C" __global__ void k_nvofLuma(const float* __restrict__ src, int planeSt
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t o = (size_t)y * rowStride + x;
-    // planeStride is SIGNED: the live host's planes are (B, G, R), so it passes the R plane with
-    // a negative stride and the BT.709 weights still meet R, G, B in this order. The luma is
+    // The host's planes are (R, G, B), the order of the BT.709 weights below. The luma is
     // rounded EXACTLY as an fp64 clip(v, 0, 1) * 255 would round: the constants, products and
     // sums carry their fp32 rounding error as a second float (ffMul / ffAdd), so the value is
     // known to ~1e-12 and the rounding takes the same side of every x.5 an fp64 sum takes. A
@@ -3093,6 +3241,68 @@ extern "C" __global__ void k_drbaDrmNorm(const long long* __restrict__ acc, cons
         ((float*)out)[i] = v;
 }
 
+// GMFlow's local correlation (gmflow_bidir's 1/4-scale window around the current flow, between its two engines):
+// out[b, p, k] = the dot of q[b, p, :] with f bilinearly sampled at the window position g[b, p, k] (GridSample's
+// rules: align_corners, zero padding). The window's samples share one fractional offset, so their taps lie on a small
+// integer grid: one warp a pixel takes the grid's dot products once (float4 lanes over the 128 channels, kept in
+// shared memory, one cell of margin for rounding), then each sample combines its 4 corners with its own weights.
+// Never builds the [B, 128, HW, K] product the engine wrote. q [B, HW, 128] and f [B, H, W, 128] channels-last,
+// g [B, HW, K, 2] normalized; 128 threads a block, one warp a pixel.
+extern "C" __global__ void k_localCorr(const float* __restrict__ q, const float* __restrict__ f,
+                                       const float* __restrict__ g, float* __restrict__ out, int B, int H, int W,
+                                       int HW, int K)
+{
+    __shared__ float dots[4][144];
+    const int wib = threadIdx.x >> 5;
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= B * HW) return;
+    const int b = warp / HW, p = warp % HW;
+    const float4 qv = reinterpret_cast<const float4*>(q + ((size_t)b * HW + p) * 128)[lane];
+    const float* fb = f + (size_t)b * H * W * 128;
+    const float* gp = g + ((size_t)b * HW + p) * K * 2;
+    float mnx = 1e30f, mny = 1e30f;
+    for (int k = lane; k < K; k += 32)
+    {
+        mnx = fminf(mnx, floorf((gp[2 * k] + 1.f) * 0.5f * (float)(W - 1)));
+        mny = fminf(mny, floorf((gp[2 * k + 1] + 1.f) * 0.5f * (float)(H - 1)));
+    }
+    for (int o = 16; o; o >>= 1)
+    {
+        mnx = fminf(mnx, __shfl_xor_sync(0xffffffffu, mnx, o));
+        mny = fminf(mny, __shfl_xor_sync(0xffffffffu, mny, o));
+    }
+    const int ox = (int)mnx, oy = (int)mny;
+    int side = 1;
+    while (side * side < K) side++;
+    const int gs = side + 2;
+    for (int t = 0; t < gs * gs; t++)
+    {
+        const int xx = ox + t % gs, yy = oy + t / gs;
+        float s = 0.f;
+        if (xx >= 0 && xx < W && yy >= 0 && yy < H)
+        {
+            const float4 v = reinterpret_cast<const float4*>(fb + ((size_t)yy * W + xx) * 128)[lane];
+            s = qv.x * v.x + qv.y * v.y + qv.z * v.z + qv.w * v.w;
+        }
+        for (int o = 16; o; o >>= 1)
+            s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (lane == 0) dots[wib][t] = s;
+    }
+    __syncwarp();
+    for (int k = lane; k < K; k += 32)
+    {
+        const float x = (gp[2 * k] + 1.f) * 0.5f * (float)(W - 1);
+        const float y = (gp[2 * k + 1] + 1.f) * 0.5f * (float)(H - 1);
+        const float x0f = floorf(x), y0f = floorf(y);
+        const float ax = x - x0f, ay = y - y0f;
+        const int cx = (int)x0f - ox, cy = (int)y0f - oy;
+        const float* d = dots[wib] + cy * gs + cx;
+        out[((size_t)b * HW + p) * K + k] = (1.f - ay) * ((1.f - ax) * d[0] + ax * d[1]) +
+                                            ay * ((1.f - ax) * d[gs] + ax * d[gs + 1]);
+    }
+}
+
 }
 
 )CUDASRC";
@@ -3516,6 +3726,14 @@ static NativeTrtLogger g_nativeTrtLogger;
         }                                                                                                              \
     } while (0)
 
+// the GMFSS engine slots: feat_ext, gmflow_bidir's first half (A), metricnet, the GMFSS IFNet, fusionnet, gmflow_bidir's
+// second half (B), then gmflow's backbone (one frame); the host computes gmflow's local correlation between A and B and
+// hands A each frame's backbone maps once
+constexpr int kGmN = 7;
+// A's outputs in this order (trt_runtime.gmflow_split's contract): q and f feed k_localCorr with coords, the rest
+// go to B beside the correlation
+static const char* const kGmA[8] = {"q", "f", "coords", "win", "valid", "flow0", "feat", "flow1"};
+
 struct NativeRife
 {
     // ---- handoff facts, straight off live_server.py's --native-handoff lines
@@ -3536,7 +3754,7 @@ struct NativeRife
     double thdrMs = 0.0, thdrMaxMs = 0.0; // host-side eval cost, reported at teardown
     uint64_t thdrN = 0;
     // live Sharpen and RTX VSR, the app's --sharpen / --rtx-vsr on this route
-    float sharpen = 0.0f;   // RCAS strength 0..1 at the presented size (0 = off)
+    float sharpen = 0.0f;   // Adaptive Sharpen strength 0..2 (curve_height) at the presented size (0 = off)
     bool vsrWant = false;   // --rtx-vsr on an SDR session with the bridge and its DLL present
     bool vsr = false;       // ...and the fit enlarges in both axes (decided after the handoff)
     bool vsrFailed = false; // a mid-run eval failed: Lanczos3 for the rest of the run
@@ -3572,22 +3790,34 @@ struct NativeRife
     bool noEngine = false;
     std::string cachePath;
     // GMFSS: the handoff answers
-    // `engine=gmfss` with the five engines of live_server.Gmfss (feat_ext at the padded size,
-    // the fused bidir GMFlow, metricnet, the GMFSS IFNet and fusionnet at the half) and their
+    // `engine=gmfss` with the six engines of the set (feat_ext at the padded size, the fused
+    // bidir GMFlow's two halves, metricnet, the GMFSS IFNet and fusionnet at the half) and their
     // jit caches; this host loads, warms and keeps the set resident (one model set at a time)
     // and runs the chain itself (nativeGmfssPair / nativeGmfssTween with the glue kernels
     // above), so gmfss is a native backend like rife.
     bool gmfss = false;
     int hh = 0, hw = 0; // the half frame (the fusion grid)
-    std::string gmPath[5], gmJit[5];
-    nvinfer1::ICudaEngine* engGm[5] = {};
-    nvinfer1::IRuntimeConfig* cfgGm[5] = {};
-    nvinfer1::IExecutionContext* ctxGm[5] = {};
+    std::string gmPath[kGmN], gmJit[kGmN];
+    nvinfer1::ICudaEngine* engGm[kGmN] = {};
+    nvinfer1::IRuntimeConfig* cfgGm[kGmN] = {};
+    nvinfer1::IExecutionContext* ctxGm[kGmN] = {};
+    // between gmflow's halves: A's outputs (kGmA order), the correlation k_localCorr writes for B, and the shapes it
+    // runs at (the quarter grid gmH x gmW, gmK window samples a pixel)
+    void* dGmA[8] = {};
+    // A's inputs map4 / map8 [2, 128, ...] in the backbone's dtype: batch slot 0 = the previous frame, 1 = the new one;
+    // gmMapSlot = one frame's bytes of each; gmMapsNext = slot 1 holds the frame the next call reads as its previous
+    // one, taken on view gmMapsKind (0 the pictures, 1 the SDR view, 2 the motion view)
+    void* dGmMap[2] = {};
+    size_t gmMapSlot[2] = {};
+    bool gmMapsNext = false;
+    int gmMapsKind = 0;
+    float* dGmCorr = nullptr;
+    int gmH = 0, gmW = 0, gmK = 0;
     // the chain's contract, read off the engines in nativeGmfssSetup (never from the handoff
     // line, the 5a rule), and the planar NCHW buffers it sizes from that. Levels: the half
     // (hh, hw), the quarter and the eighth, exactly GMFSS_infer_u's feature pyramid.
     int gmC[3] = {}; // feat_ext channels at the half / quarter / eighth
-    bool gmFeatHalf = true, gmMetricHalf = true, gmOutHalf = true;
+    bool gmFeatHalf = true, gmMetricHalf = true, gmOutHalf = true, gmFuseHalf = true;
     int gmCur = 0;               // which dGmFeat set holds the CURRENT frame's features
     void* dGmFeat[2][3] = {};    // the two frames' feature sets (cur is the next pair's prev)
     float* dGmHalf = nullptr;    // (6, hh, hw): img0's half in planes 0..2, img1's in 3..5
@@ -3597,9 +3827,9 @@ struct NativeRife
     float* dGmMetP[2] = {};      // the metric pyramids at the quarter / eighth (fp32)
     long long* dGmAcc = nullptr; // the splat accumulator, max(C) + 1 planes of the half
     float* dGmFa = nullptr;      // fusionnet a (9, half): I1t, merged (ifnet writes it), I2t
-    float* dGmFb = nullptr;      // fusionnet b (2 * gmC[0], half)
-    float* dGmFc = nullptr;      // fusionnet c (2 * gmC[1], quarter)
-    float* dGmFd = nullptr;      // fusionnet d (2 * gmC[2], eighth)
+    void* dGmFb = nullptr;       // fusionnet b (2 * gmC[0], half) in the engine's dtype
+    void* dGmFc = nullptr;       // fusionnet c (2 * gmC[1], quarter), the same dtype
+    void* dGmFd = nullptr;       // fusionnet d (2 * gmC[2], eighth), the same dtype
     float* dGmT = nullptr;       // the timestep, one device float (ifnet's 1x1x1x1 input)
     void* dGmOut = nullptr;      // the fusionnet output (3, ph, pw) in the engine's dtype
     float* dGmF = nullptr;       // that output clamped to fp32: what storeSlot consumes
@@ -3629,9 +3859,8 @@ struct NativeRife
     // `engine=fruc` with the /64 padded geometry and `NATIVE-PATH fruc=` (the folder holding the
     // shipped nvoffruc_bridge.dll beside the user-installed NvOFFRUC.dll + cudart64_110.dll);
     // this host drives that bridge's flat C API exactly as live_server.py's Fruc class does
-    // through ctypes: the model planes packed to BGRA8 at pw x ph (k_packBgra, the VSR kernel),
-    // one bridge call per tween, the BGRA8 result unpacked (k_unpackBgra). The planes go in as
-    // stored, so FRUC sees true BGRA on live (python's SDR route swaps R and B into it).
+    // through ctypes: the (R, G, B) model planes packed to true BGRA8 at pw x ph (k_packBgraRgb,
+    // the VSR kernel), one bridge call per tween, the BGRA8 result unpacked (k_unpackBgraRgb).
     bool fruc = false;
     bool dlssg = false;           // offline DLSS 4.5: no IFNet, a child server
     std::string frucDir;          // the bridge folder the handoff named
@@ -3722,11 +3951,6 @@ struct NativeRife
     // k_splatNvof / k_splatNvofNorm in the kernel text are a forward-splat tween with no host
     // launch, kept because the kernel text is shared byte for byte with that check).
     bool nvof = false;
-    // plane order of the model planes: live capture packs (B, G, R) (BGRA textures), the OFFLINE
-    // route's k_packInRaw8 / 16 pack the decoder's rgb24 / rgb48 as (R, G, B); k_nvofLuma needs
-    // R, G, B, so it gets the R plane with a negative stride on live and plain planes offline
-    // (the wrong order swaps the red and blue luma weights)
-    bool planesRgb = false;
     NvOFHandle ofH = nullptr;
     NvOFGPUBufferHandle ofIn[2] = {}, ofOut[2] = {}, ofCost[2] = {}; // [0] forward, [1] backward
     CUdeviceptr ofInP[2] = {}, ofOutP[2] = {}, ofCostP[2] = {};
@@ -3812,8 +4036,8 @@ struct NativeRife
     uint8_t* dThdrIn = nullptr;   // BGRA8 bridge input, pitch 4*cw
     uint32_t* dThdrOut = nullptr; // packed 10:10:10:2 bridge output, B in the low bits
     float* dSrcG = nullptr;       // the unquantised sRGB-encoded source, planar fp32
-    float* dShIn = nullptr;       // FSR / TrueHDR after DLSS 5: the model frame without its pad (w x h)
-    float* dShOut = nullptr;      // and the tight result (RCAS, or TrueHDR's PQ) padded back into it
+    float* dShIn = nullptr;       // Sharpen / TrueHDR after DLSS 5: the model frame without its pad (w x h)
+    float* dShOut = nullptr;      // and the tight result (the sharpen, or TrueHDR's PQ) padded back into it
     // offline: the TrueHDR buffers above are sized dw x dh (TrueHDR runs at the working size before the
     // model), and the emit's per-frame statistics block (nativeOfflinePqOut), read back one frame late
     uint8_t* dThdrStats = nullptr; // k_pqOut's hist / misc / vSum (kThdrStatsBytes)
@@ -3877,8 +4101,8 @@ struct NativeRife
     // Restore on PQ), the SDR white in scRGB units
     int encPre = 0, encPost = 0;
     float encWhite = 203.0f / 80.0f;
-    // Sharpen on HDR planes without RTX HDR: RCAS edits their SDR view (knee 1 head 0) as an SDR source's, clamped at
-    // SDR white, and the light outside the view is added back; false = SMV_HDR_SHARPEN_VIEW=0, RCAS on the codes
+    // Sharpen on HDR planes without RTX HDR: the sharpen edits their SDR view (knee 1 head 0) as an SDR source's, clamped
+    // at SDR white, and the light outside the view is added back; false = SMV_HDR_SHARPEN_VIEW=0, the sharpen on the codes
     bool shHdrView = true;
     // a resize of HDR planes before the model (live the capture to the working size, offline the decoded frame to it,
     // Restore's reference at a size change): a source frame inside the SDR range is resized as its SDR view (the SDR
@@ -3956,17 +4180,17 @@ struct NativeRife
     CUfunction fPackInDirect = nullptr, fResizeH = nullptr, fResizeV = nullptr, fH2f = nullptr, fF2h = nullptr,
                fPackOut = nullptr;
     CUfunction fPackInDirectHdr = nullptr, fPqPlanar = nullptr, fResizeHf = nullptr, fPackOutHdr = nullptr;
-    CUfunction fSdrEncode = nullptr, fThdrColor = nullptr;                                   // live TrueHDR
-    CUfunction fThdrIn = nullptr, fRcasThdrIn = nullptr, fPqOut = nullptr, fPqLut = nullptr, // TrueHDR in, the
-        fSdrPq = nullptr;                                                                    // offline PQ emit
-    CUfunction fPackBgra = nullptr, fUnpackBgra = nullptr, fFitPlanar = nullptr,             // sharpen / VSR
-        fRcasPlanar = nullptr, fPackBgraRgb = nullptr,
-               fUnpackBgraRgb = nullptr,                                 // offline (R, G, B) planes
-        fUnpackRgba = nullptr, fPackR10 = nullptr, fUnpackR10 = nullptr; // offline DLSS 4.5 frames
-    CUfunction fFitAaH = nullptr, fFitAaV = nullptr;                     // the separable fit
-    CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;              // its vertical pass + the slot store
-    CUfunction fPackOutTile = nullptr;                                   // both passes + the store, a shrinking height
-    CUfunction fFitAaTile = nullptr;                                     // both passes into a planar target
+    CUfunction fSdrEncode = nullptr, fThdrColor = nullptr;                                    // live TrueHDR
+    CUfunction fThdrIn = nullptr, fSharpThdrIn = nullptr, fPqOut = nullptr, fPqLut = nullptr, // TrueHDR in, the
+        fSdrPq = nullptr;                                                                     // offline PQ emit
+    CUfunction fFitPlanar = nullptr, fSharpPlanar = nullptr,                                  // sharpen
+        fPackBgraRgb = nullptr, fUnpackBgraRgb = nullptr,               // VSR / FRUC: (R, G, B) <-> BGRA8
+        fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr, // offline DLSS 4.5 frames
+        fUnpackR10 = nullptr;
+    CUfunction fFitAaH = nullptr, fFitAaV = nullptr;        // the separable fit
+    CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr; // its vertical pass + the slot store
+    CUfunction fPackOutTile = nullptr;                      // both passes + the store, a shrinking height
+    CUfunction fFitAaTile = nullptr;                        // both passes into a planar target
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr, // live Restore
         fRestFoldTile = nullptr, fRestToF = nullptr, fClamp01 = nullptr;
     CUfunction fPadPlanar = nullptr;                                  // the decoded frame into the model frame
@@ -3990,6 +4214,7 @@ struct NativeRife
     CUfunction fHdrEnc = nullptr, fHdrFromSdr = nullptr, fHdrRange = nullptr; // GMFSS / Restore on HDR planes
     CUfunction fPackBgraSdr = nullptr, fUnpackBgraSdr = nullptr;              // FRUC's SDR pairs on HDR planes
     CUfunction fHdrRestOut = nullptr;                                         // Restore's way back on HDR planes
+    CUfunction fLocalCorr = nullptr;                                          // gmflow's local correlation, fused
     int* dStaticFlag = nullptr; // device flag k_pairDiff sets when the pair differs
     int* hStaticFlag = nullptr; // pinned readback of it, one int per group
     uint64_t staticN = 0;       // identical pairs held this session
@@ -4096,8 +4321,8 @@ struct NativeResident
     nvinfer1::ICudaEngine* engRest = nullptr; // live Restore: kept beside the pair, per path
     std::string block0Path;                   // native DRBA: kept beside the pair, per path
     nvinfer1::ICudaEngine* engB0 = nullptr;
-    std::string gmPath[5]; // the GMFSS set, exclusive with the pair
-    nvinfer1::ICudaEngine* engGm[5] = {};
+    std::string gmPath[kGmN]; // the GMFSS set, exclusive with the pair
+    nvinfer1::ICudaEngine* engGm[kGmN] = {};
     nvinfer1::IRuntimeCache* jit = nullptr;
     CUmodule cuMod = nullptr;
     bool encHalf = true;
@@ -4147,7 +4372,7 @@ static void residentFreeEngines()
         g_res.engB0 = nullptr;
     }
     g_res.block0Path.clear();
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < kGmN; i++)
     {
         if (g_res.engGm[i])
         {
@@ -4195,8 +4420,9 @@ static bool nativeBackendOk(const std::wstring& backend)
 }
 
 // the GMFSS engine set, in handoff order (the NATIVE-PATH keys and the log names)
-static const char* const kGmKey[5] = {"gfeat", "gflow", "gmetric", "gifnet", "gfusion"};
-static const char* const kGmName[5] = {"feat_ext", "gmflow_bidir", "metricnet", "ifnet", "fusionnet"};
+static const char* const kGmKey[kGmN] = {"gfeat", "gflow", "gmetric", "gifnet", "gfusion", "gflowb", "gbone"};
+static const char* const kGmName[kGmN] = {"feat_ext",  "gmflow_bidir_a", "metricnet",      "ifnet",
+                                          "fusionnet", "gmflow_bidir_b", "gmflow_backbone"};
 
 // Upscale to: _Fit.__init__'s derivation of the
 // internal render size from the exe's own --upscale H and the handoff geometry: the factor
@@ -4398,23 +4624,6 @@ struct LkShape
     std::vector<int64_t> dims;
 };
 
-// MUST equal trt_lookup.ONNX_REV (a stale ONNX file is never used).
-// Engines built from an older graph never survive a bump: the app and the
-// CLI empty the engine cache when its stamp (weights_tags.txt, which carries the rev, plus the
-// TensorRT-RTX version) no longer matches (src/render/cache.ts)
-static const int kOnnxRev = 13; // 3: RIFE IFNet / block0 take f0 / f1 in fp16; 4: the IFNet's x
-                                // and the encode's img in fp16; 5: the IFNet's merged in fp16;
-                                // 6: the IFNet's timestep in fp16; 7: the IFNet hands out its
-                                // final flow and blend mask (fp16) instead of merged
-                                // (k_rifeBlend makes the tween); 8: the IFNet concatenates and
-                                // resizes each block's input in fp16; 9: block0 slices its flow
-                                // out before the resize to the full size; 10: the IFNet resizes
-                                // each part of a warped block's input before the concat; 11: the
-                                // IFNet's last block computes only the channels it reads; 12: the
-                                // last block's first conv reads its input in parts, no concat;
-                                // 13: the encode's transposed conv runs as a conv at half the
-                                // size + DepthToSpace
-
 // engine_name(): <base>_<shape per input joined by x, inputs by _>_<trt>_<w>, a dynamic batch
 // axis written lo"to"hi
 static std::string lkEngineName(const std::string& base, const std::vector<LkShape>& set, const char* dynInput,
@@ -4589,7 +4798,7 @@ static std::string lkF4(double v)
 }
 
 // One net of the GMFSS set: the handoff key, the engine base name, the ONNX file key, the
-// build workspace multiplier and the input shapes.
+// build workspace multiplier, the input shapes and how many of them the engine's name carries (0 = all)
 struct LkGmNet
 {
     const char* key;
@@ -4597,7 +4806,15 @@ struct LkGmNet
     const char* onnx;
     int ws;
     std::vector<LkShape> set;
+    size_t nameIn = 0;
 };
+
+// the inputs that name a GMFSS engine (and that its lookup checks): gmflow_bidir_b's corr and img0 fix every other
+// input's shape, and all eight would push its cache paths toward MAX_PATH
+static std::vector<LkShape> lkGmNameSet(const LkGmNet& n)
+{
+    return n.nameIn ? std::vector<LkShape>(n.set.begin(), n.set.begin() + n.nameIn) : n.set;
+}
 
 // Everything the lookup and the build derive from a session's arguments, in ONE place: a name
 // or a size that differed between the two would be an engine the build writes and the lookup
@@ -4626,7 +4843,7 @@ struct LkSession
     int mmw = 0, mmh = 0, mph = 0, mpw = 0, iph = 0, ipw = 0;
 };
 
-// Create a folder and its missing parents. Users delete engine\trt_cache_safe_to_delete whenever
+// Create a folder and its missing parents. Users delete model_cache_safe_to_delete whenever
 // they like (the name invites it), and every engine, JIT and cubin write below assumes the folder
 // exists: a missing one used to fail each save silently and rebuild every session.
 static void ensureDirW(const std::wstring& dir)
@@ -4671,15 +4888,20 @@ static int liveAutoMode(int w, int h)
     return px < 1920.0 * 1080 ? 2 : (px <= 2560.0 * 1440 ? 3 : (px <= 3840.0 * 2160 ? 5 : 6));
 }
 
+// DLSS 5's GPU work never completes on a 64 px wide frame (the GPU resets; 102 and 128 px wide run, and so does a
+// 64 px high one): with DLSS 5 on, a working size below the presented rect is at least this wide
+static const int kNrMinWorkW = 128;
+
 // Live's working size (Restore, the resize, DLSS 5, FSR, RTX HDR and the model run at it, the fit
 // takes it to the canvas after the model): the DLSS mode's share of the PRESENTED rect (the capture aspect-fit into
-// the canvas W x H: the window itself, or the Fill rect), even, at least 64 px and at most the presented rect a
-// side, capped at 3840x2160 keeping the aspect (offline's workPlan). DLAA = the presented rect itself (in window
+// the canvas W x H: the window itself, or the Fill rect), even, at most the presented rect a side, the share raised
+// (aspect kept) until the shorter side is 64 px and, with DLSS 5, the width kNrMinWorkW (*raised: 1 = the 64 px
+// floor, 2 = DLSS 5's width), capped at 3840x2160 keeping the aspect (offline's workPlan). DLAA = the presented rect itself (in window
 // mode the capture, odd sizes kept). liveWorkSizeFor = the size a mode gives the presented presW x presH (mode = 1 +
 // the kDlssModeName index, 0 = --scale's share); liveWorkSize = the session's: Auto picks the mode by the presented
 // pixel count, no larger than the GPU-time step's --auto-floor, or takes the one the free video memory fits
 // (g_liveAutoFit, picked once a session before anything loads), and says which mode it came from.
-static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh)
+static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh, int* raised = nullptr)
 {
     double f = 1.0;
     if (mode)
@@ -4692,10 +4914,17 @@ static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh)
     }
     mw = presW;
     mh = presH;
+    if (raised)
+        *raised = 0;
     if (f < 1.0)
     {
-        mw = (std::min)(presW, (std::max)(64, lkRound(presW * f) & ~1));
-        mh = (std::min)(presH, (std::max)(64, lkRound(presH * f) & ~1));
+        const double fFloor = (std::max)(64.0 / presW, 64.0 / presH);
+        const double fNr = g_dlssnr ? (double)kNrMinWorkW / presW : 0.0;
+        const double k = (std::max)(f, (std::max)(fFloor, fNr));
+        if (raised && k > f)
+            *raised = fNr >= fFloor ? 2 : 1;
+        mw = (std::min)(presW, (std::max)(g_dlssnr ? kNrMinWorkW : 64, lkRound(presW * k) & ~1));
+        mh = (std::min)(presH, (std::max)(64, lkRound(presH * k) & ~1));
     }
     if ((double)mw * mh > 3840.0 * 2160)
     {
@@ -4704,14 +4933,41 @@ static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh)
         mh = (int)std::floor(mh * k) & ~1;
     }
 }
-static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int& mw, int& mh)
+static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int& mw, int& mh, int* raised = nullptr)
 {
     const int outW = W ? (int)W : cw, outH = W ? (int)H : ch;
     int x0, y0;
     lkFitRect(cw, ch, outW, outH, presW, presH, x0, y0);
     mode = g_dlssMode == 1 ? (g_liveAutoFit ? g_liveAutoFit : (std::max)(liveAutoMode(presW, presH), g_liveAutoFloor))
                            : g_dlssMode;
-    liveWorkSizeFor(mode, presW, presH, mw, mh);
+    liveWorkSizeFor(mode, presW, presH, mw, mh, raised);
+}
+
+// The model cache sits in the app's top folder: the repo root in a dev tree, the folder holding
+// SmoothMyVideo.exe in an install (whose engine folder is resources\engine). src/render/cache.ts
+// derives the same folder for its stamp check and the cubin folder.
+static std::string lkModelCacheDir(const std::string& engDir)
+{
+    auto parentOf = [](const std::string& p) {
+        const size_t sl = p.find_last_of('\\');
+        return sl == std::string::npos ? std::string(".") : p.substr(0, sl);
+    };
+    // engDir can be relative or end in `..` (the default script is <exe dir>\..\live_server.py):
+    // resolve it the way the file system does before taking its parent
+    const std::wstring engW = utf8ToWide(engDir);
+    wchar_t full[4096];
+    const DWORD n = GetFullPathNameW(engW.c_str(), (DWORD)(sizeof(full) / sizeof(full[0])), full, nullptr);
+    std::string resolved = n > 0 && n < sizeof(full) / sizeof(full[0]) ? wideToUtf8(full) : engDir;
+    while (resolved.size() > 3 && resolved.back() == '\\')
+        resolved.pop_back();
+    std::string top = parentOf(resolved);
+    const size_t sl = top.find_last_of('\\');
+    std::string last = sl == std::string::npos ? top : top.substr(sl + 1);
+    for (auto& c : last)
+        c = (char)tolower((unsigned char)c);
+    if (last == "resources")
+        top = parentOf(top);
+    return top + "\\model_cache_safe_to_delete";
 }
 
 static bool lkSession(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH,
@@ -4728,7 +4984,7 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
             c = L'\\'; // the dev harnesses pass forward slashes
     s.engDir = wideToUtf8(s.engDirW);
     const std::string envCache = lkEnv("SMV_TRT_CACHE");
-    s.cacheDir = envCache.empty() ? s.engDir + "\\trt_cache_safe_to_delete" : envCache;
+    s.cacheDir = envCache.empty() ? lkModelCacheDir(s.engDir) : envCache;
     ensureDirW(utf8ToWide(s.cacheDir));
     s.cw = (int)capW;
     s.ch = (int)capH;
@@ -4751,11 +5007,21 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
     if (s.backend == "gmfss")
     {
         const int hh = s.hh = s.ph / 2, hw = s.hw = s.pw / 2;
-        // featurenet at the padded frame, the rest at the half, gmflow_bidir with the doubled
-        // workspace ceiling; the IFNet's ONNX key carries its baked scale list
+        const int64_t q4 = (int64_t)(hh / 4) * (hw / 4), K = 81;
+        // featurenet at the padded frame, the rest at the half; gmflow_bidir as two engines around
+        // k_localCorr (its quarter-scale local correlation, never the [2, 128, HW, 81] product), A
+        // with the doubled workspace ceiling (the global matching); the IFNet's ONNX key carries its
+        // baked scale list
         s.gm = {
             {"gfeat", "featurenet", "featurenet", 1, {{"x", {1, 3, s.ph, s.pw}}}},
-            {"gflow", "gmflow_bidir", "gmflow_bidir", 2, {{"img0", {1, 3, hh, hw}}, {"img1", {1, 3, hh, hw}}}},
+            {"gflow",
+             "gmflow_bidir_a",
+             "gmflow_bidir_a",
+             2,
+             {{"map4", {2, 128, hh / 4, hw / 4}},
+              {"map8", {2, 128, hh / 8, hw / 8}},
+              {"img0", {1, 3, hh, hw}},
+              {"img1", {1, 3, hh, hw}}}},
             {"gmetric",
              "metricnet",
              "metricnet",
@@ -4770,6 +5036,20 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
               {"b", {1, 128, hh, hw}},
               {"c", {1, 256, hh / 2, hw / 2}},
               {"d", {1, 384, hh / 4, hw / 4}}}},
+            {"gflowb",
+             "gmflow_bidir_b",
+             "gmflow_bidir_b",
+             1,
+             {{"corr", {2, q4, K}},
+              {"img0", {1, 3, hh, hw}},
+              {"img1", {1, 3, hh, hw}},
+              {"win", {2, q4, K, 2}},
+              {"valid", {2, q4, K}},
+              {"flow0", {2, 2, hh / 4, hw / 4}},
+              {"feat", {2, 128, hh / 4, hw / 4}},
+              {"flow1", {2, 2, hh / 4, hw / 4}}},
+             2},
+            {"gbone", "gmflow_backbone", "gmflow_backbone", 1, {{"img0", {1, 3, hh, hw}}}},
         };
         // on the fusionnet jit; the `|0x0` tail is a legacy flow-grid field, kept so existing
         // warm markers still match
@@ -4935,23 +5215,23 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     const int ph = s.ph, pw = s.pw;
     if (backend == "gmfss")
     {
-        const int hh = s.hh, hw = s.hw;
-        std::string path[5], jit[5];
-        for (int i = 0; i < 5; i++)
+        const int hh = s.hh, hw = s.hw, n = (int)s.gm.size();
+        std::string path[kGmN], jit[kGmN];
+        for (int i = 0; i < n; i++)
         {
             LkIo io;
-            if (!lkFind(rt, cacheDir, s.gm[i].base, {s.gm[i].set}, nullptr, 0, 0, t, path[i], io))
+            if (!lkFind(rt, cacheDir, s.gm[i].base, {lkGmNameSet(s.gm[i])}, nullptr, 0, 0, t, path[i], io))
                 return false;
             jit[i] = lkJit(path[i]);
         }
         if (!lkWarm(jit[4], s.warmKey))
             return false;
-        for (int i = 0; i < 4; i++)
-            if (!lkFile(jit[i]))
+        for (int i = 0; i < n; i++)
+            if (i != 4 && !lkFile(jit[i]))
                 return false;
         int dw, dh, x0, y0;
         fitRect(mw, mh, dw, dh, x0, y0);
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < n; i++)
         {
             lines.push_back(std::string("NATIVE-PATH ") + s.gm[i].key + "=" + path[i]);
             lines.push_back(std::string("NATIVE-PATH ") + s.gm[i].key + "jit=" + jit[i]);
@@ -5079,7 +5359,6 @@ static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& b
 // (EAGER specialization, so the saved kernels are the specialized ones) and writes that cache as
 // the engine's .jit and the warm key. After the build the host lookup runs again and must
 // hit.
-// (kOnnxRev sits above lkEngineName: the engine names carry it too)
 
 class LkBuildLogger : public nvinfer1::ILogger
 {
@@ -5354,10 +5633,12 @@ static bool lkWarmEngine(nvinfer1::IRuntime* rt, const std::string& enginePath,
     return true;
 }
 
+// trt_lookup.onnx_path(): <key>_<w>.onnx; onnx_export.py exports every graph again whenever its export stamp
+// changes, so the file under this name is always the current graph
 static std::string lkOnnxPath(const std::string& engDir, const std::string& key, const LookupTags& t)
 {
     const std::string env = lkEnv("SMV_ONNX_DIR");
-    return (env.empty() ? engDir + "\\onnx" : env) + "\\" + key + "_" + t.w + "_x" + std::to_string(kOnnxRev) + ".onnx";
+    return (env.empty() ? engDir + "\\onnx" : env) + "\\" + key + "_" + t.w + ".onnx";
 }
 
 // a CUDA stream for a build on the calling thread, on the device the sessions run on
@@ -5442,14 +5723,15 @@ static bool lkBuildBackend(const std::wstring& script, const std::wstring& backe
     bool done = rt != nullptr;
     if (done && gmfss)
     {
-        // the warm key sits on the last net's jit (fusionnet)
+        // the warm key sits on fusionnet's jit
         for (size_t i = 0; done && i < s.gm.size(); i++)
         {
             bool oom = false;
             const LkGmNet& n = s.gm[i];
-            const std::string path = s.cacheDir + "\\" + lkEngineName(n.base, n.set, nullptr, 0, 0, t) + ".engine";
+            const std::string path =
+                s.cacheDir + "\\" + lkEngineName(n.base, lkGmNameSet(n), nullptr, 0, 0, t) + ".engine";
             done = lkEnsure(rt, s, t, path, n.onnx, n.set, nullptr, 0, 0, n.ws, {n.set},
-                            i + 1 == s.gm.size() ? s.warmKey : std::string(), st, &oom);
+                            !strcmp(n.key, "gfusion") ? s.warmKey : std::string(), st, &oom);
         }
     }
     else if (done)
@@ -5696,9 +5978,9 @@ static bool lkOfflineGmfss(const std::wstring& script, int w, int h, NativeRife&
     for (size_t i = 0; i < s.gm.size(); i++)
     {
         const LkGmNet& n = s.gm[i];
-        const std::string p = s.cacheDir + "\\" + lkEngineName(n.base, n.set, nullptr, 0, 0, t) + ".engine";
-        // the warm key sits on the last net's jit (fusionnet), the others need their .jit
-        const std::string wk = i + 1 == s.gm.size() ? s.warmKey : std::string();
+        const std::string p = s.cacheDir + "\\" + lkEngineName(n.base, lkGmNameSet(n), nullptr, 0, 0, t) + ".engine";
+        // the warm key sits on fusionnet's jit, the others need their .jit
+        const std::string wk = !strcmp(n.key, "gfusion") ? s.warmKey : std::string();
         if (lkFile(p) && (wk.empty() ? lkFile(lkJit(p)) : lkWarm(lkJit(p), wk)))
             continue;
         if (!lkFile(p) && !g_onnxParserOk)
@@ -5719,10 +6001,10 @@ static bool lkOfflineGmfss(const std::wstring& script, int w, int h, NativeRife&
     const bool built = st != nullptr;
     if (st)
         cudaStreamDestroy(st);
-    for (int i = 0; i < 5; i++)
+    for (size_t i = 0; i < s.gm.size(); i++)
     {
         LkIo io;
-        if (!lkFind(rt, s.cacheDir, s.gm[i].base, {s.gm[i].set}, nullptr, 0, 0, t, nr.gmPath[i], io))
+        if (!lkFind(rt, s.cacheDir, s.gm[i].base, {lkGmNameSet(s.gm[i])}, nullptr, 0, 0, t, nr.gmPath[i], io))
         {
             LOG("offline: the GMFSS engines at %dx%d do not match their class (delete them from the cache to rebuild)\n",
                 s.pw, s.ph);
@@ -5846,17 +6128,19 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     // resident host: the same window as the previous session (same overlay size, capture
     // size, DLSS mode or share, Auto's memory pick and floor and HDR mode) gets the previous answer without a lookup,
     // as long as the engine files still exist (the user may empty the cache folder by hand);
-    // live Restore rides in the key: its engine path is a fact of a restore session only
+    // live Restore rides in the key: its engine path is a fact of a restore session only; DLSS 5 too: it raises a
+    // small working size (liveWorkSizeFor)
     wchar_t key[1024];
-    swprintf_s(key, L"%s|%s|%.2f|%d|%d|%d|%u|%u|%u|%u|%d|%d", script.c_str(), backend.c_str(), g_flowScale, g_dlssMode,
-               g_liveAutoFit, g_liveAutoFloor, W, H, capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0);
+    swprintf_s(key, L"%s|%s|%.2f|%d|%d|%d|%u|%u|%u|%u|%d|%d|%d", script.c_str(), backend.c_str(), g_flowScale,
+               g_dlssMode, g_liveAutoFit, g_liveAutoFloor, W, H, capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0,
+               g_dlssnr ? 1 : 0);
     bool factsOk = g_resident && g_res.haveFacts && g_res.handoffKey == key;
     if (factsOk)
     {
         const NativeRife& f = g_res.facts;
         if (f.gmfss)
         {
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < kGmN; i++)
                 factsOk = factsOk && fileExistsA(f.gmPath[i]);
         }
         else
@@ -5885,7 +6169,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         nr.gmfss = f.gmfss;
         nr.hh = f.hh;
         nr.hw = f.hw;
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < kGmN; i++)
         {
             nr.gmPath[i] = f.gmPath[i];
             nr.gmJit[i] = f.gmJit[i];
@@ -5959,7 +6243,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         else if (line.rfind("NATIVE-PATH g", 0) == 0)
         {
             // the GMFSS set: `NATIVE-PATH <key>=` and `NATIVE-PATH <key>jit=` per engine
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < kGmN; i++)
             {
                 const std::string kp = std::string("NATIVE-PATH ") + kGmKey[i] + "=";
                 const std::string kj = std::string("NATIVE-PATH ") + kGmKey[i] + "jit=";
@@ -6077,7 +6361,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     {
         nr.hh = num("hh", 0);
         nr.hw = num("hw", 0);
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < kGmN; i++)
             if (nr.gmPath[i].empty())
             {
                 LOG("native: gmfss handoff named no %s engine\n", kGmName[i]);
@@ -6150,7 +6434,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         f.gmfss = nr.gmfss;
         f.hh = nr.hh;
         f.hw = nr.hw;
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < kGmN; i++)
         {
             f.gmPath[i] = nr.gmPath[i];
             f.gmJit[i] = nr.gmJit[i];
@@ -6225,8 +6509,8 @@ static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfe
         if (nr.jit && !nr.block0Jit.empty() && nativeReadFile(nr.block0Jit, cb))
             LOG("native: block0 jit cache merged -> %d (%zu bytes)\n", (int)nr.jit->deserialize(cb.data(), cb.size()),
                 cb.size());
-        // the GMFSS set's five caches, one file per engine
-        for (int i = 0; i < 5; i++)
+        // the GMFSS set's caches, one file per engine
+        for (int i = 0; i < kGmN; i++)
             if (nr.jit && !nr.gmJit[i].empty() && nativeReadFile(nr.gmJit[i], cb))
                 LOG("native: gmfss %s jit cache merged -> %d (%zu bytes)\n", kGmName[i],
                     (int)nr.jit->deserialize(cb.data(), cb.size()), cb.size());
@@ -6315,14 +6599,13 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fSdrEncode, "k_sdrEncode"},
         {&nr.fThdrColor, "k_thdrColor"},
         {&nr.fThdrIn, "k_thdrIn"},
-        {&nr.fRcasThdrIn, "k_rcasThdrIn"},
+        {&nr.fSharpThdrIn, "k_sharpThdrIn"},
         {&nr.fPqOut, "k_pqOut"},
         {&nr.fSdrPq, "k_sdrPq"},
         {&nr.fPqLut, "k_pqLut"},
         {&nr.fPackBgra, "k_packBgra"},
-        {&nr.fUnpackBgra, "k_unpackBgra"},
         {&nr.fFitPlanar, "k_fitPlanar"},
-        {&nr.fRcasPlanar, "k_rcasPlanar"},
+        {&nr.fSharpPlanar, "k_sharpPlanar"},
         {&nr.fPackBgraRgb, "k_packBgraRgb"},
         {&nr.fUnpackBgraRgb, "k_unpackBgraRgb"},
         {&nr.fUnpackRgba, "k_unpackRgba"},
@@ -6383,6 +6666,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fPackBgraSdr, "k_packBgraSdr"},
         {&nr.fUnpackBgraSdr, "k_unpackBgraSdr"},
         {&nr.fHdrRestOut, "k_hdrRestOut"},
+        {&nr.fLocalCorr, "k_localCorr"},
     };
     for (auto& e : fns)
         if (cuModuleGetFunction(e.fn, nr.cuMod, e.nm) != CUDA_SUCCESS)
@@ -6773,13 +7057,14 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     if (nr.sharpen > 0.0f)
     {
-        LOG("native: sharpen: FSR RCAS %.2f at %dx%d, after DLSS 5 and before RTX HDR and the model\n", nr.sharpen,
-            nr.w, nr.h);
+        LOG("native: sharpen: Adaptive Sharpen %.2f at %dx%d, after DLSS 5 and before RTX HDR and the model\n",
+            nr.sharpen, nr.w, nr.h);
         if (nr.encPost && !nr.rtxHdr)
             LOG("native: sharpen: HDR planes: %s\n",
-                nr.shHdrView ? "RCAS edits their SDR view as an SDR source's, clamped at SDR white, and the light "
-                               "outside the view is added back"
-                             : "RCAS on the PQ / HLG codes (SMV_HDR_SHARPEN_VIEW=0)");
+                nr.shHdrView
+                    ? "the sharpen edits their SDR view as an SDR source's, clamped at SDR white, and the light "
+                      "outside the view is added back"
+                    : "the sharpen on the PQ / HLG codes (SMV_HDR_SHARPEN_VIEW=0)");
     }
     // Restore's fold target (_Fit._load_restore's restore_target). Offline with a
     // working size, and live, Restore runs before the model: the target is the working / model size,
@@ -7156,13 +7441,10 @@ static bool nativeNvofPair(NativeRife& nr, const float* dPrev, const float* dCur
     const size_t plane = (size_t)nr.ph * nr.pw;
     if (nr.nvProf)
         cudaEventRecord(nr.nvEv[0], st);
-    // BT.709 on (R, G, B): offline and live HDR planes are (R, G, B), live SDR planes (B, G, R), which
-    // pass the R plane with a negative stride (k_nvofLuma's note)
-    const bool rgb = nr.planesRgb || nr.hdr;
-    int nps = rgb ? (int)plane : -(int)plane, pitch = (int)nr.ofInPitch;
+    int nps = (int)plane, pitch = (int)nr.ofInPitch;
     for (int k = 0; k < 2; k++)
     {
-        const float* r = (k ? dCur : dPrev) + (rgb ? 0 : 2 * plane);
+        const float* r = k ? dCur : dPrev;
         CUdeviceptr dst = nr.ofInP[k];
         void* a[] = {(void*)&r, &nps, &nr.pw, &nr.w, &nr.h, &dst, &pitch};
         if (cuLaunchKernel(nr.fNvofLuma, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
@@ -7688,14 +7970,13 @@ static void nativeFrucPlan(NativeRife& nr, const double* ts, uint32_t n)
 // last tweened pair's end. python's Fruc._reuse, only when this group has tweens: a pair that
 // does not continue the last interpolated one first gets one dropped warp at 0.5 of the
 // skipped pair (last end, previous frame), so the OFA hints stay consecutive
-// one frame's planes into surface n: the SDR view (sdr, k_packBgraSdr) or the planes as stored (true BGRA from either
-// plane order: live SDR (B, G, R), offline and live HDR (R, G, B))
+// one frame's planes into surface n: the SDR view (sdr, k_packBgraSdr) or the planes as stored (true BGRA)
 static bool nativeFrucPack(NativeRife& nr, const float* src, int n, bool sdr)
 {
     int ps = nr.ph * nr.pw, f32 = 0;
     void* a[] = {(void*)&src, &f32, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.dFrSurf[n]};
     void* b[] = {(void*)&src, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &nr.dFrSurf[n]};
-    const CUfunction f = sdr ? nr.fPackBgraSdr : ((nr.planesRgb || nr.hdr) ? nr.fPackBgraRgb : nr.fPackBgra);
+    const CUfunction f = sdr ? nr.fPackBgraSdr : nr.fPackBgraRgb;
     if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, sdr ? b : a,
                        nullptr) != CUDA_SUCCESS)
     {
@@ -7873,14 +8154,13 @@ static uint8_t* nativeFrucNode(NativeRife& nr, int k, int L)
     return nr.dFrNode[p];
 }
 
-// a FRUC output (true BGRA8) into dFrOut (3, ph, pw) in the frames' plane order; an SDR pair's tween back to the HDR
+// a FRUC output (true BGRA8) into dFrOut (3, ph, pw) as (R, G, B) planes; an SDR pair's tween back to the HDR
 // codes (k_unpackBgraSdr)
 static bool nativeFrucUnpack(NativeRife& nr, uint8_t* src)
 {
     void* a[] = {&src, &nr.pw, &nr.ph, &nr.dFrOut};
     void* b[] = {&src, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &nr.dFrOut};
-    const CUfunction f =
-        nr.frPairSdr ? nr.fUnpackBgraSdr : ((nr.planesRgb || nr.hdr) ? nr.fUnpackBgraRgb : nr.fUnpackBgra);
+    const CUfunction f = nr.frPairSdr ? nr.fUnpackBgraSdr : nr.fUnpackBgraRgb;
     if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream,
                        nr.frPairSdr ? b : a, nullptr) != CUDA_SUCCESS)
     {
@@ -8121,16 +8401,19 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     // the live working size the handoff sized the model frame with (liveWorkSize), and where it came from
     if (!g_offline)
     {
-        int presW, presH, mode, mw, mh;
-        liveWorkSize(nr.cw, nr.ch, presW, presH, mode, mw, mh);
+        int presW, presH, mode, mw, mh, raised;
+        liveWorkSize(nr.cw, nr.ch, presW, presH, mode, mw, mh, &raised);
         const int shown = mode ? mode : (g_flowScale >= 0.995 ? 2 : 0); // no --scale = DLAA
         char how[64];
         if (shown)
             sprintf_s(how, "DLSS mode %ls%s", kDlssModeName[shown - 1], g_dlssMode == 1 ? " (Auto)" : "");
         else
             sprintf_s(how, "%.2f", g_flowScale);
-        LOG("native: live working size %dx%d = %s of the %dx%d presented, capture %dx%d\n", nr.w, nr.h, how, presW,
-            presH, nr.cw, nr.ch);
+        LOG("native: live working size %dx%d = %s of the %dx%d presented, capture %dx%d%s\n", nr.w, nr.h, how, presW,
+            presH, nr.cw, nr.ch,
+            raised == 2   ? " (raised to DLSS 5's minimum width, 128 px, aspect kept)"
+            : raised == 1 ? " (raised to the 64 px floor, aspect kept)"
+                          : "");
     }
     // live: Restore reads the captured frame (its engine has the capture size) and folds it to
     // the model size before the model runs, so srcW / srcH name the capture from here on (the Restore warm-up
@@ -8240,7 +8523,7 @@ static bool nativeConfigHdr(NativeRife& nr)
     // the bridge
     // and nvngx_vsr.dll present (else Lanczos3, never a route change), and the fit must
     // enlarge (decided in nativeRtxInit once the handoff geometry is known)
-    nr.sharpen = (float)(g_sharpen < 0.0 ? 0.0 : (g_sharpen > 1.0 ? 1.0 : g_sharpen));
+    nr.sharpen = (float)(g_sharpen < 0.0 ? 0.0 : (g_sharpen > 2.0 ? 2.0 : g_sharpen));
     if (g_rtxVsr)
     {
         if (g_hdr)
@@ -8297,6 +8580,8 @@ static const char* trtDtypeName(nvinfer1::DataType t)
         return "i32";
     case nvinfer1::DataType::kINT64:
         return "i64";
+    case nvinfer1::DataType::kBOOL:
+        return "bool";
     default:
         return "other";
     }
@@ -8383,6 +8668,98 @@ static bool nativeWarmEngine(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfer
     return ok;
 }
 
+// gmflow split: the contract between A (slot 1), k_localCorr and B (slot 5), read off the engines. The kernel takes
+// q [2, HW, 128] and f [2, H, W, 128] (channels-last: 32 lanes of float4) with coords [2, HW, K, 2] on the quarter of
+// the half frame and writes corr [2, HW, K] (K <= 100: its shared grid holds 12 x 12 taps); A hands out exactly the
+// kGmA tensors and B takes corr, img0, img1 and the other A outputs at their exact dims and dtype. The backbone (slot 6)
+// makes one frame's map4 / map8 [1, C, H, W] and A takes both frames' as [2, C, H, W] in the same dtype.
+static bool nativeGmSplitCheck(NativeRife& nr)
+{
+    nvinfer1::ICudaEngine* a = nr.engGm[1];
+    nvinfer1::ICudaEngine* b = nr.engGm[5];
+    auto bad = [](const char* nm, const char* what) {
+        LOG("native: gmfss split: %s %s\n", nm, what);
+        return false;
+    };
+    auto same = [](const nvinfer1::Dims& x, const nvinfer1::Dims& y) {
+        if (x.nbDims != y.nbDims)
+            return false;
+        for (int k = 0; k < x.nbDims; k++)
+            if (x.d[k] != y.d[k])
+                return false;
+        return true;
+    };
+    if (a->getNbIOTensors() != 12 || b->getNbIOTensors() != 9)
+        return bad("gmflow_bidir_a / _b", "do not have the split's 12 / 9 tensors");
+    nvinfer1::ICudaEngine* bb = nr.engGm[6];
+    if (bb->getNbIOTensors() != 3)
+        return bad("gmflow_backbone", "does not have its 3 tensors (img0 -> map4, map8)");
+    for (const char* nm : {"map4", "map8"})
+    {
+        const nvinfer1::Dims o = bb->getTensorShape(nm), in = a->getTensorShape(nm);
+        if (bb->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT ||
+            a->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kINPUT)
+            return bad(nm, "is not an output of gmflow_backbone and an input of gmflow_bidir_a");
+        if (o.nbDims != 4 || in.nbDims != 4 || o.d[0] != 1 || in.d[0] != 2 || o.d[1] != in.d[1] || o.d[2] != in.d[2] ||
+            o.d[3] != in.d[3] || bb->getTensorDataType(nm) != a->getTensorDataType(nm))
+            return bad(nm,
+                       "is not [1, C, H, W] out of gmflow_backbone and [2, C, H, W] into gmflow_bidir_a, one dtype");
+    }
+    for (const char* nm : kGmA)
+        if (a->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT)
+            return bad(nm, "is not an output of gmflow_bidir_a");
+    for (const char* nm : {"q", "f", "coords"})
+        if (a->getTensorDataType(nm) != nvinfer1::DataType::kFLOAT)
+            return bad(nm, "is not fp32");
+    if (b->getTensorIOMode("corr") != nvinfer1::TensorIOMode::kINPUT ||
+        b->getTensorDataType("corr") != nvinfer1::DataType::kFLOAT)
+        return bad("corr", "is not an fp32 input of gmflow_bidir_b");
+    const nvinfer1::Dims q = a->getTensorShape("q"), f = a->getTensorShape("f"), g = a->getTensorShape("coords"),
+                         c = b->getTensorShape("corr");
+    if (f.nbDims != 4 || f.d[0] != 2 || f.d[1] != nr.hh / 4 || f.d[2] != nr.hw / 4 || f.d[3] != 128)
+        return bad("f", "is not [2, H, W, 128] on the quarter of the half frame");
+    nr.gmH = (int)f.d[1];
+    nr.gmW = (int)f.d[2];
+    const int64_t hw = (int64_t)nr.gmH * nr.gmW;
+    if (q.nbDims != 3 || q.d[0] != 2 || q.d[1] != hw || q.d[2] != 128)
+        return bad("q", "is not [2, H * W, 128]");
+    if (g.nbDims != 4 || g.d[0] != 2 || g.d[1] != hw || g.d[2] < 1 || g.d[2] > 100 || g.d[3] != 2)
+        return bad("coords", "is not [2, H * W, K, 2] with K <= 100");
+    nr.gmK = (int)g.d[2];
+    if (c.nbDims != 3 || c.d[0] != 2 || c.d[1] != hw || c.d[2] != nr.gmK)
+        return bad("corr", "is not [2, H * W, K]");
+    for (int i = 0; i < b->getNbIOTensors(); i++)
+    {
+        const char* nm = b->getIOTensorName(i);
+        if (b->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kINPUT)
+        {
+            if (strcmp(nm, "flow"))
+                return bad(nm, "is an output of gmflow_bidir_b other than flow");
+            continue;
+        }
+        if (!strcmp(nm, "corr") || !strcmp(nm, "img0") || !strcmp(nm, "img1"))
+            continue;
+        int k = 3;
+        while (k < 8 && strcmp(nm, kGmA[k]))
+            k++;
+        if (k == 8)
+            return bad(nm, "is a gmflow_bidir_b input gmflow_bidir_a does not hand over");
+        if (!same(a->getTensorShape(nm), b->getTensorShape(nm)) || a->getTensorDataType(nm) != b->getTensorDataType(nm))
+            return bad(nm, "differs between gmflow_bidir_a and gmflow_bidir_b");
+    }
+    return true;
+}
+
+// one engine tensor's bytes at its static shape
+static size_t trtTensorBytes(nvinfer1::ICudaEngine* eng, const char* nm)
+{
+    const nvinfer1::Dims d = eng->getTensorShape(nm);
+    size_t n = trtElemSize(eng->getTensorDataType(nm));
+    for (int k = 0; k < d.nbDims; k++)
+        n *= (size_t)(d.d[k] > 0 ? d.d[k] : 0);
+    return n;
+}
+
 // GMFSS: the chain's contract and its buffers. Every channel count and dtype is
 // READ OFF THE ENGINES (the handoff line never types them), then one pair's and
 // one tween's planar buffers are allocated from it. Runs inside nativeTrtInit right after the
@@ -8449,10 +8826,13 @@ static bool nativeGmfssSetup(NativeRife& nr)
     nr.gmC[2] = dims[1];
     if (fh2 != nr.gmFeatHalf || fh3 != nr.gmFeatHalf)
         return bad("the feature levels have mixed dtypes");
-    // the fused bidir GMFlow: row 0 = flow01, row 1 = flow10 (so the pyramids take both at once)
-    if (!tensor(1, "img0", 1, 3, hh, hw, nullptr) || !tensor(1, "img1", 1, 3, hh, hw, nullptr))
+    // the fused bidir GMFlow: both halves take the frames, B hands the flow out: row 0 = flow01, row 1 = flow10 (so
+    // the pyramids take both at once)
+    if (!tensor(1, "img0", 1, 3, hh, hw, nullptr) || !tensor(1, "img1", 1, 3, hh, hw, nullptr) ||
+        !tensor(5, "img0", 1, 3, hh, hw, nullptr) || !tensor(5, "img1", 1, 3, hh, hw, nullptr) ||
+        !tensor(6, "img0", 1, 3, hh, hw, nullptr))
         return false;
-    if (!tensor(1, "flow", 2, 2, hh, hw, nullptr))
+    if (!tensor(5, "flow", 2, 2, hh, hw, nullptr) || !nativeGmSplitCheck(nr))
         return false;
     if (!tensor(2, "i0", 1, 3, hh, hw, nullptr) || !tensor(2, "i1", 1, 3, hh, hw, nullptr) ||
         !tensor(2, "f01", 1, 2, hh, hw, nullptr) || !tensor(2, "f10", 1, 2, hh, hw, nullptr))
@@ -8472,17 +8852,22 @@ static bool nativeGmfssSetup(NativeRife& nr)
             nr.engGm[3]->getTensorDataType("timestep") != nvinfer1::DataType::kFLOAT)
             return bad("the ifnet timestep is not a 1x1x1x1 fp32 value");
     }
-    // fusionnet: the concats are adjacent planes, so b / c / d are exactly 2x the feature levels
-    if (!tensor(4, "a", 1, 9, hh, hw, nullptr) || !tensor(4, "b", 1, 2 * nr.gmC[0], hh, hw, nullptr) ||
-        !tensor(4, "c", 1, 2 * nr.gmC[1], hh / 2, hw / 2, nullptr) ||
-        !tensor(4, "d", 1, 2 * nr.gmC[2], hh / 4, hw / 4, nullptr))
+    // fusionnet: the concats are adjacent planes, so b / c / d are exactly 2x the feature levels; k_splatNorm writes
+    // them in the engine's dtype (fp16: its store rounds to nearest even, as an ONNX Cast to fp16 does)
+    bool ch = false, dh = false;
+    if (!tensor(4, "a", 1, 9, hh, hw, nullptr) || !tensor(4, "b", 1, 2 * nr.gmC[0], hh, hw, &nr.gmFuseHalf) ||
+        !tensor(4, "c", 1, 2 * nr.gmC[1], hh / 2, hw / 2, &ch) ||
+        !tensor(4, "d", 1, 2 * nr.gmC[2], hh / 4, hw / 4, &dh))
         return false;
+    if (ch != nr.gmFuseHalf || dh != nr.gmFuseHalf)
+        return bad("the fusionnet feature inputs have mixed dtypes");
     if (!tensor(4, "out", 1, 3, nr.ph, nr.pw, &nr.gmOutHalf))
         return false;
 
     const size_t hp = (size_t)hh * hw, qp = hp / 4, ep = hp / 16;
     const size_t plane = (size_t)nr.ph * nr.pw;
-    const size_t fe = nr.gmFeatHalf ? 2 : 4, me = nr.gmMetricHalf ? 2 : 4, oe = nr.gmOutHalf ? 2 : 4;
+    const size_t fe = nr.gmFeatHalf ? 2 : 4, me = nr.gmMetricHalf ? 2 : 4, oe = nr.gmOutHalf ? 2 : 4,
+                 be = nr.gmFuseHalf ? 2 : 4;
     size_t accPlanes = (size_t)nr.gmC[0] + 1;
     if (((size_t)nr.gmC[1] + 1) * qp > accPlanes * hp)
         accPlanes = (((size_t)nr.gmC[1] + 1) * qp + hp - 1) / hp;
@@ -8503,12 +8888,23 @@ static bool nativeGmfssSetup(NativeRife& nr)
     NCHK(cudaMalloc((void**)&nr.dGmMetP[1], 2 * ep * sizeof(float)), "alloc gmfss metric pyramid");
     NCHK(cudaMalloc((void**)&nr.dGmAcc, accPlanes * hp * sizeof(long long)), "alloc gmfss splat accumulator");
     NCHK(cudaMalloc((void**)&nr.dGmFa, 9 * hp * sizeof(float)), "alloc gmfss fusion a");
-    NCHK(cudaMalloc((void**)&nr.dGmFb, (size_t)2 * nr.gmC[0] * hp * sizeof(float)), "alloc gmfss fusion b");
-    NCHK(cudaMalloc((void**)&nr.dGmFc, (size_t)2 * nr.gmC[1] * qp * sizeof(float)), "alloc gmfss fusion c");
-    NCHK(cudaMalloc((void**)&nr.dGmFd, (size_t)2 * nr.gmC[2] * ep * sizeof(float)), "alloc gmfss fusion d");
+    NCHK(cudaMalloc(&nr.dGmFb, (size_t)2 * nr.gmC[0] * hp * be), "alloc gmfss fusion b");
+    NCHK(cudaMalloc(&nr.dGmFc, (size_t)2 * nr.gmC[1] * qp * be), "alloc gmfss fusion c");
+    NCHK(cudaMalloc(&nr.dGmFd, (size_t)2 * nr.gmC[2] * ep * be), "alloc gmfss fusion d");
     NCHK(cudaMalloc((void**)&nr.dGmT, sizeof(float)), "alloc gmfss timestep");
     NCHK(cudaMalloc(&nr.dGmOut, 3 * plane * oe), "alloc gmfss fusion out");
     NCHK(cudaMalloc((void**)&nr.dGmF, 3 * plane * sizeof(float)), "alloc gmfss model frame");
+    for (int i = 0; i < 8; i++)
+        NCHK(cudaMalloc(&nr.dGmA[i], trtTensorBytes(nr.engGm[1], kGmA[i])), "alloc gmfss split tensors");
+    NCHK(cudaMalloc((void**)&nr.dGmCorr, (size_t)2 * nr.gmH * nr.gmW * nr.gmK * sizeof(float)),
+         "alloc gmfss local correlation");
+    for (int i = 0; i < 2; i++)
+    {
+        const size_t bytes = trtTensorBytes(nr.engGm[1], i ? "map8" : "map4");
+        NCHK(cudaMalloc(&nr.dGmMap[i], bytes), "alloc gmfss backbone maps");
+        nr.gmMapSlot[i] = bytes / 2;
+    }
+    nr.gmMapsNext = false;
     if (nr.encPost)
     {
         NCHK(cudaMalloc((void**)&nr.dGmEnc, 3 * plane * sizeof(float)), "alloc gmfss SDR view");
@@ -8519,10 +8915,13 @@ static bool nativeGmfssSetup(NativeRife& nr)
         nr.gmModeLogs = 0;
     }
     cudaMemGetInfo(&freeA, &totB);
-    LOG("native: gmfss chain: half %dx%d, features %d/%d/%d %s, metric %s, out %s, accumulator"
+    LOG("native: gmfss chain: half %dx%d, features %d/%d/%d %s, metric %s, fusion features %s, out %s, accumulator"
         " %zu planes, buffers %.0f MB\n",
         hw, hh, nr.gmC[0], nr.gmC[1], nr.gmC[2], nr.gmFeatHalf ? "fp16" : "fp32", nr.gmMetricHalf ? "fp16" : "fp32",
-        nr.gmOutHalf ? "fp16" : "fp32", accPlanes, ((double)freeB - (double)freeA) / 1048576.0);
+        nr.gmFuseHalf ? "fp16" : "fp32", nr.gmOutHalf ? "fp16" : "fp32", accPlanes,
+        ((double)freeB - (double)freeA) / 1048576.0);
+    LOG("native: gmfss chain: gmflow split, its local correlation in one kernel (%dx%d, %d samples a pixel)\n", nr.gmW,
+        nr.gmH, nr.gmK);
     nr.gmProf = GetEnvironmentVariableW(L"SMV_LIVE_GMFSS_PROF", nullptr, 0) != 0;
     if (nr.gmProf)
         for (auto& e : nr.gmEv)
@@ -8906,13 +9305,13 @@ static bool nativeTrtInit(NativeRife& nr)
         size_t freeB = 0, freeA = 0, totB = 0;
         cudaMemGetInfo(&freeB, &totB);
         bool same = g_resident && g_res.rt;
-        for (int i = 0; i < 5 && same; i++)
+        for (int i = 0; i < kGmN && same; i++)
             same = g_res.engGm[i] && g_res.gmPath[i] == nr.gmPath[i];
         if (same)
         {
             nr.rt = g_res.rt;
             nr.jit = g_res.jit;
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < kGmN; i++)
             {
                 nr.engGm[i] = g_res.engGm[i];
                 if (!nativeMakeContext(nr, nr.engGm[i], &nr.cfgGm[i], &nr.ctxGm[i]))
@@ -8929,7 +9328,7 @@ static bool nativeTrtInit(NativeRife& nr)
                 LOG("native: createInferRuntime failed\n");
                 return false;
             }
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < kGmN; i++)
             {
                 nr.engGm[i] = nativeLoadEngine(nr, nr.gmPath[i], &nr.cfgGm[i], &nr.ctxGm[i]);
                 if (!nr.engGm[i])
@@ -8948,7 +9347,7 @@ static bool nativeTrtInit(NativeRife& nr)
             if (!nr.engRest)
                 return false;
         }
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < kGmN; i++)
             if (!nativeWarmEngine(nr, nr.engGm[i], nr.ctxGm[i], kGmName[i]))
                 return false;
         if (!restoreReady())
@@ -8964,7 +9363,7 @@ static bool nativeTrtInit(NativeRife& nr)
             g_res.rt = nr.rt;
             g_res.jit = nr.jit;
             g_res.dev = nr.dev;
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < kGmN; i++)
             {
                 g_res.engGm[i] = nr.engGm[i];
                 g_res.gmPath[i] = nr.gmPath[i];
@@ -9250,7 +9649,7 @@ static void nativeFree(NativeRife& nr)
         wn = NativeRife::DrWin{};
     nr.dDrFlow = nr.dDrFlowN = nullptr;
     nr.dDrAcc = nullptr;
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < kGmN; i++)
     {
         if (nr.ctxGm[i])
         {
@@ -9377,14 +9776,48 @@ static void nativeFree(NativeRife& nr)
     nr.thdrStatsPending = false;
     // the GMFSS chain's buffers: per session like every other model buffer, so a
     // backend switch on the resident host gives the VRAM back even though the engines stay
-    for (void* p :
-         {nr.dGmFeat[0][0],      nr.dGmFeat[0][1],     nr.dGmFeat[0][2],     nr.dGmFeat[1][0],  nr.dGmFeat[1][1],
-          nr.dGmFeat[1][2],      (void*)nr.dGmHalf,    (void*)nr.dGmFlow,    nr.dGmMetric,      (void*)nr.dGmFlowP[0],
-          (void*)nr.dGmFlowP[1], (void*)nr.dGmMetP[0], (void*)nr.dGmMetP[1], (void*)nr.dGmAcc,  (void*)nr.dGmFa,
-          (void*)nr.dGmFb,       (void*)nr.dGmFc,      (void*)nr.dGmFd,      (void*)nr.dGmT,    nr.dGmOut,
-          (void*)nr.dGmF,        (void*)nr.dGmEnc,     (void*)nr.dGmHalfM,   (void*)nr.dGmRange})
+    for (void* p : {nr.dGmFeat[0][0],
+                    nr.dGmFeat[0][1],
+                    nr.dGmFeat[0][2],
+                    nr.dGmFeat[1][0],
+                    nr.dGmFeat[1][1],
+                    nr.dGmFeat[1][2],
+                    (void*)nr.dGmHalf,
+                    (void*)nr.dGmFlow,
+                    nr.dGmMetric,
+                    (void*)nr.dGmFlowP[0],
+                    (void*)nr.dGmFlowP[1],
+                    (void*)nr.dGmMetP[0],
+                    (void*)nr.dGmMetP[1],
+                    (void*)nr.dGmAcc,
+                    (void*)nr.dGmFa,
+                    nr.dGmFb,
+                    nr.dGmFc,
+                    nr.dGmFd,
+                    (void*)nr.dGmT,
+                    nr.dGmOut,
+                    (void*)nr.dGmF,
+                    (void*)nr.dGmEnc,
+                    (void*)nr.dGmHalfM,
+                    (void*)nr.dGmRange,
+                    nr.dGmA[0],
+                    nr.dGmA[1],
+                    nr.dGmA[2],
+                    nr.dGmA[3],
+                    nr.dGmA[4],
+                    nr.dGmA[5],
+                    nr.dGmA[6],
+                    nr.dGmA[7],
+                    (void*)nr.dGmCorr,
+                    nr.dGmMap[0],
+                    nr.dGmMap[1]})
         if (p)
             cudaFree(p);
+    for (auto& p : nr.dGmA)
+        p = nullptr;
+    nr.dGmCorr = nullptr;
+    nr.dGmMap[0] = nr.dGmMap[1] = nullptr;
+    nr.gmMapsNext = false;
     if (nr.hGmRange)
         cudaFreeHost(nr.hGmRange);
     nr.hGmRange = nullptr;
@@ -9471,6 +9904,9 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     // on a pair that really runs the flow so the average is over comparable groups
     const bool profPair = nr.gmProf && needFlow;
     const int64_t cpu0 = profPair ? nowQpc100() : 0;
+    // the backbone maps in batch slot 1 belong to this call's previous frame only when the last call was a pair
+    const bool mapsPrev = nr.gmMapsNext;
+    nr.gmMapsNext = false;
     if (profPair)
         cudaEventRecord(nr.gmEv[0], st);
     // feat_ext of the NEW frame, into the set the NEXT pair will read as feat0. HDR planes (the kernels' comment): a
@@ -9566,17 +10002,74 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     nvinfer1::IExecutionContext* ctx = nullptr;
     if (profPair)
         cudaEventRecord(nr.gmEv[2], st);
-    // the fused bidir GMFlow (one call, both directions) and metricnet on the same halves
+    // gmflow's backbone once a frame: the previous frame's maps are the last pair's new ones (batch slot 1 -> 0) when
+    // that pair took them on the same view of it (the pictures, the SDR view or the motion view), else taken again;
+    // the new frame's into slot 1
+    const int kind = mview ? 2 : (sdr ? 1 : 0);
+    auto backbone = [&](float* x, int slot) {
+        nvinfer1::IExecutionContext* c = nr.ctxGm[6];
+        c->setTensorAddress("img0", x);
+        c->setTensorAddress("map4", (uint8_t*)nr.dGmMap[0] + slot * nr.gmMapSlot[0]);
+        c->setTensorAddress("map8", (uint8_t*)nr.dGmMap[1] + slot * nr.gmMapSlot[1]);
+        return c->enqueueV3(st);
+    };
+    bool mapsOk = true;
+    if (mapsPrev && nr.gmMapsKind == kind)
+        for (int i = 0; i < 2 && mapsOk; i++)
+            mapsOk = cudaMemcpyAsync(nr.dGmMap[i], (uint8_t*)nr.dGmMap[i] + nr.gmMapSlot[i], nr.gmMapSlot[i],
+                                     cudaMemcpyDeviceToDevice, st) == cudaSuccess;
+    else
+        mapsOk = backbone(mv0, 0);
+    if (!mapsOk || !backbone(mv1, 1))
+    {
+        nr.die("gmfss gmflow_backbone enqueueV3 returned false");
+        return false;
+    }
+    nr.gmMapsKind = kind;
+    // the fused bidir GMFlow (both directions: A on both frames' maps, the local correlation (k_localCorr: one warp a
+    // pixel, 4 a block) and B) and metricnet on the same halves
     ctx = nr.ctxGm[1];
+    ctx->setTensorAddress("map4", nr.dGmMap[0]);
+    ctx->setTensorAddress("map8", nr.dGmMap[1]);
     ctx->setTensorAddress("img0", mv0);
     ctx->setTensorAddress("img1", mv1);
-    ctx->setTensorAddress("flow", nr.dGmFlow);
+    for (int i = 0; i < 8; i++)
+        ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
     const int64_t cpuF0 = profPair ? nowQpc100() : 0;
     if (!ctx->enqueueV3(st))
     {
-        nr.die("gmfss gmflow enqueueV3 returned false");
+        nr.die("gmfss gmflow_bidir_a enqueueV3 returned false");
         return false;
     }
+    int nb = 2, hw4 = nr.gmH * nr.gmW;
+    void* ac[] = {(void*)&nr.dGmA[0],
+                  (void*)&nr.dGmA[1],
+                  (void*)&nr.dGmA[2],
+                  (void*)&nr.dGmCorr,
+                  &nb,
+                  &nr.gmH,
+                  &nr.gmW,
+                  &hw4,
+                  &nr.gmK};
+    if (cuLaunchKernel(nr.fLocalCorr, (unsigned)((2LL * hw4 * 32 + 127) / 128), 1, 1, 128, 1, 1, 0, (CUstream)st, ac,
+                       nullptr) != CUDA_SUCCESS)
+    {
+        nr.die("gmfss local correlation launch failed");
+        return false;
+    }
+    ctx = nr.ctxGm[5];
+    ctx->setTensorAddress("corr", nr.dGmCorr);
+    for (int i = 3; i < 8; i++)
+        ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
+    ctx->setTensorAddress("img0", mv0);
+    ctx->setTensorAddress("img1", mv1);
+    ctx->setTensorAddress("flow", nr.dGmFlow);
+    if (!ctx->enqueueV3(st))
+    {
+        nr.die("gmfss gmflow_bidir_b enqueueV3 returned false");
+        return false;
+    }
+    nr.gmMapsNext = true; // slot 1 = the new frame's maps = the next pair's previous frame
     if (profPair)
         nr.gmCpuFlow += (double)(nowQpc100() - cpuF0) / 10000.0;
     if (profPair)
@@ -9635,8 +10128,8 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     // one softsplat: zero the accumulator, scatter every source pixel, normalize into the
     // fusionnet plane (a channel concat = adjacent planes, so no copy follows)
     auto splat = [&](void* in, int inHalf, int C, float* flow, void* metric, int metricHalf, float s, int w, int h,
-                     float* dst) -> bool {
-        int cc = C, ww = w, hh2 = h, ih = inHalf, mh = metricHalf, zero = 0;
+                     void* dst, int dstHalf) -> bool {
+        int cc = C, ww = w, hh2 = h, ih = inHalf, mh = metricHalf, dh = dstHalf;
         const int n = w * h;
         int ni = n;
         if (cudaMemsetAsync(nr.dGmAcc, 0, (size_t)(C + 1) * (size_t)n * sizeof(long long), st) != cudaSuccess)
@@ -9653,7 +10146,7 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
             nr.die("gmfss splatSoft launch failed");
             return false;
         }
-        void* b[] = {(void*)&nr.dGmAcc, &cc, &ni, (void*)&dst, &zero};
+        void* b[] = {(void*)&nr.dGmAcc, &cc, &ni, (void*)&dst, &dh};
         if (cuLaunchKernel(nr.fSplatNorm, (ni + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, b, nullptr) !=
             CUDA_SUCCESS)
         {
@@ -9678,9 +10171,9 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         cudaEventRecord(nr.gmEv[6], st);
     }
     // I1t and I2t into the fusionnet's a planes 0..2 and 6..8 (the ifnet fills 3..5 below)
-    if (!splat(nr.dGmHalf, 0, 3, flow0, met0, mHalf, sA, nr.hw, nr.hh, nr.dGmFa))
+    if (!splat(nr.dGmHalf, 0, 3, flow0, met0, mHalf, sA, nr.hw, nr.hh, nr.dGmFa, 0))
         return false;
-    if (!splat(nr.dGmHalf + 3 * hp, 0, 3, flow1, met1, mHalf, sB, nr.hw, nr.hh, nr.dGmFa + 6 * hp))
+    if (!splat(nr.dGmHalf + 3 * hp, 0, 3, flow1, met1, mHalf, sB, nr.hw, nr.hh, nr.dGmFa + 6 * hp, 0))
         return false;
     if (prof)
         cudaEventRecord(nr.gmEv[7], st);
@@ -9705,19 +10198,25 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         cudaEventRecord(nr.gmEv[8], st);
     // the three feature levels, both directions: the half from the engines' own flow and
     // metric, the quarter and the eighth from the pair's pyramids
-    if (!splat(f0[0], fHalf, nr.gmC[0], flow0, met0, mHalf, sA, nr.hw, nr.hh, nr.dGmFb))
+    // b / c / d in the engine's dtype: the second direction starts gmC planes in
+    const int bHalf = nr.gmFuseHalf ? 1 : 0;
+    const size_t be = nr.gmFuseHalf ? 2 : 4;
+    uint8_t* fb = (uint8_t*)nr.dGmFb;
+    uint8_t* fc = (uint8_t*)nr.dGmFc;
+    uint8_t* fd = (uint8_t*)nr.dGmFd;
+    if (!splat(f0[0], fHalf, nr.gmC[0], flow0, met0, mHalf, sA, nr.hw, nr.hh, fb, bHalf))
         return false;
-    if (!splat(f1[0], fHalf, nr.gmC[0], flow1, met1, mHalf, sB, nr.hw, nr.hh, nr.dGmFb + (size_t)nr.gmC[0] * hp))
+    if (!splat(f1[0], fHalf, nr.gmC[0], flow1, met1, mHalf, sB, nr.hw, nr.hh, fb + (size_t)nr.gmC[0] * hp * be, bHalf))
         return false;
-    if (!splat(f0[1], fHalf, nr.gmC[1], nr.dGmFlowP[0], nr.dGmMetP[0], 0, sA, nr.hw / 2, nr.hh / 2, nr.dGmFc))
+    if (!splat(f0[1], fHalf, nr.gmC[1], nr.dGmFlowP[0], nr.dGmMetP[0], 0, sA, nr.hw / 2, nr.hh / 2, fc, bHalf))
         return false;
     if (!splat(f1[1], fHalf, nr.gmC[1], nr.dGmFlowP[0] + 2 * qp, nr.dGmMetP[0] + qp, 0, sB, nr.hw / 2, nr.hh / 2,
-               nr.dGmFc + (size_t)nr.gmC[1] * qp))
+               fc + (size_t)nr.gmC[1] * qp * be, bHalf))
         return false;
-    if (!splat(f0[2], fHalf, nr.gmC[2], nr.dGmFlowP[1], nr.dGmMetP[1], 0, sA, nr.hw / 4, nr.hh / 4, nr.dGmFd))
+    if (!splat(f0[2], fHalf, nr.gmC[2], nr.dGmFlowP[1], nr.dGmMetP[1], 0, sA, nr.hw / 4, nr.hh / 4, fd, bHalf))
         return false;
     if (!splat(f1[2], fHalf, nr.gmC[2], nr.dGmFlowP[1] + 2 * ep, nr.dGmMetP[1] + ep, 0, sB, nr.hw / 4, nr.hh / 4,
-               nr.dGmFd + (size_t)nr.gmC[2] * ep))
+               fd + (size_t)nr.gmC[2] * ep * be, bHalf))
         return false;
     if (prof)
         cudaEventRecord(nr.gmEv[9], st);
@@ -10614,11 +11113,8 @@ static bool nativeNrMotion(NativeRife& nr, const float* frame, int pw, int ps)
     int w = nr.nrW, h = nr.nrH;
     const int cur = nr.nrOfCur, prev = cur ^ 1;
     nr.nrOfCur = prev;
-    // BT.709 on (R, G, B): offline and live HDR planes are (R, G, B), live SDR planes (B, G, R), which
-    // pass the R plane with a negative stride (k_nvofLuma's note)
-    const bool rgb = nr.planesRgb || nr.hdr;
-    const float* r0 = frame + (rgb ? 0 : 2 * (size_t)ps);
-    int nps = rgb ? ps : -ps, lpitch = (int)nr.nrOfInPitch;
+    const float* r0 = frame;
+    int nps = ps, lpitch = (int)nr.nrOfInPitch;
     CUdeviceptr lc = nr.nrOfInP[cur], lp = nr.nrOfInP[prev];
     void* a[] = {(void*)&r0, &nps, &pw, &w, &h, &lc, &lpitch};
     if (cuLaunchKernel(nr.fNvofLuma, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
@@ -10670,7 +11166,7 @@ static bool nativeNrMotion(NativeRife& nr, const float* frame, int pw, int ps)
 
 // DLSS 5 on one frame, in place, before anything reads it: the padded planar model-input frame
 // (pw x ph, plane stride ps) whose top-left nrW x nrH is the picture; offline a decoded frame,
-// live a captured one after Restore and the resize (planes (B, G, R) in SDR, PQ (R, G, B) in
+// live a captured one after Restore and the resize ((R, G, B) planes, PQ in
 // HDR). Every model and every output frame then reads DLSS 5 output: DLSS 5 on
 // the rendered frame and frame generation after it. Reset on the stream's first frame (live: and
 // after a pause).
@@ -10792,7 +11288,10 @@ static uint32_t nativeRingFit(const NativeRife& nr, size_t slotBytes, uint64_t& 
 // backend (the CUDA context, the runtime, the kernels, the engines and every buffer: a base, a padded megapixel of the
 // working size and a megapixel of the capture; NVAPI's free figure from the session's start to its steady state at
 // 854x480 and 1920x1080, and at 960x540 of a 1920x1080 capture for the capture's share, a quarter on top; rife, blend
-// and rifedrba measured with the tween stored in fp16, + 7 for its fp32 store: 6 bytes a pixel more), DLSS 5's
+// and rifedrba measured with the tween stored in fp16, + 7 for its fp32 store: 6 bytes a pixel more; gmfss moved by a
+// quarter over what its graph set changes against the whole gmflow graph in the process's own memory at 854x480 and
+// 1708x960: gmflow's two halves -76 MiB - 772 a padded megapixel, its backbone once a frame +9 + 50, fusionnet's fp16
+// feature inputs -1 - 102), DLSS 5's
 // passes (nr_host's creation and first-frame shares plus this route's own buffers, kNrLiveMp: within 2 % of the
 // measured 1526 / 828 MiB for 3 passes at 1920x1080 / 960x540), RTX HDR, RTX VSR, Restore at the capture, and the
 // output ring's 2 slots (the ring gives way down to them, nativeRingFit).
@@ -10802,7 +11301,7 @@ struct LiveModelMem
     double base, padMp, capMp;
 };
 static const LiveModelMem kLiveModelMem[] = {
-    {"rife", 345, 730, 103}, {"blend", 345, 730, 103}, {"rifedrba", 388, 1210, 103}, {"gmfss", 339, 3064, 103},
+    {"rife", 345, 730, 103}, {"blend", 345, 730, 103}, {"rifedrba", 388, 1210, 103}, {"gmfss", 254, 2036, 103},
     {"nvof", 297, 116, 103}, {"fruc", 577, 122, 103},  {"echo", 282, 0, 48}};
 constexpr double kNrLiveMp = 30.0;
 static uint64_t nativeLiveNeed(const std::string& backend, int cw, int ch, int mw, int mh)
@@ -10910,15 +11409,14 @@ static bool nativeNrFrame(NativeRife& nr, float* frame, int pw, int ph, int ps)
     cudaStream_t st = nr.stream;
     int tw = nr.nrW, th = nr.nrH;
     const size_t bytes = (size_t)tw * th * 8;
-    // the model meets (R, G, B): live SDR planes are (B, G, R), so the R plane with a negative stride;
     // live HDR planes are PQ, so the SDR-range math runs around the pass (k_nrInPq / k_nrOutPq), unless
     // RTX HDR converts after the pass (nrSdrIn: the planes are the capture's SDR range already); offline
     // HDR video (PQ or HLG codes) takes the same math
-    const bool rgb = nr.planesRgb || nr.hdr, pq = (nr.liveNr && nr.hdr && !nr.nrSdrIn) || nr.nrSrcHdr != 0;
+    const bool pq = (nr.liveNr && nr.hdr && !nr.nrSdrIn) || nr.nrSrcHdr != 0;
     int hlg = nr.nrSrcHdr == 2 ? 1 : 0;
-    float* r0 = frame + (rgb ? 0 : 2 * (size_t)ps);
+    float* r0 = frame;
     const float* src = r0;
-    int sps = rgb ? ps : -ps;
+    int sps = ps;
     void* a[] = {(void*)&src, &sps, &pw, &tw, &th, &nr.dNrIo};
     void* b[] = {&nr.dNrIo, &tw, &th, &r0, &ph, &pw, &sps};
     void* aq[] = {(void*)&src, &sps, &pw, &tw, &th, &nr.nrSdrWhite, &nr.dNrIo, &hlg};
@@ -11121,7 +11619,7 @@ static bool nativeLiveNrInit(NativeRife& nr)
 }
 
 // After DLSS 5, once per real frame on the model frame dCur (pw x ph, planes dps apart, nr.w x nr.h
-// used) before any model reads it: FSR's RCAS (post-processing at the working size), then RTX TrueHDR (SDR -> PQ
+// used) before any model reads it: Adaptive Sharpen (post-processing at the working size), then RTX TrueHDR (SDR -> PQ
 // BT.2020, after RTX VSR and every SDR pass), so the model interpolates the finished frames (frame generation last).
 // thdr = TrueHDR runs this frame. A failed TrueHDR eval fails an offline render; live it turns the pass off for the
 // session and this frame goes to PQ the faithful way. false = a launch failed (die was called).
@@ -11134,7 +11632,7 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
         return true;
     const size_t tight = (size_t)w * h;
     int fps = (int)tight;
-    // HDR planes without RTX HDR: RCAS reads their SDR view, so the SDR range is sharpened exactly as an SDR source's
+    // HDR planes without RTX HDR: the sharpen reads their SDR view, so the SDR range is sharpened exactly as an SDR source's
     // (clamped at SDR white) and a frame of SDR content stays inside the SDR range; the light the view never held is
     // added back after it (k_hdrRestOut, the way Restore and DLSS 5 treat HDR planes)
     const bool hdrView = sharpen && !thdr && nr.encPost && nr.shHdrView;
@@ -11148,7 +11646,7 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
     }
     else if (sharpen)
     {
-        // RCAS reads a tight w x h frame: the model frame without its pad
+        // the sharpen reads a tight w x h frame: the model frame without its pad
         for (int c = 0; c < 3; c++)
             if (cudaMemcpy2DAsync(nr.dShIn + (size_t)c * tight, (size_t)w * sizeof(float), dCur + (size_t)c * dps,
                                   (size_t)pw * sizeof(float), (size_t)w * sizeof(float), h, cudaMemcpyDeviceToDevice,
@@ -11158,16 +11656,16 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
                 return false;
             }
     }
-    float* out = nr.dShOut; // the tight result (RCAS, or TrueHDR's PQ), padded back into dCur below
+    float* out = nr.dShOut; // the tight result (the sharpen, or TrueHDR's PQ), padded back into dCur below
     if (thdr)
     {
         if (sharpen)
         {
             void* a[] = {&nr.dShIn, &w, &h, &nr.sharpen, &nr.dThdrIn, &nr.dSrcG};
-            if (cuLaunchKernel(nr.fRcasThdrIn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+            if (cuLaunchKernel(nr.fSharpThdrIn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                                nullptr) != CUDA_SUCCESS)
             {
-                nr.die("rcasThdrIn launch failed");
+                nr.die("sharpThdrIn launch failed");
                 return false;
             }
         }
@@ -11220,12 +11718,12 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
             {
                 void* a[] = {&nr.dShIn, &w, &h, &nr.sharpen, &out};
                 void* b[] = {&out, &fps, &w, &w, &h, &dCur, &pw, &ph, &dps};
-                if (cuLaunchKernel(nr.fRcasPlanar, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+                if (cuLaunchKernel(nr.fSharpPlanar, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                                    nullptr) != CUDA_SUCCESS ||
                     cuLaunchKernel(nr.fPadPlanar, (pw + 15) / 16, (ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b,
                                    nullptr) != CUDA_SUCCESS)
                 {
-                    nr.die("rcasPlanar launch failed");
+                    nr.die("sharpPlanar launch failed");
                     return false;
                 }
             }
@@ -11249,10 +11747,10 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
     else
     {
         void* a[] = {&nr.dShIn, &w, &h, &nr.sharpen, &out};
-        if (cuLaunchKernel(nr.fRcasPlanar, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
+        if (cuLaunchKernel(nr.fSharpPlanar, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
             CUDA_SUCCESS)
         {
-            nr.die("rcasPlanar launch failed");
+            nr.die("sharpPlanar launch failed");
             return false;
         }
         if (hdrView)
@@ -11699,9 +12197,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     }
     // RTX VSR before the model (the working size above the capture while the fit after the model does not
     // enlarge): the capture's planes through Restore (folded back to the capture size) and VSR to the working
-    // size, offline's pre-model stage; it reads (R, G, B), so the live (B, G, R) planes go in with a negative
-    // stride and come back into the model frame the same way. It replaces Restore and the resize below; after
-    // a VSR failure those run instead.
+    // size, offline's pre-model stage. It replaces Restore and the resize below; after a VSR failure those
+    // run instead.
     bool restored = false;
     if (!nrSame && nr.vsrPre && !nr.vsrFailed && !sdrPre)
     {
@@ -11713,15 +12210,15 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             nr.die("capture planes (RTX VSR) launch failed");
             return false;
         }
-        const void* src = nr.dCapF + 2 * (size_t)cps;
-        int ps = -cps, rs = nr.cw, half = 0;
+        const void* src = nr.dCapF;
+        int ps = cps, rs = nr.cw, half = 0;
         bool staged = false;
         if (!nativeOfflineStage(nr, src, ps, rs, half, staged, nr.cw, nr.ch, nr.w, nr.h, true, true))
             return false;
         if (staged)
         {
-            const float* from = nr.dPres + 2 * (size_t)nr.w * nr.h;
-            int fps = -(nr.w * nr.h), dps = (int)plane;
+            const float* from = nr.dPres;
+            int fps = nr.w * nr.h, dps = (int)plane;
             void* a[] = {&from, &fps, &nr.w, &nr.w, &nr.h, &dCur, &nr.pw, &nr.ph, &dps};
             if (cuLaunchKernel(nr.fPadPlanar, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                                nullptr) != CUDA_SUCCESS)
@@ -11751,9 +12248,6 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 return false;
             }
         }
-        // Real-ESRGAN meets (R, G, B): live SDR planes are (B, G, R), so the R plane goes in with a
-        // negative stride and the result goes back into the model frame the same way
-        const bool rgbIn = nr.planesRgb || nr.hdr;
         float* capPl = sdrPre ? nr.dSrcG : nr.dCapF;
         // HDR planes: Restore's reference at the working size takes the capture's SDR view when it stays in range
         int in = 0;
@@ -11762,15 +12256,12 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             nr.die("resize range test failed");
             return false;
         }
-        if (!nativeRestoreRun(nr, rgbIn ? capPl : capPl + 2 * (size_t)cps, rgbIn ? cps : -cps, nr.cw, nr.dRest, nr.w,
-                              nr.h, 0, sdrPre ? 0 : nr.encPost, in == 1))
+        if (!nativeRestoreRun(nr, capPl, cps, nr.cw, nr.dRest, nr.w, nr.h, 0, sdrPre ? 0 : nr.encPost, in == 1))
             return false;
         if (!nr.restFailed)
         {
             int fps = nr.w * nr.h, dps = (int)plane;
-            const float* from = rgbIn ? nr.dRest : nr.dRest + 2 * (size_t)fps;
-            if (!rgbIn)
-                fps = -fps;
+            const float* from = nr.dRest;
             void* a[] = {&from, &fps, &nr.w, &nr.w, &nr.h, &dCur, &nr.pw, &nr.ph, &dps};
             if (cuLaunchKernel(nr.fPadPlanar, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                                nullptr) != CUDA_SUCCESS)
@@ -12143,7 +12634,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // horizontal pass into dFitTmp, then its vertical pass fused with the slot store
     // (k_packOutV / k_packOutHdrV). With live effects: RTX VSR (the bridge, model size ->
     // presented size, 8-bit in and out, host-synchronous like every bridge call) or the Lanczos3
-    // pair into the planar staging frame, then RCAS in the slot store. A VSR eval failure demotes
+    // pair into the planar staging frame, then the sharpen in the slot store. A VSR eval failure demotes
     // the rest of the run to Lanczos3 with one line.
     // (half != 0 on any of these = an fp16 source: a tween as the IFNet wrote it)
     auto packFrom = [&](const void* src, int ps, int rs, int sw, int sh, uint8_t* slot, const char* what,
@@ -12294,7 +12785,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (vsrNow)
         {
             void* a[] = {(void*)&src, &half, (void*)&ps, (void*)&rs, &nr.w, &nr.h, &nr.dVsrIn};
-            if (cuLaunchKernel(nr.fPackBgra, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+            if (cuLaunchKernel(nr.fPackBgraRgb, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                                nullptr) != CUDA_SUCCESS)
             {
                 nr.die("packBgra launch failed");
@@ -12332,7 +12823,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (haveVsr)
         {
             void* a[] = {&nr.dVsrOut, (void*)&tw, (void*)&th, &stage};
-            if (cuLaunchKernel(nr.fUnpackBgra, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+            if (cuLaunchKernel(nr.fUnpackBgraRgb, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                                nullptr) != CUDA_SUCCESS)
             {
                 nr.die("unpackBgra launch failed");
@@ -12361,7 +12852,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             if (pairStatic && heldSlot)
             {
                 // the held pair's remaining slots: the real frame's finished slot, copied as
-                // it is, so the per-frame passes (VSR, the fit, RCAS) run ONCE
+                // it is, so the per-frame passes (VSR, the fit, the sharpen) run ONCE
                 if (cudaMemcpyAsync(slot, heldSlot, nr.slotBytes, cudaMemcpyDeviceToDevice, st) != cudaSuccess)
                 {
                     nr.die("held slot copy failed");

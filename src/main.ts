@@ -116,9 +116,10 @@ if (!app.requestSingleInstanceLock()) {
     }
   });
   app.whenReady().then(() => {
-    // a new TensorRT-RTX or ONNX graph revision empties the engine cache once, before any live
-    // session or render can load an engine built from the old graph (src/render/cache.ts)
-    console.log(checkEngineCache(ENGINE));
+    // a new TensorRT-RTX version or a new ONNX export empties the engine cache once, before any live
+    // session or render can load an engine built from the old graph; a cache an earlier version
+    // kept elsewhere (the engine folder, 1.0.x's AppData) is moved or removed (src/render/cache.ts)
+    console.log(checkEngineCache(ENGINE, [path.join(app.getPath('userData'), 'trt_cache')]));
     createWindow();
     checkForUpdate();
   });
@@ -697,13 +698,10 @@ let liveLabel = ''; // user-facing effective-model name for the exe's loading me
 let liveNote = ''; // substitution note (e.g. Smooth Motion live runs GMFSS), same destination
 let liveDlssMode = 'dlaa'; // the DLSS mode (dlssScaleArg): the working size's share of the presented size
 // (server backends only; dlssg has no such input)
-let liveAutoFloor = ''; // Auto's GPU-time step: the mode the host named with its exit 8 ("live: Auto next MODE"),
-// passed as --auto-floor on the revive; a user start or a settings change clears it
-let liveDlssCustom = 100; // Custom: that share in %
 let liveFit = 'window'; // 'window' = 1:1 overlay, 'fill' = the target's monitor upscaled (server
 // only), 'monitor' = whole-screen capture 1:1 (every model incl. dlssg)
 let liveTarget = 60; // adaptive output fps target, inherited from the renderer's Speed selectors
-let liveSharpen = 0; // live RCAS strength, inherited from the Sharpen controls (0 = off)
+let liveSharpen = 0; // live Adaptive Sharpen strength 0..2, inherited from the Sharpen controls (0 = off)
 let liveVsr = false; // RTX VSR as the live upscaler, inherited from the RTX VSR checkbox
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
@@ -804,10 +802,9 @@ function onLiveSessionEnd(code: number | null) {
   // exit 4 = target window resized (the overlay cannot resize in place); exit 6 = the stall
   // watchdog killed a wedged enhancement engine. Both revive the SAME session with the SAME
   // configuration: a mid-session downgrade (e.g. to the eager model path) would read as
-  // "it suddenly got slow" to the user, worse than a brief hiccup at full speed. Exit 8 = Auto's
-  // GPU-time step: the same session at the mode the host named (liveAutoFloor, --auto-floor).
+  // "it suddenly got slow" to the user, worse than a brief hiccup at full speed.
   // Bounded by the shared restart cap (interactive resizing alone can fire many restarts).
-  if ((code === 4 || code === 6 || code === 8) && !liveStopping && restarts < 20 && resolved) {
+  if ((code === 4 || code === 6) && !liveStopping && restarts < 20 && resolved) {
     liveLog(`session exit ${code}, reviving (restart ${restarts + 1})`);
     if (code === 6) sendLive('lv-out', 'live engine stalled, reviving the session\n');
     setTimeout(() => {
@@ -826,7 +823,8 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   liveStopping = false;
   liveRestartPending = false;
   offlineHostQuit(); // an idle offline render host gives its VRAM to the live session
-  const args = hwnd ? ['--hwnd', hwnd] : ['--fg', '--exclude', ownHwnd()];
+  // Whole screen uses the foreground window only to pick the monitor, so SMV itself may be it
+  const args = hwnd ? ['--hwnd', hwnd] : liveFit === 'monitor' ? ['--fg'] : ['--fg', '--exclude', ownHwnd()];
   // ONE knob: the fps target from the Speed selectors. Adaptive models resample to it; fixed
   // pipelines (DLSS 4.5) approximate it in the exe with the nearest whole multiple of the
   // captured window's measured rate, capped by the model (no --gen: the exe derives it).
@@ -843,7 +841,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     // not capped by a fixed 16-slot ceiling.
     args.push('--target', target);
     // live effects, inherited from the file-render Sharpen / RTX VSR settings
-    const sharp = Math.min(1, Math.max(0, Number(liveSharpen) || 0));
+    const sharp = Math.min(2, Math.max(0, Number(liveSharpen) || 0));
     if (sharp > 0) args.push('--sharpen', sharp.toFixed(2));
     // "Upscale to": the server resizes the model frame to this height
     // first (VSR when enlarging), then fits it to the canvas; so VSR can now engage outside
@@ -885,11 +883,10 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     // and the measured capture rate at runtime (capped at 6x by the model)
     args.push('--target', target);
   }
-  // the DLSS mode: the working size as its share of the presented size (the window, or the Fill rect); the
-  // host resolves Auto by that size, and no flag = DLAA (the presented size itself)
-  const scaleArg = dlssScaleArg(liveDlssMode, liveDlssCustom);
+  // the DLSS mode: the working size as its share of the presented size (the window, or the Fill rect); no
+  // flag = DLAA (the presented size itself)
+  const scaleArg = dlssScaleArg(liveDlssMode);
   if (liveModel !== 'dlssg' && scaleArg) args.push('--scale', scaleArg);
-  if (liveModel !== 'dlssg' && scaleArg === 'auto' && liveAutoFloor) args.push('--auto-floor', liveAutoFloor);
   if (liveModel !== 'dlssg' && liveFit === 'fill') args.push('--fit', 'fill');
   if (liveFit === 'monitor') args.push('--fit', 'monitor'); // whole-screen: all models incl. dlssg
   if (!liveHud) args.push('--no-hud');
@@ -934,8 +931,6 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     for (const line of lines) {
       const m = /target window: hwnd=0x0*([0-9a-fA-F]+)/.exec(line);
       if (m && liveProc === p && !liveIdle) liveResolved = '0x' + m[1].toLowerCase();
-      const af = /^live: Auto next (\w+):/.exec(line);
-      if (af && liveProc === p) liveAutoFloor = af[1];
       const e = LIVE_ENDED_RE.exec(line);
       if (e && liveProc === p) {
         // hotkey mode (--fg) has no hwnd of its own: it learns the target from the exe's
@@ -982,19 +977,10 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
 
 ipcMain.handle('lv-ready', () => fileExists(LIVE_EXE));
 
-// Bundled example clip (Big Buck Bunny, CC-BY Blender Foundation): drives the first-page
-// settings + before/after preview before the user has picked any video.
-// The example preview clip ships as its own extraResource (samples/ is otherwise local
-// test material and stays out of both git and the package).
-const EXAMPLE_MP4 = app.isPackaged
-  ? path.join(process.resourcesPath, 'samples', 'example.mp4')
-  : path.join(ROOT, 'samples', 'example.mp4');
-ipcMain.handle('example-path', () => (fileExists(EXAMPLE_MP4) ? EXAMPLE_MP4 : null));
-
 // the Smooth It Live! button: after the renderer's countdown, target the foreground window
-// (the user clicked the window they want during the countdown; --exclude keeps SMV itself out)
+// (the user clicked the window they want during the countdown; --exclude keeps SMV itself out
+// outside Whole screen)
 ipcMain.on('lv-start-fg', () => {
-  liveAutoFloor = '';
   startLiveSession(null);
 });
 // end the running session: "stop" on the resident host (it ends the session and stays), a
@@ -1044,7 +1030,6 @@ ipcMain.on(
       label?: string;
       note?: string;
       dlssmode?: string; // the DLSS mode (dlssScaleArg)
-      dlsscustom?: number; // Custom: the working size in % of the presented size
       fit: string;
       target?: number;
       sharpen?: number;
@@ -1068,11 +1053,9 @@ ipcMain.on(
     },
   ) => {
     liveModel = opts.model;
-    liveAutoFloor = ''; // a new configuration: Auto's GPU-time step starts over
     liveLabel = opts.label ?? '';
     liveNote = opts.note ?? '';
     liveDlssMode = opts.dlssmode ?? 'dlaa';
-    liveDlssCustom = opts.dlsscustom ?? 100;
     liveFit = opts.fit;
     if (opts.target !== undefined) liveTarget = opts.target;
     liveSharpen = opts.sharpen ?? 0;
@@ -1107,10 +1090,7 @@ ipcMain.on(
 let liveHotkey = '';
 function liveToggle() {
   if (liveProc && !liveIdle) stopLive();
-  else {
-    liveAutoFloor = '';
-    startLiveSession(null);
-  }
+  else startLiveSession(null);
 }
 function registerLiveHotkey(acc: string): boolean {
   if (!fileExists(LIVE_EXE)) return false;
@@ -1347,7 +1327,6 @@ type RunOpts = {
   sharpen?: number;
   restore?: boolean;
   dlssmode?: string; // the DLSS mode (dlssScaleArg)
-  dlsscustom?: number; // Custom: the working size in % of the output
   dlssnr?: boolean;
   nrstructure?: number;
   nrtone?: number;
@@ -1369,14 +1348,10 @@ type RunOpts = {
   hdrvib?: number;
 };
 
-// The GUI's DLSS mode as the CLI's --scale value: auto / quality / balanced / performance / ultra
-// by name, Custom as the working size's share of the output (33..100 %); null = DLAA, the default.
-function dlssScaleArg(mode?: string, custom?: number): string | null {
-  if (mode === 'custom') {
-    const pct = Math.min(100, Math.max(1, Math.round(custom ?? 100)));
-    return pct >= 100 ? null : (pct / 100).toFixed(2);
-  }
-  return mode && ['auto', 'quality', 'balanced', 'performance', 'ultra'].includes(mode) ? mode : null;
+// The GUI's DLSS mode as the CLI's --scale value: quality / balanced / performance / ultra by name;
+// null = DLAA, the default.
+function dlssScaleArg(mode?: string): string | null {
+  return mode && ['quality', 'balanced', 'performance', 'ultra'].includes(mode) ? mode : null;
 }
 
 // The render command line for one request (pure: the GUI state in, render.py's argv out; the TS
@@ -1399,10 +1374,10 @@ function engineArgs(opts: RunOpts): string[] {
   }
   // DLSS mode (the mode selector): the working size Restore's output, DLSS 5 and the model run at,
   // NVIDIA's share of the output (plan.ts workPlan); DLAA, the default, is the output itself
-  const scaleArg = dlssScaleArg(opts.dlssmode, opts.dlsscustom);
+  const scaleArg = dlssScaleArg(opts.dlssmode);
   if (scaleArg) args.push('--scale', scaleArg);
-  // FSR-style RCAS sharpening strength (GUI checkbox + slider). 0/omitted = off, leaving the
-  // frames value-preserving; >0 enables the in-engine RCAS pass. Works with or without interp.
+  // Adaptive Sharpen strength 0..2 (GUI checkbox + slider, 1 = the author's default). 0/omitted = off,
+  // leaving the frames value-preserving; >0 enables the host's sharpen pass. Works with or without interp.
   if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
   // AI detail restoration (GUI Restore checkbox): Real-ESRGAN animevideov3 once per source frame,
   // first (it folds straight to the working size). Works with or without interpolation.
@@ -1461,8 +1436,8 @@ function engineArgs(opts: RunOpts): string[] {
 
 // The engine's environment. PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from
 // crashing the engine during first-run TRT builds. The TRT cache deliberately gets NO override
-// here: GUI and CLI runs share the one in-app cache next to the engine
-// (engine/trt_cache_safe_to_delete); a separate AppData cache would split them, so GUI renders
+// here: GUI and CLI runs share the one in-app cache in the app's top folder
+// (model_cache_safe_to_delete); a separate AppData cache would split them, so GUI renders
 // would rebuild engines the CLI cache already has. SMV_LIVE_PREVIEW makes the render drop a small PNG
 // of the frame being written about once a second; the renderer polls it for the live progress
 // thumbnail.
@@ -1638,7 +1613,7 @@ ipcMain.on('render-complete', (_e, body: string) => {
 });
 
 // Before/after preview: render ONE source frame at the current spatial settings (RTX HDR when opts.hdr,
-// FSR/CAS sharpen when opts.sharpen > 0; no interpolation, no encode) and hand back the two PNG paths
+// Adaptive Sharpen when opts.sharpen > 0; no interpolation, no encode) and hand back the two PNG paths
 // for the renderer's side-by-side pane. render/preview.js (the render's decode and
 // the native host's pass chain, no python) writes <prefix>_original.png and _processed.png; a
 // fixed prefix is reused each call (the renderer cache-busts its img src) so previews never pile up.
@@ -1661,7 +1636,6 @@ ipcMain.handle(
       rtxvsr?: boolean;
       restore?: boolean;
       dlssmode?: string; // the DLSS mode (dlssScaleArg)
-      dlsscustom?: number; // Custom: the working size in % of the output
       dlssnr?: boolean;
       nrstructure?: number;
       nrtone?: number;
@@ -1681,7 +1655,7 @@ ipcMain.handle(
       const args = [PREVIEW_CLI, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
       if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
       if (opts.restore) args.push('--restore');
-      const pScale = dlssScaleArg(opts.dlssmode, opts.dlsscustom);
+      const pScale = dlssScaleArg(opts.dlssmode);
       if (pScale) args.push('--scale', pScale);
       if (opts.dlssnr)
         args.push(

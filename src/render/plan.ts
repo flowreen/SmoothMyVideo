@@ -84,18 +84,44 @@ export interface WorkPlan {
   note: string;
 }
 
+/** DLSS 5's GPU work never completes on a 64 px wide frame (the GPU resets; 102 and 128 px wide run, and so does a
+ * 64 px high one): with DLSS 5 on, a working size below the output is at least this wide (the host's kNrMinWorkW, the
+ * same rule live). */
+export const NR_MIN_WORK_W = 128;
+
 /** The pass sizes for a w x h source: the output (the --upscale factor, clamped), the working size =
- * the DLSS mode (--scale) x the output (even, at least 64, at most WORK_MAX_PX keeping the aspect),
+ * the DLSS mode (--scale) x the output (even, at most WORK_MAX_PX keeping the aspect; the share raised, aspect kept,
+ * until the shorter side is 64 px and, with DLSS 5 (nr), the width NR_MIN_WORK_W),
  * and the decode (a working size below the source folds the downscale into the decode, linear-light
  * Lanczos3). A string = why --scale is refused. */
-export function workPlan(st: Stream, w: number, h: number, upscaleF: number, scale: string | null): WorkPlan | string {
+export function workPlan(
+  st: Stream,
+  w: number,
+  h: number,
+  upscaleF: number,
+  scale: string | null,
+  nr = false,
+): WorkPlan | string {
   const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0);
   const wf = workFactor(scale, ow, oh);
   if (!wf)
     return `--scale takes a DLSS mode (auto, dlaa, quality, balanced, performance, ultra) or a number in (0, 1], not '${scale}'`;
   // DLAA is the output itself (an odd source width stays odd, no 1-px fold)
-  let ww = wf.factor === 1 ? ow : Math.min(ow, Math.max(64, pyRound(ow * wf.factor) & ~1));
-  let wh = wf.factor === 1 ? oh : Math.min(oh, Math.max(64, pyRound(oh * wf.factor) & ~1));
+  let ww = ow;
+  let wh = oh;
+  let raised = '';
+  if (wf.factor !== 1) {
+    const fFloor = Math.max(64 / ow, 64 / oh);
+    const fNr = nr ? NR_MIN_WORK_W / ow : 0;
+    const k = Math.max(wf.factor, fFloor, fNr);
+    if (k > wf.factor)
+      raised =
+        fNr >= fFloor
+          ? `, raised to DLSS 5's minimum width, ${NR_MIN_WORK_W} px, aspect kept`
+          : ', raised to the 64 px floor, aspect kept';
+    ww = Math.min(ow, Math.max(nr ? NR_MIN_WORK_W : 64, pyRound(ow * k) & ~1));
+    wh = Math.min(oh, Math.max(64, pyRound(oh * k) & ~1));
+  }
   let capped = false;
   if (ww * wh > WORK_MAX_PX) {
     const k = Math.sqrt(WORK_MAX_PX / (ww * wh));
@@ -110,7 +136,7 @@ export function workPlan(st: Stream, w: number, h: number, upscaleF: number, sca
     [dw, dh] = [ww, wh];
   }
   const note =
-    `DLSS mode ${wf.mode}: working size ${ww}x${wh} for the ${ow}x${oh} output (source ${w}x${h}` +
+    `DLSS mode ${wf.mode}: working size ${ww}x${wh}${raised} for the ${ow}x${oh} output (source ${w}x${h}` +
     (vf.length ? ', the downscale folded into the decode, linear-light Lanczos3' : '') +
     (capped ? "; capped at 3840x2160, the interpolation's reach" : '') +
     ')\n';
@@ -119,12 +145,18 @@ export function workPlan(st: Stream, w: number, h: number, upscaleF: number, sca
 
 /** Auto's candidates for its video memory fit, its own pick first: the plan of every DLSS mode from that pick down to
  * Ultra Performance (the render host prices them, --fit-work). */
-export function autoCandidates(st: Stream, w: number, h: number, upscaleF: number): { mode: string; plan: WorkPlan }[] {
+export function autoCandidates(
+  st: Stream,
+  w: number,
+  h: number,
+  upscaleF: number,
+  nr = false,
+): { mode: string; plan: WorkPlan }[] {
   const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0);
   const order = Object.keys(DLSS_MODES);
   const out: { mode: string; plan: WorkPlan }[] = [];
   for (const m of order.slice(order.indexOf(autoMode(ow, oh)))) {
-    const p = workPlan(st, w, h, upscaleF, m);
+    const p = workPlan(st, w, h, upscaleF, m, nr);
     if (typeof p !== 'string') out.push({ mode: m, plan: p });
   }
   return out;

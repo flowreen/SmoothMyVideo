@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
+import { engineCacheDir } from './cache';
 import { dvExport, hpExport } from './dvhp';
 import {
   chooseEncoder,
@@ -164,15 +165,16 @@ export function autoFit(o: {
   h: number;
   upscaleF: number;
   scale: string | null;
+  nr: boolean; // DLSS 5 on: its minimum width (workPlan)
   hostArgs: string[] | null; // the model and the passes the host prices
   ns: ArgNs;
   resumeJson: string | null; // null = no resume
   env: NodeJS.ProcessEnv;
   say: Say;
 }): { plan: WorkPlan; sigNs: ArgNs } | string {
-  const base = workPlan(o.st, o.w, o.h, o.upscaleF, o.scale);
+  const base = workPlan(o.st, o.w, o.h, o.upscaleF, o.scale, o.nr);
   if (typeof base === 'string') return base;
-  const cands = autoCandidates(o.st, o.w, o.h, o.upscaleF);
+  const cands = autoCandidates(o.st, o.w, o.h, o.upscaleF, o.nr);
   if (
     String(o.scale ?? '')
       .trim()
@@ -236,7 +238,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     multi: number;
   };
   const inp = path.win32.resolve(args.input);
-  const SHARPEN = clamp(args.sharpen, 0.0, 1.0);
+  const SHARPEN = clamp(args.sharpen, 0.0, 2.0);
   const NO_INTERP = args.no_interp,
     FRUC_MODE = args.fruc,
     DLSSG_MODE = args.dlssg;
@@ -360,6 +362,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     h: H,
     upscaleF: UPSCALE_F,
     scale: args.work_scale,
+    nr: !!args.dlssnr,
     hostArgs: fitArgs,
     ns,
     resumeJson: RESUMABLE ? P.resumeJson : null,
@@ -405,7 +408,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   }
   // the model lines render.py writes on this route
   if (NO_INTERP)
-    say('no-interp mode: GMFSS interpolation disabled (re-encode at source fps with optional FSR sharpen)\n');
+    say('no-interp mode: GMFSS interpolation disabled (re-encode at source fps with optional Adaptive Sharpen)\n');
   else if (FRUC_MODE) say('Using the NVIDIA Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n');
   else if (DLSSG_MODE) say('Using the DLSS Frame Generation backend for interpolation (DLSS 4.5)\n');
   else if (NVOF_MODE) say('Using the NVIDIA Optical Flow backend for interpolation (native host)\n');
@@ -576,7 +579,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const HDR_MKV_2STAGE = HDR_ACTIVE && OUT_IS_MKV;
   const sidecar = (k: number, t: number) => writeResumeSidecar(P.resumeJson, sig, k, t, venc, 0, 0);
   if (RESUMABLE) sidecar(R.skipSrc, totalUnits);
-  const sharpNote = SHARPEN > 0 ? `  sharpen(rcas)=${pyG(SHARPEN)}` : '';
+  const sharpNote = SHARPEN > 0 ? `  sharpen(adaptive)=${pyG(SHARPEN)}` : '';
   const upNote = UPSCALE ? `  upscale=${pyG(UPSCALE_F)}x->${OUT_W}x${OUT_H}` : '';
   const hdrNote = HDR_ACTIVE ? '  HDR10(TrueHDR,BT.2020 PQ)' : '';
   const nrNote = nr ? `  dlss5(structure ${pyG(nr.structure)}, tone ${pyG(nr.tone)})` : '';
@@ -586,7 +589,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   );
 
   // the host's flags
-  const cacheDir = env.SMV_TRT_CACHE || path.join(ENGINE, 'trt_cache_safe_to_delete');
+  const cacheDir = engineCacheDir(ENGINE, env);
   fs.mkdirSync(cacheDir, { recursive: true });
   const nargs = [
     '--w',
@@ -853,7 +856,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const outFrames = nout ? nout : null;
   if (outFrames !== null) say(`OUTFRAMES ${outFrames}\n`);
   if (NO_INTERP) {
-    say(`done ${nout} frames (${SHARPEN > 0 ? 'RCAS-sharpened' : 're-encoded'}, native host) -> ${outPath}\n`);
+    say(`done ${nout} frames (${SHARPEN > 0 ? 'sharpened' : 're-encoded'}, native host) -> ${outPath}\n`);
   } else {
     const npairs = nout && !FPS_MODE ? Math.floor((nout - 1) / Math.trunc(args.multi)) : Math.max(0, (NB || 0) - 1);
     say(`done ${npairs} pairs (native host) -> ${outPath}\n`);

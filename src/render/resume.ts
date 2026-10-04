@@ -57,7 +57,7 @@ const OPTS: Record<string, Spec> = {
   // working size's share of the output (plan.ts workPlan checks it)
   '--scale': { dest: 'work_scale', kind: 'str', def: null },
   '--fps': { dest: 'fps', kind: 'float', def: null },
-  '--sharpen': { dest: 'sharpen', kind: 'float', def: 0.0, nargsOpt: 0.8 },
+  '--sharpen': { dest: 'sharpen', kind: 'float', def: 0.0, nargsOpt: 1.0 },
   '--no-interp': { dest: 'no_interp', kind: 'bool', def: false },
   '--upscale': { dest: 'upscale', kind: 'float', def: 1.0, nargsOpt: 1.5 },
   '--rtx-vsr': { dest: 'rtx_vsr', kind: 'bool', def: false },

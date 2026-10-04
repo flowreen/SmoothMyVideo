@@ -18,8 +18,33 @@ third-party work.
 * **Real-ESRGAN** `realesr-animevideov3` architecture and weights (the `--restore` pass),
   vendored in `engine/realesr.py` / `engine/realesr-animevideov3.pth`. BSD 3-Clause License,
   Copyright (c) 2021 Xintao Wang.
-* **AMD FidelityFX RCAS** (the sharpen pass), reimplemented in `engine/rcas.py` from AMD's
-  FidelityFX-FSR reference. MIT License, Copyright (c) 2021 Advanced Micro Devices, Inc.
+* **Adaptive Sharpen** (the Sharpen pass): bacondither's DX11 two-pass HQ version (2021-09-10, from
+  github.com/bacondither/Miscellaneous-shaders), ported to CUDA in the native host
+  (`engine/live/build_src/smv-live-native.inl`, `k_sharpPlanar` / `k_sharpThdrIn`). BSD 2-Clause License:
+
+  > Copyright (c) 2015-2021, bacondither
+  > All rights reserved.
+  >
+  > Redistribution and use in source and binary forms, with or without
+  > modification, are permitted provided that the following conditions
+  > are met:
+  > 1. Redistributions of source code must retain the above copyright
+  >    notice, this list of conditions and the following disclaimer
+  >    in this position and unchanged.
+  > 2. Redistributions in binary form must reproduce the above copyright
+  >    notice, this list of conditions and the following disclaimer in the
+  >    documentation and/or other materials provided with the distribution.
+  >
+  > THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS OR
+  > IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+  > OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+  > IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+  > INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+  > NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  > DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  > THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  > (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+  > THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 * **NVIDIA RTX Video SDK sample code**: the compiled bridge `engine/rtxvideo/rtxvideo_cuda.dll`
   is built from NVIDIA's SDK convenience layer (sources in `engine/rtxvideo/build_src/`),
   used under the NVIDIA RTX Video SDK license. The SDK's AI feature models (`nvngx_vsr.dll`,

@@ -1,9 +1,13 @@
 """Export the size-free ONNX of every live graph into engine/onnx (trt_lookup.onnx_path), so an
 engine at a new window size is a build from that file instead of a torch export. Run by
-scripts/export-onnx.js (npm setup and dist); every file already present is skipped, so a rerun is
-cheap. Graphs: the RIFE IFNet (live `_bd8` and the
+scripts/export-onnx.js (npm setup and dist). While the export stamp (trt_lookup.export_stamp: the
+sources, the exporter packages, the weights) matches the one in weights_tags.txt, every file
+already present is skipped, so a rerun is cheap; a changed stamp removes the folder's graphs and
+exports every one again. Graphs: the RIFE IFNet (live `_bd8` and the
 unbatched class) and its encode, plain and as the flow-warp class at k 1 (Frame Blend), 2 and 4,
-DRBA's block0, Restore, and the five GMFSS nets. The host builds the offline fixed-batch RIFE
+DRBA's block0, Restore, and the GMFSS nets (gmflow_bidir as its backbone and two halves, trt_runtime.gmflow_split +
+gmflow_backbone_cut). The host
+builds the offline fixed-batch RIFE
 classes (`_b{B}`) from `_bd8`. Then ship_tidy() and write_tags().
 Usage: runtime python engine/onnx_export.py"""
 import os
@@ -26,6 +30,11 @@ PH, PW = 576, 960   # any /64 size inside the symbolic range works as the exampl
 
 def main():
     t0 = time.time()
+    stamp = trt_lookup.export_stamp()
+    have = read_tag("export")
+    if have != stamp:
+        clear_graphs()
+        print(f"export stamp {have or 'none'} -> {stamp}: exporting every graph", flush=True)
     torch.cuda.set_stream(torch.cuda.Stream())
     g = torch.Generator(device="cuda").manual_seed(0)
     a = torch.rand((1, 3, PH, PW), device="cuda", generator=g)
@@ -86,7 +95,14 @@ def main():
     for hk in hooks:
         hk.remove()
     ensure(tr.FeatEngine(), gm.feat_ext, rec["feat_ext"][:1])
-    ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
+    # the host runs gmflow_bidir as its backbone (one frame a call) and two halves around its own local correlation:
+    # the whole graph is exported only to be cut (ship_tidy then removes it), and parts already present skip all of it
+    parts = [trt_lookup.onnx_path(k) for k in ("gmflow_backbone", "gmflow_bidir_a", "gmflow_bidir_b")]
+    if not all(os.path.isfile(p) for p in parts):
+        ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
+        a_path, _ = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()))
+        tr.gmflow_backbone_cut(a_path)
+    done.extend(os.path.basename(p) for p in parts)
     ensure(tr.MetricEngine(), gm.metricnet, rec["metricnet"][:4])
     xi, tsv = rec["ifnet"][0], rec["ifnet"][1]
     ensure(tr.IFNetEngine(), tr._IFNetExport(gm.ifnet, [8, 4, 2, 1]),
@@ -95,7 +111,37 @@ def main():
     print(f"size-free ONNX ready in {trt_lookup.ONNX_DIR}: {len(done)} graphs, "
           f"{time.time() - t0:.0f} s", flush=True)
     ship_tidy(done)
-    write_tags()
+    write_tags(stamp)
+
+
+def tags_path():
+    return os.path.join(trt_lookup.ONNX_DIR, "weights_tags.txt")
+
+
+def read_tag(key):
+    """One `key value` line of weights_tags.txt, or None."""
+    try:
+        with open(tags_path(), encoding="ascii") as fh:
+            for line in fh:
+                k, _, v = line.strip().partition(" ")
+                if k == key:
+                    return v
+    except OSError:
+        pass
+    return None
+
+
+def clear_graphs():
+    """Before a full export: the tags file first (a run that dies midway leaves no stamp, so the next
+    run starts over), then every graph and weight file of the folder."""
+    d = trt_lookup.ONNX_DIR
+    if not os.path.isdir(d):
+        return
+    if os.path.isfile(tags_path()):
+        os.remove(tags_path())
+    for f in sorted(os.listdir(d)):
+        if f.endswith((".onnx", ".data")):
+            os.remove(os.path.join(d, f))
 
 
 def ship_tidy(done):
@@ -178,15 +224,15 @@ def ship_tidy(done):
     print(f"ONNX folder {total / 1e6:.0f} MB ({saved / 1e6:.0f} MB of duplicates removed)", flush=True)
 
 
-def write_tags():
+def write_tags(stamp):
     """weights_tags.txt: the weight tags every engine name carries, for a shipped tree without the
     weight files (the dist leaves the .pkl / .pth out; the ONNX carry the weights).
     The host hashes the weight files when they exist (a dev tree) and reads this file otherwise.
-    `x` = trt_lookup.ONNX_REV (the host ignores it): the file is half of the engine cache stamp,
-    so a graph revision empties the cache once (src/render/cache.ts)."""
-    p = os.path.join(trt_lookup.ONNX_DIR, "weights_tags.txt")
+    `export` = the export stamp these graphs were made under (the host ignores it): the file is half
+    of the engine cache stamp, so a new export empties the cache once (src/render/cache.ts)."""
+    p = tags_path()
     txt = (f"w {trt_lookup.weights_tag()}\nr {trt_lookup.rife_weights_tag()}\n"
-           f"rest {realesr.weights_hash()}\nx {trt_lookup.ONNX_REV}\n")
+           f"rest {realesr.weights_hash()}\nexport {stamp}\n")
     with open(p + ".tmp", "w", encoding="ascii", newline="\n") as fh:
         fh.write(txt)
     os.replace(p + ".tmp", p)

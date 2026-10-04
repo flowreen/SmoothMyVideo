@@ -16,8 +16,9 @@ import os
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The folder NAME is the documentation: everything in it is a rebuildable compilation cache (the
 # app empties it only when the engine stamp changes, src/render/cache.ts), and the user reclaims the
-# disk by deleting the folder whenever they want. It lives inside the app's own folders, never under AppData.
-CACHE_DIR = os.environ.get("SMV_TRT_CACHE") or os.path.join(HERE, "trt_cache_safe_to_delete")
+# disk by deleting the folder whenever they want. It lives in the app's top folder (the repo root here,
+# src/render/cache.ts), never under AppData.
+CACHE_DIR = os.environ.get("SMV_TRT_CACHE") or os.path.join(os.path.dirname(HERE), "model_cache_safe_to_delete")
 
 _tags = {}
 
@@ -87,21 +88,48 @@ def engine_name(name, shapes, input_names=None, dyn_batch=None):
 
 
 # Size-free ONNX graphs: one file per live graph with every H /
-# W symbolic, generated from the committed weights by scripts/export-onnx.js (npm setup and dist)
-# and on the first miss, gitignored, shipped in the release zip. An engine at a new size is then a
-# build from this file (about 1 s) instead of a torch export (20 to 40 s). ONNX_REV is bumped when
-# an export path changes the graph, so a stale file is never built from; weights_tags.txt carries
-# it too (`x <rev>`), and a changed tags file makes the app / CLI empty the engine cache once
-# (src/render/cache.ts), so no engine built from an older graph is reused. MUST equal the host's
-# kOnnxRev. The graph passes the current revision applies are the trt_runtime functions the export calls.
+# W symbolic, generated from the committed weights by scripts/export-onnx.js (npm setup and dist),
+# gitignored, shipped in the release archive. An engine at a new size is then a build from this file
+# (about 1 s) instead of a torch export (20 to 40 s). export_stamp() fingerprints everything an export
+# reads: when it changes, onnx_export.py exports every graph again and writes the new stamp into
+# weights_tags.txt, and a changed tags file makes the app / CLI empty the engine cache once
+# (src/render/cache.ts), so no engine built from an older graph is reused.
 ONNX_DIR = os.environ.get("SMV_ONNX_DIR") or os.path.join(HERE, "onnx")
-ONNX_REV = 13
+# the packages that write or rewrite the graphs (the dynamo exporter runs on onnxscript and onnx-ir)
+EXPORT_PACKAGES = ("torch", "onnx", "onnxscript", "onnx-ir")
 
 
 def onnx_path(key):
     """The size-free ONNX of a graph: key = the engine's base name (plus the export tag of a class
-    whose baked arguments are not in that name), then the weights and export revision tags."""
-    return os.path.join(ONNX_DIR, f"{key}_{weights_tag()}_x{ONNX_REV}.onnx")
+    whose baked arguments are not in that name), then the weights tag."""
+    return os.path.join(ONNX_DIR, f"{key}_{weights_tag()}.onnx")
+
+
+def export_stamp():
+    """Fingerprint of everything a size-free export reads: the export and model sources (engine's own
+    .py files, engine/rife, engine/GMFSS_Fortuna; CRLF read as LF, so a checkout's line endings do not
+    count), the versions of EXPORT_PACKAGES and the weight files. Any change means every graph is
+    exported again (onnx_export.py). Reads no torch, so it costs well under a second."""
+    from importlib import metadata
+
+    files = [n for n in os.listdir(HERE) if n.endswith(".py")]
+    for sub in ("rife", "GMFSS_Fortuna"):
+        for root, dirs, names in os.walk(os.path.join(HERE, sub)):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            files += [os.path.relpath(os.path.join(root, n), HERE) for n in names if n.endswith(".py")]
+    h = hashlib.md5()
+    for rel in sorted(f.replace("\\", "/") for f in files):
+        with open(os.path.join(HERE, rel), "rb") as f:
+            h.update(rel.encode() + b"\0" + f.read().replace(b"\r\n", b"\n") + b"\0")
+    for pkg in EXPORT_PACKAGES:
+        try:
+            v = metadata.version(pkg)
+        except metadata.PackageNotFoundError:
+            v = "-"
+        h.update(f"{pkg} {v}\n".encode())
+    rest = _md5_files([os.path.join(HERE, "realesr-animevideov3.pth")])
+    h.update(f"{weights_tag()} {rife_weights_tag()} {rest}\n".encode())
+    return "e" + h.hexdigest()[:10]
 
 
 def rife_scale_tag(flow_scale):

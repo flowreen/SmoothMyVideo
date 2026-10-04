@@ -6,7 +6,9 @@
 // weights), shipped in the release instead of the weight files: the native host builds every
 // engine from these files (about 1 s per new size) and names them from weights_tags.txt.
 //
-// Behaviour: every file already present is skipped by the python side, so a rerun is cheap. setup
+// Behaviour: while the export stamp (the sources, the exporter packages, the weights) is unchanged,
+// every file already present is skipped by the python side, so a rerun is cheap; a changed stamp
+// exports every graph again, so run it after any change under engine (no number to bump). setup
 // is NON-FATAL (a fresh clone may not have engine/runtime yet; renders need the files, so run it
 // once the dev python is in). `--required` (dist) fails the build instead, so a release never ships
 // without the files.

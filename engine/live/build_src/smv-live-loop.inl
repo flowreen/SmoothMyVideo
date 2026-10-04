@@ -1790,7 +1790,44 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         double lastPresSched = 0; // previous present's SCHEDULED time (the floor chain anchor)
         double hitchPrev = 0;     // hitch trace (SMV_LIVE_HITCH=1, see the present queue)
         const bool hitchOn = GetEnvironmentVariableW(L"SMV_LIVE_HITCH", nullptr, 0) != 0;
-        int64_t smoothTs = 0; // EMA-smoothed pair clock (see sendPairStream)
+        int64_t smoothTs = 0;           // EMA-smoothed pair clock (see sendPairStream)
+        int64_t prevPaceTs = 0;         // the previous frame's place on that clock
+        std::vector<double> sendGridMs; // each slot of the last sent group on that clock (ms), its present time - delay
+        // the whole multiple M an adaptive target runs as M's ladder (0 = the grid). On the grid nearly every output
+        // frame is a tween, so r times the source's rate costs ~r model calls a pair; M's ladder costs M - 1 and shows
+        // the real frame as it is. So with r = the throttle's target over the source's rate (the tweens it affords a
+        // pair, or the user's target), M = ceil(0.97 r) gives more frames for no more work whenever it stays inside
+        // the user's target and the slot ceiling; the grid is left only to a target between two multiples that
+        // binds. A lock holds while its M - 1 tweens fit and r < M + 0.5. The rate is a slow average of the pair
+        // clock's period (emaDt swings ~ +-2 % with WGC's delivery quantization). SMV_LIVE_GRID_LOCK=0 = the grid
+        // at every target.
+        wchar_t glv[8]{};
+        const bool gridLock = !(GetEnvironmentVariableW(L"SMV_LIVE_GRID_LOCK", glv, 8) && glv[0] == L'0');
+        uint32_t lockLogged = 0;
+        double lockDtMs = 0;
+        auto lockedMultiple = [&](double target) -> uint32_t {
+            lockDtMs = lockDtMs > 0 ? lockDtMs + (emaDt - lockDtMs) / 64.0 : emaDt;
+            const double r = target * lockDtMs / 1000.0;
+            const double userCap = adaptTarget * lockDtMs / 1000.0;
+            const double ceiling = srv.shmSlots ? srv.shmSlots : genFrames + 1;
+            auto fits = [&](uint32_t m) { return m >= 2 && m <= ceiling && m <= userCap * 1.03 && m - 1 <= r * 1.03; };
+            // FRUC's midpoint tree computes exact phases only at its nodes k / 2^L (L <= frMpCap): any other ladder
+            // or grid phase snaps to the nearest node and costs the whole tree (3 calls a pair at depth 2), so a
+            // tween's cost and the throttle's answer swing with the mode. Its ladders are the powers of two up to
+            // 2^frMpCap, the largest that fits; a step up needs 3 % headroom.
+            if (srv.nr && srv.nr->fruc && srv.nr->frMp)
+            {
+                uint32_t best = 0;
+                for (uint32_t m = 2; m <= (1u << srv.nr->frMpCap); m *= 2)
+                    if (fits(m) && (m <= lockLogged || m - 1 <= r * 0.97))
+                        best = m;
+                return gridLock ? best : 0;
+            }
+            if (lockLogged && fits(lockLogged) && r < lockLogged + 0.5)
+                return lockLogged;
+            const uint32_t m = (uint32_t)ceil(r * 0.97);
+            return gridLock && fits(m) ? m : 0;
+        };
         // one streaming pair handoff: bump seq, publish the frame (fence or shm copy), build
         // the fraction list, write the message. Returns nfr, or UINT32_MAX on a write failure.
         // fraction message: one f32 per slot the server was actually sized for (shmSlots),
@@ -1803,10 +1840,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // and degrades to the ladder, skipping its grid share and capping output at
             // ~330 of a 360 target (measured). The grid marches on an EMA clock
             // instead (the source's true cadence is uniform); the /8 pull bounds drift and
-            // a 1.5-step error snaps on real cadence changes (drops, seeks, pauses).
-            if (adaptTarget > 0 && emaDt > 0)
+            // a 1.5-step error snaps on real cadence changes (drops, seeks, pauses). The same
+            // clock paces the presents in every mode (sendGridMs).
+            const int64_t step100 = (int64_t)(emaDt * 10000.0);
+            int64_t paceTs = sentTs;
+            if (emaDt > 0)
             {
-                const int64_t step100 = (int64_t)(emaDt * 10000.0);
                 if (!smoothTs || llabs(sentTs - (smoothTs + step100)) > step100 * 3 / 2)
                     smoothTs = sentTs;
                 else
@@ -1814,7 +1853,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     smoothTs += step100;
                     smoothTs += (sentTs - smoothTs) / 8;
                 }
-                sentTs = smoothTs;
+                paceTs = smoothTs;
+                if (adaptTarget > 0)
+                    sentTs = smoothTs;
             }
             ++shmSeq;
             cap.signalFence(shmSeq);
@@ -1843,8 +1884,29 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 fr[nfr++] = 1.0f;
                 nextGrid = 0;
             }
+            else if (const uint32_t m = adaptTarget > 0 && emaDt > 0 ? lockedMultiple(effTarget) : 0)
+            {
+                // M's ladder (k / M + the real frame as it is, see lockedMultiple); on FRUC's midpoint tree M is a
+                // power of two, so every k / M is an exact node
+                if (m != lockLogged)
+                {
+                    LOG("present grid: locked to x%u (target %.1f, source %.3f fps)\n", m, effTarget,
+                        1000.0 / lockDtMs);
+                    lockLogged = m;
+                }
+                for (uint32_t k = 1; k < m; k++)
+                    fr[nfr++] = (float)k / (float)m;
+                fr[nfr++] = 1.0f;
+                tmInPair += m;
+                nextGrid = 0;
+            }
             else if (adaptTarget > 0)
             {
+                if (lockLogged)
+                {
+                    LOG("present grid: unlocked (target %.1f, source %.3f fps)\n", effTarget, 1000.0 / lockDtMs);
+                    lockLogged = 0;
+                }
                 const int64_t span = sentTs - prevSentTs;
                 if (!nextGrid)
                     nextGrid = prevSentTs + (int64_t)gridStep;
@@ -1878,6 +1940,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     fr[nfr++] = (float)k / (float)(genFrames + 1);
                 fr[nfr++] = 1.0f; // the real frame, bit-exact passthrough
             }
+            // each slot's place on the pacing clock: its fraction of the pair (on the adaptive route
+            // exactly its grid point); a span the clock just snapped over falls back to the source's period
+            const int64_t paceSpan =
+                prevPaceTs > 0 && paceTs > prevPaceTs && (step100 <= 0 || paceTs - prevPaceTs < 3 * step100)
+                    ? paceTs - prevPaceTs
+                    : step100;
+            sendGridMs.resize(nfr);
+            for (uint32_t k = 0; k < nfr; ++k)
+                sendGridMs[k] = ((double)paceTs - (1.0 - (double)fr[k]) * (double)paceSpan) / 10000.0;
+            prevPaceTs = paceTs;
             memcpy(msg, &nfr, 4);
             if (!srv.writeFull(msg, 4 + 4 * nfr))
                 return UINT32_MAX;
@@ -1966,8 +2038,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 double arrMs, spanMs;
                 int64_t sentTs;
                 ULONGLONG sentTick;
-                bool opened; // first slot token or end marker came back
-                bool capRel; // the server released the shared capture texture
+                bool opened;                // first slot token or end marker came back
+                bool capRel;                // the server released the shared capture texture
+                std::vector<double> gridMs; // each slot's place on the pacing clock (sendGridMs)
             };
             struct XqSlot
             {
@@ -1986,6 +2059,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             std::atomic<bool> rDead{false};
             HANDLE tokEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             const double kXqDropRate = 3.0; // drops/s tolerated before the budget shrinks
+            // GRID PACING: a slot is presented at its own place on the pacing clock plus ONE delay for the
+            // whole stream, the time the slots take to come back (raised at once when a slot would be late,
+            // lowered by kXqDelayDecay of the slot interval a slot: each gap 0.5 % short, ~5 ms a second at
+            // any rate), capped below two source periods so a half is always free again before its next
+            // group (GATE A). SMV_LIVE_GRID_PACE=0 = the old targets: the slots spread at (idx + 1) /
+            // (nfr + 1) of the period after the drain, a late one at once.
+            wchar_t gpv[8]{};
+            const bool gridPace = !(GetEnvironmentVariableW(L"SMV_LIVE_GRID_PACE", gpv, 8) && gpv[0] == L'0');
+            const double kXqReadyMarginMs = 1.0, kXqDelayDecay = 0.005;
+            double xqDelay = 0;
             uint64_t halfDefer = 0, gateCDefer = 0, halfPend = 0;
             // Phase instrumentation (SMV_LIVE_XQPHASE=1, off by default). Per-iteration
             // QPC accumulators for every named phase of this loop, printed on the 2s tick as
@@ -2288,8 +2371,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         rc2 = 1;
                         break;
                     }
-                    XqSlot s{g.set,   idx,      g.nfr, g.seq, g.arrMs + g.spanMs * (idx + 1) / (g.expect + 1),
-                             g.arrMs, g.sentTs, false};
+                    double due = g.arrMs + g.spanMs * (idx + 1) / (g.expect + 1);
+                    if (gridPace && idx < g.gridMs.size())
+                    {
+                        const double need = nowMs() - g.gridMs[idx] + kXqReadyMarginMs;
+                        const double delayCap = 1.75 * (emaDt > 0 ? emaDt : g.spanMs);
+                        const double decay = kXqDelayDecay * 1000.0 / (effTarget > 0 ? effTarget : 60.0);
+                        xqDelay = need > xqDelay ? (std::min)(need, delayCap) : (std::max)(need, xqDelay - decay);
+                        due = g.gridMs[idx] + xqDelay;
+                    }
+                    XqSlot s{g.set, idx, g.nfr, g.seq, due, g.arrMs, g.sentTs, false};
                     if (last)
                     {
                         s.lastOfGroup = true;
@@ -2356,9 +2447,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     {
                         if (hitchPrev > 0 && pNow - hitchPrev > 8.0)
                             LOG("[hitch] gap %.1fms | slot %u/%u | sinceArr %.1f | "
-                                "late %.2f | slotWait %.1f | arrGap %.1f | ema %.1f | eff %.0f\n",
+                                "late %.2f | slotWait %.1f | arrGap %.1f | ema %.1f | eff %.0f | delay %.1f\n",
                                 pNow - hitchPrev, s.idx + 1, s.nfr, pNow - s.arrMs, pNow - dueMs, 0.0,
-                                s.arrMs - hitchArrPrev, emaDt, effTarget);
+                                s.arrMs - hitchArrPrev, emaDt, effTarget, xqDelay);
                         hitchPrev = pNow;
                     }
                     const bool wasLast = s.lastOfGroup;
@@ -2505,7 +2596,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             if (pend.empty())
                                 InterlockedExchange64(&srv.ioSince, (LONGLONG)sendTick);
                             pend.push_back(XqGroup{shmSeq, (uint32_t)(shmSeq % 2), nfr ? nfr : 1, nfr, arrMs, emaDt,
-                                                   sentTs, sendTick, false, false});
+                                                   sentTs, sendTick, false, false, sendGridMs});
                             hitchArrPrev = arrMs;
                             lastNfr = nfr ? nfr : 1;
                             if (tmOn)

@@ -70,12 +70,39 @@ def _roll_hw(x, sh, sw, left):
     return x
 
 
+def _window_layout():
+    """export path (SMV): a transformer keeps its tokens in window order from its first block to its last (every op
+    but the attention works per token, and a block's self and cross attention share one shift), so an attention is a
+    reshape instead of a partition, a merge and rolls; eager keeps the original layout"""
+    return torch.compiler.is_compiling()
+
+
+def _to_windows(x, h, w, k):
+    """[B, H*W, C] in raster order -> the same tokens in split_feature's order (K x K windows, each H/K x W/K)"""
+    b, _, c = x.shape
+    return split_feature(x.view(b, h, w, c), num_splits=k, channel_last=True).reshape(b, h * w, c)
+
+
+def _from_windows(x, h, w, k):
+    """the inverse of _to_windows"""
+    b, _, c = x.shape
+    return merge_splits(x.reshape(b * k * k, h // k, w // k, c), num_splits=k, channel_last=True).reshape(b, h * w, c)
+
+
+def _shift_windows(x, h, w, k, into):
+    """window-ordered tokens -> the shifted windows' order (into) or back: merge, roll by half a window, split"""
+    b, _, c = x.shape
+    t = _roll_hw(_from_windows(x, h, w, k).view(b, h, w, c), (h // k) // 2, (w // k) // 2, into)
+    return _to_windows(t.reshape(b, h * w, c), h, w, k)
+
+
 def single_head_split_window_attention(q, k, v,
                                        num_splits=1,
                                        with_shift=False,
                                        h=None,
                                        w=None,
                                        attn_mask=None,
+                                       windowed=False,
                                        ):
     # Ref: https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
     # q, k, v: [B, L, C]
@@ -91,11 +118,20 @@ def single_head_split_window_attention(q, k, v,
     window_size_h = h // num_splits
     window_size_w = w // num_splits
 
+    scale_factor = c ** 0.5
+
+    if windowed:
+        # the tokens already sit in the (shifted) windows' order (FeatureTransformer, _window_layout): each window's
+        # L tokens are contiguous, so [B, H*W, C] is [B*K*K, L, C] as it is
+        scores = torch.matmul(q.view(b_new, -1, c), k.view(b_new, -1, c).permute(0, 2, 1)) / scale_factor
+        if with_shift:
+            scores += attn_mask.repeat(b, 1, 1)
+        attn = torch.softmax(scores, dim=-1)
+        return torch.matmul(attn, v.view(b_new, -1, c)).view(b, -1, c)
+
     q = q.view(b, h, w, c)  # [B, H, W, C]
     k = k.view(b, h, w, c)
     v = v.view(b, h, w, c)
-
-    scale_factor = c ** 0.5
 
     if with_shift:
         assert attn_mask is not None  # compute once
@@ -176,6 +212,7 @@ class TransformerLayer(nn.Module):
                 width=None,
                 shifted_window_attn_mask=None,
                 attn_num_splits=None,
+                windowed=False,
                 **kwargs,
                 ):
         # source, target: [B, L, C]
@@ -198,6 +235,7 @@ class TransformerLayer(nn.Module):
                                                              h=height,
                                                              w=width,
                                                              attn_mask=shifted_window_attn_mask,
+                                                             windowed=windowed,
                                                              )
         else:
             message = single_head_full_attention(query, key, value)  # [B, L, C]
@@ -245,6 +283,7 @@ class TransformerBlock(nn.Module):
                 width=None,
                 shifted_window_attn_mask=None,
                 attn_num_splits=None,
+                windowed=False,
                 **kwargs,
                 ):
         # source, target: [B, L, C]
@@ -255,6 +294,7 @@ class TransformerBlock(nn.Module):
                                 width=width,
                                 shifted_window_attn_mask=shifted_window_attn_mask,
                                 attn_num_splits=attn_num_splits,
+                                windowed=windowed,
                                 )
 
         # cross attention and ffn
@@ -263,6 +303,7 @@ class TransformerBlock(nn.Module):
                                      width=width,
                                      shifted_window_attn_mask=shifted_window_attn_mask,
                                      attn_num_splits=attn_num_splits,
+                                     windowed=windowed,
                                      )
 
         return source
@@ -329,17 +370,33 @@ class FeatureTransformer(nn.Module):
         concat0 = torch.cat((feature0, feature1), dim=0)  # [2B, H*W, C]
         concat1 = torch.cat((feature1, feature0), dim=0)  # [2B, H*W, C]
 
+        win = self.attention_type == 'swin' and attn_num_splits > 1 and _window_layout()
+        if win:
+            # every block works on window-ordered tokens: the order changes once in, once out, and a shifted block's
+            # rolled windows once around the block (its self and cross attention share them)
+            concat0 = _to_windows(concat0, h, w, attn_num_splits)
+            concat1 = torch.cat(concat0.chunk(chunks=2, dim=0)[::-1], dim=0)
+
         for layer in self.layers:
+            shifted = win and layer.self_attn.with_shift
+            if shifted:
+                concat0 = _shift_windows(concat0, h, w, attn_num_splits, True)
+                concat1 = torch.cat(concat0.chunk(chunks=2, dim=0)[::-1], dim=0)
             concat0 = layer(concat0, concat1,
                             height=h,
                             width=w,
                             shifted_window_attn_mask=shifted_window_attn_mask,
                             attn_num_splits=attn_num_splits,
+                            windowed=win,
                             )
+            if shifted:
+                concat0 = _shift_windows(concat0, h, w, attn_num_splits, False)
 
             # update feature1
             concat1 = torch.cat(concat0.chunk(chunks=2, dim=0)[::-1], dim=0)
 
+        if win:
+            concat0 = _from_windows(concat0, h, w, attn_num_splits)
         feature0, feature1 = concat0.chunk(chunks=2, dim=0)  # [B, H*W, C]
 
         # reshape back

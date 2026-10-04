@@ -12,8 +12,8 @@
     "postinstall": "node scripts/dev-icon.js"
   },
   "devDependencies": {
-    "@types/node": "^26.6.2",
-    "electron": "^44.4.5",
+    "@types/node": "^26.6.4",
+    "electron": "^44.5.1",
     "electron-builder": "^26.15.3",
     "prettier": "^3.9.9",
     "pyright": "^1.1.414",
@@ -34,10 +34,6 @@
       "icon.png"
     ],
     "extraResources": [
-      {
-        "from": "samples/example.mp4",
-        "to": "samples/example.mp4"
-      },
       {
         "from": "engine",
         "to": "engine",

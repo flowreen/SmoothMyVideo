@@ -26,7 +26,6 @@ window.addEventListener('wheel', (e) => {
 }, { passive: false });
 const path = require('path');
 let info = null, input = null, lastOut = null, customOut = null, fpp = 1, totalGen = 1, procStart = 0, baseK = 0, cancelled = false;
-let isExample = false;   // the bundled first-page example clip is loaded (Smooth It! gated)
 let lastPreview = null;   // path of the latest pause-generated partial preview (PREVIEW_READY), or null
 let dlssPreempt = null;   // pct if DLSS-FG stopped on RTX Video preemption (a clean resumable stop), else null
 // Batch queue: inputs waiting after the current one. Filled by a multi-select pick or a multi-file
@@ -81,6 +80,7 @@ function setMode(m){
   // the numbered panels follow the processing order, NVIDIA's, the same in both modes
   applyOrder();
   if(dlssUiReady) syncDlssMode();
+  try { syncDlssgLock(); } catch {}   // before the model boxes exist (the first setMode) lvModelUi runs it later
 }
 // Switching mid-job would hide the running thing, so both buttons grey out while a live session
 // or a file render is going (called from lvUi and from the run start/end enable sweeps).
@@ -96,9 +96,8 @@ $('modelive').onclick = () => { setMode('live'); try { syncUpscale(); } catch {}
 setMode(uiMode);
 
 function log(t){ $('log').textContent += t; $('log').scrollTop = $('log').scrollHeight; }
-// Reveal the operational UI (controls, preview, progress, log). The bundled example clip shows it
-// from launch WITH the welcome/drop hint still visible; loading a real video (or an RTX install)
-// hides the welcome panel too.
+// Reveal the operational UI (controls, preview, progress, log). The first page shows it WITH the welcome/drop hint
+// still visible (keepWelcome); loading a video (or an RTX install) hides the welcome panel too.
 function showWorkspace(keepWelcome){
   if(!keepWelcome) $('welcome').style.display = 'none';
   $('workspace').style.display = '';
@@ -123,7 +122,7 @@ function fmtBytes(b){ return b >= 1e9 ? (b/1e9).toFixed(b >= 1e10 ? 0 : 1)+' GB'
 // the Speed controls. Ids are inlined rather than using MODEL_BOXES() so this stays callable before
 // that const is initialised.
 function interpOn(){
-  return ['modelgmfss','modelrife','modeldlss','modelfruc','modelnvof','modellsfg']
+  return ['modelgmfss','modelrife','modeldlss','modelfruc','modelnvof']
     .some(id => { const e = $(id); return !!e && e.checked; });
 }
 function srcFps(){ const [n,d]=(((info && info.fps) || '24/1')).split('/'); return (+n)/((+d)||1); }
@@ -193,7 +192,7 @@ function syncTargetUI(){
   // The round button: only for a resampled target, snaps it to the closest whole multiple of the
   // EXACT source rate (14.97x of 23.976 -> 15x = 359.64), so nobody types 3 decimals to get on-grid.
   const rn = roundMulti();
-  show('fpsround', m === 'fps' && on && !isExample && rn > 0);
+  show('fpsround', m === 'fps' && on && rn > 0);
   if(rn && $('fpsround')) $('fpsround').title = 'Round to ' + rn + '× of the source (' + roundFps(rn)
     + ' fps): the closest whole multiple, on-grid real frames';
 }
@@ -262,10 +261,8 @@ function refresh(){ if(!input) return;
     : Math.round(t) <= Math.round(srcFps()) ? 'no new frames'               // degenerate: output fps = source fps
     : 'resampled';                                                          // non-integer multiple: engine uses --fps
   // The hint carries the derived other side of the relationship: the implied ratio to the source.
-  // Hidden while the bundled example is loaded: its 30 fps would leak into the UI as "4x of 30"
-  // and read as the app's choice (the same coupling that hides the example's metadata rows).
   const derived = ratioText() + '× of ' + (+srcFps().toFixed(targetDecimals())) + ' fps';
-  $('ratehint').textContent = !interpOn() || isExample ? '' : derived + ' · ' + kind;
+  $('ratehint').textContent = !interpOn() ? '' : derived + ' · ' + kind;
   syncTargetUI();
   if(!fpsValid(t)){ $('out').value = ''; $('out').placeholder = 'target fps must be ' + sliderMin() + '-' + sliderMax(); lastOut = null; return; }
   $('out').placeholder = 'output file path';
@@ -309,13 +306,11 @@ async function checkResume(){
 $('out').oninput = () => { const v = $('out').value.trim(); customOut = v || null; lastOut = v || outName(); };
 $('out').onchange = () => { if(!$('out').value.trim()){ customOut = null; refresh(); } };
 
-async function loadVideo(f, asExample){
+async function loadVideo(f){
   if(!f) return false;
-  if(asExample && input) return false;   // a real video won the boot race; keep it
-  isExample = !!asExample;
   input = f; customOut = null;
-  $('path').textContent = asExample ? 'Example clip (Big Buck Bunny) - the settings below preview on it until you pick a video' : f;
-  if(!asExample) try { localStorage.setItem('dir', path.dirname(f)); } catch {}
+  $('path').textContent = f;
+  try { localStorage.setItem('dir', path.dirname(f)); } catch {}
   const p = await ipcRenderer.invoke('probe', f);
   // A modal alert would stall an unattended batch, so mid-batch probe failures go to the log.
   if(p.error){ if(batchAuto) log('>> Could not read '+f+': '+p.error+'\n'); else alert('Could not read video: '+p.error); return false; }
@@ -336,11 +331,8 @@ async function loadVideo(f, asExample){
   $('rtxhdr').disabled = info.srcHdr;
   $('rtxhdrhint').textContent = info.srcHdr ? '(source is already HDR, carried through as-is)'
                                             : '(convert SDR video to HDR)';
-  showWorkspace(asExample);   // the example keeps the welcome/drop hint on screen
-  // The bundled example autoloads to keep the settings surface + preview alive, but its probe
-  // data (1280x720 / 30fps / h264) is the sample's, not the user's - showing it reads as "a
-  // video is loaded". Hide the metadata rows while the example is up (same gate as #outrow).
-  $('info').style.display = asExample ? 'none' : 'block';
+  showWorkspace();
+  $('info').style.display = 'block';
   $('res').textContent = s.width+' x '+s.height;
   $('fps').textContent = srcFps().toFixed(decimalsOf(srcFps()));   // natural precision: 24 -> "24", 23.976 -> "23.976"
   $('fps').title = (info.fps ? info.fps + ' = ' : '') + (+srcFps().toFixed(6)) + ' fps (shown rounded)';   // reveal the exact rational, e.g. 24000/1001 = 23.976024
@@ -348,12 +340,10 @@ async function loadVideo(f, asExample){
   $('codec').textContent = (s.codec_name || '?')
     + (info.nAud > 1 || info.nSub ? '  ·  ' + info.nAud + ' audio · ' + info.nSub
        + ' subtitle' + (info.nSub === 1 ? '' : 's') + ' (kept' + (info.needMkv ? ', MKV output)' : ')') : '');
-  $('go').disabled = asExample; $('changeout').disabled = asExample; $('open').disabled = true; $('play').disabled = true;
-  $('outrow').style.display = asExample ? 'none' : '';   // no output path for the example
+  $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true; $('play').disabled = true;
+  $('outrow').style.display = '';
   $('live').style.display = 'none';   // stale live thumbnail belongs to the previous video
-  $('status').textContent = asExample
-    ? 'This is the bundled example. Select your own video, then click Smooth It!'
-    : 'Ready. Pick a target fps, then click Smooth It!';
+  $('status').textContent = 'Ready. Pick a target fps, then click Smooth It!';
   applyScreenFps();      // re-asserts the interp / screen-rate state and recomputes the output name
   syncUpscale();         // recompute the upscale target + output dims for this video's resolution
   // The preview cold-starts Python + torch + a CUDA context (several seconds on the first video of a
@@ -411,7 +401,7 @@ function restoreOn(){ return $('restore').checked; }
 localStorage.removeItem('restoreOn');
 
 // The pass order in both modes: on each source or captured frame Restore and the resize to the
-// working size (the DLSS mode), DLSS 5, FSR and RTX HDR (with the Dolby Vision and HDR10+ metadata of
+// working size (the DLSS mode), DLSS 5, Sharpen and RTX HDR (with the Dolby Vision and HDR10+ metadata of
 // a file render), then the interpolation (frame generation last), then the final resize to the output.
 // The numbered panels follow it.
 function applyOrder(){
@@ -422,7 +412,7 @@ function applyOrder(){
 localStorage.removeItem('nvorderOn');   // retired: the pass order is no longer a setting
 applyOrder();
 
-// "Match screen" is now one of the three Speed modes rather than an override checkbox, so there is
+// "Screen refresh rate" is one of the three Speed modes rather than an override checkbox, so there is
 // nothing to re-assert after a video loads: the mode and its value are the user's, independent of
 // the source. applyScreenFps is kept as the name every caller already uses (video load, run finish,
 // model change) and simply re-renders the Speed row.
@@ -478,11 +468,7 @@ function syncUpscale(){
   }
   $('upcustomnum').textContent = (+$('upcustom').value) + 'p';
   let txt = '';
-  if(uiMode === 'live'){
-    // Live has no loaded file: the height itself is the setting (the internal render size)
-    const th = upTargetH();
-    txt = th ? '→ rendered at ' + th + 'p first, then fitted to the window or screen' : '';
-  } else if($('upres').value !== '0'){
+  if($('upres').value !== '0'){   // Video only: Live's size is what Display presents
     const d = upDims();
     // Just the resulting dimensions plus encoder-relevant warnings; no resampler names (the
     // engine always picks the best resize).
@@ -497,61 +483,24 @@ function syncUpscale(){
   refresh();             // the target height is tagged into the output filename
 }
 
-// DLSS mode: the working size's share of the output (NVIDIA's DLSS modes; plan.ts workPlan holds
-// the same table: DLAA 1, Quality 1 / 1.5, Balanced 1 / 1.724, Performance 1 / 2, Ultra
-// Performance 1 / 3, Auto by the output's pixel count, Custom 1..100 %, at least 64 px a side).
-// Restore's output, DLSS 5 and the interpolation run at it; the final resize takes it to
-// the output. Persisted, DLAA (the output itself) by default. Live takes the share of what it presents
-// (the window, or the screen in Fill) and the host resolves Auto by that size.
+// DLSS mode, Live only (a file render runs every pass at its output size): Live's working size as NVIDIA's share of
+// what it presents (the window, or the screen in Fill), Restore, DLSS 5 and the smoothing run at it; the host applies
+// the floors (aspect kept, DLSS 5 >= 128 px wide). Persisted, DLAA by default.
 var dlssUiReady = false;   // var: setMode runs before this block and must skip the sync
-const DLSS_MODES = { dlaa: 1, quality: 1 / 1.5, balanced: 1 / 1.724, performance: 1 / 2, ultra: 1 / 3 };
-// the slider (always shown) holds the share in use in whole percent, as the option labels round it;
-// dragging it onto one of these picks that mode (its exact share), any other value is Custom
+// a mode's share in whole percent, as the option labels round it
 const DLSS_PCT = { dlaa: 100, quality: 67, balanced: 58, performance: 50, ultra: 33 };
-function dlssModeForPct(v){ return Object.keys(DLSS_PCT).find(k => DLSS_PCT[k] === v) || 'custom'; }
+// the slider's stops left to right (its value = the index), DLAA at the right end under the default mark
+const DLSS_STOPS = ['ultra', 'performance', 'balanced', 'quality', 'dlaa'];
 function dlssMode(){ return $('dlssmode').value; }
-function dlssCustom(){ return +$('dlsscustom').value; }
-function dlssAuto(w, h){ const px = w * h; return px < 1920 * 1080 ? 'dlaa' : px <= 2560 * 1440 ? 'quality' : px <= 3840 * 2160 ? 'performance' : 'ultra'; }
-// the share for a w x h output (w = 0: unknown, Auto counts as DLAA)
-function dlssFactor(w, h){
-  const m = dlssMode();
-  if(m === 'custom') return dlssCustom() / 100;
-  if(m === 'auto') return w ? DLSS_MODES[dlssAuto(w, h)] : 1;
-  return DLSS_MODES[m] || 1;
-}
-function outDims(){ return upDims() || (info && info.w && info.h ? { w: info.w, h: info.h } : null); }
-// the working size workPlan computes: even, at least 64, capped at 3840x2160 keeping the aspect
-function workDims(o){
-  const f = dlssFactor(o.w, o.h);
-  let w = f >= 1 ? o.w : Math.min(o.w, Math.max(64, Math.round(o.w * f) & ~1));
-  let h = f >= 1 ? o.h : Math.min(o.h, Math.max(64, Math.round(o.h * f) & ~1));
-  if(w * h > 3840 * 2160){ const k = Math.sqrt(3840 * 2160 / (w * h)); w = Math.floor(w * k) & ~1; h = Math.floor(h * k) & ~1; }
-  return { w, h };
-}
-// a resize enlarges somewhere (RTX VSR has work): an upscale, or a mode below the output size
-function dlssBelowOutput(){ const o = outDims(); return !!o && dlssFactor(o.w, o.h) < 1; }
 function syncDlssMode(){
-  const o = uiMode === 'video' ? outDims() : null;
-  // a named mode puts the slider on its share, Auto on its pick for a known output; Auto without one (live
-  // resolves it by the presented size at the start, or no file yet) dims the slider, Custom keeps its value
-  const pick = dlssMode() === 'auto' ? (o ? dlssAuto(o.w, o.h) : null) : dlssMode();
-  if(pick && pick !== 'custom') $('dlsscustom').value = DLSS_PCT[pick];
-  $('dlsscustomwrap').style.opacity = dlssMode() === 'auto' && !o ? '0.5' : '';
-  $('dlsscustomnum').textContent = dlssCustom() + '%';
-  let t;
-  if(o){
-    const d = workDims(o);
-    t = 'works at ' + d.w + ' × ' + d.h + (d.w === o.w && d.h === o.h ? ', the output size' : ' for the ' + o.w + ' × ' + o.h + ' output')
-        + (dlssMode() === 'auto' ? ' (Auto: ' + $('dlssmode').querySelector('option[value="' + dlssAuto(o.w, o.h) + '"]').textContent + ')' : '');
-  } else t = uiMode === 'live' ? 'live: Restore, DLSS 5 and the smoothing run at this share of the presented size (the window, or the screen in Fill; Auto picks by it), then the fit'
-                              : 'Restore, DLSS 5 and the interpolation run at this share of the output size';
-  $('dlssmodehint').textContent = t;
+  $('dlssrange').value = DLSS_STOPS.indexOf(dlssMode());
+  $('dlssrangenum').textContent = DLSS_PCT[dlssMode()] + '%';
 }
 {
+  // a saved Auto or Custom (both retired) is no option any more: the select keeps DLAA
   const m = localStorage.getItem('dlssMode');
   if(m && [...$('dlssmode').options].some(o => o.value === m)) $('dlssmode').value = m;
-  const c = +localStorage.getItem('dlssCustom');
-  if(c >= 1 && c <= 100) $('dlsscustom').value = c;
+  localStorage.removeItem('dlssCustom');   // retired with Custom
   localStorage.removeItem('lvFlow');   // retired: the Image scale slider became the DLSS mode
 }
 // a value that holds 1 s starts the fresh build: the preview's refresh and a running live
@@ -559,7 +508,6 @@ function syncDlssMode(){
 let dlssSettleT = null;
 function dlssChanged(){
   localStorage.setItem('dlssMode', dlssMode());
-  localStorage.setItem('dlssCustom', String(dlssCustom()));
   syncDlssMode();
   lvSendOpts();
   clearTimeout(dlssSettleT);
@@ -569,19 +517,19 @@ function dlssChanged(){
   }, 1000);
 }
 $('dlssmode').onchange = dlssChanged;
-$('dlsscustom').oninput = () => { $('dlssmode').value = dlssModeForPct(dlssCustom()); dlssChanged(); };
+$('dlssrange').oninput = () => { $('dlssmode').value = DLSS_STOPS[+$('dlssrange').value]; dlssChanged(); };   // a drag picks the mode
 dlssUiReady = true;
 syncDlssMode();
 function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.value === 'screen');
-  if(o) o.textContent = 'Match screen' + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
+  if(o) o.textContent = 'Screen resolution' + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
 // NOTE: the element id is outcodec, NOT codec - id "codec" is taken by the source-codec info span.
 // Per-choice guidance so the trade-off is clear without leaving the dropdown. Size claims are
 // from a real A/B at the engine's verified visually-lossless settings (the quality-first
 // tuning: on the 1080p sample HEVC CQ17-p7-ladder 2.25 MB / AV1 CQ22 2.17 MB / VVC QP17 0.98 MB).
 const CODEC_HINTS = {
   hevc: 'safest choice: TVs, phones, editors and players all take it; audio is copied',
-  av1:  'encodes 1.4 to 1.6x faster than HEVC on the same GPU at higher fidelity; similar size on clean anime, up to 2.5x larger on fast noisy content; royalty-free, plays in every modern browser, but devices from before ~2020 may not decode it',
-  vvc:  'smallest files of the three (roughly half of HEVC), but the CPU encode is slow and H.266 plays in few places yet: mpv, MPC-HC, MPC-BE and VLC 4 open it, VLC 3, browsers, Windows\' own player and most phones and TVs do not',
+  av1:  '1.4 to 1.6x faster than HEVC, higher fidelity; up to 2.5x larger on noisy content; plays in browsers, not on most pre-2020 devices',
+  vvc:  'smallest files (about half of HEVC), slow CPU encode; plays in mpv, MPC-HC, MPC-BE and VLC 4, not browsers or most TVs',
 };
 function syncCodec(){ $('codechint').textContent = CODEC_HINTS[$('outcodec').value] || ''; }
 const savedCodec = localStorage.getItem('codec');
@@ -589,7 +537,10 @@ if(savedCodec && [...$('outcodec').options].some(o => o.value === savedCodec)) $
 $('outcodec').onchange = () => { localStorage.setItem('codec', $('outcodec').value); syncCodec(); };
 syncCodec();
 let savedUpres = localStorage.getItem('upres');
-if(savedUpres === '540'){ savedUpres = '480'; localStorage.setItem('upres', savedUpres); }   // 540p retired (no 540p anime exists), 480p took its slot
+// the 540p and 480p presets are retired: the custom slider reaches every height from 240p, so a saved one becomes Custom
+if(savedUpres === '540' || savedUpres === '480'){
+  localStorage.setItem('upcustom', savedUpres); savedUpres = 'custom'; localStorage.setItem('upres', savedUpres);
+}
 if(savedUpres && [...$('upres').options].some(o => o.value === savedUpres)) $('upres').value = savedUpres;
 const savedUpcustom = localStorage.getItem('upcustom'); if(savedUpcustom) $('upcustom').value = savedUpcustom;
 $('upres').onchange = () => { localStorage.setItem('upres', $('upres').value); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
@@ -672,7 +623,7 @@ ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); s
 // RTX Video / NvOFFRUC DLLs.
 // Readiness = the shim + runtime present (dlssnr-ready). The two sliders are NVIDIA's global developer
 // controls, Structure Intensity and Tone Intensity (0..2, default 1.00); the pass always runs at
-// DLAA quality (no quality selector, by decision).
+// full resolution (no quality selector, by decision).
 let dlssnrReady = { ready:false };
 function nrOn(){ return $('dlssnr').checked && !!dlssnrReady.ready; }
 function nrStructure(){ return parseFloat($('nrstructure').value) || 0; }
@@ -788,13 +739,10 @@ function modelIsDlss(){ return $('modeldlss').checked && dlssReady; }
 function modelIsRife(){ return $('modelrife').checked; }
 // The DRBA sub-checkbox (default OFF) adds anime-pacing timing on top of the same RIFE weights.
 function modelIsRifeDrba(){ return modelIsRife() && $('rifedrba').checked; }
-// Frame Blend (engine --lsfg, flow-warp) uses the bundled RIFE weights, so it is always
-// ready: nothing to install, no GPU feature check.
-function modelIsLsfg(){ return $('modellsfg').checked; }
 // NVIDIA Optical Flow: the driver's optical-flow hardware run by
-// smv-live.exe itself (engine --nvof, live backend nvof), so it is always ready like Frame Blend.
+// smv-live.exe itself (engine --nvof, live backend nvof), so it is always ready like RIFE.
 function modelIsNvof(){ return $('modelnvof').checked; }
-const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelnvof'), $('modellsfg')];
+const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelnvof')];
 function frucSetupHtml(){
   const detail = !frucBridge
     ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
@@ -816,7 +764,7 @@ function syncModel(){
     !interpOn() ? 'none' :                          // nothing ticked = interpolation off, remembered
     $('modelfruc').checked ? 'fruc' :
     $('modeldlss').checked ? 'dlssg' : $('modelrife').checked ? 'rife' :
-    $('modellsfg').checked ? 'lsfg' : $('modelnvof').checked ? 'nvof' : 'gmfss');
+    $('modelnvof').checked ? 'nvof' : 'gmfss');
   // The DRBA sub-option only makes sense while RIFE is the chosen model (always ready: bundled).
   $('rifedrbarow').style.display = $('modelrife').checked ? '' : 'none';
   if($('modeldlss').checked && !dlssReady){
@@ -831,8 +779,7 @@ function syncModel(){
   // consecutive source frames, i.e. whole 2x-6x multipliers (multi-frame generation). Picking it
   // with an off-grid or out-of-range target snaps the fps box to exactly 2x the source (the
   // steppers stay usable; a bad target is blocked with guidance at Smooth It! time).
-  // isExample guard: the snap must never rewrite the user's target from the sample clip's rate.
-  if($('modeldlss').checked && dlssReady && info && !isExample){
+  if($('modeldlss').checked && dlssReady && info){
     const gm = gridMulti();
     if((gm < 2 || gm > 6) && speedMode() === 'fps') setFps(srcFps() * 2);
   }
@@ -871,7 +818,7 @@ async function doFrucInstall(source){
 }
 $('frucget').onclick = () => ipcRenderer.invoke('fruc-open-download');
 $('frucbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('fruc-choose'); if(p) doFrucInstall(p); };  // selecting a .zip auto-installs
-for(const b of ['modelgmfss','modelrife','modeldlss','modelfruc','modelnvof','modellsfg']) $(b).onchange = () => pickModel($(b));
+for(const b of ['modelgmfss','modelrife','modeldlss','modelfruc','modelnvof']) $(b).onchange = () => pickModel($(b));
 // The DRBA sub-option persists on its own key (default OFF: max fluidity is the app's default
 // philosophy; DRBA deliberately keeps character cadence); toggling it never clears RIFE.
 $('rifedrba').checked = localStorage.getItem('rifeDrba') === '1';
@@ -885,9 +832,10 @@ function restoreModelChoice(){
     for(const b of MODEL_BOXES()) b.checked = false;
     return;
   }
+  // a saved Frame Blend ('lsfg') opens as RIFE: it rendered as RIFE (the same engines, the same frames)
   const box = saved === 'fruc' ? 'modelfruc'
-            : saved === 'dlssg' ? 'modeldlss' : saved === 'rife' ? 'modelrife'
-            : saved === 'lsfg' ? 'modellsfg' : saved === 'nvof' ? 'modelnvof' : 'modelgmfss';
+            : saved === 'dlssg' ? 'modeldlss' : saved === 'rife' || saved === 'lsfg' ? 'modelrife'
+            : saved === 'nvof' ? 'modelnvof' : 'modelgmfss';
   for(const b of MODEL_BOXES()) b.checked = false;
   $(box).checked = true;
 }
@@ -929,9 +877,6 @@ function liveModelInfo(){
   // the fruc backend is adaptive like rife/gmfss; HDR-capable like rife (the bridge warps 8-bit PQ
   // for the tweens, the real frames keep full precision)
   if(modelIsFruc()) return { model:'fruc', name:'Smooth Motion', note:'tweens at 8-bit precision' };
-  // Frame Blend is adaptive like rife/gmfss (no fixed flag): the server backend resamples
-  // to the fps target the same way, which is what makes it a like-for-like pacing comparison.
-  if(modelIsLsfg()) return { model:'blend', name:'Frame Blend', note:'flow at the Image scale, full resolution warps' };
   // NVIDIA Optical Flow: adaptive like rife (the splat takes any fraction), native only
   if(modelIsNvof()) return { model:'nvof', name:'NVIDIA Optical Flow', note:'' };
   // nothing ticked = interpolation off (same meaning as file renders): the echo backend passes
@@ -956,8 +901,6 @@ function liveLoadLabel(mi){
     if(restoreOn()) parts.push('Restore');
     if(nrOn()) parts.push('DLSS 5');
     if($('sharpen').checked && (parseFloat($('sharpval').value) || 0) > 0) parts.push('Sharpen');
-    const upH = upTargetH();
-    if(upH) parts.push((liveVsrOn() ? 'RTX VSR ' : 'upscale ') + upH + 'p');
     if(liveHdrOn()) parts.push('RTX HDR');
   }
   return parts.length ? parts.join(' + ') : 'passthrough (nothing ticked)';
@@ -972,16 +915,14 @@ function lvSendOpts(){
     model: mi.model,
     label: liveLoadLabel(mi),   // what is ticked, for the exe's loading note + substitution note
     note: mi.note,    // message/HUD (the raw backend id reads as the wrong model)
-    dlssmode: dlssMode(), dlsscustom: dlssCustom(),   // the working size's share of the presented size
+    dlssmode: dlssMode(),   // the working size's share of the presented size
     fit: $('lvfit').value,
     target: liveTargetFps(),
     // live effects: sharpen inherits the file-render setting; RTX VSR (liveVsrOn above) takes the live
     // resize that enlarges, the host picks it (none enlarges = skipped)
     sharpen: $('sharpen').checked ? parseFloat($('sharpval').value) || 0 : 0,
     rtxvsr: liveVsrOn(),
-    // "Upscale to" height (0 = off): live renders the model frame at that size first (VSR
-    // when enlarging), then fits it to the window or monitor. Match screen = this screen.
-    uph: upTargetH(),
+    // no "Upscale to": Live's size is what Display presents (the window or the screen), the DLSS mode its speed
     // Restore (AI detail): Real-ESRGAN first on every presented frame, python route only
     restore: restoreOn(),
     // NVIDIA DLSS 5: Neural Rendering once per captured frame (runtime installed), python route
@@ -997,23 +938,29 @@ function lvSendOpts(){
     hudlat: $('lvhudlat').checked,
     gpufit: $('gpufit').checked,
   });
-  const load = mi.model === 'rife' ? 'starts in ~3s, under 1s again while its engines stay loaded (first time at a new window size ~45s)'
-    : mi.model === 'rifedrba' ? 'starts in ~3s (first time at a new window size ~55s)'
-    : mi.model === 'gmfss' ? 'loads ~4s on start, under 1s again while it stays loaded (first time at a new window size ~30s)'
-    : mi.model === 'nvof' ? 'starts in a few seconds, nothing to build' : '';
+  const load = mi.model === 'rife' ? 'starts in ~3s (~45s the first time at a new window size)'
+    : mi.model === 'rifedrba' ? 'starts in ~3s (~55s the first time at a new window size)'
+    : mi.model === 'gmfss' ? 'loads in ~4s (~30s the first time at a new window size)'
+    : mi.model === 'nvof' ? 'starts in a few seconds' : '';
   // A fixed model cannot hit an arbitrary target exactly: it picks the nearest whole multiple
   // of the captured window's own rate, so say that instead of promising the exact number.
   const lvT = liveTargetFps();
   $('lvtarget').textContent = mi.name
-    + (mi.effectsOnly ? ' · effects only (Restore, Sharpen, Upscale to, RTX VSR, RTX HDR) at the source rate, capped by the ' + lvT + ' fps Speed setting; tick a model to smooth'
+    + (mi.effectsOnly ? ' · effects only (Restore, Sharpen, RTX VSR, RTX HDR) at the source rate, capped by the ' + lvT + ' fps Speed setting; tick a model to smooth'
        : mi.fixed ? ' · nearest whole multiple of the captured rate to ' + lvT + ' fps'
-                  + (mi.model === 'dlssg' ? ' (up to 6x)' : '')
+                  + (mi.model === 'dlssg' ? ' (up to 6x); it runs its own pipeline, so the greyed-out panels do not apply' : '')
        : ' · targets ' + lvT + ' fps (the Speed setting below)')
     + (load ? ' · ' + load : '')
-    + (liveHdrOn() && ['rife', 'rifedrba', 'gmfss', 'blend', 'nvof'].includes(mi.model) ? ' · RTX HDR (on HDR screens)' : '')
+    + (liveHdrOn() && ['rife', 'rifedrba', 'gmfss', 'nvof'].includes(mi.model) ? ' · RTX HDR (on HDR screens)' : '')
     + (mi.note ? ' · ' + mi.note : '') + '  ·  ';
 }
+// Live with NVIDIA DLSS 4.5: main.ts sends it only the target, so these panels do nothing there and grey out
+function syncDlssgLock(){
+  const lock = uiMode === 'live' && liveModelInfo().model === 'dlssg';
+  for(const id of ['restorepanel', 'uppanel', 'nrpanel', 'sharpenpanel', 'hdrpanel']) $(id).classList.toggle('dlssglocked', lock);
+}
 function lvModelUi(){
+  syncDlssgLock();
   const mi = liveModelInfo();
   const m = mi.model;
   const server = m !== 'dlssg';       // everything but DLSS-G runs through the server
@@ -1022,10 +969,6 @@ function lvModelUi(){
   // but a fill selection is bounced back to window with a hint.
   $('lvfit').disabled = lvState === 'running';
   if(!server && $('lvfit').value === 'fill') $('lvfit').value = 'window';
-  // the Upscale to selector applies live too (server models): rendered at that height first,
-  // then fitted; named here so the inherited setting is visible from the Live panel
-  const upH = server ? upTargetH() : 0;
-  const upTxt = upH ? (liveVsrOn() ? 'RTX VSR' : 'upscale') + ' to ' + upH + 'p first' : '';
   // Restore applies live too (server models, python route); named here like Upscale to
   const resTxt = server && restoreOn() ? 'Restore (AI detail) first, heavy' : '';
   // DLSS 5 applies live too (server models, python route): once per captured frame
@@ -1033,11 +976,11 @@ function lvModelUi(){
   const effTxt = [resTxt, nrTxt].filter(Boolean).join(' · ');
   $('lvfithint').textContent =
     $('lvfit').value === 'fill' ? 'enlarges the window to fill its monitor, aspect kept · '
-                                  + (upTxt || (liveVsrOn() ? 'RTX VSR upscale' : 'upscale'))
+                                  + (liveVsrOn() ? 'RTX VSR upscale' : 'upscale')
                                   + (effTxt ? ' · ' + effTxt : '')
     : $('lvfit').value === 'monitor' ? 'smooths everything on the monitor the window is on'
-                                       + (upTxt ? ' · ' + upTxt : '') + (effTxt ? ' · ' + effTxt : '')
-    : !server ? 'Fill screen needs the RIFE or GMFSS model' : [upTxt, effTxt].filter(Boolean).join(' · ');
+                                       + (effTxt ? ' · ' + effTxt : '')
+    : !server ? 'Fill screen needs the RIFE or GMFSS model' : effTxt;
 }
 function lvUi(){
   const b = $('lvgo');
@@ -1217,17 +1160,14 @@ ipcRenderer.on('lv-done', (_e, code) => {
   lvUnavailUi();
 })();
 
-// First page = the full settings surface: load the bundled example clip through the normal
-// video path (probe + all panels + the before/after preview) so every visual option shows its
-// effect before the user picks a file. Smooth It! stays gated until a real video is loaded;
-// picking/dropping one replaces the example via the same loadVideo flow.
-(async () => {
-  try {
-    if(input) return;   // a video arrived first (drag-drop straight onto the launching window)
-    const ex = await ipcRenderer.invoke('example-path');
-    if(ex && !input) await loadVideo(ex, true);
-  } catch {}
-})();
+// First page = the settings surface without a video: every panel can be set up beside the welcome hint, but nothing
+// is probed, sized or previewed (no GPU work) and Smooth It! waits until a picked or dropped video runs loadVideo.
+if(!input){
+  showWorkspace(true);
+  $('go').disabled = true; $('changeout').disabled = true;
+  $('outrow').style.display = 'none';
+  $('status').textContent = 'Select a video, then click Smooth It!';
+}
 
 // --- Dolby Vision export tools (mirrors the RTX library flow) ------------------------------------
 // DV 8.1 export needs ONE non-shippable open-source binary - dovi_tool - dropped into engine/dvtools;
@@ -1330,8 +1270,8 @@ $('rtxhdr').addEventListener('change', () => { if($('hpexport').checked) syncHp(
 syncHp();
 
 // Before/after preview (panel above Smooth It): render ONE frame at the current spatial settings via the
-// main process's preview (render/preview.js, the native host's pass chain) and show original vs processed. It applies RTX HDR (when on + ready) and FSR/CAS
-// sharpen (when on), so the user can see how those settings change the picture before a full render.
+// main process's preview (render/preview.js, the native host's pass chain) and show original vs processed. It applies RTX HDR (when on + ready) and
+// Adaptive Sharpen (when on), so the user can see how those settings change the picture before a full render.
 // Back / random-frame step through random positions across the clip. HDR is tonemapped to sRGB because
 // this canvas cannot show PQ. Images load as object URLs (nodeIntegration) to dodge file:// webSecurity,
 // and old URLs are revoked so memory does not grow.
@@ -1387,7 +1327,7 @@ function prevSettingsSig(){                 // everything that changes what the 
   const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
   return [sharpStrength(), restoreOn(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
           upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), nrOn(), nrStructure(), nrTone(), nrStyle(), nrPasses(), nrMaskOn(),
-          dlssMode(), dlssCustom()];
+          dlssMode()];
 }
 let lastPrevInput = null;                    // which video the shown original belongs to
 async function loadPreview(frame, bg){   // bg: background "refine" pass (the RTX auto-upgrade) - keep the shown image up, no blocking spinner
@@ -1399,7 +1339,7 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
   // the ~5s cost), so the drop is fast. Adjusting any preview control renders the full RTX version.
   const lite = previewLite; previewLite = false;
   const useHdr = lite ? false : hdr;
-  const useVsr = lite ? false : !!($('rtxvsr').checked && rtxReady.vsr && (upFactor() > 1 || dlssBelowOutput()));   // VSR enlarges only
+  const useVsr = lite ? false : !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1);   // VSR enlarges only
   const useNr = lite ? false : nrOn();     // DLSS 5: its host takes seconds to start, so the lite pass skips it too
   inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame)].concat(sig));
   $('hdrpreview').style.display = 'block';
@@ -1421,8 +1361,8 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
     { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr: useHdr,
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
       upscale: upFactor() || 0,
-      rtxvsr: useVsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses(),
-      dlssmode: dlssMode(), dlsscustom: dlssCustom() }, hdrColorPayload())); }
+      rtxvsr: useVsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
+      hdrColorPayload())); }
   catch(e){ r = { error: String(e) }; }
   setSpin($('prevprocwrap'), $('prevspin'), false);
   $('prevprocwrap').style.minHeight = '';
@@ -1450,7 +1390,7 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
   const parts = []; if(restoreOn()) parts.push('Restore');
   if(upActive) parts.push(vsrOn ? 'VSR' : upFactor() < 1 ? 'downscale' : 'upscale');
   if(useNr) parts.push('DLSS 5');
-  if(sharpen > 0) parts.push('FSR'); if(useHdr) parts.push('HDR');
+  if(sharpen > 0) parts.push('Sharpen'); if(useHdr) parts.push('HDR');
   $('prevproclabel').textContent = !active ? 'Unchanged'
     : maskShown ? 'DLSS 5 changed pixels'
     : 'Processed (' + parts.join(' + ') + ')';
@@ -1458,7 +1398,7 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
   $('prevnote').textContent = (maskShown ? 'DLSS 5 changed ' + r.nrmaskPct + '% of the pixels, average change ' + r.nrmaskMean + '/255 · bright = large change, dark = untouched'
     : rtxSkipped ? 'quick preview shown; refining to the full RTX VSR/HDR/DLSS 5 version…'
     : srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
-    : !active ? 'no Restore, FSR, DLSS 5 or RTX HDR enabled, the output will match the source'
+    : !active ? 'no Restore, Sharpen, DLSS 5 or RTX HDR enabled, the output will match the source'
     : plainOnly ? (upFactor() < 1 ? 'plain downscale, both panes match (RTX VSR is for upscaling)'
                                     : 'plain upscale, no AI detail added (enable RTX VSR for that; both panes match)')
     : useHdr ? 'HDR is tonemapped to show on this SDR screen'
@@ -1718,12 +1658,12 @@ function startRun(){
   const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
   const dims = upDims();                               // resize target ({w,h} or null)
   const factor = upFactor();                           // arbitrary resize factor (0 = off, <1 downscales)
-  const useRtxVsr = (factor > 1 || dlssBelowOutput()) && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale of an enlarging resize, else Lanczos3
+  const useRtxVsr = factor > 1 && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale of an enlarging resize, else Lanczos3
   const rtxhdr = hdrOn();  // HDR only when its runtime is installed and the source is SDR
   // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
   // HDR is on. Bail only when nothing at all is enabled.
   if(!interpOn() && sharpenStrength <= 0 && factor <= 0 && !rtxhdr && !restoreOn() && !nrOn()){
-    alert('Nothing to do: turn on Interpolate, pick an Upscale resolution, enable FSR sharpening, Restore or DLSS 5, or turn on RTX HDR (and install its runtime).');
+    alert('Nothing to do: turn on Interpolate, pick an Upscale resolution, enable Sharpen, Restore or DLSS 5, or turn on RTX HDR (and install its runtime).');
     return;
   }
   procStart = 0; baseK = 0; etaAnchor = 0; etaAnchorTime = 0; lastFps = 0; curDone = 0; curPct = 0; projBytes = 0;
@@ -1749,7 +1689,7 @@ function startRun(){
     log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
   }
   modeBtnUi(true);
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlsscustom').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlssrange').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push(factor < 1 ? 'downscaling' : 'upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -1762,7 +1702,7 @@ function startRun(){
   const what = interpOn() ? (t.toFixed(targetDecimals())+' fps ('+ratioTxt+')') : 'no interpolation';
   const extra = (dims ? '  ·  '+(useRtxVsr ? 'RTX VSR' : factor < 1 ? 'downscale' : 'upscale')+' '+dims.w+'×'+dims.h : '')
               + (rtxhdr ? '  ·  RTX HDR' : '')
-              + (sharpenStrength>0 ? '  ·  FSR '+sharpenStrength : '')
+              + (sharpenStrength>0 ? '  ·  Sharpen '+sharpenStrength : '')
               + (restoreOn() ? '  ·  Restore' : '');
   log('>> '+input+'  ->  '+what+extra+'\n');
   const payload = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
@@ -1771,7 +1711,6 @@ function startRun(){
   else if(interpOn() && modelIsRife()) payload.model = 'rife';     // plain RIFE (bundled, always ready)
   else if(interpOn() && modelIsDlss()) payload.model = 'dlssg';   // "DLSS 4.5" (Frame Generation) backend
   else if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "NVIDIA Smooth Motion" (NvOFFRUC) backend
-  else if(interpOn() && modelIsLsfg()) payload.model = 'lsfg'; // Frame Blend (flow-warp, engine --lsfg)
   else if(interpOn() && modelIsNvof()) payload.model = 'nvof'; // NVIDIA Optical Flow, engine --nvof
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
@@ -1792,10 +1731,7 @@ function startRun(){
     if($('dvexport').checked && dvReady.ready) payload.dv = true;   // also export Dolby Vision 8.1 (needs HDR)
     if($('hpexport').checked && hpReady.ready) payload.hp = true;   // also embed HDR10+ metadata (needs HDR)
   }
-  // DLSS mode (shared with Live): the working size Restore's output, DLSS 5 and the model run at,
-  // resized to the output after the interpolation (every model, with or without interpolation)
-  payload.dlssmode = dlssMode();
-  if(dlssMode() === 'custom') payload.dlsscustom = dlssCustom();
+  // no DLSS mode: a file render runs every pass at the output size (DLAA); the mode is Live's speed lever
   saveBatch([input, ...batch]);   // survives a crash/close: the next launch re-queues these files
   ipcRenderer.send('run', payload);
 }
@@ -1931,7 +1867,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
   clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
   modeBtnUi(lvState !== 'idle');
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlsscustom').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlssrange').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
     if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');

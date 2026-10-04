@@ -32,8 +32,7 @@ engine/dlssnr/build_src/*.exp
 engine/runtime/
 engine/runtime_*_bak/
 engine/gpu_runtime/
-engine/trt_cache/
-engine/trt_cache_safe_to_delete/
+/model_cache_safe_to_delete/
 engine/onnx/
 engine/trtrtx_bindings/*.obj
 engine/trtrtx_bindings/*.lib
