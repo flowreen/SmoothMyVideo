@@ -20,7 +20,7 @@ export interface RenderArgs {
   nvof: boolean;
   no_interp: boolean;
   rtx_vsr: boolean;
-  fsr_upscale: boolean; // --fsr-upscale: AMD FSR 3.1 in RTX VSR's resize (the two exclude each other)
+  fsr_upscale: boolean; // --fsr-upscale: AMD FSR 4 in RTX VSR's resize (the two exclude each other)
   rtx_hdr: boolean;
   restore: boolean;
   no_gpu_fit: boolean; // --no-gpu-fit: no video memory fit (the host's batch and Auto's working size)

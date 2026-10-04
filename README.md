@@ -76,25 +76,22 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   Uses the separately-installed open-source
   [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool).
 * 🔍 **AI upscaling to 16K + detail restoration.** NVIDIA RTX Video Super Resolution plus a Real-ESRGAN
-  restore pass, layered with the interpolation in a single render. AMD FSR 3.1 upscaling is built in as the
-  alternative to RTX VSR (tick one or the other; neither = a classic Lanczos resize).
+  restore pass, layered with the interpolation in a single render. AMD FSR 4.1 upscaling (AMD's AI upscaler) is built in as
+  the alternative to RTX VSR (tick one or the other; neither = a classic Lanczos resize).
 * 💬 **Keeps every track.** All audio, subtitles/translations, chapters and font attachments are preserved
   (auto-switches to `.mkv` when needed), nothing silently dropped.
 * 🗜️ **Visually lossless.** HEVC / AV1 / H.266 encodes at maximum encoder effort, tuned and verified
-  against a lossless 8K master (VMAF ~99.8, SSIM ≥ 0.995), no fiddly quality knob to guess at. One
-  optional "Fast" encoder tier (HEVC 2 to 3x the encode rate at the same file size, about 0.1 to 0.5 dB)
-  for the renders where the GPU encoder, not the AI model, sets the pace.
-* 📦 **100% offline & self-contained.** Extract the zip and run, no Python, no pip, no ffmpeg to install,
+  against a lossless 8K master (VMAF ~99.8, SSIM ≥ 0.995), no fiddly quality knob to guess at.
+* 📦 **100% offline & self-contained.** Extract the archive and run, no Python, no pip, no ffmpeg to install,
   no account, no cloud upload. Only the NVIDIA driver is assumed. Free.
-* ⚡ **Fast.** fp16 with a TensorRT backend, built and cached per resolution; 4K sources interpolate at
-  nearly 1080p cost (motion is estimated at a resolution-appropriate scale, automatically). The app also
-  tells you when a laptop "Silent" power profile is throttling the GPU.
+* ⚡ **Fast.** fp16 with a TensorRT backend, built and cached per resolution. The app also tells you when a
+  laptop "Silent" power profile is throttling the GPU.
 * 🧺 **Set-and-forget batches.** Queue many files; a file that fails is noted and the rest keep rendering,
   and a batch interrupted by a crash or restart is re-queued on the next launch.
 * 📱 **Handles real-world files.** Variable-frame-rate sources (phone clips, screen recordings) are
   detected and timed correctly, so audio never drifts out of sync.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time.
-  The exceptions are the NVIDIA Smooth Motion and AMD FSR 3.1 models, which are non-deterministic.
+  The exception is the NVIDIA Smooth Motion model, which is non-deterministic.
 * 🎛️ **One size control per mode.** File renders pick the output **Size** and run every pass at it
   (Restore and the resize first, then DLSS 5 and the interpolation; RTX Video Super Resolution
   enlarges when the Size is above the source). Live's size is what **Display** shows (the window, or
@@ -131,8 +128,8 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
 * 🔴 **Live mode: real-time frame generation on any window.** The Lossless-Scaling-style feature,
   built in and free: press **`** (backtick) in any app and the window you're in goes live behind a
   click-through overlay showing DLSS Frame Generation output at 2×–6×, in real time; press **`**
-  again to stop (the key is reserved system-wide while the app runs). Or pick the window from a
-  list and click **Go Live**. No file, no render, no waiting; Stop (or Esc on the overlay) ends it.
+  again to stop (the key is reserved system-wide while the app runs). Or click **Smooth It Live!**
+  and then click the window within 5 seconds. No file, no render, no waiting; Stop (or Esc on the overlay) ends it.
   Same requirements as the DLSS 4.5 model (RTX 40/50, above 2× needs an RTX 50; the RIFE and GMFSS
   live models run on any RTX); windowed or borderless windows only (exclusive fullscreen
   can't be captured). Changing the Speed target or the DLSS mode while a session is running restarts it a moment
@@ -141,7 +138,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   whole monitor at once (everything on it, works with every model including DLSS 4.5). **Original size** smooths only
   the window, and **Fill screen** fills the screen with it (upscaled, aspect kept;
   clicks on the stretched picture reach the matching spot of your window: while the cursor is on the picture, SMV draws it
-  and slows the pointer by the stretch, and gives the normal pointer back when the cursor leaves the picture or Live stops). With the RIFE, GMFSS, NVIDIA Smooth Motion or AMD FSR 3.1 model the smoothing is **adaptive**: the output locks to
+  and slows the pointer by the stretch, and gives the normal pointer back when the cursor leaves the picture or Live stops). With the RIFE, GMFSS, NVIDIA Smooth Motion or AMD FSR 4 model the smoothing is **adaptive**: the output locks to
   your fps target (the same Speed setting file renders use) and the multiplier follows the
   content, so a game dropping from 30 to 10 fps keeps playing at the same smooth rate on
   screen. The target goes up to 10000 fps; with **Fit to the GPU** ticked (the default) Live lowers the smoothing
@@ -157,11 +154,8 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   picture cleaned or expanded). A small
   green readout in the corner shows the source fps, the smoothed fps, and roughly how far the
   picture runs behind reality (about a source frame; made for watching, not for competitive
-  play). With the RIFE model the interpolation runs inside the overlay itself instead of a
-  separate engine process, which cuts latency and about a third of the processor use and, at
-  the working sizes most people run, raises the smoothed frame rate; the separate engine
-  process steps in automatically whenever the overlay cannot run it. Plain RIFE file renders use
-  the same engine host too.
+  play). Every model runs inside the overlay itself, with no separate engine process, which keeps
+  latency and processor use low; file renders run in the same engine host.
 * 🎬 **A RIFE model for live action.** GMFSS is an anime specialist; one checkbox switches to
   Practical-RIFE 4.26 heavy (bundled, nothing to install), the strongest open general-purpose
   interpolation model - the pick for filmed content. TensorRT-accelerated like GMFSS. Its
@@ -174,17 +168,17 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   model to NVIDIA's hardware optical-flow FRUC (the same family as the driver-level Smooth Motion), for
   when you want the NVIDIA look or a non-AI reference. The lowest quality of the models, and
   non-deterministic; the NVIDIA runtime is a one-time separate download (not bundled).
-* 🔺 **AMD FSR 3.1 frame generation.** One more checkbox runs AMD's FSR 3.1 frame generation (built into
-  the app from AMD's open source, nothing to install), steered by NVIDIA's optical flow, live and for
-  file renders. It never repeats a frame in place of a new one; like Smooth Motion it tears at
-  edges on very fast pans, and it is non-deterministic.
+* 🔺 **AMD FSR 4 frame generation.** One more checkbox runs AMD's FSR 4 frame generation, AMD's
+  machine-learning model (bundled, nothing to install), steered by NVIDIA's optical flow, live and for file
+  renders. On NVIDIA GPUs it runs through the open-source vkd3d-proton (D3D12 on Vulkan); tested on an
+  RTX 5090. Cleaner than FSR 3.1 on fast pans, though fine edges can still break up on fast anime motion
+  where GMFSS stays clean. Its first start takes longer while its shaders compile (cached afterwards).
 * 🧭 **NVIDIA Optical Flow.** One more checkbox runs NVIDIA's hardware
   optical-flow unit straight from the app, nothing to install (the NVIDIA driver
   provides it), live and for file renders. Fast, and clean on moderate motion; where very fast
   or twisting motion defeats the hardware's vectors it fades to a soft double image instead of
-  breaking up. File renders with it take a
-  whole multiplier and no Sharpen, Upscale, DLSS mode, RTX HDR, Restore or DLSS 5 yet (it tells
-  you when a setting is in the way); live takes every effect.
+  breaking up. File renders with it take a whole multiplier (it tells you when the Speed target is
+  not one).
 * 🎚️ **Plus the essentials:** Adaptive Sharpen (bacondither's two-pass HQ sharpener, strength 0 to 2), a live
   before/after preview, every setting remembered
   between runs, and a quiet one-line notice when a newer release is out (nothing auto-downloads).
@@ -196,8 +190,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   release notes sit beside it), extract it anywhere (Windows 11 23H2 and later open `.7z` in File
   Explorer; on older Windows use [7-Zip](https://www.7-zip.org/) or NanaZip), and run
   **`SmoothMyVideo.exe`** (or the Desktop /
-  Start-menu shortcut). No install, no dependencies, just a current NVIDIA driver. A sample clip ships in
-  `samples/test.mp4`.
+  Start-menu shortcut). No install, no dependencies, just a current NVIDIA driver.
 * **From source:** `npm start`. See **[DEVELOPMENT.md](DEVELOPMENT.md)** for the full setup.
 
 ## Under the hood

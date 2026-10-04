@@ -246,8 +246,10 @@ RTX VSR / HDR and all three codecs.
   harness gates.
 * `engine/nvoffruc/`: the "NVIDIA Smooth Motion" bridge to NvOFFRUC (user-installed DLLs), called
   by the host.
-* `engine/fsrfg/`: the AMD FSR frame generation bridge (`smv_fsrfg_bridge.dll`: FSR 3.1.6 built from
-  AMD's MIT source with our bridge, committed and shipped; the recipe in `build_src/`), called by the host.
+* `engine/fsrfg/`: the AMD FSR 4 frame generation bridge (`smv_fsrfg_bridge.dll`, ours) beside AMD's signed
+  FidelityFX loader + frame generation DLLs (MIT), vkd3d-proton's two DLLs (LGPL-2.1, renamed
+  `smv_vkd3d_*.dll`, our patches in `source/`), our `amdxc64.dll` and `licenses/`, all committed and shipped;
+  the recipe in `build_src/`; called by the host.
 * `engine/fsrup/`: the AMD FSR upscaling bridge (`smv_fsrup_bridge.dll`, ours) beside AMD's signed
   FidelityFX loader + upscaler DLLs (MIT), all committed and shipped; the recipe in `build_src/`.
 * `engine/dlssg/`: the DLSS 4.5 frame generation host (`dlssg2f.exe`, D3D12, Streamline runtime
@@ -442,10 +444,21 @@ Models (GMFSS is the default, the anime specialist):
   size keep SDR content inside the range (both edit its SDR view, see `--sharpen` and the Passes
   paragraph below). GMFSS's SDR pairs use the same test. `SMV_FRUC_SDR_PAIRS=0` = every pair as
   the codes.
-* `--fsrfg` "AMD FSR frame generation": AMD's FSR 3.1.6 frame generation (the analytic one; FSR FG 4's
-  ML model needs an AMD 9000 series GPU), built from source with its optical flow's scene-change reset
-  removed (a detected cut made it copy the next frame in place of a tween; video gives FSR no cut
-  signal, and a repeated frame is a hold), in our `engine/fsrfg/smv_fsrfg_bridge.dll`. It runs on
+* `--fsrfg` "AMD FSR frame generation": AMD's FSR 4 frame generation (the ML provider 4.0.1 of the FSR SDK
+  v2.3.0's signed `amd_fidelityfx_framegeneration_dx12.dll`, unmodified) through our
+  `engine/fsrfg/smv_fsrfg_bridge.dll`. The DLL offers FSR 4 only when AMD's driver extension reports its FP8
+  wave-matrix intrinsics and its ML shaders call them, so on NVIDIA the bridge gives it vkd3d-proton's D3D12
+  device (`smv_vkd3d_*.dll`: `VKD3D_FP8_EMULATION=1` runs the FP8 cooperative matrices as FP16 ones,
+  dxil-spirv's `DXIL_SPIRV_CONFIG=wmma_fp8_staging` stages FP8 loads / stores through shared memory, both set
+  by the bridge for its process) and our `amdxc64.dll`, which answers the extension queries (FP8 x FP8 ->
+  FP32 wave matrices, every intrinsic supported). The bridge loads the system `d3d12.dll` before AMD's DLL:
+  that DLL serializes its root signatures through the loaded module named `D3D12.dll` and, with none,
+  creates no pipeline and every dispatch is dropped (all-zero tweens). vkd3d-proton's pipeline cache sits in
+  the model cache's `fsr4_shaders\vkd3d_<core DLL size + time>` (its key ignores `DXIL_SPIRV_CONFIG`, so a
+  cache of another build or configuration replayed broken pipelines); the first session compiles the
+  shaders. FSR 4 is bit-stable run to run, and the host's tweens are 52.3 dB from AMD's own D3D12 path on
+  the same frames and vectors (8-bit vs fp16 frames; harness `fsr4_framegen\fsr4_gate.py`); the frame time
+  does not change its output. It runs on
   Smooth Motion's route: one tween at t = 0.5 per call, so every tween is a node of the pair's
   midpoint tree, level L on bridge instance L - 1, each instance fed one continuous stream (instance
   0 every real frame in order, tweens or not; the stream's first frame resets it, a gap re-feeds the
@@ -453,10 +466,12 @@ Models (GMFSS is the default, the anime specialist):
   motion vectors are NVIDIA optical flow (both directions, fast, grid 1 or 4 where 1 is refused,
   ABGR8): the previous frame is the input, this one the reference, the backward field = FSR's
   current -> previous convention; depth is a constant 0.5. Frames go to the bridge as RGBA16F
-  through D3D12 buffers shared with CUDA and one shared fence (GPU-side waits, no CPU copy). HDR
-  planes follow Smooth Motion's SDR-pair rule at fp16 (`SMV_FSRFG_SDR_PAIRS=0` = every pair as the
-  codes). Tears at occlusions on fast pans much like Smooth Motion; not run-to-run stable (AMD's own
-  DLL changes about 3 % of a 1080p tween's pixels between two runs, 42 dB).
+  through three textures shared with CUDA and one shared fence (GPU-side waits, no CPU copy): vkd3d-proton
+  shares textures, not buffers, as Vulkan opaque Win32 handles CUDA maps as arrays, and its fence as a
+  Vulkan timeline semaphore (our patches: NVIDIA's Vulkan driver exports no D3D12-fence semaphore, and
+  CUDA refuses an export vkd3d-proton has itself opened through D3DKMT); the bridge copies them into
+  FSR's own textures and back. HDR planes follow Smooth Motion's SDR-pair rule at fp16
+  (`SMV_FSRFG_SDR_PAIRS=0` = every pair as the codes).
 * SVP (`--svp` / `--svp-nvof`, live `svp` / `svpnvof`, svpflow from a local SVP 4 install in the
   runtime's VapourSynth) was REMOVED 2026-09-21 so the app no longer depends on SVP 4, SVP Manager
   or VapourSynth; `--nvof` is its replacement. To bring it back, revert the commit "remove the SVP
@@ -523,15 +538,18 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
 * `--upscale F`: the output size; bare = 1.5, clamp 1/16..16; above 8192 px auto-switches to a CPU
   AV1 / VVC encoder with a fail-closed RAM preflight (true 16K needs about 54 GB free).
   `--rtx-vsr` uses RTX Video Super Resolution for an enlarging resize (the GUI ticks it by
-  default), otherwise Lanczos3. `--fsr-upscale` puts AMD FSR 3.1.5 in that same resize instead (the two
-  exclude each other; with both, RTX VSR keeps it and the host says so): AMD's signed FidelityFX loader +
-  upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, every frame of that resize's stream in order
-  (the first resets), its motion vectors from NVIDIA optical flow (the FSR FG route's: both directions,
-  fast, grid 1), a constant depth, no jitter; RTX VSR's rules hold (SDR only, enlarging only, one resize).
-  AMD's FSR 3.1.5 is deterministic: the host's frames equal AMD's own run on the same frames byte for byte
-  (harness `fsr_framegen\host\fsrup_gate.py`). On the measured anime clips (480p -> 1080p) it scored below
-  Lanczos3 and RTX VSR on LPIPS (Tsuihou 0.176 vs 0.169 / 0.124, dragon 0.134 vs 0.116 / 0.120). Downscales
-  (F below 1) are folded into the decode.
+  default), otherwise Lanczos3. `--fsr-upscale` puts AMD FSR 4.1.1 (its INT8 model) in that same resize instead
+  (the two exclude each other; with both, RTX VSR keeps it and the host says so): AMD's signed FidelityFX loader +
+  upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, which opens the upscaler's GPU gate (see "AMD FSR
+  upscaling bridge"), every frame of that resize's stream in order (the first resets), its motion vectors from
+  NVIDIA optical flow (the FSR FG route's: both directions, fast, grid 1), a constant depth, no jitter; RTX VSR's
+  rules hold (SDR only, enlarging only, one resize). AMD's FSR 4.1.1 is deterministic: the host's frames equal
+  AMD's own run (with the same gate opened) on the same frames byte for byte (harness
+  `fsr_framegen\host\fsrup_gate.py`). On the measured anime clips (480p -> 1080p, frames 4+) it scored the best
+  PSNR of the upscalers (Tsuihou 32.6 dB vs RTX VSR 29.6 / Lanczos3 30.1 / FSR 3.1.5 31.5; dragon 35.3 vs 34.0 /
+  33.9 / 34.5), LPIPS Tsuihou 0.127 (0.124 / 0.169 / 0.176), dragon 0.118 (0.120 / 0.116 / 0.134) (harness
+  `fsr4_int8_upscaler\score_steady.py`). Its first session (and its first at a 4K output) spends ~30 s while the
+  driver compiles AMD's shaders, cached after. Downscales (F below 1) are folded into the decode.
 * `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame at the working size, after Restore and
   the resize, before the interpolation, DLAA (scaling
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
@@ -642,10 +660,9 @@ Output:
   after run, in separate processes or through the resident host, and the product encoder then writes
   byte-identical files. That holds for every model on the fixed-shape TensorRT-RTX engines, the host
   kernels (the splats accumulate in int64 fixed point), the NGX passes (DLSS 5, RTX VSR, RTX HDR),
-  with TensorRT-RTX graph capture on or off. The exceptions are `--fruc`: NvOFFRUC changes about 1 in 5
+  with TensorRT-RTX graph capture on or off, and AMD FSR 4 frame generation. The exception is `--fruc`: NvOFFRUC changes about 1 in 5
   generated frames very slightly from run to run, inside NVIDIA's library (serialising every CUDA
-  launch does not change it), and `--fsrfg`: FSR frame generation changes about 3 % of a tween's pixels
-  from run to run, AMD's signed DLL as much as our build. `smoke.py --full` asserts the RIFE case.
+  launch does not change it). `smoke.py --full` asserts the RIFE case.
 
 ## Live mode
 
@@ -1045,10 +1062,11 @@ the card at most, and only the slots the free video memory holds beside what the
 (`nativeRingFit`, `nativeLiveLateNeed`: DLSS 5's first frames, 120 MiB + 16.6 a megapixel a pass, and FRUC's
 buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel, measured by NVAPI from the
 ring to the steady session, a quarter on top; AMD FSR frame generation's second midpoint instance and its
-node frames, 35 MiB + 255 a megapixel, the process's own memory at x4 against x2, a quarter on top; when
+node frames, 45 MiB + 335 a megapixel, the process's own memory at x4 against x2, a quarter on top; when
 the slots reach x8 / x16, their third and fourth tree levels on top, the process's own memory over x4, a
 quarter on top: Smooth Motion 277 + 300 / 549 + 742 a padded megapixel, AMD FSR frame generation
-37 + 333 / 82 + 820 a megapixel; the other routes add nothing after it). Fewer slots lower
+278 + 333 / 580 + 820 a megapixel (the per-megapixel terms FSR 3.1's larger fit: FSR 4 held only ~x3.7 at
+1708x960 and left those levels' node frames partly unmade); the other routes add nothing after it). Fewer slots lower
 only the output's ceiling (at most `slots` frames a captured frame) and the host says `native: video
 memory: the output ring holds N output frames per source frame instead of M ...`; 2 at least. Gate
 `harness\live_ring_memory\ring_gate.py OLD_ENGINE NEW_ENGINE` (`ring_mem.py` = the measurement). On
@@ -1058,7 +1076,7 @@ the source is folded into the decode, so the host cannot choose it later): nativ
 `smv-live.exe --offline ... --fit-work WW:WH:DW:DH,...` (Auto's pick and every DLSS mode below it, plan.ts
 `autoCandidates`; no render, no CUDA), which prices each (per model: RIFE / Frame Blend `nativeOfflineRifeMiB`,
 DRBA 310 + 1028 MiB a padded megapixel, GMFSS 462 + 2446, Smooth Motion 461 + 182, AMD FSR frame generation
-259 + 368 and 18 + 163 for each midpoint-tree level beyond the first (x4 = 2 levels, x8 = 3, other multiples and
+644 + 325 and 68 + 128 for each midpoint-tree level beyond the first (x4 = 2 levels, x8 = 3, other multiples and
 `--fps` 3), NVIDIA Optical Flow 233 + 179, no interpolation 225 + 41, measured over x2 renders at 854x480 and 1920x1080, plus 25 MiB a megapixel of
 the output beyond the working size, all a quarter on top, and `nativeOfflineEffectsMiB`) and prints `OFFLINE
 FIT i ROOM NEED0 NEEDi`; the plan note then reads `DLSS mode Auto (M; the free video memory fits it: P needs
@@ -1505,6 +1523,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_VSR_SYNC=1` | RTX VSR runs through the bridge's blocking export (a drain of the stream before each call, a device-wide sync after it) instead of the event-ordered one, and the host times each call (`RTX VSR eval N ms mean`); the same path an older bridge without the async export takes; A/B lever, never a product setting |
 | `SMV_VRAM_MIB=<MiB>` | the GPU's memory as the app's memory checks see it, the free memory shrinks with it (both routes): a smaller card's trigger test of the cap and of the `video memory ran out` line on a card everything fits in |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_FSRFG_DIR`, `SMV_FSRUP_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
+| `SMV_FSRFG_SHIM_LOG=1`, `VKD3D_DEBUG=warn` | AMD FSR 4 frame generation's debug output: the driver-extension shim's calls, vkd3d-proton's log (the bridge sets `VKD3D_DEBUG=none` unless set) |
 | `SMV_FSRFG_SDR_PAIRS=0` | on HDR planes AMD FSR frame generation gets every frame pair as the HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
@@ -1655,38 +1674,49 @@ deprecation notice.
 
 ### AMD FSR frame generation bridge (`smv_fsrfg_bridge.dll`)
 
-AMD's FSR 3.1.6 frame generation from the FSR SDK v2.3.0 source plus `fsrfg_bridge.cpp`, in one DLL
-(committed and shipped; MIT, see THIRD_PARTY_NOTICES.md). Prerequisites: the FSR SDK v2.3.0
-(github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, release v2.3.0; `Kits/FidelityFX` is all the build
-reads), the shader compiler `FidelityFX_SC.exe` with `dxcompiler.dll` + `dxil.dll` from the FidelityFX SDK
-v1.1.4 tools (MIT; AMD's v2.x tree does not publish it), Visual Studio 2026 with the C++ workload, python.
-In `engine/fsrfg/build_src/`:
+Our `fsrfg_bridge.cpp` (the bridge) and `amdxc64_shim.cpp` (`amdxc64.dll`) beside AMD's signed FSR SDK v2.3.0
+loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd3d-proton's two DLLs, all in
+`engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
+
+vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
+github.com/HansKristian-Work/vkd3d-proton at 31d1f89ca5b3f2fd3b6f025c8e6f73ed3eaa852b with its submodules
+(dxil-spirv at e79ef39803ee1dbf31c629bc7440a659122063c7), then
+
+```
+git apply engine/fsrfg/source/vkd3d-proton-31d1f89-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/dxil-spirv-e79ef39-smv.patch          (in subprojects/dxil-spirv)
+meson setup build --buildtype=release -Denable_extended_emulation=true
+ninja -C build
+```
+
+The vkd3d-proton patch: `VKD3D_FP8_EMULATION=1` takes the FP8-as-FP16 cooperative-matrix path NVIDIA needs
+(its 8-bit matrices are 16x16x32 only); a shared fence's timeline semaphore is exported as opaque Win32 where
+the driver exports no D3D12-fence type (NVIDIA); a shared texture's memory carries the access rights CUDA
+expects, and vkd3d-proton neither opens its own export through D3DKMT nor shares that D3DKMT copy (CUDA
+refuses such a handle); the two DLLs are named `smv_vkd3d_d3d12.dll` / `smv_vkd3d_d3d12core.dll`, so they
+never share a module name with the system D3D12 in the host's process. The dxil-spirv patch: FP8 matrix
+loads / stores staged through shared memory as FP16 (`DXIL_SPIRV_CONFIG=wmma_fp8_staging`), the
+configuration read from the process environment. Then in `engine/fsrfg/build_src/` (Visual Studio 2026 with
+the C++ workload, python):
 
 ```
 set FSR_SDK=C:\path\to\FidelityFX-SDK-v2.3.0
-set FFX_SC_DIR=C:\path\to\folder\with\FidelityFX_SC.exe
+set VKD3D_BUILD=C:\path\to\vkd3d-proton\build
 python build.py
 ```
 
-It copies the sources into `build_src\work` (gitignored; FidelityFX_SC found none of its includes with
-them under `%TEMP%`), removes the scene-change reset (`ffx_frameinterpolation_setup.h`: `if(Reset() ||
-HasSceneChanged())` -> `if(Reset())`), writes the two pieces AMD does not publish (the driver-provider
-header as a stub that never offers a provider, and the DLL's provider list: only the FSR 3 frame
-generation), applies four build fixes (no AGS, no PIX, `ffx_message.cpp`'s missing include, the shader
-tool's missing `entryName`: every pass compiles with `-E CS`), compiles 18 passes x 4 permutation sets
-and links `..\smv_fsrfg_bridge.dll`. The unchanged source matches AMD's signed DLL inside its own
-run-to-run spread (FSR FG is not run-to-run stable: two runs of AMD's DLL differ on about 2 % of a 1080p
-tween's pixels).
-
-C API (`fsrfg_bridge.cpp`, nvoffruc_bridge's shape): `fsrfg_create_i(i, w, h, luidLow, luidHigh, fmt,
-FsrfgShared*)` makes instance i (up to 4) on the D3D12 adapter with the CUDA device's LUID and returns
-NT handles of three shared COMMON buffers (the frame, RG16F vectors, the generated frame, with their row
-pitches) and a shared fence; `fsrfg_frame_i(i, wait, signal, reset, frameTimeMs)`: the bridge's queue
-waits for `wait`, copies the buffers into its textures, runs configure, prepare V2 (constant depth 0.5)
-and generate, copies the generated frame out and signals `signal` (non-blocking but for its two-list
-ring; no FSR shader reads the frame time); `fsrfg_destroy_i` / `fsrfg_destroy`; `fsrfg_last_error`.
-fmt 0 = RGBA8, 1 = RGBA16F (the host's). The host imports the handles as CUDA external memory and an
-external semaphore (stream signal odd, stream wait even).
+C API (`fsrfg_bridge.cpp`, nvoffruc_bridge's shape): `fsrfg_set_cache_dir(dir)` names vkd3d-proton's shader
+cache root before the first instance (the host passes the model cache's `fsr4_shaders`); `fsrfg_create_i(i, w,
+h, luidLow, luidHigh, fmt, FsrfgShared*)` makes instance i (up to 4) on vkd3d-proton's device for the CUDA
+device's adapter (the first one loads the chain and picks the DLL's FSR 4 version, or fails naming what it
+offers) and returns NT handles of three shared textures (the frame, RG16F vectors, the generated frame),
+their allocation sizes, a linear row pitch for each, and a shared fence; `fsrfg_frame_i(i, wait, signal,
+reset, frameTimeMs)`: the bridge's queue waits for `wait`, copies the shared textures into FSR's own, runs
+configure, prepare V2 (constant depth 0.5) and generate, copies the generated frame into the shared texture
+and signals `signal` (non-blocking but for its two-list ring); `fsrfg_provider()` = the FSR version ("4.0.1");
+`fsrfg_destroy_i` / `fsrfg_destroy`; `fsrfg_last_error`. fmt 0 = RGBA8, 1 = RGBA16F (the host's). The host
+imports the textures as CUDA external memory (opaque Win32, dedicated) mapped as arrays and the fence as a
+timeline semaphore (stream signal odd, stream wait even). `SMV_FSRFG_SHIM_LOG=1` logs the shim's calls.
 
 ### AMD FSR upscaling bridge (`smv_fsrup_bridge.dll`)
 
@@ -1700,9 +1730,21 @@ python build.py
 
 It compiles `fsrup_bridge.cpp` against the SDK's `api/include` and `upscalers/include` into `..\smv_fsrup_bridge.dll`
 and copies the two signed DLLs beside it. The bridge loads AMD's upscaler DLL by full path before the loader (the
-loader opens it by name, which the exe's folder would not resolve), then the loader. `fsrup_create(w, h, ow, oh,
-luidLow, luidHigh, want, FsrupShared*)`: a D3D12 device on the adapter with the CUDA device's LUID, the first upscaler
-version whose name starts with `want` (the host asks for "3.1"; on NVIDIA AMD's DLL offers 3.1.5 and 2.3.4), three
+loader opens it by name, which the exe's folder would not resolve), then the loader.
+
+The upscaler DLL (4.1.1) carries FSR 4's INT8 model but offers its 4.x version and runs that model only where an
+internal gate says yes: a function at RVA 0x8D70, `bool (context, ID3D12Device*)`, true when AMD's GPU query reports
+an RDNA 3 part; on any other GPU the DLL lists only 3.1.5 and 2.3.4. The SDK licence lists the DLL under MIT, so
+after loading it the bridge checks the build (PE timestamp 0x6A2AB5B3, image size 0x01B6F000, the function's first
+12 bytes) and makes that function return true in the process's copy (`mov al, 1; ret`), before the loader's first
+query; another build is refused (`fsrup_create` fails with the reason, the host's `not created` line). Measured on
+the RTX 5090 (harness `fsr4_int8_upscaler\int8_patch_check.py`): the 4.1.1 provider runs at ~1.26 ms a frame for
+854x480 -> 1920x1080 (FSR 3.1.5: ~0.19 ms), two processes byte for byte, the same model OptiScaler's own
+AmdInt8Check detour runs (52 dB apart, the same PSNR to the truth).
+
+`fsrup_create(w, h, ow, oh, luidLow, luidHigh, want, FsrupShared*)`: a D3D12 device on the adapter with the CUDA
+device's LUID, the first upscaler version whose name starts with `want` (the host asks for "4."; with the gate open
+AMD's DLL offers 4.1.1, 3.1.5 and 2.3.4), three
 shared COMMON buffers (RGBA8 frame, RG16F vectors, RGBA8 result) and a shared fence as NT handles; `fsrup_frame(wait,
 signal, reset, frameTimeMs)`: the queue waits, copies, upscales (non-linear sRGB, constant depth 0.5, no jitter,
 sharpening off), copies the result out and signals; `fsrup_destroy`, `fsrup_last_error`. The host feeds it RTX VSR's

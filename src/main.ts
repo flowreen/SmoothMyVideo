@@ -703,7 +703,7 @@ let liveFit = 'monitor'; // 'monitor' = whole-screen capture 1:1 (every model in
 let liveTarget = 60; // adaptive output fps target, inherited from the renderer's Speed selectors
 let liveSharpen = 0; // live Adaptive Sharpen strength 0..2, inherited from the Sharpen controls (0 = off)
 let liveVsr = false; // RTX VSR as the live upscaler, inherited from the RTX VSR checkbox
-let liveFsrUp = false; // AMD FSR 3.1 as the live upscaler instead (its checkbox; the two exclude each other)
+let liveFsrUp = false; // AMD FSR 4 as the live upscaler instead (its checkbox; the two exclude each other)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
 let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inherited from the NVIDIA DLSS 5 checkbox
@@ -1410,7 +1410,7 @@ function engineArgs(opts: RunOpts): string[] {
   // RTX VSR: the real RTX Video SDK (the engine/rtxvideo CUDA bridge) for an enlarging resize: the
   // final one from the working size (a mode below DLAA or an upscale), else the one before the
   // model; the plan skips it when nothing enlarges. Falls back to Lanczos3 if the bridge or the RTX
-  // Video runtime is unavailable. AMD FSR 3.1 (bundled) takes the same resize when its box is ticked instead.
+  // Video runtime is unavailable. AMD FSR 4 (bundled) takes the same resize when its box is ticked instead.
   if (opts.rtxvsr) args.push('--rtx-vsr');
   else if (opts.fsrup) args.push('--fsr-upscale');
   // "Fit to the GPU" off: no video memory fit (the batch and Auto's working size stay as planned, slower when memory runs short)

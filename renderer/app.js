@@ -609,7 +609,7 @@ localStorage.removeItem('encspeed');   // retired: no Encoder speed selector (ev
 localStorage.removeItem('rtxvsrOn');   // retired: its stored choice was made while RTX VSR defaulted off
 $('rtxvsr').checked = localStorage.getItem('vsrOn') !== '0';   // default ON: RTX VSR upscales unless unticked
 if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // default OFF
-// AMD FSR 3.1 upscaling: bundled (engine/fsrup), so always ready; RTX VSR and it exclude each other (ticking one clears
+// AMD FSR 4 upscaling: bundled (engine/fsrup), so always ready; RTX VSR and it exclude each other (ticking one clears
 // the other), neither ticked = Lanczos3
 $('fsrup').checked = localStorage.getItem('fsrupOn') === '1';   // default OFF: RTX VSR is the default upscaler
 if($('fsrup').checked) $('rtxvsr').checked = false;
@@ -890,7 +890,7 @@ function liveModelInfo(){
   // for the tweens, the real frames keep full precision)
   if(modelIsFruc()) return { model:'fruc', name:'Smooth Motion', note:'tweens at 8-bit precision' };
   // AMD FSR frame generation live: Smooth Motion's route (the nearest node of the pair's midpoint tree), its own bridge
-  if(modelIsFsrfg()) return { model:'fsrfg', name:'AMD FSR 3.1', note:'' };
+  if(modelIsFsrfg()) return { model:'fsrfg', name:'AMD FSR 4', note:'' };
   // NVIDIA Optical Flow: adaptive like rife (the splat takes any fraction), native only
   if(modelIsNvof()) return { model:'nvof', name:'NVIDIA Optical Flow', note:'' };
   // nothing ticked = interpolation off (same meaning as file renders): the echo backend passes
@@ -934,7 +934,7 @@ function lvSendOpts(){
     // resize that enlarges, the host picks it (none enlarges = skipped)
     sharpen: $('sharpen').checked ? parseFloat($('sharpval').value) || 0 : 0,
     rtxvsr: liveVsrOn(),
-    fsrup: fsrUpOn(),   // AMD FSR 3.1 takes the same resize when ticked instead of RTX VSR
+    fsrup: fsrUpOn(),   // AMD FSR 4 takes the same resize when ticked instead of RTX VSR
     // no "Upscale to": Live's size is what Display presents (the window or the screen), the DLSS mode its speed
     // Restore (AI detail): Real-ESRGAN first on every presented frame, python route only
     restore: restoreOn(),
@@ -1342,7 +1342,7 @@ async function loadPreview(frame, bg){   // bg: background "refine" pass (the RT
   const lite = previewLite; previewLite = false;
   const useHdr = lite ? false : hdr;
   const useVsr = lite ? false : !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1);   // VSR enlarges only
-  const useFsr = lite ? false : fsrUpOn() && upFactor() > 1;   // AMD FSR 3.1 the same way
+  const useFsr = lite ? false : fsrUpOn() && upFactor() > 1;   // AMD FSR 4 the same way
   const useNr = lite ? false : nrOn();     // DLSS 5: its host takes seconds to start, so the lite pass skips it too
   inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame)].concat(sig));
   $('hdrpreview').style.display = 'block';
@@ -1662,7 +1662,7 @@ function startRun(){
   const dims = upDims();                               // resize target ({w,h} or null)
   const factor = upFactor();                           // arbitrary resize factor (0 = off, <1 downscales)
   const useRtxVsr = factor > 1 && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale of an enlarging resize, else Lanczos3
-  const useFsrUp = factor > 1 && fsrUpOn();            // AMD FSR 3.1 instead of RTX VSR when ticked
+  const useFsrUp = factor > 1 && fsrUpOn();            // AMD FSR 4 instead of RTX VSR when ticked
   const rtxhdr = hdrOn();  // HDR only when its runtime is installed and the source is SDR
   // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
   // HDR is on. Bail only when nothing at all is enabled.
@@ -1725,7 +1725,7 @@ function startRun(){
     payload.upscale = factor;                          // arbitrary upscale factor (target height / source)
   }
   if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else Lanczos3)
-  if(useFsrUp) payload.fsrup = true;                   // AMD FSR 3.1 upscaling (engine/fsrup)
+  if(useFsrUp) payload.fsrup = true;                   // AMD FSR 4 upscaling (engine/fsrup)
   if(!$('gpufit').checked) payload.nogpufit = true;    // no video memory fit: the same fps, slower when memory runs short
   if(rtxhdr){ payload.rtxhdr = true;     // HDR10; engine masters at a fixed 1000-nit peak
     const hp = hdrColorPayload();        // zero-strength Dynamic Vibrance routes to the source path

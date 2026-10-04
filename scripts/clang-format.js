@@ -23,6 +23,7 @@ const FILES = [
   'engine/dlssg/build_src/main.cpp',
   'engine/nvoffruc/build_src/nvoffruc_bridge.cpp',
   'engine/fsrfg/build_src/fsrfg_bridge.cpp',
+  'engine/fsrfg/build_src/amdxc64_shim.cpp',
   'engine/fsrup/build_src/fsrup_bridge.cpp',
 ];
 

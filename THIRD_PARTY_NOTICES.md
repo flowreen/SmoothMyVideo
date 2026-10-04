@@ -45,14 +45,14 @@ third-party work.
   > THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
   > (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
   > THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-* **AMD FidelityFX SDK v2.3.0: FSR 3.1.6 frame generation and FSR upscaling** (the AMD FSR 3.1 model and the
-  AMD FSR 3.1 upscaler): AMD's MIT-licensed sources (the FSR 3 frame generation and its optical flow, the FidelityFX
-  API and DX12 backend) compiled with one change (the optical flow's scene-change reset removed) and our bridge into
-  `engine/fsrfg/smv_fsrfg_bridge.dll` (the recipe: `engine/fsrfg/build_src/`; the shader compiler FidelityFX_SC and
-  DXC from the FidelityFX SDK v1.1.4 are build tools only, not shipped), and AMD's signed binaries
-  `amd_fidelityfx_loader_dx12.dll` and `amd_fidelityfx_upscaler_dx12.dll`, redistributed unmodified in
-  `engine/fsrup/` beside our `smv_fsrup_bridge.dll` (the recipe: `engine/fsrup/build_src/`). Every one of these files
-  is listed in the MIT section of the SDK's `Kits/FidelityFX/docs/license.md`. MIT License:
+* **AMD FidelityFX SDK v2.3.0: FSR 4 frame generation and FSR upscaling** (the AMD FSR 4 frame generation model and
+  the AMD FSR 4 upscaler): AMD's signed binaries `amd_fidelityfx_loader_dx12.dll` with
+  `amd_fidelityfx_framegeneration_dx12.dll` (in `engine/fsrfg/`) and with `amd_fidelityfx_upscaler_dx12.dll` (in
+  `engine/fsrup/`), redistributed unmodified beside our bridges `smv_fsrfg_bridge.dll` and `smv_fsrup_bridge.dll`
+  (the recipes: `engine/fsrfg/build_src/`, `engine/fsrup/build_src/`). At run time `smv_fsrup_bridge.dll` changes
+  one function of the upscaler DLL in memory (its GPU check), so FSR 4's model runs on NVIDIA GPUs; the files on
+  disk are AMD's. Every one of these files is listed in the MIT section of the SDK's
+  `Kits/FidelityFX/docs/license.md` (reproduced in `engine/fsrfg/licenses/`). MIT License:
 
   > Copyright (C) Advanced Micro Devices, Inc.
   >
@@ -69,6 +69,17 @@ third-party work.
   > AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
   > TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   > SOFTWARE.
+* **vkd3d-proton** (D3D12 on Vulkan: it runs AMD's FSR 4 frame generation on NVIDIA GPUs):
+  `engine/fsrfg/smv_vkd3d_d3d12.dll` and `engine/fsrfg/smv_vkd3d_d3d12core.dll`, built from vkd3d-proton
+  (github.com/HansKristian-Work/vkd3d-proton) commit 31d1f89ca5b3f2fd3b6f025c8e6f73ed3eaa852b with its dxil-spirv at
+  e79ef39803ee1dbf31c629bc7440a659122063c7, both modified: the patches ship beside the DLLs in `engine/fsrfg/source/`,
+  the build steps are in `engine/fsrfg/build_src/build.py`. GNU Lesser General Public License 2.1 (vkd3d-proton's
+  COPYING, LICENSE and AUTHORS in `engine/fsrfg/licenses/`); the app loads the two DLLs at run time, so a rebuild from
+  the corresponding source replaces them. Built into them, with their notices in `engine/fsrfg/licenses/`: dxil-spirv
+  (MIT), its bc-decoder (MIT, Copyright (c) 2019-2020 Baldur Karlsson), the glslang SPIR-V builder (BSD 3-Clause) and
+  SPIRV-Headers (MIT).
+* `engine/fsrfg/amdxc64.dll` is this project's own code (`engine/fsrfg/build_src/amdxc64_shim.cpp`, MIT): it answers
+  the driver-extension queries of AMD's frame generation DLL so the DLL offers FSR 4; it contains no AMD code.
 * **NVIDIA RTX Video SDK sample code**: the compiled bridge `engine/rtxvideo/rtxvideo_cuda.dll`
   is built from NVIDIA's SDK convenience layer (sources in `engine/rtxvideo/build_src/`),
   used under the NVIDIA RTX Video SDK license. The SDK's AI feature models (`nvngx_vsr.dll`,

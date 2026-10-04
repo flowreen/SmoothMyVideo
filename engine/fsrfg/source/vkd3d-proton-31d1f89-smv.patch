@@ -1,0 +1,288 @@
+diff --git a/include/vkd3d_sonames.h b/include/vkd3d_sonames.h
+index fd32ba4..5c33321 100644
+--- a/include/vkd3d_sonames.h
++++ b/include/vkd3d_sonames.h
+@@ -23,7 +23,7 @@
+ 
+ #if defined(_WIN32)
+ #define SONAME_LIBVULKAN "vulkan-1.dll"
+-#define SONAME_D3D12CORE "d3d12core.dll"
++#define SONAME_D3D12CORE "smv_vkd3d_d3d12core.dll" /* SMV patch: the renamed core (libs/d3d12core/meson.build) */
+ #elif defined(__ANDROID__)
+ #define SONAME_LIBVULKAN "libvulkan.so"
+ #define SONAME_D3D12CORE "libvkd3d-proton-d3d12core.so"
+diff --git a/libs/d3d12/d3d12.def b/libs/d3d12/d3d12.def
+index 12b1d03..086e33a 100644
+--- a/libs/d3d12/d3d12.def
++++ b/libs/d3d12/d3d12.def
+@@ -1,4 +1,4 @@
+-LIBRARY d3d12.dll
++LIBRARY smv_vkd3d_d3d12.dll
+ 
+ EXPORTS
+     D3D12CreateDevice @101
+diff --git a/libs/d3d12/meson.build b/libs/d3d12/meson.build
+index d99da14..a2005b1 100644
+--- a/libs/d3d12/meson.build
++++ b/libs/d3d12/meson.build
+@@ -3,7 +3,8 @@ d3d12_src = [
+ ]
+ 
+ if vkd3d_platform == 'windows'
+-  d3d12_name_prefix = ''
++  # SMV patch: renamed so it never shares a module name with the system d3d12.dll in the same process
++  d3d12_name_prefix = 'smv_vkd3d_'
+   d3d12_dependencies = [ vkd3d_common_dep, lib_gdi32, lib_dxgi ]
+ else
+   d3d12_name_prefix = 'libvkd3d-proton-'
+diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
+index abd56d6..a542b74 100644
+--- a/libs/d3d12core/d3d12core.def
++++ b/libs/d3d12core/d3d12core.def
+@@ -1,4 +1,4 @@
+-LIBRARY d3d12core.dll
++LIBRARY smv_vkd3d_d3d12core.dll
+ 
+ EXPORTS
+     D3D12GetInterface
+diff --git a/libs/d3d12core/meson.build b/libs/d3d12core/meson.build
+index dd1f779..7e168e0 100644
+--- a/libs/d3d12core/meson.build
++++ b/libs/d3d12core/meson.build
+@@ -4,7 +4,8 @@ d3d12core_src = [
+ ]
+ 
+ if vkd3d_platform == 'windows'
+-  d3d12core_name_prefix = ''
++  # SMV patch: renamed so it never shares a module name with the system D3D12Core.dll in the same process
++  d3d12core_name_prefix = 'smv_vkd3d_'
+   d3d12core_dependencies = [ vkd3d_dep, lib_gdi32, lib_dxgi ]
+ else
+   d3d12core_name_prefix = 'libvkd3d-proton-'
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ea1e8a0..56c1fe4 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -394,26 +394,32 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device, VkSemaphore vk_se
+     }
+ }
+ 
+-HRESULT vkd3d_create_timeline_semaphore(struct d3d12_device *device, uint64_t initial_value, bool shared, VkSemaphore *vk_semaphore)
++/* SMV patch: the handle type a shared fence's timeline semaphore is exported as: D3D12_FENCE where the host supports
++ * it, else OPAQUE_WIN32 (NVIDIA's Vulkan driver exports timeline semaphores only that way; CUDA imports such a handle
++ * as a timeline semaphore); 0 = neither. */
++VkExternalSemaphoreHandleTypeFlagBits vkd3d_shared_timeline_semaphore_handle_type(struct d3d12_device *device)
+ {
++    static const VkExternalSemaphoreHandleTypeFlagBits types[] =
++    {
++        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT,
++        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
++    };
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     VkPhysicalDeviceExternalSemaphoreInfo external_semaphore_info;
+     VkExternalSemaphoreProperties external_semaphore_properties;
+-    VkExportSemaphoreCreateInfo export_info;
+     VkSemaphoreTypeCreateInfoKHR type_info;
+-    VkSemaphoreCreateInfo info;
+-    VkResult vr;
+-
+-    type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR;
+-    type_info.pNext = NULL;
+-    type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR;
+-    type_info.initialValue = initial_value;
++    unsigned int i;
+ 
+-    if (shared)
++    for (i = 0; i < ARRAY_SIZE(types); i++)
+     {
++        type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR;
++        type_info.pNext = NULL;
++        type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR;
++        type_info.initialValue = 0;
++
+         external_semaphore_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO;
+         external_semaphore_info.pNext = &type_info;
+-        external_semaphore_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
++        external_semaphore_info.handleType = types[i];
+ 
+         external_semaphore_properties.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES;
+         external_semaphore_properties.pNext = NULL;
+@@ -421,17 +427,40 @@ HRESULT vkd3d_create_timeline_semaphore(struct d3d12_device *device, uint64_t in
+         VK_CALL(vkGetPhysicalDeviceExternalSemaphoreProperties(device->vk_physical_device,
+                 &external_semaphore_info, &external_semaphore_properties));
+ 
+-        if (!(external_semaphore_properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) ||
+-            !(external_semaphore_properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) ||
+-            !(external_semaphore_properties.exportFromImportedHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT))
++        if ((external_semaphore_properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) &&
++            (external_semaphore_properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) &&
++            (external_semaphore_properties.exportFromImportedHandleTypes & types[i]))
++            return types[i];
++    }
++
++    return 0;
++}
++
++HRESULT vkd3d_create_timeline_semaphore(struct d3d12_device *device, uint64_t initial_value, bool shared, VkSemaphore *vk_semaphore)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkExternalSemaphoreHandleTypeFlagBits handle_type;
++    VkExportSemaphoreCreateInfo export_info;
++    VkSemaphoreTypeCreateInfoKHR type_info;
++    VkSemaphoreCreateInfo info;
++    VkResult vr;
++
++    type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR;
++    type_info.pNext = NULL;
++    type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR;
++    type_info.initialValue = initial_value;
++
++    if (shared)
++    {
++        if (!(handle_type = vkd3d_shared_timeline_semaphore_handle_type(device)))
+         {
+-            WARN("D3D12-Fence shared timeline semaphores not supported by host.\n");
++            WARN("Shared timeline semaphores (D3D12-Fence or opaque Win32) not supported by host.\n");
+             return E_NOTIMPL;
+         }
+ 
+         export_info.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+         export_info.pNext = NULL;
+-        export_info.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
++        export_info.handleTypes = handle_type;
+ 
+         type_info.pNext = &export_info;
+     }
+diff --git a/libs/vkd3d/d3dkmt.c b/libs/vkd3d/d3dkmt.c
+index 8fabb24..588d233 100644
+--- a/libs/vkd3d/d3dkmt.c
++++ b/libs/vkd3d/d3dkmt.c
+@@ -61,6 +61,10 @@ void d3d12_shared_fence_open_export_kmt(struct d3d12_shared_fence *fence, struct
+         return;
+     }
+ 
++    /* SMV patch: a semaphore exported as opaque Win32 has no D3D12-Fence handle to open */
++    if (vkd3d_shared_timeline_semaphore_handle_type(device) != VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
++        return;
++
+     win32_handle_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
+     win32_handle_info.pNext = NULL;
+     win32_handle_info.semaphore = fence->timeline_semaphore;
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index bfabbe0..2cb14f7 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2438,9 +2438,19 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
+                 break;
+ 
+             default:
++            {
++                char fp8_emul[16];
++
++                /* SMV harness patch: let VKD3D_FP8_EMULATION=1 try the out-of-spec 8-bit accumulator elsewhere. */
++                if (vkd3d_get_env_var("VKD3D_FP8_EMULATION", fp8_emul, sizeof(fp8_emul)) && fp8_emul[0] == '1')
++                {
++                    WARN("8-bit Accumulator type not exposed, trying it anyway (VKD3D_FP8_EMULATION=1).\n");
++                    break;
++                }
+                 /* This is out of spec and known to segfault some drivers, so just don't bother.
+                  * FSR4 is only relevant on AMD GPUs anyway. */
+                 return false;
++            }
+         }
+     }
+ 
+@@ -2673,6 +2683,16 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+ 
+     if (physical_device_info->cooperative_matrix_features.cooperativeMatrix)
+     {
++        char fp8_emul[16];
++
++        /* SMV harness patch: NVIDIA exposes 8-bit cooperative matrices only as 16x16x32, so take the FP8-as-FP16
++         * emulation path (u8 storage, f16 16x16x16 math) even where native float8 cooperative matrices exist. */
++        if (vkd3d_get_env_var("VKD3D_FP8_EMULATION", fp8_emul, sizeof(fp8_emul)) && fp8_emul[0] == '1')
++        {
++            INFO("VKD3D_FP8_EMULATION=1: native float8 cooperative matrices ignored.\n");
++            physical_device_info->shader_float8_features.shaderFloat8CooperativeMatrix = VK_FALSE;
++        }
++
+         if (!vkd3d_supports_minimum_coopmat_caps(device))
+         {
+             physical_device_info->cooperative_matrix_features.cooperativeMatrix = VK_FALSE;
+@@ -6714,12 +6734,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
+             return DXGI_ERROR_INVALID_CALL;
+         }
+ 
+-        if (D3DKMTShareObjects(1, &resource->kmt_local, &attr, access, handle) == STATUS_SUCCESS)
+-        {
+-            ID3D12Resource_Release(resource_iface);
+-            return S_OK;
+-        }
+-
++        /* SMV patch: the Vulkan export handle below (CUDA imports it as opaque Win32); a D3DKMT share of the resource
++         * vkd3d-proton opened from that export does not import into CUDA. */
+         if (attributes)
+             FIXME("attributes %p not handled.\n", attributes);
+         if (access)
+@@ -6801,7 +6817,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
+         win32_handle_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
+         win32_handle_info.pNext = NULL;
+         win32_handle_info.semaphore = fence->timeline_semaphore;
+-        win32_handle_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
++        /* SMV patch: the type the semaphore was created exportable as */
++        win32_handle_info.handleType = vkd3d_shared_timeline_semaphore_handle_type(device);
+ 
+         vr = VK_CALL(vkGetSemaphoreWin32HandleKHR(device->vk_device, &win32_handle_info, handle));
+ 
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index a8fc26b..878fdf8 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -4400,6 +4400,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+ 
+ #ifdef _WIN32
+         VkImportMemoryWin32HandleInfoKHR import_info;
++        VkExportMemoryWin32HandleInfoKHR export_win32_info;
+ #endif
+ 
+         if (FAILED(hr = d3d12_resource_create_vk_resource(object, num_castable_formats, castable_formats, device)))
+@@ -4473,8 +4474,15 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+             }
+             else
+             {
++                /* SMV patch: the handle's access rights as NVIDIA's CUDA interop samples set them; without them CUDA
++                 * refuses the export (cudaErrorOperatingSystem) */
++                export_win32_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
++                export_win32_info.pNext = allocate_info.pNext;
++                export_win32_info.pAttributes = NULL;
++                export_win32_info.dwAccess = 0x80000000u | 0x1u; /* DXGI_SHARED_RESOURCE_READ | _WRITE */
++                export_win32_info.name = NULL;
+                 export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+-                export_info.pNext = allocate_info.pNext;
++                export_info.pNext = &export_win32_info;
+                 export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+                 allocate_info.pNext = &export_info;
+             }
+@@ -4518,8 +4526,8 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+         if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, allocation)))
+             goto fail;
+ 
+-        if ((heap_flags & D3D12_HEAP_FLAG_SHARED) && export_info.handleTypes == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT)
+-            d3d12_resource_open_export_kmt(object, device, allocation);
++        /* SMV patch: no D3DKMT open of the export (only the D3DKMT share in CreateSharedHandle reads it, and that
++         * share is skipped): CUDA could not import a handle vkd3d-proton had opened this way. */
+ 
+         bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
+         bind_info.pNext = NULL;
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 3e71f89..866e3d0 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -342,6 +342,7 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device,
+         VkSemaphore vk_semaphore, uint64_t value);
+ HRESULT vkd3d_create_timeline_semaphore(struct d3d12_device *device,
+         uint64_t initial_value, bool shared, VkSemaphore *vk_semaphore);
++VkExternalSemaphoreHandleTypeFlagBits vkd3d_shared_timeline_semaphore_handle_type(struct d3d12_device *device);
+ HRESULT vkd3d_enqueue_timeline_semaphore(struct vkd3d_fence_worker *worker,
+         const struct vkd3d_fence_wait_info *fence_info,
+         const struct vkd3d_queue_timeline_trace_cookie *timeline_cookie);

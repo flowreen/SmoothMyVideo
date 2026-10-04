@@ -1,0 +1,585 @@
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index a8be13e..7440418 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -9967,15 +9967,29 @@ const GlobalConfiguration &GlobalConfiguration::get()
+ 	return config;
+ }
+ 
++#ifdef _WIN32
++// SMV harness patch: read the OS environment, which a host process can still set after this DLL's C runtime took its
++// snapshot (getenv only sees that snapshot when the host uses another C runtime).
++extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char *, char *, unsigned long);
++#endif
++
+ GlobalConfiguration::GlobalConfiguration()
+ {
++#ifdef _WIN32
++	char env_buf[256];
++	unsigned long env_len = GetEnvironmentVariableA("DXIL_SPIRV_CONFIG", env_buf, sizeof(env_buf));
++	const char *env = env_len > 0 && env_len < sizeof(env_buf) ? env_buf : nullptr;
++#else
+ 	const char *env = getenv("DXIL_SPIRV_CONFIG");
++#endif
+ 	if (env)
+ 	{
+ 		if (strcmp(env, "wmma_rdna3_workaround") == 0)
+ 			wmma_rdna3_workaround = true;
+ 		else if (strcmp(env, "wmma_conv_hack") == 0)
+ 			wmma_conv_hack = true;
++		else if (strcmp(env, "wmma_fp8_staging") == 0)
++			wmma_fp8_staging = true;
+ 		else if (strcmp(env, "debug_simulate_min16float_min_spec") == 0)
+ 			simulate_min16float_min_spec = true;
+ 	}
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index bd78b84..2400c2d 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -170,6 +170,8 @@ public:
+ 	static const GlobalConfiguration &get();
+ 	bool wmma_rdna3_workaround = false;
+ 	bool wmma_conv_hack = false;
++	// SMV harness patch: FP8 emulation without 8-bit cooperative matrices (FP8 load / store staged through LDS as FP16).
++	bool wmma_fp8_staging = false;
+ 	bool simulate_min16float_min_spec = false;
+ 
+ private:
+diff --git a/opcodes/dxil/dxil_ags.cpp b/opcodes/dxil/dxil_ags.cpp
+index 6426251..0cc29e2 100644
+--- a/opcodes/dxil/dxil_ags.cpp
++++ b/opcodes/dxil/dxil_ags.cpp
+@@ -524,6 +524,45 @@ static spv::Id emit_coopmat_transpose_with_convert(
+ 	return 0;
+ }
+ 
++// One 16x16 u32 LDS block per subgroup, shared by the transpose path and the FP8 staging path.
++static bool ensure_coopmat_scratch(Converter::Impl &impl)
++{
++	auto &builder = impl.builder();
++	if (impl.ags.coopmat_transpose_scratch)
++		return true;
++
++	spv::Id lds_type_id = builder.makeUintType(32);
++	uint32_t num_elements = 16 * 16;
++
++	// Assume that the workgroup is aligned.
++	uint32_t max_num_workgroups = impl.execution_mode_meta.workgroup_threads[0] *
++	                              impl.execution_mode_meta.workgroup_threads[1] *
++	                              impl.execution_mode_meta.workgroup_threads[2];
++
++	if (impl.execution_mode_meta.wave_size_min)
++		max_num_workgroups /= impl.execution_mode_meta.wave_size_min;
++	else if (impl.options.subgroup_size.implementation_minimum)
++		max_num_workgroups /= impl.options.subgroup_size.implementation_minimum;
++	else
++	{
++		LOGE("Need LDS transpose, but there is no estimate for how large the LDS buffer needs to be.\n");
++		return false;
++	}
++
++	if (!max_num_workgroups)
++	{
++		LOGE("Invalid workgroup size.\n");
++		return false;
++	}
++
++	num_elements *= max_num_workgroups;
++
++	lds_type_id = builder.makeArrayType(lds_type_id, builder.makeUintConstant(num_elements), 0);
++	impl.ags.coopmat_transpose_scratch =
++	    impl.create_variable(spv::StorageClassWorkgroup, lds_type_id, "LDSTransposeScratch");
++	return true;
++}
++
+ static spv::Id emit_coopmat_transpose(Converter::Impl &impl, spv::Id v, uint32_t input_imm, uint32_t output_imm)
+ {
+ 	auto &builder = impl.builder();
+@@ -541,38 +580,8 @@ static spv::Id emit_coopmat_transpose(Converter::Impl &impl, spv::Id v, uint32_t
+ 		}
+ 	}
+ 
+-	if (!impl.ags.coopmat_transpose_scratch)
+-	{
+-		spv::Id lds_type_id = builder.makeUintType(32);
+-		uint32_t num_elements = 16 * 16;
+-
+-		// Assume that the workgroup is aligned.
+-		uint32_t max_num_workgroups = impl.execution_mode_meta.workgroup_threads[0] *
+-		                              impl.execution_mode_meta.workgroup_threads[1] *
+-		                              impl.execution_mode_meta.workgroup_threads[2];
+-
+-		if (impl.execution_mode_meta.wave_size_min)
+-			max_num_workgroups /= impl.execution_mode_meta.wave_size_min;
+-		else if (impl.options.subgroup_size.implementation_minimum)
+-			max_num_workgroups /= impl.options.subgroup_size.implementation_minimum;
+-		else
+-		{
+-			LOGE("Need LDS transpose, but there is no estimate for how large the LDS buffer needs to be.\n");
+-			return 0;
+-		}
+-
+-		if (!max_num_workgroups)
+-		{
+-			LOGE("Invalid workgroup size.\n");
+-			return 0;
+-		}
+-
+-		num_elements *= max_num_workgroups;
+-
+-		lds_type_id = builder.makeArrayType(lds_type_id, builder.makeUintConstant(num_elements), 0);
+-		impl.ags.coopmat_transpose_scratch =
+-		    impl.create_variable(spv::StorageClassWorkgroup, lds_type_id, "LDSTransposeScratch");
+-	}
++	if (!ensure_coopmat_scratch(impl))
++		return 0;
+ 
+ 	if (get_type_data_format(input_imm) != get_type_data_format(output_imm))
+ 		return 0;
+@@ -1745,11 +1754,23 @@ static bool emit_wmma_convert(Converter::Impl &impl)
+ 	return true;
+ }
+ 
++enum class WMMAMemoryKind
++{
++	None,
++	LDS, // u32 elements, offset and stride in u32 units
++	SSBO, // u8 elements of buffer_id's member 0
++	BDA // u8 elements of a runtime array at base_id
++};
++
+ struct WMMAAccessChain
+ {
+ 	spv::Id chain_id;
+ 	spv::Id stride_id;
+ 	uint32_t alignment;
++	// For element-wise access (wmma_fp8_staging).
++	WMMAMemoryKind kind;
++	spv::Id base_id;
++	spv::Id offset_id;
+ };
+ 
+ static WMMAAccessChain build_wmma_access_chain(
+@@ -1771,6 +1792,9 @@ static WMMAAccessChain build_wmma_access_chain(
+ 		impl.add(chain);
+ 		ret.chain_id = chain->id;
+ 		ret.stride_id = impl.get_id_for_value(stride);
++		ret.kind = WMMAMemoryKind::LDS;
++		ret.base_id = impl.ags.active_uav_ptr;
++		ret.offset_id = impl.get_id_for_value(offset);
+ 		return ret;
+ 	}
+ 
+@@ -1799,6 +1823,9 @@ static WMMAAccessChain build_wmma_access_chain(
+ 		impl.add(chain);
+ 		ret.chain_id = chain->id;
+ 		ret.stride_id = impl.get_id_for_value(stride);
++		ret.kind = WMMAMemoryKind::SSBO;
++		ret.base_id = buffer_id;
++		ret.offset_id = impl.get_id_for_value(offset);
+ 	}
+ 	else if (meta.storage == spv::StorageClassPhysicalStorageBuffer)
+ 	{
+@@ -1823,6 +1850,9 @@ static WMMAAccessChain build_wmma_access_chain(
+ 		ret.chain_id = chain->id;
+ 		ret.stride_id = impl.get_id_for_value(stride);
+ 		ret.alignment = 16; // Unsure what requirements are here. Just do the simple thing.
++		ret.kind = WMMAMemoryKind::BDA;
++		ret.base_id = cast->id;
++		ret.offset_id = impl.get_id_for_value(offset);
+ 	}
+ 	else
+ 	{
+@@ -1832,6 +1862,356 @@ static WMMAAccessChain build_wmma_access_chain(
+ 	return ret;
+ }
+ 
++// wmma_fp8_staging: FP8 matrices are emulated as FP16, and their memory form (bytes) never becomes an 8-bit
++// cooperative matrix (out of spec where the implementation exposes no 16x16x16 8-bit shape, e.g. NVIDIA). A load reads
++// the 256 bytes element-wise, converts them to FP16 into this subgroup's LDS scratch block (column-major, stride 8
++// u32 = 16 FP16 per column), then loads the FP16 matrix from there; a store is the reverse. Each lane handles element
++// pairs p = (lane + i * min_wave) & 127: column p >> 3, rows 2 * (p & 7) and + 1, scratch word p.
++static spv::Id emit_staging_u32_op(Converter::Impl &impl, spv::Op op, spv::Id a, spv::Id b)
++{
++	auto *o = impl.allocate(op, impl.builder().makeUintType(32));
++	o->add_id(a);
++	o->add_id(b);
++	impl.add(o);
++	return o->id;
++}
++
++static void emit_staging_barrier(Converter::Impl &impl)
++{
++	auto &builder = impl.builder();
++	auto *barrier = impl.allocate(spv::OpControlBarrier);
++	barrier->add_id(builder.makeUintConstant(spv::ScopeSubgroup));
++	barrier->add_id(builder.makeUintConstant(spv::ScopeSubgroup));
++	barrier->add_id(builder.getWorkgroupBarrierSemanticsId());
++	impl.add(barrier);
++}
++
++static spv::Id emit_staging_scratch_ptr(Converter::Impl &impl, spv::Id word_index)
++{
++	auto &builder = impl.builder();
++	auto *chain = impl.allocate(spv::OpInBoundsAccessChain,
++	                            builder.makePointer(spv::StorageClassWorkgroup, builder.makeUintType(32)));
++	chain->add_id(impl.ags.coopmat_transpose_scratch);
++	chain->add_id(word_index);
++	impl.add(chain);
++	return chain->id;
++}
++
++static spv::Id emit_staging_scratch_base(Converter::Impl &impl)
++{
++	auto &builder = impl.builder();
++	spv::Id subgroup_id_var = impl.spirv_module.get_builtin_shader_input(spv::BuiltInSubgroupId);
++	auto *subgroup_id = impl.allocate(spv::OpLoad, builder.makeUintType(32));
++	subgroup_id->add_id(subgroup_id_var);
++	impl.add(subgroup_id);
++	return emit_staging_u32_op(impl, spv::OpIMul, subgroup_id->id, builder.makeUintConstant(16 * 16));
++}
++
++static uint32_t staging_min_wave(Converter::Impl &impl)
++{
++	uint32_t w = impl.execution_mode_meta.wave_size_min;
++	if (!w)
++		w = impl.options.subgroup_size.implementation_minimum;
++	if (!w || w > 128)
++		w = 32;
++	return w;
++}
++
++// Byte offset of matrix element (row, col) from the access chain's offset, in bytes (LDS: stride is in u32 units).
++static spv::Id emit_staging_byte_offset(Converter::Impl &impl, const WMMAAccessChain &chain, bool column_major,
++                                        spv::Id row, spv::Id col)
++{
++	auto &builder = impl.builder();
++	spv::Id major = column_major ? col : row;
++	spv::Id minor = column_major ? row : col;
++	spv::Id stride = chain.stride_id;
++	if (chain.kind == WMMAMemoryKind::LDS)
++		stride = emit_staging_u32_op(impl, spv::OpIMul, stride, builder.makeUintConstant(4));
++	spv::Id m = emit_staging_u32_op(impl, spv::OpIMul, major, stride);
++	return emit_staging_u32_op(impl, spv::OpIAdd, m, minor);
++}
++
++static spv::Id emit_staging_byte_ptr(Converter::Impl &impl, const WMMAAccessChain &chain, spv::Id byte_off)
++{
++	auto &builder = impl.builder();
++	spv::Id u8_type = builder.makeUintType(8);
++	if (chain.kind == WMMAMemoryKind::SSBO)
++	{
++		spv::Id idx = emit_staging_u32_op(impl, spv::OpIAdd, chain.offset_id, byte_off);
++		auto *ptr = impl.allocate(spv::OpAccessChain, builder.makePointer(spv::StorageClassStorageBuffer, u8_type));
++		ptr->add_id(chain.base_id);
++		ptr->add_id(builder.makeUintConstant(0));
++		ptr->add_id(idx);
++		impl.add(ptr);
++		return ptr->id;
++	}
++	else
++	{
++		spv::Id idx = emit_staging_u32_op(impl, spv::OpIAdd, chain.offset_id, byte_off);
++		auto *ptr = impl.allocate(spv::OpAccessChain,
++		                          builder.makePointer(spv::StorageClassPhysicalStorageBuffer, u8_type));
++		ptr->add_id(chain.base_id);
++		ptr->add_id(idx);
++		impl.add(ptr);
++		return ptr->id;
++	}
++}
++
++static spv::Id emit_staging_lds_word_ptr(Converter::Impl &impl, const WMMAAccessChain &chain, spv::Id byte_off)
++{
++	auto &builder = impl.builder();
++	spv::Id word = emit_staging_u32_op(impl, spv::OpShiftRightLogical, byte_off, builder.makeUintConstant(2));
++	word = emit_staging_u32_op(impl, spv::OpIAdd, chain.offset_id, word);
++	auto *ptr = impl.allocate(spv::OpAccessChain,
++	                          builder.makePointer(spv::StorageClassWorkgroup, builder.makeUintType(32)));
++	ptr->add_id(chain.base_id);
++	ptr->add_id(word);
++	impl.add(ptr);
++	return ptr->id;
++}
++
++static spv::Id emit_staging_lds_shift(Converter::Impl &impl, spv::Id byte_off)
++{
++	auto &builder = impl.builder();
++	spv::Id lane = emit_staging_u32_op(impl, spv::OpBitwiseAnd, byte_off, builder.makeUintConstant(3));
++	return emit_staging_u32_op(impl, spv::OpShiftLeftLogical, lane, builder.makeUintConstant(3));
++}
++
++static spv::Id emit_staging_load_fp8_as_fp16(Converter::Impl &impl, const WMMAAccessChain &chain, spv::Id byte_off)
++{
++	auto &builder = impl.builder();
++	spv::Id u8_type = builder.makeUintType(8);
++	spv::Id f16_type = builder.makeFloatType(16);
++	spv::Id u8_val;
++
++	if (chain.kind == WMMAMemoryKind::LDS)
++	{
++		auto *load = impl.allocate(spv::OpLoad, builder.makeUintType(32));
++		load->add_id(emit_staging_lds_word_ptr(impl, chain, byte_off));
++		impl.add(load);
++		spv::Id v = emit_staging_u32_op(impl, spv::OpShiftRightLogical, load->id, emit_staging_lds_shift(impl, byte_off));
++		auto *narrow = impl.allocate(spv::OpUConvert, u8_type);
++		narrow->add_id(v);
++		impl.add(narrow);
++		u8_val = narrow->id;
++	}
++	else
++	{
++		auto *load = impl.allocate(spv::OpLoad, u8_type);
++		load->add_id(emit_staging_byte_ptr(impl, chain, byte_off));
++		if (chain.kind == WMMAMemoryKind::BDA)
++		{
++			load->add_literal(spv::MemoryAccessAlignedMask);
++			load->add_literal(1);
++		}
++		impl.add(load);
++		u8_val = load->id;
++	}
++
++	spv::Id type_ids[] = { u8_type, f16_type };
++	spv::Id helper_id = impl.spirv_module.get_helper_call_id(HelperCall::ScalarFP8toFP16, type_ids, 2);
++	auto *conv = impl.allocate(spv::OpFunctionCall, f16_type);
++	conv->add_id(helper_id);
++	conv->add_id(u8_val);
++	impl.add(conv);
++	return conv->id;
++}
++
++static void emit_staging_store_fp16_as_fp8(Converter::Impl &impl, const WMMAAccessChain &chain, spv::Id byte_off,
++                                           spv::Id f16_val)
++{
++	auto &builder = impl.builder();
++	spv::Id u8_type = builder.makeUintType(8);
++	spv::Id f16_type = builder.makeFloatType(16);
++
++	spv::Id type_ids[] = { u8_type, f16_type };
++	spv::Id helper_id = impl.spirv_module.get_helper_call_id(HelperCall::ScalarFP16toFP8, type_ids, 2);
++	auto *conv = impl.allocate(spv::OpFunctionCall, u8_type);
++	conv->add_id(helper_id);
++	conv->add_id(f16_val);
++	impl.add(conv);
++
++	if (chain.kind == WMMAMemoryKind::LDS)
++	{
++		// Other lanes write the other bytes of the same word: clear + set atomically.
++		spv::Id ptr = emit_staging_lds_word_ptr(impl, chain, byte_off);
++		spv::Id shift = emit_staging_lds_shift(impl, byte_off);
++		spv::Id mask = emit_staging_u32_op(impl, spv::OpShiftLeftLogical, builder.makeUintConstant(0xff), shift);
++		auto *inv = impl.allocate(spv::OpNot, builder.makeUintType(32));
++		inv->add_id(mask);
++		impl.add(inv);
++		auto *wide = impl.allocate(spv::OpUConvert, builder.makeUintType(32));
++		wide->add_id(conv->id);
++		impl.add(wide);
++		spv::Id bits = emit_staging_u32_op(impl, spv::OpShiftLeftLogical, wide->id, shift);
++
++		auto *and_op = impl.allocate(spv::OpAtomicAnd, builder.makeUintType(32));
++		and_op->add_id(ptr);
++		and_op->add_id(builder.makeUintConstant(spv::ScopeWorkgroup));
++		and_op->add_id(builder.makeUintConstant(0));
++		and_op->add_id(inv->id);
++		impl.add(and_op);
++		auto *or_op = impl.allocate(spv::OpAtomicOr, builder.makeUintType(32));
++		or_op->add_id(ptr);
++		or_op->add_id(builder.makeUintConstant(spv::ScopeWorkgroup));
++		or_op->add_id(builder.makeUintConstant(0));
++		or_op->add_id(bits);
++		impl.add(or_op);
++	}
++	else
++	{
++		auto *store = impl.allocate(spv::OpStore);
++		store->add_id(emit_staging_byte_ptr(impl, chain, byte_off));
++		store->add_id(conv->id);
++		if (chain.kind == WMMAMemoryKind::BDA)
++		{
++			store->add_literal(spv::MemoryAccessAlignedMask);
++			store->add_literal(1);
++		}
++		impl.add(store);
++	}
++}
++
++// Rows / column of element pair p: col = p >> 3, row0 = 2 * (p & 7), row1 = row0 + 1.
++static void emit_staging_pair_coords(Converter::Impl &impl, spv::Id p, spv::Id &col, spv::Id &row0, spv::Id &row1)
++{
++	auto &builder = impl.builder();
++	col = emit_staging_u32_op(impl, spv::OpShiftRightLogical, p, builder.makeUintConstant(3));
++	spv::Id r = emit_staging_u32_op(impl, spv::OpBitwiseAnd, p, builder.makeUintConstant(7));
++	row0 = emit_staging_u32_op(impl, spv::OpShiftLeftLogical, r, builder.makeUintConstant(1));
++	row1 = emit_staging_u32_op(impl, spv::OpIAdd, row0, builder.makeUintConstant(1));
++}
++
++static spv::Id emit_staging_pair_index(Converter::Impl &impl, spv::Id lane, uint32_t i, uint32_t wave)
++{
++	auto &builder = impl.builder();
++	spv::Id p = emit_staging_u32_op(impl, spv::OpIAdd, lane, builder.makeUintConstant(i * wave));
++	return emit_staging_u32_op(impl, spv::OpBitwiseAnd, p, builder.makeUintConstant(127));
++}
++
++static spv::Id emit_staging_lane(Converter::Impl &impl)
++{
++	auto &builder = impl.builder();
++	spv::Id var = impl.spirv_module.get_builtin_shader_input(spv::BuiltInSubgroupLocalInvocationId);
++	auto *lane = impl.allocate(spv::OpLoad, builder.makeUintType(32));
++	lane->add_id(var);
++	impl.add(lane);
++	return lane->id;
++}
++
++static void staging_add_capabilities(Converter::Impl &impl, const WMMAAccessChain &chain)
++{
++	auto &builder = impl.builder();
++	builder.addCapability(spv::CapabilityInt8);
++	builder.addCapability(spv::CapabilityFloat16);
++	if (chain.kind != WMMAMemoryKind::LDS)
++	{
++		builder.addExtension("SPV_KHR_8bit_storage");
++		builder.addCapability(spv::CapabilityStorageBuffer8BitAccess);
++	}
++}
++
++static spv::Id emit_fp8_staged_load(Converter::Impl &impl, const WMMAAccessChain &chain, bool column_major,
++                                    uint32_t type_imm)
++{
++	auto &builder = impl.builder();
++	if (!ensure_coopmat_scratch(impl))
++		return 0;
++	spv::Id f16_mat = build_coopmat_type(impl, type_imm, false);
++	if (!f16_mat)
++		return 0;
++	staging_add_capabilities(impl, chain);
++
++	spv::Id base = emit_staging_scratch_base(impl);
++	spv::Id lane = emit_staging_lane(impl);
++	uint32_t wave = staging_min_wave(impl);
++	spv::Id f16vec2 = builder.makeVectorType(builder.makeFloatType(16), 2);
++
++	// Previous users of the scratch block (and of an LDS source) are done.
++	emit_staging_barrier(impl);
++	for (uint32_t i = 0; i < 128 / wave || i == 0; i++)
++	{
++		spv::Id p = emit_staging_pair_index(impl, lane, i, wave);
++		spv::Id col, row0, row1;
++		emit_staging_pair_coords(impl, p, col, row0, row1);
++		spv::Id v0 = emit_staging_load_fp8_as_fp16(impl, chain, emit_staging_byte_offset(impl, chain, column_major, row0, col));
++		spv::Id v1 = emit_staging_load_fp8_as_fp16(impl, chain, emit_staging_byte_offset(impl, chain, column_major, row1, col));
++		auto *pair = impl.allocate(spv::OpCompositeConstruct, f16vec2);
++		pair->add_id(v0);
++		pair->add_id(v1);
++		impl.add(pair);
++		auto *word = impl.allocate(spv::OpBitcast, builder.makeUintType(32));
++		word->add_id(pair->id);
++		impl.add(word);
++		auto *store = impl.allocate(spv::OpStore);
++		store->add_id(emit_staging_scratch_ptr(impl, emit_staging_u32_op(impl, spv::OpIAdd, base, p)));
++		store->add_id(word->id);
++		impl.add(store);
++	}
++	emit_staging_barrier(impl);
++
++	auto *load = impl.allocate(spv::OpCooperativeMatrixLoadKHR, f16_mat);
++	load->add_id(emit_staging_scratch_ptr(impl, base));
++	load->add_id(builder.makeUintConstant(spv::CooperativeMatrixLayoutColumnMajorKHR));
++	load->add_id(builder.makeUintConstant(8));
++	if (impl.execution_mode_meta.memory_model == spv::MemoryModelVulkan)
++		load->add_literal(spv::MemoryAccessNonPrivatePointerMask);
++	impl.add(load);
++	emit_staging_barrier(impl);
++	return load->id;
++}
++
++static bool emit_fp8_staged_store(Converter::Impl &impl, const WMMAAccessChain &chain, bool column_major,
++                                  spv::Id f16_matrix)
++{
++	auto &builder = impl.builder();
++	if (!ensure_coopmat_scratch(impl))
++		return false;
++	staging_add_capabilities(impl, chain);
++
++	spv::Id base = emit_staging_scratch_base(impl);
++	spv::Id lane = emit_staging_lane(impl);
++	uint32_t wave = staging_min_wave(impl);
++	spv::Id f16_type = builder.makeFloatType(16);
++	spv::Id f16vec2 = builder.makeVectorType(f16_type, 2);
++
++	emit_staging_barrier(impl);
++	auto *store = impl.allocate(spv::OpCooperativeMatrixStoreKHR);
++	store->add_id(emit_staging_scratch_ptr(impl, base));
++	store->add_id(f16_matrix);
++	store->add_id(builder.makeUintConstant(spv::CooperativeMatrixLayoutColumnMajorKHR));
++	store->add_id(builder.makeUintConstant(8));
++	if (impl.execution_mode_meta.memory_model == spv::MemoryModelVulkan)
++		store->add_literal(spv::MemoryAccessNonPrivatePointerMask);
++	impl.add(store);
++	emit_staging_barrier(impl);
++
++	for (uint32_t i = 0; i < 128 / wave || i == 0; i++)
++	{
++		spv::Id p = emit_staging_pair_index(impl, lane, i, wave);
++		spv::Id col, row0, row1;
++		emit_staging_pair_coords(impl, p, col, row0, row1);
++		auto *word = impl.allocate(spv::OpLoad, builder.makeUintType(32));
++		word->add_id(emit_staging_scratch_ptr(impl, emit_staging_u32_op(impl, spv::OpIAdd, base, p)));
++		impl.add(word);
++		auto *pair = impl.allocate(spv::OpBitcast, f16vec2);
++		pair->add_id(word->id);
++		impl.add(pair);
++		for (uint32_t k = 0; k < 2; k++)
++		{
++			auto *e = impl.allocate(spv::OpCompositeExtract, f16_type);
++			e->add_id(pair->id);
++			e->add_literal(k);
++			impl.add(e);
++			emit_staging_store_fp16_as_fp8(
++			    impl, chain, emit_staging_byte_offset(impl, chain, column_major, k ? row1 : row0, col), e->id);
++		}
++	}
++	// The destination (LDS in particular) is read by other lanes next.
++	emit_staging_barrier(impl);
++	return true;
++}
++
+ static bool emit_wmma_store(Converter::Impl &impl)
+ {
+ 	auto &builder = impl.builder();
+@@ -1860,6 +2240,12 @@ static bool emit_wmma_store(Converter::Impl &impl)
+ 
+ 	spv::Id store_id = impl.get_id_for_value(impl.ags.backdoor_instructions[1]->getOperand(5));
+ 
++	if (!impl.options.wmma_fp8 && GlobalConfiguration::get().wmma_fp8_staging &&
++	    get_type_data_format(type_immediate) == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_FP8)
++	{
++		return emit_fp8_staged_store(impl, chain, column_major, store_id);
++	}
++
+ 	if (!impl.options.wmma_fp8 &&
+ 	    get_type_data_format(type_immediate) == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_FP8)
+ 	{
+@@ -1914,6 +2300,22 @@ static bool emit_wmma_load(Converter::Impl &impl)
+ 		return false;
+ 
+ 	uint32_t type_immediate = impl.ags.instructions[1].immediate;
++
++	if (!impl.options.wmma_fp8 && GlobalConfiguration::get().wmma_fp8_staging &&
++	    get_type_data_format(type_immediate) == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_FP8)
++	{
++		auto staged_chain = build_wmma_access_chain(impl, impl.ags.backdoor_instructions[0]->getOperand(5),
++		                                            impl.ags.backdoor_instructions[0]->getOperand(6));
++		if (staged_chain.chain_id == 0)
++			return false;
++		bool staged_column_major = ((type_immediate >> AmdExtD3DShaderIntrinsicsWaveMatrixModifier_LayoutFlagShift) &
++		                            AmdExtD3DShaderIntrinsicsWaveMatrixModifier_LayoutFlagMask) != 0;
++		spv::Id staged_id = emit_fp8_staged_load(impl, staged_chain, staged_column_major, type_immediate);
++		if (!staged_id)
++			return false;
++		return emit_wmma_return_values(impl, build_coopmat_type(impl, type_immediate, false), staged_id, 2);
++	}
++
+ 	spv::Id type_id = build_coopmat_type(impl, type_immediate, true);
+ 
+ 	if (!type_id)

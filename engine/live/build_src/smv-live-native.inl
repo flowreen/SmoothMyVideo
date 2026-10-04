@@ -3995,21 +3995,21 @@ struct NativeRife
     int* hFrRange = nullptr;
     int frModeLogs = 0;
     // AMD FSR frame generation (fsrfg): the FRUC route above (fruc is set too: its ladders, its midpoint tree, its
-    // surfaces) with our smv_fsrfg_bridge.dll (FSR 3.1.6 frame generation built from source with its scene-change reset
-    // removed) in place of NvOFFRUC. The handoff answers `engine=fsrfg` with the unpadded geometry and `NATIVE-PATH
-    // fsrfg=` (the bridge folder). Every frame (real or a node) is RGBA16F at the bridge's row pitch in dFrSurf /
-    // dFrNode; a call feeds instance i one frame and its vectors (NVIDIA optical flow, frame -> the instance's last frame,
-    // px) and returns the frame halfway between them. The bridge's buffers and fence are D3D12 resources shared with
-    // CUDA: the stream writes, signals an odd value, the bridge's queue waits, generates, signals the next even value,
-    // the stream waits for it. Instance 0 is fed every real frame in order (FSR is built for one continuous stream);
-    // level L of a pair's tree on instance L - 1, as FRUC's. frLastKey 0 = never fed (its first call resets).
+    // surfaces) with our smv_fsrfg_bridge.dll (AMD's FSR 4 ML frame generation on vkd3d-proton) in place of NvOFFRUC.
+    // The handoff answers `engine=fsrfg` with the unpadded geometry and `NATIVE-PATH fsrfg=` (the bridge folder). Every
+    // frame (real or a node) is RGBA16F at the bridge's row pitch in dFrSurf / dFrNode; a call feeds instance i one frame
+    // and its vectors (NVIDIA optical flow, frame -> the instance's last frame, px) and returns the frame halfway between
+    // them. The bridge's three textures (frame, vectors, generated frame) are Vulkan exports CUDA maps as arrays, its fence
+    // a Vulkan timeline semaphore: the stream copies in, signals an odd value, the bridge's queue waits, generates,
+    // signals the next even value, the stream waits for it and copies out. Instance 0 is fed every real frame in order
+    // (FSR is built for one continuous stream); level L of a pair's tree on instance L - 1, as FRUC's. frLastKey 0 =
+    // never fed (its first call resets).
     bool fsrfg = false;
     struct FgInst
     {
         cudaExternalMemory_t emIn = nullptr, emMv = nullptr, emOut = nullptr;
-        uint8_t* in = nullptr;
-        uint8_t* mv = nullptr;
-        uint8_t* out = nullptr;
+        cudaMipmappedArray_t mmIn = nullptr, mmMv = nullptr, mmOut = nullptr;
+        cudaArray_t in = nullptr, mv = nullptr, out = nullptr; // the three textures' level 0
         cudaExternalSemaphore_t sem = nullptr;
         uint64_t val = 0; // the fence's last value
         bool made = false;
@@ -4017,6 +4017,7 @@ struct NativeRife
     FgInst fg[4];
     LUID fgLuid = {};
     int fgPitch = 0, fgMvPitch = 0; // the bridge's row pitches (bytes), the same for every instance
+    uint8_t* dFgMv = nullptr;       // a call's vectors (RG16F rows fgMvPitch apart) before their copy into its texture
     // FSR's motion vectors (frame generation and upscaling): an Optical Flow session at w x h, ABGR8 (R, G, B, A
     // bytes), both directions, fast, its output grid; input slot `prev` is the input frame, `cur` the reference, so the
     // backward field = the current frame -> its predecessor (FSR's convention), in px: two planes + k_nvofUp's cost plane
@@ -4032,7 +4033,7 @@ struct NativeRife
     OfVec fgOf;
     // AMD FSR upscaling (fsrUp, `--fsr-upscale`): RTX VSR's resize (vsr is set too, so the slot rules, the staging and
     // nativeVsrEval's callers stay one path; nativeVsrEval hands dVsrIn to smv_fsrup_bridge.dll instead of NGX). The
-    // bridge runs AMD's signed FidelityFX upscaler (FSR 3.1.x on NVIDIA) on its own D3D12 device, frames in and out
+    // bridge runs AMD's signed FidelityFX upscaler (FSR 4.1.1's INT8 model) on its own D3D12 device, frames in and out
     // through shared buffers + one fence like FSR FG's; every frame of the slot's stream is fed in order (the first
     // resets), its vectors from the previous one (fuOf, the two input slots alternate)
     bool fsrUp = false;
@@ -8590,24 +8591,28 @@ static void nativeFrucFree(NativeRife& nr)
 
 // ---- AMD FSR frame generation (fsrfg) ----------------------------------------------------------
 // smv_fsrfg_bridge.dll's C API (source: engine\fsrfg\build_src), loaded once per process by full path from the folder
-// the handoff named; up to four instances, each its own D3D12 device and FSR context on the CUDA device's adapter
+// the handoff named; up to four instances, each its own FSR context on vkd3d-proton's device for the CUDA device's
+// adapter
 struct FsrfgShared
 {
-    HANDLE in, mv, out, fence;
-    uint64_t inBytes, mvBytes, outBytes;
-    uint32_t rowPitch, mvRowPitch;
+    HANDLE in, mv, out, fence;           // three textures (Vulkan opaque Win32 exports) and a timeline semaphore
+    uint64_t inBytes, mvBytes, outBytes; // the textures' allocation sizes
+    uint32_t rowPitch, mvRowPitch;       // the linear rows a caller keeps its frames / vectors in
 };
 struct FsrfgBridge
 {
     HMODULE mod = nullptr;
     const char* (*lastError)() = nullptr;
+    void (*setCacheDir)(const char*) = nullptr;
+    const char* (*provider)() = nullptr;
     int (*createI)(int, uint32_t, uint32_t, uint32_t, int32_t, int, FsrfgShared*) = nullptr;
     int (*frameI)(int, uint64_t, uint64_t, int, double) = nullptr;
     void (*destroy)() = nullptr;
 };
 static FsrfgBridge g_fsrfg;
 
-static bool nativeFsrfgLoad(const std::string& dir)
+// the bridge, its vkd3d-proton shader cache in cacheDir\fsr4_shaders (the model cache: users may delete it)
+static bool nativeFsrfgLoad(const std::string& dir, const std::string& cacheDir)
 {
     if (g_fsrfg.mod)
         return true;
@@ -8619,21 +8624,26 @@ static bool nativeFsrfgLoad(const std::string& dir)
         return false;
     }
     g_fsrfg.lastError = (const char* (*)())GetProcAddress(m, "fsrfg_last_error");
+    g_fsrfg.setCacheDir = (void (*)(const char*))GetProcAddress(m, "fsrfg_set_cache_dir");
+    g_fsrfg.provider = (const char* (*)())GetProcAddress(m, "fsrfg_provider");
     g_fsrfg.createI =
         (int (*)(int, uint32_t, uint32_t, uint32_t, int32_t, int, FsrfgShared*))GetProcAddress(m, "fsrfg_create_i");
     g_fsrfg.frameI = (int (*)(int, uint64_t, uint64_t, int, double))GetProcAddress(m, "fsrfg_frame_i");
     g_fsrfg.destroy = (void (*)())GetProcAddress(m, "fsrfg_destroy");
-    if (!g_fsrfg.lastError || !g_fsrfg.createI || !g_fsrfg.frameI || !g_fsrfg.destroy)
+    if (!g_fsrfg.lastError || !g_fsrfg.setCacheDir || !g_fsrfg.provider || !g_fsrfg.createI || !g_fsrfg.frameI ||
+        !g_fsrfg.destroy)
     {
         LOG("native: fsrfg: smv_fsrfg_bridge.dll lacks an expected export\n");
         FreeLibrary(m);
         return false;
     }
+    if (!cacheDir.empty())
+        g_fsrfg.setCacheDir((cacheDir + "\\fsr4_shaders").c_str());
     g_fsrfg.mod = m;
     return true;
 }
 
-// FSR instance i at w x h (RGBA16F) with its shared buffers and fence imported into this CUDA context
+// FSR instance i at w x h (RGBA16F) with its shared textures (as CUDA arrays) and fence imported into this CUDA context
 static bool nativeFsrfgCreate(NativeRife& nr, int i)
 {
     NativeRife::FgInst& g = nr.fg[i];
@@ -8653,9 +8663,11 @@ static bool nativeFsrfgCreate(NativeRife& nr, int i)
     }
     nr.fgPitch = (int)sh.rowPitch;
     nr.fgMvPitch = (int)sh.mvRowPitch;
-    auto imp = [](HANDLE hd, uint64_t bytes, cudaExternalMemory_t& em, uint8_t*& p) {
+    const int w = nr.w, h = nr.h;
+    auto imp = [w, h](HANDLE hd, uint64_t bytes, const cudaChannelFormatDesc& fd, cudaExternalMemory_t& em,
+                      cudaMipmappedArray_t& mm, cudaArray_t& a) {
         cudaExternalMemoryHandleDesc md{};
-        md.type = cudaExternalMemoryHandleTypeD3D12Resource;
+        md.type = cudaExternalMemoryHandleTypeOpaqueWin32;
         md.size = bytes;
         md.flags = cudaExternalMemoryDedicated;
         md.handle.win32.handle = hd;
@@ -8664,17 +8676,30 @@ static bool nativeFsrfgCreate(NativeRife& nr, int i)
             em = nullptr;
             return false;
         }
-        cudaExternalMemoryBufferDesc bd{};
-        bd.size = bytes;
-        return cudaExternalMemoryGetMappedBuffer((void**)&p, em, &bd) == cudaSuccess;
+        cudaExternalMemoryMipmappedArrayDesc ad{};
+        ad.formatDesc = fd;
+        ad.extent.width = (size_t)w;
+        ad.extent.height = (size_t)h;
+        ad.numLevels = 1;
+        return cudaExternalMemoryGetMappedMipmappedArray(&mm, em, &ad) == cudaSuccess &&
+               cudaGetMipmappedArrayLevel(&a, mm, 0) == cudaSuccess;
     };
+    const cudaChannelFormatDesc rgba = cudaCreateChannelDesc(16, 16, 16, 16, cudaChannelFormatKindFloat);
+    const cudaChannelFormatDesc rg = cudaCreateChannelDesc(16, 16, 0, 0, cudaChannelFormatKindFloat);
     cudaExternalSemaphoreHandleDesc sd{};
-    sd.type = cudaExternalSemaphoreHandleTypeD3D12Fence;
+    sd.type = cudaExternalSemaphoreHandleTypeTimelineSemaphoreWin32;
     sd.handle.win32.handle = sh.fence;
-    if (!imp(sh.in, sh.inBytes, g.emIn, g.in) || !imp(sh.mv, sh.mvBytes, g.emMv, g.mv) ||
-        !imp(sh.out, sh.outBytes, g.emOut, g.out) || cudaImportExternalSemaphore(&g.sem, &sd) != cudaSuccess)
+    if (!imp(sh.in, sh.inBytes, rgba, g.emIn, g.mmIn, g.in) || !imp(sh.mv, sh.mvBytes, rg, g.emMv, g.mmMv, g.mv) ||
+        !imp(sh.out, sh.outBytes, rgba, g.emOut, g.mmOut, g.out) ||
+        cudaImportExternalSemaphore(&g.sem, &sd) != cudaSuccess)
     {
-        LOG("native: fsrfg: instance %d's shared buffers or fence did not import into CUDA\n", i);
+        LOG("native: fsrfg: instance %d's shared textures or fence did not import into CUDA\n", i);
+        return false;
+    }
+    if (!nr.dFgMv && cudaMalloc((void**)&nr.dFgMv, (size_t)nr.fgMvPitch * nr.h) != cudaSuccess)
+    {
+        nr.dFgMv = nullptr;
+        LOG("native: fsrfg: the vector buffer did not allocate\n");
         return false;
     }
     g.val = 0;
@@ -8828,7 +8853,7 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
     cudaStream_t st = nr.stream;
     const size_t row = (size_t)nr.w * 8;
     const unsigned gx = (unsigned)(nr.w + 15) / 16, gy = (unsigned)(nr.h + 15) / 16;
-    if (cudaMemcpy2DAsync(g.in, nr.fgPitch, frame, nr.fgPitch, row, nr.h, cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+    if (cudaMemcpy2DToArrayAsync(g.in, 0, 0, frame, nr.fgPitch, row, nr.h, cudaMemcpyDeviceToDevice, st) != cudaSuccess)
     {
         nr.die("fsrfg frame copy failed");
         return false;
@@ -8847,12 +8872,18 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
                 return false;
             }
         }
-        if (!nativeOfVecRun(nr, nr.fgOf, 0, 1, g.mv, nr.fgMvPitch, "fsrfg"))
+        if (!nativeOfVecRun(nr, nr.fgOf, 0, 1, nr.dFgMv, nr.fgMvPitch, "fsrfg"))
             return false;
     }
-    else if (cudaMemset2DAsync(g.mv, nr.fgMvPitch, 0, (size_t)nr.w * 4, nr.h, st) != cudaSuccess)
+    else if (cudaMemset2DAsync(nr.dFgMv, nr.fgMvPitch, 0, (size_t)nr.w * 4, nr.h, st) != cudaSuccess)
     {
         nr.die("fsrfg vector clear failed");
+        return false;
+    }
+    if (cudaMemcpy2DToArrayAsync(g.mv, 0, 0, nr.dFgMv, nr.fgMvPitch, (size_t)nr.w * 4, nr.h, cudaMemcpyDeviceToDevice,
+                                 st) != cudaSuccess)
+    {
+        nr.die("fsrfg vector copy failed");
         return false;
     }
     cudaExternalSemaphoreSignalParams sp{};
@@ -8863,7 +8894,7 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
         return false;
     }
     const uint64_t ready = g.val, done = ++g.val;
-    // no shader of FSR 3.1.6 reads the frame time (the constant buffer carries it unread): one 60 Hz frame
+    // the frame time does not change FSR 4's output (a 24 and a 60 fps run byte for byte the same): one 60 Hz frame
     const int rc = g_fsrfg.frameI(i, ready, done, reset ? 1 : 0, 1000.0 / 60.0);
     if (rc != 0)
     {
@@ -8874,8 +8905,8 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
     cudaExternalSemaphoreWaitParams wp{};
     wp.params.fence.value = done;
     if (cudaWaitExternalSemaphoresAsync(&g.sem, &wp, 1, st) != cudaSuccess ||
-        (out &&
-         cudaMemcpy2DAsync(out, nr.fgPitch, g.out, nr.fgPitch, row, nr.h, cudaMemcpyDeviceToDevice, st) != cudaSuccess))
+        (out && cudaMemcpy2DFromArrayAsync(out, nr.fgPitch, g.out, 0, 0, row, nr.h, cudaMemcpyDeviceToDevice, st) !=
+                    cudaSuccess))
     {
         nr.die("fsrfg result failed");
         return false;
@@ -8966,7 +8997,7 @@ static bool nativeFsrfgPack(NativeRife& nr, const float* src, int n, bool sdr)
 
 static bool nativeFsrfgSetup(NativeRife& nr)
 {
-    if (!nativeFsrfgLoad(nr.frucDir))
+    if (!nativeFsrfgLoad(nr.frucDir, nr.cachePath))
         return false;
     int dev = 0;
     cudaDeviceProp prop{};
@@ -9013,8 +9044,8 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     nr.frNodeCalls = nr.frTweens = nr.frPrimed = nr.frRepeats = 0;
     for (bool& ok : nr.frNodeOk)
         ok = false;
-    LOG("native: fsrfg session %dx%d, AMD FSR 3.1.6 frame generation through smv_fsrfg_bridge.dll (no scene-change reset), RGBA16F, NVIDIA optical flow vectors (grid %d, fast), recursive midpoints (depth cap %d)\n",
-        nr.w, nr.h, nr.fgOf.grid, nr.frMpCap);
+    LOG("native: fsrfg session %dx%d, AMD FSR %s frame generation (ML) through smv_fsrfg_bridge.dll on vkd3d-proton, RGBA16F, NVIDIA optical flow vectors (grid %d, fast), recursive midpoints (depth cap %d)\n",
+        nr.w, nr.h, g_fsrfg.provider(), nr.fgOf.grid, nr.frMpCap);
     if (nr.encPost)
         LOG("native: fsrfg: HDR planes: %s\n",
             nr.frSdrOn ? "frame pairs inside the SDR range go to FSR as their SDR view, any other pair as the HDR codes"
@@ -9136,11 +9167,11 @@ static void nativeFsrfgRelease(NativeRife& nr)
     bool any = false;
     for (NativeRife::FgInst& g : nr.fg)
     {
-        for (uint8_t** p : {&g.in, &g.mv, &g.out})
-            if (*p)
+        for (cudaMipmappedArray_t* mm : {&g.mmIn, &g.mmMv, &g.mmOut})
+            if (*mm)
             {
-                cudaFree(*p);
-                *p = nullptr;
+                cudaFreeMipmappedArray(*mm);
+                *mm = nullptr;
             }
         if (g.sem)
             cudaDestroyExternalSemaphore(g.sem);
@@ -9155,6 +9186,11 @@ static void nativeFsrfgRelease(NativeRife& nr)
     }
     if (any && g_fsrfg.destroy)
         g_fsrfg.destroy(); // every instance
+    if (nr.dFgMv)
+    {
+        cudaFree(nr.dFgMv);
+        nr.dFgMv = nullptr;
+    }
     nativeOfVecFree(nr.fgOf);
     nr.frInst = 1;
 }
@@ -9222,7 +9258,7 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
     memcpy(&luid, prop.luid, sizeof(luid));
     FsrupShared sh{};
     const int rc =
-        g_fsrup.create((uint32_t)w, (uint32_t)h, (uint32_t)ow, (uint32_t)oh, luid.LowPart, luid.HighPart, "3.1", &sh);
+        g_fsrup.create((uint32_t)w, (uint32_t)h, (uint32_t)ow, (uint32_t)oh, luid.LowPart, luid.HighPart, "4.", &sh);
     if (rc != 0)
     {
         LOG("native: fsr upscale: %dx%d -> %dx%d not created: %s (rc %d)\n", w, h, ow, oh, g_fsrup.lastError(), rc);
@@ -9304,7 +9340,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         return false;
     }
     const uint64_t ready = nr.fuVal, done = ++nr.fuVal;
-    // FSR 3.1.5 gives byte-identical frames at any frame time (measured, harness fsr4_int8_upscaler): one 60 Hz frame
+    // FSR 4.1.1 gives byte-identical frames at any frame time (measured, harness fsr4_int8_upscaler): one 60 Hz frame
     const int rc = g_fsrup.frame(ready, done, first ? 1 : 0, 1000.0 / 60.0);
     if (rc != 0)
     {
@@ -10044,9 +10080,9 @@ static bool nativeTweenBuffers(NativeRife& nr)
 // dedicated memory with and without the feature, 82 / 226 MiB for RTX HDR at 854x480 / 1920x1080,
 // 174 / 524 MiB for RTX VSR from those into a 2560x1440 Fill)
 constexpr double kRtxHdrBase = 58.0, kRtxHdrMp = 109.0, kRtxVsrBase = 109.0, kRtxVsrMp = 264.0;
-// AMD FSR upscaling: RTX VSR's row moved by a quarter over the process's own memory against VSR's, at 854x480 and
-// 1708x960 upscaled 2.25x (+202 / +681 MiB against VSR's +108 / +402 over no upscaler)
-constexpr double kFsrUpBase = 149.0, kFsrUpMp = 452.0;
+// AMD FSR upscaling (FSR 4.1.1): RTX VSR's row moved by a quarter over the process's own memory against VSR's, at
+// 854x480 and 1708x960 upscaled 2.25x (+243 / +793 MiB against VSR's +108 / +402 over no upscaler)
+constexpr double kFsrUpBase = 171.0, kFsrUpMp = 524.0;
 
 // Restore's video memory in MiB a megapixel of the decoded frame (its engine 145 MiB at 854x480, a quarter on top)
 constexpr double kRestoreMp = 445.0;
@@ -12286,16 +12322,18 @@ static uint64_t nativeVideoMemoryRoom()
 // first frames, 120 MiB + 16.6 a megapixel a pass (157 / 226 / 465 MiB at 1920x1080 with 1 / 3 / 10 passes, 139 / 190
 // at 854x480 with 3 / 10: its per-size buffers exist before the ring on this route, so nr_host's kAfterMp is not
 // added), and FRUC's NvOFFRUC buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel of the model
-// frame (296 / 521 MiB at 896x512 / 1920x1088), and AMD FSR frame generation's second midpoint instance with its node
-// frames, 35 MiB + 255 a megapixel of the (unpadded) model frame (the process's own memory, x4 against x2: 112 / 363
-// MiB at 854x480 / 1708x960, a quarter on top); the other routes add nothing the reserve does not cover. The x8 / x16
-// ladders' third and fourth tree levels (an instance and twice the node frames a level) come on top when the session's
-// slots reach them (the process's own memory over x4 at 854x480 / 1708x960, a quarter on top, FRUC by the padded
-// megapixel: FRUC x8 +332 / +620 MiB, x16 +711 / +1423; FSR FG x8 +139 / +467, x16 +335 / +1142).
+// frame (296 / 521 MiB at 896x512 / 1920x1088), and AMD FSR 4 frame generation's second midpoint instance with its node
+// frames, 45 MiB + 335 a megapixel of the (unpadded) model frame (a parked live session's own memory, x4 against x2: 146
+// / 476 MiB at 854x480 / 1708x960, a quarter on top); the other routes add nothing the reserve does not cover. The x8 /
+// x16 ladders' third and fourth tree levels (an instance and twice the node frames a level) come on top when the
+// session's slots reach them (the process's own memory over x4 at 854x480 / 1708x960, a quarter on top, FRUC by the
+// padded megapixel: FRUC x8 +332 / +620 MiB, x16 +711 / +1423; FSR 4 x8 +282 / +462, x16 +627 / +1115, but FSR 4 held
+// only ~x3.7 at 1708x960 and leaves those levels' node frames partly unmade: the per-megapixel term is FSR 3.1's larger
+// fit).
 constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 290.0, kFrucLateMp = 173.0;
-constexpr double kFsrfgLateBase = 35.0, kFsrfgLateMp = 255.0;
+constexpr double kFsrfgLateBase = 45.0, kFsrfgLateMp = 335.0;
 constexpr double kFrucDeepBase[2] = {277.0, 549.0}, kFrucDeepMp[2] = {300.0, 742.0};
-constexpr double kFsrfgDeepBase[2] = {37.0, 82.0}, kFsrfgDeepMp[2] = {333.0, 820.0};
+constexpr double kFsrfgDeepBase[2] = {278.0, 580.0}, kFsrfgDeepMp[2] = {333.0, 820.0};
 static uint64_t nativeLiveLateNeed(const NativeRife& nr, uint32_t slots)
 {
     const double mib = 1048576.0;

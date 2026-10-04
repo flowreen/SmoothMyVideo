@@ -419,7 +419,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (NO_INTERP)
     say('no-interp mode: GMFSS interpolation disabled (re-encode at source fps with optional Adaptive Sharpen)\n');
   else if (FRUC_MODE) say('Using the NVIDIA Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n');
-  else if (FSRFG_MODE) say('Using the AMD FSR frame generation backend for interpolation (FSR 3.1.6, native host)\n');
+  else if (FSRFG_MODE) say('Using the AMD FSR frame generation backend for interpolation (FSR 4, native host)\n');
   else if (DLSSG_MODE) say('Using the DLSS Frame Generation backend for interpolation (DLSS 4.5)\n');
   else if (NVOF_MODE) say('Using the NVIDIA Optical Flow backend for interpolation (native host)\n');
   else if (RIFE_MODE) say('Using the RIFE backend for interpolation (4.26 heavy, native host)\n');

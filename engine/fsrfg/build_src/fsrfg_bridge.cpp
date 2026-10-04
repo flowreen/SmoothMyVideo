@@ -1,11 +1,15 @@
-// SmoothMyVideo's AMD FSR 3 frame generation bridge: the FidelityFX SDK v2.3.0 FSR 3.1.6 frame generation (MIT, built
-// from source with the optical flow's scene-change reset removed: build.py beside this file) behind a small C API
-// for the native host. Frames go in and out through D3D12 buffers shared with CUDA (NT handles the host imports as
-// external memory) and one shared fence (an external semaphore), so the GPU waits on the GPU: the host writes the
-// frame and its motion vectors, signals `wait`; the bridge's queue waits for it, copies the buffers into textures,
-// runs configure -> prepare V2 -> generate, copies the generated frame out and signals `signal`. One context per
-// instance; every call feeds the next real frame (frameID + 1), the generated frame lies halfway between the previous
-// call's frame and this one.
+// SmoothMyVideo's AMD FSR frame generation bridge: AMD's signed FidelityFX SDK v2.3.0 frame generation DLL
+// (amd_fidelityfx_framegeneration_dx12.dll 4.0.1, unmodified), its ML provider (FSR 4) only, behind a small C API for
+// the native host. FSR 4's shaders use AMD's WMMA FP8 driver intrinsics, so its D3D12 device comes from vkd3d-proton
+// (D3D12 on Vulkan, built from source with ..\source's patches: FP8 matrices emulated on FP16 cooperative matrices),
+// and amdxc64.dll beside this file (amdxc64_shim.cpp) answers the DLL's driver-extension queries. vkd3d-proton's two
+// DLLs are renamed smv_vkd3d_*.dll so they never share a module name with the system D3D12 in the host's process.
+// Frames go in and out through three D3D12 textures shared with CUDA (vkd3d-proton shares textures, not buffers: NT
+// handles the host imports as external memory and maps as CUDA arrays) and one shared fence (vkd3d-proton exports it
+// as a Vulkan timeline semaphore, which CUDA imports), so the GPU waits on the GPU: the host copies the frame and its
+// motion vectors in, signals `wait`; the bridge's queue waits for it, runs configure -> prepare V2 -> generate on the
+// shared textures and signals `signal`; the host copies the generated frame out. One context per instance; every call
+// feeds the next real frame (frameID + 1), the generated frame lies halfway between the previous call's frame and this.
 // Formats: fmt 0 = RGBA8 UNORM (sRGB-encoded bytes), fmt 1 = RGBA16F (sRGB-encoded values 0..1); motion vectors =
 // RG16F in pixels, current -> previous (FSR's convention); depth = a constant (no depth in video).
 #include <windows.h>
@@ -15,23 +19,22 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <vector>
 
-#include "Kits/FidelityFX/api/include/ffx_api.h"
-#include "Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h"
-#include "Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h"
-#include "Kits/FidelityFX/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h"
+#include "ffx_api.h"
+#include "ffx_api_loader.h"
+#include "dx12/ffx_api_dx12.h"
+#include "ffx_framegeneration.h"
 
 #define FSRFG_API extern "C" __declspec(dllexport)
 
 struct FsrfgShared
 {
-    HANDLE in;    // the real frame, fmt's layout, rowPitch bytes a row
-    HANDLE mv;    // RG16F motion vectors, mvRowPitch bytes a row
-    HANDLE out;   // the generated frame, fmt's layout, rowPitch bytes a row
-    HANDLE fence; // the shared fence both sides wait on / signal
-    uint64_t inBytes, mvBytes, outBytes;
-    uint32_t rowPitch, mvRowPitch;
+    HANDLE in;                           // the real frame: a w x h texture in fmt
+    HANDLE mv;                           // the motion vectors: a w x h RG16F texture
+    HANDLE out;                          // the generated frame: a w x h texture in fmt
+    HANDLE fence;                        // the shared fence (a Vulkan timeline semaphore) both sides wait on / signal
+    uint64_t inBytes, mvBytes, outBytes; // the textures' allocation sizes (the external-memory import size)
+    uint32_t rowPitch, mvRowPitch; // a linear copy's row pitches (D3D12's copy footprint), for the caller's buffers
 };
 
 namespace
@@ -40,6 +43,12 @@ constexpr int kLists = 2;
 constexpr int kMaxInstances = 4;
 
 std::string g_err;
+std::wstring g_cacheRoot; // fsrfg_set_cache_dir, else shader_cache beside this DLL
+bool g_loaded = false;
+PFN_D3D12_CREATE_DEVICE g_createDevice = nullptr;
+ffxFunctions g_ffx = {};
+uint64_t g_versionId = 0; // the FSR 4 version id the DLL offers, found at the first create
+std::string g_provider;
 
 template <class T> void release(T*& p)
 {
@@ -72,17 +81,16 @@ struct Instance
     ID3D12GraphicsCommandList* list[kLists] = {};
     uint64_t done[kLists] = {};
     int next = 0;
-    ID3D12Resource* color = nullptr;
+    ID3D12Resource* color = nullptr; // FSR's own textures
     ID3D12Resource* motion = nullptr;
     ID3D12Resource* depth = nullptr;
     ID3D12Resource* out = nullptr;
-    ID3D12Resource* shIn = nullptr;
+    ID3D12Resource* shIn = nullptr; // the textures shared with CUDA, copied from / into FSR's own
     ID3D12Resource* shMv = nullptr;
     ID3D12Resource* shOut = nullptr;
     ID3D12Fence* fence = nullptr; // shared with the caller: its values are the caller's
     ID3D12Fence* priv = nullptr;  // the bridge's own setup work
     HANDLE ev = nullptr;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fpColor = {}, fpMv = {};
     ffxContext ctx = nullptr;
     uint64_t frameID = 0;
     FsrfgShared sh = {};
@@ -92,7 +100,7 @@ Instance g_inst[kMaxInstances];
 
 bool fail(const char* what, HRESULT hr = S_OK)
 {
-    char b[256];
+    char b[512];
     if (hr != S_OK)
         snprintf(b, sizeof b, "%s (hr 0x%08lx)", what, (unsigned long)hr);
     else
@@ -101,7 +109,128 @@ bool fail(const char* what, HRESULT hr = S_OK)
     return false;
 }
 
-ID3D12Resource* texture(ID3D12Device* d, DXGI_FORMAT f, uint32_t w, uint32_t h, bool uav, D3D12_RESOURCE_STATES st)
+std::wstring moduleDir()
+{
+    HMODULE self = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&moduleDir, &self);
+    GetModuleFileNameW(self, path, MAX_PATH);
+    std::wstring d(path);
+    return d.substr(0, d.find_last_of(L"\\/") + 1);
+}
+
+void makeDirs(const std::wstring& p)
+{
+    for (size_t i = p.find_first_of(L"\\/", 3); i != std::wstring::npos; i = p.find_first_of(L"\\/", i + 1))
+        CreateDirectoryW(p.substr(0, i).c_str(), nullptr);
+    CreateDirectoryW(p.c_str(), nullptr);
+}
+
+void setEnv(const char* name, const char* value, bool keepCallers)
+{
+    char b[4];
+    if (keepCallers && GetEnvironmentVariableA(name, b, sizeof(b)) > 0)
+        return;
+    SetEnvironmentVariableA(name, value);
+}
+
+HMODULE loadBeside(const std::wstring& dir, const wchar_t* name)
+{
+    return LoadLibraryExW((dir + name).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+
+// once per process: the switches of the patched vkd3d-proton, the shim, vkd3d-proton and AMD's DLLs
+bool loadOnce()
+{
+    if (g_loaded)
+        return true;
+    const std::wstring dir = moduleDir();
+    // vkd3d-proton's pipeline cache key does not cover DXIL_SPIRV_CONFIG, so this route keeps a cache of its own, in a
+    // folder named after the vkd3d-proton build (its core DLL's size and write time): a cache of another build or
+    // configuration once replayed broken pipelines
+    WIN32_FILE_ATTRIBUTE_DATA fa = {};
+    if (!GetFileAttributesExW((dir + L"smv_vkd3d_d3d12core.dll").c_str(), GetFileExInfoStandard, &fa))
+        return fail("smv_vkd3d_d3d12core.dll is missing beside the bridge");
+    wchar_t key[64];
+    swprintf(key, 64, L"vkd3d_%lx_%08lx%08lx", (unsigned long)fa.nFileSizeLow,
+             (unsigned long)fa.ftLastWriteTime.dwHighDateTime, (unsigned long)fa.ftLastWriteTime.dwLowDateTime);
+    const std::wstring cache = (g_cacheRoot.empty() ? dir + L"shader_cache" : g_cacheRoot) + L"\\" + key;
+    makeDirs(cache);
+    SetEnvironmentVariableW(L"VKD3D_SHADER_CACHE_PATH", cache.c_str());
+    setEnv("VKD3D_FP8_EMULATION", "1", false);
+    setEnv("DXIL_SPIRV_CONFIG", "wmma_fp8_staging", false);
+    setEnv("VKD3D_DEBUG", "none", true);
+    setEnv("VKD3D_SHADER_DEBUG", "none", true);
+
+    // AMD's DLL loads amdxc64.dll by name: the shim, loaded first, is the module it finds
+    HMODULE shim = loadBeside(dir, L"amdxc64.dll");
+    if (!shim)
+        return fail("amdxc64.dll (the driver-extension shim) did not load");
+    if (GetModuleHandleW(L"amdxc64.dll") != shim)
+        return fail("another amdxc64.dll (an AMD driver's) is loaded in this process");
+    // the core first: the wrapper loads it by name
+    if (!loadBeside(dir, L"smv_vkd3d_d3d12core.dll"))
+        return fail("smv_vkd3d_d3d12core.dll did not load");
+    HMODULE d3d = loadBeside(dir, L"smv_vkd3d_d3d12.dll");
+    g_createDevice = d3d ? (PFN_D3D12_CREATE_DEVICE)GetProcAddress(d3d, "D3D12CreateDevice") : nullptr;
+    if (!g_createDevice)
+        return fail("smv_vkd3d_d3d12.dll did not load or lacks D3D12CreateDevice");
+    // AMD's DLL serializes its root signatures through the loaded module named D3D12.dll (found by name; without one
+    // every pipeline fails to create and each dispatch is dropped): the system's, whose blobs vkd3d-proton reads
+    if (!LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
+        return fail("the system's d3d12.dll did not load");
+    // the frame generation DLL first: AMD's loader loads its providers by name
+    if (!loadBeside(dir, L"amd_fidelityfx_framegeneration_dx12.dll"))
+        return fail("amd_fidelityfx_framegeneration_dx12.dll did not load");
+    HMODULE loader = loadBeside(dir, L"amd_fidelityfx_loader_dx12.dll");
+    if (!loader)
+        return fail("amd_fidelityfx_loader_dx12.dll did not load");
+    ffxLoadFunctions(&g_ffx, loader);
+    if (!g_ffx.CreateContext || !g_ffx.DestroyContext || !g_ffx.Configure || !g_ffx.Query || !g_ffx.Dispatch)
+        return fail("amd_fidelityfx_loader_dx12.dll lacks an ffx entry point");
+    g_loaded = true;
+    return true;
+}
+
+// the FSR 4 version among those the DLL offers on this device (a name starting "4."); 0 = none
+bool findVersion(ID3D12Device* dev)
+{
+    if (g_versionId)
+        return true;
+    uint64_t count = 0;
+    ffxQueryDescGetVersions gv = {};
+    gv.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    gv.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    gv.device = dev;
+    gv.outputCount = &count;
+    if (g_ffx.Query(nullptr, &gv.header) != FFX_API_RETURN_OK || !count || count > 16)
+        return fail("AMD's frame generation DLL lists no versions");
+    uint64_t ids[16] = {};
+    const char* names[16] = {};
+    gv.versionIds = ids;
+    gv.versionNames = names;
+    if (g_ffx.Query(nullptr, &gv.header) != FFX_API_RETURN_OK)
+        return fail("AMD's frame generation DLL's version query failed");
+    std::string offered;
+    for (uint64_t k = 0; k < count; ++k)
+    {
+        const char* n = names[k] ? names[k] : "?";
+        offered += (k ? ", " : "") + std::string(n);
+        if (!g_versionId && n[0] == '4' && n[1] == '.')
+        {
+            g_versionId = ids[k];
+            g_provider = n;
+        }
+    }
+    if (!g_versionId)
+        return fail(("AMD's frame generation DLL does not offer FSR 4 on this GPU (offered: " + offered + ")").c_str());
+    return true;
+}
+
+// a w x h texture; shared = one CUDA imports too: simultaneous access keeps it in a layout both APIs read and write
+ID3D12Resource* texture(ID3D12Device* d, DXGI_FORMAT f, uint32_t w, uint32_t h, bool uav, bool shared,
+                        D3D12_RESOURCE_STATES st)
 {
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -114,9 +243,11 @@ ID3D12Resource* texture(ID3D12Device* d, DXGI_FORMAT f, uint32_t w, uint32_t h, 
     rd.Format = f;
     rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    rd.Flags = (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) |
+               (shared ? D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS : D3D12_RESOURCE_FLAG_NONE);
     ID3D12Resource* r = nullptr;
-    if (FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, st, nullptr, IID_PPV_ARGS(&r))))
+    if (FAILED(d->CreateCommittedResource(&hp, shared ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE, &rd, st, nullptr,
+                                          IID_PPV_ARGS(&r))))
         return nullptr;
     return r;
 }
@@ -157,8 +288,8 @@ void destroy(Instance& s)
         cfg.frameGenerationEnabled = false;
         cfg.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
         cfg.frameID = s.frameID;
-        ffxConfigure(&s.ctx, &cfg.header);
-        ffxDestroyContext(&s.ctx, nullptr);
+        g_ffx.Configure(&s.ctx, &cfg.header);
+        g_ffx.DestroyContext(&s.ctx, nullptr);
         s.ctx = nullptr;
     }
     for (HANDLE* hnd : {&s.sh.in, &s.sh.mv, &s.sh.out, &s.sh.fence})
@@ -239,6 +370,28 @@ FSRFG_API const char* fsrfg_last_error()
     return g_err.c_str();
 }
 
+// the folder vkd3d-proton's shader cache goes into (UTF-8), before the first fsrfg_create_i; unset = shader_cache beside
+// this DLL
+FSRFG_API void fsrfg_set_cache_dir(const char* dir)
+{
+    g_cacheRoot.clear();
+    if (dir && *dir)
+    {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, dir, -1, nullptr, 0);
+        if (n > 1)
+        {
+            g_cacheRoot.resize((size_t)n - 1);
+            MultiByteToWideChar(CP_UTF8, 0, dir, -1, &g_cacheRoot[0], n);
+        }
+    }
+}
+
+// the FSR version the contexts run ("4.0.1"), empty before the first fsrfg_create_i
+FSRFG_API const char* fsrfg_provider()
+{
+    return g_provider.c_str();
+}
+
 // instance i (0..3) at w x h on the adapter with this LUID; fmt 0 = RGBA8, 1 = RGBA16F. Fills *sh (the handles stay
 // owned by the bridge until fsrfg_destroy_i). 0 = ok, < 0 = fsrfg_last_error.
 FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, int32_t luidHigh, int fmt,
@@ -246,6 +399,8 @@ FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, in
 {
     if (i < 0 || i >= kMaxInstances || !sh || !w || !h)
         return fail("bad arguments"), -1;
+    if (!loadOnce())
+        return -14;
     Instance& s = g_inst[i];
     if (s.live)
         destroy(s);
@@ -264,10 +419,12 @@ FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, in
     release(fac);
     if (FAILED(hr))
         return fail("no DXGI adapter with the CUDA device's LUID", hr), -3;
-    hr = D3D12CreateDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s.dev));
+    hr = g_createDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s.dev));
     release(ad);
     if (FAILED(hr))
-        return fail("D3D12CreateDevice failed", hr), -4;
+        return fail("vkd3d-proton's D3D12CreateDevice failed", hr), -4;
+    if (!findVersion(s.dev))
+        return destroy(s), -15;
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(hr = s.dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&s.q))))
@@ -285,32 +442,32 @@ FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, in
         FAILED(hr = s.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.priv))))
         return destroy(s), fail("fence creation failed", hr), -7;
 
-    s.color = texture(s.dev, s.fmt, w, h, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    s.motion = texture(s.dev, DXGI_FORMAT_R16G16_FLOAT, w, h, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    s.depth = texture(s.dev, DXGI_FORMAT_R32_FLOAT, w, h, false, D3D12_RESOURCE_STATE_COPY_DEST);
-    s.out = texture(s.dev, s.fmt, w, h, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (!s.color || !s.motion || !s.depth || !s.out)
+    // FSR's own textures in the states its calls name; the shared ones rest in COMMON between calls, the state CUDA
+    // reads and writes them in
+    s.color = texture(s.dev, s.fmt, w, h, false, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    s.motion =
+        texture(s.dev, DXGI_FORMAT_R16G16_FLOAT, w, h, false, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    s.depth = texture(s.dev, DXGI_FORMAT_R32_FLOAT, w, h, false, false, D3D12_RESOURCE_STATE_COPY_DEST);
+    s.out = texture(s.dev, s.fmt, w, h, true, false, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.shIn = texture(s.dev, s.fmt, w, h, false, true, D3D12_RESOURCE_STATE_COMMON);
+    s.shMv = texture(s.dev, DXGI_FORMAT_R16G16_FLOAT, w, h, false, true, D3D12_RESOURCE_STATE_COMMON);
+    s.shOut = texture(s.dev, s.fmt, w, h, false, true, D3D12_RESOURCE_STATE_COMMON);
+    if (!s.color || !s.motion || !s.depth || !s.out || !s.shIn || !s.shMv || !s.shOut)
         return destroy(s), fail("texture creation failed"), -8;
-    UINT64 inBytes = 0, mvBytes = 0;
-    const D3D12_RESOURCE_DESC cd = s.color->GetDesc(), md = s.motion->GetDesc();
-    s.dev->GetCopyableFootprints(&cd, 0, 1, 0, &s.fpColor, nullptr, nullptr, &inBytes);
-    s.dev->GetCopyableFootprints(&md, 0, 1, 0, &s.fpMv, nullptr, nullptr, &mvBytes);
-    // shared buffers start in COMMON: a buffer promotes to COPY_SOURCE / COPY_DEST implicitly and decays back when its
-    // list completes, the state CUDA reads and writes it in
-    s.shIn = buffer(s.dev, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED, inBytes, D3D12_RESOURCE_STATE_COMMON);
-    s.shMv = buffer(s.dev, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED, mvBytes, D3D12_RESOURCE_STATE_COMMON);
-    s.shOut = buffer(s.dev, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED, inBytes, D3D12_RESOURCE_STATE_COMMON);
-    if (!s.shIn || !s.shMv || !s.shOut)
-        return destroy(s), fail("shared buffer creation failed"), -9;
     if (FAILED(hr = s.dev->CreateSharedHandle(s.shIn, nullptr, GENERIC_ALL, nullptr, &s.sh.in)) ||
         FAILED(hr = s.dev->CreateSharedHandle(s.shMv, nullptr, GENERIC_ALL, nullptr, &s.sh.mv)) ||
-        FAILED(hr = s.dev->CreateSharedHandle(s.shOut, nullptr, GENERIC_ALL, nullptr, &s.sh.out)) ||
-        FAILED(hr = s.dev->CreateSharedHandle(s.fence, nullptr, GENERIC_ALL, nullptr, &s.sh.fence)))
-        return destroy(s), fail("shared handle creation failed", hr), -10;
-    s.sh.inBytes = s.sh.outBytes = inBytes;
-    s.sh.mvBytes = mvBytes;
-    s.sh.rowPitch = s.fpColor.Footprint.RowPitch;
-    s.sh.mvRowPitch = s.fpMv.Footprint.RowPitch;
+        FAILED(hr = s.dev->CreateSharedHandle(s.shOut, nullptr, GENERIC_ALL, nullptr, &s.sh.out)))
+        return destroy(s), fail("a shared texture's handle creation failed", hr), -10;
+    if (FAILED(hr = s.dev->CreateSharedHandle(s.fence, nullptr, GENERIC_ALL, nullptr, &s.sh.fence)))
+        return destroy(s), fail("the shared fence's handle creation failed", hr), -10;
+    const D3D12_RESOURCE_DESC cd = s.color->GetDesc(), md = s.motion->GetDesc();
+    s.sh.inBytes = s.sh.outBytes = s.dev->GetResourceAllocationInfo(0, 1, &cd).SizeInBytes;
+    s.sh.mvBytes = s.dev->GetResourceAllocationInfo(0, 1, &md).SizeInBytes;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fpColor = {}, fpMv = {};
+    s.dev->GetCopyableFootprints(&cd, 0, 1, 0, &fpColor, nullptr, nullptr, nullptr);
+    s.dev->GetCopyableFootprints(&md, 0, 1, 0, &fpMv, nullptr, nullptr, nullptr);
+    s.sh.rowPitch = fpColor.Footprint.RowPitch;
+    s.sh.mvRowPitch = fpMv.Footprint.RowPitch;
 
     // the constant depth (0.5, as the harness's flat depth), uploaded once
     {
@@ -350,14 +507,18 @@ FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, in
     ffxCreateBackendDX12Desc backend = {};
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
     backend.device = s.dev;
+    ffxOverrideVersion over = {};
+    over.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    over.header.pNext = &backend.header;
+    over.versionId = g_versionId;
     ffxCreateContextDescFrameGeneration create = {};
     create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
-    create.header.pNext = &backend.header;
+    create.header.pNext = &over.header;
     create.flags = 0;
     create.displaySize = {w, h};
     create.maxRenderSize = {w, h};
     create.backBufferFormat = fmt ? FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT : FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
-    if (ffxCreateContext(&s.ctx, &create.header, nullptr) != FFX_API_RETURN_OK)
+    if (g_ffx.CreateContext(&s.ctx, &create.header, nullptr) != FFX_API_RETURN_OK)
         return destroy(s), fail("ffxCreateContext(frame generation) failed"), -13;
     s.frameID = 0;
     s.live = true;
@@ -380,17 +541,20 @@ FSRFG_API int fsrfg_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int
     ID3D12GraphicsCommandList* l = openList(s, k);
     if (!l)
         return -3;
-    D3D12_RESOURCE_BARRIER b[2];
+    // the shared frame and vectors into FSR's own textures
+    D3D12_RESOURCE_BARRIER b[4];
     b[0] = transition(s.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     b[1] = transition(s.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    l->ResourceBarrier(2, b);
-    D3D12_TEXTURE_COPY_LOCATION dc = subresource(s.color), sc = footprint(s.shIn, s.fpColor);
-    l->CopyTextureRegion(&dc, 0, 0, 0, &sc, nullptr);
-    D3D12_TEXTURE_COPY_LOCATION dm = subresource(s.motion), sm = footprint(s.shMv, s.fpMv);
-    l->CopyTextureRegion(&dm, 0, 0, 0, &sm, nullptr);
+    b[2] = transition(s.shIn, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    b[3] = transition(s.shMv, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    l->ResourceBarrier(4, b);
+    l->CopyResource(s.color, s.shIn);
+    l->CopyResource(s.motion, s.shMv);
     b[0] = transition(s.color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     b[1] = transition(s.motion, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    l->ResourceBarrier(2, b);
+    b[2] = transition(s.shIn, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    b[3] = transition(s.shMv, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    l->ResourceBarrier(4, b);
 
     const FfxApiRect2D rect{0, 0, (int32_t)s.w, (int32_t)s.h};
     ffxConfigureDescFrameGeneration cfg = {};
@@ -401,7 +565,7 @@ FSRFG_API int fsrfg_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int
     cfg.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
     cfg.generationRect = rect;
     cfg.frameID = s.frameID;
-    if (ffxConfigure(&s.ctx, &cfg.header) != FFX_API_RETURN_OK)
+    if (g_ffx.Configure(&s.ctx, &cfg.header) != FFX_API_RETURN_OK)
         return l->Close(), fail("ffxConfigure(frame generation) failed"), -4;
 
     ffxDispatchDescFrameGenerationPrepareV2 prep = {};
@@ -424,7 +588,7 @@ FSRFG_API int fsrfg_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int
     memcpy(prep.cameraUp, up, sizeof(up));
     memcpy(prep.cameraRight, right, sizeof(right));
     memcpy(prep.cameraForward, forward, sizeof(forward));
-    if (ffxDispatch(&s.ctx, &prep.header) != FFX_API_RETURN_OK)
+    if (g_ffx.Dispatch(&s.ctx, &prep.header) != FFX_API_RETURN_OK)
         return l->Close(), fail("ffxDispatch(prepare V2) failed"), -5;
 
     ffxDispatchDescFrameGeneration fg = {};
@@ -439,16 +603,17 @@ FSRFG_API int fsrfg_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int
     fg.minMaxLuminance[1] = 80.0f;
     fg.generationRect = rect;
     fg.frameID = s.frameID;
-    if (ffxDispatch(&s.ctx, &fg.header) != FFX_API_RETURN_OK)
+    if (g_ffx.Dispatch(&s.ctx, &fg.header) != FFX_API_RETURN_OK)
         return l->Close(), fail("ffxDispatch(frame generation) failed"), -6;
 
-    D3D12_RESOURCE_BARRIER ob =
-        transition(s.out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    l->ResourceBarrier(1, &ob);
-    D3D12_TEXTURE_COPY_LOCATION so = subresource(s.out), dout = footprint(s.shOut, s.fpColor);
-    l->CopyTextureRegion(&dout, 0, 0, 0, &so, nullptr);
-    ob = transition(s.out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    l->ResourceBarrier(1, &ob);
+    // the generated frame into the shared texture
+    b[0] = transition(s.out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    b[1] = transition(s.shOut, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    l->ResourceBarrier(2, b);
+    l->CopyResource(s.shOut, s.out);
+    b[0] = transition(s.out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    b[1] = transition(s.shOut, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    l->ResourceBarrier(2, b);
     if (FAILED(l->Close()))
         return fail("command list Close failed"), -7;
     ID3D12CommandList* lists[] = {l};

@@ -1565,7 +1565,7 @@ static int offlineFitWork(const OfflineArgs& oa)
             const int levels = oa.fpsRatio == 0.0 && m >= 2 && (m & (m - 1)) == 0
                                    ? (m >= 16 ? 4 : (m >= 8 ? 3 : (m >= 4 ? 2 : 1)))
                                    : 3;
-            model = 259.0 + 368.0 * work + (levels - 1) * (18.0 + 163.0 * work);
+            model = 644.0 + 325.0 * work + (levels - 1) * (68.0 + 128.0 * work);
         }
         else if (oa.nvof)
             model = 233.0 + 179.0 * work;
@@ -1906,6 +1906,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         if (sl != std::wstring::npos)
             cacheDir = jp.substr(0, sl);
     }
+    if (nr.fsrfg && nr.cachePath.empty())
+        nr.cachePath = wideToUtf8(cacheDir); // FSR 4's vkd3d-proton shader cache goes into the model cache too
     const int64_t tStart = nowQpc100();
 
     // CUDA: device 0, one non-blocking compute stream, the kernels, the model buffers
