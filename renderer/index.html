@@ -201,7 +201,7 @@
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS 5 Neural Rendering 310.8.SF-v2">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS 5 Neural Rendering 310.8.SF-v2. Motion vectors: NVIDIA Optical Flow at Slow, its highest quality level.">
         <input type="checkbox" id="dlssnr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         NVIDIA DLSS 5 <span class="hint" id="dlssnrhint">(Neural Rendering at full resolution)</span>
       </label>
@@ -252,7 +252,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA Optical Flow API 5.0, run by the driver on the GPU's optical-flow engine">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA Optical Flow API 5.0, run by the driver on the GPU's optical-flow engine. Quality: Slow, the engine's highest quality level.">
         <input type="checkbox" id="modelnvof"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         NVIDIA Optical Flow <span class="hint">(NVIDIA's optical-flow hardware; very fast motion goes soft)</span>
@@ -284,7 +284,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS frame generation 310.9.1 through Streamline 2.14.1">
+      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS frame generation 310.9.1 through Streamline 2.14.1. Model preset (A or B): switch it in the NVIDIA App under Graphics &gt; Global Settings &gt; DLSS Override - Model Presets &gt; Frame Generation (Preset B = the DLSS 4.5 model); a per-game setting does not reach SmoothMyVideo. Super Resolution presets (M, L) do not apply: SmoothMyVideo runs no DLSS Super Resolution.">
         <input type="checkbox" id="modeldlss"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(AI frame generation from games; 2&times; to 6&times;; RTX 40/50, above 2&times; RTX 50)</span>
@@ -300,7 +300,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modelfsrfglabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 4.0.1 frame generation (FidelityFX SDK 2.3.0)">
+      <label class="hint" id="modelfsrfglabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 4.0.1 frame generation (FidelityFX SDK 2.3.0). Motion vectors: NVIDIA Optical Flow at Slow, its highest quality level.">
         <input type="checkbox" id="modelfsrfg"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         <span style="white-space:nowrap;">AMD FSR 4</span> <span class="hint">(AI frame generation from games)</span>
@@ -398,14 +398,14 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA RTX Video Super Resolution 1.6.0 (RTX Video SDK)">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA RTX Video Super Resolution 1.6.0 (RTX Video SDK). Quality: Ultra, the highest of its levels.">
         <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill screen or a DLSS mode below DLAA enlarges</span>)</span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="fsruplabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 4.1.1 upscaling (FidelityFX SDK 2.3.0)">
+      <label class="hint" id="fsruplabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 4.1.1 upscaling (FidelityFX SDK 2.3.0). Motion vectors: NVIDIA Optical Flow at Slow, its highest quality level.">
         <input type="checkbox" id="fsrup" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         <span style="white-space:nowrap;">AMD FSR 4.1</span> <span class="hint">(AMD's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill screen or a DLSS mode below DLAA enlarges</span>)</span>
       </label>

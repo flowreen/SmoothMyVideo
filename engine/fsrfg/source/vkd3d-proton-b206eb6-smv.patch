@@ -1,5 +1,5 @@
 diff --git a/include/vkd3d_sonames.h b/include/vkd3d_sonames.h
-index fd32ba4..5c33321 100644
+index fd32ba41..5c333215 100644
 --- a/include/vkd3d_sonames.h
 +++ b/include/vkd3d_sonames.h
 @@ -23,7 +23,7 @@
@@ -12,7 +12,7 @@ index fd32ba4..5c33321 100644
  #define SONAME_LIBVULKAN "libvulkan.so"
  #define SONAME_D3D12CORE "libvkd3d-proton-d3d12core.so"
 diff --git a/libs/d3d12/d3d12.def b/libs/d3d12/d3d12.def
-index 12b1d03..086e33a 100644
+index 12b1d03f..086e33a4 100644
 --- a/libs/d3d12/d3d12.def
 +++ b/libs/d3d12/d3d12.def
 @@ -1,4 +1,4 @@
@@ -22,7 +22,7 @@ index 12b1d03..086e33a 100644
  EXPORTS
      D3D12CreateDevice @101
 diff --git a/libs/d3d12/meson.build b/libs/d3d12/meson.build
-index d99da14..a2005b1 100644
+index d99da14c..a2005b1b 100644
 --- a/libs/d3d12/meson.build
 +++ b/libs/d3d12/meson.build
 @@ -3,7 +3,8 @@ d3d12_src = [
@@ -36,7 +36,7 @@ index d99da14..a2005b1 100644
  else
    d3d12_name_prefix = 'libvkd3d-proton-'
 diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
-index abd56d6..a542b74 100644
+index abd56d6d..a542b743 100644
 --- a/libs/d3d12core/d3d12core.def
 +++ b/libs/d3d12core/d3d12core.def
 @@ -1,4 +1,4 @@
@@ -46,7 +46,7 @@ index abd56d6..a542b74 100644
  EXPORTS
      D3D12GetInterface
 diff --git a/libs/d3d12core/meson.build b/libs/d3d12core/meson.build
-index dd1f779..7e168e0 100644
+index dd1f7799..7e168e0f 100644
 --- a/libs/d3d12core/meson.build
 +++ b/libs/d3d12core/meson.build
 @@ -4,7 +4,8 @@ d3d12core_src = [
@@ -60,7 +60,7 @@ index dd1f779..7e168e0 100644
  else
    d3d12core_name_prefix = 'libvkd3d-proton-'
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index ea1e8a0..56c1fe4 100644
+index 8a632d2d..8e3d6d44 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -394,26 +394,32 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device, VkSemaphore vk_se
@@ -154,7 +154,7 @@ index ea1e8a0..56c1fe4 100644
          type_info.pNext = &export_info;
      }
 diff --git a/libs/vkd3d/d3dkmt.c b/libs/vkd3d/d3dkmt.c
-index 8fabb24..588d233 100644
+index 8fabb245..588d2335 100644
 --- a/libs/vkd3d/d3dkmt.c
 +++ b/libs/vkd3d/d3dkmt.c
 @@ -61,6 +61,10 @@ void d3d12_shared_fence_open_export_kmt(struct d3d12_shared_fence *fence, struct
@@ -169,7 +169,7 @@ index 8fabb24..588d233 100644
      win32_handle_info.pNext = NULL;
      win32_handle_info.semaphore = fence->timeline_semaphore;
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index bfabbe0..2cb14f7 100644
+index bfabbe0f..2cb14f72 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
 @@ -2438,9 +2438,19 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
@@ -235,7 +235,7 @@ index bfabbe0..2cb14f7 100644
          vr = VK_CALL(vkGetSemaphoreWin32HandleKHR(device->vk_device, &win32_handle_info, handle));
  
 diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
-index a8fc26b..878fdf8 100644
+index a8fc26b1..878fdf89 100644
 --- a/libs/vkd3d/resource.c
 +++ b/libs/vkd3d/resource.c
 @@ -4400,6 +4400,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
@@ -275,7 +275,7 @@ index a8fc26b..878fdf8 100644
          bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
          bind_info.pNext = NULL;
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index 3e71f89..866e3d0 100644
+index 3e71f89c..866e3d04 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
 @@ -342,6 +342,7 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device,

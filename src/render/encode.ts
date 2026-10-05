@@ -17,6 +17,15 @@ export type Say = (line: string) => void;
 export type Fatal = (msg: string) => never;
 
 export const NVENC_MAX = 8192;
+/** The smallest even frame [w, h] each NVENC encoder opens; below it NVENC refuses ("Frame dimensions are less than
+ * the minimum supported value"). */
+export const NVENC_MIN: Record<string, [number, number]> = { hevc_nvenc: [130, 34], av1_nvenc: [130, 66] };
+
+/** True when NVENC encoder `venc` refuses a w x h frame. */
+export function belowNvencMin(venc: string, w: number, h: number): boolean {
+  const m = NVENC_MIN[venc];
+  return m !== undefined && (w < m[0] || h < m[1]);
+}
 
 /** python subprocess.CalledProcessError, message included (it reaches the GUI log verbatim). */
 export class CalledProcessError extends Error {
@@ -214,6 +223,14 @@ export function chooseEncoder(
     say('libvvenc (H.266/VVC) unavailable in this ffmpeg; using HEVC instead\n');
     venc = 'hevc_nvenc';
   }
+  if (venc === 'av1_nvenc' && belowNvencMin(venc, outW, outH)) {
+    // AV1 has no crop a decoder applies, so the HEVC route's padding cannot shrink it back: the CPU AV1 encoder
+    say(
+      `${outW}x${outH} is below av1_nvenc's smallest frame (${NVENC_MIN.av1_nvenc.join('x')}); ` +
+        'encoding AV1 on the CPU with libsvtav1\n',
+    );
+    venc = 'libsvtav1';
+  }
   let useNvenc = venc.endsWith('_nvenc');
   if (useNvenc && !works(ffmpeg, venc)) {
     say(`NVENC (${venc}) unavailable on this device; falling back to CPU libsvtav1\n`);
@@ -368,20 +385,36 @@ export function colorArgs(hdrActive: boolean, st: Stream, outW: number, outH: nu
 
 /** The encode -vf: the colour tags, the host's RGB frames (encInFmt) to YUV through zimg with the output's matrix
  * and range (chroma subsampled with Lanczos3), the encoder's pixel format. A matrix outside ZSC_MATRIX or another
- * input format leaves the conversion to swscale. */
-export function encodeVf(sp: string[], outPix: string, encInFmt = '', matrix = ''): string {
+ * input format leaves the conversion to swscale. `pad` = [w, h, padded w, padded h]: the frame padded on the planar
+ * format (pad and fillborders take no semi-planar input), the padding = the edge pixels smeared, so no hard edge
+ * rings into the visible blocks. `cut` = [w, h]: the frame cropped to it before the conversion (an odd size into
+ * 4:2:0, which zimg refuses). */
+export function encodeVf(
+  sp: string[],
+  outPix: string,
+  encInFmt = '',
+  matrix = '',
+  pad: number[] | null = null,
+  cut: number[] | null = null,
+): string {
   const tags = sp.length ? ['setparams=' + sp.join(':')] : [];
-  const planarIn = ({ rgb24: 'gbrp', rgb48le: 'gbrp16le', x2rgb10le: 'gbrp10le' } as Record<string, string>)[encInFmt];
-  if (!planarIn || !Object.prototype.hasOwnProperty.call(ZSC_MATRIX, matrix))
-    return tags.concat([`format=${outPix}`]).join(',');
-  const range = sp.includes('range=pc') ? 'full' : 'limited';
   const planarOut = outPix.startsWith('yuv444') ? 'yuv444p10le' : 'yuv420p10le';
+  const padF = pad
+    ? [`pad=${pad[2]}:${pad[3]}:0:0`, `fillborders=right=${pad[2] - pad[0]}:bottom=${pad[3] - pad[1]}:mode=smear`]
+    : [];
+  const cutF = cut ? [`crop=${cut[0]}:${cut[1]}:0:0`] : [];
+  const planarIn = ({ rgb24: 'gbrp', rgb48le: 'gbrp16le', x2rgb10le: 'gbrp10le' } as Record<string, string>)[encInFmt];
+  if (!planarIn || !Object.prototype.hasOwnProperty.call(ZSC_MATRIX, matrix)) {
+    const planar = padF.length || cutF.length ? [`format=${planarOut}`, ...cutF, ...padF] : [];
+    return tags.concat(planar, [`format=${outPix}`]).join(',');
+  }
+  const range = sp.includes('range=pc') ? 'full' : 'limited';
   return tags
-    .concat([
-      `format=${planarIn}`,
+    .concat([`format=${planarIn}`], cutF, [
       `zscale=matrix=${ZSC_MATRIX[matrix]}:range=${range}:filter=lanczos:dither=none`,
       `format=${planarOut}`,
     ])
+    .concat(padF)
     .concat(planarOut === outPix ? [] : [`format=${outPix}`])
     .join(',');
 }
@@ -435,6 +468,7 @@ export interface Encode {
   frag: string[];
   cmd: string[];
   notes: string[];
+  crop: boolean;
 }
 
 export interface EncodeInput {
@@ -469,10 +503,29 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   const [qargs, speedNote] = qualityArgs(e.venc, e.useNvenc, e.outLabel, e.dvOrHp, ultra, env);
   const prof = profileArgs(e.venc, outPix);
   const [sp, color, matrix] = colorArgs(e.hdrActive, e.st, e.outW, e.outH);
-  const vf = encodeVf(sp, outPix, e.encInFmt, matrix);
+  // 4:2:0 holds no odd size (HEVC and VVC crop in steps of 2, zimg refuses it, NVENC rounds it down itself): an odd
+  // frame is written at the even floor.
+  const sub = outPix.startsWith('yuv444') ? 1 : 2;
+  const [encW, encH] = [e.outW - (e.outW % sub), e.outH - (e.outH % sub)];
+  const cut = encW !== e.outW || encH !== e.outH ? [encW, encH] : null;
+  // A frame below hevc_nvenc's smallest: encoded padded up to it, then the HEVC conformance window (the SPS crop every
+  // decoder applies) cuts it back; the container's own size fields keep the padded size until the finish's
+  // stream-copy remux rewrites them from the SPS.
+  const crop = e.venc === 'hevc_nvenc' && belowNvencMin(e.venc, encW, encH);
+  const [minW, minH] = NVENC_MIN.hevc_nvenc;
+  const pad = crop ? [encW, encH, Math.max(encW, minW), Math.max(encH, minH)] : null;
+  const vf = encodeVf(sp, outPix, e.encInFmt, matrix, pad, cut);
+  const bsf = crop ? ['-bsf:v', `hevc_metadata=width=${encW}:height=${encH}`] : [];
   const tq = ultra ? ['-threads', '1', '-thread_queue_size', '1'] : [];
   let [maps, trackNotes] = trackMaps(e.outIsMkv, e.aud, e.sub, e.hasAttach);
   const notes = (speedNote ? [speedNote] : []).concat(trackNotes);
+  if (cut) notes.push(`encoder: 4:2:0 holds no odd size; ${e.outW}x${e.outH} is written as ${encW}x${encH}\n`);
+  if (pad) {
+    notes.push(
+      `encoder: ${encW}x${encH} is below hevc_nvenc's smallest frame (${minW}x${minH}); encoded padded to ` +
+        `${pad[2]}x${pad[3]}, the HEVC stream cropped back to ${encW}x${encH}\n`,
+    );
+  }
   let target: string, stage2Maps: string[], in2: string[];
   if (e.resumable) {
     target = e.resumeActive ? e.vidPart2 : e.vidPart;
@@ -519,11 +572,12 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
     ...qargs,
     ...prof,
     ...color,
+    ...bsf,
     ...(e.venc === 'libvvenc' ? ['-strict', 'experimental'] : []),
     ...frag,
     target,
   ];
-  return { outPix, qargs, prof, color, vf, tq, maps, stage2Maps, in2, target, frag, cmd, notes };
+  return { outPix, qargs, prof, color, vf, tq, maps, stage2Maps, in2, target, frag, cmd, notes, crop };
 }
 
 // --- the finish -------------------------------------------------------------------------------
@@ -624,6 +678,7 @@ export interface Finalize {
   fragCopy: boolean;
   fragFlags: string[];
   stage2Maps: string[];
+  cropped: boolean;
   rtx: HdrStats | null;
   nits: number;
   masterPrim: string;
@@ -651,6 +706,26 @@ export function finalizeOutput(f: Finalize): void {
   const hdrMkv2stage = f.hdrActive && f.outIsMkv;
   if (!f.resumable) {
     if (!hdrMkv2stage) {
+      if (f.cropped) {
+        // the one-stage encode's container still names the padded size: a stream-copy remux rewrites it from the SPS
+        const tmp = f.workPath.replace(/(\.[^.\\/]*)$/, '.remux$1');
+        runChecked([
+          f.ffmpeg,
+          '-v',
+          'error',
+          '-y',
+          '-i',
+          f.workPath,
+          '-map',
+          '0',
+          '-c',
+          'copy',
+          '-max_interleave_delta',
+          '0',
+          tmp,
+        ]);
+        fs.renameSync(tmp, f.workPath);
+      }
       hdr10(f.workPath);
       if (f.hpActive) f.hpExport();
       if (f.dvActive) f.dvExport();

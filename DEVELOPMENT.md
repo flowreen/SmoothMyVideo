@@ -401,7 +401,7 @@ Models (GMFSS is the default, the anime specialist):
 * `--nvof` "NVIDIA Optical Flow" (2026-09-21): the driver's optical-flow hardware through
   `nvofapi64.dll` (System32, opened by full path, nothing bundled; the MIT interface headers are
   vendored in `engine/live/build_src/nvofa`) run by `smv-live.exe` itself. One Execute per pair
-  gives both fields (grid 4, fast preset, gray8 luma of the two frames, temporal hints off), the
+  gives both fields (grid 4, the slow perf level, gray8 luma of the two frames, temporal hints off), the
   fields and the cost are upsampled bilinear, a metric `-0.1 * cost - 1.0 * |F01 + F10|` (forward
   backward consistency) weighs the tween, a PULL warp with a confidence fallback (since the
   2026-09-21 fix round, chosen by eye against SVP, Smooth Motion and GMFSS): the velocity of both
@@ -463,9 +463,13 @@ Models (GMFSS is the default, the anime specialist):
   midpoint tree, level L on bridge instance L - 1, each instance fed one continuous stream (instance
   0 every real frame in order, tweens or not; the stream's first frame resets it, a gap re-feeds the
   missing frame without a reset: after a reset FSR's next 10 tweens follow the vectors alone). Its
-  motion vectors are NVIDIA optical flow (both directions, fast, grid 1 or 4 where 1 is refused,
-  ABGR8): the previous frame is the input, this one the reference, the backward field = FSR's
-  current -> previous convention; depth is a constant 0.5. Frames go to the bridge as RGBA16F
+  motion vectors are NVIDIA optical flow (one direction, the slow perf level, grid 1 or 4 where 1 is
+  refused, ABGR8): this frame is the input, the previous one the reference, so the forward field =
+  FSR's current -> previous convention (byte for byte the backward field of a both-directions run at
+  about half the optical flow time, `SMV_OFVEC_BOTH=1` = that run); depth is a constant 0.5. At the
+  FAST level the tweens went wrong after a few hundred calls of a 1080p session (grid 1 ~320, grid 4
+  ~450 to 770; garbage from then on, run to run different, with vkd3d-proton in the process; zero
+  vectors and AMD's own path stay exact; harness `fsr4_optimization` `fg_long.py`); never fast here. Frames go to the bridge as RGBA16F
   through three textures shared with CUDA and one shared fence (GPU-side waits, no CPU copy): vkd3d-proton
   shares textures, not buffers, as Vulkan opaque Win32 handles CUDA maps as arrays, and its fence as a
   Vulkan timeline semaphore (our patches: NVIDIA's Vulkan driver exports no D3D12-fence semaphore, and
@@ -542,7 +546,7 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   (the two exclude each other; with both, RTX VSR keeps it and the host says so): AMD's signed FidelityFX loader +
   upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, which opens the upscaler's GPU gate (see "AMD FSR
   upscaling bridge"), every frame of that resize's stream in order (the first resets), its motion vectors from
-  NVIDIA optical flow (the FSR FG route's: both directions, fast, grid 1), a constant depth, no jitter; RTX VSR's
+  NVIDIA optical flow (one direction, the slow perf level, grid 1), a constant depth, no jitter; RTX VSR's
   rules hold (SDR only, enlarging only, one resize). AMD's FSR 4.1.1 is deterministic: the host's frames equal
   AMD's own run (with the same gate opened) on the same frames byte for byte (harness
   `fsr_framegen\host\fsrup_gate.py`). On the measured anime clips (480p -> 1080p, frames 4+) it scored the best
@@ -621,10 +625,26 @@ swscale. An untagged source converts with the matrix players assume for its size
 BT.601 below), the output with the one of its own size, which the conversion then names on the
 output (transfer and primaries stay untagged); before, an untagged HD source ran through BT.601
 both ways. The decode costs 3 to 7 % more than swscale's default (4K: 10.8 -> 11.1 ms a frame).
+zimg takes only sizes the chroma subsampling divides (`probe.ts` `zimgPadCrop`): a source missing
+rows (an odd height in 4:2:0) is padded and the RGB cropped back, bit for bit the taller frame's
+conversion; a source missing a column (an odd width in 4:2:0 / 4:2:2, a VP9 / AV1 / FFV1 size) goes
+to swscale (41.8 to 45.6 dB against zimg's decode), because ffmpeg's `pad` overwrites the chroma
+column the last pixel shares with the padding. Gates: harness `odd_size_420` (`decode_exact.py`,
+`odd_cli_gate.py`).
 
 Output:
 * Always 10-bit, always visually lossless, no quality knob. `--codec hevc` (default, `hevc_nvenc`,
   CPU `libsvtav1` fallback without NVENC), `av1` (`av1_nvenc`), `vvc` (`libvvenc`, CPU).
+* An odd size into 4:2:0 is written at the even floor (255x255 -> 254x254, cropped before the
+  conversion): HEVC and VVC 4:2:0 crop in steps of two and NVENC rounds such a frame down itself.
+  4:4:4 keeps the odd size.
+* Tiny frames: NVENC refuses a frame below 130x34 (HEVC) / 130x66 (AV1) (encode.ts `NVENC_MIN`). HEVC
+  encodes it padded up to that size (the edge pixels smeared) and the `hevc_metadata` bitstream filter
+  sets the HEVC conformance window back to the real size, the crop every decoder applies (4:2:0 to
+  even, as NVENC rounds an odd 4:2:0 frame itself); the finish's stream-copy remux rewrites the
+  container's size fields, which the encode leaves at the padded size. AV1 has no such crop: it
+  switches to CPU `libsvtav1`. Gates: harness `nvenc_min_size` (`argv_identity.js`,
+  `tiny_encode_gate.py`).
 * 4:4:4 is kept where the encoder allows it (HEVC through NVENC, `yuv444p10msble`: its ten bits in
   the high bits of 16, as `p010le`; handed 16-bit samples NVENC dropped the low six, half a code
   dark on every plane): a 4:4:4 YUV source and an RGB or palette source, whose every pixel has its
@@ -729,7 +749,7 @@ model, so the generated frames inherit the pass. The native host runs it with th
 core, handoff and motion (`nativeLiveNrInit`, `nativeNrFrame`): the NR core
 (`engine/dlssnr/build_src/nr_host.cpp`, `nr::Host::startup` on a private D3D12 device on the adapter
 whose LUID is the CUDA device's, so another GPU driving the display does not matter) at the model
-size, the zero-copy shared buffers and fence, and the CUDA Optical Flow motion vectors (grid 4, FAST,
+size, the zero-copy shared buffers and fence, and the CUDA Optical Flow motion vectors (grid 4, slow,
 current -> previous, the offline `k_nvofUp` + `k_nrMv` field); the server is never told `--dlssnr`.
 `DLSSNR.Reset` is 1 only on a stream's first frame: the session start and the first frame after a
 pause. SDR planes go to the model as they are; HDR planes (PQ BT.2020) go through `k_nrInPq` / `k_nrOutPq`, the `_nr_scrgb`
@@ -1525,6 +1545,11 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_FSRFG_DIR`, `SMV_FSRUP_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
 | `SMV_FSRFG_SHIM_LOG=1`, `VKD3D_DEBUG=warn` | AMD FSR 4 frame generation's debug output: the driver-extension shim's calls, vkd3d-proton's log (the bridge sets `VKD3D_DEBUG=none` unless set) |
 | `SMV_FSRFG_SDR_PAIRS=0` | on HDR planes AMD FSR frame generation gets every frame pair as the HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
+| `SMV_OFVEC_BOTH=1` | AMD FSR's motion vectors (frame generation and upscaling) from NVIDIA Optical Flow in both directions, the backward field read, instead of the forward field with the two frames swapped (the same field, byte for byte, at about half the Optical Flow time); A/B lever, never a product setting |
+| `SMV_OF_LEVEL=fast\|medium` | Every NVIDIA Optical Flow session (the NVIDIA Optical Flow model, DLSS 5's motion vectors, AMD FSR's vectors for frame generation and upscaling) at that perf level instead of slow, the engine's highest quality level (frame generation at fast = the repro of its tweens turning to garbage after ~320 calls at 1080p; the FSR 4 gate's like-for-like pan against AMD's path, whose vectors are fast grid 1); A/B lever, never a product setting |
+| `SMV_OFVEC_GRID4=1` | AMD FSR's motion vectors (frame generation and upscaling) at optical flow grid 4 + the bilinear upsample (`k_nvofUp`) instead of grid 1 (frame generation 1080p fast: a call 9.5 -> 3.5 ms; at fast it breaks too, later); A/B lever, never a product setting |
+| `SMV_OFVEC_COST=1` | AMD FSR's motion vectors: the Optical Flow engine's cost output on (FSR reads no cost; off by default, the same vectors byte for byte, ~2 to 3 % less Optical Flow time); A/B lever, never a product setting |
+| `SMV_FSRFG_PROF=1` / `SMV_FSRUP_PROF=1` | AMD FSR frame generation / upscaling: CUDA events between a call's stages (the copies, the Optical Flow inputs, the Optical Flow, the vector kernels, FSR itself, the unpack), `[fsrfg-prof]` / `[fsrup-prof]` ms a call at the session's end; every call then waits for its last event (profiling only, slower) |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..4, default 3 offline, 2 live; exact nodes go to depth 4 either way) |
@@ -1679,12 +1704,12 @@ loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
 vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
-github.com/HansKristian-Work/vkd3d-proton at 31d1f89ca5b3f2fd3b6f025c8e6f73ed3eaa852b with its submodules
-(dxil-spirv at e79ef39803ee1dbf31c629bc7440a659122063c7), then
+github.com/HansKristian-Work/vkd3d-proton at b206eb6680fb92a64ae57bfccc7454a138f76887 with its submodules
+(dxil-spirv at ab47c3df1a4746f36c958f0262bc9e314eb566eb), then
 
 ```
-git apply engine/fsrfg/source/vkd3d-proton-31d1f89-smv.patch        (in the vkd3d-proton checkout)
-git apply engine/fsrfg/source/dxil-spirv-e79ef39-smv.patch          (in subprojects/dxil-spirv)
+git apply engine/fsrfg/source/vkd3d-proton-b206eb6-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/dxil-spirv-ab47c3d-smv.patch          (in subprojects/dxil-spirv)
 meson setup build --buildtype=release -Denable_extended_emulation=true
 ninja -C build
 ```

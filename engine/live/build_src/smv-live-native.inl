@@ -2568,6 +2568,18 @@ __global__ void k_mvHalf(const float* __restrict__ flow, int w, int h, unsigned 
     const size_t o = (size_t)y * w + x;
     dst[(size_t)y * (dstPitch >> 2) + x] = (unsigned int)f2h(flow[o]) | ((unsigned int)f2h(flow[(size_t)w * h + o]) << 16);
 }
+// the same texels from the engine's grid-1 field in one pass: vec = w x h short2 (raw / 32 = px, rows vecPitch bytes),
+// k_nvofUp at grid 1 (weights 0 and 1, an exact copy) then k_mvHalf, byte for byte
+__global__ void k_mvHalfG1(const short* __restrict__ vec, int vecPitch, int w, int h, unsigned int* __restrict__ dst,
+                           int dstPitch)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const short* r = (const short*)((const char*)vec + (size_t)y * vecPitch);
+    const float fx = (float)r[2 * x] * (1.0f / 32.0f), fy = (float)r[2 * x + 1] * (1.0f / 32.0f);
+    dst[(size_t)y * (dstPitch >> 2) + x] = (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
+}
 // AMD FSR upscaling: RTX VSR's tight BGRA8 input frame as RGBA8 rows twice, the bridge's (aPitch bytes apart) and the
 // Optical Flow engine's ABGR8 input (bPitch); and the bridge's RGBA8 result (srcPitch) back to tight BGRA8
 __global__ void k_bgraRgbaFsr(const unsigned char* __restrict__ src, int w, int h, unsigned char* __restrict__ a,
@@ -4018,9 +4030,16 @@ struct NativeRife
     LUID fgLuid = {};
     int fgPitch = 0, fgMvPitch = 0; // the bridge's row pitches (bytes), the same for every instance
     uint8_t* dFgMv = nullptr;       // a call's vectors (RG16F rows fgMvPitch apart) before their copy into its texture
+    // SMV_FSRFG_PROF=1: CUDA events between a call's stages (copy in, the Optical Flow inputs, the Optical Flow, the
+    // vector kernels, the vector copy, FSR on vkd3d, the copy out), means at the session's end; every call then waits
+    // for its last event, so the stages do not overlap the next call's
+    bool fgProf = false;
+    cudaEvent_t fgEv[8] = {};
+    double fgStageMs[7] = {}, fgCpuMs = 0.0;
+    uint64_t fgProfN = 0, fgProfVecN = 0;
     // FSR's motion vectors (frame generation and upscaling): an Optical Flow session at w x h, ABGR8 (R, G, B, A
-    // bytes), both directions, fast, its output grid; input slot `prev` is the input frame, `cur` the reference, so the
-    // backward field = the current frame -> its predecessor (FSR's convention), in px: two planes + k_nvofUp's cost plane
+    // bytes), one direction, fast, its output grid: the field from slot `cur` to slot `prev` = the current frame -> its
+    // predecessor (FSR's convention), in px: two planes + k_nvofUp's cost plane
     struct OfVec
     {
         NvOFHandle of = nullptr;
@@ -4029,6 +4048,10 @@ struct NativeRife
         uint32_t inPitch = 0, outPitch[2] = {}, costPitch[2] = {};
         int w = 0, h = 0, grid = 1, gw = 0, gh = 0;
         float* dFlow = nullptr;
+        bool both = false; // SMV_OFVEC_BOTH=1: both directions, the backward field read (else forward, frames swapped)
+        bool costOn = false; // SMV_OFVEC_COST=1: the engine's cost output (FSR reads none; k_nvofUp's plane unread)
+        bool grid4 = false;  // SMV_OFVEC_GRID4=1: grid 4 (+ k_nvofUp's bilinear) where grid 1 is offered too
+        NV_OF_PERF_LEVEL level = NV_OF_PERF_LEVEL_SLOW; // nativeOfLevel()
     };
     OfVec fgOf;
     // AMD FSR upscaling (fsrUp, `--fsr-upscale`): RTX VSR's resize (vsr is set too, so the slot rules, the staging and
@@ -4048,6 +4071,12 @@ struct NativeRife
     bool fuMade = false;
     int fuCur = 0;    // the vector session's slot that holds this frame
     uint64_t fuN = 0; // frames upscaled
+    // SMV_FSRUP_PROF=1: CUDA events between a frame's stages (the input pack, the Optical Flow, the vector kernels, FSR
+    // on D3D12, the output unpack), means at the session's end; every frame then waits for its last event
+    bool fuProf = false;
+    cudaEvent_t fuEv[6] = {};
+    double fuStageMs[5] = {};
+    uint64_t fuProfN = 0, fuProfVecN = 0;
     char fuVersion[32] = {};
     OfVec fuOf;
     // RIFE with DRBA timing (rifedrba): the RIFE
@@ -4329,7 +4358,7 @@ struct NativeRife
     CUfunction fFitPlanar = nullptr, fSharpPlanar = nullptr,                                  // sharpen
         fPackBgraRgb = nullptr, fUnpackBgraRgb = nullptr,                   // VSR / FRUC: (R, G, B) <-> BGRA8
         fPackRgbaH = nullptr, fRgbaHAbgr = nullptr, fUnpackRgbaH = nullptr, // FSR frame generation: RGBA16F frames,
-        fMvHalf = nullptr,                                                  // the Optical Flow input, the vectors
+        fMvHalf = nullptr, fMvHalfG1 = nullptr,                             // the Optical Flow input, the vectors
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr,                        // FSR upscaling: VSR's BGRA8 <-> RGBA8
         fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,     // offline DLSS 4.5 frames
         fUnpackR10 = nullptr;
@@ -6866,6 +6895,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fRgbaHAbgr, "k_rgbaHAbgr"},
         {&nr.fUnpackRgbaH, "k_unpackRgbaH"},
         {&nr.fMvHalf, "k_mvHalf"},
+        {&nr.fMvHalfG1, "k_mvHalfG1"},
         {&nr.fBgraRgbaFsr, "k_bgraRgbaFsr"},
         {&nr.fRgbaBgra, "k_rgbaBgra"},
         {&nr.fHdrRestOut, "k_hdrRestOut"},
@@ -7462,6 +7492,26 @@ static const float kNvofA = 0.1f, kNvofB = 1.0f;
 static const float kNvofLo = -9.0f, kNvofHi = -5.0f, kNvofSigma = 6.0f;
 static const int kNvofGrid = 4;
 
+// every Optical Flow session (the nvof model, DLSS 5's vectors, FSR's vectors) runs the engine's highest quality level,
+// slow (the user's call: "we're not allowed to ship inferior quality"); SMV_OF_LEVEL=fast|medium|slow = A/B only
+static NV_OF_PERF_LEVEL nativeOfLevel()
+{
+    char ev[16] = {};
+    if (GetEnvironmentVariableA("SMV_OF_LEVEL", ev, sizeof(ev)) > 0)
+    {
+        if (!strcmp(ev, "fast"))
+            return NV_OF_PERF_LEVEL_FAST;
+        if (!strcmp(ev, "medium"))
+            return NV_OF_PERF_LEVEL_MEDIUM;
+    }
+    return NV_OF_PERF_LEVEL_SLOW;
+}
+
+static const char* nativeOfLevelName(NV_OF_PERF_LEVEL l)
+{
+    return l == NV_OF_PERF_LEVEL_FAST ? "fast" : l == NV_OF_PERF_LEVEL_MEDIUM ? "medium" : "slow";
+}
+
 static bool nativeNvofLoad()
 {
     if (g_nvofLoaded)
@@ -7559,7 +7609,7 @@ static bool nativeNvofSetup(NativeRife& nr)
     ip.outGridSize = (NV_OF_OUTPUT_VECTOR_GRID_SIZE)kNvofGrid;
     ip.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
     ip.mode = NV_OF_MODE_OPTICALFLOW;
-    ip.perfLevel = NV_OF_PERF_LEVEL_FAST;
+    ip.perfLevel = nativeOfLevel();
     ip.enableExternalHints = NV_OF_FALSE;
     ip.enableOutputCost = NV_OF_TRUE;
     ip.disparityRange = NV_OF_STEREO_DISPARITY_RANGE_UNDEFINED;
@@ -7640,8 +7690,8 @@ static bool nativeNvofSetup(NativeRife& nr)
         NCHK(cudaEventCreate(&nr.nvEv[0]), "create nvof event");
         NCHK(cudaEventCreate(&nr.nvEv[1]), "create nvof event");
     }
-    LOG("native: nvof session %dx%d, grid %d (%dx%d), fast, both directions, gray8\n", nr.w, nr.h, kNvofGrid, nr.ofGw,
-        nr.ofGh);
+    LOG("native: nvof session %dx%d, grid %d (%dx%d), %s, both directions, gray8\n", nr.w, nr.h, kNvofGrid, nr.ofGw,
+        nr.ofGh, nativeOfLevelName(ip.perfLevel));
     return true;
 }
 
@@ -8708,8 +8758,9 @@ static bool nativeFsrfgCreate(NativeRife& nr, int i)
     return true;
 }
 
-// an OfVec session at w x h (FSR's vectors: ABGR8, both directions, fast, grid 1 = the measurement harness's vectors,
-// or grid 4 with k_nvofUp's bilinear taps where the engine refuses grid 1); tag names it in the log lines
+// an OfVec session at w x h (FSR's vectors: ABGR8, one direction, grid 1 = the measurement harness's vectors, or grid 4
+// with k_nvofUp's bilinear taps where the engine refuses grid 1, or with SMV_OFVEC_GRID4=1) at nativeOfLevel(); tag names
+// it in the log lines
 static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h, const char* tag)
 {
     if (!nativeNvofLoad())
@@ -8727,8 +8778,19 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
     }
     o.w = w;
     o.h = h;
+    {
+        char ev[8] = {};
+        o.both = GetEnvironmentVariableA("SMV_OFVEC_BOTH", ev, sizeof(ev)) > 0 && ev[0] == '1';
+        ev[0] = 0;
+        o.costOn = GetEnvironmentVariableA("SMV_OFVEC_COST", ev, sizeof(ev)) > 0 && ev[0] == '1';
+        ev[0] = 0;
+        o.grid4 = GetEnvironmentVariableA("SMV_OFVEC_GRID4", ev, sizeof(ev)) > 0 && ev[0] == '1';
+    }
+    o.level = nativeOfLevel();
     for (int grid : {1, 4})
     {
+        if (o.grid4 && grid == 1)
+            continue;
         if (g_nvofApi.nvCreateOpticalFlowCuda(ctx, &o.of) != NV_OF_SUCCESS)
         {
             o.of = nullptr;
@@ -8741,12 +8803,15 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
         ip.outGridSize = (NV_OF_OUTPUT_VECTOR_GRID_SIZE)grid;
         ip.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
         ip.mode = NV_OF_MODE_OPTICALFLOW;
-        ip.perfLevel = NV_OF_PERF_LEVEL_FAST;
+        ip.perfLevel = o.level;
         ip.enableExternalHints = NV_OF_FALSE;
-        ip.enableOutputCost = NV_OF_TRUE;
+        // FSR reads no cost (k_nvofUp's cost plane goes unread): off; SMV_OFVEC_COST=1 = on
+        ip.enableOutputCost = o.costOn ? NV_OF_TRUE : NV_OF_FALSE;
         ip.disparityRange = NV_OF_STEREO_DISPARITY_RANGE_UNDEFINED;
         ip.enableRoi = NV_OF_FALSE;
-        ip.predDirection = NV_OF_PRED_DIRECTION_BOTH;
+        // FSR reads one field, current -> previous: the forward field with the two frames swapped (half the work of
+        // both directions); SMV_OFVEC_BOTH=1 = both directions, the backward one read
+        ip.predDirection = o.both ? NV_OF_PRED_DIRECTION_BOTH : NV_OF_PRED_DIRECTION_FORWARD;
         ip.enableGlobalFlow = NV_OF_FALSE;
         ip.inputBufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
         if (g_nvofApi.nvOFInit(o.of, &ip) == NV_OF_SUCCESS)
@@ -8763,7 +8828,9 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
         return false;
     }
     if (o.grid != 1)
-        LOG("native: %s: the Optical Flow engine refused grid 1, vectors at grid 4 (bilinear)\n", tag);
+        LOG(o.grid4 ? "native: %s: vectors at grid 4 (bilinear, SMV_OFVEC_GRID4=1)\n"
+                    : "native: %s: the Optical Flow engine refused grid 1, vectors at grid 4 (bilinear)\n",
+            tag);
     o.gw = (w + o.grid - 1) / o.grid;
     o.gh = (h + o.grid - 1) / o.grid;
     for (int k = 0; k < 2; k++)
@@ -8789,25 +8856,37 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
         LOG("native: %s: nvOFSetIOCudaStreams failed\n", tag);
         return false;
     }
-    NCHK(cudaMalloc((void**)&o.dFlow, 3 * (size_t)w * h * sizeof(float)), "alloc FSR vectors");
+    if (o.grid != 1) // grid 1 writes the texels straight from the field (k_mvHalfG1)
+        NCHK(cudaMalloc((void**)&o.dFlow, 3 * (size_t)w * h * sizeof(float)), "alloc FSR vectors");
     return true;
 }
 
-// the vectors from input slot `prev` (the input frame) to slot `cur` (the reference), both holding their ABGR8 frames:
-// the backward field = cur -> prev in px, into dst as R16G16_FLOAT texels, rows dstPitch bytes apart
+// the vectors between slots `prev` and `cur`, both holding their ABGR8 frames: the field cur -> prev in px (the backward
+// field of the pair), into dst as R16G16_FLOAT texels, rows dstPitch bytes apart
 static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int cur, uint8_t* dst, int dstPitch,
-                           const char* tag)
+                           const char* tag, cudaEvent_t evOf = nullptr)
 {
     cudaStream_t st = nr.stream;
     NV_OF_EXECUTE_INPUT_PARAMS ei{};
-    ei.inputFrame = o.in[prev];
-    ei.referenceFrame = o.in[cur];
-    ei.disableTemporalHints = NV_OF_TRUE;
     NV_OF_EXECUTE_OUTPUT_PARAMS eo{};
-    eo.outputBuffer = o.out[0];
-    eo.outputCostBuffer = o.cost[0];
-    eo.bwdOutputBuffer = o.out[1];
-    eo.bwdOutputCostBuffer = o.cost[1];
+    ei.disableTemporalHints = NV_OF_TRUE;
+    if (o.both)
+    {
+        ei.inputFrame = o.in[prev];
+        ei.referenceFrame = o.in[cur];
+        eo.outputBuffer = o.out[0];
+        eo.outputCostBuffer = o.costOn ? o.cost[0] : nullptr;
+        eo.bwdOutputBuffer = o.out[1];
+        eo.bwdOutputCostBuffer = o.costOn ? o.cost[1] : nullptr;
+    }
+    else
+    {
+        // the forward field from `cur` to `prev` = the backward one of (prev, cur), into the buffers it is read from
+        ei.inputFrame = o.in[cur];
+        ei.referenceFrame = o.in[prev];
+        eo.outputBuffer = o.out[1];
+        eo.outputCostBuffer = o.costOn ? o.cost[1] : nullptr;
+    }
     const NV_OF_STATUS s = g_nvofApi.nvOFExecute(o.of, &ei, &eo);
     if (s != NV_OF_SUCCESS)
     {
@@ -8815,9 +8894,21 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
         nr.die("FSR optical flow failed");
         return false;
     }
+    if (evOf) // a profiler's mark between the Optical Flow and the vector kernels (the session's stream)
+        cudaEventRecord(evOf, st);
     const unsigned gx = (unsigned)(o.w + 15) / 16, gy = (unsigned)(o.h + 15) / 16;
     int grid = o.grid, vp = (int)o.outPitch[1], cp = (int)o.costPitch[1], mp = dstPitch;
     CUdeviceptr v = o.outP[1], c = o.costP[1];
+    if (grid == 1) // the field is the texels' grid: one pass, no float planes in between
+    {
+        void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp};
+        if (cuLaunchKernel(nr.fMvHalfG1, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, g1, nullptr) != CUDA_SUCCESS)
+        {
+            nr.die("FSR vector launch failed");
+            return false;
+        }
+        return true;
+    }
     float* flow = o.dFlow;
     float* cost = o.dFlow + 2 * (size_t)o.w * o.h;
     void* b[] = {&v, &vp, &c, &cp, &o.gw, &o.gh, &grid, &o.w, &o.h, &flow, &cost};
@@ -8845,19 +8936,25 @@ static void nativeOfVecFree(NativeRife::OfVec& o)
 
 // one bridge call: instance i gets `frame` (RGBA16F rows fgPitch apart) with its vectors toward `prev` (the frame the
 // instance was fed last; null = zero vectors: a reset, or a re-prime nobody reads) and returns into `out` (null =
-// dropped) the frame halfway between them. The vectors as the harness made them: the previous frame is the Optical
-// Flow input, this one the reference, and the backward field (this frame -> the previous, px) = FSR's convention
+// dropped) the frame halfway between them. The vectors as the harness made them: the field this frame -> the previous
+// (px) = FSR's convention
 static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const uint8_t* prev, bool reset, uint8_t* out)
 {
     NativeRife::FgInst& g = nr.fg[i];
     cudaStream_t st = nr.stream;
     const size_t row = (size_t)nr.w * 8;
     const unsigned gx = (unsigned)(nr.w + 15) / 16, gy = (unsigned)(nr.h + 15) / 16;
+    auto mark = [&nr, st](int e) {
+        if (nr.fgProf)
+            cudaEventRecord(nr.fgEv[e], st);
+    };
+    mark(0);
     if (cudaMemcpy2DToArrayAsync(g.in, 0, 0, frame, nr.fgPitch, row, nr.h, cudaMemcpyDeviceToDevice, st) != cudaSuccess)
     {
         nr.die("fsrfg frame copy failed");
         return false;
     }
+    mark(1);
     if (prev)
     {
         int sp = nr.fgPitch, ip = (int)nr.fgOf.inPitch;
@@ -8872,7 +8969,8 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
                 return false;
             }
         }
-        if (!nativeOfVecRun(nr, nr.fgOf, 0, 1, nr.dFgMv, nr.fgMvPitch, "fsrfg"))
+        mark(2);
+        if (!nativeOfVecRun(nr, nr.fgOf, 0, 1, nr.dFgMv, nr.fgMvPitch, "fsrfg", nr.fgProf ? nr.fgEv[3] : nullptr))
             return false;
     }
     else if (cudaMemset2DAsync(nr.dFgMv, nr.fgMvPitch, 0, (size_t)nr.w * 4, nr.h, st) != cudaSuccess)
@@ -8880,12 +8978,19 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
         nr.die("fsrfg vector clear failed");
         return false;
     }
+    else
+    {
+        mark(2);
+        mark(3);
+    }
+    mark(4);
     if (cudaMemcpy2DToArrayAsync(g.mv, 0, 0, nr.dFgMv, nr.fgMvPitch, (size_t)nr.w * 4, nr.h, cudaMemcpyDeviceToDevice,
                                  st) != cudaSuccess)
     {
         nr.die("fsrfg vector copy failed");
         return false;
     }
+    mark(5);
     cudaExternalSemaphoreSignalParams sp{};
     sp.params.fence.value = ++g.val;
     if (cudaSignalExternalSemaphoresAsync(&g.sem, &sp, 1, st) != cudaSuccess)
@@ -8894,8 +8999,11 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
         return false;
     }
     const uint64_t ready = g.val, done = ++g.val;
+    const int64_t c0 = nr.fgProf ? nowQpc100() : 0;
     // the frame time does not change FSR 4's output (a 24 and a 60 fps run byte for byte the same): one 60 Hz frame
     const int rc = g_fsrfg.frameI(i, ready, done, reset ? 1 : 0, 1000.0 / 60.0);
+    if (nr.fgProf)
+        nr.fgCpuMs += (double)(nowQpc100() - c0) / 10000.0;
     if (rc != 0)
     {
         LOG("native: fsrfg: instance %d call failed: %s (rc %d)\n", i, g_fsrfg.lastError(), rc);
@@ -8904,12 +9012,29 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
     }
     cudaExternalSemaphoreWaitParams wp{};
     wp.params.fence.value = done;
-    if (cudaWaitExternalSemaphoresAsync(&g.sem, &wp, 1, st) != cudaSuccess ||
-        (out && cudaMemcpy2DFromArrayAsync(out, nr.fgPitch, g.out, 0, 0, row, nr.h, cudaMemcpyDeviceToDevice, st) !=
-                    cudaSuccess))
+    if (cudaWaitExternalSemaphoresAsync(&g.sem, &wp, 1, st) != cudaSuccess)
     {
         nr.die("fsrfg result failed");
         return false;
+    }
+    mark(6);
+    if (out && cudaMemcpy2DFromArrayAsync(out, nr.fgPitch, g.out, 0, 0, row, nr.h, cudaMemcpyDeviceToDevice, st) !=
+                   cudaSuccess)
+    {
+        nr.die("fsrfg result failed");
+        return false;
+    }
+    mark(7);
+    if (nr.fgProf && cudaEventSynchronize(nr.fgEv[7]) == cudaSuccess)
+    {
+        for (int s = 0; s < 7; s++)
+        {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, nr.fgEv[s], nr.fgEv[s + 1]) == cudaSuccess)
+                nr.fgStageMs[s] += ms;
+        }
+        nr.fgProfN++;
+        nr.fgProfVecN += prev ? 1 : 0;
     }
     nr.frCalls[i]++;
     return true;
@@ -9010,6 +9135,8 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     nr.fgPitch = nr.fgMvPitch = 0;
     for (NativeRife::FgInst& g : nr.fg)
         g = NativeRife::FgInst{};
+    // never the fast perf level here: at fast, grid 1, the engine's vectors can go wrong after ~320 calls of a 1080p
+    // session with vkd3d-proton in the process (garbage tweens from then on, run to run different)
     if (!nativeFsrfgCreate(nr, 0) || !nativeOfVecSetup(nr, nr.fgOf, nr.w, nr.h, "fsrfg"))
         return false;
     const size_t bytes = (size_t)nr.fgPitch * nr.h, plane = (size_t)nr.ph * nr.pw;
@@ -9028,6 +9155,17 @@ static bool nativeFsrfgSetup(NativeRife& nr)
         NCHK(cudaMalloc((void**)&nr.dFrRange, sizeof(int)), "alloc fsrfg range flag");
         NCHK(cudaHostAlloc((void**)&nr.hFrRange, sizeof(int), cudaHostAllocDefault), "alloc fsrfg range readback");
     }
+    {
+        char ev[8] = {};
+        nr.fgProf = GetEnvironmentVariableA("SMV_FSRFG_PROF", ev, sizeof(ev)) > 0 && ev[0] == '1';
+        for (cudaEvent_t& e : nr.fgEv)
+            if (nr.fgProf && !e && cudaEventCreate(&e) != cudaSuccess)
+                nr.fgProf = false;
+        for (double& s : nr.fgStageMs)
+            s = 0.0;
+        nr.fgCpuMs = 0.0;
+        nr.fgProfN = nr.fgProfVecN = 0;
+    }
     for (int i = 0; i < 3; i++)
         nr.frIn[i] = nr.frSurfSdr[i] = false;
     nr.frPairSdr = false;
@@ -9044,8 +9182,8 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     nr.frNodeCalls = nr.frTweens = nr.frPrimed = nr.frRepeats = 0;
     for (bool& ok : nr.frNodeOk)
         ok = false;
-    LOG("native: fsrfg session %dx%d, AMD FSR %s frame generation (ML) through smv_fsrfg_bridge.dll on vkd3d-proton, RGBA16F, NVIDIA optical flow vectors (grid %d, fast), recursive midpoints (depth cap %d)\n",
-        nr.w, nr.h, g_fsrfg.provider(), nr.fgOf.grid, nr.frMpCap);
+    LOG("native: fsrfg session %dx%d, AMD FSR %s frame generation (ML) through smv_fsrfg_bridge.dll on vkd3d-proton, RGBA16F, NVIDIA optical flow vectors (grid %d, %s), recursive midpoints (depth cap %d)\n",
+        nr.w, nr.h, g_fsrfg.provider(), nr.fgOf.grid, nativeOfLevelName(nr.fgOf.level), nr.frMpCap);
     if (nr.encPost)
         LOG("native: fsrfg: HDR planes: %s\n",
             nr.frSdrOn ? "frame pairs inside the SDR range go to FSR as their SDR view, any other pair as the HDR codes"
@@ -9164,6 +9302,26 @@ static void nativeFsrfgRelease(NativeRife& nr)
         LOG("native: fsrfg session: %llu tweens, %llu midpoint calls, %llu re-primed streams, %d instance%s\n",
             (unsigned long long)nr.frTweens, (unsigned long long)nr.frNodeCalls, (unsigned long long)nr.frPrimed,
             nr.frInst, nr.frInst > 1 ? "s" : "");
+    if (nr.fgProfN)
+    {
+        const double n = (double)nr.fgProfN, nv = nr.fgProfVecN ? (double)nr.fgProfVecN : 1.0;
+        double sum = 0.0;
+        for (double s : nr.fgStageMs)
+            sum += s;
+        LOG("[fsrfg-prof] %llu calls (%llu with vectors) %dx%d, ms a call: copy in %.3f, Optical Flow inputs %.3f, "
+            "Optical Flow %.3f, vector kernels %.3f (the three a vector call), vector copy %.3f, FSR on vkd3d %.3f, "
+            "copy out %.3f, all %.3f; the bridge's CPU call %.3f\n",
+            (unsigned long long)nr.fgProfN, (unsigned long long)nr.fgProfVecN, nr.w, nr.h, nr.fgStageMs[0] / n,
+            nr.fgStageMs[1] / nv, nr.fgStageMs[2] / nv, nr.fgStageMs[3] / nv, nr.fgStageMs[4] / n, nr.fgStageMs[5] / n,
+            nr.fgStageMs[6] / n, sum / n, nr.fgCpuMs / n);
+    }
+    for (cudaEvent_t& e : nr.fgEv)
+        if (e)
+        {
+            cudaEventDestroy(e);
+            e = nullptr;
+        }
+    nr.fgProfN = 0;
     bool any = false;
     for (NativeRife::FgInst& g : nr.fg)
     {
@@ -9297,11 +9455,21 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
     nr.fuVal = 0;
     nr.fuN = 0;
     nr.fuCur = 0;
+    {
+        char ev[8] = {};
+        nr.fuProf = GetEnvironmentVariableA("SMV_FSRUP_PROF", ev, sizeof(ev)) > 0 && ev[0] == '1';
+        for (cudaEvent_t& e : nr.fuEv)
+            if (nr.fuProf && !e && cudaEventCreate(&e) != cudaSuccess)
+                nr.fuProf = false;
+        for (double& s : nr.fuStageMs)
+            s = 0.0;
+        nr.fuProfN = nr.fuProfVecN = 0;
+    }
     if (!nativeOfVecSetup(nr, nr.fuOf, w, h, "fsr upscale"))
         return false;
     LOG("native: upscale: AMD FSR %s %dx%d -> %dx%d through smv_fsrup_bridge.dll, NVIDIA optical flow vectors (grid "
-        "%d, fast)\n",
-        nr.fuVersion, w, h, ow, oh, nr.fuOf.grid);
+        "%d, %s)\n",
+        nr.fuVersion, w, h, ow, oh, nr.fuOf.grid, nativeOfLevelName(nr.fuOf.level));
     return true;
 }
 
@@ -9314,6 +9482,11 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     const int cur = nr.fuCur, prev = cur ^ 1;
     int fip = nr.fuInPitch, oip = (int)nr.fuOf.inPitch;
     CUdeviceptr ofIn = nr.fuOf.inP[cur];
+    auto mark = [&nr, st](int e) {
+        if (nr.fuProf)
+            cudaEventRecord(nr.fuEv[e], st);
+    };
+    mark(0);
     void* a[] = {&nr.dVsrIn, &w, &h, &nr.dFuIn, &fip, &ofIn, &oip};
     if (cuLaunchKernel(nr.fBgraRgbaFsr, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
         CUDA_SUCCESS)
@@ -9321,6 +9494,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         nr.die("bgraRgbaFsr launch failed");
         return false;
     }
+    mark(1);
     const bool first = nr.fuN == 0;
     if (first)
     {
@@ -9329,9 +9503,12 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
             nr.die("fsr upscale vector clear failed");
             return false;
         }
+        mark(2);
     }
-    else if (!nativeOfVecRun(nr, nr.fuOf, prev, cur, nr.dFuMv, nr.fuMvPitch, "fsr upscale"))
+    else if (!nativeOfVecRun(nr, nr.fuOf, prev, cur, nr.dFuMv, nr.fuMvPitch, "fsr upscale",
+                             nr.fuProf ? nr.fuEv[2] : nullptr))
         return false;
+    mark(3);
     cudaExternalSemaphoreSignalParams sp{};
     sp.params.fence.value = ++nr.fuVal;
     if (cudaSignalExternalSemaphoresAsync(&nr.fuSem, &sp, 1, st) != cudaSuccess)
@@ -9353,12 +9530,29 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     wp.params.fence.value = done;
     int op = nr.fuOutPitch;
     void* b[] = {&nr.dFuOut, &op, &ow, &oh, &nr.dVsrOut};
-    if (cudaWaitExternalSemaphoresAsync(&nr.fuSem, &wp, 1, st) != cudaSuccess ||
-        cuLaunchKernel(nr.fRgbaBgra, (ow + 15) / 16, (oh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) !=
-            CUDA_SUCCESS)
+    if (cudaWaitExternalSemaphoresAsync(&nr.fuSem, &wp, 1, st) != cudaSuccess)
     {
         nr.die("fsr upscale result failed");
         return false;
+    }
+    mark(4);
+    if (cuLaunchKernel(nr.fRgbaBgra, (ow + 15) / 16, (oh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) !=
+        CUDA_SUCCESS)
+    {
+        nr.die("fsr upscale result failed");
+        return false;
+    }
+    mark(5);
+    if (nr.fuProf && cudaEventSynchronize(nr.fuEv[5]) == cudaSuccess)
+    {
+        for (int s = 0; s < 5; s++)
+        {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, nr.fuEv[s], nr.fuEv[s + 1]) == cudaSuccess)
+                nr.fuStageMs[s] += ms;
+        }
+        nr.fuProfN++;
+        nr.fuProfVecN += first ? 0 : 1;
     }
     nr.fuCur = prev;
     nr.fuN++;
@@ -9372,6 +9566,24 @@ static void nativeFsrupRelease(NativeRife& nr)
         cudaStreamSynchronize(nr.stream);
     if (nr.fuMade)
         LOG("native: fsr upscale: %llu frames (AMD FSR %s)\n", (unsigned long long)nr.fuN, nr.fuVersion);
+    if (nr.fuProfN)
+    {
+        const double n = (double)nr.fuProfN, nv = nr.fuProfVecN ? (double)nr.fuProfVecN : 1.0;
+        double sum = 0.0;
+        for (double s : nr.fuStageMs)
+            sum += s;
+        LOG("[fsrup-prof] %llu frames (%llu with vectors), ms a frame: input pack %.3f, Optical Flow %.3f, vector "
+            "kernels %.3f (the two a vector frame), FSR on D3D12 %.3f, output unpack %.3f, all %.3f\n",
+            (unsigned long long)nr.fuProfN, (unsigned long long)nr.fuProfVecN, nr.fuStageMs[0] / n,
+            nr.fuStageMs[1] / nv, nr.fuStageMs[2] / nv, nr.fuStageMs[3] / n, nr.fuStageMs[4] / n, sum / n);
+    }
+    for (cudaEvent_t& e : nr.fuEv)
+        if (e)
+        {
+            cudaEventDestroy(e);
+            e = nullptr;
+        }
+    nr.fuProfN = 0;
     for (uint8_t** p : {&nr.dFuIn, &nr.dFuMv, &nr.dFuOut})
         if (*p)
         {
@@ -12102,7 +12314,7 @@ static bool nativeNrMotionSetup(NativeRife& nr, std::string& err)
     ip.outGridSize = (NV_OF_OUTPUT_VECTOR_GRID_SIZE)kNvofGrid;
     ip.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
     ip.mode = NV_OF_MODE_OPTICALFLOW;
-    ip.perfLevel = NV_OF_PERF_LEVEL_FAST;
+    ip.perfLevel = nativeOfLevel();
     ip.enableExternalHints = NV_OF_FALSE;
     ip.enableOutputCost = NV_OF_TRUE;
     ip.disparityRange = NV_OF_STEREO_DISPARITY_RANGE_UNDEFINED;

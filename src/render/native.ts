@@ -751,6 +751,9 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   // its pipe (NVENC refusing a tiny frame), so the host's code alone cannot tell a good render
   let encRc = 0;
   let encRes: ChildProcess | null = null;
+  // the decoder's exit code: a decode that dies at its first frame leaves the host 0 frames and a clean exit
+  let decRc = 0;
+  let decRes: ChildProcess | null = null;
   if ((env.SMV_OFFLINE_RESIDENT || '') !== '0')
     nrc = await residentRender(
       NATIVE_EXE,
@@ -759,14 +762,15 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       onLine,
       say,
       (fin, fout) => {
-        const decp = spawn(decCmd[0], decCmd.slice(1), { ...spawnOpts, stdio: ['inherit', fin, 'inherit'] });
+        decRes = spawn(decCmd[0], decCmd.slice(1), { ...spawnOpts, stdio: ['inherit', fin, 'inherit'] });
         encRes = spawn(enc.cmd[0], enc.cmd.slice(1), { ...spawnOpts, stdio: [fout, 'inherit', 'inherit'] });
-        return [decp, encRes];
+        return [decRes, encRes];
       },
       env,
     );
-  // residentRender waited for both children, so the exit code is in
+  // residentRender waited for both children, so the exit codes are in
   if (encRes !== null) encRc = (encRes as ChildProcess).exitCode ?? 1;
+  if (decRes !== null) decRc = (decRes as ChildProcess).exitCode ?? 1;
   if (nrc === null) {
     const dec = spawn(decCmd[0], decCmd.slice(1), { ...spawnOpts, stdio: ['inherit', 'pipe', 'inherit'] });
     const exe = spawn(NATIVE_EXE, ['--offline', ...nargs], { ...spawnOpts, stdio: [dec.stdout!, 'pipe', 'pipe'] });
@@ -778,9 +782,10 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     const closed = new Promise<void>((res) => rl.once('close', () => res()));
     nrc = await waitExit(exe);
     await closed;
-    [encRc] = await Promise.all([waitExit(encp), waitExit(dec)]);
+    [encRc, decRc] = await Promise.all([waitExit(encp), waitExit(dec)]);
   }
   const encFailed = `the encoder (${venc}) failed (exit ${encRc}); its error is in the lines above`;
+  const decFailed = `the decoder failed (exit ${decRc}); its error is in the lines above`;
   if (LIVE) {
     try {
       fs.unlinkSync(THUMB_RAW);
@@ -809,9 +814,11 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       throw new RenderExit(1);
     }
     if (encRc !== 0) throw new RenderExit(encFailed); // the host's write failed because the encoder died
+    if (decRc !== 0) throw new RenderExit(decFailed);
     throw new RenderExit(`native offline host failed (exit ${nrc}); the [native] lines above name the reason`);
   }
   if (encRc !== 0) throw new RenderExit(encFailed);
+  if (decRc !== 0) throw new RenderExit(decFailed); // the host finished on the frames it got: a short or empty video
   let rtx: HdrStats | null = null;
   if (HDR_ACTIVE) {
     let hs: { maxcll: number; maxfall: number; l1?: number[][]; hp?: HpFrame[] };
@@ -849,6 +856,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     fragCopy,
     fragFlags: FRAG_FLAGS,
     stage2Maps: enc.stage2Maps,
+    cropped: enc.crop,
     rtx,
     nits: HDR_NITS,
     masterPrim: HDR_MASTER_PRIM,

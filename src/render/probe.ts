@@ -231,19 +231,53 @@ function planarRgb(st: Stream): string {
   return sourceBits(st, String(st.pix_fmt || 'yuv420p')) >= 10 ? 'gbrp16le' : 'gbrp';
 }
 
+/** [horizontal, vertical] chroma subsampling of a YUV pixel format (yuv420p10le -> [2, 2]); an unknown one = 4:2:0. */
+export function chromaSub(pix: string): [number, number] {
+  const m = /^yuvj?4([0-4])([0-4])p/.exec(pix);
+  if (m)
+    return (
+      (
+        { '44': [1, 1], '22': [2, 1], '20': [2, 2], '11': [4, 1], '10': [4, 4], '40': [1, 2] } as Record<
+          string,
+          [number, number]
+        >
+      )[m[1] + m[2]] ?? [2, 2]
+    );
+  if (/^(nv24|nv42|p41[026])/.test(pix)) return [1, 1];
+  if (/^(nv16|nv20|p21[026]|yuyv422|uyvy422|yvyu422|y21[02])/.test(pix)) return [2, 1];
+  return [2, 2];
+}
+
+/** [the pad before a zimg conversion, the crop after it], or null when zimg cannot take the frame: it takes only
+ * sizes the chroma subsampling divides. Missing rows are padded and the RGB cropped back, bit for bit the taller
+ * frame's conversion (the padding's luma reaches no visible pixel, the last chroma row stays whole). A missing column
+ * cannot be: ffmpeg's pad (and hstack) overwrite the chroma column the last pixel shares with the padding, so that
+ * frame goes to swscale (null). Both empty when the size divides. */
+export function zimgPadCrop(pix: string, w: number, h: number): [string[], string[]] | null {
+  const [sx, sy] = chromaSub(pix);
+  if (w % sx) return null;
+  const ph = Math.ceil(h / sy) * sy;
+  return ph === h ? [[], []] : [[`pad=${w}:${ph}:0:0`], [`crop=${w}:${h}:0:0`]];
+}
+
 /** The -vf chain of a decode at the source size: planar YUV to RGB through zimg. Empty = swscale converts (a
  * source that is not planar YUV without alpha, or a matrix outside ZSC_MATRIX). */
 export function decodeRgbVf(st: Stream, w: number, h: number): string[] {
-  if (!/^yuvj?4[0-4]{2}p(\d+(le|be))?$/.test(String(st.pix_fmt || ''))) return [];
+  const pix = String(st.pix_fmt || '');
+  if (!/^yuvj?4[0-4]{2}p(\d+(le|be))?$/.test(pix)) return [];
   const sp: string[] = [];
   const cs = String(st.color_space || '');
   if (UNTAGGED.includes(cs)) sp.push('colorspace=' + sizeMatrix(w, h));
   else if (!Object.prototype.hasOwnProperty.call(ZSC_MATRIX, cs)) return [];
   if (UNTAGGED.includes(String(st.color_range || ''))) sp.push('range=tv');
-  return (sp.length ? [`setparams=${sp.join(':')}`] : []).concat([
-    'zscale=filter=lanczos:dither=none',
-    `format=${planarRgb(st)}`,
-  ]);
+  const pc = zimgPadCrop(pix, w, h);
+  if (!pc) return [];
+  const [pad, crop] = pc;
+  return (sp.length ? [`setparams=${sp.join(':')}`] : []).concat(
+    pad,
+    ['zscale=filter=lanczos:dither=none', `format=${planarRgb(st)}`],
+    crop,
+  );
 }
 
 /** The -vf chain for a decode-side downscale of a w x h source to dw x dh. */
@@ -263,10 +297,14 @@ export function dscaleVf(st: Stream, w: number, h: number, dw: number, dh: numbe
   if (UNTAGGED.includes(String(st.color_primaries || ''))) sp.push('color_primaries=' + sizeMatrix(w, h));
   if (UNTAGGED.includes(String(st.color_range || ''))) sp.push('range=tv');
   // the last zimg step also rounds the float planes to the integers the pipe carries (swscale's pack of
-  // float planes is 0.36 codes bright at 8 bits)
-  return (sp.length ? [`setparams=${sp.join(':')}`] : []).concat([
+  // float planes is 0.36 codes bright at 8 bits); a padded frame is cropped back before the resize
+  const pc = zimgPadCrop(pixfmt, w, h);
+  if (!pc) return fallback;
+  const [pad, crop] = pc;
+  return (sp.length ? [`setparams=${sp.join(':')}`] : []).concat(pad, [
     'zscale=transfer=linear',
     'format=gbrpf32le',
+    ...crop,
     `zscale=w=${dw}:h=${dh}:filter=lanczos:param_a=3`,
     `zscale=transfer=${trc}:dither=none`,
     `format=${planarRgb(st)}`,

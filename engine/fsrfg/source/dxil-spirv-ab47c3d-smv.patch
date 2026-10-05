@@ -1,8 +1,8 @@
 diff --git a/dxil_converter.cpp b/dxil_converter.cpp
-index a8be13e..7440418 100644
+index f94b77ec..5a06cc05 100644
 --- a/dxil_converter.cpp
 +++ b/dxil_converter.cpp
-@@ -9967,15 +9967,29 @@ const GlobalConfiguration &GlobalConfiguration::get()
+@@ -9981,15 +9981,29 @@ const GlobalConfiguration &GlobalConfiguration::get()
  	return config;
  }
  
@@ -33,7 +33,7 @@ index a8be13e..7440418 100644
  			simulate_min16float_min_spec = true;
  	}
 diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
-index bd78b84..2400c2d 100644
+index 668cb7ca..cd2213ab 100644
 --- a/opcodes/converter_impl.hpp
 +++ b/opcodes/converter_impl.hpp
 @@ -170,6 +170,8 @@ public:
@@ -46,7 +46,7 @@ index bd78b84..2400c2d 100644
  
  private:
 diff --git a/opcodes/dxil/dxil_ags.cpp b/opcodes/dxil/dxil_ags.cpp
-index 6426251..0cc29e2 100644
+index 6426251c..0cc29e2d 100644
 --- a/opcodes/dxil/dxil_ags.cpp
 +++ b/opcodes/dxil/dxil_ags.cpp
 @@ -524,6 +524,45 @@ static spv::Id emit_coopmat_transpose_with_convert(
