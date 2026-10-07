@@ -129,7 +129,7 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   built in and free: press **`** (backtick) in any app and the window you're in goes live behind a
   click-through overlay showing DLSS Frame Generation output at 2×–6×, in real time; press **`**
   again to stop (the key is reserved system-wide while the app runs). Or click **Smooth It Live!**
-  and then click the window within 5 seconds. No file, no render, no waiting; Stop (or Esc on the overlay) ends it.
+  and then click the window within 5 seconds. No file, no render, no waiting; Stop ends it too.
   Same requirements as the DLSS 4.5 model (RTX 40/50, above 2× needs an RTX 50; the RIFE and GMFSS
   live models run on any RTX); windowed or borderless windows only (exclusive fullscreen
   can't be captured). Changing the Speed target or the DLSS mode while a session is running restarts it a moment
@@ -145,7 +145,9 @@ Built and tested on an RTX 5090 Laptop; runs on any recent NVIDIA GPU with a cur
   to what your GPU keeps up with, down to the source's own rate with every effect still on, so every source frame
   is shown with little delay. Unticked, everything runs as set and a
   target the GPU can't reach skips source frames. File renders always keep their exact fps; unticked, they just
-  run slower when video memory runs short. Your Sharpen and Restore settings apply live too (Restore,
+  run slower when video memory runs short. With GMFSS, the **GMFSS flow scale** slider (25% to 100%, default 100%)
+  estimates the motion at a smaller size: faster, though small fast-moving objects can blur more (it never goes below
+  320x192, so on small windows the low end stops there). Your Sharpen and Restore settings apply live too (Restore,
   DLSS 5, Sharpen and RTX HDR work on each captured frame before the smoothing, once per captured frame),
   and Fill screen upscales with RTX VSR when it's enabled. With NVIDIA DLSS 4.5 as the live model they apply
   too, with the DLSS mode and Fill: the effects run on each captured frame and DLSS 4.5 generates its frames from

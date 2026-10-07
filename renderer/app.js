@@ -615,7 +615,7 @@ $('fsrup').checked = localStorage.getItem('fsrupOn') === '1';   // default OFF: 
 if($('fsrup').checked) $('rtxvsr').checked = false;
 function fsrUpOn(){ return $('fsrup').checked && !$('rtxvsr').checked; }
 $('rtxvsr').onchange = () => { localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0'); if($('rtxvsr').checked && $('fsrup').checked){ $('fsrup').checked = false; localStorage.setItem('fsrupOn', '0'); } syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
-$('fsrup').onchange = () => { localStorage.setItem('fsrupOn', $('fsrup').checked ? '1' : '0'); if($('fsrup').checked && $('rtxvsr').checked){ $('rtxvsr').checked = false; localStorage.setItem('vsrOn', '0'); } syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
+$('fsrup').onchange = () => { localStorage.setItem('fsrupOn', $('fsrup').checked ? '1' : '0'); if($('fsrup').checked && $('rtxvsr').checked){ $('rtxvsr').checked = false; localStorage.setItem('vsrOn', '0'); } syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} fsrWarm(); };
 $('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 syncRtx();
 // Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
@@ -754,6 +754,9 @@ function modelIsRifeDrba(){ return modelIsRife() && $('rifedrba').checked; }
 function modelIsNvof(){ return $('modelnvof').checked; }
 // AMD FSR frame generation: our bridge ships in engine/fsrfg (engine --fsrfg, live backend fsrfg), always ready
 function modelIsFsrfg(){ return $('modelfsrfg').checked; }
+// AMD FSR 4's first session after a driver update waits ~15 to 30 s for the driver's shader compile: while an FSR route
+// is picked, main warms both routes' shaders in a tiny background session once per driver (fsr-warm; a no-op when warm)
+function fsrWarm(){ const fg = modelIsFsrfg(), up = $('fsrup').checked; if(fg || up) ipcRenderer.send('fsr-warm', { fg, up }); }
 const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelfsrfg'), $('modelnvof')];
 function frucSetupHtml(){
   const detail = !frucBridge
@@ -812,6 +815,7 @@ function pickModel(box){
   syncModel();
   syncInterp();
   try{ lvModelUi(); lvSendOpts(); }catch{}   // live inherits this model choice
+  fsrWarm();
 }
 async function doFrucInstall(source){
   $('frucsetup').style.display = 'block';
@@ -853,7 +857,15 @@ function restoreModelChoice(){
 }
 // Restore FIRST (the saved choice may be "none"), then reflect it: syncInterp greys the Speed
 // controls when nothing is ticked.
-refreshFrucState().then(() => { restoreModelChoice(); syncModel(); syncInterp(); try{ lvModelUi(); lvSendOpts(); }catch{} });
+refreshFrucState().then(() => {
+  restoreModelChoice(); syncModel(); syncInterp(); try{ lvModelUi(); lvSendOpts(); }catch{}
+  // a saved FSR pick warms after the first paint (a spawn during launch stalls the compositor), below normal priority;
+  // a window opened behind another one never paints (no rAF), so a timer starts it there
+  let bootWarm = false;
+  const warmOnce = () => { if(!bootWarm){ bootWarm = true; fsrWarm(); } };
+  requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(warmOnce, 2000)));
+  setTimeout(warmOnce, 5000);
+});
 
 // --- Live mode (real-time DLSS-G overlay; engine/dlssg/smv-live.exe) -------------------------------
 // Independent of the file workflow: usable straight from the welcome screen. Two ways in, both
@@ -950,7 +962,9 @@ function lvSendOpts(){
     hud: $('lvhud').checked,
     hudlat: $('lvhudlat').checked,
     gpufit: $('gpufit').checked,
+    gmflow: (+$('gmflow').value || 100) / 100,   // GMFSS's flow scale (--gmfss-flow below 1)
   });
+  $('gmflowrow').style.display = mi.model === 'gmfss' ? '' : 'none';
   const load = mi.model === 'rife' ? 'starts in ~3s (~45s the first time at a new window size)'
     : mi.model === 'rifedrba' ? 'starts in ~3s (~55s the first time at a new window size)'
     : mi.model === 'gmfss' ? 'loads in ~4s (~30s the first time at a new window size)'
@@ -1032,6 +1046,17 @@ $('lvhudlat').onchange = () => { localStorage.setItem('lvHudLat', $('lvhudlat').
 // "Fit to the GPU" (default ON): a spawn-time flag on both routes (off = --no-gpu-fit), so a running Live session restarts
 if(localStorage.getItem('gpuFit') === '0') $('gpufit').checked = false;
 $('gpufit').onchange = () => { localStorage.setItem('gpuFit', $('gpufit').checked ? '1' : '0'); lvSendOpts();
+  if(lvState === 'running') ipcRenderer.send('lv-restart'); };
+// GMFSS flow scale (Live, shown while GMFSS is the model): 25..100 % in 5 % steps, default 100 %; a spawn-time flag
+// (--gmfss-flow), so a running session restarts when the drag ends
+{
+  const v = +localStorage.getItem('lvGmFlow');
+  if(v >= 25 && v <= 100) $('gmflow').value = String(v);
+}
+function gmFlowUi(){ $('gmflownum').textContent = $('gmflow').value + '%'; }
+gmFlowUi();
+$('gmflow').oninput = gmFlowUi;
+$('gmflow').onchange = () => { localStorage.setItem('lvGmFlow', $('gmflow').value); gmFlowUi(); lvSendOpts();
   if(lvState === 'running') ipcRenderer.send('lv-restart'); };
 localStorage.removeItem('lvNative');   // retired: the RIFE live route always runs inside smv-live.exe
 lvHudLatUi();

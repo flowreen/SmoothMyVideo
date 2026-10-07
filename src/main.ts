@@ -16,7 +16,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
-import { checkEngineCache } from './render/cache';
+import { checkEngineCache, engineCacheDir } from './render/cache';
 
 const ROOT = path.join(__dirname, '..');
 // When packaged, the engine ships as an unpacked extraResource (the host exe, its DLLs and
@@ -127,6 +127,7 @@ if (!app.requestSingleInstanceLock()) {
 app.on('window-all-closed', () => {
   stopLive(true); // never leave a headless FG overlay (or an idle resident host) running after the GUI is gone
   offlineHostQuit();
+  fsrWarmProc?.kill();
   if (process.platform !== 'darwin') app.quit();
 });
 app.on('activate', () => {
@@ -720,6 +721,7 @@ let liveHdrSb = 0; // Dynamic Vibrance saturation boost 0..1
 let liveHud = true; // on-screen fps/latency readout (panel checkbox; off -> --no-hud)
 let liveHudLat = true; // latency segment of that readout (off -> --no-hud-latency)
 let liveGpuFit = true; // "Fit to the GPU" (off -> --no-gpu-fit: the target holds, no video memory fit)
+let liveGmFlow = 1; // GMFSS flow scale 0.25..1 (below 1 -> --gmfss-flow F: gmflow on the nearest /32 grid, 320x192 at least)
 
 // Live events go to the main window (not a captured e.sender): the ` hotkey starts sessions
 // with no IPC event at all, and the panel must reflect those too.
@@ -890,6 +892,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   if (!liveHud) args.push('--no-hud');
   else if (!liveHudLat) args.push('--no-hud-latency'); // meter on, latency segment hidden
   if (!liveGpuFit) args.push('--no-gpu-fit');
+  if (liveModel === 'gmfss' && liveGmFlow < 1) args.push('--gmfss-flow', liveGmFlow.toFixed(2));
   // Every server backend runs inside smv-live.exe (its native host), the only live route; a
   // session the host cannot run ends with its reason on the status line.
   // resident host: every server backend has something worth keeping (the native engines); the
@@ -1049,6 +1052,7 @@ ipcMain.on(
       hud?: boolean;
       hudlat?: boolean;
       gpufit?: boolean;
+      gmflow?: number; // GMFSS flow scale 0.25..1
     },
   ) => {
     liveModel = opts.model;
@@ -1076,6 +1080,7 @@ ipcMain.on(
     liveHud = opts.hud !== false;
     liveHudLat = opts.hudlat !== false;
     liveGpuFit = opts.gpufit !== false;
+    liveGmFlow = Math.min(1, Math.max(0.25, opts.gmflow ?? 1));
     // the panel moved to another model: whatever the idle resident host keeps loaded (its
     // engines) goes right away (user rule: a model must not hold VRAM
     // through a session of another model)
@@ -1119,6 +1124,95 @@ function liveRestoreMouse(sync: boolean) {
     /* the next live session restores it */
   }
 }
+
+// AMD FSR 4's first session after a driver update waits while the driver compiles FSR's shaders (frame generation
+// ~15 s for vkd3d-proton's Vulkan pipelines, the upscaler ~28 s in D3D12), at any size; the driver's own cache keeps
+// them after. While an FSR route is picked (the model, the upscale box) the renderer asks for a warm-up: ONE tiny
+// offline session of the picked routes (2 black 320x180 frames, the upscaler to 640x360) in a below-normal host, once
+// per driver and FSR build: the route keys in the model cache's fsr4_warm.txt (emptied with the cache, ~1 s to redo).
+const FSR_WARM_W = 320;
+const FSR_WARM_H = 180;
+const FSR_WARM_STAMP = 'fsr4_warm.txt';
+let fsrWarmProc: ChildProcess | null = null;
+const fsrWarmWant = { fg: false, up: false }; // asked while a warm-up, a live session or a render ran: tried after it
+function fsrWarmKeys(): { fg: string; up: string } | null {
+  // the driver = System32's nvapi64.dll (every driver install replaces it), a route = its DLLs, by size + write time
+  const id = (f: string) => {
+    const s = fs.statSync(f);
+    return `${path.basename(f)} ${s.size} ${Math.round(s.mtimeMs)}`;
+  };
+  const ids = (dir: string, files: string[]) => files.map((f) => id(path.join(ENGINE, dir, f))).join(', ');
+  try {
+    const drv = id(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'nvapi64.dll'));
+    return {
+      fg: `fg ${drv}, ${ids('fsrfg', ['smv_fsrfg_bridge.dll', 'smv_vkd3d_d3d12core.dll', 'amd_fidelityfx_framegeneration_dx12.dll'])}`,
+      up: `up ${drv}, ${ids('fsrup', ['smv_fsrup_bridge.dll', 'amd_fidelityfx_upscaler_dx12.dll'])}`,
+    };
+  } catch {
+    return null; // no NVIDIA driver or an FSR file missing: the session itself says so
+  }
+}
+function fsrWarm(fg: boolean, up: boolean) {
+  fsrWarmWant.fg ||= fg;
+  fsrWarmWant.up ||= up;
+  if (fsrWarmProc || (liveProc && !liveIdle) || current || !fileExists(LIVE_EXE)) return;
+  const keys = fsrWarmKeys();
+  if (!keys) return;
+  const cache = engineCacheDir(ENGINE);
+  const stampPath = path.join(cache, FSR_WARM_STAMP);
+  let have: string[] = [];
+  try {
+    have = fs.readFileSync(stampPath, 'utf8').split(/\r?\n/).filter(Boolean);
+  } catch {
+    /* never warmed with this cache */
+  }
+  const doFg = fsrWarmWant.fg && !have.includes(keys.fg);
+  const doUp = fsrWarmWant.up && !have.includes(keys.up);
+  fsrWarmWant.fg = fsrWarmWant.up = false;
+  if (!doFg && !doUp) return;
+  try {
+    fs.mkdirSync(cache, { recursive: true });
+  } catch {
+    return;
+  }
+  const args = ['--offline', '--w', String(FSR_WARM_W), '--h', String(FSR_WARM_H), '--frames', '2'];
+  args.push('--pixfmt', 'rgb24', '--out-pixfmt', 'rgb24', '--cache', cache);
+  args.push(...(doFg ? ['--multi', '2', '--fsrfg'] : ['--no-interp']));
+  if (doUp) args.push('--out-w', String(2 * FSR_WARM_W), '--out-h', String(2 * FSR_WARM_H), '--fsr-upscale');
+  const what = [doFg ? 'frame generation' : '', doUp ? 'upscaler' : ''].filter(Boolean).join(' + ');
+  const t0 = Date.now();
+  let err = '';
+  const p = spawn(LIVE_EXE, args, { cwd: LIVE_DIR, stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true });
+  fsrWarmProc = p;
+  try {
+    if (p.pid) os.setPriority(p.pid, os.constants.priority.PRIORITY_BELOW_NORMAL);
+  } catch {
+    /* normal priority then */
+  }
+  p.stderr?.on('data', (d) => (err += d));
+  p.stdin?.on('error', () => {});
+  p.stdin?.end(Buffer.alloc(FSR_WARM_W * FSR_WARM_H * 3 * 2));
+  p.on('error', () => {});
+  p.on('close', (code) => {
+    fsrWarmProc = null;
+    // a run that ended by itself is stamped, a failed one too (its session would fail the same way); a killed one not
+    if (code !== null) {
+      const add = [doFg ? keys.fg : '', doUp ? keys.up : ''].filter(Boolean);
+      const keep = have.filter((l) => !add.some((a) => a.slice(0, 3) === l.slice(0, 3)));
+      try {
+        fs.writeFileSync(stampPath, [...keep, ...add].join('\n') + '\n');
+      } catch {
+        /* warmed again next time */
+      }
+    }
+    liveLog(
+      `AMD FSR 4 shader warm-up (${what}): exit ${code === null ? 'killed' : code}, ${((Date.now() - t0) / 1000).toFixed(1)} s`,
+    );
+    if (code !== 0) liveLog(err.slice(-2000));
+    if (fsrWarmWant.fg || fsrWarmWant.up) fsrWarm(false, false);
+  });
+}
+ipcMain.on('fsr-warm', (_e, o: { fg?: boolean; up?: boolean }) => fsrWarm(!!o?.fg, !!o?.up));
 
 // hard = the app is leaving: kill outright (no "stop" grace, the overlay must not outlive the GUI)
 function stopLive(hard = false) {

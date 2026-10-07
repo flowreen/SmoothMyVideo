@@ -1,7 +1,7 @@
 // The render plan: engine/render_plan.py ported line by line, the
 // comments there carry the reasoning (the image scale / downscale fold, the output size, the
 // native offline eligibility). Pure functions; the callers write every stderr line.
-import { dscaleVf, Stream } from './probe';
+import { dscaleVf, sourceSar, Stream } from './probe';
 import { pyFixed, pyRound } from './pyfmt';
 
 /** The render.py arguments the plan reads, typed as argparse has them (floats vs ints matter:
@@ -82,6 +82,7 @@ export interface WorkPlan {
   workH: number;
   outW: number;
   outH: number;
+  sar: [number, number]; // the output's pixel shape: the source's, or square when Upscale to resized it
   vf: string[]; // the decoder's downscale, empty = none
   note: string;
 }
@@ -91,11 +92,12 @@ export interface WorkPlan {
  * same rule live). */
 export const NR_MIN_WORK_W = 128;
 
-/** The pass sizes for a w x h source: the output (the --upscale factor, clamped), the working size =
+/** The pass sizes for a w x h source: the output (the --upscale factor, clamped; with it an anamorphic source's
+ * pixels are made square, without it the output keeps their shape, `sar`), the working size =
  * the DLSS mode (--scale) x the output (even, at most WORK_MAX_PX keeping the aspect; the share raised, aspect kept,
  * until the shorter side is 64 px and, with DLSS 5 (nr), the width NR_MIN_WORK_W),
- * and the decode (a working size below the source folds the downscale into the decode, linear-light
- * Lanczos3). A string = why --scale is refused. */
+ * and the decode (a working size below the source folds the downscale into the decode, Lanczos at radius 7).
+ * A string = why --scale is refused. */
 export function workPlan(
   st: Stream,
   w: number,
@@ -104,7 +106,9 @@ export function workPlan(
   scale: string | null,
   nr = false,
 ): WorkPlan | string {
-  const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0);
+  const srcSar = sourceSar(st);
+  const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0, srcSar);
+  const sar: [number, number] = upscaleF !== 1.0 ? [1, 1] : srcSar;
   const wf = workFactor(scale, ow, oh);
   if (!wf)
     return `--scale takes a DLSS mode (auto, dlaa, quality, balanced, performance, ultra) or a number in (0, 1], not '${scale}'`;
@@ -139,10 +143,13 @@ export function workPlan(
   }
   const note =
     `DLSS mode ${wf.mode}: working size ${ww}x${wh}${raised} for the ${ow}x${oh} output (source ${w}x${h}` +
-    (vf.length ? ', the downscale folded into the decode, linear-light Lanczos3' : '') +
+    (srcSar[0] !== srcSar[1]
+      ? `, its ${srcSar[0]}:${srcSar[1]} pixels ` + (upscaleF !== 1.0 ? 'made square' : 'kept, the output tagged')
+      : '') +
+    (vf.length ? ', the downscale folded into the decode, Lanczos at radius 7' : '') +
     (capped ? "; capped at 3840x2160, the interpolation's reach" : '') +
     ')\n';
-  return { w: dw, h: dh, workW: ww, workH: wh, outW: ow, outH: oh, vf, note };
+  return { w: dw, h: dh, workW: ww, workH: wh, outW: ow, outH: oh, sar, vf, note };
 }
 
 /** Auto's candidates for its video memory fit, its own pick first: the plan of every DLSS mode from that pick down to
@@ -154,7 +161,7 @@ export function autoCandidates(
   upscaleF: number,
   nr = false,
 ): { mode: string; plan: WorkPlan }[] {
-  const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0);
+  const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0, sourceSar(st));
   const order = Object.keys(DLSS_MODES);
   const out: { mode: string; plan: WorkPlan }[] = [];
   for (const m of order.slice(order.indexOf(autoMode(ow, oh)))) {
@@ -164,9 +171,17 @@ export function autoCandidates(
   return out;
 }
 
-/** The output resolution: the factor on both dimensions, each rounded down to even. */
-export function outputSize(w: number, h: number, upscaleF: number, upscale: boolean): [number, number] {
-  if (upscale) return [Math.floor(pyRound(w * upscaleF) / 2) * 2, Math.floor(pyRound(h * upscaleF) / 2) * 2];
+/** The output resolution: the factor on both dimensions, each rounded down to even; the width also takes the source's
+ * pixel shape (sar), so the resized output has square pixels and the source's display aspect. */
+export function outputSize(
+  w: number,
+  h: number,
+  upscaleF: number,
+  upscale: boolean,
+  sar: [number, number] = [1, 1],
+): [number, number] {
+  if (upscale)
+    return [Math.floor(pyRound((w * upscaleF * sar[0]) / sar[1]) / 2) * 2, Math.floor(pyRound(h * upscaleF) / 2) * 2];
   return [w, h];
 }
 

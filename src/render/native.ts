@@ -570,6 +570,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       outLabel,
       outW: OUT_W,
       outH: OUT_H,
+      sar: plan.sar,
       rateStr,
       encInFmt: ENC_IN_FMT,
       aud: tr.aud,

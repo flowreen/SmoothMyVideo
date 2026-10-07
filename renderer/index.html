@@ -146,7 +146,7 @@
   <div class="panel lonly" id="lvpanel" style="display:none">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Live mode</span>
-      <span class="hint">Smooth <b>any window</b> live: a video player, a browser, a windowed game, with the model and Speed below. Click <b>Smooth It Live!</b>, then the window during the countdown, or press <b>`</b> in any app. Windowed or borderless only; Esc, <b>`</b> or Stop ends it.</span>
+      <span class="hint">Smooth <b>any window</b> live: a video player, a browser, a windowed game, with the model and Speed below. Click <b>Smooth It Live!</b>, then the window during the countdown, or press <b>`</b> in any app. Windowed or borderless only; <b>`</b> or Stop ends it.</span>
     </div>
     <div class="row">
       <button id="lvgo">Smooth It Live!</button>
@@ -266,6 +266,14 @@
         GMFSS <span class="hint">(GMFlow with Softmax Splatting: AI, best quality for anime, the default)</span>
       </label>
     </div>
+    <div class="row lonly" id="gmflowrow">
+      <span class="k"></span>
+      <span class="hint" style="display:flex;align-items:center;gap:8px;" title="GMFSS estimates the motion at this share of its size, 25% to 100%. Lower is faster; small fast-moving objects can blur more. The motion size never goes below 320x192, so on smaller windows the low end stops there.">
+        GMFSS flow scale
+        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="gmflow" type="range" min="25" max="100" step="5" value="100" style="width:150px" aria-label="GMFSS flow scale"></span>
+        <span class="v" id="gmflownum">100%</span>
+      </span>
+    </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: Practical-RIFE 4.26 heavy">
@@ -284,7 +292,7 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS frame generation 310.9.1 through Streamline 2.14.1. Model preset (A or B): switch it in the NVIDIA App under Graphics &gt; Global Settings &gt; DLSS Override - Model Presets &gt; Frame Generation (Preset B = the DLSS 4.5 model); a per-game setting does not reach SmoothMyVideo. Super Resolution presets (M, L) do not apply: SmoothMyVideo runs no DLSS Super Resolution.">
+      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS frame generation 310.9.1 through Streamline 2.14.1. The NVIDIA App's DLSS Override - Model Presets do not change SmoothMyVideo's frames: Frame Generation Preset A and B only switch UI recomposition, which a video has no use for, and SmoothMyVideo runs no DLSS Super Resolution.">
         <input type="checkbox" id="modeldlss"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(AI frame generation from games; 2&times; to 6&times;; RTX 40/50, above 2&times; RTX 50)</span>

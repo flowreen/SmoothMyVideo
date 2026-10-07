@@ -288,6 +288,24 @@ struct Hud
     }
 };
 
+// The windowed overlay follows its player on every pass of the live loops and of the model-load wait, apart from the
+// pause test's 250 ms tick: DWM's frame query costs ~1 us, so a dragged player is trailed by one pass at most. The
+// overlay (not Fill's, which covers the monitor) and the HUD move only when the frame's origin changed; the overlay
+// keeps covering the client area (frame origin + the constant crop offset). True = it moved.
+static bool followTarget(HWND target, HWND overlay, RECT& fb, int cropX, int cropY, Hud& hud, bool moveOverlay)
+{
+    RECT r{};
+    if (!frameBounds(target, r) || (r.left == fb.left && r.top == fb.top))
+        return false;
+    fb = r;
+    const int ox = r.left + cropX;
+    const int oy = r.top + cropY;
+    if (moveOverlay)
+        SetWindowPos(overlay, HWND_TOPMOST, ox, oy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    hud.move(ox + 16, oy + 16);
+    return true;
+}
+
 // ---------------------------------------------------------------- Fill: the mouse on the stretched picture
 
 // Fill stretches a smaller window over its monitor through a click-through overlay, so a click lands on whatever sits
@@ -1011,7 +1029,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         wchar_t ov[8]{};
         // rife/gmfss run on PQ and compose R10A2, so HDR reaches them (plus the
         // echo identity path). Fill is HDR-capable too: the server rescales on the PQ
-        // tensors and letterboxes into the R10A2 canvas (RTX VSR demoted to Lanczos3 there,
+        // tensors and letterboxes into the R10A2 canvas (RTX VSR demoted to Lanczos there,
         // with a log line). SMV_LIVE_HDR forces the mode for testing. "blend" (the LSFG
         // comparison baseline) composes the exact same PQ R10A2 path as rife/gmfss and exists
         // precisely for HDR A-B comparisons, so it is HDR-capable too.
@@ -1372,29 +1390,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             std::vector<uint8_t> loadBuf((size_t)capW * capH * 4);
             const ULONGLONG loadStart = GetTickCount64();
             bool announced = false;
-            ULONGLONG loadPosTick = 0;
             ULONGLONG loadSizeTick = 0;
             bool loadGone = false; // the window closed during that resize: exit 7, never revived
             while (srvRc.load(std::memory_order_acquire) < 0)
             {
                 pumpMessages();
-                // window tracking during the cold model build: the main loop's 250ms tracker
-                // only starts after the server is up, so dragging the target here left the
-                // passthrough overlay and the "loading ... model" note stuck at the old spot
-                if (!host.park && !g_monitor && GetTickCount64() - loadPosTick > 250)
-                {
-                    loadPosTick = GetTickCount64();
-                    RECT r{};
-                    if (frameBounds(target, r) && (r.left != fb.left || r.top != fb.top))
-                    {
-                        fb = r;
-                        const int ox = r.left + cap.cropX;
-                        const int oy = r.top + cap.cropY;
-                        if (!g_fill) // Fill's overlay covers the monitor: only its note follows the window
-                            SetWindowPos(host.hwnd, HWND_TOPMOST, ox, oy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-                        hud.move(ox + 16, oy + 16);
-                    }
-                }
+                // window tracking during the cold model build: the main loop's tracker only starts
+                // after the server is up, so the passthrough overlay and the "loading ... model" note
+                // follow a dragged target here (Fill: only the note, its overlay covers the monitor)
+                if (!host.park && !g_monitor)
+                    followTarget(target, host.hwnd, fb, cap.cropX, cap.cropY, hud, !g_fill);
                 // a resize during the model load: the loader cannot see it (the
                 // engine handoff only polls the flag), so watch the client size here; once it
                 // settles at a new size the session ends with exit 4 like a mid-session resize, the
@@ -1689,7 +1694,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // server backends: no pre-present (capture and output sizes differ under --fit fill;
             // the first served group arrives within one round trip anyway)
             memcpy(lastBuf.data(), buf.data(), capBytes);
-            LOG("live overlay running (Esc to stop)\n");
+            LOG("live overlay running\n");
             if (g_fill)
                 hud.move(host.posX + 16, host.posY + 16);
             if (g_fill && !park && !g_noFillMouse)
@@ -1716,6 +1721,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         ULONGLONG lastPresentTick = GetTickCount64();
         ULONGLONG lastStatTick = GetTickCount64();
         ULONGLONG lastPosTick = 0;
+        // RTSS (RivaTuner Statistics Server) injects its hook into Direct3D processes and limits their presents inside
+        // Present: a frame limit set there caps this overlay with nothing in the throttle or pacing lines saying why,
+        // so each session names the hook once (SMV_RTSS_MODULE = another module name: the trigger test's lever)
+        wchar_t rtssModule[64] = L"RTSSHooks64.dll";
+        GetEnvironmentVariableW(L"SMV_RTSS_MODULE", rtssModule, 64);
+        bool rtssNamed = false;
         UINT statPresentBase = 0;
         host.scNative->GetLastPresentCount(&statPresentBase);
         uint64_t statDropBase = 0; // cap.dropped at the last stats tick
@@ -1819,6 +1830,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         }
         HANDLE paceTimer =
             CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        // the direct loop's follow poll (followTarget): its wait ends on this timer while the target moves
+        HANDLE followTimer =
+            CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        ULONGLONG followUntil = 0;
         auto waitUntilMs = [&](double tMs) {
             for (;;)
             {
@@ -2068,6 +2083,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             char stc[32] = "";
             if (g_staticHold)
                 sprintf_s(stc, " static=%llu", (unsigned long long)g_staticHeld);
+            if (!rtssNamed && GetModuleHandleW(rtssModule))
+            {
+                rtssNamed = true;
+                LOG("RTSS (RivaTuner Statistics Server) has hooked this process (%ls): a frame limit set in RTSS caps the "
+                    "presented rate; if it stays below the target, set smv-live.exe's Application detection level to "
+                    "None in RTSS\n",
+                    rtssModule);
+            }
             LOG("live: %.1f captured fps -> %.1f presented fps (ratio %.2f, target %.1f) "
                 "%s ~%.0fms%s present %.2fms (wait %.2f flip %.2f) drop %.1f "
                 "panel %.1fHz dwm %.1fHz disp %.1f/s bunch %.1f/s%s\n",
@@ -2348,11 +2371,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     phT = nowQpc100();
                 }
                 pumpMessages();
-                if (!hidden && (GetAsyncKeyState(VK_ESCAPE) & 0x8000))
-                {
-                    LOG("Esc pressed, exiting\n");
-                    break;
-                }
                 if (g_stopReq.load())
                 {
                     LOG("stop requested, ending the session\n");
@@ -2538,35 +2556,22 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         if (g_liveNrCuda)
                             g_liveNrReset.store(true); // DLSS 5: a new stream after the gap
                     }
-                    if (!hidden)
+                    if (!hidden && g_fill)
                     {
-                        if (g_fill)
+                        HMONITOR hm = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
+                        MONITORINFO mi{sizeof(mi)};
+                        GetMonitorInfoW(hm, &mi);
+                        if (mi.rcMonitor.left != mon.left || mi.rcMonitor.top != mon.top ||
+                            mi.rcMonitor.right != mon.right || mi.rcMonitor.bottom != mon.bottom)
                         {
-                            HMONITOR hm = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
-                            MONITORINFO mi{sizeof(mi)};
-                            GetMonitorInfoW(hm, &mi);
-                            if (mi.rcMonitor.left != mon.left || mi.rcMonitor.top != mon.top ||
-                                mi.rcMonitor.right != mon.right || mi.rcMonitor.bottom != mon.bottom)
-                            {
-                                LOG("target moved to another monitor\n");
-                                rc2 = 4;
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            RECT r{};
-                            if (frameBounds(target, r) && (r.left != fb.left || r.top != fb.top))
-                            {
-                                fb = r;
-                                const int ox = r.left + cap.cropX;
-                                const int oy = r.top + cap.cropY;
-                                SetWindowPos(host.hwnd, HWND_TOPMOST, ox, oy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-                                hud.move(ox + 16, oy + 16);
-                            }
+                            LOG("target moved to another monitor\n");
+                            rc2 = 4;
+                            break;
                         }
                     }
                 }
+                if (!host.park && !g_monitor && !hidden && !g_fill)
+                    followTarget(target, host.hwnd, fb, cap.cropX, cap.cropY, hud, true);
 
                 phEnd(phHouse);
 
@@ -2917,23 +2922,31 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (waitMs > 50)
                         waitMs = 50;
                 }
-                WaitForSingleObject(cap.evt, waitMs);
+                // the follow poll (windowed): the loop wakes within 16 ms to see a move, and every 2 ms on the
+                // high-resolution timer while the target moves (a move in the last 500 ms); the wait's own timeout
+                // keeps the ~15.6 ms timer quantum here
+                const bool following = !host.park && !g_monitor && !hidden && !g_fill;
+                if (following && waitMs > 16)
+                    waitMs = 16;
+                if (following && followTimer && GetTickCount64() < followUntil)
+                {
+                    LARGE_INTEGER due{};
+                    due.QuadPart = -20000; // 2 ms, relative, in 100 ns units
+                    SetWaitableTimer(followTimer, &due, 0, nullptr, nullptr, FALSE);
+                    const HANDLE waits[2] = {cap.evt, followTimer};
+                    WaitForMultipleObjects(2, waits, FALSE, waitMs);
+                }
+                else
+                    WaitForSingleObject(cap.evt, waitMs);
                 pumpMessages();
 
-                // Esc is read globally (GetAsyncKeyState): only honor it while engaged, else typing
-                // Esc in an unrelated app would kill a paused session
-                if (!hidden && (GetAsyncKeyState(VK_ESCAPE) & 0x8000))
-                {
-                    LOG("Esc pressed, exiting\n");
-                    break;
-                }
                 if (g_stopReq.load())
                 {
                     LOG("stop requested, ending the session\n");
                     break;
                 }
                 // monitor mode: the target window only seeded the monitor choice; its lifetime and
-                // focus are irrelevant (whole-screen smoothing keeps running until Esc/hotkey/Stop)
+                // focus are irrelevant (whole-screen smoothing keeps running until the hotkey / Stop)
                 if (cap.closed || (!g_monitor && !IsWindow(target)))
                 {
                     LOG(g_monitor ? "capture closed\n" : "target window closed\n");
@@ -2958,38 +2971,24 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         hud.show(!hidden);
                         LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
                     }
-                    if (!hidden)
+                    if (!hidden && g_fill)
                     {
-                        if (g_fill)
+                        // fullscreen overlays don't track the window; they track its MONITOR
+                        HMONITOR hm = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
+                        MONITORINFO mi{sizeof(mi)};
+                        GetMonitorInfoW(hm, &mi);
+                        if (mi.rcMonitor.left != mon.left || mi.rcMonitor.top != mon.top ||
+                            mi.rcMonitor.right != mon.right || mi.rcMonitor.bottom != mon.bottom)
                         {
-                            // fullscreen overlays don't track the window; they track its MONITOR
-                            HMONITOR hm = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
-                            MONITORINFO mi{sizeof(mi)};
-                            GetMonitorInfoW(hm, &mi);
-                            if (mi.rcMonitor.left != mon.left || mi.rcMonitor.top != mon.top ||
-                                mi.rcMonitor.right != mon.right || mi.rcMonitor.bottom != mon.bottom)
-                            {
-                                LOG("target moved to another monitor\n");
-                                rc2 = 4; // the app restarts the overlay onto the new monitor
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            RECT r{};
-                            if (frameBounds(target, r) && (r.left != fb.left || r.top != fb.top))
-                            {
-                                fb = r;
-                                // The overlay tracks the CLIENT origin (frame origin + constant crop
-                                // offset), so it keeps covering the client area as the window moves.
-                                const int ox = r.left + cap.cropX;
-                                const int oy = r.top + cap.cropY;
-                                SetWindowPos(host.hwnd, HWND_TOPMOST, ox, oy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-                                hud.move(ox + 16, oy + 16);
-                            }
+                            LOG("target moved to another monitor\n");
+                            rc2 = 4; // the app restarts the overlay onto the new monitor
+                            break;
                         }
                     }
                 }
+                if (!host.park && !g_monitor && !hidden && !g_fill &&
+                    followTarget(target, host.hwnd, fb, cap.cropX, cap.cropY, hud, true))
+                    followUntil = GetTickCount64() + 500;
 
                 if (g_verbose)
                     LOG("[loop] top hidden=%d\n", (int)hidden);
@@ -3176,6 +3175,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         }
         if (paceTimer)
             CloseHandle(paceTimer);
+        if (followTimer)
+            CloseHandle(followTimer);
         hud.destroy();
         if (diagH)
         {

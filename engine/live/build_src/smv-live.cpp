@@ -9,7 +9,7 @@
 //   smv-live.exe --live "title substring" [--gen N] [--vsync] [--no-clickthrough] [--diag S]
 //       capture the first visible top-level window whose title contains the substring
 //       (case-insensitive) and run the FG overlay over it. --gen N = generated frames per
-//       captured frame (server backends 1..15 -> 2x..16x; dlssg/identity 1..5). Esc exits.
+//       captured frame (server backends 1..15 -> 2x..16x; dlssg/identity 1..5).
 //       --diag S = GDI-dump the overlay region
 //       every 40 ms for S seconds to bin\live_diag_NNN.png (verification tooling).
 //   smv-live.exe --testsrc
@@ -64,6 +64,7 @@
 #include <fstream>
 #include <memory>
 #include <wincrypt.h> // MD5 of the weights for the engine names (the host-side lookup)
+#include <tlhelp32.h> // the DLSS 4.5 child's module list (an RTSS hook named in the log)
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -142,6 +143,17 @@ static int g_liveAutoFit = 0;    // live Auto: the mode the free video memory fi
                                  // before anything loads (liveAutoFitMemory); 0 = Auto's own pick
 static int g_liveAutoFloor = 0;  // --auto-floor MODE: live Auto runs this mode or a smaller one (the app passes
                                  // the mode an exit 8 named, the GPU-time step); 0 = none
+static double g_gmFlow = 1.0;    // --gmfss-flow F: live GMFSS's motion (gmflow) on the /32 grid nearest F x its half
+                                 // frame (0.25..1; 1 = the half itself), GMFSS_infer_u.reuse's scale
+// --gmfss-flow's value: 0.25..1, kept to two decimals (the handoff memo key prints it so); false = outside
+static bool parseGmFlow(const wchar_t* v)
+{
+    const double f = _wtof(v);
+    if (!(f >= 0.25 && f <= 1.0))
+        return false;
+    g_gmFlow = std::nearbyint(f * 100.0) / 100.0;
+    return true;
+}
 static const wchar_t* const kDlssModeName[6] = {L"auto", L"dlaa", L"quality", L"balanced", L"performance", L"ultra"};
 // --scale's value: a DLSS mode name, or a share 0.01..1; false = neither
 static bool parseLiveScale(const wchar_t* v)
@@ -1042,9 +1054,42 @@ struct DgChild
     std::mutex m;                       // guards hProc against the watchdog
     std::atomic<uint64_t> recvSince{0}; // GetTickCount64 at a blocked read's start, 0 = none
     std::atomic<bool> stalled{false}, closing{false};
+    uint64_t pairs = 0;     // pairs done (the RTSS check's schedule)
+    bool rtssNamed = false; // the RTSS hook already named in this render's log
 };
 
 static const int kDgMaxRestarts = 4;
+
+// RTSS (RivaTuner Statistics Server) injects its hook into Direct3D processes and limits their presents inside
+// Present: a frame limit set there caps the child's presents and with them this render's speed, with nothing in the
+// log saying why. The child's module list at its 30th pair and every 600th after names the hook once
+// (SMV_RTSS_MODULE = another module name: the trigger test's lever).
+static void dgCheckRtss(DgChild& c)
+{
+    wchar_t want[64] = L"RTSSHooks64.dll";
+    GetEnvironmentVariableW(L"SMV_RTSS_MODULE", want, 64);
+    DWORD pid = 0;
+    {
+        std::lock_guard<std::mutex> lk(c.m);
+        pid = c.hProc ? GetProcessId(c.hProc) : 0;
+    }
+    if (!pid)
+        return;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE)
+        return;
+    MODULEENTRY32W me{sizeof(me)};
+    for (BOOL more = Module32FirstW(snap, &me); more; more = Module32NextW(snap, &me))
+        if (_wcsicmp(me.szModule, want) == 0)
+        {
+            c.rtssNamed = true;
+            LOG("RTSS (RivaTuner Statistics Server) has hooked the DLSS 4.5 host dlssg2f.exe (%ls): a frame limit set in "
+                "RTSS caps this render's speed; set dlssg2f.exe's Application detection level to None in RTSS\n",
+                want);
+            break;
+        }
+    CloseHandle(snap);
+}
 
 static void dgEnd(DgChild& c, bool kill)
 {
@@ -1241,7 +1286,11 @@ static int dgPair(DgChild& c, const uint8_t* prev, const uint8_t* cur, uint8_t* 
         for (int j = 0; ok && j < c.gen; j++)
             ok = dgRead(c, out + (size_t)j * fb, fb);
         if (ok)
+        {
+            if (!c.rtssNamed && (++c.pairs == 30 || c.pairs % 600 == 0))
+                dgCheckRtss(c);
             return 0;
+        }
         primed = false;
         DWORD rc = STILL_ACTIVE;
         {
@@ -1420,6 +1469,15 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.fitWork = argv[++i];
         else if (wcscmp(argv[i], L"--no-gpu-fit") == 0)
             g_noGpuFit = true;
+        else if (wcscmp(argv[i], L"--gmfss-flow") == 0 && i + 1 < argc)
+        {
+            // a gate lever offline (the product passes it only live): the same frames as eager GMFSS at that grid
+            if (!parseGmFlow(argv[++i]))
+            {
+                LOG("--gmfss-flow must be 0.25..1\n");
+                return 1;
+            }
+        }
         else if (wcscmp(argv[i], L"--sharpen") == 0 && i + 1 < argc)
             g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0)
@@ -2265,8 +2323,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                                                       : (nr.fruc ? (nr.fsrfg ? ", model fsrfg" : ", model fruc")
                                                                  : (oa.dlssg ? ", model dlss 4.5" : ""))))),
         nr.restore ? ", restore" : "",
-        nr.vsr ? (nr.fsrUp ? ", amd fsr upscale" : ", rtx vsr")
-               : ((outW != w || outH != h) ? ", lanczos3 upscale" : ""),
+        nr.vsr ? (nr.fsrUp ? ", amd fsr upscale" : ", rtx vsr") : ((outW != w || outH != h) ? ", lanczos upscale" : ""),
         nr.nrHost ? ", dlss 5" : "", nr.sharpen > 0.0f ? ", sharpen" : "", nr.rtxHdr ? ", rtx hdr" : "",
         (double)(nowQpc100() - tStart) / 1e7);
     if (fpsMode)
@@ -2529,7 +2586,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nr.nrReused++;
         else if (nvPre)
         {
-            // the decoded frame at its own size, then Restore / RTX VSR / Lanczos3
+            // the decoded frame at its own size, then Restore / RTX VSR / Lanczos
             // to the model (output) size, into dCur with the pad
             int sps = srcW * srcH;
             void* a[] = {&dR, &srcW, &srcH, &nr.dSrcPl, &srcH, &srcW, &sps};
@@ -2613,7 +2670,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         // RIFE's motion frame: the finished picture as the IFNet would have read it, minus what costs
         // RIFE its motion (measured on an exact pan): the PQ encoding (read as SDR sRGB) and an enlarge
-        // (Lanczos3 back to the decoded size, into dSrcPl, which the pre-model stage no longer needs),
+        // (Lanczos back to the decoded size, into dSrcPl, which the pre-model stage no longer needs),
         // padded to the model's frame. Taken after Sharpen, or before the post with RTX HDR (Sharpen is
         // fused into TrueHDR's input there). A reused frame copied it above.
         auto motionFrame = [&]() -> bool {
@@ -2621,11 +2678,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             int sps = (int)plane, srs = nr.pw, sw = w, sh = h;
             if (w != srcW || h != srcH)
             {
-                int zero = 0, tps = srcW * srcH, n = 3 * srcW * srcH;
-                void* a[] = {(void*)&dCur, &zero, (void*)&ps, &nr.pw, &w, &h, &nr.dSrcPl, &srcW, &srcH};
+                int tps = srcW * srcH, n = 3 * srcW * srcH;
                 void* b[] = {&nr.dSrcPl, &n};
-                if (cuLaunchKernel(nr.fFitPlanar, (srcW + 15) / 16, (srcH + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
-                                   nullptr) != CUDA_SUCCESS ||
+                if (!nativeFitPlanar(nr, dCur, 0, (int)ps, nr.pw, w, h, nr.dSrcPl, srcW, srcH, st) ||
                     cuLaunchKernel(nr.fClamp01, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, b, nullptr) !=
                         CUDA_SUCCESS)
                     return false;
@@ -3534,6 +3589,7 @@ static void resetSessionGlobals()
     g_dlssMode = 0;
     g_liveAutoFit = 0;
     g_liveAutoFloor = 0;
+    g_gmFlow = 1.0;
     g_noHud = g_noHudLat = false;
     g_noFillMouse = false;
     g_sharpen = 0.0;
@@ -3678,6 +3734,14 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             if (!parseLiveScale(argv[++i]))
             {
                 LOG("--scale must be 0.01..1.0 or a DLSS mode (auto, dlaa, quality, balanced, performance, ultra)\n");
+                return 1;
+            }
+        }
+        else if (wcscmp(argv[i], L"--gmfss-flow") == 0 && i + 1 < argc)
+        {
+            if (!parseGmFlow(argv[++i]))
+            {
+                LOG("--gmfss-flow must be 0.25..1\n");
                 return 1;
             }
         }

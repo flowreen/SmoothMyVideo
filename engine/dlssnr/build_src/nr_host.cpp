@@ -438,6 +438,7 @@ bool Host::createDevice(std::string& err)
         err = m_wantAdapter ? "no D3D12 adapter matches the CUDA device" : "no D3D12 capable adapter";
         return false;
     }
+    m_adapter = adapter;
 
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -625,6 +626,41 @@ int Host::startup(uint32_t w, uint32_t h, const Settings& s, std::string& err, b
     return initNgx(err);
 }
 
+// The NVIDIA driver version as the user sees it (617.14): the D3D user-mode driver's version (32.0.16.1714) carries
+// it in its last five digits.
+static std::string driverVersionText(IDXGIAdapter* a)
+{
+    LARGE_INTEGER umd{};
+    if (!a || FAILED(a->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd)))
+        return "version unknown";
+    const unsigned v = (HIWORD(umd.LowPart) % 10) * 10000u + LOWORD(umd.LowPart);
+    char b[32];
+    snprintf(b, sizeof(b), "%u.%02u", v / 100, v % 100);
+    return b;
+}
+
+// The create under a fault guard: on a driver too old for DLSS 5, NVIDIA's runtime has faulted inside the create
+// instead of refusing it (NeuralScreen #145, 576.x drivers); a fault here becomes a refusal line, never the end of the
+// process. testFault = the trigger test's fault (SMV_NR_TEST=fault). No C++ object lives in this frame (__try).
+static NVSDK_NGX_Result guardedCreate(PFN_ShimCreate sCreate, void* pCreate, ID3D12GraphicsCommandList* list, int id,
+                                      NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** f, bool testFault, bool& faulted)
+{
+    faulted = false;
+    __try
+    {
+        if (testFault)
+            RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+        return sCreate(pCreate, list, id, p, f);
+    }
+    // any fault of the create is a refusal on purpose: the session runs without DLSS 5
+#pragma warning(suppress : 6320)
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        faulted = true;
+        return NVSDK_NGX_Result_Fail;
+    }
+}
+
 int Host::initNgx(std::string& err)
 {
     // Driver core entry points.
@@ -675,6 +711,41 @@ int Host::initNgx(std::string& err)
     fci.LoggingInfo.DisableOtherLoggingSinks = false;
 
     std::wstring dataPath = moduleDir();
+    const unsigned long long kCmsAppId = 141959980ull;
+    // SMV_NR_TEST=outofdate / =fault: the trigger tests of the two refusals below (never a product setting)
+    wchar_t testv[16]{};
+    GetEnvironmentVariableW(L"SMV_NR_TEST", testv, 16);
+    const bool testOutOfDate = wcscmp(testv, L"outofdate") == 0, testFault = wcscmp(testv, L"fault") == 0;
+    const std::string driver = driverVersionText(m_adapter.Get());
+
+    // The feature's requirements first (NGX needs no Init for it): a driver too old for DLSS 5 answers OutOfDate or
+    // sets the driver bit here, and on such drivers the create has faulted instead of refusing. Only those two
+    // answers refuse; any other goes to the log and the create decides.
+    typedef NVSDK_NGX_Result (*PFN_Requirements)(IDXGIAdapter*, const NVSDK_NGX_FeatureDiscoveryInfo*,
+                                                 NVSDK_NGX_FeatureRequirement*);
+    if (auto pReq = (PFN_Requirements)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_GetFeatureRequirements"))
+    {
+        NVSDK_NGX_FeatureDiscoveryInfo di = {};
+        di.SDKVersion = NVSDK_NGX_Version_API;
+        di.FeatureID = (NVSDK_NGX_Feature)kFeatureId;
+        di.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
+        di.Identifier.v.ApplicationId = kCmsAppId;
+        di.ApplicationDataPath = dataPath.c_str();
+        di.FeatureInfo = &fci;
+        NVSDK_NGX_FeatureRequirement req = {};
+        const NVSDK_NGX_Result rr = testOutOfDate ? NVSDK_NGX_Result_FAIL_OutOfDate : pReq(m_adapter.Get(), &di, &req);
+        fprintf(stderr, "dlssnr: feature requirements -> %s, unsupported bits 0x%x, driver %s\n",
+                resultString(rr).c_str(), (unsigned)req.FeatureSupported, driver.c_str());
+        fflush(stderr);
+        if (rr == NVSDK_NGX_Result_FAIL_OutOfDate ||
+            (rr == NVSDK_NGX_Result_Success &&
+             (req.FeatureSupported & NVSDK_NGX_FeatureSupportResult_DriverVersionUnsupported)))
+        {
+            err =
+                "the NVIDIA driver " + driver + " is too old for DLSS 5 (" + resultString(rr) + "): update the driver";
+            return 3;
+        }
+    }
 
     m_last = sInit(pInit, kInitArgOrder, kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "0.1", dataPath.c_str(), m_dev.Get(),
                    &fci, NVSDK_NGX_Version_API);
@@ -698,7 +769,6 @@ int Host::initNgx(std::string& err)
         err = "nvngx_dlssnr.dll has no NVSDK_NGX_D3D12_Init_Ext";
         return 2;
     }
-    const unsigned long long kCmsAppId = 141959980ull;
     const NVSDK_NGX_Result rs = sInitF(pSnipInit, kCmsAppId, dataPath.c_str(), m_dev.Get(), 0x15, &fci);
     fprintf(stderr, "dlssnr: snippet Init_Ext -> %s\n", resultString(rs).c_str());
     fflush(stderr);
@@ -720,10 +790,17 @@ int Host::initNgx(std::string& err)
         return 2;
     }
 
+    bool faulted = false;
     auto create = [&](NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** f) {
-        return sCreate(pCreate, m_list.Get(), kFeatureId, p, f);
+        return guardedCreate(sCreate, pCreate, m_list.Get(), kFeatureId, p, f, testFault, faulted);
     };
     m_last = create(m_params, &m_feature);
+    if (faulted)
+    {
+        m_list->Close();
+        err = "DLSS 5's create faulted inside NVIDIA's runtime (driver " + driver + "): update the driver";
+        return 3;
+    }
     if (m_last != NVSDK_NGX_Result_Success || !m_feature)
     {
         m_list->Close();
@@ -748,9 +825,9 @@ int Host::initNgx(std::string& err)
         setPassParams(k, wanted - 1);
         NVSDK_NGX_Handle* f = nullptr;
         r = create(p, &f);
-        if (r != NVSDK_NGX_Result_Success || !f)
+        if (faulted || r != NVSDK_NGX_Result_Success || !f)
         {
-            m_passNote = "pass " + std::to_string(k + 1) + " CreateFeature " + resultString(r);
+            m_passNote = "pass " + std::to_string(k + 1) + " CreateFeature " + (faulted ? "faulted" : resultString(r));
             break;
         }
         m_pfeature[k] = f;

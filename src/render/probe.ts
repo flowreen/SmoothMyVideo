@@ -44,7 +44,7 @@ export function probe(ffprobe: string, path: string): Probe {
     'v:0',
     '-show_entries',
     'stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,codec_name,pix_fmt,' +
-      'bits_per_raw_sample,color_space,color_transfer,color_primaries,color_range',
+      'bits_per_raw_sample,color_space,color_transfer,color_primaries,color_range,sample_aspect_ratio',
     '-of',
     'json',
     path,
@@ -61,6 +61,18 @@ export function probe(ffprobe: string, path: string): Probe {
 export function tag(st: Stream, key: string): string | number | null {
   const v = st[key];
   return v && !['unknown', 'reserved', 'N/A'].includes(String(v)) ? v : null;
+}
+
+/** The shape of the source's pixels, reduced: ffprobe's sample aspect ratio (the container's, else the bitstream's),
+ * [1, 1] when square, absent or invalid. An anamorphic source (a DVD's 720x480 at 32:27 or 8:9, 1440x1080 at 4:3)
+ * stores its picture squeezed and the player stretches it by this ratio. */
+export function sourceSar(st: Stream): [number, number] {
+  const m = /^(\d+):(\d+)$/.exec(String(st.sample_aspect_ratio || ''));
+  const [n, d] = m ? [parseInt(m[1], 10), parseInt(m[2], 10)] : [0, 0];
+  if (!(n > 0 && d > 0)) return [1, 1];
+  const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
+  const g = gcd(n, d);
+  return [n / g, d / g];
 }
 
 /** Bit depth of the source samples: the probe's own field, else read off the pixel format. */
@@ -193,19 +205,6 @@ export function needMkv(aud: Track[], sub: Track[]): boolean {
   return sub.length > 0 || aud.some(([, c]) => !MP4_AUDIO_OK.has(c));
 }
 
-// decode-side downscale: the linear-light Lanczos3 chain (the kernel of the host's own resizes)
-export const ZSC_TRC: Record<string, string> = {
-  bt709: '709',
-  smpte170m: '601',
-  bt470bg: '601',
-  'bt2020-10': '2020_10',
-  'bt2020-12': '2020_12',
-  smpte2084: 'smpte2084',
-  'arib-std-b67': 'arib-std-b67',
-  'iec61966-2-1': 'iec61966-2-1',
-  iec61966_2_1: 'iec61966-2-1',
-  linear: 'linear',
-};
 const UNTAGGED = ['', 'unknown', 'unspecified'];
 
 // The colour conversions run through zimg (zscale): exact matrix and range math and Lanczos3 chroma, where
@@ -260,9 +259,10 @@ export function zimgPadCrop(pix: string, w: number, h: number): [string[], strin
   return ph === h ? [[], []] : [[`pad=${w}:${ph}:0:0`], [`crop=${w}:${h}:0:0`]];
 }
 
-/** The -vf chain of a decode at the source size: planar YUV to RGB through zimg. Empty = swscale converts (a
- * source that is not planar YUV without alpha, or a matrix outside ZSC_MATRIX). */
-export function decodeRgbVf(st: Stream, w: number, h: number): string[] {
+/** The -vf chain of a decode at the source size: planar YUV to RGB (`fmt`, the pipe's planar format by default)
+ * through zimg. Empty = swscale converts (a source that is not planar YUV without alpha, or a matrix outside
+ * ZSC_MATRIX). */
+export function decodeRgbVf(st: Stream, w: number, h: number, fmt = planarRgb(st)): string[] {
   const pix = String(st.pix_fmt || '');
   if (!/^yuvj?4[0-4]{2}p(\d+(le|be))?$/.test(pix)) return [];
   const sp: string[] = [];
@@ -275,38 +275,17 @@ export function decodeRgbVf(st: Stream, w: number, h: number): string[] {
   const [pad, crop] = pc;
   return (sp.length ? [`setparams=${sp.join(':')}`] : []).concat(
     pad,
-    ['zscale=filter=lanczos:dither=none', `format=${planarRgb(st)}`],
+    ['zscale=filter=lanczos:dither=none', `format=${fmt}`],
     crop,
   );
 }
 
-/** The -vf chain for a decode-side downscale of a w x h source to dw x dh. */
+/** The -vf chain for a decode-side downscale of a w x h source to dw x dh: the decode's zimg conversion to float
+ * planes, then zimg's Lanczos at radius 7 on the source's own codes (the host's shrink, kLzDown), rounded by zimg to
+ * the pipe's integers (swscale's pack of float planes is 0.36 codes bright at 8 bits). In linear light, radius 3, 4
+ * and 6 measured 1.5 to 1.7 dB under it through SMV's enlarge back. What zimg cannot read: swscale's Lanczos 7. */
 export function dscaleVf(st: Stream, w: number, h: number, dw: number, dh: number): string[] {
-  const fallback = [`scale=${dw}:${dh}:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp`];
-  const pixfmt = String(st.pix_fmt || '');
-  if (['rgb', 'bgr', 'gbr', 'gray', 'pal', 'ya', 'monob', 'monow'].some((p) => pixfmt.startsWith(p))) return fallback;
-  const trcIn = String(st.color_transfer || '');
-  let trc: string | undefined = Object.prototype.hasOwnProperty.call(ZSC_TRC, trcIn) ? ZSC_TRC[trcIn] : undefined;
-  if (trc === undefined && !UNTAGGED.includes(trcIn)) return fallback;
-  const sp: string[] = [];
-  if (UNTAGGED.includes(String(st.color_space || ''))) sp.push('colorspace=' + sizeMatrix(w, h));
-  if (trc === undefined) {
-    trc = '709';
-    sp.push('color_trc=bt709');
-  }
-  if (UNTAGGED.includes(String(st.color_primaries || ''))) sp.push('color_primaries=' + sizeMatrix(w, h));
-  if (UNTAGGED.includes(String(st.color_range || ''))) sp.push('range=tv');
-  // the last zimg step also rounds the float planes to the integers the pipe carries (swscale's pack of
-  // float planes is 0.36 codes bright at 8 bits); a padded frame is cropped back before the resize
-  const pc = zimgPadCrop(pixfmt, w, h);
-  if (!pc) return fallback;
-  const [pad, crop] = pc;
-  return (sp.length ? [`setparams=${sp.join(':')}`] : []).concat(pad, [
-    'zscale=transfer=linear',
-    'format=gbrpf32le',
-    ...crop,
-    `zscale=w=${dw}:h=${dh}:filter=lanczos:param_a=3`,
-    `zscale=transfer=${trc}:dither=none`,
-    `format=${planarRgb(st)}`,
-  ]);
+  const conv = decodeRgbVf(st, w, h, 'gbrpf32le');
+  if (!conv.length) return [`scale=${dw}:${dh}:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:param0=7`];
+  return conv.concat([`zscale=w=${dw}:h=${dh}:filter=lanczos:param_a=7:dither=none`, `format=${planarRgb(st)}`]);
 }

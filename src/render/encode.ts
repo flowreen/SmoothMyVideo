@@ -482,6 +482,7 @@ export interface EncodeInput {
   outLabel: number;
   outW: number;
   outH: number;
+  sar: [number, number]; // the output's pixel shape (the plan's), written on the stream when not square
   rateStr: string;
   encInFmt: string;
   aud: Track[];
@@ -514,7 +515,10 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   const crop = e.venc === 'hevc_nvenc' && belowNvencMin(e.venc, encW, encH);
   const [minW, minH] = NVENC_MIN.hevc_nvenc;
   const pad = crop ? [encW, encH, Math.max(encW, minW), Math.max(encH, minH)] : null;
-  const vf = encodeVf(sp, outPix, e.encInFmt, matrix, pad, cut);
+  // the frames arrive as raw planes with no pixel shape: an anamorphic one is tagged on them, the encoder and the
+  // container take it from there (the stream SAR, the bitstream's VUI)
+  const sarTag = e.sar[0] !== e.sar[1] ? `,setsar=${e.sar[0]}/${e.sar[1]}` : '';
+  const vf = encodeVf(sp, outPix, e.encInFmt, matrix, pad, cut) + sarTag;
   const bsf = crop ? ['-bsf:v', `hevc_metadata=width=${encW}:height=${encH}`] : [];
   const tq = ultra ? ['-threads', '1', '-thread_queue_size', '1'] : [];
   let [maps, trackNotes] = trackMaps(e.outIsMkv, e.aud, e.sub, e.hasAttach);

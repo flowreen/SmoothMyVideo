@@ -179,6 +179,7 @@ class Host
     std::wstring m_corePath, m_snippetPath;
 
     CP<ID3D12Device> m_dev;
+    CP<IDXGIAdapter1> m_adapter; // the adapter m_dev runs on (the feature requirements query, the driver version)
     CP<ID3D12CommandQueue> m_queue;
     CP<ID3D12CommandAllocator> m_alloc;
     CP<ID3D12GraphicsCommandList> m_list;
