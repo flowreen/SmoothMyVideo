@@ -1,6 +1,7 @@
 # build output
 /dist
 /release
+/renderer/app.js
 
 # dependencies
 /node_modules

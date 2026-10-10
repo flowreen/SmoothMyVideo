@@ -104,10 +104,10 @@ every model to apply only the picture passes, at the source frame rate. Hover a 
 | Model | Best for | Needs | Notes |
 |---|---|---|---|
 | **GMFSS** (default) | Anime | Any RTX GPU | GMFSS_Fortuna, a "union" interpolator; clean frames even at high multipliers. TensorRT-accelerated. |
+| **NVIDIA Optical Flow** | Slower PCs, fast renders, moderate motion | Nothing extra: the driver provides it | NVIDIA's hardware optical-flow unit. Clean on moderate motion; where very fast or twisting motion defeats the hardware's vectors, it fades to a soft double image instead of breaking up. File renders take a whole multiplier (it tells you when the Speed target is not one). |
 | **RIFE** (Practical-RIFE 4.26 heavy) | Live action, filmed content | Any RTX GPU | The strongest open general-purpose interpolation model. TensorRT-accelerated. Its **DRBA** (anime pacing) option keeps characters at their original animation cadence while camera pans smooth fully; in Live it adds one source frame of delay (it needs the next frame first). |
 | **NVIDIA DLSS 4.5** (DLSS Frame Generation) | NVIDIA's game frame generation, on video | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling; above 2&times; needs an RTX 50 | Whole multipliers 2&times;&ndash;6&times;. Bundled (~10 MB NVIDIA-redistributable Streamline runtime), hosted offline by a bare-bones D3D12 presentation loop, since DLSS-FG has no video API. [One caveat](#dlss-45-and-rtx-video-in-a-browser). |
 | **AMD FSR 4** frame generation | An alternative ML look | Any RTX GPU (tested on an RTX 5090) | AMD's machine-learning model, steered by NVIDIA's optical flow, running through the open-source vkd3d-proton (D3D12 on Vulkan). Cleaner than FSR 3.1 on fast pans, though fine edges can still break up on fast anime motion where GMFSS stays clean. Its shaders compile once per driver, in the background, as soon as you pick it. Varies slightly from run to run. |
-| **NVIDIA Optical Flow** | Fast renders, moderate motion | Nothing extra: the driver provides it | NVIDIA's hardware optical-flow unit. Clean on moderate motion; where very fast or twisting motion defeats the hardware's vectors, it fades to a soft double image instead of breaking up. File renders take a whole multiplier (it tells you when the Speed target is not one). |
 | **NVIDIA Smooth Motion** | The NVIDIA look, or a non-AI reference | A one-time runtime ([setup](#get-started)) | Hardware optical-flow FRUC, the same family as the driver-level Smooth Motion. The lowest quality of the models; varies from run to run. |
 
 ## Picture
@@ -215,8 +215,6 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
   3840x2160), then the result is enlarged. DLAA (the default, the full size), Quality (67%), Balanced (58%), Performance (50%) or Ultra Performance
   (33%) from the dropdown, or any share down to 1% with its slider (the dropdown then reads Custom). Lower is much
   faster and softer.
-* **GMFSS flow scale** (25% to 100%, default 100%) estimates the motion at a smaller size: faster, though small
-  fast-moving objects can blur more. It never goes below 320x192.
 * **Effects:** Restore, DLSS 5 and Sharpen run on each captured frame before the smoothing, once per captured frame;
   RTX HDR applies on an HDR display. The upscaler (RTX VSR or AMD FSR 4.1) takes whichever resize enlarges: with a
   DLSS mode below DLAA, that is the enlarge after the smoothing. With DLSS 4.5 as the live model the effects run too,
@@ -224,9 +222,8 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
 * **On an HDR display** every model runs in HDR. RTX HDR is meant for SDR windows.
 * **Pauses by itself** when the window is minimized, on another virtual desktop, or covered by the window in front,
   and resumes when it is back.
-* **Restarts by itself**, on the same window, when you change the Speed target, the DLSS mode, Fit to the GPU or the
-  GMFSS flow scale, when the window is resized or moved to another monitor, and if the engine stalls. A closed window
-  stops Live.
+* **Restarts by itself**, on the same window, when you change the Speed target, the DLSS mode or Fit to the GPU, when
+  the window is resized or moved to another monitor, and if the engine stalls. A closed window stops Live.
 * **Fill screen and the mouse:** clicks on the stretched picture reach the matching spot of your window. While the
   cursor is on the picture, SMV draws it and slows the pointer by the stretch, and gives the normal pointer back when
   the cursor leaves the picture or Live stops (or if the session crashes).

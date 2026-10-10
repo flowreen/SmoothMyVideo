@@ -21,7 +21,7 @@
 //     enqueue from outside, per the CUDA study 01 section B1).
 //
 // Delay-loaded DLLs: tensorrt_rtx_1_6.dll, cudart64_13.dll and nvrtc64_130_0.dll ship in
-// engine\gpu_runtime (staged from the dev python's wheels by scripts/stage-gpu-runtime.js).
+// engine\gpu_runtime (staged from the dev python's wheels by scripts/stage-gpu-runtime.ts).
 
 // cuda_runtime.h pulls the internal crt\ headers the runtime WHEEL does not ship; the host
 // side only ever needs the API declarations, so cuda_runtime_api.h plus the one-macro shim in
@@ -3756,83 +3756,6 @@ extern "C" __global__ void __launch_bounds__(128) k_attn2b(const unsigned* __res
 #undef AT_KT
 #undef AT_SP
 
-// ---- live GMFSS at a flow scale below 1 (--gmfss-flow, GMFSS_infer_u.reuse's scale branch) ----------------------
-// Both halves shrink to the /32 flow grid the way F.interpolate(size=(fh, fw), mode='bilinear', align_corners=False,
-// antialias=True) does (torch's _compute_weights_aa: the triangle filter over a window of support = the ratio,
-// normalised by the tap sum), gmflow runs there, and k_gmFlowUp brings its two flows back to the half the way
-// F.interpolate(size=(hh, hw), mode='bilinear', align_corners=False) * (hw / fw, hh / fh) does (channel 0 = x). The
-// axes only shrink (in >= out). No fp64: a tap's distance from the centre is the integer ratio
-// ((2j + 1) out - (2o + 1) in) / (2 in), one rounding; the window ends are exact integer floors. Both kernels are gated
-// against an fp64 reference and against torch.
-__device__ __forceinline__ void gmAaAxis(int o, int in, int out, int& mn, int& mx)
-{
-    // torch: centre = in / out * (o + 0.5), support = in / out; min = max(int(centre - support + 0.5), 0), max =
-    // min(int(centre + support + 0.5), in)
-    const long long den = 2LL * out, lo = (2LL * o - 1) * in + out, hi = (2LL * o + 3) * in + out;
-    mn = lo > 0 ? (int)(lo / den) : 0;
-    mx = (int)(hi / den);
-    if (mx > in) mx = in;
-}
-__device__ __forceinline__ float gmAaW(int j, int o, int in, int out)
-{
-    const float a = fabsf((float)((2LL * j + 1) * out - (2LL * o + 1) * in) / (float)(2LL * in));
-    return a < 1.0f ? 1.0f - a : 0.0f;
-}
-
-// C contiguous fp32 planes of (h, w) -> C contiguous planes of (dh, dw): the horizontal taps of each window row, then
-// the vertical sum, over the product of the two axes' tap sums
-__global__ void k_gmShrinkAa(const float* __restrict__ src, int C, int w, int h, float* __restrict__ dst, int dw, int dh)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= dw || y >= dh) return;
-    int x0, x1, y0, y1;
-    gmAaAxis(x, w, dw, x0, x1);
-    gmAaAxis(y, h, dh, y0, y1);
-    float sx = 0.0f, sy = 0.0f;
-    for (int i = x0; i < x1; i++) sx += gmAaW(i, x, w, dw);
-    for (int j = y0; j < y1; j++) sy += gmAaW(j, y, h, dh);
-    const float norm = sx > 0.0f && sy > 0.0f ? 1.0f / (sx * sy) : 0.0f;
-    const size_t splane = (size_t)w * h, dplane = (size_t)dw * dh, o = (size_t)y * dw + x;
-    for (int c = 0; c < C; c++)
-    {
-        const float* s = src + (size_t)c * splane;
-        float acc = 0.0f;
-        for (int j = y0; j < y1; j++)
-        {
-            const float* r = s + (size_t)j * w;
-            float row = 0.0f;
-            for (int i = x0; i < x1; i++) row += gmAaW(i, x, w, dw) * r[i];
-            acc += gmAaW(j, y, h, dh) * row;
-        }
-        dst[(size_t)c * dplane + o] = acc * norm;
-    }
-}
-
-// the flow grid's planes (sh, sw) -> (dh, dw): bilinear at rbAxis's exact source coordinate, plane p times dw / sw when
-// p is even (x) and dh / sh when it is odd (y)
-__global__ void k_gmFlowUp(const float* __restrict__ src, int planes, int sw, int sh, float* __restrict__ dst, int dw,
-                           int dh)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= dw || y >= dh) return;
-    int x0, x1, y0, y1;
-    float lx, ly;
-    rbAxis(x, dw, sw, x0, x1, lx);
-    rbAxis(y, dh, sh, y0, y1, ly);
-    const float vx = (float)dw / (float)sw, vy = (float)dh / (float)sh;
-    const size_t splane = (size_t)sw * sh, dplane = (size_t)dw * dh;
-    const size_t r0 = (size_t)y0 * sw, r1 = (size_t)y1 * sw, o = (size_t)y * dw + x;
-    for (int p = 0; p < planes; p++)
-    {
-        const float* s = src + (size_t)p * splane;
-        const float a = (1.0f - lx) * s[r0 + x0] + lx * s[r0 + x1];
-        const float b = (1.0f - lx) * s[r1 + x0] + lx * s[r1 + x1];
-        dst[(size_t)p * dplane + o] = ((1.0f - ly) * a + ly * b) * ((p & 1) ? vy : vx);
-    }
-}
-
 }
 
 )CUDASRC";
@@ -4340,8 +4263,7 @@ struct NativeRife
     // and runs the chain itself (nativeGmfssPair / nativeGmfssTween with the glue kernels
     // above), so gmfss is a native backend like rife.
     bool gmfss = false;
-    int hh = 0, hw = 0;   // the half frame (the fusion grid)
-    int gfh = 0, gfw = 0; // live --gmfss-flow below 1: gmflow's /32 grid inside the half (0 = the half itself)
+    int hh = 0, hw = 0; // the half frame (the fusion grid)
     std::string gmPath[kGmN], gmJit[kGmN];
     nvinfer1::ICudaEngine* engGm[kGmN] = {};
     nvinfer1::IRuntimeConfig* cfgGm[kGmN] = {};
@@ -4375,8 +4297,6 @@ struct NativeRife
     void* dGmFeat[2][3] = {};    // the two frames' feature sets (cur is the next pair's prev)
     float* dGmHalf = nullptr;    // (6, hh, hw): img0's half in planes 0..2, img1's in 3..5
     float* dGmFlow = nullptr;    // the gmflow output (2, 2, hh, hw) = flow01 then flow10
-    float* dGmHalfF = nullptr;   // at a flow grid (gfh): the six planes gmflow reads, shrunk to (gfh, gfw)
-    float* dGmFlowF = nullptr;   // at a flow grid: gmflow's output (2, 2, gfh, gfw) before k_gmFlowUp
     void* dGmMetric = nullptr;   // (2, hh, hw) in the engine's dtype: m0 then m1
     float* dGmFlowP[2] = {};     // the flow pyramids at the quarter / eighth, pre-scaled
     float* dGmMetP[2] = {};      // the metric pyramids at the quarter / eighth (fp32)
@@ -4837,7 +4757,7 @@ struct NativeRife
     CUfunction fNrIn = nullptr, fNrOut = nullptr, fNrMv = nullptr;    // DLSS 5
     CUfunction fNrInPq = nullptr, fNrOutPq = nullptr;                 // live DLSS 5 on HDR (PQ) planes
     CUfunction fHalf = nullptr, fPyr = nullptr, fSplatSoft = nullptr, // live GMFSS glue (5b)
-        fSplatNorm = nullptr, fGmShrink = nullptr, fGmFlowUp = nullptr;
+        fSplatNorm = nullptr;
     CUfunction fPackInRaw16 = nullptr, fPackInRaw8 = nullptr, // offline
         fPackOutRaw16 = nullptr, fPackOutRaw8 = nullptr, fExpand8to16 = nullptr;
     CUfunction fPairDiff = nullptr, fRawDiff = nullptr;                       // identical-pair test, DLSS 5 reuse test
@@ -5213,7 +5133,7 @@ static const LookupTags& lkTags(const std::wstring& engDir)
         return t;
     forDir = engDir;
     t = LookupTags();
-    // the version stage-gpu-runtime.js copied from the wheel's dist-info name (1.6.1.120)
+    // the version stage-gpu-runtime.ts copied from the wheel's dist-info name (1.6.1.120)
     FILE* vf = nullptr;
     if (!_wfopen_s(&vf, (engDir + L"\\gpu_runtime\\tensorrt_rtx_version.txt").c_str(), L"rb") && vf)
     {
@@ -5498,9 +5418,6 @@ static std::vector<LkShape> lkGmNameSet(const LkGmNet& n)
     return n.nameIn ? std::vector<LkShape>(n.set.begin(), n.set.begin() + n.nameIn) : n.set;
 }
 
-// GMFSS's flow grid floor at a --gmfss-flow below 1 (lkSession)
-constexpr int kGmFlowMinW = 320, kGmFlowMinH = 192;
-
 // Everything the lookup and the build derive from a session's arguments, in ONE place: a name
 // or a size that differed between the two would be an engine the build writes and the lookup
 // never finds. Sizes follow trt_lookup / the engine classes in trt_runtime.py.
@@ -5515,8 +5432,8 @@ struct LkSession
     int mw = 0, mh = 0;       // the model frame = the working size (live: liveWorkSize)
     int ph = 0, pw = 0;       // the /64 pad (SMV_LIVE_SAFEPAD=1 on the RIFE family)
     std::string warmKey;      // the line a warmed .jit.warm marker carries
-    // gmfss: the half size, gmflow's /32 grid at a live --gmfss-flow below 1 (0 = the half), the nets
-    int hh = 0, hw = 0, fh = 0, fw = 0;
+    // gmfss: the half size, the nets
+    int hh = 0, hw = 0;
     std::vector<LkGmNet> gm;
     // rife / blend / rifedrba
     bool drba = false;
@@ -5693,23 +5610,9 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
     if (s.backend == "gmfss")
     {
         const int hh = s.hh = s.ph / 2, hw = s.hw = s.pw / 2;
-        // --gmfss-flow below 1 (live; offline a gate lever): gmflow (backbone, A, B) on the /32 grid nearest the share
-        // of the half, GMFSS_infer_u.reuse's round(n * scale / 32) * 32 (Python's round: half to even = nearbyint), never
-        // below kGmFlowMinW x kGmFlowMinH (or the half when it is smaller): at a 256x128 grid (1080p at 25 %, 540p at
-        // 50 %) GMFlow moved 28 % of a static frame's pixels by more than 16 levels and lost a known pan (20 dB vs 46);
-        // 320x192 and up are clean
-        // (SMV_GMFSS_FLOW_FLOOR=0: 32 px, the A/B lever of the floor)
-        if (g_gmFlow < 1.0)
-        {
-            const bool floor = lkEnv("SMV_GMFSS_FLOW_FLOOR") != "0";
-            s.fh = (std::max)((std::min)(hh, floor ? kGmFlowMinH : 32), (int)std::nearbyint(hh * g_gmFlow / 32.0) * 32);
-            s.fw = (std::max)((std::min)(hw, floor ? kGmFlowMinW : 32), (int)std::nearbyint(hw * g_gmFlow / 32.0) * 32);
-            if (s.fh >= hh && s.fw >= hw)
-                s.fh = s.fw = 0;
-        }
-        const int gh = s.fh ? s.fh : hh, gw = s.fh ? s.fw : hw;
+        const int gh = hh, gw = hw; // gmflow's frame
         const int64_t q4 = (int64_t)(gh / 4) * (gw / 4), q8 = (int64_t)(gh / 8) * (gw / 8), K = 81;
-        // featurenet at the padded frame, the rest at the half, gmflow at its grid; gmflow_bidir as `_m` + A + B: the
+        // featurenet at the padded frame, the rest at the half; gmflow_bidir as `_m` + A + B: the
         // scale-0 global matching and propagation between `_m` and A (k_attn2) and the quarter-scale local correlation
         // between A and B (k_localCorr, never the [2, 128, HW, 81] product), A with the doubled workspace ceiling; the
         // IFNet's ONNX key carries its baked scale list
@@ -5965,8 +5868,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
         }
         lines.push_back("NATIVE-PATH cache=" + cacheDir);
         char tail[256];
-        sprintf_s(tail, " batch=0 batchpad=0 hh=%d hw=%d fh=%d fw=%d effects=0 restore=0 engine=gmfss fast=1", hh, hw,
-                  s.fh, s.fw);
+        sprintf_s(tail, " batch=0 batchpad=0 hh=%d hw=%d effects=0 restore=0 engine=gmfss fast=1", hh, hw);
         lines.push_back("LIVE READY native=1 " + geo(ph, pw, mw, mh, dw, dh, x0, y0) + " scale=" + lkF4(imgScale) +
                         tail);
         return true;
@@ -6416,7 +6318,7 @@ static bool lkEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTag
         const std::string onnx = lkOnnxPath(s.engDir, onnxKey, t);
         if (!lkFile(onnx))
         {
-            LOG("native: %s is missing (node scripts/export-onnx.js writes it)\n", onnx.c_str());
+            LOG("native: %s is missing (node scripts/export-onnx.ts writes it)\n", onnx.c_str());
             return false;
         }
         if (!lkBuild(rt, onnx, path, set, dynInput, dynLo, dynHi, wsMult, oom))
@@ -6768,8 +6670,6 @@ static bool lkOfflineGmfss(const std::wstring& script, int w, int h, NativeRife&
     nr.pw = s.pw;
     nr.hh = s.hh;
     nr.hw = s.hw;
-    nr.gfh = s.fh;
-    nr.gfw = s.fw;
     LOG("offline: GMFSS engines for %dx%d%s (%.1fs)\n", s.pw, s.ph, built ? ", built by the host" : ", warm",
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return true;
@@ -6904,9 +6804,9 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     // live Restore rides in the key: its engine path is a fact of a restore session only; DLSS 5 too: it raises a
     // small working size (liveWorkSizeFor)
     wchar_t key[1024];
-    swprintf_s(key, L"%s|%s|%.2f|%d|%d|%d|%u|%u|%u|%u|%d|%d|%d|%.2f", script.c_str(), backend.c_str(), g_flowScale,
+    swprintf_s(key, L"%s|%s|%.2f|%d|%d|%d|%u|%u|%u|%u|%d|%d|%d", script.c_str(), backend.c_str(), g_flowScale,
                g_dlssMode, g_liveAutoFit, g_liveAutoFloor, W, H, capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0,
-               g_dlssnr ? 1 : 0, g_gmFlow);
+               g_dlssnr ? 1 : 0);
     bool factsOk = g_resident && g_res.haveFacts && g_res.handoffKey == key;
     if (factsOk)
     {
@@ -6943,8 +6843,6 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         nr.gmfss = f.gmfss;
         nr.hh = f.hh;
         nr.hw = f.hw;
-        nr.gfh = f.gfh;
-        nr.gfw = f.gfw;
         for (int i = 0; i < kGmN; i++)
         {
             nr.gmPath[i] = f.gmPath[i];
@@ -7147,15 +7045,6 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     {
         nr.hh = num("hh", 0);
         nr.hw = num("hw", 0);
-        nr.gfh = num("fh", 0);
-        nr.gfw = num("fw", 0);
-        if ((nr.gfh || nr.gfw) &&
-            (nr.gfh < 32 || nr.gfw < 32 || (nr.gfh & 31) || (nr.gfw & 31) || nr.gfh > nr.hh || nr.gfw > nr.hw))
-        {
-            LOG("native: gmfss handoff flow grid %dx%d is not a /32 grid inside the %dx%d half\n", nr.gfw, nr.gfh,
-                nr.hw, nr.hh);
-            return false;
-        }
         for (int i = 0; i < kGmN; i++)
             if (nr.gmPath[i].empty())
             {
@@ -7429,8 +7318,6 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fPyr, "k_pyr"},
         {&nr.fSplatSoft, "k_splatSoft"},
         {&nr.fSplatNorm, "k_splatNorm"},
-        {&nr.fGmShrink, "k_gmShrinkAa"},
-        {&nr.fGmFlowUp, "k_gmFlowUp"},
         {&nr.fPackInRaw16, "k_packInRaw16"},
         {&nr.fPackInRaw8, "k_packInRaw8"},
         {&nr.fPackOutRaw16, "k_packOutRaw16"},
@@ -10718,9 +10605,9 @@ static bool nativeGmSplitCheck(NativeRife& nr)
         return bad("corr", "is not an fp32 input of gmflow_bidir_b");
     const nvinfer1::Dims q = a->getTensorShape("q"), f = a->getTensorShape("f"), g = a->getTensorShape("coords"),
                          c = b->getTensorShape("corr");
-    const int gh = nr.gfh ? nr.gfh : nr.hh, gw = nr.gfh ? nr.gfw : nr.hw;
+    const int gh = nr.hh, gw = nr.hw;
     if (f.nbDims != 4 || f.d[0] != 2 || f.d[1] != gh / 4 || f.d[2] != gw / 4 || f.d[3] != 128)
-        return bad("f", "is not [2, H, W, 128] on the quarter of gmflow's frame (the half, or its flow grid)");
+        return bad("f", "is not [2, H, W, 128] on the quarter of gmflow's frame (the half)");
     nr.gmH = (int)f.d[1];
     nr.gmW = (int)f.d[2];
     // `_m` (slot 7): A's four inputs -> mf / mq / mk, fp16 [2, N, 128] on the eighth grid (k_attn2 reads only fp16);
@@ -10857,10 +10744,8 @@ static bool nativeGmfssSetup(NativeRife& nr)
     if (fh2 != nr.gmFeatHalf || fh3 != nr.gmFeatHalf)
         return bad("the feature levels have mixed dtypes");
     // the fused bidir GMFlow: both halves take the frames, B hands the flow out: row 0 = flow01, row 1 = flow10 (so
-    // the pyramids take both at once); at a flow grid (live --gmfss-flow) the three gmflow engines run on it
-    if (nr.gfh && (nr.gfh > hh || nr.gfw > hw || (nr.gfh & 31) || (nr.gfw & 31)))
-        return bad("the flow grid is not a /32 grid inside the half frame");
-    const int gh = nr.gfh ? nr.gfh : hh, gw = nr.gfh ? nr.gfw : hw;
+    // the pyramids take both at once)
+    const int gh = hh, gw = hw;
     if (!tensor(1, "img0", 1, 3, gh, gw, nullptr) || !tensor(1, "img1", 1, 3, gh, gw, nullptr) ||
         !tensor(5, "img0", 1, 3, gh, gw, nullptr) || !tensor(5, "img1", 1, 3, gh, gw, nullptr) ||
         !tensor(6, "img0", 1, 3, gh, gw, nullptr))
@@ -10914,13 +10799,6 @@ static bool nativeGmfssSetup(NativeRife& nr)
                  "alloc gmfss features");
     NCHK(cudaMalloc((void**)&nr.dGmHalf, 6 * hp * sizeof(float)), "alloc gmfss halves");
     NCHK(cudaMalloc((void**)&nr.dGmFlow, 4 * hp * sizeof(float)), "alloc gmfss flow");
-    if (nr.gfh)
-    {
-        const size_t gp = (size_t)nr.gfh * nr.gfw;
-        NCHK(cudaMalloc((void**)&nr.dGmHalfF, 6 * gp * sizeof(float)), "alloc gmfss flow grid halves");
-        NCHK(cudaMalloc((void**)&nr.dGmFlowF, 4 * gp * sizeof(float)), "alloc gmfss flow grid flow");
-        LOG("native: gmfss flow grid %dx%d of the %dx%d half (--gmfss-flow)\n", nr.gfw, nr.gfh, hw, hh);
-    }
     NCHK(cudaMalloc(&nr.dGmMetric, 2 * hp * me), "alloc gmfss metric");
     NCHK(cudaMalloc((void**)&nr.dGmFlowP[0], 4 * qp * sizeof(float)), "alloc gmfss flow pyramid");
     NCHK(cudaMalloc((void**)&nr.dGmFlowP[1], 4 * ep * sizeof(float)), "alloc gmfss flow pyramid");
@@ -11879,8 +11757,6 @@ static void nativeFree(NativeRife& nr)
                     nr.dGmFeat[1][2],
                     (void*)nr.dGmHalf,
                     (void*)nr.dGmFlow,
-                    (void*)nr.dGmHalfF,
-                    (void*)nr.dGmFlowF,
                     nr.dGmMetric,
                     (void*)nr.dGmFlowP[0],
                     (void*)nr.dGmFlowP[1],
@@ -11933,8 +11809,6 @@ static void nativeFree(NativeRife& nr)
             nr.dGmFeat[s][l] = nullptr;
     nr.dGmHalf = nullptr;
     nr.dGmFlow = nullptr;
-    nr.dGmHalfF = nullptr;
-    nr.dGmFlowF = nullptr;
     nr.dGmMetric = nullptr;
     nr.dGmFlowP[0] = nr.dGmFlowP[1] = nullptr;
     nr.dGmMetP[0] = nr.dGmMetP[1] = nullptr;
@@ -12107,23 +11981,6 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         nr.die("gmfss motion halves launch failed");
         return false;
     }
-    // at a flow grid (live --gmfss-flow): gmflow reads both halves shrunk to it (one launch: mv1 = mv0 + 3 planes), B's
-    // flow comes back to the half through k_gmFlowUp; metricnet and everything after it read the halves
-    float* g0 = mv0;
-    float* g1 = mv1;
-    if (nr.gfh)
-    {
-        int six = 6;
-        void* as[] = {(void*)&mv0, &six, &nr.hw, &nr.hh, (void*)&nr.dGmHalfF, &nr.gfw, &nr.gfh};
-        if (cuLaunchKernel(nr.fGmShrink, (nr.gfw + 15) / 16, (nr.gfh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, as,
-                           nullptr) != CUDA_SUCCESS)
-        {
-            nr.die("gmfss flow grid shrink launch failed");
-            return false;
-        }
-        g0 = nr.dGmHalfF;
-        g1 = nr.dGmHalfF + 3 * (size_t)nr.gfh * nr.gfw;
-    }
     nvinfer1::IExecutionContext* ctx = nullptr;
     if (profPair)
         cudaEventRecord(nr.gmEv[2], st);
@@ -12144,8 +12001,8 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
             mapsOk = cudaMemcpyAsync(nr.dGmMap[i], (uint8_t*)nr.dGmMap[i] + nr.gmMapSlot[i], nr.gmMapSlot[i],
                                      cudaMemcpyDeviceToDevice, st) == cudaSuccess;
     else
-        mapsOk = backbone(g0, 0);
-    if (!mapsOk || !backbone(g1, 1))
+        mapsOk = backbone(mv0, 0);
+    if (!mapsOk || !backbone(mv1, 1))
     {
         nr.die("gmfss gmflow_backbone enqueueV3 returned false");
         return false;
@@ -12158,8 +12015,8 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     ctx = nr.ctxGm[7];
     ctx->setTensorAddress("map4", nr.dGmMap[0]);
     ctx->setTensorAddress("map8", nr.dGmMap[1]);
-    ctx->setTensorAddress("img0", g0);
-    ctx->setTensorAddress("img1", g1);
+    ctx->setTensorAddress("img0", mv0);
+    ctx->setTensorAddress("img1", mv1);
     ctx->setTensorAddress("mf", nr.dGmM[0]);
     ctx->setTensorAddress("mq", nr.dGmM[1]);
     ctx->setTensorAddress("mk", nr.dGmM[2]);
@@ -12202,8 +12059,8 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     ctx = nr.ctxGm[1];
     ctx->setTensorAddress("map4", nr.dGmMap[0]);
     ctx->setTensorAddress("map8", nr.dGmMap[1]);
-    ctx->setTensorAddress("img0", g0);
-    ctx->setTensorAddress("img1", g1);
+    ctx->setTensorAddress("img0", mv0);
+    ctx->setTensorAddress("img1", mv1);
     ctx->setTensorAddress("prop", nr.dGmProp);
     for (int i = 0; i < 8; i++)
         ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
@@ -12232,24 +12089,13 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     ctx->setTensorAddress("corr", nr.dGmCorr);
     for (int i = 3; i < 8; i++)
         ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
-    ctx->setTensorAddress("img0", g0);
-    ctx->setTensorAddress("img1", g1);
-    ctx->setTensorAddress("flow", nr.gfh ? nr.dGmFlowF : nr.dGmFlow);
+    ctx->setTensorAddress("img0", mv0);
+    ctx->setTensorAddress("img1", mv1);
+    ctx->setTensorAddress("flow", nr.dGmFlow);
     if (!ctx->enqueueV3(st))
     {
         nr.die("gmfss gmflow_bidir_b enqueueV3 returned false");
         return false;
-    }
-    if (nr.gfh)
-    {
-        int planes = 4;
-        void* au[] = {(void*)&nr.dGmFlowF, &planes, &nr.gfw, &nr.gfh, (void*)&nr.dGmFlow, &nr.hw, &nr.hh};
-        if (cuLaunchKernel(nr.fGmFlowUp, (nr.hw + 15) / 16, (nr.hh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, au,
-                           nullptr) != CUDA_SUCCESS)
-        {
-            nr.die("gmfss flow grid upsample launch failed");
-            return false;
-        }
     }
     nr.gmMapsNext = true; // slot 1 = the new frame's maps = the next pair's previous frame
     if (profPair)

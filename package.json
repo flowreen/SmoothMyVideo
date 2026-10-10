@@ -4,12 +4,15 @@
   "description": "Desktop GUI for AI video frame interpolation (GMFSS), native TensorRT engine under the hood",
   "author": "Florin Nutiu",
   "main": "dist/main.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "start": "tsc && electron .",
-    "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.js && node scripts/stage-gpu-runtime.js && node scripts/export-onnx.js && npm start",
-    "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && node scripts/stage-gpu-runtime.js --required && node scripts/export-onnx.js --required && electron-builder && node scripts/pack-zip.js",
-    "lint": "prettier --write \"src/**/*.ts\" \"scripts/*.js\" && tsc --noEmit && pyright && node scripts/clang-format.js",
-    "postinstall": "node scripts/dev-icon.js"
+    "start": "tsc && tsc -p tsconfig.renderer.json && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && electron .",
+    "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.ts && node scripts/stage-gpu-runtime.ts && node scripts/export-onnx.ts && npm start",
+    "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && tsc -p tsconfig.renderer.json && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && node scripts/stage-gpu-runtime.ts --required && node scripts/export-onnx.ts --required && electron-builder && node scripts/pack-zip.ts",
+    "lint": "prettier --write \"src/**/*.ts\" \"scripts/*.ts\" && tsc --noEmit && tsc -p tsconfig.scripts.json && tsc -p tsconfig.renderer.json && pyright && node scripts/clang-format.ts",
+    "postinstall": "node scripts/dev-icon.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
@@ -30,6 +33,7 @@
     "files": [
       "dist/**/*",
       "renderer/**/*",
+      "!renderer/app.ts",
       "icon.ico",
       "icon.png"
     ],

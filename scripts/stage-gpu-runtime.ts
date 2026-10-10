@@ -1,4 +1,4 @@
-// scripts/stage-gpu-runtime.js
+// scripts/stage-gpu-runtime.ts
 //
 // npm setup and dist: copy the CUDA 13 + TensorRT-RTX DLLs the native host (engine/live/smv-live.exe)
 // loads out of the dev python's wheels (engine/runtime, never shipped) into engine/gpu_runtime
@@ -10,16 +10,15 @@
 // engine/runtime yet); `--required` (dist) fails the build instead, so a release never ships
 // without them.
 
-'use strict';
-const fs = require('fs');
-const path = require('path');
+import fs from 'node:fs';
+import path from 'node:path';
 
-const ENGINE = path.resolve(__dirname, '..', 'engine');
+const ENGINE = path.resolve(import.meta.dirname, '..', 'engine');
 const SP = path.join(ENGINE, 'runtime', 'Lib', 'site-packages');
 const OUT = path.join(ENGINE, 'gpu_runtime');
 const required = process.argv.includes('--required');
 
-function fail(msg) {
+function fail(msg: string): void {
   if (required) {
     console.error(`[stage-gpu-runtime] ${msg}`);
     process.exit(1);
@@ -27,17 +26,17 @@ function fail(msg) {
   console.warn(`[stage-gpu-runtime] ${msg} - skipping; renders need engine/gpu_runtime.`);
 }
 
-function stage() {
+function stage(): void {
   const cuda = path.join(SP, 'nvidia', 'cu13', 'bin', 'x86_64');
   const trt = path.join(SP, 'tensorrt_rtx_libs');
   if (!fs.existsSync(cuda) || !fs.existsSync(trt)) return fail(`no CUDA 13 / TensorRT-RTX wheels under ${SP}`);
   const info = fs.readdirSync(SP).find((n) => /^tensorrt_rtx_cu13-.+\.dist-info$/.test(n));
   if (!info) return fail(`no tensorrt_rtx_cu13-*.dist-info under ${SP}`);
   const builtins = fs.readdirSync(cuda).filter((n) => /^nvrtc-builtins64_\d+\.dll$/i.test(n));
-  const want = [
+  const want: [string, string][] = [
     [cuda, 'cudart64_13.dll'],
     [cuda, 'nvrtc64_130_0.dll'],
-    ...builtins.map((n) => [cuda, n]),
+    ...builtins.map((n): [string, string] => [cuda, n]),
     [trt, 'tensorrt_rtx_1_6.dll'],
     [trt, 'tensorrt_onnxparser_rtx_1_6.dll'],
   ];

@@ -1,0 +1,7 @@
+# GitHub language stats (linguist) only; no effect on git itself.
+# Third-party model code and SDK headers, kept in the repo for the ONNX export and the build:
+engine/GMFSS_Fortuna/** linguist-vendored
+engine/rife/** linguist-vendored
+engine/live/build_src/nvofa/** linguist-vendored
+# Our headers are C++ (linguist reads a bare .h as C):
+*.h linguist-language=C++

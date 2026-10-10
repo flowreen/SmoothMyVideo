@@ -1,5 +1,5 @@
 # The C++ style of our native sources (engine/*/build_src), applied by `npm run lint` through
-# scripts/clang-format.js with the clang-format that ships with Visual Studio. Visual Studio's own preset;
+# scripts/clang-format.ts with the clang-format that ships with Visual Studio. Visual Studio's own preset;
 # the keys below it only keep every token as written: includes keep their order, string literals are never
 # split and comments are never re-wrapped, so a formatting pass changes whitespace and nothing else.
 BasedOnStyle: Microsoft

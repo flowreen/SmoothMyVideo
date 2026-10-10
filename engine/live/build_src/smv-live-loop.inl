@@ -937,7 +937,7 @@ static bool resizeSettle(HWND target, Host& host, const Capture& cap, Hud& hud, 
     ShowWindow(host.hwnd, SW_HIDE); // the old-size frames no longer cover the window
     if (hud.hwnd)
     {
-        _snwprintf_s(hud.text, _TRUNCATE, L"SMV Live: loading %ls...", loadingWhat().c_str());
+        _snwprintf_s(hud.text, _TRUNCATE, L"SMV Live: Loading %ls...", loadingWhat().c_str());
         hud.show(!hidden);
         SetWindowPos(hud.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         hud.paint();
@@ -1472,12 +1472,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     const std::wstring what = loadingWhat();
                     const wchar_t* nm = what.c_str();
                     if (g_modelNote.empty())
-                        LOG("loading %ls (first build at this resolution can take up to a minute)...\n", nm);
+                        LOG("Loading %ls (first build at this resolution can take up to a minute)...\n", nm);
                     else
-                        LOG("loading %ls (%ls; first build at this resolution can take up to a minute)...\n", nm,
+                        LOG("Loading %ls (%ls; first build at this resolution can take up to a minute)...\n", nm,
                             g_modelNote.c_str());
                     if (hud.hwnd)
-                        _snwprintf_s(hud.text, _TRUNCATE, L"SMV Live: loading %ls...", nm);
+                        _snwprintf_s(hud.text, _TRUNCATE, L"SMV Live: Loading %ls...", nm);
                     announced = true;
                 }
                 // keep the loading note on top of the passthrough presents (each Present leaves

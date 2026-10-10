@@ -252,27 +252,19 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA Optical Flow API 5.0, run by the driver on the GPU's optical-flow engine. Quality: Slow, the engine's highest quality level.">
-        <input type="checkbox" id="modelnvof"
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: GMFSS_Fortuna, union model (GMFlow with Softmax Splatting)">
+        <input type="checkbox" id="modelgmfss" checked
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA Optical Flow <span class="hint">(NVIDIA's optical-flow hardware; very fast motion goes soft)</span>
+        GMFSS <span class="hint">(AI, best quality for anime, the default; heavy on the GPU. Too slow? <span class="lonly">Lower the DLSS mode above, or pick</span><span class="vonly">Pick</span> NVIDIA Optical Flow below)</span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: GMFSS_Fortuna, union model">
-        <input type="checkbox" id="modelgmfss" checked
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA Optical Flow API 5.0, run by the driver on the GPU's optical-flow engine. Quality: Slow, the engine's highest quality level.">
+        <input type="checkbox" id="modelnvof"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        GMFSS <span class="hint">(GMFlow with Softmax Splatting: AI, best quality for anime, the default)</span>
+        <span style="white-space:nowrap;">NVIDIA Optical Flow</span> <span class="hint">(NVIDIA's optical-flow hardware: really high fps, light on the GPU, friendly to slower PCs; very fast motion goes soft)</span>
       </label>
-    </div>
-    <div class="row lonly" id="gmflowrow">
-      <span class="k"></span>
-      <span class="hint" style="display:flex;align-items:center;gap:8px;" title="GMFSS estimates the motion at this share of its size, 25% to 100%. Lower is faster; small fast-moving objects can blur more. The motion size never goes below 320x192, so on smaller windows the low end stops there.">
-        GMFSS flow scale
-        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="gmflow" type="range" min="25" max="100" step="5" value="100" style="width:150px" aria-label="GMFSS flow scale"></span>
-        <span class="v" id="gmflownum">100%</span>
-      </span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -300,18 +292,18 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA NvOFFRUC from the Optical Flow SDK 5.0.7">
-        <input type="checkbox" id="modelfruc"
-               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA Smooth Motion <span class="hint">(NVIDIA's optical-flow hardware; the lowest quality, varies run to run)</span>
-      </label>
-    </div>
-    <div class="row">
-      <span class="k"></span>
       <label class="hint" id="modelfsrfglabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 4.0.1 frame generation (FidelityFX SDK 2.3.0). Motion vectors: NVIDIA Optical Flow at Slow, its highest quality level.">
         <input type="checkbox" id="modelfsrfg"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         <span style="white-space:nowrap;">AMD FSR 4</span> <span class="hint">(AI frame generation from games)</span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA NvOFFRUC from the Optical Flow SDK 5.0.7">
+        <input type="checkbox" id="modelfruc"
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        <span style="white-space:nowrap;">NVIDIA Smooth Motion</span> <span class="hint">(NVIDIA's optical-flow hardware; the lowest quality, varies run to run)</span>
       </label>
     </div>
     <div id="dlsssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">

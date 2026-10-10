@@ -52,21 +52,25 @@ RTX VSR / HDR and all three codecs.
   code and real dovi_tool / hdr10plus_tool runs, files byte-exact) and `ts6d2\gate_6d2.py` (9,130
   cases against render.py's own functions incl. real salvage / trim / concat of torn part files and
   pause previews, files byte-exact), all 0 differences.
-* `renderer/index.html` + `renderer/app.js`: the whole UI (markup and CSS in the HTML, a small
+* `renderer/index.html` + `renderer/app.ts`: the whole UI (markup and CSS in the HTML, a small
   inline script that sets the mode class before the body renders) plus its progress / ETA / IPC
-  logic in `app.js`, loaded by a plain `<script src="app.js">` at the end of the body; both are
-  loaded directly by Electron (no build step: edit and relaunch). Panels sit in engine pass order and
+  logic in `app.ts`, loaded as `app.js` by a plain `<script src="app.js">` at the end of the body.
+  `app.ts` is a classic script (no imports), type-checked by `tsc -p tsconfig.renderer.json` (no emit;
+  `$()` returns `any`, so DOM element properties are not checked yet) and turned into the git-ignored
+  `app.js` by `scripts/build-renderer.ts`: Node's type stripper blanks the annotations and changes
+  nothing else, so `app.js` is the program as written, line for line (tsc's own emit would prepend
+  `"use strict"`). `npm start` and `dist` run both steps. Panels sit in engine pass order and
   are numbered by a CSS counter that skips hidden panels (`.panel.step`): Restore, Interpolate,
   Upscale, DLSS 5, Sharpen, HDR, Dolby Vision, HDR10+, Output. A Video / Live switch
   (`localStorage.uiMode`) puts `mode-video` or `mode-live` on `<html>`; `.vonly` and `.lonly`
   elements show in one mode only. Settings persist in `localStorage` (Restore and Dynamic Vibrance
   are per-session opt-ins by design). After any edit of either file run `python scripts/scan_index.py`
-  (duplicate ids, dangling `$()` refs from both files, every `<script src>` resolving, `node --check`
-  on the inline script and on `app.js`); a duplicate id once made the codec selection silently
+  (it builds `app.js` first; duplicate ids, dangling `$()` refs from both files, every `<script src>`
+  resolving, `node --check` on the inline script and on `app.js`); a duplicate id once made the codec selection silently
   never reach the engine. The renderer uses `require('electron')`, so it cannot run in a browser.
 * `engine/gpu_runtime/`: the CUDA 13 runtime + NVRTC and TensorRT-RTX (+ its ONNX parser) DLLs the
   host loads, plus `tensorrt_rtx_version.txt` (the version baked into every engine name). Staged
-  from the dev python's wheels by `scripts/stage-gpu-runtime.js` (setup; required in dist),
+  from the dev python's wheels by `scripts/stage-gpu-runtime.ts` (setup; required in dist),
   gitignored, shipped.
 * DEV TOOLS (python, need `engine/runtime`, never shipped: the dist filter drops `runtime/**` and
   every `*.py`): `engine/onnx_export.py` and what it imports, below.
@@ -88,7 +92,7 @@ RTX VSR / HDR and all three codecs.
   graph's SIZE-FREE ONNX in `engine/onnx` (every H / W symbolic, the engine still pinned to one
   size). The graphs: the RIFE IFNet classes, encode, block0, Restore and the GMFSS nets (GMFlow as
   two graphs around its local correlation, see the GMFlow bullets below). The
-  files come from the committed weights (`engine/onnx_export.py`, run by `scripts/export-onnx.js` in `npm run setup`
+  files come from the committed weights (`engine/onnx_export.py`, run by `scripts/export-onnx.ts` in `npm run setup`
   and, required, in `npm run dist`; gitignored, shipped in the release); the host builds every
   engine from them (the offline fixed-batch `_b{B}` classes from the `_bd8` graph, batch pinned).
   After the exports the script tidies the folder for shipping: a graph it did not produce is
@@ -102,7 +106,7 @@ RTX VSR / HDR and all three codecs.
   the torch / onnx / onnxscript / onnx-ir versions and the weight files) plus `trt_lookup.HOST_BUILD`,
   the host builder's settings that change an engine but not its graph; `weights_tags.txt`
   records it (`export <stamp>`, the host ignores it), and an export whose stamp differs removes the
-  folder's graphs and exports every one again; so run `node scripts/export-onnx.js` after any
+  folder's graphs and exports every one again; so run `node scripts/export-onnx.ts` after any
   change under `engine`. The engine cache stamp is `weights_tags.txt` plus the TensorRT-RTX
   version: at app start and CLI start `src/render/cache.ts` compares it with
   `engine_stamp.txt` in the cache folder and, when it differs, empties the folder once (every
@@ -276,8 +280,9 @@ RTX VSR / HDR and all three codecs.
   shipped (see Setup).
 * `engine/bin/`: bundled `ffmpeg.exe` + `ffprobe.exe` + DLLs, fetched, not committed.
 * `engine/onnx/`: the size-free ONNX graphs engines are built from, generated, not committed.
-* `scripts/`: `fetch-ffmpeg.js`, `stage-gpu-runtime.js`, `export-onnx.js`, `dev-icon.js`,
-  `scan_index.py`, `smoke.py`.
+* `scripts/`: the build scripts `fetch-ffmpeg.ts`, `stage-gpu-runtime.ts`, `export-onnx.ts`, `dev-icon.ts`,
+  `clang-format.ts`, `pack-zip.ts`, `build-renderer.ts` (TypeScript that Node 24 runs directly, no build step: `scripts/package.json`
+  makes them ES modules, `tsconfig.scripts.json` type-checks them), plus `scan_index.py`, `smoke.py`.
 
 Doc policy: README.md and this file are the only docs. No per-component BUILD.md files (a
 provenance note beside vendored third-party headers, `engine/live/build_src/nvofa/README.md`, is
@@ -289,12 +294,13 @@ Weights ship in git. Fetched or copied: `engine/bin` (ffmpeg, about 137 MB) and 
 `engine/runtime` (about 5.7 GB, never shipped); `engine/gpu_runtime` (about 345 MB) and
 `engine/onnx` are generated from it. All must exist before `npm run dist`.
 
-1. Dependencies and ffmpeg:
+1. Dependencies and ffmpeg (Node 24 or later: the build scripts, `postinstall`'s included, are TypeScript
+   that Node runs directly; `package.json` `engines` says so):
    ```
    npm install
-   node scripts/fetch-ffmpeg.js
+   node scripts/fetch-ffmpeg.ts
    ```
-   `fetch-ffmpeg.js` downloads the BtbN win64 LGPL shared build into `engine/bin` (idempotent). If
+   `fetch-ffmpeg.ts` downloads the BtbN win64 LGPL shared build into `engine/bin` (idempotent). If
    the Electron binary did not download: `node node_modules/electron/install.js`.
 2. The dev python into `engine/runtime` (release zips up to 1.0.3 carry a copy in
    `resources/engine/runtime`; later ones ship none):
@@ -309,8 +315,8 @@ Weights ship in git. Fetched or copied: `engine/bin` (ffmpeg, about 137 MB) and 
      cu13 wheels (the `-cu13` names are dead placeholders), `tensorrt-rtx-cu13` (cp314 wheels exist
      from 1.6.1.120 up, never pin below) and onnx / onnxscript. Never use a `venv`: a Windows venv is
      not relocatable.
-3. `node scripts/stage-gpu-runtime.js` (the host's DLLs into `engine/gpu_runtime`) and
-   `node scripts/export-onnx.js` (the size-free ONNX into `engine/onnx`); `npm run setup` runs both.
+3. `node scripts/stage-gpu-runtime.ts` (the host's DLLs into `engine/gpu_runtime`) and
+   `node scripts/export-onnx.ts` (the size-free ONNX into `engine/onnx`); `npm run setup` runs both.
 
 Refreshing bundled binaries: for ffmpeg delete `engine/bin` and re-run the fetch script, or drop a
 matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across builds). Weights
@@ -318,7 +324,7 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
 
 ## Scripts
 
-* `npm start`: `tsc` then launch.
+* `npm start`: `tsc`, the renderer's type check and build (`app.ts` -> `app.js`), then launch.
 * `npm run setup`: clean `node_modules` + `engine/bin`, `npm install`, fetch ffmpeg, stage
   `engine/gpu_runtime` and export the size-free ONNX (both skipped with a warning when
   `engine/runtime` is not there yet; run step 3 of Setup by hand after step 2), start. Never
@@ -332,10 +338,12 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
   `%ProgramFiles%\7-Zip`, or `SMV_7Z` naming it). The staging folder is deleted after 7-Zip's
   own test reads every file back and finds the folder's file count and bytes. `extraResources` copies `engine/**` minus `runtime/**`, every
   `*.py` and the other filtered paths, so no stray folders may sit under `engine` at build time.
-* `npm run lint`: Prettier writes `src/**/*.ts` and `scripts/*.js`, then `tsc --noEmit`, then pyright on
+* `npm run lint`: Prettier writes `src/**/*.ts` and `scripts/*.ts`, then `tsc --noEmit` and
+  `tsc -p tsconfig.scripts.json` (the build scripts) and `tsc -p tsconfig.renderer.json` (the
+  renderer), then pyright on
   `engine`, `scripts` and `tools`, then clang-format writes our own C++ (see Linting and formatting).
   Stops at the first failure.
-* `postinstall` runs `scripts/dev-icon.js`, stamping `icon.ico` into the dev Electron exe so
+* `postinstall` runs `scripts/dev-icon.ts`, stamping `icon.ico` into the dev Electron exe so
   `npm start` shows the app icon (a stale Explorer icon cache refreshes on the next reboot).
 * `python scripts\smoke.py [--full]` (any python 3, stdlib only): real renders through
   `dist\render\cli.js` under the Electron binary in node mode (what the app runs) on
@@ -345,7 +353,7 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
   engine change (`npx tsc` first). Checks are structural, plus one frame-md5 check with `--full`:
   the resident host's second RIFE render must decode to the first one's frames; `--trt` is accepted
   and ignored.
-* `python scripts/scan_index.py`: the renderer scan described above (`index.html` + `app.js`).
+* `python scripts/scan_index.py`: the renderer scan described above (`index.html` + `app.ts`, built into `app.js` first).
 
 ## Engine CLI
 
@@ -518,6 +526,13 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   lost small fast objects at 50 %; the flag is now refused. The re-add recipe, the pre-removal
   file snapshot and the reverse patch are in `D:\AIStuff\smv-flowscale-removal\README.md`
   (outside the repo).
+* The live GMFSS flow scale (`--gmfss-flow`, the GUI's GMFSS flow scale slider, 25 to 100 %, 2026-10-06)
+  was REMOVED 2026-10-10: it shrank gmflow alone, once a source frame, so it paid only where few
+  in-between frames fit (1440p Quality 33 -> 9.4 ms a pair) and barely at a small DLSS share (1080p
+  at 40 %: about 1.7 ms a pair); the DLSS mode is GMFSS's speed lever in Live, as for every model. A
+  live command line that still passes the flag has it ignored (the live parser skips unknown flags);
+  offline it is refused (`unknown argument`). The re-add recipe, the pre-removal snapshot and the
+  reverse patch are in `D:\AIStuff\smv-gmfss-flow-removal\README.md` (outside the repo).
 * `--scale MODE|F` (the GUI's DLSS mode): the WORKING size, NVIDIA's DLSS modes as the share of the
   output per axis: `dlaa` 1 (the default, the output itself), `quality` 1 / 1.5, `balanced`
   1 / 1.724, `performance` 1 / 2, `ultra` 1 / 3, `auto` by the output's pixel count (below 1080p
@@ -811,7 +826,6 @@ smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
   --backend NAME --gen N --target FPS --scale MODE|0.01..1 --auto-floor MODE --fit fill|monitor --sharpen S --rtx-vsr | --fsr-upscale --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --nr-passes 1..10 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
-  --gmfss-flow 0.25..1
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
 smv-live.exe --restore-mouse   gives back the pointer speed and clip a killed or crashed Fill session held (main.ts
                runs it when %TMP%\smv-live-mouse.txt outlives the host; every live session start does the same)
@@ -1580,8 +1594,8 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   `FeatureTransformer._forward_windowed`; set per variant by `onnx_export.GMFLOW_TOKEN_OUTER`), so an
   attention reads its group's slice in the layout TensorRT's fused attention kernel takes; window
   order cost three copies into it and one out per attention. The cross attention's partner = the
-  frame halves swapped. At 160 W, A against window order: the whole graph x0.86 (the flow-scale
-  floor), g2 x0.88 (Ultra's half), g4 x0.90 (Performance's, context 164 -> 177 MiB), g8 x0.90 / x0.94
+  frame halves swapped. At 160 W, A against window order: the whole graph x0.86 (the smallest
+  halves), g2 x0.88 (Ultra's half), g4 x0.90 (Performance's, context 164 -> 177 MiB), g8 x0.90 / x0.94
   (Balanced / Quality, 239 -> 279 MiB and 343 -> 363), g8r x0.94 (DLAA's, 1769 -> 1668 MiB). The
   coarse scale (attn_num_splits 2, in `_m`) is token-outer where it timed faster: the whole graph
   x0.80, g2 x0.97, g8r x0.99; g4 and g8 keep it in window order (token-outer x1.03 on g4, window
@@ -1615,17 +1629,6 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   g2 0.99, g1 1.01 (noise level); the A context 244 -> 162 MiB at Balanced, 474 -> 283 at the offline
   1080p half. The windowed path (`_m`'s coarse scale where it is not token-outer) keeps the repeat: the
   same rewrite there measured 14 to 23 % slower.
-* Live GMFSS flow scale (the GUI's GMFSS flow scale slider, 25 to 100 %, main.ts `--gmfss-flow F`): gmflow's three
-  engines (backbone, `gmflow_bidir_a` / `_b`) run on the /32 grid nearest F x the half (`GMFSS_infer_u.reuse`'s
-  `round(n * F / 32) * 32`, Python's half-to-even rounding), never below 320 x 192: at a 256 x 128 grid (1080p at 25 %,
-  540p at 50 %) GMFlow moved 28 % of a static frame's pixels by more than 16 levels and lost a known pan (20 dB against
-  46 at the half); 320 x 192 and up were clean (`SMV_GMFSS_FLOW_FLOOR=0` = 32 px, the A/B lever). `k_gmShrinkAa`
-  shrinks both halves to the grid as `F.interpolate(..., antialias=True)` does and `k_gmFlowUp` brings the two flows
-  back (bilinear times the per-axis ratio); metricnet and everything after it read the halves. Both kernels are
-  fp64-free and within 1.7e-7 / 2.5e-5 px of an fp64 reference (torch's own fp32 resize is off by up to 4.3e-3 px at
-  odd ratios); product vs eager fp32 tweens on the user's anime clip match the 100 % parity at every grid (480p and
-  1080p, 46 to 48 dB pooled; harness `gmfss_flow_scale` `kernel_gate.py` / `offline_gate.py`). Offline the host takes
-  the flag as a gate lever only; the warm marker key stays `|0x0` (fusionnet does not change with the grid).
 * RIFE engines build at the true /64-padded shape. The 1152x640 safe-zone floor that the TRT-RTX
   1.5 small-shape hang forced is off on 1.6.1 (bare-enqueue repros and live soaks clean);
   `SMV_RIFE_SAFEPAD=1` (offline) and `SMV_LIVE_SAFEPAD=1` (live) restore it. Any TRT-RTX bump must
@@ -1700,7 +1703,6 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_OFVEC_GRID4=1` | AMD FSR's motion vectors (frame generation and upscaling) at optical flow grid 4 + the bilinear upsample (`k_nvofUp`) instead of grid 1 (frame generation 1080p fast: a call 9.5 -> 3.5 ms; at fast it breaks too, later); A/B lever, never a product setting |
 | `SMV_OFVEC_COST=1` | AMD FSR's motion vectors: the Optical Flow engine's cost output on (FSR reads no cost; off by default, the same vectors byte for byte, ~2 to 3 % less Optical Flow time); A/B lever, never a product setting |
 | `SMV_FSRFG_PROF=1` / `SMV_FSRUP_PROF=1` | AMD FSR frame generation / upscaling: CUDA events between a call's stages (the copies, the Optical Flow inputs, the Optical Flow, the vector kernels, FSR itself, the unpack), `[fsrfg-prof]` / `[fsrup-prof]` ms a call at the session's end; every call then waits for its last event (profiling only, slower) |
-| `SMV_GMFSS_FLOW_FLOOR=0` | live GMFSS flow scale: the grid floor at 32 px instead of 320 x 192 (the 256 x 128 wobble repro); A/B lever, never a product setting |
 | `SMV_FSRFG_OVERLAP=0` / `SMV_FSRFG_OVERLAP=fail` | AMD FSR frame generation: every call's vectors in its turn instead of the next call's on a side stream during each FSR call (tree levels with two or more calls, x4 and up) / the side session's setup fails after a whole one, the trigger of its fallback (`the side Optical Flow session did not start`; route gate only); A/B levers, never a product setting |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
@@ -2091,7 +2093,7 @@ Standard presets, applied by tools, so whoever edits (a person or an agent) neve
 by hand: run `npm run lint` after a change. The engine Python and the renderer's inline JS are not
 reformatted.
 * Prettier (`.prettierrc.json`: Prettier's defaults plus single quotes and printWidth 120) formats
-  `src/**/*.ts` and `scripts/*.js` only; `.prettierignore` guards `engine/`, `renderer/` and build dirs.
+  `src/**/*.ts` and `scripts/*.ts` only; `.prettierignore` guards `engine/`, `renderer/` and build dirs.
 * `tsc --noEmit` with `strict` on is the TypeScript bug gate. ESLint was dropped when moving to
   TypeScript 7 (typescript-eslint pinned the old compiler).
 * pyright (`pyrightconfig.json`) type-checks `engine`, `scripts` and `tools` in its default `standard`
@@ -2100,7 +2102,7 @@ reformatted.
   cache dirs are excluded.
 * clang-format (`.clang-format`: Visual Studio's own `Microsoft` preset with `Type* p`; includes keep
   their order, string literals are never split and comments never re-wrapped, so a pass changes
-  whitespace only) formats our own C++ through `scripts/clang-format.js` (`--check` = report only;
+  whitespace only) formats our own C++ through `scripts/clang-format.ts` (`--check` = report only;
   extra file arguments are formatted too): the native host (`engine/live/build_src`), the DLSS 5 core
   and its caller shim (`engine/dlssnr/build_src`), the DLSS 4.5 host's `main.cpp` and the FRUC bridge.
   Left as they are: the vendored NVIDIA headers (`nvofa`, `cuda_shim`), the RTX Video SDK bridge
@@ -2117,7 +2119,7 @@ deletes the lockfile.
 ## Releasing
 
 GitHub hosts everything: the release page carries the `.7z`, its `.sha256` and the notes (a
-release asset must stay under 2 GiB; `pack-zip.js` refuses an archive of 2 GB or more), and GitHub
+release asset must stay under 2 GiB; `pack-zip.ts` refuses an archive of 2 GB or more), and GitHub
 adds the source archives of the tag itself.
 
 1. Bump `version` in `package.json`, commit, push.

@@ -53,7 +53,7 @@ function fmtFinish(s){ const d = new Date(Date.now() + Math.max(0,s)*1000);   //
   return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+' '
        + String(d.getDate()).padStart(2,'0')+'-'+MONTHS[d.getMonth()]+'-'+d.getFullYear(); }
 
-const $ = (id) => document.getElementById(id);
+const $ = (id: string): any => document.getElementById(id);
 // Stored-settings schema version: bump whenever a localStorage key or its scale/meaning changes,
 // and the first launch of the new build wipes every stored setting once, so stale keys can never
 // conflict with the new UI (e.g. an HDR slider rescale or a key rename).
@@ -97,7 +97,7 @@ setMode(uiMode);
 function log(t){ $('log').textContent += t; $('log').scrollTop = $('log').scrollHeight; }
 // Reveal the operational UI (controls, preview, progress, log). The first page shows it WITH the welcome/drop hint
 // still visible (keepWelcome); loading a video (or an RTX install) hides the welcome panel too.
-function showWorkspace(keepWelcome){
+function showWorkspace(keepWelcome?){
   if(!keepWelcome) $('welcome').style.display = 'none';
   $('workspace').style.display = '';
 }
@@ -596,7 +596,7 @@ async function checkRtxReady(){
 async function doInstall(source){
   $('rtxsetup').style.display = 'block';   // show install progress (checkRtxReady collapses it again on success)
   $('rtxstatus').textContent = 'installing...'; $('rtxstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('rtx-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
+  let r: any = {}; try { r = await ipcRenderer.invoke('rtx-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
   if(!r.ok) $('rtxsteps').innerHTML = '✗ ' + (r.error || 'install failed')
       + '<br>Pick the downloaded RTX_Video_SDK&hellip;.zip again with <b>Choose .zip&hellip;</b>.';
   await checkRtxReady();
@@ -634,7 +634,7 @@ ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); s
 // Readiness = the shim + runtime present (dlssnr-ready). The two sliders are NVIDIA's global developer
 // controls, Structure Intensity and Tone Intensity (0..2, default 1.00); the pass always runs at
 // full resolution (no quality selector, by decision).
-let dlssnrReady = { ready:false };
+let dlssnrReady: any = { ready:false };
 function nrOn(){ return $('dlssnr').checked && !!dlssnrReady.ready; }
 function nrStructure(){ return parseFloat($('nrstructure').value) || 0; }
 function nrTone(){ return parseFloat($('nrtone').value) || 0; }
@@ -682,7 +682,7 @@ function dlssnrInstallNote(r){   // one line about what got installed (known bui
 async function doDlssnrInstall(source){
   $('dlssnrsetup').style.display = 'block';
   $('dlssnrstatus').textContent = 'installing...'; $('dlssnrstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('dlssnr-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
+  let r: any = {}; try { r = await ipcRenderer.invoke('dlssnr-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
   if(!r.ok) $('dlssnrsteps').innerHTML = '✗ ' + (r.error || 'install failed')
       + '<br>Pick the file again with <b>Choose nvngx_dlssnr.dll&hellip;</b>.';
   await checkDlssnrReady();
@@ -694,14 +694,14 @@ let dlssnrDownloading = false;
 ipcRenderer.on('dlssnr-progress', (_e, p) => {
   if(!dlssnrDownloading) return;
   const mb = x => (x / 1048576).toFixed(0);
-  $('dlssnrstatus').textContent = p.stage === 'verify' ? 'verifying checksum...' : 'downloading... ' + mb(p.received) + ' / ' + mb(p.total) + ' MB';
+  $('dlssnrstatus').textContent = p.stage === 'verify' ? 'Verifying checksum...' : 'Downloading... ' + mb(p.received) + ' / ' + mb(p.total) + ' MB';
 });
 async function doDlssnrDownload(){
   if(dlssnrDownloading) return;
   dlssnrDownloading = true; $('dlssnrdl').disabled = true; $('dlssnrbrowse').disabled = true;
   $('dlssnrsetup').style.display = 'block';
-  $('dlssnrstatus').textContent = 'downloading...'; $('dlssnrstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('dlssnr-download'); } catch(e){ r = { ok:false, error:String(e) }; }
+  $('dlssnrstatus').textContent = 'Downloading...'; $('dlssnrstatus').style.color = 'var(--sub)';
+  let r: any = {}; try { r = await ipcRenderer.invoke('dlssnr-download'); } catch(e){ r = { ok:false, error:String(e) }; }
   dlssnrDownloading = false; $('dlssnrdl').disabled = false; $('dlssnrbrowse').disabled = false;
   await checkDlssnrReady();
   if(!r.ok){
@@ -820,7 +820,7 @@ function pickModel(box){
 async function doFrucInstall(source){
   $('frucsetup').style.display = 'block';
   $('frucstatus').textContent = 'installing...'; $('frucstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('fruc-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
+  let r: any = {}; try { r = await ipcRenderer.invoke('fruc-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
   await refreshFrucState();
   if(frucReady){ $('modelfruc').checked = true; $('modelgmfss').checked = false; localStorage.setItem('interpModel','fruc'); $('frucsetup').style.display = 'none'; }
   else if(r.ok){   // NvOFFRUC.dll copied fine; readiness just needs the one-time bridge build
@@ -962,9 +962,7 @@ function lvSendOpts(){
     hud: $('lvhud').checked,
     hudlat: $('lvhudlat').checked,
     gpufit: $('gpufit').checked,
-    gmflow: (+$('gmflow').value || 100) / 100,   // GMFSS's flow scale (--gmfss-flow below 1)
   });
-  $('gmflowrow').style.display = mi.model === 'gmfss' ? '' : 'none';
   const load = mi.model === 'rife' ? 'starts in ~3s (~45s the first time at a new window size)'
     : mi.model === 'rifedrba' ? 'starts in ~3s (~55s the first time at a new window size)'
     : mi.model === 'gmfss' ? 'loads in ~4s (~30s the first time at a new window size)'
@@ -1047,17 +1045,6 @@ $('lvhudlat').onchange = () => { localStorage.setItem('lvHudLat', $('lvhudlat').
 if(localStorage.getItem('gpuFit') === '0') $('gpufit').checked = false;
 $('gpufit').onchange = () => { localStorage.setItem('gpuFit', $('gpufit').checked ? '1' : '0'); lvSendOpts();
   if(lvState === 'running') ipcRenderer.send('lv-restart'); };
-// GMFSS flow scale (Live, shown while GMFSS is the model): 25..100 % in 5 % steps, default 100 %; a spawn-time flag
-// (--gmfss-flow), so a running session restarts when the drag ends
-{
-  const v = +localStorage.getItem('lvGmFlow');
-  if(v >= 25 && v <= 100) $('gmflow').value = String(v);
-}
-function gmFlowUi(){ $('gmflownum').textContent = $('gmflow').value + '%'; }
-gmFlowUi();
-$('gmflow').oninput = gmFlowUi;
-$('gmflow').onchange = () => { localStorage.setItem('lvGmFlow', $('gmflow').value); gmFlowUi(); lvSendOpts();
-  if(lvState === 'running') ipcRenderer.send('lv-restart'); };
 localStorage.removeItem('lvNative');   // retired: the RIFE live route always runs inside smv-live.exe
 lvHudLatUi();
 // Hotkey recorder: click the button, press the new key or combo; Esc cancels. Electron
@@ -1079,7 +1066,7 @@ $('lvkey').onclick = () => {
   const old = $('lvkey').textContent;
   $('lvkey').textContent = 'press a key…';
   $('lvkeyhint').textContent = 'Esc cancels';
-  const done = (txt, hint) => { lvKeyCapture = false; $('lvkey').textContent = txt; $('lvkeyhint').textContent = hint || ''; window.removeEventListener('keydown', h, true); };
+  const done = (txt, hint?) => { lvKeyCapture = false; $('lvkey').textContent = txt; $('lvkeyhint').textContent = hint || ''; window.removeEventListener('keydown', h, true); };
   const h = async (e) => {
     e.preventDefault(); e.stopPropagation();
     if(e.key === 'Escape'){ done(old); return; }
@@ -1140,7 +1127,7 @@ function lvLine(t){
          || /live: ([\d.]+) captured fps -> ([\d.]+) presented fps/.exec(t);
   if(m) $('lvstat').textContent = m[1] + ' fps in → ' + m[2] + ' fps out' + (m[3] ? '  ·  ~' + m[3] + ' ms latency' : '');
   // the native host is the only live route: its handoff start and cold engine build mean "loading"
-  else if(/engine handoff started|host (GMFSS |Restore )?engine build for/.test(t)) $('lvstat').textContent = 'loading the model…';
+  else if(/engine handoff started|host (GMFSS |Restore )?engine build for/.test(t)) $('lvstat').textContent = 'Loading the model…';
   else if(/FAIL|not supported|no visible window|not a visible window|no frames captured|minimized: waiting|cannot start in the native host|live server (protocol error|stalled)/i.test(t))
     $('lvstat').textContent = t.trim().slice(0, 160);
 }
@@ -1178,6 +1165,7 @@ ipcRenderer.on('lv-done', (_e, code) => {
       $('lvpanel').style.display = '';
       localStorage.removeItem('lvFlowPreset');   // retired: the 540/720 presets moved to the Upscale to selector
       localStorage.removeItem('lvFscale');       // retired: the Flow scale control is gone
+      localStorage.removeItem('lvGmFlow');       // retired: the GMFSS flow scale slider is gone
       const ft = localStorage.getItem('lvFit');
       if(ft && [...$('lvfit').options].some(o => o.value === ft)) $('lvfit').value = ft;
       lvModelUi();
@@ -1239,7 +1227,7 @@ async function checkDvReady(){
 async function doDvInstall(source){
   $('dvsetup').style.display = 'block';
   $('dvstatus').textContent = 'installing...'; $('dvstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('dv-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
+  let r: any = {}; try { r = await ipcRenderer.invoke('dv-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
   if(!r.ok) $('dvsteps').innerHTML = '✗ ' + (r.error || 'install failed')
       + '<br>Pick the dovi_tool&hellip;.zip again with <b>Choose .zip&hellip;</b>.';
   await checkDvReady();
@@ -1283,7 +1271,7 @@ async function checkHpReady(){
 async function doHpInstall(source){
   $('hpsetup').style.display = 'block';
   $('hpstatus').textContent = 'installing...'; $('hpstatus').style.color = 'var(--sub)';
-  let r = {}; try { r = await ipcRenderer.invoke('hp-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
+  let r: any = {}; try { r = await ipcRenderer.invoke('hp-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
   if(!r.ok) $('hpsteps').innerHTML = '✗ ' + (r.error || 'install failed')
       + '<br>Pick the hdr10plus_tool&hellip;.zip again with <b>Choose .zip&hellip;</b>.';
   await checkHpReady();
@@ -1306,7 +1294,7 @@ const _fs = require('fs');
 let prevTotal = 0, prevIdx = 0, prevHist = [];
 function sharpStrength(){ return $('sharpen').checked ? (parseFloat($('sharpval').value) || 0) : 0; }
 function hdrOn(){ return $('rtxhdr').checked && rtxReady.hdr && !(info && info.srcHdr); }
-function setPrevImg(el, file, mime){
+function setPrevImg(el, file, mime?){
   const old = el.dataset.url; if(old){ try { URL.revokeObjectURL(old); } catch {} }
   const url = URL.createObjectURL(new Blob([_fs.readFileSync(file)], { type: mime || 'image/png' }));
   el.dataset.url = url; el.src = url;
@@ -1357,7 +1345,7 @@ function prevSettingsSig(){                 // everything that changes what the 
           dlssMode()];
 }
 let lastPrevInput = null;                    // which video the shown original belongs to
-async function loadPreview(frame, bg){   // bg: background "refine" pass (the RTX auto-upgrade) - keep the shown image up, no blocking spinner
+async function loadPreview(frame, bg?){   // bg: background "refine" pass (the RTX auto-upgrade) - keep the shown image up, no blocking spinner
   if(!input) return;
   if(prevBusy){ prevPending = (frame == null ? 'mid' : frame); return; }
   prevBusy = true;
@@ -1734,7 +1722,7 @@ function startRun(){
               + (sharpenStrength>0 ? '  ·  Sharpen '+sharpenStrength : '')
               + (restoreOn() ? '  ·  Restore' : '');
   log('>> '+input+'  ->  '+what+extra+'\n');
-  const payload = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
+  const payload: any = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
   if(interpOn() && !gm) payload.fps = t;                                             // resample only: non-integer-multiple target
   if(interpOn() && modelIsRifeDrba()) payload.model = 'rifedrba'; // RIFE with the DRBA sub-option on
   else if(interpOn() && modelIsRife()) payload.model = 'rife';     // plain RIFE (bundled, always ready)

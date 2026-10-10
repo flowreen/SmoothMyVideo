@@ -1,6 +1,6 @@
 """Export the size-free ONNX of every live graph into engine/onnx (trt_lookup.onnx_path), so an
 engine at a new window size is a build from that file instead of a torch export. Run by
-scripts/export-onnx.js (npm setup and dist). While the export stamp (trt_lookup.export_stamp: the
+scripts/export-onnx.ts (npm setup and dist). While the export stamp (trt_lookup.export_stamp: the
 sources, the exporter packages, the weights) matches the one in weights_tags.txt, every file
 already present is skipped, so a rerun is cheap; a changed stamp removes the folder's graphs and
 exports every one again. Graphs: the RIFE IFNet (live `_bd8` and the

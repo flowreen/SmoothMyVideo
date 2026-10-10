@@ -143,17 +143,6 @@ static int g_liveAutoFit = 0;    // live Auto: the mode the free video memory fi
                                  // before anything loads (liveAutoFitMemory); 0 = Auto's own pick
 static int g_liveAutoFloor = 0;  // --auto-floor MODE: live Auto runs this mode or a smaller one (the app passes
                                  // the mode an exit 8 named, the GPU-time step); 0 = none
-static double g_gmFlow = 1.0;    // --gmfss-flow F: live GMFSS's motion (gmflow) on the /32 grid nearest F x its half
-                                 // frame (0.25..1; 1 = the half itself), GMFSS_infer_u.reuse's scale
-// --gmfss-flow's value: 0.25..1, kept to two decimals (the handoff memo key prints it so); false = outside
-static bool parseGmFlow(const wchar_t* v)
-{
-    const double f = _wtof(v);
-    if (!(f >= 0.25 && f <= 1.0))
-        return false;
-    g_gmFlow = std::nearbyint(f * 100.0) / 100.0;
-    return true;
-}
 static const wchar_t* const kDlssModeName[6] = {L"auto", L"dlaa", L"quality", L"balanced", L"performance", L"ultra"};
 // --scale's value: a DLSS mode name, or a share 0.01..1; false = neither
 static bool parseLiveScale(const wchar_t* v)
@@ -1470,15 +1459,6 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.fitWork = argv[++i];
         else if (wcscmp(argv[i], L"--no-gpu-fit") == 0)
             g_noGpuFit = true;
-        else if (wcscmp(argv[i], L"--gmfss-flow") == 0 && i + 1 < argc)
-        {
-            // a gate lever offline (the product passes it only live): the same frames as eager GMFSS at that grid
-            if (!parseGmFlow(argv[++i]))
-            {
-                LOG("--gmfss-flow must be 0.25..1\n");
-                return 1;
-            }
-        }
         else if (wcscmp(argv[i], L"--sharpen") == 0 && i + 1 < argc)
             g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0)
@@ -3590,7 +3570,6 @@ static void resetSessionGlobals()
     g_dlssMode = 0;
     g_liveAutoFit = 0;
     g_liveAutoFloor = 0;
-    g_gmFlow = 1.0;
     g_noHud = g_noHudLat = false;
     g_noFillMouse = false;
     g_sharpen = 0.0;
@@ -3735,14 +3714,6 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             if (!parseLiveScale(argv[++i]))
             {
                 LOG("--scale must be 0.01..1.0 or a DLSS mode (auto, dlaa, quality, balanced, performance, ultra)\n");
-                return 1;
-            }
-        }
-        else if (wcscmp(argv[i], L"--gmfss-flow") == 0 && i + 1 < argc)
-        {
-            if (!parseGmFlow(argv[++i]))
-            {
-                LOG("--gmfss-flow must be 0.25..1\n");
                 return 1;
             }
         }

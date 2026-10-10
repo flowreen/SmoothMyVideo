@@ -1,9 +1,13 @@
-"""Post-edit scan for the renderer (run after EVERY edit of renderer/index.html or renderer/app.js,
-see project rules): duplicate element ids, dangling $('id') references from either file, every
-<script src> resolving to a file, and node --check on the inline scripts and on app.js."""
+"""Post-edit scan for the renderer (run after EVERY edit of renderer/index.html or renderer/app.ts,
+see project rules): builds app.js from app.ts first (scripts/build-renderer.ts), then duplicate element
+ids, dangling $('id') references from either file, every <script src> resolving to a file, and
+node --check on the inline scripts and on app.js."""
 import re, subprocess, sys, os, tempfile
 
-rdir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "renderer")
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+subprocess.run(["node", "--disable-warning=ExperimentalWarning", os.path.join(root, "scripts", "build-renderer.ts")],
+               check=True)
+rdir = os.path.join(root, "renderer")
 html = open(os.path.join(rdir, "index.html"), encoding="utf-8").read()
 srcs = re.findall(r'<script[^>]*\bsrc="([^"]+)"', html)
 missing_src = [s for s in srcs if not os.path.isfile(os.path.join(rdir, s))]

@@ -1486,7 +1486,7 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
 
 
 def ensure_onnx(name, export_module, example_inputs, input_names, output_names, dyn_batch=None):
-    """Export this graph's size-free ONNX if it qualifies and is missing (scripts/export-onnx.js
+    """Export this graph's size-free ONNX if it qualifies and is missing (scripts/export-onnx.ts
     through engine/onnx_export.py); returns the path or None. Raises on a failed export."""
     return _size_free_onnx(_export_key(name, export_module, example_inputs), name, export_module,
                            example_inputs, input_names, output_names, dyn_batch)

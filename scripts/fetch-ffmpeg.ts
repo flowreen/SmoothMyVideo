@@ -1,4 +1,4 @@
-// scripts/fetch-ffmpeg.js
+// scripts/fetch-ffmpeg.ts
 //
 // npm postinstall: fetch the bundled ffmpeg into engine/bin on a fresh clone.
 //
@@ -15,22 +15,21 @@
 // install. Uses the Windows-bundled curl.exe + tar.exe (the same System32 tools main.ts uses), so it
 // adds no npm dependencies.
 
-'use strict';
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const { execFileSync } = require('child_process');
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const FFMPEG_URL =
   'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip';
-const ENGINE_BIN = path.resolve(__dirname, '..', 'engine', 'bin');
+const ENGINE_BIN = path.resolve(import.meta.dirname, '..', 'engine', 'bin');
 const SYS32 = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32');
 const CURL = path.join(SYS32, 'curl.exe');
 const TAR = path.join(SYS32, 'tar.exe');
 
-const here = (name) => fs.existsSync(path.join(ENGINE_BIN, name));
+const here = (name: string) => fs.existsSync(path.join(ENGINE_BIN, name));
 
-function run() {
+function run(): void {
   if (process.platform !== 'win32') {
     console.log('[fetch-ffmpeg] not Windows - skipping (this build is win64 only).');
     return;
@@ -92,7 +91,7 @@ function run() {
     }
     console.log(`[fetch-ffmpeg] done - ${copied} files in engine/bin.`);
   } catch (err) {
-    console.warn('[fetch-ffmpeg] could not fetch ffmpeg: ' + (err && err.message ? err.message : err));
+    console.warn('[fetch-ffmpeg] could not fetch ffmpeg: ' + (err instanceof Error ? err.message : String(err)));
     console.warn('[fetch-ffmpeg] npm install continues; the app will use ffmpeg on PATH if available,');
     console.warn('[fetch-ffmpeg] or add it later via the GUI "Choose .zip" button or README "Setup".');
     console.warn('[fetch-ffmpeg] Direct source: ' + FFMPEG_URL);

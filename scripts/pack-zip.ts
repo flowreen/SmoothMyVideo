@@ -7,12 +7,14 @@
 // the deflate zip on this bundle. Windows 11 23H2 and later open it in Explorer, older Windows needs
 // 7-Zip or NanaZip. The build machine needs 7-Zip: 7z.exe in %ProgramFiles%\7-Zip, or SMV_7Z naming it.
 // The folder passed to 7-Zip becomes the archive root, which is exactly the layout we want.
-const fs = require('fs');
-const path = require('path');
-const { execFileSync } = require('child_process');
+import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
-const version = require('../package.json').version;
-const rel = path.join(__dirname, '..', 'release');
+const ROOT = path.join(import.meta.dirname, '..');
+const version: string = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
+const rel = path.join(ROOT, 'release');
 const unpacked = path.join(rel, 'win-unpacked');
 const folder = path.join(rel, 'SmoothMyVideo');
 const archiveName = `SmoothMyVideo-${version}-win.7z`;
@@ -31,7 +33,7 @@ if (!fs.existsSync(unpacked)) {
 fs.rmSync(folder, { recursive: true, force: true });
 fs.renameSync(unpacked, folder);
 
-function tree(dir) {
+function tree(dir: string): { files: number; bytes: number } {
   let files = 0;
   let bytes = 0;
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -81,7 +83,6 @@ if (archiveSize >= 2e9) {
 fs.rmSync(folder, { recursive: true, force: true });
 
 // SHA-256 sidecar, attached beside the archive on the GitHub release so users can verify the download.
-const crypto = require('crypto');
 const hash = crypto.createHash('sha256');
 const stream = fs.createReadStream(path.join(rel, archiveName));
 stream.on('data', (d) => hash.update(d));

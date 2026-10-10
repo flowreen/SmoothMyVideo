@@ -721,7 +721,6 @@ let liveHdrSb = 0; // Dynamic Vibrance saturation boost 0..1
 let liveHud = true; // on-screen fps/latency readout (panel checkbox; off -> --no-hud)
 let liveHudLat = true; // latency segment of that readout (off -> --no-hud-latency)
 let liveGpuFit = true; // "Fit to the GPU" (off -> --no-gpu-fit: the target holds, no video memory fit)
-let liveGmFlow = 1; // GMFSS flow scale 0.25..1 (below 1 -> --gmfss-flow F: gmflow on the nearest /32 grid, 320x192 at least)
 
 // Live events go to the main window (not a captured e.sender): the ` hotkey starts sessions
 // with no IPC event at all, and the panel must reflect those too.
@@ -892,7 +891,6 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   if (!liveHud) args.push('--no-hud');
   else if (!liveHudLat) args.push('--no-hud-latency'); // meter on, latency segment hidden
   if (!liveGpuFit) args.push('--no-gpu-fit');
-  if (liveModel === 'gmfss' && liveGmFlow < 1) args.push('--gmfss-flow', liveGmFlow.toFixed(2));
   // Every server backend runs inside smv-live.exe (its native host), the only live route; a
   // session the host cannot run ends with its reason on the status line.
   // resident host: every server backend has something worth keeping (the native engines); the
@@ -1052,7 +1050,6 @@ ipcMain.on(
       hud?: boolean;
       hudlat?: boolean;
       gpufit?: boolean;
-      gmflow?: number; // GMFSS flow scale 0.25..1
     },
   ) => {
     liveModel = opts.model;
@@ -1080,7 +1077,6 @@ ipcMain.on(
     liveHud = opts.hud !== false;
     liveHudLat = opts.hudlat !== false;
     liveGpuFit = opts.gpufit !== false;
-    liveGmFlow = Math.min(1, Math.max(0.25, opts.gmflow ?? 1));
     // the panel moved to another model: whatever the idle resident host keeps loaded (its
     // engines) goes right away (user rule: a model must not hold VRAM
     // through a session of another model)

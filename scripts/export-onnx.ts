@@ -1,4 +1,4 @@
-// scripts/export-onnx.js
+// scripts/export-onnx.ts
 //
 // npm setup and dist: export the size-free ONNX of every graph into engine/onnx through the dev
 // python (engine/onnx_export.py on engine/runtime, never shipped). Generated from the committed
@@ -13,16 +13,15 @@
 // once the dev python is in). `--required` (dist) fails the build instead, so a release never ships
 // without the files.
 
-'use strict';
-const fs = require('fs');
-const path = require('path');
-const { spawnSync } = require('child_process');
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
-const ENGINE = path.resolve(__dirname, '..', 'engine');
+const ENGINE = path.resolve(import.meta.dirname, '..', 'engine');
 const PY = path.join(ENGINE, 'runtime', 'python.exe');
 const required = process.argv.includes('--required');
 
-function fail(msg) {
+function fail(msg: string): void {
   if (required) {
     console.error(`[export-onnx] ${msg}`);
     process.exit(1);

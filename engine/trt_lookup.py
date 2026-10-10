@@ -88,7 +88,7 @@ def engine_name(name, shapes, input_names=None, dyn_batch=None):
 
 
 # Size-free ONNX graphs: one file per live graph with every H /
-# W symbolic, generated from the committed weights by scripts/export-onnx.js (npm setup and dist),
+# W symbolic, generated from the committed weights by scripts/export-onnx.ts (npm setup and dist),
 # gitignored, shipped in the release archive. An engine at a new size is then a build from this file
 # (about 1 s) instead of a torch export (20 to 40 s). export_stamp() fingerprints everything an export
 # reads: when it changes, onnx_export.py exports every graph again and writes the new stamp into
