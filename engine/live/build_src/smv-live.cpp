@@ -637,6 +637,7 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
     }
 
     static Capture cap;
+    cap.allowSame = false; // the probe dumps every presented frame, repeats included
     if (cap.init(target, a.Get()))
         return 1;
     wchar_t title[256]{};

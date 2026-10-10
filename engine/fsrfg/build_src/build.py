@@ -2,15 +2,17 @@ r"""Builds engine\fsrfg: smv_fsrfg_bridge.dll (fsrfg_bridge.cpp) and amdxc64.dll
 them AMD's signed FSR SDK v2.3.0 loader + frame generation DLLs (signedbin, unmodified) and vkd3d-proton's two DLLs.
 
 vkd3d-proton (LGPL-2.1, built separately, MSYS2 UCRT64 with gcc, meson and ninja): github.com/HansKristian-Work/
-vkd3d-proton at commit b206eb6680fb92a64ae57bfccc7454a138f76887 with its submodules, dxil-spirv at
+vkd3d-proton at commit 2230755878b01993b4b82d0ac0c0624f3ab4d333 with its submodules, dxil-spirv at
 ab47c3df1a4746f36c958f0262bc9e314eb566eb, then
-  git apply ..\source\vkd3d-proton-b206eb6-smv.patch            (in the vkd3d-proton checkout)
+  git apply ..\source\vkd3d-proton-2230755-smv.patch            (in the vkd3d-proton checkout)
   git apply ..\source\dxil-spirv-ab47c3d-smv.patch              (in subprojects\dxil-spirv)
   meson setup build --buildtype=release -Denable_extended_emulation=true
   ninja -C build
 The patches: VKD3D_FP8_EMULATION=1 runs the FP8 cooperative matrices of AMD's ML shaders as FP16 ones, dxil-spirv's
-DXIL_SPIRV_CONFIG=wmma_fp8_staging stages FP8 loads / stores through shared memory as FP16 and reads its configuration
-from the process environment, and the two DLLs are named smv_vkd3d_d3d12.dll / smv_vkd3d_d3d12core.dll.
+DXIL_SPIRV_CONFIG=wmma_fp8_staging loads FP8 tiles as coopmat2 tensor loads with a decode function where the device
+has VK_NV_cooperative_matrix2 tensor addressing + block loads (else through shared memory as FP16, like the stores) and
+reads its configuration from the process environment, and the two DLLs are named smv_vkd3d_d3d12.dll /
+smv_vkd3d_d3d12core.dll.
 
 Environment:
   FSR_SDK      the FSR SDK v2.3.0 checkout (holds Kits\FidelityFX: api\include, framegeneration\include, signedbin)

@@ -27,6 +27,21 @@ static const char kHdrPackCS[] = "Texture2D<float4> src : register(t0);\n"
                                  "    dst[id.xy] = q.x | (q.y << 10) | (q.z << 20) | (3u << 30);\n"
                                  "}\n";
 
+// Whole-screen capture (Capture::samePicture): any bit that differs between two pictures sets the flag. The
+// formats read as float4 (B8G8R8A8 unorm: exact, one value per byte; FP16: exact), compared as their bits.
+static const char kSamePictureCS[] = "Texture2D<float4> a : register(t0);\n"
+                                     "Texture2D<float4> b : register(t1);\n"
+                                     "RWByteAddressBuffer flag : register(u0);\n"
+                                     "[numthreads(16,16,1)]\n"
+                                     "void main(uint3 id : SV_DispatchThreadID)\n"
+                                     "{\n"
+                                     "    uint w, h;\n"
+                                     "    a.GetDimensions(w, h);\n"
+                                     "    if (id.x >= w || id.y >= h) return;\n"
+                                     "    if (any(asuint(a[id.xy]) != asuint(b[id.xy])))\n"
+                                     "        flag.Store(0, 1u);\n"
+                                     "}\n";
+
 struct Capture
 {
     ComPtr<ID3D11Device> dev11;
@@ -58,6 +73,8 @@ struct Capture
     ComPtr<ID3D11UnorderedAccessView> convUav;
     int64_t lastFrameTs = 0; // capture timestamp of the newest drained frame (WGC
                              // SystemRelativeTime, 100ns units in the QPC time domain)
+    int newestIn = 0;        // where that frame's client pixels sit: 0 nowhere, 1 staging (latestFrame), 2 sharedTex
+                             // (latestFrameGpu); newestToShared hands it to the host
     uint64_t dropped = 0;    // frames superseded in drainNewest (the SATURATION signal:
                              // captured + dropped per window = the true source cadence)
     double emaArrMs = 0;     // smoothed ARRIVAL interval (ms) over every delivered frame,
@@ -77,6 +94,34 @@ struct Capture
     SRWLOCK lk = SRWLOCK_INIT;
     wgc::Direct3D11CaptureFrame held{nullptr};
     bool stopping = false; // set under lk by stop(): a late FrameArrived leaves the pool alone
+    // An arrival whose picture equals the last new one is no source frame. Whole screen: the overlay is excluded from
+    // the picture, but each of its presents still composes the monitor and WGC hands that composition over as a frame,
+    // so without the test the loop takes its own presents for the source (245 arrivals a second on a static screen at
+    // the 1 ms interval, ~45 at Windows' default). Window and Fill: a display-sync player (mpv's display-resample)
+    // presents the same picture every refresh, so a 24 fps video reads as 60 to 124 and each new picture's motion lands
+    // in one refresh. samePicture tests every arrival's client picture on FrameArrived's thread (the cadence keeps
+    // counting arrivals, not the loop's drains) and takeFrames drops an unchanged one uncounted. An unchanged arrival
+    // still counts once kSameKeepalive has passed since the last kept one: the static hold's refresh repaint brings
+    // the current picture after a model load or a pause, and DLSS-G's input-gap reset (700 ms) never fires on a
+    // source that keeps presenting. sameTex[sameCur] = the arrival under test, sameTex[1 - sameCur] = the last kept
+    // picture. The immediate context is multithread-protected while this runs (`mt`; its compute-shader sequences hold
+    // mt->Enter()).
+    static constexpr int64_t kSameKeepalive = 5000000; // 100 ns units: 500 ms
+    bool allowSame = true; // a caller that wants every arrival (the probe) clears it before init()
+    bool sameSkip = false;
+    ComPtr<ID3D11Multithread> mt;
+    ComPtr<ID3D11ComputeShader> sameCS;
+    ComPtr<ID3D11Texture2D> sameTex[2];
+    ComPtr<ID3D11ShaderResourceView> sameSrv[2];
+    ComPtr<ID3D11Buffer> sameFlag, sameFlagStage;
+    ComPtr<ID3D11UnorderedAccessView> sameUav;
+    int sameCur = 0;
+    bool sameRef = false;  // sameTex[1 - sameCur] holds a picture
+    uint64_t sameN = 0;    // arrivals dropped as unchanged
+    uint64_t sameKept = 0; // unchanged arrivals kept by kSameKeepalive
+    double sameMsSum = 0, sameMsMax = 0;
+    uint64_t sameTests = 0;
+    SRWLOCK sameLk = SRWLOCK_INIT; // one takeFrames at a time while sameSkip (FrameArrived's), before lk
     // Zero-copy capture interop (server route): frames are GPU-copied into a SHARED texture
     // the server imports as CUDA external memory, with a shared D3D11 fence for
     // ordering. Capture never touches the CPU: no staging Map, no shm memcpy, no H2D upload.
@@ -171,6 +216,131 @@ struct Capture
         return true;
     }
 
+    // the unchanged-picture test (samePicture) at the client crop's size and the pool's format; false = not available
+    // (a whole-screen caller then keeps Windows' update interval). SMV_WGC_SAME=fail = this failure's trigger
+    bool initSame(DXGI_FORMAT fmt)
+    {
+        wchar_t lv[8]{};
+        if (GetEnvironmentVariableW(L"SMV_WGC_SAME", lv, 8) && wcscmp(lv, L"fail") == 0)
+            return false;
+        ComPtr<ID3DBlob> cs, err;
+        if (FAILED(D3DCompile(kSamePictureCS, sizeof(kSamePictureCS) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0",
+                              0, 0, &cs, &err)) ||
+            FAILED(dev11->CreateComputeShader(cs->GetBufferPointer(), cs->GetBufferSize(), nullptr, &sameCS)))
+            return false;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = cw;
+        td.Height = ch;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = fmt;
+        td.SampleDesc = {1, 0};
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        for (int i = 0; i < 2; i++)
+            if (FAILED(dev11->CreateTexture2D(&td, nullptr, &sameTex[i])) ||
+                FAILED(dev11->CreateShaderResourceView(sameTex[i].Get(), nullptr, &sameSrv[i])))
+                return false;
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        if (FAILED(dev11->CreateBuffer(&bd, nullptr, &sameFlag)))
+            return false;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = 4;
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        if (FAILED(dev11->CreateUnorderedAccessView(sameFlag.Get(), &ud, &sameUav)))
+            return false;
+        bd.Usage = D3D11_USAGE_STAGING;
+        bd.BindFlags = 0;
+        bd.MiscFlags = 0;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(dev11->CreateBuffer(&bd, nullptr, &sameFlagStage)) || FAILED(ctx11.As(&mt)))
+            return false;
+        mt->SetMultithreadProtected(TRUE);
+        return true;
+    }
+
+    // true = this arrival's client picture equals the last kept one; a new picture becomes the reference. The flag's
+    // readback waits for the copy too, so the frame may be closed right after
+    bool samePicture(wgc::Direct3D11CaptureFrame const& f)
+    {
+        winrt::com_ptr<ID3D11Texture2D> tex;
+        int64_t ts = 0;
+        try
+        {
+            const auto csz = f.ContentSize();
+            ts = f.SystemRelativeTime().count();
+            auto access = f.Surface().as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+            if ((uint32_t)csz.Width != fullW || (uint32_t)csz.Height != fullH ||
+                FAILED(access->GetInterface(winrt::guid_of<ID3D11Texture2D>(), tex.put_void())))
+                tex = nullptr;
+        }
+        catch (...)
+        {
+            tex = nullptr;
+        }
+        D3D11_TEXTURE2D_DESC fd{}, rd{};
+        if (tex)
+        {
+            tex->GetDesc(&fd);
+            sameTex[0]->GetDesc(&rd);
+        }
+        if (!tex || fd.Width < (UINT)cropX + cw || fd.Height < (UINT)cropY + ch || fd.Format != rd.Format)
+        {
+            sameRef = false; // a resize or a caption-sized frame: the next picture starts over
+            return false;
+        }
+        const bool keepalive = sameRef && lastArrTs && ts - lastArrTs >= kSameKeepalive;
+        const int64_t t0 = nowQpc100();
+        bool same = false;
+        mt->Enter();
+        const D3D11_BOX box{(UINT)cropX, (UINT)cropY, 0, (UINT)cropX + cw, (UINT)cropY + ch, 1};
+        ctx11->CopySubresourceRegion(sameTex[sameCur].Get(), 0, 0, 0, 0, tex.get(), 0, &box);
+        if (keepalive)
+            sameKept++;
+        else if (sameRef)
+        {
+            const UINT zero[4]{};
+            ctx11->ClearUnorderedAccessViewUint(sameUav.Get(), zero);
+            ctx11->CSSetShader(sameCS.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* srv[2]{sameSrv[sameCur].Get(), sameSrv[1 - sameCur].Get()};
+            ctx11->CSSetShaderResources(0, 2, srv);
+            ID3D11UnorderedAccessView* uav = sameUav.Get();
+            ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            ctx11->Dispatch((cw + 15) / 16, (ch + 15) / 16, 1);
+            ID3D11ShaderResourceView* none[2]{};
+            ctx11->CSSetShaderResources(0, 2, none);
+            uav = nullptr;
+            ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            ctx11->CopyResource(sameFlagStage.Get(), sameFlag.Get());
+            // the Map waits with the context locked, so the loop's next capture copy can queue behind one test; an
+            // unlocked wait on a fence event was slower (1.7 ms mean, 11.5 max vs 0.87 / 4.5 on a 270/s display-resample
+            // source) and WGC discarded real pictures meanwhile (22.6 instead of 24 a second taken)
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (SUCCEEDED(ctx11->Map(sameFlagStage.Get(), 0, D3D11_MAP_READ, 0, &m)))
+            {
+                same = *(const uint32_t*)m.pData == 0;
+                ctx11->Unmap(sameFlagStage.Get(), 0);
+            }
+            const double ms = (nowQpc100() - t0) / 10000.0;
+            sameMsSum += ms;
+            sameMsMax = (std::max)(sameMsMax, ms);
+            sameTests++;
+        }
+        mt->Leave();
+        if (!same)
+        {
+            sameCur = 1 - sameCur;
+            sameRef = true;
+        }
+        return same;
+    }
+
     int init(HWND target, IDXGIAdapter1* adapter)
     {
         // resident host: this object is static and re-entered once per session, so every
@@ -183,6 +353,7 @@ struct Capture
         lastArrTs = 0;
         arrGap = 0;
         lastFrameTs = 0;
+        newestIn = 0;
         held = nullptr;
         stopping = false;
         interop = false;
@@ -196,6 +367,21 @@ struct Capture
         convStaging.Reset();
         convSrcView.Reset();
         convUav.Reset();
+        sameSkip = false;
+        sameRef = false;
+        sameCur = 0;
+        sameN = sameTests = sameKept = 0;
+        sameMsSum = sameMsMax = 0;
+        mt.Reset();
+        sameCS.Reset();
+        sameFlag.Reset();
+        sameFlagStage.Reset();
+        sameUav.Reset();
+        for (int i = 0; i < 2; i++)
+        {
+            sameTex[i].Reset();
+            sameSrv[i].Reset();
+        }
         targetWnd = target;
         evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
@@ -290,12 +476,31 @@ struct Capture
             g_hdr = false;
         }
 
+        // the unchanged-picture test (sameSkip), every fit; SMV_WGC_SAME=0 = off (A/B)
+        if (allowSame)
+        {
+            wchar_t lv[8]{};
+            if (!(GetEnvironmentVariableW(L"SMV_WGC_SAME", lv, 8) && lv[0] == L'0'))
+            {
+                sameSkip = initSame(g_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM);
+                if (sameSkip)
+                    LOG("capture: arrivals whose picture is unchanged are dropped (%s)\n",
+                        g_monitor ? "the overlay's own presents" : "a player's repeated presents");
+                else
+                    LOG(g_monitor ? "note: the whole screen's unchanged-picture test is unavailable: the capture keeps "
+                                    "Windows' update interval (60 fps at most)\n"
+                                  : "note: the unchanged-picture test is unavailable: a player's repeated presents "
+                                    "count as source frames\n");
+            }
+        }
+
         // HDR mode captures FP16 scRGB (linear, 709 primaries, 1.0 = 80 nits); the server
-        // re-encodes to BT.2020 PQ. SDR stays 8-bit BGRA.
+        // re-encodes to BT.2020 PQ. SDR stays 8-bit BGRA. The unchanged-picture test holds a frame while it runs:
+        // a third buffer keeps WGC from discarding the next arrival meanwhile
         pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
             rtDev,
-            g_hdr ? wgdx::DirectXPixelFormat::R16G16B16A16Float : wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2,
-            sz);
+            g_hdr ? wgdx::DirectXPixelFormat::R16G16B16A16Float : wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            sameSkip ? 3 : 2, sz);
         session = pool.CreateCaptureSession(item);
         try
         {
@@ -315,6 +520,24 @@ struct Capture
         {
             LOG("note: capture border suppression unavailable (pre-Win11?)\n");
         }
+        try
+        {
+            // Windows holds a capture at 60 frames a second by default (the interval reads 16 ms) whatever
+            // the source presents; 1 ms passes every composed frame. A whole-screen capture without the
+            // unchanged-picture test keeps the default: at 1 ms each of the overlay's own presents arrives as a
+            // frame (sameSkip above). SMV_WGC_INTERVAL=0 keeps Windows' default (A/B), =fail takes the
+            // fallback below (its trigger)
+            wchar_t iv[8]{};
+            const bool lever = GetEnvironmentVariableW(L"SMV_WGC_INTERVAL", iv, 8) > 0;
+            if (lever && wcscmp(iv, L"fail") == 0)
+                throw winrt::hresult_no_interface();
+            if (!(lever && iv[0] == L'0') && (!g_monitor || sameSkip))
+                session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{10000});
+        }
+        catch (...)
+        {
+            LOG("note: capture update interval unavailable on this Windows: a window captures at 60 fps at most\n");
+        }
 
         D3D11_TEXTURE2D_DESC sd{};
         sd.Width = cw;
@@ -332,7 +555,8 @@ struct Capture
             SetEvent(evt);
         });
         pool.FrameArrived([this](auto&&, auto&&) {
-            takeFrames();
+            if (!takeFrames() && sameSkip)
+                return; // an unchanged whole-screen picture: nothing for the loop
             InterlockedExchange(&arrived, 1);
             SetEvent(evt);
         });
@@ -351,15 +575,32 @@ struct Capture
         return lastArrTs && nowQpc100() - lastArrTs > 3000000;
     }
 
-    // every frame on the pool into `held`, the newest kept (FrameArrived's thread and drainNewest)
-    void takeFrames()
+    // every frame on the pool into `held`, the newest kept (FrameArrived's thread and drainNewest; with sameSkip
+    // FrameArrived's alone, so the arrivals are tested in their order). The test runs outside lk: drainNewest never
+    // waits for the GPU behind it. True = a frame was kept
+    bool takeFrames()
     {
+        bool kept = false;
+        if (sameSkip)
+            AcquireSRWLockExclusive(&sameLk);
         AcquireSRWLockExclusive(&lk);
         while (!stopping)
         {
             auto f = pool.TryGetNextFrame();
             if (!f)
                 break;
+            if (sameSkip)
+            {
+                ReleaseSRWLockExclusive(&lk);
+                const bool same = samePicture(f);
+                AcquireSRWLockExclusive(&lk);
+                if (same || stopping)
+                {
+                    sameN += same;
+                    f.Close();
+                    continue;
+                }
+            }
             const int64_t ts = f.SystemRelativeTime().count();
             if (lastArrTs && ts > lastArrTs)
             {
@@ -376,15 +617,20 @@ struct Capture
                 dropped++;
             } // superseded = the pipeline fell behind
             held = f;
+            kept = true;
         }
         ReleaseSRWLockExclusive(&lk);
+        if (sameSkip)
+            ReleaseSRWLockExclusive(&sameLk);
+        return kept;
     }
 
     // hand out the newest frame; -3 = none pending, -2 = resized, -1 = failure,
     // else 0 and `tex` holds the frame texture (caller must Close `frame`)
     int drainNewest(wgc::Direct3D11CaptureFrame& frame, winrt::com_ptr<ID3D11Texture2D>& tex)
     {
-        takeFrames();
+        if (!sameSkip)
+            takeFrames();
         AcquireSRWLockExclusive(&lk);
         if (held)
         {
@@ -485,7 +731,23 @@ struct Capture
             return rc;
         copyCropped(sharedTex.Get(), tex.get());
         frame.Close();
+        newestIn = 2;
         return 1;
+    }
+
+    // the newest drained frame into sharedTex (the server route's warm-up on a static source: the rate measurement
+    // and the load-loop passthrough drained every frame it sent); staging and sharedTex share the size and format.
+    // Stamped now: nothing has arrived since, so it is the current picture, and the pacing clock and the latency
+    // anchor read the stamp (lastArrTs keeps the source's own arrival, so the static hold still arms)
+    bool newestToShared()
+    {
+        if (!interop || !newestIn)
+            return false;
+        if (newestIn == 1)
+            ctx11->CopyResource(sharedTex.Get(), staging.Get());
+        newestIn = 2;
+        lastFrameTs = nowQpc100();
+        return true;
     }
 
     // interop path: order the shared-texture copy against the server's CUDA reads
@@ -516,6 +778,9 @@ struct Capture
         {
             copyCropped(convSrc.Get(), tex.get());
             frame.Close();
+            newestIn = 0;
+            if (mt)
+                mt->Enter(); // samePicture binds its own compute shader from FrameArrived's thread
             ctx11->CSSetShader(convCS.Get(), nullptr, 0);
             ID3D11ShaderResourceView* srv = convSrcView.Get();
             ctx11->CSSetShaderResources(0, 1, &srv);
@@ -526,6 +791,8 @@ struct Capture
             uav = nullptr; // unbind so next frame's copy into convSrc is hazard-free
             ctx11->CSSetShaderResources(0, 1, &srv);
             ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            if (mt)
+                mt->Leave();
             ctx11->CopyResource(convStaging.Get(), convDst.Get());
             D3D11_MAPPED_SUBRESOURCE pm{};
             if (FAILED(ctx11->Map(convStaging.Get(), 0, D3D11_MAP_READ, 0, &pm)))
@@ -538,6 +805,7 @@ struct Capture
 
         copyCropped(staging.Get(), tex.get());
         frame.Close();
+        newestIn = 1;
 
         D3D11_MAPPED_SUBRESOURCE map{};
         if (FAILED(ctx11->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map)))
@@ -569,6 +837,11 @@ struct Capture
             held.Close();
         held = nullptr;
         ReleaseSRWLockExclusive(&lk);
+        if (sameSkip)
+            LOG("capture: %llu unchanged arrivals dropped, %llu kept after %d ms; the test %.3f ms mean, %.3f ms max "
+                "over %llu\n",
+                (unsigned long long)sameN, (unsigned long long)sameKept, (int)(kSameKeepalive / 10000),
+                sameTests ? sameMsSum / (double)sameTests : 0.0, sameMsMax, (unsigned long long)sameTests);
         if (session)
             session.Close();
         if (pool)

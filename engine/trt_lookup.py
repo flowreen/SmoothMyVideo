@@ -97,6 +97,9 @@ def engine_name(name, shapes, input_names=None, dyn_batch=None):
 ONNX_DIR = os.environ.get("SMV_ONNX_DIR") or os.path.join(HERE, "onnx")
 # the packages that write or rewrite the graphs (the dynamo exporter runs on onnxscript and onnx-ir)
 EXPORT_PACKAGES = ("torch", "onnx", "onnxscript", "onnx-ir")
+# the host's builder settings that change an engine but not its graph (smv-live.exe lkBuild): part of
+# export_stamp(), so a change here empties the engine cache once, like a new export
+HOST_BUILD = "optimization level 5; aux stream caps: gmflow_bidir_b 0, metricnet 0, gmflow_backbone 0, fusionnet 2"
 
 
 def onnx_path(key):
@@ -108,8 +111,8 @@ def onnx_path(key):
 def export_stamp():
     """Fingerprint of everything a size-free export reads: the export and model sources (engine's own
     .py files, engine/rife, engine/GMFSS_Fortuna; CRLF read as LF, so a checkout's line endings do not
-    count), the versions of EXPORT_PACKAGES and the weight files. Any change means every graph is
-    exported again (onnx_export.py). Reads no torch, so it costs well under a second."""
+    count), the versions of EXPORT_PACKAGES, the weight files and HOST_BUILD. Any change means every
+    graph is exported again (onnx_export.py). Reads no torch, so it costs well under a second."""
     from importlib import metadata
 
     files = [n for n in os.listdir(HERE) if n.endswith(".py")]
@@ -129,6 +132,7 @@ def export_stamp():
         h.update(f"{pkg} {v}\n".encode())
     rest = _md5_files([os.path.join(HERE, "realesr-animevideov3.pth")])
     h.update(f"{weights_tag()} {rife_weights_tag()} {rest}\n".encode())
+    h.update(f"{HOST_BUILD}\n".encode())
     return "e" + h.hexdigest()[:10]
 
 

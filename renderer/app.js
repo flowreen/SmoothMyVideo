@@ -1141,7 +1141,7 @@ function lvLine(t){
   if(m) $('lvstat').textContent = m[1] + ' fps in → ' + m[2] + ' fps out' + (m[3] ? '  ·  ~' + m[3] + ' ms latency' : '');
   // the native host is the only live route: its handoff start and cold engine build mean "loading"
   else if(/engine handoff started|host (GMFSS |Restore )?engine build for/.test(t)) $('lvstat').textContent = 'loading the model…';
-  else if(/FAIL|not supported|no visible window|not a visible window|no frames captured|cannot start in the native host|live server (protocol error|stalled)/i.test(t))
+  else if(/FAIL|not supported|no visible window|not a visible window|no frames captured|minimized: waiting|cannot start in the native host|live server (protocol error|stalled)/i.test(t))
     $('lvstat').textContent = t.trim().slice(0, 160);
 }
 ipcRenderer.on('lv-out', (_e, t) => {

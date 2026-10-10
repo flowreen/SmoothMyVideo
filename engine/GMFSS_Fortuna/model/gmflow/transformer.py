@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .utils import split_feature, merge_splits
+from .position import PositionEmbeddingSine
 
 
 def single_head_full_attention(q, k, v):
@@ -71,10 +72,50 @@ def _roll_hw(x, sh, sw, left):
 
 
 def _window_layout():
-    """export path (SMV): a transformer keeps its tokens in window order from its first block to its last (every op
-    but the attention works per token, and a block's self and cross attention share one shift), so an attention is a
-    reshape instead of a partition, a merge and rolls; eager keeps the original layout"""
+    """export path (SMV): a transformer keeps its tokens in window order (or token-outer, EXPORT_TOKEN_OUTER) from its
+    first block to its last (every op but the attention works per token, and a block's self and cross attention share
+    one shift), so an attention is a reshape instead of a partition, a merge and rolls; eager keeps the original
+    layout"""
     return torch.compiler.is_compiling()
+
+
+# export path (SMV): the quarter-scale transformer (attn_num_splits 8) runs each block on this many groups of whole
+# windows, so a group's tensors stay near the GPU's L2 (its FFN ran at half the rate on 117,760 tokens as on 29,440);
+# onnx_export.py exports gmflow_bidir_a once per count and the host picks one by the token count
+EXPORT_WINDOW_CHUNKS = 1
+
+# export path (SMV): a shifted block's attention per mask region instead of with the mask (onnx_export.py's
+# gmflow_bidir_a_g8r, the host's pick from kGmRegionTokens up): after the roll by half a window only the last window row
+# and column hold two regions each (the corner four) and a token attends only inside its own (the mask's -100 is a 0
+# weight), so every region is plain attention and the masked kernel (1.5x the plain one) goes; small windows lose more
+# to the extra calls than they save
+EXPORT_REGION_ATTENTION = False
+
+# export path (SMV): the scales (attn_num_splits) whose transformer keeps its tokens token-outer (_to_groups,
+# FeatureTransformer._forward_windowed) instead of in window order: an attention reads its group's slice in the fused
+# kernel's own layout instead of 3 copies into it and 1 out; onnx_export.py sets them per variant as measured faster
+# (GMFLOW_TOKEN_OUTER)
+EXPORT_TOKEN_OUTER = ()
+
+# export path (SMV): the token-outer scales that add gmflow's position encoding after the layout change instead of
+# before it (FeatureTransformer.takes_position): with window splits the encoding is one window's table added to every
+# window of both frames, so token-outer it is a broadcast add over the outer position axis and the entry stays a
+# permute (fused with the encoding it ran at half the bandwidth); onnx_export.py sets them per variant
+# (GMFLOW_TOKEN_POSITION)
+EXPORT_TOKEN_POSITION = ()
+
+
+def fold_projections(module):
+    """export path (SMV): every TransformerLayer's attention is single-head and linear in its projections, so
+    q k^T = s Wq^T Wk t^T and merge(P v) = P t (Wm Wv)^T; the two products (formed in fp64, stored fp32) become buffers
+    the export uses instead of the k projection and the merge (two of the four 128 x 128 GEMMs of every attention).
+    Called by onnx_export.py after the weights load; eager keeps the four projections"""
+    for m in module.modules():
+        if isinstance(m, TransformerLayer):
+            with torch.no_grad():
+                wq, wk, wv, wm = (x.weight.double() for x in (m.q_proj, m.k_proj, m.v_proj, m.merge))
+                m.register_buffer("fold_q", (wk.t() @ wq).float(), persistent=False)
+                m.register_buffer("fold_v", (wm @ wv).float(), persistent=False)
 
 
 def _to_windows(x, h, w, k):
@@ -96,6 +137,108 @@ def _shift_windows(x, h, w, k, into):
     return _to_windows(t.reshape(b, h * w, c), h, w, k)
 
 
+def _region_attention(q, k, v, h, w, num_splits, group, groups):
+    """the shifted windows' attention of group `group` of `groups` (whole window rows, window-ordered tokens) as plain
+    attention per mask region (EXPORT_REGION_ATTENTION): the interior windows in one batch, the last column's windows
+    split into left / right, the last row's into top / bottom, the corner into four; [B, n * L, C] in and out"""
+    b, _, c = q.size()
+    wh, ww = h // num_splits, w // num_splits
+    sh, sw = wh // 2, ww // 2
+    th, lw = wh - sh, ww - sw  # a split window's top rows / left columns (the mask's region bounds)
+    rows = num_splits // groups
+    last = group == groups - 1
+    inner = rows - 1 if last else rows  # window rows with interior windows and a last-column window
+    qkv = [t.view(b, rows, num_splits, wh, ww, c) for t in (q, k, v)]
+
+    def attend(pick, tokens):
+        q_, k_, v_ = (pick(t).reshape(-1, tokens, c) for t in qkv)
+        scores = torch.matmul(q_, k_.permute(0, 2, 1)) / (c ** 0.5)
+        return torch.matmul(torch.softmax(scores, dim=-1), v_)
+
+    parts = []
+    if inner > 0:
+        mid = attend(lambda t: t[:, :inner, :num_splits - 1], wh * ww).view(b, inner, num_splits - 1, wh, ww, c)
+        left = attend(lambda t: t[:, :inner, num_splits - 1, :, :lw], wh * lw).view(b, inner, wh, lw, c)
+        right = attend(lambda t: t[:, :inner, num_splits - 1, :, lw:], wh * sw).view(b, inner, wh, sw, c)
+        parts.append(torch.cat((mid, torch.cat((left, right), dim=3).unsqueeze(2)), dim=2))
+    if last:
+        r = rows - 1
+        top = attend(lambda t: t[:, r, :num_splits - 1, :th], th * ww).view(b, num_splits - 1, th, ww, c)
+        bottom = attend(lambda t: t[:, r, :num_splits - 1, th:], sh * ww).view(b, num_splits - 1, sh, ww, c)
+        tl = attend(lambda t: t[:, r, num_splits - 1, :th, :lw], th * lw).view(b, th, lw, c)
+        tr = attend(lambda t: t[:, r, num_splits - 1, :th, lw:], th * sw).view(b, th, sw, c)
+        bl = attend(lambda t: t[:, r, num_splits - 1, th:, :lw], sh * lw).view(b, sh, lw, c)
+        br = attend(lambda t: t[:, r, num_splits - 1, th:, lw:], sh * sw).view(b, sh, sw, c)
+        corner = torch.cat((torch.cat((tl, tr), dim=2), torch.cat((bl, br), dim=2)), dim=1)
+        parts.append(torch.cat((torch.cat((top, bottom), dim=2), corner.unsqueeze(1)), dim=1).unsqueeze(1))
+    out = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+    return out.reshape(b, -1, c)
+
+
+def _to_groups(x, h, w, k, g):
+    """[B, H, W, C] raster -> [g, L, W_g * B, C]: g groups of whole window rows (K x K windows, each L = H/K x W/K
+    tokens), token-outer: the position in the window, then the window, then the frame; a group's [L, W_g * B, C] is
+    the fused attention kernel's own layout, so an attention needs no copy into it or out of it"""
+    b, _, _, c = x.shape
+    wh, ww, r = h // k, w // k, k // g
+    x = x.reshape(b, g, r, wh, k, ww, c).permute(1, 3, 5, 2, 4, 0, 6)
+    return x.reshape(g, wh * ww, b * r * k, c)
+
+
+def _from_groups(x, b, h, w, k, g):
+    """the inverse of _to_groups"""
+    c = x.shape[-1]
+    wh, ww, r = h // k, w // k, k // g
+    return x.reshape(g, wh, ww, r, k, b, c).permute(5, 0, 3, 1, 4, 2, 6).reshape(b, h, w, c)
+
+
+def _swap_frames(x, b):
+    """the cross attention's partner: the frame batch's halves swapped (frame-innermost tokens)"""
+    g, n, wb, c = x.shape
+    x = x.view(g, n, wb // b, b, c)
+    return torch.cat((x[:, :, :, b // 2:], x[:, :, :, :b // 2]), dim=3).view(g, n, wb, c)
+
+
+def _region_attention_tokens(q, k, v, h, w, num_splits, group, groups, nb):
+    """_region_attention on _to_groups' token-outer [L, W * nb, C]: a region = a slice of the position axes, its
+    windows x frames the attention batch"""
+    n, wb, c = q.shape
+    wh, ww = h // num_splits, w // num_splits
+    sh, sw = wh // 2, ww // 2
+    th, lw = wh - sh, ww - sw  # a split window's top rows / left columns (the mask's region bounds)
+    rows = num_splits // groups
+    last = group == groups - 1
+    inner = rows - 1 if last else rows  # window rows with interior windows and a last-column window
+    qkv = [t.view(wh, ww, rows, num_splits, nb, c) for t in (q, k, v)]
+
+    def attend(pick):
+        qs, ks, vs = (pick(t) for t in qkv)
+        ti, tj, tr_, tx = qs.shape[:4]
+        qh, kh, vh = (t.reshape(ti * tj, tr_ * tx * nb, c) for t in (qs, ks, vs))
+        s = torch.matmul(qh.permute(1, 0, 2), kh.permute(1, 2, 0)) / (c ** 0.5)
+        o = torch.matmul(torch.softmax(s, dim=-1), vh.permute(1, 0, 2)).permute(1, 0, 2)
+        return o.reshape(ti, tj, tr_, tx, nb, c)
+
+    parts = []
+    if inner > 0:
+        mid = attend(lambda t: t[:, :, :inner, :num_splits - 1])
+        left = attend(lambda t: t[:, :lw, :inner, num_splits - 1:])
+        right = attend(lambda t: t[:, lw:, :inner, num_splits - 1:])
+        parts.append(torch.cat((mid, torch.cat((left, right), dim=1)), dim=3))
+    if last:
+        r = rows - 1
+        top = attend(lambda t: t[:th, :, r:, :num_splits - 1])
+        bottom = attend(lambda t: t[th:, :, r:, :num_splits - 1])
+        tl = attend(lambda t: t[:th, :lw, r:, num_splits - 1:])
+        tr = attend(lambda t: t[:th, lw:, r:, num_splits - 1:])
+        bl = attend(lambda t: t[th:, :lw, r:, num_splits - 1:])
+        br = attend(lambda t: t[th:, lw:, r:, num_splits - 1:])
+        corner = torch.cat((torch.cat((tl, tr), dim=1), torch.cat((bl, br), dim=1)), dim=0)
+        parts.append(torch.cat((torch.cat((top, bottom), dim=0), corner), dim=3))
+    out = torch.cat(parts, dim=2) if len(parts) > 1 else parts[0]
+    return out.reshape(n, wb, c)
+
+
 def single_head_split_window_attention(q, k, v,
                                        num_splits=1,
                                        with_shift=False,
@@ -103,17 +246,34 @@ def single_head_split_window_attention(q, k, v,
                                        w=None,
                                        attn_mask=None,
                                        windowed=False,
+                                       windows=None,
                                        ):
     # Ref: https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
-    # q, k, v: [B, L, C]
+    # q, k, v: [B, L, C]; windows: a window-ordered group of that many whole windows (EXPORT_WINDOW_CHUNKS), attn_mask
+    # its rows; windowed "tokens": the group as [L, W * B, C] (_to_groups)
     assert q.dim() == k.dim() == v.dim() == 3
 
     assert h is not None and w is not None
-    assert q.size(1) == h * w
+
+    if windowed == "tokens":
+        # the tokens already sit in the (shifted) windows' token-outer order (FeatureTransformer._forward_windowed):
+        # the attention batch is the group's windows x frames, the mask repeated per frame; a (group, groups) pair in
+        # the mask's place = EXPORT_REGION_ATTENTION
+        n, wb, c = q.size()
+        nb = wb // windows
+        if with_shift and isinstance(attn_mask, tuple):
+            return _region_attention_tokens(q, k, v, h, w, num_splits, *attn_mask, nb)
+        scores = torch.matmul(q.permute(1, 0, 2), k.permute(1, 2, 0)) / (c ** 0.5)  # [W * B, L, L]
+        if with_shift:
+            scores += attn_mask.repeat_interleave(nb, dim=0)
+        attn = torch.softmax(scores, dim=-1)
+        return torch.matmul(attn, v.permute(1, 0, 2)).permute(1, 0, 2)  # [L, W * B, C]
+
+    assert windows is not None or q.size(1) == h * w
 
     b, _, c = q.size()
 
-    b_new = b * num_splits * num_splits
+    b_new = b * (windows or num_splits * num_splits)
 
     window_size_h = h // num_splits
     window_size_w = w // num_splits
@@ -122,8 +282,11 @@ def single_head_split_window_attention(q, k, v,
 
     if windowed:
         # the tokens already sit in the (shifted) windows' order (FeatureTransformer, _window_layout): each window's
-        # L tokens are contiguous, so [B, H*W, C] is [B*K*K, L, C] as it is
-        scores = torch.matmul(q.view(b_new, -1, c), k.view(b_new, -1, c).permute(0, 2, 1)) / scale_factor
+        # L tokens are contiguous, so [B, H*W, C] is [B*K*K, L, C] as it is; a (group, groups) pair in the mask's place
+        # = EXPORT_REGION_ATTENTION
+        if with_shift and isinstance(attn_mask, tuple):
+            return _region_attention(q, k, v, h, w, num_splits, *attn_mask)
+        scores =torch.matmul(q.view(b_new, -1, c), k.view(b_new, -1, c).permute(0, 2, 1)) / scale_factor
         if with_shift:
             scores += attn_mask.repeat(b, 1, 1)
         attn = torch.softmax(scores, dim=-1)
@@ -213,15 +376,23 @@ class TransformerLayer(nn.Module):
                 shifted_window_attn_mask=None,
                 attn_num_splits=None,
                 windowed=False,
+                windows=None,
                 **kwargs,
                 ):
         # source, target: [B, L, C]
         query, key, value = source, target, target
 
-        # single-head attention
-        query = self.q_proj(query)  # [B, L, C]
-        key = self.k_proj(key)  # [B, L, C]
-        value = self.v_proj(value)  # [B, L, C]
+        folded = torch.compiler.is_compiling() and hasattr(self, "fold_q")
+        if folded:
+            # export path (SMV): fold_projections' matrices; a window group's slice is viewed by the windowed attention
+            query = F.linear(query, self.fold_q)
+            key = key.contiguous()
+            value = F.linear(value, self.fold_v)
+        else:
+            # single-head attention
+            query = self.q_proj(query)  # [B, L, C]
+            key = self.k_proj(key)  # [B, L, C]
+            value = self.v_proj(value)  # [B, L, C]
 
         if self.attention_type == 'swin' and attn_num_splits > 1:
             if self.nhead > 1:
@@ -236,11 +407,13 @@ class TransformerLayer(nn.Module):
                                                              w=width,
                                                              attn_mask=shifted_window_attn_mask,
                                                              windowed=windowed,
+                                                             windows=windows,
                                                              )
         else:
             message = single_head_full_attention(query, key, value)  # [B, L, C]
 
-        message = self.merge(message)  # [B, L, C]
+        if not folded:
+            message = self.merge(message)  # [B, L, C]
         message = self.norm1(message)
 
         if not self.no_ffn:
@@ -284,6 +457,7 @@ class TransformerBlock(nn.Module):
                 shifted_window_attn_mask=None,
                 attn_num_splits=None,
                 windowed=False,
+                windows=None,
                 **kwargs,
                 ):
         # source, target: [B, L, C]
@@ -295,6 +469,7 @@ class TransformerBlock(nn.Module):
                                 shifted_window_attn_mask=shifted_window_attn_mask,
                                 attn_num_splits=attn_num_splits,
                                 windowed=windowed,
+                                windows=windows,
                                 )
 
         # cross attention and ffn
@@ -304,6 +479,7 @@ class TransformerBlock(nn.Module):
                                      shifted_window_attn_mask=shifted_window_attn_mask,
                                      attn_num_splits=attn_num_splits,
                                      windowed=windowed,
+                                     windows=windows,
                                      )
 
         return source
@@ -338,6 +514,16 @@ class FeatureTransformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+    def token_outer(self, attn_num_splits):
+        """export path (SMV): this scale runs _forward_windowed (EXPORT_TOKEN_OUTER)"""
+        return (self.attention_type == 'swin' and attn_num_splits > 1 and _window_layout()
+                and attn_num_splits in EXPORT_TOKEN_OUTER)
+
+    def takes_position(self, attn_num_splits):
+        """export path (SMV): this scale adds the position encoding itself, after _to_groups (EXPORT_TOKEN_POSITION),
+        so gmflow skips feature_add_position for it"""
+        return self.token_outer(attn_num_splits) and attn_num_splits in EXPORT_TOKEN_POSITION
+
     def forward(self, feature0, feature1,
                 attn_num_splits=None,
                 **kwargs,
@@ -345,6 +531,9 @@ class FeatureTransformer(nn.Module):
 
         b, c, h, w = feature0.shape
         assert self.d_model == c
+
+        if self.token_outer(attn_num_splits):
+            return self._forward_windowed(feature0, feature1, attn_num_splits, self.takes_position(attn_num_splits))
 
         feature0 = feature0.flatten(-2).permute(0, 2, 1)  # [B, H*W, C]
         feature1 = feature1.flatten(-2).permute(0, 2, 1)  # [B, H*W, C]
@@ -377,18 +566,36 @@ class FeatureTransformer(nn.Module):
             concat0 = _to_windows(concat0, h, w, attn_num_splits)
             concat1 = torch.cat(concat0.chunk(chunks=2, dim=0)[::-1], dim=0)
 
+        # a block works per token and per window, so it runs on groups of whole windows (window order makes each group
+        # a contiguous token range, its cross attention the same range of the other frame); the shifts see every token
+        g = EXPORT_WINDOW_CHUNKS if win and attn_num_splits == 8 else 1
+        kk = attn_num_splits * attn_num_splits
+        assert kk % g == 0
         for layer in self.layers:
             shifted = win and layer.self_attn.with_shift
+            regions = shifted and EXPORT_REGION_ATTENTION  # the attention takes its (group, groups), not the mask
             if shifted:
                 concat0 = _shift_windows(concat0, h, w, attn_num_splits, True)
                 concat1 = torch.cat(concat0.chunk(chunks=2, dim=0)[::-1], dim=0)
-            concat0 = layer(concat0, concat1,
-                            height=h,
-                            width=w,
-                            shifted_window_attn_mask=shifted_window_attn_mask,
-                            attn_num_splits=attn_num_splits,
-                            windowed=win,
-                            )
+            if g == 1:
+                concat0 = layer(concat0, concat1,
+                                height=h,
+                                width=w,
+                                shifted_window_attn_mask=(0, 1) if regions else shifted_window_attn_mask,
+                                attn_num_splits=attn_num_splits,
+                                windowed=win,
+                                )
+            else:
+                n = h * w // g
+                concat0 = torch.cat([layer(concat0[:, i * n:(i + 1) * n], concat1[:, i * n:(i + 1) * n],
+                                           height=h,
+                                           width=w,
+                                           shifted_window_attn_mask=(i, g) if regions else
+                                           shifted_window_attn_mask[i * kk // g:(i + 1) * kk // g],
+                                           attn_num_splits=attn_num_splits,
+                                           windowed=win,
+                                           windows=kk // g,
+                                           ) for i in range(g)], dim=1)
             if shifted:
                 concat0 = _shift_windows(concat0, h, w, attn_num_splits, False)
 
@@ -403,6 +610,44 @@ class FeatureTransformer(nn.Module):
         feature0 = feature0.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
         feature1 = feature1.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
 
+        return feature0, feature1
+
+    def _forward_windowed(self, feature0, feature1, k, with_position):
+        """export path (SMV, _window_layout + EXPORT_TOKEN_OUTER): every block works on one token-outer stream
+        (_to_groups), so an attention reads its group's [L, W * B, C] slice as it is (window-ordered tokens cost 3 copies
+        into the fused kernel's layout and 1 out per attention); the layout changes once in, once out, and a shifted
+        block's rolled windows once around the block (its self and cross attention share them); a block works per token
+        and per window, so at the quarter scale it runs on EXPORT_WINDOW_CHUNKS groups of whole window rows (a group's
+        tensors stay near the GPU's L2); with_position = add feature_add_position's per-window table here, once over
+        the position axis (takes_position)"""
+        b, c, h, w = feature0.shape
+        wsh, wsw = h // k, w // k
+        mask = generate_shift_window_attn_mask(input_resolution=(h, w), window_size_h=wsh, window_size_w=wsw,
+                                               shift_size_h=wsh // 2, shift_size_w=wsw // 2, device=feature0.device)
+        g = EXPORT_WINDOW_CHUNKS if k == 8 else 1
+        kk = k * k
+        assert k % g == 0
+        bb = 2 * b
+        x0 = _to_groups(torch.cat((feature0, feature1), dim=0).permute(0, 2, 3, 1), h, w, k, g)
+        if with_position:
+            pos = PositionEmbeddingSine(num_pos_feats=c // 2)(feature0[:1, :, :wsh, :wsw])  # [1, C, H/K, W/K]
+            x0 = x0 + pos[0].flatten(1).t()[None, :, None, :]
+        x1 = _swap_frames(x0, bb)
+        sh, sw = wsh // 2, wsw // 2
+        for layer in self.layers:
+            shifted = layer.self_attn.with_shift
+            regions = shifted and EXPORT_REGION_ATTENTION  # the attention takes its (group, groups), not the mask
+            if shifted:
+                x0 = _to_groups(_roll_hw(_from_groups(x0, bb, h, w, k, g), sh, sw, True), h, w, k, g)
+                x1 = _swap_frames(x0, bb)
+            x0 = torch.stack([layer(x0[i], x1[i], height=h, width=w,
+                                    shifted_window_attn_mask=(i, g) if regions else mask[i * kk // g:(i + 1) * kk // g],
+                                    attn_num_splits=k, windowed="tokens", windows=kk // g) for i in range(g)], dim=0)
+            if shifted:
+                x0 = _to_groups(_roll_hw(_from_groups(x0, bb, h, w, k, g), sh, sw, False), h, w, k, g)
+            x1 = _swap_frames(x0, bb)
+        out = _from_groups(x0, bb, h, w, k, g).permute(0, 3, 1, 2).contiguous()  # [2B, C, H, W]
+        feature0, feature1 = out.chunk(chunks=2, dim=0)
         return feature0, feature1
 
 

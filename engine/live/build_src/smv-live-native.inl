@@ -3434,6 +3434,328 @@ extern "C" __global__ void k_localCorr(const float* __restrict__ q, const float*
     }
 }
 
+// GMFlow's global matching and its flow propagation (between gmflow_bidir_a_m and A, trt_runtime.gmflow_matching_cut):
+// O[b, i] = sum_j softmax_j(Q[b, i] . K[b ^ kswap, j] * scale) V[b, j] with 128 channels and a 2-channel value. The
+// matching: Q = K = mf (f0, f1 token-major), kswap 1 (each frame's tokens attend to the other's), V = the pixel grid
+// (mode 1: x = j % gw, y = j / gw) and O minus the query's own grid point = the flow (mode 2); the propagation: mq / mk,
+// kswap 0, V = that flow, stored in A's prop dtype (mode 4 = fp16). Q / K fp16 as half pairs in 32-bit words, V / O
+// [B, N, 2]. A warp = 16 query rows, a block = 4 warps, grid (ceil(N / 64), B); keys in tiles of 64 through shared
+// memory (rows padded to 68 words: the fragment loads hit 32 distinct banks); Q K^T on the tensor cores (mma.sync
+// m16n8k16, fp32 accumulation), the softmax online in fp32 in base 2 (scale2 = scale * log2 e), the value product in
+// fp32. Keys past N score -inf, rows past N are not stored.
+#define AT_W 64
+#define AT_KT 64
+#define AT_SP 68
+__device__ __forceinline__ void attnMma(float* d, const unsigned* a, unsigned b0, unsigned b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ float attnEx2(float x)
+{
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+__device__ __forceinline__ float attnQuad(float x, bool mx)
+{
+    float a = __shfl_xor_sync(0xffffffffu, x, 1);
+    x = mx ? fmaxf(x, a) : x + a;
+    a = __shfl_xor_sync(0xffffffffu, x, 2);
+    return mx ? fmaxf(x, a) : x + a;
+}
+extern "C" __global__ void __launch_bounds__(128) k_attn2(const unsigned* __restrict__ q,
+                                                          const unsigned* __restrict__ k,
+                                                          const float* __restrict__ v, void* __restrict__ o, int n,
+                                                          int kswap, float scale2, int mode, int gw)
+{
+    __shared__ __align__(16) unsigned sk[AT_KT * AT_SP];
+    __shared__ float sv[AT_KT * 2];
+    const float ninf = __int_as_float(0xff800000);
+    const int b = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t4 = lane & 3;
+    const int r0 = blockIdx.x * 64 + warp * 16 + g, r1 = r0 + 8;
+    const unsigned* qb = q + (size_t)b * n * AT_W;
+    const unsigned* kb = k + (size_t)(b ^ kswap) * n * AT_W;
+    const float* vb = v + (size_t)b * n * 2;
+    unsigned qa[8][4];
+#pragma unroll
+    for (int s = 0; s < 8; ++s)
+    {
+        qa[s][0] = r0 < n ? qb[(size_t)r0 * AT_W + s * 8 + t4] : 0u;
+        qa[s][1] = r1 < n ? qb[(size_t)r1 * AT_W + s * 8 + t4] : 0u;
+        qa[s][2] = r0 < n ? qb[(size_t)r0 * AT_W + s * 8 + 4 + t4] : 0u;
+        qa[s][3] = r1 < n ? qb[(size_t)r1 * AT_W + s * 8 + 4 + t4] : 0u;
+    }
+    float m0 = ninf, m1 = ninf, l0 = 0.f, l1 = 0.f, x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f;
+    for (int j0 = 0; j0 < n; j0 += AT_KT)
+    {
+        __syncthreads();
+        for (int e = threadIdx.x; e < AT_KT * (AT_W / 4); e += 128)
+        {
+            const int row = e / (AT_W / 4), c4 = e % (AT_W / 4);
+            uint4 w = make_uint4(0u, 0u, 0u, 0u);
+            if (j0 + row < n)
+                w = reinterpret_cast<const uint4*>(kb + (size_t)(j0 + row) * AT_W)[c4];
+            reinterpret_cast<uint4*>(sk + row * AT_SP)[c4] = w;
+        }
+        if (threadIdx.x < AT_KT * 2)
+        {
+            const int j = j0 + (int)(threadIdx.x >> 1), c = threadIdx.x & 1;
+            sv[threadIdx.x] = j >= n ? 0.f : (mode & 1) ? (float)(c ? j / gw : j % gw) : vb[(size_t)j * 2 + c];
+        }
+        __syncthreads();
+        float acc[8][4];
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+        {
+            acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+            const unsigned* kr = sk + (t * 8 + g) * AT_SP + t4;
+#pragma unroll
+            for (int s = 0; s < 8; ++s)
+                attnMma(acc[t], qa[s], kr[s * 8], kr[s * 8 + 4]);
+        }
+        float mx0 = m0, mx1 = m1;
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+#pragma unroll
+            for (int c = 0; c < 2; ++c)
+            {
+                const bool in = j0 + t * 8 + t4 * 2 + c < n;
+                acc[t][c] = in ? acc[t][c] * scale2 : ninf;
+                acc[t][2 + c] = in ? acc[t][2 + c] * scale2 : ninf;
+                mx0 = fmaxf(mx0, acc[t][c]);
+                mx1 = fmaxf(mx1, acc[t][2 + c]);
+            }
+        mx0 = attnQuad(mx0, true);
+        mx1 = attnQuad(mx1, true);
+        const float c0 = attnEx2(m0 - mx0), c1 = attnEx2(m1 - mx1);
+        l0 *= c0;
+        x0 *= c0;
+        y0 *= c0;
+        l1 *= c1;
+        x1 *= c1;
+        y1 *= c1;
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+#pragma unroll
+            for (int c = 0; c < 2; ++c)
+            {
+                const int key = t * 8 + t4 * 2 + c;
+                const float vx = sv[key * 2], vy = sv[key * 2 + 1];
+                const float p0 = attnEx2(acc[t][c] - mx0), p1 = attnEx2(acc[t][2 + c] - mx1);
+                l0 += p0;
+                x0 += p0 * vx;
+                y0 += p0 * vy;
+                l1 += p1;
+                x1 += p1 * vx;
+                y1 += p1 * vy;
+            }
+        m0 = mx0;
+        m1 = mx1;
+    }
+    l0 = attnQuad(l0, false);
+    x0 = attnQuad(x0, false);
+    y0 = attnQuad(y0, false);
+    l1 = attnQuad(l1, false);
+    x1 = attnQuad(x1, false);
+    y1 = attnQuad(y1, false);
+    if (t4 != 0)
+        return;
+    for (int h = 0; h < 2; ++h)
+    {
+        const int r = h ? r1 : r0;
+        if (r >= n)
+            continue;
+        float ox = (h ? x1 / l1 : x0 / l0), oy = (h ? y1 / l1 : y0 / l0);
+        if (mode & 2)
+        {
+            ox -= (float)(r % gw);
+            oy -= (float)(r / gw);
+        }
+        const size_t at = ((size_t)b * n + r) * 2;
+        if (mode & 4)
+        {
+            unsigned short hx, hy;
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hx) : "f"(ox));
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hy) : "f"(oy));
+            ((unsigned short*)o)[at] = hx;
+            ((unsigned short*)o)[at + 1] = hy;
+        }
+        else
+        {
+            ((float*)o)[at] = ox;
+            ((float*)o)[at + 1] = oy;
+        }
+    }
+}
+// k_attn2b: k_attn2 with the key tiles double-buffered through cp.async (the next tile loads while this one computes)
+// and the key fragments read by ldmatrix.x4 (four 8 x 8 matrices a load: b0 / b1 of two k-steps); bit-identical to
+// k_attn2, faster at small N only (the host's kAttn2bMaxN)
+__device__ __forceinline__ unsigned attnSmem(const void* p)
+{
+    unsigned a;
+    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
+    return a;
+}
+// one key tile (rows j0 .. j0 + 63) and its values into a stage: a 16-byte cp.async per (row, 16-byte column), rows
+// past n zero-filled; the values as k_attn2 reads them
+__device__ __forceinline__ void attnLoad(unsigned* sk, float* sv, const unsigned* kb, const float* vb, int j0, int n,
+                                         int mode, int gw)
+{
+    for (int e = threadIdx.x; e < AT_KT * (AT_W / 4); e += 128)
+    {
+        const int row = e / (AT_W / 4), c4 = e % (AT_W / 4);
+        const unsigned dst = attnSmem(sk + row * AT_SP + c4 * 4);
+        const unsigned* src = kb + (size_t)(j0 + (j0 + row < n ? row : 0)) * AT_W + c4 * 4;
+        const int bytes = j0 + row < n ? 16 : 0;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(bytes));
+    }
+    if (threadIdx.x < AT_KT * 2)
+    {
+        const int j = j0 + (int)(threadIdx.x >> 1), c = threadIdx.x & 1;
+        sv[threadIdx.x] = j >= n ? 0.f : (mode & 1) ? (float)(c ? j / gw : j % gw) : vb[(size_t)j * 2 + c];
+    }
+    asm volatile("cp.async.commit_group;");
+}
+extern "C" __global__ void __launch_bounds__(128) k_attn2b(const unsigned* __restrict__ q,
+                                                           const unsigned* __restrict__ k,
+                                                           const float* __restrict__ v, void* __restrict__ o, int n,
+                                                           int kswap, float scale2, int mode, int gw)
+{
+    __shared__ __align__(16) unsigned sk[2][AT_KT * AT_SP];
+    __shared__ float sv[2][AT_KT * 2];
+    const float ninf = __int_as_float(0xff800000);
+    const int b = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t4 = lane & 3;
+    const int r0 = blockIdx.x * 64 + warp * 16 + g, r1 = r0 + 8;
+    const unsigned* qb = q + (size_t)b * n * AT_W;
+    const unsigned* kb = k + (size_t)(b ^ kswap) * n * AT_W;
+    const float* vb = v + (size_t)b * n * 2;
+    unsigned qa[8][4];
+#pragma unroll
+    for (int s = 0; s < 8; ++s)
+    {
+        qa[s][0] = r0 < n ? qb[(size_t)r0 * AT_W + s * 8 + t4] : 0u;
+        qa[s][1] = r1 < n ? qb[(size_t)r1 * AT_W + s * 8 + t4] : 0u;
+        qa[s][2] = r0 < n ? qb[(size_t)r0 * AT_W + s * 8 + 4 + t4] : 0u;
+        qa[s][3] = r1 < n ? qb[(size_t)r1 * AT_W + s * 8 + 4 + t4] : 0u;
+    }
+    // ldmatrix: lane L addresses row L & 7 of matrix L >> 3 = the half columns s * 16 + (L >> 3) * 8 of key t * 8 +
+    // (L & 7); the four matrices = b0 / b1 of k-step s and of s + 1
+    const int lrow = lane & 7, lcol = (lane >> 3) * 4;
+    float m0 = ninf, m1 = ninf, l0 = 0.f, l1 = 0.f, x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f;
+    attnLoad(sk[0], sv[0], kb, vb, 0, n, mode, gw);
+    int st = 0;
+    for (int j0 = 0; j0 < n; j0 += AT_KT, st ^= 1)
+    {
+        if (j0 + AT_KT < n)
+        {
+            attnLoad(sk[st ^ 1], sv[st ^ 1], kb, vb, j0 + AT_KT, n, mode, gw);
+            asm volatile("cp.async.wait_group 1;");
+        }
+        else
+            asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+        float acc[8][4];
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+        {
+            acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+            const unsigned base = attnSmem(sk[st] + (t * 8 + lrow) * AT_SP + lcol);
+#pragma unroll
+            for (int s = 0; s < 8; s += 2)
+            {
+                unsigned f0, f1, f2, f3;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                             : "=r"(f0), "=r"(f1), "=r"(f2), "=r"(f3)
+                             : "r"(base + s * 32));
+                attnMma(acc[t], qa[s], f0, f1);
+                attnMma(acc[t], qa[s + 1], f2, f3);
+            }
+        }
+        float mx0 = m0, mx1 = m1;
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+#pragma unroll
+            for (int c = 0; c < 2; ++c)
+            {
+                const bool in = j0 + t * 8 + t4 * 2 + c < n;
+                acc[t][c] = in ? acc[t][c] * scale2 : ninf;
+                acc[t][2 + c] = in ? acc[t][2 + c] * scale2 : ninf;
+                mx0 = fmaxf(mx0, acc[t][c]);
+                mx1 = fmaxf(mx1, acc[t][2 + c]);
+            }
+        mx0 = attnQuad(mx0, true);
+        mx1 = attnQuad(mx1, true);
+        const float c0 = attnEx2(m0 - mx0), c1 = attnEx2(m1 - mx1);
+        l0 *= c0;
+        x0 *= c0;
+        y0 *= c0;
+        l1 *= c1;
+        x1 *= c1;
+        y1 *= c1;
+        const float* svs = sv[st];
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+#pragma unroll
+            for (int c = 0; c < 2; ++c)
+            {
+                const int key = t * 8 + t4 * 2 + c;
+                const float vx = svs[key * 2], vy = svs[key * 2 + 1];
+                const float p0 = attnEx2(acc[t][c] - mx0), p1 = attnEx2(acc[t][2 + c] - mx1);
+                l0 += p0;
+                x0 += p0 * vx;
+                y0 += p0 * vy;
+                l1 += p1;
+                x1 += p1 * vx;
+                y1 += p1 * vy;
+            }
+        m0 = mx0;
+        m1 = mx1;
+        __syncthreads();
+    }
+    l0 = attnQuad(l0, false);
+    x0 = attnQuad(x0, false);
+    y0 = attnQuad(y0, false);
+    l1 = attnQuad(l1, false);
+    x1 = attnQuad(x1, false);
+    y1 = attnQuad(y1, false);
+    if (t4 != 0)
+        return;
+    for (int h = 0; h < 2; ++h)
+    {
+        const int r = h ? r1 : r0;
+        if (r >= n)
+            continue;
+        float ox = (h ? x1 / l1 : x0 / l0), oy = (h ? y1 / l1 : y0 / l0);
+        if (mode & 2)
+        {
+            ox -= (float)(r % gw);
+            oy -= (float)(r / gw);
+        }
+        const size_t at = ((size_t)b * n + r) * 2;
+        if (mode & 4)
+        {
+            unsigned short hx, hy;
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hx) : "f"(ox));
+            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hy) : "f"(oy));
+            ((unsigned short*)o)[at] = hx;
+            ((unsigned short*)o)[at + 1] = hy;
+        }
+        else
+        {
+            ((float*)o)[at] = ox;
+            ((float*)o)[at + 1] = oy;
+        }
+    }
+}
+#undef AT_W
+#undef AT_KT
+#undef AT_SP
+
 // ---- live GMFSS at a flow scale below 1 (--gmfss-flow, GMFSS_infer_u.reuse's scale branch) ----------------------
 // Both halves shrink to the /32 flow grid the way F.interpolate(size=(fh, fw), mode='bilinear', align_corners=False,
 // antialias=True) does (torch's _compute_weights_aa: the triangle filter over a window of support = the ratio,
@@ -3948,9 +4270,10 @@ static NativeTrtLogger g_nativeTrtLogger;
     } while (0)
 
 // the GMFSS engine slots: feat_ext, gmflow_bidir's first half (A), metricnet, the GMFSS IFNet, fusionnet, gmflow_bidir's
-// second half (B), then gmflow's backbone (one frame); the host computes gmflow's local correlation between A and B and
-// hands A each frame's backbone maps once
-constexpr int kGmN = 7;
+// second half (B), gmflow's backbone (one frame), then A's front (`_m`: up to the scale-0 global matching); the host
+// computes the matching and its propagation between `_m` and A (k_attn2) and gmflow's local correlation between A and B,
+// and hands `_m` and A each frame's backbone maps once
+constexpr int kGmN = 8;
 // A's outputs in this order (trt_runtime.gmflow_split's contract): q and f feed k_localCorr with coords, the rest
 // go to B beside the correlation
 static const char* const kGmA[8] = {"q", "f", "coords", "win", "valid", "flow0", "feat", "flow1"};
@@ -4035,6 +4358,14 @@ struct NativeRife
     int gmMapsKind = 0;
     float* dGmCorr = nullptr;
     int gmH = 0, gmW = 0, gmK = 0;
+    // between `_m` and A: its outputs mf / mq / mk (fp16 [2, N, 128] each), the matching's flow (fp32 [2, N, 2]) and
+    // A's prop input; N = gmN8 tokens on the eighth grid gmW8 wide, gmPropHalf = prop is fp16
+    void* dGmM[3] = {};
+    float* dGmFlow8 = nullptr;
+    void* dGmProp = nullptr;
+    int gmN8 = 0, gmW8 = 0;
+    bool gmPropHalf = false;
+    bool gmAttnB = false; // the matching and propagation run k_attn2b (N <= kAttn2bMaxN)
     // the chain's contract, read off the engines in nativeGmfssSetup (never from the handoff
     // line, the 5a rule), and the planar NCHW buffers it sizes from that. Levels: the half
     // (hh, hw), the quarter and the eighth, exactly GMFSS_infer_u's feature pyramid.
@@ -4524,9 +4855,11 @@ struct NativeRife
     CUfunction fPackBgraSdr = nullptr, fUnpackBgraSdr = nullptr;              // FRUC's SDR pairs on HDR planes
     CUfunction fHdrRestOut = nullptr;                                         // Restore's way back on HDR planes
     CUfunction fLocalCorr = nullptr;                                          // gmflow's local correlation, fused
-    int* dStaticFlag = nullptr; // device flag k_pairDiff sets when the pair differs
-    int* hStaticFlag = nullptr; // pinned readback of it, one int per group
-    uint64_t staticN = 0;       // identical pairs held this session
+    CUfunction fAttn2 = nullptr;  // gmflow's global matching and propagation (k_attn2)
+    CUfunction fAttn2b = nullptr; // the same, double-buffered (k_attn2b, gmAttnB)
+    int* dStaticFlag = nullptr;   // device flag k_pairDiff sets when the pair differs
+    int* hStaticFlag = nullptr;   // pinned readback of it, one int per group
+    uint64_t staticN = 0;         // identical pairs held this session
 
     // ---- protocol plumbing
     std::mutex mMsg, mTok;
@@ -4730,9 +5063,48 @@ static bool nativeBackendOk(const std::wstring& backend)
 }
 
 // the GMFSS engine set, in handoff order (the NATIVE-PATH keys and the log names)
-static const char* const kGmKey[kGmN] = {"gfeat", "gflow", "gmetric", "gifnet", "gfusion", "gflowb", "gbone"};
-static const char* const kGmName[kGmN] = {"feat_ext",  "gmflow_bidir_a", "metricnet",      "ifnet",
-                                          "fusionnet", "gmflow_bidir_b", "gmflow_backbone"};
+static const char* const kGmKey[kGmN] = {"gfeat", "gflow", "gmetric", "gifnet", "gfusion", "gflowb", "gbone", "gflowm"};
+static const char* const kGmName[kGmN] = {"feat_ext",  "gmflow_bidir_a", "metricnet",       "ifnet",
+                                          "fusionnet", "gmflow_bidir_b", "gmflow_backbone", "gmflow_bidir_a_m"};
+
+// gmflow_bidir_a with its quarter-scale transformer in 1 / 2 / 4 / 8 groups of whole windows (onnx_export.py
+// GMFLOW_CHUNKS): the most groups up to 8 that keep >= kGmChunkTokens quarter-scale tokens (both frames) a group, so a
+// group's tensors stay near the L2; fewer tokens a group cost more than they save
+static const char* const kGmFlowA[4] = {"gmflow_bidir_a", "gmflow_bidir_a_g2", "gmflow_bidir_a_g4",
+                                        "gmflow_bidir_a_g8"};
+static constexpr int64_t kGmChunkTokens = 4500;
+// from kGmRegionTokens a group up, the 8-group graph whose shifted blocks attend per mask region (onnx_export.py
+// GMFLOW_REGION_CHUNKS) instead of through the masked kernel: big windows gain (the 1440p DLAA half x0.94, the 4K half
+// x0.83), small ones lose to the extra calls (5,376 a group x1.03)
+static constexpr int64_t kGmRegionTokens = 9000;
+// the scale-0 matching's token count up to which k_attn2b runs instead of k_attn2 (bit-identical; 160 W, matching +
+// propagation: Ultra's 1,792 x0.88, Performance's 3,840 x1.07 and Balanced's 5,376 x1.16 slower); SMV_GM_ATTN2B=0 =
+// k_attn2 at every N
+static constexpr int kAttn2bMaxN = 1792;
+static const char* lkGmFlowA(int gh, int gw)
+{
+    const int64_t tokens = 2 * (int64_t)(gh / 4) * (gw / 4);
+    int i = 3;
+    while (i > 0 && (tokens >> i) < kGmChunkTokens)
+        --i;
+    if (i == 3 && (tokens >> 3) >= kGmRegionTokens)
+        return "gmflow_bidir_a_g8r";
+    return kGmFlowA[i];
+}
+
+// the `_m` graph cut from the same export as lkGmFlowA's pick (trt_runtime.gmflow_matching_cut)
+static const char* lkGmFlowM(int gh, int gw)
+{
+    static const char* const a[5] = {"gmflow_bidir_a", "gmflow_bidir_a_g2", "gmflow_bidir_a_g4", "gmflow_bidir_a_g8",
+                                     "gmflow_bidir_a_g8r"};
+    static const char* const m[5] = {"gmflow_bidir_a_m", "gmflow_bidir_a_g2_m", "gmflow_bidir_a_g4_m",
+                                     "gmflow_bidir_a_g8_m", "gmflow_bidir_a_g8r_m"};
+    const char* pick = lkGmFlowA(gh, gw);
+    for (int i = 0; i < 5; i++)
+        if (!strcmp(pick, a[i]))
+            return m[i];
+    return nullptr;
+}
 
 // Upscale to: _Fit.__init__'s derivation of the
 // internal render size from the exe's own --upscale H and the handoff geometry: the factor
@@ -5336,21 +5708,22 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
                 s.fh = s.fw = 0;
         }
         const int gh = s.fh ? s.fh : hh, gw = s.fh ? s.fw : hw;
-        const int64_t q4 = (int64_t)(gh / 4) * (gw / 4), K = 81;
-        // featurenet at the padded frame, the rest at the half, gmflow at its grid; gmflow_bidir as two engines around
-        // k_localCorr (its quarter-scale local correlation, never the [2, 128, HW, 81] product), A
-        // with the doubled workspace ceiling (the global matching); the IFNet's ONNX key carries its
-        // baked scale list
+        const int64_t q4 = (int64_t)(gh / 4) * (gw / 4), q8 = (int64_t)(gh / 8) * (gw / 8), K = 81;
+        // featurenet at the padded frame, the rest at the half, gmflow at its grid; gmflow_bidir as `_m` + A + B: the
+        // scale-0 global matching and propagation between `_m` and A (k_attn2) and the quarter-scale local correlation
+        // between A and B (k_localCorr, never the [2, 128, HW, 81] product), A with the doubled workspace ceiling; the
+        // IFNet's ONNX key carries its baked scale list
         s.gm = {
             {"gfeat", "featurenet", "featurenet", 1, {{"x", {1, 3, s.ph, s.pw}}}},
             {"gflow",
-             "gmflow_bidir_a",
-             "gmflow_bidir_a",
+             lkGmFlowA(gh, gw),
+             lkGmFlowA(gh, gw),
              2,
              {{"map4", {2, 128, gh / 4, gw / 4}},
               {"map8", {2, 128, gh / 8, gw / 8}},
               {"img0", {1, 3, gh, gw}},
-              {"img1", {1, 3, gh, gw}}}},
+              {"img1", {1, 3, gh, gw}},
+              {"prop", {2, q8, 2}}}},
             {"gmetric",
              "metricnet",
              "metricnet",
@@ -5379,6 +5752,14 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
               {"flow1", {2, 2, gh / 4, gw / 4}}},
              2},
             {"gbone", "gmflow_backbone", "gmflow_backbone", 1, {{"img0", {1, 3, gh, gw}}}},
+            {"gflowm",
+             lkGmFlowM(gh, gw),
+             lkGmFlowM(gh, gw),
+             1,
+             {{"map4", {2, 128, gh / 4, gw / 4}},
+              {"map8", {2, 128, gh / 8, gw / 8}},
+              {"img0", {1, 3, gh, gw}},
+              {"img1", {1, 3, gh, gw}}}},
         };
         // on the fusionnet jit; the `|0x0` tail is a legacy flow-grid field, kept so existing
         // warm markers still match
@@ -5744,6 +6125,26 @@ static bool lkWriteFile(const std::string& path, const void* data, size_t n)
     return MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
 }
 
+// The cap on TensorRT-RTX's auxiliary streams for the GMFSS nets where its heuristic (3 on fusionnet and metricnet, 1
+// on gmflow_bidir_b and gmflow_backbone) is slower or larger than a lower cap, outputs identical: gmflow_bidir_b 0
+// (x0.73 at 960x544, less memory), metricnet 0 (x0.95, 15 to 56 MiB more), gmflow_backbone 0 (x0.97 to 1.00, less
+// memory), fusionnet 2 (x0.97 to 0.99, 7 to 10 % less memory; 0 or 1 is 1 to 2 % slower). -1 = the heuristic's choice.
+// trt_lookup.HOST_BUILD names this table, so a change empties the engine cache once.
+static int lkAuxStreamCap(const std::string& onnx)
+{
+    static const struct
+    {
+        const char* prefix;
+        int cap;
+    } kCaps[] = {{"gmflow_bidir_b_", 0}, {"metricnet_", 0}, {"gmflow_backbone_", 0}, {"fusionnet_", 2}};
+    const size_t sl = onnx.find_last_of("\\/");
+    const std::string base = sl == std::string::npos ? onnx : onnx.substr(sl + 1);
+    for (const auto& c : kCaps)
+        if (!base.compare(0, strlen(c.prefix), c.prefix))
+            return c.cap;
+    return -1;
+}
+
 // one engine from a size-free ONNX; *oom = the failure was memory-shaped (python's .nofit rule:
 // a null build or an out-of-memory message)
 static bool lkBuild(nvinfer1::IRuntime* rt, const std::string& onnx, const std::string& out,
@@ -5781,6 +6182,9 @@ static bool lkBuild(nvinfer1::IRuntime* rt, const std::string& onnx, const std::
     }
     cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, (size_t)(ws * (1ull << 30)) * wsMult);
     cfg->setBuilderOptimizationLevel(5);
+    const int auxCap = lkAuxStreamCap(onnx);
+    if (auxCap >= 0)
+        cfg->setMaxAuxStreams(auxCap);
     for (int i = 0; i < net->getNbInputs(); i++)
     {
         nvinfer1::ITensor* t = net->getInput(i);
@@ -7068,6 +7472,8 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fRgbaBgra, "k_rgbaBgra"},
         {&nr.fHdrRestOut, "k_hdrRestOut"},
         {&nr.fLocalCorr, "k_localCorr"},
+        {&nr.fAttn2, "k_attn2"},
+        {&nr.fAttn2b, "k_attn2b"},
     };
     for (auto& e : fns)
         if (cuModuleGetFunction(e.fn, nr.cuMod, e.nm) != CUDA_SUCCESS)
@@ -10285,8 +10691,8 @@ static bool nativeGmSplitCheck(NativeRife& nr)
                 return false;
         return true;
     };
-    if (a->getNbIOTensors() != 12 || b->getNbIOTensors() != 9)
-        return bad("gmflow_bidir_a / _b", "do not have the split's 12 / 9 tensors");
+    if (a->getNbIOTensors() != 13 || b->getNbIOTensors() != 9)
+        return bad("gmflow_bidir_a / _b", "do not have the split's 13 / 9 tensors");
     nvinfer1::ICudaEngine* bb = nr.engGm[6];
     if (bb->getNbIOTensors() != 3)
         return bad("gmflow_backbone", "does not have its 3 tensors (img0 -> map4, map8)");
@@ -10317,6 +10723,33 @@ static bool nativeGmSplitCheck(NativeRife& nr)
         return bad("f", "is not [2, H, W, 128] on the quarter of gmflow's frame (the half, or its flow grid)");
     nr.gmH = (int)f.d[1];
     nr.gmW = (int)f.d[2];
+    // `_m` (slot 7): A's four inputs -> mf / mq / mk, fp16 [2, N, 128] on the eighth grid (k_attn2 reads only fp16);
+    // A takes the propagation's output as prop [2, N, 2], fp16 or fp32
+    nvinfer1::ICudaEngine* m = nr.engGm[7];
+    if (m->getNbIOTensors() != 7)
+        return bad("gmflow_bidir_a_m", "does not have its 7 tensors (map4, map8, img0, img1 -> mf, mq, mk)");
+    for (const char* nm : {"map4", "map8", "img0", "img1"})
+        if (m->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kINPUT ||
+            !same(m->getTensorShape(nm), a->getTensorShape(nm)) || m->getTensorDataType(nm) != a->getTensorDataType(nm))
+            return bad(nm, "is not the same input of gmflow_bidir_a_m and gmflow_bidir_a");
+    const nvinfer1::Dims mt = m->getTensorShape("mf");
+    for (const char* nm : {"mf", "mq", "mk"})
+        if (m->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT ||
+            m->getTensorDataType(nm) != nvinfer1::DataType::kHALF || !same(m->getTensorShape(nm), mt))
+            return bad(nm, "is not an fp16 output of gmflow_bidir_a_m shaped like mf");
+    if (mt.nbDims != 3 || mt.d[0] != 2 || mt.d[2] != 128 || mt.d[1] != (int64_t)(gh / 8) * (gw / 8))
+        return bad("mf", "is not [2, N, 128] on the eighth of gmflow's frame");
+    const nvinfer1::Dims pr = a->getTensorShape("prop");
+    const nvinfer1::DataType pt = a->getTensorDataType("prop");
+    if (a->getTensorIOMode("prop") != nvinfer1::TensorIOMode::kINPUT || pr.nbDims != 3 || pr.d[0] != 2 ||
+        pr.d[1] != mt.d[1] || pr.d[2] != 2 || (pt != nvinfer1::DataType::kHALF && pt != nvinfer1::DataType::kFLOAT))
+        return bad("prop", "is not a [2, N, 2] fp16 / fp32 input of gmflow_bidir_a");
+    nr.gmN8 = (int)mt.d[1];
+    nr.gmW8 = gw / 8;
+    nr.gmPropHalf = pt == nvinfer1::DataType::kHALF;
+    char attnEv[4] = {};
+    nr.gmAttnB = nr.gmN8 <= kAttn2bMaxN &&
+                 !(GetEnvironmentVariableA("SMV_GM_ATTN2B", attnEv, sizeof(attnEv)) > 0 && attnEv[0] == '0');
     const int64_t hw = (int64_t)nr.gmH * nr.gmW;
     if (q.nbDims != 3 || q.d[0] != 2 || q.d[1] != hw || q.d[2] != 128)
         return bad("q", "is not [2, H * W, 128]");
@@ -10505,6 +10938,11 @@ static bool nativeGmfssSetup(NativeRife& nr)
         NCHK(cudaMalloc(&nr.dGmA[i], trtTensorBytes(nr.engGm[1], kGmA[i])), "alloc gmfss split tensors");
     NCHK(cudaMalloc((void**)&nr.dGmCorr, (size_t)2 * nr.gmH * nr.gmW * nr.gmK * sizeof(float)),
          "alloc gmfss local correlation");
+    static const char* const kGmM[3] = {"mf", "mq", "mk"};
+    for (int i = 0; i < 3; i++)
+        NCHK(cudaMalloc(&nr.dGmM[i], trtTensorBytes(nr.engGm[7], kGmM[i])), "alloc gmfss matching operands");
+    NCHK(cudaMalloc((void**)&nr.dGmFlow8, (size_t)2 * nr.gmN8 * 2 * sizeof(float)), "alloc gmfss matching flow");
+    NCHK(cudaMalloc(&nr.dGmProp, trtTensorBytes(nr.engGm[1], "prop")), "alloc gmfss propagated flow");
     for (int i = 0; i < 2; i++)
     {
         const size_t bytes = trtTensorBytes(nr.engGm[1], i ? "map8" : "map4");
@@ -10529,6 +10967,8 @@ static bool nativeGmfssSetup(NativeRife& nr)
         ((double)freeB - (double)freeA) / 1048576.0);
     LOG("native: gmfss chain: gmflow split, its local correlation in one kernel (%dx%d, %d samples a pixel)\n", nr.gmW,
         nr.gmH, nr.gmK);
+    LOG("native: gmfss chain: the global matching by %s (%d tokens a frame)\n", nr.gmAttnB ? "k_attn2b" : "k_attn2",
+        nr.gmN8);
     nr.gmProf = GetEnvironmentVariableW(L"SMV_LIVE_GMFSS_PROF", nullptr, 0) != 0;
     if (nr.gmProf)
         for (auto& e : nr.gmEv)
@@ -11466,12 +11906,21 @@ static void nativeFree(NativeRife& nr)
                     nr.dGmA[6],
                     nr.dGmA[7],
                     (void*)nr.dGmCorr,
+                    nr.dGmM[0],
+                    nr.dGmM[1],
+                    nr.dGmM[2],
+                    (void*)nr.dGmFlow8,
+                    nr.dGmProp,
                     nr.dGmMap[0],
                     nr.dGmMap[1]})
         if (p)
             cudaFree(p);
     for (auto& p : nr.dGmA)
         p = nullptr;
+    for (auto& p : nr.dGmM)
+        p = nullptr;
+    nr.dGmFlow8 = nullptr;
+    nr.dGmProp = nullptr;
     nr.dGmCorr = nullptr;
     nr.dGmMap[0] = nr.dGmMap[1] = nullptr;
     nr.gmMapsNext = false;
@@ -11702,16 +12151,62 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         return false;
     }
     nr.gmMapsKind = kind;
-    // the fused bidir GMFlow (both directions: A on both frames' maps, the local correlation (k_localCorr: one warp a
-    // pixel, 4 a block) and B) and metricnet on the same halves
+    // the fused bidir GMFlow (both directions: `_m` on both frames' maps, the scale-0 global matching and its propagation
+    // (k_attn2 twice: the matching with the pixel grid as its value writes the flow, the propagation reads it), A, the
+    // local correlation (k_localCorr: one warp a pixel, 4 a block) and B) and metricnet on the same halves
+    const int64_t cpuF0 = profPair ? nowQpc100() : 0;
+    ctx = nr.ctxGm[7];
+    ctx->setTensorAddress("map4", nr.dGmMap[0]);
+    ctx->setTensorAddress("map8", nr.dGmMap[1]);
+    ctx->setTensorAddress("img0", g0);
+    ctx->setTensorAddress("img1", g1);
+    ctx->setTensorAddress("mf", nr.dGmM[0]);
+    ctx->setTensorAddress("mq", nr.dGmM[1]);
+    ctx->setTensorAddress("mk", nr.dGmM[2]);
+    if (!ctx->enqueueV3(st))
+    {
+        nr.die("gmfss gmflow_bidir_a_m enqueueV3 returned false");
+        return false;
+    }
+    {
+        float scale2 = 1.44269504f / 11.3137085f; // log2 e / sqrt(128): the softmax in base 2
+        int n8 = nr.gmN8, kswapMatch = 1, kswapProp = 0, modeMatch = 3, modeProp = nr.gmPropHalf ? 4 : 0;
+        const float* noV = nullptr;
+        void* am[] = {(void*)&nr.dGmM[0],
+                      (void*)&nr.dGmM[0],
+                      (void*)&noV,
+                      (void*)&nr.dGmFlow8,
+                      &n8,
+                      &kswapMatch,
+                      &scale2,
+                      &modeMatch,
+                      &nr.gmW8};
+        void* ap[] = {(void*)&nr.dGmM[1],
+                      (void*)&nr.dGmM[2],
+                      (void*)&nr.dGmFlow8,
+                      (void*)&nr.dGmProp,
+                      &n8,
+                      &kswapProp,
+                      &scale2,
+                      &modeProp,
+                      &nr.gmW8};
+        const unsigned gx = (unsigned)((n8 + 63) / 64);
+        const CUfunction fa = nr.gmAttnB ? nr.fAttn2b : nr.fAttn2;
+        if (cuLaunchKernel(fa, gx, 2, 1, 128, 1, 1, 0, (CUstream)st, am, nullptr) != CUDA_SUCCESS ||
+            cuLaunchKernel(fa, gx, 2, 1, 128, 1, 1, 0, (CUstream)st, ap, nullptr) != CUDA_SUCCESS)
+        {
+            nr.die("gmfss global matching launch failed");
+            return false;
+        }
+    }
     ctx = nr.ctxGm[1];
     ctx->setTensorAddress("map4", nr.dGmMap[0]);
     ctx->setTensorAddress("map8", nr.dGmMap[1]);
     ctx->setTensorAddress("img0", g0);
     ctx->setTensorAddress("img1", g1);
+    ctx->setTensorAddress("prop", nr.dGmProp);
     for (int i = 0; i < 8; i++)
         ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
-    const int64_t cpuF0 = profPair ? nowQpc100() : 0;
     if (!ctx->enqueueV3(st))
     {
         nr.die("gmfss gmflow_bidir_a enqueueV3 returned false");

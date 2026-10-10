@@ -218,6 +218,13 @@ class Host
     NVSDK_NGX_Result m_last = NVSDK_NGX_Result_Success;
     bool m_ngxUp = false;
     void setPassParams(int k, int last); // the create-time keys of pass k (of 0..last) on m_pparams[k]
+    // DLSSNR.LocalToneStrength of pass k: the user's tone on the first pass only; the local tone
+    // darkens the frame again on every pass it runs (mean luma x0.95 a pass at tone 1, Natural),
+    // while passes 2+ at tone 0 keep the first pass's level and still work on the structure
+    float passTone(int k) const
+    {
+        return k == 0 ? m_set.tone : 0.0f;
+    }
 };
 
 // Folder holding nvngx_dlssnr.dll, the caller shim nvngx.dll and the NGX log (the data path).

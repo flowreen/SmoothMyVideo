@@ -6,7 +6,11 @@ already present is skipped, so a rerun is cheap; a changed stamp removes the fol
 exports every one again. Graphs: the RIFE IFNet (live `_bd8` and the
 unbatched class) and its encode, plain and as the flow-warp class at k 1 (Frame Blend), 2 and 4,
 DRBA's block0, Restore, and the GMFSS nets (gmflow_bidir as its backbone and two halves, trt_runtime.gmflow_split +
-gmflow_backbone_cut, the first half's two N x N attentions in row blocks by gmflow_attention_blocks). The host
+gmflow_backbone_cut, the first half cut around its two N x N attentions by gmflow_matching_cut (`_m` before them, the
+host's k_attn2 between), and that half again with its quarter-scale transformer in 2 / 4 / 8 window groups,
+GMFLOW_CHUNKS, and in 8 with the shifted
+blocks' attention per mask region, GMFLOW_REGION_CHUNKS; every transformer attention with its projections folded,
+transformer.fold_projections). The host
 builds the offline fixed-batch RIFE
 classes (`_b{B}`) from `_bd8`. Then ship_tidy() and write_tags().
 Usage: runtime python engine/onnx_export.py"""
@@ -26,6 +30,19 @@ import trt_runtime as tr  # noqa: E402
 from rife_backend import RIFE  # noqa: E402
 
 PH, PW = 576, 960   # any /64 size inside the symbolic range works as the example
+GMFLOW_CHUNKS = (2, 4, 8)   # gmflow_bidir_a's window-group variants (the host's kGmFlowA)
+GMFLOW_REGION_CHUNKS = (8,)   # the same with transformer.EXPORT_REGION_ATTENTION, `_g<N>r` (the host's large-size pick)
+# the scales (attn_num_splits) each gmflow_bidir_a variant exports with transformer.EXPORT_TOKEN_OUTER, as the 160 W
+# A/Bs read them, outputs bit-identical: token-outer at the quarter scale x0.86 to x0.94 at every variant's size; at the
+# coarse scale (the `_m` graph) token-outer x0.80 / x0.97 / x0.99 on the 1 / 2 / 8r-group graphs, window order on the
+# 4-group graph (x0.97) and the 8-group one (x0.89 / x0.86 at Balanced / Quality)
+GMFLOW_TOKEN_OUTER = {"gmflow_bidir_a": (2, 8), "gmflow_bidir_a_g2": (2, 8), "gmflow_bidir_a_g4": (8,),
+                      "gmflow_bidir_a_g8": (8,), "gmflow_bidir_a_g8r": (2, 8)}
+# the token-outer scales that add the position encoding after the layout change (transformer.EXPORT_TOKEN_POSITION):
+# the entry kernel at Balanced's half 1.36 -> 0.72 ms (55 W map), outputs bit-identical; the whole graph's quarter
+# scale keeps it before the layout change (its engine's outputs moved, the 360p tweens 58.6 dB off byte identity)
+GMFLOW_TOKEN_POSITION = {"gmflow_bidir_a": (2,), "gmflow_bidir_a_g2": (2, 8), "gmflow_bidir_a_g4": (8,),
+                         "gmflow_bidir_a_g8": (8,), "gmflow_bidir_a_g8r": (2, 8)}
 
 
 def main():
@@ -84,6 +101,10 @@ def main():
         gm.device()
     finally:
         os.chdir(cwd)
+    from model.gmflow import transformer as gmt
+
+    # gmflow's attention exports with its projections folded (two of four GEMMs an attention, transformer.py)
+    gmt.fold_projections(gm.flownet)
     rec = {}
     hooks = []
     for nm in ("feat_ext", "flownet", "metricnet", "ifnet", "fusionnet"):
@@ -95,15 +116,50 @@ def main():
     for hk in hooks:
         hk.remove()
     ensure(tr.FeatEngine(), gm.feat_ext, rec["feat_ext"][:1])
-    # the host runs gmflow_bidir as its backbone (one frame a call) and two halves around its own local correlation:
-    # the whole graph is exported only to be cut (ship_tidy then removes it), and parts already present skip all of it
-    parts = [trt_lookup.onnx_path(k) for k in ("gmflow_backbone", "gmflow_bidir_a", "gmflow_bidir_b")]
+    # the host runs gmflow_bidir as its backbone (one frame a call) and two halves around its own local correlation,
+    # the first half itself as `_m` + the rest around its own global matching and propagation (k_attn2): the whole
+    # graph is exported only to be cut (ship_tidy then removes it), and parts already present skip all of it
+    parts = [trt_lookup.onnx_path(k) for k in
+             ("gmflow_backbone", "gmflow_bidir_a_m", "gmflow_bidir_a", "gmflow_bidir_b")]
     if not all(os.path.isfile(p) for p in parts):
-        ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
+        gmt.EXPORT_TOKEN_OUTER = GMFLOW_TOKEN_OUTER.get("gmflow_bidir_a", ())
+        gmt.EXPORT_TOKEN_POSITION = GMFLOW_TOKEN_POSITION.get("gmflow_bidir_a", ())
+        try:
+            ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
+        finally:
+            gmt.EXPORT_TOKEN_OUTER = ()
+            gmt.EXPORT_TOKEN_POSITION = ()
         a_path, _ = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()))
         tr.gmflow_backbone_cut(a_path)
-        tr.gmflow_attention_blocks(a_path)
+        tr.gmflow_matching_cut(a_path, "gmflow_bidir_a")
     done.extend(os.path.basename(p) for p in parts)
+    # gmflow_bidir_a again with its quarter-scale transformer in 2 / 4 / 8 window groups (transformer.py
+    # EXPORT_WINDOW_CHUNKS), and in 8 with the shifted blocks' attention per mask region (EXPORT_REGION_ATTENTION): the
+    # host picks one by the quarter-scale token count (lkGmFlowA); _b and the backbone are the same graphs at every
+    # count, and ship_tidy merges the variants' identical weights into one file
+    for k, regions in [(k, False) for k in GMFLOW_CHUNKS] + [(k, True) for k in GMFLOW_REGION_CHUNKS]:
+        key = f"gmflow_bidir_a_g{k}{'r' if regions else ''}"
+        p = trt_lookup.onnx_path(key)
+        if not os.path.isfile(p) or not os.path.isfile(trt_lookup.onnx_path(key + "_m")):
+            whole = trt_lookup.onnx_path(tr.BidirFlowEngine().name)
+            for f in (whole, whole + ".data"):
+                if os.path.isfile(f):
+                    os.remove(f)
+            gmt.EXPORT_WINDOW_CHUNKS = k
+            gmt.EXPORT_REGION_ATTENTION = regions
+            gmt.EXPORT_TOKEN_OUTER = GMFLOW_TOKEN_OUTER.get(key, ())
+            gmt.EXPORT_TOKEN_POSITION = GMFLOW_TOKEN_POSITION.get(key, ())
+            try:
+                ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
+            finally:
+                gmt.EXPORT_WINDOW_CHUNKS = 1
+                gmt.EXPORT_REGION_ATTENTION = False
+                gmt.EXPORT_TOKEN_OUTER = ()
+                gmt.EXPORT_TOKEN_POSITION = ()
+            a_path, = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()), a_key=key, with_b=False)
+            tr.gmflow_backbone_cut(a_path, with_bone=False)
+            tr.gmflow_matching_cut(a_path, key)
+        done.extend((os.path.basename(p), os.path.basename(trt_lookup.onnx_path(key + "_m"))))
     ensure(tr.MetricEngine(), gm.metricnet, rec["metricnet"][:4])
     xi, tsv = rec["ifnet"][0], rec["ifnet"][1]
     ensure(tr.IFNetEngine(), tr._IFNetExport(gm.ifnet, [8, 4, 2, 1]),

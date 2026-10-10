@@ -106,10 +106,12 @@ struct PipeServer
         });
         LOG("native: engine handoff started during the source-rate measurement\n");
     }
+    // every way out of a session stops the host here, the early returns of runLive's warm-up included: a
+    // compute thread left running keeps its execution contexts, and the resident host's freeAll then
+    // deletes the engines under them (TensorRT "Error Code 3", then an access violation)
     ~PipeServer()
     {
-        if (earlyTh.joinable())
-            earlyTh.join();
+        stop();
     }
 
     // A TRT-RTX engine at an unlucky shape can hang the host PERMANENTLY mid-stream (a GPU sync

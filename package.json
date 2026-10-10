@@ -13,7 +13,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
-    "electron": "^44.5.1",
+    "electron": "^44.7.0",
     "electron-builder": "^26.15.3",
     "prettier": "^3.9.9",
     "pyright": "^1.1.414",

@@ -886,7 +886,7 @@ void Host::setPassParams(int k, int last)
     p->Set("DLSSNR.Hint.Render.Preset", m_set.preset);
     p->Set("DLSSNR.Intensity", m_set.intensity);
     p->Set("DLSSNR.LocalStructureStrength", m_set.structure);
-    p->Set("DLSSNR.LocalToneStrength", m_set.tone);
+    p->Set("DLSSNR.LocalToneStrength", passTone(k));
     p->Set("DLSSNR.SkinStructureStrength", -1.0f);
     // Depth and ControlMask are deliberately not set (video has no depth); MVec only with Settings::motion.
 }
@@ -927,7 +927,7 @@ bool Host::evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& 
         p->Set("DLSSNR.Reset", reset ? 1 : 0);
         p->Set("DLSSNR.Intensity", m_set.intensity);
         p->Set("DLSSNR.LocalStructureStrength", m_set.structure);
-        p->Set("DLSSNR.LocalToneStrength", m_set.tone);
+        p->Set("DLSSNR.LocalToneStrength", passTone(k));
         m_last = sEval(pEval, list, m_pfeature[k], p);
         if (m_last != NVSDK_NGX_Result_Success)
         {

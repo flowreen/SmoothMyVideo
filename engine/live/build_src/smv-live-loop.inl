@@ -1019,6 +1019,35 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         return 1;
     }
     g_targetHwnd = target; // the resident "live session ended" line reports it (the app's revive)
+    // a minimized window captures as its caption (183x34 here), the load-phase resize watch then ends the session with
+    // exit 4 and the app revives it at that size: wait for the restore first, like the pause rule mid-session (Whole
+    // screen captures the monitor whatever the seeding window's state)
+    if (!g_monitor && IsIconic(target))
+    {
+        LOG("target window minimized: waiting for it to be restored\n");
+        for (;;)
+        {
+            if (!IsWindow(target) || !IsWindowVisible(target))
+            {
+                LOG("target window closed (hwnd 0x%p %s)\n", (void*)target,
+                    IsWindow(target) ? "is hidden" : "no longer exists");
+                timeEndPeriod(1);
+                return 7;
+            }
+            if (!IsIconic(target))
+                break;
+            if (g_stopReq.load())
+            {
+                LOG("stop requested while the target window was minimized\n");
+                timeEndPeriod(1);
+                g_sessionClean = true;
+                return 0;
+            }
+            pumpMessages();
+            Sleep(100);
+        }
+        LOG("target window restored\n");
+    }
     // Resolve HDR live mode. Env SMV_LIVE_HDR overrides detection (1 = force on, 0 = force
     // off); otherwise HDR runs when the display has Windows HDR on AND the mode supports it.
     // The native identity echo stays SDR. Re-evaluated per session (the exit-4 restart re-enters
@@ -1494,9 +1523,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 LOG("present path: direct from VRAM (shared output buffer)\n");
             // a started host always holds the zero-copy capture import (nativeRefusal)
             LOG("capture path: zero-copy (shared texture, no CPU readback)\n");
-            // the load-loop passthrough drained WGC's single initial frame, and a static source
-            // (the start-on-paused workflow) never sends another: without this refresh, warmup
-            // below would exit 1 after 5s ("no frames captured") on any paused/idle target
+            // the rate measurement and the load-loop passthrough drained WGC's frames, and a static
+            // source (the start-on-paused workflow) sends no more: this refresh asks a window that
+            // repaints on WM_PAINT for a current one; the warm-up below starts from the newest
+            // drained frame when none comes
             cap.requestRefresh();
         }
 
@@ -1639,9 +1669,20 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             return true;
         };
 
-        // warmup: block for the first frame, present it 3x so the FG feature builds
+        // warmup: block for the first frame, present it 3x so the FG feature builds. The server route takes the
+        // newest frame the rate measurement / the load loop drained when nothing newer arrives in 250 ms (a static
+        // source: a paused video, an idle desktop, a Chromium or layered window, which InvalidateRect never makes
+        // present) and the queue loop sends it as the first group
+        bool sendNewest = false;
         {
-            ULONGLONG deadline = GetTickCount64() + 5000;
+            const ULONGLONG warmStart = GetTickCount64();
+            ULONGLONG deadline = warmStart + 5000;
+            // SMV_LIVE_TEST=noframe: the warm-up sees no frame, the trigger of the no-frame exit's teardown (every
+            // window, an undrawn, cloaked or minimized one too, hands WGC an initial frame)
+            char testEv[16] = {};
+            const bool testNoFrame =
+                GetEnvironmentVariableA("SMV_LIVE_TEST", testEv, sizeof(testEv)) > 0 && strcmp(testEv, "noframe") == 0;
+            const bool newestOk = !testNoFrame && g_backend == BK_SERVER && cap.interop && srv.captexAck;
             int got = 0;
             while (!got && GetTickCount64() < deadline)
             {
@@ -1652,10 +1693,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     LOG("capture failed during warmup\n");
                     return 1;
                 }
+                if (testNoFrame)
+                    got = 0;
+                if (!got && newestOk && GetTickCount64() - warmStart >= 250 && cap.newestToShared())
+                {
+                    LOG("static source: starting from the newest captured frame\n");
+                    sendNewest = true;
+                    got = 1;
+                }
             }
             if (!got)
             {
-                LOG("no frames captured in 5s (window occluded by exclusive fullscreen?)\n");
+                LOG("no frames captured in 5s (the target drew nothing: off-screen, minimized or in exclusive "
+                    "fullscreen?)\n");
                 return 1;
             }
             if (host.useSL && !g_fgOver) // DLSS-G over echo presents the server's frames only (FP16 under HDR)
@@ -1729,7 +1779,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         bool rtssNamed = false;
         UINT statPresentBase = 0;
         host.scNative->GetLastPresentCount(&statPresentBase);
-        uint64_t statDropBase = 0; // cap.dropped at the last stats tick
+        // cap.dropped at the last stats tick; it starts at the drops of the model load, which are not this window's
+        uint64_t statDropBase = cap.dropped;
         uint64_t statCaptured = 0;
         bool ratioWarned = false;
         int fgWantPrev = -1;  // DLSS-G target derivation: last derived gen (hysteresis, see stats)
@@ -2621,7 +2672,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 phEnd(phGate);
                 if (wantProbe)
                 {
-                    const int g2 = gpuCap ? cap.latestFrameGpu() : cap.latestFrame(buf.data());
+                    // the warm-up's static-source frame already sits in sharedTex: the first group
+                    const int g2 = sendNewest ? 1 : gpuCap ? cap.latestFrameGpu() : cap.latestFrame(buf.data());
+                    sendNewest = false;
                     phProbeN++;
                     phEnd(phProbe);
                     if (g2 == -1)

@@ -1,3 +1,16 @@
+diff --git a/include/vkd3d_shader.h b/include/vkd3d_shader.h
+index 994902a7..a621d1bd 100644
+--- a/include/vkd3d_shader.h
++++ b/include/vkd3d_shader.h
+@@ -448,6 +448,8 @@ enum vkd3d_shader_target_extension
+     VKD3D_SHADER_TARGET_EXTENSION_FLOAT_CONTROLS_2,
+     VKD3D_SHADER_TARGET_EXTENSION_SHADER_ABORT,
+     VKD3D_SHADER_TARGET_EXTENSION_SHADER_IMPLIED_SSBO_ALIGNMENT,
++    /* SMV patch: VK_NV_cooperative_matrix2 tensor addressing + block loads (FP8 WMMA tiles as tensor loads). */
++    VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_TENSOR_LOADS,
+     VKD3D_SHADER_TARGET_EXTENSION_COUNT,
+ };
+ 
 diff --git a/include/vkd3d_sonames.h b/include/vkd3d_sonames.h
 index fd32ba41..5c333215 100644
 --- a/include/vkd3d_sonames.h
@@ -59,6 +72,21 @@ index dd1f7799..7e168e0f 100644
    d3d12core_dependencies = [ vkd3d_dep, lib_gdi32, lib_dxgi ]
  else
    d3d12core_name_prefix = 'libvkd3d-proton-'
+diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
+index 6c7dfcb9..0ef854bb 100644
+--- a/libs/vkd3d-shader/dxil.c
++++ b/libs/vkd3d-shader/dxil.c
+@@ -1203,6 +1203,10 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
+             {
+                 float8.nv_cooperative_matrix2_conversions = DXIL_SPV_TRUE;
+             }
++            else if (compiler_args->target_extensions[i] == VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_TENSOR_LOADS)
++            {
++                float8.nv_cooperative_matrix2_tensor_loads = DXIL_SPV_TRUE;
++            }
+             else if (compiler_args->target_extensions[i] == VKD3D_SHADER_TARGET_EXTENSION_EXTENDED_NON_SEMANTIC)
+             {
+                 static const dxil_spv_option_extended_non_semantic non_semantic = {
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
 index 8a632d2d..8e3d6d44 100644
 --- a/libs/vkd3d/command.c
@@ -169,7 +197,7 @@ index 8fabb245..588d2335 100644
      win32_handle_info.pNext = NULL;
      win32_handle_info.semaphore = fence->timeline_semaphore;
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index bfabbe0f..2cb14f72 100644
+index 817f8a80..fcb8a07d 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
 @@ -2438,9 +2438,19 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
@@ -234,6 +262,21 @@ index bfabbe0f..2cb14f72 100644
  
          vr = VK_CALL(vkGetSemaphoreWin32HandleKHR(device->vk_device, &win32_handle_info, handle));
  
+@@ -10234,6 +10251,14 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
+                 VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_CONVERSIONS;
+     }
+ 
++    /* SMV patch: dxil-spirv's wmma_fp8_staging loads FP8 tiles as tensor loads with a decode function. */
++    if (device->device_info.cooperative_matrix2_features_nv.cooperativeMatrixTensorAddressing &&
++            device->device_info.cooperative_matrix2_features_nv.cooperativeMatrixBlockLoads)
++    {
++        device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
++                VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_TENSOR_LOADS;
++    }
++
+     if (VKD3D_CONFIG_FLAG_IS_SET(EXTENDED_DEBUG_UTILS))
+     {
+         device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
 diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
 index a8fc26b1..878fdf89 100644
 --- a/libs/vkd3d/resource.c

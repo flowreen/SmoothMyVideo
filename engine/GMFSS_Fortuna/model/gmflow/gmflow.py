@@ -126,8 +126,9 @@ class GMFlow(nn.Module):
             corr_radius = corr_radius_list[scale_idx]
             prop_radius = prop_radius_list[scale_idx]
 
-            # add position to features
-            feature0, feature1 = feature_add_position(feature0, feature1, attn_splits, self.feature_channels)
+            # add position to features (an export's token-outer scale may add it itself, after its layout change)
+            if not self.transformer.takes_position(attn_splits):
+                feature0, feature1 = feature_add_position(feature0, feature1, attn_splits, self.feature_channels)
 
             # Transformer
             feature0, feature1 = self.transformer(feature0, feature1, attn_num_splits=attn_splits)

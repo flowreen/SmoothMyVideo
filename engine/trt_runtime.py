@@ -1050,7 +1050,7 @@ def _fusion_fp16_inputs(onnx_path, name):
 _GMFLOW_CROSS = ("win", "valid", "flow0", "feat", "flow1")
 
 
-def gmflow_split(full_path):
+def gmflow_split(full_path, a_key="gmflow_bidir_a", with_b=True):
     """gmflow_bidir as two graphs around its quarter-scale local correlation, which the host computes between them
     (k_localCorr: never the [2, 128, HW, 81] fp32 product the graph writes and sums back, ~11 % of a call at 960x544).
     The correlation = the one ReduceSum of Mul(GridSample(f, coords), q). A = img0, img1 -> q [2, HW, 128] and
@@ -1060,8 +1060,8 @@ def gmflow_split(full_path):
     renamed by role: valid = the bool one, feat = the 128-channel map, win = the [2, HW, K, 2] window, flow0 = the
     [2, 2, H, W] one derived from the frames' values, flow1 = the one made from the frame size alone. B = corr
     [2, HW, K] + those + img0 / img1 -> flow. The exporter's own names change from export to export, so the cut is
-    found by structure and any other shape refuses. Writes trt_lookup.onnx_path("gmflow_bidir_a" / "_b") with their
-    own weights; returns both paths."""
+    found by structure and any other shape refuses. Writes trt_lookup.onnx_path(a_key) and, with_b, ("gmflow_bidir_b")
+    with their own weights; returns the paths written."""
     import onnx
     from onnx import helper, shape_inference, TensorProto
 
@@ -1141,8 +1141,10 @@ def gmflow_split(full_path):
     ga.output.extend([helper.make_tensor_value_info("q", TensorProto.FLOAT, [2, "hw4", 128]),
                       helper.make_tensor_value_info("f", TensorProto.FLOAT, [2, "h4", "w4", 128])] + outs[2:])
     paths = []
-    for mm, key, mapping in ((a, "gmflow_bidir_a", {coords: "coords", **names}),
-                             (b, "gmflow_bidir_b", {rs.output[0]: "corr", **names})):
+    for mm, key, mapping in ((a, a_key, {coords: "coords", **names}),
+                             (b, "gmflow_bidir_b" if with_b else None, {rs.output[0]: "corr", **names})):
+        if key is None:
+            continue
         for n in mm.graph.node:
             n.input[:] = [mapping.get(x, x) for x in n.input]
             n.output[:] = [mapping.get(x, x) for x in n.output]
@@ -1155,11 +1157,11 @@ def gmflow_split(full_path):
         # the weights file is named for the final graph, so only the graph moves
         os.replace(tmp, path)
         paths.append(path)
-    _log(f"[trt] gmflow_bidir split into {os.path.basename(paths[0])} + {os.path.basename(paths[1])}")
+    _log(f"[trt] gmflow_bidir split into {' + '.join(os.path.basename(p) for p in paths)}")
     return paths
 
 
-def gmflow_backbone_cut(a_path):
+def gmflow_backbone_cut(a_path, with_bone=True):
     """gmflow_bidir_a's CNN backbone as its own graph for ONE frame, so the host computes each frame's maps once (the
     previous frame's come from the last pair) instead of both frames' every pair. Found by structure: the maps = the
     inputs of the two batch Splits (axis 0, two ways) fed straight by a Conv, named map4 / map8 by their size; the
@@ -1167,7 +1169,8 @@ def gmflow_backbone_cut(a_path):
     gmflow_backbone = that Concat replaced by its img0 branch, img0 -> map4, map8 [1, C, H, W]; gmflow_bidir_a is
     rewritten to take map4, map8 [2, C, H, W] (+ img0 / img1, read for shapes). Not bit-identical to the batch-2
     backbone (other fp16 kernels at batch 1): GMFSS tweens vs an fp32 reference stay at the whole graph's level.
-    Writes trt_lookup.onnx_path("gmflow_backbone") and a_path in place; returns the backbone's path."""
+    Writes a_path in place and, with_bone, trt_lookup.onnx_path("gmflow_backbone"); returns the backbone's path (None
+    without it)."""
     import onnx
     from onnx import helper, shape_inference
 
@@ -1214,7 +1217,10 @@ def gmflow_backbone_cut(a_path):
     bone = onnx.utils.Extractor(bone).extract_model(["img0"], maps)
     names = {maps[0]: "map4", maps[1]: "map8"}
     paths = []
-    for mm, path in ((bone, trt_lookup.onnx_path("gmflow_backbone")), (rest, a_path)):
+    for mm, path in ((bone, trt_lookup.onnx_path("gmflow_backbone") if with_bone else None), (rest, a_path)):
+        if path is None:
+            paths.append(None)
+            continue
         for n in mm.graph.node:
             n.input[:] = [names.get(x, x) for x in n.input]
             n.output[:] = [names.get(x, x) for x in n.output]
@@ -1225,25 +1231,29 @@ def gmflow_backbone_cut(a_path):
         onnx.checker.check_model(tmp)
         os.replace(tmp, path)
         paths.append(path)
-    _log(f"[trt] gmflow's backbone cut out as {os.path.basename(paths[0])}")
+    _log(f"[trt] gmflow's backbone cut out{' as ' + os.path.basename(paths[0]) if paths[0] else ''}")
     return paths[0]
 
 
-def gmflow_attention_blocks(a_path, k=8):
-    """gmflow_bidir_a's two attentions with a 2-channel value (the global matching: Softmax over Concat(X, X^T),
-    X = Reshape(Div(Reshape(MatMul(f0, f1)))), times the pixel grid; the flow propagation: Softmax(Div(MatMul(q, k^T)))
-    times the flow) computed in K row blocks: Slice(rows) -> MatMul -> Div -> Softmax -> MatMul -> Concat, so the
-    N x N matrix never exists (N = 32,640 tokens at the 4K half: two [2, N, N] fp16 matrices of ~4.3 GB each set the
-    engine's context, 10.5 GB -> 5.6 GB at K 8). Each row's softmax reads only that row, so the math is the same;
-    the global matching's second direction is f1's rows against f0^T. Block step = ceil(N / K) from the graph's own
-    Shape, size-free. Found by structure (gmflow's transformer heads carry 128-channel values); any other count
-    refuses. Rewrites a_path in place."""
+def gmflow_matching_cut(a_path, key):
+    """gmflow_bidir_a cut around its two attentions with a 2-channel value (the global matching: Softmax over
+    Concat(X, X^T), X = Reshape(Div(Reshape(MatMul(f0, f1)))), times the pixel grid; the flow propagation:
+    Softmax(Div(MatMul(q, k^T))) times the flow), which the host runs as k_attn2 between two engines: fp32 scores,
+    softmax and value product, and the N x N matrices never exist (the graph's own fp16 probabilities over N keys put
+    its flow 8x further from the fp32 model at the 1440p DLAA half). Writes `key`_m beside a_path: the same inputs ->
+    mf (f0 and f1 token-major, [2, N, C]), mq (the propagation's queries) and mk (its keys, [2, N, C] each), the graph's
+    dtype; and rewrites a_path to take `prop` (the propagation's output [2, N, 2]) instead of computing it. Found by
+    structure (gmflow's transformer heads carry 128-channel values); any other count refuses. Both graphs keep the
+    external weights file; nodes nothing reads any more are dropped. Returns the _m path."""
+    import copy
+
     import onnx
-    from onnx import TensorProto, helper, shape_inference
+    from onnx import helper, shape_inference
 
     m = onnx.load(a_path, load_external_data=False)
     g = m.graph
-    vi = {v.name: v.type.tensor_type.shape for v in shape_inference.infer_shapes(m).graph.value_info}
+    inferred = {v.name: v for v in shape_inference.infer_shapes(m).graph.value_info}
+    vi = {k: v.type.tensor_type.shape for k, v in inferred.items()}
     prod = {o: n for n in g.node for o in n.output}
     cons = {}
     for n in g.node:
@@ -1263,8 +1273,7 @@ def gmflow_attention_blocks(a_path, k=8):
         src = prod[sm.input[0]]
         if src.op_type == "Div" and prod[src.input[0]].op_type == "MatMul":
             mm = prod[src.input[0]]
-            chains["prop"].append(({mm.name, src.name, sm.name, mm_v.name}, mm.input[0], mm.input[1],
-                                   mm_v.input[1], src.input[1], mm_v.output[0]))
+            chains["prop"].append((mm.input[0], mm.input[1], mm_v.output[0]))
         elif src.op_type == "Concat" and len(src.input) == 2:
             x, xt = src.input
             r2 = prod[x]
@@ -1278,79 +1287,72 @@ def gmflow_attention_blocks(a_path, k=8):
                 continue
             mm = prod[r1.input[0]]
             if mm.op_type == "MatMul":
-                chains["global"].append(({mm.name, r1.name, div.name, r2.name, prod[xt].name, src.name, sm.name,
-                                          mm_v.name}, mm.input[0], mm.input[1], mm_v.input[1], div.input[1],
-                                         mm_v.output[0]))
+                chains["global"].append((mm.input[0], mm.input[1], mm_v.output[0]))
     for kind, found in chains.items():
         if len(found) != 1:
             raise RuntimeError(f"gmflow_bidir_a: {len(found)} {kind} attentions with a 2-channel value, expected 1")
+    f0, f1t, _ = chains["global"][0]   # f0 tokens [1, N, C], f1 channels [1, C, N]
+    q, kt, pout = chains["prop"][0]   # q [2, N, C], k^T [2, C, N], the output [2, N, 2]
 
-    consts = {}
+    def dims(t):
+        return [d.dim_value or d.dim_param for d in vi[t].dim]
 
-    def const(vals):
-        name = "attn_blocks_c" + "_".join(str(v) for v in vals)
-        if name not in consts:
-            consts[name] = helper.make_tensor(name, TensorProto.INT64, [len(vals)], vals)
-        return name
+    if dims(f0)[-1] != 128 or dims(f1t)[1] != 128 or dims(q)[-1] != 128 or dims(kt)[1] != 128:
+        raise RuntimeError(f"gmflow_bidir_a: the attentions' operands are {dims(f0)} / {dims(f1t)} / {dims(q)} / "
+                           f"{dims(kt)}, expected tokens x 128 and 128 x tokens")
+    dt = inferred[q].type.tensor_type.elem_type
+    cut = [helper.make_node("Transpose", [f1t], ["cut_f1"], perm=[0, 2, 1], name="cut_f1"),
+           helper.make_node("Concat", [f0, "cut_f1"], ["mf"], axis=0, name="cut_mf"),
+           helper.make_node("Identity", [q], ["mq"], name="cut_mq"),
+           helper.make_node("Transpose", [kt], ["mk"], perm=[0, 2, 1], name="cut_mk")]
 
-    nodes = []
-    made = [0]   # names stay unique across both chains (nodes is emptied after each splice)
+    def tokens(name):
+        """[2, N, 128] in the graph's dtype, N the propagation queries' own (symbolic) dim"""
+        v = helper.make_tensor_value_info(name, dt, [2, 1, 128])
+        v.type.tensor_type.shape.dim[1].CopyFrom(vi[q].dim[1])
+        return v
 
-    def node(op, inputs, **attrs):
-        out = f"attn_blocks_{made[0]}"
-        made[0] += 1
-        nodes.append(helper.make_node(op, inputs, [out], name=out, **attrs))
-        return out
+    def reachable(mm, nodes, outputs):
+        """keep the nodes (and initializers, value infos) the outputs read"""
+        gg = mm.graph
+        need = set(outputs)
+        keep = []
+        for n in reversed(nodes):
+            if any(o in need for o in n.output):
+                keep.append(n)
+                need.update(x for x in n.input if x)
+        del gg.node[:]
+        gg.node.extend(reversed(keep))
+        live = {x for n in gg.node for x in list(n.input) + list(n.output)}
+        inits = [t for t in gg.initializer if t.name in live]
+        del gg.initializer[:]
+        gg.initializer.extend(inits)
+        vis = [v for v in gg.value_info if v.name in live]
+        del gg.value_info[:]
+        gg.value_info.extend(vis)
 
-    def blocks(q, kt, v, scale):
-        """Concat over q's rows (axis 1) of Softmax(q_rows @ kt / scale) @ v, K blocks"""
-        dim = node("Gather", [node("Shape", [q]), const([1])], axis=0)
-        step = node("Div", [node("Add", [dim, const([k - 1])]), const([k])])
-        parts = []
-        for i in range(k):
-            rows = node("Slice", [q, node("Mul", [step, const([i])]), node("Mul", [step, const([i + 1])]),
-                                  const([1])])
-            p = node("Softmax", [node("Div", [node("MatMul", [rows, kt]), scale])], axis=-1)
-            parts.append(node("MatMul", [p, v]))
-        return node("Concat", parts, axis=1)
+    def write(mm, path):
+        tmp = path + ".tmp.onnx"
+        with open(tmp, "wb") as fh:
+            fh.write(mm.SerializeToString())
+        onnx.checker.check_model(tmp)
+        os.replace(tmp, path)
 
-    def splice(drop, out):
-        nodes[-1].output[0] = out
-        last = max(i for i, n in enumerate(g.node) if n.name in drop)
-        kept = [n for n in g.node if n.name not in drop]
-        pos = sum(1 for n in g.node[:last] if n.name not in drop)
-        del g.node[:]
-        g.node.extend(kept[:pos] + nodes + kept[pos:])
-        nodes.clear()
-
-    drop, q, kt, v, scale, out = chains["prop"][0]
-    blocks(q, kt, v, scale)
-    splice(drop, out)
-    drop, f0, f1, v, scale, out = chains["global"][0]   # f0 tokens [1, N, C], f1 channels [1, C, N], grid [2, N, 2]
-    d0 = blocks(f0, f1, node("Slice", [v, const([0]), const([1]), const([0])]), scale)
-    d1 = blocks(node("Transpose", [f1], perm=[0, 2, 1]), node("Transpose", [f0], perm=[0, 2, 1]),
-                node("Slice", [v, const([1]), const([2]), const([0])]), scale)
-    node("Concat", [d0, d1], axis=0)
-    splice(drop, out)
-    g.initializer.extend(consts.values())
-    need = {o.name for o in g.output}   # drop what no output reads any more (the views' shape helpers)
-    keep = []
-    for n in reversed(g.node):
-        if any(o in need for o in n.output):
-            keep.append(n)
-            need.update(x for x in n.input if x)
-    del g.node[:]
-    g.node.extend(reversed(keep))
-    live = {x for n in g.node for x in list(n.input) + list(n.output)}
-    vis = [v for v in g.value_info if v.name in live]
-    del g.value_info[:]
-    g.value_info.extend(vis)
-    tmp = a_path + ".tmp.onnx"
-    with open(tmp, "wb") as fh:
-        fh.write(m.SerializeToString())
-    onnx.checker.check_model(tmp)
-    os.replace(tmp, a_path)
-    _log(f"[trt] gmflow's two N x N attentions in {k} row blocks: {os.path.basename(a_path)}")
+    m_path = trt_lookup.onnx_path(key + "_m")
+    mm = copy.deepcopy(m)
+    del mm.graph.output[:]
+    mm.graph.output.extend([tokens("mf"), tokens("mq"), tokens("mk")])
+    reachable(mm, list(mm.graph.node) + cut, ["mf", "mq", "mk"])
+    write(mm, m_path)
+    for n in g.node:
+        n.input[:] = ["prop" if x == pout else x for x in n.input]
+    p = copy.deepcopy(inferred[pout])
+    p.name = "prop"
+    g.input.append(p)
+    reachable(m, list(g.node), [o.name for o in g.output])
+    write(m, a_path)
+    _log(f"[trt] gmflow's matching cut out: {os.path.basename(m_path)} + {os.path.basename(a_path)} (input prop)")
+    return m_path
 
 
 # --- size-free ONNX -----------------------------------------------------------------------------

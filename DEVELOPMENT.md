@@ -99,7 +99,8 @@ RTX VSR / HDR and all three codecs.
   `weights_tags.txt` otherwise. Names: `<engine base>[_sl<scales>][_dt<dtypes>]_<weights tag>.onnx`
   (`trt_lookup.onnx_path`). Nothing is bumped by hand: `trt_lookup.export_stamp()` fingerprints
   everything an export reads (the `.py` files of `engine`, `engine/rife` and `engine/GMFSS_Fortuna`,
-  the torch / onnx / onnxscript / onnx-ir versions and the weight files), `weights_tags.txt`
+  the torch / onnx / onnxscript / onnx-ir versions and the weight files) plus `trt_lookup.HOST_BUILD`,
+  the host builder's settings that change an engine but not its graph; `weights_tags.txt`
   records it (`export <stamp>`, the host ignores it), and an export whose stamp differs removes the
   folder's graphs and exports every one again; so run `node scripts/export-onnx.js` after any
   change under `engine`. The engine cache stamp is `weights_tags.txt` plus the TensorRT-RTX
@@ -583,7 +584,9 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
   Default / Natural (default) / Cinematic looks (DLSSNR.Style; measured 2026-09-12: same cost, 0 is
   the lightest touch, 1 the smoothest, 2 keeps the most detail; Intensity stays 1.0, the runtime
-  clamps it there and drifts below it). Needs the runtime in
+  clamps it there and drifts below it). With `--nr-passes` above 1 the tone runs on the first pass
+  only and passes 2+ at tone 0: the local tone darkens the frame again on every pass it runs (mean
+  luma x0.95 a pass at tone 1, Natural; `harness\nr_tone_per_pass`). Needs the runtime in
   `engine/dlssnr`, otherwise the frame passes through with a notice. About 10 ms per 1080p frame
   on the RTX 5090 Laptop, about 25 ms with the pipe transport. A host that dies is restarted once,
   then the pass is disabled for the rest of the render. Coexists with the RTX passes in one process.
@@ -856,7 +859,21 @@ every frame off WGC's two-buffer pool the moment it arrives (`Capture::takeFrame
 newest for the loop, so a loop slower than the source still sees each arrival: `cap.dropped` counts the superseded
 ones and `emaArrMs` reads the source's cadence (with the pool alone WGC discarded what did not fit, uncounted, and a
 GMFSS session at target 1000 read a 24 fps source as 3.5 fps with 1 drop a second while it showed ~1 s old
-pictures). The host times every group on the GPU (`grEv`, from the capture read: `gIntUs` = the work before the
+pictures). The capture sets WGC's MinUpdateInterval to 1 ms (Windows holds a capture at 60 frames a second without it;
+`SMV_WGC_INTERVAL=0` = Windows' default, `=fail` = the fallback note's trigger). Whole screen (`--fit monitor`)
+captures the monitor under SMV's own overlay: the overlay is excluded from the picture, but each of its presents still
+composes the monitor and WGC hands that over as a frame, so the loop would read its own presents as the source (245 a
+second on a static screen, a 24 fps video read as ~225). In a window or Fill, a display-sync player (mpv's
+display-resample) presents the same picture every refresh: a 24 fps video arrived ~270 times a second, 91 % of them
+byte-identical, so the throttle saw a 360 fps source and showed the video's own 24 pictures with no tween.
+`Capture::samePicture` therefore tests every arrival's client picture, every fit, on FrameArrived's thread (a GPU bit
+compare against the last kept picture; its readback waits with the immediate context locked, the faster of the two
+ways measured) and drops an
+unchanged one uncounted. An unchanged arrival still counts once 500 ms passed since the last kept one
+(`kSameKeepalive`): the static hold's refresh repaint brings the current picture after a model load or a pause, and
+DLSS-G's 700 ms input-gap reset never fires on a source that keeps presenting a still. The probe (`--probe`) keeps
+every arrival. The session's closing `capture:` line counts the drops, the keepalives and the test's cost. `SMV_WGC_SAME=0` turns the test off (A/B); where it cannot run (`SMV_WGC_SAME=fail` = the trigger) the
+whole screen keeps Windows' interval and a window counts repeats, each with a note line. The host times every group on the GPU (`grEv`, from the capture read: `gIntUs` = the work before the
 slots of a group with tweens, the frame's passes and the pair's model work; `gTweenUs` = one tween with its store;
 `gBaseUs` = a whole group without a tween). Every 500 ms window the loop (`xqThrottle`) computes the tweens a pair
 affords within the budget, m = (budget x the source's interval - the work before the slots) / one tween; the grid
@@ -1226,8 +1243,11 @@ so the lookup and the build cannot disagree on a name:
   reads the captured frame) plus its `.jit`, for every backend.
 * On a miss the host BUILDS the engines (`nativeLocalBuild`, on a worker thread): from
   `engine/onnx` with the old python builder's settings (strongly typed, optimization level 5,
-  workspace `SMV_TRT_WORKSPACE_GB` x the per-graph multiplier) through the delay-loaded ONNX parser, a
-  warm-up with a fresh runtime cache (EAGER specialization), then the `.jit` and the warm key; the lookup must then
+  workspace `SMV_TRT_WORKSPACE_GB` x the per-graph multiplier; TensorRT-RTX's auxiliary streams capped
+  where its own choice measured slower or larger with identical outputs: none on gmflow_bidir_b,
+  metricnet and gmflow_backbone, two on fusionnet; every other net keeps TensorRT-RTX's choice) through
+  the delay-loaded ONNX parser, a warm-up with a fresh runtime cache (EAGER specialization), then the
+  `.jit` and the warm key; the lookup must then
   hit. It covers rife / blend, gmfss, rifedrba (the RIFE pair plus block0) and Restore (`restore_<hash>_dth`, fp16 input, no
   warm marker). Output-identical to python's build from the same file (harness
   `onnx\gate_3c2.py`, `onnx\gate_3c3a.py`). A session that ends mid-build leaves the build
@@ -1483,16 +1503,25 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   or the motion view) and runs the backbone on the new frame into slot 1; a call without a pair
   makes the next pair take both. Not bit-identical (batch-1 fp16 kernels): tweens vs fp32 59.08 /
   52.78 dB against the whole backbone's 59.03 / 53.27; 1080p x2 x0.969 a pair.
-* GMFlow's two attentions whose value is 2 channels (the global matching: the softmax over every
-  token pair times the pixel grid, both directions; the flow propagation: the same with the flow)
-  run in 8 row blocks (`trt_runtime.gmflow_attention_blocks`: Slice the rows, MatMul, Div, Softmax,
-  MatMul, Concat; the second matching direction is the second frame's rows against the first's), so
-  the token x token matrix never exists: at the 4K DLAA half (32,640 tokens) `gmflow_bidir_a`'s
-  TensorRT context falls from 10.5 GB to 5.6 GB, which keeps 4K GMFSS inside a 24 GB card. A row's
-  softmax reads only that row: bit-identical at the 1080p half; at the 4K and live 1440p halves
-  TensorRT picks other kernels around them, as close to an fp32 reference as the unblocked graph
-  (4K global matching mean error 0.0589 / 0.105 / 1.004 grid units on three pairs either way).
-  Speed: 1080p half x0.992, live 1440p half x1.008 (both inside the spreads), 4K half x0.888.
+* GMFlow's two attentions whose value is 2 channels (the scale-0 global matching: the softmax over
+  every token pair times the pixel grid, both directions; the flow propagation: the same with the
+  flow) run in the host, not in a graph: the export cuts every `gmflow_bidir_a` variant around them
+  (`trt_runtime.gmflow_matching_cut`) into `<key>_m` (the backbone maps -> `mf`, the two frames'
+  tokens, and the propagation's `mq` / `mk`, fp16 [2, N, 128]) and the A graph, which takes the
+  propagated flow as `prop`. Between them `k_attn2` runs twice (the matching with the grid as its
+  value writes the flow, the propagation reads it): a flash-style kernel, Q K^T on the tensor cores
+  (mma.sync, fp16 in, fp32 accumulation), the softmax online in fp32, the value product in fp32, so
+  the token x token matrix never exists (in a graph it took 8 row blocks to keep 4K GMFSS inside a
+  24 GB card). The graph held the probabilities, the grid and the flow in fp16; over 14,720 keys
+  (the 1440p DLAA half) that put its scale-0 flow 0.68 px (mean) from the fp32 model, the kernel's
+  0.08. Tweens vs an fp32 reference at 480p / the Quality half / 1080p / the 1440p DLAA frame 49.49
+  / 49.65 / 49.62 / 49.70 dB pooled and 46.39 / 46.76 / 44.99 / 45.03 worst, against 48.15 / 46.65 /
+  45.74 / 43.97 and 44.62 / 42.86 / 39.91 / 37.25 before; no fixed-position difference; bit-stable
+  run to run. The 1440p DLAA half's context 1769 -> 142 + 601 MiB and x0.80 (55 W). Up to
+  `kAttn2bMaxN` (1,792 tokens a frame: Ultra's half and smaller) its twin `k_attn2b` runs instead:
+  the key tiles double-buffered through cp.async, the key fragments read by ldmatrix.x4; bit-identical,
+  x0.88 at 1,792 and slower from 3,840 up (160 W). `SMV_GM_ATTN2B=0` = `k_attn2` at every size; the
+  chain's log line names the kernel.
 * fusionnet takes the splatted feature levels `b` / `c` / `d` in fp16: in the graph each one's only
   reader is a Cast to fp16, so the export drops it (`trt_runtime._fusion_fp16_inputs`) and
   `k_splatNorm` stores fp16, rounding to nearest even as the Cast did; `a` stays fp32 (the GMFSS
@@ -1506,6 +1535,59 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   to 1303 nodes (144 Slices, 96 Reshapes, 72 Concats and 68 Transposes fewer, the MatMuls and
   Softmaxes the same). Bit-identical: eager in fp32 and fp16, and the product frame for frame at
   both GMFSS shapes. Eager keeps the original layout.
+* GMFlow's quarter-scale transformer runs each block on groups of whole windows: window order makes
+  a group a contiguous token range (its cross attention the same range of the other frame), and every
+  op of a block works per token or per window, so the math is the same; a group's tensors stay near
+  the GPU's L2 (the block's FFN ran at half the rate on 117,760 tokens as on 29,440). The export writes
+  `gmflow_bidir_a` again as `gmflow_bidir_a_g2` / `_g4` / `_g8` (`transformer.EXPORT_WINDOW_CHUNKS`,
+  `onnx_export.GMFLOW_CHUNKS`; one shared weights file) and the host picks the most groups up to 8
+  that keep >= 4,500 quarter-scale tokens a group (`lkGmFlowA`; 3,840 a group read slower than
+  7,680, 5,376 faster than 10,752): 1440p DLAA's half 92.6 -> 76.6 ms, Quality's 38.9 -> 27.8,
+  Balanced's 27.5 -> 23.6, Performance's 17.4 -> 13.9, Ultra's 6.71 -> 6.48, the 1080p half 47.4 ->
+  35.5, the 4K half 288 -> 275. Bit-identical tweens at 480p, 1080p and the live Quality / Balanced /
+  Performance / Ultra halves; at the DLAA and 4K halves TensorRT picks other kernels, tweens vs an
+  fp32 reference at the DLAA frame 43.96 / 37.05 dB (pooled / worst) on both sides.
+* At large sizes GMFlow's shifted blocks attend per mask region instead of through the mask: after
+  the roll by half a window only the last window row and column hold two regions each (the corner
+  four) and a token attends only inside its own region (the mask's -100 is a 0 weight), so each
+  region is plain attention (`transformer._region_attention`, `EXPORT_REGION_ATTENTION`). TensorRT's
+  masked attention kernel cost about 1.5x the plain one in every window group, also where 1 window
+  in 8 carries a mask. The export writes `gmflow_bidir_a_g8r` (`onnx_export.GMFLOW_REGION_CHUNKS`)
+  and the host takes it from 9,000 quarter-scale tokens a group up (`kGmRegionTokens`): the 1440p
+  DLAA half 78.1 -> 73.0 ms, 4K Balanced's 53.9 -> 50.7, the 4K half 289 -> 240; 9,216 a group read
+  x0.98, 8,160 and 6,480 ties, 5,376 x1.03 (the extra calls cost more on small windows). Exact in
+  fp64 (2e-14 against the masked form); fp16 sums in another order.
+* GMFlow's transformer attention exports with its projections folded: every attention is single-head
+  and linear in its projections, so `q k^T = s Wq^T Wk t^T` and `merge(P v) = P t (Wm Wv)^T`. The
+  query takes one 128 x 128 matrix, the key is the target itself, the value takes `Wm Wv`
+  (`transformer.fold_projections`, the products formed in fp64 and stored fp32; called by
+  `onnx_export.py` after the weights load), so the k projection and the merge GEMM leave all 108
+  attentions of `gmflow_bidir_a`. Eager keeps the four projections. The rounding differs: tweens
+  vs an fp32 reference at 480p / the Quality half / 1080p / the 1440p DLAA frame 48.15 / 46.65 /
+  45.74 / 43.97 dB pooled and 44.62 / 42.86 / 39.91 / 37.25 worst, against 48.25 / 46.51 / 45.62 /
+  43.96 and 44.41 / 41.90 / 39.24 / 37.15 before; no fixed-position difference (the mean signed
+  difference's row and column profiles).
+* Every `gmflow_bidir_a` variant keeps its transformer's tokens token-outer, [group][position in the
+  window][window][frame][C] (`transformer.EXPORT_TOKEN_OUTER` = the scales, by attn_num_splits,
+  `FeatureTransformer._forward_windowed`; set per variant by `onnx_export.GMFLOW_TOKEN_OUTER`), so an
+  attention reads its group's slice in the layout TensorRT's fused attention kernel takes; window
+  order cost three copies into it and one out per attention. The cross attention's partner = the
+  frame halves swapped. At 160 W, A against window order: the whole graph x0.86 (the flow-scale
+  floor), g2 x0.88 (Ultra's half), g4 x0.90 (Performance's, context 164 -> 177 MiB), g8 x0.90 / x0.94
+  (Balanced / Quality, 239 -> 279 MiB and 343 -> 363), g8r x0.94 (DLAA's, 1769 -> 1668 MiB). The
+  coarse scale (attn_num_splits 2, in `_m`) is token-outer where it timed faster: the whole graph
+  x0.80, g2 x0.97, g8r x0.99; g4 and g8 keep it in window order (token-outer x1.03 on g4, window
+  order x0.89 / x0.86 on g8 at Balanced / Quality). Bit-identical: every
+  output in TensorRT, and the tweens on every variant's route (360p, 480p, 720p, the Quality half,
+  1080p, 1440p DLAA).
+* A token-outer scale adds gmflow's position encoding after its layout change: with window splits
+  the encoding is one window's table, the same for every window and frame, so it becomes a
+  broadcast add over the position axis (`transformer.EXPORT_TOKEN_POSITION`,
+  `FeatureTransformer.takes_position`, gmflow.py skips `feature_add_position` there; per variant
+  `onnx_export.GMFLOW_TOKEN_POSITION`). Fused into the entry permute, the encoding held that
+  kernel at about half the bandwidth: the Balanced half's entry 1.36 -> 0.72 ms (a 55 W map).
+  Bit-identical on every variant's route; the whole graph's quarter scale keeps the encoding
+  before the layout change (its engine's outputs moved with it).
 * Live GMFSS flow scale (the GUI's GMFSS flow scale slider, 25 to 100 %, main.ts `--gmfss-flow F`): gmflow's three
   engines (backbone, `gmflow_bidir_a` / `_b`) run on the /32 grid nearest F x the half (`GMFSS_infer_u.reuse`'s
   `round(n * F / 32) * 32`, Python's half-to-even rounding), never below 320 x 192: at a 256 x 128 grid (1080p at 25 %,
@@ -1749,11 +1831,11 @@ loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
 vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
-github.com/HansKristian-Work/vkd3d-proton at b206eb6680fb92a64ae57bfccc7454a138f76887 with its submodules
+github.com/HansKristian-Work/vkd3d-proton at 2230755878b01993b4b82d0ac0c0624f3ab4d333 with its submodules
 (dxil-spirv at ab47c3df1a4746f36c958f0262bc9e314eb566eb), then
 
 ```
-git apply engine/fsrfg/source/vkd3d-proton-b206eb6-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/vkd3d-proton-2230755-smv.patch        (in the vkd3d-proton checkout)
 git apply engine/fsrfg/source/dxil-spirv-ab47c3d-smv.patch          (in subprojects/dxil-spirv)
 meson setup build --buildtype=release -Denable_extended_emulation=true
 ninja -C build
@@ -1763,10 +1845,13 @@ The vkd3d-proton patch: `VKD3D_FP8_EMULATION=1` takes the FP8-as-FP16 cooperativ
 (its 8-bit matrices are 16x16x32 only); a shared fence's timeline semaphore is exported as opaque Win32 where
 the driver exports no D3D12-fence type (NVIDIA); a shared texture's memory carries the access rights CUDA
 expects, and vkd3d-proton neither opens its own export through D3DKMT nor shares that D3DKMT copy (CUDA
-refuses such a handle); the two DLLs are named `smv_vkd3d_d3d12.dll` / `smv_vkd3d_d3d12core.dll`, so they
-never share a module name with the system D3D12 in the host's process. The dxil-spirv patch: FP8 matrix
-loads / stores staged through shared memory as FP16 (`DXIL_SPIRV_CONFIG=wmma_fp8_staging`), the
-configuration read from the process environment. Then in `engine/fsrfg/build_src/` (Visual Studio 2026 with
+refuses such a handle); a device with VK_NV_cooperative_matrix2 tensor addressing and block loads tells
+dxil-spirv so; the two DLLs are named `smv_vkd3d_d3d12.dll` / `smv_vkd3d_d3d12core.dll`, so they
+never share a module name with the system D3D12 in the host's process. The dxil-spirv patch: FP8 matrices
+emulated as FP16 (`DXIL_SPIRV_CONFIG=wmma_fp8_staging`): a storage-buffer tile load is one coopmat2 tensor
+load with a decode function where the device has them, else staged through shared memory (each lane reads
+8 bytes of a tile row or column as u32 words), stores staged; the configuration read from the process
+environment. Then in `engine/fsrfg/build_src/` (Visual Studio 2026 with
 the C++ workload, python):
 
 ```
