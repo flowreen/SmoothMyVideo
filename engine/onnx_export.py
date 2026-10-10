@@ -43,6 +43,10 @@ GMFLOW_TOKEN_OUTER = {"gmflow_bidir_a": (2, 8), "gmflow_bidir_a_g2": (2, 8), "gm
 # scale keeps it before the layout change (its engine's outputs moved, the 360p tweens 58.6 dB off byte identity)
 GMFLOW_TOKEN_POSITION = {"gmflow_bidir_a": (2,), "gmflow_bidir_a_g2": (2, 8), "gmflow_bidir_a_g4": (8,),
                          "gmflow_bidir_a_g8": (8,), "gmflow_bidir_a_g8r": (2, 8)}
+# every token-outer scale keeps its stream in fp16 (transformer.EXPORT_FP16_STREAM): the 160 W A call x0.96 to x0.97
+# from Ultra to DLAA (each block's glue moves half the bytes), the GMFSS tweens' PSNR vs eager fp32 within -0.3 / +0.2
+# dB of the fp32 stream's, real frames identical
+GMFLOW_FP16_STREAM = True
 
 
 def main():
@@ -124,11 +128,13 @@ def main():
     if not all(os.path.isfile(p) for p in parts):
         gmt.EXPORT_TOKEN_OUTER = GMFLOW_TOKEN_OUTER.get("gmflow_bidir_a", ())
         gmt.EXPORT_TOKEN_POSITION = GMFLOW_TOKEN_POSITION.get("gmflow_bidir_a", ())
+        gmt.EXPORT_FP16_STREAM = GMFLOW_FP16_STREAM
         try:
             ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
         finally:
             gmt.EXPORT_TOKEN_OUTER = ()
             gmt.EXPORT_TOKEN_POSITION = ()
+            gmt.EXPORT_FP16_STREAM = False
         a_path, _ = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()))
         tr.gmflow_backbone_cut(a_path)
         tr.gmflow_matching_cut(a_path, "gmflow_bidir_a")
@@ -149,6 +155,7 @@ def main():
             gmt.EXPORT_REGION_ATTENTION = regions
             gmt.EXPORT_TOKEN_OUTER = GMFLOW_TOKEN_OUTER.get(key, ())
             gmt.EXPORT_TOKEN_POSITION = GMFLOW_TOKEN_POSITION.get(key, ())
+            gmt.EXPORT_FP16_STREAM = GMFLOW_FP16_STREAM
             try:
                 ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
             finally:
@@ -156,6 +163,7 @@ def main():
                 gmt.EXPORT_REGION_ATTENTION = False
                 gmt.EXPORT_TOKEN_OUTER = ()
                 gmt.EXPORT_TOKEN_POSITION = ()
+                gmt.EXPORT_FP16_STREAM = False
             a_path, = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()), a_key=key, with_b=False)
             tr.gmflow_backbone_cut(a_path, with_bone=False)
             tr.gmflow_matching_cut(a_path, key)

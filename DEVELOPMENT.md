@@ -1495,6 +1495,14 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   (the whole graph spilled to system memory). `gmflow_bidir_b`'s engine name carries only `corr`
   and `img0` (the other six inputs follow from them; all eight would push cache paths toward
   MAX_PATH).
+* `gmflow_bidir_b`'s flow propagation (GMFlow's 3 x 3 local-window attention at the quarter scale,
+  the export branch of `FeatureFlowAttention.forward_local_window_attn`) takes its window from nine
+  shifted slices of the zero-padded key and flow, in `F.unfold`'s row-major order. `F.unfold`
+  exports as Range + Pad + Gather, which TensorRT-RTX fused with the 128-channel q.k sum into one
+  kernel at about 13 GB/s: 1.76 ms, ~60 % of B at the live Balanced half. With the slices B takes
+  0.65 to 0.70 x the time at every size (Balanced 3.06 -> 2.08 ms a pair at 160 W), outputs
+  byte-identical (the engine on synthetic inputs, GMFSS renders at 480p, the Quality half, 1080p
+  and DLAA).
 * GMFlow's CNN backbone runs once a frame: the export also cuts it out of `gmflow_bidir_a`
   (`trt_runtime.gmflow_backbone_cut`: the two Conv-fed batch Splits give its maps, the batch Concat
   of the two frames becomes the first frame's branch) as `gmflow_backbone` (one frame -> `map4`,
@@ -1588,6 +1596,25 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   kernel at about half the bandwidth: the Balanced half's entry 1.36 -> 0.72 ms (a 55 W map).
   Bit-identical on every variant's route; the whole graph's quarter scale keeps the encoding
   before the layout change (its engine's outputs moved with it).
+* Every token-outer scale keeps its stream in fp16 (`transformer.EXPORT_FP16_STREAM`, set by
+  `onnx_export.GMFLOW_FP16_STREAM`): between blocks, and each block's self-attention output before its
+  cross attention. Under the export's autocast(fp16) `layer_norm` returns fp32, so the residual sums
+  would carry the stream in fp32, and each block's glue kernel would read and write it at twice the
+  bytes (a kernel trace of the Balanced half: 0.29 ms a block at ~600 GB/s). Every LayerNorm still
+  computes in fp32, and the transformer's output stays fp32 (`gmflow_split` checks the dtypes of the
+  tensors that cross its cut). At 160 W, A against the fp32 stream: g8 x0.98 / x0.97 (Balanced /
+  Quality), g8r x0.96 (DLAA), g4 x0.96, g2 x0.97; the coarse-scale `_m` of g8r x0.97 and of g2 x1.00.
+  Not bit-identical: tweens vs an fp32 reference at 480p / the Quality half / 1080p / the 1440p DLAA
+  frame 49.22 / 49.68 / 49.67 / 49.90 dB pooled against 49.49 / 49.65 / 49.62 / 49.70 with the fp32
+  stream; real frames identical; no fixed-position difference.
+* A token-outer shifted-window attention adds its mask broadcast over the group's frames
+  (`scores.view(windows, nb, L, L) + mask[:, None]`), not `repeat_interleave`d: the repeated form made
+  TensorRT-RTX write eight fp32 [8, 4, 336, 336] masks every A call at the Balanced half (115.6 MB, 177 of
+  the entry kernel's 268 us). Byte-identical outputs on every changed graph and in GMFSS renders (480p,
+  the Quality half, 1080p, DLAA). At 160 W: g8 0.96 to 0.99 (offline 1080p 0.975, 10 / 10), g4 0.99,
+  g2 0.99, g1 1.01 (noise level); the A context 244 -> 162 MiB at Balanced, 474 -> 283 at the offline
+  1080p half. The windowed path (`_m`'s coarse scale where it is not token-outer) keeps the repeat: the
+  same rewrite there measured 14 to 23 % slower.
 * Live GMFSS flow scale (the GUI's GMFSS flow scale slider, 25 to 100 %, main.ts `--gmfss-flow F`): gmflow's three
   engines (backbone, `gmflow_bidir_a` / `_b`) run on the /32 grid nearest F x the half (`GMFSS_infer_u.reuse`'s
   `round(n * F / 32) * 32`, Python's half-to-even rounding), never below 320 x 192: at a 256 x 128 grid (1080p at 25 %,
@@ -2031,6 +2058,13 @@ Rules (hard-won, do not regress):
   (`engine/dlssg/build_src/sl_focus_shim.h`, installed after the `DLSS-G ready` line) answers that test
   with the overlay, and `SMV_DLSSG_FOCUS_SHIM=0` leaves the pacer in passthrough whenever another window
   has focus.
+* Both DLSS-G hosts (`engine/live` and `engine/dlssg`) clear `eAllowOTA | eLoadDownloadedPlugins` in
+  `slInit`: Streamline would otherwise load a newer plugin it downloaded into
+  `C:\ProgramData\NVIDIA\NGX\models` over the shipped one (it once ran 2.14.0 under a 2.12 build). A
+  downloaded copy changes behaviour untested, and its hashed file name escapes the focus shim (it patches
+  `sl.*` modules). The log then reads `eLoadDownloadedPlugins flag not passed to preferences, OTA'd plugins
+  will not be loaded!`; Streamline still reads the OTA manifest and starts the driver's updater, which only
+  downloads. A new Streamline reaches users through the stack update.
 * The capture D3D11 device must come from the real `d3d11.dll` (`LoadLibrary` + `GetProcAddress`):
   the Streamline import lib redirects `D3D11CreateDevice` to its proxy, which breaks frame
   generation.

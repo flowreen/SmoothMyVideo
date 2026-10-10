@@ -685,6 +685,9 @@ static int slInitCommon()
     // SL's defense against injected overlays (NVIDIA App overlay, Parsec, ...): they hook the
     // same DXGI v-tables and can silently break the interposer's present path
     pref.flags |= sl::PreferenceFlags::eUseDXGIFactoryProxy;
+    // the plugins shipped beside the exe, never a newer one Streamline downloads into ProgramData: a downloaded
+    // copy changes behaviour untested, and its hashed file name escapes the focus shim (it patches sl.* modules)
+    pref.flags &= ~(sl::PreferenceFlags::eAllowOTA | sl::PreferenceFlags::eLoadDownloadedPlugins);
     pref.renderAPI = sl::RenderAPI::eD3D12;
     CHECK_SL(slInit(pref, sl::kSDKVersion));
     return 0;

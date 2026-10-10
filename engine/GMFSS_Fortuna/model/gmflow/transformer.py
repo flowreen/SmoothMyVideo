@@ -104,6 +104,13 @@ EXPORT_TOKEN_OUTER = ()
 # (GMFLOW_TOKEN_POSITION)
 EXPORT_TOKEN_POSITION = ()
 
+# export path (SMV): the token-outer blocks (FeatureTransformer._forward_windowed) keep their stream in fp16 between
+# blocks and between a block's self and cross attention. Under the export's autocast(fp16) layer_norm returns fp32, so
+# the residual sums would carry both in fp32 and each block's glue would read and write them at twice the bytes; every
+# LayerNorm still computes in fp32 and the transformer's output stays fp32 (gmflow_split's cut checks the dtypes of the
+# tensors that cross it); onnx_export.py sets it
+EXPORT_FP16_STREAM = False
+
 
 def fold_projections(module):
     """export path (SMV): every TransformerLayer's attention is single-head and linear in its projections, so
@@ -257,15 +264,16 @@ def single_head_split_window_attention(q, k, v,
 
     if windowed == "tokens":
         # the tokens already sit in the (shifted) windows' token-outer order (FeatureTransformer._forward_windowed):
-        # the attention batch is the group's windows x frames, the mask repeated per frame; a (group, groups) pair in
-        # the mask's place = EXPORT_REGION_ATTENTION
+        # the attention batch is the group's windows x frames, the mask broadcast over the frames (a repeated mask is
+        # materialized per frame: more memory and slower); a (group, groups) pair in the mask's place =
+        # EXPORT_REGION_ATTENTION
         n, wb, c = q.size()
         nb = wb // windows
         if with_shift and isinstance(attn_mask, tuple):
             return _region_attention_tokens(q, k, v, h, w, num_splits, *attn_mask, nb)
         scores = torch.matmul(q.permute(1, 0, 2), k.permute(1, 2, 0)) / (c ** 0.5)  # [W * B, L, L]
         if with_shift:
-            scores += attn_mask.repeat_interleave(nb, dim=0)
+            scores = (scores.view(windows, nb, n, n) + attn_mask[:, None]).view(wb, n, n)
         attn = torch.softmax(scores, dim=-1)
         return torch.matmul(attn, v.permute(1, 0, 2)).permute(1, 0, 2)  # [L, W * B, C]
 
@@ -632,6 +640,9 @@ class FeatureTransformer(nn.Module):
         if with_position:
             pos = PositionEmbeddingSine(num_pos_feats=c // 2)(feature0[:1, :, :wsh, :wsw])  # [1, C, H/K, W/K]
             x0 = x0 + pos[0].flatten(1).t()[None, :, None, :]
+        half = EXPORT_FP16_STREAM
+        if half:
+            x0 = x0.half()
         x1 = _swap_frames(x0, bb)
         sh, sw = wsh // 2, wsw // 2
         for layer in self.layers:
@@ -640,13 +651,23 @@ class FeatureTransformer(nn.Module):
             if shifted:
                 x0 = _to_groups(_roll_hw(_from_groups(x0, bb, h, w, k, g), sh, sw, True), h, w, k, g)
                 x1 = _swap_frames(x0, bb)
-            x0 = torch.stack([layer(x0[i], x1[i], height=h, width=w,
-                                    shifted_window_attn_mask=(i, g) if regions else mask[i * kk // g:(i + 1) * kk // g],
-                                    attn_num_splits=k, windowed="tokens", windows=kk // g) for i in range(g)], dim=0)
+            outs = []
+            for i in range(g):
+                kw = dict(height=h, width=w, attn_num_splits=k, windowed="tokens", windows=kk // g,
+                          shifted_window_attn_mask=(i, g) if regions else mask[i * kk // g:(i + 1) * kk // g])
+                if half:  # TransformerBlock.forward with the self attention's output stored in fp16
+                    outs.append(layer.cross_attn_ffn(layer.self_attn(x0[i], x0[i], **kw).half(), x1[i], **kw))
+                else:
+                    outs.append(layer(x0[i], x1[i], **kw))
+            x0 = torch.stack(outs, dim=0)
+            if half:
+                x0 = x0.half()
             if shifted:
                 x0 = _to_groups(_roll_hw(_from_groups(x0, bb, h, w, k, g), sh, sw, False), h, w, k, g)
             x1 = _swap_frames(x0, bb)
         out = _from_groups(x0, bb, h, w, k, g).permute(0, 3, 1, 2).contiguous()  # [2B, C, H, W]
+        if half:
+            out = out.float()
         feature0, feature1 = out.chunk(chunks=2, dim=0)
         return feature0, feature1
 
@@ -717,15 +738,20 @@ class FeatureFlowAttention(nn.Module):
             # which a size-free export cannot hold. The two per-pixel products (1 x C by C x k*k,
             # then 1 x k*k by k*k x 2) as multiply + sum over one axis: no batched gemm, so no
             # launch cap and nothing per size. A different summation order: equivalent, measured
-            # closer to eager fp32 than the chunked engine
-            ks = 2 * local_window_radius + 1
-            q = self.q_proj(feature0.view(b, c, -1).permute(0, 2, 1)).permute(0, 2, 1)  # [B, C, H*W]
+            # closer to eager fp32 than the chunked engine. The k*k window = shifted slices of the zero-padded
+            # key and flow in F.unfold's row-major order: an unfold exports as a Gather, which TensorRT-RTX fused
+            # with the channel sum at ~13 GB/s (the slices: B ~0.68x the time, its outputs byte-identical)
+            r = local_window_radius
+            ks = 2 * r + 1
+            q = self.q_proj(feature0.view(b, c, -1).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, c, h, w)
             kp = self.k_proj(feature0.view(b, c, -1).permute(0, 2, 1)).permute(0, 2, 1).reshape(b, c, h, w)
-            kw = F.unfold(kp, kernel_size=ks, padding=local_window_radius).view(b, c, ks * ks, h * w)
-            scores = (q.unsqueeze(2) * kw).sum(1) / (c ** 0.5)  # [B, k*k, H*W]
+            kp = F.pad(kp, (r, r, r, r))
+            fp = F.pad(flow, (r, r, r, r))
+            scores = torch.stack([(q * kp[:, :, y:y + h, x:x + w]).sum(1) for y in range(ks) for x in range(ks)],
+                                 dim=1) / (c ** 0.5)  # [B, k*k, H, W]
             prob = torch.softmax(scores, dim=1)
-            fw = F.unfold(flow, kernel_size=ks, padding=local_window_radius).view(b, 2, ks * ks, h * w)
-            return (prob.unsqueeze(1) * fw).sum(2).view(b, 2, h, w).contiguous()  # [B, 2, H, W]
+            fw = torch.stack([fp[:, :, y:y + h, x:x + w] for y in range(ks) for x in range(ks)], dim=2)  # [B, 2, k*k, H, W]
+            return (prob.unsqueeze(1) * fw).sum(2).contiguous()  # [B, 2, H, W]
 
         feature0_reshape = self.q_proj(feature0.view(b, c, -1).permute(0, 2, 1)
                                        ).reshape(b, h * w, 1, c)  # [B, H*W, 1, C]
