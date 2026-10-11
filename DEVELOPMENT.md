@@ -1468,10 +1468,10 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   52.78 dB against the whole backbone's 59.03 / 53.27; 1080p x2 x0.969 a pair.
 * GMFlow's two attentions whose value is 2 channels (the scale-0 global matching: the softmax over
   every token pair times the pixel grid, both directions; the flow propagation: the same with the
-  flow) run in the host, not in a graph: the export cuts `gmflow_bidir_a_g8r` around them
-  (`trt_runtime.gmflow_matching_cut`) into `<key>_m` (the backbone maps -> `mf`, the two frames'
-  tokens, and the propagation's `mq` / `mk`, fp16 [2, N, 128]) and the A graph, which takes the
-  propagated flow as `prop`. Between them `k_attn2` runs twice (the matching with the grid as its
+  flow) run in the host, not in a graph: the export cuts the first half around them
+  (`trt_runtime.gmflow_matching_cut`) into `gmflow_bidir_a_g8r_m` (the backbone maps -> `mf`, the two
+  frames' tokens, and the propagation's `mq` / `mk`, fp16 [2, N, 128]) and the A graph
+  `gmflow_bidir_a_g8`, which takes the propagated flow as `prop`. Between them `k_attn2` runs twice (the matching with the grid as its
   value writes the flow, the propagation reads it): a flash-style kernel, Q K^T on the tensor cores
   (mma.sync, fp16 in, fp32 accumulation), the softmax online in fp32, the value product in fp32, so
   the token x token matrix never exists (in a graph it took 8 row blocks to keep 4K GMFSS inside a
@@ -1508,21 +1508,28 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   cost three copies into it and one out per attention); the cross attention's partner = the frame halves
   swapped. The quarter scale runs each block on 8 groups of one window row (a group's tensors stay near
   the GPU's L2: the block's FFN ran at half the rate on 117,760 tokens as on 29,440). A shifted block
-  attends per mask region (`_region_attention_tokens`): after the roll by half a window only the last
-  window row and column hold two regions each (the corner four) and a token attends only inside its own
-  region (the mask's -100 is a 0 weight), so each region is plain attention (TensorRT's masked attention
-  kernel cost about 1.5x the plain one); exact in fp64 (2e-14 against the masked form). The position
+  of the coarse scale (the `_m` graph) attends per mask region (`_region_attention_tokens`): after the
+  roll by half a window only the last window row and column hold two regions each (the corner four) and
+  a token attends only inside its own region (the mask's -100 is a 0 weight), so each region is plain
+  attention (TensorRT's masked attention kernel cost about 1.5x the plain one); exact in fp64 (2e-14
+  against the masked form). The quarter scale's shifted blocks (A) keep the shift mask: per region its 8
+  groups are ~200 attentions of distinct shapes, and TensorRT-RTX's runtime JIT compiled them in ~137 s
+  on one CPU thread at every new size (the masked form ~20 s). The position
   encoding is added after the layout change, a broadcast add over the position axis (`takes_position`;
   gmflow.py skips `feature_add_position` there): the Balanced half's entry 1.36 -> 0.72 ms. Eager keeps
   the original layout.
-* One gmflow A and one `_m` serve every size (2026-10-11, uniform only): `gmflow_bidir_a_g8r` /
-  `_g8r_m`, the fastest at the highest sizes (160 W, harness `gmfss_uniform_variant`: A at the 4K half
-  137.6 ms against 162.0 for the 8-group masked form, `_m` 34.1 against 44.0 / 46.1 for the 2- / 8-group
-  forms; the DLAA half's `_m` 9.34 against 10.70 / 11.36), slower at the small live halves of a 1440p
-  screen (A at Ultra 8.71 ms against 3.47 for 2 groups, Performance 12.32 against 8.35 for 4, Balanced
-  16.49 against 14.77 for 8), accepted: the target is the highest sizes. A window needs 2 tokens a side,
-  so the host pads a GMFSS frame to at least 128 a side (`kGmMinPad`; the packers replicate the edge into
-  the pad).
+* One gmflow A and one `_m` serve every size (uniform only): `gmflow_bidir_a_g8` (the quarter scale in 8
+  groups with the shift mask) and `gmflow_bidir_a_g8r_m` (the coarse scale per region), both cut from one
+  export. The first start at a new size decides A's form: per region (`_g8r`) A was the fastest (at the
+  4K half 137.6 ms against 161.0 masked, the DLAA half 44.7 against 46.6; harness `gmfss_first_start_fix`
+  forms_ab) but its cold load took 26 s of build + ~137 s of JIT on one CPU thread and a 9.7 GB peak
+  working set; masked it is 11 s + ~20 s (2.2 GB). Measured at 160 W: GMFSS's first start (host-direct,
+  offline x2, 8 frames, a fresh cache) 50.5-56.2 s at 1080p / 1440p / 2160p against 183-200 s with
+  `_g8r`, Live at 1440p DLAA ready after 57.5 s against 212.3 s; the price, a 4K offline pair 372.3 ms
+  against 345.9 (x1.075) and the 1440p DLAA live flow block 77.7 against 74.8 ms. `_m` per region stays:
+  the fastest `_m` (34.2 ms at the 4K half against 44.2 / 46.3 whole / 8-group masked, 9.2 against
+  10.6 / 11.3 at the DLAA half) for ~4 s of load. A window needs 2 tokens a side, so the host pads a
+  GMFSS frame to at least 128 a side (`kGmMinPad`; the packers replicate the edge into the pad).
 * GMFlow's transformer attention exports with its projections folded: every attention is single-head
   and linear in its projections, so `q k^T = s Wq^T Wk t^T` and `merge(P v) = P t (Wm Wv)^T`. The
   query takes one 128 x 128 matrix, the key is the target itself, the value takes `Wm Wv`

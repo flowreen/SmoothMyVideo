@@ -101,17 +101,18 @@ def main():
     ensure(tr.FeatEngine(), gm.feat_ext, rec["feat_ext"][:1])
     # the host runs gmflow_bidir as its backbone (one frame a call) and two halves around its own local correlation,
     # the first half itself as `_m` + the rest around its own global matching and propagation (k_attn2), one form at
-    # every size (`_g8r`: 8 window groups, the shifted blocks' attention per region, transformer.py's export path): the
-    # whole graph is exported once, only to be cut (ship_tidy then removes it), and parts already present skip all of it
+    # every size (transformer.py's export path: 8 window groups at the quarter scale, the shifted blocks' attention per
+    # region at the coarse scale = `_m`'s `_g8r_m`, with the shift mask at the quarter scale = A's `_g8`): the whole
+    # graph is exported once, only to be cut (ship_tidy then removes it), and parts already present skip all of it
     parts = [trt_lookup.onnx_path(k) for k in
-             ("gmflow_backbone", "gmflow_bidir_a_g8r_m", "gmflow_bidir_a_g8r", "gmflow_bidir_b")]
+             ("gmflow_backbone", "gmflow_bidir_a_g8r_m", "gmflow_bidir_a_g8", "gmflow_bidir_b")]
     if not all(os.path.isfile(p) for p in parts):
         gmt.EXPORT_FP16_STREAM = GMFLOW_FP16_STREAM
         try:
             ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
         finally:
             gmt.EXPORT_FP16_STREAM = False
-        a_path, _ = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()), a_key="gmflow_bidir_a_g8r")
+        a_path, _ = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()), a_key="gmflow_bidir_a_g8")
         tr.gmflow_backbone_cut(a_path)
         tr.gmflow_matching_cut(a_path, "gmflow_bidir_a_g8r")
         tr.gmflow_exit_fp16(a_path)

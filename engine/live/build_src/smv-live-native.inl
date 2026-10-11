@@ -4481,8 +4481,9 @@ static const char* const kGmKey[kGmN] = {"gfeat", "gflow", "gmetric", "gifnet", 
 static const char* const kGmName[kGmN] = {"feat_ext",  "gmflow_bidir_a", "metricnet",       "ifnet",
                                           "fusionnet", "gmflow_bidir_b", "gmflow_backbone", "gmflow_bidir_a_m"};
 
-// the smallest GMFSS pad a side (lkSession): gmflow's quarter-scale windows are the pad / 64 a side, and its shifted
-// blocks attend per region of half a window (transformer._region_attention_tokens), so a window needs 2 tokens a side
+// the smallest GMFSS pad a side (lkSession): gmflow's quarter-scale windows are the pad / 64 a side and its shifted
+// blocks roll by half a window, so a window needs 2 tokens a side (a 1-token window rolls by 0: an empty slice in the
+// export's roll, transformer._roll_hw, untested); the coarse scale's per-region blocks (`_m`) need 2 at the pad / 32
 static constexpr int kGmMinPad = 128;
 
 // Upscale to: _Fit.__init__'s derivation of the
@@ -5058,8 +5059,8 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
     char key[64];
     if (s.backend == "gmfss")
     {
-        // a 64 px pad side would give gmflow's quarter-scale windows 1 token a side and its shifted blocks empty
-        // regions: such a side runs at kGmMinPad (the packers replicate the edge into the pad)
+        // a 64 px pad side would give gmflow's quarter-scale windows 1 token a side and its shifted blocks a roll of 0
+        // (kGmMinPad): such a side runs at kGmMinPad (the packers replicate the edge into the pad)
         s.ph = (std::max)(s.ph, kGmMinPad);
         s.pw = (std::max)(s.pw, kGmMinPad);
         const int hh = s.hh = s.ph / 2, hw = s.hw = s.pw / 2;
@@ -5072,8 +5073,8 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
         s.gm = {
             {"gfeat", "featurenet", "featurenet", 1, {{"x", {1, 3, s.ph, s.pw}}}},
             {"gflow",
-             "gmflow_bidir_a_g8r",
-             "gmflow_bidir_a_g8r",
+             "gmflow_bidir_a_g8",
+             "gmflow_bidir_a_g8",
              2,
              {{"map4", {2, 128, gh / 4, gw / 4}},
               {"map8", {2, 128, gh / 8, gw / 8}},

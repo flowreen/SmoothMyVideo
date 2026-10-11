@@ -22,18 +22,28 @@ def generate_shift_window_attn_mask(input_resolution, window_size_h, window_size
     # Ref: https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
     # calculate attention mask for SW-MSA
     h, w = input_resolution
-    img_mask = torch.zeros((1, h, w, 1), device=device)  # 1 H W 1; CPU-alloc + .to() breaks CUDA graph capture
-    h_slices = (slice(0, -window_size_h),
-                slice(-window_size_h, -shift_size_h),
-                slice(-shift_size_h, None))
-    w_slices = (slice(0, -window_size_w),
-                slice(-window_size_w, -shift_size_w),
-                slice(-shift_size_w, None))
-    cnt = 0
-    for hs in h_slices:
-        for ws in w_slices:
-            img_mask[:, hs, ws, :] = cnt
-            cnt += 1
+    if torch.compiler.is_compiling():
+        # export path (SMV): the same region ids 0..8 from arange
+        # comparisons (rows [0, h - wh) / [h - wh, h - sh) / [h - sh, h), columns alike), so a
+        # size-free export has no Python slice loop over the size; exact
+        rr = ((torch.arange(h, device=device) >= h - window_size_h).long()
+              + (torch.arange(h, device=device) >= h - shift_size_h).long())
+        cr = ((torch.arange(w, device=device) >= w - window_size_w).long()
+              + (torch.arange(w, device=device) >= w - shift_size_w).long())
+        img_mask = (rr[:, None] * 3 + cr[None, :]).float().view(1, h, w, 1)
+    else:
+        img_mask = torch.zeros((1, h, w, 1), device=device)  # 1 H W 1; CPU-alloc + .to() breaks CUDA graph capture
+        h_slices = (slice(0, -window_size_h),
+                    slice(-window_size_h, -shift_size_h),
+                    slice(-shift_size_h, None))
+        w_slices = (slice(0, -window_size_w),
+                    slice(-window_size_w, -shift_size_w),
+                    slice(-shift_size_w, None))
+        cnt = 0
+        for hs in h_slices:
+            for ws in w_slices:
+                img_mask[:, hs, ws, :] = cnt
+                cnt += 1
 
     mask_windows = split_feature(img_mask, num_splits=input_resolution[-1] // window_size_w, channel_last=True)
 
@@ -107,12 +117,12 @@ def _swap_frames(x, b):
 
 
 def _region_attention_tokens(q, k, v, h, w, num_splits, group, groups, nb):
-    """a shifted block's attention of group `group` of `groups` (whole window rows) as plain attention per mask region,
-    on _to_groups' token-outer [L, W * nb, C]: after the roll by half a window only the last window row and column hold
-    two regions each (the corner four) and a token attends only inside its own (the mask's -100 is a 0 weight); the
-    interior windows in one batch, the last column's split left / right, the last row's top / bottom, the corner in
-    four; a region = a slice of the position axes, its windows x frames the attention batch. A window needs 2 tokens
-    a side (a region is empty otherwise; the host pads GMFSS to kGmMinPad)"""
+    """a shifted block's attention of group `group` of `groups` (whole window rows) as plain attention per mask region
+    (the coarse scale, _forward_windowed), on _to_groups' token-outer [L, W * nb, C]: after the roll by half a window
+    only the last window row and column hold two regions each (the corner four) and a token attends only inside its
+    own (the mask's -100 is a 0 weight); the interior windows in one batch, the last column's split left / right, the
+    last row's top / bottom, the corner in four; a region = a slice of the position axes, its windows x frames the
+    attention batch. A window needs 2 tokens a side (a region is empty otherwise; the host pads GMFSS to kGmMinPad)"""
     n, wb, c = q.shape
     wh, ww = h // num_splits, w // num_splits
     sh, sw = wh // 2, ww // 2
@@ -161,18 +171,22 @@ def single_head_split_window_attention(q, k, v,
                                        ):
     # Ref: https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
     # q, k, v: [B, L, C]; windowed "tokens": a group of `windows` whole windows as [L, W * B, C] (_to_groups), a
-    # shifted block's attn_mask = its (group, groups)
+    # shifted block's attn_mask = the group's rows of the shift mask, or its (group, groups) for the attention per region
     assert q.dim() == k.dim() == v.dim() == 3
 
     assert h is not None and w is not None
 
     if windowed == "tokens":
         # the tokens already sit in the (shifted) windows' token-outer order (FeatureTransformer._forward_windowed):
-        # the attention batch is the group's windows x frames; a shifted block attends per mask region
-        _, wb, c = q.size()
-        if with_shift:
-            return _region_attention_tokens(q, k, v, h, w, num_splits, *attn_mask, wb // windows)
+        # the attention batch is the group's windows x frames, the mask broadcast over the frames (a repeated mask is
+        # materialized per frame: more memory and slower)
+        n, wb, c = q.size()
+        nb = wb // windows
+        if with_shift and isinstance(attn_mask, tuple):
+            return _region_attention_tokens(q, k, v, h, w, num_splits, *attn_mask, nb)
         scores = torch.matmul(q.permute(1, 0, 2), k.permute(1, 2, 0)) / (c ** 0.5)  # [W * B, L, L]
+        if with_shift:
+            scores = (scores.view(windows, nb, n, n) + attn_mask[:, None]).view(wb, n, n)
         attn = torch.softmax(scores, dim=-1)
         return torch.matmul(attn, v.permute(1, 0, 2)).permute(1, 0, 2)  # [L, W * B, C]
 
@@ -477,11 +491,18 @@ class FeatureTransformer(nn.Module):
         attention reads its group's [L, W * B, C] slice as it is (window-ordered tokens cost 3 copies into the fused
         kernel's layout and 1 out per attention); the layout changes once in, once out, and a shifted block's rolled
         windows once around the block (its self and cross attention share them); a block works per token and per
-        window, so at the quarter scale it runs on 8 groups of one window row; a shifted block attends per mask region
-        (_region_attention_tokens); with_position = add feature_add_position's per-window table here, once over the
-        position axis (takes_position)"""
+        window, so at the quarter scale it runs on 8 groups of one window row; a shifted block attends with the shift
+        mask at the quarter scale and per mask region at the coarse scale (_region_attention_tokens); with_position =
+        add feature_add_position's per-window table here, once over the position axis (takes_position)"""
         b, c, h, w = feature0.shape
         wsh, wsw = h // k, w // k
+        # per region (plain attention, faster than TensorRT-RTX's masked kernel) only at the coarse scale (k 2, gmflow's
+        # `_m` after the matching cut): the quarter scale's 8 groups x regions are ~200 attentions of distinct shapes,
+        # whose runtime JIT took ~137 s on one CPU thread at every new size (the masked form ~20 s)
+        regions = k != 8
+        mask = None if regions else generate_shift_window_attn_mask(
+            input_resolution=(h, w), window_size_h=wsh, window_size_w=wsw, shift_size_h=wsh // 2, shift_size_w=wsw // 2,
+            device=feature0.device)
         # the quarter scale (k 8) in 8 groups: a group's tensors stay near the GPU's L2 (the block's FFN ran at half the
         # rate on 117,760 tokens as on 29,440)
         g = 8 if k == 8 else 1
@@ -505,7 +526,7 @@ class FeatureTransformer(nn.Module):
             outs = []
             for i in range(g):
                 kw = dict(height=h, width=w, attn_num_splits=k, windowed="tokens", windows=kk // g,
-                          shifted_window_attn_mask=(i, g))
+                          shifted_window_attn_mask=(i, g) if regions else mask[i * kk // g:(i + 1) * kk // g])
                 if half:  # TransformerBlock.forward with the self attention's output stored in fp16
                     outs.append(layer.cross_attn_ffn(layer.self_attn(x0[i], x0[i], **kw).half(), x1[i], **kw))
                 else:
