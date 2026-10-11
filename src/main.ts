@@ -801,7 +801,8 @@ function onLiveSessionEnd(code: number | null) {
     }, 400);
     return;
   }
-  // exit 4 = target window resized (the overlay cannot resize in place); exit 6 = the stall
+  // exit 4 = target window resized (the overlay cannot resize in place), moved monitor, or Whole
+  // screen's monitor left the desktop (unplugged; restarts on the current monitor); exit 6 = the stall
   // watchdog killed a wedged enhancement engine. Both revive the SAME session with the SAME
   // configuration: a mid-session downgrade (e.g. to the eager model path) would read as
   // "it suddenly got slow" to the user, worse than a brief hiccup at full speed.

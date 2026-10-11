@@ -834,7 +834,9 @@ and the latency is the Streamline handoff. Plain DLSS-G (no effect) keeps its di
 and `colour_check.py` (the red square stays red, and DLSS-G + Sharpen's real frames are exact twins of echo + Sharpen).
 `--gen`: server backends 1..15, dlssg 1..5. `--fg` targets the current foreground window (the
 app's hotkey and countdown use it). Exit codes: 2 unsupported GPU, 3 multi-frame limit, 4 target
-resized or moved monitor (the app auto-restarts, cap 20), 5 `--fg` target not capturable, 6 stall
+resized or moved monitor, or Whole screen's monitor left the desktop (`capture closed (the display layout changed),
+restarting on the current monitor`: unplugged, the layout changed; the app auto-restarts, cap 20), 5 `--fg` target
+not capturable, 6 stall
 (the watchdog killed a wedged server; the app revives the same config), 7 the target window closed
 (mid-session, during a resize, or already gone or hidden when a revive or settings restart starts on
 its handle; the app shows "stopped: the window was closed" and never revives it).
@@ -860,6 +862,8 @@ DLSS-G's 700 ms input-gap reset never fires on a source that keeps presenting a 
 every arrival. The session's closing `capture:` line counts the drops, the keepalives and the test's cost. `SMV_WGC_SAME=0` turns the test off (A/B); where it cannot run (`SMV_WGC_SAME=fail` = the trigger) the
 whole screen keeps Windows' interval and a window counts repeats, each with a note line. The host times every group on the GPU (`grEv`, from the capture read: `gIntUs` = the work before the
 slots of a group with tweens, the frame's passes and the pair's model work; `gTweenUs` = one tween with its store).
+The 2 s `live:` stats line ends with both, `gpu pre Nms tween Nms`, once a group with tweens was timed, the throttle on
+or off: a fixed-work A/B (`--no-adapt`, `--no-gpu-fit`) reads its same-work cost there.
 Every 500 ms window the loop (`xqThrottle`) computes the tweens a pair
 affords within the budget, m = (budget x the source's interval - the work before the slots) / one tween; the grid
 makes every presented frame a tween, so the target is m per source frame, capped by the user's target and the ring's
@@ -1275,7 +1279,9 @@ itself: within 0.05 codes at 16 bits, the same bytes at two block shapes),
 the live gate `harness\eff\eff_native.py`. Every resize of a planar frame runs as the Lanczos pair
 `k_fitAaH` / `k_fitAaV` at every ratio (support `kLzDown` x the ratio on a shrinking axis, `2 kLzUp` taps on an
 enlarging one, window maths exact in integers, since the window start and every tap argument are ratios of the
-frame sizes; each pixel computes its own taps): the live fit (a window larger than the monitor in Fill screen, a
+frame sizes; each axis reads its taps from one table per resize, `in -> out`, in global memory: `k_rsTab` builds it
+on the reader's stream at its first use and `rsTabFor` keeps it for the session, every ratio fits, a failed table =
+`native: the resize tap tables for WxH -> WxH failed` and the resize refuses): the live fit (a window larger than the monitor in Fill screen, a
 DLSS mode below DLAA) with its vertical pass fused with the slot store (`k_packOutV` / `k_packOutHdrV`), Upscale
 to's resizes, the resize before the model, an HDR frame's SDR-view fit, Restore's HDR reference and the motion
 frames (`nativeFitPlanar`, its horizontal pass in `dTmp`); the 1:1 stores (`sampleOut`) only copy. The log lines
@@ -1422,9 +1428,14 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   query and sums over the 128 channels through a [2, 128, HW, 81] fp32 product written and read
   back (2.7 GB at the 960x544 half, ~11 % of the call). The export cuts `gmflow_bidir` around it
   (`trt_runtime.gmflow_split`, found by structure: the one ReduceSum of GridSample x query) into
-  `gmflow_bidir_a` (the frames -> the query and the feature map channels-last, and the two
-  tensors the rest still needs: flow0, feat) and `gmflow_bidir_b` (the correlation and those -> the
-  flow); between them `k_localCorr` takes one warp a pixel and computes the 81 window positions
+  `gmflow_bidir_a` (the frames -> `qf`, the transformer's fp16 output stream [4, H, W, 128]
+  channels-last: rows 0-1 = the query and the 128-channel map B reads, rows 2-3 = the feature
+  map; plus flow0) and `gmflow_bidir_b` (the correlation, qf and flow0 -> the flow).
+  `trt_runtime.gmflow_exit_fp16` hands A's exit out as that one fp16 tensor: the graph's Cast to
+  fp32, Split and Transposes into q / f / feat cost ~6 % of A at the 4K half, and every value they
+  carried is an exact widening of qf (engine outputs and renders byte-identical); B reads qf's rows
+  in fp16 where it cast feat back to fp16 anyway. Between them `k_localCorr` takes one warp a
+  pixel, widens qf's halves itself (one uint2 load a lane) and computes the 81 window positions
   itself (normalize_coords' IEEE divide: bit for bit what the graph computed), and the export
   branch of `matching.local_correlation_softmax` makes the window's bounds and offsets after the
   correlation, so nothing size-only crosses (A writes 59 MB less a call at the Balanced half) and
@@ -1527,8 +1538,8 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   cross attention. Under the export's autocast(fp16) `layer_norm` returns fp32, so the residual sums
   would carry the stream in fp32, and each block's glue kernel would read and write it at twice the
   bytes (a kernel trace of the Balanced half: 0.29 ms a block at ~600 GB/s). Every LayerNorm still
-  computes in fp32, and the transformer's output stays fp32 (`gmflow_split` checks the dtypes of the
-  tensors that cross its cut). At 160 W, A against the fp32 stream x0.96 at the DLAA half, `_m` x0.97.
+  computes in fp32, and the transformer's output leaves A as the fp16 stream itself
+  (`gmflow_exit_fp16`; the host widens it exactly). At 160 W, A against the fp32 stream x0.96 at the DLAA half, `_m` x0.97.
   Not bit-identical: tweens vs an fp32 reference at 480p / the Quality half / 1080p / the 1440p DLAA
   frame 49.22 / 49.68 / 49.67 / 49.90 dB pooled against 49.49 / 49.65 / 49.62 / 49.70 with the fp32
   stream; real frames identical; no fixed-position difference.

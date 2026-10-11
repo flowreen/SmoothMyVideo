@@ -64,8 +64,8 @@ def _roll_hw(x, sh, sw, left):
 # export path (SMV): the token-outer blocks (FeatureTransformer._forward_windowed) keep their stream in fp16 between
 # blocks and between a block's self and cross attention. Under the export's autocast(fp16) layer_norm returns fp32, so
 # the residual sums would carry both in fp32 and each block's glue would read and write them at twice the bytes; every
-# LayerNorm still computes in fp32 and the transformer's output stays fp32 (gmflow_split's cut checks the dtypes of the
-# tensors that cross it); onnx_export.py sets it
+# LayerNorm still computes in fp32; the transformer's output is cast to fp32 here, and trt_runtime.gmflow_exit_fp16
+# hands the fp16 stream out of the exported A instead (the host widens it); onnx_export.py sets it
 EXPORT_FP16_STREAM = False
 
 

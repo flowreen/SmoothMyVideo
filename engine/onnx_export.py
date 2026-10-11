@@ -114,6 +114,7 @@ def main():
         a_path, _ = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()), a_key="gmflow_bidir_a_g8r")
         tr.gmflow_backbone_cut(a_path)
         tr.gmflow_matching_cut(a_path, "gmflow_bidir_a_g8r")
+        tr.gmflow_exit_fp16(a_path)
     done.extend(os.path.basename(p) for p in parts)
     ensure(tr.MetricEngine(), gm.metricnet, rec["metricnet"][:4])
     xi, tsv = rec["ifnet"][0], rec["ifnet"][1]

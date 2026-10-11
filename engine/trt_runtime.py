@@ -1194,7 +1194,7 @@ def _fusion_prelu_fanout(onnx_path, name):
     onnx.checker.check_model(onnx_path)
 
 
-# the host's names for what crosses the gmflow split, in its order (smv-live kGmA after q, f)
+# what crosses the gmflow split besides q, f, in its order (gmflow_exit_fp16 then folds q, f, feat into smv-live's qf)
 _GMFLOW_CROSS = ("flow0", "feat")
 
 
@@ -1487,6 +1487,168 @@ def gmflow_matching_cut(a_path, key):
     write(m, a_path)
     _log(f"[trt] gmflow's matching cut out: {os.path.basename(m_path)} + {os.path.basename(a_path)} (input prop)")
     return m_path
+
+
+def gmflow_exit_fp16(a_path):
+    """gmflow_bidir_a's exit as the transformer's own fp16 stream: after gmflow_split, A's q / f / feat are Split /
+    Reshape / Transpose of ONE Cast(fp32) of the stream [4, h4, w4, 128] channels-last (rows 0-1 = feature0 = q and
+    feat, rows 2-3 = feature1 = f), fp32 copies that cost A ~6 % of a call at the 4K half. Those 7 nodes go: A outputs
+    the stream as `qf` (fp16, as it is) + flow0, the host's k_localCorr widens qf itself, and B takes qf with its two
+    feat readers rewired in fp16 (the Reshape -> Transpose -> Cast(fp16) reader = a Reshape of qf's rows 0-1; the Concat
+    -> Cast(fp16) reader = Concat of Cast(fp16)(its other input) and those rows transposed: a Cast commutes with a
+    Concat). Lossless by construction: every value the old outputs carried is an exact widening of a qf value. The exact
+    pattern is required, any other refuses. Rewrites a_path and trt_lookup.onnx_path("gmflow_bidir_b") in place (the
+    graphs only, the weights files stay)."""
+    import collections
+
+    import onnx
+    from onnx import helper, numpy_helper, shape_inference, TensorProto
+
+    def maps(g):
+        prod = {o: n for n in g.node for o in n.output}
+        cons = collections.defaultdict(list)
+        for n in g.node:
+            for x in n.input:
+                cons[x].append(n)
+        return prod, cons
+
+    def attr(n, k):
+        return next((helper.get_attribute_value(x) for x in n.attribute if x.name == k), None)
+
+    def const(g, name):
+        for t in g.initializer:
+            if t.name == name:
+                return numpy_helper.to_array(t).tolist()
+        for n in g.node:
+            if n.op_type == "Constant" and n.output[0] == name:
+                v = attr(n, "value")
+                return numpy_helper.to_array(v).tolist() if v is not None else None
+        return None
+
+    def only(cons, t):
+        if len(cons.get(t, [])) != 1:
+            raise RuntimeError(f"gmflow_bidir: {t} has {len(cons.get(t, []))} readers, expected 1 (no fp16 exit)")
+        return cons[t][0]
+
+    def need(ok, what):
+        if not ok:
+            raise RuntimeError(f"gmflow_bidir: {what} (the exit is not the Cast / Split / Transpose pattern)")
+
+    def prune(g):
+        """drop nodes nothing reads (graph outputs kept), then initializers nothing reads; order the rest (Kahn)"""
+        keep = {o.name for o in g.output}
+        while True:
+            _, cons = maps(g)
+            dead = [n for n in g.node if not any(o in keep or cons.get(o) for o in n.output)]
+            if not dead:
+                break
+            for n in dead:
+                g.node.remove(n)
+        _, cons = maps(g)
+        for t in [t for t in g.initializer if not cons.get(t.name)]:
+            g.initializer.remove(t)
+        have = {i.name for i in g.input} | {t.name for t in g.initializer} | {""}
+        todo, order = list(g.node), []
+        while todo:
+            rest = []
+            for n in todo:
+                if all(x in have for x in n.input):
+                    order.append(n)
+                    have.update(n.output)
+                else:
+                    rest.append(n)
+            need(len(rest) < len(todo), "nodes left unordered")
+            todo = rest
+        del g.node[:]
+        g.node.extend(order)
+
+    def write(mm, path):
+        tmp = path + ".tmp.onnx"
+        with open(tmp, "wb") as fh:
+            fh.write(mm.SerializeToString())
+        onnx.checker.check_model(tmp)
+        os.replace(tmp, path)
+
+    a = onnx.load(a_path, load_external_data=False)
+    g = a.graph
+    prod, cons = maps(g)
+    outs = {o.name: o for o in g.output}
+    need(set(outs) == {"q", "f", "flow0", "feat"}, f"A's outputs are {sorted(outs)}")
+    qt = prod["q"]
+    need(qt.op_type == "Transpose" and attr(qt, "perm") == [0, 2, 1], "q is not Transpose [0, 2, 1]")
+    q3 = prod[qt.input[0]]
+    need(q3.op_type == "Reshape" and const(g, q3.input[1]) == [0, 0, -1], "q's Reshape is not [0, 0, -1]")
+    v = prod[q3.input[0]]
+    need(v.op_type == "Reshape" and v.input[0] == "feat" and const(g, v.input[1]) == [2, 128, -1, 1],
+         "q is not read off feat")
+    sp = prod["feat"]
+    need(sp.op_type == "Split" and attr(sp, "axis") == 0 and list(sp.output[:1]) == ["feat"] and len(sp.output) == 2
+         and (len(sp.input) == 1 or not sp.input[1]), "feat is not half 0 of an even axis-0 Split")
+    ft = prod["f"]
+    need(ft.op_type == "Transpose" and attr(ft, "perm") == [0, 2, 3, 1] and ft.input[0] == sp.output[1],
+         "f is not half 1 of that Split, Transpose [0, 2, 3, 1]")
+    cast = prod[sp.input[0]]
+    need(cast.op_type == "Cast" and attr(cast, "to") == TensorProto.FLOAT, "the Split does not read a Cast to fp32")
+    tr = prod[cast.input[0]]
+    need(tr.op_type == "Transpose" and attr(tr, "perm") == [0, 3, 1, 2], "the Cast does not read Transpose [0, 3, 1, 2]")
+    src = tr.input[0]
+    need(only(cons, src) is tr and only(cons, tr.output[0]) is cast and only(cons, cast.output[0]) is sp
+         and only(cons, "feat") is v and only(cons, sp.output[1]) is ft and only(cons, v.output[0]) is q3
+         and only(cons, q3.output[0]) is qt and not cons.get("q") and not cons.get("f"),
+         "an exit tensor is read elsewhere too")
+    vi = {x.name: x.type.tensor_type for x in shape_inference.infer_shapes(a).graph.value_info}
+    t = vi[src]
+    dims = [d.dim_value or d.dim_param for d in t.shape.dim]
+    need(t.elem_type == TensorProto.FLOAT16 and len(dims) == 4 and dims[0] == 4 and dims[3] == 128,
+         f"the stream is {dims}, dtype {t.elem_type}, not fp16 [4, H, W, 128]")
+    for n in (tr, cast, sp, v, q3, qt, ft):
+        g.node.remove(n)
+    sn = prod[src]
+    sn.output[list(sn.output).index(src)] = "qf"
+    flow0 = outs["flow0"]
+    del g.output[:]
+    g.output.extend([helper.make_tensor_value_info("qf", TensorProto.FLOAT16, dims), flow0])
+    prune(g)
+
+    b_path = trt_lookup.onnx_path("gmflow_bidir_b")
+    b = onnx.load(b_path, load_external_data=False)
+    gb = b.graph
+    _, cons = maps(gb)
+    fin = [i for i in gb.input if i.name == "feat"]
+    need(len(fin) == 1 and fin[0].type.tensor_type.elem_type == TensorProto.FLOAT, "B has no fp32 input feat")
+    readers = cons["feat"]
+    need(sorted(r.op_type for r in readers) == ["Concat", "Reshape"], "feat's readers in B are not a Reshape + Concat")
+    rs = next(r for r in readers if r.op_type == "Reshape")
+    need(const(gb, rs.input[1]) == [2, 128, -1], "B's Reshape of feat is not [2, 128, -1]")
+    rt = only(cons, rs.output[0])
+    need(rt.op_type == "Transpose" and attr(rt, "perm") == [0, 2, 1], "B's tokens reader is not Transpose [0, 2, 1]")
+    rc = only(cons, rt.output[0])
+    need(rc.op_type == "Cast" and attr(rc, "to") == TensorProto.FLOAT16, "B's tokens reader is not cast to fp16")
+    cat = next(r for r in readers if r.op_type == "Concat")
+    need(attr(cat, "axis") == 1 and list(cat.input).index("feat") == 1 and len(cat.input) == 2,
+         "B's Concat is not (x, feat) on axis 1")
+    cc = only(cons, cat.output[0])
+    need(cc.op_type == "Cast" and attr(cc, "to") == TensorProto.FLOAT16, "B's Concat is not cast to fp16")
+    idx = list(gb.input).index(fin[0])
+    gb.input.remove(fin[0])
+    gb.input.insert(idx, helper.make_tensor_value_info("qf", TensorProto.FLOAT16, dims))
+    for n in (rs, rt, rc, cat, cc):
+        gb.node.remove(n)
+
+    def cnode(name, vals):
+        return helper.make_node("Constant", [], [name], name=name,
+                                value=helper.make_tensor(name, TensorProto.INT64, [len(vals)], vals))
+
+    gb.node.extend([cnode("qf_s0", [0]), cnode("qf_s2", [2]), cnode("qf_ax0", [0]), cnode("qf_shape", [2, -1, 128]),
+                    helper.make_node("Slice", ["qf", "qf_s0", "qf_s2", "qf_ax0"], ["qf_q0"], name="qf_slice"),
+                    helper.make_node("Reshape", ["qf_q0", "qf_shape"], [rc.output[0]], name="qf_tokens"),
+                    helper.make_node("Transpose", ["qf_q0"], ["qf_q0t"], name="qf_nchw", perm=[0, 3, 1, 2]),
+                    helper.make_node("Cast", [cat.input[0]], ["qf_c16"], name="qf_c16", to=TensorProto.FLOAT16),
+                    helper.make_node("Concat", ["qf_c16", "qf_q0t"], [cc.output[0]], name="qf_concat", axis=1)])
+    prune(gb)
+    write(a, a_path)
+    write(b, b_path)
+    _log(f"[trt] gmflow's exit in fp16: {os.path.basename(a_path)} -> qf, flow0; {os.path.basename(b_path)} takes qf")
 
 
 # --- size-free ONNX -----------------------------------------------------------------------------

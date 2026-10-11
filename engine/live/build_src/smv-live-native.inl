@@ -53,7 +53,8 @@ __device__ __forceinline__ float h2f(unsigned short h)
 // The radius a (the lobes) per axis: kLzUp on an axis that enlarges or keeps its size, kLzDown on
 // one that shrinks = the universal resizer test's picks, the best no-sharpen PSNR over anime, real
 // camera and CGI at every ratio (up) and working size (down). These defines are the one place they
-// are set: the cubin cache key hashes this text, a harness may pass -D to try others.
+// are set: the cubin cache key hashes this text, the host reads them for the tap tables' sizes
+// (lzTaps), a harness may pass -D to try others (sizing its own tables to match).
 #ifndef kLzUp
 #define kLzUp 4
 #endif
@@ -111,6 +112,29 @@ __device__ __forceinline__ float rsInv(int o, int in, int out, int mn, int fs)
     for (int k = 0; k < fs; k++) s += rsW(mn + k, o, in, out);
     return 1.0f / s;
 }
+// one resize axis's taps (in -> out), built once by k_rsTab and read by every resize kernel: tap k of output index o
+// at k * out + o = its normalised weight (rsW times rsInv, the rounded product) and its mirrored input index, so a
+// pixel reads its taps instead of evaluating fs sines; every ratio fits (the table lives in global memory)
+struct __align__(8) RsTap
+{
+    float w;
+    int i;
+};
+__global__ void k_rsTab(int in, int out, RsTap* __restrict__ tab)
+{
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= out) return;
+    const int fs = rsTaps(in, out);
+    const int mn = rsBegin(o, in, out, fs);
+    const float inv = rsInv(o, in, out, mn, fs);
+    for (int k = 0; k < fs; k++)
+    {
+        RsTap t;
+        t.w = __fmul_rn(rsW(mn + k, o, in, out), inv);
+        t.i = rsMirror(mn + k, in);
+        tab[(size_t)k * out + o] = t;
+    }
+}
 // ---- no fp64 in these kernels (consumer GPUs run fp64 at a small fraction of fp32). Where
 // accuracy would call for double, fp32 keeps it by construction: tap centres are integer ratios (rsBegin / rsArg, nvUpTap), a
 // landing point is the pixel plus the floor and the exact fraction of its offset (land, nvAxis),
@@ -167,19 +191,18 @@ __global__ void k_packInDirect(const unsigned char* __restrict__ src, int cw, in
 // the live capture resize to the working size, horizontal pass: BGRA8 (cw x ch) -> planar (R, G, B) float (3, ch, w),
 // Lanczos with the placement above (it shrinks, or enlarges when the working size exceeds the capture)
 __global__ void k_resizeH(const unsigned char* __restrict__ src, int cw, int ch,
-                          float* __restrict__ tmp, int w)
+                          float* __restrict__ tmp, int w, const RsTap* __restrict__ tab)
 {
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int sy = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(cw, w);
     if (ox >= w || sy >= ch) return;
-    const int mn = rsBegin(ox, cw, w, fs);
-    const float inv = rsInv(ox, cw, w, mn, fs);
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = rsW(mn + k, ox, cw, w) * inv;
-        const int ix = rsMirror(mn + k, cw);
+        const RsTap t = tab[(size_t)k * w + ox];
+        const float wt = t.w;
+        const int ix = t.i;
         const unsigned char* p = src + ((size_t)sy * cw + ix) * 4;
         a0 += wt * p[0];
         a1 += wt * p[1];
@@ -195,7 +218,8 @@ __global__ void k_resizeH(const unsigned char* __restrict__ src, int cw, int ch,
 // vertical pass plus the replicate pad, writing straight into the (3, ph, pw) model half; Lanczos
 // rings slightly past [0, 1] at hard edges, so the model input is clamped back into range
 __global__ void k_resizeV(const float* __restrict__ tmp, int w, int ch,
-                          float* __restrict__ dst, int h, int ph, int pw, int planeStride)
+                          float* __restrict__ dst, int h, int ph, int pw, int planeStride,
+                          const RsTap* __restrict__ tab)
 {
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -203,14 +227,13 @@ __global__ void k_resizeV(const float* __restrict__ tmp, int w, int ch,
     if (ox >= pw || oy >= ph) return;
     const int tx = ox < w ? ox : w - 1;            // replicate pad in x
     const int ty = oy < h ? oy : h - 1;            // replicate pad in y
-    const int mn = rsBegin(ty, ch, h, fs);
-    const float inv = rsInv(ty, ch, h, mn, fs);
     const size_t plane = (size_t)ch * w;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = rsW(mn + k, ty, ch, h) * inv;
-        const int iy = rsMirror(mn + k, ch);
+        const RsTap t = tab[(size_t)k * h + ty];
+        const float wt = t.w;
+        const int iy = t.i;
         const size_t o = (size_t)iy * w + tx;
         a0 += wt * tmp[o];
         a1 += wt * tmp[plane + o];
@@ -284,21 +307,20 @@ __global__ void k_pqPlanar(const unsigned short* __restrict__ src, int cw, int c
 // the horizontal pass of an ALREADY planar float source (the HDR input path); the same taps as
 // k_resizeH, which reads BGRA8 instead.
 __global__ void k_resizeHf(const float* __restrict__ src, int cw, int ch,
-                           float* __restrict__ tmp, int w)
+                           float* __restrict__ tmp, int w, const RsTap* __restrict__ tab)
 {
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int sy = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(cw, w);
     if (ox >= w || sy >= ch) return;
-    const int mn = rsBegin(ox, cw, w, fs);
-    const float inv = rsInv(ox, cw, w, mn, fs);
     const size_t splane = (size_t)ch * cw;
     const size_t dplane = (size_t)ch * w;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = rsW(mn + k, ox, cw, w) * inv;
-        const int ix = rsMirror(mn + k, cw);
+        const RsTap t = tab[(size_t)k * w + ox];
+        const float wt = t.w;
+        const int ix = t.i;
         const size_t o = (size_t)sy * cw + ix;
         a0 += wt * src[o];
         a1 += wt * src[splane + o];
@@ -485,25 +507,24 @@ __global__ void k_padPlanar(const float* __restrict__ src, int ps, int rs, int w
 }
 
 // ---- every planar resize: the Lanczos pair --------------------------------------------------
-// The resize as a separable pair (the placement at the top of this block, each pixel's taps
-// computed per pixel): 2 kLzUp taps on an enlarging axis, 2 ceil(kLzDown in / out) on a shrinking
-// one, a pixel reading the sum of its two axes' taps.
+// The resize as a separable pair (the placement at the top of this block, each axis's taps read
+// from its k_rsTab table): 2 kLzUp taps on an enlarging axis, 2 ceil(kLzDown in / out) on a
+// shrinking one, a pixel reading the sum of its two axes' taps.
 
 // horizontal pass: the model pad cropped to (w, h) -> tmp (3, h, dw)
 __global__ void k_fitAaH(const void* __restrict__ src, int half, int planeStride, int rowStride,
-                         int w, int h, float* __restrict__ tmp, int dw)
+                         int w, int h, float* __restrict__ tmp, int dw, const RsTap* __restrict__ tab)
 {
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(w, dw);
     if (ox >= dw || y >= h) return;
-    const int mn = rsBegin(ox, w, dw, fs);
-    const float inv = rsInv(ox, w, dw, mn, fs);
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = rsW(mn + k, ox, w, dw) * inv;
-        const int ix = rsMirror(mn + k, w);
+        const RsTap t = tab[(size_t)k * dw + ox];
+        const float wt = t.w;
+        const int ix = t.i;
         const size_t o = (size_t)y * rowStride + ix;
         a0 += wt * ldS(src, half, o);
         a1 += wt * ldS(src, half, planeStride + o);
@@ -518,17 +539,17 @@ __global__ void k_fitAaH(const void* __restrict__ src, int half, int planeStride
 
 // the vertical taps of output row oy, column x, from a horizontal pass's tmp (3, h, dw): shared by
 // the vertical pass and the fused vertical pass + slot store, so both give the same values
-__device__ __forceinline__ void aaVSum(const float* __restrict__ tmp, int dw, int h, int dh, int x, int oy, float a[3])
+__device__ __forceinline__ void aaVSum(const float* __restrict__ tmp, int dw, int h, int dh, int x, int oy,
+                                       const RsTap* __restrict__ tab, float a[3])
 {
     const int fs = rsTaps(h, dh);
-    const int mn = rsBegin(oy, h, dh, fs);
-    const float inv = rsInv(oy, h, dh, mn, fs);
     const size_t splane = (size_t)h * dw;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = rsW(mn + k, oy, h, dh) * inv;
-        const int iy = rsMirror(mn + k, h);
+        const RsTap t = tab[(size_t)k * dh + oy];
+        const float wt = t.w;
+        const int iy = t.i;
         const size_t o = (size_t)iy * dw + x;
         a0 += wt * tmp[o];
         a1 += wt * tmp[splane + o];
@@ -541,13 +562,13 @@ __device__ __forceinline__ void aaVSum(const float* __restrict__ tmp, int dw, in
 
 // vertical pass: tmp (3, h, dw) -> the planar staging frame (3, dh, dw)
 __global__ void k_fitAaV(const float* __restrict__ tmp, int dw, int h,
-                         float* __restrict__ dst, int dh)
+                         float* __restrict__ dst, int dh, const RsTap* __restrict__ tab)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= dw || oy >= dh) return;
     float a[3];
-    aaVSum(tmp, dw, h, dh, x, oy, a);
+    aaVSum(tmp, dw, h, dh, x, oy, tab, a);
     const size_t plane = (size_t)dw * dh;
     const size_t o = (size_t)oy * dw + x;
     dst[o] = a[0];
@@ -559,13 +580,13 @@ __global__ void k_fitAaV(const float* __restrict__ tmp, int dw, int h,
 // -> k_packOut's BGRA8 store into the content rect of a pitched ring slot, the same bytes as the
 // vertical pass into the staging frame followed by the 1:1 store, without the staging round trip
 __global__ void k_packOutV(const float* __restrict__ tmp, int dw, int h, unsigned char* __restrict__ dst,
-                           int pitch, int x0, int y0, int dh)
+                           int pitch, int x0, int y0, int dh, const RsTap* __restrict__ tab)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= dw || oy >= dh) return;
     float c[3];
-    aaVSum(tmp, dw, h, dh, x, oy, c);
+    aaVSum(tmp, dw, h, dh, x, oy, tab, c);
     unsigned char* p = dst + (size_t)(y0 + oy) * pitch + (size_t)(x0 + x) * 4;
     for (int ci = 0; ci < 3; ci++)
     {
@@ -578,13 +599,13 @@ __global__ void k_packOutV(const float* __restrict__ tmp, int dw, int h, unsigne
 
 // the HDR twin: k_packOutHdr's R10G10B10A2 store
 __global__ void k_packOutHdrV(const float* __restrict__ tmp, int dw, int h, unsigned char* __restrict__ dst,
-                              int pitch, int x0, int y0, int dh)
+                              int pitch, int x0, int y0, int dh, const RsTap* __restrict__ tab)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= dw || oy >= dh) return;
     float c[3];
-    aaVSum(tmp, dw, h, dh, x, oy, c);
+    aaVSum(tmp, dw, h, dh, x, oy, tab, c);
     unsigned int q[3];
     for (int ci = 0; ci < 3; ci++)
     {
@@ -640,19 +661,18 @@ __global__ void k_f2h(const float* __restrict__ src, unsigned short* __restrict_
 // the fold, horizontal pass: the 4x output (fp16 or fp32 planar, clamped per tap)
 // -> tmp (3, h, dw); the taps are k_fitAaH's
 __global__ void k_restFoldH(const void* __restrict__ src, int half, int planeStride, int rowStride,
-                            int w, int h, float* __restrict__ tmp, int dw)
+                            int w, int h, float* __restrict__ tmp, int dw, const RsTap* __restrict__ tab)
 {
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(w, dw);
     if (ox >= dw || y >= h) return;
-    const int mn = rsBegin(ox, w, dw, fs);
-    const float inv = rsInv(ox, w, dw, mn, fs);
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = rsW(mn + k, ox, w, dw) * inv;
-        const int ix = rsMirror(mn + k, w);
+        const RsTap t = tab[(size_t)k * dw + ox];
+        const float wt = t.w;
+        const int ix = t.i;
         const size_t o = (size_t)y * rowStride + ix;
         a0 += wt * restTap(src, half, o);
         a1 += wt * restTap(src, half, planeStride + o);
@@ -667,20 +687,19 @@ __global__ void k_restFoldH(const void* __restrict__ src, int half, int planeStr
 
 // vertical pass with realesr.fit's final clamp: tmp (3, h, dw) -> the planar target (3, dh, dw)
 __global__ void k_restFoldV(const float* __restrict__ tmp, int dw, int h,
-                            float* __restrict__ dst, int dh)
+                            float* __restrict__ dst, int dh, const RsTap* __restrict__ tab)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(h, dh);
     if (x >= dw || oy >= dh) return;
-    const int mn = rsBegin(oy, h, dh, fs);
-    const float inv = rsInv(oy, h, dh, mn, fs);
     const size_t splane = (size_t)h * dw;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = rsW(mn + k, oy, h, dh) * inv;
-        const int iy = rsMirror(mn + k, h);
+        const RsTap t = tab[(size_t)k * dh + oy];
+        const float wt = t.w;
+        const int iy = t.i;
         const size_t o = (size_t)iy * dw + x;
         a0 += wt * tmp[o];
         a1 += wt * tmp[splane + o];
@@ -2895,10 +2914,18 @@ extern "C" __global__ void k_drbaDrmNorm(const long long* __restrict__ acc, cons
 // grid). The window's samples share one fractional offset, so their taps lie on a small integer grid: one warp a
 // pixel takes the grid's dot products once (float4 lanes over the 128 channels, kept in shared memory, one cell of
 // margin for rounding), then each sample combines its 4 corners with its own weights. Never builds the
-// [B, 128, HW, K] product the engine wrote. q [B, HW, 128] and f [B, H, W, 128] channels-last; 128 threads a block,
-// one warp a pixel.
-extern "C" __global__ void k_localCorr(const float* __restrict__ q, const float* __restrict__ f,
-                                       float* __restrict__ out, int B, int H, int W, int HW, int K)
+// [B, 128, HW, K] product the engine wrote. Reads A's one fp16 exit qf [2B, H, W, 128] channels-last as it is: rows
+// 0..B-1 = q (pixel p at y W + x), rows B..2B-1 = f; each lane widens its 4 channels exactly (one uint2 load), so the
+// sums are the fp32 ones; 128 threads a block, one warp a pixel.
+__device__ __forceinline__ float4 lcLoad4(const unsigned short* p)
+{
+    const uint2 u = *reinterpret_cast<const uint2*>(p);
+    return make_float4(h2f((unsigned short)(u.x & 0xffffu)), h2f((unsigned short)(u.x >> 16)),
+                       h2f((unsigned short)(u.y & 0xffffu)), h2f((unsigned short)(u.y >> 16)));
+}
+
+extern "C" __global__ void k_localCorr(const unsigned short* __restrict__ qf, float* __restrict__ out, int B, int H,
+                                       int W, int HW, int K)
 {
     __shared__ float dots[4][144];
     const int wib = threadIdx.x >> 5;
@@ -2906,8 +2933,8 @@ extern "C" __global__ void k_localCorr(const float* __restrict__ q, const float*
     const int lane = threadIdx.x & 31;
     if (warp >= B * HW) return;
     const int b = warp / HW, p = warp % HW;
-    const float4 qv = reinterpret_cast<const float4*>(q + ((size_t)b * HW + p) * 128)[lane];
-    const float* fb = f + (size_t)b * H * W * 128;
+    const float4 qv = lcLoad4(qf + ((size_t)b * HW + p) * 128 + lane * 4);
+    const unsigned short* fb = qf + (size_t)(B + b) * H * W * 128;
     int side = 1;
     while (side * side < K) side++;
     const int r = side / 2, px = p % W, py = p / W;
@@ -2933,7 +2960,7 @@ extern "C" __global__ void k_localCorr(const float* __restrict__ q, const float*
         float s = 0.f;
         if (xx >= 0 && xx < W && yy >= 0 && yy < H)
         {
-            const float4 v = reinterpret_cast<const float4*>(fb + ((size_t)yy * W + xx) * 128)[lane];
+            const float4 v = lcLoad4(fb + ((size_t)yy * W + xx) * 128 + lane * 4);
             s = qv.x * v.x + qv.y * v.y + qv.z * v.z + qv.w * v.w;
         }
         for (int o = 16; o; o >>= 1)
@@ -3229,6 +3256,18 @@ __global__ void k_fuTail(const unsigned short* __restrict__ pre, const unsigned 
 }
 
 )CUDASRC";
+
+// the kernel text's Lanczos radii (its #define lines, the one place they are set), for the tap tables' sizes
+static int lzDefine(const char* name)
+{
+    const char* p = strstr(kNativeKernels, name);
+    return p ? atoi(p + strlen(name)) : 0;
+}
+static const int kLzUp = lzDefine("#define kLzUp "), kLzDown = lzDefine("#define kLzDown ");
+static int lzTaps(long long in, long long out)
+{
+    return in > out ? 2 * (int)((kLzDown * in + out - 1) / out) : 2 * kLzUp;
+}
 
 // ---- dynamically resolved entry points ----------------------------------------------------
 // nvrtc ships no import library in the runtime wheel, so it is resolved by hand; cudart, the
@@ -3654,10 +3693,11 @@ static NativeTrtLogger g_nativeTrtLogger;
 // computes the matching and its propagation between `_m` and A (k_attn2) and gmflow's local correlation between A and B,
 // and hands `_m` and A each frame's backbone maps once
 constexpr int kGmN = 8;
-// A's outputs in this order (trt_runtime.gmflow_split's contract): q and f feed k_localCorr (which computes the window
-// positions itself), flow0 and feat go to B beside the correlation
-constexpr int kGmAn = 4;
-static const char* const kGmA[kGmAn] = {"q", "f", "flow0", "feat"};
+// A's outputs in this order (trt_runtime.gmflow_split + gmflow_exit_fp16's contract): qf (the transformer's fp16
+// stream as it is: q and feat = rows 0..1, f = rows 2..3) feeds k_localCorr (which computes the window positions
+// itself) and B, flow0 goes to B; B takes both beside the correlation
+constexpr int kGmAn = 2;
+static const char* const kGmA[kGmAn] = {"qf", "flow0"};
 
 struct NativeRife
 {
@@ -4045,6 +4085,13 @@ struct NativeRife
     uint8_t* dCap = nullptr;
     float* dTmp = nullptr; // the capture resize's horizontal pass, and nativeFitPlanar's (tmpN floats)
     size_t tmpN = 0;
+    // the Lanczos tap tables, one per resize axis in -> out (rsTabFor), freed by nativeFree
+    struct RsTab
+    {
+        int in, out;
+        void* d;
+    };
+    std::vector<RsTab> rsTabs;
     float* dCapF = nullptr;       // HDR + image scale under 1: planar PQ at capture resolution
     uint8_t* dThdrIn = nullptr;   // BGRA8 bridge input, pitch 4*cw
     uint32_t* dThdrOut = nullptr; // packed 10:10:10:2 bridge output, B in the low bits
@@ -4197,7 +4244,7 @@ struct NativeRife
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr,                        // FSR upscaling: VSR's BGRA8 <-> RGBA8
         fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,     // offline DLSS 4.5 frames
         fUnpackR10 = nullptr;
-    CUfunction fFitAaH = nullptr, fFitAaV = nullptr;                          // the separable fit
+    CUfunction fFitAaH = nullptr, fFitAaV = nullptr, fRsTab = nullptr;        // the separable fit, its tap tables
     CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                   // its vertical pass + the slot store
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr, // live Restore
         fRestToF = nullptr, fClamp01 = nullptr;
@@ -5055,7 +5102,7 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
               {"img0", {1, 3, gh, gw}},
               {"img1", {1, 3, gh, gw}},
               {"flow0", {2, 2, gh / 4, gw / 4}},
-              {"feat", {2, 128, gh / 4, gw / 4}}},
+              {"qf", {4, gh / 4, gw / 4, 128}}},
              2},
             {"gbone", "gmflow_backbone", "gmflow_backbone", 1, {{"img0", {1, 3, gh, gw}}}},
             {"gflowm",
@@ -6621,6 +6668,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fUnpackR10, "k_unpackR10"},
         {&nr.fFitAaH, "k_fitAaH"},
         {&nr.fFitAaV, "k_fitAaV"},
+        {&nr.fRsTab, "k_rsTab"},
         {&nr.fPackOutV, "k_packOutV"},
         {&nr.fPackOutHdrV, "k_packOutHdrV"},
         {&nr.fRestIn, "k_restIn"},
@@ -6688,6 +6736,26 @@ static bool nativeBindKernels(NativeRife& nr)
             return false;
         }
     return true;
+}
+
+// one resize axis's tap table (in -> out: lzTaps x out entries of 8 bytes), built by k_rsTab on the reader's stream at
+// its first use (so it is ready before that read) and kept for the session; nullptr = the allocation or the launch failed
+static const void* rsTabFor(NativeRife& nr, int in, int out, cudaStream_t st)
+{
+    for (const NativeRife::RsTab& e : nr.rsTabs)
+        if (e.in == in && e.out == out)
+            return e.d;
+    void* d = nullptr;
+    if (cudaMalloc(&d, (size_t)lzTaps(in, out) * out * 8) != cudaSuccess)
+        return nullptr;
+    void* a[] = {&in, &out, &d};
+    if (cuLaunchKernel(nr.fRsTab, (out + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+    {
+        cudaFree(d);
+        return nullptr;
+    }
+    nr.rsTabs.push_back({in, out, d});
+    return d;
 }
 
 static bool nativeBuildKernels(NativeRife& nr, const std::wstring& cacheDir)
@@ -9851,11 +9919,12 @@ static bool nativeWarmEngine(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfer
 }
 
 // gmflow split: the contract between A (slot 1), k_localCorr and B (slot 5), read off the engines. The kernel takes
-// q [2, HW, 128] and f [2, H, W, 128] (channels-last: 32 lanes of float4) on the quarter of the half frame, computes the
-// window of K = side x side samples (odd side, K <= 100: its shared grid holds 12 x 12 taps) itself and writes corr
-// [2, HW, K]; A hands out exactly the kGmA tensors and B takes corr, img0, img1 and the other A outputs at their exact
-// dims and dtype (an export from before the window moved to the host hands out more: refused). The backbone (slot 6)
-// makes one frame's map4 / map8 [1, C, H, W] and A takes both frames' as [2, C, H, W] in the same dtype.
+// qf [4, H, W, 128] fp16 (channels-last: 32 lanes of 4 halves; q = rows 0..1, f = rows 2..3) on the quarter of the
+// half frame, computes the window of K = side x side samples (odd side, K <= 100: its shared grid holds 12 x 12 taps)
+// itself and writes corr [2, HW, K]; A hands out exactly the kGmA tensors and B takes corr, img0, img1 and both A
+// outputs at their exact dims and dtype (an export from before the fp16 exit hands out q, f, flow0, feat: refused).
+// The backbone (slot 6) makes one frame's map4 / map8 [1, C, H, W] and A takes both frames' as [2, C, H, W] in the
+// same dtype.
 static bool nativeGmSplitCheck(NativeRife& nr)
 {
     nvinfer1::ICudaEngine* a = nr.engGm[1];
@@ -9872,8 +9941,8 @@ static bool nativeGmSplitCheck(NativeRife& nr)
                 return false;
         return true;
     };
-    if (a->getNbIOTensors() != 5 + kGmAn || b->getNbIOTensors() != 4 + kGmAn - 2)
-        return bad("gmflow_bidir_a / _b", "do not have the split's 9 / 6 tensors (an older export? re-export)");
+    if (a->getNbIOTensors() != 5 + kGmAn || b->getNbIOTensors() != 4 + kGmAn)
+        return bad("gmflow_bidir_a / _b", "do not have the split's 7 / 6 tensors (an older export? re-export)");
     nvinfer1::ICudaEngine* bb = nr.engGm[6];
     if (bb->getNbIOTensors() != 3)
         return bad("gmflow_backbone", "does not have its 3 tensors (img0 -> map4, map8)");
@@ -9891,18 +9960,17 @@ static bool nativeGmSplitCheck(NativeRife& nr)
     for (const char* nm : kGmA)
         if (a->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT)
             return bad(nm, "is not an output of gmflow_bidir_a");
-    for (const char* nm : {"q", "f"})
-        if (a->getTensorDataType(nm) != nvinfer1::DataType::kFLOAT)
-            return bad(nm, "is not fp32");
+    if (a->getTensorDataType("qf") != nvinfer1::DataType::kHALF)
+        return bad("qf", "is not fp16");
     if (b->getTensorIOMode("corr") != nvinfer1::TensorIOMode::kINPUT ||
         b->getTensorDataType("corr") != nvinfer1::DataType::kFLOAT)
         return bad("corr", "is not an fp32 input of gmflow_bidir_b");
-    const nvinfer1::Dims q = a->getTensorShape("q"), f = a->getTensorShape("f"), c = b->getTensorShape("corr");
+    const nvinfer1::Dims qf = a->getTensorShape("qf"), c = b->getTensorShape("corr");
     const int gh = nr.hh, gw = nr.hw;
-    if (f.nbDims != 4 || f.d[0] != 2 || f.d[1] != gh / 4 || f.d[2] != gw / 4 || f.d[3] != 128)
-        return bad("f", "is not [2, H, W, 128] on the quarter of gmflow's frame (the half)");
-    nr.gmH = (int)f.d[1];
-    nr.gmW = (int)f.d[2];
+    if (qf.nbDims != 4 || qf.d[0] != 4 || qf.d[1] != gh / 4 || qf.d[2] != gw / 4 || qf.d[3] != 128)
+        return bad("qf", "is not [4, H, W, 128] on the quarter of gmflow's frame (the half)");
+    nr.gmH = (int)qf.d[1];
+    nr.gmW = (int)qf.d[2];
     // `_m` (slot 7): A's four inputs -> mf / mq / mk, fp16 [2, N, 128] on the eighth grid (k_attn2 reads only fp16);
     // A takes the propagation's output as prop [2, N, 2], fp16 or fp32
     nvinfer1::ICudaEngine* m = nr.engGm[7];
@@ -9928,8 +9996,6 @@ static bool nativeGmSplitCheck(NativeRife& nr)
     nr.gmW8 = gw / 8;
     nr.gmPropHalf = pt == nvinfer1::DataType::kHALF;
     const int64_t hw = (int64_t)nr.gmH * nr.gmW;
-    if (q.nbDims != 3 || q.d[0] != 2 || q.d[1] != hw || q.d[2] != 128)
-        return bad("q", "is not [2, H * W, 128]");
     int side = 1;
     while (c.nbDims == 3 && side * side < c.d[2])
         side++;
@@ -9948,7 +10014,7 @@ static bool nativeGmSplitCheck(NativeRife& nr)
         }
         if (!strcmp(nm, "corr") || !strcmp(nm, "img0") || !strcmp(nm, "img1"))
             continue;
-        int k = 2;
+        int k = 0;
         while (k < kGmAn && strcmp(nm, kGmA[k]))
             k++;
         if (k == kGmAn)
@@ -10372,8 +10438,15 @@ static bool nativeFitPlanar(NativeRife& nr, const void* src, int half, int ps, i
         LOG("native: the resize pass buffer cannot hold %dx%d -> %dx%d\n", sw, sh, tw, th);
         return false;
     }
-    void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &nr.dTmp, &tw};
-    void* av[] = {&nr.dTmp, &tw, &sh, &dst, &th};
+    const void* tabH = rsTabFor(nr, sw, tw, st);
+    const void* tabV = rsTabFor(nr, sh, th, st);
+    if (!tabH || !tabV)
+    {
+        LOG("native: the resize tap tables for %dx%d -> %dx%d failed\n", sw, sh, tw, th);
+        return false;
+    }
+    void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &nr.dTmp, &tw, (void*)&tabH};
+    void* av[] = {&nr.dTmp, &tw, &sh, &dst, &th, (void*)&tabV};
     return cuLaunchKernel(nr.fFitAaH, (tw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah, nullptr) ==
                CUDA_SUCCESS &&
            cuLaunchKernel(nr.fFitAaV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av, nullptr) ==
@@ -10990,6 +11063,9 @@ static void nativeFree(NativeRife& nr)
     nr.dMFit = nr.dRestRem = nr.dRsView = nullptr;
     nr.dRsRange = nr.hRsRange = nullptr;
     nr.rsModeLogs = 0;
+    for (const NativeRife::RsTab& e : nr.rsTabs)
+        cudaFree(e.d);
+    nr.rsTabs.clear();
     for (void* p :
          {(void*)nr.dCap,       (void*)nr.dX,       (void*)nr.dXh,      (void*)nr.dF[0], (void*)nr.dF[1],
           (void*)nr.dEncHalf,   (void*)nr.dT,       (void*)nr.dMerged,  (void*)nr.dTmp,  (void*)nr.dCapF,
@@ -11042,8 +11118,6 @@ static void nativeFree(NativeRife& nr)
                     (void*)nr.dGmRange,
                     nr.dGmA[0],
                     nr.dGmA[1],
-                    nr.dGmA[2],
-                    nr.dGmA[3],
                     (void*)nr.dGmCorr,
                     nr.dGmM[0],
                     nr.dGmM[1],
@@ -11335,7 +11409,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         return false;
     }
     int nb = 2, hw4 = nr.gmH * nr.gmW;
-    void* ac[] = {(void*)&nr.dGmA[0], (void*)&nr.dGmA[1], (void*)&nr.dGmCorr, &nb, &nr.gmH, &nr.gmW, &hw4, &nr.gmK};
+    void* ac[] = {(void*)&nr.dGmA[0], (void*)&nr.dGmCorr, &nb, &nr.gmH, &nr.gmW, &hw4, &nr.gmK};
     if (cuLaunchKernel(nr.fLocalCorr, (unsigned)((2LL * hw4 * 32 + 127) / 128), 1, 1, 128, 1, 1, 0, (CUstream)st, ac,
                        nullptr) != CUDA_SUCCESS)
     {
@@ -11344,7 +11418,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     }
     ctx = nr.ctxGm[5];
     ctx->setTensorAddress("corr", nr.dGmCorr);
-    for (int i = 2; i < kGmAn; i++)
+    for (int i = 0; i < kGmAn; i++)
         ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
     ctx->setTensorAddress("img0", mv0);
     ctx->setTensorAddress("img1", mv1);
@@ -12062,14 +12136,21 @@ static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, fl
     int half = nr.restHalfOut ? 1 : 0, w4 = 4 * sw, h4 = 4 * sh, ps4 = w4 * h4;
     // realesr.fit: the Lanczos pair at every ratio (an exact copy at 4x itself), with `out.clamp(0,1)` folded into
     // the taps and the final clamp in the vertical pass
-    void* ah[] = {&nr.dRestOut, &half, &ps4, &w4, &w4, &h4, &nr.dRestTmp, &tw};
+    const void* tabH = rsTabFor(nr, w4, tw, st);
+    const void* tabV = rsTabFor(nr, h4, th, st);
+    if (!tabH || !tabV)
+    {
+        nr.die("restore fold tap tables failed");
+        return false;
+    }
+    void* ah[] = {&nr.dRestOut, &half, &ps4, &w4, &w4, &h4, &nr.dRestTmp, &tw, (void*)&tabH};
     if (cuLaunchKernel(nr.fRestFoldH, (tw + 15) / 16, (h4 + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah, nullptr) !=
         CUDA_SUCCESS)
     {
         nr.die("restFoldH launch failed");
         return false;
     }
-    void* av[] = {&nr.dRestTmp, &tw, &h4, &dst, &th};
+    void* av[] = {&nr.dRestTmp, &tw, &h4, &dst, &th, (void*)&tabV};
     if (cuLaunchKernel(nr.fRestFoldV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av, nullptr) !=
         CUDA_SUCCESS)
     {
@@ -13436,16 +13517,23 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (sdrPre)
         {
             // the SDR planes already exist at capture resolution, so resize them at every
-            // image scale; at 1.00 the triangle filter sits on identity positions (single
-            // tap, weight 1) and the pair is an exact copy plus the replicate pad.
-            void* a1[] = {&nr.dSrcG, &nr.cw, &nr.ch, &nr.dTmp, &nr.w};
+            // image scale; at 1.00 the Lanczos taps sit on identity positions (weight 1 on the
+            // pixel itself, 0 elsewhere) and the pair is an exact copy plus the replicate pad.
+            const void* tabH = rsTabFor(nr, nr.cw, nr.w, st);
+            const void* tabV = rsTabFor(nr, nr.ch, nr.h, st);
+            if (!tabH || !tabV)
+            {
+                nr.die("resize tap tables (RTX HDR) failed");
+                return false;
+            }
+            void* a1[] = {&nr.dSrcG, &nr.cw, &nr.ch, &nr.dTmp, &nr.w, (void*)&tabH};
             if (cuLaunchKernel(nr.fResizeHf, (nr.w + 15) / 16, (nr.ch + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a1,
                                nullptr) != CUDA_SUCCESS)
             {
                 nr.die("resizeHf (RTX HDR) launch failed");
                 return false;
             }
-            void* a2[] = {&nr.dTmp, &nr.w, &nr.ch, &dCur, &nr.h, &nr.ph, &nr.pw, (void*)&ps};
+            void* a2[] = {&nr.dTmp, &nr.w, &nr.ch, &dCur, &nr.h, &nr.ph, &nr.pw, (void*)&ps, (void*)&tabV};
             if (cuLaunchKernel(nr.fResizeV, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a2,
                                nullptr) != CUDA_SUCCESS)
             {
@@ -13497,14 +13585,21 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 if (view)
                     rsrc = nr.dRsView;
             }
-            void* a1[] = {(void*)&rsrc, &nr.cw, &nr.ch, &nr.dTmp, &nr.w};
+            const void* tabH = rsTabFor(nr, nr.cw, nr.w, st);
+            const void* tabV = rsTabFor(nr, nr.ch, nr.h, st);
+            if (!tabH || !tabV)
+            {
+                nr.die("resize tap tables failed");
+                return false;
+            }
+            void* a1[] = {(void*)&rsrc, &nr.cw, &nr.ch, &nr.dTmp, &nr.w, (void*)&tabH};
             if (cuLaunchKernel(nr.hdr ? nr.fResizeHf : nr.fResizeH, (nr.w + 15) / 16, (nr.ch + 15) / 16, 1, 16, 16, 1,
                                0, (CUstream)st, a1, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("resizeH launch failed");
                 return false;
             }
-            void* a2[] = {&nr.dTmp, &nr.w, &nr.ch, &dCur, &nr.h, &nr.ph, &nr.pw, (void*)&ps};
+            void* a2[] = {&nr.dTmp, &nr.w, &nr.ch, &dCur, &nr.h, &nr.ph, &nr.pw, (void*)&ps, (void*)&tabV};
             if (cuLaunchKernel(nr.fResizeV, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a2,
                                nullptr) != CUDA_SUCCESS)
             {
@@ -13770,14 +13865,21 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // vertical pass fused with the slot store
     auto fitPack = [&](const void* src, int ps, int rs, int sw, int sh, uint8_t* slot, const char* what,
                        int half = 0) -> bool {
-        void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &nr.dFitTmp, &nr.dw};
+        const void* tabH = rsTabFor(nr, sw, nr.dw, st);
+        const void* tabV = rsTabFor(nr, sh, nr.dh, st);
+        if (!tabH || !tabV)
+        {
+            nr.die(what);
+            return false;
+        }
+        void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &nr.dFitTmp, &nr.dw, (void*)&tabH};
         if (cuLaunchKernel(nr.fFitAaH, (nr.dw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah, nullptr) !=
             CUDA_SUCCESS)
         {
             nr.die(what);
             return false;
         }
-        void* av[] = {&nr.dFitTmp, &nr.dw, &sh, &slot, (void*)&pitchI, &nr.x0, &nr.y0, &nr.dh};
+        void* av[] = {&nr.dFitTmp, &nr.dw, &sh, &slot, (void*)&pitchI, &nr.x0, &nr.y0, &nr.dh, (void*)&tabV};
         if (cuLaunchKernel(nr.hdr ? nr.fPackOutHdrV : nr.fPackOutV, (nr.dw + 15) / 16, (nr.dh + 15) / 16, 1, 16, 16, 1,
                            0, (CUstream)st, av, nullptr) != CUDA_SUCCESS)
         {
@@ -13792,14 +13894,21 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                             int th, int half = 0) -> bool {
         if (aa)
         {
-            void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &tmp, &tw};
+            const void* tabH = rsTabFor(nr, sw, tw, st);
+            const void* tabV = rsTabFor(nr, sh, th, st);
+            if (!tabH || !tabV)
+            {
+                nr.die("fitAa tap tables failed");
+                return false;
+            }
+            void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &tmp, &tw, (void*)&tabH};
             if (cuLaunchKernel(nr.fFitAaH, (tw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah,
                                nullptr) != CUDA_SUCCESS)
             {
                 nr.die("fitAaH launch failed");
                 return false;
             }
-            void* av[] = {&tmp, &tw, &sh, &dst, &th};
+            void* av[] = {&tmp, &tw, &sh, &dst, &th, (void*)&tabV};
             if (cuLaunchKernel(nr.fFitAaV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av,
                                nullptr) != CUDA_SUCCESS)
             {

@@ -2133,6 +2133,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             char stc[32] = "";
             if (g_staticHold)
                 sprintf_s(stc, " static=%llu", (unsigned long long)g_staticHeld);
+            // the host's GPU time of its latest groups with tweens (the throttle's pre / tw, timed in every live
+            // session), APPENDED: a fixed-work A/B (--no-adapt, --no-gpu-fit) reads its same-work cost here
+            char gpu[64] = "";
+            if (srv.nr && srv.nr->gTweenUs.load())
+                sprintf_s(gpu, " gpu pre %.2fms tween %.2fms", srv.nr->gIntUs.load() / 1000.0,
+                          srv.nr->gTweenUs.load() / 1000.0);
             if (!rtssNamed && GetModuleHandleW(rtssModule))
             {
                 rtssNamed = true;
@@ -2143,9 +2149,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             }
             LOG("live: %.1f captured fps -> %.1f presented fps (ratio %.2f, target %.1f) "
                 "%s ~%.0fms%s present %.2fms (wait %.2f flip %.2f) drop %.1f "
-                "panel %.1fHz dwm %.1fHz disp %.1f/s bunch %.1f/s%s\n",
+                "panel %.1fHz dwm %.1fHz disp %.1f/s bunch %.1f/s%s%s\n",
                 capFps, outFps, ratio, tgt, host.useSL ? "handoff" : "latency", latAvg, slf, prTot, prWait, prFlip,
-                (cap.dropped - statDropBase) / secs, panelHz, dwmHz, dispFps, host.prBunch / secs, stc);
+                (cap.dropped - statDropBase) / secs, panelHz, dwmHz, dispFps, host.prBunch / secs, stc, gpu);
             return ratio;
         };
         // ================= CROSS-GROUP PRESENT QUEUE (every streaming server) =============
@@ -2426,11 +2432,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     LOG("stop requested, ending the session\n");
                     break;
                 }
+                // Whole screen: the captured monitor left the desktop (unplugged, the layout changed): exit 4, the app
+                // restarts the session on the monitor its target window sits on now
                 if (cap.closed || (!g_monitor && !IsWindow(target)))
                 {
-                    LOG(g_monitor ? "capture closed\n" : "target window closed\n");
-                    if (!g_monitor)
-                        rc2 = 7;
+                    LOG(g_monitor ? "capture closed (the display layout changed), restarting on the current monitor\n"
+                                  : "target window closed\n");
+                    rc2 = g_monitor ? 4 : 7;
                     break;
                 }
                 phEnd(phPump);
@@ -2958,12 +2966,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     break;
                 }
                 // monitor mode: the target window only seeded the monitor choice; its lifetime and
-                // focus are irrelevant (whole-screen smoothing keeps running until the hotkey / Stop)
+                // focus are irrelevant (whole-screen smoothing keeps running until the hotkey / Stop);
+                // the captured monitor leaving the desktop = exit 4, the app restarts on the current one
                 if (cap.closed || (!g_monitor && !IsWindow(target)))
                 {
-                    LOG(g_monitor ? "capture closed\n" : "target window closed\n");
-                    if (!g_monitor)
-                        rc2 = 7;
+                    LOG(g_monitor ? "capture closed (the display layout changed), restarting on the current monitor\n"
+                                  : "target window closed\n");
+                    rc2 = g_monitor ? 4 : 7;
                     break;
                 }
 
