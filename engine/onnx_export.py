@@ -3,16 +3,12 @@ engine at a new window size is a build from that file instead of a torch export.
 scripts/export-onnx.ts (npm setup and dist). While the export stamp (trt_lookup.export_stamp: the
 sources, the exporter packages, the weights) matches the one in weights_tags.txt, every file
 already present is skipped, so a rerun is cheap; a changed stamp removes the folder's graphs and
-exports every one again. Graphs: the RIFE IFNet (live `_bd8` and the
+exports every one again. Graphs: the RIFE IFNet (the
 unbatched class) and its encode, plain and as the flow-warp class at k 1 (Frame Blend), 2 and 4,
 DRBA's block0, Restore, and the GMFSS nets (gmflow_bidir as its backbone and two halves, trt_runtime.gmflow_split +
 gmflow_backbone_cut, the first half cut around its two N x N attentions by gmflow_matching_cut (`_m` before them, the
-host's k_attn2 between), and that half again with its quarter-scale transformer in 2 / 4 / 8 window groups,
-GMFLOW_CHUNKS, and in 8 with the shifted
-blocks' attention per mask region, GMFLOW_REGION_CHUNKS; every transformer attention with its projections folded,
-transformer.fold_projections). The host
-builds the offline fixed-batch RIFE
-classes (`_b{B}`) from `_bd8`. Then ship_tidy() and write_tags().
+host's k_attn2 between); one form for every size, transformer.py's export path, every transformer attention with its
+projections folded, transformer.fold_projections). Then ship_tidy() and write_tags().
 Usage: runtime python engine/onnx_export.py"""
 import os
 import sys
@@ -30,19 +26,6 @@ import trt_runtime as tr  # noqa: E402
 from rife_backend import RIFE  # noqa: E402
 
 PH, PW = 576, 960   # any /64 size inside the symbolic range works as the example
-GMFLOW_CHUNKS = (2, 4, 8)   # gmflow_bidir_a's window-group variants (the host's kGmFlowA)
-GMFLOW_REGION_CHUNKS = (8,)   # the same with transformer.EXPORT_REGION_ATTENTION, `_g<N>r` (the host's large-size pick)
-# the scales (attn_num_splits) each gmflow_bidir_a variant exports with transformer.EXPORT_TOKEN_OUTER, as the 160 W
-# A/Bs read them, outputs bit-identical: token-outer at the quarter scale x0.86 to x0.94 at every variant's size; at the
-# coarse scale (the `_m` graph) token-outer x0.80 / x0.97 / x0.99 on the 1 / 2 / 8r-group graphs, window order on the
-# 4-group graph (x0.97) and the 8-group one (x0.89 / x0.86 at Balanced / Quality)
-GMFLOW_TOKEN_OUTER = {"gmflow_bidir_a": (2, 8), "gmflow_bidir_a_g2": (2, 8), "gmflow_bidir_a_g4": (8,),
-                      "gmflow_bidir_a_g8": (8,), "gmflow_bidir_a_g8r": (2, 8)}
-# the token-outer scales that add the position encoding after the layout change (transformer.EXPORT_TOKEN_POSITION):
-# the entry kernel at Balanced's half 1.36 -> 0.72 ms (55 W map), outputs bit-identical; the whole graph's quarter
-# scale keeps it before the layout change (its engine's outputs moved, the 360p tweens 58.6 dB off byte identity)
-GMFLOW_TOKEN_POSITION = {"gmflow_bidir_a": (2,), "gmflow_bidir_a_g2": (2, 8), "gmflow_bidir_a_g4": (8,),
-                         "gmflow_bidir_a_g8": (8,), "gmflow_bidir_a_g8r": (2, 8)}
 # every token-outer scale keeps its stream in fp16 (transformer.EXPORT_FP16_STREAM): the 160 W A call x0.96 to x0.97
 # from Ultra to DLAA (each block's glue moves half the bytes), the GMFSS tweens' PSNR vs eager fp32 within -0.3 / +0.2
 # dB of the fp32 stream's, real frames identical
@@ -65,8 +48,7 @@ def main():
     done = []
 
     def ensure(eng, export_module, ins):
-        p = tr.ensure_onnx(eng.name, export_module, ins, eng.input_names, eng.output_names,
-                           eng.dyn_batch)
+        p = tr.ensure_onnx(eng.name, export_module, ins, eng.input_names, eng.output_names)
         if p is None:
             raise RuntimeError(f"{eng.name}: this graph does not qualify for a size-free export")
         done.append(os.path.basename(p))
@@ -76,12 +58,9 @@ def main():
     net, sl = rife.ifnet, list(rife.scale_list)
     with torch.inference_mode():
         f0, f1 = net.encode(a).float(), net.encode(b).float()
-    ts = torch.cat([x[:, :1] * 0 + t for t in (0.25, 0.5, 0.75)], 0)
-    e = tr.RifeIFNetBatchEngine(sl, rh, 8)
-    ensure(e, tr._RifeIFNetBatchExport(net, sl), (x, ts, f0, f1))
     e = tr.RifeEncodeEngine(rh)
     ensure(e, tr._RifeEncodeExport(net.encode), (a,))
-    # the unbatched class: the `.nofit` fallback and the offline single-tween calls
+    # the IFNet: one tween a call, live and offline
     e = tr.RifeIFNetEngine(sl, rh)
     ensure(e, tr._RifeIFNetExport(net, sl), (x, x[:, :1] * 0 + 0.5, f0, f1))
     e = tr.RifeBlock0Engine(float(sl[0]), rh)
@@ -121,53 +100,21 @@ def main():
         hk.remove()
     ensure(tr.FeatEngine(), gm.feat_ext, rec["feat_ext"][:1])
     # the host runs gmflow_bidir as its backbone (one frame a call) and two halves around its own local correlation,
-    # the first half itself as `_m` + the rest around its own global matching and propagation (k_attn2): the whole
-    # graph is exported only to be cut (ship_tidy then removes it), and parts already present skip all of it
+    # the first half itself as `_m` + the rest around its own global matching and propagation (k_attn2), one form at
+    # every size (`_g8r`: 8 window groups, the shifted blocks' attention per region, transformer.py's export path): the
+    # whole graph is exported once, only to be cut (ship_tidy then removes it), and parts already present skip all of it
     parts = [trt_lookup.onnx_path(k) for k in
-             ("gmflow_backbone", "gmflow_bidir_a_m", "gmflow_bidir_a", "gmflow_bidir_b")]
+             ("gmflow_backbone", "gmflow_bidir_a_g8r_m", "gmflow_bidir_a_g8r", "gmflow_bidir_b")]
     if not all(os.path.isfile(p) for p in parts):
-        gmt.EXPORT_TOKEN_OUTER = GMFLOW_TOKEN_OUTER.get("gmflow_bidir_a", ())
-        gmt.EXPORT_TOKEN_POSITION = GMFLOW_TOKEN_POSITION.get("gmflow_bidir_a", ())
         gmt.EXPORT_FP16_STREAM = GMFLOW_FP16_STREAM
         try:
             ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
         finally:
-            gmt.EXPORT_TOKEN_OUTER = ()
-            gmt.EXPORT_TOKEN_POSITION = ()
             gmt.EXPORT_FP16_STREAM = False
-        a_path, _ = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()))
+        a_path, _ = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()), a_key="gmflow_bidir_a_g8r")
         tr.gmflow_backbone_cut(a_path)
-        tr.gmflow_matching_cut(a_path, "gmflow_bidir_a")
+        tr.gmflow_matching_cut(a_path, "gmflow_bidir_a_g8r")
     done.extend(os.path.basename(p) for p in parts)
-    # gmflow_bidir_a again with its quarter-scale transformer in 2 / 4 / 8 window groups (transformer.py
-    # EXPORT_WINDOW_CHUNKS), and in 8 with the shifted blocks' attention per mask region (EXPORT_REGION_ATTENTION): the
-    # host picks one by the quarter-scale token count (lkGmFlowA); _b and the backbone are the same graphs at every
-    # count, and ship_tidy merges the variants' identical weights into one file
-    for k, regions in [(k, False) for k in GMFLOW_CHUNKS] + [(k, True) for k in GMFLOW_REGION_CHUNKS]:
-        key = f"gmflow_bidir_a_g{k}{'r' if regions else ''}"
-        p = trt_lookup.onnx_path(key)
-        if not os.path.isfile(p) or not os.path.isfile(trt_lookup.onnx_path(key + "_m")):
-            whole = trt_lookup.onnx_path(tr.BidirFlowEngine().name)
-            for f in (whole, whole + ".data"):
-                if os.path.isfile(f):
-                    os.remove(f)
-            gmt.EXPORT_WINDOW_CHUNKS = k
-            gmt.EXPORT_REGION_ATTENTION = regions
-            gmt.EXPORT_TOKEN_OUTER = GMFLOW_TOKEN_OUTER.get(key, ())
-            gmt.EXPORT_TOKEN_POSITION = GMFLOW_TOKEN_POSITION.get(key, ())
-            gmt.EXPORT_FP16_STREAM = GMFLOW_FP16_STREAM
-            try:
-                ensure(tr.BidirFlowEngine(), tr._BidirFlowExport(gm.flownet), rec["flownet"][:2])
-            finally:
-                gmt.EXPORT_WINDOW_CHUNKS = 1
-                gmt.EXPORT_REGION_ATTENTION = False
-                gmt.EXPORT_TOKEN_OUTER = ()
-                gmt.EXPORT_TOKEN_POSITION = ()
-                gmt.EXPORT_FP16_STREAM = False
-            a_path, = tr.gmflow_split(os.path.join(trt_lookup.ONNX_DIR, done.pop()), a_key=key, with_b=False)
-            tr.gmflow_backbone_cut(a_path, with_bone=False)
-            tr.gmflow_matching_cut(a_path, key)
-        done.extend((os.path.basename(p), os.path.basename(trt_lookup.onnx_path(key + "_m"))))
     ensure(tr.MetricEngine(), gm.metricnet, rec["metricnet"][:4])
     xi, tsv = rec["ifnet"][0], rec["ifnet"][1]
     ensure(tr.IFNetEngine(), tr._IFNetExport(gm.ifnet, [8, 4, 2, 1]),
@@ -211,8 +158,7 @@ def clear_graphs():
 
 def ship_tidy(done):
     """The shipped folder holds exactly these graphs, each weight blob once: (1) an
-    .onnx this export does not produce is removed with its .data (the python route's offline
-    `_b{B}` classes: the host builds those engines from `_bd8`); (2) external data files with the
+    .onnx this export does not produce is removed with its .data; (2) external data files with the
     same bytes are merged into one `weights_<md5 12>.data` and every graph's `location` points at
     it (the offsets stay valid: same bytes, same layout); the RIFE family carried one 23 MB blob
     twelve times. (3) a .data no kept graph references is removed. Idempotent: a merged folder has

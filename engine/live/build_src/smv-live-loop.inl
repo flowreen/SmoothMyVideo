@@ -1258,9 +1258,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const std::wstring script = engineScript(exeDir);
             // the native host is the only route for every server backend (a session it cannot
             // run ends on its reason line). Its DLL load and engine handoff overlap the
-            // source-rate measurement below (they depend on the capture size only). Auto's
-            // working size is fitted to the free video memory first, once: every lookup reads it
-            g_liveAutoFit = liveAutoFitMemory(capW, capH, g_serverBackend);
+            // source-rate measurement below (they depend on the capture size only)
             srv.beginNativeHandoff(script, g_serverBackend, capW, capH, cap.hTex, cap.hFence, &host);
             // SOURCE-RATE MEASUREMENT, before the server spawns. Two consumers:
             //  * fixed mode (--no-adapt with a --target and no --gen): seeds the whole
@@ -1573,14 +1571,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if (g_noGpuFit)
                 LOG("GPU fit off (--no-gpu-fit): the target holds, no video memory fit\n");
         }
-        // THE THROTTLE ("Fit to the GPU", one controller with Auto's GPU-time step): the grid marches on an EFFECTIVE
-        // target below the user's, computed from the host's own GPU time per group so every source frame is taken
-        // (xqThrottle); at its floor, the source's rate, the pairs carry their real frame alone, and only Auto's
-        // working-size step goes further.
-        int autoTicks = 0, autoSlow = 0, autoClean = 0; // Auto's GPU-time step, counted in stats ticks
-        double effTarget = adaptTarget;                 // throttled output target (<= adaptTarget)
-        uint64_t thrDropBase = 0;                       // cap.dropped at the window start
-        double thrCleanMs = 0;                          // drop-free time toward a budget step up
+        // THE THROTTLE ("Fit to the GPU"): the grid marches on an EFFECTIVE target below the user's, computed from the
+        // host's own GPU time per group so every source frame is taken (xqThrottle); at its floor, the source's rate,
+        // the pairs carry their real frame alone.
+        double effTarget = adaptTarget; // throttled output target (<= adaptTarget)
+        uint64_t thrDropBase = 0;       // cap.dropped at the window start
+        double thrCleanMs = 0;          // drop-free time toward a budget step up
         double thrLastLog = 0;
         double thrWinT0 = 0;     // control-window start (ms); 0 = not started
         double thrBudget = 0.95; // the share of the source's interval a group's GPU work may take
@@ -2065,7 +2061,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             {
                 for (int k = 1; k <= genFrames; k++)
                     fr[nfr++] = (float)k / (float)(genFrames + 1);
-                fr[nfr++] = 1.0f; // the real frame, bit-exact passthrough
+                fr[nfr++] = 1.0f; // the real frame
             }
             // each slot's place on the pacing clock: its fraction of the pair (on the adaptive route
             // exactly its grid point); a span the clock just snapped over falls back to the source's period
@@ -2322,7 +2318,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // source's interval for the next source frame to be taken, so the pair affords m = (budget - that work) /
             // one tween; the grid makes every presented frame a tween, so the target is m per source frame (capped by
             // the user's target and the ring's slots), and under one tween a pair it is the source's own rate: the
-            // real frames alone (thrFloor, read by sendPairStream and Auto's step). The drops keep the budget honest
+            // real frames alone (thrFloor, read by sendPairStream). The drops keep the budget honest
             // (other work on the GPU, a bridge's own context outside the timed stream): drops above kXqDropRate a
             // second, smoothed over ~2 s, take a tenth off it, 5 clean seconds give 2 points back. At the floor the
             // tween is re-timed by one window up after 4 s, doubling to 60 s while it keeps answering "the floor". A
@@ -2508,7 +2504,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         const double need = nowMs() - g.gridMs[idx] + kXqReadyMarginMs;
                         const double delayCap = 1.75 * (emaDt > 0 ? emaDt : g.spanMs);
                         const double decay = kXqDelayDecay * 1000.0 / (effTarget > 0 ? effTarget : 60.0);
-                        xqDelay = need > xqDelay ? (std::min)(need, delayCap) : (std::max)(need, xqDelay - decay);
+                        // the cap holds on the way down too: a delay raised while the source ran slow (a paused or
+                        // slowed player) would outlive the resume, keep ~200 ms of slots queued and the capture
+                        // gates shut
+                        xqDelay = (std::min)(delayCap, need > xqDelay ? need : (std::max)(need, xqDelay - decay));
                         due = g.gridMs[idx] + xqDelay;
                     }
                     XqSlot s{g.set, idx, g.nfr, g.seq, due, g.arrMs, g.sentTs, false};
@@ -2889,49 +2888,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                                 idleStepMs = 100.0;
                         }
                         fixWantPrev = want;
-                    }
-                    // Auto's working size against the GPU time, the throttle's next lever: at its floor (the real
-                    // frames alone; a fixed multiplier has no throttle) a captured frame's own work (its passes:
-                    // Restore, the resize, DLSS 5, Sharpen, RTX HDR, and the model's per-frame state and the store: the
-                    // host's tween-less group) that takes more than the throttle's budget of the time between
-                    // captured frames means no fps keeps the source's pace, a smaller working size does. Three ticks
-                    // in a row over it, with the mode below predicted at least a tenth faster (the part after
-                    // Restore / the resize scales with the working size's pixels), end the session with exit 8
-                    // naming that mode, and the app starts it again there (--auto-floor). Five minutes with the mode
-                    // above predicted under 60 % of the interval step back up, only from a floor this step set
-                    // (never below a memory fit). The first two ticks are the warm-up.
-                    if (g_dlssMode == 1 && !g_noGpuFit && srv.nr && emaDt > 0 && ++autoTicks > 2)
-                    {
-                        const double work = srv.nr->pfWorkUs.load() / 1000.0;
-                        const double all = (std::max)(srv.nr->pfAllUs.load(), srv.nr->gBaseUs.load()) / 1000.0;
-                        const bool atFloor = thrFloor || effTarget * emaDt <= 1050.0;
-                        int presW, presH, mode, mw, mh, nw = 0, nh = 0;
-                        liveWorkSize((int)capW, (int)capH, presW, presH, mode, mw, mh);
-                        auto predict = [&](int m) {
-                            liveWorkSizeFor(m, presW, presH, nw, nh);
-                            return all - work + work * ((double)nw * nh) / ((double)mw * mh);
-                        };
-                        const bool known = mode >= 2 && mode <= 6 && all > 0.0;
-                        autoSlow =
-                            known && atFloor && all > emaDt * thrBudget && mode < 6 && predict(mode + 1) < all * 0.9
-                                ? autoSlow + 1
-                                : 0;
-                        autoClean = known && !g_liveAutoFit && mode > (std::max)(2, liveAutoMode(presW, presH)) &&
-                                            predict(mode - 1) < emaDt * 0.6
-                                        ? autoClean + 1
-                                        : 0;
-                        const int next = autoSlow >= 3 ? mode + 1 : (autoClean >= 150 ? mode - 1 : 0);
-                        if (known && next >= 2 && next <= 6)
-                        {
-                            const double pred = predict(next);
-                            LOG("live: Auto next %ls: a captured frame's own passes take %.1f ms of the %.1f ms between "
-                                "captured frames at %ls (%dx%d), about %.1f ms at %ls (%dx%d); the session starts again "
-                                "there\n",
-                                kDlssModeName[next - 1], all, emaDt, kDlssModeName[mode - 1], mw, mh, pred,
-                                kDlssModeName[next - 1], nw, nh);
-                            rc2 = 8;
-                            break;
-                        }
                     }
                     lastStatTick = now;
                     statPresentBase = c;

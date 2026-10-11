@@ -1503,7 +1503,7 @@ function engineArgs(opts: RunOpts): string[] {
   // Video runtime is unavailable. AMD FSR 4 (bundled) takes the same resize when its box is ticked instead.
   if (opts.rtxvsr) args.push('--rtx-vsr');
   else if (opts.fsrup) args.push('--fsr-upscale');
-  // "Fit to the GPU" off: no video memory fit (the batch and Auto's working size stay as planned, slower when memory runs short)
+  // "Fit to the GPU" off: no video memory fit (the batch stays as planned, slower when memory runs short)
   if (opts.nogpufit) args.push('--no-gpu-fit');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
   // on, the RTX bridge does VSR then TrueHDR in one pass). The engine masters at a fixed 1000-nit

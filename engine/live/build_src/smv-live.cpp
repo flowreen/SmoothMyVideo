@@ -139,15 +139,11 @@ static double g_flowScale = 1.0; // --scale F: live, the working size as this sh
                                  // presented size (tests, the app's Custom)
 static int g_dlssMode = 0;       // --scale MODE: NVIDIA's DLSS mode instead, 1 + its index in
                                  // kDlssModeName (0 = none: g_flowScale)
-static int g_liveAutoFit = 0;    // live Auto: the mode the free video memory fits, picked once a session
-                                 // before anything loads (liveAutoFitMemory); 0 = Auto's own pick
-static int g_liveAutoFloor = 0;  // --auto-floor MODE: live Auto runs this mode or a smaller one (the app passes
-                                 // the mode an exit 8 named, the GPU-time step); 0 = none
-static const wchar_t* const kDlssModeName[6] = {L"auto", L"dlaa", L"quality", L"balanced", L"performance", L"ultra"};
+static const wchar_t* const kDlssModeName[5] = {L"dlaa", L"quality", L"balanced", L"performance", L"ultra"};
 // --scale's value: a DLSS mode name, or a share 0.01..1; false = neither
 static bool parseLiveScale(const wchar_t* v)
 {
-    for (int m = 0; m < 6; m++)
+    for (int m = 0; m < 5; m++)
         if (_wcsicmp(v, kDlssModeName[m]) == 0)
         {
             g_dlssMode = m + 1;
@@ -217,8 +213,9 @@ static int slotBudget(size_t slotBytes)
     return (int)n;
 }
 static bool g_noAdapt = false;     // --no-adapt: disable adaptive smoothness (benchmarks)
-static bool g_noGpuFit = false;    // --no-gpu-fit (the GUI's "Fit to the GPU" off): no video memory fit on either route
-                                   // (nativeVideoMemoryRoom), live holds its target (no throttle, no Auto step)
+static bool g_noGpuFit = false;    // --no-gpu-fit (the GUI's "Fit to the GPU" off): live holds its target (no throttle)
+                                   // and sizes its ring without the video memory fit (nativeVideoMemoryRoom); offline
+                                   // has no fit, the flag only logs
 static bool g_genExplicit = false; // --gen given on the CLI: never derive it from the target
 static int g_targetFps = 0;        // --target N: adaptive output target; 0 = the overlay
                                    // monitor's refresh rate
@@ -725,7 +722,7 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 // ---- offline render through this host --------------------------------------------------------
 // smv-live.exe --offline --w W --h H --multi N [--frames T] [--pixfmt rgb48le|rgb24]
 //               [--script s] [--pause-file P]
-//               [--ifnet E --encode E --jit J --ph N --pw N --batch B]
+//               [--ifnet E --encode E --jit J --ph N --pw N]
 //               [--nvof | --no-interp | --gmfss | --drba | --fruc | --fsrfg] [--cache DIR] (--no-interp = no model,
 //               --multi ignored)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
@@ -734,7 +731,7 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 //               [--dlssnr --nr-structure F --nr-tone F --nr-style N [--nr-delta PATH]] [--sharpen S] [--rtx-hdr ...]
 // Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
 // stdout in the same pixfmt (the encoder pipe). Real frames go out from the host buffer they came
-// in (bit exact); the N-1 tweens of every pair run pack-in, Head encode, batched IFNet, pack-out and
+// in (bit exact); the N-1 tweens of every pair run pack-in, Head encode, IFNet, pack-out and
 // a pinned download on the compute stream. stderr carries the log plus the PROGRESS k/total and
 // OUTFRAMES n lines src/render forwards to the GUI.
 static const uint64_t kProgressEvery = 10; // the offline host logs a PROGRESS line every 10 pairs
@@ -1319,7 +1316,7 @@ struct OfflineArgs
     bool fmt16 = true; // input pipe format (render.py's DEC_FMT)
     int out16 = -1;    // output pipe format, -1 = same as input
     std::wstring ifnetW, encodeW, jitW, pauseFile;
-    int phArg = 0, pwArg = 0, batchArg = 0;
+    int phArg = 0, pwArg = 0;
     bool resident = false;             // --resident: stay alive between renders (offlineResidentMain)
     std::wstring pipeName;             // --pipe NAME: the resident host's control pipe, \\.\pipe\NAME
     bool nvof = false;                 // --nvof: the NVIDIA Optical Flow model (no engines, no handoff)
@@ -1350,7 +1347,6 @@ struct OfflineArgs
     std::wstring nrDeltaW;          // --nr-delta PATH: DLSS 5's per-pixel change, float32 (the preview's mask)
     int srcHdr = 0;                 // --src-hdr pq|hlg: the source is HDR video (1 PQ, 2 HLG), 0 = SDR
     std::wstring thumbW, thumbOffW; // --thumb PATH / --thumb-off FILE: the GUI's progress thumbnail (OfflineIo)
-    std::wstring fitWork;           // --fit-work LIST: offline Auto's candidates, priced and answered (offlineFitWork)
 };
 
 // argv[first..] are the flags after --offline; 0 = parsed, else the exit code
@@ -1407,8 +1403,6 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.phArg = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--pw") == 0 && i + 1 < argc)
             oa.pwArg = _wtoi(argv[++i]);
-        else if (wcscmp(argv[i], L"--batch") == 0 && i + 1 < argc)
-            oa.batchArg = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--pause-file") == 0 && i + 1 < argc)
             oa.pauseFile = argv[++i];
         else if (wcscmp(argv[i], L"--resident") == 0)
@@ -1455,8 +1449,6 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.workW = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--work-h") == 0 && i + 1 < argc)
             oa.workH = _wtoi(argv[++i]);
-        else if (wcscmp(argv[i], L"--fit-work") == 0 && i + 1 < argc)
-            oa.fitWork = argv[++i];
         else if (wcscmp(argv[i], L"--no-gpu-fit") == 0)
             g_noGpuFit = true;
         else if (wcscmp(argv[i], L"--sharpen") == 0 && i + 1 < argc)
@@ -1551,100 +1543,12 @@ static bool offlineArgsValid(const OfflineArgs& oa)
 static int offlineResidentMain(const OfflineArgs& base);
 static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, bool namedPipes);
 
-// --fit-work WW:WH:DW:DH,...: offline Auto's working size by the free video memory, asked before the render plans its
-// decode (a working size below the source is folded into the decode). The candidates come in order, Auto's pick
-// first, each a working size and the decode it needs. The price per model, in MiB (the process's own memory over x2
-// renders at 854x480 and 1920x1080 with the working size at the decode, a quarter on top): RIFE and Frame Blend
-// nativeOfflineRifeMiB (the IFNet at the decode), DRBA 310 + 1034 a padded megapixel (1028 measured with the tween
-// stored in fp16, + 6 for its fp32 store), GMFSS 393 + 1623, Smooth Motion
-// 461 + 182, AMD FSR frame generation 259 + 368 and 18 + 163 a tree level beyond the first, NVIDIA Optical Flow 233 +
-// 179, no interpolation 225 + 41; the output's buffers beyond the working size, 25
-// a megapixel (1920x1080 and 3840x2160 outputs of a 960x540 render); the passes around the model
-// (nativeOfflineEffectsMiB). Prints `OFFLINE FIT i ROOM NEED0 NEEDi` in MiB: the first candidate that fits
-// nativeVideoMemoryRoom(), the last when none does, 0 without a room figure. No render and no CUDA.
-static int offlineFitWork(const OfflineArgs& oa)
-{
-    struct Cand
-    {
-        int ww, wh, dw, dh;
-    };
-    std::vector<Cand> cands;
-    for (const wchar_t* p = oa.fitWork.c_str(); p && *p;)
-    {
-        Cand k{};
-        if (swscanf_s(p, L"%d:%d:%d:%d", &k.ww, &k.wh, &k.dw, &k.dh) != 4 || k.ww < 16 || k.wh < 16 || k.dw < 16 ||
-            k.dh < 16)
-        {
-            LOG("offline: --fit-work takes WW:WH:DW:DH,... (each candidate's working size and decode)\n");
-            return 1;
-        }
-        cands.push_back(k);
-        p = wcschr(p, L',');
-        if (p)
-            ++p;
-    }
-    if (cands.empty())
-    {
-        LOG("offline: --fit-work names no candidate\n");
-        return 1;
-    }
-    const bool two = lkEnv("SMV_RIFE_TWO_DOMAIN") != "0";
-    auto needMiB = [&](const Cand& k) {
-        const double work = padMp64(k.ww, k.wh);
-        double model;
-        if (oa.gmfss)
-            model = 393.0 + 1623.0 * work;
-        else if (oa.fruc)
-            model = 461.0 + 182.0 * work;
-        else if (oa.fsrfg)
-        {
-            // one bridge instance a level of the pair's midpoint tree (nativeFrucDepth: x2 / x4 / x8 / x16 = 1 / 2 / 3
-            // / 4 levels, any other multiple and --fps 3); measured over x2 / x4 renders at 854x480 and 1708x960
-            const int m = oa.multi;
-            const int levels = oa.fpsRatio == 0.0 && m >= 2 && (m & (m - 1)) == 0
-                                   ? (m >= 16 ? 4 : (m >= 8 ? 3 : (m >= 4 ? 2 : 1)))
-                                   : 3;
-            model = 644.0 + 325.0 * work + (levels - 1) * (68.0 + 128.0 * work);
-        }
-        else if (oa.nvof)
-            model = 233.0 + 179.0 * work;
-        else if (oa.echo)
-            model = 225.0 + 41.0 * work;
-        else if (oa.drba)
-            model = 310.0 + 1034.0 * (std::max)(work, two ? padMp64(k.dw, k.dh) : work);
-        else
-            model = nativeOfflineRifeMiB(two ? k.dw : k.ww, two ? k.dh : k.wh, k.ww, k.wh);
-        const int ow = oa.outW ? oa.outW : k.ww, oh = oa.outH ? oa.outH : k.wh;
-        const double outMore = (std::max)(0.0, ((double)ow * oh - (double)k.ww * k.wh) / 1e6);
-        return 1.25 * (model + 25.0 * outMore) + nativeOfflineEffectsMiB(k.ww, k.wh, k.dw, k.dh);
-    };
-    g_vramNoCuda = true;
-    const uint64_t roomB = nativeVideoMemoryRoom();
-    const double room = roomB > 1 ? roomB / 1048576.0 : 0.0;
-    size_t pick = 0;
-    if (roomB)
-    {
-        pick = cands.size() - 1;
-        for (size_t i = 0; i < cands.size(); i++)
-            if (needMiB(cands[i]) <= room)
-            {
-                pick = i;
-                break;
-            }
-    }
-    printf("OFFLINE FIT %zu %.0f %.0f %.0f\n", pick, room, needMiB(cands[0]), needMiB(cands[pick]));
-    fflush(stdout);
-    return 0;
-}
-
 static int runOffline(int argc, wchar_t** argv)
 {
     OfflineArgs oa;
     const int prc = parseOfflineArgs(argc, argv, 2, oa);
     if (prc)
         return prc;
-    if (!oa.fitWork.empty())
-        return offlineFitWork(oa);
     if (oa.resident)
     {
         if (oa.pipeName.empty())
@@ -1697,7 +1601,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     // --fps mode: render_loops.fps_loop / drba_loop at render.py's ratio,
     // every output an interior slot of _pair_fracs, no real frame passes through; one tween
-    // per enqueue (python's per-tween inference), so the RIFE class is the unbatched x2
+    // per enqueue (python's per-tween inference)
     const bool fpsMode = oa.fpsRatio > 0.0;
     const double ratio = oa.fpsRatio;
     const int multi = oa.echo ? 1 : (fpsMode ? 2 : oa.multi);
@@ -1708,7 +1612,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     const std::wstring& encodeW = oa.encodeW;
     const std::wstring& jitW = oa.jitW;
     const std::wstring& pauseFile = oa.pauseFile;
-    const int phArg = oa.phArg, pwArg = oa.pwArg, batchArg = oa.batchArg;
+    const int phArg = oa.phArg, pwArg = oa.pwArg;
     g_offline = true;
     g_hdr = false;
     W = (uint32_t)w;
@@ -1743,7 +1647,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.ch = h;
         nr.dw = w;
         nr.dh = h;
-        nr.batchMax = 1;
     }
     else if (oa.fruc)
     {
@@ -1760,7 +1663,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.ch = h;
         nr.dw = w;
         nr.dh = h;
-        nr.batchMax = 1;
     }
     else if (oa.fsrfg)
     {
@@ -1778,7 +1680,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.ch = h;
         nr.dw = w;
         nr.dh = h;
-        nr.batchMax = 1;
     }
     else if (oa.dlssg)
     {
@@ -1793,7 +1694,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.ch = h;
         nr.dw = w;
         nr.dh = h;
-        nr.batchMax = 1;
     }
     else if (!oa.nvof && !oa.echo && ifnetW.empty())
     {
@@ -1803,8 +1703,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // SMV_RIFE_TWO_DOMAIN=0: the IFNet reads the pictures. DRBA: the unbatched IFNet (one tween per
         // enqueue, its own DRM timestep map) plus the block0 flow engine, at the same frame
         const bool two = lkEnv("SMV_RIFE_TWO_DOMAIN") != "0";
-        if (!lkOfflineRife(script, two ? srcW : w, two ? srcH : h, oa.drba ? 2 : multi, oe,
-                           nativeOfflineNeed(two ? srcW : w, two ? srcH : h, w, h, srcW, srcH), w, h))
+        if (!lkOfflineRife(script, two ? srcW : w, two ? srcH : h, oe))
             return 2;
         if (oa.drba)
         {
@@ -1835,7 +1734,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.ch = h;
         nr.dw = w;
         nr.dh = h;
-        nr.batchMax = oe.batch;
     }
     else if (oa.nvof || oa.echo)
     {
@@ -1850,7 +1748,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.ch = h;
         nr.dw = w;
         nr.dh = h;
-        nr.batchMax = 1;
     }
     else
     {
@@ -1865,7 +1762,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.ch = h;
         nr.dw = w;
         nr.dh = h;
-        nr.batchMax = batchArg < 1 ? 1 : batchArg;
         if (nr.ph < 16 || nr.pw < 16 || nr.encodePath.empty())
         {
             LOG("offline: --ifnet needs --encode, --ph and --pw\n");
@@ -1964,7 +1860,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     if (!nativeBuildKernels(nr, cacheDir))
         return 2;
     const size_t plane = (size_t)nr.ph * nr.pw;
-    const int batchMax = nr.batchMax < 1 ? 1 : nr.batchMax;
     const bool outIs16 = out16 < 0 ? fmt16 : (out16 == 1);
     const bool sameFmt = (outIs16 == fmt16);
     const size_t frameBytes = (size_t)srcW * srcH * (fmt16 ? 6 : 3);                       // input frame
@@ -1992,8 +1887,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
           (nr.mph ? !cm((void**)&nr.dM, 6 * mplane * sizeof(uint16_t), "motion frames")
                   : !cm((void**)&nr.dXh, 6 * plane * sizeof(uint16_t), "x fp16")))) ||
         !cm((void**)&dRaw[0], frameBytes, "raw0") || !cm((void**)&dRaw[1], frameBytes, "raw1") ||
-        !cm((void**)&dOutRaw, (size_t)(batchMax + 1) * frameBytesOut, "rawout") ||
-        !cm((void**)&nr.dStaticFlag, sizeof(int), "static flag"))
+        !cm((void**)&dOutRaw, 2 * frameBytesOut, "rawout") || !cm((void**)&nr.dStaticFlag, sizeof(int), "static flag"))
         return 2;
     if (cudaHostAlloc((void**)&nr.hStaticFlag, sizeof(int), cudaHostAllocDefault) != cudaSuccess)
     {
@@ -2050,6 +1944,15 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     if (nvPre && !cm((void**)&nr.dSrcPl, (size_t)3 * srcW * srcH * sizeof(float), "decoded source frame"))
         return 2;
+    // nativeFitPlanar's pass (3, source height, target width): an offline render only enlarges (srcW <= w <= outW,
+    // srcH <= h <= outH), so the working height x the output width holds every resize's (the pre-model one, the
+    // final one, the motion frame's, Restore's HDR reference)
+    if (srcW != outW || srcH != outH)
+    {
+        nr.tmpN = (size_t)3 * h * outW;
+        if (!cm((void**)&nr.dTmp, nr.tmpN * sizeof(float), "resize pass"))
+            return 2;
+    }
     if (g_dlssnr && (w < kNrMinWorkW || h < kNrMinWorkH))
     {
         LOG("[dlss5] unavailable, skipping: the frame %dx%d is below DLSS 5's minimum, %d px wide and %d high (a "
@@ -2191,7 +2094,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     io.frameBytes = frameBytes;
     io.frameBytesOut = frameBytesOut;
     io.nIn = 4;
-    io.nOut = (batchMax < 8 ? batchMax : 8) + 2;
+    io.nOut = 3;
     io.totalFrames = frames;
     io.multi = multi;
     io.frameUnits = oa.echo;
@@ -2294,9 +2197,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     if (g_noGpuFit)
         LOG("offline: GPU fit off (--no-gpu-fit): no video memory fit\n");
-    LOG("offline host ready:%dx%d %s in, %dx%d %s out, x%d, padded %dx%d, batch max %d, graph %s%s%s%s%s%s%s, %.2f s to ready\n",
-        w, h, fmt16 ? "rgb48le" : "rgb24", outW, outH, oa.outX2 ? "x2rgb10le" : (outIs16 ? "rgb48le" : "rgb24"), multi,
-        nr.pw, nr.ph, batchMax, g_offlineGraph ? "on" : "off",
+    LOG("offline host ready:%dx%d %s in, %dx%d %s out, x%d, padded %dx%d, graph %s%s%s%s%s%s%s, %.2f s to ready\n", w,
+        h, fmt16 ? "rgb48le" : "rgb24", outW, outH, oa.outX2 ? "x2rgb10le" : (outIs16 ? "rgb48le" : "rgb24"), multi,
+        nr.pw, nr.ph, g_offlineGraph ? "on" : "off",
         nr.nvof ? ", model nvof"
                 : (nr.noEngine ? ", engine=none (effects only)"
                                : (nr.gmfss ? ", model gmfss"
@@ -2365,7 +2268,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     // processing per pair side, python's held_out per window). At EOF the last pair's f >= 0.5
     // is plain pair RIFE (python's tail window), then the closing slot repeats the last output
     // multi times; a lone frame goes out once.
-    uint8_t* const dHeldOut = dOutRaw + (size_t)batchMax * frameBytesOut;
+    uint8_t* const dHeldOut = dOutRaw + frameBytesOut;
     const uint8_t* drLastOut = nullptr;
     bool drLastStatic = false;
     auto drSend = [&](const uint8_t* dO, bool repeat) -> bool {
@@ -2902,7 +2805,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     // each real frame once. That output still sits in the real-frame slot,
                     // unless a resume dropped that real frame: python's out_cur is None then
                     // and its to_bytes runs the chain on the frame once, here
-                    uint8_t* dO = dOutRaw + (size_t)batchMax * frameBytesOut;
+                    uint8_t* dO = dOutRaw + frameBytesOut;
                     srcOut = dO;
                     if (!realOutFresh)
                     {
@@ -2920,7 +2823,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 else if (passes)
                 {
                     // with passes the held slot is the real frame through the chain, as python
-                    uint8_t* dO = dOutRaw + (size_t)batchMax * frameBytesOut;
+                    uint8_t* dO = dOutRaw + frameBytesOut;
                     if (!nativeOfflineEmit(nr, dCur, ps, rs, dO, outIs16))
                     {
                         io.setFail("passes (held) failed");
@@ -2931,7 +2834,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 }
                 else if (!sameFmt)
                 {
-                    uint8_t* dO = dOutRaw + (size_t)batchMax * frameBytesOut;
+                    uint8_t* dO = dOutRaw + frameBytesOut;
                     int n = (int)((size_t)w * h * 3);
                     void* a[] = {&dR, &n, &dO};
                     if (cuLaunchKernel(nr.fExpand8to16, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a,
@@ -3065,31 +2968,23 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         else if (havePrev)
         {
-            // the N-1 interior tweens at k/N, in chunks of at most batchMax through the batched
-            // engine; --fps: the pair's slots one per enqueue, and a slot at t <= 0 is the left
-            // frame itself with no engine call (RIFE's t <= 0 rule)
-            const int bm = fpsMode ? 1 : batchMax;
-            for (int base = 0; base < nT && !failed; base += bm)
+            // the N-1 interior tweens at k/N, one IFNet call each; --fps: the pair's slots, and a slot at t <= 0
+            // is the left frame itself with no engine call (RIFE's t <= 0 rule)
+            for (int k = 0; k < nT && !failed; k++)
             {
-                const int len = (nT - base) < bm ? (nT - base) : bm;
-                const bool left = fpsMode && fr[base] <= 0.0;
-                for (int j = 0; j < len && !left; j++)
+                const bool left = fpsMode && fr[k] <= 0.0;
+                if (!left)
                 {
-                    const float t = fpsMode ? (float)fr[base + j] : (float)(base + j + 1) / (float)multi;
-                    if (!nativeFillT(nr, (size_t)j, t, mplane, st))
+                    const float t = fpsMode ? (float)fr[k] : (float)(k + 1) / (float)multi;
+                    if (!nativeFillT(nr, 0, t, mplane, st))
                     {
                         io.setFail("timestep fill failed");
                         failed = true;
                         break;
                     }
-                }
-                if (failed)
-                    break;
-                if (!left)
-                {
                     const int modelH = nr.mph ? nr.mph : nr.ph, modelW = nr.mph ? nr.mpw : nr.pw;
                     nvinfer1::Dims4 dx{1, 6, modelH, modelW};
-                    nvinfer1::Dims4 dtst{len, 1, modelH, modelW};
+                    nvinfer1::Dims4 dtst{1, 1, modelH, modelW};
                     nvinfer1::Dims4 df{1, 16, modelH, modelW};
                     if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dtst) ||
                         !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
@@ -3115,68 +3010,65 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     // the tweens: RIFE's last step on the pictures (RIFE's two domains: dX at the working
                     // size, whatever the passes before made of them), else on the frames the IFNet read
                     const bool picHalf = !nr.mph && nr.xHalf;
-                    if (!nativeRifeBlend(nr, picHalf ? (const void*)nr.dXh : (const void*)nr.dX, (int)picHalf, len, st))
+                    if (!nativeRifeBlend(nr, picHalf ? (const void*)nr.dXh : (const void*)nr.dX, (int)picHalf, 1, st))
                     {
                         io.setFail("rifeBlend launch failed");
                         failed = true;
                         break;
                     }
                 }
-                for (int j = 0; j < len && !failed; j++)
+                // resume: a banked slot of the first pair is not emitted (its call still ran, so the kept
+                // slots are the uninterrupted render's own bytes)
+                if (dropOne())
+                    continue;
+                int o = -1;
                 {
-                    // resume: a banked slot of the first pair is not emitted (the batch still
-                    // ran whole, so the kept slots are the uninterrupted render's own bytes)
-                    if (dropOne())
-                        continue;
-                    int o = -1;
+                    std::unique_lock<std::mutex> lk(io.m);
+                    io.cv.wait(lk, [&] { return !io.outFree.empty() || io.fail; });
+                    if (io.fail)
                     {
-                        std::unique_lock<std::mutex> lk(io.m);
-                        io.cv.wait(lk, [&] { return !io.outFree.empty() || io.fail; });
-                        if (io.fail)
-                        {
-                            failed = true;
-                            break;
-                        }
-                        o = io.outFree.front();
-                        io.outFree.pop_front();
-                    }
-                    const void* src = left ? (const void*)nr.dX : mergedAt(nr, j, plane);
-                    int srcHalf = left ? 0 : (int)nr.outHalf;
-                    uint8_t* dO = dOutRaw + (size_t)j * frameBytesOut;
-                    if (passes)
-                    {
-                        if (!nativeOfflineEmit(nr, src, ps, rs, dO, outIs16, srcHalf))
-                        {
-                            io.setFail("passes failed");
-                            failed = true;
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        void* a[] = {(void*)&src, &srcHalf, (void*)&ps, (void*)&rs, &w, &h, &dO};
-                        if (cuLaunchKernel(outIs16 ? nr.fPackOutRaw16 : nr.fPackOutRaw8, (w + 15) / 16, (h + 15) / 16,
-                                           1, 16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
-                        {
-                            io.setFail("packOutRaw launch failed");
-                            failed = true;
-                            break;
-                        }
-                    }
-                    if (cudaMemcpyAsync(io.hOut[o], dO, frameBytesOut, cudaMemcpyDeviceToHost, st) != cudaSuccess)
-                    {
-                        io.setFail("D2H copy failed");
                         failed = true;
                         break;
                     }
-                    cudaEventRecord(io.outEv[o], st);
-                    {
-                        std::lock_guard<std::mutex> lk(io.m);
-                        io.items.push_back({1, o});
-                    }
-                    io.cv.notify_all();
-                    drLastOut = dO; // --fps: the closing slot repeats the last output
+                    o = io.outFree.front();
+                    io.outFree.pop_front();
                 }
+                const void* src = left ? (const void*)nr.dX : mergedAt(nr, 0, plane);
+                int srcHalf = left ? 0 : (int)nr.outHalf;
+                uint8_t* dO = dOutRaw;
+                if (passes)
+                {
+                    if (!nativeOfflineEmit(nr, src, ps, rs, dO, outIs16, srcHalf))
+                    {
+                        io.setFail("passes failed");
+                        failed = true;
+                        break;
+                    }
+                }
+                else
+                {
+                    void* a[] = {(void*)&src, &srcHalf, (void*)&ps, (void*)&rs, &w, &h, &dO};
+                    if (cuLaunchKernel(outIs16 ? nr.fPackOutRaw16 : nr.fPackOutRaw8, (w + 15) / 16, (h + 15) / 16, 1,
+                                       16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+                    {
+                        io.setFail("packOutRaw launch failed");
+                        failed = true;
+                        break;
+                    }
+                }
+                if (cudaMemcpyAsync(io.hOut[o], dO, frameBytesOut, cudaMemcpyDeviceToHost, st) != cudaSuccess)
+                {
+                    io.setFail("D2H copy failed");
+                    failed = true;
+                    break;
+                }
+                cudaEventRecord(io.outEv[o], st);
+                {
+                    std::lock_guard<std::mutex> lk(io.m);
+                    io.items.push_back({1, o});
+                }
+                io.cv.notify_all();
+                drLastOut = dO; // --fps: the closing slot repeats the last output
             }
             pairs++;
         }
@@ -3231,7 +3123,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 o = io.outFree.front();
                 io.outFree.pop_front();
             }
-            uint8_t* dO = dOutRaw + (size_t)batchMax * frameBytesOut;
+            uint8_t* dO = dOutRaw + frameBytesOut;
             if (passes)
             {
                 // the real frame through the pass chain (python's to_bytes on every frame)
@@ -3568,8 +3460,6 @@ static void resetSessionGlobals()
     g_script.clear();
     g_flowScale = 1.0;
     g_dlssMode = 0;
-    g_liveAutoFit = 0;
-    g_liveAutoFloor = 0;
     g_noHud = g_noHudLat = false;
     g_noFillMouse = false;
     g_sharpen = 0.0;
@@ -3713,19 +3603,7 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
         {
             if (!parseLiveScale(argv[++i]))
             {
-                LOG("--scale must be 0.01..1.0 or a DLSS mode (auto, dlaa, quality, balanced, performance, ultra)\n");
-                return 1;
-            }
-        }
-        else if (wcscmp(argv[i], L"--auto-floor") == 0 && i + 1 < argc)
-        {
-            ++i;
-            for (int m = 2; m <= 6; m++)
-                if (_wcsicmp(argv[i], kDlssModeName[m - 1]) == 0)
-                    g_liveAutoFloor = m;
-            if (!g_liveAutoFloor)
-            {
-                LOG("--auto-floor must be a DLSS mode (dlaa, quality, balanced, performance, ultra)\n");
+                LOG("--scale must be 0.01..1.0 or a DLSS mode (dlaa, quality, balanced, performance, ultra)\n");
                 return 1;
             }
         }
@@ -3748,7 +3626,7 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
     // DLSS-G with any effect (Sharpen, Restore, DLSS 5, RTX HDR, Fill, Upscale to, a DLSS mode below DLAA): the echo
     // route runs that chain once per captured frame and DLSS-G generates from its frames. RTX VSR alone has no resize
     // to work on, so it does not count.
-    const bool belowDlaa = g_dlssMode == 1 || g_dlssMode > 2 || (g_dlssMode == 0 && g_flowScale < 1.0);
+    const bool belowDlaa = g_dlssMode > 1 || (g_dlssMode == 0 && g_flowScale < 1.0);
     if (g_backend == BK_DLSSG &&
         (g_sharpen > 0 || g_restore || g_dlssnr || g_rtxHdr || g_fill || g_upscaleH > 0 || belowDlaa))
     {
@@ -3906,14 +3784,13 @@ static int residentMain(LiveArgs first)
         g_resizeReq.store(false);
         g_sessionClean = false;
         const int rc = runLiveArgs(la);
-        // exit 7 = the captured window closed, a clean end like a stop; exit 8 = Auto's GPU-time step (the app
-        // starts the session again at the mode it names, like a resize's exit 4). Exit 5 (hotkey pressed inside
+        // exit 7 = the captured window closed, a clean end like a stop. Exit 5 (hotkey pressed inside
         // the app itself) and an exit 7 before the teardown (the window was gone at the start) never
         // started anything, stay for them too. What the host holds: the engines (g_res), or an engine
         // build a session left running in the background.
         const bool held = g_res.rt || nativeBuildPending();
-        const bool stay = (g_sessionClean && (rc == 0 || rc == 4 || rc == 7 || rc == 8) && held && !g_nrAttempted &&
-                           !g_rtxUsed && g_backend != BK_DLSSG && !g_fgOver) ||
+        const bool stay = (g_sessionClean && (rc == 0 || rc == 4 || rc == 7) && held && !g_nrAttempted && !g_rtxUsed &&
+                           g_backend != BK_DLSSG && !g_fgOver) ||
                           ((rc == 5 || (rc == 7 && !g_sessionClean)) && held);
         if (!stay)
         {

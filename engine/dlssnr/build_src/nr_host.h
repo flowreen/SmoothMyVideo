@@ -50,16 +50,9 @@ struct Settings
 
 const int kMaxPasses = 10;
 
-// What a chain needs beyond the creation of its passes, in MiB: the caller's handoff and motion
-// buffers and the first frames' one-time share (kAfterBase + kAfterMp a megapixel), and each pass's
-// working memory (kFrameMp a megapixel). Measured on nvngx_dlssnr 310.8 at 854x480, 1920x1080 and
-// 3840x2160 with 1 and 4 passes (123 / 253 / 745 and 7 / 34 / 128 MiB), a quarter on top.
-const double kAfterBase = 128.0, kAfterMp = 96.0, kFrameMp = 20.0;
-
-// What each pass takes at its creation, in MiB: kPassBase + kPassMp a megapixel (186 / 360 / 496 / 933
-// MiB at 854x480 / 1920x1080 / 2560x1440 / 3840x2160 on nvngx_dlssnr 310.8). A caller that sizes its
-// own memory before the chain exists prices the chain with these and the shares above.
-const double kPassBase = 147.0, kPassMp = 95.0;
+// Each pass's working memory in a running chain, in MiB a megapixel. Measured on nvngx_dlssnr 310.8 at 854x480,
+// 1920x1080 and 3840x2160 with 1 and 4 passes (7 / 34 / 128 MiB a pass), a quarter on top.
+const double kFrameMp = 20.0;
 
 class Host
 {

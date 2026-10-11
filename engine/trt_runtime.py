@@ -4,10 +4,9 @@ tool, run by engine/onnx_export.py; never shipped).
 
 Each graph is exported under autocast(fp16) via the dynamo exporter (mixed fp16/fp32 matching the
 app's precision) with H and W symbolic, once for every size; the host builds one engine per
-resolution from that file (H and W pinned, only the live RIFE timestep batch axis dynamic). The
-engine classes below carry only what the export needs from each graph: the engine base name, the
-input / output names and the dynamic batch range. The engines are built and run by the native
-host (smv-live.exe); nothing here builds or runs them.
+resolution from that file (every axis pinned). The engine classes below carry only what the export
+needs from each graph: the engine base name and the input / output names. The engines are built
+and run by the native host (smv-live.exe); nothing here builds or runs them.
 """
 import io
 import logging
@@ -1046,22 +1045,171 @@ def _fusion_fp16_inputs(onnx_path, name):
     onnx.checker.check_model(onnx_path)
 
 
-# the host's names for what crosses the gmflow split, in its order (smv-live kGmA after q, f, coords)
-_GMFLOW_CROSS = ("win", "valid", "flow0", "feat", "flow1")
+def _fusion_tail_cut(onnx_path, name):
+    """GMFSS fusionnet: the graph ends before its pixel shuffle. Its tail is conv2d_39 (64 -> 256 at
+    the half) -> DepthToSpace(2, CRD) -> conv_last (64 -> 3, 3x3, pad 1, at the full size) -> out;
+    `out` becomes conv2d_39's output (the pre-shuffle tensor at the half, fp16) and conv_last's own
+    fp16 weight and bias leave as the outputs `w_last` / `b_last` (Identity on the initializers),
+    so the host's k_fuTail does the shuffle + conv_last with the exact weights the graph carried.
+    The engine drops its full-size 64-channel tensor (its context at the 1080p half 876 -> 697 MiB;
+    the host keeps the pre-shuffle tensor in its splat accumulator) and the frame comes out of an
+    fp32 sum instead of the engine's fp16 store: closer to an fp32 run of the model (PSNR vs eager
+    fp32 49.67 -> 49.72 dB at 1080p, 49.22 -> 49.26 at 480p). Refuses any other tail."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    if name != "fusionnet":
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    init = {i.name: i for i in g.graph.initializer}
+    prod = {o: nd for nd in g.graph.node for o in nd.output}
+    users = {}
+    for nd in g.graph.node:
+        for x in nd.input:
+            users.setdefault(x, []).append(nd)
+    outs = [o.name for o in g.graph.output]
+    if outs != ["out"]:
+        raise RuntimeError(f"{name}: expected the one output `out`, found {outs}")
+    att = lambda nd: {a.name: helper.get_attribute_value(a) for a in nd.attribute}  # noqa: E731
+    last = prod.get("out")
+    if (last is None or last.op_type != "Conv" or len(last.input) != 3 or last.input[1] not in init
+            or last.input[2] not in init or list(init[last.input[1]].dims) != [3, 64, 3, 3]
+            or list(init[last.input[2]].dims) != [3]):
+        raise RuntimeError(f"{name}: `out` is not a 64 -> 3 conv with initializer weight and bias")
+    a = att(last)
+    if (list(a.get("kernel_shape", [])) != [3, 3] or list(a.get("pads", [])) != [1, 1, 1, 1]
+            or list(a.get("strides", [1, 1])) != [1, 1] or list(a.get("dilations", [1, 1])) != [1, 1]
+            or a.get("group", 1) != 1):
+        raise RuntimeError(f"{name}: conv_last is not 3x3 / pad 1 / stride 1 ({a})")
+    d2s = prod.get(last.input[0])
+    if d2s is None or d2s.op_type != "DepthToSpace" or att(d2s).get("blocksize") != 2 or att(d2s).get("mode") != b"CRD":
+        raise RuntimeError(f"{name}: conv_last does not read a DepthToSpace(2, CRD)")
+    up = prod.get(d2s.input[0])
+    if up is None or up.op_type != "Conv":
+        raise RuntimeError(f"{name}: the pixel shuffle does not read a conv")
+    if len(users.get(d2s.output[0], [])) != 1 or len(users.get(up.output[0], [])) != 1:
+        raise RuntimeError(f"{name}: the shuffle's or its conv's output has other readers")
+    if any(len(users.get(x, [])) != 1 for x in last.input[1:]):
+        raise RuntimeError(f"{name}: another node reads conv_last's weight or bias")
+    for t in (init[last.input[1]], init[last.input[2]]):
+        if t.data_type != TensorProto.FLOAT16:
+            raise RuntimeError(f"{name}: conv_last's {t.name} is not fp16")
+    b_in = [i for i in g.graph.input if i.name == "b"]
+    if len(b_in) != 1 or len(b_in[0].type.tensor_type.shape.dim) != 4:
+        raise RuntimeError(f"{name}: no 4-D input `b` to take the half's dims from")
+    hdim = b_in[0].type.tensor_type.shape.dim
+    pre = up.output[0]
+    keep = [nd for nd in g.graph.node if nd is not last and nd is not d2s]
+    for nd in keep:
+        nd.output[:] = ["out" if o == pre else o for o in nd.output]
+    keep.append(helper.make_node("Identity", [last.input[1]], ["w_last"], name="node_w_last"))
+    keep.append(helper.make_node("Identity", [last.input[2]], ["b_last"], name="node_b_last"))
+    del g.graph.node[:]
+    g.graph.node.extend(keep)
+    o = helper.make_tensor_value_info("out", TensorProto.FLOAT16, [1, 256, None, None])
+    for k in (2, 3):
+        o.type.tensor_type.shape.dim[k].CopyFrom(hdim[k])
+    del g.graph.output[:]
+    g.graph.output.extend([o, helper.make_tensor_value_info("w_last", TensorProto.FLOAT16, [3, 64, 3, 3]),
+                           helper.make_tensor_value_info("b_last", TensorProto.FLOAT16, [3])])
+    keep_vi = [v for v in g.graph.value_info if v.name not in (pre, d2s.output[0], "out")]
+    del g.graph.value_info[:]
+    g.graph.value_info.extend(keep_vi)
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
 
 
-def gmflow_split(full_path, a_key="gmflow_bidir_a", with_b=True):
+def _fusion_prelu_fanout(onnx_path, name):
+    """GMFSS fusionnet: a LeakyRelu whose input x has other readers too (the residual add, often a
+    second LeakyRelu with another slope) runs as its own elementwise kernel, since TensorRT-RTX fuses
+    an activation into its producer only when it is that output's one reader. With a scalar slope a
+    in (0, 1], x = min(y, y / a) for y = LeakyRelu(x), so per such x the first LeakyRelu stays its
+    only reader and every other reader takes Min(y, Div(y, a)): standalone LeakyRelu layers 18 -> 3
+    at the Balanced half (a single folds into its producer's epilogue, a pair into the consumer
+    conv's prologue). Not bit-identical (the negative half takes one more fp16 rounding, y / a):
+    PSNR vs eager fp32 equal at 480p and 1080p. Refuses a slope outside (0, 1] or a non-fp16 y."""
+    import collections
+
+    import numpy as np
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    if name != "fusionnet":
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    typed = onnx.shape_inference.infer_shapes(g).graph
+    dtype = {v.name: v.type.tensor_type.elem_type
+             for v in list(typed.value_info) + list(typed.input) + list(typed.output)}
+    users = {}
+    for nd in g.graph.node:
+        for x in nd.input:
+            users.setdefault(x, []).append(nd)
+    anchors, seen = [], set()
+    for nd in g.graph.node:
+        if nd.op_type != "LeakyRelu" or len(users.get(nd.input[0], [])) < 2 or nd.input[0] in seen:
+            continue
+        seen.add(nd.input[0])
+        a = [helper.get_attribute_value(t) for t in nd.attribute if t.name == "alpha"]
+        anchors.append((nd, nd.input[0], a[0] if a else 0.01))
+    nodes = list(g.graph.node)
+    for k, (nd, x, a) in enumerate(anchors):
+        if not 0.0 < a <= 1.0:
+            raise RuntimeError(f"{name}: {nd.name} has slope {a} outside (0, 1]: x is not min(y, y / a)")
+        y = nd.output[0]
+        if dtype.get(y) != TensorProto.FLOAT16:
+            raise RuntimeError(f"{name}: {nd.name}'s output is not fp16")
+        an, dn, xn = f"fanout_slope{k}", f"fanout_div{k}", f"fanout_x{k}"
+        g.graph.initializer.append(numpy_helper.from_array(np.array(a, np.float16), an))
+        nodes += [helper.make_node("Div", [y, an], [dn], name=f"node_fanout_div{k}"),
+                  helper.make_node("Min", [y, dn], [xn], name=f"node_fanout_min{k}")]
+        for r in users[x]:
+            if r is not nd:
+                r.input[:] = [xn if i == x else i for i in r.input]
+    # the readers now sit before the Min they read: order the nodes again (Kahn)
+    prod = {o: k for k, nd in enumerate(nodes) for o in nd.output}
+    deps = [{prod[i] for i in nd.input if i in prod} for nd in nodes]
+    readers = collections.defaultdict(list)
+    for k, d in enumerate(deps):
+        for j in d:
+            readers[j].append(k)
+    left = [len(d) for d in deps]
+    ready = collections.deque(k for k, n in enumerate(left) if n == 0)
+    order = []
+    while ready:
+        k = ready.popleft()
+        order.append(nodes[k])
+        for u in readers[k]:
+            left[u] -= 1
+            if left[u] == 0:
+                ready.append(u)
+    if len(order) != len(nodes):
+        raise RuntimeError(f"{name}: {len(nodes) - len(order)} nodes left unordered after the rewrite")
+    del g.graph.node[:]
+    g.graph.node.extend(order)
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
+# the host's names for what crosses the gmflow split, in its order (smv-live kGmA after q, f)
+_GMFLOW_CROSS = ("flow0", "feat")
+
+
+def gmflow_split(full_path, a_key="gmflow_bidir_a"):
     """gmflow_bidir as two graphs around its quarter-scale local correlation, which the host computes between them
     (k_localCorr: never the [2, 128, HW, 81] fp32 product the graph writes and sums back, ~11 % of a call at 960x544).
-    The correlation = the one ReduceSum of Mul(GridSample(f, coords), q). A = img0, img1 -> q [2, HW, 128] and
-    f [2, H, W, 128] channels-last (one coalesced read a tap), coords [2, HW, K, 2], then every tensor made before
-    the correlation and read after it that derives from the frames (Shape included) and is not an integer shape
-    vector (B recomputes those from its own img0 / img1 inputs, and weight-only tensors from its initializers),
-    renamed by role: valid = the bool one, feat = the 128-channel map, win = the [2, HW, K, 2] window, flow0 = the
-    [2, 2, H, W] one derived from the frames' values, flow1 = the one made from the frame size alone. B = corr
-    [2, HW, K] + those + img0 / img1 -> flow. The exporter's own names change from export to export, so the cut is
-    found by structure and any other shape refuses. Writes trt_lookup.onnx_path(a_key) and, with_b, ("gmflow_bidir_b")
-    with their own weights; returns the paths written."""
+    The correlation = the one ReduceSum of Mul(GridSample(f, coords), q); the host computes coords itself (the window
+    positions depend on the size alone; matching.py's export path makes the window bounds and offsets after the
+    correlation, so nothing size-only crosses). A = img0, img1 -> q [2, HW, 128] and f [2, H, W, 128] channels-last
+    (one coalesced read a tap), then every tensor made before the correlation and read after it that derives from the
+    frames (Shape included) and is not an integer shape vector (B recomputes those from its own img0 / img1 inputs, and
+    weight-only tensors from its initializers), renamed by role: feat = the 128-channel map, flow0 = the [2, 2, H, W]
+    flow derived from the frames' values. B = corr [2, HW, K] + those + img0 / img1 -> flow. The exporter's own names
+    change from export to export, so the cut is found by structure and any other shape refuses. Writes
+    trt_lookup.onnx_path(a_key) and ("gmflow_bidir_b") with their own weights; returns the paths written."""
     import onnx
     from onnx import helper, shape_inference, TensorProto
 
@@ -1109,27 +1257,20 @@ def gmflow_split(full_path, a_key="gmflow_bidir_a", with_b=True):
     names, flows = {}, []
     for x in cross:
         dt, dims = kind(x)
-        if dt == TensorProto.BOOL and len(dims) == 3:
-            role = "valid"
-        elif dt == TensorProto.FLOAT and len(dims) == 4 and dims[1] == 128:
-            role = "feat"
-        elif dt == TensorProto.FLOAT and len(dims) == 4 and dims[0] == 2 and dims[3] == 2:
-            role = "win"
+        if dt == TensorProto.FLOAT and len(dims) == 4 and dims[1] == 128:
+            if "feat" in names.values():
+                raise RuntimeError("gmflow_bidir: two crossing tensors read as feat")
+            names[x] = "feat"
         elif dt == TensorProto.FLOAT and len(dims) == 4 and dims[:2] == [2, 2]:
             flows.append(x)
-            continue
         else:
             raise RuntimeError(f"gmflow_bidir: crossing tensor {x} ({dims}, dtype {dt}) has no role in the split")
-        if role in names.values():
-            raise RuntimeError(f"gmflow_bidir: two crossing tensors read as {role}")
-        names[x] = role
-    if len(flows) != 2 or len(names) != 3 or sum(x in vals for x in flows) != 1:
+    if len(flows) != 1 or len(names) != 1 or flows[0] not in vals:
         raise RuntimeError(f"gmflow_bidir: crossing tensors {cross} do not match the split contract")
-    f0 = flows[0] if flows[0] in vals else flows[1]
-    names[f0], names[flows[1] if f0 == flows[0] else flows[0]] = "flow0", "flow1"
+    names[flows[0]] = "flow0"
     cross.sort(key=lambda x: _GMFLOW_CROSS.index(names[x]))
     ex = onnx.utils.Extractor(m)
-    a = ex.extract_model(["img0", "img1"], [q, f, coords] + cross)
+    a = ex.extract_model(["img0", "img1"], [q, f] + cross)
     b = ex.extract_model([rs.output[0]] + cross + ["img0", "img1"], ["flow"])
     ga = a.graph
     ga.initializer.append(helper.make_tensor("cl_qshape", TensorProto.INT64, [3], [0, 0, -1]))
@@ -1141,10 +1282,7 @@ def gmflow_split(full_path, a_key="gmflow_bidir_a", with_b=True):
     ga.output.extend([helper.make_tensor_value_info("q", TensorProto.FLOAT, [2, "hw4", 128]),
                       helper.make_tensor_value_info("f", TensorProto.FLOAT, [2, "h4", "w4", 128])] + outs[2:])
     paths = []
-    for mm, key, mapping in ((a, a_key, {coords: "coords", **names}),
-                             (b, "gmflow_bidir_b" if with_b else None, {rs.output[0]: "corr", **names})):
-        if key is None:
-            continue
+    for mm, key, mapping in ((a, a_key, dict(names)), (b, "gmflow_bidir_b", {rs.output[0]: "corr", **names})):
         for n in mm.graph.node:
             n.input[:] = [mapping.get(x, x) for x in n.input]
             n.output[:] = [mapping.get(x, x) for x in n.output]
@@ -1161,7 +1299,7 @@ def gmflow_split(full_path, a_key="gmflow_bidir_a", with_b=True):
     return paths
 
 
-def gmflow_backbone_cut(a_path, with_bone=True):
+def gmflow_backbone_cut(a_path):
     """gmflow_bidir_a's CNN backbone as its own graph for ONE frame, so the host computes each frame's maps once (the
     previous frame's come from the last pair) instead of both frames' every pair. Found by structure: the maps = the
     inputs of the two batch Splits (axis 0, two ways) fed straight by a Conv, named map4 / map8 by their size; the
@@ -1169,8 +1307,7 @@ def gmflow_backbone_cut(a_path, with_bone=True):
     gmflow_backbone = that Concat replaced by its img0 branch, img0 -> map4, map8 [1, C, H, W]; gmflow_bidir_a is
     rewritten to take map4, map8 [2, C, H, W] (+ img0 / img1, read for shapes). Not bit-identical to the batch-2
     backbone (other fp16 kernels at batch 1): GMFSS tweens vs an fp32 reference stay at the whole graph's level.
-    Writes a_path in place and, with_bone, trt_lookup.onnx_path("gmflow_backbone"); returns the backbone's path (None
-    without it)."""
+    Writes a_path in place and trt_lookup.onnx_path("gmflow_backbone"); returns the backbone's path."""
     import onnx
     from onnx import helper, shape_inference
 
@@ -1217,10 +1354,7 @@ def gmflow_backbone_cut(a_path, with_bone=True):
     bone = onnx.utils.Extractor(bone).extract_model(["img0"], maps)
     names = {maps[0]: "map4", maps[1]: "map8"}
     paths = []
-    for mm, path in ((bone, trt_lookup.onnx_path("gmflow_backbone") if with_bone else None), (rest, a_path)):
-        if path is None:
-            paths.append(None)
-            continue
+    for mm, path in ((bone, trt_lookup.onnx_path("gmflow_backbone")), (rest, a_path)):
         for n in mm.graph.node:
             n.input[:] = [names.get(x, x) for x in n.input]
             n.output[:] = [names.get(x, x) for x in n.output]
@@ -1231,7 +1365,7 @@ def gmflow_backbone_cut(a_path, with_bone=True):
         onnx.checker.check_model(tmp)
         os.replace(tmp, path)
         paths.append(path)
-    _log(f"[trt] gmflow's backbone cut out{' as ' + os.path.basename(paths[0]) if paths[0] else ''}")
+    _log(f"[trt] gmflow's backbone cut out as {os.path.basename(paths[0])}")
     return paths[0]
 
 
@@ -1358,7 +1492,7 @@ def gmflow_matching_cut(a_path, key):
 # --- size-free ONNX -----------------------------------------------------------------------------
 # The graphs below export ONCE with H / W symbolic (trt_lookup.onnx_path), and every engine size is
 # built from that file, pinned to the example shape exactly like a per-size export (one engine per
-# resolution still holds, the profile pins every axis but the declared batch range). Built from
+# resolution still holds, the profile pins every axis). Built from
 # these files, 8 graphs are bit-exact with the per-size
 # engines; gmflow_bidir runs its size-free branch (multiply + sum local ops) and is equivalent or
 # better (closer to eager fp32). Unit = the alignment of the FIRST input's H and W (the /64 frame
@@ -1393,7 +1527,7 @@ def _export_key(name, export_module, example_inputs):
     return key
 
 
-def _size_free_shapes(name, example_inputs, input_names, dyn_batch):
+def _size_free_shapes(name, example_inputs, input_names):
     """torch.export dynamic_shapes for the size-free export, or None when this graph / example
     does not qualify."""
     unit = _size_free_unit(name)
@@ -1406,9 +1540,8 @@ def _size_free_shapes(name, example_inputs, input_names, dyn_batch):
         return None
     D = torch.export.Dim
     sh, sw = D("sh", min=lo, max=mh), D("sw", min=lo, max=mw)
-    b = None
     ds = []
-    for n, t in zip(input_names, example_inputs):
+    for _, t in zip(input_names, example_inputs):
         d = {}
         if t.dim() != 4:
             return None
@@ -1417,23 +1550,18 @@ def _size_free_shapes(name, example_inputs, input_names, dyn_batch):
             if (hi * unit) % h0 or (wi * unit) % w0:
                 return None
             d[2], d[3] = (hi * unit // h0) * sh, (wi * unit // w0) * sw
-        if dyn_batch and n in dyn_batch:
-            if b is None:
-                b = D("b", min=dyn_batch[n][0], max=dyn_batch[n][2])
-            d[0] = b
         ds.append(d)
     return tuple(ds)
 
 
-def _size_free_onnx(key, name, export_module, example_inputs, input_names, output_names,
-                    dyn_batch):
+def _size_free_onnx(key, name, export_module, example_inputs, input_names, output_names):
     """Path of this graph's size-free ONNX, exported now when missing; None when the graph or
     example does not qualify. The export lands in a per-process temp folder and is moved in only
     once complete (weights first), so a concurrent process never builds from half a file."""
     # qualify the example FIRST, also when the file exists: TensorRT reads an axis named
     # `64*sh` as plain -1 and builds any size from it, so only this check keeps an unaligned
     # example (the export's divisibility assumption broken) out
-    ds = _size_free_shapes(name, example_inputs, input_names, dyn_batch)
+    ds = _size_free_shapes(name, example_inputs, input_names)
     if ds is None:
         return None
     path = trt_lookup.onnx_path(key)
@@ -1472,6 +1600,8 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
         _blocks12_flat_concat(tmp, name)
         _encode_subpixel(tmp, name)
         _fusion_fp16_inputs(tmp, name)
+        _fusion_tail_cut(tmp, name)
+        _fusion_prelu_fanout(tmp, name)
         if os.path.isfile(tmp + ".data"):
             os.replace(tmp + ".data", path + ".data")
         os.replace(tmp, path)
@@ -1485,23 +1615,21 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
             pass
 
 
-def ensure_onnx(name, export_module, example_inputs, input_names, output_names, dyn_batch=None):
+def ensure_onnx(name, export_module, example_inputs, input_names, output_names):
     """Export this graph's size-free ONNX if it qualifies and is missing (scripts/export-onnx.ts
     through engine/onnx_export.py); returns the path or None. Raises on a failed export."""
     return _size_free_onnx(_export_key(name, export_module, example_inputs), name, export_module,
-                           example_inputs, input_names, output_names, dyn_batch)
+                           example_inputs, input_names, output_names)
 
 
 class _Engine:
     """One graph's engine contract: the base name the host's engine and ONNX names start from,
-    the input / output tensor names, and the dynamic batch range ({input name: (min, opt, max)}
-    for the live RIFE class, None for every other graph)."""
+    and the input / output tensor names."""
 
     def __init__(self, name, input_names, output_names):
         self.name = name
         self.input_names = input_names
         self.output_names = output_names
-        self.dyn_batch = None
 
 
 class FeatEngine(_Engine):
@@ -1599,45 +1727,6 @@ class RifeIFNetEngine(_Engine):
     def __init__(self, scale_list, whash):
         super().__init__(_rife_ifnet_base(scale_list, whash),
                          ["x", "timestep", "f0", "f1"], ["flow", "mask"])
-
-
-class _RifeIFNetBatchExport(nn.Module):
-    """Same forward as _RifeIFNetExport, but up to B timesteps in ONE call: the timestep input
-    carries the batch ((B,1,H,W), a dynamic axis) and the pair-constant inputs (x, f0, f1) stay
-    batch-1 and are EXPANDED inside the graph, so the caller uploads one pair's data no matter
-    how many tweens it asks for."""
-
-    def __init__(self, ifnet, scale_list):
-        super().__init__()
-        self.ifnet = ifnet
-        self.scale_list = scale_list
-
-    def forward(self, x, timestep, f0, f1):
-        b = timestep.shape[0]
-        if getattr(self.ifnet, "batch_broadcast", False):
-            # the net expands the SMALL tensors itself, after the downsample, so the
-            # pair constant full resolution downsample runs once instead of once per tween.
-            _, flows, mask = self.ifnet(x, timestep=timestep, scale_list=self.scale_list,
-                                        f0=f0, f1=f1, return_mask=True)
-        else:
-            _, flows, mask = self.ifnet(x.expand(b, -1, -1, -1), timestep=timestep,
-                                        scale_list=self.scale_list,
-                                        f0=f0.expand(b, -1, -1, -1),
-                                        f1=f1.expand(b, -1, -1, -1), return_mask=True)
-        return flows[-1], mask
-
-
-class RifeIFNetBatchEngine(_Engine):
-    """1 to b tweens of one pair per enqueue (the live `_bd{b}` class; the host builds the offline
-    fixed-batch `_b{B}` engines from the same graph). `_bd{b}` in the name keeps it apart from the
-    unbatched class."""
-
-    def __init__(self, scale_list, whash, b):
-        super().__init__(_rife_ifnet_base(scale_list, whash) + f"_bd{b}",
-                         ["x", "timestep", "f0", "f1"], ["flow", "mask"])
-        # (min, opt, max) on the batch axis. opt = b: the full batch is the throughput case
-        # worth tuning for.
-        self.dyn_batch = {"timestep": (1, b, b)}
 
 
 class _RifeEncodeExport(nn.Module):

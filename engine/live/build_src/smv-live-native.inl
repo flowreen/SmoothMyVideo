@@ -53,8 +53,7 @@ __device__ __forceinline__ float h2f(unsigned short h)
 // The radius a (the lobes) per axis: kLzUp on an axis that enlarges or keeps its size, kLzDown on
 // one that shrinks = the universal resizer test's picks, the best no-sharpen PSNR over anime, real
 // camera and CGI at every ratio (up) and working size (down). These defines are the one place they
-// are set: the host reads them for its launch sizes (lzTaps), the cubin cache key hashes this text,
-// a harness may pass -D to try others.
+// are set: the cubin cache key hashes this text, a harness may pass -D to try others.
 #ifndef kLzUp
 #define kLzUp 4
 #endif
@@ -112,49 +111,6 @@ __device__ __forceinline__ float rsInv(int o, int in, int out, int mn, int fs)
     for (int k = 0; k < fs; k++) s += rsW(mn + k, o, in, out);
     return 1.0f / s;
 }
-// One axis of a separable pass (the shrinking fit, Restore's fold, the live capture resize): the
-// taps depend on the output index alone, so each block computes them ONCE into shared memory,
-// every thread of the block sharing the work: entry (lane, tap) holds the tap's mirrored source
-// index and its weight, tap-major so a warp reads them without bank conflicts, then one thread per
-// lane normalises its taps in tap order (rsInv's order, so the per-pixel form gives the same
-// bytes). Lanes past the last output index repeat it (last). aaTabOk false (a shrink beyond
-// kAaMaxTaps / (2 kLzDown), 4.57x at seven lobes, or a block side above kAaSide) = the per-pixel form.
-#define kAaSide 32
-#define kAaMaxTaps 64
-struct AaTab { float wt[kAaMaxTaps * kAaSide]; int ix[kAaMaxTaps * kAaSide]; };
-__device__ __forceinline__ bool aaTabOk(int fs, int side)
-{
-    return side <= kAaSide && fs <= kAaMaxTaps;
-}
-// the table at any stride (tap k of lane at k * stride + lane): AaTab's is kAaSide, the tiled
-// fit's tables in dynamic shared memory use their block side
-__device__ __forceinline__ void aaTabFillS(float* wt, int* ix, int stride, int o0, int side, int in, int out, int fs,
-                                           int last)
-{
-    const int nt = blockDim.x * blockDim.y, t = threadIdx.y * blockDim.x + threadIdx.x;
-    for (int e = t; e < side * fs; e += nt)
-    {
-        const int lane = e / fs, k = e - lane * fs;
-        const int o = o0 + lane < last ? o0 + lane : last;
-        const int mn = rsBegin(o, in, out, fs);
-        wt[k * stride + lane] = rsW(mn + k, o, in, out);
-        ix[k * stride + lane] = rsMirror(mn + k, in);
-    }
-    __syncthreads();
-    if (t < side)
-    {
-        float s = 0.0f;
-        for (int k = 0; k < fs; k++) s += wt[k * stride + t];
-        const float inv = 1.0f / s;
-        for (int k = 0; k < fs; k++) wt[k * stride + t] *= inv;
-    }
-    __syncthreads();
-}
-__device__ __forceinline__ void aaTabFill(AaTab& T, int o0, int side, int in, int out, int fs, int last)
-{
-    aaTabFillS(T.wt, T.ix, kAaSide, o0, side, in, out, fs, last);
-}
-
 // ---- no fp64 in these kernels (consumer GPUs run fp64 at a small fraction of fp32). Where
 // accuracy would call for double, fp32 keeps it by construction: tap centres are integer ratios (rsBegin / rsArg, nvUpTap), a
 // landing point is the pixel plus the floor and the exact fraction of its offset (land, nvAxis),
@@ -213,20 +169,17 @@ __global__ void k_packInDirect(const unsigned char* __restrict__ src, int cw, in
 __global__ void k_resizeH(const unsigned char* __restrict__ src, int cw, int ch,
                           float* __restrict__ tmp, int w)
 {
-    __shared__ AaTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int sy = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(cw, w);
-    const bool tab = aaTabOk(fs, blockDim.x);
-    if (tab) aaTabFill(T, blockIdx.x * blockDim.x, blockDim.x, cw, w, fs, w - 1);
     if (ox >= w || sy >= ch) return;
-    const int mn = tab ? 0 : rsBegin(ox, cw, w, fs);
-    const float inv = tab ? 0.0f : rsInv(ox, cw, w, mn, fs);
+    const int mn = rsBegin(ox, cw, w, fs);
+    const float inv = rsInv(ox, cw, w, mn, fs);
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = tab ? T.wt[k * kAaSide + threadIdx.x] : rsW(mn + k, ox, cw, w) * inv;
-        const int ix = tab ? T.ix[k * kAaSide + threadIdx.x] : rsMirror(mn + k, cw);
+        const float wt = rsW(mn + k, ox, cw, w) * inv;
+        const int ix = rsMirror(mn + k, cw);
         const unsigned char* p = src + ((size_t)sy * cw + ix) * 4;
         a0 += wt * p[0];
         a1 += wt * p[1];
@@ -244,23 +197,20 @@ __global__ void k_resizeH(const unsigned char* __restrict__ src, int cw, int ch,
 __global__ void k_resizeV(const float* __restrict__ tmp, int w, int ch,
                           float* __restrict__ dst, int h, int ph, int pw, int planeStride)
 {
-    __shared__ AaTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(ch, h);
-    const bool tab = aaTabOk(fs, blockDim.y);
-    if (tab) aaTabFill(T, blockIdx.y * blockDim.y, blockDim.y, ch, h, fs, h - 1);
     if (ox >= pw || oy >= ph) return;
     const int tx = ox < w ? ox : w - 1;            // replicate pad in x
-    const int ty = oy < h ? oy : h - 1;            // replicate pad in y (the table's lanes repeat h - 1)
-    const int mn = tab ? 0 : rsBegin(ty, ch, h, fs);
-    const float inv = tab ? 0.0f : rsInv(ty, ch, h, mn, fs);
+    const int ty = oy < h ? oy : h - 1;            // replicate pad in y
+    const int mn = rsBegin(ty, ch, h, fs);
+    const float inv = rsInv(ty, ch, h, mn, fs);
     const size_t plane = (size_t)ch * w;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = tab ? T.wt[k * kAaSide + threadIdx.y] : rsW(mn + k, ty, ch, h) * inv;
-        const int iy = tab ? T.ix[k * kAaSide + threadIdx.y] : rsMirror(mn + k, ch);
+        const float wt = rsW(mn + k, ty, ch, h) * inv;
+        const int iy = rsMirror(mn + k, ch);
         const size_t o = (size_t)iy * w + tx;
         a0 += wt * tmp[o];
         a1 += wt * tmp[plane + o];
@@ -336,22 +286,19 @@ __global__ void k_pqPlanar(const unsigned short* __restrict__ src, int cw, int c
 __global__ void k_resizeHf(const float* __restrict__ src, int cw, int ch,
                            float* __restrict__ tmp, int w)
 {
-    __shared__ AaTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int sy = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(cw, w);
-    const bool tab = aaTabOk(fs, blockDim.x);
-    if (tab) aaTabFill(T, blockIdx.x * blockDim.x, blockDim.x, cw, w, fs, w - 1);
     if (ox >= w || sy >= ch) return;
-    const int mn = tab ? 0 : rsBegin(ox, cw, w, fs);
-    const float inv = tab ? 0.0f : rsInv(ox, cw, w, mn, fs);
+    const int mn = rsBegin(ox, cw, w, fs);
+    const float inv = rsInv(ox, cw, w, mn, fs);
     const size_t splane = (size_t)ch * cw;
     const size_t dplane = (size_t)ch * w;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = tab ? T.wt[k * kAaSide + threadIdx.x] : rsW(mn + k, ox, cw, w) * inv;
-        const int ix = tab ? T.ix[k * kAaSide + threadIdx.x] : rsMirror(mn + k, cw);
+        const float wt = rsW(mn + k, ox, cw, w) * inv;
+        const int ix = rsMirror(mn + k, cw);
         const size_t o = (size_t)sy * cw + ix;
         a0 += wt * src[o];
         a1 += wt * src[splane + o];
@@ -369,57 +316,6 @@ __global__ void k_h2f(const unsigned short* __restrict__ src, float* __restrict_
     if (i < n) dst[i] = h2f(src[i]);
 }
 
-// one output pixel of a slot: crop the model pad, then copy 1:1 when the slot matches the
-// model size, else resize with Lanczos on both axes (the placement at the top of this block).
-// The SDR and HDR slot packers below share this sampler and differ only in the store.
-// The taps depend on ox alone (x) or oy alone (y), so each block computes them ONCE into shared
-// memory, every thread sharing the work: the mirrored source index and the weight per (lane, tap),
-// tap-major so a warp reads them without bank conflicts, then one thread per column lane and one
-// per row lane normalises its taps in tap order (rsInv's order, so the per-pixel form gives the
-// same bytes). false = the 1:1 copy, a block side above kOutSide, an axis with more than kOutTaps
-// taps (an enlarge, or a shrink by at most 4 / 3) or a block with fewer threads than column and
-// row lanes together (the per-pixel form).
-#define kOutSide 32
-#define kOutTaps (2 * ((4 * kLzDown + 2) / 3) > 2 * kLzUp ? 2 * ((4 * kLzDown + 2) / 3) : 2 * kLzUp)
-struct OutTab
-{
-    float wx[kOutTaps * kOutSide], wy[kOutTaps * kOutSide];
-    int cx[kOutTaps * kOutSide], cy[kOutTaps * kOutSide];
-};
-__device__ __forceinline__ bool outTabFill(OutTab& T, int w, int h, int dw, int dh)
-{
-    const int fsx = rsTaps(w, dw), fsy = rsTaps(h, dh);
-    const int bx = blockDim.x, by = blockDim.y, nt = bx * by, t = threadIdx.y * bx + threadIdx.x;
-    if ((dw == w && dh == h) || bx > kOutSide || by > kOutSide || fsx > kOutTaps || fsy > kOutTaps ||
-        nt < bx + by)
-        return false;
-    const int nx = bx * fsx, ny = by * fsy;
-    for (int e = t; e < nx + ny; e += nt)
-    {
-        const bool col = e < nx;
-        const int fs = col ? fsx : fsy, ee = col ? e : e - nx, lane = ee / fs, k = ee - lane * fs;
-        const int in = col ? w : h, out = col ? dw : dh;
-        int o = (col ? blockIdx.x * bx : blockIdx.y * by) + lane;
-        if (o > out - 1) o = out - 1;
-        const int mn = rsBegin(o, in, out, fs);
-        (col ? T.wx : T.wy)[k * kOutSide + lane] = rsW(mn + k, o, in, out);
-        (col ? T.cx : T.cy)[k * kOutSide + lane] = rsMirror(mn + k, in);
-    }
-    __syncthreads();
-    if (t < bx + by)
-    {
-        const bool col = t < bx;
-        float* wv = col ? T.wx : T.wy;
-        const int lane = col ? t : t - bx, fs = col ? fsx : fsy;
-        float s = 0.0f;
-        for (int k = 0; k < fs; k++) s += wv[k * kOutSide + lane];
-        const float inv = 1.0f / s;
-        for (int k = 0; k < fs; k++) wv[k * kOutSide + lane] *= inv;
-    }
-    __syncthreads();
-    return true;
-}
-
 // one element of a planar source that is fp32, or fp16 (half != 0: the IFNet's tweens, read as
 // the engine wrote them, so no pass widens them first)
 __device__ __forceinline__ float ldS(const void* __restrict__ src, int half, size_t o)
@@ -427,94 +323,16 @@ __device__ __forceinline__ float ldS(const void* __restrict__ src, int half, siz
     return half ? h2f(((const unsigned short*)src)[o]) : ((const float*)src)[o];
 }
 
-// the table form's gather: the column's taps in registers (a fixed NT loop the compiler unrolls,
-// NT >= fsx); the sums run in the per-pixel form's order, so both forms give the same bytes (C++
-// linkage: the text sits in one extern "C" block, and a template cannot have C linkage)
-extern "C++" template <int NT>
-__device__ __forceinline__ void sampleOutTab(const void* __restrict__ src, int half, size_t p1, size_t p2,
-                                             int rowStride, int fsx, int fsy, const OutTab* T, float& a0,
-                                             float& a1, float& a2)
-{
-    float wxr[NT];
-    int cxr[NT];
-#pragma unroll
-    for (int i = 0; i < NT; i++)
-    {
-        wxr[i] = i < fsx ? T->wx[i * kOutSide + threadIdx.x] : 0.0f;
-        cxr[i] = i < fsx ? T->cx[i * kOutSide + threadIdx.x] : 0;
-    }
-    for (int j = 0; j < fsy; j++)
-    {
-        const float wy = T->wy[j * kOutSide + threadIdx.y];
-        const size_t row = (size_t)T->cy[j * kOutSide + threadIdx.y] * rowStride;
-        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f;
-#pragma unroll
-        for (int i = 0; i < NT; i++)
-        {
-            if (i < fsx)
-            {
-                const size_t o = row + cxr[i];
-                r0 += wxr[i] * ldS(src, half, o);
-                r1 += wxr[i] * ldS(src, half, p1 + o);
-                r2 += wxr[i] * ldS(src, half, p2 + o);
-            }
-        }
-        a0 += wy * r0;
-        a1 += wy * r1;
-        a2 += wy * r2;
-    }
-}
-
-// T = the block's filled table, or nullptr for the per-pixel taps
+// one output pixel of a slot or a planar frame: the model pad cropped, copied 1:1 (every size change
+// runs as the separable Lanczos pair below); the SDR and HDR slot packers and k_fitPlanar share it and
+// differ only in the store
 __device__ __forceinline__ void sampleOut(const void* __restrict__ src, int half, int planeStride,
-                                          int rowStride, int w, int h, int ox, int oy,
-                                          int dw, int dh, const OutTab* T, float c[3])
+                                          int rowStride, int ox, int oy, float c[3])
 {
-    if (dw == w && dh == h)
-    {
-        const size_t o = (size_t)oy * rowStride + ox;
-        c[0] = ldS(src, half, o);
-        c[1] = ldS(src, half, planeStride + o);
-        c[2] = ldS(src, half, 2 * planeStride + o);
-        return;
-    }
-    const int fsx = rsTaps(w, dw), fsy = rsTaps(h, dh);
-    const size_t p1 = planeStride, p2 = 2 * (size_t)planeStride;
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-    if (T)
-    {
-        // an enlarging (or same-size) x axis has 2 kLzUp taps: unrolling kOutTaps there (a 4 / 3
-        // shrink's count) only adds predicated-off slots and registers
-        if (fsx <= 2 * kLzUp)
-            sampleOutTab<2 * kLzUp>(src, half, p1, p2, rowStride, fsx, fsy, T, a0, a1, a2);
-        else
-            sampleOutTab<kOutTaps>(src, half, p1, p2, rowStride, fsx, fsy, T, a0, a1, a2);
-    }
-    else
-    {
-        const int mx = rsBegin(ox, w, dw, fsx), my = rsBegin(oy, h, dh, fsy);
-        const float invx = rsInv(ox, w, dw, mx, fsx), invy = rsInv(oy, h, dh, my, fsy);
-        for (int j = 0; j < fsy; j++)
-        {
-            const float wy = rsW(my + j, oy, h, dh) * invy;
-            const size_t row = (size_t)rsMirror(my + j, h) * rowStride;
-            float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f;
-            for (int i = 0; i < fsx; i++)
-            {
-                const float wx = rsW(mx + i, ox, w, dw) * invx;
-                const size_t o = row + rsMirror(mx + i, w);
-                r0 += wx * ldS(src, half, o);
-                r1 += wx * ldS(src, half, p1 + o);
-                r2 += wx * ldS(src, half, p2 + o);
-            }
-            a0 += wy * r0;
-            a1 += wy * r1;
-            a2 += wy * r2;
-        }
-    }
-    c[0] = a0;
-    c[1] = a1;
-    c[2] = a2;
+    const size_t o = (size_t)oy * rowStride + ox;
+    c[0] = ldS(src, half, o);
+    c[1] = ldS(src, half, planeStride + o);
+    c[2] = ldS(src, half, 2 * planeStride + o);
 }
 
 // one output slot: sampleOut, clamp, round, and write the (R, G, B) planes as BGRA8 into the
@@ -523,13 +341,11 @@ __global__ void k_packOut(const void* __restrict__ src, int half, int planeStrid
                           int w, int h, unsigned char* __restrict__ dst, int pitch,
                           int x0, int y0, int dw, int dh)
 {
-    __shared__ OutTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
-    const bool tab = outTabFill(T, w, h, dw, dh);
-    if (ox >= dw || oy >= dh) return;
+    if (ox >= dw || oy >= dh || ox >= w || oy >= h) return;
     float c[3];
-    sampleOut(src, half, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
+    sampleOut(src, half, planeStride, rowStride, ox, oy, c);
     unsigned char* p = dst + (size_t)(y0 + oy) * pitch + (size_t)(x0 + ox) * 4;
     for (int ci = 0; ci < 3; ci++)
     {
@@ -546,13 +362,11 @@ __global__ void k_packOutHdr(const void* __restrict__ src, int half, int planeSt
                              int w, int h, unsigned char* __restrict__ dst, int pitch,
                              int x0, int y0, int dw, int dh)
 {
-    __shared__ OutTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
-    const bool tab = outTabFill(T, w, h, dw, dh);
-    if (ox >= dw || oy >= dh) return;
+    if (ox >= dw || oy >= dh || ox >= w || oy >= h) return;
     float c[3];
-    sampleOut(src, half, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
+    sampleOut(src, half, planeStride, rowStride, ox, oy, c);
     unsigned int q[3];
     for (int ci = 0; ci < 3; ci++)
     {
@@ -567,7 +381,7 @@ __global__ void k_packOutHdr(const void* __restrict__ src, int half, int planeSt
 
 // ---- live Sharpen and RTX VSR inside the native host ---------------------------------------
 // Both effects run at the PRESENTED size, after the fit, exactly like live_server.py's compose
-// (upscale, then the sharpen): the fit lands in a planar staging frame at dw x dh (k_fitPlanar, or
+// (upscale, then the sharpen): the fit lands in a planar staging frame at dw x dh (the Lanczos pair, or
 // the VSR bridge output unpacked by k_unpackBgraRgb), and the sharpen kernels apply Adaptive Sharpen
 // on it while doing the slot store that k_packOut / k_packOutHdr do without effects.
 
@@ -638,17 +452,15 @@ __global__ void k_unpackRgba(const unsigned char* __restrict__ src, int dw, int 
     dst[2 * plane + o] = p[2] / 255.0f;
 }
 
-// sampleOut's fit into the planar staging frame (the sharpen input when VSR is off)
+// sampleOut's 1:1 crop copy into a planar frame (the Restore input's fp16 widening, Upscale to at the model size)
 __global__ void k_fitPlanar(const void* __restrict__ src, int half, int planeStride, int rowStride,
                             int w, int h, float* __restrict__ dst, int dw, int dh)
 {
-    __shared__ OutTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
-    const bool tab = outTabFill(T, w, h, dw, dh);
-    if (ox >= dw || oy >= dh) return;
+    if (ox >= dw || oy >= dh || ox >= w || oy >= h) return;
     float c[3];
-    sampleOut(src, half, planeStride, rowStride, w, h, ox, oy, dw, dh, tab ? &T : nullptr, c);
+    sampleOut(src, half, planeStride, rowStride, ox, oy, c);
     const size_t plane = (size_t)dw * dh;
     const size_t o = (size_t)oy * dw + ox;
     dst[o] = c[0];
@@ -672,31 +484,26 @@ __global__ void k_padPlanar(const float* __restrict__ src, int ps, int rs, int w
     dst[2 * (size_t)dps + o] = src[2 * (size_t)ps + s];
 }
 
-// ---- the shrinking fit ----------------------------------------------------------------------
-// The Lanczos resize as a separable pair into the planar staging frame (the AaTab tables at the
-// top of this block): 2 kLzUp taps per axis on an enlarging axis, 2 ceil(kLzDown in / out) on a
-// shrinking one, so a pixel reads the sum of its two axes' taps where sampleOut's 2D gather reads
-// their product. Every live fit that changes the size runs through it; the offline stages keep
-// sampleOut (NVENC paces them).
+// ---- every planar resize: the Lanczos pair --------------------------------------------------
+// The resize as a separable pair (the placement at the top of this block, each pixel's taps
+// computed per pixel): 2 kLzUp taps on an enlarging axis, 2 ceil(kLzDown in / out) on a shrinking
+// one, a pixel reading the sum of its two axes' taps.
 
 // horizontal pass: the model pad cropped to (w, h) -> tmp (3, h, dw)
 __global__ void k_fitAaH(const void* __restrict__ src, int half, int planeStride, int rowStride,
                          int w, int h, float* __restrict__ tmp, int dw)
 {
-    __shared__ AaTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(w, dw);
-    const bool tab = aaTabOk(fs, blockDim.x);
-    if (tab) aaTabFill(T, blockIdx.x * blockDim.x, blockDim.x, w, dw, fs, dw - 1);
     if (ox >= dw || y >= h) return;
-    const int mn = tab ? 0 : rsBegin(ox, w, dw, fs);
-    const float inv = tab ? 0.0f : rsInv(ox, w, dw, mn, fs);
+    const int mn = rsBegin(ox, w, dw, fs);
+    const float inv = rsInv(ox, w, dw, mn, fs);
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = tab ? T.wt[k * kAaSide + threadIdx.x] : rsW(mn + k, ox, w, dw) * inv;
-        const int ix = tab ? T.ix[k * kAaSide + threadIdx.x] : rsMirror(mn + k, w);
+        const float wt = rsW(mn + k, ox, w, dw) * inv;
+        const int ix = rsMirror(mn + k, w);
         const size_t o = (size_t)y * rowStride + ix;
         a0 += wt * ldS(src, half, o);
         a1 += wt * ldS(src, half, planeStride + o);
@@ -711,17 +518,17 @@ __global__ void k_fitAaH(const void* __restrict__ src, int half, int planeStride
 
 // the vertical taps of output row oy, column x, from a horizontal pass's tmp (3, h, dw): shared by
 // the vertical pass and the fused vertical pass + slot store, so both give the same values
-__device__ __forceinline__ void aaVSum(const float* __restrict__ tmp, int dw, int h, int dh, int x, int oy,
-                                       const AaTab& T, bool tab, int fs, float a[3])
+__device__ __forceinline__ void aaVSum(const float* __restrict__ tmp, int dw, int h, int dh, int x, int oy, float a[3])
 {
-    const int mn = tab ? 0 : rsBegin(oy, h, dh, fs);
-    const float inv = tab ? 0.0f : rsInv(oy, h, dh, mn, fs);
+    const int fs = rsTaps(h, dh);
+    const int mn = rsBegin(oy, h, dh, fs);
+    const float inv = rsInv(oy, h, dh, mn, fs);
     const size_t splane = (size_t)h * dw;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = tab ? T.wt[k * kAaSide + threadIdx.y] : rsW(mn + k, oy, h, dh) * inv;
-        const int iy = tab ? T.ix[k * kAaSide + threadIdx.y] : rsMirror(mn + k, h);
+        const float wt = rsW(mn + k, oy, h, dh) * inv;
+        const int iy = rsMirror(mn + k, h);
         const size_t o = (size_t)iy * dw + x;
         a0 += wt * tmp[o];
         a1 += wt * tmp[splane + o];
@@ -736,15 +543,11 @@ __device__ __forceinline__ void aaVSum(const float* __restrict__ tmp, int dw, in
 __global__ void k_fitAaV(const float* __restrict__ tmp, int dw, int h,
                          float* __restrict__ dst, int dh)
 {
-    __shared__ AaTab T;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
-    const int fs = rsTaps(h, dh);
-    const bool tab = aaTabOk(fs, blockDim.y);
-    if (tab) aaTabFill(T, blockIdx.y * blockDim.y, blockDim.y, h, dh, fs, dh - 1);
     if (x >= dw || oy >= dh) return;
     float a[3];
-    aaVSum(tmp, dw, h, dh, x, oy, T, tab, fs, a);
+    aaVSum(tmp, dw, h, dh, x, oy, a);
     const size_t plane = (size_t)dw * dh;
     const size_t o = (size_t)oy * dw + x;
     dst[o] = a[0];
@@ -758,15 +561,11 @@ __global__ void k_fitAaV(const float* __restrict__ tmp, int dw, int h,
 __global__ void k_packOutV(const float* __restrict__ tmp, int dw, int h, unsigned char* __restrict__ dst,
                            int pitch, int x0, int y0, int dh)
 {
-    __shared__ AaTab T;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
-    const int fs = rsTaps(h, dh);
-    const bool tab = aaTabOk(fs, blockDim.y);
-    if (tab) aaTabFill(T, blockIdx.y * blockDim.y, blockDim.y, h, dh, fs, dh - 1);
     if (x >= dw || oy >= dh) return;
     float c[3];
-    aaVSum(tmp, dw, h, dh, x, oy, T, tab, fs, c);
+    aaVSum(tmp, dw, h, dh, x, oy, c);
     unsigned char* p = dst + (size_t)(y0 + oy) * pitch + (size_t)(x0 + x) * 4;
     for (int ci = 0; ci < 3; ci++)
     {
@@ -781,15 +580,11 @@ __global__ void k_packOutV(const float* __restrict__ tmp, int dw, int h, unsigne
 __global__ void k_packOutHdrV(const float* __restrict__ tmp, int dw, int h, unsigned char* __restrict__ dst,
                               int pitch, int x0, int y0, int dh)
 {
-    __shared__ AaTab T;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
-    const int fs = rsTaps(h, dh);
-    const bool tab = aaTabOk(fs, blockDim.y);
-    if (tab) aaTabFill(T, blockIdx.y * blockDim.y, blockDim.y, h, dh, fs, dh - 1);
     if (x >= dw || oy >= dh) return;
     float c[3];
-    aaVSum(tmp, dw, h, dh, x, oy, T, tab, fs, c);
+    aaVSum(tmp, dw, h, dh, x, oy, c);
     unsigned int q[3];
     for (int ci = 0; ci < 3; ci++)
     {
@@ -800,164 +595,13 @@ __global__ void k_packOutHdrV(const float* __restrict__ tmp, int dw, int h, unsi
     }
     unsigned int* p = (unsigned int*)(dst + (size_t)(y0 + oy) * pitch) + (x0 + x);
     *p = q[0] | (q[1] << 10) | (q[2] << 20) | (3u << 30);
-}
-
-// the pair and the slot store in ONE kernel, for a fit that shrinks the height (a block's source
-// rows then barely overlap its neighbours'): both tap tables and the horizontal pass of the source
-// rows the block's vertical taps read go into dynamic shared memory (k_fitAaH's sums in its
-// order), then the vertical taps in aaVSum's order and k_packOutV's (hdr 0) or k_packOutHdrV's
-// (hdr 1) store: the pair's bytes without the global tmp. Shared memory (the launch sizes it):
-// fsh x blockDim.x and fsv x blockDim.y table entries, two ints, the tile (3, rcap, blockDim.x);
-// rcap = ceil((blockDim.y - 1) h / dh) + fsv + 2 bounds a block's row span (rsBegin is a floor)
-__global__ void k_packOutTile(const void* __restrict__ src, int half, int planeStride, int rowStride, int w, int h,
-                              unsigned char* __restrict__ dst, int pitch, int x0, int y0, int dw, int dh, int hdr,
-                              int rcap)
-{
-    extern __shared__ float sm[];
-    const int bx = blockDim.x, by = blockDim.y;
-    const int nt = bx * by, t = threadIdx.y * bx + threadIdx.x;
-    const int fsh = rsTaps(w, dw), fsv = rsTaps(h, dh);
-    float* wtH = sm;
-    int* ixH = (int*)(wtH + fsh * bx);
-    float* wtV = (float*)(ixH + fsh * bx);
-    int* ixV = (int*)(wtV + fsv * by);
-    int* lim = ixV + fsv * by;
-    float* tile = (float*)(lim + 2);
-    if (t == 0) { lim[0] = h; lim[1] = -1; }
-    aaTabFillS(wtH, ixH, bx, blockIdx.x * bx, bx, w, dw, fsh, dw - 1);
-    aaTabFillS(wtV, ixV, by, blockIdx.y * by, by, h, dh, fsv, dh - 1);
-    for (int e = t; e < by * fsv; e += nt)
-    {
-        atomicMin(&lim[0], ixV[e]);
-        atomicMax(&lim[1], ixV[e]);
-    }
-    __syncthreads();
-    const int r0 = lim[0], nr = lim[1] - lim[0] + 1;
-    if (nr > rcap) return;
-    for (int e = t; e < nr * bx; e += nt)
-    {
-        const int r = e / bx, c = e - r * bx;
-        const size_t row = (size_t)(r0 + r) * rowStride;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-        for (int k = 0; k < fsh; k++)
-        {
-            const float wt = wtH[k * bx + c];
-            const size_t o = row + ixH[k * bx + c];
-            a0 += wt * ldS(src, half, o);
-            a1 += wt * ldS(src, half, planeStride + o);
-            a2 += wt * ldS(src, half, 2 * planeStride + o);
-        }
-        tile[r * bx + c] = a0;
-        tile[(nr + r) * bx + c] = a1;
-        tile[(2 * nr + r) * bx + c] = a2;
-    }
-    __syncthreads();
-    const int x = blockIdx.x * bx + threadIdx.x, oy = blockIdx.y * by + threadIdx.y;
-    if (x >= dw || oy >= dh) return;
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-    for (int k = 0; k < fsv; k++)
-    {
-        const float wt = wtV[k * by + threadIdx.y];
-        const int r = ixV[k * by + threadIdx.y] - r0;
-        a0 += wt * tile[r * bx + threadIdx.x];
-        a1 += wt * tile[(nr + r) * bx + threadIdx.x];
-        a2 += wt * tile[(2 * nr + r) * bx + threadIdx.x];
-    }
-    const float c[3] = {a0, a1, a2};
-    if (!hdr)
-    {
-        unsigned char* p = dst + (size_t)(y0 + oy) * pitch + (size_t)(x0 + x) * 4;
-        for (int ci = 0; ci < 3; ci++)
-        {
-            float v = c[ci];
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-            p[2 - ci] = (unsigned char)(int)rintf(v * 255.0f);
-        }
-        p[3] = 255;
-        return;
-    }
-    unsigned int q[3];
-    for (int ci = 0; ci < 3; ci++)
-    {
-        float v = c[ci];
-        v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-        q[ci] = (unsigned int)(int)(v * 1023.0f + 0.5f);
-        if (q[ci] > 1023u) q[ci] = 1023u;
-    }
-    unsigned int* p = (unsigned int*)(dst + (size_t)(y0 + oy) * pitch) + (x0 + x);
-    *p = q[0] | (q[1] << 10) | (q[2] << 20) | (3u << 30);
-}
-
-// the pair into a planar target in ONE kernel (Upscale to's first resize where it beats the pair),
-// k_packOutTile's layout: both tap tables and k_fitAaH's sums of the source rows the block's vertical
-// taps read in dynamic shared memory, then aaVSum's vertical sum into the planar target (3, dh, dw):
-// k_fitAaV's bytes without the global tmp
-__global__ void k_fitAaTile(const void* __restrict__ src, int half, int planeStride, int rowStride, int w, int h,
-                            float* __restrict__ dst, int dw, int dh, int rcap)
-{
-    extern __shared__ float sm[];
-    const int bx = blockDim.x, by = blockDim.y;
-    const int nt = bx * by, t = threadIdx.y * bx + threadIdx.x;
-    const int fsh = rsTaps(w, dw), fsv = rsTaps(h, dh);
-    float* wtH = sm;
-    int* ixH = (int*)(wtH + fsh * bx);
-    float* wtV = (float*)(ixH + fsh * bx);
-    int* ixV = (int*)(wtV + fsv * by);
-    int* lim = ixV + fsv * by;
-    float* tile = (float*)(lim + 2);
-    if (t == 0) { lim[0] = h; lim[1] = -1; }
-    aaTabFillS(wtH, ixH, bx, blockIdx.x * bx, bx, w, dw, fsh, dw - 1);
-    aaTabFillS(wtV, ixV, by, blockIdx.y * by, by, h, dh, fsv, dh - 1);
-    for (int e = t; e < by * fsv; e += nt)
-    {
-        atomicMin(&lim[0], ixV[e]);
-        atomicMax(&lim[1], ixV[e]);
-    }
-    __syncthreads();
-    const int r0 = lim[0], nr = lim[1] - lim[0] + 1;
-    if (nr > rcap) return;
-    for (int e = t; e < nr * bx; e += nt)
-    {
-        const int r = e / bx, c = e - r * bx;
-        const size_t row = (size_t)(r0 + r) * rowStride;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-        for (int k = 0; k < fsh; k++)
-        {
-            const float wt = wtH[k * bx + c];
-            const size_t o = row + ixH[k * bx + c];
-            a0 += wt * ldS(src, half, o);
-            a1 += wt * ldS(src, half, planeStride + o);
-            a2 += wt * ldS(src, half, 2 * planeStride + o);
-        }
-        tile[r * bx + c] = a0;
-        tile[(nr + r) * bx + c] = a1;
-        tile[(2 * nr + r) * bx + c] = a2;
-    }
-    __syncthreads();
-    const int x = blockIdx.x * bx + threadIdx.x, oy = blockIdx.y * by + threadIdx.y;
-    if (x >= dw || oy >= dh) return;
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-    for (int k = 0; k < fsv; k++)
-    {
-        const float wt = wtV[k * by + threadIdx.y];
-        const int r = ixV[k * by + threadIdx.y] - r0;
-        a0 += wt * tile[r * bx + threadIdx.x];
-        a1 += wt * tile[(nr + r) * bx + threadIdx.x];
-        a2 += wt * tile[(2 * nr + r) * bx + threadIdx.x];
-    }
-    const size_t plane = (size_t)dw * dh;
-    const size_t o = (size_t)oy * dw + x;
-    dst[o] = a0;
-    dst[plane + o] = a1;
-    dst[2 * plane + o] = a2;
 }
 
 // ---- live Restore ---------------------------------------------------------------------------
 // live_server._Fit._restore: the Real-ESRGAN TensorRT engine (x = the model frame as fp16
 // NCHW [1,3,h,w], y = its 4x reconstruction [1,3,4h,4w]) then realesr.fit to the restore
-// target: `out.clamp(0,1)` first, the Lanczos pair when the target height shrinks (the pair
-// above with the clamp folded in and the engine's own dtype read at the taps), sampleOut's
-// Lanczos when it enlarges (k_restToF + k_fitPlanar + k_clamp01), identity when equal.
+// target: `out.clamp(0,1)` first, then the Lanczos pair at every ratio (the pair above with the
+// clamp folded in and the engine's own dtype read at the taps).
 __device__ __forceinline__ unsigned short f2h(float f)
 {
     unsigned short h;
@@ -993,25 +637,22 @@ __global__ void k_f2h(const float* __restrict__ src, unsigned short* __restrict_
     if (i < n) dst[i] = f2h(src[i]);
 }
 
-// the shrinking fold, horizontal pass: the 4x output (fp16 or fp32 planar, clamped per tap)
+// the fold, horizontal pass: the 4x output (fp16 or fp32 planar, clamped per tap)
 // -> tmp (3, h, dw); the taps are k_fitAaH's
 __global__ void k_restFoldH(const void* __restrict__ src, int half, int planeStride, int rowStride,
                             int w, int h, float* __restrict__ tmp, int dw)
 {
-    __shared__ AaTab T;
     const int ox = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(w, dw);
-    const bool tab = aaTabOk(fs, blockDim.x);
-    if (tab) aaTabFill(T, blockIdx.x * blockDim.x, blockDim.x, w, dw, fs, dw - 1);
     if (ox >= dw || y >= h) return;
-    const int mn = tab ? 0 : rsBegin(ox, w, dw, fs);
-    const float inv = tab ? 0.0f : rsInv(ox, w, dw, mn, fs);
+    const int mn = rsBegin(ox, w, dw, fs);
+    const float inv = rsInv(ox, w, dw, mn, fs);
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = tab ? T.wt[k * kAaSide + threadIdx.x] : rsW(mn + k, ox, w, dw) * inv;
-        const int ix = tab ? T.ix[k * kAaSide + threadIdx.x] : rsMirror(mn + k, w);
+        const float wt = rsW(mn + k, ox, w, dw) * inv;
+        const int ix = rsMirror(mn + k, w);
         const size_t o = (size_t)y * rowStride + ix;
         a0 += wt * restTap(src, half, o);
         a1 += wt * restTap(src, half, planeStride + o);
@@ -1028,21 +669,18 @@ __global__ void k_restFoldH(const void* __restrict__ src, int half, int planeStr
 __global__ void k_restFoldV(const float* __restrict__ tmp, int dw, int h,
                             float* __restrict__ dst, int dh)
 {
-    __shared__ AaTab T;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int oy = blockIdx.y * blockDim.y + threadIdx.y;
     const int fs = rsTaps(h, dh);
-    const bool tab = aaTabOk(fs, blockDim.y);
-    if (tab) aaTabFill(T, blockIdx.y * blockDim.y, blockDim.y, h, dh, fs, dh - 1);
     if (x >= dw || oy >= dh) return;
-    const int mn = tab ? 0 : rsBegin(oy, h, dh, fs);
-    const float inv = tab ? 0.0f : rsInv(oy, h, dh, mn, fs);
+    const int mn = rsBegin(oy, h, dh, fs);
+    const float inv = rsInv(oy, h, dh, mn, fs);
     const size_t splane = (size_t)h * dw;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
-        const float wt = tab ? T.wt[k * kAaSide + threadIdx.y] : rsW(mn + k, oy, h, dh) * inv;
-        const int iy = tab ? T.ix[k * kAaSide + threadIdx.y] : rsMirror(mn + k, h);
+        const float wt = rsW(mn + k, oy, h, dh) * inv;
+        const int iy = rsMirror(mn + k, h);
         const size_t o = (size_t)iy * dw + x;
         a0 += wt * tmp[o];
         a1 += wt * tmp[splane + o];
@@ -1055,70 +693,7 @@ __global__ void k_restFoldV(const float* __restrict__ tmp, int dw, int h,
     dst[2 * plane + o] = a2 < 0.0f ? 0.0f : (a2 > 1.0f ? 1.0f : a2);
 }
 
-// the fold's pair in ONE kernel for a shrinking height, k_packOutTile's layout: both tap tables and
-// k_restFoldH's sums of the source rows the block's vertical taps read in dynamic shared memory, then
-// k_restFoldV's vertical sum and clamp into the planar target: the pair's bytes without the global tmp
-__global__ void k_restFoldTile(const void* __restrict__ src, int half, int planeStride, int rowStride, int w, int h,
-                               float* __restrict__ dst, int dw, int dh, int rcap)
-{
-    extern __shared__ float sm[];
-    const int bx = blockDim.x, by = blockDim.y;
-    const int nt = bx * by, t = threadIdx.y * bx + threadIdx.x;
-    const int fsh = rsTaps(w, dw), fsv = rsTaps(h, dh);
-    float* wtH = sm;
-    int* ixH = (int*)(wtH + fsh * bx);
-    float* wtV = (float*)(ixH + fsh * bx);
-    int* ixV = (int*)(wtV + fsv * by);
-    int* lim = ixV + fsv * by;
-    float* tile = (float*)(lim + 2);
-    if (t == 0) { lim[0] = h; lim[1] = -1; }
-    aaTabFillS(wtH, ixH, bx, blockIdx.x * bx, bx, w, dw, fsh, dw - 1);
-    aaTabFillS(wtV, ixV, by, blockIdx.y * by, by, h, dh, fsv, dh - 1);
-    for (int e = t; e < by * fsv; e += nt)
-    {
-        atomicMin(&lim[0], ixV[e]);
-        atomicMax(&lim[1], ixV[e]);
-    }
-    __syncthreads();
-    const int r0 = lim[0], nr = lim[1] - lim[0] + 1;
-    if (nr > rcap) return;
-    for (int e = t; e < nr * bx; e += nt)
-    {
-        const int r = e / bx, c = e - r * bx;
-        const size_t row = (size_t)(r0 + r) * rowStride;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-        for (int k = 0; k < fsh; k++)
-        {
-            const float wt = wtH[k * bx + c];
-            const size_t o = row + ixH[k * bx + c];
-            a0 += wt * restTap(src, half, o);
-            a1 += wt * restTap(src, half, planeStride + o);
-            a2 += wt * restTap(src, half, 2 * planeStride + o);
-        }
-        tile[r * bx + c] = a0;
-        tile[(nr + r) * bx + c] = a1;
-        tile[(2 * nr + r) * bx + c] = a2;
-    }
-    __syncthreads();
-    const int x = blockIdx.x * bx + threadIdx.x, oy = blockIdx.y * by + threadIdx.y;
-    if (x >= dw || oy >= dh) return;
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-    for (int k = 0; k < fsv; k++)
-    {
-        const float wt = wtV[k * by + threadIdx.y];
-        const int r = ixV[k * by + threadIdx.y] - r0;
-        a0 += wt * tile[r * bx + threadIdx.x];
-        a1 += wt * tile[(nr + r) * bx + threadIdx.x];
-        a2 += wt * tile[(2 * nr + r) * bx + threadIdx.x];
-    }
-    const size_t plane = (size_t)dw * dh;
-    const size_t o = (size_t)oy * dw + x;
-    dst[o] = a0 < 0.0f ? 0.0f : (a0 > 1.0f ? 1.0f : a0);
-    dst[plane + o] = a1 < 0.0f ? 0.0f : (a1 > 1.0f ? 1.0f : a1);
-    dst[2 * plane + o] = a2 < 0.0f ? 0.0f : (a2 > 1.0f ? 1.0f : a2);
-}
-
-// the enlarging fold's source: the 4x output clamped to fp32 planar (then k_fitPlanar)
+// an engine's output clamped to fp32 planar, python's torch.clamp(out, 0, 1) (GMFSS's output)
 __global__ void k_restToF(const void* __restrict__ src, int half, int n, float* __restrict__ dst)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2356,66 +1931,6 @@ __global__ void k_motionIn(const float* __restrict__ src, int sps, int srs, int 
     dst[(size_t)dps + d] = f2h(v[1]);
     dst[2 * (size_t)dps + d] = f2h(v[2]);
 }
-// live, the working size = the capture and nothing between the pack and the motion frame: k_packInDirect (hdr 0) or
-// k_packInDirectHdr (hdr 1), k_motionIn (mode = hdr) on the values it packs and, with prev set, k_pairDiff of the
-// planes against prev (its flag contract) in one pass; the motion frame shares the planes' pad (ph x pw, planeStride),
-// every output bit for bit what the three kernels make. tex != 0: the capture is read from the capture array itself
-// (a point-sampled texture object, element reads: SDR the four bytes as integers, HDR the four halves widened to fp32
-// like h2f), not from src; raw (SDR) then gets each capture texel's four bytes, the copy the raw passthrough reads.
-__global__ void k_packInMotion(const void* __restrict__ src, unsigned long long tex, unsigned int* __restrict__ raw,
-                               int hdr, int cw, int ch, float* __restrict__ dst, unsigned short* __restrict__ mdst,
-                               int ph, int pw, int planeStride, float sdrWhite, float knee, float cap,
-                               const float* __restrict__ prev, int* __restrict__ flag)
-{
-    const int ox = blockIdx.x * blockDim.x + threadIdx.x;
-    const int oy = blockIdx.y * blockDim.y + threadIdx.y;
-    if (ox >= pw || oy >= ph) return;
-    const int sx = ox < cw ? ox : cw - 1;
-    const int sy = oy < ch ? oy : ch - 1;
-    const size_t s = ((size_t)sy * cw + sx) * 4;
-    float v[3];
-    if (tex)
-    {
-        const float fx = sx + 0.5f, fy = sy + 0.5f;
-        if (hdr)
-        {
-            float r, g, b, a;
-            asm("tex.2d.v4.f32.f32 {%0, %1, %2, %3}, [%4, {%5, %6}];"
-                : "=f"(r), "=f"(g), "=f"(b), "=f"(a) : "l"(tex), "f"(fx), "f"(fy));
-            scrgb_to_pq2020(r, g, b, v[0], v[1], v[2]);
-        }
-        else
-        {
-            unsigned int q[4];
-            asm("tex.2d.v4.u32.f32 {%0, %1, %2, %3}, [%4, {%5, %6}];"
-                : "=r"(q[0]), "=r"(q[1]), "=r"(q[2]), "=r"(q[3]) : "l"(tex), "f"(fx), "f"(fy));
-            for (int c = 0; c < 3; c++)
-                v[c] = q[2 - c] * (1.0f / 255.0f);
-            if (raw && ox < cw && oy < ch)
-                raw[(size_t)oy * cw + ox] = q[0] | q[1] << 8 | q[2] << 16 | q[3] << 24;
-        }
-    }
-    else if (hdr)
-    {
-        const unsigned short* p = (const unsigned short*)src + s;
-        scrgb_to_pq2020(h2f(p[0]), h2f(p[1]), h2f(p[2]), v[0], v[1], v[2]);
-    }
-    else
-    {
-        const unsigned char* p = (const unsigned char*)src + s;
-        for (int c = 0; c < 3; c++)
-            v[c] = p[2 - c] * (1.0f / 255.0f);
-    }
-    const size_t o = (size_t)oy * pw + ox;
-    for (int c = 0; c < 3; c++)
-        dst[(size_t)c * planeStride + o] = v[c];
-    if (prev && !*flag &&
-        (prev[o] != v[0] || prev[(size_t)planeStride + o] != v[1] || prev[2 * (size_t)planeStride + o] != v[2]))
-        *flag = 1;
-    motionEnc(v, hdr, sdrWhite, knee, cap);
-    for (int c = 0; c < 3; c++)
-        mdst[(size_t)c * planeStride + o] = f2h(v[c]);
-}
 
 // ---- GMFSS and Restore on HDR planes: the SDR view at the model boundary ---------------------------
 // Both synthesise pixels (GMFSS the tweens, Restore the frame) and were trained on SDR sRGB pictures: on PQ codes they
@@ -3372,16 +2887,18 @@ extern "C" __global__ void k_drbaDrmNorm(const long long* __restrict__ acc, cons
         ((float*)out)[i] = v;
 }
 
-// GMFlow's local correlation (gmflow_bidir's 1/4-scale window around the current flow, between its two engines):
-// out[b, p, k] = the dot of q[b, p, :] with f bilinearly sampled at the window position g[b, p, k] (GridSample's
-// rules: align_corners, zero padding). The window's samples share one fractional offset, so their taps lie on a small
-// integer grid: one warp a pixel takes the grid's dot products once (float4 lanes over the 128 channels, kept in
-// shared memory, one cell of margin for rounding), then each sample combines its 4 corners with its own weights.
-// Never builds the [B, 128, HW, K] product the engine wrote. q [B, HW, 128] and f [B, H, W, 128] channels-last,
-// g [B, HW, K, 2] normalized; 128 threads a block, one warp a pixel.
+// GMFlow's local correlation (gmflow_bidir's 1/4-scale window, between its two engines): out[b, p, k] = the dot of
+// q[b, p, :] with f bilinearly sampled at window sample k of pixel p (GridSample's rules: align_corners, zero padding).
+// The window position is GMFlow's normalize_coords of the pixel's grid point plus the sample's offset, computed here:
+// pixel p = y W + x, sample k = (dy + r) side + (dx + r) with side x side = K, g = ((x + dx) - c) / c, c = (W - 1) / 2
+// (and y alike), with normalize_coords' IEEE divide (bit for bit TensorRT-RTX's run of that graph at every quarter
+// grid). The window's samples share one fractional offset, so their taps lie on a small integer grid: one warp a
+// pixel takes the grid's dot products once (float4 lanes over the 128 channels, kept in shared memory, one cell of
+// margin for rounding), then each sample combines its 4 corners with its own weights. Never builds the
+// [B, 128, HW, K] product the engine wrote. q [B, HW, 128] and f [B, H, W, 128] channels-last; 128 threads a block,
+// one warp a pixel.
 extern "C" __global__ void k_localCorr(const float* __restrict__ q, const float* __restrict__ f,
-                                       const float* __restrict__ g, float* __restrict__ out, int B, int H, int W,
-                                       int HW, int K)
+                                       float* __restrict__ out, int B, int H, int W, int HW, int K)
 {
     __shared__ float dots[4][144];
     const int wib = threadIdx.x >> 5;
@@ -3391,12 +2908,17 @@ extern "C" __global__ void k_localCorr(const float* __restrict__ q, const float*
     const int b = warp / HW, p = warp % HW;
     const float4 qv = reinterpret_cast<const float4*>(q + ((size_t)b * HW + p) * 128)[lane];
     const float* fb = f + (size_t)b * H * W * 128;
-    const float* gp = g + ((size_t)b * HW + p) * K * 2;
+    int side = 1;
+    while (side * side < K) side++;
+    const int r = side / 2, px = p % W, py = p / W;
+    const float cxn = 0.5f * (float)(W - 1), cyn = 0.5f * (float)(H - 1);
     float mnx = 1e30f, mny = 1e30f;
     for (int k = lane; k < K; k += 32)
     {
-        mnx = fminf(mnx, floorf((gp[2 * k] + 1.f) * 0.5f * (float)(W - 1)));
-        mny = fminf(mny, floorf((gp[2 * k + 1] + 1.f) * 0.5f * (float)(H - 1)));
+        const float gx = __fdiv_rn((float)(px + k % side - r) - cxn, cxn);
+        const float gy = __fdiv_rn((float)(py + k / side - r) - cyn, cyn);
+        mnx = fminf(mnx, floorf((gx + 1.f) * 0.5f * (float)(W - 1)));
+        mny = fminf(mny, floorf((gy + 1.f) * 0.5f * (float)(H - 1)));
     }
     for (int o = 16; o; o >>= 1)
     {
@@ -3404,8 +2926,6 @@ extern "C" __global__ void k_localCorr(const float* __restrict__ q, const float*
         mny = fminf(mny, __shfl_xor_sync(0xffffffffu, mny, o));
     }
     const int ox = (int)mnx, oy = (int)mny;
-    int side = 1;
-    while (side * side < K) side++;
     const int gs = side + 2;
     for (int t = 0; t < gs * gs; t++)
     {
@@ -3423,14 +2943,20 @@ extern "C" __global__ void k_localCorr(const float* __restrict__ q, const float*
     __syncwarp();
     for (int k = lane; k < K; k += 32)
     {
-        const float x = (gp[2 * k] + 1.f) * 0.5f * (float)(W - 1);
-        const float y = (gp[2 * k + 1] + 1.f) * 0.5f * (float)(H - 1);
+        const float gx = __fdiv_rn((float)(px + k % side - r) - cxn, cxn);
+        const float gy = __fdiv_rn((float)(py + k / side - r) - cyn, cyn);
+        const float x = (gx + 1.f) * 0.5f * (float)(W - 1);
+        const float y = (gy + 1.f) * 0.5f * (float)(H - 1);
         const float x0f = floorf(x), y0f = floorf(y);
         const float ax = x - x0f, ay = y - y0f;
         const int cx = (int)x0f - ox, cy = (int)y0f - oy;
         const float* d = dots[wib] + cy * gs + cx;
-        out[((size_t)b * HW + p) * K + k] = (1.f - ay) * ((1.f - ax) * d[0] + ax * d[1]) +
-                                            ay * ((1.f - ax) * d[gs] + ax * d[gs + 1]);
+        // the bilinear combine with its roundings pinned (which product is rounded, which one fused), so the
+        // correlation does not move with the compiler's contraction choices
+        const float bx = 1.f - ax, by = 1.f - ay;
+        const float top = __fmaf_rn(d[1], ax, __fmul_rn(d[0], bx));
+        const float bot = __fmaf_rn(ax, d[gs + 1], __fmul_rn(d[gs], bx));
+        out[((size_t)b * HW + p) * K + k] = __fmaf_rn(by, top, __fmul_rn(ay, bot));
     }
 }
 
@@ -3591,187 +3117,118 @@ extern "C" __global__ void __launch_bounds__(128) k_attn2(const unsigned* __rest
         }
     }
 }
-// k_attn2b: k_attn2 with the key tiles double-buffered through cp.async (the next tile loads while this one computes)
-// and the key fragments read by ldmatrix.x4 (four 8 x 8 matrices a load: b0 / b1 of two k-steps); bit-identical to
-// k_attn2, faster at small N only (the host's kAttn2bMaxN)
-__device__ __forceinline__ unsigned attnSmem(const void* p)
-{
-    unsigned a;
-    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
-    return a;
-}
-// one key tile (rows j0 .. j0 + 63) and its values into a stage: a 16-byte cp.async per (row, 16-byte column), rows
-// past n zero-filled; the values as k_attn2 reads them
-__device__ __forceinline__ void attnLoad(unsigned* sk, float* sv, const unsigned* kb, const float* vb, int j0, int n,
-                                         int mode, int gw)
-{
-    for (int e = threadIdx.x; e < AT_KT * (AT_W / 4); e += 128)
-    {
-        const int row = e / (AT_W / 4), c4 = e % (AT_W / 4);
-        const unsigned dst = attnSmem(sk + row * AT_SP + c4 * 4);
-        const unsigned* src = kb + (size_t)(j0 + (j0 + row < n ? row : 0)) * AT_W + c4 * 4;
-        const int bytes = j0 + row < n ? 16 : 0;
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(bytes));
-    }
-    if (threadIdx.x < AT_KT * 2)
-    {
-        const int j = j0 + (int)(threadIdx.x >> 1), c = threadIdx.x & 1;
-        sv[threadIdx.x] = j >= n ? 0.f : (mode & 1) ? (float)(c ? j / gw : j % gw) : vb[(size_t)j * 2 + c];
-    }
-    asm volatile("cp.async.commit_group;");
-}
-extern "C" __global__ void __launch_bounds__(128) k_attn2b(const unsigned* __restrict__ q,
-                                                           const unsigned* __restrict__ k,
-                                                           const float* __restrict__ v, void* __restrict__ o, int n,
-                                                           int kswap, float scale2, int mode, int gw)
-{
-    __shared__ __align__(16) unsigned sk[2][AT_KT * AT_SP];
-    __shared__ float sv[2][AT_KT * 2];
-    const float ninf = __int_as_float(0xff800000);
-    const int b = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int g = lane >> 2, t4 = lane & 3;
-    const int r0 = blockIdx.x * 64 + warp * 16 + g, r1 = r0 + 8;
-    const unsigned* qb = q + (size_t)b * n * AT_W;
-    const unsigned* kb = k + (size_t)(b ^ kswap) * n * AT_W;
-    const float* vb = v + (size_t)b * n * 2;
-    unsigned qa[8][4];
-#pragma unroll
-    for (int s = 0; s < 8; ++s)
-    {
-        qa[s][0] = r0 < n ? qb[(size_t)r0 * AT_W + s * 8 + t4] : 0u;
-        qa[s][1] = r1 < n ? qb[(size_t)r1 * AT_W + s * 8 + t4] : 0u;
-        qa[s][2] = r0 < n ? qb[(size_t)r0 * AT_W + s * 8 + 4 + t4] : 0u;
-        qa[s][3] = r1 < n ? qb[(size_t)r1 * AT_W + s * 8 + 4 + t4] : 0u;
-    }
-    // ldmatrix: lane L addresses row L & 7 of matrix L >> 3 = the half columns s * 16 + (L >> 3) * 8 of key t * 8 +
-    // (L & 7); the four matrices = b0 / b1 of k-step s and of s + 1
-    const int lrow = lane & 7, lcol = (lane >> 3) * 4;
-    float m0 = ninf, m1 = ninf, l0 = 0.f, l1 = 0.f, x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f;
-    attnLoad(sk[0], sv[0], kb, vb, 0, n, mode, gw);
-    int st = 0;
-    for (int j0 = 0; j0 < n; j0 += AT_KT, st ^= 1)
-    {
-        if (j0 + AT_KT < n)
-        {
-            attnLoad(sk[st ^ 1], sv[st ^ 1], kb, vb, j0 + AT_KT, n, mode, gw);
-            asm volatile("cp.async.wait_group 1;");
-        }
-        else
-            asm volatile("cp.async.wait_group 0;");
-        __syncthreads();
-        float acc[8][4];
-#pragma unroll
-        for (int t = 0; t < 8; ++t)
-        {
-            acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
-            const unsigned base = attnSmem(sk[st] + (t * 8 + lrow) * AT_SP + lcol);
-#pragma unroll
-            for (int s = 0; s < 8; s += 2)
-            {
-                unsigned f0, f1, f2, f3;
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                             : "=r"(f0), "=r"(f1), "=r"(f2), "=r"(f3)
-                             : "r"(base + s * 32));
-                attnMma(acc[t], qa[s], f0, f1);
-                attnMma(acc[t], qa[s + 1], f2, f3);
-            }
-        }
-        float mx0 = m0, mx1 = m1;
-#pragma unroll
-        for (int t = 0; t < 8; ++t)
-#pragma unroll
-            for (int c = 0; c < 2; ++c)
-            {
-                const bool in = j0 + t * 8 + t4 * 2 + c < n;
-                acc[t][c] = in ? acc[t][c] * scale2 : ninf;
-                acc[t][2 + c] = in ? acc[t][2 + c] * scale2 : ninf;
-                mx0 = fmaxf(mx0, acc[t][c]);
-                mx1 = fmaxf(mx1, acc[t][2 + c]);
-            }
-        mx0 = attnQuad(mx0, true);
-        mx1 = attnQuad(mx1, true);
-        const float c0 = attnEx2(m0 - mx0), c1 = attnEx2(m1 - mx1);
-        l0 *= c0;
-        x0 *= c0;
-        y0 *= c0;
-        l1 *= c1;
-        x1 *= c1;
-        y1 *= c1;
-        const float* svs = sv[st];
-#pragma unroll
-        for (int t = 0; t < 8; ++t)
-#pragma unroll
-            for (int c = 0; c < 2; ++c)
-            {
-                const int key = t * 8 + t4 * 2 + c;
-                const float vx = svs[key * 2], vy = svs[key * 2 + 1];
-                const float p0 = attnEx2(acc[t][c] - mx0), p1 = attnEx2(acc[t][2 + c] - mx1);
-                l0 += p0;
-                x0 += p0 * vx;
-                y0 += p0 * vy;
-                l1 += p1;
-                x1 += p1 * vx;
-                y1 += p1 * vy;
-            }
-        m0 = mx0;
-        m1 = mx1;
-        __syncthreads();
-    }
-    l0 = attnQuad(l0, false);
-    x0 = attnQuad(x0, false);
-    y0 = attnQuad(y0, false);
-    l1 = attnQuad(l1, false);
-    x1 = attnQuad(x1, false);
-    y1 = attnQuad(y1, false);
-    if (t4 != 0)
-        return;
-    for (int h = 0; h < 2; ++h)
-    {
-        const int r = h ? r1 : r0;
-        if (r >= n)
-            continue;
-        float ox = (h ? x1 / l1 : x0 / l0), oy = (h ? y1 / l1 : y0 / l0);
-        if (mode & 2)
-        {
-            ox -= (float)(r % gw);
-            oy -= (float)(r / gw);
-        }
-        const size_t at = ((size_t)b * n + r) * 2;
-        if (mode & 4)
-        {
-            unsigned short hx, hy;
-            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hx) : "f"(ox));
-            asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hy) : "f"(oy));
-            ((unsigned short*)o)[at] = hx;
-            ((unsigned short*)o)[at + 1] = hy;
-        }
-        else
-        {
-            ((float*)o)[at] = ox;
-            ((float*)o)[at + 1] = oy;
-        }
-    }
-}
 #undef AT_W
 #undef AT_KT
 #undef AT_SP
 
+// GMFSS fusion's tail on the host: fusionnet ends at its 64 -> 256 conv (`out`, the pre-shuffle tensor at the half,
+// fp16 [256][hh][hw]); pixel_shuffle(2) (CRD: channel 4c + 2 sy + sx = phase (sy, sx) of channel c) and conv_last
+// (64 -> 3, 3x3, zero padding at the full size) run here in one pass, fp32 sums over the graph's own fp16 weights (the
+// engine's outputs w_last [3][64][3][3] / b_last [3]), the frame written fp32 planar [3][2 hh][2 hw]. One thread = 2 x 2
+// half pixels = a 4 x 4 full block; per input channel its 6 x 6 full window (full row 2 y0 - 1 + r = half row
+// y0 - 1 + (r + 1) / 2 of phase plane sy = r even, columns alike) comes from 24 aligned pairs (half2), two a phase
+// plane a row; a full row or column outside the frame reads 0 (zero padding; hh and hw are multiples of 4, the setup's
+// check, so every pair inside the frame is whole). Every fixed-size loop unrolls, so the window, the sums and the
+// weights stay in registers. clamp01 != 0 = python's torch.clamp(out, 0, 1) on the way out (restTap's form).
+__global__ void k_fuTail(const unsigned short* __restrict__ pre, const unsigned short* __restrict__ wl,
+                         const unsigned short* __restrict__ bl, float* __restrict__ out, int hh, int hw, int clamp01)
+{
+    __shared__ float sw[64 * 27]; // [c][o * 9 + ky * 3 + kx]: one channel's 27 weights side by side
+    __shared__ float sb[3];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    for (int i = tid; i < 3 * 64 * 9; i += blockDim.x * blockDim.y)
+    {
+        const int o = i / 576, c = (i % 576) / 9, k = i % 9;
+        sw[c * 27 + o * 9 + k] = h2f(wl[i]);
+    }
+    if (tid < 3)
+        sb[tid] = h2f(bl[tid]);
+    __syncthreads();
+    const int x0 = 2 * (blockIdx.x * blockDim.x + threadIdx.x), y0 = 2 * (blockIdx.y * blockDim.y + threadIdx.y);
+    if (x0 >= hw || y0 >= hh)
+        return;
+    const int fh = 2 * hh;
+    const size_t plane = (size_t)hh * hw;
+    size_t rowOff[6];
+    bool rowOk[6];
+#pragma unroll
+    for (int r = 0; r < 6; ++r)
+    {
+        const int R = 2 * y0 - 1 + r;
+        rowOk[r] = R >= 0 && R < fh;
+        rowOff[r] = rowOk[r] ? (size_t)(2 * (R & 1)) * plane + (size_t)(R >> 1) * hw : 0;
+    }
+    const bool left = x0 >= 2, right = x0 + 2 < hw;
+    float acc[3][4][4];
+#pragma unroll
+    for (int o = 0; o < 3; ++o)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                acc[o][i][j] = sb[o];
+    for (int c = 0; c < 64; ++c)
+    {
+        const unsigned short* p = pre + (size_t)(4 * c) * plane;
+        float v[6][6];
+#pragma unroll
+        for (int r = 0; r < 6; ++r)
+        {
+            unsigned int a = 0, b = 0, cc = 0, d = 0;
+            if (rowOk[r])
+            {
+                const unsigned short* q0 = p + rowOff[r] + x0; // phase sx = 0: half columns x0, x0 + 1, x0 + 2
+                const unsigned short* q1 = q0 + plane;         // phase sx = 1: half columns x0 - 1, x0, x0 + 1
+                a = *(const unsigned int*)q0;
+                d = *(const unsigned int*)q1;
+                if (right)
+                    b = *(const unsigned int*)(q0 + 2);
+                if (left)
+                    cc = *(const unsigned int*)(q1 - 2);
+            }
+            v[r][0] = h2f((unsigned short)(cc >> 16));
+            v[r][1] = h2f((unsigned short)(a & 0xFFFFu));
+            v[r][2] = h2f((unsigned short)(d & 0xFFFFu));
+            v[r][3] = h2f((unsigned short)(a >> 16));
+            v[r][4] = h2f((unsigned short)(d >> 16));
+            v[r][5] = h2f((unsigned short)(b & 0xFFFFu));
+        }
+        float w[27];
+#pragma unroll
+        for (int k = 0; k < 27; ++k)
+            w[k] = sw[c * 27 + k];
+#pragma unroll
+        for (int o = 0; o < 3; ++o)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+#pragma unroll
+                    for (int ky = 0; ky < 3; ++ky)
+#pragma unroll
+                        for (int kx = 0; kx < 3; ++kx)
+                            acc[o][i][j] += v[i + ky][j + kx] * w[o * 9 + ky * 3 + kx];
+    }
+    if (clamp01)
+#pragma unroll
+        for (int o = 0; o < 3; ++o)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    acc[o][i][j] = acc[o][i][j] < 0.0f ? 0.0f : (acc[o][i][j] > 1.0f ? 1.0f : acc[o][i][j]);
+    const int fw = 2 * hw;
+#pragma unroll
+    for (int o = 0; o < 3; ++o)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            *(float4*)(out + (size_t)o * fh * fw + (size_t)(2 * y0 + i) * fw + 2 * x0) =
+                make_float4(acc[o][i][0], acc[o][i][1], acc[o][i][2], acc[o][i][3]);
+}
+
 }
 
 )CUDASRC";
-
-// the Lanczos radii of the host's resizes, read once from the kernel text's #defines (the one
-// place they are set), and the kernels' rsTaps for the host's launch sizes
-static int lzDefine(const char* name)
-{
-    const char* p = strstr(kNativeKernels, name);
-    return p ? atoi(p + strlen(name)) : 0;
-}
-static const int kLzUp = lzDefine("#define kLzUp "), kLzDown = lzDefine("#define kLzDown ");
-static int lzTaps(long long in, long long out)
-{
-    return in > out ? 2 * (int)((kLzDown * in + out - 1) / out) : 2 * kLzUp;
-}
 
 // ---- dynamically resolved entry points ----------------------------------------------------
 // nvrtc ships no import library in the runtime wheel, so it is resolved by hand; cudart, the
@@ -4197,9 +3654,10 @@ static NativeTrtLogger g_nativeTrtLogger;
 // computes the matching and its propagation between `_m` and A (k_attn2) and gmflow's local correlation between A and B,
 // and hands `_m` and A each frame's backbone maps once
 constexpr int kGmN = 8;
-// A's outputs in this order (trt_runtime.gmflow_split's contract): q and f feed k_localCorr with coords, the rest
-// go to B beside the correlation
-static const char* const kGmA[8] = {"q", "f", "coords", "win", "valid", "flow0", "feat", "flow1"};
+// A's outputs in this order (trt_runtime.gmflow_split's contract): q and f feed k_localCorr (which computes the window
+// positions itself), flow0 and feat go to B beside the correlation
+constexpr int kGmAn = 4;
+static const char* const kGmA[kGmAn] = {"q", "f", "flow0", "feat"};
 
 struct NativeRife
 {
@@ -4227,8 +3685,7 @@ struct NativeRife
     bool vsrFailed = false; // a mid-run eval failed: Lanczos for the rest of the run
     RtxVsrSetting vsrSet{4};
     double vsrMs = 0.0, vsrMaxMs = 0.0;
-    bool vsrAsync = false;    // the evals ran through the bridge's event-ordered export (vsrMs not timed)
-    bool fitUpLogged = false; // the fit's enlarge-in-one-kernel line was logged
+    bool vsrAsync = false; // the evals ran through the bridge's event-ordered export (vsrMs not timed)
     uint64_t vsrN = 0;
     // the shrinking fit: the Lanczos pair (k_fitAaH / V) into the staging frame
     bool fitAa = false; // the fit to (dw, dh) changes the size: the separable Lanczos pair
@@ -4238,8 +3695,7 @@ struct NativeRife
     // (dw, dh) like any frame. 0 = off (also when it equals the
     // fit rect: one resize, not two).
     int uw = 0, uh = 0;
-    bool upAa = false;   // the first resize shrinks the height (uh < h)
-    bool upTile = false; // the first resize runs as k_fitAaTile (decided with dUpTmp)
+    bool upAa = false; // the first resize shrinks the height (uh < h)
     // live Restore: the handoff builds the
     // Real-ESRGAN TensorRT engine into the shared cache and hands its path over like the
     // IFNet's; the host runs it on every presented frame before the upscale, then folds the 4x
@@ -4270,7 +3726,7 @@ struct NativeRife
     nvinfer1::IExecutionContext* ctxGm[kGmN] = {};
     // between gmflow's halves: A's outputs (kGmA order), the correlation k_localCorr writes for B, and the shapes it
     // runs at (the quarter grid gmH x gmW, gmK window samples a pixel)
-    void* dGmA[8] = {};
+    void* dGmA[kGmAn] = {};
     // A's inputs map4 / map8 [2, 128, ...] in the backbone's dtype: batch slot 0 = the previous frame, 1 = the new one;
     // gmMapSlot = one frame's bytes of each; gmMapsNext = slot 1 holds the frame the next call reads as its previous
     // one, taken on view gmMapsKind (0 the pictures, 1 the SDR view, 2 the motion view)
@@ -4287,7 +3743,6 @@ struct NativeRife
     void* dGmProp = nullptr;
     int gmN8 = 0, gmW8 = 0;
     bool gmPropHalf = false;
-    bool gmAttnB = false; // the matching and propagation run k_attn2b (N <= kAttn2bMaxN)
     // the chain's contract, read off the engines in nativeGmfssSetup (never from the handoff
     // line, the 5a rule), and the planar NCHW buffers it sizes from that. Levels: the half
     // (hh, hw), the quarter and the eighth, exactly GMFSS_infer_u's feature pyramid.
@@ -4300,13 +3755,17 @@ struct NativeRife
     void* dGmMetric = nullptr;   // (2, hh, hw) in the engine's dtype: m0 then m1
     float* dGmFlowP[2] = {};     // the flow pyramids at the quarter / eighth, pre-scaled
     float* dGmMetP[2] = {};      // the metric pyramids at the quarter / eighth (fp32)
-    long long* dGmAcc = nullptr; // the splat accumulator, max(C) + 1 planes of the half
+    long long* dGmAcc = nullptr; // the splat accumulator, max(C) + 1 planes of the half; with gmTail it also holds the
+                                 // cut fusionnet's out (256 fp16 planes, free from the splats' end to the next clear)
+    bool gmTail = false;         // the cut fusionnet (out = the pre-shuffle tensor): k_fuTail does shuffle + conv_last
+    void* dGmWl = nullptr;       // the cut fusionnet's w_last (3, 64, 3, 3) fp16: conv_last's weight
+    void* dGmBl = nullptr;       // its b_last (3) fp16: conv_last's bias
     float* dGmFa = nullptr;      // fusionnet a (9, half): I1t, merged (ifnet writes it), I2t
     void* dGmFb = nullptr;       // fusionnet b (2 * gmC[0], half) in the engine's dtype
     void* dGmFc = nullptr;       // fusionnet c (2 * gmC[1], quarter), the same dtype
     void* dGmFd = nullptr;       // fusionnet d (2 * gmC[2], eighth), the same dtype
     float* dGmT = nullptr;       // the timestep, one device float (ifnet's 1x1x1x1 input)
-    void* dGmOut = nullptr;      // the fusionnet output (3, ph, pw) in the engine's dtype
+    void* dGmOut = nullptr;      // the fusionnet output (3, ph, pw) in the engine's dtype (gmTail: k_fuTail's, fp32)
     float* dGmF = nullptr;       // that output clamped to fp32: what storeSlot consumes
     // HDR planes (nativeGmfssPair): the SDR view of one padded frame (hdrToModel, the scratch), the motion view's
     // halves gmflow and metricnet read on a pair outside the SDR range, the range flag (device, pinned host copy);
@@ -4549,7 +4008,6 @@ struct NativeRife
     void* dRestIn = nullptr;   // x: NCHW at the source size (srcW x srcH), fp16 (or fp32)
     void* dRestOut = nullptr;  // y: NCHW 4x, the engine's dtype
     float* dRestTmp = nullptr; // the fold's horizontal pass, planar fp32 at (4h) x max target width
-    float* dRestF = nullptr;   // the enlarging fold only: y as clamped fp32 planar
     float* dRest = nullptr;    // the fold back to the model size (VSR follows), planar fp32 w x h
     float* dRestRem = nullptr; // HDR planes: the source fitted to Restore's target (k_hdrRestOut's remainder)
 
@@ -4583,12 +4041,10 @@ struct NativeRife
     cudaExternalSemaphore_t semCap = nullptr;
     cudaMipmappedArray_t capMip = nullptr;
     cudaArray_t capArr = nullptr;
-    // capArr as a point-sampled texture: the live 1:1 pack reads the capture through it, no copy to dCap first (0 = the
-    // copy, SMV_CAP_DIRECT=0 or a refused texture)
-    cudaTextureObject_t capTex = 0;
     uint8_t* dOutRing = nullptr;
     uint8_t* dCap = nullptr;
-    float* dTmp = nullptr;
+    float* dTmp = nullptr; // the capture resize's horizontal pass, and nativeFitPlanar's (tmpN floats)
+    size_t tmpN = 0;
     float* dCapF = nullptr;       // HDR + image scale under 1: planar PQ at capture resolution
     uint8_t* dThdrIn = nullptr;   // BGRA8 bridge input, pitch 4*cw
     uint32_t* dThdrOut = nullptr; // packed 10:10:10:2 bridge output, B in the low bits
@@ -4716,22 +4172,16 @@ struct NativeRife
     int fCur = 0;
     cudaEvent_t capEv = nullptr;
     std::vector<cudaEvent_t> slotEv;
-    // live: a captured frame's own passes timed on the GPU (the capture read through Sharpen / RTX HDR and the motion
-    // frame; pfEv[1] = where the part at the working size starts, after Restore / the resize), smoothed, in
-    // microseconds for the present loop's Auto step (it reads them at its stats tick)
-    cudaEvent_t pfEv[3] = {};
-    bool pfArmed = false;
-    double pfAllMs = 0.0, pfWorkMs = 0.0;
-    std::atomic<uint32_t> pfAllUs{0}, pfWorkUs{0};
+    // live: the capture read's GPU time stamp, where a group's own GPU time starts (grEv below)
+    cudaEvent_t pfEv[1] = {};
     // live: a group's own GPU time for the present loop's throttle, from pfEv[0] (the capture read): grEv[0] where the
     // slots start (after the pair's model work), grEv[1] after the last slot. Smoothed per kind of group, in
-    // microseconds: gIntUs = the work before the slots of a group with tweens, gTweenUs = one tween with its store,
-    // gBaseUs = a whole group without a tween (the real frame alone)
+    // microseconds: gIntUs = the work before the slots of a group with tweens, gTweenUs = one tween with its store
     cudaEvent_t grEv[2] = {};
     bool grArmed = false;
     uint32_t grTween = 0;
-    double gIntMs = 0.0, gTweenMs = 0.0, gBaseMs = 0.0;
-    std::atomic<uint32_t> gIntUs{0}, gTweenUs{0}, gBaseUs{0};
+    double gIntMs = 0.0, gTweenMs = 0.0;
+    std::atomic<uint32_t> gIntUs{0}, gTweenUs{0};
 
     CUmodule cuMod = nullptr;
     CUfunction fPackInDirect = nullptr, fResizeH = nullptr, fResizeV = nullptr, fH2f = nullptr, fF2h = nullptr,
@@ -4747,12 +4197,10 @@ struct NativeRife
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr,                        // FSR upscaling: VSR's BGRA8 <-> RGBA8
         fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,     // offline DLSS 4.5 frames
         fUnpackR10 = nullptr;
-    CUfunction fFitAaH = nullptr, fFitAaV = nullptr;        // the separable fit
-    CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr; // its vertical pass + the slot store
-    CUfunction fPackOutTile = nullptr;                      // both passes + the store, a shrinking height
-    CUfunction fFitAaTile = nullptr;                        // both passes into a planar target
+    CUfunction fFitAaH = nullptr, fFitAaV = nullptr;                          // the separable fit
+    CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                   // its vertical pass + the slot store
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr, // live Restore
-        fRestFoldTile = nullptr, fRestToF = nullptr, fClamp01 = nullptr;
+        fRestToF = nullptr, fClamp01 = nullptr;
     CUfunction fPadPlanar = nullptr;                                  // the decoded frame into the model frame
     CUfunction fNrIn = nullptr, fNrOut = nullptr, fNrMv = nullptr;    // DLSS 5
     CUfunction fNrInPq = nullptr, fNrOutPq = nullptr;                 // live DLSS 5 on HDR (PQ) planes
@@ -4766,7 +4214,6 @@ struct NativeRife
         fPpTop = nullptr, fPpUp = nullptr, fBlur1 = nullptr, fNvofCompose = nullptr;
     CUfunction fDrFlowSplat = nullptr, fDrFlowNorm = nullptr, // native DRBA
         fDrDrmSplat = nullptr, fDrDrmNorm = nullptr;
-    CUfunction fPackInMotion = nullptr; // live 1:1: the pack, the motion frame and the identical-pair test in one pass
     CUfunction fMotionIn = nullptr, fRifeBlend = nullptr, // RIFE's motion frame, its last step (the tween: fp16
         fRifeBlendF = nullptr;                            // store, fp32 store)
     CUfunction fRifeBlendOut = nullptr;                   // its last step fused with a 1:1 slot store (blendOut)
@@ -4776,7 +4223,7 @@ struct NativeRife
     CUfunction fHdrRestOut = nullptr;                                         // Restore's way back on HDR planes
     CUfunction fLocalCorr = nullptr;                                          // gmflow's local correlation, fused
     CUfunction fAttn2 = nullptr;  // gmflow's global matching and propagation (k_attn2)
-    CUfunction fAttn2b = nullptr; // the same, double-buffered (k_attn2b, gmAttnB)
+    CUfunction fFuTail = nullptr; // GMFSS fusion's pixel shuffle + conv_last on the cut graph's out (k_fuTail)
     int* dStaticFlag = nullptr;   // device flag k_pairDiff sets when the pair differs
     int* hStaticFlag = nullptr;   // pinned readback of it, one int per group
     uint64_t staticN = 0;         // identical pairs held this session
@@ -4987,44 +4434,9 @@ static const char* const kGmKey[kGmN] = {"gfeat", "gflow", "gmetric", "gifnet", 
 static const char* const kGmName[kGmN] = {"feat_ext",  "gmflow_bidir_a", "metricnet",       "ifnet",
                                           "fusionnet", "gmflow_bidir_b", "gmflow_backbone", "gmflow_bidir_a_m"};
 
-// gmflow_bidir_a with its quarter-scale transformer in 1 / 2 / 4 / 8 groups of whole windows (onnx_export.py
-// GMFLOW_CHUNKS): the most groups up to 8 that keep >= kGmChunkTokens quarter-scale tokens (both frames) a group, so a
-// group's tensors stay near the L2; fewer tokens a group cost more than they save
-static const char* const kGmFlowA[4] = {"gmflow_bidir_a", "gmflow_bidir_a_g2", "gmflow_bidir_a_g4",
-                                        "gmflow_bidir_a_g8"};
-static constexpr int64_t kGmChunkTokens = 4500;
-// from kGmRegionTokens a group up, the 8-group graph whose shifted blocks attend per mask region (onnx_export.py
-// GMFLOW_REGION_CHUNKS) instead of through the masked kernel: big windows gain (the 1440p DLAA half x0.94, the 4K half
-// x0.83), small ones lose to the extra calls (5,376 a group x1.03)
-static constexpr int64_t kGmRegionTokens = 9000;
-// the scale-0 matching's token count up to which k_attn2b runs instead of k_attn2 (bit-identical; 160 W, matching +
-// propagation: Ultra's 1,792 x0.88, Performance's 3,840 x1.07 and Balanced's 5,376 x1.16 slower); SMV_GM_ATTN2B=0 =
-// k_attn2 at every N
-static constexpr int kAttn2bMaxN = 1792;
-static const char* lkGmFlowA(int gh, int gw)
-{
-    const int64_t tokens = 2 * (int64_t)(gh / 4) * (gw / 4);
-    int i = 3;
-    while (i > 0 && (tokens >> i) < kGmChunkTokens)
-        --i;
-    if (i == 3 && (tokens >> 3) >= kGmRegionTokens)
-        return "gmflow_bidir_a_g8r";
-    return kGmFlowA[i];
-}
-
-// the `_m` graph cut from the same export as lkGmFlowA's pick (trt_runtime.gmflow_matching_cut)
-static const char* lkGmFlowM(int gh, int gw)
-{
-    static const char* const a[5] = {"gmflow_bidir_a", "gmflow_bidir_a_g2", "gmflow_bidir_a_g4", "gmflow_bidir_a_g8",
-                                     "gmflow_bidir_a_g8r"};
-    static const char* const m[5] = {"gmflow_bidir_a_m", "gmflow_bidir_a_g2_m", "gmflow_bidir_a_g4_m",
-                                     "gmflow_bidir_a_g8_m", "gmflow_bidir_a_g8r_m"};
-    const char* pick = lkGmFlowA(gh, gw);
-    for (int i = 0; i < 5; i++)
-        if (!strcmp(pick, a[i]))
-            return m[i];
-    return nullptr;
-}
+// the smallest GMFSS pad a side (lkSession): gmflow's quarter-scale windows are the pad / 64 a side, and its shifted
+// blocks attend per region of half a window (transformer._region_attention_tokens), so a window needs 2 tokens a side
+static constexpr int kGmMinPad = 128;
 
 // Upscale to: _Fit.__init__'s derivation of the
 // internal render size from the exe's own --upscale H and the handoff geometry: the factor
@@ -5035,7 +4447,7 @@ static const char* lkGmFlowM(int gh, int gw)
 static void nativeDeriveUpscale(NativeRife& nr)
 {
     nr.uw = nr.uh = 0;
-    nr.upAa = nr.upTile = false;
+    nr.upAa = false;
     nr.fitAa = nr.dw != nr.w || nr.dh != nr.h;
     if (g_upscaleH > 0 && g_upscaleH != nr.h && nr.h > 0)
     {
@@ -5480,15 +4892,8 @@ static void lkFitRect(int w, int h, int outW, int outH, int& dw, int& dh, int& x
     y0 = (outH - dh) / 2; // python // on non-negative values
 }
 
-// NVIDIA's DLSS modes as plan.ts has them (DLSS_MODES, autoMode): the working size's share of the output per
-// kDlssModeName entry, and Auto's pick by the output's pixel count (below 1920x1080 DLAA, up to 2560x1440
-// Quality, up to 3840x2160 Performance, else Ultra Performance), as 1 + the kDlssModeName index
-static const double kDlssModeShare[6] = {1.0, 1.0, 1.0 / 1.5, 1.0 / 1.724, 1.0 / 2, 1.0 / 3};
-static int liveAutoMode(int w, int h)
-{
-    const double px = (double)w * h;
-    return px < 1920.0 * 1080 ? 2 : (px <= 2560.0 * 1440 ? 3 : (px <= 3840.0 * 2160 ? 5 : 6));
-}
+// NVIDIA's DLSS modes as plan.ts has them (DLSS_MODES): the working size's share of the output per kDlssModeName entry
+static const double kDlssModeShare[5] = {1.0, 1.0 / 1.5, 1.0 / 1.724, 1.0 / 2, 1.0 / 3};
 
 // DLSS 5's GPU work never completes on a 64 px wide frame (the GPU resets; 102 and 128 px wide run, and so does a
 // 64 px high one): with DLSS 5 on, a working size below the presented rect is at least this wide, and a frame that is
@@ -5501,9 +4906,7 @@ static const int kNrMinWorkW = 128, kNrMinWorkH = 64;
 // (aspect kept) until the shorter side is 64 px and, with DLSS 5, the width kNrMinWorkW (*raised: 1 = the 64 px
 // floor, 2 = DLSS 5's width), capped at 3840x2160 keeping the aspect (offline's workPlan). DLAA = the presented rect itself (in window
 // mode the capture, odd sizes kept). liveWorkSizeFor = the size a mode gives the presented presW x presH (mode = 1 +
-// the kDlssModeName index, 0 = --scale's share); liveWorkSize = the session's: Auto picks the mode by the presented
-// pixel count, no larger than the GPU-time step's --auto-floor, or takes the one the free video memory fits
-// (g_liveAutoFit, picked once a session before anything loads), and says which mode it came from.
+// the kDlssModeName index, 0 = --scale's share); liveWorkSize = the session's, and the mode it came from.
 static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh, int* raised = nullptr)
 {
     double f = 1.0;
@@ -5541,8 +4944,7 @@ static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int&
     const int outW = W ? (int)W : cw, outH = W ? (int)H : ch;
     int x0, y0;
     lkFitRect(cw, ch, outW, outH, presW, presH, x0, y0);
-    mode = g_dlssMode == 1 ? (g_liveAutoFit ? g_liveAutoFit : (std::max)(liveAutoMode(presW, presH), g_liveAutoFloor))
-                           : g_dlssMode;
+    mode = g_dlssMode;
     liveWorkSizeFor(mode, presW, presH, mw, mh, raised);
 }
 
@@ -5609,6 +5011,10 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
     char key[64];
     if (s.backend == "gmfss")
     {
+        // a 64 px pad side would give gmflow's quarter-scale windows 1 token a side and its shifted blocks empty
+        // regions: such a side runs at kGmMinPad (the packers replicate the edge into the pad)
+        s.ph = (std::max)(s.ph, kGmMinPad);
+        s.pw = (std::max)(s.pw, kGmMinPad);
         const int hh = s.hh = s.ph / 2, hw = s.hw = s.pw / 2;
         const int gh = hh, gw = hw; // gmflow's frame
         const int64_t q4 = (int64_t)(gh / 4) * (gw / 4), q8 = (int64_t)(gh / 8) * (gw / 8), K = 81;
@@ -5619,8 +5025,8 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
         s.gm = {
             {"gfeat", "featurenet", "featurenet", 1, {{"x", {1, 3, s.ph, s.pw}}}},
             {"gflow",
-             lkGmFlowA(gh, gw),
-             lkGmFlowA(gh, gw),
+             "gmflow_bidir_a_g8r",
+             "gmflow_bidir_a_g8r",
              2,
              {{"map4", {2, 128, gh / 4, gw / 4}},
               {"map8", {2, 128, gh / 8, gw / 8}},
@@ -5648,16 +5054,13 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
              {{"corr", {2, q4, K}},
               {"img0", {1, 3, gh, gw}},
               {"img1", {1, 3, gh, gw}},
-              {"win", {2, q4, K, 2}},
-              {"valid", {2, q4, K}},
               {"flow0", {2, 2, gh / 4, gw / 4}},
-              {"feat", {2, 128, gh / 4, gw / 4}},
-              {"flow1", {2, 2, gh / 4, gw / 4}}},
+              {"feat", {2, 128, gh / 4, gw / 4}}},
              2},
             {"gbone", "gmflow_backbone", "gmflow_backbone", 1, {{"img0", {1, 3, gh, gw}}}},
             {"gflowm",
-             lkGmFlowM(gh, gw),
-             lkGmFlowM(gh, gw),
+             "gmflow_bidir_a_g8r_m",
+             "gmflow_bidir_a_g8r_m",
              1,
              {{"map4", {2, 128, gh / 4, gw / 4}},
               {"map8", {2, 128, gh / 8, gw / 8}},
@@ -5873,9 +5276,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
                         tail);
         return true;
     }
-    // rife / blend / rifedrba: the unbatched IFNet, one in-between frame a call (the class offline runs
-    // for a single tween): faster than the batched class at 1080p, within a few percent of it at 540p and
-    // below, at a fraction of its video memory and without the wait for a batch before a pair's first frame
+    // rife / blend / rifedrba: the unbatched IFNet, one in-between frame a call (offline's class too)
     const bool drba = s.drba;
     const int batch = 0;
     std::string ipath, epath;
@@ -6047,8 +5448,7 @@ static int lkAuxStreamCap(const std::string& onnx)
     return -1;
 }
 
-// one engine from a size-free ONNX; *oom = the failure was memory-shaped (python's .nofit rule:
-// a null build or an out-of-memory message)
+// one engine from a size-free ONNX; *oom = the failure was memory-shaped (a null build or an out-of-memory message)
 static bool lkBuild(nvinfer1::IRuntime* rt, const std::string& onnx, const std::string& out,
                     const std::vector<LkShape>& set, const char* dynInput, int dynLo, int dynHi, int wsMult, bool* oom)
 {
@@ -6460,33 +5860,16 @@ static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int 
     return done;
 }
 
-static uint64_t nativeVideoMemoryRoom();
-
 // ---- offline RIFE engines -------------------------------------------------------------------
-// The offline host finds, builds and warms its own IFNet + Head engines. The classes are the ones
-// trt_lookup._rife_ifnet_spec names for offline: x2 = the unbatched IFNet, xN = the FIXED batch
-// class `_b{N-1}` (every group exactly full), pinned to the /64 pad of the source. The per-B
-// ONNX never ships, so a fixed class is built from the shipped `_bd8` graph with its batch axis
-// pinned to B (bit-exact with an engine built from a per-B `_b{B}` export). A batched
-// build that runs out of memory is marked `.nofit` and the unbatched engine serves.
-// The batched class is also taken only while its extra timesteps fit in the free video memory
-// beside the render's other needs (others, nativeOfflineNeed): the unbatched engine makes the
-// same in-between frames in more calls, where a spill into system memory slows the whole PC.
+// The offline host finds, builds and warms its own IFNet + Head engines: live's unbatched IFNet class (one
+// in-between frame a call at every multiplier) and the encoder, pinned to the /64 pad of the source.
 struct OfflineEngines
 {
     std::string ifnet, encode, jit;
-    int ph = 0, pw = 0, batch = 1;
+    int ph = 0, pw = 0;
 };
 
-// What each timestep of a batched IFNet class takes beyond the first, in MiB a padded megapixel: its activations and
-// buffers at the IFNet's frame, kIfnetStepMp (offline x4 renders: 189 / 857 MiB at 854x480 / 1920x1080 with the
-// working size at the decode, less their fp16 tween's 6 bytes a pixel), and its fp32 tween at the pictures' frame,
-// kTweenStepMp (3 channels x 4 bytes a pixel)
-constexpr double kIfnetStepMp = 405.0, kTweenStepMp = 11.4;
-
-// picW x picH = the pictures' frame (the working size: RIFE's last step and its tweens), 0 = the IFNet's w x h
-static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, OfflineEngines& o, uint64_t others = 0,
-                          int picW = 0, int picH = 0)
+static bool lkOfflineRife(const std::wstring& script, int w, int h, OfflineEngines& o)
 {
     LkSession s;
     if (!lkSession(script, L"rife", (uint32_t)w, (uint32_t)h, s))
@@ -6503,14 +5886,10 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, O
     if (!rt)
         return false;
     const auto t0 = std::chrono::steady_clock::now();
-    auto enginePath = [&](const std::string& base, const std::vector<LkShape>& set) {
-        return s.cacheDir + "\\" + lkEngineName(base, set, nullptr, 0, 0, t) + ".engine";
-    };
+    cudaStream_t st = nullptr;
     // one class: its engine exists and is warm at this size, else build (when missing) and warm
-    auto ensure = [&](const std::string& base, const std::string& onnxKey, const std::vector<LkShape>& set,
-                      const std::string& warmKey, cudaStream_t& st, bool* oom) -> bool {
-        *oom = false;
-        const std::string p = enginePath(base, set);
+    auto ensure = [&](const std::string& base, const std::vector<LkShape>& set, const std::string& warmKey) -> bool {
+        const std::string p = s.cacheDir + "\\" + lkEngineName(base, set, nullptr, 0, 0, t) + ".engine";
         if (lkFile(p) && (warmKey.empty() ? lkFile(lkJit(p)) : lkWarm(lkJit(p), warmKey)))
             return true;
         if (!lkFile(p) && !g_onnxParserOk)
@@ -6520,65 +5899,13 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, O
         }
         if (!st && !lkBuildStream(st))
             return false;
-        return lkEnsure(rt, s, t, p, onnxKey, set, nullptr, 0, 0, 1, {set}, warmKey, st, oom);
+        bool oom = false;
+        return lkEnsure(rt, s, t, p, base, set, nullptr, 0, 0, 1, {set}, warmKey, st, &oom);
     };
-    cudaStream_t st = nullptr;
-    const std::string ibase = lkIfnetBase(s, t);
-    int B = lkEnv("SMV_RIFE_BATCH") == "1" ? 1 : multi - 1;
-    const uint64_t room = B > 1 && others ? nativeVideoMemoryRoom() : 0;
-    if (room)
-    {
-        const double mib = 1048576.0;
-        const double picMp =
-            picW ? (double)((picW + 63) / 64 * 64) * ((picH + 63) / 64 * 64) / 1e6 : (double)s.pw * s.ph / 1e6;
-        const uint64_t extra = (uint64_t)((B - 1) * (kIfnetStepMp * s.pw * s.ph / 1e6 + kTweenStepMp * picMp) * mib);
-        if (others + extra > room)
-        {
-            LOG("offline: video memory: the model runs 1 of %d in-between frames a call; a batch of %d needs about "
-                "%.0f MiB more, %.0f MiB are free beside the render's other %.0f MiB\n",
-                B, B, extra / mib, room > others ? (room - others) / mib : 0.0, others / mib);
-            B = 1;
-        }
-    }
-    bool ok = false, oom = false;
-    std::string base = ibase;
-    std::vector<LkShape> set = lkIfnetSet(s, 1);
-    if (B > 1)
-    {
-        const std::string bbase = ibase + "_b" + std::to_string(B);
-        const std::vector<LkShape> bset = lkIfnetSet(s, B);
-        const std::string bpath = enginePath(bbase, bset);
-        if (lkFile(bpath) || !lkFile(bpath + ".nofit"))
-        {
-            ok = ensure(bbase, ibase + "_bd8", bset, s.warmKey, st, &oom);
-            if (ok)
-            {
-                base = bbase;
-                set = bset;
-            }
-            else if (oom)
-            {
-                char why[160];
-                sprintf_s(why, "%dx%d: the batched engine did not fit (offline host build)\n", s.pw, s.ph);
-                if (!lkWriteFile(bpath + ".nofit", why, strlen(why)))
-                    LOG("offline: cannot write %s.nofit, the next render retries the batched build\n", bpath.c_str());
-                LOG("offline: batched engine did not fit at %dx%d, marked; using the unbatched engine\n", s.pw, s.ph);
-            }
-            else
-            {
-                if (st)
-                    cudaStreamDestroy(st);
-                return false;
-            }
-        }
-        else
-            LOG("offline: batched engine marked \"did not fit\" at %dx%d, using the unbatched engine\n", s.pw, s.ph);
-    }
-    if (base == ibase)
-        ok = ensure(ibase, ibase, set, s.warmKey, st, &oom);
-    const std::string ebase = lkEncodeBase(s, t);
+    const std::string ibase = lkIfnetBase(s, t), ebase = lkEncodeBase(s, t);
+    const std::vector<LkShape> set = lkIfnetSet(s, 1);
     const std::vector<LkShape> eset = {{"img", {1, 3, s.ph, s.pw}}};
-    ok = ok && ensure(ebase, ebase, eset, std::string(), st, &oom);
+    const bool ok = ensure(ibase, set, s.warmKey) && ensure(ebase, eset, std::string());
     const bool built = st != nullptr;
     if (st)
         cudaStreamDestroy(st);
@@ -6588,7 +5915,7 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, O
         return false;
     }
     LkIo iio, eio;
-    if (!lkFind(rt, s.cacheDir, base, {set}, nullptr, 0, 0, t, o.ifnet, iio) || !lkRifeIo(iio, true) ||
+    if (!lkFind(rt, s.cacheDir, ibase, {set}, nullptr, 0, 0, t, o.ifnet, iio) || !lkRifeIo(iio, true) ||
         !lkFind(rt, s.cacheDir, ebase, {eset}, nullptr, 0, 0, t, o.encode, eio))
     {
         LOG("offline: the engines at %dx%d do not match their class (delete them from the cache to rebuild)\n", s.pw,
@@ -6598,10 +5925,7 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, int multi, O
     o.jit = lkJit(o.ifnet);
     o.ph = s.ph;
     o.pw = s.pw;
-    o.batch = base == ibase ? 1 : B;
-    LOG("offline: engines for %dx%d %s%s (%.1fs)\n", s.pw, s.ph,
-        o.batch > 1 ? ("batched B=" + std::to_string(o.batch)).c_str() : "single tween",
-        built ? " built by the host" : " warm",
+    LOG("offline: engines for %dx%d single tween%s (%.1fs)\n", s.pw, s.ph, built ? " built by the host" : " warm",
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return true;
 }
@@ -6678,7 +6002,7 @@ static bool lkOfflineGmfss(const std::wstring& script, int w, int h, NativeRife&
 // ---- offline DRBA block0 engine -------------------------------------------------------------
 // DRBA's calc_flow engine (lkBlock0Base / lkBlock0Set, the live names) at the /64 pad of the
 // source, warm or built + warmed from engine\onnx; the IFNet and encode come from lkOfflineRife
-// (x2 = the unbatched class: DRBA enqueues one tween at a time with its own DRM map).
+// (the unbatched class: DRBA enqueues one tween at a time with its own DRM map).
 static bool lkOfflineBlock0(const std::wstring& script, int w, int h, std::string& path, std::string& jit)
 {
     LkSession s;
@@ -6799,14 +6123,13 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
                           NativeRife& nr)
 {
     // resident host: the same window as the previous session (same overlay size, capture
-    // size, DLSS mode or share, Auto's memory pick and floor and HDR mode) gets the previous answer without a lookup,
+    // size, DLSS mode or share and HDR mode) gets the previous answer without a lookup,
     // as long as the engine files still exist (the user may empty the cache folder by hand);
     // live Restore rides in the key: its engine path is a fact of a restore session only; DLSS 5 too: it raises a
     // small working size (liveWorkSizeFor)
     wchar_t key[1024];
-    swprintf_s(key, L"%s|%s|%.2f|%d|%d|%d|%u|%u|%u|%u|%d|%d|%d", script.c_str(), backend.c_str(), g_flowScale,
-               g_dlssMode, g_liveAutoFit, g_liveAutoFloor, W, H, capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0,
-               g_dlssnr ? 1 : 0);
+    swprintf_s(key, L"%s|%s|%.2f|%d|%u|%u|%u|%u|%d|%d|%d", script.c_str(), backend.c_str(), g_flowScale, g_dlssMode, W,
+               H, capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0, g_dlssnr ? 1 : 0);
     bool factsOk = g_resident && g_res.haveFacts && g_res.handoffKey == key;
     if (factsOk)
     {
@@ -7067,7 +6390,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     const int outW = num("outw", 0), outH = num("outh", 0);
     nr.identity = (outW == nr.w && outH == nr.h);
     // every fit that changes the size runs as the separable Lanczos pair (the sum of the two axes'
-    // taps a pixel instead of sampleOut's product); decided here so the early helper knows to run nativeRtxInit
+    // taps a pixel); decided here so the early helper knows to run nativeRtxInit
     // (its staging buffers) before any effect flag is looked at. Upscale to re-derives it
     // against the internal render size in nativeDeriveUpscale.
     nr.fitAa = nr.dw != nr.w || nr.dh != nr.h;
@@ -7300,12 +6623,9 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fFitAaV, "k_fitAaV"},
         {&nr.fPackOutV, "k_packOutV"},
         {&nr.fPackOutHdrV, "k_packOutHdrV"},
-        {&nr.fPackOutTile, "k_packOutTile"},
-        {&nr.fFitAaTile, "k_fitAaTile"},
         {&nr.fRestIn, "k_restIn"},
         {&nr.fRestFoldH, "k_restFoldH"},
         {&nr.fRestFoldV, "k_restFoldV"},
-        {&nr.fRestFoldTile, "k_restFoldTile"},
         {&nr.fRestToF, "k_restToF"},
         {&nr.fClamp01, "k_clamp01"},
         {&nr.fPadPlanar, "k_padPlanar"},
@@ -7340,7 +6660,6 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fDrDrmSplat, "k_drbaDrmSplat"},
         {&nr.fDrDrmNorm, "k_drbaDrmNorm"},
         {&nr.fMotionIn, "k_motionIn"},
-        {&nr.fPackInMotion, "k_packInMotion"},
         {&nr.fRifeBlend, "k_rifeBlend"},
         {&nr.fRifeBlendF, "k_rifeBlendF"},
         {&nr.fRifeBlendOut, "k_rifeBlendOut"},
@@ -7360,7 +6679,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fHdrRestOut, "k_hdrRestOut"},
         {&nr.fLocalCorr, "k_localCorr"},
         {&nr.fAttn2, "k_attn2"},
-        {&nr.fAttn2b, "k_attn2b"},
+        {&nr.fFuTail, "k_fuTail"},
     };
     for (auto& e : fns)
         if (cuModuleGetFunction(e.fn, nr.cuMod, e.nm) != CUDA_SUCCESS)
@@ -7528,7 +6847,7 @@ static bool inv3d(const double* m, float* out)
 // measured slot count):
 //  * nativeCudaDeviceInit: device, context, stream, capture texture + fence import. Depends on
 //    the capture size only, so the early thread runs it in parallel with the engine handoff
-//    (it writes only dev / stream / emCap / capMip / capArr / capTex / semCap, the handoff writes the
+//    (it writes only dev / stream / emCap / capMip / capArr / semCap, the handoff writes the
 //    geometry fields; distinct members, no race).
 //  * nativeCudaInitEarly: kernels and the model buffers (needs the handoff geometry).
 //  * nativeRtxInit: the live TrueHDR / RTX VSR bridge, the sharpen staging and the warm-ups
@@ -7579,26 +6898,6 @@ static bool nativeCudaDeviceInit(NativeRife& nr, IDXGIAdapter1* adapter, HANDLE 
         NCHK(cudaExternalMemoryGetMappedMipmappedArray(&nr.capMip, nr.emCap, &ad), "map capture mipmapped array");
     }
     NCHK(cudaGetMipmappedArrayLevel(&nr.capArr, nr.capMip, 0), "capture array level");
-    const bool capDirect = lkEnv("SMV_CAP_DIRECT") != "0";
-    if (capDirect)
-    {
-        cudaResourceDesc rd{};
-        rd.resType = cudaResourceTypeArray;
-        rd.res.array.array = nr.capArr;
-        cudaTextureDesc td{};
-        td.addressMode[0] = td.addressMode[1] = cudaAddressModeClamp;
-        td.filterMode = cudaFilterModePoint;
-        td.readMode = cudaReadModeElementType;
-        td.normalizedCoords = 0;
-        if (cudaCreateTextureObject(&nr.capTex, &rd, &td, nullptr) != cudaSuccess)
-        {
-            cudaGetLastError();
-            nr.capTex = 0;
-        }
-    }
-    if (!nr.capTex)
-        LOG("native: the 1:1 pack reads a copy of the capture (%s)\n",
-            capDirect ? "the capture array has no texture object" : "SMV_CAP_DIRECT=0");
 
     cudaExternalSemaphoreHandleDesc sd{};
     sd.type = cudaExternalSemaphoreHandleTypeD3D11Fence;
@@ -7723,16 +7022,10 @@ static bool nativeRtxInit(NativeRife& nr)
     {
         NCHK(cudaMalloc((void**)&nr.dUp, (size_t)3 * nr.uw * nr.uh * sizeof(float)), "alloc internal render frame");
         if (nr.upAa)
-        {
             NCHK(cudaMalloc((void**)&nr.dUpTmp, (size_t)3 * nr.uw * nr.h * sizeof(float)),
                  "alloc internal render pass");
-            // k_fitAaTile saves the pair's round trip through dUpTmp; measured, it pays on every shrinking
-            // height and on every enlarge of at most 3x, and is slower at 4.5x (its blocks re-run the
-            // horizontal taps of the rows they share)
-            nr.upTile = nr.uh < nr.h || (long long)nr.uh <= 3LL * nr.h;
-        }
-        LOG("native: live upscale to: model %dx%d -> %dx%d first, then %s to %dx%d%s\n", nr.w, nr.h, nr.uw, nr.uh,
-            nr.identity ? "1:1" : "fit", nr.dw, nr.dh, nr.upTile ? " (the first resize in one kernel)" : "");
+        LOG("native: live upscale to: model %dx%d -> %dx%d first, then %s to %dx%d\n", nr.w, nr.h, nr.uw, nr.uh,
+            nr.identity ? "1:1" : "fit", nr.dw, nr.dh);
     }
     // the fit as the separable pair (nr.fitAa decided in the handoff parse): the horizontal
     // pass buffer and the staging frame; its source is the internal render frame under Upscale to
@@ -7778,8 +7071,6 @@ static bool nativeRtxInit(NativeRife& nr)
         const bool toModel = (g_offline && nr.nvPre) || nr.restPre;
         nr.restTw = vsrAfter ? sw : (toModel ? nr.w : tw);
         nr.restTh = vsrAfter ? sh : (toModel ? nr.h : th);
-        if (nr.restTh > 4 * sh)
-            NCHK(cudaMalloc((void**)&nr.dRestF, (size_t)3 * 16 * sw * sh * sizeof(float)), "alloc restore fp32 output");
         // HDR planes: the source fitted to the target, the remainder Restore's way back adds (nativeHdrRestOut)
         if ((nr.encPre || nr.encPost) && (nr.restTw != sw || nr.restTh != sh))
             NCHK(cudaMalloc((void**)&nr.dRestRem, (size_t)3 * nr.restTw * nr.restTh * sizeof(float)),
@@ -10266,10 +9557,10 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     {
         int presW, presH, mode, mw, mh, raised;
         liveWorkSize(nr.cw, nr.ch, presW, presH, mode, mw, mh, &raised);
-        const int shown = mode ? mode : (g_flowScale >= 0.995 ? 2 : 0); // no --scale = DLAA
+        const int shown = mode ? mode : (g_flowScale >= 0.995 ? 1 : 0); // no --scale = DLAA
         char how[64];
         if (shown)
-            sprintf_s(how, "DLSS mode %ls%s", kDlssModeName[shown - 1], g_dlssMode == 1 ? " (Auto)" : "");
+            sprintf_s(how, "DLSS mode %ls", kDlssModeName[shown - 1]);
         else
             sprintf_s(how, "%.2f", g_flowScale);
         LOG("native: live working size %dx%d = %s of the %dx%d presented, capture %dx%d%s\n", nr.w, nr.h, how, presW,
@@ -10324,8 +9615,7 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     }
     // live Restore: the engine's x / y at its input size, the captured frame (sized for fp32 so
     // either dtype fits), the fold's horizontal pass at the 4x height and the model-size target,
-    // and the folded model-size frame; the enlarging fold's fp32 copy is allocated in
-    // nativeRtxInit once the target is known (live: a working size above 4x the capture)
+    // and the folded model-size frame
     if (nr.restore)
     {
         const size_t mp = (size_t)nr.w * nr.h, sp = (size_t)srcW(nr) * srcH(nr);
@@ -10340,7 +9630,10 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     // positions and is an exact copy) and both staging planes are needed even at scale 1.00.
     if (nr.w != nr.cw || nr.h != nr.ch || nr.rtxHdr)
     {
-        NCHK(cudaMalloc((void**)&nr.dTmp, (size_t)3 * nr.ch * nr.w * sizeof(float)), "alloc resize temp");
+        // also nativeFitPlanar's pass (3, source height, target width): the capture -> working size of Restore's
+        // HDR reference and of the stage RTX VSR falls back from (ch x w), the motion frame's shrink (h x mw)
+        nr.tmpN = (size_t)3 * (std::max)((size_t)nr.ch * nr.w, nr.dMFit ? (size_t)nr.h * nr.mw : (size_t)0);
+        NCHK(cudaMalloc((void**)&nr.dTmp, nr.tmpN * sizeof(float)), "alloc resize temp");
         // HDR rescales ON PQ, so the conversion runs at capture resolution first
         if (nr.hdr)
             NCHK(cudaMalloc((void**)&nr.dCapF, (size_t)3 * nr.ch * nr.cw * sizeof(float)), "alloc PQ capture plane");
@@ -10558,9 +9851,10 @@ static bool nativeWarmEngine(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfer
 }
 
 // gmflow split: the contract between A (slot 1), k_localCorr and B (slot 5), read off the engines. The kernel takes
-// q [2, HW, 128] and f [2, H, W, 128] (channels-last: 32 lanes of float4) with coords [2, HW, K, 2] on the quarter of
-// the half frame and writes corr [2, HW, K] (K <= 100: its shared grid holds 12 x 12 taps); A hands out exactly the
-// kGmA tensors and B takes corr, img0, img1 and the other A outputs at their exact dims and dtype. The backbone (slot 6)
+// q [2, HW, 128] and f [2, H, W, 128] (channels-last: 32 lanes of float4) on the quarter of the half frame, computes the
+// window of K = side x side samples (odd side, K <= 100: its shared grid holds 12 x 12 taps) itself and writes corr
+// [2, HW, K]; A hands out exactly the kGmA tensors and B takes corr, img0, img1 and the other A outputs at their exact
+// dims and dtype (an export from before the window moved to the host hands out more: refused). The backbone (slot 6)
 // makes one frame's map4 / map8 [1, C, H, W] and A takes both frames' as [2, C, H, W] in the same dtype.
 static bool nativeGmSplitCheck(NativeRife& nr)
 {
@@ -10578,8 +9872,8 @@ static bool nativeGmSplitCheck(NativeRife& nr)
                 return false;
         return true;
     };
-    if (a->getNbIOTensors() != 13 || b->getNbIOTensors() != 9)
-        return bad("gmflow_bidir_a / _b", "do not have the split's 13 / 9 tensors");
+    if (a->getNbIOTensors() != 5 + kGmAn || b->getNbIOTensors() != 4 + kGmAn - 2)
+        return bad("gmflow_bidir_a / _b", "do not have the split's 9 / 6 tensors (an older export? re-export)");
     nvinfer1::ICudaEngine* bb = nr.engGm[6];
     if (bb->getNbIOTensors() != 3)
         return bad("gmflow_backbone", "does not have its 3 tensors (img0 -> map4, map8)");
@@ -10597,14 +9891,13 @@ static bool nativeGmSplitCheck(NativeRife& nr)
     for (const char* nm : kGmA)
         if (a->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT)
             return bad(nm, "is not an output of gmflow_bidir_a");
-    for (const char* nm : {"q", "f", "coords"})
+    for (const char* nm : {"q", "f"})
         if (a->getTensorDataType(nm) != nvinfer1::DataType::kFLOAT)
             return bad(nm, "is not fp32");
     if (b->getTensorIOMode("corr") != nvinfer1::TensorIOMode::kINPUT ||
         b->getTensorDataType("corr") != nvinfer1::DataType::kFLOAT)
         return bad("corr", "is not an fp32 input of gmflow_bidir_b");
-    const nvinfer1::Dims q = a->getTensorShape("q"), f = a->getTensorShape("f"), g = a->getTensorShape("coords"),
-                         c = b->getTensorShape("corr");
+    const nvinfer1::Dims q = a->getTensorShape("q"), f = a->getTensorShape("f"), c = b->getTensorShape("corr");
     const int gh = nr.hh, gw = nr.hw;
     if (f.nbDims != 4 || f.d[0] != 2 || f.d[1] != gh / 4 || f.d[2] != gw / 4 || f.d[3] != 128)
         return bad("f", "is not [2, H, W, 128] on the quarter of gmflow's frame (the half)");
@@ -10634,17 +9927,16 @@ static bool nativeGmSplitCheck(NativeRife& nr)
     nr.gmN8 = (int)mt.d[1];
     nr.gmW8 = gw / 8;
     nr.gmPropHalf = pt == nvinfer1::DataType::kHALF;
-    char attnEv[4] = {};
-    nr.gmAttnB = nr.gmN8 <= kAttn2bMaxN &&
-                 !(GetEnvironmentVariableA("SMV_GM_ATTN2B", attnEv, sizeof(attnEv)) > 0 && attnEv[0] == '0');
     const int64_t hw = (int64_t)nr.gmH * nr.gmW;
     if (q.nbDims != 3 || q.d[0] != 2 || q.d[1] != hw || q.d[2] != 128)
         return bad("q", "is not [2, H * W, 128]");
-    if (g.nbDims != 4 || g.d[0] != 2 || g.d[1] != hw || g.d[2] < 1 || g.d[2] > 100 || g.d[3] != 2)
-        return bad("coords", "is not [2, H * W, K, 2] with K <= 100");
-    nr.gmK = (int)g.d[2];
-    if (c.nbDims != 3 || c.d[0] != 2 || c.d[1] != hw || c.d[2] != nr.gmK)
-        return bad("corr", "is not [2, H * W, K]");
+    int side = 1;
+    while (c.nbDims == 3 && side * side < c.d[2])
+        side++;
+    if (c.nbDims != 3 || c.d[0] != 2 || c.d[1] != hw || c.d[2] < 1 || c.d[2] > 100 || side * side != c.d[2] ||
+        !(side & 1))
+        return bad("corr", "is not [2, H * W, K] with K = an odd side squared <= 100");
+    nr.gmK = (int)c.d[2];
     for (int i = 0; i < b->getNbIOTensors(); i++)
     {
         const char* nm = b->getIOTensorName(i);
@@ -10656,10 +9948,10 @@ static bool nativeGmSplitCheck(NativeRife& nr)
         }
         if (!strcmp(nm, "corr") || !strcmp(nm, "img0") || !strcmp(nm, "img1"))
             continue;
-        int k = 3;
-        while (k < 8 && strcmp(nm, kGmA[k]))
+        int k = 2;
+        while (k < kGmAn && strcmp(nm, kGmA[k]))
             k++;
-        if (k == 8)
+        if (k == kGmAn)
             return bad(nm, "is a gmflow_bidir_b input gmflow_bidir_a does not hand over");
         if (!same(a->getTensorShape(nm), b->getTensorShape(nm)) || a->getTensorDataType(nm) != b->getTensorDataType(nm))
             return bad(nm, "differs between gmflow_bidir_a and gmflow_bidir_b");
@@ -10694,6 +9986,8 @@ static bool nativeGmfssSetup(NativeRife& nr)
         return bad("the half frame is not a multiple of 4");
     if (nr.hh * 2 != nr.ph || nr.hw * 2 != nr.pw)
         return bad("the half frame is not half of the padded frame");
+    if (nr.ph < kGmMinPad || nr.pw < kGmMinPad)
+        return bad("the padded frame is below 128 a side (gmflow's quarter-scale windows need 2 tokens a side)");
     // one tensor: 4 dims, the expected dtype (kFLOAT unless dtOut takes the answer) and the
     // expected shape (a negative expectation means "read it", n = the leading dim)
     int dims[4]{};
@@ -10779,7 +10073,35 @@ static bool nativeGmfssSetup(NativeRife& nr)
         return false;
     if (ch != nr.gmFuseHalf || dh != nr.gmFuseHalf)
         return bad("the fusionnet feature inputs have mixed dtypes");
-    if (!tensor(4, "out", 1, 3, nr.ph, nr.pw, &nr.gmOutHalf))
+    // fusionnet's tail: the full graph writes the frame (`out` 3 x ph x pw); the cut graph (trt_runtime's
+    // fusion_tail_cut) stops before its pixel shuffle (`out` = the 64 -> 256 conv at the half, fp16) and hands
+    // conv_last's weight and bias out as w_last / b_last, and k_fuTail does the shuffle + conv_last (fp32 sums, the
+    // frame in fp32: dGmOut's dtype on that path)
+    {
+        const nvinfer1::Dims so = nr.engGm[4]->getTensorShape("out");
+        nr.gmTail = so.nbDims == 4 && so.d[1] == 256;
+    }
+    if (nr.gmTail)
+    {
+        auto out16 = [&](const char* nm, int nb, const int* d) {
+            const nvinfer1::Dims s = nr.engGm[4]->getTensorShape(nm);
+            if (s.nbDims != nb || nr.engGm[4]->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT ||
+                nr.engGm[4]->getTensorDataType(nm) != nvinfer1::DataType::kHALF)
+                return false;
+            for (int i = 0; i < nb; i++)
+                if (s.d[i] != d[i])
+                    return false;
+            return true;
+        };
+        const int dOut[4] = {1, 256, hh, hw}, dW[4] = {3, 64, 3, 3}, dB[1] = {3};
+        if (nr.engGm[4]->getNbIOTensors() != 7 || !out16("out", 4, dOut) || !out16("w_last", 4, dW) ||
+            !out16("b_last", 1, dB))
+            return bad("the cut fusionnet's outputs are not out 1x256 at the half, w_last 3x64x3x3 and b_last 3, fp16");
+        nr.gmOutHalf = false;
+    }
+    else if (nr.engGm[4]->getNbIOTensors() != 5)
+        return bad("fusionnet has other tensors than a, b, c, d and out");
+    else if (!tensor(4, "out", 1, 3, nr.ph, nr.pw, &nr.gmOutHalf))
         return false;
 
     const size_t hp = (size_t)hh * hw, qp = hp / 4, ep = hp / 16;
@@ -10791,6 +10113,8 @@ static bool nativeGmfssSetup(NativeRife& nr)
         accPlanes = (((size_t)nr.gmC[1] + 1) * qp + hp - 1) / hp;
     if (((size_t)nr.gmC[2] + 1) * ep > accPlanes * hp)
         accPlanes = (((size_t)nr.gmC[2] + 1) * ep + hp - 1) / hp;
+    if (nr.gmTail && accPlanes * sizeof(long long) < 256 * 2)
+        return bad("the splat accumulator cannot hold the cut fusionnet's out");
     size_t freeB = 0, freeA = 0, totB = 0;
     cudaMemGetInfo(&freeB, &totB);
     for (int s = 0; s < 2; s++)
@@ -10812,7 +10136,36 @@ static bool nativeGmfssSetup(NativeRife& nr)
     NCHK(cudaMalloc((void**)&nr.dGmT, sizeof(float)), "alloc gmfss timestep");
     NCHK(cudaMalloc(&nr.dGmOut, 3 * plane * oe), "alloc gmfss fusion out");
     NCHK(cudaMalloc((void**)&nr.dGmF, 3 * plane * sizeof(float)), "alloc gmfss model frame");
-    for (int i = 0; i < 8; i++)
+    if (nr.gmTail)
+    {
+        // conv_last's weight and bias reach k_fuTail as the engine's outputs, bound to these session buffers on every
+        // tween (the warm-up freed its own); one run here proves the engine writes them
+        const size_t wB = trtTensorBytes(nr.engGm[4], "w_last"), bB = trtTensorBytes(nr.engGm[4], "b_last");
+        NCHK(cudaMalloc(&nr.dGmWl, wB), "alloc gmfss conv_last weight");
+        NCHK(cudaMalloc(&nr.dGmBl, bB), "alloc gmfss conv_last bias");
+        NCHK(cudaMemset(nr.dGmWl, 0, wB), "clear gmfss conv_last weight");
+        NCHK(cudaMemset(nr.dGmBl, 0, bB), "clear gmfss conv_last bias");
+        nvinfer1::IExecutionContext* c = nr.ctxGm[4];
+        c->setTensorAddress("a", nr.dGmFa);
+        c->setTensorAddress("b", nr.dGmFb);
+        c->setTensorAddress("c", nr.dGmFc);
+        c->setTensorAddress("d", nr.dGmFd);
+        c->setTensorAddress("out", nr.dGmAcc);
+        c->setTensorAddress("w_last", nr.dGmWl);
+        c->setTensorAddress("b_last", nr.dGmBl);
+        if (wB != 3 * 64 * 9 * 2 || bB != 3 * 2 || !c->enqueueV3(nr.stream))
+            return bad("the cut fusionnet's probe run did not start");
+        NCHK(cudaStreamSynchronize(nr.stream), "gmfss cut fusionnet probe run");
+        unsigned short wb[3 * 64 * 9 + 3] = {};
+        NCHK(cudaMemcpy(wb, nr.dGmWl, wB, cudaMemcpyDeviceToHost), "read gmfss conv_last weight");
+        NCHK(cudaMemcpy(wb + 3 * 64 * 9, nr.dGmBl, bB, cudaMemcpyDeviceToHost), "read gmfss conv_last bias");
+        bool any = false;
+        for (unsigned short v : wb)
+            any = any || v != 0;
+        if (!any)
+            return bad("the cut fusionnet wrote no conv_last weight");
+    }
+    for (int i = 0; i < kGmAn; i++)
         NCHK(cudaMalloc(&nr.dGmA[i], trtTensorBytes(nr.engGm[1], kGmA[i])), "alloc gmfss split tensors");
     NCHK(cudaMalloc((void**)&nr.dGmCorr, (size_t)2 * nr.gmH * nr.gmW * nr.gmK * sizeof(float)),
          "alloc gmfss local correlation");
@@ -10843,10 +10196,11 @@ static bool nativeGmfssSetup(NativeRife& nr)
         hw, hh, nr.gmC[0], nr.gmC[1], nr.gmC[2], nr.gmFeatHalf ? "fp16" : "fp32", nr.gmMetricHalf ? "fp16" : "fp32",
         nr.gmFuseHalf ? "fp16" : "fp32", nr.gmOutHalf ? "fp16" : "fp32", accPlanes,
         ((double)freeB - (double)freeA) / 1048576.0);
+    LOG("native: gmfss chain: fusion tail %s\n",
+        nr.gmTail ? "on the host (k_fuTail: pixel shuffle + conv_last, fp32)" : "in the engine");
     LOG("native: gmfss chain: gmflow split, its local correlation in one kernel (%dx%d, %d samples a pixel)\n", nr.gmW,
         nr.gmH, nr.gmK);
-    LOG("native: gmfss chain: the global matching by %s (%d tokens a frame)\n", nr.gmAttnB ? "k_attn2b" : "k_attn2",
-        nr.gmN8);
+    LOG("native: gmfss chain: the global matching by k_attn2 (%d tokens a frame)\n", nr.gmN8);
     nr.gmProf = GetEnvironmentVariableW(L"SMV_LIVE_GMFSS_PROF", nullptr, 0) != 0;
     if (nr.gmProf)
         for (auto& e : nr.gmEv)
@@ -10885,7 +10239,7 @@ static uint16_t halfBitsRne(float f)
 }
 
 // timestep plane j of the IFNet's batch: a constant map of t in the engine's timestep dtype; a plane that already
-// holds this t is left as it is (x2 asks for 0.5 every group, an offline batch for the same t per plane)
+// holds this t is left as it is (x2 asks for 0.5 every group)
 static bool nativeFillT(NativeRife& nr, size_t j, float t, size_t plane, cudaStream_t st)
 {
     unsigned int bits;
@@ -10933,63 +10287,6 @@ static bool nativeTweenBuffers(NativeRife& nr)
             LOG("native: RIFE's tweens are stored in fp16 (SMV_TWEEN_FP16=1)\n");
     }
     return true;
-}
-
-// RTX HDR's and RTX VSR's video memory in MiB, by the megapixels of the model frame they take in (the
-// bridge's NGX features and their frames, a quarter on top of the measured: a live session's own
-// dedicated memory with and without the feature, 82 / 226 MiB for RTX HDR at 854x480 / 1920x1080,
-// 174 / 524 MiB for RTX VSR from those into a 2560x1440 Fill)
-constexpr double kRtxHdrBase = 58.0, kRtxHdrMp = 109.0, kRtxVsrBase = 109.0, kRtxVsrMp = 264.0;
-// AMD FSR upscaling (FSR 4.1.1): RTX VSR's row moved by a quarter over the process's own memory against VSR's, at
-// 854x480 and 1708x960 upscaled 2.25x (+243 / +793 MiB against VSR's +108 / +402 over no upscaler)
-constexpr double kFsrUpBase = 171.0, kFsrUpMp = 524.0;
-
-// Restore's video memory in MiB a megapixel of the decoded frame (its engine 145 MiB at 854x480, a quarter on top)
-constexpr double kRestoreMp = 445.0;
-
-// megapixels of a frame padded to 64 a side (the engines' and the model buffers' shape)
-static double padMp64(int a, int b)
-{
-    return (double)((a + 63) / 64 * 64) * ((b + 63) / 64 * 64) / 1e6;
-}
-
-// An offline RIFE-family render with one tween a call, in MiB: 276 + 427 a padded megapixel of the IFNet frame (its
-// activations and the encoder) + 224 a padded megapixel of the pictures at the working size (572 / 1624 MiB measured
-// at 854x480 / 1920x1080 with the tween stored in fp16, plus 6 for its fp32 store: 3 channels x 2 more bytes a pixel).
-// ifw x ifh = the IFNet's frame, w x h = the working size.
-static double nativeOfflineRifeMiB(int ifw, int ifh, int w, int h)
-{
-    return 276.0 + 427.0 * padMp64(ifw, ifh) + 224.0 * padMp64(w, h);
-}
-
-// The passes around an offline model, in MiB: DLSS 5's at the working size w x h (nr_host's per-pass constants), RTX
-// HDR, RTX VSR, and Restore at the decoded frame sw x sh.
-static double nativeOfflineEffectsMiB(int w, int h, int sw, int sh)
-{
-    const double mp = (double)w * h / 1e6;
-    double need = 0.0;
-    if (g_dlssnr)
-    {
-        const int p = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
-        need += p * (nr::kPassBase + nr::kPassMp * mp) + nr::kAfterBase + nr::kAfterMp * mp + nr::kFrameMp * mp * p;
-    }
-    if (g_rtxHdr)
-        need += kRtxHdrBase + kRtxHdrMp * mp;
-    if (g_rtxVsr)
-        need += kRtxVsrBase + kRtxVsrMp * mp;
-    else if (g_fsrUp)
-        need += kFsrUpBase + kFsrUpMp * mp;
-    if (g_restore)
-        need += kRestoreMp * (double)sw * sh / 1e6;
-    return need;
-}
-
-// What an offline RIFE-family render takes besides its IFNet's extra timesteps, in bytes, before any engine or
-// buffer exists (lkOfflineRife's batch choice): the render with one tween a call and the passes around it.
-// ifw x ifh = the IFNet's frame, w x h = the working size, sw x sh = the decoded frame.
-static uint64_t nativeOfflineNeed(int ifw, int ifh, int w, int h, int sw, int sh)
-{
-    return (uint64_t)((nativeOfflineRifeMiB(ifw, ifh, w, h) + nativeOfflineEffectsMiB(w, h, sw, sh)) * 1048576.0);
 }
 
 // k_motionIn's HDR curve, in units of SDR white: up to the knee the light passes exactly (what an SDR
@@ -11064,48 +10361,23 @@ static int nativeRsInRange(NativeRife& nr, const float* src, int ps, int rs, int
     nr.rsLastView = in;
     return in ? 1 : 0;
 }
-// the Lanczos pair of a planar source into a planar target in ONE kernel (k_fitAaTile: the pair's bytes, no global
-// tmp), 32 columns by the tallest of 32 / 16 / 8 rows whose tables and tile fit the 48 KB of shared memory a launch
-// gets without opting in; launched = false when none fits (the caller's own path then). false = a launch failed.
-static bool nativeFitAaTile(NativeRife& nr, const void* src, int half, int ps, int rs, int sw, int sh, float* dst,
-                            int tw, int th, cudaStream_t st, bool& launched)
-{
-    launched = false;
-    const int fsh = lzTaps(sw, tw), fsv = lzTaps(sh, th);
-    for (int by = 32; by >= 8; by /= 2)
-    {
-        int rcap = (int)(((long long)(by - 1) * sh + th - 1) / th) + fsv + 2;
-        const size_t smem = ((size_t)fsh * 32 + (size_t)fsv * by) * 8 + 8 + (size_t)12 * rcap * 32;
-        if (smem > 48 * 1024)
-            continue;
-        void* at[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &dst, &tw, &th, &rcap};
-        if (cuLaunchKernel(nr.fFitAaTile, (tw + 31) / 32, (th + by - 1) / by, 1, 32, by, 1, (unsigned)smem,
-                           (CUstream)st, at, nullptr) != CUDA_SUCCESS)
-        {
-            nr.die("fitAaTile launch failed");
-            return false;
-        }
-        launched = true;
-        return true;
-    }
-    return true;
-}
-
-// one planar Lanczos resize: a size change of at most 3x per axis = k_fitAaTile (the same bytes as sampleOut's 2D
-// gather, 2 to 2.5x faster at 1.2x to 3x: 2 x 2 kLzUp taps a pixel on an enlarge where the gather reads
-// (2 kLzUp)^2), else k_fitPlanar (sampleOut). false = a launch failed.
+// one planar Lanczos resize: the separable pair, k_fitAaH into dTmp (3, sh, tw) then k_fitAaV (a size kept on
+// both axes = an exact copy); dTmp holds the session's largest such pass (tmpN floats: live nativeCudaInitEarly,
+// offline runOfflineSession). false = dTmp cannot hold the pass or a launch failed.
 static bool nativeFitPlanar(NativeRife& nr, const void* src, int half, int ps, int rs, int sw, int sh, float* dst,
                             int tw, int th, cudaStream_t st)
 {
-    bool tiled = false;
-    if ((tw != sw || th != sh) && (long long)tw <= 3LL * sw && (long long)th <= 3LL * sh &&
-        !nativeFitAaTile(nr, src, half, ps, rs, sw, sh, dst, tw, th, st, tiled))
+    if (!nr.dTmp || (size_t)3 * sh * tw > nr.tmpN)
+    {
+        LOG("native: the resize pass buffer cannot hold %dx%d -> %dx%d\n", sw, sh, tw, th);
         return false;
-    if (tiled)
-        return true;
-    void* a[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &dst, &tw, &th};
-    return cuLaunchKernel(nr.fFitPlanar, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) ==
-           CUDA_SUCCESS;
+    }
+    void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &nr.dTmp, &tw};
+    void* av[] = {&nr.dTmp, &tw, &sh, &dst, &th};
+    return cuLaunchKernel(nr.fFitAaH, (tw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah, nullptr) ==
+               CUDA_SUCCESS &&
+           cuLaunchKernel(nr.fFitAaV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av, nullptr) ==
+               CUDA_SUCCESS;
 }
 
 // the resize of an SDR-range frame: its SDR view (knee 1, head 0) into dRsView, Lanczos (nativeFitPlanar) to tw x th
@@ -11673,7 +10945,6 @@ static void nativeFree(NativeRife& nr)
             cudaEventDestroy(e);
             e = nullptr;
         }
-    nr.pfArmed = false;
     for (cudaEvent_t& e : nr.grEv)
         if (e)
         {
@@ -11687,11 +10958,6 @@ static void nativeFree(NativeRife& nr)
     {
         cudaFree(nr.dOutRing);
         nr.dOutRing = nullptr;
-    }
-    if (nr.capTex)
-    {
-        cudaDestroyTextureObject(nr.capTex);
-        nr.capTex = 0;
     }
     if (nr.capMip)
     {
@@ -11724,14 +10990,13 @@ static void nativeFree(NativeRife& nr)
     nr.dMFit = nr.dRestRem = nr.dRsView = nullptr;
     nr.dRsRange = nr.hRsRange = nullptr;
     nr.rsModeLogs = 0;
-    for (void* p : {(void*)nr.dCap,    (void*)nr.dX,          (void*)nr.dXh,        (void*)nr.dF[0],
-                    (void*)nr.dF[1],   (void*)nr.dEncHalf,    (void*)nr.dT,         (void*)nr.dMerged,
-                    (void*)nr.dTmp,    (void*)nr.dCapF,       (void*)nr.dThdrIn,    (void*)nr.dThdrOut,
-                    (void*)nr.dSrcG,   (void*)nr.dPres,       (void*)nr.dSrcPl,     (void*)nr.dVsrIn,
-                    (void*)nr.dVsrOut, (void*)nr.dFitTmp,     (void*)nr.dUp,        (void*)nr.dUpTmp,
-                    nr.dRestIn,        nr.dRestOut,           (void*)nr.dRestTmp,   (void*)nr.dRestF,
-                    (void*)nr.dRest,   (void*)nr.dStaticFlag, (void*)nr.dThdrStats, (void*)nr.dShIn,
-                    (void*)nr.dShOut})
+    for (void* p :
+         {(void*)nr.dCap,       (void*)nr.dX,       (void*)nr.dXh,      (void*)nr.dF[0], (void*)nr.dF[1],
+          (void*)nr.dEncHalf,   (void*)nr.dT,       (void*)nr.dMerged,  (void*)nr.dTmp,  (void*)nr.dCapF,
+          (void*)nr.dThdrIn,    (void*)nr.dThdrOut, (void*)nr.dSrcG,    (void*)nr.dPres, (void*)nr.dSrcPl,
+          (void*)nr.dVsrIn,     (void*)nr.dVsrOut,  (void*)nr.dFitTmp,  (void*)nr.dUp,   (void*)nr.dUpTmp,
+          nr.dRestIn,           nr.dRestOut,        (void*)nr.dRestTmp, (void*)nr.dRest, (void*)nr.dStaticFlag,
+          (void*)nr.dThdrStats, (void*)nr.dShIn,    (void*)nr.dShOut})
         if (p)
             cudaFree(p);
     if (nr.hStaticFlag)
@@ -11769,6 +11034,8 @@ static void nativeFree(NativeRife& nr)
                     nr.dGmFd,
                     (void*)nr.dGmT,
                     nr.dGmOut,
+                    nr.dGmWl,
+                    nr.dGmBl,
                     (void*)nr.dGmF,
                     (void*)nr.dGmEnc,
                     (void*)nr.dGmHalfM,
@@ -11777,10 +11044,6 @@ static void nativeFree(NativeRife& nr)
                     nr.dGmA[1],
                     nr.dGmA[2],
                     nr.dGmA[3],
-                    nr.dGmA[4],
-                    nr.dGmA[5],
-                    nr.dGmA[6],
-                    nr.dGmA[7],
                     (void*)nr.dGmCorr,
                     nr.dGmM[0],
                     nr.dGmM[1],
@@ -11819,6 +11082,8 @@ static void nativeFree(NativeRife& nr)
     nr.dGmFd = nullptr;
     nr.dGmT = nullptr;
     nr.dGmOut = nullptr;
+    nr.dGmWl = nr.dGmBl = nullptr;
+    nr.gmTail = false;
     nr.dGmF = nullptr;
     nr.dGmEnc = nullptr;
     nr.dGmHalfM = nullptr;
@@ -11831,6 +11096,7 @@ static void nativeFree(NativeRife& nr)
     nr.tHeldMask = 0;
     nr.dMerged = nullptr;
     nr.dTmp = nullptr;
+    nr.tmpN = 0;
     nr.dCapF = nullptr;
     nr.dThdrIn = nullptr;
     nr.dThdrOut = nullptr;
@@ -11847,7 +11113,6 @@ static void nativeFree(NativeRife& nr)
     nr.dRestIn = nullptr;
     nr.dRestOut = nullptr;
     nr.dRestTmp = nullptr;
-    nr.dRestF = nullptr;
     nr.dRest = nullptr;
     if (nr.cuMod && nr.cuMod != g_res.cuMod)
         cuModuleUnload(nr.cuMod);
@@ -12048,7 +11313,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
                       &modeProp,
                       &nr.gmW8};
         const unsigned gx = (unsigned)((n8 + 63) / 64);
-        const CUfunction fa = nr.gmAttnB ? nr.fAttn2b : nr.fAttn2;
+        const CUfunction fa = nr.fAttn2;
         if (cuLaunchKernel(fa, gx, 2, 1, 128, 1, 1, 0, (CUstream)st, am, nullptr) != CUDA_SUCCESS ||
             cuLaunchKernel(fa, gx, 2, 1, 128, 1, 1, 0, (CUstream)st, ap, nullptr) != CUDA_SUCCESS)
         {
@@ -12062,7 +11327,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     ctx->setTensorAddress("img0", mv0);
     ctx->setTensorAddress("img1", mv1);
     ctx->setTensorAddress("prop", nr.dGmProp);
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < kGmAn; i++)
         ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
     if (!ctx->enqueueV3(st))
     {
@@ -12070,15 +11335,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         return false;
     }
     int nb = 2, hw4 = nr.gmH * nr.gmW;
-    void* ac[] = {(void*)&nr.dGmA[0],
-                  (void*)&nr.dGmA[1],
-                  (void*)&nr.dGmA[2],
-                  (void*)&nr.dGmCorr,
-                  &nb,
-                  &nr.gmH,
-                  &nr.gmW,
-                  &hw4,
-                  &nr.gmK};
+    void* ac[] = {(void*)&nr.dGmA[0], (void*)&nr.dGmA[1], (void*)&nr.dGmCorr, &nb, &nr.gmH, &nr.gmW, &hw4, &nr.gmK};
     if (cuLaunchKernel(nr.fLocalCorr, (unsigned)((2LL * hw4 * 32 + 127) / 128), 1, 1, 128, 1, 1, 0, (CUstream)st, ac,
                        nullptr) != CUDA_SUCCESS)
     {
@@ -12087,7 +11344,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     }
     ctx = nr.ctxGm[5];
     ctx->setTensorAddress("corr", nr.dGmCorr);
-    for (int i = 3; i < 8; i++)
+    for (int i = 2; i < kGmAn; i++)
         ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
     ctx->setTensorAddress("img0", mv0);
     ctx->setTensorAddress("img1", mv1);
@@ -12253,22 +11510,50 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     ctx->setTensorAddress("b", nr.dGmFb);
     ctx->setTensorAddress("c", nr.dGmFc);
     ctx->setTensorAddress("d", nr.dGmFd);
-    ctx->setTensorAddress("out", nr.dGmOut);
+    ctx->setTensorAddress("out", nr.gmTail ? (void*)nr.dGmAcc : nr.dGmOut);
+    if (nr.gmTail)
+    {
+        ctx->setTensorAddress("w_last", nr.dGmWl);
+        ctx->setTensorAddress("b_last", nr.dGmBl);
+    }
     if (!ctx->enqueueV3(st))
     {
         nr.die("gmfss fusionnet enqueueV3 returned false");
         return false;
     }
-    // python's torch.clamp(out, 0, 1) on the fp16 engine output: k_restToF is exactly that; an SDR pair's tween
-    // (the SDR view) goes back to the HDR codes in the same step (k_hdrFromSdr)
-    int n = (int)(3 * plane), half = nr.gmOutHalf ? 1 : 0, ps = (int)plane;
-    void* ac[] = {(void*)&nr.dGmOut, &half, &n, (void*)&nr.dGmF};
-    if (nr.gmPairSdr ? !nativeHdrFromSdr(nr, nr.dGmOut, half, ps, nr.pw, nr.pw, nr.ph, nr.dGmF, ps, nr.pw, nr.encPost)
-                     : cuLaunchKernel(nr.fRestToF, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, ac, nullptr) !=
-                           CUDA_SUCCESS)
+    const int ps = (int)plane;
+    if (nr.gmTail)
     {
-        nr.die("gmfss clamp launch failed");
-        return false;
+        // the cut graph's out (in the splat accumulator) -> k_fuTail: the frame clamped straight into dGmF (python's
+        // torch.clamp(out, 0, 1)), or for an SDR pair unclamped into dGmOut (fp32), which k_hdrFromSdr clamps and
+        // takes back to the HDR codes
+        const void* pre = nr.dGmAcc;
+        void* dst = nr.gmPairSdr ? nr.dGmOut : (void*)nr.dGmF;
+        int th = nr.hh, tw = nr.hw, cl = nr.gmPairSdr ? 0 : 1;
+        void* at[] = {(void*)&pre, (void*)&nr.dGmWl, (void*)&nr.dGmBl, (void*)&dst, &th, &tw, &cl};
+        if (cuLaunchKernel(nr.fFuTail, (unsigned)((tw / 2 + 15) / 16), (unsigned)((th / 2 + 7) / 8), 1, 16, 8, 1, 0,
+                           (CUstream)st, at, nullptr) != CUDA_SUCCESS ||
+            (nr.gmPairSdr &&
+             !nativeHdrFromSdr(nr, nr.dGmOut, 0, ps, nr.pw, nr.pw, nr.ph, nr.dGmF, ps, nr.pw, nr.encPost)))
+        {
+            nr.die("gmfss fusion tail launch failed");
+            return false;
+        }
+    }
+    else
+    {
+        // python's torch.clamp(out, 0, 1) on the fp16 engine output: k_restToF is exactly that; an SDR pair's tween
+        // (the SDR view) goes back to the HDR codes in the same step (k_hdrFromSdr)
+        int n = (int)(3 * plane), half = nr.gmOutHalf ? 1 : 0;
+        void* ac[] = {(void*)&nr.dGmOut, &half, &n, (void*)&nr.dGmF};
+        if (nr.gmPairSdr
+                ? !nativeHdrFromSdr(nr, nr.dGmOut, half, ps, nr.pw, nr.pw, nr.ph, nr.dGmF, ps, nr.pw, nr.encPost)
+                : cuLaunchKernel(nr.fRestToF, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, ac, nullptr) !=
+                      CUDA_SUCCESS)
+        {
+            nr.die("gmfss clamp launch failed");
+            return false;
+        }
     }
     if (prof)
         cudaEventRecord(nr.gmEv[10], st);
@@ -12775,65 +12060,20 @@ static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, fl
         return true;
     }
     int half = nr.restHalfOut ? 1 : 0, w4 = 4 * sw, h4 = 4 * sh, ps4 = w4 * h4;
-    if (th <= h4)
+    // realesr.fit: the Lanczos pair at every ratio (an exact copy at 4x itself), with `out.clamp(0,1)` folded into
+    // the taps and the final clamp in the vertical pass
+    void* ah[] = {&nr.dRestOut, &half, &ps4, &w4, &w4, &h4, &nr.dRestTmp, &tw};
+    if (cuLaunchKernel(nr.fRestFoldH, (tw + 15) / 16, (h4 + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah, nullptr) !=
+        CUDA_SUCCESS)
     {
-        // realesr.fit: the antialiased pair when the target height shrinks (an exact copy
-        // at 4x itself), with `out.clamp(0,1)` folded into the taps. A shrinking height runs both
-        // passes in k_restFoldTile (the same bytes, no dRestTmp round trip) at blocks of 32 columns by
-        // the tallest of 32 / 16 / 8 rows that fit 48 KB of shared memory (fitPack's rule); none = the pair
-        if (th < h4)
-        {
-            const int fsh = lzTaps(w4, tw), fsv = lzTaps(h4, th);
-            for (int by = 32; by >= 8; by /= 2)
-            {
-                int rcap = (int)(((long long)(by - 1) * h4 + th - 1) / th) + fsv + 2;
-                const size_t smem = ((size_t)fsh * 32 + (size_t)fsv * by) * 8 + 8 + (size_t)12 * rcap * 32;
-                if (smem > 48 * 1024)
-                    continue;
-                void* at[] = {&nr.dRestOut, &half, &ps4, &w4, &w4, &h4, &dst, &tw, &th, &rcap};
-                if (cuLaunchKernel(nr.fRestFoldTile, (tw + 31) / 32, (th + by - 1) / by, 1, 32, by, 1, (unsigned)smem,
-                                   (CUstream)st, at, nullptr) != CUDA_SUCCESS)
-                {
-                    nr.die("restFoldTile launch failed");
-                    return false;
-                }
-                return !enc || nativeHdrRestOut(nr, dst, tw, th, s, sHalf, ps_, rs_, sw, sh, enc, viewRef);
-            }
-        }
-        void* ah[] = {&nr.dRestOut, &half, &ps4, &w4, &w4, &h4, &nr.dRestTmp, &tw};
-        if (cuLaunchKernel(nr.fRestFoldH, (tw + 15) / 16, (h4 + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah, nullptr) !=
-            CUDA_SUCCESS)
-        {
-            nr.die("restFoldH launch failed");
-            return false;
-        }
-        void* av[] = {&nr.dRestTmp, &tw, &h4, &dst, &th};
-        if (cuLaunchKernel(nr.fRestFoldV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av, nullptr) !=
-            CUDA_SUCCESS)
-        {
-            nr.die("restFoldV launch failed");
-            return false;
-        }
-        return !enc || nativeHdrRestOut(nr, dst, tw, th, s, sHalf, ps_, rs_, sw, sh, enc, viewRef);
-    }
-    // an enlarging target (above 4x): sampleOut's Lanczos from the clamped fp32 copy
-    int n = 3 * ps4, f32 = 0;
-    void* a0[] = {&nr.dRestOut, &half, &n, &nr.dRestF};
-    if (cuLaunchKernel(nr.fRestToF, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
-    {
-        nr.die("restToF launch failed");
+        nr.die("restFoldH launch failed");
         return false;
     }
-    if (!nativeFitPlanar(nr, nr.dRestF, f32, ps4, w4, w4, h4, dst, tw, th, st))
+    void* av[] = {&nr.dRestTmp, &tw, &h4, &dst, &th};
+    if (cuLaunchKernel(nr.fRestFoldV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av, nullptr) !=
+        CUDA_SUCCESS)
     {
-        nr.die("fitPlanar (restore) launch failed");
-        return false;
-    }
-    int n2 = 3 * tw * th;
-    void* a2[] = {&dst, &n2};
-    if (cuLaunchKernel(nr.fClamp01, (n2 + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a2, nullptr) != CUDA_SUCCESS)
-    {
-        nr.die("clamp01 launch failed");
+        nr.die("restFoldV launch failed");
         return false;
     }
     return !enc || nativeHdrRestOut(nr, dst, tw, th, s, sHalf, ps_, rs_, sw, sh, enc, viewRef);
@@ -13213,9 +12453,7 @@ static uint64_t nativeVideoCardLever()
 // nvidia-smi shows; cudaMemGetInfo and the DXGI budget describe this process alone): cardB = its size, freeB = what
 // is free right now, moved = how many allocations the driver has moved out of video memory to make room since the
 // system started. The GPU is the CUDA device's (matched by its adapter LUID), the first NVIDIA one when that cannot
-// be told or the CUDA runtime is not loaded (g_vramNoCuda: offline Auto's fit query). SMV_VRAM_MIB shrinks the card
-// and the free memory with it. false = the driver does not say.
-static bool g_vramNoCuda = false;
+// be told. SMV_VRAM_MIB shrinks the card and the free memory with it. false = the driver does not say.
 static bool nativeVideoMemory(uint64_t& freeB, uint64_t& cardB, uint64_t* moved = nullptr)
 {
     static const NvPhysicalGpuHandle gpu = [] {
@@ -13224,7 +12462,7 @@ static bool nativeVideoMemory(uint64_t& freeB, uint64_t& cardB, uint64_t* moved 
         if (NvAPI_Initialize() != NVAPI_OK || NvAPI_EnumPhysicalGPUs(all, &n) != NVAPI_OK || !n)
             return (NvPhysicalGpuHandle) nullptr;
         LUID want{};
-        if (n > 1 && !g_vramNoCuda && nativeCudaLuid(want))
+        if (n > 1 && nativeCudaLuid(want))
             for (NvU32 i = 0; i < n; i++)
             {
                 NvLogicalGpuHandle lg = nullptr;
@@ -13272,8 +12510,8 @@ static uint64_t nativeVideoMemoryRoom()
 // contexts, RTX Video and DLSS 5's passes exist by then), so only what the first frames create comes after it
 // (NVAPI's free figure from the ring's creation to the steady session, a quarter on top of the measured): DLSS 5's
 // first frames, 120 MiB + 16.6 a megapixel a pass (157 / 226 / 465 MiB at 1920x1080 with 1 / 3 / 10 passes, 139 / 190
-// at 854x480 with 3 / 10: its per-size buffers exist before the ring on this route, so nr_host's kAfterMp is not
-// added), and FRUC's NvOFFRUC buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel of the model
+// at 854x480 with 3 / 10: its per-size buffers exist before the ring on this route, so they are not added), and
+// FRUC's NvOFFRUC buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel of the model
 // frame (296 / 521 MiB at 896x512 / 1920x1088), and AMD FSR 4 frame generation's second midpoint instance with its node
 // frames, 45 MiB + 335 a megapixel of the (unpadded) model frame (a parked live session's own memory, x4 against x2: 146
 // / 476 MiB at 854x480 / 1708x960, a quarter on top) + its side Optical Flow session (nativeFsrfgAhead, x4 and up: 34 /
@@ -13325,102 +12563,6 @@ static uint32_t nativeRingFit(const NativeRife& nr, size_t slotBytes, uint32_t s
     ringB = room > late ? room - late : 0;
     const uint64_t n = ringB / (2ull * slotBytes);
     return (uint32_t)(n < 2 ? 2 : (n > 4096 ? 4096 : n));
-}
-
-// A live session's video memory at the working size mw x mh before anything loads, in bytes. The model's share per
-// backend (the CUDA context, the runtime, the kernels, the engines and every buffer: a base, a padded megapixel of the
-// working size and a megapixel of the capture; NVAPI's free figure from the session's start to its steady state at
-// 854x480 and 1920x1080, and at 960x540 of a 1920x1080 capture for the capture's share, a quarter on top; rife, blend
-// and rifedrba measured with the tween stored in fp16, + 7 for its fp32 store: 6 bytes a pixel more; gmfss moved by a
-// quarter over what its graph set changes against the whole gmflow graph in the process's own memory at 854x480 and
-// 1708x960: gmflow's two halves -76 MiB - 772 a padded megapixel, its backbone once a frame +9 + 50, fusionnet's fp16
-// feature inputs -1 - 102; fsrfg = fruc's row moved by a quarter over the process's own memory against fruc's, one
-// instance, at 854x480 and 1708x960: 475 / 996 MiB against 608 / 928), DLSS 5's
-// passes (nr_host's creation and first-frame shares plus this route's own buffers, kNrLiveMp: within 2 % of the
-// measured 1526 / 828 MiB for 3 passes at 1920x1080 / 960x540), RTX HDR, RTX VSR, Restore at the capture, and the
-// output ring's 2 slots (the ring gives way down to them, nativeRingFit).
-struct LiveModelMem
-{
-    const char* backend;
-    double base, padMp, capMp;
-};
-static const LiveModelMem kLiveModelMem[] = {
-    {"rife", 345, 730, 103}, {"blend", 345, 730, 103}, {"rifedrba", 388, 1210, 103}, {"gmfss", 254, 2036, 103},
-    {"nvof", 297, 116, 103}, {"fruc", 577, 122, 103},  {"fsrfg", 315, 331, 103},     {"echo", 282, 0, 48}};
-constexpr double kNrLiveMp = 30.0;
-static uint64_t nativeLiveNeed(const std::string& backend, int cw, int ch, int mw, int mh)
-{
-    const double mib = 1048576.0, mp = (double)mw * mh / 1e6, capMp = (double)cw * ch / 1e6;
-    const double padMp = (double)((mw + 63) / 64 * 64) * ((mh + 63) / 64 * 64) / 1e6;
-    const LiveModelMem* m = &kLiveModelMem[0];
-    for (const LiveModelMem& e : kLiveModelMem)
-        if (backend == e.backend)
-            m = &e;
-    double need = m->base + m->padMp * padMp + m->capMp * capMp;
-    if (g_liveNrCuda)
-    {
-        const int p = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
-        need += p * (nr::kPassBase + nr::kPassMp * mp) + nr::kAfterBase + nr::kAfterMp * mp + nr::kFrameMp * mp * p +
-                kNrLiveMp * mp;
-    }
-    if (g_rtxHdr && g_hdr) // RTX HDR runs on an HDR desktop only, RTX VSR on SDR only (nativeConfigHdr)
-        need += kRtxHdrBase + kRtxHdrMp * (std::max)(mp, capMp);
-    if (g_rtxVsr && !g_hdr)
-        need += kRtxVsrBase + kRtxVsrMp * mp;
-    else if (g_fsrUp && !g_hdr)
-        need += kFsrUpBase + kFsrUpMp * mp;
-    if (g_restore)
-        need += kRestoreMp * capMp;
-    const double slot = (double)(((size_t)((W * 4 + 255) & ~255u) * H + 511) & ~(size_t)511);
-    return (uint64_t)(need * mib + 4.0 * slot);
-}
-
-// Live Auto's working size by the free video memory (DLSS 5's passes are never cut; Auto may lower its working size):
-// Auto's own pick while the session fits, else the largest lower mode that fits, Ultra Performance when none does
-// (the session then runs anyway and says `video memory ran out` if the driver moves memory out). Picked ONCE a
-// session, before anything loads: every lkSession of the session reads it through liveWorkSize, so the lookups, the
-// builds and the resident handoff key agree. 0 = Auto's own pick (it fits, Auto is off, or there is no room figure:
-// SMV_VRAM_CAP=0 or no driver figure).
-static int liveAutoFitMemory(uint32_t capW, uint32_t capH, const std::wstring& backendW)
-{
-    if (g_dlssMode != 1)
-        return 0;
-    const uint64_t room = nativeVideoMemoryRoom();
-    if (!room)
-        return 0;
-    const int cw = (int)capW, ch = (int)capH;
-    int presW, presH, x0, y0;
-    lkFitRect(cw, ch, W ? (int)W : cw, W ? (int)H : ch, presW, presH, x0, y0);
-    const int pick = (std::max)(liveAutoMode(presW, presH), g_liveAutoFloor);
-    if (pick < 2 || pick > 6)
-        return 0;
-    const std::string backend = wideToUtf8(backendW);
-    int pickW = 0, pickH = 0;
-    uint64_t pickNeed = 0;
-    for (int m = pick; m <= 6; m++)
-    {
-        int mw, mh;
-        liveWorkSizeFor(m, presW, presH, mw, mh);
-        const uint64_t need = nativeLiveNeed(backend, cw, ch, mw, mh);
-        if (m == pick)
-        {
-            pickW = mw;
-            pickH = mh;
-            pickNeed = need;
-        }
-        if (need > room && m < 6)
-            continue;
-        if (m == pick)
-            return 0;
-        const double mib = 1048576.0;
-        LOG("native: video memory: Auto runs %ls (%dx%d) instead of %ls (%dx%d): %ls needs about %.0f MiB, %.0f MiB "
-            "are free%s\n",
-            kDlssModeName[m - 1], mw, mh, kDlssModeName[pick - 1], pickW, pickH, kDlssModeName[pick - 1],
-            pickNeed / mib, room == 1 ? 0.0 : room / mib,
-            need > room ? " (it does not fit at any mode: the session runs anyway)" : "");
-        return m;
-    }
-    return 0;
 }
 
 // A session's video memory check, for every route: nativeVideoMemoryMark at its start (before the engines and
@@ -14092,21 +13234,6 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     const size_t plane = (size_t)nr.ph * nr.pw;
     cudaStream_t st = nr.stream;
 
-    // the previous captured frame's own passes, once the GPU is past them (a frame that reused the last DLSS 5
-    // output ran none and is not counted)
-    if (nr.pfArmed && cudaEventQuery(nr.pfEv[2]) == cudaSuccess)
-    {
-        float all = 0.0f, work = 0.0f;
-        if (cudaEventElapsedTime(&all, nr.pfEv[0], nr.pfEv[2]) == cudaSuccess &&
-            cudaEventElapsedTime(&work, nr.pfEv[1], nr.pfEv[2]) == cudaSuccess)
-        {
-            nr.pfAllMs = nr.pfAllMs > 0.0 ? nr.pfAllMs * 0.8 + all * 0.2 : all;
-            nr.pfWorkMs = nr.pfWorkMs > 0.0 ? nr.pfWorkMs * 0.8 + work * 0.2 : work;
-            nr.pfAllUs.store((uint32_t)(nr.pfAllMs * 1000.0));
-            nr.pfWorkUs.store((uint32_t)(nr.pfWorkMs * 1000.0));
-        }
-    }
-    nr.pfArmed = false;
     // the previous group's own GPU time (the group ended in drainReady(true), so its events are done)
     if (nr.grArmed && cudaEventQuery(nr.grEv[1]) == cudaSuccess)
     {
@@ -14122,11 +13249,6 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 nr.gIntUs.store((uint32_t)(nr.gIntMs * 1000.0));
                 nr.gTweenUs.store((uint32_t)(nr.gTweenMs * 1000.0));
             }
-            else
-            {
-                ema(nr.gBaseMs, pre + slots);
-                nr.gBaseUs.store((uint32_t)(nr.gBaseMs * 1000.0));
-            }
         }
     }
     nr.grArmed = false;
@@ -14141,32 +13263,15 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     }
     if (nr.pfEv[0])
         cudaEventRecord(nr.pfEv[0], st);
-    // the 1:1 frame with nothing between the pack and the motion frame (no DLSS 5, no Sharpen, no RTX HDR, no Restore, no
-    // RTX VSR before the model): k_packInMotion packs it, makes its motion frame and, when the identical-pair test below
-    // runs on this pair, that test too; through nr.capTex it reads the capture array itself
-    const bool packMotion = !(nr.rtxHdr && !nr.rtxFailed && g_rtxb.created) && !(nr.vsrPre && !nr.vsrFailed) &&
-                            !(nr.restPre && nr.ctxRest && !nr.restFailed) && nr.w == nr.cw && nr.h == nr.ch &&
-                            nr.mph == nr.ph && nr.mpw == nr.pw && !nr.dMFit && !(nr.liveNr && !nr.nrFailed) &&
-                            !(nr.sharpen > 0.0f);
-    const bool capDirect = packMotion && nr.capTex;
-    // the real slots present the raw capture bit for bit: the passthrough keys on identity AND no effect, never on
-    // geometry alone (with sharpen or Upscale to on, real frames go through the store like every other frame, with
-    // Restore or DLSS 5 on the real frame is the one they wrote in dCur, never on DRBA: its real frame is the lagged
-    // k - 1), and the model frame must BE the capture (a working size above it, Fill, equals the canvas too)
-    const bool rawPass = nr.identity && nr.w == nr.cw && nr.h == nr.ch && !nr.drba && !nr.hdr && nr.sharpen <= 0.0f &&
-                         !nr.uw && !nr.restore && !nr.liveNr;
-    // (2) read the shared capture texture; the event marks the exe's texture as free again (capDirect: after the pack)
+    // (2) read the shared capture texture; the event marks the exe's texture as free again
     const size_t capRow = (size_t)nr.cw * (nr.hdr ? 8 : 4);
-    if (!capDirect)
+    if (cudaMemcpy2DFromArrayAsync(nr.dCap, capRow, nr.capArr, 0, 0, capRow, nr.ch, cudaMemcpyDeviceToDevice, st) !=
+        cudaSuccess)
     {
-        if (cudaMemcpy2DFromArrayAsync(nr.dCap, capRow, nr.capArr, 0, 0, capRow, nr.ch, cudaMemcpyDeviceToDevice, st) !=
-            cudaSuccess)
-        {
-            nr.die("capture memcpy2DFromArray failed");
-            return false;
-        }
-        cudaEventRecord(nr.capEv, st);
+        nr.die("capture memcpy2DFromArray failed");
+        return false;
     }
+    cudaEventRecord(nr.capEv, st);
     bool capSent = false;
 
     // (3) the previous cur becomes prev, then pack the new frame into the cur half
@@ -14325,7 +13430,6 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             restored = true;
         }
     }
-    bool diffDone = false;
     if (!restored && !nrSame)
     {
         const int ps = (int)plane;
@@ -14348,39 +13452,6 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 nr.die("resizeV (RTX HDR) launch failed");
                 return false;
             }
-        }
-        else if (packMotion)
-        {
-            uint32_t asked = 0;
-            for (uint32_t i = 0; i < nfr; i++)
-                if (fr[i] < 0.999f)
-                    asked++;
-            const float* prev = nullptr;
-            if (asked && nr.havePrev && !nr.drba && g_staticHold && nr.fPairDiff && nr.dStaticFlag && nr.hStaticFlag)
-            {
-                if (cudaMemsetAsync(nr.dStaticFlag, 0, sizeof(int), st) != cudaSuccess)
-                {
-                    nr.die("static flag clear failed");
-                    return false;
-                }
-                prev = nativeXPrev(nr);
-            }
-            int hdr = nr.hdr ? 1 : 0;
-            float white = (float)(g_sdrWhite / 80.0), knee = kMotionPqKnee, cap = kMotionPqCap;
-            uint16_t* mdst = nr.drba ? drbaMotionNext(nr) : nr.dM + 3 * mplane;
-            unsigned long long tex = capDirect ? (unsigned long long)nr.capTex : 0ULL;
-            uint8_t* raw = capDirect && rawPass ? nr.dCap : nullptr;
-            void* a[] = {&nr.dCap, &tex,   &raw,       &hdr,   &nr.cw, &nr.ch, &dCur,        &mdst,
-                         &nr.ph,   &nr.pw, (void*)&ps, &white, &knee,  &cap,   (void*)&prev, &nr.dStaticFlag};
-            if (cuLaunchKernel(nr.fPackInMotion, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
-                               nullptr) != CUDA_SUCCESS)
-            {
-                nr.die("packInMotion launch failed");
-                return false;
-            }
-            if (capDirect)
-                cudaEventRecord(nr.capEv, st);
-            diffDone = prev != nullptr;
         }
         else if (nr.w == nr.cw && nr.h == nr.ch)
         {
@@ -14450,8 +13521,6 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // DLSS 5: once per captured frame on the model frame, after Restore and the
     // resize and before any model reads it; then Sharpen and RTX TrueHDR (nativePreModelPost), and the
     // frame the model reads is kept for the reuse above
-    if (nr.pfEv[1])
-        cudaEventRecord(nr.pfEv[1], st);
     if (nr.liveNr && !nr.nrFailed && !nrSame && !nativeNrFrame(nr, dCur, nr.pw, nr.ph, (int)plane))
         return false;
     // RIFE's motion frame (two domains): the finished picture as the IFNet would have read it, minus
@@ -14484,7 +13553,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         return cuLaunchKernel(nr.fMotionIn, (nr.mpw + 15) / 16, (nr.mph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                               nullptr) == CUDA_SUCCESS;
     };
-    const bool motionHere = nr.mph && !nrSame && !packMotion;
+    const bool motionHere = nr.mph && !nrSame;
     if (motionHere && sdrPre && !motionFrame())
     {
         nr.die("motion frame launch failed");
@@ -14505,11 +13574,6 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             return false;
         }
         nr.nrHaveLast = true;
-    }
-    if (nr.pfEv[2] && !nrSame)
-    {
-        cudaEventRecord(nr.pfEv[2], st);
-        nr.pfArmed = true;
     }
 
     // native DRBA: the new frame and its encode into the history ring; the group then shows
@@ -14551,15 +13615,14 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         const int n = (int)(3 * plane);
         float* dPrev = nr.drba ? drbaFrame(nr, nr.drFid - 2) : nativeXPrev(nr);
         float* dNext = nr.drba ? drLag : dCur;
-        // the 1:1 pack ran the test already (k_packInMotion)
-        if (!diffDone && cudaMemsetAsync(nr.dStaticFlag, 0, sizeof(int), st) != cudaSuccess)
+        if (cudaMemsetAsync(nr.dStaticFlag, 0, sizeof(int), st) != cudaSuccess)
         {
             nr.die("static flag clear failed");
             return false;
         }
         void* ad[] = {&dPrev, &dNext, (void*)&n, &nr.dStaticFlag};
-        if (!diffDone && cuLaunchKernel(nr.fPairDiff, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, ad, nullptr) !=
-                             CUDA_SUCCESS)
+        if (cuLaunchKernel(nr.fPairDiff, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, ad, nullptr) !=
+            CUDA_SUCCESS)
         {
             nr.die("pairDiff launch failed");
             return false;
@@ -14704,51 +13767,9 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         return packFrom(src, (int)plane, nr.pw, nr.w, nr.h, slot, what, half);
     };
     // a fit with no effect after it: the pair's horizontal pass into dFitTmp (3, sh, dw), then the
-    // vertical pass fused with the slot store. k_packOutTile runs both instead (the same bytes, no dFitTmp
-    // round trip) where it measured faster: a shrinking height, in blocks of 32 columns by the tallest of
-    // 32 / 16 / 8 rows whose tables and tile fit the 48 KB of shared memory a launch gets without opting in
-    // (tap counts = lzTaps), and an enlarge of at most 2.75x, in blocks of 16 x 32 (at radius 4: 5 to 27 %
-    // faster a call; a tie at 3x and 3.56x, slower at 4x); none fits = the pair
+    // vertical pass fused with the slot store
     auto fitPack = [&](const void* src, int ps, int rs, int sw, int sh, uint8_t* slot, const char* what,
                        int half = 0) -> bool {
-        auto tileLaunch = [&](int bx, int by, bool& launched) -> bool {
-            const int fsh = lzTaps(sw, nr.dw), fsv = lzTaps(sh, nr.dh);
-            int hdr = nr.hdr ? 1 : 0;
-            int rcap = (int)(((long long)(by - 1) * sh + nr.dh - 1) / nr.dh) + fsv + 2;
-            const size_t smem = ((size_t)fsh * bx + (size_t)fsv * by) * 8 + 8 + (size_t)12 * rcap * bx;
-            launched = false;
-            if (smem > 48 * 1024)
-                return true;
-            void* at[] = {(void*)&src,    &half,  &ps,    &rs,    &sw,    &sh,  &slot,
-                          (void*)&pitchI, &nr.x0, &nr.y0, &nr.dw, &nr.dh, &hdr, &rcap};
-            if (cuLaunchKernel(nr.fPackOutTile, (nr.dw + bx - 1) / bx, (nr.dh + by - 1) / by, 1, bx, by, 1,
-                               (unsigned)smem, (CUstream)st, at, nullptr) != CUDA_SUCCESS)
-            {
-                nr.die(what);
-                return false;
-            }
-            launched = true;
-            return true;
-        };
-        bool launched = false;
-        if (nr.dh < sh)
-        {
-            for (int by = 32; by >= 8 && !launched; by /= 2)
-                if (!tileLaunch(32, by, launched))
-                    return false;
-        }
-        else if (nr.dh > sh && 4LL * nr.dh <= 11LL * sh)
-        {
-            if (!tileLaunch(16, 32, launched))
-                return false;
-            if (launched && !nr.fitUpLogged)
-            {
-                nr.fitUpLogged = true;
-                LOG("native: the fit's enlarge %dx%d -> %dx%d runs in one kernel\n", sw, sh, nr.dw, nr.dh);
-            }
-        }
-        if (launched)
-            return true;
         void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &nr.dFitTmp, &nr.dw};
         if (cuLaunchKernel(nr.fFitAaH, (nr.dw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah, nullptr) !=
             CUDA_SUCCESS)
@@ -14765,20 +13786,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
         return true;
     };
-    // one resize of a planar source (ps / rs / sw x sh) into a planar target tw x th: the
-    // Lanczos pair through tmp (3, sh, tw) when aa, else sampleOut's Lanczos (an
-    // enlarging or 1:1 resize). With tile (Upscale to's nr.upTile) the pair runs as k_fitAaTile (the same
-    // bytes, no tmp round trip) at fitPack's blocks; none fits = the pair
+    // one resize of a planar source (ps / rs / sw x sh) into a planar target tw x th: the Lanczos pair through tmp
+    // (3, sh, tw) when aa, else k_fitPlanar's 1:1 crop copy
     auto resizePlanar = [&](const void* src, int ps, int rs, int sw, int sh, bool aa, float* tmp, float* dst, int tw,
-                            int th, int half = 0, bool tile = false) -> bool {
-        if (aa && tile)
-        {
-            bool launched = false;
-            if (!nativeFitAaTile(nr, src, half, ps, rs, sw, sh, dst, tw, th, st, launched))
-                return false;
-            if (launched)
-                return true;
-        }
+                            int th, int half = 0) -> bool {
         if (aa)
         {
             void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &tmp, &tw};
@@ -14841,7 +13852,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 LOG("native: RTX VSR eval failed (rc %u), Lanczos for the rest of the run\n", rv);
                 nr.vsrFailed = true;
                 if (!nr.uw) // VSR = enlarging fit
-                    return packFrom(src, ps, rs, nr.w, nr.h, slot, what, half);
+                    return fitPack(src, ps, rs, nr.w, nr.h, slot, what, half);
             }
         }
         if (haveVsr && !nr.uw)
@@ -14869,15 +13880,14 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             }
         }
         else if (!resizePlanar(src, ps, rs, nr.w, nr.h, nr.uw ? nr.upAa : nr.fitAa, nr.uw ? nr.dUpTmp : nr.dFitTmp,
-                               stage, tw, th, half, nr.uw && nr.upTile))
+                               stage, tw, th, half))
             return false;
         // the second resize, internal render frame -> the fit rect: the pair with the fused store (the
         // plain packer's 1:1 copy when the size stays)
         if (nr.uw)
             return nr.fitAa ? fitPack(nr.dUp, nr.uw * nr.uh, nr.uw, nr.uw, nr.uh, slot, what)
                             : packFrom(nr.dUp, nr.uw * nr.uh, nr.uw, nr.uw, nr.uh, slot, what);
-        // the staging frame is the presented frame, stored 1:1 (sampleOut's identity branch reads it as a
-        // dw x dh source with no pad)
+        // the staging frame is the presented frame, stored 1:1 (sampleOut reads it as a dw x dh source with no pad)
         return packFrom(nr.dPres, nr.dw * nr.dh, nr.dw, nr.dw, nr.dh, slot, what);
     };
     uint8_t* heldSlot = nullptr; // a held pair's first real slot, copied into its other slots
@@ -14897,18 +13907,6 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     fail = true;
                     break;
                 }
-            }
-            else if (rawPass)
-            {
-                // bit-exact passthrough of the raw capture (rawPass above; capDirect: the pack wrote dCap)
-                if (cudaMemcpy2DAsync(slot, nr.pitch, nr.dCap, (size_t)nr.cw * 4, (size_t)nr.cw * 4, nr.ch,
-                                      cudaMemcpyDeviceToDevice, st) != cudaSuccess)
-                {
-                    nr.die("real slot copy failed");
-                    fail = true;
-                    break;
-                }
-                heldSlot = slot;
             }
             else if (!storeSlot(nr.drba ? drLag : dCur, slot, "packOut (real) launch failed"))
             {
@@ -14989,8 +13987,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         {
             if (twDone >= chunkBase + chunkLen)
             {
-                // next chunk of tweens, up to the engine's batch (1 for the unbatched class; offline's
-                // fixed class takes a whole group)
+                // next chunk of tweens, up to the engine's batch (1: the unbatched class)
                 chunkBase = twDone;
                 chunkLen = nTween - chunkBase;
                 if (chunkLen > (uint32_t)nr.batchMax)

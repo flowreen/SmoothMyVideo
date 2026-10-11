@@ -178,7 +178,7 @@ function pyMtimeInt(p: string): number {
 export function resumeSig(ns: ArgNs, env: Env = process.env): string {
   const inp = path.win32.resolve(ns.input as string);
   const d: Record<string, string> = {};
-  // no_gpu_fit changes no pixel by itself (a working size the fit lowers is signed as work_fit)
+  // no_gpu_fit changes no pixel by itself
   for (const [k, v] of Object.entries(ns)) if (k !== 'no_gpu_fit') d[k] = argJson(k, v);
   const input = winNormAbs(ns.input as string);
   d.input = pyJsonDumps(input);

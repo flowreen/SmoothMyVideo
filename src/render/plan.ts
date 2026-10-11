@@ -23,7 +23,7 @@ export interface RenderArgs {
   fsr_upscale: boolean; // --fsr-upscale: AMD FSR 4 in RTX VSR's resize (the two exclude each other)
   rtx_hdr: boolean;
   restore: boolean;
-  no_gpu_fit: boolean; // --no-gpu-fit: no video memory fit (the host's batch and Auto's working size)
+  no_gpu_fit: boolean; // --no-gpu-fit: no video memory fit
   dlssnr: boolean;
   dv: boolean;
   hdr10plus: boolean;
@@ -48,24 +48,10 @@ export const DLSS_MODES: Record<string, number> = {
   ultra: 1 / 3,
 };
 
-/** NVIDIA's Auto by the output's pixel count: below 1080p DLAA, up to 1440p Quality, up to 4K
- * Performance, above it Ultra Performance. */
-export function autoMode(ow: number, oh: number): string {
-  const px = ow * oh;
-  if (px < 1920 * 1080) return 'dlaa';
-  if (px <= 2560 * 1440) return 'quality';
-  if (px <= 3840 * 2160) return 'performance';
-  return 'ultra';
-}
-
-/** --scale: a mode name (auto, dlaa, quality, balanced, performance, ultra) or a number in (0, 1];
+/** --scale: a mode name (dlaa, quality, balanced, performance, ultra) or a number in (0, 1];
  * absent = DLAA. null = not one of those. */
-export function workFactor(scale: string | null, ow: number, oh: number): { mode: string; factor: number } | null {
+export function workFactor(scale: string | null): { mode: string; factor: number } | null {
   const s = (scale ?? 'dlaa').trim().toLowerCase();
-  if (s === 'auto') {
-    const m = autoMode(ow, oh);
-    return { mode: `Auto (${m})`, factor: DLSS_MODES[m] };
-  }
   if (s in DLSS_MODES) return { mode: s, factor: DLSS_MODES[s] };
   const f = s === '' ? NaN : Number(s);
   if (!(f > 0 && f <= 1)) return null;
@@ -109,9 +95,9 @@ export function workPlan(
   const srcSar = sourceSar(st);
   const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0, srcSar);
   const sar: [number, number] = upscaleF !== 1.0 ? [1, 1] : srcSar;
-  const wf = workFactor(scale, ow, oh);
+  const wf = workFactor(scale);
   if (!wf)
-    return `--scale takes a DLSS mode (auto, dlaa, quality, balanced, performance, ultra) or a number in (0, 1], not '${scale}'`;
+    return `--scale takes a DLSS mode (dlaa, quality, balanced, performance, ultra) or a number in (0, 1], not '${scale}'`;
   // DLAA is the output itself (an odd source width stays odd, no 1-px fold)
   let ww = ow;
   let wh = oh;
@@ -150,25 +136,6 @@ export function workPlan(
     (capped ? "; capped at 3840x2160, the interpolation's reach" : '') +
     ')\n';
   return { w: dw, h: dh, workW: ww, workH: wh, outW: ow, outH: oh, sar, vf, note };
-}
-
-/** Auto's candidates for its video memory fit, its own pick first: the plan of every DLSS mode from that pick down to
- * Ultra Performance (the render host prices them, --fit-work). */
-export function autoCandidates(
-  st: Stream,
-  w: number,
-  h: number,
-  upscaleF: number,
-  nr = false,
-): { mode: string; plan: WorkPlan }[] {
-  const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0, sourceSar(st));
-  const order = Object.keys(DLSS_MODES);
-  const out: { mode: string; plan: WorkPlan }[] = [];
-  for (const m of order.slice(order.indexOf(autoMode(ow, oh)))) {
-    const p = workPlan(st, w, h, upscaleF, m, nr);
-    if (typeof p !== 'string') out.push({ mode: m, plan: p });
-  }
-  return out;
 }
 
 /** The output resolution: the factor on both dimensions, each rounded down to even; the width also takes the source's

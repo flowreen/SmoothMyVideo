@@ -68,22 +68,12 @@ def rife_weights_tag():
     return t
 
 
-def engine_name(name, shapes, input_names=None, dyn_batch=None):
+def engine_name(name, shapes):
     """Cache name of the engine the host builds for this sub net at these example shapes:
     every input's shape, H and W pinned (one engine per resolution: a dynamic-shape profile's
     execution context reserves memory for the profile MAXIMUM, 8 GB for a 960x540 live session,
-    and its kernel cache grows with every size).
-    An input whose batch axis is dynamic (the live RIFE timestep stack, dyn_batch = {input:
-    (min, opt, max)}) writes its range as "1to8" in place of the example batch, so no session's
-    first group size leaks into the name and the fixed-batch classes can never collide."""
-    parts = []
-    names = input_names if input_names is not None else [None] * len(shapes)
-    for n, s in zip(names, shapes):
-        dims = [str(int(v)) for v in s]
-        if dyn_batch and n in dyn_batch:
-            lo, _opt, hi = dyn_batch[n]
-            dims[0] = f"{lo}to{hi}"
-        parts.append("x".join(dims))
+    and its kernel cache grows with every size)."""
+    parts = ["x".join(str(int(v)) for v in s) for s in shapes]
     return f"{name}_{'_'.join(parts)}_{trt_tag()}_{weights_tag()}"
 
 

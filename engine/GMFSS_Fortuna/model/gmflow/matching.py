@@ -67,18 +67,27 @@ def local_correlation_softmax(feature0, feature1, local_radius,
         # which a size-free export cannot hold. The same math on the whole grid, the two
         # per-pixel products as multiply + sum over one axis (no batched gemm, so no launch cap);
         # a different summation order: equivalent, measured closer to eager fp32 than the
-        # chunked engine
-        valid = ((sample_coords[:, :, :, 0] >= 0) & (sample_coords[:, :, :, 0] < w)
-                 & (sample_coords[:, :, :, 1] >= 0) & (sample_coords[:, :, :, 1] < h))
+        # chunked engine. The host computes the window positions between gmflow's two engines
+        # (trt_runtime.gmflow_split), so the window bounds and offsets come from integer ranges
+        # made after the correlation (nothing size-only crosses the split), and the flow is
+        # prob x offsets: sum(prob * (coords + offset)) - coords with sum(prob) = 1, without
+        # the coords-sized rounding of the long form
         window_feature = F.grid_sample(feature1, normalize_coords(sample_coords, h, w),
                                        padding_mode=padding_mode, align_corners=True
                                        )  # [B, C, H*W, (2R+1)^2]
         corr = (feature0.view(b, c, h * w, 1) * window_feature).sum(1) / (c ** 0.5)
+        ks = range(local_h * local_w)
+        dx = torch.tensor([k % local_w - local_radius for k in ks], device=feature0.device)
+        dy = torch.tensor([k // local_w - local_radius for k in ks], device=feature0.device)
+        sx = torch.arange(w, device=feature0.device)[None, :] + dx[:, None]  # [(2R+1)^2, W]
+        sy = torch.arange(h, device=feature0.device)[None, :] + dy[:, None]  # [(2R+1)^2, H]
+        vx, vy = (sx >= 0) & (sx < w), (sy >= 0) & (sy < h)
+        valid = (vy.t()[:, None, :] & vx.t()[None, :, :]).reshape(1, h * w, -1)  # [1, H*W, (2R+1)^2]
         corr = corr.masked_fill(~valid, torch.finfo(corr.dtype).min / 2)
         prob = F.softmax(corr, -1)  # [B, H*W, (2R+1)^2]
-        correspondence = (prob.unsqueeze(-1) * sample_coords).sum(-2)  # [B, H*W, 2]
-        correspondence = correspondence.view(b, h, w, 2).permute(0, 3, 1, 2)  # [B, 2, H, W]
-        return correspondence - coords_init, None
+        offsets = torch.stack([dx, dy], -1).to(prob.dtype)  # [(2R+1)^2, 2]
+        flow = (prob.unsqueeze(-1) * offsets).sum(-2)  # [B, H*W, 2]
+        return flow.view(b, h, w, 2).permute(0, 3, 1, 2), None  # [B, 2, H, W]
 
     feature0_view = feature0.permute(0, 2, 3, 1).view(b, h * w, 1, c)  # [B, H*W, 1, C]
 
