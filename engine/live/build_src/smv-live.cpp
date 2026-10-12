@@ -3405,6 +3405,11 @@ int wmain(int argc, wchar_t** argv)
         return runProbe(h, (frames < 1 || frames > cap) ? 3 : frames, dumpPath);
     }
 
+    // --build-engine LOG SCRIPT ONNX ENGINE WSMULT NAME=D0xD1x...: one engine built + warmed into the cache (the GMFSS
+    // build helper, runBuildEngine)
+    if (argc >= 2 && wcscmp(argv[1], L"--build-engine") == 0)
+        return runBuildEngine(argc, argv);
+
     if (argc >= 2 && wcscmp(argv[1], L"--offline") == 0)
     {
         wchar_t gv[8]{};

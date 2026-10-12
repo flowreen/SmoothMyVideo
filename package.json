@@ -15,10 +15,10 @@
     "postinstall": "node scripts/dev-icon.ts"
   },
   "devDependencies": {
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.5",
     "electron": "^44.7.0",
     "electron-builder": "^26.15.3",
-    "prettier": "^3.9.9",
+    "prettier": "^3.9.10",
     "pyright": "^1.1.414",
     "rcedit": "^5.0.2",
     "typescript": "^7.0.2"

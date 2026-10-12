@@ -1123,6 +1123,211 @@ __global__ void k_splatNorm(const long long* __restrict__ acc, int C, int n,
                 __fdiv_rn((float)acc[(size_t)c * n + i] * (1.0f / 67108864.0f), norm));
 }
 
+// The gather form of k_splatSoft + k_splatNorm, the same output bit for bit without accumulator planes: a list per
+// target cell of the (source pixel, corner) pairs landing on it, then one thread per cell adds the SAME int64
+// fixed-point products k_splatSoft adds (integer adds are order-free, so the list order does not matter) and divides
+// like k_splatNorm. One list serves every input splatted with one flow, metric and s (the image and the features at
+// the half). k_gsCount: per source pixel k_splatSoft's landing and e, kept as e / dx / dy planes, and a count per
+// landed cell; k_gsScanA / B / C: the counts -> exclusive list offsets (off[n] = the total) and a fill cursor;
+// k_gsFill: entry = source * 4 + corner (0 NW, 1 NE, 2 SW, 3 SE).
+__device__ __forceinline__ bool gsLand(int x, int y, float s, const float* __restrict__ flow, int w, int h, int& nwX,
+                                       int& nwY, float& dx, float& dy)
+{
+    const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
+    return land(x, s, flow[o], nwX, dx) && land(y, s, flow[plane + o], nwY, dy);
+}
+
+__global__ void k_gsCount(const float* __restrict__ flow, const void* __restrict__ metric, int metricHalf, float s,
+                          int w, int h, int* __restrict__ cnt, float* __restrict__ src)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
+    int nwX, nwY;
+    float dx, dy;
+    if (!gsLand(x, y, s, flow, w, h, nwX, nwY, dx, dy)) return;
+    src[o] = expf(__fmul_rn(s, gmTap(metric, metricHalf, o)));
+    src[plane + o] = dx;
+    src[2 * plane + o] = dy;
+    const bool okW = nwX >= 0 && nwX < w, okE = nwX + 1 >= 0 && nwX + 1 < w;
+    const bool okN = nwY >= 0 && nwY < h, okS = nwY + 1 >= 0 && nwY + 1 < h;
+    const long long oNW = (long long)nwY * w + nwX;
+    if (okN && okW) atomicAdd(cnt + oNW, 1);
+    if (okN && okE) atomicAdd(cnt + oNW + 1, 1);
+    if (okS && okW) atomicAdd(cnt + oNW + w, 1);
+    if (okS && okE) atomicAdd(cnt + oNW + w + 1, 1);
+}
+
+// the exclusive prefix sum of v over a block of 1024 threads; *total = the block's sum (sh = 32 ints)
+__device__ int gsBlockScan(int v, int* sh, int* total)
+{
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    int x = v;
+    for (int d = 1; d < 32; d <<= 1)
+    {
+        const int t = __shfl_up_sync(0xffffffffu, x, d);
+        if (lane >= d) x += t;
+    }
+    if (lane == 31) sh[wid] = x;
+    __syncthreads();
+    if (wid == 0)
+    {
+        int y = sh[lane];
+        for (int d = 1; d < 32; d <<= 1)
+        {
+            const int t = __shfl_up_sync(0xffffffffu, y, d);
+            if (lane >= d) y += t;
+        }
+        sh[lane] = y;
+    }
+    __syncthreads();
+    const int r = (wid ? sh[wid - 1] : 0) + x - v;
+    *total = sh[31];
+    __syncthreads();
+    return r;
+}
+
+// 2048 counts a block of 1024 threads -> block-local offsets + the block's sum
+__global__ void k_gsScanA(const int* __restrict__ cnt, int n, int* __restrict__ off, int* __restrict__ blk)
+{
+    __shared__ int sh[32];
+    const int i = blockIdx.x * 2048 + 2 * threadIdx.x;
+    const int a = i < n ? cnt[i] : 0, b = i + 1 < n ? cnt[i + 1] : 0;
+    int total;
+    const int ex = gsBlockScan(a + b, sh, &total);
+    if (i < n) off[i] = ex;
+    if (i + 1 < n) off[i + 1] = ex + a;
+    if (threadIdx.x == 0) blk[blockIdx.x] = total;
+}
+
+// one block of 1024 threads: up to 4096 block sums -> their exclusive offsets; off[n] = the total
+__global__ void k_gsScanB(int* __restrict__ blk, int nb, int* __restrict__ off, int n)
+{
+    __shared__ int sh[32];
+    const int i = 4 * threadIdx.x;
+    int v[4], sum = 0;
+    for (int k = 0; k < 4; k++)
+    {
+        v[k] = i + k < nb ? blk[i + k] : 0;
+        sum += v[k];
+    }
+    int total;
+    int ex = gsBlockScan(sum, sh, &total);
+    for (int k = 0; k < 4; k++)
+    {
+        if (i + k < nb) blk[i + k] = ex;
+        ex += v[k];
+    }
+    if (threadIdx.x == 0) off[n] = total;
+}
+
+// the block offsets added: off = the list starts, cursor = a copy the fill advances
+__global__ void k_gsScanC(int* __restrict__ off, const int* __restrict__ blk, int n, int* __restrict__ cursor)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int v = off[i] + blk[i / 2048];
+    off[i] = v;
+    cursor[i] = v;
+}
+
+__global__ void k_gsFill(const float* __restrict__ flow, float s, int w, int h, int* __restrict__ cursor,
+                         int* __restrict__ list)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    int nwX, nwY;
+    float dx, dy;
+    if (!gsLand(x, y, s, flow, w, h, nwX, nwY, dx, dy)) return;
+    const bool okW = nwX >= 0 && nwX < w, okE = nwX + 1 >= 0 && nwX + 1 < w;
+    const bool okN = nwY >= 0 && nwY < h, okS = nwY + 1 >= 0 && nwY + 1 < h;
+    const long long oNW = (long long)nwY * w + nwX;
+    const int e0 = (y * w + x) * 4;
+    if (okN && okW) list[atomicAdd(cursor + oNW, 1)] = e0;
+    if (okN && okE) list[atomicAdd(cursor + oNW + 1, 1)] = e0 + 1;
+    if (okS && okW) list[atomicAdd(cursor + oNW + w, 1)] = e0 + 2;
+    if (okS && okE) list[atomicAdd(cursor + oNW + w + 1, 1)] = e0 + 3;
+}
+
+// llrintf(x) through the 32-bit conversion where it fits: __float2int_rn rounds to nearest even like llrintf, so
+// |x| < 2^31 gives the same integer; larger values and NaN take llrintf
+__device__ __forceinline__ long long gsQ(float x)
+{
+    return fabsf(x) < 2147483648.0f ? (long long)__float2int_rn(x) : llrintf(x);
+}
+
+// one list entry: its source pixel, e and corner weight (k_splatSoft's wNW / wNE / wSW / wSE expressions)
+__device__ __forceinline__ void gsEntry(int ent, const float* __restrict__ src, size_t plane, int& o, float& e,
+                                        float& wc)
+{
+    o = ent >> 2;
+    e = src[o];
+    const float dx = src[plane + o], dy = src[2 * plane + o];
+    const int k = ent & 3;
+    wc = k == 0 ? (1.0f - dx) * (1.0f - dy) : k == 1 ? dx * (1.0f - dy) : k == 2 ? (1.0f - dx) * dy : dx * dy;
+}
+
+// one target cell and up to 8 channels (blockIdx.y = the channel group): k_splatSoft's int64 sums over the cell's list
+// (the normalizer = e, then its channels of `in`), divided like k_splatNorm into those planes of dst; the first 8
+// entries stay in registers across the channels
+__global__ void k_gsGather(const void* __restrict__ in, int inHalf, int C, const float* __restrict__ src, int w, int h,
+                           const int* __restrict__ off, const int* __restrict__ list, void* __restrict__ dst,
+                           int dstHalf)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = w * h;
+    const int c0 = (int)blockIdx.y * 8, c1 = c0 + 8 < C ? c0 + 8 : C;
+    if (i >= n) return;
+    const size_t plane = (size_t)n;
+    const int b = off[i], m = off[i + 1] - b;
+    int so[8];
+    float se[8], sw[8];
+    unsigned long long accN = 0;
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+    {
+        so[k] = 0;
+        se[k] = 0.0f;
+        sw[k] = 0.0f;
+        if (k < m)
+        {
+            gsEntry(list[b + k], src, plane, so[k], se[k], sw[k]);
+            accN += (unsigned long long)gsQ(se[k] * sw[k] * 67108864.0f);
+        }
+    }
+    for (int k = 8; k < m; k++)
+    {
+        int o;
+        float e, wc;
+        gsEntry(list[b + k], src, plane, o, e, wc);
+        accN += (unsigned long long)gsQ(e * wc * 67108864.0f);
+    }
+    const float norm = __fadd_rn((float)(long long)accN * (1.0f / 67108864.0f), 0.0000001f);
+    for (int c = c0; c < c1; c++)
+    {
+        const size_t pc = (size_t)c * plane;
+        unsigned long long acc = 0;
+#pragma unroll
+        for (int k = 0; k < 8; k++)
+            if (k < m)
+            {
+                const float v = __fmul_rn(gmTap(in, inHalf, pc + so[k]), se[k]);
+                acc += (unsigned long long)gsQ(v * sw[k] * 67108864.0f);
+            }
+        for (int k = 8; k < m; k++)
+        {
+            int o;
+            float e, wc;
+            gsEntry(list[b + k], src, plane, o, e, wc);
+            const float v = __fmul_rn(gmTap(in, inHalf, pc + o), e);
+            acc += (unsigned long long)gsQ(v * wc * 67108864.0f);
+        }
+        gmStore(dst, dstHalf, pc + i, __fdiv_rn((float)(long long)acc * (1.0f / 67108864.0f), norm));
+    }
+}
+
 // Adaptive Sharpen: bacondither's DX11 2-pass HQ (version 2021-09-10, quality_mode 1; Copyright (c) 2015-2021,
 // bacondither, BSD-2-Clause, see THIRD_PARTY_NOTICES.md). Both passes run in one kernel per 16 x 16 block through
 // shared memory: the colour tile with a 5 px border, then the edge (pass 1) and the luma of every position pass 2
@@ -3797,16 +4002,25 @@ struct NativeRife
     float* dGmMetP[2] = {};      // the metric pyramids at the quarter / eighth (fp32)
     long long* dGmAcc = nullptr; // the splat accumulator, max(C) + 1 planes of the half; with gmTail it also holds the
                                  // cut fusionnet's out (256 fp16 planes, free from the splats' end to the next clear)
-    bool gmTail = false;         // the cut fusionnet (out = the pre-shuffle tensor): k_fuTail does shuffle + conv_last
-    void* dGmWl = nullptr;       // the cut fusionnet's w_last (3, 64, 3, 3) fp16: conv_last's weight
-    void* dGmBl = nullptr;       // its b_last (3) fp16: conv_last's bias
-    float* dGmFa = nullptr;      // fusionnet a (9, half): I1t, merged (ifnet writes it), I2t
-    void* dGmFb = nullptr;       // fusionnet b (2 * gmC[0], half) in the engine's dtype
-    void* dGmFc = nullptr;       // fusionnet c (2 * gmC[1], quarter), the same dtype
-    void* dGmFd = nullptr;       // fusionnet d (2 * gmC[2], eighth), the same dtype
-    float* dGmT = nullptr;       // the timestep, one device float (ifnet's 1x1x1x1 input)
-    void* dGmOut = nullptr;      // the fusionnet output (3, ph, pw) in the engine's dtype (gmTail: k_fuTail's, fp32)
-    float* dGmF = nullptr;       // that output clamped to fp32: what storeSlot consumes
+    // the gather splats (k_gs*): two list sets (a level's two directions), each the counts / fill cursor, the list
+    // offsets, the entries and the sources' e / dx / dy planes, sized for the half; gmGather false (SMV_GM_SPLAT=old,
+    // or a half above the scan's 2048 x 4096 cells) = k_splatSoft + k_splatNorm on dGmAcc
+    int* dGsCnt[2] = {};
+    int* dGsOff[2] = {};
+    int* dGsList[2] = {};
+    float* dGsSrc[2] = {};
+    int* dGsBlk[2] = {};
+    bool gmGather = false;
+    bool gmTail = false;    // the cut fusionnet (out = the pre-shuffle tensor): k_fuTail does shuffle + conv_last
+    void* dGmWl = nullptr;  // the cut fusionnet's w_last (3, 64, 3, 3) fp16: conv_last's weight
+    void* dGmBl = nullptr;  // its b_last (3) fp16: conv_last's bias
+    float* dGmFa = nullptr; // fusionnet a (9, half): I1t, merged (ifnet writes it), I2t
+    void* dGmFb = nullptr;  // fusionnet b (2 * gmC[0], half) in the engine's dtype
+    void* dGmFc = nullptr;  // fusionnet c (2 * gmC[1], quarter), the same dtype
+    void* dGmFd = nullptr;  // fusionnet d (2 * gmC[2], eighth), the same dtype
+    float* dGmT = nullptr;  // the timestep, one device float (ifnet's 1x1x1x1 input)
+    void* dGmOut = nullptr; // the fusionnet output (3, ph, pw) in the engine's dtype (gmTail: k_fuTail's, fp32)
+    float* dGmF = nullptr;  // that output clamped to fp32: what storeSlot consumes
     // HDR planes (nativeGmfssPair): the SDR view of one padded frame (hdrToModel, the scratch), the motion view's
     // halves gmflow and metricnet read on a pair outside the SDR range, the range flag (device, pinned host copy);
     // per feature slot: its frame stays inside the SDR range, its features came from the SDR view; the pair's mode
@@ -4253,6 +4467,8 @@ struct NativeRife
     CUfunction fNrInPq = nullptr, fNrOutPq = nullptr;                 // live DLSS 5 on HDR (PQ) planes
     CUfunction fHalf = nullptr, fPyr = nullptr, fSplatSoft = nullptr, // live GMFSS glue (5b)
         fSplatNorm = nullptr;
+    CUfunction fGsCount = nullptr, fGsScanA = nullptr, fGsScanB = nullptr, fGsScanC = nullptr, fGsFill = nullptr,
+               fGsGather = nullptr;                           // the gather splats
     CUfunction fPackInRaw16 = nullptr, fPackInRaw8 = nullptr, // offline
         fPackOutRaw16 = nullptr, fPackOutRaw8 = nullptr, fExpand8to16 = nullptr;
     CUfunction fPairDiff = nullptr, fRawDiff = nullptr;                       // identical-pair test, DLSS 5 reuse test
@@ -5623,6 +5839,7 @@ static bool lkWarmEngine(nvinfer1::IRuntime* rt, const std::string& enginePath,
                          bool* oom)
 {
     *oom = false;
+    const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> blob;
     if (!lkReadFile(enginePath, blob))
         return false;
@@ -5707,6 +5924,8 @@ static bool lkWarmEngine(nvinfer1::IRuntime* rt, const std::string& enginePath,
         LOG("native: cannot write %s\n", jit.c_str());
         return false;
     }
+    LOG("native: warmed %s in %.1fs\n", enginePath.substr(enginePath.find_last_of("\\/") + 1).c_str(),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (!warmKey.empty())
     {
         // trt_lookup.mark_warm: the key set, sorted, one per line
@@ -5775,6 +5994,156 @@ static bool lkEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTag
     return lkWarmEngine(rt, path, warmSets, warmKey, st, oom);
 }
 
+// --build-engine LOG SCRIPT ONNX ENGINE WSMULT NAME=D0xD1x... ...: build ENGINE from ONNX when it is missing, warm it
+// with a fresh runtime cache (its .jit) and exit; LOG takes this process's log lines. lkGmEnsure runs gmflow A this way
+// beside its own work. Exit 0 = done, 3 = a memory-shaped failure, 2 = any other; SMV_GM_HELPER_TEST=fail = exit 2 at
+// once (the parent's fallback trigger).
+static int runBuildEngine(int argc, wchar_t** argv)
+{
+    FILE* logf = nullptr;
+    if (argc < 8 || _wfreopen_s(&logf, argv[2], L"w", stderr) != 0)
+        return 2;
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    if (lkEnv("SMV_GM_HELPER_TEST") == "fail")
+    {
+        LOG("native: build helper failing on SMV_GM_HELPER_TEST=fail\n");
+        return 2;
+    }
+    if (!nativeLoadDlls(argv[3]) || !g_onnxParserOk)
+        return 2;
+    const std::string onnx = wideToUtf8(argv[4]), path = wideToUtf8(argv[5]);
+    const int ws = _wtoi(argv[6]);
+    std::vector<std::string> names;
+    names.reserve((size_t)argc);
+    std::vector<LkShape> set;
+    for (int i = 7; i < argc; i++)
+    {
+        const std::string a = wideToUtf8(argv[i]);
+        const size_t eq = a.find('=');
+        if (eq == std::string::npos || eq + 1 >= a.size())
+            return 2;
+        names.push_back(a.substr(0, eq));
+        LkShape sh{names.back().c_str(), {}};
+        for (size_t p = eq + 1; p <= a.size();)
+        {
+            size_t x = a.find('x', p);
+            if (x == std::string::npos)
+                x = a.size();
+            sh.dims.push_back(_atoi64(a.substr(p, x - p).c_str()));
+            p = x + 1;
+        }
+        set.push_back(sh);
+    }
+    nvinfer1::IRuntime* rt = lkRuntime();
+    cudaStream_t st = nullptr;
+    if (!rt || ws < 1 || !lkBuildStream(st))
+        return 2;
+    bool oom = false;
+    const bool ok = (lkFile(path) || lkBuild(rt, onnx, path, set, nullptr, 0, 0, ws, &oom)) &&
+                    lkWarmEngine(rt, path, {set}, std::string(), st, &oom);
+    cudaStreamDestroy(st);
+    return ok ? 0 : oom ? 3 : 2;
+}
+
+// GMFSS's nets `nets` (indices into s.gm), built when missing and warmed. TensorRT-RTX compiles one engine at a time
+// per PROCESS (a build or a JIT warm-up on another thread waits for the running one; two processes run at full speed:
+// 103rd chat), so gmflow A ("gflow", ~30 of the set's ~45 s cold at every size) goes to a helper process (this exe's
+// --build-engine, killed with this process through a job object) while this thread does the other nets in order on
+// st; a helper that fails, or cannot start, leaves A to this thread afterwards. The lookups need every net's .jit, which
+// is written only after that net's warm-up, so a set is never marked warm early. SMV_GM_HELPER=0 = no helper (the A/B
+// lever). *oom = a failure was memory-shaped.
+static bool lkGmEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTags& t, const std::vector<size_t>& nets,
+                       cudaStream_t st, bool* oom)
+{
+    *oom = false;
+    auto path = [&](size_t i) {
+        const LkGmNet& n = s.gm[i];
+        return s.cacheDir + "\\" + lkEngineName(n.base, lkGmNameSet(n), nullptr, 0, 0, t) + ".engine";
+    };
+    auto one = [&](size_t i) {
+        // the warm key sits on fusionnet's jit
+        const LkGmNet& n = s.gm[i];
+        return lkEnsure(rt, s, t, path(i), n.onnx, n.set, nullptr, 0, 0, n.ws, {n.set},
+                        !strcmp(n.key, "gfusion") ? s.warmKey : std::string(), st, oom);
+    };
+    size_t a = nets.size();
+    for (size_t k = 0; k < nets.size(); k++)
+        if (!strcmp(s.gm[nets[k]].key, "gflow"))
+            a = k;
+    HANDLE helper = nullptr, job = nullptr;
+    std::string helperLog;
+    if (a < nets.size() && lkEnv("SMV_GM_HELPER") != "0")
+    {
+        const LkGmNet& n = s.gm[nets[a]];
+        const std::string onnx = lkOnnxPath(s.engDir, n.onnx, t);
+        helperLog = path(nets[a]) + ".helper.log";
+        wchar_t exe[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --build-engine \"" + utf8ToWide(helperLog) + L"\" \"" +
+                           s.engDirW + L"\\live_server.py\" \"" + utf8ToWide(onnx) + L"\" \"" +
+                           utf8ToWide(path(nets[a])) + L"\" " + std::to_wstring(n.ws);
+        for (const auto& in : n.set)
+        {
+            cmd += L" " + utf8ToWide(in.name) + L"=";
+            for (size_t d = 0; d < in.dims.size(); d++)
+                cmd += (d ? L"x" : L"") + std::to_wstring(in.dims[d]);
+        }
+        job = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li)) &&
+            CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+                           nullptr, &si, &pi))
+        {
+            if (AssignProcessToJobObject(job, pi.hProcess))
+            {
+                ResumeThread(pi.hThread);
+                helper = pi.hProcess;
+            }
+            else
+            {
+                TerminateProcess(pi.hProcess, 2);
+                CloseHandle(pi.hProcess);
+            }
+            CloseHandle(pi.hThread);
+        }
+        if (!helper)
+            LOG("native: the gmflow A build helper did not start (%lu), building it here\n", GetLastError());
+    }
+    bool ok = true;
+    for (size_t k = 0; ok && k < nets.size(); k++)
+        if (k != a)
+            ok = one(nets[k]);
+    bool aDone = a == nets.size();
+    if (helper)
+    {
+        if (!ok)
+            TerminateProcess(helper, 2);
+        WaitForSingleObject(helper, INFINITE);
+        DWORD rc = 2;
+        GetExitCodeProcess(helper, &rc);
+        CloseHandle(helper);
+        {
+            std::ifstream f(helperLog);
+            std::string ln;
+            while (std::getline(f, ln))
+                if (!ln.empty())
+                    LOG("helper: %s\n", ln.c_str());
+        }
+        DeleteFileA(helperLog.c_str());
+        aDone = ok && rc == 0 && lkFile(path(nets[a])) && lkFile(lkJit(path(nets[a])));
+        if (ok && !aDone)
+            LOG("native: the gmflow A build helper failed (exit %lu), building it here\n", rc);
+    }
+    if (job)
+        CloseHandle(job);
+    if (ok && !aDone)
+        ok = one(nets[a]);
+    return ok;
+}
+
 // the RIFE family: the unbatched IFNet, the encoder, and DRBA's block0 flow engine
 static bool lkBuildRife(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTags& t, cudaStream_t st)
 {
@@ -5824,16 +6193,11 @@ static bool lkBuildBackend(const std::wstring& script, const std::wstring& backe
     bool done = rt != nullptr;
     if (done && gmfss)
     {
-        // the warm key sits on fusionnet's jit
-        for (size_t i = 0; done && i < s.gm.size(); i++)
-        {
-            bool oom = false;
-            const LkGmNet& n = s.gm[i];
-            const std::string path =
-                s.cacheDir + "\\" + lkEngineName(n.base, lkGmNameSet(n), nullptr, 0, 0, t) + ".engine";
-            done = lkEnsure(rt, s, t, path, n.onnx, n.set, nullptr, 0, 0, n.ws, {n.set},
-                            !strcmp(n.key, "gfusion") ? s.warmKey : std::string(), st, &oom);
-        }
+        std::vector<size_t> all;
+        for (size_t i = 0; i < s.gm.size(); i++)
+            all.push_back(i);
+        bool oom = false;
+        done = lkGmEnsure(rt, s, t, all, st, &oom);
     }
     else if (done)
         done = lkBuildRife(rt, s, t, st);
@@ -5999,7 +6363,7 @@ static bool lkOfflineGmfss(const std::wstring& script, int w, int h, NativeRife&
     if (!rt)
         return false;
     const auto t0 = std::chrono::steady_clock::now();
-    cudaStream_t st = nullptr;
+    std::vector<size_t> need;
     for (size_t i = 0; i < s.gm.size(); i++)
     {
         const LkGmNet& n = s.gm[i];
@@ -6013,19 +6377,22 @@ static bool lkOfflineGmfss(const std::wstring& script, int w, int h, NativeRife&
             LOG("offline: the ONNX parser DLL is missing, cannot build %s\n", n.base);
             return false;
         }
+        need.push_back(i);
+    }
+    const bool built = !need.empty();
+    if (built)
+    {
+        cudaStream_t st = nullptr;
         bool oom = false;
-        if ((!st && !lkBuildStream(st)) ||
-            !lkEnsure(rt, s, t, p, n.onnx, n.set, nullptr, 0, 0, n.ws, {n.set}, wk, st, &oom))
+        const bool ok = lkBuildStream(st) && lkGmEnsure(rt, s, t, need, st, &oom);
+        if (st)
+            cudaStreamDestroy(st);
+        if (!ok)
         {
-            if (st)
-                cudaStreamDestroy(st);
             LOG("offline: GMFSS engine build for %dx%d failed%s\n", s.pw, s.ph, oom ? " (out of memory)" : "");
             return false;
         }
     }
-    const bool built = st != nullptr;
-    if (st)
-        cudaStreamDestroy(st);
     for (size_t i = 0; i < s.gm.size(); i++)
     {
         LkIo io;
@@ -6687,6 +7054,12 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fPyr, "k_pyr"},
         {&nr.fSplatSoft, "k_splatSoft"},
         {&nr.fSplatNorm, "k_splatNorm"},
+        {&nr.fGsCount, "k_gsCount"},
+        {&nr.fGsScanA, "k_gsScanA"},
+        {&nr.fGsScanB, "k_gsScanB"},
+        {&nr.fGsScanC, "k_gsScanC"},
+        {&nr.fGsFill, "k_gsFill"},
+        {&nr.fGsGather, "k_gsGather"},
         {&nr.fPackInRaw16, "k_packInRaw16"},
         {&nr.fPackInRaw8, "k_packInRaw8"},
         {&nr.fPackOutRaw16, "k_packOutRaw16"},
@@ -10196,6 +10569,17 @@ static bool nativeGmfssSetup(NativeRife& nr)
     NCHK(cudaMalloc((void**)&nr.dGmMetP[0], 2 * qp * sizeof(float)), "alloc gmfss metric pyramid");
     NCHK(cudaMalloc((void**)&nr.dGmMetP[1], 2 * ep * sizeof(float)), "alloc gmfss metric pyramid");
     NCHK(cudaMalloc((void**)&nr.dGmAcc, accPlanes * hp * sizeof(long long)), "alloc gmfss splat accumulator");
+    nr.gmGather = lkEnv("SMV_GM_SPLAT") != "old" && hp <= (size_t)2048 * 4096;
+    if (nr.gmGather)
+        for (int s = 0; s < 2; s++)
+        {
+            NCHK(cudaMalloc((void**)&nr.dGsCnt[s], hp * sizeof(int)), "alloc gmfss gather counts");
+            NCHK(cudaMalloc((void**)&nr.dGsOff[s], (hp + 1) * sizeof(int)), "alloc gmfss gather offsets");
+            NCHK(cudaMalloc((void**)&nr.dGsList[s], 4 * hp * sizeof(int)), "alloc gmfss gather lists");
+            NCHK(cudaMalloc((void**)&nr.dGsSrc[s], 3 * hp * sizeof(float)), "alloc gmfss gather sources");
+            NCHK(cudaMalloc((void**)&nr.dGsBlk[s], 4096 * sizeof(int)), "alloc gmfss gather block sums");
+        }
+    LOG("native: gmfss splats by %s\n", nr.gmGather ? "gather (lists)" : "scatter (atomics)");
     NCHK(cudaMalloc((void**)&nr.dGmFa, 9 * hp * sizeof(float)), "alloc gmfss fusion a");
     NCHK(cudaMalloc(&nr.dGmFb, (size_t)2 * nr.gmC[0] * hp * be), "alloc gmfss fusion b");
     NCHK(cudaMalloc(&nr.dGmFc, (size_t)2 * nr.gmC[1] * qp * be), "alloc gmfss fusion c");
@@ -11126,9 +11510,25 @@ static void nativeFree(NativeRife& nr)
                     (void*)nr.dGmFlow8,
                     nr.dGmProp,
                     nr.dGmMap[0],
-                    nr.dGmMap[1]})
+                    nr.dGmMap[1],
+                    (void*)nr.dGsCnt[0],
+                    (void*)nr.dGsCnt[1],
+                    (void*)nr.dGsOff[0],
+                    (void*)nr.dGsOff[1],
+                    (void*)nr.dGsList[0],
+                    (void*)nr.dGsList[1],
+                    (void*)nr.dGsSrc[0],
+                    (void*)nr.dGsSrc[1],
+                    (void*)nr.dGsBlk[0],
+                    (void*)nr.dGsBlk[1]})
         if (p)
             cudaFree(p);
+    for (int s = 0; s < 2; s++)
+    {
+        nr.dGsCnt[s] = nr.dGsOff[s] = nr.dGsList[s] = nr.dGsBlk[s] = nullptr;
+        nr.dGsSrc[s] = nullptr;
+    }
+    nr.gmGather = false;
     for (auto& p : nr.dGmA)
         p = nullptr;
     for (auto& p : nr.dGmM)
@@ -11485,13 +11885,45 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     // the engines' metric keeps their dtype, a pyramid level is always fp32 (k_pyr's output)
     const int mHalf = nr.gmMetricHalf ? 1 : 0, fHalf = nr.gmFeatHalf ? 1 : 0;
     float sA = t, sB = 1.0f - t;
-    // one softsplat: zero the accumulator, scatter every source pixel, normalize into the
-    // fusionnet plane (a channel concat = adjacent planes, so no copy follows)
-    auto splat = [&](void* in, int inHalf, int C, float* flow, void* metric, int metricHalf, float s, int w, int h,
-                     void* dst, int dstHalf) -> bool {
+    // one softsplat into the fusionnet plane (a channel concat = adjacent planes, so no copy follows). Gather form
+    // (nr.gmGather): list set ls built for (flow, metric, s) when `fresh` (k_gsCount, the three scans, k_gsFill), then
+    // k_gsGather splats `in` through it; a level's image and feature splats share their direction's set. Scatter
+    // form: zero the accumulator, scatter every source pixel, normalize.
+    auto splat = [&](int ls, bool fresh, void* in, int inHalf, int C, float* flow, void* metric, int metricHalf,
+                     float s, int w, int h, void* dst, int dstHalf) -> bool {
         int cc = C, ww = w, hh2 = h, ih = inHalf, mh = metricHalf, dh = dstHalf;
         const int n = w * h;
         int ni = n;
+        if (nr.gmGather)
+        {
+            int nb = (n + 2047) / 2048;
+            const unsigned gx = (unsigned)(w + 31) / 32, gy = (unsigned)(h + 7) / 8;
+            void* k0[] = {(void*)&flow, &metric, &mh, &s, &ww, &hh2, (void*)&nr.dGsCnt[ls], (void*)&nr.dGsSrc[ls]};
+            void* k1[] = {(void*)&nr.dGsCnt[ls], &ni, (void*)&nr.dGsOff[ls], (void*)&nr.dGsBlk[ls]};
+            void* k2[] = {(void*)&nr.dGsBlk[ls], &nb, (void*)&nr.dGsOff[ls], &ni};
+            void* k3[] = {(void*)&nr.dGsOff[ls], (void*)&nr.dGsBlk[ls], &ni, (void*)&nr.dGsCnt[ls]};
+            void* k4[] = {(void*)&flow, &s, &ww, &hh2, (void*)&nr.dGsCnt[ls], (void*)&nr.dGsList[ls]};
+            void* k5[] = {
+                &in,  &ih, &cc, (void*)&nr.dGsSrc[ls], &ww, &hh2, (void*)&nr.dGsOff[ls], (void*)&nr.dGsList[ls],
+                &dst, &dh};
+            const CUstream cs = (CUstream)st;
+            const bool built =
+                !fresh ||
+                (cudaMemsetAsync(nr.dGsCnt[ls], 0, (size_t)n * sizeof(int), st) == cudaSuccess &&
+                 cuLaunchKernel(nr.fGsCount, gx, gy, 1, 32, 8, 1, 0, cs, k0, nullptr) == CUDA_SUCCESS &&
+                 cuLaunchKernel(nr.fGsScanA, (unsigned)nb, 1, 1, 1024, 1, 1, 0, cs, k1, nullptr) == CUDA_SUCCESS &&
+                 cuLaunchKernel(nr.fGsScanB, 1, 1, 1, 1024, 1, 1, 0, cs, k2, nullptr) == CUDA_SUCCESS &&
+                 cuLaunchKernel(nr.fGsScanC, (unsigned)(n + 255) / 256, 1, 1, 256, 1, 1, 0, cs, k3, nullptr) ==
+                     CUDA_SUCCESS &&
+                 cuLaunchKernel(nr.fGsFill, gx, gy, 1, 32, 8, 1, 0, cs, k4, nullptr) == CUDA_SUCCESS);
+            if (!built || cuLaunchKernel(nr.fGsGather, (unsigned)(n + 255) / 256, (unsigned)(C + 7) / 8, 1, 256, 1, 1,
+                                         0, cs, k5, nullptr) != CUDA_SUCCESS)
+            {
+                nr.die("gmfss gather splat launch failed");
+                return false;
+            }
+            return true;
+        }
         if (cudaMemsetAsync(nr.dGmAcc, 0, (size_t)(C + 1) * (size_t)n * sizeof(long long), st) != cudaSuccess)
         {
             nr.die("gmfss accumulator clear failed");
@@ -11531,9 +11963,9 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         cudaEventRecord(nr.gmEv[6], st);
     }
     // I1t and I2t into the fusionnet's a planes 0..2 and 6..8 (the ifnet fills 3..5 below)
-    if (!splat(nr.dGmHalf, 0, 3, flow0, met0, mHalf, sA, nr.hw, nr.hh, nr.dGmFa, 0))
+    if (!splat(0, true, nr.dGmHalf, 0, 3, flow0, met0, mHalf, sA, nr.hw, nr.hh, nr.dGmFa, 0))
         return false;
-    if (!splat(nr.dGmHalf + 3 * hp, 0, 3, flow1, met1, mHalf, sB, nr.hw, nr.hh, nr.dGmFa + 6 * hp, 0))
+    if (!splat(1, true, nr.dGmHalf + 3 * hp, 0, 3, flow1, met1, mHalf, sB, nr.hw, nr.hh, nr.dGmFa + 6 * hp, 0))
         return false;
     if (prof)
         cudaEventRecord(nr.gmEv[7], st);
@@ -11564,19 +11996,21 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     uint8_t* fb = (uint8_t*)nr.dGmFb;
     uint8_t* fc = (uint8_t*)nr.dGmFc;
     uint8_t* fd = (uint8_t*)nr.dGmFd;
-    if (!splat(f0[0], fHalf, nr.gmC[0], flow0, met0, mHalf, sA, nr.hw, nr.hh, fb, bHalf))
+    // the half reuses the image splats' list sets (the same flow, metric and s); the quarter and the eighth build theirs
+    if (!splat(0, false, f0[0], fHalf, nr.gmC[0], flow0, met0, mHalf, sA, nr.hw, nr.hh, fb, bHalf))
         return false;
-    if (!splat(f1[0], fHalf, nr.gmC[0], flow1, met1, mHalf, sB, nr.hw, nr.hh, fb + (size_t)nr.gmC[0] * hp * be, bHalf))
+    if (!splat(1, false, f1[0], fHalf, nr.gmC[0], flow1, met1, mHalf, sB, nr.hw, nr.hh,
+               fb + (size_t)nr.gmC[0] * hp * be, bHalf))
         return false;
-    if (!splat(f0[1], fHalf, nr.gmC[1], nr.dGmFlowP[0], nr.dGmMetP[0], 0, sA, nr.hw / 2, nr.hh / 2, fc, bHalf))
+    if (!splat(0, true, f0[1], fHalf, nr.gmC[1], nr.dGmFlowP[0], nr.dGmMetP[0], 0, sA, nr.hw / 2, nr.hh / 2, fc, bHalf))
         return false;
-    if (!splat(f1[1], fHalf, nr.gmC[1], nr.dGmFlowP[0] + 2 * qp, nr.dGmMetP[0] + qp, 0, sB, nr.hw / 2, nr.hh / 2,
-               fc + (size_t)nr.gmC[1] * qp * be, bHalf))
+    if (!splat(1, true, f1[1], fHalf, nr.gmC[1], nr.dGmFlowP[0] + 2 * qp, nr.dGmMetP[0] + qp, 0, sB, nr.hw / 2,
+               nr.hh / 2, fc + (size_t)nr.gmC[1] * qp * be, bHalf))
         return false;
-    if (!splat(f0[2], fHalf, nr.gmC[2], nr.dGmFlowP[1], nr.dGmMetP[1], 0, sA, nr.hw / 4, nr.hh / 4, fd, bHalf))
+    if (!splat(0, true, f0[2], fHalf, nr.gmC[2], nr.dGmFlowP[1], nr.dGmMetP[1], 0, sA, nr.hw / 4, nr.hh / 4, fd, bHalf))
         return false;
-    if (!splat(f1[2], fHalf, nr.gmC[2], nr.dGmFlowP[1] + 2 * ep, nr.dGmMetP[1] + ep, 0, sB, nr.hw / 4, nr.hh / 4,
-               fd + (size_t)nr.gmC[2] * ep * be, bHalf))
+    if (!splat(1, true, f1[2], fHalf, nr.gmC[2], nr.dGmFlowP[1] + 2 * ep, nr.dGmMetP[1] + ep, 0, sB, nr.hw / 4,
+               nr.hh / 4, fd + (size_t)nr.gmC[2] * ep * be, bHalf))
         return false;
     if (prof)
         cudaEventRecord(nr.gmEv[9], st);

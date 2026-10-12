@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
+import { Readable } from 'stream';
 import { engineCacheDir } from './cache';
 import { dvExport, hpExport } from './dvhp';
 import {
@@ -119,6 +120,120 @@ function waitExit(p: ChildProcess): Promise<number> {
   });
 }
 
+/** DLSS 4.5's passes for a whole multiplier: one direct pass up to the GPU's own limit, above it a cascade whose every
+ * pass stays within the limit, the largest direct pass first so that as many frames as possible are DLSS 4.5's own
+ * from the original frames (x8 = 4 x 2, x12 = 6 x 2, x16 = 4 x 4); [] when no product of passes
+ * within the limit makes m (x7, x11, x13, x14 at a limit of 6). */
+export function dlssgPasses(m: number, limit: number): number[] {
+  if (m <= limit) return m >= 2 ? [m] : [];
+  for (let a = Math.min(limit, m - 1); a >= 2; a--) {
+    if (m % a) continue;
+    const rest = dlssgPasses(m / a, limit);
+    if (rest.length) return [a, ...rest];
+  }
+  return [];
+}
+
+/** "<GPU>, <driver>" from nvidia-smi, '' when it is missing, fails or takes over 5 s. */
+function gpuDriverId(): Promise<string> {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn('nvidia-smi', ['--query-gpu=name,driver_version', '--format=csv,noheader'], {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const timer = setTimeout(() => p.kill(), 5000);
+      let out = '';
+      p.stdout!.setEncoding('utf8');
+      p.stdout!.on('data', (d: string) => (out += d));
+      p.once('error', () => {
+        clearTimeout(timer);
+        resolve('');
+      });
+      p.once('close', (code) => {
+        clearTimeout(timer);
+        resolve(code === 0 ? (out.split(/\r?\n/)[0] || '').trim() : '');
+      });
+    } catch {
+      resolve('');
+    }
+  });
+}
+
+/** The most DLSS 4.5 makes in one pass on this GPU and driver = Streamline's numFramesToGenerateMax + 1 (the host's
+ * `server max N` line): one 2-frame 256x128 render the first time, then dlssg_limit.json in the engine cache, keyed
+ * by the GPU and driver; 0 = unknown. SMV_DLSSG_LIMIT=2..6 sets it (tests). */
+async function dlssgLimit(exe: string, engine: string, cacheDir: string, env: NodeJS.ProcessEnv): Promise<number> {
+  const forced = parseInt(env.SMV_DLSSG_LIMIT || '', 10);
+  if (forced >= 2 && forced <= 6) return forced;
+  const id = await gpuDriverId();
+  const file = path.join(cacheDir, 'dlssg_limit.json');
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (id && j.id === id && j.limit >= 2) return j.limit;
+  } catch {
+    /* not measured on this driver yet */
+  }
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const [w, h] = [256, 128];
+  const log = await new Promise<string>((resolve) => {
+    let text = '';
+    try {
+      const p = spawn(
+        exe,
+        [
+          '--offline',
+          '--w',
+          String(w),
+          '--h',
+          String(h),
+          '--multi',
+          '2',
+          '--frames',
+          '2',
+          '--pixfmt',
+          'rgb24',
+          '--out-pixfmt',
+          'rgb24',
+          '--script',
+          path.join(engine, 'live_server.py'),
+          '--cache',
+          cacheDir,
+          '--dlssg',
+        ],
+        { cwd: engine, windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] },
+      );
+      const timer = setTimeout(() => p.kill(), 60000);
+      p.stderr!.setEncoding('utf8');
+      p.stderr!.on('data', (d: string) => (text += d));
+      p.once('error', () => {
+        clearTimeout(timer);
+        resolve('');
+      });
+      p.once('close', () => {
+        clearTimeout(timer);
+        resolve(text);
+      });
+      p.stdin!.on('error', () => {
+        /* the host ended before reading its frames */
+      });
+      p.stdin!.end(Buffer.alloc(w * h * 3 * 2));
+    } catch {
+      resolve('');
+    }
+  });
+  const m = /server max (\d+)/.exec(log);
+  const limit = m && parseInt(m[1], 10) >= 1 ? parseInt(m[1], 10) + 1 : 0;
+  if (limit && id) {
+    try {
+      fs.writeFileSync(file, JSON.stringify({ id, limit }) + '\n');
+    } catch {
+      /* measured again next time */
+    }
+  }
+  return limit;
+}
+
 /** Line reader over a blocking pipe fd (the resident host's control pipe). */
 function* fdLines(fd: number): Generator<string> {
   const buf = Buffer.alloc(4096);
@@ -202,10 +317,10 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const TEN_BIT = SRC_BITS >= 10;
   const CHROMA444 = fullChroma(ST);
   const FPS_MODE = args.fps !== null && args.fps > 0;
-  if (DLSSG_MODE && !NO_INTERP && (FPS_MODE || !(args.multi >= 2 && args.multi <= 6))) {
+  if (DLSSG_MODE && !NO_INTERP && FPS_MODE) {
     throw new RenderExit(
-      'DLSS Frame Generation supports whole multipliers from 2x to 6x on the source grid ' +
-        '(no --fps resampling). Pick 2x-6x, or use GMFSS for anything else.',
+      'DLSS Frame Generation supports whole multipliers on the source grid ' +
+        '(no --fps resampling). Pick a whole multiplier, or use GMFSS for anything else.',
     );
   }
   if (!NO_INTERP && !FPS_MODE && args.multi < 2) {
@@ -301,6 +416,32 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     if (miss.length)
       throw new RenderExit(`DLSS Frame Generation unavailable: DLSS host not found: ${miss[0]} is missing in ${dgdir}`);
   }
+  // DLSS 4.5 above one pass's limit = a cascade (dlssgPasses): each later pass its own host, fed the previous pass's
+  // frames through a pipe (two hosts in a pipe make the same frames as two separate passes)
+  let DG_PASSES = [Math.trunc(args.multi)];
+  let DG_LIMIT = 6;
+  if (kind === 'dlssg' && args.multi > 2) {
+    DG_LIMIT = (await dlssgLimit(NATIVE_EXE, ENGINE, engineCacheDir(ENGINE, env), env)) || 6;
+    DG_PASSES = dlssgPasses(Math.trunc(args.multi), DG_LIMIT);
+    if (!DG_PASSES.length) {
+      const reach = (m: number, step: number) => {
+        while (m >= 2 && m <= 1000 && !dlssgPasses(m, DG_LIMIT).length) m += step;
+        return m;
+      };
+      const near = [reach(args.multi - 1, -1), reach(args.multi + 1, 1)].filter((m) => m >= 2 && m <= 1000);
+      throw new RenderExit(
+        `DLSS Frame Generation cannot make ${args.multi}x on this GPU: one pass makes up to ${DG_LIMIT}x, and ` +
+          `${args.multi}x is no product of such passes. Pick ${near.map((m) => m + 'x').join(' or ')}, or use GMFSS.`,
+      );
+    }
+    if (DG_PASSES.length > 1)
+      say(
+        `DLSS Frame Generation ${args.multi}x in ${DG_PASSES.length} passes (${DG_PASSES.map((m) => m + 'x').join(' then ')}): ` +
+          `one pass makes up to ${DG_LIMIT}x on this GPU; the first on the original frames, each later one between ` +
+          "the previous pass's frames\n",
+      );
+  }
+  const CASCADE = DG_PASSES.length > 1;
   // the model lines render.py writes on this route
   if (NO_INTERP)
     say('no-interp mode: GMFSS interpolation disabled (re-encode at source fps with optional Adaptive Sharpen)\n');
@@ -369,6 +510,12 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
         : 'RTX HDR is not active';
     say(`[hdr10+] HDR10+ export skipped: ${why}\n`);
   } else if (HP_ACTIVE) say('HDR10+ dynamic metadata ON (plays as HDR10 where HDR10+ is unsupported)\n');
+  // RTX HDR's statistics (MaxCLL, Dolby Vision, HDR10+) come per output frame from one host
+  if (CASCADE && HDR_ACTIVE)
+    throw new RenderExit(
+      `DLSS Frame Generation at ${args.multi}x runs ${DG_PASSES.length} passes, which RTX HDR does not join yet: ` +
+        `turn RTX HDR off, or pick ${DG_LIMIT}x or less.`,
+    );
   let nr: { structure: number; tone: number; style: number; passes: number } | null = null;
   if (args.dlssnr) {
     const nrDir = env.SMV_DLSSNR_DIR || path.join(ENGINE, 'dlssnr');
@@ -494,13 +641,13 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     '--h',
     String(H),
     '--multi',
-    String(Math.trunc(args.multi)),
+    String(DG_PASSES[0]),
     '--frames',
     String(NB || 0),
     '--pixfmt',
     DEC_FMT,
     '--out-pixfmt',
-    ENC_IN_FMT,
+    CASCADE ? OUT_RAW_FMT : ENC_IN_FMT,
     '--script',
     path.join(ENGINE, 'live_server.py'),
     '--cache',
@@ -514,10 +661,16 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (kind === 'fsrfg') nargs.push('--fsrfg');
   if (kind === 'dlssg') nargs.push('--dlssg');
   if (FPS_MODE && !NO_INTERP) nargs.push('--fps-ratio', pyFloatRepr(ratio as number));
-  if (OUT_W !== W || OUT_H !== H) {
-    nargs.push('--out-w', String(OUT_W), '--out-h', String(OUT_H));
-    if (RTX_VSR) nargs.push('--rtx-vsr');
-    if (FSR_UP) nargs.push('--fsr-upscale');
+  // a cascade's first pass ends at the working size: its last pass makes the final resize, and RTX VSR / the FSR
+  // upscaler stay on the one resize that enlarges (here the decode's to the working size only when no final one exists)
+  const lastResize = OUT_W !== WORK_W || OUT_H !== WORK_H;
+  const [P1_W, P1_H] = CASCADE ? [WORK_W, WORK_H] : [OUT_W, OUT_H];
+  if (P1_W !== W || P1_H !== H) {
+    nargs.push('--out-w', String(P1_W), '--out-h', String(P1_H));
+    if (!CASCADE || !lastResize) {
+      if (RTX_VSR) nargs.push('--rtx-vsr');
+      if (FSR_UP) nargs.push('--fsr-upscale');
+    }
   }
   if (SHARPEN > 0) nargs.push('--sharpen', pyG(SHARPEN));
   if (args.restore) nargs.push('--restore');
@@ -576,11 +729,67 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     if (env.SMV_LIVE_OFF_FILE) nargs.push('--thumb-off', env.SMV_LIVE_OFF_FILE);
   }
   if (HDR_ACTIVE && RESUMABLE) nargs.push('--hdr-frames', P.hdrFrames);
+  const drop = NO_INTERP ? 0 : FPS_MODE || DRBA_MODE ? R.pairSkip : 1 + R.pairSkip;
   if (R.active) {
-    const drop = NO_INTERP ? 0 : FPS_MODE || DRBA_MODE ? R.pairSkip : 1 + R.pairSkip;
-    nargs.push('--resume-pair', String(R.skipSrc), '--resume-out', String(R.outBase), '--resume-drop', String(drop));
+    // a cascade's banked outputs sit on the last pass's grid: the first pass restarts at the source frame (its real
+    // frame goes on to the next pass) and the last pass drops what the encoder holds
+    if (CASCADE)
+      nargs.push(
+        '--resume-pair',
+        String(R.skipSrc),
+        '--resume-out',
+        String(R.skipSrc * DG_PASSES[0]),
+        '--resume-drop',
+        '0',
+      );
+    else
+      nargs.push('--resume-pair', String(R.skipSrc), '--resume-out', String(R.outBase), '--resume-drop', String(drop));
     if (pipeDiscard) nargs.push('--skip-in', String(pipeDiscard));
   }
+  /** a cascade's later pass k: the previous pass's frames in at the working size, DLSS 4.5 at its factor, the last
+   * pass out to the encoder with the final resize */
+  const passArgs = (k: number): string[] => {
+    const before = DG_PASSES.slice(0, k).reduce((a, b) => a * b, 1);
+    const last = k === DG_PASSES.length - 1;
+    const a = [
+      '--w',
+      String(WORK_W),
+      '--h',
+      String(WORK_H),
+      '--multi',
+      String(DG_PASSES[k]),
+      '--frames',
+      String(NB ? (NB - 1) * before + 1 : 0),
+      '--pixfmt',
+      OUT_RAW_FMT,
+      '--out-pixfmt',
+      last ? ENC_IN_FMT : OUT_RAW_FMT,
+      '--script',
+      path.join(ENGINE, 'live_server.py'),
+      '--cache',
+      cacheDir,
+      '--dlssg',
+    ];
+    if (last && lastResize) {
+      a.push('--out-w', String(OUT_W), '--out-h', String(OUT_H));
+      if (RTX_VSR) a.push('--rtx-vsr');
+      if (FSR_UP) a.push('--fsr-upscale');
+    }
+    // PQ / HLG frames go to DLSS 4.5 as HDR10, as in the first pass
+    if (SRC_HDR_IN) a.push('--src-hdr', String(tag(ST, 'color_transfer') || '') === 'arib-std-b67' ? 'hlg' : 'pq');
+    if (R.active) {
+      const out = last ? R.outBase : R.skipSrc * before * DG_PASSES[k];
+      a.push(
+        '--resume-pair',
+        String(R.skipSrc * before),
+        '--resume-out',
+        String(out),
+        '--resume-drop',
+        String(last ? drop : 0),
+      );
+    }
+    return a;
+  };
 
   const progress = new Progress({
     encTarget: enc.target,
@@ -631,6 +840,31 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   };
   const decCmd = decodeCmd(FFMPEG, inp, VFR_DEC, decFilters, DEC_FMT);
   const spawnOpts = { cwd: ENGINE, windowsHide: true };
+  // in a cascade the first pass's PROGRESS counts the render and the last pass's OUTFRAMES its frames
+  const onLine1 = CASCADE ? (ln: string) => (ln.startsWith('OUTFRAMES ') ? undefined : onLine(ln)) : onLine;
+  const passKids: ChildProcess[] = [];
+  const passRead: Promise<void>[] = [];
+  /** a cascade's later passes after `src` (the first pass's frames), each fed the one before; returns the last
+   * pass's frames for the encoder */
+  const spawnPasses = (src: number | Readable): number | Readable => {
+    let s = src;
+    for (let k = 1; k < DG_PASSES.length; k++) {
+      const last = k === DG_PASSES.length - 1;
+      const p = spawn(NATIVE_EXE, ['--offline', ...passArgs(k)], { ...spawnOpts, stdio: [s, 'pipe', 'pipe'] });
+      if (typeof s !== 'number') s.destroy(); // the pass holds its own end
+      const rl = readline.createInterface({ input: p.stderr!, crlfDelay: Infinity });
+      rl.on('line', (l) => {
+        const ln = l.replace(/\r+$/, '');
+        if (ln.startsWith('OUTFRAMES ')) {
+          if (last) onLine(ln);
+        } else if (!ln.startsWith('PROGRESS ') && ln !== 'THUMB') onLine(`pass ${k + 1}: ${ln}`);
+      });
+      passRead.push(new Promise<void>((res) => rl.once('close', () => res())));
+      passKids.push(p);
+      s = p.stdout!;
+    }
+    return s;
+  };
 
   // the resident host (render.py _native_resident_render), else one exe for this render
   let nrc: number | null = null;
@@ -646,12 +880,14 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       NATIVE_EXE,
       ENGINE,
       nargs,
-      onLine,
+      onLine1,
       say,
       (fin, fout) => {
         decRes = spawn(decCmd[0], decCmd.slice(1), { ...spawnOpts, stdio: ['inherit', fin, 'inherit'] });
-        encRes = spawn(enc.cmd[0], enc.cmd.slice(1), { ...spawnOpts, stdio: [fout, 'inherit', 'inherit'] });
-        return [decRes, encRes];
+        const src = CASCADE ? spawnPasses(fout) : fout;
+        encRes = spawn(enc.cmd[0], enc.cmd.slice(1), { ...spawnOpts, stdio: [src, 'inherit', 'inherit'] });
+        if (typeof src !== 'number') src.destroy();
+        return [decRes, ...passKids, encRes];
       },
       env,
     );
@@ -661,16 +897,22 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (nrc === null) {
     const dec = spawn(decCmd[0], decCmd.slice(1), { ...spawnOpts, stdio: ['inherit', 'pipe', 'inherit'] });
     const exe = spawn(NATIVE_EXE, ['--offline', ...nargs], { ...spawnOpts, stdio: [dec.stdout!, 'pipe', 'pipe'] });
-    const encp = spawn(enc.cmd[0], enc.cmd.slice(1), { ...spawnOpts, stdio: [exe.stdout!, 'inherit', 'inherit'] });
+    const src = CASCADE ? spawnPasses(exe.stdout!) : exe.stdout!;
+    const encp = spawn(enc.cmd[0], enc.cmd.slice(1), { ...spawnOpts, stdio: [src, 'inherit', 'inherit'] });
     dec.stdout!.destroy(); // the exe and the encoder hold their own ends
-    exe.stdout!.destroy();
+    if (typeof src !== 'number') src.destroy();
     const rl = readline.createInterface({ input: exe.stderr!, crlfDelay: Infinity });
-    rl.on('line', (l) => onLine(l.replace(/\r+$/, '')));
+    rl.on('line', (l) => onLine1(l.replace(/\r+$/, '')));
     const closed = new Promise<void>((res) => rl.once('close', () => res()));
     nrc = await waitExit(exe);
     await closed;
     [encRc, decRc] = await Promise.all([waitExit(encp), waitExit(dec)]);
   }
+  // a later pass that failed decides the render's code like the first pass (exit 3 / 4 included)
+  const passRcs = await Promise.all(passKids.map(waitExit));
+  await Promise.all(passRead);
+  const passRc = passRcs.find((c) => c !== 0);
+  if (nrc === 0 && passRc !== undefined) nrc = passRc;
   const encFailed = `the encoder (${venc}) failed (exit ${encRc}); its error is in the lines above`;
   const decFailed = `the decoder failed (exit ${decRc}); its error is in the lines above`;
   if (LIVE) {

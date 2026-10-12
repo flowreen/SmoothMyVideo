@@ -791,12 +791,13 @@ function syncModel(){
     $('dlsssetup').style.display = 'none';
   }
   // DLSS-FG has no arbitrary-timestep API: it makes only the evenly spaced frames between
-  // consecutive source frames, i.e. whole 2x-6x multipliers (multi-frame generation). Picking it
-  // with an off-grid or out-of-range target snaps the fps box to exactly 2x the source (the
-  // steppers stay usable; a bad target is blocked with guidance at Smooth It! time).
+  // consecutive source frames, i.e. whole multipliers (one pass up to the GPU's own limit, more
+  // in passes, the engine's per-GPU plan). Picking it with an off-grid target snaps the fps box
+  // to exactly 2x the source (the steppers stay usable; a bad target is blocked with guidance at
+  // Smooth It! time).
   if($('modeldlss').checked && dlssReady && info){
     const gm = gridMulti();
-    if((gm < 2 || gm > 6) && speedMode() === 'fps') setFps(srcFps() * 2);
+    if(gm < 2 && speedMode() === 'fps') setFps(srcFps() * 2);
   }
   if($('modelfruc').checked && !frucReady){
     $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
@@ -1663,13 +1664,13 @@ function startRun(){
   if(interpOn() && Math.round(t) <= Math.round(srcFps())){
     alert('A 1× target adds no frames (output fps = source fps). Raise the target above ' + Math.round(srcFps())
         + ' fps to smooth, or turn off Interpolate to just sharpen / re-encode.'); return; }
-  // DLSS-FG only generates the evenly spaced frames between consecutive frames: whole 2x-6x
-  // multipliers on the source grid (multi-frame generation). There is no timestep to ask for
-  // anything else, so block with guidance (mirrors the 1x block). The per-GPU ceiling (RTX 40 =
-  // 2x only) is enforced by the engine at render start with its own clear error.
-  if(interpOn() && modelIsDlss() && (gridMulti() < 2 || gridMulti() > 6)){
-    alert('DLSS 4.5 interpolates at whole multipliers from 2× to 6× of the source fps ('
-        + (2*srcFps()).toFixed(targetDecimals()) + '–' + (6*srcFps()).toFixed(targetDecimals())
+  // DLSS-FG only generates the evenly spaced frames between consecutive frames: whole multipliers
+  // on the source grid (multi-frame generation). There is no timestep to ask for anything else,
+  // so block with guidance (mirrors the 1x block). Above one pass's limit (RTX 50 6x, RTX 40 2x)
+  // the engine runs passes; a multiple no passes reach (7x, 11x) gets its own clear error.
+  if(interpOn() && modelIsDlss() && gridMulti() < 2){
+    alert('DLSS 4.5 interpolates at whole multiples of the source fps (2× = '
+        + (2*srcFps()).toFixed(targetDecimals()) + ' fps, 3× = ' + (3*srcFps()).toFixed(targetDecimals())
         + ' fps for this video). Pick one of those, or GMFSS for any other target.'); return; }
   const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
   const dims = upDims();                               // resize target ({w,h} or null)

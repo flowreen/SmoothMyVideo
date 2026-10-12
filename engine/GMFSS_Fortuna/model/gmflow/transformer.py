@@ -286,9 +286,11 @@ class TransformerLayer(nn.Module):
                 attn_num_splits=None,
                 windowed=False,
                 windows=None,
+                split_tail=False,
                 **kwargs,
                 ):
-        # source, target: [B, L, C]
+        # source, target: [B, L, C]; split_tail (export path, an FFN layer): return (source, message before norm2), the
+        # caller applies norm2 + the residual
         query, key, value = source, target, target
 
         folded = torch.compiler.is_compiling() and hasattr(self, "fold_q")
@@ -327,6 +329,8 @@ class TransformerLayer(nn.Module):
 
         if not self.no_ffn:
             message = self.mlp(torch.cat([source, message], dim=-1))
+            if split_tail:
+                return source, message
             message = self.norm2(message)
 
         return source + message
@@ -498,7 +502,7 @@ class FeatureTransformer(nn.Module):
         wsh, wsw = h // k, w // k
         # per region (plain attention, faster than TensorRT-RTX's masked kernel) only at the coarse scale (k 2, gmflow's
         # `_m` after the matching cut): the quarter scale's 8 groups x regions are ~200 attentions of distinct shapes,
-        # whose runtime JIT took ~137 s on one CPU thread at every new size (the masked form ~20 s)
+        # whose runtime JIT took ~137 s on one CPU thread at every new size (the masked form ~7 s)
         regions = k != 8
         mask = None if regions else generate_shift_window_attn_mask(
             input_resolution=(h, w), window_size_h=wsh, window_size_w=wsw, shift_size_h=wsh // 2, shift_size_w=wsw // 2,
@@ -523,15 +527,23 @@ class FeatureTransformer(nn.Module):
             if shifted:
                 x0 = _to_groups(_roll_hw(_from_groups(x0, bb, h, w, k, g), sh, sw, True), h, w, k, g)
                 x1 = _swap_frames(x0, bb)
+            # TransformerBlock.forward per group (the self attention's output stored in fp16 when half); with several
+            # groups the last LayerNorm + residual run once on the stacked groups (per token: the same math), so each
+            # block boundary's fused relayout reads two tensors, not every group's LayerNorm chain: those fused kernels
+            # (~1 MB of SASS each at 8 groups) dominate the runtime JIT of A's cold load. One group keeps the per-group
+            # form (nothing to fan in; the stacked form rounds differently there and runs slower)
+            split = g > 1
             outs = []
             for i in range(g):
                 kw = dict(height=h, width=w, attn_num_splits=k, windowed="tokens", windows=kk // g,
                           shifted_window_attn_mask=(i, g) if regions else mask[i * kk // g:(i + 1) * kk // g])
-                if half:  # TransformerBlock.forward with the self attention's output stored in fp16
-                    outs.append(layer.cross_attn_ffn(layer.self_attn(x0[i], x0[i], **kw).half(), x1[i], **kw))
-                else:
-                    outs.append(layer(x0[i], x1[i], **kw))
-            x0 = torch.stack(outs, dim=0)
+                s = layer.self_attn(x0[i], x0[i], **kw)
+                outs.append(layer.cross_attn_ffn(s.half() if half else s, x1[i], split_tail=split, **kw))
+            if split:
+                x0 = (torch.stack([o[0] for o in outs], dim=0)
+                      + layer.cross_attn_ffn.norm2(torch.stack([o[1] for o in outs], dim=0)))
+            else:
+                x0 = torch.stack(outs, dim=0)
             if half:
                 x0 = x0.half()
             if shifted:

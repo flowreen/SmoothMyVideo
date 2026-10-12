@@ -487,7 +487,8 @@ Models (GMFSS is the default, the anime specialist):
   models" (it restores the sources and the last `smv-live.exe` with SVP live), reinstall
   `vapoursynth==79` into the runtime if it is gone, rebuild the live host and rerun the gates.
 * `--dlssg` "NVIDIA DLSS 4.5": DLSS Frame Generation through `dlssg2f.exe` (RTX 40 / 50), in the
-  same render as every other pass: DLSS 5 before it, RTX VSR / TrueHDR on its output.
+  same render as every other pass: DLSS 5 before it, RTX VSR / TrueHDR on its output. A whole multiple
+  above what one pass makes on the GPU runs in passes (the DLSS 4.5 cascade below).
 
 Passes, in this order (both modes): on each source or captured frame Restore, the
 resize to the working size (the DLSS mode's share of the output, live of the presented size), DLSS 5,
@@ -1017,6 +1018,21 @@ system gamma 1.2) and `k_unpackR10` reads the generated frames back (x / 1023, H
 inverse). Before, HDR went as 8-bit codes labelled SDR: an exact pan's PQ tweens sat 1.8 dB under the
 SDR route's, now 0.1 dB (harness `dlssg_hdr10`). A swap chain that refuses the colour space (`dlssg2f`
 exit 5) or a `dlssg2f` without the mode makes the host start it again on 8-bit frames, with a log line.
+THE DLSS 4.5 CASCADE (`native.ts` `dlssgPasses`, 2026-10-12): one pass makes up to the GPU's own limit,
+Streamline's `numFramesToGenerateMax` + 1 (RTX 50 x6, RTX 40 x2), which `native.ts` learns once per GPU
+and driver from a 2-frame 256x128 render (the host's `server max N` line) and keeps in the engine cache
+as `dlssg_limit.json`. A whole multiple above it runs in passes, the largest pass first, so that as many
+frames as possible are DLSS 4.5's own from the original frames (x8 = 4 x 2: in every 8 frames the real
+one and three are the direct x4's; x12 = 6 x 2, x16 = 4 x 4; an RTX 40's x4 = 2 x 2); a multiple no
+passes within the limit make (x7, x11) stops with the nearest ones. The first pass is the render's host
+(resident or one-shot) with everything before the model and the model at the working size, its output
+at the working size as rgb48le; each later pass is a one-shot `smv-live.exe --offline --dlssg` fed the
+previous pass's frames through a pipe, the last one with the final resize and the encoder after it.
+Every real frame and every frame of the first pass reaches the output byte-exact (two hosts in a pipe =
+the same frames as two separate passes). The first pass's PROGRESS and the last pass's OUTFRAMES count
+the render; a resume restarts every pass at the banked source frame and the last pass drops what the
+encoder holds; a later pass's exit 3 / 4 is handled like the first's. RTX HDR (its per-frame statistics)
+does not combine with passes yet: refused with a line. Gate: harness `dlssg_cascade\cascade_gate.py`.
 The render (`src/render`) keeps the
 probe, the ffmpeg decode and encode commands, PROGRESS / OUTFRAMES and the finalize, and the exe takes the decode pipe as stdin and feeds the encode
 pipe on stdout (pack-in, Head encode, IFNet, pack-out, `k_expand8to16` for real frames of
@@ -1209,7 +1225,17 @@ so the lookup and the build cannot disagree on a name:
   the delay-loaded ONNX parser, a warm-up with a fresh runtime cache (EAGER specialization), then the
   `.jit` and the warm key; the lookup must then
   hit. It covers rife / blend, gmfss, rifedrba (the RIFE pair plus block0) and Restore (`restore_<hash>_dth`, fp16 input, no
-  warm marker). Output-identical to python's build from the same file (harness
+  warm marker). TensorRT-RTX compiles one engine at a time per PROCESS (a build or a JIT warm-up on another thread
+  waits for the running one; two processes run side by side at full speed), so a GMFSS build (live and offline,
+  `lkGmEnsure`) hands gmflow A, the set's longest build + warm-up, to a helper process: this exe as
+  `smv-live.exe --build-engine <log> <engine folder>/live_server.py <onnx> <engine> <workspace multiplier>
+  <input>=<d0>x<d1>... ...`, which builds the engine when missing, warms it and exits (0 done, 3 memory-shaped failure,
+  2 other), while the host does the other seven nets; the helper sits in a job object that ends it with the host, its
+  log lines come back as `helper: ...`, and a helper that fails or cannot start leaves A to the host afterwards
+  (`the gmflow A build helper failed (exit N), building it here`). Cold GMFSS host build at 854x480: 37.7 / 36.9 s ->
+  23.8 / 24.4 s, frames byte-identical (harness `gmfss_init_lanes`). `SMV_GM_HELPER=0` = no helper;
+  `SMV_GM_HELPER_TEST=fail` = the helper exits 2 at once (the fallback's trigger). The host logs every build
+  (`built X from Y in Ns`) and warm-up (`warmed X in Ns`). Output-identical to python's build from the same file (harness
   `onnx\gate_3c2.py`, `onnx\gate_3c3a.py`). A session that ends mid-build leaves the build
   running while the resident host stays alive; an engine file is written whole or not at all.
 * `smv-live.exe --lookup-probe <engine folder>/live_server.py <backend> <outW> <outH> <capW>
@@ -1345,6 +1371,16 @@ the accumulators bit-identical and cut the feature splats ~20 %, gate `harness\p
 `harness\eff\gmfss_equiv.py`: the kernels compiled from the host source with cupy against the exact
 maths in fp64 on real-motion inputs through the real engines, plus a quantized-flow control where the
 accumulators must match softsplat.py's own kernel bit for bit.
+
+Since 2026-10-12 the chain splats by GATHER (`k_gsCount`, `k_gsScanA` / `B` / `C`, `k_gsFill`, `k_gsGather`): a list per
+target cell of the (source pixel, corner) pairs landing on it (a count, an exclusive scan, a fill), then one thread per
+cell and 8 channels adds the same int64 fixed-point products `k_splatSoft` adds (integer adds are order-free) and
+divides like `k_splatNorm`, so the output is the scatter's bit for bit with no accumulator planes to clear and read
+back; a level's image and feature splats share their direction's list. Real motion at the 1080p half: the 8 splats of a
+tween 9.15 -> 3.07 ms in isolation (harness `gmfss_deconstruct\gs_bench.py`, identity per splat); Live per tween DLAA
+13.5 -> 7.7 ms, Performance 2.95 -> 2.2 ms, which moved Performance from x2 to x3 on a 21.5 fps source (`z1_ab.sh`).
+Gate `gmfss_deconstruct\z1_gate.py` (offline 480p frames byte-identical to the scatter's and to an earlier exe's).
+`SMV_GM_SPLAT=old` = the scatter kernels (also taken above 2048 x 4096 cells at the half, the scan's limit).
 
 Sub-step 5c (2026-09-16) wired the chain and opened the route, so gmfss is a native backend like rife:
 `native host ready` reads `engine=gmfss` (Smooth Motion has its own `fruc` live backend).
@@ -1514,7 +1550,14 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   attention (TensorRT's masked attention kernel cost about 1.5x the plain one); exact in fp64 (2e-14
   against the masked form). The quarter scale's shifted blocks (A) keep the shift mask: per region its 8
   groups are ~200 attentions of distinct shapes, and TensorRT-RTX's runtime JIT compiled them in ~137 s
-  on one CPU thread at every new size (the masked form ~20 s). The position
+  on one CPU thread at every new size. With 8 groups each block's last LayerNorm (`norm2`) and residual
+  run once on the stacked groups (per token: the same math, outputs bit-identical): applied per group,
+  TensorRT-RTX fuses all 8 groups' copies into each block boundary's relayout, kernels of ~1 MB of SASS
+  (3 of A's 19 cubins held 3.1 of its 3.8 MB of JIT output) that made most of A's cold load; stacked, A's
+  JIT takes 7 s instead of 20 s at the 4K half (1.4 GB peak working set instead of 2.2), and A runs
+  x0.93 to x1.00 with 67 to 192 MiB less context memory (harness `gmfss_packed_attention` forms3_ab,
+  census.py lists the cubins). One group (`_m`) keeps the per-group form: the stacked form rounds
+  differently there and runs x1.02. The position
   encoding is added after the layout change, a broadcast add over the position axis (`takes_position`;
   gmflow.py skips `feature_add_position` there): the Balanced half's entry 1.36 -> 0.72 ms. Eager keeps
   the original layout.
@@ -1523,7 +1566,10 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   export. The first start at a new size decides A's form: per region (`_g8r`) A was the fastest (at the
   4K half 137.6 ms against 161.0 masked, the DLAA half 44.7 against 46.6; harness `gmfss_first_start_fix`
   forms_ab) but its cold load took 26 s of build + ~137 s of JIT on one CPU thread and a 9.7 GB peak
-  working set; masked it is 11 s + ~20 s (2.2 GB). Measured at 160 W: GMFSS's first start (host-direct,
+  working set; masked it is 11 s + ~7 s (1.4 GB; ~20 s and 2.2 GB before the stacked `norm2`). With the
+  stacked `norm2` and the A build helper, GMFSS's first start (host-direct, offline x2, a fresh cache,
+  harness `first_start_load`) takes 21.5 / 23.9 / 30.4 s at 1080p / 1440p / 2160p and Live at 1440p DLAA is
+  ready after ~21 s (host build ~18 s). Measured at 160 W before both: GMFSS's first start (host-direct,
   offline x2, 8 frames, a fresh cache) 50.5-56.2 s at 1080p / 1440p / 2160p against 183-200 s with
   `_g8r`, Live at 1440p DLAA ready after 57.5 s against 212.3 s; the price, a 4K offline pair 372.3 ms
   against 345.9 (x1.075) and the 1440p DLAA live flow block 77.7 against 74.8 ms. `_m` per region stays:
@@ -1586,6 +1632,8 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_TRT_CACHE` | TRT engine cache location (default `model_cache_safe_to_delete` in the app's top folder) |
 | `SMV_ONNX_DIR` | size-free ONNX folder (default `engine/onnx`) |
 | `SMV_TRT_WORKSPACE_GB` | builder scratch ceiling (default 8) |
+| `SMV_GM_HELPER=0` / `SMV_GM_HELPER_TEST=fail` | a GMFSS cold build without the gmflow A helper process (A/B) / the helper exits 2 at once (the fallback's trigger) |
+| `SMV_GM_SPLAT=old` | GMFSS's splats by the scatter kernels (k_splatSoft + k_splatNorm) instead of the gather ones (A/B; the same output) |
 | `SMV_TRT_CACHE_KIND` | suffix for the JIT cache file (live sets `live`) |
 | `SMV_RIFE_SAFEPAD=1` / `SMV_LIVE_SAFEPAD=1` | restore the 1152x640 RIFE safe-zone pad |
 | `SMV_RIFE_FLOW_SCALE` | diagnostic live flow pyramid scale (power of two in 0.25..1.0, forces a cold engine) |
@@ -1630,6 +1678,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NVENC_SPLIT` | override the NVENC `-split_encode_mode` for measurement (default 15 = off; 2 = two strips, 0 = ffmpeg's auto); never a product setting (the split leaves a seam line) |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
 | `SMV_DLSSG_SWEEP=1` | the DLSS 4.5 host latches its buffer-sweep capture tier at startup instead of waiting for hardware flip metering, so the sweep path can be tested on demand |
+| `SMV_DLSSG_LIMIT=N` | the most DLSS 4.5 makes in one pass (2..6) instead of the GPU's measured limit (`dlssg_limit.json`): `2` renders an RTX 40's passes on an RTX 50 (the cascade's trigger test) |
 | `SMV_DLSSG_HDR10=0` | DLSS 4.5 gets HDR planes as 8-bit codes on an RGBA8 swap chain (labelled SDR) instead of HDR10; an A/B lever, never a product setting |
 | `SMV_DLSSG_REFUSE_HDR10=1` | the DLSS 4.5 host treats the HDR10 colour space as refused (exit 5): the trigger test of the host's 8-bit fallback |
 | `SMV_DLSSG_FOCUS_SHIM=0` | the DLSS 4.5 host's focus shim off: by default `dlssg2f` points the Streamline modules' `GetForegroundWindow` imports at its own off-screen window, because Streamline 2.14 pauses frame generation whenever another window has focus (a render then stopped with `DLSS_PREEMPTED` while the user worked in another window); the A/B and trigger test only, never a product setting |
