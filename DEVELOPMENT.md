@@ -820,6 +820,8 @@ smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --nr-passes 1..10 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
+smv-live.exe --hz              the exact refresh rate of every active display path as "numerator denominator" lines
+               (QueryDisplayConfig; main.ts feeds "Screen refresh rate" with it, Electron only reports integers)
 smv-live.exe --restore-mouse   gives back the pointer speed and clip a killed or crashed Fill session held (main.ts
                runs it when %TMP%\smv-live-mouse.txt outlives the host; every live session start does the same)
 smv-live.exe --testsrc [ms|cycle] [--pan] [--onscreen]   verification source (100 ms = 10 fps; 16 for perf; cycle ramps
@@ -1954,12 +1956,12 @@ loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
 vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
-github.com/HansKristian-Work/vkd3d-proton at fdbaf51f8794e8d75ad8c43dc2d62fcc8a136af3 with its submodules
-(dxil-spirv at ab47c3df1a4746f36c958f0262bc9e314eb566eb), then
+github.com/HansKristian-Work/vkd3d-proton at 0bb64c56c8f0dcc11ecc0f6c56e00e4f7bd8d506 with its submodules
+(dxil-spirv at 8434b0639fb2a48ce13aac08a420ecce5d23df0e), then
 
 ```
-git apply engine/fsrfg/source/vkd3d-proton-fdbaf51-smv.patch        (in the vkd3d-proton checkout)
-git apply engine/fsrfg/source/dxil-spirv-ab47c3d-smv.patch          (in subprojects/dxil-spirv)
+git apply engine/fsrfg/source/vkd3d-proton-0bb64c5-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/dxil-spirv-8434b06-smv.patch          (in subprojects/dxil-spirv)
 meson setup build --buildtype=release -Denable_extended_emulation=true
 ninja -C build
 ```
@@ -2123,14 +2125,14 @@ NVIDIA Optical Flow interface headers (the nvof model) are vendored in `build_sr
 their provenance README) and `build.bat` adds that include path itself:
 ```
 set "SL_SDK=D:\path\to\extracted\streamline-sdk"
-set "TRT_RTX_SDK=D:\path\to\TensorRT-RTX-1.6.1.120"
+set "TRT_RTX_SDK=D:\path\to\TensorRT-RTX-1.7.1.116"
 set "NGX_SDK=D:\path\to\DLSS"
 build.bat
 ```
 Requirements: Visual Studio 2022+ with the C++ workload, the Streamline SDK v2.14.1 (see the DLSS-G
 host section above), a Windows 11
 SDK (for the C++/WinRT Windows.Graphics.Capture headers), the TensorRT-RTX SDK zip (login gated)
-extracted anywhere (only `include\` and `lib\tensorrt_rtx_1_6.lib` are used) and the public NVIDIA
+extracted anywhere (only `include\` and `lib\tensorrt_rtx_1_7.lib` are used) and the public NVIDIA
 DLSS SDK for its NGX headers (`NGX_SDK`, the same variable the dlssnr host build uses; no `d3d12.lib`
 on purpose, `D3D12CreateDevice` must keep resolving from the Streamline interposer). NVAPI (the free
 video memory) comes with the Streamline SDK: `build.bat` takes the MIT headers and `nvapi64.lib` from
@@ -2140,7 +2142,7 @@ CUDA headers and import libs come from the app's own `engine\runtime\Lib\site-pa
 supplies the one header `cuda_runtime_api.h` opens with. Do not grow that shim; install the real
 headers if more is ever needed.
 
-Nothing added for the native host is a hard dependency: `tensorrt_rtx_1_6.dll` is delay loaded and
+Nothing added for the native host is a hard dependency: `tensorrt_rtx_1_7.dll` is delay loaded and
 the CUDA 13 libs are lazy loader stubs, opened by full path out of `engine\runtime` on the first
 native call (the log line `native: runtime folder ...` names the folder used). The exe ships
 prebuilt next to its own copy of the Streamline runtime.

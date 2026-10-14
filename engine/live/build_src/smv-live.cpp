@@ -3390,6 +3390,28 @@ int wmain(int argc, wchar_t** argv)
     if (argc >= 2 && wcscmp(argv[1], L"--list") == 0)
         return runList();
 
+    // --hz: the exact refresh rate of every active display path, one "numerator denominator" line each
+    // (QueryDisplayConfig's rational: 359.98 Hz where Electron's integer display.displayFrequency reads 360);
+    // main.ts matches the lines to a display by nearest integer for "Screen refresh rate"
+    if (argc >= 2 && wcscmp(argv[1], L"--hz") == 0)
+    {
+        UINT32 nPath = 0, nMode = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPath, &nMode) != ERROR_SUCCESS)
+            return 1;
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPath);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(nMode);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPath, paths.data(), &nMode, modes.data(), nullptr) !=
+            ERROR_SUCCESS)
+            return 1;
+        for (UINT32 i = 0; i < nPath; i++)
+        {
+            const DISPLAYCONFIG_RATIONAL& r = paths[i].targetInfo.refreshRate;
+            if (r.Denominator > 0)
+                printf("%u %u\n", r.Numerator, r.Denominator);
+        }
+        return 0;
+    }
+
     // --lookup-probe script backend outW outH capW capH imgScale: print the handoff lines the
     // host's own warm engine lookup answers, or `MISS`; stdout only. A debug entry point: a
     // change to the lookup's naming or geometry is gated by dumping this over a config matrix

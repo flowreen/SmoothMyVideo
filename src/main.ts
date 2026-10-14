@@ -228,31 +228,25 @@ ipcMain.handle('probe', async (_e, file: string) => {
 // TRUE refresh rate of the monitor the app window is on (fallback: primary), kept FRACTIONAL so a
 // 59.94 / 359.98 Hz panel feeds the renderer its exact rate - drives "match screen" and its decimal
 // precision (see decimalsOf/targetDecimals in the renderer). Electron's display.displayFrequency is
-// integer-only on Windows, so the exact rational comes from QueryDisplayConfig via the bundled
-// engine/exact_hz.ps1 helper (one "numerator denominator" line per active display path), matched to
-// the Electron display by nearest integer. Cached: the helper costs a PowerShell spawn (~0.5 s) and
-// rates only change on display mode switches.
+// integer-only on Windows, so the exact rational comes from QueryDisplayConfig through the host's
+// `smv-live.exe --hz` (one "numerator denominator" line per active display path), matched to the
+// Electron display by nearest integer. Cached: rates only change on display mode switches.
 let exactHz: number[] = [];
 let exactHzAt = 0;
 function queryExactRates(): Promise<number[]> {
   return new Promise((resolve) => {
-    execFile(
-      'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(ENGINE, 'exact_hz.ps1')],
-      { timeout: 8000 },
-      (err, stdout) => {
-        if (err) return resolve([]);
-        resolve(
-          String(stdout)
-            .split(/\r?\n/)
-            .map((l) => {
-              const m = l.trim().match(/^(\d+) (\d+)$/);
-              return m ? Number(m[1]) / Number(m[2]) : 0;
-            })
-            .filter((v) => v > 1),
-        );
-      },
-    );
+    execFile(LIVE_EXE, ['--hz'], { cwd: LIVE_DIR, timeout: 8000 }, (err, stdout) => {
+      if (err) return resolve([]);
+      resolve(
+        String(stdout)
+          .split(/\r?\n/)
+          .map((l) => {
+            const m = l.trim().match(/^(\d+) (\d+)$/);
+            return m ? Number(m[1]) / Number(m[2]) : 0;
+          })
+          .filter((v) => v > 1),
+      );
+    });
   });
 }
 ipcMain.handle('refresh-rate', async () => {

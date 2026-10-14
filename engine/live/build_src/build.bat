@@ -49,7 +49,7 @@ if "%NGX_SDK%"=="" (
 if "%NGX_SDK:~-1%"==" " set "NGX_SDK=%NGX_SDK:~0,-1%"
 if "%NGX_SDK:~-1%"==" " goto trimngx
 set "NRSRC=%~dp0..\..\dlssnr\build_src"
-rem Nothing below is a hard dependency of the exe: tensorrt_rtx_1_6.dll is delay loaded, and
+rem Nothing below is a hard dependency of the exe: tensorrt_rtx_1_7.dll is delay loaded, and
 rem CUDA 13's cudart.lib and cuda.lib are lazy LOADER stubs that open their DLLs on first call,
 rem so the exe still starts on a machine that has none of them and no non-native route changes.
 rem nvofa\ = the MIT NVIDIA Optical Flow interface headers (the nvof model); nvofapi64.dll is
@@ -62,9 +62,9 @@ cl /nologo /std:c++20 /EHsc /permissive- /O2 /W3 smv-live.cpp "%NRSRC%\nr_host.c
    /I "%NRSRC%" /I "%~dp0..\..\dlssg\build_src" /I "%NGX_SDK%\include" /I nvofa ^
    /link /LIBPATH:"%SL_SDK%\lib\x64" /LIBPATH:"%SL_SDK%\external\nvapi\amd64" /LIBPATH:"%TRT_RTX_SDK%\lib" ^
    /LIBPATH:"%SMV_CU%\lib\x64" nvapi64.lib ^
-   sl.interposer.lib tensorrt_rtx_1_6.lib tensorrt_onnxparser_rtx_1_6.lib cudart.lib cuda.lib delayimp.lib ^
+   sl.interposer.lib tensorrt_rtx_1_7.lib tensorrt_onnxparser_rtx_1_7.lib cudart.lib cuda.lib delayimp.lib ^
    user32.lib gdi32.lib ole32.lib windowscodecs.lib dxguid.lib advapi32.lib ^
    d3d11.lib d3dcompiler.lib dwmapi.lib shlwapi.lib winmm.lib windowsapp.lib ^
-   /DELAYLOAD:tensorrt_rtx_1_6.dll /DELAYLOAD:tensorrt_onnxparser_rtx_1_6.dll ^
+   /DELAYLOAD:tensorrt_rtx_1_7.dll /DELAYLOAD:tensorrt_onnxparser_rtx_1_7.dll ^
    /SUBSYSTEM:CONSOLE /OUT:..\smv-live.exe
 exit /b %errorlevel%

@@ -3,7 +3,7 @@
 // npm setup and dist: copy the CUDA 13 + TensorRT-RTX DLLs the native host (engine/live/smv-live.exe)
 // loads out of the dev python's wheels (engine/runtime, never shipped) into engine/gpu_runtime
 // (shipped, gitignored), plus tensorrt_rtx_version.txt: the wheel version the host bakes into every
-// engine name (trt1_6_1_120), so the names stay those the dev tools (trt_lookup.py) produce.
+// engine name (trt1_7_1_116), so the names stay those the dev tools (trt_lookup.py) produce.
 //
 // Behaviour: a file already staged with the same size and mtime is skipped, so a rerun is cheap; a stale
 // DLL the wheels no longer carry is removed. setup is NON-FATAL (a fresh clone may not have
@@ -37,8 +37,8 @@ function stage(): void {
     [cuda, 'cudart64_13.dll'],
     [cuda, 'nvrtc64_130_0.dll'],
     ...builtins.map((n): [string, string] => [cuda, n]),
-    [trt, 'tensorrt_rtx_1_6.dll'],
-    [trt, 'tensorrt_onnxparser_rtx_1_6.dll'],
+    [trt, 'tensorrt_rtx_1_7.dll'],
+    [trt, 'tensorrt_onnxparser_rtx_1_7.dll'],
   ];
   const missing = want.filter(([d, n]) => !fs.existsSync(path.join(d, n))).map(([, n]) => n);
   if (missing.length || !builtins.length)

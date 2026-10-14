@@ -20,7 +20,7 @@
 //   * the engine's own kWHOLE_GRAPH_CAPTURE is the ONLY graph capture (never capture a TRT
 //     enqueue from outside, per the CUDA study 01 section B1).
 //
-// Delay-loaded DLLs: tensorrt_rtx_1_6.dll, cudart64_13.dll and nvrtc64_130_0.dll ship in
+// Delay-loaded DLLs: tensorrt_rtx_1_7.dll, cudart64_13.dll and nvrtc64_130_0.dll ship in
 // engine\gpu_runtime (staged from the dev python's wheels by scripts/stage-gpu-runtime.ts).
 
 // cuda_runtime.h pulls the internal crt\ headers the runtime WHEEL does not ship; the host
@@ -32,7 +32,7 @@
 #include <nvrtc.h>
 #include <NvInferRuntime.h>
 #include <NvInfer.h>           // the builder: engines built from engine\onnx
-#include <NvOnnxParser.h>      // tensorrt_onnxparser_rtx_1_6.dll, delay-loaded like the runtime
+#include <NvOnnxParser.h>      // tensorrt_onnxparser_rtx_1_7.dll, delay-loaded like the runtime
 #include "nvOpticalFlowCuda.h" // the nvof model: MIT interface headers in build_src\nvofa
 
 // ---- the two device kernels, JIT-compiled by NVRTC at first native start ------------------
@@ -3992,7 +3992,7 @@ struct ThdrAcc
     }
 };
 
-static bool g_onnxParserOk = false; // tensorrt_onnxparser_rtx_1_6.dll loaded (nativeLoadDlls)
+static bool g_onnxParserOk = false; // tensorrt_onnxparser_rtx_1_7.dll loaded (nativeLoadDlls)
 
 static bool nativeLoadDlls(const std::wstring& scriptPath)
 {
@@ -4053,7 +4053,7 @@ static bool nativeLoadDlls(const std::wstring& scriptPath)
         {cudaBin.c_str(), L"cudart64_13.dll", true},
         {cudaBin.c_str(), builtins.empty() ? L"" : builtins.c_str(), false},
         {cudaBin.c_str(), L"nvrtc64_130_0.dll", true},
-        {trtBin.c_str(), L"tensorrt_rtx_1_6.dll", true},
+        {trtBin.c_str(), L"tensorrt_rtx_1_7.dll", true},
     };
     for (auto& wdl : want)
     {
@@ -4069,7 +4069,7 @@ static bool nativeLoadDlls(const std::wstring& scriptPath)
         }
     }
     // the ONNX parser: optional, without it a cold size cannot build
-    g_onnxParserOk = LoadLibraryExW((trtBin + L"\\tensorrt_onnxparser_rtx_1_6.dll").c_str(), nullptr,
+    g_onnxParserOk = LoadLibraryExW((trtBin + L"\\tensorrt_onnxparser_rtx_1_7.dll").c_str(), nullptr,
                                     LOAD_WITH_ALTERED_SEARCH_PATH) != nullptr;
     if (!g_onnxParserOk)
         LOG("native: ONNX parser not loadable, a window size without warm engines cannot start\n");
