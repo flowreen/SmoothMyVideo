@@ -2457,6 +2457,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // timer with a short spin tail (Sleep granularity is what caused the overshoot).
         double minSpaceMs = 0;
         double panelHzMode = 0; // panel refresh from the display MODE (not the measured one)
+        double nodeHz = 0;      // a locked node above the target (lockedMultiple's step-up): its own present rate
         // the floor follows the rate we actually sustain; recomputed on every throttle step
         auto refloor = [&] {
             if (panelHzMode <= 1.0)
@@ -2466,7 +2467,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // refresh rate was tried and is unstable: a lower effective rate then means a
             // LONGER floor, which stretches groups, which trips the throttle again - measured
             // as a spiral down to ~160 fps. The panel period bounds that feedback.
-            const double hz = effTarget > panelHzMode ? effTarget : panelHzMode;
+            // A node above the target presents faster than both: the floor follows it, else
+            // its slots outrun the floor, each group overruns its source period and source
+            // frames drop (x64 past a 400 target: ~3 drops a second, the GPU price swinging
+            // with them and the lock falling to x32 and back every ~20 s).
+            const double hz = (std::max)((std::max)(effTarget, panelHzMode), nodeHz);
             minSpaceMs = 1000.0 / hz * 0.95;
         };
         {
@@ -2687,6 +2692,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     lockLogged = m;
                     lockT = nowMs();
                 }
+                {
+                    // the node's rate at the faster of the two source clocks, so the floor never outruns its slots
+                    const double hz = m * 1000.0 / (std::min)(emaDt, lockDtMs);
+                    const double want = hz > adaptTarget * 1.03 ? hz : 0.0;
+                    if (fabs(want - nodeHz) > nodeHz * 0.01 + 0.5)
+                    {
+                        nodeHz = want;
+                        refloor();
+                    }
+                }
                 for (uint32_t k = 1; k < m; k++)
                     fr[nfr++] = (float)k / (float)m;
                 fr[nfr++] = 1.0f;
@@ -2712,6 +2727,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 {
                     LOG("present grid: unlocked (target %.1f, source %.3f fps)\n", effTarget, 1000.0 / lockDtMs);
                     lockLogged = 0;
+                }
+                if (nodeHz > 0)
+                {
+                    nodeHz = 0;
+                    refloor();
                 }
                 const int64_t span = sentTs - prevSentTs;
                 if (!nextGrid)

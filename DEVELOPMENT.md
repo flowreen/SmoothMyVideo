@@ -1930,9 +1930,11 @@ The node above the target (Live, Smooth Motion and AMD FSR 4 FG): their ladders 
 so a target between two of them (x3 of the source rate, or 40 fps from a 24 fps source) runs the
 node ABOVE it whenever the GPU affords that node: the throttle's tweens a pair before the target
 clamps them (the prices above; for FSR 4 its first x4 group is the price probe), with 10 % to spare
-and 2 s since the last lock change to enter, 3 % to hold, and only while its slots fit the present
-floor (the node's rate <= max(target, panel mode) / 0.95) and the slot count. Otherwise the largest
-node that fits, as before. A target on a node (within 3 %) never steps up. Log: `present grid: locked
+and 2 s since the last lock change to enter, 3 % to hold, and while its slots fit the slot count,
+however far past the target or the panel that node lands. The present floor follows a node above the
+target (0.95 x the node's own period, from the faster of the two source clocks), so its slots are all
+presented (tear-allowed past the panel) and no group overruns its source period. Otherwise the largest
+node that fits. A target on a node (within 3 %) never steps up. Log: `present grid: locked
 to xM (...), the node above the target`. `SMV_FRUC_STEPUP=0` = the largest node that fits (gates:
 harness ladder_gate.py's stepup cases).
 
