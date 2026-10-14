@@ -168,7 +168,7 @@ static bool g_dlssnr = false;                  // --dlssnr: forwarded to the ser
                                                // once per captured frame, the app's NVIDIA DLSS 5 checkbox)
 static double g_nrStructure = 1.0;             // --nr-structure F (0..2, the DLSS 5 Structure Intensity)
 static double g_nrTone = 1.0;                  // --nr-tone F (0..2, the DLSS 5 Tone Intensity)
-static int g_nrStyle = 1;                      // --nr-style N (DLSSNR.Style: 0 Default, 1 Natural, 2 Cinematic)
+static int g_nrStyle = 0;                      // --nr-style N (DLSSNR.Style: 0 Default, 1 Natural, 2 Cinematic)
 static int g_nrPasses = 1;                     // --nr-passes N (1..nr::kMaxPasses: DLSS 5 chained N times per frame)
 static bool g_nrNative = false;                // DLSS 5 NR runs inside this exe (the native host's pass); the
                                                // server is then NOT told --dlssnr
@@ -1998,7 +1998,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr::Settings set;
         set.structure = (float)(g_nrStructure < 0.0 ? 0.0 : (g_nrStructure > 2.0 ? 2.0 : g_nrStructure));
         set.tone = (float)(g_nrTone < 0.0 ? 0.0 : (g_nrTone > 2.0 ? 2.0 : g_nrTone));
-        set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 1;
+        set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 0;
         set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
         // Zero-copy unless the preview's change map needs the host copies or SMV_NR_STAGED=1
         // asks for CPU staging (the route A/B and the fallback's trigger test). DLSS 5 gets motion
@@ -3361,6 +3361,21 @@ int wmain(int argc, wchar_t** argv)
         return runTestSrc(onScreen);
     }
 
+    // Live DLSS 4.5's plan (dlssgSnap) for every whole and half multiple 2..40 at a one-pass limit N (default 6), one
+    // line each on stdout: the cascade gate's snap table
+    if (argc >= 2 && wcscmp(argv[1], L"--dlssg-snap-table") == 0)
+    {
+        const int lim = argc >= 3 ? (std::max)(2, (std::min)(6, _wtoi(argv[2]))) : 6;
+        for (int h2 = 4; h2 <= 80; h2++)
+        {
+            int m1 = 0, m2 = 0;
+            bool tie = false;
+            const int m = dlssgSnap(h2 / 2.0, lim, m1, m2, &tie);
+            printf("limit %d want %.1f -> %dx = %d x %d%s\n", lim, h2 / 2.0, m, m1, m2, tie ? " (tie, the lower)" : "");
+        }
+        return 0;
+    }
+
     if (argc >= 2 && wcscmp(argv[1], L"--synth") == 0)
     {
         int genFrames = (argc >= 3) ? _wtoi(argv[2]) : 1;
@@ -3475,7 +3490,7 @@ static void resetSessionGlobals()
     g_dlssnr = false;
     g_nrStructure = 1.0;
     g_nrTone = 1.0;
-    g_nrStyle = 1;
+    g_nrStyle = 0;
     g_nrPasses = 1;
     g_nrNative = false;
     g_liveNrCuda = false;
@@ -4013,7 +4028,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_dlssnr = false;
             g_nrStructure = 1.0;
             g_nrTone = 1.0;
-            g_nrStyle = 1;
+            g_nrStyle = 0;
             g_nrPasses = 1;
             g_noGpuFit = false;
             g_logPipe = ctl; // from here every log line reaches the client too

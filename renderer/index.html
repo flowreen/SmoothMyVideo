@@ -142,7 +142,7 @@
        file workflow below, so it lives OUTSIDE #workspace - and ABOVE it, so nobody has to
        scroll to discover it. The output rate is INHERITED from the Speed selectors below
        (RIFE/GMFSS resample adaptively to the fps target; DLSS 4.5 approximates it with
-       the nearest whole multiple of the captured window's rate, derived in the exe). -->
+       the first whole multiple of the captured window's rate that reaches it, derived in the exe). -->
   <div class="panel lonly" id="lvpanel" style="display:none">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Live mode</span>
@@ -208,8 +208,8 @@
       <span id="nrwrap" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
         <span class="hint">Style</span>
         <span class="seg" id="nrstyleseg" style="height:26px">
-          <button type="button" data-style="0" title="NVIDIA's Default look: the lightest touch, closest to the source, no frame-to-frame smoothing">Default</button>
-          <button type="button" data-style="1" class="on" title="NVIDIA's Natural look: the smoothest, cleanest picture (the app's default)">Natural</button>
+          <button type="button" data-style="0" class="on" title="NVIDIA's Default look: the lightest touch, closest to the source, no frame-to-frame smoothing (the app's default)">Default</button>
+          <button type="button" data-style="1" title="NVIDIA's Natural look: the smoothest, cleanest picture">Natural</button>
           <button type="button" data-style="2" title="NVIDIA's Cinematic look: keeps the most line and texture detail">Cinematic</button>
         </span>
         <span class="hint" style="margin-left:6px">Structure Intensity</span>
@@ -287,7 +287,7 @@
       <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS frame generation 310.9.1 through Streamline 2.14.1. The NVIDIA App's DLSS Override - Model Presets do not change SmoothMyVideo's frames: Frame Generation Preset A and B only switch UI recomposition, which a video has no use for, and SmoothMyVideo runs no DLSS Super Resolution.">
         <input type="checkbox" id="modeldlss"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(AI frame generation from games; 2&times; to 6&times;)</span>
+        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(AI frame generation from games; adds the same number of new frames between every two; multi-pass for high fps targets)</span>
       </label>
     </div>
     <div class="row">
@@ -295,7 +295,7 @@
       <label class="hint" id="modelfsrfglabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 4.0.1 frame generation (FidelityFX SDK 2.3.0). Motion vectors: NVIDIA Optical Flow at Slow, its highest quality level.">
         <input type="checkbox" id="modelfsrfg"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">AMD FSR 4</span> <span class="hint">(AI frame generation from games; 2&times;, 4&times;, 8&times; or 16&times;)</span>
+        <span style="white-space:nowrap;">AMD FSR 4</span> <span class="hint">(AI frame generation from games; multi-pass, each pass doubles the frame rate)</span>
       </label>
     </div>
     <div class="row">
@@ -303,7 +303,7 @@
       <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA NvOFFRUC from the Optical Flow SDK 5.0.7">
         <input type="checkbox" id="modelfruc"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">NVIDIA Smooth Motion</span> <span class="hint">(NVIDIA's optical-flow hardware; 2&times;, 4&times;, 8&times; or 16&times;; the lowest quality, varies run to run)</span>
+        <span style="white-space:nowrap;">NVIDIA Smooth Motion</span> <span class="hint">(NVIDIA's optical-flow hardware; multi-pass, each pass doubles the frame rate; the lowest quality, varies run to run)</span>
       </label>
     </div>
     <div id="dlsssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">

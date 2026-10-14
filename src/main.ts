@@ -710,7 +710,7 @@ let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from
 let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inherited from the NVIDIA DLSS 5 checkbox
 let liveNrStructure = 1; // DLSS 5 Structure Intensity 0..2
 let liveNrTone = 1; // DLSS 5 Tone Intensity 0..2
-let liveNrStyle = 1; // DLSS 5 Style: 0 Default, 1 Natural, 2 Cinematic
+let liveNrStyle = 0; // DLSS 5 Style: 0 Default (NVIDIA's, the app's default), 1 Natural, 2 Cinematic
 let liveNrPasses = 1; // DLSS 5 passes, 1..10 (chained per frame)
 let liveRtxHdr = false; // live TrueHDR, inherited from the RTX HDR checkbox
 let liveHdrColor = 'vivid'; // RTX HDR colour mode + tone knobs, inherited from the HDR sliders
@@ -842,7 +842,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   // RIFE/GMFSS resample adaptively to the fps target inherited from the Speed selectors. No --gen: with only a
   // target the exe derives the slot count per pair from the measured source rate (ceil(target/source)+1,
   // VRAM-clamped), so high targets are not capped by a fixed 16-slot ceiling; DLSS 4.5 takes the whole multiple
-  // of the measured rate nearest the target (capped at 6x by the model)
+  // of the measured rate nearest the target (past one pass's limit in two passes)
   args.push('--target', target);
   // live effects, inherited from the file-render Sharpen / RTX VSR settings
   const sharp = Math.min(2, Math.max(0, Number(liveSharpen) || 0));
@@ -1067,7 +1067,7 @@ ipcMain.on(
     liveDlssnr = !!opts.dlssnr;
     liveNrStructure = opts.nrstructure ?? 1;
     liveNrTone = opts.nrtone ?? 1;
-    liveNrStyle = opts.nrstyle ?? 1;
+    liveNrStyle = opts.nrstyle ?? 0;
     liveNrPasses = Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)));
     liveRtxHdr = !!opts.rtxhdr;
     liveHdrColor = opts.hdrcolor ?? 'vivid';
@@ -1488,7 +1488,7 @@ function engineArgs(opts: RunOpts): string[] {
       '--nr-tone',
       String(opts.nrtone ?? 1),
       '--nr-style',
-      String(opts.nrstyle ?? 1),
+      String(opts.nrstyle ?? 0),
     );
   if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
     args.push('--nr-passes', String(Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
@@ -1762,7 +1762,7 @@ ipcMain.handle(
           '--nr-tone',
           String(opts.nrtone ?? 1),
           '--nr-style',
-          String(opts.nrstyle ?? 1),
+          String(opts.nrstyle ?? 0),
         );
       if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
         args.push('--nr-passes', String(Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)))));

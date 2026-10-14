@@ -64,7 +64,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     dlssnr: false,
     nr_structure: 1,
     nr_tone: 1,
-    nr_style: 1,
+    nr_style: 0,
     nr_passes: 1,
     nr_mask: false,
     hdr_color: 'vivid',

@@ -78,6 +78,13 @@ def _roll_hw(x, sh, sw, left):
 # hands the fp16 stream out of the exported A instead (the host widens it); onnx_export.py sets it
 EXPORT_FP16_STREAM = False
 
+# export path (SMV): the quarter scale's form inside gmflow_bidir A. "masked" = every window of a shifted block attends
+# with the shift mask and each block's last LayerNorm runs on the stacked groups (its runtime JIT ~7 s at every size);
+# "edge" = plain attention everywhere but the windows the roll splits (_edge_attention_tokens), the same block tail:
+# A x0.97 at the 1440p DLAA half, x0.89 at the 4K half, its JIT ~29 s.
+# onnx_export.py exports both; the host starts on "masked" and builds "edge" in the background for the next session
+EXPORT_A_FORM = "masked"
+
 
 def fold_projections(module):
     """export path (SMV): every TransformerLayer's attention is single-head and linear in its projections, so
@@ -160,6 +167,34 @@ def _region_attention_tokens(q, k, v, h, w, num_splits, group, groups, nb):
     return out.reshape(n, wb, c)
 
 
+def _edge_attention_tokens(q, k, v, h, w, num_splits, group, groups, m, windows):
+    """the "edge" form's shifted-block attention (EXPORT_A_FORM) of group `group` of `groups` (one window row each) on
+    _to_groups' token-outer [L, windows * nb, C]; m = the group's rows of the shift mask [windows, L, L]. After the roll
+    only the last window column and the last window row hold two regions: the interior windows attend plainly in one
+    batch (the last row's split top / bottom as two token ranges: rows [0, wh - wh // 2) and the rest, row-major in the
+    window), and the mask applies only to the last-column window (TensorRT-RTX's masked attention costs ~1.5x the
+    plain one)"""
+    assert num_splits // groups == 1
+    n, wb, c = q.shape
+    nb = wb // windows
+    mw = (windows - 1) * nb
+    wh, ww = h // num_splits, w // num_splits
+    t = (wh - wh // 2) * ww
+
+    def att(qq, kk, vv, mask=None):
+        s = torch.matmul(qq.permute(1, 0, 2), kk.permute(1, 2, 0)) / (c ** 0.5)
+        if mask is not None:
+            s = (s.view(mask.shape[0], nb, s.shape[1], s.shape[2]) + mask[:, None]).view(s.shape)
+        return torch.matmul(torch.softmax(s, dim=-1), vv.permute(1, 0, 2)).permute(1, 0, 2)
+
+    edge = att(q[:, mw:], k[:, mw:], v[:, mw:], m[windows - 1:])
+    if group < groups - 1:
+        inner = att(q[:, :mw], k[:, :mw], v[:, :mw])
+    else:
+        inner = torch.cat((att(q[:t, :mw], k[:t, :mw], v[:t, :mw]), att(q[t:, :mw], k[t:, :mw], v[t:, :mw])), dim=0)
+    return torch.cat((inner, edge), dim=1)
+
+
 def single_head_split_window_attention(q, k, v,
                                        num_splits=1,
                                        with_shift=False,
@@ -171,7 +206,8 @@ def single_head_split_window_attention(q, k, v,
                                        ):
     # Ref: https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
     # q, k, v: [B, L, C]; windowed "tokens": a group of `windows` whole windows as [L, W * B, C] (_to_groups), a
-    # shifted block's attn_mask = the group's rows of the shift mask, or its (group, groups) for the attention per region
+    # shifted block's attn_mask = the group's rows of the shift mask, or its (group, groups) for the attention per region,
+    # or ("edge", group, groups, the group's mask rows) for the "edge" form's attention
     assert q.dim() == k.dim() == v.dim() == 3
 
     assert h is not None and w is not None
@@ -183,6 +219,8 @@ def single_head_split_window_attention(q, k, v,
         n, wb, c = q.size()
         nb = wb // windows
         if with_shift and isinstance(attn_mask, tuple):
+            if attn_mask[0] == "edge":
+                return _edge_attention_tokens(q, k, v, h, w, num_splits, *attn_mask[1:], windows)
             return _region_attention_tokens(q, k, v, h, w, num_splits, *attn_mask, nb)
         scores = torch.matmul(q.permute(1, 0, 2), k.permute(1, 2, 0)) / (c ** 0.5)  # [W * B, L, L]
         if with_shift:
@@ -496,8 +534,10 @@ class FeatureTransformer(nn.Module):
         kernel's layout and 1 out per attention); the layout changes once in, once out, and a shifted block's rolled
         windows once around the block (its self and cross attention share them); a block works per token and per
         window, so at the quarter scale it runs on 8 groups of one window row; a shifted block attends with the shift
-        mask at the quarter scale and per mask region at the coarse scale (_region_attention_tokens); with_position =
-        add feature_add_position's per-window table here, once over the position axis (takes_position)"""
+        mask at the quarter scale (the edge form: _edge_attention_tokens) and per mask region at the coarse scale
+        (_region_attention_tokens); with_position = add feature_add_position's per-window table here, once over the
+        position axis (takes_position)"""
+        edge = k == 8 and EXPORT_A_FORM == "edge"
         b, c, h, w = feature0.shape
         wsh, wsw = h // k, w // k
         # per region (plain attention, faster than TensorRT-RTX's masked kernel) only at the coarse scale (k 2, gmflow's
@@ -535,8 +575,9 @@ class FeatureTransformer(nn.Module):
             split = g > 1
             outs = []
             for i in range(g):
+                rows = None if regions else mask[i * kk // g:(i + 1) * kk // g]
                 kw = dict(height=h, width=w, attn_num_splits=k, windowed="tokens", windows=kk // g,
-                          shifted_window_attn_mask=(i, g) if regions else mask[i * kk // g:(i + 1) * kk // g])
+                          shifted_window_attn_mask=(i, g) if regions else ("edge", i, g, rows) if edge else rows)
                 s = layer.self_attn(x0[i], x0[i], **kw)
                 outs.append(layer.cross_attn_ffn(s.half() if half else s, x1[i], split_tail=split, **kw))
             if split:

@@ -21,6 +21,15 @@
 //       that colour space exits 5 before the handshake.
 //       All logging goes to stderr; stdout is binary-only. EOF on stdin exits.
 //       This is the SmoothMyVideo backend.
+//   dlssg2f.exe --stage1 W H [--gen N] [--hdr10 | --bgra] --share TAG [--from TAG]
+//       a stage of a live cascade before the host's own: --from = another stage's ring as its input (on the GPU,
+//       in present order; stdin then only ends it), else the same frames on stdin (--bgra: SDR frames in B8G8R8A8 order, on a
+//       B8G8R8A8 swap chain and ring, the order of Live's effects route), each presented the moment it arrives
+//       (the cadence of a game, so DLSS-G's pacer spreads its frames over the source's own interval); every
+//       native present, generated and real alike in present order, is copied on the GPU into a ring of
+//       textures shared by name with the process that reads them (smv_dg1_TAG_ring0.., a shared fence
+//       smv_dg1_TAG_fence, the header Stage1Hdr in the file mapping smv_dg1_TAG_hdr). stdout carries only
+//       the handshake line.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -38,6 +47,8 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 #include <sl.h>
 #include <sl_consts.h>
@@ -213,11 +224,12 @@ struct Host
     uint32_t maxGen = 0;      // device limit reported by the SDK (0 = not yet known)
     UINT presentSnapshot = 0; // native present count taken just before each proxy Present
     bool hdr10 = false;       // --hdr10: R10G10B10A2 frames on a G2084 / P2020 swap chain
+    bool bgra = false;        // --bgra (--stage1, SDR): B8G8R8A8 frames
     bool hdr10Refused = false;
 
     DXGI_FORMAT frameFormat() const
     {
-        return hdr10 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+        return hdr10 ? DXGI_FORMAT_R10G10B10A2_UNORM : bgra ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     }
 
     bool waitQueue()
@@ -476,17 +488,23 @@ struct Host
         return 0;
     }
 
-    // upload a frame (RGBA8, or R10G10B10A2 with --hdr10) and present it through DLSS-G
-    bool presentFrame(const uint8_t* rgba)
+    // upload a frame (RGBA8, or R10G10B10A2 with --hdr10) and present it through DLSS-G; rgba null = a texture of
+    // this device in frameFormat() instead (src, after srcFence reaches srcValue: an upstream stage's ring slot,
+    // resting in COMMON), or with no src the frame presented last again
+    bool presentFrame(const uint8_t* rgba, ID3D12Resource* src = nullptr, ID3D12Fence* srcFence = nullptr,
+                      uint64_t srcValue = 0)
     {
         pumpMessages();
 
-        uint8_t* dst = nullptr;
-        if (FAILED(uploadBuf->Map(0, nullptr, (void**)&dst)))
-            return false;
-        for (uint32_t y = 0; y < H; y++)
-            memcpy(dst + (size_t)y * rowPitch, rgba + (size_t)y * W * 4, W * 4);
-        uploadBuf->Unmap(0, nullptr);
+        if (rgba)
+        {
+            uint8_t* dst = nullptr;
+            if (FAILED(uploadBuf->Map(0, nullptr, (void**)&dst)))
+                return false;
+            for (uint32_t y = 0; y < H; y++)
+                memcpy(dst + (size_t)y * rowPitch, rgba + (size_t)y * W * 4, W * 4);
+            uploadBuf->Unmap(0, nullptr);
+        }
 
         uint32_t fi = frameIndex++;
         sl::FrameToken* tok{};
@@ -503,14 +521,27 @@ struct Host
 
         alloc->Reset();
         list->Reset(alloc.Get(), nullptr);
-        D3D12_TEXTURE_COPY_LOCATION dl{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-        D3D12_TEXTURE_COPY_LOCATION sl_{uploadBuf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-        sl_.PlacedFootprint.Footprint = {frameFormat(), W, H, 1, rowPitch};
-        list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
-
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        if (rgba)
+        {
+            D3D12_TEXTURE_COPY_LOCATION dl{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            D3D12_TEXTURE_COPY_LOCATION sl_{uploadBuf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            sl_.PlacedFootprint.Footprint = {frameFormat(), W, H, 1, rowPitch};
+            list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
+        }
+        else if (src)
+        {
+            b.Transition.pResource = src;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            list->ResourceBarrier(1, &b);
+            list->CopyResource(texFrame.Get(), src);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            list->ResourceBarrier(1, &b);
+        }
+
         b.Transition.pResource = texFrame.Get();
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -555,6 +586,8 @@ struct Host
         if (slSetTagForFrame(*tok, vp, tags, _countof(tags), nullptr) != sl::Result::eOk)
             return false;
 
+        if (src && srcFence)
+            queue->Wait(srcFence, srcValue); // the upstream slot's copy on its own device is complete
         slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *tok);
         ID3D12CommandList* ls[] = {list.Get()};
         queue->ExecuteCommandLists(1, ls);
@@ -656,6 +689,279 @@ struct Host
         if (hwnd)
             DestroyWindow(hwnd);
         pumpMessages();
+    }
+};
+
+// ---------------------------------------------------------------- --stage1: the shared present ring
+
+// The header a reader maps (smv_dg1_TAG_hdr). A slot's copy is complete once the shared fence reaches its slotFence;
+// slotSeq = the present's number since the ring started (a reader that finds a newer number lost that slot)
+struct Stage1Hdr
+{
+    uint32_t magic;   // 'SMV1'
+    uint32_t version; // 1
+    volatile uint64_t frames;
+    uint32_t w, h, ring, fmt;
+    uint64_t allocSize;
+    volatile uint32_t status;    // 0 starting, 1 running, 2 ended, 3 failed
+    volatile uint32_t lastInput; // the source frame presented last (frame 0 = the warm-up)
+    volatile uint64_t slotFence[16];
+    volatile uint64_t slotSeq[16];
+    volatile int64_t slotQpc[16];    // QueryPerformanceCounter when the capture saw the present
+    volatile uint32_t slotInput[16]; // lastInput at that moment
+};
+
+// Every native present copied into a ring of shared textures on the swap chain's own queue: that queue runs the copy
+// after the present it follows, so the copy needs no settle; the rings rest in COMMON, the state another device's
+// queue may assume
+struct Stage1Ring
+{
+    static const int kRing = 12, kAllocs = 16;
+    Host* h = nullptr;
+    Stage1Hdr* hdr = nullptr;
+    ComPtr<ID3D12Resource> ring[kRing];
+    ComPtr<ID3D12CommandAllocator> alloc[kAllocs];
+    ComPtr<ID3D12GraphicsCommandList> list[kAllocs];
+    uint64_t allocUse[kAllocs] = {};
+    ComPtr<ID3D12Fence> fence;
+    HANDLE ev{};
+    uint64_t fv = 0;
+    std::vector<ComPtr<ID3D12Resource>> native;
+    std::vector<HANDLE> handles;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> frames{0};
+    std::thread th;
+
+    bool init(Host& host, const std::wstring& tag)
+    {
+        h = &host;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = W;
+        rd.Height = H;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = host.frameFormat();
+        rd.SampleDesc = {1, 0};
+        for (int i = 0; i < kRing; i++)
+        {
+            HANDLE sh = nullptr;
+            const std::wstring nm = L"smv_dg1_" + tag + L"_ring" + std::to_wstring(i);
+            if (FAILED(host.device->CreateCommittedResource(
+                    &hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ring[i]))) ||
+                FAILED(host.device->CreateSharedHandle(ring[i].Get(), nullptr, GENERIC_ALL, nm.c_str(), &sh)))
+            {
+                LOG("stage1: ring texture %d not shared\n", i);
+                return false;
+            }
+            handles.push_back(sh);
+        }
+        for (int i = 0; i < kAllocs; i++)
+        {
+            if (FAILED(host.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc[i]))) ||
+                FAILED(host.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[i].Get(), nullptr,
+                                                      IID_PPV_ARGS(&list[i]))))
+                return false;
+            list[i]->Close();
+        }
+        HANDLE fh = nullptr;
+        const std::wstring fn = L"smv_dg1_" + tag + L"_fence";
+        if (FAILED(host.device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence))) ||
+            FAILED(host.device->CreateSharedHandle(fence.Get(), nullptr, GENERIC_ALL, fn.c_str(), &fh)))
+        {
+            LOG("stage1: fence not shared\n");
+            return false;
+        }
+        handles.push_back(fh);
+        ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const std::wstring mn = L"smv_dg1_" + tag + L"_hdr";
+        HANDLE mh = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Stage1Hdr), mn.c_str());
+        if (!mh)
+            return false;
+        handles.push_back(mh);
+        hdr = (Stage1Hdr*)MapViewOfFile(mh, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Stage1Hdr));
+        if (!hdr)
+            return false;
+        memset((void*)hdr, 0, sizeof(Stage1Hdr));
+        hdr->version = 1;
+        hdr->w = W;
+        hdr->h = H;
+        hdr->ring = kRing;
+        hdr->fmt = (uint32_t)host.frameFormat();
+        hdr->allocSize = host.device->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+        native.resize(host.nativeBufCount);
+        for (UINT i = 0; i < host.nativeBufCount; i++)
+            if (FAILED(host.scNative->GetBuffer(i, IID_PPV_ARGS(&native[i]))))
+                return false;
+        MemoryBarrier();
+        hdr->magic = 0x31564D53; // 'SMV1', last: a reader waits for it
+        return true;
+    }
+
+    static void barrier(ID3D12GraphicsCommandList* l, ID3D12Resource* r, D3D12_RESOURCE_STATES a,
+                        D3D12_RESOURCE_STATES b)
+    {
+        D3D12_RESOURCE_BARRIER br{};
+        br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource = r;
+        br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        br.Transition.StateBefore = a;
+        br.Transition.StateAfter = b;
+        l->ResourceBarrier(1, &br);
+    }
+
+    void run()
+    {
+        UINT seen = 0;
+        h->scNative->GetLastPresentCount(&seen);
+        uint64_t n = 0;
+        while (!stop.load())
+        {
+            UINT c = 0, c2 = 0;
+            h->scNative->GetLastPresentCount(&c);
+            if (c == seen)
+            {
+                SwitchToThread();
+                continue;
+            }
+            const UINT cur = h->scNative->GetCurrentBackBufferIndex();
+            h->scNative->GetLastPresentCount(&c2);
+            if (c2 != c)
+                continue; // a present landed between the two reads: the buffer index may be stale
+            LARGE_INTEGER q;
+            QueryPerformanceCounter(&q);
+            const uint32_t input = hdr->lastInput;
+            for (UINT p = seen + 1; p <= c; p++)
+            {
+                const UINT idx = (cur + h->nativeBufCount - 1 - (c - p)) % h->nativeBufCount;
+                const int a = (int)(n % kAllocs);
+                if (fence->GetCompletedValue() < allocUse[a])
+                {
+                    fence->SetEventOnCompletion(allocUse[a], ev);
+                    WaitForSingleObject(ev, 2000);
+                }
+                alloc[a]->Reset();
+                ID3D12GraphicsCommandList* l = list[a].Get();
+                l->Reset(alloc[a].Get(), nullptr);
+                ID3D12Resource* src = native[idx].Get();
+                ID3D12Resource* dst = ring[n % kRing].Get();
+                barrier(l, src, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                barrier(l, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                l->CopyResource(dst, src);
+                barrier(l, src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+                barrier(l, dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+                l->Close();
+                ID3D12CommandList* ls[] = {l};
+                h->queue->ExecuteCommandLists(1, ls);
+                h->queue->Signal(fence.Get(), ++fv);
+                allocUse[a] = fv;
+                const int s = (int)(n % kRing);
+                hdr->slotFence[s] = fv;
+                hdr->slotSeq[s] = n;
+                hdr->slotQpc[s] = q.QuadPart;
+                hdr->slotInput[s] = input;
+                MemoryBarrier();
+                hdr->frames = ++n;
+                frames++;
+            }
+            seen = c;
+        }
+    }
+
+    void start()
+    {
+        hdr->status = 1;
+        th = std::thread([this] { run(); });
+    }
+    void finish(uint32_t status)
+    {
+        stop = true;
+        if (th.joinable())
+            th.join();
+        if (hdr)
+            hdr->status = status;
+    }
+    ~Stage1Ring()
+    {
+        finish(hdr && hdr->status == 1 ? 2 : (hdr ? hdr->status : 0));
+        for (HANDLE x : handles)
+            CloseHandle(x);
+    }
+};
+
+// --stage1 --from TAG: another stage's ring as this stage's input, opened by name on this device (the live host's
+// cascade probe does the same) and read in present order: a slot already reused is skipped to the newest
+struct UpstreamRing
+{
+    HANDLE map = nullptr;
+    const Stage1Hdr* hdr = nullptr;
+    ComPtr<ID3D12Resource> ring[16];
+    ComPtr<ID3D12Fence> fence;
+    uint32_t n = 0;
+    uint64_t nextSeq = 0, skipped = 0;
+
+    bool open(ID3D12Device* dev, const std::wstring& tag, DXGI_FORMAT fmt)
+    {
+        const std::wstring mn = L"smv_dg1_" + tag + L"_hdr";
+        map = OpenFileMappingW(FILE_MAP_READ, FALSE, mn.c_str());
+        hdr = map ? (const Stage1Hdr*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(Stage1Hdr)) : nullptr;
+        if (!hdr || hdr->magic != 0x31564D53 || hdr->version != 1 || hdr->ring > 16)
+        {
+            LOG("--from %ls: no stage header\n", tag.c_str());
+            return false;
+        }
+        if (hdr->w != W || hdr->h != H || hdr->fmt != (uint32_t)fmt)
+        {
+            LOG("--from %ls: shares %ux%u format %u, %ux%u format %u wanted\n", tag.c_str(), hdr->w, hdr->h, hdr->fmt,
+                W, H, (uint32_t)fmt);
+            return false;
+        }
+        n = hdr->ring;
+        for (uint32_t i = 0; i <= n; i++)
+        {
+            HANDLE sh = nullptr;
+            const std::wstring nm = L"smv_dg1_" + tag + (i < n ? L"_ring" + std::to_wstring(i) : L"_fence");
+            const bool ok = SUCCEEDED(dev->OpenSharedHandleByName(nm.c_str(), GENERIC_ALL, &sh)) &&
+                            (i < n ? SUCCEEDED(dev->OpenSharedHandle(sh, IID_PPV_ARGS(&ring[i])))
+                                   : SUCCEEDED(dev->OpenSharedHandle(sh, IID_PPV_ARGS(&fence))));
+            if (sh)
+                CloseHandle(sh);
+            if (!ok)
+            {
+                LOG("--from %ls: %ls not opened\n", tag.c_str(), nm.c_str());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // the next shared present in order: its slot and fence value (false = none yet)
+    bool next(uint32_t& s, uint64_t& fv)
+    {
+        while (hdr->frames > nextSeq)
+        {
+            s = (uint32_t)(nextSeq % n);
+            const uint64_t seq = hdr->slotSeq[s];
+            if (seq != nextSeq)
+            {
+                skipped++;
+                nextSeq = seq > nextSeq ? seq : nextSeq + 1;
+                continue;
+            }
+            fv = hdr->slotFence[s];
+            nextSeq++;
+            return true;
+        }
+        return false;
+    }
+
+    ~UpstreamRing()
+    {
+        if (hdr)
+            UnmapViewOfFile(hdr);
+        if (map)
+            CloseHandle(map);
     }
 };
 
@@ -1052,6 +1358,187 @@ static int runServer(int genFrames, bool hdr10)
     return 0;
 }
 
+// --stage1 (see the usage at the top): present every input as it arrives, share every native present
+static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& tag, const std::wstring& from)
+{
+    Host host;
+    host.genFrames = genFrames;
+    host.hdr10 = hdr10;
+    host.bgra = bgra && !hdr10;
+    int rc = host.init();
+    if (rc)
+        return rc;
+    Stage1Ring ring;
+    if (!ring.init(host, tag))
+        return 1;
+    UpstreamRing up;
+    if (!from.empty() && !up.open(host.device.Get(), from, host.frameFormat()))
+        return 1;
+    _setmode(_fileno(stdin), _O_BINARY);
+    fprintf(stdout, "DLSSG STAGE1 READY gen=%d max=%u share=%ls%s\n", genFrames, host.maxGen, tag.c_str(),
+            host.hdr10  ? " hdr10=1"
+            : host.bgra ? " bgra=1"
+                        : "");
+    fflush(stdout);
+
+    const size_t frameBytes = (size_t)W * H * 4;
+    std::vector<uint8_t> inFrame(from.empty() ? frameBytes : 0), prevFrame(from.empty() ? frameBytes : 0);
+    auto readFull = [&](uint8_t* p, size_t n) -> bool {
+        size_t got = 0;
+        while (got < n)
+        {
+            const size_t r = fread(p + got, 1, n - got, stdin);
+            if (r == 0)
+                return false;
+            got += r;
+        }
+        return true;
+    };
+    // --from: the frames come from the upstream ring, stdin only carries the end (the host closes it); the warm-up
+    // and a reset present the input presented last again (texFrame still holds it)
+    static std::atomic<bool> inEnd{false}; // static: the detached reader outlives this function
+    if (!from.empty())
+        std::thread([] {
+            char c;
+            while (fread(&c, 1, 1, stdin) == 1)
+            {
+            }
+            inEnd = true;
+        }).detach();
+    uint32_t upSlot = 0;
+    uint64_t upValue = 0;
+    auto nextInput = [&]() -> bool {
+        if (from.empty())
+            return readFull(inFrame.data(), frameBytes);
+        while (!up.next(upSlot, upValue))
+        {
+            if (inEnd || up.hdr->status >= 2)
+                return false;
+            SwitchToThread();
+        }
+        return true;
+    };
+    auto presentInput = [&]() -> bool {
+        return from.empty() ? host.presentFrame(inFrame.data())
+                            : host.presentFrame(nullptr, up.ring[upSlot].Get(), up.fence.Get(), upValue);
+    };
+    auto presentAgain = [&]() -> bool {
+        return from.empty() ? host.presentFrame(prevFrame.data()) : host.presentFrame(nullptr);
+    };
+    // the pacer's presents gone quiet for 100 ms (after the warm-up and a reset)
+    auto drainQuiet = [&]() {
+        UINT stable = 0;
+        int quietMs = 0;
+        while (quietMs < 100)
+        {
+            UINT c = 0;
+            host.scNative->GetLastPresentCount(&c);
+            if (c == stable)
+            {
+                Sleep(5);
+                quietMs += 5;
+            }
+            else
+            {
+                stable = c;
+                quietMs = 0;
+            }
+        }
+    };
+    // the same reset as --server's (off at a present, back on, two re-warm presents)
+    auto resetFG = [&]() -> bool {
+        sl::DLSSGOptions off{};
+        off.mode = sl::DLSSGMode::eOff;
+        off.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+        if (slDLSSGSetOptions(host.vp, off) != sl::Result::eOk || !presentAgain())
+            return false;
+        sl::DLSSGOptions on{};
+        on.mode = sl::DLSSGMode::eOn;
+        on.numFramesToGenerate = (uint32_t)genFrames;
+        if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
+            return false;
+        for (int i = 0; i < 2; i++)
+            if (!presentAgain())
+                return false;
+        drainQuiet();
+        return true;
+    };
+
+    if (!nextInput())
+        return 0;
+    for (int i = 0; i < 3; i++)
+        if (!(i && !from.empty() ? host.presentFrame(nullptr) : presentInput()))
+        {
+            LOG("warmup present failed\n");
+            return 1;
+        }
+    sl::DLSSGState st{};
+    if (slDLSSGGetState(host.vp, st, nullptr) == sl::Result::eOk)
+    {
+        if (st.status != sl::DLSSGStatus::eOk)
+        {
+            LOG("DLSS-G runtime status=%d, aborting\n", (int)st.status);
+            return 1;
+        }
+        if (st.numFramesToGenerateMax && (uint32_t)genFrames > st.numFramesToGenerateMax)
+        {
+            LOG("multi-frame generation beyond %ux is not supported on this GPU (requested %ux)\n",
+                st.numFramesToGenerateMax + 1, genFrames + 1);
+            return 3;
+        }
+    }
+    drainQuiet();
+    prevFrame.swap(inFrame);
+    ring.start();
+
+    uint64_t inputs = 1, resets = 0, statInputs = 0, statFrames = ring.frames;
+    ULONGLONG lastPresentTick = GetTickCount64(), statTick = lastPresentTick;
+    while (nextInput())
+    {
+        // an input gap past 700 ms poisons the pacer: reset before presenting (the live host's own value; the capture
+        // repeats a static picture every 500 ms, which must not reset stage 1 each time; --server keeps 500)
+        if (GetTickCount64() - lastPresentTick > 700)
+        {
+            LOG("input gap detected, resetting DLSS-G\n");
+            resets++;
+            if (!resetFG())
+            {
+                LOG("DLSS-G reset failed\n");
+                ring.finish(3);
+                return 1;
+            }
+        }
+        if (!presentInput())
+        {
+            LOG("presentFrame failed\n");
+            ring.finish(3);
+            return 1;
+        }
+        lastPresentTick = GetTickCount64();
+        ring.hdr->lastInput = (uint32_t)inputs++;
+        prevFrame.swap(inFrame);
+        if (lastPresentTick - statTick >= 5000)
+        {
+            const double s = (lastPresentTick - statTick) / 1000.0;
+            const uint64_t f = ring.frames, in = inputs - statInputs;
+            LOG("stage1: %.1f inputs/s, %.1f shared presents/s (%.2f an input)%s\n", in / s, (f - statFrames) / s,
+                in ? (double)(f - statFrames) / in : 0.0,
+                from.empty() ? "" : (", " + std::to_string(up.skipped) + " upstream frames skipped").c_str());
+            statTick = lastPresentTick;
+            statInputs = inputs;
+            statFrames = f;
+        }
+    }
+    ring.finish(2);
+    if (resets)
+        LOG("note: %llu DLSS-G pacer resets during this run\n", (unsigned long long)resets);
+    LOG("stage1 done, %llu inputs, %llu shared presents\n", (unsigned long long)inputs,
+        (unsigned long long)ring.frames.load());
+    host.shutdown();
+    slShutdown();
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     setvbuf(stderr, nullptr, _IONBF, 0);
@@ -1085,7 +1572,44 @@ int wmain(int argc, wchar_t** argv)
             return 1;
         return runServer(genFrames, hdr10);
     }
+    if (argc >= 4 && wcscmp(argv[1], L"--stage1") == 0)
+    {
+        W = (uint32_t)_wtoi(argv[2]);
+        H = (uint32_t)_wtoi(argv[3]);
+        if (W < 128 || H < 128 || W > 8192 || H > 8192)
+        {
+            LOG("bad size %ux%u\n", W, H);
+            return 1;
+        }
+        int genFrames = 1;
+        bool hdr10 = false, bgra = false;
+        std::wstring tag, from;
+        for (int i = 4; i < argc; i++)
+        {
+            if (wcscmp(argv[i], L"--gen") == 0 && i + 1 < argc)
+                genFrames = _wtoi(argv[++i]);
+            else if (wcscmp(argv[i], L"--hdr10") == 0)
+                hdr10 = true;
+            else if (wcscmp(argv[i], L"--bgra") == 0)
+                bgra = true;
+            else if (wcscmp(argv[i], L"--share") == 0 && i + 1 < argc)
+                tag = argv[++i];
+            else if (wcscmp(argv[i], L"--from") == 0 && i + 1 < argc)
+                from = argv[++i];
+        }
+        if (genFrames < 1 || genFrames > 5 || tag.empty() || tag.size() > 40 || from.size() > 40 || from == tag)
+        {
+            LOG("--stage1 needs --gen 1..5 (got %d), --share TAG (1..40 chars) and an optional --from TAG of another "
+                "stage\n",
+                genFrames);
+            return 1;
+        }
+        if (slInitCommon())
+            return 1;
+        return runStage1(genFrames, hdr10, bgra, tag, from);
+    }
 
-    LOG("usage: dlssg2f.exe --server W H [--gen N] [--hdr10]\n");
+    LOG("usage: dlssg2f.exe --server W H [--gen N] [--hdr10]\n"
+        "       dlssg2f.exe --stage1 W H [--gen N] [--hdr10 | --bgra] --share TAG [--from TAG]\n");
     return 1;
 }

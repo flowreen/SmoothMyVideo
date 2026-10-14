@@ -106,9 +106,9 @@ every model to apply only the picture passes, at the source frame rate. Hover a 
 | **GMFSS** (default) | Anime | Any RTX GPU | GMFSS_Fortuna, a "union" interpolator; clean frames even at high multipliers. TensorRT-accelerated. |
 | **NVIDIA Optical Flow** | Slower PCs, fast renders, moderate motion | Nothing extra: the driver provides it | NVIDIA's hardware optical-flow unit. Clean on moderate motion; where very fast or twisting motion defeats the hardware's vectors, it fades to a soft double image instead of breaking up. File renders take a whole multiplier (it tells you when the Speed target is not one). |
 | **RIFE** (Practical-RIFE 4.26 heavy) | Live action, filmed content | Any RTX GPU | The strongest open general-purpose interpolation model. TensorRT-accelerated. Its **DRBA** (anime pacing) option keeps characters at their original animation cadence while camera pans smooth fully; in Live it adds one source frame of delay (it needs the next frame first). |
-| **NVIDIA DLSS 4.5** (DLSS Frame Generation) | NVIDIA's game frame generation, on video | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | Whole multipliers. One pass makes up to 6&times; on an RTX 50, 2&times; on an RTX 40; a file render above that runs in passes (8&times; = 4&times;, then 2&times; between those frames; an RTX 40's 4&times; = 2&times; twice), the first pass on the original frames. Live: one pass. Bundled (~10 MB NVIDIA-redistributable Streamline runtime), hosted offline by a bare-bones D3D12 presentation loop, since DLSS-FG has no video API. [One caveat](#dlss-45-and-rtx-video-in-a-browser). |
-| **AMD FSR 4** frame generation | An alternative ML look | Any RTX GPU (tested on an RTX 5090) | AMD's machine-learning model, steered by NVIDIA's optical flow, running through the open-source vkd3d-proton (D3D12 on Vulkan). Cleaner than FSR 3.1 on fast pans, though fine edges can still break up on fast anime motion where GMFSS stays clean. Its shaders compile once per driver, in the background, as soon as you pick it. Varies slightly from run to run. Powers of 2 only (2&times; / 4&times; / 8&times; / 16&times;): Live runs the largest that fits the target; a file render at another multiplier puts its frames at the nearest of those positions. |
-| **NVIDIA Smooth Motion** | The NVIDIA look, or a non-AI reference | A one-time runtime ([setup](#get-started)) | Hardware optical-flow FRUC, the same family as the driver-level Smooth Motion. The lowest quality of the models; varies from run to run. Powers of 2 only, like AMD FSR 4. |
+| **NVIDIA DLSS 4.5** (DLSS Frame Generation) | NVIDIA's game frame generation, on video | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | Whole multipliers. One pass makes up to 6&times; on an RTX 50, 2&times; on an RTX 40; a file render above that goes multi-pass (8&times; = 4&times;, then 2&times; between those frames; an RTX 40's 4&times; = 2&times; twice), the first pass on the original frames. Live: above one pass's limit the full 6&times; passes first, then the rest (12&times; = 6&times;, then 2&times;; 72&times; = 6&times;, 6&times;, then 2&times;), the first such multiple that reaches the target, with any effect and DLSS mode. Bundled (~10 MB NVIDIA-redistributable Streamline runtime), hosted offline by a bare-bones D3D12 presentation loop, since DLSS-FG has no video API. [One caveat](#dlss-45-and-rtx-video-in-a-browser). |
+| **AMD FSR 4** frame generation | An alternative ML look | Any RTX GPU (tested on an RTX 5090) | AMD's machine-learning model, steered by NVIDIA's optical flow, running through the open-source vkd3d-proton (D3D12 on Vulkan). Cleaner than FSR 3.1 on fast pans, though fine edges can still break up on fast anime motion where GMFSS stays clean. Its shaders compile once per driver, in the background, as soon as you pick it. Varies slightly from run to run. Multi-pass, each pass doubling the frame rate (powers of 2 only): Live runs the largest that fits the target; a file render at another multiplier puts its frames at the nearest of those positions. |
+| **NVIDIA Smooth Motion** | The NVIDIA look, or a non-AI reference | A one-time runtime ([setup](#get-started)) | Hardware optical-flow FRUC, the same family as the driver-level Smooth Motion. The lowest quality of the models; varies from run to run. Multi-pass like AMD FSR 4, each pass doubling the frame rate. |
 
 ## Picture
 
@@ -196,8 +196,9 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
   monitor with the window (aspect kept), upscaled with RTX VSR or AMD FSR 4.1 when ticked.
 * **Adaptive:** with GMFSS, RIFE or NVIDIA Optical Flow, the output locks to your fps target and the multiplier
   follows the content, so a game dropping from 30 to 10 fps keeps playing at the same smooth rate. NVIDIA Smooth
-  Motion and AMD FSR 4 run the largest 2&times; / 4&times; / 8&times; / 16&times; step under the target (60 fps on a
-  24 fps source shows 48), and DLSS 4.5 whole multiples, 2&times;&ndash;6&times;.
+  Motion and AMD FSR 4 are multi-pass, each pass doubling the frame rate: a target between two doublings runs the one
+  above it while the GPU keeps up (60 fps on a 24 fps source shows 96), else the one below; DLSS 4.5 runs the first
+  whole multiple it can make that reaches the target, multi-pass above one pass's limit (the full passes first).
 * **Fit to the GPU** (on by default) lowers the smoothing to what your GPU keeps up with, down to the source's own
   rate with every effect still on, so every source frame is shown with little delay. Unticked, everything runs as set
   and a target the GPU can't reach skips source frames.
@@ -246,7 +247,7 @@ in Live.
   full resolution: its own size in, the same size out.
 * **How it is fed:** the way game integrations feed it, with NVIDIA's automatic mask and motion vectors from NVIDIA's
   Optical Flow hardware. Its history follows the picture, and a paused or held picture stays perfectly still.
-* **Controls:** NVIDIA's three looks as a **Style** selector (Default, Natural, Cinematic; Natural is preselected),
+* **Controls:** NVIDIA's three looks as a **Style** selector (Default, Natural, Cinematic; NVIDIA's Default is preselected),
   **Structure Intensity** and **Tone Intensity** sliders, and **Passes** (1 to 10): DLSS 5 again on its own result,
   for a stronger effect at that many times the time and video memory.
 * **The runtime:** the host is bundled, but the Neural Rendering runtime (`nvngx_dlssnr.dll`) is not, and NVIDIA

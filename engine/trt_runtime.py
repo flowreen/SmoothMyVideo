@@ -944,6 +944,92 @@ def _blocks12_flat_concat(onnx_path, name):
     onnx.checker.check_model(onnx_path)
 
 
+def _warp_at_resize_taps(onnx_path, name):
+    """RIFE IFNet: a warp that only feeds the next block's downscale is computed only where that downscale reads.
+    Blocks 1 / 2 / 3 (the /8, /4 and /2 scales of the 16-8-4-2-1 list) take Resize(Cast16(GridSample(v, grid))) with
+    the Resize linear, half_pixel, no antialias: each output pixel reads full-size rows and columns a, a + 1 of its
+    s x s cell (a = s / 2 - 1) with weights 0.5 x 0.5. So it becomes 0.25 x the sum of Cast16(GridSample(v, grid[:,
+    a + dy :: s, a + dx :: s])) over the 4 offsets: the same samples, the same fp16 rounding, bit-identical engines;
+    1 / 16 and 1 / 4 of the warp work at /8 and /4, and at /2 (every pixel once) no full-size warped tensor written and
+    read back (IFNet x0.840 at 2560x1472). Block 4 (/1) reads the full-size warps. Needs the frame a multiple of s (the
+    host pads every RIFE size to /64). Graph only."""
+    import numpy as np
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    if not name.startswith("rife_ifnet_"):
+        return
+    scales = [int(x) for x in name.rsplit("_", 1)[-1].split("-")]
+    g = onnx.load(onnx_path, load_external_data=False)
+    nodes = list(g.graph.node)
+    cons = {}
+    for nd in nodes:
+        for x in nd.input:
+            cons.setdefault(x, []).append(nd)
+    warps = [nd for nd in nodes if nd.op_type == "GridSample"]
+    if len(warps) != 4 * (len(scales) - 1):
+        raise RuntimeError(f"{name}: expected 4 warps a block boundary, found {len(warps)}")
+    inits, replace, gone = [], {}, set()
+
+    def const(arr, dtype, nm):
+        t = numpy_helper.from_array(np.array(arr, dtype=dtype), nm)
+        inits.append(t)
+        return t.name
+
+    quarter = const(0.25, np.float32, "wt_quarter")
+    for k, gs in enumerate(warps):
+        s = scales[k // 4 + 1]
+        if s < 2:
+            continue
+        cast = cons[gs.output[0]]
+        rs = cons[cast[0].output[0]] if len(cast) == 1 and cast[0].op_type == "Cast" else []
+        if len(rs) != 1 or rs[0].op_type != "Resize":
+            raise RuntimeError(f"{name}: warp {k} does not feed one Resize through one Cast")
+        rs = rs[0]
+        a = {x.name: helper.get_attribute_value(x) for x in rs.attribute}
+        if (a.get("mode") != b"linear" or a.get("coordinate_transformation_mode") != b"half_pixel"
+                or a.get("antialias", 0) != 0):
+            raise RuntimeError(f"{name}: warp {k}'s Resize is not linear half_pixel without antialias ({a})")
+        o = s // 2 - 1
+        seq, terms = [], []
+        for dy in (0, 1):
+            for dx in (0, 1):
+                p = f"wt{k}_{dy}{dx}"
+                seq.append(helper.make_node(
+                    "Slice", [gs.input[1], const([o + dy, o + dx], np.int64, p + "_s"),
+                              const([1 << 30, 1 << 30], np.int64, p + "_e"), const([1, 2], np.int64, p + "_a"),
+                              const([s, s], np.int64, p + "_t")], [p + "_grid"], name=p + "_slice"))
+                seq.append(helper.make_node("GridSample", [gs.input[0], p + "_grid"], [p + "_w"], name=p + "_warp"))
+                seq[-1].attribute.extend(gs.attribute)
+                seq.append(helper.make_node("Cast", [p + "_w"], [p + "_h"], name=p + "_half", to=TensorProto.FLOAT16))
+                seq.append(helper.make_node("Cast", [p + "_h"], [p + "_f"], name=p + "_float", to=TensorProto.FLOAT))
+                terms.append(p + "_f")
+        acc = terms[0]
+        for i, t in enumerate(terms[1:]):
+            seq.append(helper.make_node("Add", [acc, t], [f"wt{k}_sum{i}"], name=f"wt{k}_add{i}"))
+            acc = f"wt{k}_sum{i}"
+        seq.append(helper.make_node("Mul", [acc, quarter], [f"wt{k}_mean"], name=f"wt{k}_mul"))
+        seq.append(helper.make_node("Cast", [f"wt{k}_mean"], list(rs.output), name=f"wt{k}_out",
+                                    to=TensorProto.FLOAT16))
+        replace[id(rs)] = seq
+        gone.update({id(gs), id(cast[0])})
+    if not replace:
+        raise RuntimeError(f"{name}: no warp at a /2 or coarser scale")
+    keep = []
+    for nd in nodes:
+        if id(nd) in replace:
+            keep.extend(replace[id(nd)])
+        elif id(nd) not in gone:
+            keep.append(nd)
+    del g.graph.node[:]
+    g.graph.node.extend(keep)
+    g.graph.initializer.extend(inits)
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
 def _encode_subpixel(onnx_path, name):
     """RIFE encode: its last layer, a transposed conv (4x4, stride 2, pad 1) from half the frame
     size to the full size, becomes its sub-pixel form: one Conv (3x3, pad 1) with four times the
@@ -1115,6 +1201,48 @@ def _fusion_tail_cut(onnx_path, name):
     keep_vi = [v for v in g.graph.value_info if v.name not in (pre, d2s.output[0], "out")]
     del g.graph.value_info[:]
     g.graph.value_info.extend(keep_vi)
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
+def _fusion_input_lrelu(onnx_path, name):
+    """GMFSS fusionnet: b / c / d are each read by ONE LeakyRelu before a conv, which TensorRT-RTX
+    runs as its own kernels over the three inputs (with channels-last inputs: x0.975 of fusionnet at
+    the 4K half without them). Those LeakyRelus go, their readers take the raw input, and the slopes
+    leave as the constant output `lr_bcd` (fp32 [3], the attributes' exact values), so the host's
+    splats store LeakyRelu(the fp16 value) themselves: an fp16 LeakyRelu outside the engine is bit
+    for bit TensorRT's (0 of 535 M values differ at the 4K half). Refuses another reader or a slope
+    outside (0, 1]."""
+    import numpy as np
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    if name != "fusionnet":
+        return
+    g = onnx.load(onnx_path, load_external_data=False)
+    users = {}
+    for nd in g.graph.node:
+        for x in nd.input:
+            users.setdefault(x, []).append(nd)
+    slopes = []
+    for key in ("b", "c", "d"):
+        rd = users.get(key, [])
+        if len(rd) != 1 or rd[0].op_type != "LeakyRelu":
+            raise RuntimeError(f"{name}: {key} is not read by exactly one LeakyRelu")
+        a = [helper.get_attribute_value(t) for t in rd[0].attribute if t.name == "alpha"]
+        a = a[0] if a else 0.01
+        if not 0.0 < a <= 1.0:
+            raise RuntimeError(f"{name}: {key}'s LeakyRelu has slope {a} outside (0, 1]")
+        y = rd[0].output[0]
+        g.graph.node.remove(rd[0])
+        for nd in g.graph.node:
+            nd.input[:] = [key if i == y else i for i in nd.input]
+        slopes.append(a)
+    g.graph.initializer.append(numpy_helper.from_array(np.array(slopes, np.float32), "lr_bcd_value"))
+    g.graph.node.append(helper.make_node("Identity", ["lr_bcd_value"], ["lr_bcd"], name="node_lr_bcd"))
+    g.graph.output.append(helper.make_tensor_value_info("lr_bcd", TensorProto.FLOAT, [3]))
     with open(onnx_path + ".tmp", "wb") as fh:
         fh.write(g.SerializeToString())
     os.replace(onnx_path + ".tmp", onnx_path)
@@ -1760,10 +1888,12 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
         _last_block_conv_split(tmp, name)
         _block3_conv_split(tmp, name)
         _blocks12_flat_concat(tmp, name)
+        _warp_at_resize_taps(tmp, name)
         _encode_subpixel(tmp, name)
         _fusion_fp16_inputs(tmp, name)
         _fusion_tail_cut(tmp, name)
         _fusion_prelu_fanout(tmp, name)
+        _fusion_input_lrelu(tmp, name)
         if os.path.isfile(tmp + ".data"):
             os.replace(tmp + ".data", path + ".data")
         os.replace(tmp, path)

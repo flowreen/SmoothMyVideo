@@ -99,6 +99,599 @@ static bool livePauseWanted(HWND target, HWND overlay)
     return IntersectRect(&c, &a, &b) != 0;
 }
 
+// Live DLSS 4.5's multiple for w = the target / the source rate: one pass up to `lim` (numFramesToGenerateMax + 1),
+// above it the full lim first and then the rest (the cascade below: stage 1 = dlssg2f --stage1, the last pass = the
+// session's own DLSS-G; more frames made from the real ones), so the reachable multiples are 2..lim and lim x 2..lim
+// (lim 6: 12, 18, .. 36), with m3 also lim x lim x 2..lim (72, 108, .. 216); the first of them that reaches w (within 3 %:
+// a 23.976 fps source at 48 stays 2x), the largest when none does, x2 below 2. m1, m2 = the passes in order (m2 = 1 for one
+// pass), *m3 = the third (1 for one or two passes); *tie = false (the snap table's format)
+static int dlssgSnap(double w, int lim, int& m1, int& m2, bool* tie = nullptr, int* m3 = nullptr)
+{
+    const int passes = m3 ? 3 : 2;
+    int full = 1, r = lim, k = passes;
+    for (int n = 1; n <= passes; n++, full *= lim)
+    {
+        int f = 2;
+        while (f < lim && full * f * 1.03 < w)
+            f++;
+        if (full * f * 1.03 >= w || n == passes)
+        {
+            k = n;
+            r = f;
+            break;
+        }
+    }
+    m1 = k == 1 ? r : lim;
+    m2 = k == 1 ? 1 : k == 2 ? r : lim;
+    if (m3)
+        *m3 = k == 3 ? r : 1;
+    if (tie)
+        *tie = false;
+    return full * r;
+}
+
+// the largest of dlssgSnap's multiples (with m3 the three-pass ones too) at most cap, its passes in the same order; x2
+// below 2 (a plan that fell short steps down to what the GPU held)
+static int dlssgAtMost(int cap, int lim, int& m1, int& m2, int* m3 = nullptr)
+{
+    int best = 2, k = 1, r = 2;
+    for (int n = 1, full = 1; n <= (m3 ? 3 : 2); n++, full *= lim)
+        for (int f = 2; f <= lim; f++)
+            if (full * f <= cap && full * f >= best)
+            {
+                best = full * f;
+                k = n;
+                r = f;
+            }
+    m1 = k == 1 ? r : lim;
+    m2 = k == 1 ? 1 : k == 2 ? r : lim;
+    if (m3)
+        *m3 = k == 3 ? r : 1;
+    return best;
+}
+
+// The one pass's generated frames for w (the first whole multiple reaching it within 3 %, as dlssgSnap), 1..capMax
+static int dlssgOnePassGen(double w, int capMax)
+{
+    int g = 1;
+    while (g < capMax && (g + 1) * 1.03 < w)
+        g++;
+    return g;
+}
+
+// The Live DLSS 4.5 cascade's first stage (SMV_LIVE_CASCADE=probe on the direct DLSS-G route: consume-only):
+// dlssg2f.exe --stage1 in a job object that ends it with this process, fed every captured
+// frame by a writer thread (a frame arriving while the last one is still being written is dropped, counted), and every
+// present it shares read back on THIS process's D3D12 device: its queue waits the slot's fence value and copies the
+// slot into a scratch texture. Nothing it reads is presented: the overlay keeps today's direct route.
+struct Stage1HdrView // dlssg2f's Stage1Hdr (engine\dlssg\build_src\main.cpp), version 1
+{
+    uint32_t magic, version;
+    volatile uint64_t frames;
+    uint32_t w, h, ring, fmt;
+    uint64_t allocSize;
+    volatile uint32_t status, lastInput;
+    volatile uint64_t slotFence[16];
+    volatile uint64_t slotSeq[16];
+    volatile int64_t slotQpc[16];
+    volatile uint32_t slotInput[16];
+};
+
+struct CascadeProbe
+{
+    HANDLE job = nullptr, hProc = nullptr, hIn = nullptr, hOut = nullptr, hErr = nullptr, hMap = nullptr;
+    const Stage1HdrView* hdr = nullptr;
+    std::thread errPump, writer, reader;
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<uint8_t> mail;
+    bool mailFull = false, quit = false;
+    std::atomic<bool> readerQuit{false};
+    // abortStart: the session ended while start() waits for READY; writerFailed: stage 1's stdin broke
+    std::atomic<bool> abortStart{false}, writerFailed{false}, writerDone{false}, pumpDone{false};
+    std::atomic<uint64_t> fed{0}, dropped{0}, consumed{0}, overrun{0}, skipped{0};
+    uint64_t wdFed = 0, wdFrames = 0; // stalled()'s last window
+    uint64_t repFed = 0, repDropped = 0, repConsumed = 0, repFrames = 0;
+    ComPtr<ID3D12Resource> ring[16];
+    ComPtr<ID3D12Fence> shared, own;
+    ComPtr<ID3D12CommandQueue> q;
+    ComPtr<ID3D12CommandAllocator> al;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Resource> scratch;
+    HANDLE ev = nullptr;
+    uint32_t n = 0;
+    uint32_t fw = 0, fh = 0; // the frame size stage 1 takes
+    // present mode (SMV_LIVE_CASCADE=present): no reader thread; the session's loop takes the slots in order
+    // (nextFrame) and presents them through its own DLSS-G (stage 2)
+    bool present = false;
+    uint64_t nextSeq = 0;
+    // the share tag (live<pid>; a third stage's middle probe live<pid>b) and, for that probe, the probe it takes its
+    // frames from (dlssg2f --from) instead of the session's feed
+    std::wstring tag;
+    const CascadeProbe* up = nullptr;
+
+    // the next shared present in order: its slot and fence value (false = none yet); a slot already reused = skipped
+    bool nextFrame(uint32_t& s, uint64_t& fv)
+    {
+        while (hdr->frames > nextSeq)
+        {
+            s = (uint32_t)(nextSeq % n);
+            const uint64_t seq = hdr->slotSeq[s];
+            if (seq != nextSeq)
+            {
+                skipped++;
+                nextSeq = seq > nextSeq ? seq : nextSeq + 1;
+                continue;
+            }
+            fv = hdr->slotFence[s];
+            nextSeq++;
+            consumed++;
+            return true;
+        }
+        return false;
+    }
+
+    // bgra: SDR frames in B8G8R8A8 order (the effects route's slots and back buffer), else R8G8B8A8; upstream = a
+    // running probe whose ring this one takes as its input (its stage number 2, never fed by the session)
+    bool start(ID3D12Device* dev, uint32_t w, uint32_t h, int gen, bool hdr10, bool presentMode, bool bgra,
+               const CascadeProbe* upstream = nullptr)
+    {
+        present = presentMode;
+        up = upstream;
+        fw = w;
+        fh = h;
+        wchar_t exePath[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring dir(exePath);
+        dir.resize(dir.find_last_of(L'\\'));
+        dir += L"\\..\\dlssg";
+        wchar_t ov[MAX_PATH]{};
+        if (GetEnvironmentVariableW(L"SMV_DLSSG_DIR", ov, MAX_PATH) && ov[0])
+            dir = ov;
+        wchar_t full[MAX_PATH]{};
+        if (GetFullPathNameW(dir.c_str(), MAX_PATH, full, nullptr))
+            dir = full;
+        tag = L"live" + std::to_wstring(GetCurrentProcessId()) + (up ? L"b" : L"");
+        const int stageNo = up ? 2 : 1;
+        job = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li)))
+        {
+            LOG("cascade probe: no job object (%lu)\n", GetLastError());
+            return false;
+        }
+        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+        HANDLE inR = nullptr, outW = nullptr, errW = nullptr;
+        if (!CreatePipe(&inR, &hIn, &sa, 1 << 20) || !CreatePipe(&hOut, &outW, &sa, 4096) ||
+            !CreatePipe(&hErr, &errW, &sa, 0))
+            return false;
+        SetHandleInformation(hIn, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(hOut, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(hErr, HANDLE_FLAG_INHERIT, 0);
+        HANDLE inherit[3] = {inR, outW, errW};
+        SIZE_T attrSize = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+        std::vector<uint8_t> attrBuf(attrSize);
+        auto attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)attrBuf.data();
+        STARTUPINFOEXW si{};
+        si.StartupInfo.cb = sizeof(si);
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = inR;
+        si.StartupInfo.hStdOutput = outW;
+        si.StartupInfo.hStdError = errW;
+        bool ok = InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize) &&
+                  UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit),
+                                            nullptr, nullptr);
+        si.lpAttributeList = attrs;
+        const std::wstring exe = dir + L"\\dlssg2f.exe";
+        std::wstring cmd = L"\"" + exe + L"\" --stage1 " + std::to_wstring(w) + L" " + std::to_wstring(h) + L" --gen " +
+                           std::to_wstring(gen) +
+                           (hdr10  ? L" --hdr10"
+                            : bgra ? L" --bgra"
+                                   : L"") +
+                           L" --share " + tag + (up ? L" --from " + up->tag : L"");
+        PROCESS_INFORMATION pi{};
+        // suspended until the job holds it: a child that dies with this process can never outlive it
+        ok = ok && CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
+                                  EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+                                  dir.c_str(), &si.StartupInfo, &pi);
+        DeleteProcThreadAttributeList(attrs);
+        CloseHandle(inR);
+        CloseHandle(outW);
+        CloseHandle(errW);
+        if (!ok)
+        {
+            LOG("cascade probe: cannot start %s (%lu)\n", wideToUtf8(exe).c_str(), GetLastError());
+            return false;
+        }
+        hProc = pi.hProcess;
+        if (!AssignProcessToJobObject(job, hProc))
+        {
+            LOG("cascade probe: the child is not in the job (%lu)\n", GetLastError());
+            TerminateProcess(hProc, 1);
+            CloseHandle(pi.hThread);
+            return false;
+        }
+        ResumeThread(pi.hThread);
+        CloseHandle(pi.hThread);
+        errPump = std::thread([this, e = hErr, stageNo]() {
+            std::string acc;
+            char b[1024];
+            DWORD rd = 0;
+            while (ReadFile(e, b, sizeof(b), &rd, nullptr) && rd)
+            {
+                acc.append(b, rd);
+                size_t nl;
+                while ((nl = acc.find('\n')) != std::string::npos)
+                {
+                    std::string ln = acc.substr(0, nl);
+                    if (!ln.empty() && ln.back() == '\r')
+                        ln.pop_back();
+                    LOG("cascade stage %d: %s\n", stageNo, ln.c_str());
+                    acc.erase(0, nl + 1);
+                }
+            }
+            pumpDone = true;
+        });
+        // READY within 20 s (Streamline's init + the DLSS-G feature), polled: a child that hangs or dies, or a session
+        // that ends meanwhile (abortStart), never holds the caller
+        std::string line;
+        bool eol = false;
+        const ULONGLONG until = GetTickCount64() + 20000;
+        while (!eol && !abortStart.load() && GetTickCount64() < until)
+        {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(hOut, nullptr, 0, nullptr, &avail, nullptr))
+                break; // stdout closed: the child ended
+            if (!avail)
+            {
+                Sleep(5);
+                continue;
+            }
+            char ch = 0;
+            DWORD rd = 0;
+            while (avail-- && ReadFile(hOut, &ch, 1, &rd, nullptr) && rd == 1)
+            {
+                if (ch == '\n')
+                {
+                    eol = true;
+                    break;
+                }
+                if (ch != '\r' && line.size() < 256)
+                    line += ch;
+            }
+        }
+        if (line.rfind("DLSSG STAGE1 READY", 0) != 0)
+        {
+            DWORD rc = 1;
+            const bool alive = WaitForSingleObject(hProc, 0) != WAIT_OBJECT_0;
+            if (alive)
+                TerminateJobObject(job, 1);
+            WaitForSingleObject(hProc, 5000);
+            GetExitCodeProcess(hProc, &rc);
+            LOG("cascade probe: stage %d did not start (rc %lu%s)\n", stageNo, rc,
+                !alive              ? ""
+                : abortStart.load() ? ", the session ended"
+                                    : ", no READY in 20 s");
+            return false;
+        }
+        const std::wstring mn = L"smv_dg1_" + tag + L"_hdr";
+        hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, mn.c_str());
+        hdr = hMap ? (const Stage1HdrView*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(Stage1HdrView)) : nullptr;
+        if (!hdr || hdr->magic != 0x31564D53 || hdr->version != 1 || hdr->ring > 16)
+        {
+            LOG("cascade probe: no stage-1 header\n");
+            return false;
+        }
+        // stage 2 copies a ring frame straight into its back buffer: the same size and format or no cascade (a
+        // dlssg2f that does not know --bgra shares R8G8B8A8)
+        const uint32_t wantFmt = (uint32_t)(hdr10  ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                            : bgra ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                                   : DXGI_FORMAT_R8G8B8A8_UNORM);
+        if (hdr->w != w || hdr->h != h || hdr->fmt != wantFmt)
+        {
+            LOG("cascade probe: stage 1 shares %ux%u format %u, %ux%u format %u wanted\n", hdr->w, hdr->h, hdr->fmt, w,
+                h, wantFmt);
+            return false;
+        }
+        n = hdr->ring;
+        for (uint32_t i = 0; i < n; i++)
+        {
+            HANDLE sh = nullptr;
+            const std::wstring nm = L"smv_dg1_" + tag + L"_ring" + std::to_wstring(i);
+            if (FAILED(dev->OpenSharedHandleByName(nm.c_str(), GENERIC_ALL, &sh)) ||
+                FAILED(dev->OpenSharedHandle(sh, IID_PPV_ARGS(&ring[i]))))
+            {
+                LOG("cascade probe: ring texture %u not opened\n", i);
+                return false;
+            }
+            CloseHandle(sh);
+        }
+        {
+            HANDLE sh = nullptr;
+            const std::wstring fn = L"smv_dg1_" + tag + L"_fence";
+            if (FAILED(dev->OpenSharedHandleByName(fn.c_str(), GENERIC_ALL, &sh)) ||
+                FAILED(dev->OpenSharedHandle(sh, IID_PPV_ARGS(&shared))))
+            {
+                LOG("cascade probe: stage-1 fence not opened\n");
+                return false;
+            }
+            CloseHandle(sh);
+        }
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC rd2 = ring[0]->GetDesc();
+        if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) ||
+            FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al))) ||
+            FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al.Get(), nullptr, IID_PPV_ARGS(&list))) ||
+            FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&own))) ||
+            FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd2, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                nullptr, IID_PPV_ARGS(&scratch))))
+        {
+            LOG("cascade probe: reader resources failed\n");
+            return false;
+        }
+        list->Close();
+        ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        mail.resize((size_t)w * h * 4);
+        writer = std::thread([this] { writeLoop(); });
+        nextSeq = hdr->frames;
+        if (!present)
+            reader = std::thread([this] { readLoop(); });
+        LOG("cascade probe: stage %d up (%s), %ux%u x%d, its ring of %u opened on this device%s\n", stageNo,
+            line.c_str(), w, h, gen + 1, n,
+            up        ? ", from stage 1's ring, the session presents it"
+            : present ? ", stage 2 presents it"
+                      : "");
+        return true;
+    }
+
+    // the newest captured frame for the child; one in flight at most
+    void feed(const uint8_t* p, size_t bytes)
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (mailFull || bytes != mail.size())
+        {
+            dropped++;
+            return;
+        }
+        memcpy(mail.data(), p, bytes);
+        mailFull = true;
+        cv.notify_one();
+    }
+
+    // the same for a frame whose rows sit `pitch` bytes apart (the effects route's output slots)
+    void feedRows(const uint8_t* p, size_t pitch)
+    {
+        std::lock_guard<std::mutex> lk(m);
+        const size_t row = (size_t)fw * 4;
+        if (mailFull || row * fh != mail.size())
+        {
+            dropped++;
+            return;
+        }
+        if (pitch == row)
+            memcpy(mail.data(), p, mail.size());
+        else
+            for (uint32_t y = 0; y < fh; y++)
+                memcpy(mail.data() + y * row, p + y * pitch, row);
+        mailFull = true;
+        cv.notify_one();
+    }
+
+    void writeLoop()
+    {
+        std::vector<uint8_t> out(mail.size());
+        for (;;)
+        {
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [this] { return mailFull || quit; });
+                if (quit)
+                {
+                    writerDone = true;
+                    return;
+                }
+                out.swap(mail);
+                mailFull = false;
+            }
+            size_t off = 0;
+            while (off < out.size())
+            {
+                DWORD wr = 0;
+                if (!WriteFile(hIn, out.data() + off, (DWORD)(std::min)(out.size() - off, (size_t)1 << 20), &wr,
+                               nullptr) ||
+                    !wr)
+                {
+                    writerFailed = true;
+                    writerDone = true;
+                    return;
+                }
+                off += wr;
+            }
+            fed++;
+        }
+    }
+
+    // stage 1 is gone: its process ended, its header says ended / failed, or its stdin broke
+    bool dead() const
+    {
+        return (hProc && WaitForSingleObject(hProc, 0) == WAIT_OBJECT_0) || (hdr && hdr->status >= 2) ||
+               writerFailed.load();
+    }
+
+    // one call a 2 s window: stage 1 took inputs but shared nothing (a hung child; a static source still feeds it the
+    // capture's 500 ms keepalive, each of which it presents); a middle stage's inputs = its upstream's shared frames
+    bool stalled()
+    {
+        const uint64_t f = up ? (up->hdr ? up->hdr->frames : 0) : fed.load(), fr = hdr ? hdr->frames : 0;
+        const bool s = f - wdFed >= 2 && fr == wdFrames;
+        wdFed = f;
+        wdFrames = fr;
+        return s;
+    }
+
+    // stage 2 starts at the newest shared present (a resume after a pause shows no stale tail)
+    void skipToNewest()
+    {
+        if (hdr)
+            nextSeq = hdr->frames;
+    }
+
+    // a fallback's first step: end the child at once (its job) and release any stage-2 queue wait on its fence
+    void kill()
+    {
+        if (job)
+            TerminateJobObject(job, 1);
+        if (shared)
+            shared->Signal(UINT64_MAX);
+    }
+
+    void readLoop()
+    {
+        uint64_t next = hdr->frames, ov = 0;
+        while (!readerQuit.load())
+        {
+            if (hdr->frames <= next)
+            {
+                SwitchToThread();
+                continue;
+            }
+            const uint32_t s = (uint32_t)(next % n);
+            const uint64_t seq = hdr->slotSeq[s], fv = hdr->slotFence[s];
+            if (seq != next)
+            {
+                if (seq > next)
+                    skipped++;
+                next = seq > next ? seq : next + 1;
+                continue;
+            }
+            q->Wait(shared.Get(), fv);
+            al->Reset();
+            list->Reset(al.Get(), nullptr);
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = ring[s].Get();
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            list->ResourceBarrier(1, &b);
+            list->CopyResource(scratch.Get(), ring[s].Get());
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            list->ResourceBarrier(1, &b);
+            list->Close();
+            ID3D12CommandList* ls[] = {list.Get()};
+            q->ExecuteCommandLists(1, ls);
+            q->Signal(own.Get(), ++ov);
+            if (own->GetCompletedValue() < ov)
+            {
+                own->SetEventOnCompletion(ov, ev);
+                WaitForSingleObject(ev, 2000);
+            }
+            if (hdr->slotSeq[s] != next)
+                overrun++;
+            else
+                consumed++;
+            next++;
+        }
+    }
+
+    // one line a stats window (the direct loop's 2 s block)
+    void report(double secs)
+    {
+        const uint64_t f = fed, d = dropped, c = consumed, fr = hdr ? hdr->frames : 0;
+        if (up)
+            LOG("cascade probe 2: stage 2 shared %.1f/s, read %.1f/s; skipped %llu\n", (fr - repFrames) / secs,
+                (c - repConsumed) / secs, (unsigned long long)skipped.load());
+        else
+            LOG("cascade probe: fed %.1f/s (dropped %llu), stage 1 shared %.1f/s, read %.1f/s; overrun %llu, skipped "
+                "%llu\n",
+                (f - repFed) / secs, (unsigned long long)(d - repDropped), (fr - repFrames) / secs,
+                (c - repConsumed) / secs, (unsigned long long)overrun.load(), (unsigned long long)skipped.load());
+        repFed = f;
+        repDropped = d;
+        repConsumed = c;
+        repFrames = fr;
+    }
+
+    void stop()
+    {
+        abortStart = true;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            quit = true;
+        }
+        cv.notify_all();
+        if (writer.joinable())
+        {
+            // a writer blocked in WriteFile (a child that stopped reading) is cancelled; past 500 ms the child is ended,
+            // which breaks its pipe
+            const ULONGLONG until = GetTickCount64() + 500;
+            while (!writerDone.load())
+            {
+                CancelSynchronousIo(writer.native_handle());
+                if (GetTickCount64() > until && job)
+                    TerminateJobObject(job, 1);
+                Sleep(1);
+            }
+            writer.join();
+        }
+        if (hIn)
+        {
+            CloseHandle(hIn); // EOF: stage 1 ends on its own
+            hIn = nullptr;
+        }
+        const int stageNo = up ? 2 : 1;
+        if (hProc && WaitForSingleObject(hProc, 3000) != WAIT_OBJECT_0)
+        {
+            LOG("cascade probe: stage %d still running 3 s after its input closed: ended\n", stageNo);
+            TerminateProcess(hProc, 1);
+            if (WaitForSingleObject(hProc, 2000) != WAIT_OBJECT_0)
+                LOG("cascade probe: stage %d not gone 2 s after its end\n", stageNo);
+        }
+        // a session queue wait on a value the child never signals now (it ended between a share and its copy)
+        if (shared)
+            shared->Signal(UINT64_MAX);
+        readerQuit = true;
+        if (reader.joinable())
+            reader.join();
+        if (errPump.joinable())
+        {
+            // the pump ends at the child's stderr EOF; a process the child started that inherited the pipe holds it open
+            // past the child, so a read still blocked 2 s on is cancelled
+            const ULONGLONG until = GetTickCount64() + 2000;
+            bool told = false;
+            while (!pumpDone.load())
+            {
+                if (GetTickCount64() > until)
+                {
+                    if (!told)
+                        LOG("cascade probe: stage %d's stderr still open 2 s on (a process it started holds it): "
+                            "read cancelled\n",
+                            stageNo);
+                    told = true;
+                    CancelSynchronousIo(errPump.native_handle());
+                }
+                Sleep(1);
+            }
+            errPump.join();
+        }
+        LOG("cascade probe%s: ended (fed %llu, dropped %llu, read %llu, overrun %llu, skipped %llu)\n", up ? " 2" : "",
+            (unsigned long long)fed.load(), (unsigned long long)dropped.load(), (unsigned long long)consumed.load(),
+            (unsigned long long)overrun.load(), (unsigned long long)skipped.load());
+        if (hdr)
+            UnmapViewOfFile((LPCVOID)hdr);
+        hdr = nullptr;
+        for (HANDLE x : {hProc, hOut, hErr, hMap, ev, job})
+            if (x)
+                CloseHandle(x);
+        hProc = hOut = hErr = hMap = ev = job = nullptr;
+    }
+};
+
 // Is Windows HDR ("Use HDR") active on the display the target window sits on? The
 // output reports G2084 (PQ) as its current color space when HDR is on. Used to warn that today's
 // 8-bit SDR capture clips HDR content, and later to switch on the HDR live pipeline.
@@ -166,7 +759,7 @@ static double sdrWhiteNits(HWND target)
 
 // ---------------------------------------------------------------- perf HUD
 
-// Small always-on-top readout at the overlay's corner: base fps -> interpolated fps plus the
+// Small always-on-top readout at the overlay's corner: base fps -> interpolated fps, their ratio, plus the
 // estimated capture->screen delay, in white. A SEPARATE window on purpose:
 // pixels stamped into the frames would get interpolated (DLSS-G smears moving text), and the
 // HUD must NEVER take activation (WS_EX_NOACTIVATE) or DLSS-G's focus gate would drop. Black
@@ -207,16 +800,26 @@ struct Hud
     {
         if (!hwnd)
             return;
-        // \u2192 = the arrow; ESCAPED on purpose: a raw UTF-8 literal in this file compiles
+        // \u2192 = the arrow, \u00D7 = the times sign; ESCAPED on purpose: a raw UTF-8 literal in this file compiles
         // as ANSI mojibake unless the build adds /utf-8 (it showed as "weird letters")
         // --no-hud-latency hides the latency segment only; the fps segment is governed by
         // --no-hud (whole readout). DLSS-G never reaches here with a latency to show (SL
         // paces internally and the caller passes its handoff figure), so that path is
         // unchanged either way.
+        // the in rate with one decimal, a trailing .0 dropped (a 2 s window with one arrival = 0.5 fps), and the
+        // measured multiplier, out over in (the live: line's ratio): a shown 0 never carries one
+        wchar_t inTxt[16];
+        swprintf_s(inTxt, L"%.1f", inFps);
+        const size_t inLen = wcslen(inTxt);
+        if (inLen > 2 && !wcscmp(inTxt + inLen - 2, L".0"))
+            inTxt[inLen - 2] = 0;
+        wchar_t mul[32] = L"";
+        if (wcscmp(inTxt, L"0"))
+            swprintf_s(mul, L" (%.2f\u00D7)", outFps / inFps);
         if (latMs > 0.5 && !g_noHudLat)
-            swprintf_s(text, L"%.0f fps \u2192 %.0f fps   ~%.0f ms behind", inFps, outFps, latMs);
+            swprintf_s(text, L"%ls fps \u2192 %.0f fps%ls   ~%.0f ms behind", inTxt, outFps, mul, latMs);
         else
-            swprintf_s(text, L"%.0f fps \u2192 %.0f fps", inFps, outFps);
+            swprintf_s(text, L"%ls fps \u2192 %.0f fps%ls", inTxt, outFps, mul);
         // re-assert the top of the TOPMOST band: the overlay's HWND_TOPMOST moves raise it above us
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         paint();
@@ -998,6 +1601,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
     CHECK_HR(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic)));
     timeBeginPeriod(1);
     fillMouseRestore(); // a Fill session that was killed or crashed left the pointer speed changed
+    lkGmUpgradeStop();  // before this session's lookups
 
     HWND target = targetOverride ? targetOverride : findTargetWindow(needle);
     if (targetOverride)
@@ -1346,6 +1950,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // Fixed mode keeps the classic count (its multiplier is drift-tracked).
                 const int slotsFixed = (int)ceil((double)g_targetFps / base) + 1;
                 int slots = g_noAdapt ? slotsFixed : (int)ceil((double)g_targetFps / base * 1.15) + 2;
+                // Smooth Motion / AMD FSR 4 run the powers of two only: room for the first that reaches the target (the
+                // node above it, lockedMultiple's step-up); the GPU fit decides whether it runs
+                if (!g_noAdapt && g_backend == BK_SERVER && (g_serverBackend == L"fruc" || g_serverBackend == L"fsrfg"))
+                {
+                    int p2 = 2;
+                    while (p2 < (1 << kFrDepth) && p2 * base < g_targetFps)
+                        p2 *= 2;
+                    slots = (std::max)(slots, p2);
+                }
                 if (slots < 2)
                     slots = 2;
                 bool capped = false;
@@ -1374,13 +1987,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             }
             if (g_fgOver)
             {
-                // DLSS-G makes the in-between frames: the whole multiple of the measured rate nearest the target
-                // (the model caps it), set before the first served frame; the echo route holds one slot
+                // DLSS-G makes the in-between frames: the first whole multiple of the measured rate that reaches the
+                // target (the model caps it), set before the first served frame; the echo route holds one slot
                 if (derive)
                 {
                     const int capMax = host.maxGen ? (int)(host.maxGen < 5 ? host.maxGen : 5) : 5;
-                    int want = (int)((double)g_targetFps / srcMeasFps + 0.5) - 1;
-                    want = want < 1 ? 1 : want > capMax ? capMax : want;
+                    const int want = dlssgOnePassGen((double)g_targetFps / srcMeasFps, capMax);
                     sl::DLSSGOptions on{};
                     on.mode = sl::DLSSGMode::eOn;
                     on.numFramesToGenerate = (uint32_t)want;
@@ -1585,8 +2197,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         bool thrFloor = false; // the throttle's floor: every pair carries its real frame alone (sendPairStream)
         double thrDropEma = 0; // drops a second, smoothed over the 500 ms windows (~2 s)
         double thrMoveT = 0;   // when the target last moved: drops within 2 s of it are the move's, not the budget's
-        const double kThrWinMs = 500; // control window: long enough to measure a drop RATE
-        double emaDt = 0;             // smoothed capture interval (ms), paces the group
+        // Smooth Motion's midpoint tree priced per route from the host's call and per-slot store times (gFrCallUs /
+        // gFrStoreUs): the tweens a pair the direct tree affords ((M - 1) calls + M stores) and the pipelined one
+        // ((M - 2) calls + the overlap + M stores, fruc-pipe); 0 = not priced (the plain tween time rules)
+        double thrMd = 0, thrMp = 0;
+        // the tweens a pair the GPU affords before the user's target clamps them (the throttle's model, priced where
+        // the midpoint tree is): the midpoint tree's step-up reads it (lockedMultiple); 0 = not timed
+        double thrAff = 0;
+        const double kFrucPipeOverlap = 0.1; // the level-1 call beside a level-2 one costs ~0.1 call more (t_shared)
+        const double kThrWinMs = 500;        // control window: long enough to measure a drop RATE
+        double emaDt = 0;                    // smoothed capture interval (ms), paces the group
         ULONGLONG lastArrival = 0;
         int idleSlotIdx = -1;     // last presented slot, re-presentable while the
         uint32_t idleSlotSet = 0; // source is static (the server only rewrites a half
@@ -1729,6 +2349,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             st.numFramesToGenerateMax + 1, genFrames + 1);
                         return 3;
                     }
+                    // the GPU's one-pass limit once frame generation ran (init can read 0): the cascade's plan
+                    if (st.numFramesToGenerateMax)
+                    {
+                        host.maxGen = st.numFramesToGenerateMax;
+                        LOG("DLSS-G: up to %ux in one pass on this GPU\n", host.maxGen + 1);
+                    }
                 }
                 drainQuiet();
             }
@@ -1784,6 +2410,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         bool ratioWarned = false;
         int fgWantPrev = -1;  // DLSS-G target derivation: last derived gen (hysteresis, see stats)
         int fixWantPrev = -1; // fixed-ladder server derivation: same two-window hysteresis
+        // Live DLSS 4.5 above one pass (the cascade): the session's ONE plan, made at the
+        // 2 s derive when dlssgSnap's multiple exceeds the GPU's one-pass limit twice in a row (cascWantPrev), M =
+        // cascM1 x cascM2; cascWarm = stage 1 runs and is fed beside the direct pass until it shares a frame; cascShown =
+        // the multiple the stats line reports while stage 2 presents its frames (0 = one pass). Past lim x lim three:
+        // cascM1 x cascM2 x cascM3 (cascM3 1 = two); cascLow = 2 s windows in a row three stages ran short of theirs;
+        // cascMaxM = three stages fell short: the next plan's multiple at most (what the GPU held, 0 = none)
+        int cascM = 0, cascM1 = 0, cascM2 = 0, cascM3 = 1, cascWantPrev = -1, cascShown = 0, cascLow = 0, cascMaxM = 0;
+        bool cascTried = false, cascWarm = false;
         bool hidden = false;
         int rc2 = 0;
         // STATIC-SOURCE HOLD (server route): a paused video emits no WGC frames, so the session
@@ -1924,7 +2558,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // at every target.
         wchar_t glv[8]{};
         const bool gridLock = !(GetEnvironmentVariableW(L"SMV_LIVE_GRID_LOCK", glv, 8) && glv[0] == L'0');
+        // SMV_FRUC_STEPUP=0 = the midpoint tree never runs a node above the user's target (the largest that fits)
+        wchar_t fsu[8]{};
+        const bool frStepUp = !(GetEnvironmentVariableW(L"SMV_FRUC_STEPUP", fsu, 8) && fsu[0] == L'0');
         uint32_t lockLogged = 0;
+        double lockT = 0; // when lockLogged last changed (the step-up's dwell)
         double lockDtMs = 0;
         auto lockedMultiple = [&](double target) -> uint32_t {
             lockDtMs = lockDtMs > 0 ? lockDtMs + (emaDt - lockDtMs) / 64.0 : emaDt;
@@ -1932,18 +2570,33 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const double userCap = adaptTarget * lockDtMs / 1000.0;
             const double ceiling = srv.shmSlots ? srv.shmSlots : genFrames + 1;
             auto fits = [&](uint32_t m) { return m >= 2 && m <= ceiling && m <= userCap * 1.03 && m - 1 <= r * 1.03; };
-            // FRUC's midpoint tree computes exact phases only at its nodes k / 2^L (L <= 4, one bridge instance a
-            // level): any other ladder or grid phase snaps to the nearest node and costs the whole tree (3 calls a
+            // FRUC's midpoint tree computes exact phases only at its nodes k / 2^L (L <= kFrDepth, one bridge instance
+            // a level): any other ladder or grid phase snaps to the nearest node and costs the whole tree (3 calls a
             // pair at depth 2), so a tween's cost and the throttle's answer swing with the mode. Its ladders are the
-            // powers of two up to x16 (fewer when an instance could not be made), the largest that fits; a step up
-            // needs 3 % headroom.
+            // powers of two up to x512 (fewer when an instance could not be made), the largest that fits; a step up
+            // needs 3 % headroom. A user's target between two nodes (above the lower one by more than that 3 %) runs
+            // the node ABOVE it, the first that reaches the target however far past it or the panel that lands (24 fps
+            // at 1000: x64), whenever the GPU affords
+            // that node (thrAff: the throttle's tweens a pair before the target clamps them) and the present floor
+            // (refloor) can space its slots, else the largest that fits: no node ladder makes x3, NvOFFRUC is clean
+            // only at t = 0.5. Entering wants 10 % to spare and 2 s since the last lock change; holding wants 3 %, and
+            // a window with no price holds it.
             if (srv.nr && srv.nr->fruc && srv.nr->frMp)
             {
                 uint32_t best = 0;
-                const int levels = (std::min)(4, srv.nr->frInstMax);
+                const int levels = (std::min)(kFrDepth, srv.nr->frInstMax);
                 for (uint32_t m = 2; m <= (1u << levels); m *= 2)
                     if (fits(m) && (m <= lockLogged || m - 1 <= r * 0.97))
                         best = m;
+                const uint32_t up = best ? best * 2 : 2;
+                if (gridLock && frStepUp && up <= (1u << levels) && up <= ceiling &&
+                    userCap > (best ? best : 1) * 1.03 && up > userCap * 1.03 && panelHzMode > 1.0)
+                {
+                    const bool held = up == lockLogged;
+                    if (held ? thrAff <= 0.0 || up - 1 <= thrAff * 1.03
+                             : thrAff > 0.0 && up - 1 <= thrAff * 0.9 && nowMs() - lockT >= 2000.0)
+                        return up;
+                }
                 return gridLock ? best : 0;
             }
             if (lockLogged && fits(lockLogged) && r < lockLogged + 0.5)
@@ -1951,6 +2604,20 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const uint32_t m = (uint32_t)ceil(r * 0.97);
             return gridLock && fits(m) ? m : 0;
         };
+        // fruc-pipe: Smooth Motion's tree pipelined across pairs (nativeFrucPipeAdvance): a group of x4 or deeper shows
+        // the previous pair, so its deeper levels run beside the next pair's level-1 call, one source period later. A
+        // ladder goes pipelined when the direct tree cannot hold it (M - 1 > 1.03 thrMd) and the pipelined one affords
+        // it, back to direct only with 10 % to spare (M - 1 <= 0.9 thrMd: a direct tree at its edge flaps its lock, and
+        // every switch shows, entering holds one source period, leaving skips one pair), never sooner than 2 s after the
+        // last switch. SMV_FRUC_PIPE=0 = never, =force =
+        // every x4 or deeper ladder, the fixed multipliers too (a gate's lever: the same exe both ways on one source)
+        wchar_t fpv[8]{};
+        const bool fpSet = GetEnvironmentVariableW(L"SMV_FRUC_PIPE", fpv, 8) != 0;
+        const bool frucPipeOn = !(fpSet && fpv[0] == L'0');
+        const bool frucPipeForce = fpSet && !wcscmp(fpv, L"force");
+        bool frucPiped = false;
+        double frucPipeT = -1e9; // nowMs of the last route switch
+        int sendLag = 0;         // the last sent group's content lag in source periods (its pend entry takes it)
         // one streaming pair handoff: bump seq, publish the frame (fence or shm copy), build
         // the fraction list, write the message. Returns nfr, or UINT32_MAX on a write failure.
         // fraction message: one f32 per slot the server was actually sized for (shmSlots),
@@ -1987,6 +2654,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             uint8_t* msg = msgBuf.data();
             float* fr = (float*)(msg + 4);
             uint32_t nfr = 0;
+            bool pipeThis = false;
             if (shmSeq == 1 || g_fgOver)
             {
                 fr[nfr++] = 1.0f; // very first frame: nothing to interpolate yet (DLSS-G over echo: every frame)
@@ -2013,15 +2681,30 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // power of two, so every k / M is an exact node
                 if (m != lockLogged)
                 {
-                    LOG("present grid: locked to x%u (target %.1f, source %.3f fps)\n", m, effTarget,
-                        1000.0 / lockDtMs);
+                    LOG("present grid: locked to x%u (target %.1f, source %.3f fps)%s\n", m, effTarget,
+                        1000.0 / lockDtMs,
+                        m * 1000.0 / lockDtMs > adaptTarget * 1.03 ? ", the node above the target" : "");
                     lockLogged = m;
+                    lockT = nowMs();
                 }
                 for (uint32_t k = 1; k < m; k++)
                     fr[nfr++] = (float)k / (float)m;
                 fr[nfr++] = 1.0f;
                 tmInPair += m;
                 nextGrid = 0;
+                // fruc-pipe's route for this ladder (see frucPipeOn)
+                if (frucPipeForce && srv.nr && srv.nr->fruc && srv.nr->frMp && !srv.nr->fsrfg && m >= 4)
+                    pipeThis = true;
+                else if (frucPipeOn && srv.nr && srv.nr->fruc && srv.nr->frMp && !srv.nr->fsrfg && m >= 4 && thrMd > 0)
+                {
+                    const double need = (double)(m - 1);
+                    bool want = frucPiped;
+                    if (!frucPiped && need > thrMd * 1.03 && need <= thrMp * 1.03)
+                        want = true;
+                    else if (frucPiped && need <= thrMd * 0.9)
+                        want = false;
+                    pipeThis = want != frucPiped && nowMs() - frucPipeT < 2000.0 ? frucPiped : want;
+                }
             }
             else if (adaptTarget > 0)
             {
@@ -2062,6 +2745,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 for (int k = 1; k <= genFrames; k++)
                     fr[nfr++] = (float)k / (float)(genFrames + 1);
                 fr[nfr++] = 1.0f; // the real frame
+                pipeThis = frucPipeForce && genFrames >= 3 && srv.nr && srv.nr->fruc && srv.nr->frMp && !srv.nr->fsrfg;
             }
             // each slot's place on the pacing clock: its fraction of the pair (on the adaptive route
             // exactly its grid point); a span the clock just snapped over falls back to the source's period
@@ -2073,7 +2757,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             for (uint32_t k = 0; k < nfr; ++k)
                 sendGridMs[k] = ((double)paceTs - (1.0 - (double)fr[k]) * (double)paceSpan) / 10000.0;
             prevPaceTs = paceTs;
-            memcpy(msg, &nfr, 4);
+            if (pipeThis != frucPiped)
+            {
+                LOG("present grid: x%u %s (the direct tree affords %.1f tweens, the pipelined one %.1f)\n", nfr,
+                    pipeThis ? "pipelined across pairs, the tweens one source period later" : "direct", thrMd, thrMp);
+                frucPiped = pipeThis;
+                frucPipeT = nowMs();
+            }
+            sendLag = pipeThis ? 1 : 0;
+            const uint32_t hdr = nfr | (pipeThis ? 0x80000000u : 0u); // the host's route bit (nativeGroup)
+            memcpy(msg, &hdr, 4);
             if (!srv.writeFull(msg, 4 + 4 * nfr))
                 return UINT32_MAX;
             prevSentTs = sentTs;
@@ -2092,8 +2785,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         auto logLiveStats = [&](double capFps, double outFps, double latAvg, double secs, const sl::DLSSGState* st) {
             const double ratio = capFps > 0 ? outFps / capFps : 0.0;
             const double tgt = g_backend == BK_IDENTITY           ? 1.0
-                               : g_fgOver                         ? (double)(host.genFrames + 1)
-                               : (host.useSL || adaptTarget <= 0) ? (double)(genFrames + 1)
+                               : g_fgOver                         ? (double)(cascShown ? cascShown : host.genFrames + 1)
+                               : (host.useSL || adaptTarget <= 0) ? (double)(cascShown ? cascShown : genFrames + 1)
                                                                   : (capFps > 0 ? effTarget / capFps : 0.0);
             const double prTot = host.prN ? host.prMsTot / host.prN : 0.0;
             const double prWait = host.prN ? host.prMsWait / host.prN : 0.0;
@@ -2168,6 +2861,227 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // the previous capture).
         const bool xqRoute = g_backend == BK_SERVER; // every model server runs the queue
         LOG("present queue: xq=%d (%s)\n", xqRoute ? 1 : 0, xqRoute ? "cross-group queue" : "direct present");
+        // SMV_LIVE_CASCADE=probe (the direct DLSS-G route only): the cascade's stage 1 beside the session, consume-only
+        // (CascadeProbe); =present: this session's DLSS-G (stage 2, its --gen) presents stage 1's frames instead of the
+        // captured ones; SMV_LIVE_CASCADE_GEN = stage 1's generated frames a source frame (1..5, default 5)
+        std::unique_ptr<CascadeProbe> casc;
+        const std::string cascMode = lkEnv("SMV_LIVE_CASCADE");
+        if (!xqRoute && host.useSL && !g_fgOver && (cascMode == "probe" || cascMode == "present"))
+        {
+            const std::string cg = lkEnv("SMV_LIVE_CASCADE_GEN");
+            const int g = cg.empty() ? 5 : (std::max)(1, (std::min)(5, atoi(cg.c_str())));
+            casc = std::make_unique<CascadeProbe>();
+            if (!casc->start(host.device.Get(), capW, capH, g, cap.hdrPack, cascMode == "present", false))
+            {
+                casc->stop();
+                casc.reset();
+            }
+        }
+        // the product's plan (no SMV_LIVE_CASCADE, =off = one pass only): DLSS-G as the app starts it, with --target (an
+        // explicit --gen = fixed work, no plan), on the direct route at the capture size or on the effects route at the
+        // presented size (stage 1 takes the effects' output slots); stage 1 = dlssg2f, which takes frames of 128 px a side
+        // up
+        const uint32_t cascW = g_fgOver ? W : capW, cascH = g_fgOver ? H : capH;
+        const bool cascAuto = cascMode.empty() && host.useSL && (g_fgOver ? xqRoute : !xqRoute) && !g_genExplicit &&
+                              g_targetFps > 0 && cascW >= 128 && cascH >= 128;
+        std::unique_ptr<CascadeProbe> cascPend; // stage 1 starting on cascTh (cascRes -1 = running, 1 = up, 0 = failed)
+        // three stages: cascUp = stage 1, fed by the session; casc = stage 2 on its ring (dlssg2f --from), presented
+        std::unique_ptr<CascadeProbe> cascUp, cascPendUp;
+        std::thread cascTh;
+        std::atomic<int> cascRes{-1};
+        // the one-pass limit: numFramesToGenerateMax + 1 (6 on RTX 50, 2 on RTX 40), 6 while the driver has not said;
+        // SMV_DLSSG_LIMIT=N (2..6) = another GPU's limit on this one (RTX 40's x4 = 2 x 2)
+        auto liveDlssgLimit = [&]() {
+            const std::string lv = lkEnv("SMV_DLSSG_LIMIT");
+            if (!lv.empty())
+                return (std::max)(2, (std::min)(6, atoi(lv.c_str())));
+            return (host.maxGen ? (int)(std::min)(host.maxGen, 5u) : 5) + 1;
+        };
+        // the video memory stage 1 takes: Streamline's own estimate for its DLSS-G (6 back buffers, m1 - 1 generated
+        // frames; without one, S0 (c)'s figures: ~250 MiB a megapixel + 60) + its ring of 12 shared frames, its 3 tagged
+        // inputs and its 6 back buffers
+        auto cascPrice = [&](int m1) -> uint64_t {
+            const uint64_t frame = (uint64_t)cascW * cascH * 4;
+            sl::DLSSGOptions eo{};
+            eo.mode = sl::DLSSGMode::eOn;
+            eo.numFramesToGenerate = (uint32_t)(m1 - 1);
+            eo.flags = sl::DLSSGFlags::eRequestVRAMEstimate;
+            eo.numBackBuffers = 6;
+            eo.colorWidth = eo.mvecDepthWidth = cascW;
+            eo.colorHeight = eo.mvecDepthHeight = cascH;
+            eo.colorBufferFormat = (uint32_t)host.backbuffers[0]->GetDesc().Format;
+            eo.mvecBufferFormat = DXGI_FORMAT_R16G16_FLOAT;
+            eo.depthBufferFormat = DXGI_FORMAT_R32_FLOAT;
+            sl::DLSSGState es{};
+            uint64_t est = slDLSSGGetState(host.vp, es, &eo) == sl::Result::eOk ? es.estimatedVRAMUsageInBytes : 0;
+            if (!est)
+                est = ((uint64_t)60 << 20) + frame / 4 * 250;
+            return est + 21 * frame;
+        };
+        // stage 1 lost, failed or not wanted any more: end it, release stage 2's waits on its fence, one pass again
+        auto cascFallback = [&](const char* why) -> bool {
+            const bool presenting = casc->present;
+            LOG("DLSS 4.5's second %spass%s ended (%s): back to one pass at %dx\n", cascUp ? "and third " : "",
+                cascUp ? "es" : "", why, liveDlssgLimit());
+            casc->kill();
+            if (cascUp)
+                cascUp->kill();
+            casc->stop();
+            casc.reset();
+            if (cascUp)
+            {
+                cascUp->stop();
+                cascUp.reset();
+            }
+            cascWarm = false;
+            cascShown = 0;
+            cascLow = 0;
+            if (g_fgOver) // the effects route: re-warmed on its newest output slot
+                return !presenting || idleSlotIdx < 0 ||
+                       fgRewarm(idleSlotSet, (uint32_t)idleSlotIdx, liveDlssgLimit() - 1);
+            if (!g_genExplicit)
+                genFrames = liveDlssgLimit() - 1;
+            return !presenting || resetFG();
+        };
+        // the effects route's cascade feed: one output slot read back and handed to stage 1, so every frame it
+        // generates from carries the effects
+        auto cascFeedSlot = [&](uint32_t set, uint32_t i) -> bool {
+            CascadeProbe* to = cascUp ? cascUp.get() : casc.get();
+            return host.readSlot(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, (UINT64)srv.shmPitch * H,
+                                 [&](const uint8_t* p) { to->feedRows(p, srv.shmPitch); });
+        };
+        // every check covers both probes of three stages (the session feeds cascUp, presents casc)
+        auto cascDead = [&]() { return casc->dead() || (cascUp && cascUp->dead()); };
+        auto cascStalled = [&]() {
+            const bool a = casc->stalled(), b = cascUp && cascUp->stalled();
+            return a || b;
+        };
+        auto cascReport = [&](double secs) {
+            if (cascUp)
+                cascUp->report(secs);
+            casc->report(secs);
+        };
+        // three stages below 85 % of their multiple three 2 s windows in a row: what the GPU affords is less, so they
+        // end and the next plan takes the largest multiple at most what they held, with a tenth to spare (cascMaxM);
+        // false = that fallback's reset failed
+        auto cascShortCheck = [&](double capFps, double outFps) -> bool {
+            if (!cascUp || !cascShown || hidden || capFps < 0.5)
+            {
+                cascLow = 0;
+                return true;
+            }
+            cascLow = outFps < 0.85 * cascShown * capFps ? cascLow + 1 : 0;
+            if (cascLow < 3)
+                return true;
+            char why[96];
+            snprintf(why, sizeof(why), "%.1fx of %dx, what the GPU affords is less", outFps / capFps, cascShown);
+            cascMaxM = (std::max)(2, (std::min)(cascShown - 1, (int)(outFps / capFps / 0.9)));
+            cascTried = false;
+            cascWantPrev = -1;
+            return cascFallback(why);
+        };
+        // a plan's start done (cascRes >= 0): its probes join the session warming (fed, not shown yet), or end
+        auto cascTakePend = [&]() {
+            cascTh.join();
+            if (cascRes.load() == 1)
+            {
+                casc = std::move(cascPend);
+                cascUp = std::move(cascPendUp);
+                casc->present = false;
+                cascWarm = true;
+                return;
+            }
+            cascPend->stop();
+            cascPend.reset();
+            if (cascPendUp)
+            {
+                cascPendUp->stop();
+                cascPendUp.reset();
+            }
+            LOG("DLSS 4.5 stays at %dx: its second pass did not start\n", liveDlssgLimit());
+        };
+        // the presented stage shared its first frame: the session presents its frames from now on; returns the
+        // session's own pass (its multiple between those frames)
+        auto cascTakeover = [&]() -> int {
+            cascWarm = false;
+            casc->present = true;
+            casc->skipToNewest();
+            cascStalled();
+            cascShown = cascM;
+            cascLow = 0;
+            if (cascM3 > 1)
+                LOG("DLSS 4.5 at %dx: %dx in a second process, %dx in a third, then %dx here between those frames\n",
+                    cascM, cascM1, cascM2, cascM3);
+            else
+                LOG("DLSS 4.5 at %dx: %dx in a second process, then %dx here between those frames\n", cascM, cascM1,
+                    cascM2);
+            return cascM3 > 1 ? cascM3 : cascM2;
+        };
+        // above one pass: the plan, once a session, when the same multiple is derived twice in a row (either loop's 2 s
+        // window); one pass runs at the limit meanwhile. Stage 1 takes cascW x cascH frames in the back buffer's format:
+        // the capture's R8G8B8A8 / R10G10B10A2 packing on the direct route, the output slots' B8G8R8A8 / R10G10B10A2
+        // on the effects route. Past lim x lim three passes when the room holds both processes (else the best two); after
+        // three fell short of their multiple, at most what they held (cascMaxM)
+        auto cascPlan = [&](double capFps) {
+            const int lim = liveDlssgLimit();
+            int m1 = 0, m2 = 0, m3 = 1;
+            const double want = (double)g_targetFps / capFps;
+            int M0 = dlssgSnap(want, lim, m1, m2, nullptr, &m3);
+            if (cascMaxM && M0 > cascMaxM)
+                M0 = dlssgAtMost(cascMaxM, lim, m1, m2, &m3);
+            int M = M0;
+            if (M > lim && M == cascWantPrev)
+            {
+                cascTried = true;
+                const uint64_t room = nativeVideoMemoryRoom();
+                uint64_t need = cascPrice(m1) + (m3 > 1 ? cascPrice(m2) : 0);
+                if (m3 > 1 && room && need > room)
+                {
+                    LOG("DLSS 4.5: %dx (%dx, %dx, then %dx) needs ~%.0f MiB of video memory for its second and third "
+                        "passes, %.0f MiB are free; two passes at most\n",
+                        M, m1, m2, m3, need / 1048576.0, room / 1048576.0);
+                    M = cascMaxM ? dlssgAtMost((std::min)(cascMaxM, lim * lim), lim, m1, m2)
+                                 : dlssgSnap(want, lim, m1, m2);
+                    m3 = 1;
+                    need = cascPrice(m1);
+                }
+                if (room && need > room)
+                    LOG("DLSS 4.5 stays at %dx: %dx (%dx, then %dx) needs ~%.0f MiB of video memory for its second "
+                        "pass, %.0f MiB are free\n",
+                        lim, M, m1, m2, need / 1048576.0, room / 1048576.0);
+                else
+                {
+                    cascM = M;
+                    cascM1 = m1;
+                    cascM2 = m2;
+                    cascM3 = m3;
+                    if (m3 > 1)
+                        LOG("DLSS 4.5 plan: %dx for target %d fps at ~%.1f captured = %dx, then %dx, then %dx between "
+                            "those (~%.0f MiB more video memory); starting the second and third passes\n",
+                            M, g_targetFps, capFps, m1, m2, m3, need / 1048576.0);
+                    else
+                        LOG("DLSS 4.5 plan: %dx for target %d fps at ~%.1f captured = %dx, then %dx between those "
+                            "(~%.0f MiB more video memory); starting the second pass\n",
+                            M, g_targetFps, capFps, m1, m2, need / 1048576.0);
+                    cascPend = std::make_unique<CascadeProbe>();
+                    if (m3 > 1)
+                        cascPendUp = std::make_unique<CascadeProbe>();
+                    cascRes = -1;
+                    CascadeProbe *p = cascPend.get(), *u = cascPendUp.get();
+                    ID3D12Device* dev = host.device.Get();
+                    const bool hdr10 = g_fgOver ? g_hdr : cap.hdrPack, bgra = g_fgOver && !g_hdr;
+                    // three: stage 1 first (the session feeds it), then stage 2 on its ring (the one presented)
+                    cascTh = std::thread([p, u, dev, w = cascW, h = cascH, m1, m2, hdr10, bgra, &cascRes] {
+                        cascRes = (u ? u->start(dev, w, h, m1 - 1, hdr10, true, bgra) &&
+                                           p->start(dev, w, h, m2 - 1, hdr10, true, bgra, u)
+                                     : p->start(dev, w, h, m1 - 1, hdr10, true, bgra))
+                                      ? 1
+                                      : 0;
+                    });
+                }
+            }
+            cascWantPrev = M0;
+        };
         if (xqRoute)
         {
             struct XqGroup
@@ -2179,6 +3093,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 bool opened;                // first slot token or end marker came back
                 bool capRel;                // the server released the shared capture texture
                 std::vector<double> gridMs; // each slot's place on the pacing clock (sendGridMs)
+                int lag;                    // its content's lag in source periods (a pipelined group: 1)
             };
             struct XqSlot
             {
@@ -2186,6 +3101,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 double target, arrMs;
                 int64_t sentTs;
                 bool lastOfGroup;
+                int lag;
             };
             std::deque<XqGroup> pend; // sent, not yet closed by an end marker
             std::deque<XqSlot> fifo;  // presentable slots, spanning groups
@@ -2367,9 +3283,33 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 const double pre = srv.nr ? srv.nr->gIntUs.load() / 1000.0 : 0.0;
                 const double tw = srv.nr ? srv.nr->gTweenUs.load() / 1000.0 : 0.0;
                 double next = effTarget, m = 0.0;
+                // the midpoint tree (Smooth Motion, AMD FSR 4): a call (c) and a slot's store (s) apart, once the host
+                // timed them. One mean tween time cannot price it: FSR 4 makes every real frame's level 1 before the
+                // slots (in pre), so an x2 group's tween reads ~0.1 ms and an x4 group's ~9 ms at 1440p: one mean
+                // would step the ladder up at x2 and back down at x4, over and over
+                const double fc = srv.nr ? srv.nr->gFrCallUs.load() / 1000.0 : 0.0;
+                const double fs = srv.nr ? srv.nr->gFrStoreUs.load() / 1000.0 : 0.0;
+                const double fb = srv.nr ? srv.nr->gFrBaseUs.load() / 1000.0 : 0.0;
+                const bool frPriced = srv.nr && srv.nr->fruc && srv.nr->frMp && fc > 0.0;
+                const bool frFsr = frPriced && srv.nr->fsrfg && fb > 0.0;
+                thrMd = thrMp = 0.0;
                 if (pre > 0.0 && tw > 0.0)
                 {
                     m = (emaDt * thrBudget - pre) / tw;
+                    if (frFsr)
+                    {
+                        // FSR 4: an x2 pair's whole time (fb) + (M - 2) calls and stores more
+                        m = thrMd = 1.0 + (emaDt * thrBudget - fb) / (fc + fs);
+                    }
+                    else if (frPriced && !srv.nr->fsrfg)
+                    {
+                        // Smooth Motion: (M - 1) calls + M stores direct, one call less + the overlap pipelined
+                        const double B = emaDt * thrBudget - pre;
+                        thrMd = (B - fs) / (fc + fs);
+                        thrMp = (B - fs + fc * (1.0 - kFrucPipeOverlap)) / (fc + fs);
+                        m = frucPipeOn && thrMp >= 3.0 ? (std::max)(thrMd, thrMp) : thrMd;
+                    }
+                    thrAff = m;
                     next = m >= 1.0 ? m * srcFps : srcFps;
                     const bool floor = m < 1.0;
                     thrFloor = floor;
@@ -2410,10 +3350,20 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (tn - thrLastLog > 2000.0)
                     {
                         thrLastLog = tn;
+                        char frp[128] = "";
+                        if (frFsr)
+                            sprintf_s(
+                                frp,
+                                "; an AMD FSR 4 call %.1f ms + %.1f ms a slot over an x2 pair's %.1f ms, direct %.1f",
+                                fc, fs, fb, thrMd);
+                        else if (frPriced && !srv.nr->fsrfg)
+                            sprintf_s(frp,
+                                      "; a Smooth Motion call %.1f ms + %.1f ms a slot, direct %.1f / pipelined %.1f",
+                                      fc, fs, thrMd, thrMp);
                         LOG("throttle: target %.0f fps of %.0f (%.1f ms before the slots + %.1f ms a tween of the %.1f "
-                            "ms between source frames at %.0f %%: %.1f tweens a pair%s; drops %.1f/s)\n",
+                            "ms between source frames at %.0f %%: %.1f tweens a pair%s; drops %.1f/s%s)\n",
                             effTarget, adaptTarget, pre, tw, emaDt, thrBudget * 100.0, m,
-                            thrProbing ? ", re-timing a tween" : "", dropRate);
+                            thrProbing ? ", re-timing a tween" : "", dropRate, frp);
                     }
                 }
                 thrWinT0 = tn;
@@ -2518,7 +3468,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         xqDelay = (std::min)(delayCap, need > xqDelay ? need : (std::max)(need, xqDelay - decay));
                         due = g.gridMs[idx] + xqDelay;
                     }
-                    XqSlot s{g.set, idx, g.nfr, g.seq, due, g.arrMs, g.sentTs, false};
+                    XqSlot s{g.set, idx, g.nfr, g.seq, due, g.arrMs, g.sentTs, false, g.lag};
                     if (last)
                     {
                         s.lastOfGroup = true;
@@ -2567,9 +3517,17 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         break;
                     }
                     lastPresSched = (tNow - dueMs <= 0.5) ? dueMs : tNow;
-                    if (!presentSlotFrom(s.set, s.idx))
+                    // the effects route's cascade: stage 1 takes the slot (its frames are presented below); while it
+                    // warms up it is fed beside the one-pass present
+                    if (!(casc && casc->present) && !presentSlotFrom(s.set, s.idx))
                     {
                         LOG("presentFrame failed\n");
+                        rc2 = 1;
+                        break;
+                    }
+                    if (casc && !cascFeedSlot(s.set, s.idx))
+                    {
+                        LOG("slot readback failed\n");
                         rc2 = 1;
                         break;
                     }
@@ -2580,7 +3538,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     const double pNow = nowMs();
                     if (s.sentTs)
                     {
-                        statLatSum += (nowQpc100() - s.sentTs) / 10000.0 + srv.contentLag * emaDt;
+                        statLatSum += (nowQpc100() - s.sentTs) / 10000.0 + (srv.contentLag + s.lag) * emaDt;
                         statLatN++;
                     }
                     if (hitchOn)
@@ -2600,6 +3558,58 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 }
                 if (rc2)
                     break;
+                // the effects route's cascade: its stage 1 came up (fed beside the one pass until it shares a frame)
+                // or did not; a dead one = one pass again; its first shared frame = stage 2 takes over at m2
+                if (cascPend && cascRes.load() >= 0)
+                    cascTakePend();
+                if (casc && (casc->present || cascWarm) && cascDead())
+                {
+                    if (!cascFallback("its process ended"))
+                    {
+                        LOG("DLSS-G reset failed\n");
+                        rc2 = 1;
+                        break;
+                    }
+                }
+                else if (cascWarm && casc->hdr && casc->hdr->frames > 0 && idleSlotIdx >= 0)
+                {
+                    if (!fgRewarm(idleSlotSet, (uint32_t)idleSlotIdx, cascTakeover() - 1))
+                    {
+                        LOG("DLSS-G reset failed\n");
+                        rc2 = 1;
+                        break;
+                    }
+                    fgLastPresent = GetTickCount64();
+                }
+                // stage 2: every frame stage 1 shared since the last pass, in order (a long gap re-warms DLSS-G on the
+                // newest output slot first, as presentSlotFrom does)
+                if (casc && casc->present && !hidden)
+                {
+                    uint32_t rs = 0;
+                    uint64_t fv = 0;
+                    while (!rc2 && casc->nextFrame(rs, fv))
+                    {
+                        const ULONGLONG t = GetTickCount64();
+                        if (fgLastPresent && t - fgLastPresent > 700 && idleSlotIdx >= 0)
+                        {
+                            LOG("input gap %llums, resetting DLSS-G\n", (unsigned long long)(t - fgLastPresent));
+                            if (!fgRewarm(idleSlotSet, (uint32_t)idleSlotIdx, host.genFrames))
+                            {
+                                LOG("DLSS-G reset failed\n");
+                                rc2 = 1;
+                                break;
+                            }
+                        }
+                        fgLastPresent = t;
+                        if (!host.presentRing(casc->ring[rs].Get(), casc->shared.Get(), fv))
+                        {
+                            LOG("presentRing failed\n");
+                            rc2 = 1;
+                        }
+                    }
+                    if (rc2)
+                        break;
+                }
                 phEnd(phPres);
 
                 // ---- (iii) housekeeping (nothing is due right now)
@@ -2616,6 +3626,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
                         if (g_liveNrCuda)
                             g_liveNrReset.store(true); // DLSS 5: a new stream after the gap
+                        if (!hidden && casc && casc->present)
+                            casc->skipToNewest(); // stage 1 idled with the session: no stale pre-pause tail
                     }
                     if (!hidden && g_fill)
                     {
@@ -2725,7 +3737,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             if (pend.empty())
                                 InterlockedExchange64(&srv.ioSince, (LONGLONG)sendTick);
                             pend.push_back(XqGroup{shmSeq, (uint32_t)(shmSeq % 2), nfr ? nfr : 1, nfr, arrMs, emaDt,
-                                                   sentTs, sendTick, false, false, sendGridMs});
+                                                   sentTs, sendTick, false, false, sendGridMs, sendLag});
                             hitchArrPrev = arrMs;
                             lastNfr = nfr ? nfr : 1;
                             if (tmOn)
@@ -2764,7 +3776,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         if (nextIdleTick > 0)
                             nextIdleTick = nowMs() + idleStepMs;
                     }
-                    if (idleSlotIdx >= 0)
+                    // while the cascade presents, stage 1 keeps going on the capture's 500 ms keepalive, as on the direct
+                    // route: no re-present here
+                    if (idleSlotIdx >= 0 && !(casc && casc->present))
                     {
                         const double nowQ = nowMs();
                         if (nextIdleTick <= 0)
@@ -2803,6 +3817,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (g_fgOver)
                         slDLSSGGetState(host.vp, fgSt, nullptr);
                     logLiveStats(capFps, outFps, latAvg, secs, g_fgOver ? &fgSt : nullptr);
+                    if (casc)
+                        cascReport(secs);
+                    if (casc && casc->present && !hidden &&
+                        ((cascStalled() && !cascFallback("it stopped presenting")) || !cascShortCheck(capFps, outFps)))
+                    {
+                        LOG("DLSS-G reset failed\n");
+                        rc2 = 1;
+                        break;
+                    }
                     {
                         uint64_t hn = 0;
                         for (int i = 0; i < Host::kHistN; i++)
@@ -2860,11 +3883,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     statLatN = 0;
                     // DLSS-G over echo: its generated-frame count follows the target the way the direct route's does
                     // (two equal 2 s derivations in a row before a switch)
-                    if (g_fgOver && g_targetFps > 0 && !g_genExplicit && capFps > 3.0 && idleSlotIdx >= 0)
+                    if (g_fgOver && g_targetFps > 0 && !g_genExplicit && capFps > 3.0 && idleSlotIdx >= 0 && !casc &&
+                        !cascPend)
                     {
-                        const int capMax = host.maxGen ? (int)(host.maxGen < 5 ? host.maxGen : 5) : 5;
-                        int want = (int)((double)g_targetFps / capFps + 0.5) - 1;
-                        want = want < 1 ? 1 : want > capMax ? capMax : want;
+                        if (cascAuto && !cascTried)
+                            cascPlan(capFps); // one pass runs at the limit meanwhile (want below)
+                        const int capMax = liveDlssgLimit() - 1;
+                        const int want = dlssgOnePassGen((double)g_targetFps / capFps, capMax);
                         if (want != host.genFrames && want == fixWantPrev)
                         {
                             LOG("target %d fps at ~%.1f captured: switching DLSS-G to %dx\n", g_targetFps, capFps,
@@ -2948,6 +3973,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 const bool following = !host.park && !g_monitor && !hidden && !g_fill;
                 if (following && waitMs > 16)
                     waitMs = 16;
+                if (casc && casc->present)
+                    waitMs = 1; // stage 1's frames arrive at its rate (~7 ms apart at x6 of 24 fps)
                 if (following && followTimer && GetTickCount64() < followUntil)
                 {
                     LARGE_INTEGER due{};
@@ -2991,6 +4018,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         ShowWindow(host.hwnd, hidden ? SW_HIDE : SW_SHOWNA);
                         hud.show(!hidden);
                         LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
+                        if (!hidden && casc && casc->present)
+                            casc->skipToNewest(); // stage 1 idled with the session: no stale pre-pause tail
                     }
                     if (!hidden && g_fill)
                     {
@@ -3042,11 +4071,18 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             break;
                         }
                     }
-                    if (!host.presentFrame(buf.data()))
+                    if (casc && casc->present)
+                        (cascUp ? cascUp : casc)->feed(buf.data(), capBytes); // stage 1 takes it; presented below
+                    else
                     {
-                        LOG("presentFrame failed\n");
-                        rc2 = 1;
-                        break;
+                        if (!host.presentFrame(buf.data()))
+                        {
+                            LOG("presentFrame failed\n");
+                            rc2 = 1;
+                            break;
+                        }
+                        if (casc)
+                            (cascUp ? cascUp : casc)->feed(buf.data(), capBytes);
                     }
                     // direct routes (dlssg/identity): latency of the frame just presented
                     statLatSum += (nowQpc100() - cap.lastFrameTs) / 10000.0;
@@ -3065,6 +4101,43 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         nextIdleTick = 0;
                     else if (nextIdleTick > 0)
                         nextIdleTick = nowMs() + idleStepMs;
+                }
+                // the plan's stage 1 came up (fed beside the direct pass until it shares a frame) or did not
+                if (cascPend && cascRes.load() >= 0)
+                    cascTakePend();
+                if (casc && (casc->present || cascWarm) && cascDead())
+                {
+                    if (!cascFallback("its process ended"))
+                    {
+                        LOG("DLSS-G reset failed\n");
+                        rc2 = 1;
+                        break;
+                    }
+                }
+                else if (cascWarm && casc->hdr && casc->hdr->frames > 0)
+                {
+                    genFrames = cascTakeover() - 1;
+                    if (!resetFG())
+                    {
+                        LOG("DLSS-G reset failed\n");
+                        rc2 = 1;
+                        break;
+                    }
+                }
+                // the cascade's stage 2: every frame stage 1 shared since the last pass, in order
+                if (casc && casc->present && !hidden)
+                {
+                    uint32_t s = 0;
+                    uint64_t fv = 0;
+                    while (casc->nextFrame(s, fv))
+                        if (!host.presentRing(casc->ring[s].Get(), casc->shared.Get(), fv))
+                        {
+                            LOG("presentRing failed\n");
+                            rc2 = 1;
+                            break;
+                        }
+                    if (rc2)
+                        break;
                 }
 
                 if (now - lastStatTick >= 2000)
@@ -3089,6 +4162,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     // DLSS-G: only the capture->SL-handoff is visible to us.
                     const double latAvg = statLatN ? statLatSum / statLatN : 0.0;
                     const double ratio = logLiveStats(capFps, outFps, latAvg, secs, host.useSL ? &st : nullptr);
+                    if (casc)
+                        cascReport(secs);
+                    if (casc && casc->present && !hidden &&
+                        ((cascStalled() && !cascFallback("it stopped presenting")) || !cascShortCheck(capFps, outFps)))
+                    {
+                        LOG("DLSS-G reset failed\n");
+                        rc2 = 1;
+                        break;
+                    }
                     {
                         uint64_t hn = 0;
                         for (int i = 0; i < Host::kHistN; i++)
@@ -3123,14 +4205,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     // by the model (numFramesToGenerateMax, 5 on current NGX). Applied through the
                     // existing off/on re-warm, and only after the same value is derived twice in a row
                     // (2s stats windows), so a momentary rate wobble cannot thrash the FG pipeline.
-                    if (host.useSL && g_targetFps > 0 && !g_genExplicit && capFps > 3.0)
+                    if (host.useSL && g_targetFps > 0 && !g_genExplicit && capFps > 3.0 && !casc && !cascPend)
                     {
-                        const int capMax = host.maxGen ? (int)(host.maxGen < 5 ? host.maxGen : 5) : 5;
-                        int want = (int)((double)g_targetFps / capFps + 0.5) - 1;
-                        if (want < 1)
-                            want = 1;
-                        if (want > capMax)
-                            want = capMax;
+                        const int capMax = liveDlssgLimit() - 1;
+                        if (cascAuto && !cascTried)
+                            cascPlan(capFps); // the direct pass runs at the limit meanwhile (want below)
+                        const int want = dlssgOnePassGen((double)g_targetFps / capFps, capMax);
                         if (want != genFrames && want == fgWantPrev)
                         {
                             LOG("target %d fps at ~%.1f captured: switching DLSS-G to %dx\n", g_targetFps, capFps,
@@ -3211,6 +4291,21 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         if (g_teardownTrace)
             LOG("teardown: server stopped, stopping the capture\n");
         cap.stop();
+        if (cascPend) // a plan still starting: its READY wait ends at once
+        {
+            cascPend->abortStart = true;
+            if (cascPendUp)
+                cascPendUp->abortStart = true;
+            if (cascTh.joinable())
+                cascTh.join();
+            cascPend->stop();
+            if (cascPendUp)
+                cascPendUp->stop();
+        }
+        if (casc)
+            casc->stop(); // its reader queue lives on the host's device
+        if (cascUp)
+            cascUp->stop();
         if (g_teardownTrace)
             LOG("teardown: capture stopped, shutting the host down\n");
         host.shutdown();

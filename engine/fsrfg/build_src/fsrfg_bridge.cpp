@@ -40,7 +40,7 @@ struct FsrfgShared
 namespace
 {
 constexpr int kLists = 2;
-constexpr int kMaxInstances = 4;
+constexpr int kMaxInstances = 16;
 
 std::string g_err;
 std::wstring g_cacheRoot; // fsrfg_set_cache_dir, else shader_cache beside this DLL
@@ -392,7 +392,7 @@ FSRFG_API const char* fsrfg_provider()
     return g_provider.c_str();
 }
 
-// instance i (0..3) at w x h on the adapter with this LUID; fmt 0 = RGBA8, 1 = RGBA16F. Fills *sh (the handles stay
+// instance i (0..kMaxInstances - 1) at w x h on the adapter with this LUID; fmt 0 = RGBA8, 1 = RGBA16F. Fills *sh (the handles stay
 // owned by the bridge until fsrfg_destroy_i). 0 = ok, < 0 = fsrfg_last_error.
 FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, int32_t luidHigh, int fmt,
                              FsrfgShared* sh)

@@ -792,6 +792,150 @@ struct Host
         return true;
     }
 
+    // The live cascade's stage 2: present a texture another device fills (a stage-1
+    // ring slot resting in COMMON, the same format and size as the back buffer) once `wf` reaches `wv` on this queue;
+    // presentTailInner's SL sequence with the slot copied straight into the back buffer
+    bool presentRing(ID3D12Resource* tex, ID3D12Fence* wf, uint64_t wv)
+    {
+        const int64_t t0 = nowQpc100();
+        pumpMessages();
+        const UINT ai = allocIdx;
+        allocIdx = (allocIdx + 1) % 3;
+        if (allocFence[ai] && fence->GetCompletedValue() < allocFence[ai])
+        {
+            fence->SetEventOnCompletion(allocFence[ai], fenceEvent);
+            if (WaitForSingleObject(fenceEvent, 5000) != WAIT_OBJECT_0)
+                return false;
+        }
+        sl::FrameToken* tok{};
+        uint32_t fi = frameIndex++;
+        if (slGetNewFrameToken(tok, &fi) != sl::Result::eOk)
+            return false;
+        slReflexSleep(*tok);
+        slPCLSetMarker(sl::PCLMarker::eSimulationStart, *tok);
+        if (slSetConstants(consts, *tok, vp) != sl::Result::eOk)
+            return false;
+        slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *tok);
+        const UINT bb = sc->GetCurrentBackBufferIndex();
+        allocs[ai]->Reset();
+        list->Reset(allocs[ai].Get(), nullptr);
+        D3D12_RESOURCE_BARRIER b[2]{};
+        for (auto& x : b)
+        {
+            x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        b[0].Transition.pResource = tex;
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[1].Transition.pResource = backbuffers[bb].Get();
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(2, b);
+        list->CopyResource(backbuffers[bb].Get(), tex);
+        for (auto& x : b)
+            std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+        list->ResourceBarrier(2, b);
+        list->Close();
+        sl::Extent fullExtent{0, 0, W, H};
+        sl::Resource depthRes(
+            sl::ResourceType::eTex2d, texDepth.Get(),
+            (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+        depthRes.width = W;
+        depthRes.height = H;
+        depthRes.nativeFormat = DXGI_FORMAT_R32_FLOAT;
+        sl::Resource mvecRes(
+            sl::ResourceType::eTex2d, texMvec.Get(),
+            (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+        mvecRes.width = W;
+        mvecRes.height = H;
+        mvecRes.nativeFormat = DXGI_FORMAT_R16G16_FLOAT;
+        sl::ResourceTag tags[] = {
+            sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &fullExtent),
+            sl::ResourceTag(&mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
+                            &fullExtent),
+        };
+        if (slSetTagForFrame(*tok, vp, tags, _countof(tags), nullptr) != sl::Result::eOk)
+            return false;
+        queue->Wait(wf, wv); // the slot's copy on the other device is complete
+        slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *tok);
+        ID3D12CommandList* ls[] = {list.Get()};
+        queue->ExecuteCommandLists(1, ls);
+        slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *tok);
+        slPCLSetMarker(sl::PCLMarker::ePresentStart, *tok);
+        const HRESULT hr = sc->Present(syncInterval, 0);
+        slPCLSetMarker(sl::PCLMarker::ePresentEnd, *tok);
+        if (FAILED(hr))
+        {
+            LOG("Present failed hr=0x%08lx\n", hr);
+            return false;
+        }
+        queue->Signal(fence.Get(), ++fenceValue);
+        allocFence[ai] = fenceValue;
+        if (fence->GetCompletedValue() < fenceValue)
+        {
+            fence->SetEventOnCompletion(fenceValue, fenceEvent);
+            if (WaitForSingleObject(fenceEvent, 5000) != WAIT_OBJECT_0)
+                return false;
+        }
+        prMsTot += (nowQpc100() - t0) / 1e4;
+        prN++;
+        return true;
+    }
+
+    // The effects route's cascade feed: `bytes` of the shared slot buffer from `srcOffset` copied into a READBACK
+    // buffer on this queue, then `use` reads them while mapped. The fence value it signals orders it like a present
+    // (the caller's halfFence).
+    ComPtr<ID3D12Resource> readBuf;
+    template <class F> bool readSlot(ID3D12Resource* src, UINT64 srcOffset, UINT64 bytes, F&& use)
+    {
+        if (!readBuf || readBuf->GetDesc().Width < bytes)
+        {
+            readBuf.Reset();
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = bytes;
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                       nullptr, IID_PPV_ARGS(&readBuf))))
+                return false;
+        }
+        const UINT ai = allocIdx;
+        allocIdx = (allocIdx + 1) % 3;
+        if (allocFence[ai] && fence->GetCompletedValue() < allocFence[ai])
+        {
+            fence->SetEventOnCompletion(allocFence[ai], fenceEvent);
+            if (WaitForSingleObject(fenceEvent, 5000) != WAIT_OBJECT_0)
+                return false;
+        }
+        allocs[ai]->Reset();
+        list->Reset(allocs[ai].Get(), nullptr);
+        list->CopyBufferRegion(readBuf.Get(), 0, src, srcOffset, bytes);
+        list->Close();
+        ID3D12CommandList* ls[] = {list.Get()};
+        queue->ExecuteCommandLists(1, ls);
+        queue->Signal(fence.Get(), ++fenceValue);
+        allocFence[ai] = fenceValue;
+        if (fence->GetCompletedValue() < fenceValue)
+        {
+            fence->SetEventOnCompletion(fenceValue, fenceEvent);
+            if (WaitForSingleObject(fenceEvent, 5000) != WAIT_OBJECT_0)
+                return false;
+        }
+        const D3D12_RANGE rr{0, (SIZE_T)bytes}, none{0, 0};
+        void* p = nullptr;
+        if (FAILED(readBuf->Map(0, &rr, &p)))
+            return false;
+        use((const uint8_t*)p);
+        readBuf->Unmap(0, &none);
+        return true;
+    }
+
     void shutdown()
     {
         if (useSL)

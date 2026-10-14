@@ -76,7 +76,7 @@ static PFN_cuMemFree cuMemFreeFn = nullptr;
 static PFN_cuCtxSynchronize cuCtxSynchronizeFn = nullptr;
 
 // ---- one FRUC instance ------------------------------------------------------------------------
-static const int kMaxInst = 4;
+static const int kMaxInst = 16;
 struct Inst
 {
     void* ctx = nullptr; // FRUC's dedicated context

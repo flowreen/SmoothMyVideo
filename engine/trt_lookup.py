@@ -89,7 +89,8 @@ ONNX_DIR = os.environ.get("SMV_ONNX_DIR") or os.path.join(HERE, "onnx")
 EXPORT_PACKAGES = ("torch", "onnx", "onnxscript", "onnx-ir")
 # the host's builder settings that change an engine but not its graph (smv-live.exe lkBuild): part of
 # export_stamp(), so a change here empties the engine cache once, like a new export
-HOST_BUILD = "optimization level 5; aux stream caps: gmflow_bidir_b 0, metricnet 0, gmflow_backbone 0, fusionnet 2"
+HOST_BUILD = ("optimization level 5; aux stream caps: gmflow_bidir_b 0, metricnet 0, gmflow_backbone 0, fusionnet 2; "
+              "fusionnet out channels-last (HWC8 / HWC16); featurenet f1 f2 f3 HWC8 / HWC16, fusionnet b c d HWC8")
 
 
 def onnx_path(key):

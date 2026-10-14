@@ -638,7 +638,7 @@ let dlssnrReady: any = { ready:false };
 function nrOn(){ return $('dlssnr').checked && !!dlssnrReady.ready; }
 function nrStructure(){ return parseFloat($('nrstructure').value) || 0; }
 function nrTone(){ return parseFloat($('nrtone').value) || 0; }
-function nrStyle(){ const b = $('nrstyleseg').querySelector('button.on'); return b ? parseInt(b.dataset.style, 10) : 1; }   // DLSSNR.Style 0/1/2
+function nrStyle(){ const b = $('nrstyleseg').querySelector('button.on'); return b ? parseInt(b.dataset.style, 10) : 0; }   // DLSSNR.Style 0/1/2
 function nrPasses(){ const v = parseInt($('nrpasses').value, 10); return v >= 1 && v <= 10 ? v : 1; }   // DLSS 5 chained 1..10 times per frame
 function nrMaskOn(){ return nrOn() && $('nrmask').checked; }   // preview-only heat map of the DLSS 5 change
 function syncDlssnr(){
@@ -721,7 +721,7 @@ for(const [id, key] of [['nrstructure', 'nrStructure'], ['nrtone', 'nrTone']]){
   $(id).oninput = () => { localStorage.setItem(key, $(id).value); $(id + 'num').textContent = (+$(id).value).toFixed(2); };
   $(id).addEventListener('change', () => { refreshPreviewIfOpen(); try{ lvSendOpts(); }catch{} });
 }
-{ const saved = localStorage.getItem('nrStyle');   // Style selector: persisted, default Natural (1)
+{ const saved = localStorage.getItem('nrStyle');   // Style selector: persisted, default NVIDIA's Default (0)
   if(saved !== null) for(const b of $('nrstyleseg').querySelectorAll('button')) b.classList.toggle('on', b.dataset.style === saved); }
 $('nrstyleseg').onclick = e => { const b = e.target.closest('button'); if(!b || b.disabled) return;
   for(const x of $('nrstyleseg').querySelectorAll('button')) x.classList.toggle('on', x === b);
@@ -892,7 +892,7 @@ function liveTargetFps(){
 function liveModelInfo(){
   // fixed: the model cannot resample to the exact fps target; it approximates it with a whole
   // multiplier of the captured window's own rate (derived in the exe from the target) - DLSS-G
-  // by design (Streamline, capped at 6x)
+  // by design (Streamline; past one pass's limit in two passes)
   if(modelIsDlss()) return { model:'dlssg', name:'DLSS 4.5', note:'', fixed:true };
   // DRBA live: the rifedrba backend renders the three-frame window, so the picture trails
   // the capture by one source frame
@@ -968,13 +968,13 @@ function lvSendOpts(){
     : mi.model === 'rifedrba' ? 'starts in ~3s (~55s the first time at a new window size)'
     : mi.model === 'gmfss' ? 'loads in ~4s (~30s the first time at a new window size)'
     : mi.model === 'nvof' || mi.model === 'fsrfg' ? 'starts in a few seconds' : '';
-  // A fixed model cannot hit an arbitrary target exactly: it picks the nearest whole multiple
-  // of the captured window's own rate, so say that instead of promising the exact number.
+  // A fixed model cannot hit an arbitrary target exactly: it picks the first whole multiple
+  // of the captured window's own rate that reaches it, so say that instead of promising the exact number.
   const lvT = liveTargetFps();
   $('lvtarget').textContent = mi.name
     + (mi.effectsOnly ? ' · effects only (Restore, Sharpen, RTX VSR, RTX HDR) at the source rate, capped by the ' + lvT + ' fps Speed setting; tick a model to smooth'
-       : mi.fixed ? ' · nearest whole multiple of the captured rate to ' + lvT + ' fps'
-                  + (mi.model === 'dlssg' ? ' (up to 6x)' : '')
+       : mi.fixed ? ' · the first whole multiple of the captured rate that reaches ' + lvT + ' fps'
+                  + (mi.model === 'dlssg' ? ' (multi-pass past its one-pass limit, full passes first)' : '')
        : ' · targets ' + lvT + ' fps (the Speed setting below)')
     + (load ? ' · ' + load : '')
     + (liveHdrOn() && ['rife', 'rifedrba', 'gmfss', 'nvof', 'dlssg'].includes(mi.model) ? ' · RTX HDR (on HDR screens)' : '')
@@ -1114,6 +1114,8 @@ $('lvgo').onclick = async () => {
 // intermittently drops the latency tail into the next chunk.
 let lvOutBuf = '';
 let lvRefused = false;   // a refusal reason owns the status line until the next session
+// DLSS 4.5 above one pass: the session's plan, or why it stays at one pass, kept beside the stats until the next session
+let lvNote = '';
 function lvLine(t){
   // The host's refusal reason ("native host: <reason>", or the engine lookup / build failure) is
   // the ONE thing the user must read: it stays the last word on the panel, because the exe's own
@@ -1123,10 +1125,20 @@ function lvLine(t){
           || /native: (the host could not find or build the engines[^\r\n(]*)/.exec(t);
   if(rf){ lvRefused = true; $('lvstat').textContent = rf[1].trim().slice(0, 240); return; }
   if(lvRefused) return;
+  const pl = /^DLSS 4\.5 at (\d+)x: (\d+)x in a second process, (?:(\d+)x in a third, )?then (\d+)x/.exec(t);
+  const one = /^DLSS 4\.5 stays at (\d+)x: (?:\d+x \(\d+x, then \d+x\) )?([^\r\n]+)/.exec(t);
+  const lost = /^DLSS 4\.5's second (and third )?pass(?:es)? ended \(([^)]+)\): back to one pass at (\d+)x/.exec(t);
+  if(pl) lvNote = 'DLSS 4.5 ' + pl[1] + '× (' + pl[2] + '×, ' + (pl[3] ? pl[3] + '×, ' : '') + 'then ' + pl[4] + '×)';
+  else if(one) lvNote = 'DLSS 4.5 stays at ' + one[1] + '×: ' + one[2].trim().slice(0, 120);
+  else if(lost) lvNote = 'DLSS 4.5 back to ' + lost[3] + '×: the second ' + (lost[1] ? 'and third passes' : 'pass')
+    + ' ended (' + lost[2] + ')';
   // surface the exe's 2s stats lines; pass real failures through verbatim (trimmed)
   const m = /live: ([\d.]+) captured fps -> ([\d.]+) presented fps.*?latency ~(\d+)ms/.exec(t)
          || /live: ([\d.]+) captured fps -> ([\d.]+) presented fps/.exec(t);
-  if(m) $('lvstat').textContent = m[1] + ' fps in → ' + m[2] + ' fps out' + (m[3] ? '  ·  ~' + m[3] + ' ms latency' : '');
+  // the measured multiplier (out over in, the host's ratio) on every model's line, beside DLSS 4.5's plan
+  const rt = /presented fps \(ratio ([\d.]+)/.exec(t);
+  if(m) $('lvstat').textContent = m[1] + ' fps in → ' + m[2] + ' fps out' + (rt && +rt[1] > 0 ? ' (' + rt[1] + '×)' : '')
+    + (m[3] ? '  ·  ~' + m[3] + ' ms latency' : '') + (lvNote ? '  ·  ' + lvNote : '');
   // the native host is the only live route: its handoff start and cold engine build mean "loading"
   else if(/engine handoff started|host (GMFSS |Restore )?engine build for/.test(t)) $('lvstat').textContent = 'Loading the model…';
   else if(/FAIL|not supported|no visible window|not a visible window|no frames captured|minimized: waiting|cannot start in the native host|live server (protocol error|stalled)/i.test(t))
@@ -1143,7 +1155,7 @@ ipcRenderer.on('lv-started', () => {
   if(lvTimer){ clearInterval(lvTimer); lvTimer = null; }
   setMode('live');   // the ` hotkey can start a session with no renderer involvement
 
-  lvState = 'running'; lvStopReq = false; lvRefused = false; lvUi();
+  lvState = 'running'; lvStopReq = false; lvRefused = false; lvNote = ''; lvUi();
   try{ lvSpawnTarget = lvEffTarget(); }catch{}   // what --target this session carries
   $('lvstat').textContent = 'starting…';
 });

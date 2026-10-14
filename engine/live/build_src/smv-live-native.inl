@@ -985,6 +985,18 @@ __device__ __forceinline__ void gmStore(void* __restrict__ dst, int half, size_t
 {
     if (half) ((unsigned short*)dst)[o] = f2h(v); else ((float*)dst)[o] = v;
 }
+// fusionnet's input LeakyRelu (slope lr, lr < 0 = none) on a stored fp16 value: the fp32 product of two fp16 values is
+// exact, so its one rounding = an fp16 multiply, TensorRT's own result bit for bit
+__device__ __forceinline__ unsigned short gmLrelu16(unsigned short h, float lr)
+{
+    const float f = h2f(h);
+    return lr >= 0.0f && f < 0.0f ? f2h(f * lr) : h;
+}
+__device__ __forceinline__ void gmStoreLr(void* __restrict__ dst, int half, size_t o, float v, float lr)
+{
+    if (half) ((unsigned short*)dst)[o] = gmLrelu16(f2h(v), lr);
+    else ((float*)dst)[o] = lr >= 0.0f && v < 0.0f ? v * lr : v;
+}
 
 // C planes of (2 hh, 2 hw) with strides (planeStride, rowStride) -> C contiguous planes of (hh, hw)
 __global__ void k_half(const void* __restrict__ src, int srcHalf, int planeStride, int rowStride,
@@ -1038,7 +1050,8 @@ __global__ void k_pyr(const void* __restrict__ src, int srcHalf, int C, int sw, 
 // launches 32 x 8 (one warp = 32 consecutive x of one row). The block must be a multiple of 32
 // threads and at most 256. No early return: every thread joins the shuffles and barriers.
 // Checked: the accumulators equal a one-atomic-per-corner splat's bit for bit.
-__global__ void k_splatSoft(const void* __restrict__ in, int inHalf, int C,
+// `in` channel c of pixel o at c * cs + o * ps (planar: cs = the plane, ps = 1; channels-last: cs = 1, ps = C)
+__global__ void k_splatSoft(const void* __restrict__ in, int inHalf, int C, int cs, int ps,
                             const float* __restrict__ flow, const void* __restrict__ metric,
                             int metricHalf, float s, int w, int h, long long* __restrict__ acc)
 {
@@ -1085,7 +1098,7 @@ __global__ void k_splatSoft(const void* __restrict__ in, int inHalf, int C,
     const bool vgive = act && dn < nT && shA[dn] && shX[dn] == nwX && shY[dn] == nwY + 1;
     for (int c = 0; c <= C; c++)
     {
-        const float v = !act ? 0.0f : c < C ? __fmul_rn(gmTap(in, inHalf, (size_t)c * plane + o), e) : e;
+        const float v = !act ? 0.0f : c < C ? __fmul_rn(gmTap(in, inHalf, (size_t)c * cs + o * ps), e) : e;
         unsigned long long qNW = (unsigned long long)(long long)llrintf(v * wNW * 67108864.0f);
         unsigned long long qNE = (unsigned long long)(long long)llrintf(v * wNE * 67108864.0f);
         const unsigned long long qSW = (unsigned long long)(long long)llrintf(v * wSW * 67108864.0f);
@@ -1111,16 +1124,17 @@ __global__ void k_splatSoft(const void* __restrict__ in, int inHalf, int C,
     }
 }
 
-// acc (C + 1 int64 planes of n) -> C planes of the target (fp32, or fp16 when dstHalf)
+// acc (C + 1 int64 planes of n) -> C channels of the target (fp32, or fp16 when dstHalf), channel c of cell i at
+// c * cs + i * ps (planar: cs = n, ps = 1; channels-last: cs = 1, ps = the target's channel count); lr = gmStoreLr's
 __global__ void k_splatNorm(const long long* __restrict__ acc, int C, int n,
-                            void* __restrict__ dst, int dstHalf)
+                            void* __restrict__ dst, int dstHalf, int cs, int ps, float lr)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float norm = __fadd_rn((float)acc[(size_t)C * n + i] * (1.0f / 67108864.0f), 0.0000001f);
     for (int c = 0; c < C; c++)
-        gmStore(dst, dstHalf, (size_t)c * n + i,
-                __fdiv_rn((float)acc[(size_t)c * n + i] * (1.0f / 67108864.0f), norm));
+        gmStoreLr(dst, dstHalf, (size_t)c * cs + (size_t)i * ps,
+                  __fdiv_rn((float)acc[(size_t)c * n + i] * (1.0f / 67108864.0f), norm), lr);
 }
 
 // The gather form of k_splatSoft + k_splatNorm, the same output bit for bit without accumulator planes: a list per
@@ -1270,11 +1284,11 @@ __device__ __forceinline__ void gsEntry(int ent, const float* __restrict__ src, 
 }
 
 // one target cell and up to 8 channels (blockIdx.y = the channel group): k_splatSoft's int64 sums over the cell's list
-// (the normalizer = e, then its channels of `in`), divided like k_splatNorm into those planes of dst; the first 8
-// entries stay in registers across the channels
+// (the normalizer = e, then its channels of `in`), divided like k_splatNorm into those planes of dst (lr = gmStoreLr's);
+// the first 8 entries stay in registers across the channels
 __global__ void k_gsGather(const void* __restrict__ in, int inHalf, int C, const float* __restrict__ src, int w, int h,
                            const int* __restrict__ off, const int* __restrict__ list, void* __restrict__ dst,
-                           int dstHalf)
+                           int dstHalf, float lr)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int n = w * h;
@@ -1324,8 +1338,87 @@ __global__ void k_gsGather(const void* __restrict__ in, int inHalf, int C, const
             const float v = __fmul_rn(gmTap(in, inHalf, pc + o), e);
             acc += (unsigned long long)gsQ(v * wc * 67108864.0f);
         }
-        gmStore(dst, dstHalf, pc + i, __fdiv_rn((float)(long long)acc * (1.0f / 67108864.0f), norm));
+        gmStoreLr(dst, dstHalf, pc + i, __fdiv_rn((float)(long long)acc * (1.0f / 67108864.0f), norm), lr);
     }
+}
+
+// k_gsGather on channels-last fp16 features (`in` [n][C], C a multiple of 8) into a channels-last fp16 target ([n][dstC],
+// this splat's channels from dstOff): a thread = one cell's 8 channels, a cell's channel groups on consecutive lanes
+// (blockDim.x = C / 8, cells on threadIdx.y), so a warp reads whole feature vectors; per list entry ONE 16-byte load, per
+// cell ONE 16-byte store. The int64 sums, the per-term products and the normalizer are k_gsGather's: the same values
+// bit for bit (gmStore's f2h rounding, then gmStoreLr's slope lr).
+__global__ void k_gsGatherNhwc(const unsigned short* __restrict__ in, int C, const float* __restrict__ src, int w, int h,
+                               const int* __restrict__ off, const int* __restrict__ list,
+                               unsigned short* __restrict__ dst, int dstC, int dstOff, float lr)
+{
+    const int i = blockIdx.x * blockDim.y + threadIdx.y;
+    if (i >= w * h)
+        return;
+    const int c0 = (int)threadIdx.x * 8;
+    const size_t plane = (size_t)w * h;
+    const int b = off[i], m = off[i + 1] - b;
+    int so[8];
+    float se[8], sw[8];
+    unsigned long long accN = 0;
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+    {
+        so[k] = 0;
+        se[k] = 0.0f;
+        sw[k] = 0.0f;
+        if (k < m)
+        {
+            gsEntry(list[b + k], src, plane, so[k], se[k], sw[k]);
+            accN += (unsigned long long)gsQ(se[k] * sw[k] * 67108864.0f);
+        }
+    }
+    for (int k = 8; k < m; k++)
+    {
+        int o;
+        float e, wc;
+        gsEntry(list[b + k], src, plane, o, e, wc);
+        accN += (unsigned long long)gsQ(e * wc * 67108864.0f);
+    }
+    const float norm = __fadd_rn((float)(long long)accN * (1.0f / 67108864.0f), 0.0000001f);
+    unsigned long long acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+        acc[j] = 0;
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+        if (k < m)
+        {
+            const uint4 q = *(const uint4*)(in + (size_t)so[k] * C + c0);
+            const unsigned int wd[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                const float v = __fmul_rn(h2f((unsigned short)(wd[j >> 1] >> (16 * (j & 1)))), se[k]);
+                acc[j] += (unsigned long long)gsQ(v * sw[k] * 67108864.0f);
+            }
+        }
+    for (int k = 8; k < m; k++)
+    {
+        int o;
+        float e, wc;
+        gsEntry(list[b + k], src, plane, o, e, wc);
+        const uint4 q = *(const uint4*)(in + (size_t)o * C + c0);
+        const unsigned int wd[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            const float v = __fmul_rn(h2f((unsigned short)(wd[j >> 1] >> (16 * (j & 1)))), e);
+            acc[j] += (unsigned long long)gsQ(v * wc * 67108864.0f);
+        }
+    }
+    unsigned int pk[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+        pk[j] = (unsigned int)gmLrelu16(f2h(__fdiv_rn((float)(long long)acc[2 * j] * (1.0f / 67108864.0f), norm)), lr) |
+                ((unsigned int)gmLrelu16(f2h(__fdiv_rn((float)(long long)acc[2 * j + 1] * (1.0f / 67108864.0f), norm)),
+                                         lr)
+                 << 16);
+    *(uint4*)(dst + (size_t)i * dstC + dstOff + c0) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
 }
 
 // Adaptive Sharpen: bacondither's DX11 2-pass HQ (version 2021-09-10, quality_mode 1; Copyright (c) 2015-2021,
@@ -3458,6 +3551,123 @@ __global__ void k_fuTail(const unsigned short* __restrict__ pre, const unsigned 
                 make_float4(acc[o][i][0], acc[o][i][1], acc[o][i][2], acc[o][i][3]);
 }
 
+// k_fuTail on a channels-last `out` (lkBuild asks TensorRT-RTX for HWC8 / HWC16: plain NHWC fp16 [hh][hw][256] at 256
+// channels, half pixel (y, x)'s channel 4c + 2 sy + sx = phase (sy, sx) of channel c): the same windows, sums and sum
+// order, so the same frame bit for bit. Read straight from `out`, a warp's neighbours sit 1 KB apart, so the block's
+// tile (its 16 x 32 half pixels, the 3 x 3 windows' border and one more column left so the pairs stay aligned: 18 x 36)
+// comes in 4 channels at a time as whole 16-byte pieces (2 channels x 4 phases; two threads on one half pixel's 32
+// bytes), each piece = 4 shared words, one a channel and phase row ((sx 0, sx 1): the pair the sums read), 0 outside
+// the frame. The tile is sized for 16 x 8 threads.
+#define FU_TR 18
+#define FU_TC 36
+#define FU_K 4
+#define FU_P (FU_TR * FU_TC)
+__global__ void k_fuTailNhwc(const unsigned short* __restrict__ pre, const unsigned short* __restrict__ wl,
+                             const unsigned short* __restrict__ bl, float* __restrict__ out, int hh, int hw,
+                             int clamp01)
+{
+    __shared__ float sw[64 * 27];
+    __shared__ float sb[3];
+    __shared__ __align__(16) unsigned int st[FU_K * 2 * FU_P]; // [k][sy][row][col] = (sx 0, sx 1)
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x, nt = blockDim.x * blockDim.y;
+    for (int i = tid; i < 3 * 64 * 9; i += nt)
+    {
+        const int o = i / 576, c = (i % 576) / 9, k = i % 9;
+        sw[c * 27 + o * 9 + k] = h2f(wl[i]);
+    }
+    if (tid < 3)
+        sb[tid] = h2f(bl[tid]);
+    const int x0 = 2 * (blockIdx.x * blockDim.x + threadIdx.x), y0 = 2 * (blockIdx.y * blockDim.y + threadIdx.y);
+    const int bx = 2 * blockIdx.x * blockDim.x - 2, by = 2 * blockIdx.y * blockDim.y - 1; // the tile's first column / row
+    const bool live = x0 < hw && y0 < hh;
+    const int lx = 2 * threadIdx.x + 2, ly = 2 * threadIdx.y;
+    __syncthreads();
+    float acc[3][4][4];
+#pragma unroll
+    for (int o = 0; o < 3; ++o)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                acc[o][i][j] = sb[o];
+    for (int c0 = 0; c0 < 64; c0 += FU_K)
+    {
+        if (c0)
+            __syncthreads();
+        for (int it = tid; it < FU_P * (FU_K / 2); it += nt)
+        {
+            const int seg = it % (FU_K / 2), pix = it / (FU_K / 2), rx = pix % FU_TC, ry = pix / FU_TC;
+            const int X = bx + rx, Y = by + ry;
+            uint4 u = make_uint4(0, 0, 0, 0);
+            if (X >= 0 && X < hw && Y >= 0 && Y < hh)
+                u = *(const uint4*)(pre + ((size_t)Y * hw + X) * 256 + 4 * c0 + 8 * seg);
+            unsigned int* d = st + 4 * seg * FU_P + ry * FU_TC + rx;
+            d[0] = u.x;
+            d[FU_P] = u.y;
+            d[2 * FU_P] = u.z;
+            d[3 * FU_P] = u.w;
+        }
+        __syncthreads();
+        if (live)
+#pragma unroll
+            for (int k = 0; k < FU_K; ++k)
+            {
+                const unsigned int* sk = st + 2 * k * FU_P;
+                float v[6][6];
+#pragma unroll
+                for (int r = 0; r < 6; ++r)
+                {
+                    const int j = (r + 1) >> 1, sy = (r + 1) & 1;
+                    const unsigned int* q = sk + sy * FU_P + (ly + j) * FU_TC + lx; // half column x0
+                    const uint2 m = *(const uint2*)q;
+                    const unsigned int cc = q[-1], d = q[2];
+                    v[r][0] = h2f((unsigned short)(cc >> 16));
+                    v[r][1] = h2f((unsigned short)(m.x & 0xFFFFu));
+                    v[r][2] = h2f((unsigned short)(m.x >> 16));
+                    v[r][3] = h2f((unsigned short)(m.y & 0xFFFFu));
+                    v[r][4] = h2f((unsigned short)(m.y >> 16));
+                    v[r][5] = h2f((unsigned short)(d & 0xFFFFu));
+                }
+                float w[27];
+#pragma unroll
+                for (int q = 0; q < 27; ++q)
+                    w[q] = sw[(c0 + k) * 27 + q];
+#pragma unroll
+                for (int o = 0; o < 3; ++o)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+#pragma unroll
+                        for (int j = 0; j < 4; ++j)
+#pragma unroll
+                            for (int ky = 0; ky < 3; ++ky)
+#pragma unroll
+                                for (int kx = 0; kx < 3; ++kx)
+                                    acc[o][i][j] += v[i + ky][j + kx] * w[o * 9 + ky * 3 + kx];
+            }
+    }
+    if (!live)
+        return;
+    if (clamp01)
+#pragma unroll
+        for (int o = 0; o < 3; ++o)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    acc[o][i][j] = acc[o][i][j] < 0.0f ? 0.0f : (acc[o][i][j] > 1.0f ? 1.0f : acc[o][i][j]);
+    const int fh = 2 * hh, fw = 2 * hw;
+#pragma unroll
+    for (int o = 0; o < 3; ++o)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            *(float4*)(out + (size_t)o * fh * fw + (size_t)(2 * y0 + i) * fw + 2 * x0) =
+                make_float4(acc[o][i][0], acc[o][i][1], acc[o][i][2], acc[o][i][3]);
+}
+#undef FU_TR
+#undef FU_TC
+#undef FU_K
+#undef FU_P
+
 }
 
 )CUDASRC";
@@ -3904,6 +4114,12 @@ constexpr int kGmN = 8;
 constexpr int kGmAn = 2;
 static const char* const kGmA[kGmAn] = {"qf", "flow0"};
 
+// the midpoint tree of Smooth Motion and AMD FSR 4 (one bridge instance a level, the bridges hold 16): its deepest
+// level (x512) and its node grid, kFrGrid steps a pair. The ring's memory fit prices the level the slots reach, so a
+// GPU without the room for a level never reaches it
+constexpr int kFrDepth = 9, kFrGrid = 1 << kFrDepth;
+static_assert(kFrDepth <= 9, "a slot's fraction below 0.999f is a tween: x1024's last node (1023 / 1024) is not");
+
 struct NativeRife
 {
     // ---- handoff facts, straight off live_server.py's --native-handoff lines
@@ -4012,13 +4228,17 @@ struct NativeRife
     int* dGsBlk[2] = {};
     bool gmGather = false;
     bool gmTail = false;    // the cut fusionnet (out = the pre-shuffle tensor): k_fuTail does shuffle + conv_last
+    bool gmTailHwc = false; // gmTail with out channels-last (the engine's HWC8 / HWC16): k_fuTailNhwc reads it
+    bool gmFeatHwc = false; // feat_ext's levels and fusionnet's b / c / d channels-last: the feature splats' layout
     void* dGmWl = nullptr;  // the cut fusionnet's w_last (3, 64, 3, 3) fp16: conv_last's weight
     void* dGmBl = nullptr;  // its b_last (3) fp16: conv_last's bias
-    float* dGmFa = nullptr; // fusionnet a (9, half): I1t, merged (ifnet writes it), I2t
-    void* dGmFb = nullptr;  // fusionnet b (2 * gmC[0], half) in the engine's dtype
-    void* dGmFc = nullptr;  // fusionnet c (2 * gmC[1], quarter), the same dtype
-    void* dGmFd = nullptr;  // fusionnet d (2 * gmC[2], eighth), the same dtype
-    float* dGmT = nullptr;  // the timestep, one device float (ifnet's 1x1x1x1 input)
+    void* dGmLr = nullptr;  // its lr_bcd (3) fp32 (a graph without b / c / d's LeakyRelus): their slopes
+    float gmLr[3] = {-1.0f, -1.0f, -1.0f}; // those slopes, the feature splats' stores apply them (-1 = the engine does)
+    float* dGmFa = nullptr;                // fusionnet a (9, half): I1t, merged (ifnet writes it), I2t
+    void* dGmFb = nullptr;                 // fusionnet b (2 * gmC[0], half) in the engine's dtype
+    void* dGmFc = nullptr;                 // fusionnet c (2 * gmC[1], quarter), the same dtype
+    void* dGmFd = nullptr;                 // fusionnet d (2 * gmC[2], eighth), the same dtype
+    float* dGmT = nullptr;                 // the timestep, one device float (ifnet's 1x1x1x1 input)
     void* dGmOut = nullptr; // the fusionnet output (3, ph, pw) in the engine's dtype (gmTail: k_fuTail's, fp32)
     float* dGmF = nullptr;  // that output clamped to fp32: what storeSlot consumes
     // HDR planes (nativeGmfssPair): the SDR view of one padded frame (hdrToModel, the scratch), the motion view's
@@ -4060,16 +4280,16 @@ struct NativeRife
     // the feed-once bridge (nvoffruc_step), per FRUC instance: the surface whose frame it was fed
     // last (-1 = none, or that surface was repacked since), whether the pair's next tween on it is
     // its first, and how many calls it has served
-    int frFed[4] = {-1, -1, -1, -1};
-    bool frFirst[4] = {};
-    uint64_t frCalls[4] = {};
+    int frFed[kFrDepth] = {}; // -1 each from nativeFrucSetup on
+    bool frFirst[kFrDepth] = {};
+    uint64_t frCalls[kFrDepth] = {};
     bool frCreated = false;
     uint64_t frPrimed = 0, frRepeats = 0, frTweens = 0;
     // parallel instances (the direct-t scheme, bridge nvoffruc_step_i): tween k of a pair's plan
     // runs on instance k % frInst, a round of frInst tweens at a time; instance 0 on the compute
     // thread, the others on their own workers (g_frW), each into its own BGRA8 output
     int frInst = 1, frInstMax = 1;
-    uint8_t* dFrOutBI[4] = {}; // [0] = dFrOutB
+    uint8_t* dFrOutBI[kFrDepth] = {}; // [0] = dFrOutB
     double frPlan[64] = {};
     uint32_t frPlanN = 0, frPlanK = 0;
     // recursive midpoints (the default): NvOFFRUC damages content that does not move at every
@@ -4079,14 +4299,33 @@ struct NativeRife
     // one continuous stream of new frames (NVIDIA's one call per new frame). A t that is no node
     // takes the nearest node of depth frMpCap. SMV_FRUC_MIDPOINTS=0 = the direct-t scheme above.
     bool frMp = false;
-    int frMpCap = 2;           // off-node snap depth: offline 3, live 2 (cost); SMV_FRUC_DEPTH=1..4 sets both
-    int frMpL = 0;             // this pair's depth, 0 = not chosen yet
-    bool frMpBuilt = false;    // this pair's whole tree to frMpL is computed
-    uint64_t frSerial = 0;     // frames packed this session: the node keys
-    uint8_t* dFrNode[16] = {}; // BGRA8 pw x ph: node j / 16 of this pair (j = 1..15)
-    bool frNodeOk[16] = {};
-    uint64_t frLastKey[4] = {}; // per instance: the key of the frame it was fed last, 0 = none
+    int frMpCap = 2;                // off-node snap depth: offline 3, live 2 (cost); SMV_FRUC_DEPTH=1..9 sets both
+    int frMpL = 0;                  // this pair's depth, 0 = not chosen yet
+    bool frMpBuilt = false;         // this pair's whole tree to frMpL is computed
+    uint64_t frSerial = 0;          // frames packed this session: the node keys
+    uint8_t* dFrNode[kFrGrid] = {}; // BGRA8 pw x ph: node j / kFrGrid of this pair (j = 1..kFrGrid - 1)
+    bool frNodeOk[kFrGrid] = {};
+    uint64_t frLastKey[kFrDepth] = {}; // per instance: the key of the frame it was fed last, 0 = none
     uint64_t frNodeCalls = 0;
+    // pipelined across pairs (live Smooth Motion, the exe's route bit on a group of x4 or deeper): a group shows the
+    // PREVIOUS pair, whose level-1 midpoint instance 0 made during the previous group on its own worker (g_frW[0])
+    // while the compute thread ran the levels below it of the pair before; every instance still sees its frames in
+    // time order. frLag* = the pair shown (its serial, surfaces, SDR view, nodes, held = identical or never split);
+    // frKeep = the surface the next pack spares (the shown pair's first frame)
+    bool frPipePrev = false, frLagHave = false, frLagSdr = false, frLagStatic = false, frCurStatic = false;
+    bool frSpecRun = false, frRepacked = false;
+    int frLagA = -1, frLagB = -1, frKeep = -1, frLagL = 0;
+    uint64_t frLagSerial = 0, frPipeGroups = 0;
+    uint8_t* dFrLagNode[kFrGrid] = {};
+    bool frLagOk[kFrGrid] = {};
+    // this group's midpoint-tree calls on the compute thread (Smooth Motion's bridge or AMD FSR 4's: calls, their ms,
+    // the calls and ms of those made before the slots = FSR 4's level 1, and the chain inside the slots incl. a
+    // pipelined group's level-1 join) for the exe's price (gFrCallUs / gFrStoreUs)
+    uint32_t grFrCalls = 0, grFrPreCalls = 0;
+    double grFrCallMs = 0.0, grFrPreMs = 0.0, grFrChainMs = 0.0, gFrCallMs = 0.0, gFrStoreMs = 0.0;
+    // groups whose midpoint-tree price is not sampled: one that made instances (their creation and first, cold calls
+    // land in its time: a first x4 group billed AMD FSR 4's call at 20.3 ms at 854x480) and the next
+    int grPriceSkip = 0;
     // HDR planes (encPost): a pair whose two frames stay inside the SDR range goes to FRUC as their SDR view
     // (k_packBgraSdr) and its tweens come back through k_unpackBgraSdr; any other pair as the 8-bit HDR codes. Per
     // surface: its frame inside the range, whether it holds the SDR view. SMV_FRUC_SDR_PAIRS=0 = every pair as the codes
@@ -4115,7 +4354,7 @@ struct NativeRife
         uint64_t val = 0; // the fence's last value
         bool made = false;
     };
-    FgInst fg[4];
+    FgInst fg[kFrDepth];
     LUID fgLuid = {};
     int fgPitch = 0, fgMvPitch = 0; // the bridge's row pitches (bytes), the same for every instance
     uint8_t* dFgMv = nullptr;       // a call's vectors (RG16F rows fgMvPitch apart) before their copy into its texture
@@ -4440,9 +4679,14 @@ struct NativeRife
     // microseconds: gIntUs = the work before the slots of a group with tweens, gTweenUs = one tween with its store
     cudaEvent_t grEv[2] = {};
     bool grArmed = false;
-    uint32_t grTween = 0;
+    uint32_t grTween = 0, grSlots = 0;
     double gIntMs = 0.0, gTweenMs = 0.0;
     std::atomic<uint32_t> gIntUs{0}, gTweenUs{0};
+    // Smooth Motion's midpoint tree: one bridge call, and one slot's unpack + store (the slots' time less the calls'),
+    // so the exe prices the direct tree ((M - 1) calls + M stores) and the pipelined one ((M - 2) calls + the overlap
+    // + M stores) apart; AMD FSR 4's: one call, one slot, and an x2 group's whole time (gFrBaseUs); 0 = not timed yet
+    std::atomic<uint32_t> gFrCallUs{0}, gFrStoreUs{0}, gFrBaseUs{0};
+    double gFrBaseMs = 0.0;
 
     CUmodule cuMod = nullptr;
     CUfunction fPackInDirect = nullptr, fResizeH = nullptr, fResizeV = nullptr, fH2f = nullptr, fF2h = nullptr,
@@ -4469,6 +4713,7 @@ struct NativeRife
         fSplatNorm = nullptr;
     CUfunction fGsCount = nullptr, fGsScanA = nullptr, fGsScanB = nullptr, fGsScanC = nullptr, fGsFill = nullptr,
                fGsGather = nullptr;                           // the gather splats
+    CUfunction fGsGatherNhwc = nullptr;                       // the feature splats on channels-last features
     CUfunction fPackInRaw16 = nullptr, fPackInRaw8 = nullptr, // offline
         fPackOutRaw16 = nullptr, fPackOutRaw8 = nullptr, fExpand8to16 = nullptr;
     CUfunction fPairDiff = nullptr, fRawDiff = nullptr;                       // identical-pair test, DLSS 5 reuse test
@@ -4485,11 +4730,12 @@ struct NativeRife
     CUfunction fPackBgraSdr = nullptr, fUnpackBgraSdr = nullptr;              // FRUC's SDR pairs on HDR planes
     CUfunction fHdrRestOut = nullptr;                                         // Restore's way back on HDR planes
     CUfunction fLocalCorr = nullptr;                                          // gmflow's local correlation, fused
-    CUfunction fAttn2 = nullptr;  // gmflow's global matching and propagation (k_attn2)
-    CUfunction fFuTail = nullptr; // GMFSS fusion's pixel shuffle + conv_last on the cut graph's out (k_fuTail)
-    int* dStaticFlag = nullptr;   // device flag k_pairDiff sets when the pair differs
-    int* hStaticFlag = nullptr;   // pinned readback of it, one int per group
-    uint64_t staticN = 0;         // identical pairs held this session
+    CUfunction fAttn2 = nullptr;      // gmflow's global matching and propagation (k_attn2)
+    CUfunction fFuTail = nullptr;     // GMFSS fusion's pixel shuffle + conv_last on the cut graph's out (k_fuTail)
+    CUfunction fFuTailNhwc = nullptr; // the same on a channels-last out (k_fuTailNhwc)
+    int* dStaticFlag = nullptr;       // device flag k_pairDiff sets when the pair differs
+    int* hStaticFlag = nullptr;       // pinned readback of it, one int per group
+    uint64_t staticN = 0;             // identical pairs held this session
 
     // ---- protocol plumbing
     std::mutex mMsg, mTok;
@@ -4935,6 +5181,48 @@ static std::string lkJit(const std::string& enginePath)
     return enginePath + (kind.empty() ? "" : "." + kind) + ".jit";
 }
 
+// gmflow A's two forms (transformer.py EXPORT_A_FORM): the masked form, which a cold start builds (its runtime JIT ~7 s
+// at every size), and the edge form, A x0.97 at the 1440p DLAA half and x0.89 at the 4K half but a JIT of ~29 s, past
+// the first start's 30 s on A's build lane. A GMFSS session on the masked form starts this exe's --build-engine for the
+// edge form after its first pair (lkGmUpgradeStart: no lookup of that session can see it appear) and the next session
+// at that size runs the edge form (lkGmPickA). Levers SMV_GM_UPGRADE=0 = the masked form only, =now = the edge form from
+// the cold start, =fail = the background build fails at once (its failure line's trigger)
+static const char* const kGmFlowMasked = "gmflow_bidir_a_g8";
+static const char* const kGmFlowEdge = "gmflow_bidir_a_g8e";
+static const int kGmFlowSlot = 1; // kGmKey's "gflow"
+
+// the edge form's engine beside a masked-form A engine (the same name with the edge base); "" for any other engine
+static std::string lkGmEdgeOf(const std::string& maskedEngine)
+{
+    const size_t sl = maskedEngine.find_last_of("\\/");
+    const size_t at = sl == std::string::npos ? 0 : sl + 1;
+    const std::string base = std::string(kGmFlowMasked) + "_";
+    if (maskedEngine.compare(at, base.size(), base) != 0)
+        return std::string();
+    return maskedEngine.substr(0, at) + kGmFlowEdge + maskedEngine.substr(at + base.size() - 1);
+}
+
+// the edge form is built and warm beside that A engine (the warm-up writes the .jit last)
+static bool lkGmEdgeReady(const std::string& maskedEngine)
+{
+    const std::string e = lkGmEdgeOf(maskedEngine);
+    return !e.empty() && lkFile(e) && lkFile(lkJit(e));
+}
+
+// the background build of the edge form: lkGmPickA leaves the command for the masked engine a lookup chose, the
+// session's first GMFSS pair starts it (armed), a new session start ends a running one (lkGmUpgradeStop); the helper
+// sits in a job object, so it ends with this process
+struct GmUpgrade
+{
+    std::mutex m;
+    std::string masked, log; // the masked A engine it upgrades, the helper's log file
+    std::wstring cmd;
+    std::atomic<bool> armed{false};
+    HANDLE proc = nullptr, job = nullptr;
+    std::chrono::steady_clock::time_point t0;
+};
+static GmUpgrade g_gmUpg;
+
 static bool lkWarm(const std::string& jit, const std::string& key)
 {
     if (!lkFile(jit))
@@ -5239,6 +5527,47 @@ static std::string lkModelCacheDir(const std::string& engDir)
     return top + "\\model_cache_safe_to_delete";
 }
 
+static std::string lkOnnxPath(const std::string& engDir, const std::string& key, const LookupTags& t);
+
+// lkSession's gmflow A: the edge form when SMV_GM_UPGRADE=now or when it is built and warm beside the masked engine,
+// else the masked form, then with the edge form's ONNX present the helper's command for its background build
+static void lkGmPickA(LkSession& s)
+{
+    const std::string lever = lkEnv("SMV_GM_UPGRADE");
+    const LookupTags& t = lkTags(s.engDirW);
+    if (lever == "0" || !t.ok)
+        return;
+    LkGmNet& n = s.gm[kGmFlowSlot];
+    const std::string masked = s.cacheDir + "\\" + lkEngineName(n.base, lkGmNameSet(n), nullptr, 0, 0, t) + ".engine";
+    if (lever == "now" || lkGmEdgeReady(masked))
+    {
+        n.base = n.onnx = kGmFlowEdge;
+        return;
+    }
+    const std::string onnx = lkOnnxPath(s.engDir, kGmFlowEdge, t), edge = lkGmEdgeOf(masked);
+    if (!lkFile(onnx))
+        return;
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --build-engine \"" + utf8ToWide(edge + ".helper.log") +
+                       L"\" \"" + s.engDirW + L"\\live_server.py\" \"" + utf8ToWide(onnx) + L"\" \"" +
+                       utf8ToWide(edge) + L"\" " + std::to_wstring(n.ws) + L" --room";
+    for (const auto& in : n.set)
+    {
+        cmd += L" " + utf8ToWide(in.name) + L"=";
+        for (size_t d = 0; d < in.dims.size(); d++)
+            cmd += (d ? L"x" : L"") + std::to_wstring(in.dims[d]);
+    }
+    std::lock_guard<std::mutex> lk(g_gmUpg.m);
+    if (g_gmUpg.masked != masked)
+    {
+        g_gmUpg.masked = masked;
+        g_gmUpg.log = edge + ".helper.log";
+        g_gmUpg.cmd = cmd;
+    }
+    g_gmUpg.armed = !g_gmUpg.proc;
+}
+
 static bool lkSession(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH,
                       LkSession& s)
 {
@@ -5287,7 +5616,11 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
         // between A and B (k_localCorr, never the [2, 128, HW, 81] product), A with the doubled workspace ceiling; the
         // IFNet's ONNX key carries its baked scale list
         s.gm = {
-            {"gfeat", "featurenet", "featurenet", 1, {{"x", {1, 3, s.ph, s.pw}}}},
+            {"gfeat",
+             lkEnv("SMV_FU_HWC") == "0" ? "featurenet_lin" : "featurenet",
+             "featurenet",
+             1,
+             {{"x", {1, 3, s.ph, s.pw}}}},
             {"gflow",
              "gmflow_bidir_a_g8",
              "gmflow_bidir_a_g8",
@@ -5303,8 +5636,9 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
              1,
              {{"i0", {1, 3, hh, hw}}, {"i1", {1, 3, hh, hw}}, {"f01", {1, 2, hh, hw}}, {"f10", {1, 2, hh, hw}}}},
             {"gifnet", "ifnet", "ifnet_sl8-4-2-1", 1, {{"x", {1, 6, hh, hw}}, {"timestep", {1, 1, 1, 1}}}},
+            // SMV_FU_HWC=0 (lkBuild's linear I/O) names its own engines (here and feat_ext), never the default ones' files
             {"gfusion",
-             "fusionnet",
+             lkEnv("SMV_FU_HWC") == "0" ? "fusionnet_lin" : "fusionnet",
              "fusionnet",
              1,
              {{"a", {1, 9, hh, hw}},
@@ -5335,6 +5669,7 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
         // warm markers still match
         sprintf_s(key, "%dx%d|0x0", s.ph, s.pw);
         s.warmKey = key;
+        lkGmPickA(s);
         return true;
     }
     s.drba = s.backend == "rifedrba";
@@ -5734,6 +6069,41 @@ static bool lkBuild(nvinfer1::IRuntime* rt, const std::string& onnx, const std::
                 LOG("native: onnx parse: %s\n", p->getError(i)->desc());
         return false;
     }
+    // GMFSS's host-side tensors leave and enter channels-last, the layout the convs work in (a linear one costs a
+    // whole-tensor transpose at the boundary): the cut fusionnet's `out` (the 64 -> 256 conv at the half: 4.2 ms at the
+    // 4K half, read by k_fuTailNhwc), feat_ext's f1 / f2 / f3 and fusionnet's b / c / d (read and written by
+    // k_gsGatherNhwc); at these channel counts HWC8 and HWC16 are both plain NHWC. trt_lookup.HOST_BUILD names this;
+    // SMV_FU_HWC=0 keeps every one linear (A/B, the k_fuTail and planar splat paths' trigger)
+    {
+        const size_t sl = onnx.find_last_of("\\/");
+        const size_t b0 = sl == std::string::npos ? 0 : sl + 1;
+        const bool fusion = !onnx.compare(b0, 10, "fusionnet_"), feat = !onnx.compare(b0, 11, "featurenet_");
+        const nvinfer1::TensorFormats hwc = (1U << static_cast<int>(nvinfer1::TensorFormat::kHWC8)) |
+                                            (1U << static_cast<int>(nvinfer1::TensorFormat::kHWC16));
+        auto nhwcOk = [](nvinfer1::ITensor* t) {
+            const nvinfer1::Dims d = t->getDimensions();
+            return d.nbDims == 4 && d.d[1] > 0 && d.d[1] % 16 == 0 && t->getType() == nvinfer1::DataType::kHALF;
+        };
+        if (lkEnv("SMV_FU_HWC") != "0" && (fusion || feat))
+        {
+            for (int i = 0; i < net->getNbOutputs(); i++)
+            {
+                nvinfer1::ITensor* t = net->getOutput(i);
+                const char* nm = t->getName();
+                if (((fusion && !strcmp(nm, "out") && t->getDimensions().d[1] == 256) ||
+                     (feat && (!strcmp(nm, "f1") || !strcmp(nm, "f2") || !strcmp(nm, "f3")))) &&
+                    nhwcOk(t))
+                    t->setAllowedFormats(hwc);
+            }
+            for (int i = 0; fusion && i < net->getNbInputs(); i++)
+            {
+                nvinfer1::ITensor* t = net->getInput(i);
+                const char* nm = t->getName();
+                if ((!strcmp(nm, "b") || !strcmp(nm, "c") || !strcmp(nm, "d")) && nhwcOk(t))
+                    t->setAllowedFormats(1U << static_cast<int>(nvinfer1::TensorFormat::kHWC8));
+            }
+        }
+    }
     std::unique_ptr<nvinfer1::IBuilderConfig> cfg(b->createBuilderConfig());
     nvinfer1::IOptimizationProfile* prof = b->createOptimizationProfile();
     if (!cfg || !prof)
@@ -5831,12 +6201,16 @@ static size_t lkDtypeBytes(nvinfer1::DataType d)
     }
 }
 
+static uint64_t nativeVideoMemoryRoom();
+
 // warm an engine for every input shape set with a fresh runtime cache (the existing .jit file
 // merged first, as python's context does), then write the cache as <engine>[.kind].jit and add
 // the warm key (none = the file only). Inputs are zeros: the kernels depend on shapes, not data.
+// fitRoom = refuse (a memory-shaped failure) when the context's memory exceeds the video memory room
+// (a background build beside a running session)
 static bool lkWarmEngine(nvinfer1::IRuntime* rt, const std::string& enginePath,
                          const std::vector<std::vector<LkShape>>& sets, const std::string& warmKey, cudaStream_t st,
-                         bool* oom)
+                         bool* oom, bool fitRoom = false)
 {
     *oom = false;
     const auto t0 = std::chrono::steady_clock::now();
@@ -5846,6 +6220,15 @@ static bool lkWarmEngine(nvinfer1::IRuntime* rt, const std::string& enginePath,
     std::unique_ptr<nvinfer1::ICudaEngine> eng(rt->deserializeCudaEngine(blob.data(), blob.size()));
     if (!eng)
         return false;
+    const uint64_t room = fitRoom ? nativeVideoMemoryRoom() : 0,
+                   need = (uint64_t)(std::max)((int64_t)0, eng->getDeviceMemorySizeV2());
+    if (room && need > room)
+    {
+        *oom = true;
+        LOG("native: not enough free video memory to warm %s (%.0f MiB, %.0f MiB free past the reserve)\n",
+            enginePath.substr(enginePath.find_last_of("\\/") + 1).c_str(), need / 1048576.0, room / 1048576.0);
+        return false;
+    }
     std::unique_ptr<nvinfer1::IRuntimeConfig> cfg(eng->createRuntimeConfig());
     if (!cfg)
         return false;
@@ -5994,19 +6377,21 @@ static bool lkEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTag
     return lkWarmEngine(rt, path, warmSets, warmKey, st, oom);
 }
 
-// --build-engine LOG SCRIPT ONNX ENGINE WSMULT NAME=D0xD1x... ...: build ENGINE from ONNX when it is missing, warm it
-// with a fresh runtime cache (its .jit) and exit; LOG takes this process's log lines. lkGmEnsure runs gmflow A this way
-// beside its own work. Exit 0 = done, 3 = a memory-shaped failure, 2 = any other; SMV_GM_HELPER_TEST=fail = exit 2 at
-// once (the parent's fallback trigger).
+// --build-engine LOG SCRIPT ONNX ENGINE WSMULT [--room] NAME=D0xD1x... ...: build ENGINE from ONNX when it is missing,
+// warm it with a fresh runtime cache (its .jit) and exit; LOG takes this process's log lines. lkGmEnsure runs gmflow A
+// this way beside its own work, lkGmUpgradeStart A's edge form beside a running session (--room: the warm-up's context
+// must fit the video memory room). Exit 0 = done, 3 = a memory-shaped failure, 2 = any other; SMV_GM_HELPER_TEST=fail
+// (SMV_GM_UPGRADE=fail with --room) = exit 2 at once (the parent's fallback / failure-line trigger).
 static int runBuildEngine(int argc, wchar_t** argv)
 {
     FILE* logf = nullptr;
     if (argc < 8 || _wfreopen_s(&logf, argv[2], L"w", stderr) != 0)
         return 2;
     setvbuf(stderr, nullptr, _IONBF, 0);
-    if (lkEnv("SMV_GM_HELPER_TEST") == "fail")
+    const bool room = wcscmp(argv[7], L"--room") == 0;
+    if (lkEnv(room ? "SMV_GM_UPGRADE" : "SMV_GM_HELPER_TEST") == "fail")
     {
-        LOG("native: build helper failing on SMV_GM_HELPER_TEST=fail\n");
+        LOG("native: build helper failing on %s=fail\n", room ? "SMV_GM_UPGRADE" : "SMV_GM_HELPER_TEST");
         return 2;
     }
     if (!nativeLoadDlls(argv[3]) || !g_onnxParserOk)
@@ -6016,7 +6401,9 @@ static int runBuildEngine(int argc, wchar_t** argv)
     std::vector<std::string> names;
     names.reserve((size_t)argc);
     std::vector<LkShape> set;
-    for (int i = 7; i < argc; i++)
+    if (argc < (room ? 9 : 8))
+        return 2;
+    for (int i = room ? 8 : 7; i < argc; i++)
     {
         const std::string a = wideToUtf8(argv[i]);
         const size_t eq = a.find('=');
@@ -6040,9 +6427,92 @@ static int runBuildEngine(int argc, wchar_t** argv)
         return 2;
     bool oom = false;
     const bool ok = (lkFile(path) || lkBuild(rt, onnx, path, set, nullptr, 0, 0, ws, &oom)) &&
-                    lkWarmEngine(rt, path, {set}, std::string(), st, &oom);
+                    lkWarmEngine(rt, path, {set}, std::string(), st, &oom, room);
     cudaStreamDestroy(st);
     return ok ? 0 : oom ? 3 : 2;
+}
+
+// the session's first GMFSS pair (armed by lkGmPickA): the background build of the edge form for that session's masked
+// A engine, unless it is warm already or another build runs
+static void lkGmUpgradeStart(const std::string& maskedEngine)
+{
+    std::lock_guard<std::mutex> lk(g_gmUpg.m);
+    if (g_gmUpg.proc || g_gmUpg.cmd.empty() || g_gmUpg.masked != maskedEngine || lkGmEdgeReady(maskedEngine))
+        return;
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = g_gmUpg.cmd;
+    if (job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li)) &&
+        CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW | CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si, &pi))
+    {
+        if (AssignProcessToJobObject(job, pi.hProcess))
+        {
+            ResumeThread(pi.hThread);
+            g_gmUpg.proc = pi.hProcess;
+            g_gmUpg.job = job;
+            g_gmUpg.t0 = std::chrono::steady_clock::now();
+            job = nullptr;
+            LOG("native: building gmflow A's edge form in the background (the next GMFSS session at this size runs "
+                "it)\n");
+        }
+        else
+            TerminateProcess(pi.hProcess, 2);
+        if (!g_gmUpg.proc)
+            CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    if (job)
+        CloseHandle(job);
+    if (!g_gmUpg.proc)
+        LOG("native: the background build of gmflow A's edge form did not start (%lu)\n", GetLastError());
+}
+
+// a session starts (every live session, every offline GMFSS render): a background build still running ends here, so
+// it can never complete during that session's lookups (it starts again after a GMFSS session's first pair); a finished
+// one's log lines and result come into this log; the build is armed again while the edge form is not warm
+static void lkGmUpgradeStop()
+{
+    std::lock_guard<std::mutex> lk(g_gmUpg.m);
+    if (g_gmUpg.proc)
+    {
+        DWORD rc = STILL_ACTIVE;
+        GetExitCodeProcess(g_gmUpg.proc, &rc);
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_gmUpg.t0).count();
+        if (rc == STILL_ACTIVE)
+        {
+            TerminateProcess(g_gmUpg.proc, 2);
+            WaitForSingleObject(g_gmUpg.proc, 5000);
+            LOG("native: stopped the background build of gmflow A's edge form after %.1fs (a new session started)\n",
+                s);
+        }
+        else
+        {
+            std::ifstream f(g_gmUpg.log);
+            std::string ln;
+            while (std::getline(f, ln))
+                if (!ln.empty())
+                    LOG("helper: %s\n", ln.c_str());
+            FILETIME c{}, e{}, k{}, u{};
+            if (GetProcessTimes(g_gmUpg.proc, &c, &e, &k, &u))
+                s = (double)((((uint64_t)e.dwHighDateTime << 32) | e.dwLowDateTime) -
+                             (((uint64_t)c.dwHighDateTime << 32) | c.dwLowDateTime)) /
+                    1e7;
+            if (rc == 0)
+                LOG("native: the background build of gmflow A's edge form is done (%.1fs)\n", s);
+            else
+                LOG("native: the background build of gmflow A's edge form failed (exit %lu%s)\n", rc,
+                    rc == 3 ? ", memory" : "");
+        }
+        CloseHandle(g_gmUpg.proc);
+        CloseHandle(g_gmUpg.job);
+        g_gmUpg.proc = g_gmUpg.job = nullptr;
+        DeleteFileA(g_gmUpg.log.c_str());
+    }
+    g_gmUpg.armed = !g_gmUpg.cmd.empty() && !lkGmEdgeReady(g_gmUpg.masked);
 }
 
 // GMFSS's nets `nets` (indices into s.gm), built when missing and warmed. TensorRT-RTX compiles one engine at a time
@@ -6348,6 +6818,7 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, OfflineEngin
 // lkBuildBackend does for live, then handed to nr like the live handoff's NATIVE-PATH lines.
 static bool lkOfflineGmfss(const std::wstring& script, int w, int h, NativeRife& nr)
 {
+    lkGmUpgradeStop();
     LkSession s;
     if (!lkSession(script, L"gmfss", (uint32_t)w, (uint32_t)h, s))
         return false;
@@ -6553,6 +7024,8 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         {
             for (int i = 0; i < kGmN; i++)
                 factsOk = factsOk && fileExistsA(f.gmPath[i]);
+            // a masked-form A whose edge form has been built since: a lookup takes the edge form (lkGmPickA)
+            factsOk = factsOk && (lkEnv("SMV_GM_UPGRADE") == "0" || !lkGmEdgeReady(f.gmPath[kGmFlowSlot]));
         }
         else
             factsOk = fileExistsA(f.ifnetPath) && fileExistsA(f.encodePath);
@@ -7060,6 +7533,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fGsScanC, "k_gsScanC"},
         {&nr.fGsFill, "k_gsFill"},
         {&nr.fGsGather, "k_gsGather"},
+        {&nr.fGsGatherNhwc, "k_gsGatherNhwc"},
         {&nr.fPackInRaw16, "k_packInRaw16"},
         {&nr.fPackInRaw8, "k_packInRaw8"},
         {&nr.fPackOutRaw16, "k_packOutRaw16"},
@@ -7102,6 +7576,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fLocalCorr, "k_localCorr"},
         {&nr.fAttn2, "k_attn2"},
         {&nr.fFuTail, "k_fuTail"},
+        {&nr.fFuTailNhwc, "k_fuTailNhwc"},
     };
     for (auto& e : fns)
         if (cuModuleGetFunction(e.fn, nr.cuMod, e.nm) != CUDA_SUCCESS)
@@ -8148,7 +8623,7 @@ static void nativeFsrfgRelease(NativeRife& nr);
 // NVIDIA Smooth Motion (fruc): the shipped nvoffruc_bridge.dll,
 // loaded once per process by full path from the folder the handoff named (NvOFFRUC.dll and its
 // cudart64_110.dll are user-installed beside it; the bridge loads NvOFFRUC.dll signature-checked
-// itself). Its state is process-global (up to four FRUC instances), so a
+// itself). Its state is process-global (up to 16 FRUC instances), so a
 // session creates instance 0 at setup, the others at the first pair that needs them, and
 // destroys them all in nativeFree. The bridge runs each FRUC instance in its own CUDA context and brackets
 // every call with cuCtxSynchronize on the caller's context (its SYNC FENCE notes), so the
@@ -8163,14 +8638,14 @@ struct FrucBridge
     // last, feed cur only, 2 = the same pair again; an older bridge lacks it (interpolate then)
     int (*step)(void*, void*, void*, double, int, int*) = nullptr;
     void (*destroy)() = nullptr;
-    // the instance calls: up to 4 FRUC instances in the one module, each
+    // the instance calls: up to 16 FRUC instances in the one module, each
     // with its own context; absent = an older bridge = one instance
     int (*createI)(int, unsigned, unsigned) = nullptr;
     int (*stepI)(int, void*, void*, void*, double, int, int*) = nullptr;
 };
 static FrucBridge g_fruc;
 
-// one worker per extra instance (1..3): the compute thread hands it one step at a time and
+// one worker per extra instance (1..kFrDepth - 1): the compute thread hands it one step at a time and
 // collects the result in tween order. The worker binds the host's device first, so the bridge's
 // entry fence (cuCtxSynchronize on the caller's context) covers the host's packs and unpacks.
 struct FrucWorker
@@ -8187,7 +8662,7 @@ struct FrucWorker
     std::string err;
 };
 // never destroyed: no std::thread destructor runs at process exit (nativeFrucFree joins them)
-static FrucWorker* const g_frW = new FrucWorker[4];
+static FrucWorker* const g_frW = new FrucWorker[kFrDepth];
 
 static void frucWorkerLoop(int i, int dev)
 {
@@ -8286,7 +8761,7 @@ static bool nativeFrucSetup(NativeRife& nr)
     nr.frPairSdr = false;
     nr.frModeLogs = 0;
     nr.frPrev = nr.frLast = nr.frA = nr.frB = -1;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < kFrDepth; i++)
     {
         nr.frFed[i] = -1;
         nr.frFirst[i] = false;
@@ -8296,10 +8771,10 @@ static bool nativeFrucSetup(NativeRife& nr)
     nr.frInst = 1;
     nr.frPlanN = nr.frPlanK = 0;
     // recursive midpoints are the default wherever the bridge has the instance calls, one
-    // instance per tree level, up to 4 on either route; SMV_FRUC_MIDPOINTS=0 keeps the direct-t
+    // instance per tree level, up to kFrDepth on either route; SMV_FRUC_MIDPOINTS=0 keeps the direct-t
     // scheme (parallel instances up to 4 live, 1 offline: offline FRUC is paced by the encoder,
-    // where they measured 0.99x / ~0.94x at x3 / x5 1080p), SMV_FRUC_DEPTH=1..4 the snap depth.
-    // SMV_FRUC_INSTANCES caps the instances on either scheme (1 = one instance); the extra ones
+    // where they measured 0.99x / ~0.94x at x3 / x5 1080p), SMV_FRUC_DEPTH=1..9 the snap depth.
+    // SMV_FRUC_INSTANCES caps the instances on either scheme (1 = one instance, 5 = the tree to x32); the extra ones
     // are created by the first pair that needs them (nativeFrucGrow)
     nr.frMp = false;
     nr.frInstMax = 1;
@@ -8309,10 +8784,10 @@ static bool nativeFrucSetup(NativeRife& nr)
         nr.frMp = !(GetEnvironmentVariableA("SMV_FRUC_MIDPOINTS", ev, sizeof(ev)) > 0 && ev[0] == '0');
         nr.frMpCap = g_offline ? 3 : 2;
         if (GetEnvironmentVariableA("SMV_FRUC_DEPTH", ev, sizeof(ev)) > 0)
-            nr.frMpCap = (std::max)(1, (std::min)(4, atoi(ev)));
-        nr.frInstMax = (g_offline && !nr.frMp) ? 1 : 4;
+            nr.frMpCap = (std::max)(1, (std::min)(kFrDepth, atoi(ev)));
+        nr.frInstMax = nr.frMp ? kFrDepth : g_offline ? 1 : 4;
         if (GetEnvironmentVariableA("SMV_FRUC_INSTANCES", ev, sizeof(ev)) > 0)
-            nr.frInstMax = (std::max)(1, (std::min)(4, atoi(ev)));
+            nr.frInstMax = (std::max)(1, (std::min)(kFrDepth, atoi(ev)));
     }
     nr.frMpL = 0;
     nr.frSerial = 0;
@@ -8321,6 +8796,19 @@ static bool nativeFrucSetup(NativeRife& nr)
         ok = false;
     for (uint64_t& k : nr.frLastKey)
         k = 0;
+    nr.frPipePrev = nr.frLagHave = nr.frLagSdr = nr.frLagStatic = nr.frCurStatic = false;
+    nr.frSpecRun = nr.frRepacked = false;
+    nr.frLagA = nr.frLagB = nr.frKeep = -1;
+    nr.frLagL = 0;
+    nr.frLagSerial = nr.frPipeGroups = 0;
+    for (bool& ok : nr.frLagOk)
+        ok = false;
+    nr.grFrCalls = nr.grFrPreCalls = 0;
+    nr.grPriceSkip = 0;
+    nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = nr.gFrCallMs = nr.gFrStoreMs = nr.gFrBaseMs = 0.0;
+    nr.gFrCallUs.store(0);
+    nr.gFrStoreUs.store(0);
+    nr.gFrBaseUs.store(0);
     if (nr.frMp)
         LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA, feed-once, recursive midpoints (depth cap %d)\n",
             nr.pw, nr.ph, nr.w, nr.h, nr.frMpCap);
@@ -8372,25 +8860,78 @@ static void nativeFrucGrow(NativeRife& nr, int want)
         nr.frInst = i + 1;
     }
     if (nr.frInst > had)
+    {
+        nr.grPriceSkip = 2;
         LOG("native: fruc: %d instances (%d new in %.0f ms)\n", nr.frInst, nr.frInst - had,
             (double)(nowQpc100() - t0) / 10000.0);
+    }
 }
 
-// wait until every worker is idle (a round the caller abandoned, a session's end)
+// wait until every worker is idle (a round the caller abandoned, a session's end); instance 0's worker exists once a
+// pipelined group ran
 static void nativeFrucDrain(NativeRife& nr)
 {
-    for (int i = 1; i < nr.frInst; i++)
+    for (int i = 0; i < nr.frInst; i++)
     {
         FrucWorker& w = g_frW[i];
+        if (i == 0 && !w.th.joinable())
+            continue;
         std::unique_lock<std::mutex> lk(w.m);
         w.cv.wait(lk, [&] { return w.done; });
     }
 }
 
+// a pipelined group's level-1 call (the next pair's midpoint) on instance 0's worker, made by the first such group
+static void nativeFrucSpecStart(NativeRife& nr, void* a, void* b, void* out, int mode)
+{
+    FrucWorker& w = g_frW[0];
+    if (!w.th.joinable())
+    {
+        w.job = w.quit = false;
+        w.done = true;
+        w.th = std::thread(frucWorkerLoop, 0, nr.dev);
+    }
+    std::lock_guard<std::mutex> lk(w.m);
+    w.a = a;
+    w.b = b;
+    w.out = out;
+    w.t = 0.5;
+    w.mode = mode;
+    w.done = false;
+    w.job = true;
+    w.cv.notify_all();
+    nr.frSpecRun = true;
+}
+
+// its result: the node and instance 0's key on success (the bookkeeping nativeFrucNode does for its own calls)
+static bool nativeFrucSpecJoin(NativeRife& nr)
+{
+    if (!nr.frSpecRun)
+        return true;
+    nr.frSpecRun = false;
+    FrucWorker& w = g_frW[0];
+    std::unique_lock<std::mutex> lk(w.m);
+    w.cv.wait(lk, [&] { return w.done; });
+    if (w.rc != 0)
+    {
+        LOG("native: fruc: midpoint 1/2 on instance 0 (pipelined) failed: %s (rc %d)\n", w.err.c_str(), w.rc);
+        nr.die("fruc midpoint failed");
+        return false;
+    }
+    nr.frLastKey[0] = nr.frSerial * kFrGrid + 1; // fed the pair's second frame last
+    nr.frCalls[0]++;
+    nr.frNodeCalls++;
+    if (w.rep)
+        nr.frRepeats++;
+    nr.frNodeOk[kFrGrid / 2] = true;
+    return true;
+}
+
 // the depth of a pair's midpoint tree: the smallest L that holds every t as a node k / 2^L (x2 / x4 /
-// x8 / x16 are exact on both routes); a pair with a t that is no node takes frMpCap (its nearest node
+// .. / x512 are exact on both routes); a pair with a t that is no node takes frMpCap (its nearest node
 // there), offline at least its deepest node's depth. Live never deepens such a pair: a grid phase that
-// lands on a deep node by chance would cost the whole deep tree for the pair's few snapped tweens
+// lands on a deep node by chance would cost the whole deep tree for the pair's few snapped tweens. A node is
+// within 1e-6 (a ladder's k / 2^L is exact in float), so a phase near a deep node by chance is no node
 static int nativeFrucDepth(const NativeRife& nr, const double* ts, uint32_t n)
 {
     int L = 1;
@@ -8398,20 +8939,20 @@ static int nativeFrucDepth(const NativeRife& nr, const double* ts, uint32_t n)
     for (uint32_t i = 0; i < n; i++)
     {
         int d = 1;
-        for (; d <= 4; d++)
+        for (; d <= kFrDepth; d++)
         {
             const double x = std::ldexp(ts[i], d);
-            if (fabs(x - floor(x + 0.5)) < 1e-4)
+            if (fabs(x - floor(x + 0.5)) < 1e-6)
                 break;
         }
-        if (d <= 4)
+        if (d <= kFrDepth)
             L = (std::max)(L, d);
         else
             off = true;
     }
     if (off)
         L = g_offline ? (std::max)(L, nr.frMpCap) : nr.frMpCap;
-    return (std::min)(L, 4);
+    return (std::min)(L, kFrDepth);
 }
 
 // the pair's tweens in the order the caller asks for them (every nativeFrucTween call then takes
@@ -8466,9 +9007,11 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
     if (nr.fsrfg)
         return nativeFsrfgPair(nr, dCur, nTween);
     nativeFrucDrain(nr); // no worker still reads a surface this pair may repack
+    // a pipelined group spares the shown pair's first frame (frKeep) where the others spare the last fed one
     int n = 0;
-    while (n == nr.frPrev || n == nr.frLast)
+    while (n == nr.frPrev || n == (nr.frKeep >= 0 ? nr.frKeep : nr.frLast))
         n++;
+    nr.frRepacked = false;
     // HDR planes: the new frame's range (one flag read back); the pair takes the SDR view only when both frames stay
     // inside the SDR range. A previous frame's surface in the other encoding is packed again from its planes (dX)
     // and every instance primes it again (its node key would still match)
@@ -8498,6 +9041,7 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
     {
         if (!nativeFrucPack(nr, nativeXPrev(nr), nr.frPrev, sdr))
             return false;
+        nr.frRepacked = true;
         for (uint64_t& k : nr.frLastKey)
             k = 0;
     }
@@ -8565,26 +9109,43 @@ static void nativeFrucFedOk(NativeRife& nr, int i)
     nr.frCalls[i]++;
 }
 
-// recursive midpoints: the key of node k / 2^L of this pair (k = 0 / 2^L = the pair's first /
+// a pair's midpoint tree: this group's pair, or the previous one a pipelined group shows (frLag*)
+struct FrTree
+{
+    uint64_t serial; // its second frame's serial
+    int a, b;        // its frames' surfaces
+    uint8_t** node;  // [kFrGrid]
+    bool* ok;        // [kFrGrid]
+};
+static FrTree nativeFrucCur(NativeRife& nr)
+{
+    return {nr.frSerial, nr.frA, nr.frB, nr.dFrNode, nr.frNodeOk};
+}
+static FrTree nativeFrucLag(NativeRife& nr)
+{
+    return {nr.frLagSerial, nr.frLagA, nr.frLagB, nr.dFrLagNode, nr.frLagOk};
+}
+
+// recursive midpoints: the key of node k / 2^L of a pair (k = 0 / 2^L = the pair's first /
 // second frame): a real frame = its serial, an interior node = the pair's first serial and its
-// position on the 16-grid; an instance fed the left parent of a node last feeds only the right one
-static uint64_t nativeFrucKey(const NativeRife& nr, int k, int L)
+// position on the kFrGrid grid; an instance fed the left parent of a node last feeds only the right one
+static uint64_t nativeFrucKey(const FrTree& tr, int k, int L)
 {
     while (L > 0 && !(k & 1))
     {
         k >>= 1;
         L--;
     }
-    const uint64_t a = nr.frSerial - 1;
+    const uint64_t a = tr.serial - 1;
     if (L == 0)
-        return (k ? nr.frSerial : a) * 16 + 1;
-    return a * 16 + ((uint64_t)k << (4 - L)) + 1;
+        return (k ? tr.serial : a) * kFrGrid + 1;
+    return a * kFrGrid + ((uint64_t)k << (kFrDepth - L)) + 1;
 }
 
-// node k / 2^L of this pair's midpoint tree, once per pair: FRUC at t = 0.5 between the node's two
+// node k / 2^L of a pair's midpoint tree, once per pair: FRUC at t = 0.5 between the node's two
 // parents (computed first) on instance L - 1, mode 1 when that instance was fed the left parent
 // last, else mode 0 (prime the left parent, feed the right one)
-static uint8_t* nativeFrucNode(NativeRife& nr, int k, int L)
+static uint8_t* nativeFrucNode(NativeRife& nr, const FrTree& tr, int k, int L)
 {
     while (L > 0 && !(k & 1))
     {
@@ -8592,50 +9153,53 @@ static uint8_t* nativeFrucNode(NativeRife& nr, int k, int L)
         L--;
     }
     if (L <= 0)
-        return nr.dFrSurf[k ? nr.frB : nr.frA];
-    const int p = k << (4 - L);
-    if (nr.frNodeOk[p])
-        return nr.dFrNode[p];
-    uint8_t* left = nativeFrucNode(nr, k - 1, L);
-    uint8_t* right = left ? nativeFrucNode(nr, k + 1, L) : nullptr;
+        return nr.dFrSurf[k ? tr.b : tr.a];
+    const int p = k << (kFrDepth - L);
+    if (tr.ok[p])
+        return tr.node[p];
+    uint8_t* left = nativeFrucNode(nr, tr, k - 1, L);
+    uint8_t* right = left ? nativeFrucNode(nr, tr, k + 1, L) : nullptr;
     if (!right)
         return nullptr;
-    if (!nr.dFrNode[p] && cudaMalloc((void**)&nr.dFrNode[p], (size_t)nr.pw * nr.ph * 4) != cudaSuccess)
+    if (!tr.node[p] && cudaMalloc((void**)&tr.node[p], (size_t)nr.pw * nr.ph * 4) != cudaSuccess)
     {
-        nr.dFrNode[p] = nullptr;
+        tr.node[p] = nullptr;
         nr.die("fruc midpoint buffer alloc failed");
         return nullptr;
     }
     const int i = L - 1;
-    const int mode = nr.frLastKey[i] == nativeFrucKey(nr, k - 1, L) ? 1 : 0;
+    const int mode = nr.frLastKey[i] == nativeFrucKey(tr, k - 1, L) ? 1 : 0;
     if (mode == 0 && nr.frCalls[i] > 0)
         nr.frPrimed++;
     int rep = 0;
-    const int rc = g_fruc.stepI(i, left, right, nr.dFrNode[p], 0.5, mode, &rep);
+    const int64_t c0 = nowQpc100();
+    const int rc = g_fruc.stepI(i, left, right, tr.node[p], 0.5, mode, &rep);
+    nr.grFrCalls++;
+    nr.grFrCallMs += (double)(nowQpc100() - c0) / 10000.0;
     if (rc != 0)
     {
         LOG("native: fruc: midpoint %d/%d on instance %d failed: %s (rc %d)\n", k, 1 << L, i, g_fruc.lastError(), rc);
         nr.die("fruc midpoint failed");
         return nullptr;
     }
-    nr.frLastKey[i] = nativeFrucKey(nr, k + 1, L);
+    nr.frLastKey[i] = nativeFrucKey(tr, k + 1, L);
     nr.frCalls[i]++;
     nr.frNodeCalls++;
     if (rep)
         nr.frRepeats++;
-    nr.frNodeOk[p] = true;
-    return nr.dFrNode[p];
+    tr.ok[p] = true;
+    return tr.node[p];
 }
 
 // a FRUC output (true BGRA8) into dFrOut (3, ph, pw) as (R, G, B) planes; an SDR pair's tween back to the HDR
 // codes (k_unpackBgraSdr)
-static bool nativeFrucUnpack(NativeRife& nr, uint8_t* src)
+static bool nativeFrucUnpack(NativeRife& nr, uint8_t* src, bool sdr)
 {
     void* a[] = {&src, &nr.pw, &nr.ph, &nr.dFrOut};
     void* b[] = {&src, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &nr.dFrOut};
-    const CUfunction f = nr.frPairSdr ? nr.fUnpackBgraSdr : nr.fUnpackBgraRgb;
-    if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream,
-                       nr.frPairSdr ? b : a, nullptr) != CUDA_SUCCESS)
+    const CUfunction f = sdr ? nr.fUnpackBgraSdr : nr.fUnpackBgraRgb;
+    if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, sdr ? b : a,
+                       nullptr) != CUDA_SUCCESS)
     {
         nr.die("unpackBgra (fruc) launch failed");
         return false;
@@ -8662,21 +9226,22 @@ static bool nativeFrucTween(NativeRife& nr, double t)
             nativeFrucGrow(nr, (std::min)(nr.frMpL, nr.frInstMax));
         if (nr.frInst < nr.frMpL)
             nr.frMpL = nr.frInst;
+        const FrTree tr = nativeFrucCur(nr);
         if (!nr.frMpBuilt)
         {
             for (int l = 1; l <= nr.frMpL; l++)
                 for (int k = 1; k < (1 << l); k += 2)
-                    if (!nativeFrucNode(nr, k, l))
+                    if (!nativeFrucNode(nr, tr, k, l))
                         return false;
             nr.frMpBuilt = true;
         }
         const int den = 1 << nr.frMpL;
         const int k = (std::max)(1, (std::min)(den - 1, (int)floor(t * den + 0.5)));
-        uint8_t* node = nativeFrucNode(nr, k, nr.frMpL);
+        uint8_t* node = nativeFrucNode(nr, tr, k, nr.frMpL);
         if (!node)
             return false;
         nr.frTweens++;
-        if (!nativeFrucUnpack(nr, node))
+        if (!nativeFrucUnpack(nr, node, nr.frPairSdr))
             return false;
         return true;
     }
@@ -8756,7 +9321,80 @@ static bool nativeFrucTween(NativeRife& nr, double t)
     if (rep)
         nr.frRepeats++;
     nr.frTweens++;
-    return nativeFrucUnpack(nr, outB);
+    return nativeFrucUnpack(nr, outB, nr.frPairSdr);
+}
+
+// a pipelined group's pair step: the pair the last group made current becomes the shown one (its level-1 midpoint,
+// made by instance 0's worker, is among its nodes), then the new frame is packed, sparing the shown pair's first
+// frame. The shown pair is held (its second frame in every slot) when it was identical, when the last group was not
+// pipelined (it showed that pair itself: the route's entry costs one source period's hold) or when its second frame
+// was packed again in the other encoding
+static bool nativeFrucPipeAdvance(NativeRife& nr, const float* dCur, bool curStatic)
+{
+    std::swap(nr.dFrNode, nr.dFrLagNode);
+    std::swap(nr.frNodeOk, nr.frLagOk);
+    nr.frLagSerial = nr.frSerial;
+    nr.frLagA = nr.frA;
+    nr.frLagB = nr.frB;
+    nr.frLagSdr = nr.frPairSdr;
+    nr.frLagStatic = nr.frCurStatic;
+    nr.frLagHave = nr.frPipePrev && nr.frLagA >= 0 && nr.frLagOk[kFrGrid / 2];
+    nr.frLagL = 0;
+    nr.frKeep = nr.frLagA;
+    const bool ok = nativeFrucPair(nr, dCur, curStatic ? 0 : 1);
+    nr.frKeep = -1;
+    if (nr.frRepacked)
+        nr.frLagHave = false;
+    nr.frCurStatic = curStatic;
+    nr.frPipePrev = true;
+    nr.frPipeGroups++;
+    return ok;
+}
+
+// instance 0's level-1 call of the new pair on its worker (the next group shows the pair), unless the pair is identical
+// or has no first frame yet
+static bool nativeFrucPipeSpec(NativeRife& nr)
+{
+    if (nr.frCurStatic || nr.frA < 0)
+        return true;
+    if (!nr.dFrNode[kFrGrid / 2] &&
+        cudaMalloc((void**)&nr.dFrNode[kFrGrid / 2], (size_t)nr.pw * nr.ph * 4) != cudaSuccess)
+    {
+        nr.dFrNode[kFrGrid / 2] = nullptr;
+        nr.die("fruc midpoint buffer alloc failed");
+        return false;
+    }
+    const int mode = nr.frLastKey[0] == nativeFrucKey(nativeFrucCur(nr), 0, 1) ? 1 : 0;
+    if (mode == 0 && nr.frCalls[0] > 0)
+        nr.frPrimed++;
+    nativeFrucSpecStart(nr, nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrNode[kFrGrid / 2], mode);
+    return true;
+}
+
+// a pipelined group's tween: the shown pair's levels 2.. on instances 1.. (level by level, as nativeFrucTween) beside
+// instance 0's level-1 call of the new pair, that call joined before the slots' stores; then the nearest node
+static bool nativeFrucLagTween(NativeRife& nr, double t)
+{
+    const FrTree tr = nativeFrucLag(nr);
+    if (!nr.frLagL)
+    {
+        nr.frLagL = (std::min)(nativeFrucDepth(nr, &t, 1), nr.frInst);
+        const int64_t c0 = nowQpc100();
+        for (int l = 2; l <= nr.frLagL; l++)
+            for (int k = 1; k < (1 << l); k += 2)
+                if (!nativeFrucNode(nr, tr, k, l))
+                    return false;
+        if (!nativeFrucSpecJoin(nr))
+            return false;
+        nr.grFrChainMs = (double)(nowQpc100() - c0) / 10000.0;
+    }
+    const int den = 1 << nr.frLagL;
+    const int k = (std::max)(1, (std::min)(den - 1, (int)floor(t * den + 0.5)));
+    uint8_t* node = nativeFrucNode(nr, tr, k, nr.frLagL);
+    if (!node)
+        return false;
+    nr.frTweens++;
+    return nativeFrucUnpack(nr, node, nr.frLagSdr);
 }
 
 static void nativeFrucFree(NativeRife& nr)
@@ -8764,7 +9402,7 @@ static void nativeFrucFree(NativeRife& nr)
     if (nr.fsrfg)
         nativeFsrfgRelease(nr); // the bridge's instances and the Optical Flow session; the frames below are shared
     nativeFrucDrain(nr);
-    for (int i = 1; i < 4; i++)
+    for (int i = 0; i < kFrDepth; i++)
     {
         FrucWorker& w = g_frW[i];
         if (!w.th.joinable())
@@ -8778,16 +9416,17 @@ static void nativeFrucFree(NativeRife& nr)
     }
     if (nr.frCreated)
     {
-        char mp[64] = "";
+        char mp[96] = "";
         if (nr.frMp)
-            snprintf(mp, sizeof(mp), ", %llu midpoint calls", (unsigned long long)nr.frNodeCalls);
+            snprintf(mp, sizeof(mp), ", %llu midpoint calls%s", (unsigned long long)nr.frNodeCalls,
+                     nr.frPipeGroups ? (", " + std::to_string(nr.frPipeGroups) + " groups pipelined").c_str() : "");
         LOG("native: fruc session: %llu tweens, %llu primed pairs, %llu frame repeats%s, %d instance%s\n",
             (unsigned long long)nr.frTweens, (unsigned long long)nr.frPrimed, (unsigned long long)nr.frRepeats, mp,
             nr.frInst, nr.frInst > 1 ? "s" : "");
         g_fruc.destroy(); // every instance
         nr.frCreated = false;
     }
-    for (int i = 1; i < 4; i++)
+    for (int i = 1; i < kFrDepth; i++)
         if (nr.dFrOutBI[i])
         {
             cudaFree(nr.dFrOutBI[i]);
@@ -8808,8 +9447,17 @@ static void nativeFrucFree(NativeRife& nr)
             cudaFree(s);
             s = nullptr;
         }
+    for (auto& s : nr.dFrLagNode)
+        if (s)
+        {
+            cudaFree(s);
+            s = nullptr;
+        }
     for (bool& ok : nr.frNodeOk)
         ok = false;
+    for (bool& ok : nr.frLagOk)
+        ok = false;
+    nr.frLagHave = nr.frPipePrev = false;
     if (nr.dFrOutB)
     {
         cudaFree(nr.dFrOutB);
@@ -8835,7 +9483,7 @@ static void nativeFrucFree(NativeRife& nr)
 
 // ---- AMD FSR frame generation (fsrfg) ----------------------------------------------------------
 // smv_fsrfg_bridge.dll's C API (source: engine\fsrfg\build_src), loaded once per process by full path from the folder
-// the handoff named; up to four instances, each its own FSR context on vkd3d-proton's device for the CUDA device's
+// the handoff named; up to 16 instances, each its own FSR context on vkd3d-proton's device for the CUDA device's
 // adapter
 struct FsrfgShared
 {
@@ -9260,7 +9908,7 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
 // the extra instances up to `want` (instance 0 is the session's own); a failed create keeps the ones made so far
 static void nativeFsrfgGrow(NativeRife& nr, int want)
 {
-    want = (std::min)(want, 4);
+    want = (std::min)(want, kFrDepth);
     const int64_t t0 = nowQpc100();
     const int had = nr.frInst;
     for (int i = nr.frInst; i < want; i++)
@@ -9274,8 +9922,11 @@ static void nativeFsrfgGrow(NativeRife& nr, int want)
         nr.frInst = i + 1;
     }
     if (nr.frInst > had)
+    {
+        nr.grPriceSkip = 2;
         LOG("native: fsrfg: %d instances (%d new in %.0f ms)\n", nr.frInst, nr.frInst - had,
             (double)(nowQpc100() - t0) / 10000.0);
+    }
 }
 
 // node k / 2^L of this pair's midpoint tree (FRUC's nativeFrucNode): FSR on instance L - 1 fed the right parent
@@ -9292,7 +9943,7 @@ static uint8_t* nativeFsrfgNode(NativeRife& nr, int k, int L, int ring = -1)
     }
     if (L <= 0)
         return nr.dFrSurf[k ? nr.frB : nr.frA];
-    const int p = k << (4 - L);
+    const int p = k << (kFrDepth - L);
     if (nr.frNodeOk[p])
         return nr.dFrNode[p];
     uint8_t* left = nativeFsrfgNode(nr, k - 1, L);
@@ -9306,7 +9957,7 @@ static uint8_t* nativeFsrfgNode(NativeRife& nr, int k, int L, int ring = -1)
         return nullptr;
     }
     const int i = L - 1;
-    const uint64_t lk = nativeFrucKey(nr, k - 1, L);
+    const uint64_t lk = nativeFrucKey(nativeFrucCur(nr), k - 1, L);
     if (nr.frLastKey[i] != lk)
     {
         if (!nativeFsrfgFeed(nr, i, left, nullptr, nr.frLastKey[i] == 0, nullptr))
@@ -9315,9 +9966,12 @@ static uint8_t* nativeFsrfgNode(NativeRife& nr, int k, int L, int ring = -1)
             nr.frPrimed++;
         nr.frLastKey[i] = lk;
     }
+    const int64_t c0 = nowQpc100();
     if (!nativeFsrfgFeed(nr, i, right, left, false, nr.dFrNode[p], ring))
         return nullptr;
-    nr.frLastKey[i] = nativeFrucKey(nr, k + 1, L);
+    nr.grFrCalls++;
+    nr.grFrCallMs += (double)(nowQpc100() - c0) / 10000.0;
+    nr.frLastKey[i] = nativeFrucKey(nativeFrucCur(nr), k + 1, L);
     nr.frNodeCalls++;
     nr.frNodeOk[p] = true;
     return nr.dFrNode[p];
@@ -9412,8 +10066,8 @@ static bool nativeFsrfgAheadVec(NativeRife& nr, int s, const uint8_t* prev, cons
 static bool nativeFsrfgLevel(NativeRife& nr, int l)
 {
     const int n = 1 << (l - 1);
-    uint8_t* lf[8] = {};
-    uint8_t* rt[8] = {};
+    uint8_t* lf[kFrGrid / 2] = {};
+    uint8_t* rt[kFrGrid / 2] = {};
     for (int j = 0; j < n; j++)
         if (!(lf[j] = nativeFsrfgNode(nr, 2 * j, l)) || !(rt[j] = nativeFsrfgNode(nr, 2 * j + 2, l)))
             return false;
@@ -9510,7 +10164,13 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     nr.frModeLogs = 0;
     nr.frPrev = nr.frLast = nr.frA = nr.frB = -1;
     nr.frInst = 1;
-    nr.frInstMax = 4;
+    nr.frInstMax = kFrDepth;
+    {
+        // FRUC's lever: SMV_FRUC_INSTANCES caps the instances (5 = the tree to x32)
+        char ev[8] = {};
+        if (GetEnvironmentVariableA("SMV_FRUC_INSTANCES", ev, sizeof(ev)) > 0)
+            nr.frInstMax = (std::max)(1, (std::min)(kFrDepth, atoi(ev)));
+    }
     nr.frPlanN = nr.frPlanK = 0;
     nr.frMp = true;
     nr.frMpCap = g_offline ? 3 : 2; // FRUC's snap depths: offline x8's nodes, live x4's
@@ -9587,7 +10247,7 @@ static bool nativeFsrfgPair(NativeRife& nr, const float* dCur, uint32_t nTween)
         // the stream's first frame: instance 0 starts there with a reset
         if (!nativeFsrfgFeed(nr, 0, nr.dFrSurf[n], nullptr, true, nullptr))
             return false;
-        nr.frLastKey[0] = nativeFrucKey(nr, 1, 0);
+        nr.frLastKey[0] = nativeFrucKey(nativeFrucCur(nr), 1, 0);
         return true;
     }
     // every real frame goes to instance 0 in order, tweens or not (a gap would cost a re-prime): that call is the
@@ -10513,6 +11173,26 @@ static bool nativeGmfssSetup(NativeRife& nr)
         return false;
     if (ch != nr.gmFuseHalf || dh != nr.gmFuseHalf)
         return bad("the fusionnet feature inputs have mixed dtypes");
+    // the splats' layouts: feat_ext's f1 / f2 / f3 and fusionnet's b / c / d all linear (an engine built without
+    // lkBuild's channels-last request) or all channels-last fp16 (HWC8 / HWC16: plain NHWC at these channel counts, every
+    // one a multiple of 16), so the feature splats read and write [n][C] (k_gsGatherNhwc)
+    {
+        int nl = 0, nc = 0;
+        auto layout = [&](int e, const char* nm) {
+            const nvinfer1::TensorFormat f = nr.engGm[e]->getTensorFormat(nm);
+            nl += f == nvinfer1::TensorFormat::kLINEAR;
+            nc += (f == nvinfer1::TensorFormat::kHWC8 || f == nvinfer1::TensorFormat::kHWC16) &&
+                  nr.engGm[e]->getTensorDataType(nm) == nvinfer1::DataType::kHALF;
+        };
+        for (const char* nm : {"f1", "f2", "f3"})
+            layout(0, nm);
+        for (const char* nm : {"b", "c", "d"})
+            layout(4, nm);
+        const bool c16 = nr.gmC[0] % 16 == 0 && nr.gmC[1] % 16 == 0 && nr.gmC[2] % 16 == 0;
+        if (nl != 6 && (nc != 6 || !c16))
+            return bad("the feature levels and the fusionnet inputs are not all linear or all channels-last fp16");
+        nr.gmFeatHwc = nc == 6;
+    }
     // fusionnet's tail: the full graph writes the frame (`out` 3 x ph x pw); the cut graph (trt_runtime's
     // fusion_tail_cut) stops before its pixel shuffle (`out` = the 64 -> 256 conv at the half, fp16) and hands
     // conv_last's weight and bias out as w_last / b_last, and k_fuTail does the shuffle + conv_last (fp32 sums, the
@@ -10534,9 +11214,27 @@ static bool nativeGmfssSetup(NativeRife& nr)
             return true;
         };
         const int dOut[4] = {1, 256, hh, hw}, dW[4] = {3, 64, 3, 3}, dB[1] = {3};
-        if (nr.engGm[4]->getNbIOTensors() != 7 || !out16("out", 4, dOut) || !out16("w_last", 4, dW) ||
-            !out16("b_last", 1, dB))
+        // trt_runtime's fusion_input_lrelu: b / c / d without their LeakyRelus, the slopes as lr_bcd (fp32 [3])
+        const int nio = nr.engGm[4]->getNbIOTensors();
+        const bool lr = nio == 8;
+        if (lr)
+        {
+            const nvinfer1::Dims s = nr.engGm[4]->getTensorShape("lr_bcd");
+            if (s.nbDims != 1 || s.d[0] != 3 ||
+                nr.engGm[4]->getTensorIOMode("lr_bcd") != nvinfer1::TensorIOMode::kOUTPUT ||
+                nr.engGm[4]->getTensorDataType("lr_bcd") != nvinfer1::DataType::kFLOAT)
+                return bad("the cut fusionnet's eighth tensor is not lr_bcd, 3 fp32");
+        }
+        if ((nio != 7 && !lr) || !out16("out", 4, dOut) || !out16("w_last", 4, dW) || !out16("b_last", 1, dB))
             return bad("the cut fusionnet's outputs are not out 1x256 at the half, w_last 3x64x3x3 and b_last 3, fp16");
+        // out's layout: linear [256][hh][hw] (an engine built without lkBuild's channels-last request) or HWC8 /
+        // HWC16, both plain NHWC [hh][hw][256] at 256 channels; SMV_FU_HWC=fail = an unknown one (the refusal's trigger)
+        const nvinfer1::TensorFormat of =
+            lkEnv("SMV_FU_HWC") == "fail" ? nvinfer1::TensorFormat::kCHW2 : nr.engGm[4]->getTensorFormat("out");
+        if (of != nvinfer1::TensorFormat::kLINEAR && of != nvinfer1::TensorFormat::kHWC8 &&
+            of != nvinfer1::TensorFormat::kHWC16)
+            return bad("the cut fusionnet's out is in a layout the fusion tail cannot read");
+        nr.gmTailHwc = of != nvinfer1::TensorFormat::kLINEAR;
         nr.gmOutHalf = false;
     }
     else if (nr.engGm[4]->getNbIOTensors() != 5)
@@ -10604,9 +11302,23 @@ static bool nativeGmfssSetup(NativeRife& nr)
         c->setTensorAddress("out", nr.dGmAcc);
         c->setTensorAddress("w_last", nr.dGmWl);
         c->setTensorAddress("b_last", nr.dGmBl);
+        const bool lr = nr.engGm[4]->getNbIOTensors() == 8;
+        if (lr)
+        {
+            NCHK(cudaMalloc(&nr.dGmLr, 3 * sizeof(float)), "alloc gmfss fusion input slopes");
+            NCHK(cudaMemset(nr.dGmLr, 0, 3 * sizeof(float)), "clear gmfss fusion input slopes");
+            c->setTensorAddress("lr_bcd", nr.dGmLr);
+        }
         if (wB != 3 * 64 * 9 * 2 || bB != 3 * 2 || !c->enqueueV3(nr.stream))
             return bad("the cut fusionnet's probe run did not start");
         NCHK(cudaStreamSynchronize(nr.stream), "gmfss cut fusionnet probe run");
+        if (lr)
+        {
+            NCHK(cudaMemcpy(nr.gmLr, nr.dGmLr, 3 * sizeof(float), cudaMemcpyDeviceToHost), "read gmfss fusion slopes");
+            for (float a : nr.gmLr)
+                if (!(a > 0.0f && a <= 1.0f))
+                    return bad("the cut fusionnet's lr_bcd slopes are not in (0, 1]");
+        }
         unsigned short wb[3 * 64 * 9 + 3] = {};
         NCHK(cudaMemcpy(wb, nr.dGmWl, wB, cudaMemcpyDeviceToHost), "read gmfss conv_last weight");
         NCHK(cudaMemcpy(wb + 3 * 64 * 9, nr.dGmBl, bB, cudaMemcpyDeviceToHost), "read gmfss conv_last bias");
@@ -10648,10 +11360,22 @@ static bool nativeGmfssSetup(NativeRife& nr)
         nr.gmFuseHalf ? "fp16" : "fp32", nr.gmOutHalf ? "fp16" : "fp32", accPlanes,
         ((double)freeB - (double)freeA) / 1048576.0);
     LOG("native: gmfss chain: fusion tail %s\n",
-        nr.gmTail ? "on the host (k_fuTail: pixel shuffle + conv_last, fp32)" : "in the engine");
+        !nr.gmTail     ? "in the engine"
+        : nr.gmTailHwc ? "on the host (k_fuTailNhwc: pixel shuffle + conv_last, fp32; out channels-last)"
+                       : "on the host (k_fuTail: pixel shuffle + conv_last, fp32)");
+    LOG("native: gmfss chain: feature splats %s\n",
+        nr.gmFeatHwc ? "channels-last (k_gsGatherNhwc: feat_ext's levels and fusionnet's b / c / d NHWC)" : "planar");
+    if (nr.dGmLr)
+        LOG("native: gmfss chain: fusionnet's input LeakyRelu in the feature splats' stores (slopes %.9g / %.9g / "
+            "%.9g)\n",
+            nr.gmLr[0], nr.gmLr[1], nr.gmLr[2]);
+    else
+        LOG("native: gmfss chain: fusionnet's input LeakyRelu in the engine\n");
     LOG("native: gmfss chain: gmflow split, its local correlation in one kernel (%dx%d, %d samples a pixel)\n", nr.gmW,
         nr.gmH, nr.gmK);
     LOG("native: gmfss chain: the global matching by k_attn2 (%d tokens a frame)\n", nr.gmN8);
+    LOG("native: gmfss chain: gmflow A in the %s form\n",
+        lkGmEdgeOf(nr.gmPath[kGmFlowSlot]).empty() ? "edge" : "masked");
     nr.gmProf = GetEnvironmentVariableW(L"SMV_LIVE_GMFSS_PROF", nullptr, 0) != 0;
     if (nr.gmProf)
         for (auto& e : nr.gmEv)
@@ -11497,6 +12221,7 @@ static void nativeFree(NativeRife& nr)
                     nr.dGmOut,
                     nr.dGmWl,
                     nr.dGmBl,
+                    nr.dGmLr,
                     (void*)nr.dGmF,
                     (void*)nr.dGmEnc,
                     (void*)nr.dGmHalfM,
@@ -11557,8 +12282,9 @@ static void nativeFree(NativeRife& nr)
     nr.dGmFd = nullptr;
     nr.dGmT = nullptr;
     nr.dGmOut = nullptr;
-    nr.dGmWl = nr.dGmBl = nullptr;
-    nr.gmTail = false;
+    nr.dGmWl = nr.dGmBl = nr.dGmLr = nullptr;
+    nr.gmLr[0] = nr.gmLr[1] = nr.gmLr[2] = -1.0f;
+    nr.gmTail = nr.gmTailHwc = nr.gmFeatHwc = false;
     nr.dGmF = nullptr;
     nr.dGmEnc = nullptr;
     nr.dGmHalfM = nullptr;
@@ -11629,6 +12355,8 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     // the backbone maps in batch slot 1 belong to this call's previous frame only when the last call was a pair
     const bool mapsPrev = nr.gmMapsNext;
     nr.gmMapsNext = false;
+    if (g_gmUpg.armed.load(std::memory_order_relaxed) && g_gmUpg.armed.exchange(false))
+        lkGmUpgradeStart(nr.gmPath[kGmFlowSlot]);
     if (profPair)
         cudaEventRecord(nr.gmEv[0], st);
     // feat_ext of the NEW frame, into the set the NEXT pair will read as feat0. HDR planes (the kernels' comment): a
@@ -11885,15 +12613,20 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     // the engines' metric keeps their dtype, a pyramid level is always fp32 (k_pyr's output)
     const int mHalf = nr.gmMetricHalf ? 1 : 0, fHalf = nr.gmFeatHalf ? 1 : 0;
     float sA = t, sB = 1.0f - t;
-    // one softsplat into the fusionnet plane (a channel concat = adjacent planes, so no copy follows). Gather form
-    // (nr.gmGather): list set ls built for (flow, metric, s) when `fresh` (k_gsCount, the three scans, k_gsFill), then
-    // k_gsGather splats `in` through it; a level's image and feature splats share their direction's set. Scatter
-    // form: zero the accumulator, scatter every source pixel, normalize.
+    // one softsplat into channels co .. co + C of the fusionnet input `dst` (dc channels; a channel concat = this splat's
+    // own channel range, so no copy follows); hwc = `in` and `dst` channels-last fp16 (nr.gmFeatHwc), else planar.
+    // Gather form (nr.gmGather): list set ls built for (flow, metric, s) when `fresh` (k_gsCount, the three scans,
+    // k_gsFill), then k_gsGather / k_gsGatherNhwc splats `in` through it; a level's image and feature splats share their
+    // direction's set. Scatter form: zero the accumulator, scatter every source pixel, normalize.
     auto splat = [&](int ls, bool fresh, void* in, int inHalf, int C, float* flow, void* metric, int metricHalf,
-                     float s, int w, int h, void* dst, int dstHalf) -> bool {
-        int cc = C, ww = w, hh2 = h, ih = inHalf, mh = metricHalf, dh = dstHalf;
+                     float s, int w, int h, void* dst, int dstHalf, int dc, int co, bool hwc, float lr) -> bool {
+        int cc = C, ww = w, hh2 = h, ih = inHalf, mh = metricHalf, dh = dstHalf, dcc = dc, dco = co;
+        float slope = lr; // the target's LeakyRelu (fusionnet's b / c / d without theirs), -1 = none
         const int n = w * h;
         int ni = n;
+        // planar: channel c of cell i at c * n + i of the range's start; channels-last: c + i * dc after co
+        void* dstAt = (uint8_t*)dst + (size_t)co * (hwc ? 1 : (size_t)n) * (dstHalf ? 2 : 4);
+        int isc = hwc ? 1 : n, isp = hwc ? C : 1, dsc = hwc ? 1 : n, dsp = hwc ? dc : 1;
         if (nr.gmGather)
         {
             int nb = (n + 2047) / 2048;
@@ -11904,9 +12637,22 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
             void* k3[] = {(void*)&nr.dGsOff[ls], (void*)&nr.dGsBlk[ls], &ni, (void*)&nr.dGsCnt[ls]};
             void* k4[] = {(void*)&flow, &s, &ww, &hh2, (void*)&nr.dGsCnt[ls], (void*)&nr.dGsList[ls]};
             void* k5[] = {
-                &in,  &ih, &cc, (void*)&nr.dGsSrc[ls], &ww, &hh2, (void*)&nr.dGsOff[ls], (void*)&nr.dGsList[ls],
-                &dst, &dh};
+                &in,    &ih, &cc,   (void*)&nr.dGsSrc[ls], &ww, &hh2, (void*)&nr.dGsOff[ls], (void*)&nr.dGsList[ls],
+                &dstAt, &dh, &slope};
+            void* k5n[] = {&in,
+                           &cc,
+                           (void*)&nr.dGsSrc[ls],
+                           &ww,
+                           &hh2,
+                           (void*)&nr.dGsOff[ls],
+                           (void*)&nr.dGsList[ls],
+                           &dst,
+                           &dcc,
+                           &dco,
+                           &slope};
             const CUstream cs = (CUstream)st;
+            // k_gsGatherNhwc: a cell's C / 8 channel groups on consecutive lanes, 256 / (C / 8) cells a block
+            const unsigned ng = (unsigned)C / 8, nc = 256 / ng;
             const bool built =
                 !fresh ||
                 (cudaMemsetAsync(nr.dGsCnt[ls], 0, (size_t)n * sizeof(int), st) == cudaSuccess &&
@@ -11916,8 +12662,10 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
                  cuLaunchKernel(nr.fGsScanC, (unsigned)(n + 255) / 256, 1, 1, 256, 1, 1, 0, cs, k3, nullptr) ==
                      CUDA_SUCCESS &&
                  cuLaunchKernel(nr.fGsFill, gx, gy, 1, 32, 8, 1, 0, cs, k4, nullptr) == CUDA_SUCCESS);
-            if (!built || cuLaunchKernel(nr.fGsGather, (unsigned)(n + 255) / 256, (unsigned)(C + 7) / 8, 1, 256, 1, 1,
-                                         0, cs, k5, nullptr) != CUDA_SUCCESS)
+            if (!built || (hwc ? cuLaunchKernel(nr.fGsGatherNhwc, ((unsigned)n + nc - 1) / nc, 1, 1, ng, nc, 1, 0, cs,
+                                                k5n, nullptr)
+                               : cuLaunchKernel(nr.fGsGather, (unsigned)(n + 255) / 256, (unsigned)(C + 7) / 8, 1, 256,
+                                                1, 1, 0, cs, k5, nullptr)) != CUDA_SUCCESS)
             {
                 nr.die("gmfss gather splat launch failed");
                 return false;
@@ -11929,7 +12677,7 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
             nr.die("gmfss accumulator clear failed");
             return false;
         }
-        void* a[] = {&in, &ih, &cc, (void*)&flow, &metric, &mh, &s, &ww, &hh2, (void*)&nr.dGmAcc};
+        void* a[] = {&in, &ih, &cc, &isc, &isp, (void*)&flow, &metric, &mh, &s, &ww, &hh2, (void*)&nr.dGmAcc};
         // 32 x 8: one warp = 32 consecutive x of a row, which k_splatSoft's neighbour combine
         // pairs (any shape of <= 256 threads, a multiple of 32, gives the same accumulators)
         if (cuLaunchKernel(nr.fSplatSoft, (w + 31) / 32, (h + 7) / 8, 1, 32, 8, 1, 0, (CUstream)st, a, nullptr) !=
@@ -11938,7 +12686,7 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
             nr.die("gmfss splatSoft launch failed");
             return false;
         }
-        void* b[] = {(void*)&nr.dGmAcc, &cc, &ni, (void*)&dst, &dh};
+        void* b[] = {(void*)&nr.dGmAcc, &cc, &ni, &dstAt, &dh, &dsc, &dsp, &slope};
         if (cuLaunchKernel(nr.fSplatNorm, (ni + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, b, nullptr) !=
             CUDA_SUCCESS)
         {
@@ -11963,9 +12711,10 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         cudaEventRecord(nr.gmEv[6], st);
     }
     // I1t and I2t into the fusionnet's a planes 0..2 and 6..8 (the ifnet fills 3..5 below)
-    if (!splat(0, true, nr.dGmHalf, 0, 3, flow0, met0, mHalf, sA, nr.hw, nr.hh, nr.dGmFa, 0))
+    if (!splat(0, true, nr.dGmHalf, 0, 3, flow0, met0, mHalf, sA, nr.hw, nr.hh, nr.dGmFa, 0, 9, 0, false, -1.0f))
         return false;
-    if (!splat(1, true, nr.dGmHalf + 3 * hp, 0, 3, flow1, met1, mHalf, sB, nr.hw, nr.hh, nr.dGmFa + 6 * hp, 0))
+    if (!splat(1, true, nr.dGmHalf + 3 * hp, 0, 3, flow1, met1, mHalf, sB, nr.hw, nr.hh, nr.dGmFa, 0, 9, 6, false,
+               -1.0f))
         return false;
     if (prof)
         cudaEventRecord(nr.gmEv[7], st);
@@ -11990,27 +12739,28 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         cudaEventRecord(nr.gmEv[8], st);
     // the three feature levels, both directions: the half from the engines' own flow and
     // metric, the quarter and the eighth from the pair's pyramids
-    // b / c / d in the engine's dtype: the second direction starts gmC planes in
+    // b / c / d in the engine's dtype and layout: the second direction starts gmC channels in
     const int bHalf = nr.gmFuseHalf ? 1 : 0;
-    const size_t be = nr.gmFuseHalf ? 2 : 4;
-    uint8_t* fb = (uint8_t*)nr.dGmFb;
-    uint8_t* fc = (uint8_t*)nr.dGmFc;
-    uint8_t* fd = (uint8_t*)nr.dGmFd;
+    const bool fx = nr.gmFeatHwc;
+    const int c0 = nr.gmC[0], c1 = nr.gmC[1], c2 = nr.gmC[2];
     // the half reuses the image splats' list sets (the same flow, metric and s); the quarter and the eighth build theirs
-    if (!splat(0, false, f0[0], fHalf, nr.gmC[0], flow0, met0, mHalf, sA, nr.hw, nr.hh, fb, bHalf))
+    const float* lr = nr.gmLr;
+    if (!splat(0, false, f0[0], fHalf, c0, flow0, met0, mHalf, sA, nr.hw, nr.hh, nr.dGmFb, bHalf, 2 * c0, 0, fx, lr[0]))
         return false;
-    if (!splat(1, false, f1[0], fHalf, nr.gmC[0], flow1, met1, mHalf, sB, nr.hw, nr.hh,
-               fb + (size_t)nr.gmC[0] * hp * be, bHalf))
+    if (!splat(1, false, f1[0], fHalf, c0, flow1, met1, mHalf, sB, nr.hw, nr.hh, nr.dGmFb, bHalf, 2 * c0, c0, fx,
+               lr[0]))
         return false;
-    if (!splat(0, true, f0[1], fHalf, nr.gmC[1], nr.dGmFlowP[0], nr.dGmMetP[0], 0, sA, nr.hw / 2, nr.hh / 2, fc, bHalf))
+    if (!splat(0, true, f0[1], fHalf, c1, nr.dGmFlowP[0], nr.dGmMetP[0], 0, sA, nr.hw / 2, nr.hh / 2, nr.dGmFc, bHalf,
+               2 * c1, 0, fx, lr[1]))
         return false;
-    if (!splat(1, true, f1[1], fHalf, nr.gmC[1], nr.dGmFlowP[0] + 2 * qp, nr.dGmMetP[0] + qp, 0, sB, nr.hw / 2,
-               nr.hh / 2, fc + (size_t)nr.gmC[1] * qp * be, bHalf))
+    if (!splat(1, true, f1[1], fHalf, c1, nr.dGmFlowP[0] + 2 * qp, nr.dGmMetP[0] + qp, 0, sB, nr.hw / 2, nr.hh / 2,
+               nr.dGmFc, bHalf, 2 * c1, c1, fx, lr[1]))
         return false;
-    if (!splat(0, true, f0[2], fHalf, nr.gmC[2], nr.dGmFlowP[1], nr.dGmMetP[1], 0, sA, nr.hw / 4, nr.hh / 4, fd, bHalf))
+    if (!splat(0, true, f0[2], fHalf, c2, nr.dGmFlowP[1], nr.dGmMetP[1], 0, sA, nr.hw / 4, nr.hh / 4, nr.dGmFd, bHalf,
+               2 * c2, 0, fx, lr[2]))
         return false;
-    if (!splat(1, true, f1[2], fHalf, nr.gmC[2], nr.dGmFlowP[1] + 2 * ep, nr.dGmMetP[1] + ep, 0, sB, nr.hw / 4,
-               nr.hh / 4, fd + (size_t)nr.gmC[2] * ep * be, bHalf))
+    if (!splat(1, true, f1[2], fHalf, c2, nr.dGmFlowP[1] + 2 * ep, nr.dGmMetP[1] + ep, 0, sB, nr.hw / 4, nr.hh / 4,
+               nr.dGmFd, bHalf, 2 * c2, c2, fx, lr[2]))
         return false;
     if (prof)
         cudaEventRecord(nr.gmEv[9], st);
@@ -12024,6 +12774,8 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     {
         ctx->setTensorAddress("w_last", nr.dGmWl);
         ctx->setTensorAddress("b_last", nr.dGmBl);
+        if (nr.dGmLr)
+            ctx->setTensorAddress("lr_bcd", nr.dGmLr);
     }
     if (!ctx->enqueueV3(st))
     {
@@ -12040,8 +12792,9 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         void* dst = nr.gmPairSdr ? nr.dGmOut : (void*)nr.dGmF;
         int th = nr.hh, tw = nr.hw, cl = nr.gmPairSdr ? 0 : 1;
         void* at[] = {(void*)&pre, (void*)&nr.dGmWl, (void*)&nr.dGmBl, (void*)&dst, &th, &tw, &cl};
-        if (cuLaunchKernel(nr.fFuTail, (unsigned)((tw / 2 + 15) / 16), (unsigned)((th / 2 + 7) / 8), 1, 16, 8, 1, 0,
-                           (CUstream)st, at, nullptr) != CUDA_SUCCESS ||
+        // k_fuTailNhwc's shared tile is sized for these 16 x 8 threads
+        if (cuLaunchKernel(nr.gmTailHwc ? nr.fFuTailNhwc : nr.fFuTail, (unsigned)((tw / 2 + 15) / 16),
+                           (unsigned)((th / 2 + 7) / 8), 1, 16, 8, 1, 0, (CUstream)st, at, nullptr) != CUDA_SUCCESS ||
             (nr.gmPairSdr &&
              !nativeHdrFromSdr(nr, nr.dGmOut, 0, ps, nr.pw, nr.pw, nr.ph, nr.dGmF, ps, nr.pw, nr.encPost)))
         {
@@ -13033,15 +13786,38 @@ static uint64_t nativeVideoMemoryRoom()
 // / 476 MiB at 854x480 / 1708x960, a quarter on top) + its side Optical Flow session (nativeFsrfgAhead, x4 and up: 34 /
 // 74 MiB at 854x480 / 1280x720 = 2 + 98 a megapixel with a quarter, where both sides hold x4); the other routes add
 // nothing the reserve does not cover. The x8 /
-// x16 ladders' third and fourth tree levels (an instance and twice the node frames a level) come on top when the
-// session's slots reach them (the process's own memory over x4 at 854x480 / 1708x960, a quarter on top, FRUC by the
-// padded megapixel: FRUC x8 +332 / +620 MiB, x16 +711 / +1423; FSR 4 x8 +282 / +462, x16 +627 / +1115, but FSR 4 held
-// only ~x3.7 at 1708x960 and leaves those levels' node frames partly unmade: the per-megapixel term is FSR 3.1's larger
-// fit).
+// x16 / x32 ladders' third, fourth and fifth tree levels (an instance and twice the node frames a level) come on top
+// when the session's slots reach them (the process's own memory over x4 at 854x480 / 1708x960, a quarter on top, FRUC
+// by the padded megapixel: FRUC x8 +332 / +620 MiB, x16 +711 / +1423, x32 +1184 / +2595; FSR 4 x8 +282 / +462, x16
+// +627 / +1115, but FSR 4 held only ~x3.7 at 1708x960 and leaves those levels' node frames partly unmade: the x8 / x16
+// per-megapixel terms are FSR 3.1's larger fit; FSR 4 x32 +779 / +2202). x64 / x128 / x256 (levels 6 to 8): the same
+// measure less the ring's slots past x32's (priced apart), a quarter on top: FRUC 1052 + 2453, 1264 + 4260, 1396 +
+// 7733; FSR 4 1663 + 1826, 1869 + 3803, 2126 + 7652 a megapixel. x512 (level 9): x128 to x256's step twice over (the
+// fixed 1708x960 x512 run clamps its slots, so one size measured it: FRUC 6431 MiB at 854x480 against 6717 so priced,
+// FSR 4 7054 against 7149).
 constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 290.0, kFrucLateMp = 173.0;
 constexpr double kFsrfgLateBase = 47.0, kFsrfgLateMp = 433.0;
-constexpr double kFrucDeepBase[2] = {277.0, 549.0}, kFrucDeepMp[2] = {300.0, 742.0};
-constexpr double kFsrfgDeepBase[2] = {278.0, 580.0}, kFsrfgDeepMp[2] = {333.0, 820.0};
+constexpr double kFrucDeepBase[] = {277.0, 549.0, 806.0, 1052.0, 1264.0, 1396.0, 1659.0},
+                 kFrucDeepMp[] = {300.0, 742.0, 1470.0, 2453.0, 4260.0, 7733.0, 14678.0};
+constexpr double kFsrfgDeepBase[] = {278.0, 580.0, 381.0, 1663.0, 1869.0, 2126.0, 2641.0},
+                 kFsrfgDeepMp[] = {333.0, 820.0, 1446.0, 1826.0, 3803.0, 7652.0, 15353.0};
+static_assert(sizeof(kFrucDeepBase) == sizeof(double) * (kFrDepth - 2) &&
+                  sizeof(kFrucDeepMp) == sizeof(kFrucDeepBase) && sizeof(kFsrfgDeepBase) == sizeof(kFrucDeepBase) &&
+                  sizeof(kFsrfgDeepMp) == sizeof(kFrucDeepBase),
+              "one memory term a tree level from x8 to the deepest");
+
+// the deepest midpoint-tree level `slots` output frames a source frame reach (x2^L needs 2^L slots; 2 at least, the
+// session's instances at most); 0 = no tree
+static int nativeTreeLevels(const NativeRife& nr, uint32_t slots)
+{
+    if (!nr.fruc || !nr.frMp)
+        return 0;
+    int lv = 2;
+    while (lv < kFrDepth && slots >= (2u << lv))
+        lv++;
+    return (std::min)(nr.frInstMax, lv);
+}
+
 static uint64_t nativeLiveLateNeed(const NativeRife& nr, uint32_t slots)
 {
     const double mib = 1048576.0;
@@ -13056,11 +13832,14 @@ static uint64_t nativeLiveLateNeed(const NativeRife& nr, uint32_t slots)
     {
         const double mp = (double)nr.pw * nr.ph / 1e6;
         need += nr.fsrfg ? kFsrfgLateBase + kFsrfgLateMp * mp : kFrucLateBase + kFrucLateMp * mp;
-        // the deepest ladder the slots and the instances reach: x8 = 3 levels, x16 = 4
-        const int levels = (std::min)(nr.frInstMax, slots >= 16 ? 4 : (slots >= 8 ? 3 : 2));
+        // the deepest ladder the slots and the instances reach: x8 = 3 levels, x16 = 4, .. x512 = 9
+        const int levels = nativeTreeLevels(nr, slots);
         if (nr.frMp && levels > 2)
             need += nr.fsrfg ? kFsrfgDeepBase[levels - 3] + kFsrfgDeepMp[levels - 3] * mp
                              : kFrucDeepBase[levels - 3] + kFrucDeepMp[levels - 3] * mp;
+        // a pipelined group's second tree: the shown pair's nodes beside the new pair's (BGRA8, 4 bytes a pixel)
+        if (nr.frMp && !nr.fsrfg)
+            need += ((1 << levels) - 1) * 4.0 * mp * 1e6 / mib;
     }
     return (uint64_t)(need * mib);
 }
@@ -13075,10 +13854,32 @@ static uint32_t nativeRingFit(const NativeRife& nr, size_t slotBytes, uint32_t s
     const uint64_t room = nativeVideoMemoryRoom();
     if (!room || !slotBytes)
         return 0;
-    const uint64_t late = nativeLiveLateNeed(nr, slots);
-    ringB = room > late ? room - late : 0;
-    const uint64_t n = ringB / (2ull * slotBytes);
-    return (uint32_t)(n < 2 ? 2 : (n > 4096 ? 4096 : n));
+    // a midpoint tree's level the room cannot hold beside the ring's slots for it is given up, one level at a time:
+    // the slots then stop below the next power of two, so the ladder never reaches a level that was not priced
+    uint32_t s = slots;
+    for (;;)
+    {
+        const uint64_t late = nativeLiveLateNeed(nr, s);
+        ringB = room > late ? room - late : 0;
+        const uint64_t n = (std::min)((uint64_t)s, ringB / (2ull * slotBytes));
+        const int lv = nativeTreeLevels(nr, s);
+        if (lv <= 2 || n >= (1ull << lv))
+        {
+            if (s < slots)
+            {
+                uint32_t top = 2;
+                while ((uint64_t)top * 2 <= n)
+                    top *= 2;
+                const uint32_t up = top * 2;
+                LOG("native: video memory: the midpoint tree stops at x%u (x%u with its ring slots needs about %.0f "
+                    "MiB, %.0f MiB are free beside the session)\n",
+                    top, up, (double)(nativeLiveLateNeed(nr, up) + 2ull * up * slotBytes) / 1048576.0,
+                    (double)room / 1048576.0);
+            }
+            return (uint32_t)(n < 2 ? 2 : (n > 4096 ? 4096 : n));
+        }
+        s = (1u << lv) - 1;
+    }
 }
 
 // A session's video memory check, for every route: nativeVideoMemoryMark at its start (before the engines and
@@ -13270,7 +14071,7 @@ static bool nativeLiveNrInit(NativeRife& nr)
     nr::Settings set;
     set.structure = (float)(g_nrStructure < 0.0 ? 0.0 : (g_nrStructure > 2.0 ? 2.0 : g_nrStructure));
     set.tone = (float)(g_nrTone < 0.0 ? 0.0 : (g_nrTone > 2.0 ? 2.0 : g_nrTone));
-    set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 1;
+    set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 0;
     set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
     // SMV_NR_MV=0 = no motion (a measurement lever); without motion every frame is a Reset, since kept
     // history with no motion slides; SMV_NR_AUTOMASK=0 = the mask off (read by the core)
@@ -13730,11 +14531,15 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         return false;
     uint32_t nfr = 0;
     memcpy(&nfr, msg.data(), 4);
+    // the exe's route bit (sendPairStream): this Smooth Motion group shows the previous pair, pipelined
+    const bool pipeAsk = (nfr & 0x80000000u) != 0;
+    nfr &= 0x7fffffffu;
     const float* fr = (const float*)(msg.data() + 4);
     if (msg.size() < 4 + 4ull * nfr)
         return false;
     if (nfr > nr.slots)
         nfr = nr.slots;
+    const bool pipe = pipeAsk && nr.fruc && nr.frMp && !nr.fsrfg && g_fruc.stepI && nr.havePrev;
     // no-engine mode (Identity.process_shm): an empty group stays empty (the pair advances,
     // nothing presented), any other group is exactly ONE real frame through the effects
     // chain, whatever fractions the pair clock asked for
@@ -13764,10 +14569,45 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 ema(nr.gTweenMs, slots / nr.grTween);
                 nr.gIntUs.store((uint32_t)(nr.gIntMs * 1000.0));
                 nr.gTweenUs.store((uint32_t)(nr.gTweenMs * 1000.0));
+                // the midpoint tree (Smooth Motion, AMD FSR 4): a call = the compute thread's calls' mean; a slot = the
+                // slots' time less the calls' chain in them (a direct group: its calls in the slots; a pipelined one:
+                // its levels and the level-1 join); a group that made instances is skipped (grPriceSkip)
+                if (nr.fruc && nr.frMp && nr.grPriceSkip > 0)
+                    nr.grPriceSkip--;
+                else if (nr.fruc && nr.frMp && nr.fsrfg && nr.grSlots)
+                {
+                    // AMD FSR 4 queues its calls on the stream (its CPU call returns at once) and the stream waits for
+                    // a node where it is first read, so a call's GPU time lands before or inside the slots: the prices
+                    // come off a group's WHOLE time. A group with no call in its slots (x2: level 1 is in pre) gives
+                    // the base and a slot's store; a group with calls in them gives a call = its whole time less the
+                    // base and its extra stores, per call in the slots
+                    const uint32_t in = nr.grFrCalls - nr.grFrPreCalls;
+                    const double whole = (double)pre + slots;
+                    if (!in)
+                    {
+                        ema(nr.gFrStoreMs, (double)slots / nr.grSlots);
+                        ema(nr.gFrBaseMs, whole);
+                    }
+                    else if (nr.gFrBaseMs > 0.0)
+                        ema(nr.gFrCallMs,
+                            (std::max)(0.0, whole - nr.gFrBaseMs - (nr.grSlots - 2.0) * nr.gFrStoreMs) / in);
+                    nr.gFrCallUs.store((uint32_t)(nr.gFrCallMs * 1000.0));
+                    nr.gFrStoreUs.store((uint32_t)(nr.gFrStoreMs * 1000.0));
+                    nr.gFrBaseUs.store((uint32_t)(nr.gFrBaseMs * 1000.0));
+                }
+                else if (nr.fruc && nr.frMp && nr.grFrCalls && nr.grSlots)
+                {
+                    ema(nr.gFrCallMs, nr.grFrCallMs / nr.grFrCalls);
+                    ema(nr.gFrStoreMs, (std::max)(0.0, ((double)slots - nr.grFrChainMs) / nr.grSlots));
+                    nr.gFrCallUs.store((uint32_t)(nr.gFrCallMs * 1000.0));
+                    nr.gFrStoreUs.store((uint32_t)(nr.gFrStoreMs * 1000.0));
+                }
             }
         }
     }
     nr.grArmed = false;
+    nr.grFrCalls = nr.grFrPreCalls = 0;
+    nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = 0.0;
 
     // (1) the exe signalled the capture fence with this sequence number before writing us
     cudaExternalSemaphoreWaitParams wp{};
@@ -14188,10 +15028,33 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (nTween && !nativeNvofPair(nr, nativeXPrev(nr), dCur))
             return false;
     }
+    else if (nr.fruc && pipe)
+    {
+        // Smooth Motion pipelined: the static test above judged the NEW pair, which the next group shows; this group
+        // shows the previous pair (nativeFrucPipeAdvance), held when it was identical or never split. The levels'
+        // instances are made here, before instance 0's worker runs
+        const bool curStatic = pairStatic;
+        if (!nativeFrucPipeAdvance(nr, dCur, curStatic))
+            return false;
+        pairStatic = !nr.frLagHave || nr.frLagStatic;
+        nTween = 0;
+        if (!pairStatic)
+        {
+            double tw[64];
+            for (uint32_t i = 0; i < nfr && nTween < 64; i++)
+                if (fr[i] < 0.999f)
+                    tw[nTween++] = fr[i];
+            const int want = nTween ? (std::min)(nativeFrucDepth(nr, tw, nTween), nr.frInstMax) : 0;
+            if (nr.frInst < want)
+                nativeFrucGrow(nr, want);
+        }
+    }
     else if (nr.fruc)
     {
         // Smooth Motion: every frame is packed (the next pair's start), the bridge itself
         // runs per tween below; an identical pair got nTween = 0 above and never reaches FRUC
+        nr.frPipePrev = false;
+        nr.frCurStatic = pairStatic;
         if (!nativeFrucPair(nr, dCur, nTween))
             return false;
         if (nTween > 1)
@@ -14252,6 +15115,12 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // (5) slots. Tokens go out in slot-index order, exactly like _drain_ready.
     if (nr.grEv[0])
         cudaEventRecord(nr.grEv[0], st);
+    nr.grFrPreMs = nr.grFrCallMs;
+    nr.grFrPreCalls = nr.grFrCalls;
+    // a pipelined group: the new pair's level-1 call starts beside this group's slots (joined in nativeFrucLagTween,
+    // or below when the shown pair is held)
+    if (pipe && !nativeFrucPipeSpec(nr))
+        return false;
     const int pitchI = (int)nr.pitch;
     uint32_t sent = 0;
     auto drainReady = [&](bool block) {
@@ -14452,7 +15321,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     break;
                 }
             }
-            else if (!storeSlot(nr.drba ? drLag : dCur, slot, "packOut (real) launch failed"))
+            else if (!storeSlot(nr.drba ? drLag : pipe ? nativeXPrev(nr) : dCur, slot, "packOut (real) launch failed"))
             {
                 fail = true;
                 break;
@@ -14515,7 +15384,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         {
             // Smooth Motion: one bridge call per tween (it syncs the context on entry, so the
             // previous tween's store has read dFrOut before the next unpack overwrites it)
-            if (!nativeFrucTween(nr, fr[i]))
+            if (!(pipe ? nativeFrucLagTween(nr, fr[i]) : nativeFrucTween(nr, fr[i])))
             {
                 fail = true;
                 break;
@@ -14618,14 +15487,17 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         cudaEventRecord(nr.slotEv[i], st);
         drainReady(false);
     }
-    if (fail)
+    if (fail || (pipe && !nativeFrucSpecJoin(nr)))
         return false;
+    if (!pipe)
+        nr.grFrChainMs = nr.grFrCallMs - nr.grFrPreMs;
     // the first group has no pair and a group with no slot stores nothing: their times say nothing about either kind
     if (nr.grEv[1] && nr.havePrev && nfr)
     {
         cudaEventRecord(nr.grEv[1], st);
         nr.grArmed = true;
         nr.grTween = twDone;
+        nr.grSlots = nfr;
     }
     drainReady(true); // sync the stragglers, exactly like _finish
     if (nr.gmProf && nr.gmProfTween)

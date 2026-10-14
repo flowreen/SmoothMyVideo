@@ -525,7 +525,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       nr = {
         structure: clamp(args.nr_structure, 0.0, 2.0),
         tone: clamp(args.nr_tone, 0.0, 2.0),
-        style: [0, 1, 2].includes(args.nr_style) ? args.nr_style : 1,
+        style: [0, 1, 2].includes(args.nr_style) ? args.nr_style : 0,
         passes: Math.min(10, Math.max(1, Math.round(args.nr_passes ?? 1))),
       };
   }

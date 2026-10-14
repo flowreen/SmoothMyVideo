@@ -2,9 +2,9 @@ r"""Builds engine\fsrfg: smv_fsrfg_bridge.dll (fsrfg_bridge.cpp) and amdxc64.dll
 them AMD's signed FSR SDK v2.3.0 loader + frame generation DLLs (signedbin, unmodified) and vkd3d-proton's two DLLs.
 
 vkd3d-proton (LGPL-2.1, built separately, MSYS2 UCRT64 with gcc, meson and ninja): github.com/HansKristian-Work/
-vkd3d-proton at commit 2230755878b01993b4b82d0ac0c0624f3ab4d333 with its submodules, dxil-spirv at
+vkd3d-proton at commit fdbaf51f8794e8d75ad8c43dc2d62fcc8a136af3 with its submodules, dxil-spirv at
 ab47c3df1a4746f36c958f0262bc9e314eb566eb, then
-  git apply ..\source\vkd3d-proton-2230755-smv.patch            (in the vkd3d-proton checkout)
+  git apply ..\source\vkd3d-proton-fdbaf51-smv.patch            (in the vkd3d-proton checkout)
   git apply ..\source\dxil-spirv-ab47c3d-smv.patch              (in subprojects\dxil-spirv)
   meson setup build --buildtype=release -Denable_extended_emulation=true
   ninja -C build

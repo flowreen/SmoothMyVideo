@@ -842,10 +842,34 @@ struct Capture
                 "over %llu\n",
                 (unsigned long long)sameN, (unsigned long long)sameKept, (int)(kSameKeepalive / 10000),
                 sameTests ? sameMsSum / (double)sameTests : 0.0, sameMsMax, (unsigned long long)sameTests);
-        if (session)
-            session.Close();
-        if (pool)
-            pool.Close();
+        // session.Close() calls Windows' capture service in another process and can block indefinitely (a host's main
+        // thread was found inside it, waiting on that call, after its target window closed): both Closes run on a
+        // helper thread, waited for at most kCloseWaitMs; past that the helper keeps the two objects and the teardown
+        // goes on. SMV_WGC_CLOSE=hang = the trigger (the helper waits 4 s before its Closes)
+        if (session || pool)
+        {
+            constexpr DWORD kCloseWaitMs = 2000;
+            wchar_t cv[8] = {};
+            const bool hangTest = GetEnvironmentVariableW(L"SMV_WGC_CLOSE", cv, 8) && wcscmp(cv, L"hang") == 0;
+            std::shared_ptr<void> done(CreateEventW(nullptr, TRUE, FALSE, nullptr), CloseHandle);
+            std::thread([s = std::move(session), p = std::move(pool), done, hangTest]() mutable {
+                if (hangTest)
+                    Sleep(4000);
+                if (s)
+                    s.Close();
+                if (p)
+                    p.Close();
+                s = nullptr;
+                p = nullptr;
+                SetEvent(done.get());
+            }).detach();
+            session = nullptr;
+            pool = nullptr;
+            if (WaitForSingleObject(done.get(), kCloseWaitMs) != WAIT_OBJECT_0)
+                LOG("capture: closing the capture session did not return in %lu ms (Windows' capture service): left "
+                    "to a helper thread\n",
+                    kCloseWaitMs);
+        }
         if (evt)
             CloseHandle(evt);
         evt = nullptr;

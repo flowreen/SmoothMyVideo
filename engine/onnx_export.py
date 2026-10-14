@@ -8,7 +8,8 @@ unbatched class) and its encode, plain and as the flow-warp class at k 1 (Frame 
 DRBA's block0, Restore, and the GMFSS nets (gmflow_bidir as its backbone and two halves, trt_runtime.gmflow_split +
 gmflow_backbone_cut, the first half cut around its two N x N attentions by gmflow_matching_cut (`_m` before them, the
 host's k_attn2 between); one form for every size, transformer.py's export path, every transformer attention with its
-projections folded, transformer.fold_projections). Then ship_tidy() and write_tags().
+projections folded, transformer.fold_projections; A once more in the "edge" form, export_edge_a). Then ship_tidy() and
+write_tags().
 Usage: runtime python engine/onnx_export.py"""
 import os
 import sys
@@ -117,6 +118,10 @@ def main():
         tr.gmflow_matching_cut(a_path, "gmflow_bidir_a_g8r")
         tr.gmflow_exit_fp16(a_path)
     done.extend(os.path.basename(p) for p in parts)
+    edge = trt_lookup.onnx_path("gmflow_bidir_a_g8e")
+    if not os.path.isfile(edge):
+        export_edge_a(tr._BidirFlowExport(gm.flownet), rec["flownet"][:2], gmt, edge)
+    done.append(os.path.basename(edge))
     ensure(tr.MetricEngine(), gm.metricnet, rec["metricnet"][:4])
     xi, tsv = rec["ifnet"][0], rec["ifnet"][1]
     ensure(tr.IFNetEngine(), tr._IFNetExport(gm.ifnet, [8, 4, 2, 1]),
@@ -126,6 +131,51 @@ def main():
           f"{time.time() - t0:.0f} s", flush=True)
     ship_tidy(done)
     write_tags(stamp)
+
+
+def export_edge_a(flow_export, ins, gmt, dst):
+    """gmflow_bidir A in transformer.py's "edge" form (EXPORT_A_FORM; the host builds it in the background and runs it
+    from the next session on): the whole graph exported again into a scratch folder and cut exactly as the main form;
+    only its A is kept, written to dst with its own weights file. The cut's other parts (backbone, `_m`, B) must equal
+    the main form's node for node (op types and attributes), else the export refuses."""
+    import shutil
+
+    import onnx
+
+    def nodes(p):
+        g = onnx.load(p, load_external_data=False).graph
+        return [(n.op_type, [a.SerializeToString() for a in sorted(n.attribute, key=lambda a: a.name)]) for n in g.node]
+
+    main_dir = trt_lookup.ONNX_DIR
+    scratch = os.path.join(main_dir, "edge_form")
+    shutil.rmtree(scratch, ignore_errors=True)
+    os.makedirs(scratch)
+    eng = tr.BidirFlowEngine()
+    try:
+        trt_lookup.ONNX_DIR = scratch
+        gmt.EXPORT_FP16_STREAM, gmt.EXPORT_A_FORM = GMFLOW_FP16_STREAM, "edge"
+        full = tr.ensure_onnx(eng.name, flow_export, ins, eng.input_names, eng.output_names)
+        if full is None:
+            raise RuntimeError("gmflow_bidir (edge form): this graph does not qualify for a size-free export")
+        a_path, _ = tr.gmflow_split(full, a_key="gmflow_bidir_a_g8")
+        tr.gmflow_backbone_cut(a_path)
+        tr.gmflow_matching_cut(a_path, "gmflow_bidir_a_g8r")
+        tr.gmflow_exit_fp16(a_path)
+        for key in ("gmflow_backbone", "gmflow_bidir_a_g8r_m", "gmflow_bidir_b"):
+            name = os.path.basename(trt_lookup.onnx_path(key))
+            if nodes(os.path.join(scratch, name)) != nodes(os.path.join(main_dir, name)):
+                raise RuntimeError(f"the edge form's {key} differs from the main form's: only A may differ")
+        m = onnx.load(a_path)
+    finally:
+        gmt.EXPORT_FP16_STREAM, gmt.EXPORT_A_FORM = False, "masked"
+        trt_lookup.ONNX_DIR = main_dir
+    for p in (dst, dst + ".data"):  # onnx appends external data to an existing file
+        if os.path.isfile(p):
+            os.remove(p)
+    onnx.save_model(m, dst, save_as_external_data=True, all_tensors_to_one_file=True,
+                    location=os.path.basename(dst) + ".data")
+    shutil.rmtree(scratch, ignore_errors=True)
+    print(f"exported {os.path.basename(dst)} (gmflow A, edge form)", flush=True)
 
 
 def tags_path():

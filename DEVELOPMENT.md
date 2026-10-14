@@ -227,7 +227,12 @@ RTX VSR / HDR and all three codecs.
   1.8 % faster per call at 1080p and 1.9 % at 4K, nothing measurable at 480p. Blocks 1 and
   2's first conv reads one flat concat of its eight parts instead of a concat nested in a concat
   (`trt_runtime._blocks12_flat_concat`): the same tensor, bit-identical, its speed inside the noise
-  from 240p to 4K. Built from
+  from 240p to 4K. The warps that feed blocks 1, 2 and 3 (the /8, /4 and /2 scales) are computed only
+  where that block's bilinear downscale reads, 2 x 2 pixels of every 8 x 8 / 4 x 4 / 2 x 2 cell, then
+  averaged (`trt_runtime._warp_at_resize_taps`): the same samples and fp16 rounding, bit-identical,
+  1 / 16 and 1 / 4 of the warp work at /8 and /4, no full-size warped tensor at /2; the IFNet
+  15.08 -> 12.67 ms a call at 2560x1472. Built from
+  these files the engines are
   these files the engines are
   bit-identical to the per-size ones, except gmflow_bidir (its size-free branch, see the GMFlow
   bullet below).
@@ -585,7 +590,7 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
 * `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame at the working size, after Restore and
   the resize, before the interpolation, DLAA (scaling
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
-  Default / Natural (default) / Cinematic looks (DLSSNR.Style; measured 2026-09-12: same cost, 0 is
+  Default (default) / Natural / Cinematic looks (DLSSNR.Style; measured: same cost, 0 is
   the lightest touch, 1 the smoothest, 2 keeps the most detail; Intensity stays 1.0, the runtime
   clamps it there and drifts below it). With `--nr-passes` above 1 the tone runs on the first pass
   only and passes 2+ at tone 0: the local tone darkens the frame again on every pass it runs (mean
@@ -751,7 +756,7 @@ the python class, runs one IFNet enqueue per tween with its own DRM timestep map
 pair on an exact static test and reports the one-capture lag in the latency stat. A handoff
 without the block0 engine or `lag=1` is refused. `blend` is Frame Blend's live twin (the RIFE
 engines under its own name). `fruc` is Smooth Motion's live twin: every fraction of a pair takes the
-nearest node of the pair's midpoint tree (exact up to sixteenths, see the bridge section), so it is adaptive like rife / gmfss (it takes the Image scale too); it is HDR
+nearest node of the pair's midpoint tree (exact to 512ths, see the bridge section), so it is adaptive like rife / gmfss (it takes the Image scale too); it is HDR
 capable like rife (a frame pair inside the SDR range goes to the bridge as its SDR view, any other
 pair as the PQ codes quantised to 8-bit for the flow and the warp, so only those tweens carry 8-bit PQ
 precision while the real frames stay full precision; see `--fruc` above; the SDR capture of an
@@ -764,7 +769,7 @@ API the ctypes class uses: the (R, G, B) model planes packed to true BGRA8 by th
 `k_packBgraRgb`, one bridge step per tween (feed-once, up to four FRUC instances in parallel, see the
 bridge section), `k_unpackBgraRgb` back, the same skipped-pair priming. A missing bridge / NvOFFRUC / cudart DLL refuses the session and names
 the file. `fsrfg` is AMD FSR frame generation's live twin on Smooth Motion's route (its ladders, x2 to
-x16, see `--fsrfg` above): the handoff answers with the unpadded geometry, `engine=fsrfg` and `NATIVE-PATH
+x512, see `--fsrfg` above): the handoff answers with the unpadded geometry, `engine=fsrfg` and `NATIVE-PATH
 fsrfg=` (`engine/fsrfg`, or `SMV_FSRFG_DIR`); a missing `smv_fsrfg_bridge.dll` refuses the session and names
 the folder. `echo` is
 the effects-only route: no interpolation model ticked in the app sends
@@ -828,7 +833,7 @@ DLSS-G (the default backend, no `--backend`) with any effect (`--sharpen` > 0, `
 echo route (`engine=none`, one slot) runs the effects on every captured frame through the cross-group queue, and each
 slot goes to Streamline the moment it is ready (no pacing clock: DLSS-G paces its own output) through the proxy swap
 chain in the server's slot format (BGRA8 SDR, R10G10B10A2 PQ HDR; DLSS-G takes any UNORM colour format). DLSS-G's count
-is the whole multiple of the measured rate nearest the target (drift-tracked on the stats tick, re-armed off / on with
+is the first whole multiple of the measured rate that reaches the target, within 3 % (drift-tracked on the stats tick, re-armed off / on with
 one passthrough present, and after a 700 ms input gap); the stats line carries DLSS-G's `status` / `actuallyPresented`
 and the latency is the Streamline handoff. Plain DLSS-G (no effect) keeps its direct present route. Gates
 `harness\dlssg_effects\run_cases.py` (parked routes per effect; the user's focus shim lets a parked overlay generate)
@@ -861,7 +866,11 @@ unchanged one uncounted. An unchanged arrival still counts once 500 ms passed si
 (`kSameKeepalive`): the static hold's refresh repaint brings the current picture after a model load or a pause, and
 DLSS-G's 700 ms input-gap reset never fires on a source that keeps presenting a still. The probe (`--probe`) keeps
 every arrival. The session's closing `capture:` line counts the drops, the keepalives and the test's cost. `SMV_WGC_SAME=0` turns the test off (A/B); where it cannot run (`SMV_WGC_SAME=fail` = the trigger) the
-whole screen keeps Windows' interval and a window counts repeats, each with a note line. The host times every group on the GPU (`grEv`, from the capture read: `gIntUs` = the work before the
+whole screen keeps Windows' interval and a window counts repeats, each with a note line. Closing the capture
+(`Capture::stop`: the session's and the frame pool's `Close`) calls Windows' capture service in another process and can
+block indefinitely, so both run on a helper thread the teardown waits for at most 2 s; past that the line `capture:
+closing the capture session did not return in 2000 ms` and the teardown goes on (`SMV_WGC_CLOSE=hang` = the trigger:
+the helper waits 4 s first). The host times every group on the GPU (`grEv`, from the capture read: `gIntUs` = the work before the
 slots of a group with tweens, the frame's passes and the pair's model work; `gTweenUs` = one tween with its store).
 The 2 s `live:` stats line ends with both, `gpu pre Nms tween Nms`, once a group with tweens was timed, the throttle on
 or off: a fixed-work A/B (`--no-adapt`, `--no-gpu-fit`) reads its same-work cost there.
@@ -928,10 +937,12 @@ How the server route works:
   ladder instead: M - 1 tweens at k / M plus the real frame as it is, more frames for no more work.
   The grid stays for a target between two multiples that binds. Smooth Motion (FRUC) is exact only
   at its midpoint tree's nodes k / 2^L (any other phase snaps to the nearest node and costs the
-  whole tree), so it runs only the x2 / x4 / x8 / x16 ladders (one bridge instance a tree level),
-  the largest that fits (a step up needs 3 % headroom), and the grid only when not even x2 fits: a
+  whole tree), so it runs only the x2 / x4 / x8 / .. / x512 ladders (one bridge instance a tree
+  level), the largest that fits (a step up needs 3 % headroom), and the grid only when not even x2 fits: a
   60 target on a 24 fps source presents a steady 48, a 10000 target x16's 384 when the GPU affords
-  15 tweens a pair. AMD FSR frame generation takes the same ladders. `--no-adapt` = fixed multiplier (what the smoke cases assert).
+  15 tweens a pair (x32 to x512 on a slower source or a smaller window, when it affords 31 to 511); a ladder the direct tree cannot hold runs pipelined across pairs when that fits
+  (one source period more latency, "Pipelined across pairs" below). AMD FSR frame generation takes
+  the same ladders. `--no-adapt` = fixed multiplier (what the smoke cases assert).
 * Slot sizing: the exe measures the source rate at startup and sizes the per-pair slot ring at
   `ceil(target / source * 1.15) + 2`, clamped by the VRAM budget (logs MEMORY-CAPPED). The slot
   count is a hard ceiling on the presented rate; the startup line reads `slots N (target T, source
@@ -1033,6 +1044,39 @@ the same frames as two separate passes). The first pass's PROGRESS and the last 
 the render; a resume restarts every pass at the banked source frame and the last pass drops what the
 encoder holds; a later pass's exit 3 / 4 is handled like the first's. RTX HDR (its per-frame statistics)
 does not combine with passes yet: refused with a line. Gate: harness `dlssg_cascade\cascade_gate.py`.
+`dlssg2f.exe --stage1 W H [--gen N] [--hdr10 | --bgra] --share TAG [--from TAG]` is a helper stage of the LIVE
+cascade (frames of 128 px a side and up; `--bgra` = SDR frames, swap chain and ring in B8G8R8A8, the effects route's
+order; an input gap past 700 ms resets its DLSS-G, above the capture's 500 ms repeat of a still picture; `--from` =
+another stage's ring as its input, copied on the GPU after a queue wait on that stage's fence, stdin then only ends
+it): the same frames on stdin,
+each presented the moment it arrives (a game's cadence: DLSS-G's
+pacer spreads a pair's frames over the source's own interval; the lockstep `--server` loop, which presents
+a frame only after the last pair's frames are read back, lets the pacer spread over that loop and tops out
+near x4 of 24 fps at 1080p), and every native present, generated and real in present order, copied on
+the swap chain's own queue (ordered behind the present, no settle) into 12 textures shared by name
+(`smv_dg1_TAG_ring0..11`, resting in COMMON) with a shared fence (`smv_dg1_TAG_fence`) and the header
+`Stage1Hdr` (file mapping `smv_dg1_TAG_hdr`: per slot the fence value its copy signals, its present number,
+the capture time and the source frame; a status word). stdout carries only `DLSSG STAGE1 READY gen=N max=M
+share=TAG`. A reader opens the textures by name in CUDA or another D3D12 device and waits each slot's fence
+value (harness `dlssg_gpu_transport`: x6 of 24 fps at 2560x1472 = 144 presents a second, read exact).
+Live uses it on both DLSS-G routes: the direct one feeds it the captured frames, the effects route (any effect or a
+DLSS mode below DLAA) its output slots, read back at the presented size (`--bgra` in SDR), so every frame it
+generates from carries the effects; a stage 1 whose ring is not the back buffer's size and format is refused. When
+the target needs more than one pass: at the
+2 s stats window where the derived multiple first repeats, the host snaps target / captured rate to the
+first multiple that reaches it (within 3 %; the largest when none does) of one pass (2..L, L =
+numFramesToGenerateMax + 1 read after the warm-up), two passes (the full L first, then the rest: L x 2..L, 12x =
+6x then 2x) or three (L x L x 2..L, 72x = 6x, 6x, then 2x) (`smv-live.exe --dlssg-snap-table L` prints the
+one- and two-pass table), prices the helpers' video memory (Streamline's own estimate + each ring) against the
+free memory (three passes the room does not hold = the best two), starts `--stage1` on a helper thread while
+the one pass keeps presenting, feeds it until it shares a frame, then presents its frames through the
+session's own DLSS-G at the last factor. Three passes: a second helper `--stage1 ... --from <the first's
+share tag>` takes the first's ring on the GPU (in present order, the newest after a wrap) and the session
+presents the second's; three passes below 85 % of their multiple for three 2 s windows in a row end and the
+next plan holds two. One plan a session; a helper ending, failing or sharing nothing for 2 s returns the
+session to one pass at L. Lines `DLSS 4.5 plan: ...`, `DLSS 4.5 at Mx: ... in a second process, [.. in a
+third, ]then ...`, `DLSS 4.5 stays at Lx: ...`, `DLSS 4.5's second [and third] pass[es] ended (...)`; the
+app shows them beside the stats. Gates: harness `dlssg_cascade\s2_gate.py`, `dlssg_third_stage\three_gate.py`.
 The render (`src/render`) keeps the
 probe, the ffmpeg decode and encode commands, PROGRESS / OUTFRAMES and the finalize, and the exe takes the decode pipe as stdin and feeds the encode
 pipe on stdout (pack-in, Head encode, IFNet, pack-out, `k_expand8to16` for real frames of
@@ -1120,10 +1164,16 @@ the card at most, and only the slots the free video memory holds beside what the
 buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel, measured by NVAPI from the
 ring to the steady session, a quarter on top; AMD FSR frame generation's second midpoint instance and its
 node frames, 45 MiB + 335 a megapixel, the process's own memory at x4 against x2, a quarter on top; when
-the slots reach x8 / x16, their third and fourth tree levels on top, the process's own memory over x4, a
-quarter on top: Smooth Motion 277 + 300 / 549 + 742 a padded megapixel, AMD FSR frame generation
-278 + 333 / 580 + 820 a megapixel (the per-megapixel terms FSR 3.1's larger fit: FSR 4 held only ~x3.7 at
-1708x960 and left those levels' node frames partly unmade); the other routes add nothing after it). Fewer slots lower
+the slots reach x8 / x16 / x32, their third, fourth and fifth tree levels on top, the process's own memory
+over x4, a quarter on top: Smooth Motion 277 + 300 / 549 + 742 / 806 + 1470 a padded megapixel, AMD FSR
+frame generation 278 + 333 / 580 + 820 / 381 + 1446 a megapixel (the x8 / x16 per-megapixel terms FSR 3.1's
+larger fit: FSR 4 held only ~x3.7 at 1708x960 and left those levels' node frames partly unmade); x64 / x128 / x256
+(levels 6 to 8) the same measure less the ring's slots past x32's (priced apart): Smooth Motion 1052 + 2453 / 1264 +
+4260 / 1396 + 7733 a padded megapixel, AMD FSR frame generation 1663 + 1826 / 1869 + 3803 / 2126 + 7652; x512 (level
+9) the x128 to x256 step twice over (1659 + 14678 / 2641 + 15353), checked at 854x480; the other routes add nothing
+after it). A
+tree level the room cannot hold beside its ring slots is given up one level at a time, the slots stopping below the
+next power of two (`native: video memory: the midpoint tree stops at xN ...`). Fewer slots lower
 only the output's ceiling (at most `slots` frames a captured frame) and the host says `native: video
 memory: the output ring holds N output frames per source frame instead of M ...`; 2 at least. Gate
 `harness\live_ring_memory\ring_gate.py OLD_ENGINE NEW_ENGINE` (`ring_mem.py` = the measurement).
@@ -1238,6 +1288,22 @@ so the lookup and the build cannot disagree on a name:
   (`built X from Y in Ns`) and warm-up (`warmed X in Ns`). Output-identical to python's build from the same file (harness
   `onnx\gate_3c2.py`, `onnx\gate_3c3a.py`). A session that ends mid-build leaves the build
   running while the resident host stays alive; an engine file is written whole or not at all.
+* gmflow A in two forms (transformer.py `EXPORT_A_FORM`, both exported: `gmflow_bidir_a_g8` and
+  `gmflow_bidir_a_g8e`, `onnx_export.export_edge_a`, which refuses unless the edge export's backbone, `_m` and B equal
+  the masked one's node for node). The masked form (the shift mask on every window of a shifted block, the blocks'
+  last LayerNorm on the stacked groups) is what a cold start builds: its runtime JIT ~7 s. The edge form (plain
+  attention on every window the roll leaves whole, the mask on the split last-column window only, the same block
+  tail) runs A x0.97 at the 1440p DLAA half and x0.89 at the 4K half but JITs in ~29 s, past the 30 s first start on
+  A's lane. So a GMFSS session on the masked form starts `--build-engine ... --room` for the edge form
+  at its first pair (`building gmflow A's edge form in the background`), below normal priority, in a job object;
+  `--room` = the warm-up refuses (exit 3) when the context's memory exceeds the video memory room. The next session
+  at that size finds the edge form built and warm and runs it (`gmflow A in the edge form` in the chain lines; the
+  resident handoff memo drops a masked answer then). Every live session and every offline GMFSS render ends a build
+  still running before its lookups (`stopped the background build ...`), so a session never sees the edge form appear
+  mid-start; a finished build's result comes into the next session's log. A render is bit-stable run to run on one
+  cache state; the two forms differ ~58 dB on the tweens (real frames identical), so a resumed render that crosses
+  the upgrade joins two forms. `SMV_GM_UPGRADE=0` = the masked form only, `=now` = the edge form from the cold start
+  (built like any net), `=fail` = the background build exits 2 at once.
 * `smv-live.exe --lookup-probe <engine folder>/live_server.py <backend> <outW> <outH> <capW>
   <capH> <image scale>` prints the lookup's lines (or `MISS`); the path is a marker
   for the engine folder, the file need not exist. A change to the naming or the geometry is gated
@@ -1530,7 +1596,17 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   the next clear, same stream), and the setup proves the engine writes the weights before the first
   tween. The engine's context shrinks (876 -> 697 MiB at the 1080p half) and the tweens come closer to
   an fp32 run (PSNR vs eager fp32 49.67 -> 49.72 dB at 1080p); the host takes either graph (`out`'s
-  channels decide) and logs `fusion tail on the host` / `in the engine`.
+  channels decide) and logs `fusion tail on the host` / `in the engine`. The cut graph's `out` leaves
+  channels-last: the host's builder allows only HWC8 / HWC16 on it (both plain NHWC at 256 channels,
+  the layout fusionnet's convs work in), so the whole-tensor transpose to linear after the last conv
+  is gone (fusionnet x0.955 a call at the 4K half). `k_fuTailNhwc` brings each block's tile into
+  shared memory 4 channels at a time and runs as fast as `k_fuTail` does on a linear `out`, the same
+  frame bit for bit; the host reads `out`'s format (linear = `k_fuTail`). feat_ext's `f1` / `f2` / `f3`
+  and fusionnet's `b` / `c` / `d` are channels-last too (feat_ext x0.836 a call at the 4K half), so
+  the feature splats read and write `[n][C]`: `k_gsGatherNhwc` puts a cell's 8-channel groups on
+  consecutive lanes (one 16-byte load a list entry, one 16-byte store; x0.675 for a tween's six
+  feature splats at the 4K half, the same values bit for bit), and the scatter fallback takes channel
+  / pixel strides. The setup takes all six linear or all six channels-last (`feature splats ...`).
 * fusionnet's shared activations (`trt_runtime._fusion_prelu_fanout`): a LeakyRelu whose input has
   other readers too (the residual add, a second LeakyRelu with another slope) cannot fuse into the
   conv before it and ran as its own kernel. With a slope a in (0, 1], x = min(y, y / a) for
@@ -1538,6 +1614,12 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   other reader takes Min(y, Div(y, a)), which TensorRT-RTX folds into a neighbouring conv: the
   standalone LeakyRelu layers at the Balanced half go 18 -> 3. Not bit-identical (the negative half
   takes one more fp16 rounding): PSNR vs eager fp32 equal at 480p and 1080p. No host change.
+* fusionnet's input activations (`trt_runtime._fusion_input_lrelu`): `b` / `c` / `d` are each read
+  by one LeakyRelu before a conv, which TensorRT-RTX ran as its own kernels over the inputs. Those
+  LeakyRelus go, their slopes leave as the constant output `lr_bcd` (fp32 [3]), and the feature
+  splats store LeakyRelu of the fp16 value themselves (`gmStoreLr` / `gmLrelu16`: the fp32 product of
+  two fp16 values is exact, so its one rounding is an fp16 multiply, TensorRT's result bit for bit).
+  The host reads the slopes in the setup's probe run; an engine without `lr_bcd` keeps them inside.
 * GMFlow's transformer on the export path (`FeatureTransformer._forward_windowed`, every split-window scale)
   keeps one token-outer stream, [group][position in the window][window][frame][C] (`_to_groups`), so an
   attention reads its group's slice in the layout TensorRT's fused attention kernel takes (window order
@@ -1633,7 +1715,9 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_ONNX_DIR` | size-free ONNX folder (default `engine/onnx`) |
 | `SMV_TRT_WORKSPACE_GB` | builder scratch ceiling (default 8) |
 | `SMV_GM_HELPER=0` / `SMV_GM_HELPER_TEST=fail` | a GMFSS cold build without the gmflow A helper process (A/B) / the helper exits 2 at once (the fallback's trigger) |
+| `SMV_GM_UPGRADE=0` / `=now` / `=fail` | gmflow A in the masked form only, no background build (A/B) / the edge form from the cold start (A/B) / the background build of the edge form exits 2 at once (its failure line's trigger) |
 | `SMV_GM_SPLAT=old` | GMFSS's splats by the scatter kernels (k_splatSoft + k_splatNorm) instead of the gather ones (A/B; the same output) |
+| `SMV_FU_HWC=0` / `=fail` | GMFSS's host-side tensors built linear (fusionnet's `out`, `b` / `c` / `d`, feat_ext's levels; their own engine files, `fusionnet_lin_...` / `featurenet_lin_...`), read by k_fuTail and the planar splats (A/B; the same output) / the session setup reads `out`'s layout as unknown (the refusal's trigger) |
 | `SMV_TRT_CACHE_KIND` | suffix for the JIT cache file (live sets `live`) |
 | `SMV_RIFE_SAFEPAD=1` / `SMV_LIVE_SAFEPAD=1` | restore the 1152x640 RIFE safe-zone pad |
 | `SMV_RIFE_FLOW_SCALE` | diagnostic live flow pyramid scale (power of two in 0.25..1.0, forces a cold engine) |
@@ -1671,14 +1755,17 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_OFVEC_COST=1` | AMD FSR's motion vectors: the Optical Flow engine's cost output on (FSR reads no cost; off by default, the same vectors byte for byte, ~2 to 3 % less Optical Flow time); A/B lever, never a product setting |
 | `SMV_FSRFG_PROF=1` / `SMV_FSRUP_PROF=1` | AMD FSR frame generation / upscaling: CUDA events between a call's stages (the copies, the Optical Flow inputs, the Optical Flow, the vector kernels, FSR itself, the unpack), `[fsrfg-prof]` / `[fsrup-prof]` ms a call at the session's end; every call then waits for its last event (profiling only, slower) |
 | `SMV_FSRFG_OVERLAP=0` / `SMV_FSRFG_OVERLAP=fail` | AMD FSR frame generation: every call's vectors in its turn instead of the next call's on a side stream during each FSR call (tree levels with two or more calls, x4 and up) / the side session's setup fails after a whole one, the trigger of its fallback (`the side Optical Flow session did not start`; route gate only); A/B levers, never a product setting |
-| `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion: the most FRUC instances (1..4; recursive midpoints use one per tree level on both routes, default 4; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
+| `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion (the first one AMD FSR frame generation too): the most bridge instances (1..9; recursive midpoints use one per tree level on both routes, default 9 = to x512, 5 = to x32; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
-| `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..4, default 3 offline, 2 live; exact nodes go to depth 4 either way) |
+| `SMV_FRUC_PIPE=0` / `=force` | Live Smooth Motion: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder, the fixed multipliers too (gates; see "Pipelined across pairs") |
+| `SMV_FRUC_STEPUP=0` | Live Smooth Motion / AMD FSR 4 FG: a target between two ladder nodes runs the largest node that fits instead of the node above it (gates; see "The node above the target") |
+| `SMV_LIVE_CASCADE=off` / `=probe` / `=present`, `SMV_LIVE_CASCADE_GEN` | Live DLSS 4.5: `off` = one pass only (no plan above the limit); development only (the direct route): `probe` starts `dlssg2f.exe --stage1` beside the session (in a job object that ends it with the host), feeds it every captured frame and reads every frame it shares on the host's own D3D12 device, presenting nothing of it; `present` = the cascade: the session's DLSS-G (`--gen`) presents stage 1's frames instead of the captured ones (x6 x x2 = x12); `_GEN` = stage 1's generated frames (1..5, default 5). Lines `cascade probe: ...` / `cascade stage 1: ...` (harness `dlssg_cascade\probe_gate.py`) |
+| `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..9, default 3 offline, 2 live; exact nodes go to depth 9 either way) |
 | `SMV_CQ` | override the encoder CQ for measurement |
 | `SMV_NVENC_SPLIT` | override the NVENC `-split_encode_mode` for measurement (default 15 = off; 2 = two strips, 0 = ffmpeg's auto); never a product setting (the split leaves a seam line) |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
 | `SMV_DLSSG_SWEEP=1` | the DLSS 4.5 host latches its buffer-sweep capture tier at startup instead of waiting for hardware flip metering, so the sweep path can be tested on demand |
-| `SMV_DLSSG_LIMIT=N` | the most DLSS 4.5 makes in one pass (2..6) instead of the GPU's measured limit (`dlssg_limit.json`): `2` renders an RTX 40's passes on an RTX 50 (the cascade's trigger test) |
+| `SMV_DLSSG_LIMIT=N` | the most DLSS 4.5 makes in one pass (2..6) instead of the GPU's measured limit (`dlssg_limit.json`; Live: numFramesToGenerateMax + 1): `2` renders and runs Live with an RTX 40's passes on an RTX 50 (the cascade's trigger test) |
 | `SMV_DLSSG_HDR10=0` | DLSS 4.5 gets HDR planes as 8-bit codes on an RGBA8 swap chain (labelled SDR) instead of HDR10; an A/B lever, never a product setting |
 | `SMV_DLSSG_REFUSE_HDR10=1` | the DLSS 4.5 host treats the HDR10 colour space as refused (exit 5): the trigger test of the host's 8-bit fallback |
 | `SMV_DLSSG_FOCUS_SHIM=0` | the DLSS 4.5 host's focus shim off: by default `dlssg2f` points the Streamline modules' `GetForegroundWindow` imports at its own off-screen window, because Streamline 2.14 pauses frame generation whenever another window has focus (a render then stopped with `DLSS_PREEMPTED` while the user worked in another window); the A/B and trigger test only, never a product setting |
@@ -1779,7 +1866,7 @@ bridge without `nvoffruc_step` falls back to `nvoffruc_interpolate`, which feeds
 tween (the priming call costs a full optical flow). Measured at 2560x1472: 1.51x the tweens per
 second at one tween per pair, 1.95x at four, pixels inside NvOFFRUC's run-to-run noise.
 
-Instances (2026-09-26): the bridge holds up to four FRUC instances, each with its own CUDA context,
+Instances: the bridge holds up to 16 FRUC instances (the host uses 9), each with its own CUDA context,
 surfaces and NvOFFRUC handle (`nvoffruc_create_i`, `nvoffruc_step_i`, `nvoffruc_destroy_i`; the
 classic exports drive instance 0, `nvoffruc_destroy` frees them all; the last error is per thread).
 The host plans each pair's tweens (`nativeFrucPlan`) and runs tween k on instance k % n, a round of
@@ -1803,7 +1890,8 @@ host computes the pair's whole tree to its depth, level by level, left to right
 4 / 2^L .. B) and stays in mode 1. Never compute a node alone: its instance then needs a prime
 whose optical flow spans the skipped nodes, NvOFFRUC seeds the next flow from it, and those nodes
 came out damaged (up to 28 % of a held frame). Depth: the smallest that holds every t as a node
-(x2 / x4 / x8 / x16 = 1 / 2 / 3 / 4 levels = 1 / 3 / 7 / 15 calls per pair, on both routes); a
+(x2 / x4 / x8 / .. / x512 = 1 / 2 / 3 / .. / 9 levels = 1 / 3 / 7 / .. / 511 calls per pair, on both
+routes); a
 pair with a t that is no node takes the nearest nodes at depth `SMV_FRUC_DEPTH` (default 3
 offline, 2 live, so x5 live shows the nodes 0.25 / 0.5 / 0.5 / 0.75; offline a deeper exact t in
 the same pair deepens it, live never: a grid phase that lands on a deep node by chance would cost
@@ -1811,6 +1899,42 @@ the whole deep tree for the pair's few snapped tweens). Measured on a 1440p anim
 two real frames: 0.60 % -> 0.016 % at x4, 0.90 % -> 0.015 % at x5 (RIFE 0.009 %, NVOF 0.007 %);
 FRUC time per pair offline x4 35.8 -> 41.7 ms, x5 47.0 -> 94.6 ms; motion looks like the direct-t
 scheme's.
+
+Pipelined across pairs (Live, Smooth Motion at x4 and deeper): a tree is a serial chain of bridge
+calls (x4 = 1 / 2, then 1 / 4 and 3 / 4) and every call waits for the GPU at entry and exit, so at
+1440p (~15 ms a call) x4 does not fit a 24 fps source's 41.7 ms. When the direct tree cannot hold
+the ladder and the pipelined one can, a group shows the PREVIOUS pair: its level 1 ran on instance 0
+during the previous group (its own worker thread), its levels 2 and deeper run on instances 1.. while
+instance 0 makes the new pair's level 1 beside them. Every instance still sees its frames in time
+order, so the nodes are the direct tree's; the price is one source period more latency (the stats'
+latency includes it). The exe prices both trees from the host's per-call and per-slot times (direct:
+M - 1 calls and M slot stores; pipelined: one call less plus ~0.1 call of overlap) and goes pipelined
+when M - 1 exceeds the direct tree's tweens by 3 % and fits the pipelined one's, back to direct only
+below 90 % of the direct tree's (a direct tree at its edge flaps its lock), at most one switch per 2 s;
+entering holds one source period (the pair the last direct group showed), leaving skips one pair. Log: `present grid: xM pipelined across pairs ...`
+or `... direct` at a switch, the throttle line ends with `a Smooth Motion call N ms + N ms a slot,
+direct N / pipelined N`, the session line with `N groups pipelined`. `SMV_FRUC_PIPE=0` = never,
+`=force` = every x4 or deeper ladder, the fixed multipliers too (gates). AMD FSR 4 FG does not
+pipeline. It makes every real frame's level 1 before the slots and queues its calls on the stream
+(the CPU call returns at once; the stream waits for a node where it is first read), so its price
+comes off each group's whole GPU time: an x2 group's whole time, and per extra call the x4+ group's
+whole time less that and its extra slot stores; tweens a pair = 1 + (budget - x2's time) / (call +
+slot) (the throttle line ends with `an AMD FSR 4 call N ms + N ms a slot over an x2 pair's N ms,
+direct N`). One mean tween time read ~0.1 ms at x2 and ~9 ms at x4 (1440p) and flapped the ladder
+x2 / x4 about 100 times a minute; priced, 1440p holds x2 and 1080p x4 (calls ~21 / ~11 ms). A group
+that creates bridge instances (the first group at a new depth) and the group after it leave both
+prices alone: the creation and the new instance's first calls land in their time (a first x4 group
+once billed an FSR 4 call at 20.3 ms at 854x480).
+
+The node above the target (Live, Smooth Motion and AMD FSR 4 FG): their ladders are the powers of two,
+so a target between two of them (x3 of the source rate, or 40 fps from a 24 fps source) runs the
+node ABOVE it whenever the GPU affords that node: the throttle's tweens a pair before the target
+clamps them (the prices above; for FSR 4 its first x4 group is the price probe), with 10 % to spare
+and 2 s since the last lock change to enter, 3 % to hold, and only while its slots fit the present
+floor (the node's rate <= max(target, panel mode) / 0.95) and the slot count. Otherwise the largest
+node that fits, as before. A target on a node (within 3 %) never steps up. Log: `present grid: locked
+to xM (...), the node above the target`. `SMV_FRUC_STEPUP=0` = the largest node that fits (gates:
+harness ladder_gate.py's stepup cases).
 
 Rules kept from debugging: FRUC's `pFrame` and every registered resource must be a `CUdeviceptr*`
 (the host address of the variable holding the device pointer), pitch = `width*4`, and the priming
@@ -1828,11 +1952,11 @@ loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
 vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
-github.com/HansKristian-Work/vkd3d-proton at 2230755878b01993b4b82d0ac0c0624f3ab4d333 with its submodules
+github.com/HansKristian-Work/vkd3d-proton at fdbaf51f8794e8d75ad8c43dc2d62fcc8a136af3 with its submodules
 (dxil-spirv at ab47c3df1a4746f36c958f0262bc9e314eb566eb), then
 
 ```
-git apply engine/fsrfg/source/vkd3d-proton-2230755-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/vkd3d-proton-fdbaf51-smv.patch        (in the vkd3d-proton checkout)
 git apply engine/fsrfg/source/dxil-spirv-ab47c3d-smv.patch          (in subprojects/dxil-spirv)
 meson setup build --buildtype=release -Denable_extended_emulation=true
 ninja -C build
@@ -1859,7 +1983,7 @@ python build.py
 
 C API (`fsrfg_bridge.cpp`, nvoffruc_bridge's shape): `fsrfg_set_cache_dir(dir)` names vkd3d-proton's shader
 cache root before the first instance (the host passes the model cache's `fsr4_shaders`); `fsrfg_create_i(i, w,
-h, luidLow, luidHigh, fmt, FsrfgShared*)` makes instance i (up to 4) on vkd3d-proton's device for the CUDA
+h, luidLow, luidHigh, fmt, FsrfgShared*)` makes instance i (up to 5) on vkd3d-proton's device for the CUDA
 device's adapter (the first one loads the chain and picks the DLL's FSR 4 version, or fails naming what it
 offers) and returns NT handles of three shared textures (the frame, RG16F vectors, the generated frame),
 their allocation sizes, a linear row pitch for each, and a shared fence; `fsrfg_frame_i(i, wait, signal,
