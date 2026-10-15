@@ -4119,6 +4119,8 @@ static const char* const kGmA[kGmAn] = {"qf", "flow0"};
 // GPU without the room for a level never reaches it
 constexpr int kFrDepth = 9, kFrGrid = 1 << kFrDepth;
 static_assert(kFrDepth <= 9, "a slot's fraction below 0.999f is a tween: x1024's last node (1023 / 1024) is not");
+// the groups at a pipelined spell's start whose prices over the direct call before it give the pipelined route's ratios
+constexpr int kFrPipeLearn = 8;
 
 struct NativeRife
 {
@@ -4308,21 +4310,26 @@ struct NativeRife
     uint64_t frLastKey[kFrDepth] = {}; // per instance: the key of the frame it was fed last, 0 = none
     uint64_t frNodeCalls = 0;
     // pipelined across pairs (live Smooth Motion, the exe's route bit on a group of x4 or deeper): a group shows the
-    // PREVIOUS pair, whose level-1 midpoint instance 0 made during the previous group on its own worker (g_frW[0])
-    // while the compute thread ran the levels below it of the pair before; every instance still sees its frames in
-    // time order. frLag* = the pair shown (its serial, surfaces, SDR view, nodes, held = identical or never split);
-    // frKeep = the surface the next pack spares (the shown pair's first frame)
+    // PREVIOUS pair, whose levels 1..k instance 0 made during the previous group on its own worker (g_frW[0], k = the
+    // depth less one: nativeFrucPipeSpec) while the compute thread ran the deeper levels of the pair before; every
+    // instance still sees its frames in time order. frLag* = the pair shown (its serial, surfaces, SDR view, nodes,
+    // held = identical or never split); frKeep = the surface the next pack spares (the shown pair's first frame);
+    // frPipeDepth = the depth the last pipelined group's tweens asked (the worker's k)
     bool frPipePrev = false, frLagHave = false, frLagSdr = false, frLagStatic = false, frCurStatic = false;
     bool frSpecRun = false, frRepacked = false;
-    int frLagA = -1, frLagB = -1, frKeep = -1, frLagL = 0;
+    int frLagA = -1, frLagB = -1, frKeep = -1, frLagL = 0, frPipeDepth = 0;
     uint64_t frLagSerial = 0, frPipeGroups = 0;
     uint8_t* dFrLagNode[kFrGrid] = {};
     bool frLagOk[kFrGrid] = {};
     // this group's midpoint-tree calls on the compute thread (Smooth Motion's bridge or AMD FSR 4's: calls, their ms,
     // the calls and ms of those made before the slots = FSR 4's level 1, and the chain inside the slots incl. a
-    // pipelined group's level-1 join) for the exe's price (gFrCallUs / gFrStoreUs)
-    uint32_t grFrCalls = 0, grFrPreCalls = 0;
-    double grFrCallMs = 0.0, grFrPreMs = 0.0, grFrChainMs = 0.0, gFrCallMs = 0.0, gFrStoreMs = 0.0;
+    // pipelined group's worker join) for the exe's price (gFrCallUs / gFrStoreUs); a pipelined group's route
+    // (grPiped) and instance 0's worker's calls + ms (grFrWk*) for the pipelined prices (gFrPipeMainUs / gFrPipeWkUs)
+    uint32_t grFrCalls = 0, grFrPreCalls = 0, grFrWkCalls = 0;
+    double grFrCallMs = 0.0, grFrPreMs = 0.0, grFrChainMs = 0.0, gFrCallMs = 0.0, gFrStoreMs = 0.0, grFrWkMs = 0.0;
+    double gFrPipeMainMs = 0.0, gFrPipeWkMs = 0.0, gFrPipeRm = 0.0, gFrPipeRw = 0.0, gFrCallEntryMs = 0.0;
+    int grPipeLearn = 0; // the groups left of a pipelined spell's start that learn gFrPipeRm / gFrPipeRw
+    bool grPiped = false;
     // groups whose midpoint-tree price is not sampled: one that made instances (their creation and first, cold calls
     // land in its time: a first x4 group billed AMD FSR 4's call at 20.3 ms at 854x480) and the next
     int grPriceSkip = 0;
@@ -4683,9 +4690,11 @@ struct NativeRife
     double gIntMs = 0.0, gTweenMs = 0.0;
     std::atomic<uint32_t> gIntUs{0}, gTweenUs{0};
     // Smooth Motion's midpoint tree: one bridge call, and one slot's unpack + store (the slots' time less the calls'),
-    // so the exe prices the direct tree ((M - 1) calls + M stores) and the pipelined one ((M - 2) calls + the overlap
-    // + M stores) apart; AMD FSR 4's: one call, one slot, and an x2 group's whole time (gFrBaseUs); 0 = not timed yet
-    std::atomic<uint32_t> gFrCallUs{0}, gFrStoreUs{0}, gFrBaseUs{0};
+    // so the exe prices the direct tree ((M - 1) calls + M stores) and the pipelined one (M stores + the longer of
+    // the compute thread's calls and instance 0's worker's, each at the pipelined groups' own price: gFrPipeMainUs =
+    // the compute thread's chain a call incl. the join, gFrPipeWkUs = a worker call) apart; AMD FSR 4's: one call, one
+    // slot, and an x2 group's whole time (gFrBaseUs); 0 = not timed yet
+    std::atomic<uint32_t> gFrCallUs{0}, gFrStoreUs{0}, gFrBaseUs{0}, gFrPipeMainUs{0}, gFrPipeWkUs{0};
     double gFrBaseMs = 0.0;
     // AMD FSR 4's level-1 call (made before the slots at every ladder): its FSR span on the stream (fgL1Ev, from the
     // fence signal to the result's wait), that span in the x2 groups that set the base (gFrL1BaseMs) and the call
@@ -8655,6 +8664,8 @@ static FrucBridge g_fruc;
 // one worker per extra instance (1..kFrDepth - 1): the compute thread hands it one step at a time and
 // collects the result in tween order. The worker binds the host's device first, so the bridge's
 // entry fence (cuCtxSynchronize on the caller's context) covers the host's packs and unpacks.
+// Instance 0's worker serves the pipelined route instead: a job of levels > 0 = the next pair's levels 1..levels
+// (nativeFrucSpecLevels), its calls, ms and counters kept here until the compute thread's join adds them
 struct FrucWorker
 {
     std::thread th;
@@ -8667,9 +8678,52 @@ struct FrucWorker
     double t = 0.0;
     int mode = 0, rc = 0, rep = 0;
     std::string err;
+    int levels = 0;
+    NativeRife* nr = nullptr;
+    uint32_t calls = 0;
+    uint64_t nodeCalls = 0, repeats = 0, primed = 0;
+    double ms = 0.0;
 };
 // never destroyed: no std::thread destructor runs at process exit (nativeFrucFree joins them)
 static FrucWorker* const g_frW = new FrucWorker[kFrDepth];
+static int nativeFrucSpecLevels(NativeRife& nr, FrucWorker& w);
+
+// the pipelined route's level gate: the deepest level of the shown pair the compute thread has made (kFrDepth once it
+// has no more to make), so instance 0's worker starts a level of the next pair only after the shown pair's same level
+// (one instance a level: no instance fed by two threads or out of time order when a ladder deepens)
+static std::mutex g_frLagM;
+static std::condition_variable g_frLagCv;
+static int g_frLagDone = kFrDepth;
+// each instance's calls in flight (nativeFrucNode): a second thread entering one logs `entered by two threads` once a
+// session; SMV_FRUC_PIPE_GATE=0 = the worker never waits on the gate (that line's trigger, a test lever)
+static std::atomic<int> g_frInUse[kFrDepth];
+static std::atomic<bool> g_frInUseLogged{false};
+static bool frucPipeGateOn()
+{
+    static const bool on = [] {
+        char v[8] = "";
+        return !(GetEnvironmentVariableA("SMV_FRUC_PIPE_GATE", v, sizeof(v)) > 0 && v[0] == '0');
+    }();
+    return on;
+}
+static void frucLagDone(int l)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_frLagM);
+        g_frLagDone = (std::max)(g_frLagDone, l);
+    }
+    g_frLagCv.notify_all();
+}
+
+// the levels instance 0's worker may take of a pipelined pair: SMV_FRUC_PIPE_K caps them (1 = the level-1 call alone)
+static int frucPipeK()
+{
+    static const int k = [] {
+        char v[8] = "";
+        return GetEnvironmentVariableA("SMV_FRUC_PIPE_K", v, sizeof(v)) > 0 ? (std::max)(1, atoi(v)) : kFrDepth;
+    }();
+    return k;
+}
 
 static void frucWorkerLoop(int i, int dev)
 {
@@ -8687,10 +8741,21 @@ static void frucWorkerLoop(int i, int dev)
         void* out = w.out;
         const double t = w.t;
         const int mode = w.mode;
+        const int levels = w.levels;
+        NativeRife* nr = w.nr;
         lk.unlock();
-        int rep = 0;
-        const int rc = bound ? g_fruc.stepI(i, a, b, out, t, mode, &rep) : -100;
-        std::string err = rc == -100 ? std::string("worker CUDA bind failed") : (rc ? g_fruc.lastError() : "");
+        int rep = 0, rc = -100;
+        std::string err = "worker CUDA bind failed";
+        if (bound && levels > 0)
+        {
+            rc = nativeFrucSpecLevels(*nr, w); // its calls, counters and error text go to w
+            err = rc ? w.err : std::string();
+        }
+        else if (bound)
+        {
+            rc = g_fruc.stepI(i, a, b, out, t, mode, &rep);
+            err = rc ? g_fruc.lastError() : "";
+        }
         lk.lock();
         w.rc = rc;
         w.rep = rep;
@@ -8806,18 +8871,23 @@ static bool nativeFrucSetup(NativeRife& nr)
     nr.frPipePrev = nr.frLagHave = nr.frLagSdr = nr.frLagStatic = nr.frCurStatic = false;
     nr.frSpecRun = nr.frRepacked = false;
     nr.frLagA = nr.frLagB = nr.frKeep = -1;
-    nr.frLagL = 0;
+    nr.frLagL = nr.frPipeDepth = 0;
     nr.frLagSerial = nr.frPipeGroups = 0;
     for (bool& ok : nr.frLagOk)
         ok = false;
-    nr.grFrCalls = nr.grFrPreCalls = 0;
+    nr.grFrCalls = nr.grFrPreCalls = nr.grFrWkCalls = 0;
     nr.grPriceSkip = 0;
     nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = nr.gFrCallMs = nr.gFrStoreMs = nr.gFrBaseMs = nr.gFrL1Ratio =
-        nr.gFrL1BaseMs = 0.0;
-    nr.grL1Armed = false;
+        nr.gFrL1BaseMs = nr.grFrWkMs = nr.gFrPipeMainMs = nr.gFrPipeWkMs = nr.gFrPipeRm = nr.gFrPipeRw =
+            nr.gFrCallEntryMs = 0.0;
+    nr.grPipeLearn = 0;
+    nr.grL1Armed = nr.grPiped = false;
     nr.gFrCallUs.store(0);
     nr.gFrStoreUs.store(0);
     nr.gFrBaseUs.store(0);
+    nr.gFrPipeMainUs.store(0);
+    nr.gFrPipeWkUs.store(0);
+    g_frInUseLogged = false;
     if (nr.frMp)
         LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA, feed-once, recursive midpoints (depth cap %d)\n",
             nr.pw, nr.ph, nr.w, nr.h, nr.frMpCap);
@@ -8877,9 +8947,10 @@ static void nativeFrucGrow(NativeRife& nr, int want)
 }
 
 // wait until every worker is idle (a round the caller abandoned, a session's end); instance 0's worker exists once a
-// pipelined group ran
+// pipelined group ran (the level gate opened first: a failed group never reached its join)
 static void nativeFrucDrain(NativeRife& nr)
 {
+    frucLagDone(kFrDepth);
     for (int i = 0; i < nr.frInst; i++)
     {
         FrucWorker& w = g_frW[i];
@@ -8890,8 +8961,8 @@ static void nativeFrucDrain(NativeRife& nr)
     }
 }
 
-// a pipelined group's level-1 call (the next pair's midpoint) on instance 0's worker, made by the first such group
-static void nativeFrucSpecStart(NativeRife& nr, void* a, void* b, void* out, int mode)
+// a pipelined group's job on instance 0's worker (made by the first such group): the next pair's levels 1..levels
+static void nativeFrucSpecStart(NativeRife& nr, int levels)
 {
     FrucWorker& w = g_frW[0];
     if (!w.th.joinable())
@@ -8901,38 +8972,41 @@ static void nativeFrucSpecStart(NativeRife& nr, void* a, void* b, void* out, int
         w.th = std::thread(frucWorkerLoop, 0, nr.dev);
     }
     std::lock_guard<std::mutex> lk(w.m);
-    w.a = a;
-    w.b = b;
-    w.out = out;
-    w.t = 0.5;
-    w.mode = mode;
+    w.levels = levels;
+    w.nr = &nr;
+    w.calls = 0;
+    w.nodeCalls = w.repeats = w.primed = 0;
+    w.ms = 0.0;
+    w.err.clear();
     w.done = false;
     w.job = true;
     w.cv.notify_all();
     nr.frSpecRun = true;
 }
 
-// its result: the node and instance 0's key on success (the bookkeeping nativeFrucNode does for its own calls)
+// its result: the gate opened (a level the shown pair no longer needs), the job waited for, its counters added and its
+// calls kept for the pipelined price (its nodes and its instances' keys were set by nativeFrucNode)
 static bool nativeFrucSpecJoin(NativeRife& nr)
 {
     if (!nr.frSpecRun)
         return true;
     nr.frSpecRun = false;
+    frucLagDone(kFrDepth);
     FrucWorker& w = g_frW[0];
     std::unique_lock<std::mutex> lk(w.m);
     w.cv.wait(lk, [&] { return w.done; });
+    nr.frNodeCalls += w.nodeCalls;
+    nr.frRepeats += w.repeats;
+    nr.frPrimed += w.primed;
+    nr.grFrWkCalls = w.calls;
+    nr.grFrWkMs = w.ms;
     if (w.rc != 0)
     {
-        LOG("native: fruc: midpoint 1/2 on instance 0 (pipelined) failed: %s (rc %d)\n", w.err.c_str(), w.rc);
+        LOG("native: fruc: the next pair's levels 1..%d on instance 0's worker (pipelined) failed: %s (rc %d)\n",
+            w.levels, w.err.c_str(), w.rc);
         nr.die("fruc midpoint failed");
         return false;
     }
-    nr.frLastKey[0] = nr.frSerial * kFrGrid + 1; // fed the pair's second frame last
-    nr.frCalls[0]++;
-    nr.frNodeCalls++;
-    if (w.rep)
-        nr.frRepeats++;
-    nr.frNodeOk[kFrGrid / 2] = true;
     return true;
 }
 
@@ -9153,8 +9227,9 @@ static uint64_t nativeFrucKey(const FrTree& tr, int k, int L)
 
 // node k / 2^L of a pair's midpoint tree, once per pair: FRUC at t = 0.5 between the node's two
 // parents (computed first) on instance L - 1, mode 1 when that instance was fed the left parent
-// last, else mode 0 (prime the left parent, feed the right one)
-static uint8_t* nativeFrucNode(NativeRife& nr, const FrTree& tr, int k, int L)
+// last, else mode 0 (prime the left parent, feed the right one). On instance 0's worker (w) the calls, counters and a
+// failure's text go to w (the compute thread runs the other instances meanwhile; its join adds them)
+static uint8_t* nativeFrucNode(NativeRife& nr, const FrTree& tr, int k, int L, FrucWorker* w = nullptr)
 {
     while (L > 0 && !(k & 1))
     {
@@ -9166,38 +9241,94 @@ static uint8_t* nativeFrucNode(NativeRife& nr, const FrTree& tr, int k, int L)
     const int p = k << (kFrDepth - L);
     if (tr.ok[p])
         return tr.node[p];
-    uint8_t* left = nativeFrucNode(nr, tr, k - 1, L);
-    uint8_t* right = left ? nativeFrucNode(nr, tr, k + 1, L) : nullptr;
+    uint8_t* left = nativeFrucNode(nr, tr, k - 1, L, w);
+    uint8_t* right = left ? nativeFrucNode(nr, tr, k + 1, L, w) : nullptr;
     if (!right)
         return nullptr;
     if (!tr.node[p] && cudaMalloc((void**)&tr.node[p], (size_t)nr.pw * nr.ph * 4) != cudaSuccess)
     {
         tr.node[p] = nullptr;
-        nr.die("fruc midpoint buffer alloc failed");
+        if (w)
+            w->err = "fruc midpoint buffer alloc failed";
+        else
+            nr.die("fruc midpoint buffer alloc failed");
         return nullptr;
     }
     const int i = L - 1;
     const int mode = nr.frLastKey[i] == nativeFrucKey(tr, k - 1, L) ? 1 : 0;
     if (mode == 0 && nr.frCalls[i] > 0)
-        nr.frPrimed++;
+        (w ? w->primed : nr.frPrimed)++;
     int rep = 0;
+    if (g_frInUse[i].fetch_add(1) && !g_frInUseLogged.exchange(true))
+        LOG("native: fruc: instance %d entered by two threads (pipelined level %d)\n", i, L);
     const int64_t c0 = nowQpc100();
     const int rc = g_fruc.stepI(i, left, right, tr.node[p], 0.5, mode, &rep);
-    nr.grFrCalls++;
-    nr.grFrCallMs += (double)(nowQpc100() - c0) / 10000.0;
+    const double ms = (double)(nowQpc100() - c0) / 10000.0;
+    g_frInUse[i].fetch_sub(1);
+    if (w)
+    {
+        w->calls++;
+        w->ms += ms;
+    }
+    else
+    {
+        nr.grFrCalls++;
+        nr.grFrCallMs += ms;
+    }
     if (rc != 0)
     {
+        if (w)
+        {
+            char e[256];
+            snprintf(e, sizeof(e), "midpoint %d/%d on instance %d: %s (bridge rc %d)", k, 1 << L, i, g_fruc.lastError(),
+                     rc);
+            w->err = e;
+            return nullptr;
+        }
         LOG("native: fruc: midpoint %d/%d on instance %d failed: %s (rc %d)\n", k, 1 << L, i, g_fruc.lastError(), rc);
         nr.die("fruc midpoint failed");
         return nullptr;
     }
     nr.frLastKey[i] = nativeFrucKey(tr, k + 1, L);
     nr.frCalls[i]++;
-    nr.frNodeCalls++;
+    (w ? w->nodeCalls : nr.frNodeCalls)++;
     if (rep)
-        nr.frRepeats++;
+        (w ? w->repeats : nr.frRepeats)++;
     tr.ok[p] = true;
     return tr.node[p];
+}
+
+// the levels of the shown pair already made (each level's every node), the level gate's start
+static int nativeFrucLagMade(const NativeRife& nr)
+{
+    int l = 0;
+    for (int L = 1; L <= kFrDepth; L++)
+    {
+        for (int k = 1; k < (1 << L); k += 2)
+            if (!nr.frLagOk[k << (kFrDepth - L)])
+                return l;
+        l = L;
+    }
+    return l;
+}
+
+// instance 0's worker on a pipelined group: the next pair's levels 1..w.levels (instances 0..levels - 1), level by
+// level as nativeFrucTween builds a tree, each level after the level gate passed it (the shown pair's same level made)
+static int nativeFrucSpecLevels(NativeRife& nr, FrucWorker& w)
+{
+    const FrTree tr = nativeFrucCur(nr);
+    for (int l = 1; l <= w.levels; l++)
+    {
+        if (frucPipeGateOn())
+        {
+            std::unique_lock<std::mutex> lk(g_frLagM);
+            g_frLagCv.wait(lk, [&] { return g_frLagDone >= l; });
+        }
+        for (int k = 1; k < (1 << l); k += 2)
+            if (!nativeFrucNode(nr, tr, k, l, &w))
+                return -1;
+    }
+    return 0;
 }
 
 // a FRUC output (true BGRA8) into dFrOut (3, ph, pw) as (R, G, B) planes; an SDR pair's tween back to the HDR
@@ -9333,8 +9464,8 @@ static bool nativeFrucTween(NativeRife& nr, double t)
     return nativeFrucUnpack(nr, outB, nr.frPairSdr);
 }
 
-// a pipelined group's pair step: the pair the last group made current becomes the shown one (its level-1 midpoint,
-// made by instance 0's worker, is among its nodes), then the new frame is packed, sparing the shown pair's first
+// a pipelined group's pair step: the pair the last group made current becomes the shown one (its levels 1..k, made by
+// instance 0's worker, are among its nodes), then the new frame is packed, sparing the shown pair's first
 // frame. The shown pair is held (its second frame in every slot) when it was identical, when the last group was not
 // pipelined (it showed that pair itself: the route's entry costs one source period's hold) or when its second frame
 // was packed again in the other encoding
@@ -9360,28 +9491,27 @@ static bool nativeFrucPipeAdvance(NativeRife& nr, const float* dCur, bool curSta
     return ok;
 }
 
-// instance 0's level-1 call of the new pair on its worker (the next group shows the pair), unless the pair is identical
-// or has no first frame yet
+// the new pair's levels 1..k on instance 0's worker (the next group shows the pair), unless the pair is identical or has
+// no first frame yet: k = the depth of this group's tweens less one (x4: the level-1 call alone, x8 two levels, x32
+// four), so the worker's 2^k - 1 calls run beside the compute thread's 2^L - 2^k of the shown pair (its deepest
+// level); the worker's calls run slower beside them, so depth - 1 is the best split at x8 to x64. The level gate starts
+// at the shown pair's levels already made (kFrDepth when it is held: the compute thread makes none)
 static bool nativeFrucPipeSpec(NativeRife& nr)
 {
     if (nr.frCurStatic || nr.frA < 0)
         return true;
-    if (!nr.dFrNode[kFrGrid / 2] &&
-        cudaMalloc((void**)&nr.dFrNode[kFrGrid / 2], (size_t)nr.pw * nr.ph * 4) != cudaSuccess)
+    const int k = (std::max)(1, (std::min)({nr.frPipeDepth - 1, nr.frInst - 1, frucPipeK()}));
     {
-        nr.dFrNode[kFrGrid / 2] = nullptr;
-        nr.die("fruc midpoint buffer alloc failed");
-        return false;
+        std::lock_guard<std::mutex> lk(g_frLagM);
+        g_frLagDone = nr.frLagHave && !nr.frLagStatic ? nativeFrucLagMade(nr) : kFrDepth;
     }
-    const int mode = nr.frLastKey[0] == nativeFrucKey(nativeFrucCur(nr), 0, 1) ? 1 : 0;
-    if (mode == 0 && nr.frCalls[0] > 0)
-        nr.frPrimed++;
-    nativeFrucSpecStart(nr, nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrNode[kFrGrid / 2], mode);
+    nativeFrucSpecStart(nr, k);
     return true;
 }
 
-// a pipelined group's tween: the shown pair's levels 2.. on instances 1.. (level by level, as nativeFrucTween) beside
-// instance 0's level-1 call of the new pair, that call joined before the slots' stores; then the nearest node
+// a pipelined group's tween: the shown pair's levels the worker did not make (level by level, as nativeFrucTween) on
+// their instances beside instance 0's worker's levels of the new pair, each level opening the gate for its twin; the
+// worker joined before the slots' stores; then the nearest node
 static bool nativeFrucLagTween(NativeRife& nr, double t)
 {
     const FrTree tr = nativeFrucLag(nr);
@@ -9390,9 +9520,12 @@ static bool nativeFrucLagTween(NativeRife& nr, double t)
         nr.frLagL = (std::min)(nativeFrucDepth(nr, &t, 1), nr.frInst);
         const int64_t c0 = nowQpc100();
         for (int l = 2; l <= nr.frLagL; l++)
+        {
             for (int k = 1; k < (1 << l); k += 2)
                 if (!nativeFrucNode(nr, tr, k, l))
                     return false;
+            frucLagDone(l);
+        }
         if (!nativeFrucSpecJoin(nr))
             return false;
         nr.grFrChainMs = (double)(nowQpc100() - c0) / 10000.0;
@@ -14593,7 +14726,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 nr.gTweenUs.store((uint32_t)(nr.gTweenMs * 1000.0));
                 // the midpoint tree (Smooth Motion, AMD FSR 4): a call = the compute thread's calls' mean; a slot = the
                 // slots' time less the calls' chain in them (a direct group: its calls in the slots; a pipelined one:
-                // its levels and the level-1 join); a group that made instances is skipped (grPriceSkip)
+                // its levels and the worker's join); a group that made instances is skipped (grPriceSkip)
                 if (nr.fruc && nr.frMp && nr.grPriceSkip > 0)
                     nr.grPriceSkip--;
                 else if (nr.fruc && nr.frMp && nr.fsrfg && nr.grSlots)
@@ -14641,17 +14774,50 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 }
                 else if (nr.fruc && nr.frMp && nr.grFrCalls && nr.grSlots)
                 {
+                    // a call = the compute thread's calls' mean in every group (on a pipelined one its calls beside the
+                    // worker's read a little dearer: the route's exit stays on the safe side). The pipelined route's
+                    // two prices (the compute thread's chain a call incl. the join's wait, a worker call) are measured
+                    // while it runs and, while the direct tree runs, follow the call by their ratios to the call before
+                    // the last pipelined spell (gFrPipeRm / gFrPipeRw, its first kFrPipeLearn groups): a load that passed
+                    // while the direct tree ran leaves no stale pipelined price
+                    if (nr.grPiped && nr.grPipeLearn == kFrPipeLearn)
+                        nr.gFrCallEntryMs = nr.gFrCallMs; // the call before this pipelined spell
                     ema(nr.gFrCallMs, nr.grFrCallMs / nr.grFrCalls);
+                    if (!nr.grPiped)
+                    {
+                        nr.grPipeLearn = kFrPipeLearn;
+                        if (nr.gFrPipeRm > 0.0)
+                        {
+                            nr.gFrPipeMainMs = nr.gFrCallMs * nr.gFrPipeRm;
+                            nr.gFrPipeWkMs = nr.gFrCallMs * nr.gFrPipeRw;
+                        }
+                    }
+                    else
+                    {
+                        const double main = nr.grFrChainMs / nr.grFrCalls;
+                        const double wk = nr.grFrWkCalls ? nr.grFrWkMs / nr.grFrWkCalls : 0.0;
+                        ema(nr.gFrPipeMainMs, main);
+                        if (wk > 0.0)
+                            ema(nr.gFrPipeWkMs, wk);
+                        if (nr.grPipeLearn > 0 && nr.gFrCallEntryMs > 0.0 && wk > 0.0)
+                        {
+                            ema(nr.gFrPipeRm, main / nr.gFrCallEntryMs);
+                            ema(nr.gFrPipeRw, wk / nr.gFrCallEntryMs);
+                            nr.grPipeLearn--;
+                        }
+                    }
                     ema(nr.gFrStoreMs, (std::max)(0.0, ((double)slots - nr.grFrChainMs) / nr.grSlots));
                     nr.gFrCallUs.store((uint32_t)(nr.gFrCallMs * 1000.0));
                     nr.gFrStoreUs.store((uint32_t)(nr.gFrStoreMs * 1000.0));
+                    nr.gFrPipeMainUs.store((uint32_t)(nr.gFrPipeMainMs * 1000.0));
+                    nr.gFrPipeWkUs.store((uint32_t)(nr.gFrPipeWkMs * 1000.0));
                 }
             }
         }
     }
     nr.grArmed = nr.grL1Armed = false;
-    nr.grFrCalls = nr.grFrPreCalls = 0;
-    nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = 0.0;
+    nr.grFrCalls = nr.grFrPreCalls = nr.grFrWkCalls = 0;
+    nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = nr.grFrWkMs = 0.0;
 
     // (1) the exe signalled the capture fence with this sequence number before writing us
     cudaExternalSemaphoreWaitParams wp{};
@@ -15091,6 +15257,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             const int want = nTween ? (std::min)(nativeFrucDepth(nr, tw, nTween), nr.frInstMax) : 0;
             if (nr.frInst < want)
                 nativeFrucGrow(nr, want);
+            if (want)
+                nr.frPipeDepth = want;
         }
     }
     else if (nr.fruc)
@@ -15161,8 +15329,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         cudaEventRecord(nr.grEv[0], st);
     nr.grFrPreMs = nr.grFrCallMs;
     nr.grFrPreCalls = nr.grFrCalls;
-    // a pipelined group: the new pair's level-1 call starts beside this group's slots (joined in nativeFrucLagTween,
-    // or below when the shown pair is held)
+    // a pipelined group: the new pair's levels 1..k start on instance 0's worker beside this group's slots (joined in
+    // nativeFrucLagTween, or below when the shown pair is held)
     if (pipe && !nativeFrucPipeSpec(nr))
         return false;
     const int pitchI = (int)nr.pitch;
@@ -15540,6 +15708,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     {
         cudaEventRecord(nr.grEv[1], st);
         nr.grArmed = true;
+        nr.grPiped = pipe;
         nr.grTween = twDone;
         nr.grSlots = nfr;
     }

@@ -2198,12 +2198,41 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         double thrDropEma = 0; // drops a second, smoothed over the 500 ms windows (~2 s)
         double thrMoveT = 0;   // when the target last moved: drops within 2 s of it are the move's, not the budget's
         // Smooth Motion's midpoint tree priced per route from the host's call and per-slot store times (gFrCallUs /
-        // gFrStoreUs): the tweens a pair the direct tree affords ((M - 1) calls + M stores) and the pipelined one
-        // ((M - 2) calls + the overlap + M stores, fruc-pipe); 0 = not priced (the plain tween time rules)
+        // gFrStoreUs): the tweens a pair the direct tree affords ((M - 1) calls + M stores) and the pipelined one (M
+        // stores + the longer of the compute thread's calls and instance 0's worker's, fruc-pipe); 0 = not priced (the
+        // plain tween time rules)
         double thrMd = 0, thrMp = 0;
-        const double kFrucPipeOverlap = 0.1; // the level-1 call beside a level-2 one costs ~0.1 call more (t_shared)
-        const double kThrWinMs = 500;        // control window: long enough to measure a drop RATE
-        double emaDt = 0;                    // smoothed capture interval (ms), paces the group
+        // the pipelined tree's calls at the pipelined groups' own prices (the host's gFrPipeMainUs / gFrPipeWkUs); until
+        // they are timed, the direct call times these (measured at 640x360 / 1080p / 1440p: the compute thread's calls
+        // 1.04-1.17 x the direct call, a worker call beside them 1.33-1.66 x)
+        const double kFrPipeMainK = 1.17, kFrPipeWkK = 1.66;
+        auto frucPipePrices = [&](double fc, double& pm, double& pw) {
+            pm = srv.nr ? srv.nr->gFrPipeMainUs.load() / 1000.0 : 0.0;
+            pw = srv.nr ? srv.nr->gFrPipeWkUs.load() / 1000.0 : 0.0;
+            if (pm <= 0.0)
+                pm = fc * kFrPipeMainK;
+            if (pw <= 0.0)
+                pw = fc * kFrPipeWkK;
+        };
+        // an M ladder's pipelined calls (M a node, x4 or deeper): instance 0's worker runs the next pair's levels 1..k
+        // (2^k - 1 calls, k = the depth less one, capped by SMV_FRUC_PIPE_K), the compute thread the shown pair's
+        // deeper levels (M - 2^k calls), side by side
+        auto frucPipeCalls = [](double m, double pm, double pw) {
+            const double half = (std::min)(m / 2.0, std::ldexp(1.0, frucPipeK()));
+            return (std::max)((m - half) * pm, (half - 1.0) * pw);
+        };
+        // the tweens a pair the pipelined tree affords in B ms with M stores of fs: frucPipeCalls solved for M,
+        // continuous between the nodes
+        auto frucPipeAfford = [](double B, double fs, double pm, double pw) {
+            const double kCap = std::ldexp(1.0, frucPipeK());
+            // up to the cap (2^k = M / 2): M fs + max(M / 2 pm, (M / 2 - 1) pw) <= B
+            double m = (std::min)(B / (fs + pm / 2.0), (B + pw) / (fs + pw / 2.0));
+            if (m / 2.0 > kCap) // past it: M fs + max((M - 2^k) pm, (2^k - 1) pw) <= B
+                m = (std::min)((B + kCap * pm) / (fs + pm), (B - (kCap - 1.0) * pw) / fs);
+            return m - 1.0;
+        };
+        const double kThrWinMs = 500; // control window: long enough to measure a drop RATE
+        double emaDt = 0;             // smoothed capture interval (ms), paces the group
         ULONGLONG lastArrival = 0;
         int idleSlotIdx = -1;     // last presented slot, re-presentable while the
         uint32_t idleSlotSet = 0; // source is static (the server only rewrites a half
@@ -2551,11 +2580,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         int64_t prevPaceTs = 0;         // the previous frame's place on that clock
         std::vector<double> sendGridMs; // each slot of the last sent group on that clock (ms), its present time - delay
         // fruc-pipe: Smooth Motion's tree pipelined across pairs (nativeFrucPipeAdvance): a group of x4 or deeper shows
-        // the previous pair, so its deeper levels run beside the next pair's level-1 call, one source period later. A
-        // ladder goes pipelined when the direct tree cannot hold it (M - 1 > 1.03 thrMd) and the pipelined one affords
-        // it, back to direct only with 10 % to spare (M - 1 <= 0.9 thrMd: a direct tree at its edge flaps its lock, and
-        // every switch shows, entering holds one source period, leaving skips one pair), never sooner than 2 s after the
-        // last switch. SMV_FRUC_PIPE=0 = never, =force =
+        // the previous pair, so its deepest level runs beside the next pair's levels 1..k on instance 0's worker (k =
+        // the depth less one, nativeFrucPipeSpec), one source period later. A
+        // ladder goes pipelined when the direct tree cannot hold it (M - 1 > 1.03 x the direct tree's tweens a pair)
+        // and the pipelined one affords it, back to direct only with 10 % to spare (M - 1 <= 0.9 x them: a direct tree
+        // at its edge flaps its lock, and every switch shows, entering holds one source period, leaving skips one
+        // pair), never sooner than 2 s after the last switch. SMV_FRUC_PIPE=0 = never, =force =
         // every x4 or deeper ladder, the fixed multipliers too (a gate's lever: the same exe both ways on one source)
         wchar_t fpv[8]{};
         const bool fpSet = GetEnvironmentVariableW(L"SMV_FRUC_PIPE", fpv, 8) != 0;
@@ -2563,14 +2593,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const bool frucPipeForce = fpSet && !wcscmp(fpv, L"force");
         bool frucPiped = false;
         double frucPipeT = -1e9; // nowMs of the last route switch
-        // an M ladder's route by the throttle's direct / pipelined prices (thrMd / thrMp), before the switch dwell:
-        // the sender runs it, lockedMultiple prices it
-        auto frucPipeWant = [&](uint32_t m) {
-            const double need = (double)(m - 1);
-            if (!frucPiped)
-                return need > thrMd * 1.03 && need <= thrMp * 1.03;
-            return need > thrMd * 0.9;
-        };
         // the whole multiple M an adaptive target runs as M's ladder (0 = the grid). On the grid nearly every output
         // frame is a tween, so r times the source's rate costs ~r model calls a pair; M's ladder costs M - 1 and shows
         // the real frame as it is. So with r = the throttle's target over the source's rate (the tweens it affords a
@@ -2607,6 +2629,23 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         double upK = kUpKDefault, upPred = 0, upFailT = 0, upBackoffMs = kUpBackoff0, upOverT = 0;
         uint32_t upM = 0;
         bool upSettled = false; // the stepped-up lock has logged its settled price
+        // an M ladder's route (fruc-pipe), before the switch dwell: the sender runs it, lockedMultiple prices it. The
+        // direct / pipelined trees' tweens a pair (frucAffD / frucAffP) come off the throttle's tree prices over the
+        // ladder's own budget (lockedMultiple's: the faster of the two period averages), never over emaDt alone: that
+        // swings with the source's delivery (+-9 % on the parked testsrc) wider than the band between the two tests
+        double frucAffD = 0, frucAffP = 0;
+        auto frucPipeWant = [&](uint32_t m) {
+            const double fc = srv.nr->gFrCallUs.load() / 1000.0, fs = srv.nr->gFrStoreUs.load() / 1000.0;
+            const double B = (std::min)(lockDtMs, emaDt) * thrBudget - srv.nr->gIntUs.load() / 1000.0;
+            double pm, pw;
+            frucPipePrices(fc, pm, pw);
+            frucAffD = (B - fs) / (fc + fs);
+            frucAffP = frucPipeAfford(B, fs, pm, pw);
+            const double need = (double)(m - 1);
+            if (!frucPiped)
+                return need > frucAffD * 1.03 && need <= frucAffP * 1.03;
+            return need > frucAffD * 0.9;
+        };
         auto lockedMultiple = [&](double target) -> uint32_t {
             lockDtMs = lockDtMs > 0 ? lockDtMs + (emaDt - lockDtMs) / 64.0 : emaDt;
             const double r = target * lockDtMs / 1000.0;
@@ -2653,12 +2692,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (!tree)
                     return pre + (m - 1) * tw;
                 // AMD FSR 4: an x2 group's whole time + (M - 2) calls and stores; Smooth Motion: (M - 1) calls + M
-                // stores, one call less + the overlap on the route the sender pipelines (fruc-pipe, x4 and deeper)
+                // stores, or M stores + the pipelined calls on the route the sender pipelines (fruc-pipe, x4 and deeper)
                 if (fsr)
                     return fb + (m - 2.0) * (fc + fs);
-                const double direct = pre + m * fs + (m - 1.0) * fc;
                 const bool piped = m >= 4 && (frucPipeForce || (frucPipeOn && thrMd > 0.0 && frucPipeWant(m)));
-                return piped ? direct - fc * (1.0 - kFrucPipeOverlap) : direct;
+                if (!piped)
+                    return pre + m * fs + (m - 1.0) * fc;
+                double pm, pw;
+                frucPipePrices(fc, pm, pw);
+                return pre + m * fs + frucPipeCalls(m, pm, pw);
             };
             // a lock holds within slotOk and the hold band (kUpHold), never within kUpSettleMs of its lock; before a
             // group is timed the throttle's r stands in for the price (the node above holds unpriced)
@@ -2937,7 +2979,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if (pipeThis != frucPiped)
             {
                 LOG("present grid: x%u %s (the direct tree affords %.1f tweens, the pipelined one %.1f)\n", nfr,
-                    pipeThis ? "pipelined across pairs, the tweens one source period later" : "direct", thrMd, thrMp);
+                    pipeThis ? "pipelined across pairs, the tweens one source period later" : "direct", frucAffD,
+                    frucAffP);
                 frucPiped = pipeThis;
                 frucPipeT = nowMs();
             }
@@ -3480,10 +3523,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     }
                     else if (frPriced && !srv.nr->fsrfg)
                     {
-                        // Smooth Motion: (M - 1) calls + M stores direct, one call less + the overlap pipelined
+                        // Smooth Motion: (M - 1) calls + M stores direct; M stores + the pipelined calls pipelined
                         const double B = emaDt * thrBudget - pre;
+                        double pm, pw;
+                        frucPipePrices(fc, pm, pw);
                         thrMd = (B - fs) / (fc + fs);
-                        thrMp = (B - fs + fc * (1.0 - kFrucPipeOverlap)) / (fc + fs);
+                        thrMp = frucPipeAfford(B, fs, pm, pw);
                         m = frucPipeOn && thrMp >= 3.0 ? (std::max)(thrMd, thrMp) : thrMd;
                     }
                     next = m >= 1.0 ? m * srcFps : srcFps;
