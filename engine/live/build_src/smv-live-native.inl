@@ -4687,6 +4687,13 @@ struct NativeRife
     // + M stores) apart; AMD FSR 4's: one call, one slot, and an x2 group's whole time (gFrBaseUs); 0 = not timed yet
     std::atomic<uint32_t> gFrCallUs{0}, gFrStoreUs{0}, gFrBaseUs{0};
     double gFrBaseMs = 0.0;
+    // AMD FSR 4's level-1 call (made before the slots at every ladder): its FSR span on the stream (fgL1Ev, from the
+    // fence signal to the result's wait), that span in the x2 groups that set the base (gFrL1BaseMs) and the call
+    // price over it as x4 and deeper groups show it (gFrL1Ratio), so an x2 group keeps the call price current; priced
+    // by x4 and deeper groups alone, a load that passed while x4 fell would keep pricing x4 out for the session
+    cudaEvent_t fgL1Ev[2] = {};
+    bool grL1Armed = false;
+    double gFrL1Ratio = 0.0, gFrL1BaseMs = 0.0;
 
     CUmodule cuMod = nullptr;
     CUfunction fPackInDirect = nullptr, fResizeH = nullptr, fResizeV = nullptr, fH2f = nullptr, fF2h = nullptr,
@@ -8805,7 +8812,9 @@ static bool nativeFrucSetup(NativeRife& nr)
         ok = false;
     nr.grFrCalls = nr.grFrPreCalls = 0;
     nr.grPriceSkip = 0;
-    nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = nr.gFrCallMs = nr.gFrStoreMs = nr.gFrBaseMs = 0.0;
+    nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = nr.gFrCallMs = nr.gFrStoreMs = nr.gFrBaseMs = nr.gFrL1Ratio =
+        nr.gFrL1BaseMs = 0.0;
+    nr.grL1Armed = false;
     nr.gFrCallUs.store(0);
     nr.gFrStoreUs.store(0);
     nr.gFrBaseUs.store(0);
@@ -9802,9 +9811,10 @@ static bool nativeFsrfgOfIn(NativeRife& nr, NativeRife::OfVec& o, const uint8_t*
 // one bridge call: instance i gets `frame` (RGBA16F rows fgPitch apart) with its vectors toward `prev` (the frame the
 // instance was fed last; null = zero vectors: a reset, or a re-prime nobody reads) and returns into `out` (null =
 // dropped) the frame halfway between them. The vectors as the harness made them: the field this frame -> the previous
-// (px) = FSR's convention. ring >= 0: the vectors were made ahead into dFgMvR[ring] (nativeFsrfgAheadVec)
+// (px) = FSR's convention. ring >= 0: the vectors were made ahead into dFgMvR[ring] (nativeFsrfgAheadVec). l1 = the
+// group's level-1 call: its FSR span goes into fgL1Ev for the x2 call price (nativeGroup)
 static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const uint8_t* prev, bool reset, uint8_t* out,
-                            int ring = -1)
+                            int ring = -1, bool l1 = false)
 {
     NativeRife::FgInst& g = nr.fg[i];
     cudaStream_t st = nr.stream;
@@ -9856,6 +9866,8 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
         return false;
     }
     mark(5);
+    if (l1 && nr.fgL1Ev[0])
+        nr.grL1Armed = cudaEventRecord(nr.fgL1Ev[0], st) == cudaSuccess;
     cudaExternalSemaphoreSignalParams sp{};
     sp.params.fence.value = ++g.val;
     if (cudaSignalExternalSemaphoresAsync(&g.sem, &sp, 1, st) != cudaSuccess)
@@ -9883,6 +9895,8 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
         return false;
     }
     mark(6);
+    if (l1 && nr.grL1Armed)
+        nr.grL1Armed = cudaEventRecord(nr.fgL1Ev[1], st) == cudaSuccess;
     if (out && cudaMemcpy2DFromArrayAsync(out, nr.fgPitch, g.out, 0, 0, row, nr.h, cudaMemcpyDeviceToDevice, st) !=
                    cudaSuccess)
     {
@@ -9967,7 +9981,7 @@ static uint8_t* nativeFsrfgNode(NativeRife& nr, int k, int L, int ring = -1)
         nr.frLastKey[i] = lk;
     }
     const int64_t c0 = nowQpc100();
-    if (!nativeFsrfgFeed(nr, i, right, left, false, nr.dFrNode[p], ring))
+    if (!nativeFsrfgFeed(nr, i, right, left, false, nr.dFrNode[p], ring, i == 0))
         return nullptr;
     nr.grFrCalls++;
     nr.grFrCallMs += (double)(nowQpc100() - c0) / 10000.0;
@@ -10750,6 +10764,8 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
             NCHK(cudaEventCreate(&e), "create frame timing event");
         for (cudaEvent_t& e : nr.grEv)
             NCHK(cudaEventCreate(&e), "create group timing event");
+        for (cudaEvent_t& e : nr.fgL1Ev)
+            NCHK(cudaEventCreate(&e), "create fsrfg call timing event");
     }
     // the nvof model: the Optical Flow session and the glue buffers (the kernels are bound above)
     if (nr.nvof && !nativeNvofSetup(nr))
@@ -12133,7 +12149,13 @@ static void nativeFree(NativeRife& nr)
             cudaEventDestroy(e);
             e = nullptr;
         }
-    nr.grArmed = false;
+    for (cudaEvent_t& e : nr.fgL1Ev)
+        if (e)
+        {
+            cudaEventDestroy(e);
+            e = nullptr;
+        }
+    nr.grArmed = nr.grL1Armed = false;
     // PG p.124: mappings must go before the external memory objects, and every outstanding
     // wait must have completed before the semaphore is destroyed (the stream sync above).
     if (nr.dOutRing)
@@ -14580,17 +14602,39 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     // a node where it is first read, so a call's GPU time lands before or inside the slots: the prices
                     // come off a group's WHOLE time. A group with no call in its slots (x2: level 1 is in pre) gives
                     // the base and a slot's store; a group with calls in them gives a call = its whole time less the
-                    // base and its extra stores, per call in the slots
+                    // base and its extra stores, per call in the slots. The level-1 call's FSR span (fgL1Ev) is timed
+                    // in every group: one with calls in its slots learns the call price over that span (gFrL1Ratio),
+                    // an x2 group then prices its call by it, so a load that slowed FSR as it slowed the rest leaves
+                    // no stale price once it passed. The base and the store are not re-measured at x4 and deeper, so
+                    // the ratio takes them scaled by the span's load (this span over the x2 groups' span): that load's
+                    // share of them stays out of the ratio. The call keeps the share: a held x4 is priced at its cost
                     const uint32_t in = nr.grFrCalls - nr.grFrPreCalls;
                     const double whole = (double)pre + slots;
+                    float l1 = 0.0f;
+                    const bool l1Ok = nr.grL1Armed &&
+                                      cudaEventElapsedTime(&l1, nr.fgL1Ev[0], nr.fgL1Ev[1]) == cudaSuccess && l1 > 0.0f;
                     if (!in)
                     {
                         ema(nr.gFrStoreMs, (double)slots / nr.grSlots);
                         ema(nr.gFrBaseMs, whole);
+                        if (l1Ok)
+                        {
+                            ema(nr.gFrL1BaseMs, l1);
+                            if (nr.gFrL1Ratio > 0.0)
+                                ema(nr.gFrCallMs, nr.gFrL1Ratio * l1);
+                        }
                     }
                     else if (nr.gFrBaseMs > 0.0)
-                        ema(nr.gFrCallMs,
-                            (std::max)(0.0, whole - nr.gFrBaseMs - (nr.grSlots - 2.0) * nr.gFrStoreMs) / in);
+                    {
+                        const double rest = nr.gFrBaseMs + (nr.grSlots - 2.0) * nr.gFrStoreMs;
+                        ema(nr.gFrCallMs, (std::max)(0.0, whole - rest) / in);
+                        if (l1Ok && nr.gFrL1BaseMs > 0.0)
+                        {
+                            const double own = (whole - rest * l1 / nr.gFrL1BaseMs) / in;
+                            if (own > 0.0)
+                                ema(nr.gFrL1Ratio, own / l1);
+                        }
+                    }
                     nr.gFrCallUs.store((uint32_t)(nr.gFrCallMs * 1000.0));
                     nr.gFrStoreUs.store((uint32_t)(nr.gFrStoreMs * 1000.0));
                     nr.gFrBaseUs.store((uint32_t)(nr.gFrBaseMs * 1000.0));
@@ -14605,7 +14649,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             }
         }
     }
-    nr.grArmed = false;
+    nr.grArmed = nr.grL1Armed = false;
     nr.grFrCalls = nr.grFrPreCalls = 0;
     nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = 0.0;
 

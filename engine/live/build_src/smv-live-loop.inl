@@ -2201,9 +2201,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // gFrStoreUs): the tweens a pair the direct tree affords ((M - 1) calls + M stores) and the pipelined one
         // ((M - 2) calls + the overlap + M stores, fruc-pipe); 0 = not priced (the plain tween time rules)
         double thrMd = 0, thrMp = 0;
-        // the tweens a pair the GPU affords before the user's target clamps them (the throttle's model, priced where
-        // the midpoint tree is): the midpoint tree's step-up reads it (lockedMultiple); 0 = not timed
-        double thrAff = 0;
         const double kFrucPipeOverlap = 0.1; // the level-1 call beside a level-2 one costs ~0.1 call more (t_shared)
         const double kThrWinMs = 500;        // control window: long enough to measure a drop RATE
         double emaDt = 0;                    // smoothed capture interval (ms), paces the group
@@ -2553,6 +2550,27 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         int64_t smoothTs = 0;           // EMA-smoothed pair clock (see sendPairStream)
         int64_t prevPaceTs = 0;         // the previous frame's place on that clock
         std::vector<double> sendGridMs; // each slot of the last sent group on that clock (ms), its present time - delay
+        // fruc-pipe: Smooth Motion's tree pipelined across pairs (nativeFrucPipeAdvance): a group of x4 or deeper shows
+        // the previous pair, so its deeper levels run beside the next pair's level-1 call, one source period later. A
+        // ladder goes pipelined when the direct tree cannot hold it (M - 1 > 1.03 thrMd) and the pipelined one affords
+        // it, back to direct only with 10 % to spare (M - 1 <= 0.9 thrMd: a direct tree at its edge flaps its lock, and
+        // every switch shows, entering holds one source period, leaving skips one pair), never sooner than 2 s after the
+        // last switch. SMV_FRUC_PIPE=0 = never, =force =
+        // every x4 or deeper ladder, the fixed multipliers too (a gate's lever: the same exe both ways on one source)
+        wchar_t fpv[8]{};
+        const bool fpSet = GetEnvironmentVariableW(L"SMV_FRUC_PIPE", fpv, 8) != 0;
+        const bool frucPipeOn = !(fpSet && fpv[0] == L'0');
+        const bool frucPipeForce = fpSet && !wcscmp(fpv, L"force");
+        bool frucPiped = false;
+        double frucPipeT = -1e9; // nowMs of the last route switch
+        // an M ladder's route by the throttle's direct / pipelined prices (thrMd / thrMp), before the switch dwell:
+        // the sender runs it, lockedMultiple prices it
+        auto frucPipeWant = [&](uint32_t m) {
+            const double need = (double)(m - 1);
+            if (!frucPiped)
+                return need > thrMd * 1.03 && need <= thrMp * 1.03;
+            return need > thrMd * 0.9;
+        };
         // the whole multiple M an adaptive target runs as M's ladder (0 = the grid). On the grid nearly every output
         // frame is a tween, so r times the source's rate costs ~r model calls a pair; M's ladder costs M - 1 and shows
         // the real frame as it is. So with r = the throttle's target over the source's rate (the tweens it affords a
@@ -2594,49 +2612,61 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const double r = target * lockDtMs / 1000.0;
             const double userCap = adaptTarget * lockDtMs / 1000.0;
             const double ceiling = srv.shmSlots ? srv.shmSlots : genFrames + 1;
-            auto fits = [&](uint32_t m) { return m >= 2 && m <= ceiling && m <= userCap * 1.03 && m - 1 <= r * 1.03; };
             // FRUC's midpoint tree computes exact phases only at its nodes k / 2^L (L <= kFrDepth, one bridge instance
             // a level): any other ladder or grid phase snaps to the nearest node and costs the whole tree (3 calls a
             // pair at depth 2), so a tween's cost and the throttle's answer swing with the mode. Its ladders are the
-            // powers of two up to x512 (fewer when an instance could not be made), the largest that fits; a step up
-            // needs 3 % headroom. A user's target between two nodes (above the lower one by more than that 3 %) runs
-            // the node ABOVE it, the first that reaches the target however far past it or the panel that lands (24 fps
-            // at 1000: x64), whenever the GPU affords
-            // that node (thrAff: the throttle's tweens a pair before the target clamps them) and the present floor
-            // (refloor) can space its slots, else the largest that fits: no node ladder makes x3, NvOFFRUC is clean
-            // only at t = 0.5. Entering wants 10 % to spare and 2 s since the last lock change; holding wants 3 %, and
-            // a window with no price holds it.
-            if (srv.nr && srv.nr->fruc && srv.nr->frMp)
+            // powers of two up to x512 (fewer when an instance could not be made). A user's target between two nodes
+            // (above the lower one by more than 3 %) runs the node ABOVE it (`above`), the first that reaches the
+            // target however far past it or the panel that lands (24 fps at 1000: x64), whenever its price fits and the
+            // present floor (refloor) can space its slots: no node ladder makes x3, NvOFFRUC is clean only at t = 0.5.
+            // Every tree ladder is priced, held and backed off like any other ladder, at the throttle's tree prices
+            const bool tree = srv.nr && srv.nr->fruc && srv.nr->frMp;
+            const uint32_t top = tree ? 1u << (std::min)(kFrDepth, srv.nr->frInstMax) : 0;
+            uint32_t above = 0;
+            // the GPU fit's node: Fit to the GPU off holds the user's target (and leaves FSR 4 untimed)
+            if (tree && gridLock && frStepUp && !g_noGpuFit && panelHzMode > 1.0)
             {
-                uint32_t best = 0;
-                const int levels = (std::min)(kFrDepth, srv.nr->frInstMax);
-                for (uint32_t m = 2; m <= (1u << levels); m *= 2)
-                    if (fits(m) && (m <= lockLogged || m - 1 <= r * 0.97))
-                        best = m;
-                const uint32_t up = best ? best * 2 : 2;
-                if (gridLock && frStepUp && up <= (1u << levels) && up <= ceiling &&
-                    userCap > (best ? best : 1) * 1.03 && up > userCap * 1.03 && panelHzMode > 1.0)
-                {
-                    const bool held = up == lockLogged;
-                    if (held ? thrAff <= 0.0 || up - 1 <= thrAff * 1.03
-                             : thrAff > 0.0 && up - 1 <= thrAff * 0.9 && nowMs() - lockT >= 2000.0)
-                        return up;
-                }
-                return gridLock ? best : 0;
+                uint32_t n = 2;
+                while (n <= top && n <= userCap * 1.03)
+                    n *= 2;
+                if (n <= top && userCap > n / 2 * 1.03)
+                    above = n;
             }
+            // a ladder within the slots (the tree: its nodes) and the user's target, or the node above it
+            auto slotOk = [&](uint32_t m) {
+                return m >= 2 && m <= ceiling && (m == above || m <= userCap * 1.03) &&
+                       (!tree || ((m & (m - 1)) == 0 && m <= top));
+            };
+            auto fits = [&](uint32_t m) { return slotOk(m) && (m == above || m - 1 <= r * 1.03); };
             // the ladder above, priced at this lock's readings times the learned excess
             const double pre = srv.nr ? srv.nr->gIntUs.load() / 1000.0 : 0.0;
             const double tw = srv.nr ? srv.nr->gTweenUs.load() / 1000.0 : 0.0;
+            // the tree's prices (xqThrottle's): a call, a slot's store, AMD FSR 4's x2 group
+            const double fc = tree ? srv.nr->gFrCallUs.load() / 1000.0 : 0.0;
+            const double fs = tree ? srv.nr->gFrStoreUs.load() / 1000.0 : 0.0;
+            const double fb = tree ? srv.nr->gFrBaseUs.load() / 1000.0 : 0.0;
+            const bool fsr = tree && srv.nr->fsrfg;
+            const bool timed = tree ? fc > 0.0 && (fsr ? fb > 0.0 : pre > 0.0) : tw > 0.0;
             // the faster of the two period averages: a source-rate rise tightens the budget within a few pairs
             const double budget = (std::min)(lockDtMs, emaDt) * thrBudget;
-            auto cost = [&](uint32_t m) { return pre + (m - 1) * tw; };
-            // a lock holds within the slots, the user's target and the hold band (kUpHold), never within kUpSettleMs
-            // of its lock; before a group is timed the throttle's r stands in for the price
+            auto cost = [&](uint32_t m) {
+                if (!tree)
+                    return pre + (m - 1) * tw;
+                // AMD FSR 4: an x2 group's whole time + (M - 2) calls and stores; Smooth Motion: (M - 1) calls + M
+                // stores, one call less + the overlap on the route the sender pipelines (fruc-pipe, x4 and deeper)
+                if (fsr)
+                    return fb + (m - 2.0) * (fc + fs);
+                const double direct = pre + m * fs + (m - 1.0) * fc;
+                const bool piped = m >= 4 && (frucPipeForce || (frucPipeOn && thrMd > 0.0 && frucPipeWant(m)));
+                return piped ? direct - fc * (1.0 - kFrucPipeOverlap) : direct;
+            };
+            // a lock holds within slotOk and the hold band (kUpHold), never within kUpSettleMs of its lock; before a
+            // group is timed the throttle's r stands in for the price (the node above holds unpriced)
             auto holds = [&](uint32_t m) {
-                if (!(m >= 2 && m <= ceiling && m <= userCap * 1.03))
+                if (!slotOk(m))
                     return false;
-                if (tw <= 0.0)
-                    return m - 1 <= r * 1.03;
+                if (!timed)
+                    return m == above || m - 1 <= r * 1.03;
                 if (cost(m) <= budget * kUpHold || nowMs() - lockT < kUpSettleMs)
                 {
                     upOverT = 0;
@@ -2650,14 +2680,18 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // a fallen ladder (and any above it) waits for that back-off whatever the price says
             const bool probe = upFailT > 0 && nowMs() - upFailT >= upBackoffMs;
             auto afford = [&](uint32_t m) {
-                if (tw <= 0.0 || (upFailT > 0 && !probe && m >= upM))
+                if (upFailT > 0 && !probe && m >= upM)
                     return false;
+                // an untimed tree (AMD FSR 4 learns its call price once an x4 or deeper group is priced): the
+                // throttle's r within the target, the node above as one attempt
+                if (!timed)
+                    return tree && (m == above || m - 1 <= r * 0.97);
                 return cost(m) * upK <= budget || (probe && cost(m) * kUpKDefault <= budget);
             };
             // the stepped-up lock's live price: what it costs now over the prediction that admitted it (re-read on
             // every settled pair and at its fall, so a sag raises it and its end lowers it again)
             auto learn = [&]() {
-                if (upPred > 0 && upM == lockLogged && tw > 0.0)
+                if (upPred > 0 && upM == lockLogged && timed)
                     upK = (std::max)(1.0, cost(lockLogged) / upPred);
             };
             if (lockLogged && holds(lockLogged))
@@ -2680,13 +2714,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     upFailT = 0; // the ladder the back-off guards has held: the next failure starts the ladder over
                     upBackoffMs = kUpBackoff0;
                 }
-                if (!(settled && fits(lockLogged + 1) && afford(lockLogged + 1)))
+                const uint32_t next = tree ? lockLogged * 2 : lockLogged + 1;
+                if (!(settled && fits(next) && afford(next)))
                     return lockLogged;
-                // a step up: the largest ladder up to ceil(0.97 r) the price admits, the prediction it ran on kept
-                uint32_t up = (std::max)(lockLogged + 1, (uint32_t)ceil(r * 0.97));
-                while (up > lockLogged + 1 && !(fits(up) && afford(up)))
-                    up--;
-                upPred = cost(up);
+                // a step up: the largest ladder the price admits up to ceil(0.97 r) (the tree: up to its top node), the
+                // prediction it ran on kept (an untimed tree's: one node, unpriced)
+                uint32_t up = tree ? top : (std::max)(next, (uint32_t)ceil(r * 0.97));
+                while (up > next && !(timed && fits(up) && afford(up)))
+                    up = tree ? up / 2 : up - 1;
+                upPred = timed ? cost(up) : 0.0;
                 upM = up;
                 upSettled = false;
                 return up;
@@ -2700,27 +2736,35 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     // a stepped-up ladder falls: admitted again only after the back-off
                     upBackoffMs = upFailT > 0 ? (std::min)(upBackoffMs * 2.0, kUpBackoffMax) : kUpBackoff0;
                     upFailT = nowMs();
-                    LOG("ladder price: x%u falls at %.1f ms (%.2f x its step-up's price); re-tried in %.0f s\n",
-                        lockLogged, cost(lockLogged), upK, upBackoffMs / 1000.0);
+                    if (upPred > 0)
+                        LOG("ladder price: x%u falls at %.1f ms (%.2f x its step-up's price); re-tried in %.0f s\n",
+                            lockLogged, cost(lockLogged), upK, upBackoffMs / 1000.0);
+                    else
+                        LOG("ladder price: x%u falls (an unpriced step-up); re-tried in %.0f s\n", lockLogged,
+                            upBackoffMs / 1000.0);
                 }
+            }
+            if (tree)
+            {
+                // the largest node the throttle's r affords within the target; with none, the node above (x2) at its
+                // price, kUpSettleMs after the last lock
+                uint32_t m = 0;
+                for (uint32_t n = 2; n <= top; n *= 2)
+                    if (n != above && fits(n) && n - 1 <= r * 0.97)
+                        m = n;
+                if (!m && above == 2 && nowMs() - lockT >= kUpSettleMs && afford(2))
+                {
+                    upPred = timed ? cost(2) : 0.0;
+                    upM = 2;
+                    upSettled = false;
+                    return 2;
+                }
+                return gridLock ? m : 0;
             }
             const uint32_t m = (uint32_t)ceil(r * 0.97);
             return gridLock && fits(m) ? m : 0;
         };
-        // fruc-pipe: Smooth Motion's tree pipelined across pairs (nativeFrucPipeAdvance): a group of x4 or deeper shows
-        // the previous pair, so its deeper levels run beside the next pair's level-1 call, one source period later. A
-        // ladder goes pipelined when the direct tree cannot hold it (M - 1 > 1.03 thrMd) and the pipelined one affords
-        // it, back to direct only with 10 % to spare (M - 1 <= 0.9 thrMd: a direct tree at its edge flaps its lock, and
-        // every switch shows, entering holds one source period, leaving skips one pair), never sooner than 2 s after the
-        // last switch. SMV_FRUC_PIPE=0 = never, =force =
-        // every x4 or deeper ladder, the fixed multipliers too (a gate's lever: the same exe both ways on one source)
-        wchar_t fpv[8]{};
-        const bool fpSet = GetEnvironmentVariableW(L"SMV_FRUC_PIPE", fpv, 8) != 0;
-        const bool frucPipeOn = !(fpSet && fpv[0] == L'0');
-        const bool frucPipeForce = fpSet && !wcscmp(fpv, L"force");
-        bool frucPiped = false;
-        double frucPipeT = -1e9; // nowMs of the last route switch
-        int sendLag = 0;         // the last sent group's content lag in source periods (its pend entry takes it)
+        int sendLag = 0; // the last sent group's content lag in source periods (its pend entry takes it)
         // one streaming pair handoff: bump seq, publish the frame (fence or shm copy), build
         // the fraction list, write the message. Returns nfr, or UINT32_MAX on a write failure.
         // fraction message: one f32 per slot the server was actually sized for (shmSlots),
@@ -2830,12 +2874,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     pipeThis = true;
                 else if (frucPipeOn && srv.nr && srv.nr->fruc && srv.nr->frMp && !srv.nr->fsrfg && m >= 4 && thrMd > 0)
                 {
-                    const double need = (double)(m - 1);
-                    bool want = frucPiped;
-                    if (!frucPiped && need > thrMd * 1.03 && need <= thrMp * 1.03)
-                        want = true;
-                    else if (frucPiped && need <= thrMd * 0.9)
-                        want = false;
+                    const bool want = frucPipeWant(m);
                     pipeThis = want != frucPiped && nowMs() - frucPipeT < 2000.0 ? frucPiped : want;
                 }
             }
@@ -3447,7 +3486,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         thrMp = (B - fs + fc * (1.0 - kFrucPipeOverlap)) / (fc + fs);
                         m = frucPipeOn && thrMp >= 3.0 ? (std::max)(thrMd, thrMp) : thrMd;
                     }
-                    thrAff = m;
                     next = m >= 1.0 ? m * srcFps : srcFps;
                     const bool floor = m < 1.0;
                     thrFloor = floor;
