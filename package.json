@@ -1,6 +1,6 @@
 {
   "name": "smoothmyvideo",
-  "version": "26.10.0",
+  "version": "26.10.1",
   "description": "Desktop GUI for AI video frame interpolation (GMFSS), native TensorRT engine under the hood",
   "author": "Florin Nutiu",
   "main": "dist/main.js",
