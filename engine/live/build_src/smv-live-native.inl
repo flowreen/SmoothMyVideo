@@ -2444,6 +2444,41 @@ __global__ void k_mvHalfG1(const short* __restrict__ vec, int vecPitch, int w, i
     const float fx = (float)r[2 * x] * (1.0f / 32.0f), fy = (float)r[2 * x + 1] * (1.0f / 32.0f);
     dst[(size_t)y * (dstPitch >> 2) + x] = (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
 }
+// the engine's grid-1 field (short2, raw / 32 = px) bilinear at (x, y), clamped to the frame
+__device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch, int w, int h, float x, float y,
+                                     float& vx, float& vy)
+{
+    x = fminf(fmaxf(x, 0.0f), (float)(w - 1));
+    y = fminf(fmaxf(y, 0.0f), (float)(h - 1));
+    const int x0 = (int)x, y0 = (int)y, x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+    const float fx = x - (float)x0, fy = y - (float)y0;
+    const short* r0 = (const short*)((const char*)vec + (size_t)y0 * vecPitch);
+    const short* r1 = (const short*)((const char*)vec + (size_t)y1 * vecPitch);
+    const float a = (1.0f - fx) * (1.0f - fy), b = fx * (1.0f - fy), c = (1.0f - fx) * fy, d = fx * fy;
+    vx = (a * r0[2 * x0] + b * r0[2 * x1] + c * r1[2 * x0] + d * r1[2 * x1]) * (1.0f / 32.0f);
+    vy = (a * r0[2 * x0 + 1] + b * r0[2 * x1 + 1] + c * r1[2 * x0 + 1] + d * r1[2 * x1 + 1]) * (1.0f / 32.0f);
+}
+// AMD FSR 4's level-2+ call (its two frames at t0 and t1 of the pair) as R16G16_FLOAT texels from the pair's level-1
+// field (B -> A at B's positions, grid 1): under the pair's straight-line motion the content at p in the frame at t1
+// sits at the B position q with p = q + (1 - t1) v(q) (a 3-step fixed point) and at t0 at q + (1 - t0) v(q), so the
+// call's field (its frame -> its previous, FSR's convention) = (t1 - t0) v(q)
+__global__ void k_mvDerive(const short* __restrict__ vec, int vecPitch, int w, int h, float t0, float t1,
+                           unsigned int* __restrict__ dst, int dstPitch)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    float vx, vy, qx = (float)x, qy = (float)y;
+    for (int it = 0; it < 3; it++)
+    {
+        mvAt(vec, vecPitch, w, h, qx, qy, vx, vy);
+        qx = (float)x - (1.0f - t1) * vx;
+        qy = (float)y - (1.0f - t1) * vy;
+    }
+    mvAt(vec, vecPitch, w, h, qx, qy, vx, vy);
+    dst[(size_t)y * (dstPitch >> 2) + x] =
+        (unsigned int)f2h((t1 - t0) * vx) | ((unsigned int)f2h((t1 - t0) * vy) << 16);
+}
 // AMD FSR upscaling: RTX VSR's tight BGRA8 input frame as RGBA8 rows twice, the bridge's (aPitch bytes apart) and the
 // Optical Flow engine's ABGR8 input (bPitch); and the bridge's RGBA8 result (srcPitch) back to tight BGRA8
 __global__ void k_bgraRgbaFsr(const unsigned char* __restrict__ src, int w, int h, unsigned char* __restrict__ a,
@@ -4367,11 +4402,12 @@ struct NativeRife
     uint8_t* dFgMv = nullptr;       // a call's vectors (RG16F rows fgMvPitch apart) before their copy into its texture
     // SMV_FSRFG_PROF=1: CUDA events between a call's stages (copy in, the Optical Flow inputs, the Optical Flow, the
     // vector kernels, the vector copy, FSR on vkd3d, the copy out), means at the session's end; every call then waits
-    // for its last event, so the stages do not overlap the next call's
+    // for its last event, so the stages do not overlap the next call's. A derived call's k_mvDerive counts apart
+    // (fgDeriveMs over fgProfDerN), the three Optical Flow stages over the calls that ran a pass (fgProfVecN)
     bool fgProf = false;
     cudaEvent_t fgEv[8] = {};
-    double fgStageMs[7] = {}, fgCpuMs = 0.0;
-    uint64_t fgProfN = 0, fgProfVecN = 0;
+    double fgStageMs[7] = {}, fgCpuMs = 0.0, fgDeriveMs = 0.0;
+    uint64_t fgProfN = 0, fgProfVecN = 0, fgProfDerN = 0;
     // FSR's motion vectors (frame generation and upscaling): an Optical Flow session at w x h, ABGR8 (R, G, B, A
     // bytes), one direction, fast, its output grid: the field from slot `cur` to slot `prev` = the current frame -> its
     // predecessor (FSR's convention), in px: two planes + k_nvofUp's cost plane
@@ -4388,6 +4424,7 @@ struct NativeRife
         bool grid4 = false;  // SMV_OFVEC_GRID4=1: grid 4 (+ k_nvofUp's bilinear) where grid 1 is offered too
         NV_OF_PERF_LEVEL level = NV_OF_PERF_LEVEL_SLOW; // nativeOfLevel()
         cudaStream_t st = nullptr; // the stream its Optical Flow and kernels run on, null = the session's
+        int wr = 1; // one direction: the field goes to out[wr] (FSR 4's pipelined route alternates out[0] / out[1])
     };
     OfVec fgOf;
     // a tree level with 2+ calls makes its vectors ahead (nativeFsrfgLevel): call j + 1's Optical Flow on fgOfSt (its own
@@ -4397,7 +4434,22 @@ struct NativeRife
     cudaStream_t fgOfSt = nullptr;
     OfVec fgOf2;
     uint8_t* dFgMvR[2] = {};
+    float fgChildT0 = 0.0f, fgChildT1 = 0.0f; // a serial level-2+ call's two frames in its pair (k_mvDerive's t0, t1)
     cudaEvent_t fgEvLevel = nullptr, fgEvVec[2] = {}, fgEvFree[2] = {};
+    // the level-1 chain's stream fgL1St: fgOf's Optical Flow and its kernels run there (the session's stream waits for
+    // them), and on the pipelined route (SMV_FSRFG_PIPE, nativeFsrfgPipeAdvance) instance 0's whole call of the new
+    // pair, beside the shown pair's level-2+ calls on the session's stream; FSR's calls keep the serial route's order on
+    // the device (instance 0's waits for fgEvDeep, the shown pair's last deeper call). fgOfWr / fgOfRd = the field fgOf
+    // writes / the derived vectors read (out[0] / out[1] alternate by pair while pipelined, else 1); dFgMvL1 = the
+    // calls' vectors on fgL1St, dFgL1Node = the new pair's level-1 node (swapped into dFrNode when that pair is shown);
+    // fgEvL1 = fgL1St's last work, fgEvS = the session stream's point fgL1St waits for; fgPiped = the last group ran
+    // pipelined, fgL1Pend = the new pair's call still to issue (nativeFsrfgL1Issue), fgL1Ok = its node is made
+    cudaStream_t fgL1St = nullptr;
+    cudaEvent_t fgEvL1 = nullptr, fgEvS = nullptr, fgEvDeep = nullptr;
+    int fgOfWr = 1, fgOfRd = 1;
+    uint8_t* dFgMvL1 = nullptr;
+    uint8_t* dFgL1Node = nullptr;
+    bool fgPiped = false, fgL1Pend = false, fgL1Ok = false, fgPipeLogged = false;
     // AMD FSR upscaling (fsrUp, `--fsr-upscale`): RTX VSR's resize (vsr is set too, so the slot rules, the staging and
     // nativeVsrEval's callers stay one path; nativeVsrEval hands dVsrIn to smv_fsrup_bridge.dll instead of NGX). The
     // bridge runs AMD's signed FidelityFX upscaler (FSR 4.1.1's INT8 model) on its own D3D12 device, frames in and out
@@ -4714,7 +4766,7 @@ struct NativeRife
     CUfunction fFitPlanar = nullptr, fSharpPlanar = nullptr,                                  // sharpen
         fPackBgraRgb = nullptr, fUnpackBgraRgb = nullptr,                   // VSR / FRUC: (R, G, B) <-> BGRA8
         fPackRgbaH = nullptr, fRgbaHAbgr = nullptr, fUnpackRgbaH = nullptr, // FSR frame generation: RGBA16F frames,
-        fMvHalf = nullptr, fMvHalfG1 = nullptr,                             // the Optical Flow input, the vectors
+        fMvHalf = nullptr, fMvHalfG1 = nullptr, fMvDerive = nullptr,        // the Optical Flow input, the vectors
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr,                        // FSR upscaling: VSR's BGRA8 <-> RGBA8
         fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,     // offline DLSS 4.5 frames
         fUnpackR10 = nullptr;
@@ -7586,6 +7638,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fUnpackRgbaH, "k_unpackRgbaH"},
         {&nr.fMvHalf, "k_mvHalf"},
         {&nr.fMvHalfG1, "k_mvHalfG1"},
+        {&nr.fMvDerive, "k_mvDerive"},
         {&nr.fBgraRgbaFsr, "k_bgraRgbaFsr"},
         {&nr.fRgbaBgra, "k_rgbaBgra"},
         {&nr.fHdrRestOut, "k_hdrRestOut"},
@@ -9642,10 +9695,12 @@ struct FsrfgBridge
     int (*createI)(int, uint32_t, uint32_t, uint32_t, int32_t, int, FsrfgShared*) = nullptr;
     int (*frameI)(int, uint64_t, uint64_t, int, double) = nullptr;
     void (*destroy)() = nullptr;
+    int (*devices)() = nullptr; // 1 = an own vkd3d device for every instance (optional; an older bridge has none)
 };
 static FsrfgBridge g_fsrfg;
 
-// the bridge, its vkd3d-proton shader cache in cacheDir\fsr4_shaders (the model cache: users may delete it)
+// the bridge, its vkd3d-proton shader cache in cacheDir\fsr4_shaders (the model cache: users may delete it); its
+// instances share vkd3d's one device (SMV_FSRFG_DEVICE=own = an own device each, ~235 MiB + ~0.3 s an instance)
 static bool nativeFsrfgLoad(const std::string& dir, const std::string& cacheDir)
 {
     if (g_fsrfg.mod)
@@ -9664,6 +9719,7 @@ static bool nativeFsrfgLoad(const std::string& dir, const std::string& cacheDir)
         (int (*)(int, uint32_t, uint32_t, uint32_t, int32_t, int, FsrfgShared*))GetProcAddress(m, "fsrfg_create_i");
     g_fsrfg.frameI = (int (*)(int, uint64_t, uint64_t, int, double))GetProcAddress(m, "fsrfg_frame_i");
     g_fsrfg.destroy = (void (*)())GetProcAddress(m, "fsrfg_destroy");
+    g_fsrfg.devices = (int (*)())GetProcAddress(m, "fsrfg_devices");
     if (!g_fsrfg.lastError || !g_fsrfg.setCacheDir || !g_fsrfg.provider || !g_fsrfg.createI || !g_fsrfg.frameI ||
         !g_fsrfg.destroy)
     {
@@ -9871,8 +9927,8 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
         // the forward field from `cur` to `prev` = the backward one of (prev, cur), into the buffers it is read from
         ei.inputFrame = o.in[cur];
         ei.referenceFrame = o.in[prev];
-        eo.outputBuffer = o.out[1];
-        eo.outputCostBuffer = o.costOn ? o.cost[1] : nullptr;
+        eo.outputBuffer = o.out[o.wr];
+        eo.outputCostBuffer = o.costOn ? o.cost[o.wr] : nullptr;
     }
     const NV_OF_STATUS s = g_nvofApi.nvOFExecute(o.of, &ei, &eo);
     if (s != NV_OF_SUCCESS)
@@ -9884,8 +9940,9 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
     if (evOf) // a profiler's mark between the Optical Flow and the vector kernels (the session's stream)
         cudaEventRecord(evOf, st);
     const unsigned gx = (unsigned)(o.w + 15) / 16, gy = (unsigned)(o.h + 15) / 16;
-    int grid = o.grid, vp = (int)o.outPitch[1], cp = (int)o.costPitch[1], mp = dstPitch;
-    CUdeviceptr v = o.outP[1], c = o.costP[1];
+    const int f = o.both ? 1 : o.wr;
+    int grid = o.grid, vp = (int)o.outPitch[f], cp = (int)o.costPitch[f], mp = dstPitch;
+    CUdeviceptr v = o.outP[f], c = o.costP[f];
     if (grid == 1) // the field is the texels' grid: one pass, no float planes in between
     {
         void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp};
@@ -9941,64 +9998,138 @@ static bool nativeFsrfgOfIn(NativeRife& nr, NativeRife::OfVec& o, const uint8_t*
     return true;
 }
 
+// AMD FSR 4's level-2+ calls take vectors derived from their pair's level-1 field (k_mvDerive) instead of an optical-flow
+// pass each: one SLOW pass a call bounds FSR 4 on the optical-flow engine (72-86 % busy, the SMs 17-22 %), and on real
+// 1000 fps footage the derived tweens score closer to the true frames. The field must be grid 1
+// (an engine that refuses grid 1 keeps a pass a call). On by default, every instance on the one shared vkd3d device
+// (calls of different instances back to back stay exact because our vkd3d does not offer the coopmat2 conversions);
+// SMV_FSRFG_CHILDMV=0 = a pass a call
+static bool fsrfgChildEnvOn()
+{
+    static const bool on = [] {
+        char v[8] = "";
+        return !(GetEnvironmentVariableA("SMV_FSRFG_CHILDMV", v, sizeof(v)) > 0 && v[0] == '0');
+    }();
+    return on;
+}
+
+static bool fsrfgDeriveOn(const NativeRife& nr)
+{
+    return fsrfgChildEnvOn() && nr.fgOf.grid == 1;
+}
+
+// a level-2+ call's derived vectors (its frames at t0 and t1 of the pair) into dst (rows fgMvPitch apart) on stream st,
+// from fgOf's level-1 output: no level-2+ call runs fgOf once its vectors are derived, so the field holds for the pair
+static bool nativeFsrfgChildVec(NativeRife& nr, uint8_t* dst, cudaStream_t st, float t0, float t1)
+{
+    CUdeviceptr v = nr.fgOf.outP[nr.fgOfRd];
+    int vp = (int)nr.fgOf.outPitch[nr.fgOfRd], mp = nr.fgMvPitch;
+    void* a[] = {&v, &vp, &nr.w, &nr.h, &t0, &t1, &dst, &mp};
+    if (cuLaunchKernel(nr.fMvDerive, (unsigned)(nr.w + 15) / 16, (unsigned)(nr.h + 15) / 16, 1, 16, 16, 1, 0,
+                       (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+    {
+        nr.die("fsrfg derived vector launch failed");
+        return false;
+    }
+    return true;
+}
+
 // one bridge call: instance i gets `frame` (RGBA16F rows fgPitch apart) with its vectors toward `prev` (the frame the
 // instance was fed last; null = zero vectors: a reset, or a re-prime nobody reads) and returns into `out` (null =
 // dropped) the frame halfway between them. The vectors as the harness made them: the field this frame -> the previous
 // (px) = FSR's convention. ring >= 0: the vectors were made ahead into dFgMvR[ring] (nativeFsrfgAheadVec). l1 = the
-// group's level-1 call: its FSR span goes into fgL1Ev for the x2 call price (nativeGroup)
+// group's level-1 call: its FSR span goes into fgL1Ev for the x2 call price (nativeGroup). part 0 = the whole call on
+// the session's stream; on fgL1St (the pipelined route's instance-0 calls, their vectors in dFgMvL1): 1 = the frame and
+// its vectors into the instance's textures, 2 = after fgEvDeep the call and its copy out, 3 = the whole call (a reset
+// or a re-prime, in a group that runs no deeper call)
 static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const uint8_t* prev, bool reset, uint8_t* out,
-                            int ring = -1, bool l1 = false)
+                            int ring = -1, bool l1 = false, int part = 0)
 {
     NativeRife::FgInst& g = nr.fg[i];
-    cudaStream_t st = nr.stream;
+    cudaStream_t st = part ? nr.fgL1St : nr.stream;
+    uint8_t* mvBuf = part ? nr.dFgMvL1 : nr.dFgMv;
     const size_t row = (size_t)nr.w * 8;
     auto mark = [&nr, st](int e) {
         if (nr.fgProf)
             cudaEventRecord(nr.fgEv[e], st);
     };
-    mark(0);
-    if (cudaMemcpy2DToArrayAsync(g.in, 0, 0, frame, nr.fgPitch, row, nr.h, cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+    bool derived = false;
+    if (part != 2)
     {
-        nr.die("fsrfg frame copy failed");
-        return false;
-    }
-    mark(1);
-    const uint8_t* mv = ring >= 0 ? nr.dFgMvR[ring] : nr.dFgMv;
-    if (ring >= 0)
-    {
-        if (cudaStreamWaitEvent(st, nr.fgEvVec[ring], 0) != cudaSuccess)
+        mark(0);
+        if (cudaMemcpy2DToArrayAsync(g.in, 0, 0, frame, nr.fgPitch, row, nr.h, cudaMemcpyDeviceToDevice, st) !=
+            cudaSuccess)
         {
-            nr.die("fsrfg vector wait failed");
+            nr.die("fsrfg frame copy failed");
             return false;
         }
-    }
-    else if (prev)
-    {
-        if (!nativeFsrfgOfIn(nr, nr.fgOf, prev, frame))
+        mark(1);
+        const uint8_t* mv = ring >= 0 ? nr.dFgMvR[ring] : mvBuf;
+        if (ring >= 0)
+        {
+            if (cudaStreamWaitEvent(st, nr.fgEvVec[ring], 0) != cudaSuccess)
+            {
+                nr.die("fsrfg vector wait failed");
+                return false;
+            }
+        }
+        else if (prev && (i == 0 || !fsrfgDeriveOn(nr)))
+        {
+            // fgOf runs on fgL1St: from another stream the pass waits for that stream's work so far, and it for the pass
+            const bool hop = nr.fgOf.st && nr.fgOf.st != st;
+            if (hop && (cudaEventRecord(nr.fgEvS, st) != cudaSuccess ||
+                        cudaStreamWaitEvent(nr.fgOf.st, nr.fgEvS, 0) != cudaSuccess))
+            {
+                nr.die("fsrfg vector event failed");
+                return false;
+            }
+            if (!nativeFsrfgOfIn(nr, nr.fgOf, prev, frame))
+                return false;
+            mark(2);
+            if (!nativeOfVecRun(nr, nr.fgOf, 0, 1, mvBuf, nr.fgMvPitch, "fsrfg", nr.fgProf ? nr.fgEv[3] : nullptr))
+                return false;
+            if (hop && (cudaEventRecord(nr.fgEvL1, nr.fgOf.st) != cudaSuccess ||
+                        cudaStreamWaitEvent(st, nr.fgEvL1, 0) != cudaSuccess))
+            {
+                nr.die("fsrfg vector event failed");
+                return false;
+            }
+        }
+        else if (prev)
+        {
+            derived = true;
+            mark(2);
+            if (!nativeFsrfgChildVec(nr, mvBuf, st, nr.fgChildT0, nr.fgChildT1))
+                return false;
+            mark(3);
+        }
+        else if (cudaMemset2DAsync(mvBuf, nr.fgMvPitch, 0, (size_t)nr.w * 4, nr.h, st) != cudaSuccess)
+        {
+            nr.die("fsrfg vector clear failed");
             return false;
-        mark(2);
-        if (!nativeOfVecRun(nr, nr.fgOf, 0, 1, nr.dFgMv, nr.fgMvPitch, "fsrfg", nr.fgProf ? nr.fgEv[3] : nullptr))
+        }
+        else
+        {
+            mark(2);
+            mark(3);
+        }
+        mark(4);
+        if (cudaMemcpy2DToArrayAsync(g.mv, 0, 0, mv, nr.fgMvPitch, (size_t)nr.w * 4, nr.h, cudaMemcpyDeviceToDevice,
+                                     st) != cudaSuccess ||
+            (ring >= 0 && cudaEventRecord(nr.fgEvFree[ring], st) != cudaSuccess))
+        {
+            nr.die("fsrfg vector copy failed");
             return false;
+        }
+        mark(5);
+        if (part == 1)
+            return true;
     }
-    else if (cudaMemset2DAsync(nr.dFgMv, nr.fgMvPitch, 0, (size_t)nr.w * 4, nr.h, st) != cudaSuccess)
+    else if (cudaStreamWaitEvent(st, nr.fgEvDeep, 0) != cudaSuccess)
     {
-        nr.die("fsrfg vector clear failed");
+        nr.die("fsrfg call wait failed");
         return false;
     }
-    else
-    {
-        mark(2);
-        mark(3);
-    }
-    mark(4);
-    if (cudaMemcpy2DToArrayAsync(g.mv, 0, 0, mv, nr.fgMvPitch, (size_t)nr.w * 4, nr.h, cudaMemcpyDeviceToDevice, st) !=
-            cudaSuccess ||
-        (ring >= 0 && cudaEventRecord(nr.fgEvFree[ring], st) != cudaSuccess))
-    {
-        nr.die("fsrfg vector copy failed");
-        return false;
-    }
-    mark(5);
     if (l1 && nr.fgL1Ev[0])
         nr.grL1Armed = cudaEventRecord(nr.fgL1Ev[0], st) == cudaSuccess;
     cudaExternalSemaphoreSignalParams sp{};
@@ -10043,10 +10174,11 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
         {
             float ms = 0.0f;
             if (cudaEventElapsedTime(&ms, nr.fgEv[s], nr.fgEv[s + 1]) == cudaSuccess)
-                nr.fgStageMs[s] += ms;
+                (derived && s >= 1 && s <= 3 ? nr.fgDeriveMs : nr.fgStageMs[s]) += ms;
         }
         nr.fgProfN++;
-        nr.fgProfVecN += prev ? 1 : 0;
+        nr.fgProfVecN += prev && !derived ? 1 : 0;
+        nr.fgProfDerN += derived ? 1 : 0;
     }
     nr.frCalls[i]++;
     return true;
@@ -10080,7 +10212,13 @@ static void nativeFsrfgGrow(NativeRife& nr, int want)
 // after the left one. An instance fed another frame last (a pair of another depth, a new encoding) gets the left
 // parent first, its output dropped: a reset only for its very first frame (after a reset FSR's next 10 tweens follow
 // the vectors alone, ffx_frameinterpolation.h fFrameIndexFactor), else a plain call. ring >= 0: the node's vectors were
-// made ahead into dFgMvR[ring] (nativeFsrfgLevel)
+// made ahead into dFgMvR[ring] (nativeFsrfgLevel). The tree = the pair shown: this group's, or the previous one while
+// pipelined (its nodes in dFrNode either way, nativeFsrfgPipeAdvance)
+static FrTree nativeFsrfgShown(NativeRife& nr)
+{
+    return nr.fgPiped ? FrTree{nr.frLagSerial, nr.frLagA, nr.frLagB, nr.dFrNode, nr.frNodeOk} : nativeFrucCur(nr);
+}
+
 static uint8_t* nativeFsrfgNode(NativeRife& nr, int k, int L, int ring = -1)
 {
     while (L > 0 && !(k & 1))
@@ -10088,8 +10226,9 @@ static uint8_t* nativeFsrfgNode(NativeRife& nr, int k, int L, int ring = -1)
         k >>= 1;
         L--;
     }
+    const FrTree tr = nativeFsrfgShown(nr);
     if (L <= 0)
-        return nr.dFrSurf[k ? nr.frB : nr.frA];
+        return nr.dFrSurf[k ? tr.b : tr.a];
     const int p = k << (kFrDepth - L);
     if (nr.frNodeOk[p])
         return nr.dFrNode[p];
@@ -10104,7 +10243,7 @@ static uint8_t* nativeFsrfgNode(NativeRife& nr, int k, int L, int ring = -1)
         return nullptr;
     }
     const int i = L - 1;
-    const uint64_t lk = nativeFrucKey(nativeFrucCur(nr), k - 1, L);
+    const uint64_t lk = nativeFrucKey(tr, k - 1, L);
     if (nr.frLastKey[i] != lk)
     {
         if (!nativeFsrfgFeed(nr, i, left, nullptr, nr.frLastKey[i] == 0, nullptr))
@@ -10114,11 +10253,13 @@ static uint8_t* nativeFsrfgNode(NativeRife& nr, int k, int L, int ring = -1)
         nr.frLastKey[i] = lk;
     }
     const int64_t c0 = nowQpc100();
+    nr.fgChildT0 = (float)(k - 1) / (float)(1 << L);
+    nr.fgChildT1 = (float)(k + 1) / (float)(1 << L);
     if (!nativeFsrfgFeed(nr, i, right, left, false, nr.dFrNode[p], ring, i == 0))
         return nullptr;
     nr.grFrCalls++;
     nr.grFrCallMs += (double)(nowQpc100() - c0) / 10000.0;
-    nr.frLastKey[i] = nativeFrucKey(nativeFrucCur(nr), k + 1, L);
+    nr.frLastKey[i] = nativeFrucKey(tr, k + 1, L);
     nr.frNodeCalls++;
     nr.frNodeOk[p] = true;
     return nr.dFrNode[p];
@@ -10174,30 +10315,43 @@ static bool nativeFsrfgAhead(NativeRife& nr)
              cudaMalloc((void**)&b, bytes) == cudaSuccess;
         nr.dFgMvR[s] = ok ? b : nullptr;
     }
-    if (!ok || !nativeOfVecSetup(nr, nr.fgOf2, nr.w, nr.h, "fsrfg side vectors", nr.fgOfSt) || strcmp(ev, "fail") == 0)
+    // derived level-2+ vectors need no side Optical Flow session (fsrfgDeriveOn)
+    const bool derive = fsrfgDeriveOn(nr);
+    if (!ok || (!derive && !nativeOfVecSetup(nr, nr.fgOf2, nr.w, nr.h, "fsrfg side vectors", nr.fgOfSt)) ||
+        strcmp(ev, "fail") == 0)
     {
-        LOG("native: fsrfg: the side Optical Flow session did not start, every call's vectors stay in its turn\n");
+        LOG(derive ? "native: fsrfg: the side stream did not start, every call's vectors stay in its turn\n"
+                   : "native: fsrfg: the side Optical Flow session did not start, every call's vectors stay in its "
+                     "turn\n");
         nativeFsrfgAheadFree(nr);
         nr.fgAhead = -1;
         return false;
     }
     nr.fgAhead = 1;
-    LOG("native: fsrfg: tree levels with 2+ calls make the next call's vectors during each FSR call (a side stream, its "
-        "own Optical Flow session)\n");
+    LOG(derive ? "native: fsrfg: tree levels with 2+ calls derive the next call's vectors during each FSR call (a side "
+                 "stream)\n"
+               : "native: fsrfg: tree levels with 2+ calls make the next call's vectors during each FSR call (a side "
+                 "stream, its own Optical Flow session)\n");
     return true;
 }
 
-// a call's vectors (the field frame -> prev) on the side stream into dFgMvR[s] once that buffer's last copy is done,
-// then fgEvVec[s]. The copy's event is recorded before this is enqueued: a stream waits for the event's last record
-static bool nativeFsrfgAheadVec(NativeRife& nr, int s, const uint8_t* prev, const uint8_t* frame)
+// a call's vectors (the field frame -> prev; its frames at t0 / t1 of the pair) on the side stream into dFgMvR[s] once
+// that buffer's last copy is done, then fgEvVec[s]: derived (fsrfgDeriveOn) or the side session's optical flow. The
+// copy's event is recorded before this is enqueued: a stream waits for the event's last record
+static bool nativeFsrfgAheadVec(NativeRife& nr, int s, const uint8_t* prev, const uint8_t* frame, float t0, float t1)
 {
     if (cudaStreamWaitEvent(nr.fgOfSt, nr.fgEvFree[s], 0) != cudaSuccess)
     {
         nr.die("fsrfg side vector wait failed");
         return false;
     }
-    if (!nativeFsrfgOfIn(nr, nr.fgOf2, prev, frame) ||
-        !nativeOfVecRun(nr, nr.fgOf2, 0, 1, nr.dFgMvR[s], nr.fgMvPitch, "fsrfg side vectors"))
+    if (fsrfgDeriveOn(nr))
+    {
+        if (!nativeFsrfgChildVec(nr, nr.dFgMvR[s], nr.fgOfSt, t0, t1))
+            return false;
+    }
+    else if (!nativeFsrfgOfIn(nr, nr.fgOf2, prev, frame) ||
+             !nativeOfVecRun(nr, nr.fgOf2, 0, 1, nr.dFgMvR[s], nr.fgMvPitch, "fsrfg side vectors"))
         return false;
     if (cudaEventRecord(nr.fgEvVec[s], nr.fgOfSt) != cudaSuccess)
     {
@@ -10224,11 +10378,13 @@ static bool nativeFsrfgLevel(NativeRife& nr, int l)
         nr.die("fsrfg level event failed");
         return false;
     }
-    if (!nativeFsrfgAheadVec(nr, 0, lf[0], rt[0]))
+    const float den = (float)(1 << l); // call j's frames = nodes 2 j and 2 j + 2 of 2^l
+    if (!nativeFsrfgAheadVec(nr, 0, lf[0], rt[0], 0.0f, 2.0f / den))
         return false;
     for (int j = 0; j < n; j++)
     {
-        if (j + 1 < n && !nativeFsrfgAheadVec(nr, (j + 1) & 1, lf[j + 1], rt[j + 1]))
+        if (j + 1 < n && !nativeFsrfgAheadVec(nr, (j + 1) & 1, lf[j + 1], rt[j + 1], (2.0f * j + 2.0f) / den,
+                                              (2.0f * j + 4.0f) / den))
             return false;
         if (!nativeFsrfgNode(nr, 2 * j + 1, l, j & 1))
             return false;
@@ -10274,10 +10430,36 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     nr.fgPitch = nr.fgMvPitch = 0;
     for (NativeRife::FgInst& g : nr.fg)
         g = NativeRife::FgInst{};
+    // fgOf on its own stream fgL1St (the pipelined route's level-1 chain); the profiler keeps it on the session's
+    nr.fgOfWr = nr.fgOfRd = 1;
+    nr.fgPiped = nr.fgL1Pend = nr.fgL1Ok = nr.fgPipeLogged = false;
+    {
+        char ev[8] = {};
+        if (!(GetEnvironmentVariableA("SMV_FSRFG_PROF", ev, sizeof(ev)) > 0 && ev[0] == '1') &&
+            (cudaStreamCreateWithFlags(&nr.fgL1St, cudaStreamNonBlocking) != cudaSuccess ||
+             cudaEventCreateWithFlags(&nr.fgEvL1, cudaEventDisableTiming) != cudaSuccess ||
+             cudaEventCreateWithFlags(&nr.fgEvS, cudaEventDisableTiming) != cudaSuccess ||
+             cudaEventCreateWithFlags(&nr.fgEvDeep, cudaEventDisableTiming) != cudaSuccess))
+        {
+            LOG("native: fsrfg: the level-1 stream did not start: the Optical Flow on the session's stream, no "
+                "pipelined route\n");
+            for (cudaEvent_t* e : {&nr.fgEvL1, &nr.fgEvS, &nr.fgEvDeep})
+                if (*e)
+                {
+                    cudaEventDestroy(*e);
+                    *e = nullptr;
+                }
+            if (nr.fgL1St)
+                cudaStreamDestroy(nr.fgL1St);
+            nr.fgL1St = nullptr;
+        }
+    }
     // never the fast perf level here: at fast, grid 1, the engine's vectors can go wrong after ~320 calls of a 1080p
     // session with vkd3d-proton in the process (garbage tweens from then on, run to run different)
-    if (!nativeFsrfgCreate(nr, 0) || !nativeOfVecSetup(nr, nr.fgOf, nr.w, nr.h, "fsrfg"))
+    if (!nativeFsrfgCreate(nr, 0) || !nativeOfVecSetup(nr, nr.fgOf, nr.w, nr.h, "fsrfg", nr.fgL1St))
         return false;
+    if (nr.fgL1St)
+        NCHK(cudaMalloc((void**)&nr.dFgMvL1, (size_t)nr.fgMvPitch * nr.h), "alloc fsrfg level-1 vectors");
     const size_t bytes = (size_t)nr.fgPitch * nr.h, plane = (size_t)nr.ph * nr.pw;
     for (auto& s : nr.dFrSurf)
         NCHK(cudaMalloc((void**)&s, bytes), "alloc fsrfg frame");
@@ -10302,8 +10484,8 @@ static bool nativeFsrfgSetup(NativeRife& nr)
                 nr.fgProf = false;
         for (double& s : nr.fgStageMs)
             s = 0.0;
-        nr.fgCpuMs = 0.0;
-        nr.fgProfN = nr.fgProfVecN = 0;
+        nr.fgCpuMs = nr.fgDeriveMs = 0.0;
+        nr.fgProfN = nr.fgProfVecN = nr.fgProfDerN = 0;
     }
     for (int i = 0; i < 3; i++)
         nr.frIn[i] = nr.frSurfSdr[i] = false;
@@ -10327,8 +10509,9 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     nr.frNodeCalls = nr.frTweens = nr.frPrimed = nr.frRepeats = 0;
     for (bool& ok : nr.frNodeOk)
         ok = false;
-    LOG("native: fsrfg session %dx%d, AMD FSR %s frame generation (ML) through smv_fsrfg_bridge.dll on vkd3d-proton, RGBA16F, NVIDIA optical flow vectors (grid %d, %s), recursive midpoints (depth cap %d)\n",
-        nr.w, nr.h, g_fsrfg.provider(), nr.fgOf.grid, nativeOfLevelName(nr.fgOf.level), nr.frMpCap);
+    LOG("native: fsrfg session %dx%d, AMD FSR %s frame generation (ML) through smv_fsrfg_bridge.dll on vkd3d-proton, RGBA16F, NVIDIA optical flow vectors (grid %d, %s; level-2+ calls %s), recursive midpoints (depth cap %d)\n",
+        nr.w, nr.h, g_fsrfg.provider(), nr.fgOf.grid, nativeOfLevelName(nr.fgOf.level),
+        fsrfgDeriveOn(nr) ? "derived from level 1" : "a pass a call", nr.frMpCap);
     if (nr.encPost)
         LOG("native: fsrfg: HDR planes: %s\n",
             nr.frSdrOn ? "frame pairs inside the SDR range go to FSR as their SDR view, any other pair as the HDR codes"
@@ -10336,11 +10519,14 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     return true;
 }
 
-static bool nativeFsrfgPair(NativeRife& nr, const float* dCur, uint32_t nTween)
+// the new frame packed into a frame surface (never the last one, nor `keep`) and the pair advanced to it (frA / frB /
+// frSerial, its nodes cleared); repacked = the last frame was packed again in the other encoding
+static bool nativeFsrfgPairStep(NativeRife& nr, const float* dCur, uint32_t nTween, int keep, bool& repacked)
 {
     int n = 0;
-    while (n == nr.frPrev)
+    while (n == nr.frPrev || n == keep)
         n++;
+    repacked = false;
     // HDR planes: FRUC's rule (nativeFrucPair): the SDR view only when both frames stay inside the SDR range
     bool in = false;
     if (nr.frSdrOn)
@@ -10373,6 +10559,7 @@ static bool nativeFsrfgPair(NativeRife& nr, const float* dCur, uint32_t nTween)
         for (uint64_t& k : nr.frLastKey)
             if (k)
                 k = ~0ull;
+        repacked = true;
     }
     if (nr.frSdrOn && nTween && nr.frPrev >= 0 && nr.frModeLogs < 4 && (nr.frModeLogs == 0 || sdr != nr.frPairSdr))
     {
@@ -10389,10 +10576,18 @@ static bool nativeFsrfgPair(NativeRife& nr, const float* dCur, uint32_t nTween)
     nr.frMpBuilt = false;
     for (bool& ok : nr.frNodeOk)
         ok = false;
+    return true;
+}
+
+static bool nativeFsrfgPair(NativeRife& nr, const float* dCur, uint32_t nTween)
+{
+    bool repacked = false;
+    if (!nativeFsrfgPairStep(nr, dCur, nTween, -1, repacked))
+        return false;
     if (nr.frA < 0)
     {
         // the stream's first frame: instance 0 starts there with a reset
-        if (!nativeFsrfgFeed(nr, 0, nr.dFrSurf[n], nullptr, true, nullptr))
+        if (!nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frB], nullptr, true, nullptr))
             return false;
         nr.frLastKey[0] = nativeFrucKey(nativeFrucCur(nr), 1, 0);
         return true;
@@ -10400,6 +10595,200 @@ static bool nativeFsrfgPair(NativeRife& nr, const float* dCur, uint32_t nTween)
     // every real frame goes to instance 0 in order, tweens or not (a gap would cost a re-prime): that call is the
     // pair's midpoint
     return nativeFsrfgNode(nr, 1, 1) != nullptr;
+}
+
+// the pipelined route (SMV_FSRFG_PIPE, nativeGroup's route bit) is open: the derived level-2+ vectors (a pair's
+// deeper calls read only its own level-1 field), one field a pair (not SMV_OFVEC_BOTH), fgOf on fgL1St (not the
+// profiler)
+static bool fsrfgPipeOk(const NativeRife& nr)
+{
+    return nr.fgL1St && nr.dFgMvL1 && fsrfgDeriveOn(nr) && !nr.fgOf.both && !nr.fgProf;
+}
+
+// SMV_FSRFG_PIPE=serial (an A/B lever): the pipelined route with the new pair's Optical Flow too after the shown pair's
+// deeper calls (its bookkeeping without its overlap)
+static bool fsrfgPipeSerial()
+{
+    static const bool on = [] {
+        char v[16] = "";
+        return GetEnvironmentVariableA("SMV_FSRFG_PIPE", v, sizeof(v)) > 0 && strcmp(v, "serial") == 0;
+    }();
+    return on;
+}
+
+// a pipelined group's pair step: the pair the last group made current becomes the one shown (its level-1 node, made
+// on fgL1St then, swapped into dFrNode), the new frame is packed sparing the shown pair's first frame, and the new
+// pair's level-1 call starts on fgL1St: its Optical Flow into the other field now, the call itself after the shown
+// pair's deeper calls (nativeFsrfgL1Issue). The shown pair is held (its second frame in every slot) when it was
+// identical, when the last group was not pipelined (it showed that pair itself: the route's entry costs one source
+// period's hold) or when its second frame was packed again in the other encoding
+static bool nativeFsrfgPipeAdvance(NativeRife& nr, const float* dCur, bool curStatic)
+{
+    // the pack below writes a frame surface fgL1St's earlier calls read (a held group's next pack, a repack): the
+    // session's stream waits for fgL1St's last work first (its next deeper calls wait for that call anyway)
+    if (nr.fgPiped && cudaStreamWaitEvent(nr.stream, nr.fgEvL1, 0) != cudaSuccess)
+    {
+        nr.die("fsrfg level-1 wait failed");
+        return false;
+    }
+    nr.frLagSerial = nr.frSerial;
+    nr.frLagA = nr.frA;
+    nr.frLagB = nr.frB;
+    nr.frLagSdr = nr.frPairSdr;
+    nr.frLagStatic = nr.frCurStatic;
+    const bool had = nr.fgPiped && nr.frLagA >= 0 && nr.fgL1Ok;
+    nr.fgOfRd = nr.fgOfWr;
+    bool repacked = false;
+    if (!nativeFsrfgPairStep(nr, dCur, curStatic ? 0 : 1, nr.frLagA, repacked))
+        return false;
+    nr.frLagHave = had && !repacked;
+    if (nr.frLagHave)
+    {
+        std::swap(nr.dFrNode[kFrGrid / 2], nr.dFgL1Node);
+        nr.frNodeOk[kFrGrid / 2] = true;
+    }
+    nr.frLagL = 0;
+    nr.fgL1Ok = false;
+    nr.frCurStatic = curStatic;
+    nr.frPipePrev = true;
+    nr.frPipeGroups++;
+    nr.fgPiped = true;
+    if (!nr.fgPipeLogged)
+    {
+        LOG("native: fsrfg: pipelined across pairs: the new pair's level-1 Optical Flow and call on their own stream "
+            "beside the shown pair's level-2+ calls\n");
+        nr.fgPipeLogged = true;
+    }
+    if (!nr.dFgL1Node && cudaMalloc((void**)&nr.dFgL1Node, (size_t)nr.fgPitch * nr.h) != cudaSuccess)
+    {
+        nr.dFgL1Node = nullptr;
+        nr.die("fsrfg level-1 node alloc failed");
+        return false;
+    }
+    // fgL1St after the pack
+    if (cudaEventRecord(nr.fgEvS, nr.stream) != cudaSuccess ||
+        cudaStreamWaitEvent(nr.fgL1St, nr.fgEvS, 0) != cudaSuccess)
+    {
+        nr.die("fsrfg level-1 event failed");
+        return false;
+    }
+    const FrTree cur = nativeFrucCur(nr);
+    if (nr.frA < 0)
+    {
+        // the stream's first frame: instance 0 starts there with a reset
+        if (!nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frB], nullptr, true, nullptr, -1, false, 3) ||
+            cudaEventRecord(nr.fgEvL1, nr.fgL1St) != cudaSuccess)
+            return false;
+        nr.frLastKey[0] = nativeFrucKey(cur, 1, 0);
+        return true;
+    }
+    const uint64_t lk = nativeFrucKey(cur, 0, 1);
+    if (nr.frLastKey[0] != lk)
+    {
+        // a re-prime (after a repack): the shown pair is held, so no deeper call runs beside this whole call
+        nr.frLagHave = false;
+        if (!nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frA], nullptr, nr.frLastKey[0] == 0, nullptr, -1, false, 3))
+            return false;
+        if (nr.frLastKey[0] != 0)
+            nr.frPrimed++;
+        nr.frLastKey[0] = lk;
+    }
+    nr.fgOfWr = nr.fgOf.wr = 1 - nr.fgOfRd;
+    nr.fgL1Pend = true;
+    return fsrfgPipeSerial() ||
+           nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frB], nr.dFrSurf[nr.frA], false, nullptr, -1, true, 1);
+}
+
+// the pipelined route's instance-0 call of the new pair (nativeFsrfgPipeAdvance made its vectors) on fgL1St after
+// fgEvDeep = all the session's stream queued so far (the shown pair's deeper calls), so FSR's calls keep the serial
+// route's order on the device; its node into dFgL1Node, fgEvL1 after it
+static bool nativeFsrfgL1Issue(NativeRife& nr)
+{
+    if (!nr.fgL1Pend)
+        return true;
+    nr.fgL1Pend = false;
+    if (cudaEventRecord(nr.fgEvDeep, nr.stream) != cudaSuccess)
+    {
+        nr.die("fsrfg level-1 event failed");
+        return false;
+    }
+    if (fsrfgPipeSerial() &&
+        (cudaStreamWaitEvent(nr.fgL1St, nr.fgEvDeep, 0) != cudaSuccess ||
+         !nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frB], nr.dFrSurf[nr.frA], false, nullptr, -1, true, 1)))
+    {
+        nr.die("fsrfg level-1 call failed");
+        return false;
+    }
+    if (!nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frB], nr.dFrSurf[nr.frA], false, nr.dFgL1Node, -1, true, 2))
+        return false;
+    if (cudaEventRecord(nr.fgEvL1, nr.fgL1St) != cudaSuccess)
+    {
+        nr.die("fsrfg level-1 event failed");
+        return false;
+    }
+    nr.frLastKey[0] = nativeFrucKey(nativeFrucCur(nr), 2, 1);
+    nr.frNodeCalls++;
+    nr.fgL1Ok = true;
+    return true;
+}
+
+// a pipelined group's tween: the shown pair's levels 2 to its depth (level by level, as nativeFsrfgTween) once its
+// level-1 node is done on fgL1St, then the new pair's level-1 call (nativeFsrfgL1Issue), then the nearest node
+static bool nativeFsrfgLagTween(NativeRife& nr, double t)
+{
+    if (!nr.frMpL)
+    {
+        nr.frMpL = (std::min)(nativeFrucDepth(nr, &t, 1), nr.frInst);
+        if (cudaStreamWaitEvent(nr.stream, nr.fgEvL1, 0) != cudaSuccess)
+        {
+            nr.die("fsrfg level-1 wait failed");
+            return false;
+        }
+        for (int l = 2; l <= nr.frMpL; l++)
+            if (nativeFsrfgAhead(nr))
+            {
+                if (!nativeFsrfgLevel(nr, l))
+                    return false;
+            }
+            else
+                for (int k = 1; k < (1 << l); k += 2)
+                    if (!nativeFsrfgNode(nr, k, l))
+                        return false;
+        if (!nativeFsrfgL1Issue(nr))
+            return false;
+        nr.frMpBuilt = true;
+    }
+    const int den = 1 << nr.frMpL;
+    const int k = (std::max)(1, (std::min)(den - 1, (int)floor(t * den + 0.5)));
+    uint8_t* node = nativeFsrfgNode(nr, k, nr.frMpL);
+    if (!node)
+        return false;
+    nr.frTweens++;
+    int pitch = nr.fgPitch, sdr = nr.frLagSdr ? 1 : 0, ps = nr.ph * nr.pw;
+    void* a[] = {&node, &pitch, &nr.w, &nr.h, &sdr, &nr.encPost, &nr.encWhite, &nr.dFrOut, &ps, &nr.pw};
+    if (cuLaunchKernel(nr.fUnpackRgbaH, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, a,
+                       nullptr) != CUDA_SUCCESS)
+    {
+        nr.die("unpackRgbaH (fsrfg) launch failed");
+        return false;
+    }
+    return true;
+}
+
+// the direct route after a pipelined group: the session's stream waits for fgL1St's last work (the level-1 call of
+// the pair the last group made current, which this route never shows), one field again
+static bool nativeFsrfgPipeExit(NativeRife& nr)
+{
+    if (!nr.fgPiped)
+        return true;
+    nr.fgPiped = nr.fgL1Ok = nr.fgL1Pend = false;
+    nr.fgOfWr = nr.fgOfRd = nr.fgOf.wr = 1;
+    if (cudaStreamWaitEvent(nr.stream, nr.fgEvL1, 0) != cudaSuccess)
+    {
+        nr.die("fsrfg level-1 wait failed");
+        return false;
+    }
+    return true;
 }
 
 // one tween at t into dFrOut: the pair's whole tree to its depth first, level by level (FRUC's order: level L's
@@ -10447,6 +10836,8 @@ static bool nativeFsrfgTween(NativeRife& nr, double t)
 // frames after this)
 static void nativeFsrfgRelease(NativeRife& nr)
 {
+    if (nr.fgL1St)
+        cudaStreamSynchronize(nr.fgL1St);
     if (nr.stream)
         cudaStreamSynchronize(nr.stream);
     if (nr.fg[0].made)
@@ -10455,16 +10846,18 @@ static void nativeFsrfgRelease(NativeRife& nr)
             nr.frInst, nr.frInst > 1 ? "s" : "");
     if (nr.fgProfN)
     {
-        const double n = (double)nr.fgProfN, nv = nr.fgProfVecN ? (double)nr.fgProfVecN : 1.0;
-        double sum = 0.0;
+        const double n = (double)nr.fgProfN, nv = nr.fgProfVecN ? (double)nr.fgProfVecN : 1.0,
+                     nd = nr.fgProfDerN ? (double)nr.fgProfDerN : 1.0;
+        double sum = nr.fgDeriveMs;
         for (double s : nr.fgStageMs)
             sum += s;
-        LOG("[fsrfg-prof] %llu calls (%llu with vectors) %dx%d, ms a call: copy in %.3f, Optical Flow inputs %.3f, "
-            "Optical Flow %.3f, vector kernels %.3f (the three a vector call), vector copy %.3f, FSR on vkd3d %.3f, "
-            "copy out %.3f, all %.3f; the bridge's CPU call %.3f\n",
-            (unsigned long long)nr.fgProfN, (unsigned long long)nr.fgProfVecN, nr.w, nr.h, nr.fgStageMs[0] / n,
-            nr.fgStageMs[1] / nv, nr.fgStageMs[2] / nv, nr.fgStageMs[3] / nv, nr.fgStageMs[4] / n, nr.fgStageMs[5] / n,
-            nr.fgStageMs[6] / n, sum / n, nr.fgCpuMs / n);
+        LOG("[fsrfg-prof] %llu calls (%llu with an Optical Flow pass, %llu derived) %dx%d, ms a call: copy in %.3f, "
+            "Optical Flow inputs %.3f, Optical Flow %.3f, vector kernels %.3f (the three a pass call), derived vectors "
+            "%.3f (a derived call), vector copy %.3f, FSR on vkd3d %.3f, copy out %.3f, all %.3f; the bridge's CPU "
+            "call %.3f\n",
+            (unsigned long long)nr.fgProfN, (unsigned long long)nr.fgProfVecN, (unsigned long long)nr.fgProfDerN, nr.w,
+            nr.h, nr.fgStageMs[0] / n, nr.fgStageMs[1] / nv, nr.fgStageMs[2] / nv, nr.fgStageMs[3] / nv,
+            nr.fgDeriveMs / nd, nr.fgStageMs[4] / n, nr.fgStageMs[5] / n, nr.fgStageMs[6] / n, sum / n, nr.fgCpuMs / n);
     }
     for (cudaEvent_t& e : nr.fgEv)
         if (e)
@@ -10502,6 +10895,22 @@ static void nativeFsrfgRelease(NativeRife& nr)
     }
     nativeFsrfgAheadFree(nr);
     nativeOfVecFree(nr.fgOf);
+    for (uint8_t** b : {&nr.dFgMvL1, &nr.dFgL1Node})
+        if (*b)
+        {
+            cudaFree(*b);
+            *b = nullptr;
+        }
+    for (cudaEvent_t* e : {&nr.fgEvL1, &nr.fgEvS, &nr.fgEvDeep})
+        if (*e)
+        {
+            cudaEventDestroy(*e);
+            *e = nullptr;
+        }
+    if (nr.fgL1St)
+        cudaStreamDestroy(nr.fgL1St);
+    nr.fgL1St = nullptr;
+    nr.fgPiped = nr.fgL1Pend = nr.fgL1Ok = false;
     nr.frInst = 1;
 }
 
@@ -13939,8 +14348,11 @@ static uint64_t nativeVideoMemoryRoom()
 // frame (296 / 521 MiB at 896x512 / 1920x1088), and AMD FSR 4 frame generation's second midpoint instance with its node
 // frames, 45 MiB + 335 a megapixel of the (unpadded) model frame (a parked live session's own memory, x4 against x2: 146
 // / 476 MiB at 854x480 / 1708x960, a quarter on top) + its side Optical Flow session (nativeFsrfgAhead, x4 and up: 34 /
-// 74 MiB at 854x480 / 1280x720 = 2 + 98 a megapixel with a quarter, where both sides hold x4); the other routes add
-// nothing the reserve does not cover. The x8 /
+// 74 MiB at 854x480 / 1280x720 = 2 + 98 a megapixel with a quarter, where both sides hold x4), or with derived level-2+
+// vectors (fsrfgDeriveOn) only the side stream's two vector buffers (8 bytes a pixel, 10 a megapixel with a quarter),
+// plus, while the bridge gives every instance its own vkd3d device (fsrfg_devices), 300 MiB an instance past the first
+// (x4 parked, shared vs own devices: +243 / +49 MiB at 854x480 / 1708x960, x8 at 1280x720 +471 for two: the largest,
+// flat, a quarter on top); the other routes add nothing the reserve does not cover. The x8 /
 // x16 / x32 ladders' third, fourth and fifth tree levels (an instance and twice the node frames a level) come on top
 // when the session's slots reach them (the process's own memory over x4 at 854x480 / 1708x960, a quarter on top, FRUC
 // by the padded megapixel: FRUC x8 +332 / +620 MiB, x16 +711 / +1423, x32 +1184 / +2595; FSR 4 x8 +282 / +462, x16
@@ -13951,7 +14363,8 @@ static uint64_t nativeVideoMemoryRoom()
 // fixed 1708x960 x512 run clamps its slots, so one size measured it: FRUC 6431 MiB at 854x480 against 6717 so priced,
 // FSR 4 7054 against 7149).
 constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 290.0, kFrucLateMp = 173.0;
-constexpr double kFsrfgLateBase = 47.0, kFsrfgLateMp = 433.0;
+constexpr double kFsrfgLateBase = 47.0, kFsrfgLateMp = 433.0, kFsrfgLateDerBase = 45.0, kFsrfgLateDerMp = 345.0,
+                 kFsrfgOwnDevice = 300.0;
 constexpr double kFrucDeepBase[] = {277.0, 549.0, 806.0, 1052.0, 1264.0, 1396.0, 1659.0},
                  kFrucDeepMp[] = {300.0, 742.0, 1470.0, 2453.0, 4260.0, 7733.0, 14678.0};
 constexpr double kFsrfgDeepBase[] = {278.0, 580.0, 381.0, 1663.0, 1869.0, 2126.0, 2641.0},
@@ -13986,12 +14399,17 @@ static uint64_t nativeLiveLateNeed(const NativeRife& nr, uint32_t slots)
     if (nr.fruc)
     {
         const double mp = (double)nr.pw * nr.ph / 1e6;
-        need += nr.fsrfg ? kFsrfgLateBase + kFsrfgLateMp * mp : kFrucLateBase + kFrucLateMp * mp;
+        need += !nr.fsrfg           ? kFrucLateBase + kFrucLateMp * mp
+                : fsrfgDeriveOn(nr) ? kFsrfgLateDerBase + kFsrfgLateDerMp * mp
+                                    : kFsrfgLateBase + kFsrfgLateMp * mp;
         // the deepest ladder the slots and the instances reach: x8 = 3 levels, x16 = 4, .. x512 = 9
         const int levels = nativeTreeLevels(nr, slots);
         if (nr.frMp && levels > 2)
             need += nr.fsrfg ? kFsrfgDeepBase[levels - 3] + kFsrfgDeepMp[levels - 3] * mp
                              : kFrucDeepBase[levels - 3] + kFrucDeepMp[levels - 3] * mp;
+        // an own vkd3d device for every FSR 4 instance past the first (x4 = 2 instances, x2^L = L)
+        if (nr.fsrfg && g_fsrfg.devices && g_fsrfg.devices() == 1)
+            need += ((std::max)(levels, (std::min)(2, nr.frInstMax)) - 1) * kFsrfgOwnDevice;
         // a pipelined group's second tree: the shown pair's nodes beside the new pair's (BGRA8, 4 bytes a pixel)
         if (nr.frMp && !nr.fsrfg)
             need += ((1 << levels) - 1) * 4.0 * mp * 1e6 / mib;
@@ -14686,7 +15104,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         return false;
     uint32_t nfr = 0;
     memcpy(&nfr, msg.data(), 4);
-    // the exe's route bit (sendPairStream): this Smooth Motion group shows the previous pair, pipelined
+    // the exe's route bit (sendPairStream): this Smooth Motion / AMD FSR 4 group shows the previous pair, pipelined
     const bool pipeAsk = (nfr & 0x80000000u) != 0;
     nfr &= 0x7fffffffu;
     const float* fr = (const float*)(msg.data() + 4);
@@ -14694,7 +15112,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         return false;
     if (nfr > nr.slots)
         nfr = nr.slots;
-    const bool pipe = pipeAsk && nr.fruc && nr.frMp && !nr.fsrfg && g_fruc.stepI && nr.havePrev;
+    const bool pipe =
+        pipeAsk && nr.fruc && nr.frMp && nr.havePrev && (nr.fsrfg ? fsrfgPipeOk(nr) : g_fruc.stepI != nullptr);
     // no-engine mode (Identity.process_shm): an empty group stays empty (the pair advances,
     // nothing presented), any other group is exactly ONE real frame through the effects
     // chain, whatever fractions the pair clock asked for
@@ -14729,6 +15148,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 // its levels and the worker's join); a group that made instances is skipped (grPriceSkip)
                 if (nr.fruc && nr.frMp && nr.grPriceSkip > 0)
                     nr.grPriceSkip--;
+                else if (nr.fruc && nr.frMp && nr.fsrfg && nr.grPiped)
+                {
+                    // AMD FSR 4 pipelined (SMV_FSRFG_PIPE=force, fixed work): its groups price nothing
+                }
                 else if (nr.fruc && nr.frMp && nr.fsrfg && nr.grSlots)
                 {
                     // AMD FSR 4 queues its calls on the stream (its CPU call returns at once) and the stream waits for
@@ -15240,11 +15663,11 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     }
     else if (nr.fruc && pipe)
     {
-        // Smooth Motion pipelined: the static test above judged the NEW pair, which the next group shows; this group
-        // shows the previous pair (nativeFrucPipeAdvance), held when it was identical or never split. The levels'
-        // instances are made here, before instance 0's worker runs
+        // Smooth Motion / AMD FSR 4 pipelined: the static test above judged the NEW pair, which the next group shows;
+        // this group shows the previous pair (nativeFrucPipeAdvance / nativeFsrfgPipeAdvance), held when it was
+        // identical or never split. The levels' instances are made here, before instance 0's worker / call runs
         const bool curStatic = pairStatic;
-        if (!nativeFrucPipeAdvance(nr, dCur, curStatic))
+        if (!(nr.fsrfg ? nativeFsrfgPipeAdvance(nr, dCur, curStatic) : nativeFrucPipeAdvance(nr, dCur, curStatic)))
             return false;
         pairStatic = !nr.frLagHave || nr.frLagStatic;
         nTween = 0;
@@ -15256,7 +15679,12 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     tw[nTween++] = fr[i];
             const int want = nTween ? (std::min)(nativeFrucDepth(nr, tw, nTween), nr.frInstMax) : 0;
             if (nr.frInst < want)
-                nativeFrucGrow(nr, want);
+            {
+                if (nr.fsrfg)
+                    nativeFsrfgGrow(nr, want);
+                else
+                    nativeFrucGrow(nr, want);
+            }
             if (want)
                 nr.frPipeDepth = want;
         }
@@ -15265,6 +15693,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     {
         // Smooth Motion: every frame is packed (the next pair's start), the bridge itself
         // runs per tween below; an identical pair got nTween = 0 above and never reaches FRUC
+        if (nr.fsrfg && !nativeFsrfgPipeExit(nr))
+            return false;
         nr.frPipePrev = false;
         nr.frCurStatic = pairStatic;
         if (!nativeFrucPair(nr, dCur, nTween))
@@ -15331,7 +15761,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     nr.grFrPreCalls = nr.grFrCalls;
     // a pipelined group: the new pair's levels 1..k start on instance 0's worker beside this group's slots (joined in
     // nativeFrucLagTween, or below when the shown pair is held)
-    if (pipe && !nativeFrucPipeSpec(nr))
+    if (pipe && !nr.fsrfg && !nativeFrucPipeSpec(nr))
         return false;
     const int pitchI = (int)nr.pitch;
     uint32_t sent = 0;
@@ -15596,7 +16026,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         {
             // Smooth Motion: one bridge call per tween (it syncs the context on entry, so the
             // previous tween's store has read dFrOut before the next unpack overwrites it)
-            if (!(pipe ? nativeFrucLagTween(nr, fr[i]) : nativeFrucTween(nr, fr[i])))
+            if (!(pipe ? (nr.fsrfg ? nativeFsrfgLagTween(nr, fr[i]) : nativeFrucLagTween(nr, fr[i]))
+                       : nativeFrucTween(nr, fr[i])))
             {
                 fail = true;
                 break;
@@ -15699,7 +16130,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         cudaEventRecord(nr.slotEv[i], st);
         drainReady(false);
     }
-    if (fail || (pipe && !nativeFrucSpecJoin(nr)))
+    // a pipelined group's last step: Smooth Motion's worker joined, AMD FSR 4's level-1 call issued (when no tween did)
+    if (fail || (pipe && !(nr.fsrfg ? nativeFsrfgL1Issue(nr) : nativeFrucSpecJoin(nr))))
         return false;
     if (!pipe)
         nr.grFrChainMs = nr.grFrCallMs - nr.grFrPreMs;

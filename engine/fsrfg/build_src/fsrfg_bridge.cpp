@@ -46,6 +46,12 @@ std::string g_err;
 std::wstring g_cacheRoot; // fsrfg_set_cache_dir, else shader_cache beside this DLL
 bool g_loaded = false;
 PFN_D3D12_CREATE_DEVICE g_createDevice = nullptr;
+// SMV_FSRFG_DEVICE=own: every instance on its own vkd3d-proton device (vkd3d's D3D12CreateDevice hands every caller the
+// adapter's one device; instances sharing it stay exact with their calls back to back because our vkd3d does not offer
+// the coopmat2 conversions); null = that one device (the default, or no factory). Each instance records whether its
+// device is its own (fsrfg_devices)
+ID3D12DeviceFactory* g_factory = nullptr;
+bool g_failOwn = false; // SMV_FSRFG_DEVICE=failown: instances after the first take the shared device (the trigger)
 ffxFunctions g_ffx = {};
 uint64_t g_versionId = 0; // the FSR 4 version id the DLL offers, found at the first create
 std::string g_provider;
@@ -73,6 +79,7 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3
 struct Instance
 {
     bool live = false;
+    bool own = false; // its device came from the device factory (fsrfg_devices)
     uint32_t w = 0, h = 0;
     DXGI_FORMAT fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     ID3D12Device* dev = nullptr;
@@ -176,6 +183,17 @@ bool loadOnce()
     g_createDevice = d3d ? (PFN_D3D12_CREATE_DEVICE)GetProcAddress(d3d, "D3D12CreateDevice") : nullptr;
     if (!g_createDevice)
         return fail("smv_vkd3d_d3d12.dll did not load or lacks D3D12CreateDevice");
+    {
+        char v[16] = "";
+        GetEnvironmentVariableA("SMV_FSRFG_DEVICE", v, sizeof(v));
+        g_failOwn = strcmp(v, "failown") == 0;
+        const bool own = g_failOwn || strcmp(v, "own") == 0;
+        // CLSID_D3D12DeviceFactory (the Windows SDK's d3d12.h; d3d12.lib, which defines it, is not linked)
+        static const GUID kFactory = {0x114863bf, 0xc386, 0x4aee, {0xb3, 0x9d, 0x8f, 0x0b, 0xbb, 0x06, 0x29, 0x55}};
+        auto getIf = (PFN_D3D12_GET_INTERFACE)GetProcAddress(d3d, "D3D12GetInterface");
+        if (!g_factory && own && getIf && FAILED(getIf(kFactory, IID_PPV_ARGS(&g_factory))))
+            g_factory = nullptr;
+    }
     // AMD's DLL serializes its root signatures through the loaded module named D3D12.dll (found by name; without one
     // every pipeline fails to create and each dispatch is dropped): the system's, whose blobs vkd3d-proton reads
     if (!LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
@@ -392,6 +410,19 @@ FSRFG_API const char* fsrfg_provider()
     return g_provider.c_str();
 }
 
+// 1 = every live instance runs on its own vkd3d-proton device (calls of different instances may then run back to back;
+// none live = the factory is there), 0 = one shares vkd3d's device (the default without SMV_FSRFG_DEVICE=own, no device
+// factory, or a device the factory did not create)
+FSRFG_API int fsrfg_devices()
+{
+    if (!g_factory)
+        return 0;
+    for (const Instance& s : g_inst)
+        if (s.live && !s.own)
+            return 0;
+    return 1;
+}
+
 // instance i (0..kMaxInstances - 1) at w x h on the adapter with this LUID; fmt 0 = RGBA8, 1 = RGBA16F. Fills *sh (the handles stay
 // owned by the bridge until fsrfg_destroy_i). 0 = ok, < 0 = fsrfg_last_error.
 FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, int32_t luidHigh, int fmt,
@@ -419,7 +450,12 @@ FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, in
     release(fac);
     if (FAILED(hr))
         return fail("no DXGI adapter with the CUDA device's LUID", hr), -3;
-    hr = g_createDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s.dev));
+    hr = E_FAIL;
+    if (g_factory && !(g_failOwn && i > 0))
+        hr = g_factory->CreateDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s.dev));
+    s.own = SUCCEEDED(hr);
+    if (!s.own) // on the shared device: once live, the host's callers keep the old schedule (fsrfg_devices)
+        hr = g_createDevice(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s.dev));
     release(ad);
     if (FAILED(hr))
         return fail("vkd3d-proton's D3D12CreateDevice failed", hr), -4;

@@ -197,7 +197,7 @@ index 8fabb245..588d2335 100644
      win32_handle_info.pNext = NULL;
      win32_handle_info.semaphore = fence->timeline_semaphore;
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index 817f8a80..fcb8a07d 100644
+index 817f8a80..9a018d50 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
 @@ -2438,9 +2438,19 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
@@ -262,21 +262,36 @@ index 817f8a80..fcb8a07d 100644
  
          vr = VK_CALL(vkGetSemaphoreWin32HandleKHR(device->vk_device, &win32_handle_info, handle));
  
-@@ -10234,6 +10251,14 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
-                 VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_CONVERSIONS;
+@@ -10228,10 +10245,27 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
+                 VKD3D_SHADER_TARGET_EXTENSION_WMMA_FP8;
      }
  
+-    if (device->device_info.cooperative_matrix2_features_nv.cooperativeMatrixConversions)
++    /* SMV patch: the coopmat2 conversions are offered only with SMV_VKD3D_COOPMAT2_CONV=1 (A/B and driver re-checks):
++     * on NVIDIA, AMD FSR 4 frame generation's shaders lowered with them return garbage on every call for ~0.64 s
++     * after ~3.5 s of the device's GPU work; without them the matrix use changes go through shared memory, the
++     * output otherwise identical. */
++    {
++        char env[8];
++
++        if (device->device_info.cooperative_matrix2_features_nv.cooperativeMatrixConversions &&
++                vkd3d_get_env_var("SMV_VKD3D_COOPMAT2_CONV", env, sizeof(env)) && env[0] == '1')
++        {
++            device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
++                    VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_CONVERSIONS;
++        }
++    }
++
 +    /* SMV patch: dxil-spirv's wmma_fp8_staging loads FP8 tiles as tensor loads with a decode function. */
 +    if (device->device_info.cooperative_matrix2_features_nv.cooperativeMatrixTensorAddressing &&
 +            device->device_info.cooperative_matrix2_features_nv.cooperativeMatrixBlockLoads)
-+    {
-+        device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
-+                VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_TENSOR_LOADS;
-+    }
-+
-     if (VKD3D_CONFIG_FLAG_IS_SET(EXTENDED_DEBUG_UTILS))
      {
          device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
+-                VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_CONVERSIONS;
++                VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_TENSOR_LOADS;
+     }
+ 
+     if (VKD3D_CONFIG_FLAG_IS_SET(EXTENDED_DEBUG_UTILS))
 diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
 index a8fc26b1..878fdf89 100644
 --- a/libs/vkd3d/resource.c

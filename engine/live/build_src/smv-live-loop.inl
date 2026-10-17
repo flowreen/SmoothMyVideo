@@ -2591,6 +2591,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const bool fpSet = GetEnvironmentVariableW(L"SMV_FRUC_PIPE", fpv, 8) != 0;
         const bool frucPipeOn = !(fpSet && fpv[0] == L'0');
         const bool frucPipeForce = fpSet && !wcscmp(fpv, L"force");
+        // AMD FSR 4's tree pipelined the same way (nativeFsrfgPipeAdvance: the next pair's level-1 Optical Flow and call
+        // on their own stream beside this pair's deeper calls): SMV_FSRFG_PIPE=force only (every x4 or deeper ladder
+        // and fixed multiplier; =serial the same route without its overlap, an A/B lever), not priced yet
+        wchar_t fgpv[8]{};
+        const bool fsrfgPipeForce = GetEnvironmentVariableW(L"SMV_FSRFG_PIPE", fgpv, 8) != 0 &&
+                                    (!wcscmp(fgpv, L"force") || !wcscmp(fgpv, L"serial"));
         bool frucPiped = false;
         double frucPipeT = -1e9; // nowMs of the last route switch
         // the whole multiple M an adaptive target runs as M's ladder (0 = the grid). On the grid nearly every output
@@ -2912,7 +2918,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 tmInPair += m;
                 nextGrid = 0;
                 // fruc-pipe's route for this ladder (see frucPipeOn)
-                if (frucPipeForce && srv.nr && srv.nr->fruc && srv.nr->frMp && !srv.nr->fsrfg && m >= 4)
+                if (srv.nr && srv.nr->fruc && srv.nr->frMp &&
+                    (srv.nr->fsrfg ? fsrfgPipeForce && fsrfgPipeOk(*srv.nr) : frucPipeForce) && m >= 4)
                     pipeThis = true;
                 else if (frucPipeOn && srv.nr && srv.nr->fruc && srv.nr->frMp && !srv.nr->fsrfg && m >= 4 && thrMd > 0)
                 {
@@ -2964,7 +2971,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 for (int k = 1; k <= genFrames; k++)
                     fr[nfr++] = (float)k / (float)(genFrames + 1);
                 fr[nfr++] = 1.0f; // the real frame
-                pipeThis = frucPipeForce && genFrames >= 3 && srv.nr && srv.nr->fruc && srv.nr->frMp && !srv.nr->fsrfg;
+                pipeThis = genFrames >= 3 && srv.nr && srv.nr->fruc && srv.nr->frMp &&
+                           (srv.nr->fsrfg ? fsrfgPipeForce && fsrfgPipeOk(*srv.nr) : frucPipeForce);
             }
             // each slot's place on the pacing clock: its fraction of the pair (on the adaptive route
             // exactly its grid point); a span the clock just snapped over falls back to the source's period

@@ -473,10 +473,28 @@ Models (GMFSS is the default, the anime specialist):
   motion vectors are NVIDIA optical flow (one direction, the slow perf level, grid 1 or 4 where 1 is
   refused, ABGR8): this frame is the input, the previous one the reference, so the forward field =
   FSR's current -> previous convention (byte for byte the backward field of a both-directions run at
-  about half the optical flow time, `SMV_OFVEC_BOTH=1` = that run); depth is a constant 0.5. On a tree
-  level with two or more calls (x4 and up) the next call's vectors run on a side stream with their own
-  optical flow session during each FSR call (x0.81 to 0.91 a pair at x4 / x8; `SMV_FSRFG_OVERLAP=0` = in
-  turn). At the
+  about half the optical flow time, `SMV_OFVEC_BOTH=1` = that run); depth is a constant 0.5. Only the
+  level-1 call (the pair's two real frames) runs an optical flow pass: a level-2+ call between the pair's
+  positions t0 and t1 takes vectors derived from the pair's level-1 field (`k_mvDerive`, straight-line motion
+  inside the pair: the content at p sits at the B position q with p = q + (1 - t1) v(q), a 3-step fixed
+  point, the field = (t1 - t0) v(q); grid 1 only, an engine that refuses grid 1 keeps a pass a call;
+  `SMV_FSRFG_CHILDMV=0` = a pass a call). One optical flow pass a call bounds FSR 4 on the optical flow
+  engine (72 to 86 % busy, the SMs 17 to 22 %); derived, a 1080p x8 group on a 24 fps film took 68.5 ->
+  26.8 ms (offline x8 1080p 138 -> 58 s, 1440p 79 -> 32 s), and on real 1000 fps footage (X4K1000FPS) the
+  tweens score closer to the true frames (PSNR and LPIPS, x4 and x8; weaker on fast rotation next to the
+  earlier frame). Every bridge instance shares vkd3d-proton's one device (its D3D12CreateDevice hands every
+  caller the adapter's one device), and calls of different instances back to back stay exact run to run
+  (1080p x4 / x8 / x16, x8 over 1000 frames); `SMV_FSRFG_DEVICE=own` = an own device an instance through
+  vkd3d's device factory (`fsrfg_devices()` = 1), about 0.25 s and up to ~240 MiB more an instance (priced at
+  300 in the late price). FIXED: the bursts (x16 on every schedule, 1080p: 56 to 181 broken frames of 2385 a
+  run; x4 at 1080p; derived vectors on one device in every run; one context beside other GPU work) were one ~0.64 s window after ~3.5 s of the vkd3d device's GPU work
+  in which every FSR call on that device returned garbage, then exact again; the trigger was NVIDIA's lowering of
+  VK_NV_cooperative_matrix2's conversions (the matrix use changes in 71 of FSR 4's 194 shaders). Our vkd3d-proton
+  no longer offers them (`SMV_VKD3D_COOPMAT2_CONV=1` = the old lowering, which brings the window back): 0 broken
+  runs at x16 / x4 / with a second context, the output otherwise byte for byte the old one, about 5 % more FSR
+  time (0.7 % of a whole 4K call). On a tree level with two or more calls (x4 and up) the next call's vectors are made on a side
+  stream during each FSR call (with their own optical flow session: x0.81 to 0.91 a pair at x4 / x8;
+  derived by default; `SMV_FSRFG_OVERLAP=0` = in turn). At the
   FAST level the tweens went wrong after a few hundred calls of a 1080p session (grid 1 ~320, grid 4
   ~450 to 770; garbage from then on, run to run different, with vkd3d-proton in the process; zero
   vectors and AMD's own path stay exact; harness `fsr4_optimization` `fg_long.py`); never fast here. Frames go to the bridge as RGBA16F
@@ -1755,11 +1773,15 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_OF_LEVEL=fast\|medium` | Every NVIDIA Optical Flow session (the NVIDIA Optical Flow model, DLSS 5's motion vectors, AMD FSR's vectors for frame generation and upscaling) at that perf level instead of slow, the engine's highest quality level (frame generation at fast = the repro of its tweens turning to garbage after ~320 calls at 1080p; the FSR 4 gate's like-for-like pan against AMD's path, whose vectors are fast grid 1); A/B lever, never a product setting |
 | `SMV_OFVEC_GRID4=1` | AMD FSR's motion vectors (frame generation and upscaling) at optical flow grid 4 + the bilinear upsample (`k_nvofUp`) instead of grid 1 (frame generation 1080p fast: a call 9.5 -> 3.5 ms; at fast it breaks too, later); A/B lever, never a product setting |
 | `SMV_OFVEC_COST=1` | AMD FSR's motion vectors: the Optical Flow engine's cost output on (FSR reads no cost; off by default, the same vectors byte for byte, ~2 to 3 % less Optical Flow time); A/B lever, never a product setting |
-| `SMV_FSRFG_PROF=1` / `SMV_FSRUP_PROF=1` | AMD FSR frame generation / upscaling: CUDA events between a call's stages (the copies, the Optical Flow inputs, the Optical Flow, the vector kernels, FSR itself, the unpack), `[fsrfg-prof]` / `[fsrup-prof]` ms a call at the session's end; every call then waits for its last event (profiling only, slower) |
-| `SMV_FSRFG_OVERLAP=0` / `SMV_FSRFG_OVERLAP=fail` | AMD FSR frame generation: every call's vectors in its turn instead of the next call's on a side stream during each FSR call (tree levels with two or more calls, x4 and up) / the side session's setup fails after a whole one, the trigger of its fallback (`the side Optical Flow session did not start`; route gate only); A/B levers, never a product setting |
+| `SMV_FSRFG_PROF=1` / `SMV_FSRUP_PROF=1` | AMD FSR frame generation / upscaling: CUDA events between a call's stages (the copies, the Optical Flow inputs, the Optical Flow, the vector kernels, the derived vectors, FSR itself, the unpack), `[fsrfg-prof]` / `[fsrup-prof]` ms a call at the session's end; every call then waits for its last event (profiling only, slower) |
+| `SMV_FSRFG_CHILDMV=0` | AMD FSR frame generation: level-2+ calls (x4 and up) run an optical flow pass each instead of taking vectors derived from their pair's level-1 field (the default; the session line says `level-2+ calls a pass a call` instead of `level-2+ calls derived from level 1`); A/B lever, never a product setting |
+| `SMV_FSRFG_DEVICE=own` / `=failown` | AMD FSR frame generation's bridge: every instance on its own vkd3d device instead of vkd3d's one (`fsrfg_devices()` = 1; the late price adds 300 MiB an instance past the first) / instance 0 on its own, the later ones on the shared device (the factory's failure path); the derived level-2+ vectors run on either; A/B levers, never a product setting |
+| `SMV_VKD3D_COOPMAT2_CONV=1` | AMD FSR frame generation's vkd3d-proton offers dxil-spirv NVIDIA's cooperative-matrix conversions again (VK_NV_cooperative_matrix2): the matrix use changes as one conversion each instead of through shared memory, ~5 % less FSR time, but on NVIDIA every FSR call on the device returns garbage for ~0.64 s after ~3.5 s of its GPU work (see "AMD FSR 4 frame generation"); A/B and driver re-check lever, never a product setting |
+| `SMV_FSRFG_OVERLAP=0` / `SMV_FSRFG_OVERLAP=fail` | AMD FSR frame generation: every call's vectors in its turn instead of the next call's on a side stream during each FSR call (tree levels with two or more calls, x4 and up) / the side stream's setup fails after a whole one, the trigger of its fallback (`the side stream did not start` with derived vectors, `the side Optical Flow session did not start` with `SMV_FSRFG_CHILDMV=0`; route gate only); A/B levers, never a product setting |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion (the first one AMD FSR frame generation too): the most bridge instances (1..9; recursive midpoints use one per tree level on both routes, default 9 = to x512, 5 = to x32; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_FRUC_PIPE=0` / `=force` | Live Smooth Motion: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder, the fixed multipliers too (gates; see "Pipelined across pairs") |
+| `SMV_FSRFG_PIPE=force` / `=serial` | Live AMD FSR frame generation: pipeline the midpoint tree across pairs on every x4 or deeper ladder and fixed multiplier (the new pair's level-1 Optical Flow on its own stream beside the shown pair's deeper calls; derived vectors only; the host line `fsrfg: pipelined across pairs`) / the same route with that Optical Flow after the deeper calls; off by default (not priced); A/B levers, never a product setting (see "Pipelined across pairs") |
 | `SMV_FRUC_STEPUP=0` | Live Smooth Motion / AMD FSR 4 FG: a target between two ladder nodes runs the largest node that fits instead of the node above it (gates; see "The node above the target") |
 | `SMV_LIVE_CASCADE=off` / `=probe` / `=present`, `SMV_LIVE_CASCADE_GEN` | Live DLSS 4.5: `off` = one pass only (no plan above the limit); development only (the direct route): `probe` starts `dlssg2f.exe --stage1` beside the session (in a job object that ends it with the host), feeds it every captured frame and reads every frame it shares on the host's own D3D12 device, presenting nothing of it; `present` = the cascade: the session's DLSS-G (`--gen`) presents stage 1's frames instead of the captured ones (x6 x x2 = x12); `_GEN` = stage 1's generated frames (1..5, default 5). Lines `cascade probe: ...` / `cascade stage 1: ...` (harness `dlssg_cascade\probe_gate.py`) |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..9, default 3 offline, 2 live; exact nodes go to depth 9 either way) |
@@ -1916,8 +1938,16 @@ below 90 % of the direct tree's (a direct tree at its edge flaps its lock), at m
 entering holds one source period (the pair the last direct group showed), leaving skips one pair. Log: `present grid: xM pipelined across pairs ...`
 or `... direct` at a switch, the throttle line ends with `a Smooth Motion call N ms + N ms a slot,
 direct N / pipelined N`, the session line with `N groups pipelined`. `SMV_FRUC_PIPE=0` = never,
-`=force` = every x4 or deeper ladder, the fixed multipliers too (gates). AMD FSR 4 FG does not
-pipeline. It makes every real frame's level 1 before the slots and queues its calls on the stream
+`=force` = every x4 or deeper ladder, the fixed multipliers too (gates). AMD FSR 4 FG pipelines only
+with `SMV_FSRFG_PIPE=force` (not priced, off by default): a group shows the previous pair, its levels 2
+and deeper on the session's stream while the new pair's level-1 Optical Flow runs on a stream of its own
+beside them; instance 0's call of the new pair waits for those deeper calls (FSR's calls keep the direct
+tree's order on the device, the nodes are the direct tree's: same tweens on the same pairs), its node
+becomes the shown pair's level 1 a group later; the derived vectors only (each pair reads its own field
+of the two the session alternates). It frees the period's Optical Flow share (1440p x8 at 100 % of the
+period direct, ~65 % pipelined; 1080p x16 drops halved, the deeper calls' SM time then binds), one
+source period more latency. `=serial` = the same route with the new pair's Optical Flow after the
+deeper calls (an A/B lever). Without it, FSR 4 makes every real frame's level 1 before the slots and queues its calls on the stream
 (the CPU call returns at once; the stream waits for a node where it is first read), so its price
 comes off each group's whole GPU time: an x2 group's whole time, and per extra call the x4+ group's
 whole time less that and its extra slot stores; tweens a pair = 1 + (budget - x2's time) / (call +
@@ -1971,7 +2001,8 @@ The vkd3d-proton patch: `VKD3D_FP8_EMULATION=1` takes the FP8-as-FP16 cooperativ
 the driver exports no D3D12-fence type (NVIDIA); a shared texture's memory carries the access rights CUDA
 expects, and vkd3d-proton neither opens its own export through D3DKMT nor shares that D3DKMT copy (CUDA
 refuses such a handle); a device with VK_NV_cooperative_matrix2 tensor addressing and block loads tells
-dxil-spirv so; the two DLLs are named `smv_vkd3d_d3d12.dll` / `smv_vkd3d_d3d12core.dll`, so they
+dxil-spirv so, but its conversions are not offered unless `SMV_VKD3D_COOPMAT2_CONV=1` (lowered with them, FSR 4's
+shaders turn to garbage for ~0.64 s after ~3.5 s of the device's GPU work on NVIDIA); the two DLLs are named `smv_vkd3d_d3d12.dll` / `smv_vkd3d_d3d12core.dll`, so they
 never share a module name with the system D3D12 in the host's process. The dxil-spirv patch: FP8 matrices
 emulated as FP16 (`DXIL_SPIRV_CONFIG=wmma_fp8_staging`): a storage-buffer tile load is one coopmat2 tensor
 load with a decode function where the device has them, else staged through shared memory (each lane reads
