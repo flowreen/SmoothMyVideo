@@ -117,6 +117,133 @@ static void slLog(sl::LogType type, const char* msg)
 
 #include "sl_focus_shim.h"
 
+// milliseconds on the performance counter (GetTickCount64 steps in ~16 ms)
+static double qpcMs()
+{
+    static LARGE_INTEGER f{};
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+// The native swap chain's Present / Present1 wrapped (its vtable, this process only): when a call returns, its present
+// is queued, so a readback queued after it reads that present's frame. g_presentsQueued = the present count the last
+// returned call reached; the capture copies presents up to it.
+static std::atomic<UINT> g_presentsQueued{0};
+static std::atomic<int> g_presentsInFlight{0};
+using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+static PresentFn g_present = nullptr;
+static Present1Fn g_present1 = nullptr;
+
+// after a returned call: the count it reached, kept only when no other Present call was in flight (another thread's
+// present may be counted but not yet queued)
+static void notePresentQueued(IDXGISwapChain* sc)
+{
+    UINT c = 0;
+    if (FAILED(sc->GetLastPresentCount(&c)) || g_presentsInFlight.load() != 1)
+        return;
+    UINT o = g_presentsQueued.load();
+    while (c > o && !g_presentsQueued.compare_exchange_weak(o, c))
+    {
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE presentQueued(IDXGISwapChain* sc, UINT sync, UINT flags)
+{
+    g_presentsInFlight++;
+    const HRESULT hr = g_present(sc, sync, flags);
+    notePresentQueued(sc);
+    g_presentsInFlight--;
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE present1Queued(IDXGISwapChain1* sc, UINT sync, UINT flags,
+                                                const DXGI_PRESENT_PARAMETERS* p)
+{
+    g_presentsInFlight++;
+    const HRESULT hr = g_present1(sc, sync, flags, p);
+    notePresentQueued(sc);
+    g_presentsInFlight--;
+    return hr;
+}
+
+// The real factory's CreateSwapChain / CreateSwapChainForHwnd wrapped (its vtable, this process only): Streamline creates
+// the native swap chain on a queue of its own, and only a copy on THAT queue runs behind a present.
+// g_nativeScQueue = the device / queue argument of the last real swap chain creation.
+static std::atomic<IUnknown*> g_nativeScQueue{nullptr};
+using CreateScFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using CreateScHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+                                                   const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*,
+                                                   IDXGISwapChain1**);
+static CreateScFn g_createSc = nullptr;
+static CreateScHwndFn g_createScHwnd = nullptr;
+
+static HRESULT STDMETHODCALLTYPE createScSeen(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* d,
+                                              IDXGISwapChain** out)
+{
+    g_nativeScQueue = dev;
+    return g_createSc(f, dev, d, out);
+}
+
+static HRESULT STDMETHODCALLTYPE createScHwndSeen(IDXGIFactory2* f, IUnknown* dev, HWND w,
+                                                  const DXGI_SWAP_CHAIN_DESC1* d,
+                                                  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fd, IDXGIOutput* o,
+                                                  IDXGISwapChain1** out)
+{
+    g_nativeScQueue = dev;
+    return g_createScHwnd(f, dev, w, d, fd, o, out);
+}
+
+// vtable slots: IDXGIFactory::CreateSwapChain = 10, IDXGIFactory2::CreateSwapChainForHwnd = 15
+static bool wrapRealFactory(IDXGIFactory2* proxy)
+{
+    ComPtr<IUnknown> real;
+    if (slGetNativeInterface(proxy, (void**)real.GetAddressOf()) != sl::Result::eOk || !real)
+        return false;
+    void** vt = *(void***)real.Get();
+    DWORD old = 0;
+    if (!VirtualProtect(&vt[10], sizeof(void*) * 6, PAGE_READWRITE, &old))
+        return false;
+    if (vt[10] != (void*)&createScSeen)
+    {
+        g_createSc = (CreateScFn)vt[10];
+        vt[10] = (void*)&createScSeen;
+    }
+    if (vt[15] != (void*)&createScHwndSeen)
+    {
+        g_createScHwnd = (CreateScHwndFn)vt[15];
+        vt[15] = (void*)&createScHwndSeen;
+    }
+    VirtualProtect(&vt[10], sizeof(void*) * 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+    return true;
+}
+
+// vtable slots: IDXGISwapChain::Present = 8, IDXGISwapChain1::Present1 = 22
+static bool wrapNativePresent(IDXGISwapChain1* sc)
+{
+    void** vt = *(void***)sc;
+    DWORD old = 0;
+    if (!VirtualProtect(&vt[8], sizeof(void*) * 15, PAGE_READWRITE, &old))
+        return false;
+    if (vt[8] != (void*)&presentQueued)
+    {
+        g_present = (PresentFn)vt[8];
+        vt[8] = (void*)&presentQueued;
+    }
+    if (vt[22] != (void*)&present1Queued)
+    {
+        g_present1 = (Present1Fn)vt[22];
+        vt[22] = (void*)&present1Queued;
+    }
+    VirtualProtect(&vt[8], sizeof(void*) * 15, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+    return true;
+}
+
 // ---------------------------------------------------------------- D3D helpers
 
 static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -212,13 +339,16 @@ struct Host
     UINT rowPitch = 0; // 256-aligned pitch shared by upload + readback
     ComPtr<ID3D12CommandAllocator> alloc;
     ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12CommandQueue> rbQueue; // the readback's queue: the one the native swap chain presents on
+    ComPtr<ID3D12CommandAllocator> rbAlloc;
+    ComPtr<ID3D12GraphicsCommandList> rbList;
     ComPtr<ID3D12Fence> fence;
     uint64_t fenceValue = 0;
     HANDLE fenceEvent{};
     sl::ViewportHandle vp{0u};
     sl::Constants consts{};
     uint32_t frameIndex = 1;
-    int waitMs = 5;           // settle after a native present is observed
+    int waitMs = 5;           // the longest the newest native present waits for a later one before its readback
     int genFrames = 1;        // generated frames per source frame (numFramesToGenerate)
     UINT syncInterval = 1;    // Present sync interval: vsync-paced FG, measured far more reliable for the capture
     uint32_t maxGen = 0;      // device limit reported by the SDK (0 = not yet known)
@@ -232,9 +362,9 @@ struct Host
         return hdr10 ? DXGI_FORMAT_R10G10B10A2_UNORM : bgra ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     }
 
-    bool waitQueue()
+    bool waitQueue(ID3D12CommandQueue* q = nullptr)
     {
-        queue->Signal(fence.Get(), ++fenceValue);
+        (q ? q : queue.Get())->Signal(fence.Get(), ++fenceValue);
         if (fence->GetCompletedValue() < fenceValue)
         {
             fence->SetEventOnCompletion(fenceValue, fenceEvent);
@@ -259,6 +389,7 @@ struct Host
         // SL's pacer calls SetMaximumFrameLatency and presents with DXGI_PRESENT_ALLOW_TEARING
         scd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
         ComPtr<IDXGISwapChain1> sc1;
+        g_nativeScQueue = nullptr;
         if (FAILED(factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &scd, nullptr, nullptr, &sc1)))
             return false;
         if (FAILED(sc1.As(&sc)))
@@ -272,6 +403,32 @@ struct Host
             return false;
         if (FAILED(nativeUnk.As(&scNative)))
             return false;
+        if (nativeCapture)
+        {
+            // the readback runs on the queue the native chain presents on (a copy there queues behind each present);
+            // SMV_DLSSG_RB_QUEUE=own, or no such queue seen = this host's queue with the settle before each readback
+            ComPtr<ID3D12CommandQueue> nq;
+            IUnknown* seen = g_nativeScQueue.exchange(nullptr);
+            wchar_t rq[8] = {};
+            GetEnvironmentVariableW(L"SMV_DLSSG_RB_QUEUE", rq, 8);
+            rbOwn = _wcsicmp(rq, L"own") == 0 || !seen || FAILED(seen->QueryInterface(IID_PPV_ARGS(&nq)));
+            if (rbOwn)
+                nq = queue;
+            if (nq != rbQueue)
+            {
+                const D3D12_COMMAND_LIST_TYPE t = nq->GetDesc().Type;
+                rbAlloc.Reset();
+                rbList.Reset();
+                if (FAILED(device->CreateCommandAllocator(t, IID_PPV_ARGS(&rbAlloc))) ||
+                    FAILED(device->CreateCommandList(0, t, rbAlloc.Get(), nullptr, IID_PPV_ARGS(&rbList))) ||
+                    FAILED(rbList->Close()))
+                    return false;
+                rbQueue = nq;
+            }
+            if (logIt)
+                LOG("readback queue: %s\n",
+                    rbOwn ? "this host's, a settle before each readback" : "the native swap chain's");
+        }
         if (hdr10)
         {
             // declared on the proxy chain too: the interposer only learns the colour space from a call it hooks, and
@@ -293,6 +450,15 @@ struct Host
         if (logIt)
             LOG("native swap chain: %ux%u fmt=%d buffers=%u%s\n", nd.Width, nd.Height, (int)nd.Format, nativeBufCount,
                 hdr10 ? ", HDR10 (G2084 / P2020)" : "");
+        // SMV_DLSSG_PRESENT_WRAP=0: no wrap (the capture then waits for a later present, or waitMs on the newest)
+        if (nativeCapture && !rbOwn)
+        {
+            wchar_t pw[4] = {};
+            GetEnvironmentVariableW(L"SMV_DLSSG_PRESENT_WRAP", pw, 4);
+            presentWrapped = wcscmp(pw, L"0") != 0 && wrapNativePresent(scNative.Get());
+            if (logIt)
+                LOG("native Present wrapped: %s\n", presentWrapped ? "yes" : "no");
+        }
         return true;
     }
 
@@ -355,6 +521,8 @@ struct Host
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         CHECK_HR(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
+        if (nativeCapture && !wrapRealFactory(factory.Get()))
+            LOG("the real DXGI factory could not be wrapped: reading frames back on this host's queue\n");
         if (!createSwapchain(true))
         {
             if (!hdr10Refused)
@@ -610,29 +778,29 @@ struct Host
     bool copyNativeBuffer(UINT idx, uint8_t* rgbaOut)
     {
         ComPtr<ID3D12Resource> buf;
-        if (FAILED(scNative->GetBuffer(idx, IID_PPV_ARGS(&buf))))
+        if (!rbList || FAILED(scNative->GetBuffer(idx, IID_PPV_ARGS(&buf))))
             return false;
 
-        alloc->Reset();
-        list->Reset(alloc.Get(), nullptr);
+        rbAlloc->Reset();
+        rbList->Reset(rbAlloc.Get(), nullptr);
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = buf.Get();
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        list->ResourceBarrier(1, &b);
+        rbList->ResourceBarrier(1, &b);
         D3D12_TEXTURE_COPY_LOCATION src{buf.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         D3D12_TEXTURE_COPY_LOCATION dst{readbackBuf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         dst.PlacedFootprint.Footprint = {frameFormat(), W, H, 1, rowPitch};
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        rbList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        list->ResourceBarrier(1, &b);
-        list->Close();
-        ID3D12CommandList* ls[] = {list.Get()};
-        queue->ExecuteCommandLists(1, ls);
-        if (!waitQueue())
+        rbList->ResourceBarrier(1, &b);
+        rbList->Close();
+        ID3D12CommandList* ls[] = {rbList.Get()};
+        rbQueue->ExecuteCommandLists(1, ls);
+        if (!waitQueue(rbQueue.Get()))
             return false;
 
         uint8_t* mapped = nullptr;
@@ -647,35 +815,91 @@ struct Host
     }
 
     // incremental present capture: append the pixels of every native present that landed since
-    // the last poll (the ledger maps present k back to buffer (cur - 1 - (count - k)) mod N; 6
-    // native buffers vs at most 5 generated frames means nothing is overwritten before we drain
-    // it). The caller decides WHICH captured presents are generated frames by content - present
-    // order cannot be trusted: a real-frame present sometimes slips into the stream despite
-    // eShowOnlyInterpolatedFrame, and on some runs it even leads the generated one.
-    UINT pollSeen = 0; // reset to presentSnapshot after each proxy Present
-    int pollNewPresents(std::vector<std::vector<uint8_t>>& raw)
+    // the last poll (6 native buffers vs at most 5 generated frames means nothing is overwritten
+    // before we drain it). The caller decides WHICH captured presents are generated frames by
+    // content - present order cannot be trusted: a real-frame present sometimes slips into the
+    // stream despite eShowOnlyInterpolatedFrame, and on some runs it even leads the generated one.
+    // The copies run on rbQueue, the queue the native chain presents on (Streamline's own, not this
+    // host's: a copy on another queue raced the presents and read buffers' previous frames). A copy
+    // there runs behind a present once that present is queued: its Present call returned
+    // (g_presentsQueued, the wrapped native Present), else a later present shows (the pacer presents
+    // in order from one thread) or, for the newest, waitMs passed (a pair's last present has no later one).
+    // On this host's queue (rbOwn) no rule orders a copy: a waitMs settle before each poll's copies.
+    bool nativeCapture = false;  // --server / --stage1: the readback queue, the wraps and the capture rules above
+    bool rbOwn = true;           // the readback runs on this host's queue
+    UINT pollSeen = 0;           // reset to presentSnapshot after each proxy Present
+    UINT ringOff = 0;            // present p sits in native buffer (p + ringOff) % nativeBufCount (flip model)
+    UINT newest = 0;             // the newest present count seen
+    double newestMs = 0;         // when it was first seen
+    bool presentWrapped = false; // the native Present / Present1 wrapped (wrapNativePresent)
+    bool queuedKnown = false;    // the wrap sees every native present (checked at each quiet point)
+
+    // copy presents pollSeen + 1 .. last into raw[n..], present p from native buffer bufOf(p)
+    template <class BufOf> int copyPresents(std::vector<std::vector<uint8_t>>& raw, size_t& n, UINT last, BufOf bufOf)
+    {
+        int added = 0;
+        for (UINT p = pollSeen + 1; p <= last; p++)
+        {
+            if (raw.size() <= n)
+                raw.emplace_back((size_t)W * H * 4);
+            if (!copyNativeBuffer(bufOf(p), raw[n].data()))
+                return -1;
+            n++;
+            added++;
+        }
+        pollSeen = last;
+        return added;
+    }
+
+    // the buffer ring's offset, read while no present is in flight (count and index then agree); a wrap that
+    // reached the same count sees the presents
+    void syncRing()
+    {
+        UINT c = 0;
+        scNative->GetLastPresentCount(&c);
+        const UINT cur = scNative->GetCurrentBackBufferIndex();
+        ringOff = (cur + 2 * nativeBufCount - 1 - c % nativeBufCount) % nativeBufCount;
+        const bool known = presentWrapped && g_presentsQueued.load() == c;
+        if (known != queuedKnown)
+            LOG("present capture: %s\n", known ? "copies each present once its Present call returned"
+                                               : "the wrapped Present misses presents, waits for a later present");
+        queuedKnown = known;
+    }
+
+    // raw keeps its buffers from pair to pair; n = how many of them hold the presents captured since the caller reset it
+    int pollNewPresents(std::vector<std::vector<uint8_t>>& raw, size_t& n)
     {
         UINT c = 0;
         scNative->GetLastPresentCount(&c);
         if (c == pollSeen)
             return 0;
-        Sleep(waitMs);                     // settle: let the newest present's GPU write finish
-        scNative->GetLastPresentCount(&c); // re-snapshot after the settle (more may have landed)
-        UINT cur = scNative->GetCurrentBackBufferIndex();
-        int added = 0;
-        for (UINT p = pollSeen + 1; p <= c; p++)
+        if (rbOwn)
         {
-            UINT idx = (cur + nativeBufCount - 1 - (c - p)) % nativeBufCount;
-            raw.emplace_back((size_t)W * H * 4);
-            if (!copyNativeBuffer(idx, raw.back().data()))
-            {
-                raw.pop_back();
-                return -1;
-            }
-            added++;
+            Sleep(waitMs);                     // settle: let the newest present's GPU write finish
+            scNative->GetLastPresentCount(&c); // re-snapshot after the settle (more may have landed)
+            const UINT cur = scNative->GetCurrentBackBufferIndex();
+            return copyPresents(raw, n, c,
+                                [&](UINT p) { return (cur + nativeBufCount - 1 - (c - p)) % nativeBufCount; });
         }
-        pollSeen = c;
-        return added;
+        // the ring must still agree with the count: a present that turns the buffers without being counted (hardware
+        // flip metering) breaks the mapping, and the buffer sweep takes over
+        const UINT cur = scNative->GetCurrentBackBufferIndex();
+        UINT c2 = 0;
+        scNative->GetLastPresentCount(&c2);
+        if (c2 != c || (cur + 2 * nativeBufCount - 1 - c % nativeBufCount) % nativeBufCount != ringOff)
+            return 0;
+        const double now = qpcMs();
+        if (c != newest)
+        {
+            newest = c;
+            newestMs = now;
+        }
+        UINT last = now - newestMs >= waitMs ? c : c - 1;
+        if (queuedKnown)
+            last = (std::max)(last, (std::min)(c, g_presentsQueued.load()));
+        if (last <= pollSeen)
+            return 0;
+        return copyPresents(raw, n, last, [&](UINT p) { return (p + ringOff) % nativeBufCount; });
     }
 
     void shutdown()
@@ -711,9 +935,10 @@ struct Stage1Hdr
     volatile uint32_t slotInput[16]; // lastInput at that moment
 };
 
-// Every native present copied into a ring of shared textures on the swap chain's own queue: that queue runs the copy
-// after the present it follows, so the copy needs no settle; the rings rest in COMMON, the state another device's
-// queue may assume
+// Every native present copied into a ring of shared textures on rbQueue, the queue the native chain presents on
+// (Streamline's own): a copy there runs behind present p once p is queued (its Present call returned, the wrap, or a
+// later present shows), so it needs no settle; on this host's queue (rbOwn) nothing orders it and each present is
+// copied as soon as it is counted. The rings rest in COMMON, the state another device's queue may assume
 struct Stage1Ring
 {
     static const int kRing = 12, kAllocs = 16;
@@ -757,11 +982,11 @@ struct Stage1Ring
             }
             handles.push_back(sh);
         }
+        const D3D12_COMMAND_LIST_TYPE t = host.rbQueue->GetDesc().Type;
         for (int i = 0; i < kAllocs; i++)
         {
-            if (FAILED(host.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc[i]))) ||
-                FAILED(host.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[i].Get(), nullptr,
-                                                      IID_PPV_ARGS(&list[i]))))
+            if (FAILED(host.device->CreateCommandAllocator(t, IID_PPV_ARGS(&alloc[i]))) ||
+                FAILED(host.device->CreateCommandList(0, t, alloc[i].Get(), nullptr, IID_PPV_ARGS(&list[i]))))
                 return false;
             list[i]->Close();
         }
@@ -815,12 +1040,35 @@ struct Stage1Ring
     {
         UINT seen = 0;
         h->scNative->GetLastPresentCount(&seen);
+        UINT copied = seen;
+        int64_t seenQpc[kRing] = {};    // when the capture first counted present p (slot p % kRing)
+        uint32_t seenInput[kRing] = {}; // lastInput at that moment
+        ID3D12CommandQueue* q = h->rbQueue.Get();
         uint64_t n = 0;
         while (!stop.load())
         {
             UINT c = 0, c2 = 0;
             h->scNative->GetLastPresentCount(&c);
-            if (c == seen)
+            if (c != seen)
+            {
+                LARGE_INTEGER t;
+                QueryPerformanceCounter(&t);
+                const uint32_t input = hdr->lastInput;
+                for (UINT p = seen + 1; p <= c; p++)
+                {
+                    seenQpc[p % kRing] = t.QuadPart;
+                    seenInput[p % kRing] = input;
+                }
+                seen = c;
+            }
+            UINT last = c;
+            if (!h->rbOwn)
+            {
+                last = c ? c - 1 : 0;
+                if (h->presentWrapped)
+                    last = (std::max)(last, (std::min)(c, g_presentsQueued.load()));
+            }
+            if (last <= copied)
             {
                 SwitchToThread();
                 continue;
@@ -829,10 +1077,7 @@ struct Stage1Ring
             h->scNative->GetLastPresentCount(&c2);
             if (c2 != c)
                 continue; // a present landed between the two reads: the buffer index may be stale
-            LARGE_INTEGER q;
-            QueryPerformanceCounter(&q);
-            const uint32_t input = hdr->lastInput;
-            for (UINT p = seen + 1; p <= c; p++)
+            for (UINT p = copied + 1; p <= last; p++)
             {
                 const UINT idx = (cur + h->nativeBufCount - 1 - (c - p)) % h->nativeBufCount;
                 const int a = (int)(n % kAllocs);
@@ -853,19 +1098,19 @@ struct Stage1Ring
                 barrier(l, dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
                 l->Close();
                 ID3D12CommandList* ls[] = {l};
-                h->queue->ExecuteCommandLists(1, ls);
-                h->queue->Signal(fence.Get(), ++fv);
+                q->ExecuteCommandLists(1, ls);
+                q->Signal(fence.Get(), ++fv);
                 allocUse[a] = fv;
                 const int s = (int)(n % kRing);
                 hdr->slotFence[s] = fv;
                 hdr->slotSeq[s] = n;
-                hdr->slotQpc[s] = q.QuadPart;
-                hdr->slotInput[s] = input;
+                hdr->slotQpc[s] = seenQpc[p % kRing];
+                hdr->slotInput[s] = seenInput[p % kRing];
                 MemoryBarrier();
                 hdr->frames = ++n;
                 frames++;
             }
-            seen = c;
+            copied = last;
         }
     }
 
@@ -1002,6 +1247,7 @@ static int slInitCommon()
 static int runServer(int genFrames, bool hdr10)
 {
     Host host;
+    host.nativeCapture = true;
     host.genFrames = genFrames;
     host.hdr10 = hdr10;
     int rc = host.init();
@@ -1021,6 +1267,10 @@ static int runServer(int genFrames, bool hdr10)
     std::vector<uint8_t*> outPtrs;
     for (auto& f : outFrames)
         outPtrs.push_back(f.data());
+    // the frames written: a captured present in raw (the counted tier) or an outFrames copy (the sweep tier)
+    std::vector<const uint8_t*> outSrc((size_t)genFrames);
+    std::vector<std::vector<uint8_t>> raw; // the captured presents, buffers reused from pair to pair
+    size_t rawN = 0;
 
     // wait until the pacer's native presents go quiet (used after warmup and after resyncs, so
     // leftover generated presents are never misattributed to the next pair's ledger)
@@ -1042,6 +1292,7 @@ static int runServer(int genFrames, bool hdr10)
                 quietMs = 0;
             }
         }
+        host.syncRing();
     };
 
     auto readFull = [&](uint8_t* p, size_t n) -> bool {
@@ -1073,7 +1324,14 @@ static int runServer(int genFrames, bool hdr10)
                 n++;
         return n;
     };
-    auto sameImage = [&](const uint8_t* a, const uint8_t* b) -> bool { return diffSamples(a, b) == 0; };
+    // diffSamples == 0, stopping at the first differing sample
+    auto sameImage = [&](const uint8_t* a, const uint8_t* b) -> bool {
+        const size_t px = (size_t)W * H;
+        for (size_t i = 0; i < px; i += 397)
+            if (rgbAt(a, i) != rgbAt(b, i))
+                return false;
+        return true;
+    };
     // sampled flat-colour test: a cleared swap chain buffer reads uniform on every sample
     auto uniformImage = [&](const uint8_t* f) -> bool {
         const size_t px = (size_t)W * H;
@@ -1122,6 +1380,14 @@ static int runServer(int genFrames, bool hdr10)
         {
             metered = true;
             LOG("SMV_DLSSG_SWEEP=1: buffer-sweep capture latched from the start\n");
+        }
+        // SMV_DLSSG_WAITMS=N: the newest present's wait (an A/B lever)
+        n = GetEnvironmentVariableA("SMV_DLSSG_WAITMS", buf, (DWORD)sizeof(buf));
+        if (n > 0 && n < sizeof(buf))
+        {
+            host.waitMs = atoi(buf);
+            LOG("SMV_DLSSG_WAITMS=%d: the newest present waits up to %d ms for a later one\n", host.waitMs,
+                host.waitMs);
         }
     }
     std::vector<std::vector<uint32_t>> preSig(host.nativeBufCount);
@@ -1188,7 +1454,6 @@ static int runServer(int genFrames, bool hdr10)
         //     ordering for multi-frame generation (it grows monotonically with the timestep).
         const bool pairStatic = sameImage(prevFrame.data(), inFrame.data());
         const bool inputUniform = uniformImage(inFrame.data());
-        std::vector<std::vector<uint8_t>> raw;
         bool good = false;
 
         auto takeSig = [&](const uint8_t* f, std::vector<uint32_t>& sig) {
@@ -1229,25 +1494,25 @@ static int runServer(int genFrames, bool hdr10)
                 return 1;
             }
             host.pollSeen = host.presentSnapshot;
-            raw.clear();
+            rawN = 0;
             size_t scanned = 0;
             int filled = 0;
             const ULONGLONG t0 = GetTickCount64();
             ULONGLONG nextSweep = t0 + (metered ? 50 : 350);
             while (filled < genFrames && GetTickCount64() < t0 + 1000)
             {
-                int added = host.pollNewPresents(raw);
+                int added = host.pollNewPresents(raw, rawN);
                 if (added < 0)
                 {
                     LOG("present readback failed\n");
                     return 1;
                 }
-                for (; scanned < raw.size() && filled < genFrames; scanned++)
+                for (; scanned < rawN && filled < genFrames; scanned++)
                 {
                     const uint8_t* f = raw[scanned].data();
                     if (!pairStatic && (sameImage(f, inFrame.data()) || sameImage(f, prevFrame.data())))
                         continue; // a real-frame present, not a generated frame
-                    memcpy(outPtrs[filled++], f, frameBytes);
+                    outSrc[filled++] = f;
                 }
                 if (filled >= genFrames)
                     break;
@@ -1293,7 +1558,10 @@ static int runServer(int genFrames, bool hdr10)
                                              diffSamples(b.data(), prevFrame.data());
                                   });
                         for (filled = 0; filled < genFrames; filled++)
+                        {
                             memcpy(outPtrs[filled], cand[filled].data(), frameBytes);
+                            outSrc[filled] = outPtrs[filled];
+                        }
                         if (!metered)
                         {
                             LOG("hardware flip metering detected (generated presents are not counted); "
@@ -1310,7 +1578,7 @@ static int runServer(int genFrames, bool hdr10)
             if (!good)
             {
                 LOG("captured %d generated frame(s) of %d (plus %zu real presents) within 1s\n", filled, genFrames,
-                    raw.size() - filled);
+                    rawN - filled);
                 // post-mortem: what is in each native buffer right now?
                 std::vector<uint32_t> sig;
                 for (UINT i = 0; i < host.nativeBufCount; i++)
@@ -1345,7 +1613,7 @@ static int runServer(int genFrames, bool hdr10)
         lastPresentTick = GetTickCount64();
 
         for (int i = 0; i < genFrames; i++)
-            fwrite(outPtrs[i], 1, frameBytes, stdout);
+            fwrite(outSrc[i], 1, frameBytes, stdout);
         fflush(stdout);
         emitted += genFrames;
         prevFrame.swap(inFrame);
@@ -1362,6 +1630,7 @@ static int runServer(int genFrames, bool hdr10)
 static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& tag, const std::wstring& from)
 {
     Host host;
+    host.nativeCapture = true;
     host.genFrames = genFrames;
     host.hdr10 = hdr10;
     host.bgra = bgra && !hdr10;

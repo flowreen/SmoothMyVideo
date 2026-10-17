@@ -73,7 +73,7 @@ third-party work.
   `engine/fsrfg/smv_vkd3d_d3d12.dll` and `engine/fsrfg/smv_vkd3d_d3d12core.dll`, built from vkd3d-proton
   (github.com/HansKristian-Work/vkd3d-proton) commit 0bb64c56c8f0dcc11ecc0f6c56e00e4f7bd8d506 with its dxil-spirv at
   8434b0639fb2a48ce13aac08a420ecce5d23df0e, both modified: the patches ship beside the DLLs in `engine/fsrfg/source/`,
-  the build steps are in `engine/fsrfg/build_src/build.py`. GNU Lesser General Public License 2.1 (vkd3d-proton's
+  the build steps are in `engine/fsrfg/build_src/build.bat`. GNU Lesser General Public License 2.1 (vkd3d-proton's
   COPYING, LICENSE and AUTHORS in `engine/fsrfg/licenses/`); the app loads the two DLLs at run time, so a rebuild from
   the corresponding source replaces them. Built into them, with their notices in `engine/fsrfg/licenses/`: dxil-spirv
   (MIT), its bc-decoder (MIT, Copyright (c) 2019-2020 Baldur Karlsson), the glslang SPIR-V builder (BSD 3-Clause) and

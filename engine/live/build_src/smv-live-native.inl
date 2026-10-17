@@ -1470,17 +1470,18 @@ __device__ __forceinline__ float asWpmean(float a, float b, float w)
     return __powf(w * __powf(fabsf(a), 0.7f) + fabsf(1.0f - w) * __powf(fabsf(b), 0.7f), 1.0f / 0.7f);
 }
 
-// every thread of the block: the colour tile, then pass 1's edge and the luma at each position pass 2 reads
-__device__ void asLoad(AsTile& s, const float* __restrict__ src, int dw, int dh)
+// every thread of the block: the colour tile, then pass 1's edge and the luma at each position pass 2 reads. src =
+// planes ps apart, rows rs apart, dw x dh used (a padded frame reads in place: the clamp never reaches its pad)
+__device__ void asLoad(AsTile& s, const float* __restrict__ src, int ps, int rs, int dw, int dh)
 {
     const int x0 = blockIdx.x * AS_T, y0 = blockIdx.y * AS_T;
     const int tid = threadIdx.y * AS_T + threadIdx.x;
-    const size_t plane = (size_t)dw * dh;
+    const size_t plane = (size_t)ps;
     for (int i = tid; i < AS_C * AS_C; i += AS_T * AS_T)
     {
         const int ty = i / AS_C, tx = i - ty * AS_C;
         const int gx = min(max(x0 - 5 + tx, 0), dw - 1), gy = min(max(y0 - 5 + ty, 0), dh - 1);
-        const size_t o = (size_t)gy * dw + gx;
+        const size_t o = (size_t)gy * rs + gx;
         s.c[0][ty][tx] = src[o];
         s.c[1][ty][tx] = src[plane + o];
         s.c[2][ty][tx] = src[2 * plane + o];
@@ -1636,12 +1637,13 @@ __device__ void asPixel(const AsTile& s, int tx, int ty, float curve, float out[
         out[ch] = asSat(base + (c0[ch] - c0_Y) * satmul);
 }
 
-// Adaptive Sharpen on a tight planar frame into another (dw x dh each): the sharpen after DLSS 5 at the
-// working size, before RTX HDR and the model (post-processing before frame generation); 16 x 16 blocks
-__global__ void k_sharpPlanar(const float* __restrict__ src, int dw, int dh, float curve, float* __restrict__ dst)
+// Adaptive Sharpen on a planar frame (planes ps apart, rows rs apart) into a tight one (dw x dh): the sharpen after
+// DLSS 5 at the working size, before RTX HDR and the model (post-processing before frame generation); 16 x 16 blocks
+__global__ void k_sharpPlanar(const float* __restrict__ src, int ps, int rs, int dw, int dh, float curve,
+                              float* __restrict__ dst)
 {
     __shared__ AsTile s;
-    asLoad(s, src, dw, dh);
+    asLoad(s, src, ps, rs, dw, dh);
     const int ox = blockIdx.x * AS_T + threadIdx.x, oy = blockIdx.y * AS_T + threadIdx.y;
     if (ox >= dw || oy >= dh) return;
     float c[3];
@@ -1974,12 +1976,13 @@ __global__ void k_thdrIn(const void* __restrict__ src, int half, int planeStride
                   (size_t)y * dw + x, (size_t)dw * dh, bgra, dstG);
 }
 
-// Adaptive Sharpen on the staging frame first (the last SDR pass before TrueHDR); 16 x 16 blocks
-__global__ void k_sharpThdrIn(const float* __restrict__ src, int dw, int dh, float curve,
+// Adaptive Sharpen on the staging frame first (the last SDR pass before TrueHDR; src planes ps apart, rows rs
+// apart); 16 x 16 blocks
+__global__ void k_sharpThdrIn(const float* __restrict__ src, int ps, int rs, int dw, int dh, float curve,
                               unsigned char* __restrict__ bgra, float* __restrict__ dstG)
 {
     __shared__ AsTile s;
-    asLoad(s, src, dw, dh);
+    asLoad(s, src, ps, rs, dw, dh);
     const int ox = blockIdx.x * AS_T + threadIdx.x, oy = blockIdx.y * AS_T + threadIdx.y;
     if (ox >= dw || oy >= dh) return;
     float c[3];
@@ -4608,7 +4611,7 @@ struct NativeRife
     uint8_t* dThdrIn = nullptr;   // BGRA8 bridge input, pitch 4*cw
     uint32_t* dThdrOut = nullptr; // packed 10:10:10:2 bridge output, B in the low bits
     float* dSrcG = nullptr;       // the unquantised sRGB-encoded source, planar fp32
-    float* dShIn = nullptr;       // Sharpen / TrueHDR after DLSS 5: the model frame without its pad (w x h)
+    float* dShIn = nullptr;       // the Sharpen's tight SDR view of HDR planes (w x h)
     float* dShOut = nullptr;      // and the tight result (the sharpen, or TrueHDR's PQ) padded back into it
     // offline: the TrueHDR buffers above are sized dw x dh (TrueHDR runs at the working size before the
     // model), and the emit's per-frame statistics block (nativeOfflinePqOut), read back one frame late
@@ -4755,6 +4758,15 @@ struct NativeRife
     cudaEvent_t fgL1Ev[2] = {};
     bool grL1Armed = false;
     double gFrL1Ratio = 0.0, gFrL1BaseMs = 0.0;
+    // AMD FSR 4's pipelined route (SMV_FSRFG_PIPE) is priced off three parts every group times on either route: the
+    // level-1 Optical Flow on fgL1St (fgOfEv: the direct route hops there too), the level-1 call's FSR span (fgL1Ev)
+    // and the session stream's pre outside that chain (the pipelined pre, or a direct pre less the two); the exe's
+    // pipelined cost = that pre + the longer of the deeper calls (+ the later of the stores and the next level-1 call)
+    // and the level-1 chain. 0 = not timed yet
+    cudaEvent_t fgOfEv[2] = {};
+    bool grOfArmed = false;
+    double gFgPreMs = 0.0, gFgOfMs = 0.0, gFgL1Ms = 0.0;
+    std::atomic<uint32_t> gFgPreUs{0}, gFgOfUs{0}, gFgL1Us{0};
 
     CUmodule cuMod = nullptr;
     CUfunction fPackInDirect = nullptr, fResizeH = nullptr, fResizeV = nullptr, fH2f = nullptr, fF2h = nullptr,
@@ -8031,10 +8043,9 @@ static bool nativeRtxInit(NativeRife& nr)
     if (nr.vsrPre && !nr.dCapF)
         NCHK(cudaMalloc((void**)&nr.dCapF, (size_t)3 * nr.ch * nr.cw * sizeof(float)), "alloc capture planes");
     if (nr.sharpen > 0.0f || nr.rtxHdr)
-    {
-        NCHK(cudaMalloc((void**)&nr.dShIn, (size_t)3 * nr.w * nr.h * sizeof(float)), "alloc after-DLSS 5 input");
         NCHK(cudaMalloc((void**)&nr.dShOut, (size_t)3 * nr.w * nr.h * sizeof(float)), "alloc after-DLSS 5 output");
-    }
+    if (nr.sharpen > 0.0f && nr.encPost && nr.shHdrView)
+        NCHK(cudaMalloc((void**)&nr.dShIn, (size_t)3 * nr.w * nr.h * sizeof(float)), "alloc sharpen SDR view");
     if (nr.sharpen > 0.0f)
     {
         LOG("native: sharpen: Adaptive Sharpen %.2f at %dx%d, after DLSS 5 and before RTX HDR and the model\n",
@@ -8932,14 +8943,17 @@ static bool nativeFrucSetup(NativeRife& nr)
     nr.grPriceSkip = 0;
     nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = nr.gFrCallMs = nr.gFrStoreMs = nr.gFrBaseMs = nr.gFrL1Ratio =
         nr.gFrL1BaseMs = nr.grFrWkMs = nr.gFrPipeMainMs = nr.gFrPipeWkMs = nr.gFrPipeRm = nr.gFrPipeRw =
-            nr.gFrCallEntryMs = 0.0;
+            nr.gFrCallEntryMs = nr.gFgPreMs = nr.gFgOfMs = nr.gFgL1Ms = 0.0;
     nr.grPipeLearn = 0;
-    nr.grL1Armed = nr.grPiped = false;
+    nr.grL1Armed = nr.grOfArmed = nr.grPiped = false;
     nr.gFrCallUs.store(0);
     nr.gFrStoreUs.store(0);
     nr.gFrBaseUs.store(0);
     nr.gFrPipeMainUs.store(0);
     nr.gFrPipeWkUs.store(0);
+    nr.gFgPreUs.store(0);
+    nr.gFgOfUs.store(0);
+    nr.gFgL1Us.store(0);
     g_frInUseLogged = false;
     if (nr.frMp)
         LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA, feed-once, recursive midpoints (depth cap %d)\n",
@@ -10083,11 +10097,17 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
                 nr.die("fsrfg vector event failed");
                 return false;
             }
+            // the level-1 pass's span for the pipelined route's price (nativeGroup)
+            cudaStream_t os = nr.fgOf.st ? nr.fgOf.st : nr.stream;
+            if (l1 && nr.fgOfEv[0])
+                nr.grOfArmed = cudaEventRecord(nr.fgOfEv[0], os) == cudaSuccess;
             if (!nativeFsrfgOfIn(nr, nr.fgOf, prev, frame))
                 return false;
             mark(2);
             if (!nativeOfVecRun(nr, nr.fgOf, 0, 1, mvBuf, nr.fgMvPitch, "fsrfg", nr.fgProf ? nr.fgEv[3] : nullptr))
                 return false;
+            if (l1 && nr.grOfArmed)
+                nr.grOfArmed = cudaEventRecord(nr.fgOfEv[1], os) == cudaSuccess;
             if (hop && (cudaEventRecord(nr.fgEvL1, nr.fgOf.st) != cudaSuccess ||
                         cudaStreamWaitEvent(st, nr.fgEvL1, 0) != cudaSuccess))
             {
@@ -10841,9 +10861,10 @@ static void nativeFsrfgRelease(NativeRife& nr)
     if (nr.stream)
         cudaStreamSynchronize(nr.stream);
     if (nr.fg[0].made)
-        LOG("native: fsrfg session: %llu tweens, %llu midpoint calls, %llu re-primed streams, %d instance%s\n",
+        LOG("native: fsrfg session: %llu tweens, %llu midpoint calls, %llu re-primed streams%s, %d instance%s\n",
             (unsigned long long)nr.frTweens, (unsigned long long)nr.frNodeCalls, (unsigned long long)nr.frPrimed,
-            nr.frInst, nr.frInst > 1 ? "s" : "");
+            nr.frPipeGroups ? (", " + std::to_string(nr.frPipeGroups) + " groups pipelined").c_str() : "", nr.frInst,
+            nr.frInst > 1 ? "s" : "");
     if (nr.fgProfN)
     {
         const double n = (double)nr.fgProfN, nv = nr.fgProfVecN ? (double)nr.fgProfVecN : 1.0,
@@ -11308,6 +11329,8 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
             NCHK(cudaEventCreate(&e), "create group timing event");
         for (cudaEvent_t& e : nr.fgL1Ev)
             NCHK(cudaEventCreate(&e), "create fsrfg call timing event");
+        for (cudaEvent_t& e : nr.fgOfEv)
+            NCHK(cudaEventCreate(&e), "create fsrfg Optical Flow timing event");
     }
     // the nvof model: the Optical Flow session and the glue buffers (the kernels are bound above)
     if (nr.nvof && !nativeNvofSetup(nr))
@@ -12697,7 +12720,13 @@ static void nativeFree(NativeRife& nr)
             cudaEventDestroy(e);
             e = nullptr;
         }
-    nr.grArmed = nr.grL1Armed = false;
+    for (cudaEvent_t& e : nr.fgOfEv)
+        if (e)
+        {
+            cudaEventDestroy(e);
+            e = nullptr;
+        }
+    nr.grArmed = nr.grL1Armed = nr.grOfArmed = false;
     // PG p.124: mappings must go before the external memory objects, and every outstanding
     // wait must have completed before the semaphore is destroyed (the stream sync above).
     if (nr.dOutRing)
@@ -14729,24 +14758,15 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
             return false;
         }
     }
-    else if (sharpen)
-    {
-        // the sharpen reads a tight w x h frame: the model frame without its pad
-        for (int c = 0; c < 3; c++)
-            if (cudaMemcpy2DAsync(nr.dShIn + (size_t)c * tight, (size_t)w * sizeof(float), dCur + (size_t)c * dps,
-                                  (size_t)pw * sizeof(float), (size_t)w * sizeof(float), h, cudaMemcpyDeviceToDevice,
-                                  st) != cudaSuccess)
-            {
-                nr.die("sharpen input copy failed");
-                return false;
-            }
-    }
+    // the sharpen reads the HDR planes' tight SDR view, else the model frame itself with its pad strides
+    float* shSrc = hdrView ? nr.dShIn : dCur;
+    int shPs = hdrView ? fps : dps, shRs = hdrView ? w : pw;
     float* out = nr.dShOut; // the tight result (the sharpen, or TrueHDR's PQ), padded back into dCur below
     if (thdr)
     {
         if (sharpen)
         {
-            void* a[] = {&nr.dShIn, &w, &h, &nr.sharpen, &nr.dThdrIn, &nr.dSrcG};
+            void* a[] = {&shSrc, &shPs, &shRs, &w, &h, &nr.sharpen, &nr.dThdrIn, &nr.dSrcG};
             if (cuLaunchKernel(nr.fSharpThdrIn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                                nullptr) != CUDA_SUCCESS)
             {
@@ -14801,7 +14821,7 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
             nr.rtxFailed = true;
             if (sharpen)
             {
-                void* a[] = {&nr.dShIn, &w, &h, &nr.sharpen, &out};
+                void* a[] = {&shSrc, &shPs, &shRs, &w, &h, &nr.sharpen, &out};
                 void* b[] = {&out, &fps, &w, &w, &h, &dCur, &pw, &ph, &dps};
                 if (cuLaunchKernel(nr.fSharpPlanar, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                                    nullptr) != CUDA_SUCCESS ||
@@ -14831,7 +14851,7 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
     }
     else
     {
-        void* a[] = {&nr.dShIn, &w, &h, &nr.sharpen, &out};
+        void* a[] = {&shSrc, &shPs, &shRs, &w, &h, &nr.sharpen, &out};
         if (cuLaunchKernel(nr.fSharpPlanar, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
             CUDA_SUCCESS)
         {
@@ -15148,52 +15168,79 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 // its levels and the worker's join); a group that made instances is skipped (grPriceSkip)
                 if (nr.fruc && nr.frMp && nr.grPriceSkip > 0)
                     nr.grPriceSkip--;
-                else if (nr.fruc && nr.frMp && nr.fsrfg && nr.grPiped)
-                {
-                    // AMD FSR 4 pipelined (SMV_FSRFG_PIPE=force, fixed work): its groups price nothing
-                }
                 else if (nr.fruc && nr.frMp && nr.fsrfg && nr.grSlots)
                 {
-                    // AMD FSR 4 queues its calls on the stream (its CPU call returns at once) and the stream waits for
-                    // a node where it is first read, so a call's GPU time lands before or inside the slots: the prices
-                    // come off a group's WHOLE time. A group with no call in its slots (x2: level 1 is in pre) gives
-                    // the base and a slot's store; a group with calls in them gives a call = its whole time less the
-                    // base and its extra stores, per call in the slots. The level-1 call's FSR span (fgL1Ev) is timed
-                    // in every group: one with calls in its slots learns the call price over that span (gFrL1Ratio),
-                    // an x2 group then prices its call by it, so a load that slowed FSR as it slowed the rest leaves
-                    // no stale price once it passed. The base and the store are not re-measured at x4 and deeper, so
-                    // the ratio takes them scaled by the span's load (this span over the x2 groups' span): that load's
-                    // share of them stays out of the ratio. The call keeps the share: a held x4 is priced at its cost
-                    const uint32_t in = nr.grFrCalls - nr.grFrPreCalls;
-                    const double whole = (double)pre + slots;
-                    float l1 = 0.0f;
+                    // the level-1 chain's parts, on either route (the pipelined route's price, see fgOfEv): its
+                    // Optical Flow, its call's FSR span and the session stream's pre outside them. A pipelined group
+                    // issued its level-1 call last, on fgL1St: the next pack waits for that call anyway
+                    float l1 = 0.0f, of = 0.0f;
+                    if (nr.grPiped && nr.grL1Armed)
+                        cudaEventSynchronize(nr.fgL1Ev[1]);
                     const bool l1Ok = nr.grL1Armed &&
                                       cudaEventElapsedTime(&l1, nr.fgL1Ev[0], nr.fgL1Ev[1]) == cudaSuccess && l1 > 0.0f;
-                    if (!in)
+                    if (l1Ok && nr.grOfArmed && cudaEventElapsedTime(&of, nr.fgOfEv[0], nr.fgOfEv[1]) == cudaSuccess &&
+                        of > 0.0f)
                     {
-                        ema(nr.gFrStoreMs, (double)slots / nr.grSlots);
-                        ema(nr.gFrBaseMs, whole);
-                        if (l1Ok)
+                        ema(nr.gFgOfMs, of);
+                        ema(nr.gFgL1Ms, l1);
+                        ema(nr.gFgPreMs, nr.grPiped ? (double)pre : (std::max)(0.0, (double)pre - of - l1));
+                        nr.gFgOfUs.store((uint32_t)(nr.gFgOfMs * 1000.0));
+                        nr.gFgL1Us.store((uint32_t)(nr.gFgL1Ms * 1000.0));
+                        nr.gFgPreUs.store((uint32_t)(nr.gFgPreMs * 1000.0));
+                    }
+                    const uint32_t in = nr.grFrCalls - nr.grFrPreCalls;
+                    if (nr.grPiped)
+                    {
+                        // pipelined: the slots = the shown pair's deeper calls + the stores (the level-1 chain runs
+                        // beside them on fgL1St), so a call = the slots less the stores, per call. The direct price
+                        // takes it too (its base and store stay the x2 groups'): the route's exit reads the call as
+                        // the GPU runs it now
+                        if (in && nr.gFrStoreMs > 0.0)
                         {
-                            ema(nr.gFrL1BaseMs, l1);
-                            if (nr.gFrL1Ratio > 0.0)
-                                ema(nr.gFrCallMs, nr.gFrL1Ratio * l1);
+                            ema(nr.gFrCallMs, (std::max)(0.0, (double)slots - nr.grSlots * nr.gFrStoreMs) / in);
+                            nr.gFrCallUs.store((uint32_t)(nr.gFrCallMs * 1000.0));
                         }
                     }
-                    else if (nr.gFrBaseMs > 0.0)
+                    else
                     {
-                        const double rest = nr.gFrBaseMs + (nr.grSlots - 2.0) * nr.gFrStoreMs;
-                        ema(nr.gFrCallMs, (std::max)(0.0, whole - rest) / in);
-                        if (l1Ok && nr.gFrL1BaseMs > 0.0)
+                        // AMD FSR 4 queues its calls on the stream (its CPU call returns at once) and the stream waits
+                        // for a node where it is first read, so a call's GPU time lands before or inside the slots: the
+                        // prices come off a group's WHOLE time. A group with no call in its slots (x2: level 1 is in
+                        // pre) gives the base and a slot's store; a group with calls in them gives a call = its whole
+                        // time less the base and its extra stores, per call in the slots. The level-1 call's FSR span
+                        // (fgL1Ev) is timed in every group: one with calls in its slots learns the call price over that
+                        // span (gFrL1Ratio), an x2 group then prices its call by it, so a load that slowed FSR as it
+                        // slowed the rest leaves no stale price once it passed. The base and the store are not
+                        // re-measured at x4 and deeper, so the ratio takes them scaled by the span's load (this span
+                        // over the x2 groups' span): that load's share of them stays out of the ratio. The call keeps
+                        // the share: a held x4 is priced at its cost
+                        const double whole = (double)pre + slots;
+                        if (!in)
                         {
-                            const double own = (whole - rest * l1 / nr.gFrL1BaseMs) / in;
-                            if (own > 0.0)
-                                ema(nr.gFrL1Ratio, own / l1);
+                            ema(nr.gFrStoreMs, (double)slots / nr.grSlots);
+                            ema(nr.gFrBaseMs, whole);
+                            if (l1Ok)
+                            {
+                                ema(nr.gFrL1BaseMs, l1);
+                                if (nr.gFrL1Ratio > 0.0)
+                                    ema(nr.gFrCallMs, nr.gFrL1Ratio * l1);
+                            }
                         }
+                        else if (nr.gFrBaseMs > 0.0)
+                        {
+                            const double rest = nr.gFrBaseMs + (nr.grSlots - 2.0) * nr.gFrStoreMs;
+                            ema(nr.gFrCallMs, (std::max)(0.0, whole - rest) / in);
+                            if (l1Ok && nr.gFrL1BaseMs > 0.0)
+                            {
+                                const double own = (whole - rest * l1 / nr.gFrL1BaseMs) / in;
+                                if (own > 0.0)
+                                    ema(nr.gFrL1Ratio, own / l1);
+                            }
+                        }
+                        nr.gFrCallUs.store((uint32_t)(nr.gFrCallMs * 1000.0));
+                        nr.gFrStoreUs.store((uint32_t)(nr.gFrStoreMs * 1000.0));
+                        nr.gFrBaseUs.store((uint32_t)(nr.gFrBaseMs * 1000.0));
                     }
-                    nr.gFrCallUs.store((uint32_t)(nr.gFrCallMs * 1000.0));
-                    nr.gFrStoreUs.store((uint32_t)(nr.gFrStoreMs * 1000.0));
-                    nr.gFrBaseUs.store((uint32_t)(nr.gFrBaseMs * 1000.0));
                 }
                 else if (nr.fruc && nr.frMp && nr.grFrCalls && nr.grSlots)
                 {
@@ -15238,7 +15285,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             }
         }
     }
-    nr.grArmed = nr.grL1Armed = false;
+    nr.grArmed = nr.grL1Armed = nr.grOfArmed = false;
     nr.grFrCalls = nr.grFrPreCalls = nr.grFrWkCalls = 0;
     nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = nr.grFrWkMs = 0.0;
 

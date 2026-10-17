@@ -64,7 +64,7 @@ RTX VSR / HDR and all three codecs.
   Upscale, DLSS 5, Sharpen, HDR, Dolby Vision, HDR10+, Output. A Video / Live switch
   (`localStorage.uiMode`) puts `mode-video` or `mode-live` on `<html>`; `.vonly` and `.lonly`
   elements show in one mode only. Settings persist in `localStorage` (Restore and Dynamic Vibrance
-  are per-session opt-ins by design). After any edit of either file run `python scripts/scan_index.py`
+  are per-session opt-ins by design). After any edit of either file run `node scripts/scan-index.ts`
   (it builds `app.js` first; duplicate ids, dangling `$()` refs from both files, every `<script src>`
   resolving, `node --check` on the inline script and on `app.js`); a duplicate id once made the codec selection silently
   never reach the engine. The renderer uses `require('electron')`, so it cannot run in a browser.
@@ -276,8 +276,9 @@ RTX VSR / HDR and all three codecs.
 * `engine/bin/`: bundled `ffmpeg.exe` + `ffprobe.exe` + DLLs, fetched, not committed.
 * `engine/onnx/`: the size-free ONNX graphs engines are built from, generated, not committed.
 * `scripts/`: the build scripts `fetch-ffmpeg.ts`, `stage-gpu-runtime.ts`, `export-onnx.ts`, `dev-icon.ts`,
-  `clang-format.ts`, `pack-zip.ts`, `build-renderer.ts` (TypeScript that Node 24 runs directly, no build step: `scripts/package.json`
-  makes them ES modules, `tsconfig.scripts.json` type-checks them), plus `scan_index.py`, `smoke.py`.
+  `clang-format.ts`, `pack-zip.ts`, `build-renderer.ts`, `scan-index.ts`, `cpp-check.ts` (TypeScript that Node 24 runs
+  directly, no build step: `scripts/package.json` makes them ES modules, `tsconfig.scripts.json` type-checks them), plus
+  `smoke.py`.
 
 Doc policy: README.md and this file are the only docs. No per-component BUILD.md files (a
 provenance note beside vendored third-party headers, `engine/live/build_src/nvofa/README.md`, is
@@ -336,7 +337,7 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
 * `npm run lint`: Prettier writes `src/**/*.ts` and `scripts/*.ts`, then `tsc --noEmit` and
   `tsc -p tsconfig.scripts.json` (the build scripts) and `tsc -p tsconfig.renderer.json` (the
   renderer), then pyright on
-  `engine`, `scripts` and `tools`, then clang-format writes our own C++ (see Linting and formatting).
+  `engine` and `scripts`, then clang-format writes our own C++ (see Linting and formatting).
   Stops at the first failure.
 * `postinstall` runs `scripts/dev-icon.ts`, stamping `icon.ico` into the dev Electron exe so
   `npm start` shows the app icon (a stale Explorer icon cache refreshes on the next reboot).
@@ -348,7 +349,7 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
   engine change (`npx tsc` first). Checks are structural, plus one frame-md5 check with `--full`:
   the resident host's second RIFE render must decode to the first one's frames; `--trt` is accepted
   and ignored.
-* `python scripts/scan_index.py`: the renderer scan described above (`index.html` + `app.ts`, built into `app.js` first).
+* `node scripts/scan-index.ts`: the renderer scan described above (`index.html` + `app.ts`, built into `app.js` first).
 
 ## Engine CLI
 
@@ -501,8 +502,8 @@ Models (GMFSS is the default, the anime specialist):
   through three textures shared with CUDA and one shared fence (GPU-side waits, no CPU copy): vkd3d-proton
   shares textures, not buffers, as Vulkan opaque Win32 handles CUDA maps as arrays, and its fence as a
   Vulkan timeline semaphore (our patches: NVIDIA's Vulkan driver exports no D3D12-fence semaphore, and
-  CUDA refuses an export vkd3d-proton has itself opened through D3DKMT); the bridge copies them into
-  FSR's own textures and back. HDR planes follow Smooth Motion's SDR-pair rule at fp16
+  CUDA refuses an export vkd3d-proton has itself opened through D3DKMT); FSR reads the frame and the
+  vectors from them and writes the generated frame into them (no copies). HDR planes follow Smooth Motion's SDR-pair rule at fp16
   (`SMV_FSRFG_SDR_PAIRS=0` = every pair as the codes).
 * SVP (`--svp` / `--svp-nvof`, live `svp` / `svpnvof`, svpflow from a local SVP 4 install in the
   runtime's VapourSynth) was REMOVED 2026-09-21 so the app no longer depends on SVP 4, SVP Manager
@@ -901,7 +902,10 @@ slots (the pair then runs a whole multiple's ladder wherever one fits, see Adapt
 tweens are what m affords). Under one tween a pair the target is the FLOOR (`thrFloor`): each pair sends its real frame alone, every
 effect still on. The budget starts at 95 % of the interval (the user: "95% is safe"); drops above 3 a second smoothed
 over ~2 s, outside the 2 s after a move of the target, take a tenth off it, and 5 clean seconds give 2 points back
-(other work on the GPU, a bridge's own context outside the timed stream). At the floor one window re-times a tween
+(other work on the GPU, a bridge's own context outside the timed stream). Drops AT the floor cut nothing (the pairs
+already carry their real frame alone, a smaller tween budget removes no work): a foreign load leaves the budget where
+the floor found it, so the ladder comes back once the load ends (AMD FSR 4 1440p x8 after a 15 s two-matmul load: 17 s,
+not 71 s or more from a 30-45 % budget). At the floor one window re-times a tween
 after 4 s, doubling to 60 s. Until the first group is timed the target starts at one tween a pair (twice the source
 rate measured before the spawn, never above the panel's rate or the user's target; the log line `throttle: starting at
 N fps until a group is timed`): a start the GPU cannot afford fills the queue, and the drops while that backlog drains
@@ -1781,7 +1785,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion (the first one AMD FSR frame generation too): the most bridge instances (1..9; recursive midpoints use one per tree level on both routes, default 9 = to x512, 5 = to x32; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_FRUC_PIPE=0` / `=force` | Live Smooth Motion: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder, the fixed multipliers too (gates; see "Pipelined across pairs") |
-| `SMV_FSRFG_PIPE=force` / `=serial` | Live AMD FSR frame generation: pipeline the midpoint tree across pairs on every x4 or deeper ladder and fixed multiplier (the new pair's level-1 Optical Flow on its own stream beside the shown pair's deeper calls; derived vectors only; the host line `fsrfg: pipelined across pairs`) / the same route with that Optical Flow after the deeper calls; off by default (not priced); A/B levers, never a product setting (see "Pipelined across pairs") |
+| `SMV_FSRFG_PIPE=0` / `=force` / `=serial` | Live AMD FSR frame generation: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder and fixed multiplier (gates) / the same with the new pair's level-1 Optical Flow after the shown pair's deeper calls (an A/B lever); unset = the priced automatic route (see "Pipelined across pairs") |
 | `SMV_FRUC_STEPUP=0` | Live Smooth Motion / AMD FSR 4 FG: a target between two ladder nodes runs the largest node that fits instead of the node above it (gates; see "The node above the target") |
 | `SMV_LIVE_CASCADE=off` / `=probe` / `=present`, `SMV_LIVE_CASCADE_GEN` | Live DLSS 4.5: `off` = one pass only (no plan above the limit); development only (the direct route): `probe` starts `dlssg2f.exe --stage1` beside the session (in a job object that ends it with the host), feeds it every captured frame and reads every frame it shares on the host's own D3D12 device, presenting nothing of it; `present` = the cascade: the session's DLSS-G (`--gen`) presents stage 1's frames instead of the captured ones (x6 x x2 = x12); `_GEN` = stage 1's generated frames (1..5, default 5). Lines `cascade probe: ...` / `cascade stage 1: ...` (harness `dlssg_cascade\probe_gate.py`) |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..9, default 3 offline, 2 live; exact nodes go to depth 9 either way) |
@@ -1789,6 +1793,9 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NVENC_SPLIT` | override the NVENC `-split_encode_mode` for measurement (default 15 = off; 2 = two strips, 0 = ffmpeg's auto); never a product setting (the split leaves a seam line) |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
 | `SMV_DLSSG_SWEEP=1` | the DLSS 4.5 host latches its buffer-sweep capture tier at startup instead of waiting for hardware flip metering, so the sweep path can be tested on demand |
+| `SMV_DLSSG_PRESENT_WRAP=0` | the DLSS 4.5 host leaves the native swap chain's `Present` / `Present1` unwrapped: by default it wraps them (in its own process) to learn when each present is queued and reads that frame back (a file render) or copies it into the live cascade's shared ring (`--stage1`) at once; without the wrap a present is copied only once a later one shows; the A/B and fallback test only, never a product setting |
+| `SMV_DLSSG_RB_QUEUE=own` | the DLSS 4.5 host reads frames back (and `--stage1` fills its shared ring) on its own command queue instead of the one Streamline created the native swap chain on (it learns that queue by wrapping the real DXGI factory's swap chain creation), a file render with a settle before each readback, `--stage1` copying each present as soon as it is counted; its copies then run in no order with the presents and can read a back buffer's previous frame. The same capture is the automatic fallback when that queue is not seen; the A/B and trigger test only, never a product setting |
+| `SMV_DLSSG_WAITMS=N` | on Streamline's queue without the `Present` wrap (or before it is seen to catch every present), the newest native present waits up to N ms for a later one before it is read back anyway; on the host's own queue, the settle before each readback (default 5); an A/B lever, never a product setting |
 | `SMV_DLSSG_LIMIT=N` | the most DLSS 4.5 makes in one pass (2..6) instead of the GPU's measured limit (`dlssg_limit.json`; Live: numFramesToGenerateMax + 1): `2` renders and runs Live with an RTX 40's passes on an RTX 50 (the cascade's trigger test) |
 | `SMV_DLSSG_HDR10=0` | DLSS 4.5 gets HDR planes as 8-bit codes on an RGBA8 swap chain (labelled SDR) instead of HDR10; an A/B lever, never a product setting |
 | `SMV_DLSSG_REFUSE_HDR10=1` | the DLSS 4.5 host treats the HDR10 colour space as refused (exit 5): the trigger test of the host's 8-bit fallback |
@@ -1813,9 +1820,8 @@ at it.
 ## Building the native components
 
 Two ctypes bridges (`engine/rtxvideo/build_src/`, `engine/nvoffruc/build_src/`), the FSR frame
-generation and upscaling bridges (`engine/fsrfg/build_src/build.py`, `engine/fsrup/build_src/build.py`) and three D3D12
-hosts (`engine/dlssg`, `engine/dlssnr`, `engine/live`, each with a `build_src/build.bat` that
-prints the missing environment variable). Nothing that needs MSVC is bundled; a recipient needs only
+generation and upscaling bridges (`engine/fsrfg`, `engine/fsrup`) and three D3D12 hosts (`engine/dlssg`,
+`engine/dlssnr`, `engine/live`), each with a `build_src/build.bat` that prints the missing environment variable. Nothing that needs MSVC is bundled; a recipient needs only
 the driver. Toolchain on the dev machine: VS 2019 Build Tools (`cl` 19.29) and VS 2026 Community
 (`cl` 19.51) with a Windows SDK.
 
@@ -1938,16 +1944,22 @@ below 90 % of the direct tree's (a direct tree at its edge flaps its lock), at m
 entering holds one source period (the pair the last direct group showed), leaving skips one pair. Log: `present grid: xM pipelined across pairs ...`
 or `... direct` at a switch, the throttle line ends with `a Smooth Motion call N ms + N ms a slot,
 direct N / pipelined N`, the session line with `N groups pipelined`. `SMV_FRUC_PIPE=0` = never,
-`=force` = every x4 or deeper ladder, the fixed multipliers too (gates). AMD FSR 4 FG pipelines only
-with `SMV_FSRFG_PIPE=force` (not priced, off by default): a group shows the previous pair, its levels 2
-and deeper on the session's stream while the new pair's level-1 Optical Flow runs on a stream of its own
-beside them; instance 0's call of the new pair waits for those deeper calls (FSR's calls keep the direct
-tree's order on the device, the nodes are the direct tree's: same tweens on the same pairs), its node
-becomes the shown pair's level 1 a group later; the derived vectors only (each pair reads its own field
-of the two the session alternates). It frees the period's Optical Flow share (1440p x8 at 100 % of the
-period direct, ~65 % pipelined; 1080p x16 drops halved, the deeper calls' SM time then binds), one
-source period more latency. `=serial` = the same route with the new pair's Optical Flow after the
-deeper calls (an A/B lever). Without it, FSR 4 makes every real frame's level 1 before the slots and queues its calls on the stream
+`=force` = every x4 or deeper ladder, the fixed multipliers too (gates). AMD FSR 4 FG pipelines by the
+same rule: a group shows the previous pair, its levels 2 and deeper on the session's stream while the
+new pair's level-1 Optical Flow runs on a stream of its own beside them; instance 0's call of the new
+pair waits for those deeper calls (FSR's calls keep the direct tree's order on the device, the nodes are
+the direct tree's: same tweens on the same pairs), its node becomes the shown pair's level 1 a group
+later; the derived vectors only (each pair reads its own field of the two the session alternates). Its
+price comes off three parts every group times on either route (the direct route's level-1 Optical Flow
+runs on that stream too): the level-1 Optical Flow, the level-1 call's FSR span, and the session
+stream's pre outside them; a pipelined group's deeper call = its slots less their stores, per call (the
+direct price takes it too). An M ladder costs that pre + the longer of (M - 2) calls + the later of M
+slot stores and the level-1 call, and the Optical Flow + the level-1 call; the throttle line ends with
+`direct N / pipelined N`, the session line with `N groups pipelined`. It frees the period's Optical
+Flow share: on a 24 fps film 1440p runs x8 (192 presented, x4 = 96 direct) and 1080p x16 (384, x8 or
+an x16 at its edge with drops direct), 0 drops, one source period more latency. `SMV_FSRFG_PIPE=0` =
+never, `=force` = every x4 or deeper ladder and fixed multiplier, `=serial` = forced with the new
+pair's Optical Flow after the deeper calls (an A/B lever). Direct, FSR 4 makes every real frame's level 1 before the slots and queues its calls on the stream
 (the CPU call returns at once; the stream waits for a node where it is first read), so its price
 comes off each group's whole GPU time: an x2 group's whole time, and per extra call the x4+ group's
 whole time less that and its extra slot stores; tweens a pair = 1 + (budget - x2's time) / (call +
@@ -2008,12 +2020,12 @@ emulated as FP16 (`DXIL_SPIRV_CONFIG=wmma_fp8_staging`): a storage-buffer tile l
 load with a decode function where the device has them, else staged through shared memory (each lane reads
 8 bytes of a tile row or column as u32 words), stores staged; the configuration read from the process
 environment. Then in `engine/fsrfg/build_src/` (Visual Studio 2026 with
-the C++ workload, python):
+the C++ workload):
 
 ```
 set FSR_SDK=C:\path\to\FidelityFX-SDK-v2.3.0
 set VKD3D_BUILD=C:\path\to\vkd3d-proton\build
-python build.py
+build.bat
 ```
 
 C API (`fsrfg_bridge.cpp`, nvoffruc_bridge's shape): `fsrfg_set_cache_dir(dir)` names vkd3d-proton's shader
@@ -2022,9 +2034,8 @@ h, luidLow, luidHigh, fmt, FsrfgShared*)` makes instance i (up to 5) on vkd3d-pr
 device's adapter (the first one loads the chain and picks the DLL's FSR 4 version, or fails naming what it
 offers) and returns NT handles of three shared textures (the frame, RG16F vectors, the generated frame),
 their allocation sizes, a linear row pitch for each, and a shared fence; `fsrfg_frame_i(i, wait, signal,
-reset, frameTimeMs)`: the bridge's queue waits for `wait`, copies the shared textures into FSR's own, runs
-configure, prepare V2 (constant depth 0.5) and generate, copies the generated frame into the shared texture
-and signals `signal` (non-blocking but for its two-list ring); `fsrfg_provider()` = the FSR version ("4.0.1");
+reset, frameTimeMs)`: the bridge's queue waits for `wait`, runs configure, prepare V2 (constant depth 0.5)
+and generate on the shared textures themselves (the output one is a UAV) and signals `signal` (non-blocking but for its two-list ring); `fsrfg_provider()` = the FSR version ("4.0.1");
 `fsrfg_destroy_i` / `fsrfg_destroy`; `fsrfg_last_error`. fmt 0 = RGBA8, 1 = RGBA16F (the host's). The host
 imports the textures as CUDA external memory (opaque Win32, dedicated) mapped as arrays and the fence as a
 timeline semaphore (stream signal odd, stream wait even). `SMV_FSRFG_SHIM_LOG=1` logs the shim's calls.
@@ -2036,7 +2047,7 @@ SDK licence's MIT list), which ship beside it in `engine/fsrup`. In `engine/fsru
 
 ```
 set FSR_SDK=C:\path\to\FidelityFX-SDK-v2.3.0
-python build.py
+build.bat
 ```
 
 It compiles `fsrup_bridge.cpp` against the SDK's `api/include` and `upscalers/include` into `..\smv_fsrup_bridge.dll`
@@ -2066,9 +2077,9 @@ BGRA8 buffers through two byte-swap kernels and computes the vectors with the FS
 An offline D3D12 presentation loop that lets DLSS-FG (a game-only SDK) interpolate two video
 frames. Built from `main.cpp`; ships prebuilt with NVIDIA's redistributable Streamline runtime
 (`sl.*.dll` + `nvngx_dlssg.dll` from the SDK's `bin/x64` production set, licenses alongside;
-the bundled runtime is Streamline 2.14.1 since 2026-09-15, the same set ships in `engine/live`).
+the bundled runtime is Streamline 2.14.16 with DLSS-G 310.9.16, the same set ships in `engine/live`).
 
-Requirements: Visual Studio 2022+ with the C++ workload, the NVIDIA Streamline SDK v2.14.1
+Requirements: Visual Studio 2022+ with the C++ workload, the NVIDIA Streamline SDK v2.14.16
 (https://github.com/NVIDIA-RTX/Streamline/releases, the `streamline-sdk-<tag>.zip` asset; 2.12.0
 builds too, but ship the runtime DLLs of the SDK you built against). In `engine/dlssg/build_src/`:
 ```
@@ -2160,7 +2171,7 @@ set "TRT_RTX_SDK=D:\path\to\TensorRT-RTX-1.7.1.116"
 set "NGX_SDK=D:\path\to\DLSS"
 build.bat
 ```
-Requirements: Visual Studio 2022+ with the C++ workload, the Streamline SDK v2.14.1 (see the DLSS-G
+Requirements: Visual Studio 2022+ with the C++ workload, the Streamline SDK v2.14.16 (see the DLSS-G
 host section above), a Windows 11
 SDK (for the C++/WinRT Windows.Graphics.Capture headers), the TensorRT-RTX SDK zip (login gated)
 extracted anywhere (only `include\` and `lib\tensorrt_rtx_1_7.lib` are used) and the public NVIDIA
@@ -2223,7 +2234,7 @@ reformatted.
   `src/**/*.ts` and `scripts/*.ts` only; `.prettierignore` guards `engine/`, `renderer/` and build dirs.
 * `tsc --noEmit` with `strict` on is the TypeScript bug gate. ESLint was dropped when moving to
   TypeScript 7 (typescript-eslint pinned the old compiler).
-* pyright (`pyrightconfig.json`) type-checks `engine`, `scripts` and `tools` in its default `standard`
+* pyright (`pyrightconfig.json`) type-checks `engine` and `scripts` in its default `standard`
   mode, resolving imports from the dev runtime (`engine/runtime/Lib/site-packages`) when it is
   installed; an import it cannot resolve stays silent, unused imports / vars = warning. Vendored and
   cache dirs are excluded.
@@ -2235,9 +2246,10 @@ reformatted.
   Left as they are: the vendored NVIDIA headers (`nvofa`, `cuda_shim`), the RTX Video SDK bridge
   sources and `sl_focus_shim.h`. It uses the clang-format that ships with Visual Studio 2026 (the
   "C++ Clang tools for Windows" component, found through vswhere); `CLANG_FORMAT` overrides it.
-* `python scripts/cpp_check.py analyze` / `w4`: MSVC `/analyze` and warning level 4 over the native
+* `node scripts/cpp-check.ts analyze` / `w4`: MSVC `/analyze` and warning level 4 over the native
   host's build line (compile only, into a temporary folder; the SDK headers external), with the
-  variables `build.bat` needs. Both stay at zero warnings in our sources, like the `/W3` ship build.
+  variables `build.bat` needs (`--root DIR` checks a working copy laid out like the repo). Both stay at
+  zero warnings in our sources, like the `/W3` ship build.
 
 `npm install <pkg>` re-expands `package.json`'s inline arrays to one per line; a plain `npm install`
 leaves formatting alone. Dev dependencies are pinned to caret majors because `npm run setup`

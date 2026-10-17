@@ -88,11 +88,8 @@ struct Instance
     ID3D12GraphicsCommandList* list[kLists] = {};
     uint64_t done[kLists] = {};
     int next = 0;
-    ID3D12Resource* color = nullptr; // FSR's own textures
-    ID3D12Resource* motion = nullptr;
-    ID3D12Resource* depth = nullptr;
-    ID3D12Resource* out = nullptr;
-    ID3D12Resource* shIn = nullptr; // the textures shared with CUDA, copied from / into FSR's own
+    ID3D12Resource* depth = nullptr; // FSR's constant depth
+    ID3D12Resource* shIn = nullptr;  // the textures shared with CUDA, FSR's frame, vectors and output themselves
     ID3D12Resource* shMv = nullptr;
     ID3D12Resource* shOut = nullptr;
     ID3D12Fence* fence = nullptr; // shared with the caller: its values are the caller's
@@ -322,10 +319,7 @@ void destroy(Instance& s)
         release(s.alloc[k]);
         s.done[k] = 0;
     }
-    release(s.color);
-    release(s.motion);
     release(s.depth);
-    release(s.out);
     release(s.shIn);
     release(s.shMv);
     release(s.shOut);
@@ -478,17 +472,13 @@ FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, in
         FAILED(hr = s.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.priv))))
         return destroy(s), fail("fence creation failed", hr), -7;
 
-    // FSR's own textures in the states its calls name; the shared ones rest in COMMON between calls, the state CUDA
-    // reads and writes them in
-    s.color = texture(s.dev, s.fmt, w, h, false, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    s.motion =
-        texture(s.dev, DXGI_FORMAT_R16G16_FLOAT, w, h, false, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // FSR reads the shared frame and vectors and writes the shared output itself (UAV): they rest in COMMON between
+    // calls, the state CUDA reads and writes them in; the depth in the state FSR's calls name
     s.depth = texture(s.dev, DXGI_FORMAT_R32_FLOAT, w, h, false, false, D3D12_RESOURCE_STATE_COPY_DEST);
-    s.out = texture(s.dev, s.fmt, w, h, true, false, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     s.shIn = texture(s.dev, s.fmt, w, h, false, true, D3D12_RESOURCE_STATE_COMMON);
     s.shMv = texture(s.dev, DXGI_FORMAT_R16G16_FLOAT, w, h, false, true, D3D12_RESOURCE_STATE_COMMON);
-    s.shOut = texture(s.dev, s.fmt, w, h, false, true, D3D12_RESOURCE_STATE_COMMON);
-    if (!s.color || !s.motion || !s.depth || !s.out || !s.shIn || !s.shMv || !s.shOut)
+    s.shOut = texture(s.dev, s.fmt, w, h, true, true, D3D12_RESOURCE_STATE_COMMON);
+    if (!s.depth || !s.shIn || !s.shMv || !s.shOut)
         return destroy(s), fail("texture creation failed"), -8;
     if (FAILED(hr = s.dev->CreateSharedHandle(s.shIn, nullptr, GENERIC_ALL, nullptr, &s.sh.in)) ||
         FAILED(hr = s.dev->CreateSharedHandle(s.shMv, nullptr, GENERIC_ALL, nullptr, &s.sh.mv)) ||
@@ -496,8 +486,9 @@ FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, in
         return destroy(s), fail("a shared texture's handle creation failed", hr), -10;
     if (FAILED(hr = s.dev->CreateSharedHandle(s.fence, nullptr, GENERIC_ALL, nullptr, &s.sh.fence)))
         return destroy(s), fail("the shared fence's handle creation failed", hr), -10;
-    const D3D12_RESOURCE_DESC cd = s.color->GetDesc(), md = s.motion->GetDesc();
-    s.sh.inBytes = s.sh.outBytes = s.dev->GetResourceAllocationInfo(0, 1, &cd).SizeInBytes;
+    const D3D12_RESOURCE_DESC cd = s.shIn->GetDesc(), md = s.shMv->GetDesc(), od = s.shOut->GetDesc();
+    s.sh.inBytes = s.dev->GetResourceAllocationInfo(0, 1, &cd).SizeInBytes;
+    s.sh.outBytes = s.dev->GetResourceAllocationInfo(0, 1, &od).SizeInBytes;
     s.sh.mvBytes = s.dev->GetResourceAllocationInfo(0, 1, &md).SizeInBytes;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fpColor = {}, fpMv = {};
     s.dev->GetCopyableFootprints(&cd, 0, 1, 0, &fpColor, nullptr, nullptr, nullptr);
@@ -577,20 +568,12 @@ FSRFG_API int fsrfg_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int
     ID3D12GraphicsCommandList* l = openList(s, k);
     if (!l)
         return -3;
-    // the shared frame and vectors into FSR's own textures
-    D3D12_RESOURCE_BARRIER b[4];
-    b[0] = transition(s.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    b[1] = transition(s.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    b[2] = transition(s.shIn, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    b[3] = transition(s.shMv, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    l->ResourceBarrier(4, b);
-    l->CopyResource(s.color, s.shIn);
-    l->CopyResource(s.motion, s.shMv);
-    b[0] = transition(s.color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    b[1] = transition(s.motion, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    b[2] = transition(s.shIn, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    b[3] = transition(s.shMv, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    l->ResourceBarrier(4, b);
+    // the shared frame and vectors to FSR's read state, the shared output to its write state
+    D3D12_RESOURCE_BARRIER b[3];
+    b[0] = transition(s.shIn, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    b[1] = transition(s.shMv, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    b[2] = transition(s.shOut, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    l->ResourceBarrier(3, b);
 
     const FfxApiRect2D rect{0, 0, (int32_t)s.w, (int32_t)s.h};
     ffxConfigureDescFrameGeneration cfg = {};
@@ -619,7 +602,7 @@ FSRFG_API int fsrfg_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int
     prep.cameraFovAngleVertical = 1.0f;
     prep.viewSpaceToMetersFactor = 1.0f;
     prep.depth = ffxApiGetResourceDX12(s.depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    prep.motionVectors = ffxApiGetResourceDX12(s.motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    prep.motionVectors = ffxApiGetResourceDX12(s.shMv, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     const float up[3] = {0, 1, 0}, right[3] = {1, 0, 0}, forward[3] = {0, 0, 1};
     memcpy(prep.cameraUp, up, sizeof(up));
     memcpy(prep.cameraRight, right, sizeof(right));
@@ -630,8 +613,8 @@ FSRFG_API int fsrfg_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int
     ffxDispatchDescFrameGeneration fg = {};
     fg.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
     fg.commandList = l;
-    fg.presentColor = ffxApiGetResourceDX12(s.color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    fg.outputs[0] = ffxApiGetResourceDX12(s.out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    fg.presentColor = ffxApiGetResourceDX12(s.shIn, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    fg.outputs[0] = ffxApiGetResourceDX12(s.shOut, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     fg.numGeneratedFrames = 1;
     fg.reset = reset != 0;
     fg.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
@@ -642,14 +625,11 @@ FSRFG_API int fsrfg_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int
     if (g_ffx.Dispatch(&s.ctx, &fg.header) != FFX_API_RETURN_OK)
         return l->Close(), fail("ffxDispatch(frame generation) failed"), -6;
 
-    // the generated frame into the shared texture
-    b[0] = transition(s.out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    b[1] = transition(s.shOut, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    l->ResourceBarrier(2, b);
-    l->CopyResource(s.shOut, s.out);
-    b[0] = transition(s.out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    b[1] = transition(s.shOut, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-    l->ResourceBarrier(2, b);
+    // back to COMMON for CUDA
+    b[0] = transition(s.shIn, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    b[1] = transition(s.shMv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    b[2] = transition(s.shOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    l->ResourceBarrier(3, b);
     if (FAILED(l->Close()))
         return fail("command list Close failed"), -7;
     ID3D12CommandList* lists[] = {l};

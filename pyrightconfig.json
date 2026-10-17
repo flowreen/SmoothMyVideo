@@ -1,5 +1,5 @@
 {
-  "include": ["engine", "scripts", "tools"],
+  "include": ["engine", "scripts"],
   "exclude": [
     "engine/runtime",
     "engine/GMFSS_Fortuna",

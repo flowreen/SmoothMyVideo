@@ -2592,11 +2592,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const bool frucPipeOn = !(fpSet && fpv[0] == L'0');
         const bool frucPipeForce = fpSet && !wcscmp(fpv, L"force");
         // AMD FSR 4's tree pipelined the same way (nativeFsrfgPipeAdvance: the next pair's level-1 Optical Flow and call
-        // on their own stream beside this pair's deeper calls): SMV_FSRFG_PIPE=force only (every x4 or deeper ladder
-        // and fixed multiplier; =serial the same route without its overlap, an A/B lever), not priced yet
+        // on their own stream beside this pair's deeper calls), by the same rule at its own price (fsrfgPipeCost; the
+        // route needs fsrfgPipeOk). SMV_FSRFG_PIPE=0 = never, =force = every x4 or deeper ladder and fixed multiplier
+        // (=serial the same route without its overlap, an A/B lever)
         wchar_t fgpv[8]{};
-        const bool fsrfgPipeForce = GetEnvironmentVariableW(L"SMV_FSRFG_PIPE", fgpv, 8) != 0 &&
-                                    (!wcscmp(fgpv, L"force") || !wcscmp(fgpv, L"serial"));
+        const bool fgpSet = GetEnvironmentVariableW(L"SMV_FSRFG_PIPE", fgpv, 8) != 0;
+        const bool fsrfgPipeOn = !(fgpSet && fgpv[0] == L'0');
+        const bool fsrfgPipeForce = fgpSet && (!wcscmp(fgpv, L"force") || !wcscmp(fgpv, L"serial"));
         bool frucPiped = false;
         double frucPipeT = -1e9; // nowMs of the last route switch
         // the whole multiple M an adaptive target runs as M's ladder (0 = the grid). On the grid nearly every output
@@ -2640,13 +2642,47 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // ladder's own budget (lockedMultiple's: the faster of the two period averages), never over emaDt alone: that
         // swings with the source's delivery (+-9 % on the parked testsrc) wider than the band between the two tests
         double frucAffD = 0, frucAffP = 0;
+        // AMD FSR 4 pipelined: the session stream runs its pre outside the level-1 chain (pp), the shown pair's M - 2
+        // deeper calls, then its M stores beside the new pair's level-1 call; fgL1St runs that chain (its Optical Flow
+        // po from the pack on, its call p1 after the deeper calls). An M ladder costs pp + the longer of the deeper
+        // calls + the later of the stores and p1, and po + p1 (the host's gFgPreUs / gFgOfUs / gFgL1Us, timed on
+        // either route; false = not priced yet)
+        auto fsrfgPipeParts = [&](double& pp, double& po, double& p1) {
+            pp = srv.nr->gFgPreUs.load() / 1000.0;
+            po = srv.nr->gFgOfUs.load() / 1000.0;
+            p1 = srv.nr->gFgL1Us.load() / 1000.0;
+            return po > 0.0 && p1 > 0.0;
+        };
+        auto fsrfgPipeCost = [&](double m, double fc, double fs) {
+            double pp, po, p1;
+            fsrfgPipeParts(pp, po, p1);
+            return pp + (std::max)((m - 2.0) * fc + (std::max)(m * fs, p1), po + p1);
+        };
+        // the tweens a pair the pipelined route affords in B ms: fsrfgPipeCost solved for M, continuous between the
+        // nodes (0 = not priced, or the level-1 chain alone takes more than B)
+        auto fsrfgPipeAfford = [&](double B, double fc, double fs) {
+            double pp, po, p1;
+            if (!fsrfgPipeParts(pp, po, p1) || fc <= 0.0 || pp + po + p1 > B)
+                return 0.0;
+            return (std::min)((B - pp + 2.0 * fc) / (fc + fs), (B - pp - p1) / fc + 2.0) - 1.0;
+        };
         auto frucPipeWant = [&](uint32_t m) {
             const double fc = srv.nr->gFrCallUs.load() / 1000.0, fs = srv.nr->gFrStoreUs.load() / 1000.0;
-            const double B = (std::min)(lockDtMs, emaDt) * thrBudget - srv.nr->gIntUs.load() / 1000.0;
-            double pm, pw;
-            frucPipePrices(fc, pm, pw);
-            frucAffD = (B - fs) / (fc + fs);
-            frucAffP = frucPipeAfford(B, fs, pm, pw);
+            if (srv.nr->fsrfg)
+            {
+                // AMD FSR 4: over the whole budget (its x2 group's whole time holds the pre)
+                const double B = (std::min)(lockDtMs, emaDt) * thrBudget;
+                frucAffD = 1.0 + (B - srv.nr->gFrBaseUs.load() / 1000.0) / (fc + fs);
+                frucAffP = fsrfgPipeAfford(B, fc, fs);
+            }
+            else
+            {
+                const double B = (std::min)(lockDtMs, emaDt) * thrBudget - srv.nr->gIntUs.load() / 1000.0;
+                double pm, pw;
+                frucPipePrices(fc, pm, pw);
+                frucAffD = (B - fs) / (fc + fs);
+                frucAffP = frucPipeAfford(B, fs, pm, pw);
+            }
             const double need = (double)(m - 1);
             if (!frucPiped)
                 return need > frucAffD * 1.03 && need <= frucAffP * 1.03;
@@ -2698,9 +2734,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (!tree)
                     return pre + (m - 1) * tw;
                 // AMD FSR 4: an x2 group's whole time + (M - 2) calls and stores; Smooth Motion: (M - 1) calls + M
-                // stores, or M stores + the pipelined calls on the route the sender pipelines (fruc-pipe, x4 and deeper)
+                // stores, or M stores + the pipelined calls; either pipelined (x4 and deeper) on the route the sender
+                // pipelines
                 if (fsr)
-                    return fb + (m - 2.0) * (fc + fs);
+                {
+                    double pp, po, p1;
+                    const bool piped = m >= 4 && fsrfgPipeOk(*srv.nr) && fsrfgPipeParts(pp, po, p1) &&
+                                       (fsrfgPipeForce || (fsrfgPipeOn && frucPipeWant(m)));
+                    return piped ? fsrfgPipeCost(m, fc, fs) : fb + (m - 2.0) * (fc + fs);
+                }
                 const bool piped = m >= 4 && (frucPipeForce || (frucPipeOn && thrMd > 0.0 && frucPipeWant(m)));
                 if (!piped)
                     return pre + m * fs + (m - 1.0) * fc;
@@ -2921,7 +2963,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (srv.nr && srv.nr->fruc && srv.nr->frMp &&
                     (srv.nr->fsrfg ? fsrfgPipeForce && fsrfgPipeOk(*srv.nr) : frucPipeForce) && m >= 4)
                     pipeThis = true;
-                else if (frucPipeOn && srv.nr && srv.nr->fruc && srv.nr->frMp && !srv.nr->fsrfg && m >= 4 && thrMd > 0)
+                else if (srv.nr && srv.nr->fruc && srv.nr->frMp && m >= 4 && thrMd > 0 &&
+                         (srv.nr->fsrfg ? fsrfgPipeOn && fsrfgPipeOk(*srv.nr) : frucPipeOn))
                 {
                     const bool want = frucPipeWant(m);
                     pipeThis = want != frucPiped && nowMs() - frucPipeT < 2000.0 ? frucPiped : want;
@@ -3470,7 +3513,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // the user's target and the ring's slots), and under one tween a pair it is the source's own rate: the
             // real frames alone (thrFloor, read by sendPairStream). The drops keep the budget honest
             // (other work on the GPU, a bridge's own context outside the timed stream): drops above kXqDropRate a
-            // second, smoothed over ~2 s, take a tenth off it, 5 clean seconds give 2 points back. At the floor the
+            // second, smoothed over ~2 s, take a tenth off it (not at the floor), 5 clean seconds give 2 points back. At the floor the
             // tween is re-timed by one window up after 4 s, doubling to 60 s while it keeps answering "the floor". A
             // pause or a static hold starts the window over; before any tween is timed the start target stands.
             auto xqThrottle = [&](double tn) {
@@ -3498,7 +3541,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 {
                     thrCleanMs = 0;
                     thrDropEma = 0; // one cut per spell: the next needs ~2 s of fresh drops
-                    thrBudget = (std::max)(0.3, thrBudget * 0.9);
+                    // at the floor the pairs carry their real frame alone, so a smaller tween budget removes no work:
+                    // drops there (a foreign load) leave the budget where the floor found it, so the ladder comes back
+                    // at that share once they end instead of climbing 2 points every 5 clean seconds from 30 %
+                    if (!thrFloor)
+                        thrBudget = (std::max)(0.3, thrBudget * 0.9);
                 }
                 else if (dropRate > kXqDropRate)
                     thrCleanMs = 0;
@@ -3526,8 +3573,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     m = (emaDt * thrBudget - pre) / tw;
                     if (frFsr)
                     {
-                        // FSR 4: an x2 pair's whole time (fb) + (M - 2) calls and stores more
-                        m = thrMd = 1.0 + (emaDt * thrBudget - fb) / (fc + fs);
+                        // FSR 4: an x2 pair's whole time (fb) + (M - 2) calls and stores more direct, its own cost
+                        // pipelined (fsrfgPipeCost)
+                        thrMd = 1.0 + (emaDt * thrBudget - fb) / (fc + fs);
+                        thrMp = fsrfgPipeOn && fsrfgPipeOk(*srv.nr) ? fsrfgPipeAfford(emaDt * thrBudget, fc, fs) : 0.0;
+                        m = thrMp >= 3.0 ? (std::max)(thrMd, thrMp) : thrMd;
                     }
                     else if (frPriced && !srv.nr->fsrfg)
                     {
@@ -3583,8 +3633,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         if (frFsr)
                             sprintf_s(
                                 frp,
-                                "; an AMD FSR 4 call %.1f ms + %.1f ms a slot over an x2 pair's %.1f ms, direct %.1f",
-                                fc, fs, fb, thrMd);
+                                "; an AMD FSR 4 call %.1f ms + %.1f ms a slot over an x2 pair's %.1f ms, direct %.1f / "
+                                "pipelined %.1f",
+                                fc, fs, fb, thrMd, thrMp);
                         else if (frPriced && !srv.nr->fsrfg)
                             sprintf_s(frp,
                                       "; a Smooth Motion call %.1f ms + %.1f ms a slot, direct %.1f / pipelined %.1f",

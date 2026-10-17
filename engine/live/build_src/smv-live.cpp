@@ -2422,7 +2422,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nFrames++;
         if (havePrev)
         {
-            cudaMemcpyAsync(nr.dX, nr.dX + 3 * plane, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st);
+            // dX's halves trade roles (xSwap, as live) unless an IFNet reads dX itself as its x, one tensor with prev
+            // in planes 0..2, or DRBA emits from its cur half: then the cur half is copied into the prev half
+            if (nr.drba || (!nr.gmfss && !nr.nvof && !nr.fruc && !nr.mph && !nr.xHalf))
+                cudaMemcpyAsync(nr.dX, nr.dX + 3 * plane, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st);
+            else
+                nr.xSwap = !nr.xSwap;
             // the frames the IFNet reads keep the same two frames: the motion frames, or the fp16
             // copy an fp16-x IFNet reads (DRBA builds its own x from its ring)
             if (nr.mph && !nr.drba)
@@ -2430,7 +2435,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             else if (nr.xHalf && !nr.drba)
                 cudaMemcpyAsync(nr.dXh, nr.dXh + 3 * plane, 3 * plane * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st);
         }
-        float* dCur = nr.dX + 3 * plane;
+        float* dCur = nativeXCur(nr);
         // DLSS 5 reuse: the decoded bytes against the previous frame's (dRaw alternates, so the other
         // buffer still holds them). Identical = this frame takes the previous frame's DLSS 5 output
         // and skips the pack, the pre-model stage and the evaluate: a pair route's shift above left
@@ -2456,7 +2461,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nrSame = *nr.hStaticFlag == 0;
             nrTested = true;
             if (nrSame && havePrev &&
-                (cudaMemcpyAsync(dCur, nr.dX, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
+                (cudaMemcpyAsync(dCur, nativeXPrev(nr), 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) !=
+                     cudaSuccess ||
                  (nr.mph && !nr.drba &&
                   cudaMemcpyAsync(nr.dM + 3 * mplane, nr.dM, 3 * mplane * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
                                   st) != cudaSuccess)))
@@ -2653,7 +2659,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // engine is skipped and every tween slot carries the real frame's own output bytes (the
         // Head encode above still ran, so the next pair's chain state is unchanged). Exact
         // equality only; SMV_NO_STATIC_HOLD=1 turns it off.
-        if (testPair && !pairTested && !identicalPair(nr.dX, pairStatic))
+        if (testPair && !pairTested && !identicalPair(nativeXPrev(nr), pairStatic))
         {
             io.setFail("identical-pair test failed");
             failed = true;
@@ -2672,7 +2678,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         const bool makesTweens = havePrev && !pairStatic && nT > 0;
         // GMFSS: feat_ext of every new frame (the next pair's feat0), the flow, metric and
         // pyramids only for a pair that makes tweens (live's nativeGroup; python skips reuse)
-        if (nr.gmfss && !nativeGmfssPair(nr, nr.dX, dCur, makesTweens))
+        if (nr.gmfss && !nativeGmfssPair(nr, nativeXPrev(nr), dCur, makesTweens))
         {
             io.setFail("gmfss pair failed");
             failed = true;
@@ -2869,7 +2875,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             // stream order: the D2H of the previous tween is enqueued before the next pack).
             // GMFSS: the pair ran above, then one chain per tween into dGmF (clamped fp32).
             // fruc: the pair ran above, then one bridge warp per tween into dFrOut (x / 255).
-            if (nr.nvof && !nativeNvofPair(nr, nr.dX, dCur))
+            if (nr.nvof && !nativeNvofPair(nr, nativeXPrev(nr), dCur))
             {
                 io.setFail("nvof pair failed");
                 failed = true;
@@ -3010,7 +3016,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     // the tweens: RIFE's last step on the pictures (RIFE's two domains: dX at the working
                     // size, whatever the passes before made of them), else on the frames the IFNet read
                     const bool picHalf = !nr.mph && nr.xHalf;
-                    if (!nativeRifeBlend(nr, picHalf ? (const void*)nr.dXh : (const void*)nr.dX, (int)picHalf, 1, st))
+                    if (!nativeRifeBlend(nr, picHalf ? (const void*)nr.dXh : (const void*)nr.dX, (int)picHalf, 1, st,
+                                         !picHalf && nr.xSwap))
                     {
                         io.setFail("rifeBlend launch failed");
                         failed = true;
@@ -3033,7 +3040,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     o = io.outFree.front();
                     io.outFree.pop_front();
                 }
-                const void* src = left ? (const void*)nr.dX : mergedAt(nr, 0, plane);
+                const void* src = left ? (const void*)nativeXPrev(nr) : mergedAt(nr, 0, plane);
                 int srcHalf = left ? 0 : (int)nr.outHalf;
                 uint8_t* dO = dOutRaw;
                 if (passes)
@@ -3207,7 +3214,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     break;
                 }
         }
-        else if (!oa.resumed && (!drEmit(nr.dX + 3 * plane, dHeldOut) || !drSend(dHeldOut, false)))
+        else if (!oa.resumed && (!drEmit(nativeXCur(nr), dHeldOut) || !drSend(dHeldOut, false)))
             failed = true;
     }
     const double loopS = (double)(nowQpc100() - tLoop) / 1e7;
