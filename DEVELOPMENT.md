@@ -1785,7 +1785,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion (the first one AMD FSR frame generation too): the most bridge instances (1..9; recursive midpoints use one per tree level on both routes, default 9 = to x512, 5 = to x32; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_FRUC_PIPE=0` / `=force` | Live Smooth Motion: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder, the fixed multipliers too (gates; see "Pipelined across pairs") |
-| `SMV_FSRFG_PIPE=0` / `=force` / `=serial` | Live AMD FSR frame generation: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder and fixed multiplier (gates) / the same with the new pair's level-1 Optical Flow after the shown pair's deeper calls (an A/B lever); unset = the priced automatic route (see "Pipelined across pairs") |
+| `SMV_FSRFG_PIPE=0` / `=force` / `=serial` | Live AMD FSR frame generation: never pipeline the midpoint tree across pairs / pipeline every ladder and fixed multiplier, x2 included (gates) / the same with the new pair's level-1 Optical Flow after the shown pair's deeper calls (an A/B lever); unset = the priced automatic route (see "Pipelined across pairs") |
 | `SMV_FRUC_STEPUP=0` | Live Smooth Motion / AMD FSR 4 FG: a target between two ladder nodes runs the largest node that fits instead of the node above it (gates; see "The node above the target") |
 | `SMV_LIVE_CASCADE=off` / `=probe` / `=present`, `SMV_LIVE_CASCADE_GEN` | Live DLSS 4.5: `off` = one pass only (no plan above the limit); development only (the direct route): `probe` starts `dlssg2f.exe --stage1` beside the session (in a job object that ends it with the host), feeds it every captured frame and reads every frame it shares on the host's own D3D12 device, presenting nothing of it; `present` = the cascade: the session's DLSS-G (`--gen`) presents stage 1's frames instead of the captured ones (x6 x x2 = x12); `_GEN` = stage 1's generated frames (1..5, default 5). Lines `cascade probe: ...` / `cascade stage 1: ...` (harness `dlssg_cascade\probe_gate.py`) |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..9, default 3 offline, 2 live; exact nodes go to depth 9 either way) |
@@ -1945,21 +1945,33 @@ entering holds one source period (the pair the last direct group showed), leavin
 or `... direct` at a switch, the throttle line ends with `a Smooth Motion call N ms + N ms a slot,
 direct N / pipelined N`, the session line with `N groups pipelined`. `SMV_FRUC_PIPE=0` = never,
 `=force` = every x4 or deeper ladder, the fixed multipliers too (gates). AMD FSR 4 FG pipelines by the
-same rule: a group shows the previous pair, its levels 2 and deeper on the session's stream while the
-new pair's level-1 Optical Flow runs on a stream of its own beside them; instance 0's call of the new
-pair waits for those deeper calls (FSR's calls keep the direct tree's order on the device, the nodes are
-the direct tree's: same tweens on the same pairs), its node becomes the shown pair's level 1 a group
-later; the derived vectors only (each pair reads its own field of the two the session alternates). Its
-price comes off three parts every group times on either route (the direct route's level-1 Optical Flow
-runs on that stream too): the level-1 Optical Flow, the level-1 call's FSR span, and the session
-stream's pre outside them; a pipelined group's deeper call = its slots less their stores, per call (the
-direct price takes it too). An M ladder costs that pre + the longer of (M - 2) calls + the later of M
-slot stores and the level-1 call, and the Optical Flow + the level-1 call; the throttle line ends with
-`direct N / pipelined N`, the session line with `N groups pipelined`. It frees the period's Optical
+same rule, from x2 up: a group shows the previous pair, its levels 2 and deeper on the session's stream
+while the new pair's level-1 Optical Flow runs on a stream of its own from the pack on, beside them and
+beside the shown pair's own level-1 call; instance 0's copies and call of the new pair run on a second
+stream, the call after those deeper calls (FSR's calls keep the direct tree's order on the device, the
+nodes are the direct tree's: same tweens on the same pairs), its node becomes the shown pair's level 1 a
+group later; the derived vectors only (each pair reads its own field of the two the session alternates).
+A pack waits only for its frame surface's last read off the session's stream (the Optical Flow's input
+conversion, instance 0's frame copy), never for instance 0's call, so the next pair's Optical Flow
+overlaps it. Its price comes off three parts every group times on either route (the direct route's
+level-1 Optical Flow runs on that stream too): the level-1 Optical Flow, the level-1 call's FSR span
+(read once that call is done, a group late while it still runs; never waited for), and the session
+stream's pre outside them; a pipelined group's deeper call = its slots from the wait for the shown pair's
+level-1 node on, less their stores, per call (the direct price takes it too; an x2 group prices the call
+by its level-1 span). An M ladder costs the longest of the Optical Flow, (M - 2) calls + the later of the
+level-1 call and the pre + M slot stores, and half of the pre + the Optical Flow + the level-1 call +
+(M - 2) calls + M stores (the loop through both chains spans two pairs); before an x4 or deeper group has
+timed a call, the level-1 call's FSR span stands in for the call in these sums (the throttle line says `(its
+level-1 span, untimed)`), so a session whose direct x2 does not fit still reaches the pipelined x2 and the
+ladder above it; the throttle line ends with `direct N / pipelined N`, the session line with `N groups
+pipelined`. It frees the period's Optical
 Flow share: on a 24 fps film 1440p runs x8 (192 presented, x4 = 96 direct) and 1080p x16 (384, x8 or
-an x16 at its edge with drops direct), 0 drops, one source period more latency. `SMV_FSRFG_PIPE=0` =
-never, `=force` = every x4 or deeper ladder and fixed multiplier, `=serial` = forced with the new
-pair's Optical Flow after the deeper calls (an A/B lever). Direct, FSR 4 makes every real frame's level 1 before the slots and queues its calls on the stream
+an x16 at its edge with drops direct), 0 drops, one source period more latency. On a source faster than
+the level-1 chain (1440p, 60 fps, fixed work) it takes 1.08x the pairs of the direct route at x2 (58 vs
+54 a second) and 1.04-1.05x the pairs of a chain that waited for instance 0's call at x4; at the power
+cap the overlap is not free (the Optical Flow runs slower beside FSR's calls). `SMV_FSRFG_PIPE=0` =
+never, `=force` = every ladder and fixed multiplier, `=serial` = forced with the new pair's Optical
+Flow after the deeper calls (an A/B lever). Direct, FSR 4 makes every real frame's level 1 before the slots and queues its calls on the stream
 (the CPU call returns at once; the stream waits for a node where it is first read), so its price
 comes off each group's whole GPU time: an x2 group's whole time, and per extra call the x4+ group's
 whole time less that and its extra slot stores; tweens a pair = 1 + (budget - x2's time) / (call +

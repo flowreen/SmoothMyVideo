@@ -4448,16 +4448,20 @@ struct NativeRife
     uint8_t* dFgMvR[2] = {};
     float fgChildT0 = 0.0f, fgChildT1 = 0.0f; // a serial level-2+ call's two frames in its pair (k_mvDerive's t0, t1)
     cudaEvent_t fgEvLevel = nullptr, fgEvVec[2] = {}, fgEvFree[2] = {};
-    // the level-1 chain's stream fgL1St: fgOf's Optical Flow and its kernels run there (the session's stream waits for
-    // them), and on the pipelined route (SMV_FSRFG_PIPE, nativeFsrfgPipeAdvance) instance 0's whole call of the new
-    // pair, beside the shown pair's level-2+ calls on the session's stream; FSR's calls keep the serial route's order on
-    // the device (instance 0's waits for fgEvDeep, the shown pair's last deeper call). fgOfWr / fgOfRd = the field fgOf
-    // writes / the derived vectors read (out[0] / out[1] alternate by pair while pipelined, else 1); dFgMvL1 = the
-    // calls' vectors on fgL1St, dFgL1Node = the new pair's level-1 node (swapped into dFrNode when that pair is shown);
-    // fgEvL1 = fgL1St's last work, fgEvS = the session stream's point fgL1St waits for; fgPiped = the last group ran
-    // pipelined, fgL1Pend = the new pair's call still to issue (nativeFsrfgL1Issue), fgL1Ok = its node is made
-    cudaStream_t fgL1St = nullptr;
-    cudaEvent_t fgEvL1 = nullptr, fgEvS = nullptr, fgEvDeep = nullptr;
+    // the level-1 chain's two streams: fgOfL1St runs fgOf's Optical Flow and its kernels (the session's stream waits
+    // for them on the direct route), fgL1St on the pipelined route (SMV_FSRFG_PIPE, nativeFsrfgPipeAdvance) instance
+    // 0's copies and whole call of the new pair, beside the shown pair's level-2+ calls on the session's stream, so the
+    // next pair's Optical Flow runs beside instance 0's call; FSR's calls keep the serial route's order on the device
+    // (instance 0's waits for fgEvDeep, the shown pair's last deeper call). fgOfWr / fgOfRd = the field fgOf writes /
+    // the derived vectors read (out[0] / out[1] alternate by pair while pipelined, else 1); dFgMvL1 = the calls'
+    // vectors on fgL1St, dFgL1Node = the new pair's level-1 node (swapped into dFrNode when that pair is shown);
+    // fgEvL1 = fgL1St's last work, fgEvS = the session stream's point the two streams wait for, fgEvOf = fgOfL1St's
+    // last pass, fgEvMv = fgL1St's last read of dFgMvL1 (the next pass writes it after), fgEvSurf[n] = frame surface
+    // n's last read off the session's stream (a pack into it waits for it); fgPiped = the last group ran pipelined,
+    // fgL1Pend = the new pair's call still to issue (nativeFsrfgL1Issue), fgL1Ok = its node is made
+    cudaStream_t fgL1St = nullptr, fgOfL1St = nullptr;
+    cudaEvent_t fgEvL1 = nullptr, fgEvS = nullptr, fgEvDeep = nullptr, fgEvOf = nullptr, fgEvMv = nullptr;
+    cudaEvent_t fgEvSurf[3] = {};
     int fgOfWr = 1, fgOfRd = 1;
     uint8_t* dFgMvL1 = nullptr;
     uint8_t* dFgL1Node = nullptr;
@@ -4762,17 +4766,24 @@ struct NativeRife
     // AMD FSR 4's level-1 call (made before the slots at every ladder): its FSR span on the stream (fgL1Ev, from the
     // fence signal to the result's wait), that span in the x2 groups that set the base (gFrL1BaseMs) and the call
     // price over it as x4 and deeper groups show it (gFrL1Ratio), so an x2 group keeps the call price current; priced
-    // by x4 and deeper groups alone, a load that passed while x4 fell would keep pricing x4 out for the session
-    cudaEvent_t fgL1Ev[2] = {};
-    bool grL1Armed = false;
+    // by x4 and deeper groups alone, a load that passed while x4 fell would keep pricing x4 out for the session. Two
+    // sets by group (fgEvSet = the one this group records): a pipelined group's call may still run when the next
+    // group starts (its pack does not wait for it), so its spans are read once done, without a wait
+    cudaEvent_t fgL1Ev[2][2] = {};
+    bool grL1Armed[2] = {};
+    int fgEvSet = 0;
     double gFrL1Ratio = 0.0, gFrL1BaseMs = 0.0;
     // AMD FSR 4's pipelined route (SMV_FSRFG_PIPE) is priced off three parts every group times on either route: the
-    // level-1 Optical Flow on fgL1St (fgOfEv: the direct route hops there too), the level-1 call's FSR span (fgL1Ev)
-    // and the session stream's pre outside that chain (the pipelined pre, or a direct pre less the two); the exe's
-    // pipelined cost = that pre + the longer of the deeper calls (+ the later of the stores and the next level-1 call)
-    // and the level-1 chain. 0 = not timed yet
-    cudaEvent_t fgOfEv[2] = {};
-    bool grOfArmed = false;
+    // level-1 Optical Flow on fgOfL1St (fgOfEv: the direct route hops there too), the level-1 call's FSR span
+    // (fgL1Ev) and the session stream's pre outside that chain (the pipelined pre, or a direct pre less the two); the
+    // exe's pipelined cost = the longest of the Optical Flow chain, the session stream's chain (the deeper calls + the
+    // later of the stores + pre and the next level-1 call) and half the loop through both. 0 = not timed yet
+    cudaEvent_t fgOfEv[2][2] = {};
+    bool grOfArmed[2] = {};
+    // a pipelined group's slots start with the wait for the shown pair's level-1 node (grLagEv after it, armed in
+    // nativeFsrfgLagTween): its deeper calls are priced from there
+    cudaEvent_t grLagEv = nullptr;
+    bool grLagArmed = false;
     double gFgPreMs = 0.0, gFgOfMs = 0.0, gFgL1Ms = 0.0;
     std::atomic<uint32_t> gFgPreUs{0}, gFgOfUs{0}, gFgL1Us{0};
 
@@ -8955,7 +8966,9 @@ static bool nativeFrucSetup(NativeRife& nr)
         nr.gFrL1BaseMs = nr.grFrWkMs = nr.gFrPipeMainMs = nr.gFrPipeWkMs = nr.gFrPipeRm = nr.gFrPipeRw =
             nr.gFrCallEntryMs = nr.gFgPreMs = nr.gFgOfMs = nr.gFgL1Ms = 0.0;
     nr.grPipeLearn = 0;
-    nr.grL1Armed = nr.grOfArmed = nr.grPiped = false;
+    nr.grPiped = nr.grLagArmed = false;
+    for (int k = 0; k < 2; k++)
+        nr.grL1Armed[k] = nr.grOfArmed[k] = false;
     nr.gFrCallUs.store(0);
     nr.gFrStoreUs.store(0);
     nr.gFrBaseUs.store(0);
@@ -10071,9 +10084,9 @@ static bool nativeFsrfgChildVec(NativeRife& nr, uint8_t* dst, cudaStream_t st, f
 // dropped) the frame halfway between them. The vectors as the harness made them: the field this frame -> the previous
 // (px) = FSR's convention. ring >= 0: the vectors were made ahead into dFgMvR[ring] (nativeFsrfgAheadVec). l1 = the
 // group's level-1 call: its FSR span goes into fgL1Ev for the x2 call price (nativeGroup). part 0 = the whole call on
-// the session's stream; on fgL1St (the pipelined route's instance-0 calls, their vectors in dFgMvL1): 1 = the frame and
-// its vectors into the instance's textures, 2 = after fgEvDeep the call and its copy out, 3 = the whole call (a reset
-// or a re-prime, in a group that runs no deeper call)
+// the session's stream; on fgL1St (the pipelined route's instance-0 calls, their vectors in dFgMvL1): 1 = the level-1
+// Optical Flow on fgOfL1St, then the frame and its vectors into the instance's textures, 2 = after fgEvDeep the call
+// and its copy out, 3 = the whole call (a reset or a re-prime, in a group that runs no deeper call)
 static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const uint8_t* prev, bool reset, uint8_t* out,
                             int ring = -1, bool l1 = false, int part = 0)
 {
@@ -10088,9 +10101,12 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
     bool derived = false;
     if (part != 2)
     {
+        // the pipelined level-1 pass (part 1) starts from the pack, not behind the instance's last call on fgL1St:
+        // the frame goes into the instance's texture after the pass
+        const bool pass1 = part == 1;
         mark(0);
-        if (cudaMemcpy2DToArrayAsync(g.in, 0, 0, frame, nr.fgPitch, row, nr.h, cudaMemcpyDeviceToDevice, st) !=
-            cudaSuccess)
+        if (!pass1 && cudaMemcpy2DToArrayAsync(g.in, 0, 0, frame, nr.fgPitch, row, nr.h, cudaMemcpyDeviceToDevice,
+                                               st) != cudaSuccess)
         {
             nr.die("fsrfg frame copy failed");
             return false;
@@ -10107,18 +10123,21 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
         }
         else if (prev && (i == 0 || !fsrfgDeriveOn(nr)))
         {
-            // fgOf runs on fgL1St: from another stream the pass waits for that stream's work so far, and it for the pass
+            // fgOf runs on fgOfL1St: from another stream the pass waits for that stream's work so far (the pipelined
+            // pass: for the pack, nativeFsrfgPipeAdvance, and for fgL1St's last read of dFgMvL1), and it for the pass
             const bool hop = nr.fgOf.st && nr.fgOf.st != st;
-            if (hop && (cudaEventRecord(nr.fgEvS, st) != cudaSuccess ||
-                        cudaStreamWaitEvent(nr.fgOf.st, nr.fgEvS, 0) != cudaSuccess))
+            if (hop && (pass1 ? cudaStreamWaitEvent(nr.fgOf.st, nr.fgEvMv, 0) != cudaSuccess
+                              : (cudaEventRecord(nr.fgEvS, st) != cudaSuccess ||
+                                 cudaStreamWaitEvent(nr.fgOf.st, nr.fgEvS, 0) != cudaSuccess)))
             {
                 nr.die("fsrfg vector event failed");
                 return false;
             }
             // the level-1 pass's span for the pipelined route's price (nativeGroup)
             cudaStream_t os = nr.fgOf.st ? nr.fgOf.st : nr.stream;
-            if (l1 && nr.fgOfEv[0])
-                nr.grOfArmed = cudaEventRecord(nr.fgOfEv[0], os) == cudaSuccess;
+            const int es = nr.fgEvSet;
+            if (l1 && nr.fgOfEv[es][0])
+                nr.grOfArmed[es] = cudaEventRecord(nr.fgOfEv[es][0], os) == cudaSuccess;
             int slotPrev = 0, slotCur = 1;
             if (!nativeFsrfgOfIn(nr, nr.fgOf, prev, frame, i == 0, slotPrev, slotCur))
                 return false;
@@ -10126,10 +10145,10 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
             if (!nativeOfVecRun(nr, nr.fgOf, slotPrev, slotCur, mvBuf, nr.fgMvPitch, "fsrfg",
                                 nr.fgProf ? nr.fgEv[3] : nullptr))
                 return false;
-            if (l1 && nr.grOfArmed)
-                nr.grOfArmed = cudaEventRecord(nr.fgOfEv[1], os) == cudaSuccess;
-            if (hop && (cudaEventRecord(nr.fgEvL1, nr.fgOf.st) != cudaSuccess ||
-                        cudaStreamWaitEvent(st, nr.fgEvL1, 0) != cudaSuccess))
+            if (l1 && nr.grOfArmed[es])
+                nr.grOfArmed[es] = cudaEventRecord(nr.fgOfEv[es][1], os) == cudaSuccess;
+            if (hop && (cudaEventRecord(nr.fgEvOf, nr.fgOf.st) != cudaSuccess ||
+                        cudaStreamWaitEvent(st, nr.fgEvOf, 0) != cudaSuccess))
             {
                 nr.die("fsrfg vector event failed");
                 return false;
@@ -10153,10 +10172,18 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
             mark(2);
             mark(3);
         }
+        if (pass1 && cudaMemcpy2DToArrayAsync(g.in, 0, 0, frame, nr.fgPitch, row, nr.h, cudaMemcpyDeviceToDevice, st) !=
+                         cudaSuccess)
+        {
+            nr.die("fsrfg frame copy failed");
+            return false;
+        }
         mark(4);
+        // fgEvMv: dFgMvL1 is read, the next level-1 pass may write it
         if (cudaMemcpy2DToArrayAsync(g.mv, 0, 0, mv, nr.fgMvPitch, (size_t)nr.w * 4, nr.h, cudaMemcpyDeviceToDevice,
                                      st) != cudaSuccess ||
-            (ring >= 0 && cudaEventRecord(nr.fgEvFree[ring], st) != cudaSuccess))
+            (ring >= 0 && cudaEventRecord(nr.fgEvFree[ring], st) != cudaSuccess) ||
+            (part && cudaEventRecord(nr.fgEvMv, st) != cudaSuccess))
         {
             nr.die("fsrfg vector copy failed");
             return false;
@@ -10170,8 +10197,9 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
         nr.die("fsrfg call wait failed");
         return false;
     }
-    if (l1 && nr.fgL1Ev[0])
-        nr.grL1Armed = cudaEventRecord(nr.fgL1Ev[0], st) == cudaSuccess;
+    const int es = nr.fgEvSet;
+    if (l1 && nr.fgL1Ev[es][0])
+        nr.grL1Armed[es] = cudaEventRecord(nr.fgL1Ev[es][0], st) == cudaSuccess;
     cudaExternalSemaphoreSignalParams sp{};
     sp.params.fence.value = ++g.val;
     if (cudaSignalExternalSemaphoresAsync(&g.sem, &sp, 1, st) != cudaSuccess)
@@ -10199,8 +10227,8 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
         return false;
     }
     mark(6);
-    if (l1 && nr.grL1Armed)
-        nr.grL1Armed = cudaEventRecord(nr.fgL1Ev[1], st) == cudaSuccess;
+    if (l1 && nr.grL1Armed[es])
+        nr.grL1Armed[es] = cudaEventRecord(nr.fgL1Ev[es][1], st) == cudaSuccess;
     if (out && cudaMemcpy2DFromArrayAsync(out, nr.fgPitch, g.out, 0, 0, row, nr.h, cudaMemcpyDeviceToDevice, st) !=
                    cudaSuccess)
     {
@@ -10464,6 +10492,24 @@ static bool nativeFsrfgPack(NativeRife& nr, const float* src, int n, bool sdr)
     return true;
 }
 
+// the level-1 chain's two streams and their events (nativeFsrfgSetup makes them)
+static void nativeFsrfgChainFree(NativeRife& nr)
+{
+    for (cudaEvent_t* e : {&nr.fgEvL1, &nr.fgEvS, &nr.fgEvDeep, &nr.fgEvOf, &nr.fgEvMv, &nr.fgEvSurf[0],
+                           &nr.fgEvSurf[1], &nr.fgEvSurf[2]})
+        if (*e)
+        {
+            cudaEventDestroy(*e);
+            *e = nullptr;
+        }
+    for (cudaStream_t* s : {&nr.fgL1St, &nr.fgOfL1St})
+        if (*s)
+        {
+            cudaStreamDestroy(*s);
+            *s = nullptr;
+        }
+}
+
 static bool nativeFsrfgSetup(NativeRife& nr)
 {
     if (!nativeFsrfgLoad(nr.frucDir, nr.cachePath))
@@ -10479,33 +10525,30 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     nr.fgPitch = nr.fgMvPitch = 0;
     for (NativeRife::FgInst& g : nr.fg)
         g = NativeRife::FgInst{};
-    // fgOf on its own stream fgL1St (the pipelined route's level-1 chain); the profiler keeps it on the session's
+    // fgOf on its own stream fgOfL1St, instance 0's pipelined calls on fgL1St (the pipelined route's level-1 chain);
+    // the profiler keeps both on the session's
     nr.fgOfWr = nr.fgOfRd = 1;
     nr.fgPiped = nr.fgL1Pend = nr.fgL1Ok = nr.fgPipeLogged = false;
     {
         char ev[8] = {};
-        if (!(GetEnvironmentVariableA("SMV_FSRFG_PROF", ev, sizeof(ev)) > 0 && ev[0] == '1') &&
-            (cudaStreamCreateWithFlags(&nr.fgL1St, cudaStreamNonBlocking) != cudaSuccess ||
-             cudaEventCreateWithFlags(&nr.fgEvL1, cudaEventDisableTiming) != cudaSuccess ||
-             cudaEventCreateWithFlags(&nr.fgEvS, cudaEventDisableTiming) != cudaSuccess ||
-             cudaEventCreateWithFlags(&nr.fgEvDeep, cudaEventDisableTiming) != cudaSuccess))
+        if (!(GetEnvironmentVariableA("SMV_FSRFG_PROF", ev, sizeof(ev)) > 0 && ev[0] == '1'))
         {
-            LOG("native: fsrfg: the level-1 stream did not start: the Optical Flow on the session's stream, no "
-                "pipelined route\n");
-            for (cudaEvent_t* e : {&nr.fgEvL1, &nr.fgEvS, &nr.fgEvDeep})
-                if (*e)
-                {
-                    cudaEventDestroy(*e);
-                    *e = nullptr;
-                }
-            if (nr.fgL1St)
-                cudaStreamDestroy(nr.fgL1St);
-            nr.fgL1St = nullptr;
+            bool ok = cudaStreamCreateWithFlags(&nr.fgL1St, cudaStreamNonBlocking) == cudaSuccess &&
+                      cudaStreamCreateWithFlags(&nr.fgOfL1St, cudaStreamNonBlocking) == cudaSuccess;
+            for (cudaEvent_t* e : {&nr.fgEvL1, &nr.fgEvS, &nr.fgEvDeep, &nr.fgEvOf, &nr.fgEvMv, &nr.fgEvSurf[0],
+                                   &nr.fgEvSurf[1], &nr.fgEvSurf[2]})
+                ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
+            if (!ok)
+            {
+                LOG("native: fsrfg: the level-1 streams did not start: the Optical Flow on the session's stream, no "
+                    "pipelined route\n");
+                nativeFsrfgChainFree(nr);
+            }
         }
     }
     // never the fast perf level here: at fast, grid 1, the engine's vectors can go wrong after ~320 calls of a 1080p
     // session with vkd3d-proton in the process (garbage tweens from then on, run to run different)
-    if (!nativeFsrfgCreate(nr, 0) || !nativeOfVecSetup(nr, nr.fgOf, nr.w, nr.h, "fsrfg", nr.fgL1St))
+    if (!nativeFsrfgCreate(nr, 0) || !nativeOfVecSetup(nr, nr.fgOf, nr.w, nr.h, "fsrfg", nr.fgOfL1St))
         return false;
     if (nr.fgL1St)
         NCHK(cudaMalloc((void**)&nr.dFgMvL1, (size_t)nr.fgMvPitch * nr.h), "alloc fsrfg level-1 vectors");
@@ -10596,14 +10639,24 @@ static bool nativeFsrfgPairStep(NativeRife& nr, const float* dCur, uint32_t nTwe
         in = *nr.hFrRange == 0;
     }
     const bool sdr = in && (nr.frPrev < 0 || nr.frIn[nr.frPrev]);
-    if (!nativeFsrfgPack(nr, dCur, n, sdr))
+    // pipelined, the level-1 pass and instance 0's copies read the surfaces off the session's stream: a pack waits for
+    // its surface's last such read (fgEvSurf), never for instance 0's call
+    auto surfFree = [&nr](int k) {
+        if (nr.fgPiped && cudaStreamWaitEvent(nr.stream, nr.fgEvSurf[k], 0) != cudaSuccess)
+        {
+            nr.die("fsrfg frame wait failed");
+            return false;
+        }
+        return true;
+    };
+    if (!surfFree(n) || !nativeFsrfgPack(nr, dCur, n, sdr))
         return false;
     nr.frIn[n] = in;
     if (nr.frPrev >= 0 && nr.frSurfSdr[nr.frPrev] != sdr)
     {
         // the previous frame in the other encoding: packed again, and every fed instance restarts there (a key that
         // names no frame: a plain call, never a reset)
-        if (!nativeFsrfgPack(nr, nativeXPrev(nr), nr.frPrev, sdr))
+        if (!surfFree(nr.frPrev) || !nativeFsrfgPack(nr, nativeXPrev(nr), nr.frPrev, sdr))
             return false;
         for (uint64_t& k : nr.frLastKey)
             if (k)
@@ -10665,21 +10718,30 @@ static bool fsrfgPipeSerial()
     return on;
 }
 
-// a pipelined group's pair step: the pair the last group made current becomes the one shown (its level-1 node, made
-// on fgL1St then, swapped into dFrNode), the new frame is packed sparing the shown pair's first frame, and the new
-// pair's level-1 call starts on fgL1St: its Optical Flow into the other field now, the call itself after the shown
-// pair's deeper calls (nativeFsrfgL1Issue). The shown pair is held (its second frame in every slot) when it was
-// identical, when the last group was not pipelined (it showed that pair itself: the route's entry costs one source
-// period's hold) or when its second frame was packed again in the other encoding
-static bool nativeFsrfgPipeAdvance(NativeRife& nr, const float* dCur, bool curStatic)
+// the new pair's level-1 Optical Flow and instance 0's copies (nativeFsrfgFeed part 1): the pair's two surfaces are
+// read off the session's stream until fgL1St's copies are done (fgEvSurf, the next packs wait for it)
+static bool nativeFsrfgL1Vec(NativeRife& nr)
 {
-    // the pack below writes a frame surface fgL1St's earlier calls read (a held group's next pack, a repack): the
-    // session's stream waits for fgL1St's last work first (its next deeper calls wait for that call anyway)
-    if (nr.fgPiped && cudaStreamWaitEvent(nr.stream, nr.fgEvL1, 0) != cudaSuccess)
+    if (!nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frB], nr.dFrSurf[nr.frA], false, nullptr, -1, true, 1))
+        return false;
+    if (cudaEventRecord(nr.fgEvSurf[nr.frA], nr.fgL1St) != cudaSuccess ||
+        cudaEventRecord(nr.fgEvSurf[nr.frB], nr.fgL1St) != cudaSuccess)
     {
-        nr.die("fsrfg level-1 wait failed");
+        nr.die("fsrfg level-1 event failed");
         return false;
     }
+    return true;
+}
+
+// a pipelined group's pair step: the pair the last group made current becomes the one shown (its level-1 node, made
+// on fgL1St then, swapped into dFrNode), the new frame is packed sparing the shown pair's first frame (each pack waits
+// only for its surface's last read off the session's stream, nativeFsrfgPairStep), and the new pair's level-1 chain
+// starts: its Optical Flow on fgOfL1St into the other field now, beside instance 0's last call, the call itself on
+// fgL1St after the shown pair's deeper calls (nativeFsrfgL1Issue). The shown pair is held (its second frame in every
+// slot) when it was identical, when the last group was not pipelined (it showed that pair itself: the route's entry
+// costs one source period's hold) or when its second frame was packed again in the other encoding
+static bool nativeFsrfgPipeAdvance(NativeRife& nr, const float* dCur, bool curStatic)
+{
     nr.frLagSerial = nr.frSerial;
     nr.frLagA = nr.frA;
     nr.frLagB = nr.frB;
@@ -10704,7 +10766,7 @@ static bool nativeFsrfgPipeAdvance(NativeRife& nr, const float* dCur, bool curSt
     nr.fgPiped = true;
     if (!nr.fgPipeLogged)
     {
-        LOG("native: fsrfg: pipelined across pairs: the new pair's level-1 Optical Flow and call on their own stream "
+        LOG("native: fsrfg: pipelined across pairs: the new pair's level-1 Optical Flow and call on their own streams "
             "beside the shown pair's level-2+ calls\n");
         nr.fgPipeLogged = true;
     }
@@ -10714,8 +10776,9 @@ static bool nativeFsrfgPipeAdvance(NativeRife& nr, const float* dCur, bool curSt
         nr.die("fsrfg level-1 node alloc failed");
         return false;
     }
-    // fgL1St after the pack
+    // the level-1 pass and instance 0's stream after the pack
     if (cudaEventRecord(nr.fgEvS, nr.stream) != cudaSuccess ||
+        cudaStreamWaitEvent(nr.fgOfL1St, nr.fgEvS, 0) != cudaSuccess ||
         cudaStreamWaitEvent(nr.fgL1St, nr.fgEvS, 0) != cudaSuccess)
     {
         nr.die("fsrfg level-1 event failed");
@@ -10726,7 +10789,8 @@ static bool nativeFsrfgPipeAdvance(NativeRife& nr, const float* dCur, bool curSt
     {
         // the stream's first frame: instance 0 starts there with a reset
         if (!nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frB], nullptr, true, nullptr, -1, false, 3) ||
-            cudaEventRecord(nr.fgEvL1, nr.fgL1St) != cudaSuccess)
+            cudaEventRecord(nr.fgEvL1, nr.fgL1St) != cudaSuccess ||
+            cudaEventRecord(nr.fgEvSurf[nr.frB], nr.fgL1St) != cudaSuccess)
             return false;
         nr.frLastKey[0] = nativeFrucKey(cur, 1, 0);
         return true;
@@ -10744,8 +10808,7 @@ static bool nativeFsrfgPipeAdvance(NativeRife& nr, const float* dCur, bool curSt
     }
     nr.fgOfWr = nr.fgOf.wr = 1 - nr.fgOfRd;
     nr.fgL1Pend = true;
-    return fsrfgPipeSerial() ||
-           nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frB], nr.dFrSurf[nr.frA], false, nullptr, -1, true, 1);
+    return fsrfgPipeSerial() || nativeFsrfgL1Vec(nr);
 }
 
 // the pipelined route's instance-0 call of the new pair (nativeFsrfgPipeAdvance made its vectors) on fgL1St after
@@ -10761,9 +10824,7 @@ static bool nativeFsrfgL1Issue(NativeRife& nr)
         nr.die("fsrfg level-1 event failed");
         return false;
     }
-    if (fsrfgPipeSerial() &&
-        (cudaStreamWaitEvent(nr.fgL1St, nr.fgEvDeep, 0) != cudaSuccess ||
-         !nativeFsrfgFeed(nr, 0, nr.dFrSurf[nr.frB], nr.dFrSurf[nr.frA], false, nullptr, -1, true, 1)))
+    if (fsrfgPipeSerial() && (cudaStreamWaitEvent(nr.fgOfL1St, nr.fgEvDeep, 0) != cudaSuccess || !nativeFsrfgL1Vec(nr)))
     {
         nr.die("fsrfg level-1 call failed");
         return false;
@@ -10793,6 +10854,9 @@ static bool nativeFsrfgLagTween(NativeRife& nr, double t)
             nr.die("fsrfg level-1 wait failed");
             return false;
         }
+        // the deeper calls' price starts here (nativeGroup): the wait above belongs to the level-1 chain
+        if (nr.grLagEv)
+            nr.grLagArmed = cudaEventRecord(nr.grLagEv, nr.stream) == cudaSuccess;
         for (int l = 2; l <= nr.frMpL; l++)
             if (nativeFsrfgAhead(nr))
             {
@@ -10825,7 +10889,8 @@ static bool nativeFsrfgLagTween(NativeRife& nr, double t)
 }
 
 // the direct route after a pipelined group: the session's stream waits for fgL1St's last work (the level-1 call of
-// the pair the last group made current, which this route never shows), one field again
+// the pair the last group made current, which this route never shows; it waited for fgOfL1St's last pass), one field
+// again
 static bool nativeFsrfgPipeExit(NativeRife& nr)
 {
     if (!nr.fgPiped)
@@ -10885,8 +10950,9 @@ static bool nativeFsrfgTween(NativeRife& nr, double t)
 // frames after this)
 static void nativeFsrfgRelease(NativeRife& nr)
 {
-    if (nr.fgL1St)
-        cudaStreamSynchronize(nr.fgL1St);
+    for (cudaStream_t s : {nr.fgOfL1St, nr.fgL1St})
+        if (s)
+            cudaStreamSynchronize(s);
     if (nr.stream)
         cudaStreamSynchronize(nr.stream);
     if (nr.fg[0].made)
@@ -10951,15 +11017,7 @@ static void nativeFsrfgRelease(NativeRife& nr)
             cudaFree(*b);
             *b = nullptr;
         }
-    for (cudaEvent_t* e : {&nr.fgEvL1, &nr.fgEvS, &nr.fgEvDeep})
-        if (*e)
-        {
-            cudaEventDestroy(*e);
-            *e = nullptr;
-        }
-    if (nr.fgL1St)
-        cudaStreamDestroy(nr.fgL1St);
-    nr.fgL1St = nullptr;
+    nativeFsrfgChainFree(nr);
     nr.fgPiped = nr.fgL1Pend = nr.fgL1Ok = false;
     nr.frInst = 1;
 }
@@ -11356,10 +11414,13 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
             NCHK(cudaEventCreate(&e), "create frame timing event");
         for (cudaEvent_t& e : nr.grEv)
             NCHK(cudaEventCreate(&e), "create group timing event");
-        for (cudaEvent_t& e : nr.fgL1Ev)
-            NCHK(cudaEventCreate(&e), "create fsrfg call timing event");
-        for (cudaEvent_t& e : nr.fgOfEv)
-            NCHK(cudaEventCreate(&e), "create fsrfg Optical Flow timing event");
+        for (auto& s : nr.fgL1Ev)
+            for (cudaEvent_t& e : s)
+                NCHK(cudaEventCreate(&e), "create fsrfg call timing event");
+        for (auto& s : nr.fgOfEv)
+            for (cudaEvent_t& e : s)
+                NCHK(cudaEventCreate(&e), "create fsrfg Optical Flow timing event");
+        NCHK(cudaEventCreate(&nr.grLagEv), "create fsrfg slot timing event");
     }
     // the nvof model: the Optical Flow session and the glue buffers (the kernels are bound above)
     if (nr.nvof && !nativeNvofSetup(nr))
@@ -12794,19 +12855,22 @@ static void nativeFree(NativeRife& nr)
             cudaEventDestroy(e);
             e = nullptr;
         }
-    for (cudaEvent_t& e : nr.fgL1Ev)
-        if (e)
-        {
-            cudaEventDestroy(e);
-            e = nullptr;
-        }
-    for (cudaEvent_t& e : nr.fgOfEv)
-        if (e)
-        {
-            cudaEventDestroy(e);
-            e = nullptr;
-        }
-    nr.grArmed = nr.grL1Armed = nr.grOfArmed = false;
+    for (auto* s : {&nr.fgL1Ev, &nr.fgOfEv})
+        for (auto& set : *s)
+            for (cudaEvent_t& e : set)
+                if (e)
+                {
+                    cudaEventDestroy(e);
+                    e = nullptr;
+                }
+    if (nr.grLagEv)
+    {
+        cudaEventDestroy(nr.grLagEv);
+        nr.grLagEv = nullptr;
+    }
+    nr.grArmed = nr.grLagArmed = false;
+    for (int k = 0; k < 2; k++)
+        nr.grL1Armed[k] = nr.grOfArmed[k] = false;
     // PG p.124: mappings must go before the external memory objects, and every outstanding
     // wait must have completed before the semaphore is destroyed (the stream sync above).
     if (nr.dOutRing)
@@ -15249,15 +15313,19 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 else if (nr.fruc && nr.frMp && nr.fsrfg && nr.grSlots)
                 {
                     // the level-1 chain's parts, on either route (the pipelined route's price, see fgOfEv): its
-                    // Optical Flow, its call's FSR span and the session stream's pre outside them. A pipelined group
-                    // issued its level-1 call last, on fgL1St: the next pack waits for that call anyway
+                    // Optical Flow, its call's FSR span and the session stream's pre outside them. A pipelined group's
+                    // level-1 call may still run (the next pack does not wait for it): the spans come from the newest
+                    // set whose call is done (the last group's, else the one before), read once, never waited for
                     float l1 = 0.0f, of = 0.0f;
-                    if (nr.grPiped && nr.grL1Armed)
-                        cudaEventSynchronize(nr.fgL1Ev[1]);
-                    const bool l1Ok = nr.grL1Armed &&
-                                      cudaEventElapsedTime(&l1, nr.fgL1Ev[0], nr.fgL1Ev[1]) == cudaSuccess && l1 > 0.0f;
-                    if (l1Ok && nr.grOfArmed && cudaEventElapsedTime(&of, nr.fgOfEv[0], nr.fgOfEv[1]) == cudaSuccess &&
-                        of > 0.0f)
+                    int ls = -1;
+                    for (int k : {(int)((nr.seq - 1) % 2), (int)(nr.seq % 2)})
+                        if (ls < 0 && nr.grL1Armed[k] && cudaEventQuery(nr.fgL1Ev[k][1]) == cudaSuccess)
+                            ls = k;
+                    const bool l1Ok = ls >= 0 &&
+                                      cudaEventElapsedTime(&l1, nr.fgL1Ev[ls][0], nr.fgL1Ev[ls][1]) == cudaSuccess &&
+                                      l1 > 0.0f;
+                    if (l1Ok && nr.grOfArmed[ls] &&
+                        cudaEventElapsedTime(&of, nr.fgOfEv[ls][0], nr.fgOfEv[ls][1]) == cudaSuccess && of > 0.0f)
                     {
                         ema(nr.gFgOfMs, of);
                         ema(nr.gFgL1Ms, l1);
@@ -15266,16 +15334,28 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                         nr.gFgL1Us.store((uint32_t)(nr.gFgL1Ms * 1000.0));
                         nr.gFgPreUs.store((uint32_t)(nr.gFgPreMs * 1000.0));
                     }
+                    if (ls >= 0)
+                        nr.grL1Armed[ls] = nr.grOfArmed[ls] = false;
                     const uint32_t in = nr.grFrCalls - nr.grFrPreCalls;
                     if (nr.grPiped)
                     {
-                        // pipelined: the slots = the shown pair's deeper calls + the stores (the level-1 chain runs
-                        // beside them on fgL1St), so a call = the slots less the stores, per call. The direct price
-                        // takes it too (its base and store stay the x2 groups'): the route's exit reads the call as
-                        // the GPU runs it now
+                        // pipelined: the slots = the wait for the shown pair's level-1 node (the level-1 chain's
+                        // time), the pair's deeper calls + the stores, so a call = the slots from grLagEv less the
+                        // stores, per call; an x2 group (no deeper call) prices the call by its level-1 span, as a
+                        // direct x2 group does. The direct price takes it too (its base and store stay the direct x2
+                        // groups'): the route's exit reads the call as the GPU runs it now
+                        float lag = 0.0f;
+                        const double sl =
+                            nr.grLagArmed && cudaEventElapsedTime(&lag, nr.grLagEv, nr.grEv[1]) == cudaSuccess ? lag
+                                                                                                               : slots;
                         if (in && nr.gFrStoreMs > 0.0)
                         {
-                            ema(nr.gFrCallMs, (std::max)(0.0, (double)slots - nr.grSlots * nr.gFrStoreMs) / in);
+                            ema(nr.gFrCallMs, (std::max)(0.0, sl - nr.grSlots * nr.gFrStoreMs) / in);
+                            nr.gFrCallUs.store((uint32_t)(nr.gFrCallMs * 1000.0));
+                        }
+                        else if (!in && l1Ok && nr.gFrL1Ratio > 0.0)
+                        {
+                            ema(nr.gFrCallMs, nr.gFrL1Ratio * l1);
                             nr.gFrCallUs.store((uint32_t)(nr.gFrCallMs * 1000.0));
                         }
                     }
@@ -15363,7 +15443,9 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             }
         }
     }
-    nr.grArmed = nr.grL1Armed = nr.grOfArmed = false;
+    // the level-1 spans stay armed until read (the alternate set is the next group's); this group records into its own
+    nr.grArmed = nr.grLagArmed = false;
+    nr.fgEvSet = (int)(nr.seq % 2);
     nr.grFrCalls = nr.grFrPreCalls = nr.grFrWkCalls = 0;
     nr.grFrCallMs = nr.grFrPreMs = nr.grFrChainMs = nr.grFrWkMs = 0.0;
 
