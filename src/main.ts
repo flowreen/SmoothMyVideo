@@ -675,13 +675,15 @@ let liveRestartPending = false; // renderer asked to relaunch the session with n
 // a second instead of 2.5 s). Sessions then start and stop over the
 // exe's stdin ("start<TAB>args", "stop", "quit"); the exe prints "live session ended: exit N,
 // host resident" where a non-resident run exited. The host is freed (quit) when a model other
-// than the one it holds is selected in the panel or when DLSS-G starts, when the app quits, and
+// than the one it holds is selected in the panel or when DLSS-G starts, when a file render starts, when the app quits, and
 // by the exe itself after an idle limit (10 min) or when a session used something it cannot
 // keep (DLSS-G, native DLSS 5, the TrueHDR bridge, an error exit).
 let liveResident = false; // liveProc was spawned with --resident
 let liveIdle = false; // the resident host is alive with no session running
 let liveRunModel = ''; // the model of the running (or last) session on liveProc
 let liveHeld = ''; // the model the idle resident host keeps loaded (= its last session's)
+let liveBuildHeld = false; // the idle host stayed for an engine build its session left running (its ended line says so)
+let liveRevivePending = false; // a restart / revive timer is armed: it reuses the idle host in 400 ms
 let liveResolved: string | null = null; // the running session's target hwnd (revives reuse it)
 let liveRestarts = 0; // exit 4 / 6 revive count of the current target
 let liveStopTimer: NodeJS.Timeout | null = null; // "stop" grace: kill the host if the line never comes
@@ -772,6 +774,7 @@ function liveQuitIdle() {
   liveProc = null;
   liveIdle = false;
   liveResident = false;
+  liveBuildHeld = false;
 }
 
 // a session ended: the exe exited (code from 'close') or, on the resident host, printed its
@@ -790,7 +793,9 @@ function onLiveSessionEnd(code: number | null) {
   if (liveRestartPending && !liveStopping && resolved) {
     liveRestartPending = false;
     liveLog('restarting with new settings');
+    liveRevivePending = true;
     setTimeout(() => {
+      liveRevivePending = false;
       if (!busy() && !liveStopping) startLiveSession(resolved, restarts);
     }, 400);
     return;
@@ -804,7 +809,9 @@ function onLiveSessionEnd(code: number | null) {
   if ((code === 4 || code === 6) && !liveStopping && restarts < 20 && resolved) {
     liveLog(`session exit ${code}, reviving (restart ${restarts + 1})`);
     if (code === 6) sendLive('lv-out', 'live engine stalled, reviving the session\n');
+    liveRevivePending = true;
     setTimeout(() => {
+      liveRevivePending = false;
       if (!busy() && !liveStopping) startLiveSession(resolved, restarts + 1);
     }, 400);
     return;
@@ -939,6 +946,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
         // the resident host stays alive: this line IS the session's exit
         liveIdle = true;
         liveHeld = liveRunModel;
+        liveBuildHeld = line.includes('a running engine build');
         onLiveSessionEnd(Number(e[1]));
       }
     }
@@ -1599,6 +1607,9 @@ function pipeEngineOutput(proc: ChildProcess, send: (channel: string, ...payload
 ipcMain.on('run', (e, opts: RunOpts) => {
   const args = engineArgs(opts);
   const env = engineEnv();
+  // an idle resident live host gives its VRAM to the render, unless a restart / revive is about to reuse it or it
+  // stayed to finish an engine build (that build makes the next Live start warm)
+  if (!liveRevivePending && !liveBuildHeld) liveQuitIdle();
   clearPause(); // start unpaused: never inherit a stale flag from a previous (e.g. killed) run
   // The render orchestrator is TypeScript: this Electron binary run as plain
   // node on dist/render/cli.js, which speaks render.py's stderr protocol and exit codes and runs

@@ -4225,6 +4225,11 @@ struct NativeRife
     nvinfer1::ICudaEngine* engGm[kGmN] = {};
     nvinfer1::IRuntimeConfig* cfgGm[kGmN] = {};
     nvinfer1::IExecutionContext* ctxGm[kGmN] = {};
+    // the contexts' one shared activation block (nativeGmShareMemory, gmCtxMemB bytes); ctxUserMem = nativeMakeContext
+    // creates the next contexts with user-managed memory
+    void* dGmCtxMem = nullptr;
+    int64_t gmCtxMemB = 0;
+    bool ctxUserMem = false;
     // between gmflow's halves: A's outputs (kGmA order), the correlation k_localCorr writes for B, and the shapes it
     // runs at (the quarter grid gmH x gmW, gmK window samples a pixel)
     void* dGmA[kGmAn] = {};
@@ -4428,6 +4433,10 @@ struct NativeRife
         NV_OF_PERF_LEVEL level = NV_OF_PERF_LEVEL_SLOW; // nativeOfLevel()
         cudaStream_t st = nullptr; // the stream its Optical Flow and kernels run on, null = the session's
         int wr = 1; // one direction: the field goes to out[wr] (FSR 4's pipelined route alternates out[0] / out[1])
+        // FSR 4's level-1 chain (nativeFsrfgOfIn): the input slot still holding frame surface keepSrc as the last pass
+        // converted it, -1 = none; a pack into that surface (nativeFsrfgPack) and every other pass clear it
+        int keepSlot = -1;
+        const uint8_t* keepSrc = nullptr;
     };
     OfVec fgOf;
     // a tree level with 2+ calls makes its vectors ahead (nativeFsrfgLevel): call j + 1's Optical Flow on fgOfSt (its own
@@ -4635,7 +4644,7 @@ struct NativeRife
     bool nrZeroCopy = false;    // the shared-buffer route is up
     int nrW = 0, nrH = 0;       // the decoded picture's size, the size DLSS 5 runs at
     float* dRawPrev = nullptr;  // the previous decoded frame, packed: the identical-pair test's
-                                // reference once DLSS 5 has rewritten the frames in dX
+                                // reference once DLSS 5 has rewritten the frames in dX (SMV_NR_REUSE=0 only)
     uint16_t* dNrIo = nullptr;  // device RGBA16F, both directions
     uint16_t* hNrIn = nullptr;  // pinned host copies handed to renderFrame (CPU staging)
     uint16_t* hNrOut = nullptr;
@@ -4664,11 +4673,10 @@ struct NativeRife
     uint64_t nrN = 0;
     // live DLSS 5: the same core, handoff and motion once per captured frame on the
     // model frame after Restore / the resize (nativeLiveNrInit, nativeGroup); a capture byte-identical
-    // to the previous one takes dNrLast instead of an evaluate
+    // to the previous one keeps the last output in the cur half instead of an evaluate
     bool liveNr = false;
-    bool nrHaveLast = false;     // dNrLast holds an evaluated frame
-    float* dNrLast = nullptr;    // the last evaluated model frame, 3 padded planes
-    uint8_t* dCapPrev = nullptr; // the previous raw capture, the reuse test's reference
+    bool nrHaveLast = false;     // the frame before holds an evaluated output
+    uint8_t* dCapPrev = nullptr; // the previous raw capture, the reuse test's reference; trades places with dCap
     float nrSdrWhite = 3.0f;     // HDR: the SDR reference white in scRGB units (nits / 80)
     int nrSrcHdr = 0;            // offline: HDR video (1 PQ, 2 HLG), the pass sees its SDR range
     // GMFSS and Restore on HDR planes (hdrToModel): the decoded frame's encoding (offline Restore reads it; 1 PQ,
@@ -7506,6 +7514,8 @@ static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfe
     }
     if (wantGraph)
         cfg->setCudaGraphStrategy(nvinfer1::CudaGraphStrategy::kWHOLE_GRAPH_CAPTURE);
+    if (nr.ctxUserMem)
+        cfg->setExecutionContextAllocationStrategy(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
     nvinfer1::IExecutionContext* ctx = eng->createExecutionContext(cfg);
     if (!ctx)
     {
@@ -9992,15 +10002,21 @@ static void nativeOfVecFree(NativeRife::OfVec& o)
     o = NativeRife::OfVec{};
 }
 
-// prev and frame (RGBA16F) into OfVec o's two inputs as ABGR8, on o's stream
-static bool nativeFsrfgOfIn(NativeRife& nr, NativeRife::OfVec& o, const uint8_t* prev, const uint8_t* frame)
+// prev and frame (RGBA16F) into OfVec o's two inputs as ABGR8, on o's stream; the slots they are in come back in
+// slotPrev / slotCur. chain = the level-1 pass, whose prev is the last level-1 pass's frame: when a slot still holds
+// that surface (keepSrc), only the new frame is converted, into the other slot
+static bool nativeFsrfgOfIn(NativeRife& nr, NativeRife::OfVec& o, const uint8_t* prev, const uint8_t* frame, bool chain,
+                            int& slotPrev, int& slotCur)
 {
     const unsigned gx = (unsigned)(nr.w + 15) / 16, gy = (unsigned)(nr.h + 15) / 16;
     int sp = nr.fgPitch, ip = (int)o.inPitch;
-    for (int k = 0; k < 2; k++)
+    const bool kept = chain && o.keepSlot >= 0 && o.keepSrc == prev;
+    slotPrev = kept ? o.keepSlot : 0;
+    slotCur = 1 - slotPrev;
+    for (int k = kept ? 1 : 0; k < 2; k++)
     {
         const uint8_t* s = k ? frame : prev;
-        CUdeviceptr d = o.inP[k];
+        CUdeviceptr d = o.inP[k ? slotCur : slotPrev];
         void* a[] = {(void*)&s, &sp, &nr.w, &nr.h, &d, &ip};
         if (cuLaunchKernel(nr.fRgbaHAbgr, gx, gy, 1, 16, 16, 1, 0, (CUstream)(o.st ? o.st : nr.stream), a, nullptr) !=
             CUDA_SUCCESS)
@@ -10009,6 +10025,8 @@ static bool nativeFsrfgOfIn(NativeRife& nr, NativeRife::OfVec& o, const uint8_t*
             return false;
         }
     }
+    o.keepSlot = chain ? slotCur : -1;
+    o.keepSrc = chain ? frame : nullptr;
     return true;
 }
 
@@ -10101,10 +10119,12 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
             cudaStream_t os = nr.fgOf.st ? nr.fgOf.st : nr.stream;
             if (l1 && nr.fgOfEv[0])
                 nr.grOfArmed = cudaEventRecord(nr.fgOfEv[0], os) == cudaSuccess;
-            if (!nativeFsrfgOfIn(nr, nr.fgOf, prev, frame))
+            int slotPrev = 0, slotCur = 1;
+            if (!nativeFsrfgOfIn(nr, nr.fgOf, prev, frame, i == 0, slotPrev, slotCur))
                 return false;
             mark(2);
-            if (!nativeOfVecRun(nr, nr.fgOf, 0, 1, mvBuf, nr.fgMvPitch, "fsrfg", nr.fgProf ? nr.fgEv[3] : nullptr))
+            if (!nativeOfVecRun(nr, nr.fgOf, slotPrev, slotCur, mvBuf, nr.fgMvPitch, "fsrfg",
+                                nr.fgProf ? nr.fgEv[3] : nullptr))
                 return false;
             if (l1 && nr.grOfArmed)
                 nr.grOfArmed = cudaEventRecord(nr.fgOfEv[1], os) == cudaSuccess;
@@ -10370,9 +10390,13 @@ static bool nativeFsrfgAheadVec(NativeRife& nr, int s, const uint8_t* prev, cons
         if (!nativeFsrfgChildVec(nr, nr.dFgMvR[s], nr.fgOfSt, t0, t1))
             return false;
     }
-    else if (!nativeFsrfgOfIn(nr, nr.fgOf2, prev, frame) ||
-             !nativeOfVecRun(nr, nr.fgOf2, 0, 1, nr.dFgMvR[s], nr.fgMvPitch, "fsrfg side vectors"))
-        return false;
+    else
+    {
+        int slotPrev = 0, slotCur = 1;
+        if (!nativeFsrfgOfIn(nr, nr.fgOf2, prev, frame, false, slotPrev, slotCur) ||
+            !nativeOfVecRun(nr, nr.fgOf2, slotPrev, slotCur, nr.dFgMvR[s], nr.fgMvPitch, "fsrfg side vectors"))
+            return false;
+    }
     if (cudaEventRecord(nr.fgEvVec[s], nr.fgOfSt) != cudaSuccess)
     {
         nr.die("fsrfg side vector event failed");
@@ -10432,6 +10456,11 @@ static bool nativeFsrfgPack(NativeRife& nr, const float* src, int n, bool sdr)
         return false;
     }
     nr.frSurfSdr[n] = sdr;
+    if (nr.fgOf.keepSrc == nr.dFrSurf[n]) // its ABGR8 copy in the Optical Flow's input slot is stale now
+    {
+        nr.fgOf.keepSlot = -1;
+        nr.fgOf.keepSrc = nullptr;
+    }
     return true;
 }
 
@@ -11657,6 +11686,31 @@ static size_t trtTensorBytes(nvinfer1::ICudaEngine* eng, const char* nm)
 // buffer for all eight splats (they are strictly sequential on the one stream): the widest is
 // the half level's gmC[0] + 1 planes, and the quarter / eighth levels need less
 // ((2 * gmC[1] + 1) / 4 and (2 * gmC[2] + 1) / 16 of a half plane at the stock 64/128/192).
+// GMFSS's eight contexts enqueue one after another on nr.stream (their aux streams join it at each enqueue's end), so
+// they share ONE activation block, the largest net's, instead of one each: set before the warm-up, so a whole-graph
+// capture records its address. SMV_GM_CTXSHARE=0 = each context its own (TensorRT's default).
+static bool nativeGmShareMemory(NativeRife& nr)
+{
+    int64_t need = 0, sum = 0;
+    for (int i = 0; i < kGmN; i++)
+    {
+        const int64_t b = nr.engGm[i]->getDeviceMemorySizeV2();
+        need = (std::max)(need, b);
+        sum += b;
+    }
+    if (need > 0 && cudaMalloc(&nr.dGmCtxMem, (size_t)need) != cudaSuccess)
+    {
+        LOG("native: gmfss shared activation block (%.0f MB) alloc failed\n", need / 1048576.0);
+        return false;
+    }
+    for (int i = 0; i < kGmN; i++)
+        nr.ctxGm[i]->setDeviceMemoryV2(nr.dGmCtxMem, need);
+    nr.gmCtxMemB = need;
+    LOG("native: gmfss contexts share one %.0f MB activation block (%.0f MB as eight)\n", need / 1048576.0,
+        sum / 1048576.0);
+    return true;
+}
+
 static bool nativeGmfssSetup(NativeRife& nr)
 {
     auto bad = [](const char* what) {
@@ -12314,6 +12368,8 @@ static bool nativeTrtInit(NativeRife& nr)
         bool same = g_resident && g_res.rt;
         for (int i = 0; i < kGmN && same; i++)
             same = g_res.engGm[i] && g_res.gmPath[i] == nr.gmPath[i];
+        const bool gmShare = lkEnv("SMV_GM_CTXSHARE") != "0";
+        nr.ctxUserMem = gmShare;
         if (same)
         {
             nr.rt = g_res.rt;
@@ -12342,6 +12398,9 @@ static bool nativeTrtInit(NativeRife& nr)
                     return false;
             }
         }
+        nr.ctxUserMem = false;
+        if (gmShare && !nativeGmShareMemory(nr))
+            return false;
         if (g_res.engRest)
         {
             delete g_res.engRest;
@@ -12618,6 +12677,21 @@ static void nativeFree(NativeRife& nr)
         delete nr.cfgRest;
         nr.cfgRest = nullptr;
     }
+    // a session whose runtime never became the resident one (its init failed after block0Ready / the Restore load had
+    // published an engine) takes those engines with it: an engine must not outlive the runtime that made it
+    if (nr.rt && nr.rt != g_res.rt)
+    {
+        if (g_res.engB0 && g_res.engB0 == nr.engB0)
+        {
+            g_res.engB0 = nullptr;
+            g_res.block0Path.clear();
+        }
+        if (g_res.engRest && g_res.engRest == nr.engRest)
+        {
+            g_res.engRest = nullptr;
+            g_res.restorePath.clear();
+        }
+    }
     if (nr.engRest && nr.engRest != g_res.engRest)
         delete nr.engRest;
     nr.engRest = nullptr;
@@ -12672,6 +12746,12 @@ static void nativeFree(NativeRife& nr)
         if (nr.engGm[i] && nr.engGm[i] != g_res.engGm[i])
             delete nr.engGm[i];
         nr.engGm[i] = nullptr;
+    }
+    if (nr.dGmCtxMem) // after the contexts that ran on it
+    {
+        cudaFree(nr.dGmCtxMem);
+        nr.dGmCtxMem = nullptr;
+        nr.gmCtxMemB = 0;
     }
     // the resident cache owns these in --resident mode (residentFree drops them); the
     // pointer compare keeps the non-resident teardown byte for byte
@@ -14707,9 +14787,7 @@ static bool nativeLiveNrInit(NativeRife& nr)
         nativeNrMotionFree(nr);
         LOG("live DLSS 5: motion vectors unavailable (%s)\n", err.c_str());
     }
-    const size_t plane = (size_t)nr.ph * nr.pw;
     NCHK(cudaMalloc((void**)&nr.dNrIo, (size_t)w * h * 8), "alloc dlss5 frame");
-    NCHK(cudaMalloc((void**)&nr.dNrLast, 3 * plane * sizeof(float)), "alloc dlss5 last output");
     NCHK(cudaMalloc((void**)&nr.dCapPrev, (size_t)nr.cw * nr.ch * (nr.hdr ? 8 : 4)), "alloc dlss5 reuse reference");
     nr.nrResetEvery = !nr.nrMotion || (GetEnvironmentVariableW(L"SMV_NR_RESET_EVERY", re, 8) && re[0] == L'1');
     nr.nrReuse = !(GetEnvironmentVariableW(L"SMV_NR_REUSE", ru, 8) && ru[0] == L'0');
@@ -15299,7 +15377,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     }
     if (nr.pfEv[0])
         cudaEventRecord(nr.pfEv[0], st);
-    // (2) read the shared capture texture; the event marks the exe's texture as free again
+    // (2) read the shared capture texture; the event marks the exe's texture as free again. Live DLSS 5's reuse
+    // test keeps the previous capture: the two buffers trade places and the new one lands in the older
+    if (nr.dCapPrev)
+        std::swap(nr.dCap, nr.dCapPrev);
     const size_t capRow = (size_t)nr.cw * (nr.hdr ? 8 : 4);
     if (cudaMemcpy2DFromArrayAsync(nr.dCap, capRow, nr.capArr, 0, 0, capRow, nr.ch, cudaMemcpyDeviceToDevice, st) !=
         cudaSuccess)
@@ -15314,12 +15395,16 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // (native DRBA keeps its own history ring, so it skips this). dX's halves trade roles (xSwap) unless an IFNet reads
     // dX itself as its x, one tensor with prev in planes 0..2: then the cur half is copied into the prev half
     const size_t mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
+    bool halvesTraded = false; // the cur half now holds the frame before the previous one
     if (nr.havePrev && !nr.noEngine && !nr.drba)
     {
         if (!nr.gmfss && !nr.nvof && !nr.fruc && !nr.mph && !nr.xHalf)
             cudaMemcpyAsync(nr.dX, nr.dX + 3 * plane, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st);
         else
+        {
             nr.xSwap = !nr.xSwap;
+            halvesTraded = true;
+        }
         // the frames the IFNet reads keep the same two frames: the motion frames, or the fp16 copy an
         // fp16-x IFNet reads
         if (nr.mph)
@@ -15352,17 +15437,14 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             }
             nrSame = *nr.hStaticFlag == 0;
         }
-        if (cudaMemcpyAsync(nr.dCapPrev, nr.dCap, (size_t)nb, cudaMemcpyDeviceToDevice, st) != cudaSuccess)
-        {
-            nr.die("DLSS 5 reuse reference copy failed");
-            return false;
-        }
         if (nrSame)
         {
-            // the motion frame of an identical capture is the previous one (the shift put it in the prev
-            // half; DRBA's push copies it inside its ring)
-            if (cudaMemcpyAsync(dCur, nr.dNrLast, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) !=
-                    cudaSuccess ||
+            // the last output is the previous frame's cur half, read only since: it is still the cur half where
+            // nothing moved it (the copy shift, echo, DRBA) and the prev half where the halves traded places. The
+            // motion frame of an identical capture is the previous one (the shift put it in the prev half; DRBA's
+            // push copies it inside its ring)
+            if ((halvesTraded && cudaMemcpyAsync(dCur, nativeXPrev(nr), 3 * plane * sizeof(float),
+                                                 cudaMemcpyDeviceToDevice, st) != cudaSuccess) ||
                 (nr.mph && nr.havePrev && !nr.drba &&
                  cudaMemcpyAsync(nr.dM + 3 * mplane, nr.dM, 3 * mplane * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
                                  st) != cudaSuccess))
@@ -15617,14 +15699,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         return false;
     }
     if (nr.liveNr && !nr.nrFailed && !nrSame)
-    {
-        if (cudaMemcpyAsync(nr.dNrLast, dCur, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess)
-        {
-            nr.die("DLSS 5 last output copy failed");
-            return false;
-        }
         nr.nrHaveLast = true;
-    }
 
     // native DRBA: the new frame and its encode into the history ring; the group then shows
     // the LAGGED frame k - 1 as its real frame (the first capture: itself, one slot, exactly

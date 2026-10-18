@@ -1563,10 +1563,70 @@ static int runOffline(int argc, wchar_t** argv)
     return runOfflineSession(oa, GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), false);
 }
 
+// runs f when the scope ends, whichever return leaves it
+template <class F> struct OnReturn
+{
+    F f;
+    ~OnReturn()
+    {
+        f();
+    }
+};
+
 // one render: frames in on hIn, out on hOut (the process stdio, or the resident host's frame
 // pipes; namedPipes = flush hOut before closing it, a named pipe discards unread data otherwise)
 static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, bool namedPipes)
 {
+    NativeRife nr;
+    uint8_t* dRaw[2]{};
+    uint8_t* dOutRaw = nullptr;
+    OfflineIo io;
+    uint8_t* dDgRgba = nullptr;
+    float* dDgF = nullptr;
+    uint8_t* hDgIn[2]{};
+    uint8_t* hDgOut = nullptr;
+    bool outClosed = false; // the run's end closed hOut (EOF to the encoder)
+    // A resident offline host outlives a failed item, so every return frees what the item made: the
+    // DLSS 5 handoff, the frame buffers, the session (nativeFree) and hOut, which the caller leaves to
+    // this function.
+    OnReturn freeItem{[&] {
+        if (namedPipes && !outClosed)
+            CloseHandle(hOut);
+        if (!nr.stream)
+            return; // the stream is the item's first CUDA object: nothing CUDA was made before it
+        if (nr.nrHost)
+        {
+            cudaDeviceSynchronize(); // the last fence wait has run before its semaphore goes
+            nativeNrMotionFree(nr);
+            nativeNrReleaseImports(nr);
+            nr.nrHost->abandon(); // no NGX release chain (it faults); the process exits after this item
+        }
+        cudaFree(nr.dNrIo);
+        cudaFree(nr.dRawPrev);
+        cudaFreeHost(nr.hNrIn);
+        cudaFreeHost(nr.hNrOut);
+        for (size_t i = 0; i < io.hIn.size(); i++)
+        {
+            if (io.h2dEv[i])
+                cudaEventDestroy(io.h2dEv[i]);
+            cudaFreeHost(io.hIn[i]);
+        }
+        for (size_t i = 0; i < io.hOut.size(); i++)
+        {
+            if (io.outEv[i])
+                cudaEventDestroy(io.outEv[i]);
+            cudaFreeHost(io.hOut[i]);
+        }
+        cudaFree(dRaw[0]);
+        cudaFree(dRaw[1]);
+        cudaFree(dOutRaw);
+        cudaFree(dDgRgba);
+        cudaFree(dDgF);
+        cudaFreeHost(hDgIn[0]);
+        cudaFreeHost(hDgIn[1]);
+        cudaFreeHost(hDgOut);
+        nativeFree(nr);
+    }};
     int w = oa.w, h = oa.h; // not const: kernel argument arrays take their addresses as void*
     // The passes at the working size (--work-w / --work-h, the DLSS mode x the output): the
     // decoded frame (srcW x srcH) goes through Restore and the resize to the working size first, the
@@ -1624,7 +1684,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     exeDir.resize(exeDir.find_last_of(L'\\'));
     const std::wstring script = engineScript(exeDir);
 
-    NativeRife nr;
     if (!nativeLoadDlls(script))
     {
         LOG("offline: runtime DLLs unavailable\n");
@@ -1864,8 +1923,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     const bool sameFmt = (outIs16 == fmt16);
     const size_t frameBytes = (size_t)srcW * srcH * (fmt16 ? 6 : 3);                       // input frame
     const size_t frameBytesOut = (size_t)outW * outH * (oa.outX2 ? 4 : (outIs16 ? 6 : 3)); // output frame
-    uint8_t* dRaw[2]{};
-    uint8_t* dOutRaw = nullptr;
     auto cm = [&](void** p, size_t n, const char* what) -> bool {
         if (cudaMalloc(p, n) != cudaSuccess)
         {
@@ -2014,13 +2071,21 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         LUID cudaLuid{}; // the core's device on the CUDA GPU's adapter, whatever GPU drives the display
         const bool haveLuid = nativeCudaLuid(cudaLuid);
         const int nrc = host->startup((uint32_t)w, (uint32_t)h, set, err, true, haveLuid ? &cudaLuid : nullptr);
+        // a decoded frame byte-identical to the previous one takes the previous frame's output
+        // instead of an evaluate, so a paused or held picture stays exactly still (the kept
+        // history would re-shade it a code or two every frame); SMV_NR_REUSE=0 = every frame
+        // evaluated
+        wchar_t ru[8]{};
+        const bool nrReuse = !(GetEnvironmentVariableW(L"SMV_NR_REUSE", ru, 8) && ru[0] == L'0');
         if (nrc != 0)
         {
             LOG("[dlss5] unavailable, skipping: %s (exit %d)\n", err.c_str(), nrc);
             host->abandon(); // leaked on purpose, like every NGX object here
         }
+        // the identical-pair test's reference: with the reuse test on, that test decides every pair after the first
+        // frame, so only SMV_NR_REUSE=0 reads it
         else if (!cm((void**)&nr.dNrIo, (size_t)w * h * 8, "dlss5 frame") ||
-                 !cm((void**)&nr.dRawPrev, 3 * plane * sizeof(float), "dlss5 pair reference"))
+                 (!nrReuse && !cm((void**)&nr.dRawPrev, 3 * plane * sizeof(float), "dlss5 pair reference")))
         {
             LOG("offline: DLSS 5 buffers failed\n");
             return 2;
@@ -2041,12 +2106,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             // pure function of its input, so a route gate can compare it frame by frame
             wchar_t re[8]{};
             nr.nrResetEvery = GetEnvironmentVariableW(L"SMV_NR_RESET_EVERY", re, 8) && re[0] == L'1';
-            // a decoded frame byte-identical to the previous one takes the previous frame's output
-            // instead of an evaluate, so a paused or held picture stays exactly still (the kept
-            // history would re-shade it a code or two every frame); SMV_NR_REUSE=0 = every frame
-            // evaluated
-            wchar_t ru[8]{};
-            nr.nrReuse = !(GetEnvironmentVariableW(L"SMV_NR_REUSE", ru, 8) && ru[0] == L'0');
+            nr.nrReuse = nrReuse;
             // A handoff that cannot start falls back to staging with a line; the pass still runs, so
             // the line carries no [dlss5] tag (the preview reads that tag as "DLSS 5 not applied").
             // Motion that cannot start leaves the shared field at zero (no motion) with a line.
@@ -2090,7 +2150,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
     }
 
-    OfflineIo io;
     io.frameBytes = frameBytes;
     io.frameBytesOut = frameBytesOut;
     io.nIn = 4;
@@ -2136,10 +2195,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     // DLSS 4.5: the RGBA8 staging (device + pinned: the two latest frames and the pair's
     // generated frames), then the server itself; its handshake decides "up" vs "unsupported"
     DgChild dgc;
-    uint8_t* dDgRgba = nullptr;
-    float* dDgF = nullptr;
-    uint8_t* hDgIn[2]{};
-    uint8_t* hDgOut = nullptr;
     const size_t dgBytes = (size_t)nr.pw * nr.ph * 4;
     int dgHlg = oa.srcHdr == 2 ? 1 : 0; // HDR10 frames: the HLG picture goes as PQ and comes back as HLG
     if (oa.dlssg)
@@ -2534,7 +2589,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // come back a fraction of a level apart.
         if (nrOn && !nrSame)
         {
-            if (testPair && !pairTested)
+            if (testPair && !pairTested && nr.dRawPrev)
             {
                 if (!identicalPair(nr.dRawPrev, pairStatic))
                 {
@@ -2544,8 +2599,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 }
                 pairTested = true;
             }
-            if (cudaMemcpyAsync(nr.dRawPrev, dCur, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) !=
-                cudaSuccess)
+            if (nr.dRawPrev && cudaMemcpyAsync(nr.dRawPrev, dCur, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice,
+                                               st) != cudaSuccess)
             {
                 io.setFail("DLSS 5 pair reference copy failed");
                 failed = true;
@@ -3244,6 +3299,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     if (namedPipes)
         FlushFileBuffers(io.hStdout); // wait until the encoder has read everything
     CloseHandle(io.hStdout);          // EOF to the encoder
+    outClosed = true;
     bool ok = !failed && !io.fail;
     if (nr.rtxHdr)
     {
@@ -3267,42 +3323,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         if (nr.nrReused)
             LOG("offline: DLSS 5 reused its last output on %llu frames identical to the previous one\n",
                 (unsigned long long)nr.nrReused);
-        cudaDeviceSynchronize(); // the last fence wait has run before its semaphore goes
-        nativeNrMotionFree(nr);
-        nativeNrReleaseImports(nr);
-        nr.nrHost->abandon(); // no NGX release chain (it faults); the process exits after this item
-        cudaFree(nr.dNrIo);
-        cudaFree(nr.dRawPrev);
-        cudaFreeHost(nr.hNrIn);
-        cudaFreeHost(nr.hNrOut);
     }
     LOG("offline: %llu frames in, %llu out, %llu pairs, %.2f s, %.2f ms per pair%s\n", (unsigned long long)io.framesIn,
         (unsigned long long)io.framesOut, (unsigned long long)pairs, loopS,
         pairs ? loopS * 1000.0 / (double)pairs : 0.0, ok ? "" : " (FAILED)");
     if (heldPairs)
         LOG("static pairs held: %llu\n", (unsigned long long)heldPairs);
-    for (int i = 0; i < io.nIn; i++)
-    {
-        cudaEventDestroy(io.h2dEv[i]);
-        cudaFreeHost(io.hIn[i]);
-    }
-    for (int i = 0; i < io.nOut; i++)
-    {
-        cudaEventDestroy(io.outEv[i]);
-        cudaFreeHost(io.hOut[i]);
-    }
-    cudaFree(dRaw[0]);
-    cudaFree(dRaw[1]);
-    cudaFree(dOutRaw);
-    if (oa.dlssg)
-    {
-        cudaFree(dDgRgba);
-        cudaFree(dDgF);
-        cudaFreeHost(hDgIn[0]);
-        cudaFreeHost(hDgIn[1]);
-        cudaFreeHost(hDgOut);
-    }
-    nativeFree(nr);
     return ok ? 0 : failRc;
 }
 

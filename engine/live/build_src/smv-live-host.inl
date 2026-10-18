@@ -947,6 +947,13 @@ struct Host
         waitQueue();
         if (fenceEvent)
             CloseHandle(fenceEvent);
+        // the output ring's shared NT handle keeps the ring's video memory alive however the
+        // resource and the CUDA import are released (the server's stop dropped the import already)
+        if (hOutBuf)
+        {
+            CloseHandle(hOutBuf);
+            hOutBuf = nullptr;
+        }
         if (hwnd)
             DestroyWindow(hwnd);
         pumpMessages();

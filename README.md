@@ -32,6 +32,12 @@
 </p>
 
 <p align="center">
+  <img src="docs/demo-spiderman.webp" alt="Side by side: a fast live-action fight scene at its original 24 fps and interpolated to 60 fps" width="880"><br>
+  <sub><b>Live action, too.</b> 14 seconds from <a href="https://en.wikipedia.org/wiki/Spider-Man:_Brand_New_Day"><i>Spider-Man: Brand New Day</i></a> (2026), downscaled. Left: the source frames at 24 fps, no interpolation. Right: Smooth My Video's 60 fps render with the default GMFSS model, drawing the frames in between through motion blur, flying debris and web lines.</sub><br>
+  <sub><i>&copy; 2026 Columbia Pictures (Sony Pictures) and Marvel Studios</i></sub>
+</p>
+
+<p align="center">
   <img src="docs/demo-pan.webp" alt="Side by side: the same anime-style panning shot at 10 fps and interpolated to 60 fps" width="880"><br>
   <sub><b>Slow pans, too.</b> Left: an anime-style pan at 10 fps (drawn procedurally for this README), the cadence anime pans are actually drawn at. Right: interpolated 6&times; to 60 fps. Every original frame passes through untouched; the AI draws only the frames in between.</sub>
 </p>
@@ -310,7 +316,8 @@ by, or certified by HDR10+ Technologies. HDR10+ metadata is injected by the sepa
 open-source [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool); no HDR10+ LLC software is bundled
 or redistributed.</sub>
 
-<sub>The anime demo clip above (`docs/demo-fight.webp`) is a short excerpt used only to show what Smooth My Video
-does. The footage belongs to its copyright holders, credited under the clip, and is not covered by this project's MIT
-license; Smooth My Video is not affiliated with or endorsed by them. Rights holders who want the clip removed can
-[open an issue](https://github.com/flowreen/SmoothMyVideo/issues) and it will be taken down promptly.</sub>
+<sub>The anime and film demo clips above (`docs/demo-fight.webp`, `docs/demo-spiderman.webp`) are short excerpts used
+only to show what Smooth My Video does. The footage belongs to its copyright holders, credited under each clip, and is
+not covered by this project's MIT license; Smooth My Video is not affiliated with or endorsed by them. Rights holders
+who want a clip removed can [open an issue](https://github.com/flowreen/SmoothMyVideo/issues) and it will be taken
+down promptly.</sub>
