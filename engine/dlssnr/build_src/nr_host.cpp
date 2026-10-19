@@ -27,8 +27,8 @@ namespace nr
 // i.e. the snippet asks Windows for its caller module's file name and checks the
 // basename. We do the same to our OWN process, loading a DLL the user supplied:
 // replace GetModuleFileName{W,A} in the snippet's import table with a thunk that,
-// for the snippet's queries, reports an allowed basename (SMV_NR_SPOOF, default
-// nvngx.dll = our shim). SMV_NR_NOHOOK disables it, SMV_NR_HOOKLOG traces queries.
+// for the snippet's queries, reports an allowed basename (nvngx.dll = our shim).
+// SMV_NR_NOHOOK disables it, SMV_NR_HOOKLOG traces queries.
 // ---------------------------------------------------------------------------
 typedef DWORD(WINAPI* PFN_GMFNW)(HMODULE, LPWSTR, DWORD);
 typedef DWORD(WINAPI* PFN_GMFNA)(HMODULE, LPSTR, DWORD);
@@ -51,8 +51,7 @@ static std::string envValue(const char* name)
 
 static std::string spoofName()
 {
-    const std::string s = envValue("SMV_NR_SPOOF");
-    return s.empty() ? std::string("nvngx.dll") : s;
+    return "nvngx.dll";
 }
 static bool hookLog()
 {
@@ -509,16 +508,23 @@ bool Host::createResources(std::string& err)
     td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-    if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
-                                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                              IID_PPV_ARGS(&m_color))))
+    // Color, Output and MVec on a shared heap, so the zero-copy handoff hands CUDA the textures
+    // themselves (startShared); a driver that refuses one gets private textures and CPU staging
+    m_texShared = true;
+    auto texture = [&](const D3D12_RESOURCE_DESC& d, D3D12_RESOURCE_STATES s, CP<ID3D12Resource>& r) {
+        if (m_texShared &&
+            SUCCEEDED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_SHARED, &d, s, nullptr, IID_PPV_ARGS(&r))))
+            return true;
+        m_texShared = false;
+        return SUCCEEDED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &d, s, nullptr, IID_PPV_ARGS(&r)));
+    };
+    if (!texture(td, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, m_color))
     {
         err = "CreateCommittedResource(color) failed";
         return false;
     }
 
-    if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                              nullptr, IID_PPV_ARGS(&m_output))))
+    if (!texture(td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, m_output))
     {
         err = "CreateCommittedResource(output) failed";
         return false;
@@ -540,16 +546,11 @@ bool Host::createResources(std::string& err)
         D3D12_RESOURCE_DESC md = td;
         md.Format = DXGI_FORMAT_R16G16_FLOAT;
         md.Flags = D3D12_RESOURCE_FLAG_NONE;
-        if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &md,
-                                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                                  IID_PPV_ARGS(&m_mv))))
+        if (!texture(md, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, m_mv))
         {
             err = "CreateCommittedResource(motion) failed";
             return false;
         }
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT mfp = {};
-        m_dev->GetCopyableFootprints(&md, 0, 1, 0, &mfp, nullptr, nullptr, nullptr);
-        m_mvPitch = mfp.Footprint.RowPitch;
     }
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
@@ -983,12 +984,16 @@ bool Host::renderFrame(const void* src, void* dst, bool reset, std::string& err)
     srcLoc.PlacedFootprint.Footprint.Depth = 1;
     srcLoc.PlacedFootprint.Footprint.RowPitch = (UINT)m_rowPitch;
 
-    D3D12_RESOURCE_BARRIER b =
-        transition(m_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    // a started handoff left the textures in COMMON (its import may have failed after startShared)
+    D3D12_RESOURCE_BARRIER b = transition(
+        m_color.Get(), m_shared ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
     m_list->ResourceBarrier(1, &b);
     m_list->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
     b = transition(m_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     m_list->ResourceBarrier(1, &b);
+    if (m_shared)
+        sharedStates(m_list.Get(), true, false);
 
     if (!evaluateOn(m_list.Get(), reset, err))
     {
@@ -1007,6 +1012,8 @@ bool Host::renderFrame(const void* src, void* dst, bool reset, std::string& err)
     m_list->CopyTextureRegion(&outDst, 0, 0, 0, &outSrc, nullptr);
     b = transition(m_output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_list->ResourceBarrier(1, &b);
+    if (m_shared)
+        sharedStates(m_list.Get(), false, true);
 
     if (!runCommandList(err))
         return false;
@@ -1038,12 +1045,26 @@ LUID Host::adapterLuid() const
 
 void Host::closeSharedHandles()
 {
-    for (HANDLE* h : {&m_shInH, &m_shOutH, &m_shFenceH, &m_shMvH})
+    for (HANDLE* h : {&m_colorH, &m_outputH, &m_mvH, &m_shFenceH})
         if (*h)
         {
             CloseHandle(*h);
             *h = nullptr;
         }
+}
+
+void Host::sharedStates(ID3D12GraphicsCommandList* list, bool toWork, bool color)
+{
+    const D3D12_RESOURCE_STATES c = D3D12_RESOURCE_STATE_COMMON, r = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                u = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_RESOURCE_BARRIER b[3];
+    int n = 0;
+    if (color)
+        b[n++] = transition(m_color.Get(), toWork ? c : r, toWork ? r : c);
+    if (m_mv)
+        b[n++] = transition(m_mv.Get(), toWork ? c : r, toWork ? r : c);
+    b[n++] = transition(m_output.Get(), toWork ? c : u, toWork ? u : c);
+    list->ResourceBarrier(n, b);
 }
 
 bool Host::startShared(std::string& err)
@@ -1053,29 +1074,9 @@ bool Host::startShared(std::string& err)
         err = "the shared handoff needs a started host";
         return false;
     }
-    const D3D12_RESOURCE_DESC td = m_color->GetDesc();
-    UINT64 total = 0;
-    m_dev->GetCopyableFootprints(&td, 0, 1, 0, nullptr, nullptr, nullptr, &total);
-
-    D3D12_HEAP_PROPERTIES def = {};
-    def.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC bd = {};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = total;
-    bd.Height = 1;
-    bd.DepthOrArraySize = 1;
-    bd.MipLevels = 1;
-    bd.Format = DXGI_FORMAT_UNKNOWN;
-    bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    // Shared resources start in COMMON: a buffer promotes to COPY_SOURCE / COPY_DEST implicitly
-    // and decays back to COMMON when its list completes, the state CUDA reads and writes it in.
-    if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_SHARED, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                              IID_PPV_ARGS(&m_shIn))) ||
-        FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_SHARED, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                              IID_PPV_ARGS(&m_shOut))))
+    if (!m_texShared)
     {
-        err = "shared buffer creation failed";
+        err = "the driver made no shareable textures";
         return false;
     }
     if (FAILED(m_dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&m_shFence))))
@@ -1083,31 +1084,23 @@ bool Host::startShared(std::string& err)
         err = "shared fence creation failed";
         return false;
     }
-    if (FAILED(m_dev->CreateSharedHandle(m_shIn.Get(), nullptr, GENERIC_ALL, nullptr, &m_shInH)) ||
-        FAILED(m_dev->CreateSharedHandle(m_shOut.Get(), nullptr, GENERIC_ALL, nullptr, &m_shOutH)) ||
+    if (FAILED(m_dev->CreateSharedHandle(m_color.Get(), nullptr, GENERIC_ALL, nullptr, &m_colorH)) ||
+        FAILED(m_dev->CreateSharedHandle(m_output.Get(), nullptr, GENERIC_ALL, nullptr, &m_outputH)) ||
+        (m_mv && FAILED(m_dev->CreateSharedHandle(m_mv.Get(), nullptr, GENERIC_ALL, nullptr, &m_mvH))) ||
         FAILED(m_dev->CreateSharedHandle(m_shFence.Get(), nullptr, GENERIC_ALL, nullptr, &m_shFenceH)))
     {
         closeSharedHandles();
         err = "shared handle creation failed";
         return false;
     }
-    if (m_mv)
-    {
-        const D3D12_RESOURCE_DESC md = m_mv->GetDesc();
-        UINT64 mtotal = 0;
-        m_dev->GetCopyableFootprints(&md, 0, 1, 0, nullptr, nullptr, nullptr, &mtotal);
-        D3D12_RESOURCE_DESC mb = bd;
-        mb.Width = mtotal;
-        if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_SHARED, &mb, D3D12_RESOURCE_STATE_COMMON,
-                                                  nullptr, IID_PPV_ARGS(&m_shMv))) ||
-            FAILED(m_dev->CreateSharedHandle(m_shMv.Get(), nullptr, GENERIC_ALL, nullptr, &m_shMvH)))
-        {
-            closeSharedHandles();
-            err = "shared motion buffer creation failed";
-            return false;
-        }
-        m_shMvBytes = mtotal;
-    }
+    // a dedicated import takes the texture's whole allocation, not its copy footprint
+    auto bytes = [&](ID3D12Resource* r) {
+        const D3D12_RESOURCE_DESC d = r->GetDesc();
+        return (uint64_t)m_dev->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
+    };
+    m_colorBytes = bytes(m_color.Get());
+    m_outputBytes = bytes(m_output.Get());
+    m_mvBytes = m_mv ? bytes(m_mv.Get()) : 0;
     for (int k = 0; k < kSharedLists; ++k)
     {
         if (FAILED(m_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_shAlloc[k]))) ||
@@ -1122,13 +1115,26 @@ bool Host::startShared(std::string& err)
         m_shDone[k] = 0;
     }
     m_shNext = 0;
-    m_shBytes = total;
+    // the textures rest in COMMON from here on
+    if (FAILED(m_alloc->Reset()) || FAILED(m_list->Reset(m_alloc.Get(), nullptr)))
+    {
+        closeSharedHandles();
+        err = "command list Reset failed";
+        return false;
+    }
+    sharedStates(m_list.Get(), false, true);
+    if (!runCommandList(err))
+    {
+        closeSharedHandles();
+        return false;
+    }
+    m_shared = true;
     return true;
 }
 
 bool Host::submitShared(bool reset, uint64_t waitValue, uint64_t signalValue, std::string& err)
 {
-    if (!m_shBytes)
+    if (!m_shared)
     {
         err = "the shared handoff is not started";
         return false;
@@ -1154,57 +1160,15 @@ bool Host::submitShared(bool reset, uint64_t waitValue, uint64_t signalValue, st
         return false;
     }
 
-    D3D12_TEXTURE_COPY_LOCATION tex = {};
-    tex.pResource = m_color.Get();
-    tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    tex.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION buf = {};
-    buf.pResource = m_shIn.Get();
-    buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    buf.PlacedFootprint.Offset = 0;
-    buf.PlacedFootprint.Footprint.Format = kFmt;
-    buf.PlacedFootprint.Footprint.Width = m_w;
-    buf.PlacedFootprint.Footprint.Height = m_h;
-    buf.PlacedFootprint.Footprint.Depth = 1;
-    buf.PlacedFootprint.Footprint.RowPitch = (UINT)m_rowPitch;
-
-    D3D12_RESOURCE_BARRIER b =
-        transition(m_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->ResourceBarrier(1, &b);
-    list->CopyTextureRegion(&tex, 0, 0, 0, &buf, nullptr);
-    b = transition(m_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    list->ResourceBarrier(1, &b);
-    if (m_shMv)
-    {
-        // this frame's motion field, written by the caller before the fence value the queue waits for
-        D3D12_TEXTURE_COPY_LOCATION mTex = tex;
-        mTex.pResource = m_mv.Get();
-        D3D12_TEXTURE_COPY_LOCATION mBuf = buf;
-        mBuf.pResource = m_shMv.Get();
-        mBuf.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
-        mBuf.PlacedFootprint.Footprint.RowPitch = (UINT)m_mvPitch;
-        b = transition(m_mv.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->ResourceBarrier(1, &b);
-        list->CopyTextureRegion(&mTex, 0, 0, 0, &mBuf, nullptr);
-        b = transition(m_mv.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        list->ResourceBarrier(1, &b);
-    }
-
+    // the caller wrote Color (and MVec) before the fence value the queue waits for and reads Output
+    // after the one it signals
+    sharedStates(list, true, true);
     if (!evaluateOn(list, reset, err))
     {
         list->Close();
         return false;
     }
-
-    b = transition(m_output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->ResourceBarrier(1, &b);
-    D3D12_TEXTURE_COPY_LOCATION outTex = tex;
-    outTex.pResource = m_output.Get();
-    D3D12_TEXTURE_COPY_LOCATION outBuf = buf;
-    outBuf.pResource = m_shOut.Get();
-    list->CopyTextureRegion(&outBuf, 0, 0, 0, &outTex, nullptr);
-    b = transition(m_output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    list->ResourceBarrier(1, &b);
+    sharedStates(list, false, true);
     if (FAILED(list->Close()))
     {
         err = "command list Close failed";
@@ -1243,12 +1207,9 @@ void Host::shutdown()
         m_shList[k].Reset();
         m_shAlloc[k].Reset();
     }
-    m_shIn.Reset();
-    m_shOut.Reset();
     m_shFence.Reset();
-    m_shMv.Reset();
-    m_shBytes = 0;
-    m_shMvBytes = 0;
+    m_shared = false;
+    m_colorBytes = m_outputBytes = m_mvBytes = 0;
     closeSharedHandles();
     m_readback.Reset();
     m_upload.Reset();
@@ -1288,12 +1249,9 @@ void Host::abandon()
         m_shList[k].Reset();
         m_shAlloc[k].Reset();
     }
-    m_shIn.Reset();
-    m_shOut.Reset();
     m_shFence.Reset();
-    m_shMv.Reset();
-    m_shBytes = 0;
-    m_shMvBytes = 0;
+    m_shared = false;
+    m_colorBytes = m_outputBytes = m_mvBytes = 0;
     closeSharedHandles();
     m_readback.Reset();
     m_upload.Reset();

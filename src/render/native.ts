@@ -163,7 +163,12 @@ function gpuDriverId(): Promise<string> {
 /** The most DLSS 4.5 makes in one pass on this GPU and driver = Streamline's numFramesToGenerateMax + 1 (the host's
  * `server max N` line): one 2-frame 256x128 render the first time, then dlssg_limit.json in the engine cache, keyed
  * by the GPU and driver; 0 = unknown. SMV_DLSSG_LIMIT=2..6 sets it (tests). */
-async function dlssgLimit(exe: string, engine: string, cacheDir: string, env: NodeJS.ProcessEnv): Promise<number> {
+export async function dlssgLimit(
+  exe: string,
+  engine: string,
+  cacheDir: string,
+  env: NodeJS.ProcessEnv,
+): Promise<number> {
   const forced = parseInt(env.SMV_DLSSG_LIMIT || '', 10);
   if (forced >= 2 && forced <= 6) return forced;
   const id = await gpuDriverId();
@@ -276,12 +281,11 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     FSRFG_MODE = args.fsrfg,
     DLSSG_MODE = args.dlssg;
   const RIFE_MODE = args.rife || args.rife_drba,
-    DRBA_MODE = args.rife_drba,
-    LSFG_MODE = args.lsfg;
+    DRBA_MODE = args.rife_drba;
   const NVOF_MODE = args.nvof;
-  if ([FRUC_MODE, FSRFG_MODE, DLSSG_MODE, RIFE_MODE, LSFG_MODE, NVOF_MODE].filter(Boolean).length > 1) {
+  if ([FRUC_MODE, FSRFG_MODE, DLSSG_MODE, RIFE_MODE, NVOF_MODE].filter(Boolean).length > 1) {
     throw new RenderExit(
-      '--fruc, --fsrfg, --dlssg, --rife/--rife-drba, --lsfg and --nvof are ' +
+      '--fruc, --fsrfg, --dlssg, --rife/--rife-drba and --nvof are ' +
         'mutually exclusive interpolation backends; pick one',
     );
   }
@@ -450,7 +454,6 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   else if (DLSSG_MODE) say('Using the DLSS Frame Generation backend for interpolation (DLSS 4.5)\n');
   else if (NVOF_MODE) say('Using the NVIDIA Optical Flow backend for interpolation (native host)\n');
   else if (RIFE_MODE) say('Using the RIFE backend for interpolation (4.26 heavy, native host)\n');
-  else if (LSFG_MODE) say('Using the Frame Blend backend for interpolation (RIFE 4.26 heavy flow, native host)\n');
   if (kind === 'gmfss') say('Using the GMFSS backend for interpolation (native host)\n');
 
   // RTX HDR / DV / HDR10+ (render.py's upscale / HDR backend block, native half)
@@ -526,7 +529,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
         structure: clamp(args.nr_structure, 0.0, 2.0),
         tone: clamp(args.nr_tone, 0.0, 2.0),
         style: [0, 1, 2].includes(args.nr_style) ? args.nr_style : 0,
-        passes: Math.min(10, Math.max(1, Math.round(args.nr_passes ?? 1))),
+        passes: Math.min(20, Math.max(1, Math.round(args.nr_passes ?? 1))),
       };
   }
 

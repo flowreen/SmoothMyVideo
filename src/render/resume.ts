@@ -72,7 +72,12 @@ const OPTS: Record<string, Spec> = {
   '--nr-structure': { dest: 'nr_structure', kind: 'float', def: 1.0 },
   '--nr-tone': { dest: 'nr_tone', kind: 'float', def: 1.0 },
   '--nr-style': { dest: 'nr_style', kind: 'int', def: 0, choices: [0, 1, 2] },
-  '--nr-passes': { dest: 'nr_passes', kind: 'int', def: 1, choices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] },
+  '--nr-passes': {
+    dest: 'nr_passes',
+    kind: 'int',
+    def: 1,
+    choices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+  },
   '--hdr-saturation': { dest: 'hdr_saturation', kind: 'int', def: 0 },
   '--hdr-contrast': { dest: 'hdr_contrast', kind: 'int', def: 100 },
   '--hdr-color': { dest: 'hdr_color', kind: 'str', def: 'vivid', choices: ['vivid', 'rtx', 'raw'] },
@@ -83,7 +88,6 @@ const OPTS: Record<string, Spec> = {
   '--dlssg': { dest: 'dlssg', kind: 'bool', def: false },
   '--rife': { dest: 'rife', kind: 'bool', def: false },
   '--rife-drba': { dest: 'rife_drba', kind: 'bool', def: false },
-  '--lsfg': { dest: 'lsfg', kind: 'bool', def: false },
   '--nvof': { dest: 'nvof', kind: 'bool', def: false },
 };
 const POS: Spec[] = [
@@ -171,10 +175,8 @@ function pyMtimeInt(p: string): number {
   return Math.trunc(Number(ns / 1000000000n) + Number(ns % 1000000000n) * 1e-9);
 }
 
-/** render.py _resume_sig: sha1 of json.dumps(vars(args) + the source identity + SMV_CQ + the
- * effective NVENC split mode, sort_keys=True). A mismatch means the partial video came from other
- * settings (a split-frame segment must never be concatenated onto an unsplit one, so the
- * effective mode is hashed). */
+/** render.py _resume_sig: sha1 of json.dumps(vars(args) + the source identity + SMV_CQ,
+ * sort_keys=True). A mismatch means the partial video came from other settings. */
 export function resumeSig(ns: ArgNs, env: Env = process.env): string {
   const inp = path.win32.resolve(ns.input as string);
   const d: Record<string, string> = {};
@@ -185,7 +187,6 @@ export function resumeSig(ns: ArgNs, env: Env = process.env): string {
   d.output = ns.output ? pyJsonDumps(winNormAbs(ns.output as string)) : 'null';
   d.__src = `[${pyJsonDumps(input)}, ${fs.statSync(inp).size}, ${pyMtimeInt(inp)}]`;
   d.__cq = pyJsonDumps(env.SMV_CQ || '');
-  d.__split = pyJsonDumps(env.SMV_NVENC_SPLIT || '15');
   const keys = Object.keys(d).sort();
   const text = '{' + keys.map((k) => pyJsonDumps(k) + ': ' + d[k]).join(', ') + '}';
   return createHash('sha1').update(text, 'utf8').digest('hex');

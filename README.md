@@ -22,7 +22,7 @@
   <a href="#picture">Picture</a> ·
   <a href="#file-renders">File renders</a> ·
   <a href="#live-mode">Live mode</a> ·
-  <a href="#command-line">Command line</a>
+  <a href="#under-the-hood">Under the hood</a>
 </p>
 
 <p align="center">
@@ -42,7 +42,7 @@
   <sub><b>Slow pans, too.</b> Left: an anime-style pan at 10 fps (drawn procedurally for this README), the cadence anime pans are actually drawn at. Right: interpolated 6&times; to 60 fps. Every original frame passes through untouched; the AI draws only the frames in between.</sub>
 </p>
 
-**Why it exists:** NVIDIA's RTX Video (AI upscaling + TrueHDR) is gorgeous but playback-only: it enhances what you
+**Why it exists:** NVIDIA's RTX Video (AI upscaling + RTX HDR) is gorgeous but playback-only: it enhances what you
 watch, then throws it away. Smooth My Video applies those same RTX passes, plus AI frame interpolation, straight to
 your file, so the result is saved, not just streamed.
 
@@ -113,6 +113,14 @@ enhance the picture, without adding frames. Hover a row in the app to see its ex
 | **NVIDIA DLSS 4.5** (DLSS Frame Generation) | NVIDIA's game frame generation, on video | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | Whole multipliers only. Past the GPU's limit (6&times; on an RTX 50, 2&times; on an RTX 40) it goes multi-pass, e.g. 12&times; = 6&times; then 2&times;. |
 | **AMD FSR 4** frame generation | A different AI look | Any RTX GPU | AMD's AI frame generation, running on NVIDIA GPUs. Fine edges can break up on fast anime motion, where GMFSS stays clean. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
 | **NVIDIA Smooth Motion** | Legacy: a non-AI reference | Any RTX GPU | The same technology as the NVIDIA driver's Smooth Motion. The lowest quality of the models. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
+
+**Compare to**, in the preview, puts the model you ticked next to another one on the same moment of your video: the
+real frames before and after on the left, each model's new frame between them on the right. Step through the new
+frames with **&lsaquo; &rsaquo;**, click to zoom all four pictures together, and hold **Space** to swap the two
+models. **Save image** keeps what you see; **Save clip** saves the next second as a lossless video of the four
+pictures, every frame, to step through in a player.
+
+<img src="docs/compare.webp" alt="Compare: the real frames 317 and 318 of a fight scene on the left, GMFSS's and NVIDIA DLSS 4.5's new frame halfway between them on the right. GMFSS draws her face once and clean; DLSS 4.5 doubles it but keeps the sparks and light beams crisp" width="100%">
 
 ## Picture
 
@@ -233,7 +241,7 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
 * **Where:** after Restore and the resize, at the output size up to 4K (in Live, at the DLSS mode's size).
 * **How:** fed the way games feed it, so it follows the motion, and a paused picture stays perfectly still.
 * **Controls:** NVIDIA's three looks as a **Style** selector (Default, Natural, Cinematic; Default is preselected),
-  **Structure Intensity** and **Tone Intensity** sliders, and **Passes** (1 to 10): DLSS 5 again on its own result,
+  **Structure Intensity** and **Tone Intensity** sliders, and **Passes** (1 to 20): DLSS 5 again on its own result,
   for a stronger effect at that many times the time and video memory.
 * **The download:** NVIDIA's Neural Rendering file (`nvngx_dlssnr.dll`) isn't included, and NVIDIA offers no download for it.
   The one-click **Download the DLSS 5 runtime** button fetches the community RTX 40 + 50 build
@@ -252,21 +260,18 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
   plus the track counts when there is more than one audio track or any subtitle.
 * A quiet one-line notice appears when a newer release is out (nothing auto-downloads).
 
-## Command line
-
-File renders also run without the window: `node dist\render\cli.js <input> <multiplier> [output] [flags]` takes the
-same settings the GUI builds (plus a few extras, such as the Frame Blend model and a working-size setting for file
-renders), and the native host can start Live on a window by its title. See
-**[DEVELOPMENT.md](DEVELOPMENT.md)** for every flag.
-
 ## Under the hood
 
 The UI is Electron + TypeScript. Every render and Live session runs in one native host (`smv-live.exe`, C++ on
 TensorRT for RTX and CUDA), driven by a TypeScript orchestrator that handles probing, encoding (ffmpeg) and resume;
-DLSS 4.5 file renders run NVIDIA's frame generation in a small separate helper. No Python ships. The default model, **GMFSS_Fortuna**, is a "union" interpolator: GMFlow optical flow, an IFNet/RIFE refiner,
-plus MetricNet, FeatureNet, FusionNet and softsplat warping.
+DLSS 4.5 file renders run NVIDIA's frame generation in a small separate helper. No Python ships. The default model,
+**GMFSS_Fortuna**, is a "union" interpolator: GMFlow optical flow, an IFNet/RIFE refiner, plus MetricNet, FeatureNet,
+FusionNet and softsplat warping.
 
-📖 **Build it, hack on it, or read the design rationale: [DEVELOPMENT.md](DEVELOPMENT.md)**
+File renders also run without the window: `node dist\render\cli.js <input> <multiplier> [output] [flags]` takes the
+same settings the GUI builds, and the native host can start Live on a window by its title.
+
+📖 **Every flag, the build and the design rationale: [DEVELOPMENT.md](DEVELOPMENT.md)**
 
 ## Contributing
 

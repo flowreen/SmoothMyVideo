@@ -48,6 +48,10 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <thread>
 
 #include <sl.h>
@@ -1244,6 +1248,100 @@ static int slInitCommon()
     return 0;
 }
 
+// --server's frame buffers: the server thread's set (raw = the captured presents, outFrames = the sweep tier's copies)
+// and the pair writer's set; the two trade places at every hand-over (a vector swap keeps every frame's address)
+struct ServerFrames
+{
+    std::vector<std::vector<uint8_t>> raw, rawW, outFrames, outFramesW;
+};
+
+// --server's pair writer: one thread streams a pair's generated frames to stdout while the server thread reads the
+// next input frame and presents it, so the pipe transfer leaves the present-to-present interval DLSS-G paces over.
+// post() hands over the frame pointers of a buffer set the server thread no longer touches; it waits for the previous
+// pair to be written first, so the frames leave in order. A failed write is logged once (the host's read of the pair
+// fails and restarts the server, as before). The thread holds the writer and the frames (keep), so a writer an early
+// return leaves blocked on a host that stopped reading never touches freed memory before the process exits.
+struct PairWriter : std::enable_shared_from_this<PairWriter>
+{
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<const uint8_t*> src;
+    size_t bytes = 0;
+    bool busy = false, quit = false, failed = false;
+    std::shared_ptr<ServerFrames> keep;
+    std::thread th;
+
+    void start()
+    {
+        th = std::thread([self = shared_from_this()] { self->run(); });
+    }
+    void run()
+    {
+        for (;;)
+        {
+            std::unique_lock<std::mutex> lk(m);
+            cv.wait(lk, [&] { return busy || quit; });
+            if (!busy)
+                return;
+            const std::vector<const uint8_t*> s = src;
+            const size_t n = bytes;
+            lk.unlock();
+            bool ok = true;
+            for (const uint8_t* p : s)
+                ok = ok && fwrite(p, 1, n, stdout) == n;
+            ok = fflush(stdout) == 0 && ok;
+            lk.lock();
+            if (!ok && !failed)
+            {
+                failed = true;
+                LOG("the output pipe write failed (the host stopped reading)\n");
+            }
+            busy = false;
+            cv.notify_all();
+        }
+    }
+    void waitIdle()
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return !busy; });
+    }
+    void post(const std::vector<const uint8_t*>& s, size_t n)
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return !busy; });
+        src = s;
+        bytes = n;
+        busy = true;
+        cv.notify_all();
+    }
+    // a normal end has waited for the last pair; an early return still lets the pair in flight reach the host (it
+    // reads that pair in either order, and a host that stopped reading fails the write), so a failure regenerates
+    // only the failing pair; a writer still blocked after 10 s (the host's watchdog) is left to the process exit
+    void finish()
+    {
+        bool idle;
+        {
+            std::unique_lock<std::mutex> lk(m);
+            idle = cv.wait_for(lk, std::chrono::seconds(10), [&] { return !busy; });
+            quit = true;
+        }
+        cv.notify_all();
+        if (idle)
+            th.join();
+        else
+            th.detach();
+    }
+};
+struct PairWriterGuard
+{
+    std::shared_ptr<PairWriter> w;
+    ~PairWriterGuard()
+    {
+        if (w && w->th.joinable())
+            w->finish();
+    }
+};
+
 static int runServer(int genFrames, bool hdr10)
 {
     Host host;
@@ -1257,20 +1355,33 @@ static int runServer(int genFrames, bool hdr10)
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 
-    // handshake so the driving process can distinguish "up" from "unsupported"
-    fprintf(stdout, "DLSSG READY gen=%d max=%u%s\n", genFrames, host.maxGen, host.hdr10 ? " hdr10=1" : "");
+    // handshake so the driving process can distinguish "up" from "unsupported"; wq=1 = the pair writer: the host may
+    // send the next frame before it reads this pair
+    fprintf(stdout, "DLSSG READY gen=%d max=%u%s wq=1\n", genFrames, host.maxGen, host.hdr10 ? " hdr10=1" : "");
     fflush(stdout);
 
     const size_t frameBytes = (size_t)W * H * 4;
     std::vector<uint8_t> inFrame(frameBytes), prevFrame(frameBytes);
-    std::vector<std::vector<uint8_t>> outFrames((size_t)genFrames, std::vector<uint8_t>(frameBytes));
-    std::vector<uint8_t*> outPtrs;
+    const auto frames = std::make_shared<ServerFrames>();
+    auto& raw = frames->raw; // the captured presents, buffers reused from pair to pair
+    auto& rawW = frames->rawW;
+    auto& outFrames = frames->outFrames;
+    auto& outFramesW = frames->outFramesW;
+    outFrames.assign((size_t)genFrames, std::vector<uint8_t>(frameBytes));
+    outFramesW.assign((size_t)genFrames, std::vector<uint8_t>(frameBytes));
+    std::vector<uint8_t*> outPtrs, outPtrsW;
     for (auto& f : outFrames)
         outPtrs.push_back(f.data());
+    for (auto& f : outFramesW)
+        outPtrsW.push_back(f.data());
     // the frames written: a captured present in raw (the counted tier) or an outFrames copy (the sweep tier)
     std::vector<const uint8_t*> outSrc((size_t)genFrames);
-    std::vector<std::vector<uint8_t>> raw; // the captured presents, buffers reused from pair to pair
     size_t rawN = 0;
+    const auto writerP = std::make_shared<PairWriter>();
+    writerP->keep = frames;
+    writerP->start();
+    PairWriterGuard writerGuard{writerP};
+    PairWriter& writer = *writerP;
 
     // wait until the pacer's native presents go quiet (used after warmup and after resyncs, so
     // leftover generated presents are never misattributed to the next pair's ledger)
@@ -1612,12 +1723,15 @@ static int runServer(int genFrames, bool hdr10)
         }
         lastPresentTick = GetTickCount64();
 
-        for (int i = 0; i < genFrames; i++)
-            fwrite(outSrc[i], 1, frameBytes, stdout);
-        fflush(stdout);
+        // the pair to the writer (after the previous one is written), then this thread takes the other buffer set
+        writer.post(outSrc, frameBytes);
+        raw.swap(rawW);
+        outFrames.swap(outFramesW);
+        outPtrs.swap(outPtrsW);
         emitted += genFrames;
         prevFrame.swap(inFrame);
     }
+    writer.waitIdle();
     if (resets)
         LOG("note: %llu DLSS-G pacer resets during this run\n", (unsigned long long)resets);
     LOG("server done, %llu interpolated frames\n", (unsigned long long)emitted);

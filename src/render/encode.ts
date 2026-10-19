@@ -278,7 +278,6 @@ export function qualityArgs(
   ultra: boolean,
   env: Env = process.env,
 ): [string[], string | null] {
-  let note: string | null = null;
   let qargs: string[];
   if (useNvenc) {
     if (env.SMV_ENC_LOSSLESS === '1') {
@@ -313,12 +312,8 @@ export function qualityArgs(
     // 1.15x (1080p) / 1.30x (4K) faster for RIFE 2x, but the strips are separate slices with the
     // loop filter off across them, which leaves an unfiltered line at the same row of every frame
     // (1080p: rows 575 / 576, +2 to 3 levels), a repeatable, identifiable artifact, so splitting
-    // stays off. SMV_NVENC_SPLIT overrides the mode for measurement only.
-    if (venc === 'hevc_nvenc' || venc === 'av1_nvenc') {
-      const split = env.SMV_NVENC_SPLIT || '15';
-      qargs.push('-split_encode_mode', split);
-      if (split !== '15') note = `encoder: ${venc} split frame encoding mode ${split} (SMV_NVENC_SPLIT)\n`;
-    }
+    // stays off.
+    if (venc === 'hevc_nvenc' || venc === 'av1_nvenc') qargs.push('-split_encode_mode', '15');
     if (venc === 'h264_nvenc' || venc === 'hevc_nvenc') qargs.push('-qp_cb_offset', '-2', '-qp_cr_offset', '-2');
     if (dvOrHp) qargs.push('-bf', '0');
   } else if (venc === 'libvvenc') {
@@ -327,7 +322,7 @@ export function qualityArgs(
   } else {
     qargs = ['-crf', '17', '-preset', '6'];
   }
-  return [qargs, note];
+  return [qargs, null];
 }
 
 /** The HEVC profile follows the pixel format; other encoders pick their own. */

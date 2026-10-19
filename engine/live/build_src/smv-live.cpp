@@ -96,7 +96,7 @@ static uint32_t H = 1080;
 // Enhancement backend. BK_DLSSG = Streamline DLSS Frame Generation (SL interposes the swap
 // chain, its pacer presents generated frames, needs RTX 40/50 + foreground). BK_IDENTITY =
 // no Streamline at all: captured frames are presented directly (the SL-free base of the
-// backend-agnostic server route). BK_SERVER = a model backend (rife, blend, gmfss, nvof, fruc,
+// backend-agnostic server route). BK_SERVER = a model backend (rife, gmfss, nvof, fruc,
 // fsrfg, rifedrba, echo) run by the in-process native host (smv-live-native.inl); it returns N output
 // frames per input and this host paces their presentation across the measured capture
 // interval. Comments that name functions of engine/live_server.py (the python server this host
@@ -722,11 +722,10 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 // ---- offline render through this host --------------------------------------------------------
 // smv-live.exe --offline --w W --h H --multi N [--frames T] [--pixfmt rgb48le|rgb24]
 //               [--script s] [--pause-file P]
-//               [--ifnet E --encode E --jit J --ph N --pw N]
 //               [--nvof | --no-interp | --gmfss | --drba | --fruc | --fsrfg] [--cache DIR] (--no-interp = no model,
 //               --multi ignored)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
-//               (no --ifnet = the host finds or builds the engines itself, lkOfflineRife)
+//               (RIFE: the host finds or builds the engines itself, lkOfflineRife)
 //               the per-frame passes: [--out-w W --out-h H] [--restore] [--rtx-vsr | --fsr-upscale]
 //               [--dlssnr --nr-structure F --nr-tone F --nr-style N [--nr-delta PATH]] [--sharpen S] [--rtx-hdr ...]
 // Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
@@ -1035,7 +1034,10 @@ struct DgChild
     std::wstring dir, pauseFile;
     int w = 0, h = 0, gen = 1;
     unsigned maxGen = 0;
-    bool hdr10 = false; // every spawn asks for --hdr10 and its handshake must confirm it
+    bool hdr10 = false;  // every spawn asks for --hdr10 and its handshake must confirm it
+    bool wq = false;     // the server streams a pair from a writer thread (handshake " wq=1"): frame i may go out
+                         // before pair (i - 2, i - 1) is read; SMV_DLSSG_WQ=0 = never
+    unsigned spawns = 0; // servers started (a respawn inside dgPair re-sends only its own pair)
     HANDLE hProc = nullptr, hIn = nullptr, hOut = nullptr, hErr = nullptr;
     std::thread errPump, watch;
     std::mutex m;                       // guards hProc against the watchdog
@@ -1206,8 +1208,17 @@ static int dgSpawn(DgChild& c)
     {
         const size_t mp = line.find("max=");
         c.maxGen = mp == std::string::npos ? 0u : (unsigned)strtoul(line.c_str() + mp + 4, nullptr, 10);
+        wchar_t wq[8]{};
+        c.wq = line.find(" wq=1") != std::string::npos &&
+               !(GetEnvironmentVariableW(L"SMV_DLSSG_WQ", wq, 8) && wq[0] == L'0');
         if (!c.hdr10 || line.find(" hdr10=1") != std::string::npos)
+        {
+            if (c.spawns++ == 0)
+                LOG("dlss: %s\n", c.wq ? "the server streams each pair from its own thread: a frame goes out before "
+                                         "the previous pair is read"
+                                       : "a frame goes out after the previous pair is read");
             return 0;
+        }
         dgEnd(c, true); // an older dlssg2f.exe ignores --hdr10 and would read the words as RGBA8
         return -2;
     }
@@ -1260,16 +1271,19 @@ static void dgWatch(DgChild* c)
 // one pair through the server (dlssg.py interpolate): prev once when the server has not seen it
 // (primed = it has), then cur, then the gen frames into out. 0 = ok, 3 = the multiplier is beyond
 // this GPU, 4 = the server stayed lost through its restarts (python's DLSSHostLost)
-static int dgPair(DgChild& c, const uint8_t* prev, const uint8_t* cur, uint8_t* out, bool& primed)
+static int dgPair(DgChild& c, const uint8_t* prev, const uint8_t* cur, uint8_t* out, bool& primed, bool sent = false)
 {
     const size_t fb = (size_t)c.w * c.h * 4;
     for (int attempt = 0;; attempt++)
     {
         bool ok = true;
-        if (!primed)
-            ok = dgWrite(c, prev, fb);
-        ok = ok && dgWrite(c, cur, fb);
-        primed = ok;
+        if (!sent || attempt > 0) // sent: dgSend wrote the pair already, the first attempt only reads
+        {
+            if (!primed)
+                ok = dgWrite(c, prev, fb);
+            ok = ok && dgWrite(c, cur, fb);
+            primed = ok;
+        }
         for (int j = 0; ok && j < c.gen; j++)
             ok = dgRead(c, out + (size_t)j * fb, fb);
         if (ok)
@@ -1308,6 +1322,20 @@ static int dgPair(DgChild& c, const uint8_t* prev, const uint8_t* cur, uint8_t* 
     }
 }
 
+// dgPair's write half: cur (and prev when the server has not seen it) to the server, which then
+// generates the pair while the host works on; dgPair(.., sent = true) reads it later. false = a
+// write failed (that dgPair then sends the pair again after its restart)
+static bool dgSend(DgChild& c, const uint8_t* prev, const uint8_t* cur, bool& primed)
+{
+    const size_t fb = (size_t)c.w * c.h * 4;
+    bool ok = true;
+    if (!primed)
+        ok = dgWrite(c, prev, fb);
+    ok = ok && dgWrite(c, cur, fb);
+    primed = ok;
+    return ok;
+}
+
 // one --offline command line (the resident host parses one per item from its "start" line)
 struct OfflineArgs
 {
@@ -1315,8 +1343,7 @@ struct OfflineArgs
     uint64_t frames = 0;
     bool fmt16 = true; // input pipe format (render.py's DEC_FMT)
     int out16 = -1;    // output pipe format, -1 = same as input
-    std::wstring ifnetW, encodeW, jitW, pauseFile;
-    int phArg = 0, pwArg = 0;
+    std::wstring pauseFile;
     bool resident = false;             // --resident: stay alive between renders (offlineResidentMain)
     std::wstring pipeName;             // --pipe NAME: the resident host's control pipe, \\.\pipe\NAME
     bool nvof = false;                 // --nvof: the NVIDIA Optical Flow model (no engines, no handoff)
@@ -1392,17 +1419,6 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
         }
         else if (wcscmp(argv[i], L"--script") == 0 && i + 1 < argc)
             g_script = argv[++i];
-        // engine paths handed over (the harnesses; render.py lets the host find or build them)
-        else if (wcscmp(argv[i], L"--ifnet") == 0 && i + 1 < argc)
-            oa.ifnetW = argv[++i];
-        else if (wcscmp(argv[i], L"--encode") == 0 && i + 1 < argc)
-            oa.encodeW = argv[++i];
-        else if (wcscmp(argv[i], L"--jit") == 0 && i + 1 < argc)
-            oa.jitW = argv[++i];
-        else if (wcscmp(argv[i], L"--ph") == 0 && i + 1 < argc)
-            oa.phArg = _wtoi(argv[++i]);
-        else if (wcscmp(argv[i], L"--pw") == 0 && i + 1 < argc)
-            oa.pwArg = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--pause-file") == 0 && i + 1 < argc)
             oa.pauseFile = argv[++i];
         else if (wcscmp(argv[i], L"--resident") == 0)
@@ -1583,9 +1599,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     OfflineIo io;
     uint8_t* dDgRgba = nullptr;
     float* dDgF = nullptr;
-    uint8_t* hDgIn[2]{};
+    uint8_t* hDgIn[3]{};
     uint8_t* hDgOut = nullptr;
-    bool outClosed = false; // the run's end closed hOut (EOF to the encoder)
+    bool outClosed = false;       // the run's end closed hOut (EOF to the encoder)
+    cudaEvent_t pairEv = nullptr; // the identical-pair test's flag copy (pairEnqueue / pairCollect)
     // A resident offline host outlives a failed item, so every return frees what the item made: the
     // DLSS 5 handoff, the frame buffers, the session (nativeFree) and hOut, which the caller leaves to
     // this function.
@@ -1594,6 +1611,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             CloseHandle(hOut);
         if (!nr.stream)
             return; // the stream is the item's first CUDA object: nothing CUDA was made before it
+        if (pairEv)
+            cudaEventDestroy(pairEv);
         if (nr.nrHost)
         {
             cudaDeviceSynchronize(); // the last fence wait has run before its semaphore goes
@@ -1624,6 +1643,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         cudaFree(dDgF);
         cudaFreeHost(hDgIn[0]);
         cudaFreeHost(hDgIn[1]);
+        cudaFreeHost(hDgIn[2]);
         cudaFreeHost(hDgOut);
         nativeFree(nr);
     }};
@@ -1668,11 +1688,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     const uint64_t frames = oa.frames;
     const bool fmt16 = oa.fmt16;
     const int out16 = oa.out16;
-    const std::wstring& ifnetW = oa.ifnetW;
-    const std::wstring& encodeW = oa.encodeW;
-    const std::wstring& jitW = oa.jitW;
     const std::wstring& pauseFile = oa.pauseFile;
-    const int phArg = oa.phArg, pwArg = oa.pwArg;
     g_offline = true;
     g_hdr = false;
     W = (uint32_t)w;
@@ -1690,8 +1706,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         return 2;
     }
     // RIFE: the IFNet + Head engines at the true /64 pad of the source size (out = capture =
-    // source, no fit, no effects), found or built by the host (lkOfflineRife) unless a harness
-    // hands paths over. The nvof model needs neither: the source size IS the model
+    // source, no fit, no effects), found or built by the host (lkOfflineRife).
+    // The nvof model needs neither: the source size IS the model
     // size (the Optical Flow engine takes any size from 32x32, no pad), one tween at a time.
     OfflineEngines oe;
     if (oa.gmfss)
@@ -1754,7 +1770,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.dw = w;
         nr.dh = h;
     }
-    else if (!oa.nvof && !oa.echo && ifnetW.empty())
+    else if (!oa.nvof && !oa.echo)
     {
         // RIFE's two domains: the IFNet finds the motion on the finished picture in SDR sRGB at the
         // decoded size (the PQ encoding and an enlarge cost RIFE its motion, measured on an exact pan)
@@ -1794,7 +1810,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.dw = w;
         nr.dh = h;
     }
-    else if (oa.nvof || oa.echo)
+    else
     {
         // --no-interp = live's echo: the no-engine mode, the same geometry
         nr.nvof = oa.nvof;
@@ -1807,25 +1823,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.ch = h;
         nr.dw = w;
         nr.dh = h;
-    }
-    else
-    {
-        nr.ifnetPath = wideToUtf8(ifnetW);
-        nr.encodePath = wideToUtf8(encodeW);
-        nr.jitPath = wideToUtf8(jitW);
-        nr.ph = phArg;
-        nr.pw = pwArg;
-        nr.w = w;
-        nr.h = h;
-        nr.cw = w;
-        nr.ch = h;
-        nr.dw = w;
-        nr.dh = h;
-        if (nr.ph < 16 || nr.pw < 16 || nr.encodePath.empty())
-        {
-            LOG("offline: --ifnet needs --encode, --ph and --pw\n");
-            return 1;
-        }
     }
     nr.sw = srcW;
     nr.sh = srcH; // Restore and the first resize read the decoded frame's size
@@ -1931,24 +1928,23 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         return true;
     };
-    // the IFNet's timestep and tween buffers follow once the engine's dtypes are known
+    // the IFNet's features, timestep and tween buffers follow once the engine's dtypes are known
     // (nativeTrtInit's nativeTweenBuffers)
     // the model's frame: the pictures' own (ph x pw), or RIFE's motion frame at the decoded size (mph x mpw,
     // never larger: the working size is at least the decoded one), which the IFNet reads instead of dX / dXh
     const size_t mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
-    if (!cm((void**)&nr.dX, 6 * plane * sizeof(float), "x") ||
+    // DRBA builds each frame in its ring slot: no dX
+    if ((!nr.drba && !cm((void**)&nr.dX, 6 * plane * sizeof(float), "x")) ||
         (!nr.nvof && !nr.noEngine && !nr.gmfss && !nr.fruc && !oa.dlssg && !nr.drba &&
-         (!cm((void**)&nr.dF[0], 16 * mplane * sizeof(float), "f0") ||
-          !cm((void**)&nr.dF[1], 16 * mplane * sizeof(float), "f1") ||
-          !cm((void**)&nr.dEncHalf, 16 * mplane * sizeof(uint16_t), "enc") ||
-          (nr.mph ? !cm((void**)&nr.dM, 6 * mplane * sizeof(uint16_t), "motion frames")
-                  : !cm((void**)&nr.dXh, 6 * plane * sizeof(uint16_t), "x fp16")))) ||
+         (nr.mph ? !cm((void**)&nr.dM, 6 * mplane * sizeof(uint16_t), "motion frames")
+                 : !cm((void**)&nr.dXh, 6 * plane * sizeof(uint16_t), "x fp16"))) ||
         !cm((void**)&dRaw[0], frameBytes, "raw0") || !cm((void**)&dRaw[1], frameBytes, "raw1") ||
         !cm((void**)&dOutRaw, 2 * frameBytesOut, "rawout") || !cm((void**)&nr.dStaticFlag, sizeof(int), "static flag"))
         return 2;
-    if (cudaHostAlloc((void**)&nr.hStaticFlag, sizeof(int), cudaHostAllocDefault) != cudaSuccess)
+    if (cudaHostAlloc((void**)&nr.hStaticFlag, sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
+        cudaEventCreateWithFlags(&pairEv, cudaEventDisableTiming) != cudaSuccess)
     {
-        LOG("offline: pinned static flag alloc failed\n");
+        LOG("offline: pinned static flag or its event alloc failed\n");
         return 2;
     }
     // live's DRBA history: four padded frames and their encodes, the two x buffers, two windows
@@ -1957,13 +1953,11 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         return 2;
     if (nr.restore)
     {
-        // the Restore engine's x / y (sized for fp32, either dtype fits), the fold's horizontal
-        // pass at the 4x height and the widest target, the fold back to the source size (VSR follows)
+        // the fold's horizontal pass at the 4x height and the widest target, the fold back to the source size (VSR
+        // follows); the Restore engine's x / y follow its dtypes (nativeTrtInit's restoreReady)
         const size_t mp = (size_t)srcW * srcH;
         const int maxTw = outW > srcW ? outW : srcW;
-        if (!cm(&nr.dRestIn, 3 * mp * sizeof(float), "restore input") ||
-            !cm(&nr.dRestOut, 3 * 16 * mp * sizeof(float), "restore output") ||
-            !cm((void**)&nr.dRestTmp, (size_t)3 * 4 * srcH * maxTw * sizeof(float), "restore fold pass") ||
+        if (!cm((void**)&nr.dRestTmp, (size_t)3 * 4 * srcH * maxTw * sizeof(float), "restore fold pass") ||
             !cm((void**)&nr.dRest, 3 * mp * sizeof(float), "restore source-size frame"))
             return 2;
     }
@@ -2084,8 +2078,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         // the identical-pair test's reference: with the reuse test on, that test decides every pair after the first
         // frame, so only SMV_NR_REUSE=0 reads it
-        else if (!cm((void**)&nr.dNrIo, (size_t)w * h * 8, "dlss5 frame") ||
-                 (!nrReuse && !cm((void**)&nr.dRawPrev, 3 * plane * sizeof(float), "dlss5 pair reference")))
+        else if (!nrReuse && !cm((void**)&nr.dRawPrev, 3 * plane * sizeof(float), "dlss5 pair reference"))
         {
             LOG("offline: DLSS 5 buffers failed\n");
             return 2;
@@ -2109,11 +2102,11 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nr.nrReuse = nrReuse;
             // A handoff that cannot start falls back to staging with a line; the pass still runs, so
             // the line carries no [dlss5] tag (the preview reads that tag as "DLSS 5 not applied").
-            // Motion that cannot start leaves the shared field at zero (no motion) with a line.
+            // Motion that cannot start leaves the MVec texture at zero (no motion) with a line.
             if (!staged)
             {
                 std::string zerr;
-                nr.nrZeroCopy = host->startShared(zerr) && nativeNrImport(nr, *host, zerr);
+                nr.nrZeroCopy = host->startShared(zerr) && nativeNrImport(nr, *host, w, h, zerr);
                 if (!nr.nrZeroCopy)
                 {
                     nativeNrReleaseImports(nr);
@@ -2122,13 +2115,14 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 else if (set.motion && !nativeNrMotionSetup(nr, zerr))
                 {
                     nativeNrMotionFree(nr);
-                    if (nr.dNrShMv)
-                        cudaMemset2DAsync(nr.dNrShMv, nr.nrMvPitch, 0, (size_t)w * 4, h, nr.stream);
+                    if (nr.sfNrMv)
+                        nativeNrMvClear(nr);
                     LOG("offline: DLSS 5 motion vectors unavailable (%s), none\n", zerr.c_str());
                 }
             }
             if (!nr.nrZeroCopy &&
-                (cudaHostAlloc((void**)&nr.hNrIn, (size_t)w * h * 8, cudaHostAllocDefault) != cudaSuccess ||
+                (!cm((void**)&nr.dNrIo, (size_t)w * h * 8, "dlss5 frame") ||
+                 cudaHostAlloc((void**)&nr.hNrIn, (size_t)w * h * 8, cudaHostAllocDefault) != cudaSuccess ||
                  cudaHostAlloc((void**)&nr.hNrOut, (size_t)w * h * 8, cudaHostAllocDefault) != cudaSuccess))
             {
                 LOG("offline: DLSS 5 buffers failed\n");
@@ -2192,8 +2186,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         cudaEventCreateWithFlags(&io.outEv[i], cudaEventDisableTiming);
         io.outFree.push_back(i);
     }
-    // DLSS 4.5: the RGBA8 staging (device + pinned: the two latest frames and the pair's
-    // generated frames), then the server itself; its handshake decides "up" vs "unsupported"
+    // DLSS 4.5: the RGBA8 staging (device + pinned: the three latest frames, so a restart can send
+    // the pair being read again while the next frame is staged, and the pair's generated frames),
+    // then the server itself; its handshake decides "up" vs "unsupported"
     DgChild dgc;
     const size_t dgBytes = (size_t)nr.pw * nr.ph * 4;
     int dgHlg = oa.srcHdr == 2 ? 1 : 0; // HDR10 frames: the HLG picture goes as PQ and comes back as HLG
@@ -2203,6 +2198,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             !cm((void**)&dDgF, 3 * plane * sizeof(float), "dlss tween") ||
             cudaHostAlloc((void**)&hDgIn[0], dgBytes, cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc((void**)&hDgIn[1], dgBytes, cudaHostAllocDefault) != cudaSuccess ||
+            cudaHostAlloc((void**)&hDgIn[2], dgBytes, cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc((void**)&hDgOut, dgBytes * (size_t)(multi - 1), cudaHostAllocDefault) != cudaSuccess)
         {
             LOG("offline: DLSS 4.5 buffers failed\n");
@@ -2427,6 +2423,137 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             heldPairs++;
         return true;
     };
+    // DLSS 4.5, pipelined (not --fps): frame k goes to the server as soon as it is staged and pair
+    // (k - 1, k)'s generated frames are read in the next iteration, so the server generates while the
+    // host stages the next frame and emits the pair before (the server reads frame k + 1 only after
+    // writing pair k's frames). dgEmit puts one frame out a frame late, in the serial loop's order:
+    // the generated frames of the pair that ends at it (tweens), then the frame itself from its own
+    // input slot, decoded bytes and planes.
+    const bool dgLag = oa.dlssg && !fpsMode;
+    bool dgSent = false; // the pair being generated went out whole (else dgPair sends it again)
+    int dgPendSlot = -1; // the pending frame's input slot
+    auto dgEmit = [&](bool tweens, int eSlot, uint8_t* eR, const float* eCur) -> bool {
+        for (int j = 0; tweens && j < multi - 1; j++)
+        {
+            if (dropOne())
+                continue;
+            void* au[] = {&dDgRgba, &nr.pw, &nr.ph, &dDgF};
+            void* au10[] = {&dDgRgba, &nr.pw, &nr.ph, &dgHlg, &dDgF};
+            if (cudaMemcpyAsync(dDgRgba, hDgOut + (size_t)j * dgBytes, dgBytes, cudaMemcpyHostToDevice, st) !=
+                    cudaSuccess ||
+                cuLaunchKernel(dgc.hdr10 ? nr.fUnpackR10 : nr.fUnpackRgba, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16,
+                               16, 1, 0, (CUstream)st, dgc.hdr10 ? au10 : au, nullptr) != CUDA_SUCCESS)
+            {
+                io.setFail("dlss tween upload failed");
+                return false;
+            }
+            int o = -1;
+            {
+                std::unique_lock<std::mutex> lk(io.m);
+                io.cv.wait(lk, [&] { return !io.outFree.empty() || io.fail; });
+                if (io.fail)
+                    return false;
+                o = io.outFree.front();
+                io.outFree.pop_front();
+            }
+            const float* src = dDgF;
+            uint8_t* dO = dOutRaw;
+            if (passes)
+            {
+                if (!nativeOfflineEmit(nr, src, ps, rs, dO, outIs16))
+                {
+                    io.setFail("passes (nvof / gmfss) failed");
+                    return false;
+                }
+            }
+            else
+            {
+                int f32 = 0;
+                void* a[] = {(void*)&src, &f32, (void*)&ps, (void*)&rs, &w, &h, &dO};
+                if (cuLaunchKernel(outIs16 ? nr.fPackOutRaw16 : nr.fPackOutRaw8, (w + 15) / 16, (h + 15) / 16, 1, 16,
+                                   16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+                {
+                    io.setFail("packOutRaw (nvof) launch failed");
+                    return false;
+                }
+            }
+            if (cudaMemcpyAsync(io.hOut[o], dO, frameBytesOut, cudaMemcpyDeviceToHost, st) != cudaSuccess)
+            {
+                io.setFail("D2H copy (nvof) failed");
+                return false;
+            }
+            cudaEventRecord(io.outEv[o], st);
+            drLastOut = dO;
+            {
+                std::lock_guard<std::mutex> lk(io.m);
+                io.items.push_back({1, o});
+            }
+            io.cv.notify_all();
+        }
+        if (tweens)
+            pairs++;
+        if (dropOne())
+        {
+            {
+                std::lock_guard<std::mutex> lk(io.m);
+                io.inWritten[eSlot] = 1;
+            }
+            io.cv.notify_all();
+            realOutFresh = false;
+            return true;
+        }
+        if (sameFmt && !passes)
+        {
+            std::lock_guard<std::mutex> lk(io.m);
+            io.items.push_back({0, eSlot});
+        }
+        else
+        {
+            int o = -1;
+            {
+                std::unique_lock<std::mutex> lk(io.m);
+                io.cv.wait(lk, [&] { return !io.outFree.empty() || io.fail; });
+                if (io.fail)
+                    return false;
+                o = io.outFree.front();
+                io.outFree.pop_front();
+            }
+            uint8_t* dO = dOutRaw + frameBytesOut;
+            if (passes)
+            {
+                if (!nativeOfflineEmit(nr, eCur, ps, rs, dO, outIs16))
+                {
+                    io.setFail("passes (real) failed");
+                    return false;
+                }
+                realOutFresh = true;
+            }
+            else
+            {
+                int n = (int)((size_t)w * h * 3);
+                void* a[] = {&eR, &n, &dO};
+                if (cuLaunchKernel(nr.fExpand8to16, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) !=
+                    CUDA_SUCCESS)
+                {
+                    io.setFail("expand8to16 launch failed");
+                    return false;
+                }
+            }
+            if (cudaMemcpyAsync(io.hOut[o], dO, frameBytesOut, cudaMemcpyDeviceToHost, st) != cudaSuccess)
+            {
+                io.setFail("D2H copy (real) failed");
+                return false;
+            }
+            cudaEventRecord(io.outEv[o], st);
+            {
+                std::lock_guard<std::mutex> lk(io.m);
+                io.items.push_back({1, o});
+                io.inWritten[eSlot] = 1;
+            }
+        }
+        io.cv.notify_all();
+        return true;
+    };
     for (uint64_t i = 0; !failed; i++)
     {
         if (i == 3)
@@ -2475,11 +2602,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             io.inState[slot] = 2;
         }
         nFrames++;
-        if (havePrev)
+        // DRBA builds each frame straight in the ring slot its push fills (dCur below): no dX halves to shift
+        if (havePrev && !nr.drba)
         {
             // dX's halves trade roles (xSwap, as live) unless an IFNet reads dX itself as its x, one tensor with prev
-            // in planes 0..2, or DRBA emits from its cur half: then the cur half is copied into the prev half
-            if (nr.drba || (!nr.gmfss && !nr.nvof && !nr.fruc && !nr.mph && !nr.xHalf))
+            // in planes 0..2: then the cur half is copied into the prev half
+            if (!nr.gmfss && !nr.nvof && !nr.fruc && !nr.mph && !nr.xHalf)
                 cudaMemcpyAsync(nr.dX, nr.dX + 3 * plane, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st);
             else
                 nr.xSwap = !nr.xSwap;
@@ -2490,7 +2618,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             else if (nr.xHalf && !nr.drba)
                 cudaMemcpyAsync(nr.dXh, nr.dXh + 3 * plane, 3 * plane * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st);
         }
-        float* dCur = nativeXCur(nr);
+        // DRBA: the ring slot of the frame this iteration pushes (group k's tweens, queued before this frame's pack on
+        // st, are done with that slot by then)
+        float* dCur = nr.drba ? drbaFrame(nr, nr.drFid + 1) : nativeXCur(nr);
         // DLSS 5 reuse: the decoded bytes against the previous frame's (dRaw alternates, so the other
         // buffer still holds them). Identical = this frame takes the previous frame's DLSS 5 output
         // and skips the pack, the pre-model stage and the evaluate: a pair route's shift above left
@@ -2516,8 +2646,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nrSame = *nr.hStaticFlag == 0;
             nrTested = true;
             if (nrSame && havePrev &&
-                (cudaMemcpyAsync(dCur, nativeXPrev(nr), 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice, st) !=
-                     cudaSuccess ||
+                (cudaMemcpyAsync(dCur, nr.drba ? drbaFrame(nr, nr.drFid) : nativeXPrev(nr), 3 * plane * sizeof(float),
+                                 cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
                  (nr.mph && !nr.drba &&
                   cudaMemcpyAsync(nr.dM + 3 * mplane, nr.dM, 3 * mplane * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
                                   st) != cudaSuccess)))
@@ -2560,23 +2690,30 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 break;
             }
         }
-        // IDENTICAL PAIR: two packed inputs compared element by element on the device, the flag
-        // read back once per pair (used below)
-        auto identicalPair = [&](float* dPrev, bool& same) -> bool {
+        // IDENTICAL PAIR: two packed inputs compared element by element on the device, the flag copied
+        // back once per pair (pairEnqueue) and read where the pair needs it (pairCollect). The RIFE route
+        // enqueues the test before its Head encode and reads it after, so the encode runs while the host
+        // waits; every other route reads it at once.
+        auto pairEnqueue = [&](float* dPrev) -> bool {
             const int nCmp = (int)(3 * plane);
             void* ad[] = {&dPrev, &dCur, (void*)&nCmp, &nr.dStaticFlag};
-            if (cudaMemsetAsync(nr.dStaticFlag, 0, sizeof(int), st) != cudaSuccess ||
-                cuLaunchKernel(nr.fPairDiff, (nCmp + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, ad, nullptr) !=
-                    CUDA_SUCCESS ||
-                cudaMemcpyAsync(nr.hStaticFlag, nr.dStaticFlag, sizeof(int), cudaMemcpyDeviceToHost, st) !=
-                    cudaSuccess ||
-                cudaStreamSynchronize(st) != cudaSuccess)
+            return cudaMemsetAsync(nr.dStaticFlag, 0, sizeof(int), st) == cudaSuccess &&
+                   cuLaunchKernel(nr.fPairDiff, (nCmp + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, ad, nullptr) ==
+                       CUDA_SUCCESS &&
+                   cudaMemcpyAsync(nr.hStaticFlag, nr.dStaticFlag, sizeof(int), cudaMemcpyDeviceToHost, st) ==
+                       cudaSuccess &&
+                   cudaEventRecord(pairEv, st) == cudaSuccess;
+        };
+        auto pairCollect = [&](bool& same) -> bool {
+            if (cudaEventSynchronize(pairEv) != cudaSuccess)
                 return false;
             same = (*nr.hStaticFlag == 0);
             return true;
         };
         const bool testPair = havePrev && g_staticHold && nr.fPairDiff && !oa.dlssg; // DLSS 4.5 never holds (hold_ok)
-        bool pairStatic = false, pairTested = false;
+        // the RIFE route: the Head encode below runs for this frame
+        const bool rifeRoute = !nr.nvof && !nr.noEngine && !nr.gmfss && !nr.drba && !nr.fruc && !oa.dlssg;
+        bool pairStatic = false, pairTested = false, pairPending = false;
         // the reuse test above compared the decoded frames already: it decides the pair too
         if (nrTested && testPair)
         {
@@ -2591,13 +2728,14 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         {
             if (testPair && !pairTested && nr.dRawPrev)
             {
-                if (!identicalPair(nr.dRawPrev, pairStatic))
+                if (!pairEnqueue(nr.dRawPrev) || (!rifeRoute && !pairCollect(pairStatic)))
                 {
                     io.setFail("identical-pair test failed");
                     failed = true;
                     break;
                 }
                 pairTested = true;
+                pairPending = rifeRoute;
             }
             if (nr.dRawPrev && cudaMemcpyAsync(nr.dRawPrev, dCur, 3 * plane * sizeof(float), cudaMemcpyDeviceToDevice,
                                                st) != cudaSuccess)
@@ -2665,10 +2803,21 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             failed = true;
             break;
         }
+        // the RIFE route's pair test: its inputs are final here, and the Head encode never writes them
+        if (rifeRoute && testPair && !pairTested)
+        {
+            if (!pairEnqueue(nativeXPrev(nr)))
+            {
+                io.setFail("identical-pair test failed");
+                failed = true;
+                break;
+            }
+            pairTested = pairPending = true;
+        }
         // Head encode of the new frame; the previous frame's encode is reused (exact). The nvof
         // model has no per-frame state: both frames go to gray8 per pair below.
         nr.fCur ^= 1;
-        if (!nr.nvof && !nr.noEngine && !nr.gmfss && !nr.drba && !nr.fruc && !oa.dlssg)
+        if (rifeRoute)
         {
             nvinfer1::Dims4 din{1, 3, nr.mph ? nr.mph : nr.ph, nr.mph ? nr.mpw : nr.pw};
             if (!nr.ctxEnc->setInputShape("img", din))
@@ -2710,11 +2859,13 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 }
             }
         }
-        // IDENTICAL PAIR (identicalPair above). Equal = there is no motion in this pair, so the
+        // IDENTICAL PAIR (pairEnqueue above). Equal = there is no motion in this pair, so the
         // engine is skipped and every tween slot carries the real frame's own output bytes (the
         // Head encode above still ran, so the next pair's chain state is unchanged). Exact
         // equality only; SMV_NO_STATIC_HOLD=1 turns it off.
-        if (testPair && !pairTested && !identicalPair(nativeXPrev(nr), pairStatic))
+        if ((testPair && !pairTested &&
+             (!pairEnqueue(nr.drba ? drbaFrame(nr, nr.drFid) : nativeXPrev(nr)) || !pairCollect(pairStatic))) ||
+            (pairPending && !pairCollect(pairStatic)))
         {
             io.setFail("identical-pair test failed");
             failed = true;
@@ -2760,7 +2911,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             // DLSS 4.5: every frame to RGBA8 (hdr10: R10G10B10A2) at the padded size (dlssg.py _send), then
             // for a pair the server's generated frames (dlssg.py interpolate; the sync also retires the last
             // pair's uploads from hDgOut before it is refilled)
-            uint8_t* hCur = hDgIn[i & 1];
+            uint8_t* hCur = hDgIn[i % 3];
             int f32 = 0;
             void* a[] = {&dCur, &f32, (void*)&ps, (void*)&rs, &nr.pw, &nr.ph, &dDgRgba};
             void* a10[] = {&dCur, &f32, (void*)&ps, (void*)&rs, &nr.pw, &nr.ph, &dgHlg, &dDgRgba};
@@ -2773,9 +2924,46 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 failed = true;
                 break;
             }
+            if (dgLag)
+            {
+                // the pair sent last iteration (made while this frame was), this frame out at once, then
+                // the previous frame (shifted into the prev half) with that pair's generated frames. A server
+                // with a pair writer (dgc.wq) takes this frame BEFORE the pair is read, so it presents the next
+                // pair while its writer still streams this one; only once frame i - 1 reached the server, so the
+                // frames never go out of order
+                const bool sendFirst = dgc.wq && i >= 2 && dgSent;
+                const unsigned spawns0 = dgc.spawns;
+                const bool sentFirst = sendFirst && dgSend(dgc, hDgIn[(i - 1) % 3], hCur, dgPrimed);
+                if (i >= 2)
+                {
+                    const int dr = dgPair(dgc, hDgIn[(i - 2) % 3], hDgIn[(i - 1) % 3], hDgOut, dgPrimed, dgSent);
+                    if (dr)
+                    {
+                        failRc = dr;
+                        io.setFail(dr == 4 ? "the DLSS 4.5 host stayed lost through its restarts"
+                                           : "the DLSS 4.5 host refused the multiplier");
+                        failed = true;
+                        break;
+                    }
+                }
+                // send-first: a respawn inside dgPair re-sent only its own pair and a failed send never reached a
+                // server, so this frame goes again (primed after the re-send: this frame alone)
+                if (sendFirst && sentFirst && dgc.spawns == spawns0)
+                    dgSent = true;
+                else
+                    dgSent = havePrev && dgSend(dgc, hDgIn[(i - 1) % 3], hCur, dgPrimed);
+                if (i >= 1 && !dgEmit(i >= 2, dgPendSlot, dRaw[(i - 1) & 1], nativeXPrev(nr)))
+                {
+                    failed = true;
+                    break;
+                }
+                dgPendSlot = slot;
+                havePrev = true;
+                continue;
+            }
             if (havePrev)
             {
-                const int dr = dgPair(dgc, hDgIn[(i - 1) & 1], hCur, hDgOut, dgPrimed);
+                const int dr = dgPair(dgc, hDgIn[(i - 1) % 3], hCur, hDgOut, dgPrimed);
                 if (dr)
                 {
                     failRc = dr;
@@ -3225,6 +3413,28 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         io.cv.notify_all();
         havePrev = !nr.noEngine; // --no-interp: never a pair, every frame is a real frame
     }
+    if (dgLag && !failed && !io.fail && nFrames >= 1)
+    {
+        // EOF: the last pair's generated frames (once the previous pair's uploads from hDgOut are done:
+        // no staging sync runs here), then the last frame (never shifted: the cur half)
+        if (nFrames >= 2)
+        {
+            if (cudaStreamSynchronize(st) != cudaSuccess)
+                io.setFail("dlss tween sync failed");
+            if (io.fail)
+                failed = true;
+            else if (const int dr =
+                         dgPair(dgc, hDgIn[(nFrames - 2) % 3], hDgIn[(nFrames - 1) % 3], hDgOut, dgPrimed, dgSent))
+            {
+                failRc = dr;
+                io.setFail(dr == 4 ? "the DLSS 4.5 host stayed lost through its restarts"
+                                   : "the DLSS 4.5 host refused the multiplier");
+                failed = true;
+            }
+        }
+        if (!failed && !dgEmit(nFrames >= 2, dgPendSlot, dRaw[(nFrames - 1) & 1], nativeXCur(nr)))
+            failed = true;
+    }
     if (!failed && !io.fail && nr.drba && nr.drFid >= 1)
     {
         // EOF (drba_loop's tail): the last pair with a virtual next frame id (never read), its
@@ -3289,8 +3499,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     reader.join();
     if (oa.dlssg)
     {
-        // EOF to the server (it logs "server done" and exits), then the watchdog
-        dgEnd(dgc, false);
+        // EOF to the server (it logs "server done" and exits), then the watchdog; a failed pipelined
+        // render can leave the server writing a pair nobody reads, so it is ended at once
+        dgEnd(dgc, dgLag && (failed || io.fail));
         dgc.closing = true;
         if (dgc.watch.joinable())
             dgc.watch.join();
@@ -3699,8 +3910,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
         }
     }
     // DLSS-G with any effect (Sharpen, Restore, DLSS 5, RTX HDR, Fill, Upscale to, a DLSS mode below DLAA): the echo
-    // route runs that chain once per captured frame and DLSS-G generates from its frames. RTX VSR alone has no resize
-    // to work on, so it does not count.
+    // route runs that chain once per captured frame and DLSS-G generates from its frames. RTX VSR alone has no resize to
+    // work on, so it does not count.
     const bool belowDlaa = g_dlssMode > 1 || (g_dlssMode == 0 && g_flowScale < 1.0);
     if (g_backend == BK_DLSSG &&
         (g_sharpen > 0 || g_restore || g_dlssnr || g_rtxHdr || g_fill || g_upscaleH > 0 || belowDlaa))

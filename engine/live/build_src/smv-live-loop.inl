@@ -1513,7 +1513,7 @@ static int runSynth(int genFrames, bool vsync)
 // change would turn a drag resize into a chain of engine builds at whatever intermediate size
 // the window had 400 ms later, each blocking the host for up to a minute. So the stale overlay
 // hides at once, the HUD shows the loading note at once, and the session ends only after the client
-// size has held for SMV_LIVE_RESIZE_SETTLE_MS (default 1000). Returns early when the window
+// size has held for 1 s. Returns early when the window
 // closes or the session is ending anyway (stdin "stop"). g_monitor sessions never get here
 // (monitor capture has no window size).
 // What the loading note names: the GUI's --label lists the ticked model and live effects ("GMFSS + DLSS 5",
@@ -1529,14 +1529,7 @@ static std::wstring loadingWhat()
 // session continues with the overlay shown again; false = a real resize, the caller restarts.
 static bool resizeSettle(HWND target, Host& host, const Capture& cap, Hud& hud, bool hidden)
 {
-    static DWORD settleMs = 0;
-    if (!settleMs)
-    {
-        wchar_t sv[16]{};
-        settleMs = GetEnvironmentVariableW(L"SMV_LIVE_RESIZE_SETTLE_MS", sv, 16) ? (DWORD)_wtoi(sv) : 0;
-        if (settleMs < 100 || settleMs > 10000)
-            settleMs = 1000;
-    }
+    const DWORD settleMs = 1000;    // how long the client size must hold still
     ShowWindow(host.hwnd, SW_HIDE); // the old-size frames no longer cover the window
     if (hud.hwnd)
     {
@@ -1666,9 +1659,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // rife/gmfss run on PQ and compose R10A2, so HDR reaches them (plus the
         // echo identity path). Fill is HDR-capable too: the server rescales on the PQ
         // tensors and letterboxes into the R10A2 canvas (RTX VSR demoted to Lanczos there,
-        // with a log line). SMV_LIVE_HDR forces the mode for testing. "blend" (the LSFG
-        // comparison baseline) composes the exact same PQ R10A2 path as rife/gmfss and exists
-        // precisely for HDR A-B comparisons, so it is HDR-capable too.
+        // with a log line). SMV_LIVE_HDR forces the mode for testing.
         // DLSS-G is HDR-capable through the exe-side pack (kHdrPackCS): SL mandates RGB10 + PQ
         // for HDR, the capture converts before present, SL interpolates on the PQ backbuffers.
         // "fruc" (Smooth Motion): the server feeds the NvOFFRUC bridge the PQ-encoded frames like rife, the bridge
@@ -1676,12 +1667,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // PQ precision (the real frames stay full precision); far better than the SDR capture
         // of an HDR-presented window, which is 2-3x over-bright and clipped (below). "fsrfg" (AMD FSR frame
         // generation) takes FRUC's HDR rule at fp16 (nativeFsrfgPair).
-        const bool hdrCapable =
-            g_backend == BK_DLSSG ||
-            (g_backend == BK_SERVER &&
-             (g_serverBackend == L"echo" || g_serverBackend == L"rife" || g_serverBackend == L"gmfss" ||
-              g_serverBackend == L"blend" || g_serverBackend == L"nvof" || g_serverBackend == L"rifedrba" ||
-              g_serverBackend == L"fruc" || g_serverBackend == L"fsrfg"));
+        const bool hdrCapable = g_backend == BK_DLSSG ||
+                                (g_backend == BK_SERVER && (g_serverBackend == L"echo" || g_serverBackend == L"rife" ||
+                                                            g_serverBackend == L"gmfss" || g_serverBackend == L"nvof" ||
+                                                            g_serverBackend == L"rifedrba" ||
+                                                            g_serverBackend == L"fruc" || g_serverBackend == L"fsrfg"));
         // AUTO: HDR runs whenever the display has Windows HDR on and the mode supports it. A
         // "purple screen" at the start was the model-load passthrough presenting raw FP16 capture
         // bytes into the R10A2 swap chain (a startup transient, suppressed below); the
@@ -1703,7 +1693,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             LOG("RTX HDR live: TrueHDR expansion on (colour %ls, SDR white %.0f nits)\n", g_hdrColor, g_sdrWhite);
         }
         else if (g_rtxHdr)
-            LOG("RTX HDR live skipped (needs an HDR display and a server model: RIFE/GMFSS/Frame Blend)\n");
+            LOG("RTX HDR live skipped (needs an HDR display and a server model: RIFE/GMFSS)\n");
         else if (g_hdr && g_backend == BK_SERVER)
             g_sdrWhite = sdrWhiteNits(target); // the SDR range DLSS 5 and RIFE's motion frame work on
         if (!g_hdr && hdrDisplay)
@@ -3420,23 +3410,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (GetEnvironmentVariableW(L"SMV_LIVE_XQPHASE", pv, 8) && pv[0] == L'1')
                     phOn = true;
             }
-            // Cut escapes, one env lever each so every cut can be A/B'd on its own.
-            // SMV_LIVE_XQ_CAPEV (on by default, =0 = a probe every iteration): drive the capture probe from the
-            //   frame pool's FrameArrived flag instead of calling TryGetNextFrame on every iteration. The loop also WAKES
-            //   on the arrival event, so a frame is drained as promptly as it was before (more
-            //   promptly while slots are pending, see XQ_WAITCAP), and a hard 8ms safety net
-            //   probes anyway so a lost event can never strand the session. Newest-wins drain
-            //   semantics are untouched: the flag only decides WHETHER to call drainNewest.
-            // SMV_LIVE_XQ_WAITCAP: cap the wait at 1ms even while the FIFO holds slots, so the
-            //   capture probe keeps running during a group's present span.
-            auto envOn = [](const wchar_t* nm, bool dflt) {
-                wchar_t v[8]{};
-                if (!GetEnvironmentVariableW(nm, v, 8))
-                    return dflt;
-                return v[0] != L'0';
-            };
-            const bool capEv = envOn(L"SMV_LIVE_XQ_CAPEV", true);
-            const bool waitCap = envOn(L"SMV_LIVE_XQ_WAITCAP", false);
+            // The capture probe runs on the frame pool's FrameArrived flag instead of calling TryGetNextFrame on every
+            // iteration. The loop also WAKES on the arrival event, so a frame is drained as promptly as a probe on every
+            // iteration would, and a hard 8ms safety net probes anyway so a lost event can never strand the session.
+            // Newest-wins drain semantics are untouched: the flag only decides WHETHER to call drainNewest.
             double lastProbeMs = 0;
             double phPump = 0, phDrain = 0, phPres = 0, phHouse = 0, phGate = 0, phProbe = 0, phSend = 0, phHold = 0,
                    phStats = 0, phWaitK = 0, phWaitS = 0;
@@ -3502,9 +3479,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         if (SetWaitableTimer(paceTimer, &due, 0, nullptr, nullptr, FALSE))
                         {
                             HANDLE hs[3] = {paceTimer, tokEvt, cap.evt};
-                            const DWORD nh = capEv ? 3 : 2;
                             const int64_t k0 = phOn ? nowQpc100() : 0;
-                            const DWORD w = WaitForMultipleObjects(nh, hs, FALSE, (DWORD)rem + 2);
+                            const DWORD w = WaitForMultipleObjects(3, hs, FALSE, (DWORD)rem + 2);
                             if (phOn)
                                 kern += (nowQpc100() - k0) / 1e4;
                             if (w == WAIT_OBJECT_0 + 1 || w == WAIT_OBJECT_0 + 2)
@@ -3975,12 +3951,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     halfPend++;
                 if (!gateC)
                     gateCDefer++;
-                // XQ_CAPEV: skip the TryGetNextFrame call unless the pool signalled an arrival
-                // (or the 8ms safety net is due). The flag is read and cleared only while the gates
-                // are open, so an arrival that lands while they are shut is drained as soon as they
-                // open, exactly as with the probe on every iteration.
+                // skip the TryGetNextFrame call unless the pool signalled an arrival (or the 8ms
+                // safety net is due). The flag is read and cleared only while the gates are open, so
+                // an arrival that lands while they are shut is drained as soon as they open, exactly
+                // as with a probe on every iteration.
                 bool wantProbe = gateA && !halfBusy && gateB && gateC;
-                if (capEv && wantProbe)
+                if (wantProbe)
                 {
                     const double tp = nowMs();
                     wantProbe = InterlockedExchange(&cap.arrived, 0) != 0 || lastProbeMs == 0 || tp - lastProbeMs > 8.0;
@@ -4228,7 +4204,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 double dl = nowMs() + 1.0;
                 if (nextDue > 0 && nextDue < dl)
                     dl = nextDue;
-                if (!waitCap && !fifo.empty() && nextDue > 0)
+                if (!fifo.empty() && nextDue > 0)
                     dl = nextDue;
                 xqWait(dl);
             }

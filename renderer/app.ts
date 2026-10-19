@@ -167,9 +167,11 @@ function gridMulti(){ if(!info) return 0; const s = srcFps(); const t = targetFp
 // floored to 3 dp so it lands exactly on-grid: 2397.602 on a 23.976 source), 2400 with no video.
 function setFps(v){ if(isNaN(v)) return;
   localStorage.setItem('speedFps', String(Math.min(FPS_TOP, Math.max(1, Math.round(v * 1000) / 1000))));
-  syncTargetUI(); refresh(); try{ lvSendOpts(); lvTargetChanged(); }catch{} }
+  syncTargetUI(); refresh(); try{ lvSendOpts(); lvTargetChanged(); }catch{}
+  if(cmpOn()) refreshCompare(); }   // Compare runs the render's multiplier
 function setSpeedMode(m){ localStorage.setItem('speedMode', m);
-  syncTargetUI(); refresh(); try{ lvSendOpts(); lvTargetChanged(); }catch{} }
+  syncTargetUI(); refresh(); try{ lvSendOpts(); lvTargetChanged(); }catch{}
+  if(cmpOn()) refreshCompare(); }
 // Ratio text for the current target: the exact integer when on-grid (2, 3, ...), else
 // the fractional ratio (e.g. 2.08 for a 50 fps target on a 24 source, which the engine resamples).
 function ratioText(){ const gm = gridMulti();
@@ -308,6 +310,7 @@ $('out').onchange = () => { if(!$('out').value.trim()){ customOut = null; refres
 async function loadVideo(f){
   if(!f) return false;
   input = f; customOut = null;
+  $('cmpto').value = ''; cmpRes = null; syncCompareUi();   // a new video (a batch's next one too) starts at Off: loading one never runs two models
   $('path').textContent = f;
   try { localStorage.setItem('dir', path.dirname(f)); } catch {}
   const p = await ipcRenderer.invoke('probe', f);
@@ -639,7 +642,7 @@ function nrOn(){ return $('dlssnr').checked && !!dlssnrReady.ready; }
 function nrStructure(){ return parseFloat($('nrstructure').value) || 0; }
 function nrTone(){ return parseFloat($('nrtone').value) || 0; }
 function nrStyle(){ const b = $('nrstyleseg').querySelector('button.on'); return b ? parseInt(b.dataset.style, 10) : 0; }   // DLSSNR.Style 0/1/2
-function nrPasses(){ const v = parseInt($('nrpasses').value, 10); return v >= 1 && v <= 10 ? v : 1; }   // DLSS 5 chained 1..10 times per frame
+function nrPasses(){ const v = parseInt($('nrpasses').value, 10); return v >= 1 && v <= 20 ? v : 1; }   // DLSS 5 chained 1..20 times per frame
 function nrMaskOn(){ return nrOn() && $('nrmask').checked; }   // preview-only heat map of the DLSS 5 change
 function syncDlssnr(){
   const on = $('dlssnr').checked;
@@ -726,8 +729,8 @@ for(const [id, key] of [['nrstructure', 'nrStructure'], ['nrtone', 'nrTone']]){
 $('nrstyleseg').onclick = e => { const b = e.target.closest('button'); if(!b || b.disabled) return;
   for(const x of $('nrstyleseg').querySelectorAll('button')) x.classList.toggle('on', x === b);
   localStorage.setItem('nrStyle', b.dataset.style); refreshPreviewIfOpen(); try{ lvSendOpts(); }catch{} };
-{ const saved = localStorage.getItem('nrPasses');   // Passes slider 1..10: persisted, default 1
-  if(saved !== null && +saved >= 1 && +saved <= 10) $('nrpasses').value = saved;
+{ const saved = localStorage.getItem('nrPasses');   // Passes slider 1..20: persisted, default 1
+  if(saved !== null && +saved >= 1 && +saved <= 20) $('nrpasses').value = saved;
   $('nrpassesnum').textContent = $('nrpasses').value; }
 $('nrpasses').oninput = () => { localStorage.setItem('nrPasses', $('nrpasses').value); $('nrpassesnum').textContent = $('nrpasses').value; };
 $('nrpasses').addEventListener('change', () => { refreshPreviewIfOpen(); try{ lvSendOpts(); }catch{} });
@@ -758,6 +761,13 @@ function modelIsFsrfg(){ return $('modelfsrfg').checked; }
 // is picked, main warms both routes' shaders in a tiny background session once per driver (fsr-warm; a no-op when warm)
 function fsrWarm(){ const fg = modelIsFsrfg(), up = $('fsrup').checked; if(fg || up) ipcRenderer.send('fsr-warm', { fg, up }); }
 const MODEL_BOXES = () => [$('modelgmfss'), $('modelrife'), $('modeldlss'), $('modelfruc'), $('modelfsrfg'), $('modelnvof')];
+// The run payload's model ('' = GMFSS, the CLI's default, or interpolation off); Compare's model A reads it too, so a
+// compare runs exactly the model a render would.
+function renderModel(){
+  if(!interpOn()) return '';
+  return modelIsRifeDrba() ? 'rifedrba' : modelIsRife() ? 'rife' : modelIsDlss() ? 'dlssg' : modelIsFruc() ? 'fruc'
+    : modelIsNvof() ? 'nvof' : modelIsFsrfg() ? 'fsrfg' : '';
+}
 function frucSetupHtml(){
   const detail = !frucBridge
     ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
@@ -817,6 +827,7 @@ function pickModel(box){
   syncInterp();
   try{ lvModelUi(); lvSendOpts(); }catch{}   // live inherits this model choice
   fsrWarm();
+  syncCompareUi(); if(cmpOn()) refreshCompare(); else refreshPreviewIfOpen();   // Compare's model A is this choice
 }
 async function doFrucInstall(source){
   $('frucsetup').style.display = 'block';
@@ -849,9 +860,8 @@ function restoreModelChoice(){
     for(const b of MODEL_BOXES()) b.checked = false;
     return;
   }
-  // a saved Frame Blend ('lsfg') opens as RIFE: it rendered as RIFE (the same engines, the same frames)
   const box = saved === 'fruc' ? 'modelfruc' : saved === 'fsrfg' ? 'modelfsrfg'
-            : saved === 'dlssg' ? 'modeldlss' : saved === 'rife' || saved === 'lsfg' ? 'modelrife'
+            : saved === 'dlssg' ? 'modeldlss' : saved === 'rife' ? 'modelrife'
             : saved === 'nvof' ? 'modelnvof' : 'modelgmfss';
   for(const b of MODEL_BOXES()) b.checked = false;
   $(box).checked = true;
@@ -860,6 +870,7 @@ function restoreModelChoice(){
 // controls when nothing is ticked.
 refreshFrucState().then(() => {
   restoreModelChoice(); syncModel(); syncInterp(); try{ lvModelUi(); lvSendOpts(); }catch{}
+  syncCompareUi();   // Compare's choices follow the runtimes found ready
   // a saved FSR pick warms after the first paint (a spawn during launch stalls the compositor), below normal priority;
   // a window opened behind another one never paints (no rAF), so a timer starts it there
   let bootWarm = false;
@@ -934,7 +945,7 @@ function lvSendOpts(){
   const mi = liveModelInfo();
   const hp = hdrColorPayload();
   ipcRenderer.send('lv-opts', {
-    // ONE target source: the Speed selectors. Adaptive models (RIFE/GMFSS/blend) resample to
+    // ONE target source: the Speed selectors. Adaptive models (RIFE/GMFSS) resample to
     // it; fixed models (DLSS 4.5) approximate it with a whole multiplier the exe derives
     // from the captured window's measured rate.
     model: mi.model,
@@ -1360,6 +1371,7 @@ function prevSettingsSig(){                 // everything that changes what the 
 let lastPrevInput = null;                    // which video the shown original belongs to
 async function loadPreview(frame, bg?){   // bg: background "refine" pass (the RTX auto-upgrade) - keep the shown image up, no blocking spinner
   if(!input) return;
+  if(cmpOn()) return loadCompare(frame == null ? 'mid' : frame);   // Compare on: the 2x2 takes the pane
   if(prevBusy){ prevPending = (frame == null ? 'mid' : frame); return; }
   prevBusy = true;
   const hdr = hdrOn(), sharpen = sharpStrength(), sig = prevSettingsSig();
@@ -1443,6 +1455,7 @@ function randFrame(){ return prevTotal > 1 ? Math.floor(Math.random() * prevTota
 function refreshPreviewIfOpen(){           // re-render the shown frame when sharpen / HDR changes
   if(!input) return;
   syncPreview();
+  if(cmpOn()){ refreshCompare(); return; }
   const frame = prevHist.length ? prevHist[prevHist.length - 1] : 'mid';
   const key = JSON.stringify([input, frame].concat(prevSettingsSig()));
   // Skip when the effective settings already match what is shown (or what is mid-render), so the
@@ -1597,6 +1610,247 @@ function togglePrevZoom(e){
 $('prevorig').onclick = togglePrevZoom;
 $('prevproc').onclick = togglePrevZoom;
 
+// Compare: the Video tab's model (A) beside the one "Compare to" picks (B) on the same pair of real frames. main's
+// 'compare' (render/preview.js compare) runs the pair (k, k + 1) through both models at the preview's settings and the
+// render's multiplier: left the real frame k over the real frame k + 1, right A's new frame over B's at the same
+// moment. ‹ › step through the pair's new frames and on to the next pairs, a click zooms all four together (1:1, 2x,
+// 4x, back to fit), holding Space swaps A and B. Not persisted: a new video or a restart starts at Off, so loading a
+// video never runs two models.
+const CMP_NAMES = { gmfss: 'GMFSS', nvof: 'NVIDIA Optical Flow', rife: 'RIFE', rifedrba: 'RIFE', dlssg: 'NVIDIA DLSS 4.5',
+                    fsrfg: 'AMD FSR 4', fruc: 'NVIDIA Smooth Motion' };
+const CMP_TIP = $('cmpwrap').title;
+const CMP_ZOOMS = [0, 1, 2, 4];   // 0 = fit, else pixels per image pixel
+let cmpRes = null, cmpJ = 1, cmpWantJ = 0, cmpSwap = false, cmpZoom = 0, cmpSyncing = false;
+let cmpKey = '', cmpInflight = '', cmpTimer = null, cmpShown = false;
+function cmpA(){ return interpOn() ? (renderModel() || 'gmfss') : ''; }
+function cmpOn(){ return !!$('cmpto').value && !!cmpA(); }
+function cmpMulti(){ return Math.min(100, gridMulti() || Math.max(2, Math.round(outRatio()))); }   // a resampled target shows its closest whole multiple
+function cmpSig(frame){ return JSON.stringify([input, frame, cmpA(), $('cmpto').value, cmpMulti()].concat(prevSettingsSig())); }
+function syncCompareUi(){
+  const sel = $('cmpto'), a = cmpA(), fam = m => m === 'rifedrba' ? 'rife' : m;
+  for(const o of sel.options) if(o.value)
+    o.disabled = o.value === fam(a) || (o.value === 'dlssg' && !dlssReady) || (o.value === 'fruc' && !frucReady);
+  // nothing ticked = nothing to compare; A moved onto B (or B's runtime is missing) = GMFSS, or RIFE when A is GMFSS
+  if(!a) sel.value = '';
+  else if(sel.value && sel.selectedOptions[0].disabled) sel.value = fam(a) === 'gmfss' ? 'rife' : 'gmfss';
+  sel.disabled = !a || goMode !== 'idle';
+  $('cmpwrap').title = a ? CMP_TIP : 'Tick a model under Interpolate first: Compare shows it next to another model';
+  const on = cmpOn();
+  // back to the pair: it (and its note) re-renders on the next refresh, the next compare starts at its frame
+  if(cmpShown && !on){ lastPrevKey = ''; cmpRes = null; }
+  cmpShown = on;
+  $('prevpair').style.display = on ? 'none' : 'flex';
+  $('prevnav').style.display = on ? 'none' : '';
+  $('cmpgrid').style.display = on ? '' : 'none';
+  $('cmpnav').style.display = on ? '' : 'none';
+}
+function cmpSpin(on){
+  for(let i = 0; i < 4; i++){
+    if(on && $('cmpimg' + i).clientHeight < 40) $('cmpw' + i).style.minHeight = '120px';   // spinner space on first load
+    if(!on) $('cmpw' + i).style.minHeight = '';
+    setSpin($('cmpw' + i), $('cmpspin' + i), on);
+  }
+}
+function cmpOpts(frame, a, b, multi, pairs){   // main's 'compare' request at the preview's settings
+  return Object.assign(
+    { input, frame, modelA: a, modelB: b, multi, pairs, sharpen: sharpStrength(), restore: restoreOn(), hdr: hdrOn(),
+      vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(), upscale: upFactor() || 0,
+      rtxvsr: !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1), fsrup: fsrUpOn() && upFactor() > 1,
+      dlssnr: nrOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
+    hdrColorPayload());
+}
+async function loadCompare(frame){
+  if(!input || !cmpOn()) return;
+  if(prevBusy){ prevPending = frame; return; }   // the pending request re-enters through loadPreview
+  prevBusy = true;
+  const key = cmpSig(frame), a = cmpA(), b = $('cmpto').value, multi = cmpMulti(), video = input;
+  const wantLast = cmpWantJ < 0; cmpWantJ = 0;   // this run's own step-back request (a queued one keeps its own)
+  cmpInflight = key;
+  cmpSpin(true);
+  $('prevnote').textContent = 'running both models on this moment… the first run at a new video size takes up to a minute';
+  let r; try { r = await ipcRenderer.invoke('compare', cmpOpts(frame, a, b, multi, 1)); }
+  catch(e){ r = { error: String(e) }; }
+  cmpSpin(false);
+  prevBusy = false;
+  if(prevPending != null){ const f = prevPending; prevPending = null; loadPreview(f); }
+  if(input !== video || !cmpOn()) return;   // another video or Compare off meanwhile: this result is no longer asked for
+  if(!r || r.error){ cmpKey = '';   // never dedupe-skip a retry after a failure
+    $('prevnote').textContent = 'compare unavailable: ' + ((r && r.error) || 'no result'); return; }
+  cmpRes = Object.assign(r, { modelA: a, modelB: b, shown: false });
+  cmpKey = key;
+  if(r.total) prevTotal = r.total;
+  prevIdx = r.frame;
+  cmpJ = wantLast ? r.multi - 1 : 1;   // stepping back into a pair lands on its last new frame
+  showCompare();
+}
+function showCompare(){
+  const r = cmpRes; if(!r) return;
+  const n = r.multi - 1;
+  if(!r.shown){ setPrevImg($('cmpimg0'), r.real0); setPrevImg($('cmpimg2'), r.real1); r.shown = true; }
+  const [x, y, mx, my] = cmpSwap ? [r.b, r.a, r.modelB, r.modelA] : [r.a, r.b, r.modelA, r.modelB];
+  setPrevImg($('cmpimg1'), x[cmpJ - 1]);
+  setPrevImg($('cmpimg3'), y[cmpJ - 1]);
+  const label = m => CMP_NAMES[m] + (m === 'rifedrba' ? ' (without DRBA timing)' : '') + ' · new frame ' + cmpJ + ' of ' + n;
+  $('cmplab0').textContent = 'Real frame ' + r.frame;
+  $('cmplab1').textContent = label(mx);
+  $('cmplab2').textContent = 'Real frame ' + (r.frame + 1);
+  $('cmplab3').textContent = label(my);
+  $('cmplabel').textContent = 'frames ' + r.frame + ' → ' + (r.frame + 1) + (prevTotal ? ' of ' + prevTotal : '');
+  $('cmpback').disabled = r.frame <= 0 && cmpJ <= 1;
+  $('cmpfwd').disabled = prevTotal > 0 && r.frame >= prevTotal - 2 && cmpJ >= n;
+  $('prevnote').textContent = (gridMulti() ? '' : 'shown at ' + r.multi + '×, your target resamples between these · ')
+    + (hdrOn() || (info && info.srcHdr) ? 'HDR is tonemapped to show on this SDR screen · ' : '')
+    + 'click to zoom (1:1, 2×, 4×) · hold Space to swap the two models';
+}
+function refreshCompare(){          // settings changed: re-run the shown pair once they settle
+  clearTimeout(cmpTimer);
+  cmpTimer = setTimeout(() => {
+    if(!input || !cmpOn()) return;
+    const frame = cmpRes ? cmpRes.frame : (lastPrevInput === input ? prevIdx : 'mid');
+    if(cmpSig(frame) === (prevBusy ? cmpInflight : cmpKey)) return;
+    loadCompare(frame);
+  }, 300);
+}
+$('cmpto').onchange = () => { syncCompareUi(); if(cmpOn()) refreshCompare(); else refreshPreviewIfOpen(); };
+$('cmpfwd').onclick = () => { const r = cmpRes; if(!r) return;
+  if(cmpJ < r.multi - 1){ cmpJ++; showCompare(); } else if(!prevTotal || r.frame < prevTotal - 2) loadCompare(r.frame + 1); };
+$('cmpback').onclick = () => { const r = cmpRes; if(!r) return;
+  if(cmpJ > 1){ cmpJ--; showCompare(); } else if(r.frame > 0){ cmpWantJ = -1; loadCompare(r.frame - 1); } };
+$('cmprand').onclick = () => loadCompare(randFrame());
+// the panes' frame size from the result (an image swapping its src reads naturalWidth 0 until it decodes)
+function cmpFrameW(){ return cmpRes ? cmpRes.w : $('cmpimg0').naturalWidth; }
+function cmpFrameH(){ return cmpRes ? cmpRes.h : $('cmpimg0').naturalHeight; }
+function applyCmpZoom(){
+  for(let i = 0; i < 4; i++){
+    const w = $('cmpw' + i), img = $('cmpimg' + i);
+    w.style.overflow = cmpZoom ? 'auto' : 'hidden';
+    w.style.maxHeight = cmpZoom ? '300px' : '';
+    img.style.width = cmpZoom ? (cmpFrameW() * cmpZoom) + 'px' : '100%';
+    img.style.maxWidth = cmpZoom ? 'none' : '';
+    img.style.imageRendering = cmpZoom >= 2 ? 'pixelated' : '';
+    img.style.cursor = cmpZoom === CMP_ZOOMS[CMP_ZOOMS.length - 1] ? 'zoom-out' : 'zoom-in';
+  }
+}
+function cmpScrollSync(src){
+  if(cmpSyncing) return; cmpSyncing = true;
+  // pixel-absolute: the four panes hold frames of one size, so the same scroll shows the same spot
+  for(let i = 0; i < 4; i++){
+    const w = $('cmpw' + i); if(w === src) continue;
+    if(Math.abs(w.scrollLeft - src.scrollLeft) >= 1) w.scrollLeft = src.scrollLeft;
+    if(Math.abs(w.scrollTop - src.scrollTop) >= 1) w.scrollTop = src.scrollTop;
+  }
+  cmpSyncing = false;
+}
+for(let i = 0; i < 4; i++){
+  const w = $('cmpw' + i), img = $('cmpimg' + i);
+  w.addEventListener('scroll', () => { cmpScrollSync(w);
+    const sp = $('cmpspin' + i); if(sp.style.display !== 'none') setSpin(w, sp, true); });
+  img.onclick = (e) => {
+    // the clicked spot in image pixels, read before the restyle moves it; the zoomed view centres on it
+    const px = e.offsetX / Math.max(1, img.clientWidth) * cmpFrameW();
+    const py = e.offsetY / Math.max(1, img.clientHeight) * cmpFrameH();
+    cmpZoom = CMP_ZOOMS[(CMP_ZOOMS.indexOf(cmpZoom) + 1) % CMP_ZOOMS.length]; applyCmpZoom();
+    if(cmpZoom){ w.scrollLeft = px * cmpZoom - w.clientWidth / 2; w.scrollTop = py * cmpZoom - w.clientHeight / 2; cmpScrollSync(w); }
+  };
+}
+// Hold Space: A and B trade panes (and labels) until it is let go; never while a text box or checkbox has the focus
+window.addEventListener('keydown', (e) => {
+  if(e.code !== 'Space' || uiMode !== 'video' || !cmpOn() || !cmpRes) return;
+  const t: any = document.activeElement;
+  if(t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;
+  e.preventDefault();
+  if(t && t.tagName === 'BUTTON') t.blur();   // a focused button would take the Space as a click
+  if(!cmpSwap){ cmpSwap = true; showCompare(); }
+});
+window.addEventListener('keyup', (e) => {
+  if(e.code !== 'Space' || !cmpSwap) return;
+  e.preventDefault(); cmpSwap = false; showCompare();
+});
+window.addEventListener('blur', () => { if(cmpSwap){ cmpSwap = false; showCompare(); } });
+// Save image: the four panes as shown (the visible crop at the shown zoom, else the whole frames), with their labels
+$('cmpsave').onclick = async () => {
+  const r = cmpRes; if(!r) return;
+  const imgs = [0, 1, 2, 3].map(i => $('cmpimg' + i));
+  await Promise.all(imgs.map(i => i.decode().catch(() => {})));   // a pane mid-swap draws once it has decoded
+  const fw = cmpFrameW(), fh = cmpFrameH(); if(!fw || !fh) return;
+  const z = cmpZoom || 1, w0 = $('cmpw0');
+  const sx = cmpZoom ? w0.scrollLeft / z : 0, sy = cmpZoom ? w0.scrollTop / z : 0;
+  const cw = cmpZoom ? Math.min(fw - sx, w0.clientWidth / z) : fw, ch = cmpZoom ? Math.min(fh - sy, w0.clientHeight / z) : fh;
+  const pw = Math.round(cw * z), ph = Math.round(ch * z), lab = 34, gap = 8;
+  const cv = document.createElement('canvas'); cv.width = 2 * pw + gap; cv.height = 2 * (ph + lab) + gap;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#111'; g.fillRect(0, 0, cv.width, cv.height);
+  g.imageSmoothingEnabled = false;
+  g.font = '600 20px "Segoe UI", sans-serif'; g.fillStyle = '#ddd'; g.textBaseline = 'middle';
+  imgs.forEach((img, i) => {
+    const x = (i % 2) * (pw + gap), y = Math.floor(i / 2) * (ph + lab + gap);
+    g.fillText($('cmplab' + i).textContent, x + 4, y + lab / 2);
+    g.drawImage(img, sx, sy, cw, ch, x, y + lab, pw, ph);
+  });
+  const file = await ipcRenderer.invoke('pick-save', input.replace(/\.[^.\\/]+$/, '') + '_compare_' + r.frame + '_' + cmpJ + '.png', 'image');
+  if(!file) return;
+  const blob: any = await new Promise(res => cv.toBlob(res, 'image/png'));
+  _fs.writeFileSync(file, new Uint8Array(await blob.arrayBuffer()));
+  $('prevnote').textContent = 'saved ' + file;
+};
+// Save clip: one second from the shown pair as a lossless video of the 2x2 (main's clip-begin / clip-frame /
+// clip-end, FFV1), every output frame at the render's output rate; at a real frame's slot both model panes show that
+// real frame (the models keep it as it is). The labels and layout of Save image, the whole frames.
+async function cmpImg(file){
+  const img = new Image();
+  img.src = URL.createObjectURL(new Blob([_fs.readFileSync(file)], { type: 'image/png' }));
+  await img.decode();
+  return img;
+}
+$('cmpclip').onclick = async () => {
+  const r = cmpRes; if(!r || prevBusy) return;
+  const n = r.multi, pairs = Math.max(1, Math.min(240, Math.round(srcFps()), (prevTotal || r.total) - 1 - r.frame));
+  const file = await ipcRenderer.invoke('pick-save', input.replace(/\.[^.\\/]+$/, '') + '_compare_' + r.frame + '.mkv', 'clip');
+  if(!file || prevBusy || cmpRes !== r) return;
+  prevBusy = true;
+  cmpSpin(true);
+  $('prevnote').textContent = 'saving the clip: running both models on ' + pairs + ' pairs…';
+  let err = '', began = false, reals = [];
+  try {
+    const c = await ipcRenderer.invoke('compare', cmpOpts(r.frame, r.modelA, r.modelB, n, pairs));
+    cmpSpin(false);
+    if(!c || c.error) throw new Error((c && c.error) || 'no result');
+    const W = c.w, H = c.h, lab = 34, gap = 8, cw = 2 * W + gap, ch = 2 * (H + lab) + gap;
+    const [num, den] = String((info && info.fps) || '24/1').split('/').map(Number);
+    began = await ipcRenderer.invoke('clip-begin', { out: file, w: cw, h: ch, fps: (num * n) + '/' + (den || 1) });
+    const cv = document.createElement('canvas'); cv.width = cw; cv.height = ch;
+    const g = cv.getContext('2d', { willReadFrequently: true });
+    const names = [CMP_NAMES[r.modelA] + (r.modelA === 'rifedrba' ? ' (without DRBA timing)' : ''), CMP_NAMES[r.modelB]];
+    let realsP = -1;
+    for(let o = 0; o <= c.pairs * n; o++){
+      const p = Math.min(Math.floor(o / n), c.pairs - 1), j = o - p * n, real = j === 0 || j === n;
+      if(p !== realsP){ reals.forEach(i => URL.revokeObjectURL(i.src)); reals = [await cmpImg(c.reals[p]), await cmpImg(c.reals[p + 1])]; realsP = p; }
+      const at = p * (n - 1) + j - 1;   // the new frame's place in c.a / c.b (outputs o not a multiple of n)
+      const right = real ? [reals[j ? 1 : 0], reals[j ? 1 : 0]] : [await cmpImg(c.a[at]), await cmpImg(c.b[at])];
+      const what = real ? ' · real frame ' + (c.frame + p + (j ? 1 : 0)) : ' · new frame ' + j + ' of ' + (n - 1);
+      const panes = [[reals[0], 'Real frame ' + (c.frame + p)], [right[0], names[0] + what],
+                     [reals[1], 'Real frame ' + (c.frame + p + 1)], [right[1], names[1] + what]];
+      g.fillStyle = '#111'; g.fillRect(0, 0, cw, ch);
+      g.font = '600 20px "Segoe UI", sans-serif'; g.fillStyle = '#ddd'; g.textBaseline = 'middle';
+      panes.forEach(([img, text]: any, i) => {
+        const x = (i % 2) * (W + gap), y = Math.floor(i / 2) * (H + lab + gap);
+        g.fillText(text, x + 4, y + lab / 2);
+        g.drawImage(img, x, y + lab, W, H);
+      });
+      if(!real) right.forEach(i => URL.revokeObjectURL(i.src));
+      $('prevnote').textContent = 'saving the clip: frame ' + (o + 1) + ' of ' + (c.pairs * n + 1) + '…';
+      if(!await ipcRenderer.invoke('clip-frame', new Uint8Array(g.getImageData(0, 0, cw, ch).data.buffer)))
+        throw new Error('the encoder stopped');
+    }
+  } catch(e){ err = (e && e.message) || String(e); }
+  reals.forEach(i => URL.revokeObjectURL(i.src));
+  cmpSpin(false);
+  if(began){ const e = await ipcRenderer.invoke('clip-end'); if(!err && e.rc !== 0) err = 'the encoder failed (exit ' + e.rc + '): ' + e.error; }
+  prevBusy = false;
+  if(prevPending != null){ const f = prevPending; prevPending = null; loadPreview(f); }
+  $('prevnote').textContent = err ? 'clip not saved: ' + err : 'saved ' + file;
+};
+
 // Interpolation on/off is expressed by the MODEL GROUP itself: any model ticked = on, none ticked
 // = off. With it off the app only re-encodes (sharpen, upscale, HDR and restore still apply), so
 // the fps and screen-rate controls grey out and the output keeps the source frame rate.
@@ -1719,6 +1973,7 @@ function startRun(){
     log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
   }
   modeBtnUi(true);
+  $('cmpto').disabled = true;   // Compare waits for the render (syncCompareUi at engine-done)
   $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlssrange').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('fsrup').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push(factor < 1 ? 'downscaling' : 'upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
@@ -1737,12 +1992,10 @@ function startRun(){
   log('>> '+input+'  ->  '+what+extra+'\n');
   const payload: any = { input, multi: gm || 2, output: lastOut, interp: interpOn() };   // on-grid: the derived integer multiplier; resample: --fps overrides this placeholder
   if(interpOn() && !gm) payload.fps = t;                                             // resample only: non-integer-multiple target
-  if(interpOn() && modelIsRifeDrba()) payload.model = 'rifedrba'; // RIFE with the DRBA sub-option on
-  else if(interpOn() && modelIsRife()) payload.model = 'rife';     // plain RIFE (bundled, always ready)
-  else if(interpOn() && modelIsDlss()) payload.model = 'dlssg';   // "DLSS 4.5" (Frame Generation) backend
-  else if(interpOn() && modelIsFruc()) payload.model = 'fruc';   // "NVIDIA Smooth Motion" (NvOFFRUC) backend
-  else if(interpOn() && modelIsNvof()) payload.model = 'nvof'; // NVIDIA Optical Flow, engine --nvof
-  else if(interpOn() && modelIsFsrfg()) payload.model = 'fsrfg'; // AMD FSR frame generation, engine --fsrfg
+  // rifedrba = RIFE with the DRBA sub-option on, rife = plain RIFE (bundled, always ready), dlssg = "DLSS 4.5" (Frame
+  // Generation), fruc = "NVIDIA Smooth Motion" (NvOFFRUC), nvof = NVIDIA Optical Flow (engine --nvof), fsrfg = AMD FSR
+  // frame generation (engine --fsrfg); none = GMFSS
+  const model = renderModel(); if(model) payload.model = model;
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
   if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
   if(nrOn()){ payload.dlssnr = true; payload.nrstructure = nrStructure(); payload.nrtone = nrTone(); payload.nrstyle = nrStyle(); payload.nrpasses = nrPasses(); }   // DLSS 5 (runtime installed)
@@ -1901,6 +2154,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   modeBtnUi(lvState !== 'idle');
   $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlssrange').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('fsrup').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
+  syncCompareUi();
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
     if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');
     batch = []; batchTotal = 1; batchFailed = []; saveBatch(null); }

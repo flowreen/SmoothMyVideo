@@ -8,8 +8,7 @@ so 2x on-grid = 49 frames, 3x = 73, 5x = 121,
 metadata boxes, Dolby Vision configuration record and HDR10+ dynamic-metadata SEI.
 
     python scripts\\smoke.py            # quick set (first run per resolution builds engines)
-    python scripts\\smoke.py --full     # + 5x, av1/vvc, HDR/DV/HDR10+, the live cases
-                                        # (--trt is accepted and ignored: every render is TensorRT)
+    python scripts\\smoke.py --full     # + 5x, av1/vvc, HDR/DV/HDR10+, the live RIFE case
 
 Pure stdlib, any python 3 (a dev tool; the product ships no python). Runs the render CLI
 exactly like the GUI does: dist/render/cli.js under the Electron binary in node mode (run
@@ -157,16 +156,15 @@ def c_noint(tmp, trt):
     assert frames(out) == 25, f"frames {frames(out)} != 25"
 
 
-@case("--lsfg (Frame Blend) 2x -> 49 frames")
+@case("--lsfg is refused (the Frame Blend model is gone)")
 def c_blend(tmp, trt):
-    # the flow-warp Frame Blend path: RIFE's flow at the blend scale, full-resolution
-    # warps
+    # Frame Blend rendered exactly as RIFE (the same engines, the same host arguments), so it was
+    # removed. The flag must be refused, never silently ignored.
     out = os.path.join(tmp, "s_blend.mp4")
     rc, err = render(SAMPLE, out, "--lsfg")
-    assert rc == 0, "engine exit " + str(rc)
-    expect_part_promoted(out)
-    assert frames(out) == 49, f"frames {frames(out)} != 49"
-    assert "Using the Frame Blend backend" in err, "Frame Blend backend line missing from stderr"
+    assert rc != 0, "a --lsfg render must fail"
+    assert "unrecognized arguments: --lsfg" in err, "the refusal line is missing"
+    assert not os.path.exists(out), "a refused render must write no output"
 
 
 @case("--nvof (NVIDIA Optical Flow) 2x -> 49 frames, native host, identical pair held")
@@ -273,7 +271,6 @@ def c_encsplit(tmp, trt):
     rc, err = render(SAMPLE, out, "--rife")
     assert rc == 0, "engine exit " + str(rc)
     assert frames(out) == 49, f"frames {frames(out)} != 49"
-    assert "split frame encoding" not in err, "a split-frame note appeared without SMV_NVENC_SPLIT"
     spf = slices_per_frame(out)
     assert spf == 1, f"{spf} slices per frame: split-frame encoding is on (it leaves a seam line)"
 
@@ -491,7 +488,6 @@ def main():
     ap = argparse.ArgumentParser(description="SMV engine smoke tests (real renders)")
     ap.add_argument("--full", action="store_true",
                     help="also run 5x, av1/vvc, HDR, DV, HDR10+, DLSS 4.5 with DLSS 5 in one render")
-    ap.add_argument("--trt", action="store_true", help="ignored (every render runs on TensorRT-RTX)")
     ap.add_argument("--keep", action="store_true", help="keep the rendered outputs")
     args = ap.parse_args()
     assert os.path.isfile(SAMPLE), "samples/test.mp4 missing"

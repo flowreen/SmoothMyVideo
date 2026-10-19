@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- The host keeps every path as UTF-8 (wmain converts its arguments). This code page makes the
+     ANSI file calls, its own and those inside the DLLs it loads (the ONNX parser), read them as
+     UTF-8, so SMV works from a folder with a non-ASCII name. Windows 10 1903 and later. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

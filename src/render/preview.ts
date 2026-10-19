@@ -11,13 +11,14 @@
 // reasoning. Two deliberate changes: the frame is decoded by ffmpeg like the render (preview.py
 // used cv2's own decode), and a 10-bit source keeps its 16-bit samples up to the display encode.
 // `node dist/render/preview.js <preview.py's arguments>`; main.ts runs it under Electron's node.
+// With --model-a / --model-b / --multi it runs a compare instead (compare() below).
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { INFERNO } from './inferno';
 import { engineCacheDir } from './cache';
-import { engineDir, tool } from './native';
+import { dlssgLimit, dlssgPasses, engineDir, tool } from './native';
 import { workPlan } from './plan';
 import { decodeRgbVf, frameCount, probe, sourceBits, SWS_ACCURATE, vfrConform } from './probe';
 import { pyFixed, pyG } from './pyfmt';
@@ -46,7 +47,24 @@ export interface PreviewArgs {
   hdr_satboost: number;
   hdr_saturation: number;
   hdr_contrast: number;
+  model_a: string | null; // --model-a: a compare's first model (the Video tab's pick)
+  model_b: string | null; // --model-b: the model it is compared to
+  multi: number; // --multi: the compare's multiplier (new frames per pair + 1)
+  pairs: number; // --pairs: the compare's pairs from the frame on (Save clip)
 }
+
+/** A compare side's host model flags (native.ts's kind; RIFE is the host's default model). RIFE + DRBA shows plain
+ * RIFE's frames: DRBA's output follows a resampled grid (native.ts runs it like --fps), not one pair's evenly spaced
+ * new frames. */
+const MODEL_FLAGS: Record<string, string[]> = {
+  gmfss: ['--gmfss'],
+  rife: [],
+  rifedrba: [],
+  nvof: ['--nvof'],
+  dlssg: ['--dlssg'],
+  fsrfg: ['--fsrfg'],
+  fruc: ['--fruc'],
+};
 
 /** preview.py's argparse flags. */
 export function parsePreviewArgv(argv: string[]): PreviewArgs {
@@ -72,6 +90,10 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     hdr_satboost: 0,
     hdr_saturation: 0,
     hdr_contrast: 100,
+    model_a: null,
+    model_b: null,
+    multi: 2,
+    pairs: 1,
   };
   const num = (k: string, v: string | undefined, int = false): number => {
     const x = v === undefined ? NaN : Number(v);
@@ -101,6 +123,8 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--nr-passes': 'nr_passes',
     '--hdr-saturation': 'hdr_saturation',
     '--hdr-contrast': 'hdr_contrast',
+    '--multi': 'multi',
+    '--pairs': 'pairs',
   };
   const rec = a as unknown as Record<string, unknown>;
   const pos: string[] = [];
@@ -109,12 +133,14 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     if (k in flags) rec[flags[k]] = true;
     else if (k in floats) rec[floats[k]] = num(k, argv[++i]);
     else if (k in ints) rec[ints[k]] = num(k, argv[++i], true);
-    else if (k === '--frame' || k === '--out' || k === '--hdr-color' || k === '--scale') {
+    else if (['--frame', '--out', '--hdr-color', '--scale', '--model-a', '--model-b'].includes(k)) {
       const v = argv[++i];
       if (v === undefined) throw new Error(`argument ${k}: expected one argument`);
       if (k === '--frame') a.frame = v;
       else if (k === '--out') a.out = v;
       else if (k === '--scale') a.scale = v;
+      else if (k === '--model-a') a.model_a = v;
+      else if (k === '--model-b') a.model_b = v;
       else a.hdr_color = v;
     } else if (k.startsWith('-') && k.length > 1) throw new Error(`unrecognized arguments: ${k}`);
     else pos.push(k);
@@ -127,11 +153,23 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
   if (!a.out) throw new Error('the following arguments are required: --out');
   if (![0, 1, 2].includes(a.nr_style))
     throw new Error(`argument --nr-style: invalid choice: ${a.nr_style} (choose from 0, 1, 2)`);
-  if (!(a.nr_passes >= 1 && a.nr_passes <= 10))
-    throw new Error(`argument --nr-passes: invalid choice: ${a.nr_passes} (choose from 1 to 10)`);
+  if (!(a.nr_passes >= 1 && a.nr_passes <= 20))
+    throw new Error(`argument --nr-passes: invalid choice: ${a.nr_passes} (choose from 1 to 20)`);
   if (!['vivid', 'rtx', 'raw'].includes(a.hdr_color)) {
     throw new Error(`argument --hdr-color: invalid choice: '${a.hdr_color}' (choose from 'vivid', 'rtx', 'raw')`);
   }
+  for (const [k, v] of [
+    ['--model-a', a.model_a],
+    ['--model-b', a.model_b],
+  ] as const) {
+    if (v !== null && !(v in MODEL_FLAGS))
+      throw new Error(`argument ${k}: invalid choice: '${v}' (choose from ${Object.keys(MODEL_FLAGS).join(', ')})`);
+  }
+  if ((a.model_a === null) !== (a.model_b === null)) throw new Error('a compare takes both --model-a and --model-b');
+  if (!(a.multi >= 2 && a.multi <= 100))
+    throw new Error(`argument --multi: invalid choice: ${a.multi} (choose from 2 to 100)`);
+  if (!(a.pairs >= 1 && a.pairs <= 240))
+    throw new Error(`argument --pairs: invalid choice: ${a.pairs} (choose from 1 to 240)`);
   return a;
 }
 
@@ -326,17 +364,21 @@ function hdrLinear(words: Buffer, w: number, h: number): { lin: Float32Array; lu
   return { lin, lum };
 }
 
+/** _tonemap's exposure: the source's lit median luminance over the TrueHDR output's. */
+function hdrExposure(lum: Float32Array, src: Frame): number {
+  const ms = litMedian(srcLum(src), f(1e-4)),
+    mh = litMedian(lum, f(1e-6));
+  return ms !== null && mh !== null ? ms / Math.max(1e-9, mh) : 1.0;
+}
+
 /** _tonemap: the TrueHDR output (x2rgb10le words) to sRGB, anchored to the source. */
 function tonemapHdr(words: Buffer, w: number, h: number, src: Frame): Buffer {
   const { lin, lum } = hdrLinear(words, w, h);
-  const ms = litMedian(srcLum(src), f(1e-4)),
-    mh = litMedian(lum, f(1e-6));
-  const k = ms !== null && mh !== null ? ms / Math.max(1e-9, mh) : 1.0;
-  return shoulderSrgb(lin, k);
+  return shoulderSrgb(lin, hdrExposure(lum, src));
 }
 
-/** _tonemap_pq: an already-PQ frame to sRGB, self-anchored (median luminance at 0.2 linear). */
-function tonemapPq(fr: Frame): Buffer {
+/** An already-PQ frame as linear BT.709 and its luminance. */
+function pqLinear(fr: Frame): { lin: Float32Array; lum: Float32Array } {
   const c = codes(fr);
   const d = f(c.levels - 1);
   const lut = table(c.levels, (v) => pqToLinear(f(v / d)));
@@ -344,8 +386,19 @@ function tonemapPq(fr: Frame): Buffer {
     lum = new Float32Array(fr.w * fr.h);
   for (let i = 0; i < c.n; i++) lin[i] = lut[c.at(i)];
   to709(lin, lum);
+  return { lin, lum };
+}
+
+/** _tonemap_pq's exposure: the lit median luminance at 0.2 linear. */
+function pqExposure(lum: Float32Array): number {
   const m = litMedian(lum, f(1e-5));
-  return shoulderSrgb(lin, m !== null ? 0.2 / Math.max(1e-9, m) : 1.0);
+  return m !== null ? 0.2 / Math.max(1e-9, m) : 1.0;
+}
+
+/** _tonemap_pq: an already-PQ frame to sRGB, self-anchored (median luminance at 0.2 linear). */
+function tonemapPq(fr: Frame): Buffer {
+  const { lin, lum } = pqLinear(fr);
+  return shoulderSrgb(lin, pqExposure(lum));
 }
 
 /** A frame as display uint8 (torch's clamp * 255 then round half to even for 16-bit samples). */
@@ -524,8 +577,9 @@ function nrMask(delta: Float32Array, proc: Buffer): { png: Buffer; touched: numb
 }
 
 // ---- the preview ----------------------------------------------------------------------------
-/** preview.py main(): writes the PNGs and resolves to its stdout line. */
-export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+/** What a preview and a compare share: the probe, the render's plan at the current settings, the decode, and the
+ * RTX / DLSS 5 passes that can run here. */
+async function setup(a: PreviewArgs, env: NodeJS.ProcessEnv) {
   const ENGINE = engineDir();
   const FFMPEG = tool(ENGINE, 'ffmpeg'),
     FFPROBE = tool(ENGINE, 'ffprobe');
@@ -552,11 +606,23 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   const bits: 8 | 16 = sourceBits(pr.st, String(pr.st.pix_fmt || 'yuv420p')) >= 10 ? 16 : 8;
   const DEC_FMT = bits === 16 ? 'rgb48le' : 'rgb24',
     bpp = bits === 16 ? 6 : 3;
+  let needVsr = OW > W && OH > H && a.rtx_vsr;
+  const rtxDir = env.SMV_RTXVIDEO_DIR || path.join(ENGINE, 'rtxvideo');
+  if ((needVsr || doHdr) && !['rtxvideo_cuda.dll', 'nvngx_truehdr.dll'].every((d) => isFile(path.join(rtxDir, d)))) {
+    needVsr = false; // no RTX Video bridge means Lanczos3 + SDR
+    doHdr = false;
+  }
+  const nrDir = env.SMV_DLSSNR_DIR || path.join(ENGINE, 'dlssnr');
+  const nrOn = a.dlssnr && ['nvngx.dll', 'nvngx_dlssnr.dll'].every((d) => isFile(path.join(nrDir, d)));
 
-  // the frame: the render's decode (its pixel format, colour conversion and downscale fold), seeked to
-  // idx; the original pane decodes without the fold (vf empty, the source size)
-  const decode = async (at: number, fold: string[] = plan.vf, dw: number = W, dh: number = H) => {
-    const ss = at > 0 ? ['-ss', String(Math.max(0, ((at - 0.5) * vfr.den) / vfr.num))] : [];
+  // `count` frames from idx `at` on: the render's decode (its pixel format, colour conversion and downscale fold);
+  // the original pane decodes without the fold (fold empty, the source size). A VFR source takes the render's constant
+  // average rate (vfrConform's flags) from a seek ON that grid a few frames early, the frames before `at` dropped: a
+  // seek between grid points moves the rate conversion's picks (harness compare_view vfr_decode_check.py)
+  const decode = async (at: number, count = 1, fold: string[] = plan.vf, dw: number = W, dh: number = H) => {
+    const from = vfr.flags.length ? Math.max(0, at - 3) : at;
+    const t = vfr.flags.length ? (from * vfr.den) / vfr.num : Math.max(0, ((at - 0.5) * vfr.den) / vfr.num);
+    const ss = from > 0 ? ['-ss', String(t)] : [];
     const vf = fold.length ? fold : decodeRgbVf(pr.st, dw, dh);
     const r = await run(
       FFMPEG,
@@ -571,9 +637,10 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         '-an',
         '-sn',
         '-dn',
+        ...vfr.flags,
         ...(vf.length ? ['-vf', vf.join(',')] : []),
         '-frames:v',
-        '1',
+        String(at - from + count),
         '-f',
         'rawvideo',
         '-pix_fmt',
@@ -583,18 +650,106 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
       null,
       ENGINE,
     );
-    return r.out.length >= dw * dh * bpp ? r.out.subarray(0, dw * dh * bpp) : null;
+    const skip = (at - from) * dw * dh * bpp,
+      size = count * dw * dh * bpp;
+    return r.out.length >= skip + size ? r.out.subarray(skip, skip + size) : null;
   };
+  return {
+    ENGINE,
+    inp,
+    strength,
+    pr,
+    n,
+    idx,
+    transfer,
+    srcHdr,
+    doHdr,
+    up,
+    fold: plan.vf,
+    W,
+    H,
+    OW,
+    OH,
+    WW,
+    WH,
+    bits,
+    DEC_FMT,
+    bpp,
+    needVsr,
+    nrOn,
+    decode,
+  };
+}
+type Setup = Awaited<ReturnType<typeof setup>>;
+
+/** The host's pass flags for the render's chain at the current settings (Restore and the resize to the working size,
+ * DLSS 5, the resize to `out` with RTX VSR / AMD FSR 4 when `upscaler`, Adaptive Sharpen, RTX HDR); `srcHdr` = a PQ /
+ * HLG source's --src-hdr, `deltaFile` = the DLSS 5 change map's file. */
+function passFlags(
+  a: PreviewArgs,
+  s: Setup,
+  o: { outW: number; outH: number; upscaler: boolean; srcHdr: boolean; deltaFile?: string },
+): string[] {
+  const args: string[] = [];
+  if (o.outW !== s.W || o.outH !== s.H) {
+    args.push('--out-w', String(o.outW), '--out-h', String(o.outH));
+    if (o.upscaler) {
+      if (s.needVsr) args.push('--rtx-vsr');
+      else if (a.fsr_upscale && o.outW > s.W && o.outH > s.H) args.push('--fsr-upscale');
+    }
+  }
+  if (s.strength > 0) args.push('--sharpen', pyG(s.strength));
+  if (a.restore) args.push('--restore');
+  if (s.WW !== s.W || s.WH !== s.H || a.restore) args.push('--work-w', String(s.WW), '--work-h', String(s.WH));
+  if (s.nrOn) {
+    args.push(
+      '--dlssnr',
+      '--nr-structure',
+      pyG(clamp(a.nr_structure, 0.0, 2.0)),
+      '--nr-tone',
+      pyG(clamp(a.nr_tone, 0.0, 2.0)),
+      '--nr-style',
+      String(a.nr_style),
+    );
+    if (a.nr_passes > 1) args.push('--nr-passes', String(a.nr_passes));
+  }
+  // HDR video (PQ or HLG): DLSS 5 sees its SDR range, as Live does on an HDR desktop, and RIFE finds the motion on
+  // the same SDR view of the decoded picture
+  if (o.srcHdr && s.srcHdr) args.push('--src-hdr', s.transfer === 'arib-std-b67' ? 'hlg' : 'pq');
+  if (o.deltaFile) args.push('--nr-delta', o.deltaFile);
+  if (s.doHdr) {
+    args.push(
+      '--rtx-hdr',
+      '--hdr-color',
+      a.hdr_color,
+      '--hdr-contrast',
+      String(clamp(a.hdr_contrast, 0, 200)),
+      '--hdr-saturation',
+      String(clamp(a.hdr_saturation, 0, 200)),
+      '--hdr-vibrance',
+      pyG(clamp(a.hdr_vibrance, 0.0, 1.0)),
+      '--hdr-satboost',
+      pyG(clamp(a.hdr_satboost, 0.0, 1.0)),
+    );
+  }
+  return args;
+}
+
+/** preview.py main(): writes the PNGs and resolves to its stdout line. */
+export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const s = await setup(a, env);
+  const { ENGINE, idx, n, W, H, OW, OH, WW, WH, bits, DEC_FMT, bpp, strength, srcHdr, transfer, up } = s;
+  const { needVsr, nrOn, doHdr } = s;
   let at = idx;
-  let px = await decode(at);
-  if (!px && idx > 0) px = await decode((at = 0)); // a missed seek: frame 0, like preview.py
+  let px = await s.decode(at);
+  if (!px && idx > 0) px = await s.decode((at = 0)); // a missed seek: frame 0, like preview.py
   if (!px) throw new Error('could not read a frame from ' + a.input);
   const orig: Frame = { w: W, h: H, bits, px };
   // the before pane: the source itself when the working size folds the decode
   let before: Frame = orig;
-  if (plan.vf.length) {
-    const full = await decode(at, [], pr.w, pr.h);
-    if (full) before = { w: pr.w, h: pr.h, bits, px: full };
+  if (s.fold.length) {
+    const full = await s.decode(at, 1, [], s.pr.w, s.pr.h);
+    if (full) before = { w: s.pr.w, h: s.pr.h, bits, px: full };
   }
 
   let vsrUsed = false,
@@ -603,18 +758,19 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   let proc: Frame | null = null,
     hdrWords: Buffer | null = null,
     delta: Float32Array | null = null;
-  let needVsr = OW > W && OH > H && a.rtx_vsr;
-  const rtxDir = env.SMV_RTXVIDEO_DIR || path.join(ENGINE, 'rtxvideo');
-  if ((needVsr || doHdr) && !['rtxvideo_cuda.dll', 'nvngx_truehdr.dll'].every((d) => isFile(path.join(rtxDir, d)))) {
-    needVsr = false; // no RTX Video bridge means Lanczos3 + SDR
-    doHdr = false;
-  }
-  const nrDir = env.SMV_DLSSNR_DIR || path.join(ENGINE, 'dlssnr');
-  const nrOn = a.dlssnr && ['nvngx.dll', 'nvngx_dlssnr.dll'].every((d) => isFile(path.join(nrDir, d)));
   if (strength > 0 || a.restore || OW !== W || OH !== H || doHdr || nrOn) {
     const cacheDir = engineCacheDir(ENGINE, env);
     fs.mkdirSync(cacheDir, { recursive: true });
     const outFmt = doHdr ? 'x2rgb10le' : DEC_FMT;
+    const deltaFile = path.resolve(a.out) + '_nrdelta.f32';
+    const mask = nrOn && a.nr_mask;
+    if (mask) {
+      try {
+        fs.unlinkSync(deltaFile);
+      } catch {
+        /* not there */
+      }
+    }
     const args = [
       '--offline',
       '--w',
@@ -632,53 +788,8 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
       path.join(ENGINE, 'live_server.py'),
       '--cache',
       cacheDir,
+      ...passFlags(a, s, { outW: OW, outH: OH, upscaler: true, srcHdr: true, deltaFile: mask ? deltaFile : undefined }),
     ];
-    if (OW !== W || OH !== H) {
-      args.push('--out-w', String(OW), '--out-h', String(OH));
-      if (needVsr) args.push('--rtx-vsr');
-      else if (a.fsr_upscale && OW > W && OH > H) args.push('--fsr-upscale');
-    }
-    if (strength > 0) args.push('--sharpen', pyG(strength));
-    if (a.restore) args.push('--restore');
-    if (WW !== W || WH !== H || a.restore) args.push('--work-w', String(WW), '--work-h', String(WH));
-    const deltaFile = path.resolve(a.out) + '_nrdelta.f32';
-    if (nrOn) {
-      args.push(
-        '--dlssnr',
-        '--nr-structure',
-        pyG(clamp(a.nr_structure, 0.0, 2.0)),
-        '--nr-tone',
-        pyG(clamp(a.nr_tone, 0.0, 2.0)),
-        '--nr-style',
-        String(a.nr_style),
-      );
-      if (a.nr_passes > 1) args.push('--nr-passes', String(a.nr_passes));
-      // HDR video (PQ or HLG): DLSS 5 sees its SDR range, as Live does on an HDR desktop
-      if (srcHdr) args.push('--src-hdr', transfer === 'arib-std-b67' ? 'hlg' : 'pq');
-      if (a.nr_mask) {
-        try {
-          fs.unlinkSync(deltaFile);
-        } catch {
-          /* not there */
-        }
-        args.push('--nr-delta', deltaFile);
-      }
-    }
-    if (doHdr) {
-      args.push(
-        '--rtx-hdr',
-        '--hdr-color',
-        a.hdr_color,
-        '--hdr-contrast',
-        String(clamp(a.hdr_contrast, 0, 200)),
-        '--hdr-saturation',
-        String(clamp(a.hdr_saturation, 0, 200)),
-        '--hdr-vibrance',
-        pyG(clamp(a.hdr_vibrance, 0.0, 1.0)),
-        '--hdr-satboost',
-        pyG(clamp(a.hdr_satboost, 0.0, 1.0)),
-      );
-    }
     const r = await run(path.join(ENGINE, 'live', 'smv-live.exe'), args, px, ENGINE);
     const outBytes = OW * OH * (doHdr ? 4 : bpp);
     if (r.rc !== 0 || r.out.length < outBytes) {
@@ -728,6 +839,197 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
   );
 }
 
+// ---- the compare ----------------------------------------------------------------------------
+/** Host stages in a pipe (DLSS 4.5's passes; one stage otherwise), `input` on the first one's stdin: the last one's
+ * frames of `frameBytes` from frame `keepFrom` on go to `onFrame` as they arrive (the earlier ones are only read), and
+ * it resolves to the first failing exit code and every stage's stderr. A failed stage stops the others, so a pass
+ * never waits on a reader that left. */
+function runChain(
+  exe: string,
+  stages: string[][],
+  input: Buffer,
+  cwd: string,
+  frameBytes: number,
+  keepFrom: number,
+  onFrame: (fr: Buffer) => void,
+): Promise<{ rc: number; err: string }> {
+  const ps = stages.map((a) => spawn(exe, a, { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }));
+  const errs = ps.map(() => [] as Buffer[]);
+  const wrote = ps.map(() => false); // the stage's stdout ended: it wrote everything it had
+  ps.forEach((p, i) => {
+    p.stderr!.on('data', (b: Buffer) => errs[i].push(b));
+    p.stdout!.once('end', () => (wrote[i] = true));
+    p.stdin!.on('error', () => {
+      /* the stage left early: its exit code says why */
+    });
+    if (i + 1 < ps.length) p.stdout!.pipe(ps[i + 1].stdin!);
+  });
+  let parts: Buffer[] = [],
+    have = 0,
+    seen = 0;
+  ps[ps.length - 1].stdout!.on('data', (b: Buffer) => {
+    while (b.length) {
+      const take = Math.min(b.length, frameBytes - have);
+      if (seen >= keepFrom) parts.push(b.subarray(0, take));
+      have += take;
+      b = b.subarray(take);
+      if (have === frameBytes) {
+        if (seen >= keepFrom) onFrame(Buffer.concat(parts, frameBytes));
+        parts = [];
+        have = 0;
+        seen++;
+      }
+    }
+  });
+  const done = ps.map(
+    (p, i) =>
+      new Promise<number>((res) => {
+        p.once('error', (e) => {
+          errs[i].push(Buffer.from(e.message));
+          res(-1);
+        });
+        p.once('close', (c: number | null) => {
+          // a failure stops every other stage; any end stops the stages before it that have not written all their
+          // frames (left writing to a reader that is gone, they would wait forever)
+          ps.forEach((q, j) => {
+            if (q !== p && q.exitCode === null && (c !== 0 || (j < i && !wrote[j]))) q.kill();
+          });
+          res(c ?? 1);
+        });
+      }),
+  );
+  ps[0].stdin!.end(input);
+  return Promise.all(done).then((rcs) => ({
+    rc: rcs.find((c) => c !== 0) ?? 0,
+    err: errs.map((e) => Buffer.concat(e).toString('utf8')).join('\n'),
+  }));
+}
+
+/** A compare: the pairs (k, k + 1) .. (k + pairs - 1, k + pairs) through two models at the current settings, each pane
+ * the render's own frame: the real frames (model A's run) and both models' new frames between them -> <out>_real<p>.png
+ * (the real frame k + p) and _a<o>.png / _b<o>.png (o = the output frame from k on, never a multiple of multi), and one
+ * stdout line; one pair = _real0, _real1 and _a1 .. _a<multi - 1>. Each side is one host run of the render's flags
+ * on the render's decode, starting one pair before k when there is one (DLSS 4.5, Smooth Motion, AMD FSR 4 and
+ * DLSS 5 carry history from frame to frame); DLSS 4.5 above one pass's limit runs the render's passes, piped. Every
+ * pane shares one tone-map anchor, the real frame k's, so the panes compare by eye. */
+export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const s = await setup(a, env);
+  const { ENGINE, W, H, OW, OH, WW, WH, bits, DEC_FMT, bpp } = s;
+  if (s.n < 2) throw new Error('a compare needs a video of two frames or more');
+  const P = Math.min(a.pairs, s.n - 1);
+  const k = Math.min(s.idx, s.n - 1 - P);
+  const lead = Math.min(k, 1);
+  const N = a.multi;
+  const px = await s.decode(k - lead, lead + P + 1);
+  if (!px) throw new Error(`could not read frames ${k} to ${k + P} from ${a.input}`);
+  const src: Frame = { w: W, h: H, bits, px: px.subarray(lead * W * H * bpp, (lead + 1) * W * H * bpp) };
+  const cacheDir = engineCacheDir(ENGINE, env);
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const exe = path.join(ENGINE, 'live', 'smv-live.exe');
+  // the render's encoder input on an interpolating route (native.ts ENC_IN_FMT): 16-bit RGB, TrueHDR's words
+  const outFmt = s.doHdr ? 'x2rgb10le' : 'rgb48le';
+  const frameBytes = OW * OH * (s.doHdr ? 4 : 6);
+  const outDir = path.dirname(path.resolve(a.out));
+  if (outDir) fs.mkdirSync(outDir, { recursive: true });
+
+  // display conversion: one exposure for every pane, set by the first frame shown (the real frame k)
+  const pq = s.transfer === 'smpte2084';
+  let exposure: number | null = null;
+  const show = (fr: Buffer): Buffer => {
+    if (s.doHdr) {
+      const { lin, lum } = hdrLinear(fr, OW, OH);
+      return shoulderSrgb(lin, (exposure ??= hdrExposure(lum, src)));
+    }
+    const F: Frame = { w: OW, h: OH, bits: 16, px: fr };
+    if (!pq) return toU8(F);
+    const { lin, lum } = pqLinear(F);
+    return shoulderSrgb(lin, (exposure ??= pqExposure(lum)));
+  };
+
+  let notes = '';
+  const side = async (model: string, tag: string): Promise<void> => {
+    let passes = [N];
+    if (model === 'dlssg' && N > 2) {
+      const limit = (await dlssgLimit(exe, ENGINE, cacheDir, env)) || 6;
+      passes = dlssgPasses(N, limit);
+      if (!passes.length) throw new Error(`DLSS 4.5 cannot make ${N}x on this GPU: one pass makes up to ${limit}x`);
+      if (passes.length > 1 && s.doHdr)
+        throw new Error(`DLSS 4.5 at ${N}x runs ${passes.length} passes, which RTX HDR does not join yet`);
+    }
+    // native.ts's cascade: the first pass ends at the working size, the last one makes the final resize
+    const cascade = passes.length > 1;
+    const lastResize = OW !== WW || OH !== WH;
+    const head = (w: number, h: number, m: number, frames: number, pixIn: string, pixOut: string) => [
+      '--offline',
+      '--w',
+      String(w),
+      '--h',
+      String(h),
+      '--multi',
+      String(m),
+      '--frames',
+      String(frames),
+      '--pixfmt',
+      pixIn,
+      '--out-pixfmt',
+      pixOut,
+      '--script',
+      path.join(ENGINE, 'live_server.py'),
+      '--cache',
+      cacheDir,
+    ];
+    const stages = [
+      [
+        ...head(W, H, passes[0], lead + P + 1, DEC_FMT, outFmt),
+        ...MODEL_FLAGS[model],
+        ...passFlags(a, s, {
+          outW: cascade ? WW : OW,
+          outH: cascade ? WH : OH,
+          upscaler: !cascade || !lastResize,
+          srcHdr: true,
+        }),
+      ],
+    ];
+    let frames = (lead + P) * passes[0] + 1;
+    for (let i = 1; i < passes.length; i++) {
+      const last = i === passes.length - 1;
+      const st = [...head(WW, WH, passes[i], frames, 'rgb48le', last ? outFmt : 'rgb48le'), '--dlssg'];
+      if (last && lastResize) {
+        st.push('--out-w', String(OW), '--out-h', String(OH));
+        if (s.needVsr) st.push('--rtx-vsr');
+        else if (a.fsr_upscale && OW > WW && OH > WH) st.push('--fsr-upscale');
+      }
+      if (s.srcHdr) st.push('--src-hdr', s.transfer === 'arib-std-b67' ? 'hlg' : 'pq');
+      stages.push(st);
+      frames = (frames - 1) * passes[i] + 1;
+    }
+    // the pairs' frames from the real frame k on: output o = p * N is the real frame k + p (model A's run), every
+    // other o a new frame
+    let o = 0;
+    const r = await runChain(exe, stages, px, ENGINE, frameBytes, lead * N, (fr) => {
+      if (o % N) writePng(`${a.out}_${tag}${o}.png`, show(fr), OW, OH);
+      else if (tag === 'a') writePng(`${a.out}_real${o / N}.png`, show(fr), OW, OH);
+      o++;
+    });
+    if (r.rc !== 0 || o < P * N + 1) {
+      const why = r.err.trim().split(/\r?\n/).slice(-4).join(' | ');
+      throw new Error(`${model}: the native host failed (exit ${r.rc}, ${o} of ${P * N + 1} frames): ${why}`);
+    }
+    if (tag === 'a') {
+      const vsr = s.needVsr && !/RTX VSR (unavailable|skipped|demoted)|VSR run failed|VSR eval failed/.test(r.err);
+      const restore = a.restore && !/\[restore\] unavailable|restore failed/.test(r.err);
+      const nr = s.nrOn && /DLSS 5 Neural Rendering ready/.test(r.err) && !/\[dlss5\]/.test(r.err);
+      notes = `vsr=${+vsr} restore=${+restore} nr=${+nr}`;
+    }
+  };
+  await side(a.model_a!, 'a');
+  await side(a.model_b!, 'b');
+  return (
+    `compare frame ${k}/${s.n} ${OW}x${OH} multi=${N} pairs=${P} a=${a.model_a} b=${a.model_b} hdr=${+s.doHdr} ` +
+    `srchdr=${+s.srcHdr} ${notes} -> ${a.out}\n`
+  );
+}
+
 if (require.main === module) {
   let a: PreviewArgs;
   try {
@@ -736,7 +1038,7 @@ if (require.main === module) {
     process.stderr.write(`preview: error: ${(e as Error).message}\n`);
     process.exit(2);
   }
-  preview(a).then(
+  (a.model_a !== null ? compare(a) : preview(a)).then(
     (line) => {
       process.stdout.write(line);
     },

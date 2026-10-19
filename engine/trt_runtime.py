@@ -80,10 +80,15 @@ def _fuse_prelu(onnx_path):
     """Rewrite every PRelu into an exact form TensorRT-RTX fuses into the conv before it: it runs
     PRelu as a separate elementwise kernel (22 % of fusionnet, 26 % of Restore) but fuses
     LeakyRelu and Max. Scalar slope a: LeakyRelu(alpha=a); per-channel slopes all <= 1:
-    Max(x, x * a); any per-channel slope: Max(x, 0) + a * Min(x, 0). Each is exact for its case,
-    and the engines built from the rewrite give bit-identical output (Restore 1.30x, fusionnet
-    1.06x / 1.09x faster at 1080p / 4K).
-    Only the graph is rewritten; the external weight file stays as it is."""
+    Max(x, x * a). Per-channel slopes with one above 1 where a Conv's output is the PRelu's only
+    input reader and one Conv reads its result: the SIGN FOLD, every channel with a > 1 gets its
+    conv output channel (weights and bias) and the next conv's input channel negated, so there
+    PReLU_a(x) = -Max(-x, -a x) and the activation is Max(x, x * a) again (Restore's 14 such:
+    1.84 -> 1.74 ms a layer, the 1080p call x0.977, bit-identical); any other per-channel slope:
+    Max(x, 0) + a * Min(x, 0). Each is exact for its case, and the engines built from the rewrite
+    give bit-identical output (Restore 1.30x, fusionnet 1.06x / 1.09x faster at 1080p / 4K).
+    The graph is rewritten and the sign fold's changed weights are written into it under new
+    names; the external weight file stays as it is."""
     import numpy as np
     import onnx
     from onnx import helper, numpy_helper
@@ -92,6 +97,51 @@ def _fuse_prelu(onnx_path):
     if not any(n.op_type == "PRelu" for n in g.graph.node):
         return
     vals = {i.name: numpy_helper.to_array(i) for i in onnx.load(onnx_path).graph.initializer}
+    prod = {o: n for n in g.graph.node for o in n.output}
+    cons = {}
+    for n in g.graph.node:
+        for x in n.input:
+            cons.setdefault(x, []).append(n)
+    outs = {o.name for o in g.graph.output}
+    folded = {}   # weight / bias name -> its sign-folded values
+    renamed = {}  # the convs whose weights the fold changed
+
+    def cur(t):
+        return folded[t] if t in folded else vals[t]
+
+    def per_channel(a, w):
+        """slopes a broadcast over a conv output's channel axis only (conv weight w): (C, 1, 1) or (1, C, 1, 1)
+        for a 2-D conv; a (C,) slope would broadcast over the last axis instead"""
+        sh = list(a.shape)
+        while len(sh) > w.ndim - 1 and sh[0] == 1:
+            sh.pop(0)
+        return sh == [w.shape[0]] + [1] * (w.ndim - 2)
+
+    def fold(nd, a):
+        """the sign fold of PRelu nd (slopes a), when its producer and its reader are single Convs"""
+        cv, rd = prod.get(nd.input[0]), cons.get(nd.output[0], [])
+        if (cv is None or cv.op_type != "Conv" or len(cv.input) != 3 or cons.get(nd.input[0]) != [nd]
+                or len(rd) != 1 or rd[0].op_type != "Conv" or rd[0].input[0] != nd.output[0]
+                or not all(t in vals for t in (cv.input[1], cv.input[2], rd[0].input[1]))
+                or not per_channel(a, vals[cv.input[1]])
+                # a grouped reader's weights index its input channels per group
+                or any(at.name == "group" and helper.get_attribute_value(at) != 1 for at in rd[0].attribute)
+                # a graph output would see the negated channels
+                or nd.input[0] in outs or nd.output[0] in outs
+                # a weight or bias another node reads too (tied convs) would carry the other's sign flips
+                or any(cons.get(t) != [c] for c, t in ((cv, cv.input[1]), (cv, cv.input[2]),
+                                                        (rd[0], rd[0].input[1])))):
+            return False
+        neg = np.nonzero(a.reshape(-1) > 1.0)[0]
+        w, b, w2 = cur(cv.input[1]).copy(), cur(cv.input[2]).copy(), cur(rd[0].input[1]).copy()
+        w[neg] = -w[neg]
+        b[neg] = -b[neg]
+        w2[:, neg] = -w2[:, neg]
+        folded.update({cv.input[1]: w, cv.input[2]: b, rd[0].input[1]: w2})
+        for c in (cv, rd[0]):
+            renamed[id(c)] = c
+        return True
+
     nodes = []
     for nd in g.graph.node:
         if nd.op_type != "PRelu":
@@ -102,7 +152,7 @@ def _fuse_prelu(onnx_path):
         if a.size == 1:
             nodes.append(helper.make_node("LeakyRelu", [x], [y], alpha=float(a.reshape(-1)[0]),
                                           name=nd.name + "_lrelu"))
-        elif float(a.max()) <= 1.0:
+        elif float(a.max()) <= 1.0 or fold(nd, a):
             nodes += [helper.make_node("Mul", [x, s], [y + "_ax"], name=nd.name + "_mul"),
                       helper.make_node("Max", [x, y + "_ax"], [y], name=nd.name + "_max")]
         else:
@@ -112,6 +162,10 @@ def _fuse_prelu(onnx_path):
                       helper.make_node("Min", [x, z], [y + "_n"], name=nd.name + "_neg"),
                       helper.make_node("Mul", [s, y + "_n"], [y + "_an"], name=nd.name + "_mul"),
                       helper.make_node("Add", [y + "_p", y + "_an"], [y], name=nd.name + "_add")]
+    for c in renamed.values():
+        c.input[:] = [t + "_sf" if t in folded else t for t in c.input]
+    for t, v in folded.items():
+        g.graph.initializer.append(numpy_helper.from_array(np.ascontiguousarray(v), t + "_sf"))
     used = {i for n in nodes for i in n.input}
     keep = [i for i in g.graph.initializer if i.name in used]
     del g.graph.initializer[:]

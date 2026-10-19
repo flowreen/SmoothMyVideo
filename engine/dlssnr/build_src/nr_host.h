@@ -1,7 +1,7 @@
 // nr_host.h - reusable DLSS 5 Neural Rendering core for SmoothMyVideo.
 //
 // The core creates its own D3D12 device: smv-live.exe hands the frames over through
-// shared buffers (startShared) or through CPU staging (renderFrame).
+// textures shared with CUDA (startShared) or through CPU staging (renderFrame).
 // Everything DLSS 5 specific lives here.
 //
 // Nothing here is copied from any third party host. The NGX call order, the
@@ -40,7 +40,7 @@ struct Settings
     int preset = 3;         // DLSSNR.Hint.Render.Preset, 0..3
     int automask = 1;       // DLSSNR.UseAutoMask, as every reference host sets it (SMV_NR_AUTOMASK=0 = off)
     // DLSSNR.MVec: a per-frame R16G16_FLOAT motion field (current -> previous, px) that the caller
-    // writes into the shared motion buffer (startShared); without it the runtime gets no motion
+    // writes into the shared MVec texture (startShared); without it the runtime gets no motion
     bool motion = false;
     // the pass run 1..kMaxPasses times in a chain on every frame: pass k's output is pass k + 1's
     // input, each pass its OWN feature and history (one feature called twice a frame would see two
@@ -48,7 +48,7 @@ struct Settings
     int passes = 1;
 };
 
-const int kMaxPasses = 10;
+const int kMaxPasses = 20;
 
 // Each pass's working memory in a running chain, in MiB a megapixel. Measured on nvngx_dlssnr 310.8 at 854x480,
 // 1920x1080 and 3840x2160 with 1 and 4 passes (7 / 34 / 128 MiB a pass), a quarter on top.
@@ -75,53 +75,48 @@ class Host
     // discontinuity; the runtime keeps temporal history otherwise.
     bool renderFrame(const void* src, void* dst, bool reset, std::string& err);
 
-    // Zero-copy handoff for a caller that renders with CUDA on the same GPU, after startup():
-    // two shared DEFAULT-heap buffers carry the frame in and out in the copy footprint layout
-    // (rowPitch() bytes per row, sharedBytes() in all) and a shared fence orders the caller's
-    // work and the evaluate on the GPU, so no frame crosses the CPU. false = a resource or a
-    // handle could not be made (err says which); renderFrame stays usable either way.
+    // Zero-copy handoff for a caller that renders with CUDA on the same GPU, after startup(): the
+    // Color, Output and (Settings::motion) MVec textures themselves are shared (an NT handle and the
+    // allocation size each, for a dedicated import as CUDA arrays) and a shared fence orders the
+    // caller's work and the evaluate on the GPU, so no frame crosses the CPU or a copy. From then on
+    // the three rest in COMMON between command lists, the state CUDA reads and writes them in.
+    // false = the textures are not shareable or a handle could not be made (err says which);
+    // renderFrame stays usable either way.
     bool startShared(std::string& err);
-    HANDLE sharedInHandle() const
+    HANDLE colorHandle() const
     {
-        return m_shInH;
+        return m_colorH;
     }
-    HANDLE sharedOutHandle() const
+    HANDLE outputHandle() const
     {
-        return m_shOutH;
+        return m_outputH;
+    }
+    HANDLE mvHandle() const // null without Settings::motion
+    {
+        return m_mvH;
+    }
+    uint64_t colorBytes() const
+    {
+        return m_colorBytes;
+    }
+    uint64_t outputBytes() const
+    {
+        return m_outputBytes;
+    }
+    uint64_t mvBytes() const
+    {
+        return m_mvBytes;
     }
     HANDLE sharedFenceHandle() const
     {
         return m_shFenceH;
     }
-    uint64_t sharedBytes() const
-    {
-        return m_shBytes;
-    }
-    uint64_t rowPitch() const
-    {
-        return m_rowPitch;
-    }
-    // Settings::motion: a third shared buffer, the motion field in the MVec texture's copy
-    // footprint (mvRowPitch() bytes per row, R16G16_FLOAT), copied into MVec before each evaluate
-    HANDLE sharedMvHandle() const
-    {
-        return m_shMvH;
-    }
-    uint64_t sharedMvBytes() const
-    {
-        return m_shMvBytes;
-    }
-    uint64_t mvRowPitch() const
-    {
-        return m_mvPitch;
-    }
     LUID adapterLuid() const;
 
-    // One frame through the shared buffers: the queue waits until the fence reaches waitValue
-    // (the caller signals it once the input buffer holds the frame), copies it into Color,
-    // evaluates, copies Output into the output buffer and signals signalValue. Returns without
-    // waiting for the GPU; a command allocator still in flight is waited for, so at most
-    // kSharedLists frames are queued.
+    // One frame through the shared textures: the queue waits until the fence reaches waitValue
+    // (the caller signals it once Color, and MVec with motion, hold the frame), evaluates into
+    // Output and signals signalValue. Returns without waiting for the GPU; a command allocator
+    // still in flight is waited for, so at most kSharedLists frames are queued.
     bool submitShared(bool reset, uint64_t waitValue, uint64_t signalValue, std::string& err);
 
     // The passes actually built (Settings::passes, fewer when a later feature could not be created:
@@ -156,6 +151,9 @@ class Host
     // UNORDERED_ACCESS; the result lands in m_output in that state. The list's descriptor heaps,
     // root signature and pipeline state are clobbered by NGX.
     bool evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& err);
+    // After startShared: Color (when color) and MVec between COMMON and NON_PIXEL_SHADER_RESOURCE,
+    // Output between COMMON and UNORDERED_ACCESS, into evaluateOn's contract (toWork) or back.
+    void sharedStates(ID3D12GraphicsCommandList* list, bool toWork, bool color);
 
     bool m_wantAdapter = false; // startup's adapter LUID was given
     LUID m_wantLuid = {};
@@ -180,21 +178,20 @@ class Host
     HANDLE m_fenceEvent = nullptr;
     uint64_t m_fenceValue = 0;
 
+    // Color / Output / MVec rest in their states below between command lists, in COMMON once m_shared
     CP<ID3D12Resource> m_color;    // RGBA16F, NON_PIXEL_SHADER_RESOURCE
     CP<ID3D12Resource> m_output;   // RGBA16F, UNORDERED_ACCESS
     CP<ID3D12Resource> m_upload;   // CPU write, linear
     CP<ID3D12Resource> m_readback; // CPU read, linear
     uint64_t m_rowPitch = 0;       // aligned row pitch of the staging buffers
     CP<ID3D12Resource> m_mv;       // Settings::motion: R16G16_FLOAT, NON_PIXEL_SHADER_RESOURCE (DLSSNR.MVec)
-    uint64_t m_mvPitch = 0;        // its copy footprint row pitch
+    bool m_texShared = false;      // the three were made on a shared heap (startShared can hand them out)
 
     static const int kSharedLists = 2;
-    CP<ID3D12Resource> m_shIn;  // shared input buffer, COMMON between lists
-    CP<ID3D12Resource> m_shOut; // shared output buffer, COMMON between lists
-    CP<ID3D12Fence> m_shFence;  // shared with the caller's CUDA stream
-    CP<ID3D12Resource> m_shMv;  // Settings::motion: the shared motion buffer, COMMON between lists
-    HANDLE m_shInH = nullptr, m_shOutH = nullptr, m_shFenceH = nullptr, m_shMvH = nullptr;
-    uint64_t m_shBytes = 0, m_shMvBytes = 0;
+    bool m_shared = false;     // startShared ran: the textures are CUDA's between lists
+    CP<ID3D12Fence> m_shFence; // shared with the caller's CUDA stream
+    HANDLE m_colorH = nullptr, m_outputH = nullptr, m_mvH = nullptr, m_shFenceH = nullptr;
+    uint64_t m_colorBytes = 0, m_outputBytes = 0, m_mvBytes = 0;
     CP<ID3D12CommandAllocator> m_shAlloc[kSharedLists];
     CP<ID3D12GraphicsCommandList> m_shList[kSharedLists];
     uint64_t m_shDone[kSharedLists] = {}; // fence value that frees each allocator

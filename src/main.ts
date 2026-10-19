@@ -707,7 +707,7 @@ let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inhe
 let liveNrStructure = 1; // DLSS 5 Structure Intensity 0..2
 let liveNrTone = 1; // DLSS 5 Tone Intensity 0..2
 let liveNrStyle = 0; // DLSS 5 Style: 0 Default (NVIDIA's, the app's default), 1 Natural, 2 Cinematic
-let liveNrPasses = 1; // DLSS 5 passes, 1..10 (chained per frame)
+let liveNrPasses = 1; // DLSS 5 passes, 1..20 (chained per frame)
 let liveRtxHdr = false; // live TrueHDR, inherited from the RTX HDR checkbox
 let liveHdrColor = 'vivid'; // RTX HDR colour mode + tone knobs, inherited from the HDR sliders
 let liveHdrSat = 0; // SDK Saturation (drives the rtx colour mode)
@@ -1043,7 +1043,7 @@ ipcMain.on(
       nrstructure?: number;
       nrtone?: number;
       nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
-      nrpasses?: number; // DLSS 5 passes 1..10
+      nrpasses?: number; // DLSS 5 passes 1..20
       rtxhdr?: boolean;
       hdrcolor?: string;
       hdrsat?: number;
@@ -1070,7 +1070,7 @@ ipcMain.on(
     liveNrStructure = opts.nrstructure ?? 1;
     liveNrTone = opts.nrtone ?? 1;
     liveNrStyle = opts.nrstyle ?? 0;
-    liveNrPasses = Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)));
+    liveNrPasses = Math.min(20, Math.max(1, Math.round(opts.nrpasses ?? 1)));
     liveRtxHdr = !!opts.rtxhdr;
     liveHdrColor = opts.hdrcolor ?? 'vivid';
     liveHdrSat = opts.hdrsat ?? 0;
@@ -1424,7 +1424,7 @@ type RunOpts = {
   nrstructure?: number;
   nrtone?: number;
   nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
-  nrpasses?: number; // DLSS 5 passes 1..10
+  nrpasses?: number; // DLSS 5 passes 1..20
   interp?: boolean;
   model?: string;
   upscale?: number;
@@ -1465,7 +1465,6 @@ function engineArgs(opts: RunOpts): string[] {
     if (opts.model === 'dlssg') args.push('--dlssg'); // "DLSS 4.5" (Frame Generation) backend instead of GMFSS
     if (opts.model === 'fruc') args.push('--fruc'); // "NVIDIA Smooth Motion" backend instead of GMFSS
     if (opts.model === 'fsrfg') args.push('--fsrfg'); // AMD FSR frame generation (our bundled bridge)
-    if (opts.model === 'lsfg') args.push('--lsfg'); // Frame Blend: flow-warp interpolation
     if (opts.model === 'nvof') args.push('--nvof'); // NVIDIA Optical Flow: hardware flow + splat, native host only
     if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
   }
@@ -1493,7 +1492,7 @@ function engineArgs(opts: RunOpts): string[] {
       String(opts.nrstyle ?? 0),
     );
   if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
-    args.push('--nr-passes', String(Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
+    args.push('--nr-passes', String(Math.min(20, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
   // Resize factor (an arbitrary float, source height -> chosen target height), computed by the
   // renderer from the resolution selector. >1 enables the upscale pass; <1 is a downscale the
   // engine FOLDS into the decode (whole pipeline runs at the output size - also what keeps 4K
@@ -1713,105 +1712,240 @@ ipcMain.on('render-complete', (_e, body: string) => {
   }
 });
 
+type PreviewOpts = {
+  input: string;
+  frame?: number | string;
+  sharpen?: number;
+  hdr?: boolean;
+  color?: string;
+  saturation?: number;
+  vibrance?: number;
+  satboost?: number;
+  contrast?: number;
+  upscale?: number;
+  rtxvsr?: boolean;
+  fsrup?: boolean;
+  restore?: boolean;
+  dlssmode?: string; // the DLSS mode (dlssScaleArg)
+  dlssnr?: boolean;
+  nrstructure?: number;
+  nrtone?: number;
+  nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
+  nrpasses?: number; // DLSS 5 passes 1..20
+  nrmask?: boolean;
+};
+
+// render/preview.js's command line for the current settings, writing its PNGs under `prefix`
+function previewArgv(opts: PreviewOpts, prefix: string): string[] {
+  const args = [PREVIEW_CLI, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
+  if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
+  if (opts.restore) args.push('--restore');
+  const pScale = dlssScaleArg(opts.dlssmode);
+  if (pScale) args.push('--scale', pScale);
+  if (opts.dlssnr)
+    args.push(
+      '--dlssnr',
+      '--nr-structure',
+      String(opts.nrstructure ?? 1),
+      '--nr-tone',
+      String(opts.nrtone ?? 1),
+      '--nr-style',
+      String(opts.nrstyle ?? 0),
+    );
+  if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
+    args.push('--nr-passes', String(Math.min(20, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
+  if (opts.dlssnr && opts.nrmask) args.push('--nr-mask'); // heat map of the DLSS 5 change, <prefix>_nrmask.png
+  if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) args.push('--upscale', String(opts.upscale));
+  if (opts.rtxvsr)
+    args.push('--rtx-vsr'); // the plan runs it on an enlarging resize only
+  else if (opts.fsrup) args.push('--fsr-upscale');
+  if (opts.hdr)
+    args.push(
+      '--rtx-hdr',
+      '--hdr-color',
+      String(opts.color ?? 'vivid'),
+      '--hdr-saturation',
+      String(opts.saturation ?? 0),
+      '--hdr-vibrance',
+      String(opts.vibrance ?? 0),
+      '--hdr-satboost',
+      String(opts.satboost ?? 0),
+      '--hdr-contrast',
+      String(opts.contrast ?? 100),
+    );
+  return args;
+}
+
+// The PNG prefix under userData\preview, one fixed name per kind, reused each call (the renderer cache-busts its img
+// src) so previews never pile up.
+function previewPrefix(name: string): string {
+  const dir = path.join(app.getPath('userData'), 'preview');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    /* already exists */
+  }
+  return path.join(dir, name);
+}
+
 // Before/after preview: render ONE source frame at the current spatial settings (RTX HDR when opts.hdr,
 // Adaptive Sharpen when opts.sharpen > 0; no interpolation, no encode) and hand back the two PNG paths
 // for the renderer's side-by-side pane. render/preview.js (the render's decode and
-// the native host's pass chain, no python) writes <prefix>_original.png and _processed.png; a
-// fixed prefix is reused each call (the renderer cache-busts its img src) so previews never pile up.
+// the native host's pass chain, no python) writes <prefix>_original.png and _processed.png.
 // Resolves with { error } instead when the frame or the RTX bridge is unavailable.
-ipcMain.handle(
-  'preview',
-  (
-    _e,
-    opts: {
-      input: string;
-      frame?: number | string;
-      sharpen?: number;
-      hdr?: boolean;
-      color?: string;
-      saturation?: number;
-      vibrance?: number;
-      satboost?: number;
-      contrast?: number;
-      upscale?: number;
-      rtxvsr?: boolean;
-      fsrup?: boolean;
-      restore?: boolean;
-      dlssmode?: string; // the DLSS mode (dlssScaleArg)
-      dlssnr?: boolean;
-      nrstructure?: number;
-      nrtone?: number;
-      nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
-      nrpasses?: number; // DLSS 5 passes 1..10
-      nrmask?: boolean;
-    },
-  ) => {
-    return new Promise((resolve) => {
-      const dir = path.join(app.getPath('userData'), 'preview');
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-      } catch {
-        /* already exists */
+ipcMain.handle('preview', (_e, opts: PreviewOpts) => {
+  return new Promise((resolve) => {
+    const prefix = previewPrefix('frame');
+    const args = previewArgv(opts, prefix);
+    // like the render: Electron's own node runs the compiled module (no python)
+    const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', SMV_ENGINE_DIR: ENGINE };
+    execFile(process.execPath, args, { cwd: ENGINE, env, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
+      if (err) {
+        resolve({ error: String(stderr || err).slice(-400) });
+        return;
       }
-      const prefix = path.join(dir, 'frame');
-      const args = [PREVIEW_CLI, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
-      if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
-      if (opts.restore) args.push('--restore');
-      const pScale = dlssScaleArg(opts.dlssmode);
-      if (pScale) args.push('--scale', pScale);
-      if (opts.dlssnr)
-        args.push(
-          '--dlssnr',
-          '--nr-structure',
-          String(opts.nrstructure ?? 1),
-          '--nr-tone',
-          String(opts.nrtone ?? 1),
-          '--nr-style',
-          String(opts.nrstyle ?? 0),
-        );
-      if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
-        args.push('--nr-passes', String(Math.min(10, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
-      if (opts.dlssnr && opts.nrmask) args.push('--nr-mask'); // heat map of the DLSS 5 change, <prefix>_nrmask.png
-      if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) args.push('--upscale', String(opts.upscale));
-      if (opts.rtxvsr)
-        args.push('--rtx-vsr'); // the plan runs it on an enlarging resize only
-      else if (opts.fsrup) args.push('--fsr-upscale');
-      if (opts.hdr)
-        args.push(
-          '--rtx-hdr',
-          '--hdr-color',
-          String(opts.color ?? 'vivid'),
-          '--hdr-saturation',
-          String(opts.saturation ?? 0),
-          '--hdr-vibrance',
-          String(opts.vibrance ?? 0),
-          '--hdr-satboost',
-          String(opts.satboost ?? 0),
-          '--hdr-contrast',
-          String(opts.contrast ?? 100),
-        );
-      // like the render: Electron's own node runs the compiled module (no python)
+      const m = /frame (\d+)\/(\d+)/.exec(String(stdout ?? ''));
+      // "nrmask=<touched %>/<mean change, 8-bit> <path>" is present only when the DLSS 5 pass ran
+      // with --nr-mask; a pass that degraded to the plain frame writes no mask and the pane shows
+      // the processed picture as usual.
+      const mm = /nrmask=([\d.]+)%\/([\d.]+) /.exec(String(stdout ?? ''));
+      resolve({
+        original: prefix + '_original.png',
+        processed: prefix + '_processed.png',
+        frame: m ? Number(m[1]) : null,
+        total: m ? Number(m[2]) : null,
+        nrmask: mm ? prefix + '_nrmask.png' : null,
+        nrmaskPct: mm ? Number(mm[1]) : null,
+        nrmaskMean: mm ? Number(mm[2]) : null,
+      });
+    });
+  });
+});
+
+// Compare: the pairs from frame on (one, or Save clip's `pairs`) through the Video tab's model (modelA) and the one
+// it is compared to (modelB) at the preview's settings and the render's multiplier; render/preview.js compare writes
+// the real frames <prefix>_real<p>.png and each model's new frames <prefix>_a<o>.png / _b<o>.png (o = the output frame
+// from frame on, never a multiple of multi). Resolves with { error } instead when a model or the frames are unavailable.
+ipcMain.handle(
+  'compare',
+  (_e, opts: PreviewOpts & { modelA: string; modelB: string; multi: number; pairs?: number }) => {
+    return new Promise((resolve) => {
+      const prefix = previewPrefix((opts.pairs ?? 1) > 1 ? 'clip' : 'compare');
+      const args = [
+        ...previewArgv(opts, prefix),
+        '--model-a',
+        opts.modelA,
+        '--model-b',
+        opts.modelB,
+        '--multi',
+        String(opts.multi),
+        '--pairs',
+        String(opts.pairs ?? 1),
+      ];
       const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', SMV_ENGINE_DIR: ENGINE };
       execFile(process.execPath, args, { cwd: ENGINE, env, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
         if (err) {
           resolve({ error: String(stderr || err).slice(-400) });
           return;
         }
-        const m = /frame (\d+)\/(\d+)/.exec(String(stdout ?? ''));
-        // "nrmask=<touched %>/<mean change, 8-bit> <path>" is present only when the DLSS 5 pass ran
-        // with --nr-mask; a pass that degraded to the plain frame writes no mask and the pane shows
-        // the processed picture as usual.
-        const mm = /nrmask=([\d.]+)%\/([\d.]+) /.exec(String(stdout ?? ''));
+        const m = /compare frame (\d+)\/(\d+) (\d+)x(\d+) multi=(\d+) pairs=(\d+) .*vsr=(\d) restore=(\d) nr=(\d)/.exec(
+          String(stdout ?? ''),
+        );
+        if (!m) {
+          resolve({ error: 'no compare result: ' + String(stdout ?? '').slice(-200) });
+          return;
+        }
+        const n = Number(m[5]),
+          pairs = Number(m[6]);
+        const reals = Array.from({ length: pairs + 1 }, (_, p) => `${prefix}_real${p}.png`);
+        const news = (tag: string) =>
+          Array.from({ length: pairs * n }, (_, o) => o)
+            .filter((o) => o % n)
+            .map((o) => `${prefix}_${tag}${o}.png`);
         resolve({
-          original: prefix + '_original.png',
-          processed: prefix + '_processed.png',
-          frame: m ? Number(m[1]) : null,
-          total: m ? Number(m[2]) : null,
-          nrmask: mm ? prefix + '_nrmask.png' : null,
-          nrmaskPct: mm ? Number(mm[1]) : null,
-          nrmaskMean: mm ? Number(mm[2]) : null,
+          real0: reals[0],
+          real1: reals[1],
+          reals,
+          a: news('a'),
+          b: news('b'),
+          frame: Number(m[1]),
+          total: Number(m[2]),
+          w: Number(m[3]),
+          h: Number(m[4]),
+          multi: n,
+          pairs,
+          vsr: m[7] === '1',
+          restore: m[8] === '1',
+          nr: m[9] === '1',
         });
       });
     });
   },
 );
+
+// Compare's Save image / Save clip: where to write the PNG or the lossless MKV the renderer composes
+ipcMain.handle('pick-save', async (_e, defaultPath: string, kind: 'image' | 'clip') => {
+  const r = await dialog.showSaveDialog(win!, {
+    defaultPath,
+    filters: [
+      kind === 'clip' ? { name: 'Lossless video', extensions: ['mkv'] } : { name: 'PNG image', extensions: ['png'] },
+    ],
+  });
+  return r.canceled ? null : r.filePath || null;
+});
+
+// Compare's Save clip: the renderer's composed frames (RGBA, w x h) into a lossless FFV1 MKV at fps, one clip at a
+// time: clip-begin starts ffmpeg, each clip-frame resolves once ffmpeg took the frame, clip-end resolves to its exit.
+let clip: { p: ChildProcess; done: Promise<number>; ended: boolean; err: string } | null = null;
+ipcMain.handle('clip-begin', (_e, o: { out: string; w: number; h: number; fps: string }) => {
+  if (clip) clip.p.kill();
+  const ffmpeg = fs.existsSync(path.join(ENGINE, 'bin', 'ffmpeg.exe'))
+    ? path.join(ENGINE, 'bin', 'ffmpeg.exe')
+    : 'ffmpeg';
+  const p = spawn(
+    ffmpeg,
+    // FFV1 keeps every RGB value; gbrp drops only the canvas's alpha
+    ['-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${o.w}x${o.h}`, '-r', o.fps, '-i', '-'].concat([
+      '-c:v',
+      'ffv1',
+      '-level',
+      '3',
+      '-pix_fmt',
+      'gbrp',
+      o.out,
+    ]),
+    { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] },
+  );
+  const c = { p, done: Promise.resolve(0), ended: false, err: '' };
+  c.done = new Promise<number>((res) => {
+    p.once('error', (e) => {
+      c.err += e.message;
+      c.ended = true;
+      res(-1);
+    });
+    p.once('close', (code: number | null) => {
+      c.ended = true;
+      res(code ?? 1);
+    });
+  });
+  p.stderr!.on('data', (b: Buffer) => (c.err += b.toString('utf8')));
+  p.stdin!.on('error', () => {
+    /* ffmpeg left early: clip-end reports its exit and stderr */
+  });
+  clip = c;
+  return true;
+});
+ipcMain.handle('clip-frame', (_e, data: Uint8Array) => {
+  const c = clip;
+  if (!c || c.ended) return false;
+  if (c.p.stdin!.write(data)) return true;
+  // ffmpeg's pipe is full: on once it drains, or false when ffmpeg ends first
+  return Promise.race([new Promise((res) => c.p.stdin!.once('drain', () => res(true))), c.done.then(() => false)]);
+});
+ipcMain.handle('clip-end', async () => {
+  const c = clip;
+  clip = null;
+  if (!c) return { rc: -1, error: 'no clip running' };
+  c.p.stdin!.end();
+  return { rc: await c.done, error: c.err.trim().slice(-300) };
+});

@@ -1,5 +1,5 @@
 // Formats our own C++ with the repo's .clang-format, the way the lint's Prettier step formats TypeScript:
-// `node scripts/clang-format.ts` rewrites the files in place, `--check` only reports what would change.
+// `node scripts/clang-format.ts` rewrites the files in place.
 // Extra file arguments are formatted too (a working copy of the host sources outside the repo).
 // Uses CLANG_FORMAT, else the clang-format that ships with Visual Studio (found with vswhere), else PATH.
 // Out of scope: the vendored NVIDIA headers (nvofa, cuda_shim), the RTX Video SDK bridge sources and
@@ -43,16 +43,14 @@ function findClangFormat(): string {
   return 'clang-format';
 }
 
-const check = process.argv.includes('--check');
-const extra = process.argv.slice(2).filter((a) => a !== '--check');
+const extra = process.argv.slice(2);
 const exe = findClangFormat();
 const files = FILES.map((f) => path.join(ROOT, f)).concat(extra);
-const mode = check ? ['--dry-run', '--Werror'] : ['-i'];
 const run = () =>
-  spawnSync(exe, [...mode, `--style=file:${path.join(ROOT, '.clang-format')}`, ...files], { stdio: 'inherit' });
+  spawnSync(exe, ['-i', `--style=file:${path.join(ROOT, '.clang-format')}`, ...files], { stdio: 'inherit' });
 let r = run();
-// a trailing comment after `};` can move again on a second pass: writing twice leaves what --check accepts
-if (!check && !r.error && r.status === 0) r = run();
+// a trailing comment after `};` can move again on a second pass: a second write settles it
+if (!r.error && r.status === 0) r = run();
 if (r.error) {
   console.error(
     `clang-format not found (${exe}): add Visual Studio's "C++ Clang tools for Windows" or set CLANG_FORMAT`,

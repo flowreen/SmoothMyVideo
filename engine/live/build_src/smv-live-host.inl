@@ -541,8 +541,9 @@ struct Host
             return SUCCEEDED(
                 device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&buf)));
         };
-        if (!makeTex(texFmt, texFrame) || (useSL && !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth)) ||
-            (useSL && !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec)) ||
+        // texFrame = the SL route's staging copy (the server route copies the footprint straight into the back buffer)
+        if ((useSL && (!makeTex(texFmt, texFrame) || !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth) ||
+                       !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec))) ||
             !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadBuf))
         {
             LOG("resource creation failed\n");

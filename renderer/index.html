@@ -77,6 +77,11 @@
   .hint { color:var(--sub); font-size:16px; }
   body.drag { outline:3px dashed var(--green); outline-offset:-10px; }
   button.mini { padding:3px 9px; font-size:16px; background:#3a3a3a; color:var(--text); }
+  /* Compare: the 2x2 of real frames (left) and the two models' new frames (right) */
+  #cmpgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:6px; }
+  .cmpwrap { overflow:hidden; border-radius:6px; position:relative; }
+  .cmpwrap img { width:100%; display:block; cursor:zoom-in; }
+  .cmpspin { display:none; position:absolute; align-items:center; justify-content:center; pointer-events:none; }
   .spinwheel { width:34px; height:34px; border:3px solid rgba(255,255,255,.25);
                border-top-color:var(--green); border-radius:50%; animation:spin .8s linear infinite;
                filter:drop-shadow(0 0 2px rgba(0,0,0,.7)); }
@@ -222,9 +227,9 @@
         <span class="v" id="nrtonenum">1.00</span>
         <span class="hint" style="margin-left:6px"
               title="Runs DLSS 5 this many times a frame, each pass on the last one's result: a stronger effect at that many times the time and video memory.">Passes</span>
-        <span class="defmark" style="--def:8px"><input id="nrpasses" type="range" min="1" max="10" step="1" value="1"
+        <span class="defmark" style="--def:8px"><input id="nrpasses" type="range" min="1" max="20" step="1" value="1"
                title="Runs DLSS 5 this many times a frame, each pass on the last one's result: a stronger effect at that many times the time and video memory."
-               style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
+               style="width:200px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="nrpassesnum">1</span>
         <label class="hint vonly" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:6px"
                title="Preview only: shows where DLSS 5 changed the picture (bright = a big change). The render is unaffected.">
@@ -564,8 +569,22 @@
       <span class="k">Preview</span>
       <span class="hint" id="hdrpreviewhint">your restore / sharpen / HDR settings on a real frame · updates automatically</span>
     </div>
+    <div class="row" id="cmpwrap"
+         title="Shows the model ticked under Interpolate next to another model on the same moment: the real frames before and after on the left, each model's new frames between them on the right">
+      <span class="k">Compare to</span>
+      <select id="cmpto">
+        <option value="">Off</option>
+        <option value="gmfss">GMFSS</option>
+        <option value="nvof">NVIDIA Optical Flow</option>
+        <option value="rife">RIFE</option>
+        <option value="dlssg">NVIDIA DLSS 4.5</option>
+        <option value="fsrfg">AMD FSR 4</option>
+        <option value="fruc">NVIDIA Smooth Motion</option>
+      </select>
+      <span class="hint">your model next to another one on the same moment</span>
+    </div>
     <div id="hdrpreview" style="display:none;margin-top:6px">
-      <div style="display:flex;align-items:center;gap:8px">
+      <div id="prevpair" style="display:flex;align-items:center;gap:8px">
         <div style="flex:1;text-align:center;min-width:0">
           <div class="hint" id="prevoriglabel" style="margin-bottom:4px">Original</div>
           <div id="prevorigwrap" style="overflow:hidden;border-radius:6px;position:relative">
@@ -582,10 +601,32 @@
           </div>
         </div>
       </div>
-      <div class="row" style="justify-content:center;gap:10px;margin-top:6px">
+      <div class="row" id="prevnav" style="justify-content:center;gap:10px;margin-top:6px">
         <button id="prevprev" class="mini" style="visibility:hidden">&lsaquo; back</button>
         <span class="v" id="prevlabel">frame &hellip;</span>
         <button id="prevnext" class="mini">random frame &rsaquo;</button>
+      </div>
+      <div id="cmpgrid" style="display:none">
+        <div><div class="hint" id="cmplab0" style="margin-bottom:4px">Real frame</div>
+          <div class="cmpwrap" id="cmpw0"><img id="cmpimg0" alt="real frame before" style="visibility:hidden">
+            <div class="cmpspin" id="cmpspin0"><div class="spinwheel"></div></div></div></div>
+        <div><div class="hint" id="cmplab1" style="margin-bottom:4px">New frame</div>
+          <div class="cmpwrap" id="cmpw1"><img id="cmpimg1" alt="first model's new frame" style="visibility:hidden">
+            <div class="cmpspin" id="cmpspin1"><div class="spinwheel"></div></div></div></div>
+        <div><div class="hint" id="cmplab2" style="margin-bottom:4px">Real frame</div>
+          <div class="cmpwrap" id="cmpw2"><img id="cmpimg2" alt="real frame after" style="visibility:hidden">
+            <div class="cmpspin" id="cmpspin2"><div class="spinwheel"></div></div></div></div>
+        <div><div class="hint" id="cmplab3" style="margin-bottom:4px">New frame</div>
+          <div class="cmpwrap" id="cmpw3"><img id="cmpimg3" alt="second model's new frame" style="visibility:hidden">
+            <div class="cmpspin" id="cmpspin3"><div class="spinwheel"></div></div></div></div>
+      </div>
+      <div class="row" id="cmpnav" style="display:none;justify-content:center;gap:10px;margin-top:6px">
+        <button id="cmpback" class="mini" title="The new frame before this one">&lsaquo;</button>
+        <span class="v" id="cmplabel">frame &hellip;</span>
+        <button id="cmpfwd" class="mini" title="The new frame after this one">&rsaquo;</button>
+        <button id="cmprand" class="mini">random frame &rsaquo;</button>
+        <button id="cmpsave" class="mini" title="Saves the four panes as you see them, with their labels, as a PNG">Save image</button>
+        <button id="cmpclip" class="mini" title="Saves one second from this moment as a lossless video of the four panes: every frame, real and new, with its labels, at the output frame rate (step through it frame by frame in a player such as mpv)">Save clip</button>
       </div>
       <div class="hint" id="prevnote" style="text-align:center;margin-top:4px"></div>
     </div>

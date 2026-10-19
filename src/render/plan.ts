@@ -13,7 +13,6 @@ export interface RenderArgs {
   sharpen: number; // float
   rife: boolean;
   rife_drba: boolean;
-  lsfg: boolean;
   fruc: boolean;
   fsrfg: boolean;
   dlssg: boolean;
@@ -35,7 +34,7 @@ export interface RenderArgs {
   nr_structure: number; // float
   nr_tone: number; // float
   nr_style: number; // int
-  nr_passes: number; // int, 1..10: DLSS 5 chained per frame
+  nr_passes: number; // int, 1..20: DLSS 5 chained per frame
 }
 
 /** NVIDIA's DLSS modes: the working size's share of the output per axis (DLSS Programming Guide:
@@ -154,16 +153,7 @@ export function outputSize(
 
 /** GMFSS is the default model: no other model flag and frames are generated. */
 export function isGmfss(args: RenderArgs): boolean {
-  return !(
-    args.rife ||
-    args.rife_drba ||
-    args.lsfg ||
-    args.fruc ||
-    args.fsrfg ||
-    args.dlssg ||
-    args.nvof ||
-    args.no_interp
-  );
+  return !(args.rife || args.rife_drba || args.fruc || args.fsrfg || args.dlssg || args.nvof || args.no_interp);
 }
 
 /** Why an --nvof render cannot run, or null. */

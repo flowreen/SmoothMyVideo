@@ -57,6 +57,7 @@ rem driver-installed and opened at run time by full path, nothing to link or shi
 rem No d3d12.lib on purpose: D3D12CreateDevice must keep resolving from sl.interposer.lib.
 rem NVAPI (the free video memory, NvAPI_GPU_GetMemoryInfoEx) = the MIT headers and static lib inside the
 rem Streamline SDK (external\nvapi); the lib opens the driver's own nvapi64.dll at run time, nothing to ship.
+rem smv-live.manifest = the UTF-8 process code page, so a folder with a non-ASCII name works (its comment).
 cl /nologo /std:c++20 /EHsc /permissive- /O2 /W3 smv-live.cpp "%NRSRC%\nr_host.cpp" ^
    /I "%SL_SDK%\include" /I "%SL_SDK%\external\nvapi" /I "%TRT_RTX_SDK%\include" /I "%SMV_CU%\include" /I cuda_shim ^
    /I "%NRSRC%" /I "%~dp0..\..\dlssg\build_src" /I "%NGX_SDK%\include" /I nvofa ^
@@ -66,5 +67,6 @@ cl /nologo /std:c++20 /EHsc /permissive- /O2 /W3 smv-live.cpp "%NRSRC%\nr_host.c
    user32.lib gdi32.lib ole32.lib windowscodecs.lib dxguid.lib advapi32.lib ^
    d3d11.lib d3dcompiler.lib dwmapi.lib shlwapi.lib winmm.lib windowsapp.lib ^
    /DELAYLOAD:tensorrt_rtx_1_7.dll /DELAYLOAD:tensorrt_onnxparser_rtx_1_7.dll ^
+   /MANIFEST:EMBED /MANIFESTINPUT:"%~dp0smv-live.manifest" /MANIFESTUAC:NO ^
    /SUBSYSTEM:CONSOLE /OUT:..\smv-live.exe
 exit /b %errorlevel%
