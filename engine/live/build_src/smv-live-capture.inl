@@ -27,18 +27,21 @@ static const char kHdrPackCS[] = "Texture2D<float4> src : register(t0);\n"
                                  "    dst[id.xy] = q.x | (q.y << 10) | (q.z << 20) | (3u << 30);\n"
                                  "}\n";
 
-// Whole-screen capture (Capture::samePicture): any bit that differs between two pictures sets the flag. The
-// formats read as float4 (B8G8R8A8 unorm: exact, one value per byte; FP16: exact), compared as their bits.
+// Whole-screen capture (Capture::samePicture): any bit that differs between two pictures sets the flag. a = the
+// arrival (the WGC frame itself, read at the client crop's offset `off`; the copy route: its crop, off = 0), b = the
+// last kept picture (the crop, its size = the test's). The formats read as float4 (B8G8R8A8 unorm: exact, one value per
+// byte; FP16: exact), compared as their bits.
 static const char kSamePictureCS[] = "Texture2D<float4> a : register(t0);\n"
                                      "Texture2D<float4> b : register(t1);\n"
                                      "RWByteAddressBuffer flag : register(u0);\n"
+                                     "cbuffer crop : register(b0) { uint2 off; uint2 unused; };\n"
                                      "[numthreads(16,16,1)]\n"
                                      "void main(uint3 id : SV_DispatchThreadID)\n"
                                      "{\n"
                                      "    uint w, h;\n"
-                                     "    a.GetDimensions(w, h);\n"
+                                     "    b.GetDimensions(w, h);\n"
                                      "    if (id.x >= w || id.y >= h) return;\n"
-                                     "    if (any(asuint(a[id.xy]) != asuint(b[id.xy])))\n"
+                                     "    if (any(asuint(a[id.xy + off]) != asuint(b[id.xy])))\n"
                                      "        flag.Store(0, 1u);\n"
                                      "}\n";
 
@@ -103,22 +106,26 @@ struct Capture
     // counting arrivals, not the loop's drains) and takeFrames drops an unchanged one uncounted. An unchanged arrival
     // still counts once kSameKeepalive has passed since the last kept one: the static hold's refresh repaint brings
     // the current picture after a model load or a pause, and DLSS-G's input-gap reset (700 ms) never fires on a
-    // source that keeps presenting. sameTex[sameCur] = the arrival under test, sameTex[1 - sameCur] = the last kept
-    // picture. The immediate context is multithread-protected while this runs (`mt`; its compute-shader sequences hold
-    // mt->Enter()).
+    // source that keeps presenting. The test reads the arrival in place (a view of the WGC frame at the crop's offset)
+    // against sameRefTex, the last kept picture, and a new picture's crop is copied into sameRefTex after it: an
+    // unchanged arrival costs the compare alone. The immediate context is multithread-protected while this runs (`mt`;
+    // its compute-shader sequences hold mt->Enter()).
     static constexpr int64_t kSameKeepalive = 5000000; // 100 ns units: 500 ms
     bool allowSame = true; // a caller that wants every arrival (the probe) clears it before init()
     bool sameSkip = false;
     ComPtr<ID3D11Multithread> mt;
     ComPtr<ID3D11ComputeShader> sameCS;
-    ComPtr<ID3D11Texture2D> sameTex[2];
-    ComPtr<ID3D11ShaderResourceView> sameSrv[2];
-    ComPtr<ID3D11Buffer> sameFlag, sameFlagStage;
+    ComPtr<ID3D11Texture2D> sameRefTex, sameTmpTex; // the last kept picture (the crop); the copy route's arrival
+    ComPtr<ID3D11ShaderResourceView> sameRefSrv, sameTmpSrv;
+    ComPtr<ID3D11Buffer> sameFlag, sameFlagStage, sameCb; // sameCb = the shader's crop offset
     ComPtr<ID3D11UnorderedAccessView> sameUav;
-    int sameCur = 0;
-    bool sameRef = false;  // sameTex[1 - sameCur] holds a picture
-    uint64_t sameN = 0;    // arrivals dropped as unchanged
-    uint64_t sameKept = 0; // unchanged arrivals kept by kSameKeepalive
+    bool sameCopy =
+        false; // the copy route: the arrival's crop copied into sameTmpTex, then compared (SMV_WGC_SAME=copy;
+               // a frame no view can read takes it too)
+    bool sameViewFail = false; // a frame no view could read (logged once a session)
+    bool sameRef = false;      // sameRefTex holds a picture
+    uint64_t sameN = 0;        // arrivals dropped as unchanged
+    uint64_t sameKept = 0;     // unchanged arrivals kept by kSameKeepalive
     double sameMsSum = 0, sameMsMax = 0;
     uint64_t sameTests = 0;
     SRWLOCK sameLk = SRWLOCK_INIT; // one takeFrames at a time while sameSkip (FrameArrived's), before lk
@@ -216,13 +223,24 @@ struct Capture
         return true;
     }
 
+    // the copy route's arrival texture, the reference's twin (made on first use)
+    bool sameTmpMake()
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        sameRefTex->GetDesc(&td);
+        return SUCCEEDED(dev11->CreateTexture2D(&td, nullptr, &sameTmpTex)) &&
+               SUCCEEDED(dev11->CreateShaderResourceView(sameTmpTex.Get(), nullptr, &sameTmpSrv));
+    }
+
     // the unchanged-picture test (samePicture) at the client crop's size and the pool's format; false = not available
-    // (a whole-screen caller then keeps Windows' update interval). SMV_WGC_SAME=fail = this failure's trigger
+    // (a whole-screen caller then keeps Windows' update interval). SMV_WGC_SAME=fail = this failure's trigger,
+    // SMV_WGC_SAME=copy = the copy route on every arrival
     bool initSame(DXGI_FORMAT fmt)
     {
         wchar_t lv[8]{};
         if (GetEnvironmentVariableW(L"SMV_WGC_SAME", lv, 8) && wcscmp(lv, L"fail") == 0)
             return false;
+        sameCopy = wcscmp(lv, L"copy") == 0;
         ComPtr<ID3DBlob> cs, err;
         if (FAILED(D3DCompile(kSamePictureCS, sizeof(kSamePictureCS) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0",
                               0, 0, &cs, &err)) ||
@@ -237,11 +255,17 @@ struct Capture
         td.SampleDesc = {1, 0};
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        for (int i = 0; i < 2; i++)
-            if (FAILED(dev11->CreateTexture2D(&td, nullptr, &sameTex[i])) ||
-                FAILED(dev11->CreateShaderResourceView(sameTex[i].Get(), nullptr, &sameSrv[i])))
-                return false;
+        if (FAILED(dev11->CreateTexture2D(&td, nullptr, &sameRefTex)) ||
+            FAILED(dev11->CreateShaderResourceView(sameRefTex.Get(), nullptr, &sameRefSrv)) ||
+            (sameCopy && !sameTmpMake()))
+            return false;
         D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(dev11->CreateBuffer(&bd, nullptr, &sameCb)))
+            return false;
+        bd = {};
         bd.ByteWidth = 16;
         bd.Usage = D3D11_USAGE_DEFAULT;
         bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
@@ -266,7 +290,9 @@ struct Capture
     }
 
     // true = this arrival's client picture equals the last kept one; a new picture becomes the reference. The flag's
-    // readback waits for the copy too, so the frame may be closed right after
+    // readback waits for the test's reads, so an unchanged frame may be closed right after. A new picture's reference
+    // copy is queued after the test and not waited for: takeFrames closes a kept frame only once a later arrival's test
+    // (whose readback waits for everything queued before it) has run, or after the loop's own copy of it
     bool samePicture(wgc::Direct3D11CaptureFrame const& f)
     {
         winrt::com_ptr<ID3D11Texture2D> tex;
@@ -288,7 +314,7 @@ struct Capture
         if (tex)
         {
             tex->GetDesc(&fd);
-            sameTex[0]->GetDesc(&rd);
+            sameRefTex->GetDesc(&rd);
         }
         if (!tex || fd.Width < (UINT)cropX + cw || fd.Height < (UINT)cropY + ch || fd.Format != rd.Format)
         {
@@ -300,23 +326,45 @@ struct Capture
         bool same = false;
         mt->Enter();
         const D3D11_BOX box{(UINT)cropX, (UINT)cropY, 0, (UINT)cropX + cw, (UINT)cropY + ch, 1};
-        ctx11->CopySubresourceRegion(sameTex[sameCur].Get(), 0, 0, 0, 0, tex.get(), 0, &box);
+        // the arrival as the test reads it: a view of the frame itself at the crop's offset, else (the copy route) its
+        // crop copied first; no texture for that = no test, the arrival counts as new
+        ComPtr<ID3D11ShaderResourceView> arr;
+        UINT off[4]{(UINT)cropX, (UINT)cropY, 0, 0};
+        const bool test = !keepalive && sameRef;
+        if (test && !sameCopy && FAILED(dev11->CreateShaderResourceView(tex.get(), nullptr, &arr)) && !sameViewFail)
+        {
+            sameViewFail = true;
+            LOG("capture: the frame cannot be read in place (format %d, bind 0x%x): each arrival is copied before its "
+                "unchanged-picture test\n",
+                (int)fd.Format, fd.BindFlags);
+        }
+        if (test && !arr && (sameTmpTex || sameTmpMake()))
+        {
+            ctx11->CopySubresourceRegion(sameTmpTex.Get(), 0, 0, 0, 0, tex.get(), 0, &box);
+            arr = sameTmpSrv;
+            off[0] = off[1] = 0;
+        }
         if (keepalive)
             sameKept++;
-        else if (sameRef)
+        else if (test && arr)
         {
+            ctx11->UpdateSubresource(sameCb.Get(), 0, nullptr, off, 0, 0);
             const UINT zero[4]{};
             ctx11->ClearUnorderedAccessViewUint(sameUav.Get(), zero);
             ctx11->CSSetShader(sameCS.Get(), nullptr, 0);
-            ID3D11ShaderResourceView* srv[2]{sameSrv[sameCur].Get(), sameSrv[1 - sameCur].Get()};
+            ID3D11ShaderResourceView* srv[2]{arr.Get(), sameRefSrv.Get()};
             ctx11->CSSetShaderResources(0, 2, srv);
             ID3D11UnorderedAccessView* uav = sameUav.Get();
             ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            ID3D11Buffer* cb = sameCb.Get();
+            ctx11->CSSetConstantBuffers(0, 1, &cb);
             ctx11->Dispatch((cw + 15) / 16, (ch + 15) / 16, 1);
             ID3D11ShaderResourceView* none[2]{};
             ctx11->CSSetShaderResources(0, 2, none);
             uav = nullptr;
             ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            cb = nullptr;
+            ctx11->CSSetConstantBuffers(0, 1, &cb);
             ctx11->CopyResource(sameFlagStage.Get(), sameFlag.Get());
             // the Map waits with the context locked, so the loop's next capture copy can queue behind one test; an
             // unlocked wait on a fence event was slower (1.7 ms mean, 11.5 max vs 0.87 / 4.5 on a 270/s display-resample
@@ -332,12 +380,11 @@ struct Capture
             sameMsMax = (std::max)(sameMsMax, ms);
             sameTests++;
         }
+        if (!same)
+            ctx11->CopySubresourceRegion(sameRefTex.Get(), 0, 0, 0, 0, tex.get(), 0, &box);
         mt->Leave();
         if (!same)
-        {
-            sameCur = 1 - sameCur;
             sameRef = true;
-        }
         return same;
     }
 
@@ -369,7 +416,7 @@ struct Capture
         convUav.Reset();
         sameSkip = false;
         sameRef = false;
-        sameCur = 0;
+        sameCopy = sameViewFail = false;
         sameN = sameTests = sameKept = 0;
         sameMsSum = sameMsMax = 0;
         mt.Reset();
@@ -377,11 +424,11 @@ struct Capture
         sameFlag.Reset();
         sameFlagStage.Reset();
         sameUav.Reset();
-        for (int i = 0; i < 2; i++)
-        {
-            sameTex[i].Reset();
-            sameSrv[i].Reset();
-        }
+        sameCb.Reset();
+        sameRefTex.Reset();
+        sameRefSrv.Reset();
+        sameTmpTex.Reset();
+        sameTmpSrv.Reset();
         targetWnd = target;
         evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
@@ -484,8 +531,9 @@ struct Capture
             {
                 sameSkip = initSame(g_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM);
                 if (sameSkip)
-                    LOG("capture: arrivals whose picture is unchanged are dropped (%s)\n",
-                        g_monitor ? "the overlay's own presents" : "a player's repeated presents");
+                    LOG("capture: arrivals whose picture is unchanged are dropped (%s)%s\n",
+                        g_monitor ? "the overlay's own presents" : "a player's repeated presents",
+                        sameCopy ? "; each arrival copied before its test (SMV_WGC_SAME=copy)" : "");
                 else
                     LOG(g_monitor ? "note: the whole screen's unchanged-picture test is unavailable: the capture keeps "
                                     "Windows' update interval (60 fps at most)\n"

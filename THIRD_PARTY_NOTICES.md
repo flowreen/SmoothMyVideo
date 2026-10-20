@@ -84,16 +84,18 @@ third-party work.
   is built from NVIDIA's SDK convenience layer (sources in `engine/rtxvideo/build_src/`),
   used under the NVIDIA RTX Video SDK license. The SDK's AI feature models (`nvngx_vsr.dll`,
   `nvngx_truehdr.dll`) are NOT redistributed; users install them from NVIDIA directly.
+* **NVIDIA DLSS Frame Generation and Streamline** (the DLSS 4.5 frame generation model): NVIDIA's binaries
+  `nvngx_dlssg.dll`, `sl.interposer.dll`, `sl.common.dll`, `sl.dlss_g.dll`, `sl.pcl.dll` and `sl.reflex.dll` in
+  `engine/dlssg/`, redistributed unmodified beside this project's `dlssg2f.exe` (sources in `engine/dlssg/build_src/`),
+  under NVIDIA's licenses shipped beside them (`nvngx_dlss.license.txt`, `streamline.license.txt`,
+  `reflex.license.txt`).
 
-## Bundled in the release zip (not in this repository)
+## Bundled in the release archive (not in this repository)
 
-* **FFmpeg** (LGPL v2.1+ shared build by BtbN, `engine/bin/`): source code at
+* **FFmpeg** (LGPL v3 shared build by BtbN, `engine/bin/`, license in `engine/bin/FFMPEG-LICENSE.txt`): source code at
   https://github.com/BtbN/FFmpeg-Builds (LGPL builds link their exact sources per release).
-* **CPython** via python-build-standalone (PSF License and component licenses).
-* **PyTorch** (BSD-style), **CuPy** (MIT), **NumPy** (BSD), **OpenCV** (Apache-2.0),
-  **ONNX / onnxscript** (Apache-2.0 / MIT).
-* **NVIDIA TensorRT for RTX, cuDNN, CUDA runtime libraries**: redistributed as permitted by the
-  NVIDIA software license agreements covering runtime redistribution.
+* **NVIDIA TensorRT for RTX** (with its ONNX parser), the **CUDA runtime** and **NVRTC** (`engine/gpu_runtime/`):
+  redistributed as permitted by the NVIDIA software license agreements covering runtime redistribution.
 
 ## Optional, user-installed (never bundled or redistributed)
 

@@ -1958,18 +1958,22 @@ __device__ __forceinline__ void thdr_linear(unsigned int u, float s0, float s1, 
 }
 
 // Unpack the bridge output (10:10:10:2, B in the LOW 10 bits), apply the
-// colour mode against the unquantised source, and write planar PQ at capture resolution.
+// colour mode against the unquantised source, and write planar PQ into the padded model frame
+// (pw x ph, planes dps apart) with the edge replicated as k_padPlanar pads it: a pad pixel takes
+// the result of the edge pixel it repeats.
 // mode 0 = vivid (_ictcp_linear), 1 = rtx (_rtx_linear), 2 = raw.
 __global__ void k_thdrColor(const unsigned int* __restrict__ thdrOut,
                             const float* __restrict__ srcG, int cw, int ch,
-                            float* __restrict__ dst, int mode, float vib, float sb)
+                            float* __restrict__ dst, int pw, int ph, int dps,
+                            int mode, float vib, float sb)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= cw || y >= ch) return;
+    if (x >= pw || y >= ph) return;
     const size_t plane = (size_t)ch * cw;
-    const size_t o = (size_t)y * cw + x;
-    const unsigned int u = thdrOut[o];
+    const int sx = x < cw ? x : cw - 1, sy = y < ch ? y : ch - 1;
+    const size_t s = (size_t)sy * cw + sx, o = (size_t)y * pw + x;
+    const unsigned int u = thdrOut[s];
     float p0, p1, p2;
     if (mode == 2)
     {
@@ -1980,12 +1984,12 @@ __global__ void k_thdrColor(const unsigned int* __restrict__ thdrOut,
     else
     {
         float v[3];
-        thdr_linear(u, srcG[o], srcG[plane + o], srcG[2 * plane + o], mode, vib, sb, v);
+        thdr_linear(u, srcG[s], srcG[plane + s], srcG[2 * plane + s], mode, vib, sb, v);
         p0 = pq_oetf(v[0]); p1 = pq_oetf(v[1]); p2 = pq_oetf(v[2]);
     }
     dst[o] = p0;
-    dst[plane + o] = p1;
-    dst[2 * plane + o] = p2;
+    dst[(size_t)dps + o] = p1;
+    dst[2 * (size_t)dps + o] = p2;
 }
 
 // ---- offline RTX TrueHDR (rtxvideo.run_hdr on every output frame) -------------------------
@@ -4552,18 +4556,21 @@ struct NativeRife
     nvinfer1::ICudaEngine* engB0 = nullptr;
     nvinfer1::IRuntimeConfig* cfgB0 = nullptr;
     nvinfer1::IExecutionContext* ctxB0 = nullptr;
-    uint32_t drFid = 0;        // frames pushed this session; frame id i sits in ring slot i & 3
-    float* dDrIBase = nullptr; // the four ring slots in ONE block, slot i at i * (3, ph, pw): two ring neighbours
-                               // are one (6, ph, pw) frame pair
-    float* dDrI[4] = {};       // (3, ph, pw) the padded frames (the pictures), slot i of dDrIBase
-    uint32_t drPicFix = 0;     // two domains: the k whose wrap pair copied frame k - 1 into slot (k + 1) & 3
-    uint16_t* dDrM[4] = {};    // two domains: (3, M, N) fp16, their motion frames
-    float* dDrF[4] = {};       // (16, M, N) their encodes in the IFNet's feature dtype (nativeTweenBuffers)
-    float* dDrX[2] = {};       // one domain: (6, ph, pw) the frame pair: [0] = [k-1, k-2] (side -1), [1] = [k-2,
-                               // k-1]; the IFNet's x (fp16 in place when xHalf)
-    uint16_t* dDrMX[2] = {};   // two domains: (6, M, N) fp16, the IFNet's x (the motion frames of that pair)
-    float* dDrB0 = nullptr;    // two domains: (6, M, N) block0's frame pair, the motion frames in fp32
-    uint32_t drXFor[2] = {};   // the newest frame id each x was built for (0 = none)
+    uint32_t drFid = 0;           // frames pushed this session; frame id i sits in ring slot i & 3
+    float* dDrIBase = nullptr;    // the four ring slots in ONE block, slot i at i * (3, ph, pw): two ring neighbours
+                                  // are one (6, ph, pw) frame pair
+    float* dDrI[4] = {};          // (3, ph, pw) the padded frames (the pictures), slot i of dDrIBase
+    uint32_t drPicFix = 0;        // two domains: the k whose wrap pair copied frame k - 1 into slot (k + 1) & 3
+    uint16_t* dDrMBase = nullptr; // two domains: the motion ring, five (3, M, N) fp16 slots in ONE block: frame i
+                                  // in slot 3 - (i & 3) (descending, so frame i - 1 follows frame i), slot 4 a spare
+    uint16_t* dDrM[4] = {};       // two domains: their motion frames, ring slot i & 3 = block slot 3 - (i & 3)
+    float* dDrF[4] = {};          // (16, M, N) their encodes in the IFNet's feature dtype (nativeTweenBuffers)
+    float* dDrX[2] = {};          // one domain: (6, ph, pw) the frame pair: [0] = [k-1, k-2] (side -1), [1] = [k-2,
+                                  // k-1]; the IFNet's x (fp16 in place when xHalf)
+    uint16_t* dDrMX[2] = {};      // two domains: the IFNet's x, two neighbouring slots of dDrMBase (not owned)
+    float* dDrB0 = nullptr;       // two domains: (6, M, N) block0's frame pair, the motion frames in fp32, in dDrAcc
+                                  // (nativeDrbaAlloc)
+    uint32_t drXFor[2] = {};      // the newest frame id each x was built for (0 = none)
     struct DrWin
     {
         uint32_t c;
@@ -4571,8 +4578,6 @@ struct NativeRife
         float* r;
     }; // r = (4, M, N): flow12 | flow21
     DrWin drWin[2] = {};         // c = 0: empty
-    float* dDrFlow = nullptr;    // (4, M, N) block0's output
-    float* dDrFlowN = nullptr;   // (4, M, N) a non-chained left flow's FlowNorm output
     long long* dDrAcc = nullptr; // (6, M, N) the splat accumulator
     uint64_t drTweens = 0, drHeads = 0, drBlock0 = 0;
     // NVIDIA Optical Flow model: the handoff answers
@@ -4673,7 +4678,7 @@ struct NativeRife
     uint32_t* dThdrOut = nullptr; // packed 10:10:10:2 bridge output, B in the low bits
     float* dSrcG = nullptr;       // the unquantised sRGB-encoded source, planar fp32
     float* dShIn = nullptr;       // the Sharpen's tight SDR view of HDR planes (w x h)
-    float* dShOut = nullptr;      // and the tight result (the sharpen, or TrueHDR's PQ) padded back into it
+    float* dShOut = nullptr;      // and the sharpen's tight result padded back into the model frame (Sharpen on only)
     // offline: the TrueHDR buffers above are sized dw x dh (TrueHDR runs at the working size before the
     // model), and the emit's per-frame statistics block (nativeOfflinePqOut), read back one frame late
     uint8_t* dThdrStats = nullptr; // k_pqOut's hist / misc / vSum (kThdrStatsBytes)
@@ -8080,7 +8085,7 @@ static bool nativeRtxInit(NativeRife& nr)
              "alloc fit staging");
     if (nr.vsrPre && !nr.dCapF)
         NCHK(cudaMalloc((void**)&nr.dCapF, (size_t)3 * nr.ch * nr.cw * sizeof(float)), "alloc capture planes");
-    if (nr.sharpen > 0.0f || nr.rtxHdr)
+    if (nr.sharpen > 0.0f)
         NCHK(cudaMalloc((void**)&nr.dShOut, (size_t)3 * nr.w * nr.h * sizeof(float)), "alloc after-DLSS 5 output");
     if (nr.sharpen > 0.0f && nr.encPost && nr.shHdrView)
         NCHK(cudaMalloc((void**)&nr.dShIn, (size_t)3 * nr.w * nr.h * sizeof(float)), "alloc sharpen SDR view");
@@ -11282,35 +11287,37 @@ static void nativeFsrupRelease(NativeRife& nr)
 
 // native DRBA's buffers (both routes): the ring of pictures at the pictures' pad, everything the
 // motion search uses at the model's frame (RIFE's two domains: the motion frame, where the ring also
-// keeps the motion frames, the IFNet's x and block0's fp32 frame pair; else the pictures' pad, the
-// encode's fp16 frame in dXh's cur half)
+// keeps the motion frames and the IFNet's x; else the pictures' pad, the encode's fp16 frame in dXh's
+// cur half)
 static bool nativeDrbaAlloc(NativeRife& nr)
 {
     const size_t plane = (size_t)nr.ph * nr.pw, mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
     if (!nr.mph)
         NCHK(cudaMalloc((void**)&nr.dXh, 6 * plane * sizeof(uint16_t)), "alloc x fp16");
-    else
-        NCHK(cudaMalloc((void**)&nr.dDrB0, 6 * mplane * sizeof(float)), "alloc drba block0 frames");
     NCHK(cudaMalloc((void**)&nr.dDrIBase, 4 * 3 * plane * sizeof(float)), "alloc drba frame ring");
+    if (nr.mph)
+        NCHK(cudaMalloc((void**)&nr.dDrMBase, 5 * 3 * mplane * sizeof(uint16_t)), "alloc drba motion ring");
     for (int i = 0; i < 4; i++)
     {
         nr.dDrI[i] = nr.dDrIBase + (size_t)i * 3 * plane;
         if (nr.mph)
-            NCHK(cudaMalloc((void**)&nr.dDrM[i], 3 * mplane * sizeof(uint16_t)), "alloc drba motion ring");
+            nr.dDrM[i] = nr.dDrMBase + (size_t)(3 - i) * 3 * mplane;
     }
     for (int i = 0; i < 2; i++)
     {
-        // two domains: the blend reads its pictures straight from the ring (nativeDrbaPics)
+        // two domains: the blend reads its pictures straight from the ring (nativeDrbaPics), the IFNet its
+        // motion frames (nativeDrbaTween)
         if (!nr.mph)
             NCHK(cudaMalloc((void**)&nr.dDrX[i], 6 * plane * sizeof(float)), "alloc drba x");
-        if (nr.mph)
-            NCHK(cudaMalloc((void**)&nr.dDrMX[i], 6 * mplane * sizeof(uint16_t)), "alloc drba motion x");
         NCHK(cudaMalloc((void**)&nr.drWin[i].f10, 2 * mplane * sizeof(float)), "alloc drba window");
         NCHK(cudaMalloc((void**)&nr.drWin[i].r, 4 * mplane * sizeof(float)), "alloc drba window");
     }
-    NCHK(cudaMalloc((void**)&nr.dDrFlow, 4 * mplane * sizeof(float)), "alloc drba flow");
-    NCHK(cudaMalloc((void**)&nr.dDrFlowN, 4 * mplane * sizeof(float)), "alloc drba flow");
     NCHK(cudaMalloc((void**)&nr.dDrAcc, 6 * mplane * sizeof(long long)), "alloc drba accumulator");
+    // two domains: block0's fp32 frame pair (24 B a pixel) in the accumulator's first half (48 B a pixel):
+    // nativeDrbaFlow widens into it, block0 reads it, then clears the accumulator, all on nr.stream; every
+    // accumulator use clears it first
+    if (nr.mph)
+        nr.dDrB0 = (float*)nr.dDrAcc;
     return true;
 }
 
@@ -12788,15 +12795,13 @@ static void nativeFree(NativeRife& nr)
     if (nr.drTweens || nr.drHeads)
         LOG("native: drba %llu tweens (%llu head pairs), %llu block0 runs\n", (unsigned long long)nr.drTweens,
             (unsigned long long)nr.drHeads, (unsigned long long)nr.drBlock0);
-    for (void* p :
-         {(void*)nr.dDrIBase,   (void*)nr.dDrF[0], (void*)nr.dDrF[1],      (void*)nr.dDrF[2],    (void*)nr.dDrF[3],
-          (void*)nr.dDrX[0],    (void*)nr.dDrX[1], (void*)nr.drWin[0].f10, (void*)nr.drWin[0].r, (void*)nr.drWin[1].f10,
-          (void*)nr.drWin[1].r, (void*)nr.dDrFlow, (void*)nr.dDrFlowN,     (void*)nr.dDrAcc,     (void*)nr.dDrM[0],
-          (void*)nr.dDrM[1],    (void*)nr.dDrM[2], (void*)nr.dDrM[3],      (void*)nr.dDrMX[0],   (void*)nr.dDrMX[1],
-          (void*)nr.dDrB0})
+    for (void* p : {(void*)nr.dDrIBase, (void*)nr.dDrF[0], (void*)nr.dDrF[1], (void*)nr.dDrF[2], (void*)nr.dDrF[3],
+                    (void*)nr.dDrX[0], (void*)nr.dDrX[1], (void*)nr.drWin[0].f10, (void*)nr.drWin[0].r,
+                    (void*)nr.drWin[1].f10, (void*)nr.drWin[1].r, (void*)nr.dDrAcc, (void*)nr.dDrMBase})
         if (p)
             cudaFree(p);
     nr.dDrIBase = nullptr;
+    nr.dDrMBase = nullptr;
     for (int i = 0; i < 4; i++)
     {
         nr.dDrI[i] = nr.dDrF[i] = nullptr;
@@ -12807,7 +12812,6 @@ static void nativeFree(NativeRife& nr)
     nr.dDrB0 = nullptr;
     for (auto& wn : nr.drWin)
         wn = NativeRife::DrWin{};
-    nr.dDrFlow = nr.dDrFlowN = nullptr;
     nr.dDrAcc = nullptr;
     for (int i = 0; i < kGmN; i++)
     {
@@ -13719,8 +13723,9 @@ static bool nativeDrbaPush(NativeRife& nr, const float* dCur, bool same = false)
 }
 
 // calc_flow(frame a, frame b): block0 on the pair, then its tail (the DRBA glue kernels) into out
-// (4 planes: flow05 * 2 | flow15 * 2). Two domains: block0 takes fp32 frames, so the two motion
-// frames are widened into dDrB0 first.
+// (4 planes: flow05 * 2 | flow15 * 2). block0 writes its flow into out, the splat reads it from there
+// into the accumulator and FlowNorm then overwrites every value of out. Two domains: block0 takes fp32
+// frames, so the two motion frames are widened into dDrB0 (the accumulator's first half) first.
 static bool nativeDrbaFlow(NativeRife& nr, uint32_t a, uint32_t b, float* out)
 {
     cudaStream_t st = nr.stream;
@@ -13753,7 +13758,7 @@ static bool nativeDrbaFlow(NativeRife& nr, uint32_t a, uint32_t b, float* out)
     nr.ctxB0->setTensorAddress("img1", img1);
     nr.ctxB0->setTensorAddress("f0", drbaEnc(nr, a));
     nr.ctxB0->setTensorAddress("f1", drbaEnc(nr, b));
-    nr.ctxB0->setTensorAddress("flow", nr.dDrFlow);
+    nr.ctxB0->setTensorAddress("flow", out);
     if (!nr.ctxB0->enqueueV3(st))
     {
         nr.die("block0 enqueueV3 returned false");
@@ -13764,7 +13769,7 @@ static bool nativeDrbaFlow(NativeRife& nr, uint32_t a, uint32_t b, float* out)
         nr.die("drba accumulator clear failed");
         return false;
     }
-    void* as[] = {&nr.dDrFlow, &mw, &mh, &nr.dDrAcc};
+    void* as[] = {&out, &mw, &mh, &nr.dDrAcc};
     if (cuLaunchKernel(nr.fDrFlowSplat, (mw + 15) / 16, (mh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, as, nullptr) !=
         CUDA_SUCCESS)
     {
@@ -13809,9 +13814,10 @@ static NativeRife::DrWin* nativeDrbaWindow(NativeRife& nr, uint32_t c)
     }
     else
     {
-        if (!nativeDrbaFlow(nr, c, c - 1, nr.dDrFlowN))
+        // the left flow lands in wn.r, which the right flow below overwrites (wn.c = 0: nothing reads it between)
+        if (!nativeDrbaFlow(nr, c, c - 1, wn.r))
             return nullptr;
-        if (cudaMemcpyAsync(wn.f10, nr.dDrFlowN, 2 * plane * sizeof(float), cudaMemcpyDeviceToDevice, nr.stream) !=
+        if (cudaMemcpyAsync(wn.f10, wn.r, 2 * plane * sizeof(float), cudaMemcpyDeviceToDevice, nr.stream) !=
             cudaSuccess)
         {
             nr.die("drba window left flow copy failed");
@@ -13902,15 +13908,22 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
     {
         if (nr.mph)
         {
-            // two domains: the pair's motion frames for the IFNet (its pictures: nativeDrbaPics)
-            if (cudaMemcpyAsync(nr.dDrMX[xi], drbaMotion(nr, i1), 3 * mplane * sizeof(uint16_t),
-                                cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
-                cudaMemcpyAsync(nr.dDrMX[xi] + 3 * mplane, drbaMotion(nr, i0), 3 * mplane * sizeof(uint16_t),
+            // two domains: the IFNet's x is the motion ring itself from frame i1's slot on (its pictures:
+            // nativeDrbaPics). The ring descends, so on side -1 frame k - 2 already follows frame k - 1 unless
+            // frame k - 1 holds the last slot (then frame k - 2 is copied into the spare). Side +1 and the head's
+            // plain pair copy frame k - 1 into the slot after frame k - 2: the spare, or frame k - 3's, whose last
+            // reader is window k - 2's block0, built above before this copy (the offline tail's plain tweens come
+            // after the group's windowed ones). Frame k + 1's motion frame lands in that slot next, so its pack
+            // must be enqueued after group k's tweens on the same stream, like its picture.
+            uint16_t* x = drbaMotion(nr, i1);
+            if (x + 3 * mplane != drbaMotion(nr, i0) &&
+                cudaMemcpyAsync(x + 3 * mplane, drbaMotion(nr, i0), 3 * mplane * sizeof(uint16_t),
                                 cudaMemcpyDeviceToDevice, st) != cudaSuccess)
             {
                 nr.die("drba x copy failed");
                 return false;
             }
+            nr.dDrMX[xi] = x;
         }
         else if (nr.xHalf)
         {
@@ -14951,7 +14964,8 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
     // the sharpen reads the HDR planes' tight SDR view, else the model frame itself with its pad strides
     float* shSrc = hdrView ? nr.dShIn : dCur;
     int shPs = hdrView ? fps : dps, shRs = hdrView ? w : pw;
-    float* out = nr.dShOut; // the tight result (the sharpen, or TrueHDR's PQ), padded back into dCur below
+    // the sharpen's tight result, padded back into dCur below (TrueHDR's colour step pads itself)
+    float* out = nr.dShOut;
     if (thdr)
     {
         if (sharpen)
@@ -15031,13 +15045,15 @@ static bool nativePreModelPost(NativeRife& nr, float* dCur, int dps, bool thdr)
             }
             return true;
         }
-        void* a[] = {&nr.dThdrOut, &nr.dSrcG, &w, &h, &out, &nr.rtxMode, &nr.rtxVib, &nr.rtxSb};
-        if (cuLaunchKernel(nr.fThdrColor, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
+        // the colour step writes the padded model frame itself, its pad included
+        void* a[] = {&nr.dThdrOut, &nr.dSrcG, &w, &h, &dCur, &pw, &ph, &dps, &nr.rtxMode, &nr.rtxVib, &nr.rtxSb};
+        if (cuLaunchKernel(nr.fThdrColor, (pw + 15) / 16, (ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
             CUDA_SUCCESS)
         {
             nr.die("thdrColor launch failed");
             return false;
         }
+        return true;
     }
     else
     {

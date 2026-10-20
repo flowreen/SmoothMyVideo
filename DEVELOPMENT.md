@@ -893,7 +893,10 @@ byte-identical, so the throttle saw a 360 fps source and showed the video's own 
 `Capture::samePicture` therefore tests every arrival's client picture, every fit, on FrameArrived's thread (a GPU bit
 compare against the last kept picture; its readback waits with the immediate context locked, the faster of the two
 ways measured) and drops an
-unchanged one uncounted. An unchanged arrival still counts once 500 ms passed since the last kept one
+unchanged one uncounted. The test reads the capture's frame in place (a view of it at the client crop's offset), and
+only a new picture's crop is copied, after the test, to become the reference: an unchanged arrival costs the compare
+alone. `SMV_WGC_SAME=copy` copies every arrival's crop before its test instead (the route a frame no view can read
+also takes, with a one-time log line). An unchanged arrival still counts once 500 ms passed since the last kept one
 (`kSameKeepalive`): the static hold's refresh repaint brings the current picture after a model load or a pause, and
 DLSS-G's 700 ms input-gap reset never fires on a source that keeps presenting a still. The probe (`--probe`) keeps
 every arrival. The session's closing `capture:` line counts the drops, the keepalives and the test's cost. `SMV_WGC_SAME=0` turns the test off (A/B); where it cannot run (`SMV_WGC_SAME=fail` = the trigger) the
