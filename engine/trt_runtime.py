@@ -1084,6 +1084,78 @@ def _warp_at_resize_taps(onnx_path, name):
     onnx.checker.check_model(onnx_path)
 
 
+def _parts_at_resize_taps(onnx_path, name):
+    """RIFE IFNet: the mask and feature parts of blocks 1 / 2 / 3's input (_blockin_resize_parts' `_part5` / `_part6`,
+    each read only through its /8, /4 or /2 Resize: linear, half_pixel, no antialias) are taken at that Resize's taps,
+    as _warp_at_resize_taps does for the warps: 0.25 x the sum of the 4 strided slices [a + dy :: s, a + dx :: s]
+    (a = s / 2 - 1) in fp32, one fp16 rounding. The same values as the Resize bit for bit; TensorRT-RTX 1.7 builds 6
+    layers fewer and the IFNet runs x0.94 at 1088x1920 and 2560x1472. Needs the frame a multiple of s (the host pads
+    every RIFE size to /64). Graph only."""
+    import re
+
+    import numpy as np
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    if not name.startswith("rife_ifnet_"):
+        return
+    sl = re.search(r"_(\d+(?:-\d+)+)(?:_|\.|$)", name)
+    if sl is None:
+        raise RuntimeError(f"{name}: no scale list in the name")
+    scales = [int(s) for s in sl.group(1).split("-")][1:]
+    g = onnx.load(onnx_path, load_external_data=False)
+    typed = onnx.shape_inference.infer_shapes(g).graph
+    dtype = {v.name: v.type.tensor_type.elem_type for v in list(typed.value_info) + list(typed.input)}
+    parts = [nd for nd in g.graph.node if nd.op_type == "Resize" and nd.name.endswith(("_part5", "_part6"))]
+    if len(parts) != 2 * sum(1 for s in scales if s != 1):
+        raise RuntimeError(f"{name}: {len(parts)} mask / feature part Resizes for the scales {scales}")
+    inits, replace = [], {}
+
+    def const(arr, dt, nm):
+        t = numpy_helper.from_array(np.array(arr, dtype=dt), nm)
+        inits.append(t)
+        return t.name
+
+    quarter = const(0.25, np.float32, "pt_quarter")
+    for k, rs in enumerate(parts):
+        s = [x for x in scales if x != 1][k // 2]
+        a = {x.name: helper.get_attribute_value(x) for x in rs.attribute}
+        if (a.get("mode") != b"linear" or a.get("coordinate_transformation_mode") != b"half_pixel"
+                or a.get("antialias", 0) != 0 or s < 2):
+            raise RuntimeError(f"{name}: part Resize {rs.name} is not a linear half_pixel /{s} without antialias ({a})")
+        if dtype.get(rs.input[0]) != TensorProto.FLOAT16:
+            raise RuntimeError(f"{name}: part Resize {rs.name} does not read fp16")
+        o = s // 2 - 1
+        seq, terms = [], []
+        for dy in (0, 1):
+            for dx in (0, 1):
+                p = f"pt{k}_{dy}{dx}"
+                seq.append(helper.make_node(
+                    "Slice", [rs.input[0], const([o + dy, o + dx], np.int64, p + "_s"),
+                              const([1 << 30, 1 << 30], np.int64, p + "_e"), const([2, 3], np.int64, p + "_a"),
+                              const([s, s], np.int64, p + "_t")], [p + "_tap"], name=p + "_slice"))
+                seq.append(helper.make_node("Cast", [p + "_tap"], [p + "_f"], name=p + "_float", to=TensorProto.FLOAT))
+                terms.append(p + "_f")
+        acc = terms[0]
+        for i, t in enumerate(terms[1:]):
+            seq.append(helper.make_node("Add", [acc, t], [f"pt{k}_sum{i}"], name=f"pt{k}_add{i}"))
+            acc = f"pt{k}_sum{i}"
+        seq.append(helper.make_node("Mul", [acc, quarter], [f"pt{k}_mean"], name=f"pt{k}_mul"))
+        seq.append(helper.make_node("Cast", [f"pt{k}_mean"], list(rs.output), name=f"pt{k}_out",
+                                    to=TensorProto.FLOAT16))
+        replace[id(rs)] = seq
+    keep = []
+    for nd in g.graph.node:
+        keep.extend(replace.get(id(nd), [nd]))
+    del g.graph.node[:]
+    g.graph.node.extend(keep)
+    g.graph.initializer.extend(inits)
+    with open(onnx_path + ".tmp", "wb") as fh:
+        fh.write(g.SerializeToString())
+    os.replace(onnx_path + ".tmp", onnx_path)
+    onnx.checker.check_model(onnx_path)
+
+
 def _encode_subpixel(onnx_path, name):
     """RIFE encode: its last layer, a transposed conv (4x4, stride 2, pad 1) from half the frame
     size to the full size, becomes its sub-pixel form: one Conv (3x3, pad 1) with four times the
@@ -1943,6 +2015,7 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
         _block3_conv_split(tmp, name)
         _blocks12_flat_concat(tmp, name)
         _warp_at_resize_taps(tmp, name)
+        _parts_at_resize_taps(tmp, name)
         _encode_subpixel(tmp, name)
         _fusion_fp16_inputs(tmp, name)
         _fusion_tail_cut(tmp, name)

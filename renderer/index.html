@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <title>Smooth My Video</title>
 <style>
-  :root { --green:#76b900; --panel:#2a2a2a; --bg:#1b1b1b; --text:#eaeaea; --sub:#9a9a9a; }
+  :root { --green:#76b900; --panel:#252524; --bg:#151515; --text:#f0efec; --sub:#959490; }
   * { box-sizing: border-box; }
   body { margin:0; padding:18px; background:var(--bg); color:var(--text);
          font-family:'Segoe UI',sans-serif; font-size:16px; }   /* 16px floor for all text */
@@ -21,8 +21,8 @@
   .panel.step > .row:first-child > .k::before { content: counter(step) " "; color:var(--green); font-family:Consolas,monospace; }
   .panel.step > .row:first-child > .k { white-space:nowrap; }
   #go { background:var(--green); color:#0d0d0d; font-weight:700; font-size:16px; padding:10px 18px; }
-  #go:disabled { background:#444; color:#888; cursor:default; }
-  select, input { font:inherit; background:#101010; color:var(--text); border:1px solid #444;
+  #go:disabled { background:#3f3f3e; color:#898781; cursor:default; }
+  select, input { font:inherit; background:#101010; color:var(--text); border:1px solid #3f3f3e;
                   border-radius:5px; padding:5px 8px; }
   /* Sliders must not inherit the box padding/border above: Chromium paints the range track across
      the whole box but confines the thumb travel and fill to the content area, so a padded slider
@@ -32,31 +32,31 @@
   #bar { position:relative; height:28px; background:#101010; border-radius:14px; overflow:hidden; }
   #fill { height:100%; width:0; background:var(--green); transition:width .15s; }
   /* Target-fps stepper ([-] value [unit] [+]). */
-  .stepper { display:inline-flex; align-items:stretch; height:30px; border:1px solid #3a3a3a;
+  .stepper { display:inline-flex; align-items:stretch; height:30px; border:1px solid #353534;
              border-radius:5px; overflow:hidden; vertical-align:middle; }
   .stepper button, .stepper input, .stepper .mx { box-sizing:border-box; }
-  .stepper button { width:26px; background:#222; color:var(--text); border:0; border-radius:0;
-                    border-right:1px solid #3a3a3a; cursor:pointer; font-size:17px; line-height:1; padding:0; }
-  .stepper button:last-child { border-right:0; border-left:1px solid #3a3a3a; }
-  .stepper button:hover:not(:disabled) { background:#2a2a2a; color:var(--green); }
+  .stepper button { width:26px; background:#1d1d1c; color:var(--text); border:0; border-radius:0;
+                    border-right:1px solid #353534; cursor:pointer; font-size:17px; line-height:1; padding:0; }
+  .stepper button:last-child { border-right:0; border-left:1px solid #353534; }
+  .stepper button:hover:not(:disabled) { background:#252524; color:var(--green); }
   .stepper button:disabled { opacity:.4; cursor:default; }
-  .stepper input { border:0; background:#1a1a1a; color:var(--text); text-align:center; padding:0 2px; font-size:14px; }
+  .stepper input { border:0; background:#151515; color:var(--text); text-align:center; padding:0 2px; font-size:14px; }
   .stepper input:disabled { opacity:.5; }
-  .stepper .mx { display:flex; align-items:center; padding:0 7px 0 3px; background:#1a1a1a; color:#888; font-size:13px; }
+  .stepper .mx { display:flex; align-items:center; padding:0 7px 0 3px; background:#151515; color:#898781; font-size:13px; }
   .stepper input::-webkit-inner-spin-button, .stepper input::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
-  .roundbtn { width:26px; height:26px; padding:0; border:1px solid #3a3a3a; border-radius:50%; background:#222;
+  .roundbtn { width:26px; height:26px; padding:0; border:1px solid #353534; border-radius:50%; background:#1d1d1c;
     color:var(--text); font-size:15px; line-height:1; cursor:pointer; flex:0 0 auto; }
-  .roundbtn:hover:not(:disabled) { background:#2a2a2a; color:var(--green); border-color:var(--green); }
+  .roundbtn:hover:not(:disabled) { background:#252524; color:var(--green); border-color:var(--green); }
   .roundbtn:disabled { opacity:.4; cursor:default; }
   #fpsin { width:84px; }
-  .eq { padding:0 9px; color:#888; }
+  .eq { padding:0 9px; color:#898781; }
   /* Speed mode selector: one control, three mutually exclusive answers to "what output rate?" */
-  .seg { display:inline-flex; align-items:stretch; height:30px; border:1px solid #3a3a3a;
+  .seg { display:inline-flex; align-items:stretch; height:30px; border:1px solid #353534;
          border-radius:6px; overflow:hidden; }
-  .seg button { background:#222; color:var(--text); border:0; border-right:1px solid #3a3a3a;
+  .seg button { background:#1d1d1c; color:var(--text); border:0; border-right:1px solid #353534;
                 padding:0 12px; font-size:16px; line-height:1; cursor:pointer; }
   .seg button:last-child { border-right:0; }
-  .seg button:hover:not(:disabled):not(.on) { background:#2a2a2a; color:var(--green); }
+  .seg button:hover:not(:disabled):not(.on) { background:#252524; color:var(--green); }
   .seg button.on { background:var(--green); color:#0d0d0d; font-weight:600; }
   .seg button:disabled { opacity:.4; cursor:default; }
   /* Mode switch = the same segmented control, scaled up: it is the first choice on the page. */
@@ -72,11 +72,11 @@
   #pct { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
          color:#fff; font-size:22px; font-weight:600; pointer-events:none;
          text-shadow:0 1px 2px rgba(0,0,0,.6); }
-  #log { background:#101010; color:#ccc; font-family:Consolas,monospace; font-size:16px;
+  #log { background:#101010; color:#cdccca; font-family:Consolas,monospace; font-size:16px;
          height:150px; overflow:auto; white-space:pre-wrap; padding:8px; border-radius:6px; }
   .hint { color:var(--sub); font-size:16px; }
   body.drag { outline:3px dashed var(--green); outline-offset:-10px; }
-  button.mini { padding:3px 9px; font-size:16px; background:#3a3a3a; color:var(--text); }
+  button.mini { padding:3px 9px; font-size:16px; background:#353534; color:var(--text); }
   /* Compare: the 2x2 of real frames (left) and the two models' new frames (right) */
   #cmpgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:6px; }
   .cmpwrap { overflow:hidden; border-radius:6px; position:relative; }

@@ -1990,7 +1990,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // helper; offline sets no Upscale to and no downscaling fit)
         if (!nativeRtxInit(nr))
             return 2;
-        if (!nr.dPres && !cm((void**)&nr.dPres, (size_t)3 * outW * outH * sizeof(float), "pass staging"))
+        // a stage resizes only between sizes that differ, and srcW <= w <= outW: no size change = no resize staging
+        // (Restore's target is nativeRtxInit's)
+        if (!nr.dPres && (srcW != outW || srcH != outH) &&
+            !cm((void**)&nr.dPres, (size_t)3 * outW * outH * sizeof(float), "pass staging"))
             return 2;
     }
     if (nvPre && !cm((void**)&nr.dSrcPl, (size_t)3 * srcW * srcH * sizeof(float), "decoded source frame"))

@@ -4276,7 +4276,8 @@ struct NativeRife
     nvinfer1::ICudaEngine* engGm[kGmN] = {};
     nvinfer1::IRuntimeConfig* cfgGm[kGmN] = {};
     nvinfer1::IExecutionContext* ctxGm[kGmN] = {};
-    // the contexts' one shared activation block (nativeGmShareMemory, gmCtxMemB bytes); ctxUserMem = nativeMakeContext
+    // the contexts' one shared activation block, gmCtxMemB bytes: GMFSS's eight + Restore's (nativeGmShareMemory) or
+    // the IFNet's, the encode's, Restore's and DRBA's block0 (nativeModelShareMemory); ctxUserMem = nativeMakeContext
     // creates the next contexts with user-managed memory
     void* dGmCtxMem = nullptr;
     int64_t gmCtxMemB = 0;
@@ -4305,15 +4306,19 @@ struct NativeRife
     // (hh, hw), the quarter and the eighth, exactly GMFSS_infer_u's feature pyramid.
     int gmC[3] = {}; // feat_ext channels at the half / quarter / eighth
     bool gmFeatHalf = true, gmMetricHalf = true, gmOutHalf = true, gmFuseHalf = true;
-    int gmCur = 0;               // which dGmFeat set holds the CURRENT frame's features
-    void* dGmFeat[2][3] = {};    // the two frames' feature sets (cur is the next pair's prev)
-    float* dGmHalf = nullptr;    // (6, hh, hw): img0's half in planes 0..2, img1's in 3..5
-    float* dGmFlow = nullptr;    // the gmflow output (2, 2, hh, hw) = flow01 then flow10
-    void* dGmMetric = nullptr;   // (2, hh, hw) in the engine's dtype: m0 then m1
-    float* dGmFlowP[2] = {};     // the flow pyramids at the quarter / eighth, pre-scaled
-    float* dGmMetP[2] = {};      // the metric pyramids at the quarter / eighth (fp32)
-    long long* dGmAcc = nullptr; // the splat accumulator, max(C) + 1 planes of the half; with gmTail it also holds the
-                                 // cut fusionnet's out (256 fp16 planes, free from the splats' end to the next clear)
+    int gmCur = 0;             // which dGmFeat set holds the CURRENT frame's features
+    void* dGmFeat[2][3] = {};  // the two frames' feature sets (cur is the next pair's prev)
+    float* dGmHalf = nullptr;  // (6, hh, hw): img0's half in planes 0..2, img1's in 3..5
+    float* dGmFlow = nullptr;  // the gmflow output (2, 2, hh, hw) = flow01 then flow10
+    void* dGmMetric = nullptr; // (2, hh, hw) in the engine's dtype: m0 then m1
+    float* dGmFlowP[2] = {};   // the flow pyramids at the quarter / eighth, pre-scaled
+    float* dGmMetP[2] = {};    // the metric pyramids at the quarter / eighth (fp32)
+    // the scatter splats' accumulator, max(C) + 1 planes of the half; with gmTail it also holds the cut fusionnet's
+    // out (256 fp16 planes, free from the splats' end to the next clear); the gather splats never use it: then only
+    // that out (64 planes), or null
+    long long* dGmAcc = nullptr;
+    // the pair scratch (dGmA, dGmCorr, dGmM, dGmFlow8, dGmProp, dGmEnc, dGmHalfM) carved from dGmAcc, not allocated
+    bool gmScratchInAcc = false;
     // the gather splats (k_gs*): two list sets (a level's two directions), each the counts / fill cursor, the list
     // offsets, the entries and the sources' e / dx / dy planes, sized for the half; gmGather false (SMV_GM_SPLAT=old,
     // or a half above the scan's 2048 x 4096 cells) = k_splatSoft + k_splatNorm on dGmAcc
@@ -4335,7 +4340,8 @@ struct NativeRife
     void* dGmFc = nullptr;                 // fusionnet c (2 * gmC[1], quarter), the same dtype
     void* dGmFd = nullptr;                 // fusionnet d (2 * gmC[2], eighth), the same dtype
     float* dGmT = nullptr;                 // the timestep, one device float (ifnet's 1x1x1x1 input)
-    void* dGmOut = nullptr; // the fusionnet output (3, ph, pw) in the engine's dtype (gmTail: k_fuTail's, fp32)
+    void* dGmOut = nullptr; // the full graph's fusionnet output (3, ph, pw) in the engine's dtype (gmTail: null, the
+                            // tail writes dGmF)
     float* dGmF = nullptr;  // that output clamped to fp32: what storeSlot consumes
     // HDR planes (nativeGmfssPair): the SDR view of one padded frame (hdrToModel, the scratch), the motion view's
     // halves gmflow and metricnet read on a pair outside the SDR range, the range flag (device, pinned host copy);
@@ -4346,6 +4352,13 @@ struct NativeRife
     int* hGmRange = nullptr;
     bool gmSdrPairs = true; // SMV_GMFSS_SDR_PAIRS=0: every pair the way outside the SDR range
     bool gmFrameSdr[2] = {}, gmFeatSdr[2] = {}, gmPairSdr = false;
+    // gmFeatOk[s] = dGmFeat[s] holds its frame's features: a call without tweens skips feat_ext (gmFeatLazy;
+    // SMV_GM_FEAT_LAZY=0 = never) and the next pair that makes tweens takes the previous frame's again (the refeat
+    // branch). gmCatchUp = the last pair ran such a catch-up the eager route would not have (its span between
+    // gmCatchEv[0] and [1], live only), which the throttle's price takes out of that group's pre
+    bool gmFeatOk[2] = {}, gmFeatLazy = true, gmCatchUp = false;
+    cudaEvent_t gmCatchEv[2] = {};
+    uint32_t gmFeatSkips = 0, gmCatchUps = 0;
     int gmModeLogs = 0; // the mode lines this session printed (the first pair's and up to 3 switches)
     // SMV_LIVE_GMFSS_PROF=1: per-phase CUDA-event breakdown of the chain, printed every 32
     // groups (the native answer to the python route's [timing] line; nine spans, the tween ones
@@ -6644,11 +6657,12 @@ static void lkGmUpgradeStop()
 
 // GMFSS's nets `nets` (indices into s.gm), built when missing and warmed. TensorRT-RTX compiles one engine at a time
 // per PROCESS (a build or a JIT warm-up on another thread waits for the running one; two processes run at full speed:
-// 103rd chat), so gmflow A ("gflow", ~30 of the set's ~45 s cold at every size) goes to a helper process (this exe's
-// --build-engine, killed with this process through a job object) while this thread does the other nets in order on
-// st; a helper that fails, or cannot start, leaves A to this thread afterwards. The lookups need every net's .jit, which
-// is written only after that net's warm-up, so a set is never marked warm early. SMV_GM_HELPER=0 = no helper (the A/B
-// lever). *oom = a failure was memory-shaped.
+// 103rd chat), so gmflow A ("gflow", ~30 of the set's ~45 s cold at every size) and its front `_m` ("gflowm", the
+// host chain's longest net after it) each go to a helper process (this exe's --build-engine, killed with this process
+// through one job object) while this thread does the other nets in order on st; a helper that fails, or cannot start,
+// leaves its net to this thread afterwards. The lookups need every net's .jit, which is written only after that net's
+// warm-up, so a set is never marked warm early. SMV_GM_HELPER=0 = no helper, =1 = A's alone (the A/B levers).
+// *oom = a failure was memory-shaped.
 static bool lkGmEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTags& t, const std::vector<size_t>& nets,
                        cudaStream_t st, bool* oom)
 {
@@ -6663,41 +6677,58 @@ static bool lkGmEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupT
         return lkEnsure(rt, s, t, path(i), n.onnx, n.set, nullptr, 0, 0, n.ws, {n.set},
                         !strcmp(n.key, "gfusion") ? s.warmKey : std::string(), st, oom);
     };
-    size_t a = nets.size();
-    for (size_t k = 0; k < nets.size(); k++)
-        if (!strcmp(s.gm[nets[k]].key, "gflow"))
-            a = k;
-    HANDLE helper = nullptr, job = nullptr;
-    std::string helperLog;
-    if (a < nets.size() && lkEnv("SMV_GM_HELPER") != "0")
+    // the helpers' nets: k into nets, the name their lines carry, the process and its log
+    struct Helper
     {
-        const LkGmNet& n = s.gm[nets[a]];
+        size_t k;
+        const char* name;
+        HANDLE proc = nullptr;
+        std::string log;
+    };
+    std::vector<Helper> hs;
+    const std::string helperLever = lkEnv("SMV_GM_HELPER");
+    for (size_t k = 0; k < nets.size() && helperLever != "0"; k++)
+        if (!strcmp(s.gm[nets[k]].key, "gflow"))
+            hs.push_back({k, "gmflow A"});
+        else if (!strcmp(s.gm[nets[k]].key, "gflowm") && helperLever != "1")
+            hs.push_back({k, "gmflow _m"});
+    HANDLE job = nullptr;
+    if (!hs.empty())
+    {
+        job = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (job && !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li)))
+        {
+            CloseHandle(job);
+            job = nullptr;
+        }
+    }
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    for (Helper& h : hs)
+    {
+        const LkGmNet& n = s.gm[nets[h.k]];
         const std::string onnx = lkOnnxPath(s.engDir, n.onnx, t);
-        helperLog = path(nets[a]) + ".helper.log";
-        wchar_t exe[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --build-engine \"" + utf8ToWide(helperLog) + L"\" \"" +
+        h.log = path(nets[h.k]) + ".helper.log";
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --build-engine \"" + utf8ToWide(h.log) + L"\" \"" +
                            s.engDirW + L"\\live_server.py\" \"" + utf8ToWide(onnx) + L"\" \"" +
-                           utf8ToWide(path(nets[a])) + L"\" " + std::to_wstring(n.ws);
+                           utf8ToWide(path(nets[h.k])) + L"\" " + std::to_wstring(n.ws);
         for (const auto& in : n.set)
         {
             cmd += L" " + utf8ToWide(in.name) + L"=";
             for (size_t d = 0; d < in.dims.size(); d++)
                 cmd += (d ? L"x" : L"") + std::to_wstring(in.dims[d]);
         }
-        job = CreateJobObjectW(nullptr, nullptr);
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
-        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         STARTUPINFOW si{sizeof(si)};
         PROCESS_INFORMATION pi{};
-        if (job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li)) &&
-            CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
-                           nullptr, &si, &pi))
+        if (job && CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                                  nullptr, nullptr, &si, &pi))
         {
             if (AssignProcessToJobObject(job, pi.hProcess))
             {
                 ResumeThread(pi.hThread);
-                helper = pi.hProcess;
+                h.proc = pi.hProcess;
             }
             else
             {
@@ -6706,38 +6737,50 @@ static bool lkGmEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupT
             }
             CloseHandle(pi.hThread);
         }
-        if (!helper)
-            LOG("native: the gmflow A build helper did not start (%lu), building it here\n", GetLastError());
+        if (!h.proc)
+            LOG("native: the %s build helper did not start (%lu), building it here\n", h.name, GetLastError());
     }
+    auto helped = [&](size_t k) {
+        for (const Helper& h : hs)
+            if (h.k == k && h.proc)
+                return true;
+        return false;
+    };
     bool ok = true;
     for (size_t k = 0; ok && k < nets.size(); k++)
-        if (k != a)
+        if (!helped(k))
             ok = one(nets[k]);
-    bool aDone = a == nets.size();
-    if (helper)
+    std::vector<size_t> again;
+    for (Helper& h : hs)
     {
+        if (!h.proc)
+            continue;
         if (!ok)
-            TerminateProcess(helper, 2);
-        WaitForSingleObject(helper, INFINITE);
+            TerminateProcess(h.proc, 2);
+        WaitForSingleObject(h.proc, INFINITE);
         DWORD rc = 2;
-        GetExitCodeProcess(helper, &rc);
-        CloseHandle(helper);
+        GetExitCodeProcess(h.proc, &rc);
+        CloseHandle(h.proc);
         {
-            std::ifstream f(helperLog);
+            std::ifstream f(h.log);
             std::string ln;
             while (std::getline(f, ln))
                 if (!ln.empty())
                     LOG("helper: %s\n", ln.c_str());
         }
-        DeleteFileA(helperLog.c_str());
-        aDone = ok && rc == 0 && lkFile(path(nets[a])) && lkFile(lkJit(path(nets[a])));
-        if (ok && !aDone)
-            LOG("native: the gmflow A build helper failed (exit %lu), building it here\n", rc);
+        DeleteFileA(h.log.c_str());
+        const bool done = ok && rc == 0 && lkFile(path(nets[h.k])) && lkFile(lkJit(path(nets[h.k])));
+        if (ok && !done)
+        {
+            LOG("native: the %s build helper failed (exit %lu), building it here\n", h.name, rc);
+            again.push_back(h.k);
+        }
     }
     if (job)
         CloseHandle(job);
-    if (ok && !aDone)
-        ok = one(nets[a]);
+    for (size_t k : again)
+        if (ok)
+            ok = one(nets[k]);
     return ok;
 }
 
@@ -8141,16 +8184,16 @@ static bool nativeRtxInit(NativeRife& nr)
         NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)vtw * vth * 4), "alloc VSR output");
     }
     // RTX TrueHDR runs once per real frame at the working size, after Restore, DLSS 5 and Sharpen and before the
-    // model (nativePreModelPost); its buffers take the largest frame of the route (live the capture or the working
-    // size, whichever is bigger; the output offline), and live dSrcG first carries the capture's SDR planes
-    // (k_sdrEncode)
-    const bool workBig = !g_offline && (size_t)nr.w * nr.h > (size_t)nr.cw * nr.ch;
-    const int hw = g_offline ? nr.dw : (workBig ? nr.w : nr.cw), hh = g_offline ? nr.dh : (workBig ? nr.h : nr.ch);
+    // model (nativePreModelPost): its input and output (and the bridge's arrays, which the warm-up makes) are
+    // working-size, dSrcG too offline; live dSrcG first carries the capture's SDR planes (k_sdrEncode), so it takes
+    // the capture or the working size, whichever is bigger
+    const bool workBig = (size_t)nr.w * nr.h > (size_t)nr.cw * nr.ch;
+    const int gw = g_offline || workBig ? nr.w : nr.cw, gh = g_offline || workBig ? nr.h : nr.ch;
     if (nr.rtxHdr)
     {
-        NCHK(cudaMalloc((void**)&nr.dThdrIn, (size_t)hw * hh * 4), "alloc TrueHDR input");
-        NCHK(cudaMalloc((void**)&nr.dThdrOut, (size_t)hw * hh * 4), "alloc TrueHDR output");
-        NCHK(cudaMalloc((void**)&nr.dSrcG, (size_t)3 * hw * hh * sizeof(float)), "alloc source gamma planes");
+        NCHK(cudaMalloc((void**)&nr.dThdrIn, (size_t)nr.w * nr.h * 4), "alloc TrueHDR input");
+        NCHK(cudaMalloc((void**)&nr.dThdrOut, (size_t)nr.w * nr.h * 4), "alloc TrueHDR output");
+        NCHK(cudaMalloc((void**)&nr.dSrcG, (size_t)3 * gw * gh * sizeof(float)), "alloc source gamma planes");
         if (g_offline)
         {
             NCHK(cudaMalloc((void**)&nr.dThdrStats, kThdrStatsBytes), "alloc TrueHDR stats");
@@ -8242,14 +8285,14 @@ static bool nativeRtxInit(NativeRife& nr)
     if (nr.rtxHdr)
     {
         // warm-up eval on a zero frame (opaque black BGRA), python live_server.py ~1859
-        if (cuMemsetD32Async((CUdeviceptr)nr.dThdrIn, 0xFF000000u, (size_t)hw * hh, (CUstream)nr.stream) !=
+        if (cuMemsetD32Async((CUdeviceptr)nr.dThdrIn, 0xFF000000u, (size_t)nr.w * nr.h, (CUstream)nr.stream) !=
             CUDA_SUCCESS)
         {
             LOG("native: TrueHDR warm-up clear failed\n");
             return false;
         }
         NCHK(cudaStreamSynchronize(nr.stream), "warm-up stream sync");
-        const RtxRect wr{0, 0, (uint32_t)hw, (uint32_t)hh};
+        const RtxRect wr{0, 0, (uint32_t)nr.w, (uint32_t)nr.h};
         if (g_rtxb.evalThdr(nr.dThdrIn, nr.dThdrOut, wr, wr, &nr.thdr) != 1u)
         {
             LOG("native: the TrueHDR warm-up eval failed\n");
@@ -11766,16 +11809,57 @@ static bool nativeGmShareMemory(NativeRife& nr)
         need = (std::max)(need, b);
         sum += b;
     }
-    if (need > 0 && cudaMalloc(&nr.dGmCtxMem, (size_t)need) != cudaSuccess)
+    // Restore (live and offline, before the model on the same stream) takes the block too; it grows to Restore's size
+    // when that is the larger
+    const int64_t rb = nr.ctxRest ? nr.engRest->getDeviceMemorySizeV2() : 0, blk = (std::max)(need, rb);
+    if (blk > 0 && cudaMalloc(&nr.dGmCtxMem, (size_t)blk) != cudaSuccess)
     {
-        LOG("native: gmfss shared activation block (%.0f MB) alloc failed\n", need / 1048576.0);
+        LOG("native: gmfss shared activation block (%.0f MB) alloc failed\n", blk / 1048576.0);
         return false;
     }
     for (int i = 0; i < kGmN; i++)
         nr.ctxGm[i]->setDeviceMemoryV2(nr.dGmCtxMem, need);
-    nr.gmCtxMemB = need;
+    nr.gmCtxMemB = blk;
     LOG("native: gmfss contexts share one %.0f MB activation block (%.0f MB as eight)\n", need / 1048576.0,
         sum / 1048576.0);
+    if (nr.ctxRest)
+    {
+        nr.ctxRest->setDeviceMemoryV2(nr.dGmCtxMem, nr.gmCtxMemB);
+        LOG("native: the restore context shares it (%.0f MB on its own)\n", rb / 1048576.0);
+    }
+    return true;
+}
+
+// The RIFE family's contexts (the IFNet, the encode, Restore, DRBA's block0) enqueue one after another on nr.stream
+// too, so they share ONE activation block, the largest one's, set before any warm-up (a whole-graph capture records its
+// address). SMV_CTXSHARE=0 = each context its own (TensorRT's default).
+static bool nativeModelShareMemory(NativeRife& nr)
+{
+    std::pair<nvinfer1::ICudaEngine*, nvinfer1::IExecutionContext*> set[] = {
+        {nr.engIf, nr.ctxIf}, {nr.engEnc, nr.ctxEnc}, {nr.engRest, nr.ctxRest}, {nr.engB0, nr.ctxB0}};
+    int64_t need = 0, sum = 0;
+    int n = 0;
+    for (const auto& c : set)
+        if (c.second)
+        {
+            const int64_t b = c.first->getDeviceMemorySizeV2();
+            need = (std::max)(need, b);
+            sum += b;
+            n++;
+        }
+    if (!n)
+        return true;
+    if (need > 0 && cudaMalloc(&nr.dGmCtxMem, (size_t)need) != cudaSuccess)
+    {
+        LOG("native: shared activation block (%.0f MB) alloc failed\n", need / 1048576.0);
+        return false;
+    }
+    for (const auto& c : set)
+        if (c.second)
+            c.second->setDeviceMemoryV2(nr.dGmCtxMem, need);
+    nr.gmCtxMemB = need;
+    LOG("native: the model contexts share one %.0f MB activation block (%.0f MB as %d)\n", need / 1048576.0,
+        sum / 1048576.0, n);
     return true;
 }
 
@@ -11899,7 +11983,7 @@ static bool nativeGmfssSetup(NativeRife& nr)
     // fusionnet's tail: the full graph writes the frame (`out` 3 x ph x pw); the cut graph (trt_runtime's
     // fusion_tail_cut) stops before its pixel shuffle (`out` = the 64 -> 256 conv at the half, fp16) and hands
     // conv_last's weight and bias out as w_last / b_last, and k_fuTail does the shuffle + conv_last (fp32 sums, the
-    // frame in fp32: dGmOut's dtype on that path)
+    // frame in fp32, straight into dGmF)
     {
         const nvinfer1::Dims so = nr.engGm[4]->getTensorShape("out");
         nr.gmTail = so.nbDims == 4 && so.d[1] == 256;
@@ -11954,6 +12038,11 @@ static bool nativeGmfssSetup(NativeRife& nr)
         accPlanes = (((size_t)nr.gmC[1] + 1) * qp + hp - 1) / hp;
     if (((size_t)nr.gmC[2] + 1) * ep > accPlanes * hp)
         accPlanes = (((size_t)nr.gmC[2] + 1) * ep + hp - 1) / hp;
+    nr.gmGather = lkEnv("SMV_GM_SPLAT") != "old" && hp <= (size_t)2048 * 4096;
+    // the gather splats never touch the accumulator: it then holds only the cut fusionnet's out (256 fp16 a half
+    // pixel = 64 planes of 8 bytes), and nothing with the full graph
+    if (nr.gmGather)
+        accPlanes = nr.gmTail ? 256 * 2 / sizeof(long long) : 0;
     if (nr.gmTail && accPlanes * sizeof(long long) < 256 * 2)
         return bad("the splat accumulator cannot hold the cut fusionnet's out");
     size_t freeB = 0, freeA = 0, totB = 0;
@@ -11969,8 +12058,8 @@ static bool nativeGmfssSetup(NativeRife& nr)
     NCHK(cudaMalloc((void**)&nr.dGmFlowP[1], 4 * ep * sizeof(float)), "alloc gmfss flow pyramid");
     NCHK(cudaMalloc((void**)&nr.dGmMetP[0], 2 * qp * sizeof(float)), "alloc gmfss metric pyramid");
     NCHK(cudaMalloc((void**)&nr.dGmMetP[1], 2 * ep * sizeof(float)), "alloc gmfss metric pyramid");
-    NCHK(cudaMalloc((void**)&nr.dGmAcc, accPlanes * hp * sizeof(long long)), "alloc gmfss splat accumulator");
-    nr.gmGather = lkEnv("SMV_GM_SPLAT") != "old" && hp <= (size_t)2048 * 4096;
+    if (accPlanes)
+        NCHK(cudaMalloc((void**)&nr.dGmAcc, accPlanes * hp * sizeof(long long)), "alloc gmfss splat accumulator");
     if (nr.gmGather)
         for (int s = 0; s < 2; s++)
         {
@@ -11986,7 +12075,8 @@ static bool nativeGmfssSetup(NativeRife& nr)
     NCHK(cudaMalloc(&nr.dGmFc, (size_t)2 * nr.gmC[1] * qp * be), "alloc gmfss fusion c");
     NCHK(cudaMalloc(&nr.dGmFd, (size_t)2 * nr.gmC[2] * ep * be), "alloc gmfss fusion d");
     NCHK(cudaMalloc((void**)&nr.dGmT, sizeof(float)), "alloc gmfss timestep");
-    NCHK(cudaMalloc(&nr.dGmOut, 3 * plane * oe), "alloc gmfss fusion out");
+    if (!nr.gmTail)
+        NCHK(cudaMalloc(&nr.dGmOut, 3 * plane * oe), "alloc gmfss fusion out");
     NCHK(cudaMalloc((void**)&nr.dGmF, 3 * plane * sizeof(float)), "alloc gmfss model frame");
     if (nr.gmTail)
     {
@@ -12031,15 +12121,48 @@ static bool nativeGmfssSetup(NativeRife& nr)
         if (!any)
             return bad("the cut fusionnet wrote no conv_last weight");
     }
-    for (int i = 0; i < kGmAn; i++)
-        NCHK(cudaMalloc(&nr.dGmA[i], trtTensorBytes(nr.engGm[1], kGmA[i])), "alloc gmfss split tensors");
-    NCHK(cudaMalloc((void**)&nr.dGmCorr, (size_t)2 * nr.gmH * nr.gmW * nr.gmK * sizeof(float)),
-         "alloc gmfss local correlation");
+    // the pair's scratch (A's qf / flow0, the local correlation, the matching operands and flow, the propagated flow;
+    // with encPost the SDR view and the motion halves) is written and read inside nativeGmfssPair only, and the
+    // accumulator under the gather splats inside nativeGmfssTween only (the cut out, written before it is read), both
+    // on nr.stream: so the scratch is carved from the accumulator when it fits (256-B aligned), else it gets its own
+    // buffers (SMV_GM_SCRATCH=own)
     static const char* const kGmM[3] = {"mf", "mq", "mk"};
+    struct Scratch
+    {
+        void** p;
+        size_t bytes;
+        const char* what;
+    };
+    std::vector<Scratch> scr;
+    for (int i = 0; i < kGmAn; i++)
+        scr.push_back({&nr.dGmA[i], trtTensorBytes(nr.engGm[1], kGmA[i]), "alloc gmfss split tensors"});
+    scr.push_back(
+        {(void**)&nr.dGmCorr, (size_t)2 * nr.gmH * nr.gmW * nr.gmK * sizeof(float), "alloc gmfss local correlation"});
     for (int i = 0; i < 3; i++)
-        NCHK(cudaMalloc(&nr.dGmM[i], trtTensorBytes(nr.engGm[7], kGmM[i])), "alloc gmfss matching operands");
-    NCHK(cudaMalloc((void**)&nr.dGmFlow8, (size_t)2 * nr.gmN8 * 2 * sizeof(float)), "alloc gmfss matching flow");
-    NCHK(cudaMalloc(&nr.dGmProp, trtTensorBytes(nr.engGm[1], "prop")), "alloc gmfss propagated flow");
+        scr.push_back({&nr.dGmM[i], trtTensorBytes(nr.engGm[7], kGmM[i]), "alloc gmfss matching operands"});
+    scr.push_back({(void**)&nr.dGmFlow8, (size_t)2 * nr.gmN8 * 2 * sizeof(float), "alloc gmfss matching flow"});
+    scr.push_back({&nr.dGmProp, trtTensorBytes(nr.engGm[1], "prop"), "alloc gmfss propagated flow"});
+    if (nr.encPost)
+    {
+        scr.push_back({(void**)&nr.dGmEnc, 3 * plane * sizeof(float), "alloc gmfss SDR view"});
+        scr.push_back({(void**)&nr.dGmHalfM, 6 * hp * sizeof(float), "alloc gmfss motion halves"});
+    }
+    size_t scrB = 0;
+    for (const Scratch& s : scr)
+        scrB += (s.bytes + 255) & ~(size_t)255;
+    nr.gmScratchInAcc =
+        nr.gmTail && nr.gmGather && lkEnv("SMV_GM_SCRATCH") != "own" && scrB <= accPlanes * hp * sizeof(long long);
+    size_t scrOff = 0;
+    for (const Scratch& s : scr)
+        if (nr.gmScratchInAcc)
+        {
+            *s.p = (uint8_t*)nr.dGmAcc + scrOff;
+            scrOff += (s.bytes + 255) & ~(size_t)255;
+        }
+        else
+            NCHK(cudaMalloc(s.p, s.bytes), s.what);
+    LOG("native: gmfss chain: pair scratch %.0f MB %s\n", (double)scrB / 1048576.0,
+        nr.gmScratchInAcc ? "inside the splat accumulator" : "in its own buffers");
     for (int i = 0; i < 2; i++)
     {
         const size_t bytes = trtTensorBytes(nr.engGm[1], i ? "map8" : "map4");
@@ -12049,8 +12172,6 @@ static bool nativeGmfssSetup(NativeRife& nr)
     nr.gmMapsNext = false;
     if (nr.encPost)
     {
-        NCHK(cudaMalloc((void**)&nr.dGmEnc, 3 * plane * sizeof(float)), "alloc gmfss SDR view");
-        NCHK(cudaMalloc((void**)&nr.dGmHalfM, 6 * hp * sizeof(float)), "alloc gmfss motion halves");
         NCHK(cudaMalloc((void**)&nr.dGmRange, sizeof(int)), "alloc gmfss range flag");
         NCHK(cudaHostAlloc((void**)&nr.hGmRange, sizeof(int), cudaHostAllocDefault), "alloc gmfss range readback");
         nr.gmFrameSdr[0] = nr.gmFrameSdr[1] = nr.gmFeatSdr[0] = nr.gmFeatSdr[1] = nr.gmPairSdr = false;
@@ -12083,6 +12204,16 @@ static bool nativeGmfssSetup(NativeRife& nr)
     if (nr.gmProf)
         for (auto& e : nr.gmEv)
             NCHK(cudaEventCreate(&e), "create gmfss profile event");
+    nr.gmFeatLazy = lkEnv("SMV_GM_FEAT_LAZY") != "0";
+    nr.gmFeatOk[0] = nr.gmFeatOk[1] = nr.gmCatchUp = false;
+    nr.gmFeatSkips = nr.gmCatchUps = 0;
+    if (!g_offline && nr.gmFeatLazy)
+        for (auto& e : nr.gmCatchEv)
+            NCHK(cudaEventCreate(&e), "create gmfss catch-up event");
+    LOG("native: gmfss chain: %s\n", nr.gmFeatLazy
+                                         ? "feat_ext only for pairs that make tweens (the next such pair takes a "
+                                           "skipped frame's)"
+                                         : "feat_ext on every new frame (SMV_GM_FEAT_LAZY=0)");
     return true;
 }
 
@@ -12436,7 +12567,16 @@ static bool nativeTrtInit(NativeRife& nr)
             LOG("native: block0 f0 / f1 dtype differs from the IFNet's\n");
             return false;
         }
-        return nativeWarmEngine(nr, nr.engB0, nr.ctxB0, "block0", "drba");
+        return true;
+    };
+    // the warm-up after the contexts' shared block is set (nativeModelShareMemory)
+    auto block0Warm = [&]() -> bool { return !nr.ctxB0 || nativeWarmEngine(nr, nr.engB0, nr.ctxB0, "block0", "drba"); };
+    // the RIFE family's contexts on one activation block: every context below is made user-managed, the block follows
+    // once they all exist
+    const bool modelShare = lkEnv("SMV_CTXSHARE") != "0";
+    auto shareReady = [&]() -> bool {
+        nr.ctxUserMem = false;
+        return !modelShare || nativeModelShareMemory(nr);
     };
     // GMFSS: the five-engine set, resident like the pair (the same paths =
     // reuse, contexts recreated; anything else frees whatever set was resident and loads this
@@ -12482,9 +12622,6 @@ static bool nativeTrtInit(NativeRife& nr)
                     return false;
             }
         }
-        nr.ctxUserMem = false;
-        if (gmShare && !nativeGmShareMemory(nr))
-            return false;
         if (g_res.engRest)
         {
             delete g_res.engRest;
@@ -12497,6 +12634,9 @@ static bool nativeTrtInit(NativeRife& nr)
             if (!nr.engRest)
                 return false;
         }
+        nr.ctxUserMem = false;
+        if (gmShare && !nativeGmShareMemory(nr))
+            return false;
         for (int i = 0; i < kGmN; i++)
             if (!nativeWarmEngine(nr, nr.engGm[i], nr.ctxGm[i], kGmName[i]))
                 return false;
@@ -12524,6 +12664,7 @@ static bool nativeTrtInit(NativeRife& nr)
         }
         return true;
     }
+    nr.ctxUserMem = modelShare;
     if (g_resident && g_res.rt && g_res.ifnetPath == nr.ifnetPath && g_res.encodePath == nr.encodePath)
     {
         const int64_t t0 = nowQpc100();
@@ -12573,7 +12714,7 @@ static bool nativeTrtInit(NativeRife& nr)
             if (!nativeMakeContext(nr, nr.engRest, &nr.cfgRest, &nr.ctxRest))
                 return false;
         }
-        if (!restoreReady() || !block0Ready())
+        if (!block0Ready() || !shareReady() || !restoreReady() || !block0Warm())
             return false;
         LOG("native: resident engines reused, contexts recreated in %.2f s\n", (nowQpc100() - t0) / 1e7);
         return true;
@@ -12678,7 +12819,7 @@ static bool nativeTrtInit(NativeRife& nr)
                    : "",
             nr.w, nr.h);
     }
-    if (!restoreReady() || !block0Ready())
+    if (!block0Ready() || !shareReady() || !restoreReady() || !block0Warm())
         return false;
     if (g_resident)
     {
@@ -12859,6 +13000,17 @@ static void nativeFree(NativeRife& nr)
             cudaEventDestroy(e);
             e = nullptr;
         }
+    for (auto& e : nr.gmCatchEv)
+        if (e)
+        {
+            cudaEventDestroy(e);
+            e = nullptr;
+        }
+    if (nr.gmFeatSkips)
+        LOG("native: gmfss: feat_ext skipped on %u frames without tweens, %u taken by a later pair\n", nr.gmFeatSkips,
+            nr.gmCatchUps);
+    nr.gmFeatSkips = nr.gmCatchUps = 0;
+    nr.gmCatchUp = false;
     if (nr.capEv)
     {
         cudaEventDestroy(nr.capEv);
@@ -12957,6 +13109,17 @@ static void nativeFree(NativeRife& nr)
     nr.thdrStatsPending = false;
     // the GMFSS chain's buffers: per session like every other model buffer, so a
     // backend switch on the resident host gives the VRAM back even though the engines stay
+    if (nr.gmScratchInAcc)
+    {
+        // the pair scratch lives inside dGmAcc: the accumulator's free returns it
+        for (auto& p : nr.dGmA)
+            p = nullptr;
+        for (auto& p : nr.dGmM)
+            p = nullptr;
+        nr.dGmCorr = nr.dGmFlow8 = nr.dGmEnc = nr.dGmHalfM = nullptr;
+        nr.dGmProp = nullptr;
+        nr.gmScratchInAcc = false;
+    }
     for (void* p : {nr.dGmFeat[0][0],
                     nr.dGmFeat[0][1],
                     nr.dGmFeat[0][2],
@@ -13161,6 +13324,15 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         return c->enqueueV3(st);
     };
     float* xCur = sdr ? nr.dGmEnc : dCur;
+    if (!needFlow && nr.gmFeatLazy)
+    {
+        // no tween in this group: its frame's features wait for the next pair that makes tweens, which takes them
+        // from dPrev (the same bytes) in its own mode; gmFeatSdr keeps the mode the eager route would have used
+        nr.gmFeatOk[nr.gmCur] = false;
+        nr.gmFeatSdr[nr.gmCur] = sdr;
+        nr.gmFeatSkips++;
+        return true;
+    }
     if (sdr && !view(dCur, 0.0f))
     {
         nr.die("gmfss SDR view launch failed");
@@ -13172,6 +13344,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         return false;
     }
     nr.gmFeatSdr[nr.gmCur] = sdr;
+    nr.gmFeatOk[nr.gmCur] = true;
     if (!needFlow)
         return true; // no tween in this group: python skips reuse() as well
     if (profPair)
@@ -13188,13 +13361,25 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         return cuLaunchKernel(nr.fHalf, (nr.hw + 15) / 16, (nr.hh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                               nullptr) == CUDA_SUCCESS;
     };
-    const bool refeat = nr.gmFeatSdr[nr.gmCur ^ 1] != sdr;
-    if (!halfOf(a1) || (sdr && !view(dPrev, 0.0f)) || !halfOf(a0) || (refeat && !featExt(x0, nr.dGmFeat[nr.gmCur ^ 1])))
+    // the previous frame's features again: taken in the other mode, or skipped by its call (a catch-up, timed apart
+    // live when the eager route would not have taken them again)
+    const bool stale = !nr.gmFeatOk[nr.gmCur ^ 1];
+    const bool modeAgain = nr.gmFeatSdr[nr.gmCur ^ 1] != sdr;
+    const bool refeat = stale || modeAgain;
+    const bool catchUp = stale && !modeAgain && nr.gmCatchEv[0];
+    if (!halfOf(a1) || (sdr && !view(dPrev, 0.0f)) || !halfOf(a0) ||
+        (catchUp && cudaEventRecord(nr.gmCatchEv[0], st) != cudaSuccess) ||
+        (refeat && !featExt(x0, nr.dGmFeat[nr.gmCur ^ 1])) ||
+        (catchUp && cudaEventRecord(nr.gmCatchEv[1], st) != cudaSuccess))
     {
         nr.die("gmfss half launch failed");
         return false;
     }
     nr.gmFeatSdr[nr.gmCur ^ 1] = sdr;
+    nr.gmFeatOk[nr.gmCur ^ 1] = true;
+    nr.gmCatchUp = catchUp;
+    if (stale)
+        nr.gmCatchUps++;
     // the motion nets: an SDR pair's halves, else (HDR planes) the motion view's
     const bool mview = nr.encPost && !sdr;
     float* mv0 = mview ? nr.dGmHalfM : h0;
@@ -13543,18 +13728,18 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     const int ps = (int)plane;
     if (nr.gmTail)
     {
-        // the cut graph's out (in the splat accumulator) -> k_fuTail: the frame clamped straight into dGmF (python's
-        // torch.clamp(out, 0, 1)), or for an SDR pair unclamped into dGmOut (fp32), which k_hdrFromSdr clamps and
-        // takes back to the HDR codes
+        // the cut graph's out (in the splat accumulator) -> k_fuTail into dGmF: the frame clamped (python's
+        // torch.clamp(out, 0, 1)), or for an SDR pair unclamped, which k_hdrFromSdr then clamps and takes back to the
+        // HDR codes in place (each pixel's three planes are read before it writes them)
         const void* pre = nr.dGmAcc;
-        void* dst = nr.gmPairSdr ? nr.dGmOut : (void*)nr.dGmF;
+        void* dst = nr.dGmF;
         int th = nr.hh, tw = nr.hw, cl = nr.gmPairSdr ? 0 : 1;
         void* at[] = {(void*)&pre, (void*)&nr.dGmWl, (void*)&nr.dGmBl, (void*)&dst, &th, &tw, &cl};
         // k_fuTailNhwc's shared tile is sized for these 16 x 8 threads
         if (cuLaunchKernel(nr.gmTailHwc ? nr.fFuTailNhwc : nr.fFuTail, (unsigned)((tw / 2 + 15) / 16),
                            (unsigned)((th / 2 + 7) / 8), 1, 16, 8, 1, 0, (CUstream)st, at, nullptr) != CUDA_SUCCESS ||
             (nr.gmPairSdr &&
-             !nativeHdrFromSdr(nr, nr.dGmOut, 0, ps, nr.pw, nr.pw, nr.ph, nr.dGmF, ps, nr.pw, nr.encPost)))
+             !nativeHdrFromSdr(nr, nr.dGmF, 0, ps, nr.pw, nr.pw, nr.ph, nr.dGmF, ps, nr.pw, nr.encPost)))
         {
             nr.die("gmfss fusion tail launch failed");
             return false;
@@ -15365,6 +15550,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             auto ema = [](double& v, double x) { v = v > 0.0 ? v * 0.8 + x * 0.2 : x; };
             if (nr.grTween)
             {
+                // a GMFSS catch-up (a skipped frame's feat_ext) is no part of a tweening group's steady price
+                float cu = 0.0f;
+                if (nr.gmCatchUp && cudaEventElapsedTime(&cu, nr.gmCatchEv[0], nr.gmCatchEv[1]) == cudaSuccess)
+                    pre = (std::max)(0.0f, pre - cu);
                 ema(nr.gIntMs, pre);
                 ema(nr.gTweenMs, slots / nr.grTween);
                 nr.gIntUs.store((uint32_t)(nr.gIntMs * 1000.0));

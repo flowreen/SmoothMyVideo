@@ -1497,7 +1497,8 @@ The chain makes gmfss a native backend like rife:
 allocates the chain's buffers from it, so a set that does not match is refused with the tensor named.
 `nativeGmfssPair` runs per group: feat_ext of the new frame (the previous group's output IS this
 pair's feat0, the same reuse the RIFE route does with the encode, so one feat_ext per group instead of
-python's two), then, when the group interpolates, `k_half` on both frames into one six-plane buffer,
+python's two; a group without tweens skips it, and the next pair that makes tweens takes that frame's
+features from the previous picture, the same bytes), then, when the group interpolates, `k_half` on both frames into one six-plane buffer,
 the bidir GMFlow, metricnet and `k_pyr` x4 (both flow directions in one launch, both metrics in
 another). `nativeGmfssTween` runs per tween: the two image splats into the fusionnet's `a` planes 0..2
 and 6..8, the GMFSS IFNet straight into planes 3..5, the six feature splats into `b` / `c` / `d`
@@ -1506,9 +1507,13 @@ pixel shuffle + last conv, with python's `clamp(out, 0, 1)` folded in; `k_restTo
 graph still ends at the frame); the result rides the shared storeSlot chain, so Sharpen, RTX VSR,
 Upscale to, Restore, TrueHDR and the fit work exactly as on the RIFE route. The pyramids are built
 once per pair and the timestep is applied by the splat (`interp(t * flow) * 0.5` equals
-`t * (interp(flow) * 0.5)`). One accumulator buffer serves all eight splats (they are sequential on
-the one stream): `max(C) + 1` planes of the half, 276 MB at 960x540 and 986 MB at 1920x1080 for the
-whole chain. Gates: the seven `gmfss_*` cases in `harness\eff\eff_native.py` (plain, sharpen, Upscale
+`t * (interp(flow) * 0.5)`). With the scatter splats (`SMV_GM_SPLAT=old`) one accumulator buffer serves
+all eight (they are sequential on the one stream): `max(C) + 1` planes of the half. The gather splats
+(the default) need no accumulator, so it then holds only the cut fusionnet's `out` (64 planes of
+8 bytes = 256 fp16 channels), and none with the full graph. That `out` is written and read inside a
+tween, the pair's gmflow scratch (A's outputs, the local correlation, the matching operands and flow, on
+HDR sessions the SDR view and the motion halves) inside the pair, so the scratch is carved from the
+same buffer when it fits (`SMV_GM_SCRATCH=own` gives it its own buffers). Gates: the seven `gmfss_*` cases in `harness\eff\eff_native.py` (plain, sharpen, Upscale
 to, RTX VSR, Restore, TrueHDR, plus the python control; all on the 10 fps testsrc, since a GMFSS group
 is 31 to 41 ms on both routes) and `harness\eff\gmfss_share.py`'s `*_nat` cases for the rate.
 Measured against the python route (parked 60 fps testsrc, consumed groups per second): 960x540 gen 1
@@ -1756,6 +1761,9 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_GM_HELPER=0` / `SMV_GM_HELPER_TEST=fail` | a GMFSS cold build without the gmflow A helper process (A/B) / the helper exits 2 at once (the fallback's trigger) |
 | `SMV_GM_UPGRADE=0` / `=now` / `=fail` | gmflow A in the masked form only, no background build (A/B) / the edge form from the cold start (A/B) / the background build of the edge form exits 2 at once (its failure line's trigger) |
 | `SMV_GM_SPLAT=old` | GMFSS's splats by the scatter kernels (k_splatSoft + k_splatNorm) instead of the gather ones (A/B; the same output) |
+| `SMV_GM_SCRATCH=own` | GMFSS's pair scratch in its own buffers instead of carved from the splat accumulator (A/B; the same output) |
+| `SMV_GM_FEAT_LAZY=0` | GMFSS's feat_ext on every new frame, also in groups without tweens (A/B; the same output) |
+| `SMV_CTXSHARE=0` | the IFNet, encode, Restore and DRBA block0 contexts each on their own activation block instead of one shared block (A/B; the same output) |
 | `SMV_FU_HWC=0` / `=fail` | GMFSS's host-side tensors built linear (fusionnet's `out`, `b` / `c` / `d`, feat_ext's levels; their own engine files, `fusionnet_lin_...` / `featurenet_lin_...`), read by k_fuTail and the planar splats (A/B; the same output) / the session setup reads `out`'s layout as unknown (the refusal's trigger) |
 | `SMV_RIFE_SAFEPAD=1` / `SMV_LIVE_SAFEPAD=1` | restore the 1152x640 RIFE safe-zone pad |
 | `SMV_LIVE_XQPHASE=1` | present-loop phase breakdown |
