@@ -397,7 +397,7 @@
         <option value="custom" id="dlsscustomopt" hidden>Custom</option>
       </select>
       <span id="dlssrangewrap" style="display:inline-flex;align-items:center;gap:8px;">
-        <span class="defmark" style="flex:0 1 150px;--def:calc(100% - 8px)"><input id="dlssrange" type="range" min="1" max="100" step="1" value="100" style="width:150px" aria-label="DLSS mode" title="The working size's share, 1% to 100% (DLAA); the DLSS modes sit at 33, 50, 58 and 67%. A very small size is raised to 64 px on its short side (128 px wide with DLSS 5)."></span>
+        <span class="defmark" style="flex:0 1 214px;--def:calc(100% - 8px)"><input id="dlssrange" type="range" min="1" max="100" step="1" value="100" style="width:214px" aria-label="DLSS mode" title="The working size's share, 1% to 100% (DLAA); the DLSS modes sit at 33, 50, 58 and 67%. A very small size is raised to 64 px on its short side (128 px wide with DLSS 5)."></span>
         <span class="v" id="dlssrangenum">100%</span>
       </span>
     </div>
@@ -461,11 +461,17 @@
         <span class="defmark"><input id="hdrsat" type="range" min="-100" max="100" step="5" value="0"
                style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="hdrsatnum">0</span>
+        <span class="vonly" style="display:inline-flex;align-items:center;gap:8px;margin-left:6px"
+              title="The brightest white of the HDR file, in nits (400 to 2000). Empty = the maximum of the HDR display this window is on">
+          <span class="hint">Peak</span>
+          <input id="hdrnits" type="number" min="400" max="2000" step="10" placeholder="auto" aria-label="HDR peak in nits" style="width:120px">
+          <span class="hint">nits</span>
+        </span>
       </span>
     </div>
     <div class="row" id="hdrpurewrap" style="display:none">
       <span class="k"></span>
-      <span class="hint" style="line-height:1.5">(NVIDIA's RTX HDR look: Contrast 0, Saturation 0; the source's own look: Saturation -100)</span>
+      <span class="hint" style="line-height:1.5">(NVIDIA's RTX HDR look: Contrast 0, Saturation 0; brightness peaks at your HDR display's maximum)</span>
     </div>
     <div id="hdrcolorwrap" style="display:none">
       <div class="row" style="flex-wrap:wrap">

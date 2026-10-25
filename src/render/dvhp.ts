@@ -140,11 +140,13 @@ function removeQuiet(p: string): void {
   }
 }
 
-/** The dovi_tool generate config: one L1 block per scene shot + L6. */
+/** The dovi_tool generate config: one L1 block per scene shot + L6, and the RPU's source peak = the mastering peak
+ * (dovi_tool's own pick from L6 stays at 1000 nits' 3079 for an 800-nit L6). */
 export function dvConfig(l1: number[][], nits: number, cll: number, fall: number, fps: number): object {
   return {
     cm_version: 'V29',
     length: l1.length,
+    source_max_pq: pq12(nits * 10),
     level6: {
       max_display_mastering_luminance: nits,
       min_display_mastering_luminance: 1,

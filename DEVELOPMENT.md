@@ -372,7 +372,7 @@ node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--dlssg] [--no-gpu-fit]
   [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr | --fsr-upscale] [--rtx-hdr] [--dv] [--hdr10plus]
-  [--hdr-color vivid|rtx|raw] [--hdr-saturation N] [--hdr-contrast N] [--hdr-vibrance B] [--hdr-satboost S]
+  [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
 Timing:
@@ -596,7 +596,8 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   F x the width x the ratio (720x480 at 32:27 x 2 = 1706x960), so no player has to stretch the picture. The plan's
   log line names either case. Gate `harness\anamorphic_sar\sar_probe.py` (every route's display aspect).
   `--rtx-vsr` uses RTX Video Super Resolution for an enlarging resize (the GUI ticks it by
-  default), otherwise Lanczos. `--fsr-upscale` puts AMD FSR 4.1.1 (its INT8 model) in that same resize instead
+  default), otherwise Lanczos. The bridge reads and writes R, G, B, A bytes; the host's VSR buffers hold B, G, R, A,
+  swapped in place around each eval (`nativeVsrEval`). `--fsr-upscale` puts AMD FSR 4.1.1 (its INT8 model) in that same resize instead
   (the two exclude each other; with both, RTX VSR keeps it and the host says so): AMD's signed FidelityFX loader +
   upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, which opens the upscaler's GPU gate (see "AMD FSR
   upscaling bridge"), every frame of that resize's stream in order (the first resets), its motion vectors from
@@ -647,19 +648,23 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   Motion's SDR pairs form with Sharpen on; light above SDR white is not sharpened.
   `SMV_HDR_SHARPEN_VIEW=0` sharpens the PQ / HLG codes instead (an A/B lever: SDR content then
   leaves the SDR range; `harness\sharpen_hdr_domain`).
-* `--rtx-hdr`: SDR to HDR10 (BT.2020 PQ) through TrueHDR, fixed 1000-nit mastering peak, Display P3
-  `mdcv`, injected `mdcv` / `clli`. Colour is rebuilt in ICtCp from the source (TrueHDR rotates
-  hues even at Saturation 0, so its chroma is dropped and the source's transplanted). `--hdr-color`
-  `vivid` (default), `rtx` (SDK saturation, hue-corrected), `raw` (debug). `--hdr-saturation N`
-  (SDK 0..200, default 0 = matches the SDR source; the SDK's "neutral" 100 oversaturates),
-  `--hdr-contrast N` (0..200, default 100). Dynamic Vibrance: `--hdr-vibrance B` boosts muted
-  colours only, `--hdr-satboost S` (0..1) adds saturation on top; both hue-safe in ICtCp and
+* `--rtx-hdr`: SDR to HDR10 (BT.2020 PQ) through TrueHDR, Display P3 `mdcv`, injected `mdcv` /
+  `clli`. The bridge takes R, G, B, A bytes and returns 10:10:10:2 words with R in the low bits.
+  `--hdr-nits N` = the peak (the SDK's 400..2000; the mastering luminance follows it): the app passes
+  the Peak box or else the peak of the display its window is on (`smv-live.exe --peak-nits X Y`);
+  without it the CLI takes the primary display's, or 1000 when that display is not in HDR mode.
+  `--hdr-color` `raw` (default: TrueHDR's result as NVIDIA gives it, the colours of NVIDIA's own
+  RTX Video HDR in a player), `vivid` (the source's hue and chroma in ICtCp at TrueHDR's luminance),
+  `rtx` (the source's hue at TrueHDR's chroma). `--hdr-saturation N` (SDK 0..200, default 100, inert
+  in vivid), `--hdr-contrast N` (0..200, default 100). Dynamic Vibrance: `--hdr-vibrance B` boosts
+  muted colours only, `--hdr-satboost S` (0..1) adds saturation on top; both hue-safe in ICtCp and
   luminance-coupled.
 * `--dv`: adds a Dolby Vision Profile 8.1 RPU on top of the HDR10 render (HDR10-compatible
   fallback). Needs `--rtx-hdr`, HEVC, MP4 out and `dovi_tool` in `engine/dvtools` (installed from
   the GUI panel). Per-frame L1 is accumulated during the HDR render, then after encode: extract
   HEVC, `dovi_tool generate` + `inject-rpu`, ffmpeg remux with audio, `dvvC` + HDR10 boxes written
-  in-engine. B-frames are disabled for DV renders (dovi_tool needs an Annex-B stream whose coding
+  in-engine. The RPU's `source_max_pq` and L6 take the render's `--hdr-nits` peak (dovi_tool's own pick from L6
+  stays at 1000 nits for other peaks); HDR10+ takes the same peak in its HDR10 boxes, its scene values are measured. B-frames are disabled for DV renders (dovi_tool needs an Annex-B stream whose coding
   order equals display order for an exact remux). Best-effort: any failure keeps the HDR10 file.
   The preview does not change with `--dv` (the pixels are identical HDR10). Legal: `dvvC` is our
   own code writing a public box format; the UI says "Profile 8.1", credits
@@ -850,6 +855,8 @@ smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
 smv-live.exe --hz              the exact refresh rate of every active display path as "numerator denominator" lines
                (QueryDisplayConfig; main.ts feeds "Screen refresh rate" with it, Electron only reports integers)
+smv-live.exe --peak-nits [X Y] the peak (nits) of the monitor at screen point X, Y (the primary one without a point) as
+               Windows reports it, 0 when it is not in HDR mode; main.ts passes it to RTX HDR renders as --hdr-nits
 smv-live.exe --restore-mouse   gives back the pointer speed and clip a killed or crashed Fill session held (main.ts
                runs it when %TMP%\smv-live-mouse.txt outlives the host; every live session start does the same)
 smv-live.exe --testsrc [ms|cycle] [--pan] [--onscreen]   verification source (100 ms = 10 fps; 16 for perf; cycle ramps
@@ -988,9 +995,10 @@ How the server route works:
 * HDR: on an HDR display every backend runs in HDR (`SMV_LIVE_HDR` overrides): FP16 scRGB
   capture, R10G10B10A2 BT.2020 PQ present. Server backends convert in python, `dlssg` inside the
   exe (DLSS-G requires RGB10 HDR10). The RTX HDR checkbox applies live too: the exe
-  forwards `--rtx-hdr` plus the colour knobs and the monitor's SDR reference white, and each real
-  frame is expanded with the same TrueHDR bridge and ICtCp correction as a file render. An
-  HDR-presenting source window clips at SDR white, so live RTX HDR is for SDR sources.
+  forwards `--rtx-hdr` plus the colour knobs, reads the monitor's SDR reference white and peak
+  (the peak TrueHDR expands to, as NVIDIA's own RTX Video HDR does), and each real frame is
+  expanded with the same TrueHDR bridge and colour step as a file render. An HDR-presenting source
+  window clips at SDR white, so live RTX HDR is for SDR sources.
 * Mid-session Speed or DLSS mode changes send `lv-restart`: the exe is killed and respawned on
   the same window (700 ms debounce, not counted against the restart cap). `src/main.ts` learns the
   window handle from the exe's `target window: hwnd=0x... "title"` line, parsed from complete lines

@@ -47,6 +47,7 @@ export interface PreviewArgs {
   hdr_satboost: number;
   hdr_saturation: number;
   hdr_contrast: number;
+  hdr_nits: number; // --hdr-nits: TrueHDR's peak, 0 = the host's own pick (the primary display's)
   model_a: string | null; // --model-a: a compare's first model (the Video tab's pick)
   model_b: string | null; // --model-b: the model it is compared to
   multi: number; // --multi: the compare's multiplier (new frames per pair + 1)
@@ -85,11 +86,12 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     nr_style: 0,
     nr_passes: 1,
     nr_mask: false,
-    hdr_color: 'vivid',
+    hdr_color: 'raw',
     hdr_vibrance: 0,
     hdr_satboost: 0,
-    hdr_saturation: 0,
+    hdr_saturation: 100,
     hdr_contrast: 100,
+    hdr_nits: 0,
     model_a: null,
     model_b: null,
     multi: 2,
@@ -123,6 +125,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--nr-passes': 'nr_passes',
     '--hdr-saturation': 'hdr_saturation',
     '--hdr-contrast': 'hdr_contrast',
+    '--hdr-nits': 'hdr_nits',
     '--multi': 'multi',
     '--pairs': 'pairs',
   };
@@ -155,8 +158,8 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     throw new Error(`argument --nr-style: invalid choice: ${a.nr_style} (choose from 0, 1, 2)`);
   if (!(a.nr_passes >= 1 && a.nr_passes <= 20))
     throw new Error(`argument --nr-passes: invalid choice: ${a.nr_passes} (choose from 1 to 20)`);
-  if (!['vivid', 'rtx', 'raw'].includes(a.hdr_color)) {
-    throw new Error(`argument --hdr-color: invalid choice: '${a.hdr_color}' (choose from 'vivid', 'rtx', 'raw')`);
+  if (!['raw', 'vivid', 'rtx'].includes(a.hdr_color)) {
+    throw new Error(`argument --hdr-color: invalid choice: '${a.hdr_color}' (choose from 'raw', 'vivid', 'rtx')`);
   }
   for (const [k, v] of [
     ['--model-a', a.model_a],
@@ -731,6 +734,7 @@ function passFlags(
       '--hdr-satboost',
       pyG(clamp(a.hdr_satboost, 0.0, 1.0)),
     );
+    if (a.hdr_nits > 0) args.push('--hdr-nits', String(a.hdr_nits));
   }
   return args;
 }

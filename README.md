@@ -133,8 +133,10 @@ These run before the new frames are made, in videos and in Live:
 * 🧠 **NVIDIA DLSS 5** (optional): NVIDIA's Neural Rendering, an AI picture enhancement on every original frame.
   [Details](#nvidia-dlss-5).
 * ✏️ **Sharpen**: bacondither's Adaptive Sharpen, strength 0 to 2 (on at 1.00 by default).
-* 🎨 **RTX HDR**: turns normal (SDR) video into HDR, with **Contrast** and **Saturation** sliders, plus optional
-  **RTX Dynamic Vibrance** (richer colours, skin tones kept). HDR sources stay as they are.
+* 🎨 **RTX HDR**: turns normal (SDR) video into HDR with the same colours as NVIDIA's RTX Video HDR in a player, with
+  **Contrast** and **Saturation** sliders, plus optional **RTX Dynamic Vibrance** (richer colours, skin tones kept).
+  Its brightest white matches your HDR display; type a **Peak** in nits to make a file for another screen. HDR sources
+  stay as they are.
 
 In the preview, **Show changed pixels** turns the Processed pane into a heat map of where DLSS 5 changed the picture.
 

@@ -28,6 +28,7 @@ export interface RenderArgs {
   hdr10plus: boolean;
   hdr_saturation: number; // int
   hdr_contrast: number; // int
+  hdr_nits: number; // int, 0 = the primary display's peak
   hdr_color: string;
   hdr_vibrance: number; // float
   hdr_satboost: number; // float

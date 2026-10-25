@@ -458,6 +458,16 @@ __global__ void k_unpackBgraRgb(const unsigned char* __restrict__ src, int dw, i
     dst[2 * plane + o] = p[0] / 255.0f;
 }
 
+// R and B of n packed 8-bit pixels exchanged in place: the RTX Video bridge's VSR takes and returns R, G, B, A bytes
+// where SMV's VSR buffers hold B, G, R, A (nativeVsrEval, around the bridge call)
+__global__ void k_swapRB(unsigned int* __restrict__ p, unsigned int n)
+{
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned int w = p[i];
+    p[i] = (w & 0xFF00FF00u) | ((w & 0xFFu) << 16) | ((w >> 16) & 0xFFu);
+}
+
 // RGBA8 back to the offline (R, G, B) planes: a DLSS 4.5 host frame,
 // dlssg.py _recv (uint8 / 255.0, a division, as python and k_unpackBgraRgb)
 __global__ void k_unpackRgba(const unsigned char* __restrict__ src, int dw, int dh,
@@ -1894,15 +1904,15 @@ __global__ void k_sdrEncode(const unsigned short* __restrict__ src, int cw, int 
 }
 
 // the vivid / rtx colour step of one pixel (_source_at_thdr_luma + _ictcp_linear / _rtx_linear +
-// _pack_out's nan_to_num): the bridge word u (10:10:10:2, B in the LOW 10 bits) and the
+// _pack_out's nan_to_num): the bridge word u (10:10:10:2, R in the LOW 10 bits) and the
 // unquantised SDR source s0..s2 (gamma BT.709, R, G, B) -> the corrected linear BT.2020 in
 // [0,1]. mode 0 = vivid, 1 = rtx. k_thdrColor's colour step (both routes).
 __device__ __forceinline__ void thdr_linear(unsigned int u, float s0, float s1, float s2,
                                             int mode, float vib, float sb, float* v)
 {
-    const float tr = (float)((u >> 20) & 1023u) * (1.0f / 1023.0f);
+    const float tr = (float)(u & 1023u) * (1.0f / 1023.0f);
     const float tg = (float)((u >> 10) & 1023u) * (1.0f / 1023.0f);
-    const float tb = (float)(u & 1023u) * (1.0f / 1023.0f);
+    const float tb = (float)((u >> 20) & 1023u) * (1.0f / 1023.0f);
     {
         const float lt0 = pq_eotf(tr), lt1 = pq_eotf(tg), lt2 = pq_eotf(tb);
         const float y_t = 0.2627f * lt0 + 0.6780f * lt1 + 0.0593f * lt2;
@@ -1957,11 +1967,33 @@ __device__ __forceinline__ void thdr_linear(unsigned int u, float s0, float s1, 
     }
 }
 
-// Unpack the bridge output (10:10:10:2, B in the LOW 10 bits), apply the
+// Dynamic Vibrance on TrueHDR's own result (PQ R, G, B in place): the gain of the vivid / rtx step, in the result's
+// ICtCp
+__device__ __forceinline__ void thdr_vibrance(float& p0, float& p1, float& p2, float vib, float sb)
+{
+    float i, ct, cp, oct, ocp;
+    to_ictcp(pq_eotf(p0), pq_eotf(p1), pq_eotf(p2), i, ct, cp);
+    vibrance_gain(i, ct, cp, vib, sb, oct, ocp);
+    float l0, l1, l2;
+    mat3(g_ictcp2lms, i, oct, ocp, l0, l1, l2);
+    l0 = pq_eotf(l0); l1 = pq_eotf(l1); l2 = pq_eotf(l2);
+    float v[3];
+    mat3(g_lms2rgb, l0, l1, l2, v[0], v[1], v[2]);
+    for (int c = 0; c < 3; c++)
+    {
+        float t = v[c];
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        if (!(t == t)) t = 0.0f;
+        v[c] = t;
+    }
+    p0 = pq_oetf(v[0]); p1 = pq_oetf(v[1]); p2 = pq_oetf(v[2]);
+}
+
+// Unpack the bridge output (10:10:10:2, R in the LOW 10 bits), apply the
 // colour mode against the unquantised source, and write planar PQ into the padded model frame
 // (pw x ph, planes dps apart) with the edge replicated as k_padPlanar pads it: a pad pixel takes
 // the result of the edge pixel it repeats.
-// mode 0 = vivid (_ictcp_linear), 1 = rtx (_rtx_linear), 2 = raw.
+// mode 0 = vivid (_ictcp_linear), 1 = rtx (_rtx_linear), 2 = raw (TrueHDR's result as is, Dynamic Vibrance when on).
 __global__ void k_thdrColor(const unsigned int* __restrict__ thdrOut,
                             const float* __restrict__ srcG, int cw, int ch,
                             float* __restrict__ dst, int pw, int ph, int dps,
@@ -1977,9 +2009,10 @@ __global__ void k_thdrColor(const unsigned int* __restrict__ thdrOut,
     float p0, p1, p2;
     if (mode == 2)
     {
-        p0 = (float)((u >> 20) & 1023u) * (1.0f / 1023.0f);
+        p0 = (float)(u & 1023u) * (1.0f / 1023.0f);
         p1 = (float)((u >> 10) & 1023u) * (1.0f / 1023.0f);
-        p2 = (float)(u & 1023u) * (1.0f / 1023.0f);
+        p2 = (float)((u >> 20) & 1023u) * (1.0f / 1023.0f);
+        if (vib > 0.0f || sb > 0.0f) thdr_vibrance(p0, p1, p2, vib, sb);
     }
     else
     {
@@ -1993,10 +2026,10 @@ __global__ void k_thdrColor(const unsigned int* __restrict__ thdrOut,
 }
 
 // ---- offline RTX TrueHDR (rtxvideo.run_hdr on every output frame) -------------------------
-// The output-size SDR frame after the pass chain -> the bridge's BGRA8 input (_eval_thdr: clamp,
+// The output-size SDR frame after the pass chain -> the bridge's RGBA8 input (_eval_thdr: clamp,
 // * 255, round) and the unquantised planar source the colour step reads (R, G, B, tight).
 __device__ __forceinline__ void thdr_in_store(float r, float g, float b, size_t o, size_t plane,
-                                              unsigned char* __restrict__ bgra, float* __restrict__ dstG)
+                                              unsigned char* __restrict__ rgba, float* __restrict__ dstG)
 {
     const float c[3] = { r, g, b };
     unsigned char q[3];
@@ -2005,8 +2038,8 @@ __device__ __forceinline__ void thdr_in_store(float r, float g, float b, size_t 
         const float v = c[ci] < 0.0f ? 0.0f : (c[ci] > 1.0f ? 1.0f : c[ci]);
         q[ci] = (unsigned char)(int)rintf(v * 255.0f);
     }
-    unsigned char* d = bgra + o * 4;
-    d[0] = q[2]; d[1] = q[1]; d[2] = q[0]; d[3] = 255;
+    unsigned char* d = rgba + o * 4;
+    d[0] = q[0]; d[1] = q[1]; d[2] = q[2]; d[3] = 255;
     dstG[o] = r;
     dstG[plane + o] = g;
     dstG[2 * plane + o] = b;
@@ -2014,7 +2047,7 @@ __device__ __forceinline__ void thdr_in_store(float r, float g, float b, size_t 
 
 // the frame straight from the model or the staging buffer (planar with its own strides)
 __global__ void k_thdrIn(const void* __restrict__ src, int half, int planeStride, int rowStride, int dw, int dh,
-                         unsigned char* __restrict__ bgra, float* __restrict__ dstG)
+                         unsigned char* __restrict__ rgba, float* __restrict__ dstG)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -2022,13 +2055,13 @@ __global__ void k_thdrIn(const void* __restrict__ src, int half, int planeStride
     const size_t i = (size_t)y * rowStride + x;
     thdr_in_store(ldS(src, half, i), ldS(src, half, (size_t)planeStride + i),
                   ldS(src, half, 2 * (size_t)planeStride + i),
-                  (size_t)y * dw + x, (size_t)dw * dh, bgra, dstG);
+                  (size_t)y * dw + x, (size_t)dw * dh, rgba, dstG);
 }
 
 // Adaptive Sharpen on the staging frame first (the last SDR pass before TrueHDR; src planes ps apart, rows rs
 // apart); 16 x 16 blocks
 __global__ void k_sharpThdrIn(const float* __restrict__ src, int ps, int rs, int dw, int dh, float curve,
-                              unsigned char* __restrict__ bgra, float* __restrict__ dstG)
+                              unsigned char* __restrict__ rgba, float* __restrict__ dstG)
 {
     __shared__ AsTile s;
     asLoad(s, src, ps, rs, dw, dh);
@@ -2036,7 +2069,7 @@ __global__ void k_sharpThdrIn(const float* __restrict__ src, int ps, int rs, int
     if (ox >= dw || oy >= dh) return;
     float c[3];
     asPixel(s, threadIdx.x, threadIdx.y, curve, c);
-    thdr_in_store(c[0], c[1], c[2], (size_t)oy * dw + ox, (size_t)dw * dh, bgra, dstG);
+    thdr_in_store(c[0], c[1], c[2], (size_t)oy * dw + ox, (size_t)dw * dh, rgba, dstG);
 }
 
 // the 10-bit PQ code -> display-linear table of _accum_hp (_pq_to_linear(arange(1024) / 1023))
@@ -4224,7 +4257,7 @@ struct NativeRife
     // live RTX TrueHDR through the CUDA bridge, once per real frame at capture size
     bool rtxHdr = false;    // the session asked for it and the bridge loaded
     bool rtxFailed = false; // a mid-run eval failed: faithful PQ for the rest of the run
-    RtxThdrSetting thdr{};  // Contrast, Saturation, MiddleGray 50, MaxLuminance 1000
+    RtxThdrSetting thdr{};  // Contrast, Saturation, MiddleGray 50, MaxLuminance (thdrPeakNits)
     float sdrScale = 3.0f;  // SDR reference white as an scRGB scale (nits / 80)
     int rtxMode = 0;        // 0 vivid, 1 rtx, 2 raw
     float rtxVib = 0.0f, rtxSb = 0.0f;
@@ -4687,7 +4720,7 @@ struct NativeRife
     };
     std::vector<RsTab> rsTabs;
     float* dCapF = nullptr;       // HDR + image scale under 1: planar PQ at capture resolution
-    uint8_t* dThdrIn = nullptr;   // BGRA8 bridge input, pitch 4*cw
+    uint8_t* dThdrIn = nullptr;   // RGBA8 bridge input, pitch 4*cw
     uint32_t* dThdrOut = nullptr; // packed 10:10:10:2 bridge output, B in the low bits
     float* dSrcG = nullptr;       // the unquantised sRGB-encoded source, planar fp32
     float* dShIn = nullptr;       // the Sharpen's tight SDR view of HDR planes (w x h)
@@ -4860,6 +4893,7 @@ struct NativeRife
         fSdrPq = nullptr;                                                                     // offline PQ emit
     CUfunction fFitPlanar = nullptr, fSharpPlanar = nullptr,                                  // sharpen
         fPackBgraRgb = nullptr, fUnpackBgraRgb = nullptr,                   // VSR / FRUC: (R, G, B) <-> BGRA8
+        fSwapRB = nullptr,                                                  // VSR: BGRA8 <-> the bridge's RGBA8
         fPackRgbaH = nullptr, fRgbaHAbgr = nullptr, fUnpackRgbaH = nullptr, // FSR frame generation: RGBA16F frames,
         fMvHalf = nullptr, fMvHalfG1 = nullptr, fMvDerive = nullptr,        // the Optical Flow input, the vectors
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr,                        // FSR upscaling: VSR's BGRA8 <-> RGBA8
@@ -7668,6 +7702,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fSharpPlanar, "k_sharpPlanar"},
         {&nr.fPackBgraRgb, "k_packBgraRgb"},
         {&nr.fUnpackBgraRgb, "k_unpackBgraRgb"},
+        {&nr.fSwapRB, "k_swapRB"},
         {&nr.fUnpackRgba, "k_unpackRgba"},
         {&nr.fPackR10, "k_packR10"},
         {&nr.fUnpackR10, "k_unpackR10"},
@@ -8284,7 +8319,7 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     if (nr.rtxHdr)
     {
-        // warm-up eval on a zero frame (opaque black BGRA), python live_server.py ~1859
+        // warm-up eval on a zero frame (opaque black RGBA), python live_server.py ~1859
         if (cuMemsetD32Async((CUdeviceptr)nr.dThdrIn, 0xFF000000u, (size_t)nr.w * nr.h, (CUstream)nr.stream) !=
             CUDA_SUCCESS)
         {
@@ -8305,8 +8340,9 @@ static bool nativeRtxInit(NativeRife& nr)
                 nr.w, nr.h, g_hdrColor, nr.thdr.Contrast, nr.thdr.Saturation, nr.thdr.MaxLuminance);
         else
             LOG("native: live RTX TrueHDR on: %dx%d per real frame, after Restore, DLSS 5 and Sharpen and before the "
-                "model, colour %ls, SDR white %.0f nits, contrast %u saturation %u\n",
-                nr.w, nr.h, g_hdrColor, nr.sdrScale * 80.0f, nr.thdr.Contrast, nr.thdr.Saturation);
+                "model, colour %ls, SDR white %.0f nits, contrast %u saturation %u, %u nits\n",
+                nr.w, nr.h, g_hdrColor, nr.sdrScale * 80.0f, nr.thdr.Contrast, nr.thdr.Saturation,
+                nr.thdr.MaxLuminance);
     }
     return true;
 }
@@ -11560,7 +11596,7 @@ static bool nativeConfigHdr(NativeRife& nr)
     nr.thdr.Contrast = (uint32_t)(g_hdrCon < 0 ? 0 : (g_hdrCon > 200 ? 200 : g_hdrCon));
     nr.thdr.Saturation = (uint32_t)(g_hdrSat < 0 ? 0 : (g_hdrSat > 200 ? 200 : g_hdrSat));
     nr.thdr.MiddleGray = 50; // the live defaults, rtxvideo.py ~173
-    nr.thdr.MaxLuminance = 1000;
+    nr.thdr.MaxLuminance = g_thdrPeak;
     nr.sdrScale = (float)(g_sdrWhite / 80.0 < 0.5 ? 0.5 : g_sdrWhite / 80.0);
     nr.rtxMode = !wcscmp(g_hdrColor, L"rtx") ? 1 : (!wcscmp(g_hdrColor, L"raw") ? 2 : 0);
     nr.rtxVib = (float)(g_hdrVib < 0.0 ? 0.0 : (g_hdrVib > 1.0 ? 1.0 : g_hdrVib));
@@ -15312,7 +15348,8 @@ static bool nativeOfflinePqOut(NativeRife& nr, const void* src, int half, int ps
 // its fp32 frame; enc = the frame's HDR encoding for Restore (nativeRestoreRun). false = a launch failed.
 // one RTX VSR eval of nr.dVsrIn into nr.dVsrOut for the work queued on st: through the bridge's event-ordered export
 // when it has one (the thread keeps enqueuing while VSR runs), else (an older bridge, SMV_VSR_SYNC=1) the blocking
-// export between a drain of st and a device-wide sync, because its copies ride the legacy default stream
+// export between a drain of st and a device-wide sync, because its copies ride the legacy default stream. The bridge
+// takes and returns R, G, B, A bytes: both buffers are swapped from and back to SMV's B, G, R, A on st around the call
 static bool nativeVsrEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, cudaStream_t st, unsigned int& rv)
 {
     if (nr.fsrUp)
@@ -15321,12 +15358,22 @@ static bool nativeVsrEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, 
         wchar_t v[8]{};
         return GetEnvironmentVariableW(L"SMV_VSR_SYNC", v, 8) && v[0] != L'0';
     }();
+    auto swapRB = [&](uint8_t* buf, const RtxRect& r) {
+        unsigned int n = r.right * r.bottom;
+        void* a[] = {&buf, &n};
+        if (cuLaunchKernel(nr.fSwapRB, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) == CUDA_SUCCESS)
+            return true;
+        nr.die("swapRB launch failed");
+        return false;
+    };
+    if (!swapRB(nr.dVsrIn, ri))
+        return false;
     if (g_rtxb.evalVsrAsync && !sync)
     {
         rv = g_rtxb.evalVsrAsync(nr.dVsrIn, nr.dVsrOut, ri, ro, &nr.vsrSet, (void*)st);
         nr.vsrN++;
         nr.vsrAsync = true;
-        return true;
+        return swapRB(nr.dVsrOut, ro);
     }
     if (cudaStreamSynchronize(st) != cudaSuccess)
     {
@@ -15345,7 +15392,7 @@ static bool nativeVsrEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, 
     nr.vsrN++;
     if (ms > nr.vsrMaxMs)
         nr.vsrMaxMs = ms;
-    return true;
+    return swapRB(nr.dVsrOut, ro);
 }
 
 static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& rs, int& srcHalf, bool& staged, int sw,

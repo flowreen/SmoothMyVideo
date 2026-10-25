@@ -3,7 +3,7 @@
 // spawns the decoder / encoder and the host (smv-live.exe --offline, one-shot or the resident host
 // behind its named pipe), relays the host's lines and finishes the container; no frame passes
 // through it (only the progress thumbnail's small dump, thumbPng).
-import { ChildProcess, spawn } from 'child_process';
+import { ChildProcess, execFileSync, spawn } from 'child_process';
 import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -56,8 +56,22 @@ export class RenderExit extends Error {
 }
 
 const FRAG_FLAGS = ['-movflags', '+frag_keyframe+empty_moov+default_base_moof'];
-const HDR_NITS = 1000;
 const HDR_MASTER_PRIM = 'display-p3';
+
+/** TrueHDR's peak: --hdr-nits (the app passes its display's), else the primary display's as the host reads it (0 when
+ * it is not in HDR mode), else 1000; inside the SDK's 400..2000, the same rule as the host's thdrPeakNits. */
+function hdrPeakNits(asked: number, exe: string): number {
+  let n = asked;
+  if (!(n > 0)) {
+    try {
+      n = parseInt(execFileSync(exe, ['--peak-nits'], { cwd: path.dirname(exe), timeout: 8000 }).toString(), 10);
+    } catch {
+      n = 0;
+    }
+  }
+  if (!(n > 0)) n = 1000;
+  return Math.min(2000, Math.max(400, Math.round(n)));
+}
 
 export function engineDir(): string {
   return process.env.SMV_ENGINE_DIR || path.resolve(__dirname, '..', '..', 'engine');
@@ -354,6 +368,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     if (why) throw new RenderExit('NVIDIA Optical Flow: ' + why);
   }
   if (!isFile(NATIVE_EXE)) throw new RenderExit(`the render host ${NATIVE_EXE} is missing; reinstall SmoothMyVideo`);
+  const HDR_NITS = RTX_HDR ? hdrPeakNits(args.hdr_nits, NATIVE_EXE) : 1000;
   let fragCopy = CODEC === 'vvc';
   const P = partsOf(WORK_PATH, ob, OUT_IS_MKV);
   const RESUMABLE = !env.SMV_NO_RESUME;
@@ -706,6 +721,8 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       String(HDR_CON),
       '--hdr-saturation',
       String(HDR_SAT),
+      '--hdr-nits',
+      String(HDR_NITS),
       '--hdr-vibrance',
       pyG(HDR_VIBRANCE),
       '--hdr-satboost',

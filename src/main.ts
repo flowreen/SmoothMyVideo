@@ -264,6 +264,22 @@ ipcMain.handle('refresh-rate', async () => {
   }
 });
 
+// The peak (nits) of the HDR display the app window is on, from `smv-live.exe --peak-nits X Y` (Windows' Max
+// Luminance, the level NVIDIA's own RTX Video HDR expands to); 1000 when that display is not in HDR mode (the usual
+// HDR10 master). File renders and the preview pass it as --hdr-nits, so RTX HDR targets the user's screen.
+function displayPeakNits(): number {
+  try {
+    const b = win ? win.getBounds() : screen.getPrimaryDisplay().bounds;
+    const p = screen.dipToScreenPoint({ x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2) });
+    const out = execFileSync(LIVE_EXE, ['--peak-nits', String(p.x), String(p.y)], { cwd: LIVE_DIR, timeout: 8000 });
+    const n = parseInt(out.toString(), 10);
+    return n > 0 ? n : 1000;
+  } catch {
+    return 1000;
+  }
+}
+ipcMain.handle('peak-nits', () => displayPeakNits());
+
 ipcMain.handle('screen-size', () => {
   // Physical pixel resolution of the monitor the window is on (fallback: primary). display.size is
   // in logical DIPs, so multiply by the scale factor to get the real panel resolution. Feeds the
@@ -709,8 +725,8 @@ let liveNrTone = 1; // DLSS 5 Tone Intensity 0..2
 let liveNrStyle = 0; // DLSS 5 Style: 0 Default (NVIDIA's, the app's default), 1 Natural, 2 Cinematic
 let liveNrPasses = 1; // DLSS 5 passes, 1..20 (chained per frame)
 let liveRtxHdr = false; // live TrueHDR, inherited from the RTX HDR checkbox
-let liveHdrColor = 'vivid'; // RTX HDR colour mode + tone knobs, inherited from the HDR sliders
-let liveHdrSat = 0; // SDK Saturation (drives the rtx colour mode)
+let liveHdrColor = 'raw'; // RTX HDR colour mode + tone knobs, inherited from the HDR sliders
+let liveHdrSat = 100; // SDK Saturation (100 = NVIDIA's default)
 let liveHdrCon = 100; // SDK Contrast (100 = neutral)
 let liveHdrVib = 0; // Dynamic Vibrance intensity 0..1 (per-session opt-in, like renders)
 let liveHdrSb = 0; // Dynamic Vibrance saturation boost 0..1
@@ -879,7 +895,8 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   // controls; the exe forwards these to the server only when its HDR live mode is on
   if (liveRtxHdr) {
     args.push('--rtx-hdr');
-    if (liveHdrColor !== 'vivid') args.push('--hdr-color', liveHdrColor, '--hdr-saturation', String(liveHdrSat));
+    if (liveHdrColor !== 'raw') args.push('--hdr-color', liveHdrColor);
+    if (liveHdrSat !== 100) args.push('--hdr-saturation', String(liveHdrSat));
     if (liveHdrCon !== 100) args.push('--hdr-contrast', String(liveHdrCon));
     if (liveHdrVib > 0) args.push('--hdr-vibrance', String(liveHdrVib));
     if (liveHdrSb > 0) args.push('--hdr-satboost', String(liveHdrSb));
@@ -1072,8 +1089,8 @@ ipcMain.on(
     liveNrStyle = opts.nrstyle ?? 0;
     liveNrPasses = Math.min(20, Math.max(1, Math.round(opts.nrpasses ?? 1)));
     liveRtxHdr = !!opts.rtxhdr;
-    liveHdrColor = opts.hdrcolor ?? 'vivid';
-    liveHdrSat = opts.hdrsat ?? 0;
+    liveHdrColor = opts.hdrcolor ?? 'raw';
+    liveHdrSat = opts.hdrsat ?? 100;
     liveHdrCon = opts.hdrcon ?? 100;
     liveHdrVib = opts.hdrvib ?? 0;
     liveHdrSb = opts.hdrsb ?? 0;
@@ -1438,6 +1455,7 @@ type RunOpts = {
   hdrcolor?: string;
   hdrsat?: number;
   hdrcon?: number;
+  hdrnits?: number;
   hdrsb?: number;
   hdrvib?: number;
 };
@@ -1508,17 +1526,15 @@ function engineArgs(opts: RunOpts): string[] {
   // "Fit to the GPU" off: no video memory fit (the batch stays as planned, slower when memory runs short)
   if (opts.nogpufit) args.push('--no-gpu-fit');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
-  // on, the RTX bridge does VSR then TrueHDR in one pass). The engine masters at a fixed 1000-nit
-  // peak and writes the HDR10 metadata, so there is no per-display nits knob; it falls back to an
-  // SDR render if the bridge is unavailable.
+  // on, the RTX bridge does VSR then TrueHDR in one pass). The peak = the Peak box, else the app
+  // window's display (as NVIDIA's own RTX Video HDR does), the HDR10 metadata follows it; it falls
+  // back to an SDR render if the bridge is unavailable.
   if (opts.rtxhdr) {
-    args.push('--rtx-hdr');
-    // HDR colour controls: mode (vivid default / rtx / raw), the SDK Saturation (drives rtx and raw
-    // modes; inert in vivid), and the vibrance boost (vivid/rtx modes).
-    if (opts.hdrcolor && opts.hdrcolor !== 'vivid') {
-      args.push('--hdr-color', opts.hdrcolor);
-      if (typeof opts.hdrsat === 'number') args.push('--hdr-saturation', String(opts.hdrsat));
-    }
+    args.push('--rtx-hdr', '--hdr-nits', String(opts.hdrnits && opts.hdrnits > 0 ? opts.hdrnits : displayPeakNits()));
+    // HDR colour controls: mode (raw = NVIDIA's result, the default / vivid / rtx), the SDK
+    // Saturation (inert in vivid), and Dynamic Vibrance.
+    if (opts.hdrcolor && opts.hdrcolor !== 'raw') args.push('--hdr-color', opts.hdrcolor);
+    if (typeof opts.hdrsat === 'number' && opts.hdrsat !== 100) args.push('--hdr-saturation', String(opts.hdrsat));
     if (opts.hdrvib && opts.hdrvib > 0) args.push('--hdr-vibrance', String(opts.hdrvib));
     if (opts.hdrsb && opts.hdrsb > 0) args.push('--hdr-satboost', String(opts.hdrsb));
     // RTX HDR tone curve (SDK 0..200, 100 = neutral; the GUI shows the App's -100..100 scale).
@@ -1719,6 +1735,7 @@ type PreviewOpts = {
   hdr?: boolean;
   color?: string;
   saturation?: number;
+  nits?: number;
   vibrance?: number;
   satboost?: number;
   contrast?: number;
@@ -1763,15 +1780,17 @@ function previewArgv(opts: PreviewOpts, prefix: string): string[] {
     args.push(
       '--rtx-hdr',
       '--hdr-color',
-      String(opts.color ?? 'vivid'),
+      String(opts.color ?? 'raw'),
       '--hdr-saturation',
-      String(opts.saturation ?? 0),
+      String(opts.saturation ?? 100),
       '--hdr-vibrance',
       String(opts.vibrance ?? 0),
       '--hdr-satboost',
       String(opts.satboost ?? 0),
       '--hdr-contrast',
       String(opts.contrast ?? 100),
+      '--hdr-nits',
+      String(opts.nits && opts.nits > 0 ? opts.nits : displayPeakNits()),
     );
   return args;
 }

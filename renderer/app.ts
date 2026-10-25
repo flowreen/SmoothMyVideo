@@ -1491,19 +1491,16 @@ $('restore').addEventListener('change', () => { refreshPreviewIfOpen(); try{ lvM
 for(const _id of ['sharpen', 'sharpval', 'restore', 'rtxhdr', 'dlssnr'])
   $(_id).addEventListener('change', () => refresh());
 
-// RTX HDR colour controls: Colour mode (Faithful = vivid 1.0, the accurate default; NVIDIA vivid =
-// the rtx mode where the Saturation slider behaves like real RTX TrueHDR but hue-corrected), plus a
-// Vibrance boost for muted colours. The engine's raw mode (the unmodified model output, cyan cast
-// and all) is deliberately NOT offered here - it is a known-defective rendition kept at the CLI
-// (--hdr-color raw) as a debug/reference only.
+// RTX HDR colour: TrueHDR's result as NVIDIA gives it (the engine's raw mode; the same colours as
+// NVIDIA's own RTX Video HDR in a player), its Contrast and Saturation sliders = the SDK's, as the
+// NVIDIA App's RTX HDR filter. The engine's vivid / rtx modes stay CLI-only. nits = the file
+// renders' Peak box (0 = empty: main.ts takes the peak of the display the window is on).
 function hdrColorPayload(){
-  // The RTX HDR Saturation slider spans true-to-source (-100) to NVIDIA-max (+100), always
-  // hue-corrected: above -100 it drives NVIDIA's TrueHDR saturation via the rtx colour mode.
-  // At -100 (SDK 0) it routes to the exact source-chroma path: the rtx safety floor (per-pixel
-  // max against the source) would otherwise leave a small excess (~0.33/255 mean pixel diff).
-  const sat = sdkSat();
-  if(sat > 0) return { color: 'rtx', saturation: sat };
-  return { color: 'vivid', saturation: 0 };   // Saturation at -100 = true to source, exact
+  return { color: 'raw', saturation: sdkSat(), nits: hdrNitsAsked() };
+}
+function hdrNitsAsked(){
+  const v = Math.round(+$('hdrnits').value || 0);
+  return v > 0 ? Math.min(2000, Math.max(400, v)) : 0;
 }
 // The Dynamic Vibrance sliders belong to that feature: both are 0 when it is switched off, and
 // the feature at 0/0 is identity (NVIDIA convention, verified in the App).
@@ -1536,6 +1533,13 @@ function sdkSat(){ return 100 + (+$('hdrsat').value || 0); }
 localStorage.removeItem('dynVib');
 const savedHdrSat = localStorage.getItem('hdrSatApp');   // App scale -100..100 (older keys orphaned)
 if(savedHdrSat !== null) $('hdrsat').value = savedHdrSat;
+const savedHdrNits = localStorage.getItem('hdrNits');    // the Peak box, empty = the display's
+if(savedHdrNits) $('hdrnits').value = savedHdrNits;
+$('hdrnits').onchange = () => { localStorage.setItem('hdrNits', $('hdrnits').value); refreshPreviewIfOpen(); };
+// the empty box shows what it stands for: the peak of the display the window is on
+function showDisplayPeak(){ ipcRenderer.invoke('peak-nits').then(n => { $('hdrnits').placeholder = 'auto ' + n; }).catch(() => {}); }
+showDisplayPeak();
+$('rtxhdr').addEventListener('change', showDisplayPeak);
 const savedHdrCon = localStorage.getItem('hdrCon'); if(savedHdrCon !== null) $('hdrcon').value = savedHdrCon;
 const savedHdrSB = localStorage.getItem('hdrSB'); if(savedHdrSB !== null) $('hdrsb').value = savedHdrSB;
 const savedHdrVib = localStorage.getItem('hdrVib'); if(savedHdrVib !== null) $('hdrvib').value = savedHdrVib;
@@ -2006,10 +2010,11 @@ function startRun(){
   if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else Lanczos3)
   if(useFsrUp) payload.fsrup = true;                   // AMD FSR 4 upscaling (engine/fsrup)
   if(!$('gpufit').checked) payload.nogpufit = true;    // no video memory fit: the same fps, slower when memory runs short
-  if(rtxhdr){ payload.rtxhdr = true;     // HDR10; engine masters at a fixed 1000-nit peak
-    const hp = hdrColorPayload();        // zero-strength Dynamic Vibrance routes to the source path
-    payload.hdrcolor = hp.color;                                   // vivid (default) / rtx
-    payload.hdrsat = hp.saturation;                                // SDK Saturation (rtx mode)
+  if(rtxhdr){ payload.rtxhdr = true;     // HDR10 at the Peak box's nits or the app window's display's
+    const hp = hdrColorPayload();
+    payload.hdrcolor = hp.color;                                   // raw = NVIDIA's result
+    payload.hdrsat = hp.saturation;                                // SDK Saturation (100 = NVIDIA's default)
+    if(hp.nits > 0) payload.hdrnits = hp.nits;                     // the Peak box (else the display's peak)
     payload.hdrcon = sdkCon();                                     // SDK Contrast (100 = neutral)
     payload.hdrsb = effSatBoost();                                 // vibrance uniform gain (0..1)
     payload.hdrvib = effVibrance();

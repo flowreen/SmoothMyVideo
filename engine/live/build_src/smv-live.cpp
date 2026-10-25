@@ -179,13 +179,15 @@ static bool g_nrAttempted = false;             // NGX was initialised in this pr
                                                // refused): leave through ExitProcess, see the end of run()
 // Live TrueHDR (SDR window -> HDR out). Applied only when the HDR live mode is on (server
 // backends; not DLSS-G).
-static bool g_rtxHdr = false;            // --rtx-hdr
-static wchar_t g_hdrColor[8] = L"vivid"; // --hdr-color vivid|rtx|raw
-static int g_hdrSat = 0;                 // --hdr-saturation (SDK 0..200; drives the rtx mode)
-static int g_hdrCon = 100;               // --hdr-contrast (SDK 0..200, 100 = neutral)
-static double g_hdrVib = 0.0;            // --hdr-vibrance 0..1 (Dynamic Vibrance intensity)
-static double g_hdrSb = 0.0;             // --hdr-satboost 0..1 (Dynamic Vibrance saturation)
-static double g_sdrWhite = 240.0;        // SDR reference white (nits) of the target's monitor
+static bool g_rtxHdr = false;          // --rtx-hdr
+static wchar_t g_hdrColor[8] = L"raw"; // --hdr-color raw|vivid|rtx (raw = TrueHDR's result as NVIDIA gives it)
+static int g_hdrSat = 100;             // --hdr-saturation (SDK 0..200, 100 = NVIDIA's default)
+static int g_hdrCon = 100;             // --hdr-contrast (SDK 0..200, 100 = neutral)
+static int g_hdrNits = 0;              // --hdr-nits: TrueHDR's peak (0 = the display's, thdrPeakNits)
+static uint32_t g_thdrPeak = 1000;     // Live: TrueHDR's peak for the target's monitor (thdrPeakNits)
+static double g_hdrVib = 0.0;          // --hdr-vibrance 0..1 (Dynamic Vibrance intensity)
+static double g_hdrSb = 0.0;           // --hdr-satboost 0..1 (Dynamic Vibrance saturation)
+static double g_sdrWhite = 240.0;      // SDR reference white (nits) of the target's monitor
 // Server-backend generated-frame ceiling. gen+1 slots per pair IS the ceiling on how far
 // above the source rate the adaptive grid can go (a pair that wants more grid points than
 // it has slots degrades to the uniform ladder), so the slot count must follow the TARGET,
@@ -1484,6 +1486,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_hdrSat = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--hdr-contrast") == 0 && i + 1 < argc)
             g_hdrCon = _wtoi(argv[++i]);
+        else if (wcscmp(argv[i], L"--hdr-nits") == 0 && i + 1 < argc)
+            g_hdrNits = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--hdr-vibrance") == 0 && i + 1 < argc)
             g_hdrVib = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--hdr-satboost") == 0 && i + 1 < argc)
@@ -1850,7 +1854,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     ThdrAcc thdrAcc;
     if (g_rtxHdr)
     {
-        // render.py's RTXVideo settings: MaxLuminance HDR_NITS 1000, MiddleGray 50, the
+        // MaxLuminance = --hdr-nits (the app passes its display's peak), else the primary display's; MiddleGray 50, the
         // SDK Contrast / Saturation 0..200, the colour mode and Dynamic Vibrance 0..1
         if (!rtxBridgeLoad())
             return 2;
@@ -1858,7 +1862,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.thdr.Contrast = (uint32_t)(g_hdrCon < 0 ? 0 : (g_hdrCon > 200 ? 200 : g_hdrCon));
         nr.thdr.Saturation = (uint32_t)(g_hdrSat < 0 ? 0 : (g_hdrSat > 200 ? 200 : g_hdrSat));
         nr.thdr.MiddleGray = 50;
-        nr.thdr.MaxLuminance = 1000;
+        nr.thdr.MaxLuminance = thdrPeakNits(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
         nr.rtxMode = !wcscmp(g_hdrColor, L"rtx") ? 1 : (!wcscmp(g_hdrColor, L"raw") ? 2 : 0);
         nr.rtxVib = (float)(g_hdrVib < 0.0 ? 0.0 : (g_hdrVib > 1.0 ? 1.0 : g_hdrVib));
         nr.rtxSb = (float)(g_hdrSb < 0.0 ? 0.0 : (g_hdrSb > 1.0 ? 1.0 : g_hdrSb));
@@ -3659,6 +3663,17 @@ int wmain(int argc, wchar_t** argv)
         return 0;
     }
 
+    // --peak-nits [X Y]: the peak (nits) of the monitor at screen point (X, Y), physical px (the primary monitor
+    // without a point) as Windows reports it, 0 when that monitor is not in HDR mode; main.ts passes it to a render
+    // as --hdr-nits
+    if (argc >= 2 && wcscmp(argv[1], L"--peak-nits") == 0)
+    {
+        const bool at = argc >= 4;
+        const POINT pt{at ? _wtoi(argv[2]) : 0, at ? _wtoi(argv[3]) : 0};
+        printf("%d\n", monitorPeakNits(MonitorFromPoint(pt, at ? MONITOR_DEFAULTTONEAREST : MONITOR_DEFAULTTOPRIMARY)));
+        return 0;
+    }
+
     // --lookup-probe script backend outW outH capW capH imgScale: print the handoff lines the
     // host's own warm engine lookup answers, or `MISS`; stdout only. A debug entry point: a
     // change to the lookup's naming or geometry is gated by dumping this over a config matrix
@@ -3765,9 +3780,11 @@ static void resetSessionGlobals()
     g_liveNrCuda = false;
     g_liveNrReset.store(false);
     g_rtxHdr = false;
-    wcscpy_s(g_hdrColor, L"vivid");
-    g_hdrSat = 0;
+    wcscpy_s(g_hdrColor, L"raw");
+    g_hdrSat = 100;
     g_hdrCon = 100;
+    g_hdrNits = 0;
+    g_thdrPeak = 1000;
     g_hdrVib = 0.0;
     g_hdrSb = 0.0;
     g_sdrWhite = 240.0;
@@ -3884,6 +3901,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_hdrSat = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--hdr-contrast") == 0 && i + 1 < argc)
             g_hdrCon = _wtoi(argv[++i]);
+        else if (wcscmp(argv[i], L"--hdr-nits") == 0 && i + 1 < argc)
+            g_hdrNits = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--hdr-vibrance") == 0 && i + 1 < argc)
             g_hdrVib = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--hdr-satboost") == 0 && i + 1 < argc)
@@ -4289,9 +4308,10 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_fsrUp = false;
             g_restore = false;
             g_rtxHdr = false;
-            wcscpy_s(g_hdrColor, L"vivid");
-            g_hdrSat = 0;
+            wcscpy_s(g_hdrColor, L"raw");
+            g_hdrSat = 100;
             g_hdrCon = 100;
+            g_hdrNits = 0;
             g_hdrVib = 0.0;
             g_hdrSb = 0.0;
             g_dlssnr = false;

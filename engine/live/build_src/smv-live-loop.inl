@@ -692,12 +692,9 @@ struct CascadeProbe
     }
 };
 
-// Is Windows HDR ("Use HDR") active on the display the target window sits on? The
-// output reports G2084 (PQ) as its current color space when HDR is on. Used to warn that today's
-// 8-bit SDR capture clips HDR content, and later to switch on the HDR live pipeline.
-static bool monitorIsHDR(HWND target)
+// The DXGI description of the adapter output that shows hmon
+static bool monitorDesc1(HMONITOR hmon, DXGI_OUTPUT_DESC1& od1)
 {
-    HMONITOR hmon = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
     ComPtr<IDXGIFactory1> f;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f))))
         return false;
@@ -711,13 +708,40 @@ static bool monitorIsHDR(HWND target)
             if (FAILED(o->GetDesc(&od)) || od.Monitor != hmon)
                 continue;
             ComPtr<IDXGIOutput6> o6;
-            DXGI_OUTPUT_DESC1 od1{};
-            if (SUCCEEDED(o.As(&o6)) && SUCCEEDED(o6->GetDesc1(&od1)))
-                return od1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-            return false;
+            return SUCCEEDED(o.As(&o6)) && SUCCEEDED(o6->GetDesc1(&od1));
         }
     }
     return false;
+}
+
+// Is Windows HDR ("Use HDR") active on the display the target window sits on? The
+// output reports G2084 (PQ) as its current color space when HDR is on. Used to warn that today's
+// 8-bit SDR capture clips HDR content, and later to switch on the HDR live pipeline.
+static bool monitorIsHDR(HWND target)
+{
+    DXGI_OUTPUT_DESC1 od1{};
+    return monitorDesc1(MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST), od1) &&
+           od1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+}
+
+// The peak (nits) of a monitor in HDR mode as Windows reports it (DXGI MaxLuminance), the level NVIDIA's own RTX
+// Video HDR expands to; 0 when the monitor is not in HDR mode
+static int monitorPeakNits(HMONITOR hmon)
+{
+    DXGI_OUTPUT_DESC1 od1{};
+    if (!monitorDesc1(hmon, od1) || od1.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+        return 0;
+    return (int)(od1.MaxLuminance + 0.5f);
+}
+
+// TrueHDR's MaxLuminance: --hdr-nits, else the monitor's peak, else 1000 (an SDR monitor: the usual HDR10 master),
+// inside the SDK's 400..2000
+static uint32_t thdrPeakNits(HMONITOR hmon)
+{
+    int n = g_hdrNits > 0 ? g_hdrNits : monitorPeakNits(hmon);
+    if (n <= 0)
+        n = 1000;
+    return (uint32_t)(n < 400 ? 400 : (n > 2000 ? 2000 : n));
 }
 
 // The SDR reference white (nits) of the display the target sits on - the level DWM
@@ -1686,11 +1710,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             LOG("HDR live mode ON: FP16 scRGB capture -> BT.2020 PQ, R10G10B10A2 present (G2084)\n");
         // TrueHDR needs the HDR live pipeline (server backends only; not the exe-side DLSS-G
         // pack). Resolve the target monitor's
-        // SDR white here, while the target is known.
+        // SDR white and peak here, while the target is known.
         if (g_rtxHdr && g_hdr && g_backend == BK_SERVER)
         {
             g_sdrWhite = sdrWhiteNits(target);
-            LOG("RTX HDR live: TrueHDR expansion on (colour %ls, SDR white %.0f nits)\n", g_hdrColor, g_sdrWhite);
+            g_thdrPeak = thdrPeakNits(MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST));
+            LOG("RTX HDR live: TrueHDR expansion on (colour %ls, SDR white %.0f nits, peak %u nits)\n", g_hdrColor,
+                g_sdrWhite, g_thdrPeak);
         }
         else if (g_rtxHdr)
             LOG("RTX HDR live skipped (needs an HDR display and a server model: RIFE/GMFSS)\n");
