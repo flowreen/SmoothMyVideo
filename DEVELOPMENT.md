@@ -1323,14 +1323,17 @@ so the lookup and the build cannot disagree on a name:
   hit. It covers rife, gmfss, rifedrba (the RIFE pair plus block0) and Restore (`restore_<hash>_dth`, fp16 input, no
   warm marker). TensorRT-RTX compiles one engine at a time per PROCESS (a build or a JIT warm-up on another thread
   waits for the running one; two processes run side by side at full speed), so a GMFSS build (live and offline,
-  `lkGmEnsure`) hands gmflow A, the set's longest build + warm-up, to a helper process: this exe as
+  `lkGmEnsure`) hands the set's two longest builds + warm-ups, gmflow A (`gflow`) and its front `_m` (`gflowm`), each
+  to a helper process: this exe as
   `smv-live.exe --build-engine <log> <engine folder>/live_server.py <onnx> <engine> <workspace multiplier>
   <input>=<d0>x<d1>... ...`, which builds the engine when missing, warms it and exits (0 done, 3 memory-shaped failure,
-  2 other), while the host does the other seven nets; the helper sits in a job object that ends it with the host, its
-  log lines come back as `helper: ...`, and a helper that fails or cannot start leaves A to the host afterwards
-  (`the gmflow A build helper failed (exit N), building it here`). Cold GMFSS host build at 854x480: 37.7 / 36.9 s ->
-  23.8 / 24.4 s, frames byte-identical (harness `gmfss_init_lanes`). `SMV_GM_HELPER=0` = no helper;
-  `SMV_GM_HELPER_TEST=fail` = the helper exits 2 at once (the fallback's trigger). The host logs every build
+  2 other), while the host does the other six nets; both helpers sit in one job object that ends them with the host,
+  their log lines come back as `helper: ...`, and a helper that fails or cannot start leaves its net to the host
+  afterwards (`the gmflow A build helper failed (exit N), building it here`, the same line with `gmflow _m`). Cold GMFSS
+  host build at 854x480 with A's helper: 37.7 / 36.9 s -> 23.8 / 24.4 s; the `_m` helper beside it: 1080p 16.2 -> 14.3 s,
+  2160p 18.1 -> 17.4 s; frames byte-identical (harness `gmfss_init_lanes`, `gmfss_cold_helpers`). `SMV_GM_HELPER=0` = no
+  helper, `=1` = A's helper alone; `SMV_GM_HELPER_TEST=fail` = every helper exits 2 at once (the fallback's trigger).
+  The host logs every build
   (`built X from Y in Ns`) and warm-up (`warmed X in Ns`). Output-identical to python's build from the same file (harness
   `onnx\gate_3c2.py`, `onnx\gate_3c3a.py`). A session that ends mid-build leaves the build
   running while the resident host stays alive; an engine file is written whole or not at all.
@@ -1758,7 +1761,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 |---|---|
 | `SMV_TRT_CACHE` | TRT engine cache location (default `model_cache_safe_to_delete` in the app's top folder) |
 | `SMV_ONNX_DIR` | size-free ONNX folder (default `engine/onnx`) |
-| `SMV_GM_HELPER=0` / `SMV_GM_HELPER_TEST=fail` | a GMFSS cold build without the gmflow A helper process (A/B) / the helper exits 2 at once (the fallback's trigger) |
+| `SMV_GM_HELPER=0` / `=1` / `SMV_GM_HELPER_TEST=fail` | a GMFSS cold build without the build helper processes / with gmflow A's helper alone (A/B) / every helper exits 2 at once (the fallback's trigger) |
 | `SMV_GM_UPGRADE=0` / `=now` / `=fail` | gmflow A in the masked form only, no background build (A/B) / the edge form from the cold start (A/B) / the background build of the edge form exits 2 at once (its failure line's trigger) |
 | `SMV_GM_SPLAT=old` | GMFSS's splats by the scatter kernels (k_splatSoft + k_splatNorm) instead of the gather ones (A/B; the same output) |
 | `SMV_GM_SCRATCH=own` | GMFSS's pair scratch in its own buffers instead of carved from the splat accumulator (A/B; the same output) |
