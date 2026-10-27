@@ -2039,12 +2039,12 @@ loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
 vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
-github.com/HansKristian-Work/vkd3d-proton at 0bb64c56c8f0dcc11ecc0f6c56e00e4f7bd8d506 with its submodules
-(dxil-spirv at 8434b0639fb2a48ce13aac08a420ecce5d23df0e), then
+github.com/HansKristian-Work/vkd3d-proton at f5443fe51c99363ad02a3e7dbead2f3ec25f6ded with its submodules
+(dxil-spirv at 8b48f0e0392d76be4fdcea2a3ba3ea99dddaae5b), then
 
 ```
-git apply engine/fsrfg/source/vkd3d-proton-0bb64c5-smv.patch        (in the vkd3d-proton checkout)
-git apply engine/fsrfg/source/dxil-spirv-8434b06-smv.patch          (in subprojects/dxil-spirv)
+git apply engine/fsrfg/source/vkd3d-proton-f5443fe-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/dxil-spirv-8b48f0e-smv.patch          (in subprojects/dxil-spirv)
 meson setup build --buildtype=release -Denable_extended_emulation=true
 ninja -C build
 ```

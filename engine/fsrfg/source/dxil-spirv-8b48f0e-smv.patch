@@ -1,8 +1,8 @@
 diff --git a/dxil_converter.cpp b/dxil_converter.cpp
-index f94b77ec..6dacadf7 100644
+index 90f963ec..74e13d24 100644
 --- a/dxil_converter.cpp
 +++ b/dxil_converter.cpp
-@@ -9820,6 +9820,7 @@ void Converter::Impl::set_option(const OptionBase &cap)
+@@ -9838,6 +9838,7 @@ void Converter::Impl::set_option(const OptionBase &cap)
  		auto &float8 = static_cast<const OptionFloat8Support &>(cap);
  		options.wmma_fp8 = float8.wmma_fp8;
  		options.nv_cooperative_matrix2_conversions = float8.nv_cooperative_matrix2_conversions;
@@ -10,7 +10,7 @@ index f94b77ec..6dacadf7 100644
  		break;
  	}
  
-@@ -9981,15 +9982,29 @@ const GlobalConfiguration &GlobalConfiguration::get()
+@@ -9999,15 +10000,29 @@ const GlobalConfiguration &GlobalConfiguration::get()
  	return config;
  }
  
@@ -41,10 +41,10 @@ index f94b77ec..6dacadf7 100644
  			simulate_min16float_min_spec = true;
  	}
 diff --git a/dxil_converter.hpp b/dxil_converter.hpp
-index 9f7b242c..a62f05c9 100644
+index 1b692e1e..ffc711cb 100644
 --- a/dxil_converter.hpp
 +++ b/dxil_converter.hpp
-@@ -846,6 +846,7 @@ struct OptionFloat8Support : OptionBase
+@@ -847,6 +847,7 @@ struct OptionFloat8Support : OptionBase
  
  	bool wmma_fp8 = false;
  	bool nv_cooperative_matrix2_conversions = false;
@@ -53,10 +53,10 @@ index 9f7b242c..a62f05c9 100644
  
  struct OptionNvAPI : OptionBase
 diff --git a/dxil_spirv.cpp b/dxil_spirv.cpp
-index 06227db3..9c800de0 100644
+index 8a4bec15..205fb30b 100644
 --- a/dxil_spirv.cpp
 +++ b/dxil_spirv.cpp
-@@ -264,6 +264,7 @@ struct Arguments
+@@ -265,6 +265,7 @@ struct Arguments
  	bool vkmm = false;
  	bool wmma_fp8 = false;
  	bool wmma_nv_coopmat2 = false;
@@ -64,7 +64,7 @@ index 06227db3..9c800de0 100644
  	bool non_semantic = false;
  	bool mixed_float_dot_product = false;
  	std::vector<dxil_spv_shader_quirk> quirks;
-@@ -912,7 +913,10 @@ int main(int argc, char **argv)
+@@ -921,7 +922,10 @@ int main(int argc, char **argv)
  	});
  	cbs.add("--full-wmma", [&](CLIParser &parser) {
  		args.wmma_fp8 = parser.next_uint() != 0;
@@ -76,7 +76,7 @@ index 06227db3..9c800de0 100644
  	});
  	cbs.add("--shader-quirk", [&](CLIParser &parser) {
  		args.quirks.push_back(dxil_spv_shader_quirk(parser.next_uint()));
-@@ -1308,7 +1312,7 @@ int main(int argc, char **argv)
+@@ -1317,7 +1321,7 @@ int main(int argc, char **argv)
  	if (args.wmma_fp8 || args.wmma_nv_coopmat2)
  	{
  		dxil_spv_option_float8_support wmma = {
@@ -86,10 +86,10 @@ index 06227db3..9c800de0 100644
  	}
  
 diff --git a/dxil_spirv_c.cpp b/dxil_spirv_c.cpp
-index 33931836..4fc288a5 100644
+index cfc4f021..07114210 100644
 --- a/dxil_spirv_c.cpp
 +++ b/dxil_spirv_c.cpp
-@@ -1429,6 +1429,7 @@ dxil_spv_result dxil_spv_converter_add_option(dxil_spv_converter converter, cons
+@@ -1440,6 +1440,7 @@ dxil_spv_result dxil_spv_converter_add_option(dxil_spv_converter converter, cons
  		auto *float8 = reinterpret_cast<const dxil_spv_option_float8_support *>(option);
  		helper.wmma_fp8 = float8->wmma_fp8;
  		helper.nv_cooperative_matrix2_conversions = float8->nv_cooperative_matrix2_conversions;
@@ -98,10 +98,10 @@ index 33931836..4fc288a5 100644
  		converter->options.emplace_back(duplicate(helper));
  		break;
 diff --git a/dxil_spirv_c.h b/dxil_spirv_c.h
-index 6477e773..cc576c95 100644
+index 19daf224..f6efc4da 100644
 --- a/dxil_spirv_c.h
 +++ b/dxil_spirv_c.h
-@@ -846,6 +846,8 @@ typedef struct dxil_spv_option_float8_support
+@@ -852,6 +852,8 @@ typedef struct dxil_spv_option_float8_support
  	dxil_spv_option_base base;
  	dxil_spv_bool wmma_fp8;
  	dxil_spv_bool nv_cooperative_matrix2_conversions;
@@ -111,7 +111,7 @@ index 6477e773..cc576c95 100644
  
  typedef struct dxil_spv_option_nvapi
 diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
-index 668cb7ca..f3b2287a 100644
+index b16dc421..de659de4 100644
 --- a/opcodes/converter_impl.hpp
 +++ b/opcodes/converter_impl.hpp
 @@ -170,6 +170,8 @@ public:
@@ -123,7 +123,7 @@ index 668cb7ca..f3b2287a 100644
  	bool simulate_min16float_min_spec = false;
  
  private:
-@@ -787,6 +789,7 @@ struct Converter::Impl
+@@ -789,6 +791,7 @@ struct Converter::Impl
  		bool nv_raw_access_chains = false;
  		bool wmma_fp8 = false;
  		bool nv_cooperative_matrix2_conversions = false;

@@ -73,10 +73,10 @@ index dd1f7799..7e168e0f 100644
  else
    d3d12core_name_prefix = 'libvkd3d-proton-'
 diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
-index 6c7dfcb9..0ef854bb 100644
+index 7390c962..56e0cc2f 100644
 --- a/libs/vkd3d-shader/dxil.c
 +++ b/libs/vkd3d-shader/dxil.c
-@@ -1203,6 +1203,10 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
+@@ -1209,6 +1209,10 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
              {
                  float8.nv_cooperative_matrix2_conversions = DXIL_SPV_TRUE;
              }
@@ -88,7 +88,7 @@ index 6c7dfcb9..0ef854bb 100644
              {
                  static const dxil_spv_option_extended_non_semantic non_semantic = {
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index 8a632d2d..8e3d6d44 100644
+index 534c6f14..80dcdac2 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -394,26 +394,32 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device, VkSemaphore vk_se
@@ -197,7 +197,7 @@ index 8fabb245..588d2335 100644
      win32_handle_info.pNext = NULL;
      win32_handle_info.semaphore = fence->timeline_semaphore;
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index 817f8a80..9a018d50 100644
+index 14ed4f83..40a8d963 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
 @@ -2438,9 +2438,19 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
@@ -237,7 +237,7 @@ index 817f8a80..9a018d50 100644
          if (!vkd3d_supports_minimum_coopmat_caps(device))
          {
              physical_device_info->cooperative_matrix_features.cooperativeMatrix = VK_FALSE;
-@@ -6714,12 +6734,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
+@@ -6760,12 +6780,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
              return DXGI_ERROR_INVALID_CALL;
          }
  
@@ -252,7 +252,7 @@ index 817f8a80..9a018d50 100644
          if (attributes)
              FIXME("attributes %p not handled.\n", attributes);
          if (access)
-@@ -6801,7 +6817,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
+@@ -6847,7 +6863,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
          win32_handle_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
          win32_handle_info.pNext = NULL;
          win32_handle_info.semaphore = fence->timeline_semaphore;
@@ -262,7 +262,7 @@ index 817f8a80..9a018d50 100644
  
          vr = VK_CALL(vkGetSemaphoreWin32HandleKHR(device->vk_device, &win32_handle_info, handle));
  
-@@ -10228,10 +10245,27 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
+@@ -10277,10 +10294,27 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
                  VKD3D_SHADER_TARGET_EXTENSION_WMMA_FP8;
      }
  
@@ -333,7 +333,7 @@ index a8fc26b1..878fdf89 100644
          bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
          bind_info.pNext = NULL;
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index 3e71f89c..866e3d04 100644
+index 80244859..fde7e2e5 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
 @@ -342,6 +342,7 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device,

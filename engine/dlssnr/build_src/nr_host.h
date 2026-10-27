@@ -37,7 +37,7 @@ struct Settings
     float tone = 1.0f;      // DLSSNR.LocalToneStrength, 0..2
     float intensity = 1.0f; // DLSSNR.Intensity, 0..2
     int style = 0;          // DLSSNR.Style, 0 default / 1 natural / 2 cinematic
-    int preset = 3;         // DLSSNR.Hint.Render.Preset, 0..3
+    int preset = 2;         // DLSSNR.Hint.Render.Preset, 1 WEIGHTS_HT / 2 WEIGHTS_CC_SMALL_FP8 (else the DLL's default)
     int automask = 1;       // DLSSNR.UseAutoMask, as every reference host sets it (SMV_NR_AUTOMASK=0 = off)
     // DLSSNR.MVec: a per-frame R16G16_FLOAT motion field (current -> previous, px) that the caller
     // writes into the shared MVec texture (startShared); without it the runtime gets no motion

@@ -120,6 +120,9 @@ if (!app.requestSingleInstanceLock()) {
     // session or render can load an engine built from the old graph; a cache an earlier version
     // kept elsewhere (the engine folder, 1.0.x's AppData) is moved or removed (src/render/cache.ts)
     console.log(checkEngineCache(ENGINE, [path.join(app.getPath('userData'), 'trt_cache')]));
+    // a retired DLSS 5 runtime (DLSSNR_RETIRED) goes before any host can load it
+    const nr = retireOldDlssnr();
+    if (nr) console.log(nr);
     createWindow();
     checkForUpdate();
   });
@@ -335,17 +338,46 @@ const DLSSNR_DIR = path.join(ENGINE, 'dlssnr');
 const DLSSNR_HOST = ['nvngx.dll'];
 const DLSSNR_RUNTIME = 'nvngx_dlssnr.dll';
 const DLSSNR_SR = 'nvngx_dlss.dll';
-// The one-click source: the most-downloaded rhi-repo asset, and the ONE hash this app holds: the
+// The one-click source: the pinned rhi-repo asset, and the ONE hash this app holds: the
 // SHA256 of the nvngx_dlssnr.dll inside it (probe-verified on the host). The download refuses to install any other DLL; a dropped file with another hash still
 // installs, the UI just says it is unverified. Bump tag, asset and hash together when moving to a
-// newer build (the zip's own digest is at https://api.github.com/repos/RankFTW/rhi-repo/releases).
+// newer build and add the replaced one to DLSSNR_RETIRED (the zip's own digest is at
+// https://api.github.com/repos/RankFTW/rhi-repo/releases).
 const DLSSNR_DL = {
-  url: 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.SF-v2/nvngx_dlssnr_310.8.SF-v2.zip',
-  page: 'https://github.com/RankFTW/rhi-repo/releases/tag/dlssnr-310.8.SF-v2',
-  dllSha256: '6eb209e764f39872625debd6abaf45e2bb6322f6f270f781f70c059ae30b3927',
-  label: '310.8.SF-v2 (rhi-repo, RTX 40 + 50)',
-  zipBytes: 116693212,
+  url: 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.9.16/nvngx_dlssnr_310.9.16.zip',
+  page: 'https://github.com/RankFTW/rhi-repo/releases/tag/dlssnr-310.9.16',
+  dllSha256: 'cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed',
+  label: '310.9.16 (rhi-repo, RTX 40 + 50)',
+  zipBytes: 192378839,
 };
+// Superseded one-click builds (size + SHA256 of nvngx_dlssnr.dll). An installed copy, downloaded or dropped, is
+// removed at app start so the DLSS 5 row offers DLSSNR_DL's build: SMV offers one build only.
+const DLSSNR_RETIRED = [
+  {
+    label: '310.8.SF-v2',
+    bytes: 165830144,
+    sha256: '6eb209e764f39872625debd6abaf45e2bb6322f6f270f781f70c059ae30b3927',
+  },
+];
+/** Remove an installed retired runtime; '' when there is none. One held by a running host stays and is
+ *  retried next start. The size test comes first, so only a same-size file gets hashed. */
+function retireOldDlssnr(): string {
+  const p = path.join(DLSSNR_DIR, DLSSNR_RUNTIME);
+  let old: (typeof DLSSNR_RETIRED)[number] | undefined;
+  try {
+    const size = fs.statSync(p).size;
+    old = DLSSNR_RETIRED.find((r) => r.bytes === size && r.sha256 === sha256File(p));
+  } catch {
+    return '';
+  }
+  if (!old) return '';
+  try {
+    fs.rmSync(p);
+  } catch {
+    return `DLSS 5: the retired ${old.label} runtime is in use, retried next start`;
+  }
+  return `DLSS 5: removed the retired ${old.label} runtime, the download offers ${DLSSNR_DL.label}`;
+}
 function sha256File(p: string): string {
   const h = crypto.createHash('sha256');
   const fd = fs.openSync(p, 'r');
