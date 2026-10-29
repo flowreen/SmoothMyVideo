@@ -45,7 +45,7 @@ third-party work.
   > THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
   > (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
   > THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-* **AMD FidelityFX SDK v2.3.0: FSR 4 frame generation and FSR upscaling** (the AMD FSR 4 frame generation model and
+* **AMD FidelityFX SDK v2.4.0: FSR 4 frame generation and FSR upscaling** (the AMD FSR 4 frame generation model and
   the AMD FSR 4 upscaler): AMD's signed binaries `amd_fidelityfx_loader_dx12.dll` with
   `amd_fidelityfx_framegeneration_dx12.dll` (in `engine/fsrfg/`) and with `amd_fidelityfx_upscaler_dx12.dll` (in
   `engine/fsrup/`), redistributed unmodified beside our bridges `smv_fsrfg_bridge.dll` and `smv_fsrup_bridge.dll`

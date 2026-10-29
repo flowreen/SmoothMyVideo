@@ -1,6 +1,6 @@
 @echo off
 rem Builds engine\fsrfg: smv_fsrfg_bridge.dll (fsrfg_bridge.cpp) and amdxc64.dll (amdxc64_shim.cpp), and copies beside
-rem them AMD's signed FSR SDK v2.3.0 loader + frame generation DLLs (signedbin, unmodified) and vkd3d-proton's two DLLs.
+rem them AMD's signed FSR SDK v2.4.0 loader + frame generation DLLs (signedbin, unmodified) and vkd3d-proton's two DLLs.
 rem
 rem vkd3d-proton (LGPL-2.1, built separately, MSYS2 UCRT64 with gcc, meson and ninja): github.com/HansKristian-Work/
 rem vkd3d-proton at commit f5443fe51c99363ad02a3e7dbead2f3ec25f6ded with its submodules, dxil-spirv at
@@ -16,7 +16,7 @@ rem reads its configuration from the process environment, and the two DLLs are n
 rem smv_vkd3d_d3d12core.dll.
 rem
 rem Environment:
-rem   FSR_SDK      the FSR SDK v2.3.0 checkout (holds Kits\FidelityFX: api\include, framegeneration\include, signedbin)
+rem   FSR_SDK      the FSR SDK v2.4.0 checkout (holds Kits\FidelityFX: api\include, framegeneration\include, signedbin)
 rem   VKD3D_BUILD  the vkd3d-proton build folder above (holds libs\d3d12\smv_vkd3d_d3d12.dll, libs\d3d12core\...)
 rem Usage (Visual Studio 2026 with the C++ workload): build.bat [output folder, default engine\fsrfg]
 rem No delayed expansion (a `!` in a path stays) and no ( ) blocks around paths (a `)` in one stays).
@@ -62,7 +62,7 @@ echo   amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_framegeneration_dx12.dll
 exit /b 0
 
 :missing
-echo set FSR_SDK (the FSR SDK v2.3.0 checkout) and VKD3D_BUILD (the vkd3d-proton build folder); missing:%MISSING%
+echo set FSR_SDK (the FSR SDK v2.4.0 checkout) and VKD3D_BUILD (the vkd3d-proton build folder); missing:%MISSING%
 exit /b 1
 
 :failed

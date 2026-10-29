@@ -1,10 +1,10 @@
 @echo off
 rem Builds engine\fsrup\smv_fsrup_bridge.dll (fsrup_bridge.cpp: the host's C API over AMD's FidelityFX upscaler) and copies
-rem AMD's signed FidelityFX loader + upscaler DLLs from the FSR SDK v2.3.0 beside it (both MIT: Kits/FidelityFX/docs/license.md
+rem AMD's signed FidelityFX loader + upscaler DLLs from the FSR SDK v2.4.0 beside it (both MIT: Kits/FidelityFX/docs/license.md
 rem lists Kits\FidelityFX\signedbin\amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll in its MIT section).
 rem
 rem Environment:
-rem   FSR_SDK  the FSR SDK v2.3.0 checkout (holds Kits\FidelityFX: api\include, upscalers\include, signedbin)
+rem   FSR_SDK  the FSR SDK v2.4.0 checkout (holds Kits\FidelityFX: api\include, upscalers\include, signedbin)
 rem Usage (Visual Studio 2026 with the C++ workload): build.bat
 rem No delayed expansion (a `!` in a path stays) and no ( ) blocks around paths (a `)` in one stays).
 setlocal
@@ -32,7 +32,7 @@ echo dll: cl rc 0 (%LOG%), %OUT% (+ the two signed AMD DLLs)
 exit /b 0
 
 :nosdk
-echo set FSR_SDK (the FSR SDK v2.3.0 checkout with Kits\FidelityFX\signedbin)
+echo set FSR_SDK (the FSR SDK v2.4.0 checkout with Kits\FidelityFX\signedbin)
 exit /b 1
 
 :failed

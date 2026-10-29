@@ -1,5 +1,5 @@
-// SmoothMyVideo's AMD FSR frame generation bridge: AMD's signed FidelityFX SDK v2.3.0 frame generation DLL
-// (amd_fidelityfx_framegeneration_dx12.dll 4.0.1, unmodified), its ML provider (FSR 4) only, behind a small C API for
+// SmoothMyVideo's AMD FSR frame generation bridge: AMD's signed FidelityFX SDK v2.4.0 frame generation DLL
+// (amd_fidelityfx_framegeneration_dx12.dll 4.0.2, unmodified), its ML provider (FSR 4) only, behind a small C API for
 // the native host. FSR 4's shaders use AMD's WMMA FP8 driver intrinsics, so its D3D12 device comes from vkd3d-proton
 // (D3D12 on Vulkan, built from source with ..\source's patches: FP8 matrices emulated on FP16 cooperative matrices),
 // and amdxc64.dll beside this file (amdxc64_shim.cpp) answers the DLL's driver-extension queries. vkd3d-proton's two
@@ -150,15 +150,25 @@ bool loadOnce()
     if (g_loaded)
         return true;
     const std::wstring dir = moduleDir();
-    // vkd3d-proton's pipeline cache key does not cover DXIL_SPIRV_CONFIG, so this route keeps a cache of its own, in a
-    // folder named after the vkd3d-proton build (its core DLL's size and write time): a cache of another build or
-    // configuration once replayed broken pipelines
+    // VK_NV_cooperative_matrix2 is not offered to the lowering: with its tensor loads, NVIDIA's R620 driver turns every
+    // FSR call on the device into garbage for ~0.64 s after ~3.5 s of the device's GPU work (its conversions did the
+    // same on R617); the staged FP8 loads through shared memory give the same frames. SMV_VKD3D_COOPMAT2=1 offers the
+    // extension again (a driver re-check); a caller's own VKD3D_DISABLE_EXTENSIONS is kept.
+    char c2[4] = "";
+    GetEnvironmentVariableA("SMV_VKD3D_COOPMAT2", c2, sizeof(c2));
+    const bool coopmat2 = c2[0] == '1';
+    if (!coopmat2)
+        setEnv("VKD3D_DISABLE_EXTENSIONS", "VK_NV_cooperative_matrix2", true);
+    // vkd3d-proton's pipeline cache key does not cover DXIL_SPIRV_CONFIG or the disabled extensions, so this route keeps
+    // a cache of its own, in a folder named after the vkd3d-proton build (its core DLL's size and write time) and the
+    // lowering's configuration: a cache of another build or configuration once replayed broken pipelines
     WIN32_FILE_ATTRIBUTE_DATA fa = {};
     if (!GetFileAttributesExW((dir + L"smv_vkd3d_d3d12core.dll").c_str(), GetFileExInfoStandard, &fa))
         return fail("smv_vkd3d_d3d12core.dll is missing beside the bridge");
     wchar_t key[64];
-    swprintf(key, 64, L"vkd3d_%lx_%08lx%08lx", (unsigned long)fa.nFileSizeLow,
-             (unsigned long)fa.ftLastWriteTime.dwHighDateTime, (unsigned long)fa.ftLastWriteTime.dwLowDateTime);
+    swprintf(key, 64, L"vkd3d_%lx_%08lx%08lx%s", (unsigned long)fa.nFileSizeLow,
+             (unsigned long)fa.ftLastWriteTime.dwHighDateTime, (unsigned long)fa.ftLastWriteTime.dwLowDateTime,
+             coopmat2 ? L"" : L"_nc2");
     const std::wstring cache = (g_cacheRoot.empty() ? dir + L"shader_cache" : g_cacheRoot) + L"\\" + key;
     makeDirs(cache);
     SetEnvironmentVariableW(L"VKD3D_SHADER_CACHE_PATH", cache.c_str());
@@ -398,7 +408,7 @@ FSRFG_API void fsrfg_set_cache_dir(const char* dir)
     }
 }
 
-// the FSR version the contexts run ("4.0.1"), empty before the first fsrfg_create_i
+// the FSR version the contexts run ("4.0.2"), empty before the first fsrfg_create_i
 FSRFG_API const char* fsrfg_provider()
 {
     return g_provider.c_str();

@@ -1,5 +1,5 @@
-// SmoothMyVideo's AMD FSR upscaling bridge: AMD's signed FidelityFX loader + upscaler DLLs (FSR SDK v2.3.0, MIT, beside
-// this DLL) behind a small C API for the native host, the upscaler version picked by name (FSR 4.1.1 with its INT8 model:
+// SmoothMyVideo's AMD FSR upscaling bridge: AMD's signed FidelityFX loader + upscaler DLLs (FSR SDK v2.4.0, MIT, beside
+// this DLL) behind a small C API for the native host, the upscaler version picked by name (FSR 4.1.2 with its INT8 model:
 // unlockInt8 opens AMD's GPU gate in this process's copy of the upscaler DLL). Frames
 // go in and out through D3D12 buffers shared with CUDA (NT handles the host imports as external memory) and one shared
 // fence (an external semaphore), so the GPU waits on the GPU: the host writes the frame and its motion vectors, signals
@@ -225,13 +225,14 @@ D3D12_TEXTURE_COPY_LOCATION footprint(ID3D12Resource* r, const D3D12_PLACED_SUBR
     return l;
 }
 
-// AMD's upscaler DLL 4.1.1 (FSR SDK v2.3.0: this PE timestamp and image size) carries FSR 4's INT8 model but offers the
-// 4.x version and runs that model only where its internal gate says yes: a function at kInt8Check, bool (context,
-// ID3D12Device*), true when AMD's GPU query reports an RDNA 3 part; anywhere else the DLL lists FSR 3.1.5 and below.
+// AMD's upscaler DLL 4.1.2 (FSR SDK v2.4.0: this PE timestamp and image size) carries FSR 4's INT8 model but offers the
+// 4.x version and runs that model only where its INT8 provider's gate says yes: a function at kInt8Check (the
+// ffxProvider_FSR4_Int8 class's third virtual), bool (context, ID3D12Device*), true when the device has shader model
+// 6.6 and AMD's GPU query reports one of the AMD parts it lists; anywhere else the DLL lists FSR 3.1 and below.
 // The DLL is MIT (license.md lists it), so the gate returns true in this process's copy (`mov al, 1; ret`), before the
 // loader's first query. Any other build of the DLL is refused, never patched blind.
-constexpr DWORD kUpTimestamp = 0x6A2AB5B3, kUpImageSize = 0x01B6F000, kInt8Check = 0x8D70;
-constexpr uint8_t kInt8Prologue[] = {0x48, 0x83, 0xEC, 0x48, 0x48, 0x8B, 0xC2, 0x48, 0x85, 0xD2, 0x74, 0x54};
+constexpr DWORD kUpTimestamp = 0x6ADB3B35, kUpImageSize = 0x036FF000, kInt8Check = 0x9960;
+constexpr uint8_t kInt8Prologue[] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0x05, 0x93, 0x76, 0x63};
 constexpr uint8_t kReturnTrue[] = {0xB0, 0x01, 0xC3};
 
 bool unlockInt8(HMODULE up)
@@ -239,13 +240,13 @@ bool unlockInt8(HMODULE up)
     uint8_t* base = (uint8_t*)up;
     const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
     if (nt->FileHeader.TimeDateStamp != kUpTimestamp || nt->OptionalHeader.SizeOfImage != kUpImageSize)
-        return fail("amd_fidelityfx_upscaler_dx12.dll is not the FSR SDK v2.3.0 build (4.1.1) whose INT8 gate this "
+        return fail("amd_fidelityfx_upscaler_dx12.dll is not the FSR SDK v2.4.0 build (4.1.2) whose INT8 gate this "
                     "bridge opens");
     uint8_t* f = base + kInt8Check;
     const size_t n = sizeof kReturnTrue;
     if (memcmp(f + n, kInt8Prologue + n, sizeof kInt8Prologue - n) != 0 ||
         (memcmp(f, kInt8Prologue, n) != 0 && memcmp(f, kReturnTrue, n) != 0))
-        return fail("amd_fidelityfx_upscaler_dx12.dll's INT8 gate is not where the 4.1.1 build has it");
+        return fail("amd_fidelityfx_upscaler_dx12.dll's INT8 gate is not where the 4.1.2 build has it");
     if (memcmp(f, kReturnTrue, n) == 0)
         return true;
     DWORD old = 0;
