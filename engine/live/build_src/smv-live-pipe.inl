@@ -126,8 +126,8 @@ struct PipeServer
             // one second, or a stop; without the event (creation failed) the plain sleep
             if (s->wdogEv ? WaitForSingleObject(s->wdogEv, 1000) == WAIT_OBJECT_0 : (Sleep(1000), false))
                 break;
-            const LONGLONG since = s->ioSince;
-            if (since && (LONGLONG)GetTickCount64() - since > 10000)
+            const LONGLONG since = s->ioSince, now = (LONGLONG)GetTickCount64();
+            if (since && now - since > 10000 && now >= g_wdogHold)
             {
                 LOG("live server stalled >10s, ending the session (engine shape bug? the app revives it)\n");
                 InterlockedExchange(&s->stalled, 1);

@@ -408,7 +408,7 @@ __global__ void k_packOutHdr(const void* __restrict__ src, int half, int planeSt
 // on it while doing the slot store that k_packOut / k_packOutHdr do without effects.
 
 // crop the model pad and quantise to tight 8-bit pixels at the model size, plane c into byte c,
-// alpha 255: the (R, G, B) planes as the offline DLSS 4.5 host's RGBA8 frame
+// alpha 255: the (R, G, B) planes as the offline DLSS 4.5 host's RGBA8 frame and RTX VSR's input
 __global__ void k_packBgra(const void* __restrict__ src, int half, int planeStride, int rowStride,
                            int w, int h, unsigned char* __restrict__ dst)
 {
@@ -426,8 +426,8 @@ __global__ void k_packBgra(const void* __restrict__ src, int half, int planeStri
     p[3] = 255;
 }
 
-// the (R, G, B) planes of either route as the B G R A bytes of the VSR bridge and NvOFFRUC, and
-// back, as rtxvideo.py run_vsr packs and unpacks them (back with a true / 255)
+// the (R, G, B) planes of either route as the B G R A bytes of NvOFFRUC and AMD FSR upscaling, and
+// back (back with a true / 255)
 __global__ void k_packBgraRgb(const void* __restrict__ src, int half, int planeStride, int rowStride,
                               int w, int h, unsigned char* __restrict__ dst)
 {
@@ -458,17 +458,7 @@ __global__ void k_unpackBgraRgb(const unsigned char* __restrict__ src, int dw, i
     dst[2 * plane + o] = p[0] / 255.0f;
 }
 
-// R and B of n packed 8-bit pixels exchanged in place: the RTX Video bridge's VSR takes and returns R, G, B, A bytes
-// where SMV's VSR buffers hold B, G, R, A (nativeVsrEval, around the bridge call)
-__global__ void k_swapRB(unsigned int* __restrict__ p, unsigned int n)
-{
-    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const unsigned int w = p[i];
-    p[i] = (w & 0xFF00FF00u) | ((w & 0xFFu) << 16) | ((w >> 16) & 0xFFu);
-}
-
-// RGBA8 back to the offline (R, G, B) planes: a DLSS 4.5 host frame,
+// RGBA8 back to the offline (R, G, B) planes: a DLSS 4.5 host frame or RTX VSR's output,
 // dlssg.py _recv (uint8 / 255.0, a division, as python and k_unpackBgraRgb)
 __global__ void k_unpackRgba(const unsigned char* __restrict__ src, int dw, int dh,
                              float* __restrict__ dst)
@@ -2564,8 +2554,9 @@ __global__ void k_mvDerive(const short* __restrict__ vec, int vecPitch, int w, i
     dst[(size_t)y * (dstPitch >> 2) + x] =
         (unsigned int)f2h((t1 - t0) * vx) | ((unsigned int)f2h((t1 - t0) * vy) << 16);
 }
-// AMD FSR upscaling: RTX VSR's tight BGRA8 input frame as RGBA8 rows twice, the bridge's (aPitch bytes apart) and the
-// Optical Flow engine's ABGR8 input (bPitch); and the bridge's RGBA8 result (srcPitch) back to tight BGRA8
+// AMD FSR upscaling: its tight BGRA8 input frame as RGBA8 rows twice, the bridge's (aPitch bytes apart) and the Optical
+// Flow engine's ABGR8 input (bPitch); and an RGBA8 frame (srcPitch) as BGRA8 rows dstPitch apart: FSR's result into its
+// tight buffer, RTX VSR's output into a live slot
 __global__ void k_bgraRgbaFsr(const unsigned char* __restrict__ src, int w, int h, unsigned char* __restrict__ a,
                               int aPitch, unsigned char* __restrict__ b, int bPitch)
 {
@@ -2578,13 +2569,14 @@ __global__ void k_bgraRgbaFsr(const unsigned char* __restrict__ src, int w, int 
     *(unsigned int*)(b + (size_t)y * bPitch + 4 * (size_t)x) = q;
 }
 __global__ void k_rgbaBgra(const unsigned char* __restrict__ src, int srcPitch, int w, int h,
-                           unsigned char* __restrict__ dst)
+                           unsigned char* __restrict__ dst, int dstPitch)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const unsigned int p = *(const unsigned int*)(src + (size_t)y * srcPitch + 4 * (size_t)x);
-    ((unsigned int*)dst)[(size_t)y * w + x] = (p & 0xFF00FF00u) | ((p & 0xFFu) << 16) | ((p >> 16) & 0xFFu);
+    *(unsigned int*)(dst + (size_t)y * dstPitch + 4 * (size_t)x) =
+        (p & 0xFF00FF00u) | ((p & 0xFFu) << 16) | ((p >> 16) & 0xFFu);
 }
 // Restore on HDR planes reads the frame's SDR view (hdrToModel, knee 1, head 0: the SDR range exactly, a brighter pixel
 // scaled to white with its hue); the way back = the restored view (sRGB codes, the fold's 0..1) through the sRGB EOTF
@@ -4409,8 +4401,8 @@ struct NativeRife
     // `engine=fruc` with the /64 padded geometry and `NATIVE-PATH fruc=` (the folder holding the
     // shipped nvoffruc_bridge.dll beside the user-installed NvOFFRUC.dll + cudart64_110.dll);
     // this host drives that bridge's flat C API exactly as live_server.py's Fruc class does
-    // through ctypes: the (R, G, B) model planes packed to true BGRA8 at pw x ph (k_packBgraRgb,
-    // the VSR kernel), one bridge call per tween, the BGRA8 result unpacked (k_unpackBgraRgb).
+    // through ctypes: the (R, G, B) model planes packed to true BGRA8 at pw x ph (k_packBgraRgb),
+    // one bridge call per tween, the BGRA8 result unpacked (k_unpackBgraRgb).
     bool fruc = false;
     bool dlssg = false;           // offline DLSS 4.5: no IFNet, a child server
     std::string frucDir;          // the bridge folder the handoff named
@@ -4813,8 +4805,8 @@ struct NativeRife
     float* dFitTmp = nullptr;     // fitAa: the horizontal pass, planar fp32 at dw x (uh or h)
     float* dUp = nullptr;         // Upscale to: the internal render frame, planar fp32 at uw x uh
     float* dUpTmp = nullptr;      // upAa: the horizontal pass of the first resize, planar fp32 at uw x h
-    uint8_t* dVsrIn = nullptr;    // VSR: tight BGRA8 at the source size (srcW x srcH)
-    uint8_t* dVsrOut = nullptr;   // VSR: tight BGRA8 at the presented size dw x dh
+    uint8_t* dVsrIn = nullptr;    // VSR: tight RGBA8 (FSR upscaling: BGRA8) at the source size (srcW x srcH)
+    uint8_t* dVsrOut = nullptr;   // VSR: tight RGBA8 (FSR upscaling: BGRA8) at the presented size dw x dh
     float* dX = nullptr;          // (1,6,ph,pw): prev in planes 0..2, cur in 3..5 (xSwap: the reverse)
     bool xSwap = false;           // live: dX's halves trade roles instead of the cur -> prev copy (nativeXPrev / Cur)
     uint16_t* dXh = nullptr;      // dX in fp16 for the RIFE engines that take fp16 frames (xHalf /
@@ -4892,12 +4884,11 @@ struct NativeRife
     CUfunction fThdrIn = nullptr, fSharpThdrIn = nullptr, fPqOut = nullptr, fPqLut = nullptr, // TrueHDR in, the
         fSdrPq = nullptr;                                                                     // offline PQ emit
     CUfunction fFitPlanar = nullptr, fSharpPlanar = nullptr,                                  // sharpen
-        fPackBgraRgb = nullptr, fUnpackBgraRgb = nullptr,                   // VSR / FRUC: (R, G, B) <-> BGRA8
-        fSwapRB = nullptr,                                                  // VSR: BGRA8 <-> the bridge's RGBA8
+        fPackBgraRgb = nullptr, fUnpackBgraRgb = nullptr,                   // FSR upscaling / FRUC: (R, G, B) <-> BGRA8
         fPackRgbaH = nullptr, fRgbaHAbgr = nullptr, fUnpackRgbaH = nullptr, // FSR frame generation: RGBA16F frames,
         fMvHalf = nullptr, fMvHalfG1 = nullptr, fMvDerive = nullptr,        // the Optical Flow input, the vectors
-        fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr,                        // FSR upscaling: VSR's BGRA8 <-> RGBA8
-        fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,     // offline DLSS 4.5 frames
+        fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr,                    // FSR upscaling: BGRA8 <-> RGBA8; VSR's slot
+        fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr, // offline DLSS 4.5 frames, RTX VSR
         fUnpackR10 = nullptr;
     CUfunction fFitAaH = nullptr, fFitAaV = nullptr, fRsTab = nullptr;        // the separable fit, its tap tables
     CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                   // its vertical pass + the slot store
@@ -7702,7 +7693,6 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fSharpPlanar, "k_sharpPlanar"},
         {&nr.fPackBgraRgb, "k_packBgraRgb"},
         {&nr.fUnpackBgraRgb, "k_unpackBgraRgb"},
-        {&nr.fSwapRB, "k_swapRB"},
         {&nr.fUnpackRgba, "k_unpackRgba"},
         {&nr.fPackR10, "k_packR10"},
         {&nr.fUnpackR10, "k_unpackR10"},
@@ -11230,6 +11220,12 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
     return true;
 }
 
+// the tick the stall watchdog (PipeServer::wdogProc) waits for. The driver compiles FSR's shaders inside a session's first
+// dispatch, per exe location and upscale ratio (47 s measured, a warm-up covers its own ratio only), and that call blocks this
+// thread; a real hang there still ends at kFsrCompileMs, and the watchdog's 10 s start over when it returns
+static volatile LONGLONG g_wdogHold = 0;
+static constexpr int kFsrCompileMs = 180000;
+
 // one frame of the slot's stream: nr.dVsrIn (tight BGRA8 ri) upscaled into nr.dVsrOut (tight BGRA8 ro), queued on st;
 // the frame into the bridge's buffer and the vector session's slot, the vectors from the previous frame's slot (the
 // stream's first frame: zero vectors and a reset), the bridge's queue waits on the stream and the stream on the bridge
@@ -11274,8 +11270,19 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         return false;
     }
     const uint64_t ready = nr.fuVal, done = ++nr.fuVal;
+    // SMV_FSRUP_TEST=hang1 / hang2: that frame's call blocks past the watchdog's bound, the watchdog's trigger
+    static const int testHang = [] {
+        wchar_t v[8]{};
+        return GetEnvironmentVariableW(L"SMV_FSRUP_TEST", v, 8) && wcsncmp(v, L"hang", 4) == 0 ? _wtoi(v + 4) : 0;
+    }();
+    if (first)
+        InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + kFsrCompileMs);
+    if (testHang && nr.fuN + 1 == (uint64_t)testHang)
+        Sleep(kFsrCompileMs + 20000);
     // FSR 4.1.1 gives byte-identical frames at any frame time (measured, harness fsr4_int8_upscaler): one 60 Hz frame
     const int rc = g_fsrup.frame(ready, done, first ? 1 : 0, 1000.0 / 60.0);
+    if (first)
+        InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + 10000);
     if (rc != 0)
     {
         LOG("native: fsr upscale: frame %llu failed: %s (rc %d)\n", (unsigned long long)nr.fuN, g_fsrup.lastError(),
@@ -11285,8 +11292,8 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     }
     cudaExternalSemaphoreWaitParams wp{};
     wp.params.fence.value = done;
-    int op = nr.fuOutPitch;
-    void* b[] = {&nr.dFuOut, &op, &ow, &oh, &nr.dVsrOut};
+    int op = nr.fuOutPitch, otp = ow * 4;
+    void* b[] = {&nr.dFuOut, &op, &ow, &oh, &nr.dVsrOut, &otp};
     if (cudaWaitExternalSemaphoresAsync(&nr.fuSem, &wp, 1, st) != cudaSuccess)
     {
         nr.die("fsr upscale result failed");
@@ -15349,31 +15356,21 @@ static bool nativeOfflinePqOut(NativeRife& nr, const void* src, int half, int ps
 // one RTX VSR eval of nr.dVsrIn into nr.dVsrOut for the work queued on st: through the bridge's event-ordered export
 // when it has one (the thread keeps enqueuing while VSR runs), else (an older bridge, SMV_VSR_SYNC=1) the blocking
 // export between a drain of st and a device-wide sync, because its copies ride the legacy default stream. The bridge
-// takes and returns R, G, B, A bytes: both buffers are swapped from and back to SMV's B, G, R, A on st around the call
+// takes and returns the R, G, B, A bytes both buffers hold
 static bool nativeVsrEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, cudaStream_t st, unsigned int& rv)
 {
     if (nr.fsrUp)
-        return nativeFsrupEval(nr, ri, ro, st, rv); // AMD FSR upscaling holds RTX VSR's resize
+        return nativeFsrupEval(nr, ri, ro, st, rv); // AMD FSR upscaling holds RTX VSR's resize, on B, G, R, A buffers
     static const bool sync = [] {
         wchar_t v[8]{};
         return GetEnvironmentVariableW(L"SMV_VSR_SYNC", v, 8) && v[0] != L'0';
     }();
-    auto swapRB = [&](uint8_t* buf, const RtxRect& r) {
-        unsigned int n = r.right * r.bottom;
-        void* a[] = {&buf, &n};
-        if (cuLaunchKernel(nr.fSwapRB, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) == CUDA_SUCCESS)
-            return true;
-        nr.die("swapRB launch failed");
-        return false;
-    };
-    if (!swapRB(nr.dVsrIn, ri))
-        return false;
     if (g_rtxb.evalVsrAsync && !sync)
     {
         rv = g_rtxb.evalVsrAsync(nr.dVsrIn, nr.dVsrOut, ri, ro, &nr.vsrSet, (void*)st);
         nr.vsrN++;
         nr.vsrAsync = true;
-        return swapRB(nr.dVsrOut, ro);
+        return true;
     }
     if (cudaStreamSynchronize(st) != cudaSuccess)
     {
@@ -15392,7 +15389,7 @@ static bool nativeVsrEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, 
     nr.vsrN++;
     if (ms > nr.vsrMaxMs)
         nr.vsrMaxMs = ms;
-    return swapRB(nr.dVsrOut, ro);
+    return true;
 }
 
 static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& rs, int& srcHalf, bool& staged, int sw,
@@ -15430,8 +15427,8 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
         if (vsrNow)
         {
             void* a[] = {(void*)&src, &srcHalf, (void*)&ps, (void*)&rs, &sw, &sh, &nr.dVsrIn};
-            if (cuLaunchKernel(nr.fPackBgraRgb, (sw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
-                               nullptr) != CUDA_SUCCESS)
+            if (cuLaunchKernel(nr.fsrUp ? nr.fPackBgraRgb : nr.fPackBgra, (sw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1,
+                               0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("packBgraRgb launch failed");
                 return false;
@@ -15452,8 +15449,8 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
         if (haveVsr)
         {
             void* a[] = {&nr.dVsrOut, (void*)&tw, (void*)&th, &nr.dPres};
-            if (cuLaunchKernel(nr.fUnpackBgraRgb, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
-                               nullptr) != CUDA_SUCCESS)
+            if (cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
+                               1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("unpackBgraRgb launch failed");
                 return false;
@@ -16396,8 +16393,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (vsrNow)
         {
             void* a[] = {(void*)&src, &half, (void*)&ps, (void*)&rs, &nr.w, &nr.h, &nr.dVsrIn};
-            if (cuLaunchKernel(nr.fPackBgraRgb, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
-                               nullptr) != CUDA_SUCCESS)
+            if (cuLaunchKernel(nr.fsrUp ? nr.fPackBgraRgb : nr.fPackBgra, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16,
+                               1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("packBgra launch failed");
                 return false;
@@ -16419,10 +16416,16 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
         if (haveVsr && !nr.uw)
         {
-            // the bridge output is the presented frame: into the content rect as it is
-            if (cudaMemcpy2DAsync(slot + (size_t)nr.y0 * nr.pitch + (size_t)nr.x0 * 4, nr.pitch, nr.dVsrOut,
-                                  (size_t)nr.dw * 4, (size_t)nr.dw * 4, nr.dh, cudaMemcpyDeviceToDevice,
-                                  st) != cudaSuccess)
+            // the bridge output is the presented frame: into the content rect, RTX VSR's R, G, B, A as the slot's
+            // B, G, R, A in one pass; AMD FSR upscaling's buffer already holds the slot's order
+            uint8_t* to = slot + (size_t)nr.y0 * nr.pitch + (size_t)nr.x0 * 4;
+            int srcPitch = nr.dw * 4;
+            void* a[] = {&nr.dVsrOut, &srcPitch, &nr.dw, &nr.dh, &to, (void*)&pitchI};
+            const bool ok = nr.fsrUp ? cudaMemcpy2DAsync(to, nr.pitch, nr.dVsrOut, (size_t)nr.dw * 4, (size_t)nr.dw * 4,
+                                                         nr.dh, cudaMemcpyDeviceToDevice, st) == cudaSuccess
+                                     : cuLaunchKernel(nr.fRgbaBgra, (nr.dw + 15) / 16, (nr.dh + 15) / 16, 1, 16, 16, 1,
+                                                      0, (CUstream)st, a, nullptr) == CUDA_SUCCESS;
+            if (!ok)
             {
                 nr.die("VSR slot copy failed");
                 return false;
@@ -16434,8 +16437,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (haveVsr)
         {
             void* a[] = {&nr.dVsrOut, (void*)&tw, (void*)&th, &stage};
-            if (cuLaunchKernel(nr.fUnpackBgraRgb, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
-                               nullptr) != CUDA_SUCCESS)
+            if (cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
+                               1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("unpackBgra launch failed");
                 return false;

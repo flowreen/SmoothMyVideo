@@ -1174,8 +1174,9 @@ function liveRestoreMouse(sync: boolean) {
 }
 
 // AMD FSR 4's first session after a driver update waits while the driver compiles FSR's shaders (frame generation
-// ~15 s for vkd3d-proton's Vulkan pipelines, the upscaler ~28 s in D3D12), at any size; the driver's own cache keeps
-// them after. While an FSR route is picked (the model, the upscale box) the renderer asks for a warm-up: ONE tiny
+// ~15 s for vkd3d-proton's Vulkan pipelines at any size, the upscaler ~47 s in D3D12 per exe location and upscale ratio); the
+// driver's own cache keeps them after. A Live session at another ratio compiles in its first frame, with the host's
+// stall watchdog held for it. While an FSR route is picked (the model, the upscale box) the renderer asks for a warm-up: ONE tiny
 // offline session of the picked routes (2 black 320x180 frames, the upscaler to 640x360) in a below-normal host, once
 // per driver and FSR build: the route keys in the model cache's fsr4_warm.txt (emptied with the cache, ~1 s to redo).
 const FSR_WARM_W = 320;
