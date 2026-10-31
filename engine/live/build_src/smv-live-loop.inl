@@ -2210,6 +2210,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         double thrBudget = 0.95; // the share of the source's interval a group's GPU work may take
         double thrProbeGapMs = 4000.0, thrProbeLast = 0; // at the floor: the next tween re-measure (4 .. 60 s)
         bool thrProbing = false;
+        // a re-measure leaves the floor only once kThrProbeWins consecutive windows afford a tween: on a power-capped
+        // GPU the first half second of load after seconds at the floor runs at a boosted clock and reads "fits" for
+        // work that does not fit sustained (a 55 W cap: 1.1-1.7 tweens a pair in the first window, the floor in the
+        // next, so the gap never grew and a re-measure stuttered every 5 s); one floor answer ends the re-measure
+        uint32_t thrProbeWins = 0; // windows the running re-measure has answered "fits"
+        const uint32_t kThrProbeWins = 2;
         bool thrFloor = false; // the throttle's floor: every pair carries its real frame alone (sendPairStream)
         double thrDropEma = 0; // drops a second, smoothed over the 500 ms windows (~2 s)
         double thrMoveT = 0;   // when the target last moved: drops within 2 s of it are the move's, not the budget's
@@ -3530,7 +3536,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // real frames alone (thrFloor, read by sendPairStream). The drops keep the budget honest
             // (other work on the GPU, a bridge's own context outside the timed stream): drops above kXqDropRate a
             // second, smoothed over ~2 s, take a tenth off it (not at the floor), 5 clean seconds give 2 points back. At the floor the
-            // tween is re-timed by one window up after 4 s, doubling to 60 s while it keeps answering "the floor". A
+            // tween is re-timed one window up after 4 s, over kThrProbeWins consecutive windows (the boosted first
+            // window of a power-capped GPU, above), the gap doubling to 60 s while any window answers "the floor". A
             // pause or a static hold starts the window over; before any tween is timed the start target stands.
             auto xqThrottle = [&](double tn) {
                 if (g_noGpuFit || !(adaptTarget > 0 && !hidden && !nextIdleTick && emaDt > 0))
@@ -3610,9 +3617,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     next = m >= 1.0 ? m * srcFps : srcFps;
                     const bool floor = m < 1.0;
                     thrFloor = floor;
-                    if (thrProbing)
+                    if (thrProbing && !floor && ++thrProbeWins < kThrProbeWins)
                     {
-                        thrProbing = false; // the window just timed fresh tweens: the model above read them
+                        // the window timed fresh tweens that fit: one more window at the re-measure's target before
+                        // the floor is left (the boosted first window, above)
+                        next = srcFps * 1.1;
+                    }
+                    else if (thrProbing)
+                    {
+                        thrProbing = false; // the windows timed fresh tweens: the model above read them
                         thrProbeGapMs = floor ? (std::min)(60000.0, thrProbeGapMs * 2.0) : 4000.0;
                         thrProbeLast = tn;
                     }
@@ -3627,6 +3640,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     {
                         next = srcFps * 1.1;
                         thrProbing = true;
+                        thrProbeWins = 0;
                         thrFloor = false;
                     }
                 }
