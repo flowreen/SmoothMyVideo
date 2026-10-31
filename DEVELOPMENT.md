@@ -2140,9 +2140,10 @@ shared COMMON buffers (RGBA8 frame, RG16F vectors, RGBA8 result; in the HDR mode
 shared fence as NT handles; `fsrup_frame(wait, signal, reset, frameTimeMs)`: the queue waits, copies, upscales
 (non-linear sRGB, or in the HDR mode linear light under FSR's high dynamic range flag; constant depth 0.5, no jitter,
 sharpening off), copies the result out and signals; `fsrup_destroy`, `fsrup_last_error`. The host feeds it RTX VSR's
-BGRA8 buffers through two byte-swap kernels (on HDR planes the frame in linear light through `k_fsrHdrIn`, the result
-back to the PQ codes through `k_fsrHdrOut`, the SDR view only for the vectors) and computes the vectors with the FSR
-FG route's Optical Flow session.
+BGRA8 buffers through two byte-swap kernels (on HDR planes one pass, `k_fsrHdrPack`, writes both the SDR view the
+vectors read and the frame in linear light for the bridge from one read of the planes; the result comes back to the
+PQ codes through `k_fsrHdrOut`; the live pre-model call, whose stored view Restore reads first, keeps `k_fsrHdrIn` on
+the frame) and computes the vectors with the FSR FG route's Optical Flow session.
 
 ### DLSS 4.5 Frame Generation host (`dlssg2f.exe`)
 

@@ -2625,6 +2625,34 @@ __global__ void k_fsrHdrOut(const unsigned char* __restrict__ src, int srcPitch,
     dst[plane + o] = q[1];
     dst[2 * plane + o] = q[2];
 }
+// AMD FSR upscaling on HDR planes in one pass over the frame: the frame's SDR view (hdrToModel, knee 1, head 0) packed
+// to the vectors' BGRA8 (k_hdrEnc's view then k_packBgraRgb's bytes, the fp32 view never stored) and the codes in
+// linear light into the bridge's FP16 buffer (k_fsrHdrIn's halves): one read of the planes in place of three
+__global__ void k_fsrHdrPack(const void* __restrict__ src, int half, int planeStride, int rowStride, int w, int h,
+                             int mode, float white, float scale, int hlg, unsigned char* __restrict__ view,
+                             unsigned char* __restrict__ dst, int dstPitch)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t o = (size_t)y * rowStride + x;
+    float v[3] = { ldS(src, half, o), ldS(src, half, planeStride + o), ldS(src, half, 2 * planeStride + o) };
+    float s[3] = { v[0], v[1], v[2] };
+    hdrToModel(s, mode, white, 1.0f, 0.0f);
+    unsigned char* b = view + ((size_t)y * w + x) * 4;
+    for (int ci = 0; ci < 3; ci++)
+    {
+        const float c = s[ci] < 0.0f ? 0.0f : (s[ci] > 1.0f ? 1.0f : s[ci]);
+        b[2 - ci] = (unsigned char)(int)rintf(c * 255.0f);
+    }
+    b[3] = 255;
+    unsigned short* p = (unsigned short*)(dst + (size_t)y * dstPitch) + 4 * (size_t)x;
+    if (hlg) hlg2020_to_pq2020(v[0], v[1], v[2], v[0], v[1], v[2]);
+    p[0] = f2h(pq_eotf(v[0]) * scale);
+    p[1] = f2h(pq_eotf(v[1]) * scale);
+    p[2] = f2h(pq_eotf(v[2]) * scale);
+    p[3] = f2h(1.0f);
+}
 // Restore on HDR planes reads the frame's SDR view (hdrToModel, knee 1, head 0: the SDR range exactly, a brighter pixel
 // scaled to white with its hue); the way back = the restored view (sRGB codes, the fold's 0..1) through the sRGB EOTF
 // plus the light the view never held (ref's light minus its view: above white, below 0), times white, to the BT.2020
@@ -4941,10 +4969,10 @@ struct NativeRife
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr, fOddEdge = nullptr, // FSR upscaling: BGRA8 <-> RGBA8; VSR's slot
         fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,  // offline DLSS 4.5 frames, RTX VSR
         fUnpackR10 = nullptr;
-    CUfunction fFitAaH = nullptr, fFitAaV = nullptr, fRsTab = nullptr;        // the separable fit, its tap tables
-    CUfunction fFsrHdrIn = nullptr, fFsrHdrOut = nullptr;                     // AMD FSR upscaling on HDR planes
-    CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                   // its vertical pass + the slot store
-    CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr, // live Restore
+    CUfunction fFitAaH = nullptr, fFitAaV = nullptr, fRsTab = nullptr;           // the separable fit, its tap tables
+    CUfunction fFsrHdrIn = nullptr, fFsrHdrOut = nullptr, fFsrHdrPack = nullptr; // AMD FSR upscaling on HDR planes
+    CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                      // its vertical pass + the slot store
+    CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr,    // live Restore
         fRestToF = nullptr, fClamp01 = nullptr;
     CUfunction fPadPlanar = nullptr; // the decoded frame into the model frame
     CUfunction fNrIn = nullptr, fNrOut = nullptr, fNrMv = nullptr, fNrMvClear = nullptr; // DLSS 5
@@ -7752,6 +7780,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fFitAaV, "k_fitAaV"},
         {&nr.fFsrHdrIn, "k_fsrHdrIn"},
         {&nr.fFsrHdrOut, "k_fsrHdrOut"},
+        {&nr.fFsrHdrPack, "k_fsrHdrPack"},
         {&nr.fRsTab, "k_rsTab"},
         {&nr.fPackOutV, "k_packOutV"},
         {&nr.fPackOutHdrV, "k_packOutHdrV"},
@@ -15531,9 +15560,11 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
             // HDR video (enc: src holds the codes, restored or not): RTX VSR takes SDR, so it reads the frame's SDR
             // view (knee 1, head 0) and comes back to the codes below; AMD FSR upscaling takes the codes in linear
             // light (k_fsrHdrIn) and the view feeds only its vectors, as live's planes and view do
+            // (HDR video through AMD FSR upscaling: the view and the linear frame in ONE pass over the codes, below)
+            const bool onePass = enc && nr.fuHdr;
             const void* vsrSrc = src;
             int vHalf = srcHalf, vps = ps, vrs = rs;
-            if (enc)
+            if (enc && !onePass)
             {
                 if (!nativeHdrEnc(nr, src, srcHalf, ps, rs, sw, sh, nr.dVsrView, 0, sw * sh, sw, enc, 1.0f, 0.0f))
                 {
@@ -15546,13 +15577,27 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
                 vrs = sw;
             }
             void* a[] = {(void*)&vsrSrc, &vHalf, &vps, &vrs, &sw, &sh, &nr.dVsrIn};
-            if (cuLaunchKernel(nr.fsrUp ? nr.fPackBgraRgb : nr.fPackBgra, (sw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1,
-                               0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+            if (!onePass && cuLaunchKernel(nr.fsrUp ? nr.fPackBgraRgb : nr.fPackBgra, (sw + 15) / 16, (sh + 15) / 16, 1,
+                                           16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("packBgraRgb launch failed");
                 return false;
             }
-            if (nr.fuHdr)
+            if (onePass)
+            {
+                // the SDR view packed for the vectors (k_hdrEnc + k_packBgraRgb's bytes) and the codes in linear
+                // light for the bridge (k_fsrHdrIn's halves) from one read of the frame (k_fsrHdrPack)
+                const float scale = 125.0f / nr.encWhite;
+                void* f[] = {(void*)&src,  &srcHalf,      &ps,         &rs,        &sw,       &sh,          (void*)&enc,
+                             &nr.encWhite, (void*)&scale, (void*)&hlg, &nr.dVsrIn, &nr.dFuIn, &nr.fuInPitch};
+                if (cuLaunchKernel(nr.fFsrHdrPack, (sw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, f,
+                                   nullptr) != CUDA_SUCCESS)
+                {
+                    nr.die("FSR HDR pack launch failed");
+                    return false;
+                }
+            }
+            else if (nr.fuHdr)
             {
                 // AMD FSR upscaling on HDR planes: the frame in linear light into the bridge's buffer. Live hands the
                 // planes (pl, the SDR view src came from; after Restore on the view, the restored view goes back to
@@ -16633,21 +16678,40 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (vsrNow)
         {
             // HDR planes: RTX VSR takes SDR, so it reads the frame's SDR view; the way back to the codes is below
+            // (HDR planes through AMD FSR upscaling: the view and the linear frame in ONE pass over the planes, below)
+            const bool onePass = nr.hdr && nr.fuHdr;
             const void* vsrSrc = nr.hdr ? (const void*)nr.dVsrView : src;
             int vHalf = nr.hdr ? 0 : half, vps = nr.hdr ? nr.w * nr.h : ps, vrs = nr.hdr ? nr.w : rs;
-            if (nr.hdr && !nativeHdrEnc(nr, src, half, ps, rs, nr.w, nr.h, nr.dVsrView, 0, vps, vrs, 1, 1.0f, 0.0f))
+            if (nr.hdr && !onePass &&
+                !nativeHdrEnc(nr, src, half, ps, rs, nr.w, nr.h, nr.dVsrView, 0, vps, vrs, 1, 1.0f, 0.0f))
             {
                 nr.die("VSR SDR view launch failed");
                 return false;
             }
             void* a[] = {(void*)&vsrSrc, &vHalf, (void*)&vps, (void*)&vrs, &nr.w, &nr.h, &nr.dVsrIn};
-            if (cuLaunchKernel(nr.fsrUp ? nr.fPackBgraRgb : nr.fPackBgra, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16,
-                               1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+            if (!onePass && cuLaunchKernel(nr.fsrUp ? nr.fPackBgraRgb : nr.fPackBgra, (nr.w + 15) / 16,
+                                           (nr.h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("packBgra launch failed");
                 return false;
             }
-            if (nr.fuHdr)
+            if (onePass)
+            {
+                // the SDR view packed for the vectors (k_hdrEnc + k_packBgraRgb's bytes) and the planes in linear
+                // light for the bridge (k_fsrHdrIn's halves) from one read of the frame (k_fsrHdrPack); the way back
+                // is k_fsrHdrOut below
+                const float scale = 125.0f / nr.encWhite;
+                int mode = 1, hlg = nr.encPost == 2 ? 1 : 0;
+                void* f[] = {(void*)&src,  &half,         (void*)&ps, (void*)&rs, &nr.w,     &nr.h,        &mode,
+                             &nr.encWhite, (void*)&scale, &hlg,       &nr.dVsrIn, &nr.dFuIn, &nr.fuInPitch};
+                if (cuLaunchKernel(nr.fFsrHdrPack, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, f,
+                                   nullptr) != CUDA_SUCCESS)
+                {
+                    nr.die("FSR HDR pack launch failed");
+                    return false;
+                }
+            }
+            else if (nr.fuHdr)
             {
                 // AMD FSR upscaling on HDR planes: the frame in linear light into the bridge's buffer (the view above
                 // feeds the vectors only); the way back is k_fsrHdrOut below
