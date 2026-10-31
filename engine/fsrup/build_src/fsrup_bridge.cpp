@@ -5,8 +5,9 @@
 // fence (an external semaphore), so the GPU waits on the GPU: the host writes the frame and its motion vectors, signals
 // `wait`; the bridge's queue waits for it, copies the buffers into textures, runs the upscale, copies the result out and
 // signals `signal`. One context; every call upscales the next frame of one continuous stream.
-// Formats: frames RGBA8 UNORM (sRGB-encoded); motion vectors RG16F in render-size pixels, current -> previous; depth = a
-// constant (no depth in video); no jitter.
+// Formats: frames RGBA8 UNORM (sRGB-encoded), or in the HDR mode (hdr) FP16 RGBA linear light with SDR white at 1.0 (FSR's
+// high dynamic range flag, no colour-space flag); motion vectors RG16F in render-size pixels, current -> previous; depth
+// = a constant (no depth in video); no jitter.
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -25,9 +26,9 @@
 
 struct FsrupShared
 {
-    HANDLE in;    // the render-size frame, RGBA8, inPitch bytes a row
+    HANDLE in;    // the render-size frame, RGBA8 (FP16 RGBA in the HDR mode), inPitch bytes a row
     HANDLE mv;    // RG16F motion vectors at the render size, mvPitch bytes a row
-    HANDLE out;   // the upscaled frame, RGBA8, outPitch bytes a row
+    HANDLE out;   // the upscaled frame, RGBA8 (FP16 RGBA in the HDR mode), outPitch bytes a row
     HANDLE fence; // the shared fence both sides wait on / signal
     uint64_t inBytes, mvBytes, outBytes;
     uint32_t inPitch, mvPitch, outPitch;
@@ -63,6 +64,7 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3
 struct State
 {
     bool live = false;
+    bool hdr = false; // the HDR mode: FP16 linear-light frames, FSR's high dynamic range flag
     uint32_t w = 0, h = 0, ow = 0, oh = 0;
     HMODULE loader = nullptr;
     ffxFunctions ffx = {};
@@ -298,10 +300,10 @@ FSRUP_API const char* fsrup_last_error()
 }
 
 // the upscaler context w x h -> ow x oh on the adapter with this LUID, the first upscaler version whose name starts with
-// `want` (e.g. "4."). Fills *sh (the handles stay owned by the bridge until fsrup_destroy). 0 = ok, < 0 =
-// fsrup_last_error.
+// `want` (e.g. "4."); hdr = the HDR mode (FP16 linear-light frames in and out, FSR's high dynamic range flag), else
+// RGBA8 sRGB. Fills *sh (the handles stay owned by the bridge until fsrup_destroy). 0 = ok, < 0 = fsrup_last_error.
 FSRUP_API int fsrup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t luidLow, int32_t luidHigh,
-                           const char* want, FsrupShared* sh)
+                           const char* want, int hdr, FsrupShared* sh)
 {
     if (!sh || !w || !h || !ow || !oh || !want)
         return fail("bad arguments"), -1;
@@ -310,6 +312,7 @@ FSRUP_API int fsrup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uin
         destroy(s);
     if (!loadLoader(s))
         return -2;
+    s.hdr = hdr != 0;
     s.w = w;
     s.h = h;
     s.ow = ow;
@@ -347,10 +350,11 @@ FSRUP_API int fsrup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uin
         FAILED(hr = s.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.priv))))
         return destroy(s), fail("fence creation failed", hr), -8;
 
-    s.color = texture(s.dev, DXGI_FORMAT_R8G8B8A8_UNORM, w, h, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const DXGI_FORMAT cf = s.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    s.color = texture(s.dev, cf, w, h, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     s.motion = texture(s.dev, DXGI_FORMAT_R16G16_FLOAT, w, h, false, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     s.depth = texture(s.dev, DXGI_FORMAT_R32_FLOAT, w, h, false, D3D12_RESOURCE_STATE_COPY_DEST);
-    s.out = texture(s.dev, DXGI_FORMAT_R8G8B8A8_UNORM, ow, oh, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.out = texture(s.dev, cf, ow, oh, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (!s.color || !s.motion || !s.depth || !s.out)
         return destroy(s), fail("texture creation failed"), -9;
     UINT64 inBytes = 0, mvBytes = 0, outBytes = 0;
@@ -459,7 +463,7 @@ FSRUP_API int fsrup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uin
     ffxCreateContextDescUpscale create = {};
     create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     create.header.pNext = &ver.header;
-    create.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+    create.flags = s.hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
     create.maxRenderSize = {w, h};
     create.maxUpscaleSize = {ow, oh};
     if (s.ffx.CreateContext(&s.ctx, &create.header, nullptr) != FFX_API_RETURN_OK)
@@ -514,7 +518,7 @@ FSRUP_API int fsrup_frame(uint64_t waitValue, uint64_t signalValue, int reset, d
     up.cameraFar = 1000.0f;
     up.cameraFovAngleVertical = 1.0f;
     up.viewSpaceToMetersFactor = 1.0f;
-    up.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+    up.flags = s.hdr ? 0 : FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
     if (s.ffx.Dispatch(&s.ctx, &up.header) != FFX_API_RETURN_OK)
         return l->Close(), fail("ffxDispatch(upscale) failed"), -4;
 

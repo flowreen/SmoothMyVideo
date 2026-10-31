@@ -534,9 +534,14 @@ Passes, in this order (both modes): on each source or captured frame Restore, th
 resize to the working size (the DLSS mode's share of the output, live of the presented size), DLSS 5,
 Adaptive Sharpen and RTX TrueHDR (SDR to HDR10); then the interpolation at the working size on those
 finished frames, so frame generation comes last and the generated frames inherit the sharpen and the
-HDR; then on every output or presented frame the final resize. RTX VSR takes SDR only, so with RTX HDR
-on it can take only the resize before the model and the one after it is Lanczos (a log line says
-so). The order follows NVIDIA's documents: DLSS Frame Generation generates from the finished,
+HDR; then on every output or presented frame the final resize. RTX VSR takes SDR only, so offline with
+RTX HDR on it can take only the resize before the model and the one after it is Lanczos (a log line
+says so). Live on HDR planes it reads the frame's SDR view and comes back through the sRGB EOTF, a
+frame with light outside the view adding it from the frame's Lanczos fit, Restore's way back
+(`SMV_VSR_HDR=0` = Lanczos there). AMD FSR 4 upscaling takes HDR itself: on HDR planes the bridge runs in its HDR
+mode, the frame handed over as linear light (FP16, SDR white at 1.0, FSR's high dynamic range flag) and taken back to
+the codes, highlights included (`SMV_FSRUP_HDR=0` = Lanczos there); with RTX HDR on and the resize before the model it
+takes the SDR planes, the upscale then TrueHDR. The order follows NVIDIA's documents: DLSS Frame Generation generates from the finished,
 tone-mapped (HDR-encoded) image, the RTX Video SDK runs TrueHDR after VSR, and sharpening is
 post-processing after the upscaler (NIS).
 
@@ -610,9 +615,15 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, which opens the upscaler's GPU gate (see "AMD FSR
   upscaling bridge"), every frame of that resize's stream in order (the first resets), its motion vectors from
   NVIDIA optical flow (one direction, the slow perf level, grid 1), a constant depth, no jitter; RTX VSR's
-  rules hold (SDR only, enlarging only, one resize). AMD's FSR 4.1.2 is deterministic: the host's frames equal
-  AMD's own run (with the same gate opened) on the same frames byte for byte (harness
-  `fsr_framegen\host\fsrup_gate.py`). On the measured anime clips (480p -> 1080p, frames 4+) it scored the best
+  rules hold (enlarging only, one resize). On HDR planes (Live on an HDR desktop) and on HDR video (`--src-hdr pq|hlg`,
+  the offline render's PQ / HLG codes at either resize) it runs in the bridge's HDR mode (linear light in and out; an
+  HLG picture as PQ on BT.2100's reference display and back), where RTX VSR, which takes SDR only, reads the frame's SDR
+  view and comes back to the codes after it: a frame inside the SDR range through the view's way back, any other with
+  the light the view never held from the frame's Lanczos fit (the session line says `on the HDR video's SDR view`).
+  AMD's FSR 4.1.2 is deterministic at 854x480 -> 1920x1080: the host's frames equal AMD's own run (with the same gate
+  opened) on the same frames byte for byte. At an exact 2x (854x480 -> 1708x960) AMD's own run itself differs from run
+  to run in the right third of the picture, so a gate at such a ratio compares against two runs of one build instead of
+  a byte match. On the measured anime clips (480p -> 1080p, frames 4+) it scored the best
   PSNR of the upscalers (Tsuihou 32.6 dB vs RTX VSR 29.6 / Lanczos3 30.1 / FSR 3.1.5 31.5; dragon 35.3 vs 34.0 /
   33.9 / 34.5), LPIPS Tsuihou 0.127 (0.124 / 0.169 / 0.176), dragon 0.118 (0.120 / 0.116 / 0.134) (harness
   `fsr4_int8_upscaler\score_steady.py`). Its first session after a driver update spends ~30 s while the driver
@@ -1021,7 +1032,8 @@ How the server route works:
   rect), even, at least 64 px and at most the presented rect a side, capped at 3840x2160 keeping the
   aspect; DLAA = the presented rect
   (window mode: the capture, odd sizes kept). Restore, the resize to it (Lanczos either way; Fill at
-  DLAA enlarges here), DLSS 5, Sharpen, RTX HDR and the model run at it, the fit takes it to the canvas;
+  DLAA enlarges here), DLSS 5, Sharpen, RTX HDR and the model run at it, the fit takes it to the whole
+  presented rect (each axis on its own: the even rounding can miss the aspect by under 1 %);
   echo follows it too. RTX VSR takes ONE resize: the fit when it enlarges, else the capture to the
   working size before the model (offline's pre-model stage, Restore folded back to the capture size
   first); `native: live working size WxH = DLSS mode M of the WxH presented, capture WxH` names it. A
@@ -1806,6 +1818,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_HDR_MODEL_ENC=0` / `SMV_GMFSS_SDR_PAIRS=0` | on HDR planes GMFSS, Restore and Sharpen read the PQ / HLG codes as they are instead of their SDR view / GMFSS runs every frame pair as one outside the SDR range (the pictures, the motion nets on the motion view); A/B levers, never product settings |
 | `SMV_HDR_SHARPEN_VIEW=0` | on HDR planes Sharpen runs on the PQ / HLG codes instead of their SDR view (SDR content then leaves the SDR range, so no SDR pair forms with Sharpen on); A/B lever, never a product setting |
 | `SMV_HDR_RESIZE_VIEW=0` | on HDR planes the resize to the working size and Restore's reference run on the PQ / HLG codes for every frame instead of an SDR-range frame's SDR view (its ringing then crosses white and its pairs leave the SDR range); A/B lever, never a product setting |
+| `SMV_VSR_HDR=0` / `SMV_FSRUP_HDR=0` | on HDR planes (live) and HDR video (`--src-hdr`): Lanczos instead of RTX VSR on the frame's SDR view / instead of AMD FSR upscaling in its HDR mode; the refusal triggers of their gates |
 | `SMV_TWEEN_FP16=1` | RIFE and DRBA store their tweens in fp16 (`k_rifeBlend`) instead of fp32 (`k_rifeBlendF`), half the tween buffer and a second rounding (about 9 % of 10-bit codes one off); the host logs `RIFE's tweens are stored in fp16`; A/B lever, never a product setting |
 | `SMV_VSR_SYNC=1` | RTX VSR runs through the bridge's blocking export (a drain of the stream before each call, a device-wide sync after it) instead of the event-ordered one, and the host times each call (`RTX VSR eval N ms mean`); the same path an older bridge without the async export takes; A/B lever, never a product setting |
 | `SMV_VRAM_MIB=<MiB>` | the GPU's memory as the app's memory checks see it, the free memory shrinks with it (both routes): a smaller card's trigger test of the cap and of the `video memory ran out` line on a card everything fits in |
@@ -2120,13 +2133,16 @@ the RTX 5090 (harness `fsr_sdk_bump\fp8_up\fp8_probe.py`, `up412_probe.py`): ~1.
 1920x1080, two processes byte for byte, the RX 6000 variant 52-61 dB from it at the same PSNR to the truth; the FP8
 model does not run on NVIDIA (on vkd3d-proton's FP8 emulation its shaders lose the device).
 
-`fsrup_create(w, h, ow, oh, luidLow, luidHigh, want, FsrupShared*)`: a D3D12 device on the adapter with the CUDA
+`fsrup_create(w, h, ow, oh, luidLow, luidHigh, want, hdr, FsrupShared*)`: a D3D12 device on the adapter with the CUDA
 device's LUID, the first upscaler version whose name starts with `want` (the host asks for "4."; with the gate open
 AMD's DLL offers 4.1.2, 3.1.6 and 2.3.4), three
-shared COMMON buffers (RGBA8 frame, RG16F vectors, RGBA8 result) and a shared fence as NT handles; `fsrup_frame(wait,
-signal, reset, frameTimeMs)`: the queue waits, copies, upscales (non-linear sRGB, constant depth 0.5, no jitter,
+shared COMMON buffers (RGBA8 frame, RG16F vectors, RGBA8 result; in the HDR mode FP16 RGBA frame and result) and a
+shared fence as NT handles; `fsrup_frame(wait, signal, reset, frameTimeMs)`: the queue waits, copies, upscales
+(non-linear sRGB, or in the HDR mode linear light under FSR's high dynamic range flag; constant depth 0.5, no jitter,
 sharpening off), copies the result out and signals; `fsrup_destroy`, `fsrup_last_error`. The host feeds it RTX VSR's
-BGRA8 buffers through two byte-swap kernels and computes the vectors with the FSR FG route's Optical Flow session.
+BGRA8 buffers through two byte-swap kernels (on HDR planes the frame in linear light through `k_fsrHdrIn`, the result
+back to the PQ codes through `k_fsrHdrOut`, the SDR view only for the vectors) and computes the vectors with the FSR
+FG route's Optical Flow session.
 
 ### DLSS 4.5 Frame Generation host (`dlssg2f.exe`)
 

@@ -2565,8 +2565,18 @@ __global__ void k_bgraRgbaFsr(const unsigned char* __restrict__ src, int w, int 
     if (x >= w || y >= h) return;
     const unsigned int p = ((const unsigned int*)src)[(size_t)y * w + x];
     const unsigned int q = (p & 0xFF00FF00u) | ((p & 0xFFu) << 16) | ((p >> 16) & 0xFFu); // bytes 0 and 2 swapped
-    *(unsigned int*)(a + (size_t)y * aPitch + 4 * (size_t)x) = q;
+    if (a) *(unsigned int*)(a + (size_t)y * aPitch + 4 * (size_t)x) = q; // null on HDR planes (k_fsrHdrIn's frame)
     *(unsigned int*)(b + (size_t)y * bPitch + 4 * (size_t)x) = q;
+}
+// an odd output's last column and row, which AMD FSR upscaling leaves untouched: a copy of their neighbours (tight
+// 32-bit pixels, w x h)
+__global__ void k_oddEdge(unsigned int* dst, int w, int h)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const int sx = (w & 1) && x == w - 1 ? x - 1 : x, sy = (h & 1) && y == h - 1 ? y - 1 : y;
+    if (sx != x || sy != y) dst[(size_t)y * w + x] = dst[(size_t)sy * w + sx];
 }
 __global__ void k_rgbaBgra(const unsigned char* __restrict__ src, int srcPitch, int w, int h,
                            unsigned char* __restrict__ dst, int dstPitch)
@@ -2577,6 +2587,43 @@ __global__ void k_rgbaBgra(const unsigned char* __restrict__ src, int srcPitch, 
     const unsigned int p = *(const unsigned int*)(src + (size_t)y * srcPitch + 4 * (size_t)x);
     *(unsigned int*)(dst + (size_t)y * dstPitch + 4 * (size_t)x) =
         (p & 0xFF00FF00u) | ((p & 0xFFu) << 16) | ((p >> 16) & 0xFFu);
+}
+// ---- AMD FSR upscaling on HDR planes: the bridge's HDR mode takes linear light (FP16 RGBA), so the PQ codes go in
+// through the PQ EOTF per channel with SDR white at 1.0 (BT.2020 light as it is: no matrix, nothing clipped; scale =
+// 10000 nits over SDR white) and come back through the inverse; an HLG picture (offline HLG video) goes as PQ on
+// BT.2100's reference display first and comes back through the exact inverse (k_packR10's rule). The output's odd
+// last column / row, which the upscaler leaves untouched, read their neighbours (k_oddEdge's rule). ----
+__global__ void k_fsrHdrIn(const void* __restrict__ src, int half, int planeStride, int rowStride, int w, int h,
+                           float scale, int hlg, unsigned char* __restrict__ dst, int dstPitch)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    unsigned short* p = (unsigned short*)(dst + (size_t)y * dstPitch) + 4 * (size_t)x;
+    const size_t o = (size_t)y * rowStride + x;
+    float v[3] = { ldS(src, half, o), ldS(src, half, planeStride + o), ldS(src, half, 2 * planeStride + o) };
+    if (hlg) hlg2020_to_pq2020(v[0], v[1], v[2], v[0], v[1], v[2]);
+    p[0] = f2h(pq_eotf(v[0]) * scale);
+    p[1] = f2h(pq_eotf(v[1]) * scale);
+    p[2] = f2h(pq_eotf(v[2]) * scale);
+    p[3] = f2h(1.0f);
+}
+__global__ void k_fsrHdrOut(const unsigned char* __restrict__ src, int srcPitch, int w, int h, float inv, int hlg,
+                            float* __restrict__ dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const int sx = (w & 1) && x == w - 1 ? x - 1 : x, sy = (h & 1) && y == h - 1 ? y - 1 : y;
+    const unsigned short* p = (const unsigned short*)(src + (size_t)sy * srcPitch) + 4 * (size_t)sx;
+    const size_t plane = (size_t)w * h;
+    const size_t o = (size_t)y * w + x;
+    float q[3] = { pq_oetf(fmaxf(h2f(p[0]), 0.0f) * inv), pq_oetf(fmaxf(h2f(p[1]), 0.0f) * inv),
+                   pq_oetf(fmaxf(h2f(p[2]), 0.0f) * inv) };
+    if (hlg) pq2020_to_hlg2020(q[0], q[1], q[2], q[0], q[1], q[2]);
+    dst[o] = q[0];
+    dst[plane + o] = q[1];
+    dst[2 * plane + o] = q[2];
 }
 // Restore on HDR planes reads the frame's SDR view (hdrToModel, knee 1, head 0: the SDR range exactly, a brighter pixel
 // scaled to white with its hue); the way back = the restored view (sRGB codes, the fold's 0..1) through the sRGB EOTF
@@ -4559,6 +4606,7 @@ struct NativeRife
     // through shared buffers + one fence like FSR FG's; every frame of the slot's stream is fed in order (the first
     // resets), its vectors from the previous one (fuOf, the two input slots alternate)
     bool fsrUp = false;
+    bool fuHdr = false; // live HDR planes: the bridge in its HDR mode (linear light; off with RTX HDR before the model)
     std::string fsrUpDir;
     cudaExternalMemory_t fuEmIn = nullptr, fuEmMv = nullptr, fuEmOut = nullptr;
     uint8_t* dFuIn = nullptr;
@@ -4807,6 +4855,9 @@ struct NativeRife
     float* dUpTmp = nullptr;      // upAa: the horizontal pass of the first resize, planar fp32 at uw x h
     uint8_t* dVsrIn = nullptr;    // VSR: tight RGBA8 (FSR upscaling: BGRA8) at the source size (srcW x srcH)
     uint8_t* dVsrOut = nullptr;   // VSR: tight RGBA8 (FSR upscaling: BGRA8) at the presented size dw x dh
+    float* dVsrView = nullptr;    // live HDR planes: the SDR view RTX VSR reads, planar fp32 at its input size
+    float* dVsrRem = nullptr;     // live HDR planes: the Lanczos fit at VSR's target (k_hdrRestOut's remainder)
+    unsigned hdrInBits = 0;       // live HDR planes: one bit a capture, newest lowest: it stayed inside the SDR range
     float* dX = nullptr;          // (1,6,ph,pw): prev in planes 0..2, cur in 3..5 (xSwap: the reverse)
     bool xSwap = false;           // live: dX's halves trade roles instead of the cur -> prev copy (nativeXPrev / Cur)
     uint16_t* dXh = nullptr;      // dX in fp16 for the RIFE engines that take fp16 frames (xHalf /
@@ -4887,10 +4938,11 @@ struct NativeRife
         fPackBgraRgb = nullptr, fUnpackBgraRgb = nullptr,                   // FSR upscaling / FRUC: (R, G, B) <-> BGRA8
         fPackRgbaH = nullptr, fRgbaHAbgr = nullptr, fUnpackRgbaH = nullptr, // FSR frame generation: RGBA16F frames,
         fMvHalf = nullptr, fMvHalfG1 = nullptr, fMvDerive = nullptr,        // the Optical Flow input, the vectors
-        fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr,                    // FSR upscaling: BGRA8 <-> RGBA8; VSR's slot
-        fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr, // offline DLSS 4.5 frames, RTX VSR
+        fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr, fOddEdge = nullptr, // FSR upscaling: BGRA8 <-> RGBA8; VSR's slot
+        fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,  // offline DLSS 4.5 frames, RTX VSR
         fUnpackR10 = nullptr;
     CUfunction fFitAaH = nullptr, fFitAaV = nullptr, fRsTab = nullptr;        // the separable fit, its tap tables
+    CUfunction fFsrHdrIn = nullptr, fFsrHdrOut = nullptr;                     // AMD FSR upscaling on HDR planes
     CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                   // its vertical pass + the slot store
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr, // live Restore
         fRestToF = nullptr, fClamp01 = nullptr;
@@ -5939,9 +5991,9 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     const double imgScale = s.imgScale;
     const int cw = s.cw, ch = s.ch, mw = s.mw, mh = s.mh;
     const int outW = W ? (int)W : cw, outH = W ? (int)H : ch;
-    auto fitRect = [&](int w, int h, int& dw, int& dh, int& x0, int& y0) {
-        lkFitRect(w, h, outW, outH, dw, dh, x0, y0);
-    };
+    // the presented rect comes from the capture, never the working size: each of its axes rounds to even on its own,
+    // so its aspect can miss the capture's and a fit from it would leave black rows or columns
+    auto fitRect = [&](int& dw, int& dh, int& x0, int& y0) { lkFitRect(cw, ch, outW, outH, dw, dh, x0, y0); };
     auto geo = [&](int ph, int pw, int w, int h, int dw, int dh, int x0, int y0) -> std::string {
         char b[512];
         sprintf_s(b, "ph=%d pw=%d w=%d h=%d cw=%d ch=%d outw=%d outh=%d dw=%d dh=%d x0=%d y0=%d", ph, pw, w, h, cw, ch,
@@ -5952,7 +6004,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     {
         // the effects run at the working size like the models' (no /64 pad: no engine reads the frame)
         int dw, dh, x0, y0;
-        fitRect(mw, mh, dw, dh, x0, y0);
+        fitRect(dw, dh, x0, y0);
         lines.push_back("NATIVE-PATH cache=" + cacheDir);
         lines.push_back("LIVE READY native=1 " + geo(mh, mw, mw, mh, dw, dh, x0, y0) + " scale=" + lkF4(imgScale) +
                         " batch=0 batchpad=0 effects=0 restore=0 engine=none fast=1");
@@ -5962,7 +6014,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     {
         const int gw = mw, gh = mh;
         int dw, dh, x0, y0;
-        fitRect(gw, gh, dw, dh, x0, y0);
+        fitRect(dw, dh, x0, y0);
         const std::string tail =
             " scale=" + lkF4(imgScale) + " batch=0 batchpad=0 effects=0 restore=0 engine=" + backend + " fast=1";
         if (backend == "nvof")
@@ -6034,7 +6086,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
             if (i != 4 && !lkFile(jit[i]))
                 return false;
         int dw, dh, x0, y0;
-        fitRect(mw, mh, dw, dh, x0, y0);
+        fitRect(dw, dh, x0, y0);
         for (int i = 0; i < n; i++)
         {
             lines.push_back(std::string("NATIVE-PATH ") + s.gm[i].key + "=" + path[i]);
@@ -6074,7 +6126,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
             return false;
     }
     int dw, dh, x0, y0;
-    fitRect(mw, mh, dw, dh, x0, y0);
+    fitRect(dw, dh, x0, y0);
     if (drba)
     {
         lines.push_back("NATIVE-PATH block0=" + bpath);
@@ -7698,6 +7750,8 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fUnpackR10, "k_unpackR10"},
         {&nr.fFitAaH, "k_fitAaH"},
         {&nr.fFitAaV, "k_fitAaV"},
+        {&nr.fFsrHdrIn, "k_fsrHdrIn"},
+        {&nr.fFsrHdrOut, "k_fsrHdrOut"},
         {&nr.fRsTab, "k_rsTab"},
         {&nr.fPackOutV, "k_packOutV"},
         {&nr.fPackOutHdrV, "k_packOutHdrV"},
@@ -7763,6 +7817,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fMvDerive, "k_mvDerive"},
         {&nr.fBgraRgbaFsr, "k_bgraRgbaFsr"},
         {&nr.fRgbaBgra, "k_rgbaBgra"},
+        {&nr.fOddEdge, "k_oddEdge"},
         {&nr.fHdrRestOut, "k_hdrRestOut"},
         {&nr.fLocalCorr, "k_localCorr"},
         {&nr.fAttn2, "k_attn2"},
@@ -8126,6 +8181,10 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     nr.fsrUp = nr.fsrUp && nr.vsr;
     nr.vsrPre = nr.vsrPre && nr.vsr;
+    // offline HDR video (--src-hdr): the upscaler's frames are the source's PQ / HLG codes at either stage (RTX HDR,
+    // which would make them PQ after the model, keeps the upscaler off that resize), so RTX VSR reads their SDR view
+    // and AMD FSR upscaling runs in its HDR mode, as live does on HDR planes
+    const int upEnc = g_offline ? nr.encPre : 0;
     if (nr.uw)
     {
         NCHK(cudaMalloc((void**)&nr.dUp, (size_t)3 * nr.uw * nr.uh * sizeof(float)), "alloc internal render frame");
@@ -8145,9 +8204,10 @@ static bool nativeRtxInit(NativeRife& nr)
             nr.dh < fh ? "downscale" : "upscale");
     }
     // a resize stage's staging frame (nativeOfflineStage): Restore after the model, or RTX VSR before it (the
-    // working-size frame, from the capture's planes); live's store after the model never stages (RTX VSR straight
-    // into the slot, the Lanczos fit fused into the store, Upscale to through dUp), offline's emit allocates its own
-    if ((nr.restore && !nr.restPre) || nr.vsrPre)
+    // working-size frame, from the capture's planes) or after it on HDR planes (VSR's way back to the codes); live's
+    // other stores never stage (RTX VSR straight into the slot, the Lanczos fit fused into the store, Upscale to
+    // through dUp), offline's emit allocates its own
+    if ((nr.restore && !nr.restPre) || nr.vsrPre || (nr.vsr && nr.hdr))
         NCHK(cudaMalloc((void**)&nr.dPres,
                         (size_t)3 * (std::max)(nr.dw * nr.dh, nr.vsrPre ? nr.w * nr.h : 0) * sizeof(float)),
              "alloc fit staging");
@@ -8203,10 +8263,21 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     else if (rsHere)
         LOG("native: resize: HDR planes: resized on the codes (SMV_HDR_RESIZE_VIEW=0)\n");
+    if (upEnc && nr.vsr && !nr.fsrUp && !nr.dRsRange)
+    {
+        // RTX VSR's way back to the codes tests each frame's range itself at a stage with no resize view (the final one)
+        NCHK(cudaMalloc((void**)&nr.dRsRange, sizeof(int)), "alloc resize range flag");
+        NCHK(cudaHostAlloc((void**)&nr.hRsRange, sizeof(int), cudaHostAllocDefault), "alloc resize range readback");
+    }
     if (nr.vsr)
     {
         NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)vw * vh * 4), "alloc VSR input");
         NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)vtw * vth * 4), "alloc VSR output");
+        if (nr.hdr || upEnc)
+        {
+            NCHK(cudaMalloc((void**)&nr.dVsrView, (size_t)3 * vw * vh * sizeof(float)), "alloc VSR SDR view");
+            NCHK(cudaMalloc((void**)&nr.dVsrRem, (size_t)3 * vtw * vth * sizeof(float)), "alloc VSR HDR fit");
+        }
     }
     // RTX TrueHDR runs once per real frame at the working size, after Restore, DLSS 5 and Sharpen and before the
     // model (nativePreModelPost): its input and output (and the bridge's arrays, which the warm-up makes) are
@@ -8285,6 +8356,9 @@ static bool nativeRtxInit(NativeRife& nr)
         g_rtxb.created = true;
         g_rtxUsed = true; // resident host: NGX is single-instance per process, end it after this session
     }
+    // AMD FSR upscaling on HDR planes runs in the bridge's HDR mode (linear light); with RTX HDR on, the frame before
+    // the model is the SDR planes (NVIDIA's order: the upscale, then TrueHDR), the SDR mode
+    nr.fuHdr = nr.fsrUp && (g_offline ? upEnc != 0 : nr.hdr && !(nr.vsrPre && nr.rtxHdr));
     if (nr.fsrUp && !nativeFsrupSetup(nr, vw, vh, vtw, vth))
         return false;
     if (nr.vsr && !nr.fsrUp)
@@ -8304,8 +8378,9 @@ static bool nativeRtxInit(NativeRife& nr)
             return false;
         }
         NCHK(cudaDeviceSynchronize(), "VSR warm-up eval sync");
-        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d%s\n", vw, vh, vtw, vth,
-            nr.vsrPre ? ", the captured frame before the model" : "");
+        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d%s%s\n", vw, vh, vtw, vth,
+            nr.vsrPre ? ", the captured frame before the model" : "",
+            nr.hdr ? ", on the HDR planes' SDR view" : (upEnc ? ", on the HDR video's SDR view" : ""));
     }
     if (nr.rtxHdr)
     {
@@ -11114,7 +11189,7 @@ struct FsrupBridge
 {
     HMODULE mod = nullptr;
     const char* (*lastError)() = nullptr;
-    int (*create)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char*, FsrupShared*) = nullptr;
+    int (*create)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char*, int, FsrupShared*) = nullptr;
     int (*frame)(uint64_t, uint64_t, int, double) = nullptr;
     void (*destroy)() = nullptr;
 };
@@ -11132,7 +11207,7 @@ static bool nativeFsrupLoad(const std::string& dir)
         return false;
     }
     g_fsrup.lastError = (const char* (*)())GetProcAddress(m, "fsrup_last_error");
-    g_fsrup.create = (int (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char*,
+    g_fsrup.create = (int (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char*, int,
                               FsrupShared*))GetProcAddress(m, "fsrup_create");
     g_fsrup.frame = (int (*)(uint64_t, uint64_t, int, double))GetProcAddress(m, "fsrup_frame");
     g_fsrup.destroy = (void (*)())GetProcAddress(m, "fsrup_destroy");
@@ -11162,8 +11237,9 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
     LUID luid;
     memcpy(&luid, prop.luid, sizeof(luid));
     FsrupShared sh{};
-    const int rc =
-        g_fsrup.create((uint32_t)w, (uint32_t)h, (uint32_t)ow, (uint32_t)oh, luid.LowPart, luid.HighPart, "4.", &sh);
+    // live HDR planes: the bridge's HDR mode (FP16 linear light in and out, k_fsrHdrIn / k_fsrHdrOut)
+    const int rc = g_fsrup.create((uint32_t)w, (uint32_t)h, (uint32_t)ow, (uint32_t)oh, luid.LowPart, luid.HighPart,
+                                  "4.", nr.fuHdr ? 1 : 0, &sh);
     if (rc != 0)
     {
         LOG("native: fsr upscale: %dx%d -> %dx%d not created: %s (rc %d)\n", w, h, ow, oh, g_fsrup.lastError(), rc);
@@ -11215,8 +11291,9 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
     if (!nativeOfVecSetup(nr, nr.fuOf, w, h, "fsr upscale"))
         return false;
     LOG("native: upscale: AMD FSR %s %dx%d -> %dx%d through smv_fsrup_bridge.dll, NVIDIA optical flow vectors (grid "
-        "%d, %s)\n",
-        nr.fuVersion, w, h, ow, oh, nr.fuOf.grid, nativeOfLevelName(nr.fuOf.level));
+        "%d, %s)%s\n",
+        nr.fuVersion, w, h, ow, oh, nr.fuOf.grid, nativeOfLevelName(nr.fuOf.level),
+        nr.fuHdr ? ", on the HDR planes' linear light (the bridge's HDR mode)" : "");
     return true;
 }
 
@@ -11240,7 +11317,10 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
             cudaEventRecord(nr.fuEv[e], st);
     };
     mark(0);
-    void* a[] = {&nr.dVsrIn, &w, &h, &nr.dFuIn, &fip, &ofIn, &oip};
+    // HDR planes (fuHdr): the callers packed the frame in linear light into dFuIn (k_fsrHdrIn) and take the result back
+    // themselves (k_fsrHdrOut); dVsrIn (the frame's SDR view) feeds the vectors only
+    uint8_t* in8 = nr.fuHdr ? nullptr : nr.dFuIn;
+    void* a[] = {&nr.dVsrIn, &w, &h, &in8, &fip, &ofIn, &oip};
     if (cuLaunchKernel(nr.fBgraRgbaFsr, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
         CUDA_SUCCESS)
     {
@@ -11300,11 +11380,21 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         return false;
     }
     mark(4);
-    if (cuLaunchKernel(nr.fRgbaBgra, (ow + 15) / 16, (oh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) !=
-        CUDA_SUCCESS)
+    if (!nr.fuHdr)
     {
-        nr.die("fsr upscale result failed");
-        return false;
+        if (cuLaunchKernel(nr.fRgbaBgra, (ow + 15) / 16, (oh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) !=
+            CUDA_SUCCESS)
+        {
+            nr.die("fsr upscale result failed");
+            return false;
+        }
+        void* e[] = {&nr.dVsrOut, &ow, &oh};
+        if (((ow | oh) & 1) && cuLaunchKernel(nr.fOddEdge, (ow + 15) / 16, (oh + 15) / 16, 1, 16, 16, 1, 0,
+                                              (CUstream)st, e, nullptr) != CUDA_SUCCESS)
+        {
+            nr.die("fsr upscale edge failed");
+            return false;
+        }
     }
     mark(5);
     if (nr.fuProf && cudaEventSynchronize(nr.fuEv[5]) == cudaSuccess)
@@ -11539,17 +11629,19 @@ static std::wstring nativeCacheDir(const NativeRife& nr)
 // Live RTX TrueHDR runs in this process. Everything comes from the exe's own
 // globals, parsed from the app's RTX HDR controls, so no new flag exists. Runs after
 // nativeLoadDlls (the bridge folder is derived from the runtime folder found there).
-static bool nativeConfigHdr(NativeRife& nr)
+// srcHdr = offline HDR video (1 PQ, 2 HLG): the upscalers' HDR levers apply to it as to live's HDR planes
+static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
 {
-    // live Sharpen and RTX VSR read the exe's own globals; VSR needs SDR (Lanczos in HDR),
-    // the bridge
-    // and nvngx_vsr.dll present (else Lanczos, never a route change), and the fit must
-    // enlarge (decided in nativeRtxInit once the handoff geometry is known)
+    // live Sharpen and RTX VSR read the exe's own globals; VSR needs the bridge and nvngx_vsr.dll present (else
+    // Lanczos, never a route change), and the fit must enlarge (decided in nativeRtxInit once the handoff geometry is
+    // known). It takes SDR, so on HDR planes it reads their SDR view (SMV_VSR_HDR=0 = Lanczos there)
     nr.sharpen = (float)(g_sharpen < 0.0 ? 0.0 : (g_sharpen > 2.0 ? 2.0 : g_sharpen));
     if (g_rtxVsr)
     {
-        if (g_hdr)
-            LOG("native: live RTX VSR demoted to Lanczos in HDR mode (SDR-only feature)\n");
+        wchar_t vh[8]{};
+        if ((g_hdr || srcHdr) && GetEnvironmentVariableW(L"SMV_VSR_HDR", vh, 8) && vh[0] == L'0')
+            LOG(g_hdr ? "native: live RTX VSR off on HDR planes (SMV_VSR_HDR=0), Lanczos\n"
+                      : "native: RTX VSR off on HDR video (SMV_VSR_HDR=0), Lanczos\n");
         else
         {
             std::wstring dir;
@@ -11569,12 +11661,15 @@ static bool nativeConfigHdr(NativeRife& nr)
                 nr.vsrWant = true;
         }
     }
-    // AMD FSR upscaling (--fsr-upscale) takes RTX VSR's resize under its rules (SDR only, enlarging only); the two
-    // exclude each other (the app ticks one), RTX VSR wins a command line with both
+    // AMD FSR upscaling (--fsr-upscale) takes RTX VSR's resize under its rules (enlarging only); the two exclude each
+    // other (the app ticks one), RTX VSR wins a command line with both. On HDR planes it runs in the bridge's HDR mode
+    // (linear light, nativeFsrupSetup; SMV_FSRUP_HDR=0 = Lanczos there)
+    wchar_t fh[8]{};
     if (g_fsrUp && g_rtxVsr)
         LOG("native: --fsr-upscale ignored: RTX VSR holds the resize (the two exclude each other)\n");
-    else if (g_fsrUp && g_hdr)
-        LOG("native: AMD FSR upscaling demoted to Lanczos in HDR mode (SDR only, as RTX VSR)\n");
+    else if (g_fsrUp && (g_hdr || srcHdr) && GetEnvironmentVariableW(L"SMV_FSRUP_HDR", fh, 8) && fh[0] == L'0')
+        LOG(g_hdr ? "native: AMD FSR upscaling off on HDR planes (SMV_FSRUP_HDR=0), Lanczos\n"
+                  : "native: AMD FSR upscaling off on HDR video (SMV_FSRUP_HDR=0), Lanczos\n");
     else if (g_fsrUp)
     {
         std::string dir = lkEnv("SMV_FSRUP_DIR");
@@ -13129,12 +13224,12 @@ static void nativeFree(NativeRife& nr)
         cudaFree(e.d);
     nr.rsTabs.clear();
     for (void* p :
-         {(void*)nr.dCap,       (void*)nr.dX,       (void*)nr.dXh,      (void*)nr.dF[0], (void*)nr.dF[1],
-          (void*)nr.dEncHalf,   (void*)nr.dT,       (void*)nr.dMerged,  (void*)nr.dTmp,  (void*)nr.dCapF,
-          (void*)nr.dThdrIn,    (void*)nr.dThdrOut, (void*)nr.dSrcG,    (void*)nr.dPres, (void*)nr.dSrcPl,
-          (void*)nr.dVsrIn,     (void*)nr.dVsrOut,  (void*)nr.dFitTmp,  (void*)nr.dUp,   (void*)nr.dUpTmp,
-          nr.dRestIn,           nr.dRestOut,        (void*)nr.dRestTmp, (void*)nr.dRest, (void*)nr.dStaticFlag,
-          (void*)nr.dThdrStats, (void*)nr.dShIn,    (void*)nr.dShOut})
+         {(void*)nr.dCap,     (void*)nr.dX,          (void*)nr.dXh,        (void*)nr.dF[0],   (void*)nr.dF[1],
+          (void*)nr.dEncHalf, (void*)nr.dT,          (void*)nr.dMerged,    (void*)nr.dTmp,    (void*)nr.dCapF,
+          (void*)nr.dThdrIn,  (void*)nr.dThdrOut,    (void*)nr.dSrcG,      (void*)nr.dPres,   (void*)nr.dSrcPl,
+          (void*)nr.dVsrIn,   (void*)nr.dVsrOut,     (void*)nr.dVsrView,   (void*)nr.dVsrRem, (void*)nr.dFitTmp,
+          (void*)nr.dUp,      (void*)nr.dUpTmp,      nr.dRestIn,           nr.dRestOut,       (void*)nr.dRestTmp,
+          (void*)nr.dRest,    (void*)nr.dStaticFlag, (void*)nr.dThdrStats, (void*)nr.dShIn,   (void*)nr.dShOut})
         if (p)
             cudaFree(p);
     if (nr.hStaticFlag)
@@ -13272,6 +13367,8 @@ static void nativeFree(NativeRife& nr)
     nr.dSrcPl = nullptr;
     nr.dVsrIn = nullptr;
     nr.dVsrOut = nullptr;
+    nr.dVsrView = nullptr;
+    nr.dVsrRem = nullptr;
     nr.dFitTmp = nullptr;
     nr.dUp = nullptr;
     nr.dUpTmp = nullptr;
@@ -15392,9 +15489,13 @@ static bool nativeVsrEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, 
     return true;
 }
 
+// Restore and the resize of one frame into nr.dPres (staged) or in place. enc = the frame's encoding (0 SDR planes; 1 PQ,
+// 2 HLG = offline HDR video, src holds the codes); live hands an SDR view as src and the HDR planes it came from as pl.
+// inRange = the caller's range test of src (1 inside the SDR range, 0 outside, -1 none).
 static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& rs, int& srcHalf, bool& staged, int sw,
                                int sh, int tw, int th, bool withRestore, bool vsrHere, int enc = 0,
-                               bool viewFit = false)
+                               bool viewFit = false, const void* pl = nullptr, int plHalf = 0, int plPs = 0,
+                               int plRs = 0, int inRange = -1)
 {
     cudaStream_t st = nr.stream;
     const bool resize = tw != sw || th != sh;
@@ -15424,14 +15525,64 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
     if (!staged && resize)
     {
         bool haveVsr = false;
+        const int hlg = (enc ? enc : nr.encPost) == 2 ? 1 : 0;
         if (vsrNow)
         {
-            void* a[] = {(void*)&src, &srcHalf, (void*)&ps, (void*)&rs, &sw, &sh, &nr.dVsrIn};
+            // HDR video (enc: src holds the codes, restored or not): RTX VSR takes SDR, so it reads the frame's SDR
+            // view (knee 1, head 0) and comes back to the codes below; AMD FSR upscaling takes the codes in linear
+            // light (k_fsrHdrIn) and the view feeds only its vectors, as live's planes and view do
+            const void* vsrSrc = src;
+            int vHalf = srcHalf, vps = ps, vrs = rs;
+            if (enc)
+            {
+                if (!nativeHdrEnc(nr, src, srcHalf, ps, rs, sw, sh, nr.dVsrView, 0, sw * sh, sw, enc, 1.0f, 0.0f))
+                {
+                    nr.die("VSR SDR view launch failed");
+                    return false;
+                }
+                vsrSrc = nr.dVsrView;
+                vHalf = 0;
+                vps = sw * sh;
+                vrs = sw;
+            }
+            void* a[] = {(void*)&vsrSrc, &vHalf, &vps, &vrs, &sw, &sh, &nr.dVsrIn};
             if (cuLaunchKernel(nr.fsrUp ? nr.fPackBgraRgb : nr.fPackBgra, (sw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1,
                                0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("packBgraRgb launch failed");
                 return false;
+            }
+            if (nr.fuHdr)
+            {
+                // AMD FSR upscaling on HDR planes: the frame in linear light into the bridge's buffer. Live hands the
+                // planes (pl, the SDR view src came from; after Restore on the view, the restored view goes back to
+                // the codes first: dVsrRem as the scratch, the planes as the reference); offline src is the codes
+                const void* fp = enc ? src : pl;
+                int fh = enc ? srcHalf : plHalf, fps = enc ? ps : plPs, frs = enc ? rs : plRs;
+                if (!enc && src == nr.dRest)
+                {
+                    const int n = sw * sh;
+                    if (cudaMemcpyAsync(nr.dVsrRem, nr.dRest, (size_t)3 * n * sizeof(float), cudaMemcpyDeviceToDevice,
+                                        st) != cudaSuccess ||
+                        !nativeHdrRestOut(nr, nr.dVsrRem, sw, sh, fp, fh, fps, frs, sw, sh, nr.encPost))
+                    {
+                        nr.die("restored HDR codes (FSR) launch failed");
+                        return false;
+                    }
+                    fp = nr.dVsrRem;
+                    fh = 0;
+                    fps = n;
+                    frs = sw;
+                }
+                const float scale = 125.0f / nr.encWhite;
+                void* f[] = {(void*)&fp, &fh,           &fps,        &frs,      &sw,
+                             &sh,        (void*)&scale, (void*)&hlg, &nr.dFuIn, &nr.fuInPitch};
+                if (!fp || cuLaunchKernel(nr.fFsrHdrIn, (sw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st,
+                                          f, nullptr) != CUDA_SUCCESS)
+                {
+                    nr.die("FSR HDR input launch failed");
+                    return false;
+                }
             }
             const RtxRect ri{0, 0, (uint32_t)sw, (uint32_t)sh};
             const RtxRect ro{0, 0, (uint32_t)tw, (uint32_t)th};
@@ -15446,7 +15597,19 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
                 nr.vsrFailed = true;
             }
         }
-        if (haveVsr)
+        if (haveVsr && nr.fuHdr)
+        {
+            // AMD FSR upscaling on HDR planes: the bridge's linear-light result back to the codes (k_fsrHdrOut)
+            const float inv = nr.encWhite / 125.0f;
+            void* a[] = {&nr.dFuOut, &nr.fuOutPitch, (void*)&tw, (void*)&th, (void*)&inv, (void*)&hlg, &nr.dPres};
+            if (cuLaunchKernel(nr.fFsrHdrOut, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+                               nullptr) != CUDA_SUCCESS)
+            {
+                nr.die("FSR HDR output launch failed");
+                return false;
+            }
+        }
+        else if (haveVsr)
         {
             void* a[] = {&nr.dVsrOut, (void*)&tw, (void*)&th, &nr.dPres};
             if (cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
@@ -15454,6 +15617,44 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
             {
                 nr.die("unpackBgraRgb launch failed");
                 return false;
+            }
+            if (enc)
+            {
+                // HDR video, back to the codes: a frame inside the SDR range takes the view's way back (the caller's
+                // range test, else one here on fp32 codes: an fp16 frame widened into dVsrView, free once the view is
+                // packed), any other gets the light the view never held from the frame's Lanczos fit (k_hdrRestOut)
+                int in = inRange;
+                if (in < 0 && nr.dRsRange)
+                {
+                    const float* f32 = (const float*)src;
+                    int fps = ps, frs = rs;
+                    if (srcHalf)
+                    {
+                        void* wa[] = {(void*)&src, &srcHalf, &ps, &rs, &sw, &sh, &nr.dVsrView, &sw, &sh};
+                        if (cuLaunchKernel(nr.fFitPlanar, (sw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st,
+                                           wa, nullptr) != CUDA_SUCCESS)
+                        {
+                            nr.die("VSR range widen failed");
+                            return false;
+                        }
+                        f32 = nr.dVsrView;
+                        fps = sw * sh;
+                        frs = sw;
+                    }
+                    if ((in = nativeRsInRange(nr, f32, fps, frs, sw, sh, enc)) < 0)
+                    {
+                        nr.die("VSR range test failed");
+                        return false;
+                    }
+                }
+                const int tps = tw * th;
+                if (in == 1 ? !nativeHdrFromSdr(nr, nr.dPres, 0, tps, tw, tw, th, nr.dPres, tps, tw, enc)
+                            : !nativeFitPlanar(nr, src, srcHalf, ps, rs, sw, sh, nr.dVsrRem, tw, th, st) ||
+                                  !nativeHdrRestOut(nr, nr.dPres, tw, th, nr.dVsrRem, 0, tps, tw, tw, th, enc))
+                {
+                    nr.die("VSR HDR codes launch failed");
+                    return false;
+                }
             }
         }
         else if (viewFit && enc)
@@ -15502,7 +15703,7 @@ static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
         return false;
     }
     if (!nativeOfflineStage(nr, src, ps, rs, half, staged, srcW(nr), srcH(nr), nr.w, nr.h, true, !nr.vsrPost, nr.encPre,
-                            in == 1))
+                            in == 1, nullptr, 0, 0, 0, nr.dRsView ? in : -1))
         return false;
     // unstaged = no resize and Restore dropped: the source already has the model size
     const float* from = staged ? nr.dPres : (const float*)src;
@@ -15537,7 +15738,7 @@ static bool nativeOfflineEmit(NativeRife& nr, const void* src, int ps, int rs, u
             return false;
     }
     else if ((nr.w != tw || nr.h != th) &&
-             !nativeOfflineStage(nr, src, ps, rs, srcHalf, staged, nr.w, nr.h, tw, th, false, nr.vsrPost))
+             !nativeOfflineStage(nr, src, ps, rs, srcHalf, staged, nr.w, nr.h, tw, th, false, nr.vsrPost, nr.encPost))
         return false;
     const void* fin = staged ? (const void*)nr.dPres : src;
     int fps = staged ? tw * th : ps, frs = staged ? tw : rs, fhalf = staged ? 0 : srcHalf;
@@ -15856,27 +16057,62 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // RTX VSR before the model (the working size above the capture while the fit after the model does not
     // enlarge): the capture's planes through Restore (folded back to the capture size) and VSR to the working
     // size, offline's pre-model stage. It replaces Restore and the resize below; after a VSR failure those
-    // run instead.
+    // run instead. VSR takes SDR: RTX HDR's SDR planes as they are (TrueHDR follows, NVIDIA's order), other HDR
+    // planes as their SDR view, back to the codes after it with the light the view never held.
     bool restored = false;
-    if (!nrSame && nr.vsrPre && !nr.vsrFailed && !sdrPre)
+    bool hdrIn = false; // this capture stayed inside the SDR range (the range test ran and said so)
+    if (!nrSame && nr.vsrPre && !nr.vsrFailed)
     {
         const int cps = nr.cw * nr.ch;
-        void* ap[] = {&nr.dCap, &nr.cw, &nr.ch, &nr.dCapF, &nr.ch, &nr.cw, (void*)&cps};
-        if (cuLaunchKernel(nr.fPackInDirect, (nr.cw + 15) / 16, (nr.ch + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ap,
-                           nullptr) != CUDA_SUCCESS)
+        const bool viewHere = nr.hdr && !sdrPre;
+        if (viewHere)
         {
-            nr.die("capture planes (RTX VSR) launch failed");
-            return false;
+            void* a0[] = {&nr.dCap, &nr.cw, &nr.ch, &nr.dCapF};
+            if (cuLaunchKernel(nr.fPqPlanar, (nr.cw + 15) / 16, (nr.ch + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a0,
+                               nullptr) != CUDA_SUCCESS ||
+                !nativeHdrEnc(nr, nr.dCapF, 0, cps, nr.cw, nr.cw, nr.ch, nr.dVsrView, 0, cps, nr.cw, 1, 1.0f, 0.0f))
+            {
+                nr.die("capture SDR view (RTX VSR) launch failed");
+                return false;
+            }
+            int in = 0;
+            if (nr.dRsView && (in = nativeRsInRange(nr, nr.dCapF, cps, nr.cw, nr.cw, nr.ch, 1)) < 0)
+            {
+                nr.die("resize range test failed");
+                return false;
+            }
+            hdrIn = in == 1;
         }
-        const void* src = nr.dCapF;
+        else if (!sdrPre)
+        {
+            void* ap[] = {&nr.dCap, &nr.cw, &nr.ch, &nr.dCapF, &nr.ch, &nr.cw, (void*)&cps};
+            if (cuLaunchKernel(nr.fPackInDirect, (nr.cw + 15) / 16, (nr.ch + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st,
+                               ap, nullptr) != CUDA_SUCCESS)
+            {
+                nr.die("capture planes (RTX VSR) launch failed");
+                return false;
+            }
+        }
+        const void* src = viewHere ? nr.dVsrView : (sdrPre ? nr.dSrcG : nr.dCapF);
         int ps = cps, rs = nr.cw, half = 0;
         bool staged = false;
-        if (!nativeOfflineStage(nr, src, ps, rs, half, staged, nr.cw, nr.ch, nr.w, nr.h, true, true))
+        if (!nativeOfflineStage(nr, src, ps, rs, half, staged, nr.cw, nr.ch, nr.w, nr.h, true, true, 0, false, nr.dCapF,
+                                0, cps, nr.cw))
             return false;
         if (staged)
         {
+            const int wps = nr.w * nr.h;
+            // (AMD FSR upscaling on HDR planes staged the codes itself: k_fsrHdrOut; after a failure the view's fit)
+            if (viewHere && !(nr.fuHdr && !nr.vsrFailed) &&
+                (hdrIn ? !nativeHdrFromSdr(nr, nr.dPres, 0, wps, nr.w, nr.w, nr.h, nr.dPres, wps, nr.w, 1)
+                       : !nativeFitPlanar(nr, nr.dCapF, 0, cps, nr.cw, nr.cw, nr.ch, nr.dVsrRem, nr.w, nr.h, st) ||
+                             !nativeHdrRestOut(nr, nr.dPres, nr.w, nr.h, nr.dVsrRem, 0, wps, nr.w, nr.w, nr.h, 1)))
+            {
+                nr.die("capture HDR codes (RTX VSR) launch failed");
+                return false;
+            }
             const float* from = nr.dPres;
-            int fps = nr.w * nr.h, dps = (int)plane;
+            int fps = wps, dps = (int)plane;
             void* a[] = {&from, &fps, &nr.w, &nr.w, &nr.h, &dCur, &nr.pw, &nr.ph, &dps};
             if (cuLaunchKernel(nr.fPadPlanar, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                                nullptr) != CUDA_SUCCESS)
@@ -15914,6 +16150,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             nr.die("resize range test failed");
             return false;
         }
+        hdrIn = in == 1;
         if (!nativeRestoreRun(nr, capPl, cps, nr.cw, nr.dRest, nr.w, nr.h, 0, sdrPre ? 0 : nr.encPost, in == 1))
             return false;
         if (!nr.restFailed)
@@ -15995,6 +16232,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     return false;
                 }
                 view = in == 1;
+                hdrIn = view;
                 if (view && !nativeHdrEnc(nr, nr.dCapF, 0, cps, nr.cw, nr.cw, nr.ch, nr.dRsView, 0, cps, nr.cw,
                                           nr.encPost, 1.0f, 0.0f))
                 {
@@ -16032,6 +16270,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             }
         }
     }
+    if (!nrSame)
+        nr.hdrInBits = (nr.hdrInBits << 1) | (hdrIn ? 1u : 0u);
     // DLSS 5: once per captured frame on the model frame, after Restore and the
     // resize and before any model reads it; then Sharpen and RTX TrueHDR (nativePreModelPost), and the
     // frame the model reads is kept for the reuse above
@@ -16392,12 +16632,35 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         bool haveVsr = false;
         if (vsrNow)
         {
-            void* a[] = {(void*)&src, &half, (void*)&ps, (void*)&rs, &nr.w, &nr.h, &nr.dVsrIn};
+            // HDR planes: RTX VSR takes SDR, so it reads the frame's SDR view; the way back to the codes is below
+            const void* vsrSrc = nr.hdr ? (const void*)nr.dVsrView : src;
+            int vHalf = nr.hdr ? 0 : half, vps = nr.hdr ? nr.w * nr.h : ps, vrs = nr.hdr ? nr.w : rs;
+            if (nr.hdr && !nativeHdrEnc(nr, src, half, ps, rs, nr.w, nr.h, nr.dVsrView, 0, vps, vrs, 1, 1.0f, 0.0f))
+            {
+                nr.die("VSR SDR view launch failed");
+                return false;
+            }
+            void* a[] = {(void*)&vsrSrc, &vHalf, (void*)&vps, (void*)&vrs, &nr.w, &nr.h, &nr.dVsrIn};
             if (cuLaunchKernel(nr.fsrUp ? nr.fPackBgraRgb : nr.fPackBgra, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16,
                                1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("packBgra launch failed");
                 return false;
+            }
+            if (nr.fuHdr)
+            {
+                // AMD FSR upscaling on HDR planes: the frame in linear light into the bridge's buffer (the view above
+                // feeds the vectors only); the way back is k_fsrHdrOut below
+                const float scale = 125.0f / nr.encWhite;
+                int hlg = nr.encPost == 2 ? 1 : 0;
+                void* f[] = {(void*)&src, &half,         (void*)&ps, (void*)&rs, &nr.w,
+                             &nr.h,       (void*)&scale, &hlg,       &nr.dFuIn,  &nr.fuInPitch};
+                if (cuLaunchKernel(nr.fFsrHdrIn, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, f,
+                                   nullptr) != CUDA_SUCCESS)
+                {
+                    nr.die("FSR HDR input launch failed");
+                    return false;
+                }
             }
             const RtxRect ri{0, 0, (uint32_t)nr.w, (uint32_t)nr.h};
             const RtxRect ro{0, 0, (uint32_t)tw, (uint32_t)th};
@@ -16414,7 +16677,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     return fitPack(src, ps, rs, nr.w, nr.h, slot, what, half);
             }
         }
-        if (haveVsr && !nr.uw)
+        if (haveVsr && !nr.uw && !nr.hdr)
         {
             // the bridge output is the presented frame: into the content rect, RTX VSR's R, G, B, A as the slot's
             // B, G, R, A in one pass; AMD FSR upscaling's buffer already holds the slot's order
@@ -16434,13 +16697,40 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
         // the first resize target (the internal render frame, or the staging frame at the
         // presented size): the VSR output unpacked, or the Lanczos fit
-        if (haveVsr)
+        if (haveVsr && nr.fuHdr)
+        {
+            // AMD FSR upscaling on HDR planes: the bridge's linear-light result back to the codes (k_fsrHdrOut), no
+            // SDR view to come back from
+            const float inv = nr.encWhite / 125.0f;
+            int hlg = nr.encPost == 2 ? 1 : 0;
+            void* a[] = {&nr.dFuOut, &nr.fuOutPitch, (void*)&tw, (void*)&th, (void*)&inv, &hlg, &stage};
+            if (cuLaunchKernel(nr.fFsrHdrOut, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+                               nullptr) != CUDA_SUCCESS)
+            {
+                nr.die("FSR HDR output launch failed");
+                return false;
+            }
+        }
+        else if (haveVsr)
         {
             void* a[] = {&nr.dVsrOut, (void*)&tw, (void*)&th, &stage};
             if (cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
                                1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("unpackBgra launch failed");
+                return false;
+            }
+            // HDR planes: back to the codes. The frames this one came from all inside the SDR range take the view's way
+            // back; any other gets the light the view never held from the frame's Lanczos fit (k_hdrRestOut). A DRBA
+            // frame is 3 captures old, so the last 4 count
+            const int fps = tw * th;
+            if (nr.hdr && ((nr.hdrInBits & 15u) == 15u
+                               ? !nativeHdrFromSdr(nr, stage, 0, fps, tw, tw, th, stage, fps, tw, 1)
+                               : !resizePlanar(src, ps, rs, nr.w, nr.h, true, nr.uw ? nr.dUpTmp : nr.dFitTmp,
+                                               nr.dVsrRem, tw, th, half) ||
+                                     !nativeHdrRestOut(nr, stage, tw, th, nr.dVsrRem, 0, fps, tw, tw, th, 1)))
+            {
+                nr.die("VSR HDR codes launch failed");
                 return false;
             }
         }

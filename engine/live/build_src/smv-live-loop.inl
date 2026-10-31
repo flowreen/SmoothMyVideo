@@ -1682,8 +1682,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         wchar_t ov[8]{};
         // rife/gmfss run on PQ and compose R10A2, so HDR reaches them (plus the
         // echo identity path). Fill is HDR-capable too: the server rescales on the PQ
-        // tensors and letterboxes into the R10A2 canvas (RTX VSR demoted to Lanczos there,
-        // with a log line). SMV_LIVE_HDR forces the mode for testing.
+        // tensors and letterboxes into the R10A2 canvas (RTX VSR reads the SDR view there).
+        // SMV_LIVE_HDR forces the mode for testing.
         // DLSS-G is HDR-capable through the exe-side pack (kHdrPackCS): SL mandates RGB10 + PQ
         // for HDR, the capture converts before present, SL interpolates on the PQ backbuffers.
         // "fruc" (Smooth Motion): the server feeds the NvOFFRUC bridge the PQ-encoded frames like rife, the bridge

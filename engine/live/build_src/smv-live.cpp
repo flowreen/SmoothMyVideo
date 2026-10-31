@@ -1849,8 +1849,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     // (every frame goes through the passes; the raw-copy real frames would be source-size)
     const bool passes = g_sharpen > 0.0 || g_restore || outW != w || outH != h || g_rtxHdr || g_dlssnr || nvPre;
-    if (passes && !nativeConfigHdr(nr))
-        return 2; // the sharpen strength and RTX VSR's availability (g_hdr is off)
+    if (passes && !nativeConfigHdr(nr, oa.srcHdr))
+        return 2; // the sharpen strength and RTX VSR's availability (g_hdr is off; HDR video keeps the HDR levers)
     ThdrAcc thdrAcc;
     if (g_rtxHdr)
     {
