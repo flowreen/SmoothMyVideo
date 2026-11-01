@@ -73,7 +73,7 @@ index dd1f7799..7e168e0f 100644
  else
    d3d12core_name_prefix = 'libvkd3d-proton-'
 diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
-index 7390c962..56e0cc2f 100644
+index b74cea3a..de2a79a8 100644
 --- a/libs/vkd3d-shader/dxil.c
 +++ b/libs/vkd3d-shader/dxil.c
 @@ -1209,6 +1209,10 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
@@ -88,7 +88,7 @@ index 7390c962..56e0cc2f 100644
              {
                  static const dxil_spv_option_extended_non_semantic non_semantic = {
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index 534c6f14..80dcdac2 100644
+index c6f6ee85..c82460fc 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -394,26 +394,32 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device, VkSemaphore vk_se
@@ -293,10 +293,10 @@ index 14ed4f83..40a8d963 100644
  
      if (VKD3D_CONFIG_FLAG_IS_SET(EXTENDED_DEBUG_UTILS))
 diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
-index a8fc26b1..878fdf89 100644
+index 25754b76..fbc352a7 100644
 --- a/libs/vkd3d/resource.c
 +++ b/libs/vkd3d/resource.c
-@@ -4400,6 +4400,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+@@ -4404,6 +4404,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
  
  #ifdef _WIN32
          VkImportMemoryWin32HandleInfoKHR import_info;
@@ -304,7 +304,7 @@ index a8fc26b1..878fdf89 100644
  #endif
  
          if (FAILED(hr = d3d12_resource_create_vk_resource(object, num_castable_formats, castable_formats, device)))
-@@ -4473,8 +4474,15 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+@@ -4477,8 +4478,15 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
              }
              else
              {
@@ -321,7 +321,7 @@ index a8fc26b1..878fdf89 100644
                  export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
                  allocate_info.pNext = &export_info;
              }
-@@ -4518,8 +4526,8 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+@@ -4522,8 +4530,8 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
          if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, allocation)))
              goto fail;
  

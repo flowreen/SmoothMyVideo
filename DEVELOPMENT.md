@@ -614,7 +614,10 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   (the two exclude each other; with both, RTX VSR keeps it and the host says so): AMD's signed FidelityFX loader +
   upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, which opens the upscaler's GPU gate (see "AMD FSR
   upscaling bridge"), every frame of that resize's stream in order (the first resets), its motion vectors from
-  NVIDIA optical flow (one direction, the slow perf level, grid 1), a constant depth, no jitter; RTX VSR's
+  NVIDIA optical flow (one direction, the slow perf level, grid 1; a vector shorter than 0.125 px is written as
+  exactly zero: between consecutive emitted frames still detail reads a few 1/32 px of flow noise, and FSR
+  resamples its history by any nonzero vector until still lines drift and flip by whole output pixels, while exact
+  zeros hold them; real motion sits far above the gate), a constant depth, no jitter; RTX VSR's
   rules hold (enlarging only, one resize). On HDR planes (Live on an HDR desktop) and on HDR video (`--src-hdr pq|hlg`,
   the offline render's PQ / HLG codes at either resize) it runs in the bridge's HDR mode (linear light in and out; an
   HLG picture as PQ on BT.2100's reference display and back), where RTX VSR, which takes SDR only, reads the frame's SDR
@@ -1829,6 +1832,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_OF_LEVEL=fast\|medium` | Every NVIDIA Optical Flow session (the NVIDIA Optical Flow model, DLSS 5's motion vectors, AMD FSR's vectors for frame generation and upscaling) at that perf level instead of slow, the engine's highest quality level (frame generation at fast = the repro of its tweens turning to garbage after ~320 calls at 1080p; the FSR 4 gate's like-for-like pan against AMD's path, whose vectors are fast grid 1); A/B lever, never a product setting |
 | `SMV_FSRFG_PROF=1` / `SMV_FSRUP_PROF=1` | AMD FSR frame generation / upscaling: CUDA events between a call's stages (the copies, the Optical Flow inputs, the Optical Flow, the vector kernels, the derived vectors, FSR itself, the unpack), `[fsrfg-prof]` / `[fsrup-prof]` ms a call at the session's end; every call then waits for its last event (profiling only, slower) |
 | `SMV_FSRUP_TEST=hang1` / `=hang2` | AMD FSR upscaling's first / second frame blocks past the Live stall watchdog: its trigger test. The watchdog holds up to 180 s during a session's first dispatch, where the driver compiles FSR's shaders (per exe location and upscale ratio), and its 10 s start over when that call returns |
+| `SMV_FSRUP_TEST=gateN` / `=zerovec` | AMD FSR upscaling's motion vectors: `gateN` = vectors shorter than N / 1000 px written as zero instead of the product's 0.125 px (`gate0` = no gate, the trigger test of the still-detail gate); `zerovec` = zero vectors on every frame. A/B levers, never a product setting |
 | `SMV_FSRFG_CHILDMV=0` | AMD FSR frame generation: level-2+ calls (x4 and up) run an optical flow pass each instead of taking vectors derived from their pair's level-1 field (the default; the session line says `level-2+ calls a pass a call` instead of `level-2+ calls derived from level 1`); A/B lever, never a product setting |
 | `SMV_FSRFG_DEVICE=own` / `=failown` | AMD FSR frame generation's bridge: every instance on its own vkd3d device instead of vkd3d's one (`fsrfg_devices()` = 1; the late price adds 300 MiB an instance past the first) / instance 0 on its own, the later ones on the shared device (the factory's failure path); the derived level-2+ vectors run on either; A/B levers, never a product setting |
 | `SMV_VKD3D_COOPMAT2=1` | AMD FSR frame generation's bridge offers vkd3d-proton VK_NV_cooperative_matrix2 again (its tensor loads for the FP8 tiles, ~14 % less FSR time, and with `SMV_VKD3D_COOPMAT2_CONV=1` its conversions), with a vkd3d cache folder of its own; on NVIDIA's R620 drivers every FSR call on the device then returns garbage for ~0.64 s after ~3.5 s of its GPU work (see "AMD FSR 4 frame generation"); A/B and driver re-check lever, never a product setting |
@@ -2062,11 +2066,11 @@ loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
 vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
-github.com/HansKristian-Work/vkd3d-proton at f5443fe51c99363ad02a3e7dbead2f3ec25f6ded with its submodules
+github.com/HansKristian-Work/vkd3d-proton at 8293130ebe370b1deb761898ae0d397d680837de with its submodules
 (dxil-spirv at 8b48f0e0392d76be4fdcea2a3ba3ea99dddaae5b), then
 
 ```
-git apply engine/fsrfg/source/vkd3d-proton-f5443fe-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/vkd3d-proton-8293130-smv.patch        (in the vkd3d-proton checkout)
 git apply engine/fsrfg/source/dxil-spirv-8b48f0e-smv.patch          (in subprojects/dxil-spirv)
 meson setup build --buildtype=release -Denable_extended_emulation=true
 ninja -C build

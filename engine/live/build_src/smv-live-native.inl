@@ -2499,25 +2499,31 @@ __global__ void k_unpackRgbaH(const unsigned short* __restrict__ src, int srcPit
 }
 // FSR's motion vectors: a field in px (two w x h planes, k_nvofUp's output) as R16G16_FLOAT texels, rows dstPitch bytes
 // apart, every vector as it is (k_nrMv without its test)
-__global__ void k_mvHalf(const float* __restrict__ flow, int w, int h, unsigned int* __restrict__ dst, int dstPitch)
+// gate: a vector shorter than it (px) is written as exactly zero (0 = off): FSR upscaling's history holds still
+// detail only under exact zeros (nativeFsrupEval)
+__global__ void k_mvHalf(const float* __restrict__ flow, int w, int h, unsigned int* __restrict__ dst, int dstPitch,
+                         float gate)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t o = (size_t)y * w + x;
-    dst[(size_t)y * (dstPitch >> 2) + x] = (unsigned int)f2h(flow[o]) | ((unsigned int)f2h(flow[(size_t)w * h + o]) << 16);
+    const float fx = flow[o], fy = flow[(size_t)w * h + o];
+    dst[(size_t)y * (dstPitch >> 2) + x] =
+        fx * fx + fy * fy < gate * gate ? 0u : (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
 }
 // the same texels from the engine's grid-1 field in one pass: vec = w x h short2 (raw / 32 = px, rows vecPitch bytes),
 // k_nvofUp at grid 1 (weights 0 and 1, an exact copy) then k_mvHalf, byte for byte
 __global__ void k_mvHalfG1(const short* __restrict__ vec, int vecPitch, int w, int h, unsigned int* __restrict__ dst,
-                           int dstPitch)
+                           int dstPitch, float gate)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const short* r = (const short*)((const char*)vec + (size_t)y * vecPitch);
     const float fx = (float)r[2 * x] * (1.0f / 32.0f), fy = (float)r[2 * x + 1] * (1.0f / 32.0f);
-    dst[(size_t)y * (dstPitch >> 2) + x] = (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
+    dst[(size_t)y * (dstPitch >> 2) + x] =
+        fx * fx + fy * fy < gate * gate ? 0u : (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
 }
 // the engine's grid-1 field (short2, raw / 32 = px) bilinear at (x, y), clamped to the frame
 __device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch, int w, int h, float x, float y,
@@ -10129,7 +10135,7 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
 // the vectors between slots `prev` and `cur`, both holding their ABGR8 frames: the field cur -> prev in px (the backward
 // field of the pair), into dst as R16G16_FLOAT texels, rows dstPitch bytes apart
 static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int cur, uint8_t* dst, int dstPitch,
-                           const char* tag, cudaEvent_t evOf = nullptr)
+                           const char* tag, cudaEvent_t evOf = nullptr, float gate = 0.0f)
 {
     cudaStream_t st = o.st ? o.st : nr.stream;
     NV_OF_EXECUTE_INPUT_PARAMS ei{};
@@ -10164,7 +10170,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
     CUdeviceptr v = o.outP[f], c = 0;
     if (grid == 1) // the field is the texels' grid: one pass, no float planes in between
     {
-        void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp};
+        void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp, &gate};
         if (cuLaunchKernel(nr.fMvHalfG1, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, g1, nullptr) != CUDA_SUCCESS)
         {
             nr.die("FSR vector launch failed");
@@ -10175,7 +10181,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
     float* flow = o.dFlow;
     float* cost = nullptr; // k_nvofUp: the flow alone, the cost never read
     void* b[] = {&v, &vp, &c, &cp, &o.gw, &o.gh, &grid, &o.w, &o.h, &flow, &cost};
-    void* m[] = {&flow, &o.w, &o.h, &dst, &mp};
+    void* m[] = {&flow, &o.w, &o.h, &dst, &mp, &gate};
     if (cuLaunchKernel(nr.fNvofUp, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS ||
         cuLaunchKernel(nr.fMvHalf, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, m, nullptr) != CUDA_SUCCESS)
     {
@@ -11357,8 +11363,25 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         return false;
     }
     mark(1);
+    // The vectors between consecutive emitted frames are mostly near zero on still content (a tween step moves a
+    // fraction of a pixel; the flow's noise is a few 1/32 px), and FSR resamples its history by any nonzero vector:
+    // still detail then drifts and flips by whole output pixels while exact zeros hold it. So a vector shorter than
+    // kFuVecGate px is written as exactly zero; real motion is far above it (a 1 px / frame pan tracks to 0.02 px),
+    // and FSR follows a sub-gate tween step no better with the vector than without. SMV_FSRUP_TEST=gateN = N
+    // thousandths of a px (gate0 = off, the A/B); =zerovec = zero vectors every frame (A/B only)
+    static constexpr float kFuVecGate = 0.125f;
+    static const float gate = [] {
+        wchar_t v[16]{};
+        if (!GetEnvironmentVariableW(L"SMV_FSRUP_TEST", v, 16) || wcsncmp(v, L"gate", 4))
+            return kFuVecGate;
+        return (float)_wtoi(v + 4) / 1000.0f;
+    }();
+    static const bool zeroVec = [] {
+        wchar_t v[16]{};
+        return GetEnvironmentVariableW(L"SMV_FSRUP_TEST", v, 16) && !wcscmp(v, L"zerovec");
+    }();
     const bool first = nr.fuN == 0;
-    if (first)
+    if (first || zeroVec)
     {
         if (cudaMemset2DAsync(nr.dFuMv, nr.fuMvPitch, 0, (size_t)w * 4, h, st) != cudaSuccess)
         {
@@ -11368,7 +11391,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         mark(2);
     }
     else if (!nativeOfVecRun(nr, nr.fuOf, prev, cur, nr.dFuMv, nr.fuMvPitch, "fsr upscale",
-                             nr.fuProf ? nr.fuEv[2] : nullptr))
+                             nr.fuProf ? nr.fuEv[2] : nullptr, gate))
         return false;
     mark(3);
     cudaExternalSemaphoreSignalParams sp{};
