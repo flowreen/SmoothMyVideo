@@ -2210,6 +2210,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         double thrBudget = 0.95; // the share of the source's interval a group's GPU work may take
         double thrProbeGapMs = 4000.0, thrProbeLast = 0; // at the floor: the next tween re-measure (4 .. 60 s)
         bool thrProbing = false;
+        // a re-measure adds one tween after each pair's real frame, computed and stored but never presented (the hidden
+        // slot of sendPairStream / XqGroup::show): the host re-times the tween under the probe's load while the picture
+        // keeps the floor's real frames, pacing and latency; the source frame the extra work costs is the same either way
         // a re-measure leaves the floor only once kThrProbeWins consecutive windows afford a tween: on a power-capped
         // GPU the first half second of load after seconds at the floor runs at a boosted clock and reads "fits" for
         // work that does not fit sustained (a 55 W cap: 1.1-1.7 tweens a pair in the first window, the floor in the
@@ -2887,7 +2890,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const uint32_t m = (uint32_t)ceil(r * 0.97);
             return gridLock && fits(m) ? m : 0;
         };
-        int sendLag = 0; // the last sent group's content lag in source periods (its pend entry takes it)
+        int sendLag = 0;       // the last sent group's content lag in source periods (its pend entry takes it)
+        uint32_t sendHide = 0; // the last sent group's hidden slots (a floor re-measure's tween: 1), never presented
         // one streaming pair handoff: bump seq, publish the frame (fence or shm copy), build
         // the fraction list, write the message. Returns nfr, or UINT32_MAX on a write failure.
         // fraction message: one f32 per slot the server was actually sized for (shmSlots),
@@ -2902,6 +2906,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // instead (the source's true cadence is uniform); the /8 pull bounds drift and
             // a 1.5-step error snaps on real cadence changes (drops, seeks, pauses). The same
             // clock paces the presents in every mode (sendGridMs).
+            sendHide = 0;
             const int64_t step100 = (int64_t)(emaDt * 10000.0);
             int64_t paceTs = sentTs;
             if (emaDt > 0)
@@ -2964,6 +2969,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 }
                 fr[nfr++] = 1.0f;
                 nextGrid = 0;
+                if (thrProbing && nfr < srv.shmSlots)
+                {
+                    // the floor re-measure's tween: the host computes and stores it after the real frame, for its GPU
+                    // time alone; its slot is never presented (XqGroup::show)
+                    fr[nfr++] = 0.5f;
+                    sendHide = 1;
+                }
             }
             else if (const uint32_t m = adaptTarget > 0 && emaDt > 0 ? lockedMultiple(effTarget) : 0)
             {
@@ -3401,6 +3413,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 bool capRel;                // the server released the shared capture texture
                 std::vector<double> gridMs; // each slot's place on the pacing clock (sendGridMs)
                 int lag;                    // its content's lag in source periods (a pipelined group: 1)
+                uint32_t show;              // slots presented: every slot but a floor re-measure's hidden tween
             };
             struct XqSlot
             {
@@ -3535,10 +3548,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // the user's target and the ring's slots), and under one tween a pair it is the source's own rate: the
             // real frames alone (thrFloor, read by sendPairStream). The drops keep the budget honest
             // (other work on the GPU, a bridge's own context outside the timed stream): drops above kXqDropRate a
-            // second, smoothed over ~2 s, take a tenth off it (not at the floor), 5 clean seconds give 2 points back. At the floor the
-            // tween is re-timed one window up after 4 s, over kThrProbeWins consecutive windows (the boosted first
-            // window of a power-capped GPU, above), the gap doubling to 60 s while any window answers "the floor". A
-            // pause or a static hold starts the window over; before any tween is timed the start target stands.
+            // second, smoothed over ~2 s, take a tenth off it (not at the floor), 5 clean seconds give 2 points back. At the floor a
+            // tween is re-timed after 4 s: each pair computes one after its real frame, never presented (sendPairStream's
+            // hidden slot), over kThrProbeWins consecutive windows (the boosted first window of a power-capped GPU,
+            // above), the gap doubling to 60 s while any window answers "the floor"; the target moves only once the
+            // windows afford a tween. A pause or a static hold starts the window over; before any tween is timed the
+            // start target stands.
             auto xqThrottle = [&](double tn) {
                 if (g_noGpuFit || !(adaptTarget > 0 && !hidden && !nextIdleTick && emaDt > 0))
                 {
@@ -3619,9 +3634,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     thrFloor = floor;
                     if (thrProbing && !floor && ++thrProbeWins < kThrProbeWins)
                     {
-                        // the window timed fresh tweens that fit: one more window at the re-measure's target before
-                        // the floor is left (the boosted first window, above)
-                        next = srcFps * 1.1;
+                        // the window timed fresh tweens that fit: one more window of hidden tweens before the floor is
+                        // left (the boosted first window, above); the target holds
+                        next = effTarget;
                     }
                     else if (thrProbing)
                     {
@@ -3638,10 +3653,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         thrProbeLast = tn;
                     else if (tn - thrProbeLast >= thrProbeGapMs)
                     {
-                        next = srcFps * 1.1;
+                        // the re-measure: the pairs carry a hidden tween each (sendPairStream) while the target and the
+                        // floor's presentation hold
                         thrProbing = true;
                         thrProbeWins = 0;
-                        thrFloor = false;
+                        LOG("throttle: re-timing a tween at the floor (computed after the real frame, not shown)\n");
                     }
                 }
                 const double ceilT = (srv.shmSlots > 1 ? srv.shmSlots - 1 : 1) * srcFps;
@@ -3744,9 +3760,18 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     g.opened = true;
                     const bool last = (v & 0x80000000u) != 0;
                     const uint32_t raw = v & 0x7FFFFFFFu;
-                    if (raw == 0)
+                    if (raw && raw - 1 >= g.nfr)
                     {
-                        // bare end marker: closes the group (an empty group opens and closes here)
+                        LOG("live server protocol error (slot index)\n");
+                        rc2 = 1;
+                        break;
+                    }
+                    // a floor re-measure's tween: it ran for its GPU time, its slot is never presented
+                    const bool hiddenSlot = raw && raw - 1 >= g.show;
+                    if (raw == 0 || (hiddenSlot && last))
+                    {
+                        // bare end marker (or a hidden slot's last token): closes the group (an empty group opens and
+                        // closes here)
                         const uint32_t seq = g.seq;
                         pend.pop_front();
                         bool tagged = false;
@@ -3761,13 +3786,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             xqThrottle(xqLastPresMs > 0 ? xqLastPresMs : nowMs());
                         continue;
                     }
+                    if (hiddenSlot)
+                        continue;
                     const uint32_t idx = raw - 1;
-                    if (idx >= g.nfr)
-                    {
-                        LOG("live server protocol error (slot index)\n");
-                        rc2 = 1;
-                        break;
-                    }
                     double due = g.arrMs + g.spanMs * (idx + 1) / (g.expect + 1);
                     if (gridPace && idx < g.gridMs.size())
                     {
@@ -4048,14 +4069,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             const ULONGLONG sendTick = GetTickCount64();
                             if (pend.empty())
                                 InterlockedExchange64(&srv.ioSince, (LONGLONG)sendTick);
-                            pend.push_back(XqGroup{shmSeq, (uint32_t)(shmSeq % 2), nfr ? nfr : 1, nfr, arrMs, emaDt,
-                                                   sentTs, sendTick, false, false, sendGridMs, sendLag});
+                            const uint32_t show = nfr - sendHide; // a re-measure's hidden tween is never presented
+                            pend.push_back(XqGroup{shmSeq, (uint32_t)(shmSeq % 2), show ? show : 1, nfr, arrMs, emaDt,
+                                                   sentTs, sendTick, false, false, sendGridMs, sendLag, show});
                             hitchArrPrev = arrMs;
-                            lastNfr = nfr ? nfr : 1;
+                            lastNfr = show ? show : 1;
                             if (tmOn)
                             {
                                 tmEma += emaDt;
-                                tmNfr += nfr;
+                                tmNfr += show;
                                 tmN++;
                             }
                             const ULONGLONG prevProcTick = lastPresentTick;

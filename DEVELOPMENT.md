@@ -476,7 +476,7 @@ Models (GMFSS is the default, the anime specialist):
   follow the dispatch before them with no D3D12 barrier, copy or clear in between, and on NVIDIA such a dispatch
   overlaps its predecessor, which computed an occasional call differently (which calls, depends on the size; bounded,
   quality-neutral against exact truth); our vkd3d-proton puts a compute barrier before every dispatch that follows such
-  a gap (`SMV_VKD3D_FG_BARRIER=0` = off, the drift back; `=all` = before every compute dispatch), for about 3 % of a
+  a gap (`SMV_VKD3D_FG_BARRIER=0` = off, the drift back; `=all` = before every compute dispatch), for about 1.3 % of a
   4K x8 pair (harness `fsrfg_determinism`: two runs byte-identical and 8 runs alike at 480p to 4K); the host's tweens are
   52.3 dB from AMD's own D3D12 path on the same frames and vectors (8-bit vs fp16 frames; harness
   `fsr4_framegen\fsr4_gate.py`); the frame time does not change its output. It runs on
@@ -950,8 +950,12 @@ over ~2 s, outside the 2 s after a move of the target, take a tenth off it, and 
 (other work on the GPU, a bridge's own context outside the timed stream). Drops AT the floor cut nothing (the pairs
 already carry their real frame alone, a smaller tween budget removes no work): a foreign load leaves the budget where
 the floor found it, so the ladder comes back once the load ends (AMD FSR 4 1440p x8 after a 15 s two-matmul load: 17 s,
-not 71 s or more from a 30-45 % budget). At the floor one window re-times a tween
-after 4 s, doubling to 60 s. Until the first group is timed the target starts at one tween a pair (twice the source
+not 71 s or more from a 30-45 % budget). At the floor a tween is re-timed after 4 s, doubling to 60 s while the answer
+stays the floor: each pair computes one tween after its real frame and never presents it (the loop hides that slot),
+over two consecutive 500 ms windows (on a power-capped GPU the first window after seconds at the floor runs at a boosted
+clock and reads a fit that does not hold); the target moves only once both windows afford a tween, so a re-measure keeps
+the floor's real frames, pacing and latency on screen, at the price of one late source frame (the log line `throttle:
+re-timing a tween at the floor`). Until the first group is timed the target starts at one tween a pair (twice the source
 rate measured before the spawn, never above the panel's rate or the user's target; the log line `throttle: starting at
 N fps until a group is timed`): a start the GPU cannot afford fills the queue, and the drops while that backlog drains
 outlast the move's 2 s window and cut the budget for about a minute (1440p RIFE x5 at target 1000: three cuts to 69 %,
