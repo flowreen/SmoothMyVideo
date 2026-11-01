@@ -472,9 +472,12 @@ Models (GMFSS is the default, the anime specialist):
   extension off; vkd3d-proton's key ignores `DXIL_SPIRV_CONFIG` and the disabled extensions, so a cache of another
   build or configuration replayed broken pipelines; without it a session starts ~0.3 s later). The
   first session after a driver update waits ~15 s while the driver compiles the Vulkan pipelines, at any size; the
-  app warms them ahead (`fsr-warm` below). FSR 4 is not bit-stable run to run on vkd3d-proton: its output shifts with the timing around
-  its calls (at 648p to 4K always; at 480p / 540p / 576p / 1080p once other GPU work runs beside it),
-  bounded and quality-neutral against exact truth (harness `fsr4_optimization`); the host's tweens are
+  app warms them ahead (`fsr-warm` below). FSR 4 is bit-stable run to run: about half of its compute dispatches
+  follow the dispatch before them with no D3D12 barrier, copy or clear in between, and on NVIDIA such a dispatch
+  overlaps its predecessor, which computed an occasional call differently (which calls, depends on the size; bounded,
+  quality-neutral against exact truth); our vkd3d-proton puts a compute barrier before every dispatch that follows such
+  a gap (`SMV_VKD3D_FG_BARRIER=0` = off, the drift back; `=all` = before every compute dispatch), for about 3 % of a
+  4K x8 pair (harness `fsrfg_determinism`: two runs byte-identical and 8 runs alike at 480p to 4K); the host's tweens are
   52.3 dB from AMD's own D3D12 path on the same frames and vectors (8-bit vs fp16 frames; harness
   `fsr4_framegen\fsr4_gate.py`); the frame time does not change its output. It runs on
   Smooth Motion's route: one tween at t = 0.5 per call, so every tween is a node of the pair's
@@ -1837,6 +1840,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_FSRFG_DEVICE=own` / `=failown` | AMD FSR frame generation's bridge: every instance on its own vkd3d device instead of vkd3d's one (`fsrfg_devices()` = 1; the late price adds 300 MiB an instance past the first) / instance 0 on its own, the later ones on the shared device (the factory's failure path); the derived level-2+ vectors run on either; A/B levers, never a product setting |
 | `SMV_VKD3D_COOPMAT2=1` | AMD FSR frame generation's bridge offers vkd3d-proton VK_NV_cooperative_matrix2 again (its tensor loads for the FP8 tiles, ~14 % less FSR time, and with `SMV_VKD3D_COOPMAT2_CONV=1` its conversions), with a vkd3d cache folder of its own; on NVIDIA's R620 drivers every FSR call on the device then returns garbage for ~0.64 s after ~3.5 s of its GPU work (see "AMD FSR 4 frame generation"); A/B and driver re-check lever, never a product setting |
 | `SMV_VKD3D_COOPMAT2_CONV=1` | with the extension offered: vkd3d-proton offers dxil-spirv NVIDIA's cooperative-matrix conversions too, the matrix use changes as one conversion each instead of through shared memory, ~5 % less FSR time, but every FSR call on the device returns garbage for ~0.64 s after ~3.5 s of its GPU work on R617 drivers as well; A/B and driver re-check lever, never a product setting |
+| `SMV_VKD3D_FG_BARRIER=0` / `=all` | AMD FSR frame generation's vkd3d-proton: no compute barrier before the dispatches that follow the previous one with no D3D12 barrier, copy or clear in between (the run-to-run drift comes back) / a barrier before every compute dispatch; A/B levers, never a product setting |
 | `SMV_FSRFG_OVERLAP=0` / `SMV_FSRFG_OVERLAP=fail` | AMD FSR frame generation: every call's vectors in its turn instead of the next call's on a side stream during each FSR call (tree levels with two or more calls, x4 and up) / the side stream's setup fails after a whole one, the trigger of its fallback (`the side stream did not start` with derived vectors, `the side Optical Flow session did not start` with `SMV_FSRFG_CHILDMV=0`; route gate only); A/B levers, never a product setting |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion (the first one AMD FSR frame generation too): the most bridge instances (1..9; recursive midpoints use one per tree level on both routes, default 9 = to x512, 5 = to x32; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
@@ -2085,7 +2089,11 @@ dxil-spirv so, but its conversions are not offered unless `SMV_VKD3D_COOPMAT2_CO
 shaders turn to garbage for ~0.64 s after ~3.5 s of the device's GPU work on NVIDIA), and the bridge disables the
 extension for its process anyway (`SMV_VKD3D_COOPMAT2=1` = offered), since its tensor loads open the same window on
 R620 drivers; the two DLLs are named `smv_vkd3d_d3d12.dll` / `smv_vkd3d_d3d12core.dll`, so they
-never share a module name with the system D3D12 in the host's process. The dxil-spirv patch: FP8 matrices
+never share a module name with the system D3D12 in the host's process; and a compute barrier goes before every
+compute dispatch that follows the previous one with no D3D12 barrier, copy or clear in between (frame generation
+records about half of its dispatches so; on NVIDIA they overlap their predecessor and compute an occasional call
+differently run to run; `SMV_VKD3D_FG_BARRIER=0` = off, `=all` = one before every compute dispatch). The dxil-spirv
+patch: FP8 matrices
 emulated as FP16 (`DXIL_SPIRV_CONFIG=wmma_fp8_staging`): a storage-buffer tile load is one coopmat2 tensor
 load with a decode function where the device has them, else staged through shared memory (each lane reads
 8 bytes of a tile row or column as u32 words), stores staged; the configuration read from the process

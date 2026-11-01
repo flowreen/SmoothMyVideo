@@ -157,7 +157,7 @@ In the preview, **Show changed pixels** turns the Processed pane into a heat map
 * 📱 **Handles real-world files.** Phone clips and screen recordings with a changing frame rate stay in sync, HDR
   sources stay HDR, and DVDs and other stretched formats keep their shape.
 * 🔁 **Reproducible.** The same file with the same settings renders byte-for-byte identically, every time, except
-  with the NVIDIA Smooth Motion and AMD FSR 4 models.
+  with the NVIDIA Smooth Motion model and AMD FSR 4.1 upscaling.
 * ⏯️ **Pause, preview, resume.** **Pause** holds the render; **Play preview** opens the part done so far, with sound
   and subtitles. A render that was closed or crashed continues where it stopped (with the same settings and an
   unchanged source). **Cancel** deletes the partial file. A render never leaves a cut-off file behind.
