@@ -79,8 +79,8 @@ to 10000.
 ## Get started
 
 1. Download `SmoothMyVideo-<version>-win.7z` from the
-   [latest release](https://github.com/flowreen/SmoothMyVideo/releases/latest) (its `.sha256` and the release notes
-   sit beside it).
+   [latest release](https://github.com/flowreen/SmoothMyVideo/releases/latest) (the release notes carry its
+   SHA-256).
 2. Extract it anywhere. Windows 11 23H2 and later open `.7z` in File Explorer; on older Windows use
    [7-Zip](https://www.7-zip.org/).
 3. Run **`SmoothMyVideo.exe`**. A second launch just brings the running window forward.

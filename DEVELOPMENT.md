@@ -2358,14 +2358,15 @@ deletes the lockfile.
 
 ## Releasing
 
-GitHub hosts everything: the release page carries the `.7z`, its `.sha256` and the notes (a
-release asset must stay under 2 GiB; `pack-zip.ts` refuses an archive of 2 GB or more), and GitHub
-adds the source archives of the tag itself.
+GitHub hosts everything: the release page carries the `.7z` and the notes, which hold the archive's
+SHA-256 (a release asset must stay under 2 GiB; `pack-zip.ts` refuses an archive of 2 GB or more),
+and GitHub adds the source archives of the tag itself. The `.sha256` file stays local: every release
+asset counts on the README's downloads badge, so the archive is the only asset.
 
 1. Bump `version` in `package.json`, commit, push.
-2. `npm run dist` (`release/SmoothMyVideo-<v>-win.7z` + `.sha256`).
+2. `npm run dist` (`release/SmoothMyVideo-<v>-win.7z` + `.sha256`, the hash for the notes).
 3. Tag `v<v>` on the release commit and push the tag.
-4. Create the GitHub release for the tag: notes, then attach the `.7z` and its `.sha256`.
+4. Create the GitHub release for the tag: notes with the hash, then attach the `.7z` only.
 
 The tag is what installed copies compare against (`checkForUpdate` in `main.ts`), so publishing
 the GitHub release lights up the in-app notice. Never re-upload different code under an existing
