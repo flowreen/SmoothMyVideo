@@ -1009,7 +1009,16 @@ How the server route works:
   costs ~r model calls a pair), so whenever a whole multiple M = ceil(0.97 r) of the source's rate
   fits the user's target (r = the throttle's target over the source's rate) the pair runs M's
   ladder instead: M - 1 tweens at k / M plus the real frame as it is, more frames for no more work.
-  The grid stays for a target between two multiples that binds. Smooth Motion (FRUC) is exact only
+  The grid stays for a target between two multiples that binds. The ladder above a lock is admitted
+  at a price: its cost predicted from the lock's own readings, times the excess that ladder showed
+  over such a prediction the last time it ran (never under 1.05), inside the throttle's 95 % budget.
+  A lock holds while its cost stays under 1.10 x that budget and under 98 % of the source period: a
+  ladder that costs more than a source period keeps up only by losing source frames, so it falls
+  (after a second over, never within two seconds of locking) and is probed again after a back-off
+  that doubles per failure, at a price halfway from the excess it showed to the default; a refused
+  probe keeps that halfway price and doubles the back-off, and the back-off ends only once the ladder
+  has held two minutes, so a ladder whose cost drifts around the period settles on the lock below
+  instead of flapping. The `ladder price:` log lines carry the predictions and the measured costs. Smooth Motion (FRUC) is exact only
   at its midpoint tree's nodes k / 2^L (any other phase snaps to the nearest node and costs the
   whole tree), so it runs only the x2 / x4 / x8 / .. / x512 ladders (one bridge instance a tree
   level), the largest that fits (a step up needs 3 % headroom), and the grid only when not even x2 fits: a

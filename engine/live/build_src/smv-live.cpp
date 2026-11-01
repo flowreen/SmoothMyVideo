@@ -61,6 +61,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <map>
 #include <fstream>
 #include <memory>
 #include <wincrypt.h> // MD5 of the weights for the engine names (the host-side lookup)

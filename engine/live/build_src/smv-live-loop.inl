@@ -2646,23 +2646,33 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // the ladder above a lock is admitted at a price, not a band: M + 1 costs this lock's readings pre + M tw
         // times upK, the excess the ladder above showed over such a prediction the last time one ran (every stage
         // runs slower once the GPU has no idle gaps: GMFSS x3 over x2's readings ~+4 % at a 175 W ceiling, ~+8 %
-        // at 160 W under the power cap, so a half-tween band would price x3 ~5 ms over its cost). One attempt per
-        // regime: a step-up records its prediction (upPred for upM); the new lock's settled readings (kUpSettleMs)
-        // or its fall set upK to what it cost, so a failed step is retried only once the readings improve that much,
-        // or as a probe at the default price after a back-off that doubles per failure (kUpBackoff0 to
-        // kUpBackoffMax: a price learned through a transient, a CPU burst lowering the GPU's ceiling, would otherwise
-        // hold the session below a ladder it affords; at a real cap the probe costs ~2 s of the ladder above). Enter
+        // at 160 W under the power cap, so a half-tween band would price x3 ~5 ms over its cost). kUpKDefault is
+        // also upK's floor: a measured excess is never read below it, so a step-up always keeps that margin inside
+        // the budget (a prediction admitted at the budget's edge ran ~10 % over it). One attempt per regime: a
+        // step-up records its prediction (upPred for upM); the new lock's settled readings (kUpSettleMs) or its fall
+        // set upK to what it cost, kept per ladder in upKAt (a lower lock's own price never re-admits a ladder above
+        // at less than that ladder showed), so a failed step is retried only once the readings improve that much,
+        // or as a probe after a back-off that doubles per failure (kUpBackoff0 to kUpBackoffMax: a price learned
+        // through a transient, a CPU burst lowering the GPU's ceiling, would otherwise hold the session below a
+        // ladder it affords; at a real cap the probe costs ~3 s of the ladder above). A probe prices the ladder
+        // halfway from the excess it showed to the default, and a refused probe keeps that halfway price and doubles
+        // the back-off: a transient's excess relaxes over a few probes, a marginal ladder (its cost drifting around
+        // the period with the GPU's clocks) is looked at ever more rarely instead of flapping with the lock below.
+        // The back-off ends only once the ladder it guards has held kUpResetMs, so a ladder that keeps falling
+        // keeps its back-off growing. Enter
         // with margin, hold with less: a lock holds while its cost stays under the budget times kUpHold (a ladder
-        // at the edge of the budget would otherwise leave and re-enter every few seconds; up to ~5 % over the
-        // source period the pacing absorbs a sag as latency, 0 to 0.5 drops/s, and the throttle's own drop cut
-        // lowers the budget past that), falls only once it has been over for kUpOverMs (the group times are a
+        // at the edge of the budget would otherwise leave and re-enter every few seconds) and under kUpPeriod of
+        // the source period: a ladder that costs more than the period keeps up only by losing source frames (the
+        // capture's dropped arrivals, about one a second at 3 to 5 % over, under the throttle's own drop cut), so the
+        // band never reaches the period. It falls only once it has been over for kUpOverMs (the group times are a
         // 5-group EMA) and never within kUpSettleMs of its lock; the back-off ends once the ladder it guards has
         // held kUpResetMs
         const double kUpKDefault = 1.05, kUpSettleMs = 2000.0, kUpBackoff0 = 4000.0, kUpBackoffMax = 300000.0;
-        const double kUpHold = 1.10, kUpOverMs = 1000.0, kUpResetMs = 30000.0;
+        const double kUpHold = 1.10, kUpPeriod = 0.98, kUpOverMs = 1000.0, kUpResetMs = 120000.0;
         double upK = kUpKDefault, upPred = 0, upFailT = 0, upBackoffMs = kUpBackoff0, upOverT = 0;
         uint32_t upM = 0;
-        bool upSettled = false; // the stepped-up lock has logged its settled price
+        std::map<uint32_t, double> upKAt; // the excess each stepped-up ladder showed over its prediction, by ladder
+        bool upSettled = false;           // the stepped-up lock has logged its settled price
         // an M ladder's route (fruc-pipe), before the switch dwell: the sender runs it, lockedMultiple prices it. The
         // direct / pipelined trees' tweens a pair (frucAffD / frucAffP) come off the throttle's tree prices over the
         // ladder's own budget (lockedMultiple's: the faster of the two period averages), never over emaDt alone: that
@@ -2765,7 +2775,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const bool fsr = tree && srv.nr->fsrfg;
             const bool timed = tree ? fc > 0.0 && (fsr ? fb > 0.0 : pre > 0.0) : tw > 0.0;
             // the faster of the two period averages: a source-rate rise tightens the budget within a few pairs
-            const double budget = (std::min)(lockDtMs, emaDt) * thrBudget;
+            const double period = (std::min)(lockDtMs, emaDt);
+            const double budget = period * thrBudget;
             auto cost = [&](uint32_t m) {
                 if (!tree)
                     return pre + (m - 1) * tw;
@@ -2786,14 +2797,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 frucPipePrices(fc, pm, pw);
                 return pre + m * fs + frucPipeCalls(m, pm, pw);
             };
-            // a lock holds within slotOk and the hold band (kUpHold), never within kUpSettleMs of its lock; before a
-            // group is timed the throttle's r stands in for the price (the node above holds unpriced)
+            // a lock holds within slotOk and the hold band (kUpHold, under kUpPeriod of the period), never within
+            // kUpSettleMs of its lock; before a group is timed the throttle's r stands in for the price (the node
+            // above holds unpriced)
             auto holds = [&](uint32_t m) {
                 if (!slotOk(m))
                     return false;
                 if (!timed)
                     return m == above || m - 1 <= r * 1.03;
-                if (cost(m) <= budget * kUpHold || nowMs() - lockT < kUpSettleMs)
+                if (cost(m) <= (std::min)(budget * kUpHold, period * kUpPeriod) || nowMs() - lockT < kUpSettleMs)
                 {
                     upOverT = 0;
                     return true;
@@ -2805,6 +2817,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // the learned price admits a ladder, or the default price once the back-off since a failed step is over;
             // a fallen ladder (and any above it) waits for that back-off whatever the price says
             const bool probe = upFailT > 0 && nowMs() - upFailT >= upBackoffMs;
+            // the price a ladder is admitted at: the excess it showed itself when it last ran as a step-up, at least
+            // the current one
+            auto kFor = [&](uint32_t m) {
+                const auto it = upKAt.find(m);
+                return it == upKAt.end() ? upK : (std::max)(upK, it->second);
+            };
+            // a probe's price: halfway from the ladder's learned excess to the default
+            auto kProbe = [&](uint32_t m) { return (std::max)(kUpKDefault, (kUpKDefault + kFor(m)) * 0.5); };
             auto afford = [&](uint32_t m) {
                 if (upFailT > 0 && !probe && m >= upM)
                     return false;
@@ -2812,13 +2832,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // throttle's r within the target, the node above as one attempt
                 if (!timed)
                     return tree && (m == above || m - 1 <= r * 0.97);
-                return cost(m) * upK <= budget || (probe && cost(m) * kUpKDefault <= budget);
+                return cost(m) * kFor(m) <= budget || (probe && cost(m) * kProbe(m) <= budget);
             };
             // the stepped-up lock's live price: what it costs now over the prediction that admitted it (re-read on
-            // every settled pair and at its fall, so a sag raises it and its end lowers it again)
+            // every settled pair and at its fall, so a sag raises it and its end lowers it again), never under the
+            // default, kept for its ladder
             auto learn = [&]() {
                 if (upPred > 0 && upM == lockLogged && timed)
-                    upK = (std::max)(1.0, cost(lockLogged) / upPred);
+                    upKAt[lockLogged] = upK = (std::max)(kUpKDefault, cost(lockLogged) / upPred);
             };
             if (lockLogged && holds(lockLogged))
             {
@@ -2832,7 +2853,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     {
                         upSettled = true;
                         LOG("ladder price: x%u costs %.1f ms, %.2f x the %.1f ms its step-up priced\n", lockLogged,
-                            cost(lockLogged), upK, upPred);
+                            cost(lockLogged), cost(lockLogged) / upPred, upPred);
                     }
                 }
                 if (upFailT > 0 && lockLogged == upM && nowMs() - lockT >= kUpResetMs)
@@ -2842,7 +2863,17 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 }
                 const uint32_t next = tree ? lockLogged * 2 : lockLogged + 1;
                 if (!(settled && fits(next) && afford(next)))
+                {
+                    // a refused probe of the ladder that fell: its excess relaxes to the probe's price, the next look
+                    // waits for the doubled back-off
+                    if (probe && timed && next == upM && upKAt.count(upM))
+                    {
+                        upKAt[upM] = kProbe(upM);
+                        upBackoffMs = (std::min)(upBackoffMs * 2.0, kUpBackoffMax);
+                        upFailT = nowMs();
+                    }
                     return lockLogged;
+                }
                 // a step up: the largest ladder the price admits up to ceil(0.97 r) (the tree: up to its top node), the
                 // prediction it ran on kept (an untimed tree's: one node, unpriced)
                 uint32_t up = tree ? top : (std::max)(next, (uint32_t)ceil(r * 0.97));
@@ -2864,7 +2895,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     upFailT = nowMs();
                     if (upPred > 0)
                         LOG("ladder price: x%u falls at %.1f ms (%.2f x its step-up's price); re-tried in %.0f s\n",
-                            lockLogged, cost(lockLogged), upK, upBackoffMs / 1000.0);
+                            lockLogged, cost(lockLogged), cost(lockLogged) / upPred, upBackoffMs / 1000.0);
                     else
                         LOG("ladder price: x%u falls (an unpriced step-up); re-tried in %.0f s\n", lockLogged,
                             upBackoffMs / 1000.0);
