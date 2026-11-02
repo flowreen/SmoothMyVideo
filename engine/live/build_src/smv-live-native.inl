@@ -4785,10 +4785,15 @@ struct NativeRife
     // bilinearly over its whole /64 frame as B, G, R (k_motionIn st), RIFE's last step at that frame on the pair's
     // stretched pictures, every output frame (tweens and real frames alike) bilinearly back to the pictures' size
     bool drAuthor = false;
-    float* dDrS = nullptr;  // (6, M, N) the pair's pictures stretched (nativeDrbaAuthorBlend), the pair of drSKey
-    int64_t drSKey = -1;    // k * 2 + (side > 0) of the pair in dDrS
-    float* dDrB = nullptr;  // (3, M, N) the blend at the network's frame; a real frame's stretch on its way back
-    float* dDrRT = nullptr; // (3, ph, pw) a real frame stretched and back (nativeDrbaReal)
+    float* dDrS = nullptr; // (6, M, N) the pair's pictures stretched (nativeDrbaAuthorBlend): two (3, M, N) slots,
+                           // frame i in slot i & 1, each frame stretched once (both sides of a group and the next
+                           // group's left frame read it)
+    int64_t drSFid[2] = {-1, -1}; // the frame id in each slot of dDrS (-1 = none)
+    float* dDrB = nullptr;  // (3, M, N) the blend at the network's frame; a real frame's stretch on its way back: the
+                            // accumulator's last 12 B a pixel (nativeDrbaAlloc, not owned)
+    float* dDrRT = nullptr; // (3, ph, pw) a real frame stretched and back (nativeDrbaReal): the accumulator's first
+                            // 36 B a motion pixel when the picture fits there, else its own block (drRtOwn)
+    bool drRtOwn = false;
     // NVIDIA Optical Flow model: the handoff answers
     // `engine=nvof` with the geometry only (like echo, no TensorRT engine at all); this host runs
     // the Optical Flow Accelerator itself through the driver's nvofapi64.dll (grid 4, fast,
@@ -11630,16 +11635,9 @@ static bool nativeDrbaAlloc(NativeRife& nr)
 {
     const size_t plane = (size_t)nr.ph * nr.pw, mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
     nr.drAuthor = drbaAuthorWanted(nr);
-    nr.drSKey = -1;
+    nr.drSFid[0] = nr.drSFid[1] = -1;
     if (nr.drAuthor)
-    {
         NCHK(cudaMalloc((void**)&nr.dDrS, 6 * mplane * sizeof(float)), "alloc drba stretched pair");
-        NCHK(cudaMalloc((void**)&nr.dDrB, 3 * mplane * sizeof(float)), "alloc drba stretched blend");
-        NCHK(cudaMalloc((void**)&nr.dDrRT, 3 * plane * sizeof(float)), "alloc drba real frame");
-        LOG("native: DRBA as its author runs it: the network's %dx%d frame stretched bilinearly as B, G, R, every "
-            "frame back to %dx%d (SMV_DRBA_AUTHOR=0 = the padded frame)\n",
-            nr.mpw, nr.mph, nr.w, nr.h);
-    }
     if (!nr.mph)
         NCHK(cudaMalloc((void**)&nr.dXh, 6 * plane * sizeof(uint16_t)), "alloc x fp16");
     NCHK(cudaMalloc((void**)&nr.dDrIBase, 4 * 3 * plane * sizeof(float)), "alloc drba frame ring");
@@ -11666,6 +11664,26 @@ static bool nativeDrbaAlloc(NativeRife& nr)
     // accumulator use clears it first
     if (nr.mph)
         nr.dDrB0 = (float*)nr.dDrAcc;
+    // DRBA as its author: the accumulator is idle from a tween's DrmNorm (and block0's FlowNorm) to its next clear,
+    // and every reader of these two runs on nr.stream before that clear (the blend's bilinear back, the pack of a real
+    // frame): the blend at the network's frame, also a real frame's stretch on its way back, takes the accumulator's
+    // last 12 B a pixel; the real frame stretched back (12 B a picture pixel) takes its first 36 B a motion pixel when
+    // the picture fits there (the pictures sit at the working size, the motion frame at the decoded size), else its
+    // own block
+    if (nr.drAuthor)
+    {
+        nr.dDrB = (float*)nr.dDrAcc + 9 * mplane;
+        if (plane <= 3 * mplane)
+            nr.dDrRT = (float*)nr.dDrAcc;
+        else
+        {
+            NCHK(cudaMalloc((void**)&nr.dDrRT, 3 * plane * sizeof(float)), "alloc drba real frame");
+            nr.drRtOwn = true;
+        }
+        LOG("native: DRBA as its author runs it: the network's %dx%d frame stretched bilinearly as B, G, R, every "
+            "frame back to %dx%d (SMV_DRBA_AUTHOR=0 = the padded frame); the blend%s in the accumulator\n",
+            nr.mpw, nr.mph, nr.w, nr.h, nr.drRtOwn ? "" : " and the real frame");
+    }
     return true;
 }
 
@@ -13247,17 +13265,18 @@ static void nativeFree(NativeRife& nr)
     if (nr.drTweens || nr.drHeads)
         LOG("native: drba %llu tweens (%llu head pairs), %llu block0 runs\n", (unsigned long long)nr.drTweens,
             (unsigned long long)nr.drHeads, (unsigned long long)nr.drBlock0);
-    for (void* p :
-         {(void*)nr.dDrIBase, (void*)nr.dDrF[0], (void*)nr.dDrF[1], (void*)nr.dDrF[2], (void*)nr.dDrF[3],
-          (void*)nr.dDrX[0], (void*)nr.dDrX[1], (void*)nr.drWin[0].f10, (void*)nr.drWin[0].r, (void*)nr.drWin[1].f10,
-          (void*)nr.drWin[1].r, (void*)nr.dDrAcc, (void*)nr.dDrMBase, (void*)nr.dDrS, (void*)nr.dDrB, (void*)nr.dDrRT})
+    for (void* p : {(void*)nr.dDrIBase, (void*)nr.dDrF[0], (void*)nr.dDrF[1], (void*)nr.dDrF[2], (void*)nr.dDrF[3],
+                    (void*)nr.dDrX[0], (void*)nr.dDrX[1], (void*)nr.drWin[0].f10, (void*)nr.drWin[0].r,
+                    (void*)nr.drWin[1].f10, (void*)nr.drWin[1].r, (void*)nr.dDrAcc, (void*)nr.dDrMBase, (void*)nr.dDrS,
+                    (void*)(nr.drRtOwn ? nr.dDrRT : nullptr)})
         if (p)
             cudaFree(p);
     nr.dDrIBase = nullptr;
     nr.dDrMBase = nullptr;
     nr.dDrS = nr.dDrB = nr.dDrRT = nullptr;
+    nr.drRtOwn = false;
     nr.drAuthor = false;
-    nr.drSKey = -1;
+    nr.drSFid[0] = nr.drSFid[1] = -1;
     for (int i = 0; i < 4; i++)
     {
         nr.dDrI[i] = nr.dDrF[i] = nullptr;
@@ -14378,22 +14397,30 @@ static bool nativeBilin(NativeRife& nr, const float* src, int sps, int srs, int 
 }
 
 // DRBA as its author (drAuthor): the pair's pictures (pic, frame 0 / frame 1 swapped by sw as k_rifeBlend reads them)
-// stretched to the network's frame once per pair side (to_inp), RIFE's last step there with the IFNet's flow and mask
-// as they are, the tween back to the pictures' size into dMerged (to_out)
+// stretched to the network's frame once per FRAME (to_inp; dDrS slot i & 1 holds frame i: both sides of a group and
+// the next group's left frame find theirs there), RIFE's last step there with the IFNet's flow and mask as they are,
+// the tween back to the pictures' size into dMerged (to_out)
 static bool nativeDrbaAuthorBlend(NativeRife& nr, const float* pic, int sw, uint32_t k, int side, cudaStream_t st)
 {
     int mw = nr.mpw, mh = nr.mph, mps = mw * mh, pps = nr.ph * nr.pw, half = 0, zp = 0;
-    const int64_t key = (int64_t)k * 2 + (side > 0 ? 1 : 0);
-    if (nr.drSKey != key)
+    // frame k - 2 sits at pic's slot k2 (nativeDrbaPics: sw = 1 puts the IFNet's frame 0 second; frame 0 is k - 1 on
+    // side -1, k - 2 on side +1), frame k - 1 at the other
+    const int k2 = side < 0 ? 1 - sw : sw;
+    for (int f = 0; f < 2; f++)
     {
-        for (int f = 0; f < 2; f++)
-            if (!nativeBilin(nr, pic + (size_t)f * 3 * pps, pps, nr.pw, nr.w, nr.h, nr.dDrS + (size_t)f * 3 * mps, mps,
-                             mw, mw, mh, 0, st))
-                return false;
-        nr.drSKey = key;
+        const int64_t fid = (int64_t)k - 2 + f;
+        const int slot = (int)(fid & 1), src = f ? 1 - k2 : k2;
+        if (nr.drSFid[slot] == fid)
+            continue;
+        if (!nativeBilin(nr, pic + (size_t)src * 3 * pps, pps, nr.pw, nr.w, nr.h, nr.dDrS + (size_t)slot * 3 * mps, mps,
+                         mw, mw, mh, 0, st))
+            return false;
+        nr.drSFid[slot] = fid;
     }
+    // the blend's frame 0 (k - 1 on side -1, k - 2 on side +1) is second in dDrS when its id is odd
+    int ssw = (int)(((int64_t)k - (side < 0 ? 1 : 2)) & 1);
     const float* sp = nr.dDrS;
-    void* a[] = {(void*)&sp, &sw,       &half, &mps, &mw, &mw, &mh,      &mw, &mh,
+    void* a[] = {(void*)&sp, &ssw,      &half, &mps, &mw, &mw, &mh,      &mw, &mh,
                  &nr.dFlow,  &nr.dMask, &mps,  &mw,  &mw, &mh, &nr.dDrB, &zp};
     return cuLaunchKernel(nr.fRifeBlendF, (mw + 15) / 16, (mh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) ==
                CUDA_SUCCESS &&
