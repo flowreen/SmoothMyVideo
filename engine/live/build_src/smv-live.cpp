@@ -1783,7 +1783,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // SMV_RIFE_TWO_DOMAIN=0: the IFNet reads the pictures. DRBA: the unbatched IFNet (one tween per
         // enqueue, its own DRM timestep map) plus the block0 flow engine, at the same frame
         const bool two = lkEnv("SMV_RIFE_TWO_DOMAIN") != "0";
-        if (!lkOfflineRife(script, two ? srcW : w, two ? srcH : h, oe))
+        // plain RIFE pads as its author does (NativeRife::zeroPad): zeros to a multiple of 128 in the motion frames
+        nr.zeroPad = two && !oa.drba && lkEnv("SMV_RIFE_AUTHOR_PAD") != "0";
+        if (!lkOfflineRife(script, two ? srcW : w, two ? srcH : h, oe, nr.zeroPad ? 128 : 64))
             return 2;
         if (oa.drba)
         {
@@ -2356,8 +2358,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         drLastOut = dO;
         return true;
     };
+    // DRBA's real frames as its author writes them (nativeDrbaReal); null = failed, which drEmit refuses
+    auto drReal = [&](const float* pic) -> const void* { return nativeDrbaReal(nr, pic); };
     // half != 0: an fp16 source (a tween as the IFNet wrote it)
     auto drEmit = [&](const void* src, uint8_t* dO, int half = 0) -> bool {
+        if (!src)
+            return false;
         if (passes)
             return nativeOfflineEmit(nr, src, ps, rs, dO, outIs16, half);
         void* a[] = {(void*)&src, &half, (void*)&ps, (void*)&rs, &w, &h, &dO};
@@ -2384,7 +2390,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             bool h = held;
             if (!h && fpsMode && side == 0 && 1.0 + fr[j] == 1.0)
             {
-                if (!drEmit(drbaFrame(nr, nr.drFid - 2), dOutRaw))
+                if (!drEmit(drReal(drbaFrame(nr, nr.drFid - 2)), dOutRaw))
                 {
                     io.setFail("drba left frame emit failed");
                     return false;
@@ -2416,7 +2422,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             const bool again = heldSide == side;
             if (!again)
             {
-                if (!drEmit(drbaFrame(nr, nr.drFid - 1), dHeldOut))
+                if (!drEmit(drReal(drbaFrame(nr, nr.drFid - 1)), dHeldOut))
                 {
                     io.setFail("drba held emit failed");
                     return false;
@@ -2785,8 +2791,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             float white = 203.0f / 80.0f; // BT.2408's reference white in scRGB units
             float knee = kMotionPqKnee, cap = kMotionPqCap;
             uint16_t* mdst = nr.drba ? drbaMotionNext(nr) : nr.dM + 3 * mplane;
-            void* a[] = {(void*)&msrc, &sps,    &srs,    &sw,   &sh,    &mdst, &dps,
-                         &nr.mpw,      &nr.mpw, &nr.mph, &mode, &white, &knee, &cap};
+            int zp = nr.zeroPad ? 1 : 0, stb = nr.drAuthor ? 1 : 0;
+            void* a[] = {(void*)&msrc, &sps,    &srs,  &sw,    &sh,   &mdst, &dps, &nr.mpw,
+                         &nr.mpw,      &nr.mph, &mode, &white, &knee, &cap,  &zp,  &stb};
             return cuLaunchKernel(nr.fMotionIn, (nr.mpw + 15) / 16, (nr.mph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st,
                                   a, nullptr) == CUDA_SUCCESS;
         };
@@ -3457,7 +3464,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             {
                 // --fps: no pair had a slot (closing_slot's last_out None): the last frame once,
                 // never on a resumed run (that frame is banked already)
-                if (!oa.resumed && (!drEmit(drbaFrame(nr, nr.drFid), dHeldOut) || !drSend(dHeldOut, false)))
+                if (!oa.resumed && (!drEmit(drReal(drbaFrame(nr, nr.drFid)), dHeldOut) || !drSend(dHeldOut, false)))
                     failed = true;
             }
             else
@@ -3470,7 +3477,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             if (!ok)
                 failed = true;
         }
-        else if (!oa.resumed && (!drEmit(drbaFrame(nr, 1), dHeldOut) || !drSend(dHeldOut, false)))
+        else if (!oa.resumed && (!drEmit(drReal(drbaFrame(nr, 1)), dHeldOut) || !drSend(dHeldOut, false)))
             failed = true;
     }
     if (!failed && !io.fail && fpsMode && !nr.drba && nFrames >= 1)

@@ -2281,7 +2281,7 @@ __device__ __forceinline__ float nvLerp(const float* __restrict__ p, int rowStri
 
 // ---- RIFE: the IFNet hands out its final flow and blend mask, the host makes the tween ---------
 // The motion frame the IFNet and its encode read: a planar source (fp32 codes, sw x sh) padded to
-// dpw x dph by replicating the edge, fp16 out (k_f2h's rounding). mode 0 = the codes as they are
+// dpw x dph by replicating the edge (zp: zeros, RIFE's author's pad), fp16 out (k_f2h's rounding). mode 0 = the codes as they are
 // (an SDR picture: bit for bit what k_f2h makes of it); 1 PQ / 2 HLG = the BT.2020 codes as BT.709
 // light over SDR white in sRGB, the encoding RIFE was trained on: up to the knee exactly an SDR
 // source's values, above it the largest channel takes PQ's spacing, cap of extended sRGB from the
@@ -2308,20 +2308,81 @@ __device__ __forceinline__ void motionEnc(float v[3], int mode, float sdrWhite, 
     for (int c = 0; c < 3; c++)
         v[c] = srgbOetf(l[c] * k);
 }
+// one axis of PyTorch's bilinear resize (F.interpolate, align_corners False, no antialias) as DRBA's author stretches
+// with it: output index d of m from n source samples = cell i0 / i1 and the weight l1 of i1
+__device__ __forceinline__ void blAxis(int d, int n, int m, int& i0, int& i1, float& l1)
+{
+    float s = ((float)n / (float)m) * ((float)d + 0.5f) - 0.5f;
+    s = s < 0.0f ? 0.0f : s;
+    i0 = (int)s;
+    i1 = i0 + (i0 < n - 1 ? 1 : 0);
+    l1 = s - (float)i0;
+}
+__device__ __forceinline__ float blAt(const float* __restrict__ p, int rs, int x0, int x1, int y0, int y1, float lx,
+                                      float ly)
+{
+    const float lx0 = 1.0f - lx, ly0 = 1.0f - ly;
+    return ly0 * (lx0 * p[(size_t)y0 * rs + x0] + lx * p[(size_t)y0 * rs + x1]) +
+           ly * (lx0 * p[(size_t)y1 * rs + x0] + lx * p[(size_t)y1 * rs + x1]);
+}
+// st (DRBA as its author, NativeRife::drAuthor): the source stretched bilinearly over the whole dpw x dph frame and
+// handed over as B, G, R (the author's frames come from OpenCV)
 __global__ void k_motionIn(const float* __restrict__ src, int sps, int srs, int sw, int sh,
                            unsigned short* __restrict__ dst, int dps, int drs, int dpw, int dph, int mode,
-                           float sdrWhite, float knee, float cap)
+                           float sdrWhite, float knee, float cap, int zp, int st)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= dpw || y >= dph) return;
     const size_t s = (size_t)(y < sh ? y : sh - 1) * srs + (x < sw ? x : sw - 1);
     const size_t d = (size_t)y * drs + x;
+    if (zp && (x >= sw || y >= sh))
+    {
+        dst[d] = dst[(size_t)dps + d] = dst[2 * (size_t)dps + d] = 0;
+        return;
+    }
     float v[3] = { src[s], src[(size_t)sps + s], src[2 * (size_t)sps + s] };
+    if (st)
+    {
+        int x0, x1, y0, y1;
+        float lx, ly;
+        blAxis(x, sw, dpw, x0, x1, lx);
+        blAxis(y, sh, dph, y0, y1, ly);
+        for (int c = 0; c < 3; c++)
+            v[c] = blAt(src + (size_t)c * sps, srs, x0, x1, y0, y1, lx, ly);
+    }
     motionEnc(v, mode, sdrWhite, knee, cap);
+    if (st)
+    {
+        const float t = v[0];
+        v[0] = v[2];
+        v[2] = t;
+    }
     dst[d] = f2h(v[0]);
     dst[(size_t)dps + d] = f2h(v[1]);
     dst[2 * (size_t)dps + d] = f2h(v[2]);
+}
+// three planes resized bilinearly as PyTorch's F.interpolate(mode='bilinear', align_corners=False) does (DRBA as its
+// author: every frame to the network's frame and every output back): sw x sh fp32 -> dw x dh, fp16 out when dHalf
+__global__ void k_bilin(const float* __restrict__ src, int sps, int srs, int sw, int sh, void* __restrict__ dst, int dps,
+                        int drs, int dw, int dh, int dHalf)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dw || y >= dh) return;
+    int x0, x1, y0, y1;
+    float lx, ly;
+    blAxis(x, sw, dw, x0, x1, lx);
+    blAxis(y, sh, dh, y0, y1, ly);
+    const size_t o = (size_t)y * drs + x;
+    for (int c = 0; c < 3; c++)
+    {
+        const float v = blAt(src + (size_t)c * sps, srs, x0, x1, y0, y1, lx, ly);
+        if (dHalf)
+            ((unsigned short*)dst)[(size_t)c * dps + o] = f2h(v);
+        else
+            ((float*)dst)[(size_t)c * dps + o] = v;
+    }
 }
 
 // ---- GMFSS and Restore on HDR planes: the SDR view at the model boundary ---------------------------
@@ -2708,6 +2769,22 @@ __device__ __forceinline__ float rbLerp(const void* __restrict__ p, int half, si
                     T.lx * ldS(p, half, base + (size_t)T.y1 * rs + T.x1);
     return (1.0f - T.ly) * a + T.ly * b;
 }
+// rbLerp over a zero pad (RIFE's author pads the frames with zeros and warps the padded frame): a tap at or past the
+// picture's w x h reads 0
+__device__ __forceinline__ float rbAtZ(const void* __restrict__ p, int half, size_t base, int rs, int x, int y, int w,
+                                       int h)
+{
+    return x < w && y < h ? ldS(p, half, base + (size_t)y * rs + x) : 0.0f;
+}
+__device__ __forceinline__ float rbLerpZ(const void* __restrict__ p, int half, size_t base, int rs, const NvTap& T, int w,
+                                         int h)
+{
+    const float a = (1.0f - T.lx) * rbAtZ(p, half, base, rs, T.x0, T.y0, w, h) +
+                    T.lx * rbAtZ(p, half, base, rs, T.x1, T.y0, w, h);
+    const float b = (1.0f - T.lx) * rbAtZ(p, half, base, rs, T.x0, T.y1, w, h) +
+                    T.lx * rbAtZ(p, half, base, rs, T.x1, T.y1, w, h);
+    return (1.0f - T.ly) * a + T.ly * b;
+}
 __device__ __forceinline__ void rbAxis(int x, int w, int fw, int& a0, int& a1, float& l)
 {
     const long long num = (2LL * x + 1) * fw - w, den = 2LL * w;
@@ -2764,7 +2841,7 @@ __device__ __forceinline__ void rbTaps(int x, int y, int w, int h, int cw, int c
 // RIFE's last step: frame 0 in pic's planes 0..2 and frame 1 in 3..5, or the reverse (sw)
 __global__ void k_rifeBlend(const void* __restrict__ pic, int sw, int half, int pps, int prs, int w, int h, int cw,
                             int ch, const unsigned short* __restrict__ flow, const unsigned short* __restrict__ mask,
-                            int mps, int mrs, int fw, int fh, unsigned short* __restrict__ out)
+                            int mps, int mrs, int fw, int fh, unsigned short* __restrict__ out, int zp)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -2777,8 +2854,9 @@ __global__ void k_rifeBlend(const void* __restrict__ pic, int sw, int half, int 
     const size_t o = (size_t)y * prs + x;
     for (int c = 0; c < 3; c++)
     {
-        const float a = rbLerp(pic, half, (size_t)((sw ? 3 : 0) + c) * pps, prs, T0);
-        const float b = rbLerp(pic, half, (size_t)((sw ? 0 : 3) + c) * pps, prs, T1);
+        const size_t b0 = (size_t)((sw ? 3 : 0) + c) * pps, b1 = (size_t)((sw ? 0 : 3) + c) * pps;
+        const float a = zp ? rbLerpZ(pic, half, b0, prs, T0, w, h) : rbLerp(pic, half, b0, prs, T0);
+        const float b = zp ? rbLerpZ(pic, half, b1, prs, T1, w, h) : rbLerp(pic, half, b1, prs, T1);
         O[(size_t)c * pps + o] = f2h(a * m + b * (1.0f - m));
     }
 }
@@ -2786,7 +2864,7 @@ __global__ void k_rifeBlend(const void* __restrict__ pic, int sw, int half, int 
 // it rounds once
 __global__ void k_rifeBlendF(const void* __restrict__ pic, int sw, int half, int pps, int prs, int w, int h, int cw,
                              int ch, const unsigned short* __restrict__ flow, const unsigned short* __restrict__ mask,
-                             int mps, int mrs, int fw, int fh, float* __restrict__ out)
+                             int mps, int mrs, int fw, int fh, float* __restrict__ out, int zp)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -2799,8 +2877,9 @@ __global__ void k_rifeBlendF(const void* __restrict__ pic, int sw, int half, int
     const size_t o = (size_t)y * prs + x;
     for (int c = 0; c < 3; c++)
     {
-        const float a = rbLerp(pic, half, (size_t)((sw ? 3 : 0) + c) * pps, prs, T0);
-        const float b = rbLerp(pic, half, (size_t)((sw ? 0 : 3) + c) * pps, prs, T1);
+        const size_t b0 = (size_t)((sw ? 3 : 0) + c) * pps, b1 = (size_t)((sw ? 0 : 3) + c) * pps;
+        const float a = zp ? rbLerpZ(pic, half, b0, prs, T0, w, h) : rbLerp(pic, half, b0, prs, T0);
+        const float b = zp ? rbLerpZ(pic, half, b1, prs, T1, w, h) : rbLerp(pic, half, b1, prs, T1);
         O[(size_t)c * pps + o] = a * m + b * (1.0f - m);
     }
 }
@@ -2810,7 +2889,7 @@ __global__ void k_rifeBlendF(const void* __restrict__ pic, int sw, int half, int
 __global__ void k_rifeBlendOut(const void* __restrict__ pic, int sw, int half, int pps, int prs, int w, int h,
                                int cw, int ch, const unsigned short* __restrict__ flow,
                                const unsigned short* __restrict__ mask, int mps, int mrs, int fw, int fh, int hdr,
-                               unsigned char* __restrict__ dst, int pitch, int x0, int y0)
+                               unsigned char* __restrict__ dst, int pitch, int x0, int y0, int zp)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -2822,8 +2901,9 @@ __global__ void k_rifeBlendOut(const void* __restrict__ pic, int sw, int half, i
     unsigned int word = 3u << 30;
     for (int c = 0; c < 3; c++)
     {
-        const float a = rbLerp(pic, half, (size_t)((sw ? 3 : 0) + c) * pps, prs, T0);
-        const float b = rbLerp(pic, half, (size_t)((sw ? 0 : 3) + c) * pps, prs, T1);
+        const size_t b0 = (size_t)((sw ? 3 : 0) + c) * pps, b1 = (size_t)((sw ? 0 : 3) + c) * pps;
+        const float a = zp ? rbLerpZ(pic, half, b0, prs, T0, w, h) : rbLerp(pic, half, b0, prs, T0);
+        const float b = zp ? rbLerpZ(pic, half, b1, prs, T1, w, h) : rbLerp(pic, half, b1, prs, T1);
         float v = a * m + b * (1.0f - m);
         v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
         if (hdr)
@@ -2846,7 +2926,7 @@ __global__ void k_rifeBlendOut(const void* __restrict__ pic, int sw, int half, i
 __global__ void k_rifeBlendOut32(const void* __restrict__ pic, int sw, int pps, int prs, int w, int h, int cw, int ch,
                                  const unsigned short* __restrict__ flow, const unsigned short* __restrict__ mask,
                                  int mps, int mrs, int fw, int fh, int hdr, unsigned char* __restrict__ dst, int pitch,
-                                 int x0, int y0)
+                                 int x0, int y0, int zp)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -2858,8 +2938,9 @@ __global__ void k_rifeBlendOut32(const void* __restrict__ pic, int sw, int pps, 
     unsigned int word = 3u << 30;
     for (int c = 0; c < 3; c++)
     {
-        const float a = rbLerp(pic, 0, (size_t)((sw ? 3 : 0) + c) * pps, prs, T0);
-        const float b = rbLerp(pic, 0, (size_t)((sw ? 0 : 3) + c) * pps, prs, T1);
+        const size_t b0 = (size_t)((sw ? 3 : 0) + c) * pps, b1 = (size_t)((sw ? 0 : 3) + c) * pps;
+        const float a = zp ? rbLerpZ(pic, 0, b0, prs, T0, w, h) : rbLerp(pic, 0, b0, prs, T0);
+        const float b = zp ? rbLerpZ(pic, 0, b1, prs, T1, w, h) : rbLerp(pic, 0, b1, prs, T1);
         float v = a * m + b * (1.0f - m);
         v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
         if (hdr)
@@ -4700,6 +4781,14 @@ struct NativeRife
     DrWin drWin[2] = {};         // c = 0: empty
     long long* dDrAcc = nullptr; // (6, M, N) the splat accumulator
     uint64_t drTweens = 0, drHeads = 0, drBlock0 = 0;
+    // DRBA as its author runs it (routineLife1/DRBA infer.py; drbaAuthorWanted): the network's frames stretched
+    // bilinearly over its whole /64 frame as B, G, R (k_motionIn st), RIFE's last step at that frame on the pair's
+    // stretched pictures, every output frame (tweens and real frames alike) bilinearly back to the pictures' size
+    bool drAuthor = false;
+    float* dDrS = nullptr;  // (6, M, N) the pair's pictures stretched (nativeDrbaAuthorBlend), the pair of drSKey
+    int64_t drSKey = -1;    // k * 2 + (side > 0) of the pair in dDrS
+    float* dDrB = nullptr;  // (3, M, N) the blend at the network's frame; a real frame's stretch on its way back
+    float* dDrRT = nullptr; // (3, ph, pw) a real frame stretched and back (nativeDrbaReal)
     // NVIDIA Optical Flow model: the handoff answers
     // `engine=nvof` with the geometry only (like echo, no TensorRT engine at all); this host runs
     // the Optical Flow Accelerator itself through the driver's nvofapi64.dll (grid 4, fast,
@@ -4915,6 +5004,10 @@ struct NativeRife
     // (mw x mh, padded to mph x mpw), and k_rifeBlend applies their flow and mask to the pictures dX
     // at the working size. mph = 0: the model's frame is the picture's (ph x pw), the IFNet reads dX / dXh.
     int mph = 0, mpw = 0, mw = 0, mh = 0;
+    // plain RIFE (two domains, both routes) as its author pads: zeros to a multiple of 128 (Practical-RIFE at scale 1)
+    // in the motion frames and under the blend's taps, instead of the edge replicated to a multiple of 64 (DRBA's pad);
+    // live reads it off the handoff's zpad=1; SMV_RIFE_AUTHOR_PAD=0 = the old pad
+    bool zeroPad = false;
     uint16_t* dM = nullptr; // (1,6,mph,mpw) fp16: prev in planes 0..2, cur in 3..5
     float* dMFit = nullptr; // live: the working-size picture shrunk to mw x mh (3 fp32 planes)
     int fCur = 0;
@@ -5000,6 +5093,7 @@ struct NativeRife
         fRifeBlendF = nullptr;                            // store, fp32 store)
     CUfunction fRifeBlendOut = nullptr;                   // its last step fused with a 1:1 slot store (blendOut)
     CUfunction fRifeBlendOut32 = nullptr;                 // the same for fp32 pictures
+    CUfunction fBilin = nullptr;                          // PyTorch's bilinear resize (DRBA as its author)
     CUfunction fHdrEnc = nullptr, fHdrFromSdr = nullptr, fHdrRange = nullptr; // GMFSS / Restore on HDR planes
     CUfunction fPackBgraSdr = nullptr, fUnpackBgraSdr = nullptr;              // FRUC's SDR pairs on HDR planes
     CUfunction fHdrRestOut = nullptr;                                         // Restore's way back on HDR planes
@@ -5671,6 +5765,7 @@ struct LkSession
     // live rife: RIFE's motion frame (mmw x mmh, padded mph x mpw), the frame the IFNet and
     // its encode run at (iph x ipw = the motion pad, else the pictures' pad)
     int mmw = 0, mmh = 0, mph = 0, mpw = 0, iph = 0, ipw = 0;
+    bool zpad = false; // live rife: the motion frame padded as RIFE's author pads (NativeRife::zeroPad)
 };
 
 // Create a folder and its missing parents. Users delete model_cache_safe_to_delete whenever
@@ -5833,7 +5928,7 @@ static void lkGmPickA(LkSession& s)
 }
 
 static bool lkSession(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH,
-                      LkSession& s)
+                      LkSession& s, int padMult = 64)
 {
     s = LkSession();
     s.backend = wideToUtf8(backendW);
@@ -5863,8 +5958,8 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
         sprintf_s(sb, "%.2f", g_flowScale);
         s.imgScale = s.mode ? kDlssModeShare[s.mode - 1] : (std::max)(0.01, (std::min)(1.0, strtod(sb, nullptr)));
     }
-    s.ph = (s.mh + 63) / 64 * 64;
-    s.pw = (s.mw + 63) / 64 * 64;
+    s.ph = (s.mh + padMult - 1) / padMult * padMult;
+    s.pw = (s.mw + padMult - 1) / padMult * padMult;
     char key[64];
     if (s.backend == "gmfss")
     {
@@ -5954,8 +6049,11 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
         const bool up = s.mw > s.cw || s.mh > s.ch;
         s.mmw = up ? s.cw : s.mw;
         s.mmh = up ? s.ch : s.mh;
-        s.mph = (s.mmh + 63) / 64 * 64;
-        s.mpw = (s.mmw + 63) / 64 * 64;
+        // plain RIFE pads as its author does (zeros to a multiple of 128, NativeRife::zeroPad); DRBA keeps 64
+        s.zpad = s.backend == "rife" && lkEnv("SMV_RIFE_AUTHOR_PAD") != "0";
+        const int pm = s.zpad ? 128 : 64;
+        s.mph = (s.mmh + pm - 1) / pm * pm;
+        s.mpw = (s.mmw + pm - 1) / pm * pm;
         if (safePad)
         {
             s.mpw = (std::max)(s.mpw, 1152);
@@ -6174,7 +6272,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     const std::string ed = eio.outs.empty() ? "?" : eio.outs[0].second, eid = eio.ins.empty() ? "?" : eio.ins[0].second;
     char tail[512], motion[96] = "";
     if (s.mph)
-        sprintf_s(motion, " mph=%d mpw=%d motw=%d moth=%d", s.mph, s.mpw, s.mmw, s.mmh);
+        sprintf_s(motion, " mph=%d mpw=%d motw=%d moth=%d%s", s.mph, s.mpw, s.mmw, s.mmh, s.zpad ? " zpad=1" : "");
     sprintf_s(
         tail,
         " batch=%d batchpad=%d xdtype=%s tdtype=%s fdtype=%s outdtype=%s ename=%s einame=%s edtype=%s eidtype=%s effects=0 fast=1%s%s",
@@ -7032,10 +7130,10 @@ struct OfflineEngines
     int ph = 0, pw = 0;
 };
 
-static bool lkOfflineRife(const std::wstring& script, int w, int h, OfflineEngines& o)
+static bool lkOfflineRife(const std::wstring& script, int w, int h, OfflineEngines& o, int padMult = 64)
 {
     LkSession s;
-    if (!lkSession(script, L"rife", (uint32_t)w, (uint32_t)h, s))
+    if (!lkSession(script, L"rife", (uint32_t)w, (uint32_t)h, s, padMult))
         return false;
     if (!nativeLoadDlls(script))
         return false;
@@ -7354,6 +7452,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         nr.mpw = f.mpw;
         nr.mw = f.mw;
         nr.mh = f.mh;
+        nr.zeroPad = f.zeroPad;
         nr.batchMax = f.batchMax;
         nr.identity = f.identity;
         nr.fitAa = f.fitAa;
@@ -7491,6 +7590,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     nr.mpw = num("mpw", 0);
     nr.mw = num("motw", 0);
     nr.mh = num("moth", 0);
+    nr.zeroPad = nr.mph && num("zpad", 0) == 1;
     if (nr.mph && (nr.mpw <= 0 || nr.mw <= 0 || nr.mh <= 0 || nr.mw > nr.mpw || nr.mh > nr.mph))
     {
         LOG("native: handoff line names an incomplete motion frame (mph / mpw / motw / moth)\n");
@@ -7630,6 +7730,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         f.mpw = nr.mpw;
         f.mw = nr.mw;
         f.mh = nr.mh;
+        f.zeroPad = nr.zeroPad;
         f.batchMax = nr.batchMax;
         f.identity = nr.identity;
         f.fitAa = nr.fitAa;
@@ -7839,6 +7940,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fRifeBlendF, "k_rifeBlendF"},
         {&nr.fRifeBlendOut, "k_rifeBlendOut"},
         {&nr.fRifeBlendOut32, "k_rifeBlendOut32"},
+        {&nr.fBilin, "k_bilin"},
         {&nr.fHdrEnc, "k_hdrEnc"},
         {&nr.fHdrFromSdr, "k_hdrFromSdr"},
         {&nr.fHdrRange, "k_hdrRange"},
@@ -11517,9 +11619,27 @@ static void nativeFsrupRelease(NativeRife& nr)
 // motion search uses at the model's frame (RIFE's two domains: the motion frame, where the ring also
 // keeps the motion frames and the IFNet's x; else the pictures' pad, the encode's fp16 frame in dXh's
 // cur half)
+// DRBA as its author runs it (NativeRife::drAuthor) in two domains, the default; SMV_DRBA_AUTHOR=0 = the network's
+// frames as SMV pads RIFE's (the edge replicated to a multiple of 64, R, G, B) and the blend on the pictures
+static bool drbaAuthorWanted(const NativeRife& nr)
+{
+    return nr.drba && nr.mph && lkEnv("SMV_DRBA_AUTHOR") != "0";
+}
+
 static bool nativeDrbaAlloc(NativeRife& nr)
 {
     const size_t plane = (size_t)nr.ph * nr.pw, mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
+    nr.drAuthor = drbaAuthorWanted(nr);
+    nr.drSKey = -1;
+    if (nr.drAuthor)
+    {
+        NCHK(cudaMalloc((void**)&nr.dDrS, 6 * mplane * sizeof(float)), "alloc drba stretched pair");
+        NCHK(cudaMalloc((void**)&nr.dDrB, 3 * mplane * sizeof(float)), "alloc drba stretched blend");
+        NCHK(cudaMalloc((void**)&nr.dDrRT, 3 * plane * sizeof(float)), "alloc drba real frame");
+        LOG("native: DRBA as its author runs it: the network's %dx%d frame stretched bilinearly as B, G, R, every "
+            "frame back to %dx%d (SMV_DRBA_AUTHOR=0 = the padded frame)\n",
+            nr.mpw, nr.mph, nr.w, nr.h);
+    }
     if (!nr.mph)
         NCHK(cudaMalloc((void**)&nr.dXh, 6 * plane * sizeof(uint16_t)), "alloc x fp16");
     NCHK(cudaMalloc((void**)&nr.dDrIBase, 4 * 3 * plane * sizeof(float)), "alloc drba frame ring");
@@ -12486,7 +12606,7 @@ static bool nativeTweenBuffers(NativeRife& nr)
     nr.tHeldMask = 0;
     NCHK(cudaMalloc((void**)&nr.dFlow, b * 4 * mplane * sizeof(uint16_t)), "alloc flow");
     NCHK(cudaMalloc((void**)&nr.dMask, b * mplane * sizeof(uint16_t)), "alloc mask");
-    nr.blendOut = !g_offline && !nr.gmfss && nr.w == nr.dw && nr.h == nr.dh && !nr.uw;
+    nr.blendOut = !g_offline && !nr.gmfss && nr.w == nr.dw && nr.h == nr.dh && !nr.uw && !drbaAuthorWanted(nr);
     if (nr.blendOut)
         LOG("native: RIFE's last step stores each tween straight into its slot (the %dx%d model frame is the "
             "presented one)\n",
@@ -12617,15 +12737,16 @@ static bool nativeViewFit(NativeRife& nr, const void* src, int half, int ps, int
 // pic = frame 0 in planes 0..2 and frame 1 in 3..5 at the pictures' layout (ph x pw), fp32 or fp16 by
 // half, or the reverse (sw). The model's frame is the pictures' (the engine's own x: the engine's warp clamps at its
 // padded frame) unless mph is set (RIFE's two domains: the flow is read at the picture size and a
-// tap clamps at the picture's content).
+// tap clamps at the picture's content). zeroPad: a tap in the picture's pad reads 0 (the author's zero pad).
 static bool nativeRifeBlend(NativeRife& nr, const void* pic, int half, int n, cudaStream_t st, int sw = 0)
 {
     int pps = nr.ph * nr.pw, prs = nr.pw, w = nr.w, h = nr.h;
     int mps = nr.mph ? nr.mph * nr.mpw : pps, mrs = nr.mph ? nr.mpw : nr.pw;
     int fw = nr.mph ? nr.mw : w, fh = nr.mph ? nr.mh : h;
     int cw = (fw == w && fh == h) ? nr.pw : w, ch = (fw == w && fh == h) ? nr.ph : h;
-    void* a[] = {(void*)&pic, &sw,       &half,     &pps, &prs, &w,  &h,  &cw,
-                 &ch,         &nr.dFlow, &nr.dMask, &mps, &mrs, &fw, &fh, &nr.dMerged};
+    int zp = nr.zeroPad ? 1 : 0;
+    void* a[] = {(void*)&pic, &sw,       &half, &pps, &prs, &w,  &h,          &cw, &ch,
+                 &nr.dFlow,   &nr.dMask, &mps,  &mrs, &fw,  &fh, &nr.dMerged, &zp};
     return cuLaunchKernel(nr.outHalf ? nr.fRifeBlend : nr.fRifeBlendF, (w + 15) / 16, (h + 15) / 16, (unsigned)n, 16,
                           16, 1, 0, (CUstream)st, a, nullptr) == CUDA_SUCCESS;
 }
@@ -12641,11 +12762,11 @@ static bool nativeRifeBlendOut(NativeRife& nr, const void* pic, int half, int k,
     int cw = (fw == w && fh == h) ? nr.pw : w, ch = (fw == w && fh == h) ? nr.ph : h;
     const uint16_t* flow = nr.dFlow + (size_t)k * 4 * mps;
     const uint16_t* mask = nr.dMask + (size_t)k * mps;
-    int hdr = nr.hdr ? 1 : 0, pitch = (int)nr.pitch;
-    void* a[] = {(void*)&pic,  &sw,  &half, &pps, &prs, &w,   &h,    &cw,    &ch,    (void*)&flow,
-                 (void*)&mask, &mps, &mrs,  &fw,  &fh,  &hdr, &slot, &pitch, &nr.x0, &nr.y0};
+    int hdr = nr.hdr ? 1 : 0, pitch = (int)nr.pitch, zp = nr.zeroPad ? 1 : 0;
+    void* a[] = {(void*)&pic, &sw,  &half, &pps, &prs, &w,    &h,     &cw,    &ch,    (void*)&flow, (void*)&mask,
+                 &mps,        &mrs, &fw,   &fh,  &hdr, &slot, &pitch, &nr.x0, &nr.y0, &zp};
     void* a32[] = {(void*)&pic, &sw,  &pps, &prs, &w,   &h,           &cw,    &ch,    (void*)&flow, (void*)&mask,
-                   &mps,        &mrs, &fw,  &fh,  &hdr, (void*)&slot, &pitch, &nr.x0, &nr.y0};
+                   &mps,        &mrs, &fw,  &fh,  &hdr, (void*)&slot, &pitch, &nr.x0, &nr.y0,       &zp};
     return cuLaunchKernel(half ? nr.fRifeBlendOut : nr.fRifeBlendOut32, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0,
                           (CUstream)st, half ? a : a32, nullptr) == CUDA_SUCCESS;
 }
@@ -13126,13 +13247,17 @@ static void nativeFree(NativeRife& nr)
     if (nr.drTweens || nr.drHeads)
         LOG("native: drba %llu tweens (%llu head pairs), %llu block0 runs\n", (unsigned long long)nr.drTweens,
             (unsigned long long)nr.drHeads, (unsigned long long)nr.drBlock0);
-    for (void* p : {(void*)nr.dDrIBase, (void*)nr.dDrF[0], (void*)nr.dDrF[1], (void*)nr.dDrF[2], (void*)nr.dDrF[3],
-                    (void*)nr.dDrX[0], (void*)nr.dDrX[1], (void*)nr.drWin[0].f10, (void*)nr.drWin[0].r,
-                    (void*)nr.drWin[1].f10, (void*)nr.drWin[1].r, (void*)nr.dDrAcc, (void*)nr.dDrMBase})
+    for (void* p :
+         {(void*)nr.dDrIBase, (void*)nr.dDrF[0], (void*)nr.dDrF[1], (void*)nr.dDrF[2], (void*)nr.dDrF[3],
+          (void*)nr.dDrX[0], (void*)nr.dDrX[1], (void*)nr.drWin[0].f10, (void*)nr.drWin[0].r, (void*)nr.drWin[1].f10,
+          (void*)nr.drWin[1].r, (void*)nr.dDrAcc, (void*)nr.dDrMBase, (void*)nr.dDrS, (void*)nr.dDrB, (void*)nr.dDrRT})
         if (p)
             cudaFree(p);
     nr.dDrIBase = nullptr;
     nr.dDrMBase = nullptr;
+    nr.dDrS = nr.dDrB = nr.dDrRT = nullptr;
+    nr.drAuthor = false;
+    nr.drSKey = -1;
     for (int i = 0; i < 4; i++)
     {
         nr.dDrI[i] = nr.dDrF[i] = nullptr;
@@ -14243,6 +14368,54 @@ static bool nativeDrbaPics(NativeRife& nr, uint32_t k, int side, const float*& p
     return true;
 }
 
+// k_bilin: three planes (sw x sh at sps / srs) to dw x dh (at dps / drs), fp16 out when dHalf
+static bool nativeBilin(NativeRife& nr, const float* src, int sps, int srs, int sw, int sh, void* dst, int dps, int drs,
+                        int dw, int dh, int dHalf, cudaStream_t st)
+{
+    void* a[] = {(void*)&src, &sps, &srs, &sw, &sh, &dst, &dps, &drs, &dw, &dh, &dHalf};
+    return cuLaunchKernel(nr.fBilin, (dw + 15) / 16, (dh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) ==
+           CUDA_SUCCESS;
+}
+
+// DRBA as its author (drAuthor): the pair's pictures (pic, frame 0 / frame 1 swapped by sw as k_rifeBlend reads them)
+// stretched to the network's frame once per pair side (to_inp), RIFE's last step there with the IFNet's flow and mask
+// as they are, the tween back to the pictures' size into dMerged (to_out)
+static bool nativeDrbaAuthorBlend(NativeRife& nr, const float* pic, int sw, uint32_t k, int side, cudaStream_t st)
+{
+    int mw = nr.mpw, mh = nr.mph, mps = mw * mh, pps = nr.ph * nr.pw, half = 0, zp = 0;
+    const int64_t key = (int64_t)k * 2 + (side > 0 ? 1 : 0);
+    if (nr.drSKey != key)
+    {
+        for (int f = 0; f < 2; f++)
+            if (!nativeBilin(nr, pic + (size_t)f * 3 * pps, pps, nr.pw, nr.w, nr.h, nr.dDrS + (size_t)f * 3 * mps, mps,
+                             mw, mw, mh, 0, st))
+                return false;
+        nr.drSKey = key;
+    }
+    const float* sp = nr.dDrS;
+    void* a[] = {(void*)&sp, &sw,       &half, &mps, &mw, &mw, &mh,      &mw, &mh,
+                 &nr.dFlow,  &nr.dMask, &mps,  &mw,  &mw, &mh, &nr.dDrB, &zp};
+    return cuLaunchKernel(nr.fRifeBlendF, (mw + 15) / 16, (mh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) ==
+               CUDA_SUCCESS &&
+           nativeBilin(nr, nr.dDrB, mps, mw, mw, mh, nr.dMerged, pps, nr.pw, nr.w, nr.h, nr.outHalf ? 1 : 0, st);
+}
+
+// a real frame of a DRBA session as its author outputs it (drAuthor: stretched to the network's frame and back, as
+// infer.py's to_out does to every frame it writes), else the picture itself
+static const float* nativeDrbaReal(NativeRife& nr, const float* pic)
+{
+    if (!nr.drAuthor)
+        return pic;
+    const int mps = nr.mph * nr.mpw, pps = nr.ph * nr.pw;
+    if (!nativeBilin(nr, pic, pps, nr.pw, nr.w, nr.h, nr.dDrB, mps, nr.mpw, nr.mpw, nr.mph, 0, nr.stream) ||
+        !nativeBilin(nr, nr.dDrB, mps, nr.mpw, nr.mpw, nr.mph, nr.dDrRT, pps, nr.pw, nr.w, nr.h, 0, nr.stream))
+    {
+        nr.die("drba real frame stretch failed");
+        return nullptr;
+    }
+    return nr.dDrRT;
+}
+
 static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool plain = false, uint8_t* slot = nullptr)
 {
     cudaStream_t st = nr.stream;
@@ -14380,8 +14553,16 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
     int sw = 0;
     if (nr.mph && !nativeDrbaPics(nr, k, side, pic, sw))
         return false;
-    if (slot ? !nativeRifeBlendOut(nr, pic, nr.mph ? 0 : (int)nr.xHalf, 0, slot, st, sw)
-             : !nativeRifeBlend(nr, pic, nr.mph ? 0 : (int)nr.xHalf, 1, st, sw))
+    if (nr.drAuthor)
+    {
+        if (!nativeDrbaAuthorBlend(nr, pic, sw, k, side, st))
+        {
+            nr.die("drba stretched blend failed");
+            return false;
+        }
+    }
+    else if (slot ? !nativeRifeBlendOut(nr, pic, nr.mph ? 0 : (int)nr.xHalf, 0, slot, st, sw)
+                  : !nativeRifeBlend(nr, pic, nr.mph ? 0 : (int)nr.xHalf, 1, st, sw))
     {
         nr.die(slot ? "rifeBlendOut launch failed" : "rifeBlend launch failed");
         return false;
@@ -16370,8 +16551,9 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         int dps = (int)mplane, mode = nr.hdr && !sdrPre ? 1 : 0;
         float white = (float)(g_sdrWhite / 80.0), knee = kMotionPqKnee, cap = kMotionPqCap;
         uint16_t* mdst = nr.drba ? drbaMotionNext(nr) : nr.dM + 3 * mplane;
-        void* a[] = {(void*)&msrc, &sps,    &srs,    &sw,   &sh,    &mdst, &dps,
-                     &nr.mpw,      &nr.mpw, &nr.mph, &mode, &white, &knee, &cap};
+        int zp = nr.zeroPad ? 1 : 0, stb = nr.drAuthor ? 1 : 0;
+        void* a[] = {(void*)&msrc, &sps,    &srs,  &sw,    &sh,   &mdst, &dps, &nr.mpw,
+                     &nr.mpw,      &nr.mph, &mode, &white, &knee, &cap,  &zp,  &stb};
         return cuLaunchKernel(nr.fMotionIn, (nr.mpw + 15) / 16, (nr.mph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
                               nullptr) == CUDA_SUCCESS;
     };
@@ -16687,6 +16869,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // one output slot's chain after the model (Restore, DLSS 5, Sharpen and RTX HDR already ran on the
     // captured frame): RTX VSR or the Lanczos resize, Upscale to
     auto storeSlot = [&](const void* src, uint8_t* slot, const char* what, int half = 0) -> bool {
+        if (!src)
+            return false; // a source that failed before (its line is logged)
         int ps = (int)plane, rs = nr.pw;
         const bool vsrNow = nr.vsr && !nr.vsrPre && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp);
         if (!vsrNow && !nr.fitAa && !nr.uw)
@@ -16850,7 +17034,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     break;
                 }
             }
-            else if (!storeSlot(nr.drba ? drLag : pipe ? nativeXPrev(nr) : dCur, slot, "packOut (real) launch failed"))
+            else if (!storeSlot(nr.drba ? nativeDrbaReal(nr, drLag)
+                                : pipe  ? nativeXPrev(nr)
+                                        : dCur,
+                                slot, "packOut (real) launch failed"))
             {
                 fail = true;
                 break;
@@ -16868,8 +17055,9 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 fail = true;
                 break;
             }
-            if ((held || !nr.blendOut) && !storeSlot(held ? (const void*)drLag : mergedAt(nr, 0, plane), slot,
-                                                     "packOut (drba) launch failed", held ? 0 : (int)nr.outHalf))
+            if ((held || !nr.blendOut) &&
+                !storeSlot(held ? (const void*)nativeDrbaReal(nr, drLag) : mergedAt(nr, 0, plane), slot,
+                           "packOut (drba) launch failed", held ? 0 : (int)nr.outHalf))
             {
                 fail = true;
                 break;

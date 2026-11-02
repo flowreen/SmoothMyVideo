@@ -172,9 +172,20 @@ RTX VSR / HDR and all three codecs.
   timestep map live at the motion frame (block0 takes fp32 frames: the two motion frames widened
   per call), and the blend warps the pictures; on exact pans DRBA gains 3.8 to 4.7 dB on PQ, 2.4
   to 2.8 with RTX HDR and 3.5 to 6.1 at a 2x working size, SDR at the picture's size stays within
-  76 dB of the one-domain tweens (`harness\drba_two_domain\drba_pan.py`). Live, when the model
+  76 dB of the one-domain tweens. Plain RIFE pads as its
+  author's inference script does, offline and live: zeros right and bottom to a multiple of 128 in
+  the motion frame, and a blend tap past the picture reads 0, which keeps the tweens at 55.7 / 57.2 dB
+  from the author's own fp32 output on anime / X4K clips (40.8 / 46.1 with the old pad). Live learns
+  it from the handoff's `zpad=1`.
+  `SMV_RIFE_AUTHOR_PAD=0` replicates the edge to a multiple of 64 instead. DRBA runs as its author's
+  `infer.py` does: no pad, every frame the network reads is stretched bilinearly to the next multiple
+  of 64 (PyTorch's `F.interpolate` arithmetic, `k_bilin` / `k_motionIn`) and handed over as B, G, R,
+  RIFE's last step runs at that size on the pair's stretched pictures, and every frame written, real
+  ones included, is stretched back bilinearly (the one resize in SMV that is not Lanczos: it is the
+  author's); the tweens sit at 57.5 / 57.2 dB from the author's own output on anime / X4K clips (35.9 /
+  39.4 padded). `SMV_DRBA_AUTHOR=0` = the padded RGB frame. Live, when the model
   frame is the presented rect (DLAA in a window or in Fill: no resize after the model),
-  `k_rifeBlendOut` makes each RIFE and DRBA tween straight in its output slot: the
+  `k_rifeBlendOut` makes each RIFE tween (and a padded DRBA one) straight in its output slot: the
   fp32 blend is clamped and rounded once to the slot's 8 or 10 bits instead of through an fp16
   tween, so the session allocates no tween buffer, the store takes 12 to 20 % less GPU time than
   the blend and pack it replaces (0.06 ms a tween at 1080p, 0.12 at 1440p), and the codes land on
