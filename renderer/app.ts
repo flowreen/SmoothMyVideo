@@ -594,6 +594,7 @@ async function checkRtxReady(){
   // screen space; it reappears only while something needed is still missing.
   $('rtxsetup').style.display = ok ? 'none' : 'block';
   syncUpscale();         // the upscale backend label depends on VSR readiness
+  syncHdrColor();        // so do the RTX HDR colour controls
   refreshPreviewIfOpen(); // re-render the open preview now that HDR readiness is known
 }
 async function doInstall(source){
@@ -619,7 +620,7 @@ if($('fsrup').checked) $('rtxvsr').checked = false;
 function fsrUpOn(){ return $('fsrup').checked && !$('rtxvsr').checked; }
 $('rtxvsr').onchange = () => { localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0'); if($('rtxvsr').checked && $('fsrup').checked){ $('fsrup').checked = false; localStorage.setItem('fsrupOn', '0'); } syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 $('fsrup').onchange = () => { localStorage.setItem('fsrupOn', $('fsrup').checked ? '1' : '0'); if($('fsrup').checked && $('rtxvsr').checked){ $('rtxvsr').checked = false; localStorage.setItem('vsrOn', '0'); } syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} fsrWarm(); };
-$('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
+$('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); syncHdrColor(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 syncRtx();
 // Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
 ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); syncPreview();

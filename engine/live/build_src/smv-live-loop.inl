@@ -2161,8 +2161,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
 
         const size_t capBytes = (size_t)capW * capH * 4; // capture-size frames (server input)
         std::vector<uint8_t> buf(capBytes), lastBuf(capBytes);
-        uint32_t shmSeq = 0;   // shm-mode: frame token sequence
-        double statLatSum = 0; // capture->present latency accumulation (ms)
+        bool lastInUpload = false; // the frame presented last is the upload buffer's (the pass from the mapped capture)
+        uint32_t shmSeq = 0;       // shm-mode: frame token sequence
+        double statLatSum = 0;     // capture->present latency accumulation (ms)
         uint64_t statLatN = 0;
         // ADAPTIVE SMOOTHNESS (server route, streaming only), Lossless-Scaling-style TARGET
         // mode: output frames are generated AT THE TARGET GRID's timestamps (the overlay
@@ -2330,13 +2331,18 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 }
             }
         };
+        // the frame presented last, again (an estimate of a repeated frame is zero vectors either way)
+        auto presentLast = [&] {
+            return lastInUpload ? host.presentTail(host.uploadBuf.Get(), 0, host.rowPitch)
+                                : host.presentFrame(lastBuf.data());
+        };
         auto resetFG = [&]() -> bool {
             sl::DLSSGOptions off{};
             off.mode = sl::DLSSGMode::eOff;
             off.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
             if (slDLSSGSetOptions(host.vp, off) != sl::Result::eOk)
                 return false;
-            if (!host.presentFrame(lastBuf.data()))
+            if (!presentLast())
                 return false;
             sl::DLSSGOptions on{};
             on.mode = sl::DLSSGMode::eOn;
@@ -2344,7 +2350,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
                 return false;
             for (int i = 0; i < 2; i++)
-                if (!host.presentFrame(lastBuf.data()))
+                if (!presentLast())
                     return false;
             drainQuiet();
             return true;
@@ -4419,7 +4425,29 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (g_verbose)
                     LOG("[loop] top hidden=%d\n", (int)hidden);
                 const bool gpuCap = cap.interop && srv.captexAck; // zero-copy capture active
-                int got = gpuCap ? cap.latestFrameGpu() : cap.latestFrame(buf.data());
+                // the direct DLSS-G pass with no cascade presents straight from the mapped capture (the estimate and
+                // the upload copy read it, no copy into buf); its reset fodder is then the upload buffer
+                const bool fromMap = !gpuCap && host.useSL && !g_fgOver && !casc && !cascUp;
+                int mapRc = 0; // 1 = presented, -1 = the reset failed, -2 = the present failed
+                auto presentMapped = [&](const uint8_t* p, size_t pitch, bool swz) {
+                    if (hidden)
+                        return;
+                    // a long input gap (paused video, idle desktop) poisons the DLSS-G pacer: re-warm
+                    if (now - lastPresentTick > 700)
+                    {
+                        LOG("input gap %llums, resetting DLSS-G\n", (unsigned long long)(now - lastPresentTick));
+                        if (!resetFG())
+                        {
+                            mapRc = -1;
+                            return;
+                        }
+                    }
+                    mapRc = host.presentFrame(p, (UINT)pitch, swz) ? 1 : -2;
+                    lastInUpload = true;
+                };
+                int got = gpuCap    ? cap.latestFrameGpu()
+                          : fromMap ? cap.latestFrameMapped(presentMapped)
+                                    : cap.latestFrame(buf.data());
                 if (g_verbose)
                     LOG("[loop] latest=%d\n", got);
                 if (got == -1)
@@ -4436,8 +4464,20 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // paused (alt-tab): frames are drained but not processed (the overlay is hidden)
                 if (got == 1 && !hidden)
                 {
+                    if (mapRc == -1)
+                    {
+                        LOG("DLSS-G reset failed\n");
+                        rc2 = 1;
+                        break;
+                    }
+                    if (mapRc == -2)
+                    {
+                        LOG("presentFrame failed\n");
+                        rc2 = 1;
+                        break;
+                    }
                     // a long input gap (paused video, idle desktop) poisons the DLSS-G pacer: re-warm
-                    if (host.useSL && now - lastPresentTick > 700)
+                    if (!fromMap && host.useSL && now - lastPresentTick > 700)
                     {
                         LOG("input gap %llums, resetting DLSS-G\n", (unsigned long long)(now - lastPresentTick));
                         if (!resetFG())
@@ -4447,7 +4487,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             break;
                         }
                     }
-                    if (casc && casc->present)
+                    if (fromMap)
+                    {
+                        // presented from the mapped capture above
+                    }
+                    else if (casc && casc->present)
                         (cascUp ? cascUp : casc)->feed(buf.data(), capBytes); // stage 1 takes it; presented below
                     else
                     {
@@ -4463,8 +4507,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     // direct routes (dlssg/identity): latency of the frame just presented
                     statLatSum += (nowQpc100() - cap.lastFrameTs) / 10000.0;
                     statLatN++;
-                    if (!gpuCap)
-                        memcpy(lastBuf.data(), buf.data(), capBytes); // lastBuf = SL-reset fodder only
+                    if (!gpuCap && !fromMap)
+                    {
+                        buf.swap(lastBuf); // lastBuf = SL-reset fodder only; latestFrame rewrites every byte of buf
+                        lastInUpload = false;
+                    }
                     const ULONGLONG prevProcTick = lastPresentTick;
                     lastPresentTick = GetTickCount64();
                     statCaptured++;

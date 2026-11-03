@@ -812,6 +812,15 @@ struct Capture
     // 1 = got a frame, 0 = none pending, -1 = failure, -2 = content resized.
     int latestFrame(uint8_t* out)
     {
+        return latestFrameMapped([&](const uint8_t* src, size_t pitch, bool swz) {
+            copyRows(out, (size_t)cw * 4, src, pitch, cw, ch, swz);
+        });
+    }
+
+    // latestFrame without the copy: use(rows, rowPitch, swz) reads the mapped readback before it is unmapped (swz = BGRA
+    // rows for the RGBA route to swap; the HDR pack's rows are its R10G10B10A2 words). Same returns.
+    template <class F> int latestFrameMapped(F&& use)
+    {
         wgc::Direct3D11CaptureFrame frame{nullptr};
         winrt::com_ptr<ID3D11Texture2D> tex;
         int rc = drainNewest(frame, tex);
@@ -845,8 +854,7 @@ struct Capture
             D3D11_MAPPED_SUBRESOURCE pm{};
             if (FAILED(ctx11->Map(convStaging.Get(), 0, D3D11_MAP_READ, 0, &pm)))
                 return -1;
-            for (uint32_t y = 0; y < ch; y++)
-                memcpy(out + (size_t)y * cw * 4, (const uint8_t*)pm.pData + (size_t)y * pm.RowPitch, (size_t)cw * 4);
+            use((const uint8_t*)pm.pData, (size_t)pm.RowPitch, false);
             ctx11->Unmap(convStaging.Get(), 0);
             return 1;
         }
@@ -858,21 +866,7 @@ struct Capture
         D3D11_MAPPED_SUBRESOURCE map{};
         if (FAILED(ctx11->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map)))
             return -1;
-        for (uint32_t y = 0; y < ch; y++)
-        {
-            const uint8_t* s = (const uint8_t*)map.pData + (size_t)y * map.RowPitch;
-            if (!swizzle)
-            {
-                memcpy(out + (size_t)y * cw * 4, s, (size_t)cw * 4);
-                continue;
-            }
-            uint32_t* d = (uint32_t*)(out + (size_t)y * cw * 4);
-            for (uint32_t x = 0; x < cw; x++)
-            {
-                uint32_t v = ((const uint32_t*)s)[x]; // BGRA in memory = 0xAARRGGBB little-endian
-                d[x] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16);
-            }
-        }
+        use((const uint8_t*)map.pData, (size_t)map.RowPitch, swizzle);
         ctx11->Unmap(staging.Get(), 0);
         return 1;
     }

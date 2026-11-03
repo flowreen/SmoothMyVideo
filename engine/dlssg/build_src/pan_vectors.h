@@ -8,6 +8,8 @@
 // else keeps the exact zero vectors, so those frames stay the ones DLSS-G made without this.
 #pragma once
 #include <emmintrin.h>
+#include <immintrin.h>
+#include <intrin.h>
 
 namespace panvec
 {
@@ -48,6 +50,115 @@ static inline uint64_t sadRow(const uint8_t* a, const uint8_t* b, int n)
     for (; i < n; i++)
         s += (uint64_t)(a[i] > b[i] ? a[i] - b[i] : b[i] - a[i]);
     return s;
+}
+
+// the CPU runs AVX2 and the OS saves its registers (CPUID 7 EBX bit 5, OSXSAVE + AVX, XCR0 bits 1 and 2)
+static inline bool hasAvx2()
+{
+    static const bool on = [] {
+        int r[4];
+        __cpuid(r, 0);
+        if (r[0] < 7)
+            return false;
+        __cpuid(r, 1);
+        if (!(r[2] & (1 << 27)) || !(r[2] & (1 << 28)) || (_xgetbv(0) & 6) != 6)
+            return false;
+        __cpuidex(r, 7, 0);
+        return (r[1] & (1 << 5)) != 0;
+    }();
+    return on;
+}
+
+// sadRow 32 bytes a step (AVX2 CPUs only), then 16, then the bytes left
+static inline uint64_t sadRow32(const uint8_t* a, const uint8_t* b, int n)
+{
+    __m256i acc = _mm256_setzero_si256();
+    int i = 0;
+    for (; i + 32 <= n; i += 32)
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_loadu_si256((const __m256i*)(a + i)),
+                                                    _mm256_loadu_si256((const __m256i*)(b + i))));
+    __m128i h = _mm_add_epi64(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    if (i + 16 <= n)
+    {
+        h = _mm_add_epi64(
+            h, _mm_sad_epu8(_mm_loadu_si128((const __m128i*)(a + i)), _mm_loadu_si128((const __m128i*)(b + i))));
+        i += 16;
+    }
+    uint64_t s = (uint64_t)_mm_cvtsi128_si64(h) + (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(h, h));
+    for (; i < n; i++)
+        s += (uint64_t)(a[i] > b[i] ? a[i] - b[i] : b[i] - a[i]);
+    return s;
+}
+
+// four 1/4 thumbnail pixels of an 8-bit RGBA frame: per 4 x 4 block (16 bytes of rows r1 and r2) the sum of
+// R + 2 G + B over pixels 1 and 2 of both rows, >> 4 (the thumbnail loop's own integer sums)
+static inline uint32_t thumbStep(const uint8_t* r1, const uint8_t* r2)
+{
+    const __m128i z = _mm_setzero_si128(), wt = _mm_setr_epi16(1, 2, 1, 0, 1, 2, 1, 0), one = _mm_set1_epi16(1);
+    __m128i m[4];
+    for (int k = 0; k < 4; k++)
+    {
+        // pixels 1 and 2 of the block as 16-bit channels, the two rows added: lanes R + 2 G, B for each pixel
+        const __m128i a = _mm_srli_si128(_mm_loadu_si128((const __m128i*)(r1 + 16 * k)), 4);
+        const __m128i b = _mm_srli_si128(_mm_loadu_si128((const __m128i*)(r2 + 16 * k)), 4);
+        m[k] = _mm_madd_epi16(_mm_add_epi16(_mm_unpacklo_epi8(a, z), _mm_unpacklo_epi8(b, z)), wt);
+    }
+    const __m128i q01 = _mm_madd_epi16(_mm_packs_epi32(m[0], m[1]), one);
+    const __m128i q23 = _mm_madd_epi16(_mm_packs_epi32(m[2], m[3]), one);
+    const __m128i s = _mm_srli_epi32(_mm_madd_epi16(_mm_packs_epi32(q01, q23), one), 4);
+    const __m128i p = _mm_packs_epi32(s, s);
+    return (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(p, p));
+}
+
+// the same for an R10G10B10A2 frame: (R + 2 G + B) of the 10-bit codes, >> 6
+static inline uint32_t thumbStep10(const uint8_t* r1, const uint8_t* r2)
+{
+    const __m128i m10 = _mm_set1_epi32(1023), m10x2 = _mm_set1_epi32(2046), mid = _mm_setr_epi32(0, -1, -1, 0);
+    auto luma = [&](__m128i v) {
+        return _mm_add_epi32(_mm_add_epi32(_mm_and_si128(v, m10), _mm_and_si128(_mm_srli_epi32(v, 9), m10x2)),
+                             _mm_and_si128(_mm_srli_epi32(v, 20), m10));
+    };
+    __m128i y[4];
+    for (int k = 0; k < 4; k++)
+        y[k] = _mm_and_si128(_mm_add_epi32(luma(_mm_loadu_si128((const __m128i*)(r1 + 16 * k))),
+                                           luma(_mm_loadu_si128((const __m128i*)(r2 + 16 * k)))),
+                             mid);
+    // each block's four lanes summed: a 4 x 4 transpose, then the rows added
+    const __m128i t0 = _mm_unpacklo_epi32(y[0], y[1]), t1 = _mm_unpackhi_epi32(y[0], y[1]);
+    const __m128i t2 = _mm_unpacklo_epi32(y[2], y[3]), t3 = _mm_unpackhi_epi32(y[2], y[3]);
+    const __m128i s = _mm_add_epi32(_mm_add_epi32(_mm_unpacklo_epi64(t0, t2), _mm_unpackhi_epi64(t0, t2)),
+                                    _mm_add_epi32(_mm_unpacklo_epi64(t1, t3), _mm_unpackhi_epi64(t1, t3)));
+    const __m128i p = _mm_packs_epi32(_mm_srli_epi32(s, 6), _mm_setzero_si128());
+    return (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(p, p));
+}
+
+// f() on a thread-pool thread beside g() on this one, both in this thread's float mode; f() runs here after g() when no
+// pool thread takes it
+template <class F, class G> static void beside(F f, G g)
+{
+    struct Job
+    {
+        F* f;
+        unsigned csr;
+        HANDLE done;
+    } job{&f, _mm_getcsr(), CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+    const bool queued = job.done && TrySubmitThreadpoolCallback(
+                                        [](PTP_CALLBACK_INSTANCE, void* ctx) {
+                                            Job* j = (Job*)ctx;
+                                            const unsigned csr = _mm_getcsr();
+                                            _mm_setcsr(j->csr);
+                                            (*j->f)();
+                                            _mm_setcsr(csr);
+                                            SetEvent(j->done);
+                                        },
+                                        &job, nullptr);
+    g();
+    if (queued)
+        WaitForSingleObject(job.done, INFINITE);
+    else
+        f();
+    if (job.done)
+        CloseHandle(job.done);
 }
 
 class Estimator
@@ -108,12 +219,44 @@ class Estimator
     // mean of each 4 x 4 block of that, the 1/32 one as the mean of each 2 x 2 block of the 1/16 one
     void thumbs(const uint8_t* frame, size_t pitch, bool hdr10, uint8_t* o4, uint8_t* o16, uint8_t* o32) const
     {
-        for (uint32_t y = 0; y < h4; y++)
+        // the 1/4 rows in two halves, the lower one on a pool thread
+        beside([&] { thumbRows(frame, pitch, hdr10, o4, h4 / 2, h4); },
+               [&] { thumbRows(frame, pitch, hdr10, o4, 0, h4 / 2); });
+        for (uint32_t y = 0; y < h16; y++)
+            for (uint32_t x = 0; x < w16; x++)
+            {
+                uint32_t s = 0;
+                for (uint32_t j = 0; j < 4; j++)
+                {
+                    const uint8_t* p = o4 + (size_t)(y * 4 + j) * w4 + x * 4;
+                    s += (uint32_t)p[0] + p[1] + p[2] + p[3];
+                }
+                o16[(size_t)y * w16 + x] = (uint8_t)(s >> 4);
+            }
+        for (uint32_t y = 0; y < h32; y++)
+            for (uint32_t x = 0; x < w32; x++)
+            {
+                const uint8_t* p = o16 + (size_t)(y * 2) * w16 + x * 2;
+                o32[(size_t)y * w32 + x] = (uint8_t)(((uint32_t)p[0] + p[1] + p[w16] + p[w16 + 1] + 2) >> 2);
+            }
+    }
+
+    // rows y0 .. y1 - 1 of the 1/4 thumbnail
+    void thumbRows(const uint8_t* frame, size_t pitch, bool hdr10, uint8_t* o4, uint32_t y0, uint32_t y1) const
+    {
+        for (uint32_t y = y0; y < y1; y++)
         {
             const uint8_t* r1 = frame + (size_t)(y * 4 + 1) * pitch;
             const uint8_t* r2 = r1 + pitch;
             uint8_t* o = o4 + (size_t)y * w4;
-            for (uint32_t x = 0; x < w4; x++)
+            const uint32_t x4 = w4 & ~3u; // four blocks a step, the loop below for the last few
+            for (uint32_t x = 0; x < x4; x += 4)
+            {
+                const size_t b = (size_t)x * 16;
+                const uint32_t v = hdr10 ? thumbStep10(r1 + b, r2 + b) : thumbStep(r1 + b, r2 + b);
+                memcpy(o + x, &v, 4);
+            }
+            for (uint32_t x = x4; x < w4; x++)
             {
                 const size_t b = (size_t)(x * 4 + 1) * 4;
                 uint32_t s = 0;
@@ -135,23 +278,6 @@ class Estimator
                 }
             }
         }
-        for (uint32_t y = 0; y < h16; y++)
-            for (uint32_t x = 0; x < w16; x++)
-            {
-                uint32_t s = 0;
-                for (uint32_t j = 0; j < 4; j++)
-                {
-                    const uint8_t* p = o4 + (size_t)(y * 4 + j) * w4 + x * 4;
-                    s += (uint32_t)p[0] + p[1] + p[2] + p[3];
-                }
-                o16[(size_t)y * w16 + x] = (uint8_t)(s >> 4);
-            }
-        for (uint32_t y = 0; y < h32; y++)
-            for (uint32_t x = 0; x < w32; x++)
-            {
-                const uint8_t* p = o16 + (size_t)(y * 2) * w16 + x * 2;
-                o32[(size_t)y * w32 + x] = (uint8_t)(((uint32_t)p[0] + p[1] + p[w16] + p[w16 + 1] + 2) >> 2);
-            }
     }
 
     // mean |c(x, y) - p(x - dx, y - dy)| over the overlap of a w x h thumbnail; -1 when the overlap is under 40 %
@@ -163,8 +289,12 @@ class Estimator
         if (n <= 0 || m <= 0 || (double)n * m < 0.4 * w * h)
             return -1;
         uint64_t s = 0;
-        for (int y = y0; y < y1; y++)
-            s += sadRow(c + (size_t)y * w + x0, p + (size_t)(y - dy) * w + (x0 - dx), n);
+        if (hasAvx2())
+            for (int y = y0; y < y1; y++)
+                s += sadRow32(c + (size_t)y * w + x0, p + (size_t)(y - dy) * w + (x0 - dx), n);
+        else
+            for (int y = y0; y < y1; y++)
+                s += sadRow(c + (size_t)y * w + x0, p + (size_t)(y - dy) * w + (x0 - dx), n);
         return (double)s / ((double)n * m);
     }
 
@@ -241,22 +371,29 @@ class Estimator
         bx = ax;
         by = ay;
 
-        // fine: +-4 around it at 1/4, then the sub-pixel fit
+        // fine: +-4 around it at 1/4 (offsets 0 .. 40 on a pool thread, 41 .. 80 and the still one here), then the
+        // sub-pixel fit
         double tab[9][9];
+        auto fill = [&](int k0, int k1) {
+            for (int k = k0; k < k1; k++)
+                tab[k / 9][k % 9] = meanSad(c4, p4, W4, H4, 4 * bx + k % 9 - 4, 4 * by + k / 9 - 4);
+        };
+        double s0 = -1;
+        beside([&] { fill(0, 41); },
+               [&] {
+                   fill(41, 81);
+                   s0 = meanSad(c4, p4, W4, H4, 0, 0);
+               });
         int fx = 4 * bx, fy = 4 * by;
         double fb = -1;
         for (int j = 0; j < 9; j++)
             for (int i = 0; i < 9; i++)
-            {
-                tab[j][i] = meanSad(c4, p4, W4, H4, 4 * bx + i - 4, 4 * by + j - 4);
                 if (tab[j][i] >= 0 && (fb < 0 || tab[j][i] < fb))
                 {
                     fb = tab[j][i];
                     fx = 4 * bx + i - 4;
                     fy = 4 * by + j - 4;
                 }
-            }
-        const double s0 = meanSad(c4, p4, W4, H4, 0, 0);
         if (fb < 0 || s0 < 0.5 || fb > kExplain * s0)
             return r;
         const int ti = fx - 4 * bx + 4, tj = fy - 4 * by + 4;

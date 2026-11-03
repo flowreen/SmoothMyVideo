@@ -85,6 +85,31 @@ static void pumpMessages()
     }
 }
 
+// h rows of w 4-byte pixels from src to dst in two halves, the lower one on a pool thread; swz = swap bytes 0 and 2 of
+// every pixel (BGRA <-> RGBA)
+static void copyRows(uint8_t* dst, size_t dstPitch, const uint8_t* src, size_t srcPitch, uint32_t w, uint32_t h,
+                     bool swz)
+{
+    auto rows = [&](uint32_t y0, uint32_t y1) {
+        for (uint32_t y = y0; y < y1; y++)
+        {
+            const uint8_t* s = src + (size_t)y * srcPitch;
+            if (!swz)
+            {
+                memcpy(dst + (size_t)y * dstPitch, s, (size_t)w * 4);
+                continue;
+            }
+            uint32_t* d = (uint32_t*)(dst + (size_t)y * dstPitch);
+            for (uint32_t x = 0; x < w; x++)
+            {
+                uint32_t v = ((const uint32_t*)s)[x]; // BGRA in memory = 0xAARRGGBB little-endian
+                d[x] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16);
+            }
+        }
+    };
+    panvec::beside([&] { rows(h / 2, h); }, [&] { rows(0, h / 2); });
+}
+
 // "now" in the WGC SystemRelativeTime domain (100ns since boot, QPC-based). Integer split
 // instead of double: at ~day-scale uptimes a double loses enough mantissa to skew by ~1ms.
 static int64_t qpcFreq()
@@ -174,11 +199,21 @@ struct Host
     ComPtr<ID3D12Resource> texFrame;
     ComPtr<ID3D12Resource> texDepth;
     ComPtr<ID3D12Resource> texMvec;
-    bool panOn = false;     // the pan as motion vectors (pan_vectors.h), set once its writer is up on the SL route
-    panvec::Estimator pan;  // measures each CPU frame against the one presented before
-    panvec::Writer panTex;  // writes texMvec
-    panvec::Result panNext; // the next SL present's vectors (zero unless presentFrame measured its frame)
-    ComPtr<ID3D12Resource> uploadBuf;
+    bool panOn = false;       // the pan as motion vectors (pan_vectors.h), set once its writer is up on the SL route
+    panvec::Estimator pan;    // measures each CPU frame against the one presented before
+    panvec::Writer panTex;    // writes texMvec
+    panvec::Result panNext;   // the next SL present's vectors (zero unless presentFrame measured its frame)
+    HANDLE panDone = nullptr; // set by the pool thread presentFrame hands its estimate to
+    struct
+    {
+        const uint8_t* src;
+        UINT pitch;
+        unsigned csr; // the presenting thread's float mode, so the pool thread's Result is the inline one
+    } panJob{};
+    ComPtr<ID3D12Resource> uploadBuf;     // the upload buffer presentFrame filled last (the init uploads use it too)
+    ComPtr<ID3D12Resource> uploadRing[2]; // the SL route's two: one fills while the GPU still copies from the other
+    uint64_t uploadFence[2]{};            // the fence value of the present that last copied from each
+    UINT uploadIdx = 0;
     UINT rowPitch = 0;
     // Ring of 3 allocators so the slot-buffer presents can be PIPELINED (recorded while earlier
     // presents still execute); allocFence[i] gates reuse of allocs[i]. alloc stays an alias
@@ -550,11 +585,14 @@ struct Host
         // texFrame = the SL route's staging copy (the server route copies the footprint straight into the back buffer)
         if ((useSL && (!makeTex(texFmt, texFrame) || !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth) ||
                        !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
-            !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadBuf))
+            !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadRing[0]) ||
+            (useSL &&
+             !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadRing[1])))
         {
             LOG("resource creation failed\n");
             return 1;
         }
+        uploadBuf = uploadRing[0];
 
         // fill depth (flat 0.5) + mvec (zero) once, via the shared upload buffer (SL tag inputs)
         if (useSL)
@@ -632,20 +670,60 @@ struct Host
     }
 
     // CPU path: copy a frame into the upload buffer, then run the present tail.
-    // srcPitch = source row stride in bytes (0 = tight W*4; shm slots are 256-aligned).
-    bool presentFrame(const uint8_t* rgba, UINT srcPitch = 0)
+    // srcPitch = source row stride in bytes (0 = tight W*4; shm slots are 256-aligned); swz = BGRA rows (the mapped
+    // capture), swapped to the route's RGBA on the way in.
+    bool presentFrame(const uint8_t* rgba, UINT srcPitch = 0, bool swz = false)
     {
         if (!srcPitch)
             srcPitch = W * 4;
-        if (panOn)
+        // the estimate (R and B in either order) reads the frame on a pool thread while this one copies it into the
+        // upload buffer
+        const bool panAsync = panOn && startPan(rgba, srcPitch);
+        if (panOn && !panAsync)
             panNext = pan.run(rgba, W, H, srcPitch, texFmt == DXGI_FORMAT_R10G10B10A2_UNORM);
+        // the SL route's presents do not wait for the GPU: fill the ring's other buffer once its last copy ran
+        bool ringFree = true;
+        if (useSL)
+        {
+            uploadIdx ^= 1;
+            uploadBuf = uploadRing[uploadIdx];
+            if (fence->GetCompletedValue() < uploadFence[uploadIdx])
+            {
+                fence->SetEventOnCompletion(uploadFence[uploadIdx], fenceEvent);
+                ringFree = WaitForSingleObject(fenceEvent, 5000) == WAIT_OBJECT_0;
+            }
+        }
         uint8_t* dst = nullptr;
-        if (FAILED(uploadBuf->Map(0, nullptr, (void**)&dst)))
+        const bool mapped = ringFree && SUCCEEDED(uploadBuf->Map(0, nullptr, (void**)&dst));
+        if (mapped)
+        {
+            copyRows(dst, rowPitch, rgba, srcPitch, W, H, swz);
+            uploadBuf->Unmap(0, nullptr);
+        }
+        if (panAsync)
+            WaitForSingleObject(panDone, INFINITE); // the caller may reuse rgba once this returns
+        if (!mapped)
             return false;
-        for (uint32_t y = 0; y < H; y++)
-            memcpy(dst + (size_t)y * rowPitch, rgba + (size_t)y * srcPitch, W * 4);
-        uploadBuf->Unmap(0, nullptr);
         return presentTail(uploadBuf.Get(), 0, rowPitch);
+    }
+
+    // queues pan.run on the thread pool; false = no event or no pool thread, the caller measures inline
+    bool startPan(const uint8_t* rgba, UINT srcPitch)
+    {
+        if (!panDone && !(panDone = CreateEventW(nullptr, FALSE, FALSE, nullptr)))
+            return false;
+        panJob = {rgba, srcPitch, _mm_getcsr()};
+        return TrySubmitThreadpoolCallback(
+                   [](PTP_CALLBACK_INSTANCE, void* ctx) {
+                       Host* h = (Host*)ctx;
+                       const unsigned csr = _mm_getcsr();
+                       _mm_setcsr(h->panJob.csr);
+                       h->panNext =
+                           h->pan.run(h->panJob.src, W, H, h->panJob.pitch, h->texFmt == DXGI_FORMAT_R10G10B10A2_UNORM);
+                       _mm_setcsr(csr);
+                       SetEvent(h->panDone);
+                   },
+                   this, nullptr) != FALSE;
     }
 
     bool presentTail(ID3D12Resource* src, UINT64 srcOffset, UINT srcPitch)
@@ -661,9 +739,8 @@ struct Host
     {
         pumpMessages();
 
-        // Pipelining applies ONLY to the shared VRAM slot buffer: the slot memory is stable until
-        // the next group. The CPU path reuses uploadBuf immediately after returning and the SL
-        // route owns its own pacing, so both stay fully synchronous.
+        // Pipelining: the shared VRAM slot buffer (stable until the next group) and, on the SL route, a CPU frame
+        // (its upload buffer = one of uploadRing's two, see the end). Any other source stays fully synchronous.
         const bool pipelined = !useSL && outBuf && src == outBuf.Get();
         const UINT ai = allocIdx;
         allocIdx = (allocIdx + 1) % 3;
@@ -820,6 +897,13 @@ struct Host
         allocFence[ai] = fenceValue;
         if (pipelined)
             return true;
+        if (useSL && src == uploadBuf.Get())
+        {
+            // a CPU frame on the SL route: the next one fills the ring's other buffer, this one is free once the fence
+            // passes (the queue keeps the copies in order; the allocator ring bounds the frames in flight)
+            uploadFence[uploadIdx] = fenceValue;
+            return true;
+        }
         if (fence->GetCompletedValue() < fenceValue)
         {
             fence->SetEventOnCompletion(fenceValue, fenceEvent);
@@ -986,6 +1070,11 @@ struct Host
         waitQueue();
         if (fenceEvent)
             CloseHandle(fenceEvent);
+        if (panDone)
+        {
+            CloseHandle(panDone);
+            panDone = nullptr;
+        }
         // the output ring's shared NT handle keeps the ring's video memory alive however the
         // resource and the CUDA import are released (the server's stop dropped the import already)
         if (hOutBuf)
