@@ -2162,8 +2162,21 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const size_t capBytes = (size_t)capW * capH * 4; // capture-size frames (server input)
         std::vector<uint8_t> buf(capBytes), lastBuf(capBytes);
         bool lastInUpload = false; // the frame presented last is the upload buffer's (the pass from the mapped capture)
-        uint32_t shmSeq = 0;       // shm-mode: frame token sequence
-        double statLatSum = 0;     // capture->present latency accumulation (ms)
+        bool lastInTex = false;    // ... or texFrame's (that pass through the GPU handoff)
+        // the GPU handoff for that pass (Capture::dgInit; SMV_LIVE_DGPU=0 = off, =fail = its fallback): set up at its
+        // first frame, once a session
+        bool dgWanted = true;
+        bool dgFailTest = false;
+        {
+            wchar_t dv[8]{};
+            if (GetEnvironmentVariableW(L"SMV_LIVE_DGPU", dv, 8))
+            {
+                dgWanted = dgWanted && dv[0] != L'0';
+                dgFailTest = wcscmp(dv, L"fail") == 0;
+            }
+        }
+        uint32_t shmSeq = 0;   // shm-mode: frame token sequence
+        double statLatSum = 0; // capture->present latency accumulation (ms)
         uint64_t statLatN = 0;
         // ADAPTIVE SMOOTHNESS (server route, streaming only), Lossless-Scaling-style TARGET
         // mode: output frames are generated AT THE TARGET GRID's timestamps (the overlay
@@ -2333,8 +2346,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         };
         // the frame presented last, again (an estimate of a repeated frame is zero vectors either way)
         auto presentLast = [&] {
-            return lastInUpload ? host.presentTail(host.uploadBuf.Get(), 0, host.rowPitch)
-                                : host.presentFrame(lastBuf.data());
+            return lastInTex      ? host.presentTail(nullptr, 0, 0)
+                   : lastInUpload ? host.presentTail(host.uploadBuf.Get(), 0, host.rowPitch)
+                                  : host.presentFrame(lastBuf.data());
         };
         auto resetFG = [&]() -> bool {
             sl::DLSSGOptions off{};
@@ -4444,10 +4458,42 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     }
                     mapRc = host.presentFrame(p, (UINT)pitch, swz) ? 1 : -2;
                     lastInUpload = true;
+                    lastInTex = false;
                 };
-                int got = gpuCap    ? cap.latestFrameGpu()
-                          : fromMap ? cap.latestFrameMapped(presentMapped)
-                                    : cap.latestFrame(buf.data());
+                // the same pass through the GPU handoff: the frame reaches DLSS-G as a shared slot, the readback serves
+                // the estimate alone
+                auto presentShared = [&](const uint8_t* p, size_t pitch, int slot, uint64_t wrote) {
+                    if (hidden)
+                        return;
+                    if (now - lastPresentTick > 700)
+                    {
+                        LOG("input gap %llums, resetting DLSS-G\n", (unsigned long long)(now - lastPresentTick));
+                        if (!resetFG())
+                        {
+                            mapRc = -1;
+                            return;
+                        }
+                    }
+                    const uint64_t freed = host.presentShared(p, (UINT)pitch, slot, wrote);
+                    cap.dgFree[slot] = freed ? freed : cap.dgFree[slot];
+                    mapRc = freed ? 1 : -2;
+                    lastInTex = true;
+                };
+                if (fromMap && dgWanted && !cap.dgOn())
+                {
+                    if (dgFailTest || !cap.dgInit() || !host.dgOpen(cap.dgTexH[0], cap.dgTexH[1], cap.dgWroteH) ||
+                        !cap.dgOpenCopied(host.dgCopiedH))
+                    {
+                        cap.dgRelease();
+                        host.dgClose();
+                        LOG("note: the GPU handoff is unavailable: frames reach DLSS-G through an upload copy\n");
+                    }
+                    dgWanted = false; // set up once a session
+                }
+                int got = gpuCap                  ? cap.latestFrameGpu()
+                          : fromMap && cap.dgOn() ? cap.latestFrameShared(presentShared)
+                          : fromMap               ? cap.latestFrameMapped(presentMapped)
+                                                  : cap.latestFrame(buf.data());
                 if (g_verbose)
                     LOG("[loop] latest=%d\n", got);
                 if (got == -1)
@@ -4510,7 +4556,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (!gpuCap && !fromMap)
                     {
                         buf.swap(lastBuf); // lastBuf = SL-reset fodder only; latestFrame rewrites every byte of buf
-                        lastInUpload = false;
+                        lastInUpload = lastInTex = false;
                     }
                     const ULONGLONG prevProcTick = lastPresentTick;
                     lastPresentTick = GetTickCount64();

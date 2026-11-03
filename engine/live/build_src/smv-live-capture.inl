@@ -27,6 +27,72 @@ static const char kHdrPackCS[] = "Texture2D<float4> src : register(t0);\n"
                                  "    dst[id.xy] = q.x | (q.y << 10) | (q.z << 20) | (3u << 30);\n"
                                  "}\n";
 
+// The direct DLSS-G pass's GPU handoff (Capture::latestFrameShared): the client crop (B8G8R8A8 read as float: exact, one
+// value per byte) stored into an R8G8B8A8 slot of the DLSS-G device, the bytes in its RGBA order (the CPU route's swizzle)
+static const char kDgSwizzleCS[] = "Texture2D<float4> src : register(t0);\n"
+                                   "RWTexture2D<unorm float4> dst : register(u0);\n"
+                                   "[numthreads(8,8,1)]\n"
+                                   "void main(uint3 id : SV_DispatchThreadID)\n"
+                                   "{\n"
+                                   "    uint w, h;\n"
+                                   "    dst.GetDimensions(w, h);\n"
+                                   "    if (id.x >= w || id.y >= h) return;\n"
+                                   "    dst[id.xy] = src[id.xy];\n"
+                                   "}\n";
+
+// ... and the estimate's 1/4 thumbnail of the crop (panvec thumbRows' integer sums: per 4 x 4 block R + 2 G + B over
+// rows and columns 1 and 2, >> 4; R and B either order), read back instead of the frame
+static const char kDgThumbCS[] =
+    "Texture2D<float4> src : register(t0);\n"
+    "RWTexture2D<uint> dst : register(u0);\n"
+    "[numthreads(8,8,1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID)\n"
+    "{\n"
+    "    uint w, h;\n"
+    "    dst.GetDimensions(w, h);\n"
+    "    if (id.x >= w || id.y >= h) return;\n"
+    "    uint s = 0;\n"
+    "    for (uint j = 1; j <= 2; j++)\n"
+    "        for (uint i = 1; i <= 2; i++)\n"
+    "        {\n"
+    "            uint3 c = (uint3)(src[uint2(id.x * 4 + i, id.y * 4 + j)].rgb * 255.0 + 0.5);\n"
+    "            s += c.r + 2 * c.g + c.b;\n"
+    "        }\n"
+    "    dst[id.xy] = s >> 4;\n"
+    "}\n";
+
+// the HDR10 route's two: the pack's R10G10B10A2 words (kHdrPackCS, u1) stored into the R10G10B10A2 slot (code / 1023 and
+// alpha / 3: exact), and their thumbnail (thumbRows' 10-bit sums: R + 2 G + B of the codes, >> 6)
+static const char kDgUnpack10CS[] = "RWTexture2D<unorm float4> dst : register(u0);\n"
+                                    "RWTexture2D<uint> src : register(u1);\n"
+                                    "[numthreads(8,8,1)]\n"
+                                    "void main(uint3 id : SV_DispatchThreadID)\n"
+                                    "{\n"
+                                    "    uint w, h;\n"
+                                    "    dst.GetDimensions(w, h);\n"
+                                    "    if (id.x >= w || id.y >= h) return;\n"
+                                    "    uint v = src[id.xy];\n"
+                                    "    dst[id.xy] = float4(v & 1023, (v >> 10) & 1023, (v >> 20) & 1023, v >> 30) /\n"
+                                    "                 float4(1023.0, 1023.0, 1023.0, 3.0);\n"
+                                    "}\n";
+static const char kDgThumb10CS[] = "RWTexture2D<uint> dst : register(u0);\n"
+                                   "RWTexture2D<uint> src : register(u1);\n"
+                                   "[numthreads(8,8,1)]\n"
+                                   "void main(uint3 id : SV_DispatchThreadID)\n"
+                                   "{\n"
+                                   "    uint w, h;\n"
+                                   "    dst.GetDimensions(w, h);\n"
+                                   "    if (id.x >= w || id.y >= h) return;\n"
+                                   "    uint s = 0;\n"
+                                   "    for (uint j = 1; j <= 2; j++)\n"
+                                   "        for (uint i = 1; i <= 2; i++)\n"
+                                   "        {\n"
+                                   "            uint v = src[uint2(id.x * 4 + i, id.y * 4 + j)];\n"
+                                   "            s += (v & 1023) + 2 * ((v >> 10) & 1023) + ((v >> 20) & 1023);\n"
+                                   "        }\n"
+                                   "    dst[id.xy] = s >> 6;\n"
+                                   "}\n";
+
 // Whole-screen capture (Capture::samePicture): any bit that differs between two pictures sets the flag. a = the
 // arrival (the WGC frame itself, read at the client crop's offset `off`; the copy route: its crop, off = 0), b = the
 // last kept picture (the crop, its size = the test's). The formats read as float4 (B8G8R8A8 unorm: exact, one value per
@@ -138,6 +204,127 @@ struct Capture
     HANDLE hTex = nullptr, hFence = nullptr; // INHERITABLE NT handles (same values in the child)
     bool interop = false;
     HWND targetWnd = nullptr; // capture target (monitor mode: the seeding window), for requestRefresh
+    // THE GPU HANDOFF (the direct DLSS-G pass; the loop sets it up, SMV_LIVE_DGPU=0 = off, =fail = its fallback): a
+    // frame reaches the DLSS-G device on the GPU, stored into one of two shared slots in the route's format (SDR: the
+    // crop as RGBA, kDgSwizzleCS; HDR10: the pack's words as R10G10B10A2, kDgUnpack10CS), instead of through the CPU and
+    // an upload copy; the estimate reads back its 1/4 thumbnail (kDgThumbCS / kDgThumb10CS, ~1/64 of the frame) instead
+    // of the frame. dgWrote = this device's fence (a slot written), dgCopied = the DLSS-G device's (a slot copied): a
+    // slot is rewritten only once its last frame's copy ran (dgFree[slot], set by the loop from the present)
+    ComPtr<ID3D11ComputeShader> dgCS, dgThumbCS;
+    ComPtr<ID3D11Texture2D> dgSrc, dgTex[2], dgThumb, dgThumbStage;
+    ComPtr<ID3D11ShaderResourceView> dgSrcView;
+    ComPtr<ID3D11UnorderedAccessView> dgUav[2], dgThumbUav;
+    ComPtr<ID3D11Fence> dgWrote, dgCopied;
+    HANDLE dgTexH[2]{}, dgWroteH{};
+    uint64_t dgWroteVal = 0, dgFree[2]{};
+    int dgSlot = 0;
+
+    bool dgOn() const
+    {
+        return dgCopied != nullptr;
+    }
+
+    // this device's half of the handoff (the slots, their handles, dgWrote); false = unavailable, released again
+    bool dgInit()
+    {
+        dgRelease();
+        ComPtr<ID3D11Device5> dev5;
+        ComPtr<ID3DBlob> cs, ts, err;
+        const char* sw = hdrPack ? kDgUnpack10CS : kDgSwizzleCS;
+        const char* th = hdrPack ? kDgThumb10CS : kDgThumbCS;
+        if (cw < 4 || ch < 4 || FAILED(dev11.As(&dev5)) || (!ctx4 && FAILED(ctx11.As(&ctx4))) ||
+            FAILED(D3DCompile(sw, strlen(sw), nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err)) ||
+            FAILED(dev11->CreateComputeShader(cs->GetBufferPointer(), cs->GetBufferSize(), nullptr, &dgCS)) ||
+            FAILED(D3DCompile(th, strlen(th), nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &ts, &err)) ||
+            FAILED(dev11->CreateComputeShader(ts->GetBufferPointer(), ts->GetBufferSize(), nullptr, &dgThumbCS)))
+            return dgFail();
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = cw / 4;
+        td.Height = ch / 4;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.SampleDesc = {1, 0};
+        td.Format = DXGI_FORMAT_R8_UINT;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        if (FAILED(dev11->CreateTexture2D(&td, nullptr, &dgThumb)) ||
+            FAILED(dev11->CreateUnorderedAccessView(dgThumb.Get(), nullptr, &dgThumbUav)))
+            return dgFail();
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(dev11->CreateTexture2D(&td, nullptr, &dgThumbStage)))
+            return dgFail();
+        td = D3D11_TEXTURE2D_DESC{};
+        td.Width = cw;
+        td.Height = ch;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.SampleDesc = {1, 0};
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (!hdrPack && (FAILED(dev11->CreateTexture2D(&td, nullptr, &dgSrc)) ||
+                         FAILED(dev11->CreateShaderResourceView(dgSrc.Get(), nullptr, &dgSrcView))))
+            return dgFail(); // HDR10 reads the pack's convDst instead
+        td.Format = hdrPack ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        for (int i = 0; i < 2; i++)
+        {
+            ComPtr<IDXGIResource1> r1;
+            if (FAILED(dev11->CreateTexture2D(&td, nullptr, &dgTex[i])) ||
+                FAILED(dev11->CreateUnorderedAccessView(dgTex[i].Get(), nullptr, &dgUav[i])) ||
+                FAILED(dgTex[i].As(&r1)) || FAILED(r1->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &dgTexH[i])))
+                return dgFail();
+        }
+        if (FAILED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&dgWrote))) ||
+            FAILED(dgWrote->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &dgWroteH)))
+            return dgFail();
+        return true;
+    }
+
+    // the DLSS-G device's dgCopied, from its handle: the handoff is on once this opens
+    bool dgOpenCopied(HANDLE h)
+    {
+        ComPtr<ID3D11Device5> dev5;
+        if (FAILED(dev11.As(&dev5)) || FAILED(dev5->OpenSharedFence(h, IID_PPV_ARGS(&dgCopied))))
+            return dgFail();
+        return true;
+    }
+
+    bool dgFail()
+    {
+        dgRelease();
+        return false;
+    }
+
+    void dgRelease()
+    {
+        dgCS.Reset();
+        dgThumbCS.Reset();
+        dgThumb.Reset();
+        dgThumbStage.Reset();
+        dgThumbUav.Reset();
+        dgSrc.Reset();
+        dgSrcView.Reset();
+        dgWrote.Reset();
+        dgCopied.Reset();
+        for (int i = 0; i < 2; i++)
+        {
+            dgTex[i].Reset();
+            dgUav[i].Reset();
+            if (dgTexH[i])
+                CloseHandle(dgTexH[i]);
+            dgTexH[i] = nullptr;
+            dgFree[i] = 0;
+        }
+        if (dgWroteH)
+            CloseHandle(dgWroteH);
+        dgWroteH = nullptr;
+        dgWroteVal = 0;
+        dgSlot = 0;
+    }
 
     void initInterop()
     {
@@ -402,6 +589,7 @@ struct Capture
         lastFrameTs = 0;
         newestIn = 0;
         held = nullptr;
+        dgRelease();
         stopping = false;
         interop = false;
         sharedTex.Reset();
@@ -868,6 +1056,60 @@ struct Capture
             return -1;
         use((const uint8_t*)map.pData, (size_t)map.RowPitch, swizzle);
         ctx11->Unmap(staging.Get(), 0);
+        return 1;
+    }
+
+    // the frame through the GPU handoff: its crop into dgTex[slot] for the DLSS-G device, its thumbnail read back.
+    // use(thumb, pitch, slot, wrote) runs the estimate on the thumbnail and presents the slot once dgWrote reaches
+    // `wrote`; the caller sets dgFree[slot] to the dgCopied value of that present. latestFrame's returns
+    template <class F> int latestFrameShared(F&& use)
+    {
+        wgc::Direct3D11CaptureFrame frame{nullptr};
+        winrt::com_ptr<ID3D11Texture2D> tex;
+        int rc = drainNewest(frame, tex);
+        if (rc == -3)
+            return 0;
+        if (rc)
+            return rc;
+        const int s = dgSlot;
+        dgSlot ^= 1;
+        copyCropped(hdrPack ? convSrc.Get() : dgSrc.Get(), tex.get());
+        frame.Close();
+        newestIn = 0;
+        if (mt)
+            mt->Enter(); // samePicture binds its own compute shader from FrameArrived's thread
+        // one compute pass: t0 = srv, u0 = dst, u1 = in (an R32_UINT input read as a UAV)
+        auto pass = [&](ID3D11ComputeShader* cs, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* dst,
+                        ID3D11UnorderedAccessView* in, UINT w, UINT h) {
+            ctx11->CSSetShader(cs, nullptr, 0);
+            ctx11->CSSetShaderResources(0, 1, &srv);
+            ID3D11UnorderedAccessView* uav[2] = {dst, in};
+            ctx11->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
+            ctx11->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            srv = nullptr;
+            uav[0] = uav[1] = nullptr;
+            ctx11->CSSetShaderResources(0, 1, &srv);
+            ctx11->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
+        };
+        if (hdrPack) // dlssg HDR: the pack into convDst first, the passes below read its words
+            pass(convCS.Get(), convSrcView.Get(), convUav.Get(), nullptr, cw, ch);
+        ID3D11ShaderResourceView* src = hdrPack ? nullptr : dgSrcView.Get();
+        ID3D11UnorderedAccessView* in = hdrPack ? convUav.Get() : nullptr;
+        // the thumbnail first: its Map below waits for it alone, not for the slot's wait
+        pass(dgThumbCS.Get(), src, dgThumbUav.Get(), in, cw / 4, ch / 4);
+        ctx11->CopyResource(dgThumbStage.Get(), dgThumb.Get());
+        if (dgFree[s])
+            ctx4->Wait(dgCopied.Get(), dgFree[s]); // the slot's last frame was copied out
+        pass(dgCS.Get(), src, dgUav[s].Get(), in, cw, ch);
+        ctx4->Signal(dgWrote.Get(), ++dgWroteVal);
+        if (mt)
+            mt->Leave();
+        ctx11->Flush(); // the DLSS-G device waits for the signal
+        D3D11_MAPPED_SUBRESOURCE map{};
+        if (FAILED(ctx11->Map(dgThumbStage.Get(), 0, D3D11_MAP_READ, 0, &map)))
+            return -1;
+        use((const uint8_t*)map.pData, (size_t)map.RowPitch, s, dgWroteVal);
+        ctx11->Unmap(dgThumbStage.Get(), 0);
         return 1;
     }
 

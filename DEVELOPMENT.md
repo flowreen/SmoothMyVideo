@@ -1133,7 +1133,8 @@ exit 5) or a `dlssg2f` without the mode makes the host start it again on 8-bit f
 PAN VECTORS (`engine\dlssg\build_src\pan_vectors.h`, used by `dlssg2f` and by the live host's own DLSS-G): a video has
 no game motion vectors, and with zero vectors DLSS-G's own flow loses a fast camera pan (past about 60-90 px a frame
 the new frames melt or show people twice, at x2 as at x6). Each presenter measures every frame it uploads against the
-frame it presented before: luma thumbnails at 1/4, 1/16 and 1/32 of the size, a full SAD search at 1/32 (up to 384 px
+frame it presented before (Live's direct pass, whose frames stay on the GPU, from the 1/4 thumbnail its capture device
+makes with the same integer sums: `Estimator::runThumb`): luma thumbnails at 1/4, 1/16 and 1/32 of the size, a full SAD search at 1/32 (up to 384 px
 each way), refines at 1/16 and 1/4, a sub-pixel fit. When one translation explains the change (its error under 0.6 x
 the still picture's, and at least half of the changed 32 px tiles agree), the vector texture holds it, written by a
 UAV clear; tiles a still picture explains clearly better (subtitles, logos, the edge of a letterbox bar) stay zero.
@@ -1883,6 +1884,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_FRUC_PIPE=0` / `=force` | Live Smooth Motion: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder, the fixed multipliers too (gates; see "Pipelined across pairs") |
 | `SMV_FSRFG_PIPE=0` / `=force` / `=serial` | Live AMD FSR frame generation: never pipeline the midpoint tree across pairs / pipeline every ladder and fixed multiplier, x2 included (gates) / the same with the new pair's level-1 Optical Flow after the shown pair's deeper calls (an A/B lever); unset = the priced automatic route (see "Pipelined across pairs") |
 | `SMV_FRUC_STEPUP=0` | Live Smooth Motion / AMD FSR 4 FG: a target between two ladder nodes runs the largest node that fits instead of the node above it (gates; see "The node above the target") |
+| `SMV_LIVE_DGPU=0` / `=fail` | Live DLSS 4.5's direct pass hands its frames to DLSS-G through the CPU and an upload copy instead of on the GPU (the A/B lever) / the GPU handoff's setup fails (its trigger test: `note: the GPU handoff is unavailable ...`, the session runs the upload route); never a product setting |
 | `SMV_LIVE_CASCADE=off` / `=probe` / `=present`, `SMV_LIVE_CASCADE_GEN` | Live DLSS 4.5: `off` = one pass only (no plan above the limit); development only (the direct route): `probe` starts `dlssg2f.exe --stage1` beside the session (in a job object that ends it with the host), feeds it every captured frame and reads every frame it shares on the host's own D3D12 device, presenting nothing of it; `present` = the cascade: the session's DLSS-G (`--gen`) presents stage 1's frames instead of the captured ones (x6 x x2 = x12); `_GEN` = stage 1's generated frames (1..5, default 5). Lines `cascade probe: ...` / `cascade stage 1: ...` (harness `dlssg_cascade\probe_gate.py`) |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..9, default 3 offline, 2 live; exact nodes go to depth 9 either way) |
 | `SMV_CQ` | override the encoder CQ for measurement |
@@ -2316,6 +2318,14 @@ prebuilt next to its own copy of the Streamline runtime.
 Rules (hard-won, do not regress):
 * Swap chain flags `FRAME_LATENCY_WAITABLE_OBJECT | ALLOW_TEARING`, or Streamline's pacer kills the
   first Present.
+* The direct DLSS 4.5 pass (no effects, no cascade) hands each frame to DLSS-G on the GPU
+  (`Capture::latestFrameShared`, `Host::presentShared`): the capture device stores the crop into one of two shared
+  textures in the swap chain's format (SDR: `kDgSwizzleCS`, the B8G8R8A8 crop as R8G8B8A8; HDR10: `kDgUnpack10CS`, the
+  pack's words as R10G10B10A2), the DLSS-G queue waits on the capture device's fence (`dgWrote`), copies the slot into
+  `texFrame` and signals its own (`dgCopied`), which the capture device waits on before it rewrites that slot. The pan
+  estimate reads back only the 1/4 thumbnail (`kDgThumbCS` / `kDgThumb10CS`). The frames and vectors are the bytes of
+  the upload route; a thumbnail change edits these shaders and `thumbStep` / `thumbStep10` together. At 4K the two 33 MB
+  copies over PCIe were most of the cycle's GPU time.
 * The overlay never activates: it is created `WS_EX_NOACTIVATE` and shown with `SW_SHOWNOACTIVATE`
   (a resume with `SW_SHOWNA`), so a live start or resume never takes the user's focus. Streamline 2.14
   pauses DLSS-FG while its window is not the foreground; the focus shim

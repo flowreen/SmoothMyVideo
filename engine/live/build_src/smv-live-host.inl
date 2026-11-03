@@ -214,6 +214,14 @@ struct Host
     ComPtr<ID3D12Resource> uploadRing[2]; // the SL route's two: one fills while the GPU still copies from the other
     uint64_t uploadFence[2]{};            // the fence value of the present that last copied from each
     UINT uploadIdx = 0;
+    // the GPU handoff (Capture::dgInit): the capture device's two shared slots and its dgWrote opened here; dgCopied =
+    // this queue's fence the capture device waits on before rewriting a slot (dgCopiedH = its handle there)
+    ComPtr<ID3D12Resource> dgTex[2];
+    ComPtr<ID3D12Fence> dgWrote, dgCopied;
+    HANDLE dgCopiedH{};
+    uint64_t dgCopiedVal = 0;
+    int dgPend = -1;          // the slot the next present copies into texFrame (presentShared), -1 = none
+    uint64_t dgPendWrote = 0; // the dgWrote value that present waits for
     UINT rowPitch = 0;
     // Ring of 3 allocators so the slot-buffer presents can be PIPELINED (recorded while earlier
     // presents still execute); allocFence[i] gates reuse of allocs[i]. alloc stays an alias
@@ -707,6 +715,47 @@ struct Host
         return presentTail(uploadBuf.Get(), 0, rowPitch);
     }
 
+    // the capture device's half of the GPU handoff (its slots' and dgWrote's handles); false = unavailable, closed again
+    bool dgOpen(HANDLE t0, HANDLE t1, HANDLE wrote)
+    {
+        dgClose();
+        const HANDLE th[2] = {t0, t1};
+        bool ok = true;
+        for (int i = 0; i < 2 && ok; i++)
+            ok = SUCCEEDED(device->OpenSharedHandle(th[i], IID_PPV_ARGS(&dgTex[i])));
+        ok = ok && SUCCEEDED(device->OpenSharedHandle(wrote, IID_PPV_ARGS(&dgWrote))) &&
+             SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&dgCopied))) &&
+             SUCCEEDED(device->CreateSharedHandle(dgCopied.Get(), nullptr, GENERIC_ALL, nullptr, &dgCopiedH));
+        if (!ok)
+            dgClose();
+        return ok;
+    }
+
+    void dgClose()
+    {
+        for (auto& t : dgTex)
+            t.Reset();
+        dgWrote.Reset();
+        dgCopied.Reset();
+        if (dgCopiedH)
+            CloseHandle(dgCopiedH);
+        dgCopiedH = nullptr;
+        dgCopiedVal = 0;
+        dgPend = -1;
+    }
+
+    // the GPU handoff's present: the estimate on the frame's 1/4 thumbnail (rows `pitch` apart), then slot `slot`
+    // copied into texFrame once the capture device's dgWrote reaches `wrote`. Returns the dgCopied value that frees the
+    // slot, 0 = the present failed
+    uint64_t presentShared(const uint8_t* thumb, UINT pitch, int slot, uint64_t wrote)
+    {
+        if (panOn)
+            panNext = pan.runThumb(thumb, pitch, W, H);
+        dgPend = slot;
+        dgPendWrote = wrote;
+        return presentTail(nullptr, 0, 0) ? dgCopiedVal : 0;
+    }
+
     // queues pan.run on the thread pool; false = no event or no pool thread, the caller measures inline
     bool startPan(const uint8_t* rgba, UINT srcPitch)
     {
@@ -735,9 +784,12 @@ struct Host
         return ok;
     }
 
+    // src null on the SL route = the GPU handoff's slot dgPend (presentShared), else texFrame as it is (the last frame)
     bool presentTailInner(ID3D12Resource* src, UINT64 srcOffset, UINT srcPitch)
     {
         pumpMessages();
+        const int pend = src ? -1 : dgPend;
+        dgPend = -1;
 
         // Pipelining: the shared VRAM slot buffer (stable until the next group) and, on the SL route, a CPU frame
         // (its upload buffer = one of uploadRing's two, see the end). Any other source stays fully synchronous.
@@ -788,7 +840,19 @@ struct Host
         {
             // SL route: stage through texFrame (unchanged, verified pipeline)
             D3D12_TEXTURE_COPY_LOCATION dl{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
+            if (pend >= 0)
+            {
+                // the capture device's slot, resting in COMMON
+                b.Transition.pResource = dgTex[pend].Get();
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                list->ResourceBarrier(1, &b);
+                list->CopyResource(texFrame.Get(), dgTex[pend].Get());
+                std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+                list->ResourceBarrier(1, &b);
+            }
+            else if (src)
+                list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
             b.Transition.pResource = texFrame.Get();
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -850,7 +914,11 @@ struct Host
 
             slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *tok);
             ID3D12CommandList* ls[] = {list.Get()};
+            if (pend >= 0)
+                queue->Wait(dgWrote.Get(), dgPendWrote); // the capture device wrote the slot
             queue->ExecuteCommandLists(1, ls);
+            if (pend >= 0)
+                queue->Signal(dgCopied.Get(), ++dgCopiedVal); // the slot may be rewritten
             slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *tok);
 
             slPCLSetMarker(sl::PCLMarker::ePresentStart, *tok);
@@ -897,6 +965,8 @@ struct Host
         allocFence[ai] = fenceValue;
         if (pipelined)
             return true;
+        if (useSL && !src)
+            return true; // texFrame and the slot are the GPU's alone (the capture device waits on dgCopied)
         if (useSL && src == uploadBuf.Get())
         {
             // a CPU frame on the SL route: the next one fills the ring's other buffer, this one is free once the fence
@@ -1068,6 +1138,7 @@ struct Host
             slDLSSGSetOptions(vp, off);
         }
         waitQueue();
+        dgClose();
         if (fenceEvent)
             CloseHandle(fenceEvent);
         if (panDone)

@@ -190,7 +190,20 @@ class Estimator
         return r;
     }
 
+    // run() from a ready 1/4 thumbnail (what thumbRows writes for the frame: fw / 4 bytes a row, rows `pitch` apart),
+    // e.g. one a GPU made
+    Result runThumb(const uint8_t* t4src, size_t pitch, uint32_t fw, uint32_t fh)
+    {
+        given4 = t4src;
+        given4Pitch = pitch;
+        const Result r = run(nullptr, fw, fh, 0, false);
+        given4 = nullptr;
+        return r;
+    }
+
   private:
+    const uint8_t* given4 = nullptr; // runThumb's thumbnail, thumbs() copies it instead of making one
+    size_t given4Pitch = 0;
     static constexpr int kTile = 8;         // a tile = 8 x 8 thumbnail pixels = 32 x 32 frame pixels
     static constexpr int kRange32 = 12;     // the coarse search, in 1/32 pixels each way (384 frame pixels)
     static constexpr double kExplain = 0.6; // the translation's error must stay under this share of the still one's
@@ -219,9 +232,13 @@ class Estimator
     // mean of each 4 x 4 block of that, the 1/32 one as the mean of each 2 x 2 block of the 1/16 one
     void thumbs(const uint8_t* frame, size_t pitch, bool hdr10, uint8_t* o4, uint8_t* o16, uint8_t* o32) const
     {
-        // the 1/4 rows in two halves, the lower one on a pool thread
-        beside([&] { thumbRows(frame, pitch, hdr10, o4, h4 / 2, h4); },
-               [&] { thumbRows(frame, pitch, hdr10, o4, 0, h4 / 2); });
+        // the 1/4 rows in two halves, the lower one on a pool thread (runThumb's own thumbnail copied)
+        if (given4)
+            for (uint32_t y = 0; y < h4; y++)
+                memcpy(o4 + (size_t)y * w4, given4 + (size_t)y * given4Pitch, w4);
+        else
+            beside([&] { thumbRows(frame, pitch, hdr10, o4, h4 / 2, h4); },
+                   [&] { thumbRows(frame, pitch, hdr10, o4, 0, h4 / 2); });
         for (uint32_t y = 0; y < h16; y++)
             for (uint32_t x = 0; x < w16; x++)
             {
