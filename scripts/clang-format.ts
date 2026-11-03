@@ -21,6 +21,7 @@ const FILES = [
   'engine/dlssnr/build_src/shim.cpp',
   'engine/dlssnr/build_src/shim_abi.h',
   'engine/dlssg/build_src/main.cpp',
+  'engine/dlssg/build_src/pan_vectors.h',
   'engine/nvoffruc/build_src/nvoffruc_bridge.cpp',
   'engine/fsrfg/build_src/fsrfg_bridge.cpp',
   'engine/fsrfg/build_src/amdxc64_shim.cpp',

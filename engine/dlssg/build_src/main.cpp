@@ -120,6 +120,7 @@ static void slLog(sl::LogType type, const char* msg)
 }
 
 #include "sl_focus_shim.h"
+#include "pan_vectors.h"
 
 // milliseconds on the performance counter (GetTickCount64 steps in ~16 ms)
 static double qpcMs()
@@ -338,6 +339,9 @@ struct Host
     ComPtr<ID3D12Resource> texFrame; // upload target, copied to backbuffer each present
     ComPtr<ID3D12Resource> texDepth;
     ComPtr<ID3D12Resource> texMvec;
+    bool panOn = false;    // the pan as motion vectors (pan_vectors.h), set once its writer is up
+    panvec::Estimator pan; // measures each uploaded frame against the one presented before
+    panvec::Writer panTex; // writes texMvec
     ComPtr<ID3D12Resource> uploadBuf;
     ComPtr<ID3D12Resource> readbackBuf;
     UINT rowPitch = 0; // 256-aligned pitch shared by upload + readback
@@ -570,7 +574,8 @@ struct Host
 
         rowPitch = (W * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
 
-        auto makeTex = [&](DXGI_FORMAT fmt, ComPtr<ID3D12Resource>& tex) -> bool {
+        auto makeTex = [&](DXGI_FORMAT fmt, ComPtr<ID3D12Resource>& tex,
+                           D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) -> bool {
             D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
             D3D12_RESOURCE_DESC rd{};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -580,6 +585,7 @@ struct Host
             rd.MipLevels = 1;
             rd.Format = fmt;
             rd.SampleDesc = {1, 0};
+            rd.Flags = flags;
             return SUCCEEDED(device->CreateCommittedResource(
                 &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
         };
@@ -598,7 +604,7 @@ struct Host
                 device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&buf)));
         };
         if (!makeTex(frameFormat(), texFrame) || !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth) ||
-            !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec) ||
+            !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
             !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadBuf) ||
             !makeBuf(D3D12_HEAP_TYPE_READBACK, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_COPY_DEST, readbackBuf))
         {
@@ -655,9 +661,24 @@ struct Host
             if (!waitQueue())
                 return 1;
         }
+        panOn = panTex.init(device.Get(), texMvec.Get(), W, H);
+        if (!panOn)
+            LOG("pan vectors: the descriptor heaps did not allocate, zero vectors\n");
 
         fillConstants(consts);
         return 0;
+    }
+
+    // the run's pan vector summary
+    void logPan() const
+    {
+        if (!panOn || !pan.frames)
+            return;
+        LOG("pan vectors: %llu of %llu frames moved (mean %.1f px, %.1f %% of their area still), %.2f ms a frame "
+            "(max %.2f)\n",
+            (unsigned long long)pan.tagged, (unsigned long long)pan.frames,
+            pan.tagged ? pan.sumLen / (double)pan.tagged : 0.0,
+            pan.tagged ? 100.0 * pan.sumStill / (double)pan.tagged : 0.0, pan.sumMs / (double)pan.frames, pan.maxMs);
     }
 
     // upload a frame (RGBA8, or R10G10B10A2 with --hdr10) and present it through DLSS-G; rgba null = a texture of
@@ -677,6 +698,8 @@ struct Host
                 memcpy(dst + (size_t)y * rowPitch, rgba + (size_t)y * W * 4, W * 4);
             uploadBuf->Unmap(0, nullptr);
         }
+        // an uploaded frame is measured; a ring texture or the last frame again keeps zero vectors
+        const panvec::Result panR = panOn && rgba ? pan.run(rgba, W, H, (size_t)W * 4, hdr10) : panvec::Result{};
 
         uint32_t fi = frameIndex++;
         sl::FrameToken* tok{};
@@ -693,6 +716,8 @@ struct Host
 
         alloc->Reset();
         list->Reset(alloc.Get(), nullptr);
+        if (panOn)
+            panTex.record(list.Get(), texMvec.Get(), panR);
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -1734,6 +1759,7 @@ static int runServer(int genFrames, bool hdr10)
     writer.waitIdle();
     if (resets)
         LOG("note: %llu DLSS-G pacer resets during this run\n", (unsigned long long)resets);
+    host.logPan();
     LOG("server done, %llu interpolated frames\n", (unsigned long long)emitted);
     host.shutdown();
     slShutdown();
@@ -1915,6 +1941,7 @@ static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& t
     ring.finish(2);
     if (resets)
         LOG("note: %llu DLSS-G pacer resets during this run\n", (unsigned long long)resets);
+    host.logPan();
     LOG("stage1 done, %llu inputs, %llu shared presents\n", (unsigned long long)inputs,
         (unsigned long long)ring.frames.load());
     host.shutdown();

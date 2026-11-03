@@ -2284,7 +2284,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             return true;
         };
         // present one output slot GPU-direct from the shared VRAM ring (slots never touch host
-        // memory)
+        // memory, except the readback that measures DLSS-G's pan vectors)
         auto presentSlotFrom = [&](uint32_t set, uint32_t i) -> bool {
             if (g_fgOver)
             {
@@ -2296,6 +2296,17 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         return false;
                 }
                 fgLastPresent = t;
+                if (host.panOn)
+                {
+                    const int64_t t0 = nowQpc100();
+                    if (!host.readSlot(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, (UINT64)srv.shmPitch * H,
+                                       [&](const uint8_t* p) {
+                                           host.panNext = host.pan.run(p, W, H, srv.shmPitch,
+                                                                       host.texFmt == DXGI_FORMAT_R10G10B10A2_UNORM);
+                                       }))
+                        return false;
+                    host.pan.readMs += (double)(nowQpc100() - t0) / 1e4;
+                }
             }
             return host.presentTail(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, srv.shmPitch);
         };
@@ -4673,6 +4684,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             cascUp->stop();
         if (g_teardownTrace)
             LOG("teardown: capture stopped, shutting the host down\n");
+        host.logPan();
         host.shutdown();
         if (g_teardownTrace)
             LOG("teardown: host down\n");

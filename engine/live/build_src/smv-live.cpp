@@ -365,6 +365,7 @@ static void slLog(sl::LogType type, const char* msg)
 }
 
 #include "sl_focus_shim.h"
+#include "pan_vectors.h"
 #include "smv-live-host.inl"
 #include "smv-live-capture.inl"
 #include "smv-live-native.inl"

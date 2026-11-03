@@ -1130,6 +1130,18 @@ system gamma 1.2) and `k_unpackR10` reads the generated frames back (x / 1023, H
 inverse). Before, HDR went as 8-bit codes labelled SDR: an exact pan's PQ tweens sat 1.8 dB under the
 SDR route's, now 0.1 dB (harness `dlssg_hdr10`). A swap chain that refuses the colour space (`dlssg2f`
 exit 5) or a `dlssg2f` without the mode makes the host start it again on 8-bit frames, with a log line.
+PAN VECTORS (`engine\dlssg\build_src\pan_vectors.h`, used by `dlssg2f` and by the live host's own DLSS-G): a video has
+no game motion vectors, and with zero vectors DLSS-G's own flow loses a fast camera pan (past about 60-90 px a frame
+the new frames melt or show people twice, at x2 as at x6). Each presenter measures every frame it uploads against the
+frame it presented before: luma thumbnails at 1/4, 1/16 and 1/32 of the size, a full SAD search at 1/32 (up to 384 px
+each way), refines at 1/16 and 1/4, a sub-pixel fit. When one translation explains the change (its error under 0.6 x
+the still picture's, and at least half of the changed 32 px tiles agree), the vector texture holds it, written by a
+UAV clear; tiles a still picture explains clearly better (subtitles, logos, the edge of a letterbox bar) stay zero.
+Anything else, and every move under 1 px, keeps the exact zero vectors, so those frames are the ones DLSS-G made
+without it. A frame from a GPU ring (Live's second cascade stage, the effects route's slots) keeps zero vectors. The
+run's summary line: `pan vectors: N of M frames moved (mean P px, S % of their area still), E ms a frame`. Every other
+frame of a clip as the input, the dropped frames as truth (harness `dlssg_pan_vectors\triplet.py`): an anime pan
++3.4 dB median, the dragon pan +7.4 dB, clips with no pan unchanged.
 THE DLSS 4.5 CASCADE (`native.ts` `dlssgPasses`): one pass makes up to the GPU's own limit,
 Streamline's `numFramesToGenerateMax` + 1 (RTX 50 x6, RTX 40 x2), which `native.ts` learns once per GPU
 and driver from a 2-frame 256x128 render (the host's `server max N` line) and keeps in the engine cache
