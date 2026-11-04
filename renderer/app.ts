@@ -40,18 +40,27 @@ function saveBatch(list){ try {
 // #go doubles as the run's Pause/Resume toggle: 'idle' = "Smooth It!" (starts a run), 'running' =
 // "Pause" (holds generation), 'paused' = "Resume" (continues). engine-done resets it to 'idle'.
 let goMode = 'idle';
-function fileTag(){ return batchTotal > 1 ? 'File ' + (batchTotal - batch.length) + '/' + batchTotal + ' · ' : ''; }
+// the batch's "File n of N · " prefix as it reads now, rebuilt in the language of the moment
+function fileTag(): () => string {
+  const n = batchTotal - batch.length, total = batchTotal;
+  return () => total > 1 ? tr('run.file', { n, total }) + ' · ' : '';
+}
+// the render status line (txt below): one language string, with the batch prefix when tagged
+function setStatus(key: string, vars?: Record<string, string | number>, tagged = false){
+  const tag = tagged ? fileTag() : () => '';
+  txt('status', () => tag() + tr(key, vars));
+}
 // ETA is a live countdown. Each PROGRESS frame re-anchors it to the average pace since warmup,
 // and a timer ticks the displayed seconds down between frames so it never sits frozen. curDone/
 // curPct hold the last frame numbers so the timer can repaint the line with no new PROGRESS.
 let etaAnchor = 0, etaAnchorTime = 0, lastFps = 0, etaTimer = null, curDone = 0, curPct = 0, projBytes = 0;
 function fmtEta(s){ s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), ss=s%60;
-  return h>0 ? h+'h '+String(m).padStart(2,'0')+'m '+String(ss).padStart(2,'0')+'s'
-       : m>0 ? m+'m '+String(ss).padStart(2,'0')+'s' : ss+'s'; }
-const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-function fmtFinish(s){ const d = new Date(Date.now() + Math.max(0,s)*1000);   // wall-clock end time
+  const p = (x) => String(x).padStart(2,'0');
+  return h>0 ? tr('time.hms', { h, m: p(m), s: p(ss) }) : m>0 ? tr('time.ms', { m, s: p(ss) }) : tr('time.s', { s: ss }); }
+// the wall-clock end time, its month in the UI language
+function fmtFinish(s){ const d = new Date(Date.now() + Math.max(0,s)*1000);
   return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+' '
-       + String(d.getDate()).padStart(2,'0')+'-'+MONTHS[d.getMonth()]+'-'+d.getFullYear(); }
+       + String(d.getDate()).padStart(2,'0')+'-'+new Intl.DateTimeFormat(uiLang, { month: 'long' }).format(d)+'-'+d.getFullYear(); }
 
 const $ = (id: string): any => document.getElementById(id);
 // Stored-settings schema version: bump whenever a localStorage key or its scale/meaning changes,
@@ -61,6 +70,88 @@ const SETTINGS_VERSION = '3';   // 3 = the unified target-fps slider (key fpsTar
 if(localStorage.getItem('settingsVersion') !== SETTINGS_VERSION){
   localStorage.clear();
   localStorage.setItem('settingsVersion', SETTINGS_VERSION);
+}
+// --- UI text: every visible string lives in i18n\<code>.json -------------------------------------
+// en.json is the source and the fallback for a key another language lacks. index.html marks its texts with data-i18n
+// (the element's HTML) and data-i18n-title / -ph / -aria / -alt (that attribute); the code asks tr(key, {name: value})
+// for every text it writes, and each code-owned text registers in i18nRelabel so a switch repaints it from the
+// current state. The language = the user's pick (localStorage uiLang), else the first of Windows' languages SMV
+// has, else English.
+const fs = require('fs');
+const { fileURLToPath } = require('url');
+const I18N_DIR = path.join(path.dirname(fileURLToPath(location.href)), 'i18n');
+// the selector offers the languages whose file is present (en always)
+const I18N_CODES = ['en', 'ja', 'zh-CN', 'ko', 'es', 'pt-BR', 'fr', 'de', 'id', 'hi', 'ar'].filter(c => c === 'en' || fs.existsSync(path.join(I18N_DIR, c + '.json')));
+function i18nLoad(code: string): Record<string, string> {
+  try { return JSON.parse(fs.readFileSync(path.join(I18N_DIR, code + '.json'), 'utf8')); } catch { return {}; }
+}
+const I18N_EN = i18nLoad('en');
+let I18N_CUR: Record<string, string> = I18N_EN;
+let uiLang = 'en';
+function i18nPick(): string {
+  const saved = localStorage.getItem('uiLang');
+  if(saved && I18N_CODES.includes(saved)) return saved;
+  for(const l of (navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || 'en'])){
+    const s = String(l).toLowerCase();
+    if(s.startsWith('ja')) return 'ja';
+    if(s === 'zh' || s.startsWith('zh-cn') || s.startsWith('zh-sg') || s.startsWith('zh-hans')) return 'zh-CN';
+    if(s.startsWith('ko')) return 'ko';
+    if(s.startsWith('es')) return 'es';
+    if(s.startsWith('pt')) return 'pt-BR';
+    if(s.startsWith('fr')) return 'fr';
+    if(s.startsWith('de')) return 'de';
+    if(s.startsWith('id') || s.startsWith('in')) return 'id';
+    if(s.startsWith('hi')) return 'hi';
+    if(s.startsWith('ar')) return 'ar';
+    if(s.startsWith('en')) return 'en';
+  }
+  return 'en';
+}
+function tr(key: string, vars?: Record<string, string | number>): string {
+  let s = I18N_CUR[key] ?? I18N_EN[key] ?? key;
+  if(vars) s = s.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+  return s;
+}
+const I18N_ATTRS: [string, string, string][] = [['i18nTitle', 'data-i18n-title', 'title'], ['i18nPh', 'data-i18n-ph', 'placeholder'],
+  ['i18nAria', 'data-i18n-aria', 'aria-label'], ['i18nAlt', 'data-i18n-alt', 'alt']];
+// Arabic reads right to left: <html dir> mirrors the layout (index.html keeps the pictures, the log and the paths
+// left to right)
+const I18N_RTL = ['ar'];
+function applyI18n(){
+  document.documentElement.lang = uiLang;
+  document.documentElement.dir = I18N_RTL.includes(uiLang) ? 'rtl' : 'ltr';
+  document.querySelectorAll('[data-i18n]').forEach((e: any) => { e.innerHTML = tr(e.dataset.i18n); });
+  for(const [ds, sel, attr] of I18N_ATTRS)
+    document.querySelectorAll('[' + sel + ']').forEach((e: any) => e.setAttribute(attr, tr(e.dataset[ds])));
+}
+const i18nRelabel: (() => void)[] = [];
+// The lines an event writes (the render status, the frames line, the Live status, the preview note, the hotkey hint):
+// txt(id, build) writes build() and keeps it, so a switch rebuilds the line in the new language even when no later
+// event comes (Stopped, Done, Paused, a saved clip); raw(id, s) writes the host's own words as they are and drops it.
+const i18nLine = new Map<string, () => string>();
+function txt(id: string, build: () => string){ i18nLine.set(id, build); $(id).textContent = build(); }
+function raw(id: string, s: string){ i18nLine.delete(id); $(id).textContent = s; }
+// the line's current text as a builder, for an event that appends to it
+function lineOf(id: string): () => string { const f = i18nLine.get(id); if(f) return f; const s = $(id).textContent; return () => s; }
+function setLang(code: string){
+  uiLang = I18N_CODES.includes(code) ? code : 'en';
+  I18N_CUR = uiLang === 'en' ? I18N_EN : i18nLoad(uiLang);
+  try { localStorage.setItem('uiLang', uiLang); } catch {}
+  applyI18n();
+  for(const [id, f] of i18nLine){ try { $(id).textContent = f(); } catch {} }
+  for(const f of i18nRelabel){ try { f(); } catch {} }
+}
+{ const sel = $('langsel');
+  for(const c of I18N_CODES){
+    const o = document.createElement('option');
+    o.value = c; o.textContent = (c === 'en' ? I18N_EN : i18nLoad(c))['lang.name'] || c;
+    sel.appendChild(o);
+  }
+  uiLang = i18nPick();
+  I18N_CUR = uiLang === 'en' ? I18N_EN : i18nLoad(uiLang);
+  sel.value = uiLang;
+  sel.onchange = () => setLang(sel.value);
+  applyI18n();
 }
 // --- UI mode (Video / Live) ----------------------------------------------------------------
 // ONE class on <html> drives the split: mode-video hides every .lonly element, mode-live every
@@ -83,11 +174,16 @@ function setMode(m){
 }
 // Switching mid-job would hide the running thing, so both buttons grey out while a live session
 // or a file render is going (called from lvUi and from the run start/end enable sweeps).
+let modeBusy = false;
 function modeBtnUi(busy){
-  $('modevideo').disabled = !!busy; $('modelive').disabled = !!busy;
-  $('modevideo').title = busy ? 'stop the current session first' : 'Smooth a video file and save the result';
-  $('modelive').title = busy ? 'stop the current session first' : 'Smooth any window on screen in real time';
+  modeBusy = !!busy;
+  $('modevideo').disabled = modeBusy; $('modelive').disabled = modeBusy;
+  $('modevideo').textContent = tr('mode.video'); $('modelive').textContent = tr('mode.live');
+  $('modevideo').title = modeBusy ? tr('mode.busy') : tr('mode.video.tip');
+  $('modelive').title = modeBusy ? tr('mode.busy') : tr('mode.live.tip');
 }
+modeBtnUi(false);
+i18nRelabel.push(() => modeBtnUi(modeBusy));
 // the Size hint under Upscale reads differently per mode (syncUpscale is defined further down,
 // so it runs on the click, not at boot where the boot-time syncUpscale call covers it)
 $('modevideo').onclick = () => { setMode('video'); try { syncUpscale(); } catch {} };
@@ -105,16 +201,15 @@ function showWorkspace(keepWelcome?){
 // tick recomputes the remaining seconds from the anchor so the ETA counts down between frames.
 function paint(){
   if(!procStart) return;                              // still warming up: keep the warmup message
-  let speed = '   ·   measuring speed...';
-  if(lastFps > 0){
-    const remain = Math.max(0, etaAnchor - (Date.now()-etaAnchorTime)/1000);
-    speed = '   ·   '+Math.round(lastFps)+' fps   ·   ETA '+fmtEta(remain)+'  ('+fmtFinish(remain)+')';
-  }
+  const fps = Math.round(lastFps), remain = lastFps > 0 ? Math.max(0, etaAnchor - (Date.now()-etaAnchorTime)/1000) : -1;
   // Projected final size (engine SIZE lines: bytes so far, linearly extrapolated to 100%), so a
   // long render reveals its disk cost in the first minutes instead of at the end.
   const size = projBytes > 0 ? '   ·   ~'+fmtBytes(projBytes) : '';
-  $('frames').textContent = 'Frames: '+Math.round(curDone*fpp)+' / '+totalGen+speed+size;
+  const done = Math.round(curDone*fpp), total = totalGen;
+  txt('frames', () => tr('run.frames', { done, total }) + '   ·   '
+    + (remain < 0 ? tr('run.measuring') : tr('run.speedEta', { fps, eta: fmtEta(remain), finish: fmtFinish(remain) })) + size);
 }
+i18nRelabel.push(() => paint());
 function fmtBytes(b){ return b >= 1e9 ? (b/1e9).toFixed(b >= 1e10 ? 0 : 1)+' GB' : Math.round(b/1e6)+' MB'; }
 // Interpolation is ON when ANY model is ticked. The model checkboxes ARE the master toggle (there
 // is no separate Interpolate box): unticking them all means "keep the source frames", which greys
@@ -194,9 +289,9 @@ function syncTargetUI(){
   // EXACT source rate (14.97x of 23.976 -> 15x = 359.64), so nobody types 3 decimals to get on-grid.
   const rn = roundMulti();
   show('fpsround', m === 'fps' && on && rn > 0);
-  if(rn && $('fpsround')) $('fpsround').title = 'Round to ' + rn + '× of the source (' + roundFps(rn)
-    + ' fps): the closest whole multiple, on-grid real frames';
+  if(rn && $('fpsround')) $('fpsround').title = tr('speed.round.tip', { n: rn, fps: roundFps(rn) });
 }
+i18nRelabel.push(() => syncTargetUI());
 // The closest whole multiple (>= 2) for a resampled target, else 0 (already on-grid / no video).
 function roundMulti(){ if(!info || gridMulti()) return 0;
   const N = Math.max(2, Math.round(targetFps() / srcFps()));
@@ -258,21 +353,22 @@ function retagCustom(name){
 function refresh(){ if(!input) return;
   const t = targetFps();
   const N = gridMulti();
-  const kind = N ? 'on-grid · real frames'                                  // exact integer multiple of the source
-    : Math.round(t) <= Math.round(srcFps()) ? 'no new frames'               // degenerate: output fps = source fps
-    : 'resampled';                                                          // non-integer multiple: engine uses --fps
+  const kind = N ? tr('rate.ongrid')                                        // exact integer multiple of the source
+    : Math.round(t) <= Math.round(srcFps()) ? tr('rate.none')               // degenerate: output fps = source fps
+    : tr('rate.resampled');                                                 // non-integer multiple: engine uses --fps
   // The hint carries the derived other side of the relationship: the implied ratio to the source.
-  const derived = ratioText() + '× of ' + (+srcFps().toFixed(targetDecimals())) + ' fps';
+  const derived = tr('rate.derived', { ratio: ratioText(), fps: +srcFps().toFixed(targetDecimals()) });
   $('ratehint').textContent = !interpOn() ? '' : derived + ' · ' + kind;
   syncTargetUI();
-  if(!fpsValid(t)){ $('out').value = ''; $('out').placeholder = 'target fps must be ' + sliderMin() + '-' + sliderMax(); lastOut = null; return; }
-  $('out').placeholder = 'output file path';
+  if(!fpsValid(t)){ $('out').value = ''; $('out').placeholder = tr('out.ph.range', { min: sliderMin(), max: sliderMax() }); lastOut = null; return; }
+  $('out').placeholder = tr('out.ph');
   if(customOut) customOut = retagCustom(customOut);   // re-sync the _fps/_p tags in the user's name
   lastOut = customOut || outName(); $('out').value = lastOut;
   if(goMode === 'idle') $('out').disabled = false;   // editable while idle; startRun locks it
   updateDvHpHints();   // the DV/HDR10+ "skipped for MKV" hints track the resolved output name
   scheduleCheckResume();   // the Resume detection tracks the resolved output name too
 }
+i18nRelabel.push(() => refresh());
 // Crash/exit resume detection: an interrupted render leaves its stage-1 video + sidecar next to
 // the output (see the engine's resume block); when the resolved output name has one, #go becomes
 // "Resume" and the render continues where it left off (the engine re-validates the settings
@@ -287,21 +383,35 @@ async function checkResume(){
   if(seq !== resumeSeq) return;          // a newer check superseded this one mid-flight
   resumeInfo = r;
   if(goMode !== 'idle') return;          // never touch the button while it is the Pause toggle
-  $('go').textContent = resumeInfo ? 'Resume' : 'Smooth It!';
+  $('go').textContent = resumeInfo ? tr('run.resume') : tr('run.go');
   if(resumeInfo){
     const pct = resumeInfo.total ? Math.round(100*resumeInfo.pair/resumeInfo.total) : 0;
-    $('go').title = 'Continues the interrupted render from where it left off (~'+pct+'% is already done). '
-                  + 'You can pause or close the app again at any time and resume later.';
-    $('status').textContent = 'Interrupted render found: click Resume to continue from ~'+pct+'%.';
+    $('go').title = tr('run.resume.tip', { pct });
+    setStatus('run.status.interrupted', { pct });
     if(resumeLoggedFor !== lastOut){
       resumeLoggedFor = lastOut;
       log('>> Interrupted render found for this file; it will resume from ~'+pct+'% instead of starting over\n');
     }
   } else {
     if(resumeLoggedFor === lastOut) resumeLoggedFor = null;   // gone (e.g. cancelled): a future interruption logs anew
-    $('go').title = 'Starts the render. You can pause or even close the app mid-render: it resumes where it left off.';
+    $('go').title = tr('run.go.tip');
   }
 }
+// the code-owned texts before a video: the Go button, the path line, the status line
+function idleTexts(){
+  if(goMode !== 'idle') return;
+  if(!input){ $('go').textContent = tr('run.go'); $('go').title = tr('run.go.tip'); $('path').textContent = tr('pick.none');
+    setStatus('run.status.select'); }
+  else { scheduleCheckResume(); if(!resumeInfo) setStatus('run.status.ready'); }
+}
+idleTexts();
+// a switch relabels the idle Go button and path; the status line rebuilds its own last text (txt), so a finished run
+// still reads Done / Failed / Cancelled
+i18nRelabel.push(() => {
+  if(goMode !== 'idle') return;
+  if(!input){ $('go').textContent = tr('run.go'); $('go').title = tr('run.go.tip'); $('path').textContent = tr('pick.none'); }
+  else scheduleCheckResume();
+});
 // Editing the output path inline: a non-empty value becomes the custom output (kept across setting
 // changes, like the Change... dialog); clearing it on blur reverts to the auto-generated name.
 $('out').oninput = () => { const v = $('out').value.trim(); customOut = v || null; lastOut = v || outName(); };
@@ -315,7 +425,7 @@ async function loadVideo(f){
   try { localStorage.setItem('dir', path.dirname(f)); } catch {}
   const p = await ipcRenderer.invoke('probe', f);
   // A modal alert would stall an unattended batch, so mid-batch probe failures go to the log.
-  if(p.error){ if(batchAuto) log('>> Could not read '+f+': '+p.error+'\n'); else alert('Could not read video: '+p.error); return false; }
+  if(p.error){ if(batchAuto) log('>> Could not read '+f+': '+p.error+'\n'); else alert(tr('err.read', { err: p.error })); return false; }
   const streams = p.streams || [];
   const s = streams.find(x => x.codec_type === 'video') || streams[0] || {};
   // Track passthrough: subtitles or mp4-incompatible audio push the output container to .mkv
@@ -331,21 +441,18 @@ async function loadVideo(f){
   info.srcHdr = info.transfer === 'smpte2084' || info.transfer === 'arib-std-b67';
   // TrueHDR converts SDR only; for an HDR source the engine carries the HDR through untouched.
   $('rtxhdr').disabled = info.srcHdr;
-  $('rtxhdrhint').textContent = info.srcHdr ? '(source is already HDR, carried through as-is)'
-                                            : '(convert SDR video to HDR)';
+  syncRtxHdrHint();
   showWorkspace();
   $('info').style.display = 'block';
   $('res').textContent = s.width+' x '+s.height;
   $('fps').textContent = srcFps().toFixed(decimalsOf(srcFps()));   // natural precision: 24 -> "24", 23.976 -> "23.976"
-  $('fps').title = (info.fps ? info.fps + ' = ' : '') + (+srcFps().toFixed(6)) + ' fps (shown rounded)';   // reveal the exact rational, e.g. 24000/1001 = 23.976024
   const d=info.dur|0; $('dur').textContent = (d/3600|0)+':'+String((d%3600/60|0)).padStart(2,'0')+':'+String(d%60).padStart(2,'0');
-  $('codec').textContent = (s.codec_name || '?')
-    + (info.nAud > 1 || info.nSub ? '  ·  ' + info.nAud + ' audio · ' + info.nSub
-       + ' subtitle' + (info.nSub === 1 ? '' : 's') + ' (kept' + (info.needMkv ? ', MKV output)' : ')') : '');
+  info.codecName = s.codec_name || '?';
+  paintInfoTexts();
   $('go').disabled = false; $('changeout').disabled = false; $('open').disabled = true; $('play').disabled = true;
   $('outrow').style.display = '';
   $('live').style.display = 'none';   // stale live thumbnail belongs to the previous video
-  $('status').textContent = 'Ready. Pick a target fps, then click Smooth It!';
+  setStatus('run.status.ready');
   applyScreenFps();      // re-asserts the interp / screen-rate state and recomputes the output name
   syncUpscale();         // recompute the upscale target + output dims for this video's resolution
   // The preview cold-starts Python + torch + a CUDA context (several seconds on the first video of a
@@ -362,6 +469,17 @@ async function loadVideo(f){
   }
   return true;
 }
+// the RTX HDR hint, the exact source rate's tooltip and the tracks line, from the loaded video
+function syncRtxHdrHint(){ $('rtxhdrhint').textContent = info && info.srcHdr ? tr('rtxhdr.srcHdr') : tr('rtxhdr.hint'); }
+function paintInfoTexts(){
+  if(!info) return;
+  $('fps').title = tr('info.fps.tip', { exact: (info.fps ? info.fps + ' = ' : '') + (+srcFps().toFixed(6)) });   // e.g. 24000/1001 = 23.976024
+  $('codec').textContent = info.codecName
+    + (info.nAud > 1 || info.nSub ? '  ·  ' + tr(info.nSub === 1 ? 'info.tracks1' : 'info.tracksN', { aud: info.nAud, sub: info.nSub })
+       + ' (' + tr(info.needMkv ? 'info.keptMkv' : 'info.kept') + ')' : '');
+}
+syncRtxHdrHint();
+i18nRelabel.push(() => { syncRtxHdrHint(); paintInfoTexts(); });
 // One or more inputs: the first loads now, the rest queue for the same settings back to back.
 function queueVideos(paths){
   const list = (paths || []).filter(Boolean);
@@ -397,10 +515,74 @@ $('sharpval').oninput = () => { localStorage.setItem('sharpenVal', $('sharpval')
 // redraws linework on every output frame (before the upscale); fine texture can flatten - it
 // is a generative repaint, not a filter. Off by default: it changes the look, and every
 // emitted frame pays a second model pass.
-function restoreOn(){ return $('restore').checked; }
+// The second row, AnimeJaNai HD: the author's 2x anime model (CC BY-NC-SA 4.0, never bundled), the same pass with
+// another model (the host's --restore-model). The two rows exclude each other; AnimeJaNai runs once installed
+// (aj-ready), else its setup note shows (one click downloads the author's release, checked in main, or a picked .onnx).
+let ajReady: any = { ready:false };
+function ajOn(){ return $('restoreaj').checked && !!ajReady.ready; }
+function restoreOn(){ return $('restore').checked || ajOn(); }
+function restoreModelId(){ return ajOn() ? 'animejanai' : ''; }
 // Restore ALWAYS starts off: an expensive, look-altering pass you opt
 // into per session, so its state is deliberately NOT persisted; old key retired.
 localStorage.removeItem('restoreOn');
+async function checkAjReady(){
+  $('ajstatus').textContent = tr('common.checking'); $('ajstatus').style.color = 'var(--sub)';
+  try { ajReady = await ipcRenderer.invoke('aj-ready'); } catch { ajReady = { ready:false }; }
+  const r = ajReady, line = (r.ready ? '✓ ' : '✗ ') + tr('aj.line', { file: r.file || '' });
+  if(r.ready){
+    $('ajstatus').textContent = tr('setup.ready'); $('ajstatus').style.color = 'var(--green)';
+    $('ajsteps').innerHTML = line + '<br>'
+      + (r.known === false ? tr('aj.unverified', { sha: String(r.sha256 || '').slice(0, 12) }) : tr('aj.installed'));
+  } else {
+    $('ajstatus').textContent = tr('dlss.notReady'); $('ajstatus').style.color = '#e85c5c';
+    $('ajsteps').innerHTML = line + '<br>' + tr('aj.howto', { licence: ajLink('licence', tr('aj.licLink')),
+                                                             link: ajLink('page', tr('aj.repoLink')), mb: r.mb || 41 });
+  }
+  $('ajbtns').style.display = r.ready ? 'none' : '';
+  $('ajsetup').style.display = $('restoreaj').checked && (!r.ready || r.known === false) ? 'block' : 'none';
+  refreshPreviewIfOpen(); refresh();
+  try{ lvModelUi(); lvSendOpts(); }catch{}
+}
+// a link main opens (the licence or the author's release page): its text is the language's, its action the code's
+function ajLink(which, text){ return '<a href="#" onclick="ipcRenderer.invoke(\'aj-open\', \'' + which + '\');return false;">' + text + '</a>'; }
+function syncAj(){
+  if($('restoreaj').checked) checkAjReady();
+  else $('ajsetup').style.display = 'none';
+}
+i18nRelabel.push(() => syncAj());
+async function doAjInstall(source){
+  $('ajsetup').style.display = 'block';
+  $('ajstatus').textContent = tr('common.installing'); $('ajstatus').style.color = 'var(--sub)';
+  let r: any = {}; try { r = await ipcRenderer.invoke('aj-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
+  await checkAjReady();
+  if(!r.ok){ $('ajsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('aj.pickAgain'); $('ajsetup').style.display = 'block'; }
+}
+let ajDownloading = false;
+ipcRenderer.on('aj-progress', (_e, p) => {
+  if(!ajDownloading) return;
+  const mb = x => (x / 1048576).toFixed(0);
+  $('ajstatus').textContent = p.stage === 'verify' ? tr('dl.verify') : tr('dl.progress', { got: mb(p.received), total: mb(p.total) });
+});
+async function doAjDownload(){
+  if(ajDownloading) return;
+  ajDownloading = true; $('ajdl').disabled = true; $('ajbrowse').disabled = true;
+  $('ajsetup').style.display = 'block';
+  $('ajstatus').textContent = tr('dl.start'); $('ajstatus').style.color = 'var(--sub)';
+  let r: any = {}; try { r = await ipcRenderer.invoke('aj-download'); } catch(e){ r = { ok:false, error:String(e) }; }
+  ajDownloading = false; $('ajdl').disabled = false; $('ajbrowse').disabled = false;
+  await checkAjReady();
+  if(!r.ok){
+    $('ajstatus').textContent = tr('dl.failed'); $('ajstatus').style.color = '#e85c5c';
+    $('ajsteps').innerHTML = '✗ ' + (r.error || tr('dl.failedShort')) + '<br>'
+      + tr('aj.dlRetry', { link: ajLink('page', tr('aj.repoLink')), file: ajReady.file || '' });
+    $('ajsetup').style.display = 'block';
+  }
+}
+$('ajdl').onclick = doAjDownload;
+$('ajbrowse').onclick = async () => { const p = await ipcRenderer.invoke('aj-choose'); if(p) doAjInstall(p); };
+// one Restore model at a time: ticking a row unticks the other
+$('restore').addEventListener('change', () => { if($('restore').checked && $('restoreaj').checked){ $('restoreaj').checked = false; syncAj(); } });
+$('restoreaj').addEventListener('change', () => { if($('restoreaj').checked) $('restore').checked = false; syncAj(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} });
 
 // The pass order in both modes: on each source or captured frame Restore and the resize to the
 // working size (the DLSS mode), DLSS 5, Sharpen and RTX HDR (with the Dolby Vision and HDR10+ metadata of
@@ -475,10 +657,10 @@ function syncUpscale(){
     // Just the resulting dimensions plus encoder-relevant warnings; no resampler names (the
     // engine always picks the best resize).
     if(d) txt = '→ ' + d.w + ' × ' + d.h
-                + ((d.w > NVENC_MAX || d.h > NVENC_MAX) ? '  ·  CPU encode at this size (slower)' : '')
-                + ((d.w >= ENC_MAX || d.h >= ENC_MAX) ? '  ·  at the 16K encoder cap' : '');
-    else if(info) txt = 'source is already exactly at that height, 1:1, nothing to resize';
-    else txt = 'load a video to preview the result';
+                + ((d.w > NVENC_MAX || d.h > NVENC_MAX) ? '  ·  ' + tr('up.cpu') : '')
+                + ((d.w >= ENC_MAX || d.h >= ENC_MAX) ? '  ·  ' + tr('up.cap') : '');
+    else if(info) txt = tr('up.same');
+    else txt = tr('up.load');
   }
   $('upinfo').textContent = txt;
   if(dlssUiReady) syncDlssMode();   // the working size follows the output
@@ -499,7 +681,7 @@ function dlssMode(){ return Object.keys(DLSS_PCT).find(m => DLSS_PCT[m] === dlss
 function syncDlssMode(){
   const m = dlssMode();
   if(Object.hasOwn(DLSS_PCT, m)) $('dlssmode').value = m;
-  else { $('dlsscustomopt').textContent = `Custom (${m}%)`; $('dlssmode').value = 'custom'; }
+  else { $('dlsscustomopt').textContent = tr('dlssmode.customPct', { pct: m }); $('dlssmode').value = 'custom'; }
   $('dlssrangenum').textContent = dlssPct() + '%';
 }
 {
@@ -528,17 +710,15 @@ $('dlssrange').oninput = dlssChanged;   // a drag stops anywhere from 1 to 100 %
 dlssUiReady = true;
 syncDlssMode();
 function setScreenOptLabel(){ const o = [...$('upres').options].find(o => o.value === 'screen');
-  if(o) o.textContent = 'Screen resolution' + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
+  if(o) o.textContent = tr('up.opt.screen') + (screenW && screenH ? ' (' + screenW + '×' + screenH + ')' : ''); }
+i18nRelabel.push(() => { syncUpscale(); syncDlssMode(); setScreenOptLabel(); });
 // NOTE: the element id is outcodec, NOT codec - id "codec" is taken by the source-codec info span.
 // Per-choice guidance so the trade-off is clear without leaving the dropdown. Size claims are
 // from a real A/B at the engine's verified visually-lossless settings (the quality-first
 // tuning: on the 1080p sample HEVC CQ17-p7-ladder 2.25 MB / AV1 CQ22 2.17 MB / VVC QP17 0.98 MB).
-const CODEC_HINTS = {
-  hevc: 'safest choice: TVs, phones, editors and players all take it; audio is copied',
-  av1:  '1.4 to 1.6x faster than HEVC, higher fidelity; up to 2.5x larger on noisy content; plays in browsers, not on most pre-2020 devices',
-  vvc:  'smallest files (about half of HEVC), slow CPU encode; plays in mpv, MPC-HC, MPC-BE and VLC 4, not browsers or most TVs',
-};
-function syncCodec(){ $('codechint').textContent = CODEC_HINTS[$('outcodec').value] || ''; }
+function syncCodec(){ const c = $('outcodec').value;
+  $('codechint').textContent = ['hevc', 'av1', 'vvc'].includes(c) ? tr('codec.' + c + '.hint') : ''; }
+i18nRelabel.push(syncCodec);
 const savedCodec = localStorage.getItem('codec');
 if(savedCodec && [...$('outcodec').options].some(o => o.value === savedCodec)) $('outcodec').value = savedCodec;
 $('outcodec').onchange = () => { localStorage.setItem('codec', $('outcodec').value); syncCodec(); };
@@ -568,21 +748,19 @@ function syncRtx(){
   else $('rtxsetup').style.display = 'none';
 }
 async function checkRtxReady(){
-  $('rtxstatus').textContent = 'checking...'; $('rtxstatus').style.color = 'var(--sub)';
+  $('rtxstatus').textContent = tr('common.checking'); $('rtxstatus').style.color = 'var(--sub)';
   try { rtxReady = await ipcRenderer.invoke('rtx-ready'); } catch { rtxReady = { vsr:false, hdr:false, bridge:false }; }
   const needVsr = $('rtxvsr').checked, needHdr = $('rtxhdr').checked;
   const ok = (!needVsr || rtxReady.vsr) && (!needHdr || rtxReady.hdr);
   const lines = [];
-  if(needVsr) lines.push((rtxReady.vsr ? '✓' : '✗') + ' RTX Video Super Resolution');
-  if(needHdr) lines.push((rtxReady.hdr ? '✓' : '✗') + ' RTX HDR');
+  if(needVsr) lines.push((rtxReady.vsr ? '✓ ' : '✗ ') + tr('vsr.name'));
+  if(needHdr) lines.push((rtxReady.hdr ? '✓ ' : '✗ ') + tr('rtxhdr.name'));
   if(ok){
-    $('rtxstatus').textContent = '✓ READY'; $('rtxstatus').style.color = 'var(--green)';
-    $('rtxsteps').innerHTML = lines.join('<br>') + '<br>The RTX Video runtime is installed.';
+    $('rtxstatus').textContent = tr('setup.ready'); $('rtxstatus').style.color = 'var(--green)';
+    $('rtxsteps').innerHTML = lines.join('<br>') + '<br>' + tr('rtx.installed');
   } else {
-    $('rtxstatus').textContent = '✗ NOT READY'; $('rtxstatus').style.color = '#e85c5c';
-    const detail = rtxReady.bridge === false
-      ? 'The RTX bridge (rtxvideo_cuda.dll) is missing from engine/rtxvideo. Rebuild it (see DEVELOPMENT.md, "Building the native bridges").'
-      : 'Click <b>Get from NVIDIA</b>, then <b>Choose .zip&hellip;</b> and pick the downloaded RTX_Video_SDK&hellip;.zip. It installs automatically.';
+    $('rtxstatus').textContent = tr('dlss.notReady'); $('rtxstatus').style.color = '#e85c5c';
+    const detail = rtxReady.bridge === false ? tr('rtx.noBridge') : tr('rtx.howto');
     $('rtxsteps').innerHTML = lines.join('<br>') + '<br>' + detail;
   }
   $('rtxbtns').style.display = ok ? 'none' : '';   // hide Get / Choose once the runtime is ready
@@ -599,10 +777,9 @@ async function checkRtxReady(){
 }
 async function doInstall(source){
   $('rtxsetup').style.display = 'block';   // show install progress (checkRtxReady collapses it again on success)
-  $('rtxstatus').textContent = 'installing...'; $('rtxstatus').style.color = 'var(--sub)';
+  $('rtxstatus').textContent = tr('common.installing'); $('rtxstatus').style.color = 'var(--sub)';
   let r: any = {}; try { r = await ipcRenderer.invoke('rtx-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('rtxsteps').innerHTML = '✗ ' + (r.error || 'install failed')
-      + '<br>Pick the downloaded RTX_Video_SDK&hellip;.zip again with <b>Choose .zip&hellip;</b>.';
+  if(!r.ok) $('rtxsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('rtx.pickAgain');
   await checkRtxReady();
   if(!r.ok) $('rtxsetup').style.display = 'block';   // keep an install error visible even if no toggle needs the feature
 }
@@ -634,6 +811,7 @@ $('vsrq').oninput = () => { localStorage.setItem('vsrQuality', $('vsrq').value);
 $('vsrq').addEventListener('change', () => refreshPreviewIfOpen());
 $('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); syncHdrColor(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 syncRtx();
+i18nRelabel.push(syncRtx);
 // Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
 ipcRenderer.invoke('rtx-ready').then(r => { if(r) rtxReady = r; syncUpscale(); syncPreview();
   // Live's VSR default depends on rtxReady, which just arrived: re-send + refresh the fill hint
@@ -664,23 +842,19 @@ function syncDlssnr(){
   else $('dlssnrsetup').style.display = 'none';
 }
 async function checkDlssnrReady(){
-  $('dlssnrstatus').textContent = 'checking...'; $('dlssnrstatus').style.color = 'var(--sub)';
+  $('dlssnrstatus').textContent = tr('common.checking'); $('dlssnrstatus').style.color = 'var(--sub)';
   try { dlssnrReady = await ipcRenderer.invoke('dlssnr-ready'); } catch { dlssnrReady = { ready:false }; }
   const r = dlssnrReady;
-  const lines = [(r.host ? '✓' : '✗') + ' DLSS 5 bridge (nvngx.dll, bundled)',
-                 (r.runtime ? '✓' : '✗') + ' ' + (r.file || 'nvngx_dlssnr.dll') + ' (the Neural Rendering runtime, not included)',
-                 (r.sr ? '✓' : '○') + ' ' + (r.srFile || 'nvngx_dlss.dll') + ' (DLSS SR runtime from the same pack, optional)'];
+  const lines = [(r.host ? '✓ ' : '✗ ') + tr('nr.line.host'),
+                 (r.runtime ? '✓ ' : '✗ ') + tr('nr.line.runtime', { file: r.file || 'nvngx_dlssnr.dll' }),
+                 (r.sr ? '✓ ' : '○ ') + tr('nr.line.sr', { file: r.srFile || 'nvngx_dlss.dll' })];
   if(r.ready){
-    $('dlssnrstatus').textContent = '✓ READY'; $('dlssnrstatus').style.color = 'var(--green)';
-    $('dlssnrsteps').innerHTML = lines.join('<br>') + '<br>The DLSS 5 runtime is installed.';
+    $('dlssnrstatus').textContent = tr('setup.ready'); $('dlssnrstatus').style.color = 'var(--green)';
+    $('dlssnrsteps').innerHTML = lines.join('<br>') + '<br>' + tr('nr.installed');
   } else {
-    $('dlssnrstatus').textContent = '✗ NOT READY'; $('dlssnrstatus').style.color = '#e85c5c';
-    const detail = r.host === false
-      ? 'The DLSS 5 bridge (nvngx.dll) is missing from engine/dlssnr. Rebuild it (see DEVELOPMENT.md, "Building the native components").'
-      : 'NVIDIA does not publish <code>nvngx_dlssnr.dll</code> (no SDK, no driver copy, no NVIDIA App override); it only ships inside NBA 2K27. '
-        + '<b>Download the DLSS 5 runtime</b> fetches the community build every DLSS 5 tool uses (' + ((r.download && r.download.mb) || 111) + ' MB zip from '
-        + '<a href="#" onclick="ipcRenderer.invoke(\'dlssnr-open-download\');return false;">rhi-repo on GitHub</a>, RTX 40 + 50), verifies its checksum and installs it. '
-        + 'Or, if you already have the file, drop it on this window or click <b>Choose nvngx_dlssnr.dll&hellip;</b>.';
+    $('dlssnrstatus').textContent = tr('dlss.notReady'); $('dlssnrstatus').style.color = '#e85c5c';
+    const detail = r.host === false ? tr('nr.noBridge')
+      : tr('nr.howto', { mb: (r.download && r.download.mb) || 111, link: rhiLink() });
     $('dlssnrsteps').innerHTML = lines.join('<br>') + '<br>' + detail;
   }
   $('dlssnrbtns').style.display = r.ready ? 'none' : '';   // hide the buttons once the runtime is in place
@@ -693,14 +867,16 @@ async function checkDlssnrReady(){
   try{ lvModelUi(); lvSendOpts(); }catch{}
 }
 function dlssnrInstallNote(r){   // one line about what got installed (known build or not)
-  return r.known ? 'Installed build: ' + r.known + '.' : 'Installed an unverified build (SHA256 ' + String(r.sha256 || '').slice(0, 12) + '&hellip;), not the verified build; it may still work.';
+  return r.known ? tr('nr.installedBuild', { build: r.known }) : tr('nr.unverified', { sha: String(r.sha256 || '').slice(0, 12) });
 }
+// the DLSS 5 runtime's download page as a link (main opens it): its text is the language's, its action the code's
+function rhiLink(){ return '<a href="#" onclick="ipcRenderer.invoke(\'dlssnr-open-download\');return false;">' + tr('nr.rhiLink') + '</a>'; }
+i18nRelabel.push(() => syncDlssnr());
 async function doDlssnrInstall(source){
   $('dlssnrsetup').style.display = 'block';
-  $('dlssnrstatus').textContent = 'installing...'; $('dlssnrstatus').style.color = 'var(--sub)';
+  $('dlssnrstatus').textContent = tr('common.installing'); $('dlssnrstatus').style.color = 'var(--sub)';
   let r: any = {}; try { r = await ipcRenderer.invoke('dlssnr-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('dlssnrsteps').innerHTML = '✗ ' + (r.error || 'install failed')
-      + '<br>Pick the file again with <b>Choose nvngx_dlssnr.dll&hellip;</b>.';
+  if(!r.ok) $('dlssnrsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('nr.pickAgain');
   await checkDlssnrReady();
   if(!r.ok) $('dlssnrsetup').style.display = 'block';   // keep an install error visible
   else if(!r.known){ $('dlssnrsteps').innerHTML += '<br>' + dlssnrInstallNote(r); $('dlssnrsetup').style.display = 'block'; }
@@ -710,20 +886,19 @@ let dlssnrDownloading = false;
 ipcRenderer.on('dlssnr-progress', (_e, p) => {
   if(!dlssnrDownloading) return;
   const mb = x => (x / 1048576).toFixed(0);
-  $('dlssnrstatus').textContent = p.stage === 'verify' ? 'Verifying checksum...' : 'Downloading... ' + mb(p.received) + ' / ' + mb(p.total) + ' MB';
+  $('dlssnrstatus').textContent = p.stage === 'verify' ? tr('dl.verify') : tr('dl.progress', { got: mb(p.received), total: mb(p.total) });
 });
 async function doDlssnrDownload(){
   if(dlssnrDownloading) return;
   dlssnrDownloading = true; $('dlssnrdl').disabled = true; $('dlssnrbrowse').disabled = true;
   $('dlssnrsetup').style.display = 'block';
-  $('dlssnrstatus').textContent = 'Downloading...'; $('dlssnrstatus').style.color = 'var(--sub)';
+  $('dlssnrstatus').textContent = tr('dl.start'); $('dlssnrstatus').style.color = 'var(--sub)';
   let r: any = {}; try { r = await ipcRenderer.invoke('dlssnr-download'); } catch(e){ r = { ok:false, error:String(e) }; }
   dlssnrDownloading = false; $('dlssnrdl').disabled = false; $('dlssnrbrowse').disabled = false;
   await checkDlssnrReady();
   if(!r.ok){
-    $('dlssnrstatus').textContent = '✗ DOWNLOAD FAILED'; $('dlssnrstatus').style.color = '#e85c5c';
-    $('dlssnrsteps').innerHTML = '✗ ' + (r.error || 'download failed') + '<br>Check the connection and try again, or get the file yourself from '
-      + '<a href="#" onclick="ipcRenderer.invoke(\'dlssnr-open-download\');return false;">rhi-repo on GitHub</a> and use <b>Choose nvngx_dlssnr.dll&hellip;</b>.';
+    $('dlssnrstatus').textContent = tr('dl.failed'); $('dlssnrstatus').style.color = '#e85c5c';
+    $('dlssnrsteps').innerHTML = '✗ ' + (r.error || tr('dl.failedShort')) + '<br>' + tr('nr.dlRetry', { link: rhiLink() });
     $('dlssnrsetup').style.display = 'block';
   }
 }
@@ -783,10 +958,7 @@ function renderModel(){
     : modelIsNvof() ? 'nvof' : modelIsFsrfg() ? 'fsrfg' : '';
 }
 function frucSetupHtml(){
-  const detail = !frucBridge
-    ? 'The bridge (nvoffruc_bridge.dll) is missing from engine/nvoffruc. Build it once (see DEVELOPMENT.md, "Building the native bridges").'
-    : 'Click <b>Get from NVIDIA</b>, then <b>Choose .zip&hellip;</b> and pick the downloaded Optical_Flow_SDK&hellip;.zip. It installs automatically. Until then GMFSS is used.';
-  return "NVIDIA Smooth Motion uses NVIDIA's Optical Flow runtime (a one-time download, not bundled).<br>" + detail;
+  return tr('fruc.intro') + '<br>' + (!frucBridge ? tr('fruc.noBridge') : tr('fruc.howto'));
 }
 async function refreshFrucState(){
   try { const r = await ipcRenderer.invoke('fruc-ready'); frucReady = !!(r && r.ready); frucBridge = !!(r && r.bridge); }
@@ -807,15 +979,13 @@ function syncModel(){
   // The DRBA sub-option only makes sense while RIFE is the chosen model (always ready: bundled).
   $('rifedrbarow').style.display = $('modelrife').checked ? '' : 'none';
   if($('modeldlss').checked && !dlssReady){
-    $('dlsssteps').innerHTML = 'The bundled DLSS runtime is incomplete: <b>' + dlssMissing.join(', ')
-      + '</b> missing from engine/dlssg. Reinstall the app (or rebuild per DEVELOPMENT.md). '
-      + 'Until then GMFSS is used.';
+    $('dlsssteps').innerHTML = tr('dlssg.incomplete', { files: dlssMissing.join(', ') });
     $('dlsssetup').style.display = 'block';
   } else {
     $('dlsssetup').style.display = 'none';
   }
   if($('modelfruc').checked && !frucReady){
-    $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
+    $('frucstatus').textContent = tr('dlss.notReady'); $('frucstatus').style.color = '#e85c5c';
     $('frucsteps').innerHTML = frucSetupHtml();
     $('frucbtns').style.display = '';
     $('frucsetup').style.display = 'block';
@@ -836,19 +1006,19 @@ function pickModel(box){
 }
 async function doFrucInstall(source){
   $('frucsetup').style.display = 'block';
-  $('frucstatus').textContent = 'installing...'; $('frucstatus').style.color = 'var(--sub)';
+  $('frucstatus').textContent = tr('common.installing'); $('frucstatus').style.color = 'var(--sub)';
   let r: any = {}; try { r = await ipcRenderer.invoke('fruc-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
   await refreshFrucState();
   if(frucReady){ $('modelfruc').checked = true; $('modelgmfss').checked = false; localStorage.setItem('interpModel','fruc'); $('frucsetup').style.display = 'none'; }
   else if(r.ok){   // NvOFFRUC.dll copied fine; readiness just needs the one-time bridge build
-    $('frucstatus').textContent = '✓ DLL installed'; $('frucstatus').style.color = 'var(--green)';
-    $('frucsteps').innerHTML = 'NvOFFRUC.dll installed. Last step: build <b>nvoffruc_bridge.dll</b> into '
-      + 'engine/nvoffruc once (see DEVELOPMENT.md, "Building the native bridges"). Until then GMFSS is used.';
+    $('frucstatus').textContent = tr('fruc.dllInstalled'); $('frucstatus').style.color = 'var(--green)';
+    $('frucsteps').innerHTML = tr('fruc.lastStep');
   } else {
-    $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
-    $('frucsteps').innerHTML = '✗ ' + (r.error || 'install failed') + '<br>' + frucSetupHtml();
+    $('frucstatus').textContent = tr('dlss.notReady'); $('frucstatus').style.color = '#e85c5c';
+    $('frucsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + frucSetupHtml();
   }
 }
+i18nRelabel.push(syncModel);
 $('frucget').onclick = () => ipcRenderer.invoke('fruc-open-download');
 $('frucbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('fruc-choose'); if(p) doFrucInstall(p); };  // selecting a .zip auto-installs
 for(const b of ['modelgmfss','modelrife','modeldlss','modelfruc','modelfsrfg','modelnvof']) $(b).onchange = () => pickModel($(b));
@@ -968,8 +1138,8 @@ function lvSendOpts(){
     vsrquality: vsrQuality(),
     fsrup: fsrUpOn(),   // AMD FSR 4 takes the same resize when ticked instead of RTX VSR
     // no "Upscale to": Live's size is what Display presents (the window or the screen), the DLSS mode its speed
-    // Restore (AI detail): Real-ESRGAN first on every presented frame, python route only
-    restore: restoreOn(),
+    // Restore (AI detail): Real-ESRGAN or AnimeJaNai first on every presented frame
+    restore: restoreOn(), restoreModel: restoreModelId(),
     // NVIDIA DLSS 5: Neural Rendering once per captured frame (runtime installed), python route
     dlssnr: nrOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses(),
     // live TrueHDR (SDR window -> HDR out) + the RTX HDR tone/colour knobs it inherits
@@ -983,50 +1153,54 @@ function lvSendOpts(){
     hudlat: $('lvhudlat').checked,
     gpufit: $('gpufit').checked,
   });
-  const load = mi.model === 'rife' ? 'starts in ~3s (~45s the first time at a new window size)'
-    : mi.model === 'rifedrba' ? 'starts in ~3s (~55s the first time at a new window size)'
-    : mi.model === 'gmfss' ? 'loads in ~4s (~30s the first time at a new window size)'
-    : mi.model === 'nvof' || mi.model === 'fsrfg' ? 'starts in a few seconds' : '';
+  lvTargetUi(mi);
+}
+// the line beside Smooth It Live!: the model, how it meets the Speed target, its load time (mi.name / mi.note above stay
+// English: they also go to the host's own overlay)
+function lvTargetUi(mi = liveModelInfo()){
+  const load = mi.model === 'rife' ? tr('lv.load.rife') : mi.model === 'rifedrba' ? tr('lv.load.drba')
+    : mi.model === 'gmfss' ? tr('lv.load.gmfss') : mi.model === 'nvof' || mi.model === 'fsrfg' ? tr('lv.load.fast') : '';
   // A fixed model cannot hit an arbitrary target exactly: it picks the first whole multiple
   // of the captured window's own rate that reaches it, so say that instead of promising the exact number.
   const lvT = liveTargetFps();
-  $('lvtarget').textContent = mi.name
-    + (mi.effectsOnly ? ' · effects only (Restore, Sharpen, RTX VSR, RTX HDR) at the source rate, capped by the ' + lvT + ' fps Speed setting; tick a model to smooth'
-       : mi.fixed ? ' · the first whole multiple of the captured rate that reaches ' + lvT + ' fps'
-                  + (mi.model === 'dlssg' ? ' (multi-pass past its one-pass limit, full passes first)' : '')
-       : ' · targets ' + lvT + ' fps (the Speed setting below)')
+  $('lvtarget').textContent = (mi.effectsOnly ? tr('lv.none') : mi.name)
+    + ' · ' + (mi.effectsOnly ? tr('lv.effectsOnly', { fps: lvT })
+       : mi.fixed ? tr('lv.fixed', { fps: lvT }) + (mi.model === 'dlssg' ? ' ' + tr('lv.fixed.dlssg') : '')
+       : tr('lv.targets', { fps: lvT }))
     + (load ? ' · ' + load : '')
-    + (liveHdrOn() && ['rife', 'rifedrba', 'gmfss', 'nvof', 'dlssg'].includes(mi.model) ? ' · RTX HDR (on HDR screens)' : '')
-    + (mi.note ? ' · ' + mi.note : '') + '  ·  ';
+    + (liveHdrOn() && ['rife', 'rifedrba', 'gmfss', 'nvof', 'dlssg'].includes(mi.model) ? ' · ' + tr('lv.rtxhdr') : '')
+    + (mi.note ? ' · ' + tr('lv.note.' + mi.model) : '') + '  ·  ';
 }
 function lvModelUi(){
   // every display mode works with every model (DLSS 4.5 with an effect, Fill included, runs the effects route
   // before its frame generation)
   $('lvfit').disabled = lvState === 'running';
   // Restore applies live too; named here like Upscale to
-  const resTxt = restoreOn() ? 'Restore (AI detail) first, heavy' : '';
+  const resTxt = restoreOn() ? tr('lv.fit.restore', { model: tr(ajOn() ? 'restoreaj.label' : 'restore.label') }) : '';
   // DLSS 5 applies live too: once per captured frame
-  const nrTxt = nrOn() ? 'DLSS 5 on every captured frame' : '';
+  const nrTxt = nrOn() ? tr('lv.fit.nr') : '';
   const effTxt = [resTxt, nrTxt].filter(Boolean).join(' · ');
   $('lvfithint').textContent =
-    $('lvfit').value === 'fill' ? 'enlarges the window to fill its monitor, aspect kept · '
-                                  + (liveVsrOn() ? 'RTX VSR upscale' : fsrUpOn() ? 'AMD FSR upscale' : 'upscale')
+    $('lvfit').value === 'fill' ? tr('lv.fit.fill') + ' · '
+                                  + (liveVsrOn() ? tr('lv.fit.vsr') : fsrUpOn() ? tr('lv.fit.fsr') : tr('lv.fit.up'))
                                   + (effTxt ? ' · ' + effTxt : '')
-    : $('lvfit').value === 'monitor' ? 'smooths everything on the monitor the window is on'
+    : $('lvfit').value === 'monitor' ? tr('lv.fit.monitor')
                                        + (effTxt ? ' · ' + effTxt : '')
     : effTxt;
 }
 function lvUi(){
   const b = $('lvgo');
-  if(lvState === 'running') b.textContent = 'Stop';
-  else if(lvState === 'idle') b.textContent = 'Smooth It Live!';
+  if(lvState === 'running') b.textContent = tr('lv.stop');
+  else if(lvState === 'idle') b.textContent = tr('live.go');
   // arming: the countdown tick owns the button text ("Cancel (N)")
   modeBtnUi(lvState !== 'idle');
   lvModelUi();
 }
+lvUi();
+i18nRelabel.push(() => { lvUi(); lvTargetUi(); });
 function lvDisarm(){
   if(lvTimer){ clearInterval(lvTimer); lvTimer = null; }
-  if(lvState === 'arming'){ lvState = 'idle'; lvUi(); $('lvstat').textContent = ''; }
+  if(lvState === 'arming'){ lvState = 'idle'; lvUi(); raw('lvstat', ''); }
 }
 // The fps target is a spawn-time argument (--target, and the exe derives the slot
 // count from it), so a Speed change during a running session relaunches the session like a DLSS
@@ -1084,9 +1258,10 @@ $('lvkey').onclick = () => {
   if(lvKeyCapture || lvState !== 'idle') return;
   lvKeyCapture = true;
   const old = $('lvkey').textContent;
-  $('lvkey').textContent = 'press a key…';
-  $('lvkeyhint').textContent = 'Esc cancels';
-  const done = (txt, hint?) => { lvKeyCapture = false; $('lvkey').textContent = txt; $('lvkeyhint').textContent = hint || ''; window.removeEventListener('keydown', h, true); };
+  txt('lvkey', () => tr('lv.key.press'));
+  txt('lvkeyhint', () => tr('lv.key.esc'));
+  const done = (key: string, hint?: () => string) => { lvKeyCapture = false; raw('lvkey', key);
+    if(hint) txt('lvkeyhint', hint); else raw('lvkeyhint', ''); window.removeEventListener('keydown', h, true); };
   const h = async (e) => {
     e.preventDefault(); e.stopPropagation();
     if(e.key === 'Escape'){ done(old); return; }
@@ -1094,7 +1269,7 @@ $('lvkey').onclick = () => {
     if(!acc) return;
     const ok = await ipcRenderer.invoke('lv-hotkey', acc);
     if(ok){ localStorage.setItem('lvHotkey', acc); done(acc); }
-    else done(old, 'could not register ' + acc + ' (taken by another app?)');
+    else done(old, () => tr('lv.key.fail', { key: acc }));
   };
   window.addEventListener('keydown', h, true);
 };
@@ -1102,7 +1277,7 @@ $('lvkey').onclick = () => {
 {
   const savedKey = localStorage.getItem('lvHotkey');
   if(savedKey && savedKey !== '`')
-    ipcRenderer.invoke('lv-hotkey', savedKey).then(ok => { if(ok) $('lvkey').textContent = savedKey; });
+    ipcRenderer.invoke('lv-hotkey', savedKey).then(ok => { if(ok) raw('lvkey', savedKey); });
 }
 $('lvgo').onclick = async () => {
   if(lvState === 'running'){
@@ -1117,12 +1292,12 @@ $('lvgo').onclick = async () => {
   const tick = () => {
     if(n <= 0){
       if(lvTimer){ clearInterval(lvTimer); lvTimer = null; }
-      $('lvgo').textContent = 'starting…';
+      $('lvgo').textContent = tr('lv.starting');
       ipcRenderer.send('lv-start-fg');
       return;
     }
-    $('lvgo').textContent = 'Cancel (' + n + ')';
-    $('lvstat').textContent = 'click the window you want smoothed…';
+    $('lvgo').textContent = tr('lv.cancelN', { n });
+    txt('lvstat', () => tr('lv.clickWindow'));
     n--;
   };
   tick();
@@ -1134,7 +1309,7 @@ $('lvgo').onclick = async () => {
 let lvOutBuf = '';
 let lvRefused = false;   // a refusal reason owns the status line until the next session
 // DLSS 4.5 above one pass: the session's plan, or why it stays at one pass, kept beside the stats until the next session
-let lvNote = '';
+let lvNote: (() => string) | null = null;
 function lvLine(t){
   // The host's refusal reason ("native host: <reason>", or the engine lookup / build failure) is
   // the ONE thing the user must read: it stays the last word on the panel, because the exe's own
@@ -1142,26 +1317,25 @@ function lvLine(t){
   // start") arrive after it and would otherwise replace it, and lv-out never reaches the log panel.
   const rf = /native host: (?!this session cannot start)([^\r\n]+)/.exec(t)
           || /native: (the host could not find or build the engines[^\r\n(]*)/.exec(t);
-  if(rf){ lvRefused = true; $('lvstat').textContent = rf[1].trim().slice(0, 240); return; }
+  if(rf){ lvRefused = true; raw('lvstat', rf[1].trim().slice(0, 240)); return; }
   if(lvRefused) return;
   const pl = /^DLSS 4\.5 at (\d+)x: (\d+)x in a second process, (?:(\d+)x in a third, )?then (\d+)x/.exec(t);
   const one = /^DLSS 4\.5 stays at (\d+)x: (?:\d+x \(\d+x, then \d+x\) )?([^\r\n]+)/.exec(t);
   const lost = /^DLSS 4\.5's second (and third )?pass(?:es)? ended \(([^)]+)\): back to one pass at (\d+)x/.exec(t);
-  if(pl) lvNote = 'DLSS 4.5 ' + pl[1] + '× (' + pl[2] + '×, ' + (pl[3] ? pl[3] + '×, ' : '') + 'then ' + pl[4] + '×)';
-  else if(one) lvNote = 'DLSS 4.5 stays at ' + one[1] + '×: ' + one[2].trim().slice(0, 120);
-  else if(lost) lvNote = 'DLSS 4.5 back to ' + lost[3] + '×: the second ' + (lost[1] ? 'and third passes' : 'pass')
-    + ' ended (' + lost[2] + ')';
+  if(pl){ const [, all, a, b, c] = pl; lvNote = () => 'DLSS 4.5 ' + all + '× (' + a + '×, ' + (b ? b + '×, ' : '') + tr('lv.then') + ' ' + c + '×)'; }
+  else if(one){ const n = one[1], why = one[2].trim().slice(0, 120); lvNote = () => tr('lv.stays', { n }) + ': ' + why; }
+  else if(lost){ const key = lost[1] ? 'lv.lost2' : 'lv.lost1', n = lost[3], why = lost[2]; lvNote = () => tr(key, { n, why }); }
   // surface the exe's 2s stats lines; pass real failures through verbatim (trimmed)
   const m = /live: ([\d.]+) captured fps -> ([\d.]+) presented fps.*?latency ~(\d+)ms/.exec(t)
          || /live: ([\d.]+) captured fps -> ([\d.]+) presented fps/.exec(t);
   // the measured multiplier (out over in, the host's ratio) on every model's line, beside DLSS 4.5's plan
   const rt = /presented fps \(ratio ([\d.]+)/.exec(t);
-  if(m) $('lvstat').textContent = m[1] + ' fps in → ' + m[2] + ' fps out' + (rt && +rt[1] > 0 ? ' (' + rt[1] + '×)' : '')
-    + (m[3] ? '  ·  ~' + m[3] + ' ms latency' : '') + (lvNote ? '  ·  ' + lvNote : '');
+  if(m){ const fin = m[1], fout = m[2], ms = m[3], ratio = rt && +rt[1] > 0 ? ' (' + rt[1] + '×)' : '', note = lvNote;
+    txt('lvstat', () => tr('lv.stats', { fin, fout }) + ratio + (ms ? '  ·  ' + tr('lv.latency', { ms }) : '') + (note ? '  ·  ' + note() : '')); }
   // the native host is the only live route: its handoff start and cold engine build mean "loading"
-  else if(/engine handoff started|host (GMFSS |Restore )?engine build for/.test(t)) $('lvstat').textContent = 'Loading the model…';
+  else if(/engine handoff started|host (GMFSS |Restore )?engine build for/.test(t)) txt('lvstat', () => tr('lv.loading'));
   else if(/FAIL|not supported|no visible window|not a visible window|no frames captured|minimized: waiting|cannot start in the native host|live server (protocol error|stalled)/i.test(t))
-    $('lvstat').textContent = t.trim().slice(0, 160);
+    raw('lvstat', t.trim().slice(0, 160));
 }
 ipcRenderer.on('lv-out', (_e, t) => {
   lvOutBuf += t;
@@ -1174,19 +1348,19 @@ ipcRenderer.on('lv-started', () => {
   if(lvTimer){ clearInterval(lvTimer); lvTimer = null; }
   setMode('live');   // the ` hotkey can start a session with no renderer involvement
 
-  lvState = 'running'; lvStopReq = false; lvRefused = false; lvNote = ''; lvUi();
+  lvState = 'running'; lvStopReq = false; lvRefused = false; lvNote = null; lvUi();
   try{ lvSpawnTarget = lvEffTarget(); }catch{}   // what --target this session carries
-  $('lvstat').textContent = 'starting…';
+  txt('lvstat', () => tr('lv.starting'));
 });
 ipcRenderer.on('lv-done', (_e, code) => {
   lvState = 'idle'; lvUi();
   // a requested Stop kills the exe (code null via kill(), or nonzero on Windows), and the
   // ` hotkey stops the same way from main without setting lvStopReq: both read as a clean stop
   if(!lvRefused){   // a refusal reason stays on the line: an exit code adds nothing to it
-    if(lvStopReq || code === 0 || code === null) $('lvstat').textContent = 'stopped';
-    else if(code === 5) $('lvstat').textContent = 'no smoothable window was focused - click the window you want smoothed during the countdown';
-    else if(code === 7) $('lvstat').textContent = 'stopped: the window was closed';
-    else $('lvstat').textContent += '  (live mode ended, exit ' + code + ')';
+    if(lvStopReq || code === 0 || code === null) txt('lvstat', () => tr('lv.stopped'));
+    else if(code === 5) txt('lvstat', () => tr('lv.noWindow'));
+    else if(code === 7) txt('lvstat', () => tr('lv.closed'));
+    else { const before = lineOf('lvstat'); txt('lvstat', () => before() + '  (' + tr('lv.ended', { code }) + ')'); }
   }
   lvStopReq = false;
 });
@@ -1213,7 +1387,7 @@ if(!input){
   showWorkspace(true);
   $('go').disabled = true; $('changeout').disabled = true;
   $('outrow').style.display = 'none';
-  $('status').textContent = 'Select a video, then click Smooth It!';
+  setStatus('run.status.select');
 }
 
 // --- Dolby Vision export tools (mirrors the RTX library flow) ------------------------------------
@@ -1236,36 +1410,32 @@ function syncDv(){
 // name resolves to .mkv. Pure text updates (no IPC), safe to call from refresh() on every change.
 function updateDvHpHints(){
   const mkv = (lastOut || '').toLowerCase().endsWith('.mkv');
-  const hint = (name, base = 'HDR10') => !$('rtxhdr').checked ? '(needs RTX HDR on)'
-    : mkv ? '(skipped for this video: its tracks need MKV output, ' + name + ' needs MP4)'
-    : "(plays as " + base + " where " + name + " isn't supported)";
+  const hint = (name, base = 'HDR10') => !$('rtxhdr').checked ? tr('common.needsRtxHdr')
+    : mkv ? tr('dvhp.mkv', { name }) : tr('dvhp.fallback', { base, name });
   $('dvhint').textContent = hint('Dolby Vision');
   $('dv84hint').textContent = hint('Dolby Vision', 'HLG');
   $('hphint').textContent = hint('HDR10+');
 }
 async function checkDvReady(){
-  $('dvstatus').textContent = 'checking...'; $('dvstatus').style.color = 'var(--sub)';
+  $('dvstatus').textContent = tr('common.checking'); $('dvstatus').style.color = 'var(--sub)';
   try { dvReady = await ipcRenderer.invoke('dv-ready'); } catch { dvReady = { dovi:false, ready:false }; }
-  const line = (dvReady.dovi ? '✓' : '✗') + ' dovi_tool (RPU generate + inject)';
+  const line = (dvReady.dovi ? '✓ ' : '✗ ') + tr('dv.line');
   if(dvReady.ready){
-    $('dvstatus').textContent = '✓ READY'; $('dvstatus').style.color = 'var(--green)';
-    $('dvsteps').innerHTML = line + '<br>The Dolby Vision export tool is installed.';
+    $('dvstatus').textContent = tr('setup.ready'); $('dvstatus').style.color = 'var(--green)';
+    $('dvsteps').innerHTML = line + '<br>' + tr('dv.installed');
   } else {
-    $('dvstatus').textContent = '✗ NOT READY'; $('dvstatus').style.color = '#e85c5c';
+    $('dvstatus').textContent = tr('dlss.notReady'); $('dvstatus').style.color = '#e85c5c';
     // Name the exact Windows download, since the release page also lists macOS/Linux/ARM builds.
-    $('dvsteps').innerHTML = line
-      + '<br>Click <b>Get dovi_tool</b> and pick the <b>x64 Windows</b> build '
-      + '(<code>&hellip;x86_64-pc-windows-msvc.zip</code>), then <b>Choose .zip&hellip;</b> and pick it; it installs automatically.';
+    $('dvsteps').innerHTML = line + '<br>' + tr('dv.howto');
   }
   $('dvbtns').style.display = dvReady.ready ? 'none' : '';   // hide Get / Choose once dovi_tool is installed
   $('dvsetup').style.display = dvReady.ready ? 'none' : 'block';
 }
 async function doDvInstall(source){
   $('dvsetup').style.display = 'block';
-  $('dvstatus').textContent = 'installing...'; $('dvstatus').style.color = 'var(--sub)';
+  $('dvstatus').textContent = tr('common.installing'); $('dvstatus').style.color = 'var(--sub)';
   let r: any = {}; try { r = await ipcRenderer.invoke('dv-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('dvsteps').innerHTML = '✗ ' + (r.error || 'install failed')
-      + '<br>Pick the dovi_tool&hellip;.zip again with <b>Choose .zip&hellip;</b>.';
+  if(!r.ok) $('dvsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('dv.pickAgain');
   await checkDvReady();
   if(!r.ok) $('dvsetup').style.display = 'block';   // keep an install error visible
 }
@@ -1288,6 +1458,7 @@ $('dv84export').onchange = () => {
 };
 $('rtxhdr').addEventListener('change', () => { if(dvOn()) syncDv(); });   // hint tracks HDR state
 syncDv();
+i18nRelabel.push(syncDv);
 
 // --- HDR10+ export tool (mirrors the Dolby Vision flow) ------------------------------------------
 // HDR10+ export needs ONE non-shippable open-source binary - hdr10plus_tool - dropped into
@@ -1301,28 +1472,25 @@ function syncHp(){
   updateDvHpHints();
 }
 async function checkHpReady(){
-  $('hpstatus').textContent = 'checking...'; $('hpstatus').style.color = 'var(--sub)';
+  $('hpstatus').textContent = tr('common.checking'); $('hpstatus').style.color = 'var(--sub)';
   try { hpReady = await ipcRenderer.invoke('hp-ready'); } catch { hpReady = { ready:false }; }
-  const line = (hpReady.ready ? '✓' : '✗') + ' hdr10plus_tool (ST 2094-40 SEI inject)';
+  const line = (hpReady.ready ? '✓ ' : '✗ ') + tr('hp.line');
   if(hpReady.ready){
-    $('hpstatus').textContent = '✓ READY'; $('hpstatus').style.color = 'var(--green)';
-    $('hpsteps').innerHTML = line + '<br>The HDR10+ export tool is installed.';
+    $('hpstatus').textContent = tr('setup.ready'); $('hpstatus').style.color = 'var(--green)';
+    $('hpsteps').innerHTML = line + '<br>' + tr('hp.installed');
   } else {
-    $('hpstatus').textContent = '✗ NOT READY'; $('hpstatus').style.color = '#e85c5c';
+    $('hpstatus').textContent = tr('dlss.notReady'); $('hpstatus').style.color = '#e85c5c';
     // Name the exact Windows download, since the release page also lists macOS/Linux/ARM builds.
-    $('hpsteps').innerHTML = line
-      + '<br>Click <b>Get hdr10plus_tool</b> and pick the <b>x64 Windows</b> build '
-      + '(<code>&hellip;x86_64-pc-windows-msvc.zip</code>), then <b>Choose .zip&hellip;</b> and pick it; it installs automatically.';
+    $('hpsteps').innerHTML = line + '<br>' + tr('hp.howto');
   }
   $('hpbtns').style.display = hpReady.ready ? 'none' : '';   // hide Get / Choose once the tool is installed
   $('hpsetup').style.display = hpReady.ready ? 'none' : 'block';
 }
 async function doHpInstall(source){
   $('hpsetup').style.display = 'block';
-  $('hpstatus').textContent = 'installing...'; $('hpstatus').style.color = 'var(--sub)';
+  $('hpstatus').textContent = tr('common.installing'); $('hpstatus').style.color = 'var(--sub)';
   let r: any = {}; try { r = await ipcRenderer.invoke('hp-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('hpsteps').innerHTML = '✗ ' + (r.error || 'install failed')
-      + '<br>Pick the hdr10plus_tool&hellip;.zip again with <b>Choose .zip&hellip;</b>.';
+  if(!r.ok) $('hpsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('hp.pickAgain');
   await checkHpReady();
   if(!r.ok) $('hpsetup').style.display = 'block';   // keep an install error visible
 }
@@ -1336,6 +1504,7 @@ $('hpexport').onchange = () => {
 };
 $('rtxhdr').addEventListener('change', () => { if($('hpexport').checked) syncHp(); });   // hint tracks HDR state
 syncHp();
+i18nRelabel.push(syncHp);
 
 // Before/after preview (panel above Smooth It): render ONE frame at the current spatial settings via the
 // main process's preview (render/preview.js, the native host's pass chain) and show original vs processed. It applies RTX HDR (when on + ready) and
@@ -1363,7 +1532,7 @@ ipcRenderer.invoke('live-path').then(p => { livePath = p; });
 let liveHidden = localStorage.getItem('liveHidden') === '1';
 function applyLiveOff(){ ipcRenderer.send('live-off', liveHidden); }   // sync engine to the saved choice
 function syncLiveToggle(){
-  $('livetoggle').textContent = liveHidden ? 'Show preview' : 'Hide preview (frees resources)';
+  $('livetoggle').textContent = liveHidden ? tr('run.liveShow') : tr('run.livetoggle');
   if(liveHidden) $('live').style.display = 'none';   // Show reveals again on the next written frame
 }
 $('livetoggle').onclick = () => {
@@ -1372,6 +1541,7 @@ $('livetoggle').onclick = () => {
   syncLiveToggle(); applyLiveOff();
 };
 syncLiveToggle();
+i18nRelabel.push(syncLiveToggle);
 function updateLive(){
   if(!livePath || liveHidden) return;             // hidden: engine produces nothing, keep it hidden
   try {
@@ -1393,7 +1563,7 @@ let prevBusy = false, prevPending = null, previewLite = false;   // serialize re
 let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown / mid-render preview
 function prevSettingsSig(){                 // everything that changes what the processed pane shows
   const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
-  return [sharpStrength(), restoreOn(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
+  return [sharpStrength(), restoreOn(), restoreModelId(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
           upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), vsrQuality(), fsrUpOn(), nrOn(), nrStructure(), nrTone(), nrStyle(), nrPasses(), nrMaskOn(),
           dlssMode()];
 }
@@ -1428,7 +1598,7 @@ async function loadPreview(frame, bg?){   // bg: background "refine" pass (the R
     setSpin($('prevorigwrap'), $('prevorigspin'), true);
   }
   let r; try { r = await ipcRenderer.invoke('preview', Object.assign(
-    { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr: useHdr,
+    { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), restoreModel: restoreModelId(), hdr: useHdr,
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
       upscale: upFactor() || 0,
       rtxvsr: useVsr, vsrquality: vsrQuality(), fsrup: useFsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
@@ -1441,7 +1611,7 @@ async function loadPreview(frame, bg?){   // bg: background "refine" pass (the R
   prevBusy = false;
   if(prevPending != null){ const f = prevPending; prevPending = null; loadPreview(f); }
   if(!r || r.error){ lastPrevKey = '';   // never dedupe-skip a retry after a failure
-    $('prevnote').textContent = 'preview unavailable: ' + ((r && r.error) || 'no result'); return; }
+    const err = r && r.error; txt('prevnote', () => tr('prev.unavail', { err: err || tr('prev.noResult') })); return; }
   if(r.total) prevTotal = r.total;
   if(typeof r.frame === 'number') prevIdx = r.frame;
   setPrevImg($('prevorig'), r.original);
@@ -1456,23 +1626,16 @@ async function loadPreview(frame, bg?){   // bg: background "refine" pass (the R
   const plainOnly = upActive && !vsrOn && !useFsr && !restoreOn() && sharpen <= 0 && !useHdr && !useNr;
   const rtxSkipped = lite && (hdr || nrOn() || ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1) || (fsrUpOn() && upFactor() > 1));   // RTX / FSR / DLSS 5 on in settings but skipped for the fast auto-preview
   const srcHdr = !!(info && info.srcHdr);
-  $('prevoriglabel').textContent = srcHdr ? 'Original (HDR, tonemapped)' : 'Original';
-  const parts = []; if(restoreOn()) parts.push('Restore');
-  if(upActive) parts.push(vsrOn ? 'VSR' : useFsr ? 'FSR' : upFactor() < 1 ? 'downscale' : 'upscale');
+  // the pass names ('@key' = a language string, else a name that stays as is)
+  const parts = []; if(restoreOn()) parts.push('@restore.k');
+  if(upActive) parts.push(vsrOn ? 'VSR' : useFsr ? 'FSR' : upFactor() < 1 ? '@prev.part.down' : '@prev.part.up');
   if(useNr) parts.push('DLSS 5');
-  if(sharpen > 0) parts.push('Sharpen'); if(useHdr) parts.push('HDR');
-  $('prevproclabel').textContent = !active ? 'Unchanged'
-    : maskShown ? 'DLSS 5 changed pixels'
-    : 'Processed (' + parts.join(' + ') + ')';
-  $('prevlabel').textContent = 'frame ' + prevIdx + (prevTotal ? ' / ' + prevTotal : '');
-  $('prevnote').textContent = (maskShown ? 'DLSS 5 changed ' + r.nrmaskPct + '% of the pixels, average change ' + r.nrmaskMean + '/255 · bright = large change, dark = untouched'
-    : rtxSkipped ? 'quick preview shown; refining to the full RTX VSR/HDR/DLSS 5 version…'
-    : srcHdr ? 'source is already HDR (shown tonemapped); RTX HDR does not apply'
-    : !active ? 'no Restore, Sharpen, DLSS 5 or RTX HDR enabled, the output will match the source'
-    : plainOnly ? (upFactor() < 1 ? 'plain downscale, both panes match (RTX VSR is for upscaling)'
-                                    : 'plain upscale, no AI detail added (enable RTX VSR for that; both panes match)')
-    : useHdr ? 'HDR is tonemapped to show on this SDR screen'
-    : 'detail changes are subtle when the frame is shrunk to fit') + ' · click an image for 1:1 pixels';
+  if(sharpen > 0) parts.push('@sharpen.k'); if(useHdr) parts.push('HDR');
+  const note = maskShown ? 'prev.note.mask' : rtxSkipped ? 'prev.note.quick' : srcHdr ? 'prev.note.srcHdr'
+    : !active ? 'prev.note.none' : plainOnly ? (upFactor() < 1 ? 'prev.note.plainDown' : 'prev.note.plainUp')
+    : useHdr ? 'prev.note.hdr' : 'prev.note.subtle';
+  prevLab = { srcHdr, active, maskShown, parts, idx: prevIdx, total: prevTotal, note, pct: r.nrmaskPct, mean: r.nrmaskMean };
+  paintPrevLabels();
   // Auto-upgrade: the quick preview skipped the slow RTX passes for an instant first paint. Now that it's
   // on screen, render the full RTX (VSR/HDR) version of the SAME frame so the pane ends on the real result
   // without the user needing to touch a control - their RTX picks persist across sessions, so many never
@@ -1480,6 +1643,18 @@ async function loadPreview(frame, bg?){   // bg: background "refine" pass (the R
   // skipped if the user already queued another render, which supersedes it.
   if(rtxSkipped && prevPending == null && !prevBusy) loadPreview(prevIdx, true);
 }
+// the shown preview's labels from its last result (prevLab), so a language switch relabels it with no new render
+let prevLab: any = null;
+function paintPrevLabels(){
+  if(!prevLab) return;
+  const L = prevLab;
+  $('prevoriglabel').textContent = L.srcHdr ? tr('prev.origHdr') : tr('prev.orig');
+  const parts = L.parts.map(p => p.startsWith('@') ? tr(p.slice(1)) : p).join(' + ');
+  $('prevproclabel').textContent = !L.active ? tr('prev.unchanged') : L.maskShown ? tr('prev.maskLabel') : tr('prev.procParts', { parts });
+  $('prevlabel').textContent = tr('prev.frameN', { n: L.idx }) + (L.total ? ' / ' + L.total : '');
+  txt('prevnote', () => tr(L.note, { pct: L.pct, mean: L.mean }) + ' · ' + tr('prev.note.click'));
+}
+i18nRelabel.push(paintPrevLabels);
 function randFrame(){ return prevTotal > 1 ? Math.floor(Math.random() * prevTotal) : 'mid'; }
 function refreshPreviewIfOpen(){           // re-render the shown frame when sharpen / HDR changes
   if(!input) return;
@@ -1503,7 +1678,7 @@ function showPreviewInitializing(){
     if($(inner).clientHeight < 40) $(wrap).style.minHeight = '120px';   // room for the wheel on first load
     setSpin($(wrap), $(spin), true);
   }
-  $('prevnote').textContent = 'Initializing preview…';
+  txt('prevnote', () => tr('prev.init'));
 }
 function openPreviewForVideo(){            // auto-load the pane when a video is selected
   syncPreview(); prevHist = []; prevTotal = 0; prevIdx = 0; updatePrevNav();
@@ -1517,7 +1692,7 @@ $('sharpen').addEventListener('change', refreshPreviewIfOpen);
 $('restore').addEventListener('change', () => { refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} });
 // The interp-off output name tags the active pass (_restored/_dlss5/_sharpened/_hdr), so it must
 // re-resolve when any of them toggles (refresh() is a no-op until a video is selected).
-for(const _id of ['sharpen', 'sharpval', 'restore', 'rtxhdr', 'dlssnr'])
+for(const _id of ['sharpen', 'sharpval', 'restore', 'restoreaj', 'rtxhdr', 'dlssnr'])
   $(_id).addEventListener('change', () => refresh());
 
 // RTX HDR colour: TrueHDR's result as NVIDIA gives it (the engine's raw mode; the same colours as
@@ -1566,8 +1741,11 @@ const savedHdrNits = localStorage.getItem('hdrNits');    // the Peak box, empty 
 if(savedHdrNits) $('hdrnits').value = savedHdrNits;
 $('hdrnits').onchange = () => { localStorage.setItem('hdrNits', $('hdrnits').value); refreshPreviewIfOpen(); };
 // the empty box shows what it stands for: the peak of the display the window is on
-function showDisplayPeak(){ ipcRenderer.invoke('peak-nits').then(n => { $('hdrnits').placeholder = 'auto ' + n; }).catch(() => {}); }
+let displayPeak = null;
+function paintDisplayPeak(){ if(displayPeak != null) $('hdrnits').placeholder = tr('hdr.peak.auto', { n: displayPeak }); }
+function showDisplayPeak(){ ipcRenderer.invoke('peak-nits').then(n => { displayPeak = n; paintDisplayPeak(); }).catch(() => {}); }
 showDisplayPeak();
+i18nRelabel.push(paintDisplayPeak);
 $('rtxhdr').addEventListener('change', showDisplayPeak);
 const savedHdrCon = localStorage.getItem('hdrCon'); if(savedHdrCon !== null) $('hdrcon').value = savedHdrCon;
 const savedHdrSB = localStorage.getItem('hdrSB'); if(savedHdrSB !== null) $('hdrsb').value = savedHdrSB;
@@ -1651,7 +1829,6 @@ $('prevproc').onclick = togglePrevZoom;
 // video never runs two models.
 const CMP_NAMES = { gmfss: 'GMFSS', nvof: 'NVIDIA Optical Flow', rife: 'RIFE', rifedrba: 'RIFE', dlssg: 'NVIDIA DLSS 4.5',
                     fsrfg: 'AMD FSR 4', fruc: 'NVIDIA Smooth Motion' };
-const CMP_TIP = $('cmpwrap').title;
 const CMP_ZOOMS = [0, 1, 2, 4];   // 0 = fit, else pixels per image pixel
 let cmpRes = null, cmpJ = 1, cmpWantJ = 0, cmpSwap = false, cmpZoom = 0, cmpSyncing = false;
 let cmpKey = '', cmpInflight = '', cmpTimer = null, cmpShown = false;
@@ -1667,7 +1844,7 @@ function syncCompareUi(){
   if(!a) sel.value = '';
   else if(sel.value && sel.selectedOptions[0].disabled) sel.value = fam(a) === 'gmfss' ? 'rife' : 'gmfss';
   sel.disabled = !a || goMode !== 'idle';
-  $('cmpwrap').title = a ? CMP_TIP : 'Tick a model under Interpolate first: Compare shows it next to another model';
+  $('cmpwrap').title = a ? tr('cmp.tip') : tr('cmp.needModel');
   const on = cmpOn();
   // back to the pair: it (and its note) re-renders on the next refresh, the next compare starts at its frame
   if(cmpShown && !on){ lastPrevKey = ''; cmpRes = null; }
@@ -1686,7 +1863,8 @@ function cmpSpin(on){
 }
 function cmpOpts(frame, a, b, multi, pairs){   // main's 'compare' request at the preview's settings
   return Object.assign(
-    { input, frame, modelA: a, modelB: b, multi, pairs, sharpen: sharpStrength(), restore: restoreOn(), hdr: hdrOn(),
+    { input, frame, modelA: a, modelB: b, multi, pairs, sharpen: sharpStrength(), restore: restoreOn(),
+      restoreModel: restoreModelId(), hdr: hdrOn(),
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(), upscale: upFactor() || 0,
       rtxvsr: !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1), vsrquality: vsrQuality(), fsrup: fsrUpOn() && upFactor() > 1,
       dlssnr: nrOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
@@ -1700,7 +1878,7 @@ async function loadCompare(frame){
   const wantLast = cmpWantJ < 0; cmpWantJ = 0;   // this run's own step-back request (a queued one keeps its own)
   cmpInflight = key;
   cmpSpin(true);
-  $('prevnote').textContent = 'running both models on this moment… the first run at a new video size takes up to a minute';
+  txt('prevnote', () => tr('cmp.running'));
   let r; try { r = await ipcRenderer.invoke('compare', cmpOpts(frame, a, b, multi, 1)); }
   catch(e){ r = { error: String(e) }; }
   cmpSpin(false);
@@ -1708,7 +1886,7 @@ async function loadCompare(frame){
   if(prevPending != null){ const f = prevPending; prevPending = null; loadPreview(f); }
   if(input !== video || !cmpOn()) return;   // another video or Compare off meanwhile: this result is no longer asked for
   if(!r || r.error){ cmpKey = '';   // never dedupe-skip a retry after a failure
-    $('prevnote').textContent = 'compare unavailable: ' + ((r && r.error) || 'no result'); return; }
+    const err = r && r.error; txt('prevnote', () => tr('cmp.unavail', { err: err || tr('prev.noResult') })); return; }
   cmpRes = Object.assign(r, { modelA: a, modelB: b, shown: false });
   cmpKey = key;
   if(r.total) prevTotal = r.total;
@@ -1723,18 +1901,20 @@ function showCompare(){
   const [x, y, mx, my] = cmpSwap ? [r.b, r.a, r.modelB, r.modelA] : [r.a, r.b, r.modelA, r.modelB];
   setPrevImg($('cmpimg1'), x[cmpJ - 1]);
   setPrevImg($('cmpimg3'), y[cmpJ - 1]);
-  const label = m => CMP_NAMES[m] + (m === 'rifedrba' ? ' (without DRBA timing)' : '') + ' · new frame ' + cmpJ + ' of ' + n;
-  $('cmplab0').textContent = 'Real frame ' + r.frame;
+  const label = m => CMP_NAMES[m] + (m === 'rifedrba' ? ' ' + tr('cmp.noDrba') : '') + ' · ' + tr('cmp.newFrame', { j: cmpJ, n });
+  $('cmplab0').textContent = tr('cmp.realN', { n: r.frame });
   $('cmplab1').textContent = label(mx);
-  $('cmplab2').textContent = 'Real frame ' + (r.frame + 1);
+  $('cmplab2').textContent = tr('cmp.realN', { n: r.frame + 1 });
   $('cmplab3').textContent = label(my);
-  $('cmplabel').textContent = 'frames ' + r.frame + ' → ' + (r.frame + 1) + (prevTotal ? ' of ' + prevTotal : '');
+  $('cmplabel').textContent = tr('cmp.frames', { a: r.frame, b: r.frame + 1 }) + (prevTotal ? ' ' + tr('cmp.of', { total: prevTotal }) : '');
   $('cmpback').disabled = r.frame <= 0 && cmpJ <= 1;
   $('cmpfwd').disabled = prevTotal > 0 && r.frame >= prevTotal - 2 && cmpJ >= n;
-  $('prevnote').textContent = (gridMulti() ? '' : 'shown at ' + r.multi + '×, your target resamples between these · ')
-    + (hdrOn() || (info && info.srcHdr) ? 'HDR is tonemapped to show on this SDR screen · ' : '')
-    + 'click to zoom (1:1, 2×, 4×) · hold Space to swap the two models';
+  const resampled = !gridMulti(), hdrNote = hdrOn() || (info && info.srcHdr), m = r.multi;
+  txt('prevnote', () => (resampled ? tr('cmp.note.resample', { m }) + ' · ' : '')
+    + (hdrNote ? tr('prev.note.hdr') + ' · ' : '')
+    + tr('cmp.note.zoom'));
 }
+i18nRelabel.push(() => { syncCompareUi(); if(cmpOn()) showCompare(); });
 function refreshCompare(){          // settings changed: re-run the shown pair once they settle
   clearTimeout(cmpTimer);
   cmpTimer = setTimeout(() => {
@@ -1824,7 +2004,7 @@ $('cmpsave').onclick = async () => {
   if(!file) return;
   const blob: any = await new Promise(res => cv.toBlob(res, 'image/png'));
   _fs.writeFileSync(file, new Uint8Array(await blob.arrayBuffer()));
-  $('prevnote').textContent = 'saved ' + file;
+  txt('prevnote', () => tr('cmp.saved', { file }));
 };
 // Save clip: one second from the shown pair as a lossless video of the 2x2 (main's clip-begin / clip-frame /
 // clip-end, FFV1), every output frame at the render's output rate; at a real frame's slot both model panes show that
@@ -1842,27 +2022,27 @@ $('cmpclip').onclick = async () => {
   if(!file || prevBusy || cmpRes !== r) return;
   prevBusy = true;
   cmpSpin(true);
-  $('prevnote').textContent = 'saving the clip: running both models on ' + pairs + ' pairs…';
+  txt('prevnote', () => tr('clip.running', { pairs }));
   let err = '', began = false, reals = [];
   try {
     const c = await ipcRenderer.invoke('compare', cmpOpts(r.frame, r.modelA, r.modelB, n, pairs));
     cmpSpin(false);
-    if(!c || c.error) throw new Error((c && c.error) || 'no result');
+    if(!c || c.error) throw new Error((c && c.error) || tr('prev.noResult'));
     const W = c.w, H = c.h, lab = 34, gap = 8, cw = 2 * W + gap, ch = 2 * (H + lab) + gap;
     const [num, den] = String((info && info.fps) || '24/1').split('/').map(Number);
     began = await ipcRenderer.invoke('clip-begin', { out: file, w: cw, h: ch, fps: (num * n) + '/' + (den || 1) });
     const cv = document.createElement('canvas'); cv.width = cw; cv.height = ch;
     const g = cv.getContext('2d', { willReadFrequently: true });
-    const names = [CMP_NAMES[r.modelA] + (r.modelA === 'rifedrba' ? ' (without DRBA timing)' : ''), CMP_NAMES[r.modelB]];
+    const names = [CMP_NAMES[r.modelA] + (r.modelA === 'rifedrba' ? ' ' + tr('cmp.noDrba') : ''), CMP_NAMES[r.modelB]];
     let realsP = -1;
     for(let o = 0; o <= c.pairs * n; o++){
       const p = Math.min(Math.floor(o / n), c.pairs - 1), j = o - p * n, real = j === 0 || j === n;
       if(p !== realsP){ reals.forEach(i => URL.revokeObjectURL(i.src)); reals = [await cmpImg(c.reals[p]), await cmpImg(c.reals[p + 1])]; realsP = p; }
       const at = p * (n - 1) + j - 1;   // the new frame's place in c.a / c.b (outputs o not a multiple of n)
       const right = real ? [reals[j ? 1 : 0], reals[j ? 1 : 0]] : [await cmpImg(c.a[at]), await cmpImg(c.b[at])];
-      const what = real ? ' · real frame ' + (c.frame + p + (j ? 1 : 0)) : ' · new frame ' + j + ' of ' + (n - 1);
-      const panes = [[reals[0], 'Real frame ' + (c.frame + p)], [right[0], names[0] + what],
-                     [reals[1], 'Real frame ' + (c.frame + p + 1)], [right[1], names[1] + what]];
+      const what = ' · ' + (real ? tr('clip.real', { n: c.frame + p + (j ? 1 : 0) }) : tr('cmp.newFrame', { j, n: n - 1 }));
+      const panes = [[reals[0], tr('cmp.realN', { n: c.frame + p })], [right[0], names[0] + what],
+                     [reals[1], tr('cmp.realN', { n: c.frame + p + 1 })], [right[1], names[1] + what]];
       g.fillStyle = '#111'; g.fillRect(0, 0, cw, ch);
       g.font = '600 20px "Segoe UI", sans-serif'; g.fillStyle = '#ddd'; g.textBaseline = 'middle';
       panes.forEach(([img, text]: any, i) => {
@@ -1871,17 +2051,17 @@ $('cmpclip').onclick = async () => {
         g.drawImage(img, x, y + lab, W, H);
       });
       if(!real) right.forEach(i => URL.revokeObjectURL(i.src));
-      $('prevnote').textContent = 'saving the clip: frame ' + (o + 1) + ' of ' + (c.pairs * n + 1) + '…';
+      const at1 = o + 1, all = c.pairs * n + 1; txt('prevnote', () => tr('clip.frame', { o: at1, total: all }));
       if(!await ipcRenderer.invoke('clip-frame', new Uint8Array(g.getImageData(0, 0, cw, ch).data.buffer)))
-        throw new Error('the encoder stopped');
+        throw new Error(tr('clip.encStopped'));
     }
   } catch(e){ err = (e && e.message) || String(e); }
   reals.forEach(i => URL.revokeObjectURL(i.src));
   cmpSpin(false);
-  if(began){ const e = await ipcRenderer.invoke('clip-end'); if(!err && e.rc !== 0) err = 'the encoder failed (exit ' + e.rc + '): ' + e.error; }
+  if(began){ const e = await ipcRenderer.invoke('clip-end'); if(!err && e.rc !== 0) err = tr('clip.encFailed', { rc: e.rc, err: e.error }); }
   prevBusy = false;
   if(prevPending != null){ const f = prevPending; prevPending = null; loadPreview(f); }
-  $('prevnote').textContent = err ? 'clip not saved: ' + err : 'saved ' + file;
+  txt('prevnote', () => err ? tr('clip.notSaved', { err }) : tr('cmp.saved', { file }));
 };
 
 // Interpolation on/off is expressed by the MODEL GROUP itself: any model ticked = on, none ticked
@@ -1958,12 +2138,11 @@ try {
 function startRun(){
   if(!input) return;
   const t = targetFps();
-  if(!fpsValid(t)){ alert('Enter a target fps between ' + sliderMin() + ' and ' + sliderMax() + '.'); return; }
+  if(!fpsValid(t)){ alert(tr('err.fpsRange', { min: sliderMin(), max: sliderMax() })); return; }
   // 1x (target fps == source fps) adds no frames - it just re-generates every frame as a midpoint tween
   // (softer, half-frame shift), a strictly worse video. Block it with guidance instead of running it.
   if(interpOn() && Math.round(t) <= Math.round(srcFps())){
-    alert('A 1× target adds no frames (output fps = source fps). Raise the target above ' + Math.round(srcFps())
-        + ' fps to smooth, or turn off Interpolate to just sharpen / re-encode.'); return; }
+    alert(tr('err.oneX', { fps: Math.round(srcFps()) })); return; }
   // DLSS 4.5 makes only whole multiples; a target between them goes to the render as --fps, which runs the smallest
   // multiple whose every k-th frame lands on it (24 -> 60 = 5x, every 2nd) and says so in the log
   const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
@@ -1975,7 +2154,7 @@ function startRun(){
   // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
   // HDR is on. Bail only when nothing at all is enabled.
   if(!interpOn() && sharpenStrength <= 0 && factor <= 0 && !rtxhdr && !restoreOn() && !nrOn()){
-    alert('Nothing to do: turn on Interpolate, pick an Upscale resolution, enable Sharpen, Restore or DLSS 5, or turn on RTX HDR (and install its runtime).');
+    alert(tr('err.nothing'));
     return;
   }
   procStart = 0; baseK = 0; etaAnchor = 0; etaAnchorTime = 0; lastFps = 0; curDone = 0; curPct = 0; projBytes = 0;
@@ -1994,8 +2173,8 @@ function startRun(){
   totalGen = Math.max(1, Math.round(srcFrames*fpp));   // total frames the conversion will output
   cancelled = false;
   // #go stays enabled and becomes the Pause toggle for the duration of the run (see goMode).
-  goMode = 'running'; $('go').textContent = 'Pause';
-  $('go').title = 'Pauses the render. You can also just close the app - the render resumes where it left off next time.';
+  goMode = 'running'; $('go').textContent = tr('run.pause');
+  $('go').title = tr('run.pause.tip');
   if(!resumeTipShown){
     resumeTipShown = true;   // once per session; batch auto-advance re-enters startRun per file
     log('>> Tip: you can Pause, or even close the app mid-render: the render resumes where it left off\n');
@@ -2004,11 +2183,13 @@ function startRun(){
   $('cmpto').disabled = true;   // Compare waits for the render (syncCompareUi at engine-done)
   $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlssrange').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('vsrq').disabled = true; $('fsrup').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
-  const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push(factor < 1 ? 'downscaling' : 'upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
-  const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
-  $('status').textContent = fileTag() + (interpOn() ? 'Warming up the model...' : offLabel);
+  // the pass names ('=name' stays as is, else a language key), read in the language of each repaint
+  const passes = []; if(restoreOn()) passes.push('run.pass.restore'); if(factor > 0) passes.push(factor < 1 ? 'run.pass.down' : 'run.pass.up'); if(rtxhdr) passes.push('=HDR'); if(sharpenStrength > 0) passes.push('run.pass.sharpen');
+  const offLabel = () => (passes.map(p => p[0] === '=' ? p.slice(1) : tr(p)).join(' + ') || tr('run.pass.processing')).replace(/^./, c => c.toUpperCase()) + '...';
+  const warm = interpOn(), tag = fileTag();
+  txt('status', () => tag() + (warm ? tr('run.warming') : offLabel()));
   $('fill').style.width = '0%'; $('pct').textContent = '0%';
-  $('frames').textContent = interpOn() ? 'Warming up (loading model, first frames)...' : offLabel;
+  txt('frames', () => warm ? tr('run.warmingFrames') : offLabel());
   const gm = gridMulti();
   const rr = t/srcFps();
   const ratioTxt = gm ? gm+'×, on-grid' : (rr < 9.95 ? rr.toFixed(1)+'×, resampled' : '≈'+Math.round(rr)+'×, resampled');
@@ -2025,7 +2206,7 @@ function startRun(){
   // frame generation (engine --fsrfg); none = GMFSS
   const model = renderModel(); if(model) payload.model = model;
   payload.sharpen = sharpenStrength;   // 0 = engine leaves frames untouched
-  if(restoreOn()) payload.restore = true;   // AI detail restoration (Real-ESRGAN animevideov3)
+  if(restoreOn()){ payload.restore = true; payload.restoreModel = restoreModelId(); }   // Real-ESRGAN or AnimeJaNai
   if(nrOn()){ payload.dlssnr = true; payload.nrstructure = nrStructure(); payload.nrtone = nrTone(); payload.nrstyle = nrStyle(); payload.nrpasses = nrPasses(); }   // DLSS 5 (runtime installed)
   payload.codec = $('outcodec').value; // output codec family (hevc default / av1 / vvc)
   if(factor > 0){
@@ -2055,25 +2236,30 @@ $('go').onclick = () => {
   if(goMode === 'running'){
     // Pause: the engine finishes the frames already queued to the encoder, then holds before the
     // next source pair. Stop the ETA countdown (it would keep ticking down through the idle time).
-    goMode = 'paused'; $('go').textContent = 'Resume';
-    $('go').title = 'Continues rendering now. Closing the app instead is also fine - the render resumes where it left off next time.';
-    $('status').textContent = fileTag() + 'Paused; click Resume to continue (or close the app and resume another time).';
+    goMode = 'paused'; $('go').textContent = tr('run.resume');
+    $('go').title = tr('run.resumeNow.tip');
+    setStatus('run.status.paused', undefined, true);
     clearInterval(etaTimer); etaTimer = null;
     ipcRenderer.send('pause');
   } else { // paused -> resume
-    goMode = 'running'; $('go').textContent = 'Pause';
+    goMode = 'running'; $('go').textContent = tr('run.pause');
     // The pause preview describes the paused-at point; once we resume it is stale, so hide it (the
     // engine overwrites it on the next Pause and deletes it at finalize).
     $('playprev').style.display = 'none'; $('playprev').disabled = true; lastPreview = null;
-    $('go').title = 'Pauses the render. You can also just close the app - the render resumes where it left off next time.';
+    $('go').title = tr('run.pause.tip');
     // Re-anchor the pace clock so the paused span doesn't drag the mean fps (and ETA) down; skip
     // if warmup never finished (procStart still 0; the first-frame handler will anchor instead).
     if(procStart){ procStart = Date.now(); baseK = curDone; }
     etaTimer = setInterval(paint, 500);
-    $('status').textContent = fileTag() + 'Smoothing on the GPU...';
+    setStatus('run.status.smoothing', undefined, true);
     ipcRenderer.send('resume');
   }
 };
+// a switch mid-run relabels the Pause / Resume toggle (the status line follows the run's next event)
+i18nRelabel.push(() => {
+  if(goMode === 'running'){ $('go').textContent = tr('run.pause'); $('go').title = tr('run.pause.tip'); }
+  else if(goMode === 'paused'){ $('go').textContent = tr('run.resume'); $('go').title = tr('run.resumeNow.tip'); }
+});
 $('open').onclick = () => { if(lastOut) shell.showItemInFolder(lastOut); };
 $('play').onclick = () => { if(lastOut) shell.openPath(lastOut); };   // system default player
 $('playprev').onclick = () => { if(lastPreview) shell.openPath(lastPreview); };  // partial preview, sys player
@@ -2082,12 +2268,12 @@ $('changeout').onclick = async () => {
   if(chosen){ customOut = chosen; refresh(); }
 };
 $('cancel').onclick = async () => {
-  cancelled = true; $('cancel').disabled = true; $('status').textContent = 'Cancelling...';
+  cancelled = true; $('cancel').disabled = true; setStatus('run.status.cancelling');
   // The bar and live thumbnail describe progress that is being deleted: reset them right away
   // (engine-out drops any PROGRESS still flushing from the dying engine while cancelled, so
   // nothing can repaint the bar between this reset and engine-done).
   clearInterval(etaTimer); etaTimer = null;
-  $('fill').style.width = '0%'; $('pct').textContent = '0%'; $('frames').textContent = '';
+  $('fill').style.width = '0%'; $('pct').textContent = '0%'; raw('frames', '');
   $('livewrap').style.display = 'none'; $('live').style.display = 'none';
   // invoke resolves only after main killed the engine AND deleted the .part/resume artifacts,
   // so the probe below sees the truth (engine-done skips its own probe on a cancelled run).
@@ -2104,9 +2290,9 @@ ipcRenderer.on('engine-out', (_e, t) => {
   if(pr){
     lastPreview = pr[1].trim();
     $('playprev').disabled = false; $('playprev').style.display = '';
-    $('status').textContent = fileTag() + 'Paused. A preview of the part rendered so far (with sound & subtitles) is ready - click "Play preview".';
+    setStatus('run.status.prevReady', undefined, true);
   } else if(/PREVIEW_PENDING/.test(t)){
-    $('status').textContent = fileTag() + 'Paused; preview not ready yet (too few frames rendered) - Resume, then Pause again a bit later.';
+    setStatus('run.status.prevPending', undefined, true);
   }
   // DLSS-FG was preempted (RTX Video enhancement) and stopped after its restarts, but banked a clean
   // resumable checkpoint. Remember the % so engine-done presents it as a resumable stop, not a crash.
@@ -2138,7 +2324,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
       // First generated frame is in, so warmup (model load + first inference) is over. Anchor the
       // clock here so the average pace excludes that one-time startup cost and this first frame.
       procStart = now; baseK = done;
-      $('status').textContent = fileTag() + 'Smoothing on the GPU...';
+      setStatus('run.status.smoothing', undefined, true);
       paint();
       return;
     }
@@ -2153,7 +2339,7 @@ ipcRenderer.on('engine-out', (_e, t) => {
     }
     paint();
   } else if(!m) {   // PROGRESS chunks are never logged; while cancelled they are dropped entirely
-    if(/\[trt\] building/.test(t)) $('status').textContent = 'Building TensorRT engines (one time for this resolution)...';
+    if(/\[trt\] building/.test(t)) setStatus('run.status.building');
     // OUTFRAMES is machine-only, and the engine's "done ..." line duplicates the ">> Saved: <path>"
     // the GUI prints on engine-done - strip both from the GUI log (they still show in CLI output).
     const shown = t.replace(/OUTFRAMES\s+\d+\n?/g, '').replace(/SIZE\s+\d+\s+\d+\n?/g, '')
@@ -2173,7 +2359,7 @@ ipcRenderer.on('update-available', (_e, u) => {
 ipcRenderer.on('engine-done', (_e, code) => {
   // Reset the Pause/Resume toggle back to a fresh "Smooth It!" first, so every exit path
   // (done / cancelled / failed) restores it and the batch auto-advance below re-enters startRun.
-  goMode = 'idle'; $('go').textContent = 'Smooth It!'; $('go').title = '';   // checkResume below re-fills the tooltip
+  goMode = 'idle'; $('go').textContent = tr('run.go'); $('go').title = '';   // checkResume below re-fills the tooltip
   // The run ended (done/cancelled/failed): the engine deletes the partial preview at finalize, so hide
   // the "Play preview" button - the finished "Play video" takes over on success.
   $('playprev').style.display = 'none'; $('playprev').disabled = true; lastPreview = null;
@@ -2184,22 +2370,22 @@ ipcRenderer.on('engine-done', (_e, code) => {
   $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlssrange').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('vsrq').disabled=false; $('fsrup').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   syncCompareUi();
-  if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');
+  if(cancelled){ setStatus('run.status.cancelled'); log('>> Cancelled\n');
     if(batch.length) log('>> Batch cleared ('+batch.length+' queued files not processed)\n');
     batch = []; batchTotal = 1; batchFailed = []; saveBatch(null); }
-  else if(code===0){ $('fill').style.width='100%'; $('pct').textContent='100%'; $('frames').textContent='Frames: '+totalGen+' / '+totalGen;
-    $('status').textContent='Done!'; $('open').disabled=false; $('play').disabled=false; log('>> Saved: '+lastOut+'\n');
+  else if(code===0){ $('fill').style.width='100%'; $('pct').textContent='100%'; const all = totalGen; txt('frames', () => tr('run.frames', { done: all, total: all }));
+    setStatus('run.status.done'); $('open').disabled=false; $('play').disabled=false; log('>> Saved: '+lastOut+'\n');
     if(batch.length) advanceBatch(); else finishBatch(); }
   else if(dlssPreempt !== null){
     // Not a failure: DLSS-FG was preempted by RTX Video enhancement and stopped after its restarts,
     // but the render banked a clean, fully-resumable checkpoint. Present it as a resumable stop; the
     // checkResume below turns #go into "Resume" so the user closes the video and continues.
-    $('status').textContent = 'Stopped: DLSS was preempted (RTX Video). ~'+dlssPreempt+'% saved - close the video and click Resume.';
+    setStatus('run.status.preempted', { pct: dlssPreempt });
     log('>> DLSS Frame Generation was preempted (RTX Video enhancement); ~'+dlssPreempt+'% saved and resumable. Close the interfering video, then Resume (or use GMFSS).\n');
     if(batch.length){ log('>> Continuing with the next queued file\n'); advanceBatch(); }
     else if(batchTotal > 1) finishBatch();
     else saveBatch(null); }
-  else { $('status').textContent='Failed (exit '+code+'). See log.'; log('>> Failed (exit '+code+')\n');
+  else { setStatus('run.status.failed', { code }); log('>> Failed (exit '+code+')\n');
     // A failed file no longer kills the rest of an unattended batch: note it and keep going.
     if(batchTotal > 1) batchFailed.push(input);
     if(batch.length){ log('>> Continuing with the next queued file\n'); advanceBatch(); }
@@ -2226,12 +2412,11 @@ function advanceBatch(){
 function finishBatch(){
   const fails = batchFailed.length;
   if(batchTotal > 1){
-    $('status').textContent = 'Done! ' + (batchTotal - fails) + '/' + batchTotal + ' files processed'
-      + (fails ? ', ' + fails + ' failed (see log)' : '.');
+    setStatus(fails ? 'run.batch.doneFails' : 'run.batch.done', { ok: batchTotal - fails, total: batchTotal, fails });
     if(fails) log('>> Failed files:\n' + batchFailed.map(f => '>>   ' + f).join('\n') + '\n');
   }
   ipcRenderer.send('render-complete', batchTotal > 1
-    ? ((batchTotal - fails) + '/' + batchTotal + ' files done' + (fails ? ', ' + fails + ' failed' : ''))
-    : 'Render complete');
+    ? tr(fails ? 'notify.batchFails' : 'notify.batch', { ok: batchTotal - fails, total: batchTotal, fails })
+    : tr('notify.done'));
   batchTotal = 1; batchFailed = []; saveBatch(null);
 }

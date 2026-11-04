@@ -13,6 +13,7 @@
   button { font:inherit; padding:7px 12px; border:0; border-radius:6px; cursor:pointer; }
   .panel { background:var(--panel); border-radius:8px; padding:12px 14px; margin:10px 0; }
   .row { display:flex; align-items:center; gap:10px; margin:6px 0; }
+  .row > button { white-space:nowrap; flex-shrink:0; }
   .k { color:var(--sub); width:140px; flex-shrink:0; } .v { font-family:Consolas,monospace; }
   /* Pipeline order: numbered panels count only when rendered, so Live mode (which hides
      the .vonly panels) renumbers itself with no gaps. */
@@ -36,13 +37,13 @@
              border-radius:5px; overflow:hidden; vertical-align:middle; }
   .stepper button, .stepper input, .stepper .mx { box-sizing:border-box; }
   .stepper button { width:26px; background:#1d1d1c; color:var(--text); border:0; border-radius:0;
-                    border-right:1px solid #353534; cursor:pointer; font-size:17px; line-height:1; padding:0; }
-  .stepper button:last-child { border-right:0; border-left:1px solid #353534; }
+                    border-inline-end:1px solid #353534; cursor:pointer; font-size:17px; line-height:1; padding:0; }
+  .stepper button:last-child { border-inline-end:0; border-inline-start:1px solid #353534; }
   .stepper button:hover:not(:disabled) { background:#252524; color:var(--green); }
   .stepper button:disabled { opacity:.4; cursor:default; }
   .stepper input { border:0; background:#151515; color:var(--text); text-align:center; padding:0 2px; font-size:14px; }
   .stepper input:disabled { opacity:.5; }
-  .stepper .mx { display:flex; align-items:center; padding:0 7px 0 3px; background:#151515; color:#898781; font-size:13px; }
+  .stepper .mx { display:flex; align-items:center; padding-block:0; padding-inline:3px 7px; background:#151515; color:#898781; font-size:13px; }
   .stepper input::-webkit-inner-spin-button, .stepper input::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
   .roundbtn { width:26px; height:26px; padding:0; border:1px solid #353534; border-radius:50%; background:#1d1d1c;
     color:var(--text); font-size:15px; line-height:1; cursor:pointer; flex:0 0 auto; }
@@ -53,9 +54,9 @@
   /* Speed mode selector: one control, three mutually exclusive answers to "what output rate?" */
   .seg { display:inline-flex; align-items:stretch; height:30px; border:1px solid #353534;
          border-radius:6px; overflow:hidden; }
-  .seg button { background:#1d1d1c; color:var(--text); border:0; border-right:1px solid #353534;
+  .seg button { background:#1d1d1c; color:var(--text); border:0; border-inline-end:1px solid #353534;
                 padding:0 12px; font-size:16px; line-height:1; cursor:pointer; }
-  .seg button:last-child { border-right:0; }
+  .seg button:last-child { border-inline-end:0; }
   .seg button:hover:not(:disabled):not(.on) { background:#252524; color:var(--green); }
   .seg button.on { background:var(--green); color:#0d0d0d; font-weight:600; }
   .seg button:disabled { opacity:.4; cursor:default; }
@@ -93,11 +94,18 @@
      current defaults sit mid-scale; a slider with an off-centre default would override the left
      offset inline. Fades with the control when disabled. */
   .defmark { position:relative; display:inline-flex; align-items:center; isolation:isolate; }
-  .defmark::before { content:''; position:absolute; left:calc(var(--def, 50%) - 1px); top:-2px; bottom:-2px;
+  .defmark::before { content:''; position:absolute; inset-inline-start:calc(var(--def, 50%) - 1px); top:-2px; bottom:-2px;
                      width:2px; background:#e85c5c; z-index:-1; }
   /* --def on the wrapper moves the tick for an off-centre default (the DLSS mode slider's DLAA
      sits at the right end, inset by the half thumb) */
   .defmark:has(input:disabled)::before { opacity:.45; }
+  /* Right to left (Arabic, app.ts applyI18n sets <html dir>): the layout mirrors, the sliders and their default tick
+     with it; the before / after pair and the Compare grid stay left to right (their zoom scrolls by scrollLeft, Save
+     image draws the grid left to right), so do the log and the output path; the file line reads in its own direction */
+  html[dir=rtl] #prevpair, html[dir=rtl] #cmpgrid, html[dir=rtl] #log, html[dir=rtl] #out { direction:ltr; }
+  html[dir=rtl] #prevpair .hint, html[dir=rtl] #cmpgrid .hint, html[dir=rtl] #path { unicode-bidi:plaintext; }
+  /* the video's own values (1920 x 1080, 0:00:01) read left to right inside the mirrored rows */
+  html[dir=rtl] #res, html[dir=rtl] #fps, html[dir=rtl] #dur, html[dir=rtl] #codec { direction:ltr; unicode-bidi:isolate; }
   @keyframes spin { to { transform:rotate(360deg); } }
 </style>
 <script>
@@ -110,11 +118,17 @@
 </script>
 </head>
 <body>
-  <h1>Smooth My Video</h1>
-  <div class="sub">Make any video buttery-smooth. AI adds in-between frames for a higher frame rate, right on your NVIDIA GPU. Offline · No quality loss · No account needed.</div>
+  <!-- Every visible text lives in i18n\<lang>.json: data-i18n = the element's content, data-i18n-title / -ph / -aria /
+       -alt = that attribute (app.ts applyI18n). Elements the code relabels at run time (status lines, the setup
+       states, the Go buttons, the preview labels) carry no key: app.ts sets them through t(). -->
+  <div class="row" style="justify-content:space-between;margin:0">
+    <h1>Smooth My Video</h1>
+    <select id="langsel" data-i18n-title="lang.tip" data-i18n-aria="lang.tip"></select>
+  </div>
+  <div class="sub" data-i18n="app.tagline"></div>
   <!-- One-line update notice; hidden unless main's launch-time release check finds a newer build. -->
   <div id="update" class="hint" style="display:none;margin:2px 0 6px">
-    ⬆️ Version <span id="updatever"></span> is out: <a id="updatelink" href="#" style="color:var(--green)">get the new build</a>
+    <span data-i18n="update.pre"></span><span id="updatever"></span><span data-i18n="update.mid"></span><a id="updatelink" href="#" style="color:var(--green)" data-i18n="update.link"></a>
   </div>
 
   <!-- MODE SWITCH. The app does two unrelated things (render a video file, and smooth a live
@@ -124,21 +138,20 @@
        The choice persists in localStorage.uiMode and is painted by the head script. -->
   <div class="row">
     <span class="seg modeseg" id="modeseg">
-      <button type="button" id="modevideo" title="Smooth a video file and save the result">Video</button>
-      <button type="button" id="modelive" title="Smooth any window on screen in real time">Live</button>
+      <button type="button" id="modevideo"></button>
+      <button type="button" id="modelive"></button>
     </span>
   </div>
 
   <div class="row vonly">
-    <button id="pick">Select video...</button>
-    <span id="path" class="hint">No file selected. You can also drag a video onto the window.</span>
+    <button id="pick" data-i18n="pick.btn"></button>
+    <span id="path" class="hint"></span>
   </div>
 
   <!-- Empty state: shown until a video is loaded (or an RTX install begins), then replaced by #workspace. -->
   <div id="welcome" class="panel vonly" style="text-align:center;padding:40px 20px">
-    <div style="font-size:15px;margin-bottom:8px">👋 Welcome to <b>Smooth My Video</b></div>
-    <div class="hint">Drop a video on this window or click <b>Select video…</b> above.<br>
-      You get a smoother, higher-frame-rate copy next to the original.</div>
+    <div style="font-size:15px;margin-bottom:8px" data-i18n="welcome.title"></div>
+    <div class="hint" data-i18n="welcome.body"></div>
   </div>
 
   <!-- Live mode: real-time frame generation over any window on screen (no file involved).
@@ -150,234 +163,248 @@
        the first whole multiple of the captured window's rate that reaches it, derived in the exe). -->
   <div class="panel lonly" id="lvpanel" style="display:none">
     <div class="row" style="margin-bottom:2px">
-      <span class="k">Live mode</span>
-      <span class="hint">Smooth <b>any window</b> live: a video player, a browser, a windowed game, with the model and Speed below. Click <b>Smooth It Live!</b>, then the window during the countdown, or press <b>`</b> in any app. Windowed or borderless only; <b>`</b> or Stop ends it.</span>
+      <span class="k" data-i18n="live.k"></span>
+      <span class="hint" data-i18n="live.intro"></span>
     </div>
     <div class="row">
-      <button id="lvgo">Smooth It Live!</button>
+      <button id="lvgo"></button>
       <span class="hint" id="lvtarget"></span>
       <span class="hint" id="lvstat"></span>
     </div>
     <div class="row">
-      <span class="k">Display</span>
-      <select id="lvfit" title="Whole screen: everything on the monitor, with every model (DLSS 4.5 too). Original size: the window as it is. Fill screen: the window enlarged to its whole monitor, aspect kept.">
-        <option value="monitor">Whole screen</option>
-        <option value="window">Original size</option>
-        <option value="fill">Fill screen</option>
+      <span class="k" data-i18n="live.display"></span>
+      <select id="lvfit" data-i18n-title="live.fit.tip">
+        <option value="monitor" data-i18n="live.fit.monitor"></option>
+        <option value="window" data-i18n="live.fit.window"></option>
+        <option value="fill" data-i18n="live.fit.fill"></option>
       </select>
       <span class="hint" id="lvfithint"></span>
     </div>
     <div class="row">
-      <span class="k">Extras</span>
+      <span class="k" data-i18n="live.extras"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="lvhud" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Show FPS meter
+        <span data-i18n="live.hud"></span>
       </label>
-      <label class="hint" id="lvhudlatlbl" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-left:14px;">
+      <label class="hint" id="lvhudlatlbl" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-inline-start:14px;">
         <input type="checkbox" id="lvhudlat" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Show latency
+        <span data-i18n="live.hudlat"></span>
       </label>
-      <span class="hint" style="margin-left:14px">Hotkey</span>
-      <button id="lvkey" class="mini" title="Toggles Live on the window in front, from any app (reserved while SMV runs). Click, then press a key or combo; Esc cancels.">`</button>
+      <span class="hint" style="margin-inline-start:14px" data-i18n="live.hotkey"></span>
+      <button id="lvkey" class="mini" data-i18n-title="live.key.tip">`</button>
       <span class="hint" id="lvkeyhint"></span>
     </div>
   </div>
 
   <!-- Shown in Live mode only when main answered lv-ready = false (the bundled exe is missing). -->
-  <div class="panel hint lonly" id="lvunavail" style="display:none">
-    Live needs engine/live/smv-live.exe, which this build lacks. Reinstalling the full app restores it.
-  </div>
+  <div class="panel hint lonly" id="lvunavail" style="display:none" data-i18n="live.unavail"></div>
 
   <!-- Everything operational: hidden until there's something to act on (see showWorkspace). -->
   <div id="workspace" style="display:none">
   <div class="panel vonly" id="info" style="display:none">
-    <div class="row"><span class="k">Resolution</span><span class="v" id="res">-</span></div>
-    <div class="row"><span class="k">Source FPS</span><span class="v" id="fps">-</span></div>
-    <div class="row"><span class="k">Duration</span><span class="v" id="dur">-</span></div>
-    <div class="row"><span class="k">Codec</span><span class="v" id="codec">-</span></div>
+    <div class="row"><span class="k" data-i18n="info.res"></span><span class="v" id="res">-</span></div>
+    <div class="row"><span class="k" data-i18n="info.fps"></span><span class="v" id="fps">-</span></div>
+    <div class="row"><span class="k" data-i18n="info.dur"></span><span class="v" id="dur">-</span></div>
+    <div class="row"><span class="k" data-i18n="info.codec"></span><span class="v" id="codec">-</span></div>
   </div>
 
-  <div class="hint" style="margin:10px 0 0 4px">Numbered panels are the processing order: each frame goes through them top to bottom.</div>
+  <div class="hint" style="margin:10px 0 0 4px" data-i18n="order.note"></div>
 
   <div class="panel step" id="nrpanel">
     <div class="row" style="margin-bottom:2px">
-      <span class="k">DLSS 5</span>
-      <span class="hint">Opt-in. NVIDIA's Neural Rendering redraws each frame with more photoreal light and surfaces; the generated frames inherit it<span class="lonly">. On an HDR screen it works on the window's SDR range</span>.</span>
+      <span class="k" data-i18n="nr.k"></span>
+      <span class="hint" data-i18n="nr.intro"></span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS 5 Neural Rendering 310.9.16, NVIDIA's default model. Motion vectors: NVIDIA Optical Flow at Slow, its highest quality level.">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="nr.tip">
         <input type="checkbox" id="dlssnr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        NVIDIA DLSS 5 <span class="hint" id="dlssnrhint">(Neural Rendering at full resolution)</span>
+        <span data-i18n="nr.name"></span> <span class="hint" id="dlssnrhint" data-i18n="nr.hint"></span>
       </label>
       <span id="nrwrap" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
-        <span class="hint">Style</span>
+        <span class="hint" data-i18n="nr.style"></span>
         <span class="seg" id="nrstyleseg" style="height:26px">
-          <button type="button" data-style="0" class="on" title="NVIDIA's Default look: the lightest touch, closest to the source, no frame-to-frame smoothing (the app's default)">Default</button>
-          <button type="button" data-style="1" title="NVIDIA's Natural look: the smoothest, cleanest picture">Natural</button>
-          <button type="button" data-style="2" title="NVIDIA's Cinematic look: keeps the most line and texture detail">Cinematic</button>
+          <button type="button" data-style="0" class="on" data-i18n="nr.style0" data-i18n-title="nr.style0.tip"></button>
+          <button type="button" data-style="1" data-i18n="nr.style1" data-i18n-title="nr.style1.tip"></button>
+          <button type="button" data-style="2" data-i18n="nr.style2" data-i18n-title="nr.style2.tip"></button>
         </span>
-        <span class="hint" style="margin-left:6px">Structure Intensity</span>
+        <span class="hint" style="margin-inline-start:6px" data-i18n="nr.structure"></span>
         <span class="defmark"><input id="nrstructure" type="range" min="0" max="2" step="0.05" value="1"
                style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="nrstructurenum">1.00</span>
-        <span class="hint" style="margin-left:6px">Tone Intensity</span>
+        <span class="hint" style="margin-inline-start:6px" data-i18n="nr.tone"></span>
         <span class="defmark"><input id="nrtone" type="range" min="0" max="2" step="0.05" value="1"
                style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="nrtonenum">1.00</span>
-        <span class="hint" style="margin-left:6px"
-              title="Runs DLSS 5 this many times a frame, each pass on the last one's result: a stronger effect at that many times the time and video memory.">Passes</span>
+        <span class="hint" style="margin-inline-start:6px" data-i18n="nr.passes" data-i18n-title="nr.passes.tip"></span>
         <span class="defmark" style="--def:8px"><input id="nrpasses" type="range" min="1" max="20" step="1" value="1"
-               title="Runs DLSS 5 this many times a frame, each pass on the last one's result: a stronger effect at that many times the time and video memory."
+               data-i18n-title="nr.passes.tip"
                style="width:200px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="nrpassesnum">1</span>
-        <label class="hint vonly" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:6px"
-               title="Preview only: shows where DLSS 5 changed the picture (bright = a big change). The render is unaffected.">
+        <label class="hint vonly" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-inline-start:6px"
+               data-i18n-title="nr.mask.tip">
           <input type="checkbox" id="nrmask" style="width:auto;padding:0;accent-color:var(--green);">
-          Show changed pixels
+          <span data-i18n="nr.mask"></span>
         </label>
       </span>
     </div>
     <div id="dlssnrsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
       <div class="row" style="margin:0 0 6px">
-        <span id="dlssnrstatus" class="v">checking...</span>
+        <span id="dlssnrstatus" class="v"></span>
       </div>
       <div class="hint" id="dlssnrsteps" style="line-height:1.6;margin-bottom:8px"></div>
       <div class="row" id="dlssnrbtns" style="flex-wrap:wrap;gap:6px">
-        <button id="dlssnrdl" class="mini">Download the DLSS 5 runtime</button>
-        <button id="dlssnrbrowse" class="mini">Choose nvngx_dlssnr.dll&hellip;</button>
+        <button id="dlssnrdl" class="mini" data-i18n="nr.dl"></button>
+        <button id="dlssnrbrowse" class="mini" data-i18n="nr.browse"></button>
       </div>
     </div>
   </div>
 
   <div class="panel step" id="interppanel">
     <div class="row">
-      <span class="k">Interpolate</span>
-      <span class="hint">in-between frames from the model below; none ticked = the source frames, the other panels still apply</span>
+      <span class="k" data-i18n="interp.k"></span>
+      <span class="hint" data-i18n="interp.intro"></span>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS frame generation 310.9.16 through Streamline 2.14.16. The model is picked in the NVIDIA App (Graphics, DLSS Override - Model Presets, Frame Generation). Highest quality in SmoothMyVideo: Use 3D app setting, the default; Recommended, Preset A and Preset B give the same frames. Preset C, NVIDIA's lighter and faster model, lowers the quality here and renders files no faster. SmoothMyVideo runs no DLSS Super Resolution.">
+      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="dlssg.tip">
         <input type="checkbox" id="modeldlss"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(AI frame generation from games, the fastest; the default on RTX 40 and 50; multi-pass for high fps targets)</span>
+        <span style="white-space:nowrap;" data-i18n="dlssg.name"></span> <span class="hint" data-i18n="dlssg.hint"></span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: GMFSS_Fortuna, union model (GMFlow with Softmax Splatting)">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="gmfss.tip">
         <input type="checkbox" id="modelgmfss" checked
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        GMFSS <span class="hint">(AI, best quality for anime; heavy on the GPU. Too slow? <span class="lonly">Lower the DLSS mode above, or pick</span><span class="vonly">Pick</span> NVIDIA Optical Flow below)</span>
+        <span data-i18n="gmfss.name"></span> <span class="hint" data-i18n="gmfss.hint"></span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: Practical-RIFE 4.26 heavy">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="rife.tip">
         <input type="checkbox" id="modelrife"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RIFE <span class="hint">(Real-Time Intermediate Flow Estimation: AI, fast, best for live action)</span>
+        <span data-i18n="rife.name"></span> <span class="hint" data-i18n="rife.hint"></span>
       </label>
     </div>
     <div class="row" id="rifedrbarow" style="display:none">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-left:22px;" title="Version: DRBA (routineLife1, 2025) on Practical-RIFE 4.26 heavy">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;margin-inline-start:22px;" data-i18n-title="drba.tip">
         <input type="checkbox" id="rifedrba"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        DRBA <span class="hint">(anime pacing: characters keep their own timing and crisp poses while camera pans smooth fully)</span>
+        <span data-i18n="drba.name"></span> <span class="hint" data-i18n="drba.hint"></span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA Optical Flow API 5.0, run by the driver on the GPU's optical-flow engine. Quality: Slow, the engine's highest quality level.">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="nvof.tip">
         <input type="checkbox" id="modelnvof"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">NVIDIA Optical Flow</span> <span class="hint">(NVIDIA's optical-flow hardware: really high fps, light on the GPU, friendly to slower PCs; very fast motion goes soft)</span>
+        <span style="white-space:nowrap;" data-i18n="nvof.name"></span> <span class="hint" data-i18n="nvof.hint"></span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modelfsrfglabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 4.0.2 frame generation (FidelityFX SDK 2.4.0). Motion vectors: NVIDIA Optical Flow at Slow, its highest quality level.">
+      <label class="hint" id="modelfsrfglabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="fsrfg.tip">
         <input type="checkbox" id="modelfsrfg"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">AMD FSR 4</span> <span class="hint">(AI frame generation from games; multi-pass, each pass doubles the frame rate)</span>
+        <span style="white-space:nowrap;" data-i18n="fsrfg.name"></span> <span class="hint" data-i18n="fsrfg.hint"></span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA NvOFFRUC from the Optical Flow SDK 5.0.7">
+      <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="fruc.tip">
         <input type="checkbox" id="modelfruc"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">NVIDIA Smooth Motion</span> <span class="hint">(NVIDIA's optical-flow hardware; multi-pass, each pass doubles the frame rate; the lowest quality, varies run to run)</span>
+        <span style="white-space:nowrap;" data-i18n="fruc.name"></span> <span class="hint" data-i18n="fruc.hint"></span>
       </label>
     </div>
     <div id="dlsssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
-      <div class="row" style="margin:0 0 6px"><span id="dlssstatus" class="v">&#10007; NOT READY</span></div>
+      <div class="row" style="margin:0 0 6px"><span id="dlssstatus" class="v" data-i18n="dlss.notReady"></span></div>
       <div class="hint" id="dlsssteps" style="line-height:1.6"></div>
     </div>
     <div id="frucsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
-      <div class="row" style="margin:0 0 6px"><span id="frucstatus" class="v">checking...</span></div>
+      <div class="row" style="margin:0 0 6px"><span id="frucstatus" class="v"></span></div>
       <div class="hint" id="frucsteps" style="line-height:1.6;margin-bottom:8px"></div>
       <div class="row" id="frucbtns" style="flex-wrap:wrap;gap:6px">
-        <button id="frucget" class="mini">Get from NVIDIA</button>
-        <button id="frucbrowsezip" class="mini">Choose .zip&hellip;</button>
+        <button id="frucget" class="mini" data-i18n="common.getNvidia"></button>
+        <button id="frucbrowsezip" class="mini" data-i18n="common.chooseZip"></button>
       </div>
     </div>
     <div class="row">
-      <span class="k">Speed</span>
+      <span class="k" data-i18n="speed.k"></span>
       <span class="seg" id="speedseg">
-        <button type="button" id="smfps" title="Output runs at this exact frame rate, whatever the source is (decimals allowed: 47.952 is exactly 2x a 23.976 source)">Target fps</button>
-        <button type="button" id="smscreen" title="Output matches this monitor's refresh rate">Screen refresh rate</button>
+        <button type="button" id="smfps" data-i18n="speed.fps" data-i18n-title="speed.fps.tip"></button>
+        <button type="button" id="smscreen" data-i18n="speed.screen" data-i18n-title="speed.screen.tip"></button>
       </span>
     </div>
     <div class="row">
       <span class="k"></span>
-      <span class="stepper" id="fpswrap" title="Target frames per second (steppers move by 1; type up to 3 decimals for an exact multiple of a fractional source rate)">
+      <span class="stepper" id="fpswrap" data-i18n-title="speed.stepper.tip">
         <button type="button" id="fpsdn" tabindex="-1">−</button>
-        <input id="fpsin" type="number" min="1" max="10000" step="0.001" aria-label="target fps">
-        <span class="mx">fps</span>
+        <input id="fpsin" type="number" min="1" max="10000" step="0.001" data-i18n-aria="speed.fps.aria">
+        <span class="mx" data-i18n="speed.unit"></span>
         <button type="button" id="fpsup" tabindex="-1">+</button>
       </span>
       <button type="button" class="roundbtn" id="fpsround" style="display:none">≈</button>
-      <span class="hint" id="screenwrap">matching <span id="screenhz">?</span> Hz</span>
+      <span class="hint" id="screenwrap"><span data-i18n="speed.matching"></span> <span id="screenhz">?</span> <span data-i18n="speed.hz"></span></span>
       <span class="hint" id="ratehint"></span>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="On (default): targets the highest frame rate your GPU can hold, at the lowest latency. When the GPU or its memory runs short, Live makes fewer in-between frames (down to the source rate) so every frame still shows; file renders keep their exact fps. Off: everything runs as set; Live may skip frames.">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="gpufit.tip">
         <input type="checkbox" id="gpufit" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Fit to the GPU
+        <span data-i18n="gpufit.label"></span>
       </label>
     </div>
   </div>
 
   <div class="panel step" id="restorepanel">
     <div class="row">
-      <span class="k">Restore</span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: Real-ESRGAN realesr-animevideov3">
-        <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> AI detail
+      <span class="k" data-i18n="restore.k"></span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="restore.tip">
+        <input type="checkbox" id="restore" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> <span style="white-space:nowrap" data-i18n="restore.label"></span>
       </label>
-      <span class="hint">cleans noise &amp; redraws linework (Real-ESRGAN, anime); can flatten fine texture<span class="lonly">; heavy: a large window can lower the frame rate</span></span>
+      <span class="hint" data-i18n="restore.hint"></span>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="restoreaj.tip">
+        <input type="checkbox" id="restoreaj" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> <span style="white-space:nowrap" data-i18n="restoreaj.label"></span>
+      </label>
+      <span class="hint" data-i18n="restoreaj.hint"></span>
+    </div>
+    <div id="ajsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px">
+        <span id="ajstatus" class="v"></span>
+      </div>
+      <div class="hint" id="ajsteps" style="line-height:1.6;margin-bottom:8px"></div>
+      <div class="row" id="ajbtns" style="flex-wrap:wrap;gap:6px">
+        <button id="ajdl" class="mini" data-i18n="aj.dl"></button>
+        <button id="ajbrowse" class="mini" data-i18n="aj.browse"></button>
+      </div>
     </div>
   </div>
 
   <div class="panel step" id="uppanel">
     <div class="row" style="margin-bottom:2px">
-      <span class="k">Upscale</span>
-      <span class="hint"><span class="vonly">the output size; DLSS 5 and the interpolation run at it</span><span class="lonly">Live's size is what Display shows; the DLSS mode below is its speed</span></span>
+      <span class="k" data-i18n="up.k"></span>
+      <span class="hint" data-i18n="up.intro"></span>
     </div>
     <div class="row vonly">
-      <span class="k">Size</span>
+      <span class="k" data-i18n="up.size"></span>
       <select id="upres">
-        <option value="0">Off (keep source resolution)</option>
-        <option value="screen">Screen resolution</option>
-        <option value="720">720p &middot; HD</option>
-        <option value="1080">1080p &middot; Full HD</option>
-        <option value="1440">1440p &middot; 2K</option>
-        <option value="2160">2160p &middot; 4K</option>
-        <option value="4320">4320p &middot; 8K</option>
-        <option value="8640">8640p &middot; 16K</option>
-        <option value="custom">Custom height&hellip;</option>
+        <option value="0" data-i18n="up.opt.off"></option>
+        <option value="screen" data-i18n="up.opt.screen"></option>
+        <option value="720" data-i18n="up.opt.720"></option>
+        <option value="1080" data-i18n="up.opt.1080"></option>
+        <option value="1440" data-i18n="up.opt.1440"></option>
+        <option value="2160" data-i18n="up.opt.2160"></option>
+        <option value="4320" data-i18n="up.opt.4320"></option>
+        <option value="8640" data-i18n="up.opt.8640"></option>
+        <option value="custom" data-i18n="up.opt.custom"></option>
       </select>
       <span id="upcustomwrap" style="display:none;align-items:center;gap:8px;">
         <input id="upcustom" type="range" min="240" max="8640" step="2" value="2160"
@@ -387,58 +414,58 @@
       <span class="v hint" id="upinfo"></span>
     </div>
     <div class="row lonly" style="flex-wrap:wrap">
-      <span class="k">DLSS mode</span>
-      <select id="dlssmode" title="Live's speed: every pass runs at this share of the window or screen, then the result is enlarged to fit. DLAA = the full size; lower = faster and softer.">
-        <option value="dlaa" selected>DLAA (100%)</option>
-        <option value="quality">Quality (67%)</option>
-        <option value="balanced">Balanced (58%)</option>
-        <option value="performance">Performance (50%)</option>
-        <option value="ultra">Ultra Performance (33%)</option>
-        <option value="custom" id="dlsscustomopt" hidden>Custom</option>
+      <span class="k" data-i18n="dlssmode.k"></span>
+      <select id="dlssmode" data-i18n-title="dlssmode.tip">
+        <option value="dlaa" selected data-i18n="dlssmode.dlaa"></option>
+        <option value="quality" data-i18n="dlssmode.quality"></option>
+        <option value="balanced" data-i18n="dlssmode.balanced"></option>
+        <option value="performance" data-i18n="dlssmode.performance"></option>
+        <option value="ultra" data-i18n="dlssmode.ultra"></option>
+        <option value="custom" id="dlsscustomopt" hidden></option>
       </select>
       <span id="dlssrangewrap" style="display:inline-flex;align-items:center;gap:8px;">
-        <span class="defmark" style="flex:0 1 214px;--def:calc(100% - 8px)"><input id="dlssrange" type="range" min="1" max="100" step="1" value="100" style="width:214px" aria-label="DLSS mode" title="The working size's share, 1% to 100% (DLAA); the DLSS modes sit at 33, 50, 58 and 67%. A very small size is raised to 64 px on its short side (128 px wide with DLSS 5)."></span>
+        <span class="defmark" style="flex:0 1 214px;--def:calc(100% - 8px)"><input id="dlssrange" type="range" min="1" max="100" step="1" value="100" style="width:214px" data-i18n-aria="dlssrange.aria" data-i18n-title="dlssrange.tip"></span>
         <span class="v" id="dlssrangenum">100%</span>
       </span>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA RTX Video Super Resolution 1.6.0 (RTX Video SDK). Quality: the slider below, 4 = Ultra, the highest of its levels (the default).">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="vsr.tip">
         <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill screen or a DLSS mode below DLAA enlarges</span>)</span>
+        <span data-i18n="vsr.name"></span> <span class="hint" data-i18n="vsr.hint"></span>
       </label>
     </div>
-    <div class="row" id="vsrqwrap" style="display:flex;align-items:center;gap:8px;" title="RTX VSR's quality level. 4 = Ultra, the highest (the default); a lower level costs less GPU time a frame: 3 about 3/4 of level 4's, 2 about 1/3, 1 about 1/4.">
+    <div class="row" id="vsrqwrap" style="display:flex;align-items:center;gap:8px;" data-i18n-title="vsrq.tip">
       <span class="k"></span>
-      <span class="hint" style="padding-left:22px;">Quality</span>
-      <span class="defmark" style="--def:calc(100% - 8px)"><input id="vsrq" type="range" min="1" max="4" step="1" value="4" aria-label="RTX VSR quality"
+      <span class="hint" style="padding-inline-start:22px;" data-i18n="vsrq.label"></span>
+      <span class="defmark" style="--def:calc(100% - 8px)"><input id="vsrq" type="range" min="1" max="4" step="1" value="4" data-i18n-aria="vsrq.aria"
              style="width:120px;padding:0;border:0;background:transparent;accent-color:var(--green);"></span>
       <span class="v" id="vsrqnum">4</span>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="fsruplabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: AMD FSR 4.1.2 upscaling (FidelityFX SDK 2.4.0). Motion vectors: NVIDIA Optical Flow at Slow, its highest quality level.">
+      <label class="hint" id="fsruplabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="fsrup.tip">
         <input type="checkbox" id="fsrup" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">AMD FSR 4.1</span> <span class="hint">(AMD's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill screen or a DLSS mode below DLAA enlarges</span>)</span>
+        <span style="white-space:nowrap;" data-i18n="fsrup.name"></span> <span class="hint" data-i18n="fsrup.hint"></span>
       </label>
     </div>
     <div id="rtxsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
       <div class="row" style="margin:0 0 6px">
-        <span id="rtxstatus" class="v">checking...</span>
+        <span id="rtxstatus" class="v"></span>
       </div>
       <div class="hint" id="rtxsteps" style="line-height:1.6;margin-bottom:8px"></div>
       <div class="row" id="rtxbtns" style="flex-wrap:wrap;gap:6px">
-        <button id="rtxget" class="mini">Get from NVIDIA</button>
-        <button id="rtxbrowsezip" class="mini">Choose .zip&hellip;</button>
+        <button id="rtxget" class="mini" data-i18n="common.getNvidia"></button>
+        <button id="rtxbrowsezip" class="mini" data-i18n="common.chooseZip"></button>
       </div>
     </div>
   </div>
 
   <div class="panel step" id="sharpenpanel">
     <div class="row">
-      <span class="k">Sharpen</span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: Adaptive Sharpen by bacondither, the DX11 two-pass HQ version of 2021-09-10">
-        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> Adaptive (crisper picture)
+      <span class="k" data-i18n="sharpen.k"></span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="sharpen.tip">
+        <input type="checkbox" id="sharpen" checked style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);"> <span data-i18n="sharpen.label"></span>
       </label>
       <span id="sharpwrap" style="display:flex;align-items:center;gap:8px;">
         <span class="defmark"><input id="sharpval" type="range" min="0" max="2" step="0.05" value="1"
@@ -450,51 +477,51 @@
 
   <div class="panel step" id="hdrpanel">
     <div class="row" style="margin-bottom:2px">
-      <span class="k">HDR</span>
-      <span class="hint">Opt-in. NVIDIA RTX HDR turns SDR into HDR, with its colour controls<span class="vonly">; Dolby Vision and HDR10+ below can add metadata to it</span>.</span>
+      <span class="k" data-i18n="hdr.k"></span>
+      <span class="hint" data-i18n="hdr.intro"></span>
     </div>
     <div class="row" style="flex-wrap:wrap">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA RTX HDR (TrueHDR) 1.1.0 (RTX Video SDK)">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="rtxhdr.tip">
         <input type="checkbox" id="rtxhdr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        RTX HDR <span class="hint" id="rtxhdrhint">(convert SDR video to HDR)</span>
+        <span data-i18n="rtxhdr.name"></span> <span class="hint" id="rtxhdrhint"></span>
       </label>
       <span id="hdrtonewrap" style="display:none;align-items:center;gap:8px;">
-        <span class="hint">Contrast</span>
+        <span class="hint" data-i18n="hdr.contrast"></span>
         <span class="defmark"><input id="hdrcon" type="range" min="-100" max="100" step="5" value="0"
                style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="hdrconnum">0</span>
-        <span class="hint" style="margin-left:6px">Saturation</span>
+        <span class="hint" style="margin-inline-start:6px" data-i18n="hdr.saturation"></span>
         <span class="defmark"><input id="hdrsat" type="range" min="-100" max="100" step="5" value="0"
                style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
         <span class="v" id="hdrsatnum">0</span>
-        <span class="vonly" style="display:inline-flex;align-items:center;gap:8px;margin-left:6px"
-              title="The brightest white of the HDR file, in nits (400 to 2000). Empty = the maximum of the HDR display this window is on">
-          <span class="hint">Peak</span>
-          <input id="hdrnits" type="number" min="400" max="2000" step="10" placeholder="auto" aria-label="HDR peak in nits" style="width:120px">
-          <span class="hint">nits</span>
+        <span class="vonly" style="display:inline-flex;align-items:center;gap:8px;margin-inline-start:6px"
+              data-i18n-title="hdr.peak.tip">
+          <span class="hint" data-i18n="hdr.peak"></span>
+          <input id="hdrnits" type="number" min="400" max="2000" step="10" data-i18n-ph="hdr.peak.ph" data-i18n-aria="hdr.peak.aria" style="width:120px">
+          <span class="hint" data-i18n="hdr.nits"></span>
         </span>
       </span>
     </div>
     <div class="row" id="hdrpurewrap" style="display:none">
       <span class="k"></span>
-      <span class="hint" style="line-height:1.5">(NVIDIA's RTX HDR look: Contrast 0, Saturation 0; brightness peaks at your HDR display's maximum)</span>
+      <span class="hint" style="line-height:1.5" data-i18n="hdr.pure"></span>
     </div>
     <div id="hdrcolorwrap" style="display:none">
       <div class="row" style="flex-wrap:wrap">
         <span class="k"></span>
         <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
           <input type="checkbox" id="hdrdynvib" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-          RTX Dynamic Vibrance
+          <span data-i18n="hdr.dynvib"></span>
         </label>
         <span id="hdrsbwrap" style="display:inline-flex;align-items:center;gap:8px;">
-          <span class="hint">Saturation boost</span>
+          <span class="hint" data-i18n="hdr.satboost"></span>
           <span class="defmark"><input id="hdrsb" type="range" min="0" max="100" step="5" value="50"
                  style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
           <span class="v" id="hdrsbnum">50</span>
         </span>
         <span id="hdrvibwrap" style="display:inline-flex;align-items:center;gap:8px;">
-          <span class="hint">Intensity</span>
+          <span class="hint" data-i18n="hdr.intensity"></span>
           <span class="defmark"><input id="hdrvib" type="range" min="0" max="100" step="5" value="50"
                  style="width:100px;padding:0;border:0;accent-color:var(--green);"></span>
           <span class="v" id="hdrvibnum">50</span>
@@ -502,172 +529,170 @@
       </div>
       <div class="row">
         <span class="k"></span>
-        <span class="hint" style="line-height:1.5">(Saturation boost: the whole image evenly; Intensity: muted colours only, vivid colours and skin stay)</span>
+        <span class="hint" style="line-height:1.5" data-i18n="hdr.vibnote"></span>
       </div>
     </div>
   </div>
 
   <div class="panel vonly" id="dvpanel">
     <div class="row" style="margin-bottom:2px">
-      <span class="k">Dolby Vision</span>
-      <span class="hint">Opt-in. Adds Dolby Vision metadata to the HDR render (open-source dovi_tool). For LG, Sony and most streaming boxes; not Samsung TVs. Profile 8.1 keeps the HDR10 video, which other TVs play as HDR10. Profile 8.4 writes the video as HLG, which other HDR TVs play as HDR and SDR TVs show close to right.</span>
+      <span class="k" data-i18n="dv.k"></span>
+      <span class="hint" data-i18n="dv.intro"></span>
     </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="dvexport" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Add Dolby Vision Profile 8.1 (HDR10 video, works with HDR10+) <span class="hint" id="dvhint">(needs RTX HDR on)</span>
+        <span data-i18n="dv.81"></span> <span class="hint" id="dvhint"></span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="dv84export" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Add Dolby Vision Profile 8.4 (HLG video, up to 1000 nits) <span class="hint" id="dv84hint">(needs RTX HDR on)</span>
+        <span data-i18n="dv.84"></span> <span class="hint" id="dv84hint"></span>
       </label>
     </div>
     <div id="dvsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
       <div class="row" style="margin:0 0 6px">
-        <span id="dvstatus" class="v">checking...</span>
+        <span id="dvstatus" class="v"></span>
       </div>
       <div class="hint" id="dvsteps" style="line-height:1.6;margin-bottom:8px"></div>
       <div class="row" id="dvbtns" style="flex-wrap:wrap;gap:6px">
-        <button id="dvget" class="mini">Get dovi_tool</button>
-        <button id="dvbrowsezip" class="mini">Choose .zip&hellip;</button>
+        <button id="dvget" class="mini" data-i18n="dv.get"></button>
+        <button id="dvbrowsezip" class="mini" data-i18n="common.chooseZip"></button>
       </div>
     </div>
-    <div class="hint" style="margin-top:8px;line-height:1.5">Dolby Vision metadata is generated by the third-party open-source dovi_tool. Not affiliated with, endorsed by, or certified by Dolby Laboratories; "Dolby" and "Dolby Vision" are their trademarks.</div>
+    <div class="hint" style="margin-top:8px;line-height:1.5" data-i18n="dv.legal"></div>
   </div>
 
   <div class="panel vonly" id="hppanel">
     <div class="row" style="margin-bottom:2px">
-      <span class="k">HDR10+</span>
-      <span class="hint">Opt-in. Adds HDR10+ metadata (SMPTE ST 2094-40) to the HDR10 render (open-source hdr10plus_tool); still plain HDR10 elsewhere. For Samsung and other HDR10+ TVs; works beside Dolby Vision 8.1 in one file, not with 8.4 (its HLG video).</span>
+      <span class="k" data-i18n="hp.k"></span>
+      <span class="hint" data-i18n="hp.intro"></span>
     </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="hpexport" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Add HDR10+ metadata <span class="hint" id="hphint">(needs RTX HDR on)</span>
+        <span data-i18n="hp.add"></span> <span class="hint" id="hphint"></span>
       </label>
     </div>
     <div id="hpsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
       <div class="row" style="margin:0 0 6px">
-        <span id="hpstatus" class="v">checking...</span>
+        <span id="hpstatus" class="v"></span>
       </div>
       <div class="hint" id="hpsteps" style="line-height:1.6;margin-bottom:8px"></div>
       <div class="row" id="hpbtns" style="flex-wrap:wrap;gap:6px">
-        <button id="hpget" class="mini">Get hdr10plus_tool</button>
-        <button id="hpbrowsezip" class="mini">Choose .zip&hellip;</button>
+        <button id="hpget" class="mini" data-i18n="hp.get"></button>
+        <button id="hpbrowsezip" class="mini" data-i18n="common.chooseZip"></button>
       </div>
     </div>
-    <div class="hint" style="margin-top:8px;line-height:1.5">HDR10+ metadata is injected by the third-party open-source hdr10plus_tool. Not affiliated with, endorsed by, or certified by HDR10+ Technologies, LLC; "HDR10+" is their trademark.</div>
+    <div class="hint" style="margin-top:8px;line-height:1.5" data-i18n="hp.legal"></div>
   </div>
 
   <div class="panel vonly step" id="outpanel">
     <div class="row" style="margin-bottom:2px">
-      <span class="k">Output</span>
-      <span class="hint">the file written from the passes above</span>
+      <span class="k" data-i18n="out.k"></span>
+      <span class="hint" data-i18n="out.intro"></span>
     </div>
     <div class="row vonly">
-      <span class="k">Codec</span>
+      <span class="k" data-i18n="out.codec"></span>
       <select id="outcodec">
-        <option value="hevc">HEVC &middot; H.265 &middot; GPU &middot; plays everywhere (recommended)</option>
-        <option value="av1">AV1 &middot; GPU &middot; royalty-free, best for web playback</option>
-        <option value="vvc">H.266 &middot; VVC &middot; CPU &middot; much smaller file, slow</option>
+        <option value="hevc" data-i18n="out.hevc"></option>
+        <option value="av1" data-i18n="out.av1"></option>
+        <option value="vvc" data-i18n="out.vvc"></option>
       </select>
       <span class="hint" id="codechint"></span>
     </div>
-    <div class="row vonly" id="outrow"><span class="k">Saves to</span>
-      <button id="changeout" class="mini" disabled>Change...</button>
+    <div class="row vonly" id="outrow"><span class="k" data-i18n="out.saves"></span>
+      <button id="changeout" class="mini" disabled data-i18n="out.change"></button>
       <input id="out" class="v" type="text" spellcheck="false" disabled
-             placeholder="output file path" style="flex:1;min-width:0;font-size:16px"></div>
+             data-i18n-ph="out.ph" style="flex:1;min-width:0;font-size:16px"></div>
   </div>
 
   <div class="panel vonly" id="previewpanel" style="display:none">
     <div class="row">
-      <span class="k">Preview</span>
-      <span class="hint" id="hdrpreviewhint">your restore / sharpen / HDR settings on a real frame · updates automatically</span>
+      <span class="k" data-i18n="prev.k"></span>
+      <span class="hint" id="hdrpreviewhint" data-i18n="prev.hint"></span>
     </div>
-    <div class="row" id="cmpwrap"
-         title="Shows the model ticked under Interpolate next to another model on the same moment: the real frames before and after on the left, each model's new frames between them on the right">
-      <span class="k">Compare to</span>
+    <div class="row" id="cmpwrap" data-i18n-title="cmp.tip">
+      <span class="k" data-i18n="cmp.k"></span>
       <select id="cmpto">
-        <option value="">Off</option>
-        <option value="gmfss">GMFSS</option>
-        <option value="nvof">NVIDIA Optical Flow</option>
-        <option value="rife">RIFE</option>
-        <option value="dlssg">NVIDIA DLSS 4.5</option>
-        <option value="fsrfg">AMD FSR 4</option>
-        <option value="fruc">NVIDIA Smooth Motion</option>
+        <option value="" data-i18n="cmp.off"></option>
+        <option value="gmfss" data-i18n="cmp.gmfss"></option>
+        <option value="nvof" data-i18n="cmp.nvof"></option>
+        <option value="rife" data-i18n="cmp.rife"></option>
+        <option value="dlssg" data-i18n="cmp.dlssg"></option>
+        <option value="fsrfg" data-i18n="cmp.fsrfg"></option>
+        <option value="fruc" data-i18n="cmp.fruc"></option>
       </select>
-      <span class="hint">your model next to another one on the same moment</span>
+      <span class="hint" data-i18n="cmp.hint"></span>
     </div>
     <div id="hdrpreview" style="display:none;margin-top:6px">
       <div id="prevpair" style="display:flex;align-items:center;gap:8px">
         <div style="flex:1;text-align:center;min-width:0">
-          <div class="hint" id="prevoriglabel" style="margin-bottom:4px">Original</div>
+          <div class="hint" id="prevoriglabel" style="margin-bottom:4px"></div>
           <div id="prevorigwrap" style="overflow:hidden;border-radius:6px;position:relative">
-            <img id="prevorig" alt="original frame" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
+            <img id="prevorig" data-i18n-alt="prev.orig.alt" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
             <div id="prevorigspin" style="display:none;position:absolute;align-items:center;justify-content:center;pointer-events:none"><div class="spinwheel"></div></div>
           </div>
         </div>
         <div style="flex:0 0 auto;font-size:30px;line-height:1;color:var(--green);font-weight:700">&rarr;</div>
         <div style="flex:1;text-align:center;min-width:0">
-          <div class="hint" id="prevproclabel" style="margin-bottom:4px">Processed</div>
+          <div class="hint" id="prevproclabel" style="margin-bottom:4px"></div>
           <div id="prevprocwrap" style="overflow:hidden;border-radius:6px;position:relative">
-            <img id="prevproc" alt="processed frame" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
+            <img id="prevproc" data-i18n-alt="prev.proc.alt" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
             <div id="prevspin" style="display:none;position:absolute;align-items:center;justify-content:center;pointer-events:none"><div class="spinwheel"></div></div>
           </div>
         </div>
       </div>
       <div class="row" id="prevnav" style="justify-content:center;gap:10px;margin-top:6px">
-        <button id="prevprev" class="mini" style="visibility:hidden">&lsaquo; back</button>
-        <span class="v" id="prevlabel">frame &hellip;</span>
-        <button id="prevnext" class="mini">random frame &rsaquo;</button>
+        <button id="prevprev" class="mini" style="visibility:hidden" data-i18n="prev.back"></button>
+        <span class="v" id="prevlabel"></span>
+        <button id="prevnext" class="mini" data-i18n="prev.random"></button>
       </div>
       <div id="cmpgrid" style="display:none">
-        <div><div class="hint" id="cmplab0" style="margin-bottom:4px">Real frame</div>
-          <div class="cmpwrap" id="cmpw0"><img id="cmpimg0" alt="real frame before" style="visibility:hidden">
+        <div><div class="hint" id="cmplab0" style="margin-bottom:4px"></div>
+          <div class="cmpwrap" id="cmpw0"><img id="cmpimg0" data-i18n-alt="cmp.alt0" style="visibility:hidden">
             <div class="cmpspin" id="cmpspin0"><div class="spinwheel"></div></div></div></div>
-        <div><div class="hint" id="cmplab1" style="margin-bottom:4px">New frame</div>
-          <div class="cmpwrap" id="cmpw1"><img id="cmpimg1" alt="first model's new frame" style="visibility:hidden">
+        <div><div class="hint" id="cmplab1" style="margin-bottom:4px"></div>
+          <div class="cmpwrap" id="cmpw1"><img id="cmpimg1" data-i18n-alt="cmp.alt1" style="visibility:hidden">
             <div class="cmpspin" id="cmpspin1"><div class="spinwheel"></div></div></div></div>
-        <div><div class="hint" id="cmplab2" style="margin-bottom:4px">Real frame</div>
-          <div class="cmpwrap" id="cmpw2"><img id="cmpimg2" alt="real frame after" style="visibility:hidden">
+        <div><div class="hint" id="cmplab2" style="margin-bottom:4px"></div>
+          <div class="cmpwrap" id="cmpw2"><img id="cmpimg2" data-i18n-alt="cmp.alt2" style="visibility:hidden">
             <div class="cmpspin" id="cmpspin2"><div class="spinwheel"></div></div></div></div>
-        <div><div class="hint" id="cmplab3" style="margin-bottom:4px">New frame</div>
-          <div class="cmpwrap" id="cmpw3"><img id="cmpimg3" alt="second model's new frame" style="visibility:hidden">
+        <div><div class="hint" id="cmplab3" style="margin-bottom:4px"></div>
+          <div class="cmpwrap" id="cmpw3"><img id="cmpimg3" data-i18n-alt="cmp.alt3" style="visibility:hidden">
             <div class="cmpspin" id="cmpspin3"><div class="spinwheel"></div></div></div></div>
       </div>
       <div class="row" id="cmpnav" style="display:none;justify-content:center;gap:10px;margin-top:6px">
-        <button id="cmpback" class="mini" title="The new frame before this one">&lsaquo;</button>
-        <span class="v" id="cmplabel">frame &hellip;</span>
-        <button id="cmpfwd" class="mini" title="The new frame after this one">&rsaquo;</button>
-        <button id="cmprand" class="mini">random frame &rsaquo;</button>
-        <button id="cmpsave" class="mini" title="Saves the four panes as you see them, with their labels, as a PNG">Save image</button>
-        <button id="cmpclip" class="mini" title="Saves one second from this moment as a lossless video of the four panes: every frame, real and new, with its labels, at the output frame rate (step through it frame by frame in a player such as mpv)">Save clip</button>
+        <button id="cmpback" class="mini" data-i18n-title="cmp.back.tip">&lsaquo;</button>
+        <span class="v" id="cmplabel"></span>
+        <button id="cmpfwd" class="mini" data-i18n-title="cmp.fwd.tip">&rsaquo;</button>
+        <button id="cmprand" class="mini" data-i18n="prev.random"></button>
+        <button id="cmpsave" class="mini" data-i18n="cmp.save" data-i18n-title="cmp.save.tip"></button>
+        <button id="cmpclip" class="mini" data-i18n="cmp.clip" data-i18n-title="cmp.clip.tip"></button>
       </div>
       <div class="hint" id="prevnote" style="text-align:center;margin-top:4px"></div>
     </div>
   </div>
 
   <div class="row vonly">
-    <button id="go" disabled>Smooth It!</button>
-    <button id="cancel" disabled title="Stops this render and deletes its progress (no resume). To continue later, Pause or close the app instead.">Cancel</button>
-    <button id="open" disabled>Open folder</button>
-    <button id="play" disabled>Play video</button>
-    <button id="playprev" disabled style="display:none" title="Plays what is rendered so far, with sound and subtitles; made each time you Pause.">Play preview</button>
-    <span id="status" class="hint">Select a video to begin.</span>
+    <button id="go" disabled></button>
+    <button id="cancel" disabled data-i18n="run.cancel" data-i18n-title="run.cancel.tip"></button>
+    <button id="open" disabled data-i18n="run.open"></button>
+    <button id="play" disabled data-i18n="run.play"></button>
+    <button id="playprev" disabled style="display:none" data-i18n="run.playprev" data-i18n-title="run.playprev.tip"></button>
+    <span id="status" class="hint"></span>
   </div>
 
   <div class="panel vonly"><div id="bar"><div id="fill"></div><div id="pct">0%</div></div>
     <div class="hint" id="frames" style="margin-top:6px"></div>
     <div id="livewrap" style="display:none;margin-top:8px;align-items:flex-start;gap:8px">
-      <img id="live" title="The frame being written right now" alt=""
+      <img id="live" data-i18n-title="run.live.tip" alt=""
            style="display:none;max-width:100%;border-radius:4px">
-      <button id="livetoggle" class="mini"
-              title="Shows or hides the frame being written; hidden, the engine stops making it (a little less GPU and CPU).">Hide preview (frees resources)</button>
+      <button id="livetoggle" class="mini" data-i18n-title="run.livetoggle.tip"></button>
     </div></div>
 
   <div id="log" class="vonly"></div>

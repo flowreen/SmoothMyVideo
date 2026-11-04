@@ -166,6 +166,8 @@ static int g_upscaleH = 0;                     // --upscale H: forwarded to the 
                                                // height as the internal render size before the fit)
 static bool g_restore = false;                 // --restore: forwarded to the server (Real-ESRGAN first on
                                                // every composed frame, the app's Restore checkbox)
+static std::string g_restoreModel;             // --restore-model PATH (implies --restore): Restore's model = this
+                                               // ONNX file (the user's AnimeJaNai download); empty = Real-ESRGAN
 static bool g_dlssnr = false;                  // --dlssnr: forwarded to the server (DLSS 5 Neural Rendering
                                                // once per captured frame, the app's NVIDIA DLSS 5 checkbox)
 static double g_nrStructure = 1.0;             // --nr-structure F (0..2, the DLSS 5 Structure Intensity)
@@ -731,7 +733,8 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 //               --multi ignored)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
 //               (RIFE: the host finds or builds the engines itself, lkOfflineRife)
-//               the per-frame passes: [--out-w W --out-h H] [--restore] [--rtx-vsr [--vsr-quality N] | --fsr-upscale]
+//               the per-frame passes: [--out-w W --out-h H] [--restore | --restore-model ONNX]
+//               [--rtx-vsr [--vsr-quality N] | --fsr-upscale]
 //               [--dlssnr --nr-structure F --nr-tone F --nr-style N [--nr-delta PATH]] [--sharpen S] [--rtx-hdr ...]
 // Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
 // stdout in the same pixfmt (the encoder pipe). Real frames go out from the host buffer they came
@@ -1482,6 +1485,11 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_fsrUp = true;
         else if (wcscmp(argv[i], L"--restore") == 0)
             g_restore = true;
+        else if (wcscmp(argv[i], L"--restore-model") == 0 && i + 1 < argc)
+        {
+            g_restore = true;
+            g_restoreModel = wideToUtf8(argv[++i]);
+        }
         // RTX HDR: TrueHDR once per decoded frame after DLSS 5 and Sharpen, before the model; x2rgb10le out
         else if (wcscmp(argv[i], L"--rtx-hdr") == 0)
             g_rtxHdr = true;
@@ -3784,6 +3792,7 @@ static void resetSessionGlobals()
     g_fsrUp = false;
     g_upscaleH = 0;
     g_restore = false;
+    g_restoreModel.clear();
     g_dlssnr = false;
     g_nrStructure = 1.0;
     g_nrTone = 1.0;
@@ -3898,6 +3907,11 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_upscaleH = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--restore") == 0)
             g_restore = true;
+        else if (wcscmp(argv[i], L"--restore-model") == 0 && i + 1 < argc)
+        {
+            g_restore = true;
+            g_restoreModel = wideToUtf8(argv[++i]);
+        }
         else if (wcscmp(argv[i], L"--dlssnr") == 0)
             g_dlssnr = true;
         else if (wcscmp(argv[i], L"--nr-structure") == 0 && i + 1 < argc)
@@ -4323,6 +4337,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_vsrQuality = 4;
             g_fsrUp = false;
             g_restore = false;
+            g_restoreModel.clear();
             g_rtxHdr = false;
             wcscpy_s(g_hdrColor, L"raw");
             g_hdrSat = 100;

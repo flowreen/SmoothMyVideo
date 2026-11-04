@@ -23,6 +23,7 @@ export interface RenderArgs {
   fsr_upscale: boolean; // --fsr-upscale: AMD FSR 4 in RTX VSR's resize (the two exclude each other)
   rtx_hdr: boolean;
   restore: boolean;
+  restore_model: string | null; // --restore-model: Restore's model file (AnimeJaNai), null = Real-ESRGAN
   no_gpu_fit: boolean; // --no-gpu-fit: no video memory fit
   dlssnr: boolean;
   dv: boolean;

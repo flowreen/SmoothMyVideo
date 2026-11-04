@@ -4834,15 +4834,17 @@ struct NativeRife
         float* out;
     };
     std::vector<NvLevel> nvPyr;                 // levels 1.. down to 1 px on the short side
-    bool restHalfIn = true, restHalfOut = true; // the engine's x / y dtypes (read off it)
+    bool restHalfIn = true, restHalfOut = true; // the engine's input / output dtypes (read off it)
+    std::string restIn = "x", restOut = "y";    // the engine's input / output names (read off it)
+    int restScale = 4;                          // the model's scale (read off it): Real-ESRGAN 4, AnimeJaNai 2
     bool restFailed = false;
     int restTw = 0, restTh = 0; // the fold target (decided once VSR is known)
     nvinfer1::ICudaEngine* engRest = nullptr;
     nvinfer1::IRuntimeConfig* cfgRest = nullptr;
     nvinfer1::IExecutionContext* ctxRest = nullptr;
-    void* dRestIn = nullptr;   // x: NCHW at the source size (srcW x srcH), fp16 (or fp32)
-    void* dRestOut = nullptr;  // y: NCHW 4x, the engine's dtype
-    float* dRestTmp = nullptr; // the fold's horizontal pass, planar fp32 at (4h) x max target width
+    void* dRestIn = nullptr;   // the input: NCHW at the source size (srcW x srcH), fp16 (or fp32)
+    void* dRestOut = nullptr;  // the output: NCHW at restScale x, the engine's dtype
+    float* dRestTmp = nullptr; // the fold's horizontal pass, planar fp32 at (4h, the largest scale) x max target width
     float* dRest = nullptr;    // the fold back to the model size (VSR follows), planar fp32 w x h
     float* dRestRem = nullptr; // HDR planes: the source fitted to Restore's target (k_hdrRestOut's remainder)
 
@@ -6288,11 +6290,31 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     return true;
 }
 
-// the Restore engine for a model size, as trt_runtime.RestoreEngine names it: restore_<md5[:8] of
-// the weights>, input x (1,3,h,w) at the unpadded model size (the fit's w x h)
+static bool lkReadFile(const std::string& path, std::vector<char>& out);
+
+// Restore's model tag: the bundled Real-ESRGAN = trt_runtime.RestoreEngine's md5[:8] of the weights; --restore-model =
+// "x" + an FNV-1a 64 of the file's bytes (8 hex), so a changed file builds anew. Empty = the file cannot be read.
+static std::string lkRestoreTag(const LookupTags& t)
+{
+    if (g_restoreModel.empty())
+        return t.rest;
+    std::vector<char> b;
+    if (!lkReadFile(g_restoreModel, b) || b.empty())
+        return std::string();
+    uint64_t h = 1469598103934665603ULL;
+    for (const char c : b)
+        h = (h ^ (uint8_t)c) * 1099511628211ULL;
+    char hex[17];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+    return "x" + std::string(hex, 8);
+}
+
+// the Restore engine for a model size, as trt_runtime.RestoreEngine names it: restore_<tag>, input (1,3,h,w) at the
+// unpadded model size (the fit's w x h)
 static std::string lkRestorePath(const std::string& cacheDir, const LookupTags& t, int w, int h)
 {
-    return cacheDir + "\\" + lkEngineName("restore_" + t.rest, {{"x", {1, 3, h, w}}}, nullptr, 0, 0, t) + ".engine";
+    return cacheDir + "\\" + lkEngineName("restore_" + lkRestoreTag(t), {{"x", {1, 3, h, w}}}, nullptr, 0, 0, t) +
+           ".engine";
 }
 
 static int lkField(const std::string& line, const char* key)
@@ -6320,7 +6342,7 @@ static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& b
         return false;
     }
     const LookupTags& t = lkTags(s.engDirW);
-    if (!t.ok || t.rest.empty())
+    if (!t.ok || lkRestoreTag(t).empty())
     {
         lines.clear();
         return false;
@@ -6708,18 +6730,19 @@ static bool lkBuildStream(cudaStream_t& st)
     return true;
 }
 
-// one engine of a build: the file when it exists, else built from its ONNX in engine\onnx, then
-// warmed for every shape set (a warm key, when given, marks the jit as warmed for the session's
-// size). *oom = the failure was memory-shaped.
+// one engine of a build: the file when it exists, else built from its ONNX in engine\onnx (onnxFile = another
+// ONNX file, the user's Restore model), then warmed for every shape set (a warm key, when given, marks the jit as
+// warmed for the session's size). *oom = the failure was memory-shaped.
 static bool lkEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTags& t, const std::string& path,
                      const std::string& onnxKey, const std::vector<LkShape>& set, const char* dynInput, int dynLo,
                      int dynHi, int wsMult, const std::vector<std::vector<LkShape>>& warmSets,
-                     const std::string& warmKey, cudaStream_t st, bool* oom)
+                     const std::string& warmKey, cudaStream_t st, bool* oom,
+                     const std::string& onnxFile = std::string())
 {
     *oom = false;
     if (!lkFile(path))
     {
-        const std::string onnx = lkOnnxPath(s.engDir, onnxKey, t);
+        const std::string onnx = onnxFile.empty() ? lkOnnxPath(s.engDir, onnxKey, t) : onnxFile;
         if (!lkFile(onnx))
         {
             LOG("native: %s is missing (node scripts/export-onnx.ts writes it)\n", onnx.c_str());
@@ -7090,18 +7113,42 @@ static bool nativeLocalBuild(const std::wstring& script, const std::wstring& bac
     return lkEnsureRestore(script, s, (int)capW, (int)capH, rpath, rjit); // the captured frame's size
 }
 
-// the Real-ESRGAN Restore engine at its input size w x h (restore_<hash>_dth: fp16 input; live the
-// captured frame, offline the decoded one) from engine\onnx when it is missing, warmed once so its
-// .jit exists; the live cold build and the offline host share it. true = both files exist, paths
-// in rpath / rjit.
+// the first input's name of a one-input ONNX graph (the user's Restore model names its own; Real-ESRGAN's export
+// says "x"); empty = it does not parse or has another input count
+static std::string lkOnnxInputName(const std::string& onnx)
+{
+    LkBuildLogger lg;
+    std::unique_ptr<nvinfer1::IBuilder> b(nvinfer1::createInferBuilder(lg));
+    if (!b)
+        return std::string();
+    const auto flags = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+    std::unique_ptr<nvinfer1::INetworkDefinition> net(b->createNetworkV2(flags));
+    if (!net)
+        return std::string();
+    std::unique_ptr<nvonnxparser::IParser> p(nvonnxparser::createParser(*net, lg));
+    if (!p || !p->parseFromFile(onnx.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)) ||
+        net->getNbInputs() != 1)
+        return std::string();
+    return net->getInput(0)->getName();
+}
+
+// the Restore engine at its input size w x h (live the captured frame, offline the decoded one): Real-ESRGAN from
+// engine\onnx (restore_<hash>_dth: fp16 input x) or the --restore-model file, built when it is missing, warmed once so
+// its .jit exists; the live cold build and the offline host share it. true = both files exist, paths in rpath / rjit.
 static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int w, int h, std::string& rpath,
                             std::string& rjit)
 {
     if (!nativeLoadDlls(script))
         return false;
     const LookupTags& t = lkTags(s.engDirW);
-    if (!t.ok || t.rest.empty())
+    if (!t.ok)
         return false;
+    if (lkRestoreTag(t).empty())
+    {
+        if (!g_restoreModel.empty())
+            LOG("native: the Restore model %s cannot be read\n", g_restoreModel.c_str());
+        return false;
+    }
     rpath = lkRestorePath(s.cacheDir, t, w, h);
     rjit = lkJit(rpath);
     if (lkFile(rpath) && lkFile(rjit))
@@ -7117,9 +7164,16 @@ static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int 
         return false;
     nvinfer1::IRuntime* rt = lkRuntime();
     bool oom = false;
-    const std::vector<LkShape> rset = {{"x", {1, 3, h, w}}};
+    const std::string inName = g_restoreModel.empty() ? std::string("x") : lkOnnxInputName(g_restoreModel);
+    if (inName.empty())
+    {
+        LOG("native: the Restore model %s is not a one-input ONNX graph\n", g_restoreModel.c_str());
+        cudaStreamDestroy(st);
+        return false;
+    }
+    const std::vector<LkShape> rset = {{inName.c_str(), {1, 3, h, w}}};
     const bool done = rt && lkEnsure(rt, s, t, rpath, "restore_" + t.rest + "_dth", rset, nullptr, 0, 0, 1, {rset},
-                                     std::string(), st, &oom);
+                                     std::string(), st, &oom, g_restoreModel);
     cudaStreamDestroy(st);
     LOG("native: host Restore engine build for %dx%d %s (%.1fs)\n", w, h, done ? "done" : "failed",
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -8385,8 +8439,10 @@ static bool nativeRtxInit(NativeRife& nr)
         if ((nr.encPre || nr.encPost) && (nr.restTw != sw || nr.restTh != sh))
             NCHK(cudaMalloc((void**)&nr.dRestRem, (size_t)3 * nr.restTw * nr.restTh * sizeof(float)),
                  "alloc restore HDR fit");
-        LOG("native: live restore: Real-ESRGAN animevideov3 (TensorRT) at %dx%d -> %dx%d%s\n", sw, sh, nr.restTw,
-            nr.restTh, nr.restPre ? ", on the captured frame before the model" : "");
+        const std::string rm = g_restoreModel.empty() ? std::string("Real-ESRGAN animevideov3")
+                                                      : g_restoreModel.substr(g_restoreModel.find_last_of("\\/") + 1);
+        LOG("native: live restore: %s (TensorRT) at %dx%d -> %dx%d%s\n", rm.c_str(), sw, sh, nr.restTw, nr.restTh,
+            nr.restPre ? ", on the captured frame before the model" : "");
     }
     // a resize of HDR planes before the model: live the capture to the working size (with Restore, its reference),
     // offline the pre-model stage (the resize, or Restore at a size change)
@@ -11755,8 +11811,9 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
         if (nr.mph && (nr.mw != nr.w || nr.mh != nr.h))
             NCHK(cudaMalloc((void**)&nr.dMFit, (size_t)3 * nr.mw * nr.mh * sizeof(float)), "alloc motion fit");
     }
-    // live Restore: the fold's horizontal pass at the 4x height and the model-size target, and the folded
-    // model-size frame (the engine's x / y follow its dtypes in nativeTrtInit's restoreReady)
+    // live Restore: the fold's horizontal pass at the model's output height (4x, the largest scale, before the engine
+    // is read) and the model-size target, and the folded model-size frame (the engine's input / output follow its
+    // dtypes and scale in nativeTrtInit's restoreReady)
     if (nr.restore)
     {
         const size_t mp = (size_t)nr.w * nr.h;
@@ -12811,7 +12868,20 @@ static bool nativeTrtInit(NativeRife& nr)
     auto restoreReady = [&]() -> bool {
         if (!nr.engRest)
             return true;
-        const auto xd = dt(nr.engRest, "x"), yd = dt(nr.engRest, "y");
+        // one input and one output, their names read off the engine (Real-ESRGAN x / y, AnimeJaNai input / output)
+        nr.restIn.clear();
+        nr.restOut.clear();
+        for (int i = 0; i < nr.engRest->getNbIOTensors(); i++)
+        {
+            const char* n = nr.engRest->getIOTensorName(i);
+            (nr.engRest->getTensorIOMode(n) == nvinfer1::TensorIOMode::kINPUT ? nr.restIn : nr.restOut) = n;
+        }
+        if (nr.engRest->getNbIOTensors() != 2 || nr.restIn.empty() || nr.restOut.empty())
+        {
+            LOG("native: restore engine is not one input and one output\n");
+            return false;
+        }
+        const auto xd = dt(nr.engRest, nr.restIn.c_str()), yd = dt(nr.engRest, nr.restOut.c_str());
         if (xd == nvinfer1::DataType::kHALF)
             nr.restHalfIn = true;
         else if (xd == nvinfer1::DataType::kFLOAT)
@@ -12830,23 +12900,33 @@ static bool nativeTrtInit(NativeRife& nr)
             LOG("native: restore engine output dtype unsupported\n");
             return false;
         }
-        // x / y in the engine's own dtypes (fp16 as exported), so they are sized here, once the engine is known
+        nvinfer1::Dims4 din{1, 3, srcH(nr), srcW(nr)};
+        if (!nr.ctxRest->setInputShape(nr.restIn.c_str(), din))
+        {
+            LOG("native: restore setInputShape rejected (engine built for another size)\n");
+            return false;
+        }
+        // the scale = the output's width over the input's (one integer factor on both axes, at most 4: dRestTmp)
+        const nvinfer1::Dims od = nr.ctxRest->getTensorShape(nr.restOut.c_str());
+        nr.restScale = od.nbDims == 4 && od.d[3] % srcW(nr) == 0 ? (int)(od.d[3] / srcW(nr)) : 0;
+        if (nr.restScale < 1 || nr.restScale > 4 || od.d[1] != 3 || od.d[2] != (int64_t)nr.restScale * srcH(nr))
+        {
+            LOG("native: restore engine output shape is not 3 x (s*h) x (s*w), s 1 to 4\n");
+            return false;
+        }
+        // the input and output in the engine's own dtypes (fp16 as exported), so they are sized here, once the engine
+        // is known
         const size_t sp = (size_t)srcW(nr) * srcH(nr);
         const size_t inBytes = 3 * sp * (nr.restHalfIn ? sizeof(uint16_t) : sizeof(float));
-        const size_t outBytes = 3 * 16 * sp * (nr.restHalfOut ? sizeof(uint16_t) : sizeof(float));
+        const size_t outBytes =
+            3 * (size_t)nr.restScale * nr.restScale * sp * (nr.restHalfOut ? sizeof(uint16_t) : sizeof(float));
         if (!nr.dRestIn)
             NCHK(cudaMalloc(&nr.dRestIn, inBytes), "alloc restore input");
         if (!nr.dRestOut)
             NCHK(cudaMalloc(&nr.dRestOut, outBytes), "alloc restore output");
         NCHK(cudaMemsetAsync(nr.dRestIn, 0, inBytes, nr.stream), "restore warm-up clear");
-        nvinfer1::Dims4 din{1, 3, srcH(nr), srcW(nr)};
-        if (!nr.ctxRest->setInputShape("x", din))
-        {
-            LOG("native: restore setInputShape rejected (engine built for another size)\n");
-            return false;
-        }
-        nr.ctxRest->setTensorAddress("x", nr.dRestIn);
-        nr.ctxRest->setTensorAddress("y", nr.dRestOut);
+        nr.ctxRest->setTensorAddress(nr.restIn.c_str(), nr.dRestIn);
+        nr.ctxRest->setTensorAddress(nr.restOut.c_str(), nr.dRestOut);
         if (!nr.ctxRest->enqueueV3(nr.stream))
         {
             LOG("native: restore warm-up enqueue failed\n");
@@ -14707,17 +14787,18 @@ static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, fl
             }
     }
     nvinfer1::Dims4 din{1, 3, sh, sw};
-    nr.ctxRest->setTensorAddress("x", nr.dRestIn);
-    nr.ctxRest->setTensorAddress("y", nr.dRestOut);
-    if (!nr.ctxRest->setInputShape("x", din) || !nr.ctxRest->enqueueV3(st))
+    nr.ctxRest->setTensorAddress(nr.restIn.c_str(), nr.dRestIn);
+    nr.ctxRest->setTensorAddress(nr.restOut.c_str(), nr.dRestOut);
+    if (!nr.ctxRest->setInputShape(nr.restIn.c_str(), din) || !nr.ctxRest->enqueueV3(st))
     {
         LOG("native: restore failed, dropping the pass for the rest of the %s\n", g_offline ? "render" : "session");
         nr.restFailed = true;
         return true;
     }
-    int half = nr.restHalfOut ? 1 : 0, w4 = 4 * sw, h4 = 4 * sh, ps4 = w4 * h4;
-    // realesr.fit: the Lanczos pair at every ratio (an exact copy at 4x itself), with `out.clamp(0,1)` folded into
-    // the taps and the final clamp in the vertical pass
+    // w4 / h4 = the model's output size (restScale x the input: Real-ESRGAN 4, AnimeJaNai 2)
+    int half = nr.restHalfOut ? 1 : 0, w4 = nr.restScale * sw, h4 = nr.restScale * sh, ps4 = w4 * h4;
+    // realesr.fit: the Lanczos pair at every ratio (an exact copy at the model's own scale), with `out.clamp(0,1)`
+    // folded into the taps and the final clamp in the vertical pass
     const void* tabH = rsTabFor(nr, w4, tw, st);
     const void* tabV = rsTabFor(nr, h4, th, st);
     if (!tabH || !tabV)

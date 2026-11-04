@@ -61,6 +61,7 @@
           "!rtxvideo/nvngx_truehdr.dll",
           "!dlssnr/nvngx_dlssnr.dll",
           "!dlssnr/nvngx_dlss.dll",
+          "!restore/**",
           "!**/build_src/**",
           "!**/*.log",
           "!nvoffruc/NvOFFRUC.dll",

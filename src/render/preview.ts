@@ -32,6 +32,7 @@ export interface PreviewArgs {
   rtx_hdr: boolean;
   sharpen: number;
   restore: boolean;
+  restore_model: string | null; // --restore-model: Restore's model file (AnimeJaNai), null = Real-ESRGAN
   scale: string | null; // --scale: the render's DLSS mode or working-size share
   upscale: number;
   rtx_vsr: boolean;
@@ -82,6 +83,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     rtx_hdr: false,
     sharpen: 0,
     restore: false,
+    restore_model: null,
     scale: null,
     upscale: 1,
     rtx_vsr: false,
@@ -144,10 +146,11 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     if (k in flags) rec[flags[k]] = true;
     else if (k in floats) rec[floats[k]] = num(k, argv[++i]);
     else if (k in ints) rec[ints[k]] = num(k, argv[++i], true);
-    else if (['--frame', '--out', '--hdr-color', '--scale', '--model-a', '--model-b'].includes(k)) {
+    else if (['--frame', '--out', '--hdr-color', '--scale', '--model-a', '--model-b', '--restore-model'].includes(k)) {
       const v = argv[++i];
       if (v === undefined) throw new Error(`argument ${k}: expected one argument`);
       if (k === '--frame') a.frame = v;
+      else if (k === '--restore-model') a.restore_model = v;
       else if (k === '--out') a.out = v;
       else if (k === '--scale') a.scale = v;
       else if (k === '--model-a') a.model_a = v;
@@ -713,7 +716,7 @@ function passFlags(
     }
   }
   if (s.strength > 0) args.push('--sharpen', pyG(s.strength));
-  if (a.restore) args.push('--restore');
+  if (a.restore) args.push(...(a.restore_model ? ['--restore-model', a.restore_model] : ['--restore']));
   if (s.WW !== s.W || s.WH !== s.H || a.restore) args.push('--work-w', String(s.WW), '--work-h', String(s.WH));
   if (s.nrOn) {
     args.push(

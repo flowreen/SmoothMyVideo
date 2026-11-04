@@ -69,6 +69,8 @@ const OPTS: Record<string, Spec> = {
   '--hdr10plus': { dest: 'hdr10plus', kind: 'bool', def: false },
   '--codec': { dest: 'codec', kind: 'str', def: 'hevc', choices: ['hevc', 'av1', 'vvc'] },
   '--restore': { dest: 'restore', kind: 'bool', def: false },
+  // Restore's model file (the installed AnimeJaNai ONNX; the host's --restore-model), none = Real-ESRGAN
+  '--restore-model': { dest: 'restore_model', kind: 'str', def: null },
   '--no-gpu-fit': { dest: 'no_gpu_fit', kind: 'bool', def: false },
   '--dlssnr': { dest: 'dlssnr', kind: 'bool', def: false },
   '--nr-structure': { dest: 'nr_structure', kind: 'float', def: 1.0 },

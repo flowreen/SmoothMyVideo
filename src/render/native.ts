@@ -763,7 +763,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     }
   }
   if (SHARPEN > 0) nargs.push('--sharpen', pyG(SHARPEN));
-  if (args.restore) nargs.push('--restore');
+  if (args.restore) nargs.push(...(args.restore_model ? ['--restore-model', args.restore_model] : ['--restore']));
   if (args.no_gpu_fit) nargs.push('--no-gpu-fit');
   // the working size: the host runs Restore and the resize to it on the decoded frame, DLSS 5 and
   // the model at it, then the final resize to the output (sent only when it changes something, so

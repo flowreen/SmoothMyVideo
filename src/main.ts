@@ -694,6 +694,117 @@ ipcMain.handle('dlssnr-choose', async () => {
   return r.canceled ? null : r.filePaths[0] || null;
 });
 
+// "AnimeJaNai HD", Restore's second model: the author's 2x ONNX (CC BY-NC-SA 4.0, so never bundled: package.json's
+// filter drops engine/restore). One click downloads the pinned release archive, checks its SHA256, extracts the one
+// model with Windows' bsdtar and checks the model's SHA256 before the copy; a picked .onnx installs under the same
+// name and the UI says when it is not the verified file. The host gets it as --restore-model.
+const AJ_DIR = path.join(ENGINE, 'restore');
+const AJ_FILE = '2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx';
+const AJ_DL = {
+  url: 'https://github.com/the-database/mpv-upscale-2x_animejanai/releases/download/3.9.0/mpv-upscale-2x_animejanai-overlay-3.9.0.7z',
+  page: 'https://github.com/the-database/mpv-upscale-2x_animejanai/releases/tag/3.9.0',
+  licence: 'https://creativecommons.org/licenses/by-nc-sa/4.0/',
+  member: 'animejanai/onnx/' + AJ_FILE,
+  archiveSha256: '8933e1003dc9bdf5bc9cd4bb8da91051c28e03129841846b17bb65f1c0446ab0',
+  onnxSha256: 'b308e93c3dda3c4f9f968295b2b7b8d1c0583a711bca53a08d51134d9d1cbd5c',
+  archiveBytes: 42945210,
+};
+const ajPath = () => path.join(AJ_DIR, AJ_FILE);
+/** The host's --restore-model arguments for a Restore model id: 'animejanai' = the installed file; none = Real-ESRGAN. */
+function restoreModelArgs(id?: string): string[] {
+  return id === 'animejanai' && fileExists(ajPath()) ? ['--restore-model', ajPath()] : [];
+}
+
+ipcMain.handle('aj-ready', () => {
+  const ready = fileExists(ajPath());
+  let sha256 = '';
+  try {
+    if (ready) sha256 = sha256File(ajPath());
+  } catch {
+    /* the hash is informational */
+  }
+  const known = sha256 ? sha256 === AJ_DL.onnxSha256 : undefined;
+  return { ready, known, sha256, file: AJ_FILE, mb: Math.round(AJ_DL.archiveBytes / 1048576) };
+});
+
+ipcMain.handle('aj-install', (_e, source: string) => {
+  try {
+    if (!/\.onnx$/i.test(source)) return { ok: false, error: 'not an .onnx file, nothing installed' };
+    fs.mkdirSync(AJ_DIR, { recursive: true });
+    fs.copyFileSync(source, ajPath());
+    const sha256 = sha256File(ajPath());
+    return { ok: true, sha256, known: sha256 === AJ_DL.onnxSha256 };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+
+ipcMain.handle('aj-download', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'smv-animejanai-'));
+  const archive = path.join(tmp, 'release.7z');
+  const progress = (received: number, total: number, stage: string) => {
+    try {
+      if (win && !win.webContents.isDestroyed()) win.webContents.send('aj-progress', { received, total, stage });
+    } catch {
+      /* window gone */
+    }
+  };
+  try {
+    const res = await fetch(AJ_DL.url, { headers: { 'user-agent': 'SmoothMyVideo' } });
+    if (!res.ok || !res.body) return { ok: false, error: `download failed: HTTP ${res.status}` };
+    const total = parseInt(res.headers.get('content-length') || '0', 10) || AJ_DL.archiveBytes;
+    let received = 0;
+    let last = 0;
+    const src = Readable.fromWeb(res.body as never);
+    src.on('data', (chunk: Buffer) => {
+      received += chunk.length;
+      if (received - last > 2 * 1048576 || received === total) {
+        last = received;
+        progress(received, total, 'download');
+      }
+    });
+    await pipeline(src, fs.createWriteStream(archive));
+    progress(received, total, 'verify');
+    const ah = sha256File(archive);
+    if (ah !== AJ_DL.archiveSha256)
+      return { ok: false, error: `archive checksum mismatch (${ah.slice(0, 12)}...), nothing installed` };
+    execFileSync(SYS_TAR, ['-xf', archive, '-C', tmp, AJ_DL.member]);
+    const found = path.join(tmp, ...AJ_DL.member.split('/'));
+    if (!fileExists(found)) return { ok: false, error: AJ_FILE + ' not in the downloaded archive, nothing installed' };
+    const mh = sha256File(found);
+    if (mh !== AJ_DL.onnxSha256)
+      return { ok: false, error: `model checksum mismatch (${mh.slice(0, 12)}...), nothing installed` };
+    fs.mkdirSync(AJ_DIR, { recursive: true });
+    fs.copyFileSync(found, ajPath());
+    return { ok: true, sha256: mh, known: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  } finally {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    } catch {
+      /* temp cleanup best effort */
+    }
+  }
+});
+
+ipcMain.handle('aj-open', (_e, which: string) => {
+  shell.openExternal(which === 'licence' ? AJ_DL.licence : AJ_DL.page);
+  return true;
+});
+
+ipcMain.handle('aj-choose', async () => {
+  const r = await dialog.showOpenDialog(win!, {
+    title: 'Select the AnimeJaNai model (.onnx)',
+    properties: ['openFile'],
+    filters: [
+      { name: 'ONNX model', extensions: ['onnx'] },
+      { name: 'All files', extensions: ['*'] },
+    ],
+  });
+  return r.canceled ? null : r.filePaths[0] || null;
+});
+
 // --- Live mode: the real-time pipeline host (engine/live/smv-live.exe) -----------------------------
 // The exe captures the target window via Windows.Graphics.Capture and presents it enhanced into a
 // click-through topmost overlay. Backend today: DLSS Frame Generation at (gen+1)x (its own copy of
@@ -785,6 +896,7 @@ function vsrQArgs(q: number): string[] {
 let liveFsrUp = false; // AMD FSR 4 as the live upscaler instead (its checkbox; the two exclude each other)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
+let liveRestoreModel = ''; // Restore's model id ('animejanai' = the installed AnimeJaNai file, '' = Real-ESRGAN)
 let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inherited from the NVIDIA DLSS 5 checkbox
 let liveNrStructure = 1; // DLSS 5 Structure Intensity 0..2
 let liveNrTone = 1; // DLSS 5 Tone Intensity 0..2
@@ -941,7 +1053,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   else if (liveFsrUp) args.push('--fsr-upscale');
   // Restore: Real-ESRGAN first on every presented frame; costs most
   // of a 1080p frame budget, the panel hint says so
-  if (liveRestore) args.push('--restore');
+  if (liveRestore) args.push('--restore', ...restoreModelArgs(liveRestoreModel));
   // NVIDIA DLSS 5: Neural Rendering once per captured frame inside
   // the exe (SDR domain, before the model; the tweens inherit it); a session whose pass cannot
   // run goes on without it and logs why. Only sent when the runtime is installed (the
@@ -1124,6 +1236,7 @@ ipcMain.on(
       fsrup?: boolean;
       uph?: number;
       restore?: boolean;
+      restoreModel?: string; // Restore's model id ('animejanai'; none = Real-ESRGAN)
       dlssnr?: boolean;
       nrstructure?: number;
       nrtone?: number;
@@ -1152,6 +1265,7 @@ ipcMain.on(
     liveFsrUp = !!opts.fsrup;
     liveUpH = opts.uph ?? 0;
     liveRestore = !!opts.restore;
+    liveRestoreModel = opts.restoreModel ?? '';
     liveDlssnr = !!opts.dlssnr;
     liveNrStructure = opts.nrstructure ?? 1;
     liveNrTone = opts.nrtone ?? 1;
@@ -1506,6 +1620,7 @@ type RunOpts = {
   fps?: number;
   sharpen?: number;
   restore?: boolean;
+  restoreModel?: string; // Restore's model id ('animejanai'; none = Real-ESRGAN)
   dlssmode?: string; // the DLSS mode (dlssScaleArg)
   dlssnr?: boolean;
   nrstructure?: number;
@@ -1565,9 +1680,9 @@ function engineArgs(opts: RunOpts): string[] {
   // Adaptive Sharpen strength 0..2 (GUI checkbox + slider, 1 = the author's default). 0/omitted = off,
   // leaving the frames value-preserving; >0 enables the host's sharpen pass. Works with or without interp.
   if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
-  // AI detail restoration (GUI Restore checkbox): Real-ESRGAN animevideov3 once per source frame,
-  // first (it folds straight to the working size). Works with or without interpolation.
-  if (opts.restore) args.push('--restore');
+  // AI detail restoration (GUI Restore rows): Real-ESRGAN animevideov3, or the installed AnimeJaNai, once per source
+  // frame, first (it folds straight to the working size). Works with or without interpolation.
+  if (opts.restore) args.push('--restore', ...restoreModelArgs(opts.restoreModel));
   // NVIDIA DLSS 5 Neural Rendering (GUI checkbox + the two sliders): once per source frame at the
   // working size, after Restore and the resize, before the interpolation. The
   // renderer only sends it when the user-supplied runtime is installed (dlssnr-ready).
@@ -1818,6 +1933,7 @@ type PreviewOpts = {
   vsrquality?: number; // RTX VSR's quality level 1..4
   fsrup?: boolean;
   restore?: boolean;
+  restoreModel?: string; // Restore's model id ('animejanai'; none = Real-ESRGAN)
   dlssmode?: string; // the DLSS mode (dlssScaleArg)
   dlssnr?: boolean;
   nrstructure?: number;
@@ -1831,7 +1947,7 @@ type PreviewOpts = {
 function previewArgv(opts: PreviewOpts, prefix: string): string[] {
   const args = [PREVIEW_CLI, opts.input, '--out', prefix, '--frame', String(opts.frame ?? 'mid')];
   if (opts.sharpen && opts.sharpen > 0) args.push('--sharpen', String(opts.sharpen));
-  if (opts.restore) args.push('--restore');
+  if (opts.restore) args.push('--restore', ...restoreModelArgs(opts.restoreModel));
   const pScale = dlssScaleArg(opts.dlssmode);
   if (pScale) args.push('--scale', pScale);
   if (opts.dlssnr)
