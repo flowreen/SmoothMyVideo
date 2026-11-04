@@ -238,7 +238,7 @@ let exactHz: number[] = [];
 let exactHzAt = 0;
 function queryExactRates(): Promise<number[]> {
   return new Promise((resolve) => {
-    execFile(LIVE_EXE, ['--hz'], { cwd: LIVE_DIR, timeout: 8000 }, (err, stdout) => {
+    execFile(LIVE_EXE, ['--hz'], { cwd: LIVE_DIR, timeout: 8000, windowsHide: true }, (err, stdout) => {
       if (err) return resolve([]);
       resolve(
         String(stdout)
@@ -551,9 +551,33 @@ ipcMain.handle('rtx-choose', async () => {
 
 // "NVIDIA Smooth Motion" (NvOFFRUC) runtime: ready only when our bridge AND NvOFFRUC.dll are present.
 // "DLSS 4.5" (DLSS Frame Generation): bundled, so this only guards against a broken install.
-ipcMain.handle('dlssg-ready', () => {
+// DLSS 4.5 runs on RTX 40 / 50 GPUs with Windows' hardware-accelerated GPU scheduling on (HwSchMode 2); read once a run.
+// The renderer makes it the default model only when both hold
+let dlssgSupport: Promise<{ gpu: string; hags: boolean; supported: boolean }> | null = null;
+function dlssgSupportOnce(): Promise<{ gpu: string; hags: boolean; supported: boolean }> {
+  if (!dlssgSupport)
+    dlssgSupport = new Promise((resolve) => {
+      execFile(
+        'nvidia-smi',
+        ['--query-gpu=name', '--format=csv,noheader'],
+        { timeout: 5000, windowsHide: true },
+        (e1, o1) => {
+          const gpu = e1 ? '' : String(o1).split(/\r?\n/)[0].trim();
+          const key = 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers';
+          execFile('reg', ['query', key, '/v', 'HwSchMode'], { timeout: 5000, windowsHide: true }, (e2, o2) => {
+            const hags = !e2 && /HwSchMode\s+REG_DWORD\s+0x2\b/i.test(String(o2));
+            resolve({ gpu, hags, supported: hags && /RTX\s*(40|50)\d{2}\b|\bAda\b|Blackwell/i.test(gpu) });
+          });
+        },
+      );
+    });
+  return dlssgSupport;
+}
+
+ipcMain.handle('dlssg-ready', async () => {
   const missing = DLSSG_FILES.filter((f) => !fileExists(path.join(DLSSG_DIR, f)));
-  return { ready: missing.length === 0, missing, dir: DLSSG_DIR };
+  const s = await dlssgSupportOnce();
+  return { ready: missing.length === 0, missing, dir: DLSSG_DIR, gpu: s.gpu, hags: s.hags, supported: s.supported };
 });
 
 // "NVIDIA DLSS 5" (Neural Rendering): ready when the shipped caller shim AND the user-supplied
@@ -748,6 +772,16 @@ let liveFit = 'monitor'; // 'monitor' = whole-screen capture 1:1 (every model in
 let liveTarget = 60; // adaptive output fps target, inherited from the renderer's Speed selectors
 let liveSharpen = 0; // live Adaptive Sharpen strength 0..2, inherited from the Sharpen controls (0 = off)
 let liveVsr = false; // RTX VSR as the live upscaler, inherited from the RTX VSR checkbox
+let liveVsrQ = 4; // RTX VSR's quality level 1..4, inherited from its slider (4 = Ultra)
+/** RTX VSR's quality level from the renderer's slider: 1..4, anything else = 4 (Ultra, the default). */
+function vsrQ(v: number | undefined): number {
+  const q = Math.round(Number(v));
+  return q >= 1 && q <= 4 ? q : 4;
+}
+/** The host flag for a quality level; none for 4, the host's own default. */
+function vsrQArgs(q: number): string[] {
+  return q !== 4 ? ['--vsr-quality', String(q)] : [];
+}
 let liveFsrUp = false; // AMD FSR 4 as the live upscaler instead (its checkbox; the two exclude each other)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
@@ -903,7 +937,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   if (upH > 0) args.push('--upscale', String(upH));
   // the host gives RTX VSR the one resize that enlarges (the fit after the model, else the capture to the
   // working size before it) and skips it with a line when neither does
-  if (liveVsr) args.push('--rtx-vsr');
+  if (liveVsr) args.push('--rtx-vsr', ...vsrQArgs(liveVsrQ));
   else if (liveFsrUp) args.push('--fsr-upscale');
   // Restore: Real-ESRGAN first on every presented frame; costs most
   // of a 1080p frame budget, the panel hint says so
@@ -962,7 +996,8 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     liveQuitIdle();
   }
   if (resident) args.push('--resident');
-  const p = spawn(LIVE_EXE, args, { cwd: LIVE_DIR });
+  // windowsHide: a packaged app has no console, so a console-subsystem child would get a window of its own
+  const p = spawn(LIVE_EXE, args, { cwd: LIVE_DIR, windowsHide: true });
   liveProc = p;
   liveResident = resident;
   liveIdle = false;
@@ -1085,6 +1120,7 @@ ipcMain.on(
       target?: number;
       sharpen?: number;
       rtxvsr?: boolean;
+      vsrquality?: number; // RTX VSR's quality level 1..4
       fsrup?: boolean;
       uph?: number;
       restore?: boolean;
@@ -1112,6 +1148,7 @@ ipcMain.on(
     if (opts.target !== undefined) liveTarget = opts.target;
     liveSharpen = opts.sharpen ?? 0;
     liveVsr = !!opts.rtxvsr;
+    liveVsrQ = vsrQ(opts.vsrquality);
     liveFsrUp = !!opts.fsrup;
     liveUpH = opts.uph ?? 0;
     liveRestore = !!opts.restore;
@@ -1166,8 +1203,8 @@ function liveRestoreMouse(sync: boolean) {
   if (!fileExists(LIVE_MOUSE_MARKER)) return;
   liveLog('restoring the pointer speed and clip a killed Fill session held');
   try {
-    if (sync) execFileSync(LIVE_EXE, ['--restore-mouse'], { cwd: LIVE_DIR, timeout: 5000 });
-    else execFile(LIVE_EXE, ['--restore-mouse'], { cwd: LIVE_DIR, timeout: 5000 }, () => {});
+    if (sync) execFileSync(LIVE_EXE, ['--restore-mouse'], { cwd: LIVE_DIR, timeout: 5000, windowsHide: true });
+    else execFile(LIVE_EXE, ['--restore-mouse'], { cwd: LIVE_DIR, timeout: 5000, windowsHide: true }, () => {});
   } catch {
     /* the next live session restores it */
   }
@@ -1479,9 +1516,11 @@ type RunOpts = {
   model?: string;
   upscale?: number;
   rtxvsr?: boolean;
+  vsrquality?: number; // RTX VSR's quality level 1..4
   fsrup?: boolean;
   rtxhdr?: boolean;
   dv?: boolean;
+  dvprofile?: string; // Dolby Vision 8.1 (HDR10 base, the default) or 8.4 (HLG base)
   hp?: boolean;
   codec?: string;
   nogpufit?: boolean;
@@ -1554,7 +1593,7 @@ function engineArgs(opts: RunOpts): string[] {
   // final one from the working size (a mode below DLAA or an upscale), else the one before the
   // model; the plan skips it when nothing enlarges. Falls back to Lanczos3 if the bridge or the RTX
   // Video runtime is unavailable. AMD FSR 4 (bundled) takes the same resize when its box is ticked instead.
-  if (opts.rtxvsr) args.push('--rtx-vsr');
+  if (opts.rtxvsr) args.push('--rtx-vsr', ...vsrQArgs(vsrQ(opts.vsrquality)));
   else if (opts.fsrup) args.push('--fsr-upscale');
   // "Fit to the GPU" off: no video memory fit (the batch stays as planned, slower when memory runs short)
   if (opts.nogpufit) args.push('--no-gpu-fit');
@@ -1572,8 +1611,10 @@ function engineArgs(opts: RunOpts): string[] {
     if (opts.hdrsb && opts.hdrsb > 0) args.push('--hdr-satboost', String(opts.hdrsb));
     // RTX HDR tone curve (SDK 0..200, 100 = neutral; the GUI shows the App's -100..100 scale).
     if (typeof opts.hdrcon === 'number' && opts.hdrcon !== 100) args.push('--hdr-contrast', String(opts.hdrcon));
-    // Dolby Vision Profile 8.1 export on top of the HDR10 render (needs dovi_tool in engine/dvtools).
+    // Dolby Vision export (needs dovi_tool in engine/dvtools): Profile 8.1 on the HDR10 render, or 8.4 with the video
+    // written as HLG.
     if (opts.dv) args.push('--dv');
+    if (opts.dv && opts.dvprofile === '8.4') args.push('--dv-profile', '8.4');
     // HDR10+ dynamic metadata on top of the HDR10 render (needs hdr10plus_tool in engine/hptools).
     if (opts.hp) args.push('--hdr10plus');
   }
@@ -1774,6 +1815,7 @@ type PreviewOpts = {
   contrast?: number;
   upscale?: number;
   rtxvsr?: boolean;
+  vsrquality?: number; // RTX VSR's quality level 1..4
   fsrup?: boolean;
   restore?: boolean;
   dlssmode?: string; // the DLSS mode (dlssScaleArg)
@@ -1807,7 +1849,7 @@ function previewArgv(opts: PreviewOpts, prefix: string): string[] {
   if (opts.dlssnr && opts.nrmask) args.push('--nr-mask'); // heat map of the DLSS 5 change, <prefix>_nrmask.png
   if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) args.push('--upscale', String(opts.upscale));
   if (opts.rtxvsr)
-    args.push('--rtx-vsr'); // the plan runs it on an enlarging resize only
+    args.push('--rtx-vsr', ...vsrQArgs(vsrQ(opts.vsrquality))); // the plan runs it on an enlarging resize only
   else if (opts.fsrup) args.push('--fsr-upscale');
   if (opts.hdr)
     args.push(

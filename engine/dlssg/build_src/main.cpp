@@ -550,6 +550,8 @@ struct Host
         sl::DLSSGOptions go{};
         go.mode = sl::DLSSGMode::eOn;
         go.numFramesToGenerate = (uint32_t)genFrames;
+        go.mvecDepthWidth = panvec::vecSize(W);
+        go.mvecDepthHeight = panvec::vecSize(H);
         CHECK_SL(slDLSSGSetOptions(vp, go));
 
         // multi-frame support is a device/driver capability; refuse early when the requested
@@ -575,12 +577,13 @@ struct Host
         rowPitch = (W * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
 
         auto makeTex = [&](DXGI_FORMAT fmt, ComPtr<ID3D12Resource>& tex,
-                           D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) -> bool {
+                           D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE, uint32_t tw = W,
+                           uint32_t th = H) -> bool {
             D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
             D3D12_RESOURCE_DESC rd{};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            rd.Width = W;
-            rd.Height = H;
+            rd.Width = tw;
+            rd.Height = th;
             rd.DepthOrArraySize = 1;
             rd.MipLevels = 1;
             rd.Format = fmt;
@@ -603,8 +606,10 @@ struct Host
             return SUCCEEDED(
                 device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&buf)));
         };
-        if (!makeTex(frameFormat(), texFrame) || !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth) ||
-            !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        const uint32_t vw = panvec::vecSize(W), vh = panvec::vecSize(H);
+        if (!makeTex(frameFormat(), texFrame) ||
+            !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth, D3D12_RESOURCE_FLAG_NONE, vw, vh) ||
+            !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, vw, vh) ||
             !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadBuf) ||
             !makeBuf(D3D12_HEAP_TYPE_READBACK, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_COPY_DEST, readbackBuf))
         {
@@ -625,7 +630,7 @@ struct Host
             list->Reset(alloc.Get(), nullptr);
             D3D12_TEXTURE_COPY_LOCATION dl{texDepth.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             D3D12_TEXTURE_COPY_LOCATION sl_{uploadBuf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            sl_.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, W, H, 1, rowPitch};
+            sl_.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, vw, vh, 1, rowPitch};
             list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
             list->Close();
             ID3D12CommandList* ls[] = {list.Get()};
@@ -757,18 +762,18 @@ struct Host
         list->ResourceBarrier(1, &b);
         list->Close();
 
-        sl::Extent fullExtent{0, 0, W, H};
+        sl::Extent vecExtent{0, 0, panvec::vecSize(W), panvec::vecSize(H)};
         sl::Resource depthRes(
             sl::ResourceType::eTex2d, texDepth.Get(),
             (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-        depthRes.width = W;
-        depthRes.height = H;
+        depthRes.width = vecExtent.width;
+        depthRes.height = vecExtent.height;
         depthRes.nativeFormat = DXGI_FORMAT_R32_FLOAT;
         sl::Resource mvecRes(
             sl::ResourceType::eTex2d, texMvec.Get(),
             (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-        mvecRes.width = W;
-        mvecRes.height = H;
+        mvecRes.width = vecExtent.width;
+        mvecRes.height = vecExtent.height;
         mvecRes.nativeFormat = DXGI_FORMAT_R16G16_FLOAT;
         // NOTE: do NOT tag kBufferTypeBackbuffer here, even with a null resource "just to silence
         // the extent warning": the tag flips sl.dlss_g into its subrect present path and the real
@@ -776,9 +781,9 @@ struct Host
         // returns the REAL frame (tween == right endpoint, verified). The extent
         // warning it would silence is benign and filtered in slLog instead.
         sl::ResourceTag tags[] = {
-            sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &fullExtent),
+            sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &vecExtent),
             sl::ResourceTag(&mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
-                            &fullExtent),
+                            &vecExtent),
         };
         if (slSetTagForFrame(*tok, vp, tags, _countof(tags), nullptr) != sl::Result::eOk)
             return false;
@@ -1494,6 +1499,8 @@ static int runServer(int genFrames, bool hdr10)
         sl::DLSSGOptions on{};
         on.mode = sl::DLSSGMode::eOn;
         on.numFramesToGenerate = (uint32_t)genFrames;
+        on.mvecDepthWidth = panvec::vecSize(W);
+        on.mvecDepthHeight = panvec::vecSize(H);
         if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
             return false;
         for (int i = 0; i < 2; i++)
@@ -1864,6 +1871,8 @@ static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& t
         sl::DLSSGOptions on{};
         on.mode = sl::DLSSGMode::eOn;
         on.numFramesToGenerate = (uint32_t)genFrames;
+        on.mvecDepthWidth = panvec::vecSize(W);
+        on.mvecDepthHeight = panvec::vecSize(H);
         if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
             return false;
         for (int i = 0; i < 2; i++)

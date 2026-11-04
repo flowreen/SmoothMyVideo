@@ -317,6 +317,24 @@ def c_dv(tmp, trt):
     assert any("DOVI" in s for s in stream_side_data(out)), "DOVI configuration record missing"
 
 
+@case("--rtx-hdr --dv --dv-profile 8.4 -> HLG video + DOVI 8.4 record")
+def c_dv84(tmp, trt):
+    if not _rtx_ready():
+        return "SKIP (RTX runtime not installed)"
+    if not os.path.isfile(os.path.join(ENGINE, "dvtools", "dovi_tool.exe")):
+        return "SKIP (dovi_tool not installed)"
+    out = os.path.join(tmp, "s_dv84.mp4")
+    rc, _ = render(SAMPLE, out, "--rtx-hdr", "--dv", "--dv-profile", "8.4", "--no-interp")
+    assert rc == 0, "engine exit " + str(rc)
+    assert frames(out) == 25, f"frames {frames(out)} != 25"
+    st = probe_json(out, "-select_streams", "v:0", "-show_streams")["streams"][0]
+    assert st.get("color_transfer") == "arib-std-b67", f"transfer {st.get('color_transfer')}, not HLG"
+    dovi = [d for d in st.get("side_data_list", []) if "DOVI" in d.get("side_data_type", "")]
+    assert dovi and dovi[0].get("dv_profile") == 8 and dovi[0].get("dv_bl_signal_compatibility_id") == 4, \
+        f"DOVI record {dovi[:1]} is not Profile 8 with compatibility 4 (HLG)"
+    assert not any("Mastering" in s or "light level" in s for s in stream_side_data(out)), "HDR10 boxes on HLG"
+
+
 @case("--rtx-hdr(rtx) --hdr10plus -> ST 2094-40 frame SEI")
 def c_hp(tmp, trt):
     if not _rtx_ready():
@@ -361,6 +379,19 @@ def c_dlss_onepass(tmp, trt):
     assert "model dlss 4.5, dlss 5" in err, "the host ready line does not carry both passes"
     left = [n for n in os.listdir(tmp) if ".dlss-interp-" in n]
     assert not left, "an intermediate was written: " + ", ".join(left)
+
+
+@case("--dlssg --fps 60 -> 5x, every 2nd frame = 59.94 fps, 61 frames")
+def c_dlss_fps(tmp, trt):
+    # DLSS 4.5 makes whole multiples only: a target between them renders the multiple whose every k-th frame lands on
+    # it (native.ts dlssgFpsPlan; 23.976 -> 60 = 5x, every 2nd), the encode keeping those frames
+    if not os.path.isfile(os.path.join(ENGINE, "dlssg", "dlssg2f.exe")):
+        return "SKIP (DLSS-G host not present)"
+    out = os.path.join(tmp, "s_dlssfps.mp4")
+    rc, err = render(SAMPLE, out, "--dlssg", "--fps", "60")
+    assert rc == 0, "engine exit " + str(rc) + ": " + err[-300:]
+    assert "5x, then every 2nd frame = 59.940 fps" in err, "the DLSS 4.5 plan line is missing from stderr"
+    assert frames(out) == 61, f"frames {frames(out)} != 61"
 
 
 LIVE_EXE = os.path.join(ENGINE, "live", "smv-live.exe")
@@ -467,7 +498,7 @@ def c_live_rife(tmp, trt):
 
 
 QUICK = [c_2x, c_fps60, c_noint, c_blend, c_nvof, c_rife_flow, c_vfr, c_live_echo]
-FULL = [c_rife_native, c_5x, c_av1, c_encsplit, c_vvc, c_hdr, c_dv, c_hp, c_dlss_onepass,
+FULL = [c_rife_native, c_5x, c_av1, c_encsplit, c_vvc, c_hdr, c_dv, c_dv84, c_hp, c_dlss_onepass, c_dlss_fps,
         c_live_rife]
 
 

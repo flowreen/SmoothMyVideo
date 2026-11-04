@@ -2012,6 +2012,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     sl::DLSSGOptions on{};
                     on.mode = sl::DLSSGMode::eOn;
                     on.numFramesToGenerate = (uint32_t)want;
+                    on.mvecDepthWidth = panvec::vecSize(W);
+                    on.mvecDepthHeight = panvec::vecSize(H);
                     if (slDLSSGSetOptions(host.vp, on) == sl::Result::eOk)
                         host.genFrames = want;
                     LOG("measured ~%.1f fps source, target %d fps: DLSS-G %dx\n", srcMeasFps, g_targetFps,
@@ -2162,7 +2164,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const size_t capBytes = (size_t)capW * capH * 4; // capture-size frames (server input)
         std::vector<uint8_t> buf(capBytes), lastBuf(capBytes);
         bool lastInUpload = false; // the frame presented last is the upload buffer's (the pass from the mapped capture)
-        bool lastInTex = false;    // ... or texFrame's (that pass through the GPU handoff)
+        bool lastInTex = false;    // ... or the GPU handoff's last slot (host.dgLast; that pass through the handoff)
         // the GPU handoff for that pass (Capture::dgInit; SMV_LIVE_DGPU=0 = off, =fail = its fallback): set up at its
         // first frame, once a session
         bool dgWanted = true;
@@ -2292,6 +2294,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             sl::DLSSGOptions on{};
             on.mode = sl::DLSSGMode::eOn;
             on.numFramesToGenerate = (uint32_t)gen;
+            on.mvecDepthWidth = panvec::vecSize(W);
+            on.mvecDepthHeight = panvec::vecSize(H);
             if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
                 return false;
             host.genFrames = gen;
@@ -2346,9 +2350,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         };
         // the frame presented last, again (an estimate of a repeated frame is zero vectors either way)
         auto presentLast = [&] {
-            return lastInTex      ? host.presentTail(nullptr, 0, 0)
-                   : lastInUpload ? host.presentTail(host.uploadBuf.Get(), 0, host.rowPitch)
-                                  : host.presentFrame(lastBuf.data());
+            if (lastInTex)
+            {
+                // the GPU handoff's last slot again: the capture device rewrites it only after this copy too
+                const bool ok = host.presentTail(nullptr, 0, 0);
+                if (ok && host.dgLast >= 0)
+                    cap.dgFree[host.dgLast] = host.dgCopiedVal;
+                return ok;
+            }
+            return lastInUpload ? host.presentTail(host.uploadBuf.Get(), 0, host.rowPitch)
+                                : host.presentFrame(lastBuf.data());
         };
         auto resetFG = [&]() -> bool {
             sl::DLSSGOptions off{};
@@ -2361,6 +2372,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             sl::DLSSGOptions on{};
             on.mode = sl::DLSSGMode::eOn;
             on.numFramesToGenerate = (uint32_t)genFrames;
+            on.mvecDepthWidth = panvec::vecSize(W);
+            on.mvecDepthHeight = panvec::vecSize(H);
             if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
                 return false;
             for (int i = 0; i < 2; i++)
@@ -3279,8 +3292,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             return (host.maxGen ? (int)(std::min)(host.maxGen, 5u) : 5) + 1;
         };
         // the video memory stage 1 takes: Streamline's own estimate for its DLSS-G (6 back buffers, m1 - 1 generated
-        // frames; without one, S0 (c)'s figures: ~250 MiB a megapixel + 60) + its ring of 12 shared frames, its 3 tagged
-        // inputs and its 6 back buffers
+        // frames; without one, S0 (c)'s figures: ~250 MiB a megapixel + 60) + its ring of 12 shared frames, its tagged
+        // frame, its depth and vectors (panvec::vecSize: a quarter of a frame each) and its 6 back buffers
         auto cascPrice = [&](int m1) -> uint64_t {
             const uint64_t frame = (uint64_t)cascW * cascH * 4;
             sl::DLSSGOptions eo{};
@@ -3288,8 +3301,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             eo.numFramesToGenerate = (uint32_t)(m1 - 1);
             eo.flags = sl::DLSSGFlags::eRequestVRAMEstimate;
             eo.numBackBuffers = 6;
-            eo.colorWidth = eo.mvecDepthWidth = cascW;
-            eo.colorHeight = eo.mvecDepthHeight = cascH;
+            eo.colorWidth = cascW;
+            eo.colorHeight = cascH;
+            eo.mvecDepthWidth = panvec::vecSize(cascW);
+            eo.mvecDepthHeight = panvec::vecSize(cascH);
             eo.colorBufferFormat = (uint32_t)host.backbuffers[0]->GetDesc().Format;
             eo.mvecBufferFormat = DXGI_FORMAT_R16G16_FLOAT;
             eo.depthBufferFormat = DXGI_FORMAT_R32_FLOAT;
@@ -3297,7 +3312,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             uint64_t est = slDLSSGGetState(host.vp, es, &eo) == sl::Result::eOk ? es.estimatedVRAMUsageInBytes : 0;
             if (!est)
                 est = ((uint64_t)60 << 20) + frame / 4 * 250;
-            return est + 21 * frame;
+            return est + 19 * frame + 2 * (uint64_t)panvec::vecSize(cascW) * panvec::vecSize(cascH) * 4;
         };
         // stage 1 lost, failed or not wanted any more: end it, release stage 2's waits on its fence, one pass again
         auto cascFallback = [&](const char* why) -> bool {

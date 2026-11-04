@@ -257,18 +257,18 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: GMFSS_Fortuna, union model (GMFlow with Softmax Splatting)">
-        <input type="checkbox" id="modelgmfss" checked
+      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS frame generation 310.9.16 through Streamline 2.14.16. The model is picked in the NVIDIA App (Graphics, DLSS Override - Model Presets, Frame Generation). Highest quality in SmoothMyVideo: Use 3D app setting, the default; Recommended, Preset A and Preset B give the same frames. Preset C, NVIDIA's lighter and faster model, lowers the quality here and renders files no faster. SmoothMyVideo runs no DLSS Super Resolution.">
+        <input type="checkbox" id="modeldlss"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        GMFSS <span class="hint">(AI, best quality for anime, the default; heavy on the GPU. Too slow? <span class="lonly">Lower the DLSS mode above, or pick</span><span class="vonly">Pick</span> NVIDIA Optical Flow below)</span>
+        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(AI frame generation from games, the fastest; the default on RTX 40 and 50; multi-pass for high fps targets)</span>
       </label>
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA Optical Flow API 5.0, run by the driver on the GPU's optical-flow engine. Quality: Slow, the engine's highest quality level.">
-        <input type="checkbox" id="modelnvof"
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: GMFSS_Fortuna, union model (GMFlow with Softmax Splatting)">
+        <input type="checkbox" id="modelgmfss" checked
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">NVIDIA Optical Flow</span> <span class="hint">(NVIDIA's optical-flow hardware: really high fps, light on the GPU, friendly to slower PCs; very fast motion goes soft)</span>
+        GMFSS <span class="hint">(AI, best quality for anime; heavy on the GPU. Too slow? <span class="lonly">Lower the DLSS mode above, or pick</span><span class="vonly">Pick</span> NVIDIA Optical Flow below)</span>
       </label>
     </div>
     <div class="row">
@@ -289,10 +289,10 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" id="modeldlsslabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA DLSS frame generation 310.9.16 through Streamline 2.14.16. The model is picked in the NVIDIA App (Graphics, DLSS Override - Model Presets, Frame Generation). Highest quality in SmoothMyVideo: Use 3D app setting, the default; Recommended, Preset A and Preset B give the same frames. Preset C, NVIDIA's lighter and faster model, lowers the quality here and renders files no faster. SmoothMyVideo runs no DLSS Super Resolution.">
-        <input type="checkbox" id="modeldlss"
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA Optical Flow API 5.0, run by the driver on the GPU's optical-flow engine. Quality: Slow, the engine's highest quality level.">
+        <input type="checkbox" id="modelnvof"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        <span style="white-space:nowrap;">NVIDIA DLSS 4.5</span> <span class="hint">(AI frame generation from games; adds the same number of new frames between every two; multi-pass for high fps targets)</span>
+        <span style="white-space:nowrap;">NVIDIA Optical Flow</span> <span class="hint">(NVIDIA's optical-flow hardware: really high fps, light on the GPU, friendly to slower PCs; very fast motion goes soft)</span>
       </label>
     </div>
     <div class="row">
@@ -403,10 +403,17 @@
     </div>
     <div class="row">
       <span class="k"></span>
-      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA RTX Video Super Resolution 1.6.0 (RTX Video SDK). Quality: Ultra, the highest of its levels.">
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" title="Version: NVIDIA RTX Video Super Resolution 1.6.0 (RTX Video SDK). Quality: the slider below, 4 = Ultra, the highest of its levels (the default).">
         <input type="checkbox" id="rtxvsr" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         RTX Video Super Resolution <span class="hint">(NVIDIA's AI upscaler, used when <span class="vonly">the Size is above the source</span><span class="lonly">Fill screen or a DLSS mode below DLAA enlarges</span>)</span>
       </label>
+    </div>
+    <div class="row" id="vsrqwrap" style="display:flex;align-items:center;gap:8px;" title="RTX VSR's quality level. 4 = Ultra, the highest (the default); a lower level costs less GPU time a frame: 3 about 3/4 of level 4's, 2 about 1/3, 1 about 1/4.">
+      <span class="k"></span>
+      <span class="hint" style="padding-left:22px;">Quality</span>
+      <span class="defmark" style="--def:calc(100% - 8px)"><input id="vsrq" type="range" min="1" max="4" step="1" value="4" aria-label="RTX VSR quality"
+             style="width:120px;padding:0;border:0;background:transparent;accent-color:var(--green);"></span>
+      <span class="v" id="vsrqnum">4</span>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -503,13 +510,20 @@
   <div class="panel vonly" id="dvpanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">Dolby Vision</span>
-      <span class="hint">Opt-in. Adds Profile 8.1 metadata to the HDR10 render (open-source dovi_tool); still plain HDR10 elsewhere. For LG, Sony and most streaming boxes; not Samsung TVs.</span>
+      <span class="hint">Opt-in. Adds Dolby Vision metadata to the HDR render (open-source dovi_tool). For LG, Sony and most streaming boxes; not Samsung TVs. Profile 8.1 keeps the HDR10 video, which other TVs play as HDR10. Profile 8.4 writes the video as HLG, which other HDR TVs play as HDR and SDR TVs show close to right.</span>
     </div>
     <div class="row">
       <span class="k"></span>
       <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
         <input type="checkbox" id="dvexport" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
-        Add Dolby Vision metadata (Profile 8.1) <span class="hint" id="dvhint">(needs RTX HDR on)</span>
+        Add Dolby Vision Profile 8.1 (HDR10 video, works with HDR10+) <span class="hint" id="dvhint">(needs RTX HDR on)</span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="dv84export" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        Add Dolby Vision Profile 8.4 (HLG video, up to 1000 nits) <span class="hint" id="dv84hint">(needs RTX HDR on)</span>
       </label>
     </div>
     <div id="dvsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
@@ -522,13 +536,13 @@
         <button id="dvbrowsezip" class="mini">Choose .zip&hellip;</button>
       </div>
     </div>
-    <div class="hint" style="margin-top:8px;line-height:1.5">Profile 8.1 metadata is generated by the third-party open-source dovi_tool. Not affiliated with, endorsed by, or certified by Dolby Laboratories; "Dolby" and "Dolby Vision" are their trademarks.</div>
+    <div class="hint" style="margin-top:8px;line-height:1.5">Dolby Vision metadata is generated by the third-party open-source dovi_tool. Not affiliated with, endorsed by, or certified by Dolby Laboratories; "Dolby" and "Dolby Vision" are their trademarks.</div>
   </div>
 
   <div class="panel vonly" id="hppanel">
     <div class="row" style="margin-bottom:2px">
       <span class="k">HDR10+</span>
-      <span class="hint">Opt-in. Adds HDR10+ metadata (SMPTE ST 2094-40) to the HDR10 render (open-source hdr10plus_tool); still plain HDR10 elsewhere. For Samsung and other HDR10+ TVs; works beside Dolby Vision in one file.</span>
+      <span class="hint">Opt-in. Adds HDR10+ metadata (SMPTE ST 2094-40) to the HDR10 render (open-source hdr10plus_tool); still plain HDR10 elsewhere. For Samsung and other HDR10+ TVs; works beside Dolby Vision 8.1 in one file, not with 8.4 (its HLG video).</span>
     </div>
     <div class="row">
       <span class="k"></span>

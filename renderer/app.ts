@@ -618,8 +618,20 @@ if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // de
 $('fsrup').checked = localStorage.getItem('fsrupOn') === '1';   // default OFF: RTX VSR is the default upscaler
 if($('fsrup').checked) $('rtxvsr').checked = false;
 function fsrUpOn(){ return $('fsrup').checked && !$('rtxvsr').checked; }
-$('rtxvsr').onchange = () => { localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0'); if($('rtxvsr').checked && $('fsrup').checked){ $('fsrup').checked = false; localStorage.setItem('fsrupOn', '0'); } syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
-$('fsrup').onchange = () => { localStorage.setItem('fsrupOn', $('fsrup').checked ? '1' : '0'); if($('fsrup').checked && $('rtxvsr').checked){ $('rtxvsr').checked = false; localStorage.setItem('vsrOn', '0'); } syncRtx(); syncUpscale(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} fsrWarm(); };
+$('rtxvsr').onchange = () => { localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0'); if($('rtxvsr').checked && $('fsrup').checked){ $('fsrup').checked = false; localStorage.setItem('fsrupOn', '0'); } syncRtx(); syncUpscale(); syncVsrQ(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
+$('fsrup').onchange = () => { localStorage.setItem('fsrupOn', $('fsrup').checked ? '1' : '0'); if($('fsrup').checked && $('rtxvsr').checked){ $('rtxvsr').checked = false; localStorage.setItem('vsrOn', '0'); } syncRtx(); syncUpscale(); syncVsrQ(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} fsrWarm(); };
+// RTX VSR's quality level 1..4 (default 4 = Ultra, the highest): the slider beside the box, shown while it is ticked; it
+// persists, and goes to the host as --vsr-quality when it is not 4
+function vsrQuality(){ const q = Math.round(+$('vsrq').value); return q >= 1 && q <= 4 ? q : 4; }
+function syncVsrQ(){
+  $('vsrqwrap').style.display = $('rtxvsr').checked ? 'flex' : 'none';
+  $('vsrqnum').textContent = String(vsrQuality());
+}
+const savedVsrQ = localStorage.getItem('vsrQuality');
+if(savedVsrQ !== null) $('vsrq').value = savedVsrQ;
+syncVsrQ();
+$('vsrq').oninput = () => { localStorage.setItem('vsrQuality', $('vsrq').value); syncVsrQ(); try{ lvSendOpts(); }catch{} };
+$('vsrq').addEventListener('change', () => refreshPreviewIfOpen());
 $('rtxhdr').onchange = () => { localStorage.setItem('rtxhdrOn', $('rtxhdr').checked ? '1' : '0'); syncRtx(); syncHdrColor(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 syncRtx();
 // Populate readiness on load so the upscale backend label is right even before the RTX panel opens.
@@ -747,6 +759,7 @@ syncDlssnr();
 // it just reveals a one-time installer when the runtime is missing, and a render only uses FRUC once
 // it is installed - otherwise it falls back to GMFSS (see modelIsFruc + the run payload gate below).
 let frucReady = false, frucBridge = false, dlssReady = false, dlssMissing = [];
+let dlssDefault = false;   // DLSS 4.5 is the default model: its files present, an RTX 40 / 50 GPU, GPU scheduling on
 function modelIsFruc(){ return $('modelfruc').checked && frucReady; }
 function modelIsDlss(){ return $('modeldlss').checked && dlssReady; }
 // RIFE ships bundled (weights vendored in engine/rife), so it is always ready.
@@ -780,8 +793,8 @@ async function refreshFrucState(){
   catch { frucReady = false; frucBridge = false; }
   // DLSS ("DLSS 4.5" Frame Generation) ships bundled, so not-ready means files were deleted from
   // engine/dlssg (a broken install); GPU/driver support is only knowable at render time.
-  try { const d = await ipcRenderer.invoke('dlssg-ready'); dlssReady = !!(d && d.ready); dlssMissing = (d && d.missing) || []; }
-  catch { dlssReady = false; dlssMissing = []; }
+  try { const d = await ipcRenderer.invoke('dlssg-ready'); dlssReady = !!(d && d.ready); dlssMissing = (d && d.missing) || []; dlssDefault = dlssReady && !!(d && d.supported); }
+  catch { dlssReady = false; dlssMissing = []; dlssDefault = false; }
 }
 // Reflect the current model choice: show a setup hint only while the chosen model's runtime is
 // missing (FRUC has a one-time DLL installer).
@@ -800,15 +813,6 @@ function syncModel(){
     $('dlsssetup').style.display = 'block';
   } else {
     $('dlsssetup').style.display = 'none';
-  }
-  // DLSS-FG has no arbitrary-timestep API: it makes only the evenly spaced frames between
-  // consecutive source frames, i.e. whole multipliers (one pass up to the GPU's own limit, more
-  // in passes, the engine's per-GPU plan). Picking it with an off-grid target snaps the fps box
-  // to exactly 2x the source (the steppers stay usable; a bad target is blocked with guidance at
-  // Smooth It! time).
-  if($('modeldlss').checked && dlssReady && info){
-    const gm = gridMulti();
-    if(gm < 2 && speedMode() === 'fps') setFps(srcFps() * 2);
   }
   if($('modelfruc').checked && !frucReady){
     $('frucstatus').textContent = '✗ NOT READY'; $('frucstatus').style.color = '#e85c5c';
@@ -861,7 +865,9 @@ function restoreModelChoice(){
     for(const b of MODEL_BOXES()) b.checked = false;
     return;
   }
-  const box = saved === 'fruc' ? 'modelfruc' : saved === 'fsrfg' ? 'modelfsrfg'
+  // no saved choice (a first start): DLSS 4.5 where it runs, else GMFSS
+  const box = saved === null ? (dlssDefault ? 'modeldlss' : 'modelgmfss')
+            : saved === 'fruc' ? 'modelfruc' : saved === 'fsrfg' ? 'modelfsrfg'
             : saved === 'dlssg' ? 'modeldlss' : saved === 'rife' ? 'modelrife'
             : saved === 'nvof' ? 'modelnvof' : 'modelgmfss';
   for(const b of MODEL_BOXES()) b.checked = false;
@@ -959,6 +965,7 @@ function lvSendOpts(){
     // resize that enlarges, the host picks it (none enlarges = skipped)
     sharpen: $('sharpen').checked ? parseFloat($('sharpval').value) || 0 : 0,
     rtxvsr: liveVsrOn(),
+    vsrquality: vsrQuality(),
     fsrup: fsrUpOn(),   // AMD FSR 4 takes the same resize when ticked instead of RTX VSR
     // no "Upscale to": Live's size is what Display presents (the window or the screen), the DLSS mode its speed
     // Restore (AI detail): Real-ESRGAN first on every presented frame, python route only
@@ -1215,8 +1222,11 @@ if(!input){
 // itself (hdr10_meta.inject_dv_config), so no GPAC/MP4Box is involved. The setup box appears when the
 // toggle is on and dovi_tool is missing, and collapses to nothing once it is installed (dv-ready).
 let dvReady = { dovi:false, ready:false };
+// Two Dolby Vision boxes that exclude each other: Profile 8.1 on the HDR10 video, 8.4 with the video written as HLG
+// (HDR10+ rides on HDR10 only, so 8.4 and HDR10+ exclude each other too)
+function dvOn(){ return $('dvexport').checked || $('dv84export').checked; }
 function syncDv(){
-  if($('dvexport').checked) checkDvReady();
+  if(dvOn()) checkDvReady();
   else $('dvsetup').style.display = 'none';
   updateDvHpHints();
 }
@@ -1226,10 +1236,11 @@ function syncDv(){
 // name resolves to .mkv. Pure text updates (no IPC), safe to call from refresh() on every change.
 function updateDvHpHints(){
   const mkv = (lastOut || '').toLowerCase().endsWith('.mkv');
-  const hint = (name) => !$('rtxhdr').checked ? '(needs RTX HDR on)'
+  const hint = (name, base = 'HDR10') => !$('rtxhdr').checked ? '(needs RTX HDR on)'
     : mkv ? '(skipped for this video: its tracks need MKV output, ' + name + ' needs MP4)'
-    : '(HDR10-compatible, falls back to HDR10)';
+    : "(plays as " + base + " where " + name + " isn't supported)";
   $('dvhint').textContent = hint('Dolby Vision');
+  $('dv84hint').textContent = hint('Dolby Vision', 'HLG');
   $('hphint').textContent = hint('HDR10+');
 }
 async function checkDvReady(){
@@ -1261,8 +1272,21 @@ async function doDvInstall(source){
 $('dvget').onclick = () => ipcRenderer.invoke('dv-open-download');
 $('dvbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('dv-choose'); if(p) doDvInstall(p); };   // selecting auto-installs
 if(localStorage.getItem('dvOn') === '1') $('dvexport').checked = true;   // default OFF
-$('dvexport').onchange = () => { localStorage.setItem('dvOn', $('dvexport').checked ? '1' : '0'); syncDv(); };
-$('rtxhdr').addEventListener('change', () => { if($('dvexport').checked) syncDv(); });   // hint tracks HDR state
+if(localStorage.getItem('dv84On') === '1' && !$('dvexport').checked) $('dv84export').checked = true;   // default OFF
+$('dvexport').onchange = () => {
+  localStorage.setItem('dvOn', $('dvexport').checked ? '1' : '0');
+  if($('dvexport').checked && $('dv84export').checked){ $('dv84export').checked = false; localStorage.setItem('dv84On', '0'); }
+  syncDv();
+};
+$('dv84export').onchange = () => {
+  localStorage.setItem('dv84On', $('dv84export').checked ? '1' : '0');
+  if($('dv84export').checked){
+    if($('dvexport').checked){ $('dvexport').checked = false; localStorage.setItem('dvOn', '0'); }
+    if($('hpexport').checked){ $('hpexport').checked = false; localStorage.setItem('hpOn', '0'); syncHp(); }
+  }
+  syncDv();
+};
+$('rtxhdr').addEventListener('change', () => { if(dvOn()) syncDv(); });   // hint tracks HDR state
 syncDv();
 
 // --- HDR10+ export tool (mirrors the Dolby Vision flow) ------------------------------------------
@@ -1304,8 +1328,12 @@ async function doHpInstall(source){
 }
 $('hpget').onclick = () => ipcRenderer.invoke('hp-open-download');
 $('hpbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('hp-choose'); if(p) doHpInstall(p); };   // selecting auto-installs
-if(localStorage.getItem('hpOn') === '1') $('hpexport').checked = true;   // default OFF
-$('hpexport').onchange = () => { localStorage.setItem('hpOn', $('hpexport').checked ? '1' : '0'); syncHp(); };
+if(localStorage.getItem('hpOn') === '1' && !$('dv84export').checked) $('hpexport').checked = true;   // default OFF
+$('hpexport').onchange = () => {
+  localStorage.setItem('hpOn', $('hpexport').checked ? '1' : '0');
+  if($('hpexport').checked && $('dv84export').checked){ $('dv84export').checked = false; localStorage.setItem('dv84On', '0'); syncDv(); }
+  syncHp();
+};
 $('rtxhdr').addEventListener('change', () => { if($('hpexport').checked) syncHp(); });   // hint tracks HDR state
 syncHp();
 
@@ -1366,7 +1394,7 @@ let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown 
 function prevSettingsSig(){                 // everything that changes what the processed pane shows
   const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
   return [sharpStrength(), restoreOn(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
-          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), fsrUpOn(), nrOn(), nrStructure(), nrTone(), nrStyle(), nrPasses(), nrMaskOn(),
+          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), vsrQuality(), fsrUpOn(), nrOn(), nrStructure(), nrTone(), nrStyle(), nrPasses(), nrMaskOn(),
           dlssMode()];
 }
 let lastPrevInput = null;                    // which video the shown original belongs to
@@ -1403,7 +1431,7 @@ async function loadPreview(frame, bg?){   // bg: background "refine" pass (the R
     { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), hdr: useHdr,
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
       upscale: upFactor() || 0,
-      rtxvsr: useVsr, fsrup: useFsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
+      rtxvsr: useVsr, vsrquality: vsrQuality(), fsrup: useFsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
       hdrColorPayload())); }
   catch(e){ r = { error: String(e) }; }
   setSpin($('prevprocwrap'), $('prevspin'), false);
@@ -1660,7 +1688,7 @@ function cmpOpts(frame, a, b, multi, pairs){   // main's 'compare' request at th
   return Object.assign(
     { input, frame, modelA: a, modelB: b, multi, pairs, sharpen: sharpStrength(), restore: restoreOn(), hdr: hdrOn(),
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(), upscale: upFactor() || 0,
-      rtxvsr: !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1), fsrup: fsrUpOn() && upFactor() > 1,
+      rtxvsr: !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1), vsrquality: vsrQuality(), fsrup: fsrUpOn() && upFactor() > 1,
       dlssnr: nrOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
     hdrColorPayload());
 }
@@ -1893,11 +1921,12 @@ document.addEventListener('drop', (e) => {
   } else if(/hdr10plus_tool/i.test(nm)){       // the hdr10plus_tool download: install into engine/hptools
     showWorkspace();
     $('hpexport').checked = true; localStorage.setItem('hpOn', '1');   // engage the HDR10+ panel so its setup box is coherent
+    if($('dv84export').checked){ $('dv84export').checked = false; localStorage.setItem('dv84On', '0'); syncDv(); }   // HDR10+ excludes 8.4's HLG video
     $('hpsetup').style.display = 'block';       // reveal install feedback
     doHpInstall(p);
   } else if(/dovi_tool/i.test(nm) || /\.exe$/i.test(nm)){   // the dovi_tool download: install into engine/dvtools
     showWorkspace();
-    $('dvexport').checked = true; localStorage.setItem('dvOn', '1');   // engage the DV panel so its setup box is coherent
+    if(!dvOn()){ $('dvexport').checked = true; localStorage.setItem('dvOn', '1'); }   // engage the DV panel so its setup box is coherent
     $('dvsetup').style.display = 'block';       // reveal install feedback
     doDvInstall(p);
   } else if(/\.zip$/i.test(nm)){               // otherwise a .zip is the RTX Video SDK: install the RTX runtime
@@ -1935,14 +1964,8 @@ function startRun(){
   if(interpOn() && Math.round(t) <= Math.round(srcFps())){
     alert('A 1× target adds no frames (output fps = source fps). Raise the target above ' + Math.round(srcFps())
         + ' fps to smooth, or turn off Interpolate to just sharpen / re-encode.'); return; }
-  // DLSS-FG only generates the evenly spaced frames between consecutive frames: whole multipliers
-  // on the source grid (multi-frame generation). There is no timestep to ask for anything else,
-  // so block with guidance (mirrors the 1x block). Above one pass's limit (RTX 50 6x, RTX 40 2x)
-  // the engine runs passes; a multiple no passes reach (7x, 11x) gets its own clear error.
-  if(interpOn() && modelIsDlss() && gridMulti() < 2){
-    alert('DLSS 4.5 interpolates at whole multiples of the source fps (2× = '
-        + (2*srcFps()).toFixed(targetDecimals()) + ' fps, 3× = ' + (3*srcFps()).toFixed(targetDecimals())
-        + ' fps for this video). Pick one of those, or GMFSS for any other target.'); return; }
+  // DLSS 4.5 makes only whole multiples; a target between them goes to the render as --fps, which runs the smallest
+  // multiple whose every k-th frame lands on it (24 -> 60 = 5x, every 2nd) and says so in the log
   const sharpenStrength = $('sharpen').checked ? parseFloat($('sharpval').value) : 0;
   const dims = upDims();                               // resize target ({w,h} or null)
   const factor = upFactor();                           // arbitrary resize factor (0 = off, <1 downscales)
@@ -1979,7 +2002,7 @@ function startRun(){
   }
   modeBtnUi(true);
   $('cmpto').disabled = true;   // Compare waits for the render (syncCompareUi at engine-done)
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlssrange').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('fsrup').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlssrange').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('vsrq').disabled = true; $('fsrup').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   const passes = []; if(restoreOn()) passes.push('restoring'); if(factor > 0) passes.push(factor < 1 ? 'downscaling' : 'upscaling'); if(rtxhdr) passes.push('HDR'); if(sharpenStrength > 0) passes.push('sharpening');
   const offLabel = (passes.join(' + ') || 'processing').replace(/^./, c => c.toUpperCase()) + '...';
@@ -2008,7 +2031,7 @@ function startRun(){
   if(factor > 0){
     payload.upscale = factor;                          // arbitrary upscale factor (target height / source)
   }
-  if(useRtxVsr) payload.rtxvsr = true;                 // AI upscale via the RTX Video SDK (else Lanczos3)
+  if(useRtxVsr){ payload.rtxvsr = true; payload.vsrquality = vsrQuality(); }   // AI upscale via the RTX Video SDK (else Lanczos3)
   if(useFsrUp) payload.fsrup = true;                   // AMD FSR 4 upscaling (engine/fsrup)
   if(!$('gpufit').checked) payload.nogpufit = true;    // no video memory fit: the same fps, slower when memory runs short
   if(rtxhdr){ payload.rtxhdr = true;     // HDR10 at the Peak box's nits or the app window's display's
@@ -2019,8 +2042,8 @@ function startRun(){
     payload.hdrcon = sdkCon();                                     // SDK Contrast (100 = neutral)
     payload.hdrsb = effSatBoost();                                 // vibrance uniform gain (0..1)
     payload.hdrvib = effVibrance();
-    if($('dvexport').checked && dvReady.ready) payload.dv = true;   // also export Dolby Vision 8.1 (needs HDR)
-    if($('hpexport').checked && hpReady.ready) payload.hp = true;   // also embed HDR10+ metadata (needs HDR)
+    if(dvOn() && dvReady.ready){ payload.dv = true; if($('dv84export').checked) payload.dvprofile = '8.4'; }   // also export Dolby Vision 8.1 / 8.4 (needs HDR)
+    if($('hpexport').checked && !$('dv84export').checked && hpReady.ready) payload.hp = true;   // also embed HDR10+ metadata (needs HDR; not on 8.4's HLG)
   }
   // no DLSS mode: a file render runs every pass at the output size (DLAA); the mode is Live's speed lever
   saveBatch([input, ...batch]);   // survives a crash/close: the next launch re-queues these files
@@ -2158,7 +2181,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
   clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
   modeBtnUi(lvState !== 'idle');
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlssrange').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('fsrup').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlssrange').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('vsrq').disabled=false; $('fsrup').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   syncCompareUi();
   if(cancelled){ $('status').textContent='Cancelled.'; log('>> Cancelled\n');

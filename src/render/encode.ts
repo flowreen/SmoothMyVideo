@@ -348,11 +348,27 @@ export function fullChroma(st: Stream): boolean {
  * through, or HDR10 forced. An RGB source has no YUV matrix or range to carry: the YUV output takes BT.709 (BT.601
  * below HD, the size rule of an untagged decode) at TV range. An untagged YUV source converts with the matrix
  * players assume for the output's size, and the conversion names it on the output. */
-export function colorArgs(hdrActive: boolean, st: Stream, outW: number, outH: number): [string[], string[], string] {
+export function colorArgs(
+  hdrActive: boolean,
+  st: Stream,
+  outW: number,
+  outH: number,
+  hlg = false,
+): [string[], string[], string] {
+  // the host's HDR frames are BT.2020 PQ (the -vf tags); `hlg` = the video is written as HLG, encodeVf converts them
   if (hdrActive) {
     return [
       ['range=tv', 'colorspace=bt2020nc', 'color_trc=smpte2084', 'color_primaries=bt2020'],
-      ['-color_range', 'tv', '-colorspace', 'bt2020nc', '-color_trc', 'smpte2084', '-color_primaries', 'bt2020'],
+      [
+        '-color_range',
+        'tv',
+        '-colorspace',
+        'bt2020nc',
+        '-color_trc',
+        hlg ? 'arib-std-b67' : 'smpte2084',
+        '-color_primaries',
+        'bt2020',
+      ],
       'bt2020nc',
     ];
   }
@@ -383,7 +399,8 @@ export function colorArgs(hdrActive: boolean, st: Stream, outW: number, outH: nu
  * input format leaves the conversion to swscale. `pad` = [w, h, padded w, padded h]: the frame padded on the planar
  * format (pad and fillborders take no semi-planar input), the padding = the edge pixels smeared, so no hard edge
  * rings into the visible blocks. `cut` = [w, h]: the frame cropped to it before the conversion (an odd size into
- * 4:2:0, which zimg refuses). */
+ * 4:2:0, which zimg refuses). `hlg` = the PQ frames converted to HLG in the same zimg step, BT.2100's 1000-nit
+ * nominal peak (203 nits = HLG 75 %, BT.2408); the HDR frames always take the zimg route (gbrp10le, BT.2020). */
 export function encodeVf(
   sp: string[],
   outPix: string,
@@ -391,6 +408,7 @@ export function encodeVf(
   matrix = '',
   pad: number[] | null = null,
   cut: number[] | null = null,
+  hlg = false,
 ): string {
   const tags = sp.length ? ['setparams=' + sp.join(':')] : [];
   const planarOut = outPix.startsWith('yuv444') ? 'yuv444p10le' : 'yuv420p10le';
@@ -406,7 +424,8 @@ export function encodeVf(
   const range = sp.includes('range=pc') ? 'full' : 'limited';
   return tags
     .concat([`format=${planarIn}`], cutF, [
-      `zscale=matrix=${ZSC_MATRIX[matrix]}:range=${range}:filter=lanczos:dither=none`,
+      `zscale=matrix=${ZSC_MATRIX[matrix]}:range=${range}${hlg ? ':transfer=arib-std-b67:npl=1000' : ''}:filter=lanczos:` +
+        'dither=none',
       `format=${planarOut}`,
     ])
     .concat(padF)
@@ -490,6 +509,9 @@ export interface EncodeInput {
   vidPart2: string;
   workPath: string;
   dvOrHp: boolean;
+  hlg?: boolean; // the HDR video as HLG (Dolby Vision 8.4's base layer), converted from the host's PQ frames
+  inRateStr?: string; // the host's frame rate when the file keeps only every `keep`-th frame (rateStr = the file's)
+  keep?: number; // > 1: the encode keeps every keep-th frame (DLSS 4.5 at a target between whole multiples)
 }
 
 /** The encode command and everything it is built from (render_encode.encode_plan). */
@@ -498,7 +520,7 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   const ultra = e.outW > NVENC_MAX || e.outH > NVENC_MAX;
   const [qargs, speedNote] = qualityArgs(e.venc, e.useNvenc, e.outLabel, e.dvOrHp, ultra, env);
   const prof = profileArgs(e.venc, outPix);
-  const [sp, color, matrix] = colorArgs(e.hdrActive, e.st, e.outW, e.outH);
+  const [sp, color, matrix] = colorArgs(e.hdrActive, e.st, e.outW, e.outH, !!e.hlg);
   // 4:2:0 holds no odd size (HEVC and VVC crop in steps of 2, zimg refuses it, NVENC rounds it down itself): an odd
   // frame is written at the even floor.
   const sub = outPix.startsWith('yuv444') ? 1 : 2;
@@ -513,7 +535,9 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   // the frames arrive as raw planes with no pixel shape: an anamorphic one is tagged on them, the encoder and the
   // container take it from there (the stream SAR, the bitstream's VUI)
   const sarTag = e.sar[0] !== e.sar[1] ? `,setsar=${e.sar[0]}/${e.sar[1]}` : '';
-  const vf = encodeVf(sp, outPix, e.encInFmt, matrix, pad, cut) + sarTag;
+  const keep = e.keep && e.keep > 1 ? e.keep : 1;
+  const vf =
+    (keep > 1 ? `framestep=${keep},` : '') + encodeVf(sp, outPix, e.encInFmt, matrix, pad, cut, !!e.hlg) + sarTag;
   const bsf = crop ? ['-bsf:v', `hevc_metadata=width=${encW}:height=${encH}`] : [];
   const tq = ultra ? ['-threads', '1', '-thread_queue_size', '1'] : [];
   let [maps, trackNotes] = trackMaps(e.outIsMkv, e.aud, e.sub, e.hasAttach);
@@ -552,7 +576,7 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
     '-s',
     `${e.outW}x${e.outH}`,
     '-r',
-    e.rateStr,
+    keep > 1 && e.inRateStr ? e.inRateStr : e.rateStr,
     ...tq,
     '-i',
     '-',
@@ -673,6 +697,7 @@ export interface Finalize {
   outIsMkv: boolean;
   hpActive: boolean;
   dvActive: boolean;
+  hlg?: boolean; // the video is HLG (Dolby Vision 8.4): no HDR10 static boxes
   resumeDvhpNote: string;
   fragCopy: boolean;
   fragFlags: string[];
@@ -698,7 +723,8 @@ function removeQuiet(p: string): void {
 
 /** Finish the container (the routes sit on render_encode.finalize_output). */
 export function finalizeOutput(f: Finalize): void {
-  const hdr10 = (target: string) => writeHdr10Metadata(target, f.hdrActive, f.rtx, f.nits, f.masterPrim, f.say);
+  const hdr10 = (target: string) =>
+    writeHdr10Metadata(target, f.hdrActive && !f.hlg, f.rtx, f.nits, f.masterPrim, f.say);
   const remux = (vidSrc: string, dst: string) =>
     remuxTracks(f.ffmpeg, f.inp, f.stage2Maps, f.fragCopy, f.fragFlags, vidSrc, dst, f.say);
 

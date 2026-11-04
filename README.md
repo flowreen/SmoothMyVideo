@@ -102,15 +102,16 @@ setup box; you can also drop the file onto the window (not for Smooth Motion).
 
 ## Models
 
-One model at a time; every model works in videos and in Live. **GMFSS** is the default. Untick every model to only
-enhance the picture, without adding frames. Hover a row in the app to see its exact version.
+One model at a time; every model works in videos and in Live. **NVIDIA DLSS 4.5** is the default on RTX 40 and 50 GPUs
+(with Windows' hardware-accelerated GPU scheduling on), **GMFSS** on other GPUs. Untick every model to only enhance the
+picture, without adding frames. Hover a row in the app to see its exact version.
 
 | Model | Best for | Needs | Notes |
 |---|---|---|---|
-| **GMFSS** (default) | Anime | Any RTX GPU | The cleanest frames, even at high multipliers; the heaviest on the GPU. |
-| **NVIDIA Optical Flow** | Slower PCs, fast renders, moderate motion | Any RTX GPU | Runs on a dedicated part of the GPU, so it is fast. Very fast motion turns into a soft double image instead of breaking up. Videos need a whole multiplier (2&times;, 3&times; ...). |
+| **NVIDIA DLSS 4.5** (DLSS Frame Generation; default on RTX 40/50) | Most videos, high frame rates, Live | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | NVIDIA's game frame generation, on video, and the fastest model. Makes whole multiples of the source rate; any other target is reached evenly by making more and keeping some (24 to 60 fps = 5&times;, every 2nd frame), else the first whole multiple above it. Past the GPU's limit (6&times; on an RTX 50, 2&times; on an RTX 40) it goes multi-pass, e.g. 12&times; = 6&times; then 2&times;. |
+| **GMFSS** (default on other GPUs) | Anime | Any RTX GPU | The cleanest frames, even at high multipliers; the heaviest on the GPU. |
 | **RIFE** (Practical-RIFE 4.26 heavy) | Live action, filmed content | Any RTX GPU | A strong all-round model. Its **DRBA** option (for anime) keeps characters moving at their drawn pace while camera pans get fully smooth; in Live it adds one frame of delay. |
-| **NVIDIA DLSS 4.5** (DLSS Frame Generation) | NVIDIA's game frame generation, on video | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | Whole multipliers only. Past the GPU's limit (6&times; on an RTX 50, 2&times; on an RTX 40) it goes multi-pass, e.g. 12&times; = 6&times; then 2&times;. |
+| **NVIDIA Optical Flow** | Slower PCs, fast renders, moderate motion | Any RTX GPU | Runs on a dedicated part of the GPU, so it is fast. Very fast motion turns into a soft double image instead of breaking up. Videos need a whole multiplier (2&times;, 3&times; ...). |
 | **AMD FSR 4** frame generation | A different AI look | Any RTX GPU | AMD's AI frame generation, running on NVIDIA GPUs. Fine edges can break up on fast anime motion, where GMFSS stays clean. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
 | **NVIDIA Smooth Motion** | Legacy: a non-AI reference | Any RTX GPU | The same technology as the NVIDIA driver's Smooth Motion. The lowest quality of the models. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
 
@@ -147,9 +148,10 @@ In the preview, **Show changed pixels** turns the Processed pane into a heat map
   still picture stays perfectly still.
 * 📏 **One Size control.** Pick the output **Size**: Off, your screen's resolution, 720p up to 8640p, or a custom
   height (240p to 16K). Above 4K, the AI work runs at 4K and the result is enlarged at the end.
-* 🌈 **Proper HDR10**, with real brightness data and accurate colour. Optional **Dolby Vision** (plays as HDR10 where
-  Dolby Vision isn't supported) and **HDR10+**, together or apart. Both need RTX HDR, HEVC and an MP4 file; the app
-  tells you when it has to skip them.
+* 🌈 **Proper HDR10**, with real brightness data and accurate colour. Optional **Dolby Vision** and **HDR10+**,
+  together or apart. Dolby Vision comes two ways: Profile 8.1 keeps the HDR10 video (other TVs play HDR10), Profile
+  8.4 writes the video as HLG (other HDR TVs play HDR, SDR TVs show it close to right; not combined with HDR10+). All
+  need RTX HDR, HEVC and an MP4 file; the app tells you when it has to skip them.
 * 🗜️ **Visually lossless, 10-bit.** HEVC (default), AV1 or H.266 (VVC), at top quality with no knob to guess at.
   10-bit output keeps skies and glows free of banding.
 * 💬 **Keeps your tracks.** All audio, subtitles / translations and chapters are copied, and the output switches to
@@ -266,8 +268,8 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
 
 The UI is Electron + TypeScript. Every render and Live session runs in one native host (`smv-live.exe`, C++ on
 TensorRT for RTX and CUDA), driven by a TypeScript orchestrator that handles probing, encoding (ffmpeg) and resume;
-DLSS 4.5 file renders run NVIDIA's frame generation in a small separate helper. No Python ships. The default model,
-**GMFSS_Fortuna**, is a "union" interpolator: GMFlow optical flow, an IFNet/RIFE refiner, plus MetricNet, FeatureNet,
+DLSS 4.5 file renders run NVIDIA's frame generation in a small separate helper. No Python ships. The default model on
+GPUs without DLSS 4.5, **GMFSS_Fortuna**, is a "union" interpolator: GMFlow optical flow, an IFNet/RIFE refiner, plus MetricNet, FeatureNet,
 FusionNet and softsplat warping.
 
 File renders also run without the window: `node dist\render\cli.js <input> <multiplier> [output] [flags]` takes the
@@ -286,7 +288,7 @@ this app was built.
 
 <sub>Dolby and Dolby Vision are trademarks of Dolby Laboratories. Smooth My Video is an independent project and
 is not affiliated with, endorsed by, sponsored by, or certified by Dolby Laboratories. Dolby Vision Profile
-8.1 metadata is produced by the separately-installed, third-party open-source
+8.1 and 8.4 metadata is produced by the separately-installed, third-party open-source
 [dovi_tool](https://github.com/quietvoid/dovi_tool); no Dolby software is bundled or redistributed.
 HDR10+ is a trademark of HDR10+ Technologies, LLC; Smooth My Video is likewise not affiliated with, endorsed
 by, or certified by HDR10+ Technologies. HDR10+ metadata is injected by the separately-installed, third-party

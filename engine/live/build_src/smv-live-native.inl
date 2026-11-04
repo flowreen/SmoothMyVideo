@@ -4007,7 +4007,7 @@ struct RtxThdrSetting
 struct RtxVsrSetting
 {
     uint32_t QualityLevel;
-}; // 0 bicubic .. 4 Ultra; the host always asks for 4 (vsrSet)
+}; // 0 bicubic .. 4 Ultra; the host asks --vsr-quality's level, 1..4 (vsrSet, default 4)
 typedef void (*PFN_rtxvSetModelPath)(const wchar_t*);
 typedef unsigned int (*PFN_rtxCreate)(void*, void*, int, unsigned int, unsigned int);
 typedef unsigned int (*PFN_rtxEvalThdr)(void*, void*, RtxRect, RtxRect, RtxThdrSetting*);
@@ -11826,8 +11826,17 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
     // Lanczos, never a route change), and the fit must enlarge (decided in nativeRtxInit once the handoff geometry is
     // known). It takes SDR, so on HDR planes it reads their SDR view (SMV_VSR_HDR=0 = Lanczos there)
     nr.sharpen = (float)(g_sharpen < 0.0 ? 0.0 : (g_sharpen > 2.0 ? 2.0 : g_sharpen));
+    // RTX VSR's quality level (--vsr-quality, the app's slider): 1..4, 4 = Ultra by default; level 0 (bicubic) is left
+    // out, since an unticked box already gives Lanczos. The network runs at the input size, so a level's price is the same
+    // at any output size
+    nr.vsrSet.QualityLevel = (uint32_t)(g_vsrQuality < 1 ? 1 : (g_vsrQuality > 4 ? 4 : g_vsrQuality));
     if (g_rtxVsr)
     {
+        if (g_vsrQuality != (int)nr.vsrSet.QualityLevel)
+            LOG("native: --vsr-quality %d is outside 1..4, RTX VSR runs quality %u\n", g_vsrQuality,
+                nr.vsrSet.QualityLevel);
+        else if (nr.vsrSet.QualityLevel != 4)
+            LOG("native: RTX VSR quality %u of 4\n", nr.vsrSet.QualityLevel);
         wchar_t vh[8]{};
         if ((g_hdr || srcHdr) && GetEnvironmentVariableW(L"SMV_VSR_HDR", vh, 8) && vh[0] == L'0')
             LOG(g_hdr ? "native: live RTX VSR off on HDR planes (SMV_VSR_HDR=0), Lanczos\n"

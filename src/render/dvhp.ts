@@ -141,10 +141,20 @@ function removeQuiet(p: string): void {
 }
 
 /** The dovi_tool generate config: one L1 block per scene shot + L6, and the RPU's source peak = the mastering peak
- * (dovi_tool's own pick from L6 stays at 1000 nits' 3079 for an 800-nit L6). */
-export function dvConfig(l1: number[][], nits: number, cll: number, fall: number, fps: number): object {
+ * (dovi_tool's own pick from L6 stays at 1000 nits' 3079 for an 800-nit L6). `profile` '8.4' = dovi_tool's HLG base
+ * layer with its static reshaping (the key is written only then, so an 8.1 config stays as before); the L1 / L6
+ * values are the host's PQ frames, the picture that reshaping rebuilds from the HLG video. */
+export function dvConfig(
+  l1: number[][],
+  nits: number,
+  cll: number,
+  fall: number,
+  fps: number,
+  profile = '8.1',
+): object {
   return {
     cm_version: 'V29',
+    ...(profile === '8.4' ? { profile: '8.4' } : {}),
     length: l1.length,
     source_max_pq: pq12(nits * 10),
     level6: {
@@ -221,7 +231,14 @@ function extractCmd(ffmpeg: string, mp4Path: string, hevc: string): string[] {
   ];
 }
 
-function remuxCmd(ffmpeg: string, rateStr: string, es: string, mp4Path: string, tmpOut: string): string[] {
+function remuxCmd(
+  ffmpeg: string,
+  rateStr: string,
+  es: string,
+  mp4Path: string,
+  tmpOut: string,
+  trc = 'smpte2084',
+): string[] {
   return [
     ffmpeg,
     '-v',
@@ -246,7 +263,7 @@ function remuxCmd(ffmpeg: string, rateStr: string, es: string, mp4Path: string, 
     '-color_primaries',
     'bt2020',
     '-color_trc',
-    'smpte2084',
+    trc,
     '-colorspace',
     'bt2020nc',
     '-color_range',
@@ -259,7 +276,8 @@ function remuxCmd(ffmpeg: string, rateStr: string, es: string, mp4Path: string, 
   ];
 }
 
-/** The finished HDR10 MP4 -> Dolby Vision Profile 8.1 in place (render_encode.dv_export). */
+/** The finished HDR10 MP4 -> Dolby Vision Profile 8.1 in place (render_encode.dv_export); `profile` '8.4' = the
+ * finished HLG MP4 -> Profile 8.4 (HLG-compatible: the stream tagged HLG, dvvC compatibility 4, no HDR10 boxes). */
 export function dvExport(
   mp4Path: string,
   ffmpeg: string,
@@ -272,10 +290,13 @@ export function dvExport(
   outW: number,
   outH: number,
   say: Say,
+  profile = '8.1',
 ): void {
+  const hlg = profile === '8.4';
+  const base0 = hlg ? 'HLG' : 'HDR10';
   const l1 = rtx && rtx.l1 ? Array.from(rtx.l1) : [];
   if (!l1.length) {
-    say('[dv] no per-frame metadata collected; kept the HDR10 file\n');
+    say(`[dv] no per-frame metadata collected; kept the ${base0} file\n`);
     return;
   }
   const base = mp4Path + '.dvwork';
@@ -283,16 +304,20 @@ export function dvExport(
   const [cll, fall] = hdrLight(rtx);
   try {
     runChecked(extractCmd(ffmpeg, mp4Path, hevc));
-    fs.writeFileSync(cfg, pyJsonDumps(dvConfig(l1, nits, cll, fall, outLabel || 24)));
+    fs.writeFileSync(cfg, pyJsonDumps(dvConfig(l1, nits, cll, fall, outLabel || 24, profile)));
     runChecked([doviExe, 'generate', '-j', cfg, '-o', rpu]);
     runChecked([doviExe, 'inject-rpu', '-i', hevc, '--rpu-in', rpu, '-o', dvhevc]);
-    runChecked(remuxCmd(ffmpeg, rateStr, dvhevc, mp4Path, tmpOut));
-    injectDvConfig(tmpOut, outW, outH, outLabel);
-    injectHdr10(tmpOut, nits, 0.0, cll, fall, masterPrim);
+    runChecked(remuxCmd(ffmpeg, rateStr, dvhevc, mp4Path, tmpOut, hlg ? 'arib-std-b67' : 'smpte2084'));
+    injectDvConfig(tmpOut, outW, outH, outLabel, 8, hlg ? 4 : 1);
+    if (!hlg) injectHdr10(tmpOut, nits, 0.0, cll, fall, masterPrim);
     fs.renameSync(tmpOut, mp4Path);
-    say('Dolby Vision: Profile 8.1 written (HDR10-compatible)\n');
+    say(
+      hlg
+        ? 'Dolby Vision: Profile 8.4 written (HLG-compatible)\n'
+        : 'Dolby Vision: Profile 8.1 written (HDR10-compatible)\n',
+    );
   } catch (e) {
-    say(`[dv] export failed (${cut(pyExcRepr(e), 200)}); kept the HDR10 file at ${mp4Path}\n`);
+    say(`[dv] export failed (${cut(pyExcRepr(e), 200)}); kept the ${base0} file at ${mp4Path}\n`);
   } finally {
     for (const p of [hevc, rpu, dvhevc, cfg, tmpOut]) removeQuiet(p);
   }

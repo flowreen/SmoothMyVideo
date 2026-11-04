@@ -421,35 +421,65 @@ class Estimator
             return r;
 
         // tiles: the translation must explain most of the changed ones; the ones a still picture explains clearly
-        // better keep zero
+        // better keep zero. A tile row's sums row by row: the SAD against the same place two tiles a SSE2 step (each
+        // 64-bit lane of _mm_sad_epu8 = one tile's 8 bytes), against the moved place a tile a step where the tile lies
+        // inside the overlap, pixel by pixel at its edges
+        static_assert(kTile == 8, "the tile sums take 8 bytes a lane");
         const int tw = W4 / kTile, th = H4 / kTile;
         std::vector<uint8_t> still((size_t)tw * th, 0);
+        std::vector<uint64_t> a0s, avs;
+        std::vector<int> nvs;
         int changed = 0, agree = 0;
         for (int ty = 0; ty < th; ty++)
-            for (int tx = 0; tx < tw; tx++)
+        {
+            a0s.assign((size_t)tw, 0);
+            avs.assign((size_t)tw, 0);
+            nvs.assign((size_t)tw, 0);
+            for (int y = ty * kTile; y < (ty + 1) * kTile; y++)
             {
-                uint64_t a0 = 0, av = 0;
-                int nv = 0;
-                for (int y = ty * kTile; y < (ty + 1) * kTile; y++)
+                const uint8_t *cr = c4 + (size_t)y * W4, *pr = p4 + (size_t)y * W4;
+                int tx = 0;
+                for (; tx + 2 <= tw; tx += 2)
                 {
-                    const uint8_t* cr = c4 + (size_t)y * W4;
-                    a0 += sadRow(cr + tx * kTile, p4 + (size_t)y * W4 + tx * kTile, kTile);
-                    const int sy = y - fy;
-                    if (sy < 0 || sy >= H4)
+                    const __m128i s = _mm_sad_epu8(_mm_loadu_si128((const __m128i*)(cr + tx * kTile)),
+                                                   _mm_loadu_si128((const __m128i*)(pr + tx * kTile)));
+                    a0s[tx] += (uint64_t)_mm_cvtsi128_si64(s);
+                    a0s[tx + 1] += (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(s, s));
+                }
+                if (tx < tw)
+                    a0s[tx] +=
+                        (uint64_t)_mm_cvtsi128_si64(_mm_sad_epu8(_mm_loadl_epi64((const __m128i*)(cr + tx * kTile)),
+                                                                 _mm_loadl_epi64((const __m128i*)(pr + tx * kTile))));
+                const int sy = y - fy;
+                if (sy < 0 || sy >= H4)
+                    continue;
+                const uint8_t* ps = p4 + (size_t)sy * W4;
+                for (tx = 0; tx < tw; tx++)
+                {
+                    const int x0 = tx * kTile, sx0 = x0 - fx;
+                    if (sx0 >= 0 && sx0 + kTile <= W4)
+                    {
+                        avs[tx] += (uint64_t)_mm_cvtsi128_si64(_mm_sad_epu8(
+                            _mm_loadl_epi64((const __m128i*)(cr + x0)), _mm_loadl_epi64((const __m128i*)(ps + sx0))));
+                        nvs[tx] += kTile;
                         continue;
-                    for (int x = tx * kTile; x < (tx + 1) * kTile; x++)
+                    }
+                    for (int x = x0; x < x0 + kTile; x++)
                     {
                         const int sx = x - fx;
                         if (sx < 0 || sx >= W4)
                             continue;
-                        const uint8_t a = cr[x], b = p4[(size_t)sy * W4 + sx];
-                        av += (uint64_t)(a > b ? a - b : b - a);
-                        nv++;
+                        const uint8_t a = cr[x], b = ps[sx];
+                        avs[tx] += (uint64_t)(a > b ? a - b : b - a);
+                        nvs[tx]++;
                     }
                 }
-                if (nv < kTile * kTile / 2)
+            }
+            for (int tx = 0; tx < tw; tx++)
+            {
+                if (nvs[tx] < kTile * kTile / 2)
                     continue;
-                const double m0 = (double)a0 / (kTile * kTile), mv = (double)av / nv;
+                const double m0 = (double)a0s[tx] / (kTile * kTile), mv = (double)avs[tx] / nvs[tx];
                 if (m0 >= 2.0)
                 {
                     changed++;
@@ -459,6 +489,7 @@ class Estimator
                 if (mv > m0 + 1.0 && mv > 1.5 * m0)
                     still[(size_t)ty * tw + tx] = 1;
             }
+        }
         if (!changed || agree < kCover * changed)
             return r;
 
@@ -507,8 +538,17 @@ class Estimator
     }
 };
 
+// DLSS-G's depth and motion vector textures are the frame / kVecDiv per axis: the generated frames are byte for byte
+// the full-size textures' at a quarter of the bytes (the still rects sit on 32 px tiles, so they scale exactly)
+constexpr uint32_t kVecDiv = 2;
+inline uint32_t vecSize(uint32_t n)
+{
+    return (n + kVecDiv - 1) / kVecDiv;
+}
+
 // the vector texture's contents, written by UAV clears on the present's command list (the texture needs
-// D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS and rests in the tagged shader-resource state)
+// D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS and rests in the tagged shader-resource state); w x h = the frame, the
+// texture = vecSize(w) x vecSize(h), a still rect scaled outward to it
 struct Writer
 {
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> gpuHeap, cpuHeap;
@@ -566,8 +606,12 @@ struct Writer
                 u.UAV.pResource = tex;
                 list->ResourceBarrier(1, &u);
                 // one rectangle a call: a long list in one call stops NVIDIA's driver (0xC0000409 in nvwgf2umx.dll)
+                constexpr LONG d = (LONG)kVecDiv;
                 for (const D3D12_RECT& q : r.still)
-                    list->ClearUnorderedAccessViewFloat(g, c, tex, zero, 1, &q);
+                {
+                    const D3D12_RECT s{q.left / d, q.top / d, (q.right + d - 1) / d, (q.bottom + d - 1) / d};
+                    list->ClearUnorderedAccessViewFloat(g, c, tex, zero, 1, &s);
+                }
             }
         }
         else

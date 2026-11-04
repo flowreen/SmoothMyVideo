@@ -148,6 +148,19 @@ export function dlssgPasses(m: number, limit: number): number[] {
   return [];
 }
 
+/** DLSS 4.5 at a target between whole multiples ([multiple, keep]): DLSS 4.5 makes only the evenly spaced frames between
+ * two originals, so the render makes the smallest multiple its passes reach whose every keep-th frame lands within
+ * 0.5 % of the target (23.976 -> 59.94 fps = 5x, every 2nd frame: still evenly spaced), keeping at least every 6th;
+ * none = [the first multiple reaching the target within 3 % (Live's rule), 1]; [0, 0] = no multiple up to 64. */
+export function dlssgFpsPlan(target: number, src: number, limit: number): [number, number] {
+  for (let m = 2; m <= 64; m++) {
+    if (!dlssgPasses(m, limit).length) continue;
+    for (let k = 1; k <= 6 && k < m; k++) if (Math.abs((m * src) / k - target) <= 0.005 * target) return [m, k];
+  }
+  for (let m = 2; m <= 64; m++) if (dlssgPasses(m, limit).length && m * src * 1.03 >= target) return [m, 1];
+  return [0, 0];
+}
+
 /** "<GPU>, <driver>" from nvidia-smi, '' when it is missing, fails or takes over 5 s. */
 function gpuDriverId(): Promise<string> {
   return new Promise((resolve) => {
@@ -306,11 +319,15 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   let UPSCALE_F = args.upscale <= 0 ? 1.0 : clamp(args.upscale, 1.0 / 16, 16.0);
   let UPSCALE = UPSCALE_F !== 1.0;
   const RTX_VSR = args.rtx_vsr;
+  // RTX VSR's quality level goes to the host only when it is not the default Ultra (4)
+  const VSR_Q = (args.vsr_quality ?? 4) !== 4 ? ['--vsr-quality', String(args.vsr_quality)] : [];
   const FSR_UP = args.fsr_upscale && !RTX_VSR;
   let RTX_HDR = args.rtx_hdr;
   const DV_EXPORT = args.dv,
     HP_EXPORT = args.hdr10plus,
     CODEC = args.codec;
+  // Dolby Vision 8.4 = the HDR video written as HLG (its base layer); 8.1 = HDR10
+  const DV_PROFILE = args.dv_profile === '8.4' ? '8.4' : '8.1';
   const HDR_SAT = clamp(args.hdr_saturation, 0, 200),
     HDR_CON = clamp(args.hdr_contrast, 0, 200);
   const HDR_COLOR = args.hdr_color;
@@ -334,12 +351,28 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const SRC_BITS = sourceBits(ST, SRC_PIX);
   const TEN_BIT = SRC_BITS >= 10;
   const CHROMA444 = fullChroma(ST);
-  const FPS_MODE = args.fps !== null && args.fps > 0;
+  let FPS_MODE = args.fps !== null && args.fps > 0;
+  // DLSS 4.5 at a target between whole multiples (dlssgFpsPlan): the render runs as that multiple and the encode keeps
+  // every DG_KEEP-th frame; from here on it is an ordinary whole-multiple render
+  let DG_KEEP = 1;
   if (DLSSG_MODE && !NO_INTERP && FPS_MODE) {
-    throw new RenderExit(
-      'DLSS Frame Generation supports whole multipliers on the source grid ' +
-        '(no --fps resampling). Pick a whole multiplier, or use GMFSS for anything else.',
+    const want = args.fps as number;
+    const lim =
+      (await dlssgLimit(path.join(ENGINE, 'live', 'smv-live.exe'), ENGINE, engineCacheDir(ENGINE, env), env)) || 6;
+    const [m, k] = dlssgFpsPlan(want, num / den, lim);
+    if (!m) throw new RenderExit(`DLSS Frame Generation cannot reach ${pyG(want)} fps on this GPU; use GMFSS.`);
+    const got = ((m * num) / (den * k)).toFixed(3);
+    say(
+      k > 1
+        ? `DLSS Frame Generation at ${pyG(want)} fps: ${m}x, then every ${k === 2 ? '2nd' : k === 3 ? '3rd' : k + 'th'} ` +
+            `frame = ${got} fps (evenly spaced: DLSS 4.5 makes whole multiples only)\n`
+        : `DLSS Frame Generation at ${pyG(want)} fps: ${m}x = ${got} fps, the first whole multiple that reaches it ` +
+            '(no multiple of the source lands on it)\n',
     );
+    args.multi = m;
+    args.fps = null;
+    FPS_MODE = false;
+    DG_KEEP = k;
   }
   if (!NO_INTERP && !FPS_MODE && args.multi < 2) {
     throw new RenderExit(
@@ -348,8 +381,10 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   }
   NB = frameCount(FFPROBE, inp, NB, num / den);
   const rate = outputRate(args.multi, FPS_MODE ? args.fps : null, NO_INTERP, num, den);
-  const rateStr = rate.rateStr,
-    outLabel = rate.outLabel;
+  // the host's frames arrive at IN_RATE; with DG_KEEP > 1 the file holds every DG_KEEP-th of them at rateStr
+  const IN_RATE = rate.rateStr;
+  const rateStr = DG_KEEP > 1 ? `${num * args.multi}/${den * DG_KEEP}` : rate.rateStr,
+    outLabel = DG_KEEP > 1 ? pyRound((num * args.multi) / (den * DG_KEEP)) : rate.outLabel;
   let ratio = rate.ratio;
   const tr = probeTracks(FFPROBE, inp);
   const outPath = args.output
@@ -368,10 +403,24 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     if (why) throw new RenderExit('NVIDIA Optical Flow: ' + why);
   }
   if (!isFile(NATIVE_EXE)) throw new RenderExit(`the render host ${NATIVE_EXE} is missing; reinstall SmoothMyVideo`);
-  const HDR_NITS = RTX_HDR ? hdrPeakNits(args.hdr_nits, NATIVE_EXE) : 1000;
+  // Dolby Vision 8.4's HLG video holds light up to BT.2100's 1000-nit nominal peak, so TrueHDR's peak stays at or
+  // below it there (nothing above it clips in the conversion)
+  const DV84_WANT =
+    DV_EXPORT &&
+    DV_PROFILE === '8.4' &&
+    CODEC === 'hevc' &&
+    !OUT_IS_MKV &&
+    isFile(path.join(ENGINE, 'dvtools', 'dovi_tool.exe'));
+  const HDR_PEAK = RTX_HDR ? hdrPeakNits(args.hdr_nits, NATIVE_EXE) : 1000;
+  const HDR_NITS = DV84_WANT ? Math.min(HDR_PEAK, 1000) : HDR_PEAK;
+  if (RTX_HDR && HDR_NITS < HDR_PEAK)
+    say(`RTX HDR peak ${HDR_PEAK} -> ${HDR_NITS} nits: Dolby Vision 8.4's HLG video holds light up to 1000 nits\n`);
   let fragCopy = CODEC === 'vvc';
   const P = partsOf(WORK_PATH, ob, OUT_IS_MKV);
-  const RESUMABLE = !env.SMV_NO_RESUME;
+  // kept frames that skip some of the host's do not line up with source pairs, which a resume counts in
+  const RESUMABLE = !env.SMV_NO_RESUME && DG_KEEP === 1;
+  if (DG_KEEP > 1 && !env.SMV_NO_RESUME)
+    say('resume is off for this render (its frames skip some of the generated ones)\n');
   const DEC_FMT = TEN_BIT ? 'rgb48le' : 'rgb24';
   const OUT_RAW_FMT = 'rgb48le';
   if (DRBA_MODE && !FPS_MODE) ratio = args.multi;
@@ -506,7 +555,8 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       const sb = HDR_SATBOOST > 0 ? `, sb ${pyG(HDR_SATBOOST)}` : '';
       say(
         `RTX HDR ready (TrueHDR ${HDR_NITS} nits, contrast ${HDR_CON - 100}, saturation ${HDR_SAT - 100}, ` +
-          `colour ${HDR_COLOR}${vib}${sb}) HDR10 (BT.2020 PQ) @ ${OUT_W}x${OUT_H}\n`,
+          `colour ${HDR_COLOR}${vib}${sb}) ${DV84_WANT ? 'HLG (BT.2020) for Dolby Vision 8.4' : 'HDR10 (BT.2020 PQ)'} ` +
+          `@ ${OUT_W}x${OUT_H}\n`,
       );
     }
   }
@@ -518,14 +568,23 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
         ? 'dovi_tool not found in engine/dvtools'
         : 'RTX HDR is not active';
     say(`[dv] Dolby Vision export skipped: ${why}\n`);
-  } else if (DV_ACTIVE) say('Dolby Vision Profile 8.1 export ON (plays as HDR10 where DV is unsupported)\n');
-  const HP_ACTIVE = wantHp && HDR_ACTIVE;
+  } else if (DV_ACTIVE)
+    say(
+      DV_PROFILE === '8.4'
+        ? 'Dolby Vision Profile 8.4 export ON (an HLG video; plays as HLG where DV is unsupported)\n'
+        : 'Dolby Vision Profile 8.1 export ON (plays as HDR10 where DV is unsupported)\n',
+    );
+  // the video is HLG: Dolby Vision 8.4's base layer
+  const HLG_OUT = DV_ACTIVE && DV_PROFILE === '8.4';
+  const HP_ACTIVE = wantHp && HDR_ACTIVE && !HLG_OUT;
   if (HP_EXPORT && !HP_ACTIVE) {
-    const why = OUT_IS_MKV
-      ? 'output is MKV (HDR10+ export needs MP4)'
-      : !isFile(HP_EXE)
-        ? 'hdr10plus_tool not found in engine/hptools'
-        : 'RTX HDR is not active';
+    const why = HLG_OUT
+      ? 'Dolby Vision 8.4 writes an HLG video and HDR10+ needs HDR10 (PQ)'
+      : OUT_IS_MKV
+        ? 'output is MKV (HDR10+ export needs MP4)'
+        : !isFile(HP_EXE)
+          ? 'hdr10plus_tool not found in engine/hptools'
+          : 'RTX HDR is not active';
     say(`[hdr10+] HDR10+ export skipped: ${why}\n`);
   } else if (HP_ACTIVE) say('HDR10+ dynamic metadata ON (plays as HDR10 where HDR10+ is unsupported)\n');
   // RTX HDR's statistics (MaxCLL, Dolby Vision, HDR10+) come per output frame from one host
@@ -634,6 +693,9 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       vidPart2: P.vidPart2,
       workPath: WORK_PATH,
       dvOrHp: DV_ACTIVE || HP_ACTIVE,
+      hlg: HLG_OUT,
+      inRateStr: IN_RATE,
+      keep: DG_KEEP,
     },
     env,
   );
@@ -686,7 +748,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (P1_W !== W || P1_H !== H) {
     nargs.push('--out-w', String(P1_W), '--out-h', String(P1_H));
     if (!CASCADE || !lastResize) {
-      if (RTX_VSR) nargs.push('--rtx-vsr');
+      if (RTX_VSR) nargs.push('--rtx-vsr', ...VSR_Q);
       if (FSR_UP) nargs.push('--fsr-upscale');
     }
   }
@@ -792,7 +854,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     ];
     if (last && lastResize) {
       a.push('--out-w', String(OUT_W), '--out-h', String(OUT_H));
-      if (RTX_VSR) a.push('--rtx-vsr');
+      if (RTX_VSR) a.push('--rtx-vsr', ...VSR_Q);
       if (FSR_UP) a.push('--fsr-upscale');
     }
     // PQ / HLG frames go to DLSS 4.5 as HDR10, as in the first pass
@@ -1001,6 +1063,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     outIsMkv: OUT_IS_MKV,
     hpActive: HP_ACTIVE,
     dvActive: DV_ACTIVE,
+    hlg: HLG_OUT,
     resumeDvhpNote: dvhpNote,
     fragCopy,
     fragFlags: FRAG_FLAGS,
@@ -1011,7 +1074,20 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     masterPrim: HDR_MASTER_PRIM,
     hpExport: () => hpExport(WORK_PATH, FFMPEG, HP_EXE, rtx, HDR_NITS, HDR_MASTER_PRIM, rateStr, outLabel, say),
     dvExport: () =>
-      dvExport(WORK_PATH, FFMPEG, DOVI_EXE, rtx, HDR_NITS, HDR_MASTER_PRIM, rateStr, outLabel, OUT_W, OUT_H, say),
+      dvExport(
+        WORK_PATH,
+        FFMPEG,
+        DOVI_EXE,
+        rtx,
+        HDR_NITS,
+        HDR_MASTER_PRIM,
+        rateStr,
+        outLabel,
+        OUT_W,
+        OUT_H,
+        say,
+        DV_PROFILE,
+      ),
     concatCopy: (parts, dst) =>
       concatCopy(
         { ffmpeg: FFMPEG, ffprobe: FFPROBE, fragCopy, fragFlags: FRAG_FLAGS, concatTxt: P.concatTxt },
@@ -1022,7 +1098,8 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     say,
   });
   if (fs.existsSync(WORK_PATH)) fs.renameSync(WORK_PATH, outPath);
-  const outFrames = nout ? nout : null;
+  // the file's frames: every DG_KEEP-th of the host's (framestep keeps frame 0, DG_KEEP, 2 DG_KEEP ...)
+  const outFrames = nout ? (DG_KEEP > 1 ? Math.floor((nout - 1) / DG_KEEP) + 1 : nout) : null;
   if (outFrames !== null) say(`OUTFRAMES ${outFrames}\n`);
   if (NO_INTERP) {
     say(`done ${nout} frames (${SHARPEN > 0 ? 'sharpened' : 're-encoded'}, native host) -> ${outPath}\n`);

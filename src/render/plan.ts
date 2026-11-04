@@ -19,12 +19,14 @@ export interface RenderArgs {
   nvof: boolean;
   no_interp: boolean;
   rtx_vsr: boolean;
+  vsr_quality: number; // --vsr-quality: RTX VSR's quality level 1..4, 4 = Ultra
   fsr_upscale: boolean; // --fsr-upscale: AMD FSR 4 in RTX VSR's resize (the two exclude each other)
   rtx_hdr: boolean;
   restore: boolean;
   no_gpu_fit: boolean; // --no-gpu-fit: no video memory fit
   dlssnr: boolean;
   dv: boolean;
+  dv_profile: string; // --dv-profile: 8.1 (HDR10 base) or 8.4 (HLG base)
   hdr10plus: boolean;
   hdr_saturation: number; // int
   hdr_contrast: number; // int

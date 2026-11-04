@@ -35,6 +35,7 @@ export interface PreviewArgs {
   scale: string | null; // --scale: the render's DLSS mode or working-size share
   upscale: number;
   rtx_vsr: boolean;
+  vsr_quality: number; // --vsr-quality: RTX VSR's quality level 1..4, 4 = Ultra
   fsr_upscale: boolean;
   dlssnr: boolean;
   nr_structure: number;
@@ -67,6 +68,11 @@ const MODEL_FLAGS: Record<string, string[]> = {
   fruc: ['--fruc'],
 };
 
+/** RTX VSR's quality level for the host, only when it is not the default Ultra (4). */
+function vsrQuality(a: PreviewArgs): string[] {
+  return a.vsr_quality !== 4 ? ['--vsr-quality', String(a.vsr_quality)] : [];
+}
+
 /** preview.py's argparse flags. */
 export function parsePreviewArgv(argv: string[]): PreviewArgs {
   const a: PreviewArgs = {
@@ -79,6 +85,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     scale: null,
     upscale: 1,
     rtx_vsr: false,
+    vsr_quality: 4,
     fsr_upscale: false,
     dlssnr: false,
     nr_structure: 1,
@@ -121,6 +128,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--hdr-satboost': 'hdr_satboost',
   };
   const ints: Record<string, keyof PreviewArgs> = {
+    '--vsr-quality': 'vsr_quality',
     '--nr-style': 'nr_style',
     '--nr-passes': 'nr_passes',
     '--hdr-saturation': 'hdr_saturation',
@@ -154,6 +162,8 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     );
   a.input = pos[0];
   if (!a.out) throw new Error('the following arguments are required: --out');
+  if (![1, 2, 3, 4].includes(a.vsr_quality))
+    throw new Error(`argument --vsr-quality: invalid choice: ${a.vsr_quality} (choose from 1, 2, 3, 4)`);
   if (![0, 1, 2].includes(a.nr_style))
     throw new Error(`argument --nr-style: invalid choice: ${a.nr_style} (choose from 0, 1, 2)`);
   if (!(a.nr_passes >= 1 && a.nr_passes <= 20))
@@ -697,7 +707,7 @@ function passFlags(
   if (o.outW !== s.W || o.outH !== s.H) {
     args.push('--out-w', String(o.outW), '--out-h', String(o.outH));
     if (o.upscaler) {
-      if (s.needVsr) args.push('--rtx-vsr');
+      if (s.needVsr) args.push('--rtx-vsr', ...vsrQuality(a));
       else if (a.fsr_upscale && o.outW > s.W && o.outH > s.H) args.push('--fsr-upscale');
     }
   }
@@ -1000,7 +1010,7 @@ export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
       const st = [...head(WW, WH, passes[i], frames, 'rgb48le', last ? outFmt : 'rgb48le'), '--dlssg'];
       if (last && lastResize) {
         st.push('--out-w', String(OW), '--out-h', String(OH));
-        if (s.needVsr) st.push('--rtx-vsr');
+        if (s.needVsr) st.push('--rtx-vsr', ...vsrQuality(a));
         else if (a.fsr_upscale && OW > WW && OH > WH) st.push('--fsr-upscale');
       }
       if (s.srcHdr) st.push('--src-hdr', s.transfer === 'arib-std-b67' ? 'hlg' : 'pq');

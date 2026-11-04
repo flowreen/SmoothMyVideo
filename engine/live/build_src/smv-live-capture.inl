@@ -7,25 +7,55 @@
 // convert, so the exe does it: this compute shader is the same math as the native kernels'
 // scrgb_to_pq2020 + R10G10B10A2 pack (709->2020 matrix FIRST, clamp AFTER it - negative scRGB is
 // valid wide gamut - scRGB 1.0 = 80 nits over PQ 10000, A = 3). Output is R32_UINT (manual bit
-// pack, typed-UAV support guaranteed) whose bit pattern IS R10G10B10A2_UNORM.
-static const char kHdrPackCS[] = "Texture2D<float4> src : register(t0);\n"
-                                 "RWTexture2D<uint> dst : register(u0);\n"
-                                 "[numthreads(8,8,1)]\n"
-                                 "void main(uint3 id : SV_DispatchThreadID)\n"
-                                 "{\n"
-                                 "    uint w, h;\n"
-                                 "    dst.GetDimensions(w, h);\n"
-                                 "    if (id.x >= w || id.y >= h) return;\n"
-                                 "    float3 c = src[id.xy].rgb;\n"
-                                 "    float3 v = float3(dot(float3(0.6274, 0.3293, 0.0433), c),\n"
-                                 "                      dot(float3(0.0691, 0.9195, 0.0114), c),\n"
-                                 "                      dot(float3(0.0164, 0.0880, 0.8956), c));\n"
-                                 "    v = max(v, 0.0) * (80.0 / 10000.0);\n"
-                                 "    float3 lm = pow(v, 0.1593017578125);\n"
-                                 "    float3 p = pow((0.8359375 + 18.8515625 * lm) / (1.0 + 18.6875 * lm), 78.84375);\n"
-                                 "    uint3 q = (uint3)(saturate(p) * 1023.0 + 0.5);\n"
-                                 "    dst[id.xy] = q.x | (q.y << 10) | (q.z << 20) | (3u << 30);\n"
-                                 "}\n";
+// pack, typed-UAV support guaranteed) whose bit pattern IS R10G10B10A2_UNORM. src is read at `off`: the client crop
+// inside the WGC frame read in place, 0 for a copied crop. SLOT = the GPU handoff's variant: the codes stored into the
+// R10G10B10A2_UNORM slot itself (code / 1023 and alpha / 3: exact) and the estimate's 1/4 thumbnail written beside it
+// (u1) from the same codes: per 4 x 4 block R + 2 G + B over rows and columns 1 and 2, >> 6 (panvec thumbStep10's
+// integer sums), through the group's shared sums (a group = 2 x 2 blocks), so no pass reads the slot back
+static const char kHdrPackCS[] =
+    "Texture2D<float4> src : register(t0);\n"
+    "#ifdef SLOT\n"
+    "RWTexture2D<unorm float4> dst : register(u0);\n"
+    "RWTexture2D<uint> thumb : register(u1);\n"
+    "groupshared uint lum[8][8];\n"
+    "#else\n"
+    "RWTexture2D<uint> dst : register(u0);\n"
+    "#endif\n"
+    "cbuffer crop : register(b0) { uint2 off; uint2 unused; };\n"
+    "uint3 codes(uint2 px)\n"
+    "{\n"
+    "    float3 c = src[px + off].rgb;\n"
+    "    float3 v = float3(dot(float3(0.6274, 0.3293, 0.0433), c),\n"
+    "                      dot(float3(0.0691, 0.9195, 0.0114), c),\n"
+    "                      dot(float3(0.0164, 0.0880, 0.8956), c));\n"
+    "    v = max(v, 0.0) * (80.0 / 10000.0);\n"
+    "    float3 lm = pow(v, 0.1593017578125);\n"
+    "    float3 p = pow((0.8359375 + 18.8515625 * lm) / (1.0 + 18.6875 * lm), 78.84375);\n"
+    "    return (uint3)(saturate(p) * 1023.0 + 0.5);\n"
+    "}\n"
+    "[numthreads(8,8,1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID, uint3 t : SV_GroupThreadID)\n"
+    "{\n"
+    "    uint w, h;\n"
+    "    dst.GetDimensions(w, h);\n"
+    "#ifdef SLOT\n"
+    "    uint3 q = 0;\n"
+    "    if (id.x < w && id.y < h)\n"
+    "    {\n"
+    "        q = codes(id.xy);\n"
+    "        dst[id.xy] = float4(q, 3) / float4(1023.0, 1023.0, 1023.0, 3.0);\n"
+    "    }\n"
+    "    lum[t.y][t.x] = q.x + 2 * q.y + q.z;\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    if ((t.x & 3) == 0 && (t.y & 3) == 0 && (id.x >> 2) < (w >> 2) && (id.y >> 2) < (h >> 2))\n"
+    "        thumb[id.xy >> 2] = (lum[t.y + 1][t.x + 1] + lum[t.y + 1][t.x + 2] + lum[t.y + 2][t.x + 1] +\n"
+    "                             lum[t.y + 2][t.x + 2]) >> 6;\n"
+    "#else\n"
+    "    if (id.x >= w || id.y >= h) return;\n"
+    "    uint3 q = codes(id.xy);\n"
+    "    dst[id.xy] = q.x | (q.y << 10) | (q.z << 20) | (3u << 30);\n"
+    "#endif\n"
+    "}\n";
 
 // The direct DLSS-G pass's GPU handoff (Capture::latestFrameShared): the client crop (B8G8R8A8 read as float: exact, one
 // value per byte) stored into an R8G8B8A8 slot of the DLSS-G device, the bytes in its RGBA order (the CPU route's swizzle)
@@ -40,8 +70,9 @@ static const char kDgSwizzleCS[] = "Texture2D<float4> src : register(t0);\n"
                                    "    dst[id.xy] = src[id.xy];\n"
                                    "}\n";
 
-// ... and the estimate's 1/4 thumbnail of the crop (panvec thumbRows' integer sums: per 4 x 4 block R + 2 G + B over
-// rows and columns 1 and 2, >> 4; R and B either order), read back instead of the frame
+// ... and the estimate's 1/4 thumbnail of the SDR crop (panvec thumbRows' integer sums: per 4 x 4 block R + 2 G + B over
+// rows and columns 1 and 2, >> 4; R and B either order), read back instead of the frame. The HDR10 route's thumbnail
+// comes out of the pack itself (kHdrPackCS with SLOT, from its 10-bit codes)
 static const char kDgThumbCS[] =
     "Texture2D<float4> src : register(t0);\n"
     "RWTexture2D<uint> dst : register(u0);\n"
@@ -61,55 +92,34 @@ static const char kDgThumbCS[] =
     "    dst[id.xy] = s >> 4;\n"
     "}\n";
 
-// the HDR10 route's two: the pack's R10G10B10A2 words (kHdrPackCS, u1) stored into the R10G10B10A2 slot (code / 1023 and
-// alpha / 3: exact), and their thumbnail (thumbRows' 10-bit sums: R + 2 G + B of the codes, >> 6)
-static const char kDgUnpack10CS[] = "RWTexture2D<unorm float4> dst : register(u0);\n"
-                                    "RWTexture2D<uint> src : register(u1);\n"
-                                    "[numthreads(8,8,1)]\n"
-                                    "void main(uint3 id : SV_DispatchThreadID)\n"
-                                    "{\n"
-                                    "    uint w, h;\n"
-                                    "    dst.GetDimensions(w, h);\n"
-                                    "    if (id.x >= w || id.y >= h) return;\n"
-                                    "    uint v = src[id.xy];\n"
-                                    "    dst[id.xy] = float4(v & 1023, (v >> 10) & 1023, (v >> 20) & 1023, v >> 30) /\n"
-                                    "                 float4(1023.0, 1023.0, 1023.0, 3.0);\n"
-                                    "}\n";
-static const char kDgThumb10CS[] = "RWTexture2D<uint> dst : register(u0);\n"
-                                   "RWTexture2D<uint> src : register(u1);\n"
-                                   "[numthreads(8,8,1)]\n"
-                                   "void main(uint3 id : SV_DispatchThreadID)\n"
-                                   "{\n"
-                                   "    uint w, h;\n"
-                                   "    dst.GetDimensions(w, h);\n"
-                                   "    if (id.x >= w || id.y >= h) return;\n"
-                                   "    uint s = 0;\n"
-                                   "    for (uint j = 1; j <= 2; j++)\n"
-                                   "        for (uint i = 1; i <= 2; i++)\n"
-                                   "        {\n"
-                                   "            uint v = src[uint2(id.x * 4 + i, id.y * 4 + j)];\n"
-                                   "            s += (v & 1023) + 2 * ((v >> 10) & 1023) + ((v >> 20) & 1023);\n"
-                                   "        }\n"
-                                   "    dst[id.xy] = s >> 6;\n"
-                                   "}\n";
-
 // Whole-screen capture (Capture::samePicture): any bit that differs between two pictures sets the flag. a = the
-// arrival (the WGC frame itself, read at the client crop's offset `off`; the copy route: its crop, off = 0), b = the
-// last kept picture (the crop, its size = the test's). The formats read as float4 (B8G8R8A8 unorm: exact, one value per
-// byte; FP16: exact), compared as their bits.
-static const char kSamePictureCS[] = "Texture2D<float4> a : register(t0);\n"
-                                     "Texture2D<float4> b : register(t1);\n"
-                                     "RWByteAddressBuffer flag : register(u0);\n"
-                                     "cbuffer crop : register(b0) { uint2 off; uint2 unused; };\n"
-                                     "[numthreads(16,16,1)]\n"
-                                     "void main(uint3 id : SV_DispatchThreadID)\n"
-                                     "{\n"
-                                     "    uint w, h;\n"
-                                     "    b.GetDimensions(w, h);\n"
-                                     "    if (id.x >= w || id.y >= h) return;\n"
-                                     "    if (any(asuint(a[id.xy + off]) != asuint(b[id.xy])))\n"
-                                     "        flag.Store(0, 1u);\n"
-                                     "}\n";
+// arrival (the WGC frame itself, read at the client crop's offset offA; the copy route: its crop, offA = 0), b = the
+// reference (the last kept WGC frame itself, read at the crop's offset offB; a copied reference: its crop, offB = 0),
+// size = the crop's. The formats read as float4 (B8G8R8A8 unorm: exact, one value per byte; FP16: exact), compared as
+// their bits. A group covers kSameRows rows (four stacked 16 x 16 tiles, a thread four pixels) and a thread that sees
+// the flag already set skips its reads: the verdict is decided, so a changed picture stops costing a full read of both.
+// The read is a plain one: within a dispatch the flag only goes 0 -> 1 (the clear is ordered before it), so a stale read
+// is a 0 and that thread just compares.
+constexpr UINT kSameRows = 64;
+static const char kSamePictureCS[] =
+    "Texture2D<float4> a : register(t0);\n"
+    "Texture2D<float4> b : register(t1);\n"
+    "RWByteAddressBuffer flag : register(u0);\n"
+    "cbuffer crop : register(b0) { uint2 offA; uint2 offB; uint2 size; uint2 unused; };\n"
+    "[numthreads(16,16,1)]\n"
+    "void main(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID)\n"
+    "{\n"
+    "    if (flag.Load(0)) return;\n"
+    "    uint x = g.x * 16 + t.x;\n"
+    "    if (x >= size.x) return;\n"
+    "    bool d = false;\n"
+    "    [unroll] for (uint k = 0; k < 4; k++)\n"
+    "    {\n"
+    "        uint y = g.y * 64 + k * 16 + t.y;\n"
+    "        if (y < size.y && any(asuint(a[uint2(x, y) + offA]) != asuint(b[uint2(x, y) + offB]))) d = true;\n"
+    "    }\n"
+    "    if (d) flag.Store(0, 1u);\n"
+    "}\n";
 
 struct Capture
 {
@@ -140,6 +150,11 @@ struct Capture
     ComPtr<ID3D11Texture2D> convSrc, convDst, convStaging;
     ComPtr<ID3D11ShaderResourceView> convSrcView;
     ComPtr<ID3D11UnorderedAccessView> convUav;
+    // the pack's read offset (kHdrPackCS's cbuffer crop)
+    ComPtr<ID3D11Buffer> convCb;
+    // the pack reads the WGC frame itself at the crop's offset on both routes (inPlaceView); SMV_LIVE_INPLACE=0 = the
+    // crop copied into convSrc first, =fail = the view's failure (its note, then that route)
+    bool hdrInPlace = false, hdrInPlaceFail = false;
     int64_t lastFrameTs = 0; // capture timestamp of the newest drained frame (WGC
                              // SystemRelativeTime, 100ns units in the QPC time domain)
     int newestIn = 0;        // where that frame's client pixels sit: 0 nowhere, 1 staging (latestFrame), 2 sharedTex
@@ -162,6 +177,9 @@ struct Capture
     // drop a second, and its throttle never fired).
     SRWLOCK lk = SRWLOCK_INIT;
     wgc::Direct3D11CaptureFrame held{nullptr};
+    // the loop's frame (drainNewest hands it out, release() takes it back). A frame goes back to the pool only once it
+    // is none of held, the loop's and the unchanged-picture test's reference (refFrame below): closeFree, under lk
+    wgc::Direct3D11CaptureFrame loopFrame{nullptr};
     bool stopping = false; // set under lk by stop(): a late FrameArrived leaves the pool alone
     // An arrival whose picture equals the last new one is no source frame. Whole screen: the overlay is excluded from
     // the picture, but each of its presents still composes the monitor and WGC hands that composition over as a frame,
@@ -173,23 +191,28 @@ struct Capture
     // still counts once kSameKeepalive has passed since the last kept one: the static hold's refresh repaint brings
     // the current picture after a model load or a pause, and DLSS-G's input-gap reset (700 ms) never fires on a
     // source that keeps presenting. The test reads the arrival in place (a view of the WGC frame at the crop's offset)
-    // against sameRefTex, the last kept picture, and a new picture's crop is copied into sameRefTex after it: an
-    // unchanged arrival costs the compare alone. The immediate context is multithread-protected while this runs (`mt`;
-    // its compute-shader sequences hold mt->Enter()).
+    // against the reference = the last kept WGC frame itself, held open (refFrame, its view refSrv) until the next new
+    // picture's test has read it: a new picture costs no reference copy and no reference texture, an unchanged arrival
+    // the compare alone. A frame no view can read, and the copy route (SMV_WGC_SAME=copy), keep the reference as a
+    // copy of the crop instead (sameRefTex, made on first use). The immediate context is multithread-protected while
+    // this runs (`mt`; its compute-shader sequences hold mt->Enter()).
     static constexpr int64_t kSameKeepalive = 5000000; // 100 ns units: 500 ms
     bool allowSame = true; // a caller that wants every arrival (the probe) clears it before init()
     bool sameSkip = false;
     ComPtr<ID3D11Multithread> mt;
     ComPtr<ID3D11ComputeShader> sameCS;
-    ComPtr<ID3D11Texture2D> sameRefTex, sameTmpTex; // the last kept picture (the crop); the copy route's arrival
+    wgc::Direct3D11CaptureFrame refFrame{nullptr};  // the reference when it is a held frame (read at the crop's offset)
+    ComPtr<ID3D11ShaderResourceView> refSrv;        // its view
+    ComPtr<ID3D11Texture2D> sameRefTex, sameTmpTex; // the reference as a copy of the crop; the copy route's arrival
     ComPtr<ID3D11ShaderResourceView> sameRefSrv, sameTmpSrv;
-    ComPtr<ID3D11Buffer> sameFlag, sameFlagStage, sameCb; // sameCb = the shader's crop offset
+    DXGI_FORMAT sameFmt = DXGI_FORMAT_UNKNOWN;            // the pool's format (the two textures, the frame check)
+    ComPtr<ID3D11Buffer> sameFlag, sameFlagStage, sameCb; // sameCb = the shader's offsets and size
     ComPtr<ID3D11UnorderedAccessView> sameUav;
     bool sameCopy =
         false; // the copy route: the arrival's crop copied into sameTmpTex, then compared (SMV_WGC_SAME=copy;
                // a frame no view can read takes it too)
     bool sameViewFail = false; // a frame no view could read (logged once a session)
-    bool sameRef = false;      // sameRefTex holds a picture
+    bool sameRef = false;      // a reference exists: refFrame, else sameRefTex
     uint64_t sameN = 0;        // arrivals dropped as unchanged
     uint64_t sameKept = 0;     // unchanged arrivals kept by kSameKeepalive
     double sameMsSum = 0, sameMsMax = 0;
@@ -206,10 +229,12 @@ struct Capture
     HWND targetWnd = nullptr; // capture target (monitor mode: the seeding window), for requestRefresh
     // THE GPU HANDOFF (the direct DLSS-G pass; the loop sets it up, SMV_LIVE_DGPU=0 = off, =fail = its fallback): a
     // frame reaches the DLSS-G device on the GPU, stored into one of two shared slots in the route's format (SDR: the
-    // crop as RGBA, kDgSwizzleCS; HDR10: the pack's words as R10G10B10A2, kDgUnpack10CS), instead of through the CPU and
-    // an upload copy; the estimate reads back its 1/4 thumbnail (kDgThumbCS / kDgThumb10CS, ~1/64 of the frame) instead
-    // of the frame. dgWrote = this device's fence (a slot written), dgCopied = the DLSS-G device's (a slot copied): a
-    // slot is rewritten only once its last frame's copy ran (dgFree[slot], set by the loop from the present)
+    // crop as RGBA, kDgSwizzleCS; HDR10: the pack itself, kHdrPackCS with SLOT), instead of through the CPU and an upload
+    // copy; the estimate reads back its 1/4 thumbnail (kDgThumbCS of the crop; HDR10: the pack writes it beside the
+    // slot from its own codes, ~1/64 of the frame) instead of the frame. dgWrote = this device's fence (a slot written),
+    // dgCopied = the DLSS-G device's (a slot copied): a
+    // slot is rewritten only once its last frame's copy ran (dgFree[slot], set by the loop from the present). HDR10's
+    // pack reads the WGC frame in place (hdrInPlace, inPlaceView)
     ComPtr<ID3D11ComputeShader> dgCS, dgThumbCS;
     ComPtr<ID3D11Texture2D> dgSrc, dgTex[2], dgThumb, dgThumbStage;
     ComPtr<ID3D11ShaderResourceView> dgSrcView;
@@ -230,13 +255,17 @@ struct Capture
         dgRelease();
         ComPtr<ID3D11Device5> dev5;
         ComPtr<ID3DBlob> cs, ts, err;
-        const char* sw = hdrPack ? kDgUnpack10CS : kDgSwizzleCS;
-        const char* th = hdrPack ? kDgThumb10CS : kDgThumbCS;
+        const char* sw = hdrPack ? kHdrPackCS : kDgSwizzleCS;
+        const D3D_SHADER_MACRO slot[] = {{"SLOT", "1"}, {nullptr, nullptr}};
+        // SDR's thumbnail pass; HDR10's thumbnail is the pack's own write
         if (cw < 4 || ch < 4 || FAILED(dev11.As(&dev5)) || (!ctx4 && FAILED(ctx11.As(&ctx4))) ||
-            FAILED(D3DCompile(sw, strlen(sw), nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err)) ||
+            FAILED(D3DCompile(sw, strlen(sw), nullptr, hdrPack ? slot : nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs,
+                              &err)) ||
             FAILED(dev11->CreateComputeShader(cs->GetBufferPointer(), cs->GetBufferSize(), nullptr, &dgCS)) ||
-            FAILED(D3DCompile(th, strlen(th), nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &ts, &err)) ||
-            FAILED(dev11->CreateComputeShader(ts->GetBufferPointer(), ts->GetBufferSize(), nullptr, &dgThumbCS)))
+            (!hdrPack &&
+             (FAILED(D3DCompile(kDgThumbCS, strlen(kDgThumbCS), nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &ts,
+                                &err)) ||
+              FAILED(dev11->CreateComputeShader(ts->GetBufferPointer(), ts->GetBufferSize(), nullptr, &dgThumbCS)))))
             return dgFail();
         D3D11_TEXTURE2D_DESC td{};
         td.Width = cw / 4;
@@ -266,7 +295,7 @@ struct Capture
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (!hdrPack && (FAILED(dev11->CreateTexture2D(&td, nullptr, &dgSrc)) ||
                          FAILED(dev11->CreateShaderResourceView(dgSrc.Get(), nullptr, &dgSrcView))))
-            return dgFail(); // HDR10 reads the pack's convDst instead
+            return dgFail(); // HDR10 packs from the frame (or convSrc) into the slot instead
         td.Format = hdrPack ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
         td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
@@ -389,10 +418,6 @@ struct Capture
         td.ArraySize = 1;
         td.SampleDesc = {1, 0};
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(dev11->CreateTexture2D(&td, nullptr, &convSrc)))
-            return false;
         td.Format = DXGI_FORMAT_R32_UINT;
         td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         if (FAILED(dev11->CreateTexture2D(&td, nullptr, &convDst)))
@@ -402,21 +427,87 @@ struct Capture
         td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(dev11->CreateTexture2D(&td, nullptr, &convStaging)))
             return false;
-        if (FAILED(dev11->CreateShaderResourceView(convSrc.Get(), nullptr, &convSrcView)))
-            return false;
         if (FAILED(dev11->CreateUnorderedAccessView(convDst.Get(), nullptr, &convUav)))
+            return false;
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        const UINT zero[4]{};
+        const D3D11_SUBRESOURCE_DATA sd{zero, 0, 0};
+        if (FAILED(dev11->CreateBuffer(&bd, &sd, &convCb)))
             return false;
         LOG("dlssg HDR: exe-side scRGB -> PQ R10A2 pack ready (%ux%u)\n", cw, ch);
         return true;
     }
 
-    // the copy route's arrival texture, the reference's twin (made on first use)
-    bool sameTmpMake()
+    // convSrc, the crop's FP16 copy the HDR pack reads when it cannot read the frame in place (inPlaceView): made by
+    // the first frame that copies, so a session reading in place never holds it; false = it cannot be made
+    bool convSrcReady()
+    {
+        if (convSrc)
+            return true;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = cw;
+        td.Height = ch;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.SampleDesc = {1, 0};
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev11->CreateTexture2D(&td, nullptr, &convSrc)) ||
+            FAILED(dev11->CreateShaderResourceView(convSrc.Get(), nullptr, &convSrcView)))
+        {
+            convSrc.Reset();
+            convSrcView.Reset();
+            LOG("HDR pack: the crop's copy texture (%ux%u FP16) cannot be made\n", cw, ch);
+            return false;
+        }
+        return true;
+    }
+
+    // a view of the WGC frame for the HDR pack to read at the crop's offset; null = the crop is copied into convSrc
+    // first: in place off, a frame smaller than the crop, or the view's failure (its note once, then every frame)
+    ComPtr<ID3D11ShaderResourceView> inPlaceView(ID3D11Texture2D* tex)
+    {
+        ComPtr<ID3D11ShaderResourceView> v;
+        if (!hdrInPlace)
+            return v;
+        D3D11_TEXTURE2D_DESC fd{};
+        tex->GetDesc(&fd);
+        if (fd.Width < (UINT)cropX + cw || fd.Height < (UINT)cropY + ch)
+            return v;
+        if (hdrInPlaceFail || FAILED(dev11->CreateShaderResourceView(tex, nullptr, &v)))
+        {
+            LOG("note: the frame cannot be read in place (format %d, bind 0x%x): each frame's crop is copied "
+                "before the HDR pack\n",
+                (int)fd.Format, fd.BindFlags);
+            hdrInPlace = false;
+            v = nullptr;
+        }
+        return v;
+    }
+
+    // a crop-sized texture in the pool's format and its view (the copied reference, the copy route's arrival), made on
+    // first use; false = it cannot be made (both left null)
+    bool sameTexMake(ComPtr<ID3D11Texture2D>& t, ComPtr<ID3D11ShaderResourceView>& v)
     {
         D3D11_TEXTURE2D_DESC td{};
-        sameRefTex->GetDesc(&td);
-        return SUCCEEDED(dev11->CreateTexture2D(&td, nullptr, &sameTmpTex)) &&
-               SUCCEEDED(dev11->CreateShaderResourceView(sameTmpTex.Get(), nullptr, &sameTmpSrv));
+        td.Width = cw;
+        td.Height = ch;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = sameFmt;
+        td.SampleDesc = {1, 0};
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (SUCCEEDED(dev11->CreateTexture2D(&td, nullptr, &t)) &&
+            SUCCEEDED(dev11->CreateShaderResourceView(t.Get(), nullptr, &v)))
+            return true;
+        t.Reset();
+        v.Reset();
+        return false;
     }
 
     // the unchanged-picture test (samePicture) at the client crop's size and the pool's format; false = not available
@@ -428,26 +519,15 @@ struct Capture
         if (GetEnvironmentVariableW(L"SMV_WGC_SAME", lv, 8) && wcscmp(lv, L"fail") == 0)
             return false;
         sameCopy = wcscmp(lv, L"copy") == 0;
+        sameFmt = fmt;
         ComPtr<ID3DBlob> cs, err;
         if (FAILED(D3DCompile(kSamePictureCS, sizeof(kSamePictureCS) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0",
                               0, 0, &cs, &err)) ||
-            FAILED(dev11->CreateComputeShader(cs->GetBufferPointer(), cs->GetBufferSize(), nullptr, &sameCS)))
-            return false;
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width = cw;
-        td.Height = ch;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = fmt;
-        td.SampleDesc = {1, 0};
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(dev11->CreateTexture2D(&td, nullptr, &sameRefTex)) ||
-            FAILED(dev11->CreateShaderResourceView(sameRefTex.Get(), nullptr, &sameRefSrv)) ||
-            (sameCopy && !sameTmpMake()))
+            FAILED(dev11->CreateComputeShader(cs->GetBufferPointer(), cs->GetBufferSize(), nullptr, &sameCS)) ||
+            (sameCopy && !sameTexMake(sameTmpTex, sameTmpSrv)))
             return false;
         D3D11_BUFFER_DESC bd{};
-        bd.ByteWidth = 16;
+        bd.ByteWidth = 32;
         bd.Usage = D3D11_USAGE_DEFAULT;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         if (FAILED(dev11->CreateBuffer(&bd, nullptr, &sameCb)))
@@ -476,12 +556,16 @@ struct Capture
         return true;
     }
 
-    // true = this arrival's client picture equals the last kept one; a new picture becomes the reference. The flag's
-    // readback waits for the test's reads, so an unchanged frame may be closed right after. A new picture's reference
-    // copy is queued after the test and not waited for: takeFrames closes a kept frame only once a later arrival's test
-    // (whose readback waits for everything queued before it) has run, or after the loop's own copy of it
-    bool samePicture(wgc::Direct3D11CaptureFrame const& f)
+    // true = this arrival's client picture equals the reference; the flag's readback waits for the test's reads, so an
+    // unchanged frame may be closed right after. A new picture becomes the reference: `view` = its in-place view, and
+    // the caller holds the frame open (refFrame) until the next new picture's test has read it; no view = its crop was
+    // copied into sameRefTex, queued after the test and not waited for (the copy route, or a frame no view can read):
+    // takeFrames closes such a frame only once a later arrival's test (whose readback waits for everything queued
+    // before it) has run, or after the loop's own copy of it. A resize or a caption-sized frame drops the reference:
+    // the next picture starts over
+    bool samePicture(wgc::Direct3D11CaptureFrame const& f, ComPtr<ID3D11ShaderResourceView>& view)
     {
+        view = nullptr;
         winrt::com_ptr<ID3D11Texture2D> tex;
         int64_t ts = 0;
         try
@@ -497,13 +581,10 @@ struct Capture
         {
             tex = nullptr;
         }
-        D3D11_TEXTURE2D_DESC fd{}, rd{};
+        D3D11_TEXTURE2D_DESC fd{};
         if (tex)
-        {
             tex->GetDesc(&fd);
-            sameRefTex->GetDesc(&rd);
-        }
-        if (!tex || fd.Width < (UINT)cropX + cw || fd.Height < (UINT)cropY + ch || fd.Format != rd.Format)
+        if (!tex || fd.Width < (UINT)cropX + cw || fd.Height < (UINT)cropY + ch || fd.Format != sameFmt)
         {
             sameRef = false; // a resize or a caption-sized frame: the next picture starts over
             return false;
@@ -513,39 +594,41 @@ struct Capture
         bool same = false;
         mt->Enter();
         const D3D11_BOX box{(UINT)cropX, (UINT)cropY, 0, (UINT)cropX + cw, (UINT)cropY + ch, 1};
-        // the arrival as the test reads it: a view of the frame itself at the crop's offset, else (the copy route) its
-        // crop copied first; no texture for that = no test, the arrival counts as new
+        // the arrival as the test reads it, and as the reference once it is new: a view of the frame itself at the
+        // crop's offset, else (the copy route) its crop copied first; no texture for that = no test, the arrival counts
+        // as new. The reference: the held frame at the crop's offset, else its copy at 0
         ComPtr<ID3D11ShaderResourceView> arr;
-        UINT off[4]{(UINT)cropX, (UINT)cropY, 0, 0};
+        const bool refHeld = refFrame != nullptr;
+        UINT off[8]{(UINT)cropX, (UINT)cropY, refHeld ? (UINT)cropX : 0u, refHeld ? (UINT)cropY : 0u, cw, ch, 0, 0};
         const bool test = !keepalive && sameRef;
-        if (test && !sameCopy && FAILED(dev11->CreateShaderResourceView(tex.get(), nullptr, &arr)) && !sameViewFail)
+        if (!sameCopy && FAILED(dev11->CreateShaderResourceView(tex.get(), nullptr, &arr)) && !sameViewFail)
         {
             sameViewFail = true;
             LOG("capture: the frame cannot be read in place (format %d, bind 0x%x): each arrival is copied before its "
                 "unchanged-picture test\n",
                 (int)fd.Format, fd.BindFlags);
         }
-        if (test && !arr && (sameTmpTex || sameTmpMake()))
+        if (test && !arr && (sameTmpTex || sameTexMake(sameTmpTex, sameTmpSrv)))
         {
             ctx11->CopySubresourceRegion(sameTmpTex.Get(), 0, 0, 0, 0, tex.get(), 0, &box);
-            arr = sameTmpSrv;
             off[0] = off[1] = 0;
         }
         if (keepalive)
             sameKept++;
-        else if (test && arr)
+        else if (test && (arr || sameTmpTex))
         {
             ctx11->UpdateSubresource(sameCb.Get(), 0, nullptr, off, 0, 0);
             const UINT zero[4]{};
             ctx11->ClearUnorderedAccessViewUint(sameUav.Get(), zero);
             ctx11->CSSetShader(sameCS.Get(), nullptr, 0);
-            ID3D11ShaderResourceView* srv[2]{arr.Get(), sameRefSrv.Get()};
+            ID3D11ShaderResourceView* srv[2]{arr ? arr.Get() : sameTmpSrv.Get(),
+                                             refHeld ? refSrv.Get() : sameRefSrv.Get()};
             ctx11->CSSetShaderResources(0, 2, srv);
             ID3D11UnorderedAccessView* uav = sameUav.Get();
             ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
             ID3D11Buffer* cb = sameCb.Get();
             ctx11->CSSetConstantBuffers(0, 1, &cb);
-            ctx11->Dispatch((cw + 15) / 16, (ch + 15) / 16, 1);
+            ctx11->Dispatch((cw + 15) / 16, (ch + kSameRows - 1) / kSameRows, 1);
             ID3D11ShaderResourceView* none[2]{};
             ctx11->CSSetShaderResources(0, 2, none);
             uav = nullptr;
@@ -568,10 +651,15 @@ struct Capture
             sameTests++;
         }
         if (!same)
-            ctx11->CopySubresourceRegion(sameRefTex.Get(), 0, 0, 0, 0, tex.get(), 0, &box);
+        {
+            if (arr)
+                view = arr;
+            else if (sameRefTex || sameTexMake(sameRefTex, sameRefSrv))
+                ctx11->CopySubresourceRegion(sameRefTex.Get(), 0, 0, 0, 0, tex.get(), 0, &box);
+        }
         mt->Leave();
         if (!same)
-            sameRef = true;
+            sameRef = view != nullptr || sameRefTex != nullptr;
         return same;
     }
 
@@ -589,6 +677,9 @@ struct Capture
         lastFrameTs = 0;
         newestIn = 0;
         held = nullptr;
+        loopFrame = nullptr;
+        refFrame = nullptr;
+        refSrv.Reset();
         dgRelease();
         stopping = false;
         interop = false;
@@ -602,8 +693,10 @@ struct Capture
         convStaging.Reset();
         convSrcView.Reset();
         convUav.Reset();
+        convCb.Reset();
         sameSkip = false;
         sameRef = false;
+        sameFmt = DXGI_FORMAT_UNKNOWN;
         sameCopy = sameViewFail = false;
         sameN = sameTests = sameKept = 0;
         sameMsSum = sameMsMax = 0;
@@ -710,6 +803,12 @@ struct Capture
             hdrPack = false;
             g_hdr = false;
         }
+        {
+            wchar_t iv[8]{};
+            const bool ivSet = GetEnvironmentVariableW(L"SMV_LIVE_INPLACE", iv, 8) > 0;
+            hdrInPlace = hdrPack && !(ivSet && wcscmp(iv, L"0") == 0);
+            hdrInPlaceFail = ivSet && wcscmp(iv, L"fail") == 0;
+        }
 
         // the unchanged-picture test (sameSkip), every fit; SMV_WGC_SAME=0 = off (A/B)
         if (allowSame)
@@ -732,7 +831,8 @@ struct Capture
 
         // HDR mode captures FP16 scRGB (linear, 709 primaries, 1.0 = 80 nits); the server
         // re-encodes to BT.2020 PQ. SDR stays 8-bit BGRA. The unchanged-picture test holds a frame while it runs:
-        // a third buffer keeps WGC from discarding the next arrival meanwhile
+        // a third buffer keeps WGC from discarding the next arrival meanwhile (its reference is a held frame too, the
+        // one the loop's release would free)
         pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
             rtDev,
             g_hdr ? wgdx::DirectXPixelFormat::R16G16B16A16Float : wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -811,9 +911,28 @@ struct Capture
         return lastArrTs && nowQpc100() - lastArrTs > 3000000;
     }
 
+    // back to the pool, unless the frame still holds a role (held, the loop's, the test's reference); under lk
+    void closeFree(wgc::Direct3D11CaptureFrame const& f)
+    {
+        if (f && f != held && f != loopFrame && f != refFrame)
+            f.Close();
+    }
+
+    // the loop's frame back (to the pool, unless it is the test's reference); every drained frame ends here
+    void release(wgc::Direct3D11CaptureFrame& frame)
+    {
+        AcquireSRWLockExclusive(&lk);
+        if (frame == loopFrame)
+            loopFrame = nullptr;
+        closeFree(frame);
+        ReleaseSRWLockExclusive(&lk);
+        frame = nullptr;
+    }
+
     // every frame on the pool into `held`, the newest kept (FrameArrived's thread and drainNewest; with sameSkip
     // FrameArrived's alone, so the arrivals are tested in their order). The test runs outside lk: drainNewest never
-    // waits for the GPU behind it. True = a frame was kept
+    // waits for the GPU behind it. A kept frame takes the roles (held; with a view, the test's reference) and the
+    // frames that lost every role go back to the pool. True = a frame was kept
     bool takeFrames()
     {
         bool kept = false;
@@ -825,10 +944,11 @@ struct Capture
             auto f = pool.TryGetNextFrame();
             if (!f)
                 break;
+            ComPtr<ID3D11ShaderResourceView> view;
             if (sameSkip)
             {
                 ReleaseSRWLockExclusive(&lk);
-                const bool same = samePicture(f);
+                const bool same = samePicture(f, view);
                 AcquireSRWLockExclusive(&lk);
                 if (same || stopping)
                 {
@@ -847,12 +967,20 @@ struct Capture
             }
             arrGap = lastArrTs && ts > lastArrTs ? ts - lastArrTs : 0;
             lastArrTs = ts;
-            if (held)
-            {
-                held.Close();
-                dropped++;
-            } // superseded = the pipeline fell behind
+            const auto oldHeld = held, oldRef = refFrame;
             held = f;
+            if (sameSkip)
+            {
+                refSrv = view;
+                refFrame = nullptr;
+                if (view != nullptr)
+                    refFrame = f;
+            }
+            if (oldHeld)
+                dropped++; // superseded = the pipeline fell behind
+            closeFree(oldHeld);
+            if (oldRef != oldHeld)
+                closeFree(oldRef);
             kept = true;
         }
         ReleaseSRWLockExclusive(&lk);
@@ -862,7 +990,7 @@ struct Capture
     }
 
     // hand out the newest frame; -3 = none pending, -2 = resized, -1 = failure,
-    // else 0 and `tex` holds the frame texture (caller must Close `frame`)
+    // else 0 and `tex` holds the frame texture (the caller hands `frame` back through release())
     int drainNewest(wgc::Direct3D11CaptureFrame& frame, winrt::com_ptr<ID3D11Texture2D>& tex)
     {
         if (!sameSkip)
@@ -872,11 +1000,14 @@ struct Capture
         {
             if (frame)
             {
-                frame.Close();
+                if (frame == loopFrame)
+                    loopFrame = nullptr;
+                closeFree(frame);
                 dropped++;
             }
             frame = held;
             held = nullptr;
+            loopFrame = frame;
         }
         ReleaseSRWLockExclusive(&lk);
         if (!frame)
@@ -902,21 +1033,18 @@ struct Capture
                       abs((int)(wb.right - wb.left) - (int)fullW) <= 2 &&
                       abs((int)(wb.bottom - wb.top) - (int)fullH) <= 2)))
                 {
-                    frame.Close();
-                    frame = nullptr;
+                    release(frame);
                     return -3;
                 }
                 LOG("target window resized (%dx%d -> %ux%u)\n", csz.Width, csz.Height, fullW, fullH);
-                frame.Close();
-                frame = nullptr;
+                release(frame);
                 return -2;
             }
         }
         auto access = frame.Surface().as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
         if (FAILED(access->GetInterface(winrt::guid_of<ID3D11Texture2D>(), tex.put_void())))
         {
-            frame.Close();
-            frame = nullptr;
+            release(frame);
             return -1;
         }
         lastFrameTs = frame.SystemRelativeTime().count(); // capture->present latency anchor
@@ -966,7 +1094,7 @@ struct Capture
         if (rc)
             return rc;
         copyCropped(sharedTex.Get(), tex.get());
-        frame.Close();
+        release(frame);
         newestIn = 2;
         return 1;
     }
@@ -1021,26 +1149,46 @@ struct Capture
         // The R32_UINT staging bytes ARE the R10G10B10A2_UNORM bit pattern presentFrame uploads.
         if (hdrPack)
         {
-            copyCropped(convSrc.Get(), tex.get());
-            frame.Close();
+            // the pack reads the frame at the crop's offset, the frame back to the pool after the Map (it waits for
+            // the pack); else the crop is copied first and read at 0
+            const ComPtr<ID3D11ShaderResourceView> arr = inPlaceView(tex.get());
+            if (!arr)
+            {
+                if (!convSrcReady())
+                {
+                    release(frame);
+                    return -1;
+                }
+                copyCropped(convSrc.Get(), tex.get());
+                release(frame);
+            }
             newestIn = 0;
             if (mt)
                 mt->Enter(); // samePicture binds its own compute shader from FrameArrived's thread
             ctx11->CSSetShader(convCS.Get(), nullptr, 0);
-            ID3D11ShaderResourceView* srv = convSrcView.Get();
+            ID3D11ShaderResourceView* srv = arr ? arr.Get() : convSrcView.Get();
             ctx11->CSSetShaderResources(0, 1, &srv);
             ID3D11UnorderedAccessView* uav = convUav.Get();
             ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            const UINT off[4]{arr ? (UINT)cropX : 0u, arr ? (UINT)cropY : 0u, 0, 0};
+            ctx11->UpdateSubresource(convCb.Get(), 0, nullptr, off, 0, 0);
+            ID3D11Buffer* cb = convCb.Get();
+            ctx11->CSSetConstantBuffers(0, 1, &cb);
             ctx11->Dispatch((cw + 7) / 8, (ch + 7) / 8, 1);
             srv = nullptr;
             uav = nullptr; // unbind so next frame's copy into convSrc is hazard-free
+            cb = nullptr;
             ctx11->CSSetShaderResources(0, 1, &srv);
             ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            ctx11->CSSetConstantBuffers(0, 1, &cb);
             if (mt)
                 mt->Leave();
             ctx11->CopyResource(convStaging.Get(), convDst.Get());
             D3D11_MAPPED_SUBRESOURCE pm{};
-            if (FAILED(ctx11->Map(convStaging.Get(), 0, D3D11_MAP_READ, 0, &pm)))
+            const HRESULT mapped = ctx11->Map(convStaging.Get(), 0, D3D11_MAP_READ, 0, &pm);
+            if (arr)
+                release(frame); // the pack has run: the Map waited for it
+            if (FAILED(mapped))
                 return -1;
             use((const uint8_t*)pm.pData, (size_t)pm.RowPitch, false);
             ctx11->Unmap(convStaging.Get(), 0);
@@ -1048,7 +1196,7 @@ struct Capture
         }
 
         copyCropped(staging.Get(), tex.get());
-        frame.Close();
+        release(frame);
         newestIn = 1;
 
         D3D11_MAPPED_SUBRESOURCE map{};
@@ -1073,40 +1221,70 @@ struct Capture
             return rc;
         const int s = dgSlot;
         dgSlot ^= 1;
-        copyCropped(hdrPack ? convSrc.Get() : dgSrc.Get(), tex.get());
-        frame.Close();
+        // HDR10: the pack reads the frame itself at the crop's offset, the frame stays out of the pool until the
+        // thumbnail's Map below (the thumbnail reads the pack's slot); else the crop is copied first
+        const ComPtr<ID3D11ShaderResourceView> arr = inPlaceView(tex.get());
+        if (!arr)
+        {
+            if (hdrPack && !convSrcReady())
+            {
+                release(frame);
+                return -1;
+            }
+            copyCropped(hdrPack ? convSrc.Get() : dgSrc.Get(), tex.get());
+            release(frame);
+        }
         newestIn = 0;
         if (mt)
             mt->Enter(); // samePicture binds its own compute shader from FrameArrived's thread
-        // one compute pass: t0 = srv, u0 = dst, u1 = in (an R32_UINT input read as a UAV)
-        auto pass = [&](ID3D11ComputeShader* cs, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* dst,
-                        ID3D11UnorderedAccessView* in, UINT w, UINT h) {
+        // one compute pass: t0 = srv, u0 = dst (and u1 = dst1 when given)
+        auto pass = [&](ID3D11ComputeShader* cs, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* dst, UINT w,
+                        UINT h, ID3D11UnorderedAccessView* dst1 = nullptr) {
             ctx11->CSSetShader(cs, nullptr, 0);
             ctx11->CSSetShaderResources(0, 1, &srv);
-            ID3D11UnorderedAccessView* uav[2] = {dst, in};
-            ctx11->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
+            ID3D11UnorderedAccessView* uavs[2]{dst, dst1};
+            const UINT n = dst1 ? 2u : 1u;
+            ctx11->CSSetUnorderedAccessViews(0, n, uavs, nullptr);
             ctx11->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
             srv = nullptr;
-            uav[0] = uav[1] = nullptr;
+            uavs[0] = uavs[1] = nullptr;
             ctx11->CSSetShaderResources(0, 1, &srv);
-            ctx11->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
+            ctx11->CSSetUnorderedAccessViews(0, n, uavs, nullptr);
         };
-        if (hdrPack) // dlssg HDR: the pack into convDst first, the passes below read its words
-            pass(convCS.Get(), convSrcView.Get(), convUav.Get(), nullptr, cw, ch);
-        ID3D11ShaderResourceView* src = hdrPack ? nullptr : dgSrcView.Get();
-        ID3D11UnorderedAccessView* in = hdrPack ? convUav.Get() : nullptr;
-        // the thumbnail first: its Map below waits for it alone, not for the slot's wait
-        pass(dgThumbCS.Get(), src, dgThumbUav.Get(), in, cw / 4, ch / 4);
-        ctx11->CopyResource(dgThumbStage.Get(), dgThumb.Get());
-        if (dgFree[s])
-            ctx4->Wait(dgCopied.Get(), dgFree[s]); // the slot's last frame was copied out
-        pass(dgCS.Get(), src, dgUav[s].Get(), in, cw, ch);
-        ctx4->Signal(dgWrote.Get(), ++dgWroteVal);
+        if (hdrPack)
+        {
+            // dlssg HDR: the pack stores the slot itself once its last frame was copied out, and the thumbnail beside
+            // it (u1) from the codes it made: no pass reads the slot back
+            if (dgFree[s])
+                ctx4->Wait(dgCopied.Get(), dgFree[s]);
+            const UINT off[4]{arr ? (UINT)cropX : 0u, arr ? (UINT)cropY : 0u, 0, 0};
+            ctx11->UpdateSubresource(convCb.Get(), 0, nullptr, off, 0, 0);
+            ID3D11Buffer* cb = convCb.Get();
+            ctx11->CSSetConstantBuffers(0, 1, &cb);
+            pass(dgCS.Get(), arr ? arr.Get() : convSrcView.Get(), dgUav[s].Get(), cw, ch, dgThumbUav.Get());
+            cb = nullptr;
+            ctx11->CSSetConstantBuffers(0, 1, &cb);
+            ctx4->Signal(dgWrote.Get(), ++dgWroteVal);
+            ctx11->CopyResource(dgThumbStage.Get(), dgThumb.Get());
+        }
+        else
+        {
+            // the thumbnail first: its Map below waits for it alone, not for the slot's wait
+            pass(dgThumbCS.Get(), dgSrcView.Get(), dgThumbUav.Get(), cw / 4, ch / 4);
+            ctx11->CopyResource(dgThumbStage.Get(), dgThumb.Get());
+            if (dgFree[s])
+                ctx4->Wait(dgCopied.Get(), dgFree[s]); // the slot's last frame was copied out
+            pass(dgCS.Get(), dgSrcView.Get(), dgUav[s].Get(), cw, ch);
+            ctx4->Signal(dgWrote.Get(), ++dgWroteVal);
+        }
         if (mt)
             mt->Leave();
         ctx11->Flush(); // the DLSS-G device waits for the signal
         D3D11_MAPPED_SUBRESOURCE map{};
-        if (FAILED(ctx11->Map(dgThumbStage.Get(), 0, D3D11_MAP_READ, 0, &map)))
+        const HRESULT mapped = ctx11->Map(dgThumbStage.Get(), 0, D3D11_MAP_READ, 0, &map);
+        if (arr)
+            release(frame); // the pack has run (the thumbnail is its write): the Map waited for it
+        if (FAILED(mapped))
             return -1;
         use((const uint8_t*)map.pData, (size_t)map.RowPitch, s, dgWroteVal);
         ctx11->Unmap(dgThumbStage.Get(), 0);
@@ -1115,12 +1293,20 @@ struct Capture
 
     void stop()
     {
+        if (sameSkip)
+            AcquireSRWLockExclusive(&sameLk); // no test in flight reads the reference while it goes
         AcquireSRWLockExclusive(&lk);
         stopping = true;
-        if (held)
-            held.Close();
+        const auto h = held, r = refFrame;
         held = nullptr;
+        refFrame = nullptr;
+        refSrv.Reset();
+        closeFree(h);
+        if (r != h)
+            closeFree(r);
         ReleaseSRWLockExclusive(&lk);
+        if (sameSkip)
+            ReleaseSRWLockExclusive(&sameLk);
         if (sameSkip)
             LOG("capture: %llu unchanged arrivals dropped, %llu kept after %d ms; the test %.3f ms mean, %.3f ms max "
                 "over %llu\n",

@@ -220,8 +220,9 @@ struct Host
     ComPtr<ID3D12Fence> dgWrote, dgCopied;
     HANDLE dgCopiedH{};
     uint64_t dgCopiedVal = 0;
-    int dgPend = -1;          // the slot the next present copies into texFrame (presentShared), -1 = none
-    uint64_t dgPendWrote = 0; // the dgWrote value that present waits for
+    int dgPend = -1;          // the slot the next present copies into the back buffer (presentShared), -1 = none
+    int dgLast = -1;          // the slot presented last (presentLast presents it again), -1 = a CPU frame was
+    uint64_t dgPendWrote = 0; // the dgWrote value that present waits for (still dgLast's when presentLast runs)
     UINT rowPitch = 0;
     // Ring of 3 allocators so the slot-buffer presents can be PIPELINED (recorded while earlier
     // presents still execute); allocFence[i] gates reuse of allocs[i]. alloc stays an alias
@@ -534,6 +535,8 @@ struct Host
             sl::DLSSGOptions go{};
             go.mode = sl::DLSSGMode::eOn;
             go.numFramesToGenerate = (uint32_t)genFrames;
+            go.mvecDepthWidth = panvec::vecSize(W);
+            go.mvecDepthHeight = panvec::vecSize(H);
             CHECK_SL(slDLSSGSetOptions(vp, go));
 
             sl::DLSSGState st{};
@@ -562,12 +565,13 @@ struct Host
         rowPitch = (W * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
 
         auto makeTex = [&](DXGI_FORMAT fmt, ComPtr<ID3D12Resource>& tex,
-                           D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) -> bool {
+                           D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE, uint32_t tw = W,
+                           uint32_t th = H) -> bool {
             D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
             D3D12_RESOURCE_DESC rd{};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            rd.Width = W;
-            rd.Height = H;
+            rd.Width = tw;
+            rd.Height = th;
             rd.DepthOrArraySize = 1;
             rd.MipLevels = 1;
             rd.Format = fmt;
@@ -591,8 +595,11 @@ struct Host
                 device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&buf)));
         };
         // texFrame = the SL route's staging copy (the server route copies the footprint straight into the back buffer)
-        if ((useSL && (!makeTex(texFmt, texFrame) || !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth) ||
-                       !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
+        const uint32_t vw = panvec::vecSize(W), vh = panvec::vecSize(H);
+        if ((useSL &&
+             (!makeTex(texFmt, texFrame) ||
+              !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth, D3D12_RESOURCE_FLAG_NONE, vw, vh) ||
+              !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, vw, vh))) ||
             !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadRing[0]) ||
             (useSL &&
              !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadRing[1])))
@@ -616,7 +623,7 @@ struct Host
             list->Reset(alloc.Get(), nullptr);
             D3D12_TEXTURE_COPY_LOCATION dl{texDepth.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             D3D12_TEXTURE_COPY_LOCATION sl_{uploadBuf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            sl_.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, W, H, 1, rowPitch};
+            sl_.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, vw, vh, 1, rowPitch};
             list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
             list->Close();
             ID3D12CommandList* ls[] = {list.Get()};
@@ -741,12 +748,12 @@ struct Host
             CloseHandle(dgCopiedH);
         dgCopiedH = nullptr;
         dgCopiedVal = 0;
-        dgPend = -1;
+        dgPend = dgLast = -1;
     }
 
     // the GPU handoff's present: the estimate on the frame's 1/4 thumbnail (rows `pitch` apart), then slot `slot`
-    // copied into texFrame once the capture device's dgWrote reaches `wrote`. Returns the dgCopied value that frees the
-    // slot, 0 = the present failed
+    // copied into the back buffer once the capture device's dgWrote reaches `wrote`. Returns the dgCopied value that
+    // frees the slot, 0 = the present failed
     uint64_t presentShared(const uint8_t* thumb, UINT pitch, int slot, uint64_t wrote)
     {
         if (panOn)
@@ -784,11 +791,12 @@ struct Host
         return ok;
     }
 
-    // src null on the SL route = the GPU handoff's slot dgPend (presentShared), else texFrame as it is (the last frame)
+    // src null on the SL route = the GPU handoff's slot dgPend (presentShared), else its slot presented last again
+    // (presentLast; the caller moves that slot's dgFree to dgCopiedVal), else texFrame as it is (the last CPU frame)
     bool presentTailInner(ID3D12Resource* src, UINT64 srcOffset, UINT srcPitch)
     {
         pumpMessages();
-        const int pend = src ? -1 : dgPend;
+        const int pend = src ? -1 : dgPend >= 0 ? dgPend : dgLast;
         dgPend = -1;
 
         // Pipelining: the shared VRAM slot buffer (stable until the next group) and, on the SL route, a CPU frame
@@ -836,23 +844,32 @@ struct Host
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        if (useSL)
+        if (useSL && pend >= 0)
+        {
+            // the capture device's slot (resting in COMMON) straight into the back buffer
+            D3D12_RESOURCE_BARRIER bs[2]{b, b};
+            bs[0].Transition.pResource = dgTex[pend].Get();
+            bs[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            bs[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            bs[1].Transition.pResource = backbuffers[bb].Get();
+            bs[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            bs[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            list->ResourceBarrier(2, bs);
+            list->CopyResource(backbuffers[bb].Get(), dgTex[pend].Get());
+            for (D3D12_RESOURCE_BARRIER& x : bs)
+                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            list->ResourceBarrier(2, bs);
+            dgLast = pend;
+        }
+        else if (useSL)
         {
             // SL route: stage through texFrame (unchanged, verified pipeline)
             D3D12_TEXTURE_COPY_LOCATION dl{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            if (pend >= 0)
+            if (src)
             {
-                // the capture device's slot, resting in COMMON
-                b.Transition.pResource = dgTex[pend].Get();
-                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                list->ResourceBarrier(1, &b);
-                list->CopyResource(texFrame.Get(), dgTex[pend].Get());
-                std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-                list->ResourceBarrier(1, &b);
-            }
-            else if (src)
                 list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
+                dgLast = -1;
+            }
             b.Transition.pResource = texFrame.Get();
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -888,26 +905,25 @@ struct Host
 
         if (useSL)
         {
-            sl::Extent fullExtent{0, 0, W, H};
+            sl::Extent vecExtent{0, 0, panvec::vecSize(W), panvec::vecSize(H)};
             sl::Resource depthRes(sl::ResourceType::eTex2d, texDepth.Get(),
                                   (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-            depthRes.width = W;
-            depthRes.height = H;
+            depthRes.width = vecExtent.width;
+            depthRes.height = vecExtent.height;
             depthRes.nativeFormat = DXGI_FORMAT_R32_FLOAT;
             sl::Resource mvecRes(sl::ResourceType::eTex2d, texMvec.Get(),
                                  (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-            mvecRes.width = W;
-            mvecRes.height = H;
+            mvecRes.width = vecExtent.width;
+            mvecRes.height = vecExtent.height;
             mvecRes.nativeFormat = DXGI_FORMAT_R16G16_FLOAT;
             // NOTE: do NOT tag kBufferTypeBackbuffer (see dlssg-two-frame: it flips sl.dlss_g
             // into the subrect present path)
             sl::ResourceTag tags[] = {
-                sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent,
-                                &fullExtent),
+                sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &vecExtent),
                 sl::ResourceTag(&mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
-                                &fullExtent),
+                                &vecExtent),
             };
             if (slSetTagForFrame(*tok, vp, tags, _countof(tags), nullptr) != sl::Result::eOk)
                 return false;
@@ -966,7 +982,7 @@ struct Host
         if (pipelined)
             return true;
         if (useSL && !src)
-            return true; // texFrame and the slot are the GPU's alone (the capture device waits on dgCopied)
+            return true; // the slot (or texFrame) is the GPU's alone (the capture device waits on dgCopied)
         if (useSL && src == uploadBuf.Get())
         {
             // a CPU frame on the SL route: the next one fills the ring's other buffer, this one is free once the fence
@@ -1030,23 +1046,23 @@ struct Host
             std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
         list->ResourceBarrier(2, b);
         list->Close();
-        sl::Extent fullExtent{0, 0, W, H};
+        sl::Extent vecExtent{0, 0, panvec::vecSize(W), panvec::vecSize(H)};
         sl::Resource depthRes(
             sl::ResourceType::eTex2d, texDepth.Get(),
             (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-        depthRes.width = W;
-        depthRes.height = H;
+        depthRes.width = vecExtent.width;
+        depthRes.height = vecExtent.height;
         depthRes.nativeFormat = DXGI_FORMAT_R32_FLOAT;
         sl::Resource mvecRes(
             sl::ResourceType::eTex2d, texMvec.Get(),
             (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-        mvecRes.width = W;
-        mvecRes.height = H;
+        mvecRes.width = vecExtent.width;
+        mvecRes.height = vecExtent.height;
         mvecRes.nativeFormat = DXGI_FORMAT_R16G16_FLOAT;
         sl::ResourceTag tags[] = {
-            sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &fullExtent),
+            sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &vecExtent),
             sl::ResourceTag(&mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
-                            &fullExtent),
+                            &vecExtent),
         };
         if (slSetTagForFrame(*tok, vp, tags, _countof(tags), nullptr) != sl::Result::eOk)
             return false;

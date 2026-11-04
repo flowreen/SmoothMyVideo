@@ -382,7 +382,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--dlssg] [--no-gpu-fit]
-  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr | --fsr-upscale] [--rtx-hdr] [--dv] [--hdr10plus]
+  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
@@ -404,7 +404,9 @@ Timing:
   without it: its host is stateful across pairs (skipping a send would desynchronise the frame
   it interpolates from) and it already returns the held frame on an identical pair.
 
-Models (GMFSS is the default, the anime specialist):
+Models (the app's default = DLSS 4.5 where `dlssg-ready` reports an RTX 40 / 50 GPU with hardware-accelerated GPU
+scheduling on (nvidia-smi's name + HwSchMode 2, read once a run), else GMFSS, the anime specialist; a saved choice wins;
+the CLI's default with no model flag stays GMFSS):
 * GMFSS on HDR planes (HDR video, the HDR desktop, RTX HDR's output): every value outside 0..1 breaks
   its synthesis (read as extended sRGB, highlights lost 5 to 11 dB and wide gamut 8 dB on exact
   pans), and on PQ codes it falls short of its SDR quality, so the host decides per frame pair
@@ -623,7 +625,9 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   F x the width x the ratio (720x480 at 32:27 x 2 = 1706x960), so no player has to stretch the picture. The plan's
   log line names either case. Gate `harness\anamorphic_sar\sar_probe.py` (every route's display aspect).
   `--rtx-vsr` uses RTX Video Super Resolution for an enlarging resize (the GUI ticks it by
-  default), otherwise Lanczos. The bridge reads and writes R, G, B, A bytes, the order the host's VSR buffers hold;
+  default), otherwise Lanczos. `--vsr-quality N` picks its quality level, 1..4 (default 4 = Ultra, the GUI's slider
+  beside the box): the network runs at the input size, so a level's GPU time per frame is the same at any output size
+  (1080p in, RTX 5090 Laptop: 4 = 5.4 ms, 3 = 3.9, 2 = 1.8, 1 = 1.4); the host logs the level when it is not 4. The bridge reads and writes R, G, B, A bytes, the order the host's VSR buffers hold;
   a live slot takes them as B, G, R, A in the store's one pass. `--fsr-upscale` puts AMD FSR 4.1.2 (its INT8 model) in that same resize instead
   (the two exclude each other; with both, RTX VSR keeps it and the host says so): AMD's signed FidelityFX loader +
   upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, which opens the upscaler's GPU gate (see "AMD FSR
@@ -702,8 +706,15 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   in-engine. The RPU's `source_max_pq` and L6 take the render's `--hdr-nits` peak (dovi_tool's own pick from L6
   stays at 1000 nits for other peaks); HDR10+ takes the same peak in its HDR10 boxes, its scene values are measured. B-frames are disabled for DV renders (dovi_tool needs an Annex-B stream whose coding
   order equals display order for an exact remux). Best-effort: any failure keeps the HDR10 file.
-  The preview does not change with `--dv` (the pixels are identical HDR10). Legal: `dvvC` is our
-  own code writing a public box format; the UI says "Profile 8.1", credits
+  `--dv-profile 8.4` (default 8.1; the GUI's second Dolby Vision box) writes the video as HLG instead: the encode's
+  zimg step converts the host's PQ frames with BT.2100's 1000-nit nominal peak (`transfer=arib-std-b67:npl=1000`;
+  203 nits = HLG 75 %, 1000 nits = 100 %, as BT.2408 has them), the stream is tagged HLG, TrueHDR's peak is capped at
+  1000 nits (a line says so), `dovi_tool generate` takes `"profile": "8.4"` (its HLG base layer with static
+  reshaping; L1 / L6 = the PQ frames, the picture the reshaping rebuilds), `dvvC` carries compatibility 4 and no HDR10
+  boxes are written. HDR10+ needs HDR10 (PQ), so `--hdr10plus` is skipped with a line on an 8.4 render.
+  The preview does not change with `--dv` (the pixels are identical HDR10; with 8.4 the picture before its HLG
+  conversion). Legal: `dvvC` is our
+  own code writing a public box format; the UI says "Profile 8.1" / "Profile 8.4", credits
   dovi_tool and carries a non-affiliation disclaimer. Dolby and Dolby Vision are trademarks of
   Dolby Laboratories; this project is independent and bundles no Dolby software.
 * `--hdr10plus`: SMPTE ST 2094-40 dynamic metadata measured per frame during the HDR render
@@ -885,7 +896,7 @@ mean); a Reset on every evaluate made the pass a pure function of the frame (0 o
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr | --fsr-upscale --upscale H --restore
+  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --nr-passes 1..20 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
@@ -936,10 +947,12 @@ byte-identical, so the throttle saw a 360 fps source and showed the video's own 
 `Capture::samePicture` therefore tests every arrival's client picture, every fit, on FrameArrived's thread (a GPU bit
 compare against the last kept picture; its readback waits with the immediate context locked, the faster of the two
 ways measured) and drops an
-unchanged one uncounted. The test reads the capture's frame in place (a view of it at the client crop's offset), and
-only a new picture's crop is copied, after the test, to become the reference: an unchanged arrival costs the compare
-alone. `SMV_WGC_SAME=copy` copies every arrival's crop before its test instead (the route a frame no view can read
-also takes, with a one-time log line). An unchanged arrival still counts once 500 ms passed since the last kept one
+unchanged one uncounted. The test reads the capture's frame in place (a view of it at the client crop's offset)
+against the last kept frame itself, held open until the next new picture's test has read it: no reference copy, no
+reference texture, and an unchanged arrival costs the compare alone. A changed picture stops early: each compute thread tests four pixels (a group four stacked 16 x 16 tiles) and
+skips its reads when it finds the flag already set (a plain read: within one dispatch the flag only goes from 0 to 1,
+so a stale read just compares). `SMV_WGC_SAME=copy` copies every arrival's crop before its test instead and keeps the reference as a copy of
+the crop (the route a frame no view can read also takes, with a one-time log line). An unchanged arrival still counts once 500 ms passed since the last kept one
 (`kSameKeepalive`): the static hold's refresh repaint brings the current picture after a model load or a pause, and
 DLSS-G's 700 ms input-gap reset never fires on a source that keeps presenting a still. The probe (`--probe`) keeps
 every arrival. The session's closing `capture:` line counts the drops, the keepalives and the test's cost. `SMV_WGC_SAME=0` turns the test off (A/B); where it cannot run (`SMV_WGC_SAME=fail` = the trigger) the
@@ -1138,6 +1151,8 @@ makes with the same integer sums: `Estimator::runThumb`): luma thumbnails at 1/4
 each way), refines at 1/16 and 1/4, a sub-pixel fit. When one translation explains the change (its error under 0.6 x
 the still picture's, and at least half of the changed 32 px tiles agree), the vector texture holds it, written by a
 UAV clear; tiles a still picture explains clearly better (subtitles, logos, the edge of a letterbox bar) stay zero.
+The depth and vector textures DLSS-G is given are half the frame per axis (`panvec::kVecDiv`; the still tiles scale
+exactly): the generated frames are byte for byte the full-size textures' at a quarter of the bytes.
 Anything else, and every move under 1 px, keeps the exact zero vectors, so those frames are the ones DLSS-G made
 without it. A frame from a GPU ring (Live's second cascade stage, the effects route's slots) keeps zero vectors. The
 run's summary line: `pan vectors: N of M frames moved (mean P px, S % of their area still), E ms a frame`. Every other
@@ -1149,7 +1164,12 @@ and driver from a 2-frame 256x128 render (the host's `server max N` line) and ke
 as `dlssg_limit.json`. A whole multiple above it runs in passes, the largest pass first, so that as many
 frames as possible are DLSS 4.5's own from the original frames (x8 = 4 x 2: in every 8 frames the real
 one and three are the direct x4's; x12 = 6 x 2, x16 = 4 x 4; an RTX 40's x4 = 2 x 2); a multiple no
-passes within the limit make (x7, x11) stops with the nearest ones. The first pass is the render's host
+passes within the limit make (x7, x11) stops with the nearest ones. A TARGET BETWEEN MULTIPLES (`--dlssg --fps T`,
+`dlssgFpsPlan`): the smallest multiple M the passes make whose every k-th frame (k <= 6) lands within 0.5 % of T
+renders as M and the encode keeps every k-th frame (`framestep`; 23.976 -> 60 = x5 every 2nd = 59.94, 24 -> 60 = 60,
+25 -> 60 = x12 every 5th): the kept frames stay evenly spaced on the x5 grid; no such M = the first multiple reaching
+T within 3 % (Live's rule: 23.976 -> 50 = x3); a line names the choice, and resume is off for a k > 1 render (its
+frames do not line up with source pairs). The first pass is the render's host
 (resident or one-shot) with everything before the model and the model at the working size, its output
 at the working size as rgb48le; each later pass is a one-shot `smv-live.exe --offline --dlssg` fed the
 previous pass's frames through a pipe, the last one with the final resize and the encoder after it.
@@ -1885,6 +1905,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_FSRFG_PIPE=0` / `=force` / `=serial` | Live AMD FSR frame generation: never pipeline the midpoint tree across pairs / pipeline every ladder and fixed multiplier, x2 included (gates) / the same with the new pair's level-1 Optical Flow after the shown pair's deeper calls (an A/B lever); unset = the priced automatic route (see "Pipelined across pairs") |
 | `SMV_FRUC_STEPUP=0` | Live Smooth Motion / AMD FSR 4 FG: a target between two ladder nodes runs the largest node that fits instead of the node above it (gates; see "The node above the target") |
 | `SMV_LIVE_DGPU=0` / `=fail` | Live DLSS 4.5's direct pass hands its frames to DLSS-G through the CPU and an upload copy instead of on the GPU (the A/B lever) / the GPU handoff's setup fails (its trigger test: `note: the GPU handoff is unavailable ...`, the session runs the upload route); never a product setting |
+| `SMV_LIVE_INPLACE=0` / `=fail` | the HDR10 pack (the GPU handoff's and the upload route's) reads a copy of the client crop instead of the WGC frame in place (the A/B lever) / the frame's view fails (its trigger test: `note: the frame cannot be read in place ...`, the session copies each crop); never a product setting |
 | `SMV_LIVE_CASCADE=off` / `=probe` / `=present`, `SMV_LIVE_CASCADE_GEN` | Live DLSS 4.5: `off` = one pass only (no plan above the limit); development only (the direct route): `probe` starts `dlssg2f.exe --stage1` beside the session (in a job object that ends it with the host), feeds it every captured frame and reads every frame it shares on the host's own D3D12 device, presenting nothing of it; `present` = the cascade: the session's DLSS-G (`--gen`) presents stage 1's frames instead of the captured ones (x6 x x2 = x12); `_GEN` = stage 1's generated frames (1..5, default 5). Lines `cascade probe: ...` / `cascade stage 1: ...` (harness `dlssg_cascade\probe_gate.py`) |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..9, default 3 offline, 2 live; exact nodes go to depth 9 either way) |
 | `SMV_CQ` | override the encoder CQ for measurement |
@@ -2320,12 +2341,20 @@ Rules (hard-won, do not regress):
   first Present.
 * The direct DLSS 4.5 pass (no effects, no cascade) hands each frame to DLSS-G on the GPU
   (`Capture::latestFrameShared`, `Host::presentShared`): the capture device stores the crop into one of two shared
-  textures in the swap chain's format (SDR: `kDgSwizzleCS`, the B8G8R8A8 crop as R8G8B8A8; HDR10: `kDgUnpack10CS`, the
-  pack's words as R10G10B10A2), the DLSS-G queue waits on the capture device's fence (`dgWrote`), copies the slot into
-  `texFrame` and signals its own (`dgCopied`), which the capture device waits on before it rewrites that slot. The pan
-  estimate reads back only the 1/4 thumbnail (`kDgThumbCS` / `kDgThumb10CS`). The frames and vectors are the bytes of
-  the upload route; a thumbnail change edits these shaders and `thumbStep` / `thumbStep10` together. At 4K the two 33 MB
-  copies over PCIe were most of the cycle's GPU time.
+  textures in the swap chain's format (SDR: `kDgSwizzleCS`, the B8G8R8A8 crop as R8G8B8A8; HDR10: the pack itself,
+  `kHdrPackCS` compiled with `SLOT`, its codes stored as R10G10B10A2), the DLSS-G queue waits on the capture device's
+  fence (`dgWrote`), copies the slot straight into the back buffer and signals its own (`dgCopied`), which the capture
+  device waits on before it rewrites that slot. A re-present of the last frame (the reset after an input gap) copies
+  that slot again (`dgLast`), and the loop moves the slot's `dgFree` to that copy's `dgCopied` value, so the capture
+  device never rewrites it while the copy is queued. The pan estimate reads back only the 1/4 thumbnail (SDR:
+  `kDgThumbCS` of the crop; HDR10: the pack writes it beside the slot from its own codes, through the group's shared
+  sums, so no pass reads the slot back). The frames and vectors are the bytes of the upload route; a thumbnail change
+  edits these shaders and `thumbStep` / `thumbStep10` together. At 4K the two 33 MB copies over PCIe were most of the
+  cycle's GPU time. HDR10's pack reads the WGC frame itself at the client crop's offset (its `crop` cbuffer; 0 for a
+  copied crop) instead of a copy of the crop, and the frame goes back to the pool after the thumbnail's Map (the
+  thumbnail is the pack's write, so that Map waits for the pack). The upload route's pack (the session's first
+  frame, a cascade, the effects route) reads the frame in place too and returns it after its readback's Map, so the
+  crop's FP16 copy (`convSrc`, 66 MB at 4K) is made only once a frame cannot be read in place.
 * The overlay never activates: it is created `WS_EX_NOACTIVATE` and shown with `SW_SHOWNOACTIVATE`
   (a resume with `SW_SHOWNA`), so a live start or resume never takes the user's focus. Streamline 2.14
   pauses DLSS-FG while its window is not the foreground; the focus shim

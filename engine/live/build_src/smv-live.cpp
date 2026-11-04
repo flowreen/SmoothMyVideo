@@ -160,6 +160,7 @@ static bool g_noHudLat = false;                // --no-hud-latency: keep the rea
 static bool g_noFillMouse = false;             // --no-fill-mouse: Fill leaves the mouse alone (FillMouse)
 static double g_sharpen = 0.0;                 // --sharpen S: Adaptive Sharpen strength 0..2 (both routes)
 static bool g_rtxVsr = false;                  // --rtx-vsr: forwarded to the server (VSR fill upscaler)
+static int g_vsrQuality = 4;                   // --vsr-quality N: RTX VSR's quality level 1..4, 4 = Ultra (both routes)
 static bool g_fsrUp = false;                   // --fsr-upscale: AMD FSR upscaling in RTX VSR's resize (both routes)
 static int g_upscaleH = 0;                     // --upscale H: forwarded to the server (the app's "Upscale to"
                                                // height as the internal render size before the fit)
@@ -730,7 +731,7 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 //               --multi ignored)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
 //               (RIFE: the host finds or builds the engines itself, lkOfflineRife)
-//               the per-frame passes: [--out-w W --out-h H] [--restore] [--rtx-vsr | --fsr-upscale]
+//               the per-frame passes: [--out-w W --out-h H] [--restore] [--rtx-vsr [--vsr-quality N] | --fsr-upscale]
 //               [--dlssnr --nr-structure F --nr-tone F --nr-style N [--nr-delta PATH]] [--sharpen S] [--rtx-hdr ...]
 // Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
 // stdout in the same pixfmt (the encoder pipe). Real frames go out from the host buffer they came
@@ -1475,6 +1476,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0)
             g_rtxVsr = true;
+        else if (wcscmp(argv[i], L"--vsr-quality") == 0 && i + 1 < argc)
+            g_vsrQuality = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--fsr-upscale") == 0)
             g_fsrUp = true;
         else if (wcscmp(argv[i], L"--restore") == 0)
@@ -3777,6 +3780,7 @@ static void resetSessionGlobals()
     g_noFillMouse = false;
     g_sharpen = 0.0;
     g_rtxVsr = false;
+    g_vsrQuality = 4;
     g_fsrUp = false;
     g_upscaleH = 0;
     g_restore = false;
@@ -3886,6 +3890,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0)
             g_rtxVsr = true;
+        else if (wcscmp(argv[i], L"--vsr-quality") == 0 && i + 1 < argc)
+            g_vsrQuality = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--fsr-upscale") == 0)
             g_fsrUp = true;
         else if (wcscmp(argv[i], L"--upscale") == 0 && i + 1 < argc)
@@ -4314,6 +4320,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_dlssMode = 0; // the globals an item's flags may set, which must not carry over
             g_sharpen = 0.0;
             g_rtxVsr = false;
+            g_vsrQuality = 4;
             g_fsrUp = false;
             g_restore = false;
             g_rtxHdr = false;
