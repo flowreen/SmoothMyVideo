@@ -359,6 +359,9 @@ struct Host
     int waitMs = 5;           // the longest the newest native present waits for a later one before its readback
     int genFrames = 1;        // generated frames per source frame (numFramesToGenerate)
     UINT syncInterval = 1;    // Present sync interval: vsync-paced FG, measured far more reliable for the capture
+                              // (the server route); a live stage presents free-running at 0 (runStage1)
+    bool tearPresent = true;  // sync-0 presents pass DXGI_PRESENT_ALLOW_TEARING: without it DXGI throttles the flip
+                              // queue to the refresh; cleared when DXGI rejects the flag
     uint32_t maxGen = 0;      // device limit reported by the SDK (0 = not yet known)
     UINT presentSnapshot = 0; // native present count taken just before each proxy Present
     bool hdr10 = false;       // --hdr10: R10G10B10A2 frames on a G2084 / P2020 swap chain
@@ -797,7 +800,13 @@ struct Host
 
         scNative->GetLastPresentCount(&presentSnapshot);
         slPCLSetMarker(sl::PCLMarker::ePresentStart, *tok);
-        HRESULT hr = sc->Present(syncInterval, 0);
+        HRESULT hr = sc->Present(syncInterval, syncInterval == 0 && tearPresent ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        if (hr == DXGI_ERROR_INVALID_CALL && syncInterval == 0 && tearPresent)
+        {
+            tearPresent = false;
+            LOG("present: ALLOW_TEARING rejected, plain sync-0 presents\n");
+            hr = sc->Present(0, 0);
+        }
         slPCLSetMarker(sl::PCLMarker::ePresentEnd, *tok);
         if (FAILED(hr))
         {
@@ -1781,6 +1790,10 @@ static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& t
     host.genFrames = genFrames;
     host.hdr10 = hdr10;
     host.bgra = bgra && !hdr10;
+    // free-running: each input is presented on arrival, so no vsync pacing (a sync-1 present caps the stage at the
+    // panel's refresh: 360 frames a second on a 360 Hz panel, 60 on a 60 Hz one); SMV_DLSSG_STAGE1_VSYNC=1 = paced (A/B)
+    wchar_t sv[8]{};
+    host.syncInterval = GetEnvironmentVariableW(L"SMV_DLSSG_STAGE1_VSYNC", sv, 8) && sv[0] == L'1' ? 1u : 0u;
     int rc = host.init();
     if (rc)
         return rc;

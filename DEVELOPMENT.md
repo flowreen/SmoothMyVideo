@@ -1161,10 +1161,16 @@ frame of a clip as the input, the dropped frames as truth (harness `dlssg_pan_ve
 THE DLSS 4.5 CASCADE (`native.ts` `dlssgPasses`): one pass makes up to the GPU's own limit,
 Streamline's `numFramesToGenerateMax` + 1 (RTX 50 x6, RTX 40 x2), which `native.ts` learns once per GPU
 and driver from a 2-frame 256x128 render (the host's `server max N` line) and keeps in the engine cache
-as `dlssg_limit.json`. A whole multiple above it runs in passes, the largest pass first, so that as many
-frames as possible are DLSS 4.5's own from the original frames (x8 = 4 x 2: in every 8 frames the real
-one and three are the direct x4's; x12 = 6 x 2, x16 = 4 x 4; an RTX 40's x4 = 2 x 2); a multiple no
-passes within the limit make (x7, x11) stops with the nearest ones. A TARGET BETWEEN MULTIPLES (`--dlssg --fps T`,
+as `dlssg_limit.json`. A whole multiple runs in passes, the smallest first: an even multiple splits 2x then the
+rest (x4 = 2 x 2, x6 = 2 x 3), above the limit every pass stays within it, ascending (x8 = 2 x 4, x12 = 2 x 6,
+x16 = 4 x 4; an RTX 40's x4 = 2 x 2). A generated midpoint is the same frame whatever the pass count, and each
+later pass works on pairs half as far apart, where DLSS 4.5's flow is better: against 1000 fps truth (harness
+`dlssg_pass_order\pass_order.py`, 15 clips at 1080p) 2x then 3x beats one 6x pass by 0.8 dB on pairs 30 ms
+apart and ties at 6 ms, 2x then 4x beats 4x then 2x by 0.25 dB at 32 ms; above the limit the pipe between
+passes also carries fewer frames (x12: the 2x pass's instead of the 6x pass's). A multiple up to the limit stays
+one pass with RTX HDR (its statistics come from one host) and on a source above 100 fps (pairs under 10 ms: one
+pass is as good there and 0.3 dB better at 4 ms). A multiple no passes within the limit make (x7, x11) stops with
+the nearest ones. A TARGET BETWEEN MULTIPLES (`--dlssg --fps T`,
 `dlssgFpsPlan`): the smallest multiple M the passes make whose every k-th frame (k <= 6) lands within 0.5 % of T
 renders as M and the encode keeps every k-th frame (`framestep`; 23.976 -> 60 = x5 every 2nd = 59.94, 24 -> 60 = 60,
 25 -> 60 = x12 every 5th): the kept frames stay evenly spaced on the x5 grid; no such M = the first multiple reaching
@@ -1186,7 +1192,10 @@ it): the same frames on stdin,
 each presented the moment it arrives (a game's cadence: DLSS-G's
 pacer spreads a pair's frames over the source's own interval; the lockstep `--server` loop, which presents
 a frame only after the last pair's frames are read back, lets the pacer spread over that loop and tops out
-near x4 of 24 fps at 1080p), and every native present, generated and real in present order, copied on
+near x4 of 24 fps at 1080p), free-running (a sync-0 present with tearing allowed, so the stage's rate follows
+the GPU, not the panel's refresh: a vsync-paced stage capped at 360 presents a second on a 360 Hz panel and
+would cap at 60 on a 60 Hz one, under the 144 that 6x of 24 fps asks; `SMV_DLSSG_STAGE1_VSYNC=1` = the paced
+presents, which `--server` keeps), and every native present, generated and real in present order, copied on
 the swap chain's own queue (ordered behind the present, no settle) into 12 textures shared by name
 (`smv_dg1_TAG_ring0..11`, resting in COMMON) with a shared fence (`smv_dg1_TAG_fence`) and the header
 `Stage1Hdr` (file mapping `smv_dg1_TAG_hdr`: per slot the fence value its copy signals, its present number,
@@ -1198,19 +1207,30 @@ DLSS mode below DLAA) its output slots, read back at the presented size (`--bgra
 generates from carries the effects; a stage 1 whose ring is not the back buffer's size and format is refused. When
 the target needs more than one pass: at the
 2 s stats window where the derived multiple first repeats, the host snaps target / captured rate to the
-first multiple that reaches it (within 3 %; the largest when none does) of one pass (2..L, L =
-numFramesToGenerateMax + 1 read after the warm-up), two passes (the full L first, then the rest: L x 2..L, 12x =
-6x then 2x) or three (L x L x 2..L, 72x = 6x, 6x, then 2x) (`smv-live.exe --dlssg-snap-table L` prints the
-one- and two-pass table), prices the helpers' video memory (Streamline's own estimate + each ring) against the
+first rung that reaches it (within 3 %; the largest when none does): every product of one, two or three
+passes of 2..L (L = numFramesToGenerateMax + 1 read after the warm-up), the passes smallest first as on the
+file route (one pass 2..6; two 4, 6, 8, 9, 10, 12, 15, 16, 18, 20, 24, 25, 30, 36: 12x = 2x then 6x, 360 fps
+from 24 = 15x = 3x then 5x; three up to 216, 72x = 2x, 6x, then 6x; the same multiple with fewer passes wins,
+then the smaller first pass) (`smv-live.exe --dlssg-snap-table L` prints the
+one- and two-pass table). A DLSS-G stage whose output rate lands on the panel's refresh (within 2 %) paces at
+about 96 % of it (15x of 24 fps on a 360 Hz panel presents 346 of 360, in the session and in a helper alike,
+while 16x presents 384 of 384), so such a whole rung steps up to the next rung and the panel shows its full
+rate (a kept plan takes its first candidate). The host then prices the helpers' video memory (Streamline's own estimate + each ring) against the
 free memory (three passes the room does not hold = the best two), starts `--stage1` on a helper thread while
 the one pass keeps presenting, feeds it until it shares a frame, then presents its frames through the
 session's own DLSS-G at the last factor. Three passes: a second helper `--stage1 ... --from <the first's
 share tag>` takes the first's ring on the GPU (in present order, the newest after a wrap) and the session
 presents the second's; three passes below 85 % of their multiple for three 2 s windows in a row end and the
 next plan holds two. One plan a session; a helper ending, failing or sharing nothing for 2 s returns the
-session to one pass at L. Lines `DLSS 4.5 plan: ...`, `DLSS 4.5 at Mx: ... in a second process, [.. in a
-third, ]then ...`, `DLSS 4.5 stays at Lx: ...`, `DLSS 4.5's second [and third] pass[es] ended (...)`; the
-app shows them beside the stats. Gates: harness `dlssg_cascade\s2_gate.py`, `dlssg_third_stage\three_gate.py`.
+session to one pass at L. A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
+route's way: a rung R of one or two helper passes and a keep k of 2..6 with R / k within 3 % (the fewest passes,
+then the smallest R: 2.5x = 5x in a helper, 4.5x = 3x then 3x in two, 7.5x = 3x then 5x), the session presents every k-th frame of
+the presented ring and makes none itself, so the output stays evenly spaced (`SMV_LIVE_DLSSG_KEEP=0` = whole
+multiples only). Lines `DLSS 4.5 plan: ...`, `DLSS 4.5 at Mx: ... in a second process, [.. in a
+third, ]then ...` (a kept plan: `DLSS 4.5 at 2.50x: 5x in a second process, every 2nd of its frames presented
+here, none made here`), `DLSS 4.5 stays at Lx: ...`, `DLSS 4.5's second [and third] pass[es] ended (...)`; the
+app shows them beside the stats. Gates: harness `dlssg_cascade\s2_gate.py`, `dlssg_third_stage\three_gate.py`,
+`dlssg_live_keep\keep_gate.py`.
 The render (`src/render`) keeps the
 probe, the ffmpeg decode and encode commands, PROGRESS / OUTFRAMES and the finalize, and the exe takes the decode pipe as stdin and feeds the encode
 pipe on stdout (pack-in, Head encode, IFNet, pack-out, `k_expand8to16` for real frames of

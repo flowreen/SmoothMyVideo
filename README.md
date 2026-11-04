@@ -108,7 +108,7 @@ picture, without adding frames. Hover a row in the app to see its exact version.
 
 | Model | Best for | Needs | Notes |
 |---|---|---|---|
-| **NVIDIA DLSS 4.5** (DLSS Frame Generation; default on RTX 40/50) | Most videos, high frame rates, Live | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | NVIDIA's game frame generation, on video, and the fastest model. Makes whole multiples of the source rate; any other target is reached evenly by making more and keeping some (24 to 60 fps = 5&times;, every 2nd frame), else the first whole multiple above it. Past the GPU's limit (6&times; on an RTX 50, 2&times; on an RTX 40) it goes multi-pass, e.g. 12&times; = 6&times; then 2&times;. |
+| **NVIDIA DLSS 4.5** (DLSS Frame Generation; default on RTX 40/50) | Most videos, high frame rates, Live | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | NVIDIA's game frame generation, on video, and the fastest model. Makes whole multiples of the source rate; any other target is reached evenly by making more and keeping some (24 to 60 fps = 5&times;, every 2nd frame), else the first whole multiple above it. Its passes run smallest first (4&times; = 2&times; then 2&times;, 6&times; = 2&times; then 3&times;, 12&times; = 2&times; then 6&times;): each later pass works on frames closer together, which DLSS 4.5 handles better, measured 0.8 dB closer to the real frames on 24 to 36 fps footage. One pass up to the GPU's limit (6&times; on an RTX 50, 2&times; on an RTX 40) with RTX HDR or on a source above 100 fps. |
 | **GMFSS** (default on other GPUs) | Anime | Any RTX GPU | The cleanest frames, even at high multipliers; the heaviest on the GPU. |
 | **RIFE** (Practical-RIFE 4.26 heavy) | Live action, filmed content | Any RTX GPU | A strong all-round model. Its **DRBA** option (for anime) keeps characters moving at their drawn pace while camera pans get fully smooth; in Live it adds one frame of delay. |
 | **NVIDIA Optical Flow** | Slower PCs, fast renders, moderate motion | Any RTX GPU | Runs on a dedicated part of the GPU, so it is fast. Very fast motion turns into a soft double image instead of breaking up. Videos need a whole multiplier (2&times;, 3&times; ...). |
@@ -204,7 +204,11 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
 * **Adaptive:** with GMFSS, RIFE or NVIDIA Optical Flow the output holds your fps target whatever the source does (a
   game dropping from 30 to 10 fps still plays at the same smooth rate). AMD FSR 4 and Smooth Motion double the frame
   rate per pass, so they pick the doubling that reaches your target (60 fps on a 24 fps source shows 96); DLSS 4.5
-  picks the first whole multiple that does.
+  picks the first multiple its passes make that does (up to 6&times; a pass, smallest pass first: 15&times; = 3&times;
+  then 5&times;), and reaches a target in between by making more and showing every 2nd to 6th frame (60 fps from 24
+  = 5&times;, every 2nd), evenly spaced. A plan that lands exactly on the screen's refresh rate steps one up (360 fps
+  from 24 on a 360 Hz screen runs 16&times;), because DLSS Frame Generation paces about 4 % short right at the
+  refresh rate; the screen then shows its full rate.
 * **Fit to the GPU** (on by default) lowers the frame rate to what your GPU can keep up with, never below the source,
   with every effect kept. Unticked, a target the GPU can't reach makes it skip frames.
 * **Readout:** a small green corner readout shows the source fps, the smoothed fps, and roughly how far the picture

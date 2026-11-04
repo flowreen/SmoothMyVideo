@@ -672,6 +672,7 @@ async function setup(a: PreviewArgs, env: NodeJS.ProcessEnv) {
     inp,
     strength,
     pr,
+    vfr,
     n,
     idx,
     transfer,
@@ -965,7 +966,7 @@ export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
     let passes = [N];
     if (model === 'dlssg' && N > 2) {
       const limit = (await dlssgLimit(exe, ENGINE, cacheDir, env)) || 6;
-      passes = dlssgPasses(N, limit);
+      passes = dlssgPasses(N, limit, s.doHdr || s.vfr.num / s.vfr.den > 100);
       if (!passes.length) throw new Error(`DLSS 4.5 cannot make ${N}x on this GPU: one pass makes up to ${limit}x`);
       if (passes.length > 1 && s.doHdr)
         throw new Error(`DLSS 4.5 at ${N}x runs ${passes.length} passes, which RTX HDR does not join yet`);

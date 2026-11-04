@@ -134,18 +134,28 @@ function waitExit(p: ChildProcess): Promise<number> {
   });
 }
 
-/** DLSS 4.5's passes for a whole multiplier: one direct pass up to the GPU's own limit, above it a cascade whose every
- * pass stays within the limit, the largest direct pass first so that as many frames as possible are DLSS 4.5's own
- * from the original frames (x8 = 4 x 2, x12 = 6 x 2, x16 = 4 x 4); [] when no product of passes
- * within the limit makes m (x7, x11, x13, x14 at a limit of 6). */
-export function dlssgPasses(m: number, limit: number): number[] {
-  if (m <= limit) return m >= 2 ? [m] : [];
-  for (let a = Math.min(limit, m - 1); a >= 2; a--) {
-    if (m % a) continue;
-    const rest = dlssgPasses(m / a, limit);
-    if (rest.length) return [a, ...rest];
-  }
-  return [];
+/** DLSS 4.5's passes for a whole multiplier, the smallest pass first: an even multiple splits 2x then the rest (x4 =
+ * 2 x 2, x6 = 2 x 3); above the GPU's own limit every pass stays within it, ascending (x8 = 2 x 4, x12 = 2 x 6,
+ * x16 = 4 x 4, x18 = 3 x 6). A generated midpoint is the same frame whatever the pass count, and each later pass works
+ * on pairs half as far apart, where DLSS 4.5's flow is better: against 1000 fps truth, 2x then 3x beats one 6x pass by
+ * 0.8 dB on pairs 30 ms apart and ties at 6 ms; above the limit the pipe between passes also carries fewer frames.
+ * `onePass` keeps a multiple up to the limit in one pass: RTX HDR (its statistics come from one host) and a source
+ * above 100 fps (pairs under 10 ms, where one pass is as good and 0.3 dB better at 4 ms). [] when no product of
+ * passes within the limit makes m (x7, x11, x13, x14 at a limit of 6). */
+export function dlssgPasses(m: number, limit: number, onePass = false): number[] {
+  if (m < 2) return [];
+  if (m <= limit) return onePass || m % 2 || m < 4 ? [m] : [2, m / 2];
+  // the fewest passes within the limit, ascending
+  const split = (n: number): number[] => {
+    if (n <= limit) return n >= 2 ? [n] : [];
+    for (let a = Math.min(limit, n - 1); a >= 2; a--) {
+      if (n % a) continue;
+      const rest = split(n / a);
+      if (rest.length) return [a, ...rest].sort((x, y) => x - y);
+    }
+    return [];
+  };
+  return split(m);
 }
 
 /** DLSS 4.5 at a target between whole multiples ([multiple, keep]): DLSS 4.5 makes only the evenly spaced frames between
@@ -490,7 +500,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   let DG_LIMIT = 6;
   if (kind === 'dlssg' && args.multi > 2) {
     DG_LIMIT = (await dlssgLimit(NATIVE_EXE, ENGINE, engineCacheDir(ENGINE, env), env)) || 6;
-    DG_PASSES = dlssgPasses(Math.trunc(args.multi), DG_LIMIT);
+    DG_PASSES = dlssgPasses(Math.trunc(args.multi), DG_LIMIT, !!RTX_HDR || num / den > 100);
     if (!DG_PASSES.length) {
       const reach = (m: number, step: number) => {
         while (m >= 2 && m <= 1000 && !dlssgPasses(m, DG_LIMIT).length) m += step;
@@ -505,8 +515,8 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     if (DG_PASSES.length > 1)
       say(
         `DLSS Frame Generation ${args.multi}x in ${DG_PASSES.length} passes (${DG_PASSES.map((m) => m + 'x').join(' then ')}): ` +
-          `one pass makes up to ${DG_LIMIT}x on this GPU; the first on the original frames, each later one between ` +
-          "the previous pass's frames\n",
+          "the smallest first on the original frames, each later one between the previous pass's frames, which sit " +
+          `closer together (one pass makes up to ${DG_LIMIT}x on this GPU)\n`,
       );
   }
   const CASCADE = DG_PASSES.length > 1;
