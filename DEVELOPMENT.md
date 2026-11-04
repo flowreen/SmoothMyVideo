@@ -2376,7 +2376,10 @@ Rules (hard-won, do not regress):
   frame, a cascade, the effects route) reads the frame in place too and returns it after its readback's Map, so the
   crop's FP16 copy (`convSrc`, 66 MB at 4K) is made only once a frame cannot be read in place.
 * The overlay never activates: it is created `WS_EX_NOACTIVATE` and shown with `SW_SHOWNOACTIVATE`
-  (a resume with `SW_SHOWNA`), so a live start or resume never takes the user's focus. Streamline 2.14
+  (a resume with `SW_SHOWNA`), so a live start or resume never takes the user's focus; the DLSS 4.5 host's
+  off-screen swap-chain window (`dlssg2f`, a popup parked at -32000) is created without `WS_VISIBLE` and shown
+  the same way (`SW_SHOWNOACTIVATE`, plus `WS_EX_NOACTIVATE`; the style alone leaves a popup created visible its
+  thread's active window), so a file render or a cascade stage never takes it either. Streamline 2.14
   pauses DLSS-FG while its window is not the foreground; the focus shim
   (`engine/dlssg/build_src/sl_focus_shim.h`, installed after the `DLSS-G ready` line) answers that test
   with the overlay, and `SMV_DLSSG_FOCUS_SHIM=0` leaves the pacer in passthrough whenever another window

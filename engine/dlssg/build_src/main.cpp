@@ -475,21 +475,24 @@ struct Host
 
     int init()
     {
-        // window: swap chain needs an HWND, but with native readback it never
-        // has to be visible on the desktop, so park it far offscreen
+        // window: swap chain needs an HWND, but with native readback it never has to be visible on the desktop, so
+        // park it far offscreen. Created without WS_VISIBLE and shown SW_SHOWNOACTIVATE (plus WS_EX_NOACTIVATE), as the
+        // live overlay is: a popup created visible activates itself, and from a render the app started that pulls
+        // the foreground off the app or the game; Streamline's focus test is answered by the focus shim
         WNDCLASSW wc{};
         wc.lpfnWndProc = wndProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = L"dlssg2f";
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
         RegisterClassW(&wc);
-        hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"dlssg2f", L"dlssg2f", WS_POPUP | WS_VISIBLE, -32000, -32000, W, H,
-                               nullptr, nullptr, wc.hInstance, nullptr);
+        hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"dlssg2f", L"dlssg2f", WS_POPUP, -32000, -32000, W,
+                               H, nullptr, nullptr, wc.hInstance, nullptr);
         if (!hwnd)
         {
             LOG("CreateWindow failed\n");
             return 1;
         }
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         pumpMessages();
 
         CHECK_HR(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
