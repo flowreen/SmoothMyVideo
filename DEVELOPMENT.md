@@ -474,15 +474,15 @@ the CLI's default with no model flag stays GMFSS):
   v2.4.0's signed `amd_fidelityfx_framegeneration_dx12.dll`, unmodified) through our
   `engine/fsrfg/smv_fsrfg_bridge.dll`. The DLL offers FSR 4 only when AMD's driver extension reports its FP8
   wave-matrix intrinsics and its ML shaders call them, so on NVIDIA the bridge gives it vkd3d-proton's D3D12
-  device (`smv_vkd3d_*.dll`: `VKD3D_FP8_EMULATION=1` runs the FP8 cooperative matrices as FP16 ones,
-  dxil-spirv's `DXIL_SPIRV_CONFIG=wmma_fp8_staging` stages FP8 loads / stores through shared memory, and
-  `VKD3D_DISABLE_EXTENSIONS=VK_NV_cooperative_matrix2` keeps that extension out of the lowering, all three set
-  by the bridge for its process) and our `amdxc64.dll`, which answers the extension queries (FP8 x FP8 ->
+  device (`smv_vkd3d_*.dll`: `VKD3D_FP8_EMULATION=1` runs the FP8 cooperative matrices as FP16 ones and
+  dxil-spirv's `DXIL_SPIRV_CONFIG=wmma_fp8_staging` loads FP8 tiles as VK_NV_cooperative_matrix2 tensor loads where
+  the device has them and stages the other FP8 loads / stores through shared memory, both set by the bridge for its
+  process) and our `amdxc64.dll`, which answers the extension queries (FP8 x FP8 ->
   FP32 wave matrices, every intrinsic supported). The bridge loads the system `d3d12.dll` before AMD's DLL:
   that DLL serializes its root signatures through the loaded module named `D3D12.dll` and, with none,
   creates no pipeline and every dispatch is dropped (all-zero tweens). vkd3d-proton's pipeline cache sits in
-  the model cache's `fsr4_shaders\vkd3d_<core DLL size + time>_nc2` (the suffix = the lowering's configuration, the
-  extension off; vkd3d-proton's key ignores `DXIL_SPIRV_CONFIG` and the disabled extensions, so a cache of another
+  the model cache's `fsr4_shaders\vkd3d_<core DLL size + time>` (`_nc2` added with the extension hidden, the
+  lowering's other configuration; vkd3d-proton's key ignores `DXIL_SPIRV_CONFIG` and the disabled extensions, so a cache of another
   build or configuration replayed broken pipelines; without it a session starts ~0.3 s later). The
   first session after a driver update waits ~15 s while the driver compiles the Vulkan pipelines, at any size; the
   app warms them ahead (`fsr-warm` below). FSR 4 is bit-stable run to run: about half of its compute dispatches
@@ -519,13 +519,12 @@ the CLI's default with no model flag stays GMFSS):
   VK_NV_cooperative_matrix2's conversions (the matrix use changes in 71 of FSR 4's 194 shaders). Our vkd3d-proton
   no longer offers them (`SMV_VKD3D_COOPMAT2_CONV=1` = the old lowering, which brings the window back): 0 broken
   runs at x16 / x4 / with a second context, the output otherwise byte for byte the old one, about 5 % more FSR
-  time (0.7 % of a whole 4K call). On NVIDIA's R620 drivers (621.01) the same window opened with the extension's
-  TENSOR LOADS (the FP8 tile loads the lowering had kept: every x16 run, bursts of 3 to 5 whole pairs), so the
-  bridge now keeps VK_NV_cooperative_matrix2 out of the lowering altogether (`SMV_VKD3D_COOPMAT2=1` = offered again,
-  a driver re-check): the FP8 tiles take the staged loads through shared memory, the same frames, FSR's call +16 %
-  (2.25 -> 2.60 ms at 1080p, a whole x2 call +8 %), and what is left is the bounded drift class below (x16 1080p,
-  two runs: 381 of 2385 frames differ, none under 43 dB; harness `fsr4_call_hashes\x16_bar.py` reads a rate-probe log
-  for the window's signature). On a tree level with two or more calls (x4 and up) the next call's vectors are made on a side
+  time (0.7 % of a whole 4K call). On NVIDIA's R620 drivers the same window opens with the extension's TENSOR LOADS
+  (the FP8 tile loads the lowering keeps: every x16 run, bursts of 3 to 5 whole pairs) unless the compute barriers
+  above run (`SMV_VKD3D_FG_BARRIER=0` brings it back); with them every x16 run is exact, so the bridge offers
+  VK_NV_cooperative_matrix2 (`SMV_VKD3D_COOPMAT2=0` = kept out: the FP8 tiles take the staged loads through shared
+  memory, the same frames byte for byte at x16 / x32 / x64, FSR's call +7 %, a whole 1080p x2 call +4 %; harness
+  `fsr4_call_hashes\x16_bar.py` reads a rate-probe log for the window's signature). On a tree level with two or more calls (x4 and up) the next call's vectors are made on a side
   stream during each FSR call (with their own optical flow session: x0.81 to 0.91 a pair at x4 / x8;
   derived by default; `SMV_FSRFG_OVERLAP=0` = in turn). At the
   FAST level the tweens went wrong after a few hundred calls of a 1080p session (grid 1 ~320, grid 4
@@ -1915,7 +1914,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_FSRUP_TEST=gateN` / `=zerovec` | AMD FSR upscaling's motion vectors: `gateN` = vectors shorter than N / 1000 px written as zero instead of the product's 0.125 px (`gate0` = no gate, the trigger test of the still-detail gate); `zerovec` = zero vectors on every frame. A/B levers, never a product setting |
 | `SMV_FSRFG_CHILDMV=0` | AMD FSR frame generation: level-2+ calls (x4 and up) run an optical flow pass each instead of taking vectors derived from their pair's level-1 field (the default; the session line says `level-2+ calls a pass a call` instead of `level-2+ calls derived from level 1`); A/B lever, never a product setting |
 | `SMV_FSRFG_DEVICE=own` / `=failown` | AMD FSR frame generation's bridge: every instance on its own vkd3d device instead of vkd3d's one (`fsrfg_devices()` = 1; the late price adds 300 MiB an instance past the first) / instance 0 on its own, the later ones on the shared device (the factory's failure path); the derived level-2+ vectors run on either; A/B levers, never a product setting |
-| `SMV_VKD3D_COOPMAT2=1` | AMD FSR frame generation's bridge offers vkd3d-proton VK_NV_cooperative_matrix2 again (its tensor loads for the FP8 tiles, ~14 % less FSR time, and with `SMV_VKD3D_COOPMAT2_CONV=1` its conversions), with a vkd3d cache folder of its own; on NVIDIA's R620 drivers every FSR call on the device then returns garbage for ~0.64 s after ~3.5 s of its GPU work (see "AMD FSR 4 frame generation"); A/B and driver re-check lever, never a product setting |
+| `SMV_VKD3D_COOPMAT2=0` | AMD FSR frame generation's bridge hides VK_NV_cooperative_matrix2 from vkd3d-proton (the FP8 tiles take the staged loads through shared memory: the same frames, ~7 % more FSR time), with a vkd3d cache folder of its own (`_nc2`); A/B lever |
 | `SMV_VKD3D_COOPMAT2_CONV=1` | with the extension offered: vkd3d-proton offers dxil-spirv NVIDIA's cooperative-matrix conversions too, the matrix use changes as one conversion each instead of through shared memory, ~5 % less FSR time, but every FSR call on the device returns garbage for ~0.64 s after ~3.5 s of its GPU work on R617 drivers as well; A/B and driver re-check lever, never a product setting |
 | `SMV_VKD3D_FG_BARRIER=0` / `=all` | AMD FSR frame generation's vkd3d-proton: no compute barrier before the dispatches that follow the previous one with no D3D12 barrier, copy or clear in between (the run-to-run drift comes back) / a barrier before every compute dispatch; A/B levers, never a product setting |
 | `SMV_FSRFG_OVERLAP=0` / `SMV_FSRFG_OVERLAP=fail` | AMD FSR frame generation: every call's vectors in its turn instead of the next call's on a side stream during each FSR call (tree levels with two or more calls, x4 and up) / the side stream's setup fails after a whole one, the trigger of its fallback (`the side stream did not start` with derived vectors, `the side Optical Flow session did not start` with `SMV_FSRFG_CHILDMV=0`; route gate only); A/B levers, never a product setting |
@@ -2165,9 +2164,9 @@ the driver exports no D3D12-fence type (NVIDIA); a shared texture's memory carri
 expects, and vkd3d-proton neither opens its own export through D3DKMT nor shares that D3DKMT copy (CUDA
 refuses such a handle); a device with VK_NV_cooperative_matrix2 tensor addressing and block loads tells
 dxil-spirv so, but its conversions are not offered unless `SMV_VKD3D_COOPMAT2_CONV=1` (lowered with them, FSR 4's
-shaders turn to garbage for ~0.64 s after ~3.5 s of the device's GPU work on NVIDIA), and the bridge disables the
-extension for its process anyway (`SMV_VKD3D_COOPMAT2=1` = offered), since its tensor loads open the same window on
-R620 drivers; the two DLLs are named `smv_vkd3d_d3d12.dll` / `smv_vkd3d_d3d12core.dll`, so they
+shaders turn to garbage for ~0.64 s after ~3.5 s of the device's GPU work on NVIDIA); the bridge leaves the
+extension on (`SMV_VKD3D_COOPMAT2=0` = disabled for its process): its tensor loads open the same window on R620
+drivers only without the compute barriers below; the two DLLs are named `smv_vkd3d_d3d12.dll` / `smv_vkd3d_d3d12core.dll`, so they
 never share a module name with the system D3D12 in the host's process; and a compute barrier goes before every
 compute dispatch that follows the previous one with no D3D12 barrier, copy or clear in between (frame generation
 records about half of its dispatches so; on NVIDIA they overlap their predecessor and compute an occasional call

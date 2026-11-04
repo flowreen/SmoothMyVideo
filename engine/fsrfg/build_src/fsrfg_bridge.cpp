@@ -150,13 +150,14 @@ bool loadOnce()
     if (g_loaded)
         return true;
     const std::wstring dir = moduleDir();
-    // VK_NV_cooperative_matrix2 is not offered to the lowering: with its tensor loads, NVIDIA's R620 driver turns every
-    // FSR call on the device into garbage for ~0.64 s after ~3.5 s of the device's GPU work (its conversions did the
-    // same on R617); the staged FP8 loads through shared memory give the same frames. SMV_VKD3D_COOPMAT2=1 offers the
-    // extension again (a driver re-check); a caller's own VKD3D_DISABLE_EXTENSIONS is kept.
+    // VK_NV_cooperative_matrix2 is offered to the lowering: its tensor loads give the same frames as the staged FP8 loads
+    // through shared memory, at a lower cost. On NVIDIA's R620 driver they turn every FSR call on the device into garbage
+    // for ~0.64 s after ~3.5 s of the device's GPU work unless vkd3d's FG barriers run (SMV_VKD3D_FG_BARRIER=0 brings
+    // that window back). SMV_VKD3D_COOPMAT2=0 hides the extension (the staged loads); a caller's own
+    // VKD3D_DISABLE_EXTENSIONS is kept.
     char c2[4] = "";
     GetEnvironmentVariableA("SMV_VKD3D_COOPMAT2", c2, sizeof(c2));
-    const bool coopmat2 = c2[0] == '1';
+    const bool coopmat2 = c2[0] != '0';
     if (!coopmat2)
         setEnv("VKD3D_DISABLE_EXTENSIONS", "VK_NV_cooperative_matrix2", true);
     // vkd3d-proton's pipeline cache key does not cover DXIL_SPIRV_CONFIG or the disabled extensions, so this route keeps
