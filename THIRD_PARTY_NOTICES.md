@@ -10,11 +10,14 @@ third-party work.
   vendored under `engine/GMFSS_Fortuna/`. MIT License, Copyright (c) 2023 98mxr; see
   `engine/GMFSS_Fortuna/LICENSE`. Upstream components it builds on: GMFlow (Apache-2.0,
   Haofei Xu et al.), RIFE/IFNet (MIT, hzwer et al.), softmax splatting (Simon Niklaus).
-* **DRBA / Practical-RIFE 4.26 heavy** (the RIFE interpolation model and its optional DRBA
-  anime-pacing timing: IFNet 4.26-heavy network + `flownet.pkl` weights, DistanceRatioMap
-  adjuster, softmax splatting), vendored under `engine/rife/` + `engine/rife_backend.py` from
-  routineLife1's DRBA repository. MIT License; see `engine/rife/DRBA-LICENSE.txt`. Upstream
-  components: Practical-RIFE (MIT, hzwer et al.), softmax splatting (Simon Niklaus).
+* **Practical-RIFE 4.25** (the RIFE interpolation model: the `flownet.pkl` weights in
+  `engine/rife/`), from hzwer's Practical-RIFE. MIT License, Copyright (c) 2021 hzwer; see
+  `engine/rife/PRACTICAL-RIFE-LICENSE.txt`.
+* **DRBA** (the IFNet network code at Practical-RIFE 4.25's width and the optional DRBA
+  anime-pacing timing: DistanceRatioMap adjuster, softmax splatting), vendored under
+  `engine/rife/` + `engine/rife_backend.py` from routineLife1's DRBA repository. MIT License; see
+  `engine/rife/DRBA-LICENSE.txt`. Upstream components: Practical-RIFE (MIT, hzwer et al.),
+  softmax splatting (Simon Niklaus).
 * **Real-ESRGAN** `realesr-animevideov3` architecture and weights (the `--restore` pass),
   vendored in `engine/realesr.py` / `engine/realesr-animevideov3.pth`. BSD 3-Clause License,
   Copyright (c) 2021 Xintao Wang.

@@ -1809,7 +1809,6 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nr.drba = true;
         }
         nr.ifnetPath = oe.ifnet;
-        nr.encodePath = oe.encode;
         nr.jitPath = oe.jit;
         nr.ph = oe.ph;
         nr.pw = oe.pw;
@@ -1996,9 +1995,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         return 2;
     if (nr.mph)
     {
-        if (!nr.xHalf || !nr.imgHalf)
+        if (!nr.xHalf)
         {
-            LOG("offline: RIFE's motion frames are fp16 but the engines take fp32 frames (an ONNX before rev 4)\n");
+            LOG("offline: RIFE's motion frames are fp16 but the IFNet takes fp32 frames (empty the engine cache)\n");
             return 2;
         }
         LOG("offline: RIFE finds the motion on the picture at the decoded %dx%d%s, its warp + blend runs on the "
@@ -2852,44 +2851,21 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.fCur ^= 1;
         if (rifeRoute)
         {
-            nvinfer1::Dims4 din{1, 3, nr.mph ? nr.mph : nr.ph, nr.mph ? nr.mpw : nr.pw};
-            if (!nr.ctxEnc->setInputShape("img", din))
-            {
-                io.setFail("encode setInputShape rejected");
-                failed = true;
-                break;
-            }
-            // fp16 frames: the new frame into the fp16 copy's cur half, read by an
-            // fp16-x IFNet and / or an fp16-img encode; RIFE's two domains: the motion frame
-            uint16_t* cur16 = nr.mph ? nr.dM + 3 * mplane : nr.dXh + 3 * plane;
-            if (!nr.mph && (nr.xHalf || nr.imgHalf) && !nativeF2h(nr, dCur, cur16, 3 * plane, st))
+            // fp16 frames: the new frame into the fp16 copy's cur half for an fp16-x IFNet; RIFE's two domains: the
+            // motion frame
+            if (!nr.mph && nr.xHalf && !nativeF2h(nr, dCur, nr.dXh + 3 * plane, 3 * plane, st))
             {
                 io.setFail("f2h launch failed");
                 failed = true;
                 break;
             }
-            nr.ctxEnc->setTensorAddress("img", nr.imgHalf ? (void*)cur16 : (void*)dCur);
-            // fp16 features: the encode writes dF directly, no widen pass
-            const bool widen = nr.encHalf && !nr.featHalf;
-            void* encOut = widen ? (void*)nr.dEncHalf : (void*)nr.dF[nr.fCur];
-            nr.ctxEnc->setTensorAddress("feat", encOut);
-            if (!nr.ctxEnc->enqueueV3(st))
+            // the encode reads the motion frame (fp16), else the new frame itself (fp32), into dF in the IFNet's dtype
+            if (!(nr.mph ? nativeEncodeRun(nr, nr.dM + 3 * mplane, 1, nr.mpw, nr.mph, nr.dF[nr.fCur], st)
+                         : nativeEncodeRun(nr, dCur, 0, nr.pw, nr.ph, nr.dF[nr.fCur], st)))
             {
-                io.setFail("encode enqueueV3 returned false");
+                io.setFail("encode launch failed");
                 failed = true;
                 break;
-            }
-            if (widen)
-            {
-                int n = (int)(16 * mplane);
-                void* a[] = {&nr.dEncHalf, &nr.dF[nr.fCur], &n};
-                if (cuLaunchKernel(nr.fH2f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) !=
-                    CUDA_SUCCESS)
-                {
-                    io.setFail("h2f launch failed");
-                    failed = true;
-                    break;
-                }
             }
         }
         // IDENTICAL PAIR (pairEnqueue above). Equal = there is no motion in this pair, so the
@@ -3267,7 +3243,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                     const int modelH = nr.mph ? nr.mph : nr.ph, modelW = nr.mph ? nr.mpw : nr.pw;
                     nvinfer1::Dims4 dx{1, 6, modelH, modelW};
                     nvinfer1::Dims4 dtst{1, 1, modelH, modelW};
-                    nvinfer1::Dims4 df{1, 16, modelH, modelW};
+                    nvinfer1::Dims4 df{1, kRifeFeatC, modelH, modelW};
                     if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dtst) ||
                         !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
                     {

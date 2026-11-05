@@ -528,7 +528,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   else if (FSRFG_MODE) say('Using the AMD FSR frame generation backend for interpolation (FSR 4, native host)\n');
   else if (DLSSG_MODE) say('Using the DLSS Frame Generation backend for interpolation (DLSS 4.5)\n');
   else if (NVOF_MODE) say('Using the NVIDIA Optical Flow backend for interpolation (native host)\n');
-  else if (RIFE_MODE) say('Using the RIFE backend for interpolation (4.26 heavy, native host)\n');
+  else if (RIFE_MODE) say('Using the RIFE backend for interpolation (4.25, native host)\n');
   if (kind === 'gmfss') say('Using the GMFSS backend for interpolation (native host)\n');
 
   // RTX HDR / DV / HDR10+ (render.py's upscale / HDR backend block, native half)

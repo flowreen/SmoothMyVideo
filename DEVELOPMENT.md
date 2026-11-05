@@ -234,20 +234,20 @@ RTX VSR / HDR and all three codecs.
   one more, and Adds join them. The fp16 sum runs in another order, so the flow and mask are not
   bit-identical: the tweens move by up to 4 codes at 8 bits (62 dB at the worst tween of the 480p
   and 1080p renders, 66 to 68 dB pooled), the real frames do not; the IFNet runs about 5.5 % faster
-  per call at 480p, 1080p and 4K. The RIFE encode's last layer, a transposed conv from half
-  the frame size to the full size, runs as one conv with four times the channels at the half size
-  and a DepthToSpace (`trt_runtime._encode_subpixel`): the same products, but TensorRT-RTX runs the
-  transposed conv as a slow kernel plus a full-size layout pass, so the encode takes 1.19 instead
-  of 1.76 ms at 1472x2560. Its fp16 sum is coarser, so a quarter of the features move by one or two
-  fp16 steps and the IFNet carries that into the tweens on fast motion (53.8 to 57.2 dB pooled, up
-  to 59 codes at 8 bits in the worst tween); an encode computed in fp32 moves them as far, so the
-  spread is the IFNet's sensitivity to its features, and the real frames do not move. Block
+  per call at 480p, 1080p and 4K. The RIFE encode (the IFNet's Head) has no graph:
+  it runs on the host's kernels (`k_encC0` .. `k_encUp`, fp32 sums, the weights inline as
+  `kRifeEncW` from `engine/rife/flownet.pkl`'s `encode.*` tensors), reads the frame in fp32 (the
+  motion frame in fp16) and writes the IFNet's feature dtype. RIFE 4.25's 4-channel features are
+  sensitive to their rounding: an fp16 engine's encode (48 dB from fp32 on a hard anime pair) moved
+  that pair's tweens to 43 dB from the fp32 model, the fp32 sums keep the features at 74 dB. Block
   3's first conv reads its input in parts too (`trt_runtime._block3_conv_split`: the two 16-channel
   feature warps on their own convs, the other 20 channels on a third, Adds join them; its weight is
   an fp32 initializer behind a Cast, so each slice keeps one). Not bit-identical (the fp16 sum
   order): the tweens move by 63 to 65 dB pooled against the unsplit conv's and stay as close to an
   fp32 IFNet as before (53 to 57 dB pooled on RIFE and DRBA); the IFNet runs about
-  1.8 % faster per call at 1080p and 1.9 % at 4K, nothing measurable at 480p. Blocks 1 and
+  1.8 % faster per call at 1080p and 1.9 % at 4K, nothing measurable at 480p. Both conv splits
+  need 16-channel feature warps: RIFE 4.25's encode has 4 channels, so every part stays under 16,
+  both passes leave its graph as it is and each block keeps its one conv. Blocks 1 and
   2's first conv reads one flat concat of its eight parts instead of a concat nested in a concat
   (`trt_runtime._blocks12_flat_concat`): the same tensor, bit-identical, its speed inside the noise
   from 240p to 4K. The warps that feed blocks 1, 2 and 3 (the /8, /4 and /2 scales) are computed only
@@ -264,9 +264,10 @@ RTX VSR / HDR and all three codecs.
   weights and TRT tags, the size-free ONNX paths; the export imports them, the native host has
   their C++ twin). The native host keeps the warm markers (`<jit cache>.warm`) its handoffs use
   to skip the model load and warm-up once a shape was warmed.
-* `engine/rife_backend.py` + `engine/rife/`: vendored Practical-RIFE 4.26 heavy (MIT, weights
-  committed): the IFNet the size-free export reads, and DRBA's coarse flow (`calc_flow`) for the
-  harness gates.
+* `engine/rife_backend.py` + `engine/rife/`: Practical-RIFE 4.25, the README's default (hzwer's
+  weights, MIT, `engine/rife/PRACTICAL-RIFE-LICENSE.txt`; the network code vendored from DRBA at
+  4.25's 4-channel feature width; weights committed): the IFNet the size-free export reads, and
+  DRBA's coarse flow (`calc_flow`) for the harness gates.
 * `engine/nvoffruc/`: the "NVIDIA Smooth Motion" bridge to NvOFFRUC (user-installed DLLs), called
   by the host.
 * `engine/fsrfg/`: the AMD FSR 4 frame generation bridge (`smv_fsrfg_bridge.dll`, ours) beside AMD's signed
@@ -422,7 +423,7 @@ the CLI's default with no model flag stays GMFSS):
   49.8 dB against the SDR route's tweens, was 31.2 with double exposures); highlight and
   wide-gamut pictures keep their tweens within 0.05 dB (`harness\gmfss_restore_hdr`).
   `SMV_HDR_MODEL_ENC=0` keeps the codes, `SMV_GMFSS_SDR_PAIRS=0` runs every pair the second way.
-* `--rife`: Practical-RIFE 4.26 heavy, the recommendation for live action. TRT-engined like GMFSS.
+* `--rife`: Practical-RIFE 4.25, the recommendation for live action. TRT-engined like GMFSS.
 * `--rife-drba`: RIFE with DistanceRatioMap timing ("Preserve anime pacing"): pans smooth fully,
   character motion keeps closer to its original cadence. Renders on the uniform grid for integer
   multipliers too; the first window after a start or resume seam falls back to plain RIFE.

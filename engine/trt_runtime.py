@@ -208,19 +208,16 @@ def _half_features(onnx_path, name):
 
 
 def _half_frames(onnx_path, name):
-    """RIFE IFNet x / the encode's img: take the frames as fp16 inputs. The IFNet widens x inside
-    the graph (its warps still run fp32, on the fp16-rounded pixels); the encode's first node
-    casts img to fp16 anyway, so that Cast goes and its features stay identical. The host fills an
-    fp16 copy of the frame pair once per frame and the IFNet reads half the bytes (1.05x per call
-    at 1080p). Not bit-identical: the rounding reaches the flow (tweens 56 to 65 dB against fp32
-    frames on anime, every real frame unchanged). Graph only."""
+    """RIFE IFNet x: take the frames as fp16 inputs. The IFNet widens x inside the graph (its
+    warps still run fp32, on the fp16-rounded pixels). The host fills an fp16 copy of the frame pair
+    once per frame and the IFNet reads half the bytes (1.05x per call at 1080p). Not bit-identical:
+    the rounding reaches the flow (tweens 56 to 65 dB against fp32 frames on anime, every real
+    frame unchanged). Graph only."""
     import onnx
     from onnx import helper, TensorProto
 
     if name.startswith("rife_ifnet_"):
         key = "x"
-    elif name.startswith("rife_encode_"):
-        key = "img"
     else:
         return
     g = onnx.load(onnx_path, load_external_data=False)
@@ -697,7 +694,9 @@ def _last_block_conv_split(onnx_path, name):
     the fp16 sum runs in another order, the flow moves by up to one fp16 step and the tweens stay
     above 62 dB from the unsplit conv's at 480p and 1080p. Parts under 16 channels stay joined,
     because a conv that small runs slowly on TensorRT-RTX 1.6.1.120. The three weight slices are
-    written into the graph (about 15 KB); the shared weight file stays as it is."""
+    written into the graph (about 15 KB); the shared weight file stays as it is. A graph with no
+    part of 16 channels (RIFE 4.25's 4-channel feature warps) has nothing to split and stays as it
+    is."""
     import numpy as np
     import onnx
     from onnx import helper, numpy_helper
@@ -756,6 +755,8 @@ def _last_block_conv_split(onnx_path, name):
         raise RuntimeError(f"{name}: the parts' channels {chans} do not add up to the weight {list(wt.shape)}")
     big = [i for i, c in enumerate(chans) if c >= 16]
     rest = [i for i, c in enumerate(chans) if c < 16]
+    if not big:
+        return
     groups = [[i] for i in big] + ([rest] if rest else [])
     if len(groups) < 2:
         raise RuntimeError(f"{name}: no part to split off ({chans})")
@@ -817,7 +818,8 @@ def _block3_conv_split(onnx_path, name):
     measurable at 480p). NOT bit-identical (the fp16 sum runs in another order): the tweens move by 63 to 65 dB against the unsplit
     conv's and stay as close to an fp32 IFNet as before (53 to 57 dB pooled on RIFE x2 / x4, Frame Blend and DRBA). The
     graph's shape annotations (value_info) are dropped, the parser infers them. The three weight slices are written
-    into the graph (about 60 KB)."""
+    into the graph (about 60 KB). RIFE 4.25's input (parts 3, 3, 4, 4, 1, 1, 8, 4: every part under 16 channels) has
+    nothing to split and stays as it is."""
     import numpy as np
     import onnx
     from onnx import helper, numpy_helper
@@ -881,6 +883,8 @@ def _block3_conv_split(onnx_path, name):
         else:
             parts.append(x)
     chans = [chan(p) for p in parts]
+    if chans == [3, 3, 4, 4, 1, 1, 8, 4]:
+        return
     cast = prod.get(conv.input[1])
     if cast is None or cast.op_type != "Cast" or cast.input[0] not in init:
         raise RuntimeError(f"{name}: expected block 3's weight as an initializer behind a Cast")
@@ -1148,74 +1152,6 @@ def _parts_at_resize_taps(onnx_path, name):
         keep.extend(replace.get(id(nd), [nd]))
     del g.graph.node[:]
     g.graph.node.extend(keep)
-    g.graph.initializer.extend(inits)
-    with open(onnx_path + ".tmp", "wb") as fh:
-        fh.write(g.SerializeToString())
-    os.replace(onnx_path + ".tmp", onnx_path)
-    onnx.checker.check_model(onnx_path)
-
-
-def _encode_subpixel(onnx_path, name):
-    """RIFE encode: its last layer, a transposed conv (4x4, stride 2, pad 1) from half the frame
-    size to the full size, becomes its sub-pixel form: one Conv (3x3, pad 1) with four times the
-    output channels at the half size, then DepthToSpace(2, DCR). Output pixel (2m + i, 2n + j)
-    reads input rows m - 1 .. m + 1 through the transposed kernel's rows 3 - 2r + i (window row r,
-    two of the three in range), columns alike, so each of the four phases keeps its 2x2 taps in a
-    3x3 window, the other taps are exact zeros and the bias repeats per phase: the same products.
-    TensorRT-RTX 1.6.1.120 runs the transposed conv as one slow kernel plus a full-size layout
-    pass; the encode at 1472x2560 takes 1.19 instead of 1.76 ms. NOT bit-identical: the fp16 sum
-    runs in another order, about a quarter of the features move by one fp16 step and RIFE's tweens
-    stay above 64 dB from the transposed conv's (72 dB pooled on 2560x1440 anime), as close to an
-    fp32 run of the model as before. The new weight (18 KB) is written into the graph."""
-    import numpy as np
-    import onnx
-    from onnx import helper, numpy_helper
-
-    if not name.startswith("rife_encode_"):
-        return
-    g = onnx.load(onnx_path, load_external_data=False)
-    outs = {o.name for o in g.graph.output}
-    cts = [nd for nd in g.graph.node if nd.op_type == "ConvTranspose"]
-    if len(cts) != 1 or len(cts[0].input) != 3 or cts[0].output[0] not in outs:
-        raise RuntimeError(f"{name}: expected one transposed conv with a bias writing the output")
-    ct = cts[0]
-    a = {x.name: helper.get_attribute_value(x) for x in ct.attribute}
-    if (list(a.get("kernel_shape", [])) != [4, 4] or list(a.get("strides", [])) != [2, 2]
-            or list(a.get("pads", [])) != [1, 1, 1, 1] or a.get("group", 1) != 1
-            or list(a.get("dilations", [1, 1])) != [1, 1] or list(a.get("output_padding", [0, 0])) != [0, 0]):
-        raise RuntimeError(f"{name}: expected a 4x4, stride 2, pad 1 transposed conv ({a})")
-    init = {i.name: i for i in g.graph.initializer}
-    if ct.input[1] not in init or ct.input[2] not in init:
-        raise RuntimeError(f"{name}: the transposed conv's weight or bias is not an initializer")
-    if any(x in ct.input[1:] for nd in g.graph.node if nd is not ct for x in nd.input):
-        raise RuntimeError(f"{name}: another node reads the transposed conv's weight or bias")
-    base = os.path.dirname(onnx_path)
-    wt = numpy_helper.to_array(init[ct.input[1]], base_dir=base)
-    bt = numpy_helper.to_array(init[ct.input[2]], base_dir=base)
-    ci, co = wt.shape[:2]
-    if wt.shape != (ci, co, 4, 4) or bt.shape != (co,):
-        raise RuntimeError(f"{name}: unexpected weight {list(wt.shape)} / bias {list(bt.shape)}")
-    w = np.zeros((4 * co, ci, 3, 3), wt.dtype)
-    for i in range(2):
-        for j in range(2):
-            ph = i * 2 + j   # DCR: the phase is the outer channel index
-            for ry in range(3):
-                for rx in range(3):
-                    ky, kx = 3 - 2 * ry + i, 3 - 2 * rx + j
-                    if 0 <= ky <= 3 and 0 <= kx <= 3:
-                        w[ph * co:(ph + 1) * co, :, ry, rx] = wt[:, :, ky, kx].T
-    sub = "enc_subpixel"
-    conv = helper.make_node("Conv", [ct.input[0], sub + "_w", sub + "_b"], [sub], name=sub + "_conv",
-                            kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[1, 1])
-    d2s = helper.make_node("DepthToSpace", [sub], [ct.output[0]], name=sub + "_d2s", blocksize=2, mode="DCR")
-    nodes = list(g.graph.node)
-    at = nodes.index(ct)
-    nodes[at:at + 1] = [conv, d2s]
-    inits = [i for i in g.graph.initializer if i.name not in ct.input[1:]]
-    inits += [numpy_helper.from_array(w, sub + "_w"), numpy_helper.from_array(np.tile(bt, 4), sub + "_b")]
-    del g.graph.node[:]
-    g.graph.node.extend(nodes)
-    del g.graph.initializer[:]
     g.graph.initializer.extend(inits)
     with open(onnx_path + ".tmp", "wb") as fh:
         fh.write(g.SerializeToString())
@@ -1916,7 +1852,7 @@ def gmflow_exit_fp16(a_path):
 # oversized example does not qualify (ensure_onnx returns None).
 _SIZE_FREE_UNIT = {"featurenet": 64, "gmflow_bidir": 32, "metricnet": 32, "ifnet": 32,
                    "fusionnet": 32}
-_SIZE_FREE_PREFIX = (("rife_ifnet_", 64), ("rife_encode_", 64), ("rife_block0_", 64))
+_SIZE_FREE_PREFIX = (("rife_ifnet_", 64), ("rife_block0_", 64))
 _SIZE_FREE_MAX = (4352, 7680)   # H, W: an 8K frame padded to /64
 
 
@@ -2014,7 +1950,6 @@ def _size_free_onnx(key, name, export_module, example_inputs, input_names, outpu
         _blocks12_flat_concat(tmp, name)
         _warp_at_resize_taps(tmp, name)
         _parts_at_resize_taps(tmp, name)
-        _encode_subpixel(tmp, name)
         _fusion_fp16_inputs(tmp, name)
         _fusion_tail_cut(tmp, name)
         _fusion_prelu_fanout(tmp, name)
@@ -2098,7 +2033,7 @@ class IFNetEngine(_Engine):
         super().__init__("ifnet", ["x", "timestep"], ["merged"])
 
 
-# --- RIFE 4.26 (rife_backend.py) ----------------------------------------------------------------
+# --- RIFE 4.25 (rife_backend.py) ----------------------------------------------------------------
 # The RIFE IFNet_HDv3 is a different network from GMFSS's IFNet above, so it gets its own graphs:
 # the full IFNet forward (five IFBlocks + the interleaved grid_sample warps), the feature Head
 # (encode) and DRBA's block0 flow.
@@ -2136,25 +2071,6 @@ class RifeIFNetEngine(_Engine):
     def __init__(self, scale_list, whash):
         super().__init__(_rife_ifnet_base(scale_list, whash),
                          ["x", "timestep", "f0", "f1"], ["flow", "mask"])
-
-
-class _RifeEncodeExport(nn.Module):
-    """The IFNet feature Head as its own graph: one padded frame in, its 16-channel encode out."""
-
-    def __init__(self, head):
-        super().__init__()
-        self.head = head
-
-    def forward(self, img):
-        return self.head(img)
-
-
-class RifeEncodeEngine(_Engine):
-    """The RIFE IFNet Head (f0/f1). The name carries the rife checkpoint fingerprint exactly like
-    the IFNet engines."""
-
-    def __init__(self, whash):
-        super().__init__(f"rife_encode_{whash}", ["img"], ["feat"])
 
 
 class _RifeBlock0Export(nn.Module):

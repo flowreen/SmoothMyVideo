@@ -1,8 +1,9 @@
-"""RIFE 4.26-heavy: the IFNet with its weights, for the size-free ONNX export (onnx_export.py reads
+"""RIFE 4.25: the IFNet with its weights, for the size-free ONNX export (onnx_export.py reads
 `ifnet` and `scale_list`), and DRBA's coarse flow (`calc_flow`, the harness gates' reference).
 
-Model code and weights are vendored from routineLife1/DRBA (MIT, engine/rife/DRBA-LICENSE.txt),
-which itself packages hzwer's Practical-RIFE 4.26 heavy checkpoint (MIT).
+The weights are hzwer's Practical-RIFE 4.25 checkpoint, the README's default (MIT,
+engine/rife/PRACTICAL-RIFE-LICENSE.txt); the model code is vendored from routineLife1/DRBA (MIT,
+engine/rife/DRBA-LICENSE.txt) at 4.25's width, a 4-channel feature encode.
 
 Inputs are frame tensors: [1,3,H,W] float RGB in [0,1], padded to a multiple of 64.
 """

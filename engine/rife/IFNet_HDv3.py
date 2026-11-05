@@ -31,7 +31,7 @@ class Head(nn.Module):
         self.cnn0 = nn.Conv2d(3, 16, 3, 2, 1)
         self.cnn1 = nn.Conv2d(16, 16, 3, 1, 1)
         self.cnn2 = nn.Conv2d(16, 16, 3, 1, 1)
-        self.cnn3 = nn.ConvTranspose2d(16, 16, 4, 2, 1)
+        self.cnn3 = nn.ConvTranspose2d(16, 4, 4, 2, 1)
         self.relu = nn.LeakyReLU(0.2, True)
 
     def forward(self, x, feat=False):
@@ -113,18 +113,18 @@ class IFBlock(nn.Module):
 class IFNet(nn.Module):
     def __init__(self):
         super(IFNet, self).__init__()
-        self.block0 = IFBlock(7 + 32, c=192)
-        self.block1 = IFBlock(8 + 4 + 8 + 32, c=128)
-        self.block2 = IFBlock(8 + 4 + 8 + 32, c=96)
-        self.block3 = IFBlock(8 + 4 + 8 + 32, c=64)
-        self.block4 = IFBlock(8 + 4 + 8 + 32, c=32)
+        self.block0 = IFBlock(7 + 8, c=192)
+        self.block1 = IFBlock(8 + 4 + 8 + 8, c=128)
+        self.block2 = IFBlock(8 + 4 + 8 + 8, c=96)
+        self.block3 = IFBlock(8 + 4 + 8 + 8, c=64)
+        self.block4 = IFBlock(8 + 4 + 8 + 8, c=32)
         self.encode = Head()
 
         # not used during inference
         '''
-        self.teacher = IFBlock(8+4+8+3+32, c=64)
+        self.teacher = IFBlock(8+4+8+3+8, c=64)
         self.caltime = nn.Sequential(
-            nn.Conv2d(32+9, 8, 3, 2, 1),
+            nn.Conv2d(16+9, 8, 3, 2, 1),
             nn.LeakyReLU(0.2, True),
             nn.Conv2d(32, 64, 3, 2, 1),
             nn.LeakyReLU(0.2, True),

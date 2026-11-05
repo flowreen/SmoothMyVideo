@@ -4,8 +4,7 @@ scripts/export-onnx.ts (npm setup and dist). While the export stamp (trt_lookup.
 sources, the exporter packages, the weights) matches the one in weights_tags.txt, every file
 already present is skipped, so a rerun is cheap; a changed stamp removes the folder's graphs and
 exports every one again. Graphs: the RIFE IFNet (the
-unbatched class) and its encode, plain and as the flow-warp class at k 1 (Frame Blend), 2 and 4,
-DRBA's block0, and the GMFSS nets (gmflow_bidir as its backbone and two halves, trt_runtime.gmflow_split +
+unbatched class; its encode runs on the host's kernels), DRBA's block0, and the GMFSS nets (gmflow_bidir as its backbone and two halves, trt_runtime.gmflow_split +
 gmflow_backbone_cut, the first half cut around its two N x N attentions by gmflow_matching_cut (`_m` before them, the
 host's k_attn2 between); one form for every size, transformer.py's export path, every transformer attention with its
 projections folded, transformer.fold_projections; A once more in the "edge" form, export_edge_a). Then ship_tidy() and
@@ -58,8 +57,6 @@ def main():
     net, sl = rife.ifnet, list(rife.scale_list)
     with torch.inference_mode():
         f0, f1 = net.encode(a).float(), net.encode(b).float()
-    e = tr.RifeEncodeEngine(rh)
-    ensure(e, tr._RifeEncodeExport(net.encode), (a,))
     # the IFNet: one tween a call, live and offline
     e = tr.RifeIFNetEngine(sl, rh)
     ensure(e, tr._RifeIFNetExport(net, sl), (x, x[:, :1] * 0 + 0.5, f0, f1))
