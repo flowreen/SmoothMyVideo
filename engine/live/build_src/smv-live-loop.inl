@@ -2578,9 +2578,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         bool ratioWarned = false;
         int fgWantPrev = -1;  // DLSS-G target derivation: last derived gen (hysteresis, see stats)
         int fixWantPrev = -1; // fixed-ladder server derivation: same two-window hysteresis
-        // Live DLSS 4.5 above one pass (the cascade): the session's ONE plan, made at the
-        // 2 s derive when dlssgSnap's multiple exceeds the GPU's one-pass limit twice in a row (cascWantPrev), M =
-        // cascM1 x cascM2; cascWarm = stage 1 runs and is fed beside the direct pass until it shares a frame; cascShown =
+        // Live DLSS 4.5 in more than one pass (the cascade): the session's ONE plan, made at the
+        // 2 s derive when dlssgSnap's multiple exceeds the GPU's one-pass limit, or is an even one at or under it (the
+        // 2x split, cascPlan), twice in a row (cascWantPrev), M = cascM1 x cascM2; cascWarm = stage 1 runs and is fed beside the direct pass until it shares a frame; cascShown =
         // the multiple the stats line reports while stage 2 presents its frames (0 = one pass). Past lim x lim three:
         // cascM1 x cascM2 x cascM3 (cascM3 1 = two); cascLow = 2 s windows in a row three stages ran short of theirs;
         // cascMaxM = three stages fell short: the next plan's multiple at most (what the GPU held, 0 = none)
@@ -3339,6 +3339,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const std::string cascMode = lkEnv("SMV_LIVE_CASCADE");
         // SMV_LIVE_DLSSG_KEEP=0: whole multiples only (no kept ring: the rule before the keep plan, an A/B)
         const bool cascKeepOn = lkEnv("SMV_LIVE_DLSSG_KEEP") != "0";
+        // SMV_LIVE_DLSSG_SPLIT=0: an even multiple at or under the one-pass limit stays one pass (no 2x split, the A/B)
+        const bool cascSplitOn = lkEnv("SMV_LIVE_DLSSG_SPLIT") != "0";
         if (!xqRoute && host.useSL && !g_fgOver && (cascMode == "probe" || cascMode == "present"))
         {
             const std::string cg = lkEnv("SMV_LIVE_CASCADE_GEN");
@@ -3393,11 +3395,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 est = ((uint64_t)60 << 20) + frame / 4 * 250;
             return est + 19 * frame + 2 * (uint64_t)panvec::vecSize(cascW) * panvec::vecSize(cascH) * 4;
         };
+        // the one pass a plan falls back to: the limit, or a 2x split's own multiple
+        auto cascOnePass = [&]() { return cascM >= 2 && cascM <= liveDlssgLimit() ? cascM : liveDlssgLimit(); };
         // stage 1 lost, failed or not wanted any more: end it, release stage 2's waits on its fence, one pass again
         auto cascFallback = [&](const char* why) -> bool {
             const bool presenting = casc->present;
+            const int one = cascOnePass();
             LOG("DLSS 4.5's second %spass%s ended (%s): back to one pass at %dx\n", cascUp ? "and third " : "",
-                cascUp ? "es" : "", why, liveDlssgLimit());
+                cascUp ? "es" : "", why, one);
             casc->kill();
             if (cascUp)
                 cascUp->kill();
@@ -3413,10 +3418,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             cascKeep = 1;
             cascLow = 0;
             if (g_fgOver) // the effects route: re-warmed on its newest output slot
-                return !presenting || idleSlotIdx < 0 ||
-                       fgRewarm(idleSlotSet, (uint32_t)idleSlotIdx, liveDlssgLimit() - 1);
+                return !presenting || idleSlotIdx < 0 || fgRewarm(idleSlotSet, (uint32_t)idleSlotIdx, one - 1);
             if (!g_genExplicit)
-                genFrames = liveDlssgLimit() - 1;
+                genFrames = one - 1;
             return !presenting || resetFG();
         };
         // the effects route's cascade feed: one output slot read back and handed to stage 1, so every frame it
@@ -3475,7 +3479,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 cascPendUp->stop();
                 cascPendUp.reset();
             }
-            LOG("DLSS 4.5 stays at %dx: its second pass did not start\n", liveDlssgLimit());
+            LOG("DLSS 4.5 stays at %dx: its second pass did not start\n", cascOnePass());
         };
         // the presented stage shared its first frame: the session presents its frames from now on; returns the
         // session's own pass (its multiple between those frames)
@@ -3504,8 +3508,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     cascM2);
             return cascKeep > 1 ? 1 : cascM3 > 1 ? cascM3 : cascM2;
         };
-        // above one pass: the plan, once a session, when the same multiple is derived twice in a row (either loop's 2 s
-        // window); one pass runs at the limit meanwhile. Stage 1 takes cascW x cascH frames in the back buffer's format:
+        // more than one pass (above the limit, or an even multiple's 2x split at or under it): the plan, once a session,
+        // when the same multiple is derived twice in a row (either loop's 2 s window); one pass runs meanwhile. Stage 1 takes cascW x cascH frames in the back buffer's format:
         // the capture's R8G8B8A8 / R10G10B10A2 packing on the direct route, the output slots' B8G8R8A8 / R10G10B10A2
         // on the effects route. Past lim x lim three passes when the room holds both processes (else the best two); after
         // three fell short of their multiple, at most what they held (cascMaxM)
@@ -3554,8 +3558,18 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 m2 = n2;
                 m3 = n3;
             }
+            // an even rung at or under the one-pass limit splits: 2x in a second process, then M / 2 here (the file
+            // route's order: against 1000 fps truth 2x then 3x beat one 6x pass by 0.8 dB on 30 ms pairs, 2x then 2x
+            // one 4x pass by 0.6 on 28 ms pairs, while one 4x pass was better on 4 ms pairs: a source above 100 fps
+            // keeps one pass)
+            if (cascSplitOn && keep == 1 && m2 == 1 && m3 == 1 && M0 >= 4 && M0 <= lim && M0 % 2 == 0 &&
+                capFps <= 100.0)
+            {
+                m1 = 2;
+                m2 = M0 / 2;
+            }
             int M = M0;
-            if ((M > lim || keep > 1) && M == cascWantPrev && keep == cascKeepPrev)
+            if ((M > lim || keep > 1 || m2 > 1) && M == cascWantPrev && keep == cascKeepPrev)
             {
                 cascTried = true;
                 const uint64_t room = nativeVideoMemoryRoom();
@@ -3583,7 +3597,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     else
                         LOG("DLSS 4.5 stays at %dx: %dx (%dx, then %dx) needs ~%.0f MiB of video memory for its second "
                             "pass, %.0f MiB are free\n",
-                            lim, M, m1, m2, need / 1048576.0, room / 1048576.0);
+                            M <= lim ? M : lim, M, m1, m2, need / 1048576.0, room / 1048576.0);
                 }
                 else
                 {

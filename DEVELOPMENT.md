@@ -287,7 +287,8 @@ RTX VSR / HDR and all three codecs.
   by the host. The NGX feature DLLs are user-installed through the in-app RTX setup box; the
   folder is gitignored and excluded from the zip.
 * `engine/realesr.py`: the `--restore` Real-ESRGAN model (vendored SRVGGNetCompact, BSD-3, weights
-  committed as `engine/realesr-animevideov3.pth`), the Restore ONNX's source (dev tool).
+  committed as `engine/realesr-animevideov3.pth`, which ships: the host reads it), the reference the host's Restore
+  kernels are gated against (dev tool).
 * `engine/live/`: the native host (Live mode, see below, and every offline render). The python live
   server and the python render engine (`render*.py`, `preview.py`,
   `hdr10_meta.py`, `rcas.py`, `rtxvideo.py`, `dlssg.py`, `dlssnr.py`, `nvoffruc.py`) were deleted;
@@ -382,7 +383,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--dlssg] [--no-gpu-fit]
-  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
+  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
@@ -610,7 +611,21 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   shrink.
 * `--restore`: Real-ESRGAN anime-video model once per source frame, first (a generative repaint;
   cleans compression noise, can flatten fine texture), folded straight to the working size, or
-  back to the source size when RTX VSR runs the resize after it. On HDR planes (both routes) it
+  back to the source size when RTX VSR runs the resize after it. The bundled model runs on the host's own CUDA
+  kernels, not a TensorRT engine: the host reads `engine/realesr-animevideov3.pth` itself (torch's stored zip and its
+  pickle; a file that is not this model's form falls back with a line), runs the 16 middle 3 x 3 convs as tensor-core
+  implicit GEMMs with fp16 accumulators (`k_restConvMid`, between `k_restConv0` and `k_restConvLast`, the last one at
+  fp32 accumulate) and folds the 48 sub-pixel planes as below; at 1080p a Restore-only frame takes 0.80x the engine
+  route's time, every output within one 8-bit code of it. A missing or wrong .pth = no Restore (`Restore unavailable
+  (...)`; a render drops the pass). A `--restore-model` ONNX in AnimeJaNai's SPAN-F3 form (64 features, any block
+  count up to 16: reflect pad, PixelUnshuffle(2), conv 12 -> 64, blocks of three 3 x 3 convs with a tanh attention, a
+  1 x 1 concat conv, conv 64 -> 48, DepthToSpace 4) runs on the host's kernels as well: the host reads the ONNX file
+  itself (its protobuf: the nodes and the fp16 initializers), checks that form node by node along the data path and
+  runs the 3 x 3 convs on `k_restConvMid`, the block tails on `k_ajAtt` (the 1 x 1 on the tensor cores, `(t + c3) *
+  tanh(...)` in fp32), the concat conv on `k_ajCat` (its four inputs read in place) and the first conv on `k_ajFirst`
+  (the pad and the unshuffle folded into its loads), then folds the 48 sub-pixel planes at the half grid without a base
+  add. 1.10x its engine's time at 1080p and 6 dB closer to the model in fp32 (74.8 vs 68.4 dB); any other graph (a
+  48-feature Performance file, another architecture) runs as a TensorRT engine, with a line saying why. On HDR planes (both routes) it
   reads the frame's SDR view (`k_hdrEnc`, a brighter pixel scaled to white with its hue) and
   `k_hdrRestOut` adds back the light the view never held (the source fitted to the target when
   the size changes), DLSS 5's way: the SDR range comes out as from an SDR source (87 dB against
@@ -653,7 +668,21 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   per driver and FSR build: each route's key (System32's `nvapi64.dll` + the route's DLLs, by size and write
   time) is kept in the model cache's `fsr4_warm.txt`; none while a live session or a render runs; the app's exit
   kills a running one (no key). Gate `harness\fsr4_warmup\app_gate.py` (`npx tsc` first; a driver-cold Vulkan cache
-  via `__GL_SHADER_DISK_CACHE_PATH`). Downscales (F below 1) are folded into the decode.
+  via `__GL_SHADER_DISK_CACHE_PATH`). `--anime4k` puts Anime4K's Upscale CNN x2 UL (bloc97, v4.0.1) in that same
+  resize instead (RTX VSR and AMD FSR win over it, with a line). The shader's weights live in the host as fp32 bit
+  patterns (`kA4kWeights` in `smv-live-native.inl`, with the source shader's md5; no shader file ships), and the host
+  runs its conv passes as CUDA kernels in the shader's own arithmetic (fp32 math, every texture stored as fp16): the
+  session's setup writes them with every weight as a float literal (`a4kKernelText`: `k_a4kConv0`, `k_a4kConv_1` ..
+  `_6` and the 1 x 1 `k_a4kLast`) and compiles that text once into its own module, cached beside the main kernels'
+  cubin (`smv_anime4k_*.cubin`; the first Anime4K session per driver pays a few seconds), on the planar floats at the
+  resize's input size, then `k_a4kFoldHSub` does the shader's Depth-to-Space
+  pass (the sub-pixels + the source's bilinear 2x, added in fp32) while Restore's Lanczos fold reads them straight to
+  the target with the clamp (no 8-bit round trip, the 2x frame never written). No engine build and nothing in the
+  model cache. HDR frames go in as their SDR view and come back to the codes the way RTX VSR's do. Its output equals
+  the PyTorch net's within one 8-bit code (75 dB; the net equals libplacebo's run of the shader at 70 dB). A module
+  that does not compile or load = Lanczos with the `Anime4K unavailable` line. A new upstream release: compare its UL
+  shader's md5 with the one `kA4kWeights` names; a different file needs a new table (its weights in the same order,
+  as fp32 bit patterns) and the identity gate. Downscales (F below 1) are folded into the decode.
 * `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame at the working size, after Restore and
   the resize, before the interpolation, DLAA (scaling
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
@@ -895,7 +924,7 @@ mean); a Reset on every evaluate made the pass a pure function of the frame (0 o
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale --upscale H --restore
+  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --nr-passes 1..20 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
@@ -1204,7 +1233,9 @@ value (harness `dlssg_gpu_transport`: x6 of 24 fps at 2560x1472 = 144 presents a
 Live uses it on both DLSS-G routes: the direct one feeds it the captured frames, the effects route (any effect or a
 DLSS mode below DLAA) its output slots, read back at the presented size (`--bgra` in SDR), so every frame it
 generates from carries the effects; a stage 1 whose ring is not the back buffer's size and format is refused. When
-the target needs more than one pass: at the
+the target needs more than one pass (above the limit, or an even multiple at or under it, which splits the file
+route's way: 4x = 2x then 2x, 6x = 2x then 3x, one pass on a source above 100 fps; `SMV_LIVE_DLSSG_SPLIT=0` = one
+pass): at the
 2 s stats window where the derived multiple first repeats, the host snaps target / captured rate to the
 first rung that reaches it (within 3 %; the largest when none does): every product of one, two or three
 passes of 2..L (L = numFramesToGenerateMax + 1 read after the warm-up), the passes smallest first as on the
@@ -1221,13 +1252,13 @@ session's own DLSS-G at the last factor. Three passes: a second helper `--stage1
 share tag>` takes the first's ring on the GPU (in present order, the newest after a wrap) and the session
 presents the second's; three passes below 85 % of their multiple for three 2 s windows in a row end and the
 next plan holds two. One plan a session; a helper ending, failing or sharing nothing for 2 s returns the
-session to one pass at L. A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
+session to one pass (at L, or at the split multiple). A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
 route's way: a rung R of one or two helper passes and a keep k of 2..6 with R / k within 3 % (the fewest passes,
 then the smallest R: 2.5x = 5x in a helper, 4.5x = 3x then 3x in two, 7.5x = 3x then 5x), the session presents every k-th frame of
 the presented ring and makes none itself, so the output stays evenly spaced (`SMV_LIVE_DLSSG_KEEP=0` = whole
 multiples only). Lines `DLSS 4.5 plan: ...`, `DLSS 4.5 at Mx: ... in a second process, [.. in a
 third, ]then ...` (a kept plan: `DLSS 4.5 at 2.50x: 5x in a second process, every 2nd of its frames presented
-here, none made here`), `DLSS 4.5 stays at Lx: ...`, `DLSS 4.5's second [and third] pass[es] ended (...)`; the
+here, none made here`), `DLSS 4.5 stays at Mx: ...`, `DLSS 4.5's second [and third] pass[es] ended (...)`; the
 app shows them beside the stats. Gates: harness `dlssg_cascade\s2_gate.py`, `dlssg_third_stage\three_gate.py`,
 `dlssg_live_keep\keep_gate.py`.
 The render (`src/render`) keeps the
@@ -1241,8 +1272,8 @@ per-frame passes run in the exe
 too (`nativeOfflineEmit` on every output frame: the resize, RTX VSR or clamped Lanczos,
 only ever an enlarge since a downscale folds into the decode, then to_bytes' quantisation; Restore,
 DLSS 5, Sharpen and RTX HDR run before the model, see Passes above): `native.ts` passes `--out-w --out-h --rtx-vsr --sharpen S
---restore` and loads none of those passes itself, the host builds the Restore engine from
-`engine\onnx` when it is missing. RTX HDR runs there too: TrueHDR once per decoded frame at the working
+--restore` and loads none of those passes itself, the host runs the bundled Restore on its own kernels (a
+`--restore-model` graph: its engine, built when it is missing). RTX HDR runs there too: TrueHDR once per decoded frame at the working
 size after DLSS 5 and Sharpen (`nativePreModelPost`, the vivid / rtx / raw colour modes and Dynamic
 Vibrance with live's kernel math), the model interpolates the PQ frames, and the emit writes the
 x2rgb10le words and each output frame's statistics (`nativeOfflinePqOut`, `k_pqOut`): `native.ts` passes `--out-pixfmt x2rgb10le
@@ -1421,8 +1452,9 @@ so the lookup and the build cannot disagree on a name:
   checks in C++ (the engine names are shared with offline renders). Engines that exist AND carry
   the warm marker for the size answer at once (log: `warm engines found by the host, no python
   process`); nvof, fruc and echo have no engine and answer with geometry only (fruc checks its
-  bridge folder and three DLLs). Live Restore adds the Real-ESRGAN engine at the capture size (it
-  reads the captured frame) plus its `.jit`, for every backend.
+  bridge folder and three DLLs). Live Restore adds `NATIVE-PATH restore=native:realesr-animevideov3` (the host's
+  kernels), or a `--restore-model` engine at the capture size (it reads the captured frame) plus its `.jit`, for
+  every backend.
 * On a miss the host BUILDS the engines (`nativeLocalBuild`, on a worker thread): from
   `engine/onnx` with the old python builder's settings (strongly typed, optimization level 5,
   workspace 8 GB x the per-graph multiplier; TensorRT-RTX's auxiliary streams capped
@@ -1430,8 +1462,8 @@ so the lookup and the build cannot disagree on a name:
   metricnet and gmflow_backbone, two on fusionnet; every other net keeps TensorRT-RTX's choice) through
   the delay-loaded ONNX parser, a warm-up with a fresh runtime cache (EAGER specialization), then the
   `.jit` and the warm key; the lookup must then
-  hit. It covers rife, gmfss, rifedrba (the RIFE pair plus block0) and Restore (`restore_<hash>_dth`, fp16 input, no
-  warm marker). TensorRT-RTX compiles one engine at a time per PROCESS (a build or a JIT warm-up on another thread
+  hit. It covers rife, gmfss, rifedrba (the RIFE pair plus block0) and a `--restore-model` graph (`restore_x<hash>`,
+  no warm marker). TensorRT-RTX compiles one engine at a time per PROCESS (a build or a JIT warm-up on another thread
   waits for the running one; two processes run side by side at full speed), so a GMFSS build (live and offline,
   `lkGmEnsure`) hands the set's two longest builds + warm-ups, gmflow A (`gflow`) and its front `_m` (`gflowm`), each
   to a helper process: this exe as
@@ -1548,14 +1580,16 @@ upscale to: model WxH -> WxH first, then 1:1|fit to
 WxH` and `upscale=native`; gate `harness\eff\upto_equiv.py` (the two-stage chain within 5e-5 of
 `_Fit._upscale` run in fp64, the stores off by one in under 1% of bytes, plus a 9596-height sweep of
 the size derivation against the python expression) and the `upto_*` cases of `eff_native.py`. Restore
-runs natively too: `--restore` rides on the handoff line, so the python handoff builds and
-warms the Real-ESRGAN TensorRT engine into the shared cache and hands its path over like the IFNet's
+runs natively too: `--restore-model` rides on the handoff line, so the handoff builds and
+warms that graph's TensorRT engine into the shared cache and hands its path over like the IFNet's
 (`NATIVE-PATH restore=` / `rjit=`, the restore kernels merged into the shared jit cache); the host
 runs it once per captured frame before the model (on the capture itself, as SDR planes when RTX
 HDR is on: TrueHDR runs later, after Restore, DLSS 5 and Sharpen; `k_restIn` = torch `.half()` of the frame, one `enqueueV3`, the engine at the
 capture size), then folds the 4x output straight to the model size into the model frame, in place of
 the capture shrink, so every model, DLSS 5 and every presented frame read restored frames (`k_restFoldH` / `k_restFoldV` = the antialiased pair with `out.clamp(0,1)` folded into the taps,
-at every ratio); the resident host keeps
+at every ratio; Real-ESRGAN's exported graph stops at its last conv, so `k_restFoldHSub` reads its 48 sub-pixel planes
+and adds the nearest base, the input pixel, in fp32: the x4 frame is never written; the host tells the two forms
+apart by the engine's output shape); the resident host keeps
 the restore engine beside the RIFE pair per path; the log lines are `native: live restore: Real-ESRGAN
 animevideov3 (TensorRT) at WxH -> WxH, on the captured frame before the model` and `restore=native`; an
 engine refusal mid-run drops the pass with one line. Gate
@@ -1563,10 +1597,15 @@ engine refusal mid-run drops the pass with one line. Gate
 output; python's own fp16 fold sits about 1e-3 from it) and the `restore_*` cases of `eff_native.py`.
 The session stays model-bound: measured before the port (`harness\eff\restore_share.py`), the python
 route's wall per group equalled its own GPU-event span at 1080p and 540p, so the port removes the
-python process, not milliseconds. The effects-only route runs natively too:
+python process, not milliseconds. That engine route serves a `--restore-model` graph that is not AnimeJaNai's
+SPAN-F3 form only (that form = `NATIVE-PATH restore=native:animejanai`, the host's kernels); the bundled
+Real-ESRGAN runs on the host's own kernels (see `--restore`): the handoff names it `NATIVE-PATH restore=native:realesr-animevideov3` (no engine, no jit), its two
+channels-last buffers sit in the shared activation block of the model contexts (every enqueue there runs one after
+another on the session stream, Restore first), and the line reads `(the host's kernels)`. The effects-only route runs
+natively too:
 `echo` (no
 model ticked) runs the host's no-engine mode: the handoff answers with the geometry only (`engine=none`,
-`NATIVE-PATH cache=` for the kernel cubin, the Real-ESRGAN engine when Restore is on; without Restore
+`NATIVE-PATH cache=` for the kernel cubin, the Restore line when Restore is on; without Restore
 it is torch-free on every start), no IFNet or encode engine is loaded, and every group stores its one
 real frame through the same effects chain (Identity's rule: an empty adaptive group presents nothing,
 any other group exactly one frame), `engine=none (effects only)` on the `native host ready` line. The
@@ -2148,12 +2187,12 @@ loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
 vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
-github.com/HansKristian-Work/vkd3d-proton at 8293130ebe370b1deb761898ae0d397d680837de with its submodules
-(dxil-spirv at 8b48f0e0392d76be4fdcea2a3ba3ea99dddaae5b), then
+github.com/HansKristian-Work/vkd3d-proton at 87983f34c5cffa6691b7deb665d09d06376772ea with its submodules
+(dxil-spirv at 788f3e22968ee79d145a680279531389b439cb96), then
 
 ```
-git apply engine/fsrfg/source/vkd3d-proton-8293130-smv.patch        (in the vkd3d-proton checkout)
-git apply engine/fsrfg/source/dxil-spirv-8b48f0e-smv.patch          (in subprojects/dxil-spirv)
+git apply engine/fsrfg/source/vkd3d-proton-87983f3-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/dxil-spirv-788f3e2-smv.patch          (in subprojects/dxil-spirv)
 meson setup build --buildtype=release -Denable_extended_emulation=true
 ninja -C build
 ```

@@ -78,15 +78,14 @@ def _export_onnx(export_module, example_inputs, input_names, output_names, onnx_
 
 def _fuse_prelu(onnx_path):
     """Rewrite every PRelu into an exact form TensorRT-RTX fuses into the conv before it: it runs
-    PRelu as a separate elementwise kernel (22 % of fusionnet, 26 % of Restore) but fuses
+    PRelu as a separate elementwise kernel (22 % of fusionnet) but fuses
     LeakyRelu and Max. Scalar slope a: LeakyRelu(alpha=a); per-channel slopes all <= 1:
     Max(x, x * a). Per-channel slopes with one above 1 where a Conv's output is the PRelu's only
     input reader and one Conv reads its result: the SIGN FOLD, every channel with a > 1 gets its
     conv output channel (weights and bias) and the next conv's input channel negated, so there
-    PReLU_a(x) = -Max(-x, -a x) and the activation is Max(x, x * a) again (Restore's 14 such:
-    1.84 -> 1.74 ms a layer, the 1080p call x0.977, bit-identical); any other per-channel slope:
-    Max(x, 0) + a * Min(x, 0). Each is exact for its case, and the engines built from the rewrite
-    give bit-identical output (Restore 1.30x, fusionnet 1.06x / 1.09x faster at 1080p / 4K).
+    PReLU_a(x) = -Max(-x, -a x) and the activation is Max(x, x * a) again (bit-identical); any
+    other per-channel slope: Max(x, 0) + a * Min(x, 0). Each is exact for its case, and the engines
+    built from the rewrite give bit-identical output (fusionnet 1.06x / 1.09x faster at 1080p / 4K).
     The graph is rewritten and the sign fold's changed weights are written into it under new
     names; the external weight file stays as it is."""
     import numpy as np
@@ -1912,13 +1911,12 @@ def gmflow_exit_fp16(a_path):
 # these files, 8 graphs are bit-exact with the per-size
 # engines; gmflow_bidir runs its size-free branch (multiply + sum local ops) and is equivalent or
 # better (closer to eager fp32). Unit = the alignment of the FIRST input's H and W (the /64 frame
-# pad, 32 for GMFSS's half-size nets, 1 for Restore at the model size); every other input's
+# pad, 32 for GMFSS's half-size nets); every other input's
 # spatial dims are an integer multiple of the same symbols. Any other name or an unaligned or
 # oversized example does not qualify (ensure_onnx returns None).
 _SIZE_FREE_UNIT = {"featurenet": 64, "gmflow_bidir": 32, "metricnet": 32, "ifnet": 32,
                    "fusionnet": 32}
-_SIZE_FREE_PREFIX = (("rife_ifnet_", 64), ("rife_encode_", 64), ("rife_block0_", 64),
-                     ("restore_", 1))
+_SIZE_FREE_PREFIX = (("rife_ifnet_", 64), ("rife_encode_", 64), ("rife_block0_", 64))
 _SIZE_FREE_MAX = (4352, 7680)   # H, W: an 8K frame padded to /64
 
 
@@ -1933,7 +1931,7 @@ def _export_key(name, export_module, example_inputs):
     """The ONNX key: the engine base name, plus what that name leaves out but the graph bakes in:
     the GMFSS IFNet's scale_list (its engine is named plain `ifnet`) and the input dtypes (a
     strongly typed engine takes its input types from the ONNX; `_dt` + one letter per input
-    only when an input is not fp32, e.g. Restore's fp16 `_dth`)."""
+    only when an input is not fp32, e.g. an fp16 input = `_dth`)."""
     key = name
     if isinstance(export_module, _IFNetExport):
         key += "_sl" + "-".join(f"{s:g}" for s in export_module.scale_list)
@@ -2098,14 +2096,6 @@ class _IFNetExport(nn.Module):
 class IFNetEngine(_Engine):
     def __init__(self):
         super().__init__("ifnet", ["x", "timestep"], ["merged"])
-
-
-class RestoreEngine(_Engine):
-    """The --restore Real-ESRGAN pass (realesr.py). The realesr weights hash rides in the NAME
-    (not the _w tag): a realesr weight swap changes the name and is a plain cache miss."""
-
-    def __init__(self, whash):
-        super().__init__(f"restore_{whash}", ["x"], ["y"])
 
 
 # --- RIFE 4.26 (rife_backend.py) ----------------------------------------------------------------

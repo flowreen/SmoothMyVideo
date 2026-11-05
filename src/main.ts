@@ -894,6 +894,7 @@ function vsrQArgs(q: number): string[] {
   return q !== 4 ? ['--vsr-quality', String(q)] : [];
 }
 let liveFsrUp = false; // AMD FSR 4 as the live upscaler instead (its checkbox; the two exclude each other)
+let liveA4kUp = false; // Anime4K as the live upscaler instead (its checkbox; RTX VSR and AMD FSR 4 clear it)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
 let liveRestoreModel = ''; // Restore's model id ('animejanai' = the installed AnimeJaNai file, '' = Real-ESRGAN)
@@ -1051,6 +1052,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   // working size before it) and skips it with a line when neither does
   if (liveVsr) args.push('--rtx-vsr', ...vsrQArgs(liveVsrQ));
   else if (liveFsrUp) args.push('--fsr-upscale');
+  else if (liveA4kUp) args.push('--anime4k');
   // Restore: Real-ESRGAN first on every presented frame; costs most
   // of a 1080p frame budget, the panel hint says so
   if (liveRestore) args.push('--restore', ...restoreModelArgs(liveRestoreModel));
@@ -1234,6 +1236,7 @@ ipcMain.on(
       rtxvsr?: boolean;
       vsrquality?: number; // RTX VSR's quality level 1..4
       fsrup?: boolean;
+      anime4k?: boolean;
       uph?: number;
       restore?: boolean;
       restoreModel?: string; // Restore's model id ('animejanai'; none = Real-ESRGAN)
@@ -1263,6 +1266,7 @@ ipcMain.on(
     liveVsr = !!opts.rtxvsr;
     liveVsrQ = vsrQ(opts.vsrquality);
     liveFsrUp = !!opts.fsrup;
+    liveA4kUp = !!opts.anime4k;
     liveUpH = opts.uph ?? 0;
     liveRestore = !!opts.restore;
     liveRestoreModel = opts.restoreModel ?? '';
@@ -1633,6 +1637,7 @@ type RunOpts = {
   rtxvsr?: boolean;
   vsrquality?: number; // RTX VSR's quality level 1..4
   fsrup?: boolean;
+  anime4k?: boolean;
   rtxhdr?: boolean;
   dv?: boolean;
   dvprofile?: string; // Dolby Vision 8.1 (HDR10 base, the default) or 8.4 (HLG base)
@@ -1707,9 +1712,10 @@ function engineArgs(opts: RunOpts): string[] {
   // RTX VSR: the real RTX Video SDK (the engine/rtxvideo CUDA bridge) for an enlarging resize: the
   // final one from the working size (a mode below DLAA or an upscale), else the one before the
   // model; the plan skips it when nothing enlarges. Falls back to Lanczos3 if the bridge or the RTX
-  // Video runtime is unavailable. AMD FSR 4 (bundled) takes the same resize when its box is ticked instead.
+  // Video runtime is unavailable. AMD FSR 4 (bundled) or Anime4K takes the same resize when its box is ticked instead.
   if (opts.rtxvsr) args.push('--rtx-vsr', ...vsrQArgs(vsrQ(opts.vsrquality)));
   else if (opts.fsrup) args.push('--fsr-upscale');
+  else if (opts.anime4k) args.push('--anime4k');
   // "Fit to the GPU" off: no video memory fit (the batch stays as planned, slower when memory runs short)
   if (opts.nogpufit) args.push('--no-gpu-fit');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
@@ -1932,6 +1938,7 @@ type PreviewOpts = {
   rtxvsr?: boolean;
   vsrquality?: number; // RTX VSR's quality level 1..4
   fsrup?: boolean;
+  anime4k?: boolean;
   restore?: boolean;
   restoreModel?: string; // Restore's model id ('animejanai'; none = Real-ESRGAN)
   dlssmode?: string; // the DLSS mode (dlssScaleArg)
@@ -1967,6 +1974,7 @@ function previewArgv(opts: PreviewOpts, prefix: string): string[] {
   if (opts.rtxvsr)
     args.push('--rtx-vsr', ...vsrQArgs(vsrQ(opts.vsrquality))); // the plan runs it on an enlarging resize only
   else if (opts.fsrup) args.push('--fsr-upscale');
+  else if (opts.anime4k) args.push('--anime4k');
   if (opts.hdr)
     args.push(
       '--rtx-hdr',

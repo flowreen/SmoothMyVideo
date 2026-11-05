@@ -140,6 +140,9 @@
   "fsrup.tip": "Versi: AMD FSR 4.1.2 upscaling (FidelityFX SDK 2.4.0). Vektor gerak: NVIDIA Optical Flow di Slow, tingkat kualitas tertingginya.",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(upscaler AI dari AMD, dipakai saat <span class='vonly'>Ukuran lebih besar dari sumber</span><span class='lonly'>Penuhi layar atau mode DLSS di bawah DLAA memperbesar gambar</span>)",
+  "a4k.tip": "Versi: Anime4K 4.0.1, Upscale CNN x2 UL (model terbesarnya). Memperbesar 2x, lalu Lanczos menyesuaikan Ukuran. Dalam uji fidelitas SMV (1,5x dan 2x, empat klip) hasilnya rata-rata lebih dekat ke aslinya berukuran penuh daripada RTX VSR dan AMD FSR.",
+  "a4k.name": "Anime4K",
+  "a4k.hint": "(upscaler CNN khusus anime, dipakai saat <span class='vonly'>Ukuran lebih besar dari sumber</span><span class='lonly'>Penuhi layar atau mode DLSS di bawah DLAA memperbesar gambar</span>)",
 
   "sharpen.k": "Pertajam",
   "sharpen.tip": "Versi: Adaptive Sharpen oleh bacondither, versi HQ dua lintasan DX11 tanggal 2021-09-10",
@@ -315,6 +318,7 @@
   "lv.fit.fill": "memperbesar jendela ke seluruh monitornya, rasio aspek dipertahankan",
   "lv.fit.vsr": "upscale RTX VSR",
   "lv.fit.fsr": "upscale AMD FSR",
+  "lv.fit.a4k": "upscale Anime4K",
   "lv.fit.up": "upscale",
   "lv.fit.monitor": "menghaluskan semua yang ada di monitor tempat jendela berada",
   "lv.stop": "Berhenti",

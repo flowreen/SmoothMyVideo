@@ -121,8 +121,7 @@ def export_stamp():
         except metadata.PackageNotFoundError:
             v = "-"
         h.update(f"{pkg} {v}\n".encode())
-    rest = _md5_files([os.path.join(HERE, "realesr-animevideov3.pth")])
-    h.update(f"{weights_tag()} {rife_weights_tag()} {rest}\n".encode())
+    h.update(f"{weights_tag()} {rife_weights_tag()}\n".encode())
     h.update(f"{HOST_BUILD}\n".encode())
     return "e" + h.hexdigest()[:10]
 

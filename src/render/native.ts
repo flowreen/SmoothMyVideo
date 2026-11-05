@@ -332,6 +332,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   // RTX VSR's quality level goes to the host only when it is not the default Ultra (4)
   const VSR_Q = (args.vsr_quality ?? 4) !== 4 ? ['--vsr-quality', String(args.vsr_quality)] : [];
   const FSR_UP = args.fsr_upscale && !RTX_VSR;
+  const A4K_UP = args.anime4k && !RTX_VSR && !FSR_UP;
   let RTX_HDR = args.rtx_hdr;
   const DV_EXPORT = args.dv,
     HP_EXPORT = args.hdr10plus,
@@ -760,6 +761,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     if (!CASCADE || !lastResize) {
       if (RTX_VSR) nargs.push('--rtx-vsr', ...VSR_Q);
       if (FSR_UP) nargs.push('--fsr-upscale');
+      if (A4K_UP) nargs.push('--anime4k');
     }
   }
   if (SHARPEN > 0) nargs.push('--sharpen', pyG(SHARPEN));
@@ -866,6 +868,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       a.push('--out-w', String(OUT_W), '--out-h', String(OUT_H));
       if (RTX_VSR) a.push('--rtx-vsr', ...VSR_Q);
       if (FSR_UP) a.push('--fsr-upscale');
+      if (A4K_UP) a.push('--anime4k');
     }
     // PQ / HLG frames go to DLSS 4.5 as HDR10, as in the first pass
     if (SRC_HDR_IN) a.push('--src-hdr', String(tag(ST, 'color_transfer') || '') === 'arib-std-b67' ? 'hlg' : 'pq');

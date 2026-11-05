@@ -38,6 +38,7 @@ export interface PreviewArgs {
   rtx_vsr: boolean;
   vsr_quality: number; // --vsr-quality: RTX VSR's quality level 1..4, 4 = Ultra
   fsr_upscale: boolean;
+  anime4k: boolean;
   dlssnr: boolean;
   nr_structure: number;
   nr_tone: number;
@@ -89,6 +90,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     rtx_vsr: false,
     vsr_quality: 4,
     fsr_upscale: false,
+    anime4k: false,
     dlssnr: false,
     nr_structure: 1,
     nr_tone: 1,
@@ -118,6 +120,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--restore': 'restore',
     '--rtx-vsr': 'rtx_vsr',
     '--fsr-upscale': 'fsr_upscale',
+    '--anime4k': 'anime4k',
     '--dlssnr': 'dlssnr',
     '--nr-mask': 'nr_mask',
   };
@@ -700,7 +703,7 @@ async function setup(a: PreviewArgs, env: NodeJS.ProcessEnv) {
 type Setup = Awaited<ReturnType<typeof setup>>;
 
 /** The host's pass flags for the render's chain at the current settings (Restore and the resize to the working size,
- * DLSS 5, the resize to `out` with RTX VSR / AMD FSR 4 when `upscaler`, Adaptive Sharpen, RTX HDR); `srcHdr` = a PQ /
+ * DLSS 5, the resize to `out` with RTX VSR / AMD FSR 4 / Anime4K when `upscaler`, Adaptive Sharpen, RTX HDR); `srcHdr` = a PQ /
  * HLG source's --src-hdr, `deltaFile` = the DLSS 5 change map's file. */
 function passFlags(
   a: PreviewArgs,
@@ -713,6 +716,7 @@ function passFlags(
     if (o.upscaler) {
       if (s.needVsr) args.push('--rtx-vsr', ...vsrQuality(a));
       else if (a.fsr_upscale && o.outW > s.W && o.outH > s.H) args.push('--fsr-upscale');
+      else if (a.anime4k && o.outW > s.W && o.outH > s.H) args.push('--anime4k');
     }
   }
   if (s.strength > 0) args.push('--sharpen', pyG(s.strength));
@@ -1016,6 +1020,7 @@ export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         st.push('--out-w', String(OW), '--out-h', String(OH));
         if (s.needVsr) st.push('--rtx-vsr', ...vsrQuality(a));
         else if (a.fsr_upscale && OW > WW && OH > WH) st.push('--fsr-upscale');
+        else if (a.anime4k && OW > WW && OH > WH) st.push('--anime4k');
       }
       if (s.srcHdr) st.push('--src-hdr', s.transfer === 'arib-std-b67' ? 'hlg' : 'pq');
       stages.push(st);

@@ -140,6 +140,9 @@
   "fsrup.tip": "الإصدار: تكبير AMD FSR 4.1.2 (FidelityFX SDK 2.4.0). متجهات الحركة: NVIDIA Optical Flow على Slow، أعلى مستويات جودته.",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(مكبّر AMD بالذكاء الاصطناعي، يُستخدم عندما <span class='vonly'>يكون الحجم أكبر من المصدر</span><span class='lonly'>يكبّر ملء الشاشة أو وضع DLSS أقل من DLAA</span>)",
+  "a4k.tip": "الإصدار: Anime4K 4.0.1، Upscale CNN x2 UL (أكبر نماذجه). يكبّر 2x ثم يضبط Lanczos الحجم. في اختبار الدقة في SMV (1.5x و2x، أربعة مقاطع) كان في المتوسط أقرب إلى الأصل كامل الحجم من RTX VSR وAMD FSR.",
+  "a4k.name": "Anime4K",
+  "a4k.hint": "(مكبّر CNN مصمم للأنمي، يُستخدم عندما <span class='vonly'>يكون الحجم أكبر من المصدر</span><span class='lonly'>يكبّر ملء الشاشة أو وضع DLSS أقل من DLAA</span>)",
 
   "sharpen.k": "الحدة",
   "sharpen.tip": "الإصدار: Adaptive Sharpen من bacondither، نسخة DX11 الثنائية التمريرة HQ بتاريخ 2021-09-10",
@@ -315,6 +318,7 @@
   "lv.fit.fill": "يكبّر النافذة لتملأ شاشتها مع الحفاظ على النسبة",
   "lv.fit.vsr": "تكبير RTX VSR",
   "lv.fit.fsr": "تكبير AMD FSR",
+  "lv.fit.a4k": "تكبير Anime4K",
   "lv.fit.up": "تكبير",
   "lv.fit.monitor": "ينعّم كل ما على الشاشة التي عليها النافذة",
   "lv.stop": "إيقاف",

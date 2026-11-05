@@ -140,6 +140,9 @@
   "fsrup.tip": "版本：AMD FSR 4.1.2 放大（FidelityFX SDK 2.4.0）。运动矢量：NVIDIA Optical Flow 的 Slow 档（最高质量级别）。",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "（AMD 的 AI 放大，在<span class='vonly'>尺寸大于源视频</span><span class='lonly'>填满屏幕或 DLSS 模式低于 DLAA 需要放大</span>时使用）",
+  "a4k.tip": "版本：Anime4K 4.0.1，Upscale CNN x2 UL（其最大的模型）。先放大 2 倍，再用 Lanczos 缩放到目标尺寸。在 SMV 的保真度测试（1.5 倍和 2 倍，四段视频）中，它平均比 RTX VSR 和 AMD FSR 更接近完整尺寸的原图。",
+  "a4k.name": "Anime4K",
+  "a4k.hint": "（面向动画的 CNN 放大，在<span class='vonly'>尺寸大于源视频</span><span class='lonly'>填满屏幕或 DLSS 模式低于 DLAA 需要放大</span>时使用）",
 
   "sharpen.k": "锐化",
   "sharpen.tip": "版本：bacondither 的 Adaptive Sharpen，DX11 双遍 HQ 版（2021-09-10）",
@@ -315,6 +318,7 @@
   "lv.fit.fill": "把窗口放大到所在显示器的全屏，保持宽高比",
   "lv.fit.vsr": "RTX VSR 放大",
   "lv.fit.fsr": "AMD FSR 放大",
+  "lv.fit.a4k": "Anime4K 放大",
   "lv.fit.up": "放大",
   "lv.fit.monitor": "让窗口所在显示器上的所有内容变顺滑",
   "lv.stop": "停止",

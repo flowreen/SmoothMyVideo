@@ -129,8 +129,9 @@ These run before the new frames are made, in videos and in Live:
 
 * 🔍 **Restore**: cleans up compression noise and blur (Real-ESRGAN); it can flatten fine texture. Off by
   default.
-* 📐 **Upscale**: makes the picture bigger and sharper with NVIDIA RTX Video Super Resolution (on by default) or AMD
-  FSR 4.1; with neither ticked, a standard resize. They only run when the picture is enlarged.
+* 📐 **Upscale**: makes the picture bigger and sharper with NVIDIA RTX Video Super Resolution (on by default), AMD
+  FSR 4.1 or Anime4K (made for anime); with none ticked, a standard resize. They only run when the picture is
+  enlarged.
 * 🧠 **NVIDIA DLSS 5** (optional): NVIDIA's Neural Rendering, an AI picture enhancement on every original frame.
   [Details](#nvidia-dlss-5).
 * ✏️ **Sharpen**: bacondither's Adaptive Sharpen, strength 0 to 2 (on at 1.00 by default).
@@ -200,12 +201,12 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
 * **Stop:** press the hotkey again, or click **Stop**. The hotkey is reserved system-wide while the app runs.
 * **Display:** **Whole screen** (the default) smooths the whole monitor the active window is on, everything on it, and
   works with every model including DLSS 4.5. **Original size** smooths only the window. **Fill screen** fills its
-  monitor with the window (aspect kept), upscaled with RTX VSR or AMD FSR 4.1 when ticked.
+  monitor with the window (aspect kept), upscaled with RTX VSR, AMD FSR 4.1 or Anime4K when ticked.
 * **Adaptive:** with GMFSS, RIFE or NVIDIA Optical Flow the output holds your fps target whatever the source does (a
   game dropping from 30 to 10 fps still plays at the same smooth rate). AMD FSR 4 and Smooth Motion double the frame
   rate per pass, so they pick the doubling that reaches your target (60 fps on a 24 fps source shows 96); DLSS 4.5
-  picks the first multiple its passes make that does (up to 6&times; a pass, smallest pass first: 15&times; = 3&times;
-  then 5&times;), and reaches a target in between by making more and showing every 2nd to 6th frame (60 fps from 24
+  picks the first multiple its passes make that does (up to 6&times; a pass, smallest pass first: 6&times; = 2&times;
+  then 3&times;, 15&times; = 3&times; then 5&times;), and reaches a target in between by making more and showing every 2nd to 6th frame (60 fps from 24
   = 5&times;, every 2nd), evenly spaced. A plan that lands exactly on the screen's refresh rate steps one up (360 fps
   from 24 on a 360 Hz screen runs 16&times;), because DLSS Frame Generation paces about 4 % short right at the
   refresh rate; the screen then shows its full rate.

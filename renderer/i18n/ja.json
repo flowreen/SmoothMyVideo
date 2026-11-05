@@ -140,6 +140,9 @@
   "fsrup.tip": "バージョン: AMD FSR 4.1.2 アップスケーリング (FidelityFX SDK 2.4.0)。モーションベクトル: NVIDIA Optical Flow の Slow (最高品質レベル)。",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(AMD の AI アップスケーラー。<span class='vonly'>サイズが元より大きいとき</span><span class='lonly'>画面に合わせる、または DLAA 未満の DLSS モードで拡大するとき</span>に使われます)",
+  "a4k.tip": "バージョン: Anime4K 4.0.1、Upscale CNN x2 UL (最大のモデル)。2 倍に拡大してから Lanczos でサイズに合わせます。SMV の忠実度テスト (1.5 倍と 2 倍、4 本のクリップ) では、平均して RTX VSR や AMD FSR より元のフルサイズ画像に近い結果でした。",
+  "a4k.name": "Anime4K",
+  "a4k.hint": "(アニメ向けの CNN アップスケーラー。<span class='vonly'>サイズが元より大きいとき</span><span class='lonly'>画面に合わせる、または DLAA 未満の DLSS モードで拡大するとき</span>に使われます)",
 
   "sharpen.k": "シャープ",
   "sharpen.tip": "バージョン: bacondither の Adaptive Sharpen、DX11 2 パス HQ 版 (2021-09-10)",
@@ -315,6 +318,7 @@
   "lv.fit.fill": "ウィンドウをそのモニター全体に拡大 (縦横比は維持)",
   "lv.fit.vsr": "RTX VSR でアップスケール",
   "lv.fit.fsr": "AMD FSR でアップスケール",
+  "lv.fit.a4k": "Anime4K でアップスケール",
   "lv.fit.up": "アップスケール",
   "lv.fit.monitor": "ウィンドウがあるモニター上のすべてをなめらかに",
   "lv.stop": "停止",

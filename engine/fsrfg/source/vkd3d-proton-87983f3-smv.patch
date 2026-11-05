@@ -1,5 +1,5 @@
 diff --git a/include/vkd3d_shader.h b/include/vkd3d_shader.h
-index 994902a7..a621d1bd 100644
+index 78132c51..bea8e87b 100644
 --- a/include/vkd3d_shader.h
 +++ b/include/vkd3d_shader.h
 @@ -448,6 +448,8 @@ enum vkd3d_shader_target_extension
@@ -73,10 +73,10 @@ index dd1f7799..7e168e0f 100644
  else
    d3d12core_name_prefix = 'libvkd3d-proton-'
 diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
-index b74cea3a..de2a79a8 100644
+index faf378d0..6c48ae0e 100644
 --- a/libs/vkd3d-shader/dxil.c
 +++ b/libs/vkd3d-shader/dxil.c
-@@ -1209,6 +1209,10 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
+@@ -1226,6 +1226,10 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
              {
                  float8.nv_cooperative_matrix2_conversions = DXIL_SPV_TRUE;
              }
@@ -88,7 +88,7 @@ index b74cea3a..de2a79a8 100644
              {
                  static const dxil_spv_option_extended_non_semantic non_semantic = {
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index c6f6ee85..c0c9a1df 100644
+index a0a01bf1..41e5b9d7 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -394,26 +394,32 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device, VkSemaphore vk_se
@@ -266,7 +266,7 @@ index c6f6ee85..c0c9a1df 100644
  
      /* Ignore enhanced barriers. They are much harder to reason about due to the transient nature of Vulkan-style
       * barriers. This is more or less just a workaround too for terribly written games,
-@@ -16809,6 +16874,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewUint(d3
+@@ -16837,6 +16902,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewUint(d3
      struct vkd3d_clear_uav_info args;
      VkClearColorValue color;
  
@@ -274,7 +274,7 @@ index c6f6ee85..c0c9a1df 100644
      TRACE("iface %p, gpu_handle %#"PRIx64", cpu_handle %zx, resource %p, values %p, rect_count %u, rects %p.\n",
              iface, gpu_handle.ptr, cpu_handle.ptr, resource, values, rect_count, rects);
  
-@@ -16976,6 +17042,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewFloat(d
+@@ -17004,6 +17070,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewFloat(d
      struct vkd3d_clear_uav_info args;
      VkClearColorValue color;
  
@@ -282,7 +282,7 @@ index c6f6ee85..c0c9a1df 100644
      TRACE("iface %p, gpu_handle %#"PRIx64", cpu_handle %zx, resource %p, values %p, rect_count %u, rects %p.\n",
              iface, gpu_handle.ptr, cpu_handle.ptr, resource, values, rect_count, rects);
  
-@@ -22756,6 +22823,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_Barrier(d3d12_command_list_ifac
+@@ -22780,6 +22847,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_Barrier(d3d12_command_list_ifac
  
      TRACE("iface %p, NumBarrierGroups %u, D3D12_BARRIER_GROUP %p\n",
              iface, NumBarrierGroups, pBarrierGroups);
@@ -306,7 +306,7 @@ index 8fabb245..588d2335 100644
      win32_handle_info.pNext = NULL;
      win32_handle_info.semaphore = fence->timeline_semaphore;
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index 14ed4f83..40a8d963 100644
+index 6064e100..af017710 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
 @@ -2438,9 +2438,19 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
@@ -371,7 +371,7 @@ index 14ed4f83..40a8d963 100644
  
          vr = VK_CALL(vkGetSemaphoreWin32HandleKHR(device->vk_device, &win32_handle_info, handle));
  
-@@ -10277,10 +10294,27 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
+@@ -10280,10 +10297,27 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
                  VKD3D_SHADER_TARGET_EXTENSION_WMMA_FP8;
      }
  
@@ -442,7 +442,7 @@ index 25754b76..fbc352a7 100644
          bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
          bind_info.pNext = NULL;
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index 80244859..8cd01bda 100644
+index 076d5c5c..7842e51d 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
 @@ -342,6 +342,7 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device,
@@ -453,7 +453,7 @@ index 80244859..8cd01bda 100644
  HRESULT vkd3d_enqueue_timeline_semaphore(struct vkd3d_fence_worker *worker,
          const struct vkd3d_fence_wait_info *fence_info,
          const struct vkd3d_queue_timeline_trace_cookie *timeline_cookie);
-@@ -3416,6 +3417,9 @@ struct d3d12_command_list
+@@ -3415,6 +3416,9 @@ struct d3d12_command_list
  
      D3D12_COMMAND_LIST_TYPE type;
      VkQueueFlags vk_queue_flags;

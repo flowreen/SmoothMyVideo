@@ -5,7 +5,7 @@ sources, the exporter packages, the weights) matches the one in weights_tags.txt
 already present is skipped, so a rerun is cheap; a changed stamp removes the folder's graphs and
 exports every one again. Graphs: the RIFE IFNet (the
 unbatched class) and its encode, plain and as the flow-warp class at k 1 (Frame Blend), 2 and 4,
-DRBA's block0, Restore, and the GMFSS nets (gmflow_bidir as its backbone and two halves, trt_runtime.gmflow_split +
+DRBA's block0, and the GMFSS nets (gmflow_bidir as its backbone and two halves, trt_runtime.gmflow_split +
 gmflow_backbone_cut, the first half cut around its two N x N attentions by gmflow_matching_cut (`_m` before them, the
 host's k_attn2 between); one form for every size, transformer.py's export path, every transformer attention with its
 projections folded, transformer.fold_projections; A once more in the "edge" form, export_edge_a). Then ship_tidy() and
@@ -21,7 +21,6 @@ sys.path.insert(0, os.path.join(HERE, "GMFSS_Fortuna"))
 
 import torch  # noqa: E402
 
-import realesr  # noqa: E402
 import trt_lookup  # noqa: E402
 import trt_runtime as tr  # noqa: E402
 from rife_backend import RIFE  # noqa: E402
@@ -67,11 +66,6 @@ def main():
     e = tr.RifeBlock0Engine(float(sl[0]), rh)
     ensure(e, tr._RifeBlock0Export(net.block0, float(sl[0])), (a, b, f0, f1))
     del rife, net
-
-    # Restore: fp16 at the model size (the caller halves the frame)
-    rnet = realesr.load("cuda")
-    ensure(tr.RestoreEngine(realesr.weights_hash()), rnet, (a.half(),))
-    del rnet
 
     # GMFSS: the exact tensors an eager reuse + inference hands each sub net (forward pre-hooks)
     cwd = os.getcwd()
@@ -289,13 +283,12 @@ def ship_tidy(done):
 
 def write_tags(stamp):
     """weights_tags.txt: the weight tags every engine name carries, for a shipped tree without the
-    weight files (the dist leaves the .pkl / .pth out; the ONNX carry the weights).
+    weight files (the dist leaves the .pkl out; the ONNX carry the weights).
     The host hashes the weight files when they exist (a dev tree) and reads this file otherwise.
     `export` = the export stamp these graphs were made under (the host ignores it): the file is half
     of the engine cache stamp, so a new export empties the cache once (src/render/cache.ts)."""
     p = tags_path()
-    txt = (f"w {trt_lookup.weights_tag()}\nr {trt_lookup.rife_weights_tag()}\n"
-           f"rest {realesr.weights_hash()}\nexport {stamp}\n")
+    txt = f"w {trt_lookup.weights_tag()}\nr {trt_lookup.rife_weights_tag()}\nexport {stamp}\n"
     with open(p + ".tmp", "w", encoding="ascii", newline="\n") as fh:
         fh.write(txt)
     os.replace(p + ".tmp", p)

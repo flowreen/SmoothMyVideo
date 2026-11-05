@@ -619,16 +619,21 @@ __global__ void k_packOutHdrV(const float* __restrict__ tmp, int dw, int h, unsi
 }
 
 // ---- live Restore ---------------------------------------------------------------------------
-// live_server._Fit._restore: the Real-ESRGAN TensorRT engine (x = the model frame as fp16
-// NCHW [1,3,h,w], y = its 4x reconstruction [1,3,4h,4w]) then realesr.fit to the restore
-// target: `out.clamp(0,1)` first, then the Lanczos pair at every ratio (the pair above with the
-// clamp folded in and the engine's own dtype read at the taps).
+// live_server._Fit._restore: the model (the bundled Real-ESRGAN on the host's kernels below, a --restore-model graph
+// as a TensorRT engine; x = the model frame as fp16 NCHW [1,3,h,w], y = its s x reconstruction) then realesr.fit to the
+// restore target: `out.clamp(0,1)` first, then the Lanczos pair at every ratio (the pair above with the clamp folded in
+// and the output's own dtype read at the taps).
 __device__ __forceinline__ unsigned short f2h(float f)
 {
     unsigned short h;
     asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
     return h;
 }
+__device__ __forceinline__ float restRaw(const void* __restrict__ src, int half, size_t o)
+{
+    return half ? h2f(((const unsigned short*)src)[o]) : ((const float*)src)[o];
+}
+
 __device__ __forceinline__ float restTap(const void* __restrict__ src, int half, size_t o)
 {
     const float v = half ? h2f(((const unsigned short*)src)[o]) : ((const float*)src)[o];
@@ -680,6 +685,561 @@ __global__ void k_restFoldH(const void* __restrict__ src, int half, int planeStr
     }
     const size_t plane = (size_t)h * dw;
     const size_t o = (size_t)y * dw + ox;
+    tmp[o] = a0;
+    tmp[plane + o] = a1;
+    tmp[2 * plane + o] = a2;
+}
+
+// the fold's horizontal pass on an x s net's sub-pixel planes (k_restConvLast writes them; their PixelShuffle and, with
+// in, the nearest-base add happen here): the s x value at (Y, X) = plane c s^2 + (Y % s) s + X % s at (Y / s, X / s)
+// of the w x h plane grid (+ the input's pixel there when in != nullptr: Real-ESRGAN), added in fp32 and clamped per
+// tap like k_restFoldH -> tmp (3, oh, dw); ow x oh = the model's output size, at most s w x s h (AnimeJaNai's half grid
+// x 4 = the frame x 2, cropped where the frame is odd)
+__global__ void k_restFoldHSub(const void* __restrict__ sub, int half, const void* __restrict__ in, int inHalf, int s,
+                               int w, int h, int ow, int oh, float* __restrict__ tmp, int dw,
+                               const RsTap* __restrict__ tab)
+{
+    const int ox = blockIdx.x * blockDim.x + threadIdx.x;
+    const int Y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int fs = rsTaps(ow, dw);
+    if (ox >= dw || Y >= oh) return;
+    const int y = Y / s;
+    const size_t ps = (size_t)w * h, row = (size_t)y * w, cs = (size_t)s * s * ps;
+    const size_t sy = (size_t)(Y - y * s) * s * ps;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    for (int k = 0; k < fs; k++)
+    {
+        const RsTap t = tab[(size_t)k * dw + ox];
+        const int x = t.i / s;
+        const size_t o = row + x;
+        const size_t p = sy + (size_t)(t.i - x * s) * ps + o;
+        const float v0 = restRaw(sub, half, p) + (in ? restRaw(in, inHalf, o) : 0.0f);
+        const float v1 = restRaw(sub, half, cs + p) + (in ? restRaw(in, inHalf, ps + o) : 0.0f);
+        const float v2 = restRaw(sub, half, 2 * cs + p) + (in ? restRaw(in, inHalf, 2 * ps + o) : 0.0f);
+        a0 += t.w * (v0 < 0.0f ? 0.0f : (v0 > 1.0f ? 1.0f : v0));
+        a1 += t.w * (v1 < 0.0f ? 0.0f : (v1 > 1.0f ? 1.0f : v1));
+        a2 += t.w * (v2 < 0.0f ? 0.0f : (v2 > 1.0f ? 1.0f : v2));
+    }
+    const size_t plane = (size_t)oh * dw;
+    const size_t o = (size_t)Y * dw + ox;
+    tmp[o] = a0;
+    tmp[plane + o] = a1;
+    tmp[2 * plane + o] = a2;
+}
+
+// Real-ESRGAN animevideov3 on the host's own kernels (restNat, no TensorRT engine): k_restConv0 (3 -> 64 + PReLU),
+// 16 x k_restConvMid (64 -> 64 + PReLU), k_restConvLast (64 -> 48 sub-pixel planes = k_restFoldHSub's input); between
+// them channels-last fp16 (64 halves = 128 B a pixel). The 64 -> 64 layers are implicit GEMMs on the tensor cores
+// (mma.sync m16n8k16, M = pixels, N = 64 outputs, K = 9 taps x 64 channels) with fp16 ACCUMULATORS (the GeForce rate:
+// 1.4x TensorRT-RTX's fp32-accumulate convs, the image within one 8-bit code of its engine); the last layer keeps fp32
+// accumulators. A block = 4 warps on an 8 x 32 pixel tile, its 10 x 34 halo in shared memory (16-byte chunks XOR-
+// swizzled by pixel & 7, so each ldmatrix reads 8 bank groups), two blocks an SM so one block's loads and stores
+// overlap the other's math; the weights come from global memory already in fragment order (one uint4 a lane = the four
+// B registers of two n-tiles), loaded a k-step ahead.
+#define RN_TW 32
+#define RN_TH 8
+#define RN_HW (RN_TW + 2)
+#define RN_HH (RN_TH + 2)
+
+__device__ __forceinline__ void rnCp16(unsigned dst, const void* src, int bytes)
+{
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(bytes));
+}
+
+__device__ __forceinline__ void rnLdm4(unsigned addr, unsigned* r)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+// a PReLU on an fp16 value: the fp32 product of two fp16 values is exact, so its one rounding = the fp16 multiply
+__device__ __forceinline__ unsigned rnPrelu(unsigned v, unsigned short a)
+{
+    const float y = h2f((unsigned short)v);
+    return y < 0.0f ? (unsigned)f2h(h2f(a) * y) : v;
+}
+
+// the 10 x 34 halo of an 8 x 32 tile (zero outside the frame) into shared memory, cp.async; the caller waits
+__device__ __forceinline__ void rnHalo(unsigned halo, const unsigned short* __restrict__ x, int tx0, int ty0, int H,
+                                       int W)
+{
+    for (int i = threadIdx.x; i < RN_HH * RN_HW * 8; i += 128)
+    {
+        const int p = i >> 3, k = i & 7;
+        const int hr = p / RN_HW, hc = p - hr * RN_HW;
+        const int gy = ty0 - 1 + hr, gx = tx0 - 1 + hc;
+        const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+        const unsigned short* src = in ? x + ((size_t)gy * W + gx) * 64 + k * 8 : x;
+        rnCp16(halo + ((p * 8 + (k ^ (p & 7))) << 4), src, in ? 16 : 0);
+    }
+    asm volatile("cp.async.commit_group;\n");
+}
+
+// the first layer: three fp16 planes (k_restIn's) -> channels-last + PReLU; one pixel a thread, fp32 sums of 27 terms;
+// w0[o][c][tap] and b0 fp32 in shared memory
+__global__ void __launch_bounds__(256) k_restConv0(const unsigned short* __restrict__ src, unsigned short* __restrict__ y,
+                                                    const float* __restrict__ w0, const float* __restrict__ b0,
+                                                    const unsigned short* __restrict__ slope, int H, int W)
+{
+    __shared__ float sw[64 * 27 + 64];
+    for (int i = threadIdx.x; i < 64 * 27 + 64; i += 256)
+        sw[i] = i < 64 * 27 ? w0[i] : b0[i - 64 * 27];
+    __syncthreads();
+    const int xx = blockIdx.x * 32 + (threadIdx.x & 31), yy = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (xx >= W || yy >= H) return;
+    const size_t ps = (size_t)W * H;
+    float v[27];
+#pragma unroll
+    for (int c = 0; c < 3; ++c)
+#pragma unroll
+        for (int t = 0; t < 9; ++t)
+        {
+            const int gy = yy + t / 3 - 1, gx = xx + t % 3 - 1;
+            v[c * 9 + t] = (gy >= 0 && gy < H && gx >= 0 && gx < W) ? h2f(src[c * ps + (size_t)gy * W + gx]) : 0.0f;
+        }
+    unsigned short* o = y + ((size_t)yy * W + xx) * 64;
+#pragma unroll
+    for (int n = 0; n < 64; n += 8)
+    {
+        unsigned r[4];
+#pragma unroll
+        for (int j = 0; j < 8; j += 2)
+        {
+            float a0 = sw[64 * 27 + n + j], a1 = sw[64 * 27 + n + j + 1];
+#pragma unroll
+            for (int k = 0; k < 27; ++k)
+            {
+                a0 = fmaf(sw[(n + j) * 27 + k], v[k], a0);
+                a1 = fmaf(sw[(n + j + 1) * 27 + k], v[k], a1);
+            }
+            r[j / 2] = rnPrelu(f2h(a0), slope[n + j]) | (rnPrelu(f2h(a1), slope[n + j + 1]) << 16);
+        }
+        *reinterpret_cast<uint4*>(o + n) = make_uint4(r[0], r[1], r[2], r[3]);
+    }
+}
+
+// a 64 -> 64 layer + PReLU, channels-last in and out; fp16 accumulators started at the bias; wf[tap][kc][q][lane]
+__global__ void __launch_bounds__(128, 2) k_restConvMid(const unsigned short* __restrict__ x,
+                                                         unsigned short* __restrict__ y, const uint4* __restrict__ wf,
+                                                         const unsigned short* __restrict__ bias,
+                                                         const unsigned short* __restrict__ slope, int H, int W)
+{
+    extern __shared__ __align__(128) unsigned char rnSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(rnSm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * RN_TW, ty0 = blockIdx.y * RN_TH;
+    rnHalo(halo, x, tx0, ty0, H, W);
+    uint4 bc[4], bn[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q)
+        bc[q] = __ldg(wf + q * 32 + lane);
+    const int g = lane >> 2, t4 = lane & 3;
+    unsigned acc[4][8][2];
+#pragma unroll
+    for (int nj = 0; nj < 8; ++nj)
+    {
+        const unsigned b2 = (unsigned)bias[nj * 8 + t4 * 2] | ((unsigned)bias[nj * 8 + t4 * 2 + 1] << 16);
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+            acc[mi][nj][0] = acc[mi][nj][1] = b2;
+    }
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+#pragma unroll 1
+    for (int tap = 0; tap < 9; ++tap)
+    {
+        const int dy = tap / 3, dx = tap - dy * 3;
+        int pa[4];
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+            pa[mi] = (2 * warp + (mi >> 1) + dy) * RN_HW + (mi & 1) * 16 + arow + dx;
+#pragma unroll
+        for (int kc = 0; kc < 4; ++kc)
+        {
+            const int step = tap * 4 + kc;
+            if (step + 1 < 36)
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+                    bn[q] = __ldg(wf + ((step + 1) * 4 + q) * 32 + lane);
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+            {
+                unsigned a[4];
+                const int p = pa[mi], ch = kc * 2 + akc;
+                rnLdm4(halo + ((p * 8 + (ch ^ (p & 7))) << 4), a);
+#pragma unroll
+                for (int q = 0; q < 8; ++q)
+                {
+                    const unsigned b0 = (q & 1) ? bc[q >> 1].z : bc[q >> 1].x;
+                    const unsigned b1 = (q & 1) ? bc[q >> 1].w : bc[q >> 1].y;
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                        : "+r"(acc[mi][q][0]), "+r"(acc[mi][q][1])
+                        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                }
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+                bc[q] = bn[q];
+        }
+    }
+#pragma unroll
+    for (int nj = 0; nj < 8; ++nj)
+    {
+        const int n0 = nj * 8 + t4 * 2;
+        const unsigned short s0 = slope[n0], s1 = slope[n0 + 1];
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+        {
+            const int gy = ty0 + 2 * warp + (mi >> 1);
+            if (gy >= H) continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int gx = tx0 + (mi & 1) * 16 + g + h * 8;
+                if (gx >= W) continue;
+                const unsigned v = acc[mi][nj][h];
+                *reinterpret_cast<unsigned*>(y + ((size_t)gy * W + gx) * 64 + n0) =
+                    rnPrelu(v & 0xffffu, s0) | (rnPrelu(v >> 16, s1) << 16);
+            }
+        }
+    }
+}
+
+// the last layer: 64 -> 48, channels-last in -> 48 fp16 planes out (plane n at out[n * ps]), fp32 accumulators started
+// at the bias, no activation; wf[tap][kc][q 3][lane]
+__global__ void __launch_bounds__(128, 2) k_restConvLast(const unsigned short* __restrict__ x,
+                                                          unsigned short* __restrict__ out, const uint4* __restrict__ wf,
+                                                          const unsigned short* __restrict__ bias, int H, int W)
+{
+    extern __shared__ __align__(128) unsigned char rnSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(rnSm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * RN_TW, ty0 = blockIdx.y * RN_TH;
+    rnHalo(halo, x, tx0, ty0, H, W);
+    uint4 bc[3], bn[3];
+#pragma unroll
+    for (int q = 0; q < 3; ++q)
+        bc[q] = __ldg(wf + q * 32 + lane);
+    const int g = lane >> 2, t4 = lane & 3;
+    float acc[4][6][4];
+#pragma unroll
+    for (int nj = 0; nj < 6; ++nj)
+    {
+        const float b0 = h2f(bias[nj * 8 + t4 * 2]), b1 = h2f(bias[nj * 8 + t4 * 2 + 1]);
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+        {
+            acc[mi][nj][0] = acc[mi][nj][2] = b0;
+            acc[mi][nj][1] = acc[mi][nj][3] = b1;
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+#pragma unroll 1
+    for (int tap = 0; tap < 9; ++tap)
+    {
+        const int dy = tap / 3, dx = tap - dy * 3;
+        int pa[4];
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+            pa[mi] = (2 * warp + (mi >> 1) + dy) * RN_HW + (mi & 1) * 16 + arow + dx;
+#pragma unroll
+        for (int kc = 0; kc < 4; ++kc)
+        {
+            const int step = tap * 4 + kc;
+            if (step + 1 < 36)
+#pragma unroll
+                for (int q = 0; q < 3; ++q)
+                    bn[q] = __ldg(wf + ((step + 1) * 3 + q) * 32 + lane);
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+            {
+                unsigned a[4];
+                const int p = pa[mi], ch = kc * 2 + akc;
+                rnLdm4(halo + ((p * 8 + (ch ^ (p & 7))) << 4), a);
+#pragma unroll
+                for (int q = 0; q < 6; ++q)
+                {
+                    const unsigned b0 = (q & 1) ? bc[q >> 1].z : bc[q >> 1].x;
+                    const unsigned b1 = (q & 1) ? bc[q >> 1].w : bc[q >> 1].y;
+                    float* d = acc[mi][q];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                                 "{%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                }
+            }
+#pragma unroll
+            for (int q = 0; q < 3; ++q)
+                bc[q] = bn[q];
+        }
+    }
+    const size_t ps = (size_t)W * H;
+#pragma unroll
+    for (int nj = 0; nj < 6; ++nj)
+    {
+        const int n0 = nj * 8 + t4 * 2;
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+        {
+            const int gy = ty0 + 2 * warp + (mi >> 1);
+            if (gy >= H) continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int gx = tx0 + (mi & 1) * 16 + g + h * 8;
+                if (gx >= W) continue;
+                const size_t pix = (size_t)gy * W + gx;
+                out[n0 * ps + pix] = f2h(acc[mi][nj][2 * h]);
+                out[(n0 + 1) * ps + pix] = f2h(acc[mi][nj][2 * h + 1]);
+            }
+        }
+    }
+}
+
+// AnimeJaNai (SPAN-F3, 64 features, the --restore-model ONNX's weights) on the host's kernels: k_ajFirst, then per
+// block 3 x k_restConvMid (ReLU = slope 0, none = slope 1) + k_ajAtt, k_ajCat, k_restConvLast -> the 48 sub-pixel
+// planes at the half grid (k_restFoldHSub at s 4, no base). Every activation channels-last fp16 at the half grid.
+
+// the first layer: three fp16 planes at the source size sw x sh (k_restIn's) -> reflect pad to even -> PixelUnshuffle(2)
+// (channel c * 4 + dy * 2 + dx = plane c at (2 y + dy, 2 x + dx)) -> conv 12 -> 64 3 x 3 (zero pad 1 on the half grid),
+// no activation -> channels-last fp16 at hw x hh; one half-grid pixel a thread, fp32 sums; w[o][12][9] + b fp32 in
+// shared memory
+__global__ void __launch_bounds__(256) k_ajFirst(const unsigned short* __restrict__ src, int sw, int sh,
+                                                  unsigned short* __restrict__ y, const float* __restrict__ wt,
+                                                  const float* __restrict__ bias, int hw, int hh)
+{
+    __shared__ float sm[64 * 108 + 64];
+    for (int i = threadIdx.x; i < 64 * 108 + 64; i += 256)
+        sm[i] = i < 64 * 108 ? wt[i] : bias[i - 64 * 108];
+    __syncthreads();
+    const int x2 = blockIdx.x * 32 + (threadIdx.x & 31), y2 = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (x2 >= hw || y2 >= hh) return;
+    const size_t ps = (size_t)sw * sh;
+    float acc[64];
+#pragma unroll
+    for (int o = 0; o < 64; o++)
+        acc[o] = sm[64 * 108 + o];
+    for (int c = 0; c < 12; c++)
+    {
+        const int pl = c >> 2, dy = (c >> 1) & 1, dx = c & 1;
+        float v[9];
+#pragma unroll
+        for (int t = 0; t < 9; t++)
+        {
+            const int yy = y2 + t / 3 - 1, xx = x2 + t % 3 - 1;
+            if (yy < 0 || yy >= hh || xx < 0 || xx >= hw)
+                v[t] = 0.0f;
+            else
+            {
+                int fy = 2 * yy + dy, fx = 2 * xx + dx;
+                fy = fy < sh ? fy : 2 * sh - 2 - fy; // the reflect pad of an odd height / width
+                fx = fx < sw ? fx : 2 * sw - 2 - fx;
+                v[t] = h2f(src[pl * ps + (size_t)fy * sw + fx]);
+            }
+        }
+#pragma unroll
+        for (int o = 0; o < 64; o++)
+        {
+            float a = acc[o];
+#pragma unroll
+            for (int t = 0; t < 9; t++)
+                a = fmaf(sm[o * 108 + c * 9 + t], v[t], a);
+            acc[o] = a;
+        }
+    }
+    unsigned short* out = y + ((size_t)y2 * hw + x2) * 64;
+#pragma unroll
+    for (int n = 0; n < 64; n += 8)
+        *reinterpret_cast<uint4*>(out + n) =
+            make_uint4((unsigned)f2h(acc[n]) | ((unsigned)f2h(acc[n + 1]) << 16),
+                       (unsigned)f2h(acc[n + 2]) | ((unsigned)f2h(acc[n + 3]) << 16),
+                       (unsigned)f2h(acc[n + 4]) | ((unsigned)f2h(acc[n + 5]) << 16),
+                       (unsigned)f2h(acc[n + 6]) | ((unsigned)f2h(acc[n + 7]) << 16));
+}
+
+// 128 pixels' 64 channels (a channels-last run) into shared memory, 16-byte chunks XOR-swizzled by pixel & 7; pixels
+// past n = zeros; the caller commits / waits
+__device__ __forceinline__ void ajTile(unsigned smem, const unsigned short* __restrict__ x, size_t p0, size_t n)
+{
+    for (int i = threadIdx.x; i < 128 * 8; i += 128)
+    {
+        const int p = i >> 3, k = i & 7;
+        const bool in = p0 + p < n;
+        rnCp16(smem + ((p * 8 + (k ^ (p & 7))) << 4), in ? x + (p0 + p) * 64 + k * 8 : x, in ? 16 : 0);
+    }
+}
+
+// one 1 x 1 64 -> 64 GEMM on a staged tile: K = 64 (4 k-steps), the warp's 32 pixels (2 m16 tiles) x 64 outputs, fp32
+// accumulators; wf[kc][q][lane] (B registers of n-tiles 2q, 2q + 1)
+__device__ __forceinline__ void ajGemm64(unsigned smem, const uint4* __restrict__ wf, float (*acc)[8][4])
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+#pragma unroll
+    for (int kc = 0; kc < 4; kc++)
+    {
+        uint4 b[4];
+#pragma unroll
+        for (int q = 0; q < 4; q++)
+            b[q] = __ldg(wf + (kc * 4 + q) * 32 + lane);
+#pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+        {
+            unsigned a[4];
+            const int p = warp * 32 + mi * 16 + arow, ch = kc * 2 + akc;
+            rnLdm4(smem + ((p * 8 + (ch ^ (p & 7))) << 4), a);
+#pragma unroll
+            for (int q = 0; q < 8; q++)
+            {
+                const unsigned b0 = (q & 1) ? b[q >> 1].z : b[q >> 1].x;
+                const unsigned b1 = (q & 1) ? b[q >> 1].w : b[q >> 1].y;
+                float* d = acc[mi][q];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                             "{%8,%9}, {%0,%1,%2,%3};\n"
+                             : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+            }
+        }
+    }
+}
+
+// a SPAN block's tail on n pixels: out = (t + c3) * tanh(conv1x1(c3) + b), fp32 math, one rounding to fp16; 128 pixels a
+// block of 4 warps; wf = the 1 x 1's fragment-order weights, bias fp32
+__global__ void __launch_bounds__(128) k_ajAtt(const unsigned short* __restrict__ c3,
+                                                const unsigned short* __restrict__ t, unsigned short* __restrict__ out,
+                                                const uint4* __restrict__ wf, const float* __restrict__ bias, int n)
+{
+    __shared__ __align__(128) unsigned char sm[128 * 128];
+    const unsigned smem = (unsigned)__cvta_generic_to_shared(sm);
+    const size_t p0 = (size_t)blockIdx.x * 128;
+    ajTile(smem, c3, p0, (size_t)n);
+    asm volatile("cp.async.commit_group;\n");
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
+    float acc[2][8][4];
+#pragma unroll
+    for (int q = 0; q < 8; q++)
+    {
+        const float b0 = bias[q * 8 + t4 * 2], b1 = bias[q * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+        {
+            acc[mi][q][0] = acc[mi][q][2] = b0;
+            acc[mi][q][1] = acc[mi][q][3] = b1;
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+    ajGemm64(smem, wf, acc);
+#pragma unroll
+    for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+        for (int h = 0; h < 2; h++)
+        {
+            const size_t p = p0 + warp * 32 + mi * 16 + g + h * 8;
+            if (p >= (size_t)n) continue;
+#pragma unroll
+            for (int q = 0; q < 8; q++)
+            {
+                const size_t o = p * 64 + q * 8 + t4 * 2;
+                const unsigned cv = *reinterpret_cast<const unsigned*>(c3 + o);
+                const unsigned tv = *reinterpret_cast<const unsigned*>(t + o);
+                const float r0 = (h2f((unsigned short)tv) + h2f((unsigned short)cv)) * tanhf(acc[mi][q][2 * h]);
+                const float r1 = (h2f((unsigned short)(tv >> 16)) + h2f((unsigned short)(cv >> 16))) *
+                                 tanhf(acc[mi][q][2 * h + 1]);
+                *reinterpret_cast<unsigned*>(out + o) = (unsigned)f2h(r0) | ((unsigned)f2h(r1) << 16);
+            }
+        }
+}
+
+// the tail's 1 x 1 256 -> 64 on n pixels of the concat [s0, s1, s2, s3] (each channels-last 64, read in place, one
+// staged tile at a time), fp32 accumulators from the bias, no activation; wf[src][kc][q][lane]
+__global__ void __launch_bounds__(128) k_ajCat(const unsigned short* __restrict__ s0,
+                                                const unsigned short* __restrict__ s1,
+                                                const unsigned short* __restrict__ s2,
+                                                const unsigned short* __restrict__ s3, unsigned short* __restrict__ out,
+                                                const uint4* __restrict__ wf, const float* __restrict__ bias, int n)
+{
+    __shared__ __align__(128) unsigned char sm[128 * 128];
+    const unsigned smem = (unsigned)__cvta_generic_to_shared(sm);
+    const size_t p0 = (size_t)blockIdx.x * 128;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
+    float acc[2][8][4];
+#pragma unroll
+    for (int q = 0; q < 8; q++)
+    {
+        const float b0 = bias[q * 8 + t4 * 2], b1 = bias[q * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+        {
+            acc[mi][q][0] = acc[mi][q][2] = b0;
+            acc[mi][q][1] = acc[mi][q][3] = b1;
+        }
+    }
+    const unsigned short* src[4] = {s0, s1, s2, s3};
+    for (int s = 0; s < 4; s++)
+    {
+        ajTile(smem, src[s], p0, (size_t)n);
+        asm volatile("cp.async.commit_group;\n");
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+        ajGemm64(smem, wf + (size_t)s * 4 * 4 * 32, acc);
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mi = 0; mi < 2; mi++)
+#pragma unroll
+        for (int h = 0; h < 2; h++)
+        {
+            const size_t p = p0 + warp * 32 + mi * 16 + g + h * 8;
+            if (p >= (size_t)n) continue;
+#pragma unroll
+            for (int q = 0; q < 8; q++)
+                *reinterpret_cast<unsigned*>(out + p * 64 + q * 8 + t4 * 2) =
+                    (unsigned)f2h(acc[mi][q][2 * h]) | ((unsigned)f2h(acc[mi][q][2 * h + 1]) << 16);
+        }
+}
+
+// Anime4K's fold, horizontal pass on its three last textures (the exported graph ends before the shader's Depth-to-Space
+// pass, which happens here): the 2x value at (Y, X) = texture c's channel (Y % 2) 2 + X % 2 at (Y / 2, X / 2) + the
+// source's bilinear 2x there (align_corners False, edge clamp: 3/4 of the nearest source pixel, 1/4 of the next one out
+// on each axis), added in fp32 and clamped per tap like k_restFoldH -> tmp (3, 2h, dw); in = the engine's fp16 input
+__global__ void k_a4kFoldHSub(const void* __restrict__ sub, int half, const unsigned short* __restrict__ in, int w,
+                              int h, float* __restrict__ tmp, int dw, const RsTap* __restrict__ tab)
+{
+    const int ox = blockIdx.x * blockDim.x + threadIdx.x;
+    const int Y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int fs = rsTaps(2 * w, dw);
+    if (ox >= dw || Y >= 2 * h) return;
+    const int y = Y >> 1, dy = Y & 1;
+    const int yn = dy ? (y + 1 < h ? y + 1 : h - 1) : (y > 0 ? y - 1 : 0);
+    const size_t ps = (size_t)w * h, r0 = (size_t)y * w, r1 = (size_t)yn * w;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    for (int k = 0; k < fs; k++)
+    {
+        const RsTap t = tab[(size_t)k * dw + ox];
+        const int x = t.i >> 1, dx = t.i & 1;
+        const int xn = dx ? (x + 1 < w ? x + 1 : w - 1) : (x > 0 ? x - 1 : 0);
+        const size_t sp = (size_t)(dy * 2 + dx) * ps + r0 + x;
+        float v[3];
+        for (int c = 0; c < 3; c++)
+        {
+            const unsigned short* p = in + (size_t)c * ps;
+            const float base = 0.75f * (0.75f * h2f(p[r0 + x]) + 0.25f * h2f(p[r0 + xn])) +
+                               0.25f * (0.75f * h2f(p[r1 + x]) + 0.25f * h2f(p[r1 + xn]));
+            const float s = restRaw(sub, half, (size_t)c * 4 * ps + sp) + base;
+            v[c] = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+        }
+        a0 += t.w * v[0];
+        a1 += t.w * v[1];
+        a2 += t.w * v[2];
+    }
+    const size_t plane = (size_t)2 * h * dw;
+    const size_t o = (size_t)Y * dw + ox;
     tmp[o] = a0;
     tmp[plane + o] = a1;
     tmp[2 * plane + o] = a2;
@@ -4435,9 +4995,9 @@ struct NativeRife
     // fit rect: one resize, not two).
     int uw = 0, uh = 0;
     bool upAa = false; // the first resize shrinks the height (uh < h)
-    // live Restore: the handoff builds the
-    // Real-ESRGAN TensorRT engine into the shared cache and hands its path over like the
-    // IFNet's; the host runs it on every presented frame before the upscale, then folds the 4x
+    // live Restore: the handoff names the bundled Real-ESRGAN (the host's kernels) or builds a
+    // --restore-model TensorRT engine into the shared cache and hands its path over like the
+    // IFNet's; the host runs it on every presented frame before the upscale, then folds the s x
     // output to the first resize target (_Fit._load_restore's restore_target rule: back to the
     // model size when RTX VSR follows, else straight to the internal render size or the fit
     // rect). A mid-run failure drops the pass for the rest of the session with one line.
@@ -4741,6 +5301,20 @@ struct NativeRife
     uint64_t fuProfN = 0, fuProfVecN = 0;
     char fuVersion[32] = {};
     OfVec fuOf;
+    // Anime4K (a4kUp, `--anime4k`): RTX VSR's resize too (vsr is set), on planar floats instead of the bridge's BGRA:
+    // Upscale CNN x2 UL's conv passes in CUDA (its own module a4kMod: k_a4kConv0, k_a4kConv_1 .. _6, k_a4kLast, the
+    // weights as literals in their text, a4kKernelText) at the slot's input size, then the fold (k_a4kFoldHSub: the
+    // shader's Depth-to-Space pass, and the Lanczos pair from 2w x 2h to the slot's target); HDR frames go in as their
+    // SDR view and come back through RTX VSR's way to the codes
+    bool a4kUp = false;
+    CUmodule a4kMod = nullptr;
+    CUfunction fA4k[8] = {};  // k_a4kConv0, k_a4kConv_1 .. _6, k_a4kLast
+    int a4kW = 0, a4kH = 0;   // the passes' input size (the slot's)
+    int a4kOw = 0;            // the widest fold target dA4kTmp holds
+    void* dA4kIn = nullptr;   // NCHW fp16 at a4kW x a4kH
+    void* dA4kT = nullptr;    // five layer slots, 3 textures x 4 fp16 a pixel each (nativeA4kRun)
+    void* dA4kOut = nullptr;  // the three last textures as 12 fp16 planes at a4kW x a4kH
+    float* dA4kTmp = nullptr; // the fold's horizontal pass: planar fp32, target width x 2 a4kH
     // RIFE with DRBA timing (rifedrba): the RIFE
     // handoff plus `NATIVE-PATH block0=` (calc_flow's block0 as its own engine) and `engine=drba
     // lag=1`. live_server.RifeDrba natively: a four-frame history of padded frames and their
@@ -4837,11 +5411,23 @@ struct NativeRife
     bool restHalfIn = true, restHalfOut = true; // the engine's input / output dtypes (read off it)
     std::string restIn = "x", restOut = "y";    // the engine's input / output names (read off it)
     int restScale = 4;                          // the model's scale (read off it): Real-ESRGAN 4, AnimeJaNai 2
+    bool restSub = false; // the output = 3 s^2 sub-pixel planes at the input size (Real-ESRGAN): k_restFoldHSub
     bool restFailed = false;
     int restTw = 0, restTh = 0; // the fold target (decided once VSR is known)
     nvinfer1::ICudaEngine* engRest = nullptr;
     nvinfer1::IRuntimeConfig* cfgRest = nullptr;
     nvinfer1::IExecutionContext* ctxRest = nullptr;
+    // Real-ESRGAN on the host's kernels (restorePath = kRestNative, no engine): dRestA / dRestB = the channels-last fp16
+    // ping-pong (64 halves a pixel each; inside the shared activation block when it holds them, else restNatOwn),
+    // dRestW = the weights (restNatOff offsets)
+    bool restNat = false, restNatOwn = false;
+    int restNatKind = 0;   // 1 = the bundled Real-ESRGAN, 2 = AnimeJaNai (SPAN-F3 64, the --restore-model ONNX)
+    int restNatBlocks = 0; // AnimeJaNai's block count
+    void *dRestA = nullptr, *dRestB = nullptr, *dRestW = nullptr; // dRestA = the whole activation region
+    std::vector<size_t> restNatOff;
+    // the fold's sub-pixel input (restSub): s, the plane grid w x h, the nearest-base add (Real-ESRGAN) or none
+    int restSubS = 4, restSubW = 0, restSubH = 0;
+    bool restSubBase = true;
     void* dRestIn = nullptr;   // the input: NCHW at the source size (srcW x srcH), fp16 (or fp32)
     void* dRestOut = nullptr;  // the output: NCHW at restScale x, the engine's dtype
     float* dRestTmp = nullptr; // the fold's horizontal pass, planar fp32 at (4h, the largest scale) x max target width
@@ -5062,6 +5648,7 @@ struct NativeRife
     std::atomic<uint32_t> gFgPreUs{0}, gFgOfUs{0}, gFgL1Us{0};
 
     CUmodule cuMod = nullptr;
+    std::wstring kernCacheDir; // the cubin folder nativeBuildKernels was given (Anime4K's module caches there too)
     CUfunction fPackInDirect = nullptr, fResizeH = nullptr, fResizeV = nullptr, fH2f = nullptr, fF2h = nullptr,
                fPackOut = nullptr;
     CUfunction fPackInDirectHdr = nullptr, fPqPlanar = nullptr, fResizeHf = nullptr, fPackOutHdr = nullptr;
@@ -5079,7 +5666,9 @@ struct NativeRife
     CUfunction fFsrHdrIn = nullptr, fFsrHdrOut = nullptr, fFsrHdrPack = nullptr; // AMD FSR upscaling on HDR planes
     CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                      // its vertical pass + the slot store
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr,    // live Restore
-        fRestToF = nullptr, fClamp01 = nullptr;
+        fRestFoldHSub = nullptr, fA4kFoldHSub = nullptr, fRestToF = nullptr, fClamp01 = nullptr;
+    CUfunction fRestConv0 = nullptr, fRestConvMid = nullptr, fRestConvLast = nullptr; // Restore on the host's kernels
+    CUfunction fAjFirst = nullptr, fAjAtt = nullptr, fAjCat = nullptr;                // AnimeJaNai's own three
     CUfunction fPadPlanar = nullptr; // the decoded frame into the model frame
     CUfunction fNrIn = nullptr, fNrOut = nullptr, fNrMv = nullptr, fNrMvClear = nullptr; // DLSS 5
     CUfunction fNrInPq = nullptr, fNrOutPq = nullptr;                 // live DLSS 5 on HDR (PQ) planes
@@ -5359,9 +5948,9 @@ static void nativeDeriveUpscale(NativeRife& nr)
 // the format nativeHandoff parses. A miss returns false and nativeHandoff builds the engines.
 struct LookupTags
 {
-    std::string trt, w, r, rest;
+    std::string trt, w, r;
     bool ok = false;
-}; // rest = realesr.weights_hash()
+};
 
 static std::string lkEnv(const char* name)
 {
@@ -5466,13 +6055,10 @@ static const LookupTags& lkTags(const std::wstring& engDir)
     const std::string r = lkMd5Files({engDir + L"\\rife\\flownet.pkl"});
     t.w = w.empty() ? std::string() : "w" + w;
     t.r = r.empty() ? std::string() : "r" + r;
-    // the Restore engine's name part: md5[:8] of the bundled Real-ESRGAN weights (optional)
-    const std::string rs = lkMd5Files({engDir + L"\\realesr-animevideov3.pth"});
-    t.rest = rs.size() >= 8 ? rs.substr(0, 8) : std::string();
     // a shipped tree carries no weight files (the ONNX hold the weights): the tags
-    // onnx_export.py wrote next to the ONNX ("w <tag>", "r <tag>", "rest <tag>"); a tag whose
+    // onnx_export.py wrote next to the ONNX ("w <tag>", "r <tag>"); a tag whose
     // weight file exists is always the hash above, so a dev tree never reads a stale file
-    if (t.w.empty() || t.r.empty() || t.rest.empty())
+    if (t.w.empty() || t.r.empty())
     {
         std::string od = lkEnv("SMV_ONNX_DIR");
         std::wstring odW = od.empty() ? engDir + L"\\onnx" : std::wstring(od.begin(), od.end());
@@ -5493,8 +6079,6 @@ static const LookupTags& lkTags(const std::wstring& engDir)
                     t.w = v;
                 else if (k == "r" && t.r.empty())
                     t.r = v;
-                else if (k == "rest" && t.rest.empty())
-                    t.rest = v;
             }
             fclose(tf);
         }
@@ -6292,12 +6876,12 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
 
 static bool lkReadFile(const std::string& path, std::vector<char>& out);
 
-// Restore's model tag: the bundled Real-ESRGAN = trt_runtime.RestoreEngine's md5[:8] of the weights; --restore-model =
-// "x" + an FNV-1a 64 of the file's bytes (8 hex), so a changed file builds anew. Empty = the file cannot be read.
-static std::string lkRestoreTag(const LookupTags& t)
+// a --restore-model engine's tag: "x" + an FNV-1a 64 of the file's bytes (8 hex), so a changed file builds anew. Empty =
+// no such file to read, or the bundled Real-ESRGAN (the host's own kernels, no engine)
+static std::string lkRestoreTag(const LookupTags&)
 {
     if (g_restoreModel.empty())
-        return t.rest;
+        return std::string();
     std::vector<char> b;
     if (!lkReadFile(g_restoreModel, b) || b.empty())
         return std::string();
@@ -6309,8 +6893,7 @@ static std::string lkRestoreTag(const LookupTags& t)
     return "x" + std::string(hex, 8);
 }
 
-// the Restore engine for a model size, as trt_runtime.RestoreEngine names it: restore_<tag>, input (1,3,h,w) at the
-// unpadded model size (the fit's w x h)
+// a --restore-model engine for a model size: restore_<tag>, input (1,3,h,w) at the unpadded model size (the fit's w x h)
 static std::string lkRestorePath(const std::string& cacheDir, const LookupTags& t, int w, int h)
 {
     return cacheDir + "\\" + lkEngineName("restore_" + lkRestoreTag(t), {{"x", {1, 3, h, w}}}, nullptr, 0, 0, t) +
@@ -6322,6 +6905,1056 @@ static int lkField(const std::string& line, const char* key)
     const std::string k = std::string(" ") + key + "=";
     const size_t p = line.find(k);
     return p == std::string::npos ? -1 : atoi(line.c_str() + p + k.size());
+}
+
+// ---- Restore on the host's own kernels -------------------------------------------------------------------------
+// The bundled Real-ESRGAN (realesr-animevideov3, BSD-3, engine\realesr-animevideov3.pth) runs as k_restConv0,
+// 16 x k_restConvMid and k_restConvLast, never as a TensorRT engine: no ONNX, no build. The handoff names it as
+// restorePath = kRestNative; weights that are missing or not this model = no Restore (offline: the pass is dropped
+// with its line). A --restore-model graph runs as a TensorRT engine.
+static const char* const kRestNative = "native:realesr-animevideov3";
+// a --restore-model ONNX in AnimeJaNai's SPAN-F3 form (64 features) runs on the host's kernels too (ajNatLoad); any
+// other graph stays a TensorRT engine
+static const char* const kRestNativeAj = "native:animejanai";
+
+// fp32 -> fp16 on the CPU, round to nearest even (torch's .half())
+static uint16_t f2hRne(float f)
+{
+    uint32_t x = 0;
+    memcpy(&x, &f, sizeof x);
+    const uint32_t sign = (x >> 16) & 0x8000u, ax = x & 0x7fffffffu;
+    if (ax >= 0x7f800000u)
+        return (uint16_t)(sign | (ax > 0x7f800000u ? 0x7e00u : 0x7c00u));
+    if (ax >= 0x477ff000u) // rounds to 65520 or more
+        return (uint16_t)(sign | 0x7c00u);
+    if (ax < 0x38800000u) // below 2^-14: a subnormal half = the value x 2^24 rounded to an even integer
+    {
+        float v = 0.0f;
+        memcpy(&v, &ax, sizeof v);
+        return (uint16_t)(sign | (uint32_t)std::nearbyint(v * 16777216.0f));
+    }
+    const uint32_t r = ax - 0x38000000u;
+    return (uint16_t)(sign | ((r + 0xfffu + ((r >> 13) & 1u)) >> 13));
+}
+
+static float h2fHost(uint16_t h)
+{
+    const uint32_t e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    float f = e == 0 ? std::ldexp((float)m, -24)
+                     : (e == 31 ? (m ? NAN : INFINITY) : std::ldexp((float)(m | 0x400u), (int)e - 25));
+    return (h & 0x8000u) ? -f : f;
+}
+
+// torch.save's file = a stored zip: <dir>/data.pkl, a protocol-2 pickle of the saved object (each tensor =
+// torch._utils._rebuild_tensor_v2(its persistent storage ('storage', <dtype class>, key, location, numel), offset,
+// size, stride, ...)), and <dir>/data/<key> = each storage's little-endian bytes. Read: the opcodes a state dict uses.
+struct PkObj
+{
+    enum Kind
+    {
+        None,
+        Int,
+        Str,
+        Tuple,
+        List,
+        Dict,
+        Global,
+        Storage,
+        Tensor,
+        Other
+    } k = None;
+    int64_t i = 0;
+    std::string s;                         // Str; Global = "module.name"; Storage / Tensor = the storage key
+    std::vector<std::shared_ptr<PkObj>> v; // Tuple / List items; Dict = key, value, key, value, ...
+    int bytes = 0;                         // Storage / Tensor: 4 = fp32, 2 = fp16
+    int64_t off = 0;
+    std::vector<int64_t> size, stride;
+};
+using PkP = std::shared_ptr<PkObj>;
+
+static PkP pkLoad(const std::string& b, std::string& why)
+{
+    std::vector<PkP> st;
+    std::vector<size_t> marks;
+    std::map<uint32_t, PkP> memo;
+    size_t p = 0;
+    auto mk = [](PkObj::Kind k) {
+        auto o = std::make_shared<PkObj>();
+        o->k = k;
+        return o;
+    };
+    auto need = [&](size_t n) { return p + n <= b.size(); };
+    auto le = [&](size_t n) {
+        uint64_t v = 0;
+        for (size_t j = 0; j < n; j++)
+            v |= (uint64_t)(unsigned char)b[p + j] << (8 * j);
+        p += n;
+        return v;
+    };
+    auto popMark = [&](std::vector<PkP>& items) {
+        if (marks.empty() || marks.back() > st.size())
+            return false;
+        items.assign(st.begin() + (ptrdiff_t)marks.back(), st.end());
+        st.resize(marks.back());
+        marks.pop_back();
+        return true;
+    };
+    while (p < b.size())
+    {
+        const unsigned char op = (unsigned char)b[p++];
+        bool ok = true;
+        switch (op)
+        {
+        case 0x80: // PROTO
+            ok = need(1);
+            p += 1;
+            break;
+        case 0x95: // FRAME
+            ok = need(8);
+            p += 8;
+            break;
+        case '}':
+            st.push_back(mk(PkObj::Dict));
+            break;
+        case ']':
+            st.push_back(mk(PkObj::List));
+            break;
+        case ')':
+            st.push_back(mk(PkObj::Tuple));
+            break;
+        case 'N':
+            st.push_back(mk(PkObj::None));
+            break;
+        case 0x88:
+        case 0x89: {
+            auto o = mk(PkObj::Int);
+            o->i = op == 0x88;
+            st.push_back(o);
+            break;
+        }
+        case 'K':
+        case 'M':
+        case 'J': {
+            const size_t n = op == 'K' ? 1 : op == 'M' ? 2 : 4;
+            if (!(ok = need(n)))
+                break;
+            const uint64_t u = le(n);
+            auto o = mk(PkObj::Int);
+            o->i = op == 'J' ? (int64_t)(int32_t)(uint32_t)u : (int64_t)u;
+            st.push_back(o);
+            break;
+        }
+        case 0x8a: // LONG1
+        {
+            if (!(ok = need(1)))
+                break;
+            const size_t n = (unsigned char)b[p++];
+            if (!(ok = n <= 8 && need(n)))
+                break;
+            const uint64_t u = le(n);
+            auto o = mk(PkObj::Int);
+            o->i = (n && n < 8 && ((u >> (8 * n - 1)) & 1u)) ? (int64_t)(u | (~0ull << (8 * n))) : (int64_t)u;
+            st.push_back(o);
+            break;
+        }
+        case 'X':  // BINUNICODE
+        case 0x8c: // SHORT_BINUNICODE
+        {
+            const size_t ln = op == 'X' ? 4 : 1;
+            if (!(ok = need(ln)))
+                break;
+            const size_t n = (size_t)le(ln);
+            if (!(ok = need(n)))
+                break;
+            auto o = mk(PkObj::Str);
+            o->s = b.substr(p, n);
+            p += n;
+            st.push_back(o);
+            break;
+        }
+        case 'c': // GLOBAL module\nname\n
+        {
+            const size_t e1 = b.find('\n', p);
+            const size_t e2 = e1 == std::string::npos ? e1 : b.find('\n', e1 + 1);
+            if (!(ok = e2 != std::string::npos))
+                break;
+            auto o = mk(PkObj::Global);
+            o->s = b.substr(p, e1 - p) + "." + b.substr(e1 + 1, e2 - e1 - 1);
+            p = e2 + 1;
+            st.push_back(o);
+            break;
+        }
+        case '(':
+            marks.push_back(st.size());
+            break;
+        case 't': {
+            std::vector<PkP> it;
+            if (!(ok = popMark(it)))
+                break;
+            auto o = mk(PkObj::Tuple);
+            o->v = it;
+            st.push_back(o);
+            break;
+        }
+        case 0x85: // TUPLE1 .. TUPLE3
+        case 0x86:
+        case 0x87: {
+            const size_t n = (size_t)(op - 0x84);
+            if (!(ok = st.size() >= n))
+                break;
+            auto o = mk(PkObj::Tuple);
+            o->v.assign(st.end() - (ptrdiff_t)n, st.end());
+            st.resize(st.size() - n);
+            st.push_back(o);
+            break;
+        }
+        case 'q': // BINPUT, LONG_BINPUT
+        case 'r': {
+            const size_t n = op == 'q' ? 1 : 4;
+            if (!(ok = need(n) && !st.empty()))
+                break;
+            memo[(uint32_t)le(n)] = st.back();
+            break;
+        }
+        case 0x94: // MEMOIZE
+            if ((ok = !st.empty()))
+                memo[(uint32_t)memo.size()] = st.back();
+            break;
+        case 'h': // BINGET, LONG_BINGET
+        case 'j': {
+            const size_t n = op == 'h' ? 1 : 4;
+            if (!(ok = need(n)))
+                break;
+            const auto it = memo.find((uint32_t)le(n));
+            if (!(ok = it != memo.end()))
+                break;
+            st.push_back(it->second);
+            break;
+        }
+        case 'Q': // BINPERSID: ('storage', <dtype class>, key, location, numel)
+        {
+            if (!(ok = !st.empty()))
+                break;
+            const PkP id = st.back();
+            st.pop_back();
+            if (!(ok = id->k == PkObj::Tuple && id->v.size() >= 3 && id->v[1]->k == PkObj::Global &&
+                       id->v[2]->k == PkObj::Str))
+                break;
+            auto o = mk(PkObj::Storage);
+            o->s = id->v[2]->s;
+            o->bytes = id->v[1]->s == "torch.FloatStorage" ? 4 : id->v[1]->s == "torch.HalfStorage" ? 2 : 0;
+            st.push_back(o);
+            break;
+        }
+        case 'R': // REDUCE
+        {
+            if (!(ok = st.size() >= 2))
+                break;
+            const PkP args = st.back();
+            st.pop_back();
+            const PkP fn = st.back();
+            st.pop_back();
+            PkP o;
+            if (fn->k == PkObj::Global && fn->s == "torch._utils._rebuild_tensor_v2" && args->k == PkObj::Tuple &&
+                args->v.size() >= 4 && args->v[0]->k == PkObj::Storage && args->v[2]->k == PkObj::Tuple &&
+                args->v[3]->k == PkObj::Tuple)
+            {
+                o = mk(PkObj::Tensor);
+                o->s = args->v[0]->s;
+                o->bytes = args->v[0]->bytes;
+                o->off = args->v[1]->i;
+                for (const PkP& d : args->v[2]->v)
+                    o->size.push_back(d->i);
+                for (const PkP& d : args->v[3]->v)
+                    o->stride.push_back(d->i);
+            }
+            else
+                o = mk(fn->k == PkObj::Global && fn->s == "collections.OrderedDict" ? PkObj::Dict : PkObj::Other);
+            st.push_back(o);
+            break;
+        }
+        case 's': // SETITEM
+        {
+            if (!(ok = st.size() >= 3))
+                break;
+            const PkP val = st.back();
+            st.pop_back();
+            const PkP key = st.back();
+            st.pop_back();
+            st.back()->v.push_back(key);
+            st.back()->v.push_back(val);
+            break;
+        }
+        case 'u': // SETITEMS
+        case 'e': // APPENDS
+        {
+            std::vector<PkP> it;
+            if (!(ok = popMark(it) && !st.empty()))
+                break;
+            for (const PkP& o : it)
+                st.back()->v.push_back(o);
+            break;
+        }
+        case 'a': // APPEND
+        {
+            if (!(ok = st.size() >= 2))
+                break;
+            const PkP val = st.back();
+            st.pop_back();
+            st.back()->v.push_back(val);
+            break;
+        }
+        case 'b': // BUILD: the state is not needed
+            if ((ok = st.size() >= 2))
+                st.pop_back();
+            break;
+        case '.':
+            if (st.empty())
+            {
+                why = "an empty pickle";
+                return nullptr;
+            }
+            return st.back();
+        default: {
+            char h[48];
+            snprintf(h, sizeof h, "pickle opcode 0x%02x not read", op);
+            why = h;
+            return nullptr;
+        }
+        }
+        if (!ok)
+        {
+            why = "a malformed pickle";
+            return nullptr;
+        }
+    }
+    why = "the pickle has no end";
+    return nullptr;
+}
+
+// a stored zip's entries: name -> (data offset, size); false = not one (`why`: a compressed or zip64 entry, ...)
+static bool pthZip(const std::string& f, std::map<std::string, std::pair<size_t, size_t>>& ent, std::string& why)
+{
+    auto u16 = [&](size_t o) { return (uint32_t)(unsigned char)f[o] | ((uint32_t)(unsigned char)f[o + 1] << 8); };
+    auto u32 = [&](size_t o) { return u16(o) | (u16(o + 2) << 16); };
+    size_t eocd = std::string::npos;
+    for (size_t o = f.size() >= 22 ? f.size() - 22 : 0; f.size() >= 22 && f.size() - o <= 65557; o--)
+    {
+        if (u32(o) == 0x06054b50u)
+        {
+            eocd = o;
+            break;
+        }
+        if (o == 0)
+            break;
+    }
+    if (eocd == std::string::npos)
+    {
+        why = "not a zip";
+        return false;
+    }
+    const uint32_t n = u16(eocd + 10);
+    size_t o = u32(eocd + 16);
+    for (uint32_t i = 0; i < n; i++)
+    {
+        if (o + 46 > f.size() || u32(o) != 0x02014b50u)
+        {
+            why = "a bad zip directory";
+            return false;
+        }
+        const uint32_t method = u16(o + 10), csize = u32(o + 20), usize = u32(o + 24), nl = u16(o + 28);
+        const uint32_t el = u16(o + 30), cl = u16(o + 32), lho = u32(o + 42);
+        if (o + 46 + nl > f.size())
+        {
+            why = "a bad zip directory";
+            return false;
+        }
+        const std::string name = f.substr(o + 46, nl);
+        if (method != 0 || csize != usize || csize == 0xffffffffu || lho == 0xffffffffu)
+        {
+            why = "a compressed or zip64 entry (" + name + ")";
+            return false;
+        }
+        if ((size_t)lho + 30 > f.size() || u32(lho) != 0x04034b50u)
+        {
+            why = "a bad zip entry (" + name + ")";
+            return false;
+        }
+        const size_t data = (size_t)lho + 30 + u16(lho + 26) + u16(lho + 28);
+        if (data + csize > f.size())
+        {
+            why = "a cut zip entry (" + name + ")";
+            return false;
+        }
+        ent[name] = {data, (size_t)csize};
+        o += 46 + (size_t)nl + el + cl;
+    }
+    return true;
+}
+
+// The bundled model's weights for the kernels, in one block (restNatOff's offsets, 256-byte aligned): k_restConv0's
+// w0[64][27] and b0 fp32 + its slopes fp16; per middle layer its fragment-order weights wf[tap][kc][q 4][lane][8 halves]
+// (lane's B registers for n-tiles 2q, 2q + 1 at channels 16 kc .. + 15: n = 16 q + lane / 4 (+ 8), k = 2 (lane % 4)
+// (+ 1, + 8, + 9)), bias and slopes fp16; the last layer's wf[tap][kc][q 3][lane][8] and bias fp16. Every value is
+// first rounded to fp16, as the model runs (.half()). false = missing, or not this model (`why`).
+static std::vector<uint16_t> restFragOf(const std::vector<float>& w, int nout, int cin, int coff, int taps);
+static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std::string& why)
+{
+    off.assign(3 + 16 * 3 + 2, 0);
+    const std::wstring path = g_nativeEngineDir + L"\\realesr-animevideov3.pth";
+    std::string f;
+    {
+        FILE* fp = nullptr;
+        if (_wfopen_s(&fp, path.c_str(), L"rb") || !fp)
+        {
+            why = "its weights " + wideToUtf8(path) + " are missing";
+            return false;
+        }
+        if (_fseeki64(fp, 0, SEEK_END) == 0)
+        {
+            const long long n = _ftelli64(fp);
+            if (n > 0 && n < (256ll << 20) && _fseeki64(fp, 0, SEEK_SET) == 0)
+            {
+                f.resize((size_t)n);
+                f.resize(fread(f.data(), 1, (size_t)n, fp));
+            }
+        }
+        fclose(fp);
+    }
+    std::map<std::string, std::pair<size_t, size_t>> ent;
+    if (!pthZip(f, ent, why))
+        return false;
+    std::string pkl, dir;
+    for (const auto& e : ent)
+        if (e.first.size() > 9 && e.first.compare(e.first.size() - 9, 9, "/data.pkl") == 0)
+        {
+            dir = e.first.substr(0, e.first.size() - 9);
+            pkl = f.substr(e.second.first, e.second.second);
+        }
+    if (pkl.empty())
+    {
+        why = "no data.pkl in its weights";
+        return false;
+    }
+    const PkP top = pkLoad(pkl, why);
+    if (!top)
+        return false;
+    PkP sd = top; // BasicSR's save = {"params": the state dict}
+    if (top->k == PkObj::Dict)
+        for (size_t i = 0; i + 1 < top->v.size(); i += 2)
+            if (top->v[i]->k == PkObj::Str && top->v[i]->s == "params")
+                sd = top->v[i + 1];
+    if (sd->k != PkObj::Dict)
+    {
+        why = "no state dict in its weights";
+        return false;
+    }
+    std::map<std::string, std::vector<float>> wts;
+    std::map<std::string, std::vector<int64_t>> S;
+    for (size_t i = 0; i + 1 < sd->v.size(); i += 2)
+    {
+        const PkObj& k = *sd->v[i];
+        const PkObj& t = *sd->v[i + 1];
+        if (k.k != PkObj::Str || t.k != PkObj::Tensor || (t.bytes != 4 && t.bytes != 2) ||
+            t.size.size() != t.stride.size())
+        {
+            why = "a state dict entry that is not an fp32 / fp16 tensor";
+            return false;
+        }
+        int64_t n = 1, want = 1;
+        for (int64_t d : t.size)
+            n *= d;
+        for (size_t d = t.size.size(); d-- > 0;)
+        {
+            if (t.size[d] != 1 && t.stride[d] != want)
+            {
+                why = "a tensor that is not contiguous (" + k.s + ")";
+                return false;
+            }
+            want *= t.size[d];
+        }
+        const auto e = ent.find(dir + "/data/" + t.s);
+        if (n <= 0 || t.off < 0 || e == ent.end() || (uint64_t)(t.off + n) * (uint64_t)t.bytes > e->second.second)
+        {
+            why = "a tensor's storage is missing or short (" + k.s + ")";
+            return false;
+        }
+        std::vector<float> v((size_t)n);
+        const char* src = f.data() + e->second.first + (size_t)t.off * (size_t)t.bytes;
+        for (size_t j = 0; j < (size_t)n; j++)
+        {
+            if (t.bytes == 4)
+                memcpy(&v[j], src + 4 * j, 4);
+            else
+            {
+                uint16_t h = 0;
+                memcpy(&h, src + 2 * j, 2);
+                v[j] = h2fHost(h);
+            }
+        }
+        wts[k.s] = std::move(v);
+        S[k.s] = t.size;
+    }
+    // the form: body.0 conv 3 -> 64, body.1 PReLU 64, 16 x (conv 64 -> 64, PReLU 64), body.34 conv 64 -> 48, 3 x 3
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    };
+    bool form = wts.size() == 53 && has("body.0.weight", {64, 3, 3, 3}) && has("body.0.bias", {64}) &&
+                has("body.1.weight", {64}) && has("body.34.weight", {48, 64, 3, 3}) && has("body.34.bias", {48});
+    for (int L = 0; L < 16 && form; L++)
+    {
+        const std::string c = "body." + std::to_string(2 + 2 * L), a = "body." + std::to_string(3 + 2 * L);
+        form = has(c + ".weight", {64, 64, 3, 3}) && has(c + ".bias", {64}) && has(a + ".weight", {64});
+    }
+    if (!form)
+    {
+        why = "its weights are not realesr-animevideov3's form";
+        return false;
+    }
+    for (auto& kv : wts)
+        for (float& x : kv.second)
+            x = h2fHost(f2hRne(x));
+    blob.clear();
+    auto put = [&](const void* p, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, p, n);
+        return o;
+    };
+    auto halves = [](const std::vector<float>& v) {
+        std::vector<uint16_t> h(v.size());
+        for (size_t i = 0; i < v.size(); i++)
+            h[i] = f2hRne(v[i]);
+        return h;
+    };
+    auto fragOf = [](const std::vector<float>& w, int nout) { return restFragOf(w, nout, 64, 0, 9); };
+    const std::vector<float>&w0 = wts["body.0.weight"], &b0 = wts["body.0.bias"];
+    off[0] = put(w0.data(), w0.size() * sizeof(float));
+    off[1] = put(b0.data(), b0.size() * sizeof(float));
+    const std::vector<uint16_t> s0 = halves(wts["body.1.weight"]);
+    off[2] = put(s0.data(), s0.size() * 2);
+    for (int L = 0; L < 16; L++)
+    {
+        const std::string c = "body." + std::to_string(2 + 2 * L), a = "body." + std::to_string(3 + 2 * L);
+        const std::vector<uint16_t> wf = fragOf(wts[c + ".weight"], 64), bs = halves(wts[c + ".bias"]),
+                                    sl = halves(wts[a + ".weight"]);
+        off[3 + 3 * L] = put(wf.data(), wf.size() * 2);
+        off[4 + 3 * L] = put(bs.data(), bs.size() * 2);
+        off[5 + 3 * L] = put(sl.data(), sl.size() * 2);
+    }
+    const std::vector<uint16_t> wl = fragOf(wts["body.34.weight"], 48), bl = halves(wts["body.34.bias"]);
+    off[51] = put(wl.data(), wl.size() * 2);
+    off[52] = put(bl.data(), bl.size() * 2);
+    return true;
+}
+
+// a conv's fp16 fragment-order weights for the tensor-core kernels: w[o][cin][taps] (PyTorch's layout) -> per tap, per
+// 16-channel step kc of the 64 channels from coff, per n-tile pair q of nout, per lane the 8 halves of its B registers
+// (n = 16 q + lane / 4 (+ 8), k = 2 (lane % 4) (+ 1, + 8, + 9))
+static std::vector<uint16_t> restFragOf(const std::vector<float>& w, int nout, int cin, int coff, int taps)
+{
+    const int nq = nout / 16;
+    std::vector<uint16_t> fr((size_t)taps * 4 * nq * 32 * 8);
+    size_t i = 0;
+    for (int t = 0; t < taps; t++)
+        for (int kc = 0; kc < 4; kc++)
+            for (int q = 0; q < nq; q++)
+                for (int l = 0; l < 32; l++)
+                {
+                    const int n0 = 16 * q + (l >> 2), c0 = coff + 16 * kc + 2 * (l & 3);
+                    const int ns[8] = {n0, n0, n0, n0, n0 + 8, n0 + 8, n0 + 8, n0 + 8};
+                    const int cs[8] = {c0, c0 + 1, c0 + 8, c0 + 9, c0, c0 + 1, c0 + 8, c0 + 9};
+                    for (int j = 0; j < 8; j++)
+                        fr[i++] = f2hRne(w[((size_t)ns[j] * cin + (size_t)cs[j]) * taps + (size_t)t]);
+                }
+    return fr;
+}
+
+// the native route for this session: the bundled model (no --restore-model), its weights readable
+static bool restNatWanted()
+{
+    if (!g_restoreModel.empty())
+        return false;
+    static int ok = -1; // the file is read once a process
+    if (ok < 0)
+    {
+        std::vector<uint8_t> blob;
+        std::vector<size_t> off;
+        std::string why;
+        ok = restNatLoad(blob, off, why) ? 1 : 0;
+        if (!ok)
+            LOG("native: Restore unavailable (%s)\n", why.c_str());
+    }
+    return ok == 1;
+}
+
+// one protobuf field: its number, wire type and value (a varint / fixed one, or the bytes of a length-delimited one)
+struct PbField
+{
+    uint32_t num = 0, wire = 0;
+    uint64_t v = 0;
+    const uint8_t* p = nullptr;
+    size_t n = 0;
+};
+static bool pbVarint(const uint8_t*& p, const uint8_t* end, uint64_t& v)
+{
+    v = 0;
+    for (int s = 0; s < 64 && p < end; s += 7)
+    {
+        const uint8_t b = *p++;
+        v |= (uint64_t)(b & 0x7fu) << s;
+        if (!(b & 0x80u))
+            return true;
+    }
+    return false;
+}
+static bool pbNext(const uint8_t*& p, const uint8_t* end, PbField& f)
+{
+    uint64_t key = 0;
+    if (p >= end || !pbVarint(p, end, key))
+        return false;
+    f.num = (uint32_t)(key >> 3);
+    f.wire = (uint32_t)(key & 7u);
+    f.v = 0;
+    f.p = nullptr;
+    f.n = 0;
+    const size_t left = (size_t)(end - p);
+    switch (f.wire)
+    {
+    case 0:
+        return pbVarint(p, end, f.v);
+    case 1:
+        if (left < 8)
+            return false;
+        memcpy(&f.v, p, 8);
+        p += 8;
+        return true;
+    case 5: {
+        if (left < 4)
+            return false;
+        uint32_t u = 0;
+        memcpy(&u, p, 4);
+        f.v = u;
+        p += 4;
+        return true;
+    }
+    case 2: {
+        uint64_t n = 0;
+        if (!pbVarint(p, end, n) || n > (uint64_t)(end - p))
+            return false;
+        f.p = p;
+        f.n = (size_t)n;
+        p += f.n;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+// the ONNX subset a conv net's weights and wiring need: the graph's nodes (op, inputs, outputs, int / string
+// attributes) and its float / fp16 initializers as floats (shape constants: their dims only)
+struct OnnxNode
+{
+    std::string op;
+    std::vector<std::string> in, out;
+    std::map<std::string, std::vector<int64_t>> ints;
+    std::map<std::string, std::string> strs;
+};
+struct OnnxInit
+{
+    std::vector<int64_t> dims;
+    std::vector<float> f;
+};
+struct OnnxGraph
+{
+    std::vector<OnnxNode> nodes;
+    std::map<std::string, OnnxInit> inits;
+    std::vector<std::string> inputs, outputs;
+};
+
+static bool onnxRead(const std::vector<char>& file, OnnxGraph& g, std::string& why)
+{
+    const uint8_t* p = (const uint8_t*)file.data();
+    const uint8_t* end = p + file.size();
+    PbField f;
+    const uint8_t *gp = nullptr, *ge = nullptr;
+    while (pbNext(p, end, f))
+        if (f.num == 7 && f.wire == 2) // ModelProto.graph
+        {
+            gp = f.p;
+            ge = f.p + f.n;
+        }
+    if (!gp)
+    {
+        why = "no ONNX graph";
+        return false;
+    }
+    auto ints = [](const PbField& x, std::vector<int64_t>& v) { // repeated int64: packed or one at a time
+        if (x.wire == 0)
+            v.push_back((int64_t)x.v);
+        else if (x.wire == 2)
+        {
+            const uint8_t* q = x.p;
+            uint64_t u = 0;
+            while (q < x.p + x.n && pbVarint(q, x.p + x.n, u))
+                v.push_back((int64_t)u);
+        }
+    };
+    auto name = [](const PbField& x) { return std::string((const char*)x.p, x.n); };
+    while (pbNext(gp, ge, f))
+    {
+        if (f.wire != 2)
+            continue;
+        const uint8_t *q = f.p, *qe = f.p + f.n;
+        PbField a;
+        if (f.num == 1) // NodeProto
+        {
+            OnnxNode nd;
+            while (pbNext(q, qe, a))
+                if (a.num == 1 && a.wire == 2)
+                    nd.in.push_back(name(a));
+                else if (a.num == 2 && a.wire == 2)
+                    nd.out.push_back(name(a));
+                else if (a.num == 4 && a.wire == 2)
+                    nd.op = name(a);
+                else if (a.num == 5 && a.wire == 2) // AttributeProto: name 1, i 3, s 4, ints 8
+                {
+                    const uint8_t *r = a.p, *re = a.p + a.n;
+                    PbField b;
+                    std::string an;
+                    std::vector<int64_t> iv;
+                    std::string sv;
+                    bool hasS = false;
+                    while (pbNext(r, re, b))
+                        if (b.num == 1 && b.wire == 2)
+                            an = name(b);
+                        else if (b.num == 3 && b.wire == 0)
+                            iv.push_back((int64_t)b.v);
+                        else if (b.num == 8)
+                            ints(b, iv);
+                        else if (b.num == 4 && b.wire == 2)
+                        {
+                            sv = name(b);
+                            hasS = true;
+                        }
+                    if (hasS)
+                        nd.strs[an] = sv;
+                    else
+                        nd.ints[an] = iv;
+                }
+            g.nodes.push_back(std::move(nd));
+        }
+        else if (f.num == 5) // TensorProto: dims 1, data_type 2, float_data 4, int32_data 5, name 8, raw_data 9,
+        {                    // data_location 14 (1 = external)
+            OnnxInit t;
+            std::string tn;
+            int64_t type = 0, loc = 0;
+            const uint8_t* raw = nullptr;
+            size_t rawN = 0;
+            std::vector<int64_t> i32;
+            std::vector<float> f32;
+            while (pbNext(q, qe, a))
+                if (a.num == 1)
+                    ints(a, t.dims);
+                else if (a.num == 2 && a.wire == 0)
+                    type = (int64_t)a.v;
+                else if (a.num == 8 && a.wire == 2)
+                    tn = name(a);
+                else if (a.num == 9 && a.wire == 2)
+                {
+                    raw = a.p;
+                    rawN = a.n;
+                }
+                else if (a.num == 5)
+                    ints(a, i32);
+                else if (a.num == 4 && a.wire == 2)
+                    for (size_t j = 0; j + 4 <= a.n; j += 4)
+                    {
+                        float v = 0.0f;
+                        memcpy(&v, a.p + j, 4);
+                        f32.push_back(v);
+                    }
+                else if (a.num == 4 && a.wire == 5)
+                {
+                    float v = 0.0f;
+                    const uint32_t u = (uint32_t)a.v;
+                    memcpy(&v, &u, 4);
+                    f32.push_back(v);
+                }
+                else if (a.num == 14 && a.wire == 0)
+                    loc = (int64_t)a.v;
+            if (loc == 1)
+            {
+                why = "an initializer in an external file (" + tn + ")";
+                return false;
+            }
+            if (type == 1) // FLOAT
+            {
+                if (raw)
+                    for (size_t j = 0; j + 4 <= rawN; j += 4)
+                    {
+                        float v = 0.0f;
+                        memcpy(&v, raw + j, 4);
+                        t.f.push_back(v);
+                    }
+                else
+                    t.f = f32;
+            }
+            else if (type == 10) // FLOAT16: raw bytes, or one value per int32_data entry
+            {
+                if (raw)
+                    for (size_t j = 0; j + 2 <= rawN; j += 2)
+                    {
+                        uint16_t h = 0;
+                        memcpy(&h, raw + j, 2);
+                        t.f.push_back(h2fHost(h));
+                    }
+                else
+                    for (int64_t v : i32)
+                        t.f.push_back(h2fHost((uint16_t)v));
+            }
+            g.inits[tn] = std::move(t);
+        }
+        else if (f.num == 11 || f.num == 12) // ValueInfoProto: name 1
+            while (pbNext(q, qe, a))
+                if (a.num == 1 && a.wire == 2)
+                    (f.num == 11 ? g.inputs : g.outputs).push_back(name(a));
+    }
+    return true;
+}
+
+// AnimeJaNai's SPAN-F3 net (64 features, n blocks) from a --restore-model ONNX, checked node by node along its data
+// path: Pad (reflect) -> PixelUnshuffle(2) as Reshape / Transpose [0,1,3,5,2,4] / Reshape -> Conv 12 -> 64 3 x 3 (x0)
+// -> per block Conv 3 x 3 -> Relu -> Conv 3 x 3 -> Relu -> Conv 3 x 3 (c3), Add(block input, c3), Conv 1 x 1 (c3) ->
+// Tanh, Mul(Add, Tanh) -> Concat [x0, the last block, the first block, the last block's first Relu] -> Conv 1 x 1
+// 256 -> 64 -> Conv 3 x 3 64 -> 48 -> DepthToSpace(4, CRD) -> Slices -> the output. Every conv: bias, stride 1, group 1,
+// pad 1 (3 x 3) / 0 (1 x 1). Anything else = not this form (`why`). The weights for the kernels, in one block (off: the
+// first conv's w[64][108] + b fp32; per block c1 / c2 / c3 fragment-order + bias + slope (0 = ReLU, 1 = none) fp16,
+// the 1 x 1's fragments + bias fp32; the concat conv's fragments (4 sources) + bias fp32; the last conv's + bias fp16).
+static bool ajNatLoad(const std::string& path, std::vector<uint8_t>& blob, std::vector<size_t>& off, int& nblocks,
+                      std::string& why)
+{
+    std::vector<char> file;
+    if (!lkReadFile(path, file) || file.empty())
+    {
+        why = "its model file cannot be read";
+        return false;
+    }
+    OnnxGraph g;
+    if (!onnxRead(file, g, why))
+        return false;
+    std::map<std::string, int> prod;
+    std::map<std::string, std::vector<int>> cons;
+    for (int i = 0; i < (int)g.nodes.size(); i++)
+    {
+        for (const std::string& o : g.nodes[i].out)
+            prod[o] = i;
+        for (const std::string& x : g.nodes[i].in)
+            cons[x].push_back(i);
+    }
+    auto bad = [&](const std::string& where) {
+        why = "not AnimeJaNai's SPAN-F3 form (" + where + ")";
+        return false;
+    };
+    auto node = [&](const std::string& t) -> const OnnxNode* {
+        const auto it = prod.find(t);
+        return it == prod.end() ? nullptr : &g.nodes[it->second];
+    };
+    auto dims = [&](const std::string& t) {
+        const auto it = g.inits.find(t);
+        return it == g.inits.end() ? std::vector<int64_t>() : it->second.dims;
+    };
+    // the one consumer of tensor t with op `op` (and, for a Conv, weight dims wd), or -1
+    auto take = [&](const std::string& t, const char* op, const std::vector<int64_t>& wd) {
+        int hit = -1, n = 0;
+        for (int i : cons[t])
+            if (g.nodes[i].op == op && (wd.empty() || (g.nodes[i].in.size() == 3 && dims(g.nodes[i].in[1]) == wd)))
+            {
+                hit = i;
+                n++;
+            }
+        return n == 1 ? hit : -1;
+    };
+    auto convOk = [&](int i, int k) {
+        const OnnxNode& c = g.nodes[i];
+        auto at = [&](const char* a, const std::vector<int64_t>& want) {
+            const auto it = c.ints.find(a);
+            return it == c.ints.end() || it->second == want;
+        };
+        const std::vector<int64_t> pd(4, k == 3 ? 1 : 0);
+        return c.in.size() == 3 && dims(c.in[2]).size() == 1 && at("strides", {1, 1}) && at("dilations", {1, 1}) &&
+               at("group", {1}) && at("kernel_shape", {k, k}) && at("pads", pd) && c.out.size() == 1;
+    };
+    // the head: input -> Pad (reflect) -> Reshape -> Transpose [0,1,3,5,2,4] -> Reshape -> the first conv
+    const std::vector<int64_t> w12 = {64, 12, 3, 3}, w64 = {64, 64, 3, 3}, w1 = {64, 64, 1, 1}, wc = {64, 256, 1, 1},
+                               wl = {48, 64, 3, 3};
+    int first = -1, nFirst = 0;
+    for (int i = 0; i < (int)g.nodes.size(); i++)
+        if (g.nodes[i].op == "Conv" && g.nodes[i].in.size() == 3 && dims(g.nodes[i].in[1]) == w12)
+        {
+            first = i;
+            nFirst++;
+        }
+    if (nFirst != 1 || !convOk(first, 3) || g.inputs.empty() || g.outputs.size() != 1)
+        return bad("the first conv");
+    {
+        const OnnxNode* r2 = node(g.nodes[first].in[0]);
+        const OnnxNode* tr = r2 && r2->op == "Reshape" ? node(r2->in[0]) : nullptr;
+        const OnnxNode* r1 = tr && tr->op == "Transpose" ? node(tr->in[0]) : nullptr;
+        const OnnxNode* pad = r1 && r1->op == "Reshape" ? node(r1->in[0]) : nullptr;
+        const auto perm = tr ? tr->ints.find("perm") : std::map<std::string, std::vector<int64_t>>::const_iterator();
+        const auto mode = pad ? pad->strs.find("mode") : std::map<std::string, std::string>::const_iterator();
+        if (!pad || pad->op != "Pad" || pad->in.empty() || pad->in[0] != g.inputs[0] || perm == tr->ints.end() ||
+            perm->second != std::vector<int64_t>{0, 1, 3, 5, 2, 4} || mode == pad->strs.end() ||
+            mode->second != "reflect")
+            return bad("the pad and pixel unshuffle");
+    }
+    struct Block
+    {
+        int c[3], att;
+        std::string relu1, out;
+    };
+    std::vector<Block> blocks;
+    std::string cur = g.nodes[first].out[0];
+    for (;;)
+    {
+        Block b{};
+        b.c[0] = take(cur, "Conv", w64);
+        if (b.c[0] < 0)
+            break;
+        const int r1 = take(g.nodes[b.c[0]].out[0], "Relu", {});
+        b.c[1] = r1 < 0 ? -1 : take(g.nodes[r1].out[0], "Conv", w64);
+        const int r2 = b.c[1] < 0 ? -1 : take(g.nodes[b.c[1]].out[0], "Relu", {});
+        b.c[2] = r2 < 0 ? -1 : take(g.nodes[r2].out[0], "Conv", w64);
+        if (b.c[2] < 0 || !convOk(b.c[0], 3) || !convOk(b.c[1], 3) || !convOk(b.c[2], 3))
+            return bad("block " + std::to_string(blocks.size() + 1) + "'s convs");
+        const std::string c3 = g.nodes[b.c[2]].out[0];
+        const int add = take(c3, "Add", {});
+        b.att = take(c3, "Conv", w1);
+        const int th = b.att < 0 ? -1 : take(g.nodes[b.att].out[0], "Tanh", {});
+        const int mul = add < 0 || th < 0 ? -1 : take(g.nodes[add].out[0], "Mul", {});
+        if (add < 0 || th < 0 || mul < 0 || !convOk(b.att, 1) || cons[c3].size() != 2 ||
+            !((g.nodes[add].in[0] == cur && g.nodes[add].in[1] == c3) ||
+              (g.nodes[add].in[1] == cur && g.nodes[add].in[0] == c3)) ||
+            std::find(g.nodes[mul].in.begin(), g.nodes[mul].in.end(), g.nodes[th].out[0]) == g.nodes[mul].in.end())
+            return bad("block " + std::to_string(blocks.size() + 1) + "'s attention");
+        b.relu1 = g.nodes[r1].out[0];
+        b.out = cur = g.nodes[mul].out[0];
+        blocks.push_back(b);
+        if (blocks.size() > 16)
+            return bad("more than 16 blocks");
+    }
+    if (blocks.empty())
+        return bad("no block");
+    const int cat = take(cur, "Concat", {});
+    const std::vector<std::string> want = {g.nodes[first].out[0], blocks.back().out, blocks.front().out,
+                                           blocks.back().relu1};
+    const int cc = cat < 0 ? -1 : take(g.nodes[cat].out[0], "Conv", wc);
+    const int last = cc < 0 ? -1 : take(g.nodes[cc].out[0], "Conv", wl);
+    const int d2s = last < 0 ? -1 : take(g.nodes[last].out[0], "DepthToSpace", {});
+    if (cat < 0 || g.nodes[cat].in != want || cc < 0 || last < 0 || d2s < 0 || !convOk(cc, 1) || !convOk(last, 3))
+        return bad("the tail");
+    {
+        const OnnxNode& d = g.nodes[d2s];
+        const auto bs = d.ints.find("blocksize");
+        const auto md = d.strs.find("mode");
+        if (bs == d.ints.end() || bs->second != std::vector<int64_t>{4} || (md != d.strs.end() && md->second != "CRD"))
+            return bad("the depth to space");
+        std::string t = g.outputs[0];
+        for (int s = 0; s < 3 && node(t) && node(t)->op == "Slice"; s++)
+            t = node(t)->in[0];
+        if (t != d.out[0])
+            return bad("the output's crop");
+    }
+    int nconv = 0, nrelu = 0, ntanh = 0;
+    for (const OnnxNode& nd : g.nodes)
+    {
+        nconv += nd.op == "Conv";
+        nrelu += nd.op == "Relu";
+        ntanh += nd.op == "Tanh";
+    }
+    const int n = (int)blocks.size();
+    if (nconv != 3 + 4 * n || nrelu != 2 * n || ntanh != n)
+        return bad("extra layers");
+    // the weights
+    auto wOf = [&](int i) -> const std::vector<float>& { return g.inits[g.nodes[i].in[1]].f; };
+    auto bOf = [&](int i) -> const std::vector<float>& { return g.inits[g.nodes[i].in[2]].f; };
+    blob.clear();
+    off.assign((size_t)(6 + 11 * n), 0);
+    auto put = [&](const void* p, size_t bytes) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + bytes);
+        memcpy(blob.data() + o, p, bytes);
+        return o;
+    };
+    auto halves = [](const std::vector<float>& v) {
+        std::vector<uint16_t> h(v.size());
+        for (size_t i = 0; i < v.size(); i++)
+            h[i] = f2hRne(v[i]);
+        return h;
+    };
+    auto sizesOk = [&](int i, size_t nw, size_t nb) { return wOf(i).size() == nw && bOf(i).size() == nb; };
+    if (!sizesOk(first, 64 * 108, 64) || !sizesOk(cc, 64 * 256, 64) || !sizesOk(last, 48 * 64 * 9, 48))
+        return bad("a weight's size");
+    off[0] = put(wOf(first).data(), wOf(first).size() * sizeof(float));
+    off[1] = put(bOf(first).data(), 64 * sizeof(float));
+    const std::vector<uint16_t> zeros(64, 0), ones(64, 0x3c00);
+    for (int k = 0; k < n; k++)
+    {
+        const Block& b = blocks[(size_t)k];
+        for (int j = 0; j < 3; j++)
+        {
+            if (!sizesOk(b.c[j], 64 * 64 * 9, 64))
+                return bad("a weight's size");
+            const std::vector<uint16_t> wf = restFragOf(wOf(b.c[j]), 64, 64, 0, 9), bs = halves(bOf(b.c[j]));
+            off[(size_t)(2 + 11 * k + 3 * j)] = put(wf.data(), wf.size() * 2);
+            off[(size_t)(3 + 11 * k + 3 * j)] = put(bs.data(), bs.size() * 2);
+            off[(size_t)(4 + 11 * k + 3 * j)] = put(j < 2 ? zeros.data() : ones.data(), 64 * 2);
+        }
+        if (!sizesOk(b.att, 64 * 64, 64))
+            return bad("a weight's size");
+        const std::vector<uint16_t> wa = restFragOf(wOf(b.att), 64, 64, 0, 1);
+        off[(size_t)(11 + 11 * k)] = put(wa.data(), wa.size() * 2);
+        off[(size_t)(12 + 11 * k)] = put(bOf(b.att).data(), 64 * sizeof(float));
+    }
+    std::vector<uint16_t> wcat;
+    for (int s = 0; s < 4; s++)
+    {
+        const std::vector<uint16_t> part = restFragOf(wOf(cc), 64, 256, 64 * s, 1);
+        wcat.insert(wcat.end(), part.begin(), part.end());
+    }
+    off[(size_t)(2 + 11 * n)] = put(wcat.data(), wcat.size() * 2);
+    off[(size_t)(3 + 11 * n)] = put(bOf(cc).data(), 64 * sizeof(float));
+    const std::vector<uint16_t> wlf = restFragOf(wOf(last), 48, 64, 0, 9), bl = halves(bOf(last));
+    off[(size_t)(4 + 11 * n)] = put(wlf.data(), wlf.size() * 2);
+    off[(size_t)(5 + 11 * n)] = put(bl.data(), bl.size() * 2);
+    nblocks = n;
+    return true;
+}
+
+// a --restore-model file on the host's kernels: AnimeJaNai's form (read once a path, the line once)
+static bool ajNatWanted()
+{
+    if (g_restoreModel.empty())
+        return false;
+    static std::string path;
+    static bool ok = false;
+    if (path != g_restoreModel)
+    {
+        path = g_restoreModel;
+        std::vector<uint8_t> blob;
+        std::vector<size_t> off;
+        std::string why;
+        int nb = 0;
+        ok = ajNatLoad(path, blob, off, nb, why);
+        if (ok)
+            LOG("native: the Restore model runs on the host's kernels (SPAN-F3, %d blocks)\n", nb);
+        else
+            LOG("native: the Restore model runs as a TensorRT engine (%s)\n", why.c_str());
+    }
+    return ok;
 }
 
 // The session's full handoff answer: the base answer plus, for live Restore (every backend:
@@ -6340,6 +7973,27 @@ static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& b
     {
         lines.clear();
         return false;
+    }
+    if (g_restoreModel.empty()) // the bundled Real-ESRGAN on the host's kernels: no engine, no jit
+    {
+        if (!restNatWanted())
+        {
+            lines.clear();
+            return false;
+        }
+        const std::string ready = lines.back();
+        lines.pop_back();
+        lines.push_back(std::string("NATIVE-PATH restore=") + kRestNative);
+        lines.push_back(ready);
+        return true;
+    }
+    if (ajNatWanted()) // AnimeJaNai's form on the host's kernels: no engine, no jit
+    {
+        const std::string ready = lines.back();
+        lines.pop_back();
+        lines.push_back(std::string("NATIVE-PATH restore=") + kRestNativeAj);
+        lines.push_back(ready);
+        return true;
     }
     const LookupTags& t = lkTags(s.engDirW);
     if (!t.ok || lkRestoreTag(t).empty())
@@ -7085,9 +8739,9 @@ static bool lkBuildBackend(const std::wstring& script, const std::wstring& backe
 }
 
 // the cold-start build: the backend's engines when its warm answer misses (echo, nvof and fruc
-// have none), then for live Restore the Real-ESRGAN engine from engine\onnx (restore_<hash>_dth:
-// fp16 input) at the model size the answer names, warmed once so its .jit exists. A backend that
-// is already warm is never rewarmed. true = worth a second lookup.
+// have none), then for live Restore the --restore-model engine at the capture size, warmed once so its .jit exists
+// (the bundled Real-ESRGAN builds nothing). A backend that is already warm is never rewarmed. true = worth a second
+// lookup.
 static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int w, int h, std::string& rpath,
                             std::string& rjit);
 static bool nativeLocalBuild(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH)
@@ -7113,8 +8767,8 @@ static bool nativeLocalBuild(const std::wstring& script, const std::wstring& bac
     return lkEnsureRestore(script, s, (int)capW, (int)capH, rpath, rjit); // the captured frame's size
 }
 
-// the first input's name of a one-input ONNX graph (the user's Restore model names its own; Real-ESRGAN's export
-// says "x"); empty = it does not parse or has another input count
+// the first input's name of a one-input ONNX graph (the user's Restore model names its own); empty = it does not parse
+// or has another input count
 static std::string lkOnnxInputName(const std::string& onnx)
 {
     LkBuildLogger lg;
@@ -7132,21 +8786,29 @@ static std::string lkOnnxInputName(const std::string& onnx)
     return net->getInput(0)->getName();
 }
 
-// the Restore engine at its input size w x h (live the captured frame, offline the decoded one): Real-ESRGAN from
-// engine\onnx (restore_<hash>_dth: fp16 input x) or the --restore-model file, built when it is missing, warmed once so
-// its .jit exists; the live cold build and the offline host share it. true = both files exist, paths in rpath / rjit.
+// Restore at its input size w x h (live the captured frame, offline the decoded one): the bundled Real-ESRGAN =
+// kRestNative (the host's kernels, nothing to build; false when its weights are unusable), a --restore-model file = its
+// TensorRT engine, built when it is missing, warmed once so its .jit exists; the live cold build and the offline host
+// share it. true = ready, paths in rpath / rjit.
 static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int w, int h, std::string& rpath,
                             std::string& rjit)
 {
     if (!nativeLoadDlls(script))
         return false;
+    if (g_restoreModel.empty() || ajNatWanted())
+    {
+        if (g_restoreModel.empty() && !restNatWanted())
+            return false;
+        rpath = g_restoreModel.empty() ? kRestNative : kRestNativeAj;
+        rjit.clear();
+        return true;
+    }
     const LookupTags& t = lkTags(s.engDirW);
     if (!t.ok)
         return false;
     if (lkRestoreTag(t).empty())
     {
-        if (!g_restoreModel.empty())
-            LOG("native: the Restore model %s cannot be read\n", g_restoreModel.c_str());
+        LOG("native: the Restore model %s cannot be read\n", g_restoreModel.c_str());
         return false;
     }
     rpath = lkRestorePath(s.cacheDir, t, w, h);
@@ -7164,7 +8826,7 @@ static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int 
         return false;
     nvinfer1::IRuntime* rt = lkRuntime();
     bool oom = false;
-    const std::string inName = g_restoreModel.empty() ? std::string("x") : lkOnnxInputName(g_restoreModel);
+    const std::string inName = lkOnnxInputName(g_restoreModel);
     if (inName.empty())
     {
         LOG("native: the Restore model %s is not a one-input ONNX graph\n", g_restoreModel.c_str());
@@ -7172,8 +8834,8 @@ static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int 
         return false;
     }
     const std::vector<LkShape> rset = {{inName.c_str(), {1, 3, h, w}}};
-    const bool done = rt && lkEnsure(rt, s, t, rpath, "restore_" + t.rest + "_dth", rset, nullptr, 0, 0, 1, {rset},
-                                     std::string(), st, &oom, g_restoreModel);
+    const bool done = rt && lkEnsure(rt, s, t, rpath, std::string(), rset, nullptr, 0, 0, 1, {rset}, std::string(), st,
+                                     &oom, g_restoreModel);
     cudaStreamDestroy(st);
     LOG("native: host Restore engine build for %dx%d %s (%.1fs)\n", w, h, done ? "done" : "failed",
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -7467,7 +9129,8 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         }
         else
             factsOk = fileExistsA(f.ifnetPath) && fileExistsA(f.encodePath);
-        factsOk = factsOk && (f.restorePath.empty() || fileExistsA(f.restorePath));
+        factsOk = factsOk && (f.restorePath.empty() || f.restorePath == kRestNative || f.restorePath == kRestNativeAj ||
+                              fileExistsA(f.restorePath));
         factsOk = factsOk && (!f.drba || fileExistsA(f.block0Path));
     }
     if (factsOk)
@@ -7953,6 +9616,14 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fRestIn, "k_restIn"},
         {&nr.fRestFoldH, "k_restFoldH"},
         {&nr.fRestFoldV, "k_restFoldV"},
+        {&nr.fRestFoldHSub, "k_restFoldHSub"},
+        {&nr.fA4kFoldHSub, "k_a4kFoldHSub"},
+        {&nr.fRestConv0, "k_restConv0"},
+        {&nr.fRestConvMid, "k_restConvMid"},
+        {&nr.fRestConvLast, "k_restConvLast"},
+        {&nr.fAjFirst, "k_ajFirst"},
+        {&nr.fAjAtt, "k_ajAtt"},
+        {&nr.fAjCat, "k_ajCat"},
         {&nr.fRestToF, "k_restToF"},
         {&nr.fClamp01, "k_clamp01"},
         {&nr.fPadPlanar, "k_padPlanar"},
@@ -8049,29 +9720,28 @@ static const void* rsTabFor(NativeRife& nr, int in, int out, cudaStream_t st)
     return d;
 }
 
-static bool nativeBuildKernels(NativeRife& nr, const std::wstring& cacheDir)
+// one NVRTC program's cubin: read from cacheDir\<tag>_<source hash>_sm<arch>.cubin, else compiled (the arch the only
+// option) and saved there; `what` names it in the lines
+static bool nativeCubin(const char* src, const char* file, const wchar_t* tag, const char* what,
+                        const std::wstring& cacheDir, std::vector<char>& cubin)
 {
-    // resident host: the module is per process (same device, same cubin), only rebind
-    if (g_resident && g_res.cuMod)
-    {
-        nr.cuMod = g_res.cuMod;
-        return nativeBindKernels(nr);
-    }
     int dev = 0;
-    NCHK(cudaGetDevice(&dev), "cudaGetDevice");
+    if (cudaGetDevice(&dev) != cudaSuccess)
+        return false;
     cudaDeviceProp prop{};
-    NCHK(cudaGetDeviceProperties(&prop, dev), "cudaGetDeviceProperties");
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
+        return false;
     uint64_t hash = 1469598103934665603ull;
-    for (const char* p = kNativeKernels; *p; p++)
+    for (const char* p = src; *p; p++)
     {
         hash ^= (unsigned char)*p;
         hash *= 1099511628211ull;
     }
     wchar_t nm[128];
-    swprintf_s(nm, L"\\smv_native_%016llx_sm%d%d.cubin", (unsigned long long)hash, prop.major, prop.minor);
+    swprintf_s(nm, L"\\%s_%016llx_sm%d%d.cubin", tag, (unsigned long long)hash, prop.major, prop.minor);
     const std::wstring cubinPath = cacheDir + nm;
     ensureDirW(cacheDir);
-    std::vector<char> cubin;
+    cubin.clear();
     bool haveCubin = false;
     {
         FILE* f = nullptr;
@@ -8110,9 +9780,9 @@ static bool nativeBuildKernels(NativeRife& nr, const std::wstring& cacheDir)
             return false;
         }
         void* prog = nullptr;
-        if (nv.create(&prog, kNativeKernels, "smv_native.cu", 0, nullptr, nullptr) != 0)
+        if (nv.create(&prog, src, file, 0, nullptr, nullptr) != 0)
         {
-            LOG("native: nvrtcCreateProgram failed\n");
+            LOG("native: nvrtcCreateProgram failed (%s)\n", what);
             return false;
         }
         char arch[64];
@@ -8128,21 +9798,21 @@ static bool nativeBuildKernels(NativeRife& nr, const std::wstring& cacheDir)
                 lg.resize(ls);
                 nv.log(prog, lg.data());
             }
-            LOG("native: nvrtc compile failed (%d): %s\n", crc, lg.c_str());
+            LOG("native: nvrtc compile failed (%s, %d): %s\n", what, crc, lg.c_str());
             nv.destroy(&prog);
             return false;
         }
         size_t cs = 0;
         if (nv.cubinSize(prog, &cs) != 0 || !cs)
         {
-            LOG("native: nvrtcGetCUBINSize failed\n");
+            LOG("native: nvrtcGetCUBINSize failed (%s)\n", what);
             nv.destroy(&prog);
             return false;
         }
         cubin.resize(cs);
         if (nv.cubin(prog, cubin.data()) != 0)
         {
-            LOG("native: nvrtcGetCUBIN failed\n");
+            LOG("native: nvrtcGetCUBIN failed (%s)\n", what);
             nv.destroy(&prog);
             return false;
         }
@@ -8156,12 +9826,27 @@ static bool nativeBuildKernels(NativeRife& nr, const std::wstring& cacheDir)
             _wunlink(cubinPath.c_str());
             if (_wrename(tmp.c_str(), cubinPath.c_str()) != 0)
             {
-                LOG("native: kernel cache not saved (rename failed)\n");
+                LOG("native: kernel cache not saved (%s, rename failed)\n", what);
                 _wunlink(tmp.c_str());
             }
         }
-        LOG("native: kernels compiled for sm_%d%d (%zu bytes cubin)\n", prop.major, prop.minor, cubin.size());
+        LOG("native: %s compiled for sm_%d%d (%zu bytes cubin)\n", what, prop.major, prop.minor, cubin.size());
     }
+    return true;
+}
+
+static bool nativeBuildKernels(NativeRife& nr, const std::wstring& cacheDir)
+{
+    nr.kernCacheDir = cacheDir;
+    // resident host: the module is per process (same device, same cubin), only rebind
+    if (g_resident && g_res.cuMod)
+    {
+        nr.cuMod = g_res.cuMod;
+        return nativeBindKernels(nr);
+    }
+    std::vector<char> cubin;
+    if (!nativeCubin(kNativeKernels, "smv_native.cu", L"smv_native", "kernels", cacheDir, cubin))
+        return false;
     if (cuInit(0) != CUDA_SUCCESS)
     {
         LOG("native: cuInit failed\n");
@@ -8321,6 +10006,9 @@ static int srcH(const NativeRife& nr)
 static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh);
 static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, cudaStream_t st, unsigned int& rv);
 static void nativeFsrupRelease(NativeRife& nr);
+static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc);
+static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th);
+static void nativeA4kRelease(NativeRife& nr);
 
 static bool nativeRtxInit(NativeRife& nr)
 {
@@ -8352,7 +10040,9 @@ static bool nativeRtxInit(NativeRife& nr)
         nr.vsrPost = nr.dw > nr.w && nr.dh > nr.h && !nr.rtxHdr;
         if (nr.vsrWant && nr.rtxHdr && nr.dw > nr.w && nr.dh > nr.h)
             LOG("native: %s takes SDR only and RTX HDR runs before the model: the resize after it is Lanczos\n",
-                nr.fsrUp ? "AMD FSR upscaling" : "RTX VSR");
+                nr.fsrUp   ? "AMD FSR upscaling"
+                : nr.a4kUp ? "Anime4K"
+                           : "RTX VSR");
         if (nr.vsrPost)
         {
             vw = nr.w;
@@ -8366,7 +10056,7 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     if (nr.vsrWant)
     {
-        const char* up = nr.fsrUp ? "AMD FSR upscaling" : "RTX VSR";
+        const char* up = nr.fsrUp ? "AMD FSR upscaling" : nr.a4kUp ? "Anime4K" : "RTX VSR";
         if (g_offline && !nr.nvPre && nr.rtxHdr)
             LOG("native: %s skipped (it takes SDR only, and the one resize follows RTX HDR and the model), Lanczos\n",
                 up);
@@ -8376,6 +10066,7 @@ static bool nativeRtxInit(NativeRife& nr)
             LOG("native: live %s skipped (upscales only; this resize does not enlarge), Lanczos\n", up);
     }
     nr.fsrUp = nr.fsrUp && nr.vsr;
+    nr.a4kUp = nr.a4kUp && nr.vsr;
     nr.vsrPre = nr.vsrPre && nr.vsr;
     // offline HDR video (--src-hdr): the upscaler's frames are the source's PQ / HLG codes at either stage (RTX HDR,
     // which would make them PQ after the model, keeps the upscaler off that resize), so RTX VSR reads their SDR view
@@ -8441,8 +10132,9 @@ static bool nativeRtxInit(NativeRife& nr)
                  "alloc restore HDR fit");
         const std::string rm = g_restoreModel.empty() ? std::string("Real-ESRGAN animevideov3")
                                                       : g_restoreModel.substr(g_restoreModel.find_last_of("\\/") + 1);
-        LOG("native: live restore: %s (TensorRT) at %dx%d -> %dx%d%s\n", rm.c_str(), sw, sh, nr.restTw, nr.restTh,
-            nr.restPre ? ", on the captured frame before the model" : "");
+        LOG("native: live restore: %s (%s) at %dx%d -> %dx%d%s\n", rm.c_str(),
+            nr.restorePath == kRestNative || nr.restorePath == kRestNativeAj ? "the host's kernels" : "TensorRT", sw,
+            sh, nr.restTw, nr.restTh, nr.restPre ? ", on the captured frame before the model" : "");
     }
     // a resize of HDR planes before the model: live the capture to the working size (with Restore, its reference),
     // offline the pre-model stage (the resize, or Restore at a size change)
@@ -8469,8 +10161,11 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     if (nr.vsr)
     {
-        NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)vw * vh * 4), "alloc VSR input");
-        NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)vtw * vth * 4), "alloc VSR output");
+        if (!nr.a4kUp) // Anime4K reads and writes planar floats, never the bridge's BGRA buffers
+        {
+            NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)vw * vh * 4), "alloc VSR input");
+            NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)vtw * vth * 4), "alloc VSR output");
+        }
         if (nr.hdr || upEnc)
         {
             NCHK(cudaMalloc((void**)&nr.dVsrView, (size_t)3 * vw * vh * sizeof(float)), "alloc VSR SDR view");
@@ -8538,7 +10233,8 @@ static bool nativeRtxInit(NativeRife& nr)
             return false;
         }
     }
-    if (nr.rtxHdr || (nr.vsr && !nr.fsrUp))
+    const bool rtxVsrNow = nr.vsr && !nr.fsrUp && !nr.a4kUp; // NVIDIA's RTX VSR holds the slot
+    if (nr.rtxHdr || rtxVsrNow)
     {
         // the bridge retains the PRIMARY context (cuContext = NULL), which is the context this
         // thread just bound with cudaSetDevice. cuStream is NULL exactly as rtxvideo.py passes
@@ -8546,7 +10242,7 @@ static bool nativeRtxInit(NativeRife& nr)
         // default stream, and the host's own stream is cudaStreamNonBlocking, so an NGX eval
         // placed on it would not be ordered against the bridge's own output copy. ONE create
         // per process (NGX is single-instance), so both features are asked for at once.
-        if (g_rtxb.create(nullptr, nullptr, 0, nr.rtxHdr ? 1u : 0u, nr.vsr && !nr.fsrUp ? 1u : 0u) != 1u)
+        if (g_rtxb.create(nullptr, nullptr, 0, nr.rtxHdr ? 1u : 0u, rtxVsrNow ? 1u : 0u) != 1u)
         {
             LOG("native: rtx_video_api_cuda_create failed\n");
             return false;
@@ -8559,7 +10255,9 @@ static bool nativeRtxInit(NativeRife& nr)
     nr.fuHdr = nr.fsrUp && (g_offline ? upEnc != 0 : nr.hdr && !(nr.vsrPre && nr.rtxHdr));
     if (nr.fsrUp && !nativeFsrupSetup(nr, vw, vh, vtw, vth))
         return false;
-    if (nr.vsr && !nr.fsrUp)
+    if (nr.a4kUp && !nativeA4kSetup(nr, vw, vh, vtw, vth, upEnc))
+        return false;
+    if (rtxVsrNow)
     {
         // warm-up eval on an opaque black frame, so the first presented frame pays nothing
         if (cuMemsetD32Async((CUdeviceptr)nr.dVsrIn, 0xFF000000u, (size_t)vw * vh, (CUstream)nr.stream) != CUDA_SUCCESS)
@@ -11676,6 +13374,2123 @@ static void nativeFsrupRelease(NativeRife& nr)
     nativeOfVecFree(nr.fuOf);
 }
 
+// Anime4K Upscale CNN x2 UL (bloc97, release v4.0.1, MIT: THIRD_PARTY_NOTICES.md): its weights as fp32 bit patterns
+// in the order its shader file gives them (Anime4K_Upscale_CNN_x2_UL.glsl, md5 43d023a000f213fce4b191a5534a0269; GLSL's
+// mat4 is column-major: out[i] += a[4 j + i] * in[j]). kA4kW0 = layer 0 on R, G, B ([out][channel][tap (dy + 1) 3 + dx +
+// 1], then 12 biases with MAIN's constant 4th channel folded in); six kA4kW = layers 1..6 on the previous layer's CReLU
+// ([out][24 channels: max(x, 0) of texture c / 4's channel c % 4, then max(-x, 0)][tap], then 12 biases); kA4kWL = the
+// 1 x 1 on the CReLU of layers 2..6 ([out][24 L + channel], then 12 biases).
+constexpr size_t kA4kW0 = 12 * 3 * 9 + 12, kA4kW = 12 * 24 * 9 + 12, kA4kWL = 12 * 120 + 12;
+// clang-format off
+static const uint32_t kA4kWeights[kA4kW0 + 6 * kA4kW + kA4kWL] = {
+0xbe8d3076u, 0x3dfdd305u, 0x3e75cf89u, 0xbd9d48a9u, 0xbdfb6800u, 0x3e0a59d3u, 0xbe68247bu, 0xbdaf6968u, 0x3e91f9e5u, 0x3e1733e6u,
+0xbdf3d7f4u, 0xbdc5f22du, 0xbe2c70acu, 0xbeef21bcu, 0x3f346881u, 0x3ddf067au, 0xbc4b7c70u, 0xbdfe263bu, 0x3dea688fu, 0xbaeab5c1u,
+0xbdd06daeu, 0xbd94d59du, 0xbcdcb238u, 0x3db805b9u, 0x3e0d3af6u, 0xbd7ceaa4u, 0xbd487431u, 0xbd90d9a3u, 0xbb855a37u, 0x3dad513au,
+0xbcdcbb46u, 0x3db34494u, 0xbdc071f3u, 0xbda47eacu, 0x3d8311c7u, 0x3d3ee67du, 0xbd23d709u, 0x3cc9a0d5u, 0xbcf5c6a9u, 0x3e33d88cu,
+0x3d4c8bc6u, 0xbdba0956u, 0x3dca46bcu, 0x3eb37623u, 0xbf0d7dabu, 0x3de11320u, 0xbcb69fb8u, 0xbd4921bau, 0xbe2ae9fau, 0x3dd66097u,
+0xbd46046cu, 0x3d3d117cu, 0x3eb482aau, 0xbea1a2a7u, 0xbe26ebe9u, 0x3e2194ceu, 0x3ccec175u, 0xbe7ff11bu, 0x3e6b455cu, 0xbe9e30dau,
+0x3e217969u, 0x3e2c1083u, 0x3e7a7258u, 0x3d3f5c46u, 0x3d24a2bdu, 0xbdd475b2u, 0x3e9ea277u, 0xbebfccd8u, 0x3e96a294u, 0xbe02223fu,
+0xbc5c2825u, 0xbe0943dau, 0x3e02ca3bu, 0xbe7cfafeu, 0x3dd2300cu, 0xbcebb339u, 0x3e7d99efu, 0x3c8b4e14u, 0x3c09e202u, 0xbf369c2cu,
+0xbcb090feu, 0xbde790b4u, 0xbe8071e4u, 0xbca2e12eu, 0x3e80cc11u, 0x3ea6630bu, 0x3e093f1du, 0xbdc0c1c8u, 0xba727756u, 0xbe57871au,
+0xbd7b737eu, 0xbe4ff932u, 0xbe8848ccu, 0xbe8569b7u, 0x3f30d97au, 0xbe9cf16eu, 0x3e55eb69u, 0xbec0ed96u, 0x3e6f4bc7u, 0x3e4943a9u,
+0xbca80bf6u, 0xbc537e17u, 0xbea7d518u, 0x3e94c19au, 0xbe669684u, 0x3ceb42b1u, 0x3e23f92bu, 0xbdadca55u, 0x3d706e38u, 0xbe38d2fcu,
+0x3c6b092cu, 0xbbb701e5u, 0x3dd2d95eu, 0x3e880946u, 0xbd39d120u, 0x3cec9a7eu, 0xbe741debu, 0xbd45d3abu, 0x3e06f7b3u, 0x3d8f6890u,
+0x3d311b3eu, 0x3d3afb25u, 0x3edd3acfu, 0x3c8506d2u, 0xbddbbb52u, 0xbf158ebdu, 0xbd100d03u, 0x3cb338edu, 0xbc279f62u, 0x3c8dd69eu,
+0x3d7f5f63u, 0x3daabe10u, 0x3c0b69dbu, 0xbd6b73d8u, 0xbdb07b72u, 0xbd955412u, 0x3e8e14b2u, 0x3d743c8bu, 0x3e880c7du, 0xbd8a68e6u,
+0xbe502cbdu, 0x3e2cee45u, 0xbed543bbu, 0xbf143638u, 0x3d65d316u, 0xbe444d03u, 0x3da5a9dbu, 0x3d291c6eu, 0x3d7c1bbcu, 0x3dbe49f1u,
+0xbdfc4643u, 0x3d689549u, 0xbb37a613u, 0x3bf92895u, 0xbd573c19u, 0xbdcaea31u, 0xbe890e94u, 0xbc4c330fu, 0x3de98878u, 0xbc457697u,
+0x3e93433bu, 0x3e663661u, 0x3d49d221u, 0x3efaa47eu, 0xbe4f1279u, 0xbe5d5b91u, 0x3ea44ed4u, 0x3ece5843u, 0xbe5c4e4cu, 0xbf0deb3cu,
+0xbd86318du, 0x3d9054e5u, 0xbd3018dbu, 0x3de9ef67u, 0xbe4a51f7u, 0xbe687efau, 0xbe77ac30u, 0x3e593354u, 0x3e847e14u, 0x3d261958u,
+0x3d9db9ceu, 0xbe735450u, 0x3e375c3cu, 0x3da4e78cu, 0xbe893129u, 0xbe33f83bu, 0x3e161e51u, 0x3e5cfb74u, 0xbc82b1f5u, 0x3dbd9ae2u,
+0x3ea5ca89u, 0xbdb82eb9u, 0xbd2fa678u, 0xbdb687b6u, 0x3f0a6798u, 0xbefd2682u, 0xbe741578u, 0xba46da6au, 0xbd91d2fau, 0xbe7768f9u,
+0x3b28a6bau, 0x3e213af4u, 0x3dab7c02u, 0xbed01b89u, 0x3e963779u, 0x3e9e7c0au, 0xbe11a55eu, 0xbd736653u, 0xbe32a742u, 0x3d48906fu,
+0x3cae0d3eu, 0xbd07f562u, 0xbe61091fu, 0x3e286381u, 0x3d98d836u, 0x3e412700u, 0x3d9409efu, 0x3e8f2c29u, 0xbd8817e1u, 0x3e137270u,
+0xbeb78d2cu, 0x3f0d0a89u, 0xbb5fbf23u, 0xbe4be6ebu, 0xbc3b8a6du, 0xbd860d4du, 0x3c8c1f2cu, 0x3de4998du, 0xbd99e87fu, 0xbd3faea4u,
+0xbdd922d3u, 0x3da155d2u, 0x3d8af985u, 0x3cc992a6u, 0x3d6f29f2u, 0xbdb5be51u, 0xbcd895dfu, 0xbd8dd245u, 0x3d1b6b1cu, 0xbd779e6du,
+0xbe10be6fu, 0x3e693c8au, 0x3cc98c38u, 0x3bfb358fu, 0x3ead15bau, 0x3d1677b8u, 0x3eab0792u, 0x3ecb1b59u, 0xbee6d440u, 0x3d0df094u,
+0xbf32fbbau, 0x3c418db0u, 0xbd4bcec7u, 0xbe389b3bu, 0x3cd621b4u, 0xbe3a4ebfu, 0x3cedb0ccu, 0x3e0b3b33u, 0x3e03f76du, 0xbd888696u,
+0x3e0c03aau, 0x3ccf3440u, 0xbd1f3326u, 0xbd2c9843u, 0x3da98492u, 0xbea09f15u, 0x3e6b43d0u, 0xbe5dc61eu, 0x3ef37d1eu, 0xbe3ec0a8u,
+0x3b188176u, 0xbe84a933u, 0x3db4d9fcu, 0x3e9c6359u, 0xbef2d9a0u, 0x3af4bb9cu, 0x3e06dc71u, 0x3e00e742u, 0x3dcc2da6u, 0x3e2da1bfu,
+0xbdaab072u, 0x3cd7a395u, 0xbe9d11f1u, 0xbded47b5u, 0xbb1c6280u, 0x3ea03259u, 0x3e59ad68u, 0xbe66593bu, 0xbe5cc0a9u, 0x3e1f09c8u,
+0x3cd73c7au, 0x3e9d9aa1u, 0xbe29034cu, 0xbe235060u, 0xbda7c8fbu, 0x3dff0d1du, 0x3c7c1f6au, 0xbe0c02b4u, 0x3d5a9932u, 0x3e81d276u,
+0xbcc94001u, 0xbe99f59cu, 0x3e599fe3u, 0x3e464729u, 0xbe83febfu, 0x3d62ef09u, 0x3d4749efu, 0x3e96f257u, 0xbec04244u, 0xbead5fe4u,
+0x3f0c3d79u, 0x3cf1e849u, 0x3d20cf5fu, 0xbe9cb732u, 0xbe78638du, 0xbe03169fu, 0x3eaf2d15u, 0xbe7f71f5u, 0x3e399fb5u, 0x3e15a463u,
+0xbeac1262u, 0xbc8534f2u, 0xbe756be7u, 0x3eccb72au, 0x3d125e21u, 0x3ccb443du, 0x3d2685b7u, 0xbb09de6au, 0xbd2900acu, 0x3e51b788u,
+0xbc87a12au, 0x3cb35f3eu, 0xbea6c6d9u, 0x3cad8b49u, 0x3d8174c9u, 0x3c8b5af8u, 0xbc1b0756u, 0x3d14b4b9u, 0x3e2874dau, 0x3e6ceae7u,
+0x3ea5b561u, 0x3d5a40eeu, 0x3cbf44d9u, 0x3e9dca71u, 0x3d242312u, 0xbe3a0aaau, 0xbdd0dcddu, 0x3df84b1eu, 0x3d8da871u, 0xbdbd05dfu,
+0xbd7991d6u, 0x3de96100u, 0x3e21c9cau, 0x3d538c89u, 0x3e22ce80u, 0xbd481454u, 0xbdbc3cd5u, 0x3d72416eu, 0xbe0e05cdu, 0x3df7552au,
+0x3d70f0b4u, 0xbd11c3a2u, 0x3d745294u, 0x3dbe9888u, 0x3bae2607u, 0xbdf094aeu, 0x3d2b3ac7u, 0xbd62a29eu, 0xbd21cd28u, 0xbde0ae28u,
+0xbd89b5bcu, 0xbc66ac78u, 0x3e218dbbu, 0x3d457b74u, 0xbe5920b5u, 0xbe3399e3u, 0x3e1969c1u, 0xbcd8ace2u, 0x3d0b6467u, 0xbc5fe8e4u,
+0xbde90dadu, 0xbebc8177u, 0x3e61ed06u, 0xbb41c512u, 0x3cea2f23u, 0x3d9100c3u, 0xbe2c26bau, 0x3d4ab369u, 0xbd671272u, 0x3dfa7b80u,
+0x3c21f954u, 0x3d4815cbu, 0xbdf50383u, 0x3d1fcd12u, 0x3d7e770au, 0xbdf370ecu, 0x3d982be3u, 0xbd772eadu, 0x3e44096eu, 0x3d5405f8u,
+0x3e03a17fu, 0xbd61091fu, 0xbd6185e4u, 0x3e820d2du, 0x3d98af97u, 0xbd97a227u, 0xbe6fb41du, 0x3df70757u, 0x3d4a09e3u, 0x3e16a296u,
+0xbd89e92cu, 0xbebbe94au, 0x3eadbc84u, 0xbcf6a037u, 0xbdf08530u, 0xbe556388u, 0x3d47930au, 0xbc0aed0du, 0xbc41033du, 0xbe2c600eu,
+0xbd557a8cu, 0xbda49ba6u, 0x3e0eca8fu, 0x3d096413u, 0x3bd93456u, 0xbc81d0c0u, 0x3ccb8899u, 0x3d186b35u, 0xbe2fafd7u, 0x3db24ed1u,
+0x3db54751u, 0xbd5e8b56u, 0xbd22f00cu, 0x3e082e2au, 0x3d329c2au, 0x3dcff1a5u, 0x3dc8bf8bu, 0xbda6f82du, 0x3bc2c404u, 0x3e22899au,
+0xbd76abdbu, 0x3d804863u, 0x3d3a0604u, 0xbd52adebu, 0x3d490524u, 0xbd1a02d6u, 0xbe0f0c97u, 0x3d0e5d7au, 0x3eadd24eu, 0x3dfe46eau,
+0xbd515ba8u, 0xbe25d2d6u, 0xbcb84d53u, 0x3ecb8c73u, 0xbe2065f5u, 0xbe873344u, 0x3e0dc470u, 0x3e5de3ddu, 0x3d1799afu, 0xbdeafe38u,
+0xbdca1c2du, 0xbd8b108eu, 0xbd11d240u, 0xbe107ab5u, 0x3e027270u, 0x3d033abbu, 0x3d4b34b7u, 0xbd117a51u, 0xbd77e21eu, 0x3c871f78u,
+0xbd5b0ed0u, 0xbdffc51eu, 0x3cee216cu, 0x3da1d3dbu, 0x3c82b925u, 0x3de5bd8du, 0xbb94acfau, 0xbd352a5cu, 0x3e1fd21bu, 0xbdbce651u,
+0xbe910febu, 0xbdb62d25u, 0x3e41be54u, 0x3dadea43u, 0xbe5c7e2au, 0xbc4e4e1eu, 0xbde17cb3u, 0x3d9045b7u, 0x3da76411u, 0xbe8897c2u,
+0x3d8832f0u, 0x3d13522bu, 0xbd8c902cu, 0xbd8c7736u, 0x3e5354eeu, 0xbd349f2au, 0x3ba64eedu, 0xbd1ecf98u, 0x3d99b872u, 0xbc867f71u,
+0xbd67f449u, 0xbced3d14u, 0x3ddbff6fu, 0x3a289a0au, 0xbd5df69fu, 0x3d838837u, 0xb97d08a6u, 0xbcb6e018u, 0xbe00b18fu, 0xbc1cc744u,
+0x3db3999cu, 0xbdd055f6u, 0xbe43123eu, 0x3b0d39f5u, 0x3e7bae89u, 0xbe0bd6b4u, 0xbe24983cu, 0xbd57b09eu, 0x3dea1a8eu, 0x3e5ad91cu,
+0x3dcff401u, 0x3d74e6cfu, 0xbe7e84afu, 0x3bfd8951u, 0x3d289a1cu, 0xbafb7b38u, 0x3da4aa75u, 0x3e17a4a8u, 0x3cabbe8du, 0x3e585726u,
+0xbd9bfd1du, 0xbc865f86u, 0x3cc50935u, 0xbe06947au, 0xbdc113e9u, 0x3d4b9e4au, 0x3dfcdb59u, 0xbdbf5773u, 0xbd8ee9e9u, 0x3dc3a568u,
+0x3d806f17u, 0xbdfb8193u, 0xbd066822u, 0xbdb8258eu, 0x3d653de4u, 0x3cf0df72u, 0x3d992c07u, 0x3d85ec6fu, 0x3ce5eac7u, 0xbd388341u,
+0xbd3b62e1u, 0x3d11ada3u, 0x3d8a8902u, 0xbe6285edu, 0x3c694af5u, 0x3e56ba22u, 0x3e7053cfu, 0x3dac845au, 0x3e234d8bu, 0xbdd29485u,
+0xbd2d8864u, 0x3d5ad23fu, 0xbd3840ccu, 0xbd6955c1u, 0xbe45b2dfu, 0xbe087547u, 0x3e0dd2b4u, 0xbd926a39u, 0xbd1d7365u, 0xbdb16711u,
+0xbe2044bbu, 0xbd171414u, 0x3e0dd09cu, 0x3ea307bau, 0xbe1d8186u, 0xbd8deeb3u, 0x3dc19988u, 0x3b3525fbu, 0xbbe69019u, 0x3d4182b8u,
+0xbe12e8f1u, 0x3d38e561u, 0xbe053537u, 0x3e3926cbu, 0xbd84075fu, 0xbe801981u, 0xbde7644bu, 0xbdcdb8bcu, 0xbe165e61u, 0x3e24e9b6u,
+0x3e17a0f0u, 0xbe9716bdu, 0x3e35857cu, 0xbd9900e4u, 0xbd0f4541u, 0x3dbe6ff9u, 0x3e085752u, 0xbdc21f19u, 0xbd5b6339u, 0xbe100663u,
+0x3e4bbf2fu, 0x3c484c19u, 0x3c2f6a44u, 0x3e1a2ed2u, 0xbd3d57e2u, 0xbc8db58eu, 0xbd7d2256u, 0x3cf9864au, 0xbc9213a2u, 0xbdb93cd0u,
+0x3dbf8717u, 0xbe9cb453u, 0x3e37461au, 0x3ed71260u, 0xbdb1dc5eu, 0xbe1495f0u, 0x3cf51503u, 0x3e64d643u, 0xbd44b20fu, 0xbdae90feu,
+0xbdab1e08u, 0xbcd876d7u, 0xbecaba86u, 0x3ddbcabeu, 0x3ca9d0d6u, 0xbd894db3u, 0x3d7a71d5u, 0x3e018930u, 0xbdddd80eu, 0x3d9953f0u,
+0x3df4cf25u, 0x3bb18a53u, 0xbe31435bu, 0x3e1d2771u, 0xbdfcca73u, 0x3e80149fu, 0x3e22ff48u, 0x3d91dcf9u, 0xbdf7b39fu, 0xbdb05e2du,
+0xbe1a690du, 0x3d88f5beu, 0xbe1b8042u, 0xbe11ac74u, 0x3e156758u, 0xbb7a498du, 0xbe4b215fu, 0xbe73dc03u, 0x3d8433b7u, 0x3bfd6bf8u,
+0x3e251d7cu, 0xbdca6443u, 0x3d3c6428u, 0xbcee609cu, 0xbd65137fu, 0x3eb5dc24u, 0x3c654390u, 0x3d27c2e7u, 0x3e0abd08u, 0xbc80c86cu,
+0xbda18499u, 0x3e0a362du, 0xbd099ea5u, 0xbe62b9ebu, 0x3dea4953u, 0x3d386df5u, 0xbdddb7f4u, 0x3e04a497u, 0x3d4b5cd5u, 0xbcf5c360u,
+0xbc80c6ecu, 0xbcdde6a5u, 0xbe35d9e9u, 0xbdc851d3u, 0xbe29ed71u, 0xbb163829u, 0x3d68c330u, 0x3df09307u, 0x3d01285bu, 0xbd00c174u,
+0xbd9164bdu, 0xbe0bf8adu, 0x3e0ad27eu, 0x3bd0419bu, 0xbdea84a9u, 0x3d2fbdd0u, 0x3d8763aeu, 0x3c8068b9u, 0x3e2bc8dbu, 0xbdd9f908u,
+0xbb202baeu, 0xbdc2967eu, 0xbc8e0335u, 0x3c4ca066u, 0x3e6787fbu, 0x3ddecab8u, 0x3d54eb6fu, 0xbcf41eccu, 0xbd5f3e38u, 0x3d224c8eu,
+0xbd81e7fbu, 0x3d8dfb7cu, 0xbd05138au, 0xbd1b620eu, 0xbdc425bdu, 0xbd43d891u, 0xbde99a7du, 0x3e3aca02u, 0x3ceffb65u, 0xbd7fef63u,
+0x3d59ac2du, 0xbe40c442u, 0x3d6fb759u, 0x3cb1c0ffu, 0x3d6395ccu, 0xbdf4bad8u, 0x3df2434bu, 0x3c91733cu, 0x3c461e2du, 0x3e598e7au,
+0xbe12c10eu, 0xbee27017u, 0x3e56a8a2u, 0x3e294651u, 0x3b21385cu, 0xbd112eecu, 0xbdc0c3c1u, 0x3e497eb5u, 0xbd9d798fu, 0xbd020348u,
+0x3e762914u, 0xbd503aaau, 0x3e11005cu, 0x3d20d27fu, 0xbd951962u, 0xbe2b6c63u, 0x3e358e22u, 0xbd927d34u, 0xbe04ca38u, 0xbdf440a2u,
+0x3e3e526eu, 0xbdc402bau, 0x3eb7fb59u, 0xbe9537a5u, 0xbcc003c7u, 0x3da8ed80u, 0x3e3f7b45u, 0x3e11f8a2u, 0x3d946f3cu, 0xbe389807u,
+0x3d7ed0b4u, 0xbe31231fu, 0x3d779032u, 0xbe9e07e3u, 0x3e77b01cu, 0x3d9307eeu, 0xbcdaa0b8u, 0xbe19fb33u, 0xbe39c306u, 0x3d82e584u,
+0xbccff8b0u, 0x3de0d579u, 0xbd97edc9u, 0xbe872e17u, 0x3c503accu, 0xbddec8f9u, 0xbd8d58ebu, 0x3bc66e4fu, 0x3dc8376cu, 0x3df690ecu,
+0xbe1e8adfu, 0xbe814865u, 0x3e0a0771u, 0x3e2d6be7u, 0x3e2bc243u, 0xbe1412cbu, 0xbe556aefu, 0xbcb99171u, 0xbdb48954u, 0xbe74a5deu,
+0xbd90cb96u, 0x3e3b1ecbu, 0x3e240854u, 0x3e0375d3u, 0x3d9e6f10u, 0xbddea9beu, 0x3e957ccau, 0xbe762ddau, 0x3dd92159u, 0xbe1ab95au,
+0x3903c32bu, 0xbe28b021u, 0x3c8bafd9u, 0x3dc7ae32u, 0x3d25d1d4u, 0xbe0e46e4u, 0x3d278fdcu, 0xbd64858du, 0x3e1d1118u, 0xbe192c2du,
+0x3e0e2ec0u, 0x3d996bf4u, 0xbe72c6e1u, 0x3dc3388fu, 0xbcd94f19u, 0x3d1eddb5u, 0x3dda87cau, 0x3e130f0eu, 0x3e9d72dbu, 0xbdd2fd26u,
+0xbd1d5925u, 0xbe668fc0u, 0x3dea61f3u, 0xbe8e7864u, 0x3e08bcadu, 0xbbcb47d3u, 0x3d71d8bdu, 0xbdf049d7u, 0xbdeec548u, 0xbc24b278u,
+0x3e883e93u, 0xbbac690au, 0x3da3e64cu, 0xbe643bb7u, 0xbcc7d7f8u, 0x3dab2c0eu, 0x3ede1884u, 0xbec3b2c3u, 0xbd79c62bu, 0x3ea062ceu,
+0xbe0773f1u, 0xbe041d97u, 0x3e7dd190u, 0xbe3e995au, 0x3e8e85deu, 0xbea46006u, 0x3de463e9u, 0xbe3a0dfau, 0x3daeab31u, 0xbd9c68c7u,
+0xbe6f6f90u, 0xbcad44ceu, 0x3dee0df3u, 0x3c9aab43u, 0xbdd27ad0u, 0x3d9496cbu, 0xbe1e7c7eu, 0x3dec63bcu, 0x3df765afu, 0x3ed3c336u,
+0xbf0e349du, 0x3e2aa926u, 0xbde96812u, 0x3f02ffd4u, 0xbdf4755eu, 0x3d26e813u, 0xbb1fd262u, 0xbe724c7cu, 0xbd6983c8u, 0xbe0df278u,
+0x3d02f802u, 0x3e00d2c0u, 0x3de7083fu, 0x3e5d74ecu, 0xbd0a6f20u, 0xbda0bc8cu, 0xbcc98f73u, 0x3d22c198u, 0x3e5b4e13u, 0x3ddac62cu,
+0x3e6260beu, 0xbebd3636u, 0xbd38053bu, 0xba4ad978u, 0xbd3518a1u, 0xbda7ac78u, 0xbd7cf797u, 0xbe0bf616u, 0x3dfc926du, 0x3eaf6350u,
+0xbcfddd7cu, 0xbda47a78u, 0xbe905ccau, 0x3e0169cbu, 0x3e15f1d2u, 0x3e0cb5acu, 0x3e575c7cu, 0x3e241bd3u, 0x3d862c0du, 0xbe13c555u,
+0xbe2bf0c6u, 0xbd9b324eu, 0xbd22ce64u, 0x3e045e07u, 0xbe87ef94u, 0xbca9a3e5u, 0x3d7137a1u, 0x3e0608c7u, 0xbcf32105u, 0x3e858dabu,
+0x3c94c02au, 0xbddb9317u, 0xbd3b6b3eu, 0x3dcde67fu, 0xbd75c6a8u, 0x3dae1024u, 0xbdd1094cu, 0x3cd606ddu, 0xbdf985e7u, 0xbc83e6ccu,
+0x3e75bbafu, 0xbd663d4eu, 0x3cb40858u, 0x3decabc1u, 0xbd684165u, 0xbe0a5872u, 0xbe8a51e8u, 0x3e522d53u, 0x3cd46bd8u, 0x3e2ff19eu,
+0xbdaf39a1u, 0xbcc325d8u, 0x3dbd8f2fu, 0x3bf392f5u, 0x3c85acb5u, 0x3d16d2d8u, 0x3daef2c0u, 0x3da669c4u, 0xbe9963f6u, 0x3d25c107u,
+0x3c8fe87cu, 0x3e97a4e4u, 0xbd98620bu, 0xbd603f5bu, 0xbe62fceeu, 0x3e2bb7e3u, 0x3e14c8d7u, 0xbe8d1d43u, 0x3e3ebe1au, 0x3da4ede6u,
+0xbdf0aa28u, 0xbd72b432u, 0xbcbe1513u, 0x3ec23629u, 0xbcffe43bu, 0x3c9047c4u, 0xbd9690bbu, 0x3d94b353u, 0x3dfc6a26u, 0x3dacf226u,
+0xbdfc3fbfu, 0xbdd2b5cdu, 0x3ecaf56fu, 0xbe47296bu, 0x3cd79665u, 0xbde8417cu, 0xbc1cbbf1u, 0xbe6b3bc6u, 0x3ea69e36u, 0xbe7bdc10u,
+0x3e3b0323u, 0xbeff06e7u, 0xbce6dbbbu, 0x3b9de5a5u, 0x3c957fa4u, 0x3e53e464u, 0xbc52255eu, 0x3d9da7b4u, 0xbe8567c8u, 0xbd23ffd6u,
+0xbe0abd7bu, 0xbe9bc61fu, 0x3ca40109u, 0x3dc367b7u, 0x3dcf04b1u, 0xbcbcb780u, 0xbe02ce98u, 0xbe14370fu, 0xbe6dfb07u, 0x3eb2331bu,
+0x3bd8df71u, 0x3aaf2a4eu, 0x3d3f9176u, 0xbc220eaau, 0xbd8c7901u, 0xbd50dc71u, 0x3c3a9a94u, 0xbd1dbd5eu, 0xbd91696du, 0xbe26b3a2u,
+0x3d2a5dfau, 0x3dec0c7bu, 0x3ccf03c5u, 0x3d8744ecu, 0x3cc93e6au, 0xbd9741dbu, 0x3c87449au, 0x3e2861ffu, 0xbc00f77cu, 0xbd317778u,
+0xbde7da74u, 0x3d1bf16du, 0x3bc1b3d5u, 0xbde566c1u, 0xbdaf174au, 0x3d70d378u, 0x3e7242beu, 0x3e03da60u, 0x3d45df31u, 0xbd1265f0u,
+0x3d86f67du, 0xbbfb3597u, 0x3d251568u, 0x3ded3da2u, 0x3d1b532fu, 0x3e38d6aeu, 0xbdbf8d94u, 0xbd26fbb0u, 0xbda7927bu, 0xbe02d2f4u,
+0xbd1f3c65u, 0xbd08d6d0u, 0x3dc93136u, 0xbdc1c7e0u, 0xbbc9dbc9u, 0x3d15b908u, 0xbdbe5c43u, 0x3d8c2e72u, 0x3be9789au, 0x3c8aced8u,
+0xbe88922eu, 0x3d71a96cu, 0xbdb89356u, 0xbd35db94u, 0x3e24d8f2u, 0x3db26dabu, 0x3e2c6a8du, 0x3c9e27a9u, 0xbda7344du, 0x3d87fdfau,
+0xbdc23c92u, 0x3d55c3aau, 0xbda98431u, 0x3dafd59cu, 0xbdb0d714u, 0x3d26209au, 0x3e38ccd6u, 0x3d8f50bau, 0xbe2d1ac3u, 0x3dd260cau,
+0xbd11e013u, 0xbe373186u, 0xbe448319u, 0x3bf48d66u, 0x3d40ff37u, 0xbd0db1f8u, 0x3e2302d1u, 0xbe1ee6ceu, 0x3d12111eu, 0xbe6b9a7du,
+0xbd320153u, 0x3e89630du, 0xbe5a6c1fu, 0x3e279fb9u, 0xbe868965u, 0xbd7bbac6u, 0x3d90df52u, 0x3eb51043u, 0x3e5b02c7u, 0x3ee6ed22u,
+0x3c0f4d2bu, 0x3de940bcu, 0xbbc8ab5eu, 0xbe3bbbcfu, 0xbdccc2c7u, 0xbdf64935u, 0xbcba49c5u, 0xbe3feff9u, 0x3e13949au, 0x3e4aa138u,
+0x3d3b22d3u, 0x3bf218a2u, 0xbcc9c7d5u, 0xbd9f672bu, 0xbe01987fu, 0x3d56a7b2u, 0xbe1eea3du, 0x3e68188cu, 0x3dd9951du, 0xbd597d1bu,
+0x3e33c922u, 0x3d45ca5cu, 0xbd48e011u, 0x3d9f1914u, 0x3ccc7469u, 0xbc92427du, 0x3d4761fdu, 0x3c623b06u, 0x3bfe4393u, 0x3d91cbd4u,
+0xbd3fedbfu, 0x3d115595u, 0x3e366794u, 0x3e413d4bu, 0xbd5f1578u, 0xbeaed834u, 0x3d5f2cfcu, 0xbca78f76u, 0x3e17dd19u, 0xbda86f33u,
+0x3cb9ec06u, 0x3da83bb4u, 0xbd639d37u, 0xbda51be6u, 0xbca00740u, 0x3e0037eeu, 0xbd9b69f6u, 0xba293a84u, 0xbe12a2f5u, 0xbc85210bu,
+0x3d92000bu, 0xbda08629u, 0xbdb800beu, 0xbdea11a9u, 0x3caca460u, 0x3d7ba834u, 0x3e5c94d8u, 0x3e29797bu, 0xbe1e4cd1u, 0x3d47266au,
+0xbd024cf4u, 0x3e7eb4bcu, 0x3d8c5ef3u, 0xbab2410bu, 0x3e236c62u, 0x3c05451du, 0xb88d429cu, 0xbdcf49b5u, 0xbe3bbbc7u, 0x3c807598u,
+0xbd330bcau, 0xbdcfe395u, 0x3aceb408u, 0xbbfcef58u, 0xbda36500u, 0x3d9cfa01u, 0x3c13c295u, 0xbe8e5f20u, 0xbcc175fau, 0xbd64b6a0u,
+0x3ceaa813u, 0xbb44cb38u, 0x3d9fe8c1u, 0xbe17f439u, 0xbd11f4b1u, 0xbe421accu, 0x3daf7375u, 0xbecd1ec3u, 0xbd832053u, 0xbdef9a13u,
+0x3e6933bau, 0xbe1f1fdbu, 0x3d0f1327u, 0xbca3a9a2u, 0x3e504bf7u, 0x3cd200b6u, 0xbd9c5c9bu, 0xbd7c50afu, 0xbe46ba0eu, 0x3b7ed896u,
+0x3da9dc76u, 0xbe64ae60u, 0x3cf5a3b5u, 0x3eb6ee97u, 0x3d332d95u, 0x3e41b74cu, 0xbe9f02bfu, 0xbcd58a17u, 0x3e9720f9u, 0xba97ff8cu,
+0x3e8b4948u, 0xbd01cd58u, 0x3df34f85u, 0x3daf6461u, 0xbe96bcacu, 0x3d8e3b90u, 0xbe994d64u, 0xbe076d87u, 0xbd65b4b3u, 0xbdc5fe29u,
+0xbb8ad4abu, 0xbc8f362fu, 0x3d8451b7u, 0x3c88dfbfu, 0x3dfcc65au, 0xbdfab12fu, 0xbe122285u, 0x3bdab4bbu, 0xbdf5a644u, 0xbdb81767u,
+0x3d8420abu, 0xbd85f73fu, 0xbd830b70u, 0xbe47af15u, 0xbe826e4du, 0xbde3514cu, 0x3d0a66cfu, 0x3e0cdc8du, 0x3e15b4f5u, 0x3d07f268u,
+0x3d1b12c9u, 0xbc9d0039u, 0xbd134261u, 0x3e65ab69u, 0x3b198c27u, 0x3bbb01d6u, 0xbe07cb47u, 0xbce0eb3cu, 0x3d0e986au, 0xbda35070u,
+0xbd7f0717u, 0xbe2d1883u, 0x3d71207fu, 0x3d386912u, 0x3cf8bbb6u, 0x3de1a611u, 0x3e02b823u, 0xbd1eeaa0u, 0x3d560aa7u, 0xbd9ea966u,
+0x3cd9dd79u, 0xbd3f3d7fu, 0xbde6e2ddu, 0x3c2635f5u, 0xbd83107au, 0x3ca81c05u, 0xbf09c41au, 0x3d8aeee4u, 0x3d01bdfeu, 0xbedb19c8u,
+0x3c7f17adu, 0x3e0e77c4u, 0xbdbd3945u, 0xbd877365u, 0x3cbe3047u, 0xbe3d931cu, 0xbe179132u, 0xbd6e4acdu, 0x3de37712u, 0xbd86613eu,
+0x3dc5e88cu, 0xbd31f529u, 0x3e83e41cu, 0x3d9a2f42u, 0xbb3a6926u, 0xbe0df0c6u, 0x3daaa3aeu, 0xbda54c9bu, 0x3ec57a89u, 0x3e80a9f3u,
+0x3cea59edu, 0x3d9e38f5u, 0x3d6e5905u, 0x3bccc610u, 0x3e4238beu, 0xbd2b4915u, 0x3d5115e6u, 0xbe210c2eu, 0xbe057fd8u, 0x3dec4ab1u,
+0x3cbb1976u, 0xbd7e51e4u, 0xbd86acd6u, 0x3d9567a3u, 0xbe254a3bu, 0xbd6a9cecu, 0xbebcdbd5u, 0x3e2d3ad3u, 0x3d7906afu, 0x3c05b948u,
+0x3d383183u, 0xbae18dc7u, 0x3e7fe44fu, 0x3d1370f7u, 0xbd368c0bu, 0xbd6f2a72u, 0xbd574d4bu, 0xbc9d5f67u, 0xbdd7370au, 0xbe4f491bu,
+0xbd62a181u, 0xbe5261b8u, 0x3d677f47u, 0x3ba2f0d4u, 0x3c6315f1u, 0x3e877b76u, 0x3d20d323u, 0x3dc5b4c5u, 0xbc096e64u, 0xbd04c342u,
+0x3e29935bu, 0x3da942b6u, 0x3dd30d50u, 0x3b984ef9u, 0x3dc12bdbu, 0x3c07a585u, 0xbbf871f3u, 0x3cd34dd3u, 0x3d9d7128u, 0xbd9d4a30u,
+0x3dab4afcu, 0x3de38ec7u, 0x3dd2980au, 0x3d8f8c31u, 0xbde3f5c1u, 0xbe15611au, 0xbdec74a8u, 0xbc1e7090u, 0xbe9ebae7u, 0x3dbf30b1u,
+0xbd250407u, 0xbe1300b6u, 0x3db16cbeu, 0xba7c211cu, 0x3e163bc0u, 0x3cd6631au, 0x3ddca9abu, 0x3dea82b7u, 0x3ca90ee6u, 0x3e550a6fu,
+0xbdd0e8e5u, 0xbdfa6a08u, 0xbd682584u, 0xbddb3973u, 0xbe25c676u, 0x3df0b59du, 0xbd78030bu, 0x3d713a34u, 0x3e3daf6cu, 0x3d8da7e6u,
+0xbd2552bfu, 0xbcee3f3eu, 0x3c8cc9d7u, 0xbe100504u, 0xbe92916au, 0xbebe2004u, 0xbe00a74au, 0xbd915ac2u, 0xbd516725u, 0xbe2286a8u,
+0xbcbf5ab1u, 0x3e1fb3eau, 0xbd3df996u, 0x3e212e73u, 0x3dbafdb0u, 0x3d1c9165u, 0xbd83cf52u, 0xbdbb9de1u, 0xbd9619d6u, 0x3d8d96b0u,
+0xbe959a94u, 0xbbfb65bcu, 0x3d76d18bu, 0x3e4e128du, 0xbdd76fc4u, 0x3e0a1c8eu, 0xbe00c366u, 0xbcb2eff8u, 0x3db2fb8cu, 0x3b6ce41bu,
+0x3d1a5449u, 0x3dfdc3ecu, 0xbe3fff8eu, 0x3e1c51a8u, 0xbc17f5d4u, 0x3e771c23u, 0xbc96c026u, 0xbe0f6a7eu, 0xbdaad91fu, 0x3e085f0du,
+0x3d19dcefu, 0x3c99f817u, 0x3dea0a5bu, 0x3e7bade4u, 0xbd3b1aeau, 0x3d1baf60u, 0xbe2259afu, 0xbe289e45u, 0xbdf51ed5u, 0xbe10c25au,
+0xbe56b4bau, 0xbd1cb564u, 0x3d151326u, 0xbe61922cu, 0xbd218eddu, 0xba97e126u, 0x3d726e96u, 0x3d5aed6fu, 0xbbd86253u, 0x3e94358cu,
+0x3e82ac07u, 0x3dd540d6u, 0x3e3fc65du, 0xbdd3d16cu, 0x3cca1d5bu, 0x3d69d1cfu, 0x3b88814cu, 0x3df81399u, 0xbdbd0b24u, 0xbd487751u,
+0xbd5d34ecu, 0xbd843926u, 0xbdc55222u, 0xbc122bcdu, 0x3cbf3e4au, 0xbc7bc8d3u, 0x3da1b6afu, 0xbd856a2bu, 0xbe18a2b5u, 0xbec7824cu,
+0x3eae8d5bu, 0x3e29c5cfu, 0x3d9060c4u, 0xbbeee415u, 0xbe088ebau, 0xbd5fa9e6u, 0x3dd391dfu, 0xbe23ddf1u, 0xbe6ad11fu, 0x3dfd5698u,
+0xbd109195u, 0x3dcbeb80u, 0x3dcd0e47u, 0xbd56c95fu, 0x3d89bd9eu, 0xbe482c1au, 0x3de5465fu, 0xbdbc8892u, 0x3e901f6fu, 0xbe17bfe2u,
+0x3d27fc3bu, 0x3db1987eu, 0xbd760c6eu, 0xbde5174bu, 0x3e33af20u, 0xbd4f8fa8u, 0x3dc36201u, 0x3d05e460u, 0x3d0c23adu, 0xbe0afc27u,
+0xbe4ed878u, 0x3da50f0bu, 0x3c89c28fu, 0xbcf8c7e9u, 0x3e0fd14fu, 0x3ebabe8bu, 0xbcd297b3u, 0x3d2c401bu, 0xbe01c218u, 0xbeb57ee9u,
+0x3dda76e0u, 0xbcf51ef7u, 0xbdb408fau, 0x3dc10e6cu, 0x3db757ebu, 0x3cf09cbdu, 0xbcd8d566u, 0x3cc4f9d0u, 0x3e7e8700u, 0xbe33932bu,
+0xbd6eeabdu, 0x3cc4db41u, 0x3e0dc751u, 0xbd310ecfu, 0x3e205beau, 0x3e01a3d4u, 0xbdc6f088u, 0xbe7a5f35u, 0xbd56fa87u, 0x3ded99d4u,
+0x3e059d67u, 0xbd61eec6u, 0x3e5c5f57u, 0xbe7ec29du, 0x3e0cd0c8u, 0x3de8c839u, 0x3ca7cf09u, 0x3c8480d5u, 0x3d7cb6afu, 0x3e138597u,
+0x3dc3ae78u, 0x3ed4b9aeu, 0xbd876f74u, 0xbd29974eu, 0xbe1f61dbu, 0xbdc0ccc2u, 0xbd474c96u, 0x3db6a40eu, 0xbdcfe4efu, 0xbc638a0fu,
+0xbe286209u, 0xbd5af2c2u, 0x3e021515u, 0x3e56da92u, 0x3d86bdbbu, 0xbc755531u, 0xbda137ecu, 0xbd1666dau, 0x3cc8aa9fu, 0xbe361892u,
+0x3e0d63fau, 0x3da92d6cu, 0x3d920484u, 0xbd743390u, 0xbd74a6fau, 0x3d8abf8cu, 0x3dda14ebu, 0x3d6cec0fu, 0x3dcae829u, 0xbefbe9e2u,
+0x3b1ef296u, 0xbde90960u, 0x3c71bf1eu, 0x3d896c94u, 0xbdd0a56du, 0x3e173259u, 0x3e147e16u, 0x3eed1e6cu, 0xbe46f01eu, 0xbd0ccc94u,
+0xbe1f5dbau, 0xbe222915u, 0x3d75f602u, 0x3c638470u, 0x3d616122u, 0x3d2daa6cu, 0x3e7b2bf9u, 0xbe1a4a11u, 0x3dae4abfu, 0xbde333a1u,
+0xbe8aa41fu, 0x3cd81ab5u, 0xbe9e16ceu, 0xbe3ff232u, 0x3d2a978bu, 0x3e773356u, 0x3e0764bau, 0x3e17bcf9u, 0xbdcc86e7u, 0xbdb08996u,
+0x3d4bb57eu, 0x3daf147fu, 0xbe13b776u, 0x3d4b5301u, 0xbdab6b74u, 0x3d45a64eu, 0xbcf67aa5u, 0x3ced1644u, 0x3de89ccbu, 0xbd2a5220u,
+0x3e9643bau, 0x3e440a7cu, 0xbdb6d37cu, 0xbe1a61a5u, 0x3e574cdeu, 0xbd876419u, 0x3dd11f23u, 0x3e7a8500u, 0xbe0a0c46u, 0xbe32b79du,
+0x3d219ccbu, 0xbd6be52cu, 0x3e2ba0fbu, 0xbda3b946u, 0x3c38533bu, 0xbdc47e7bu, 0xbe301d8fu, 0x3e0bd1d3u, 0x3d84c10au, 0x3cf3d51du,
+0xbdedff87u, 0xbe4d87e0u, 0xbe9b4958u, 0x3d0179ceu, 0x3a993ebfu, 0x3e2934dcu, 0x3db9b425u, 0x3d4836feu, 0xbd2763b1u, 0x3e21b4bbu,
+0xbe1f63e6u, 0x3ee6f9e7u, 0x3c9f1067u, 0xbc876002u, 0xbe3f17a7u, 0xbc9bdcf8u, 0xbb568e25u, 0xbce73cb0u, 0xbc03a7afu, 0xbea19c78u,
+0x3e70870bu, 0xbccdd7f3u, 0x3e71e9d7u, 0xbe799123u, 0xbce08cb3u, 0x3e383e59u, 0x3eb1fc5cu, 0xbdfb0cc3u, 0x3e8d3636u, 0xbe0bda1du,
+0xbe91c447u, 0xbe9b1ed9u, 0xbe89958cu, 0xbb9492d7u, 0x3c459b2eu, 0xbe12bf6cu, 0xbdee06a1u, 0x3daf7b28u, 0xbe39a0fbu, 0xbe3cb92du,
+0xbcec35efu, 0x3e05a0aau, 0x3e3a0c6au, 0xbdd6476du, 0xbe17e1afu, 0xbd75e25bu, 0xbde24e06u, 0x3efc9d84u, 0xbcaa37bfu, 0x3d0ace31u,
+0xbc9d926cu, 0xbda74bb0u, 0x3d66033bu, 0x3d90da6du, 0xbdb16afbu, 0x3e8aa7a5u, 0xbe2b8cf7u, 0x3d6af05eu, 0xbd9473e2u, 0xbea7c8f0u,
+0xbdc8af7cu, 0xbeeb155bu, 0xbe02ee6bu, 0x3cd496c0u, 0xbdc13b81u, 0x3e4e29fau, 0xbbfb7516u, 0x3dd16c83u, 0x3e2b0559u, 0xbc720cd4u,
+0x3d698705u, 0x3d8611e4u, 0xbd743754u, 0xbc5b6113u, 0xbda03574u, 0xbdeebe54u, 0x3d2982a2u, 0x3bf2a951u, 0xbd552e63u, 0x3d596fa7u,
+0x3da587cfu, 0xbc40b24cu, 0xbe46c5b6u, 0x3dd0e3d2u, 0x3dfd24deu, 0xbac45f90u, 0xbe10cf7bu, 0x3d840a6cu, 0x3d1271a5u, 0xbd0580e5u,
+0x3d0b05e8u, 0x3df3b253u, 0xbd1217e6u, 0x3e0fde42u, 0xbcbafd37u, 0xbcfe45a0u, 0x3cde718fu, 0x3e864499u, 0x3e1b7218u, 0xbd4292e3u,
+0x3c71bfe5u, 0xbd3c02dbu, 0xbd67ba46u, 0xbb0d3ed1u, 0xbe004d1au, 0xbcf8892fu, 0x3d956494u, 0x3da3278du, 0x3bb20aa7u, 0xbd33fa3fu,
+0x3e519e4bu, 0x3de95621u, 0xbd32ea5fu, 0x3dec20c2u, 0xbe29e10bu, 0x3d6fece1u, 0xbd93989au, 0xbd07bce2u, 0x3bb4f546u, 0xbe08b25au,
+0xbd8e73dbu, 0x3e3dd8c0u, 0xbd6a81afu, 0x3e01ab31u, 0xba6022a7u, 0xbc181867u, 0x3d083578u, 0x3dbd0ecbu, 0xbdf2cbf3u, 0xbe2e2d27u,
+0x3c925d51u, 0xbcf9867fu, 0x3d7ce8f2u, 0xbb32c217u, 0xbe554fc9u, 0xbd87c310u, 0xbeabfb46u, 0xbcd36bf5u, 0x3e0c024fu, 0x3d8fb072u,
+0xbd005d25u, 0x3e143055u, 0x3e06b2dfu, 0xbcc9b0d0u, 0xbdbfcd46u, 0x3e18f80cu, 0xbe2354a2u, 0xbd83d9acu, 0xbcffc805u, 0x3c3bd313u,
+0x3d82bf37u, 0xbdb38838u, 0x3c568a46u, 0xbd5eec54u, 0xbdb8d50fu, 0xbdb0f21du, 0x3dde2b7du, 0x3e15e678u, 0x3c1dcce7u, 0xbd0a596bu,
+0xbe21d219u, 0xbcf0e18eu, 0xbbd81c74u, 0xbee4f1b9u, 0xbd1c317du, 0xbc55832bu, 0xbe25493eu, 0xbde559b2u, 0xbdc0685eu, 0xbe32314bu,
+0xbe1a3adfu, 0xbdbc322fu, 0x3e6138e7u, 0x3de54145u, 0x3e274c50u, 0xbdb46276u, 0xbd951881u, 0x3d8d66d4u, 0xbde5fc10u, 0xbdbcde96u,
+0x3d386d85u, 0xbd9d35cbu, 0x3da6f92du, 0x3d27eb80u, 0xbc573a80u, 0xbc757f21u, 0x3d8a3b32u, 0xbd39e9cdu, 0xbda78d12u, 0x3d93196bu,
+0x3d28b8c6u, 0xbe31bce6u, 0xbb6eeabcu, 0x3e209f7du, 0x3e1e7cf1u, 0xbcbdb6bcu, 0x3d917544u, 0x3dc4324du, 0x3cd0cdecu, 0x3e09f412u,
+0x3c49c7fau, 0xbdea9907u, 0xbd1614a8u, 0x3b231dbcu, 0x3cb6c835u, 0xbe2b1987u, 0xbc98d531u, 0x3c84233cu, 0xbe02d40fu, 0x3e05d91bu,
+0xbb0b53ddu, 0x3d13e586u, 0x3dfc8e4cu, 0x3d29cc74u, 0xbd0e3a1eu, 0xbe0cd1e6u, 0xba16714du, 0x3dbd17fcu, 0xbdd44e66u, 0xbda4f1e9u,
+0x3dc19a99u, 0x3cd98c63u, 0x3e05092au, 0x3bd2077du, 0x3d4cf41cu, 0x3c1981f5u, 0x3e34adbeu, 0x3d913370u, 0x3e012668u, 0xbdcb9438u,
+0x3d9a20f7u, 0xbe164a16u, 0xbd1a5137u, 0x3c206d54u, 0x3cbd0fa3u, 0xbeb47e9du, 0x3e207254u, 0x3d5c5c63u, 0x3d915445u, 0xbd0cc1c2u,
+0xbbd4013au, 0x3d6edfdeu, 0x3d9dfbeeu, 0x3aca65e7u, 0x3d15b5c6u, 0xbd0995b1u, 0xbe112860u, 0xbe45ce55u, 0xbdf9eae7u, 0xbd8bcffau,
+0xbccd4363u, 0xbda16001u, 0x3cce5824u, 0xbcba59cfu, 0x3eba5a3au, 0x3d443b40u, 0x3d7ecd2au, 0x3da7815du, 0x3d8c8997u, 0x3d825992u,
+0xbd4efc51u, 0x3c9d53d6u, 0x3d54cf96u, 0x3cdcb50bu, 0xbdcbb745u, 0xbdc06a86u, 0xbd0cd941u, 0x3cffdc2au, 0x3d35f741u, 0x3e23daa9u,
+0xbe156cefu, 0xbe5121d2u, 0xbe84cf98u, 0x3daab41eu, 0x3e23593fu, 0xbda7c600u, 0xbc7642b3u, 0x3e1ed775u, 0x3e6f0ddbu, 0xbd04a5d8u,
+0x3d9c4e37u, 0x3e93807bu, 0x3d1fd592u, 0x3e130854u, 0x3dc3c7e8u, 0xbd82527cu, 0x3d25877bu, 0xbeb17f2du, 0x3daaf5b1u, 0xbcd3f10fu,
+0xbdcda78fu, 0x3de9ba7fu, 0xbda0ebe3u, 0xbd8d717eu, 0x3e4e9a5au, 0xbdca8768u, 0xbb3398afu, 0x3d376c60u, 0xbca27ea9u, 0x3e0e56c2u,
+0xbdc0971du, 0xbe5f850fu, 0xbe397f07u, 0xbbea2398u, 0x3e1cc043u, 0xbdec0c03u, 0x3ca69e8au, 0x3e8a2ebau, 0x3ca028ccu, 0xbd689bbdu,
+0x3dd68563u, 0xbe1915ffu, 0x3c1816bdu, 0x3e37f186u, 0x3dcb50dcu, 0x3d50c83eu, 0xbdb52443u, 0x3b966bb2u, 0xbc959610u, 0xbe218bbdu,
+0xbdc53a80u, 0x3d9d93ebu, 0xbde224fdu, 0xbcd46b0cu, 0x3bc542c3u, 0xbe413468u, 0xbe6407fau, 0x3e295fdfu, 0xbd908e9du, 0xbe1d7522u,
+0x3bae07e2u, 0x3d84d02bu, 0x3da2e615u, 0xbd8a9692u, 0xbd5dbe2du, 0x3dc79ceeu, 0x3dc918d6u, 0xbcd39b08u, 0x3d9d7e27u, 0x3e2c6ae1u,
+0xbc09b5e3u, 0xbda91d20u, 0x3e2dc078u, 0x3e5b1e25u, 0x3d88a660u, 0xbd69f17cu, 0xbe35947du, 0x3bbc61b2u, 0xb9969db7u, 0xbdbc3958u,
+0xbe164fc2u, 0x3b7bb18eu, 0x3d5d96ddu, 0xbd532961u, 0x3d6512c8u, 0x3c51782du, 0xbd163413u, 0x3d8e780eu, 0x3cbc2c85u, 0x3b15d040u,
+0x3db72df3u, 0xbe07e156u, 0x3d210a5du, 0x3eb2146eu, 0x3aa07615u, 0xbe0b29f7u, 0x3d49b1d0u, 0x3bb920fau, 0xbe2ce093u, 0x3d0e364du,
+0x3d927c32u, 0x3d8986e4u, 0xbc38ca3fu, 0x3c79c65du, 0x3d5c5652u, 0xbd1247dbu, 0xbdfff240u, 0xbd97a1e5u, 0x3e0e3e05u, 0x3c9db307u,
+0xbb2f0f98u, 0xbdbe9f8au, 0xbc693ee6u, 0x3bac191cu, 0x3cbf8acau, 0x3e0d3d54u, 0x3ef66fd1u, 0x3e78e57au, 0xbd90e489u, 0x3e2c96b8u,
+0xbce20a1eu, 0xbe075013u, 0xbd62101cu, 0x3d6213a6u, 0x3c3145e4u, 0xbd12a5b9u, 0xbe087fa1u, 0x3da2a3b5u, 0x3b23645du, 0xbd626ad5u,
+0x3d836d23u, 0x3e0f8f9cu, 0xbe17a53cu, 0x3d6a9cb1u, 0x3d0d2f58u, 0xbd4998b7u, 0xbd0e10dcu, 0xbe0a7e55u, 0x3d685b7du, 0x3e06f763u,
+0x3e216029u, 0xbd22608fu, 0xbd4e9b0fu, 0x3dbebc97u, 0xbd7fdaaau, 0xbe07a5cau, 0xbd8daf22u, 0x3dbef4ecu, 0xbddd69f0u, 0x3d4d6144u,
+0xbbcf415bu, 0x3d8a22e3u, 0xbe03f494u, 0x3b96da4fu, 0x3c7e7ea4u, 0x3e16785eu, 0x3d052ed1u, 0x3d4f85b4u, 0x3d5fb1f8u, 0xbd9f781au,
+0xbc8d2086u, 0xbcdccdedu, 0x3cf6475fu, 0x3da6acccu, 0xbe64a959u, 0xbe3669c0u, 0xbcc424d3u, 0x3dc03935u, 0xbd1eb522u, 0xbc270eb9u,
+0x3e34d8a8u, 0x38f274a9u, 0xbcc4f5a5u, 0x3e0b44a8u, 0x3db67367u, 0x3d86775fu, 0xbe0dfea0u, 0xbe09f84bu, 0x3d1c7ddau, 0x3d7c952fu,
+0xbe128259u, 0xbdd82ab4u, 0x3dfd0ae0u, 0x3dc78469u, 0x3e20f8d7u, 0xbd90a35cu, 0xbce97f0bu, 0xbd81382au, 0x3db12e6cu, 0x3cfaf455u,
+0xbbe1ecbeu, 0xbe21e674u, 0xbd8acd56u, 0xbdb7e7cbu, 0xbd611f92u, 0xbddf7804u, 0x3d06e581u, 0x3dc20a84u, 0xbe9aae3bu, 0xbc0e3785u,
+0xbd5a15efu, 0xbdf20f34u, 0xbc85b3f4u, 0x3e1be572u, 0x3d29a11fu, 0xbd364e9eu, 0x3d48d463u, 0xbd686368u, 0xbdeb0f27u, 0xbc1dd5a1u,
+0x3d6aa3adu, 0xbc387d61u, 0x3d10eb9du, 0xb94828b7u, 0x3d549cdcu, 0xbe1fff7fu, 0xbe1be3d8u, 0xbea0014du, 0x3de50766u, 0x3e0a4e4au,
+0x3d8ba143u, 0x3def40fdu, 0xbd1ea27fu, 0x3dcf4754u, 0x3ddbd141u, 0x3e06bea4u, 0xbdb43bfbu, 0xbea53584u, 0xbe4e4b0fu, 0x3dbb7ebeu,
+0x3dc21dfeu, 0x3d31c1efu, 0x3df698e8u, 0x3dc4f0ccu, 0xba461fbeu, 0xbe1af895u, 0xbd081644u, 0xbd4f059au, 0x3b7fbdbau, 0x3e2e14c7u,
+0xbdce6634u, 0xbd9a6aebu, 0x3e5c425au, 0xbd97fa67u, 0xbd769364u, 0xbe2a716fu, 0xbc8dab2du, 0xbe2e9671u, 0x3d37d138u, 0x3d587487u,
+0xbe9e4b73u, 0x3e8b2f7eu, 0x3ce1b810u, 0xbe1315e4u, 0x3ce5a742u, 0x3d976a6du, 0x3d975c17u, 0xbe1c0797u, 0x3c1c25a8u, 0x3e1dc09au,
+0x3dd8203eu, 0xbdb52465u, 0xbe11f880u, 0x3d4c0636u, 0x3cd080d9u, 0x3cc0d0a0u, 0xbd3beb5cu, 0xbd499cbcu, 0xbd43e980u, 0xbd9eb1a7u,
+0x3e0ef747u, 0xbd69c370u, 0xbc0cca45u, 0x3e267e72u, 0xbdb44d91u, 0x3e1158d2u, 0xbcd10e67u, 0xbd3b5fe0u, 0x3da48eadu, 0xbdb22bacu,
+0x3d8777e8u, 0x3c854c4bu, 0xbe7871beu, 0x3d38a300u, 0xbddef8fcu, 0xbd115835u, 0x3ea4ec47u, 0xbddf0452u, 0x3d5caacbu, 0xbedbf1a3u,
+0x3eb58e3fu, 0xbe83e92du, 0xbdb79112u, 0x3e496478u, 0x3d32d607u, 0xbe6ea0b5u, 0x3d49ba37u, 0xbdf3338au, 0x3e8f68efu, 0x3e3c9c71u,
+0xbdffe978u, 0x3de5ff31u, 0xbc8d63d6u, 0x3d9f65e7u, 0x3d2208b1u, 0xbe406ca6u, 0x3e6c77c8u, 0xbe69f750u, 0x3e87bd92u, 0x3c191a83u,
+0x3cabb87cu, 0xbcf24e4du, 0xbdb5a2ecu, 0xbc86769du, 0x3e89c950u, 0xbb9adaa1u, 0xbe0b1466u, 0x3df610b7u, 0xbd4d597fu, 0x3dd06262u,
+0xbdfcf882u, 0x3d04cab4u, 0xbcc47502u, 0x3c3491cdu, 0x3c332e6au, 0x3d24b9ecu, 0xbd334883u, 0xbd32339fu, 0x3d83a0dcu, 0xb9c34d3fu,
+0x3daf5318u, 0x3e72c5a1u, 0xbe4a66a6u, 0xbe44ad67u, 0x3d633b9cu, 0xbd3f9a60u, 0x3dbca7e0u, 0xbcfc6114u, 0xbc82f74cu, 0xbd3903c0u,
+0xbd284ff4u, 0x3bb69afdu, 0x3d73f96fu, 0x3d986ecfu, 0xbdd9c6cau, 0x3d63d52au, 0xbcb525aeu, 0xbdf66df8u, 0x3db21bf4u, 0x3e4c2736u,
+0xbe9251b7u, 0x3d9bcbbcu, 0xbe2f01afu, 0x3e84ce06u, 0x3be40c2bu, 0x3dbe9565u, 0x3c286505u, 0xbc931e7du, 0x3e860fdau, 0xbd9e79f0u,
+0x3d29f312u, 0x3c850bcfu, 0x3da78078u, 0xbdc2406au, 0xbd6bdd9du, 0x3df48954u, 0x3c1bc1c2u, 0x3bed5edcu, 0xbe86e038u, 0x3cc0af70u,
+0x3c9f3380u, 0x3e113e52u, 0xbd536a3fu, 0x3b91bf91u, 0x3ba33a5au, 0x3daab95bu, 0x3d7e07f4u, 0xbddb8858u, 0x3d618d44u, 0x3e6d5ab5u,
+0xbe26e0f1u, 0xbe2f3d9au, 0x3e23f854u, 0xbe1a1089u, 0x3d65850fu, 0xbdf33422u, 0xbc4e152fu, 0x3e8c05ceu, 0xbe382fd7u, 0x3d5cbafcu,
+0x3e6d2f2au, 0xbe42b326u, 0x3e2ecc78u, 0x3d1f4416u, 0xbe11a6e1u, 0x3b84ee3au, 0xbccac6d8u, 0x3d511811u, 0xbcfa077du, 0x3e57cdb5u,
+0x3deba98du, 0xbd93b955u, 0xbe08c66du, 0x3e86bdd6u, 0xbd348c7bu, 0x3dfd3e2eu, 0xbe76c58du, 0x3c3bedb9u, 0xbce8aca7u, 0xbd04f7e4u,
+0xbcb39995u, 0xbe2b5fa1u, 0x3e1a3ca8u, 0xbe44deb3u, 0xbd92d1adu, 0x3e07ca60u, 0xbd847f8cu, 0xbd3bbb34u, 0xbdad9e7cu, 0xba011295u,
+0x3e10880bu, 0x3d2a052fu, 0xbec6717fu, 0x3ceb935fu, 0x3b69abd1u, 0xbe1e40fbu, 0x3d53e8d5u, 0xbd125f80u, 0x3e3a47b9u, 0xbd80f089u,
+0x3e2ab0c0u, 0x3dd26d7eu, 0x3d7770afu, 0x3e9d1bf3u, 0xb9bf27b2u, 0xbdcd337fu, 0xbdcdaa1eu, 0xbe60375du, 0xbc306401u, 0xbe178965u,
+0xbe11064fu, 0xbb6eb2feu, 0xbe87a714u, 0xbdac1a5bu, 0x3c9f69e9u, 0x3d020a0eu, 0x3e1cb522u, 0xbcefa495u, 0x3dbd18e9u, 0x3e1bc80bu,
+0x3da953bcu, 0x3dd6cea0u, 0x3e054955u, 0xbdd5ac7cu, 0xbda163e1u, 0xbd425497u, 0xbe153e14u, 0x3dc7d111u, 0x3dacd085u, 0x3d95bccbu,
+0x3d34e9b5u, 0x3e78a17eu, 0xbe4b4771u, 0x3d65ff7au, 0x3d2f7f6cu, 0xbdff324cu, 0xbe5fc707u, 0xbe609dcau, 0xbdfa0d19u, 0xbe14491du,
+0xbc8501ccu, 0x3deaee8bu, 0xbddffdb9u, 0xba57857au, 0x3d491759u, 0x3e49c4f7u, 0xbbd3b319u, 0x3e0e8e02u, 0x3dccd2acu, 0xbd6b141bu,
+0xbe35caa6u, 0xbb99976eu, 0xbe49725fu, 0xbccc93fcu, 0x3e4ccba7u, 0x3d973164u, 0x3d3f2bcbu, 0x3d15e182u, 0xbd021103u, 0xbdab6d45u,
+0x3d670aa0u, 0x3d351e73u, 0xbe0b476bu, 0xbcdae4bfu, 0xbe239d34u, 0x3c08be13u, 0xbcb85f43u, 0x3d956aefu, 0xbd9d23b7u, 0xbd7d95dfu,
+0xbd056b53u, 0x3d7b08f4u, 0xbda413e7u, 0x3e7d80cau, 0xbcf9c283u, 0x3bd6aec1u, 0xbe35efd8u, 0xbd9b6c28u, 0xbd9ec73cu, 0x3d969332u,
+0xbded6d7fu, 0x3c0eb1ecu, 0xbd82f526u, 0xbcf06237u, 0x3df1b93bu, 0x3e564853u, 0x3a1e51dcu, 0x3dbca8fcu, 0x3d9315b6u, 0x3e40334du,
+0x3e19722bu, 0x3de6af6bu, 0x3c968bb9u, 0xbca66c45u, 0xbb080c77u, 0x3d797e37u, 0xbd1ae0b0u, 0xbe410a3eu, 0x3d956f8bu, 0xbdaca704u,
+0xbe042b7bu, 0xbce28031u, 0xbe35b0b9u, 0x3e13e57du, 0x3d86d51cu, 0xbbd13fcau, 0x3e02f9ddu, 0x3d51dba3u, 0x3cd558c2u, 0xbd95492bu,
+0xbce97636u, 0xbe751cb6u, 0x3d456c2du, 0x3e0801a0u, 0x3e37da65u, 0x3e4bb6f4u, 0xbd01f427u, 0x3cdd6af2u, 0xbdf24680u, 0xbd35a817u,
+0x3e3b6ffcu, 0x3e495f55u, 0x3d12ed1eu, 0x3c3d25b4u, 0xbd5f7f91u, 0x3d0e194au, 0xbde7910bu, 0x3d87028fu, 0xbd5c00a6u, 0xbdf883eau,
+0xbdcbd67cu, 0x3e15d8e1u, 0x3d68c2cdu, 0x3d07260bu, 0x3daf276du, 0xbd3695a4u, 0xbda762b1u, 0xbd49faaeu, 0xbda9cf39u, 0xbe1995abu,
+0x3e186166u, 0xbcc19f0au, 0x3d839976u, 0x3e1a4d27u, 0xbde9657du, 0x3df46fadu, 0x3d90e3fau, 0x3d38dc5cu, 0xbde2fb70u, 0xbe1d4674u,
+0x3dee1646u, 0xbd09a752u, 0xbd2a7d2eu, 0xbec0f1b1u, 0xbe57c973u, 0xbd747f1eu, 0xbdf4e84au, 0xbd86eab3u, 0x3e4adbcbu, 0x3d456d89u,
+0x3e4f7fafu, 0x3de3fb10u, 0xbd8cac20u, 0xbded801bu, 0xbd957a41u, 0x3dd7c00cu, 0x3e305a8eu, 0x3d8f301cu, 0xbbdc9f95u, 0x3d1c74c6u,
+0x3dfe0db0u, 0xbdc0a79bu, 0x3d8ed02cu, 0xbceb1acdu, 0xbde6640eu, 0xbe441fe7u, 0xbd1562bdu, 0xbd808b94u, 0x3cc11d26u, 0xbd351083u,
+0xbd6083deu, 0xbe1c0f3bu, 0xbc2d7e41u, 0xbe607a28u, 0x3dc7c1cfu, 0x3db0d368u, 0x3e25f570u, 0xbe37cf9du, 0x3db15390u, 0x3e1eba77u,
+0x3ea1bcc6u, 0x3cc919f0u, 0x3dbd99f9u, 0xbde2fcacu, 0xbd5a993au, 0xbd2022bfu, 0xbdeae7c5u, 0xbdabf554u, 0xbdfe7deeu, 0xbb299aa5u,
+0x3e1dad80u, 0xbccc3084u, 0x3d393e28u, 0x3cc40bc8u, 0x3c55863bu, 0x3e0e81c9u, 0x3c9695feu, 0x3d959d12u, 0x3dd1b640u, 0x3d91ca25u,
+0x3dbb2179u, 0xbdab1a7au, 0xbd8bd4a2u, 0x3d6c2ab5u, 0xbd7a6128u, 0xbd65d28du, 0xbd2950d0u, 0xbd8b1b75u, 0x3bc8bf38u, 0xbd6263bcu,
+0x3dc7998bu, 0x3c231762u, 0x3c3286b6u, 0xbe38a28fu, 0x3b9acf13u, 0xbe42c144u, 0xbe33d159u, 0x3d51a560u, 0x3ea1bef9u, 0x3d5194ecu,
+0x3d670bdbu, 0xbdca5656u, 0x3caa8ba7u, 0xbc7141aau, 0x3df117f6u, 0x3ccb1dbfu, 0xbc27c2fbu, 0x3da00df7u, 0xbd46e012u, 0x3bf716c1u,
+0xbdac92b4u, 0x3cc06b91u, 0xbe57d8a0u, 0x3d564cb4u, 0x3dd19295u, 0x3a420bfbu, 0xbb022d12u, 0xbe10a96eu, 0xbd88475bu, 0x3d75a4b2u,
+0x3e93136bu, 0xbe03dddeu, 0x3d989797u, 0xbd805661u, 0xbd3ddd21u, 0x3ecae3c9u, 0xbdfe8d5cu, 0xbce99a8eu, 0x3db152a8u, 0x3e12432fu,
+0x3c9554a0u, 0x3d9ef7b8u, 0xbcde6359u, 0xba8fe5c5u, 0x3d37a20fu, 0xbe05c8f0u, 0x3b33c8b1u, 0xbd0ecd35u, 0xbd4ddee0u, 0xbd90b19du,
+0x3d8806abu, 0x3d76829bu, 0x3dcf74d4u, 0x3e2b93f3u, 0x3dda7032u, 0x3e0f1e09u, 0x3cfea18fu, 0xbe563707u, 0xbe3e49c3u, 0x3d8a119bu,
+0xbd6299bau, 0xbd369e53u, 0xbca63bc8u, 0xbdb3467fu, 0xbe4ef5c4u, 0xbde292a0u, 0x3e64dc03u, 0x3e4f5585u, 0x3cad478fu, 0xbcbe8900u,
+0x3d3e01d3u, 0xbcbc1bd2u, 0xbe2ca1aeu, 0x3e30ca2du, 0xbc9e2921u, 0xbc726260u, 0xbe3b7fe7u, 0xbe16da59u, 0xbcc49df4u, 0xbcb91980u,
+0x3c788973u, 0xbdb518d3u, 0x3cbc606du, 0xbda74726u, 0x3d846bbbu, 0x3c576455u, 0xbc476e35u, 0x3bff9f6du, 0xbc2991bau, 0xbc341cbfu,
+0x3e92649bu, 0x3da14f93u, 0x3c8aa376u, 0xbd1a5bedu, 0xbcdc5acdu, 0x3cceb7a4u, 0xbc8fca83u, 0x3d4897b4u, 0xbc9a8723u, 0xbdfc8f59u,
+0xbcd36ae0u, 0xbd82b584u, 0xbe166f8cu, 0xbd859721u, 0x3c0a8c68u, 0x3b85073au, 0x3cd8f1b6u, 0x3db7bd05u, 0xbe3e8e4du, 0xbb6295b3u,
+0xbe786e69u, 0x3e2d2697u, 0x3bc4706cu, 0x3c392636u, 0x3debe314u, 0xbd5fd7bdu, 0xbda06f35u, 0xbe250dfcu, 0xbdbfc3a5u, 0x3cadd7c7u,
+0xbd56c6d9u, 0x3b803cddu, 0xbdd0668du, 0xbe2ad2c7u, 0xbd9645a3u, 0xbcde2d70u, 0x3e3ec545u, 0xbd46dcdeu, 0x3df02da7u, 0xbb6e19bbu,
+0x3e60ec33u, 0xbd234587u, 0xbe09cccfu, 0x3d026bd3u, 0xbd852486u, 0x3d3f8b76u, 0x3d7c5431u, 0xbd295cfeu, 0xbe42c429u, 0x3da1ff9cu,
+0x3d847181u, 0x3dfb2299u, 0x3cf2b033u, 0x3e7fabcdu, 0x3ecd17ffu, 0x3dc1f7cfu, 0xbd772a8cu, 0xbde92bd4u, 0xbd16b2c5u, 0xbe421b33u,
+0xbd46b9aau, 0xbc055fd1u, 0x3d96f87eu, 0x3db5bc0du, 0xbc4041ceu, 0x3d62bc07u, 0x3ceffdb3u, 0x3de3283eu, 0x3bda8aebu, 0xbe0a12d6u,
+0xbdf80d91u, 0xbe06aa96u, 0x3d3db39bu, 0xbe285162u, 0x3c8177f9u, 0x3ec3c488u, 0x3e8f23a8u, 0xbc23607bu, 0x3c8b5ea2u, 0x3dc3ef48u,
+0x3dc8b22cu, 0x3cfc0341u, 0x3e619eeeu, 0x3d39f553u, 0xbe8ab390u, 0xbe7442d6u, 0xbddaec6bu, 0x3dba0c5fu, 0xbc800558u, 0x3d6f62bau,
+0x3d55a43du, 0xbd78c6e1u, 0x3b9ffbb1u, 0xbd548c75u, 0x3e0eca0cu, 0x3e18b991u, 0x3cd93742u, 0x3dcc518au, 0xbe2eb8a5u, 0x3ea6257au,
+0x3d18a6a3u, 0x3dc0baebu, 0xbe1049fau, 0xbe01eeb7u, 0xbd301986u, 0x3c140c6fu, 0xbd939e31u, 0x3d66972au, 0xbe80dd4cu, 0x3e2f18deu,
+0xbd62f51fu, 0x3db73380u, 0x3d74a020u, 0xbd2be390u, 0xbd9b20eau, 0xbd515b8du, 0xbd7a8c6fu, 0x3e576593u, 0xbd53e493u, 0x3d5b4ff0u,
+0x3e4c14ccu, 0x3d398518u, 0x3d59ac6cu, 0x3d697b8fu, 0x3be2aa61u, 0x3d849c38u, 0xbe4aaebdu, 0xbe35dd90u, 0xbdae9e06u, 0xbe12ea16u,
+0x3dfb4720u, 0x3d328e8eu, 0x3d81bb95u, 0x3d3cf45au, 0xbde56f1fu, 0xbceda5eau, 0x3d40a2ceu, 0x3d82cb2eu, 0x3e223c9du, 0xbabd7475u,
+0xbd294ed2u, 0xbe286ff4u, 0x3e02ac5bu, 0xbd305574u, 0xbe4d80e7u, 0x3e49367cu, 0xbd7c897bu, 0xbd763bc5u, 0x3d2e59d6u, 0xbdd79e01u,
+0xbe5f67b9u, 0x3e0a46fbu, 0xbe441935u, 0xbd713bb5u, 0xbe56a78cu, 0xbdf059ccu, 0xbef1f519u, 0xbe2939a8u, 0x3d8e5a9fu, 0xbe0094dfu,
+0xbde4fb06u, 0x3ee2c596u, 0x3e0e5b28u, 0x3cb1e2a2u, 0x3da97aa5u, 0xbd017273u, 0xbbb525e3u, 0xbb341d3fu, 0xbc79eb2bu, 0x3c064205u,
+0xbdea4e2eu, 0xbe2d8cacu, 0x3d23e051u, 0xbdb74e52u, 0x3d2e55edu, 0x3d3a22a3u, 0xbd9d5e2bu, 0x3dcd54b2u, 0xbdc55e65u, 0xbdd9ce8eu,
+0xbe0eb064u, 0xbd90ab5eu, 0x3d7931ebu, 0x3e3f4801u, 0x3d0fc5dfu, 0xbd250891u, 0xbd2433f6u, 0x3e11b4d2u, 0xbd6a079au, 0x3e01ca64u,
+0x3e9500abu, 0xbc7a3647u, 0xbd85f4f9u, 0xbe21c34cu, 0xbda8b519u, 0xbe13d6b7u, 0x3e4dad63u, 0x3e0f7392u, 0xbe72fd90u, 0x3d114b76u,
+0x3d7c5473u, 0x3d82f9a8u, 0x3d991117u, 0x3d8f5c9cu, 0xbe328274u, 0x3d8afbc7u, 0x3b200124u, 0x3cbf55d3u, 0x3d5fc609u, 0x3d4eef4fu,
+0xba7daa22u, 0xbdde6f88u, 0xbd630a3du, 0xbda4d5b3u, 0x3e17e96cu, 0x3d2b8bd5u, 0xbd9d31a2u, 0x3dd85e2eu, 0xbcdb7797u, 0xbe8687c4u,
+0x3e02125au, 0xbd7dfa9cu, 0xbe2cad5du, 0xbd02a33fu, 0xbdfc8dacu, 0xbde57b48u, 0xbe93a00bu, 0x3ce5d3b3u, 0x3dff4ac5u, 0x3c71809au,
+0xbd2988b1u, 0xbda2e4fbu, 0x3d43581au, 0xbdc690b0u, 0x3e36aadau, 0x3e433136u, 0x3e3e4c49u, 0x3e69468fu, 0xbdecb3d6u, 0x3e81492au,
+0xbd543208u, 0xbd973fe7u, 0x3de69df9u, 0xbd6aac4au, 0xbc807e5au, 0xbca0bfecu, 0xbdc833ddu, 0xbc10a64cu, 0x3e0153b9u, 0xbda9ffa7u,
+0xbdf4957cu, 0xbd21ac39u, 0x3e3d6057u, 0xbe798e45u, 0x3d280d4cu, 0x3e0c8f5bu, 0x3bd508c1u, 0xbd38eb25u, 0x3e411b38u, 0xbe330ad8u,
+0x3d783fe0u, 0xbc65fb43u, 0x3e206134u, 0x39041100u, 0x3e6c5fd8u, 0x3dc996d8u, 0xbdb974f5u, 0x3c964bf6u, 0x3dd123f5u, 0x3c42f852u,
+0xbd6220cbu, 0xbde9810au, 0x3d82ddc9u, 0xbc546ecbu, 0xbc33c269u, 0x3dcea032u, 0xbdc3e0e7u, 0x3d0705a2u, 0xbcb4e49cu, 0x3da64e65u,
+0xbd69ed3eu, 0x3de0b988u, 0x3b152b87u, 0xbdb23d86u, 0x3dc199fdu, 0xbd148d04u, 0x3c841916u, 0x3e0e746du, 0x3ddf8b53u, 0x3e53bc32u,
+0xbe114348u, 0xbe3826c5u, 0xbca00aecu, 0xbd6d1812u, 0x3dc78d6eu, 0xbe1333d4u, 0x3d5d7969u, 0xbe165b51u, 0xbe956bd5u, 0x3e189241u,
+0x3dd7401du, 0x3e07611bu, 0x3d9b4755u, 0x3d1917e0u, 0xbe2605f6u, 0xbd63f3ceu, 0x3d45618au, 0xbd31edfcu, 0x3e012c02u, 0xbd897687u,
+0xbcd53f2au, 0xbdb3f428u, 0x3e0fa5deu, 0xbdca09dcu, 0x3dc264bbu, 0x3d36e0d8u, 0xbc07db1fu, 0xbd236396u, 0x3bd351d9u, 0x3e0199e8u,
+0x3d25faf6u, 0x3e10c794u, 0xbd92e620u, 0x3ca34ea3u, 0x3e4ddf8du, 0xbe0b232cu, 0xbc145784u, 0x3e2b43ccu, 0xbdb09644u, 0x3d291850u,
+0x3df04624u, 0xbbb9a48cu, 0x3d24c2d0u, 0xbbbe4f5au, 0x3e322cfeu, 0x3bf6b6a4u, 0xbdccd8c9u, 0xbc0ab176u, 0xbdb9972cu, 0x3c56a2c5u,
+0xbcfa5d29u, 0xbbd2785cu, 0x3da2eb38u, 0xbc216171u, 0x3d4e0118u, 0xbe000e8au, 0xbca94ca5u, 0x3d6d90f2u, 0xbd41e763u, 0x3dae8678u,
+0xbd1b4855u, 0x3d2a7174u, 0x3b16a9b1u, 0xbb9dd980u, 0x3d0baffbu, 0x3dd8fc74u, 0xbab17bf4u, 0xbdf32756u, 0xbdf606f0u, 0x3dc1fa82u,
+0xbd7fe399u, 0xbbfdb86fu, 0x3db2c477u, 0xbd6471b8u, 0xbebd618eu, 0x3aa5a632u, 0xbc257678u, 0x3c22e64bu, 0x3cb69953u, 0xbdb588e6u,
+0xbc8a3b84u, 0xbd9b3146u, 0x3d3ebf7eu, 0x3dababdeu, 0xbcf2b0c4u, 0xbbf0225cu, 0x3d688fe8u, 0x3d02df5bu, 0x3d83a2a5u, 0xbca95608u,
+0x3cd767fdu, 0x3d627dd9u, 0xbd984b02u, 0xbbaa4108u, 0xbc72d20eu, 0x3e447e6cu, 0xbd05082au, 0xbd79f995u, 0x3cd95309u, 0xbbca88d2u,
+0x3ebf3718u, 0xbd33d6f9u, 0xbaebea04u, 0x3def832du, 0x3e34d795u, 0xbd83737au, 0x3d07828bu, 0x3d81de67u, 0x3d6b3323u, 0xbdfd5dccu,
+0xbc49df0au, 0x3d35ac3eu, 0xbcf00780u, 0xbd8cde9du, 0x3c36c013u, 0x3de8c01au, 0xbe041600u, 0x3c59553fu, 0x3e01ea06u, 0xbf0c41a7u,
+0x3bc3f8deu, 0xbd9e2104u, 0x39d8a487u, 0x3d007e13u, 0xbdf20120u, 0x3b575f00u, 0xbdafc487u, 0xbdcc666cu, 0xbd53ebe2u, 0x3d5c6143u,
+0xbe1d5574u, 0x3e4b2d39u, 0xbcf16cd2u, 0xbdc7970au, 0xbcaea90eu, 0x3d33edbbu, 0xbdc6f196u, 0x3e4e16b5u, 0xbc733fe7u, 0x3d866bc2u,
+0xbd300298u, 0xba9cc5d2u, 0x3c0b7d6au, 0xbbe80f48u, 0xbdae04a3u, 0x3e39bbefu, 0xbdda136fu, 0xbdff5fb2u, 0x3c2c6229u, 0xbe323715u,
+0x3baba584u, 0xbcdefcf3u, 0x3d3d8654u, 0x3d17c9d1u, 0xbc31684cu, 0x3e574329u, 0x3ab0e266u, 0xbceaa26eu, 0x3b909f37u, 0x3a214494u,
+0x3b2b26b0u, 0xbd1ae0cfu, 0x3d55730au, 0x3e71952bu, 0xbd987159u, 0x3d71e624u, 0xbca3a0e6u, 0xbdb1e5ddu, 0xbdac2c65u, 0x3d30cd06u,
+0x3d1348f4u, 0xbb55f5b3u, 0x3e49178fu, 0x3db7fa81u, 0xbe100364u, 0x3db12605u, 0x3e03911bu, 0xbcfde3e2u, 0x3d9ee5ceu, 0xbcd5376du,
+0xbdfb84b9u, 0x3cd283e5u, 0x3e943d00u, 0x3cfd0bcdu, 0x3c97c43du, 0x3d8850a2u, 0xbca7e402u, 0x3d093c29u, 0x3d942b79u, 0x3d4c88c4u,
+0x3d883c57u, 0xbd832961u, 0x3d2eed83u, 0xbcc53f8du, 0xbd16d0eau, 0xbd02eafeu, 0x3b2db9b4u, 0x3d1671c6u, 0xbd2e1569u, 0xbe40dd70u,
+0x3cfb4f51u, 0xbcc5431fu, 0x3d828767u, 0xbdf434fcu, 0x3cca8a8au, 0xbd2bc070u, 0x3cb34ea2u, 0xbdb8e9eau, 0xbd4b9ba7u, 0x3d7b1d33u,
+0xbc852c4au, 0xbdf4c804u, 0xbd98baabu, 0x3da04f9fu, 0xbdb08120u, 0xbcc59db9u, 0xbce63ad1u, 0x3ce0926cu, 0x3d1d8238u, 0xbd81588fu,
+0x3d5d753eu, 0x3c98af51u, 0xbc9d7e2bu, 0xbca4f3d8u, 0x3e236338u, 0x3cd993d7u, 0xbe2c6809u, 0x3e738210u, 0x3d146cfcu, 0x3de6b768u,
+0xbd3f7901u, 0x3bc7e5edu, 0xbd436e08u, 0x3d46fb5du, 0x3e28115fu, 0xbef5e63eu, 0x3dad0736u, 0x3c527d67u, 0x3da2dcafu, 0xbda78a83u,
+0x3d1e3819u, 0x3ddaeaa7u, 0x3d333543u, 0xbd0742f4u, 0x3d964c92u, 0xbe8f3b7au, 0xbce2d68bu, 0xbe02b1bau, 0x3d874d0du, 0xbb2b8782u,
+0xbd5d3b2du, 0x3dbe4d37u, 0x3ddfa9b7u, 0xbde34841u, 0x3dcbbb4eu, 0x3dd2ae18u, 0xbde588cau, 0x3e1b5552u, 0x3cfdda91u, 0xbe02446du,
+0xbd8abb84u, 0xbc973638u, 0xbe0cb5cau, 0xbdf0f230u, 0xbd41b286u, 0x3d64224eu, 0x3c8ffd77u, 0x3d9b0978u, 0xbd14ff84u, 0xbd19efc7u,
+0xbc351e17u, 0x3e568405u, 0xbe85a47du, 0x3b1917fau, 0xbc92ddffu, 0x3db5dadeu, 0xbd1168e8u, 0x3ce15381u, 0x3d400a90u, 0xbde39dedu,
+0x3db19fcfu, 0x3d257eb7u, 0x3c5814c7u, 0xbce63de1u, 0xbd826859u, 0xbc583ab5u, 0x3e129182u, 0x3d450bc9u, 0xbd636626u, 0xbed59383u,
+0x3dd505d4u, 0x3cb8ebddu, 0x3c1049f6u, 0x3d425322u, 0x3b299df3u, 0xbd8f8000u, 0xbd8e6b80u, 0x3904bb80u, 0xbe3afa53u, 0xbd104116u,
+0xbdde445du, 0x3db78d94u, 0x3ba73f24u, 0x3d7cfb76u, 0xbd537b0eu, 0x3b0ad2f0u, 0xbd948a88u, 0xbc8660afu, 0xbd1101dcu, 0xbd0c3fe9u,
+0x3cc39060u, 0xbd22d7fau, 0xbce18e35u, 0x3dcb8928u, 0xbc951396u, 0xbdde1390u, 0xbdf201f4u, 0xbdc06ca5u, 0x3cb977a5u, 0xbc165e92u,
+0xbdb990ffu, 0xbc82a76au, 0xbd1aec4du, 0xbcb49dd9u, 0xbd8c07c1u, 0x3e85fd4eu, 0xbe6dd6ecu, 0xbc67aaf7u, 0x3c78a888u, 0xbd200ccdu,
+0x3d95a4c0u, 0x3e1f3082u, 0x3df48973u, 0xbaee53d0u, 0xbdd7461cu, 0x3e32ab60u, 0x3d3a6772u, 0xbd18a2d2u, 0xbd03c8a9u, 0xbcdc9996u,
+0x3dc8581bu, 0x3d27fb8fu, 0xbdb965feu, 0xbda9886au, 0x3d8b9472u, 0x3d56838du, 0x3da35072u, 0xbd68a70cu, 0x3a88b212u, 0x3c153b28u,
+0x3cdf0bffu, 0x3d3c862cu, 0x3eba0530u, 0x3d65afc2u, 0x3ccdfa45u, 0xbb04adcfu, 0x3d007fcdu, 0xbc907e91u, 0x3d9e859fu, 0xbcec3547u,
+0xbd0e3900u, 0xbd815f0du, 0x3e077a5bu, 0x3de3eae7u, 0x3dfe3162u, 0x3d24eccdu, 0xbe30b1f5u, 0xbe4a4d22u, 0xbde53d5cu, 0xbe1c413au,
+0x3c879522u, 0xbdfc1262u, 0xbd444bd7u, 0x3cf68068u, 0xbbcdc38au, 0x3d6076fcu, 0x3d70295cu, 0x3c42d17cu, 0x3d733becu, 0xbe9dcab0u,
+0x3d7b11d0u, 0xbd5b0e0du, 0xbc7fea1du, 0xba9b8b8bu, 0x3c8f617eu, 0xbd8c3493u, 0xbd46745eu, 0xbbc8ff7au, 0xbd2b6311u, 0x3c76ca57u,
+0x3dfd87e6u, 0xbb92007bu, 0xbc8636a9u, 0xbcdf363du, 0xbe39cdeau, 0xbd16d213u, 0x3d43988bu, 0x3edce00fu, 0xbd879883u, 0x3cbdd743u,
+0xbd3a7985u, 0xbd46fa21u, 0xbc891a0du, 0x3cb93d0au, 0xbaf6dbe1u, 0x3d26ea57u, 0x3e2c3376u, 0xbcfce10fu, 0x3c1284fcu, 0xbd78b7fcu,
+0xbd911e71u, 0x3d06269bu, 0xbd368f56u, 0x3cb0739cu, 0x3cafe092u, 0x3de69281u, 0xbb659bebu, 0xbd4da6a8u, 0xbcc923b3u, 0x3ce38c2eu,
+0x3ac79fb0u, 0xbd310501u, 0xbc771a46u, 0x3da020beu, 0xbd7e3bc5u, 0x3df8d554u, 0x3c70148fu, 0x3d3c0c19u, 0x3d1a54b8u, 0x3b035ddcu,
+0x3d9dd930u, 0x3ccc8e57u, 0x3c2e5678u, 0xbe1746d4u, 0x3e437180u, 0x3d5c8710u, 0xb98e7dc3u, 0x3c4993d1u, 0xbd3d57d9u, 0xbe139941u,
+0xbdbaa57bu, 0x3d8d2e48u, 0x3e85c80au, 0xbdaf111fu, 0xbd84da36u, 0xbc202fbfu, 0xbc9fe69du, 0xbc40bd83u, 0xbdc9cdbfu, 0xbd513800u,
+0x3dab1e88u, 0x3e4a701au, 0xbc274cebu, 0xbe017033u, 0xbd95fd19u, 0xbcac027cu, 0xbd18fa96u, 0x3c10aa26u, 0xbcb02bbfu, 0x39385674u,
+0xbe3d3315u, 0x3d8238a7u, 0x3d7b2497u, 0x3e5dbbb8u, 0xbba2799bu, 0x3d404ecdu, 0xbc1d9c9fu, 0xbd80f7ceu, 0x3d431062u, 0x3b4f1e2fu,
+0xbd693818u, 0xbd915ca0u, 0xbd9fe8d6u, 0xbdb2889cu, 0x3de445c3u, 0x3db938c4u, 0xbd3d1ad4u, 0x3cc72abeu, 0x3dd941a1u, 0xbd122314u,
+0xbd470250u, 0x3d456e29u, 0xbd9cd141u, 0xbdbab640u, 0x3da0926fu, 0x3d62792fu, 0x3ca787e9u, 0x3ea7fac1u, 0x3e29a505u, 0x3dcc1280u,
+0x3e0834cau, 0x3d4cd53bu, 0xbcb359ebu, 0x3cd392d1u, 0x3c42647du, 0xbd1d2062u, 0x3d3c38e6u, 0x3e48a66du, 0x3d76a027u, 0x3d4b5426u,
+0x3cb1a313u, 0x3d912158u, 0xbc481606u, 0x3d051a70u, 0x3dc10c9au, 0xbda75ca2u, 0x3e0215fcu, 0x3c7ae1adu, 0x3bd2dd8au, 0x3db55ad0u,
+0x3dad6a2eu, 0x3d3f408bu, 0xbddd9563u, 0x3e848324u, 0xbe06eec6u, 0xbbd5d389u, 0x3ddee6b5u, 0xbd977011u, 0x3d46f0b7u, 0x3e8c4025u,
+0x3dfb28dcu, 0xbc211771u, 0xbd657808u, 0xbf0d2784u, 0xbea43230u, 0xbd0339acu, 0xbda62594u, 0x3d2c1ed1u, 0x3d91fb18u, 0x3d82b2ddu,
+0x3d8c88eeu, 0xbdcdb9d3u, 0xbe71f21cu, 0x3e1b5b97u, 0x3cbfba46u, 0x3e2b8814u, 0x3d642330u, 0x3e6e3c53u, 0x3e7770e4u, 0x3e2c927fu,
+0xbcd2fec9u, 0xbe994ea2u, 0xbd8ee3e7u, 0xbd9ee544u, 0xbdd8e5d6u, 0xbd23ff00u, 0xba87783fu, 0x3debecbeu, 0x3d4c9d81u, 0x3d6e3b72u,
+0xbeaa08ffu, 0xbd729f9du, 0x3cefe809u, 0xbdc41038u, 0x3b9dc8a4u, 0xbd99f082u, 0x3dce4e9du, 0xbc731b44u, 0x3dbafa8au, 0xbdf3bd26u,
+0x3cee192au, 0xbde13ab7u, 0x3d52197du, 0x3d54c1c8u, 0x3dcbc5ccu, 0x3d6eb35du, 0xbda3a01du, 0x3de67437u, 0xbe01fc15u, 0xbe094b90u,
+0x3e2e1c2cu, 0x3db147efu, 0xbcf44095u, 0x3d5fe75fu, 0x3d1d5dd3u, 0xbcb9a68du, 0xbd4f8509u, 0x3dc52d51u, 0xbb7a3fe7u, 0x3cf9507au,
+0xbce2359eu, 0xbe3a1dc3u, 0xbd2eee8fu, 0xbdcf5456u, 0x3dcb8626u, 0x3b17e6a8u, 0x3e4a190bu, 0x3e3ba537u, 0x3c7ef86eu, 0x3c6e1477u,
+0xbca3fde7u, 0xbd51bf6du, 0x3db2a2e2u, 0x3d9c07e9u, 0xbd967ee2u, 0x3e2f5055u, 0xbdd32a2bu, 0x3d0922a0u, 0x3dbb262cu, 0xbe0a014du,
+0xbe079015u, 0xbcbb2a7du, 0x3db37853u, 0xbe1845b0u, 0x3da5c095u, 0x3ceba01eu, 0xbdbc37c2u, 0x3e1b9f9fu, 0xbdc6b69fu, 0x3dec0f6du,
+0x3e7831fbu, 0x3d85d002u, 0xbd2150e4u, 0x3e051708u, 0xbdfcc1c1u, 0x3d806601u, 0x3dcbe748u, 0xbd00c0b4u, 0x3c3f8f53u, 0xbe4f70f7u,
+0xbd91dedeu, 0xbde1d8eeu, 0x3e382ccdu, 0xbd24b38fu, 0x3bf382c2u, 0xbd6d42e0u, 0xbd1c3a00u, 0x3c1aeaeau, 0x3db226dbu, 0x3ce18851u,
+0x3e48b771u, 0x3d8f6c74u, 0xbaa90b4cu, 0x3d1f0f82u, 0xbe1669ccu, 0x3d9c99b9u, 0xbd6e728fu, 0x3ceb389bu, 0xbdae1688u, 0x3ba83612u,
+0x3ea4066bu, 0xbe24d5c6u, 0xbe4a7940u, 0xbea69173u, 0xbd396ebfu, 0xbd910cfau, 0x3d510439u, 0xbdb3e09cu, 0xbe2b3baau, 0x3cd9f665u,
+0xbe55ab45u, 0xbe4b5ffau, 0xbddf2259u, 0x3d8c6ef3u, 0xbcd3103eu, 0xbe353a78u, 0xbdc1c063u, 0xbd6db9f2u, 0x3ea84ebbu, 0xbdbf3546u,
+0xbb1dd467u, 0xbd5eba56u, 0xbdc57ffeu, 0x3d55bda5u, 0x3d37571bu, 0x3dfb1518u, 0xbe287250u, 0x3ecf75a5u, 0x3dde528bu, 0x3d1b127du,
+0xbcfb57b7u, 0xbe48d867u, 0xbada0c9au, 0x3c86af71u, 0x3d99394cu, 0xbd2c94abu, 0x3d892a55u, 0x3d18d702u, 0xbe34da08u, 0xbe51b619u,
+0x3c502c35u, 0x3c40b82au, 0xbdb37955u, 0x3c2851cfu, 0x3d139a33u, 0xbeeef713u, 0x3d10f5afu, 0x3b89cf0au, 0x3ccb8a48u, 0x3e325d32u,
+0x3e48ca82u, 0x3eaa630du, 0xbc02745bu, 0x3e20dfc2u, 0xbdc55069u, 0xbe6cf406u, 0xbcf3305au, 0xbdc6525bu, 0x3c737df2u, 0xbc924b5bu,
+0xbe4d1a2bu, 0xbceca700u, 0xbd73d876u, 0xbe9e8d2au, 0x3e4a5993u, 0xbd7c3d8du, 0x3e3af39cu, 0x3dabe736u, 0x3d5eb485u, 0x3d385fd3u,
+0x3dd566e5u, 0xbe261addu, 0xbe745b03u, 0x3d764abdu, 0x3d2b1fb7u, 0xbd19c9e7u, 0x3c55cf6cu, 0xbdef594du, 0xbd99f154u, 0xbd7f1261u,
+0xbdb65f50u, 0xbe15efb8u, 0xbe6fe720u, 0xbda4d004u, 0xbdd4a8a9u, 0xbdcd4ab8u, 0xbd69c2b0u, 0xbdfe23efu, 0xbd6646e0u, 0x3e61c36eu,
+0xbe923a24u, 0x3c230cd8u, 0x3e0b80e7u, 0x3ddeefebu, 0xbd3ac9c8u, 0x3dceddbeu, 0x3e8a778eu, 0x3e3f7ffeu, 0x3e81f201u, 0x3baff4feu,
+0x3de2f1c0u, 0x3b958826u, 0x3dd3eb43u, 0xbdca264au, 0x3dba73e4u, 0xbdb7660du, 0xbccd711bu, 0x3d8984f2u, 0xbe15622cu, 0xbd77daf2u,
+0x3d08bf44u, 0xbd6de8b0u, 0xbd0db079u, 0x3b820578u, 0x3ea1a227u, 0x3e54f31du, 0x3e00d14cu, 0xbea28818u, 0x3cb03763u, 0x3cac22c7u,
+0x3bcf0495u, 0xbdb835d4u, 0xbd356d88u, 0x3c1a2ed8u, 0xbdda66cbu, 0xbd5afa2du, 0x3da0c1d4u, 0xbce6ca45u, 0x3dbbc1eau, 0x3da99d47u,
+0xbd365759u, 0xbd619e69u, 0xbde4ea65u, 0xbd1f471fu, 0x3c80a490u, 0xbdd77433u, 0x3d37d7e7u, 0xbdd352eeu, 0x3cae66cdu, 0x3dae018eu,
+0xbd699016u, 0xbdc60accu, 0x39084350u, 0xbdffcedbu, 0xbe858f84u, 0xba578c94u, 0xbca048e5u, 0xbd8b4d39u, 0xbd1244eau, 0x3d828b73u,
+0xbc4932b7u, 0xbd9ce410u, 0x3da9d5c7u, 0xbe9754a8u, 0xbd71881au, 0x3d3b96a6u, 0x3d3ec71du, 0x3e08ed94u, 0xbdb0d8e6u, 0xbe7b36a0u,
+0xbbe31da0u, 0xbc8c564eu, 0xbe122fd1u, 0xbd3b12ccu, 0x3d41d6ffu, 0x3ce68b7fu, 0xbc219af6u, 0xbd415ab0u, 0x3c9fbda8u, 0xbb929d69u,
+0xbd574e7cu, 0x3e2e71e0u, 0xbd0e911du, 0xbd794011u, 0xbd9121bau, 0x3dc60167u, 0xbd85f20du, 0x3cdb93d8u, 0x3d23fad5u, 0xbe661846u,
+0x3d7b0e50u, 0x3e080b3au, 0xbe47878fu, 0xbe06becbu, 0x3d6756afu, 0xbce50664u, 0xbd7f0ed3u, 0xbda49eecu, 0xbe2599e4u, 0xbe119975u,
+0x3bc1f7e1u, 0xbc8fcb13u, 0xbdefe21au, 0xbcc77b1bu, 0xbd9da353u, 0xbd4bb9cfu, 0x3db4e133u, 0xbe38b968u, 0x3e47ba05u, 0xbe08da9du,
+0xbda4fb79u, 0x3d95f2dfu, 0xba1cb339u, 0x390d7dffu, 0xbbbd8f36u, 0xbc250038u, 0x3d7b040eu, 0xbd8d95b5u, 0xbdf6969fu, 0x3d5ff558u,
+0xbe085f9au, 0xbda23117u, 0x3dd5ad14u, 0x3d0e61f9u, 0xbd67fb77u, 0x3e9599ddu, 0x3ec4b912u, 0x3d5e2560u, 0x3d1060bau, 0x3e241e45u,
+0x3dd334f1u, 0x3e5a7aefu, 0x3d2d391du, 0xbe1393eeu, 0x3df011ddu, 0x3ed79334u, 0x3e337e6bu, 0x3d789049u, 0xbd893b30u, 0x3dd9d471u,
+0xbbbfbbe2u, 0x3c41073au, 0xbc5f7d43u, 0x3dd21420u, 0x3e716707u, 0xbd1ccd68u, 0x3d4bf299u, 0x3e204b87u, 0x3db1878eu, 0xbc728ba7u,
+0x3d9c7718u, 0xbdfd54ecu, 0xbe4859a3u, 0x3e9190a5u, 0x3dce4d7fu, 0xbd890183u, 0xbe122361u, 0x3c4431b3u, 0xbcee204du, 0x3d15ebf7u,
+0x3d8f765cu, 0xbb53491bu, 0x3e212a87u, 0x3c09de3fu, 0xbe0d03c5u, 0xbd2cdcc2u, 0x3b5e42f4u, 0x3d77acc8u, 0xbbd983c0u, 0x3e18362bu,
+0x3c8f05f4u, 0x3d651ab8u, 0x3e29c1ceu, 0x3ce9fb1fu, 0x3e3aa83du, 0x3dea995fu, 0x3db3f998u, 0xbd988467u, 0xbe80841du, 0x3d624e7fu,
+0x3df96823u, 0xbde82be5u, 0x3ccdaca7u, 0x3dd4ffcfu, 0xbd65d52au, 0x3c9d3da7u, 0x3d4468b5u, 0xbdb2cad3u, 0xbbf01640u, 0x3b1dd046u,
+0xbdd2ff8fu, 0x3d030216u, 0xbe008b27u, 0xbd52e243u, 0x3d9b2517u, 0xbd5bda13u, 0x3c9e6723u, 0xbe7e824au, 0x3d7f51bcu, 0xbc9ffeb8u,
+0x3cab6065u, 0x3c602118u, 0x3d8afe18u, 0x3df4e375u, 0xbdcf2735u, 0x3c74b8c6u, 0xbbc00db3u, 0x3d883d3du, 0x3d4ac07cu, 0x3dae7cd2u,
+0xbcc70103u, 0x3e106594u, 0x3ccc8feau, 0x3c7d5e0eu, 0xbd088be0u, 0x3d9bb339u, 0x3ccf3451u, 0x3cdf4808u, 0x3d061249u, 0x3e335200u,
+0x3cb81d23u, 0x3bae3cb5u, 0xbd8577d3u, 0xbdb92c62u, 0x3d988a73u, 0xbc122f2au, 0xbd51dea0u, 0xbddb1b4eu, 0xbe2ce7efu, 0x3d64fb93u,
+0xbd84a441u, 0x3e6c131cu, 0xbd4bbfb7u, 0xbe991d2fu, 0xbdc9bd83u, 0x3d19d676u, 0xbe3562a1u, 0x3dbc88e7u, 0x3e09c88du, 0xbdefc3a0u,
+0xbceedd5bu, 0x3d854144u, 0xbdc95f24u, 0xbe006241u, 0xbd320140u, 0x3db84deau, 0xbcdee900u, 0xbd83a999u, 0xbbc86d72u, 0x3d097a84u,
+0xbd221ff4u, 0xbdacf80du, 0x3d654447u, 0x3e11b88cu, 0x3df428cbu, 0xbe327f6fu, 0x3db858bbu, 0x3ddfeadfu, 0x3e16d9abu, 0x3c97640du,
+0xbe5b68ffu, 0xbdc62be9u, 0x3bb5386bu, 0x3e57239bu, 0xbdaa38bdu, 0xbd3ad94au, 0x3d1c69acu, 0xbc205d72u, 0xbb49bba3u, 0xbcc2ef00u,
+0xbc1e024bu, 0xbdb9ecbbu, 0x3e72b6f1u, 0x3d660c33u, 0xbde1e018u, 0xbcdab48eu, 0x3c8db7b5u, 0x3db26997u, 0xbe1472f1u, 0xbde1335eu,
+0xbd6c700eu, 0x3e2cf8c7u, 0x3d807ab6u, 0xbdfaa1f5u, 0xbd40ba3du, 0xbe1945e3u, 0xbc9ee817u, 0xbce8c5d9u, 0x3e9c64bbu, 0x3dca7edau,
+0xbce3bc50u, 0x3e30db65u, 0x3d405c31u, 0x3d93fff3u, 0xbc778db6u, 0x3d40a3eeu, 0xbd89298eu, 0xbda03b2au, 0x3c26ad0eu, 0x3d4e3eb1u,
+0x3c353e9eu, 0xbdbdb519u, 0xbe1e53b6u, 0xbc41f634u, 0x3d8a3126u, 0x3c0eb2ccu, 0xbc0204abu, 0x3d0f439au, 0x3e408365u, 0xbe30308du,
+0xbe367e8du, 0xbc6e87fau, 0x3c1a06d4u, 0x3e1464c7u, 0x3e5113cdu, 0x3e0ea24eu, 0x3e057c8fu, 0xbd62ffc1u, 0x3dbfceb0u, 0xbdd504bau,
+0x3cd91afeu, 0xbdc926a7u, 0x3c3afa50u, 0x3dbe2d14u, 0xbdbadb51u, 0x3c869183u, 0x3dcdf293u, 0xbb43d5a5u, 0x3ce908f0u, 0x3c29ea15u,
+0xbd87396bu, 0x3d016985u, 0x3da9dd93u, 0xbe0c2d56u, 0x3c5452c5u, 0x3b93f1fbu, 0x3de1565eu, 0xbd49c806u, 0xbcb77983u, 0xbe84f5deu,
+0x3cf3a10du, 0xbde53f0du, 0x3d8ad861u, 0xbdb9fa19u, 0x3c5df17bu, 0xbd3ad66eu, 0xbe1267e8u, 0xbe652c24u, 0x3dcf1a9fu, 0xbd254ebau,
+0x3c328a5cu, 0x3e9c4402u, 0xbc553582u, 0xbd9e69cbu, 0x3cba8ffdu, 0xbd657766u, 0xbd70d2fbu, 0xbe800243u, 0xbd8155ccu, 0x3e17ef11u,
+0xbda99b25u, 0x3ddbe767u, 0xbe72e6b0u, 0x3e2c54c2u, 0xbd4b5f07u, 0xbd8a9536u, 0x3ca3ffdcu, 0x3bf5574cu, 0xbc9c823cu, 0x3c541df2u,
+0x3e60a606u, 0xbd2c64f6u, 0x3d800b3eu, 0xbd22d647u, 0xbd86b618u, 0xbdac7da9u, 0xbbaeea85u, 0xb9088ef0u, 0xbdb22154u, 0x3b64cbbau,
+0x3da2998fu, 0xbc217973u, 0x3d8f8417u, 0xbdaa8ad3u, 0x3de380f3u, 0xbe45513fu, 0x3d847587u, 0xbd17c93fu, 0xbe1f03e8u, 0x3ca498dfu,
+0xbe5ad742u, 0x3ce37e3eu, 0xbe936c40u, 0x3e2e159fu, 0xbdd5e67du, 0x3e19a7b8u, 0x3ea496b4u, 0xbbdc1522u, 0xbdfb32d1u, 0x3d847e18u,
+0x3dc513d8u, 0xbd61a5d8u, 0xbe159f8fu, 0xbbd60e71u, 0x3e85a640u, 0x3b31cf62u, 0x3e0436f3u, 0xbc85f885u, 0x3ddbb52eu, 0x3d0c45c7u,
+0xbd26843au, 0xbda0962eu, 0x3d5f772au, 0xbc5fa1a0u, 0x3d7653bau, 0xbc8bda15u, 0xbcc40b1bu, 0xbbdfdafdu, 0x3db066bfu, 0x3c3a770du,
+0xbc84973du, 0x3d012f9fu, 0x3d21d921u, 0x3ea101b3u, 0x3d8792a7u, 0x3d1d270eu, 0xbdade252u, 0x3d61b950u, 0xbce5770au, 0x3d2d37bdu,
+0x3caa3561u, 0x3b071983u, 0x3dae9594u, 0xbd415649u, 0x3d0c4a03u, 0xbd0a2aa9u, 0x3c3276e7u, 0x3b4e5f96u, 0x3d942ed7u, 0xbccdf62eu,
+0xbd831f40u, 0xbcc297e7u, 0x3d1da587u, 0x3db3354bu, 0x3dc76cb9u, 0x3cb4cf8bu, 0xbd5168fdu, 0xbd2207dcu, 0xbc9a0a8bu, 0xbdccb58fu,
+0x3d9bfa84u, 0xbd062c3fu, 0x3d8e2b02u, 0x3f0f73d4u, 0xbd7640abu, 0xbc9cfc36u, 0xbd1aa021u, 0xbce94786u, 0x3c365c97u, 0x3b87b954u,
+0x3dd0b8b3u, 0xbd8dbf55u, 0x3d8a684au, 0xbd4b15b5u, 0x3d7d3615u, 0x3d182f44u, 0x3db68938u, 0xbc4f6883u, 0x3d2efea0u, 0xbd7499fdu,
+0x3d119ae0u, 0x3d891ac9u, 0xbd2d0cd9u, 0xbbd9a0b0u, 0xbd942e40u, 0xbcaa3ab5u, 0xbd9458e1u, 0xbcfa1f06u, 0x3d1d256du, 0x3d8c76a9u,
+0xbe0569e4u, 0xbd9fa9ecu, 0xbc53b746u, 0xbb4d4e50u, 0xbd207056u, 0xbd116f49u, 0xbd904273u, 0x3e03091cu, 0x3b24b56fu, 0x3da7bf29u,
+0xbbb15d74u, 0xbd028575u, 0xbda787fdu, 0xbd1a86c5u, 0xbbae61e5u, 0x3dd9b9eau, 0xbcfa71f8u, 0xbe0f0dd9u, 0xbe997a97u, 0xbdc0d9cau,
+0x3d19586au, 0x3c09498du, 0xbbaa9cfdu, 0xbcb4c212u, 0xbc49b50du, 0x3dc77e84u, 0x3d34ec8fu, 0x3e422ef6u, 0xbceff4ffu, 0x3db1739au,
+0x3d4d93b6u, 0x3b36ccf9u, 0x3cb67a5eu, 0x3b94121au, 0xbc4426e1u, 0x3cad98ecu, 0xbe400c27u, 0x3d5d48c1u, 0xbd3eb015u, 0x3d968745u,
+0x3c96bee1u, 0x3e02b152u, 0xbe85f40fu, 0xbcd2abccu, 0xbd00696au, 0x3d4ca44au, 0x3b76f80eu, 0x3d94de5du, 0x3d816e15u, 0x3d07569eu,
+0xbcf49ce2u, 0xbdccb303u, 0x3a88b0ccu, 0xbd82112bu, 0xbce7e79eu, 0x3ca88fbfu, 0x3d06a80fu, 0x3b650f18u, 0xbd0860a1u, 0xbca489dfu,
+0xbd97d431u, 0x3bc10a59u, 0x3c8ff27au, 0x3d8e4380u, 0xbce267e6u, 0x3cfa4b92u, 0xbc0cf711u, 0xbd1a8676u, 0x3c351097u, 0xbde4f1e6u,
+0xbd0aa259u, 0xbd9f8295u, 0xbe0d3994u, 0xbd849f06u, 0xbd465507u, 0x3cbdca5cu, 0x3c30bc5eu, 0x3acdc9c9u, 0xbd48873au, 0xbd06559au,
+0x3df5eb96u, 0xbe0c2042u, 0xbda2ec4du, 0xbd28f553u, 0xbd20e86du, 0x3d024f7du, 0x3d1574a0u, 0x3dae9447u, 0xbd9df42bu, 0x3d97c873u,
+0xbd0e4757u, 0x3cd1a097u, 0xbc5c60a1u, 0x3d8552fbu, 0xbde0e099u, 0xbd8505b9u, 0xbdd05974u, 0x3d9c0792u, 0x3d13e139u, 0xbce7dccfu,
+0xbcaf4029u, 0xbd13890eu, 0x3dc930feu, 0x3d6a8943u, 0x3daa9b12u, 0x3d453c51u, 0xbd463eb9u, 0x3dad8656u, 0x3b26e0a0u, 0xbd4d9e3cu,
+0x3ccebc82u, 0x3cba7151u, 0x3d0b0b7bu, 0x3bf1a152u, 0x3ba0b701u, 0xbd7db71bu, 0xbdae5967u, 0xbe865976u, 0x3c420af6u, 0xbd269b1bu,
+0x3d9b3972u, 0x3da6e072u, 0xbcbdb98bu, 0xbe08cbceu, 0xbbe803deu, 0x3e3d37e0u, 0x3e41ce63u, 0x3e0c92e6u, 0xbdd16f83u, 0x3d70f83bu,
+0xbd2c5ee5u, 0x3e2e4639u, 0x3f726648u, 0x3da7a7d1u, 0x3b218974u, 0xbc3e9625u, 0x3c5fb2b6u, 0xbd090ca8u, 0xbe0476f9u, 0x3c706b68u,
+0x3e126bb1u, 0x3df301fau, 0xbca68675u, 0xbdebc011u, 0xb98b6c21u, 0xbdba1f83u, 0x3becc3ddu, 0x3ddc88c0u, 0xbdab777au, 0xbe2eb5b8u,
+0xbd24451du, 0x3e275ec9u, 0xbb2eceb2u, 0xbbcf7a63u, 0x3d6ed35fu, 0x3e2b3d38u, 0x3e8d142fu, 0x3d3cd3c4u, 0xbb9a82bbu, 0xbda6ed05u,
+0x3e33947cu, 0x3c5476a9u, 0x3d586f7cu, 0x3da869cbu, 0x3bf70b7cu, 0x3e437514u, 0x3d904769u, 0x3d0fbd10u, 0x3e19b1ccu, 0x3cf96282u,
+0x3deec0dcu, 0x3d003b6bu, 0xbc7487bcu, 0xbd8ae212u, 0x3d8989fbu, 0x3cf95e93u, 0x3e5398adu, 0xbe23d5b3u, 0xbd955885u, 0xbcf5aa9du,
+0xbd87810eu, 0xbdcab2afu, 0x3d0b5b89u, 0xbda4c409u, 0x3dcfb8cfu, 0xbda6500bu, 0xbdc7ae10u, 0x3d6b5dc2u, 0xbd7e44feu, 0x3d12efc6u,
+0x3d59cc05u, 0x3d1b16f7u, 0xbe78793du, 0xbca07e3fu, 0x3d13fc4du, 0xbd894c93u, 0x3dc634fbu, 0xbdc47444u, 0x3d1e7c35u, 0xbaed480eu,
+0x3ce5b6c1u, 0x3e5f7ae0u, 0x3e1dc54eu, 0xbcdc758cu, 0xbe0a9901u, 0x3e2d85e8u, 0x3d6f9f9fu, 0xbcbedf8eu, 0xbcf1a705u, 0xbdb39335u,
+0x3db78652u, 0x3cfe4772u, 0x3deec5f2u, 0xbd997642u, 0xbe0af5efu, 0x3d3dd711u, 0x3cfda32bu, 0xbd5ba48au, 0xbca09e57u, 0x3e07929eu,
+0xbc470ba6u, 0xbddbfbedu, 0xbe609ec5u, 0xbe3cbf72u, 0xbdbd9f49u, 0xbe570e32u, 0x3b806a3eu, 0xbe2326fbu, 0xbcd527bfu, 0x3dab5193u,
+0x3d92668du, 0xbe7551a2u, 0x3deec8e4u, 0xbc421d3bu, 0x3e381ae3u, 0xbd0e8863u, 0x3dd077b9u, 0xbe0a4f4fu, 0x3da55e1au, 0x3e66ae9au,
+0x3eb88aa9u, 0x3ddaa0bau, 0xbc9b4907u, 0x3c67d6bcu, 0x3d3b745fu, 0x3dcf1de6u, 0x3d1a828eu, 0x3e22341eu, 0xbd432a4fu, 0xbe161d9bu,
+0xbd81b623u, 0x3ca42e06u, 0xbdf15747u, 0xbad08588u, 0xbd205df4u, 0x3d2c5f54u, 0x3cb6ccd6u, 0x3cba129bu, 0x3d264948u, 0xbe274d4eu,
+0x3d21a9feu, 0xbd13479du, 0x3d6b738au, 0xbca6d277u, 0x3d78a1c1u, 0x3e888ff1u, 0xbc81c192u, 0x3e89d7bdu, 0x3e0a4ea1u, 0x3c91970du,
+0xbd9c3bafu, 0xbc44e0c9u, 0x3e00800bu, 0xbc318a52u, 0x3bcfa10eu, 0x3e6e95e7u, 0xbdb7516fu, 0xbcfa59c5u, 0x3d7268abu, 0x3e2fc349u,
+0x3def5bb4u, 0xbd2fce07u, 0xbb192041u, 0xbdab7c3du, 0xbd4c8821u, 0xbcecdc8fu, 0x3da27344u, 0xb9e63ea0u, 0xbd5a8245u, 0xbcc596ddu,
+0xbcd1ae73u, 0xbd0b3b1fu, 0x3b775c50u, 0xbe3d279au, 0x3e12dc49u, 0xbd21326bu, 0xbdb66a36u, 0xbd97fed5u, 0xbdecc443u, 0xbdc430c3u,
+0x3d3f50f0u, 0x3c93c175u, 0xbdb42158u, 0x3dc6d2b6u, 0xbd56a0ccu, 0x3c9ef623u, 0xbcfab4d6u, 0xbde28864u, 0xbd18365fu, 0xbe093714u,
+0xbd94f9ecu, 0x3da4f339u, 0x3e5779b6u, 0xbe49b8b0u, 0xbc36b3b3u, 0x3dec53e0u, 0xbd847a67u, 0x3e0b5ff5u, 0xbe9268abu, 0x3d783f05u,
+0x3e1e9805u, 0xbcc2ce32u, 0x3e03bfc3u, 0xbdc0d321u, 0xbd121fa1u, 0x3c39cedeu, 0xbdca409cu, 0xbdff7ed2u, 0xbd8c7fc0u, 0x3d291400u,
+0x3d809136u, 0x3d1dffc6u, 0xbd69679au, 0x3da418e4u, 0xbceecb28u, 0x3d49303du, 0xbbfb6131u, 0xbcc7c563u, 0xbdca8085u, 0x3e8c334du,
+0xbe26dca9u, 0x3cd3fb7eu, 0xbe6f6962u, 0xbe02586eu, 0x3d8c5d50u, 0x3e3df20du, 0x3e42f28eu, 0xbd42f4b0u, 0xbdc8477eu, 0x3de3d268u,
+0xbca6e392u, 0x3cd16e71u, 0x3d5cedb9u, 0xbd363884u, 0x3e03e097u, 0xbe40df28u, 0x3dceff3fu, 0x3db800c3u, 0x3dacc1f3u, 0xbdc23efbu,
+0x3ddf4c37u, 0x3da4b760u, 0xbd33e44fu, 0xbd542683u, 0x3c560d95u, 0x3d2fce9au, 0xbeaca052u, 0xbdb86381u, 0x3db2b5c6u, 0x3d27a167u,
+0xbcc12097u, 0xbc5764d2u, 0xbe76addcu, 0xbe1738f2u, 0x3c812350u, 0x3e36c184u, 0xbde0940eu, 0xbc6f2c0fu, 0xbd6694f6u, 0xbc4487e8u,
+0x3c197a52u, 0xbe2148ccu, 0xbc1ebe46u, 0xbe19bd4bu, 0xbcebe007u, 0xbdd6b97fu, 0xbdd84b52u, 0xbe14b71bu, 0xbdebbf19u, 0x3cb71e12u,
+0x3e8691a2u, 0xbdefcea3u, 0xbe1c8619u, 0xbddcb293u, 0x3cc13079u, 0x3d64abe5u, 0x3e618b28u, 0x3d23e414u, 0x3d6b1860u, 0x3d8d4973u,
+0xbc40f379u, 0xbd002b0eu, 0x3db5b335u, 0xbe529fc7u, 0xbcfb2720u, 0x3d6c0866u, 0xbd4c859eu, 0xbd56816au, 0x3d6406d8u, 0xbc1cfeafu,
+0x3e370206u, 0xbec7eb8du, 0x3ca4e9abu, 0x3d970cb3u, 0x3d6e06fau, 0xbbdca3c3u, 0xbdc25d7bu, 0xbd324cf3u, 0xbde3bbd4u, 0x3e106e22u,
+0xbd319729u, 0xbd1a6706u, 0x3d7c5a02u, 0xbd138ef2u, 0x3e3e360eu, 0x3be70cf8u, 0x3cd53efbu, 0xbce92c32u, 0xbb3af0b5u, 0xbe516d6eu,
+0x3d9ab257u, 0xbc3e38c2u, 0xbdbf898au, 0x3de02a65u, 0x3ddf085au, 0xbcb82b05u, 0x3c029105u, 0x3e77bd01u, 0xbdfb3194u, 0x3e2b401au,
+0x3e472d7bu, 0xbd0950d3u, 0x3c74b852u, 0xbcda3dddu, 0x3e38e1e5u, 0xbdacc4aau, 0x3e017739u, 0xbc783c8du, 0x3d86a231u, 0xbde49330u,
+0x3d681ef4u, 0x3c811cf4u, 0xbc2bccf2u, 0xbec7db2eu, 0xbe9aaa38u, 0x3d1dc842u, 0x3d2c66f2u, 0xba385d83u, 0xbcfe3791u, 0x3d848c6bu,
+0xbc77db05u, 0xbc593f42u, 0xbd24f8a8u, 0xbc76a50eu, 0x3df6c6b7u, 0xbe059478u, 0x3dc709c6u, 0x3d332a66u, 0xbd0bac94u, 0xbd097ddeu,
+0xbdc19f1au, 0x3e263021u, 0x3e128fc2u, 0xbd00cf27u, 0xbd74a669u, 0x3ce847eau, 0xbe0eb427u, 0x3c2fc1e5u, 0x3d1c163du, 0x3c78d3c5u,
+0xbe782949u, 0xbe6c8342u, 0x3dd6baf2u, 0xbe951368u, 0xbe6e53c0u, 0x3d5b6d11u, 0x3dc39099u, 0x3c32f801u, 0xbe480c05u, 0xbd91580cu,
+0x3d60da32u, 0xbe962e6au, 0xbcf7b9b9u, 0x3d5da292u, 0xbe3c1f2au, 0xbe2a4210u, 0xbd94b958u, 0x3df3e037u, 0x3d15e571u, 0x3d2790bau,
+0x3d2c6dd6u, 0x3e1e6170u, 0xbdab5697u, 0xbc0dadd6u, 0x3d50b932u, 0xbcf2920fu, 0x3d834902u, 0xbcd1c273u, 0xbd014ec6u, 0xbdc8a993u,
+0x3c101eadu, 0x3e0fbb5au, 0xbd06c616u, 0x3c29a20cu, 0x3e11b2c8u, 0x3d9da41fu, 0x3dc088bcu, 0xbd130681u, 0xbd97ba49u, 0x3df7904fu,
+0x3cfb3c11u, 0x3c4d2b67u, 0x3d274d67u, 0x3d88ad15u, 0x3db5464fu, 0x3e126f4cu, 0x3b5487b8u, 0xbdd87a6du, 0xbc2ace79u, 0xbd15e44au,
+0xbdc1160cu, 0x3ad5733cu, 0x3d205274u, 0xbd829bbfu, 0x3e214f80u, 0x3d7a568du, 0x3dc7ec21u, 0xbe67b1d3u, 0x3c5a8a35u, 0x3e299c61u,
+0xbdbdd977u, 0xbc1d5550u, 0xbbd9ebb8u, 0x3e226fd8u, 0x3dab904au, 0xbd368730u, 0x3e835d27u, 0x3d73b32du, 0x3d26d082u, 0x3d7079f8u,
+0xbb586478u, 0x3d09c4ffu, 0xbe51bb2eu, 0x3cb8cb9au, 0x3c7c76e2u, 0x3e6cc26du, 0xbd373a98u, 0x3cfb0675u, 0xbdc20718u, 0x3e4e6872u,
+0xbe927104u, 0xbe699fe4u, 0xbd9fb65bu, 0xbdb4e128u, 0xbc20112au, 0xbdfaaeb9u, 0x3d907d63u, 0x3d919408u, 0xbceef8a4u, 0x3de21f55u,
+0xbda22647u, 0x3ab068b7u, 0x3d88a8a3u, 0x3e66459fu, 0x3d7d0e49u, 0xbdb576abu, 0xbcf83fbdu, 0xbde9899au, 0x3d1689c0u, 0x3c775bacu,
+0x3dfcab12u, 0x3dff8fafu, 0xbe61b5deu, 0xbe48adcfu, 0x3d1be6d4u, 0xbd8c90c1u, 0x3e1ce116u, 0x3e0b6fd7u, 0xbd9dc99au, 0x3de35284u,
+0xbbe3f98du, 0xbe351656u, 0x3e0ebe31u, 0x3cca47e4u, 0x3dff10f4u, 0x3cd15ea7u, 0x3da3b1b7u, 0xbc6de34bu, 0x3d1538d1u, 0xbe23419du,
+0xbe0b241eu, 0x3c6e5be8u, 0xbcbe0f21u, 0x3e514cb0u, 0xbc61ec88u, 0xbddf7663u, 0x3d0e483fu, 0x3b62b333u, 0xbe3989d7u, 0x3d91465au,
+0xbdced57cu, 0x3a644f37u, 0x3d53c4c2u, 0xbe1652efu, 0x3dbc7ff4u, 0xbd01a8a4u, 0x3d7ba9e0u, 0xbe2fadcfu, 0xbd9074cau, 0xbe0d96e3u,
+0xbcd36819u, 0xbe5cf03cu, 0x3dec28b1u, 0xbc91e0e6u, 0x3c3295e9u, 0xbdc28acau, 0x3dc8d0bbu, 0x3e15aa05u, 0xbdbbc39au, 0xbcaecf58u,
+0xbdc7604du, 0x3da4f22eu, 0xbe86f6a7u, 0xbdaadbc4u, 0xbcf33510u, 0x3d9f3cb1u, 0x3e9b5becu, 0x3e924506u, 0xbc304949u, 0xbd00e6e9u,
+0x3e1352a2u, 0x3d74bf22u, 0x3d87a34cu, 0xbc9cfe17u, 0xbb382f72u, 0x3e334d75u, 0x3de5ca2bu, 0xbe192a3fu, 0xbc04381du, 0xbdbac586u,
+0x3d55753bu, 0x3d510679u, 0xbd59d940u, 0x3e357101u, 0x3e08c600u, 0xbd18f261u, 0xbca71d58u, 0xbe91a0b4u, 0xbdc49d90u, 0xbc2ebe7fu,
+0xbd1e51f0u, 0xbcc6715fu, 0xbe37a8e4u, 0x3e0eb97fu, 0x3dfdecf8u, 0x3deed363u, 0xbd3a007du, 0x3db40275u, 0xbd694882u, 0xbd7f2e5cu,
+0xbe0b5513u, 0x3e79aa82u, 0x3e1e3a2cu, 0x3d717b01u, 0x3d68dcedu, 0xbc9c7bf2u, 0x3a5c3ce9u, 0xbc54eae0u, 0x3d852f62u, 0xbc5a5d4du,
+0xbe2c92d7u, 0xbda22ea7u, 0x3e54f830u, 0xbd903580u, 0x3d70f062u, 0xbd5dde44u, 0xbc8f7578u, 0x3e15cee5u, 0x3d6d96a9u, 0xbe6e98d4u,
+0xbe57dce4u, 0xbdce4bb9u, 0xbc10ae3du, 0x3d494a2cu, 0x3cfcce79u, 0xbd89dbcdu, 0x3d7b4646u, 0xbd865d29u, 0x3e2316f4u, 0x3e5d8383u,
+0x3d0b1b85u, 0xbcaeaa55u, 0xbc9d313bu, 0x3c89ea8cu, 0xbdcddcbcu, 0x3cb647e1u, 0x3cd4db77u, 0xbd53a891u, 0x3e82318cu, 0x3cba934au,
+0x3dc9e062u, 0xbe2650c3u, 0x3bf3e3d3u, 0xbda6c33eu, 0x3dd20f4cu, 0xbc9d2e29u, 0x3ea0dacbu, 0xbe15441bu, 0x3e44550du, 0x3d45925cu,
+0x3d6e7edfu, 0xbcbca990u, 0x3e0af069u, 0xbd2f0ecbu, 0xbb895fabu, 0xbc4f6c44u, 0x3e9a03bcu, 0x3ce6e806u, 0xbdc1c578u, 0x3d594c1fu,
+0xbd3b4b98u, 0xbdd59a45u, 0x3d25fb28u, 0x3d2d4b30u, 0xbd9cb4d8u, 0xbe67184du, 0x3e0180dcu, 0xbdb10578u, 0x3d506cf9u, 0xbda51200u,
+0x3d52efb0u, 0xbd2e53a3u, 0x3a7ae495u, 0xbc2dd84bu, 0xbd56d036u, 0xbd13efcau, 0xbdf95ebdu, 0x3dfbdfeau, 0x3d8b8968u, 0x3d135eb4u,
+0x3c03ffb9u, 0xbd1bbc50u, 0x3e474fa2u, 0x3de966aau, 0x3da9e150u, 0x3e042776u, 0xbdf8ec1eu, 0x3d8bb051u, 0xbd8fb1acu, 0xbdaaf9aau,
+0x3b30655au, 0xbe6fc8adu, 0xbe8ed138u, 0x3b3c8d88u, 0xbb3cd888u, 0x3dff23ffu, 0x3dfa2559u, 0xbda9858au, 0xbd9dcc2cu, 0xbc2733fau,
+0x3e063935u, 0xbdc5b79eu, 0xbe89ed3fu, 0xbd9d0111u, 0xbb795232u, 0xbd433f48u, 0xbd24ae62u, 0xbe960d68u, 0x3e226c42u, 0x3c32e4ebu,
+0xbdc711c6u, 0xbe06dd09u, 0x3ba3eebfu, 0xbd9c60f9u, 0x3dfa3493u, 0x3e0a566au, 0xb9dfc7abu, 0xbd87fd46u, 0x3dd23c31u, 0x3ec320bdu,
+0xbe07dd3cu, 0xb822d8cdu, 0xbc467202u, 0xbd69251bu, 0x3cf2e407u, 0x3a7fae4cu, 0x3e281585u, 0x3ce6adabu, 0xbd89b619u, 0xbea788d5u,
+0x3a19e5b6u, 0x3dfef4f7u, 0x3e28abd9u, 0x3c608311u, 0x3db159bcu, 0xbc10f17au, 0xbdedad17u, 0xbd968155u, 0x3dd978d1u, 0x3dc2ddabu,
+0x3d4c060fu, 0xbddd9faeu, 0x3cb58f8bu, 0xbdf79623u, 0xbcb6876fu, 0xbd85b989u, 0xbe4a15c1u, 0xbd874758u, 0xbe19ebf7u, 0xbe28c67fu,
+0x3d929a5du, 0xbc888dffu, 0xbdf78194u, 0x3ddaf124u, 0x3e4cf418u, 0xbe7ff768u, 0x3caf99c4u, 0x3d7a73ceu, 0x3e6481cau, 0xbe1174b9u,
+0xbe2db178u, 0x3e50b1d5u, 0xbda14effu, 0xbd86a7f5u, 0x3d7d9642u, 0xbe7d3769u, 0x3dfa080eu, 0xbd825533u, 0x3eade867u, 0xbd5a1b77u,
+0x3d02f6c7u, 0x3dbb882fu, 0x3e1bfb17u, 0x3d712ddcu, 0x3c00af1cu, 0xbda8bf7du, 0x3d6be5deu, 0x3d495cafu, 0x3d35eab1u, 0xbe70735du,
+0xbebd63c3u, 0x3e1420edu, 0x3eba70f0u, 0x3e96a73au, 0xbe3b17c6u, 0xbe40e80eu, 0xbeae3642u, 0x3d6fff12u, 0xbdb0e2bcu, 0xbdbeca53u,
+0x3e1b2455u, 0x3d5e0c07u, 0x3df3de8au, 0xbe6e8e11u, 0xbde370f0u, 0x3bfa6f60u, 0x3cda3305u, 0xbd10cda8u, 0x3e50f7c8u, 0x3b7dfeceu,
+0x3db8bff8u, 0xbe5ce89eu, 0xbe6c2a92u, 0xbd32efcbu, 0x3e61f907u, 0xbd9dd539u, 0x3d405cedu, 0xbd9a07a8u, 0xbdad722du, 0xbe115d15u,
+0x3e4efdafu, 0x3dd2651cu, 0xbd33c3d3u, 0xbc41d9d8u, 0xbda7a504u, 0x3dea44c6u, 0xbe02bdfcu, 0xbdfcc574u, 0x3da13b31u, 0xbacb42d1u,
+0xbd4cde4bu, 0x3d147261u, 0x3da6d13eu, 0xbca0ec71u, 0xbd95d063u, 0x3d22ffa7u, 0x3de6bbefu, 0x3bc68003u, 0xbe0620aau, 0x3d52ac43u,
+0xbadfac43u, 0x3d28b64eu, 0xbe67a3c2u, 0x3dd32a38u, 0x3d7786c6u, 0x3ba754f6u, 0xbecde188u, 0xbe687ce2u, 0x3e7e3a70u, 0x3e944caau,
+0x3e0942ccu, 0xbd6cf219u, 0xbdfe581eu, 0xbdbd626au, 0x3db5d0a1u, 0x3de3e8deu, 0xbd8d008eu, 0x3d77244bu, 0xbba2c510u, 0xbca9d4c4u,
+0xbdb4b26fu, 0xbdf8f61fu, 0xbcfd21e7u, 0xbb3e2512u, 0xbe1e7941u, 0xbc74ef32u, 0xbd44a1a5u, 0xbdc8f8bdu, 0xbdd13bf5u, 0x3d82e90bu,
+0xbc28be9fu, 0xbd26fd10u, 0xbdabfe80u, 0x3e62ca8au, 0x3de9910bu, 0x3d5731a8u, 0xbe628bd1u, 0x3c72bccau, 0x3dfae329u, 0xbcb61e11u,
+0x3ce4bc4eu, 0xbbf00e76u, 0xbd5a8daeu, 0x3e4f0663u, 0xbd155988u, 0x3d9be60fu, 0xbe3e3c89u, 0x3d8c5205u, 0x3e0a2e79u, 0x3c81779fu,
+0xbde52795u, 0x3c16bd1eu, 0xbca4d222u, 0x3d100af6u, 0xbb8c0811u, 0x3e21deccu, 0x3ae48ca5u, 0xbd6b3385u, 0x3d7a107cu, 0xbdcf8e09u,
+0x3d28c410u, 0x3dd2d553u, 0x3cd5ad0du, 0xbd4678f2u, 0xbd02c03fu, 0x3d833b5eu, 0x3d879dd2u, 0xbe3bb9a5u, 0x3e1eca99u, 0x3eda3833u,
+0x3d8e9df8u, 0xbdf3df76u, 0xbecad6d4u, 0xbdd2044au, 0xbd84f5feu, 0x3cf4cc75u, 0xbdff78ebu, 0xbba5cb76u, 0xbe425f4du, 0x3e2df083u,
+0x3d9a6202u, 0x3d8b1779u, 0xbd2b624au, 0xbb999958u, 0xbc883f28u, 0xba26b8a7u, 0x3dd6f475u, 0x3e8cca95u, 0xbe78df34u, 0xbe1c9264u,
+0x3cecf77au, 0x3d5d839fu, 0xbdf1caf8u, 0x3d586c9du, 0x3b965792u, 0xbe40a562u, 0x3dda2fe4u, 0x3dee1674u, 0xbc8708b3u, 0xbdbb4226u,
+0x3d6405d1u, 0xbd927557u, 0x3e4fc575u, 0xbd812278u, 0xbd865e89u, 0x3cb8c16au, 0xbbe8bbf7u, 0xbe287f12u, 0x3d244297u, 0x3e18c3e2u,
+0xbdc7a745u, 0x3d340fefu, 0xbdae324fu, 0x3d9b5e51u, 0xba9a0766u, 0x3e52d9ccu, 0xbd8766d3u, 0x39ad2c98u, 0x3d03785eu, 0xbe19965au,
+0xbe0e2056u, 0x3d0eaf30u, 0x3cbf5c7du, 0xbd1b726bu, 0x3d0ce8d8u, 0x3e039fdfu, 0x3c4c43ddu, 0xbe0c00d2u, 0xbc94a798u, 0x3b98b878u,
+0xbd990697u, 0xbe1cffa8u, 0x3e8cdaf2u, 0xbd520473u, 0xbe49d63du, 0x3d420e36u, 0x3d9b772au, 0x3d683a72u, 0xbc9e35dfu, 0xbc2b4325u,
+0xbe9f0dabu, 0x3e62bc1fu, 0xbcb01db9u, 0xbb97afefu, 0x3e76d1f9u, 0xbb860669u, 0x3b66865bu, 0x3d012ecfu, 0x3bc09c91u, 0x3e3fb440u,
+0x3b1cd583u, 0x3d897aceu, 0x3d7957edu, 0xbe392767u, 0x3c0cdc87u, 0x3d55f526u, 0x3d6584c4u, 0x3e087c2au, 0xbdc07aa8u, 0xbe1768c9u,
+0x3e6e9be9u, 0xbd4a6802u, 0xbdaa0c93u, 0xbd69e445u, 0xbda02a57u, 0xbd2cbfd5u, 0x3e2dace8u, 0x3d3c3516u, 0xbe3c8858u, 0xbd732698u,
+0xbe5ae920u, 0x3d4fc0e8u, 0xbd9075c3u, 0xbd0ae83eu, 0x3d93e82du, 0xbb3ac66au, 0xbd311e20u, 0xbdcf5356u, 0xbcd40916u, 0xbe506cb3u,
+0xbda3976fu, 0x3da63442u, 0x3dd90423u, 0xbda54709u, 0xbd46316eu, 0xbdf2395bu, 0x3af3c7a1u, 0x3e0202e7u, 0xbe6125fbu, 0x3e2dd43bu,
+0x3dcb628eu, 0x3d7eabbau, 0xbc8811c1u, 0x3cb48aebu, 0x3e066befu, 0xbdc066f4u, 0xbe34fc5bu, 0x3dd09ec7u, 0xbd7e4208u, 0xbda1823au,
+0xbca7226fu, 0x3b41635eu, 0x3d7bfbacu, 0xbdf06321u, 0x3dfb77bbu, 0x3e711054u, 0xbc197ac2u, 0xbdcbc043u, 0xbbe77900u, 0x3be50d31u,
+0xbddecf25u, 0xbd86b031u, 0x3d9d10c0u, 0x3dfce817u, 0x3b787088u, 0xbbd2fe6cu, 0x3d372d23u, 0x3be85848u, 0xbc417527u, 0x3d97fe3du,
+0xbd27da3cu, 0x3e71f236u, 0x3d12b4c0u, 0xba88147cu, 0x3e175b82u, 0x3e405b30u, 0x3d74cd44u, 0x3d50c447u, 0x3dae9743u, 0xbd830486u,
+0x3d81fc1eu, 0xbc459510u, 0x3db0762du, 0x3c827f3fu, 0xbc4d42e3u, 0x3d18670eu, 0x3c7a77f1u, 0xbc3d48d7u, 0xbd2f2b9eu, 0xbe1779bdu,
+0x3dbda9a0u, 0xbdc09bbau, 0xbdd0d5a1u, 0x3c9fe047u, 0xbd0105c0u, 0x3d7eb039u, 0x3d8a8e22u, 0x3d5832b8u, 0xbd51a58eu, 0x3cc33ab4u,
+0xbdd2988eu, 0x3d486bb2u, 0xbe0fd2a1u, 0xbdb70851u, 0xbd4b48deu, 0xbd1dd744u, 0x3cd70594u, 0x3be15c9eu, 0xbd5dd6a6u, 0xbd73fb34u,
+0xbe259c0au, 0xbdb3d9e2u, 0xbcab3010u, 0xbe93cb56u, 0x3dd8d625u, 0xbd876e9au, 0xbc519b64u, 0x3d61e748u, 0xbbab7e8au, 0x3d7b0bfeu,
+0xbd36083du, 0x3da5a1c5u, 0xbd1d1590u, 0x3e4a42d1u, 0x3d2c5dcbu, 0xbe12e390u, 0x3d45e773u, 0xbccd89c7u, 0x3d85998du, 0xbe307261u,
+0xbd7240b7u, 0x3d1236b6u, 0xbaf00c84u, 0x3e00e1ebu, 0xbe71eed6u, 0x3d0db400u, 0x3d92570fu, 0x3c82d55bu, 0xbe056aabu, 0xbdaddcb5u,
+0x3d929b14u, 0x3e5e4b09u, 0x3dff5786u, 0x3d211201u, 0x3e21c647u, 0x3d797266u, 0xbd06d48bu, 0xbd765d9eu, 0xbd58125du, 0xbd17787bu,
+0xbd77c94cu, 0x3c803841u, 0xbe6fd9bbu, 0xbc9c0fe4u, 0x3e96668cu, 0xbe335634u, 0x3df2c776u, 0x3eaa1fbau, 0xbdf5d553u, 0x3df741b5u,
+0x3d360f91u, 0xbe930dd8u, 0xbe6ec4cbu, 0xbe07cd17u, 0xbde76082u, 0xbd8c7ae8u, 0xbc4ba688u, 0xbe2fc568u, 0x3ddedfa3u, 0x3dd10953u,
+0xbdf1373cu, 0x3e075c58u, 0xbcfe3503u, 0xbcbe2775u, 0xbe8b2269u, 0xbbb167b6u, 0x3d7453efu, 0x3cb65dc8u, 0xbd57d17du, 0x3e03831eu,
+0xbe9e2df3u, 0x3d9f3e30u, 0xbd398a5fu, 0xbd97d455u, 0x3caa278au, 0x3c1387d6u, 0x3e862bc7u, 0x3d0daedau, 0xbbf4f80au, 0x3da275fbu,
+0xba6a16afu, 0x3de706b1u, 0xbd26ba71u, 0x3d9dc3bcu, 0xbdac5252u, 0xbce85652u, 0xbd874468u, 0xbda0c538u, 0x3e21c80au, 0x3d32a74bu,
+0xbd086419u, 0xbd948270u, 0x3c8b6d27u, 0xbdaa06c6u, 0xbe42adfau, 0xbd17855bu, 0xbd634c5au, 0xbe1eb08fu, 0xbdbcaa57u, 0xbc6a1bf6u,
+0x3d2e11e0u, 0x3d46dd3au, 0xbe01b95fu, 0x3dacd61bu, 0x3a1116d2u, 0xbce75ae7u, 0x3e92933bu, 0x3da48ad3u, 0x3dcf5406u, 0x3e7c9193u,
+0x3c5e9624u, 0x3bae1a91u, 0xbd4ef065u, 0x3d30d127u, 0xbe11c054u, 0xbd886c92u, 0xbd63c413u, 0x3c888694u, 0x3ca0f411u, 0x3bc455fbu,
+0x3dca202bu, 0x3c10574du, 0xbd0c1386u, 0xbd063335u, 0xbe2c7846u, 0xbd9882efu, 0x3c2f9e91u, 0xbdccd25eu, 0xbe268959u, 0xbd3de417u,
+0xbd8dc328u, 0x3d30d396u, 0xbd5df6e7u, 0x3d8ea096u, 0x3d55d762u, 0x3df64f0cu, 0xbbf6f062u, 0xbd300b23u, 0x3cb45610u, 0xbd63dfe5u,
+0x3cdd3001u, 0xbe6e90d1u, 0x3d60288bu, 0x3d255fd1u, 0xbda861c7u, 0xbd210cb5u, 0xbda02210u, 0xbd61ff84u, 0xbcff8430u, 0x3e1858b9u,
+0x3d53e95au, 0xbe7107f3u, 0x3c715299u, 0x3c3947f3u, 0xbdc2d996u, 0xbca41994u, 0xbd30fb36u, 0x3d696ab6u, 0xbd5cb40eu, 0xbe54418au,
+0x3da1726cu, 0xbe14b513u, 0xbdbae4c6u, 0x3bc6a03au, 0xbbfd22ffu, 0xbd39082du, 0x3e032a35u, 0xbd952704u, 0xbe258bb1u, 0x3e026260u,
+0xbd1a1261u, 0x3c718105u, 0x3dded286u, 0xbd187c1fu, 0xbd849970u, 0xbe821be6u, 0x3d0d74ceu, 0x3d5a8866u, 0x3f33396au, 0x3d4fdaffu,
+0x3dc4d10eu, 0x3d14d117u, 0xbdc01818u, 0x3d8a1570u, 0xbcf0e0e6u, 0x3e13ea04u, 0x3ddd6c15u, 0x3cc00250u, 0x3e859389u, 0xbd21072bu,
+0x3e0bae2bu, 0x3e01ed18u, 0x3d6b3cc4u, 0xbc47b249u, 0xbd784203u, 0x3b35c555u, 0x3e183bc7u, 0xbb358c67u, 0x3dbebdf9u, 0xbc0a68b7u,
+0xbdab3f57u, 0x3cf4a02bu, 0xbdb4a603u, 0x3dc5672cu, 0xbd95f235u, 0x3d97f859u, 0x3ccda5b8u, 0xbde45c43u, 0xbcc1df9du, 0x3debed80u,
+0xba887a83u, 0xbda61d81u, 0xbca7c068u, 0x3d5e5e6bu, 0xbe0ca265u, 0xbcc6a9a8u, 0x3e222d42u, 0xbbe2b124u, 0xbe073791u, 0xbdc90aa3u,
+0xbe0ec342u, 0xbd710a68u, 0xbd96e798u, 0x3e05dcabu, 0xbe0b9dd1u, 0xbddd5112u, 0x3c44e2e6u, 0x3dc5ddffu, 0xbe0ae467u, 0xbdc0ef8cu,
+0x3dc9dc3bu, 0x3d4005a1u, 0x3ea933d8u, 0x3d8a6ec4u, 0xbd5a1ba3u, 0xbc5baf84u, 0xbcbcfce0u, 0x3ddba3c0u, 0xbdd708d4u, 0xbdaf7c68u,
+0x3cbf5d57u, 0x3d0e4cafu, 0x3d7b217au, 0xbd837715u, 0x3d9b0dbau, 0xbe049e0cu, 0xbd428b45u, 0xbd5a0b72u, 0xbdc7c0cfu, 0x3e1fda0eu,
+0xbcfd503fu, 0xbdab6362u, 0x3d412b5du, 0x3d5b00b3u, 0x3d7f7019u, 0x3d04c1e7u, 0x3dda1973u, 0xbe764109u, 0xbc92bd9cu, 0x3e242152u,
+0xbd73cf9fu, 0x3d33a1a0u, 0xbe08ca2cu, 0xbebc48a4u, 0x3dc09b56u, 0x3d0df3b3u, 0xbc49bc01u, 0x3e5a0ef1u, 0x3e4fb97au, 0xbaa1a914u,
+0xbd0e395eu, 0xbd8a6191u, 0xbdd8c9efu, 0xbda9a23du, 0xbd265603u, 0x3e0103d6u, 0x3d8e599au, 0x3f942b2eu, 0x3d9a43f9u, 0x3e22f03eu,
+0x3e26eb88u, 0x3d4a5c3au, 0xba883386u, 0x3a32cb3eu, 0xbcf7f1acu, 0x3d70d162u, 0xbd028921u, 0xbd49e56au, 0xbd658cbdu, 0x3ca1d68fu,
+0x3c88e1e7u, 0x3c4ec262u, 0xbc8d2a78u, 0xbd341083u, 0x3d795bdeu, 0x3dc900beu, 0x3d838b94u, 0x3da2ea5du, 0xbc106649u, 0x3d8437f9u,
+0x3dc081cbu, 0x3dbce7dbu, 0xbccd4ca8u, 0x3d1ae41bu, 0xbdc5e367u, 0x3d476ef6u, 0x3d4e8319u, 0xbc1b096du, 0x3b9bbbf2u, 0xbdd991b3u,
+0xbee7e4f2u, 0xbd82019cu, 0x3cf18091u, 0x3df4a226u, 0x3d66d522u, 0xbd9b2389u, 0x3debb43eu, 0x3daee923u, 0x3c6fc766u, 0xbd205b14u,
+0xbbcd40d8u, 0xbb61425bu, 0xbe171a98u, 0xbda0ab4au, 0xbdaebd68u, 0xbd65a0aau, 0x3dc23f62u, 0xbd3d7c0bu, 0x3e70e049u, 0x3be27aaau,
+0xbcda3217u, 0xbdd64e1au, 0xbda5ef31u, 0x3d3542d0u, 0x3cec209bu, 0x3bda1054u, 0x3d74f4b2u, 0x3e20584fu, 0xbc2ccfc0u, 0xbd8e4615u,
+0x3d38022du, 0xbdc21d9bu, 0xbddac1a1u, 0xbe5b7cf8u, 0xbd23584eu, 0xbd41dfbdu, 0xbd0e77b0u, 0xbcab15d2u, 0xbc733e0cu, 0x3dbc7d35u,
+0xbc64c4e6u, 0xbe1a56ebu, 0xbca3c400u, 0xbdc66442u, 0xbdb1d9f0u, 0xbd5e0107u, 0xbe44058fu, 0x3d8dc768u, 0xbbbdb124u, 0xbd9eec8fu,
+0x3d816cd7u, 0x3e9f6783u, 0x3dc6cb92u, 0x3e2c43aeu, 0xbe03cae3u, 0x3d9bedbcu, 0xbe19a45fu, 0x3dc61c3eu, 0x3c75d4e6u, 0xbd0261b2u,
+0xbe337db8u, 0x3ac89e0eu, 0xbd950d50u, 0x3dd78256u, 0x3e609a05u, 0xbe3e664bu, 0x3ba4ac2bu, 0xbc887079u, 0xbca5401du, 0xbd3c2dc5u,
+0xbdb15afbu, 0x3d9c162bu, 0x3d5c6491u, 0xbe062fa5u, 0xbd6937d4u, 0x3d363891u, 0x3d58247cu, 0xbe2887bdu, 0xbeae60d8u, 0x3d58fb16u,
+0xba02b8d8u, 0xbd1f3457u, 0x3dfd5552u, 0x3d063206u, 0xbd95a9ecu, 0xbcd8f14du, 0x3e41558eu, 0xbe0b816du, 0x3cce489eu, 0x3dace9b1u,
+0xbd8bdb51u, 0x3d4323bbu, 0x3e187b57u, 0x3e1c4383u, 0x3d1271b5u, 0x3e376ee2u, 0x3e2b8be3u, 0x3cbad91du, 0xbdcaae4fu, 0xbd90482du,
+0x3e1cd22du, 0x3b8c7cd7u, 0x3cd98b37u, 0xbd047c69u, 0xbc0a6dc7u, 0xbec132b2u, 0xbd7c77d9u, 0x3c7429d1u, 0x3e5b2bd9u, 0x3ba6cd8du,
+0xbdeb83a9u, 0xbc1cade4u, 0x3cb7a712u, 0xbcb666f0u, 0xbeb78bdau, 0xbd1aa12fu, 0xbd378659u, 0x3df653e8u, 0x3d27103cu, 0x3d49ecd9u,
+0x3c363e8fu, 0xbbe39b8cu, 0xbd840c39u, 0x3da48cadu, 0x3d3a6c15u, 0x3d7d36e7u, 0xbdf090a1u, 0xbdb11c2cu, 0x3cb78fe7u, 0x3e432a84u,
+0xbcaff426u, 0x3d8cc92bu, 0x3d7a1fb8u, 0x3cd3dd4bu, 0x3c44f3ebu, 0x3db0a750u, 0xbd8a9b07u, 0x3df5a0c4u, 0x3e33f407u, 0xbd4d4ddbu,
+0x3da9d3cdu, 0xbbb24c9au, 0xbdd223d2u, 0x3d0a3a58u, 0x3d086a0cu, 0xbe2d9528u, 0xbd2dd447u, 0xbe2313edu, 0xbde61416u, 0x3d7c03a1u,
+0xbe1873dcu, 0xbd8cc066u, 0x3cd1548bu, 0xbd68608bu, 0x3d232d6cu, 0xbdb72683u, 0xbcb833e0u, 0xbc174820u, 0x3d8d8459u, 0x3db9e5a7u,
+0x3ddf0563u, 0xbd5f6d8du, 0x3e5c6a93u, 0xbb82a6c4u, 0x3e316900u, 0x3d8678fcu, 0x3bdc7021u, 0x3e0f5fb0u, 0xbc5a56eeu, 0xbbf763cdu,
+0x3d87c72du, 0xbdc6d570u, 0xbd4076f3u, 0x3d648c6cu, 0xbe37b357u, 0xbe2ffb45u, 0xbdb8bf91u, 0xbd866613u, 0xbe5cea89u, 0xbd2ff5cfu,
+0xbd8d0932u, 0xbd2ea7dcu, 0x3c455dd6u, 0xbd465273u, 0xbdaec462u, 0x3dec6434u, 0x3e13e301u, 0x3e17eb74u, 0x3cc50fd6u, 0x3b4157deu,
+0xbe1e39d5u, 0x3ca2f099u, 0x3d3c8661u, 0x3cd66508u, 0xbd893feeu, 0x3db69647u, 0x3c857ca2u, 0xbdff6022u, 0xbd67eeb6u, 0xbd429749u,
+0xbd2bfbd6u, 0x3b91d91au, 0xbda54c4eu, 0xbe2d1d32u, 0x3c775713u, 0xbd2d1d7eu, 0xbe137063u, 0xbda38b08u, 0xbd31d453u, 0xbd07f85bu,
+0xbd099fd6u, 0xbdce7c1bu, 0x3d23e6f0u, 0x3dc1ea23u, 0x3d37d271u, 0x3d6d2b50u, 0x3db0d09fu, 0x3d7e7742u, 0x3bc671a3u, 0x3d290f40u,
+0x3dc61b75u, 0x3c9132e6u, 0x3e0bdc83u, 0x3dd56941u, 0x3dbaa1c3u, 0x3d996eaau, 0x3df56110u, 0xbd22db21u, 0xbdc3b374u, 0xbc30c906u,
+0xbdca1978u, 0xbc5e0d9eu, 0x3e112cadu, 0xbd982ff2u, 0x3d9b2bf5u, 0xbd845954u, 0xbd00e84fu, 0x3d934b1du, 0xbd9dfea6u, 0xbca0adffu,
+0x3e8a7923u, 0x3e068f5au, 0x3dae6bc3u, 0x3d8fe375u, 0xbc595227u, 0x3d0ed5b2u, 0xbdf35bf2u, 0xbd9b10a2u, 0xbd1e25dcu, 0xbcd6d1e6u,
+0xbc29f5f6u, 0x3c4a2328u, 0x3c7b4b40u, 0xbd91cca3u, 0x3d9da1e7u, 0x3ca19980u, 0xbd5b1026u, 0x3c9d68c8u, 0xbe8ff17cu, 0xbca924d8u,
+0x3c854a4fu, 0x3d9d7cdbu, 0xbcbd7dbeu, 0x3e1bd6ffu, 0x3d67fdb2u, 0x3d928720u, 0x3dfda1b6u, 0x3e4cf086u, 0x3e28bac1u, 0x3e216323u,
+0xbdb1475cu, 0x3da69530u, 0xbd411198u, 0xbd2b21fau, 0x3bc45580u, 0xbda58f14u, 0xbeda50b9u, 0xbdc27611u, 0xbe1dff58u, 0xbc1aefacu,
+0xbdd33947u, 0x3debba46u, 0x3e0d4f82u, 0xbb762fa8u, 0x3df11a5fu, 0x3e6c5fdfu, 0x3dfa022eu, 0x3c6afbbdu, 0x3d0500dcu, 0xbca4bacdu,
+0x3deade05u, 0x3e10ab9bu, 0x3d9df75cu, 0x3dca2970u, 0xbced7c65u, 0x3ce2d3b5u, 0x3c854cd1u, 0x3dc64e3cu, 0x3df26b3du, 0xbdb026cbu,
+0x3dc6ad8cu, 0x3d9670dfu, 0xbce87e74u, 0x3daedb34u, 0x3d219d3cu, 0xbd999722u, 0xbdb80d11u, 0xbd37153du, 0x3df4d50eu, 0xbd88d333u,
+0x3d429a1bu, 0xbce5575cu, 0xbefabf40u, 0xbdb021c2u, 0xbe30a120u, 0xbe84299bu, 0xbcf88261u, 0xbc671b8du, 0xbcb332bfu, 0x3db1b1bcu,
+0x3defaec0u, 0x3db583d2u, 0x3d0c74d6u, 0xbd043903u, 0x3d9f10d8u, 0xbdb4a930u, 0xbdf103d7u, 0x3ac4c39au, 0x3ba5673du, 0x3cf05c9du,
+0xbd5bc30bu, 0xbd31ae58u, 0x3d2e5ce8u, 0xbdac963au, 0x3d4c9c92u, 0x3e0dd115u, 0x3ce0f82bu, 0x3c593f52u, 0x3d63b13bu, 0x3ddddc0au,
+0x3e0effaeu, 0x3d3d9418u, 0x3dd25169u, 0xbd468bebu, 0x3d519ac6u, 0x3df0e00eu, 0x3c7f2d48u, 0x3cf17668u, 0x3d0ec5cau, 0xbcaef266u,
+0xbb3aa051u, 0xbda578f1u, 0xbdebe1eau, 0xbce22b52u, 0xbd960c65u, 0xbe08d486u, 0x3d8ca41eu, 0xbe80ed90u, 0xbe5aa258u, 0xbd88eb1eu,
+0xbdde0673u, 0xbce1c5b9u, 0xbdeaf3d1u, 0x3c4c456eu, 0x3cd6fe8fu, 0x3d1394a8u, 0x3e9f255fu, 0x3ddb6c56u, 0x3df1de4bu, 0xbcd1f566u,
+0x3dc8304au, 0xbd99aadcu, 0xbd9ad7a4u, 0x3c79e968u, 0xbc8a70c1u, 0x3aa873b4u, 0x3d99a628u, 0xbc83a465u, 0xbc9eb893u, 0xbd0c2bbcu,
+0xbcb5c155u, 0xbe4af064u, 0xbe5acba4u, 0xbe58a2f4u, 0xbe529d76u, 0xbe3f792du, 0x3da4a51fu, 0xbe329706u, 0x3c42f122u, 0x3cf8c28au,
+0x3bb8e6adu, 0xbd0d963du, 0x3cc14d28u, 0x3d757436u, 0xbd0d84d7u, 0xbbc69a21u, 0xbcfce493u, 0xbaa59d74u, 0x3cc747e5u, 0xbc45c28au,
+0x3dcfbf4cu, 0x3daf4107u, 0x3dcd5461u, 0x3e0388b6u, 0x3cc4ef66u, 0xbcf7492cu, 0x3c4972d5u, 0x3c94ee76u, 0xbd9c0ffeu, 0xbe409aabu,
+0xbd740479u, 0xbe84b1e0u, 0xbd8c47a9u, 0xbd8a4bbfu, 0xbd016b47u, 0xbcb0287au, 0x3dd51cb7u, 0x3e0691b2u, 0x3c693b94u, 0xbe0c94a7u,
+0x3e6eeb46u, 0xbde2a60bu, 0xbe8b567cu, 0xbe044cacu, 0xbbac9e30u, 0x3c69f3f8u, 0x3df9c65cu, 0x3d4b552bu, 0xbd3c13bbu, 0xbe14dbc4u,
+0xbe1af75eu, 0x3ddc84d2u, 0xbcdfad63u, 0x3cc7ccf8u, 0xbcaafd2fu, 0x3d225056u, 0xbd80eb5bu, 0xbcc249f5u, 0x3d99370fu, 0xbcb3190bu,
+0x3df3239du, 0xbc1966a8u, 0x3d5e5806u, 0xbd7629dbu, 0xbc2f484cu, 0xbe0f2479u, 0x3d3799d6u, 0x3e41dfa5u, 0x3d2c4617u, 0xbe42c09du,
+0xbd2ce733u, 0x3cea0d02u, 0x3e0484d0u, 0x3e6dae12u, 0xbd2f1651u, 0x3ca571bcu, 0x3d95ed05u, 0x3da5a308u, 0x3d16a307u, 0xbdba7389u,
+0x3d95778eu, 0xbb198c2bu, 0xbdf69cf8u, 0xbd7f4064u, 0x3e4b4adfu, 0x3e2b22c1u, 0xbd545654u, 0x3d892275u, 0x3daa37d1u, 0x3b88f4eau,
+0x3c1c0bf6u, 0xbd61b5e9u, 0xbd3933dbu, 0xbd934199u, 0x3e068b04u, 0x3db2e8b1u, 0xbe026a1au, 0x3d9807e2u, 0x3d1c5388u, 0xbddf2512u,
+0x3d85b295u, 0x3d87d5bau, 0x3d1b32ceu, 0x3c33a251u, 0x3e0189d6u, 0xbd9ad0d0u, 0xbd4367dcu, 0xbdaf414fu, 0xbd6e8b43u, 0xbc8a6005u,
+0x3d86bae5u, 0x3bfccb9eu, 0x3de6547fu, 0x3d1ef583u, 0x3d95b4c8u, 0xbdbf69dfu, 0xbd48c8b7u, 0x3dd22148u, 0x3b7d4561u, 0xbc8afbb0u,
+0x3e4c32a8u, 0x3e85fd44u, 0x3daea0aau, 0x3dc78711u, 0x3e640849u, 0x3cdd9051u, 0xbd980318u, 0xbda75143u, 0xbdabe47au, 0x3dd4b9d8u,
+0xbdfdb1d8u, 0xbe2be0fau, 0x3e3321b0u, 0xbd93e739u, 0xbe5eeba6u, 0x3d97b63bu, 0x3d2c7550u, 0xbcf3e894u, 0x3e082ed2u, 0x3dee4c44u,
+0x3e2f182au, 0x3cc67ceau, 0x3c150bb7u, 0xbc3223b1u, 0x3dc497adu, 0x3d0339bbu, 0xbc02bd71u, 0x3e80cc16u, 0xbe75a9dcu, 0xbb0b9224u,
+0x3e4fd11fu, 0x3de9ae72u, 0xb9f11e1cu, 0xbcda76d7u, 0xbd8bdcb0u, 0x3b6a2231u, 0xbe0c77a6u, 0xbc04170fu, 0x3e2fcfd1u, 0x3d31c52fu,
+0xbdf079c5u, 0xbdc9ae3fu, 0xbdaa7a68u, 0x3c4c2045u, 0xbda2467fu, 0xbcb034e0u, 0x3cecc0a1u, 0x3b919dbcu, 0xbe39ada3u, 0xbd6a2935u,
+0xbc8011fau, 0x3d8a7418u, 0x3d6d8431u, 0xbd87dc27u, 0xbe7574f1u, 0x3df0b691u, 0x3c37dc02u, 0x3bddc391u, 0xbd95f79cu, 0x3c0cd18bu,
+0xbd8f7b3bu, 0x3d8bd9a5u, 0x3dbe6d4cu, 0xbd4dd6b3u, 0x3df97bdcu, 0x3dd2daf5u, 0xbe6c0ac5u, 0x3d11d888u, 0x3c4b0370u, 0x3d7db5e3u,
+0x3e974bb5u, 0x3e15edc1u, 0xbef2a063u, 0xbe9e7713u, 0xbba83ef3u, 0xbe34b187u, 0x3cf93c82u, 0xbd379230u, 0x3d7f758eu, 0xbcbb1afeu,
+0xbe054e88u, 0xbc23096bu, 0x3ed9c3d7u, 0xbc84f016u, 0xbeb035f4u, 0xbe3b3aa5u, 0xbcc951d3u, 0xbb21c3a2u, 0x3cd82fc7u, 0xbc5c3ad8u,
+0xbe2d4e30u, 0xbd49136eu, 0xbdbb6161u, 0x3d02c339u, 0xbd9635cdu, 0xbb8f3e32u, 0x3cbd33b4u, 0x3e0657edu, 0xbd9b2f53u, 0xbd38779eu,
+0xbce18ea1u, 0xbe04c85cu, 0xbe0d63e8u, 0xbd839217u, 0x3dd64fa5u, 0x3d4ddf85u, 0x3dc2e63fu, 0x3e1c1726u, 0x3de12882u, 0x3e1d8170u,
+0x3e0c243cu, 0x3db22846u, 0xbca2152bu, 0x3ca0444fu, 0xbd89555cu, 0xbe4238b8u, 0x3cd33e8cu, 0x3ced9127u, 0xbd4bb576u, 0x3d0ef672u,
+0xbdae164eu, 0xbd723034u, 0xbe20fa06u, 0x3e225f1eu, 0xbdb790c3u, 0xbd08fbadu, 0xbd128664u, 0x3dee2cfbu, 0xbc9d58d1u, 0x3cc025ceu,
+0xbc857d8bu, 0xbd2aeb28u, 0xbdb63685u, 0x3dbae2bcu, 0x3c930a80u, 0xbd1be41fu, 0x3dc8656du, 0x3dffd6e6u, 0x3c84c654u, 0xbbd78705u,
+0xbd874ee0u, 0x3d811d7fu, 0x3e5d2d9eu, 0x3dd4179du, 0x3d3182d8u, 0xbef93c0cu, 0xbd4df118u, 0x39be953fu, 0xbe572dc6u, 0xbdb7f5abu,
+0xbddf4583u, 0xbd011c7cu, 0xbd15fd24u, 0x3c4a6807u, 0xbe15facbu, 0x3d8b5cecu, 0x3d16186cu, 0xbc7f6d6au, 0xbdacc0f4u, 0x3dfd412du,
+0xbdc57c4cu, 0xbcd2da0bu, 0xbc67d7d4u, 0xbd980ec6u, 0x3ce45be6u, 0x3d151174u, 0xbb76bbb2u, 0xbd8f3f03u, 0x3c7598e3u, 0x3de9d733u,
+0x3d1998deu, 0xbd8c5aebu, 0xbda9ab92u, 0xbe80caf1u, 0xbc2858f2u, 0x3d92b515u, 0xbd8b4da2u, 0x3d22f8d0u, 0x3e4a3d3cu, 0xbd0daba1u,
+0x3e445d1au, 0x3d9356eeu, 0x3c48b2bfu, 0xbc89932au, 0x3c3198beu, 0xbd195a7cu, 0x3d89456au, 0x3d58ea88u, 0xbdef43f2u, 0xbd91858cu,
+0x3d5c72f1u, 0x3d2f21a5u, 0xbe01cda8u, 0xbdce611bu, 0xbc6d2f2au, 0x3cc46f0bu, 0xbdb8999bu, 0xbd8f5688u, 0xbdcd61cbu, 0x3d9c437fu,
+0xbdabf7feu, 0xbd9d43f3u, 0xbccd713fu, 0x3c2ee424u, 0xbd1200c1u, 0x3d8e67aau, 0xbd081f06u, 0x3e8e8a2bu, 0x3e8928f1u, 0x3b676488u,
+0x3d56ab2fu, 0x3e2baa3au, 0x3de08de5u, 0x3de04f9cu, 0xbbb84f13u, 0x3dfd1950u, 0x3db7a77au, 0x3baa5a62u, 0x3e42d560u, 0xbbca7900u,
+0xb9eed22au, 0xbd9fc7ebu, 0x3c5a14a1u, 0x3d4c435eu, 0xbd86aca9u, 0xbcb60088u, 0xbd8b80f2u, 0xbe9b940bu, 0xbcc02545u, 0xbe1a3464u,
+0xbd2b5811u, 0x3d806266u, 0x3c4f46c1u, 0xbdc979beu, 0x3de2ed62u, 0xbebc9f98u, 0x3cf04cbdu, 0x3bc70a1cu, 0x3e36c178u, 0x3d3e3dd4u,
+0x3cd88421u, 0xbde6cc8cu, 0x3cfe2a39u, 0x3ec604fcu, 0x3e8b61c6u, 0xbe024824u, 0xbe2c2eeeu, 0xbe5837e1u, 0x3c839f00u, 0xbb5e0e6au,
+0xbd86b6cau, 0xbd6a09abu, 0x3ccc177du, 0xbd9e6a1cu, 0x3c459d75u, 0x3c88b7b6u, 0x3c3668efu, 0xbd7b035au, 0x3dbd7a3cu, 0x3d873bcau,
+0x3cfa48a0u, 0x3cb39d7eu, 0xbd87da90u, 0x3bd0deb9u, 0xbbd03ecau, 0x3e453522u, 0x3ca511e7u, 0xbc2551a0u, 0xbe419684u, 0xbc82aad0u,
+0xbe775cefu, 0x3dbfb69au, 0xbd6ea803u, 0x3bc86b08u, 0xbdd52d2fu, 0xbd81e21bu, 0x3b42d076u, 0xbd923190u, 0x3d2bd68bu, 0xbd2d3022u,
+0xbe937486u, 0x3d7c46f3u, 0xbdf0f009u, 0x3caccab0u, 0xbdf6e376u, 0x3e4323abu, 0x3f097ccfu, 0x3e6342ddu, 0xbd2a1d16u, 0x3f1979a9u,
+0x3d80b51du, 0x3d6f54f8u, 0xbde0e3fdu, 0xbd8e71dfu, 0xbd7742bdu, 0xbe1f69d5u, 0x3c08901cu, 0xbcf6fbc9u, 0xbf012cc6u, 0xbd6463f1u,
+0x3cf03853u, 0x3e820c37u, 0xbccdc6c0u, 0x3d75ed46u, 0x3d851c43u, 0x3cec1dffu, 0xbd88b1c6u, 0xbc9a11dcu, 0xb954b63eu, 0xbde40f64u,
+0x3d2a716bu, 0x3d392379u, 0x3d0e9698u, 0x3e84da3bu, 0xbbf48ba9u, 0x3d5a8114u, 0xbd64ed89u, 0x3e6b9ad5u, 0x3d921bbcu, 0x3ccae1a2u,
+0x3ca32879u, 0x3cef8770u, 0xbc75d474u, 0x3d0888b2u, 0x3d3821bdu, 0xbc7a0b8fu, 0xbdf48237u, 0x3c9a74feu, 0xbdc2578du, 0xbe2751d8u,
+0xbcec9d80u, 0xbe6e1a86u, 0xbdba4fb3u, 0x3d869ccau, 0x3a489e10u, 0x3db04918u, 0xbcf9333du, 0x3cc0cd40u, 0xbd40e689u, 0x3e3e84b8u,
+0xbda99157u, 0x3d9b4304u, 0xbe8093d1u, 0x3f01d613u, 0x3e152b4fu, 0x3d79dc37u, 0xbd92a5d5u, 0xbd25259bu, 0x3d5313aau, 0xbaca832bu,
+0xbcb412bdu, 0xbe898d06u, 0x3e3ce8c5u, 0x3c2babe7u, 0x3d860554u, 0x3d5000eeu, 0x3d5bd2ffu, 0xbd3363c3u, 0xbc173d99u, 0xbd95f6e5u,
+0x3d70eb40u, 0x3e25a089u, 0x3d5b8449u, 0x3d5dbf48u, 0x3e208e24u, 0x3e04b75eu, 0xbd73891cu, 0x3dd5a472u, 0xbd212822u, 0x3dcb7ecdu,
+0xbde6f94eu, 0xbd54c5f8u, 0x3c9d55dbu, 0x3e808559u, 0x3cb0101fu, 0xbbc06c15u, 0x3c144a1bu, 0x3d757338u, 0xbd25dc8cu, 0x3e5613eau,
+0xbdf73490u, 0x3e03710fu, 0xbe1b6b50u, 0xbda278c4u, 0x3d7a5c48u, 0xbe4d6c18u, 0x3c75b09cu, 0x3e07e101u, 0xbbbba901u, 0x3e2a3ef8u,
+0x3b162371u, 0xbb8b7403u, 0x3d32946eu, 0xbd527519u, 0xbe5a7847u, 0x3d7a2e85u, 0x3d839b03u, 0xbe0cfe03u, 0x3da31a94u, 0x3d82a2c6u,
+0x3db8e2bfu, 0xbc18b38cu, 0x3cf808f6u, 0xbe05913cu, 0x3d6821c0u, 0xbd0c9f9du, 0xbe2a1c52u, 0xbd8dce91u, 0x3d1ab70eu, 0xbc8ef98au,
+0xbd56080eu, 0x3d08441au, 0x3d936b15u, 0x3c529fdau, 0x3bd450f9u, 0xbe105d8bu, 0x3d9e6f5au, 0x3d24d5ddu, 0x3e2174e4u, 0x3e48202fu,
+0x3d273cd9u, 0x3ba9943fu, 0xbd95fed1u, 0x3b802721u, 0x3dbdfe9fu, 0xbe2e0195u, 0xbc837d50u, 0x3b16334bu, 0xbcf88046u, 0x3d40fd85u,
+0xbdadb92du, 0x3dcbf1d1u, 0x3d11dacbu, 0xbc9e190fu, 0x3e142f68u, 0x3c531a36u, 0xbdaa0baeu, 0x3d8946a7u, 0x3bd4383eu, 0xbc19aba8u,
+0x3decd004u, 0x3d2bb3bcu, 0x3e54d80du, 0x3e8404dcu, 0x3d01ec5du, 0x3e305650u, 0x3dbda0ebu, 0x3c8f47b6u, 0x3d23f770u, 0x3caf7a97u,
+0xbca27d3cu, 0x3e986829u, 0xbd5ed650u, 0xbd90554au, 0xbe04312du, 0x3d55e2e1u, 0xbe235d67u, 0xbdc06ca8u, 0x3d9ddef5u, 0xbe01856bu,
+0xbe02ac58u, 0x3e0b5154u, 0xbca8f281u, 0x3d806588u, 0x3d15363du, 0xbba1f805u, 0x3ced2d4au, 0x3cfb7ca7u, 0xbe01dcbcu, 0x3ebf78b1u,
+0xbdc3ab2du, 0xbe0a9e7du, 0xbe516599u, 0xbdbd5479u, 0xbbc9ced3u, 0xbc8c4437u, 0x3e017a3du, 0xbcf80429u, 0xbd15d290u, 0x3cb60d14u,
+0xbd271593u, 0x394f5666u, 0x3d406aa4u, 0xbde498bau, 0x3c10ab4bu, 0xbb1061d8u, 0xbe0ead5bu, 0xbc088ed9u, 0x3d4ee96bu, 0x3e027cdbu,
+0x3c374ee7u, 0xbaa47640u, 0x3d756e61u, 0xbd569273u, 0x3970e89au, 0x3d8b23fbu, 0x3d644193u, 0xbdd76151u, 0x3d4991e9u, 0xbd69fd0bu,
+0xbcada0bdu, 0xbd97d974u, 0xbdfe7f00u, 0xbba84eefu, 0xbcde7c39u, 0xbdecbd9eu, 0x3c7b309eu, 0x3d06cca8u, 0xbdbe7c5du, 0xbd24c028u,
+0xbd5d14e7u, 0x3e027420u, 0x3d16011eu, 0x3cff24a8u, 0x3e82dc85u, 0x3da2f789u, 0x3d8813a7u, 0x3d57395bu, 0xbcdb8204u, 0xbd13e68bu,
+0x3c497758u, 0xbbb803d5u, 0x3d4b3a02u, 0x3def951cu, 0x3c938298u, 0xbd8c19f1u, 0xbd4b0277u, 0xbcf0a4a9u, 0xbe40c09eu, 0xbe2f1739u,
+0x3d9d409eu, 0xbe8ead6du, 0xbe662883u, 0xbc8a03f0u, 0xbc766ba4u, 0xbbafd44eu, 0xba02447fu, 0xbdb4c7deu, 0x3debc96au, 0xbca188d5u,
+0xbdbaf8cau, 0x3da7151bu, 0xbd82c3beu, 0x3d1f13a3u, 0x3db98eebu, 0xbc684168u, 0x3d0af26au, 0x3e1eb4f3u, 0xbd1b344bu, 0xbdd23dceu,
+0xbe6c122eu, 0xbe4a21abu, 0x3c7d2f6fu, 0xbd80bdcfu, 0x3dec97b9u, 0xbd3ece83u, 0xbdaf841cu, 0x3d356e1au, 0x3d40e1a0u, 0xbee079b3u,
+0xbd6d2ab3u, 0x3e2492efu, 0x3dad6e9cu, 0x3d1501b6u, 0x3dba90f9u, 0x3e0afc7fu, 0xbc296257u, 0x3c1ab8bfu, 0x3e86d81cu, 0xbce1ce4bu,
+0x3dcc8801u, 0x3dbe2aabu, 0x3d364d39u, 0x3dc04534u, 0xbcddf5aau, 0x3cdb4669u, 0x3eb33bf9u, 0xbe845da4u, 0x3e16bfd0u, 0x3e2957c3u,
+0x3dc708d1u, 0x3c2c6fcfu, 0x3c1c90ecu, 0xbdb9fe70u, 0xbcff637cu, 0xbb913014u, 0xbd32b23fu, 0x3dd0a662u, 0xbd93b858u, 0xbd6b46f2u,
+0x3e210a0au, 0xbcc76b26u, 0x3d2dbf79u, 0x3dcd6de1u, 0x3d850290u, 0xbe6303f3u, 0x3d461350u, 0xbd2aaa58u, 0x3d7d4e27u, 0x3c6bc193u,
+0xbc0bb598u, 0x3dd81091u, 0x3d1bbc48u, 0xbe14b2f1u, 0x3d7d2c35u, 0x3de4d799u, 0xbce3e9d4u, 0x3d4db4fdu, 0xb79686c1u, 0xbdc8d1c8u,
+0xbdbaf97du, 0xbdfff940u, 0xbda7a671u, 0x3c0ad0ebu, 0xbe4c3812u, 0x3b25d9f4u, 0xbc74836bu, 0xbd76f398u, 0xbd74a39cu, 0xbc3bb013u,
+0xbd852962u, 0x3c34efc7u, 0xbea6f862u, 0xbc0ba73au, 0x3c79eb65u, 0xbc6f4228u, 0x3d564918u, 0xbc8d4738u, 0xbe136077u, 0xbe2ce589u,
+0x3d2188dfu, 0xbe071f92u, 0x3c802156u, 0xbd72335du, 0xbe047031u, 0xbd5a688eu, 0x3ce00270u, 0x3d1dddf6u, 0x3b7a4e31u, 0x3e4f7be5u,
+0xbe158dbcu, 0xbde2ca79u, 0x3adf22f3u, 0xbe0811c1u, 0xbd895195u, 0xbe5ea591u, 0xbe096d80u, 0xbe43953du, 0xbea2c13cu, 0x3d2366c4u,
+0xbdaef7ccu, 0xbe1d15abu, 0xbdf2650fu, 0xba96ac13u, 0x3ddf55a4u, 0xbccc1951u, 0xbda41036u, 0x3dce7bdeu, 0xbe8234d8u, 0xbc58f081u,
+0x3dd068e8u, 0x3e53df20u, 0xbc787444u, 0x3da420dcu, 0x3ca077efu, 0x3cc21043u, 0xbc8ebed0u, 0xbe0bc9abu, 0x3d9a63d0u, 0xbd15c9f2u,
+0xbc801e32u, 0xbca4afe1u, 0x3e49e983u, 0x3e11af74u, 0x3d0375b8u, 0x3f171524u, 0x3e900d4du, 0xbb70250bu, 0x3dd5bddbu, 0xbb0998e5u,
+0x3b0042eau, 0x3d106cefu, 0xbd4a3175u, 0x3c61f3d2u, 0xbe28fe73u, 0x3e244543u, 0xbd9e0b5au, 0xbe039ac2u, 0xba9df82fu, 0x3d90105eu,
+0x3dff5c8cu, 0x3ca4b7e7u, 0xbd59f570u, 0xbc8c64a7u, 0xbe198a0au, 0x3d2c32b8u, 0xbbd79053u, 0xbd08f9d5u, 0xbd0deb0bu, 0x3cab3e11u,
+0xbdb97531u, 0xbd101866u, 0x3d836b06u, 0x3d9be8ddu, 0x3cad747bu, 0x3d10e86fu, 0x3d4aac34u, 0xbcb03e8cu, 0xbd915be6u, 0x3b85b34cu,
+0x3c1f1875u, 0xbd306b70u, 0xbdb81223u, 0x3d30a2cau, 0x3c8fdebcu, 0x3ceaa627u, 0x3db7ab1bu, 0x3daddadcu, 0x3d6c65a3u, 0xbd29fd9au,
+0xbe008135u, 0x3da1a9cbu, 0xbd8dfb1du, 0xbe2c85edu, 0xbdab0d27u, 0xbd4d08bau, 0xbc6878dbu, 0x3d5c480eu, 0x3c62607bu, 0x3cf3f70au,
+0x3deaf795u, 0xbd885295u, 0x3d3697e5u, 0xbde51fdeu, 0xbc33d894u, 0xbceca7b6u, 0x3cec5fe4u, 0x3d69db64u, 0x3bf89353u, 0x3b4f0c16u,
+0x3cc3a3acu, 0xbbba82f5u, 0x3cfb2e6bu, 0xbbc3072au, 0xbd990601u, 0xbd077598u, 0xbddd9ba7u, 0x3c8ee338u, 0x3d31c526u, 0x3de15e7fu,
+0xbd8e1088u, 0x3c9c4cb3u, 0x3d55ce6du, 0x3df78cecu, 0x3cb955e9u, 0x3c6df18eu, 0x3e3fd48au, 0xbdfa6e30u, 0xbd3d309bu, 0xbd6b777au,
+0x3d776820u, 0x3bea4ab3u, 0x3ccbc8d6u, 0xbd09446bu, 0x3d8cbc46u, 0x3c0e5b7du, 0x3ead82cbu, 0x3d92a72au, 0xbcd23cebu, 0xbddb9223u,
+0xbc1c58e0u, 0xbda451c5u, 0xbd62abf7u, 0xbd0c8480u, 0xbde5d303u, 0x3dddfcfcu, 0xbcff94d0u, 0xbd83f9b9u, 0x3cabb962u, 0xbc6fdc8du,
+0x3e1152b4u, 0x3df7a20eu, 0x3c8e802bu, 0x3e2cb8b9u, 0x3ebf56f1u, 0xbd957cbfu, 0xbe481fc0u, 0x3c5c95b1u, 0xbd91c0e9u, 0xbba608b5u,
+0x3e796be3u, 0x3e4c3706u, 0xbd733a43u, 0x3dc35f7bu, 0x3d4e9d7eu, 0x3cd515cdu, 0xbdd267ddu, 0x3caf4936u, 0xbdaf6555u, 0x3cc61bb9u,
+0xbdd54a4du, 0xbdd66b72u, 0xbd9a42b2u, 0x3dac5429u, 0x3cc7c21eu, 0xbbdf9518u, 0x3c9a1676u, 0x3d7cd76au, 0xbd8f5d8bu, 0x3d5894f2u,
+0x3d895ac5u, 0xbe9c355cu, 0x3cb53035u, 0x3d64a914u, 0x3d10efeeu, 0xbd335967u, 0x3d694347u, 0x3d25268cu, 0xbd1e54fbu, 0x3d8fdd9fu,
+0x3e880b5fu, 0xbe108a11u, 0x3bfb3502u, 0x3d0fd4acu, 0x3ca401b6u, 0xbd96a2b3u, 0x3e19186cu, 0x3c0996f8u, 0xbc97fcffu, 0x3d84d92du,
+0xbd9cd5ceu, 0xbc431a44u, 0xbcf3bfb6u, 0xbda47307u, 0xbb845f19u, 0xbd725574u, 0xbd2a52e5u, 0xbe1b2844u, 0xbbbaabbfu, 0xbc4aaa37u,
+0xbdbaafa1u, 0xbd261d85u, 0xbd4519f4u, 0xbc937a02u, 0xbd49d989u, 0x3d98b519u, 0xbd91dbb2u, 0x3e32d48fu, 0xbdb89f4au, 0xbe03e08au,
+0xbdd53ac9u, 0xbd9fa70au, 0x3d212e1cu, 0xbd3ce1f0u, 0xbd384d2cu, 0x3c2e54fau, 0xbdd341bcu, 0x3cf8561fu, 0x3d98da1fu, 0x3d0fa653u,
+0x3dec2914u, 0x3cb2961cu, 0xbcb92956u, 0x3deabbb3u, 0xbde99a8cu, 0xbdfc0226u, 0x3d21389fu, 0xbdf8bc68u, 0xbd31b5e4u, 0xbd0e2673u,
+0xbe225c97u, 0xbe1f6c7eu, 0xbd3fcc55u, 0x3d5623e8u, 0xbf142193u, 0xbe85b70du, 0x3e3779dbu, 0xbe011a16u, 0xbda2bcbfu, 0x3d508560u,
+0xb95523e4u, 0xbd898d94u, 0x3d8f129bu, 0x3d5e8d49u, 0xbc6f4e42u, 0x3cfc74b5u, 0x3c0be683u, 0x3d8fec6fu, 0xbd8cd9d6u, 0xbd589571u,
+0xbd86f8acu, 0xbd6f68b5u, 0x3e8d2eeeu, 0x3d604bf1u, 0x3d05247bu, 0xbd128e15u, 0xbd84577fu, 0x3d899e91u, 0xbdd496f4u, 0xbce30c76u,
+0x3d80ae1fu, 0xbe610e32u, 0xbb9180e1u, 0x3d320e4eu, 0xbd6202e7u, 0x3e0a6172u, 0x3da983e3u, 0x3e32db03u, 0x3cf6f25eu, 0x3eb62131u,
+0xbe5a78c5u, 0x3d22550au, 0x3c6fda46u, 0x3dcf5a4bu, 0xbce84f5du, 0xbd8874afu, 0xbe1d6f51u, 0xbcffe93cu, 0xbe80c32fu, 0x3e00fe2eu,
+0xbe22b4d2u, 0xbca94bd8u, 0xbe2186b8u, 0xbbbc6a94u, 0xbb0e094eu, 0xbd4630edu, 0x3c900c49u, 0xbd8a38e6u, 0x3dad887fu, 0xbc50b365u,
+0xbe2d7ba5u, 0x3d0d593au, 0x3d4ef6f6u, 0xbc312cfbu, 0x3e0e1a65u, 0x3e102465u, 0xbdf74835u, 0x3e808902u, 0x3e014e44u, 0xbe0cfc4eu,
+0xbd233c53u, 0xbd05e9fau, 0xbb7bcf2au, 0x3bb58297u, 0xbdc05438u, 0x3e2aa29au, 0xbec4c623u, 0x3dd60570u, 0xbd838a0eu, 0x3df650b2u,
+0x3dcb6c42u, 0x3dab2780u, 0x3d120703u, 0xbd433803u, 0x3d31b27bu, 0xbe812941u, 0x3c8dab16u, 0xbc8421e5u, 0xbe07ea12u, 0x3de46e9fu,
+0x3dce9222u, 0x3ec918bcu, 0x3e457485u, 0x3e6436e2u, 0x3e8b1d6fu, 0x3e3a51cbu, 0xbd546714u, 0x3dceebdfu, 0x3d365753u, 0xbdcd1544u,
+0x3dbcb969u, 0x3d077a78u, 0x3e0c4f6cu, 0x3de324bfu, 0x3e1555fcu, 0x3c0a2a03u, 0x3d1fa2eeu, 0xbd70f0c2u, 0x3bb46046u, 0xbdfc7c3du,
+0xbd26d7b7u, 0x3c8d1328u, 0x3d420b7eu, 0xbe147500u, 0xbe0f9bb2u, 0xbd28efd3u, 0xbcf1d449u, 0x3c2c134fu, 0x3dad7dc8u, 0x3e30e297u,
+0xbc3adecfu, 0xbd2eb2e9u, 0x3e2d5d9fu, 0xbcd15925u, 0x3e26f9ccu, 0xbdd15d00u, 0x3cae2428u, 0x3deeccc4u, 0x3c3f3f65u, 0x3f1f61aau,
+0xbd802f35u, 0x3b4f47a7u, 0x3dbff8f3u, 0x3dc029dbu, 0x3c9436c3u, 0xbb1a0c14u, 0xbd283cefu, 0xbd5eb4f0u, 0xbd802774u, 0x3d9dcdbbu,
+0x3d600eb7u, 0xbd13ad87u, 0x3c253688u, 0xbdcf5be7u, 0xbab91e69u, 0xbdfda73cu, 0xbd0b1e93u, 0x3cea0df4u, 0x3c96fef0u, 0xbe29e460u,
+0xbbfb81b2u, 0x3d01b8a6u, 0x3e2b32cdu, 0xbb82e90cu, 0xbd386ebbu, 0xbc3cd3d5u, 0xbdbffab6u, 0x3bbde9b4u, 0x3e12a3d1u, 0xbcaa6838u,
+0x3dc19a75u, 0xbd018151u, 0xbdd9a825u, 0x3cb48a51u, 0x3dd39cc5u, 0xbd35a3fdu, 0xbd506614u, 0x3d9f3e01u, 0xbdc08ea5u, 0x3e05bb2du,
+0x3e271e6du, 0x3d6e98d3u, 0x3e8bef2eu, 0x3cdbdefcu, 0x3c54ffdeu, 0x3e75fa8au, 0x3de9c58bu, 0x3d58db50u, 0xbd421633u, 0x3b9a4464u,
+0xbd779f5bu, 0x3d7b57f2u, 0x3ca6b9f0u, 0x3d805739u, 0x3d703afau, 0x3dadb904u, 0x3ca89ab2u, 0xbd245eb8u, 0x3cdf2023u, 0xbe44d538u,
+0xbe279e0fu, 0xbe8b866cu, 0xbc4892f6u, 0xbd94e761u, 0xbe83323eu, 0xbe18f65cu, 0xbd748dd8u, 0xbe859eb2u, 0xbc93e332u, 0x3c4fe037u,
+0xbce81657u, 0x3a40b271u, 0xbdd144ffu, 0xbd26e050u, 0x3cf0d295u, 0xbe020cddu, 0xbdb4664au, 0x3d41a7feu, 0xbcbe734bu, 0x3d0bd34fu,
+0xbdb28675u, 0x3da99f26u, 0x3dab49c9u, 0xbdad10c0u, 0xbd4c8d6bu, 0x3e099ae2u, 0x3d85b28cu, 0x3d9e0749u, 0xbd9cb58du, 0x3e121054u,
+0x3dab3ef7u, 0x3d702d94u, 0xbda6d7c5u, 0x3c858f36u, 0xbda9978fu, 0x3cce1f16u, 0xbd1322c3u, 0x3d62d70cu, 0xbe0b5c3au, 0xbb1877fau,
+0x3b5c1d27u, 0x3a73ce11u, 0x3c41926bu, 0xbd86b5dbu, 0xbc58ca32u, 0xbc8b75adu, 0xbd37faffu, 0x3d4de9d8u, 0x3ec40f88u, 0xbdb31d13u,
+0x3dd392deu, 0xbc0e6e00u, 0xbcd338c4u, 0x3d5c22dfu, 0xbca57e05u, 0x3d0f518eu, 0x3e1ea1f3u, 0xbdc402a8u, 0xbd9f86c5u, 0x3e1fb04cu,
+0x3d9de677u, 0x3d4a6a93u, 0xbd81cec5u, 0xbd3b4cd9u, 0x3d02b780u, 0xbe4dda8fu, 0xbe142b94u, 0xbd8dcc5fu, 0xbe05b34eu, 0xbceea8d7u,
+0x3cf44d35u, 0x3dd9ede3u, 0x3d1baedfu, 0xbc3d18a0u, 0x3e4b13d6u, 0x3d3625c8u, 0xbc87b6edu, 0x3e043d05u, 0x3cd8c80fu, 0xbc819e6fu,
+0xbd6c7e04u, 0xbdbb392au, 0xbd086fbfu, 0xbe635ef4u, 0xbdbe1654u, 0x3b2c15b7u, 0x3ca75f1bu, 0xbe5b03a2u, 0xbe04ca8fu, 0x3dc9e9d7u,
+0x3da38756u, 0xbccc4964u, 0x3e210855u, 0x3eddbffdu, 0xbbf280c4u, 0x3cc0f059u, 0x3d1dc4acu, 0x3e01f7cdu, 0xbdb611ceu, 0xbe216c4fu,
+0xbc89fee9u, 0xbe4517dcu, 0xbf0ca47bu, 0xbe5daf9fu, 0x3cd7028eu, 0xbcd2e086u, 0xbdcccdc4u, 0x3d012fdfu, 0x3c12f660u, 0x3cc48d93u,
+0x3d75c18au, 0xbe26a861u, 0x3ce89b1du, 0xbd3327bdu, 0x3df22d83u, 0xbcacf09cu, 0xbda4487fu, 0xbe88ff65u, 0xbe87ee63u, 0xbdf771f0u,
+0xbdaed23fu, 0x3cad30a7u, 0xbe6fbfecu, 0x3c9e40abu, 0xba008364u, 0xbd2beefdu, 0xbd115d56u, 0x3d52ccecu, 0x3de1828cu, 0xbe2e3d19u,
+0xbd2de727u, 0x3c550b0du, 0xbc5f4768u, 0xbddc572eu, 0xbd017717u, 0x3d84194au, 0xbd87b24au, 0x3d69688fu, 0xbd214d0bu, 0xbdeaf03au,
+0x3d6d4741u, 0x3e1ea57eu, 0x3d6c680au, 0x3c9b4180u, 0x3d77e0dbu, 0xbdc76bc4u, 0xbda4a39eu, 0xbd9c6d8au, 0xbd4f436cu, 0xbd070161u,
+0xbdf94474u, 0x3c7165f7u, 0x3cf6130eu, 0x3e139ed1u, 0x3e11accbu, 0x3e02d18eu, 0xbccd7a07u, 0x3db1c940u, 0xbe33261cu, 0xbe1da8a8u,
+0x3d6546e1u, 0xbdc826dfu, 0x3dc28e20u, 0x3e322150u, 0xbca387adu, 0x3e79ea3cu, 0x3cfda07au, 0xbe2e7b50u, 0xbe20330fu, 0x3d1bc88fu,
+0xbd39d99eu, 0xbd66adb0u, 0xbc59dfc6u, 0xbd0d18b6u, 0x3d28dd73u, 0xbe0f9197u, 0xbcfb9668u, 0x3d5b6e98u, 0x3d7d7fcfu, 0x3d50c4c0u,
+0xbdf0d50du, 0xbe0d5e92u, 0x3c401d7fu, 0xbc135628u, 0x3d57a35fu, 0x3d205801u, 0x3e0b6dedu, 0x3c849b14u, 0xbd8fd4a3u, 0x3de5b196u,
+0x3db7ece6u, 0x3ddbcc5fu, 0xbd9d97efu, 0xbe111f24u, 0x3cb2167bu, 0xbd607024u, 0xbd9dd4c0u, 0xbd36d81bu, 0xbe63f4ceu, 0x3d4fd6aeu,
+0xbd533bd0u, 0xbdbffe3cu, 0x3cae0f28u, 0xbca5730du, 0x3d1657ddu, 0x3d84b6ddu, 0x3dd8a352u, 0x3da2d778u, 0xbd318193u, 0x3b990982u,
+0x3d48c164u, 0x3d5ba168u, 0xbacc1a5cu, 0x3df2d2c4u, 0x3d12702eu, 0xbe1784b3u, 0xbd5ec7acu, 0xbe31af8du, 0x3ce3c9c8u, 0x3e73529cu,
+0xbdb48a5du, 0xbb56a703u, 0xbe01016eu, 0x3daafa3du, 0x3d78e02fu, 0x3da005e8u, 0x3dd26ec4u, 0xbe0fab15u, 0x3e0341e7u, 0x3cf6e7f7u,
+0xbc25e6c9u, 0x3e0ed5abu, 0x3da2a425u, 0xbd6bd0c3u, 0xbd10b2d6u, 0x3d84a997u, 0xbd680af7u, 0xbc638994u, 0xbce1d88bu, 0xbd3495ebu,
+0x3d2ed4a7u, 0xbd8aad81u, 0xbe2346a5u, 0x3e2de911u, 0xbd83a909u, 0xbe605dfau, 0x3e2b2764u, 0xbd567cb3u, 0xbdc20f5bu, 0xbe021c4du,
+0xbdafac70u, 0x3d8022cau, 0xbe23b530u, 0xbd9c309du, 0x3d8abe81u, 0x3e902a0cu, 0xbc31a1c6u, 0x3d35e919u, 0x3d397dc9u, 0x3cb1ac16u,
+0x3e325869u, 0x3e67d24cu, 0xbc0ac0e7u, 0xbd892a11u, 0xbea82e57u, 0x3ddac4cbu, 0x3d958255u, 0x3d7135ffu, 0x3d5c66e4u, 0xbcbb4387u,
+0xbe241e78u, 0xbd506a5eu, 0xbd43fd08u, 0x3c3034e2u, 0xbe08bc37u, 0x3cebc018u, 0xbdc13fd5u, 0xbd8180e6u, 0xbb60d832u, 0x3e128218u,
+0xbd82a626u, 0x3c1b4122u, 0xbda6ffe5u, 0xbd89e81fu, 0x3d5c7c5bu, 0xbd5accfdu, 0x3c20790eu, 0xbd7e29b8u, 0xbd92ab69u, 0xbcca9f46u,
+0x3cde48beu, 0x3c86115au, 0xbd9e83eau, 0x3bf5e7eau, 0x3cc6a6b9u, 0xbd8a76c4u, 0x3de78ff6u, 0xbd5f030cu, 0xbd9a30c2u, 0x3d5e93e6u,
+0x3ee15cd3u, 0x3d165a82u, 0xbc72fd18u, 0x3de40142u, 0x3c32022au, 0xbd9cbb3au, 0x3f191eeau, 0x3e4ba0afu, 0x3d1c2e4au, 0x3e51475du,
+0x3e316889u, 0xbd81157eu, 0xbe5846f3u, 0xbd0ca747u, 0xbc1f9abau, 0xbe4e347bu, 0xbe3e236bu, 0xbd67e1fdu, 0x3e26cd56u, 0x3d662e50u,
+0x3bfdbcc0u, 0x3df017ddu, 0xbd4a21deu, 0x3d9554aau, 0x3ddef143u, 0xbd95f176u, 0xbd02a152u, 0x3cfdbce3u, 0xbd465800u, 0x3cf6b185u,
+0x3dbc1031u, 0x3bd3c6c8u, 0x3db06b66u, 0x3ea1a813u, 0x3ec6c8e6u, 0x3d25aaf5u, 0xbde2f3e4u, 0x3dd00b7bu, 0xbc328a7du, 0xbdccb31eu,
+0x3ce7fe07u, 0xbdab4852u, 0xbcea4627u, 0xbca7ff10u, 0xbe305649u, 0x3cb0734eu, 0x3d021965u, 0x3da0fef4u, 0xbd50deb3u, 0xbc28638eu,
+0xbd38a509u, 0xbe80fb58u, 0xbe8c50bbu, 0xbadb6f24u, 0xbe2f180du, 0xbd90fbc3u, 0x3c25b652u, 0xbcd7ce52u, 0xbcefdd17u, 0x3d9ef2c8u,
+0x3e407df7u, 0x3e54644fu, 0x3c0e05d9u, 0xbd983c22u, 0x3dce96e8u, 0xbd83ac49u, 0xbd453c85u, 0xbd42371au, 0xbcb22ecbu, 0xbd3230b7u,
+0x3d1d16c4u, 0x3d27e114u, 0x3e231282u, 0xbda35b26u, 0x3dbfc77fu, 0x3d444a48u, 0x3d0e3bb3u, 0x3d20755du, 0xbd983effu, 0x3d7698d7u,
+0x3ca59054u, 0xbe63dcefu, 0xbdeefb4eu, 0x3d3ce7a8u, 0xbd5b8ae5u, 0xbe310750u, 0x3b7921a0u, 0xbdc78eccu, 0x3c8b7c13u, 0xbd2f5343u,
+0xbc953172u, 0xbe43bfaeu, 0xbe2ae67bu, 0x3c0fecd1u, 0x3c0e8485u, 0x3dbf17b4u, 0x3d24e6fau, 0xbd3eb547u, 0x3e007f72u, 0xbd5a2cfbu,
+0x3e250bf1u, 0x3e776da9u, 0x3d92c530u, 0x3cef90d8u, 0xbd489d82u, 0x3da5f816u, 0x3ca5fa80u, 0xbe3fea93u, 0xbe154205u, 0xbe7bfa6au,
+0xbd9c2b7au, 0xbda05516u, 0xbe783530u, 0x3dc14b86u, 0x3da9a97bu, 0x3dade949u, 0x3df47fc4u, 0x3e54d93bu, 0xbd557beau, 0xbd052a63u,
+0xbdd442a8u, 0x3e08353eu, 0xbd5a51abu, 0x3d97172bu, 0xbd009a0eu, 0x3e020e62u, 0xbdf2acbfu, 0x3b85db6au, 0xbcd4ef47u, 0xbd49ae19u,
+0x3e518f44u, 0xbd8c707fu, 0xbdaf62c4u, 0x3cbfcc9eu, 0xbd6615deu, 0xbe8a647au, 0xbe66ddb4u, 0xbe55ea91u, 0xbd7264d9u, 0xbe5788e0u,
+0x3dc93627u, 0x3dbc0a18u, 0x3d34f4abu, 0x3e9d4f45u, 0x3de199f7u, 0x3eb0ea97u, 0x3dd3177du, 0x3e292a48u, 0x3dd95deeu, 0xbdca82e4u,
+0xbd3bd868u, 0xbe70cf79u, 0xbec2bec3u, 0x3cc17777u, 0xbeb9413fu, 0xbe635e71u, 0xbd8d238au, 0xbd4af76du, 0xbd8c69a9u, 0xbe49f342u,
+0xbe9e51a2u, 0x3db0816fu, 0xbc40bee1u, 0xbe4ffa93u, 0xbcfe40aau, 0xbdc01d40u, 0xbe73e6f9u, 0x3d1eb6d6u, 0xbd59b512u, 0xbd5d4ec4u,
+0xbcf688aau, 0xbd9e3acbu, 0xbd663fecu, 0x3dd0fc16u, 0x3e7e885au, 0xbc6de563u, 0xbd62a9d7u, 0x3cb2834du, 0xbdc58c00u, 0x3e5b1feeu,
+0x3d09b8beu, 0xbda304d7u, 0x3ca2e06fu, 0xb89e4222u, 0xbe05c5a0u, 0x3d58252eu, 0x3dff9d47u, 0xbcb16b07u, 0xbd303286u, 0x3d4f5948u,
+0x3e32d9deu, 0xbda3654au, 0x3c4deea7u, 0x3e035c10u, 0x3e937ad2u, 0x3c83af5bu, 0xbc88fd4eu, 0x3cbee415u, 0x3d960f84u, 0xbd9c4066u,
+0x3ce78f1fu, 0x3d2e84aau, 0xbd855f30u, 0xbd136b31u, 0x3dfd2e33u, 0xbb173f3bu, 0xbdff8916u, 0xbdc18efcu, 0xbcb5d998u, 0xbda68bd0u,
+0xbe0a8a64u, 0xbd51ad0du, 0xbe10ed27u, 0xbe1aa9cdu, 0x3d971539u, 0xbd7eff87u, 0xbe211561u, 0xbd59e05eu, 0xbd996fdfu, 0x3d0d388eu,
+0x3e2aaee1u, 0x3d4b9744u, 0x3e2a3466u, 0xbce00ee2u, 0x3d0cea01u, 0x3e646c22u, 0x3dea79ffu, 0xbb8ae327u, 0xbaccfb6du, 0x3c390b9eu,
+0x3e41c5fau, 0xbd6f33dbu, 0x3dae6d28u, 0xbde3bf56u, 0xbe0c0ec3u, 0xbc969ba3u, 0xbd1d3a8eu, 0x3ce47760u, 0xbd317fb3u, 0x3da82ac0u,
+0xbd905becu, 0xbbdf4d1au, 0xbd7a1d30u, 0xbe20e393u, 0xbd1f3dccu, 0x3d55944eu, 0xbe1a1fa1u, 0x3cc4970cu, 0x3e6ab812u, 0x3e8e74e7u,
+0x3e65bd8cu, 0x3e8764e9u, 0x3f657f7au, 0x3e382a26u, 0x3df57f34u, 0x3e1fe74du, 0xbd92efe1u, 0x3dfb1345u, 0xbe045914u, 0x3cc756acu,
+0x3e854d15u, 0xbe9044acu, 0x3dbc716fu, 0xbcfd241du, 0xbd0e504cu, 0x3be8d23du, 0xbccf5238u, 0xbc63380au, 0x3e57a2dfu, 0xbe1a8571u,
+0xbe3e7a3au, 0xbda77de3u, 0xbdedf105u, 0xbd8552e8u, 0x3d7f033cu, 0xbdebb978u, 0x3df8a882u, 0x3d99c509u, 0x3d01e587u, 0x3e27c9aau,
+0x3df681c8u, 0xbd1c1fbbu, 0xbd39917eu, 0xbd2369aau, 0xbd6865f8u, 0xbd75a853u, 0x3d1a636du, 0xbd243db5u, 0x3e87dc43u, 0x3dcc831fu,
+0x3e59001au, 0x3da615a7u, 0x3d96564eu, 0x3d89656au, 0xbc9b9e3du, 0x3cd48cecu, 0x3bd8a664u, 0xbeac0e37u, 0xbcb68584u, 0x39d723d4u,
+0x3e08e74eu, 0x3da25553u, 0x3d131869u, 0xbd84fd02u, 0x3d11d91eu, 0x3d153b71u, 0x3cf50456u, 0xbe4814bfu, 0xbb5a154eu, 0xbd961447u,
+0xbdc27d9au, 0xbcffb1a4u, 0x3c6b5504u, 0xbddcf693u, 0xbd36ceecu, 0xbea8feabu, 0xbd1f1f2au, 0xbd88dc54u, 0xbe0d9addu, 0x3af1d20bu,
+0xbd1193b9u, 0xbe263f8cu, 0x3c53e957u, 0xbde4637eu, 0x3e2657cfu, 0x3d4210d0u, 0xbda09a86u, 0xbdc3b821u, 0x3e1f0260u, 0xbdae09ccu,
+0x3e41bd80u, 0xbb9bcc5du, 0xbddf846cu, 0x3f21d4d1u, 0xbd7394dfu, 0xbc5e6324u, 0x3d7ae82bu, 0xbcdcb832u, 0xbdc61103u, 0x3d25a362u,
+0x3d8a5623u, 0x3dde4e00u, 0xbe368260u, 0x3e09d9b5u, 0x3d2c448bu, 0xbd43fd7fu, 0xbccef898u, 0xbd7ed50bu, 0xbd0c565du, 0xbd23e57cu,
+0xbd96b251u, 0xbe8472e8u, 0xbe013502u, 0xbdeef23du, 0x3e449e4au, 0x3cba32acu, 0xbcb139afu, 0xbd9730efu, 0xbd95c0a0u, 0x3d869f1du,
+0xbea03cd1u, 0xbddd0282u, 0x3e03125au, 0xbddbe4cbu, 0xbe2f4facu, 0x3cea2748u, 0x3c811d70u, 0x3d8b09edu, 0x3e159411u, 0xbdd4e6f1u,
+0x3da7e34eu, 0x3e14cd3cu, 0xbdf960c0u, 0x3da17b06u, 0x3aa28d59u, 0xbd353aa5u, 0x3d8d44cfu, 0xbd9e12eeu, 0x3c5d05c4u, 0x3cb5a84bu,
+0xbd84df80u, 0x3e4d1f5cu, 0x3cea0254u, 0xbd4a75a3u, 0xbcad0acau, 0xbd03e35eu, 0xbd7d7b52u, 0xbef786bau, 0xbc9ac2dau, 0xbcbc4a43u,
+0x3c8e75d5u, 0xbb125b6du, 0xbdb1bc32u, 0xbd5c14a3u, 0xbd1648f5u, 0x3e2004f2u, 0x3e20c968u, 0x3df5bedfu, 0x3e09e2d6u, 0x3e79f240u,
+0x3d4deaf5u, 0x3c93942cu, 0x3dc6e2d3u, 0xbdbcbf15u, 0x3ce59c13u, 0x3e0f16eeu, 0xbd821f94u, 0x3d4495b7u, 0xbc1319cfu, 0xbc973b72u,
+0xbe0441efu, 0x3e90d730u, 0x3d249269u, 0x3db16e9fu, 0xbe46a2c1u, 0x3d80b3f8u, 0x3c87246fu, 0xbd0c4b44u, 0xbd8ed772u, 0x3e145739u,
+0x3d0e1f1bu, 0xbd4f8192u, 0xbbd864e9u, 0x3e490287u, 0xbccda6edu, 0xbd036af6u, 0xbc1d4116u, 0x3c76afaeu, 0x3c8ce61bu, 0x3d0a4c3au,
+0xbc45316eu, 0x3da34fe3u, 0xbe4229aeu, 0x3d541d27u, 0x3dc3be34u, 0xbd1212b6u, 0x3d8cdcbbu, 0x3db212aau, 0xbe0efdbcu, 0x3e22bb53u,
+0xbdbcb48bu, 0xbe2dc10bu, 0x3e53dd58u, 0x3dc446edu, 0x3e23d798u, 0x3e0ff46bu, 0xbc15072du, 0x3c7946dau, 0x3c9f84cbu, 0xbcb6bbd8u,
+0x3ec96484u, 0xbe40c761u, 0xbae3eef4u, 0xbdf07fd6u, 0xbd64ade8u, 0xbd051f84u, 0xbd139e76u, 0x3cc794f6u, 0x3d9cbca8u, 0x3e98a692u,
+0xbd966d13u, 0x3d2d6092u, 0xbd4f417du, 0xbc891813u, 0xbc276f48u, 0xbd37c411u, 0xbd1ecb73u, 0x3c9f7edbu, 0x3e753798u, 0x3dbf4488u,
+0xbe052084u, 0x3db29c1au, 0x3d8006fdu, 0xbd961281u, 0x3c380ec9u, 0x3dd02fcau, 0xbe11b7e8u, 0x3de25940u, 0x3ccf699cu, 0xbd5ba63du,
+0x3deeae71u, 0x3d5d95e5u, 0x3cb83becu, 0x3da3d08cu, 0xbd65feacu, 0x3cc61733u, 0xbe1522b9u, 0x3ce2bf6cu, 0x3dbb4f6fu, 0xbd16fa1fu,
+0x3c4202eeu, 0x3d7261b0u, 0xbd9a24efu, 0x3d5b4893u, 0x3badc818u, 0x3e808e4eu, 0x3d2f32b0u, 0x3da3b4deu, 0x3dc65c3du, 0x3dc8a4a4u,
+0xbcaa3f48u, 0xbd0ac80fu, 0x3ce79c9eu, 0xbef05362u, 0xbde3ce87u, 0xbbb4b1c1u, 0x3ebce531u, 0x3de89203u, 0x3d5bb802u, 0xbd4a1210u,
+0xbde8a101u, 0xbdf1b1d8u, 0xbdfa3ca6u, 0x3ed6237cu, 0xbe0b7e7eu, 0x3bab0d28u, 0xbd2f7369u, 0xbddec176u, 0xbd36d5dfu, 0x3e0f3b61u,
+0x3c5c7fe4u, 0x3c0fa4dcu, 0xbe3c6518u, 0x3e430befu, 0x3afaca67u, 0xbdbb1097u, 0x3bbb53efu, 0x3d98273cu, 0x3d3a2de6u, 0x3d644e36u,
+0xb9a1d4a0u, 0x3e2c0216u, 0x3bc9df9du, 0x3c7a5a91u, 0x3d0946e1u, 0xbd4ac1b6u, 0x3d7222f4u, 0xbd34c4dfu, 0xbdc0be2bu, 0x3c8080dau,
+0x3d8ebee3u, 0x3d9dd6b5u, 0xbcd5f4adu, 0xbd921b87u, 0xbd156763u, 0x3c14e0c3u, 0xbdfc6395u, 0x3da87ba1u, 0x3e4c0750u, 0xbe16258fu,
+0x3df57e61u, 0xbbd3f308u, 0x3dbbb78au, 0x3e1e3980u, 0xbd88e260u, 0xbdaf7c5cu, 0x3d7f5abeu, 0x3c3d33d9u, 0x3e018689u, 0xbe3ca088u,
+0xbd9f7f5fu, 0xbde4fa61u, 0x3ca74820u, 0xbd28d07du, 0x3e2c2caau, 0x3e04f32eu, 0xbd05f46cu, 0x3eaec70au, 0x3db3ed4du, 0x3c6b4763u,
+0x3e71673bu, 0x3dae4bd6u, 0xbca39a84u, 0x3df03a6cu, 0x3d05b79bu, 0x3de3d93du, 0xbd2186ccu, 0x3dde8593u, 0x3d4fe9f9u, 0x3df3994du,
+0x3df05da9u, 0xbd9bd697u, 0xbe751f1du, 0xbdd08792u, 0x3ccf4234u, 0xbdd3341du, 0xbe3d901cu, 0x3e11cb3au, 0xbc25de25u, 0x3ce7fa4bu,
+0xbe136a33u, 0xbe4bff50u, 0xbdf5d440u, 0xbe6973c4u, 0xbe8d8e4bu, 0x3de58678u, 0xbd88eb0fu, 0x3c558a67u, 0xbdc7f2e2u, 0x3d84e24eu,
+0x3c8ba4d6u, 0xbc8d0afbu, 0x3e2ec056u, 0x3ee94d66u, 0xbcb2b607u, 0x3e0e47aeu, 0x3c05dff5u, 0x3d7935ccu, 0xbe44a44bu, 0xbdf357aau,
+0x3da1ac3eu, 0x3dc2f0b3u, 0xbd0b1a02u, 0x3d56fc17u, 0x3dc414bbu, 0x3e7dbdf2u, 0x3db67bf8u, 0x3cad51f7u, 0x3e039752u, 0x3ce15d3au,
+0xbe61911bu, 0xbd8e2809u, 0x3da7b1a4u, 0xbdb0d1c6u, 0xbe7e6610u, 0xbd9a8079u, 0xbc028be8u, 0xbce8c95du, 0xbdabda3au, 0x3dad6334u,
+0x3e48305au, 0x3d127f7cu, 0xbc909641u, 0xbd06c011u, 0x3d63ec02u, 0xbd3a94afu, 0xbd39f8e2u, 0x3e055f58u, 0xbe08fb72u, 0xbe264d14u,
+0x3c5b2c50u, 0xbd7e7c5au, 0xbc23f372u, 0xbd9cd554u, 0xbda25ca0u, 0xbe35ed38u, 0x3e15eeb8u, 0x3db6bb15u, 0x3d5d4c9bu, 0xbe2d16dau,
+0x3c97ac72u, 0x3b85ca91u, 0x3daa26aau, 0x3cbe78cfu, 0xbddc77d5u, 0xbd03d64bu, 0xbda2e322u, 0xbe9ba5c5u, 0xbc9ae715u, 0x3e84b0f3u,
+0x3df142b8u, 0xbe07e88bu, 0x3e48093du, 0x3db744d6u, 0x3de8d0a2u, 0xbe02c671u, 0x3e170b7eu, 0x3d4bbd40u, 0xbe5c8eaau, 0xbdcf32eau,
+0xbdaed0bfu, 0xbb95cca6u, 0xbc63e9a7u, 0xbd29951eu, 0xbc935bfeu, 0xbda2b85eu, 0x3de657c1u, 0xbcb391b1u, 0xbda0f715u, 0xbc43aa60u,
+0x3d731678u, 0xbd8b3ac0u, 0x3e0402b8u, 0x3df5344au, 0x3e5bff1fu, 0x3d1e955au, 0x3e4abff2u, 0x3dafde21u, 0xbc8120c2u, 0x3cca1fecu,
+0x3c73ccf2u, 0xbd8176b1u, 0xbdf78a1au, 0xbe5339d0u, 0xbe1199f9u, 0xbb891a10u, 0x3dcbd2ecu, 0xbd004455u, 0x3c098609u, 0x3e7cf4a4u,
+0x3db70868u, 0xbe215e99u, 0xbc1e464au, 0xbdb388b6u, 0x3c9a1714u, 0xbd84c612u, 0xbd125e46u, 0xbd2c6471u, 0xbdc2b0e5u, 0x3d9cd423u,
+0x3df63847u, 0xbe41d6ffu, 0xbd3b5121u, 0x3e364ed5u, 0x3d0f1bb1u, 0x3c7c62acu, 0x3e1d6b99u, 0x3cc0ab55u, 0xbd4a02d5u, 0xbda9a4a7u,
+0xbdb7f23cu, 0xbd3df54du, 0xbc846d20u, 0x3bfaeb9cu, 0x3d548617u, 0xbd75c1a1u, 0xbdaadaefu, 0x3da9fab6u, 0x3e783b83u, 0x3e04b570u,
+0x3de7d17fu, 0x3c333c9bu, 0x3d09a81au, 0xbd99c2ffu, 0xbdde5c42u, 0xbe837e16u, 0xbdb8bf62u, 0xbda45dbeu, 0xbd9d35abu, 0x3b95ded8u,
+0xbda4276eu, 0xbdb2ddcbu, 0xbd869056u, 0x3e742f24u, 0xbdc99284u, 0xbe74e914u, 0xbe029000u, 0xbcc74b82u, 0xbd7d599du, 0x388b5148u,
+0xbccc9d1au, 0x3e347de5u, 0xbba58561u, 0x3cd70bdfu, 0xbcbcec05u, 0xbdb5bd0fu, 0xbd010484u, 0x3cdb35b3u, 0xbe4500c7u, 0xbee339dbu,
+0xbdb9208du, 0x3d87511bu, 0x3e38684eu, 0xbc5f4159u, 0xbe25bee4u, 0x3ed22ca4u, 0x3d9d7ac8u, 0xbd0970cau, 0xbebbdabeu, 0xbd2be283u,
+0x3cb89d5fu, 0xbde48c87u, 0xbb268b2eu, 0xbc9dccaau, 0xbd04a3bdu, 0xbc4df67fu, 0x3d93fc3fu, 0xbd87b69eu, 0x3e188938u, 0xbdb64109u,
+0x3d67abc1u, 0xbc711c83u, 0x3dbe4e1du, 0xbe1d67d0u, 0xbe398b3cu, 0x3d5c2414u, 0x3e6d55d4u, 0x3e542f58u, 0x3ca4246cu, 0xbc946e27u,
+0xbd032df6u, 0x3d35d20eu, 0x3e06ed0cu, 0x3e0fc529u, 0x3eadc066u, 0x3d0d9868u, 0x3d48b0d8u, 0xbd158ad4u, 0x3d2eb702u, 0xbcc44634u,
+0x3b59c922u, 0xbdb86b80u, 0x3ca148b8u, 0x3ddcf535u, 0xbc5767d9u, 0xbd03ab31u, 0xbda7cb04u, 0x3ba650a2u, 0xbb5b39f7u, 0x3d9c82b5u,
+0x3e05cfe9u, 0x3e00e669u, 0x3cb1ebe8u, 0xbdc4d62cu, 0xbdc179eeu, 0x3d2bde07u, 0xbc01dc9au, 0xbc349088u, 0x3ca93800u, 0xbe09f521u,
+0xbde4981bu, 0x3cc9a037u, 0x3e62f3bcu, 0x3dd11563u, 0x3cee1194u, 0x3d7dbe0au, 0xbddf24e0u, 0xbc4c48fcu, 0x3e17a063u, 0x3d80ed1du,
+0x3d9b8d41u, 0x3d2e4698u, 0x3df4b60au, 0x3e047047u, 0x3dde8256u, 0x3d1090ffu, 0xbd413588u, 0xbe00c028u, 0x3d072f7du, 0xbe2ccf7eu,
+0xbe4a01edu, 0xbdb0f032u, 0x3cab0adbu, 0xbd865eaau, 0x3c24a8f6u, 0x3da373afu, 0xbba10d56u, 0xbcb193b6u, 0xbc229f78u, 0x3eb4ac21u,
+0x3daaf100u, 0xbdc7e577u, 0x3df8731eu, 0xbdac70c1u, 0xbc3015abu, 0xbe146cf5u, 0x3d204a0bu, 0xbda642f7u, 0x3e1d5b1bu, 0xbdc4c82du,
+0x3d9880ddu, 0x3dfd6597u, 0x3da8047eu, 0xbc425e2du, 0x3d12caf4u, 0xbd4cd8c8u, 0xbd9a3a6du, 0xbb020cf8u, 0xbd3e8e0bu, 0x3dd5f1e3u,
+0x3dc1437du, 0xbd2077cau, 0xbdee3397u, 0xbdcf074fu, 0xbdbe6911u, 0xbda319d1u, 0x3c3ac823u, 0xbdc0a100u, 0xbd2fd228u, 0xbd866cb0u,
+0xbda77840u, 0xbc3001ffu, 0xbd49f177u, 0xbdc8cbf9u, 0xbd21eb0cu, 0x3d2889b1u, 0xbd0261dbu, 0xbe0da9f7u, 0x3d98179du, 0x3e0a6a77u,
+0x3cd58d0fu, 0x3dad53c8u, 0xbd636c9cu, 0x3c7666e2u, 0x3d8c206eu, 0xbc9e00f8u, 0xbda7daeeu, 0xbe349006u, 0x3d80bdbfu, 0x3ce2da07u,
+0xbdd48edau, 0x3dbd13edu, 0x3cfe5b41u, 0xbd8ce828u, 0xbe2d5b85u, 0xbd6afa2du, 0xbdcdee4bu, 0x3e054825u, 0xbdf1e8c9u, 0xbeb7bc93u,
+0x3d49a77du, 0x3c3ae2f0u, 0x3da8b2d7u, 0xbd9609f5u, 0xbc2f9286u, 0xbe3953cbu, 0xbd113bcbu, 0x3ead2077u, 0x3d8d3aedu, 0xbdb065ebu,
+0x3c08011au, 0x3e226cc1u, 0x3e54cfd4u, 0xbdba6631u, 0x3d45ef18u, 0xbe38e84bu, 0xbdc2fe1bu, 0xbd9c14e3u, 0x3bfaed5bu, 0xbe59112bu,
+0xbe3bc8d8u, 0xbdaacb94u, 0x3c8cb8a7u, 0xbe028b28u, 0x3e0f0447u, 0xbd5d07c4u, 0x3e5b1be0u, 0xbde38ad4u, 0xbe413bffu, 0xbe8434d8u,
+0xbe457801u, 0xbc541340u, 0x3eb6cf7au, 0xbd595ea6u, 0xbdcde209u, 0x3cd898b6u, 0xbd000fbdu, 0x3dc9d182u, 0x3ea2f759u, 0xbdf3489au,
+0x3dcb0a3eu, 0x3e6357a4u, 0x3d044941u, 0x3ea5b917u, 0x3ce50ac5u, 0xbd8af230u, 0xbd010ea0u, 0xbd92bbdau, 0x3e11685fu, 0xbe433835u,
+0x3d63c601u, 0x3df82a30u, 0x3c40b478u, 0x3e59e61au, 0x3e128b94u, 0x3c9a7aefu, 0xbdf0f7a6u, 0xbe711572u, 0x3c66a9adu, 0x3d25025au,
+0x3e44502fu, 0xbd46d883u, 0x3e2b0f87u, 0x3dad7209u, 0x3e9e619bu, 0xbdae3bd0u, 0xbc168485u, 0x3da0e205u, 0xbdc6b15du, 0xbd88258au,
+0x3c6c32d5u, 0xbe06e686u, 0xbcf24999u, 0x3e3b3bc1u, 0xbdebcc78u, 0xbd157637u, 0xbc5992cdu, 0x3eb839e8u, 0x3e2fc98au, 0x3d6899d5u,
+0x3c2eb41bu, 0xbd4e8b1fu, 0xbd02ffa8u, 0xbe407b49u, 0x3de11ce1u, 0x3d80439du, 0x3da3e27du, 0xbd96102fu, 0x3db18416u, 0xbe0a8626u,
+0xbdd95498u, 0x3e191b30u, 0x3e624204u, 0x3c1b58beu, 0x3ded6d70u, 0x3dd61377u, 0x3cdc5b7cu, 0xbdc966f9u, 0x3d21b22cu, 0xbb9096aeu,
+0xbd732447u, 0x3df2d3afu, 0x3c57f659u, 0x3dfdc082u, 0xbd7748b7u, 0x3cf513c8u, 0x3cce07d7u, 0xbd91becbu, 0xbda6a1d7u, 0xbe026b35u,
+0xbe0f42c0u, 0xbc0d5cf3u, 0x3dfd16f7u, 0x3d858b27u, 0x3d7ee991u, 0x3c662122u, 0x3c712af1u, 0x3da458c5u, 0x3ca9e4e2u, 0xbd34eaccu,
+0xbe4e127au, 0x3d938492u, 0xbd3c848fu, 0x3d4f48edu, 0xbd4164bdu, 0x3e575259u, 0xbc893e85u, 0xbdbc91f1u, 0xbec1ce04u, 0x3d8b8066u,
+0x3dde2557u, 0xbd4ae53fu, 0xbd4f50e1u, 0xbd4600bcu, 0xbdaa683bu, 0xbd80a3cau, 0xbe8a4df7u, 0x3ca31e22u, 0x3e1a1c65u, 0xbd5bc313u,
+0xbbb04ed9u, 0xbd3d08cdu, 0xbd821b70u, 0x3e869edcu, 0xbd8fd0f8u, 0x3d2f8f93u, 0xbe8d6008u, 0x3e666fd0u, 0xbd29264bu, 0x3de1f741u,
+0x3d8f39a6u, 0x3d0cff16u, 0xbdc2ba26u, 0x3d21b1d8u, 0xbe27acdcu, 0xbde763d0u, 0xbdd5b5bdu, 0x3e12db1fu, 0x3d00a663u, 0x3d1c44e6u,
+0xbcf26a4bu, 0xbe076904u, 0xbdc04b78u, 0xbe3ab6c0u, 0xbbbf44eeu, 0x3d0c2bcfu, 0xbd8dcca5u, 0xbd4680acu, 0xbe289176u, 0x3df9dadeu,
+0xbcedd657u, 0x3d2f35d6u, 0x3d3d0d70u, 0x3de041cbu, 0xbe240aabu, 0xbe1aa4b0u, 0xbe377436u, 0xbd7905b3u, 0x3d8323b5u, 0x3cb7e055u,
+0x3da8177bu, 0xbd965e83u, 0x3de8cec1u, 0x3da464dbu, 0xbd4ab516u, 0xbe47df1du, 0xbd233bafu, 0x3dcac1d5u, 0xbd1f0652u, 0x3db4c082u,
+0xbe6478e6u, 0x3e6eb282u, 0xbdd9e34du, 0x3dc57d37u, 0x3c50ab9fu, 0xbd842b51u, 0xbde5f5ddu, 0x3d0a872au, 0xbd9384c1u, 0x3e66dc4au,
+0xbe86845du, 0xbd96686eu, 0xbd5d1de0u, 0xbc40e625u, 0xbc96b25fu, 0x3d71b53fu, 0x3df9b546u, 0x3d90ffc2u, 0x3e17105fu, 0xbe002262u,
+0x3e3fa320u, 0x3de1163au, 0x3e34cf66u, 0xbc54417fu, 0xbe842891u, 0xbe5b4152u, 0x3dd63ed3u, 0x3d1483d0u, 0xbed0c823u, 0xbd5d2232u,
+0x3ca130efu, 0x3e4eeeaau, 0xbe640be9u, 0xbe1cb42du, 0x3d022670u, 0x3e005860u, 0xbd86e5dfu, 0x3ec4b94au, 0x3e218e32u, 0x3d3d311eu,
+0x3d54e6d7u, 0x3e956d53u, 0xbcd14f02u, 0xbe4e2dd3u, 0xbd9bc587u, 0x3dc47cdau, 0x3e527c86u, 0x3e0ff7c6u, 0xbe2fb0e4u, 0x3e5be828u,
+0xbdca0046u, 0x3d7d3ea7u, 0x3ca89ac0u, 0x3cddfa3au, 0xbdcd7966u, 0x3e60c788u, 0x3db166aau, 0x3b2268f6u, 0xbe2ed64bu, 0x3cb4ab33u,
+0x3dad48d8u, 0xba9800c8u, 0x3d93a027u, 0x3d49e690u, 0x3dc76b33u, 0xbdd1d980u, 0xbd2b59e5u, 0xbe3c625cu, 0xbce143c4u, 0xbdaa16c3u,
+0x3d717c0cu, 0x3df1a204u, 0xbeb8dcddu, 0xbdee20f2u, 0x3df8e366u, 0xbd204bacu, 0x3e83d533u, 0xbe333f54u, 0xbd06ccaau, 0x3e05bd04u,
+0x3d3d917cu, 0x3cfe1eadu, 0xbd4af8a3u, 0xbcc1eb4du, 0xbcb4af10u, 0xbd973050u, 0x3db7a24eu, 0x3d97ed87u, 0x3dc13671u, 0x3ce5b823u,
+0xbb94ed1au, 0x3d060bceu, 0x3e0ffe56u, 0xbca59cebu, 0x3e4a455au, 0x3c64ea0bu, 0xbe1dec32u, 0x3e9a3b97u, 0x3d726addu, 0xbecf71acu,
+0xbd9a8755u, 0xbd86dddcu, 0xbe402cecu, 0xbd248772u, 0xbcf51e59u, 0xbdb1c08fu, 0xbe24a409u, 0xbd3f3298u, 0xbda7d056u, 0xbe866d85u,
+0x3d12d782u, 0xbd1c3eb5u, 0xbbbdc325u, 0xbd97085du, 0x3cd16beeu, 0xbbedd564u, 0xbd8579b7u, 0xbdc32ca3u, 0xbef945aeu, 0x3d746f8fu,
+0xbd938f11u, 0xbd87a572u, 0x3c316648u, 0xbb13ecfbu, 0x3e4ccbbcu, 0x3db56402u, 0xbd550034u, 0x3dbe83eau, 0x3c48ef05u, 0xbc5fcf9du,
+0xbe0d754cu, 0xbda9b13eu, 0xbd18a5e7u, 0xbd7cc919u, 0xbcc22680u, 0xbc59bcd1u, 0x3e11da2bu, 0xbd84dfbdu, 0xbd88a6afu, 0xbd3f4533u,
+0xbd099c8fu, 0x3dfba4acu, 0x3df6ffb3u, 0x3db67782u, 0xbd163b67u, 0x3dedf9d7u, 0xbdfa18b2u, 0xbd45019fu, 0x3beb3391u, 0xbdea66d2u,
+0x3d8d498bu, 0xbcb4735eu, 0x3d374a6eu, 0x3ca48636u, 0x3df352b0u, 0x3e4955e8u, 0xbd3b9547u, 0xbe01eb7bu, 0xbbf85b20u, 0xbc971cc6u,
+0x3d8aa385u, 0x3c1e9488u, 0x3c0be0edu, 0x3e391046u, 0x3cad5999u, 0x3c871d54u, 0xbc7f74c6u, 0xbd4b40ebu, 0x3cd837b5u, 0x3cad87abu,
+0xbe683badu, 0xbd2f0599u, 0x3d56a72bu, 0x3bead57cu, 0x3d850884u, 0x3dad7e7bu, 0xbca12f79u, 0xbe0bf9a0u, 0xbe2ea25cu, 0x3cbd715du,
+0x3dd26733u, 0xbe364ebau, 0x3d881523u, 0xbc6496eeu, 0x3c9da432u, 0x3dae960cu, 0x3cbfd0e3u, 0xbe2a77e2u, 0xbc3010d4u, 0x3b6e969du,
+0xbe004cb7u, 0x3d660a0eu, 0xbb16c206u, 0x3d9bad64u, 0x3c0bf8f8u, 0xbd6855acu, 0xbda04837u, 0xbc3a6df6u, 0xbdc604dbu, 0xbdef47bdu,
+0xbe106264u, 0x3d2983a9u, 0xbe2a95e7u, 0xbda76961u, 0xbc7eb1c3u, 0xbe2dc9c8u, 0xbddd7839u, 0x3cb4df81u, 0xbe03a129u, 0xbcedee4fu,
+0x3bb952c1u, 0xbe294001u, 0xbd719a29u, 0x3e25a76au, 0x3e0dfad1u, 0x3dfbcb94u, 0x3e8302e0u, 0x3e4f4976u, 0x3e6962bdu, 0x3dea1e80u,
+0xbccff57cu, 0x3cbe27b6u, 0x3d902f06u, 0x3ceec430u, 0x3aa04fdfu, 0x3e409b8fu, 0x3e1c3b5fu, 0xbd894a98u, 0x3e2e208du, 0x3ded75d1u,
+0xbc6dff5du, 0x3d8280feu, 0xbddfdb27u, 0xbe0e1ce1u, 0x3cb1e9d0u, 0x3eb9fa38u, 0x3bfc3fb8u, 0x3d145c58u, 0x3c043fe3u, 0x3d430206u,
+0xbd56d8dau, 0xbdd12ea6u, 0x3e0d3570u, 0x3e34de1bu, 0xbe9b50a5u, 0x3ea17e50u, 0x3e159adcu, 0x3e3945d3u, 0x3e27d1fdu, 0x3e1fff33u,
+0xbde73448u, 0xbde28db8u, 0x3d85d80au, 0x3d91e276u, 0xbcbd3fbcu, 0x3c9c95dau, 0x3d28af31u, 0x3dd65eb4u, 0xbd6244a4u, 0xbd01dc0bu,
+0xbe0d9258u, 0xbc9c2eedu, 0xbe781c04u, 0xbdfe084du, 0x3d293b4eu, 0x3d12b4deu, 0xbc964cb8u, 0x3be78dbfu, 0x3d6db938u, 0xbd73036cu,
+0x3dd9ed98u, 0xbd8d2da3u, 0xbd8e4fa8u, 0x3d8279e7u, 0x3d586c10u, 0x3d9e9d03u, 0xbda57e38u, 0xbea27039u, 0x3d9fe35cu, 0xbe65aeefu,
+0x3d87855bu, 0x3d0ff8e8u, 0xbd2060d7u, 0xbe77e557u, 0xbe4fbb71u, 0x3e142b80u, 0x3df94873u, 0x3cab2c50u, 0x3dff3192u, 0xbe23083bu,
+0xbdfbf04au, 0xbe82a112u, 0x3e713932u, 0xbd90c4fbu, 0xbdbe142eu, 0x3e0a4adcu, 0x3c07834eu, 0x3e02a3ddu, 0xbd04fdd4u, 0x3dc0368fu,
+0xbdf294c3u, 0x3d3f3447u, 0x3cd79387u, 0x3d389d71u, 0xbcbe951fu, 0xbd2258e6u, 0x3d7cca36u, 0x3ca145b7u, 0x3d0eff28u, 0xbe3b4fcbu,
+0xbde8e8b5u, 0x3a9ea6b7u, 0xbd1d1020u, 0xbdeb7ebau, 0x3e3fd34cu, 0xbdaa34fdu, 0xbef94221u, 0xbe1991beu, 0xbe47b268u, 0xbc92bfd4u,
+0xbdc3c82eu, 0x3dff2cc2u, 0x3da4d44eu, 0xbc8c6990u, 0xbe557984u, 0xbe8b46ebu, 0xbe533de8u, 0x3d7f73abu, 0x3dcaea08u, 0x3df97da2u,
+0x3c1be1c8u, 0x3d1ec45au, 0x3d2d32b5u, 0xbceee2a7u, 0xbe200812u, 0x3ceed0e8u, 0xbd9f3663u, 0xbd547720u, 0x3cce9db9u, 0xbdf4b5d6u,
+0x3c905f17u, 0xbdc53e33u, 0xbdc013cfu, 0x3d6e325cu, 0x3de56e2du, 0x3c2423abu, 0xbe0e1a0du, 0xbdb11b66u, 0x3940043cu, 0x3d1757d8u,
+0xbd04aadau, 0xbcb88128u, 0x3decea52u, 0xbc2e4715u, 0xba850cbau, 0x3dca370du, 0x3d9fb992u, 0xbb93b6bbu, 0xbe2902fau, 0xba0319a2u,
+0xbca40efcu, 0xbe04601bu, 0xbdfe2cd5u, 0x3d6483c5u, 0x3d89abf4u, 0xbd6b8526u, 0xbda2d185u, 0x3d9b345fu, 0xbde9695fu, 0x3da93ffbu,
+0x3d6342d0u, 0x3d33546au, 0xbc29fb31u, 0xbd9fff04u, 0x3da9482eu, 0x3cde940bu, 0x3c820646u, 0xbdd25a9eu, 0xbc72a93du, 0xbdfaf415u,
+0xbe588f78u, 0xbdcadd8fu, 0xbe03c068u, 0xbcdf8516u, 0x3d7b3cc7u, 0x3cb54267u, 0xbde37b49u, 0x3e05baaau, 0x3d7969a7u, 0xbe144069u,
+0xbc72e5d7u, 0x3da9b001u, 0xbdb51429u, 0xbce484ebu, 0x3d09133au, 0xbd8aea72u, 0xbb17e283u, 0x3e97b157u, 0x3da15af0u, 0x3c549b13u,
+0xbcbefd01u, 0xbc2b8920u, 0x3dd5f0f1u, 0xbe51dccbu, 0x3c625688u, 0xbd2761dcu, 0x3e94c2d7u, 0x3e27180eu, 0x3d22fe9bu, 0xbe5a876eu,
+0xbc9b3b13u, 0xbbf57390u, 0x3dce2415u, 0x3d0f6f3eu, 0xbd25e192u, 0xbea32b21u, 0x3aa81eaeu, 0x3d39e0ebu, 0xbde86b4bu, 0xbd8769b4u,
+0x3d2b6ac0u, 0x3e1c1d2du, 0x3cabeb5au, 0x3dcb2adfu, 0xbcb0cf81u, 0x3b909b0bu, 0xbd9528edu, 0x3bfd71b8u, 0xbdac7a84u, 0xbda7bcd5u,
+0xbcb78771u, 0x3d821cefu, 0x3df84e83u, 0x3e0c4b52u, 0x3e95235fu, 0x3d0c8c87u, 0xbe0e1220u, 0xbdd534f8u, 0x3cd52284u, 0xbcba9eb9u,
+0x3d023449u, 0x3cc32182u, 0x3de0c090u, 0x3d84c1c5u, 0x3c9b2f06u, 0x3d137fcbu, 0x3cba220eu, 0x3d7a8a84u, 0xbe097711u, 0x3e07ada2u,
+0xbd98d559u, 0xbdaa2b66u, 0xbeb5efb0u, 0x3dded941u, 0x3e1fde64u, 0xbccaaf79u, 0x3c601dfbu, 0xbdbbc90eu, 0x3deb0c48u, 0x3e69f9f9u,
+0x3e37eaddu, 0x3e8455fau, 0x3cc37213u, 0xbe8fdc28u, 0xbdd3da86u, 0xbd2adf80u, 0x3c939f5eu, 0xbd7d269fu, 0xbe11a6c9u, 0xbe139259u,
+0x3c923bbau, 0x3d8113bfu, 0xbd1c266du, 0xbdb973a4u, 0x3e045e34u, 0xbe21311au, 0x3d62f9e3u, 0x3da3b34du, 0x3de3d93bu, 0x3cbf0ea0u,
+0x3c131efdu, 0xbd7c6afau, 0xbd105ad0u, 0xbcf97d8bu, 0xbd761f93u, 0x3da1d51du, 0x3e4bd214u, 0x3e9ead57u, 0x3c9cdefcu, 0x3e5a0e52u,
+0xbe1f0e54u, 0x3dd905a9u, 0x3e4a4c49u, 0xbd94a797u, 0x3d0ebb90u, 0xbdeded14u, 0xbde275b3u, 0x3acc62f2u, 0xbd5beb1eu, 0xbd526d2au,
+0xbd0fed1fu, 0x3eb2cadfu, 0xbcbd593cu, 0xbe1140bdu, 0x3ca33f08u, 0xbd1d60d5u, 0xbe4dd642u, 0x3e617ebau, 0xbe341d3cu, 0xbe85f381u,
+0xbde033acu, 0x3cbb9df1u, 0x3e47b532u, 0xbda40a82u, 0xbdb0e1fcu, 0xbe33974bu, 0x3c80af42u, 0xbd397c47u, 0xbe1a3667u, 0xbd8969a5u,
+0x3e77fa04u, 0xbce18a57u, 0xbd296a1du, 0x3d4cd61cu, 0x3c43cbbbu, 0x3db02d29u, 0x3e2cb7b5u, 0xbe038f6cu, 0xbe017ffcu, 0x3d816842u,
+0x3e7031dau, 0x3e6e98a7u, 0xbe5fe9abu, 0xbda66888u, 0x3e6f9b1cu, 0xbe03c5d6u, 0xbc812490u, 0x398e5b0cu, 0xbdd167bfu, 0xbe4a90c5u,
+0x3b8f3291u, 0x3e228d61u, 0xbca76503u, 0xbda07bcau, 0xbd8655ebu, 0x3db92982u, 0xbc901f89u, 0x3d90ac1eu, 0x3e4a2913u, 0x3e61afc3u,
+0x3ddf2a15u, 0x3e0fcbf5u, 0x3d18eae3u, 0x3d863099u, 0xbdcf772eu, 0xbe033500u, 0x3ceea26cu, 0x3dd289b2u, 0x3d5a7ac4u, 0xbd55a508u,
+0xbe0b1398u, 0x3c8fa55au, 0xbd521672u, 0x3d8ae404u, 0xba52fbaau, 0xbcb9d2feu, 0xbda64b9fu, 0xbd1e1d64u, 0xbdaa3232u, 0x3c3636c1u,
+0xbe24e3ecu, 0xbdaaf1ffu, 0xbca7aef2u, 0xbcb57d4fu, 0xbd974622u, 0xbdbf2b14u, 0x3d87c64cu, 0x3df6e112u, 0xbd928182u, 0x3cee345au,
+0xbc65d3c2u, 0x3c1afe25u, 0x3dea8ad6u, 0x3daa30a8u, 0x3d042a20u, 0x3e0f8318u, 0x3efda299u, 0xbc671c46u, 0x3dc4a1c1u, 0xbd96d0d8u,
+0xbe12a752u, 0x3d42b7d5u, 0x3e631045u, 0xbdda1b8cu, 0xbca7ee13u, 0xbe8e50b7u, 0xbc15a290u, 0x3d7c4a7eu, 0x3e5bae67u, 0x3c3bceaau,
+0xbea46f78u, 0x3d1b566cu, 0xbd16f3d2u, 0x3e20f972u, 0xbe920ff4u, 0xbbbfffb2u, 0xbd2f0435u, 0x3d8d935du, 0x3da2fe62u, 0x3e769bcbu,
+0x3e8be7e7u, 0x3d5eaad1u, 0xbde251edu, 0x3d786f6au, 0xbcf27b4du, 0xbe395ebau, 0xbcd88c2du, 0xbd4c5877u, 0x3da222ccu, 0xbdd9d157u,
+0xbe1a10f4u, 0x3c87e132u, 0x3d999e89u, 0x3dd89172u, 0xbcb6766cu, 0x3e83b31bu, 0x3c2a1875u, 0xbd97dee9u, 0xbdb63189u, 0x3b8f7fd6u,
+0x3e2dbf68u, 0x3e60cc82u, 0x3e2d5f9fu, 0x3cd07127u, 0x3df5d639u, 0x3dfefd03u, 0xbdcd4a2eu, 0xbe69a46du, 0xbe685e92u, 0xbaeea172u,
+0xbd88dd81u, 0x3e04a29bu, 0x3dc07490u, 0x3d4ade6eu, 0x3d8029aau, 0x3da95bb1u, 0x3cffff7fu, 0x3db0dd46u, 0xbe350c60u, 0xbd67b72bu,
+0x3ed069e0u, 0xbdc8418au, 0xbe459c37u, 0x3caa0589u, 0x3e25f7ceu, 0x3e7c80efu, 0xbdfb710cu, 0xbd7cd863u, 0xbe0da661u, 0xbdcf22a8u,
+0xbdba9c44u, 0xbe4c9bd6u, 0x3cba08d7u, 0x3d3df75au, 0x3d4c659du, 0xbde0c320u, 0x3d2d0d8fu, 0x3d2751fdu, 0x3d455200u, 0xbe734f9fu,
+0xbe4a602fu, 0x3d5da613u, 0xbe9e1a18u, 0xbe555c86u, 0x3e30aef3u, 0xbdfcd6dbu, 0xbe048228u, 0x3df6b232u, 0x3cc12dc6u, 0xbe91208bu,
+0x3d238b36u, 0xbe30c15du, 0xbe42ba6bu, 0x3c9eacd1u, 0xbe467f5bu, 0xbd7fd9fcu, 0xbe4637ecu, 0xbe0088a0u, 0xbd7da4f1u, 0xbdb8ad31u,
+0xbd5e4e2bu, 0xbdfab1a5u, 0xbdb9cea0u, 0xbdf0345eu, 0xbf3784efu, 0x3e8ea7e4u, 0x3cc169ddu, 0x3e4afa11u, 0x3e07d38eu, 0x3b3dab1fu,
+0xbdec42abu, 0x3d49f957u, 0x3be5a17eu, 0x3e60040eu, 0xbdc2b6a2u, 0xbdb8111bu, 0x3dbd24efu, 0x3df9b863u, 0x3d01a968u, 0xbe4545ebu,
+0x3e813c9eu, 0xbd005940u, 0xbea10f69u, 0x3da3e689u, 0x3e38da80u, 0x3e261f9fu, 0xbe5e60bcu, 0x3db7bbdbu, 0xbc044956u, 0x3c9104c9u,
+0x3ebcecc5u, 0x3e0d8768u, 0xbe5d7c89u, 0x3eb24b8cu, 0x3e5a4af2u, 0xbf282d6du, 0x3d854f2au, 0x3d03c727u, 0xbb2753cfu, 0x3dbca6a2u,
+0x3ddc549cu, 0xbe16c0bfu, 0xbbf6032du, 0x3d9ad483u, 0xbd8fea54u, 0xbdf50ef8u, 0x3e0aa48fu, 0x3e34d722u, 0x3e9891b8u, 0xbdfc66adu,
+0x3e7d9637u, 0x3d506a45u, 0xbe01e790u, 0xbd3abfd9u, 0xbdf400fbu, 0x3d7bce36u, 0x3e8edd10u, 0x3e6de879u, 0x3e5babd9u, 0xbdb46592u,
+0x3d61907bu, 0x3bdfad4bu, 0xbde771e5u, 0x3bc5cbc8u, 0x3d0f1df9u, 0xbd0fc8f5u, 0xbc1a370cu, 0xbd6d2992u, 0xbc57c0c7u, 0xbd0d262bu,
+0x3db97126u, 0x3dcb7164u, 0xbc513056u, 0xbe69efe3u, 0xbda31bdeu, 0x3dc64987u, 0xbdc9bf2bu, 0xbcd6ea3du, 0xbe355876u, 0xbe03c434u,
+0x3d83c5aeu, 0xbd82b68du, 0x3e33063au, 0xbc30e59eu, 0xbc803752u, 0x3ddf6bbfu, 0xbdb65148u, 0x3e1ffa28u, 0xbcf09ae8u, 0x3bead2e3u,
+0x3dbad5f5u, 0xbe723216u, 0xbc3fac3au, 0x3cbf252cu, 0xbe34b715u, 0xbca71c41u, 0x3e5dbb2au, 0xbd0e9df4u, 0xbdf19421u, 0x3daee41au,
+0x3e517f86u, 0x3da07b7cu, 0x3daade5au, 0xbe15ea39u, 0xbd357642u, 0x3e28662cu, 0x3c625e26u, 0xbcb2ff2cu, 0x3d442b2fu, 0x3e156b21u,
+0xbd21642du, 0xbe162e78u, 0x3cbfdf5cu, 0x3dd14c30u, 0xbd066193u, 0xbe18976au, 0xbcb1ff0bu, 0xbdddd10au, 0x3e12016au, 0xbcaff5b3u,
+0x3c00ece2u, 0x3da63f37u, 0xbd876ba6u, 0xbc19ef59u, 0xbd5a41f4u, 0xbcae1b8fu, 0x3cbae5feu, 0x3e3e9543u, 0xbdff6768u, 0x3e0167b9u,
+0x3e482b73u, 0xbc216530u, 0x3dad0479u, 0xbd5d7f4du, 0x3ca16dbdu, 0xbdee47eeu, 0xbdabcffbu, 0x3a175f0fu, 0xbe02535bu, 0xbc9f14cdu,
+0x3e66d7eau, 0xbe06ef7du, 0x3dcb18b9u, 0xbdac4d86u, 0x3ba7ec3eu, 0x3d3d752au, 0x3e3a1f3au, 0xbd9d1d89u, 0xbcc136c4u, 0x3d9538a3u,
+0xbe43ede6u, 0x3ded7faeu, 0xbc7d4fddu, 0x3b2d5322u, 0xbb25e5e4u, 0xbdc0f39fu, 0xbe4607a7u, 0x3ed08070u, 0x3e000f9du, 0xbe37bbf6u,
+0x3df52822u, 0x3d858d51u, 0xbd5039b1u, 0x3e644092u, 0xbd4fc302u, 0xbe0f46dfu, 0xbd3e75afu, 0x3e018a44u, 0x3d8f1412u, 0xbdba10bau,
+0xbd8ada35u, 0x3d61da3au, 0xbbaf0816u, 0x3e823683u, 0xbe526f7bu, 0x3efa928eu, 0x3f233313u, 0x3e1f8d92u, 0x3d60811eu, 0x3d2ef0d2u,
+0xbe09843cu, 0x3e2cbd72u, 0xbbe733e2u, 0x3e22e17cu, 0x3d20ab8bu, 0xbe7f8bc6u, 0x3cea1afdu, 0xbd934eedu, 0xbe43b518u, 0xbde392ecu,
+0x3e045d26u, 0xbe3f996cu, 0xbd23225fu, 0xbc8c933au, 0xbd7be781u, 0x3e17f6d5u, 0xbe50e078u, 0x3e01580bu, 0xbe0b58eeu, 0xbec658a1u,
+0x3e2ef84du, 0xbd8b1613u, 0xbe565098u, 0x3eb2936bu, 0x3e5f1ae0u, 0x3f108359u, 0x3d98144fu, 0x3c6e5be1u, 0x3e39dbc9u, 0xbdcfdb7fu,
+0x3c00334au, 0x3e3fe251u, 0x3d347b01u, 0xbe1efe17u, 0x3e8bd9a5u, 0x3e54dabcu, 0x3d4f253bu, 0xbe27a907u, 0x3d80ec07u, 0xbc85a424u,
+0x3bb8bc68u, 0x3e215b51u, 0xbe2657e7u, 0x3d967aeau, 0xbdb62c20u, 0xbd4bd3a4u, 0x3d718323u, 0x3d2b300bu, 0xbea23b2eu, 0x3d06a194u,
+0xbc0a7522u, 0xbe705294u, 0x3d189e97u, 0x3d73d209u, 0xbcd6f41bu, 0x3bff0050u, 0x3d0b6567u, 0x3e4a2ed2u, 0xbe088bb5u, 0xbe19eac9u,
+0xbd3cc06cu, 0xbd18be85u, 0xbe2d6badu, 0x3e21b483u, 0x3e9f4338u, 0xbcc9d81bu, 0xbdc03110u, 0xbe1ab3edu, 0xbe672780u, 0x3dd9c209u,
+0xbeaa6effu, 0xbd62f31du, 0xbc95fa65u, 0x3e1eb55fu, 0x3d5ab432u, 0xbc28dc6bu, 0x3e326743u, 0x3e123ef4u, 0xbc48d3cbu, 0x3d57da92u,
+0x3d2a8bebu, 0x3cdeb7c1u, 0xbd51dc48u, 0xbcec5a9cu, 0xbe2fb359u, 0x3e6618e2u, 0xbe14ec42u, 0xbd54aa19u, 0x3e52d8b2u, 0x3d5b1d05u,
+0x3b86a537u, 0x3d78bf63u, 0xbd209cf7u, 0xbd84f3e2u, 0xbf06a527u, 0xbdbc486du, 0x3c3a985au, 0xbe5afb8eu, 0xbe1c7bd1u, 0xbd62fb51u,
+0x3e479b95u, 0xbc178ea3u, 0x3ca4a2e4u, 0x3dd8416du, 0xbd88746fu, 0x3ae0dd65u, 0xbd977846u, 0x3d899840u, 0x3c8e6e10u, 0x3c2e86b9u,
+0xbe85d30du, 0xbe0d04aau, 0x3be5d69cu, 0x3d5e53b8u, 0xbdc70b1au, 0xbda7c5cfu, 0xbd9b5866u, 0xbc905c7du, 0xbc20c1b9u, 0x3e28282fu,
+0x3c5d346au, 0x3dce2874u, 0xbe207657u, 0xbdf34eacu, 0x3db8d279u, 0xbdafc99du, 0xbbb480c7u, 0xbd0246a8u, 0xbabe9d56u, 0x3c9193a2u,
+0xbe4580b2u, 0x3c8b3bf4u, 0x3dda4721u, 0x3d804ff6u, 0x3aa52c85u, 0x3d0f74c6u, 0x3db7fb22u, 0x3e0ffc2du, 0x3cdb9f82u, 0xbd1d83a6u,
+0xbb6b84e6u, 0x3e1ef902u, 0xbd40cafdu, 0xbc6866beu, 0x3c080060u, 0x3e322266u, 0x3dafa05fu, 0x3ca0e74au, 0x3ea27a2eu, 0x3e1a58c3u,
+0xbdc0e66eu, 0xbdc0f1a1u, 0xbd89905fu, 0x3d61b920u, 0xbce96b02u, 0xbd15e98du, 0xbd2ba629u, 0x3d0891b5u, 0xbd0d2c09u, 0xbdcd19acu,
+0x3dc5de93u, 0x3dacb6fau, 0x3d59b83fu, 0xbe37d2b9u, 0xba8fc3d3u, 0xbc66fa38u, 0xbe9df904u, 0x3db4fe3fu, 0x3d153468u, 0x3c093db9u,
+0x3e335253u, 0xbdf7dec5u, 0xbcb69965u, 0xbc859701u, 0xbe134959u, 0xbbc58ab8u, 0x3db5d1f1u, 0xbe024f96u, 0x3cfbe22cu, 0xbcbe22b0u,
+0xbd1d6953u, 0xbe354894u, 0xbe12e83fu, 0x3d7a92bau, 0xbd0b0fe6u, 0xbe22ff59u, 0x3df7dbe3u, 0x3da6c836u, 0x3d27c8b1u, 0xbdf6d54du,
+0x3c32ce5au, 0x3d950632u, 0x3d08dc2cu, 0xbd02a754u, 0xbcbdf8efu, 0x3e0a6c18u, 0x3e43c52bu, 0x3c82e830u, 0x3dbb947au, 0x3c915353u,
+0x3d569bd4u, 0x3dab8573u, 0x3e93cfd4u, 0xbd9b757au, 0x3d91bf44u, 0x3d0d9002u, 0x3d33805au, 0xbd77bbadu, 0xbe79114eu, 0xbe44d2ceu,
+0x3e253ca5u, 0xbf0ff325u, 0xbf04a397u, 0x3d126362u, 0x3c9fb49du, 0xbe224499u, 0x3a84e5dfu, 0xbd8d13bfu, 0x3cb3a4f7u, 0xbd6a370au,
+0xbdf78ef7u, 0x3e9b2fbfu, 0xbcdc0f62u, 0xbdf782d6u, 0x3cf6a656u, 0xbc8dcd69u, 0x3cbb6407u, 0x3e3c03cau, 0xbe43e8c1u, 0xbde25b6du,
+0x3c71215bu, 0xbe18f6c4u, 0xbe16d212u, 0xbc92156bu, 0x3d52d9f8u, 0xbda5a77eu, 0x3e2d04d2u, 0xbd79da19u, 0x3e4a046cu, 0xbedc13a0u,
+0x3e7dda8du, 0xbece2441u, 0x3d0deb19u, 0x3c61d8d1u, 0xbe4e1c00u, 0xbbe209c8u, 0x3e5a03c3u, 0xbe010cd8u, 0x3e180099u, 0xbd4a550cu,
+0x3e62fc5cu, 0x3d7b0debu, 0xbdb19377u, 0xbe72857bu, 0xbd0fa59au, 0x3e3b4ba6u, 0xbf02c71au, 0xbe45b1e1u, 0x3dda652du, 0x3e02c79cu,
+0x3dc5e4e9u, 0xbda5a11fu, 0x3d13193fu, 0xbe2b9f92u, 0x3e55c9d5u, 0x3df836aau, 0xbe4219edu, 0xbe69d076u, 0x3e14e39eu, 0x3d73e8a6u,
+0xbcab82a0u, 0x3e22bba6u, 0xbde7e761u, 0x3de12721u, 0xbbaee3c1u, 0x3e3b6e29u, 0x3e4b997bu, 0x3ea01633u, 0xbdd6dbaau, 0xbda14a12u,
+0x3d4ccb43u, 0x3dcdb787u, 0x3e1b2334u, 0x3e15be6du, 0x3daad5e9u, 0xbcbbba1eu, 0x3e58de52u, 0xbebeba80u, 0x3dd5757cu, 0xbcfe3728u,
+0x3e86bedbu, 0x3dccdecau, 0x3e392413u, 0x3d751dd8u, 0x3d1649f5u, 0x3e18c8bfu, 0x3c4647b2u, 0x3c365687u, 0xbd8bccecu, 0x3dd30be4u,
+0x3e4966c7u, 0xbe8cd79fu, 0xbe9a558eu, 0xbd4fff34u, 0xbc347497u, 0xbd3f7e82u, 0x3e2c8968u, 0xbe5b6270u, 0xbc4daaa4u, 0xbce99bc7u,
+0xbd20a4aau, 0x3e767347u, 0x3bc91b06u, 0x3d8e5466u, 0xbd9e40aau, 0xbc3244a7u, 0x3c94a0e8u, 0x3ddbb18fu, 0x3d9fcce1u, 0x3e73f545u,
+0xbe81bb3fu, 0xbdb50fd4u, 0xbd8f06a5u, 0x3e56feeau, 0xbd9d2941u, 0xba933ea8u, 0xbe1ba9eau, 0x3d36d7e0u, 0xbe4af8f6u, 0x3d2996dfu,
+0xbe83b0feu, 0xbeab3078u, 0xbe008dfcu, 0xbcfde4b4u, 0x3ca1d6deu, 0x3df7fa61u, 0x3dde5e34u, 0xbd8cf9f2u, 0x3c5c3990u, 0x3c971412u,
+0xbcda01e8u, 0x3d760697u, 0x3cbea05du, 0x3cbd5f94u, 0xbb4c752fu, 0xbe2b7f3fu, 0x3dde2cadu, 0x3d45b9fdu, 0x3e1ab109u, 0x3dc1f2d1u,
+0x3bec130cu, 0xbb74a67bu, 0xbda8d71fu, 0x3d04c822u, 0x3daff71eu, 0x3dd7aaf2u, 0x3e2d37c3u, 0x3dc05304u, 0xbc00dbd6u, 0x3d8dc7a7u,
+0xbc43ceccu, 0x3bcd1799u, 0xbe159106u, 0xbd6ad37eu, 0x3d6fc6bbu, 0x3c763920u, 0xbc193b3cu, 0xbd94182bu, 0xbd232527u, 0xbdb4f6b2u,
+0xbdec43f0u, 0x3d2423ceu, 0x3ca6aff9u, 0xbdf88a68u, 0xbe12367eu, 0xbcf83ac0u, 0xbd9af72du, 0x3cd6edfdu, 0x3daf93bfu, 0x3e0eb2f8u,
+0x3cae0606u, 0xbe15d880u, 0xbd0b2185u, 0xbe06eb3fu, 0x3c5667ffu, 0x3ca81fa6u, 0xbcdfdaeau, 0xbd93d855u, 0x3e10386du, 0xbdfe634eu,
+0xbe3a20c8u, 0xbdca302du, 0x3dde2786u, 0x3d07c8cbu, 0x3cb86f64u, 0xbe2cb966u, 0xbca75924u, 0x3def9199u, 0xbe03ed45u, 0xbc42bc63u,
+0xbe383405u, 0xbd9bc2ecu, 0xbd820889u, 0x3c809078u, 0xbc581c17u, 0xba5578f3u, 0xbd8f6c98u, 0x3c6fe703u, 0xbe221486u, 0xbe3b3b22u,
+0x3eab138fu, 0xbd031294u, 0x3d6ece09u, 0x3e23335cu, 0x3dd6b0dau, 0x3df7b00cu, 0x3d7a4d11u, 0xbb4716a2u, 0xbdc82a5au, 0xbcbaf303u,
+0x3c71f7b3u, 0x3d1ca835u, 0x3e080751u, 0xbd25b885u, 0xbdb4d8bfu, 0x3d95d8c2u, 0xbd82965cu, 0xbd0bba5fu, 0x3ec732eeu, 0x3e68de91u,
+0x3e812cfeu, 0x3d496c95u, 0xbe05f1a5u, 0xbdc13ef3u, 0x3dc8ef56u, 0xbcecb1fbu, 0x3d061d5au, 0xbe0b122eu, 0x3c791311u, 0xbcec1ff7u,
+0xbe1e1497u, 0x3cae57f9u, 0xbcf140c0u, 0xbdcfc11cu, 0xbe28af0au, 0x3e7cad15u, 0xbe0a7691u, 0x3d2eaa09u, 0xbdecfd47u, 0x3b42c53cu,
+0xbc6fa7e5u, 0x3d677ec1u, 0xbdfa2e98u, 0xbdc7fb53u, 0xbdba096cu, 0x39a5c0f5u, 0x3e3b2d25u, 0xbd50a9dau, 0xbd578065u, 0xbda81162u,
+0xbb6365c7u, 0xbd55dd45u, 0x3d93c12cu, 0xbdd1252eu, 0xbdc4ac23u, 0xbdba2245u, 0x3e76f263u, 0x3e12b4d2u, 0x3d465560u, 0x3db3b8e6u,
+0x3caa7fe4u, 0x3de4d20bu, 0xbe3b0e5eu, 0x3e53849fu, 0xbdb372dbu, 0x3dc08a74u, 0xbd8d5fa2u, 0x3d0064e2u, 0xbe018a3fu, 0xbca94d01u,
+0xbd8bcd29u, 0xbd0f333eu, 0x3dcc2ab0u, 0xbdaf0ddau, 0x3e54350fu, 0xbd02b003u, 0x3d9b4ffcu, 0xbce76732u, 0x3d9bcaa2u, 0x3e30f915u,
+0xbd66d16eu, 0xbd818a82u, 0xbe1d64b8u, 0x3dce85bbu, 0x3d8437e2u, 0x3d19e9b6u, 0x3da31e35u, 0xbd96a4a1u, 0xbebcb1f7u, 0x3dba5d4eu,
+0x3e84508cu, 0x3dc8fdf2u, 0x3d5112f8u, 0x3d07cd02u, 0xbe59ece3u, 0x3deb72eau, 0x3c66067au, 0xbe0e3aa3u, 0x3c9b2892u, 0xbc1365a5u,
+0x3d5ac695u, 0xbe15646cu, 0xbde1d985u, 0x3db949ddu, 0x3dd1a9f1u, 0x3db4d139u, 0x3ddba6f6u, 0xbe5b45f3u, 0x3c8975d0u, 0x3e3040efu,
+0x3dce4d7cu, 0x3d361157u, 0x3c16556bu, 0xbe2d96b2u, 0xbd2a314au, 0xbcd6d836u, 0x3eaa448bu, 0x3d86d776u, 0x3d75a2a4u, 0xbc9aed36u,
+0x3d50dec1u, 0x3ddc7877u, 0x3e9520fbu, 0x3ddc1a07u, 0x3b860a65u, 0x3dd547e1u, 0xbe27e13du, 0xbd80d098u, 0xbd948033u, 0x3cb76263u,
+0x3d1cc001u, 0x3cca7da7u, 0xbe0d6381u, 0xbb4661ceu, 0x3db90777u, 0x3b1cd0f2u, 0x3d8ac72au, 0xbcde1d73u, 0xbdbae452u, 0xbdd82c83u,
+0xbd8812d6u, 0x3e86677bu, 0x3e2b844cu, 0x3ca42c65u, 0xbe81d072u, 0xbe12eb07u, 0xbc03961bu, 0xbd97edb0u, 0x3d55091bu, 0xbd05f422u,
+0x3b49baa0u, 0xbe315174u, 0xbe89232eu, 0xbc97695cu, 0x3b882530u, 0x3e2cf9e9u, 0x3c213037u, 0xbb895881u, 0xbd6549e9u, 0x3d8b66a2u,
+0xbdef428bu, 0xbb90aeecu, 0x3dd34201u, 0xbd918ad2u, 0xbdb5a1e9u, 0xbd262024u, 0x3d632e93u, 0x3dc5f078u, 0x3d1a87b8u, 0xbdd2ae5au,
+0xbcbbcd39u, 0x3e0ebc83u, 0x3ae4456cu, 0xbca9b2b2u, 0xbd5351b9u, 0x3cccd316u, 0x3b86deedu, 0xbd1d6082u, 0x3d7ea218u, 0x3e1918adu,
+0x3d65365bu, 0x3d474e3du, 0x3dd3193au, 0x3da4aaa1u, 0x3d875cf4u, 0x3d1d53d1u, 0x3d704826u, 0x3d4a34bau, 0x3e163c1du, 0x3df69727u,
+0xbbf24f70u, 0x3e02f128u, 0x3d925895u, 0x3d8ec0cdu, 0x3e2504eau, 0x3d0d3c30u, 0xbdc60998u, 0xbda64eddu, 0x3bcda9a9u, 0xbda34088u,
+0xbc887febu, 0xbcc0cf20u, 0x3db6244cu, 0xbdc4e144u, 0xbe9a6fb8u, 0x3c879b50u, 0xbe8fd524u, 0x3c9a0a89u, 0x3d2b7799u, 0x3e117e33u,
+0x3dc41ceeu, 0x3c53c73bu, 0x3e3de248u, 0x3d530045u, 0x3b372d9bu, 0x3e886b0bu, 0xbe330bf7u, 0x3d076f20u, 0x3d13330eu, 0xbc303180u,
+0xbdb04ca0u, 0x3e41a59eu, 0xbd8b1be2u, 0x3d79c9d0u, 0x3d0a95dcu, 0x3c862b31u, 0xbc5e3701u, 0x3d113f86u, 0x3dfe231cu, 0x3e11cf01u,
+0xbd71d86cu, 0x3d41f755u, 0x3e842affu, 0x3d67fae8u, 0xbea4204cu, 0xbde0ab2du, 0x3c9a8304u, 0x3e0e7626u, 0xbd74c501u, 0xbdf2a173u,
+0xbe73d2dbu, 0x3d59a59au, 0x3d6179d9u, 0x3d8db93fu, 0x3da8f2f9u, 0x3c634258u, 0xbc6b35f8u, 0x3cbcc659u, 0x3e499f0du, 0x3de9a73eu,
+0x3d89fe0bu, 0x3eadc030u, 0x3e6dbfc7u, 0xbe8104eeu, 0x3d78c6ddu, 0x3cf68923u, 0xbeda205au, 0xbeae4687u, 0x3e1a5e61u, 0x3e5971c3u,
+0x3d96d431u, 0xbf180227u, 0x3dac06ceu, 0x3e05279au, 0xbb80a34du, 0x3d5d12c7u, 0x3dc23d1cu, 0xbd72968cu, 0x3e1fa392u, 0x3e03a5ebu,
+0x3dcfbea6u, 0xbd9ddb6bu, 0x3b1e204fu, 0x3a56971au, 0xbdfb8ec2u, 0xbeaacdd4u, 0xbe012673u, 0x3dc0e2f6u, 0x3e11eaaeu, 0xbe8a8e3bu,
+0x3de99e3au, 0x3d35430au, 0xbd3265e1u, 0xbba4895cu, 0x3c49b205u, 0xbe000b1au, 0xbea12381u, 0xbe5ec3b3u, 0xbdda06aeu, 0xbe88801du,
+0xbaa8342fu, 0xbe1a5ed6u, 0xbd488b2au, 0x3e94ae13u, 0x3df70d09u, 0xbe3c3337u, 0xbc63c553u, 0x3dfafdabu, 0x3d179805u, 0xbdb178bfu,
+0xbd7631efu, 0x3e8e1d20u, 0xbdb791e5u, 0xbe6d48e2u, 0x3ebff96eu, 0xbc9b2cefu, 0xbde8b6bdu, 0x3e1c81d5u, 0xbd3e526au, 0xbe82c14du,
+0x3e1e70aeu, 0x3d8aaa8bu, 0xbcb2ee7bu, 0x3e2722c6u, 0x3c43d40du, 0x3e10e5d8u, 0xbd24fd58u, 0x3dfe3a72u, 0x3cde0982u, 0xbd42cc16u,
+0xbe3a0de5u, 0xbddab0abu, 0x3d434365u, 0x3ec9b6c9u, 0x3dbff607u, 0xbd8475f7u, 0xbb41eb6bu, 0x3e04ad3bu, 0x3e816376u, 0xbd047715u,
+0x3da5acb1u, 0x3ee83826u, 0xbd1acaedu, 0xbd132b0fu, 0xbc84884fu, 0x3dbf83a7u, 0x3e0eac10u, 0x3d56c7c3u, 0xbd9285dfu, 0x3da3275du,
+0xbc96808au, 0xbd5ad9bdu, 0x3da4c826u, 0xbd3e535fu, 0x3cd1ded6u, 0x3c8e412bu, 0xbbf2a029u, 0xbdb0b768u, 0xbe022200u, 0x3d8e136fu,
+0xbca53f0au, 0x3d371545u, 0xbc9c483fu, 0xbd148c0cu, 0x3c98be93u, 0x3d5a49c3u, 0x3dcbd7eau, 0xbe24e51cu, 0x3d4cf9bcu, 0xbdb2a333u,
+0x3e0f7792u, 0x3ddb90c2u, 0x3e090fb5u, 0x3e48acd7u, 0x3d4d7d2fu, 0x3d4b5f08u, 0x3d3da41au, 0x3d2d7102u, 0x3d399d82u, 0xbd11000fu,
+0xbd5ab3c0u, 0xbd4862d3u, 0xbde2628cu, 0x3cb4b272u, 0x3dccd56fu, 0x3dadbf81u, 0x3d33b531u, 0xba5e6a9du, 0xbca5b21au, 0x3e1d7aebu,
+0xbd00b025u, 0xbdf1a8aau, 0x3d1bc2b1u, 0x3d80eaa0u, 0xbd94bf36u, 0x3dbd796du, 0x3e803e79u, 0x3d7cb8f6u, 0xbd230bd1u, 0x3d1aeb7bu,
+0x3cfc6685u, 0x3d074257u, 0xbe58dcb7u, 0x3a73bf66u, 0xbd83292eu, 0xbe9c51e3u, 0x3cbb5a0cu, 0x3d98912au, 0x3cb27319u, 0x3c4ba50eu,
+0xbe400e1cu, 0xbdf9a89du, 0xbda480d0u, 0xbe105231u, 0xbe5efbb6u, 0xbe817da1u, 0xbc839a5bu, 0xbd135d95u, 0xbd469dadu, 0x3a254014u,
+0xbcf91edbu, 0xbdafa4b9u, 0x3ca36bc2u, 0x3c1d1bacu, 0x3dea0d81u, 0xbcb3474bu, 0x3c92ea5eu, 0xbd183221u, 0xbdf4ed8bu, 0x3d9714e8u,
+0x3e1caa85u, 0xbe32f7d7u, 0x3ecfc0d5u, 0x3e363154u, 0xbd48d1a7u, 0xbda01781u, 0xbd5777c9u, 0x3dfd3128u, 0x3d522848u, 0x3d02f787u,
+0x3d7debdbu, 0xbe98923eu, 0x3e0a86a8u, 0x3cca1761u, 0xbe20cdedu, 0x3e03a5d6u, 0x3cc4dfa2u, 0xbe1def3au, 0x3d2e643eu, 0x3ca7fad5u,
+0xbdae8792u, 0x3d49aeaau, 0xbc0ded96u, 0xbdad9d19u, 0xbd6b8a5eu, 0xbe4e9125u, 0x3d9e5d55u, 0xbc21202eu, 0xbece083du, 0xbe624305u,
+0x3e98ea8cu, 0x3c55badeu, 0xbe4a2a9cu, 0x3e842901u, 0xbe0f759bu, 0xbccdb9dbu, 0x3d935cceu, 0xbdd23193u, 0xbdaf0b1bu, 0xbe497dfau,
+0xbe586f09u, 0xbd6ac168u, 0xbdefd7fbu, 0xbe0fba25u, 0xbe71472au, 0xbdc264aeu, 0x3e07a161u, 0xbdc908e8u, 0xbea45057u, 0x3d837afau,
+0xbe2cc2d1u, 0xbdaa35e2u, 0xbe17bff7u, 0x3ea0197eu, 0xbe18e217u, 0xbe30c641u, 0xbeee1660u, 0x3e8f8372u, 0xbe44e59eu, 0xbeaaa7afu,
+0x3e47c6a9u, 0xbe88cee6u, 0xbdb7ae43u, 0x3d4c841au, 0xbdb97c11u, 0x3c78db33u, 0xbc724ee8u, 0xbde447b6u, 0x3ddbac2du, 0xbd94298eu,
+0xbbeabf73u, 0x3e2dc9d6u, 0x3db05554u, 0xbe1cbd84u, 0xbef80537u, 0x3e6bfc26u, 0x3d22ea37u, 0xbe69939du, 0x3d48af96u, 0xbd9b09e7u,
+0xbcadaaf8u, 0x3d932176u, 0xbdc592dbu, 0x3e27d306u, 0xbcac804eu, 0x3d87acb9u, 0x3bd9d0e5u, 0x3b5a5e53u, 0x3c5d531fu, 0x3e83af52u,
+0xbd9d8e52u, 0x3e0dd6d8u, 0x3e1dced9u, 0xbdb236c7u, 0xbd635b42u, 0x3e0a3123u, 0xbd901e46u, 0xbeacd315u, 0xbe85bb66u, 0x3d5c18cau,
+0xbe64bf99u, 0x3d06cbf7u, 0x3e3b43f5u, 0xbd4863d6u, 0xbd1b5769u, 0x3e4e36e2u, 0x3ca9d63du, 0x3ce2d6c7u, 0x3dcf97cdu, 0x3c15b5dcu,
+0x3c3b9c9cu, 0xbc971765u, 0xbd4f7d3cu, 0xbc02e11au, 0x3d9ab9d7u, 0xbc918b16u, 0xbdfaafe2u, 0xbdb3ee1fu, 0x3be2e92eu, 0xbdc82e64u,
+0xbd217e9du, 0xbd929d06u, 0xbead6f39u, 0xbe080907u, 0xbdaebf08u, 0x3e477bb4u, 0x3cd84568u, 0xbe8ebccdu, 0x3ead5840u, 0x3b8c68a1u,
+0x3d21f537u, 0x3cdcf6a0u, 0x3b5d7f30u, 0xbd1bc765u, 0xbc1ef770u, 0x3cdcc721u, 0xbc22e63au, 0x3ea2266bu, 0x3e06b383u, 0x3e43fd3au,
+0x3e42d067u, 0xbe30b568u, 0xbd63dc41u, 0xbd832b15u, 0xbdcdfa10u, 0x3da281f2u, 0xbcd2e6e6u, 0xbddb09c9u, 0x3e17dddfu, 0x3e896239u,
+0x3e05c3aeu, 0x3d430af7u, 0xbd08446eu, 0xbe08a0c4u, 0xbde219b0u, 0xbe9aa493u, 0x3d63025bu, 0x3bb784adu, 0x3b81b7a6u, 0x3d010a54u,
+0xbd93c530u, 0xbe0fadc7u, 0x3cb1aa94u, 0x3d1d3b1bu, 0x3e7641c2u, 0x3d861f81u, 0x3e04e1a5u, 0xbdfccb6du, 0xbb4019f1u, 0x3dfaca9bu,
+0x3e09f7b6u, 0xbda1164au, 0xbd0d074cu, 0xbe05860du, 0xbd3566f2u, 0xbe12f484u, 0x3d168b56u, 0xbdc05a95u, 0xbdde8ac6u, 0xbd84d51au,
+0xbd14bc92u, 0xbe1ee47cu, 0xbdd94b18u, 0x3d955d62u, 0x3cb5e912u, 0x3c9330f6u, 0x3d2d4378u, 0xbdd9a7ffu, 0xbdb0fa1bu, 0x3ccb28b6u,
+0xbe095909u, 0x3e31869eu, 0x3d8e9a0fu, 0xbda28598u, 0xbd1d37ccu, 0xbcef4a17u, 0xbd17a1cau, 0x3c21cfa2u, 0xbccea53au, 0x3aa5a98au,
+0x3d19617cu, 0x3dd41bbfu, 0x3e363945u, 0xbd4d8f6au, 0x3e176508u, 0xbe2022a3u, 0x3cc86af6u, 0x3d2615b8u, 0x3d697527u, 0xbe898900u,
+0xbe2a0858u, 0x3da01dc5u, 0x3d167361u, 0x3cb34a3fu, 0xbd647c00u, 0x3cfb4ebdu, 0xbd445768u, 0x3d12f9a2u, 0x3d9c58a4u, 0x3d749817u,
+0x3d839f60u, 0xbd8619f7u, 0xbd37d81bu, 0x3d477d04u, 0xbd678837u, 0x3d6a6dbfu, 0xbd1eebf5u, 0xbd9a0336u, 0xbdc1edb3u, 0xbdd2579cu,
+0xbd1fe183u, 0xbd9fd853u, 0x3d0a4f04u, 0x3cbfd712u, 0x3da50945u, 0xbd925811u, 0xbe286b9cu, 0x3d2c6743u, 0xbdddb180u, 0xbc92dbb2u,
+0x3c0b9106u, 0x3d73aea2u, 0x3d2d79dcu, 0xbcb22037u, 0x3d3cfcf3u, 0xbe60f0d4u, 0xbdb8e9ccu, 0xbd9c804du, 0xbcc0dbb7u, 0xbddb922au,
+0x3d853a95u, 0x3c0e6731u, 0x3cdc2f18u, 0x3daa361eu, 0x3d35aa15u, 0xbd1eca94u, 0xbdac3ff1u, 0xbd465d50u, 0xbd965219u, 0x3d866fccu,
+0x3c4b6e21u, 0xbc7b747bu, 0x3d143348u, 0xbcca10ccu, 0x3e602458u, 0x3d99a850u, 0x3e0502a4u, 0xbe1d720cu, 0x3e7ffa19u, 0x3e838df7u,
+0x3df608edu, 0x3ddee0f7u, 0xbea6f106u, 0x3d28df23u, 0x3e2ee9dfu, 0x3f09515fu, 0xba95fc8du, 0x3e2d40afu, 0x3d95de3du, 0x3df9a967u,
+0x3e3f2f1au, 0x3e3ef5a6u, 0x3d331d32u, 0x3e14ef21u, 0x3df6e960u, 0x3e95c9b7u, 0x3d4e1240u, 0x3dbd1897u, 0x3bb66a8cu, 0x3d8fa847u,
+0x3d819767u, 0x3cce0555u, 0x3cd8acfbu, 0xbe0fa327u, 0xbdb8663du, 0x3dffac48u, 0x3e481bc3u, 0x3d409f37u, 0x3dcd1a88u, 0x3e3b4048u,
+0x3e4ef329u, 0x3d30e083u, 0xbdc44908u, 0x3de49698u, 0x3e617340u, 0x3eabcac7u, 0x3e0e6335u, 0x3cadc7bcu, 0xbd9f8273u, 0xbc5f86abu,
+0xbda0d1e7u, 0xbced32b6u, 0xbd542758u, 0xbec6b4fcu, 0xbe2e8003u, 0xbd8a1649u, 0xbe30087cu, 0xbb40996eu, 0x3e8238c6u, 0x3dd5ccb8u,
+0x3dd45a84u, 0xbe1ddf18u, 0xbd507de0u, 0x3cf44948u, 0xbda62231u, 0xbe247852u, 0xbda3d5deu, 0xbd192367u, 0x3da62d10u, 0xbcb0d8f6u,
+0x3caf9c08u, 0xbe517af1u, 0xbd8abf57u, 0xbdae9486u, 0xbe551c1fu, 0xbe4dc7f6u, 0x3cab2a0du, 0x3d23ec23u, 0x3e433428u, 0x3d100e12u,
+0xbd14e9c0u, 0x3e853013u, 0x3c8fbdb5u, 0x3ed0d347u, 0x3ea92ad5u, 0xbde017dau, 0xbce41a1du, 0xbe7e6a74u, 0xbd10a230u, 0xbc4aaf93u,
+0x3b8c1739u, 0x3c67f412u, 0x3e5248a9u, 0x3c552d18u, 0xbb3d5c1cu, 0xbd978999u, 0xbd9ac559u, 0xbd9ee06bu, 0xbced3589u, 0xbdef6b95u,
+0x3c6c8c98u, 0xbcfd6c77u, 0x3cd95a1du, 0x3d63b000u, 0x3dc31fe2u, 0xbdd67636u, 0xbd9b322bu, 0x3e47cc23u, 0x3e2f5db1u, 0x3d4f4c33u,
+0xbd95ace6u, 0xbe18a5e8u, 0xbdeb68d5u, 0x3d48bf74u, 0x3cab3c7eu, 0x3cbc9736u, 0x3d6dca96u, 0xbd07bf3cu, 0x3be57b12u, 0x3e1d06a6u,
+0x3ca8aa79u, 0xbdef6c03u, 0xbdbc537au, 0x3d9c38a1u, 0x3d536dafu, 0xbc6f5cd8u, 0xbd4e15f2u, 0x3d3c94ebu, 0x3d5f83c1u, 0x3c118129u,
+0xbd4f32a3u, 0x3d49b8cau, 0xbccbd23bu, 0xbd4b090bu, 0x39040daeu, 0xbe1e2e83u, 0x3d631f28u, 0x3c3c980cu, 0x3e8988f9u, 0x3dd8fd78u,
+0x3da146dbu, 0x3dcc5eb0u, 0xbd426dd9u, 0xbcbbcfebu, 0x3e558a59u, 0x3d5e67e0u, 0xbde66afbu, 0xbdc3f777u, 0xbccaacf5u, 0x3d10e74cu,
+0x3e2cae6du, 0x3d5ac7a2u, 0xbe3287b5u, 0xbe56ae46u, 0xbe21cf00u, 0x3dd6893du, 0x3e4862bdu, 0xbd3c5cd5u, 0xbda7ee9eu, 0x39ba55b5u,
+0xbd575808u, 0x3dd353e0u, 0x3d7bb9adu, 0x3db6f4c2u, 0x3dc66777u, 0x3dcf2356u, 0xbd18b285u, 0xbdf26eb2u, 0x3d6a0de7u, 0xbc1b6f9fu,
+0xbc984b50u, 0x3c5311a8u, 0x3aa87949u, 0x3b5d74aeu, 0xbcbacbbfu, 0xbc3e13e0u, 0x3d42d0e2u, 0x3e0341e5u, 0xbb114b17u, 0x3deea24cu,
+0xbc911db7u, 0xbd8d329bu, 0xbcf06d38u, 0xbdbe7001u, 0xbc17ed40u, 0x3d80045fu, 0xbb906830u, 0x3d9f9155u, 0xbd88a501u, 0x3ba51833u,
+0xbd69aad1u, 0xbdb60d0bu, 0xbe3a5534u, 0xbca8e3a5u, 0xbbb5fcf0u, 0xbd01c8d5u, 0xbab4704cu, 0x3d206f4fu, 0x3d8d67e6u, 0xbdbebde6u,
+0xbc1557f0u, 0xbe7d0133u, 0x3e36a279u, 0xbd875df3u, 0xbde7b372u, 0x3d29a261u, 0x3bafdcc5u, 0x3d2f42a6u, 0xbd83763bu, 0x3c27b865u,
+0x3ea374a4u, 0x3bdb4170u, 0xbca7837bu, 0xbc344850u, 0xbd2d8cbcu, 0xbca1da96u, 0xbc3baf9au, 0x3e215e22u, 0x3e58337bu, 0x3e01a089u,
+0xbcfffcaeu, 0xbe49bd53u, 0xbe07e891u, 0x3c083344u, 0xbd900ad1u, 0xbd8e4ccau, 0xbd5b4789u, 0x3ebaa573u, 0x3c9eac91u, 0x3db5b8b2u,
+0x3da12b62u, 0xbd89ffccu, 0xbda2c990u, 0x3f03ebf9u, 0x3e0a6f90u, 0xbd9374b2u, 0xbdb5a78fu, 0xbd7c0f83u, 0x3e65a209u, 0xbd4945d4u,
+0x3cddcc8eu, 0xbe111617u, 0xbba8c9ccu, 0x3e251daau, 0xbc32f41eu, 0x3d50a56cu, 0xbe6ce601u, 0xbdbdc497u, 0xbb96c4e9u, 0x3d642980u,
+0xbca87c49u, 0x3ced018eu, 0x3df07584u, 0x3d484ec1u, 0xbd5f31fau, 0xbe299f83u, 0xbd98c59fu, 0x3ccf7633u, 0x3d1dfc44u, 0x3d461966u,
+0x3d73a890u, 0xbd3585b9u, 0x3e07d2ffu, 0x3d5e6cbeu, 0x3d396729u, 0x3d6bf7cbu, 0x3ce34973u, 0xbd1a941eu, 0xbd55ec8eu, 0x3dbc63d5u,
+0xbd958d54u, 0x3b10aa11u, 0x3dd3016du, 0x3e0af0acu, 0xbdc0588cu, 0xbd62fff7u, 0x3e562eceu, 0xbde759e1u, 0xbb7cb7deu, 0x3d4fa053u,
+0xbd8d9099u, 0xbcfbcb8fu, 0xbe1b8abau, 0xbe08fdaeu, 0x3ddaa0a1u, 0xbcedd226u, 0x3e08a211u, 0x3d3d8152u, 0xbe1e7d7fu, 0xbc169feau,
+0xbdbedd33u, 0xbdf59771u, 0xba3c645cu, 0x3ecd1e20u, 0xbbdf2396u, 0x3df43132u, 0x3d165cebu, 0xbe4cf4d4u, 0xbe21b9c9u, 0x3e8c9385u,
+0x3dfd9929u, 0xbd5525a2u, 0x3e88f41bu, 0x3e47a3bau, 0x3e92ca5fu, 0xbe1b3955u, 0x3e0a188au, 0xbbdacc31u, 0xbd66e5d0u, 0xbdbb9d21u,
+0xbea2820fu, 0x3e3f60c6u, 0x3e9fc35du, 0x3d22a04bu, 0xbe9b9d21u, 0x3e353cb5u, 0xbc181216u, 0x3cf5eee9u, 0xbdbd06bau, 0x3e150667u,
+0xbd62e184u, 0xbbcfdec4u, 0x3dc67566u, 0x3da6e6cau, 0x3caabcdcu, 0xbcb6434fu, 0xbde2ec3bu, 0xbe36798bu, 0xbd0ab0dbu, 0xbe30f321u,
+0x3e883bf6u, 0x3e4ddc0bu, 0xbdacaeb5u, 0xbe0adf70u, 0xbe2e4cbau, 0xbe257705u, 0x3e204934u, 0xbe1b9cf3u, 0xbdaae42bu, 0x3ebca743u,
+0x3df3fdd8u, 0x3db3b6efu, 0xbd2205adu, 0xbe0b2c74u, 0x3c5e6ea4u, 0xbce8f803u, 0x3e23e16du, 0x3e8b156au, 0xbe865092u, 0xbe20e258u,
+0x3e04f001u, 0x3d318c7bu, 0x3e7911f4u, 0xbe58e7c1u, 0xbdd5fdeau, 0x3df220acu, 0x3d1296b4u, 0x3c460f37u, 0xbe4a1405u, 0x3d830b09u,
+0xbb9113ffu, 0x3db7bdfbu, 0x3e8011d9u, 0xbd647b61u, 0x3de34533u, 0x3e007c07u, 0x3d08d0d1u, 0xbe13c908u, 0xbd492f28u, 0x3dce1399u,
+0xbd8f9b9au, 0x3d27ecadu, 0xbcb6af92u, 0xbd9a898eu, 0xbdfcb841u, 0xbc6218f8u, 0xbdedb368u, 0xbe6a0167u, 0xbd45cbe2u, 0x3da4b8beu,
+0x3d392b59u, 0xbe222548u, 0xbca6642fu, 0xbcee8342u, 0xbdcaa311u, 0x3c7d4488u, 0x3e3e6a60u, 0xbe2ac51fu, 0x3c89df23u, 0x3d8ab285u,
+0x3e1772c7u, 0xbd928a9cu, 0xbe55c8f7u, 0xbdea6834u, 0xbddff73du, 0x3c27feedu, 0x3c57eb89u, 0x3b17fe9du, 0x3e85f1f2u, 0x3d8b0700u,
+0x3e4cef19u, 0xbed9e6bfu, 0xbecf6008u, 0x3e0f0f54u, 0x3ec3e5cau, 0xbb1f74cau, 0x3e39b811u, 0xbbf05c22u, 0xbdf888d2u, 0x3e590ce1u,
+0x3e0ee798u, 0xbe1c651du, 0xbe1a51eeu, 0xbd4ffd78u, 0xbd236aa8u, 0xbd99ab2au, 0x3d258147u, 0xbde84dd4u, 0x3d29a421u, 0x3dc4be30u,
+0xbebb0e1du, 0xbcd23591u, 0x3e8492b4u, 0x3e46cf97u, 0xbe2c0cdbu, 0x3d54c696u, 0x3dc2fd59u, 0x3b422811u, 0xbdce30e5u, 0x3e27767du,
+0x3efa9a1eu, 0xbe0cda0eu, 0x3e2ae588u, 0x3dc77e1au, 0x3cceb2aeu, 0x3e2ec754u, 0xbe4795d8u, 0x3d993922u, 0xbd89af21u, 0xbb28fcebu,
+0xbe905cadu, 0xbad37e7cu, 0x3e4ac024u, 0xbdf6be61u, 0xbde4c5ffu, 0xbe3e6299u, 0xbca1e4dau, 0xbde2838fu, 0xbd62c982u, 0xbdfb0bd8u,
+0x3dc42b78u, 0xbe11c478u, 0xbe899e38u, 0x3bdabf85u, 0x3d9a64deu, 0xbedad2abu, 0xbd110328u, 0xbe97c8dau, 0x3e54f9f7u, 0xbdfc5505u,
+0xbe959ddcu, 0xbc6c8c57u, 0x3e031375u, 0xbdaa1a8eu, 0xbe2dd32bu, 0xbd5aead0u, 0x3d36b5a7u, 0xbdd2cc5fu, 0xbe19f95fu, 0x3cc8bd3du,
+0xbdea60aeu, 0xbdcec3f9u, 0xbd6b9f09u, 0x3e4abfe8u, 0xbe480636u, 0x3db415a0u, 0x3c704d08u, 0xbd8a3e1fu, 0x3e17c2f6u, 0x3d5b860bu,
+0x3db29393u, 0x3dbabc73u, 0x3e6e58cfu, 0xbe3b3d2eu, 0xbe05dd73u, 0x3ecc1b00u, 0xbe58a456u, 0x3c8c9545u, 0xbcc5aa31u, 0x3edad9bcu,
+0x3e0e3a7du, 0xbdb22300u, 0x3e14ad6fu, 0xbdb4037fu, 0x3d81abd0u, 0xbc8957cau, 0xbcc50965u, 0x3d73d393u, 0x3ea77769u, 0x3e3aaf30u,
+0xbd3d8802u, 0x3d9e39aeu, 0x3e231bf6u, 0x3e0267dbu, 0x3cfb153cu, 0x3d7b873du, 0x3dc6eec6u, 0x3d343428u, 0xbe18133eu, 0x3c46e53bu,
+0x3e840b12u, 0x3e17601cu, 0x3d26585bu, 0xbe18b01du, 0xbd313cf0u, 0xbdd441fcu, 0xbf030093u, 0x3d937793u, 0x3c2f3255u, 0x3ec9a1a3u,
+0x3db164d1u, 0xbdc156f0u, 0x3dc0a150u, 0x3dfc8180u, 0xbdcedafcu, 0xbcd980cdu, 0x3e174746u, 0xbc8f2ef7u, 0x3e118400u, 0xbccb5520u,
+0xbd53d074u, 0xbcba4d0du, 0x3e04d25cu, 0x3d0a1fb1u, 0xbd814644u, 0xbc383ed2u, 0x3d05db8du, 0xbd592be3u, 0x3db13f20u, 0x3c986152u,
+0x3d8df3d4u, 0xbd0f4397u, 0x3c2d36d3u, 0xbeb96197u, 0xbe57baeau, 0xbd421c8fu, 0xbf0e3ac7u, 0x39c7ead6u, 0xbdd444eau, 0xbe0b7f90u,
+0xbd8d8c2fu, 0xbda8dc59u, 0xbd3ba8bcu, 0x3c44c0bbu, 0xbc74ad95u, 0x3e83c520u, 0xbde7e3e9u, 0xbe35fca7u, 0xbca27108u, 0xbd55bc53u,
+0xbd1c1671u, 0xbe2f62cau, 0xbd451c03u, 0xbce05672u, 0x3c8878d9u, 0xbd3c4e55u, 0x3df84359u, 0x3ddbdde6u, 0x3d80e5bbu, 0xbe3ca996u,
+0xbee299eau, 0xbe1b2f66u, 0xbdce9970u, 0xbd963fccu, 0x3c91e192u, 0xbd4db473u, 0xbc9ab6e6u, 0xbdf86dcau, 0x3cb0eae9u, 0x3e2736bau,
+0xbca6334du, 0xbd3e901fu, 0x3c14b319u, 0xbe1f436eu, 0xbdbb7a64u, 0xbd206f99u, 0xbc80add9u, 0x3de4a639u, 0xbe1cba0cu, 0xbd0e6844u,
+0x3dc740bbu, 0xbc0b9b81u, 0x3de11f71u, 0xbd89be93u, 0xbd95af78u, 0x3d29f227u, 0x3e3197b5u, 0xbe0e2d73u, 0xbdf2f329u, 0x3dc1c853u,
+0x3c414adbu, 0x3e4b605cu, 0xbd1c8bfcu, 0x3d849127u, 0xbccbb93fu, 0x3e2b7016u, 0xbed2b550u, 0xbe5b786au, 0x3e17212eu, 0x3dd76f86u,
+0xbdd40ed7u, 0xbc218b4eu, 0x3a92ea2bu, 0x3c089d54u, 0x3e5e4be0u, 0x3db03b02u, 0x3dfe19f2u, 0xbe3f5830u, 0xbe3d2b78u, 0xbcd9a2e7u,
+0x3dc7d39fu, 0x3e229201u, 0x3d3d377fu, 0x3b18c0cbu, 0x3d28ff83u, 0xbd22a48eu, 0x3d2c4d40u, 0xbe4a451bu, 0x3d9525fdu, 0x3c9f9933u,
+0x3cb5590cu, 0xbd85c625u, 0xbe1752ceu, 0x3d6b960du, 0xbdc8ab45u, 0x3b9defdcu, 0x3d869b4du, 0xbd2f3667u, 0x3da921ceu, 0x3e36e12cu,
+0xbd48831fu, 0x3e82f016u, 0x3edd5ec6u, 0x3e94bd18u, 0x3e0b77ecu, 0xbd629b0au, 0x3e23f4f8u, 0x3e16716du, 0x3c4770dfu, 0x3cfc02a3u,
+0x3d875bd7u, 0x3e93faffu, 0xbdaad49eu, 0x3d7a1b08u, 0x3d9eb137u, 0xbd643f39u, 0xbdd52e43u, 0xbb3f5ba1u, 0x3d4bb584u, 0xbd826be1u,
+0xbcfdebbau, 0x3e03e89du, 0xbdb2f768u, 0xbe8be00du, 0x3d997426u, 0x3d1c4b3cu, 0x3daa79b3u, 0x3d0ff246u, 0xbe44b2d1u, 0xbe832ae4u,
+0xbd357517u, 0x3da415cfu, 0xbd8be69bu, 0xbd213da7u, 0x3e4d4b47u, 0xbd76cc62u, 0xbdfb023du, 0xbc803b6eu, 0xbcfcdd6fu, 0x3d639837u,
+0xbdb680bfu, 0xbe3e7b1cu, 0xbdfb92c3u, 0x3c0f9fd1u, 0xbe08ff28u, 0x3ce4f99au, 0xbd290f1bu, 0x3e485b5eu, 0x3c4cc6bbu, 0xbd8ba25au,
+0xbe08d136u, 0xbd69a4a9u, 0xbd066e2fu, 0x3d3a053cu, 0x3cd1450du, 0x3cacad94u, 0x3c94438du, 0xbda717e4u, 0xbe13c752u, 0xbdeea1ceu,
+0x3dac55a1u, 0x3e63335bu, 0x3e7ea137u, 0x3d925254u, 0xbbd0ef57u, 0x3d13e1cfu, 0x3d5f3443u, 0x3d628df1u, 0x3e95f134u, 0xbe4df317u,
+0x3d951cd4u, 0xbd8d1ea3u, 0x3dac25e9u, 0xbd7099cbu, 0x3d9a162au, 0xbd309dcdu, 0x3b359b2fu, 0x3edbc3dfu, 0xb9e79161u, 0xbd86a203u,
+0xbdce267du, 0x3d94c128u, 0xbdab37acu, 0xbd4052c9u, 0xbe39c2dbu, 0x3d85ed62u, 0xbe6f7c14u, 0xbe815abau, 0x3dd46176u, 0xbcf99db8u,
+0xbd543e74u, 0x3c3cce48u, 0xbe8d35fdu, 0xbdaf25ccu, 0xbe86d8e2u, 0x3e078184u, 0xbd7345e3u, 0x3e246860u, 0xbe1678fbu, 0x3d7a4a60u,
+0x3d07c717u, 0xbe875dd0u, 0xbe7c248fu, 0xbe39a817u, 0x3d43436au, 0xbe4d18e8u, 0x3c09d1c6u, 0x3d77b63cu, 0xbd58ce86u, 0xbd03a3f8u,
+0xbdc25431u, 0x3dff2a60u, 0x3d995c9au, 0x3dd65bf3u, 0xbc4eba50u, 0x3cb18a3du, 0xbc9c9cdau, 0x3db621f3u, 0xbc5f40eeu, 0x3e5b9f5au,
+0xbd9a8cd9u, 0x3e8c02f2u, 0x3e20ac84u, 0x3df80362u, 0xbe5d9d22u, 0x3e96bf4au, 0x3e324c7au, 0x3df2a077u, 0x3cd57282u, 0xbded8cd0u,
+0xbdc37e51u, 0x3d9878d6u, 0xbc53078fu, 0x3e07b865u, 0x3e2f4b68u, 0xbe9b45e4u, 0x3d3d4a9au, 0xbe2505ecu, 0x3d293e50u, 0xbd9ecb95u,
+0xbe2a78a8u, 0xbd5e3419u, 0xbc505565u, 0xbe06e72du, 0xbdce74bbu, 0x3bed3c87u, 0x3d64c390u, 0x3d94fd78u, 0xbe5f36b1u, 0x3f0c762du,
+0xbe3798cau, 0x3c434663u, 0x3e00402eu, 0x3cfa2186u, 0x3e4eef3cu, 0xbec0dd36u, 0x3d839793u, 0xbd8f54b1u, 0xbdf3c230u, 0x3e00bbeeu,
+0xbdb491e7u, 0x3eb12268u, 0xbc0318c0u, 0x3d9b4063u, 0xbde0032eu, 0xbde51b1fu, 0x3d7fa5ceu, 0xbbf85bfau, 0xbcdb6e8du, 0xbd6f3eabu,
+0x3e354b2fu, 0xbd53eb06u, 0x3d1c8710u, 0xbed30d9bu, 0x3ccc95aeu, 0x3e0218a0u, 0xbec06c0cu, 0x3e81ab0du, 0x3d468ddeu, 0xbcf41226u,
+0x3d55439cu, 0xbd8f4f9bu, 0xbdce03e6u, 0xbd069f65u, 0x3deee1fau, 0xbf082907u, 0xbd8edd9cu, 0xbd8be60bu, 0xbe11ed50u, 0xbdbca78cu,
+0xbd98dde3u, 0x3d578449u, 0x3db8c29au, 0x3c9d204au, 0xbce235bcu, 0xbd61fcfau, 0x3e1a0d17u, 0xbe39d325u, 0x3d924fe4u, 0x3dd18f49u,
+0xbe64eac1u, 0x3e39a967u, 0xbe202fa2u, 0xbc17ff69u, 0x3d720168u, 0xbdc6455cu, 0x3dc68a59u, 0xbc39298eu, 0xbd1690d1u, 0x3eb36658u,
+0xbcf48eeeu, 0xbc319054u, 0xbd13da89u, 0xbd383dd5u, 0xbdaeb768u, 0xbd33cec1u, 0xbe5d0a74u, 0xbd2abbb7u, 0x3d158486u, 0xbe134aa8u,
+0x3e203c75u, 0xbe905f80u, 0x3eb7a900u, 0x3e3714ebu, 0xbe2035c8u, 0x3e32debau, 0x3ca58688u, 0x3db6e754u, 0xbd4c5e34u, 0x3df66a52u,
+0xbeb245c6u, 0x3df44611u, 0x3d8b208au, 0xbd96e058u, 0xbcc79f5eu, 0xbc8bd603u, 0xbd4ef007u, 0xbd37a2f4u, 0x3d12bacfu, 0x3e1a9d44u,
+0xbda1ca10u, 0xbe882afeu, 0x3e000e5du, 0x3d2b2cc5u, 0x3c4c674cu, 0xbc6517afu, 0x3e1da519u, 0xbdf72116u, 0x3ed752e0u, 0xbe3c0e13u,
+0xbd683041u, 0xbe035c6au, 0x3cb1d763u, 0xbde2a2d1u, 0x3dd677deu, 0xbd023747u, 0xbd9d3690u, 0xbd95873bu, 0x3e715672u, 0x3e69ce7fu,
+0xbe3e4e06u, 0x3d93ccb5u, 0x3d13c7adu, 0x3d6a6017u, 0x3c293f53u, 0xbddf8e94u, 0xbe4b0981u, 0x3e2f1fe5u, 0x3d7b8fc4u, 0x3ce722ccu,
+0xbd5ebab7u, 0xbc8dd0e7u, 0xbda3c534u, 0x3e88bf1du, 0xbc37d0f4u, 0x3cf50ec4u, 0x3e0eec92u, 0x3d3be407u, 0x3e5b4d15u, 0x3de9087eu,
+0x3dab3e6fu, 0x3e05b4cfu, 0xbd7ed2f1u, 0x3c626c15u, 0xbe0f63fau, 0xbe10ccb0u, 0x3ba3956eu, 0xbd7c8f05u, 0x3b1df1a8u, 0x3d2edd02u,
+0xbd0a5948u, 0x3db97c57u, 0x3dc78646u, 0x3e659c69u, 0xbdb14277u, 0xbd235125u, 0xbdfcba0bu, 0xbdc9ab9cu, 0x3cb75e1fu, 0x3d6ced2cu,
+0xbe652df4u, 0xbe861800u, 0x3e3aa534u, 0x3d85d383u, 0xbd8fb77fu, 0xbd13776fu, 0xbd76bb8au, 0x3a3197c1u, 0xbd84ea8cu, 0x3d215c07u,
+0x3e0ef482u, 0xbd22fd00u, 0xbe0170eau, 0x3cdc69f6u, 0x3df8139eu, 0x3d177251u, 0xbdd44d77u, 0x3e6be1f8u, 0x3dde6fc7u, 0x3e0ea142u,
+0x3d33d012u, 0x3e979022u, 0x3e101b73u, 0x3e8322a8u, 0xbdff6216u, 0x3c53e1a9u, 0xbd45092cu, 0x3c3069d1u, 0x3c9ac405u, 0x3d635f31u,
+0xbe0078e9u, 0x3d787eeeu, 0xbdb42c3du, 0xbdee5de9u, 0x3c2d4265u, 0xbd6471d1u, 0x3d4a3f57u, 0xbcba08fdu, 0x3d843a28u, 0xbe045324u,
+0xbd2f3aafu, 0x3e093d58u, 0xbd7f104cu, 0xbe0940d9u, 0xbdb086a2u, 0x3ddbd28cu, 0xbd086b3fu, 0xbee5adbau, 0xbd2ba9f0u, 0xbd8ca11eu,
+0x3e02e32bu, 0x3e46a2b4u, 0x3c3357e4u, 0x3ca6d998u, 0xbe10ba63u, 0x3e17a441u, 0x3e40110au, 0x3de07990u, 0x3cdc3e8du, 0xbdf802c0u,
+0x3cbf99cfu, 0xbd8555d8u, 0xbe3ba791u, 0xbe81fa12u, 0x3e0025b4u, 0x3eb95cc5u, 0x3d892a73u, 0x3cf1046fu, 0xbe1e3f90u, 0x3d0d50ffu,
+0x3d8692e8u, 0xbe193c65u, 0xbd3d83c0u, 0xbd74b1d1u, 0xbebea358u, 0xbdd1020bu, 0x3c65c179u, 0x3dd89726u, 0x3db71ff8u, 0x3d64462au,
+0xbdec968au, 0x3d3ca822u, 0x3d5f0563u, 0xbc990385u, 0x3d945cadu, 0x3d292dc1u, 0x3c21d1adu, 0x3e2b788du, 0x3c4b4fedu, 0xbe11fca6u,
+0xbe48c148u, 0xbb379df7u, 0x3e0c2545u, 0x3ea6f28du, 0x3dbf4933u, 0x3ceabd0au, 0xbdc5b053u, 0xbdbcb8bfu, 0xbde75938u, 0xbc216282u,
+0xbe178e1bu, 0x3e4e55beu, 0x3c890df9u, 0xbccf0b33u, 0x3cc97c37u, 0xbd6afb03u, 0x3dce39aau, 0xbda9f60du, 0x3e0d69b6u, 0xbe134fa7u,
+0xbdfbc20bu, 0xbec83de2u, 0x3c487da9u, 0xbe5f1b7bu, 0xbba7bde4u, 0xbd36d2c8u, 0xbeadc637u, 0x3cb8db68u, 0xbe12f28au, 0xbe0c564eu,
+0x3c7480c6u, 0xbd94a3e1u, 0x3e15db05u, 0x3d46ffb0u, 0x3cd1501eu, 0x3e556ebau, 0x3e0813efu, 0x3e7f3790u, 0x3e2aafafu, 0xbd6c6979u,
+0xbcbddc0bu, 0xbd4dea10u, 0x3d3d0b7cu, 0x3dbd1c26u, 0xbec025eau, 0x3ea9b72au, 0xbe1e6f89u, 0xbd4adf45u, 0xbeca73d0u, 0xbcd188ecu,
+0x3e15be46u, 0x3c454ccdu, 0x3c2c3d2cu, 0x3df131aau, 0x3de21da1u, 0xbda311b7u, 0xbe1c167du, 0x3c18b000u, 0xbd8c0a69u, 0x3e398154u,
+0xbc04e2ddu, 0x3c28e4cfu, 0x3e394400u, 0x3e0a8eadu, 0x3e4ca90du, 0x3ed282bau, 0xbdcf7ceau, 0x3e456e47u, 0xbc1732e7u, 0xbdba8e5au,
+0xbe053b41u, 0xbdb0a7a8u, 0xbda3a94du, 0xbdf23bfdu, 0x3df4b7adu, 0x3e264407u, 0xbe004ab1u, 0xbde82aacu, 0xbe592f84u, 0xbd68a622u,
+0x3e160474u, 0x3ddf1a61u, 0xbdb6a6bbu, 0xbe9e0d52u, 0xbdafb518u, 0x3c20e2e8u, 0x3d387c49u, 0xbd055bbbu, 0xbd36c643u, 0x3e761935u,
+0x3e019f83u, 0x3d0a5a8eu, 0x3da17386u, 0x3d993d62u, 0xbd56108cu, 0x3d8b4533u, 0x3d92d6d0u, 0xbd73ee97u, 0xbc80a09bu, 0xbe249a55u,
+0xbd4564fcu, 0x3e5bddb4u, 0x3e2c015au, 0xbd666d28u, 0xbd23f257u, 0x3e9f4586u, 0x3d83302cu, 0xbd0b95ffu, 0x3c9e0d17u, 0xbdccb6c9u,
+0xbcc4821eu, 0xbb31e902u, 0xbc9e7480u, 0x3d8f1de1u, 0xbce5ff19u, 0xbd91aa25u, 0x3cf67331u, 0xbdc23736u, 0xbdcde9bdu, 0xbe86a92au,
+0x3c0c75fdu, 0x3c60ad81u, 0xbd6eec55u, 0xbcbc13f9u, 0x3d82443eu, 0x3d2d60deu, 0xbc73d527u, 0x3e73557cu, 0xbc3d7093u, 0x3e895554u,
+0xbe218df4u, 0x3cbb7337u, 0xbda0addau, 0x3de46a63u, 0x3e47398bu, 0x3d2d89f0u, 0x3e61bddcu, 0xbdcb6187u, 0xbc13219fu, 0xbdf339efu,
+0x3e2b1dc1u, 0xbac8f580u, 0x3c95d506u, 0x3dc3984cu, 0xbd11b20au, 0x3d93f919u, 0x3ea13f7eu, 0x3cb6e4bfu, 0x3d77376eu, 0xbe1f6478u,
+0x3e7e713eu, 0x3d911752u, 0xbd86c63cu, 0xbbb9dcefu, 0xbdda0347u, 0xbd59087fu, 0xbc8fcd70u, 0x3d41644bu, 0x3d6d5c94u, 0xbd956791u,
+0xbd45e5efu, 0x3d4cc202u, 0xbc94a268u, 0xbe5c4ee3u, 0xbf02ecfau, 0x3d7dd8b6u, 0x3cbfc9b4u, 0xbdebcbecu, 0xbe09c7bfu, 0xbd1bfecbu,
+0x3df5139eu, 0x3c0dcb96u, 0x3e3b323du, 0x3d855609u, 0x3c52a245u, 0xbd4527fbu, 0xbe629ae9u, 0x3e30258au, 0x3d0ff555u, 0xbe2ee38eu,
+0xbcc94c93u, 0x3cd94b5du, 0x3ed48a42u, 0xbe075e45u, 0xbd6a7ef3u, 0x3e26441du, 0x3d769d3eu, 0xbd7450dcu, 0x3d623352u, 0x3dc71613u,
+0x3bb438d0u, 0x3d0c58eau, 0xbe339e85u, 0x3e06ad7du, 0xbc973a05u, 0x3e095808u, 0x3e210ae8u, 0xbde76343u, 0x3e2528f7u, 0xbdfd92aau,
+0x3ee5fa85u, 0xbe86fa3bu, 0x3e1c4742u, 0xbe72399au, 0x3e471567u, 0xbd093eaau, 0x3e51aeb2u, 0xbd440ae2u, 0xbdc06fa8u, 0x3ddac586u,
+0x3dc35376u, 0xbda0e963u, 0xbe0084deu, 0x3d90ebc4u, 0x3deeb314u, 0x3e42d45du, 0xbe2dbd0au, 0xbe2f8caeu, 0x3eeb5b0au, 0x3e201884u,
+0x3cd0d66fu, 0xbda41e0au, 0xbce8a547u, 0xbc22f2a7u, 0xbdb2b70au, 0x3d059ed3u, 0xbdc8b454u, 0x3e9ad2d1u, 0xbd891b61u, 0x3d884aa8u,
+0x3d69792cu, 0x3d20c05cu, 0x3dafb378u, 0xbdd15c14u, 0xbd862724u, 0x3bc0efdeu, 0x3d874669u, 0x3e01d0a6u, 0xbbb85739u, 0x3e104d05u,
+0x3e1c139fu, 0x3e5f2308u, 0xbe0b4131u, 0x3c82dfe3u, 0x3e13e8c2u, 0x3cee921eu, 0xbd0545ebu, 0x3cd0583cu, 0x3d378760u, 0xbda07212u,
+0xbe48db0au, 0xbaf27df7u, 0xbcb9c897u, 0x3d88f46cu, 0xbd42fd13u, 0x3da7e112u, 0x3d1b47edu, 0x3e04b364u, 0x3da566adu, 0x3e29a0edu,
+0xbe62cfe8u, 0x3e0d062du, 0x3d0b0beeu, 0x3e5e1789u, 0x3cbae0f7u, 0xbe40e0f6u, 0x3dcd3ce9u, 0xbde8eceau, 0xbd2d2afau, 0xbd401e4au,
+0xbd2d4ea5u, 0xbd17470fu, 0x3e6fbbb0u, 0x3d5d02cdu, 0xbdaadc2eu, 0xbd570d1eu, 0x3d362475u, 0xbd23d5fau, 0xbe33a5b1u, 0x3daee8adu,
+0xbdedc620u, 0xbe052d93u, 0xbd00ba88u, 0x3deddf48u, 0xbc947bfbu, 0xbe13bf6du, 0xbcf34679u, 0xbd0bfaabu, 0xbd893516u, 0xbdb14341u,
+0xbf25a1d8u, 0x3be0d845u, 0x3c0ade58u, 0xbd8444f3u, 0xbe0ed043u, 0x3cab3f6cu, 0x3d3cd585u, 0xbb782806u, 0x3e02806bu, 0xbc725cebu,
+0xbd4baee8u, 0xbda95c6eu, 0x3d1769b0u, 0x3c1ae285u, 0xbcb64a95u, 0x3e2f4db0u, 0xbd5848e7u, 0x3e7b0d78u, 0xbe7bc23fu, 0x3dbdbe87u,
+0xbc8502c7u, 0xbc91c524u, 0x3c3c6169u, 0x3daaaca2u, 0xbe11e2ebu, 0xbd0531d9u, 0x3d3e18d0u, 0xbe5592b6u, 0x3e878d8au, 0x3d40f5e3u,
+0x3e1f8b81u, 0xbcd981f8u, 0xbd91470eu, 0xbe38e242u, 0x3c4999a7u, 0xbdbf01dau, 0xbcc2286bu, 0xbe0cdf05u, 0xbbe23b98u, 0x3ddffc1au,
+0x3d8e097du, 0xbd9937e4u, 0xbc6b313au, 0x3c016be3u, 0xbe261942u, 0x3e98495eu, 0xbe11caf9u, 0xbdfe2cccu, 0x3d3dbe6au, 0xbc670ffeu,
+0x3d0f1847u, 0xbc98d030u, 0xbe2ef951u, 0x3c64c06cu, 0xbea65e14u, 0xbda005b0u, 0xbe86eda4u, 0xbdaed61eu, 0xbdb45910u, 0x3be9ce44u,
+0xbde9026au, 0x3e1a65e8u, 0x3d92cfd7u, 0x3e0f9697u, 0xbc9a393du, 0xbd219202u, 0x3e3bf2d7u, 0x3e1b6f12u, 0xbc696734u, 0xbce66d88u,
+0x3d819a29u, 0xbcf08d0fu, 0x3e597d85u, 0x3ca20e69u, 0x3e662c9du, 0x3d095bc7u, 0x3d178ef4u, 0x3d124b64u, 0x3d2b16b0u, 0x3db65c44u,
+0x3db1427du, 0xbdb8db71u, 0xbe509686u, 0x3d2f6f6au, 0x3c573e14u, 0xbdb85bc1u, 0x3ccfe357u, 0x3db23ab5u, 0x3d24db7du, 0xbd851f0au,
+0x3e478ecfu, 0xbe1c2246u, 0xbd5a5d5du, 0x3e2fb88fu, 0x3cd04ae3u, 0x3c99560fu, 0xbcd51c6eu, 0x3d3c8d5du, 0x3d752795u, 0x3d48e671u,
+0xbd89db74u, 0xbd805df6u, 0xbd304cd9u, 0xbb6e91bbu, 0x3d99e5f0u, 0x3bf0ce3cu, 0xbd495881u, 0xbddf61f1u, 0xbe18acb9u, 0x3e1652dbu,
+0xbde5e2eeu, 0x3d2c6628u, 0xbce1f45fu, 0x3de2adbeu, 0x3dece5a3u, 0xbcdf01a9u, 0xbdd51c88u, 0x3eb4bc2au, 0x3db5f3edu, 0xbd7ae77cu,
+0x3c9dce17u, 0x3d820eb3u, 0x3d861a0au, 0xbe2197cbu, 0x3c8e4afbu, 0xbdfd9410u, 0xbe897e6fu, 0xbd59d981u, 0xbcdcd858u, 0xbdc64a62u,
+0x3e576b52u, 0x3d357005u, 0x3dcee0eeu, 0xbd086c1cu, 0x3bd0bdb1u, 0xbd15336eu, 0x3d828147u, 0x3dcf19adu, 0xbd203658u, 0x3e09670fu,
+0x3dfabefeu, 0xbd004601u, 0xbe7c4f6cu, 0x3d9cb38bu, 0xbec7c658u, 0x3e2ecbfau, 0xbda2624au, 0x3dcd3de8u, 0xbe0b46b4u, 0x3dc4193cu,
+0xbdcce95eu, 0x3dbb0315u, 0x3e8f6da1u, 0xbe9f0645u, 0x3e3189d1u, 0x3d43145bu, 0xbdde83b3u, 0xbd2d25b1u, 0xbdece093u, 0xbd432fadu,
+0x3e07ce2fu, 0xbcc5bf4bu, 0x3effe259u, 0xbe5b7610u, 0xbe4f0901u, 0x3e4db62cu, 0x3d64d00au, 0x3df13e0du, 0x3ba0977cu, 0xbd797d84u,
+0x3c8ee60eu, 0x3d7612acu, 0xbce2200bu, 0xbc08ee42u, 0xbd6d19acu, 0xbd28d5e0u, 0xbdbfc434u, 0x3e3f8567u, 0xbbd606e7u, 0xbdf5a881u,
+0x3d5e0b51u, 0xbbbe7984u, 0x3c94ef06u, 0xbdc24f15u, 0xbc9b149bu, 0xbdac89e7u, 0x3e1c4d6eu, 0x3d3f4eb9u, 0x3ea3c4fau, 0x3f14e1a7u,
+0xbdad67c2u, 0xbd50804bu, 0x3ead57c5u, 0xbdf6016du, 0xbcb265b0u, 0xbde4c926u, 0xbcb07733u, 0x3e6a9de9u, 0xbd951d23u, 0x3de4641fu,
+0x3e0e58b7u, 0x3cef078bu, 0xbdb5c939u, 0x3d919083u, 0x3bcce446u, 0x3da68035u, 0x3c799c9du, 0x3e41799eu, 0xbcf85f64u, 0x3d859be2u,
+0xbd9d45dcu, 0x3cf0c1e5u, 0xbc12571cu, 0xbd791607u, 0x3d812739u, 0x3de9f5fau, 0x3d274f3fu, 0xbd9d2d58u, 0x3c8ec04cu, 0xbe59676fu,
+0xbd98f64bu, 0xbe0bd2b5u, 0x3c12af27u, 0x3c7e5db1u, 0x3d80d728u, 0xbe231050u, 0x3ced3026u, 0x3ddc0178u, 0x3cef7ee8u, 0x3d5c82efu,
+0xbd2fdb75u, 0xbb8fd43eu, 0xbd7288ebu, 0xbe0cdc65u, 0x3e676307u, 0x3db2795fu, 0xbbc3c08eu, 0xbddf4de3u, 0xbba36872u, 0x3cfd3038u,
+0x3d3b3bd2u, 0xbcd903e5u, 0x3d7502f4u, 0xbe698e97u, 0xbdb6b7cbu, 0xbe149a13u, 0x3dd833a3u, 0xbeb3ca74u, 0x3d43c88cu, 0xbcd10cf6u,
+0xbe209b36u, 0x3d8ac156u, 0x3db10c46u, 0xbe0ecb03u, 0xbddb72d4u, 0x3d0b5ffdu, 0xbc19635eu, 0xbd8c1d11u, 0xbc33e851u, 0xbda3c434u,
+0x3dd2712au, 0x3e19f849u, 0x3dcde76fu, 0xbc005535u, 0xbc331649u, 0x3cfeea78u, 0xbd1186bbu, 0x3d745398u, 0xbe305ad4u, 0x3c7f8eadu,
+0x3c347f23u, 0x3de04a31u, 0x3b81d931u, 0x3dd66bf9u, 0x3d816162u, 0x3e44515cu, 0x3e889834u, 0x3db59216u, 0xbda813a8u, 0xbea6cb2cu,
+0xbcdd7d89u, 0x3d87c5aau, 0xbd88faf2u, 0x3b75722eu, 0xbe31bf44u, 0x3e3b2bc5u, 0x3c89fbd1u, 0x3c3a24b7u, 0x3e6f246bu, 0x3e0de036u,
+0x3c82bdd5u, 0xbe0927e6u, 0x3ca4e349u, 0x3cf4a29au, 0xbdae445du, 0x3d5838ddu, 0xbc1140c4u, 0xbe6adc75u, 0xbe37ddf2u, 0x3cf2d8b4u,
+0x3d6ea35bu, 0x3dcb1969u, 0xbdcb6b71u, 0xbd84d982u, 0x3c7dc969u, 0x3dadc68au, 0x3e8a3e1au, 0x3d81ae5bu, 0x3bac5deau, 0xbbd10b67u,
+0xbd25f846u, 0xbe3dfd06u, 0x3d001859u, 0x3dd70d55u, 0xbe0d1eacu, 0xbab8066fu, 0x3e861646u, 0x3c9e0811u, 0x3cc50867u, 0x3c320e4bu,
+0x3d989927u, 0xbba45980u, 0xbdb69c8fu, 0x3e30f021u, 0xbe5193c6u, 0xbcaaafdeu, 0x3d38c188u, 0xbe02683eu, 0xbd7757c2u, 0x3ba4f72au,
+0xbe53b6c4u, 0xbda7a973u, 0x3d2cf843u, 0x3d416196u, 0xbe23ebdau, 0xbe02a33bu, 0xbe2d481cu, 0xbe2c7c63u, 0xbb49ad03u, 0xbeef3719u,
+0xbe35cffdu, 0x3da43175u, 0x3e935dfcu, 0x3e5c71ebu, 0xbd32f20bu, 0x3cc106c1u, 0xbe59fe0au, 0xbd5b5349u, 0xbd4c1e39u, 0xbde41758u,
+0xbd53a17fu, 0xbd72bc0au, 0x3d914047u, 0xbdbcf2f2u, 0xbc24978eu, 0x3da20fa9u, 0xbd4a6e62u, 0xbf1bb75fu, 0x3c9be1cfu, 0x3e41c50du,
+0x3d4f4d8cu, 0x3e189793u, 0x3db34f6bu, 0xbdee273bu, 0x3e6d5a2du, 0xbdc4fa9au, 0xbdfa6b14u, 0x3c58c5fau, 0xbdfa3d04u, 0x3d889724u,
+0xbe451388u, 0xbcb44898u, 0x3ca2eb85u, 0xbdeea3c4u, 0x3e32dd0fu, 0xbe835670u, 0x3db5d3b6u, 0xbe8748b6u, 0xbd50848bu, 0xbd960fbau,
+0x3da7c00au, 0xbdd0ea7bu, 0x3d192b42u, 0xbcc92897u, 0xbebe2042u, 0x3d7a81fcu, 0xbdb67653u, 0xbda036cbu, 0x3e0d1eb0u, 0x3d5755b9u,
+0x3d4525cdu, 0x3d39fe26u, 0x3d65694du, 0x3e9ca58cu, 0x3d81524du, 0x3e58fc4eu, 0xbe910fe4u, 0xbe41d9dbu, 0xbd2d6505u, 0x3d88b7a3u,
+0xbe508424u, 0x3de1c512u, 0xbf2a12bau, 0xbd3de429u, 0xbe63bf3cu, 0x3ef0296cu, 0xbe63a677u, 0xbcad30a8u, 0xbe9ec33fu, 0x3e29a65bu,
+0xbd002ee7u, 0x3e7ee1b7u, 0x3c8fe625u, 0xbdecf3b2u, 0xbe05d8acu, 0xbd851d6eu, 0x3c7e35beu, 0xbba0092fu, 0xbcf3085cu, 0x3c9f5880u,
+0x3e4acd11u, 0x3de2d275u, 0x3ec42606u, 0xbe841ff5u, 0xbbff1d51u, 0x3e05af2au, 0x3dc28c26u, 0x3d51e596u, 0xbdce112eu, 0xba289fb7u,
+0xbe0afb16u, 0xbe2851d9u, 0xbd52ca43u, 0x3e4836c2u, 0xbdb822e3u, 0x3e194ca7u, 0x3c04105bu, 0xbd85800cu, 0x3e1e20cfu, 0x3d07425fu,
+0xbe85544au, 0xbe4150d7u, 0xbd521785u, 0xbc74a7eau, 0x3dd38c76u, 0x3d5bf538u, 0xbd47ed5cu, 0x3ea0fa5cu, 0x3da848d5u, 0xbb486487u,
+0xbdcf538du, 0x3e141ab7u, 0xbce0e522u, 0x3d3250abu, 0xbca2c38cu, 0xbc9b2994u, 0xbe0aea03u, 0x3d9c4447u, 0x3ea086c3u, 0x3ebf8563u,
+0xbdd382a5u, 0x3d9ea90du, 0x3dd2552du, 0x3c7f67cfu, 0xbcd3fae4u, 0x3c6b780eu, 0x3d60afcfu, 0xbd1c868au, 0xbe3343a3u, 0x3d12d1b2u,
+0x3e330caeu, 0xbe2ffb24u, 0xbda0a7deu, 0xbdae19c0u, 0xbe55450fu, 0x3d8d6e30u, 0x3d936147u, 0xbed74090u, 0x3d9b8a60u, 0xbd1e71eeu,
+0xbddc8ae1u, 0xbc2313f2u, 0xbe7fda6du, 0x3cf43ae9u, 0xbc9a009au, 0xbe86c31fu, 0xbdbf0b5du, 0x3d13e8ddu, 0xbe3d6743u, 0xbd97220bu,
+0x3c9834e6u, 0xbcf11f4bu, 0x3def841fu, 0xbdde9d57u, 0x3e0e4196u, 0x3cda90ceu, 0xbc2432b8u, 0x3e64bf96u, 0xbc9f5234u, 0xbcf332afu,
+0xbd65e665u, 0x3e19a250u, 0xbd889372u, 0x3dbfd496u, 0x3cc0f565u, 0xbdc33e2du, 0x3dc26137u, 0xbc911e5cu, 0xbdaf4f80u, 0xbddae05cu,
+0x3df0510au, 0xbae095adu, 0xbc41532bu, 0x3cafa998u, 0x3d512e5cu, 0x3da6c986u, 0xbd97e958u, 0xbd660d8fu, 0x3c41b2eau, 0x3d8230a5u,
+0xbceadb83u, 0x3e707b79u, 0xbe4ba7acu, 0x3e279a55u, 0x3d3546a4u, 0x3e411bc5u, 0x3dd43a5eu, 0x3ccf3d77u, 0xbdff1c6cu, 0x3cdfef8au,
+0xbd0df28au, 0xbd6c6bc3u, 0x3c6a3e99u, 0xbd704d7bu, 0x3e349c98u, 0xbbdd180fu, 0xbc1eb6e9u, 0x3d595e05u, 0xbdcf7699u, 0xbd6cb25cu,
+0x3ea8ecc0u, 0xbe4c1127u, 0x3d000309u, 0x3df4ea85u, 0xbe281f76u, 0xbc1aca59u, 0xbb54e3eeu, 0xbdb43a1bu, 0x3e97c5a2u, 0x3e6a0624u,
+0xbe8e750au, 0x3e7d4d9bu, 0xbca982e9u, 0xbd0299f0u, 0xbdc2feaeu, 0x3dd8e353u, 0x3cfa4c54u, 0xbed30023u, 0x3e935464u, 0xbe02c8afu,
+0x3d9e0e87u, 0x3e959536u, 0x3b5864dau, 0x3d88b213u, 0xbe78e277u, 0x3dc72c71u, 0x3e236a04u, 0xbdc8e250u, 0x3c858968u, 0x3dc69513u,
+0x3c21f271u, 0x3cccccf4u, 0xbdbd3342u, 0x3e387b07u, 0xbd8b8282u, 0xbe726ddcu, 0x3d0518c1u, 0x3c1db7deu, 0x3d06f96bu, 0x3e12e86fu,
+0xbcd4f141u, 0xbd0141beu, 0x3dc4b053u, 0xbde8d4a3u, 0xbd335a9du, 0x3ea79770u, 0xbd5ba8f5u, 0xbd5ced1du, 0x3dd4c462u, 0xbdc32666u,
+0x3e5034fbu, 0x3dbacf54u, 0xbda7fcc4u, 0xbdecfe6du, 0xbd09231fu, 0xbd6bca13u, 0x3ddc6f7du, 0x3e07aef2u, 0xbdca2bceu, 0xbd8953cdu,
+0xbe34f828u, 0x3e1d17d4u, 0xbe91cc57u, 0x3e560beau, 0x3e0abc9cu, 0xbe080128u, 0xbd88404au, 0x3e043dc6u, 0x3bc06852u, 0xbc8a6374u,
+0xbd5fd3c7u, 0x3eb3b3fbu, 0xbcd074e7u, 0xbd163776u, 0x3c5f3ab2u, 0xbe327011u, 0x3d66ede5u, 0x3e0d0befu, 0xbce6bf2cu, 0x3e0f8d56u,
+0xbe2ab7eau, 0xbd4cded3u, 0x3e945374u, 0xbba23a95u, 0xbccd24fbu, 0x3db14f34u, 0x3e1b142au, 0x3d3c28a9u, 0x3b46f3d2u, 0xbe28cd1du,
+0xbc7cf090u, 0x3e001ccfu, 0xbe4b9279u, 0x3d1d49a6u, 0x3d1340c4u, 0xbdf8c4b1u, 0x3c901fa9u, 0x3c634fe0u, 0x3e1605fcu, 0xbe1cd31cu,
+0xbd398885u, 0x3e0c8048u, 0xbe3c1534u, 0x3b946450u, 0xbd58c00fu, 0xbe56ddc9u, 0x3de55ad8u, 0xbdb2ee7fu, 0xbd8612dfu, 0x3d29131fu,
+0xbdf72c5eu, 0xbdec62b5u, 0x3d9b39bfu, 0x3dcd0c77u, 0xbddb1bc5u, 0x3ded64cfu, 0x3dff21c5u, 0xbe6c5efbu, 0x3dd22284u, 0xbcd72d13u,
+0x3d36472eu, 0xbdc59cc0u, 0xbd600b79u, 0xbde1bc36u, 0x3da2c1a4u, 0x3ddc0995u, 0xbe4a66e1u, 0x3c8a4e39u, 0xbde87a3au, 0x3cecfa0fu,
+0x3d8648adu, 0xbcd935a5u, 0x3e85b84du, 0xbe0da4cbu, 0xbe3abb84u, 0x3db0279cu, 0x3e6c11beu, 0xbd93c554u, 0xbe0fc35du, 0x3d921e6eu,
+0x3d858c57u, 0x3dab5aa6u, 0xbc99fd0cu, 0x3d1e5629u, 0xbe990c12u, 0x3e2168a0u, 0x3c0a472eu, 0xbe21e192u, 0xbdf8e5cfu, 0x3d7175f3u,
+0xbd3427beu, 0xbbb840b0u, 0x3dd4c584u, 0x3dd3a4b5u, 0x3dfb091eu, 0x3d71bccdu, 0xbde1e20fu, 0x3b5d3eb0u, 0xbe0070a6u, 0xbab13c6eu,
+0x3e3b0581u, 0xbdf172a4u, 0x3eb6c45fu, 0x3eccd644u, 0xbdaa4f2fu, 0x3e54a5ddu, 0x3e3d8e59u, 0xbd7fbc67u, 0x3ebd896bu, 0xbc4f0109u,
+0x3e5e2591u, 0xbed3e28bu, 0x3d1b8d11u, 0x3d1a59afu, 0xba559526u, 0xbde8107eu, 0xbe008592u, 0x3c809432u, 0x3cbc31bcu, 0x3e2db4e2u,
+0xbea26c59u, 0xbd03954fu, 0x3cd17bd3u, 0xbdfd92feu, 0xbd19c490u, 0xbc9d82ccu, 0x3e105e59u, 0xbe317f14u, 0xbcbce160u, 0xbd813386u,
+0x3dd67a1du, 0x3cff587du, 0xbd8f8ad4u, 0x3d59313cu, 0xba0c4e94u, 0xbde0fe79u, 0xbc6775cau, 0xbd9973aeu, 0xbe4b8ac1u, 0x3d255b2bu,
+0x3dffec13u, 0xbd113200u, 0x3bee97c6u, 0xbcb8496eu, 0x3acc0ccbu, 0x3e28a891u, 0x3cc3a00du, 0xbe017cdcu, 0xbbc7403eu, 0xbe016491u,
+0x3d03015bu, 0x3cbf97c3u, 0x3d7d4e55u, 0xbd900af4u, 0x3c90fea6u, 0x3d976b67u, 0x3dc12c15u, 0xbd317bddu, 0x3d3c47cfu, 0xbd8e34b6u,
+0xbd8c5617u, 0x3dc14a86u, 0xbd11b446u, 0x3d19042cu, 0x3e525b2eu, 0xbf146ba5u, 0xbdc0c07eu, 0x3d4249bfu, 0xbe1b4834u, 0x3d9e7e0cu,
+0xbdcd0b59u, 0x3dc7c05bu, 0xbe06977eu, 0xbcf6f9f6u, 0x3f133c74u, 0xbd1885f6u, 0xbc8937f6u, 0x3ca46ad7u, 0xbdd4e148u, 0xbd82b4f7u,
+0xbdf958f4u, 0x3da85cacu, 0xbc7750eeu, 0xbdd72e85u, 0x3df6c372u, 0x3c976415u, 0xbd4259e2u, 0x3d936a0eu, 0xbe1424b1u, 0x3e1e5ba3u,
+0x3e606a91u, 0xbe0ce071u, 0x3f3ebab3u, 0x3c024f49u, 0x3d0b76d2u, 0xbe0b737eu, 0x3b96f641u, 0xbd7f949fu, 0x3ba50b22u, 0xbe0eabfau,
+0xbe282139u, 0x3ea6d103u, 0xbe3cb8b5u, 0xbe070dc7u, 0x3dee2981u, 0xbd3c6c71u, 0x3e25b119u, 0x3dfeb393u, 0xbe9cb487u, 0xbe59c7feu,
+0x3d9cf959u, 0x3d937007u, 0xb8dc022cu, 0xbdf993cfu, 0xbe2a61d9u, 0xbe197598u, 0x3e354404u, 0xbdbe3090u, 0xbe014fd9u, 0x3e974331u,
+0x3c943368u, 0x3deb5a0au, 0x3d45352bu, 0x3df1cea3u, 0x3e2fc073u, 0xbe1b2244u, 0xbd21294bu, 0x3e0e61c9u, 0xbe7e20b0u, 0xbd0d70a2u,
+0x3cd3f465u, 0x3d1e0b9au, 0xbc0a20bdu, 0x3da3fb06u, 0x3d7ed6ccu, 0xbea2150du, 0xbe791623u, 0x3eddbde6u, 0xbe9e7733u, 0xbe02418du,
+0xbda9094eu, 0xbda39642u, 0x3d1eddb7u, 0x3c09635fu, 0xbd6058bfu, 0xbde93ceau, 0xbd1b1e6eu, 0xbd9dd501u, 0xbe3fee51u, 0x3d5a796bu,
+0xbd7a9f4fu, 0x3b8f5ffbu, 0x3deb29bcu, 0xbda95d7cu, 0x3d995028u, 0xbd9f0010u, 0x3e1c22a8u, 0x3e9b93f9u, 0xbdecffceu, 0x3da182bau,
+0xbdaea576u, 0x3df00e6cu, 0xbd30a434u, 0xba2a6ebcu, 0x3d963e70u, 0x3e5a512eu, 0x3d202279u, 0x3e07522fu, 0x3e55bce3u, 0x3d7a047fu,
+0xbc8aa8b2u, 0x3b01070eu, 0x3d855a4cu, 0x3d35d247u, 0x3bc22ed4u, 0xbde9de1du, 0x3ccc21a3u, 0xbd50c38du, 0xbd3053d1u, 0x3c35b65fu,
+0x3d8898c2u, 0x3def98e1u, 0xbbfddf70u, 0x3dbf743bu, 0x3d0bc6c8u, 0x3bcb9993u, 0x3c97a069u, 0xbc832f76u, 0xbcbc5065u, 0xbdb8360cu,
+0xbc95cb07u, 0x3e8966a3u, 0xbe6eb31fu, 0x3d4b9827u, 0xbd362e4eu, 0x3e4041feu, 0x3df55b42u, 0x3e5f23a6u, 0xbd362286u, 0x3e09b49bu,
+0xbdf049b1u, 0x3dd89d65u, 0x3dfbd925u, 0xbdd92664u, 0xbdd8e5c2u, 0x3ea19040u, 0x3e0fb84eu, 0x3e4287d3u, 0x3c87bc80u, 0x3e2bb3e1u,
+0xbc3c08e5u, 0x3d821fe1u, 0xbdb5cdf8u, 0xbe0f0443u, 0x3e323ba0u, 0xbd8bf238u, 0xbdcd6133u, 0xbcfbaccfu, 0xbe843d5du, 0x3db24800u,
+0x3caee067u, 0xbe316e13u, 0xbdd10094u, 0xbe4649f7u, 0x3dd532d5u, 0xbcf1ddcbu, 0xbe25ac76u, 0xbd4f79dau, 0xbded5bcau, 0x3d85cddau,
+0x3dd3c587u, 0xbdf332edu, 0x3e291100u, 0x3c776a61u, 0xbc0251cau, 0x3e3ff115u, 0xbdf1b332u, 0x3d05ee10u, 0x3db5173au, 0x3e5f332eu,
+0x3ccc1bddu, 0xbe42181du, 0xbcc8aefeu, 0xbce45111u, 0xbd9124dbu, 0x3d03014du, 0x3d20dcd6u, 0x3d8774bbu, 0x3cfb3375u, 0xbdd50b92u,
+0x3d3501dfu, 0x3e281b58u, 0x3d22a2eau, 0xbd3c0c74u, 0xbeb1db3fu, 0xbe3a5e38u, 0xbe64f4f4u, 0x3def25ecu, 0x3d77fe92u, 0x3d465fa5u,
+0xbb9cf974u, 0x3d89e180u, 0x3e090b88u, 0xbdfb3b65u, 0xbdd2db8au, 0xbe2aa44fu, 0x3cc00e74u, 0xbb7a7e2du, 0xbd68e014u, 0xbdcd7dddu,
+0xbc32abc9u, 0xbcfd4b4bu, 0xbdc7ddfdu, 0xbd78397bu, 0x3e79bcd1u, 0x3dd42154u, 0xbcd31b28u, 0x3db0fe22u, 0xbe30fbfau, 0xbc7139d5u,
+0xbe11e0aau, 0xbd9905eau, 0xbd5f279cu, 0x3d96eee4u, 0x3dfe61fau, 0x3e438eb6u, 0x3e25ec66u, 0xbd09a273u, 0xbcefd355u, 0x3d27b419u,
+0x3f0d9a56u, 0xbea3da4bu, 0xbdebb46eu, 0xbd85a6e6u, 0x3e8de0d2u, 0xbd857573u, 0xbd8ffd55u, 0x3e2369e1u, 0x3da811d5u, 0x3eb57514u,
+0xbeaaddfbu, 0x3ca59dbau, 0x3e7528d2u, 0x3e6b85b4u, 0xbc2724b4u, 0x3e06b70cu, 0x3d62f403u, 0xbcb54bc8u, 0xbcaf1aeau, 0x3ed4ebc0u,
+0x3d3231c2u, 0x3e054f59u, 0xbe191165u, 0xbe513a62u, 0xbcf74dc0u, 0xbe86c86du, 0x3cdd4bc6u, 0x3d75e3a7u, 0x3d6e7edeu, 0xbdba533du,
+0xbe4db621u, 0x3d94e0bbu, 0xbdfb7479u, 0x3e420056u, 0xbe592af0u, 0x3e362b35u, 0x3dab1247u, 0xbd1be37du, 0xbeb44eb3u, 0x3c46de8au,
+0x3c067746u, 0x3d8a9bd4u, 0xbec88cd5u, 0x3c94d367u, 0xbdf4b1dcu, 0xbca69b42u, 0x3e1f7e1eu, 0xbcfbd29fu, 0x3e97fce5u, 0x3daf6613u,
+0x3e379041u, 0x3e5017b8u, 0xbce2a7c5u, 0xbea23178u, 0x3dfb6d6fu, 0xbd0df799u, 0x3db2d921u, 0x3d366493u, 0x3e410009u, 0x3e2786e3u,
+0xbe8809f1u, 0x3e72dc2eu, 0x3ee6798du, 0x3eca3852u, 0x3dd3f972u, 0xbd145347u, 0xbd784e33u, 0xbd312920u, 0xbcc5d06du, 0x3de61621u,
+0xbe026830u, 0x3e7e2636u, 0x3e076a6fu, 0x3e94ccb8u, 0xbd9a4cbbu, 0x3cbd9025u, 0xbdca0703u, 0xbe04ea09u, 0x3df67d3eu, 0x3deeca50u,
+0xbe19e4dbu, 0xbeaa0d41u, 0x3d8b5986u, 0x3d1de0f7u, 0x3d355ce6u, 0xbe15c11bu, 0xbe6fc993u, 0xbe00ce83u, 0x3df054d2u, 0xbe9b1be0u,
+0x3dfadae5u, 0xbea25078u, 0xbaafb1c4u, 0xbd8cd25eu, 0xbe3aac30u, 0xba5c2a39u, 0x3bde6eb4u, 0x3d4dc787u, 0x3c88d84du, 0x3e170d4eu,
+0xbdc0f04au, 0x3d8da912u, 0xbe870c0eu, 0xbd1c8810u, 0x3e10440eu, 0x3cf28ab0u, 0x3e029445u, 0x3da69e6eu, 0xbe2b6acau, 0x3ea6cef0u,
+0x3e45a6a0u, 0xbda74e46u, 0x3d88748du, 0xbd541776u, 0xbe55d1c3u, 0xbdf6212cu, 0xbdaf6814u, 0x3e2ddccbu, 0x3e875cd0u, 0xbd1f1d3bu,
+0xbd0194f6u, 0xbe79ac49u, 0x3c8be9cfu, 0xbe685551u, 0xbdbb94c5u, 0xbe2b19aeu, 0xbd4ecb84u, 0x3e0e4349u, 0xbc85bf20u, 0x3e940267u,
+0xbd1fa01cu, 0xbcdbb098u, 0xbebbb496u, 0x3dac9b2du, 0xbda3800du, 0x3e3c43cbu, 0x3bcfce27u, 0x3da99a5du, 0x3db519c1u, 0xbceae94bu,
+0x3d18b2b9u, 0xbc868337u, 0xbdca10ddu, 0x3dfc48c4u, 0xbd9856a4u, 0xbe58e3dbu, 0xbdb6e901u, 0xbe45fe26u, 0xbc83d09du, 0xbcdd12a8u,
+0x3d7d5cafu, 0xbd9e4fccu, 0xbc3f0d3eu, 0x3e139923u, 0x3ba0e9c8u, 0xbcec9d09u, 0xbc1ffef7u, 0x3c9947a6u, 0x3dd97e19u, 0x3e30ef51u,
+0x3d526957u, 0x3e5a16e4u, 0x3f0ac355u, 0x3e194422u, 0x3e24bbdfu, 0x3d4142e2u, 0x3e38534du, 0xbde10d38u, 0x3e5cec1bu, 0x3cee407au,
+0xbd14d248u, 0xbd363ae6u, 0x3da699dfu, 0x3d5ad0a1u, 0x3dd95254u, 0xbddab4d5u, 0xbdb515b3u, 0xbdcb7254u, 0x3d31ddf1u, 0x3e5d81cau,
+0x3e1472abu, 0x3db6cc43u, 0xbd1780cau, 0xbe59c523u, 0xbdf81260u, 0xbcaa4422u, 0xbe571fc8u, 0x3d30c3feu, 0xbd1fd03cu, 0x3ddebb55u,
+0xbdbb4091u, 0x3c983a49u, 0xbe32e355u, 0x3bc026bcu, 0xbd25e952u, 0x3e0a3410u, 0xbd466d33u, 0xbd50a615u, 0xbdf568a3u, 0xbe07d924u,
+0x3d9b4846u, 0x3dbe7a92u, 0x3e2823deu, 0xbd9015a4u, 0xbdede17bu, 0xbe1fa91bu, 0xbdb2ce45u, 0x3d2c814bu, 0xbc2409eeu, 0xbdfe3d78u,
+0xbe55c592u, 0x3cf5e7bfu, 0x3b13c2bbu, 0xbd126578u, 0x3cafd126u, 0xbe342d6du, 0xbe5606ceu, 0xbe439f64u, 0x3cefa101u, 0x3b56ff8fu,
+0x3d985704u, 0x3cb17c72u, 0x3c5ed7fbu, 0xbcb6144cu, 0x3e4053f0u, 0xbd83f762u, 0xbe08c974u, 0xbd4f9bc5u, 0x3d98f0fbu, 0xbccd4351u,
+0x3bfa130du, 0xbcd4b948u, 0x3ddbeabbu, 0xbe100341u, 0x3e436998u, 0xbdfbef2au, 0x3e13220au, 0x3d966147u, 0xbd78eeefu, 0xbc0733ddu,
+0x3e88ad3cu, 0xbccca532u, 0x3d0b7a12u, 0xbe28c46bu, 0x3b717f23u, 0xbcb56447u, 0xbd138374u, 0x3daeb51fu, 0xbc3cc4deu, 0x3dc89cb9u,
+0x3e17c6d4u, 0xbde9291bu, 0xbe45abb4u, 0xbdf51bc3u, 0x3d4579acu, 0x3e36b7d7u, 0xbd83396au, 0x3e39462bu, 0x3d949374u, 0x3c96b32au,
+0xbdafda1du, 0x3e0fd2c0u, 0x3e152e1bu, 0xbe1ec3e7u, 0x3d8f5bc9u, 0xbdc8918eu, 0x3da5c5a9u, 0xbe046475u, 0x3cdcb1ebu, 0xbd60c228u,
+0xbe5967deu, 0x3d5076b6u, 0xba380b01u, 0x3d4e4a74u, 0x3e22ffd6u, 0x3d7be8a3u, 0x3e87461eu, 0x3ee63160u, 0x3e2bba08u, 0x3e20c337u,
+0x3deda566u, 0x3ebd863du, 0x3e82f9b2u, 0xbc3dcda9u, 0x3d2b813bu, 0xbdcbf2ddu, 0x3d6d31abu, 0x3dde173eu, 0x3c002894u, 0x3e282b0du,
+0xbcde1d0eu, 0xbc1cd57eu, 0xbb473fbcu, 0xbdedba59u, 0x3d84efb5u, 0x3dc9a5e7u, 0xbd4d87f2u, 0xbc4780b1u, 0xbd58b9cdu, 0xbdb1edf0u,
+0x3dc7a9d1u, 0xbe272013u, 0x3d8eda5eu, 0x3eb9637eu, 0xbd9a996bu, 0xbe66bc2au, 0x3e1b4d41u, 0xbe08ca50u, 0x3c47bb45u, 0x3e733541u,
+0xbe792e9cu, 0x3cf8df7du, 0xbdc9d62bu, 0x3d255ddeu, 0xbd39eb88u, 0xbe4e47fcu, 0xbdf429dfu, 0x3d0bd032u, 0x3d38d7ecu, 0xbe1cfd15u,
+0x3e87bb5cu, 0xbdcf870fu, 0x3d702e39u, 0x3ca532efu, 0x3d8cdb7eu, 0x3de65a3du, 0xbd621bd0u, 0xbd95f928u, 0x3cf3e844u, 0xbc4e2ab2u,
+0x3df05f65u, 0xbe41c2a6u, 0xbe882acdu, 0x3ca5f27fu, 0x3de8fdd7u, 0x3e0ccb71u, 0x3e419c71u, 0xbe929ce9u, 0xbd83edd9u, 0xbe01111du,
+0xbe19c7f2u, 0xbe12f461u, 0xbd7a608du, 0x39ebdf2au, 0xbda0e83fu, 0x3c0cd72eu, 0xbbeae6b4u, 0xbd99cb41u, 0xbd869ffau, 0xbe09b7ccu,
+0xbe24d108u, 0x3cdf3951u, 0xbe8635deu, 0xbdc25e57u, 0xbd217194u, 0xbc797eb4u, 0xbdee06e2u, 0x3d8d89bbu, 0x3df165a0u, 0xbdce7ea9u,
+0xbd2d1228u, 0x3cda3834u, 0xbe243338u, 0xbd7a78d4u, 0x3d71c0e7u, 0xbd0067e7u, 0xbe2aa320u, 0x3bb32eacu, 0x3e0e9dedu, 0x3ea8a46du,
+0x3e041a4du, 0xbdc52b14u, 0xbd95fbd9u, 0x3c8e9b41u, 0xbc85424cu, 0xbd234e66u, 0x3d116132u, 0x3daaa8d4u, 0x3e608301u, 0x3bd809bcu,
+0xbcc2c609u, 0x3e0a07d8u, 0xbd6e721bu, 0x3c880818u, 0x3d364df5u, 0x3d5c298bu, 0xbc7a29beu, 0xbd384072u, 0xbb823139u, 0xbc557ee8u,
+0xbde0fbc8u, 0xbcf6efb9u, 0x3c1391deu, 0x3e1160f2u, 0x3dff28c3u, 0xbe299f0au, 0x3e76cf3cu, 0xbdc9d270u, 0x3e0b62d0u, 0x3e06dc1du,
+0x3d3686cau, 0x3c26acecu, 0x3e150937u, 0xbd2328bcu, 0x3d815677u, 0xbd2c2b3bu, 0x3dcd0ae3u, 0x3ab480dau, 0x3e32681cu, 0xbcb4c59du,
+0x3d86b2deu, 0x3d671e32u, 0x3d916c79u, 0x3d2b0cbbu, 0xbe113cd2u, 0x3e76dcf8u, 0xbdeac80cu, 0xbdcb2a50u, 0x3cea7a45u, 0x3d5c2656u,
+0x3d61053eu, 0x3dd956ffu, 0x3d8872b9u, 0x3e8667d8u, 0x3da124e1u, 0xbe0523f5u, 0xbe3fa5c0u, 0x3db72435u, 0xbdad690du, 0xbe39d9dfu,
+0x3c421ffdu, 0xbe29ba9cu, 0xbee3a901u, 0x3cc951c0u, 0xbb285f04u, 0xbbec149bu, 0x3d30d7b1u, 0xbc9e38ebu, 0x3d07b694u, 0xbd7d1686u,
+0x3cf80456u, 0xbe8b314au, 0xbdf3dfd2u, 0x3e22977cu, 0x3d741052u, 0x3dc26180u, 0xbd9fa70au, 0xbdfa9802u, 0x3d9c3338u, 0xbe1be4e5u,
+0xbee0a260u, 0xbd925537u, 0x3d8bc530u, 0xbe94686fu, 0xbe3e87dau, 0x3dae0efau, 0x3dbe6e98u, 0x3dcdddf4u, 0xbcd3603fu, 0xbdc84419u,
+0x3e3cf43eu, 0x3d3be6a5u, 0x3e066043u, 0xbd99cb16u, 0x3d06b6fcu, 0xbe4a5bfbu, 0xbdea9c73u, 0xbe0ff04eu, 0xbe622d1cu, 0x3d6a999au,
+0x3dd47779u, 0x3d1ccf39u, 0x3daa714bu, 0x3d158bfcu, 0x3e3bd852u, 0xbd040477u, 0xbd2f3063u, 0xbe4cba2au, 0xbc05bbddu, 0x3b229d1fu,
+0xbe052370u, 0xbc233a4eu, 0x3c7feffau, 0xbdb44af7u, 0x3c4e6c4du, 0x3ceb85abu, 0x3e73be35u, 0xbd21acedu, 0x3d1f9c3cu, 0x3cdf7f14u,
+0x3bcfd79cu, 0x3c788318u, 0xbd9f5324u, 0xbe65da55u, 0xbe5c3404u, 0x3e013587u, 0x3db19b0du, 0x3daca74bu, 0x3d25279au, 0xbc2dc43du,
+0x3ca7a528u, 0xbdff802eu, 0xbe07b182u, 0x3e29fbd1u, 0xbe0b64dbu, 0x3d983c55u, 0x3d43d0c0u, 0x3e24743du, 0xbdad70afu, 0x3cce697au,
+0xbd16b89bu, 0x3cd7b910u, 0x3d6de7b6u, 0x3e2adc4au, 0xbe2311d9u, 0x3d32a2b3u, 0xbe19eefdu, 0xbc6e0e9cu, 0x3d572f29u, 0x3e595958u,
+0x3d3acfbcu, 0x3d4d422bu, 0x3e454459u, 0xbdafcca3u, 0x3dc118edu, 0xbcae3e63u, 0x3d64ac20u, 0xbcc0771du, 0x3da0c4cdu, 0xbd714097u,
+0x3d334961u, 0xbe0d90feu, 0xbdcc6218u, 0x3d8781b6u, 0x3e0b8071u, 0x3c274aaau, 0xbd8eaa34u, 0x3dbc9ad2u, 0x3c4d41d2u, 0x3e4b06c5u,
+0x3eb7735au, 0xbd4c0393u, 0x3d259838u, 0xbc01f037u, 0x3d503032u, 0xbd07a56au, 0x3d523169u, 0x3cbf1ddeu, 0xbd1c1a47u, 0xbe09e261u,
+0x3e0af186u, 0xbdd0fac6u, 0x3deeedd6u, 0x3c9cdd29u, 0xbdb672ceu, 0xbca9cc02u, 0xbdce2639u, 0xbd2e9f41u, 0x3d3c7b38u, 0x3d5ee7c2u,
+0xbc850dbdu, 0x3cab812eu, 0x3ad9c14du, 0x3d72e5eau, 0xbd1ef75du, 0x3dda96cfu, 0x3d822711u, 0xbdc25e4cu, 0xbd6daa05u, 0xbec039fau,
+0xbeee23cfu, 0x3d247410u, 0xbdef0f85u, 0xbde6d34du, 0x3b702384u, 0x3cdbacd7u, 0xbda811c5u, 0x3e0cc7b5u, 0x3c652b8bu, 0xbd63748cu,
+0x3e1d7a52u, 0x3ddf8cb1u, 0xbcc9050fu, 0x3c7b8530u, 0xbe45ce50u, 0x3e873005u, 0x3d64d190u, 0x3dc7f55fu, 0x3f284cd7u, 0x3dc8fac1u,
+0x3d93af73u, 0x3ee1ed92u, 0xbe32f51du, 0xbd77c427u, 0x3dade887u, 0xbcabdd37u, 0x3e88b5f7u, 0xbe2ed98cu, 0xbdc3fbf1u, 0xbdf5c7c3u,
+0x3e4e4606u, 0xbda23e1du, 0xbdb0c143u, 0xbc94e8adu, 0xbbdabb9bu, 0xbdc7e79du, 0xbdbd2028u, 0x3db4f552u, 0x3d6277fcu, 0xbd9e5b64u,
+0x3de953e7u, 0x3d0743c7u, 0x3d07013au, 0x3df65946u, 0x3d96a2bbu, 0x3effec93u, 0xbe043dfdu, 0x3c47db8bu, 0x3d74648au, 0x3dae1e0du,
+0xbd1f3947u, 0x3c07318fu, 0xbd030b72u, 0x3e1638dcu, 0xbd34fe67u, 0x3d6e1c91u, 0x3d544189u, 0x3eb1f5f7u, 0xbd60b75cu, 0xbe0c6901u,
+0x3ea2a8f7u, 0xbdd5887au, 0x3d841c01u, 0x3f3a1f16u, 0xbeb305e2u, 0x3d0a4bedu, 0x3e02f1cau, 0x3c83d412u, 0x3cc1e868u, 0x3dada12fu,
+0xbd0dcbcbu, 0xbd2139ccu, 0x3de79ff8u, 0x3d072b48u, 0xbcdfe928u, 0xbdb0a0c9u, 0xbda2478au, 0x3c4079afu, 0xbc8965bau, 0xbd7d8bfdu,
+0x3cbe2ba2u, 0xbe172df3u, 0x3d4b3a83u, 0x3bdf1425u, 0xbd18b38du, 0x3d28e5b1u, 0x3ceb36b9u, 0xbe03d330u, 0x3dc4d765u, 0xbdf78719u,
+0x3e89b62eu, 0xbe037da7u, 0xbdc0c282u, 0x3db727deu, 0xbde0779eu, 0xbdaa1963u, 0xbd143022u, 0xbd85458cu, 0xbc8f4f2fu, 0xbea728a4u,
+0x3caf99e0u, 0x3d5f73a7u, 0x3c000cf6u, 0x3d328d50u, 0xbceeef36u, 0xbca20e5bu, 0x3d3f3302u, 0xbdb909e3u, 0x3cb13bd5u, 0x3e014b5bu,
+0x3d9f2834u, 0xbc5ef4f9u, 0xbceecac0u, 0x3d2a31cau, 0x3a09d36au, 0xbd97e3abu, 0x3c899521u, 0xbeaef28du, 0xbcef6f5fu, 0xbde1254eu,
+0x3e075ee3u, 0xbbef6975u, 0x3db8339eu, 0xbcf57525u, 0xbc1fde1eu, 0x3e2f8569u, 0x3e97c74bu, 0xbda58c2eu, 0x3ce83a89u, 0x3d851c0fu,
+0xbd183914u, 0xbd6c1c7eu, 0xbc86fa80u, 0xbb05649fu, 0x3d86a3c9u, 0x3dd03d9eu, 0x3dfa3711u, 0x3d0f7256u, 0x3de66e83u, 0x3d8ca115u,
+0xbddc4cf7u, 0x3deded22u, 0xbd8565d7u, 0x3e5da238u, 0x3b6ff410u, 0xbe8a2556u, 0xbdc66f4cu, 0xbe3bd02bu, 0x3db34bd0u, 0x3e04469au,
+0xbd8935ccu, 0x3d5b3582u, 0x3dd7bd69u, 0xbd665529u, 0xbe34e459u, 0x3d7ef91du, 0x3b4bda17u, 0x3da372afu, 0x3d189e52u, 0xbd639270u,
+0x3d2b6fbfu, 0xbdec144du, 0xbeb16877u, 0x3abf1ce3u, 0xbdc7af23u, 0xbd95a63cu, 0xbdb7340eu, 0xbdbeb5f6u, 0xbb9e3ddcu, 0xbd318f4au,
+0x3cb22b91u, 0xbe35986bu, 0x3db1f059u, 0xbd352b02u, 0xbdea83e6u, 0xbd1a6d70u, 0x3e392bd9u, 0xbde7d4f3u, 0xbdd47be1u, 0x3d815972u,
+0x3f0e739eu, 0xbc692f5au, 0xbd5e7ff0u, 0x3d3be218u, 0x3cd13464u, 0xbb3cd64bu, 0xbe7fcb1au, 0x3da45977u, 0x3d9f7ffdu, 0xbec68620u,
+0xbe75ee77u, 0xbbb220a4u, 0xbdaaeee6u, 0xbcaf015du, 0x3d9696ebu, 0x3db324a1u, 0xbc99af95u, 0xbdd4ec55u, 0x3ccc329cu, 0xbe0aecc8u,
+0xbdd69d50u, 0x3d6681aeu, 0xbd7da822u, 0x3d0f8105u, 0x3e5690a5u, 0xbd302108u, 0x3e35b5e5u, 0xbe20bda7u, 0x3dd14a96u, 0xbe0df270u,
+0x3dc08363u, 0xbe0ceed3u, 0xbe2a1f1fu, 0xbc7f4ca8u, 0xbc0b4fdau, 0x3e043d8bu, 0x3d2879f9u, 0xbdb61cd5u, 0xbd9da89du, 0x3e2c1581u,
+0xbd814e5bu, 0x3d90cf37u, 0xbc824c70u, 0xbc87ced6u, 0xbd8a2c8du, 0xbd901518u, 0x3dac34d8u, 0xbd8c45fbu, 0x3dc91b26u, 0xbe8980d5u,
+0xbe477163u, 0x3eafae1fu, 0x3d09dcccu, 0x3ec0915du, 0x3edde0c4u, 0x3cadc789u, 0xbdd171c9u, 0xbda938e1u, 0x3e3f5b4eu, 0xbdea3a7fu,
+0x3df4029bu, 0x3d3bdadeu, 0xbe91620cu, 0x3ee6769cu, 0x3d933a77u, 0x3e7626e6u, 0xbe253e96u, 0x3cb59d82u, 0xbd0a1801u, 0x3d62cebcu,
+0xbdd87cd8u, 0xbda15b58u, 0xbe6cdef1u, 0x3da0b4a2u, 0xbd24952du, 0x3d0e2651u, 0x3cfadd13u, 0xbd1260e0u, 0xbeb9e888u, 0xbc41a09eu,
+0xbd828d18u, 0x3f008b02u, 0x3da3390au, 0xbd8257d5u, 0xbdc45192u, 0xbc00dd06u, 0x3b7899b5u, 0x3c46a495u, 0xba967e6eu, 0x3e426c1bu,
+0x3e22b2f9u, 0x3d0f16d3u, 0x3e72f0d8u, 0xbe62bf4du, 0x3d7e2299u, 0xbdc09188u, 0x3e5952bcu, 0xbe076eeeu, 0x3dfe641eu, 0xbdd3ba69u,
+0x3e680b72u, 0xbc41d390u, 0xbcac09a4u, 0xbce7c1c0u, 0xbdd6aff2u, 0x3e78ea7au, 0xbd6cd8c1u, 0x3c6033a4u, 0xbe2a44c6u, 0x3e16d5b2u,
+0x3c237f3cu, 0x3d2343f8u, 0xbdcd2479u, 0x3cb5a86fu, 0xbe057ee3u, 0x3c1a40d8u, 0xbc2f0e8fu, 0xbdb51badu, 0xbd99db45u, 0xbcbfd83eu,
+0x3d27b414u, 0x3d0cf4d0u, 0x3d290382u, 0xbdd9d9a1u, 0x3c8d79e7u, 0x3e3483b2u, 0xbd735efdu, 0x3e35ef01u, 0xbd8da854u, 0xbc5393d7u,
+0x3ccc9c82u, 0xbc22c483u, 0x3d2d1a34u, 0xbde34a55u, 0xbc8ef4d7u, 0xbc8edbe1u, 0xbe074dfdu, 0xbd89b854u, 0x3dc66591u, 0xbdfb2f3eu,
+0x3ccb01cbu, 0xbcefcf71u, 0x3d700141u, 0x3d86f694u, 0xbe70587au, 0x3d200a4au, 0x3cb38ca0u, 0xbd9f4838u, 0xbcc38e99u, 0xbccaaa17u,
+0xbc7ab7e7u, 0x3d8f1fcbu, 0x3dbf705eu, 0xbeb11f27u, 0xbe4b48f3u, 0xbe80f7afu, 0x3ec02ccau, 0x3d16f464u, 0x3db9c93eu, 0xbe0dac5eu,
+0xbd1ecaa7u, 0x3e9764cau, 0x3ba58e48u, 0xbe13e963u, 0xbcaa13fdu, 0x3d56abbau, 0xbc943275u, 0x3dd902cbu, 0xbd9e4d4du, 0xbd6e413du,
+0xbdaebfc6u, 0x3ec2a884u, 0xbd46b012u, 0x3dadb741u, 0xbdd86661u, 0x3d9939bdu, 0x3e0429eau, 0x3eef50e6u, 0xbdb9a423u, 0x3c1304d9u,
+0xbd005553u, 0x3ef89eaau, 0x3c9c6d6bu, 0x3e8d826eu, 0xbda58822u, 0x3d3d5668u, 0x3e04b534u, 0x3d743845u, 0x3c6a796fu, 0xbf08e4f0u,
+0x3de61f40u, 0xbb1839dfu, 0x3dd47943u, 0x3c038655u, 0xbd62c1acu, 0x3dabb38du, 0xbcb802e7u, 0xbd95a32eu, 0xbec5114cu, 0xbc6f5893u,
+0xba9473cfu, 0xbb8f2da0u, 0xbe0248f7u, 0xbc5dae5du, 0xbd30895du, 0xbc3e78b0u, 0x3e219d76u, 0xbe9f8a60u, 0x3c88ddadu, 0x3c675ec8u,
+0xbd13b5d3u, 0x3d8eb62bu, 0x3d94fc61u, 0x3e3f71bfu, 0x3d8e3d91u, 0x3da86ab7u, 0xbe51cfa7u, 0xbdb65597u, 0x3db30c0bu, 0xbacfcdb6u,
+0x3e01a3a3u, 0x3d6164f6u, 0x3e883c1bu, 0x3dc08b80u, 0xbda08a2bu, 0x3e5943d6u, 0xbe7d632au, 0x3e00c264u, 0xbea297e6u, 0x3e4c7c24u,
+0xbd26d8ffu, 0x3de933d3u, 0xbd38ef6du, 0x3b87d01au, 0x3e2e8b67u, 0xbd28f665u, 0x3d03b3a3u, 0xbe728b66u, 0x3d862680u, 0xbd9a8011u,
+0x3e5708e3u, 0x3dbefbfau, 0x3e621c15u, 0xbeb4f3e7u, 0x3d6594cdu, 0xbd84cf45u, 0xbd31bf11u, 0x3e3a19e5u, 0x3e003290u, 0xbe479b70u,
+0x3d26b9aau, 0x3e0bf06au, 0xbd0ae86au, 0x3c2bc77du, 0x3e032980u, 0x3d8bcc9bu, 0xbd19eb38u, 0xbcac6412u, 0xbd710f4du, 0x3d53bc9fu,
+0xbc08b22fu, 0xbd602e9bu, 0x3e801326u, 0x3dcde271u, 0x3e1961b6u, 0x3bd913ebu, 0xbe1d95e7u, 0xbcd58a4fu, 0xbd950d53u, 0xbd401b6eu,
+0xbdd52919u, 0xbe0241e7u, 0xbcb688d6u, 0xbdc04ae3u, 0xbdd4e312u, 0x3ce1975fu, 0xbe06fc60u, 0xbda357f5u, 0x3e4defe5u, 0xbe6bb097u,
+0xbd88b4c9u, 0xbdbd1e55u, 0x3ca8c98cu, 0xbcffe2e8u, 0xbe6cd17du, 0x3dbfcc35u, 0xbd248d4cu, 0xbdaf783eu, 0x3e4d9685u, 0xbc063747u,
+0xbd497ea1u, 0xbbae058eu, 0xbd41c428u, 0x3d1d69ffu, 0x3caafd30u, 0x3dcd7473u, 0x3e1089cbu, 0xbe6bfee7u, 0xbde6661bu, 0xbd907ea7u,
+0x3e4bd93eu, 0xbcd26331u, 0xbd3a9c20u, 0x3db6222au, 0x3ce944bbu, 0xbe1bb97cu, 0x3f2274c1u, 0xbdd859e5u, 0x3db1c3cau, 0xbe55cf64u,
+0x3d617ec8u, 0xbc2af087u, 0x3e863251u, 0xbdb996edu, 0x3c1d8bc4u, 0x3eca6c47u, 0xbebfeeeau, 0x3d044883u, 0x3e48fefeu, 0x3cb9fb7cu,
+0xbdb04e38u, 0xbd6d1ce1u, 0xbdf48ac8u, 0xbc2b92dau, 0x3e65c1e1u, 0xbdeb33d7u, 0xbda73046u, 0xbe071137u, 0xbe1afee8u, 0x3bebeadfu,
+0x3dea964au, 0x3a12032cu, 0x3e11448fu, 0xbd28f2d1u, 0x3dc1957cu, 0x3c0e40efu, 0xbdbdbe92u, 0x3de71a4cu, 0xbb79e88eu, 0x3d80e92cu,
+0x3d022e31u, 0xbdb8b034u, 0x3da67b16u, 0xbe48fd2fu, 0xbc30ed56u, 0x3d9faf1eu, 0xbded6285u, 0xbd26b322u, 0xbd496450u, 0x3cb41ce5u,
+0x3cdaf4e6u, 0x3e16733au, 0x3dda27b6u, 0x3dd26ff0u, 0xbd9a97fau, 0x3d842ff7u, 0xbd3c98fbu, 0x3db28641u, 0xbd85cd3bu, 0xbe130eb8u,
+0x3e4d94e5u, 0x3dd55c58u, 0x3da9fd4fu, 0xbd3908e1u, 0x3cba4bcfu, 0xb98c856cu, 0x3d7e7932u, 0xbd30b806u, 0x3e0d504bu, 0xbefe798au,
+0x3e7f4111u, 0xbb95680au, 0x3e2514c4u, 0xbe458a8au, 0x3d877ff4u, 0x3de7174au, 0x3e36242eu, 0x3df87fcfu, 0xbe8ad914u, 0xbd6f027bu,
+0x3d8f55bdu, 0x3dd856bdu, 0x3ddcc51au, 0x3ca71f64u, 0x3d3d0ca3u, 0x3dd7846fu, 0x3dc625c4u, 0x3e069ea6u, 0xbdaaadeeu, 0xbd5b94adu,
+0x3b38178bu, 0x3dddbc99u, 0xbde784adu, 0x3d92c56du, 0xbda3b19fu, 0x3e7d439bu, 0xbdc7825cu, 0x3e97cd9bu, 0xbd0f226fu, 0x3e3ee192u,
+0x3cd5296au, 0x3d578c2fu, 0x3dd9530bu, 0xbd3bfc58u, 0x3e0184f4u, 0xbe1ad939u, 0x3e366b65u, 0x3da12244u, 0xbdf233d1u, 0x3e334551u,
+0xbd65ed83u, 0xbda17e00u, 0xbd1eb941u, 0xbc9fdc38u, 0xbdd106abu, 0x3e0509c8u, 0xbd434101u, 0xbdd4a42du, 0xbc73af30u, 0xbda2cf07u,
+0x3d3c076fu, 0xbcff992du, 0xbe1e1ef9u, 0xbe85e2fcu, 0xbd12a867u, 0xbcdcc6adu, 0xbdabcd62u, 0x3d0b37cfu, 0x3cdbe7deu, 0x3ec2ea7fu,
+0xbde0aa7bu, 0x3d8efe07u, 0xbec3695cu, 0x3ca3d60au, 0x3c95b902u, 0x3db1d4fcu, 0x3d547063u, 0xbe719625u, 0x3ee95d1eu, 0xbe2f8cbfu,
+0x3e0c84aeu, 0xbe417025u, 0xbece71adu, 0xbd763be7u, 0x3e097566u, 0x3dfd27b4u, 0x3d82d977u, 0xbdc1f97bu, 0x3c6f5987u, 0x3cbeb378u,
+0x3d473f22u, 0xbd429cd6u, 0xbd772e55u, 0x3c6ee435u, 0xbd619f14u, 0x3dad425du, 0x3dfba40cu, 0xbd476771u, 0xbdc34b97u, 0x3d8bb3a2u,
+0xbcd1ad3au, 0xbd83e1d1u, 0x3e504a5fu, 0xbe426478u, 0x3e85ce87u, 0xbea49271u, 0xbc94b616u, 0x3ea0a8c4u, 0xbcc1c1b1u, 0x3dd2fe6au,
+0x3d2432f5u, 0x3b59f0a1u, 0xbdab102cu, 0xbd892a73u, 0x3d90a4acu, 0x3d4a4029u, 0x3e3b2905u, 0x3e184a28u, 0xbe7c76f8u, 0xbd33bfbdu,
+0x3d96c115u, 0x3e0e0732u, 0xbc21cc17u, 0xbea2e32bu, 0xbdb8704au, 0xbc500a27u, 0x3d99c9c0u, 0x3e38e478u, 0x3e6fb73eu, 0xbc8ffb11u,
+0x3e096732u, 0x3e0d0cb2u, 0x3de76b5du, 0xbd54e8dau, 0xbe16d3aeu, 0x3def707au, 0x3ccc8f0eu, 0x3a0a2c1cu, 0xbded4282u, 0xbd0af394u,
+0x3d81ec44u, 0xbde49d12u, 0xbde5054au, 0x3c6237b7u, 0xbe29ae54u, 0x3c87d27bu, 0x3cab6108u, 0x3e024076u, 0xbc7681aau, 0x3e0bd042u,
+0x3cdd2a11u, 0x3d4ef885u, 0xbd3704edu, 0x3eef68f7u, 0x3dca76e4u, 0x3d14ed53u, 0x3d922dcfu, 0xbe0884c7u, 0x3db6cd8au, 0xbe9831a0u,
+0x3d1257b3u, 0x3d7ec0bbu, 0x3da5a8c1u, 0x3d22e251u, 0xbe3cd19bu, 0xbd92c573u, 0x3e26d9a4u, 0x3d816ea3u, 0xbd9fd869u, 0x3e415a32u,
+0x3dd234b5u, 0x3db4339du, 0xbdfd52b5u, 0xbd93f658u, 0x3e9ea119u, 0xbe032acfu, 0xbd7e557au, 0xbe9e09c0u, 0x3e4aeeaeu, 0xbdd638d0u,
+0x3ecacf55u, 0xbdccacdcu, 0x3e352415u, 0xbe0d26f2u, 0xbdbd9e8fu, 0xbde6efabu, 0x3e0cefcau, 0xbd06d994u, 0xbdb971b8u, 0x3cd1adfdu,
+0xbd928898u, 0x3cd0c275u, 0xbe138629u, 0x3d8ef169u, 0xbde48df7u, 0xbc8c5651u, 0x3d5b09a0u, 0x3d70a4cau, 0xbd0ddcadu, 0x3decac87u,
+0x3da91836u, 0xbc41230fu, 0x3b9924e9u, 0xbe01e164u, 0x3e615d0eu, 0xbe1c7a46u, 0x3c19414fu, 0xbe115a0eu, 0xbd3b5d2du, 0xbd12338cu,
+0x3cef7e01u, 0x3de3948fu, 0xbe2e85b5u, 0x3d95b689u, 0xbe21e8fdu, 0xbcb1f0dfu, 0xbd945677u, 0xbd950995u, 0x3cd2efa0u, 0xbcbe96c2u,
+0x3dd48db1u, 0xbd910e06u, 0xb9389fa8u, 0x3c1b9bc1u, 0xbe80d239u, 0x3d7e3f82u, 0xbe40053du, 0xbd66105bu, 0x3c9c08b9u, 0xbe013b35u,
+0x3d77d7adu, 0x3de604c1u, 0x3d9f38d2u, 0xbe865b29u, 0xbd8c9a62u, 0xbcc6379du, 0xbe5ad13bu, 0xba5f663du, 0xbca33934u, 0xbe332ccdu,
+0x3e795d7bu, 0xbd88fe64u, 0x3d7d9f36u, 0x3cddd0ccu, 0x3ad5786du, 0x3bfa5ac8u, 0xbdce1bc0u, 0x3e13d253u, 0xbd932ee1u, 0xbea25df5u,
+0x3e1f4498u, 0xbe62d4f2u, 0x3ee5384eu, 0x3dafb661u, 0xbe54f428u, 0x3d9589dau, 0xbe62e7e2u, 0x3cdeac36u, 0xbdb78e2cu, 0xbd8a6d5bu,
+0xbea98fdau, 0xbf1f8ef6u, 0x3e965856u, 0xbd3dcc9bu, 0xbe03a176u, 0x3e7d1550u, 0x3d8dde1du, 0xbd9cda01u, 0x3dcb4c2au, 0x3d0d00a7u,
+0x3dfd6591u, 0xbd863d7cu, 0x3d9512fbu, 0x3b5a6aebu, 0xbda5bf35u, 0x3d91dedau, 0x3d16511bu, 0xbce7ec94u, 0xbcca759eu, 0xbe02a145u,
+0xbe5b0928u, 0x3e10f0d4u, 0xbe3e25a3u, 0x3d4f817eu, 0x3d764641u, 0xbd8d8990u, 0x3d2da378u, 0x3cb14e22u, 0xbd809879u, 0xbca67fd2u,
+0xbdfe4cccu, 0x3db9ba76u, 0x3d9ad4e6u, 0xbea0336fu, 0xbebdb94fu, 0x3d758d58u, 0x3e84447eu, 0x3e0fce23u, 0xbe2216d0u, 0x3d408fd8u,
+0xbdb4930cu, 0x3d9b24c4u, 0x3e035b60u, 0xbe32da6cu, 0x3d7f6cedu, 0x3e66c9d2u, 0xbe2f1c14u, 0x3d6ad2ceu, 0x3e2829eeu, 0xbe82712du,
+0x3defb3dcu, 0x3e0557a9u, 0xbed2038bu, 0x3e8fb079u, 0xbdfa4400u, 0xbed2cfe2u, 0xbc843cebu, 0x3e539e00u, 0xbcbafc00u, 0xbd49c2a8u,
+0xbd01d328u, 0x3c3391eeu, 0x3d476e11u, 0xbebfa87au, 0x3e49205au, 0xbe8c5ec2u, 0x3d30b3ccu, 0x3e2a9178u, 0xbdf72455u, 0x3d1b27f6u,
+0xbd1df24fu, 0xbe303bbfu, 0x3c757359u, 0xbd12da84u, 0xbc6d4779u, 0xbe587054u, 0x3d248f2cu, 0xbe887015u, 0x3e433af7u, 0xbd9edf07u,
+0xbc3c96e9u, 0xbde8fac6u, 0xbef09975u, 0x3e8ed77bu, 0x3dc39b52u, 0x3db63eb4u, 0x3e6e09b9u, 0xbe2b14e9u, 0x3cb5e5c6u, 0xbc35e53du,
+0x3c15be48u, 0xbd877eb1u, 0x3db90d0cu, 0x3e0ade8au, 0xbe23b39au, 0x3ad46a6bu, 0x3e3f7127u, 0xbe7912c8u, 0xbdb4c2eeu, 0xbdd9b5b2u,
+0xbea2b719u, 0x3dba8a39u, 0xbc38982fu, 0x3e9b63f4u, 0x3bb32954u, 0xbcbb5a74u, 0x3d86c241u, 0x3d4c47c8u, 0xbd9fddebu, 0x3f0fd6a1u,
+0x3c09cbbeu, 0xbe0b5351u, 0x3bbda72cu, 0xbd82a2ceu, 0x3da6b601u, 0xbd50c20cu, 0x3c89c431u, 0xbe9868fbu, 0x3ebf7a76u, 0xbdcacb21u,
+0xbca279bbu, 0xbf1d70bbu, 0x3ddbb5c2u, 0x3cc6bd9fu, 0x3d278f35u, 0x3d5905bcu, 0x3ddb6d7fu, 0x3e2e55b7u, 0x3d83fbe7u, 0xbd8b5e7au,
+0x3e300ccfu, 0x3d5bfcc3u, 0xbd72bb5cu, 0x3dff92f8u, 0xbd8f3ebfu, 0xbea500c9u, 0xbed50b15u, 0x3d0300a8u, 0x3e254ccdu, 0xbd929509u,
+0xbe301d00u, 0xbd559aeeu, 0x3da03decu, 0x3cd7a7d6u, 0xbdc71c26u, 0xbc93b956u, 0xbcf56edbu, 0x3d28c138u, 0xbdc3b775u, 0x3db2d9e3u,
+0x3dfac7afu, 0xbe456e69u, 0x3dc5e16eu, 0x3d9962fdu, 0xbe6dfafdu, 0x3e4a7823u, 0x3d9d4746u, 0xbdb0909bu, 0x3d2523d7u, 0xbdb0900bu,
+0x3e64d6acu, 0xbe59d4b8u, 0xbe155c75u, 0x3da353a3u, 0xbeae4d4eu, 0xbe3c68ebu, 0x3da51e6eu, 0xbdbb6939u, 0x3d436dd8u, 0xbe2e6622u,
+0xbd5e2862u, 0x3da822c9u, 0xbebef47eu, 0x3c20eb9cu, 0x3d11896du, 0xbe02d154u, 0x3c5121d5u, 0xbd830744u, 0x3d60ceecu, 0x3c90948cu,
+0xbe7ee0aeu, 0x3ed5ac17u, 0xbdeb1902u, 0xbe2347a2u, 0x3e5c808au, 0xbe121f2bu, 0x3dc7b6eeu, 0x3df5fa85u, 0xbe1708e9u, 0xbda93f79u,
+0x3e953a78u, 0xbe419e3au, 0xbdc1df6au, 0xbc4e03dau, 0xbced578du, 0xbdfc71c1u, 0x3eaf2e12u, 0xbe23915bu, 0xbe3790a5u, 0x3e8619d5u,
+0xbdd866c7u, 0x3dd45ed7u, 0xbe1e0419u, 0x3dab26adu, 0x3e12fcdeu, 0xbd7b8a7fu, 0xbc3f308eu, 0xbe562f4cu, 0x3ed4baf7u, 0x3e910a97u,
+0x3d82ecc1u, 0x3d1c2262u, 0xbe7cde2du, 0x3de298b0u, 0xbe76bd18u, 0x3ea3db51u, 0xbe3958a7u, 0xbe1b7f90u, 0x3eed2c1eu, 0x3d7dab01u,
+0xbc2fc6e5u, 0x3e223eb2u, 0x3d849e86u, 0xbd3caa5au, 0x3d25a085u, 0x3bfddd38u, 0xbe73649fu, 0xbddab718u, 0x3d9514d1u, 0x3d661fc3u,
+0xbe3df5f8u, 0x3e4c5e1du, 0xbe91b0a8u, 0xbcd15066u, 0x3e6ebd72u, 0xbec8415cu, 0x3e49c7a8u, 0x3d915ed4u, 0xbe38e7b1u, 0x3dca004du,
+0x3d9a1f76u, 0xbe841e06u, 0xbca5fa3fu, 0x3e524b26u, 0x3e0787acu, 0xbc983000u, 0xbb2bafafu, 0x3dbe2e75u, 0x3e246784u, 0x3e71d11au,
+0xbe9fa7b1u, 0x3d45107au, 0x3b9e7a02u, 0xbe00a4e1u, 0xbe997746u, 0x3e0ef2a1u, 0x3cdfcac9u, 0x3daca50bu, 0x3dafbb6bu, 0x3bb0074fu,
+0xbaafca5fu, 0x3e892896u, 0xbe474523u, 0xbc2b6c15u, 0x3cb0240au, 0xbe3af0b8u, 0x3e18d832u, 0x3c3943aau, 0xbde1b036u, 0x3e350806u,
+0x3e2092cfu, 0xbf204770u, 0x3dc05cdbu, 0x3d7863c3u, 0xbe5d3ffau, 0x3e5f5949u, 0xbea03514u, 0x3bc4c91du, 0xbc156709u, 0xbec10337u,
+0x3d05f7eau, 0xbdf6c9e7u, 0xbe205e7au, 0xbd20b7f3u, 0xbd93ce9cu, 0x3d9f347eu, 0xbd0e73f2u, 0xbcdff3dfu, 0xbda39969u, 0x3d7d57cfu,
+0x3cae37d1u, 0xbcb38800u, 0xbd08ede0u, 0xbe449a00u, 0xbe3b4aadu, 0x3eae013bu, 0xbd356654u, 0xbd570e13u, 0xbed4ed9du, 0x3e372012u,
+0x3d68e70du, 0xbe28e80eu, 0x3dea82f7u, 0xbdceedf3u, 0x3e541535u, 0xbc4695efu, 0x3e419d4cu, 0xbef576b9u, 0x3dd14784u, 0x3b591e9au,
+0x3dbae25au, 0xbc9277d2u, 0x3d3aa4d0u, 0xbda6e728u, 0xbe179e3cu, 0xbd5287cfu, 0xbb729ebcu, 0x3cd27b89u, 0x3d03343eu, 0x3c201232u,
+0x3e264bbfu, 0x3d689d66u, 0xbe218bd3u, 0xbc653719u, 0xbe23f658u, 0xbd413797u, 0xbdaa7cdcu, 0x3d4c64d7u, 0x3de0c496u, 0xbd89cd81u,
+0x3c61b229u, 0xbe2381a3u, 0x3dafca80u, 0xbd04e923u, 0x3eacd6cdu, 0x3e5380e4u, 0x3d625578u, 0x3e34b01au, 0xbdbae202u, 0xbdab6301u,
+0x3e44114au, 0x3ccb24efu, 0x3d9dbc90u, 0xbe61e13au, 0xbdf8b483u, 0xbd4fca2au, 0x3df64524u, 0xbc9dc308u, 0x3d8fbf52u, 0x3dcfd21au,
+0xbcfe7d3cu, 0xbe12d141u, 0xbe8616a2u, 0x3dbc4aaau, 0x3d9a9ac4u, 0x3bf78e1fu, 0xbe6fe7d7u, 0x3b766572u, 0xbdd527abu, 0x3d3905f9u,
+0x3c180ec6u, 0x3c3069b3u, 0xbd3a20c1u, 0x3d1e9595u, 0xbc92be30u, 0xbabb6aeeu, 0x3d2e1cc1u, 0xbe49f768u, 0xbd044d2eu, 0xbdeb5f1fu,
+0x3eaae9e8u, 0x3e39592eu, 0xbd3b503cu, 0x3ae69bd3u, 0xbd8ae746u, 0xbcc2f432u, 0x3bd6cd3au, 0xbdf7b66au, 0xbe2778dfu, 0x3ea8fdb3u,
+0xbe11e581u, 0xbd38143eu, 0x3d6c2bb8u, 0xbc5a2eb6u, 0x3d4f63dfu, 0xbdeb4d7cu, 0x3d9d9013u, 0xbc38cec2u, 0x3d5af5f3u, 0x3cc0371eu,
+0x3b9d2c35u, 0xbe095e2fu, 0x3da3e7c1u, 0xbce36724u, 0xbd2a02b5u, 0x3d7adf8bu, 0xb8cdfe7au, 0x3d75bce2u, 0xbe198d9fu, 0xbde9df0au,
+0xbcccf999u, 0x3e1d7986u, 0xbbd9ad9eu, 0xbdcd915du, 0xbd27f963u, 0x3c9e2176u, 0x3e929d2cu, 0xbd6ca788u, 0xbd52a5a2u, 0x3d419180u,
+0xbd9b235au, 0xbb98053fu, 0x3c827ac9u, 0x3d03e9d8u, 0xbda38015u, 0x3eb2b689u, 0x3cf42f7fu, 0x3dae897du, 0x3dfaedc5u, 0xbc0c3608u,
+0x3cde6173u, 0x3ee3ce17u, 0xbde1fbc8u, 0xbdaf9252u, 0x3f0ec73du, 0x3ec95485u, 0x3d6dfc31u, 0x3cea302au, 0xbe0915d6u, 0x3d72bacdu,
+0xbdba544eu, 0x3d84d3d4u, 0xbbb6808fu, 0xbdc66c84u, 0x3de2d246u, 0x3d56959au, 0xbd549f82u, 0x3e1d2c13u, 0xbc1bb6b2u, 0x3cdcb57fu,
+0xbd8d18a5u, 0x3d188ccau, 0xbe79ea5bu, 0xbe30939eu, 0x3d06e798u, 0x3ae3ae20u, 0xbdd8ec2bu, 0xbc213879u, 0x3cd2e901u, 0xbdeb1b35u,
+0x3e442346u, 0xbe95c740u, 0x3e2a6147u, 0xbd1b5803u, 0xbe26569fu, 0x3d20b17eu, 0xbd4a72dau, 0x3da3b202u, 0x3db3ea1bu, 0x3dec44e2u,
+0x3e46c7e0u, 0xbd83b52eu, 0xbd2d8c50u, 0x3dc8d423u, 0x3db8ef96u, 0x3e0bd2aau, 0x3d8cd866u, 0x3e222d73u, 0xbde87776u, 0x3ed72216u,
+0xbe8b9a7eu, 0x3d7b501du, 0xbddea30bu, 0x3ca7b2c4u, 0xbcacb2d3u, 0x3e0a9235u, 0xbd9fbb34u, 0x3bacddd2u, 0x3c5d9dcfu, 0xbbfc5f0cu,
+0x3cd61da4u, 0xbd5748feu, 0xbd2f2041u, 0xbe06e7a8u, 0x3ea79233u, 0x3e37467du, 0x3e82a621u, 0xbe9b4f94u, 0x3d0d9a6cu, 0xbd64d17du,
+0xbde185f5u, 0x3a79741fu, 0x3e33ca15u, 0xbe7269cbu, 0x3cbbaa80u, 0x3e1fa49fu, 0x3d33610bu, 0x3e357784u, 0xbb263639u, 0x3d1e0445u,
+0xbd2ce5f5u, 0x3c8297dfu, 0x3e28adefu, 0xbe0e457bu, 0x3c688173u, 0x3e18058fu, 0xbdbafd1eu, 0xbe93179bu, 0x3e4d2137u, 0x3cf27e1fu,
+0x3e6ed4e5u, 0xbe740cb9u, 0x3ac817a4u, 0xbc61012eu, 0x3ebfd4d9u, 0xbe91a92fu, 0xbda99831u, 0xbead7c45u, 0x3e2d79deu, 0xbe1fe0bau,
+0x3e229672u, 0x3d87a92bu, 0xbe98a010u, 0x3d21ac43u, 0x3c384f85u, 0x3e11c472u, 0x3d28caccu, 0x3debc374u, 0x3e3297aau, 0xbdc38a56u,
+0x3da6e13bu, 0xbe11f26du, 0x3d6a16dcu, 0xbe3032fbu, 0xbe2a3389u, 0x3e92d1ceu, 0xbe937f63u, 0xbd6717a9u, 0xbe861a98u, 0x3d98151du,
+0xbe0304a1u, 0xbdfaf9e3u, 0xbd5f47d4u, 0xbdfdddb6u, 0xbd94deb1u, 0xbd5783c9u, 0x3daee300u, 0xbdb90e98u, 0xbde367b3u, 0xbda4035cu,
+0x3e2ac7fau, 0xbe224daau, 0x3d33e5a9u, 0x3e95ea07u, 0xbdab32f7u, 0xbd01057cu, 0xbe110724u, 0x3e1ec092u, 0x3db07464u, 0xbe9add29u,
+0x3e4df6c8u, 0x3c807d85u, 0xbd931bb5u, 0xbe6d6801u, 0xbcaedba8u, 0x3eba4c57u, 0xbe0a0712u, 0xbe7316beu, 0x3f799493u, 0xbe96e56du,
+0xbcb349d1u, 0xbdd16cbcu, 0x3b89a7b0u, 0x3b241da6u, 0xbd30abc2u, 0x3ce0f52cu, 0x3d2614ddu, 0x3cb29676u, 0x3debe25bu, 0x3cc351d8u,
+0xbe18a3d5u, 0x3e12fc75u, 0x3da89fc2u, 0xbd7debd4u, 0x3e4021e4u, 0x3dc917d8u, 0xbe3324b3u, 0xbcbe8c4eu, 0x3e670bc8u, 0xbe48f524u,
+0xbdc942f0u, 0x3d81b1a6u, 0x3e27156eu, 0x3d98dcb0u, 0x3e6ebe64u, 0xbe3f7a34u, 0x3e5e3264u, 0xbdc46431u, 0x3e07530bu, 0x3abda37eu,
+0x3e2465a6u, 0x3e7e0aa7u, 0xbd1c5fdau, 0x3d87cd5bu, 0x3e7e8515u, 0xbd3b6427u, 0x3db64cc7u, 0x3d10813bu, 0xbda26e80u, 0xbdf91f13u,
+0x3d1c1e79u, 0xbc860289u, 0xbde97c1au, 0x3e10e040u, 0xbdd201adu, 0xbd7465b1u, 0x3eb1995du, 0xbde851dfu, 0xbd8ed966u, 0xbe51b896u,
+0x3cfb0ef7u, 0x3e16600fu, 0x3e5c0784u, 0x3e627b6cu, 0x3e217593u, 0xbbdb9ca7u, 0x3dd52228u, 0xbd1053f6u, 0x3ecb82d0u, 0xbebc8201u,
+0xbd35298du, 0xba950524u, 0x3d80f4f8u, 0xbd8164bfu, 0xbe1c4111u, 0x3ddc9555u, 0x3d82267fu, 0xbe7fe8d4u, 0x3e92d0d0u, 0xbe9d6e91u,
+0x3e5956cfu, 0x3ebd3de3u, 0xbda31a93u, 0x3f1f53dfu, 0x3c5d605du, 0xbdc3b858u, 0x3e804bb2u, 0x3c600ae3u, 0xbd81b257u, 0x3e813cd8u,
+0x3e1750a5u, 0x3c9d7515u, 0x3c1defafu, 0x3db20748u, 0xbd301608u, 0xbe13d394u, 0x3d18507au, 0x3c50d6fcu, 0x3d4c5aefu, 0x3d8a1dbfu,
+0x3d2c52a1u, 0x3c7f0cbau, 0x3e0b1a7au, 0x3db2409au, 0xbdd051bfu, 0xbe03a8d4u, 0x3d68fb03u, 0x3d73de0au, 0xbef1423bu, 0x3cf3bc26u,
+0xbd8a33dfu, 0x3e312fa1u, 0xbd3b5cf2u, 0xbe60b3e9u, 0x3d440844u, 0x3d860263u, 0xbe17e7afu, 0x3dbb839fu, 0x3e237dafu, 0xbd9657c7u,
+0xbd1508c3u, 0x3f09661cu, 0x3e86caadu, 0xbe5153bcu, 0xbe06ea28u, 0xbde4691cu, 0xbd1e365au, 0xbd6b6efau, 0xbd1cd9d4u, 0xbe46cea2u,
+0x3ea52a40u, 0xbe8ed83eu, 0x3e1d0adau, 0x3e5e0c2au, 0xbed4cc71u, 0x3df11f6cu, 0x3cf486dcu, 0xbe9b0362u, 0x3ea614cfu, 0x3dd9d28bu,
+0xbe4237cfu, 0xbdc621c7u, 0xbda51a80u, 0x3ef1458eu, 0x3de1dc26u, 0x3d99e177u, 0x3c89e961u, 0xbceeb66fu, 0xbdce498eu, 0x3cafbf54u,
+0xbe2f72adu, 0x3e9a77f7u, 0xbe614099u, 0xbe2c25c7u, 0xbe28e457u, 0x3d494db3u, 0x3ca1c1dau, 0xbdeeff19u, 0x3e055250u, 0xbd9c3cd1u,
+0xba92fbbcu, 0xbeb8ec2cu, 0xbe24495bu, 0xbe13dc1cu, 0x3d6efa7fu, 0x3e06a1e7u, 0x3ce743d8u, 0x3dc3437eu, 0xbdf531f6u, 0x3e1ab9feu,
+0x3db93bc9u, 0x3e5cbf4au, 0xbe5d4cb6u, 0x3e3f0991u, 0xbe6d6528u, 0x3dc9e58cu, 0x3e8cdd39u, 0x3c1f41a5u, 0xbea3862du, 0xbeade4aau,
+0xbdd2076bu, 0x3e99ccf8u, 0x3e1f026cu, 0x3d3b6b7eu, 0xbed8840fu, 0x3e05a3b9u, 0x3dd8fb63u, 0x3e00669du, 0x3ed7110bu, 0xbcebc19fu,
+0x3cd2af02u, 0xbdf23ab6u, 0xbe5f2e4cu, 0x3e047ad8u, 0x3da32befu, 0xbcfd7157u, 0x3b1836a6u, 0xbc734281u, 0x3dd7a00fu, 0xbcc23a49u,
+0x3cf99c9eu, 0xbda494ebu, 0xbdff5d3eu, 0xbe4ab34au, 0x3dc959c6u, 0xbdd2a71bu, 0xbd8a2519u, 0xbcb51221u, 0x3d99345bu, 0x3da0e3fdu,
+0xbda7af77u, 0x3e0506b0u, 0x3e56137eu, 0xbd563408u, 0x3d05f31bu, 0xbf0b9d99u, 0x3e122c13u, 0xbd9bd222u, 0x3dd7ccb8u, 0x3e86cbcfu,
+0x3d6047d4u, 0xbd4dae58u, 0x3d3ad861u, 0xbe4ae1a7u, 0xbe4ff5d4u, 0xbe32185au, 0x3d803d32u, 0x3dd9f2fau, 0xbccacce0u, 0xbd3407d5u,
+0x3ea873aau, 0x3da187ecu, 0x3e20d020u, 0xbb8b9899u, 0x3d30335eu, 0xbc3a6364u, 0x3cda2d9du, 0xbd475572u, 0xbc71a9f7u, 0x3ccc8c58u,
+0x3c90da3bu, 0x3e1ad527u, 0x3e37ad75u, 0x3d410464u, 0xbdb91a7du, 0xbdec6192u, 0x3a4e909eu, 0xbdef1c96u, 0xbcff6b6bu, 0x3e2b9dd8u,
+0xbb15cf9du, 0xbec1e407u, 0xbcb63e94u, 0x3cf9d82du, 0xbd123acfu, 0x3c91c806u, 0x3d3300b2u, 0x3cf8c12fu, 0xba203620u, 0x3dc05337u,
+0x3e3c2b19u, 0xbd034768u, 0x3b8bb17cu, 0x3bd74c0du, 0x3ddf8bf4u, 0x3d7ca67cu, 0xbd836425u, 0x3c8242eau, 0x3e2c4c70u, 0x3e2080fbu,
+0x3e1859e6u, 0x3d4a67b7u, 0xbdacba76u, 0xbda01111u, 0xbdd1e6e1u, 0x3dc9d8a4u, 0x3cad8fe5u, 0x3d99ab72u, 0xbe28f1dau, 0xbc136894u,
+0xbde83f3du, 0x3d1685e4u, 0x3e2d5c73u, 0x3def24eau, 0xbc1f7943u, 0x3e2ea467u, 0x3de776eeu, 0xbd426b0du, 0xbdca0155u, 0xbdedf0dfu,
+0xbdd4895eu, 0xbdd67cd9u, 0xbe2208ddu, 0x3e2422d0u, 0xbd4b8824u, 0x3e59d194u, 0xbe985126u, 0xbea070f5u, 0x3dc5c171u, 0xbe88e259u,
+0x3e7071feu, 0xbe0b81f5u, 0xbe500d0du, 0xbd229484u, 0x3e31393fu, 0x3efa2683u, 0x3e97b489u, 0x3dbb3831u, 0xbc902476u, 0xbcd5ba55u,
+0xbe618c89u, 0xbdcbb3cbu, 0xbd63ea96u, 0x3ec13535u, 0x3e3b6773u, 0xbd8b99e6u, 0x3dcdd481u, 0x3ebf7995u, 0x3e114c21u, 0x3d92ae4fu,
+0x3ea78f19u, 0xbd58d98cu, 0xbe750995u, 0xbc91cbcau, 0x3e19e37eu, 0x3a3fccc6u, 0x3d6cb128u, 0x3b6bd6f3u, 0xbeb02333u, 0xbd9c7231u,
+0xbd443784u, 0x3e8c0c63u, 0x3d390370u, 0x3c7f25dau, 0x3c347c15u, 0xbe338afdu, 0xbd2757eeu, 0xbeafbb67u, 0xbda0d106u, 0xbdce36b4u,
+0xbc2ce882u, 0x3e0f784fu, 0x3d4be987u, 0x3d318231u, 0xbe28aec3u, 0xbea619acu, 0x3d601fe1u, 0xbe5ed8e6u, 0xbdcf5213u, 0xbd1f110eu,
+0x3b3ca1f9u, 0x3e36b632u, 0x3d29c112u, 0xbe1309a5u, 0xbe8d9f23u, 0x3e216110u, 0x3e0984acu, 0xbc344c94u, 0xbe863c6eu, 0x3f528100u,
+0xbdba9027u, 0xbcf69211u, 0xbe35ada3u, 0xbe1747a8u, 0x3e7b4295u, 0xbdb10f94u, 0xbe99c6fcu, 0x3efd4600u, 0x3f1d300bu, 0x3e2a15c3u,
+0xbe8ba7d9u, 0xbd757e41u, 0x3e176b11u, 0x3c672a2eu, 0xbd95e76cu, 0x3e2d9821u, 0x3d03f0efu, 0xba01c79eu, 0xbea22d45u, 0xbb7813abu,
+0xbe0276ebu, 0xbc5fda52u, 0xbdc25f1bu, 0x3e49bcedu, 0x3dbd01b2u, 0xbdf624abu, 0xbeb80db9u, 0x3deef6b2u, 0x3e38fd3eu, 0x3e8089bfu,
+0x3dbfecbbu, 0xbd0f5d0eu, 0x3e4414f6u, 0x3d8f009fu, 0x3cd530aau, 0xbe841e7du, 0x3da85074u, 0x3e119626u, 0x3c28daf7u, 0xbd8cbd8bu,
+0xbe5c41c9u, 0x3d8660b7u, 0xbd3d65feu, 0x3e11f7a4u, 0x3def621du, 0x3e4db09cu, 0xbcd6bb09u, 0xbc98747eu, 0x3d8eab4du, 0x3d474531u,
+0xbe8d1ebfu, 0xbde631aau, 0xbe3da39au, 0x3df6cb54u, 0xbe14a089u, 0xbb8084f0u, 0xbea78de5u, 0xbd88c0e0u, 0x3cdded76u, 0xbdc1153eu,
+0xbb99cad2u, 0x3dde001bu, 0x3e7e05abu, 0x3e311645u, 0xbd9b487eu, 0xbe31ec21u, 0x3df14841u, 0x3d5ec8e2u, 0x3e9058efu, 0xbda6dcc4u,
+0xbdc2792au, 0xbe7e7085u, 0xbead5b40u, 0x3d8b19e8u, 0x3e1502b8u, 0x3e2c3c69u, 0xbe1af06fu, 0xbca73407u, 0x3e2fcb3eu, 0x3ce72dfbu,
+0xbe2fd740u, 0xbd14e0afu, 0x3e0149c0u, 0xbc331254u, 0x3d136b26u, 0xbd6439fbu, 0xbd715ec6u, 0xbe0e8f46u, 0xb9dd9467u, 0xbe17a928u,
+0xbd850239u, 0xbd90ce7cu, 0x3d7fe6edu, 0x3d71254fu, 0xbd77b1c9u, 0xbdee14ceu, 0xbdb3fdd7u, 0x3e8c6774u, 0x3e91ff55u, 0x3e6f30e0u,
+0xbe1af119u, 0x3d04d314u, 0xbce15362u, 0xbdab2c5cu, 0x3d56c727u, 0xbe862958u, 0xbdad6e3du, 0x3ec860cbu, 0x3cbe145au, 0xbd99bedau,
+0x3e30ec30u, 0x3d2847edu, 0xbd87d176u, 0xbc7dac99u, 0xbc86e8f5u, 0x3dd9c57au, 0xbd439bc9u, 0x3e297a05u, 0xbdfd3fceu, 0x3d3c8a66u,
+0x3c12a743u, 0xbc998f3fu, 0xbc3988f2u, 0xbbc7740fu, 0x3db35ebdu, 0xbe8e05afu, 0xbe872e68u, 0xbe19c910u, 0x3de070d6u, 0x3ddb49f1u,
+0x3e1d2efau, 0xbd533928u, 0xbd391fe5u, 0x3e58bd0du, 0x3dc5eaf1u, 0xbe8002e6u, 0xbe0a9783u, 0xbd89575du, 0xbd0892b4u, 0xbd06698fu,
+0xbdda6eafu, 0xbd067c48u, 0xbe2c82c8u, 0x3e4b7d1bu, 0x3dba3b8bu, 0x3dc484a5u, 0xbe231120u, 0xbd07cf01u, 0xbdfb6547u, 0x3e878205u,
+0x3e4aa5deu, 0x3e3bb700u, 0xbe584776u, 0xbf12ff1eu, 0xbdf2680eu, 0xbe586ea3u, 0x3e288eacu, 0x3b8ef8e8u, 0x3ba02f7au, 0xbcc5405bu,
+0xba01c1c3u, 0xbddaa883u, 0x3e2cfe43u, 0xbde94209u, 0x3e136e5du, 0x3aac29d7u, 0xbc73210bu, 0x3cea81c9u, 0x3d55416au, 0xbce9aa0au,
+0xbe365787u, 0xbe292f0fu, 0x3db41e1fu, 0xbaa5ee3cu, 0xbe2dc4ceu, 0xbced912fu, 0x3dc31cd4u, 0x3d15c311u, 0x3ce2ebfcu, 0xbe3cb0f7u,
+0x3e673924u, 0x3c7a902cu, 0x3d47d923u, 0xbd1e7563u, 0x3d502a66u, 0xbde83450u, 0x3e238941u, 0x3de667a5u, 0x3e6d2313u, 0xbe40a02bu,
+0xbdac3bbau, 0xbdb23bc6u, 0x3dd0df14u, 0xbef01d6eu, 0xbdd231cfu, 0x3d460cfcu, 0x3ea00757u, 0x3ebd3bdcu, 0x3f0793e1u, 0x3ddd9aefu,
+0xbd8b80b0u, 0xbe8de7dbu, 0xbd08a3bfu, 0x3dc207bau, 0x3cedaa43u, 0xbe154e1bu, 0xbd597273u, 0x3cc82c45u, 0x3d1747d4u, 0xbe95b5b2u,
+0xbe0f4e9eu, 0x3dceab65u, 0x3ea369dau, 0x3e8230d2u, 0x3de1b966u, 0xbf80c687u, 0x3cd00203u, 0x3d4dccfau, 0xbe1c7c62u, 0x3d510f4au,
+0x3e375b76u, 0xbe1830a4u, 0x3e4d38f0u, 0x3bc51a8au, 0xbce323b5u, 0xbe6743beu, 0x3da015b7u, 0x3d5780bdu, 0x3d26c6ecu, 0xbc39b43fu,
+0x3e1ebef1u, 0xbdab273bu, 0x3ce79724u, 0xbe2e80a7u, 0x3da284ccu, 0xbd71044au, 0x3e93f1bfu, 0xbe178b3cu, 0x3d66e602u, 0x3d3deec4u,
+0xbde6f905u, 0xbea5059bu, 0x3e81aa0du, 0xbe8e294bu, 0x3e05122eu, 0xbe4651b3u, 0x3af5df3au, 0xbb8bac62u, 0x3cfe0813u, 0xbde701c8u,
+0xbec48219u, 0xbd436008u, 0x3c502406u, 0x3d75f43cu, 0xbe247102u, 0x3d2900f5u, 0x3ca3396fu, 0x3dae97ccu, 0x3dbdb14bu, 0x3dc09703u,
+0x3e827c6du, 0xbdd735aeu, 0xbc87fd1eu, 0x3dcd568au, 0xbd8ad2fdu, 0xbc283621u, 0xbd9bc613u, 0x3e0419aeu, 0x3d122653u, 0x3e1993f5u,
+0xbdac74cbu, 0xbdbcfb93u, 0xbd36bea6u, 0x3ccbd2b6u, 0xbd2e1fedu, 0x3d64446au, 0xbc7e6ef8u, 0x3f2bf151u, 0xbf69014cu, 0xbc580973u,
+0xbeb0295bu, 0xbd3f3694u, 0xbcaca2e9u, 0xbdfb6b84u, 0x3e8e5acbu, 0xbd4ea829u, 0x3da6e8e6u, 0x3b6d86aau, 0x3e70d510u, 0xbd475f07u,
+0xbdbd29c8u, 0x3cc29397u, 0xbdc005f4u, 0x3e62dc4au, 0xbdf9993bu, 0xbced1ccfu, 0xbe002ecbu, 0x3c28afe2u, 0x3c9ad173u, 0xbd8ce6aau,
+0x3dd3da05u, 0xbc2291dfu, 0xbd87d4feu, 0x3d9abb7fu, 0x3dab38b6u, 0x3c42011cu, 0x3da1f29cu, 0xbc00b0c0u, 0x3c808820u, 0xbc7da8aeu,
+0x3ce88bbfu, 0x3d4e6ec7u, 0xbda48f0fu, 0xbd389fc0u, 0xbe0ff7cdu, 0xbcf3041au, 0x3b18768bu, 0xbde841f0u, 0x3dac8b09u, 0x3cd8e9bcu,
+0x3d9bce12u, 0x3d40fddau, 0xbd48332du, 0x3ec92d2fu, 0x3d8e388fu, 0xbda911d5u, 0x3daae435u, 0xbd9660a6u, 0x3d2e4a08u, 0xbe01a733u,
+0xbbc5af3eu, 0xbc98d480u, 0x3e2955f2u, 0xbdfd13c6u, 0xbc658de5u, 0xbb65e775u, 0xbc416bb1u, 0xbc267c67u, 0xbde0de94u, 0x3e138f64u,
+0x3e4c1ca5u, 0x3e2bd6a3u, 0x3d59d206u, 0x3dd372c7u, 0xbda59497u, 0xbd262b5fu, 0x3d81049fu, 0xbd3d6a63u, 0xbd4f634cu, 0xbcd0b2cfu,
+0xbe00c259u, 0x3d3ea232u, 0xbab1d0f9u, 0xbcacf086u, 0x3c61120au, 0xbe09a1e0u, 0x3db4fff1u, 0x3d8fdfccu, 0x3ed0ec4eu, 0x3e027d75u,
+0x3cd50cafu, 0xbd22048eu, 0xbd39627eu, 0x3ba81986u, 0x3e19e867u, 0x3e0b6a1fu, 0xbdef2db6u, 0x3ecab0e2u, 0x3db547e1u, 0x3dc95058u,
+0xbd301369u, 0x3d6cce85u, 0xbd14dcf4u, 0x3da277cfu, 0xbec5f2d2u, 0x3e33ed34u, 0xbe1f98cfu, 0x3e20c307u, 0x3dee624au, 0x3d8cda4fu,
+0x3cbbe4ddu, 0xbdc5813bu, 0xbd877529u, 0x3da75445u, 0x3d15f40fu, 0xbd8dea96u, 0x3c90794cu, 0xbdbeeda8u, 0x3e02c5f1u, 0x3b7ab8d8u,
+0x3d14b14cu, 0x3def875du, 0x3d2ec1a1u, 0x3d4afbbbu, 0xbe695f8eu, 0xbdf69f61u, 0x3d96dacfu, 0x3ca31b88u, 0xbd98e577u, 0xbccc1eb1u,
+0x3dd7ddb7u, 0xbe1a17f4u, 0xbc34bcf7u, 0xbeb42495u, 0xbe96d76cu, 0xbbfa8e10u, 0x3e1570a9u, 0x3b2571a7u, 0xbc8d4a68u, 0xbe26571du,
+0xbe1a8d19u, 0xbad41158u, 0x3e82d12du, 0xbcda2274u, 0x3c4f0c69u, 0xbd13fda8u, 0xbdb15ad8u, 0x3dd9e96cu, 0x3e01d5b5u, 0xbe03b85au,
+0x3dfbad11u, 0xbe0f18a8u, 0x3dc56b9cu, 0xbcc340f7u, 0x3da5fd32u, 0x3e5daf30u, 0x3d632a0du, 0x3cba7496u, 0x3d12d856u, 0xbdc45786u,
+0xbd550435u, 0x3ebc5708u, 0xbdd4c66bu, 0x3d95c987u, 0xbe300244u, 0x3df77855u, 0x3d9f8667u, 0xbf068af8u, 0x3d1fa7b5u, 0xbe25fecau,
+0xbc179d69u, 0xbe7a9dabu, 0x3e29d23eu, 0xbde32b43u, 0x3cf79234u, 0xbd02c10cu, 0xbc2a1457u, 0x3b8784abu, 0xbb430c08u, 0xbe2bc970u,
+0x3e4022efu, 0xbce62cefu, 0xbcc8e3b2u, 0xbcea04efu, 0xbc415b69u, 0x3dee9f17u, 0x3cd78c0fu, 0xbd164dccu, 0xbf28ecc0u, 0xbdf36c39u,
+0xbc4f90cau, 0x3ea36c8cu, 0xbd9b37b2u, 0x3d9f2e07u, 0x3dd19b9eu, 0x3b415146u, 0xbddbf674u, 0xbe478e3eu, 0xbd101d34u, 0x3e063571u,
+0x3ccf8f0eu, 0x3c98752cu, 0xbd69a3e1u, 0xbd84316cu, 0x3d8eb472u, 0xbd9dd293u, 0xbdad6a69u, 0x3d845e00u, 0xbd04cc97u, 0x3db95bebu,
+0xbc5d01e5u, 0x3e01ca0au, 0xbe2a3702u, 0x3e2625adu, 0xbd838be0u, 0x3eb4c5b4u, 0xbefd57d0u, 0xbd571ec0u, 0xbdae9393u, 0x3dc5d7beu,
+0xbe1b80e2u, 0x3db67ffbu, 0xbd102515u, 0x3ea3bd40u, 0x3e9d8469u, 0x3d7c6464u, 0x3c4846b3u, 0x3de25588u, 0xbdccf8dau, 0xbda0d6f9u,
+0x3ed4b104u, 0xbdb24e91u, 0x3d7c2a09u, 0xbe368192u, 0xbeaa3ff0u, 0xbcd193e0u, 0x3e647946u, 0x3ddc24d0u, 0xbb4a0938u, 0x3e8855d5u,
+0xbdb50fb5u, 0xbe47e0dfu, 0xbd064470u, 0xbd65eb52u, 0x3e086b65u, 0xbdaaf8f1u, 0x3cbb90adu, 0xbd34087fu, 0x3c1c553au, 0xbd29fdb1u,
+0x3c2e453cu, 0xbe34a4c2u, 0x3e029367u, 0x3ce55fe4u, 0xbd57e7f3u, 0xbc6a40f0u, 0xbc5c8708u, 0xbdb68d1eu, 0x3dbc05cau, 0x3d958a72u,
+0x3f3d69f0u, 0xbe97a136u, 0x3c5ed5beu, 0xbe0164bdu, 0x3d38bfbau, 0xbe537bf6u, 0xbdf56552u, 0xbddbc7deu, 0xbdbb5e34u, 0x3e0d4f88u,
+0xbdcd5a84u, 0xbdb5e4adu, 0x3d1d328au, 0xbdaa6653u, 0xbda3268du, 0x3d47a01du, 0xbcde479au, 0xbc8955f6u, 0x3d9cc2ebu, 0x3ddf1f59u,
+0x3cea1638u, 0x39485e0du, 0xbd29a3c6u, 0xbc3ac39au, 0xbcc3bad6u, 0xbcb143c5u, 0x3d3ee082u, 0xbe1a97e0u, 0x3e2ec3a2u, 0xbdf1322bu,
+0x3e34d1fcu, 0xbdcbaa35u, 0x3d3ab0aau, 0xbdf54e8fu, 0xbd05206eu, 0x3da0c554u, 0xbda283ffu, 0xbd9879acu, 0xbc82c58cu, 0xbc6b23d7u,
+0xbdb616a8u, 0xbd27bdeeu, 0x3c3e7d15u, 0xbc0c7b45u, 0xbd831a40u, 0xbc7d82c6u, 0x3cac59ebu, 0x3d9c7739u, 0xbda94a41u, 0x3c78e270u,
+0xbda98811u, 0x3e5ca8d2u, 0xbe2593d9u, 0x3e5280dau, 0x3f0ef966u, 0x3d81a445u, 0x3d06e17au, 0xbdc99dbfu, 0x3d960ea3u, 0x3d91da0du,
+0xbe530324u, 0x3e251fe3u, 0xbd25fc87u, 0xbd3165c2u, 0x3da0e3e0u, 0x3ca21e81u, 0x3dc8a4d8u, 0x3d828c36u, 0x3c7a81e2u, 0x36da2774u,
+0x3d57375au, 0xbd6e52eeu, 0xbda9b77eu, 0xbba7b542u, 0x3c74d08cu, 0x3d8f8772u, 0xbd833464u, 0x3d30fefcu, 0xbd268f2cu, 0x3da9ef32u,
+0x3d891af1u, 0xbc82c4d1u, 0x3e2d979fu, 0x3d1354b3u, 0xbd3f2a66u, 0x3d0b6be7u, 0xbcb619e9u, 0x3e544ef0u, 0xbe4d2442u, 0xbda307ccu,
+0xbe24d718u, 0x3e2fbe29u, 0x3c3df3b9u, 0xbd6cbf22u, 0xbdd19349u, 0xbda8e7f4u, 0xbc704b79u, 0xbd6cecf2u, 0x3e0e1191u, 0x3f21d4aeu,
+0xbedc6fc7u, 0x3dea110du, 0xbe061400u, 0x3d0a36aau, 0x3e03dc47u, 0xbce244eeu, 0xba3ca843u, 0xbcd2e58bu, 0x3df6d38du, 0xbe36a7c9u,
+0xbd6c5338u, 0xbe4f8c30u, 0xbc1a0150u, 0x3e817d5cu, 0xbcff5ed4u, 0xbd9bb5cdu, 0xbe0eb75au, 0xbe2f43ddu, 0x3ce5d231u, 0xbc30c764u,
+0xbe8164ffu, 0x3b5baed1u, 0x3c8adfffu, 0x3e25a021u, 0x3e7ee33bu, 0x3ee3e431u, 0xbe94b8f1u, 0xbe8cb8dbu, 0x3ea6bae0u, 0xbd914635u,
+0xbdf7b686u, 0xbb34820au, 0xbd94e9c7u, 0xbdee7ac9u, 0xbd99bb6bu, 0x3c079918u, 0x3e0581e0u, 0x3dba11a7u, 0x3dd866abu, 0xbe07a295u,
+0xbe0f023du, 0x3da6de68u, 0x3d860e34u, 0xbe8edaffu, 0x3e47f5e7u, 0xbd54c58eu, 0xbe3ec1ffu, 0xbda9a9f1u, 0x3cade593u, 0x3da783efu,
+0x3da14301u, 0x3d1e0470u, 0x3dd99fc6u, 0x3e887aa3u, 0xbddbcb9fu, 0x3b05dd13u, 0xbe1199f8u, 0x39cac359u, 0xbd6161a1u, 0x3d08337eu,
+0xbd91cbc8u, 0xbd24edbdu, 0x3c8099f7u, 0x3d068e6eu, 0xbc971351u, 0x3dbf78edu, 0x3dad1b2au, 0x3dbbaa8eu, 0xbe42b6ceu, 0xbd868621u,
+0x3d6b62f1u, 0x3d82e78du, 0x3e4e3b72u, 0xbabb3672u, 0xbd92d57au, 0xbe13e0f8u, 0xbde7262fu, 0x3d13c162u, 0x3c8537c8u, 0xbe65306du,
+0x3ed3a204u, 0x3ea9ac3au, 0x3e282919u, 0xbe611798u, 0x3e2d1d48u, 0x3e245c51u, 0xbeeb94ffu, 0xbe8b9530u, 0xbd7b6179u, 0xbd8d0f1fu,
+0x3e3812ebu, 0xbcb7ea47u, 0x3e69def3u, 0x3dfe9fa4u, 0xbde16d71u, 0x3d77f306u, 0xbe70d499u, 0x3e0a6734u, 0xbcdd4939u, 0x3db3e9f7u,
+0x3d10981au, 0x3d18ea7au, 0xbd927d62u, 0x3d4f8c8cu, 0x3cfb71dau, 0x3d4ce319u, 0xbcf9c0fbu, 0xbe1b70bdu, 0x3cec6a77u, 0x3d45e7cdu,
+0x3d2663bdu, 0x3d62caa5u, 0xbda7031au, 0xbd47e772u, 0x3d54561eu, 0x3bde32b9u, 0x3c8466b6u, 0xbdd5a2e9u, 0xbd0d050au, 0xbc84a4acu,
+0x3c919160u, 0xbbc70588u, 0xbcf92f42u, 0xbe1800a6u, 0x3c9a90d8u, 0x3eac6ccau, 0xbdc567bcu, 0xbd92c193u, 0x3d97553au, 0x3d886b10u,
+0xbdfe3afeu, 0xbdb520b5u, 0xbc3b0f07u, 0xbd33c514u, 0xbe38cdeau, 0x3d7ab526u, 0xbd8dd338u, 0xbd7aab0bu, 0xbb9a67dcu, 0x3d23c48au,
+0x3d65c94du, 0x3cc6c506u, 0x3c8a758eu, 0xbe19fe4cu, 0x3d10d679u, 0xbd6f9effu, 0xbd9f7313u, 0xbd83161du, 0x3ddb7195u, 0xbd9396dcu,
+0xbd742117u, 0x3d8784eau, 0x3e1da2c2u, 0x3db4af96u, 0xbcc4304fu, 0xbe0bbf20u, 0xbc623520u, 0x3e3b03f4u, 0xbdf3fe63u, 0x3d3f21b9u,
+0xbda512b6u, 0xbe0f201cu, 0xbc09bc08u, 0x3d981d62u, 0x3e3edb20u, 0x3cc19343u, 0x3e41ed84u, 0xbea57046u, 0xbe65fc82u, 0xbddee728u,
+0x3d8930cau, 0x3e18196au, 0x3e65ab41u, 0x3cbbbb4eu, 0xbe4a5d98u, 0xbdaab19fu, 0x3e1a7fdau, 0x3ecc657au, 0xbd6d7f33u, 0xbf065801u,
+0x3e2229a9u, 0xbcf642a2u, 0x3d2e2bc0u, 0xbcc51420u, 0xbd276ec5u, 0x3e4da6cdu, 0xbd4e6e81u, 0x3cd4948eu, 0xbf10cd7bu, 0xbd4db01fu,
+0xbdbb1f94u, 0xbe3ad355u, 0xbe2b9790u, 0xbd6deba9u, 0x3b76b0bfu, 0x3e526e1fu, 0xbca4bac1u, 0xbd850512u, 0x3d00fa85u, 0x3d40d507u,
+0x3d0451ecu, 0xbd535d72u, 0x3cbe298bu, 0x3e965fa2u, 0xbd40562fu, 0xbd215071u, 0xbee924e7u, 0x3acb7251u, 0xbda29c1fu, 0x3d3884a3u,
+0x3e0c2489u, 0xbe8e3a98u, 0xbdbb2edeu, 0x3da79e85u, 0xbec0a86cu, 0x3dd80316u, 0xbee4ddfbu, 0x3daa4a5fu, 0x3e24517fu, 0x3d3a0e3au,
+0xbe768cf0u, 0x3bbaa4b3u, 0xbdf9c7b9u, 0x3dfc0496u, 0xbd8ad372u, 0x3cf5f464u, 0x3ce2c921u, 0x3c99235bu, 0x3c79f49cu, 0x3c31b7bcu,
+0xbcbb46f1u, 0x3bdc0213u, 0xbd1b927eu, 0xbf14cfd1u, 0xbd8efb61u, 0x3e04ee1cu, 0x3cd53461u, 0x3d5a0107u, 0xbdfe6a85u, 0x3d15c7cau,
+0xbd029d08u, 0xbc3d0249u, 0x3d9fa08au, 0xbce641ccu, 0xbd7260b2u, 0x3c988c91u, 0xbcc89b73u, 0xbd2849f8u, 0x3cd8d030u, 0xbcd0fe91u,
+0xbc939ca0u, 0xbd86855fu, 0xbe257722u, 0x3bf078c9u, 0xbe10196bu, 0xbd5d0d9cu, 0xbbcff111u, 0xbdd9d085u, 0x3e560a44u, 0xbb105cbau,
+0x3cb915beu, 0xba94340bu, 0x3d69d463u, 0x3d493dcau, 0x3d7cfbabu, 0x3db6dbd3u, 0x3ccbe2b1u, 0x3cb3fa84u, 0xbcc4c2a3u, 0x3885b8f0u,
+0xbddc2e70u, 0x3993e42du, 0x3d9d780fu, 0x3be21122u, 0x3c8be09cu, 0x3e453ad5u, 0xbcef7c17u, 0xbc3fcaf5u, 0xbdab9865u, 0xbca8236au,
+0x3d726f93u, 0x3c9b91fau, 0x3db2a445u, 0x3cd1a44fu, 0x3e36b4fbu, 0x3dbe5246u, 0xbd4fba07u, 0xbe7656e9u, 0x3cf3047au, 0x3b096d2au,
+0x3d316796u, 0x3bde95a8u, 0xbd84f7d9u, 0xbcba888du, 0xbdb87d8fu, 0xbccf6ce9u, 0xbe47a0eau, 0xbdc9ab05u, 0x3c4414bfu, 0xbb9329e8u,
+0xbd825913u, 0x3d2c6f5bu, 0x3c99b27bu, 0x3a6be164u, 0xbce65e36u, 0x3c748d73u, 0x3c3ab037u, 0x3bdc613eu, 0xbc6c91f1u, 0x3c1b04f9u,
+0xbcce0a94u, 0x3a4b3577u, 0x3c571b76u, 0xbd488694u, 0x3d012190u, 0xbd9ceeccu, 0x3cdf07ccu, 0xbc90ed07u, 0xbc9765c6u, 0x3cdf54c9u,
+0x3cde8d47u, 0xbda4e64cu, 0x3c160b44u, 0xbcbeb15cu, 0x3bbf47afu, 0xbcb7961eu, 0xbc12bef6u, 0x3c8c2d5eu, 0x3d31212fu, 0x3be5464bu,
+0x3c821699u, 0xbc549b4du, 0x3ca7e837u, 0xbd513db2u, 0xbca01607u, 0x3c94f33du, 0xbcf27b57u, 0xbc3f985bu, 0xbdb380dcu, 0xbb8cb077u,
+0x3cadc8f8u, 0x3ce611d6u, 0x3bbdc4d3u, 0x3d0a4d5du, 0xbcc5f063u, 0xbb0b9447u, 0x3d67677eu, 0x3d527163u, 0x3bbb1161u, 0xbd35615du,
+0xbddec119u, 0x3c4ca944u, 0x3c96a688u, 0x3ba33ca6u, 0x3d909d1fu, 0x3cd3967bu, 0x3d15a55du, 0xbd57528cu, 0xbc93be3cu, 0xbc6af013u,
+0xbcdb7aaeu, 0xbccbb9cbu, 0x3d2d96ddu, 0xbd14d9a2u, 0x3d620e14u, 0xbda4daa1u, 0x3b123865u, 0xbdb8cc49u, 0x3b949d86u, 0xbcad155eu,
+0x3c8b215eu, 0x3d02ad5au, 0xbdeea329u, 0xbdfde1e4u, 0x3c5f7fcfu, 0xbda33310u, 0xbd2b1b47u, 0x3d06b624u, 0xbd0047d9u, 0x3cb9a401u,
+0xbe2c968bu, 0x3d04971cu, 0x3cf5d1edu, 0xbc1cc3a4u, 0x3e1c2371u, 0x3da763f1u, 0x3d4e2084u, 0x3d8a7b55u, 0xbc5f2662u, 0x3cbac7bau,
+0xbda4eb3bu, 0xbd2deb89u, 0x3e38abf1u, 0x3c2bbfd4u, 0x3da4075fu, 0x3d01762bu, 0x3d99df30u, 0x3d17df57u, 0x3e07d079u, 0xbde37dc2u,
+0xbde4cc71u, 0x3ae55e14u, 0xbba5220cu, 0x3e2d87cdu, 0x3de55f15u, 0xbdae3368u, 0xbde926d1u, 0xbd6769a3u, 0xbda67948u, 0x3ceddd0au,
+0xbdd216c4u, 0x3dc924e0u, 0x3d96b9d7u, 0x3b0b7de9u, 0xbbf00dd5u, 0xbe17266bu, 0xbdd928cdu, 0x3d6333e7u, 0x3d302a40u, 0xbcbc80ecu,
+0xbd825f95u, 0x3d051450u, 0x3d24e59fu, 0xbcc82787u, 0xbcd601e7u, 0x3d0a79dfu, 0x3c14e76bu, 0xbc564c91u, 0x3c1cb485u, 0xbc7060edu,
+0xbd3747abu, 0x3c67e4cbu, 0x3d10c40du, 0xbd1a1b21u, 0x3c962f2au, 0x3c749612u, 0x3d3ed92fu, 0xbd3a97dau, 0xbd633881u, 0x3cca8a30u,
+0xbcbc8d4au, 0xbd3dff92u, 0x3dad2b41u, 0xbcadc87cu, 0xbe31034eu, 0xbd442291u, 0xbc2615f0u, 0xbd50758fu, 0x3d991ef9u, 0xbd933425u,
+0x3d26cf76u, 0xbbc3f202u, 0x3d0bb1f6u, 0x3c038d43u, 0x3b8e8584u, 0x3ce4153du, 0xbd265192u, 0xbc6e347cu, 0x3d99dec3u, 0xbcada5e8u,
+0x3d2f7510u, 0x3cedb425u, 0xbdc9a127u, 0x3dfb7da1u, 0xbc218974u, 0x3acefb4fu, 0x3d5e0631u, 0xbae08068u, 0xbcf996aeu, 0x3d816f3eu,
+0x3da9282du, 0x3d5ec81du, 0x3c087117u, 0x3cbf32c5u, 0x3d5a1dc4u, 0x3c382a67u, 0xbd964a0du, 0xbd86173cu, 0xbda134b4u, 0xbc9b3a8cu,
+0x3ccdeeb0u, 0xbc909d5du, 0xbc02f4dfu, 0x3cbc3a18u, 0xbdb79f01u, 0xbdbc1f1fu, 0x3c00b3f0u, 0x3c8a5baau, 0x3d265d8cu, 0xbca5e2e1u,
+0x3e169435u, 0xbd6cd38fu, 0xbd51ba57u, 0xbdac3fb4u, 0xbde15370u, 0x3d139022u, 0xbdd76147u, 0xbd9b1f09u, 0x3d5bc97bu, 0x3ce29cd8u,
+0xba3342a4u, 0x3b128391u, 0xbd3906d7u, 0x3da00e80u, 0x3d7e7ed1u, 0x3da1c31bu, 0x3c9cc268u, 0xbcac6c47u, 0x3d4d9a56u, 0xbd1f67b8u,
+0x3b0c6979u, 0xbb7484dcu, 0xbcb237bau, 0xbd3cbeb8u, 0xbdc64bedu, 0xbab45c9cu, 0xbd7c1157u, 0x3badc317u, 0xbe83e2b8u, 0x3d46013du,
+0xbd2247d5u, 0xbd1ef1c6u, 0x3d9a75fbu, 0xbdeaa011u, 0x3c0e4fd0u, 0x3db2a556u, 0x3de4bf8du, 0xbcbb3cfbu, 0x3d98eec8u, 0xbc95e9c5u,
+0x3e7df038u, 0xbd28f346u, 0x3d087f4eu, 0x3ce5ac24u, 0xbdb67487u, 0x3e063e67u, 0xbcc058a0u, 0xbd71735au, 0xbd0311e2u, 0xbbcb5c67u,
+0xbcede664u, 0x3c6d6f7cu, 0x3c7b7c39u, 0x3c789afbu, 0xbc3f17f5u, 0xbd014d3eu, 0x3c36c015u, 0x3c9bf1ddu, 0xbc5e8dcfu, 0x3c9ed031u,
+0x3cfa7426u, 0x3baf8d71u, 0x3b9c67efu, 0xb858f776u, 0xb78ceae9u, 0xbc2b5240u, 0xbbe6bad4u, 0x3bc7ac76u, 0x3c646cb6u, 0x3bd0f914u,
+0xbba80a68u, 0x3c7fed3du, 0xbd76e6e7u, 0x3bbab68cu, 0x3e085c80u, 0x3d33bdbeu, 0xbbfd869au, 0x3af5a8d3u, 0xbd39b2e6u, 0xbb8735d0u,
+0x3c57bfd7u, 0xbc76be97u, 0x3c72a1cdu, 0xbd3a2dbeu, 0xb9319baeu, 0xbcc924fbu, 0xbd453c63u, 0xbcba08b3u, 0x3ca73cceu, 0xbaec49efu,
+0x3c83cebfu, 0x3d13f4d4u, 0x3d167c6fu, 0xbcce1016u, 0xbb0a1eb1u, 0xbca7f436u, 0x3d04fce4u, 0xbdaf2f1cu, 0x3d68f29du, 0xbd9eabdbu,
+0xbd52592fu, 0x3cfa17f4u, 0x3c58893du, 0xbc9efac8u, 0xbd3be44eu, 0x3c9efce7u, 0xbd83c527u, 0x3d4320feu, 0x3c3adcebu, 0x3d3e2e7cu,
+0xbd39af8du, 0x3c8a2136u, 0xbc54060fu, 0xbcd5941cu, 0x3d6ecaf4u, 0x3dc24f51u, 0xbcadbdd6u, 0x3cf2c02au, 0x3cc1cdbeu, 0xbbcefa59u,
+0x3e0d0fddu, 0x3d1511d3u, 0xbc9153b3u, 0xbe0d8b95u, 0x3cb957efu, 0x3d0d82eau, 0xbe11e7b0u, 0x3d190d47u, 0xbe0ee26bu, 0x3d54c9aau,
+0xbe1b5a1cu, 0x3d61d35cu, 0xbdcfb8e7u, 0x3d98d7e1u, 0x3da92e8du, 0x3e4ff102u, 0x3d2f54c5u, 0xbcf2aa51u, 0x3dc24d40u, 0xbcc1deaau,
+0x3c93f3c1u, 0xbd481bbeu, 0x3d9c5993u, 0xbd926d82u, 0xbcfb7947u, 0xbe44d55du, 0x3b909d9au, 0x3da2f8b8u, 0xbd616a0au, 0xbd485b6du,
+0xbe29a1fdu, 0xbdb21497u, 0xbd7a0ea9u, 0xbd0eaa8au, 0xbd29a984u, 0xbdd1ad90u, 0x3d5311eeu, 0x3e467c8bu, 0xbc9dea73u, 0xbd31e81eu,
+0x3d8cc754u, 0x3d37eda5u, 0x3df76718u, 0x3d8cbc3cu, 0x3d3fa6ffu, 0x3d23bde3u, 0x3d4e2551u, 0x3dbf27a7u, 0x3cb5af76u, 0xbcfe4591u,
+0xbd88b853u, 0xba931fa9u, 0x3c993df8u, 0xbc0df2f4u, 0x3bfb47fbu, 0x3c948aa0u, 0xbb926891u, 0xbb3c1878u, 0x3d1f4038u, 0xbbfe0608u,
+0xbcbe5ac9u, 0x3cb889e6u, 0x3d9ed35bu, 0x3c48bb7eu, 0xbcb212cbu, 0x3d9f5fc6u, 0x3cd8b67fu, 0xbd023480u, 0xbcc80620u, 0x3c8f0bf8u,
+0xbd641c90u, 0x3d57b3dcu, 0xbb1fdc5cu, 0x3b1bdb60u, 0xbd013887u, 0x3d43908au, 0x3c4de7e1u, 0xbd73e38cu, 0xbd71c29bu, 0xbd837b72u,
+0x3d38a132u, 0xbc332a26u, 0x3c0913b6u, 0x3cc42907u, 0x3cce8db6u, 0x3bddb6d1u, 0xbc94f8f8u, 0xbd6b3c52u, 0xbd507611u, 0x3d1eef6du,
+0x3d075ad8u, 0x3d6d2a4eu, 0xbd8698d5u, 0x3c62329bu, 0xbcab22ceu, 0xbd0748cbu, 0xbd1fa931u, 0x3da700c3u, 0x3d0755e1u, 0x3d6cbedcu,
+0x3da6ae85u, 0xbd7091bau, 0xbc8f4718u, 0xbb30fb38u, 0xbdb801fbu, 0x3bde7574u, 0xbcbf8cc1u, 0x3d4f5b63u, 0x3907d2cfu, 0xbd2df488u,
+0xbd853705u, 0xbc020638u, 0xbc95ad42u, 0x3c3ed51cu, 0xbd6d1278u, 0x3d78a2c8u, 0x3c1cd6f2u, 0xbb60ada0u, 0x3d1708f9u, 0x3c8c821eu,
+0xbc87cb04u, 0xbd8ea54du, 0x3d4585cfu, 0x3b94ba19u, 0x3dbbc429u, 0x3cc645f7u, 0xbd1f06cdu, 0x3d02c410u, 0xbdc60a71u, 0x39a623e0u,
+0xbd1487ceu, 0x3c0bc1d7u, 0x3d140f16u, 0x3d815600u, 0xbcf27f21u, 0xbd52ac79u, 0xbcb4538au, 0xbc8474b0u, 0x3c4c3c9du, 0x3bb7df9du,
+0x3da2a354u, 0x3b8f8a2fu, 0xbd04beedu, 0xbd091b52u, 0xbd628d38u, 0xbd96371fu, 0x3c413c4au, 0xbadc2f4fu, 0x3c0800f4u, 0x3d92a8e0u,
+0xbda34d8au, 0xbcf3e84fu, 0x3c9b1499u, 0xbc67a0d9u, 0xbd502f15u, 0xbc8d5adcu, 0x3d0f3eeau, 0x3d7965fbu, 0xbbb2cf55u, 0xbd5e98e6u,
+0xbd44727cu, 0xbd89c696u, 0x3dbc8fa2u, 0x3caf09b4u, 0x3c6a0258u, 0x3bb23163u, 0x3d530ffau, 0x3c2d22e4u, 0xbab5d826u, 0x3b87be4cu,
+0xbad1fdcfu, 0xbaab1cf9u, 0x3c980fb6u, 0xbb538055u, 0xbba941efu, 0xbc4edd13u, 0x3c45c119u, 0x3d02d428u, 0xbc1a784eu, 0xbb0236e3u,
+0x3a407a92u, 0xbc124c32u, 0xbd1f4b80u, 0xbc5cbe48u, 0x3cd2cf50u, 0xbd8994e2u, 0x3c29351cu, 0x3ca5f867u, 0xbcc3e411u, 0x39bce3d7u,
+0x3d03160cu, 0xbd86a56fu, 0x3bf54833u, 0xbcbcdf17u, 0x3bbe5cb3u, 0xbcd59d58u, 0xbc40bdf0u, 0x3cbf0370u, 0x3d3492dfu, 0x3b747965u,
+0x3b9034e7u, 0xbc3d0021u, 0x3caffcb1u, 0xbd50d86au, 0xbcadea51u, 0x3c501d73u, 0xbcf6087eu, 0xbc4b0093u, 0xbdb541eau, 0xbc1a0baeu,
+0x3c8d76c5u, 0x3cff5d10u, 0x3c4c6970u, 0x3d06c2e6u, 0xbc926ad1u, 0xbc471349u, 0x3d733a09u, 0x3d64280du, 0x3c10a56eu, 0xbd442673u,
+0xbddf489au, 0x3c7533b3u, 0x3c9ffca1u, 0x3bc61428u, 0x3da682d7u, 0x3cea25f2u, 0x3d10d866u, 0xbd4b886fu, 0xbc81bdecu, 0xbc84d66eu,
+0xbccee0fbu, 0xbcab8ae6u, 0x3d2dffffu, 0xbd2683c4u, 0x3d6bffb3u, 0xbda94496u, 0xbb3289f2u, 0xbdbf1672u, 0x3be87d7fu, 0xbc9535b0u,
+0xbc55a3eau, 0xbe0244dcu, 0x3d01f424u, 0x3d0f119du, 0x3d66d4e4u, 0x3c866f96u, 0xbd1a4f70u, 0xbcbfc45bu, 0xbd29a6b4u, 0xbc0f151fu,
+0x3d346634u, 0xbc7fb634u, 0x3cd3671fu, 0x3dcf973bu, 0xbd83b5c5u, 0xbd214fcfu, 0xbd209152u, 0x3af9ed51u, 0x3c9827dau, 0x3c4d921du,
+0x3d62a44bu, 0x3cdb40adu, 0xbd68f436u, 0xbc8eb13eu, 0xbda1ef9eu, 0xba813c5eu, 0xbc6d2c2bu, 0x3d3936d5u, 0x3ce8b673u, 0x3dc581b9u,
+0xbcfb8e67u, 0xbc94181eu, 0x3d0399fcu, 0xbd427176u, 0xbcdd8086u, 0x3d238072u, 0x3da2081cu, 0xbbaf94d3u, 0x3ca5f722u, 0xbd1142e2u,
+0x3cb26ac8u, 0xbd9e50edu, 0x3c19febcu, 0x3ba7ee54u, 0xbc80cbedu, 0x3d5769abu, 0x3d14aea9u, 0xbd9938a6u, 0x3ce85c11u, 0xbb9f5f58u,
+0xbb350b58u, 0xbb8bb317u, 0x3d0c12e0u, 0xbc5bfbe2u, 0x3c4fed2du, 0x3bb3250eu, 0xbc83771bu, 0xbc5a704bu, 0xbcbceb47u, 0xbc9feb27u,
+0xbcd70838u, 0xbb1a27f5u, 0xbcc9e391u, 0xbc65c04eu, 0x3cc29d89u, 0x3c1096cau, 0x3ca251e9u, 0xbc64170fu, 0xbce91288u, 0x3c4f62f7u,
+0x3cab24a8u, 0xbce70157u, 0x3daef9e0u, 0xbcd35ff3u, 0xbe44e36cu, 0xbd5c36a9u, 0xbc3cb6c7u, 0xbd6620e6u, 0x3dadbba3u, 0xbda83ab9u,
+0x3d2000d1u, 0xbb8b6bc6u, 0x3d0aa5c6u, 0x3c20371au, 0x3b589c01u, 0x3d0805f4u, 0xbd1b5bf4u, 0xbc5e5a47u, 0x3da27fcau, 0xbce52653u,
+0x3d356d2au, 0x3d0a6b99u, 0xbdcda2a5u, 0x3e0980f1u, 0xbb23eb35u, 0xbb10d11cu, 0x3d748cb8u, 0xbb3f402bu, 0xbcfb2149u, 0x3d92e778u,
+0x3db594f1u, 0x3d748ac3u, 0x3c0666f0u, 0x3cdecc26u, 0x3d7dee7du, 0x3c3d8917u, 0xbda8c9c8u, 0xbd8629aeu, 0xbdb2e84bu, 0xbca53d1du,
+0x3cac3f63u, 0xbca169fau, 0xbc25e671u, 0x3cb74533u, 0xbdba7c87u, 0xbdc24343u, 0x3becbb32u, 0x3c2e3b2du, 0x3d44c536u, 0xbca55928u,
+0xbd9298afu, 0xbd954586u, 0x3c684c3bu, 0x3d01f7e2u, 0x3cc302acu, 0x3c88acaau, 0xbc2a4175u, 0x3ce17b27u, 0xbd63f201u, 0xbcc94e82u,
+0xbc7154a0u, 0x3c7ad484u, 0x3d6f170fu, 0x3d4d7eddu, 0xbcfb4502u, 0xbd4ff742u, 0xbcfaf416u, 0xbc75226du, 0x3c1aae67u, 0x3c9e46eeu,
+0x3cc248e7u, 0x3c3e3aa4u, 0xbafaef5fu, 0xb9589482u, 0x3bda8358u, 0xbc445b2bu, 0x3d12ea7bu, 0x3c875dd6u, 0x3d872cc0u, 0x3d0e08b8u,
+0xbd17ef50u, 0x3adf828au, 0x3c31e53bu, 0x3d54b462u, 0xbc08829eu, 0xbc2dcd00u, 0x3c892fe9u, 0xbc6448bau, 0xbd009955u, 0xbcd4b3b2u,
+0xbdeb5f0au, 0xbd255b2eu, 0x3d022d3cu, 0xbc04ab11u, 0xbce10eadu, 0xbd2ee83du, 0xbb98eff7u, 0x3d18d7edu, 0xbcfe2b8du, 0xbc624310u,
+0xbcc4e40fu, 0x3cabd37fu, 0x3c7a4f64u, 0x3c93472cu, 0x3a97b6e3u, 0xbcf854bbu, 0x3c611894u, 0x3c8acdeeu, 0xbc5fcac7u, 0x3c7113a4u,
+0x3cf6b8d7u, 0x3c8698a0u, 0x3bd96514u, 0x3b022769u, 0x3a1c4859u, 0xbaac1b23u, 0xbc1268f4u, 0x3c99928fu, 0x3c8c8d94u, 0x3bc8244eu,
+0xbbdc7c57u, 0x3d041072u, 0xbd839adbu, 0x3ba8ea40u, 0x3e15f219u, 0x3d2ee622u, 0xbc27811au, 0x3bc4298fu, 0xbd2c4341u, 0xbaf0d8dbu,
+0x3c317a2au, 0xbc3d9886u, 0x3c9efcecu, 0xbd5920aeu, 0x3b1fe2edu, 0xbcf67c84u, 0xbd540525u, 0xbcb09924u, 0x3ca85954u, 0xbba8fa3du,
+0x3c20b6ffu, 0x3d3409aau, 0x3d2f4b89u, 0xbd0a2bbeu, 0x3b688f7du, 0xbcbf42aeu, 0x3cf7b5a5u, 0xbdc0da02u, 0x3d845939u, 0xbdad1859u,
+0xbd43ab84u, 0x3d035a91u, 0x3c6fab20u, 0xbc9ae3e2u, 0xbd392801u, 0x3cc995adu, 0xbd8c3f95u, 0x3d4ccd4au, 0x3c7a2c13u, 0x3d492527u,
+0xbd41bb3au, 0x3ca70bc9u, 0xbc8561ceu, 0xbcec3c10u, 0x3d771f81u, 0x3dcf3021u, 0xbcd81146u, 0x3cc5215cu, 0x3cf5a0f5u, 0xbbef824eu,
+0xbd677691u, 0xbdd577b6u, 0x3b3b2959u, 0x3d0bc1cdu, 0x3c1be8dau, 0xbc501e67u, 0xbc6fcef6u, 0xbc7f128cu, 0x3b0ac791u, 0xbd0c4d18u,
+0x3d6620e4u, 0xbc5f2d6au, 0x3d8c8534u, 0x3d9636ceu, 0xbd2e21c3u, 0xbdb0bdb5u, 0xbd593591u, 0x3c917fa5u, 0xbc6ae342u, 0x3cd42171u,
+0x3bb1e95eu, 0x3d04ee19u, 0xbcd69959u, 0x3cc0f5c3u, 0xbd0dad11u, 0x3daa2604u, 0x3c141670u, 0x3d3b1896u, 0x3d98cb1du, 0x3d6e9163u,
+0x3c4740c8u, 0x3c4964feu, 0x3d18784bu, 0x3d032fe8u, 0x3cfae168u, 0x3d41837eu, 0x3d6b596bu, 0xbdda97bcu, 0xbc1307adu, 0xbb09bec9u,
+0xbd0943cdu, 0xbd38a68cu, 0xbc395a41u, 0xbc95ec53u, 0xbd504246u, 0xbcbd39c7u, 0xbccc3003u, 0xbd2db629u, 0x3c7fede3u, 0xbcaebde4u,
+0xbd0d0428u, 0xbb13ce15u, 0xbc3625ecu, 0xbac5a155u, 0x3caf014cu, 0x3c51b9c2u, 0xbc59e060u, 0xbbbef68cu, 0x3c80dea6u, 0xbbab156du,
+0xbc820a07u, 0x3cc2e520u, 0x3d3e84dau, 0x3c4277bcu, 0xbc8a9f4fu, 0x3d94b8a9u, 0x3c5ff579u, 0xbce8f6a4u, 0xbbf8a81du, 0x3c672297u,
+0xbcfc7faeu, 0x3d7b303cu, 0xbc3bc7dfu, 0x3bb7d88du, 0xbd122855u, 0x3d5294eeu, 0x3c8217cau, 0xbd727adbu, 0xbd6c4a2du, 0xbd9184bfu,
+0x3d3eb602u, 0xbc0df7bbu, 0x3c340227u, 0x3cb296cau, 0x3ccd8935u, 0x3b99d041u, 0xbcbaae6bu, 0xbd827eb3u, 0xbd5fb71au, 0x3cf2e916u,
+0x3d01c593u, 0x3d7f0cedu, 0xbd8529c7u, 0x3c84e57fu, 0xbc817534u, 0xbd1ee79eu, 0xbd3250dbu, 0x3dacd9ffu, 0x3d14ad91u, 0x3d739e50u,
+0x3db627b7u, 0xbd5c4673u, 0xbc8f1102u, 0xbb2db1adu, 0xbdb00cd3u, 0x3c019bd5u, 0xbcd930bbu, 0x3d5d3395u, 0x3a1a33aeu, 0xbd315c9eu,
+0xbd8a46dbu, 0xbba2cd18u, 0xbcbdf0e0u, 0x3c22d455u, 0xbd6b9805u, 0x3d82f56au, 0x3bad26a4u, 0xbba81eb4u, 0x3d2eea80u, 0x3c9aef80u,
+0x3e52c8bfu, 0x3e793dadu, 0x3ddf3e4bu, 0xbd529a6fu, 0x3d925270u, 0x3e0c8522u, 0xbe6105b0u, 0xbdd2c5cdu, 0x3d1df711u, 0x3c7b020du,
+0xbd853f37u, 0xbe0b69f2u, 0xbe5032f6u, 0xbe6b44c2u, 0xbd701799u, 0x3aec17d5u, 0x3c5146cbu, 0xbe0cf3c6u, 0x3e66e452u, 0x3e20dddeu,
+0xbd2cc064u, 0x3b898774u, 0xbc6d3beau, 0x3dcbf171u, 0xbd0a0bcau, 0xbdf50362u, 0xbb0b132cu, 0xbc9f55d3u, 0xbc98ba02u, 0x3cdee6f0u,
+0xbd6d9c7cu, 0xbbb7dfefu, 0xbc5a1809u, 0xbd269437u, 0xbdfa3e6du, 0xbd2fb501u, 0x3cc451e5u, 0x3dfedc39u, 0x3bcb1a35u, 0xbcfb507bu,
+0xbcb6d031u, 0xbcb12e5du, 0x3d89d28eu, 0xbbe9bee6u, 0x3d6fa21cu, 0x3cab6a36u, 0x3dcce8e9u, 0x3d21d5b9u, 0x3af56721u, 0x3b7041dbu,
+0x3be0023cu, 0xbbafc398u, 0x3cae1febu, 0xbc14d632u, 0xbb9b0684u, 0xbc06719fu, 0x3c98e636u, 0x3d109c00u, 0x38b34428u, 0x3960e776u,
+0xbc2054dfu, 0xbb3cb87au, 0xbd19056du, 0xbbfe0573u, 0x3c939215u, 0xbd93f874u, 0x3c3a6aa1u, 0x3c4bad36u, 0xbce1c718u, 0xbbe4b122u,
+0x3cbd60e5u, 0xbd90571fu, 0x3c81020bu, 0xbcbdff66u, 0x3c32f38au, 0xbc928d01u, 0xbbf0a03au, 0x3c9375e2u, 0x3d294fe5u, 0xbb0169a8u,
+0x3c1abb40u, 0xbc3dbab8u, 0x3cc1cc16u, 0xbd44e5dcu, 0xbca30175u, 0x3c5820c3u, 0xbce8201au, 0xbc631e42u, 0xbdb10c46u, 0xbbef0eeeu,
+0x3c8a5f64u, 0x3d0b7533u, 0x3c0bebafu, 0x3ce89e39u, 0xbcacdb6bu, 0xbc32359du, 0x3d5e4c62u, 0x3d4e41c5u, 0x3c1b3d7du, 0xbd272acdu,
+0xbdd34869u, 0x3c7452bdu, 0x3c810f2du, 0x3b9a87a9u, 0x3d9422e8u, 0x3ccb33f5u, 0x3cff3cddu, 0xbd53189fu, 0xbc567b49u, 0xbc6fcdbcu,
+0xbccc2b3fu, 0xbca51fccu, 0x3d1f4b8fu, 0xbd21640bu, 0x3d5b149cu, 0xbd9fd318u, 0x3ae4668bu, 0xbdb03feeu, 0x3bc0da21u, 0xbc72c706u,
+0x3e6315b6u, 0x3e32fe5bu, 0x3da4a09bu, 0x3a37e926u, 0x3cdae95eu, 0x3e07afd6u, 0xbe63ab73u, 0xbe476d60u, 0x3df79c97u, 0x3ba9798du,
+0x3d666afbu, 0xbe280f4du, 0xbe53b1deu, 0xbe3c8868u, 0xbdeae851u, 0x3c33c165u, 0xbc64ffb0u, 0xbdf97432u, 0x3e6acbb7u, 0x3e29b960u,
+0xbda10de3u, 0x3d1367d1u, 0xbd761f98u, 0x3df6b42du, 0xbd8f9505u, 0xbc72a7d7u, 0xbd4d51a6u, 0x3c8f65e3u, 0xbd361436u, 0x3d851e70u,
+0x3ca2320eu, 0x3c14fe3eu, 0x3c9d7789u, 0xbdc3f9c5u, 0xbda59e6du, 0x3d65a5b5u, 0x3d9c25a6u, 0x3c8f8169u, 0x3d556fd7u, 0xbc78b7dcu,
+0x3dbc2f44u, 0xbd44018eu, 0xbd2d36cdu, 0xbca39e79u, 0xbb9cf22au, 0x3dbfdb77u, 0x3d7bf517u, 0xbdac1d59u, 0x3ca97298u, 0xbbe32574u,
+0x3b6010ccu, 0xbb4bb4bdu, 0x3d172ae8u, 0xbc4ffbd1u, 0x3baa3dc7u, 0x3b5655adu, 0xbc4c83c8u, 0xbb12a317u, 0xbca690deu, 0xbbf82893u,
+0xbcce03fcu, 0x3aa4e253u, 0xbcd382cfu, 0xbc5089ddu, 0x3cdbef54u, 0xbb28ba17u, 0x3c8bc5e9u, 0xbca1684fu, 0xbcfa2450u, 0x3c053326u,
+0x3ca760bfu, 0xbd1b32ceu, 0x3db029f2u, 0xbcc26dcdu, 0xbe34610au, 0xbd3eaddcu, 0xbc3efb25u, 0xbd5af28bu, 0x3da38a83u, 0xbda0f67cu,
+0x3d3330b8u, 0xbbd53a00u, 0x3cf8fd87u, 0x3c007b41u, 0x3a5688b0u, 0x3cf2cb76u, 0xbd0a5f5cu, 0xbc642d3du, 0x3d9626c1u, 0xbcd45ea4u,
+0x3d29f268u, 0x3d1465c1u, 0xbdc85b03u, 0x3dfd52f2u, 0xbc025234u, 0xbb8b0f42u, 0x3d5a1a11u, 0xbb8ce1beu, 0xbcd870c7u, 0x3d95688du,
+0x3da2b075u, 0x3d65a633u, 0x3b9dde7eu, 0x3ccfd35du, 0x3d5d5a04u, 0x3c41abc1u, 0xbd9869beu, 0xbd824179u, 0xbda076a5u, 0xbca52f43u,
+0x3c932610u, 0xbca03f89u, 0xbbe5eb5bu, 0x3c9e2decu, 0xbdb3811au, 0xbdb950b0u, 0x3c2f5c04u, 0x3c13179cu, 0x3d2eaddcu, 0xbc88c421u,
+0x3e033fe6u, 0x3e70d412u, 0x3d49ab21u, 0xbc31318fu, 0xbc817571u, 0x3df8f144u, 0xbe246a41u, 0xbdf125a0u, 0x3dc23e10u, 0xbc8aac23u,
+0xbcf45c53u, 0xbe0711f9u, 0xbe263dd8u, 0xbe86122du, 0xbd84c7a6u, 0xbad0bf94u, 0x3bfc8629u, 0xbdf90256u, 0x3e4af47eu, 0x3e34f38fu,
+0xbdf7b353u, 0x3c1dd31du, 0x3d2921e1u, 0x3e207da4u, 0x3d3e6284u, 0xbc7ef5b4u, 0x3d02cafbu, 0xbbf739b9u, 0x3d9a7484u, 0xbc956d58u,
+0x3b45e1bau, 0x3d04079cu, 0xbca17a75u, 0x3d5a12a1u, 0xbd31cb86u, 0xbd120eedu, 0xbcaaff47u, 0x3ba2c1c4u, 0xbcee4b22u, 0xbb5a2351u,
+0xbe084fdfu, 0x3c6f3e15u, 0xbb4662cbu, 0xbd144a6cu, 0xbb6c06a2u, 0xbd7a5791u, 0x3c9540b7u, 0x3d506b6cu, 0xbcc104a8u, 0xbc7d12e1u,
+0xbca5c4ceu, 0x3c85d859u, 0x3ca16b29u, 0x3c49c32fu, 0x3bad2656u, 0xbcbc141du, 0x3c39292fu, 0x3c2ef926u, 0xbc041af1u, 0x3c7d14d8u,
+0x3cc573c9u, 0x3c95ae89u, 0x3bbed6a2u, 0x3bdd9d02u, 0x3b0bd761u, 0xbc51b4cfu, 0xbbf59815u, 0x3be811c4u, 0x3c9c0935u, 0x3b3db30eu,
+0xbbb9498cu, 0x3ccf10d2u, 0xbd52117cu, 0x3b377085u, 0x3e110e85u, 0x3d2263d3u, 0xbbe15349u, 0x3c00d9c5u, 0xbd1e74dcu, 0xbbfb5702u,
+0x3c9b39a0u, 0xbc6554a2u, 0x3caedfd2u, 0xbd5a09dcu, 0x3a876eb1u, 0xbcbe1524u, 0xbd4beb46u, 0xbcadeac8u, 0x3c9221aau, 0xbbe0577cu,
+0x3c3bdd43u, 0x3d41e1d5u, 0x3d17af32u, 0xbd0dac20u, 0xbb0c0640u, 0xbca2771du, 0x3cd0068au, 0xbdb10efeu, 0x3d7a5492u, 0xbd9c6471u,
+0xbd4a2540u, 0x3cebddb5u, 0x3c37b819u, 0xbc826087u, 0xbd4344a9u, 0x3cb4c4a2u, 0xbd87e915u, 0x3d38a0f5u, 0x3c7305f5u, 0x3d32a147u,
+0xbd39c490u, 0x3c8557e3u, 0xbc614778u, 0xbcd80ac7u, 0x3d6acf08u, 0x3dbbe010u, 0xbcac8104u, 0x3caf09bdu, 0x3ce69beeu, 0xbbba0139u,
+0x3e276a84u, 0x3e4492b3u, 0x3ce3b1c5u, 0x3b8c1815u, 0xbd165de2u, 0x3dbdc028u, 0xbe2a1040u, 0xbe40c2a1u, 0x3e40a1bdu, 0xbd0d58d6u,
+0x3d806c90u, 0xbe318018u, 0xbe0be3e2u, 0xbe71d7aeu, 0xbda936d1u, 0xbd685362u, 0xbcb9a8b2u, 0xbdb9485cu, 0x3e2b258fu, 0x3e3b39deu,
+0xbe100d76u, 0x3d23e0acu, 0xbb979e60u, 0x3e3b2d91u, 0xbc011013u, 0x3df2b37du, 0xbc51f6d1u, 0x3b3c28dcu, 0x3d311c7au, 0x3c6eb84du,
+0x3d8decaeu, 0x3d59476du, 0x3d169215u, 0x3cc3a8fdu, 0x3c1becdau, 0x3d7dcb29u, 0x3cd1c235u, 0xbe0a97a0u, 0x3c5dc779u, 0x3cae6652u,
+0xbc16f7abu, 0x3a61f729u, 0xbd88983cu, 0xbd6879fdu, 0xbd5785c6u, 0xbca72a1eu, 0xbcaa8fc6u, 0xbd579f8au, 0x3c195d9au, 0xbca6213cu,
+0xbcf342f9u, 0xbbbfd232u, 0xbc1b6e23u, 0xbb0b08e6u, 0x3c9bddf6u, 0x3c223cf1u, 0xbc390cdeu, 0xba0541fcu, 0x3c56c8c6u, 0x3b1adb55u,
+0xbc1c3c2du, 0x3cad293eu, 0x3d276c53u, 0x3c4f92ecu, 0xbc25e721u, 0x3d68cd75u, 0x3c2bdc51u, 0xbd00a08bu, 0xbbe115c8u, 0x3c1e0531u,
+0xbccb3208u, 0x3d49d79bu, 0xbb6be129u, 0x3bac4cdau, 0xbcf5051cu, 0x3d4a7396u, 0x3c66a7d0u, 0xbd50e4b0u, 0xbd5bf746u, 0xbd8a2651u,
+0x3d4d3420u, 0xbc3b6c17u, 0x3c1aacf2u, 0x3c6126dbu, 0x3c9df122u, 0x3bf330d1u, 0xbca54984u, 0xbd6f66b6u, 0xbd4aa6e2u, 0x3ccc0754u,
+0x3cf45cf3u, 0x3d7e31f8u, 0xbd81d72eu, 0x3c4d5e77u, 0xbca1b58cu, 0xbd091ca4u, 0xbd3277d8u, 0x3d9e2f18u, 0x3d117b7du, 0x3d7537cfu,
+0x3d9f1f2fu, 0xbd54bb0cu, 0xbc95d1acu, 0xba5ce388u, 0xbdac034du, 0x3be1aa01u, 0xbcbf8d73u, 0x3d500e6fu, 0x3b586458u, 0xbd24fdb6u,
+0xbd8723a9u, 0xbbd70a7du, 0xbc987c38u, 0x3c01dc19u, 0xbd62ab0cu, 0x3d6b672au, 0x3be0c910u, 0xbb8f0c88u, 0x3d1b6830u, 0x3c9c0cadu,
+0x39a9ff00u, 0x3ce178f2u, 0xbcb1da87u, 0x3bb1acfcu, 0x3cd7593eu, 0x3c8086efu, 0x3cafdc40u, 0x3bad4088u, 0x3c395cd9u, 0xbbd0f626u,
+0x3c33cb7du, 0xbc3d6731u,
+};
+// clang-format on
+
+// Anime4K's conv passes as their own NVRTC module (a4kKernelText): the shader's arithmetic (fp32 math, every texture
+// stored as fp16, libplacebo's rgba16f), one kernel a layer, every weight a float literal in the text (an FFMA
+// immediate, like the shader's literal mat4s, instead of a constant-bank operand). A layer = 12 channels as three
+// 4-channel fp16 textures, texture k of pixel i at t[k * ps + i] (8 bytes); 3 x 3 taps clamp at the edges (texOff's
+// clamp-to-edge). Built at the first Anime4K session's setup and cached beside the main kernels' cubin.
+static const char kA4kHead[] = R"A4KSRC(
+extern "C" {
+__device__ __forceinline__ float h2f(unsigned short h)
+{
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+__device__ __forceinline__ unsigned short f2h(float f)
+{
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
+struct A4kLastIn
+{
+    const uint2* l[5]; // conv2d_2 .. conv2d_6
+};
+#define A4K_BX 32
+#define A4K_BY 8
+#define A4K_TX (A4K_BX + 2)
+#define A4K_TY (A4K_BY + 2)
+__device__ __forceinline__ unsigned int a4kPack(float a, float b)
+{
+    return (unsigned int)f2h(a) | ((unsigned int)f2h(b) << 16);
+}
+__device__ __forceinline__ void a4kStore(uint2* __restrict__ out, size_t ps, size_t i, const float* acc)
+{
+#pragma unroll
+    for (int k = 0; k < 3; k++)
+        out[k * ps + i] = make_uint2(a4kPack(acc[4 * k], acc[4 * k + 1]), a4kPack(acc[4 * k + 2], acc[4 * k + 3]));
+}
+)A4KSRC";
+
+// conv2d_tf*'s tile: the source (three fp16 planes, R, G, B: k_restIn's) with a one-pixel clamped border
+static const char kA4kLoad0[] = R"A4KSRC(    __shared__ float s[3][A4K_TY][A4K_TX];
+    const int x0 = blockIdx.x * A4K_BX - 1, y0 = blockIdx.y * A4K_BY - 1;
+    const size_t ps = (size_t)w * h;
+    for (int i = threadIdx.y * A4K_BX + threadIdx.x; i < A4K_TX * A4K_TY; i += A4K_BX * A4K_BY)
+    {
+        const int ly = i / A4K_TX, lx = i % A4K_TX;
+        const int gx = min(max(x0 + lx, 0), w - 1), gy = min(max(y0 + ly, 0), h - 1);
+        const size_t g = (size_t)gy * w + gx;
+#pragma unroll
+        for (int c = 0; c < 3; c++)
+            s[c][ly][lx] = h2f(src[c * ps + g]);
+    }
+    __syncthreads();
+    const int x = blockIdx.x * A4K_BX + threadIdx.x, y = blockIdx.y * A4K_BY + threadIdx.y;
+    if (x >= w || y >= h) return;
+    float v;
+)A4KSRC";
+
+// conv2d_N_tf*'s tile (N = 1..6): the previous layer's CReLU (24 channels) with a one-pixel clamped border
+static const char kA4kLoadM[] = R"A4KSRC(    __shared__ float s[24][A4K_TY][A4K_TX];
+    const int x0 = blockIdx.x * A4K_BX - 1, y0 = blockIdx.y * A4K_BY - 1;
+    const size_t ps = (size_t)w * h;
+    for (int i = threadIdx.y * A4K_BX + threadIdx.x; i < A4K_TX * A4K_TY; i += A4K_BX * A4K_BY)
+    {
+        const int ly = i / A4K_TX, lx = i % A4K_TX;
+        const int gx = min(max(x0 + lx, 0), w - 1), gy = min(max(y0 + ly, 0), h - 1);
+        const size_t g = (size_t)gy * w + gx;
+#pragma unroll
+        for (int k = 0; k < 3; k++)
+        {
+            const uint2 q = in[k * ps + g];
+            const float r[4] = {h2f((unsigned short)(q.x & 0xffff)), h2f((unsigned short)(q.x >> 16)),
+                                h2f((unsigned short)(q.y & 0xffff)), h2f((unsigned short)(q.y >> 16))};
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                s[4 * k + j][ly][lx] = fmaxf(r[j], 0.0f);
+                s[12 + 4 * k + j][ly][lx] = fmaxf(-r[j], 0.0f);
+            }
+        }
+    }
+    __syncthreads();
+    const int x = blockIdx.x * A4K_BX + threadIdx.x, y = blockIdx.y * A4K_BY + threadIdx.y;
+    if (x >= w || y >= h) return;
+    float v;
+)A4KSRC";
+
+// one weight as an exact float literal: the hex form of its own bits (printf %a, the mantissa's trailing zeros cut)
+static void a4kLit(std::string& s, uint32_t bits)
+{
+    float v = 0.0f;
+    memcpy(&v, &bits, sizeof v);
+    char b[48];
+    snprintf(b, sizeof b, "%a", (double)v);
+    const char* p = strchr(b, 'p');
+    std::string m(b, p ? (size_t)(p - b) : strlen(b));
+    if (m.find('.') != std::string::npos)
+    {
+        while (m.back() == '0')
+            m.pop_back();
+        if (m.back() == '.')
+            m.pop_back();
+    }
+    s += m;
+    if (p)
+        s += p;
+    s += 'f';
+}
+
+// a 3 x 3 layer's sums: the biases, then per input channel c, per tap t, the 12 outputs' FMAs (blk = its weight block,
+// nin = 3 or 24 input channels)
+static void a4kConvBody(std::string& s, const uint32_t* blk, int nin)
+{
+    s += "    float acc[12] = {";
+    for (int o = 0; o < 12; o++)
+    {
+        a4kLit(s, blk[(size_t)nin * 9 * 12 + o]);
+        s += o < 11 ? ", " : "};\n";
+    }
+    char ln[96];
+    for (int c = 0; c < nin; c++)
+        for (int t = 0; t < 9; t++)
+        {
+            sprintf_s(ln, "    v = s[%d][threadIdx.y + %d][threadIdx.x + %d];\n", c, t / 3, t % 3);
+            s += ln;
+            for (int o = 0; o < 12; o++)
+            {
+                sprintf_s(ln, "    acc[%d] = fmaf(", o);
+                s += ln;
+                a4kLit(s, blk[((size_t)o * nin + c) * 9 + t]);
+                sprintf_s(ln, ", v, acc[%d]);\n", o);
+                s += ln;
+            }
+        }
+    s += "    a4kStore(out, ps, (size_t)y * w + x, acc);\n}\n";
+}
+
+// the module's whole text: k_a4kConv0 (layer 0), k_a4kConv_1 .. _6, k_a4kLast (the 1 x 1 over the CReLU of layers 2..6
+// -> the three last textures as 12 fp16 planes, plane 4 k + j = texture k's channel j: k_a4kFoldHSub's input)
+static void a4kKernelText(std::string& s)
+{
+    s.reserve((size_t)2 << 20);
+    s = kA4kHead;
+    s += "__global__ void __launch_bounds__(A4K_BX * A4K_BY) k_a4kConv0(const unsigned short* __restrict__ src, int w, "
+         "int h, uint2* __restrict__ out)\n{\n";
+    s += kA4kLoad0;
+    a4kConvBody(s, kA4kWeights, 3);
+    char ln[160];
+    for (int L = 1; L < 7; L++)
+    {
+        sprintf_s(
+            ln,
+            "__global__ void __launch_bounds__(A4K_BX * A4K_BY) k_a4kConv_%d(const uint2* __restrict__ in, int w, "
+            "int h, uint2* __restrict__ out)\n{\n",
+            L);
+        s += ln;
+        s += kA4kLoadM;
+        a4kConvBody(s, kA4kWeights + kA4kW0 + (size_t)(L - 1) * kA4kW, 24);
+    }
+    const uint32_t* wl = kA4kWeights + kA4kW0 + 6 * kA4kW;
+    s += "__global__ void __launch_bounds__(A4K_BX * A4K_BY) k_a4kLast(A4kLastIn in, int w, int h, unsigned short* "
+         "__restrict__ out)\n{\n"
+         "    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;\n"
+         "    if (x >= w || y >= h) return;\n"
+         "    const size_t ps = (size_t)w * h, i = (size_t)y * w + x;\n"
+         "    float acc[12] = {";
+    for (int o = 0; o < 12; o++)
+    {
+        a4kLit(s, wl[1440 + o]);
+        s += o < 11 ? ", " : "};\n";
+    }
+    s += "    float pos, neg;\n    uint2 q;\n    float r[4];\n";
+    for (int L = 0; L < 5; L++)
+        for (int k = 0; k < 3; k++)
+        {
+            sprintf_s(ln, "    q = in.l[%d][%d * ps + i];\n", L, k);
+            s += ln;
+            s += "    r[0] = h2f((unsigned short)(q.x & 0xffff)); r[1] = h2f((unsigned short)(q.x >> 16));\n"
+                 "    r[2] = h2f((unsigned short)(q.y & 0xffff)); r[3] = h2f((unsigned short)(q.y >> 16));\n";
+            for (int j = 0; j < 4; j++)
+            {
+                sprintf_s(ln, "    pos = fmaxf(r[%d], 0.0f); neg = fmaxf(-r[%d], 0.0f);\n", j, j);
+                s += ln;
+                for (int o = 0; o < 12; o++)
+                {
+                    sprintf_s(ln, "    acc[%d] = fmaf(", o);
+                    s += ln;
+                    a4kLit(s, wl[(size_t)o * 120 + 24 * L + 4 * k + j]);
+                    sprintf_s(ln, ", pos, acc[%d]);\n    acc[%d] = fmaf(", o, o);
+                    s += ln;
+                    a4kLit(s, wl[(size_t)o * 120 + 24 * L + 12 + 4 * k + j]);
+                    sprintf_s(ln, ", neg, acc[%d]);\n", o);
+                    s += ln;
+                }
+            }
+        }
+    s +=
+        "#pragma unroll\n    for (int o = 0; o < 12; o++)\n        out[o * ps + i] = f2h(acc[o]);\n}\n} // extern \"C\"\n";
+}
+
+// this session's Anime4K module: its text compiled (or the cached cubin) and loaded, its eight kernels bound; false =
+// `why` says what failed (the session teardown unloads a module left in a4kMod)
+static bool nativeA4kModule(NativeRife& nr, std::string& why)
+{
+    if (nr.a4kMod)
+        return true;
+    std::string text;
+    a4kKernelText(text);
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_anime4k.cu", L"smv_anime4k", "Anime4K kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.a4kMod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.a4kMod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    static const char* const kNames[8] = {"k_a4kConv0",  "k_a4kConv_1", "k_a4kConv_2", "k_a4kConv_3",
+                                          "k_a4kConv_4", "k_a4kConv_5", "k_a4kConv_6", "k_a4kLast"};
+    for (int i = 0; i < 8; i++)
+        if (cuModuleGetFunction(&nr.fA4k[i], nr.a4kMod, kNames[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kNames[i] + " is missing";
+            return false;
+        }
+    return true;
+}
+
+// the conv passes on nr.stream: dA4kIn -> the layers in their slots (layer -> slot 0 1 2 0 1 3 4: a slot is reused
+// once its layer's only reader has run; layers 2..6 stay for the 1 x 1) -> dA4kOut
+static bool nativeA4kPasses(NativeRife& nr, cudaStream_t st)
+{
+    int w = nr.a4kW, h = nr.a4kH;
+    const size_t lb = (size_t)3 * w * h * 8;
+    static const int kSlot[7] = {0, 1, 2, 0, 1, 3, 4};
+    void* t[7];
+    for (int i = 0; i < 7; i++)
+        t[i] = (char*)nr.dA4kT + kSlot[i] * lb;
+    const unsigned gx = (unsigned)(w + 31) / 32, gy = (unsigned)(h + 7) / 8; // A4K_BX x A4K_BY
+    void* a0[] = {&nr.dA4kIn, &w, &h, &t[0]};
+    if (cuLaunchKernel(nr.fA4k[0], gx, gy, 1, 32, 8, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
+        return false;
+    for (int L = 1; L < 7; L++)
+    {
+        void* a[] = {&t[L - 1], &w, &h, &t[L]};
+        if (cuLaunchKernel(nr.fA4k[L], gx, gy, 1, 32, 8, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+            return false;
+    }
+    void* li[5] = {t[2], t[3], t[4], t[5], t[6]}; // A4kLastIn
+    void* al[] = {li, &w, &h, &nr.dA4kOut};
+    return cuLaunchKernel(nr.fA4k[7], gx, gy, 1, 32, 8, 1, 0, (CUstream)st, al, nullptr) == CUDA_SUCCESS;
+}
+
+// Anime4K at the slot's input size w x h (-> ow x oh after the fold): its kernel module (nativeA4kModule), the input,
+// the five layer slots, the output and the fold's buffers, then one run of the passes on zeros, so the first frame pays
+// no first launch. A module that fails or a failed allocation = Lanczos for the session (vsrFailed), with its line.
+static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string why;
+    if (!nativeA4kModule(nr, why))
+    {
+        LOG("native: Anime4K unavailable (%s), Lanczos for the %s\n", why.c_str(), g_offline ? "render" : "session");
+        nr.vsrFailed = true;
+        return true;
+    }
+    const size_t sp = (size_t)w * h;
+    if (cudaMalloc(&nr.dA4kIn, 3 * sp * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&nr.dA4kT, 5 * 3 * sp * 8) != cudaSuccess ||
+        cudaMalloc(&nr.dA4kOut, 12 * sp * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc((void**)&nr.dA4kTmp, (size_t)3 * ow * 2 * h * sizeof(float)) != cudaSuccess)
+    {
+        cudaGetLastError();
+        nativeA4kRelease(nr);
+        LOG("native: Anime4K ran out of video memory, Lanczos for the %s\n", g_offline ? "render" : "session");
+        nr.vsrFailed = true;
+        return true;
+    }
+    nr.a4kW = w;
+    nr.a4kH = h;
+    nr.a4kOw = ow;
+    NCHK(cudaMemsetAsync(nr.dA4kIn, 0, 3 * sp * sizeof(uint16_t), nr.stream), "Anime4K warm-up clear");
+    if (!nativeA4kPasses(nr, nr.stream))
+    {
+        LOG("native: Anime4K warm-up launch failed\n");
+        return false;
+    }
+    NCHK(cudaStreamSynchronize(nr.stream), "Anime4K warm-up sync");
+    LOG("native: %s upscale: Anime4K Upscale CNN x2 UL %dx%d -> %dx%d -> Lanczos %dx%d%s%s (CUDA passes, %.1fs)\n",
+        g_offline ? "offline" : "live", w, h, 2 * w, 2 * h, ow, oh,
+        nr.vsrPre ? ", the captured frame before the model" : "",
+        nr.hdr ? ", on the HDR planes' SDR view" : (upEnc ? ", on the HDR video's SDR view" : ""),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return true;
+}
+
+// one frame through Anime4K: s (planar, fp32 or fp16 by sHalf, plane / row strides ps_ / rs_) at the passes' input
+// size into their fp16 input (k_restIn), the conv passes on nr.stream, then the fold (the Depth-to-Space pass and the
+// Lanczos pair from 2w x 2h to tw x th) into dst (planar fp32, tight; the clamp to 0..1 folded in, as Restore's fold
+// does)
+static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th)
+{
+    cudaStream_t st = nr.stream;
+    int w = nr.a4kW, h = nr.a4kH;
+    if (tw > nr.a4kOw)
+    {
+        nr.die("Anime4K fold target wider than its buffer");
+        return false;
+    }
+    void* a[] = {(void*)&s, &sHalf, &ps_, &rs_, &w, &h, &nr.dA4kIn};
+    if (cuLaunchKernel(nr.fRestIn, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
+        CUDA_SUCCESS)
+    {
+        nr.die("Anime4K input launch failed");
+        return false;
+    }
+    if (!nativeA4kPasses(nr, st))
+    {
+        nr.die("Anime4K pass launch failed");
+        return false;
+    }
+    int half = 1, h2 = 2 * h;
+    const void* tabH = rsTabFor(nr, 2 * w, tw, st);
+    const void* tabV = rsTabFor(nr, h2, th, st);
+    if (!tabH || !tabV)
+    {
+        nr.die("Anime4K fold tap tables failed");
+        return false;
+    }
+    void* ahs[] = {&nr.dA4kOut, &half, &nr.dA4kIn, &w, &h, &nr.dA4kTmp, &tw, (void*)&tabH};
+    if (cuLaunchKernel(nr.fA4kFoldHSub, (tw + 15) / 16, (h2 + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ahs, nullptr) !=
+        CUDA_SUCCESS)
+    {
+        nr.die("Anime4K fold (horizontal) launch failed");
+        return false;
+    }
+    void* av[] = {&nr.dA4kTmp, &tw, &h2, &dst, &th, (void*)&tabV};
+    if (cuLaunchKernel(nr.fRestFoldV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av, nullptr) !=
+        CUDA_SUCCESS)
+    {
+        nr.die("Anime4K fold (vertical) launch failed");
+        return false;
+    }
+    return true;
+}
+
+static void nativeA4kRelease(NativeRife& nr)
+{
+    if (nr.stream && nr.dA4kT)
+        cudaStreamSynchronize(nr.stream);
+    for (void** p : {&nr.dA4kIn, &nr.dA4kT, &nr.dA4kOut, (void**)&nr.dA4kTmp})
+        if (*p)
+        {
+            cudaFree(*p);
+            *p = nullptr;
+        }
+    nr.a4kW = nr.a4kH = nr.a4kOw = 0;
+}
+
 // native DRBA's buffers (both routes): the ring of pictures at the pictures' pad, everything the
 // motion search uses at the model's frame (RIFE's two domains: the motion frame, where the ring also
 // keeps the motion frames and the IFNet's x; else the pictures' pad, the encode's fp16 frame in dXh's
@@ -11946,6 +15761,17 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
             nr.fsrUpDir = dir;
         }
     }
+    // Anime4K (--anime4k) takes RTX VSR's resize under the same rules; it excludes RTX VSR and AMD FSR upscaling the
+    // way those two exclude each other (either of them wins a command line with both). Its kernels build at the
+    // session's setup (nativeA4kSetup)
+    if (g_a4kUp && (g_rtxVsr || g_fsrUp))
+        LOG("native: --anime4k ignored: %s holds the resize (the upscalers exclude each other)\n",
+            g_rtxVsr ? "RTX VSR" : "AMD FSR upscaling");
+    else if (g_a4kUp)
+    {
+        nr.vsrWant = true;
+        nr.a4kUp = true;
+    }
     if (!(g_hdr && g_rtxHdr))
         return true;
     if (!rtxBridgeLoad())
@@ -12194,6 +16020,141 @@ static size_t trtTensorBytes(nvinfer1::ICudaEngine* eng, const char* nm)
 // GMFSS's eight contexts enqueue one after another on nr.stream (their aux streams join it at each enqueue's end), so
 // they share ONE activation block, the largest net's, instead of one each: set before the warm-up, so a whole-graph
 // capture records its address. SMV_GM_CTXSHARE=0 = each context its own (TensorRT's default).
+// Restore on the host's kernels: its channels-last activations (Real-ESRGAN: two 64-half frames at the source size;
+// AnimeJaNai: eight at the half grid: x0, the first block's output, two block ping-pong frames, c1, c2, c3, the concat
+// conv's output), 0 = not this route
+static size_t restNatBytes(const NativeRife& nr)
+{
+    if (nr.restNatKind == 2)
+        return 8 * (size_t)((srcW(nr) + 1) / 2) * (size_t)((srcH(nr) + 1) / 2) * 128;
+    return nr.restNat ? 2 * (size_t)srcW(nr) * (size_t)srcH(nr) * 128 : 0;
+}
+
+// AnimeJaNai on st: dRestIn -> k_ajFirst -> per block 3 x k_restConvMid + k_ajAtt -> k_ajCat -> k_restConvLast ->
+// dRestOut (48 fp16 sub-pixel planes at the half grid); false = a launch failed
+static bool ajNatRun(NativeRife& nr, cudaStream_t st)
+{
+    int sw = srcW(nr), sh = srcH(nr), hw = nr.restSubW, hh = nr.restSubH, n = hw * hh;
+    const size_t nb = (size_t)n * 128;
+    auto at = [&](size_t i) { return (void*)((char*)nr.dRestW + nr.restNatOff[i]); };
+    auto buf = [&](int i) { return (void*)((char*)nr.dRestA + (size_t)i * nb); };
+    void *x0 = buf(0), *out1 = buf(1), *tA = buf(2), *tB = buf(3), *c1 = buf(4), *c2 = buf(5), *c3 = buf(6),
+         *cat = buf(7);
+    const unsigned gx = (unsigned)(hw + 31) / 32, gy = (unsigned)(hh + 7) / 8, gp = (unsigned)(n + 127) / 128,
+                   smem = 10 * 34 * 128;
+    void *w0 = at(0), *b0 = at(1);
+    void* a0[] = {&nr.dRestIn, &sw, &sh, &x0, &w0, &b0, &hw, &hh};
+    if (cuLaunchKernel(nr.fAjFirst, gx, gy, 1, 256, 1, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
+        return false;
+    void* t = x0;
+    for (int k = 0; k < nr.restNatBlocks; k++)
+    {
+        void* io[3][2] = {{t, c1}, {c1, c2}, {c2, c3}};
+        for (int j = 0; j < 3; j++)
+        {
+            const size_t o = (size_t)(2 + 11 * k + 3 * j);
+            void *wf = at(o), *bs = at(o + 1), *sl = at(o + 2);
+            void* a[] = {&io[j][0], &io[j][1], &wf, &bs, &sl, &hh, &hw};
+            if (cuLaunchKernel(nr.fRestConvMid, gx, gy, 1, 128, 1, 1, smem, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+                return false;
+        }
+        void* dst = k == 0 ? out1 : (t == tA ? tB : tA);
+        void *wa = at((size_t)(11 + 11 * k)), *ba = at((size_t)(12 + 11 * k));
+        void* aa[] = {&c3, &t, &dst, &wa, &ba, &n};
+        if (cuLaunchKernel(nr.fAjAtt, gp, 1, 1, 128, 1, 1, 0, (CUstream)st, aa, nullptr) != CUDA_SUCCESS)
+            return false;
+        t = dst;
+    }
+    const size_t tail = (size_t)(2 + 11 * nr.restNatBlocks);
+    void *wc = at(tail), *bc = at(tail + 1), *wl = at(tail + 2), *bl = at(tail + 3);
+    void* ac[] = {&x0, &t, &out1, &c1, &cat, &wc, &bc, &n};
+    if (cuLaunchKernel(nr.fAjCat, gp, 1, 1, 128, 1, 1, 0, (CUstream)st, ac, nullptr) != CUDA_SUCCESS)
+        return false;
+    void* al[] = {&cat, &nr.dRestOut, &wl, &bl, &hh, &hw};
+    return cuLaunchKernel(nr.fRestConvLast, gx, gy, 1, 128, 1, 1, smem, (CUstream)st, al, nullptr) == CUDA_SUCCESS;
+}
+
+// one Restore on the host's kernels on st: dRestIn (three fp16 planes) -> k_restConv0 -> 16 x k_restConvMid ->
+// k_restConvLast -> dRestOut (48 fp16 sub-pixel planes); AnimeJaNai = ajNatRun; false = a launch failed
+static bool restNatRun(NativeRife& nr, cudaStream_t st)
+{
+    if (nr.restNatKind == 2)
+        return ajNatRun(nr, st);
+    int w = srcW(nr), h = srcH(nr);
+    auto at = [&](int i) { return (void*)((char*)nr.dRestW + nr.restNatOff[(size_t)i]); };
+    const unsigned gx = (unsigned)(w + 31) / 32, gy = (unsigned)(h + 7) / 8, smem = 10 * 34 * 128;
+    void *w0 = at(0), *b0 = at(1), *s0 = at(2);
+    void* a0[] = {&nr.dRestIn, &nr.dRestA, &w0, &b0, &s0, &h, &w};
+    if (cuLaunchKernel(nr.fRestConv0, gx, gy, 1, 256, 1, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
+        return false;
+    void *s = nr.dRestA, *d = nr.dRestB;
+    for (int L = 0; L < 16; L++)
+    {
+        void *wf = at(3 + 3 * L), *bs = at(4 + 3 * L), *sl = at(5 + 3 * L);
+        void* a[] = {&s, &d, &wf, &bs, &sl, &h, &w};
+        if (cuLaunchKernel(nr.fRestConvMid, gx, gy, 1, 128, 1, 1, smem, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+            return false;
+        std::swap(s, d);
+    }
+    void *wl = at(51), *bl = at(52);
+    void* al[] = {&s, &nr.dRestOut, &wl, &bl, &h, &w};
+    return cuLaunchKernel(nr.fRestConvLast, gx, gy, 1, 128, 1, 1, smem, (CUstream)st, al, nullptr) == CUDA_SUCCESS;
+}
+
+// Restore on the host's kernels for this session: the weights uploaded, dRestIn / dRestOut, the ping-pong (inside the
+// shared activation block when that holds it: every enqueue there runs one after another on nr.stream, Restore
+// first), one run on zeros; the engine route's facts it reads (fp16 in and out, 48 sub-pixel planes at x4)
+static bool restNatSetup(NativeRife& nr)
+{
+    std::vector<uint8_t> blob;
+    std::string why;
+    const bool aj = nr.restNatKind == 2;
+    if (!(aj ? ajNatLoad(g_restoreModel, blob, nr.restNatOff, nr.restNatBlocks, why)
+             : restNatLoad(blob, nr.restNatOff, why)))
+    {
+        LOG("native: Restore on the host's kernels failed (%s)\n", why.c_str());
+        return false;
+    }
+    nr.restHalfIn = nr.restHalfOut = true;
+    nr.restSub = true;
+    nr.restScale = aj ? 2 : 4;
+    nr.restSubS = 4;
+    nr.restSubW = aj ? (srcW(nr) + 1) / 2 : srcW(nr);
+    nr.restSubH = aj ? (srcH(nr) + 1) / 2 : srcH(nr);
+    nr.restSubBase = !aj;
+    const size_t sp = (size_t)srcW(nr) * srcH(nr), pp = restNatBytes(nr);
+    if (!nr.dRestW)
+        NCHK(cudaMalloc(&nr.dRestW, blob.size()), "alloc restore weights");
+    NCHK(cudaMemcpy(nr.dRestW, blob.data(), blob.size(), cudaMemcpyHostToDevice), "restore weights upload");
+    if (!nr.dRestIn)
+        NCHK(cudaMalloc(&nr.dRestIn, 3 * sp * sizeof(uint16_t)), "alloc restore input");
+    if (!nr.dRestOut)
+        NCHK(cudaMalloc(&nr.dRestOut, 48 * (size_t)nr.restSubW * nr.restSubH * sizeof(uint16_t)),
+             "alloc restore output");
+    if (nr.dGmCtxMem && nr.gmCtxMemB >= (int64_t)pp)
+    {
+        nr.dRestA = nr.dGmCtxMem;
+        nr.restNatOwn = false;
+    }
+    else if (!nr.dRestA)
+    {
+        nr.restNatOwn = true;
+        NCHK(cudaMalloc(&nr.dRestA, pp), "alloc restore activations");
+    }
+    nr.dRestB = (char*)nr.dRestA + pp / 2; // Real-ESRGAN's pong
+    NCHK(cudaMemsetAsync(nr.dRestIn, 0, 3 * sp * sizeof(uint16_t), nr.stream), "restore warm-up clear");
+    if (!restNatRun(nr, nr.stream))
+    {
+        LOG("native: restore warm-up launch failed\n");
+        return false;
+    }
+    NCHK(cudaStreamSynchronize(nr.stream), "restore warm-up sync");
+    LOG("native: Restore = %s on the host's kernels at %dx%d (fp16 accumulate; its %.0f MB of activations %s)\n",
+        aj ? "AnimeJaNai (SPAN-F3)" : "Real-ESRGAN", srcW(nr), srcH(nr), pp / 1048576.0,
+        nr.restNatOwn ? "on their own" : "in the shared activation block");
+    return true;
+}
+
 static bool nativeGmShareMemory(NativeRife& nr)
 {
     int64_t need = 0, sum = 0;
@@ -12205,7 +16166,8 @@ static bool nativeGmShareMemory(NativeRife& nr)
     }
     // Restore (live and offline, before the model on the same stream) takes the block too; it grows to Restore's size
     // when that is the larger
-    const int64_t rb = nr.ctxRest ? nr.engRest->getDeviceMemorySizeV2() : 0, blk = (std::max)(need, rb);
+    const int64_t rb = nr.ctxRest ? nr.engRest->getDeviceMemorySizeV2() : (int64_t)restNatBytes(nr),
+                  blk = (std::max)(need, rb);
     if (blk > 0 && cudaMalloc(&nr.dGmCtxMem, (size_t)blk) != cudaSuccess)
     {
         LOG("native: gmfss shared activation block (%.0f MB) alloc failed\n", blk / 1048576.0);
@@ -12241,6 +16203,13 @@ static bool nativeModelShareMemory(NativeRife& nr)
             sum += b;
             n++;
         }
+    if (nr.restNat) // Restore on the host's kernels: its ping-pong takes the block too
+    {
+        const int64_t b = (int64_t)restNatBytes(nr);
+        need = (std::max)(need, b);
+        sum += b;
+        n++;
+    }
     if (!n)
         return true;
     if (need > 0 && cudaMalloc(&nr.dGmCtxMem, (size_t)need) != cudaSuccess)
@@ -12860,15 +16829,20 @@ static bool nativeTrtInit(NativeRife& nr)
     // resident host: the same engine pair stays loaded across sessions, only the two
     // execution contexts are recreated (measured: engine deserialize 0.10 s +
     // jit cache 1.0 to 3.5 s per start against 0.3 to 0.8 s for the contexts alone)
-    // live Restore: the Real-ESRGAN engine loads beside the pair when the handoff
-    // named one, its dtypes read off the engine (x / y are fp16 as python exports the .half()
-    // net; fp32 is accepted too), and one warm enqueue on zeros so the first presented frame
-    // pays no kernel specialisation (the merged jit cache makes that cheap)
+    // live Restore: a --restore-model engine loads beside the pair when the handoff
+    // named one, its dtypes read off the engine (fp16 or fp32), and one warm enqueue on zeros so the
+    // first presented frame pays no kernel specialisation (the merged jit cache makes that cheap);
+    // the bundled Real-ESRGAN = restNatSetup instead
     auto dt = [](nvinfer1::ICudaEngine* e, const char* n) { return e->getTensorDataType(n); };
+    // Restore on the host's kernels: no engine to load
+    nr.restNatKind = nr.restorePath == kRestNative ? 1 : (nr.restorePath == kRestNativeAj ? 2 : 0);
+    nr.restNat = nr.restNatKind != 0;
     auto restoreReady = [&]() -> bool {
+        if (nr.restNat)
+            return restNatSetup(nr);
         if (!nr.engRest)
             return true;
-        // one input and one output, their names read off the engine (Real-ESRGAN x / y, AnimeJaNai input / output)
+        // one input and one output, their names read off the engine (AnimeJaNai: input / output)
         nr.restIn.clear();
         nr.restOut.clear();
         for (int i = 0; i < nr.engRest->getNbIOTensors(); i++)
@@ -12906,12 +16880,27 @@ static bool nativeTrtInit(NativeRife& nr)
             LOG("native: restore setInputShape rejected (engine built for another size)\n");
             return false;
         }
-        // the scale = the output's width over the input's (one integer factor on both axes, at most 4: dRestTmp)
+        // the scale = the output's width over the input's (one integer factor on both axes, at most 4: dRestTmp); an
+        // output of 3 s^2 planes at the input size = the graph ends before its PixelShuffle + nearest-base add,
+        // which the fold then does (k_restFoldHSub)
         const nvinfer1::Dims od = nr.ctxRest->getTensorShape(nr.restOut.c_str());
-        nr.restScale = od.nbDims == 4 && od.d[3] % srcW(nr) == 0 ? (int)(od.d[3] / srcW(nr)) : 0;
-        if (nr.restScale < 1 || nr.restScale > 4 || od.d[1] != 3 || od.d[2] != (int64_t)nr.restScale * srcH(nr))
+        nr.restSub = false;
+        if (od.nbDims == 4 && od.d[2] == srcH(nr) && od.d[3] == srcW(nr))
+            for (int s = 2; s <= 4; s++)
+                if (od.d[1] == 3LL * s * s)
+                {
+                    nr.restSub = true;
+                    nr.restScale = nr.restSubS = s;
+                    nr.restSubW = srcW(nr);
+                    nr.restSubH = srcH(nr);
+                    nr.restSubBase = true;
+                }
+        if (!nr.restSub)
+            nr.restScale = od.nbDims == 4 && od.d[3] % srcW(nr) == 0 ? (int)(od.d[3] / srcW(nr)) : 0;
+        if (!nr.restSub &&
+            (nr.restScale < 1 || nr.restScale > 4 || od.d[1] != 3 || od.d[2] != (int64_t)nr.restScale * srcH(nr)))
         {
-            LOG("native: restore engine output shape is not 3 x (s*h) x (s*w), s 1 to 4\n");
+            LOG("native: restore engine output shape is neither 3 x (s*h) x (s*w) nor 3 s^2 x h x w, s 1 to 4\n");
             return false;
         }
         // the input and output in the engine's own dtypes (fp16 as exported), so they are sized here, once the engine
@@ -13046,7 +17035,7 @@ static bool nativeTrtInit(NativeRife& nr)
             g_res.engRest = nullptr;
             g_res.restorePath.clear();
         }
-        if (!nr.restorePath.empty())
+        if (!nr.restorePath.empty() && !nr.restNat)
         {
             nr.engRest = nativeLoadEngine(nr, nr.restorePath, &nr.cfgRest, &nr.ctxRest);
             if (!nr.engRest)
@@ -13117,7 +17106,7 @@ static bool nativeTrtInit(NativeRife& nr)
                 g_res.engRest = nullptr;
             }
             g_res.restorePath.clear();
-            if (!nr.restorePath.empty())
+            if (!nr.restorePath.empty() && !nr.restNat)
             {
                 nr.engRest = nativeLoadEngine(nr, nr.restorePath, &nr.cfgRest, &nr.ctxRest);
                 if (!nr.engRest)
@@ -13154,7 +17143,7 @@ static bool nativeTrtInit(NativeRife& nr)
         if (!nr.engEnc)
             return false;
     }
-    if (!nr.restorePath.empty())
+    if (!nr.restorePath.empty() && !nr.restNat)
     {
         nr.engRest = nativeLoadEngine(nr, nr.restorePath, &nr.cfgRest, &nr.ctxRest);
         if (!nr.engRest)
@@ -13268,6 +17257,7 @@ static void nativeFree(NativeRife& nr)
     nativeNvofFree(nr);     // the Optical Flow session and its buffers (nvof sessions only)
     nativeFrucFree(nr);     // the bridge's FRUC instance and its surfaces (fruc sessions only)
     nativeFsrupRelease(nr); // the FSR upscaler and its vector session (fsrUp sessions only)
+    nativeA4kRelease(nr);   // Anime4K's buffers (a4kUp sessions only)
     // release the TrueHDR feature on the compute thread, before the CUDA teardown
     if (nr.thdrN && !g_offline) // offline logs its own line with the light levels
         LOG("native: TrueHDR eval %.2f ms mean, %.2f ms max, over %llu real frames\n", nr.thdrMs / (double)nr.thdrN,
@@ -13517,6 +17507,13 @@ static void nativeFree(NativeRife& nr)
           (void*)nr.dRest,    (void*)nr.dStaticFlag, (void*)nr.dThdrStats, (void*)nr.dShIn,   (void*)nr.dShOut})
         if (p)
             cudaFree(p);
+    if (nr.restNatOwn && nr.dRestA) // else the activations sit in the shared activation block
+        cudaFree(nr.dRestA);
+    if (nr.dRestW)
+        cudaFree(nr.dRestW);
+    nr.dRestA = nr.dRestB = nr.dRestW = nullptr;
+    nr.restNat = nr.restNatOwn = false;
+    nr.restNatKind = 0;
     if (nr.hStaticFlag)
     {
         cudaFreeHost(nr.hStaticFlag);
@@ -13664,6 +17661,11 @@ static void nativeFree(NativeRife& nr)
     if (nr.cuMod && nr.cuMod != g_res.cuMod)
         cuModuleUnload(nr.cuMod);
     nr.cuMod = nullptr;
+    if (nr.a4kMod)
+        cuModuleUnload(nr.a4kMod);
+    nr.a4kMod = nullptr;
+    for (CUfunction& f : nr.fA4k)
+        f = nullptr;
     if (nr.stream)
     {
         cudaStreamDestroy(nr.stream);
@@ -14786,14 +18788,25 @@ static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, fl
                 return false;
             }
     }
-    nvinfer1::Dims4 din{1, 3, sh, sw};
-    nr.ctxRest->setTensorAddress(nr.restIn.c_str(), nr.dRestIn);
-    nr.ctxRest->setTensorAddress(nr.restOut.c_str(), nr.dRestOut);
-    if (!nr.ctxRest->setInputShape(nr.restIn.c_str(), din) || !nr.ctxRest->enqueueV3(st))
+    if (nr.restNat)
     {
-        LOG("native: restore failed, dropping the pass for the rest of the %s\n", g_offline ? "render" : "session");
-        nr.restFailed = true;
-        return true;
+        if (!restNatRun(nr, st))
+        {
+            nr.die("restore kernel launch failed");
+            return false;
+        }
+    }
+    else
+    {
+        nvinfer1::Dims4 din{1, 3, sh, sw};
+        nr.ctxRest->setTensorAddress(nr.restIn.c_str(), nr.dRestIn);
+        nr.ctxRest->setTensorAddress(nr.restOut.c_str(), nr.dRestOut);
+        if (!nr.ctxRest->setInputShape(nr.restIn.c_str(), din) || !nr.ctxRest->enqueueV3(st))
+        {
+            LOG("native: restore failed, dropping the pass for the rest of the %s\n", g_offline ? "render" : "session");
+            nr.restFailed = true;
+            return true;
+        }
     }
     // w4 / h4 = the model's output size (restScale x the input: Real-ESRGAN 4, AnimeJaNai 2)
     int half = nr.restHalfOut ? 1 : 0, w4 = nr.restScale * sw, h4 = nr.restScale * sh, ps4 = w4 * h4;
@@ -14806,9 +18819,13 @@ static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, fl
         nr.die("restore fold tap tables failed");
         return false;
     }
+    int inHalf = nr.restHalfIn ? 1 : 0;
+    const void* base = nr.restSubBase ? nr.dRestIn : nullptr; // Real-ESRGAN adds the nearest base, AnimeJaNai none
     void* ah[] = {&nr.dRestOut, &half, &ps4, &w4, &w4, &h4, &nr.dRestTmp, &tw, (void*)&tabH};
-    if (cuLaunchKernel(nr.fRestFoldH, (tw + 15) / 16, (h4 + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah, nullptr) !=
-        CUDA_SUCCESS)
+    void* ahs[] = {&nr.dRestOut, &half, (void*)&base, &inHalf,      &nr.restSubS, &nr.restSubW,
+                   &nr.restSubH, &w4,   &h4,          &nr.dRestTmp, &tw,          (void*)&tabH};
+    if (cuLaunchKernel(nr.restSub ? nr.fRestFoldHSub : nr.fRestFoldH, (tw + 15) / 16, (h4 + 15) / 16, 1, 16, 16, 1, 0,
+                       (CUstream)st, nr.restSub ? ahs : ah, nullptr) != CUDA_SUCCESS)
     {
         nr.die("restFoldH launch failed");
         return false;
@@ -15849,9 +19866,9 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
 {
     cudaStream_t st = nr.stream;
     const bool resize = tw != sw || th != sh;
-    const bool vsrNow = vsrHere && nr.vsr && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp);
+    const bool vsrNow = vsrHere && nr.vsr && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp || nr.a4kUp);
     staged = false;
-    if (withRestore && nr.restore && nr.ctxRest && !nr.restFailed)
+    if (withRestore && nr.restore && (nr.ctxRest || nr.restNat) && !nr.restFailed)
     {
         if (vsrNow)
         {
@@ -15876,7 +19893,29 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
     {
         bool haveVsr = false;
         const int hlg = (enc ? enc : nr.encPost) == 2 ? 1 : 0;
-        if (vsrNow)
+        if (vsrNow && nr.a4kUp)
+        {
+            // Anime4K: the planes (HDR video: their SDR view, as RTX VSR reads it) through its x2 engine and the
+            // Lanczos pair into nr.dPres; HDR video comes back to the codes in RTX VSR's block below
+            const void* a4kSrc = src;
+            int aHalf = srcHalf, aps = ps, ars = rs;
+            if (enc)
+            {
+                if (!nativeHdrEnc(nr, src, srcHalf, ps, rs, sw, sh, nr.dVsrView, 0, sw * sh, sw, enc, 1.0f, 0.0f))
+                {
+                    nr.die("Anime4K SDR view launch failed");
+                    return false;
+                }
+                a4kSrc = nr.dVsrView;
+                aHalf = 0;
+                aps = sw * sh;
+                ars = sw;
+            }
+            if (!nativeA4kRun(nr, a4kSrc, aHalf, aps, ars, nr.dPres, tw, th))
+                return false;
+            haveVsr = true;
+        }
+        else if (vsrNow)
         {
             // HDR video (enc: src holds the codes, restored or not): RTX VSR takes SDR, so it reads the frame's SDR
             // view (knee 1, head 0) and comes back to the codes below; AMD FSR upscaling takes the codes in linear
@@ -15978,7 +20017,8 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
         else if (haveVsr)
         {
             void* a[] = {&nr.dVsrOut, (void*)&tw, (void*)&th, &nr.dPres};
-            if (cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
+            if (!nr.a4kUp && // Anime4K wrote nr.dPres itself
+                cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
                                1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("unpackBgraRgb launch failed");
@@ -16493,7 +20533,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // RTX HDR converts later), folded straight to the model size and into the model frame with the packers'
     // replicate pad, so every model reads restored frames; it replaces the resize below. When the
     // engine refuses, the pass is dropped for the session and the resize below runs instead.
-    if (!restored && !nrSame && nr.restPre && nr.ctxRest && !nr.restFailed)
+    if (!restored && !nrSame && nr.restPre && (nr.ctxRest || nr.restNat) && !nr.restFailed)
     {
         const int cps = nr.cw * nr.ch;
         if (!sdrPre)
@@ -16989,7 +21029,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (!src)
             return false; // a source that failed before (its line is logged)
         int ps = (int)plane, rs = nr.pw;
-        const bool vsrNow = nr.vsr && !nr.vsrPre && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp);
+        const bool vsrNow = nr.vsr && !nr.vsrPre && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp || nr.a4kUp);
         if (!vsrNow && !nr.fitAa && !nr.uw)
             return plainPack(src, slot, what, half);
         if (!vsrNow && nr.fitAa && !nr.uw)
@@ -16999,7 +21039,29 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
         float* stage = nr.uw ? nr.dUp : nr.dPres;
         bool haveVsr = false;
-        if (vsrNow)
+        if (vsrNow && nr.a4kUp)
+        {
+            // Anime4K: the model frame (HDR planes: its SDR view, as RTX VSR reads it) through its x2 engine and the
+            // Lanczos pair into the stage; HDR planes come back to the codes in RTX VSR's block below
+            const void* a4kSrc = src;
+            int aHalf = half, aps = ps, ars = rs;
+            if (nr.hdr)
+            {
+                aps = nr.w * nr.h;
+                ars = nr.w;
+                if (!nativeHdrEnc(nr, src, half, ps, rs, nr.w, nr.h, nr.dVsrView, 0, aps, ars, 1, 1.0f, 0.0f))
+                {
+                    nr.die("Anime4K SDR view launch failed");
+                    return false;
+                }
+                a4kSrc = nr.dVsrView;
+                aHalf = 0;
+            }
+            if (!nativeA4kRun(nr, a4kSrc, aHalf, aps, ars, stage, tw, th))
+                return false;
+            haveVsr = true;
+        }
+        else if (vsrNow)
         {
             // HDR planes: RTX VSR takes SDR, so it reads the frame's SDR view; the way back to the codes is below
             // (HDR planes through AMD FSR upscaling: the view and the linear frame in ONE pass over the planes, below)
@@ -17065,7 +21127,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     return fitPack(src, ps, rs, nr.w, nr.h, slot, what, half);
             }
         }
-        if (haveVsr && !nr.uw && !nr.hdr)
+        if (haveVsr && !nr.uw && !nr.hdr && !nr.a4kUp)
         {
             // the bridge output is the presented frame: into the content rect, RTX VSR's R, G, B, A as the slot's
             // B, G, R, A in one pass; AMD FSR upscaling's buffer already holds the slot's order
@@ -17102,7 +21164,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         else if (haveVsr)
         {
             void* a[] = {&nr.dVsrOut, (void*)&tw, (void*)&th, &stage};
-            if (cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
+            if (!nr.a4kUp && // Anime4K wrote the stage itself
+                cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
                                1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {
                 nr.die("unpackBgra launch failed");
@@ -17376,8 +21439,12 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
         nr.gmfss ? ", engine=gmfss" : "", nr.nvof ? ", engine=nvof" : "",
         nr.fruc ? (nr.fsrfg ? ", engine=fsrfg" : ", engine=fruc") : "", nr.drba ? ", engine=drba (lag 1)" : "",
         nr.rtxHdr ? ", rtxhdr=native" : "", nr.sharpen > 0.0f ? ", sharpen=native" : "",
-        nr.vsr ? (nr.fsrUp ? ", fsrup=native" : ", vsr=native") : "", nr.uw ? ", upscale=native" : "",
-        nr.fitAa ? ", fit=native-aa" : "", nr.restore && nr.ctxRest ? ", restore=native" : "");
+        nr.vsr ? (nr.fsrUp   ? ", fsrup=native"
+                  : nr.a4kUp ? ", anime4k=native"
+                             : ", vsr=native")
+               : "",
+        nr.uw ? ", upscale=native" : "", nr.fitAa ? ", fit=native-aa" : "",
+        nr.restore && (nr.ctxRest || nr.restNat) ? ", restore=native" : "");
     for (;;)
     {
         std::vector<uint8_t> msg;

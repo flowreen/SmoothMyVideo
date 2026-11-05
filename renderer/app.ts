@@ -790,13 +790,20 @@ localStorage.removeItem('encspeed');   // retired: no Encoder speed selector (ev
 localStorage.removeItem('rtxvsrOn');   // retired: its stored choice was made while RTX VSR defaulted off
 $('rtxvsr').checked = localStorage.getItem('vsrOn') !== '0';   // default ON: RTX VSR upscales unless unticked
 if(localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true;   // default OFF
-// AMD FSR 4 upscaling: bundled (engine/fsrup), so always ready; RTX VSR and it exclude each other (ticking one clears
-// the other), neither ticked = Lanczos3
+// AMD FSR 4 upscaling: bundled (engine/fsrup), so always ready; Anime4K too (its weights are inside the host); RTX VSR,
+// AMD FSR 4 and Anime4K exclude each other (ticking one clears the others), none ticked = Lanczos3
 $('fsrup').checked = localStorage.getItem('fsrupOn') === '1';   // default OFF: RTX VSR is the default upscaler
-if($('fsrup').checked) $('rtxvsr').checked = false;
+$('a4kup').checked = !$('fsrup').checked && localStorage.getItem('a4kOn') === '1';   // default OFF
+if($('fsrup').checked || $('a4kup').checked) $('rtxvsr').checked = false;
 function fsrUpOn(){ return $('fsrup').checked && !$('rtxvsr').checked; }
-$('rtxvsr').onchange = () => { localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0'); if($('rtxvsr').checked && $('fsrup').checked){ $('fsrup').checked = false; localStorage.setItem('fsrupOn', '0'); } syncRtx(); syncUpscale(); syncVsrQ(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
-$('fsrup').onchange = () => { localStorage.setItem('fsrupOn', $('fsrup').checked ? '1' : '0'); if($('fsrup').checked && $('rtxvsr').checked){ $('rtxvsr').checked = false; localStorage.setItem('vsrOn', '0'); } syncRtx(); syncUpscale(); syncVsrQ(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} fsrWarm(); };
+function a4kUpOn(){ return $('a4kup').checked && !$('rtxvsr').checked && !$('fsrup').checked; }
+function upOnly(keep){   // the upscaler box just ticked stays, the other two clear (their stored choices too)
+  for(const [id, key] of [['rtxvsr', 'vsrOn'], ['fsrup', 'fsrupOn'], ['a4kup', 'a4kOn']])
+    if(id !== keep && $(id).checked){ $(id).checked = false; localStorage.setItem(key, '0'); }
+}
+$('rtxvsr').onchange = () => { localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0'); if($('rtxvsr').checked) upOnly('rtxvsr'); syncRtx(); syncUpscale(); syncVsrQ(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
+$('fsrup').onchange = () => { localStorage.setItem('fsrupOn', $('fsrup').checked ? '1' : '0'); if($('fsrup').checked) upOnly('fsrup'); syncRtx(); syncUpscale(); syncVsrQ(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} fsrWarm(); };
+$('a4kup').onchange = () => { localStorage.setItem('a4kOn', $('a4kup').checked ? '1' : '0'); if($('a4kup').checked) upOnly('a4kup'); syncRtx(); syncUpscale(); syncVsrQ(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 // RTX VSR's quality level 1..4 (default 4 = Ultra, the highest): the slider beside the box, shown while it is ticked; it
 // persists, and goes to the host as --vsr-quality when it is not 4
 function vsrQuality(){ const q = Math.round(+$('vsrq').value); return q >= 1 && q <= 4 ? q : 4; }
@@ -1137,6 +1144,7 @@ function lvSendOpts(){
     rtxvsr: liveVsrOn(),
     vsrquality: vsrQuality(),
     fsrup: fsrUpOn(),   // AMD FSR 4 takes the same resize when ticked instead of RTX VSR
+    anime4k: a4kUpOn(), // Anime4K the same way
     // no "Upscale to": Live's size is what Display presents (the window or the screen), the DLSS mode its speed
     // Restore (AI detail): Real-ESRGAN or AnimeJaNai first on every presented frame
     restore: restoreOn(), restoreModel: restoreModelId(),
@@ -1182,7 +1190,7 @@ function lvModelUi(){
   const effTxt = [resTxt, nrTxt].filter(Boolean).join(' · ');
   $('lvfithint').textContent =
     $('lvfit').value === 'fill' ? tr('lv.fit.fill') + ' · '
-                                  + (liveVsrOn() ? tr('lv.fit.vsr') : fsrUpOn() ? tr('lv.fit.fsr') : tr('lv.fit.up'))
+                                  + (liveVsrOn() ? tr('lv.fit.vsr') : fsrUpOn() ? tr('lv.fit.fsr') : a4kUpOn() ? tr('lv.fit.a4k') : tr('lv.fit.up'))
                                   + (effTxt ? ' · ' + effTxt : '')
     : $('lvfit').value === 'monitor' ? tr('lv.fit.monitor')
                                        + (effTxt ? ' · ' + effTxt : '')
@@ -1564,7 +1572,7 @@ let lastPrevKey = '', inflightPrevKey = ''; // settings signatures of the shown 
 function prevSettingsSig(){                 // everything that changes what the processed pane shows
   const p = hdrColorPayload();   // normalized: the vibrance feature at zero strength equals OFF
   return [sharpStrength(), restoreOn(), restoreModelId(), hdrOn(), p.color, p.saturation, effVibrance(), effSatBoost(), sdkCon(),
-          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), vsrQuality(), fsrUpOn(), nrOn(), nrStructure(), nrTone(), nrStyle(), nrPasses(), nrMaskOn(),
+          upFactor() || 0, !!($('rtxvsr').checked && rtxReady.vsr), vsrQuality(), fsrUpOn(), a4kUpOn(), nrOn(), nrStructure(), nrTone(), nrStyle(), nrPasses(), nrMaskOn(),
           dlssMode()];
 }
 let lastPrevInput = null;                    // which video the shown original belongs to
@@ -1580,6 +1588,7 @@ async function loadPreview(frame, bg?){   // bg: background "refine" pass (the R
   const useHdr = lite ? false : hdr;
   const useVsr = lite ? false : !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1);   // VSR enlarges only
   const useFsr = lite ? false : fsrUpOn() && upFactor() > 1;   // AMD FSR 4 the same way
+  const useA4k = lite ? false : a4kUpOn() && upFactor() > 1;   // Anime4K too
   const useNr = lite ? false : nrOn();     // DLSS 5: its host takes seconds to start, so the lite pass skips it too
   inflightPrevKey = JSON.stringify([input, (frame == null ? 'mid' : frame)].concat(sig));
   $('hdrpreview').style.display = 'block';
@@ -1601,7 +1610,7 @@ async function loadPreview(frame, bg?){   // bg: background "refine" pass (the R
     { input, frame: (frame == null ? 'mid' : frame), sharpen, restore: restoreOn(), restoreModel: restoreModelId(), hdr: useHdr,
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(),
       upscale: upFactor() || 0,
-      rtxvsr: useVsr, vsrquality: vsrQuality(), fsrup: useFsr, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
+      rtxvsr: useVsr, vsrquality: vsrQuality(), fsrup: useFsr, anime4k: useA4k, dlssnr: useNr, nrmask: useNr && nrMaskOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
       hdrColorPayload())); }
   catch(e){ r = { error: String(e) }; }
   setSpin($('prevprocwrap'), $('prevspin'), false);
@@ -1623,12 +1632,12 @@ async function loadPreview(frame, bg?){   // bg: background "refine" pass (the R
   const vsrOn = useVsr;              // what the processed pane actually rendered (lite skips VSR)
   const active = useHdr || sharpen > 0 || restoreOn() || upActive || useNr;
   // Plain Lanczos3 resize with no AI/enhancement pass: both panes are the same resized image, so say so.
-  const plainOnly = upActive && !vsrOn && !useFsr && !restoreOn() && sharpen <= 0 && !useHdr && !useNr;
-  const rtxSkipped = lite && (hdr || nrOn() || ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1) || (fsrUpOn() && upFactor() > 1));   // RTX / FSR / DLSS 5 on in settings but skipped for the fast auto-preview
+  const plainOnly = upActive && !vsrOn && !useFsr && !useA4k && !restoreOn() && sharpen <= 0 && !useHdr && !useNr;
+  const rtxSkipped = lite && (hdr || nrOn() || ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1) || ((fsrUpOn() || a4kUpOn()) && upFactor() > 1));   // RTX / FSR / Anime4K / DLSS 5 on in settings but skipped for the fast auto-preview
   const srcHdr = !!(info && info.srcHdr);
   // the pass names ('@key' = a language string, else a name that stays as is)
   const parts = []; if(restoreOn()) parts.push('@restore.k');
-  if(upActive) parts.push(vsrOn ? 'VSR' : useFsr ? 'FSR' : upFactor() < 1 ? '@prev.part.down' : '@prev.part.up');
+  if(upActive) parts.push(vsrOn ? 'VSR' : useFsr ? 'FSR' : useA4k ? 'Anime4K' : upFactor() < 1 ? '@prev.part.down' : '@prev.part.up');
   if(useNr) parts.push('DLSS 5');
   if(sharpen > 0) parts.push('@sharpen.k'); if(useHdr) parts.push('HDR');
   const note = maskShown ? 'prev.note.mask' : rtxSkipped ? 'prev.note.quick' : srcHdr ? 'prev.note.srcHdr'
@@ -1867,6 +1876,7 @@ function cmpOpts(frame, a, b, multi, pairs){   // main's 'compare' request at th
       restoreModel: restoreModelId(), hdr: hdrOn(),
       vibrance: effVibrance(), satboost: effSatBoost(), contrast: sdkCon(), upscale: upFactor() || 0,
       rtxvsr: !!($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1), vsrquality: vsrQuality(), fsrup: fsrUpOn() && upFactor() > 1,
+      anime4k: a4kUpOn() && upFactor() > 1,
       dlssnr: nrOn(), nrstructure: nrStructure(), nrtone: nrTone(), nrstyle: nrStyle(), nrpasses: nrPasses() },
     hdrColorPayload());
 }
@@ -2150,6 +2160,7 @@ function startRun(){
   const factor = upFactor();                           // arbitrary resize factor (0 = off, <1 downscales)
   const useRtxVsr = factor > 1 && $('rtxvsr').checked && rtxReady.vsr;   // AI upscale of an enlarging resize, else Lanczos3
   const useFsrUp = factor > 1 && fsrUpOn();            // AMD FSR 4 instead of RTX VSR when ticked
+  const useA4kUp = factor > 1 && a4kUpOn();            // Anime4K the same way
   const rtxhdr = hdrOn();  // HDR only when its runtime is installed and the source is SDR
   // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
   // HDR is on. Bail only when nothing at all is enabled.
@@ -2181,7 +2192,7 @@ function startRun(){
   }
   modeBtnUi(true);
   $('cmpto').disabled = true;   // Compare waits for the render (syncCompareUi at engine-done)
-  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlssrange').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('vsrq').disabled = true; $('fsrup').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
+  $('pick').disabled = true; $('changeout').disabled = true; $('out').disabled = true; for(const b of MODEL_BOXES()) b.disabled = true; $('fpsin').disabled = true; $('sharpen').disabled = true; $('sharpval').disabled = true; $('restore').disabled = true; $('dlssmode').disabled = true; $('dlssrange').disabled = true; $('dlssnr').disabled = true; $('nrstructure').disabled = true; $('nrtone').disabled = true; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true; $('nrpasses').disabled = true; $('nrmask').disabled = true; $('upres').disabled = true; $('upcustom').disabled = true; $('outcodec').disabled = true; $('rtxvsr').disabled = true; $('vsrq').disabled = true; $('fsrup').disabled = true; $('a4kup').disabled = true; $('gpufit').disabled = true; $('rtxhdr').disabled = true; $('hdrdynvib').disabled = true; $('hdrsat').disabled = true; $('hdrvib').disabled = true; $('hdrcon').disabled = true; $('hdrsb').disabled = true; $('open').disabled = true; $('play').disabled = true; $('cancel').disabled = false; $('playprev').disabled = true; $('playprev').style.display = 'none'; lastPreview = null; dlssPreempt = null; syncTargetUI();
   // What this run does, for the status / log (mainly relevant when interpolation is off).
   // the pass names ('=name' stays as is, else a language key), read in the language of each repaint
   const passes = []; if(restoreOn()) passes.push('run.pass.restore'); if(factor > 0) passes.push(factor < 1 ? 'run.pass.down' : 'run.pass.up'); if(rtxhdr) passes.push('=HDR'); if(sharpenStrength > 0) passes.push('run.pass.sharpen');
@@ -2214,6 +2225,7 @@ function startRun(){
   }
   if(useRtxVsr){ payload.rtxvsr = true; payload.vsrquality = vsrQuality(); }   // AI upscale via the RTX Video SDK (else Lanczos3)
   if(useFsrUp) payload.fsrup = true;                   // AMD FSR 4 upscaling (engine/fsrup)
+  if(useA4kUp) payload.anime4k = true;                 // Anime4K upscaling (inside the host)
   if(!$('gpufit').checked) payload.nogpufit = true;    // no video memory fit: the same fps, slower when memory runs short
   if(rtxhdr){ payload.rtxhdr = true;     // HDR10 at the Peak box's nits or the app window's display's
     const hp = hdrColorPayload();
@@ -2367,7 +2379,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   // Final thumbnail pull (the last written frame), except on cancel: the click hid the preview.
   clearInterval(liveTimer); liveTimer = null; if(!cancelled) updateLive();
   modeBtnUi(lvState !== 'idle');
-  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlssrange').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('vsrq').disabled=false; $('fsrup').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
+  $('go').disabled=false; $('pick').disabled=false; $('changeout').disabled=false; $('out').disabled=false; for(const b of MODEL_BOXES()) b.disabled=false; $('fpsin').disabled=false; $('sharpen').disabled=false; $('sharpval').disabled=false; $('restore').disabled=false; $('dlssmode').disabled=false; $('dlssrange').disabled=false; $('dlssnr').disabled=false; $('nrstructure').disabled=false; $('nrtone').disabled=false; for(const b of $('nrstyleseg').querySelectorAll('button')) b.disabled=false; $('nrpasses').disabled=false; $('nrmask').disabled=false; $('upres').disabled=false; $('upcustom').disabled=false; $('outcodec').disabled=false; $('rtxvsr').disabled=false; $('vsrq').disabled=false; $('fsrup').disabled=false; $('a4kup').disabled=false; $('gpufit').disabled=false; $('rtxhdr').disabled=!!(info&&info.srcHdr); $('hdrdynvib').disabled=false; $('hdrcon').disabled=false; syncHdrColor(); $('cancel').disabled=true;
   syncInterp();         // re-assert the interp / screen-rate state after the run re-enabled the inputs
   syncCompareUi();
   if(cancelled){ setStatus('run.status.cancelled'); log('>> Cancelled\n');

@@ -162,6 +162,7 @@ static double g_sharpen = 0.0;                 // --sharpen S: Adaptive Sharpen 
 static bool g_rtxVsr = false;                  // --rtx-vsr: forwarded to the server (VSR fill upscaler)
 static int g_vsrQuality = 4;                   // --vsr-quality N: RTX VSR's quality level 1..4, 4 = Ultra (both routes)
 static bool g_fsrUp = false;                   // --fsr-upscale: AMD FSR upscaling in RTX VSR's resize (both routes)
+static bool g_a4kUp = false;                   // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (both routes)
 static int g_upscaleH = 0;                     // --upscale H: forwarded to the server (the app's "Upscale to"
                                                // height as the internal render size before the fit)
 static bool g_restore = false;                 // --restore: forwarded to the server (Real-ESRGAN first on
@@ -734,7 +735,7 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
 //               (RIFE: the host finds or builds the engines itself, lkOfflineRife)
 //               the per-frame passes: [--out-w W --out-h H] [--restore | --restore-model ONNX]
-//               [--rtx-vsr [--vsr-quality N] | --fsr-upscale]
+//               [--rtx-vsr [--vsr-quality N] | --fsr-upscale | --anime4k]
 //               [--dlssnr --nr-structure F --nr-tone F --nr-style N [--nr-delta PATH]] [--sharpen S] [--rtx-hdr ...]
 // Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
 // stdout in the same pixfmt (the encoder pipe). Real frames go out from the host buffer they came
@@ -1483,6 +1484,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_vsrQuality = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--fsr-upscale") == 0)
             g_fsrUp = true;
+        else if (wcscmp(argv[i], L"--anime4k") == 0)
+            g_a4kUp = true;
         else if (wcscmp(argv[i], L"--restore") == 0)
             g_restore = true;
         else if (wcscmp(argv[i], L"--restore-model") == 0 && i + 1 < argc)
@@ -2280,7 +2283,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                                                       : (nr.fruc ? (nr.fsrfg ? ", model fsrfg" : ", model fruc")
                                                                  : (oa.dlssg ? ", model dlss 4.5" : ""))))),
         nr.restore ? ", restore" : "",
-        nr.vsr ? (nr.fsrUp ? ", amd fsr upscale" : ", rtx vsr") : ((outW != w || outH != h) ? ", lanczos upscale" : ""),
+        nr.vsr ? (nr.fsrUp   ? ", amd fsr upscale"
+                  : nr.a4kUp ? ", anime4k"
+                             : ", rtx vsr")
+               : ((outW != w || outH != h) ? ", lanczos upscale" : ""),
         nr.nrHost ? ", dlss 5" : "", nr.sharpen > 0.0f ? ", sharpen" : "", nr.rtxHdr ? ", rtx hdr" : "",
         (double)(nowQpc100() - tStart) / 1e7);
     if (fpsMode)
@@ -3790,6 +3796,7 @@ static void resetSessionGlobals()
     g_rtxVsr = false;
     g_vsrQuality = 4;
     g_fsrUp = false;
+    g_a4kUp = false;
     g_upscaleH = 0;
     g_restore = false;
     g_restoreModel.clear();
@@ -3903,6 +3910,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_vsrQuality = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--fsr-upscale") == 0)
             g_fsrUp = true;
+        else if (wcscmp(argv[i], L"--anime4k") == 0)
+            g_a4kUp = true;
         else if (wcscmp(argv[i], L"--upscale") == 0 && i + 1 < argc)
             g_upscaleH = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--restore") == 0)
@@ -4336,6 +4345,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_rtxVsr = false;
             g_vsrQuality = 4;
             g_fsrUp = false;
+            g_a4kUp = false;
             g_restore = false;
             g_restoreModel.clear();
             g_rtxHdr = false;

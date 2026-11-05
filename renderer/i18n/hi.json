@@ -140,6 +140,9 @@
   "fsrup.tip": "वर्ज़न: AMD FSR 4.1.2 अपस्केलिंग (FidelityFX SDK 2.4.0)। मोशन वेक्टर: NVIDIA Optical Flow का Slow, उसका सबसे ऊँचा क्वालिटी लेवल।",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(AMD का AI अपस्केलर, तब इस्तेमाल होता है जब <span class='vonly'>आकार सोर्स से बड़ा हो</span><span class='lonly'>स्क्रीन भरें या DLAA से नीचे का DLSS मोड तस्वीर बड़ी करे</span>)",
+  "a4k.tip": "वर्ज़न: Anime4K 4.0.1, Upscale CNN x2 UL (उसका सबसे बड़ा मॉडल)। यह 2x बड़ा करता है, फिर Lanczos आकार में फ़िट करता है। SMV के फ़िडेलिटी टेस्ट (1.5x और 2x, चार क्लिप) में यह औसतन RTX VSR और AMD FSR से ज़्यादा पूरे आकार के ओरिजिनल के क़रीब रहा।",
+  "a4k.name": "Anime4K",
+  "a4k.hint": "(एनिमे के लिए बना CNN अपस्केलर, तब इस्तेमाल होता है जब <span class='vonly'>आकार सोर्स से बड़ा हो</span><span class='lonly'>स्क्रीन भरें या DLAA से नीचे का DLSS मोड तस्वीर बड़ी करे</span>)",
 
   "sharpen.k": "शार्पन",
   "sharpen.tip": "वर्ज़न: bacondither का Adaptive Sharpen, 2021-09-10 का DX11 टू-पास HQ वर्ज़न",
@@ -315,6 +318,7 @@
   "lv.fit.fill": "विंडो को उसके पूरे मॉनिटर तक बड़ा करता है, आस्पेक्ट रेशियो वही रहता है",
   "lv.fit.vsr": "RTX VSR अपस्केल",
   "lv.fit.fsr": "AMD FSR अपस्केल",
+  "lv.fit.a4k": "Anime4K अपस्केल",
   "lv.fit.up": "अपस्केल",
   "lv.fit.monitor": "विंडो वाले मॉनिटर पर सब कुछ स्मूथ करता है",
   "lv.stop": "रोकें",

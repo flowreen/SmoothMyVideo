@@ -140,6 +140,9 @@
   "fsrup.tip": "Version: AMD FSR 4.1.2 Upscaling (FidelityFX SDK 2.4.0). Bewegungsvektoren: NVIDIA Optical Flow auf Slow, der höchsten Qualitätsstufe.",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(AMDs KI-Hochskalierer, genutzt wenn <span class='vonly'>die Größe über der Quelle liegt</span><span class='lonly'>Bildschirm füllen oder ein DLSS-Modus unter DLAA vergrößert</span>)",
+  "a4k.tip": "Version: Anime4K 4.0.1, Upscale CNN x2 UL (sein größtes Modell). Es vergrößert 2x, dann passt Lanczos die Größe an. In SMVs Treuetest (1,5x und 2x, vier Clips) kam es im Mittel näher ans Original in voller Größe als RTX VSR und AMD FSR.",
+  "a4k.name": "Anime4K",
+  "a4k.hint": "(ein CNN-Hochskalierer für Anime, genutzt wenn <span class='vonly'>die Größe über der Quelle liegt</span><span class='lonly'>Bildschirm füllen oder ein DLSS-Modus unter DLAA vergrößert</span>)",
 
   "sharpen.k": "Schärfen",
   "sharpen.tip": "Version: Adaptive Sharpen von bacondither, die DX11-Zwei-Pass-HQ-Version vom 2021-09-10",
@@ -315,6 +318,7 @@
   "lv.fit.fill": "vergrößert das Fenster auf seinen ganzen Monitor, Seitenverhältnis beibehalten",
   "lv.fit.vsr": "RTX-VSR-Hochskalierung",
   "lv.fit.fsr": "AMD-FSR-Hochskalierung",
+  "lv.fit.a4k": "Anime4K-Hochskalierung",
   "lv.fit.up": "Hochskalierung",
   "lv.fit.monitor": "glättet alles auf dem Monitor, auf dem das Fenster liegt",
   "lv.stop": "Stopp",

@@ -18,6 +18,29 @@ third-party work.
 * **Real-ESRGAN** `realesr-animevideov3` architecture and weights (the `--restore` pass),
   vendored in `engine/realesr.py` / `engine/realesr-animevideov3.pth`. BSD 3-Clause License,
   Copyright (c) 2021 Xintao Wang.
+* **Anime4K** (the Anime4K upscaler): the weights of bloc97's Upscale CNN x2 UL shader from release
+  v4.0.1 (github.com/bloc97/Anime4K), carried in the native host (`engine/live/build_src/smv-live-native.inl`,
+  `kA4kWeights`), which runs its passes as CUDA kernels. MIT License:
+
+  > Copyright (c) 2019 bloc97
+  >
+  > Permission is hereby granted, free of charge, to any person obtaining a copy
+  > of this software and associated documentation files (the "Software"), to deal
+  > in the Software without restriction, including without limitation the rights
+  > to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  > copies of the Software, and to permit persons to whom the Software is
+  > furnished to do so, subject to the following conditions:
+  >
+  > The above copyright notice and this permission notice shall be included in all
+  > copies or substantial portions of the Software.
+  >
+  > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  > IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  > FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  > AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  > LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  > SOFTWARE.
 * **Adaptive Sharpen** (the Sharpen pass): bacondither's DX11 two-pass HQ version (2021-09-10, from
   github.com/bacondither/Miscellaneous-shaders), ported to CUDA in the native host
   (`engine/live/build_src/smv-live-native.inl`, `k_sharpPlanar` / `k_sharpThdrIn`). BSD 2-Clause License:
@@ -71,8 +94,8 @@ third-party work.
   > SOFTWARE.
 * **vkd3d-proton** (D3D12 on Vulkan: it runs AMD's FSR 4 frame generation on NVIDIA GPUs):
   `engine/fsrfg/smv_vkd3d_d3d12.dll` and `engine/fsrfg/smv_vkd3d_d3d12core.dll`, built from vkd3d-proton
-  (github.com/HansKristian-Work/vkd3d-proton) commit 8293130ebe370b1deb761898ae0d397d680837de with its dxil-spirv at
-  8b48f0e0392d76be4fdcea2a3ba3ea99dddaae5b, both modified: the patches ship beside the DLLs in `engine/fsrfg/source/`,
+  (github.com/HansKristian-Work/vkd3d-proton) commit 87983f34c5cffa6691b7deb665d09d06376772ea with its dxil-spirv at
+  788f3e22968ee79d145a680279531389b439cb96, both modified: the patches ship beside the DLLs in `engine/fsrfg/source/`,
   the build steps are in `engine/fsrfg/build_src/build.bat`. GNU Lesser General Public License 2.1 (vkd3d-proton's
   COPYING, LICENSE and AUTHORS in `engine/fsrfg/licenses/`); the app loads the two DLLs at run time, so a rebuild from
   the corresponding source replaces them. Built into them, with their notices in `engine/fsrfg/licenses/`: dxil-spirv
