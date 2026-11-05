@@ -672,15 +672,20 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   via `__GL_SHADER_DISK_CACHE_PATH`). `--anime4k` puts Anime4K's Upscale CNN x2 UL (bloc97, v4.0.1) in that same
   resize instead (RTX VSR and AMD FSR win over it, with a line). The shader's weights live in the host as fp32 bit
   patterns (`kA4kWeights` in `smv-live-native.inl`, with the source shader's md5; no shader file ships), and the host
-  runs its conv passes as CUDA kernels in the shader's own arithmetic (fp32 math, every texture stored as fp16): the
-  session's setup writes them with every weight as a float literal (`a4kKernelText`: `k_a4kConv0`, `k_a4kConv_1` ..
-  `_6` and the 1 x 1 `k_a4kLast`) and compiles that text once into its own module, cached beside the main kernels'
-  cubin (`smv_anime4k_*.cubin`; the first Anime4K session per driver pays a few seconds), on the planar floats at the
-  resize's input size, then `k_a4kFoldHSub` does the shader's Depth-to-Space
+  runs its conv passes as three CUDA kernels, every texture stored as fp16 like the shader's: the six 3 x 3 middle
+  layers on the tensor cores (the stored fp16 values times the weights rounded to fp16, fp16 sums), the first layer
+  computed inside the first middle layer's kernel (`k_a4kConvM16First`) and the 1 x 1 inside the last one's
+  (`k_a4kConvM16Last`), both in the shader's fp32 math with every weight a float literal, so neither layer's texture
+  is ever written. The session's setup writes that text (`a4kKernelText`),
+  compiles it once into its own module, cached beside the main kernels' cubin (`smv_anime4k_*.cubin`; under a second
+  the first time per driver), and uploads the middle layers' weights in fragment order (`a4kFragments`); the passes
+  run on the planar floats at the resize's input size, then `k_a4kFoldHSub` does the shader's Depth-to-Space
   pass (the sub-pixels + the source's bilinear 2x, added in fp32) while Restore's Lanczos fold reads them straight to
-  the target with the clamp (no 8-bit round trip, the 2x frame never written). No engine build and nothing in the
+  the target with the clamp (no 8-bit round trip, the 2x frame never written; each 2x value computed once per block
+  into shared memory for the taps that read it). An exact 2x target skips the Lanczos pair (the identity there):
+  `k_a4kFold2x` writes the clamped 2x values in one pass. No engine build and nothing in the
   model cache. HDR frames go in as their SDR view and come back to the codes the way RTX VSR's do. Its output equals
-  the PyTorch net's within one 8-bit code (75 dB; the net equals libplacebo's run of the shader at 70 dB). A module
+  the PyTorch net's within one 8-bit code (71 dB; the net equals libplacebo's run of the shader at 70 dB). A module
   that does not compile or load = Lanczos with the `Anime4K unavailable` line. A new upstream release: compare its UL
   shader's md5 with the one `kA4kWeights` names; a different file needs a new table (its weights in the same order,
   as fp32 bit patterns) and the identity gate. Downscales (F below 1) are folded into the decode.

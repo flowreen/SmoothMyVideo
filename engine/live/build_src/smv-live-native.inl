@@ -1204,36 +1204,92 @@ __global__ void __launch_bounds__(128) k_ajCat(const unsigned short* __restrict_
         }
 }
 
-// Anime4K's fold, horizontal pass on its three last textures (the exported graph ends before the shader's Depth-to-Space
-// pass, which happens here): the 2x value at (Y, X) = texture c's channel (Y % 2) 2 + X % 2 at (Y / 2, X / 2) + the
-// source's bilinear 2x there (align_corners False, edge clamp: 3/4 of the nearest source pixel, 1/4 of the next one out
-// on each axis), added in fp32 and clamped per tap like k_restFoldH -> tmp (3, 2h, dw); in = the engine's fp16 input
-__global__ void k_a4kFoldHSub(const void* __restrict__ sub, int half, const unsigned short* __restrict__ in, int w,
-                              int h, float* __restrict__ tmp, int dw, const RsTap* __restrict__ tab)
+// Anime4K's fold on its three last textures (the exported graph ends before the shader's Depth-to-Space pass, which
+// happens here): the 2x value at (Y, X) = texture c's channel (Y % 2) 2 + X % 2 at (Y / 2, X / 2) + the source's
+// bilinear 2x there (align_corners False, edge clamp: 3/4 of the nearest source pixel, 1/4 of the next one out on each
+// axis), added in fp32 and clamped like k_restFoldH's taps; in = the engine's fp16 input
+__device__ __forceinline__ void a4kFoldPx(const void* __restrict__ sub, int half, const unsigned short* __restrict__ in,
+                                          int w, int h, int Y, int X, float* v)
 {
-    const int ox = blockIdx.x * blockDim.x + threadIdx.x;
-    const int Y = blockIdx.y * blockDim.y + threadIdx.y;
-    const int fs = rsTaps(2 * w, dw);
-    if (ox >= dw || Y >= 2 * h) return;
     const int y = Y >> 1, dy = Y & 1;
     const int yn = dy ? (y + 1 < h ? y + 1 : h - 1) : (y > 0 ? y - 1 : 0);
     const size_t ps = (size_t)w * h, r0 = (size_t)y * w, r1 = (size_t)yn * w;
+    const int x = X >> 1, dx = X & 1;
+    const int xn = dx ? (x + 1 < w ? x + 1 : w - 1) : (x > 0 ? x - 1 : 0);
+    const size_t sp = (size_t)(dy * 2 + dx) * ps + r0 + x;
+    for (int c = 0; c < 3; c++)
+    {
+        const unsigned short* p = in + (size_t)c * ps;
+        const float base = 0.75f * (0.75f * h2f(p[r0 + x]) + 0.25f * h2f(p[r0 + xn])) +
+                           0.25f * (0.75f * h2f(p[r1 + x]) + 0.25f * h2f(p[r1 + xn]));
+        const float s = restRaw(sub, half, (size_t)c * 4 * ps + sp) + base;
+        v[c] = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+    }
+}
+
+// the horizontal pass, 2w -> dw along x -> tmp (3, 2h, dw); 16 x 16 blocks: each 2x value the block's outputs tap is
+// computed ONCE into shared memory (the block's 16 rows x its taps' column range, at most AF_CAP columns; a wider
+// range, a far shrink, computes per tap), then every output sums its taps in the table's order
+#define AF_CAP 128
+__global__ void __launch_bounds__(256) k_a4kFoldHSub(const void* __restrict__ sub, int half,
+                                                     const unsigned short* __restrict__ in, int w, int h,
+                                                     float* __restrict__ tmp, int dw, const RsTap* __restrict__ tab)
+{
+    __shared__ float sv[3][16][AF_CAP];
+    __shared__ int lo, hi;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int ox = blockIdx.x * 16 + tx, Y0 = blockIdx.y * 16, Y = Y0 + ty;
+    const int fs = rsTaps(2 * w, dw);
+    if (tx == 0 && ty == 0)
+    {
+        lo = 0x7fffffff;
+        hi = -1;
+    }
+    __syncthreads();
+    if (ty == 0 && ox < dw)
+    {
+        int mn = 0x7fffffff, mx = -1;
+        for (int k = 0; k < fs; k++)
+        {
+            const int i = tab[(size_t)k * dw + ox].i;
+            mn = min(mn, i);
+            mx = max(mx, i);
+        }
+        atomicMin(&lo, mn);
+        atomicMax(&hi, mx);
+    }
+    __syncthreads();
+    const int c0 = lo, n = hi - lo + 1;
+    const bool staged = n <= AF_CAP;
+    if (staged)
+        for (int q = ty * 16 + tx; q < 16 * n; q += 256)
+        {
+            const int r = q / n, cc = q - r * n;
+            if (Y0 + r < 2 * h)
+            {
+                float v[3];
+                a4kFoldPx(sub, half, in, w, h, Y0 + r, c0 + cc, v);
+                sv[0][r][cc] = v[0];
+                sv[1][r][cc] = v[1];
+                sv[2][r][cc] = v[2];
+            }
+        }
+    __syncthreads();
+    if (ox >= dw || Y >= 2 * h) return;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
     for (int k = 0; k < fs; k++)
     {
         const RsTap t = tab[(size_t)k * dw + ox];
-        const int x = t.i >> 1, dx = t.i & 1;
-        const int xn = dx ? (x + 1 < w ? x + 1 : w - 1) : (x > 0 ? x - 1 : 0);
-        const size_t sp = (size_t)(dy * 2 + dx) * ps + r0 + x;
         float v[3];
-        for (int c = 0; c < 3; c++)
+        if (staged)
         {
-            const unsigned short* p = in + (size_t)c * ps;
-            const float base = 0.75f * (0.75f * h2f(p[r0 + x]) + 0.25f * h2f(p[r0 + xn])) +
-                               0.25f * (0.75f * h2f(p[r1 + x]) + 0.25f * h2f(p[r1 + xn]));
-            const float s = restRaw(sub, half, (size_t)c * 4 * ps + sp) + base;
-            v[c] = s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+            const int cc = t.i - c0;
+            v[0] = sv[0][ty][cc];
+            v[1] = sv[1][ty][cc];
+            v[2] = sv[2][ty][cc];
         }
+        else
+            a4kFoldPx(sub, half, in, w, h, Y, t.i, v);
         a0 += t.w * v[0];
         a1 += t.w * v[1];
         a2 += t.w * v[2];
@@ -1243,6 +1299,22 @@ __global__ void k_a4kFoldHSub(const void* __restrict__ sub, int half, const unsi
     tmp[o] = a0;
     tmp[plane + o] = a1;
     tmp[2 * plane + o] = a2;
+}
+
+// an exact 2x target (2w x 2h): Lanczos at 1:1 weighs the centre tap 1 and every other 0 (sinpi at an integer is 0), so
+// the two passes reproduce the clamped 2x values exactly; this one pass writes them straight into the planar target
+__global__ void k_a4kFold2x(const void* __restrict__ sub, int half, const unsigned short* __restrict__ in, int w, int h,
+                            float* __restrict__ dst)
+{
+    const int X = blockIdx.x * blockDim.x + threadIdx.x;
+    const int Y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (X >= 2 * w || Y >= 2 * h) return;
+    float v[3];
+    a4kFoldPx(sub, half, in, w, h, Y, X, v);
+    const size_t plane = (size_t)4 * w * h, o = (size_t)Y * (2 * w) + X;
+    dst[o] = v[0];
+    dst[plane + o] = v[1];
+    dst[2 * plane + o] = v[2];
 }
 
 // vertical pass with realesr.fit's final clamp: tmp (3, h, dw) -> the planar target (3, dh, dw)
@@ -5369,17 +5441,17 @@ struct NativeRife
     char fuVersion[32] = {};
     OfVec fuOf;
     // Anime4K (a4kUp, `--anime4k`): RTX VSR's resize too (vsr is set), on planar floats instead of the bridge's BGRA:
-    // Upscale CNN x2 UL's conv passes in CUDA (its own module a4kMod: k_a4kConv0, k_a4kConv_1 .. _6, k_a4kLast, the
-    // weights as literals in their text, a4kKernelText) at the slot's input size, then the fold (k_a4kFoldHSub: the
-    // shader's Depth-to-Space pass, and the Lanczos pair from 2w x 2h to the slot's target); HDR frames go in as their
-    // SDR view and come back through RTX VSR's way to the codes
+    // Upscale CNN x2 UL's conv passes in CUDA (its own module a4kMod, a4kKernelText: layers 1..6 on the tensor cores,
+    // layer 0 inside layer 1's kernel and the last 1 x 1 inside layer 6's, both with literal weights) at the slot's
+    // input size, then the fold (k_a4kFoldHSub: the shader's Depth-to-Space pass, and the Lanczos pair from 2w x 2h to
+    // the slot's target); HDR frames go in as their SDR view and come back through RTX VSR's way to the codes
     bool a4kUp = false;
     CUmodule a4kMod = nullptr;
-    CUfunction fA4k[8] = {};  // k_a4kConv0, k_a4kConv_1 .. _6, k_a4kLast
+    CUfunction fA4k[3] = {};  // k_a4kConvM16First, k_a4kConvM16, k_a4kConvM16Last
     int a4kW = 0, a4kH = 0;   // the passes' input size (the slot's)
     int a4kOw = 0;            // the widest fold target dA4kTmp holds
     void* dA4kIn = nullptr;   // NCHW fp16 at a4kW x a4kH
-    void* dA4kT = nullptr;    // five layer slots, 3 textures x 4 fp16 a pixel each (nativeA4kRun)
+    void* dA4kT = nullptr;    // four layer slots, 3 textures x 4 fp16 a pixel each (nativeA4kRun)
     void* dA4kOut = nullptr;  // the three last textures as 12 fp16 planes at a4kW x a4kH
     float* dA4kTmp = nullptr; // the fold's horizontal pass: planar fp32, target width x 2 a4kH
     // RIFE with DRBA timing (rifedrba): the RIFE
@@ -5727,7 +5799,7 @@ struct NativeRife
     CUfunction fFsrHdrIn = nullptr, fFsrHdrOut = nullptr, fFsrHdrPack = nullptr; // AMD FSR upscaling on HDR planes
     CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                      // its vertical pass + the slot store
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr,    // live Restore
-        fRestFoldHSub = nullptr, fA4kFoldHSub = nullptr, fRestToF = nullptr, fClamp01 = nullptr;
+        fRestFoldHSub = nullptr, fA4kFoldHSub = nullptr, fA4kFold2x = nullptr, fRestToF = nullptr, fClamp01 = nullptr;
     CUfunction fRestConv0 = nullptr, fRestConvMid = nullptr, fRestConvLast = nullptr; // Restore on the host's kernels
     CUfunction fAjFirst = nullptr, fAjAtt = nullptr, fAjCat = nullptr;                // AnimeJaNai's own three
     CUfunction fPadPlanar = nullptr; // the decoded frame into the model frame
@@ -10568,6 +10640,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fRestFoldV, "k_restFoldV"},
         {&nr.fRestFoldHSub, "k_restFoldHSub"},
         {&nr.fA4kFoldHSub, "k_a4kFoldHSub"},
+        {&nr.fA4kFold2x, "k_a4kFold2x"},
         {&nr.fRestConv0, "k_restConv0"},
         {&nr.fRestConvMid, "k_restConvMid"},
         {&nr.fRestConvLast, "k_restConvLast"},
@@ -16082,11 +16155,11 @@ static const uint32_t kA4kWeights[kA4kW0 + 6 * kA4kW + kA4kWL] = {
 };
 // clang-format on
 
-// Anime4K's conv passes as their own NVRTC module (a4kKernelText): the shader's arithmetic (fp32 math, every texture
-// stored as fp16, libplacebo's rgba16f), one kernel a layer, every weight a float literal in the text (an FFMA
-// immediate, like the shader's literal mat4s, instead of a constant-bank operand). A layer = 12 channels as three
-// 4-channel fp16 textures, texture k of pixel i at t[k * ps + i] (8 bytes); 3 x 3 taps clamp at the edges (texOff's
-// clamp-to-edge). Built at the first Anime4K session's setup and cached beside the main kernels' cubin.
+// Anime4K's conv passes as their own NVRTC module (a4kKernelText), every texture stored as fp16 (libplacebo's rgba16f).
+// A layer = 12 channels as three 4-channel fp16 textures, texture k of pixel i at t[k * ps + i] (8 bytes); 3 x 3 taps
+// clamp at the edges (texOff's clamp-to-edge). conv2d_tf (layer 0) and the last 1 x 1 = the shader's fp32 math with
+// every weight a float literal in the text (an FFMA immediate, like the shader's literal mat4s); conv2d_1 .. _6 = the
+// tensor-core kernels of kA4kMma. Built at the first Anime4K session's setup and cached beside the main kernels' cubin.
 static const char kA4kHead[] = R"A4KSRC(
 extern "C" {
 __device__ __forceinline__ float h2f(unsigned short h)
@@ -16101,72 +16174,209 @@ __device__ __forceinline__ unsigned short f2h(float f)
     asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
     return h;
 }
-struct A4kLastIn
+struct A4kLast4
 {
-    const uint2* l[5]; // conv2d_2 .. conv2d_6
+    const uint2* l[4]; // conv2d_2 .. conv2d_5 (conv2d_6 = the fused kernel's own sums)
 };
-#define A4K_BX 32
-#define A4K_BY 8
-#define A4K_TX (A4K_BX + 2)
-#define A4K_TY (A4K_BY + 2)
 __device__ __forceinline__ unsigned int a4kPack(float a, float b)
 {
     return (unsigned int)f2h(a) | ((unsigned int)f2h(b) << 16);
 }
-__device__ __forceinline__ void a4kStore(uint2* __restrict__ out, size_t ps, size_t i, const float* acc)
+)A4KSRC";
+
+// conv2d_1 .. conv2d_6 on the tensor cores with fp16 sums: the previous layer's 12 channels -> CReLU (24: 0..11 =
+// max(x, 0), 12..23 = max(-x, 0)) -> 3 x 3 -> 12 + bias. Implicit GEMM, mma.sync m16n8k16: M = pixels, N = 12 outputs
+// (two n-tiles, the second half empty), K = 9 taps x 24 channels = 27 chunks of 8 halves (14 k-steps, the last half on a
+// zero chunk); A = the stored fp16 values (exact), B = the weights rounded to fp16 once (nativeA4kModule fills g_a4kWf
+// in fragment order, [layer][step][lane] = n-tile 0 b0 b1, n-tile 1 b0 b1, and g_a4kB with the fp32 biases). A block =
+// 4 warps on an 8 x 32 pixel tile, its 10 x 34 halo in shared memory at 48 B a pixel (3 chunks: an odd stride, so each
+// ldmatrix row group hits 8 bank groups), CReLU on the load; the weights a k-step ahead. k_a4kConvM16 = conv2d_2 ..
+// conv2d_5; a4kKernelText writes k_a4kConvM16First (conv2d_tf computed on conv2d_1's halo, then conv2d_1) and
+// k_a4kConvM16Last (conv2d_6, then the last 1 x 1) from the same pieces (AM_SETUP, AM_LOOP, AM_STORE).
+static const char kA4kMma[] = R"A4KSRC(
+__device__ uint4 g_a4kWf[6 * 14 * 32];
+__device__ float g_a4kB[6 * 12];
+#define AM_HW 34
+#define AM_HH 10
+#define AM_ZERO (AM_HH * AM_HW * 3)
+__device__ __forceinline__ void amLdm4(unsigned addr, unsigned* r)
 {
-#pragma unroll
-    for (int k = 0; k < 3; k++)
-        out[k * ps + i] = make_uint2(a4kPack(acc[4 * k], acc[4 * k + 1]), a4kPack(acc[4 * k + 2], acc[4 * k + 3]));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
 }
-)A4KSRC";
-
-// conv2d_tf*'s tile: the source (three fp16 planes, R, G, B: k_restIn's) with a one-pixel clamped border
-static const char kA4kLoad0[] = R"A4KSRC(    __shared__ float s[3][A4K_TY][A4K_TX];
-    const int x0 = blockIdx.x * A4K_BX - 1, y0 = blockIdx.y * A4K_BY - 1;
+// CReLU on a packed half2: max(x, 0) and max(-x, 0) per half (sign-bit masks: exact)
+__device__ __forceinline__ unsigned amPos(unsigned u)
+{
+    const unsigned m = ((u >> 15) & 0x00010001u) * 0xffffu;
+    return u & ~m;
+}
+__device__ __forceinline__ unsigned amNeg(unsigned u)
+{
+    const unsigned m = ((u >> 15) & 0x00010001u) * 0xffffu;
+    return u & 0x7fff7fffu & m;
+}
+// the 10 x 34 halo (clamped to the frame) as 24 CReLU halves a pixel (chunk 0 = c 0..7, 1 = c 8..15, 2 = c 16..23),
+// then one zero chunk
+__device__ __forceinline__ void amHalo(uint4* __restrict__ s, const uint2* __restrict__ in, int w, int h, int tx0,
+                                       int ty0)
+{
     const size_t ps = (size_t)w * h;
-    for (int i = threadIdx.y * A4K_BX + threadIdx.x; i < A4K_TX * A4K_TY; i += A4K_BX * A4K_BY)
+    for (int p = threadIdx.x; p < AM_HH * AM_HW; p += 128)
     {
-        const int ly = i / A4K_TX, lx = i % A4K_TX;
-        const int gx = min(max(x0 + lx, 0), w - 1), gy = min(max(y0 + ly, 0), h - 1);
+        const int hr = p / AM_HW, hc = p - hr * AM_HW;
+        const int gy = min(max(ty0 - 1 + hr, 0), h - 1), gx = min(max(tx0 - 1 + hc, 0), w - 1);
         const size_t g = (size_t)gy * w + gx;
-#pragma unroll
-        for (int c = 0; c < 3; c++)
-            s[c][ly][lx] = h2f(src[c * ps + g]);
+        const uint2 a = in[g], b = in[ps + g], c = in[2 * ps + g];
+        s[p * 3 + 0] = make_uint4(amPos(a.x), amPos(a.y), amPos(b.x), amPos(b.y));
+        s[p * 3 + 1] = make_uint4(amPos(c.x), amPos(c.y), amNeg(a.x), amNeg(a.y));
+        s[p * 3 + 2] = make_uint4(amNeg(b.x), amNeg(b.y), amNeg(c.x), amNeg(c.y));
     }
+    if (threadIdx.x == 0)
+        s[AM_ZERO] = make_uint4(0, 0, 0, 0);
     __syncthreads();
-    const int x = blockIdx.x * A4K_BX + threadIdx.x, y = blockIdx.y * A4K_BY + threadIdx.y;
-    if (x >= w || y >= h) return;
-    float v;
-)A4KSRC";
-
-// conv2d_N_tf*'s tile (N = 1..6): the previous layer's CReLU (24 channels) with a one-pixel clamped border
-static const char kA4kLoadM[] = R"A4KSRC(    __shared__ float s[24][A4K_TY][A4K_TX];
-    const int x0 = blockIdx.x * A4K_BX - 1, y0 = blockIdx.y * A4K_BY - 1;
-    const size_t ps = (size_t)w * h;
-    for (int i = threadIdx.y * A4K_BX + threadIdx.x; i < A4K_TX * A4K_TY; i += A4K_BX * A4K_BY)
-    {
-        const int ly = i / A4K_TX, lx = i % A4K_TX;
-        const int gx = min(max(x0 + lx, 0), w - 1), gy = min(max(y0 + ly, 0), h - 1);
-        const size_t g = (size_t)gy * w + gx;
-#pragma unroll
-        for (int k = 0; k < 3; k++)
-        {
-            const uint2 q = in[k * ps + g];
-            const float r[4] = {h2f((unsigned short)(q.x & 0xffff)), h2f((unsigned short)(q.x >> 16)),
-                                h2f((unsigned short)(q.y & 0xffff)), h2f((unsigned short)(q.y >> 16))};
-#pragma unroll
-            for (int j = 0; j < 4; j++)
-            {
-                s[4 * k + j][ly][lx] = fmaxf(r[j], 0.0f);
-                s[12 + 4 * k + j][ly][lx] = fmaxf(-r[j], 0.0f);
-            }
+}
+// chunk q (0..26) of K: tap q / 3 (dy, dx), channel chunk q % 3: its offset in chunks from a pixel's first chunk
+#define AM_OFF(q) ((((q) / 3) / 3 * AM_HW + ((q) / 3) % 3) * 3 + (q) % 3)
+// a layer's shared tile, block origin and weights (layer in scope)
+#define AM_SETUP                                                                                                       \
+        __shared__ __align__(16) uint4 s[AM_ZERO + 1];                                                                 \
+        const uint4* wf = g_a4kWf + layer * 14 * 32;                                                                   \
+        const float* bias = g_a4kB + layer * 12;                                                                       \
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;                                                    \
+        const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * 8;                                                         \
+        uint4 bc = __ldg(wf + lane), bn;
+// the mma main loop over the filled halo and its zero chunk (leaves acc, g, t4)
+#define AM_LOOP(ACC16)                                                                                                 \
+        const unsigned sb = (unsigned)__cvta_generic_to_shared(s);                                                     \
+        const int g = lane >> 2, t4 = lane & 3;                                                                        \
+        const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;                                          \
+        int pb[4];                                                                                                     \
+        _Pragma("unroll") for (int mi = 0; mi < 4; ++mi) pb[mi] =                                                      \
+            ((2 * warp + (mi >> 1)) * AM_HW + (mi & 1) * 16 + arow) * 3;                                               \
+        AM_ACC_DECL_##ACC16;                                                                                           \
+        _Pragma("unroll") for (int st = 0; st < 14; ++st)                                                              \
+        {                                                                                                              \
+            if (st + 1 < 14)                                                                                           \
+                bn = __ldg(wf + (st + 1) * 32 + lane);                                                                 \
+            const int qa = 2 * st, qb = 2 * st + 1;                                                                    \
+            const int off = akc ? (qb < 27 ? AM_OFF(qb) : -1) : AM_OFF(qa);                                            \
+            _Pragma("unroll") for (int mi = 0; mi < 4; ++mi)                                                           \
+            {                                                                                                          \
+                unsigned a[4];                                                                                         \
+                const unsigned addr = off < 0 ? sb + AM_ZERO * 16 : sb + (unsigned)(pb[mi] + off) * 16;                \
+                amLdm4(addr, a);                                                                                       \
+                AM_MMA_##ACC16(mi, 0, bc.x, bc.y);                                                                     \
+                AM_MMA_##ACC16(mi, 1, bc.z, bc.w);                                                                     \
+            }                                                                                                          \
+            bc = bn;                                                                                                   \
         }
+// the generic epilogue: the 12 outputs into the three fp16 textures
+#define AM_STORE(ACC16)                                                                                                \
+        const size_t ps = (size_t)w * h;                                                                               \
+        _Pragma("unroll") for (int nt = 0; nt < 2; ++nt)                                                               \
+        {                                                                                                              \
+            const int n0 = nt * 8 + t4 * 2;                                                                            \
+            if (n0 >= 12)                                                                                              \
+                continue;                                                                                              \
+            _Pragma("unroll") for (int mi = 0; mi < 4; ++mi)                                                           \
+            {                                                                                                          \
+                const int gy = ty0 + 2 * warp + (mi >> 1);                                                             \
+                if (gy >= h)                                                                                           \
+                    continue;                                                                                          \
+                _Pragma("unroll") for (int hh = 0; hh < 2; ++hh)                                                       \
+                {                                                                                                      \
+                    const int gx = tx0 + (mi & 1) * 16 + g + hh * 8;                                                   \
+                    if (gx >= w)                                                                                       \
+                        continue;                                                                                      \
+                    unsigned* o = (unsigned*)(out + (n0 >> 2) * ps + (size_t)gy * w + gx) + ((n0 & 3) >> 1);           \
+                    *o = AM_PACK_##ACC16(mi, nt, hh);                                                                  \
+                }                                                                                                      \
+            }                                                                                                          \
+        }
+#define AM_KERNEL(NAME, ACC16)                                                                                         \
+    __global__ void __launch_bounds__(128) NAME(const uint2* __restrict__ in, int w, int h, uint2* __restrict__ out,   \
+                                                int layer)                                                             \
+    {                                                                                                                  \
+        AM_SETUP                                                                                                       \
+        amHalo(s, in, w, h, tx0, ty0);                                                                                 \
+        AM_LOOP(ACC16)                                                                                                 \
+        AM_STORE(ACC16)                                                                                                \
+    }
+// fp16 sums: acc[mi][nt][2] packed half2 (row g, row g + 8)
+#define AM_ACC_DECL_1                                                                                                  \
+    unsigned acc[4][2][2];                                                                                             \
+    _Pragma("unroll") for (int nt = 0; nt < 2; ++nt)                                                                   \
+    {                                                                                                                  \
+        const int n0 = nt * 8 + t4 * 2;                                                                                \
+        const unsigned b2 = n0 < 12 ? a4kPack(bias[n0], bias[n0 + 1]) : 0u;                                            \
+        _Pragma("unroll") for (int mi = 0; mi < 4; ++mi) acc[mi][nt][0] = acc[mi][nt][1] = b2;                         \
+    }
+#define AM_MMA_1(mi, nt, b0, b1)                                                                                       \
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"      \
+                 : "+r"(acc[mi][nt][0]), "+r"(acc[mi][nt][1])                                                          \
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1))
+#define AM_PACK_1(mi, nt, hh) (acc[mi][nt][hh])
+AM_KERNEL(k_a4kConvM16, 1)
+)A4KSRC";
+
+// k_a4kConvM16First's tile fill: the source (three fp16 planes, R, G, B: k_restIn's) as a clamped 12 x 36 tile, then
+// conv2d_tf (a4kC0At) at each of conv2d_1's 10 x 34 halo pixels' clamped position, rounded to fp16 as its texture would
+// be and CReLU'd into the mma's chunks (amHalo's layout): conv2d_tf never reaches memory
+static const char kA4kFirstFill[] = R"A4KSRC(    __shared__ float st[3 * 12 * 36];
+    const size_t psrc = (size_t)w * h;
+    for (int i = threadIdx.x; i < 12 * 36; i += 128)
+    {
+        const int r = i / 36, c = i - r * 36;
+        const int gy = min(max(ty0 - 2 + r, 0), h - 1), gx = min(max(tx0 - 2 + c, 0), w - 1);
+        const size_t gi = (size_t)gy * w + gx;
+#pragma unroll
+        for (int ch = 0; ch < 3; ch++)
+            st[ch * 432 + i] = h2f(src[ch * psrc + gi]);
     }
     __syncthreads();
-    const int x = blockIdx.x * A4K_BX + threadIdx.x, y = blockIdx.y * A4K_BY + threadIdx.y;
-    if (x >= w || y >= h) return;
-    float v;
+    for (int p = threadIdx.x; p < AM_HH * AM_HW; p += 128)
+    {
+        const int hr = p / AM_HW, hc = p - hr * AM_HW;
+        const int cy = min(max(ty0 - 1 + hr, 0), h - 1), cx = min(max(tx0 - 1 + hc, 0), w - 1);
+        unsigned hv[6];
+        a4kC0At(st + (cy - ty0 + 1) * 36 + (cx - tx0 + 1), hv);
+        s[p * 3 + 0] = make_uint4(amPos(hv[0]), amPos(hv[1]), amPos(hv[2]), amPos(hv[3]));
+        s[p * 3 + 1] = make_uint4(amPos(hv[4]), amPos(hv[5]), amNeg(hv[0]), amNeg(hv[1]));
+        s[p * 3 + 2] = make_uint4(amNeg(hv[2]), amNeg(hv[3]), amNeg(hv[4]), amNeg(hv[5]));
+    }
+    if (threadIdx.x == 0)
+        s[AM_ZERO] = make_uint4(0, 0, 0, 0);
+    __syncthreads();
+)A4KSRC";
+
+// k_a4kConvM16Last's middle: conv2d_6's fp16 sums (the values its texture would hold) staged per pixel in the freed
+// halo, then each thread takes two of the tile's pixels for the last 1 x 1
+static const char kA4kLastStage[] = R"A4KSRC(    __syncthreads();
+    unsigned short* s6 = (unsigned short*)s;
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt)
+    {
+        const int n0 = nt * 8 + t4 * 2;
+        if (n0 >= 12)
+            continue;
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+            for (int hh = 0; hh < 2; ++hh)
+                *(unsigned*)(s6 + ((2 * warp + (mi >> 1)) * 32 + (mi & 1) * 16 + g + hh * 8) * 12 + n0) =
+                    acc[mi][nt][hh];
+    }
+    __syncthreads();
+    const size_t ps = (size_t)w * h;
+    for (int p = threadIdx.x; p < 256; p += 128)
+    {
+        const int gx = tx0 + (p & 31), gy = ty0 + (p >> 5);
+        if (gx >= w || gy >= h)
+            continue;
+        const size_t i = (size_t)gy * w + gx;
+        float pos, neg, r[4];
+        uint2 q;
 )A4KSRC";
 
 // one weight as an exact float literal: the hex form of its own bits (printf %a, the mantissa's trailing zeros cut)
@@ -16191,99 +16401,137 @@ static void a4kLit(std::string& s, uint32_t bits)
     s += 'f';
 }
 
-// a 3 x 3 layer's sums: the biases, then per input channel c, per tap t, the 12 outputs' FMAs (blk = its weight block,
-// nin = 3 or 24 input channels)
-static void a4kConvBody(std::string& s, const uint32_t* blk, int nin)
+// the module's whole text: kA4kMma's pieces and k_a4kConvM16 (conv2d_2 .. _5); a4kC0At = conv2d_tf at one pixel (t =
+// its 3 x 3 window's top-left in the [3][12][36] source tile; its 12 sums as 6 packed half2; the literal weights in the
+// shader's order: the bias, then channel, tap, output); k_a4kConvM16First (conv2d_tf on conv2d_1's halo, then
+// conv2d_1); k_a4kConvM16Last (conv2d_6, then the 1 x 1 over the CReLU of conv2d_2 .. _6 with literal weights, per
+// output by layer, texture, channel, pos then neg -> the three last textures as 12 fp16 planes, plane 4 k + j = texture
+// k's channel j: k_a4kFoldHSub's input)
+static void a4kKernelText(std::string& s)
 {
-    s += "    float acc[12] = {";
+    s.reserve((size_t)1 << 20);
+    s = kA4kHead;
+    s += kA4kMma;
+    char ln[160];
+    s += "__device__ __forceinline__ void a4kC0At(const float* __restrict__ t, unsigned* __restrict__ h6)\n{\n"
+         "    float v;\n    float acc[12] = {";
     for (int o = 0; o < 12; o++)
     {
-        a4kLit(s, blk[(size_t)nin * 9 * 12 + o]);
+        a4kLit(s, kA4kWeights[3 * 9 * 12 + o]);
         s += o < 11 ? ", " : "};\n";
     }
-    char ln[96];
-    for (int c = 0; c < nin; c++)
+    for (int c = 0; c < 3; c++)
         for (int t = 0; t < 9; t++)
         {
-            sprintf_s(ln, "    v = s[%d][threadIdx.y + %d][threadIdx.x + %d];\n", c, t / 3, t % 3);
+            sprintf_s(ln, "    v = t[%d];\n", c * 432 + (t / 3) * 36 + t % 3);
             s += ln;
             for (int o = 0; o < 12; o++)
             {
                 sprintf_s(ln, "    acc[%d] = fmaf(", o);
                 s += ln;
-                a4kLit(s, blk[((size_t)o * nin + c) * 9 + t]);
+                a4kLit(s, kA4kWeights[((size_t)o * 3 + c) * 9 + t]);
                 sprintf_s(ln, ", v, acc[%d]);\n", o);
                 s += ln;
             }
         }
-    s += "    a4kStore(out, ps, (size_t)y * w + x, acc);\n}\n";
-}
-
-// the module's whole text: k_a4kConv0 (layer 0), k_a4kConv_1 .. _6, k_a4kLast (the 1 x 1 over the CReLU of layers 2..6
-// -> the three last textures as 12 fp16 planes, plane 4 k + j = texture k's channel j: k_a4kFoldHSub's input)
-static void a4kKernelText(std::string& s)
-{
-    s.reserve((size_t)2 << 20);
-    s = kA4kHead;
-    s += "__global__ void __launch_bounds__(A4K_BX * A4K_BY) k_a4kConv0(const unsigned short* __restrict__ src, int w, "
-         "int h, uint2* __restrict__ out)\n{\n";
-    s += kA4kLoad0;
-    a4kConvBody(s, kA4kWeights, 3);
-    char ln[160];
-    for (int L = 1; L < 7; L++)
-    {
-        sprintf_s(
-            ln,
-            "__global__ void __launch_bounds__(A4K_BX * A4K_BY) k_a4kConv_%d(const uint2* __restrict__ in, int w, "
-            "int h, uint2* __restrict__ out)\n{\n",
-            L);
-        s += ln;
-        s += kA4kLoadM;
-        a4kConvBody(s, kA4kWeights + kA4kW0 + (size_t)(L - 1) * kA4kW, 24);
-    }
+    s +=
+        "#pragma unroll\n    for (int k = 0; k < 6; k++)\n        h6[k] = a4kPack(acc[2 * k], acc[2 * k + 1]);\n}\n"
+        "__global__ void __launch_bounds__(128) k_a4kConvM16First(const unsigned short* __restrict__ src, int w, int h, "
+        "uint2* __restrict__ out)\n{\n    const int layer = 0;\n    AM_SETUP\n";
+    s += kA4kFirstFill;
+    s += "    AM_LOOP(1)\n    AM_STORE(1)\n}\n";
     const uint32_t* wl = kA4kWeights + kA4kW0 + 6 * kA4kW;
-    s += "__global__ void __launch_bounds__(A4K_BX * A4K_BY) k_a4kLast(A4kLastIn in, int w, int h, unsigned short* "
-         "__restrict__ out)\n{\n"
-         "    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;\n"
-         "    if (x >= w || y >= h) return;\n"
-         "    const size_t ps = (size_t)w * h, i = (size_t)y * w + x;\n"
-         "    float acc[12] = {";
+    s +=
+        "__global__ void __launch_bounds__(128) k_a4kConvM16Last(const uint2* __restrict__ in, int w, int h, A4kLast4 l, "
+        "unsigned short* __restrict__ out)\n{\n    const int layer = 5;\n    AM_SETUP\n"
+        "    amHalo(s, in, w, h, tx0, ty0);\n    AM_LOOP(1)\n";
+    s += kA4kLastStage;
+    s += "        float z[12] = {";
     for (int o = 0; o < 12; o++)
     {
         a4kLit(s, wl[1440 + o]);
         s += o < 11 ? ", " : "};\n";
     }
-    s += "    float pos, neg;\n    uint2 q;\n    float r[4];\n";
     for (int L = 0; L < 5; L++)
         for (int k = 0; k < 3; k++)
         {
-            sprintf_s(ln, "    q = in.l[%d][%d * ps + i];\n", L, k);
-            s += ln;
-            s += "    r[0] = h2f((unsigned short)(q.x & 0xffff)); r[1] = h2f((unsigned short)(q.x >> 16));\n"
-                 "    r[2] = h2f((unsigned short)(q.y & 0xffff)); r[3] = h2f((unsigned short)(q.y >> 16));\n";
+            if (L < 4)
+            {
+                sprintf_s(ln, "        q = l.l[%d][%d * ps + i];\n", L, k);
+                s += ln;
+                s += "        r[0] = h2f((unsigned short)(q.x & 0xffff)); r[1] = h2f((unsigned short)(q.x >> 16));\n"
+                     "        r[2] = h2f((unsigned short)(q.y & 0xffff)); r[3] = h2f((unsigned short)(q.y >> 16));\n";
+            }
+            else
+            {
+                sprintf_s(ln,
+                          "        r[0] = h2f(s6[p * 12 + %d]); r[1] = h2f(s6[p * 12 + %d]); r[2] = h2f(s6[p * 12 + "
+                          "%d]); r[3] = h2f(s6[p * 12 + %d]);\n",
+                          4 * k, 4 * k + 1, 4 * k + 2, 4 * k + 3);
+                s += ln;
+            }
             for (int j = 0; j < 4; j++)
             {
-                sprintf_s(ln, "    pos = fmaxf(r[%d], 0.0f); neg = fmaxf(-r[%d], 0.0f);\n", j, j);
+                sprintf_s(ln, "        pos = fmaxf(r[%d], 0.0f); neg = fmaxf(-r[%d], 0.0f);\n", j, j);
                 s += ln;
                 for (int o = 0; o < 12; o++)
                 {
-                    sprintf_s(ln, "    acc[%d] = fmaf(", o);
+                    sprintf_s(ln, "        z[%d] = fmaf(", o);
                     s += ln;
                     a4kLit(s, wl[(size_t)o * 120 + 24 * L + 4 * k + j]);
-                    sprintf_s(ln, ", pos, acc[%d]);\n    acc[%d] = fmaf(", o, o);
+                    sprintf_s(ln, ", pos, z[%d]);\n        z[%d] = fmaf(", o, o);
                     s += ln;
                     a4kLit(s, wl[(size_t)o * 120 + 24 * L + 12 + 4 * k + j]);
-                    sprintf_s(ln, ", neg, acc[%d]);\n", o);
+                    sprintf_s(ln, ", neg, z[%d]);\n", o);
                     s += ln;
                 }
             }
         }
-    s +=
-        "#pragma unroll\n    for (int o = 0; o < 12; o++)\n        out[o * ps + i] = f2h(acc[o]);\n}\n} // extern \"C\"\n";
+    s += "#pragma unroll\n        for (int o = 0; o < 12; o++)\n            out[o * ps + i] = f2h(z[o]);\n    }\n}\n"
+         "} // extern \"C\"\n";
 }
 
-// this session's Anime4K module: its text compiled (or the cached cubin) and loaded, its eight kernels bound; false =
-// `why` says what failed (the session teardown unloads a module left in a4kMod)
+static uint16_t halfBitsRne(float f);
+
+// the six 3 x 3 layers' weights for kA4kMma: wf = [layer][14 k-steps][32 lanes][4] = n-tile 0 b0 b1, n-tile 1 b0 b1, each
+// register two fp16 weights (K rows k0, k0 + 1 at output g of the n-tile; lane = 4 g + k0 / 2, b1 = rows + 8); K row
+// kl of k-step st = chunk q = 2 st + kl / 8 (tap q / 3, channel (q % 3) * 8 + kl % 8), chunk 27 and outputs 12..15 zero;
+// b = the fp32 biases
+static void a4kFragments(std::vector<uint32_t>& wf, std::vector<float>& b)
+{
+    wf.assign((size_t)6 * 14 * 32 * 4, 0u);
+    b.assign(6 * 12, 0.0f);
+    for (int L = 0; L < 6; L++)
+    {
+        const uint32_t* blk = kA4kWeights + kA4kW0 + (size_t)L * kA4kW;
+        auto wh = [&](int st, int kl, int n) -> uint32_t {
+            const int q = 2 * st + kl / 8;
+            if (q >= 27 || n >= 12)
+                return 0u;
+            const int tap = q / 3, c = (q % 3) * 8 + kl % 8;
+            float v;
+            memcpy(&v, &blk[((size_t)n * 24 + c) * 9 + tap], sizeof v);
+            return halfBitsRne(v);
+        };
+        for (int st = 0; st < 14; st++)
+            for (int lane = 0; lane < 32; lane++)
+            {
+                const int g = lane >> 2, k0 = (lane & 3) * 2;
+                uint32_t* e = &wf[(((size_t)L * 14 + st) * 32 + lane) * 4];
+                for (int nt = 0; nt < 2; nt++)
+                {
+                    const int n = nt * 8 + g;
+                    e[2 * nt] = wh(st, k0, n) | (wh(st, k0 + 1, n) << 16);
+                    e[2 * nt + 1] = wh(st, k0 + 8, n) | (wh(st, k0 + 9, n) << 16);
+                }
+            }
+        for (int o = 0; o < 12; o++)
+            memcpy(&b[(size_t)L * 12 + o], &blk[24 * 9 * 12 + o], sizeof(float));
+    }
+}
+
+// this session's Anime4K module: its text compiled (or the cached cubin) and loaded, its three kernels bound and
+// kA4kMma's weights uploaded; false = `why` says what failed (the session teardown unloads a module left in a4kMod)
 static bool nativeA4kModule(NativeRife& nr, std::string& why)
 {
     if (nr.a4kMod)
@@ -16303,44 +16551,57 @@ static bool nativeA4kModule(NativeRife& nr, std::string& why)
         why = "its kernel module did not load";
         return false;
     }
-    static const char* const kNames[8] = {"k_a4kConv0",  "k_a4kConv_1", "k_a4kConv_2", "k_a4kConv_3",
-                                          "k_a4kConv_4", "k_a4kConv_5", "k_a4kConv_6", "k_a4kLast"};
-    for (int i = 0; i < 8; i++)
+    static const char* const kNames[3] = {"k_a4kConvM16First", "k_a4kConvM16", "k_a4kConvM16Last"};
+    for (int i = 0; i < 3; i++)
         if (cuModuleGetFunction(&nr.fA4k[i], nr.a4kMod, kNames[i]) != CUDA_SUCCESS)
         {
             why = std::string("its kernel ") + kNames[i] + " is missing";
             return false;
         }
+    std::vector<uint32_t> wf;
+    std::vector<float> b;
+    a4kFragments(wf, b);
+    CUdeviceptr gw = 0, gb = 0;
+    size_t sw = 0, sb = 0;
+    if (cuModuleGetGlobal(&gw, &sw, nr.a4kMod, "g_a4kWf") != CUDA_SUCCESS || sw != wf.size() * sizeof(uint32_t) ||
+        cuModuleGetGlobal(&gb, &sb, nr.a4kMod, "g_a4kB") != CUDA_SUCCESS || sb != b.size() * sizeof(float) ||
+        cuMemcpyHtoD(gw, wf.data(), sw) != CUDA_SUCCESS || cuMemcpyHtoD(gb, b.data(), sb) != CUDA_SUCCESS)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
     return true;
 }
 
-// the conv passes on nr.stream: dA4kIn -> the layers in their slots (layer -> slot 0 1 2 0 1 3 4: a slot is reused
-// once its layer's only reader has run; layers 2..6 stay for the 1 x 1) -> dA4kOut
+// the conv passes on nr.stream, 4 warps a 32 x 8 tile each: dA4kIn -> k_a4kConvM16First (conv2d_tf + conv2d_1) ->
+// k_a4kConvM16 (conv2d_2 .. _5) -> k_a4kConvM16Last (conv2d_6 + the 1 x 1) -> dA4kOut. Layers 1..5 in four slots
+// (layer -> slot 0 1 2 3 0: layer 1's only reader has run before layer 5 is written; layers 2..5 stay for the 1 x 1)
 static bool nativeA4kPasses(NativeRife& nr, cudaStream_t st)
 {
     int w = nr.a4kW, h = nr.a4kH;
     const size_t lb = (size_t)3 * w * h * 8;
-    static const int kSlot[7] = {0, 1, 2, 0, 1, 3, 4};
-    void* t[7];
-    for (int i = 0; i < 7; i++)
+    static const int kSlot[6] = {0, 0, 1, 2, 3, 0};
+    void* t[6];
+    for (int i = 1; i < 6; i++)
         t[i] = (char*)nr.dA4kT + kSlot[i] * lb;
-    const unsigned gx = (unsigned)(w + 31) / 32, gy = (unsigned)(h + 7) / 8; // A4K_BX x A4K_BY
-    void* a0[] = {&nr.dA4kIn, &w, &h, &t[0]};
-    if (cuLaunchKernel(nr.fA4k[0], gx, gy, 1, 32, 8, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
+    const unsigned gx = (unsigned)(w + 31) / 32, gy = (unsigned)(h + 7) / 8;
+    void* a0[] = {&nr.dA4kIn, &w, &h, &t[1]};
+    if (cuLaunchKernel(nr.fA4k[0], gx, gy, 1, 128, 1, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
         return false;
-    for (int L = 1; L < 7; L++)
+    for (int L = 2; L < 6; L++)
     {
-        void* a[] = {&t[L - 1], &w, &h, &t[L]};
-        if (cuLaunchKernel(nr.fA4k[L], gx, gy, 1, 32, 8, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+        int layer = L - 1;
+        void* a[] = {&t[L - 1], &w, &h, &t[L], &layer};
+        if (cuLaunchKernel(nr.fA4k[1], gx, gy, 1, 128, 1, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             return false;
     }
-    void* li[5] = {t[2], t[3], t[4], t[5], t[6]}; // A4kLastIn
-    void* al[] = {li, &w, &h, &nr.dA4kOut};
-    return cuLaunchKernel(nr.fA4k[7], gx, gy, 1, 32, 8, 1, 0, (CUstream)st, al, nullptr) == CUDA_SUCCESS;
+    void* l4[4] = {t[2], t[3], t[4], t[5]}; // A4kLast4
+    void* al[] = {&t[5], &w, &h, l4, &nr.dA4kOut};
+    return cuLaunchKernel(nr.fA4k[2], gx, gy, 1, 128, 1, 1, 0, (CUstream)st, al, nullptr) == CUDA_SUCCESS;
 }
 
 // Anime4K at the slot's input size w x h (-> ow x oh after the fold): its kernel module (nativeA4kModule), the input,
-// the five layer slots, the output and the fold's buffers, then one run of the passes on zeros, so the first frame pays
+// the four layer slots, the output and the fold's buffers, then one run of the passes on zeros, so the first frame pays
 // no first launch. A module that fails or a failed allocation = Lanczos for the session (vsrFailed), with its line.
 static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc)
 {
@@ -16354,7 +16615,7 @@ static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upE
     }
     const size_t sp = (size_t)w * h;
     if (cudaMalloc(&nr.dA4kIn, 3 * sp * sizeof(uint16_t)) != cudaSuccess ||
-        cudaMalloc(&nr.dA4kT, 5 * 3 * sp * 8) != cudaSuccess ||
+        cudaMalloc(&nr.dA4kT, 4 * 3 * sp * 8) != cudaSuccess ||
         cudaMalloc(&nr.dA4kOut, 12 * sp * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc((void**)&nr.dA4kTmp, (size_t)3 * ow * 2 * h * sizeof(float)) != cudaSuccess)
     {
@@ -16374,7 +16635,8 @@ static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upE
         return false;
     }
     NCHK(cudaStreamSynchronize(nr.stream), "Anime4K warm-up sync");
-    LOG("native: %s upscale: Anime4K Upscale CNN x2 UL %dx%d -> %dx%d -> Lanczos %dx%d%s%s (CUDA passes, %.1fs)\n",
+    LOG("native: %s upscale: Anime4K Upscale CNN x2 UL %dx%d -> %dx%d -> Lanczos %dx%d%s%s (CUDA passes, tensor-core "
+        "layers with fp16 sums, %.1fs)\n",
         g_offline ? "offline" : "live", w, h, 2 * w, 2 * h, ow, oh,
         nr.vsrPre ? ", the captured frame before the model" : "",
         nr.hdr ? ", on the HDR planes' SDR view" : (upEnc ? ", on the HDR video's SDR view" : ""),
@@ -16384,8 +16646,8 @@ static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upE
 
 // one frame through Anime4K: s (planar, fp32 or fp16 by sHalf, plane / row strides ps_ / rs_) at the passes' input
 // size into their fp16 input (k_restIn), the conv passes on nr.stream, then the fold (the Depth-to-Space pass and the
-// Lanczos pair from 2w x 2h to tw x th) into dst (planar fp32, tight; the clamp to 0..1 folded in, as Restore's fold
-// does)
+// Lanczos pair from 2w x 2h to tw x th; one pass, k_a4kFold2x, when tw x th is exactly 2w x 2h) into dst (planar fp32,
+// tight; the clamp to 0..1 folded in, as Restore's fold does)
 static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th)
 {
     cudaStream_t st = nr.stream;
@@ -16408,6 +16670,18 @@ static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int 
         return false;
     }
     int half = 1, h2 = 2 * h;
+    if (tw == 2 * w && th == h2)
+    {
+        // an exact 2x target: the Lanczos pair is the identity there, one pass writes the clamped 2x values
+        void* a2[] = {&nr.dA4kOut, &half, &nr.dA4kIn, &w, &h, &dst};
+        if (cuLaunchKernel(nr.fA4kFold2x, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a2, nullptr) !=
+            CUDA_SUCCESS)
+        {
+            nr.die("Anime4K fold (2x) launch failed");
+            return false;
+        }
+        return true;
+    }
     const void* tabH = rsTabFor(nr, 2 * w, tw, st);
     const void* tabV = rsTabFor(nr, h2, th, st);
     if (!tabH || !tabV)
