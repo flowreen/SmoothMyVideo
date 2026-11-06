@@ -1,17 +1,15 @@
-// The engine cache stamp. Engines are found by NAME (net, shapes, TensorRT-RTX version,
-// weight tags) and the name does not say which ONNX graph an engine was built from, so after a new
-// export the old engines would keep being reused. The stamp = the TensorRT-RTX version the host
-// loads + onnx/weights_tags.txt (the weight tags and the `export` line, trt_lookup.export_stamp:
-// it changes with every export input); when it differs from the one stored in the cache
-// folder, the folder is emptied once (every engine rebuilds at its size on first use) and the new
-// stamp is written. Runs at app start and CLI start, before anything spawns the host.
+// The model cache: the folder the host keeps its compiled kernel cubins in (named by their source
+// hash, so a new build never reuses a stale one). Earlier versions also kept TensorRT engines there
+// (*.engine, their *.jit / *.warm files and the engine_stamp.txt that guarded them): those are
+// removed once, at app start and CLI start, before anything spawns the host.
 import * as fs from 'fs';
 import * as path from 'path';
 
-const STAMP = 'engine_stamp.txt';
 const CACHE_NAME = 'model_cache_safe_to_delete';
 // where earlier versions kept the cache, inside the engine folder
 const OLD_NAMES = ['trt_cache_safe_to_delete', 'trt_cache'];
+// what earlier versions' TensorRT engines left in the cache
+const ENGINE_LEFTOVER = /(\.engine|\.jit|\.warm)$|^engine_stamp\.txt$/i;
 
 /** The app's top folder: the repo root in a dev tree, the folder holding SmoothMyVideo.exe in an
  *  install (its engine folder is resources\engine). The host (lkModelCacheDir) derives the same. */
@@ -37,7 +35,7 @@ function moveEntry(from: string, to: string): void {
 
 /** Move every cache an earlier version left elsewhere into the top folder's cache once: the engine
  *  folder's (OLD_NAMES) and `legacy` (1.0.x's AppData one). Into an existing cache the old entries
- *  merge, the cache's own entries win; the stamp check then empties whatever is stale. */
+ *  merge, the cache's own entries win. */
 function adoptOldCache(engine: string, dir: string, legacy: string[]): string {
   if (process.env.SMV_TRT_CACHE) return '';
   const notes: string[] = [];
@@ -60,57 +58,30 @@ function adoptOldCache(engine: string, dir: string, legacy: string[]): string {
   return notes.length ? `engine cache: ${notes.join(', ')}\n` : '';
 }
 
-/** The stamp this tree's engines must carry, or null when a part is missing (then nothing is
- *  wiped: a tree without its ONNX or its runtime cannot build engines anyway). */
-function currentStamp(engine: string): string | null {
-  try {
-    const trt = fs.readFileSync(path.join(engine, 'gpu_runtime', 'tensorrt_rtx_version.txt'), 'utf8').trim();
-    const onnxDir = process.env.SMV_ONNX_DIR || path.join(engine, 'onnx');
-    const tags = fs.readFileSync(path.join(onnxDir, 'weights_tags.txt'), 'utf8').trim();
-    return trt && tags ? `trt ${trt}\n${tags}\n` : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Empty the engine cache when its stamp is stale; returns what it did (for the caller's log). */
-export function checkEngineCache(engine: string, legacy: string[] = []): string {
-  const dir = engineCacheDir(engine);
-  const moved = adoptOldCache(engine, dir, legacy);
-  return moved + stampCheck(engine, dir);
-}
-
-function stampCheck(engine: string, dir: string): string {
-  const want = currentStamp(engine);
-  if (want === null) return 'engine cache: no stamp inputs, left as is';
-  let have = '';
-  try {
-    have = fs.readFileSync(path.join(dir, STAMP), 'utf8');
-  } catch {
-    /* no stamp yet: a fresh folder, or one from before the stamp existed */
-  }
-  if (have === want) return 'engine cache: current';
+/** Remove what earlier versions' TensorRT engines left in the cache folder (top level only). */
+function dropEngineLeftovers(dir: string): string {
   let removed = 0;
   let left = 0;
   try {
     for (const f of fs.readdirSync(dir)) {
-      if (f === STAMP) continue;
+      if (!ENGINE_LEFTOVER.test(f)) continue;
       try {
         fs.rmSync(path.join(dir, f), { recursive: true, force: true });
         removed++;
       } catch {
-        left++; // held open by another process: its name would match a new build, so no stamp yet
+        left++; // held open by another process: retried next start
       }
     }
   } catch {
-    /* no folder yet */
+    return 'engine cache: no folder yet';
   }
-  if (left) return `engine cache: stamp changed, emptied ${removed} entries, ${left} in use (retried next start)`;
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, STAMP), want);
-  } catch {
-    return `engine cache: emptied ${removed} entries, stamp not written`;
-  }
-  return `engine cache: stamp changed, emptied ${removed} entries`;
+  if (!removed && !left) return 'engine cache: current';
+  return `engine cache: removed ${removed} TensorRT leftovers` + (left ? `, ${left} in use (retried next start)` : '');
+}
+
+/** Adopt an older cache and remove its TensorRT leftovers; returns what it did (for the caller's log). */
+export function checkEngineCache(engine: string, legacy: string[] = []): string {
+  const dir = engineCacheDir(engine);
+  const moved = adoptOldCache(engine, dir, legacy);
+  return moved + dropEngineLeftovers(dir);
 }

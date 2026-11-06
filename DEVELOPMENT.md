@@ -6,14 +6,13 @@ overview see [README.md](README.md).
 
 ## Overview
 
-An Electron + TypeScript GUI over one native host (`engine/live/smv-live.exe`, C++ on TensorRT for
-RTX and CUDA 13) that runs every offline render and Live session; a TypeScript orchestrator
-(`src/render`) probes, plans, encodes and resumes. No Python ships: the
-engines are built by the host from size-free ONNX shipped in `engine/onnx`, which a DEV python
-(`engine/runtime`, torch cu134, never shipped) exports from the committed weights. The packaged
-build is self-contained: extract the zip, run `SmoothMyVideo.exe`, nothing else on the target but
-the NVIDIA driver. Built and tested on an RTX 5090 Laptop (Blackwell, sm_120) across TensorRT-RTX,
-RTX VSR / HDR and all three codecs.
+An Electron + TypeScript GUI over one native host (`engine/live/smv-live.exe`, C++ on CUDA 13: every
+net runs on its own kernels, compiled by NVRTC) that runs every offline render and Live session; a
+TypeScript orchestrator (`src/render`) probes, plans, encodes and resumes. The repo holds no Python and none
+ships: the host reads the committed weights itself; a DEV python install (`engine/runtime`, never shipped) only
+carries the CUDA 13 wheels the host's build and the runtime staging read. The packaged build is self-contained: extract the
+zip, run `SmoothMyVideo.exe`, nothing else on the target but the NVIDIA driver. Built and tested on an
+RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
 
 ## Project layout
 
@@ -78,83 +77,39 @@ RTX VSR / HDR and all three codecs.
   (it builds `app.js` first; duplicate ids, dangling `$()` refs from both files, every `<script src>`
   resolving, `node --check` on the inline script and on `app.js`); a duplicate id once made the codec selection silently
   never reach the engine. The renderer uses `require('electron')`, so it cannot run in a browser.
-* `engine/gpu_runtime/`: the CUDA 13 runtime + NVRTC and TensorRT-RTX (+ its ONNX parser) DLLs the
-  host loads, plus `tensorrt_rtx_version.txt` (the version baked into every engine name). Staged
-  from the dev python's wheels by `scripts/stage-gpu-runtime.ts` (setup; required in dist),
-  gitignored, shipped.
-* DEV TOOLS (python, need `engine/runtime`, never shipped: the dist filter drops `runtime/**` and
-  every `*.py`): `engine/onnx_export.py` and what it imports, below.
-* `engine/trt_runtime.py`: the size-free ONNX export (dev tool): each graph's export module and
-  its engine contract (base name, input / output names). The python
-  TensorRT runtime it used to hold (`trtify`, `rife_trtify`, the per-size export, the strict mode)
-  was removed with the python render routes. The native host builds the engines
-  and caches them by name in `model_cache_safe_to_delete` in the app's top folder (the repo root;
-  in an install the folder holding SmoothMyVideo.exe, whose engine folder is `resources\engine`)
-  (name = net, shapes, TRT version, weights hash; no GPU in the key, TRT-RTX engines are portable).
-  Code empties that folder only when its stamp goes stale (a new TensorRT-RTX version, weight tags
-  or ONNX export; see the size-free ONNX paragraph); deleting it by hand is always safe, engines
-  rebuild on demand. GUI and CLI share it (`SMV_TRT_CACHE` overrides the location and turns the
-  move off). At start the app moves into it every cache an earlier version left elsewhere: the
-  engine folder's `trt_cache_safe_to_delete` / `trt_cache` and (the GUI) 1.0.x's
-  `%APPDATA%\SmoothMyVideo\trt_cache` (across drives a copy, then the old folder is deleted); into
-  an existing cache the old entries merge, its own entries win, and the stamp check then empties
-  whatever is stale. An engine at a new size is built from the
-  graph's SIZE-FREE ONNX in `engine/onnx` (every H / W symbolic, the engine still pinned to one
-  size). The graphs: the RIFE IFNet, encode, block0, Restore and the GMFSS nets (GMFlow as
-  two graphs around its local correlation, see the GMFlow bullets below). The
-  files come from the committed weights (`engine/onnx_export.py`, run by `scripts/export-onnx.ts` in `npm run setup`
-  and, required, in `npm run dist`; gitignored, shipped in the release); the host builds every
-  engine from them.
-  After the exports the script tidies the folder for shipping: a graph it did not produce is
-  removed, identical external weight files are merged into one `weights_<md5>.data` that every
-  such graph points at (the RIFE family's 23 MB of weights once instead of eight times), and
-  `weights_tags.txt` records the weight tags. The dist leaves the `.pkl` / `.pth` weights out (the
-  ONNX carry them): the host names engines from the weight files' hashes when they exist and from
-  `weights_tags.txt` otherwise. Names: `<engine base>[_sl<scales>][_dt<dtypes>]_<weights tag>.onnx`
-  (`trt_lookup.onnx_path`). Nothing is bumped by hand: `trt_lookup.export_stamp()` fingerprints
-  everything an export reads (the `.py` files of `engine`, `engine/rife` and `engine/GMFSS_Fortuna`,
-  the torch / onnx / onnxscript / onnx-ir versions and the weight files) plus `trt_lookup.HOST_BUILD`,
-  the host builder's settings that change an engine but not its graph; `weights_tags.txt`
-  records it (`export <stamp>`, the host ignores it), and an export whose stamp differs removes the
-  folder's graphs and exports every one again; so run `node scripts/export-onnx.ts` after any
-  change under `engine`. The engine cache stamp is `weights_tags.txt` plus the TensorRT-RTX
-  version: at app start and CLI start `src/render/cache.ts` compares it with
-  `engine_stamp.txt` in the cache folder and, when it differs, empties the folder once (every
-  engine rebuilds at its size on first use), so no engine built from an older graph or runtime is
-  reused; engine names stay as they are. The graph passes the export applies, in the order they
-  were added (each measured against the graph before it): it rewrites each
-  PRelu into an exact LeakyRelu / Max form (`trt_runtime._fuse_prelu`), which TensorRT-RTX fuses
-  into the conv before it (it runs PRelu as a separate kernel): Restore 1.30x, fusionnet 1.06x /
-  1.09x per call at 1080p / 4K, output bit-identical. Where per-channel slopes reach above 1 and
-  a single conv sits on each side, the sign fold negates those channels' outputs in the conv before
-  and their inputs in the conv after, so the activation keeps the one-step Max form instead of
-  Max(x, 0) + a * Min(x, 0) (Restore's 14 such layers: a 1080p call x0.977, bit-identical). The RIFE IFNet and block0 graphs
-  take the feature encodes `f0` / `f1` in fp16 and widen them inside the graph
-  (`trt_runtime._half_features`), so the host feeds the encode engine's fp16 output as it is
-  instead of widening it with `k_h2f` (the host reads the dtype off the engine and refuses a
-  block0 or encode engine that does not match): live batched IFNet 1.02x per call at 1440p,
-  output bit-identical. The RIFE IFNet takes its frame pair `x` and the encode its `img`
-  in fp16 (`trt_runtime._half_frames`); the host keeps the fp32 frames for everything else and
-  fills an fp16 copy for these engines once per frame (`k_f2h`), reading each engine's dtype on
-  its own, so either form of either engine works. The IFNet runs 1.05x faster per call at
-  1080p; the tweens change slightly (the fp16 rounding reaches the flow, 56 to 65 dB on anime),
-  the real frames do not. The RIFE IFNet hands its tween `merged` out in fp16
-  (one Cast after the fp32 blend), and every host reader of a tween
-  (the packs, the fits, Restore, RTX VSR, TrueHDR) takes it as it is through a half flag beside
-  the source pointer, so no pass widens it; each tween is the fp32 one rounded to fp16 (at most 1
-  code at 8 and 10 bits). The RIFE IFNet takes its `timestep` in fp16
-  (`trt_runtime._half_timestep`, one Cast in front of its readers); the host fills the constant
-  planes in fp16 (`nativeFillT`, rounded to nearest even like the graph's own cast), DRBA's map
-  kernel writes fp16 (`k_drbaDrmNorm`'s half flag), and the timestep and tween buffers are sized by
-  the engine's dtypes after the load (`nativeTweenBuffers`). A plane that already holds the t
-  asked for is not filled again (x2 asks for 0.5 every group; DRBA's map marks the planes
-  unknown). RIFE tweens stay
-  bit-identical, DRBA's move by up to 31 codes on thin moving edges (55.7 dB at the worst frame),
-  and a live 1080p session holds 126 MiB less. The RIFE IFNet hands out its final `flow`
-  and blend `mask` (fp16, the tensors its own last warp read, `trt_runtime._half_flow_mask`)
-  instead of `merged`, and the host makes each tween with RIFE's own last step (`k_rifeBlend`:
-  both frames warped along their flow with grid_sample's bilinear border tap, blended by the
-  mask), so one flow can warp other pictures of the pair. Offline RIFE runs the IFNet on a motion frame (`k_motionIn`): the finished picture after
+* `engine/gpu_runtime/`: the CUDA 13 runtime + NVRTC DLLs the host loads. Staged from the dev
+  python's wheels by `scripts/stage-gpu-runtime.ts` (setup; required in dist), gitignored, shipped.
+* The model cache: `model_cache_safe_to_delete` in the app's top folder (the repo root; in an install
+  the folder holding SmoothMyVideo.exe, whose engine folder is `resources\engine`) holds the host's
+  compiled kernel cubins, named by their source hash and the GPU's architecture, so a new build never
+  reuses a stale one; deleting it by hand is always safe, the cubins compile again on demand. GUI and
+  CLI share it (`SMV_TRT_CACHE` overrides the location and turns the move off). At app start and CLI
+  start `src/render/cache.ts` moves into it every cache an earlier version left elsewhere (the engine
+  folder's `trt_cache_safe_to_delete` / `trt_cache` and, the GUI, 1.0.x's
+  `%APPDATA%\SmoothMyVideo\trt_cache`; across drives a copy, then the old folder is deleted; into an
+  existing cache the old entries merge, its own entries win) and removes what an earlier version's
+  TensorRT engines left in it (`*.engine`, `*.jit`, `*.warm`, `engine_stamp.txt`). Every net runs on
+  the host's own kernels and reads its weights itself (no ONNX, no engine build); the dist ships those
+  weights (`realesr-animevideov3.pth`, `GMFSS_Fortuna/train_log/feat.pkl`, `metric.pkl`, `rife.pkl`,
+  `fusionnet.pkl` and `flownet.pkl`, `rife/flownet.pkl`). RIFE's IFNet: the five IFBlocks and the warps
+  between them run on the host's kernels (`nativeIfnRun`, 59 launches
+  of its own module `smv_ifnet_*.cubin`, the weights read from `engine/rife/flownet.pkl` with the same torch zip
+  reader as Restore, feat_ext and block0, the IFNet_HDv3 form checked; no engine, no ONNX, no fallback: a missing or
+  wrong flownet.pkl refuses RIFE and DRBA with `the IFNet unavailable (...)`). Each block's input is built at its
+  own scale straight from the full-size pixels the author's bilinear downscale reads (the flow summed over the
+  blocks before in fp32 from their outputs, the warps by the host's bilinear border tap, the mask and features by
+  PyTorch's bilinear), so no full-size intermediate is written; each block's output stays at its scale as float4
+  quads (the flow, the mask and the 8 features); the convs run on the tensor cores with fp32 accumulators and the
+  residual stream in fp16 (the author's network under its autocast export), the transposed conv as one 2 x 2-tap
+  conv per output parity class, and the last block adds the flows before it and hands out the fp16 `flow` and
+  sigmoid `mask`. It takes the frame pair `x`, the `timestep` plane and the encodes `f0` / `f1` in fp16 (the host
+  fills an fp16 copy of the pair once per frame with `k_f2h`, the constant timestep planes in fp16 with
+  `nativeFillT`, rounded to nearest even, DRBA's map with `k_drbaDrmNorm`'s half flag; a plane that already holds
+  the t asked for is not filled again). Against an fp32 IFNet the flow sits at 61 dB pooled on 1080p pairs. Its
+  scratch lives in the shared activation block (the four block outputs, one input
+  buffer, one conv output, one ping-pong pair, each sized for its largest block). The host makes each tween with
+  RIFE's own last step (`k_rifeBlend`: both frames warped along their flow with grid_sample's bilinear border tap,
+  blended by the mask), so one flow can warp other pictures of the pair. Offline RIFE runs the IFNet on a motion frame (`k_motionIn`): the finished picture after
   Restore, DLSS 5 and Sharpen as SDR sRGB (an HDR source's PQ / HLG light over SDR white: the SDR
   range exactly, up to 1.002 x white where the decode of white's 16-bit PQ code can land; the
   light above it in PQ's spacing, 10000 nits at 0.75 above it in extended sRGB, where highlight
@@ -166,11 +121,11 @@ RTX VSR / HDR and all three codecs.
   same: the motion frame is the finished picture at the working size, or at the
   capture size when the working size enlarges it (Fill at DLAA), the HDR desktop's PQ read as SDR
   sRGB over the desktop's SDR white (with RTX HDR: the SDR picture before TrueHDR), so the live
-  IFNet and encode engines are built at the motion frame's size (`mph` / `mpw` / `motw` / `moth`
+  IFNet and encode run at the motion frame's size (`mph` / `mpw` / `motw` / `moth`
   on the LIVE READY line). RIFE (DRBA) does the same on both routes: its ring keeps each frame's
   motion frame beside the picture, the encodes, block0 and its flows, the windows and the DRM
-  timestep map live at the motion frame (block0 takes fp32 frames: the two motion frames widened
-  per call), and the blend warps the pictures; on exact pans DRBA gains 3.8 to 4.7 dB on PQ, 2.4
+  timestep map live at the motion frame (block0 reads the two fp16 motion frames itself), and the
+  blend warps the pictures; on exact pans DRBA gains 3.8 to 4.7 dB on PQ, 2.4
   to 2.8 with RTX HDR and 3.5 to 6.1 at a 2x working size, SDR at the picture's size stays within
   76 dB of the one-domain tweens. Plain RIFE pads as its
   author's inference script does, offline and live: zeros right and bottom to a multiple of 128 in
@@ -205,69 +160,15 @@ RTX VSR / HDR and all three codecs.
   highlights (a quarter to a third of their pixels above SDR white, up to 40 x white) PQ's
   spacing above white measured best among the curves tried: RIFE's tweens 0.7 to 2.4 dB above a
   roll-off toward 5 x white, within 1.2 dB of the one-domain path's and above it on the 10 x
-  pictures, DRBA +0.2 to 0.3 dB (`harness\motion_curve_shape\curve_pan.py`). Against the engines
-  before this pass the tweens move by up to 7 codes at 8 bits on edges (62.9 dB at the worst tween):
-  those rounded the normalised flow and 1 - mask to fp16 inside their warp, the host's tap does
-  not. The RIFE IFNet builds each block's input in fp16 (`trt_runtime._half_blockin`):
-  its four warps stay fp32 (TensorRT-RTX takes one type for a GridSample's input and grid), each
-  warp output is narrowed to fp16 at once, and the concat and the resize to the block's scale run
-  in fp16 instead of fp32 followed by a narrowing cast. The IFNet runs 1.12x to 1.13x faster per
-  call at 1080p and 4K (those fp32 stages were 27 % of its time); the tweens move by up to 29
-  codes at 8 bits on thin fast-moving edges (58.2 dB at the worst of 96 tweens over 480p, 1080p,
-  4K and a DRBA-like timestep map, median 74 to 82 dB), the real frames do not. RIFE
-  block0 (DRBA's flow) slices its 4 flow channels out of the last layer's 13 before the resize to
-  the full size instead of after it (`trt_runtime._b0_slice_first`); a bilinear resize works per
-  channel, so the flow stays bit-identical, and block0 runs 1.33x to 1.36x faster per call at 1080p
-  and 4K. The RIFE IFNet resizes each part of a warped block's input on its own and
-  concatenates the results, instead of concatenating at the full size and resizing that
-  (`trt_runtime._blockin_resize_parts`, the blocks at scales 8, 4 and 2); the flow and mask stay
-  bit-identical and the IFNet runs about 3 % faster per call at 1080p and 4K, both classes. Block
-  0's input stays as it is: split the same way it makes TensorRT-RTX 1.6.1.120 build an engine
-  that outputs NaN. The RIFE IFNet's last block computes only the channels it reads
-  (`trt_runtime._last_block_prune`): its transposed conv makes 52 channels that the pixel shuffle
-  turns into 13 at the full size, and the block reads only the first 5 (flow and mask), so the
-  conv's weight and bias are sliced to the 20 that feed them; the flow and mask stay bit-identical
-  and the IFNet runs about 5 % faster per call at 1080p and 4K. The RIFE IFNet's last
-  block's first conv reads its input in parts (`trt_runtime._last_block_conv_split`): that block
-  runs at scale 1 and its 52-channel input was a full-size concat only this conv reads, so the two
-  16-channel feature warps each get a conv over their slice of the weight, the other 20 channels
-  one more, and Adds join them. The fp16 sum runs in another order, so the flow and mask are not
-  bit-identical: the tweens move by up to 4 codes at 8 bits (62 dB at the worst tween of the 480p
-  and 1080p renders, 66 to 68 dB pooled), the real frames do not; the IFNet runs about 5.5 % faster
-  per call at 480p, 1080p and 4K. The RIFE encode (the IFNet's Head) has no graph:
+  pictures, DRBA +0.2 to 0.3 dB (`harness\motion_curve_shape\curve_pan.py`). The RIFE encode (the IFNet's Head) has no graph either:
   it runs on the host's kernels (`k_encC0` .. `k_encUp`, fp32 sums, the weights inline as
   `kRifeEncW` from `engine/rife/flownet.pkl`'s `encode.*` tensors), reads the frame in fp32 (the
-  motion frame in fp16) and writes the IFNet's feature dtype. RIFE 4.25's 4-channel features are
-  sensitive to their rounding: an fp16 engine's encode (48 dB from fp32 on a hard anime pair) moved
-  that pair's tweens to 43 dB from the fp32 model, the fp32 sums keep the features at 74 dB. Block
-  3's first conv reads its input in parts too (`trt_runtime._block3_conv_split`: the two 16-channel
-  feature warps on their own convs, the other 20 channels on a third, Adds join them; its weight is
-  an fp32 initializer behind a Cast, so each slice keeps one). Not bit-identical (the fp16 sum
-  order): the tweens move by 63 to 65 dB pooled against the unsplit conv's and stay as close to an
-  fp32 IFNet as before (53 to 57 dB pooled on RIFE and DRBA); the IFNet runs about
-  1.8 % faster per call at 1080p and 1.9 % at 4K, nothing measurable at 480p. Both conv splits
-  need 16-channel feature warps: RIFE 4.25's encode has 4 channels, so every part stays under 16,
-  both passes leave its graph as it is and each block keeps its one conv. Blocks 1 and
-  2's first conv reads one flat concat of its eight parts instead of a concat nested in a concat
-  (`trt_runtime._blocks12_flat_concat`): the same tensor, bit-identical, its speed inside the noise
-  from 240p to 4K. The warps that feed blocks 1, 2 and 3 (the /8, /4 and /2 scales) are computed only
-  where that block's bilinear downscale reads, 2 x 2 pixels of every 8 x 8 / 4 x 4 / 2 x 2 cell, then
-  averaged (`trt_runtime._warp_at_resize_taps`): the same samples and fp16 rounding, bit-identical,
-  1 / 16 and 1 / 4 of the warp work at /8 and /4, no full-size warped tensor at /2; the IFNet
-  15.08 -> 12.67 ms a call at 2560x1472. Built from
-  these files the engines are
-  these files the engines are
-  bit-identical to the per-size ones, except gmflow_bidir (its size-free branch, see the GMFlow
-  bullet below).
-  `SMV_ONNX_DIR` moves the folder.
-* `engine/trt_lookup.py`: the torch-free naming helpers of that cache (the engine names, the
-  weights and TRT tags, the size-free ONNX paths; the export imports them, the native host has
-  their C++ twin). The native host keeps the warm markers (`<jit cache>.warm`) its handoffs use
-  to skip the model load and warm-up once a shape was warmed.
-* `engine/rife_backend.py` + `engine/rife/`: Practical-RIFE 4.25, the README's default (hzwer's
-  weights, MIT, `engine/rife/PRACTICAL-RIFE-LICENSE.txt`; the network code vendored from DRBA at
-  4.25's 4-channel feature width; weights committed): the IFNet the size-free export reads, and
-  DRBA's coarse flow (`calc_flow`) for the harness gates.
+  motion frame in fp16) and writes the fp16 features the IFNet reads. RIFE 4.25's 4-channel features are
+  sensitive to their rounding: fp16 sums (48 dB from fp32 on a hard anime pair) move that pair's tweens
+  to 43 dB from the fp32 model, the fp32 sums keep the features at 74 dB.
+* `engine/rife/`: Practical-RIFE 4.25's weights `flownet.pkl`, the README's default (hzwer's, MIT,
+  `PRACTICAL-RIFE-LICENSE.txt`; DRBA's MIT licence beside it): the host reads them itself (the encode's literals,
+  DRBA's block0, the IFNet).
 * `engine/nvoffruc/`: the "NVIDIA Smooth Motion" bridge to NvOFFRUC (user-installed DLLs), called
   by the host.
 * `engine/fsrfg/`: the AMD FSR 4 frame generation bridge (`smv_fsrfg_bridge.dll`, ours) beside AMD's signed
@@ -287,23 +188,19 @@ RTX VSR / HDR and all three codecs.
 * `engine/rtxvideo/`: RTX Video (VSR + TrueHDR) over the locally built `rtxvideo_cuda.dll`, called
   by the host. The NGX feature DLLs are user-installed through the in-app RTX setup box; the
   folder is gitignored and excluded from the zip.
-* `engine/realesr.py`: the `--restore` Real-ESRGAN model (vendored SRVGGNetCompact, BSD-3, weights
-  committed as `engine/realesr-animevideov3.pth`, which ships: the host reads it), the reference the host's Restore
-  kernels are gated against (dev tool).
+* `engine/realesr-animevideov3.pth`: the `--restore` Real-ESRGAN model's weights (SRVGGNetCompact, BSD-3), which
+  ship: the host reads them and runs the net on its own kernels.
 * `engine/live/`: the native host (Live mode, see below, and every offline render). The python live
   server and the python render engine (`render*.py`, `preview.py`,
   `hdr10_meta.py`, `rcas.py`, `rtxvideo.py`, `dlssg.py`, `dlssnr.py`, `nvoffruc.py`) were deleted;
   git history has them.
-* `engine/GMFSS_Fortuna/`: the GMFSS model and `train_log/` weights, committed (the weights' hash
-  names the engines, so they ship).
-* `engine/runtime/`: the DEV python 3.14 with torch and the CUDA 13 wheels, gitignored, never
-  shipped (see Setup).
+* `engine/GMFSS_Fortuna/`: GMFSS's `train_log/` weights (the host reads them itself, they ship) with the
+  upstream LICENSE and README.
+* `engine/runtime/`: the DEV python 3.14 with the CUDA 13 wheels, gitignored, never shipped (see Setup).
 * `engine/bin/`: bundled `ffmpeg.exe` + `ffprobe.exe` + DLLs, fetched, not committed.
-* `engine/onnx/`: the size-free ONNX graphs engines are built from, generated, not committed.
-* `scripts/`: the build scripts `fetch-ffmpeg.ts`, `stage-gpu-runtime.ts`, `export-onnx.ts`, `dev-icon.ts`,
+* `scripts/`: the build scripts `fetch-ffmpeg.ts`, `stage-gpu-runtime.ts`, `dev-icon.ts`,
   `clang-format.ts`, `pack-zip.ts`, `build-renderer.ts`, `scan-index.ts`, `cpp-check.ts` (TypeScript that Node 24 runs
-  directly, no build step: `scripts/package.json` makes them ES modules, `tsconfig.scripts.json` type-checks them), plus
-  `smoke.py`.
+  directly, no build step: `scripts/package.json` makes them ES modules, `tsconfig.scripts.json` type-checks them).
 
 Doc policy: README.md and this file are the only docs. No per-component BUILD.md files (a
 provenance note beside vendored third-party headers, `engine/live/build_src/nvofa/README.md`, is
@@ -312,8 +209,8 @@ not a doc in this sense).
 ## Setup (fresh clone)
 
 Weights ship in git. Fetched or copied: `engine/bin` (ffmpeg, about 137 MB) and the DEV python
-`engine/runtime` (about 5.7 GB, never shipped); `engine/gpu_runtime` (about 345 MB) and
-`engine/onnx` are generated from it. All must exist before `npm run dist`.
+`engine/runtime` (about 5.7 GB, never shipped); `engine/gpu_runtime` (about 115 MB) is staged from
+it. All must exist before `npm run dist`.
 
 1. Dependencies and ffmpeg (Node 24 or later: the build scripts, `postinstall`'s included, are TypeScript
    that Node runs directly; `package.json` `engines` says so):
@@ -329,15 +226,12 @@ Weights ship in git. Fetched or copied: `engine/bin` (ffmpeg, about 137 MB) and 
      [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases)
      CPython 3.14 `install_only` win64 build to `engine/runtime`, then
      ```
-     engine\runtime\python.exe -m pip install torch==2.15.0 torchvision --index-url https://download.pytorch.org/whl/cu134
      engine\runtime\python.exe -m pip install -r engine\requirements.txt
      ```
-     `requirements.txt` pulls cupy-cuda13x, the unsuffixed `nvidia-cuda-nvrtc` / `nvidia-cuda-runtime`
-     cu13 wheels (the `-cu13` names are dead placeholders), `tensorrt-rtx-cu13` (cp314 wheels exist
-     from 1.6.1.120 up, never pin below) and onnx / onnxscript. Never use a `venv`: a Windows venv is
-     not relocatable.
-3. `node scripts/stage-gpu-runtime.ts` (the host's DLLs into `engine/gpu_runtime`) and
-   `node scripts/export-onnx.ts` (the size-free ONNX into `engine/onnx`); `npm run setup` runs both.
+     `requirements.txt` pulls the unsuffixed `nvidia-cuda-nvrtc` / `nvidia-cuda-runtime` cu13 wheels (the `-cu13`
+     names are dead placeholders). Never use a `venv`: a Windows venv is not relocatable.
+3. `node scripts/stage-gpu-runtime.ts` (the host's DLLs into `engine/gpu_runtime`); `npm run setup`
+   runs it.
 
 Refreshing bundled binaries: for ffmpeg delete `engine/bin` and re-run the fetch script, or drop a
 matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across builds). Weights
@@ -347,33 +241,24 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
 
 * `npm start`: `tsc`, the renderer's type check and build (`app.ts` -> `app.js`), then launch.
 * `npm run setup`: clean `node_modules` + `engine/bin`, `npm install`, fetch ffmpeg, stage
-  `engine/gpu_runtime` and export the size-free ONNX (both skipped with a warning when
-  `engine/runtime` is not there yet; run step 3 of Setup by hand after step 2), start. Never
+  `engine/gpu_runtime` (skipped with a warning when `engine/runtime` is not there yet; run step 3 of
+  Setup by hand after step 2), start. Never
   name a wrapper script `install` / `preinstall` / `postinstall` (npm lifecycle names; a script named
   `install` that runs `npm install` recurses).
-* `npm run dist`: wipes `release/`, compiles, stages `engine/gpu_runtime` and exports any missing
-  size-free ONNX into `engine/onnx` (both `--required`, a failure stops the build), runs
+* `npm run dist`: wipes `release/`, compiles, stages `engine/gpu_runtime` (`--required`, a failure
+  stops the build), runs
   electron-builder and packs `release/SmoothMyVideo-<version>-win.7z` (7-Zip's maximum
   compression, LZMA2 level 9, solid; an archive, not an installer, because `makensis` cannot
   memory-map an archive this large). The build machine needs 7-Zip (`7z.exe` in
   `%ProgramFiles%\7-Zip`, or `SMV_7Z` naming it). The staging folder is deleted after 7-Zip's
-  own test reads every file back and finds the folder's file count and bytes. `extraResources` copies `engine/**` minus `runtime/**`, every
-  `*.py` and the other filtered paths, so no stray folders may sit under `engine` at build time.
+  own test reads every file back and finds the folder's file count and bytes. `extraResources` copies `engine/**` minus `runtime/**` and
+  the other filtered paths, so no stray folders may sit under `engine` at build time.
 * `npm run lint`: Prettier writes `src/**/*.ts` and `scripts/*.ts`, then `tsc --noEmit` and
   `tsc -p tsconfig.scripts.json` (the build scripts) and `tsc -p tsconfig.renderer.json` (the
-  renderer), then pyright on
-  `engine` and `scripts`, then clang-format writes our own C++ (see Linting and formatting).
+  renderer), then clang-format writes our own C++ (see Linting and formatting).
   Stops at the first failure.
 * `postinstall` runs `scripts/dev-icon.ts`, stamping `icon.ico` into the dev Electron exe so
   `npm start` shows the app icon (a stale Explorer icon cache refreshes on the next reboot).
-* `python scripts\smoke.py [--full]` (any python 3, stdlib only): real renders through
-  `dist\render\cli.js` under the Electron binary in node mode (what the app runs) on
-  `samples/test.mp4` asserting frame counts, VFR duration, `.part` promotion, the refusal of
-  removed flags and the live echo case; `--full` adds 5x, AV1, VVC, the one-slice check, the HDR10
-  boxes, DV record, HDR10+ SEI, DLSS-G with DLSS 5 in one render (SKIP without the runtimes), the
-  resident RIFE render and the live RIFE case. Run after every
-  engine change (`npx tsc` first). Checks are structural, plus one frame-md5 check with `--full`:
-  the resident host's second RIFE render must decode to the first one's frames.
 * `node scripts/scan-index.ts`: the renderer scan described above (`index.html` + `app.ts`, built into `app.js` first).
 
 ## Engine CLI
@@ -613,20 +498,20 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
 * `--restore`: Real-ESRGAN anime-video model once per source frame, first (a generative repaint;
   cleans compression noise, can flatten fine texture), folded straight to the working size, or
   back to the source size when RTX VSR runs the resize after it. The bundled model runs on the host's own CUDA
-  kernels, not a TensorRT engine: the host reads `engine/realesr-animevideov3.pth` itself (torch's stored zip and its
-  pickle; a file that is not this model's form falls back with a line), runs the 16 middle 3 x 3 convs as tensor-core
-  implicit GEMMs with fp16 accumulators (`k_restConvMid`, between `k_restConv0` and `k_restConvLast`, the last one at
-  fp32 accumulate) and folds the 48 sub-pixel planes as below; at 1080p a Restore-only frame takes 0.80x the engine
-  route's time, every output within one 8-bit code of it. A missing or wrong .pth = no Restore (`Restore unavailable
-  (...)`; a render drops the pass). A `--restore-model` ONNX in AnimeJaNai's SPAN-F3 form (64 features, any block
+  kernels: the host reads `engine/realesr-animevideov3.pth` itself (torch's stored zip and its pickle), runs the 16
+  middle 3 x 3 convs as tensor-core implicit GEMMs with fp16 accumulators (`k_restConvMid`, between `k_restConv0` and
+  `k_restConvLast`, the last one at fp32 accumulate) and folds the 48 sub-pixel planes as below, every output within
+  one 8-bit code of fp32 sums. A missing or wrong .pth = no Restore (`Restore unavailable (...)`; a render drops the
+  pass). A `--restore-model` ONNX in AnimeJaNai's SPAN-F3 form (64 features, any block
   count up to 16: reflect pad, PixelUnshuffle(2), conv 12 -> 64, blocks of three 3 x 3 convs with a tanh attention, a
   1 x 1 concat conv, conv 64 -> 48, DepthToSpace 4) runs on the host's kernels as well: the host reads the ONNX file
   itself (its protobuf: the nodes and the fp16 initializers), checks that form node by node along the data path and
   runs the 3 x 3 convs on `k_restConvMid`, the block tails on `k_ajAtt` (the 1 x 1 on the tensor cores, `(t + c3) *
   tanh(...)` in fp32), the concat conv on `k_ajCat` (its four inputs read in place) and the first conv on `k_ajFirst`
   (the pad and the unshuffle folded into its loads), then folds the 48 sub-pixel planes at the half grid without a base
-  add. 1.10x its engine's time at 1080p and 6 dB closer to the model in fp32 (74.8 vs 68.4 dB); any other graph (a
-  48-feature Performance file, another architecture) runs as a TensorRT engine, with a line saying why. On HDR planes (both routes) it
+  add, 74.8 dB from the model in fp32. Any other graph (a 48-feature Performance file, another architecture, a file
+  that is no ONNX) = no Restore the same way, with a line saying why (`Restore unavailable (...; a --restore-model runs
+  only in AnimeJaNai HD's SPAN-F3 form, the Balanced model's)`). On HDR planes (both routes) it
   reads the frame's SDR view (`k_hdrEnc`, a brighter pixel scaled to white with its hue) and
   `k_hdrRestOut` adds back the light the view never held (the source fitted to the target when
   the size changes), DLSS 5's way: the SDR range comes out as from an SDR source (87 dB against
@@ -734,8 +619,9 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   muted colours only, `--hdr-satboost S` (0..1) adds saturation on top; both hue-safe in ICtCp and
   luminance-coupled.
 * `--dv`: adds a Dolby Vision Profile 8.1 RPU on top of the HDR10 render (HDR10-compatible
-  fallback). Needs `--rtx-hdr`, HEVC, MP4 out and `dovi_tool` in `engine/dvtools` (installed from
-  the GUI panel). Per-frame L1 is accumulated during the HDR render, then after encode: extract
+  fallback). Needs `--rtx-hdr`, HEVC, MP4 out and `dovi_tool` in `engine/dvtools` (the GUI panel's
+  one-click download of a pinned release, as for `hdr10plus_tool`: main.ts `DOVI_DL` / `HP_DL`, whose version, URL,
+  zip SHA256 and size move together). Per-frame L1 is accumulated during the HDR render, then after encode: extract
   HEVC, `dovi_tool generate` + `inject-rpu`, ffmpeg remux with audio, `dvvC` + HDR10 boxes written
   in-engine. The RPU's `source_max_pq` and L6 take the render's `--hdr-nits` peak (dovi_tool's own pick from L6
   stays at 1000 nits for other peaks); HDR10+ takes the same peak in its HDR10 boxes, its scene values are measured. B-frames are disabled for DV renders (dovi_tool needs an Annex-B stream whose coding
@@ -825,11 +711,11 @@ Output:
   warning fires when the projection exceeds the free space on the output drive.
 * Renders are deterministic: the same file with the same settings decodes to the same frames run
   after run, in separate processes or through the resident host, and the product encoder then writes
-  byte-identical files. That holds for every model on the fixed-shape TensorRT-RTX engines, the host
-  kernels (the splats accumulate in int64 fixed point), the NGX passes (DLSS 5, RTX VSR, RTX HDR),
-  with TensorRT-RTX graph capture on or off, and AMD FSR 4 frame generation. The exception is `--fruc`: NvOFFRUC changes about 1 in 5
+  byte-identical files. That holds for every model on the host's kernels (the splats accumulate in
+  int64 fixed point), the NGX passes (DLSS 5, RTX VSR, RTX HDR), with the CUDA graphs on or off, and
+  AMD FSR 4 frame generation. The exception is `--fruc`: NvOFFRUC changes about 1 in 5
   generated frames very slightly from run to run, inside NVIDIA's library (serialising every CUDA
-  launch does not change it). `smoke.py --full` asserts the RIFE case.
+  launch does not change it).
 
 ## Live mode
 
@@ -855,21 +741,24 @@ the picture trails the capture by exactly one source frame (handshake `lag=1`, f
 latency stat), windows are cached by centre frame and chained like the offline loop, and the first
 groups fall back to plain pair RIFE, then to the lagged real frame, until the history holds four
 frames; HDR capable like rife. `rifedrba` runs in the native host like every
-live model: the handoff is the RIFE one plus
-`NATIVE-PATH block0=` / `block0jit=`, the `calc_flow` block0 as its own engine (timestep 0.5 and
-the first pyramid scale baked, fp32 in and out, validated against the eager block0 like the encode
-engine; a failure refuses the handoff), `engine=drba lag=1` on the ready line; the torch-free
-fast path finds it warm like the RIFE engines. The
+live model: the handoff is the RIFE one plus `engine=drba lag=1` on the ready line. The
 exe keeps a four-frame ring of padded frames (one block: each frame is built straight in its slot,
 no separate frame buffer; in two domains the blend reads its frame pair from two neighbouring slots,
 the wrap pair once a group copied into the slot of frame k - 3, which nothing reads after push(k)
 and where frame k + 1 is built after group k) and their encodes, builds the windows with block0
+(`calc_flow`'s first pyramid level, timestep 0.5 at scale 16, on the host's own kernels: no engine,
+no ONNX; the host reads `engine/rife/flownet.pkl`'s `block0.*` tensors with the same torch zip reader
+as Restore and feat_ext, checks the IFBlock(15, c = 192) form, and runs the input resize, conv 0 in
+fp32, conv 1 and the 8 ResConvs on the tensor cores with fp32 sums and an fp32 residual stream, and
+the ConvTranspose for the 4 flow channels in fp32; its flow stays at 1/16 and `k_drbaFlowSplat`
+samples it back to the motion frame, so the full-size flow is never written; a missing or wrong flownet.pkl refuses
+DRBA with `block0 unavailable (...)`)
 plus four kernels (`k_drbaFlowSplat` / `k_drbaFlowNorm` = the rest of `calc_flow`,
 `k_drbaDrmSplat` / `k_drbaDrmNorm` = `calc_drm_rife(linear=True)`, gated against float64; fp32
 with the hole test on the integer weight accumulator), chains them like
 the python class, runs one IFNet enqueue per tween with its own DRM timestep map, holds the lagged
 pair on an exact static test and reports the one-capture lag in the latency stat. A handoff
-without the block0 engine or `lag=1` is refused. `fruc` is Smooth Motion's live twin: every fraction of a pair takes the
+without `lag=1` is refused. `fruc` is Smooth Motion's live twin: every fraction of a pair takes the
 nearest node of the pair's midpoint tree (exact to 512ths, see the bridge section), so it is adaptive like rife / gmfss (it takes the Image scale too); it is HDR
 capable like rife (a frame pair inside the SDR range goes to the bridge as its SDR view, any other
 pair as the PQ codes quantised to 8-bit for the flow and the warp, so only those tweens carry 8-bit PQ
@@ -1040,12 +929,10 @@ at the session end. `%TMP%\smv-live-mouse.txt` holds the original speed and the 
 A resize is debounced: on the first size change the overlay hides and the HUD switches to the
 "loading ... model" note at once, the exit 4 comes only after the client size has held for 1 s
 (a window that settles back at the captured size keeps the session: the restore animation after a
-minimize hands out one frame of another size), so a drag costs one engine build at the final size, not one per
+minimize hands out one frame of another size), so a drag costs one session start at the final size, not one per
 intermediate size. The same applies while the model is still loading (the load loop watches the
-client size). A session that ends during the native engine load (the hotkey toggled off, or that
-load-time resize) ends within milliseconds and leaves the engine build running in the
-background: the engines still land in the cache, the resident host stays for it, and the next
-handoff waits for it (one builder at a time) instead of starting a second one.
+client size). A session that ends during the load (the hotkey toggled off, or that load-time resize)
+ends within milliseconds.
 
 How the server route works:
 * Zero CPU touches between capture and present. The WGC frame is GPU-copied into a shared D3D11
@@ -1126,7 +1013,7 @@ for a pair that makes tweens, then `nativeGmfssTween` per tween), the engines fo
 from `engine\onnx` by `lkOfflineGmfss` with the live names; real frames match python's route bit for bit, tweens within a 16-bit mean of about 15.
 DRBA (`--rife-drba`) runs there too (`--drba`): `render_loops.drba_loop`'s offset
 grid (every output interior, N x multi frames) on live's lag-1 windows (the history ring, the
-block0 engine `lkOfflineBlock0` finds or builds, the DRM kernels); pair (k-2, k-1) goes out once
+block0 on the host's kernels, the DRM kernels); pair (k-2, k-1) goes out once
 frame k is in, the first pair's f < 0.5 and the last pair's f >= 0.5 are plain pair RIFE, an
 identical pair holds its frame per side, the closing slot repeats the last output. Its distance
 to the fp32 eager render is within 5 % of python's route (harness `offline\gate_drba.py`).
@@ -1417,16 +1304,13 @@ works (`--pause-file`, the partial preview included). The GUI's progress thumbna
 `SMV_LIVE_PREVIEW` set, native.ts passes `--thumb <png>.raw` (+ `--thumb-off` for the Hide flag);
 the writer thread drops a small copy of the frame it writes about once a second (at most 480 rows,
 2x2 taps per block, the output pixfmt) and logs `THUMB`, and native.ts turns it into the PNG
-(preview.ts's display math; a TrueHDR output is self-anchored). `SMV_OFFLINE_GRAPH=1` turns TensorRT-RTX graph capture
-on for it (off by default). Measured through render.py against the python route: per pair
-+9% at 480p, +6% at 720p, +3% at 1080p, +16% at 4K, 2.3x at 120p, about 2.5 s more startup per render;
-real frames bit exact, tweens within the TensorRT class of the eager model.
+(preview.ts's display math; a TrueHDR output is self-anchored). `SMV_OFFLINE_GRAPH=1` turns the IFNets' CUDA
+graphs on for it (off by default).
 
 Resident offline host: the exe of that route stays alive between renders as
-`smv-live.exe --offline --resident --pipe NAME` with the TensorRT runtime, the engines, the JIT cache
-and the kernel module loaded (the same per-process cache as the resident live host, about 300 MB of
-VRAM idle), so a later render of the same size and multiplier pays only the execution contexts
-instead of the process start plus the engine load. `native.ts` finds the host through the control
+`smv-live.exe --offline --resident --pipe NAME` with the kernel module loaded (the same per-process
+cache as the resident live host), so a later render pays only its own buffers instead of the process
+start plus the module load. `native.ts` finds the host through the control
 pipe `\\.\pipe\NAME` (the app sets `SMV_OFFLINE_HOST_PIPE` to one name per Electron process, a CLI
 run derives `smv-offline-<hash of the exe path>`), spawns it detached when there is none, sends one
 item as `start<TAB>--w<TAB>...` (the `--offline` flags minus `--offline`), waits for `offline pipes
@@ -1438,11 +1322,10 @@ to what starts); the host also quits itself after `SMV_OFFLINE_RESIDENT_IDLE_S` 
 (default 600). A busy host (another render on it, or a cancelled render's ffmpegs still draining)
 answers nothing: the render then runs a one-shot exe as before, and the host leaves on its idle
 limit. `SMV_OFFLINE_RESIDENT=0` keeps one exe per render; `SMV_OFFLINE_HOST_LOG=<file>` collects the
-host's own stderr (it has no console). `scripts/smoke.py` renders the RIFE native case twice and
-expects the second to reuse the host's engines, then quits the host at the end.
+host's own stderr (it has no console).
 
 Native host = the ONLY live route: every model except DLSS 4.5 (Streamline, its
-own path) runs inside the exe, the engine models through the TensorRT-RTX C++ runtime. No python
+own path) runs inside the exe, every net on the host's own kernels. No python
 process is part of a live session.
 A session the host cannot start ends on its reason line (log: `native host: <reason>`, then
 `this session cannot start in the native host`; the app keeps the reason on the status line); a
@@ -1450,57 +1333,15 @@ refused native DLSS 5 pass (above 3840x2160, `SMV_LIVE_NR_NATIVE=0`, no zero-cop
 the session WITHOUT DLSS 5 and logs `live DLSS 5 skipped for this session: <why>`.
 
 The engine handoff (`nativeHandoff` in `smv-live-native.inl`) gives a session its geometry and
-engine paths as `NATIVE-PATH` lines plus one `LIVE READY native=1` line (`SMV_HANDOFF_DUMP=1` logs
-them). `lkSession` derives everything both of its halves need from the session's arguments (the
-folders, the Image scale, the padded sizes, the GMFSS net table, the RIFE engine names),
-so the lookup and the build cannot disagree on a name:
-* The lookup (`nativeLocalHandoff`) is `engine/trt_lookup.py`'s naming, weights hashes and find
-  checks in C++ (the engine names are shared with offline renders). Engines that exist AND carry
-  the warm marker for the size answer at once (log: `warm engines found by the host, no python
-  process`); nvof, fruc and echo have no engine and answer with geometry only (fruc checks its
-  bridge folder and three DLLs). Live Restore adds `NATIVE-PATH restore=native:realesr-animevideov3` (the host's
-  kernels), or a `--restore-model` engine at the capture size (it reads the captured frame) plus its `.jit`, for
-  every backend.
-* On a miss the host BUILDS the engines (`nativeLocalBuild`, on a worker thread): from
-  `engine/onnx` with the old python builder's settings (strongly typed, optimization level 5,
-  workspace 8 GB x the per-graph multiplier; TensorRT-RTX's auxiliary streams capped
-  where its own choice measured slower or larger with identical outputs: none on gmflow_bidir_b,
-  metricnet and gmflow_backbone, two on fusionnet; every other net keeps TensorRT-RTX's choice) through
-  the delay-loaded ONNX parser, a warm-up with a fresh runtime cache (EAGER specialization), then the
-  `.jit` and the warm key; the lookup must then
-  hit. It covers rife, gmfss, rifedrba (the RIFE pair plus block0) and a `--restore-model` graph (`restore_x<hash>`,
-  no warm marker). TensorRT-RTX compiles one engine at a time per PROCESS (a build or a JIT warm-up on another thread
-  waits for the running one; two processes run side by side at full speed), so a GMFSS build (live and offline,
-  `lkGmEnsure`) hands the set's two longest builds + warm-ups, gmflow A (`gflow`) and its front `_m` (`gflowm`), each
-  to a helper process: this exe as
-  `smv-live.exe --build-engine <log> <engine folder>/live_server.py <onnx> <engine> <workspace multiplier>
-  <input>=<d0>x<d1>... ...`, which builds the engine when missing, warms it and exits (0 done, 3 memory-shaped failure,
-  2 other), while the host does the other six nets; both helpers sit in one job object that ends them with the host,
-  their log lines come back as `helper: ...`, and a helper that fails or cannot start leaves its net to the host
-  afterwards (`the gmflow A build helper failed (exit N), building it here`, the same line with `gmflow _m`). Cold GMFSS
-  host build at 854x480 with A's helper: 37.7 / 36.9 s -> 23.8 / 24.4 s; the `_m` helper beside it: 1080p 16.2 -> 14.3 s,
-  2160p 18.1 -> 17.4 s; frames byte-identical (harness `gmfss_init_lanes`, `gmfss_cold_helpers`). `SMV_GM_HELPER=0` = no
-  helper, `=1` = A's helper alone; `SMV_GM_HELPER_TEST=fail` = every helper exits 2 at once (the fallback's trigger).
-  The host logs every build
-  (`built X from Y in Ns`) and warm-up (`warmed X in Ns`). Output-identical to python's build from the same file (harness
-  `onnx\gate_3c2.py`, `onnx\gate_3c3a.py`). A session that ends mid-build leaves the build
-  running while the resident host stays alive; an engine file is written whole or not at all.
-* gmflow A in two forms (transformer.py `EXPORT_A_FORM`, both exported: `gmflow_bidir_a_g8` and
-  `gmflow_bidir_a_g8e`, `onnx_export.export_edge_a`, which refuses unless the edge export's backbone, `_m` and B equal
-  the masked one's node for node). The masked form (the shift mask on every window of a shifted block, the blocks'
-  last LayerNorm on the stacked groups) is what a cold start builds: its runtime JIT ~7 s. The edge form (plain
-  attention on every window the roll leaves whole, the mask on the split last-column window only, the same block
-  tail) runs A x0.97 at the 1440p DLAA half and x0.89 at the 4K half but JITs in ~29 s, past the 30 s first start on
-  A's lane. So a GMFSS session on the masked form starts `--build-engine ... --room` for the edge form
-  at its first pair (`building gmflow A's edge form in the background`), below normal priority, in a job object;
-  `--room` = the warm-up refuses (exit 3) when the context's memory exceeds the video memory room. The next session
-  at that size finds the edge form built and warm and runs it (`gmflow A in the edge form` in the chain lines; the
-  resident handoff memo drops a masked answer then). Every live session and every offline GMFSS render ends a build
-  still running before its lookups (`stopped the background build ...`), so a session never sees the edge form appear
-  mid-start; a finished build's result comes into the next session's log. A render is bit-stable run to run on one
-  cache state; the two forms differ ~58 dB on the tweens (real frames identical), so a resumed render that crosses
-  the upgrade joins two forms. `SMV_GM_UPGRADE=0` = the masked form only, `=now` = the edge form from the cold start
-  (built like any net), `=fail` = the background build exits 2 at once.
+model paths as `NATIVE-PATH` lines plus one `LIVE READY native=1` line (`SMV_HANDOFF_DUMP=1` logs
+them). `lkSession` derives everything from the session's arguments (the folders, the Image scale,
+the padded sizes):
+* The lookup (`nativeLocalHandoff`) answers at once: every interpolation model runs on the host's
+  kernels (RIFE, DRBA and the whole GMFSS chain; a GMFSS session answers with its half size and the
+  kernel cache folder); nvof, fruc and echo answer with geometry only (fruc checks its bridge folder
+  and three DLLs). Live Restore adds `NATIVE-PATH restore=native:realesr-animevideov3` or
+  `restore=native:animejanai` (a `--restore-model` in AnimeJaNai's SPAN-F3 form), for every backend;
+  any other `--restore-model` graph = the session refuses with the Restore line.
 * `smv-live.exe --lookup-probe <engine folder>/live_server.py <backend> <outW> <outH> <capW>
   <capH> <image scale>` prints the lookup's lines (or `MISS`); the path is a marker
   for the engine folder, the file need not exist. A change to the naming or the geometry is gated
@@ -1509,41 +1350,40 @@ so the lookup and the build cannot disagree on a name:
 Everything but the output ring
 starts on its own thread before the source-rate measurement (it needs only the capture size):
 the runtime DLL load, the handoff (with the CUDA device init and the capture import in parallel
-on a helper thread), then the kernels, the buffers, the engine deserialize, the jit caches (the
-IFNet's and the encoder's, merged into one) and the execution contexts; the log lines are `engine handoff started during the source-rate
-measurement` and `early init done`, and the warm start measures ~2.55 s instead of ~3.1 s
-(the measurement is fully hidden, the remaining time is capture setup, the handoff and the
-engine load itself). With live RTX HDR on, the TrueHDR bridge setup and its warm-up eval
-(~0.6 s) run on a helper thread beside the engine load (HDR warm start ~2.8 s instead of
-~3.35 s). The compute thread then imports the output ring (sized from the measured slot
+on a helper thread), then the kernels, the buffers and the models' setup; the log lines are `engine
+handoff started during the source-rate measurement` and `early init done` (the measurement is fully
+hidden). With live RTX HDR on, the TrueHDR bridge setup and its warm-up eval (~0.6 s) run on a
+helper thread beside the models' setup. The compute thread then imports the output ring (sized from the measured slot
 count, fitted to the free video memory) and starts serving. A stop signals the stall watchdog's event, so `srv.stop()` no
 longer waits out the watchdog's one-second sleep (native-route stop ~0.08 s instead of ~1 s).
 
 Resident host (`--resident`, passed by the app on every server-backend session; `SMV_LIVE_RESIDENT=0` on the app
-restores one process per session): after a native RIFE session ends, the exe stays alive with the
-TensorRT runtime, both engines, the JIT cache and the kernel module loaded (about 270 MB of VRAM,
-the execution contexts and every buffer are freed) and reads one command per line from stdin:
+restores one process per session): after a native session ends, the exe stays alive with the
+kernel module loaded (every buffer is freed) and reads one command per line from stdin:
 `start<TAB>--hwnd<TAB>0x...<TAB>--backend<TAB>rife ...` (the next session's arguments, tab separated,
 the same tokens the command line takes), `stop` (ends the running session, exit 0) and `quit`. Where
 a one-shot run exits, the resident host prints `live session ended: exit N, host resident (... kept,
 idle limit S s) target=0x...` and `main.ts` treats that line as the exit code (the exit 4 / 6 revive
 and the settings restart go through it too). The trailing `target=` field (present once a session
 resolved a window) is the revive's fallback source for the handle when no `target window:` line
-reached the app. The next session on the same window skips the python handoff entirely (`engine handoff
-skipped, same window as the resident session`) and recreates only the two execution contexts
-(`resident engines reused, contexts recreated in X s`); a different window size runs the handoff,
-drops the old pair (`resident engines released`) and loads the new one. Measured on the
-960x540 testsrc: native host ready 0.78 s from the `start` line against 2.55 s for a fresh process.
-The host exits on its own after a session it cannot keep (an error exit, DLSS-G, native DLSS 5, the
-TrueHDR bridge, no engines loaded), when stdin closes, and after `SMV_LIVE_RESIDENT_IDLE_S` seconds
-idle (default 600); the app quits it when another model starts or is selected in the panel and at
-app exit, and kills it when a `stop` gets no answer within 3 s (a stop during a cold engine build
-lands only when the session loop starts).
+reached the app. The next session on the same window skips the handoff entirely (`engine handoff
+skipped, same window as the resident session`) and keeps the models' dtypes (`resident engines
+reused, contexts recreated in X s`); a different window size runs the handoff (`resident engines
+released`). The host exits on its own after a session it cannot keep (an error exit, DLSS-G, native
+DLSS 5, the TrueHDR bridge, no model state held), when stdin closes, and after
+`SMV_LIVE_RESIDENT_IDLE_S` seconds idle (default 600); the app quits it when another model starts or
+is selected in the panel and at app exit, and kills it when a `stop` gets no answer within 3 s.
 
 The host prints what
-it keeps in the `live session ended` line (`engines`, `a running engine build`). The exe deserializes
-both engines, imports its own capture texture, fence and output ring into CUDA, JIT-builds five small
-kernels with NVRTC (cached as a cubin next to the TRT cache), and feeds the unchanged present loop.
+it keeps in the `live session ended` line (`engines` = the model state). The exe imports its own
+capture texture, fence and output ring into CUDA, JIT-builds its kernels with NVRTC (cached as
+cubins in the model cache), and feeds the unchanged present loop.
+Every NVRTC module is compiled for the running card (`sm_<major><minor>`). The tensor-core and async-copy
+instructions go through the head macros `SMV_MMA_F32` / `SMV_MMA_F16` / `SMV_CP_COMMIT` / `SMV_CP_WAIT0` and
+`rnCp16`: RTX 30 and newer (sm_80+) get the instructions as written, an RTX 20 card (sm_75, no `cp.async`, no k16
+mma) gets each product as its two k8 halves and plain copies, so the newer cards' machine code is the same with or
+without the sm_75 branches; a new kernel uses the macros, never a raw `mma.sync` / `cp.async` string. Dynamic
+shared memory stays at or under 64 KB a block (Turing's limit).
 No kernel in that NVRTC block uses fp64 (GeForce GPUs run it at a small fraction of the
 fp32 rate): accuracy that once needed double comes from integer tap maths (resampling centres and
 windows are ratios of the frame sizes), exact fp32 landing products (`land`: floor plus the fraction
@@ -1586,28 +1426,20 @@ upscale to: model WxH -> WxH first, then 1:1|fit to
 WxH` and `upscale=native`; gate `harness\eff\upto_equiv.py` (the two-stage chain within 5e-5 of
 `_Fit._upscale` run in fp64, the stores off by one in under 1% of bytes, plus a 9596-height sweep of
 the size derivation against the python expression) and the `upto_*` cases of `eff_native.py`. Restore
-runs natively too: `--restore-model` rides on the handoff line, so the handoff builds and
-warms that graph's TensorRT engine into the shared cache and hands its path over like the IFNet's
-(`NATIVE-PATH restore=` / `rjit=`, the restore kernels merged into the shared jit cache); the host
-runs it once per captured frame before the model (on the capture itself, as SDR planes when RTX
-HDR is on: TrueHDR runs later, after Restore, DLSS 5 and Sharpen; `k_restIn` = torch `.half()` of the frame, one `enqueueV3`, the engine at the
-capture size), then folds the 4x output straight to the model size into the model frame, in place of
-the capture shrink, so every model, DLSS 5 and every presented frame read restored frames (`k_restFoldH` / `k_restFoldV` = the antialiased pair with `out.clamp(0,1)` folded into the taps,
-at every ratio; Real-ESRGAN's exported graph stops at its last conv, so `k_restFoldHSub` reads its 48 sub-pixel planes
-and adds the nearest base, the input pixel, in fp32: the x4 frame is never written; the host tells the two forms
-apart by the engine's output shape); the resident host keeps
-the restore engine beside the RIFE pair per path; the log lines are `native: live restore: Real-ESRGAN
-animevideov3 (TensorRT) at WxH -> WxH, on the captured frame before the model` and `restore=native`; an
-engine refusal mid-run drops the pass with one line. Gate
-`harness\eff\restore_equiv.py` (the fold within 4e-7 of `realesr.fit` in fp64 on the shared engine
-output; python's own fp16 fold sits about 1e-3 from it) and the `restore_*` cases of `eff_native.py`.
-The session stays model-bound: measured before the port (`harness\eff\restore_share.py`), the python
-route's wall per group equalled its own GPU-event span at 1080p and 540p, so the port removes the
-python process, not milliseconds. That engine route serves a `--restore-model` graph that is not AnimeJaNai's
-SPAN-F3 form only (that form = `NATIVE-PATH restore=native:animejanai`, the host's kernels); the bundled
-Real-ESRGAN runs on the host's own kernels (see `--restore`): the handoff names it `NATIVE-PATH restore=native:realesr-animevideov3` (no engine, no jit), its two
-channels-last buffers sit in the shared activation block of the model contexts (every enqueue there runs one after
-another on the session stream, Restore first), and the line reads `(the host's kernels)`. The effects-only route runs
+runs natively too, on the host's kernels (see `--restore`): the handoff names the bundled Real-ESRGAN
+(`NATIVE-PATH restore=native:realesr-animevideov3`) or a `--restore-model` in AnimeJaNai's SPAN-F3 form
+(`restore=native:animejanai`); any other graph = the session refuses. The host runs it once per captured
+frame before the model (on the capture itself, as SDR planes when RTX HDR is on: TrueHDR runs later,
+after Restore, DLSS 5 and Sharpen; `k_restIn` = torch `.half()` of the frame), then folds the output
+straight to the model size into the model frame, in place of the capture shrink, so every model, DLSS 5
+and every presented frame read restored frames (`k_restFoldHSub` reads the model's sub-pixel planes and,
+for Real-ESRGAN, adds the nearest base, the input pixel, in fp32: the x4 frame is never written; the
+antialiased pair with `out.clamp(0,1)` folded into the taps, at every ratio). Its channels-last buffers sit
+in the shared activation block of the models (every enqueue there runs one after another on the session
+stream, Restore first); the log lines are `native: live restore: Real-ESRGAN animevideov3 (the host's
+kernels) at WxH -> WxH, on the captured frame before the model` and `restore=native`; a failure mid-run
+drops the pass with one line. Gate `harness\eff\restore_equiv.py` (the fold within 4e-7 of `realesr.fit`
+in fp64) and the `restore_*` cases of `eff_native.py`. The effects-only route runs
 natively too:
 `echo` (no
 model ticked) runs the host's no-engine mode: the handoff answers with the geometry only (`engine=none`,
@@ -1619,13 +1451,10 @@ Measured against the python route at 1080p 24 fps, target
 1000: identical picture (PSNR 72..78 dB SDR, 66 dB median HDR), +37% presented fps at image scale
 0.25, +13% at 0.40, 27..43% less process CPU.
 
-GMFSS on the native host. Both handoffs know the `gmfss` backend: `engine=gmfss` on the LIVE READY line, the five engines of
-`live_server.Gmfss` (feat_ext, the fused bidir GMFlow, metricnet, the GMFSS IFNet, fusionnet) as
-`NATIVE-PATH gfeat= gflow= gmetric= gifnet= gfusion=` plus their `<key>jit=` caches (merged into the
-host's shared cache), `trt_lookup.find_gmfss_engines` for the torch-free start (warm marker on the
-fusionnet jit). The host loads and warms the set (one enqueue per engine on zeros, the tensor contract
-logged per engine) and keeps it resident like the RIFE pair (one model set at a time: a switch frees
-the other). The glue kernels sit in the host's
+GMFSS on the native host. Both handoffs know the `gmfss` backend: `engine=gmfss` on the LIVE READY line with the half
+size (`hh= hw=`) and `NATIVE-PATH cache=` (the kernel cubins' folder); every net of the chain runs on the host's
+kernels, so there is no engine to find, build, warm or keep resident (offline: `GMFSS at WxH on the host's kernels (no
+engine)`; a session logs `gmfss ready in N s`). The glue kernels sit in the host's
 NVRTC block (the chain below launches them):
 `k_half` (the 2x2 box halves of both frames as adjacent planes), `k_pyr` (the per-pair flow and metric
 pyramids at 1/2 and 1/4), `k_splatSoft` (softsplat.py's int64 fixed-point forward with the 'soft'
@@ -1651,8 +1480,47 @@ Gate `gmfss_deconstruct\z1_gate.py` (offline 480p frames byte-identical to the s
 
 The chain makes gmfss a native backend like rife:
 `native host ready` reads `engine=gmfss` (Smooth Motion has its own `fruc` live backend).
-`nativeGmfssSetup` reads the contract off the five engines (channel counts, dtypes, every shape) and
+`nativeGmfssSetup` reads the contract off the engines (dtypes, every shape) and
 allocates the chain's buffers from it, so a set that does not match is refused with the tensor named.
+feat_ext (GMFSS's FeatureNet: three blocks of LeakyRelu, a 3 x 3 stride-2 conv, LeakyRelu, a 3 x 3 conv, 64 / 128 /
+192 channels) is no engine: the host reads `engine/GMFSS_Fortuna/train_log/feat.pkl` itself (the same torch zip reader
+as Restore's; it ships) and runs the six convs on its own CUDA kernels, built into their own cached module at the
+first GMFSS session: the first conv on the fp32 frame with its weights as float literals, the other five as
+tensor-core implicit GEMMs with fp16 accumulators (`fnConvT`, the input's LeakyRelu on the A fragments, the output's
+in the epilogue). At 1080p a frame's feat_ext takes 0.84x the engine's time (0.76x at 4K), and its levels come
+closer to the model in fp32 than the engine's did (60.9 / 57.8 / 56.1 vs 58.7 / 56.8 / 55.3 dB); its scratch lives
+in the GMFSS contexts' shared activation block. A missing or wrong feat.pkl = the session refuses (`feat_ext
+unavailable (...)`).
+metricnet is no engine either: the host reads `engine/GMFSS_Fortuna/train_log/metric.pkl` (it ships) and runs it at
+the half as six launches of its own cached module: one kernel for its input (both backward warps' photometric means,
+gmflow's forward-backward check, the normalized flows), then conv_in, the three residual convs (their PReLU applied
+once to the shared-memory halo, the last one storing conv_out's PReLU) and conv_out as tensor-core implicit GEMMs (an
+8 x 32 tile, 64 outputs a block, fp16 accumulators; conv_out's fp32, tanh x 10 in its epilogue). At 1080p a pair's
+metricnet takes 0.73x the engine's time (0.64x at 4K), and m0 / m1 come closer to the model in fp64 than the
+engine's did (59.99 / 61.42 vs 59.18 / 59.24 dB); its scratch lives in the shared activation block. A missing or
+wrong metric.pkl = the session refuses (`metricnet unavailable (...)`).
+The GMFSS IFNet (RIFE 4.6's IFNet: four blocks at 1 / 8, 1 / 4, 1 / 2 and 1 / 1 of the half, 192 / 128 / 96 / 64
+channels) is no engine either: the host reads `engine/GMFSS_Fortuna/train_log/rife.pkl` (it ships) and runs it as 47
+launches of its own cached module, the RIFE IFNet module's design: each block's input built at its own scale from the
+full-size taps the author's resize reads (the earlier blocks' flows and masks summed at each tap, the frames' border
+warps), the stride-2 convs, residual convs and transposed conv on the tensor cores with fp32 accumulators, each
+block's output kept at its own scale, and one last kernel that sums the four blocks' flows and masks, warps both
+frames and writes the merged picture (fp32) straight into fusionnet's `a` planes 3..5. At the 1080p half it takes
+0.84x the engine's time (0.80x at 4K), and the picture comes closer to the model in fp64 than the engine's did (74.2 /
+61.0 vs 64.7 / 52.4 dB mean / worst); its scratch lives in the shared activation block. A missing or wrong rife.pkl =
+the session refuses (`the GMFSS IFNet unavailable (...)`).
+fusionnet (GMFSS's GridNet: four heads, nine residual blocks, four stride-2 and four transposed-conv blocks over three
+levels of 64 / 128 / 192 channels, up to its 64 -> 256 conv before the pixel shuffle) is no engine either: the host
+reads `engine/GMFSS_Fortuna/train_log/fusionnet.pkl` (it ships) and runs it as 45 launches of its own cached module
+(`smv_fusion_*.cubin`): `k_fuIn` (the `a` planes through head0's first PReLU), head0's first conv with fp32
+accumulators, every other conv on the tensor cores with fp16 accumulators (the stride-1 ones on an 8 x 32 tile and the
+stride-2 ones on a 4 x 32 tile, 64 outputs a block, weights from global memory a k-step ahead, the PReLU before a conv
+applied once to its shared-memory halo, a residual's adds at the output pixel), the transposed convs as their four
+parity classes in one block; every activation channels-last fp16, the buffers alive at once per level (4 / 4 / 3) in
+the shared activation block. At the 1080p half it takes 0.94x the engine's time (0.99x at 4K), and `out` stays as
+close to the model in fp64 as the engine's (54.9 / 54.5 dB mean / worst, the picture 75.9 vs 75.7 dB). Its launches
+go through the CUDA graph helper like the IFNets' (`gmfss fusionnet as one CUDA graph`). A missing or wrong
+fusionnet.pkl = the session refuses (`fusionnet unavailable (...)`).
 `nativeGmfssPair` runs per group: feat_ext of the new frame (the previous group's output IS this
 pair's feat0, the same reuse the RIFE route does with the encode, so one feat_ext per group instead of
 python's two; a group without tweens skips it, and the next pair that makes tweens takes that frame's
@@ -1660,15 +1528,14 @@ features from the previous picture, the same bytes), then, when the group interp
 the bidir GMFlow, metricnet and `k_pyr` x4 (both flow directions in one launch, both metrics in
 another). `nativeGmfssTween` runs per tween: the two image splats into the fusionnet's `a` planes 0..2
 and 6..8, the GMFSS IFNet straight into planes 3..5, the six feature splats into `b` / `c` / `d`
-(a channel concat is adjacent planes, so nothing is copied), the fusionnet, and `k_fuTail` (its
-pixel shuffle + last conv, with python's `clamp(out, 0, 1)` folded in; `k_restToF` when an older
-graph still ends at the frame); the result rides the shared storeSlot chain, so Sharpen, RTX VSR,
+(a channel concat is adjacent planes, so nothing is copied), fusionnet, and `k_fuTailNhwc` (its
+pixel shuffle + last conv, with python's `clamp(out, 0, 1)` folded in); the result rides the shared storeSlot chain, so Sharpen, RTX VSR,
 Upscale to, Restore, TrueHDR and the fit work exactly as on the RIFE route. The pyramids are built
 once per pair and the timestep is applied by the splat (`interp(t * flow) * 0.5` equals
 `t * (interp(flow) * 0.5)`). With the scatter splats (`SMV_GM_SPLAT=old`) one accumulator buffer serves
 all eight (they are sequential on the one stream): `max(C) + 1` planes of the half. The gather splats
-(the default) need no accumulator, so it then holds only the cut fusionnet's `out` (64 planes of
-8 bytes = 256 fp16 channels), and none with the full graph. That `out` is written and read inside a
+(the default) need no accumulator, so it then holds only fusionnet's `out` (64 planes of
+8 bytes = 256 fp16 channels). That `out` is written and read inside a
 tween, the pair's gmflow scratch (A's outputs, the local correlation, the matching operands and flow, on
 HDR sessions the SDR view and the motion halves) inside the pair, so the scratch is carved from the
 same buffer when it fits (`SMV_GM_SCRATCH=own` gives it its own buffers). Gates: the seven `gmfss_*` cases in `harness\eff\eff_native.py` (plain, sharpen, Upscale
@@ -1682,8 +1549,7 @@ the pair block, of the gmflow enqueue inside it and of one tween (1080p gen 1: f
 of a 92.9 ms pair, tween 38.5 ms of GPU for 0.17 ms of CPU, so no per-tween CUDA graph is needed).
 
 A Flow scale below 100 once ran on the native GMFSS route (gmflow at a /32
-flow grid, `k_shrinkAaH` / `k_shrinkAaV` / `k_flowUp`); it left with the Flow scale control. The GMFSS warm marker key keeps its `{ph}x{pw}|0x0` form (the `|0x0` was the flow
-grid at 100 %) so every warm marker written before still matches.
+flow grid, `k_shrinkAaH` / `k_shrinkAaV` / `k_flowUp`); it left with the Flow scale control.
 
 Harness rules for unattended perf runs: `--park` (bypasses the alt-tab pause), `--no-hud`,
 `--no-adapt`; `-WindowStyle Hidden` only on the live process; the HUD and overlay are excluded
@@ -1697,86 +1563,57 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   breaks the no-deps promise), calibrated FP8 is closed (FusionNet no speedup, GMFlow 1.3x with
   disqualifying flow outliers). The engine warns at startup when the GPU power limit sits below the
   board default (a laptop Silent profile costs 2..3x wall time).
-* TensorRT for RTX does not change interpolation throughput; it cuts the per-resolution engine
-  build from 75..100 s to 1..11 s and the libs from 2.2 GB to 0.2 GB. RIFE on TRT measured 1.54x
-  end to end at 1080p 2x (against the eager torch route).
-* Builder scratch ceiling 8 GB (the host's builder).
-* One engine per resolution: every sub-net engine is pinned to the height and width that triggered
-  its build, so a new source or window size builds once (seconds to a minute per net) and is cached
-  forever, every axis pinned. Dynamic-shape profiles were removed: TensorRT sizes an
-  execution context for the profile MAXIMUM, which cost 8 GB of VRAM and a 3.5 s kernel-cache load
-  per 960x540 live session; the pinned engine takes 2 GB, loads in 1 s and presents 5 to 12% more
-  frames.
 * Flow always runs at the model's native half resolution, at every source size. The old flow
   caps and auto-scaling were removed after an eyeball ladder showed reduced flow visibly degrades
   2K / 4K motion; `--scale` is the one sanctioned speed lever.
-* GMFlow's per-pixel batched gemms are chunked at 61440 batches (`GEMM_BATCH_CHUNK` in
-  `matching.py`): CUDA caps `gridDim.z` at 65535 and TRT-RTX emits batched-gemm launches unguarded
-  past it, which made every enqueue fail from about 832x1472 up. Mathematically exact. A `gmflow`
-  engine cached by a pre-fix build shadows the fixed graph (names hash weights + shape, not the
-  graph); delete the cache folder to clear it. The EAGER path keeps that chunking; the
-  EXPORT path (`torch.compiler.is_compiling()`) writes both per-pixel products as
-  multiply + sum instead (no batched gemm, so no launch cap), the shifted-window rolls as explicit
-  slices, the window mask from arange comparisons and `normalize_coords` from scalar arithmetic,
-  so one ONNX with symbolic H / W can serve every size (the ONNX-in-exe work; a size-free graph
-  cannot hold a loop that unrolls by H * W). Measured against eager fp32 the new graph is closer
-  than the chunked one (mean 0.049 vs 0.057 px at 960x544), 1 to 8% faster, +3 to 5% engine
-  memory; a gmflow engine exported after this is not bit-identical to an older cached one.
-  `MetricNet.backwarp`'s export path builds its grid without `linspace` (whose length pins the
-  size) and splits every multiply from its add with a no-op `torch.maximum`: on the GPU TensorRT
-  would fuse them into one rounding where the per-size export's host-folded constant rounded
-  twice; split, the engine is bit-identical to the per-size one.
-* Bidirectional GMFlow: both flows from one call sharing the backbone, about 1.07x per pair. The
-  host runs only the `gmflow_bidir` graph.
-* GMFlow's quarter-scale local correlation runs in the host. Inside the graph it
-  samples the feature map at the 81 window positions around each pixel's flow, multiplies by the
-  query and sums over the 128 channels through a [2, 128, HW, 81] fp32 product written and read
-  back (2.7 GB at the 960x544 half, ~11 % of the call). The export cuts `gmflow_bidir` around it
-  (`trt_runtime.gmflow_split`, found by structure: the one ReduceSum of GridSample x query) into
-  `gmflow_bidir_a` (the frames -> `qf`, the transformer's fp16 output stream [4, H, W, 128]
-  channels-last: rows 0-1 = the query and the 128-channel map B reads, rows 2-3 = the feature
-  map; plus flow0) and `gmflow_bidir_b` (the correlation, qf and flow0 -> the flow).
-  `trt_runtime.gmflow_exit_fp16` hands A's exit out as that one fp16 tensor: the graph's Cast to
-  fp32, Split and Transposes into q / f / feat cost ~6 % of A at the 4K half, and every value they
-  carried is an exact widening of qf (engine outputs and renders byte-identical); B reads qf's rows
-  in fp16 where it cast feat back to fp16 anyway. Between them `k_localCorr` takes one warp a
-  pixel, widens qf's halves itself (one uint2 load a lane) and computes the 81 window positions
-  itself (normalize_coords' IEEE divide: bit for bit what the graph computed), and the export
-  branch of `matching.local_correlation_softmax` makes the window's bounds and offsets after the
-  correlation, so nothing size-only crosses (A writes 59 MB less a call at the Balanced half) and
-  B's flow is prob x offsets (sum(prob * (coords + offset)) - coords with sum(prob) = 1, without the
-  long form's coords-sized rounding; tweens vs an fp32 reference unchanged to 0.01 dB). The 81
-  positions share one fractional offset, so their taps fall on an 11 x 11 grid whose dot products
-  it takes once, then each position combines its four corners (GridSample's bilinear, zero padding,
-  align_corners; the combine's roundings pinned with fma / mul intrinsics). Not
-  bit-identical (fp32 sum order): GMFSS tweens vs an fp32 reference 59.03 dB pooled / 53.27 worst,
-  the same as the whole graph's. Faster at every size (the product, x2: 1080p 0.964, 4K 0.784) and
-  about 1.5 GB less video memory at the live 1440p shapes; at 4K DLAA it is what fits a 24 GB card
-  (the whole graph spilled to system memory). `gmflow_bidir_b`'s engine name carries only `corr`
-  and `img0` (the other inputs follow from them; all of them would push cache paths toward
-  MAX_PATH).
-* `gmflow_bidir_b`'s flow propagation (GMFlow's 3 x 3 local-window attention at the quarter scale,
-  the export branch of `FeatureFlowAttention.forward_local_window_attn`) takes its window from nine
-  shifted slices of the zero-padded key and flow, in `F.unfold`'s row-major order. `F.unfold`
-  exports as Range + Pad + Gather, which TensorRT-RTX fused with the 128-channel q.k sum into one
-  kernel at about 13 GB/s: 1.76 ms, ~60 % of B at the live Balanced half. With the slices B takes
-  0.65 to 0.70 x the time at every size (Balanced 3.06 -> 2.08 ms a pair at 160 W), outputs
-  byte-identical (the engine on synthetic inputs, GMFSS renders at 480p, the Quality half, 1080p
-  and DLAA).
-* GMFlow's CNN backbone runs once a frame: the export also cuts it out of `gmflow_bidir_a`
-  (`trt_runtime.gmflow_backbone_cut`: the two Conv-fed batch Splits give its maps, the batch Concat
-  of the two frames becomes the first frame's branch) as `gmflow_backbone` (one frame -> `map4`,
-  `map8`), and `gmflow_bidir_a` takes both frames' maps. Per pair the host copies the last pair's new
+* Bidirectional GMFlow: both flows from one call sharing the backbone, about 1.07x per pair.
+* GMFlow's quarter-scale local correlation runs in the host between the transformer (A) and B:
+  `k_localCorr` takes one warp a pixel, reads A's fp16 exit `qf` ([4, H, W, 128] channels-last: rows
+  0-1 = the query and the 128-channel map B reads, rows 2-3 = the feature map), widens its halves
+  itself (one uint2 load a lane) and computes the 81 window positions around each pixel's flow
+  itself (normalize_coords' IEEE divide), and B's flow is prob x offsets (sum(prob * (coords +
+  offset)) - coords with sum(prob) = 1). The 81 positions share one fractional offset, so their taps
+  fall on an 11 x 11 grid whose dot products it takes once, then each position combines its four
+  corners (GridSample's bilinear, zero padding, align_corners; the combine's roundings pinned with
+  fma / mul intrinsics); GMFSS tweens vs an fp32 reference 59.03 dB pooled / 53.27 worst, and the
+  [2, 128, HW, 81] product the model writes (2.7 GB at the 960x544 half) is never formed.
+* GMFlow's second half B runs on the host's kernels: the host reads `engine/GMFSS_Fortuna/train_log/flownet.pkl`'s
+  `feature_flow_attn` and `upsampler` (the file ships) and runs B as 7 launches of its own cached module
+  (`smv_gmflowb_*.cubin`) at the quarter of the half, both directions as one batch: the window's softmax over the 81
+  correlations (/ sqrt(128), the taps off the frame masked) plus flow0; the q / k projections as a tensor-core GEMM
+  (fp32 sums); the 3 x 3 flow propagation (one warp a pixel: the nine zero-padded neighbours' q . k, softmax, the
+  zero-padded flow summed), which also writes the upsampler's input (the 128-channel map, the flow, zeros to 192
+  channels); the upsampler's 3 x 3 conv with fusionnet's wide conv kernel (fp16 sums), its 1 x 1 conv on the ReLU as a
+  GEMM (fp32 sums), and the convex combination (a softmax over the 9 taps per 4 x 4 sub-pixel of 4 x the flow) straight
+  into the half's flow, 0.0007 px mean error from the model in fp64 at 1080p; its activations live in the shared
+  activation block.
+  A missing or wrong flownet.pkl = the session refuses (`gmflow B unavailable (...)`).
+* GMFlow's CNN backbone runs once a frame, and the transformer takes both frames' maps. Per pair the host copies the last pair's new
   maps to batch slot 0 when that pair read the same view of the frame (the pictures, the SDR view
   or the motion view) and runs the backbone on the new frame into slot 1; a call without a pair
-  makes the next pair take both. Not bit-identical (batch-1 fp16 kernels): tweens vs fp32 59.08 /
-  52.78 dB against the whole backbone's 59.03 / 53.27; 1080p x2 x0.969 a pair.
+  makes the next pair take both. The backbone runs on the host's kernels: the host reads flownet.pkl's `backbone.*`
+  and runs 54 launches of its own cached module (`smv_gmflowbb_*.cubin`): normalize_img and the 7 x 7 stride-2 conv in
+  fp32, every InstanceNorm as its statistics (per-block Welford partials merged in a fixed order: bit-stable run to
+  run, no atomics) applied where the next pass reads them (the next 3 x 3 conv's halo, or the residual's combine), the
+  residual blocks' 3 x 3 convs on the tensor cores with fp16 accumulators (fusionnet's wide form), the downsamples and
+  conv2 as 1 x 1 GEMMs, the trident's two strides writing map4 / map8 planar fp16 straight into A's batch slot; its maps
+  sit at 53.4 dB SNR from the model in fp64; a missing or wrong flownet.pkl = the session refuses.
+* GMFlow's transformer at both scales runs on the host's kernels (`nativeGaRun`, its own cached module
+  `smv_gmflowa_*.cubin`; flownet.pkl's `transformer.*` and `feature_flow_attn`'s two projections): `_m` (the eighth in
+  2 x 2 windows, the frame pair, no warp) = 6 layers + the propagation's projections -> `mf` (the two frames' tokens) and
+  `mq` / `mk` (fp16 [2, N, 128]); A (the quarter in 8 x 8 windows, shifted windows on the odd layers) = the propagated
+  flow upsampled to flow0, feature1 warped by it, the window position, 6 layers -> `qf` + flow0. A layer = one GEMM
+  for both attentions' folded projections (q' = s (Wk^T Wq)^T, v' = t (Wm Wv)^T, folded in double at load), the window
+  attention as one flash-form kernel a window (the roll as an index map, the shift regions skipped, online softmax in
+  fp32, norm1 and the residual in its epilogue), the cross attention's q' GEMM, the cross attention, and the MLP in one
+  kernel whose 1024-wide hidden layer stays in registers (norm2 and the residual in its epilogue). fp16 operands, fp16
+  sums in the GEMMs and q' k^T, P v' on fp32 sums, LayerNorm / softmax / the residual stream in fp32. Against the
+  model in fp64 at the 1080p half A's q / f sit at 56.6 / 57.8 dB SNR, `_m`'s mf / mq / mk at 57.3 / 51.0 / 52.4.
+  `SMV_GA_GRAPH` = the CUDA graphs' switch. A window needs 2 tokens a side, so the host pads a GMFSS frame to at
+  least 128 a side (`kGmMinPad`; the packers replicate the edge into the pad).
 * GMFlow's two attentions whose value is 2 channels (the scale-0 global matching: the softmax over
   every token pair times the pixel grid, both directions; the flow propagation: the same with the
-  flow) run in the host, not in a graph: the export cuts the first half around them
-  (`trt_runtime.gmflow_matching_cut`) into `gmflow_bidir_a_g8r_m` (the backbone maps -> `mf`, the two
-  frames' tokens, and the propagation's `mq` / `mk`, fp16 [2, N, 128]) and the A graph
-  `gmflow_bidir_a_g8`, which takes the propagated flow as `prop`. Between them `k_attn2` runs twice (the matching with the grid as its
+  flow) run in the host between `_m` and A: `k_attn2` runs twice (the matching with the grid as its
   value writes the flow, the propagation reads it): a flash-style kernel, Q K^T on the tensor cores
   (mma.sync, fp16 in, fp32 accumulation), the softmax online in fp32, the value product in fp32, so
   the token x token matrix never exists (in a graph it took 8 row blocks to keep 4K GMFSS inside a
@@ -1786,111 +1623,19 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   / 49.65 / 49.62 / 49.70 dB pooled and 46.39 / 46.76 / 44.99 / 45.03 worst, against 48.15 / 46.65 /
   45.74 / 43.97 and 44.62 / 42.86 / 39.91 / 37.25 before; no fixed-position difference; bit-stable
   run to run. The 1440p DLAA half's context 1769 -> 142 + 601 MiB and x0.80 (55 W).
-* fusionnet takes the splatted feature levels `b` / `c` / `d` in fp16: in the graph each one's only
-  reader is a Cast to fp16, so the export drops it (`trt_runtime._fusion_fp16_inputs`) and
-  `k_splatNorm` stores fp16, rounding to nearest even as the Cast did; `a` stays fp32 (the GMFSS
-  IFNet writes its middle planes). Bit-identical tweens, half the bytes in those three buffers
-  (170 MB less at the 864x480 half), fusionnet x0.962 a call at the 1080p half.
-* fusionnet ends before its pixel shuffle (`trt_runtime._fusion_tail_cut`): `out` is the 64 -> 256
-  conv at the half (fp16) and conv_last's own fp16 weight / bias leave as the outputs `w_last` /
-  `b_last`; `k_fuTail` does the shuffle (DepthToSpace CRD) + conv_last (3x3, zero padding at the full
-  size) in one pass, fp32 sums, the clamp folded in (an SDR pair of an HDR source: unclamped into
-  `k_hdrFromSdr`). The pre-shuffle tensor lives in the splat accumulator (free from the splats' end to
-  the next clear, same stream), and the setup proves the engine writes the weights before the first
-  tween. The engine's context shrinks (876 -> 697 MiB at the 1080p half) and the tweens come closer to
-  an fp32 run (PSNR vs eager fp32 49.67 -> 49.72 dB at 1080p); the host takes either graph (`out`'s
-  channels decide) and logs `fusion tail on the host` / `in the engine`. The cut graph's `out` leaves
-  channels-last: the host's builder allows only HWC8 / HWC16 on it (both plain NHWC at 256 channels,
-  the layout fusionnet's convs work in), so the whole-tensor transpose to linear after the last conv
-  is gone (fusionnet x0.955 a call at the 4K half). `k_fuTailNhwc` brings each block's tile into
-  shared memory 4 channels at a time and runs as fast as `k_fuTail` does on a linear `out`, the same
-  frame bit for bit; the host reads `out`'s format (linear = `k_fuTail`). feat_ext's `f1` / `f2` / `f3`
-  and fusionnet's `b` / `c` / `d` are channels-last too (feat_ext x0.836 a call at the 4K half), so
-  the feature splats read and write `[n][C]`: `k_gsGatherNhwc` puts a cell's 8-channel groups on
-  consecutive lanes (one 16-byte load a list entry, one 16-byte store; x0.675 for a tween's six
-  feature splats at the 4K half, the same values bit for bit), and the scatter fallback takes channel
-  / pixel strides. The setup takes all six linear or all six channels-last (`feature splats ...`).
-* fusionnet's shared activations (`trt_runtime._fusion_prelu_fanout`): a LeakyRelu whose input has
-  other readers too (the residual add, a second LeakyRelu with another slope) cannot fuse into the
-  conv before it and ran as its own kernel. With a slope a in (0, 1], x = min(y, y / a) for
-  y = LeakyRelu(x), so per such tensor the first LeakyRelu stays the conv's only reader and every
-  other reader takes Min(y, Div(y, a)), which TensorRT-RTX folds into a neighbouring conv: the
-  standalone LeakyRelu layers at the Balanced half go 18 -> 3. Not bit-identical (the negative half
-  takes one more fp16 rounding): PSNR vs eager fp32 equal at 480p and 1080p. No host change.
-* fusionnet's input activations (`trt_runtime._fusion_input_lrelu`): `b` / `c` / `d` are each read
-  by one LeakyRelu before a conv, which TensorRT-RTX ran as its own kernels over the inputs. Those
-  LeakyRelus go, their slopes leave as the constant output `lr_bcd` (fp32 [3]), and the feature
-  splats store LeakyRelu of the fp16 value themselves (`gmStoreLr` / `gmLrelu16`: the fp32 product of
-  two fp16 values is exact, so its one rounding is an fp16 multiply, TensorRT's result bit for bit).
-  The host reads the slopes in the setup's probe run; an engine without `lr_bcd` keeps them inside.
-* GMFlow's transformer on the export path (`FeatureTransformer._forward_windowed`, every split-window scale)
-  keeps one token-outer stream, [group][position in the window][window][frame][C] (`_to_groups`), so an
-  attention reads its group's slice in the layout TensorRT's fused attention kernel takes (window order
-  cost three copies into it and one out per attention); the cross attention's partner = the frame halves
-  swapped. The quarter scale runs each block on 8 groups of one window row (a group's tensors stay near
-  the GPU's L2: the block's FFN ran at half the rate on 117,760 tokens as on 29,440). A shifted block
-  of the coarse scale (the `_m` graph) attends per mask region (`_region_attention_tokens`): after the
-  roll by half a window only the last window row and column hold two regions each (the corner four) and
-  a token attends only inside its own region (the mask's -100 is a 0 weight), so each region is plain
-  attention (TensorRT's masked attention kernel cost about 1.5x the plain one); exact in fp64 (2e-14
-  against the masked form). The quarter scale's shifted blocks (A) keep the shift mask: per region its 8
-  groups are ~200 attentions of distinct shapes, and TensorRT-RTX's runtime JIT compiled them in ~137 s
-  on one CPU thread at every new size. With 8 groups each block's last LayerNorm (`norm2`) and residual
-  run once on the stacked groups (per token: the same math, outputs bit-identical): applied per group,
-  TensorRT-RTX fuses all 8 groups' copies into each block boundary's relayout, kernels of ~1 MB of SASS
-  (3 of A's 19 cubins held 3.1 of its 3.8 MB of JIT output) that made most of A's cold load; stacked, A's
-  JIT takes 7 s instead of 20 s at the 4K half (1.4 GB peak working set instead of 2.2), and A runs
-  x0.93 to x1.00 with 67 to 192 MiB less context memory (harness `gmfss_packed_attention` forms3_ab,
-  census.py lists the cubins). One group (`_m`) keeps the per-group form: the stacked form rounds
-  differently there and runs x1.02. The position
-  encoding is added after the layout change, a broadcast add over the position axis (`takes_position`;
-  gmflow.py skips `feature_add_position` there): the Balanced half's entry 1.36 -> 0.72 ms. Eager keeps
-  the original layout.
-* One gmflow A and one `_m` serve every size (uniform only): `gmflow_bidir_a_g8` (the quarter scale in 8
-  groups with the shift mask) and `gmflow_bidir_a_g8r_m` (the coarse scale per region), both cut from one
-  export. The first start at a new size decides A's form: per region (`_g8r`) A was the fastest (at the
-  4K half 137.6 ms against 161.0 masked, the DLAA half 44.7 against 46.6; harness `gmfss_first_start_fix`
-  forms_ab) but its cold load took 26 s of build + ~137 s of JIT on one CPU thread and a 9.7 GB peak
-  working set; masked it is 11 s + ~7 s (1.4 GB; ~20 s and 2.2 GB before the stacked `norm2`). With the
-  stacked `norm2` and the A build helper, GMFSS's first start (host-direct, offline x2, a fresh cache,
-  harness `first_start_load`) takes 21.5 / 23.9 / 30.4 s at 1080p / 1440p / 2160p and Live at 1440p DLAA is
-  ready after ~21 s (host build ~18 s). Measured at 160 W before both: GMFSS's first start (host-direct,
-  offline x2, 8 frames, a fresh cache) 50.5-56.2 s at 1080p / 1440p / 2160p against 183-200 s with
-  `_g8r`, Live at 1440p DLAA ready after 57.5 s against 212.3 s; the price, a 4K offline pair 372.3 ms
-  against 345.9 (x1.075) and the 1440p DLAA live flow block 77.7 against 74.8 ms. `_m` per region stays:
-  the fastest `_m` (34.2 ms at the 4K half against 44.2 / 46.3 whole / 8-group masked, 9.2 against
-  10.6 / 11.3 at the DLAA half) for ~4 s of load. A window needs 2 tokens a side, so the host pads a
-  GMFSS frame to at least 128 a side (`kGmMinPad`; the packers replicate the edge into the pad).
-* GMFlow's transformer attention exports with its projections folded: every attention is single-head
-  and linear in its projections, so `q k^T = s Wq^T Wk t^T` and `merge(P v) = P t (Wm Wv)^T`. The
-  query takes one 128 x 128 matrix, the key is the target itself, the value takes `Wm Wv`
-  (`transformer.fold_projections`, the products formed in fp64 and stored fp32; called by
-  `onnx_export.py` after the weights load), so the k projection and the merge GEMM leave all 108
-  attentions of `gmflow_bidir_a`. Eager keeps the four projections. The rounding differs: tweens
-  vs an fp32 reference at 480p / the Quality half / 1080p / the 1440p DLAA frame 48.15 / 46.65 /
-  45.74 / 43.97 dB pooled and 44.62 / 42.86 / 39.91 / 37.25 worst, against 48.25 / 46.51 / 45.62 /
-  43.96 and 44.41 / 41.90 / 39.24 / 37.15 before; no fixed-position difference (the mean signed
-  difference's row and column profiles).
-* Every token-outer scale keeps its stream in fp16 (`transformer.EXPORT_FP16_STREAM`, set by
-  `onnx_export.GMFLOW_FP16_STREAM`): between blocks, and each block's self-attention output before its
-  cross attention. Under the export's autocast(fp16) `layer_norm` returns fp32, so the residual sums
-  would carry the stream in fp32, and each block's glue kernel would read and write it at twice the
-  bytes (a kernel trace of the Balanced half: 0.29 ms a block at ~600 GB/s). Every LayerNorm still
-  computes in fp32, and the transformer's output leaves A as the fp16 stream itself
-  (`gmflow_exit_fp16`; the host widens it exactly). At 160 W, A against the fp32 stream x0.96 at the DLAA half, `_m` x0.97.
-  Not bit-identical: tweens vs an fp32 reference at 480p / the Quality half / 1080p / the 1440p DLAA
-  frame 49.22 / 49.68 / 49.67 / 49.90 dB pooled against 49.49 / 49.65 / 49.62 / 49.70 with the fp32
-  stream; real frames identical; no fixed-position difference.
-* RIFE engines build at the true /64-padded shape. The 1152x640 safe-zone floor that the TRT-RTX
-  1.5 small-shape hang forced is off on 1.6.1 (bare-enqueue repros and live soaks clean);
-  `SMV_RIFE_SAFEPAD=1` (offline) and `SMV_LIVE_SAFEPAD=1` (live) restore it. Any TRT-RTX bump must
-  re-soak the small shapes before trusting the true-shape default.
-* TRT-RTX JIT kernels persist per engine as `<engine>.engine.jit` beside the engine (one shared
-  cache once grew to 325 MB and cost every TRT process about 16 s to load). The native live host
-  loads the IFNet's file and merges the encoder's into the same cache (the handoff's
-  `NATIVE-PATH ejit=` line); without the merge the encode context recompiled its kernels on
-  every first session of an engine pair (0.5 s of the warm start).
-* Live RIFE and DRBA run the unbatched IFNet engine, one in-between frame a call
+* fusionnet's inputs and tail: `b` / `c` / `d` are fp16 channels-last, and feat_ext writes its `f1` / `f2` / `f3` the
+  same way, so the feature splats read and write `[n][C]`: `k_gsGatherNhwc` puts a cell's 8-channel groups on
+  consecutive lanes (one 16-byte load a list entry, one 16-byte store; x0.675 for a tween's six feature splats at the 4K
+  half, the same values bit for bit), and the scatter fallback takes channel / pixel strides. The heads' first
+  LeakyRelu on `b` / `c` / `d` is the splats' store (`gmStoreLr` / `gmLrelu16`: the fp32 product of two fp16 values is
+  exact, so its one rounding is an fp16 multiply), its slopes read from fusionnet.pkl. `out` (the 64 -> 256 conv at
+  the half, channels-last fp16) lives in the splat accumulator (free from the splats' end to the next clear, same
+  stream); `k_fuTailNhwc` does the shuffle (DepthToSpace CRD) + conv_last (3x3, zero padding at the full size,
+  fusionnet.pkl's weights in fp16) in one pass with fp32 sums, the clamp folded in (an SDR pair of an HDR source:
+  unclamped into `k_hdrFromSdr`), each block's tile brought into shared memory 4 channels at a time.
+* RIFE runs at the true /64-padded shape. `SMV_RIFE_SAFEPAD=1` (offline) and `SMV_LIVE_SAFEPAD=1` (live) pad
+  it to at least 1152x640 instead.
+* Live RIFE and DRBA run the IFNet one in-between frame a call
   (offline's class too, at every multiplier). Measured on the RTX 5090 laptop (harness
   `vram_estimate`: batch_speed.py, session_mem.py): at 1920x1088 a frame takes 10.8 ms where the
   batched class (a timestep axis of 1 to 8) took 11.3 to 11.9 at any batch, and a parked 1080p
@@ -1898,12 +1643,9 @@ three runs per config, deltas under about 5% mean nothing. Never graph-capture a
   class presented 74.5 to 78.5 holding 8871 MiB at 55 to 130 ms; at 960x576 and below a batch of 5
   to 8 is a few percent faster a frame (896x512: 2.36 ms against 2.46), but doubles the latency (41
   against 18 ms) and holds 1488 MiB more. Gates `live_two_domain\live_pan.py --gen 3`,
-  `drba\drba_resident.py`. TRT-RTX whole graph
-  capture is the live default (offline opt-in: `SMV_OFFLINE_GRAPH=1`); it cut live
-  enqueue CPU per tween by 49%. Gotcha kept from the dropped flow-warp class (harness
-  `onnx\fwnan`): TRT-RTX 1.6.1.120 miscompiles an Expand of batch-1 inputs that feed both a
-  concat and a warp (wrong flow, stale-memory NaN slices); broadcast such inputs with a Tile
-  (`repeat`) on the export path.
+  `drba\drba_resident.py`. The IFNets on the host's kernels run as CUDA graphs live (offline opt-in:
+  `SMV_OFFLINE_GRAPH=1`; chainGraphRun: one graph per set of buffers, captured on first use, up to 16 a
+  chain): their many short launches at small sizes otherwise leave the GPU waiting between kernels.
 * Cross-session fps comparisons lie (thermal drift): pair baseline and candidate back to back in
   one session. A subset suite proves nothing about the regime it skips: ship loop, protocol or
   batching changes only on the full smoke suite.
@@ -1914,15 +1656,12 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 
 | Variable | Effect |
 |---|---|
-| `SMV_TRT_CACHE` | TRT engine cache location (default `model_cache_safe_to_delete` in the app's top folder) |
-| `SMV_ONNX_DIR` | size-free ONNX folder (default `engine/onnx`) |
-| `SMV_GM_HELPER=0` / `=1` / `SMV_GM_HELPER_TEST=fail` | a GMFSS cold build without the build helper processes / with gmflow A's helper alone (A/B) / every helper exits 2 at once (the fallback's trigger) |
-| `SMV_GM_UPGRADE=0` / `=now` / `=fail` | gmflow A in the masked form only, no background build (A/B) / the edge form from the cold start (A/B) / the background build of the edge form exits 2 at once (its failure line's trigger) |
+| `SMV_TRT_CACHE` | the model cache's location (the kernels' cubins; default `model_cache_safe_to_delete` in the app's top folder) |
 | `SMV_GM_SPLAT=old` | GMFSS's splats by the scatter kernels (k_splatSoft + k_splatNorm) instead of the gather ones (A/B; the same output) |
 | `SMV_GM_SCRATCH=own` | GMFSS's pair scratch in its own buffers instead of carved from the splat accumulator (A/B; the same output) |
 | `SMV_GM_FEAT_LAZY=0` | GMFSS's feat_ext on every new frame, also in groups without tweens (A/B; the same output) |
-| `SMV_CTXSHARE=0` | the IFNet, encode, Restore and DRBA block0 contexts each on their own activation block instead of one shared block (A/B; the same output) |
-| `SMV_FU_HWC=0` / `=fail` | GMFSS's host-side tensors built linear (fusionnet's `out`, `b` / `c` / `d`, feat_ext's levels; their own engine files, `fusionnet_lin_...` / `featurenet_lin_...`), read by k_fuTail and the planar splats (A/B; the same output) / the session setup reads `out`'s layout as unknown (the refusal's trigger) |
+| `SMV_CTXSHARE=0` | Restore's context, the encode's planes and the scratch of DRBA's block0 and of the IFNet each on their own activation block instead of one shared block (A/B; the same output) |
+| `SMV_IFN_GRAPH=0` / `=fail`, `SMV_GI_GRAPH=0` / `=fail`, `SMV_FU_GRAPH=0` / `=fail`, `SMV_GB_GRAPH=0` / `=fail`, `SMV_BB_GRAPH=0` / `=fail`, `SMV_GA_GRAPH=0` / `=fail` | RIFE's IFNet / the GMFSS IFNet / fusionnet / gmflow B / gmflow's backbone / gmflow's transformer (A and `_m`) launched kernel by kernel instead of replayed as CUDA graphs (A/B; the same output) / every capture thrown away, the session falls back to kernel-by-kernel launches (the fallback line's trigger) |
 | `SMV_RIFE_SAFEPAD=1` / `SMV_LIVE_SAFEPAD=1` | restore the 1152x640 RIFE safe-zone pad |
 | `SMV_LIVE_XQPHASE=1` | present-loop phase breakdown |
 | `SMV_LIVE_GRID_PACE=0` / `SMV_LIVE_GRID_LOCK=0` | the old present targets (slots spread at (idx + 1) / (n + 1) of the source period after the frame's arrival, a late slot at once) / the grid at every adaptive target, no whole-multiple ladder (A/B only) |
@@ -1932,7 +1671,8 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_LIVE_TIMING=1` / `SMV_LIVE_HITCH=1` | live present-loop diagnostics: an `[exe-timing] xq:` line on every 2 s stats tick (the pair interval EMA, tweens a pair, the pair position, degrades) / `[hitch]` lines from the present queue (the gap between presents, the slot, the time since the frame arrived, the pacing delay) |
 | `SMV_EXSTYLE=<hex>` | the live overlay window's extended style replaced by this value; a diagnostic bisect knob, never a product setting |
 | `DLSSG_VERBOSE=1` | Streamline's verbose log, in the live host's DLSS-G route and in `dlssg2f.exe` |
-| `SMV_OFFLINE_GRAPH=1` | TensorRT-RTX graph capture on for offline renders (off by default) |
+| `SMV_OFFLINE_GRAPH=1` | the IFNets' CUDA graphs on for offline renders (off by default) |
+| `SMV_NATIVE_ARCH=75` | every NVRTC module compiled as compute_75 PTX that the driver JIT-compiles for the running card (cached as `<tag>_<hash>_ptx75.ptx`): the RTX 20 code paths run on a newer GPU; a test lever, never a product setting |
 | `SMV_OFFLINE_RESIDENT=0` / `SMV_OFFLINE_RESIDENT_IDLE_S` / `SMV_OFFLINE_HOST_PIPE` / `SMV_OFFLINE_HOST_LOG` | one exe per plain RIFE render instead of the resident offline host / its idle limit in seconds (default 600) / its pipe name (the app sets one per process) / a file for its stderr |
 | `SMV_HANDOFF_DUMP=1` | the live host logs every handoff line it answers |
 | `SMV_NR_NOHOOK=1`, `SMV_NR_HOOKLOG=1` | DLSS 5 caller hook off / trace |
@@ -2010,7 +1750,7 @@ the driver. Toolchain on the dev machine: VS 2019 Build Tools (`cl` 19.29) and V
 
 ### RTX Video bridge (`rtxvideo_cuda.dll`)
 
-Lets `engine/rtxvideo.py` drive the RTX Video SDK (VSR + TrueHDR). It statically links the SDK's
+Lets the native host drive the RTX Video SDK (VSR + TrueHDR). It statically links the SDK's
 `nvsdk_ngx_s.lib`, so the built DLL is not redistributable; only the sources are committed. Rebuild
 only after an SDK update.
 
@@ -2375,17 +2115,15 @@ NVIDIA Optical Flow interface headers (the nvof model) are vendored in `build_sr
 their provenance README) and `build.bat` adds that include path itself:
 ```
 set "SL_SDK=D:\path\to\extracted\streamline-sdk"
-set "TRT_RTX_SDK=D:\path\to\TensorRT-RTX-1.7.1.116"
 set "NGX_SDK=D:\path\to\DLSS"
 build.bat
 ```
 `build.bat` also embeds `smv-live.manifest`, the UTF-8 process code page (Windows 10 1903 and later): the host
-keeps its paths as UTF-8, and this makes the ANSI file calls, its own and those inside the ONNX parser, read them
-as such, so SMV runs from a folder with a non-ASCII name.
+keeps its paths as UTF-8, and this makes the ANSI file calls read them as such, so SMV runs from a folder with a
+non-ASCII name.
 Requirements: Visual Studio 2022+ with the C++ workload, the Streamline SDK v2.14.16 (see the DLSS-G
 host section above), a Windows 11
-SDK (for the C++/WinRT Windows.Graphics.Capture headers), the TensorRT-RTX SDK zip (login gated)
-extracted anywhere (only `include\` and `lib\tensorrt_rtx_1_7.lib` are used) and the public NVIDIA
+SDK (for the C++/WinRT Windows.Graphics.Capture headers) and the public NVIDIA
 DLSS SDK for its NGX headers (`NGX_SDK`, the same variable the dlssnr host build uses; no `d3d12.lib`
 on purpose, `D3D12CreateDevice` must keep resolving from the Streamline interposer). NVAPI (the free
 video memory) comes with the Streamline SDK: `build.bat` takes the MIT headers and `nvapi64.lib` from
@@ -2395,9 +2133,8 @@ CUDA headers and import libs come from the app's own `engine\runtime\Lib\site-pa
 supplies the one header `cuda_runtime_api.h` opens with. Do not grow that shim; install the real
 headers if more is ever needed.
 
-Nothing added for the native host is a hard dependency: `tensorrt_rtx_1_7.dll` is delay loaded and
-the CUDA 13 libs are lazy loader stubs, opened by full path out of `engine\runtime` on the first
-native call (the log line `native: runtime folder ...` names the folder used). The exe ships
+Nothing added for the native host is a hard dependency: the CUDA 13 libs are lazy loader stubs, opened
+by full path out of `engine\gpu_runtime` on the first native call (the log line `native: runtime folder ...` names the folder used). The exe ships
 prebuilt next to its own copy of the Streamline runtime.
 
 Rules (hard-won, do not regress):
@@ -2450,7 +2187,6 @@ Rules (hard-won, do not regress):
 * CUDA 13 (Blackwell): torch is the cu134 build; cupy finds the runtime through `cuda-pathfinder`.
   cupy's NVRTC kernels only compile once torch has been imported first (it primes the DLL search
   path for `nvrtc-builtins64_133.dll`): a dev script that uses both imports torch before cupy.
-* Python 3.14 + TensorRT-RTX: cp314 wheels exist from 1.6.1.120 up, never pin below.
 * The RTX bridge stays cu12-built with `cudart64_12.dll` beside it (see its build section).
 * `engine/runtime` stays a relocatable python-build-standalone install, never a venv.
 * The renderer cannot run in a plain browser; launch through `npm start`.
@@ -2458,16 +2194,11 @@ Rules (hard-won, do not regress):
 ## Linting and formatting
 
 Standard presets, applied by tools, so whoever edits (a person or an agent) never matches a house style
-by hand: run `npm run lint` after a change. The engine Python and the renderer's inline JS are not
-reformatted.
+by hand: run `npm run lint` after a change. The renderer's inline JS is not reformatted.
 * Prettier (`.prettierrc.json`: Prettier's defaults plus single quotes and printWidth 120) formats
   `src/**/*.ts` and `scripts/*.ts` only; `.prettierignore` guards `engine/`, `renderer/` and build dirs.
 * `tsc --noEmit` with `strict` on is the TypeScript bug gate. ESLint was dropped when moving to
   TypeScript 7 (typescript-eslint pinned the old compiler).
-* pyright (`pyrightconfig.json`) type-checks `engine` and `scripts` in its default `standard`
-  mode, resolving imports from the dev runtime (`engine/runtime/Lib/site-packages`) when it is
-  installed; an import it cannot resolve stays silent, unused imports / vars = warning. Vendored and
-  cache dirs are excluded.
 * clang-format (`.clang-format`: Visual Studio's own `Microsoft` preset with `Type* p`; includes keep
   their order, string literals are never split and comments never re-wrapped, so a pass changes
   whitespace only) formats our own C++ through `scripts/clang-format.ts` (in place;

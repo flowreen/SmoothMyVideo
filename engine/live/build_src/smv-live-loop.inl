@@ -860,10 +860,11 @@ struct Hud
     HWND hwnd = nullptr;
     HFONT font = nullptr;
     wchar_t text[256]{};
-    wchar_t sized[256]{}; // the text the window was last sized for
-    int textH = 0;        // that text's height as drawn, one line or more
+    wchar_t sized[256]{};       // the text the window was last sized for
+    int textH = 0;              // that text's height as drawn, one line or more
+    bool readoutLogged = false; // the first readout of the session went to the log (its form)
 
-    void create(int x, int y)
+    void create(int x, int y, const wchar_t* first)
     {
         WNDCLASSW wc{};
         wc.lpfnWndProc = DefWindowProcW;
@@ -878,15 +879,21 @@ struct Hud
             return;
         }
         SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
-        SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE); // best effort
+        // SMV_HUD_CAPTURE=1 (a measurement aid): the HUD stays capturable, so a harness can read it off the screen
+        if (GetEnvironmentVariableW(L"SMV_HUD_CAPTURE", nullptr, 0) == 0)
+            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE); // best effort
         font = CreateFontW(-24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                            CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        wcscpy_s(text, L"\u2026"); // ellipsis until the first stats window lands (escaped: see update())
+        _snwprintf_s(text, _TRUNCATE, L"%ls", first); // the opening note until the first stats window lands
+        LOG("HUD opens with: %s\n", wideToUtf8(text).c_str());
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         paint();
     }
 
-    void update(double inFps, double outFps, double latMs)
+    // sourceOnly = passthrough and effects only (the echo route, no frame generated): one figure, the source's frame
+    // rate (its new pictures a second, those the pipeline superseded included: what an overlay inside the source app
+    // shows for a game); the presents' count would add the held frame's re-presents
+    void update(double inFps, double outFps, double latMs, bool sourceOnly = false)
     {
         if (!hwnd)
             return;
@@ -896,20 +903,28 @@ struct Hud
         // --no-hud (whole readout). DLSS-G never reaches here with a latency to show (SL
         // paces internally and the caller passes its handoff figure), so that path is
         // unchanged either way.
-        // the in rate with one decimal, a trailing .0 dropped (a 2 s window with one arrival = 0.5 fps), and the
-        // measured multiplier, out over in (the live: line's ratio): a shown 0 never carries one
+        // the in rate in whole numbers like the in-game overlays (a decimal only showed the capture stamps' jitter: 23.9 /
+        // 24 / 24.1 on a 23.976 video), and the measured multiplier, out over in (the live: line's ratio): a shown 0
+        // never carries one
         wchar_t inTxt[16];
-        swprintf_s(inTxt, L"%.1f", inFps);
-        const size_t inLen = wcslen(inTxt);
-        if (inLen > 2 && !wcscmp(inTxt + inLen - 2, L".0"))
-            inTxt[inLen - 2] = 0;
+        swprintf_s(inTxt, L"%.0f", inFps);
         wchar_t mul[32] = L"";
         if (wcscmp(inTxt, L"0"))
             swprintf_s(mul, L" (%.2f\u00D7)", outFps / inFps);
-        if (latMs > 0.5 && !g_noHudLat)
+        if (sourceOnly && latMs > 0.5 && !g_noHudLat)
+            swprintf_s(text, L"%ls fps   ~%.0f ms behind", inTxt, latMs);
+        else if (sourceOnly)
+            swprintf_s(text, L"%ls fps", inTxt);
+        else if (latMs > 0.5 && !g_noHudLat)
             swprintf_s(text, L"%ls fps \u2192 %.0f fps%ls   ~%.0f ms behind", inTxt, outFps, mul, latMs);
         else
             swprintf_s(text, L"%ls fps \u2192 %.0f fps%ls", inTxt, outFps, mul);
+        if (!readoutLogged)
+        {
+            LOG("HUD readout: %s (%s)\n", wideToUtf8(text).c_str(),
+                sourceOnly ? "the source's frame rate" : "captured -> presented");
+            readoutLogged = true;
+        }
         // re-assert the top of the TOPMOST band: the overlay's HWND_TOPMOST moves raise it above us
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         paint();
@@ -927,15 +942,28 @@ struct Hud
         MONITORINFO mi{sizeof(mi)};
         GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
         const int room = (std::max)(200, (int)(mi.rcWork.right - w.left) - 16);
-        RECT r{0, 0, room - 8, 0};
+        RECT r{0, 0, room - 8 - 2 * kEdge, 0};
         HDC dc = GetDC(hwnd);
         HGDIOBJ of = SelectObject(dc, font);
-        DrawTextW(dc, text, -1, &r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+        DrawTextW(dc, text, -1, &r, drawFlags() | DT_CALCRECT);
         SelectObject(dc, of);
         ReleaseDC(hwnd, dc);
         textH = (int)(r.bottom - r.top);
-        SetWindowPos(hwnd, nullptr, 0, 0, (int)(r.right - r.left) + 8, (std::max)(36, textH + 4),
-                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(hwnd, nullptr, 0, 0, (int)(r.right - r.left) + 8 + 2 * kEdge,
+                     (std::max)(36, textH + 4 + 2 * kEdge), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // the edge around the white text, in px: a near-black copy of the text drawn within it (pure black is the colour
+    // key and would show through)
+    static constexpr int kEdge = 2;
+
+    // right-to-left text (Arabic, Hebrew) takes DrawText's right-to-left reading order, right-aligned
+    UINT drawFlags() const
+    {
+        bool rtl = false;
+        for (const wchar_t* s = text; *s && !rtl; ++s)
+            rtl = (*s >= 0x0590 && *s <= 0x08FF) || (*s >= 0xFB1D && *s <= 0xFDFF) || (*s >= 0xFE70 && *s <= 0xFEFF);
+        return DT_WORDBREAK | DT_NOPREFIX | (rtl ? DT_RIGHT | DT_RTLREADING : DT_LEFT);
     }
 
     void paint()
@@ -944,16 +972,37 @@ struct Hud
             return;
         fit();
         HDC dc = GetDC(hwnd);
-        RECT r;
-        GetClientRect(hwnd, &r);
-        FillRect(dc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
-        HGDIOBJ of = SelectObject(dc, font);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(255, 255, 255)); // full white: easier to read than green
-        r.left += 4;
+        RECT c;
+        GetClientRect(hwnd, &c);
+        // drawn off screen and copied in one BitBlt: the black fill (the colour key) and the edge's copies drawn on the
+        // window itself let DWM compose a blank or edge-only HUD between them (the model-load wait repaints every pass)
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, c.right, c.bottom);
+        HGDIOBJ ob = SelectObject(mem, bmp);
+        FillRect(mem, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        HGDIOBJ of = SelectObject(mem, font);
+        SetBkMode(mem, TRANSPARENT);
+        RECT r = c;
+        r.left += 4 + kEdge;
+        r.right -= 4 + kEdge;
         r.top = (r.bottom - textH) / 2; // centred: one line in the window's 36 px, more lines in their own height
-        DrawTextW(dc, text, -1, &r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
-        SelectObject(dc, of);
+        const UINT fl = drawFlags();
+        SetTextColor(mem, RGB(8, 8, 8)); // the edge: readable on a white picture
+        for (int dy = -kEdge; dy <= kEdge; ++dy)
+            for (int dx = -kEdge; dx <= kEdge; ++dx)
+                if ((dx || dy) && dx * dx + dy * dy <= kEdge * kEdge + 1)
+                {
+                    RECT e = r;
+                    OffsetRect(&e, dx, dy);
+                    DrawTextW(mem, text, -1, &e, fl);
+                }
+        SetTextColor(mem, RGB(255, 255, 255)); // full white: easier to read than green
+        DrawTextW(mem, text, -1, &r, fl);
+        SelectObject(mem, of);
+        BitBlt(dc, 0, 0, c.right, c.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, ob);
+        DeleteObject(bmp);
+        DeleteDC(mem);
         ReleaseDC(hwnd, dc);
     }
 
@@ -1614,6 +1663,163 @@ static std::wstring loadingWhat()
         return g_modelLabel;
     return (g_serverBackend.empty() ? std::wstring(L"DLSS 4.5") : g_serverBackend) + L" model";
 }
+// The HUD's loading note: the GUI's --hud-note (its language) as is, else the English note around loadingWhat()
+static std::wstring loadingNote()
+{
+    if (!g_hudNote.empty())
+        return g_hudNote;
+    return L"SMV Live: Loading " + loadingWhat() + L"...";
+}
+// The HUD's figures every 0.5 s (the `live:` line keeps its 2 s window), counted the way the in-game overlays count
+// frames: the source's rate = its PRESENTS where the capture sees each one (a window: every present arrives, an unchanged
+// picture too), else its new pictures (the whole screen carries every other update on it; a player that repeats its
+// picture on every refresh shows what it plays, not the panel's rate); (n - 1) over the first-to-last span (one frame
+// in the second = n over it). SMV's own figures (the presented rate = the swap chain's present count between two
+// readings about a second apart; the latency = the mean of 0.5 s of samples, each present call - capture stamp + lag +
+// one panel refresh, see stampLagMs) follow the new pictures: a still picture makes no new frame. Every figure covers
+// the second up to the PREVIOUS reading (0.5 s behind), so a stream's last frames before it stops (a player's repaint
+// when it pauses or ends) never reach one. A stream that stops (no frame for 2.5 of its mean intervals, at least 250
+// ms: a paused player, a menu that stops rendering, a still shot on the whole screen) keeps its figures; moving again for
+// 0.5 s at least, they count only what came since
+struct HudMeter
+{
+    static constexpr int64_t kWin = 10000000, kEvery = 5000000, kStopMin = 2500000; // 1 s, 0.5 s, 250 ms in 100 ns
+    // one frame stream's stop and resume
+    struct Track
+    {
+        bool stopped = false;
+        bool resumed = false; // this read is the first after a stop
+        int64_t stopLast = 0; // the newest frame when it stopped
+        int64_t resumeAt = 0; // the first frame after the stop, until the figures' second is past it (0 = none)
+        int64_t seen = 0;     // the newest frame the previous step saw
+        // false = the stream stopped (hold its figures)
+        bool step(int64_t now, Capture& cap, bool presents)
+        {
+            resumed = false;
+            int64_t first = 0, lastIn = 0, last = 0, prev = 0;
+            const int n = cap.framesSince(presents, now - kWin, now, first, lastIn, last, prev);
+            const int64_t iv = n >= 2 && lastIn > first ? (lastIn - first) / (n - 1) : (prev ? last - prev : 0);
+            const int64_t stopGap = (std::max)(kStopMin, iv * 5 / 2);
+            if (!last || now - last > stopGap)
+            {
+                if (!stopped)
+                    stopLast = last;
+                stopped = true;
+                seen = last;
+                return false;
+            }
+            // a stop between two readings (a pause, then a short burst before this one): a gap wider than the stop
+            // threshold among the frames since the previous step
+            int64_t before = 0, after = 0;
+            if (!stopped && seen && cap.latestGap(presents, seen, stopGap, before, after))
+            {
+                stopLast = before;
+                stopped = true;
+            }
+            seen = last;
+            if (stopped)
+            {
+                stopped = false;
+                resumed = true;
+                cap.framesSince(presents, stopLast + 1, now, first, lastIn, last, prev);
+                resumeAt = first ? first : last;
+            }
+            if (resumeAt && now - resumeAt >= kWin + kEvery)
+            {
+                // one stray picture is no resume (a player's on-screen note while paused, a frame step): stopped again
+                const bool one = cap.framesSince(presents, resumeAt, now, first, lastIn, last, prev) < 2;
+                resumeAt = 0;
+                if (one)
+                {
+                    stopped = true;
+                    stopLast = last;
+                    return false;
+                }
+            }
+            return true;
+        }
+        // its figures may move up to `to`: no resume, or one that lasted (three frames over 0.5 s at least: a player's
+        // on-screen note or a frame step while paused is a short burst, playing again is not)
+        bool settled(int64_t to, Capture& cap, bool presents) const
+        {
+            int64_t first = 0, lastIn = 0, last = 0, prev = 0;
+            return !resumeAt || (cap.framesSince(presents, resumeAt, to, first, lastIn, last, prev) >= 3 &&
+                                 lastIn - resumeAt >= kEvery);
+        }
+    };
+    int64_t lastTick = 0;
+    std::deque<std::pair<int64_t, UINT>> pcs; // (QPC 100 ns, the swap chain's present count), the newest four readings
+    std::deque<std::pair<int64_t, double>> lat;
+    Track src, pic;                     // the source's rate stream; the new pictures (SMV's own figures)
+    bool started = false;               // three readings done (a presented rate up to the previous one exists)
+    bool picSeen = false;               // the pictures moved at least once
+    double inF = 0, outF = 0, latF = 0; // the figures shown
+    void addLat(int64_t t, double ms)
+    {
+        lat.emplace_back(t, ms);
+        while (!lat.empty() && t - lat.front().first > kWin)
+            lat.pop_front();
+    }
+    bool due(int64_t now) const
+    {
+        return now - lastTick >= kEvery;
+    }
+    // false = no figure yet (the first second): the HUD keeps its loading note. panelHz = the overlay monitor's refresh
+    // rate (0 = unknown)
+    bool read(int64_t now, Capture& cap, UINT pc, double panelHz, double& inFps, double& outFps, double& latMs)
+    {
+        const int64_t upTo = lastTick; // the previous reading: the figures' second ends there
+        lastTick = now;
+        pcs.emplace_back(now, pc);
+        while (pcs.size() > 4)
+            pcs.pop_front();
+        while (!lat.empty() && now - lat.front().first > kWin)
+            lat.pop_front();
+        started = started || pcs.size() >= 3;
+        int64_t f = 0, li = 0, l = 0, p = 0;
+        const int nP = g_monitor ? 0 : cap.framesSince(true, now - kWin, now, f, li, l, p);
+        const int nC = cap.framesSince(false, now - kWin, now, f, li, l, p);
+        const bool presents = !g_monitor && !(panelHz > 0 && nP >= 0.8 * panelHz && 2 * nC <= nP);
+        if (src.step(now, cap, presents) && upTo && src.settled(upTo, cap, presents))
+        {
+            int64_t first = 0, lastIn = 0, last = 0, prev = 0;
+            const int n =
+                cap.framesSince(presents, (std::max)(upTo - kWin, src.resumeAt), upTo, first, lastIn, last, prev);
+            inF = n >= 2 && lastIn > first ? (n - 1) * 1e7 / (double)(lastIn - first) : n * 1e7 / (double)kWin;
+        }
+        const bool picMoving = pic.step(now, cap, false);
+        picSeen = picSeen || picMoving;
+        if (picMoving && pic.resumed)
+        {
+            // SMV's output since the resume only: the stop's re-presents and old samples stay out
+            pcs.clear();
+            pcs.emplace_back(now, pc);
+            lat.clear();
+        }
+        else if (((picMoving && pic.settled(upTo, cap, false)) || !picSeen) && pcs.size() >= 3)
+        {
+            // (a picture that never moved yet: the plain present count, nothing to hold)
+            const auto& a = pcs.front();
+            const auto& b = pcs[pcs.size() - 2];
+            if (b.first > a.first)
+                outF = (double)(b.second - a.second) * 1e7 / (double)(b.first - a.first);
+            double s = 0;
+            int k = 0;
+            for (const auto& x : lat)
+                if (x.first <= upTo && upTo - x.first <= kEvery)
+                {
+                    s += x.second;
+                    k++;
+                }
+            if (k)
+                latF = s / k;
+        }
+        inFps = inF;
+        outFps = outF;
+        latMs = latF;
+        return started;
+    }
+};
 // Waits until the target's client size holds still. true = it came back to the captured size (a
 // transient: the restore animation after a minimize hands out a frame of another size), the
 // session continues with the overlay shown again; false = a real resize, the caller restarts.
@@ -1623,7 +1829,7 @@ static bool resizeSettle(HWND target, Host& host, const Capture& cap, Hud& hud, 
     ShowWindow(host.hwnd, SW_HIDE); // the old-size frames no longer cover the window
     if (hud.hwnd)
     {
-        _snwprintf_s(hud.text, _TRUNCATE, L"SMV Live: Loading %ls...", loadingWhat().c_str());
+        _snwprintf_s(hud.text, _TRUNCATE, L"%ls", loadingNote().c_str());
         hud.show(!hidden);
         SetWindowPos(hud.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         hud.paint();
@@ -1684,7 +1890,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
     CHECK_HR(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic)));
     timeBeginPeriod(1);
     fillMouseRestore(); // a Fill session that was killed or crashed left the pointer speed changed
-    lkGmUpgradeStop();  // before this session's lookups
 
     HWND target = targetOverride ? targetOverride : findTargetWindow(needle);
     if (targetOverride)
@@ -1922,16 +2127,18 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             }
         }
 
-        // HUD created up front (not after warmup) so server backends can show a "loading" note
-        // during the cold model build: the passthrough overlay looks identical to the source
-        // until smoothing starts, so without a visible cue the long first build still reads as
-        // "nothing happened". WS_EX_NOACTIVATE keeps it clear of DLSS-G's foreground gate.
+        // HUD created up front (not after warmup), opening with the loading note that names the picked models and
+        // effects (the GUI's --label) until the first stats window: the passthrough overlay looks identical to the
+        // source until smoothing starts, so without a visible cue the start reads as "nothing happened".
+        // WS_EX_NOACTIVATE keeps it clear of DLSS-G's foreground gate.
         // Fill presents nothing until the first served group, so its note starts at the window's corner and
         // moves to the screen's once the overlay runs.
         Hud hud;
+        HudMeter meter;
         FillMouse fillMouse; // started once the overlay runs (Fill only), stopped before the teardown
         if (!g_noHud && !park)
-            hud.create((g_fill ? cap.clientScreenX : host.posX) + 16, (g_fill ? cap.clientScreenY : host.posY) + 16);
+            hud.create((g_fill ? cap.clientScreenX : host.posX) + 16, (g_fill ? cap.clientScreenY : host.posY) + 16,
+                       loadingNote().c_str());
 
         PipeServer srv;
         double srcMeasFps = 0; // the source rate measured before the server spawns (0 = not measured)
@@ -2171,7 +2378,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         LOG("Loading %ls (%ls; first build at this resolution can take up to a minute)...\n", nm,
                             g_modelNote.c_str());
                     if (hud.hwnd)
-                        _snwprintf_s(hud.text, _TRUNCATE, L"SMV Live: Loading %ls...", nm);
+                        _snwprintf_s(hud.text, _TRUNCATE, L"%ls", loadingNote().c_str());
                     announced = true;
                 }
                 // keep the loading note on top of the passthrough presents (each Present leaves
@@ -2246,6 +2453,46 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         uint32_t shmSeq = 0;   // shm-mode: frame token sequence
         double statLatSum = 0; // capture->present latency accumulation (ms)
         uint64_t statLatN = 0;
+        // The latency figure (the HUD's "~N ms behind", the `live:` line) = SMV's present call - the picture's capture
+        // stamp + the route's lag + ONE PANEL REFRESH. WGC stamps a capture one refresh after the picture's own flip
+        // (PresentMon beside a visible source: the stamps sit one refresh period after the source's displays, a
+        // DWM-composed source the same), so present - stamp alone read a passthrough as ~0 ms behind a picture it
+        // followed by a whole refresh, negative at times. The refresh = the overlay monitor's mode (steady; the frame
+        // statistics' measured rate wobbles between stats ticks), the measured period only when the mode gives none.
+        // Not in the figure: SMV's own present -> flip (tear-allowed presents, well under a refresh).
+        double modeRefreshMs = 0;
+        {
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            GetMonitorInfoW(MonitorFromWindow(host.hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsExW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm, 0) && dm.dmDisplayFrequency > 1)
+                modeRefreshMs = 1000.0 / dm.dmDisplayFrequency;
+        }
+        auto stampLagMs = [&]() {
+            return modeRefreshMs > 0 ? modeRefreshMs : host.refreshQpc100 > 0 ? host.refreshQpc100 / 1e4 : 0.0;
+        };
+        LOG("latency figure: present - capture stamp + lag + one refresh (%.2f ms)\n", stampLagMs());
+        // SMV_LAT_TRACE=<file> (a measurement aid, the server route): every served present as `P <present count> <its
+        // QPC> <the frame's capture stamp> <the lag term ms>` and each new frame statistics reading as `S <displayed
+        // present count> <its sync QPC> <the refresh period> <PresentRefreshCount> <SyncRefreshCount>` (QPC in 100 ns
+        // units, the capture stamp's timeline), written at the end
+        // and every HUD refresh as `H 0 <its reading's QPC> 0 <the source fps> <the presented fps> <the latency ms>`, then the
+        // capture's A / N / Q rows (Capture::dumpStamps)
+        struct LatRow
+        {
+            char kind;
+            uint64_t a;
+            int64_t b, c;
+            double d, e = 0, f = 0;
+        };
+        std::vector<LatRow> latRows;
+        wchar_t latPath[MAX_PATH] = L"";
+        const bool latOn = GetEnvironmentVariableW(L"SMV_LAT_TRACE", latPath, MAX_PATH) > 0;
+        UINT latFsPrev = 0;
+        if (latOn)
+            latRows.reserve(1 << 16);
         // ADAPTIVE SMOOTHNESS (server route, streaming only), Lossless-Scaling-style TARGET
         // mode: output frames are generated AT THE TARGET GRID's timestamps (the overlay
         // monitor's refresh rate, or --target N) by FRACTIONAL resampling - each source pair
@@ -4116,8 +4363,27 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     const double pNow = nowMs();
                     if (s.sentTs)
                     {
-                        statLatSum += (nowQpc100() - s.sentTs) / 10000.0 + (srv.contentLag + s.lag) * emaDt;
+                        const double latMs =
+                            (nowQpc100() - s.sentTs) / 10000.0 + (srv.contentLag + s.lag) * emaDt + stampLagMs();
+                        statLatSum += latMs;
                         statLatN++;
+                        meter.addLat(nowQpc100(), latMs);
+                    }
+                    if (latOn && latRows.size() < latRows.capacity())
+                    {
+                        UINT pc = 0;
+                        host.scNative->GetLastPresentCount(&pc);
+                        latRows.push_back({'P', pc, nowQpc100(), s.sentTs, (srv.contentLag + s.lag) * emaDt});
+                        DXGI_FRAME_STATISTICS lfs{};
+                        if (SUCCEEDED(host.scNative->GetFrameStatistics(&lfs)) && lfs.SyncQPCTime.QuadPart &&
+                            lfs.PresentCount != latFsPrev)
+                        {
+                            latFsPrev = lfs.PresentCount;
+                            latRows.push_back({'S', lfs.PresentCount,
+                                               (int64_t)((double)lfs.SyncQPCTime.QuadPart * 1e7 / qpcFreq()),
+                                               (int64_t)host.refreshQpc100, (double)lfs.PresentRefreshCount,
+                                               (double)lfs.SyncRefreshCount});
+                        }
                     }
                     if (hitchOn)
                     {
@@ -4382,7 +4648,24 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
 
                 phEnd(phHold);
 
-                // ---- (vi) 2s stats / HUD tick (server route fields only)
+                // the HUD: every 0.5 s over the last second (HudMeter)
+                if (hud.hwnd && meter.due(nowQpc100()))
+                {
+                    UINT pc = 0;
+                    host.scNative->GetLastPresentCount(&pc);
+                    double inF = 0, outF = 0, latM = 0;
+                    // DLSS-G over echo: the handoff plus one capture interval, as on the direct DLSS-G route
+                    if (meter.read(nowQpc100(), cap, pc, stampLagMs() > 0 ? 1000.0 / stampLagMs() : 0.0, inF, outF,
+                                   latM))
+                    {
+                        const double latShown = g_fgOver && inF > 0.5 ? latM + 1000.0 / inF : latM;
+                        hud.update(inF, outF, latShown, g_serverBackend == L"echo" && !g_fgOver);
+                        if (latOn && latRows.size() < latRows.capacity())
+                            latRows.push_back({'H', 0, meter.lastTick, 0, inF, outF, latShown});
+                    }
+                }
+
+                // ---- (vi) 2s stats tick (server route fields only)
                 if (now - lastStatTick >= 2000)
                 {
                     UINT c = 0;
@@ -4456,8 +4739,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     host.prMsTot = host.prMsWait = host.prMsFlip = 0;
                     host.prN = 0;
                     host.prBunch = 0;
-                    // DLSS-G over echo: the handoff plus one capture interval, as on the direct DLSS-G route
-                    hud.update(capFps, outFps, g_fgOver && capFps > 0.5 ? latAvg + 1000.0 / capFps : latAvg);
                     statLatSum = 0;
                     statLatN = 0;
                     // DLSS-G over echo: its generated-frame count follows the target the way the direct route's does
@@ -4734,8 +5015,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             (cascUp ? cascUp : casc)->feed(buf.data(), capBytes);
                     }
                     // direct routes (dlssg/identity): latency of the frame just presented
-                    statLatSum += (nowQpc100() - cap.lastFrameTs) / 10000.0;
+                    const double latDirect = (nowQpc100() - cap.lastFrameTs) / 10000.0 + stampLagMs();
+                    statLatSum += latDirect;
                     statLatN++;
+                    meter.addLat(nowQpc100(), latDirect);
                     if (!gpuCap && !fromMap)
                     {
                         buf.swap(lastBuf); // lastBuf = SL-reset fodder only; latestFrame rewrites every byte of buf
@@ -4792,6 +5075,23 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         break;
                 }
 
+                // the HUD every 0.5 s over the last second (HudMeter); DLSS-G shows the handoff plus one capture
+                // interval (the inherent interpolation delay SL adds while it waits for the next real frame)
+                if (hud.hwnd && meter.due(nowQpc100()))
+                {
+                    UINT pc = 0;
+                    host.scNative->GetLastPresentCount(&pc);
+                    double inF = 0, outF = 0, latM = 0;
+                    if (meter.read(nowQpc100(), cap, pc, stampLagMs() > 0 ? 1000.0 / stampLagMs() : 0.0, inF, outF,
+                                   latM))
+                    {
+                        const double latShown = host.useSL && inF > 0.5 ? latM + 1000.0 / inF : latM;
+                        hud.update(inF, outF, latShown);
+                        if (latOn && latRows.size() < latRows.capacity())
+                            latRows.push_back({'H', 0, meter.lastTick, 0, inF, outF, latShown});
+                    }
+                }
+
                 if (now - lastStatTick >= 2000)
                 {
                     UINT c = 0;
@@ -4843,10 +5143,6 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     host.prMsTot = host.prMsWait = host.prMsFlip = 0;
                     host.prN = 0;
                     host.prBunch = 0;
-                    // HUD estimate: server routes show the measured number; DLSS-G shows the
-                    // handoff plus one capture interval (the inherent interpolation delay SL
-                    // adds while it waits for the next real frame to interpolate toward).
-                    hud.update(capFps, outFps, host.useSL && capFps > 0.5 ? latAvg + 1000.0 / capFps : latAvg);
                     statLatSum = 0;
                     statLatN = 0;
                     // (adaptive smoothness needs no controller here: the target grid IS the
@@ -4918,6 +5214,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
 
         running = 0;
         fillMouse.stop(); // hands the cursor and the pointer speed back before the overlay goes
+        if (latOn && !latRows.empty())
+        {
+            FILE* lf = nullptr;
+            if (_wfopen_s(&lf, latPath, L"w") == 0 && lf)
+            {
+                for (const LatRow& r : latRows)
+                    fprintf(lf, "%c %llu %lld %lld %.4f %.4f %.4f\n", r.kind, (unsigned long long)r.a, (long long)r.b,
+                            (long long)r.c, r.d, r.e, r.f);
+                cap.dumpStamps(lf);
+                fclose(lf);
+            }
+            LOG("latency trace: %zu rows\n", latRows.size());
+        }
         if (host.prHistNAll > 20)
         {
             double avg = 0, l1 = 0, l01 = 0;

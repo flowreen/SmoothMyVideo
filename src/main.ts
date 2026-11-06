@@ -116,9 +116,9 @@ if (!app.requestSingleInstanceLock()) {
     }
   });
   app.whenReady().then(() => {
-    // a new TensorRT-RTX version or a new ONNX export empties the engine cache once, before any live
-    // session or render can load an engine built from the old graph; a cache an earlier version
-    // kept elsewhere (the engine folder, 1.0.x's AppData) is moved or removed (src/render/cache.ts)
+    // an earlier version's TensorRT engines leave the model cache, before any live session or
+    // render starts; a cache an earlier version kept elsewhere (the engine folder, 1.0.x's AppData)
+    // is moved or removed (src/render/cache.ts)
     console.log(checkEngineCache(ENGINE, [path.join(app.getPath('userData'), 'trt_cache')]));
     // a retired DLSS 5 runtime (DLSSNR_RETIRED) goes before any host can load it
     const nr = retireOldDlssnr();
@@ -331,16 +331,15 @@ const DLSSG_FILES = [
 // NVIDIA copy sits inside NBA 2K27. So the app offers a one-click download of the community build
 // every DLSS 5 tool pulls from (RankFTW/rhi-repo release assets, the RenoDX author's RTX 40 + 50
 // rebuild), pinned to one asset and verified twice (zip SHA256 from the GitHub API digest, then the
-// DLL inside), or the user drops a copy in, like the RTX Video and NvOFFRUC DLLs. nvngx_dlss.dll is
-// the DLSS SR runtime; the NGX core only warns when it is absent (probe-verified), so it
-// is copied when found beside a dropped runtime, reported, never required.
+// DLL inside). nvngx_dlss.dll is the DLSS SR runtime; the NGX core only warns when it is absent
+// (probe-verified), so it is reported, never required.
 const DLSSNR_DIR = path.join(ENGINE, 'dlssnr');
 const DLSSNR_HOST = ['nvngx.dll'];
 const DLSSNR_RUNTIME = 'nvngx_dlssnr.dll';
 const DLSSNR_SR = 'nvngx_dlss.dll';
 // The one-click source: the pinned rhi-repo asset, and the ONE hash this app holds: the
-// SHA256 of the nvngx_dlssnr.dll inside it (probe-verified on the host). The download refuses to install any other DLL; a dropped file with another hash still
-// installs, the UI just says it is unverified. Bump tag, asset and hash together when moving to a
+// SHA256 of the nvngx_dlssnr.dll inside it (probe-verified on the host). The download refuses to install any other
+// DLL. Bump tag, asset and hash together when moving to a
 // newer build and add the replaced one to DLSSNR_RETIRED (the zip's own digest is at
 // https://api.github.com/repos/RankFTW/rhi-repo/releases).
 const DLSSNR_DL = {
@@ -598,29 +597,6 @@ ipcMain.handle('dlssnr-ready', () => {
   };
 });
 
-// Install the NR runtime from a picked/dropped nvngx_dlssnr.dll, a folder, or a .zip holding it
-// (installBin searches the selection by name); nvngx_dlss.dll is copied too when it sits in the
-// same selection, and its absence is not an error. The installed file is hashed so the UI can say
-// whether it is the verified build.
-ipcMain.handle('dlssnr-install', (_e, source: string) => {
-  const r: { ok: boolean; error?: string; copied: string[]; sha256?: string; known?: string } = installBin(
-    source,
-    DLSSNR_RUNTIME,
-    DLSSNR_DIR,
-  );
-  if (r.ok) {
-    const sr = installBin(source, DLSSNR_SR, DLSSNR_DIR);
-    if (sr.ok) r.copied.push(...sr.copied);
-    try {
-      r.sha256 = sha256File(path.join(DLSSNR_DIR, DLSSNR_RUNTIME));
-      r.known = r.sha256 === DLSSNR_DL.dllSha256 ? DLSSNR_DL.label : undefined;
-    } catch {
-      /* hash is informational */
-    }
-  }
-  return r;
-});
-
 // One-click: download the pinned rhi-repo zip into a temp dir (progress to the renderer as
 // 'dlssnr-progress'), extract with bsdtar, verify the DLL hash, copy it into engine/dlssnr. A
 // mismatch aborts before the copy, so a replaced release asset can never install anything.
@@ -682,22 +658,10 @@ ipcMain.handle('dlssnr-open-download', () => {
   return true;
 });
 
-ipcMain.handle('dlssnr-choose', async () => {
-  const r = await dialog.showOpenDialog(win!, {
-    title: 'Select nvngx_dlssnr.dll (or a .zip containing it)',
-    properties: ['openFile'],
-    filters: [
-      { name: 'DLSS 5 runtime', extensions: ['dll', 'zip'] },
-      { name: 'All files', extensions: ['*'] },
-    ],
-  });
-  return r.canceled ? null : r.filePaths[0] || null;
-});
-
 // "AnimeJaNai HD", Restore's second model: the author's 2x ONNX (CC BY-NC-SA 4.0, so never bundled: package.json's
 // filter drops engine/restore). One click downloads the pinned release archive, checks its SHA256, extracts the one
-// model with Windows' bsdtar and checks the model's SHA256 before the copy; a picked .onnx installs under the same
-// name and the UI says when it is not the verified file. The host gets it as --restore-model.
+// model with Windows' bsdtar and checks the model's SHA256 before the copy; the UI says when the installed file is not
+// the verified one. The host gets it as --restore-model.
 const AJ_DIR = path.join(ENGINE, 'restore');
 const AJ_FILE = '2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx';
 const AJ_DL = {
@@ -725,18 +689,6 @@ ipcMain.handle('aj-ready', () => {
   }
   const known = sha256 ? sha256 === AJ_DL.onnxSha256 : undefined;
   return { ready, known, sha256, file: AJ_FILE, mb: Math.round(AJ_DL.archiveBytes / 1048576) };
-});
-
-ipcMain.handle('aj-install', (_e, source: string) => {
-  try {
-    if (!/\.onnx$/i.test(source)) return { ok: false, error: 'not an .onnx file, nothing installed' };
-    fs.mkdirSync(AJ_DIR, { recursive: true });
-    fs.copyFileSync(source, ajPath());
-    const sha256 = sha256File(ajPath());
-    return { ok: true, sha256, known: sha256 === AJ_DL.onnxSha256 };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
 });
 
 ipcMain.handle('aj-download', async () => {
@@ -793,18 +745,6 @@ ipcMain.handle('aj-open', (_e, which: string) => {
   return true;
 });
 
-ipcMain.handle('aj-choose', async () => {
-  const r = await dialog.showOpenDialog(win!, {
-    title: 'Select the AnimeJaNai model (.onnx)',
-    properties: ['openFile'],
-    filters: [
-      { name: 'ONNX model', extensions: ['onnx'] },
-      { name: 'All files', extensions: ['*'] },
-    ],
-  });
-  return r.canceled ? null : r.filePaths[0] || null;
-});
-
 // --- Live mode: the real-time pipeline host (engine/live/smv-live.exe) -----------------------------
 // The exe captures the target window via Windows.Graphics.Capture and presents it enhanced into a
 // click-through topmost overlay. Backend today: DLSS Frame Generation at (gen+1)x (its own copy of
@@ -853,9 +793,8 @@ let liveProc: ChildProcess | null = null;
 let liveStopping = false;
 let liveRestartPending = false; // renderer asked to relaunch the session with new settings
 // Resident host: every server-backend session runs `smv-live.exe --resident`,
-// which keeps the process alive after the session with what the session loaded: the TensorRT
-// engines (about 300 MB of VRAM for RIFE, the next session of that model starts in well under
-// a second instead of 2.5 s). Sessions then start and stop over the
+// which keeps the process alive after the session with what the session loaded (the kernel
+// module, so the next session of that model starts faster). Sessions then start and stop over the
 // exe's stdin ("start<TAB>args", "stop", "quit"); the exe prints "live session ended: exit N,
 // host resident" where a non-resident run exited. The host is freed (quit) when a model other
 // than the one it holds is selected in the panel or when DLSS-G starts, when a file render starts, when the app quits, and
@@ -876,6 +815,7 @@ let liveModel = 'dlssg'; // mirrored from the renderer's Live settings (lv-opts)
 // and countdown paths spawn with whatever the panel currently shows
 let liveLabel = ''; // user-facing effective-model name for the exe's loading message/HUD
 let liveNote = ''; // substitution note (e.g. Smooth Motion live runs GMFSS), same destination
+let liveHudNote = ''; // the HUD's opening note in the GUI language (the exe shows it as is)
 let liveDlssMode = 'dlaa'; // the DLSS mode (dlssScaleArg): the working size's share of the presented size
 // (every backend; below DLAA, DLSS 4.5 runs on the echo route's frames)
 let liveFit = 'monitor'; // 'monitor' = whole-screen capture 1:1 (every model incl. dlssg; the default),
@@ -1035,6 +975,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   // backend id read as the wrong model when live substitutes, e.g. Smooth Motion -> GMFSS)
   if (liveLabel) args.push('--label', liveLabel);
   if (liveNote) args.push('--note', liveNote);
+  if (liveHudNote) args.push('--hud-note', liveHudNote);
   // RIFE/GMFSS resample adaptively to the fps target inherited from the Speed selectors. No --gen: with only a
   // target the exe derives the slot count per pair from the measured source rate (ceil(target/source)+1,
   // VRAM-clamped), so high targets are not capped by a fixed 16-slot ceiling; DLSS 4.5 takes the whole multiple
@@ -1229,6 +1170,7 @@ ipcMain.on(
       model: string;
       label?: string;
       note?: string;
+      hudnote?: string;
       dlssmode?: string; // the DLSS mode (dlssScaleArg)
       fit: string;
       target?: number;
@@ -1259,6 +1201,7 @@ ipcMain.on(
     liveModel = opts.model;
     liveLabel = opts.label ?? '';
     liveNote = opts.note ?? '';
+    liveHudNote = opts.hudnote ?? '';
     liveDlssMode = opts.dlssmode ?? 'dlaa';
     liveFit = opts.fit;
     if (opts.target !== undefined) liveTarget = opts.target;
@@ -1458,86 +1401,113 @@ ipcMain.handle('fruc-choose', async () => {
   return r.canceled ? null : r.filePaths[0] || null;
 });
 
-// --- Dolby Vision export tool: readiness + install (mirrors the RTX flow) -------------------------
+// --- Dolby Vision + HDR10+ export tools: readiness + one-click install -----------------------------
 // DV Profile 8.1 export layers a Dolby Vision RPU on top of the HDR10 render, then tags the MP4 with a
 // dvvC box the engine writes itself (see hdr10_meta.inject_dv_config) - so the bundled ffmpeg is enough
-// to mux DV and NO GPAC/MP4Box is needed. The one non-bundled piece is dovi_tool (open source, but
-// Dolby-adjacent enough that the user fetches it deliberately, like the NVIDIA DLLs); this app copies
-// dovi_tool.exe into engine/dvtools. "Ready" = dovi_tool present.
+// to mux DV and NO GPAC/MP4Box is needed. HDR10+ export embeds ST 2094-40 dynamic metadata into the
+// HDR10 render; the engine collects the per-frame stats itself and hdr10plus_tool injects the SEI (see
+// _hp_export). The two non-bundled pieces are quietvoid's MIT tools: one click downloads the pinned
+// Windows x64 release zip, checks its SHA256 (the GitHub API digest) before anything is extracted,
+// extracts the exe with Windows' bsdtar and copies it into engine/dvtools / engine/hptools. "Ready" =
+// the exe present. Bump version, url, page, hash and size together.
+type PinnedZip = { version: string; url: string; page: string; zipSha256: string; zipBytes: number };
 const DV_DIR = path.join(ENGINE, 'dvtools');
 const DOVI_BIN = 'dovi_tool.exe';
-// The general releases page (newest at the top) so the user always grabs the latest build; the UI
-// names the exact Windows asset to pick.
-const DOVI_URL = 'https://github.com/quietvoid/dovi_tool/releases/';
+const DOVI_DL: PinnedZip = {
+  version: '2.3.4',
+  url: 'https://github.com/quietvoid/dovi_tool/releases/download/2.3.4/dovi_tool-2.3.4-x86_64-pc-windows-msvc.zip',
+  page: 'https://github.com/quietvoid/dovi_tool/releases/tag/2.3.4',
+  zipSha256: '0d9733d311dfe49f9dca0c350f7e6d978182673d333c6f07f7365daf9e6c81eb',
+  zipBytes: 1346827,
+};
+const HP_DIR = path.join(ENGINE, 'hptools');
+const HP_BIN = 'hdr10plus_tool.exe';
+const HP_DL: PinnedZip = {
+  version: '1.7.2',
+  url: 'https://github.com/quietvoid/hdr10plus_tool/releases/download/1.7.2/hdr10plus_tool-1.7.2-x86_64-pc-windows-msvc.zip',
+  page: 'https://github.com/quietvoid/hdr10plus_tool/releases/tag/1.7.2',
+  zipSha256: '82b2d560073941b14c6511a431f429e33e134e5caefb60d7e8f6f6e6da8e16ba',
+  zipBytes: 948827,
+};
 
-// Recursive case-insensitive search for a file by name under root (dovi_tool.exe can sit in a nested
-// folder inside its release zip).
+// Recursive case-insensitive search for a file by name under root (a release zip can nest its payload).
 const findDvBin = (root: string, name: string): string | null => findFilesNamed(root, [name])[0] || null;
 
-// Copy a single tool file out of a chosen source (its release .zip, a folder, or the file directly)
-// into an engine subdir. Shared by the Dolby Vision (dovi_tool), HDR10+ (hdr10plus_tool) and DLSS 5
-// runtime installers.
-const installBin = (source: string, binName: string, destDir: string): InstallResult =>
-  installFiles(source, [binName], destDir, { what: 'the selection', where: binName + ' into ' + destDir });
+// One-click install of a pinned release zip: download into a temp dir (progress to the renderer as
+// `channel`), check the zip's SHA256 before anything is extracted (a replaced asset installs nothing),
+// extract it with bsdtar and copy `bin` into destDir. The temp dir is removed again.
+async function installPinnedZip(dl: PinnedZip, bin: string, destDir: string, channel: string): Promise<InstallResult> {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'smv-tool-'));
+  const zip = path.join(tmp, 'tool.zip');
+  const progress = (received: number, total: number, stage: string) => {
+    try {
+      if (win && !win.webContents.isDestroyed()) win.webContents.send(channel, { received, total, stage });
+    } catch {
+      /* window gone */
+    }
+  };
+  try {
+    const res = await fetch(dl.url, { headers: { 'user-agent': 'SmoothMyVideo' } });
+    if (!res.ok || !res.body) return { ok: false, error: `download failed: HTTP ${res.status}`, copied: [] };
+    const total = parseInt(res.headers.get('content-length') || '0', 10) || dl.zipBytes;
+    let received = 0;
+    const src = Readable.fromWeb(res.body as never);
+    src.on('data', (chunk: Buffer) => {
+      received += chunk.length;
+      progress(received, total, 'download');
+    });
+    await pipeline(src, fs.createWriteStream(zip));
+    progress(received, total, 'verify');
+    const zh = sha256File(zip);
+    if (zh !== dl.zipSha256)
+      return { ok: false, error: `checksum mismatch (${zh.slice(0, 12)}...), nothing installed`, copied: [] };
+    execFileSync(SYS_TAR, ['-xf', zip, '-C', tmp]);
+    const found = findDvBin(tmp, bin);
+    if (!found) return { ok: false, error: bin + ' not in the downloaded zip, nothing installed', copied: [] };
+    fs.mkdirSync(destDir, { recursive: true });
+    const dest = path.join(destDir, bin);
+    try {
+      if (fileExists(dest)) fs.chmodSync(dest, 0o666);
+    } catch {
+      /* best effort */
+    }
+    fs.copyFileSync(found, dest);
+    return { ok: true, copied: [bin] };
+  } catch (e) {
+    return { ok: false, error: String(e), copied: [] };
+  } finally {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    } catch {
+      /* temp cleanup best effort */
+    }
+  }
+}
+const toolMb = (dl: PinnedZip) => (dl.zipBytes / 1048576).toFixed(1);
 
 ipcMain.handle('dv-ready', () => {
   const dovi = fileExists(path.join(DV_DIR, DOVI_BIN));
-  return { dovi, ready: dovi, dir: DV_DIR };
+  return { dovi, ready: dovi, dir: DV_DIR, ver: DOVI_DL.version, mb: toolMb(DOVI_DL) };
 });
 
 ipcMain.handle('dv-open-download', () => {
-  shell.openExternal(DOVI_URL);
+  shell.openExternal(DOVI_DL.page);
   return true;
 });
 
-ipcMain.handle('dv-install', (_e, source: string) => installBin(source, DOVI_BIN, DV_DIR));
-
-// Picker: the UI only ever talks about the release .zip, so the default filter is zip-only; a bare
-// dovi_tool.exe is still accepted SILENTLY via the "All files" fallback (installBin handles both).
-ipcMain.handle('dv-choose', async () => {
-  const r = await dialog.showOpenDialog(win!, {
-    title: 'Select the dovi_tool release .zip',
-    properties: ['openFile'],
-    filters: [
-      { name: 'Zip', extensions: ['zip'] },
-      { name: 'All files', extensions: ['*'] },
-    ],
-  });
-  return r.canceled ? null : r.filePaths[0] || null;
-});
-
-// --- HDR10+ export tool: readiness + install (mirrors the Dolby Vision flow) ----------------------
-// HDR10+ export embeds ST 2094-40 dynamic metadata into the HDR10 render; the engine collects the
-// per-frame stats itself and the user-installed hdr10plus_tool injects the SEI (see _hp_export).
-const HP_DIR = path.join(ENGINE, 'hptools');
-const HP_BIN = 'hdr10plus_tool.exe';
-const HP_URL = 'https://github.com/quietvoid/hdr10plus_tool/releases/';
+ipcMain.handle('dv-download', () => installPinnedZip(DOVI_DL, DOVI_BIN, DV_DIR, 'dv-progress'));
 
 ipcMain.handle('hp-ready', () => {
   const ready = fileExists(path.join(HP_DIR, HP_BIN));
-  return { ready, dir: HP_DIR };
+  return { ready, dir: HP_DIR, ver: HP_DL.version, mb: toolMb(HP_DL) };
 });
 
 ipcMain.handle('hp-open-download', () => {
-  shell.openExternal(HP_URL);
+  shell.openExternal(HP_DL.page);
   return true;
 });
 
-ipcMain.handle('hp-install', (_e, source: string) => installBin(source, HP_BIN, HP_DIR));
-
-// Picker: zip-only default filter like the DV one; a bare hdr10plus_tool.exe still works
-// silently through "All files".
-ipcMain.handle('hp-choose', async () => {
-  const r = await dialog.showOpenDialog(win!, {
-    title: 'Select the hdr10plus_tool release .zip',
-    properties: ['openFile'],
-    filters: [
-      { name: 'Zip', extensions: ['zip'] },
-      { name: 'All files', extensions: ['*'] },
-    ],
-  });
-  return r.canceled ? null : r.filePaths[0] || null;
-});
+ipcMain.handle('hp-download', () => installPinnedZip(HP_DL, HP_BIN, HP_DIR, 'hp-progress'));
 
 let current: ChildProcess | null = null;
 let currentOut: string | null = null; // output path of the in-flight run, for .part cleanup on Cancel

@@ -517,7 +517,7 @@ $('sharpval').oninput = () => { localStorage.setItem('sharpenVal', $('sharpval')
 // emitted frame pays a second model pass.
 // The second row, AnimeJaNai HD: the author's 2x anime model (CC BY-NC-SA 4.0, never bundled), the same pass with
 // another model (the host's --restore-model). The two rows exclude each other; AnimeJaNai runs once installed
-// (aj-ready), else its setup note shows (one click downloads the author's release, checked in main, or a picked .onnx).
+// (aj-ready), else its setup note shows (one click downloads the author's release, checked in main).
 let ajReady: any = { ready:false };
 function ajOn(){ return $('restoreaj').checked && !!ajReady.ready; }
 function restoreOn(){ return $('restore').checked || ajOn(); }
@@ -550,13 +550,6 @@ function syncAj(){
   else $('ajsetup').style.display = 'none';
 }
 i18nRelabel.push(() => syncAj());
-async function doAjInstall(source){
-  $('ajsetup').style.display = 'block';
-  $('ajstatus').textContent = tr('common.installing'); $('ajstatus').style.color = 'var(--sub)';
-  let r: any = {}; try { r = await ipcRenderer.invoke('aj-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  await checkAjReady();
-  if(!r.ok){ $('ajsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('aj.pickAgain'); $('ajsetup').style.display = 'block'; }
-}
 let ajDownloading = false;
 ipcRenderer.on('aj-progress', (_e, p) => {
   if(!ajDownloading) return;
@@ -565,21 +558,20 @@ ipcRenderer.on('aj-progress', (_e, p) => {
 });
 async function doAjDownload(){
   if(ajDownloading) return;
-  ajDownloading = true; $('ajdl').disabled = true; $('ajbrowse').disabled = true;
+  ajDownloading = true; $('ajdl').disabled = true;
   $('ajsetup').style.display = 'block';
   $('ajstatus').textContent = tr('dl.start'); $('ajstatus').style.color = 'var(--sub)';
   let r: any = {}; try { r = await ipcRenderer.invoke('aj-download'); } catch(e){ r = { ok:false, error:String(e) }; }
-  ajDownloading = false; $('ajdl').disabled = false; $('ajbrowse').disabled = false;
+  ajDownloading = false; $('ajdl').disabled = false;
   await checkAjReady();
   if(!r.ok){
     $('ajstatus').textContent = tr('dl.failed'); $('ajstatus').style.color = '#e85c5c';
     $('ajsteps').innerHTML = '✗ ' + (r.error || tr('dl.failedShort')) + '<br>'
-      + tr('aj.dlRetry', { link: ajLink('page', tr('aj.repoLink')), file: ajReady.file || '' });
+      + tr('dl.retry');
     $('ajsetup').style.display = 'block';
   }
 }
 $('ajdl').onclick = doAjDownload;
-$('ajbrowse').onclick = async () => { const p = await ipcRenderer.invoke('aj-choose'); if(p) doAjInstall(p); };
 // one Restore model at a time: ticking a row unticks the other
 $('restore').addEventListener('change', () => { if($('restore').checked && $('restoreaj').checked){ $('restoreaj').checked = false; syncAj(); } });
 $('restoreaj').addEventListener('change', () => { if($('restoreaj').checked) $('restore').checked = false; syncAj(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} });
@@ -873,21 +865,9 @@ async function checkDlssnrReady(){
   // (otherwise the fit hint stays stale after the tick)
   try{ lvModelUi(); lvSendOpts(); }catch{}
 }
-function dlssnrInstallNote(r){   // one line about what got installed (known build or not)
-  return r.known ? tr('nr.installedBuild', { build: r.known }) : tr('nr.unverified', { sha: String(r.sha256 || '').slice(0, 12) });
-}
 // the DLSS 5 runtime's download page as a link (main opens it): its text is the language's, its action the code's
 function rhiLink(){ return '<a href="#" onclick="ipcRenderer.invoke(\'dlssnr-open-download\');return false;">' + tr('nr.rhiLink') + '</a>'; }
 i18nRelabel.push(() => syncDlssnr());
-async function doDlssnrInstall(source){
-  $('dlssnrsetup').style.display = 'block';
-  $('dlssnrstatus').textContent = tr('common.installing'); $('dlssnrstatus').style.color = 'var(--sub)';
-  let r: any = {}; try { r = await ipcRenderer.invoke('dlssnr-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('dlssnrsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('nr.pickAgain');
-  await checkDlssnrReady();
-  if(!r.ok) $('dlssnrsetup').style.display = 'block';   // keep an install error visible
-  else if(!r.known){ $('dlssnrsteps').innerHTML += '<br>' + dlssnrInstallNote(r); $('dlssnrsetup').style.display = 'block'; }
-}
 // One-click download (main does fetch + checksum + extract + copy); progress lands in the status line.
 let dlssnrDownloading = false;
 ipcRenderer.on('dlssnr-progress', (_e, p) => {
@@ -897,20 +877,19 @@ ipcRenderer.on('dlssnr-progress', (_e, p) => {
 });
 async function doDlssnrDownload(){
   if(dlssnrDownloading) return;
-  dlssnrDownloading = true; $('dlssnrdl').disabled = true; $('dlssnrbrowse').disabled = true;
+  dlssnrDownloading = true; $('dlssnrdl').disabled = true;
   $('dlssnrsetup').style.display = 'block';
   $('dlssnrstatus').textContent = tr('dl.start'); $('dlssnrstatus').style.color = 'var(--sub)';
   let r: any = {}; try { r = await ipcRenderer.invoke('dlssnr-download'); } catch(e){ r = { ok:false, error:String(e) }; }
-  dlssnrDownloading = false; $('dlssnrdl').disabled = false; $('dlssnrbrowse').disabled = false;
+  dlssnrDownloading = false; $('dlssnrdl').disabled = false;
   await checkDlssnrReady();
   if(!r.ok){
     $('dlssnrstatus').textContent = tr('dl.failed'); $('dlssnrstatus').style.color = '#e85c5c';
-    $('dlssnrsteps').innerHTML = '✗ ' + (r.error || tr('dl.failedShort')) + '<br>' + tr('nr.dlRetry', { link: rhiLink() });
+    $('dlssnrsteps').innerHTML = '✗ ' + (r.error || tr('dl.failedShort')) + '<br>' + tr('dl.retry');
     $('dlssnrsetup').style.display = 'block';
   }
 }
 $('dlssnrdl').onclick = doDlssnrDownload;
-$('dlssnrbrowse').onclick = async () => { const p = await ipcRenderer.invoke('dlssnr-choose'); if(p) doDlssnrInstall(p); };
 if(localStorage.getItem('dlssnrOn') === '1') $('dlssnr').checked = true;   // default OFF
 $('dlssnr').onchange = () => { localStorage.setItem('dlssnrOn', $('dlssnr').checked ? '1' : '0'); syncDlssnr(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} };
 for(const [id, key] of [['nrstructure', 'nrStructure'], ['nrtone', 'nrTone']]){
@@ -1116,15 +1095,29 @@ function liveVsrOn(){ return !!(rtxReady.vsr && $('rtxvsr').checked); }
 // srcHdr gate here: live has no loaded file, the source is whatever window gets captured.
 function liveHdrOn(){ return !!(rtxReady.hdr && $('rtxhdr').checked); }
 // The exe's loading note / HUD names what is actually ticked: the model, then the live effects it applies,
-// e.g. "GMFSS + DLSS 5" or "DLSS 5 + Sharpen".
-function liveLoadLabel(mi){
+// e.g. "GMFSS + AnimeJaNai HD + DLSS 5 + RTX VSR" or "DLSS 4.5 + Sharpen"; Restore by its picked row's name, the
+// upscaler that takes the live resize when ticked; sharpen = Sharpen's word (English for the exe's log, the GUI
+// language's for the HUD)
+function liveLoadParts(mi, sharpen: string){
   const parts = mi.effectsOnly ? [] : [mi.name];
-  if(restoreOn()) parts.push('Restore');
+  if(restoreOn()) parts.push(ajOn() ? 'AnimeJaNai HD' : 'Real-ESRGAN');
   if(nrOn()) parts.push('DLSS 5');
-  if($('sharpen').checked && (parseFloat($('sharpval').value) || 0) > 0) parts.push('Sharpen');
+  const up = liveVsrOn() ? 'RTX VSR' : fsrUpOn() ? 'AMD FSR 4.1' : a4kUpOn() ? 'Anime4K' : '';
+  if(up) parts.push(up);
+  if($('sharpen').checked && (parseFloat($('sharpval').value) || 0) > 0) parts.push(sharpen);
   if(liveHdrOn()) parts.push('RTX HDR');
+  return parts;
+}
+function liveLoadLabel(mi){
+  const parts = liveLoadParts(mi, 'Sharpen');
   return parts.length ? parts.join(' + ') : 'passthrough (nothing ticked)';
 }
+// the HUD's opening note in the GUI language, shown by the exe as is until the first fps reading
+function liveHudNote(mi){
+  const parts = liveLoadParts(mi, tr('sharpen.k'));
+  return tr('lv.hud.loading', { what: parts.length ? parts.join(' + ') : tr('lv.hud.passthrough') });
+}
+i18nRelabel.push(() => { try{ lvSendOpts(); }catch{} });
 function lvSendOpts(){
   const mi = liveModelInfo();
   const hp = hdrColorPayload();
@@ -1134,6 +1127,7 @@ function lvSendOpts(){
     // from the captured window's measured rate.
     model: mi.model,
     label: liveLoadLabel(mi),   // what is ticked, for the exe's loading note + substitution note
+    hudnote: liveHudNote(mi),
     note: mi.note,    // message/HUD (the raw backend id reads as the wrong model)
     dlssmode: dlssMode(),   // the working size's share of the presented size
     fit: $('lvfit').value,
@@ -1403,7 +1397,7 @@ if(!input){
 // the RPU it injects is muxed by the bundled ffmpeg and the DV signaling box is written by the engine
 // itself (hdr10_meta.inject_dv_config), so no GPAC/MP4Box is involved. The setup box appears when the
 // toggle is on and dovi_tool is missing, and collapses to nothing once it is installed (dv-ready).
-let dvReady = { dovi:false, ready:false };
+let dvReady: any = { dovi:false, ready:false };
 // Two Dolby Vision boxes that exclude each other: Profile 8.1 on the HDR10 video, 8.4 with the video written as HLG
 // (HDR10+ rides on HDR10 only, so 8.4 and HDR10+ exclude each other too)
 function dvOn(){ return $('dvexport').checked || $('dv84export').checked; }
@@ -1433,22 +1427,39 @@ async function checkDvReady(){
     $('dvsteps').innerHTML = line + '<br>' + tr('dv.installed');
   } else {
     $('dvstatus').textContent = tr('dlss.notReady'); $('dvstatus').style.color = '#e85c5c';
-    // Name the exact Windows download, since the release page also lists macOS/Linux/ARM builds.
-    $('dvsteps').innerHTML = line + '<br>' + tr('dv.howto');
+    $('dvsteps').innerHTML = line + '<br>' + tr('dv.howto', { ver: dvReady.ver || '', mb: dvReady.mb || '1.3',
+                                                              link: toolPageLink('dv-open-download') });
   }
-  $('dvbtns').style.display = dvReady.ready ? 'none' : '';   // hide Get / Choose once dovi_tool is installed
+  $('dvbtns').style.display = dvReady.ready ? 'none' : '';   // hide the Download button once dovi_tool is installed
   $('dvsetup').style.display = dvReady.ready ? 'none' : 'block';
 }
-async function doDvInstall(source){
-  $('dvsetup').style.display = 'block';
-  $('dvstatus').textContent = tr('common.installing'); $('dvstatus').style.color = 'var(--sub)';
-  let r: any = {}; try { r = await ipcRenderer.invoke('dv-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('dvsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('dv.pickAgain');
-  await checkDvReady();
-  if(!r.ok) $('dvsetup').style.display = 'block';   // keep an install error visible
+// a tool's pinned release page as a link (main opens it): its text is the language's, its action the code's
+function toolPageLink(channel){ return '<a href="#" onclick="ipcRenderer.invoke(\'' + channel + '\');return false;">' + tr('aj.repoLink') + '</a>'; }
+// One-click download of a pinned tool release (main does fetch + checksum + extract + copy): progress lands in the
+// status line, a failure keeps the note open with the retry line; `ready` re-reads the row afterwards.
+function toolDownloader(id, channel, ready){
+  let busy = false;
+  ipcRenderer.on(channel.replace('download', 'progress'), (_e, p) => {
+    if(!busy) return;
+    const mb = x => (x / 1048576).toFixed(1);
+    $(id + 'status').textContent = p.stage === 'verify' ? tr('dl.verify') : tr('dl.progress', { got: mb(p.received), total: mb(p.total) });
+  });
+  return async () => {
+    if(busy) return;
+    busy = true; $(id + 'dl').disabled = true;
+    $(id + 'setup').style.display = 'block';
+    $(id + 'status').textContent = tr('dl.start'); $(id + 'status').style.color = 'var(--sub)';
+    let r: any = {}; try { r = await ipcRenderer.invoke(channel); } catch(e){ r = { ok:false, error:String(e) }; }
+    busy = false; $(id + 'dl').disabled = false;
+    await ready();
+    if(!r.ok){
+      $(id + 'status').textContent = tr('dl.failed'); $(id + 'status').style.color = '#e85c5c';
+      $(id + 'steps').innerHTML = '✗ ' + (r.error || tr('dl.failedShort')) + '<br>' + tr('dl.retry');
+      $(id + 'setup').style.display = 'block';
+    }
+  };
 }
-$('dvget').onclick = () => ipcRenderer.invoke('dv-open-download');
-$('dvbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('dv-choose'); if(p) doDvInstall(p); };   // selecting auto-installs
+$('dvdl').onclick = toolDownloader('dv', 'dv-download', () => checkDvReady());
 if(localStorage.getItem('dvOn') === '1') $('dvexport').checked = true;   // default OFF
 if(localStorage.getItem('dv84On') === '1' && !$('dvexport').checked) $('dv84export').checked = true;   // default OFF
 $('dvexport').onchange = () => {
@@ -1473,7 +1484,7 @@ i18nRelabel.push(syncDv);
 // engine/hptools; the engine collects the per-frame brightness stats itself and the tool injects
 // the ST 2094-40 SEI (see _hp_export in the engine). The setup box appears when the toggle is on
 // and the tool is missing, and collapses once it is installed (hp-ready).
-let hpReady = { ready:false };
+let hpReady: any = { ready:false };
 function syncHp(){
   if($('hpexport').checked) checkHpReady();
   else $('hpsetup').style.display = 'none';
@@ -1488,22 +1499,13 @@ async function checkHpReady(){
     $('hpsteps').innerHTML = line + '<br>' + tr('hp.installed');
   } else {
     $('hpstatus').textContent = tr('dlss.notReady'); $('hpstatus').style.color = '#e85c5c';
-    // Name the exact Windows download, since the release page also lists macOS/Linux/ARM builds.
-    $('hpsteps').innerHTML = line + '<br>' + tr('hp.howto');
+    $('hpsteps').innerHTML = line + '<br>' + tr('hp.howto', { ver: hpReady.ver || '', mb: hpReady.mb || '0.9',
+                                                              link: toolPageLink('hp-open-download') });
   }
-  $('hpbtns').style.display = hpReady.ready ? 'none' : '';   // hide Get / Choose once the tool is installed
+  $('hpbtns').style.display = hpReady.ready ? 'none' : '';   // hide the Download button once the tool is installed
   $('hpsetup').style.display = hpReady.ready ? 'none' : 'block';
 }
-async function doHpInstall(source){
-  $('hpsetup').style.display = 'block';
-  $('hpstatus').textContent = tr('common.installing'); $('hpstatus').style.color = 'var(--sub)';
-  let r: any = {}; try { r = await ipcRenderer.invoke('hp-install', source); } catch(e){ r = { ok:false, error:String(e) }; }
-  if(!r.ok) $('hpsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('hp.pickAgain');
-  await checkHpReady();
-  if(!r.ok) $('hpsetup').style.display = 'block';   // keep an install error visible
-}
-$('hpget').onclick = () => ipcRenderer.invoke('hp-open-download');
-$('hpbrowsezip').onclick = async () => { const p = await ipcRenderer.invoke('hp-choose'); if(p) doHpInstall(p); };   // selecting auto-installs
+$('hpdl').onclick = toolDownloader('hp', 'hp-download', () => checkHpReady());
 if(localStorage.getItem('hpOn') === '1' && !$('dv84export').checked) $('hpexport').checked = true;   // default OFF
 $('hpexport').onchange = () => {
   localStorage.setItem('hpOn', $('hpexport').checked ? '1' : '0');
@@ -2092,10 +2094,8 @@ function syncInterp(){
 }
 syncInterp();
 
-// Drop anything onto the window: a video loads for processing, a tool archive installs a library.
-// Routing by filename since all three installers take a .zip: an hdr10plus_tool release goes to the
-// HDR10+ installer, a dovi_tool release (its name, or a bare .exe) to the Dolby Vision installer;
-// any other .zip is treated as the RTX Video SDK. All drops are ignored while a job is running.
+// Drop anything onto the window: a video loads for processing, a .zip installs the RTX Video SDK (the
+// other tools download in one click). All drops are ignored while a job is running.
 document.addEventListener('dragover', (e) => { e.preventDefault(); if($('cancel').disabled) document.body.classList.add('drag'); });
 document.addEventListener('dragleave', (e) => { if(e.relatedTarget === null) document.body.classList.remove('drag'); });
 document.addEventListener('drop', (e) => {
@@ -2104,22 +2104,7 @@ document.addEventListener('drop', (e) => {
   const files = [...(e.dataTransfer.files || [])];
   if(!files.length) return;
   const nm = files[0].name, p = webUtils.getPathForFile(files[0]);
-  if(/nvngx_dlssnr\.dll$/i.test(nm) || (/\.zip$/i.test(nm) && /dlss[ _-]?5|dlssnr/i.test(nm))){   // the DLSS 5 runtime: install into engine/dlssnr
-    showWorkspace();
-    $('dlssnr').checked = true; localStorage.setItem('dlssnrOn', '1'); syncDlssnr();   // engage the row so its setup box is coherent
-    doDlssnrInstall(p);
-  } else if(/hdr10plus_tool/i.test(nm)){       // the hdr10plus_tool download: install into engine/hptools
-    showWorkspace();
-    $('hpexport').checked = true; localStorage.setItem('hpOn', '1');   // engage the HDR10+ panel so its setup box is coherent
-    if($('dv84export').checked){ $('dv84export').checked = false; localStorage.setItem('dv84On', '0'); syncDv(); }   // HDR10+ excludes 8.4's HLG video
-    $('hpsetup').style.display = 'block';       // reveal install feedback
-    doHpInstall(p);
-  } else if(/dovi_tool/i.test(nm) || /\.exe$/i.test(nm)){   // the dovi_tool download: install into engine/dvtools
-    showWorkspace();
-    if(!dvOn()){ $('dvexport').checked = true; localStorage.setItem('dvOn', '1'); }   // engage the DV panel so its setup box is coherent
-    $('dvsetup').style.display = 'block';       // reveal install feedback
-    doDvInstall(p);
-  } else if(/\.zip$/i.test(nm)){               // otherwise a .zip is the RTX Video SDK: install the RTX runtime
+  if(/\.zip$/i.test(nm)){                      // a .zip is the RTX Video SDK: install the RTX runtime
     showWorkspace();   // RTX install feedback lives in #workspace, so reveal it even before a video is loaded
     if($('rtxsetup').style.display === 'none') $('rtxsetup').style.display = 'block';   // reveal install feedback
     doInstall(p);

@@ -89,14 +89,15 @@ to 10000.
 upload, and it is free. Built and tested on an RTX 5090 Laptop.
 
 **Optional extras.** A few features need a file the app can't include. Tick the feature and the app shows a short
-setup box; you can also drop the file onto the window (not for Smooth Motion).
+setup box. Most install with one click. NVIDIA's two SDKs sit behind a free NVIDIA developer login, so you download
+those yourself.
 
 | Feature | What to get | How |
 |---|---|---|
-| RTX Video Super Resolution, RTX HDR | NVIDIA's RTX Video SDK | **Get from NVIDIA**, then **Choose .zip&hellip;** (or drop the zip). Without it, upscaling uses a standard resize and RTX HDR is off. |
-| NVIDIA DLSS 5 | The Neural Rendering runtime (`nvngx_dlssnr.dll`) | One-click **Download the DLSS 5 runtime** ([details](#nvidia-dlss-5)), or drop the file. |
-| NVIDIA Smooth Motion | `NvOFFRUC.dll` from NVIDIA's Optical Flow SDK | **Get from NVIDIA**, then **Choose .zip&hellip;**. GMFSS is used until it is installed. |
-| Dolby Vision, HDR10+ | The open-source [dovi_tool](https://github.com/quietvoid/dovi_tool) / [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool) | **Get &hellip;**, then **Choose .zip&hellip;** (or drop the file). |
+| RTX Video Super Resolution, RTX HDR | NVIDIA's RTX Video SDK | **Get from NVIDIA** (free developer login), then **Choose .zip&hellip;** (or drop the zip). Without it, upscaling uses a standard resize and RTX HDR is off. |
+| NVIDIA DLSS 5 | The Neural Rendering runtime (`nvngx_dlssnr.dll`) | One click: **Download the DLSS 5 runtime** ([details](#nvidia-dlss-5)). |
+| NVIDIA Smooth Motion | `NvOFFRUC.dll` from NVIDIA's Optical Flow SDK | **Get from NVIDIA** (free developer login), then **Choose .zip&hellip;**. GMFSS is used until it is installed. |
+| Dolby Vision, HDR10+ | The open-source [dovi_tool](https://github.com/quietvoid/dovi_tool) / [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool) | One click: **Download dovi_tool** / **Download hdr10plus_tool** (a fixed release, checked and installed). |
 
 **From source:** `npm start`. See **[DEVELOPMENT.md](DEVELOPMENT.md)** for the full setup.
 
@@ -254,8 +255,7 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
   for a stronger effect at that many times the time and video memory.
 * **The download:** NVIDIA's Neural Rendering file (`nvngx_dlssnr.dll`) isn't included, and NVIDIA offers no download for it.
   The one-click **Download the DLSS 5 runtime** button fetches the community RTX 40 + 50 build
-  ([rhi-repo](https://github.com/RankFTW/rhi-repo/releases) on GitHub), checks it and installs it. Already have the
-  file? Drop it on the window.
+  ([rhi-repo](https://github.com/RankFTW/rhi-repo/releases) on GitHub), checks it and installs it.
 * **In Live:** on every captured frame of SDR content.
 
 </details>
@@ -272,7 +272,7 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
 ## Under the hood
 
 The UI is Electron + TypeScript. Every render and Live session runs in one native host (`smv-live.exe`, C++ on
-TensorRT for RTX and CUDA), driven by a TypeScript orchestrator that handles probing, encoding (ffmpeg) and resume;
+CUDA, every model on its own GPU kernels), driven by a TypeScript orchestrator that handles probing, encoding (ffmpeg) and resume;
 DLSS 4.5 file renders run NVIDIA's frame generation in a small separate helper. No Python ships. The default model on
 GPUs without DLSS 4.5, **GMFSS_Fortuna**, is a "union" interpolator: GMFlow optical flow, an IFNet/RIFE refiner, plus MetricNet, FeatureNet,
 FusionNet and softsplat warping.

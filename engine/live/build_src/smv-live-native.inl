@@ -1,10 +1,9 @@
 // part of smv-live.cpp (unity include, see the file map there); not a standalone translation unit
 // ---------------------------------------------------------------- the native model host
 //
-// Every live model runs INSIDE this process: the TensorRT-RTX C++ runtime for the engine
-// models (the host looks its engines up by name and builds missing ones from engine\onnx), the
-// driver's Optical Flow API for nvof, the shipped bridge DLL for fruc. No python process is
-// part of a live session. The python live server this host replaced (engine/live_server.py, in
+// Every live model runs INSIDE this process: the host's own CUDA kernels for every net (NVRTC-compiled,
+// their cubins cached by source hash), the driver's Optical Flow API for nvof, the shipped bridge DLL for
+// fruc. No python process is part of a live session. The python live server this host replaced (engine/live_server.py, in
 // the git history) is where most of the math below was ported from; comments that name its
 // classes and functions record that origin.
 //
@@ -14,14 +13,12 @@
 // 0x80000000 end marker).
 //
 // Everything CUDA happens on ONE compute thread and ONE non-default stream:
-//   * a TRT-RTX execution context per engine (contexts are not documented thread safe);
-//   * the default stream is never used (TRT inserts a device sync there, SMV's permanent-hang
-//     class, see NvInferRuntime.h :5039 and live_server.py's stream comment);
-//   * the engine's own kWHOLE_GRAPH_CAPTURE is the ONLY graph capture (never capture a TRT
-//     enqueue from outside, per the CUDA study 01 section B1).
+//   * the default stream is never used (it synchronises with every other stream, SMV's
+//     permanent-hang class, see live_server.py's stream comment);
+//   * the kernel chains replay as CUDA graphs captured on that stream (chainGraphRun).
 //
-// Delay-loaded DLLs: tensorrt_rtx_1_7.dll, cudart64_13.dll and nvrtc64_130_0.dll ship in
-// engine\gpu_runtime (staged from the dev python's wheels by scripts/stage-gpu-runtime.ts).
+// cudart64_13.dll and nvrtc64_130_0.dll ship in engine\gpu_runtime (staged from the dev
+// python's wheels by scripts/stage-gpu-runtime.ts).
 
 // cuda_runtime.h pulls the internal crt\ headers the runtime WHEEL does not ship; the host
 // side only ever needs the API declarations, so cuda_runtime_api.h plus the one-macro shim in
@@ -30,9 +27,6 @@
 #include <cuda.h>
 #include <cuda_d3d11_interop.h>
 #include <nvrtc.h>
-#include <NvInferRuntime.h>
-#include <NvInfer.h>           // the builder: engines built from engine\onnx
-#include <NvOnnxParser.h>      // tensorrt_onnxparser_rtx_1_7.dll, delay-loaded like the runtime
 #include "nvOpticalFlowCuda.h" // the nvof model: MIT interface headers in build_src\nvofa
 
 // ---- the two device kernels, JIT-compiled by NVRTC at first native start ------------------
@@ -619,8 +613,8 @@ __global__ void k_packOutHdrV(const float* __restrict__ tmp, int dw, int h, unsi
 }
 
 // ---- live Restore ---------------------------------------------------------------------------
-// live_server._Fit._restore: the model (the bundled Real-ESRGAN on the host's kernels below, a --restore-model graph
-// as a TensorRT engine; x = the model frame as fp16 NCHW [1,3,h,w], y = its s x reconstruction) then realesr.fit to the
+// live_server._Fit._restore: the model (the bundled Real-ESRGAN or AnimeJaNai's form on the host's kernels below; x =
+// the model frame as fp16 NCHW [1,3,h,w], y = its s x reconstruction) then realesr.fit to the
 // restore target: `out.clamp(0,1)` first, then the Lanczos pair at every ratio (the pair above with the clamp folded in
 // and the output's own dtype read at the taps).
 __device__ __forceinline__ unsigned short f2h(float f)
@@ -727,11 +721,11 @@ __global__ void k_restFoldHSub(const void* __restrict__ sub, int half, const voi
     tmp[2 * plane + o] = a2;
 }
 
-// Real-ESRGAN animevideov3 on the host's own kernels (restNat, no TensorRT engine): k_restConv0 (3 -> 64 + PReLU),
+// Real-ESRGAN animevideov3 on the host's own kernels (restNat): k_restConv0 (3 -> 64 + PReLU),
 // 16 x k_restConvMid (64 -> 64 + PReLU), k_restConvLast (64 -> 48 sub-pixel planes = k_restFoldHSub's input); between
 // them channels-last fp16 (64 halves = 128 B a pixel). The 64 -> 64 layers are implicit GEMMs on the tensor cores
 // (mma.sync m16n8k16, M = pixels, N = 64 outputs, K = 9 taps x 64 channels) with fp16 ACCUMULATORS (the GeForce rate:
-// 1.4x TensorRT-RTX's fp32-accumulate convs, the image within one 8-bit code of its engine); the last layer keeps fp32
+// 1.4x fp32-accumulate convs, the image within one 8-bit code of fp32 sums); the last layer keeps fp32
 // accumulators. A block = 4 warps on an 8 x 32 pixel tile, its 10 x 34 halo in shared memory (16-byte chunks XOR-
 // swizzled by pixel & 7, so each ldmatrix reads 8 bank groups), two blocks an SM so one block's loads and stores
 // overlap the other's math; the weights come from global memory already in fragment order (one uint4 a lane = the four
@@ -741,9 +735,43 @@ __global__ void k_restFoldHSub(const void* __restrict__ sub, int half, const voi
 #define RN_HW (RN_TW + 2)
 #define RN_HH (RN_TH + 2)
 
+// the tensor-core and async-copy instructions: sm_80+ (RTX 30 and newer) as written; sm_75 (RTX 20) has no cp.async
+// and no k16 mma: the product runs as its two k8 halves (a0 a1 with b0, then a2 a3 with b1), the trailing `//` turns
+// the call site's k16 operand list into a PTX comment, rnCp16 copies in place and commit / wait are empty
+#if __CUDA_ARCH__ >= 800
+#define SMV_MMA_F32 "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+#define SMV_MMA_F16 "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+#define SMV_CP_COMMIT "cp.async.commit_group;\n"
+#define SMV_CP_WAIT0 "cp.async.wait_group 0;\n"
+#else
+#define SMV_MMA_F32                                                                                                    \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%8}, {%0,%1,%2,%3};\n"                 \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%6,%7}, {%9}, {%0,%1,%2,%3}; // "
+// fp16 sums: both halves on fp32 accumulators, rounded to fp16 once (as the sm_80 instruction rounds)
+#define SMV_MMA_F16                                                                                                    \
+    "{\n.reg .f16 smvh<4>;\n.reg .f32 smvf<4>;\nmov.b32 {smvh0, smvh1}, %0;\nmov.b32 {smvh2, smvh3}, %1;\n"           \
+    "cvt.f32.f16 smvf0, smvh0;\ncvt.f32.f16 smvf1, smvh1;\ncvt.f32.f16 smvf2, smvh2;\ncvt.f32.f16 smvf3, smvh3;\n"    \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {smvf0,smvf1,smvf2,smvf3}, {%2,%3}, {%6}, "                     \
+    "{smvf0,smvf1,smvf2,smvf3};\n"                                                                                     \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {smvf0,smvf1,smvf2,smvf3}, {%4,%5}, {%7}, "                     \
+    "{smvf0,smvf1,smvf2,smvf3};\n"                                                                                     \
+    "cvt.rn.f16.f32 smvh0, smvf0;\ncvt.rn.f16.f32 smvh1, smvf1;\ncvt.rn.f16.f32 smvh2, smvf2;\n"                      \
+    "cvt.rn.f16.f32 smvh3, smvf3;\nmov.b32 %0, {smvh0, smvh1};\nmov.b32 %1, {smvh2, smvh3};\n} // "
+#define SMV_CP_COMMIT ""
+#define SMV_CP_WAIT0 ""
+#endif
+
 __device__ __forceinline__ void rnCp16(unsigned dst, const void* src, int bytes)
 {
+#if __CUDA_ARCH__ >= 800
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(bytes));
+#else
+    uint4 v = make_uint4(0u, 0u, 0u, 0u);
+    if (bytes)
+        v = *reinterpret_cast<const uint4*>(src);
+    asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" ::"r"(dst), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+#endif
 }
 
 __device__ __forceinline__ void rnLdm4(unsigned addr, unsigned* r)
@@ -773,7 +801,7 @@ __device__ __forceinline__ void rnHalo(unsigned halo, const unsigned short* __re
         const unsigned short* src = in ? x + ((size_t)gy * W + gx) * 64 + k * 8 : x;
         rnCp16(halo + ((p * 8 + (k ^ (p & 7))) << 4), src, in ? 16 : 0);
     }
-    asm volatile("cp.async.commit_group;\n");
+    asm volatile(SMV_CP_COMMIT);
 }
 
 // the first layer: three fp16 planes (k_restIn's) -> channels-last + PReLU; one pixel a thread, fp32 sums of 27 terms;
@@ -844,7 +872,7 @@ __global__ void __launch_bounds__(128, 2) k_restConvMid(const unsigned short* __
         for (int mi = 0; mi < 4; ++mi)
             acc[mi][nj][0] = acc[mi][nj][1] = b2;
     }
-    asm volatile("cp.async.wait_group 0;\n");
+    asm volatile(SMV_CP_WAIT0);
     __syncthreads();
     const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
 #pragma unroll 1
@@ -875,7 +903,7 @@ __global__ void __launch_bounds__(128, 2) k_restConvMid(const unsigned short* __
                     const unsigned b0 = (q & 1) ? bc[q >> 1].z : bc[q >> 1].x;
                     const unsigned b1 = (q & 1) ? bc[q >> 1].w : bc[q >> 1].y;
                     asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                        SMV_MMA_F16 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                         : "+r"(acc[mi][q][0]), "+r"(acc[mi][q][1])
                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
                 }
@@ -936,7 +964,7 @@ __global__ void __launch_bounds__(128, 2) k_restConvLast(const unsigned short* _
             acc[mi][nj][1] = acc[mi][nj][3] = b1;
         }
     }
-    asm volatile("cp.async.wait_group 0;\n");
+    asm volatile(SMV_CP_WAIT0);
     __syncthreads();
     const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
 #pragma unroll 1
@@ -967,7 +995,7 @@ __global__ void __launch_bounds__(128, 2) k_restConvLast(const unsigned short* _
                     const unsigned b0 = (q & 1) ? bc[q >> 1].z : bc[q >> 1].x;
                     const unsigned b1 = (q & 1) ? bc[q >> 1].w : bc[q >> 1].y;
                     float* d = acc[mi][q];
-                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                    asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, "
                                  "{%8,%9}, {%0,%1,%2,%3};\n"
                                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
@@ -1099,7 +1127,7 @@ __device__ __forceinline__ void ajGemm64(unsigned smem, const uint4* __restrict_
                 const unsigned b0 = (q & 1) ? b[q >> 1].z : b[q >> 1].x;
                 const unsigned b1 = (q & 1) ? b[q >> 1].w : b[q >> 1].y;
                 float* d = acc[mi][q];
-                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, "
                              "{%8,%9}, {%0,%1,%2,%3};\n"
                              : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                              : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
@@ -1118,7 +1146,7 @@ __global__ void __launch_bounds__(128) k_ajAtt(const unsigned short* __restrict_
     const unsigned smem = (unsigned)__cvta_generic_to_shared(sm);
     const size_t p0 = (size_t)blockIdx.x * 128;
     ajTile(smem, c3, p0, (size_t)n);
-    asm volatile("cp.async.commit_group;\n");
+    asm volatile(SMV_CP_COMMIT);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
     float acc[2][8][4];
 #pragma unroll
@@ -1132,7 +1160,7 @@ __global__ void __launch_bounds__(128) k_ajAtt(const unsigned short* __restrict_
             acc[mi][q][1] = acc[mi][q][3] = b1;
         }
     }
-    asm volatile("cp.async.wait_group 0;\n");
+    asm volatile(SMV_CP_WAIT0);
     __syncthreads();
     ajGemm64(smem, wf, acc);
 #pragma unroll
@@ -1184,8 +1212,8 @@ __global__ void __launch_bounds__(128) k_ajCat(const unsigned short* __restrict_
     for (int s = 0; s < 4; s++)
     {
         ajTile(smem, src[s], p0, (size_t)n);
-        asm volatile("cp.async.commit_group;\n");
-        asm volatile("cp.async.wait_group 0;\n");
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
         __syncthreads();
         ajGemm64(smem, wf + (size_t)s * 4 * 4 * 32, acc);
         __syncthreads();
@@ -1669,7 +1697,7 @@ __device__ __forceinline__ void gmStore(void* __restrict__ dst, int half, size_t
     if (half) ((unsigned short*)dst)[o] = f2h(v); else ((float*)dst)[o] = v;
 }
 // fusionnet's input LeakyRelu (slope lr, lr < 0 = none) on a stored fp16 value: the fp32 product of two fp16 values is
-// exact, so its one rounding = an fp16 multiply, TensorRT's own result bit for bit
+// exact, so its one rounding = an fp16 multiply's result bit for bit
 __device__ __forceinline__ unsigned short gmLrelu16(unsigned short h, float lr)
 {
     const float f = h2f(h);
@@ -3985,7 +4013,8 @@ extern "C" __global__ void k_nvofCompose(const float* __restrict__ i0, const flo
 
 // ---- native DRBA glue -----------------------------------------------------------------------
 // The two pieces DRBA adds around the IFNet, ported from the python reference:
-//   rife_backend.RIFE.calc_flow's tail: block0's flow (4 planes, 0->0.5 | 1->0.5) splatted by
+//   rife_backend.RIFE.calc_flow's tail: block0's flow (4 planes, 0->0.5 | 1->0.5, sampled from
+//     block0's 1/16 planes, drbaFlowAt) splatted by
 //     itself with softsplat 'avg', negated, holes (splatted ones < 0.999) filled with
 //     max(H, W), times 2 = flow05 * 2 | flow15 * 2.
 //   rife.drm.calc_drm_rife(tt, flow10, flow12, linear=True) for ONE side (each tween needs one):
@@ -4030,17 +4059,42 @@ __device__ __forceinline__ void drbaSplat4(unsigned long long* p, size_t plane, 
     }
 }
 
-// flow (4 planes) -> acc (6 int64 planes, zeroed by the caller): half j = planes 3j, 3j+1 (x, y) + 3j+2 (weight)
-extern "C" __global__ void k_drbaFlowSplat(const float* __restrict__ flow, int w, int h,
+// block0's flow at pixel (x, y) of the w x h motion frame: block0 hands over its 4 planes at w / 16 x h / 16 (lo),
+// and calc_flow's F.interpolate(size = (h, w), bilinear, align_corners = False) * 16 runs here, where its one reader
+// samples it
+__device__ __forceinline__ void drbaFlowAt(const float* __restrict__ lo, int w, int h, int x, int y, float* f)
+{
+    const int w16 = w >> 4, h16 = h >> 4;
+    float sy = 0.0625f * ((float)y + 0.5f) - 0.5f, sx = 0.0625f * ((float)x + 0.5f) - 0.5f;
+    sy = sy < 0.0f ? 0.0f : sy;
+    sx = sx < 0.0f ? 0.0f : sx;
+    const int y0 = (int)sy, x0 = (int)sx;
+    const int y1 = y0 + (y0 < h16 - 1 ? 1 : 0), x1 = x0 + (x0 < w16 - 1 ? 1 : 0);
+    const float ly1 = sy - (float)y0, ly0 = 1.0f - ly1, lx1 = sx - (float)x0, lx0 = 1.0f - lx1;
+    const size_t po = (size_t)w16 * h16;
+    for (int c = 0; c < 4; c++)
+    {
+        const float* p = lo + c * po;
+        const float v = ly0 * (lx0 * p[y0 * w16 + x0] + lx1 * p[y0 * w16 + x1]) +
+                        ly1 * (lx0 * p[y1 * w16 + x0] + lx1 * p[y1 * w16 + x1]);
+        f[c] = v * 16.0f;
+    }
+}
+
+// block0's flow (its 4 planes at w / 16 x h / 16, drbaFlowAt) -> acc (6 int64 planes, zeroed by the caller): half j
+// = planes 3j, 3j+1 (x, y) + 3j+2 (weight)
+extern "C" __global__ void k_drbaFlowSplat(const float* __restrict__ lo, int w, int h,
                                            long long* __restrict__ acc)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
-    const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
+    const size_t plane = (size_t)w * h;
+    float f[4];
+    drbaFlowAt(lo, w, h, x, y, f);
     for (int j = 0; j < 2; j++)
     {
-        const float v[2] = {flow[(2 * j) * plane + o], flow[(2 * j + 1) * plane + o]};
+        const float v[2] = {f[2 * j], f[2 * j + 1]};
         drbaSplat4((unsigned long long*)(acc + (size_t)(3 * j) * plane), plane, 2, v,
                    x, y, v[0], v[1], 1.0f, w, h);
     }
@@ -4116,7 +4170,7 @@ extern "C" __global__ void k_drbaDrmNorm(const long long* __restrict__ acc, cons
 // q[b, p, :] with f bilinearly sampled at window sample k of pixel p (GridSample's rules: align_corners, zero padding).
 // The window position is GMFlow's normalize_coords of the pixel's grid point plus the sample's offset, computed here:
 // pixel p = y W + x, sample k = (dy + r) side + (dx + r) with side x side = K, g = ((x + dx) - c) / c, c = (W - 1) / 2
-// (and y alike), with normalize_coords' IEEE divide (bit for bit TensorRT-RTX's run of that graph at every quarter
+// (and y alike), with normalize_coords' IEEE divide (bit for bit PyTorch's fp32 run of that graph at every quarter
 // grid). The window's samples share one fractional offset, so their taps lie on a small integer grid: one warp a
 // pixel takes the grid's dot products once (float4 lanes over the 128 channels, kept in shared memory, one cell of
 // margin for rounding), then each sample combines its 4 corners with its own weights. Never builds the
@@ -4207,7 +4261,7 @@ extern "C" __global__ void k_localCorr(const unsigned short* __restrict__ qf, fl
 #define AT_SP 68
 __device__ __forceinline__ void attnMma(float* d, const unsigned* a, unsigned b0, unsigned b1)
 {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+    asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
@@ -4356,8 +4410,8 @@ extern "C" __global__ void __launch_bounds__(128) k_attn2(const unsigned* __rest
 
 // GMFSS fusion's tail on the host: fusionnet ends at its 64 -> 256 conv (`out`, the pre-shuffle tensor at the half,
 // fp16 [256][hh][hw]); pixel_shuffle(2) (CRD: channel 4c + 2 sy + sx = phase (sy, sx) of channel c) and conv_last
-// (64 -> 3, 3x3, zero padding at the full size) run here in one pass, fp32 sums over the graph's own fp16 weights (the
-// engine's outputs w_last [3][64][3][3] / b_last [3]), the frame written fp32 planar [3][2 hh][2 hw]. One thread = 2 x 2
+// (64 -> 3, 3x3, zero padding at the full size) run here in one pass, fp32 sums over fusionnet.pkl's conv_last in fp16
+// (w_last [3][64][3][3] / b_last [3]), the frame written fp32 planar [3][2 hh][2 hw]. One thread = 2 x 2
 // half pixels = a 4 x 4 full block; per input channel its 6 x 6 full window (full row 2 y0 - 1 + r = half row
 // y0 - 1 + (r + 1) / 2 of phase plane sy = r even, columns alike) comes from 24 aligned pairs (half2), two a phase
 // plane a row; a full row or column outside the frame reads 0 (zero padding; hh and hw are multiples of 4, the setup's
@@ -4459,7 +4513,7 @@ __global__ void k_fuTail(const unsigned short* __restrict__ pre, const unsigned 
                 make_float4(acc[o][i][0], acc[o][i][1], acc[o][i][2], acc[o][i][3]);
 }
 
-// k_fuTail on a channels-last `out` (lkBuild asks TensorRT-RTX for HWC8 / HWC16: plain NHWC fp16 [hh][hw][256] at 256
+// k_fuTail on a channels-last `out` (plain NHWC fp16 [hh][hw][256] at 256
 // channels, half pixel (y, x)'s channel 4c + 2 sy + sx = phase (sy, sx) of channel c): the same windows, sums and sum
 // order, so the same frame bit for bit. Read straight from `out`, a warp's neighbours sit 1 KB apart, so the block's
 // tile (its 16 x 32 half pixels, the 3 x 3 windows' border and one more column left so the pairs stay aligned: 18 x 36)
@@ -4657,8 +4711,8 @@ static int lzTaps(long long in, long long out)
 }
 
 // ---- dynamically resolved entry points ----------------------------------------------------
-// nvrtc ships no import library in the runtime wheel, so it is resolved by hand; cudart, the
-// driver API and TRT-RTX are delay-loaded imports whose DLLs are pre-loaded by full path in
+// nvrtc ships no import library in the runtime wheel, so it is resolved by hand; cudart and the
+// driver API are lazily loaded imports whose DLLs are pre-loaded by full path in
 // nativeLoadDlls() (which is why no process-wide DLL search order is touched).
 typedef int (*PFN_nvrtcCreateProgram)(void**, const char*, const char*, int, const char* const*, const char* const*);
 typedef int (*PFN_nvrtcCompileProgram)(void*, int, const char* const*);
@@ -4684,7 +4738,7 @@ struct NvrtcApi
     }
 };
 
-static std::wstring g_nativeRuntimeDir; // engine\gpu_runtime: the CUDA 13 + TensorRT-RTX DLLs
+static std::wstring g_nativeRuntimeDir; // engine\gpu_runtime: the CUDA 13 DLLs
 static std::wstring g_nativeEngineDir;  // ...\engine itself, the parent of the folders above
 
 // ---- the RTX Video SDK CUDA bridge (engine\rtxvideo\rtxvideo_cuda.dll) --------------------
@@ -4964,8 +5018,6 @@ struct ThdrAcc
     }
 };
 
-static bool g_onnxParserOk = false; // tensorrt_onnxparser_rtx_1_7.dll loaded (nativeLoadDlls)
-
 static bool nativeLoadDlls(const std::wstring& scriptPath)
 {
     static int state = 0; // 0 untried, 1 ok, -1 failed
@@ -5000,7 +5052,6 @@ static bool nativeLoadDlls(const std::wstring& scriptPath)
     g_nativeRuntimeDir = engineDir + L"\\gpu_runtime";
     LOG("native: runtime folder %s\n", wideToUtf8(g_nativeRuntimeDir).c_str());
     const std::wstring cudaBin = g_nativeRuntimeDir;
-    const std::wstring trtBin = g_nativeRuntimeDir;
     // nvrtc opens nvrtc-builtins64_<ver>.dll BY NAME at compile time, and a module loaded with
     // LOAD_WITH_ALTERED_SEARCH_PATH does not make its own directory searchable for that later
     // call (measured: "nvrtc: error: failed to open nvrtc-builtins64_133.dll"), so the builtins
@@ -5025,7 +5076,6 @@ static bool nativeLoadDlls(const std::wstring& scriptPath)
         {cudaBin.c_str(), L"cudart64_13.dll", true},
         {cudaBin.c_str(), builtins.empty() ? L"" : builtins.c_str(), false},
         {cudaBin.c_str(), L"nvrtc64_130_0.dll", true},
-        {trtBin.c_str(), L"tensorrt_rtx_1_7.dll", true},
     };
     for (auto& wdl : want)
     {
@@ -5040,29 +5090,12 @@ static bool nativeLoadDlls(const std::wstring& scriptPath)
             return false;
         }
     }
-    // the ONNX parser: optional, without it a cold size cannot build
-    g_onnxParserOk = LoadLibraryExW((trtBin + L"\\tensorrt_onnxparser_rtx_1_7.dll").c_str(), nullptr,
-                                    LOAD_WITH_ALTERED_SEARCH_PATH) != nullptr;
-    if (!g_onnxParserOk)
-        LOG("native: ONNX parser not loadable, a window size without warm engines cannot start\n");
     // AddDllDirectory for anything either DLL loads later by name; harmless when the process
     // never opts into the safe search order.
     AddDllDirectory(cudaBin.c_str());
-    AddDllDirectory(trtBin.c_str());
     state = 1;
     return true;
 }
-
-class NativeTrtLogger : public nvinfer1::ILogger
-{
-  public:
-    void log(Severity s, const char* msg) noexcept override
-    {
-        if (s <= Severity::kWARNING)
-            LOG("[trt-native] %s\n", msg);
-    }
-};
-static NativeTrtLogger g_nativeTrtLogger;
 
 #define NCHK(call, what)                                                                                               \
     do                                                                                                                 \
@@ -5075,16 +5108,12 @@ static NativeTrtLogger g_nativeTrtLogger;
         }                                                                                                              \
     } while (0)
 
-// the GMFSS engine slots: feat_ext, gmflow_bidir's first half (A), metricnet, the GMFSS IFNet, fusionnet, gmflow_bidir's
-// second half (B), gmflow's backbone (one frame), then A's front (`_m`: up to the scale-0 global matching); the host
-// computes the matching and its propagation between `_m` and A (k_attn2) and gmflow's local correlation between A and B,
-// and hands `_m` and A each frame's backbone maps once
-constexpr int kGmN = 8;
-// A's outputs in this order (trt_runtime.gmflow_split + gmflow_exit_fp16's contract): qf (the transformer's fp16
-// stream as it is: q and feat = rows 0..1, f = rows 2..3) feeds k_localCorr (which computes the window positions
-// itself) and B, flow0 goes to B; B takes both beside the correlation
+// gmflow A's outputs (the transformer on the host's kernels, nativeGaRun): qf (the transformer's fp16 stream as it is:
+// q and feat = rows 0..1, f = rows 2..3) feeds k_localCorr (which computes the window positions itself) and B, flow0
+// goes to B; B takes both beside the correlation
 constexpr int kGmAn = 2;
-static const char* const kGmA[kGmAn] = {"qf", "flow0"};
+// the quarter-scale local correlation's window (gmflow's radius 4: 9 x 9 taps), k_localCorr's K and gmflow B's
+constexpr int kGmCorrK = 81;
 
 // the midpoint tree of Smooth Motion and AMD FSR 4 (one bridge instance a level, the bridges hold 16): its deepest
 // level (x512) and its node grid, kFrGrid steps a pair. The ring's memory fit prices the level the slots reach, so a
@@ -5097,10 +5126,36 @@ constexpr int kFrPipeLearn = 8;
 // RIFE's feature planes: the encode's output and the IFNet / block0 inputs f0 / f1 (RIFE 4.25: 4)
 constexpr int kRifeFeatC = 4;
 
+// a kernel chain on the host's kernels replayed as CUDA graphs (chainGraphRun): up to kN executable graphs, each
+// captured on the first call with its key (the chain's buffers, then its w and h), replaced oldest first; mode 0 =
+// direct launches, 1 = graphs, 2 = every capture thrown away (the fallback's trigger); logged = the graph line written;
+// captures past kMaxCaptures (a chain whose buffers keep changing) = direct launches
+struct ChainGraphs
+{
+    static constexpr int kN = 16, kKey = 10, kMaxCaptures = 4 * kN;
+    struct Entry
+    {
+        const void* key[kKey] = {};
+        cudaGraphExec_t exec = nullptr;
+    } e[kN];
+    int next = 0, mode = 0, captures = 0;
+    bool logged = false;
+};
+
+// one launch of GMFSS's fusionnet on the host's kernels (fuPlan's step at the same index): its kernel (kFuKern), the
+// channels, the PReLU slope before the conv (0 = none), the offsets of its fragment-order weights and fp32 bias in the
+// weight block (fuNatLoad)
+struct FuOp
+{
+    int k = 0, cin = 0, cout = 0;
+    float slope = 0.0f;
+    size_t wOff = 0, bOff = 0;
+};
+
 struct NativeRife
 {
     // ---- handoff facts, straight off live_server.py's --native-handoff lines
-    std::string ifnetPath, jitPath;
+    std::string ifnetPath;
     int ph = 0, pw = 0, w = 0, h = 0, cw = 0, ch = 0;
     int dw = 0, dh = 0, x0 = 0, y0 = 0;
     int batchMax = 1;
@@ -5134,14 +5189,14 @@ struct NativeRife
     // fit rect: one resize, not two).
     int uw = 0, uh = 0;
     bool upAa = false; // the first resize shrinks the height (uh < h)
-    // live Restore: the handoff names the bundled Real-ESRGAN (the host's kernels) or builds a
-    // --restore-model TensorRT engine into the shared cache and hands its path over like the
-    // IFNet's; the host runs it on every presented frame before the upscale, then folds the s x
-    // output to the first resize target (_Fit._load_restore's restore_target rule: back to the
-    // model size when RTX VSR follows, else straight to the internal render size or the fit
-    // rect). A mid-run failure drops the pass for the rest of the session with one line.
-    std::string restorePath, rjitPath;
-    bool restore = false; // the handoff named an engine (the session asked for it)
+    // live Restore: the handoff names the bundled Real-ESRGAN or a --restore-model in AnimeJaNai's
+    // SPAN-F3 form, both on the host's kernels; the host runs it on every presented frame before the
+    // upscale, then folds the s x output to the first resize target (_Fit._load_restore's
+    // restore_target rule: back to the model size when RTX VSR follows, else straight to the internal
+    // render size or the fit rect). A mid-run failure drops the pass for the rest of the session with
+    // one line.
+    std::string restorePath;
+    bool restore = false; // the handoff named a Restore model (the session asked for it)
     // no-engine mode: the effects-only route (the
     // app's `echo` backend, no model ticked) runs here too. The handoff answers with the
     // geometry only (`engine=none`, plus the restore engine when asked for): no IFNet, no
@@ -5150,24 +5205,16 @@ struct NativeRife
     // from `NATIVE-PATH cache=` since no jit path names it.
     bool noEngine = false;
     std::string cachePath;
-    // GMFSS: the handoff answers
-    // `engine=gmfss` with the six engines of the set (feat_ext at the padded size, the fused
-    // bidir GMFlow's two halves, metricnet, the GMFSS IFNet and fusionnet at the half) and their
-    // jit caches; this host loads, warms and keeps the set resident (one model set at a time)
-    // and runs the chain itself (nativeGmfssPair / nativeGmfssTween with the glue kernels
-    // above), so gmfss is a native backend like rife.
+    // GMFSS: the handoff answers `engine=gmfss` with the half size and the kernel cache; this host runs the whole chain
+    // on its own kernels (feat_ext, metricnet, the GMFSS IFNet, fusionnet, gmflow's backbone, A, `_m` and B,
+    // nativeGmfssPair / nativeGmfssTween with the glue kernels above): no engine, so gmfss is a native backend like rife.
     bool gmfss = false;
     int hh = 0, hw = 0; // the half frame (the fusion grid)
-    std::string gmPath[kGmN], gmJit[kGmN];
-    nvinfer1::ICudaEngine* engGm[kGmN] = {};
-    nvinfer1::IRuntimeConfig* cfgGm[kGmN] = {};
-    nvinfer1::IExecutionContext* ctxGm[kGmN] = {};
-    // the contexts' one shared activation block, gmCtxMemB bytes: GMFSS's eight + Restore's (nativeGmShareMemory) or
-    // the IFNet's, the encode's, Restore's and DRBA's block0 (nativeModelShareMemory); ctxUserMem = nativeMakeContext
-    // creates the next contexts with user-managed memory
+    // the one shared activation block, gmCtxMemB bytes: feat_ext's, metricnet's, the GMFSS IFNet's, fusionnet's and
+    // gmflow's scratch + Restore's (nativeGmShareMemory) or
+    // the IFNet's, the encode's, Restore's and DRBA block0's scratch (nativeModelShareMemory)
     void* dGmCtxMem = nullptr;
     int64_t gmCtxMemB = 0;
-    bool ctxUserMem = false;
     // between gmflow's halves: A's outputs (kGmA order), the correlation k_localCorr writes for B, and the shapes it
     // runs at (the quarter grid gmH x gmW, gmK window samples a pixel)
     void* dGmA[kGmAn] = {};
@@ -5217,18 +5264,78 @@ struct NativeRife
     bool gmTail = false;    // the cut fusionnet (out = the pre-shuffle tensor): k_fuTail does shuffle + conv_last
     bool gmTailHwc = false; // gmTail with out channels-last (the engine's HWC8 / HWC16): k_fuTailNhwc reads it
     bool gmFeatHwc = false; // feat_ext's levels and fusionnet's b / c / d channels-last: the feature splats' layout
-    void* dGmWl = nullptr;  // the cut fusionnet's w_last (3, 64, 3, 3) fp16: conv_last's weight
-    void* dGmBl = nullptr;  // its b_last (3) fp16: conv_last's bias
-    void* dGmLr = nullptr;  // its lr_bcd (3) fp32 (a graph without b / c / d's LeakyRelus): their slopes
-    float gmLr[3] = {-1.0f, -1.0f, -1.0f}; // those slopes, the feature splats' stores apply them (-1 = the engine does)
-    float* dGmFa = nullptr;                // fusionnet a (9, half): I1t, merged (ifnet writes it), I2t
-    void* dGmFb = nullptr;                 // fusionnet b (2 * gmC[0], half) in the engine's dtype
-    void* dGmFc = nullptr;                 // fusionnet c (2 * gmC[1], quarter), the same dtype
-    void* dGmFd = nullptr;                 // fusionnet d (2 * gmC[2], eighth), the same dtype
-    float* dGmT = nullptr;                 // the timestep, one device float (ifnet's 1x1x1x1 input)
-    void* dGmOut = nullptr; // the full graph's fusionnet output (3, ph, pw) in the engine's dtype (gmTail: null, the
-                            // tail writes dGmF)
-    float* dGmF = nullptr;  // that output clamped to fp32: what storeSlot consumes
+    // feat_ext on the host's kernels (nativeFnModule): its module and six kernels, the weight block (fnOff = per conv
+    // 1..5 its fragment-order weights, then its fp32 bias), the six LeakyRelu slopes, the scratch (in the shared
+    // activation block, else dFnOwn)
+    CUmodule fnMod = nullptr;
+    CUfunction fFn[6] = {};
+    void* dFnW = nullptr;
+    size_t fnOff[10] = {};
+    float fnSlope[6] = {};
+    void* dFnScr = nullptr;
+    void* dFnOwn = nullptr;
+    // metricnet on the host's kernels (nativeMnModule): its module and five kernels, the weight block (mnOff, see
+    // mnNatLoad), the four PReLU slopes, the scratch (in the shared activation block, else dMnOwn)
+    CUmodule mnMod = nullptr;
+    CUfunction fMn[5] = {};
+    void* dMnW = nullptr;
+    size_t mnOff[10] = {};
+    float mnSlope[4] = {};
+    void* dMnOwn = nullptr;
+    // the GMFSS IFNet on the host's kernels (nativeGiModule): its module and kernels, the weight block (giOff, see
+    // giNatLoad), the scratch (in the shared activation block, else dGiOwn)
+    CUmodule giMod = nullptr;
+    CUfunction fGi[11] = {};
+    void* dGiW = nullptr;
+    std::vector<size_t> giOff;
+    void* dGiOwn = nullptr;
+    ChainGraphs giGraphs; // its launches as CUDA graphs (nativeGiRun; SMV_GI_GRAPH)
+    // fusionnet on the host's kernels (nativeFuModule): its module and kernels, one FuOp a launch, the weight block, the
+    // activations (fuArena; in the shared activation block, else dFuOwn)
+    CUmodule fuMod = nullptr;
+    CUfunction fFu[8] = {};
+    void* dFuW = nullptr;
+    std::vector<FuOp> fuOps;
+    void* dFuOwn = nullptr;
+    ChainGraphs fuGraphs; // its launches as CUDA graphs (nativeFuRun; SMV_FU_GRAPH)
+    // gmflow's second half B on the host's kernels (nativeGbModule): its module and kernels, the weight block (gbOff, see
+    // gbNatLoad), the activations (gbArena; in the shared activation block, else dGbOwn)
+    CUmodule gbMod = nullptr;
+    CUfunction fGb[6] = {};
+    void* dGbW = nullptr;
+    size_t gbOff[6] = {};
+    void* dGbOwn = nullptr;
+    ChainGraphs gbGraphs; // its launches as CUDA graphs (nativeGbRun; SMV_GB_GRAPH)
+    // gmflow's backbone on the host's kernels (nativeBbModule): its module and kernels, the weight block (bbOff, see
+    // bbNatLoad), the activations (bbArena; in the shared activation block, else dBbOwn)
+    CUmodule bbMod = nullptr;
+    CUfunction fBb[16] = {};
+    void* dBbW = nullptr;
+    size_t bbOff[22] = {};
+    void* dBbOwn = nullptr;
+    ChainGraphs bbGraphs; // its launches as CUDA graphs (nativeBbRun; SMV_BB_GRAPH)
+    // gmflow's transformer at both scales on the host's kernels (nativeGaModule): its module and kernels, the weight
+    // block (gaOff, see gaNatLoad), the window position tables (dGaPos: A's posY | posX, then `_m`'s), the activations
+    // (gaArena; in the shared activation block, else dGaOwn)
+    CUmodule gaMod = nullptr;
+    CUfunction fGa[5] = {};
+    void* dGaW = nullptr;
+    size_t gaOff[46] = {};
+    float* dGaPos = nullptr;
+    void* dGaOwn = nullptr;
+    ChainGraphs gaGraphs[2]; // `_m` (0) and A (1) as CUDA graphs (nativeGaRun; SMV_GA_GRAPH)
+    void* dGmWl = nullptr;   // conv_last's weight (3, 64, 3, 3) fp16 (fusionnet.pkl, k_fuTailNhwc reads it)
+    void* dGmBl = nullptr;   // its bias (3) fp16
+    float gmLr[3] = {-1.0f, -1.0f,
+                     -1.0f}; // the heads' first PReLU slopes on b / c / d: the feature splats' stores apply them
+    float* dGmFa = nullptr;  // fusionnet a (9, half): I1t, merged (ifnet writes it), I2t
+    void* dGmFb = nullptr;   // fusionnet b (2 * gmC[0], half), channels-last fp16
+    void* dGmFc = nullptr;   // fusionnet c (2 * gmC[1], quarter), the same
+    void* dGmFd = nullptr;   // fusionnet d (2 * gmC[2], eighth), the same
+    float* dGmT = nullptr;   // the timestep, one device float (ifnet's 1x1x1x1 input)
+    void* dGmOut = nullptr;  // the full graph's fusionnet output (3, ph, pw) in the engine's dtype (gmTail: null, the
+                             // tail writes dGmF)
+    float* dGmF = nullptr;   // that output clamped to fp32: what storeSlot consumes
     // HDR planes (nativeGmfssPair): the SDR view of one padded frame (hdrToModel, the scratch), the motion view's
     // halves gmflow and metricnet read on a pair outside the SDR range, the range flag (device, pinned host copy);
     // per feature slot: its frame stays inside the SDR range, its features came from the SDR view; the pair's mode
@@ -5455,8 +5562,8 @@ struct NativeRife
     void* dA4kOut = nullptr;  // the three last textures as 12 fp16 planes at a4kW x a4kH
     float* dA4kTmp = nullptr; // the fold's horizontal pass: planar fp32, target width x 2 a4kH
     // RIFE with DRBA timing (rifedrba): the RIFE
-    // handoff plus `NATIVE-PATH block0=` (calc_flow's block0 as its own engine) and `engine=drba
-    // lag=1`. live_server.RifeDrba natively: a four-frame history of padded frames and their
+    // handoff plus `engine=drba lag=1` (calc_flow's block0 runs on the host's kernels,
+    // nativeB0Module). live_server.RifeDrba natively: a four-frame history of padded frames and their
     // encodes, windows centred on a frame id (two kept, chained: a window's left flow is the
     // previous window's right one, reversed), the lag-1 group (every slot shows time (k-2) + f,
     // the real slot is frame k-1), one IFNet enqueue per tween with its own DRM timestep map
@@ -5466,10 +5573,22 @@ struct NativeRife
     // the encodes, block0 and its flows, the windows, the DRM map and the IFNet's x live at the
     // motion frame (M x N = mph x mpw, else the pictures' ph x pw); k_rifeBlend warps the pictures.
     bool drba = false;
-    std::string block0Path, block0Jit;
-    nvinfer1::ICudaEngine* engB0 = nullptr;
-    nvinfer1::IRuntimeConfig* cfgB0 = nullptr;
-    nvinfer1::IExecutionContext* ctxB0 = nullptr;
+    // DRBA's block0 on the host's kernels (nativeB0Module): its module and five kernels, the weight block (b0Off, see
+    // b0NatLoad), the scratch (in the shared activation block, else dB0Own)
+    CUmodule b0Mod = nullptr;
+    CUfunction fB0[5] = {};
+    void* dB0W = nullptr;
+    size_t b0Off[28] = {};
+    void* dB0Own = nullptr;
+    // RIFE's IFNet on the host's kernels (ifnetPath = kIfnNative, nativeIfnModule): its module and kernels, the weight
+    // block (ifnOff, see ifnNatLoad), the scratch (in the shared activation block, else dIfnOwn)
+    bool ifnNat = false;
+    CUmodule ifnMod = nullptr;
+    CUfunction fIfn[12] = {};
+    void* dIfnW = nullptr;
+    std::vector<size_t> ifnOff;
+    void* dIfnOwn = nullptr;
+    ChainGraphs ifnGraphs;        // its launches as CUDA graphs (nativeIfnRun; SMV_IFN_GRAPH)
     uint32_t drFid = 0;           // frames pushed this session; frame id i sits in ring slot i & 3
     float* dDrIBase = nullptr;    // the four ring slots in ONE block, slot i at i * (3, ph, pw): two ring neighbours
                                   // are one (6, ph, pw) frame pair
@@ -5482,8 +5601,6 @@ struct NativeRife
     float* dDrX[2] = {};          // one domain: (6, ph, pw) the frame pair: [0] = [k-1, k-2] (side -1), [1] = [k-2,
                                   // k-1]; the IFNet's x (fp16 in place when xHalf)
     uint16_t* dDrMX[2] = {};      // two domains: the IFNet's x, two neighbouring slots of dDrMBase (not owned)
-    float* dDrB0 = nullptr;       // two domains: (6, M, N) block0's frame pair, the motion frames in fp32, in dDrAcc
-                                  // (nativeDrbaAlloc)
     uint32_t drXFor[2] = {};      // the newest frame id each x was built for (0 = none)
     struct DrWin
     {
@@ -5547,15 +5664,11 @@ struct NativeRife
         float* out;
     };
     std::vector<NvLevel> nvPyr;                 // levels 1.. down to 1 px on the short side
-    bool restHalfIn = true, restHalfOut = true; // the engine's input / output dtypes (read off it)
-    std::string restIn = "x", restOut = "y";    // the engine's input / output names (read off it)
-    int restScale = 4;                          // the model's scale (read off it): Real-ESRGAN 4, AnimeJaNai 2
+    bool restHalfIn = true, restHalfOut = true; // Restore's input / output dtypes (fp16 on the host's kernels)
+    int restScale = 4;                          // the model's scale: Real-ESRGAN 4, AnimeJaNai 2
     bool restSub = false; // the output = 3 s^2 sub-pixel planes at the input size (Real-ESRGAN): k_restFoldHSub
     bool restFailed = false;
     int restTw = 0, restTh = 0; // the fold target (decided once VSR is known)
-    nvinfer1::ICudaEngine* engRest = nullptr;
-    nvinfer1::IRuntimeConfig* cfgRest = nullptr;
-    nvinfer1::IExecutionContext* ctxRest = nullptr;
     // Real-ESRGAN on the host's kernels (restorePath = kRestNative, no engine): dRestA / dRestB = the channels-last fp16
     // ping-pong (64 halves a pixel each; inside the shared activation block when it holds them, else restNatOwn),
     // dRestW = the weights (restNatOff offsets)
@@ -5567,8 +5680,8 @@ struct NativeRife
     // the fold's sub-pixel input (restSub): s, the plane grid w x h, the nearest-base add (Real-ESRGAN) or none
     int restSubS = 4, restSubW = 0, restSubH = 0;
     bool restSubBase = true;
-    void* dRestIn = nullptr;   // the input: NCHW at the source size (srcW x srcH), fp16 (or fp32)
-    void* dRestOut = nullptr;  // the output: NCHW at restScale x, the engine's dtype
+    void* dRestIn = nullptr;   // the input: NCHW at the source size (srcW x srcH), fp16
+    void* dRestOut = nullptr;  // the output: the model's fp16 sub-pixel planes (restSub)
     float* dRestTmp = nullptr; // the fold's horizontal pass, planar fp32 at (4h, the largest scale) x max target width
     float* dRest = nullptr;    // the fold back to the model size (VSR follows), planar fp32 w x h
     float* dRestRem = nullptr; // HDR planes: the source fitted to Restore's target (k_hdrRestOut's remainder)
@@ -5577,14 +5690,9 @@ struct NativeRife
     uint32_t slots = 0, pitch = 0;
     size_t slotBytes = 0;
 
-    // ---- TRT
-    nvinfer1::IRuntime* rt = nullptr;
-    nvinfer1::ICudaEngine* engIf = nullptr;
-    nvinfer1::IRuntimeConfig* cfgIf = nullptr;
-    nvinfer1::IRuntimeCache* jit = nullptr;
-    nvinfer1::IExecutionContext* ctxIf = nullptr;
+    // ---- the models' dtypes
     bool featHalf = false; // IFNet / block0 take f0 / f1 in fp16: the encode (nativeEncodeRun) writes that dtype
-    // the IFNet's x in fp16 (read off the engine)
+    // the IFNet's x in fp16 (the native IFNet takes the fp16 copy of the pair, dXh, or the motion frames)
     bool xHalf = false;
     // the tweens (merged) are fp16 (k_rifeBlend, SMV_TWEEN_FP16=1), else fp32 (k_rifeBlendF): every reader of a
     // tween gets this as its half flag (mergedAt)
@@ -5922,23 +6030,15 @@ static float* nativeXCur(const NativeRife& nr)
 }
 // ---- part 2: handoff, engine load, kernels, buffers, the compute thread -------------------
 
-// What a --resident process keeps between sessions: the TensorRT runtime, the two deserialized
-// engines, the JIT kernel cache and the NVRTC kernel module, plus the last successful
-// handoff's facts so the same window starts again without a new handoff.
-// Everything else in NativeRife (stream, execution contexts, buffers, imports, events) is per
-// session. Sessions are strictly sequential (the previous compute thread is joined before
-// the next early thread starts), so no lock guards this.
+// What a --resident process keeps between sessions: the NVRTC kernel module and the models' dtypes,
+// plus the last successful handoff's facts so the same window starts again without a new handoff.
+// Everything else in NativeRife (stream, buffers, imports, events) is per session. Sessions are
+// strictly sequential (the previous compute thread is joined before the next early thread starts),
+// so no lock guards this.
 struct NativeResident
 {
-    std::string ifnetPath, jitPath, restorePath;
-    nvinfer1::IRuntime* rt = nullptr;
-    nvinfer1::ICudaEngine* engIf = nullptr;
-    nvinfer1::ICudaEngine* engRest = nullptr; // live Restore: kept beside the pair, per path
-    std::string block0Path;                   // native DRBA: kept beside the pair, per path
-    nvinfer1::ICudaEngine* engB0 = nullptr;
-    std::string gmPath[kGmN]; // the GMFSS set, exclusive with the pair
-    nvinfer1::ICudaEngine* engGm[kGmN] = {};
-    nvinfer1::IRuntimeCache* jit = nullptr;
+    std::string ifnetPath;
+    bool ready = false; // a session's model state (the dtypes below) is held for the next one
     CUmodule cuMod = nullptr;
     bool featHalf = false;
     bool xHalf = false, outHalf = false, tHalf = false;
@@ -5958,43 +6058,10 @@ static NativeResident g_res;
 // calling thread must have the device bound.
 static void residentFreeEngines()
 {
-    if (!g_res.rt)
+    if (!g_res.ready)
         return;
-    if (g_res.jit)
-    {
-        delete g_res.jit;
-        g_res.jit = nullptr;
-    }
-    if (g_res.engIf)
-    {
-        delete g_res.engIf;
-        g_res.engIf = nullptr;
-    }
-    if (g_res.engRest)
-    {
-        delete g_res.engRest;
-        g_res.engRest = nullptr;
-    }
-    if (g_res.engB0)
-    {
-        delete g_res.engB0;
-        g_res.engB0 = nullptr;
-    }
-    g_res.block0Path.clear();
-    for (int i = 0; i < kGmN; i++)
-    {
-        if (g_res.engGm[i])
-        {
-            delete g_res.engGm[i];
-            g_res.engGm[i] = nullptr;
-        }
-        g_res.gmPath[i].clear();
-    }
-    delete g_res.rt;
-    g_res.rt = nullptr;
+    g_res.ready = false;
     g_res.ifnetPath.clear();
-    g_res.jitPath.clear();
-    g_res.restorePath.clear();
     LOG("native: resident engines released\n");
 }
 
@@ -6018,7 +6085,7 @@ static bool fileExistsA(const std::string& p)
 }
 
 // the server backends this host runs (PipeServer::nativeRefusal asks here): rife, echo (the
-// effects-only route, the no-engine mode above), gmfss (the five-engine chain), nvof (the NVIDIA
+// effects-only route, the no-engine mode above), gmfss (its chain on the host's kernels), nvof (the NVIDIA
 // Optical Flow model), fruc (Nvidia Smooth Motion), fsrfg (AMD FSR frame generation) and rifedrba
 // (RIFE with DRBA timing). Any other name is refused.
 static bool nativeBackendOk(const std::wstring& backend)
@@ -6026,11 +6093,6 @@ static bool nativeBackendOk(const std::wstring& backend)
     return backend == L"rife" || backend == L"echo" || backend == L"gmfss" || backend == L"nvof" ||
            backend == L"fruc" || backend == L"fsrfg" || backend == L"rifedrba";
 }
-
-// the GMFSS engine set, in handoff order (the NATIVE-PATH keys and the log names)
-static const char* const kGmKey[kGmN] = {"gfeat", "gflow", "gmetric", "gifnet", "gfusion", "gflowb", "gbone", "gflowm"};
-static const char* const kGmName[kGmN] = {"feat_ext",  "gmflow_bidir_a", "metricnet",       "ifnet",
-                                          "fusionnet", "gmflow_bidir_b", "gmflow_backbone", "gmflow_bidir_a_m"};
 
 // the smallest GMFSS pad a side (lkSession): gmflow's quarter-scale windows are the pad / 64 a side and its shifted
 // blocks roll by half a window, so a window needs 2 tokens a side (a 1-token window rolls by 0: an empty slice in the
@@ -6067,16 +6129,9 @@ static void nativeDeriveUpscale(NativeRife& nr)
     }
 }
 
-// ---- warm engine lookup ---------------------------------------------------------------------
-// trt_lookup.py's naming and find_* checks in C++ (trt_lookup.engine_name stays the naming
-// reference of the dev tools, so the two must agree): when a previous session built AND warmed the engines
-// for this window, the lookup answers the handoff as NATIVE-PATH lines plus one LIVE READY line,
-// the format nativeHandoff parses. A miss returns false and nativeHandoff builds the engines.
-struct LookupTags
-{
-    std::string trt, w, r;
-    bool ok = false;
-};
+// ---- the session handoff --------------------------------------------------------------------
+// Every net runs on the host's kernels, so the host answers the handoff itself from the session's
+// arguments: NATIVE-PATH lines plus one LIVE READY line, the format nativeHandoff parses.
 
 static std::string lkEnv(const char* name)
 {
@@ -6090,161 +6145,10 @@ static std::string lkEnv(const char* name)
 // SMV_HANDOFF_DUMP=1: log every handoff line the host produces as `handoff-line ...`
 static const bool g_handoffDump = lkEnv("SMV_HANDOFF_DUMP") == "1";
 
-// md5 of the concatenated file contents, first 10 hex digits (trt_lookup._md5_files)
-static std::string lkMd5Files(const std::vector<std::wstring>& files)
-{
-    HCRYPTPROV prov = 0;
-    HCRYPTHASH h = 0;
-    std::string out;
-    if (!CryptAcquireContextW(&prov, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
-        return out;
-    if (CryptCreateHash(prov, CALG_MD5, 0, 0, &h))
-    {
-        bool ok = true;
-        std::vector<BYTE> buf(1 << 20);
-        for (const auto& f : files)
-        {
-            HANDLE fh = CreateFileW(f.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                    FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-            if (fh == INVALID_HANDLE_VALUE)
-            {
-                ok = false;
-                break;
-            }
-            DWORD got = 0;
-            while (ok && ReadFile(fh, buf.data(), (DWORD)buf.size(), &got, nullptr) && got)
-                ok = CryptHashData(h, buf.data(), got, 0) != FALSE;
-            CloseHandle(fh);
-            if (!ok)
-                break;
-        }
-        BYTE dig[16];
-        DWORD dl = sizeof(dig);
-        if (ok && CryptGetHashParam(h, HP_HASHVAL, dig, &dl, 0))
-        {
-            char hex[33];
-            for (int i = 0; i < 16; i++)
-                sprintf_s(hex + 2 * i, 3, "%02x", dig[i]);
-            out.assign(hex, 10);
-        }
-        CryptDestroyHash(h);
-    }
-    CryptReleaseContext(prov, 0);
-    return out;
-}
-
-// the name tags trt_lookup bakes into every engine: trt<version> (the tensorrt_rtx package
-// version, read from the same dist-info folder python reports), w<md5 of GMFSS train_log/*.pkl>
-// and r<md5 of rife/flownet.pkl>. Hashed once per process (the resident host keeps them).
-static const LookupTags& lkTags(const std::wstring& engDir)
-{
-    static LookupTags t;
-    static std::wstring forDir;
-    if (forDir == engDir)
-        return t;
-    forDir = engDir;
-    t = LookupTags();
-    // the version stage-gpu-runtime.ts copied from the wheel's dist-info name (1.6.1.120)
-    FILE* vf = nullptr;
-    if (!_wfopen_s(&vf, (engDir + L"\\gpu_runtime\\tensorrt_rtx_version.txt").c_str(), L"rb") && vf)
-    {
-        char buf[64]{};
-        const size_t n = fread(buf, 1, sizeof(buf) - 1, vf);
-        fclose(vf);
-        std::string v(buf, n);
-        while (!v.empty() && (v.back() == '\n' || v.back() == '\r' || v.back() == ' '))
-            v.pop_back();
-        for (char& c : v)
-            if (c == '.')
-                c = '_';
-        if (!v.empty())
-            t.trt = "trt" + v;
-    }
-    WIN32_FIND_DATAW fd{};
-    HANDLE hf;
-    std::vector<std::wstring> pkls;
-    const std::wstring tl = engDir + L"\\GMFSS_Fortuna\\train_log";
-    hf = FindFirstFileW((tl + L"\\*.pkl").c_str(), &fd);
-    if (hf != INVALID_HANDLE_VALUE)
-    {
-        do
-        {
-            pkls.push_back(fd.cFileName);
-        } while (FindNextFileW(hf, &fd));
-        FindClose(hf);
-    }
-    // python: sorted(os.listdir(...)), code point order on the names
-    std::sort(pkls.begin(), pkls.end());
-    for (auto& p : pkls)
-        p = tl + L"\\" + p;
-    const std::string w = pkls.empty() ? std::string() : lkMd5Files(pkls);
-    const std::string r = lkMd5Files({engDir + L"\\rife\\flownet.pkl"});
-    t.w = w.empty() ? std::string() : "w" + w;
-    t.r = r.empty() ? std::string() : "r" + r;
-    // a shipped tree carries no weight files (the ONNX hold the weights): the tags
-    // onnx_export.py wrote next to the ONNX ("w <tag>", "r <tag>"); a tag whose
-    // weight file exists is always the hash above, so a dev tree never reads a stale file
-    if (t.w.empty() || t.r.empty())
-    {
-        std::string od = lkEnv("SMV_ONNX_DIR");
-        std::wstring odW = od.empty() ? engDir + L"\\onnx" : std::wstring(od.begin(), od.end());
-        FILE* tf = nullptr;
-        if (!_wfopen_s(&tf, (odW + L"\\weights_tags.txt").c_str(), L"rb") && tf)
-        {
-            char line[128];
-            while (fgets(line, sizeof(line), tf))
-            {
-                std::string s(line);
-                while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
-                    s.pop_back();
-                const size_t sp = s.find(' ');
-                if (sp == std::string::npos)
-                    continue;
-                const std::string k = s.substr(0, sp), v = s.substr(sp + 1);
-                if (k == "w" && t.w.empty())
-                    t.w = v;
-                else if (k == "r" && t.r.empty())
-                    t.r = v;
-            }
-            fclose(tf);
-        }
-    }
-    t.ok = !t.trt.empty() && !t.w.empty() && !t.r.empty();
-    return t;
-}
-
 // python's round(): ties to even (the default FP rounding mode), then int()
 static int lkRound(double x)
 {
     return (int)std::nearbyint(x);
-}
-
-struct LkShape
-{
-    const char* name;
-    std::vector<int64_t> dims;
-};
-
-// engine_name(): <base>_<shape per input joined by x, inputs by _>_<trt>_<w>, a dynamic batch
-// axis written lo"to"hi
-static std::string lkEngineName(const std::string& base, const std::vector<LkShape>& set, const char* dynInput,
-                                int dynLo, int dynHi, const LookupTags& t)
-{
-    std::string s = base;
-    for (const auto& in : set)
-    {
-        s += '_';
-        for (size_t i = 0; i < in.dims.size(); i++)
-        {
-            if (i)
-                s += 'x';
-            if (i == 0 && dynInput && !strcmp(in.name, dynInput))
-                s += std::to_string(dynLo) + "to" + std::to_string(dynHi);
-            else
-                s += std::to_string(in.dims[i]);
-        }
-    }
-    return s + "_" + t.trt + "_" + t.w;
 }
 
 static bool lkFile(const std::string& p)
@@ -6252,210 +6156,14 @@ static bool lkFile(const std::string& p)
     return fileExistsA(p);
 }
 
-static std::string lkJit(const std::string& enginePath)
-{
-    return enginePath + ".jit";
-}
-
-// gmflow A's two forms (transformer.py EXPORT_A_FORM): the masked form, which a cold start builds (its runtime JIT ~7 s
-// at every size), and the edge form, A x0.97 at the 1440p DLAA half and x0.89 at the 4K half but a JIT of ~29 s, past
-// the first start's 30 s on A's build lane. A GMFSS session on the masked form starts this exe's --build-engine for the
-// edge form after its first pair (lkGmUpgradeStart: no lookup of that session can see it appear) and the next session
-// at that size runs the edge form (lkGmPickA). Levers SMV_GM_UPGRADE=0 = the masked form only, =now = the edge form from
-// the cold start, =fail = the background build fails at once (its failure line's trigger)
-static const char* const kGmFlowMasked = "gmflow_bidir_a_g8";
-static const char* const kGmFlowEdge = "gmflow_bidir_a_g8e";
-static const int kGmFlowSlot = 1; // kGmKey's "gflow"
-
-// the edge form's engine beside a masked-form A engine (the same name with the edge base); "" for any other engine
-static std::string lkGmEdgeOf(const std::string& maskedEngine)
-{
-    const size_t sl = maskedEngine.find_last_of("\\/");
-    const size_t at = sl == std::string::npos ? 0 : sl + 1;
-    const std::string base = std::string(kGmFlowMasked) + "_";
-    if (maskedEngine.compare(at, base.size(), base) != 0)
-        return std::string();
-    return maskedEngine.substr(0, at) + kGmFlowEdge + maskedEngine.substr(at + base.size() - 1);
-}
-
-// the edge form is built and warm beside that A engine (the warm-up writes the .jit last)
-static bool lkGmEdgeReady(const std::string& maskedEngine)
-{
-    const std::string e = lkGmEdgeOf(maskedEngine);
-    return !e.empty() && lkFile(e) && lkFile(lkJit(e));
-}
-
-// the background build of the edge form: lkGmPickA leaves the command for the masked engine a lookup chose, the
-// session's first GMFSS pair starts it (armed), a new session start ends a running one (lkGmUpgradeStop); the helper
-// sits in a job object, so it ends with this process
-struct GmUpgrade
-{
-    std::mutex m;
-    std::string masked, log; // the masked A engine it upgrades, the helper's log file
-    std::wstring cmd;
-    std::atomic<bool> armed{false};
-    HANDLE proc = nullptr, job = nullptr;
-    std::chrono::steady_clock::time_point t0;
-};
-static GmUpgrade g_gmUpg;
-
-static bool lkWarm(const std::string& jit, const std::string& key)
-{
-    if (!lkFile(jit))
-        return false;
-    std::ifstream f(jit + ".warm");
-    std::string ln;
-    while (std::getline(f, ln))
-    {
-        while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ' || ln.back() == '\t'))
-            ln.pop_back();
-        size_t a = 0;
-        while (a < ln.size() && (ln[a] == ' ' || ln[a] == '\t'))
-            a++;
-        if (ln.compare(a, std::string::npos, key) == 0)
-            return true;
-    }
-    return false;
-}
-
-static const char* lkDtype(nvinfer1::DataType d)
-{
-    switch (d)
-    {
-    case nvinfer1::DataType::kFLOAT:
-        return "fp32";
-    case nvinfer1::DataType::kHALF:
-        return "fp16";
-    case nvinfer1::DataType::kBF16:
-        return "bf16";
-    case nvinfer1::DataType::kINT32:
-        return "i32";
-    case nvinfer1::DataType::kINT64:
-        return "i64";
-    case nvinfer1::DataType::kBOOL:
-        return "bool";
-    case nvinfer1::DataType::kUINT8:
-        return "u8";
-    default:
-        return "?";
-    }
-}
-
-struct LkIo
-{
-    std::vector<std::pair<std::string, std::string>> ins, outs;
-};
-
-// find_engine() + _inspect(): the file by name, deserialized without a context, every input
-// admitting every shape set (static dims exact, dynamic ones inside profile 0)
-static bool lkFind(nvinfer1::IRuntime* rt, const std::string& cacheDir, const std::string& base,
-                   const std::vector<std::vector<LkShape>>& sets, const char* dynInput, int dynLo, int dynHi,
-                   const LookupTags& t, std::string& path, LkIo& io)
-{
-    path = cacheDir + "\\" + lkEngineName(base, sets[0], dynInput, dynLo, dynHi, t) + ".engine";
-    if (!lkFile(path))
-        return false;
-    std::ifstream f(path, std::ios::binary);
-    std::vector<char> blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (blob.empty())
-        return false;
-    std::unique_ptr<nvinfer1::ICudaEngine> eng(rt->deserializeCudaEngine(blob.data(), blob.size()));
-    if (!eng)
-        return false;
-    for (const auto& set : sets)
-        for (const auto& in : set)
-        {
-            const nvinfer1::Dims d = eng->getTensorShape(in.name);
-            if (d.nbDims != (int)in.dims.size())
-                return false;
-            bool dyn = false;
-            for (int k = 0; k < d.nbDims; k++)
-                dyn = dyn || d.d[k] < 0;
-            if (!dyn)
-            {
-                for (int k = 0; k < d.nbDims; k++)
-                    if (d.d[k] != in.dims[k])
-                        return false;
-                continue;
-            }
-            const nvinfer1::Dims lo = eng->getProfileShape(in.name, 0, nvinfer1::OptProfileSelector::kMIN);
-            const nvinfer1::Dims hi = eng->getProfileShape(in.name, 0, nvinfer1::OptProfileSelector::kMAX);
-            if (lo.nbDims != d.nbDims || hi.nbDims != d.nbDims)
-                return false;
-            for (int k = 0; k < d.nbDims; k++)
-                if (in.dims[k] < lo.d[k] || in.dims[k] > hi.d[k])
-                    return false;
-        }
-    io = LkIo();
-    for (int i = 0; i < eng->getNbIOTensors(); i++)
-    {
-        const char* n = eng->getIOTensorName(i);
-        auto e = std::make_pair(std::string(n), std::string(lkDtype(eng->getTensorDataType(n))));
-        (eng->getTensorIOMode(n) == nvinfer1::TensorIOMode::kINPUT ? io.ins : io.outs).push_back(e);
-    }
-    return true;
-}
-
-// the RIFE IFNet / block0 class: fp32 everywhere except the feature encodes f0 / f1 (fp32 or fp16, the same
-// for both; nativeTrtInit pairs them with the encode output), the IFNet's frame pair x and timestep (fp32 or
-// fp16) and its outputs flow / mask (fp16); block0's frames and flow stay fp32
-static bool lkRifeIo(const LkIo& io, bool ifnet)
-{
-    std::string fd;
-    for (auto& p : io.ins)
-    {
-        if (p.first == "f0" || p.first == "f1")
-        {
-            if ((p.second != "fp32" && p.second != "fp16") || (!fd.empty() && fd != p.second))
-                return false;
-            fd = p.second;
-        }
-        else if (ifnet && (p.first == "x" || p.first == "timestep"))
-        {
-            if (p.second != "fp32" && p.second != "fp16")
-                return false;
-        }
-        else if (p.second != "fp32")
-            return false;
-    }
-    for (auto& p : io.outs)
-        if (p.second != "fp32" && !(ifnet && (p.first == "flow" || p.first == "mask") && p.second == "fp16"))
-            return false;
-    return true;
-}
-
-static std::string lkDt(const LkIo& io, bool in, const char* name)
-{
-    for (auto& p : (in ? io.ins : io.outs))
-        if (p.first == name)
-            return p.second;
-    return "None";
-}
+// RIFE's IFNet on the host's kernels (nativeIfnModule): the path every RIFE / DRBA lookup hands out, nothing to build
+static const char* const kIfnNative = "native:rife-4.25-ifnet";
 
 static std::string lkF4(double v)
 {
     char b[64];
     sprintf_s(b, "%.4f", v);
     return b;
-}
-
-// One net of the GMFSS set: the handoff key, the engine base name, the ONNX file key, the
-// build workspace multiplier, the input shapes and how many of them the engine's name carries (0 = all)
-struct LkGmNet
-{
-    const char* key;
-    const char* base;
-    const char* onnx;
-    int ws;
-    std::vector<LkShape> set;
-    size_t nameIn = 0;
-};
-
-// the inputs that name a GMFSS engine (and that its lookup checks): gmflow_bidir_b's corr and img0 fix every other
-// input's shape, and all eight would push its cache paths toward MAX_PATH
-static std::vector<LkShape> lkGmNameSet(const LkGmNet& n)
-{
-    return n.nameIn ? std::vector<LkShape>(n.set.begin(), n.set.begin() + n.nameIn) : n.set;
 }
 
 // Everything the lookup and the build derive from a session's arguments, in ONE place: a name
@@ -6471,14 +6179,10 @@ struct LkSession
     int mode = 0;             // live: the DLSS mode the size came from (1 + kDlssModeName index, 0 = a share)
     int mw = 0, mh = 0;       // the model frame = the working size (live: liveWorkSize)
     int ph = 0, pw = 0;       // the /64 pad (SMV_LIVE_SAFEPAD=1 on the RIFE family)
-    std::string warmKey;      // the line a warmed .jit.warm marker carries
-    // gmfss: the half size, the nets
+    // gmfss: the half size (every net on the host's kernels: no engine)
     int hh = 0, hw = 0;
-    std::vector<LkGmNet> gm;
     // rife / rifedrba
     bool drba = false;
-    std::string scaleTag;      // name part: the scale list
-    std::vector<int64_t> x, f; // the IFNet's frame pair and feature shapes
     // live rife: RIFE's motion frame (mmw x mmh, padded mph x mpw), the frame the IFNet and
     // its encode run at (iph x ipw = the motion pad, else the pictures' pad)
     int mmw = 0, mmh = 0, mph = 0, mpw = 0, iph = 0, ipw = 0;
@@ -6603,47 +6307,6 @@ static std::string lkModelCacheDir(const std::string& engDir)
     return top + "\\model_cache_safe_to_delete";
 }
 
-static std::string lkOnnxPath(const std::string& engDir, const std::string& key, const LookupTags& t);
-
-// lkSession's gmflow A: the edge form when SMV_GM_UPGRADE=now or when it is built and warm beside the masked engine,
-// else the masked form, then with the edge form's ONNX present the helper's command for its background build
-static void lkGmPickA(LkSession& s)
-{
-    const std::string lever = lkEnv("SMV_GM_UPGRADE");
-    const LookupTags& t = lkTags(s.engDirW);
-    if (lever == "0" || !t.ok)
-        return;
-    LkGmNet& n = s.gm[kGmFlowSlot];
-    const std::string masked = s.cacheDir + "\\" + lkEngineName(n.base, lkGmNameSet(n), nullptr, 0, 0, t) + ".engine";
-    if (lever == "now" || lkGmEdgeReady(masked))
-    {
-        n.base = n.onnx = kGmFlowEdge;
-        return;
-    }
-    const std::string onnx = lkOnnxPath(s.engDir, kGmFlowEdge, t), edge = lkGmEdgeOf(masked);
-    if (!lkFile(onnx))
-        return;
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --build-engine \"" + utf8ToWide(edge + ".helper.log") +
-                       L"\" \"" + s.engDirW + L"\\live_server.py\" \"" + utf8ToWide(onnx) + L"\" \"" +
-                       utf8ToWide(edge) + L"\" " + std::to_wstring(n.ws) + L" --room";
-    for (const auto& in : n.set)
-    {
-        cmd += L" " + utf8ToWide(in.name) + L"=";
-        for (size_t d = 0; d < in.dims.size(); d++)
-            cmd += (d ? L"x" : L"") + std::to_wstring(in.dims[d]);
-    }
-    std::lock_guard<std::mutex> lk(g_gmUpg.m);
-    if (g_gmUpg.masked != masked)
-    {
-        g_gmUpg.masked = masked;
-        g_gmUpg.log = edge + ".helper.log";
-        g_gmUpg.cmd = cmd;
-    }
-    g_gmUpg.armed = !g_gmUpg.proc;
-}
-
 static bool lkSession(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH,
                       LkSession& s, int padMult = 64)
 {
@@ -6677,75 +6340,17 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
     }
     s.ph = (s.mh + padMult - 1) / padMult * padMult;
     s.pw = (s.mw + padMult - 1) / padMult * padMult;
-    char key[64];
     if (s.backend == "gmfss")
     {
         // a 64 px pad side would give gmflow's quarter-scale windows 1 token a side and its shifted blocks a roll of 0
         // (kGmMinPad): such a side runs at kGmMinPad (the packers replicate the edge into the pad)
         s.ph = (std::max)(s.ph, kGmMinPad);
         s.pw = (std::max)(s.pw, kGmMinPad);
-        const int hh = s.hh = s.ph / 2, hw = s.hw = s.pw / 2;
-        const int gh = hh, gw = hw; // gmflow's frame
-        const int64_t q4 = (int64_t)(gh / 4) * (gw / 4), q8 = (int64_t)(gh / 8) * (gw / 8), K = 81;
-        // featurenet at the padded frame, the rest at the half; gmflow_bidir as `_m` + A + B: the
-        // scale-0 global matching and propagation between `_m` and A (k_attn2) and the quarter-scale local correlation
-        // between A and B (k_localCorr, never the [2, 128, HW, 81] product), A with the doubled workspace ceiling; the
-        // IFNet's ONNX key carries its baked scale list
-        s.gm = {
-            {"gfeat",
-             lkEnv("SMV_FU_HWC") == "0" ? "featurenet_lin" : "featurenet",
-             "featurenet",
-             1,
-             {{"x", {1, 3, s.ph, s.pw}}}},
-            {"gflow",
-             "gmflow_bidir_a_g8",
-             "gmflow_bidir_a_g8",
-             2,
-             {{"map4", {2, 128, gh / 4, gw / 4}},
-              {"map8", {2, 128, gh / 8, gw / 8}},
-              {"img0", {1, 3, gh, gw}},
-              {"img1", {1, 3, gh, gw}},
-              {"prop", {2, q8, 2}}}},
-            {"gmetric",
-             "metricnet",
-             "metricnet",
-             1,
-             {{"i0", {1, 3, hh, hw}}, {"i1", {1, 3, hh, hw}}, {"f01", {1, 2, hh, hw}}, {"f10", {1, 2, hh, hw}}}},
-            {"gifnet", "ifnet", "ifnet_sl8-4-2-1", 1, {{"x", {1, 6, hh, hw}}, {"timestep", {1, 1, 1, 1}}}},
-            // SMV_FU_HWC=0 (lkBuild's linear I/O) names its own engines (here and feat_ext), never the default ones' files
-            {"gfusion",
-             lkEnv("SMV_FU_HWC") == "0" ? "fusionnet_lin" : "fusionnet",
-             "fusionnet",
-             1,
-             {{"a", {1, 9, hh, hw}},
-              {"b", {1, 128, hh, hw}},
-              {"c", {1, 256, hh / 2, hw / 2}},
-              {"d", {1, 384, hh / 4, hw / 4}}}},
-            {"gflowb",
-             "gmflow_bidir_b",
-             "gmflow_bidir_b",
-             1,
-             {{"corr", {2, q4, K}},
-              {"img0", {1, 3, gh, gw}},
-              {"img1", {1, 3, gh, gw}},
-              {"flow0", {2, 2, gh / 4, gw / 4}},
-              {"qf", {4, gh / 4, gw / 4, 128}}},
-             2},
-            {"gbone", "gmflow_backbone", "gmflow_backbone", 1, {{"img0", {1, 3, gh, gw}}}},
-            {"gflowm",
-             "gmflow_bidir_a_g8r_m",
-             "gmflow_bidir_a_g8r_m",
-             1,
-             {{"map4", {2, 128, gh / 4, gw / 4}},
-              {"map8", {2, 128, gh / 8, gw / 8}},
-              {"img0", {1, 3, gh, gw}},
-              {"img1", {1, 3, gh, gw}}}},
-        };
-        // on the fusionnet jit; the `|0x0` tail is a legacy flow-grid field, kept so existing
-        // warm markers still match
-        sprintf_s(key, "%dx%d|0x0", s.ph, s.pw);
-        s.warmKey = key;
-        lkGmPickA(s);
+        // every net on the host's kernels (feat_ext at the padded frame; metricnet, the GMFSS IFNet, fusionnet and
+        // gmflow (backbone, `_m` + A, the scale-0 matching and propagation between them, the local correlation, B) at
+        // the half): no engine to look up, build or warm
+        s.hh = s.ph / 2;
+        s.hw = s.pw / 2;
         return true;
     }
     s.drba = s.backend == "rifedrba";
@@ -6779,45 +6384,11 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
         s.iph = s.mph;
         s.ipw = s.mpw;
     }
-    s.scaleTag = "16-8-4-2-1"; // the IFNet's pyramid scales
-    s.x = {1, 6, s.iph, s.ipw};
-    s.f = {1, kRifeFeatC, s.iph, s.ipw};
-    sprintf_s(key, "%dx%d", s.iph, s.ipw);
-    s.warmKey = key;
     return true;
 }
 
-// the RIFE family's engine base names (they carry the weights tag)
-static std::string lkIfnetBase(const LkSession& s, const LookupTags& t)
-{
-    return "rife_ifnet_" + t.r + "_" + s.scaleTag;
-}
-static std::string lkBlock0Base(const LkSession& s, const LookupTags& t)
-{
-    (void)s;
-    return "rife_block0_" + t.r + "_16";
-}
-// the IFNet input set at a timestep batch b
-static std::vector<LkShape> lkIfnetSet(const LkSession& s, int b)
-{
-    return {{"x", s.x}, {"timestep", {b, 1, s.iph, s.ipw}}, {"f0", s.f}, {"f1", s.f}};
-}
-static std::vector<LkShape> lkBlock0Set(const LkSession& s)
-{
-    const std::vector<int64_t> x = {1, 3, s.iph, s.ipw}, f = {1, kRifeFeatC, s.iph, s.ipw};
-    return {{"img0", x}, {"img1", x}, {"f0", f}, {"f1", f}};
-}
-
-// one TensorRT runtime for every lookup and build (deserialize checks and builds never overlap:
-// nativeHandoff waits for a running build first); process lifetime, like the engines' own g_res.rt
-static nvinfer1::IRuntime* lkRuntime()
-{
-    static nvinfer1::IRuntime* rt = nvinfer1::createInferRuntime(g_nativeTrtLogger);
-    return rt;
-}
-
 // the session's handoff answer (the NATIVE-PATH lines and the LIVE READY line nativeHandoff
-// parses) when its engines exist and were warmed, or false
+// parses), or false
 static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH,
                           std::vector<std::string>& lines)
 {
@@ -6903,114 +6474,40 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     }
     if (!nativeLoadDlls(script))
         return false;
-    const LookupTags& t = lkTags(s.engDirW);
-    if (!t.ok)
-    {
-        LOG("native: host lookup could not read the engine name tags\n");
-        return false;
-    }
-    nvinfer1::IRuntime* rt = lkRuntime();
-    if (!rt)
-        return false;
     const int ph = s.ph, pw = s.pw;
-    if (backend == "gmfss")
+    // rife / rifedrba: the IFNet on the host's kernels (one in-between frame a call, offline's class too): nothing to
+    // find, build or warm; its kernel cubin goes into the model cache
+    if (backend == "rife" || backend == "rifedrba")
     {
-        const int hh = s.hh, hw = s.hw, n = (int)s.gm.size();
-        std::string path[kGmN], jit[kGmN];
-        for (int i = 0; i < n; i++)
-        {
-            LkIo io;
-            if (!lkFind(rt, cacheDir, s.gm[i].base, {lkGmNameSet(s.gm[i])}, nullptr, 0, 0, t, path[i], io))
-                return false;
-            jit[i] = lkJit(path[i]);
-        }
-        if (!lkWarm(jit[4], s.warmKey))
-            return false;
-        for (int i = 0; i < n; i++)
-            if (i != 4 && !lkFile(jit[i]))
-                return false;
         int dw, dh, x0, y0;
         fitRect(dw, dh, x0, y0);
-        for (int i = 0; i < n; i++)
-        {
-            lines.push_back(std::string("NATIVE-PATH ") + s.gm[i].key + "=" + path[i]);
-            lines.push_back(std::string("NATIVE-PATH ") + s.gm[i].key + "jit=" + jit[i]);
-        }
+        lines.push_back(std::string("NATIVE-PATH ifnet=") + kIfnNative);
         lines.push_back("NATIVE-PATH cache=" + cacheDir);
-        char tail[256];
-        sprintf_s(tail, " batch=0 batchpad=0 hh=%d hw=%d effects=0 restore=0 engine=gmfss fast=1", hh, hw);
+        char tail[512], motion[96] = "";
+        if (s.mph)
+            sprintf_s(motion, " mph=%d mpw=%d motw=%d moth=%d%s", s.mph, s.mpw, s.mmw, s.mmh, s.zpad ? " zpad=1" : "");
+        sprintf_s(tail, " batch=0 batchpad=0 xdtype=fp16 tdtype=fp16 fdtype=fp16 outdtype=fp16 effects=0 fast=1%s%s",
+                  motion, s.drba ? " engine=drba lag=1" : "");
         lines.push_back("LIVE READY native=1 " + geo(ph, pw, mw, mh, dw, dh, x0, y0) + " scale=" + lkF4(imgScale) +
                         tail);
         return true;
     }
-    // rife / rifedrba: the unbatched IFNet, one in-between frame a call (offline's class too)
-    const bool drba = s.drba;
-    const int batch = 0;
-    std::string ipath;
-    LkIo iio;
-    if (!lkFind(rt, cacheDir, lkIfnetBase(s, t), {lkIfnetSet(s, 1)}, nullptr, 1, batch, t, ipath, iio))
-        return false;
-    if (!lkRifeIo(iio, true))
-        return false;
-    const std::string ijit = lkJit(ipath);
-    if (!lkWarm(ijit, s.warmKey))
-        return false;
-    std::string bpath, bjit;
-    if (drba)
+    if (backend == "gmfss")
     {
-        LkIo bio;
-        if (!lkFind(rt, cacheDir, lkBlock0Base(s, t), {lkBlock0Set(s)}, nullptr, 0, 0, t, bpath, bio))
-            return false;
-        if (!lkRifeIo(bio, false))
-            return false;
-        bjit = lkJit(bpath);
-        if (!lkWarm(bjit, s.warmKey))
-            return false;
+        // every GMFSS net runs on the host's kernels: the session's half size and the kernel cache, no engine
+        int dw, dh, x0, y0;
+        fitRect(dw, dh, x0, y0);
+        lines.push_back("NATIVE-PATH cache=" + cacheDir);
+        char tail[256];
+        sprintf_s(tail, " batch=0 batchpad=0 hh=%d hw=%d effects=0 restore=0 engine=gmfss fast=1", s.hh, s.hw);
+        lines.push_back("LIVE READY native=1 " + geo(ph, pw, mw, mh, dw, dh, x0, y0) + " scale=" + lkF4(imgScale) +
+                        tail);
+        return true;
     }
-    int dw, dh, x0, y0;
-    fitRect(dw, dh, x0, y0);
-    if (drba)
-    {
-        lines.push_back("NATIVE-PATH block0=" + bpath);
-        lines.push_back("NATIVE-PATH block0jit=" + bjit);
-    }
-    lines.push_back("NATIVE-PATH ifnet=" + ipath);
-    lines.push_back("NATIVE-PATH jit=" + ijit);
-    char tail[512], motion[96] = "";
-    if (s.mph)
-        sprintf_s(motion, " mph=%d mpw=%d motw=%d moth=%d%s", s.mph, s.mpw, s.mmw, s.mmh, s.zpad ? " zpad=1" : "");
-    sprintf_s(tail, " batch=%d batchpad=%d xdtype=%s tdtype=%s fdtype=%s outdtype=%s effects=0 fast=1%s%s", batch, 0,
-              lkDt(iio, true, "x").c_str(), lkDt(iio, true, "timestep").c_str(), lkDt(iio, true, "f0").c_str(),
-              lkDt(iio, false, "flow").c_str(), motion, drba ? " engine=drba lag=1" : "");
-    lines.push_back("LIVE READY native=1 " + geo(ph, pw, mw, mh, dw, dh, x0, y0) + " scale=" + lkF4(imgScale) + tail);
-    return true;
+    return false;
 }
 
 static bool lkReadFile(const std::string& path, std::vector<char>& out);
-
-// a --restore-model engine's tag: "x" + an FNV-1a 64 of the file's bytes (8 hex), so a changed file builds anew. Empty =
-// no such file to read, or the bundled Real-ESRGAN (the host's own kernels, no engine)
-static std::string lkRestoreTag(const LookupTags&)
-{
-    if (g_restoreModel.empty())
-        return std::string();
-    std::vector<char> b;
-    if (!lkReadFile(g_restoreModel, b) || b.empty())
-        return std::string();
-    uint64_t h = 1469598103934665603ULL;
-    for (const char c : b)
-        h = (h ^ (uint8_t)c) * 1099511628211ULL;
-    char hex[17];
-    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
-    return "x" + std::string(hex, 8);
-}
-
-// a --restore-model engine for a model size: restore_<tag>, input (1,3,h,w) at the unpadded model size (the fit's w x h)
-static std::string lkRestorePath(const std::string& cacheDir, const LookupTags& t, int w, int h)
-{
-    return cacheDir + "\\" + lkEngineName("restore_" + lkRestoreTag(t), {{"x", {1, 3, h, w}}}, nullptr, 0, 0, t) +
-           ".engine";
-}
 
 static int lkField(const std::string& line, const char* key)
 {
@@ -7023,10 +6520,10 @@ static int lkField(const std::string& line, const char* key)
 // The bundled Real-ESRGAN (realesr-animevideov3, BSD-3, engine\realesr-animevideov3.pth) runs as k_restConv0,
 // 16 x k_restConvMid and k_restConvLast, never as a TensorRT engine: no ONNX, no build. The handoff names it as
 // restorePath = kRestNative; weights that are missing or not this model = no Restore (offline: the pass is dropped
-// with its line). A --restore-model graph runs as a TensorRT engine.
+// with its line).
 static const char* const kRestNative = "native:realesr-animevideov3";
-// a --restore-model ONNX in AnimeJaNai's SPAN-F3 form (64 features) runs on the host's kernels too (ajNatLoad); any
-// other graph stays a TensorRT engine
+// a --restore-model ONNX runs on the host's kernels in AnimeJaNai's SPAN-F3 form (64 features, ajNatLoad) only; any
+// other graph = no Restore, the same way (ajNatWanted's line names why)
 static const char* const kRestNativeAj = "native:animejanai";
 
 // fp32 -> fp16 on the CPU, round to nearest even (torch's .half())
@@ -7345,12 +6842,14 @@ static PkP pkLoad(const std::string& b, std::string& why)
 }
 
 // a stored zip's entries: name -> (data offset, size); false = not one (`why`: a compressed or zip64 entry, ...)
-static bool pthZip(const std::string& f, std::map<std::string, std::pair<size_t, size_t>>& ent, std::string& why)
+// the stored zip's directory over the file's n bytes at f: each entry's data offset and size by name
+static bool pthZip(const unsigned char* f, size_t fn, std::map<std::string, std::pair<size_t, size_t>>& ent,
+                   std::string& why)
 {
-    auto u16 = [&](size_t o) { return (uint32_t)(unsigned char)f[o] | ((uint32_t)(unsigned char)f[o + 1] << 8); };
+    auto u16 = [&](size_t o) { return (uint32_t)f[o] | ((uint32_t)f[o + 1] << 8); };
     auto u32 = [&](size_t o) { return u16(o) | (u16(o + 2) << 16); };
-    size_t eocd = std::string::npos;
-    for (size_t o = f.size() >= 22 ? f.size() - 22 : 0; f.size() >= 22 && f.size() - o <= 65557; o--)
+    size_t eocd = SIZE_MAX;
+    for (size_t o = fn >= 22 ? fn - 22 : 0; fn >= 22 && fn - o <= 65557; o--)
     {
         if (u32(o) == 0x06054b50u)
         {
@@ -7360,7 +6859,7 @@ static bool pthZip(const std::string& f, std::map<std::string, std::pair<size_t,
         if (o == 0)
             break;
     }
-    if (eocd == std::string::npos)
+    if (eocd == SIZE_MAX)
     {
         why = "not a zip";
         return false;
@@ -7369,31 +6868,31 @@ static bool pthZip(const std::string& f, std::map<std::string, std::pair<size_t,
     size_t o = u32(eocd + 16);
     for (uint32_t i = 0; i < n; i++)
     {
-        if (o + 46 > f.size() || u32(o) != 0x02014b50u)
+        if (o + 46 > fn || u32(o) != 0x02014b50u)
         {
             why = "a bad zip directory";
             return false;
         }
         const uint32_t method = u16(o + 10), csize = u32(o + 20), usize = u32(o + 24), nl = u16(o + 28);
         const uint32_t el = u16(o + 30), cl = u16(o + 32), lho = u32(o + 42);
-        if (o + 46 + nl > f.size())
+        if (o + 46 + nl > fn)
         {
             why = "a bad zip directory";
             return false;
         }
-        const std::string name = f.substr(o + 46, nl);
+        const std::string name((const char*)f + o + 46, nl);
         if (method != 0 || csize != usize || csize == 0xffffffffu || lho == 0xffffffffu)
         {
             why = "a compressed or zip64 entry (" + name + ")";
             return false;
         }
-        if ((size_t)lho + 30 > f.size() || u32(lho) != 0x04034b50u)
+        if ((size_t)lho + 30 > fn || u32(lho) != 0x04034b50u)
         {
             why = "a bad zip entry (" + name + ")";
             return false;
         }
         const size_t data = (size_t)lho + 30 + u16(lho + 26) + u16(lho + 28);
-        if (data + csize > f.size())
+        if (data + csize > fn)
         {
             why = "a cut zip entry (" + name + ")";
             return false;
@@ -7404,44 +6903,64 @@ static bool pthZip(const std::string& f, std::map<std::string, std::pair<size_t,
     return true;
 }
 
-// The bundled model's weights for the kernels, in one block (restNatOff's offsets, 256-byte aligned): k_restConv0's
-// w0[64][27] and b0 fp32 + its slopes fp16; per middle layer its fragment-order weights wf[tap][kc][q 4][lane][8 halves]
-// (lane's B registers for n-tiles 2q, 2q + 1 at channels 16 kc .. + 15: n = 16 q + lane / 4 (+ 8), k = 2 (lane % 4)
-// (+ 1, + 8, + 9)), bias and slopes fp16; the last layer's wf[tap][kc][q 3][lane][8] and bias fp16. Every value is
-// first rounded to fp16, as the model runs (.half()). false = missing, or not this model (`why`).
-static std::vector<uint16_t> restFragOf(const std::vector<float>& w, int nout, int cin, int coff, int taps);
-static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std::string& why)
+// A torch.save file's state dict (BasicSR's {"params": ...} unwrapped) read in place: the file mapped read-only, each
+// tensor in t a view of its stored fp32 values (an fp16 or misaligned tensor converted into own), its shape in S; every
+// tensor contiguous. The views live as long as the PthFile.
+struct PthFile
 {
-    off.assign(3 + 16 * 3 + 2, 0);
-    const std::wstring path = g_nativeEngineDir + L"\\realesr-animevideov3.pth";
-    std::string f;
+    HANDLE fh = INVALID_HANDLE_VALUE, mh = nullptr;
+    const unsigned char* base = nullptr;
+    std::map<std::string, std::span<const float>> t;
+    std::map<std::string, std::vector<int64_t>> S;
+    std::list<std::vector<float>> own;
+    PthFile() = default;
+    PthFile(const PthFile&) = delete;
+    PthFile& operator=(const PthFile&) = delete;
+    ~PthFile()
     {
-        FILE* fp = nullptr;
-        if (_wfopen_s(&fp, path.c_str(), L"rb") || !fp)
-        {
-            why = "its weights " + wideToUtf8(path) + " are missing";
-            return false;
-        }
-        if (_fseeki64(fp, 0, SEEK_END) == 0)
-        {
-            const long long n = _ftelli64(fp);
-            if (n > 0 && n < (256ll << 20) && _fseeki64(fp, 0, SEEK_SET) == 0)
-            {
-                f.resize((size_t)n);
-                f.resize(fread(f.data(), 1, (size_t)n, fp));
-            }
-        }
-        fclose(fp);
+        if (base)
+            UnmapViewOfFile(base);
+        if (mh)
+            CloseHandle(mh);
+        if (fh != INVALID_HANDLE_VALUE)
+            CloseHandle(fh);
     }
+};
+
+// false = missing or malformed (`why`)
+static bool pthStateDict(const std::wstring& path, PthFile& wf, std::string& why)
+{
+    wf.fh = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
+                        nullptr);
+    LARGE_INTEGER sz = {};
+    if (wf.fh == INVALID_HANDLE_VALUE || !GetFileSizeEx(wf.fh, &sz))
+    {
+        why = "its weights " + wideToUtf8(path) + " are missing";
+        return false;
+    }
+    if (sz.QuadPart < 22)
+    {
+        why = "not a zip";
+        return false;
+    }
+    const size_t fn = (size_t)sz.QuadPart;
+    wf.mh = CreateFileMappingW(wf.fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    wf.base = wf.mh ? (const unsigned char*)MapViewOfFile(wf.mh, FILE_MAP_READ, 0, 0, 0) : nullptr;
+    if (!wf.base)
+    {
+        why = "its weights " + wideToUtf8(path) + " could not be mapped";
+        return false;
+    }
+    const unsigned char* f = wf.base;
     std::map<std::string, std::pair<size_t, size_t>> ent;
-    if (!pthZip(f, ent, why))
+    if (!pthZip(f, fn, ent, why))
         return false;
     std::string pkl, dir;
     for (const auto& e : ent)
         if (e.first.size() > 9 && e.first.compare(e.first.size() - 9, 9, "/data.pkl") == 0)
         {
             dir = e.first.substr(0, e.first.size() - 9);
-            pkl = f.substr(e.second.first, e.second.second);
+            pkl.assign((const char*)f + e.second.first, e.second.second);
         }
     if (pkl.empty())
     {
@@ -7461,8 +6980,6 @@ static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, st
         why = "no state dict in its weights";
         return false;
     }
-    std::map<std::string, std::vector<float>> wts;
-    std::map<std::string, std::vector<int64_t>> S;
     for (size_t i = 0; i + 1 < sd->v.size(); i += 2)
     {
         const PkObj& k = *sd->v[i];
@@ -7491,22 +7008,44 @@ static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, st
             why = "a tensor's storage is missing or short (" + k.s + ")";
             return false;
         }
-        std::vector<float> v((size_t)n);
-        const char* src = f.data() + e->second.first + (size_t)t.off * (size_t)t.bytes;
-        for (size_t j = 0; j < (size_t)n; j++)
+        const unsigned char* src = f + e->second.first + (size_t)t.off * (size_t)t.bytes;
+        if (t.bytes == 4 && ((uintptr_t)src & 3) == 0)
+            wf.t[k.s] = std::span<const float>(reinterpret_cast<const float*>(src), (size_t)n);
+        else
         {
-            if (t.bytes == 4)
-                memcpy(&v[j], src + 4 * j, 4);
-            else
+            std::vector<float>& v = wf.own.emplace_back((size_t)n);
+            for (size_t j = 0; j < (size_t)n; j++)
             {
-                uint16_t h = 0;
-                memcpy(&h, src + 2 * j, 2);
-                v[j] = h2fHost(h);
+                if (t.bytes == 4)
+                    memcpy(&v[j], src + 4 * j, 4);
+                else
+                {
+                    uint16_t h = 0;
+                    memcpy(&h, src + 2 * j, 2);
+                    v[j] = h2fHost(h);
+                }
             }
+            wf.t[k.s] = std::span<const float>(v);
         }
-        wts[k.s] = std::move(v);
-        S[k.s] = t.size;
+        wf.S[k.s] = t.size;
     }
+    return true;
+}
+
+// The bundled model's weights for the kernels, in one block (restNatOff's offsets, 256-byte aligned): k_restConv0's
+// w0[64][27] and b0 fp32 + its slopes fp16; per middle layer its fragment-order weights wf[tap][kc][q 4][lane][8 halves]
+// (lane's B registers for n-tiles 2q, 2q + 1 at channels 16 kc .. + 15: n = 16 q + lane / 4 (+ 8), k = 2 (lane % 4)
+// (+ 1, + 8, + 9)), bias and slopes fp16; the last layer's wf[tap][kc][q 3][lane][8] and bias fp16. Every value is
+// first rounded to fp16, as the model runs (.half()). false = missing, or not this model (`why`).
+static std::vector<uint16_t> restFragOf(std::span<const float> w, int nout, int cin, int coff, int taps);
+static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std::string& why)
+{
+    off.assign(3 + 16 * 3 + 2, 0);
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\realesr-animevideov3.pth", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
     // the form: body.0 conv 3 -> 64, body.1 PReLU 64, 16 x (conv 64 -> 64, PReLU 64), body.34 conv 64 -> 48, 3 x 3
     auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
         const auto it = S.find(n);
@@ -7524,9 +7063,6 @@ static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, st
         why = "its weights are not realesr-animevideov3's form";
         return false;
     }
-    for (auto& kv : wts)
-        for (float& x : kv.second)
-            x = h2fHost(f2hRne(x));
     blob.clear();
     auto put = [&](const void* p, size_t n) {
         const size_t o = (blob.size() + 255) & ~(size_t)255;
@@ -7534,14 +7070,22 @@ static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, st
         memcpy(blob.data() + o, p, n);
         return o;
     };
-    auto halves = [](const std::vector<float>& v) {
+    auto halves = [](std::span<const float> v) {
         std::vector<uint16_t> h(v.size());
         for (size_t i = 0; i < v.size(); i++)
             h[i] = f2hRne(v[i]);
         return h;
     };
-    auto fragOf = [](const std::vector<float>& w, int nout) { return restFragOf(w, nout, 64, 0, 9); };
-    const std::vector<float>&w0 = wts["body.0.weight"], &b0 = wts["body.0.bias"];
+    // conv 0 keeps fp32 storage of the fp16-rounded values; every other weight goes through f2hRne once (rounding an
+    // fp16 value again changes nothing)
+    auto rounded = [](std::span<const float> v) {
+        std::vector<float> r(v.begin(), v.end());
+        for (float& x : r)
+            x = h2fHost(f2hRne(x));
+        return r;
+    };
+    auto fragOf = [](std::span<const float> w, int nout) { return restFragOf(w, nout, 64, 0, 9); };
+    const std::vector<float> w0 = rounded(wts["body.0.weight"]), b0 = rounded(wts["body.0.bias"]);
     off[0] = put(w0.data(), w0.size() * sizeof(float));
     off[1] = put(b0.data(), b0.size() * sizeof(float));
     const std::vector<uint16_t> s0 = halves(wts["body.1.weight"]);
@@ -7564,7 +7108,7 @@ static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, st
 // a conv's fp16 fragment-order weights for the tensor-core kernels: w[o][cin][taps] (PyTorch's layout) -> per tap, per
 // 16-channel step kc of the 64 channels from coff, per n-tile pair q of nout, per lane the 8 halves of its B registers
 // (n = 16 q + lane / 4 (+ 8), k = 2 (lane % 4) (+ 1, + 8, + 9))
-static std::vector<uint16_t> restFragOf(const std::vector<float>& w, int nout, int cin, int coff, int taps)
+static std::vector<uint16_t> restFragOf(std::span<const float> w, int nout, int cin, int coff, int taps)
 {
     const int nq = nout / 16;
     std::vector<uint16_t> fr((size_t)taps * 4 * nq * 32 * 8);
@@ -8046,7 +7590,7 @@ static bool ajNatLoad(const std::string& path, std::vector<uint8_t>& blob, std::
     return true;
 }
 
-// a --restore-model file on the host's kernels: AnimeJaNai's form (read once a path, the line once)
+// a --restore-model file on the host's kernels: AnimeJaNai's form, else no Restore (read once a path, the line once)
 static bool ajNatWanted()
 {
     if (g_restoreModel.empty())
@@ -8064,14 +7608,15 @@ static bool ajNatWanted()
         if (ok)
             LOG("native: the Restore model runs on the host's kernels (SPAN-F3, %d blocks)\n", nb);
         else
-            LOG("native: the Restore model runs as a TensorRT engine (%s)\n", why.c_str());
+            LOG("native: Restore unavailable (%s; a --restore-model runs only in AnimeJaNai HD's SPAN-F3 form, the "
+                "Balanced model's)\n",
+                why.c_str());
     }
     return ok;
 }
 
 // The session's full handoff answer: the base answer plus, for live Restore (every backend:
-// the host restores the captured frame before any model reads it), the Restore engine and its
-// jit once both exist (nativeLocalBuild creates them; the engine has no warm marker).
+// the host restores the captured frame before any model reads it), the Restore model on the host's kernels.
 static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH,
                                std::vector<std::string>& lines)
 {
@@ -8099,220 +7644,15 @@ static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& b
         lines.push_back(ready);
         return true;
     }
-    if (ajNatWanted()) // AnimeJaNai's form on the host's kernels: no engine, no jit
-    {
-        const std::string ready = lines.back();
-        lines.pop_back();
-        lines.push_back(std::string("NATIVE-PATH restore=") + kRestNativeAj);
-        lines.push_back(ready);
-        return true;
-    }
-    const LookupTags& t = lkTags(s.engDirW);
-    if (!t.ok || lkRestoreTag(t).empty())
-    {
-        lines.clear();
-        return false;
-    }
-    // Restore reads the captured frame, so its engine has the capture size
-    const std::string rpath = lkRestorePath(s.cacheDir, t, (int)capW, (int)capH);
-    const std::string rjit = lkJit(rpath);
-    if (!lkFile(rpath) || !lkFile(rjit))
+    if (!ajNatWanted()) // a --restore-model in another form: no Restore (ajNatWanted's line says why)
     {
         lines.clear();
         return false;
     }
     const std::string ready = lines.back();
     lines.pop_back();
-    lines.push_back("NATIVE-PATH restore=" + rpath);
-    lines.push_back("NATIVE-PATH rjit=" + rjit);
+    lines.push_back(std::string("NATIVE-PATH restore=") + kRestNativeAj);
     lines.push_back(ready);
-    return true;
-}
-
-// ---- cold engine build inside the host ------------------------------------------------------
-// A window size with no warm engines: the host builds them itself from the size-free ONNX in
-// engine\onnx (strongly typed, workspace
-// 8 GB x the per-graph multiplier, optimization level 5, one profile pinning
-// every input to its shape, only a declared batch axis spanning), writes the engine file only
-// after it deserializes, then warms every shape the session will run with a FRESH runtime cache
-// (EAGER specialization, so the saved kernels are the specialized ones) and writes that cache as
-// the engine's .jit and the warm key. After the build the host lookup runs again and must
-// hit.
-
-class LkBuildLogger : public nvinfer1::ILogger
-{
-  public:
-    std::string errs;
-    void log(Severity s, const char* msg) noexcept override
-    {
-        if (s <= Severity::kWARNING)
-            LOG("[TRT] %s\n", msg);
-        if (s <= Severity::kERROR)
-        {
-            errs += msg;
-            errs += "\n";
-        }
-    }
-};
-
-static bool lkOom(const std::string& s)
-{
-    std::string l = s;
-    for (auto& c : l)
-        c = (char)tolower((unsigned char)c);
-    return l.find("out of memory") != std::string::npos || l.find("outofmemory") != std::string::npos ||
-           l.find("not enough gpu memory") != std::string::npos;
-}
-
-static bool lkWriteFile(const std::string& path, const void* data, size_t n)
-{
-    const std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary);
-        f.write(static_cast<const char*>(data), (std::streamsize)n);
-        if (!f)
-            return false;
-    }
-    return MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
-}
-
-// The cap on TensorRT-RTX's auxiliary streams for the GMFSS nets where its heuristic (3 on fusionnet and metricnet, 1
-// on gmflow_bidir_b and gmflow_backbone) is slower or larger than a lower cap, outputs identical: gmflow_bidir_b 0
-// (x0.73 at 960x544, less memory), metricnet 0 (x0.95, 15 to 56 MiB more), gmflow_backbone 0 (x0.97 to 1.00, less
-// memory), fusionnet 2 (x0.97 to 0.99, 7 to 10 % less memory; 0 or 1 is 1 to 2 % slower). -1 = the heuristic's choice.
-// trt_lookup.HOST_BUILD names this table, so a change empties the engine cache once.
-static int lkAuxStreamCap(const std::string& onnx)
-{
-    static const struct
-    {
-        const char* prefix;
-        int cap;
-    } kCaps[] = {{"gmflow_bidir_b_", 0}, {"metricnet_", 0}, {"gmflow_backbone_", 0}, {"fusionnet_", 2}};
-    const size_t sl = onnx.find_last_of("\\/");
-    const std::string base = sl == std::string::npos ? onnx : onnx.substr(sl + 1);
-    for (const auto& c : kCaps)
-        if (!base.compare(0, strlen(c.prefix), c.prefix))
-            return c.cap;
-    return -1;
-}
-
-// one engine from a size-free ONNX; *oom = the failure was memory-shaped (a null build or an out-of-memory message)
-static bool lkBuild(nvinfer1::IRuntime* rt, const std::string& onnx, const std::string& out,
-                    const std::vector<LkShape>& set, const char* dynInput, int dynLo, int dynHi, int wsMult, bool* oom)
-{
-    *oom = false;
-    LkBuildLogger lg;
-    const auto t0 = std::chrono::steady_clock::now();
-    std::unique_ptr<nvinfer1::IBuilder> b(nvinfer1::createInferBuilder(lg));
-    if (!b)
-        return false;
-    const auto flags = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
-    std::unique_ptr<nvinfer1::INetworkDefinition> net(b->createNetworkV2(flags));
-    if (!net)
-        return false;
-    std::unique_ptr<nvonnxparser::IParser> p(nvonnxparser::createParser(*net, lg));
-    if (!p || !p->parseFromFile(onnx.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
-    {
-        if (p)
-            for (int i = 0; i < p->getNbErrors(); i++)
-                LOG("native: onnx parse: %s\n", p->getError(i)->desc());
-        return false;
-    }
-    // GMFSS's host-side tensors leave and enter channels-last, the layout the convs work in (a linear one costs a
-    // whole-tensor transpose at the boundary): the cut fusionnet's `out` (the 64 -> 256 conv at the half: 4.2 ms at the
-    // 4K half, read by k_fuTailNhwc), feat_ext's f1 / f2 / f3 and fusionnet's b / c / d (read and written by
-    // k_gsGatherNhwc); at these channel counts HWC8 and HWC16 are both plain NHWC. trt_lookup.HOST_BUILD names this;
-    // SMV_FU_HWC=0 keeps every one linear (A/B, the k_fuTail and planar splat paths' trigger)
-    {
-        const size_t sl = onnx.find_last_of("\\/");
-        const size_t b0 = sl == std::string::npos ? 0 : sl + 1;
-        const bool fusion = !onnx.compare(b0, 10, "fusionnet_"), feat = !onnx.compare(b0, 11, "featurenet_");
-        const nvinfer1::TensorFormats hwc = (1U << static_cast<int>(nvinfer1::TensorFormat::kHWC8)) |
-                                            (1U << static_cast<int>(nvinfer1::TensorFormat::kHWC16));
-        auto nhwcOk = [](nvinfer1::ITensor* t) {
-            const nvinfer1::Dims d = t->getDimensions();
-            return d.nbDims == 4 && d.d[1] > 0 && d.d[1] % 16 == 0 && t->getType() == nvinfer1::DataType::kHALF;
-        };
-        if (lkEnv("SMV_FU_HWC") != "0" && (fusion || feat))
-        {
-            for (int i = 0; i < net->getNbOutputs(); i++)
-            {
-                nvinfer1::ITensor* t = net->getOutput(i);
-                const char* nm = t->getName();
-                if (((fusion && !strcmp(nm, "out") && t->getDimensions().d[1] == 256) ||
-                     (feat && (!strcmp(nm, "f1") || !strcmp(nm, "f2") || !strcmp(nm, "f3")))) &&
-                    nhwcOk(t))
-                    t->setAllowedFormats(hwc);
-            }
-            for (int i = 0; fusion && i < net->getNbInputs(); i++)
-            {
-                nvinfer1::ITensor* t = net->getInput(i);
-                const char* nm = t->getName();
-                if ((!strcmp(nm, "b") || !strcmp(nm, "c") || !strcmp(nm, "d")) && nhwcOk(t))
-                    t->setAllowedFormats(1U << static_cast<int>(nvinfer1::TensorFormat::kHWC8));
-            }
-        }
-    }
-    std::unique_ptr<nvinfer1::IBuilderConfig> cfg(b->createBuilderConfig());
-    nvinfer1::IOptimizationProfile* prof = b->createOptimizationProfile();
-    if (!cfg || !prof)
-        return false;
-    const double ws = 8.0; // GB of builder scratch, x the per-graph multiplier
-    cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, (size_t)(ws * (1ull << 30)) * wsMult);
-    cfg->setBuilderOptimizationLevel(5);
-    const int auxCap = lkAuxStreamCap(onnx);
-    if (auxCap >= 0)
-        cfg->setMaxAuxStreams(auxCap);
-    for (int i = 0; i < net->getNbInputs(); i++)
-    {
-        nvinfer1::ITensor* t = net->getInput(i);
-        const LkShape* s = nullptr;
-        for (const auto& in : set)
-            if (!strcmp(in.name, t->getName()))
-                s = &in;
-        if (!s || (int)s->dims.size() != t->getDimensions().nbDims)
-        {
-            LOG("native: onnx input %s does not match the engine class\n", t->getName());
-            return false;
-        }
-        nvinfer1::Dims lo, hi;
-        lo.nbDims = hi.nbDims = (int)s->dims.size();
-        for (int k = 0; k < lo.nbDims; k++)
-            lo.d[k] = hi.d[k] = s->dims[k];
-        if (dynInput && !strcmp(s->name, dynInput))
-        {
-            lo.d[0] = dynLo;
-            hi.d[0] = dynHi;
-        }
-        if (!prof->setDimensions(t->getName(), nvinfer1::OptProfileSelector::kMIN, lo) ||
-            !prof->setDimensions(t->getName(), nvinfer1::OptProfileSelector::kOPT, hi) ||
-            !prof->setDimensions(t->getName(), nvinfer1::OptProfileSelector::kMAX, hi))
-            return false;
-    }
-    cfg->addOptimizationProfile(prof);
-    std::unique_ptr<nvinfer1::IHostMemory> ser(b->buildSerializedNetwork(*net, *cfg));
-    if (!ser)
-    {
-        *oom = true; // python: "returned None" counts as memory-shaped
-        LOG("native: engine build returned nothing for %s\n", out.c_str());
-        return false;
-    }
-    // deserialize BEFORE the file reaches the cache: a file that cannot load must not be left
-    std::unique_ptr<nvinfer1::ICudaEngine> eng(rt->deserializeCudaEngine(ser->data(), ser->size()));
-    if (!eng)
-    {
-        *oom = lkOom(lg.errs);
-        return false;
-    }
-    eng.reset();
-    if (!lkWriteFile(out, ser->data(), ser->size()))
-    {
-        LOG("native: cannot write %s\n", out.c_str());
-        return false;
-    }
-    LOG("native: built %s from %s in %.1fs\n", out.substr(out.find_last_of("\\/") + 1).c_str(),
-        onnx.substr(onnx.find_last_of("\\/") + 1).c_str(),
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return true;
 }
 
@@ -8325,637 +7665,38 @@ static bool lkReadFile(const std::string& path, std::vector<char>& out)
     return !out.empty();
 }
 
-static size_t lkDtypeBytes(nvinfer1::DataType d)
+// Restore on the host's kernels for a session: the bundled Real-ESRGAN = kRestNative (false when its weights are
+// unusable), a --restore-model file = kRestNativeAj in AnimeJaNai's SPAN-F3 form, any other graph = false
+// (ajNatWanted's line says why). The live cold start and the offline host share it. true = ready, the path in rpath.
+static bool lkEnsureRestore(const std::wstring& script, std::string& rpath)
 {
-    switch (d)
-    {
-    case nvinfer1::DataType::kHALF:
-    case nvinfer1::DataType::kBF16:
-        return 2;
-    case nvinfer1::DataType::kINT64:
-        return 8;
-    case nvinfer1::DataType::kBOOL:
-    case nvinfer1::DataType::kUINT8:
-    case nvinfer1::DataType::kINT8:
-        return 1;
-    default:
-        return 4;
-    }
-}
-
-static uint64_t nativeVideoMemoryRoom();
-
-// warm an engine for every input shape set with a fresh runtime cache (the existing .jit file
-// merged first, as python's context does), then write the cache as <engine>[.kind].jit and add
-// the warm key (none = the file only). Inputs are zeros: the kernels depend on shapes, not data.
-// fitRoom = refuse (a memory-shaped failure) when the context's memory exceeds the video memory room
-// (a background build beside a running session)
-static bool lkWarmEngine(nvinfer1::IRuntime* rt, const std::string& enginePath,
-                         const std::vector<std::vector<LkShape>>& sets, const std::string& warmKey, cudaStream_t st,
-                         bool* oom, bool fitRoom = false)
-{
-    *oom = false;
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<char> blob;
-    if (!lkReadFile(enginePath, blob))
+    if (!nativeLoadDlls(script))
         return false;
-    std::unique_ptr<nvinfer1::ICudaEngine> eng(rt->deserializeCudaEngine(blob.data(), blob.size()));
-    if (!eng)
+    if (g_restoreModel.empty() ? !restNatWanted() : !ajNatWanted())
         return false;
-    const uint64_t room = fitRoom ? nativeVideoMemoryRoom() : 0,
-                   need = (uint64_t)(std::max)((int64_t)0, eng->getDeviceMemorySizeV2());
-    if (room && need > room)
-    {
-        *oom = true;
-        LOG("native: not enough free video memory to warm %s (%.0f MiB, %.0f MiB free past the reserve)\n",
-            enginePath.substr(enginePath.find_last_of("\\/") + 1).c_str(), need / 1048576.0, room / 1048576.0);
-        return false;
-    }
-    std::unique_ptr<nvinfer1::IRuntimeConfig> cfg(eng->createRuntimeConfig());
-    if (!cfg)
-        return false;
-    std::unique_ptr<nvinfer1::IRuntimeCache> cache(cfg->createRuntimeCache());
-    if (!cache)
-        return false;
-    const std::string jit = lkJit(enginePath);
-    std::vector<char> cb;
-    if (lkReadFile(jit, cb) && !cache->deserialize(cb.data(), cb.size()))
-    {
-        // python's rule: a rejected cache starts fresh and nothing in it is warm any more
-        DeleteFileA((jit + ".warm").c_str());
-        cache.reset(cfg->createRuntimeCache());
-        if (!cache)
-            return false;
-    }
-    cfg->setRuntimeCache(*cache);
-    cfg->setDynamicShapesKernelSpecializationStrategy(nvinfer1::DynamicShapesKernelSpecializationStrategy::kEAGER);
-    std::unique_ptr<nvinfer1::IExecutionContext> ctx(eng->createExecutionContext(cfg.get()));
-    if (!ctx)
-    {
-        *oom = true;
-        LOG("native: warm-up context failed for %s\n", enginePath.c_str());
-        return false;
-    }
-    std::vector<void*> bufs;
-    bool ok = true;
-    for (const auto& set : sets)
-    {
-        for (const auto& in : set)
-        {
-            nvinfer1::Dims d;
-            d.nbDims = (int)in.dims.size();
-            for (int k = 0; k < d.nbDims; k++)
-                d.d[k] = in.dims[k];
-            if (!ctx->setInputShape(in.name, d))
-            {
-                ok = false;
-                break;
-            }
-        }
-        for (int i = 0; ok && i < eng->getNbIOTensors(); i++)
-        {
-            const char* n = eng->getIOTensorName(i);
-            const nvinfer1::Dims d = ctx->getTensorShape(n);
-            size_t bytes = lkDtypeBytes(eng->getTensorDataType(n));
-            for (int k = 0; k < d.nbDims; k++)
-                bytes *= (size_t)(d.d[k] > 0 ? d.d[k] : 1);
-            void* ptr = nullptr;
-            if (cudaMalloc(&ptr, bytes) != cudaSuccess)
-            {
-                ok = false;
-                *oom = true;
-                break;
-            }
-            bufs.push_back(ptr);
-            cudaMemsetAsync(ptr, 0, bytes, st);
-            ctx->setTensorAddress(n, ptr);
-        }
-        ok = ok && ctx->enqueueV3(st) && cudaStreamSynchronize(st) == cudaSuccess;
-        for (void* ptr : bufs)
-            cudaFree(ptr);
-        bufs.clear();
-        if (!ok)
-            break;
-    }
-    if (!ok)
-    {
-        LOG("native: warm-up enqueue failed for %s\n", enginePath.c_str());
-        return false;
-    }
-    ctx.reset();
-    std::unique_ptr<nvinfer1::IHostMemory> ser(cache->serialize());
-    if (!ser || !lkWriteFile(jit, ser->data(), ser->size()))
-    {
-        LOG("native: cannot write %s\n", jit.c_str());
-        return false;
-    }
-    LOG("native: warmed %s in %.1fs\n", enginePath.substr(enginePath.find_last_of("\\/") + 1).c_str(),
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    if (!warmKey.empty())
-    {
-        // trt_lookup.mark_warm: the key set, sorted, one per line
-        std::vector<std::string> keys;
-        {
-            std::ifstream f(jit + ".warm");
-            std::string ln;
-            while (std::getline(f, ln))
-            {
-                while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' '))
-                    ln.pop_back();
-                if (!ln.empty())
-                    keys.push_back(ln);
-            }
-        }
-        keys.push_back(warmKey);
-        std::sort(keys.begin(), keys.end());
-        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-        std::string txt;
-        for (auto& k : keys)
-            txt += k + "\n";
-        if (!lkWriteFile(jit + ".warm", txt.data(), txt.size()))
-            return false;
-    }
+    rpath = g_restoreModel.empty() ? kRestNative : kRestNativeAj;
     return true;
 }
 
-// trt_lookup.onnx_path(): <key>_<w>.onnx; onnx_export.py exports every graph again whenever its export stamp
-// changes, so the file under this name is always the current graph
-static std::string lkOnnxPath(const std::string& engDir, const std::string& key, const LookupTags& t)
-{
-    const std::string env = lkEnv("SMV_ONNX_DIR");
-    return (env.empty() ? engDir + "\\onnx" : env) + "\\" + key + "_" + t.w + ".onnx";
-}
-
-// a CUDA stream for a build on the calling thread, on the device the sessions run on
-static bool lkBuildStream(cudaStream_t& st)
-{
-    st = nullptr;
-    NCHK(cudaSetDevice(0), "cudaSetDevice (build)");
-    NCHK(cudaFree(nullptr), "cuda context (build)");
-    NCHK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "cudaStreamCreate (build)");
-    return true;
-}
-
-// one engine of a build: the file when it exists, else built from its ONNX in engine\onnx (onnxFile = another
-// ONNX file, the user's Restore model), then warmed for every shape set (a warm key, when given, marks the jit as
-// warmed for the session's size). *oom = the failure was memory-shaped.
-static bool lkEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTags& t, const std::string& path,
-                     const std::string& onnxKey, const std::vector<LkShape>& set, const char* dynInput, int dynLo,
-                     int dynHi, int wsMult, const std::vector<std::vector<LkShape>>& warmSets,
-                     const std::string& warmKey, cudaStream_t st, bool* oom,
-                     const std::string& onnxFile = std::string())
-{
-    *oom = false;
-    if (!lkFile(path))
-    {
-        const std::string onnx = onnxFile.empty() ? lkOnnxPath(s.engDir, onnxKey, t) : onnxFile;
-        if (!lkFile(onnx))
-        {
-            LOG("native: %s is missing (node scripts/export-onnx.ts writes it)\n", onnx.c_str());
-            return false;
-        }
-        if (!lkBuild(rt, onnx, path, set, dynInput, dynLo, dynHi, wsMult, oom))
-            return false;
-    }
-    return lkWarmEngine(rt, path, warmSets, warmKey, st, oom);
-}
-
-// --build-engine LOG SCRIPT ONNX ENGINE WSMULT [--room] NAME=D0xD1x... ...: build ENGINE from ONNX when it is missing,
-// warm it with a fresh runtime cache (its .jit) and exit; LOG takes this process's log lines. lkGmEnsure runs gmflow A
-// this way beside its own work, lkGmUpgradeStart A's edge form beside a running session (--room: the warm-up's context
-// must fit the video memory room). Exit 0 = done, 3 = a memory-shaped failure, 2 = any other; SMV_GM_HELPER_TEST=fail
-// (SMV_GM_UPGRADE=fail with --room) = exit 2 at once (the parent's fallback / failure-line trigger).
-static int runBuildEngine(int argc, wchar_t** argv)
-{
-    FILE* logf = nullptr;
-    if (argc < 8 || _wfreopen_s(&logf, argv[2], L"w", stderr) != 0)
-        return 2;
-    setvbuf(stderr, nullptr, _IONBF, 0);
-    const bool room = wcscmp(argv[7], L"--room") == 0;
-    if (lkEnv(room ? "SMV_GM_UPGRADE" : "SMV_GM_HELPER_TEST") == "fail")
-    {
-        LOG("native: build helper failing on %s=fail\n", room ? "SMV_GM_UPGRADE" : "SMV_GM_HELPER_TEST");
-        return 2;
-    }
-    if (!nativeLoadDlls(argv[3]) || !g_onnxParserOk)
-        return 2;
-    const std::string onnx = wideToUtf8(argv[4]), path = wideToUtf8(argv[5]);
-    const int ws = _wtoi(argv[6]);
-    std::vector<std::string> names;
-    names.reserve((size_t)argc);
-    std::vector<LkShape> set;
-    if (argc < (room ? 9 : 8))
-        return 2;
-    for (int i = room ? 8 : 7; i < argc; i++)
-    {
-        const std::string a = wideToUtf8(argv[i]);
-        const size_t eq = a.find('=');
-        if (eq == std::string::npos || eq + 1 >= a.size())
-            return 2;
-        names.push_back(a.substr(0, eq));
-        LkShape sh{names.back().c_str(), {}};
-        for (size_t p = eq + 1; p <= a.size();)
-        {
-            size_t x = a.find('x', p);
-            if (x == std::string::npos)
-                x = a.size();
-            sh.dims.push_back(_atoi64(a.substr(p, x - p).c_str()));
-            p = x + 1;
-        }
-        set.push_back(sh);
-    }
-    nvinfer1::IRuntime* rt = lkRuntime();
-    cudaStream_t st = nullptr;
-    if (!rt || ws < 1 || !lkBuildStream(st))
-        return 2;
-    bool oom = false;
-    const bool ok = (lkFile(path) || lkBuild(rt, onnx, path, set, nullptr, 0, 0, ws, &oom)) &&
-                    lkWarmEngine(rt, path, {set}, std::string(), st, &oom, room);
-    cudaStreamDestroy(st);
-    return ok ? 0 : oom ? 3 : 2;
-}
-
-// the session's first GMFSS pair (armed by lkGmPickA): the background build of the edge form for that session's masked
-// A engine, unless it is warm already or another build runs
-static void lkGmUpgradeStart(const std::string& maskedEngine)
-{
-    std::lock_guard<std::mutex> lk(g_gmUpg.m);
-    if (g_gmUpg.proc || g_gmUpg.cmd.empty() || g_gmUpg.masked != maskedEngine || lkGmEdgeReady(maskedEngine))
-        return;
-    HANDLE job = CreateJobObjectW(nullptr, nullptr);
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
-    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    STARTUPINFOW si{sizeof(si)};
-    PROCESS_INFORMATION pi{};
-    std::wstring cmd = g_gmUpg.cmd;
-    if (job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li)) &&
-        CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW | CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si, &pi))
-    {
-        if (AssignProcessToJobObject(job, pi.hProcess))
-        {
-            ResumeThread(pi.hThread);
-            g_gmUpg.proc = pi.hProcess;
-            g_gmUpg.job = job;
-            g_gmUpg.t0 = std::chrono::steady_clock::now();
-            job = nullptr;
-            LOG("native: building gmflow A's edge form in the background (the next GMFSS session at this size runs "
-                "it)\n");
-        }
-        else
-            TerminateProcess(pi.hProcess, 2);
-        if (!g_gmUpg.proc)
-            CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    }
-    if (job)
-        CloseHandle(job);
-    if (!g_gmUpg.proc)
-        LOG("native: the background build of gmflow A's edge form did not start (%lu)\n", GetLastError());
-}
-
-// a session starts (every live session, every offline GMFSS render): a background build still running ends here, so
-// it can never complete during that session's lookups (it starts again after a GMFSS session's first pair); a finished
-// one's log lines and result come into this log; the build is armed again while the edge form is not warm
-static void lkGmUpgradeStop()
-{
-    std::lock_guard<std::mutex> lk(g_gmUpg.m);
-    if (g_gmUpg.proc)
-    {
-        DWORD rc = STILL_ACTIVE;
-        GetExitCodeProcess(g_gmUpg.proc, &rc);
-        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_gmUpg.t0).count();
-        if (rc == STILL_ACTIVE)
-        {
-            TerminateProcess(g_gmUpg.proc, 2);
-            WaitForSingleObject(g_gmUpg.proc, 5000);
-            LOG("native: stopped the background build of gmflow A's edge form after %.1fs (a new session started)\n",
-                s);
-        }
-        else
-        {
-            std::ifstream f(g_gmUpg.log);
-            std::string ln;
-            while (std::getline(f, ln))
-                if (!ln.empty())
-                    LOG("helper: %s\n", ln.c_str());
-            FILETIME c{}, e{}, k{}, u{};
-            if (GetProcessTimes(g_gmUpg.proc, &c, &e, &k, &u))
-                s = (double)((((uint64_t)e.dwHighDateTime << 32) | e.dwLowDateTime) -
-                             (((uint64_t)c.dwHighDateTime << 32) | c.dwLowDateTime)) /
-                    1e7;
-            if (rc == 0)
-                LOG("native: the background build of gmflow A's edge form is done (%.1fs)\n", s);
-            else
-                LOG("native: the background build of gmflow A's edge form failed (exit %lu%s)\n", rc,
-                    rc == 3 ? ", memory" : "");
-        }
-        CloseHandle(g_gmUpg.proc);
-        CloseHandle(g_gmUpg.job);
-        g_gmUpg.proc = g_gmUpg.job = nullptr;
-        DeleteFileA(g_gmUpg.log.c_str());
-    }
-    g_gmUpg.armed = !g_gmUpg.cmd.empty() && !lkGmEdgeReady(g_gmUpg.masked);
-}
-
-// GMFSS's nets `nets` (indices into s.gm), built when missing and warmed. TensorRT-RTX compiles one engine at a time
-// per PROCESS (a build or a JIT warm-up on another thread waits for the running one; two processes run at full speed:
-// 103rd chat), so gmflow A ("gflow", ~30 of the set's ~45 s cold at every size) and its front `_m` ("gflowm", the
-// host chain's longest net after it) each go to a helper process (this exe's --build-engine, killed with this process
-// through one job object) while this thread does the other nets in order on st; a helper that fails, or cannot start,
-// leaves its net to this thread afterwards. The lookups need every net's .jit, which is written only after that net's
-// warm-up, so a set is never marked warm early. SMV_GM_HELPER=0 = no helper, =1 = A's alone (the A/B levers).
-// *oom = a failure was memory-shaped.
-static bool lkGmEnsure(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTags& t, const std::vector<size_t>& nets,
-                       cudaStream_t st, bool* oom)
-{
-    *oom = false;
-    auto path = [&](size_t i) {
-        const LkGmNet& n = s.gm[i];
-        return s.cacheDir + "\\" + lkEngineName(n.base, lkGmNameSet(n), nullptr, 0, 0, t) + ".engine";
-    };
-    auto one = [&](size_t i) {
-        // the warm key sits on fusionnet's jit
-        const LkGmNet& n = s.gm[i];
-        return lkEnsure(rt, s, t, path(i), n.onnx, n.set, nullptr, 0, 0, n.ws, {n.set},
-                        !strcmp(n.key, "gfusion") ? s.warmKey : std::string(), st, oom);
-    };
-    // the helpers' nets: k into nets, the name their lines carry, the process and its log
-    struct Helper
-    {
-        size_t k;
-        const char* name;
-        HANDLE proc = nullptr;
-        std::string log;
-    };
-    std::vector<Helper> hs;
-    const std::string helperLever = lkEnv("SMV_GM_HELPER");
-    for (size_t k = 0; k < nets.size() && helperLever != "0"; k++)
-        if (!strcmp(s.gm[nets[k]].key, "gflow"))
-            hs.push_back({k, "gmflow A"});
-        else if (!strcmp(s.gm[nets[k]].key, "gflowm") && helperLever != "1")
-            hs.push_back({k, "gmflow _m"});
-    HANDLE job = nullptr;
-    if (!hs.empty())
-    {
-        job = CreateJobObjectW(nullptr, nullptr);
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
-        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (job && !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li)))
-        {
-            CloseHandle(job);
-            job = nullptr;
-        }
-    }
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    for (Helper& h : hs)
-    {
-        const LkGmNet& n = s.gm[nets[h.k]];
-        const std::string onnx = lkOnnxPath(s.engDir, n.onnx, t);
-        h.log = path(nets[h.k]) + ".helper.log";
-        std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --build-engine \"" + utf8ToWide(h.log) + L"\" \"" +
-                           s.engDirW + L"\\live_server.py\" \"" + utf8ToWide(onnx) + L"\" \"" +
-                           utf8ToWide(path(nets[h.k])) + L"\" " + std::to_wstring(n.ws);
-        for (const auto& in : n.set)
-        {
-            cmd += L" " + utf8ToWide(in.name) + L"=";
-            for (size_t d = 0; d < in.dims.size(); d++)
-                cmd += (d ? L"x" : L"") + std::to_wstring(in.dims[d]);
-        }
-        STARTUPINFOW si{sizeof(si)};
-        PROCESS_INFORMATION pi{};
-        if (job && CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                                  nullptr, nullptr, &si, &pi))
-        {
-            if (AssignProcessToJobObject(job, pi.hProcess))
-            {
-                ResumeThread(pi.hThread);
-                h.proc = pi.hProcess;
-            }
-            else
-            {
-                TerminateProcess(pi.hProcess, 2);
-                CloseHandle(pi.hProcess);
-            }
-            CloseHandle(pi.hThread);
-        }
-        if (!h.proc)
-            LOG("native: the %s build helper did not start (%lu), building it here\n", h.name, GetLastError());
-    }
-    auto helped = [&](size_t k) {
-        for (const Helper& h : hs)
-            if (h.k == k && h.proc)
-                return true;
-        return false;
-    };
-    bool ok = true;
-    for (size_t k = 0; ok && k < nets.size(); k++)
-        if (!helped(k))
-            ok = one(nets[k]);
-    std::vector<size_t> again;
-    for (Helper& h : hs)
-    {
-        if (!h.proc)
-            continue;
-        if (!ok)
-            TerminateProcess(h.proc, 2);
-        WaitForSingleObject(h.proc, INFINITE);
-        DWORD rc = 2;
-        GetExitCodeProcess(h.proc, &rc);
-        CloseHandle(h.proc);
-        {
-            std::ifstream f(h.log);
-            std::string ln;
-            while (std::getline(f, ln))
-                if (!ln.empty())
-                    LOG("helper: %s\n", ln.c_str());
-        }
-        DeleteFileA(h.log.c_str());
-        const bool done = ok && rc == 0 && lkFile(path(nets[h.k])) && lkFile(lkJit(path(nets[h.k])));
-        if (ok && !done)
-        {
-            LOG("native: the %s build helper failed (exit %lu), building it here\n", h.name, rc);
-            again.push_back(h.k);
-        }
-    }
-    if (job)
-        CloseHandle(job);
-    for (size_t k : again)
-        if (ok)
-            ok = one(nets[k]);
-    return ok;
-}
-
-// the RIFE family: the unbatched IFNet and DRBA's block0 flow engine (the encode runs on the host's kernels)
-static bool lkBuildRife(nvinfer1::IRuntime* rt, const LkSession& s, const LookupTags& t, cudaStream_t st)
-{
-    auto path = [&](const std::string& base, const std::vector<LkShape>& set) {
-        return s.cacheDir + "\\" + lkEngineName(base, set, nullptr, 0, 0, t) + ".engine";
-    };
-    bool oom = false;
-    const std::string ibase = lkIfnetBase(s, t);
-    const std::vector<LkShape> uset = lkIfnetSet(s, 1);
-    if (!lkEnsure(rt, s, t, path(ibase, uset), ibase, uset, nullptr, 0, 0, 1, {uset}, s.warmKey, st, &oom))
-        return false;
-    if (s.drba)
-    {
-        const std::vector<LkShape> b0set = lkBlock0Set(s);
-        const std::string b0base = lkBlock0Base(s, t);
-        if (!lkEnsure(rt, s, t, path(b0base, b0set), b0base, b0set, nullptr, 0, 0, 1, {b0set}, s.warmKey, st, &oom))
-            return false;
-    }
-    return true;
-}
-
-// build + warm what lkBaseHandoff needs for this session; true = worth a second lookup
-static bool lkBuildBackend(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH)
-{
-    if (g_offline)
-        return false;
-    LkSession s;
-    if (!lkSession(script, backendW, capW, capH, s))
-        return false;
-    const bool gmfss = s.backend == "gmfss";
-    if (s.backend != "rife" && !gmfss && !s.drba)
-        return false;
-    if (!nativeLoadDlls(script) || !g_onnxParserOk)
-        return false;
-    const LookupTags& t = lkTags(s.engDirW);
-    if (!t.ok)
-        return false;
-    const auto t0 = std::chrono::steady_clock::now();
-    cudaStream_t st = nullptr;
-    if (!lkBuildStream(st))
-        return false;
-    nvinfer1::IRuntime* rt = lkRuntime();
-    bool done = rt != nullptr;
-    if (done && gmfss)
-    {
-        std::vector<size_t> all;
-        for (size_t i = 0; i < s.gm.size(); i++)
-            all.push_back(i);
-        bool oom = false;
-        done = lkGmEnsure(rt, s, t, all, st, &oom);
-    }
-    else if (done)
-        done = lkBuildRife(rt, s, t, st);
-    cudaStreamDestroy(st);
-    LOG("native: host %sengine build for %dx%d %s (%.1fs)\n", gmfss ? "GMFSS " : "", s.pw, s.ph,
-        done ? "done" : "failed", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    return done;
-}
-
-// the cold-start build: the backend's engines when its warm answer misses (echo, nvof and fruc
-// have none), then for live Restore the --restore-model engine at the capture size, warmed once so its .jit exists
-// (the bundled Real-ESRGAN builds nothing). A backend that is already warm is never rewarmed. true = worth a second
-// lookup.
-static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int w, int h, std::string& rpath,
-                            std::string& rjit);
+// the cold start: every backend's nets run on the host's kernels (echo, nvof and fruc have none) and so does live
+// Restore, so nothing is built; true = the session can start (worth a second lookup)
 static bool nativeLocalBuild(const std::wstring& script, const std::wstring& backendW, uint32_t capW, uint32_t capH)
 {
     if (g_offline)
         return false;
     std::vector<std::string> base;
     if (!lkBaseHandoff(script, backendW, capW, capH, base))
-    {
-        if (!lkBuildBackend(script, backendW, capW, capH))
-            return false;
-        base.clear();
-        if (!lkBaseHandoff(script, backendW, capW, capH, base))
-            return false;
-    }
-    if (!g_restore)
-        return true;
-    LkSession s;
-    const int w = lkField(base.back(), "w"), h = lkField(base.back(), "h");
-    if (!lkSession(script, backendW, capW, capH, s) || w <= 0 || h <= 0)
         return false;
-    std::string rpath, rjit;
-    return lkEnsureRestore(script, s, (int)capW, (int)capH, rpath, rjit); // the captured frame's size
+    std::string rpath;
+    return !g_restore || lkEnsureRestore(script, rpath);
 }
 
-// the first input's name of a one-input ONNX graph (the user's Restore model names its own); empty = it does not parse
-// or has another input count
-static std::string lkOnnxInputName(const std::string& onnx)
-{
-    LkBuildLogger lg;
-    std::unique_ptr<nvinfer1::IBuilder> b(nvinfer1::createInferBuilder(lg));
-    if (!b)
-        return std::string();
-    const auto flags = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
-    std::unique_ptr<nvinfer1::INetworkDefinition> net(b->createNetworkV2(flags));
-    if (!net)
-        return std::string();
-    std::unique_ptr<nvonnxparser::IParser> p(nvonnxparser::createParser(*net, lg));
-    if (!p || !p->parseFromFile(onnx.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)) ||
-        net->getNbInputs() != 1)
-        return std::string();
-    return net->getInput(0)->getName();
-}
-
-// Restore at its input size w x h (live the captured frame, offline the decoded one): the bundled Real-ESRGAN =
-// kRestNative (the host's kernels, nothing to build; false when its weights are unusable), a --restore-model file = its
-// TensorRT engine, built when it is missing, warmed once so its .jit exists; the live cold build and the offline host
-// share it. true = ready, paths in rpath / rjit.
-static bool lkEnsureRestore(const std::wstring& script, const LkSession& s, int w, int h, std::string& rpath,
-                            std::string& rjit)
-{
-    if (!nativeLoadDlls(script))
-        return false;
-    if (g_restoreModel.empty() || ajNatWanted())
-    {
-        if (g_restoreModel.empty() && !restNatWanted())
-            return false;
-        rpath = g_restoreModel.empty() ? kRestNative : kRestNativeAj;
-        rjit.clear();
-        return true;
-    }
-    const LookupTags& t = lkTags(s.engDirW);
-    if (!t.ok)
-        return false;
-    if (lkRestoreTag(t).empty())
-    {
-        LOG("native: the Restore model %s cannot be read\n", g_restoreModel.c_str());
-        return false;
-    }
-    rpath = lkRestorePath(s.cacheDir, t, w, h);
-    rjit = lkJit(rpath);
-    if (lkFile(rpath) && lkFile(rjit))
-        return true;
-    if (!g_onnxParserOk)
-    {
-        LOG("native: the ONNX parser DLL is missing, cannot build the Restore engine\n");
-        return false;
-    }
-    const auto t0 = std::chrono::steady_clock::now();
-    cudaStream_t st = nullptr;
-    if (!lkBuildStream(st))
-        return false;
-    nvinfer1::IRuntime* rt = lkRuntime();
-    bool oom = false;
-    const std::string inName = lkOnnxInputName(g_restoreModel);
-    if (inName.empty())
-    {
-        LOG("native: the Restore model %s is not a one-input ONNX graph\n", g_restoreModel.c_str());
-        cudaStreamDestroy(st);
-        return false;
-    }
-    const std::vector<LkShape> rset = {{inName.c_str(), {1, 3, h, w}}};
-    const bool done = rt && lkEnsure(rt, s, t, rpath, std::string(), rset, nullptr, 0, 0, 1, {rset}, std::string(), st,
-                                     &oom, g_restoreModel);
-    cudaStreamDestroy(st);
-    LOG("native: host Restore engine build for %dx%d %s (%.1fs)\n", w, h, done ? "done" : "failed",
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    return done;
-}
-
-// ---- offline RIFE engines -------------------------------------------------------------------
-// The offline host finds, builds and warms its own IFNet engine: live's unbatched IFNet class (one in-between frame a
-// call at every multiplier), pinned to the /64 pad of the source (the encode runs on the host's kernels).
+// ---- offline RIFE -------------------------------------------------------------------------------------------------
+// The offline host's IFNet runs on the host's kernels (kIfnNative, one in-between frame a call at every multiplier):
+// the session's pad of the source only (/64, the author's /128 for plain RIFE), nothing to find or build.
 struct OfflineEngines
 {
-    std::string ifnet, jit;
+    std::string ifnet;
     int ph = 0, pw = 0;
 };
 
@@ -8966,182 +7707,29 @@ static bool lkOfflineRife(const std::wstring& script, int w, int h, OfflineEngin
         return false;
     if (!nativeLoadDlls(script))
         return false;
-    const LookupTags& t = lkTags(s.engDirW);
-    if (!t.ok)
-    {
-        LOG("offline: could not read the engine name tags\n");
-        return false;
-    }
-    nvinfer1::IRuntime* rt = lkRuntime();
-    if (!rt)
-        return false;
-    const auto t0 = std::chrono::steady_clock::now();
-    cudaStream_t st = nullptr;
-    // one class: its engine exists and is warm at this size, else build (when missing) and warm
-    auto ensure = [&](const std::string& base, const std::vector<LkShape>& set, const std::string& warmKey) -> bool {
-        const std::string p = s.cacheDir + "\\" + lkEngineName(base, set, nullptr, 0, 0, t) + ".engine";
-        if (lkFile(p) && (warmKey.empty() ? lkFile(lkJit(p)) : lkWarm(lkJit(p), warmKey)))
-            return true;
-        if (!lkFile(p) && !g_onnxParserOk)
-        {
-            LOG("offline: the ONNX parser DLL is missing, cannot build %s\n", base.c_str());
-            return false;
-        }
-        if (!st && !lkBuildStream(st))
-            return false;
-        bool oom = false;
-        return lkEnsure(rt, s, t, p, base, set, nullptr, 0, 0, 1, {set}, warmKey, st, &oom);
-    };
-    const std::string ibase = lkIfnetBase(s, t);
-    const std::vector<LkShape> set = lkIfnetSet(s, 1);
-    const bool ok = ensure(ibase, set, s.warmKey);
-    const bool built = st != nullptr;
-    if (st)
-        cudaStreamDestroy(st);
-    if (!ok)
-    {
-        LOG("offline: engine build for %dx%d failed\n", s.pw, s.ph);
-        return false;
-    }
-    LkIo iio;
-    if (!lkFind(rt, s.cacheDir, ibase, {set}, nullptr, 0, 0, t, o.ifnet, iio) || !lkRifeIo(iio, true))
-    {
-        LOG("offline: the engines at %dx%d do not match their class (delete them from the cache to rebuild)\n", s.pw,
-            s.ph);
-        return false;
-    }
-    o.jit = lkJit(o.ifnet);
+    o.ifnet = kIfnNative;
     o.ph = s.ph;
     o.pw = s.pw;
-    LOG("offline: engines for %dx%d single tween%s (%.1fs)\n", s.pw, s.ph, built ? " built by the host" : " warm",
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    LOG("offline: RIFE's IFNet on the host's kernels at %dx%d\n", s.pw, s.ph);
     return true;
 }
 
-// ---- offline GMFSS engines ------------------------------------------------------------------
-// The live host's five-engine set (lkSession "gmfss": featurenet at the /64 pad, the fused bidir
-// gmflow, metricnet, the GMFSS IFNet and fusionnet at the half), found warm or built and warmed from engine\onnx exactly as
-// lkBuildBackend does for live, then handed to nr like the live handoff's NATIVE-PATH lines.
+// ---- offline GMFSS ----------------------------------------------------------------------------
+// lkSession "gmfss"'s sizes (the padded frame, the half) for nr: every GMFSS net runs on the host's kernels, so there
+// is no engine to find or build
 static bool lkOfflineGmfss(const std::wstring& script, int w, int h, NativeRife& nr)
 {
-    lkGmUpgradeStop();
     LkSession s;
     if (!lkSession(script, L"gmfss", (uint32_t)w, (uint32_t)h, s))
         return false;
     if (!nativeLoadDlls(script))
         return false;
-    const LookupTags& t = lkTags(s.engDirW);
-    if (!t.ok)
-    {
-        LOG("offline: could not read the engine name tags\n");
-        return false;
-    }
-    nvinfer1::IRuntime* rt = lkRuntime();
-    if (!rt)
-        return false;
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<size_t> need;
-    for (size_t i = 0; i < s.gm.size(); i++)
-    {
-        const LkGmNet& n = s.gm[i];
-        const std::string p = s.cacheDir + "\\" + lkEngineName(n.base, lkGmNameSet(n), nullptr, 0, 0, t) + ".engine";
-        // the warm key sits on fusionnet's jit, the others need their .jit
-        const std::string wk = !strcmp(n.key, "gfusion") ? s.warmKey : std::string();
-        if (lkFile(p) && (wk.empty() ? lkFile(lkJit(p)) : lkWarm(lkJit(p), wk)))
-            continue;
-        if (!lkFile(p) && !g_onnxParserOk)
-        {
-            LOG("offline: the ONNX parser DLL is missing, cannot build %s\n", n.base);
-            return false;
-        }
-        need.push_back(i);
-    }
-    const bool built = !need.empty();
-    if (built)
-    {
-        cudaStream_t st = nullptr;
-        bool oom = false;
-        const bool ok = lkBuildStream(st) && lkGmEnsure(rt, s, t, need, st, &oom);
-        if (st)
-            cudaStreamDestroy(st);
-        if (!ok)
-        {
-            LOG("offline: GMFSS engine build for %dx%d failed%s\n", s.pw, s.ph, oom ? " (out of memory)" : "");
-            return false;
-        }
-    }
-    for (size_t i = 0; i < s.gm.size(); i++)
-    {
-        LkIo io;
-        if (!lkFind(rt, s.cacheDir, s.gm[i].base, {lkGmNameSet(s.gm[i])}, nullptr, 0, 0, t, nr.gmPath[i], io))
-        {
-            LOG("offline: the GMFSS engines at %dx%d do not match their class (delete them from the cache to rebuild)\n",
-                s.pw, s.ph);
-            return false;
-        }
-        nr.gmJit[i] = lkJit(nr.gmPath[i]);
-    }
     nr.gmfss = true;
     nr.ph = s.ph;
     nr.pw = s.pw;
     nr.hh = s.hh;
     nr.hw = s.hw;
-    LOG("offline: GMFSS engines for %dx%d%s (%.1fs)\n", s.pw, s.ph, built ? ", built by the host" : ", warm",
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    return true;
-}
-
-// ---- offline DRBA block0 engine -------------------------------------------------------------
-// DRBA's calc_flow engine (lkBlock0Base / lkBlock0Set, the live names) at the /64 pad of the
-// source, warm or built + warmed from engine\onnx; the IFNet and encode come from lkOfflineRife
-// (the unbatched class: DRBA enqueues one tween at a time with its own DRM map).
-static bool lkOfflineBlock0(const std::wstring& script, int w, int h, std::string& path, std::string& jit)
-{
-    LkSession s;
-    if (!lkSession(script, L"rifedrba", (uint32_t)w, (uint32_t)h, s))
-        return false;
-    if (!nativeLoadDlls(script))
-        return false;
-    const LookupTags& t = lkTags(s.engDirW);
-    if (!t.ok)
-    {
-        LOG("offline: could not read the engine name tags\n");
-        return false;
-    }
-    nvinfer1::IRuntime* rt = lkRuntime();
-    if (!rt)
-        return false;
-    const std::string base = lkBlock0Base(s, t);
-    const std::vector<LkShape> set = lkBlock0Set(s);
-    const std::string p = s.cacheDir + "\\" + lkEngineName(base, set, nullptr, 0, 0, t) + ".engine";
-    const bool warm = lkFile(p) && lkWarm(lkJit(p), s.warmKey);
-    if (!warm)
-    {
-        if (!lkFile(p) && !g_onnxParserOk)
-        {
-            LOG("offline: the ONNX parser DLL is missing, cannot build %s\n", base.c_str());
-            return false;
-        }
-        cudaStream_t st = nullptr;
-        bool oom = false;
-        const bool ok =
-            lkBuildStream(st) && lkEnsure(rt, s, t, p, base, set, nullptr, 0, 0, 1, {set}, s.warmKey, st, &oom);
-        if (st)
-            cudaStreamDestroy(st);
-        if (!ok)
-        {
-            LOG("offline: DRBA block0 engine build for %dx%d failed%s\n", s.pw, s.ph, oom ? " (out of memory)" : "");
-            return false;
-        }
-    }
-    LkIo io;
-    if (!lkFind(rt, s.cacheDir, base, {set}, nullptr, 0, 0, t, path, io) || !lkRifeIo(io, false))
-    {
-        LOG("offline: the DRBA block0 engine at %dx%d does not match its class\n", s.pw, s.ph);
-        return false;
-    }
-    jit = lkJit(path);
-    LOG("offline: DRBA block0 engine for %dx%d %s\n", s.pw, s.ph, warm ? "warm" : "built by the host");
+    LOG("offline: GMFSS at %dx%d on the host's kernels (no engine)\n", s.pw, s.ph);
     return true;
 }
 
@@ -9187,15 +7775,10 @@ static bool lkOfflineFsrfg(const std::wstring& script, std::string& dir)
     return true;
 }
 
-// The engine handoff: the session's geometry and engine paths, from the host's own lookup
-// (nativeLocalHandoff), after a cold build on a worker thread when the lookup misses.
-// Blocking (the caller is srv.start() on the loader thread or the early handoff thread).
-// A build whose session was ended meanwhile (the hotkey toggled off, or the target window
-// resized during the load) keeps running while the resident host stays alive
-// (residentMain's stay rule counts it): its engines land in the cache, so the next start at
-// that size is warm. A host that
-// exits anyway ends the build with it; engine files are written whole or not at all
-// (lkWriteFile). One builder at a time: a new handoff waits for a running one first.
+// The engine handoff: the session's geometry and model paths, from the host's own lookup
+// (nativeLocalHandoff), after the cold-start check (nativeLocalBuild) on a worker thread when the
+// lookup misses. Blocking (the caller is srv.start() on the loader thread or the early handoff
+// thread). One check at a time: a new handoff waits for a running one first.
 struct BgHandoff
 {
     std::atomic<bool> pending{false};
@@ -9226,26 +7809,15 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     if (factsOk)
     {
         const NativeRife& f = g_res.facts;
-        if (f.gmfss)
-        {
-            for (int i = 0; i < kGmN; i++)
-                factsOk = factsOk && fileExistsA(f.gmPath[i]);
-            // a masked-form A whose edge form has been built since: a lookup takes the edge form (lkGmPickA)
-            factsOk = factsOk && (lkEnv("SMV_GM_UPGRADE") == "0" || !lkGmEdgeReady(f.gmPath[kGmFlowSlot]));
-        }
-        else
-            factsOk = fileExistsA(f.ifnetPath);
-        factsOk = factsOk && (f.restorePath.empty() || f.restorePath == kRestNative || f.restorePath == kRestNativeAj ||
-                              fileExistsA(f.restorePath));
-        factsOk = factsOk && (!f.drba || fileExistsA(f.block0Path));
+        if (!f.gmfss)
+            factsOk = f.ifnetPath == kIfnNative;
+        factsOk = factsOk && (f.restorePath.empty() || f.restorePath == kRestNative || f.restorePath == kRestNativeAj);
     }
     if (factsOk)
     {
         const NativeRife& f = g_res.facts;
         nr.ifnetPath = f.ifnetPath;
-        nr.jitPath = f.jitPath;
         nr.restorePath = f.restorePath;
-        nr.rjitPath = f.rjitPath;
         nr.restore = f.restore;
         nr.noEngine = f.noEngine;
         nr.cachePath = f.cachePath;
@@ -9254,16 +7826,9 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         nr.fsrfg = f.fsrfg;
         nr.frucDir = f.frucDir;
         nr.drba = f.drba;
-        nr.block0Path = f.block0Path;
-        nr.block0Jit = f.block0Jit;
         nr.gmfss = f.gmfss;
         nr.hh = f.hh;
         nr.hw = f.hw;
-        for (int i = 0; i < kGmN; i++)
-        {
-            nr.gmPath[i] = f.gmPath[i];
-            nr.gmJit[i] = f.gmJit[i];
-        }
         nr.ph = f.ph;
         nr.pw = f.pw;
         nr.w = f.w;
@@ -9308,39 +7873,18 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     auto onLine = [&](const std::string& line) {
         if (line.rfind("NATIVE-PATH ifnet=", 0) == 0)
             nr.ifnetPath = line.substr(18);
-        else if (line.rfind("NATIVE-PATH jit=", 0) == 0)
-            nr.jitPath = line.substr(16);
         else if (line.rfind("NATIVE-PATH restore=", 0) == 0)
             nr.restorePath = line.substr(20);
-        else if (line.rfind("NATIVE-PATH rjit=", 0) == 0)
-            nr.rjitPath = line.substr(17);
         else if (line.rfind("NATIVE-PATH cache=", 0) == 0)
             nr.cachePath = line.substr(18);
         else if (line.rfind("NATIVE-PATH fruc=", 0) == 0)
             nr.frucDir = line.substr(17);
         else if (line.rfind("NATIVE-PATH fsrfg=", 0) == 0)
             nr.frucDir = line.substr(18);
-        else if (line.rfind("NATIVE-PATH block0=", 0) == 0)
-            nr.block0Path = line.substr(19);
-        else if (line.rfind("NATIVE-PATH block0jit=", 0) == 0)
-            nr.block0Jit = line.substr(22);
         else if (line.rfind("LIVE READY", 0) == 0)
         {
             all = line;
             ready = true;
-        }
-        else if (line.rfind("NATIVE-PATH g", 0) == 0)
-        {
-            // the GMFSS set: `NATIVE-PATH <key>=` and `NATIVE-PATH <key>jit=` per engine
-            for (int i = 0; i < kGmN; i++)
-            {
-                const std::string kp = std::string("NATIVE-PATH ") + kGmKey[i] + "=";
-                const std::string kj = std::string("NATIVE-PATH ") + kGmKey[i] + "jit=";
-                if (line.rfind(kp, 0) == 0)
-                    nr.gmPath[i] = line.substr(kp.size());
-                else if (line.rfind(kj, 0) == 0)
-                    nr.gmJit[i] = line.substr(kj.size());
-            }
         }
     };
     {
@@ -9452,30 +7996,23 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         return false;
     }
     nr.fruc = nr.fruc || nr.fsrfg;
-    // GMFSS: five engine paths, the half-frame grid, the cache folder for the
-    // kernel cubin (no RIFE jit path names it)
+    // GMFSS: the half-frame grid and the cache folder for the kernel cubins (no engine, no jit path)
     nr.gmfss = all.find(" engine=gmfss") != std::string::npos;
     if (nr.gmfss)
     {
         nr.hh = num("hh", 0);
         nr.hw = num("hw", 0);
-        for (int i = 0; i < kGmN; i++)
-            if (nr.gmPath[i].empty())
-            {
-                LOG("native: gmfss handoff named no %s engine\n", kGmName[i]);
-                return false;
-            }
         if (nr.hh <= 0 || nr.hw <= 0 || nr.cachePath.empty())
         {
             LOG("native: gmfss handoff line incomplete (hh / hw / cache)\n");
             return false;
         }
     }
-    // native DRBA: the RIFE handoff plus the block0 engine; the lag is one capture
+    // native DRBA: the RIFE handoff (block0 runs on the host's kernels); the lag is one capture
     nr.drba = all.find(" engine=drba") != std::string::npos;
-    if (nr.drba && (nr.block0Path.empty() || num("lag", 0) != 1))
+    if (nr.drba && num("lag", 0) != 1)
     {
-        LOG("native: drba handoff named no block0 engine or no lag=1\n");
+        LOG("native: drba handoff named no lag=1\n");
         return false;
     }
     const int outW = num("outw", 0), outH = num("outh", 0);
@@ -9498,11 +8035,11 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         LOG("native: live effects are on, phase 1 has no sharpen or VSR path\n");
         return false;
     }
-    // live Restore: the session asked for it, so the handoff must have named the engine
+    // live Restore: the session asked for it, so the handoff must have named its model
     nr.restore = !nr.restorePath.empty();
     if (g_restore && !nr.restore)
     {
-        LOG("native: Restore is on but the handoff named no restore engine\n");
+        LOG("native: Restore is on but the handoff named no Restore model\n");
         return false;
     }
     // a downscaling fit runs natively (k_fitAaH / k_fitAaV, nativeRtxInit)
@@ -9515,9 +8052,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     {
         NativeRife& f = g_res.facts;
         f.ifnetPath = nr.ifnetPath;
-        f.jitPath = nr.jitPath;
         f.restorePath = nr.restorePath;
-        f.rjitPath = nr.rjitPath;
         f.restore = nr.restore;
         f.noEngine = nr.noEngine;
         f.cachePath = nr.cachePath;
@@ -9526,16 +8061,9 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         f.fsrfg = nr.fsrfg;
         f.frucDir = nr.frucDir;
         f.drba = nr.drba;
-        f.block0Path = nr.block0Path;
-        f.block0Jit = nr.block0Jit;
         f.gmfss = nr.gmfss;
         f.hh = nr.hh;
         f.hw = nr.hw;
-        for (int i = 0; i < kGmN; i++)
-        {
-            f.gmPath[i] = nr.gmPath[i];
-            f.gmJit[i] = nr.gmJit[i];
-        }
         f.ph = nr.ph;
         f.pw = nr.pw;
         f.w = nr.w;
@@ -9558,110 +8086,6 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         g_res.haveFacts = true;
     }
     return true;
-}
-
-static bool nativeReadFile(const std::string& path, std::vector<char>& out)
-{
-    FILE* f = nullptr;
-    if (fopen_s(&f, path.c_str(), "rb") || !f)
-        return false;
-    fseek(f, 0, SEEK_END);
-    const long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    out.resize(n > 0 ? (size_t)n : 0);
-    const bool ok = n > 0 && fread(out.data(), 1, (size_t)n, f) == (size_t)n;
-    fclose(f);
-    return ok;
-}
-
-// runtime config with the SHARED JIT cache and the engine's own whole-graph capture strategy,
-// then the execution context (the per-session part: a context is sized for the engine's
-// maximum shape and is what the resident host drops between sessions; the engine itself stays)
-static bool nativeMakeContext(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfer1::IRuntimeConfig** cfgOut,
-                              nvinfer1::IExecutionContext** ctxOut)
-{
-    nvinfer1::IRuntimeConfig* cfg = eng->createRuntimeConfig();
-    if (!cfg)
-    {
-        LOG("native: createRuntimeConfig failed\n");
-        return false;
-    }
-    if (!nr.jit)
-    {
-        nr.jit = cfg->createRuntimeCache();
-        std::vector<char> cb;
-        if (nr.jit && !nr.jitPath.empty() && nativeReadFile(nr.jitPath, cb))
-            LOG("native: jit cache deserialize -> %d (%zu bytes)\n", (int)nr.jit->deserialize(cb.data(), cb.size()),
-                cb.size());
-        // every engine keeps its own cache file, so the restore engine's kernels (live Restore) sit in its own .jit;
-        // merged into this cache its context skips recompiling them on every first session
-        if (nr.jit && !nr.rjitPath.empty() && nativeReadFile(nr.rjitPath, cb))
-            LOG("native: restore jit cache merged -> %d (%zu bytes)\n", (int)nr.jit->deserialize(cb.data(), cb.size()),
-                cb.size());
-        // native DRBA's block0 engine, same reason
-        if (nr.jit && !nr.block0Jit.empty() && nativeReadFile(nr.block0Jit, cb))
-            LOG("native: block0 jit cache merged -> %d (%zu bytes)\n", (int)nr.jit->deserialize(cb.data(), cb.size()),
-                cb.size());
-        // the GMFSS set's caches, one file per engine
-        for (int i = 0; i < kGmN; i++)
-            if (nr.jit && !nr.gmJit[i].empty() && nativeReadFile(nr.gmJit[i], cb))
-                LOG("native: gmfss %s jit cache merged -> %d (%zu bytes)\n", kGmName[i],
-                    (int)nr.jit->deserialize(cb.data(), cb.size()), cb.size());
-    }
-    if (nr.jit)
-        cfg->setRuntimeCache(*nr.jit);
-    // offline keeps TRT-RTX's graph capture OFF by default (no gain above 480p, one
-    // cudaErrorInvalidValue in ten runs, a possible GPU TDR link); SMV_OFFLINE_GRAPH=1 turns it on
-    const bool wantGraph = !g_offline || g_offlineGraph;
-    if (wantGraph)
-        cfg->setCudaGraphStrategy(nvinfer1::CudaGraphStrategy::kWHOLE_GRAPH_CAPTURE);
-    if (nr.ctxUserMem)
-        cfg->setExecutionContextAllocationStrategy(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
-    nvinfer1::IExecutionContext* ctx = eng->createExecutionContext(cfg);
-    if (!ctx)
-    {
-        LOG("native: createExecutionContext failed\n");
-        delete cfg;
-        return false;
-    }
-    *cfgOut = cfg;
-    *ctxOut = ctx;
-    return true;
-}
-
-// exact sequence from NATIVE-HOST-API-MAP.md (a): validity pre-check, deserialize, then the
-// config + context through nativeMakeContext.
-static nvinfer1::ICudaEngine* nativeLoadEngine(NativeRife& nr, const std::string& path,
-                                               nvinfer1::IRuntimeConfig** cfgOut, nvinfer1::IExecutionContext** ctxOut)
-{
-    std::vector<char> blob;
-    if (!nativeReadFile(path, blob))
-    {
-        LOG("native: cannot read %s\n", path.c_str());
-        return nullptr;
-    }
-    uint64_t diag = 0;
-    const auto v = nr.rt->getEngineValidity(blob.data(), blob.size(), &diag);
-    if (v == nvinfer1::EngineValidity::kINVALID)
-    {
-        LOG("native: engine rejected by getEngineValidity (reasons 0x%llx): %s\n", (unsigned long long)diag,
-            path.c_str());
-        return nullptr;
-    }
-    if (v == nvinfer1::EngineValidity::kSUBOPTIMAL)
-        LOG("native: engine reports kSUBOPTIMAL (reasons 0x%llx), continuing\n", (unsigned long long)diag);
-    nvinfer1::ICudaEngine* eng = nr.rt->deserializeCudaEngine(blob.data(), blob.size());
-    if (!eng)
-    {
-        LOG("native: deserializeCudaEngine failed for %s\n", path.c_str());
-        return nullptr;
-    }
-    if (!nativeMakeContext(nr, eng, cfgOut, ctxOut))
-    {
-        delete eng;
-        return nullptr;
-    }
-    return eng;
 }
 
 // RIFE 4.25's encode weights (the literals encKernelText writes), fp32 bits in PyTorch's layouts: cnn0 [16][3][3][3]
@@ -10593,7 +9017,7 @@ static void encKernelText(std::string& s)
     s += "}\n} // extern \"C\"\n";
 }
 
-// NVRTC once, then the cubin is cached on disk next to the TRT cache, keyed by source hash and
+// NVRTC once, then the cubin is cached on disk in the model cache, keyed by source hash and
 // device arch (no nvcc anywhere).
 static bool nativeBindKernels(NativeRife& nr)
 {
@@ -10745,8 +9169,18 @@ static const void* rsTabFor(NativeRife& nr, int in, int out, cudaStream_t st)
     return d;
 }
 
+// SMV_NATIVE_ARCH=75 (a test lever): every module compiled as compute_75 PTX, which the driver JIT-compiles for the
+// running card, so the RTX 20 code paths (no cp.async, the k8 mma halves) run on a newer GPU
+static int nativeArchLever()
+{
+    const std::string v = lkEnv("SMV_NATIVE_ARCH");
+    return v.empty() ? 0 : atoi(v.c_str());
+}
+static const int g_nativeArch = nativeArchLever();
+
 // one NVRTC program's cubin: read from cacheDir\<tag>_<source hash>_sm<arch>.cubin, else compiled (the arch the only
-// option) and saved there; `what` names it in the lines
+// option) and saved there; `what` names it in the lines. Under SMV_NATIVE_ARCH the buffer holds PTX instead
+// (<tag>_<hash>_ptx<arch>.ptx, NUL-terminated), which cuModuleLoadData JIT-compiles the same way it loads a cubin.
 static bool nativeCubin(const char* src, const char* file, const wchar_t* tag, const char* what,
                         const std::wstring& cacheDir, std::vector<char>& cubin)
 {
@@ -10763,7 +9197,10 @@ static bool nativeCubin(const char* src, const char* file, const wchar_t* tag, c
         hash *= 1099511628211ull;
     }
     wchar_t nm[128];
-    swprintf_s(nm, L"\\%s_%016llx_sm%d%d.cubin", tag, (unsigned long long)hash, prop.major, prop.minor);
+    if (g_nativeArch)
+        swprintf_s(nm, L"\\%s_%016llx_ptx%d.ptx", tag, (unsigned long long)hash, g_nativeArch);
+    else
+        swprintf_s(nm, L"\\%s_%016llx_sm%d%d.cubin", tag, (unsigned long long)hash, prop.major, prop.minor);
     const std::wstring cubinPath = cacheDir + nm;
     ensureDirW(cacheDir);
     cubin.clear();
@@ -10794,8 +9231,10 @@ static bool nativeCubin(const char* src, const char* file, const wchar_t* tag, c
         }
         nv.create = (PFN_nvrtcCreateProgram)GetProcAddress(nv.mod, "nvrtcCreateProgram");
         nv.compile = (PFN_nvrtcCompileProgram)GetProcAddress(nv.mod, "nvrtcCompileProgram");
-        nv.cubinSize = (PFN_nvrtcGetCUBINSize)GetProcAddress(nv.mod, "nvrtcGetCUBINSize");
-        nv.cubin = (PFN_nvrtcGetCUBIN)GetProcAddress(nv.mod, "nvrtcGetCUBIN");
+        // the PTX getters share the CUBIN getters' signatures
+        nv.cubinSize =
+            (PFN_nvrtcGetCUBINSize)GetProcAddress(nv.mod, g_nativeArch ? "nvrtcGetPTXSize" : "nvrtcGetCUBINSize");
+        nv.cubin = (PFN_nvrtcGetCUBIN)GetProcAddress(nv.mod, g_nativeArch ? "nvrtcGetPTX" : "nvrtcGetCUBIN");
         nv.logSize = (PFN_nvrtcGetProgramLogSize)GetProcAddress(nv.mod, "nvrtcGetProgramLogSize");
         nv.log = (PFN_nvrtcGetProgramLog)GetProcAddress(nv.mod, "nvrtcGetProgramLog");
         nv.destroy = (PFN_nvrtcDestroyProgram)GetProcAddress(nv.mod, "nvrtcDestroyProgram");
@@ -10811,7 +9250,10 @@ static bool nativeCubin(const char* src, const char* file, const wchar_t* tag, c
             return false;
         }
         char arch[64];
-        sprintf_s(arch, "--gpu-architecture=sm_%d%d", prop.major, prop.minor);
+        if (g_nativeArch)
+            sprintf_s(arch, "--gpu-architecture=compute_%d", g_nativeArch);
+        else
+            sprintf_s(arch, "--gpu-architecture=sm_%d%d", prop.major, prop.minor);
         const char* opts[] = {arch, "--use_fast_math=false", "-default-device"};
         const int crc = nv.compile(prog, 1, opts); // arch only; the other two are informational
         if (crc != 0)
@@ -10855,7 +9297,11 @@ static bool nativeCubin(const char* src, const char* file, const wchar_t* tag, c
                 _wunlink(tmp.c_str());
             }
         }
-        LOG("native: %s compiled for sm_%d%d (%zu bytes cubin)\n", what, prop.major, prop.minor, cubin.size());
+        if (g_nativeArch)
+            LOG("native: %s compiled as compute_%d PTX for the driver's JIT on sm_%d%d (SMV_NATIVE_ARCH, %zu bytes)\n",
+                what, g_nativeArch, prop.major, prop.minor, cubin.size());
+        else
+            LOG("native: %s compiled for sm_%d%d (%zu bytes cubin)\n", what, prop.major, prop.minor, cubin.size());
     }
     return true;
 }
@@ -10927,7 +9373,7 @@ static bool inv3d(const double* m, float* out)
 //  * nativeCudaInitLate: the output ring and the slot events (needs the slot count), always
 //    on the compute thread.
 // The CUDA runtime binds the device's PRIMARY context on every thread that calls
-// cudaSetDevice, so streams, allocations, the kernel module and the TRT contexts created on
+// cudaSetDevice, so streams, allocations and the kernel modules created on
 // the early thread are valid on the compute thread once it binds the same device.
 static bool nativeCudaDeviceInit(NativeRife& nr, IDXGIAdapter1* adapter, HANDLE hTex, HANDLE hFence, uint32_t capW,
                                  uint32_t capH, bool hdr)
@@ -11159,9 +9605,8 @@ static bool nativeRtxInit(NativeRife& nr)
                  "alloc restore HDR fit");
         const std::string rm = g_restoreModel.empty() ? std::string("Real-ESRGAN animevideov3")
                                                       : g_restoreModel.substr(g_restoreModel.find_last_of("\\/") + 1);
-        LOG("native: live restore: %s (%s) at %dx%d -> %dx%d%s\n", rm.c_str(),
-            nr.restorePath == kRestNative || nr.restorePath == kRestNativeAj ? "the host's kernels" : "TensorRT", sw,
-            sh, nr.restTw, nr.restTh, nr.restPre ? ", on the captured frame before the model" : "");
+        LOG("native: live restore: %s (the host's kernels) at %dx%d -> %dx%d%s\n", rm.c_str(), sw, sh, nr.restTw,
+            nr.restTh, nr.restPre ? ", on the captured frame before the model" : "");
     }
     // a resize of HDR planes before the model: live the capture to the working size (with Restore, its reference),
     // offline the pre-model stage (the resize, or Restore at a size change)
@@ -16161,6 +14606,22 @@ static const uint32_t kA4kWeights[kA4kW0 + 6 * kA4kW + kA4kWL] = {
 // every weight a float literal in the text (an FFMA immediate, like the shader's literal mat4s); conv2d_1 .. _6 = the
 // tensor-core kernels of kA4kMma. Built at the first Anime4K session's setup and cached beside the main kernels' cubin.
 static const char kA4kHead[] = R"A4KSRC(
+// the tensor-core instruction: sm_80+ as written; sm_75 (RTX 20) = its two k8 halves, the trailing `//` turns the call
+// site's k16 operand list into a PTX comment
+#if __CUDA_ARCH__ >= 800
+#define SMV_MMA_F16 "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+#else
+// fp16 sums: both halves on fp32 accumulators, rounded to fp16 once (as the sm_80 instruction rounds)
+#define SMV_MMA_F16                                                                                                    \
+    "{\n.reg .f16 smvh<4>;\n.reg .f32 smvf<4>;\nmov.b32 {smvh0, smvh1}, %0;\nmov.b32 {smvh2, smvh3}, %1;\n"           \
+    "cvt.f32.f16 smvf0, smvh0;\ncvt.f32.f16 smvf1, smvh1;\ncvt.f32.f16 smvf2, smvh2;\ncvt.f32.f16 smvf3, smvh3;\n"    \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {smvf0,smvf1,smvf2,smvf3}, {%2,%3}, {%6}, "                     \
+    "{smvf0,smvf1,smvf2,smvf3};\n"                                                                                     \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {smvf0,smvf1,smvf2,smvf3}, {%4,%5}, {%7}, "                     \
+    "{smvf0,smvf1,smvf2,smvf3};\n"                                                                                     \
+    "cvt.rn.f16.f32 smvh0, smvf0;\ncvt.rn.f16.f32 smvh1, smvf1;\ncvt.rn.f16.f32 smvh2, smvf2;\n"                      \
+    "cvt.rn.f16.f32 smvh3, smvf3;\nmov.b32 %0, {smvh0, smvh1};\nmov.b32 %1, {smvh2, smvh3};\n} // "
+#endif
 extern "C" {
 __device__ __forceinline__ float h2f(unsigned short h)
 {
@@ -16313,7 +14774,7 @@ __device__ __forceinline__ void amHalo(uint4* __restrict__ s, const uint2* __res
         _Pragma("unroll") for (int mi = 0; mi < 4; ++mi) acc[mi][nt][0] = acc[mi][nt][1] = b2;                         \
     }
 #define AM_MMA_1(mi, nt, b0, b1)                                                                                       \
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"      \
+    asm volatile(SMV_MMA_F16 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"      \
                  : "+r"(acc[mi][nt][0]), "+r"(acc[mi][nt][1])                                                          \
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1))
 #define AM_PACK_1(mi, nt, hh) (acc[mi][nt][hh])
@@ -16758,11 +15219,6 @@ static bool nativeDrbaAlloc(NativeRife& nr)
         NCHK(cudaMalloc((void**)&nr.drWin[i].r, 4 * mplane * sizeof(float)), "alloc drba window");
     }
     NCHK(cudaMalloc((void**)&nr.dDrAcc, 6 * mplane * sizeof(long long)), "alloc drba accumulator");
-    // two domains: block0's fp32 frame pair (24 B a pixel) in the accumulator's first half (48 B a pixel):
-    // nativeDrbaFlow widens into it, block0 reads it, then clears the accumulator, all on nr.stream; every
-    // accumulator use clears it first
-    if (nr.mph)
-        nr.dDrB0 = (float*)nr.dDrAcc;
     // DRBA as its author: the accumulator is idle from a tween's DrmNorm (and block0's FlowNorm) to its next clear,
     // and every reader of these two runs on nr.stream before that clear (the blend's bilinear back, the pack of a real
     // frame): the blend at the network's frame, also a real frame's stretch on its way back, takes the accumulator's
@@ -16812,9 +15268,9 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
             : raised == 1 ? " (raised to the 64 px floor, aspect kept)"
                           : "");
     }
-    // live: Restore reads the captured frame (its engine has the capture size) and folds it to
-    // the model size before the model runs, so srcW / srcH name the capture from here on (the Restore warm-up
-    // in nativeTrtInit and its target in nativeRtxInit read them, possibly on two threads)
+    // live: Restore reads the captured frame and folds it to the model size before the model runs, so srcW /
+    // srcH name the capture from here on (Restore's setup in nativeModelInit and its target in nativeRtxInit read
+    // them, possibly on two threads)
     if (nr.restore)
     {
         nr.restPre = true;
@@ -16854,9 +15310,8 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
         if (nr.mph && (nr.mw != nr.w || nr.mh != nr.h))
             NCHK(cudaMalloc((void**)&nr.dMFit, (size_t)3 * nr.mw * nr.mh * sizeof(float)), "alloc motion fit");
     }
-    // live Restore: the fold's horizontal pass at the model's output height (4x, the largest scale, before the engine
-    // is read) and the model-size target, and the folded model-size frame (the engine's input / output follow its
-    // dtypes and scale in nativeTrtInit's restoreReady)
+    // live Restore: the fold's horizontal pass at the model's output height (4x, the largest scale) and the model-size
+    // target, and the folded model-size frame (the model's input / output follow in nativeModelInit's restoreReady)
     if (nr.restore)
     {
         const size_t mp = (size_t)nr.w * nr.h;
@@ -16904,16 +15359,10 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     return true;
 }
 
-// the TRT cache folder = the folder of the jit cache the handoff named (kernels cubin lives there)
+// the model cache folder the handoff named (the kernels' cubins live there)
 static std::wstring nativeCacheDir(const NativeRife& nr)
 {
-    if (!nr.cachePath.empty())
-        return std::wstring(nr.cachePath.begin(), nr.cachePath.end());
-    if (nr.jitPath.empty())
-        return std::wstring();
-    std::wstring w(nr.jitPath.begin(), nr.jitPath.end());
-    const size_t sl = w.find_last_of(L"\\/");
-    return sl == std::wstring::npos ? std::wstring(L".") : w.substr(0, sl);
+    return std::wstring(nr.cachePath.begin(), nr.cachePath.end());
 }
 
 // Live RTX TrueHDR runs in this process. Everything comes from the exe's own
@@ -17016,238 +15465,37 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
     return true;
 }
 
-// GMFSS: one warm enqueue of an engine on zeroed scratch buffers sized from its own tensor
-// shapes (every GMFSS engine is H/W pinned, so the shapes are static), which also logs the
-// tensor contract the chain binds to. Buffers are freed again here.
-static const char* trtDtypeName(nvinfer1::DataType t)
-{
-    switch (t)
-    {
-    case nvinfer1::DataType::kFLOAT:
-        return "fp32";
-    case nvinfer1::DataType::kHALF:
-        return "fp16";
-    case nvinfer1::DataType::kBF16:
-        return "bf16";
-    case nvinfer1::DataType::kINT32:
-        return "i32";
-    case nvinfer1::DataType::kINT64:
-        return "i64";
-    case nvinfer1::DataType::kBOOL:
-        return "bool";
-    default:
-        return "other";
-    }
-}
-
-static size_t trtElemSize(nvinfer1::DataType t)
-{
-    switch (t)
-    {
-    case nvinfer1::DataType::kFLOAT:
-    case nvinfer1::DataType::kINT32:
-        return 4;
-    case nvinfer1::DataType::kHALF:
-    case nvinfer1::DataType::kBF16:
-        return 2;
-    case nvinfer1::DataType::kINT64:
-        return 8;
-    default:
-        return 1;
-    }
-}
-
-static bool nativeWarmEngine(NativeRife& nr, nvinfer1::ICudaEngine* eng, nvinfer1::IExecutionContext* ctx,
-                             const char* tag, const char* model = "gmfss")
-{
-    std::vector<void*> bufs;
-    std::string contract;
-    bool ok = true;
-    const int n = eng->getNbIOTensors();
-    for (int i = 0; i < n && ok; i++)
-    {
-        const char* nm = eng->getIOTensorName(i);
-        const nvinfer1::Dims d = eng->getTensorShape(nm);
-        size_t vol = 1;
-        std::string dims;
-        for (int k = 0; k < d.nbDims; k++)
-        {
-            if (d.d[k] < 0)
-            {
-                LOG("native: %s %s tensor %s has a dynamic dim\n", model, tag, nm);
-                ok = false;
-                break;
-            }
-            vol *= (size_t)d.d[k];
-            dims += (k ? "x" : "") + std::to_string(d.d[k]);
-        }
-        if (!ok)
-            break;
-        const bool in = eng->getTensorIOMode(nm) == nvinfer1::TensorIOMode::kINPUT;
-        if (in && !ctx->setInputShape(nm, d))
-        {
-            LOG("native: %s %s setInputShape rejected on %s\n", model, tag, nm);
-            ok = false;
-            break;
-        }
-        void* p = nullptr;
-        const size_t bytes = vol * trtElemSize(eng->getTensorDataType(nm));
-        if (cudaMalloc(&p, bytes) != cudaSuccess)
-        {
-            LOG("native: %s %s warm-up alloc failed (%zu bytes)\n", model, tag, bytes);
-            ok = false;
-            break;
-        }
-        bufs.push_back(p);
-        cudaMemsetAsync(p, 0, bytes, nr.stream);
-        ctx->setTensorAddress(nm, p);
-        contract += std::string(i ? ", " : "") + (in ? "" : "-> ") + nm + " " +
-                    trtDtypeName(eng->getTensorDataType(nm)) + " " + dims;
-    }
-    if (ok && !ctx->enqueueV3(nr.stream))
-    {
-        LOG("native: %s %s warm-up enqueue failed\n", model, tag);
-        ok = false;
-    }
-    if (ok && cudaStreamSynchronize(nr.stream) != cudaSuccess)
-    {
-        LOG("native: %s %s warm-up sync failed\n", model, tag);
-        ok = false;
-    }
-    for (void* p : bufs)
-        cudaFree(p);
-    if (ok)
-        LOG("native: %s %s: %s\n", model, tag, contract.c_str());
-    return ok;
-}
-
-// gmflow split: the contract between A (slot 1), k_localCorr and B (slot 5), read off the engines. The kernel takes
-// qf [4, H, W, 128] fp16 (channels-last: 32 lanes of 4 halves; q = rows 0..1, f = rows 2..3) on the quarter of the
-// half frame, computes the window of K = side x side samples (odd side, K <= 100: its shared grid holds 12 x 12 taps)
-// itself and writes corr [2, HW, K]; A hands out exactly the kGmA tensors and B takes corr, img0, img1 and both A
-// outputs at their exact dims and dtype (an export from before the fp16 exit hands out q, f, flow0, feat: refused).
-// The backbone (slot 6) makes one frame's map4 / map8 [1, C, H, W] and A takes both frames' as [2, C, H, W] in the
-// same dtype.
+// gmflow split: the sizes of the contract between `_m`, the scale-0 matching and propagation (k_attn2), A, k_localCorr
+// and gmflow B, all on the host's kernels: the backbone writes each frame's map4 / map8 as planar fp16 [128, H, W] (A /
+// `_m` take both frames' as [2, 128, H, W]); A hands out qf [4, H, W, 128] fp16 (channels-last; q = rows 0..1, f = rows
+// 2..3) and flow0 fp32 [2, 2, H, W] on the quarter (gmH x gmW) of the half frame; `_m` hands out mf / mq / mk fp16 [2, N,
+// 128] on the eighth (N = gmN8 tokens, gmW8 wide), the propagation writes prop fp16 [2, N, 2]; k_localCorr computes the
+// window of K = kGmCorrK samples itself and writes corr [2, HW, K] for B. A's 8 x 8 windows need a quarter in eighths.
 static bool nativeGmSplitCheck(NativeRife& nr)
 {
-    nvinfer1::ICudaEngine* a = nr.engGm[1];
-    nvinfer1::ICudaEngine* b = nr.engGm[5];
-    auto bad = [](const char* nm, const char* what) {
-        LOG("native: gmfss split: %s %s\n", nm, what);
+    if (nr.hh <= 0 || nr.hw <= 0 || nr.hh % 32 || nr.hw % 32)
+    {
+        LOG("native: gmfss split: the half %dx%d is not a multiple of 32\n", nr.hw, nr.hh);
         return false;
-    };
-    auto same = [](const nvinfer1::Dims& x, const nvinfer1::Dims& y) {
-        if (x.nbDims != y.nbDims)
-            return false;
-        for (int k = 0; k < x.nbDims; k++)
-            if (x.d[k] != y.d[k])
-                return false;
-        return true;
-    };
-    if (a->getNbIOTensors() != 5 + kGmAn || b->getNbIOTensors() != 4 + kGmAn)
-        return bad("gmflow_bidir_a / _b", "do not have the split's 7 / 6 tensors (an older export? re-export)");
-    nvinfer1::ICudaEngine* bb = nr.engGm[6];
-    if (bb->getNbIOTensors() != 3)
-        return bad("gmflow_backbone", "does not have its 3 tensors (img0 -> map4, map8)");
-    for (const char* nm : {"map4", "map8"})
-    {
-        const nvinfer1::Dims o = bb->getTensorShape(nm), in = a->getTensorShape(nm);
-        if (bb->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT ||
-            a->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kINPUT)
-            return bad(nm, "is not an output of gmflow_backbone and an input of gmflow_bidir_a");
-        if (o.nbDims != 4 || in.nbDims != 4 || o.d[0] != 1 || in.d[0] != 2 || o.d[1] != in.d[1] || o.d[2] != in.d[2] ||
-            o.d[3] != in.d[3] || bb->getTensorDataType(nm) != a->getTensorDataType(nm))
-            return bad(nm,
-                       "is not [1, C, H, W] out of gmflow_backbone and [2, C, H, W] into gmflow_bidir_a, one dtype");
     }
-    for (const char* nm : kGmA)
-        if (a->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT)
-            return bad(nm, "is not an output of gmflow_bidir_a");
-    if (a->getTensorDataType("qf") != nvinfer1::DataType::kHALF)
-        return bad("qf", "is not fp16");
-    if (b->getTensorIOMode("corr") != nvinfer1::TensorIOMode::kINPUT ||
-        b->getTensorDataType("corr") != nvinfer1::DataType::kFLOAT)
-        return bad("corr", "is not an fp32 input of gmflow_bidir_b");
-    const nvinfer1::Dims qf = a->getTensorShape("qf"), c = b->getTensorShape("corr");
-    const int gh = nr.hh, gw = nr.hw;
-    if (qf.nbDims != 4 || qf.d[0] != 4 || qf.d[1] != gh / 4 || qf.d[2] != gw / 4 || qf.d[3] != 128)
-        return bad("qf", "is not [4, H, W, 128] on the quarter of gmflow's frame (the half)");
-    nr.gmH = (int)qf.d[1];
-    nr.gmW = (int)qf.d[2];
-    // `_m` (slot 7): A's four inputs -> mf / mq / mk, fp16 [2, N, 128] on the eighth grid (k_attn2 reads only fp16);
-    // A takes the propagation's output as prop [2, N, 2], fp16 or fp32
-    nvinfer1::ICudaEngine* m = nr.engGm[7];
-    if (m->getNbIOTensors() != 7)
-        return bad("gmflow_bidir_a_m", "does not have its 7 tensors (map4, map8, img0, img1 -> mf, mq, mk)");
-    for (const char* nm : {"map4", "map8", "img0", "img1"})
-        if (m->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kINPUT ||
-            !same(m->getTensorShape(nm), a->getTensorShape(nm)) || m->getTensorDataType(nm) != a->getTensorDataType(nm))
-            return bad(nm, "is not the same input of gmflow_bidir_a_m and gmflow_bidir_a");
-    const nvinfer1::Dims mt = m->getTensorShape("mf");
-    for (const char* nm : {"mf", "mq", "mk"})
-        if (m->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT ||
-            m->getTensorDataType(nm) != nvinfer1::DataType::kHALF || !same(m->getTensorShape(nm), mt))
-            return bad(nm, "is not an fp16 output of gmflow_bidir_a_m shaped like mf");
-    if (mt.nbDims != 3 || mt.d[0] != 2 || mt.d[2] != 128 || mt.d[1] != (int64_t)(gh / 8) * (gw / 8))
-        return bad("mf", "is not [2, N, 128] on the eighth of gmflow's frame");
-    const nvinfer1::Dims pr = a->getTensorShape("prop");
-    const nvinfer1::DataType pt = a->getTensorDataType("prop");
-    if (a->getTensorIOMode("prop") != nvinfer1::TensorIOMode::kINPUT || pr.nbDims != 3 || pr.d[0] != 2 ||
-        pr.d[1] != mt.d[1] || pr.d[2] != 2 || (pt != nvinfer1::DataType::kHALF && pt != nvinfer1::DataType::kFLOAT))
-        return bad("prop", "is not a [2, N, 2] fp16 / fp32 input of gmflow_bidir_a");
-    nr.gmN8 = (int)mt.d[1];
-    nr.gmW8 = gw / 8;
-    nr.gmPropHalf = pt == nvinfer1::DataType::kHALF;
-    const int64_t hw = (int64_t)nr.gmH * nr.gmW;
-    int side = 1;
-    while (c.nbDims == 3 && side * side < c.d[2])
-        side++;
-    if (c.nbDims != 3 || c.d[0] != 2 || c.d[1] != hw || c.d[2] < 1 || c.d[2] > 100 || side * side != c.d[2] ||
-        !(side & 1))
-        return bad("corr", "is not [2, H * W, K] with K = an odd side squared <= 100");
-    nr.gmK = (int)c.d[2];
-    for (int i = 0; i < b->getNbIOTensors(); i++)
-    {
-        const char* nm = b->getIOTensorName(i);
-        if (b->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kINPUT)
-        {
-            if (strcmp(nm, "flow"))
-                return bad(nm, "is an output of gmflow_bidir_b other than flow");
-            continue;
-        }
-        if (!strcmp(nm, "corr") || !strcmp(nm, "img0") || !strcmp(nm, "img1"))
-            continue;
-        int k = 0;
-        while (k < kGmAn && strcmp(nm, kGmA[k]))
-            k++;
-        if (k == kGmAn)
-            return bad(nm, "is a gmflow_bidir_b input gmflow_bidir_a does not hand over");
-        if (!same(a->getTensorShape(nm), b->getTensorShape(nm)) || a->getTensorDataType(nm) != b->getTensorDataType(nm))
-            return bad(nm, "differs between gmflow_bidir_a and gmflow_bidir_b");
-    }
+    nr.gmH = nr.hh / 4;
+    nr.gmW = nr.hw / 4;
+    nr.gmN8 = (nr.hh / 8) * (nr.hw / 8);
+    nr.gmW8 = nr.hw / 8;
+    nr.gmPropHalf = true;
+    nr.gmK = kGmCorrK;
     return true;
 }
 
-// one engine tensor's bytes at its static shape
-static size_t trtTensorBytes(nvinfer1::ICudaEngine* eng, const char* nm)
-{
-    const nvinfer1::Dims d = eng->getTensorShape(nm);
-    size_t n = trtElemSize(eng->getTensorDataType(nm));
-    for (int k = 0; k < d.nbDims; k++)
-        n *= (size_t)(d.d[k] > 0 ? d.d[k] : 0);
-    return n;
-}
-
-// GMFSS: the chain's contract and its buffers. Every channel count and dtype is
-// READ OFF THE ENGINES (the handoff line never types them), then one pair's and
-// one tween's planar buffers are allocated from it. Runs inside nativeTrtInit right after the
-// five warm-ups, so a mismatch refuses the session before any group. The accumulator is one
+// GMFSS: the chain's contract and its buffers: one pair's and one tween's planar buffers at the
+// nets' channel counts and dtypes. Runs inside nativeModelInit, so a mismatch refuses the session
+// before any group. The accumulator is one
 // buffer for all eight splats (they are strictly sequential on the one stream): the widest is
 // the half level's gmC[0] + 1 planes, and the quarter / eighth levels need less
 // ((2 * gmC[1] + 1) / 4 and (2 * gmC[2] + 1) / 16 of a half plane at the stock 64/128/192).
 // GMFSS's eight contexts enqueue one after another on nr.stream (their aux streams join it at each enqueue's end), so
 // they share ONE activation block, the largest net's, instead of one each: set before the warm-up, so a whole-graph
-// capture records its address. SMV_GM_CTXSHARE=0 = each context its own (TensorRT's default).
+// capture records its address. SMV_GM_CTXSHARE=0 = each net its own.
 // Restore on the host's kernels: its channels-last activations (Real-ESRGAN: two 64-half frames at the source size;
 // AnimeJaNai: eight at the half grid: x0, the first block's output, two block ping-pong frames, c1, c2, c3, the concat
 // conv's output), 0 = not this route
@@ -17383,65 +15631,2810 @@ static bool restNatSetup(NativeRife& nr)
     return true;
 }
 
+// ---- GMFSS's feat_ext (FeatureNet) on the host's kernels -----------------------------------------------------------
+// FeatureNet = 3 blocks {LeakyRelu, conv 3 x 3 stride 2, LeakyRelu, conv 3 x 3}: 3 -> 64 -> 64 (f1, at the half),
+// -> 128 -> 128 (f2, the quarter), -> 192 -> 192 (f3, the eighth); its PReLUs are scalar. Weights from
+// engine\GMFSS_Fortuna\train_log\feat.pkl (the host's torch zip reader; no engine, no ONNX). Its own NVRTC module
+// (fnKernelText): k_fnConv0L = block 1's first conv on the fp32 frame planes, both LeakyRelus in fp32, its weights as
+// float literals, one rounding to channels-last fp16; the five other convs on the tensor cores (fnConvT: an implicit
+// GEMM, mma.sync m16n8k16 with fp16 sums started at the bias; M = 16-pixel row runs of a TH x 32 output tile, N = 8 NB
+// outputs a block (blockIdx.z = the output slice), K = 9 taps x the input channels, CG at a time: stride 1 = the
+// 64-channel halo of an 8 x 32 tile, stride 2 = the 32-channel halo of a 4 x 32 tile with each row's even offsets
+// before its odd ones; 16-byte chunks XOR-swizzled so each ldmatrix reads 8 bank groups; the input's LeakyRelu on the
+// A fragments (an fp16 multiply, then max: LeakyRelu for any slope up to 1), the output's in the epilogue; weights from
+// global memory in fragment order, a k-step ahead). Activations channels-last fp16; f1 / f2 / f3 channels-last (the
+// planar form, planes beside the channels-last copies the next convs read, has no caller since fusionnet runs on the
+// host's kernels).
+static const int kFnCh[4] = {3, 64, 128, 192};   // the channel widths
+static const int kFnNb[5] = {8, 16, 16, 24, 12}; // n-tiles a block, conv 1..5
+static const int kFnSmS1 = 10 * 34 * 8 * 16;     // a stride-1 block's halo bytes
+static const int kFnSmS2 = 9 * 65 * 4 * 16;      // a stride-2 block's
+static const char* const kFnKern[6] = {"k_fnConv0L",       "k_fnConvS1A16N8",  "k_fnConvS2A16N16",
+                                       "k_fnConvS1A16N16", "k_fnConvS2A16N24", "k_fnConvS1A16N12"};
+
+static const char kFnHead[] = R"FNSRC(
+// the tensor-core and async-copy instructions: sm_80+ (RTX 30 and newer) as written; sm_75 (RTX 20) has no cp.async
+// and no k16 mma: the product runs as its two k8 halves (a0 a1 with b0, then a2 a3 with b1), the trailing `//` turns
+// the call site's k16 operand list into a PTX comment, rnCp16 copies in place and commit / wait are empty
+#if __CUDA_ARCH__ >= 800
+#define SMV_MMA_F32 "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+#define SMV_MMA_F16 "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+#define SMV_CP_COMMIT "cp.async.commit_group;\n"
+#define SMV_CP_WAIT0 "cp.async.wait_group 0;\n"
+#else
+#define SMV_MMA_F32                                                                                                    \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%8}, {%0,%1,%2,%3};\n"                 \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%6,%7}, {%9}, {%0,%1,%2,%3}; // "
+// fp16 sums: both halves on fp32 accumulators, rounded to fp16 once (as the sm_80 instruction rounds)
+#define SMV_MMA_F16                                                                                                    \
+    "{\n.reg .f16 smvh<4>;\n.reg .f32 smvf<4>;\nmov.b32 {smvh0, smvh1}, %0;\nmov.b32 {smvh2, smvh3}, %1;\n"           \
+    "cvt.f32.f16 smvf0, smvh0;\ncvt.f32.f16 smvf1, smvh1;\ncvt.f32.f16 smvf2, smvh2;\ncvt.f32.f16 smvf3, smvh3;\n"    \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {smvf0,smvf1,smvf2,smvf3}, {%2,%3}, {%6}, "                     \
+    "{smvf0,smvf1,smvf2,smvf3};\n"                                                                                     \
+    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {smvf0,smvf1,smvf2,smvf3}, {%4,%5}, {%7}, "                     \
+    "{smvf0,smvf1,smvf2,smvf3};\n"                                                                                     \
+    "cvt.rn.f16.f32 smvh0, smvf0;\ncvt.rn.f16.f32 smvh1, smvf1;\ncvt.rn.f16.f32 smvh2, smvf2;\n"                      \
+    "cvt.rn.f16.f32 smvh3, smvf3;\nmov.b32 %0, {smvh0, smvh1};\nmov.b32 %1, {smvh2, smvh3};\n} // "
+#define SMV_CP_COMMIT ""
+#define SMV_CP_WAIT0 ""
+#endif
+__device__ __forceinline__ float h2f(unsigned short h)
+{
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+__device__ __forceinline__ unsigned short f2h(float f)
+{
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
+__device__ __forceinline__ void rnCp16(unsigned dst, const void* src, int bytes)
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(bytes));
+#else
+    uint4 v = make_uint4(0u, 0u, 0u, 0u);
+    if (bytes)
+        v = *reinterpret_cast<const uint4*>(src);
+    asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" ::"r"(dst), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+#endif
+}
+__device__ __forceinline__ void rnLdm4(unsigned addr, unsigned* r)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+__device__ __forceinline__ unsigned rnPrelu(unsigned v, unsigned short a)
+{
+    const float y = h2f((unsigned short)v);
+    return y < 0.0f ? (unsigned)f2h(h2f(a) * y) : v;
+}
+__device__ __forceinline__ float fnLr(float v, float a)
+{
+    return v < 0.0f ? v * a : v;
+}
+)FNSRC";
+
+static const char kFnConv[] = R"FNSRC(
+// the LeakyRelu of two fp16 values (slope s2 = the slope twice): max(v, s v), one fp16 rounding of the product
+__device__ __forceinline__ unsigned fnLr2(unsigned v, unsigned s2)
+{
+    unsigned t;
+    asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(t) : "r"(v), "r"(s2));
+#if __CUDA_ARCH__ >= 800
+    asm("max.f16x2 %0, %1, %2;\n" : "=r"(t) : "r"(v), "r"(t));
+#else
+    // sm_75 has no fp16 max: the same max in fp32 (exact: the result is one of the two fp16 values)
+    t = (unsigned)f2h(fmaxf(h2f((unsigned short)v), h2f((unsigned short)t))) |
+        ((unsigned)f2h(fmaxf(h2f((unsigned short)(v >> 16)), h2f((unsigned short)(t >> 16)))) << 16);
+#endif
+    return t;
+}
+
+// the stored index of halo pixel (hr, hc) and its chunk k's swizzled slot
+template <int S, int NCH>
+__device__ __forceinline__ unsigned fnSlot(int sp, int k)
+{
+    const int sw = NCH == 8 ? (k ^ (sp & 7)) : (k ^ ((sp >> 1) & 3));
+    return (unsigned)((sp * NCH + sw) << 4);
+}
+
+// the CG-channel halo (channels c0 .. c0 + CG - 1) of the output tile at (tx0, ty0) into shared memory, zero outside
+// the input frame W x H, cp.async; the caller waits
+template <int S, int CG, int TH>
+__device__ __forceinline__ void fnHalo(unsigned halo, const unsigned short* __restrict__ x, int cin, int c0, int tx0,
+                                       int ty0, int H, int W)
+{
+    constexpr int NCH = CG / 8;
+    constexpr int HR = S == 1 ? TH + 2 : 2 * TH + 1, HC = S == 1 ? 34 : 65;
+    for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+    {
+        const int p = i / NCH, k = i - p * NCH;
+        const int hr = p / HC, hc = p - hr * HC;
+        const int gy = S * ty0 - 1 + hr, gx = S * tx0 - 1 + hc;
+        const int sp = S == 1 ? p : hr * HC + ((hc & 1) ? 33 + (hc >> 1) : (hc >> 1));
+        const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+        const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + c0 + k * 8 : x;
+        rnCp16(halo + fnSlot<S, NCH>(sp, k), src, in ? 16 : 0);
+    }
+    asm volatile(SMV_CP_COMMIT);
+}
+
+// one conv: x = cin channels-last fp16 at W x H, y = cout channels-last fp16 at W / S x H / S and / or ylin = the same
+// values as cout fp16 planes (either may be null); wf[z][step][q][lane] (step = (group * 9 + tap) * CG / 16 + kc); bias
+// fp32; aIn / aOut = the LeakyRelu slopes (1 = none)
+template <int S, int CG, bool A32, int NB>
+__device__ __forceinline__ void fnConvT(const unsigned short* __restrict__ x, int cin, int H, int W,
+                                        unsigned short* __restrict__ y, int cout, const uint4* __restrict__ wf,
+                                        const float* __restrict__ bias, float aIn, float aOut,
+                                        unsigned short* __restrict__ ylin)
+{
+    constexpr int TH = S == 1 ? 8 : 4;
+    constexpr int RW = TH / 4, MI = RW * 2;
+    constexpr int HC = S == 1 ? 34 : 65;
+    constexpr int NCH = CG / 8, KC = CG / 16;
+    extern __shared__ __align__(128) unsigned char fnSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(fnSm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, z = blockIdx.z;
+    const int OW = W / S, OH = H / S;
+    const int ksteps = cin * 9 / 16;
+    constexpr int NQ = NB / 2;
+    wf += (size_t)z * ksteps * NQ * 32;
+    const int g = lane >> 2, t4 = lane & 3;
+    const bool lrIn = aIn != 1.0f, lrOut = aOut != 1.0f;
+    const unsigned s2 = (unsigned)f2h(aIn) * 0x10001u;
+    float accF[A32 ? MI : 1][NB][4];
+    unsigned accH[A32 ? 1 : MI][NB][2];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[z * NB * 8 + nj * 8 + t4 * 2], b1 = bias[z * NB * 8 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < MI; ++mi)
+        {
+            if constexpr (A32)
+            {
+                accF[mi][nj][0] = accF[mi][nj][2] = b0;
+                accF[mi][nj][1] = accF[mi][nj][3] = b1;
+            }
+            else
+                accH[mi][nj][0] = accH[mi][nj][1] = (unsigned)f2h(b0) | ((unsigned)f2h(b1) << 16);
+        }
+    }
+    uint4 bc[NQ], bn[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q)
+        bc[q] = __ldg(wf + q * 32 + lane);
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        fnHalo<S, CG, TH>(halo, x, cin, gi * CG, tx0, ty0, H, W);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+#pragma unroll 1
+        for (int tap = 0; tap < 9; ++tap)
+        {
+            const int dy = tap / 3, dx = tap - dy * 3;
+            int pa[MI];
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi)
+            {
+                const int orow = RW * warp + (mi >> 1), col = (mi & 1) * 16 + arow;
+                pa[mi] = S == 1 ? (orow + dy) * HC + col + dx
+                                : (2 * orow + dy) * HC + (dx == 1 ? 33 + col : col + (dx >> 1));
+            }
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                const int step = (gi * 9 + tap) * KC + kc;
+                if (step + 1 < ksteps)
+#pragma unroll
+                    for (int q = 0; q < NQ; ++q)
+                        bn[q] = __ldg(wf + ((step + 1) * NQ + q) * 32 + lane);
+#pragma unroll
+                for (int mi = 0; mi < MI; ++mi)
+                {
+                    unsigned a[4];
+                    rnLdm4(halo + fnSlot<S, NCH>(pa[mi], kc * 2 + akc), a);
+                    if (lrIn)
+#pragma unroll
+                        for (int r = 0; r < 4; ++r)
+                            a[r] = fnLr2(a[r], s2);
+#pragma unroll
+                    for (int q = 0; q < NB; ++q)
+                    {
+                        const unsigned b0 = (q & 1) ? bc[q >> 1].z : bc[q >> 1].x;
+                        const unsigned b1 = (q & 1) ? bc[q >> 1].w : bc[q >> 1].y;
+                        if constexpr (A32)
+                        {
+                            float* d = accF[mi][q];
+                            asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                        }
+                        else
+                            asm volatile(SMV_MMA_F16 "{%0,%1}, {%2,%3,%4,%5}, "
+                                         "{%6,%7}, {%0,%1};\n"
+                                         : "+r"(accH[mi][q][0]), "+r"(accH[mi][q][1])
+                                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < NQ; ++q)
+                    bc[q] = bn[q];
+            }
+        }
+    }
+    const unsigned short so = f2h(aOut);
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const int n0 = z * NB * 8 + nj * 8 + t4 * 2;
+#pragma unroll
+        for (int mi = 0; mi < MI; ++mi)
+        {
+            const int oy = ty0 + RW * warp + (mi >> 1);
+            if (oy >= OH)
+                continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int ox = tx0 + (mi & 1) * 16 + g + h * 8;
+                if (ox >= OW)
+                    continue;
+                unsigned v;
+                if constexpr (A32)
+                {
+                    float v0 = accF[mi][nj][2 * h], v1 = accF[mi][nj][2 * h + 1];
+                    if (lrOut)
+                    {
+                        v0 = fnLr(v0, aOut);
+                        v1 = fnLr(v1, aOut);
+                    }
+                    v = (unsigned)f2h(v0) | ((unsigned)f2h(v1) << 16);
+                }
+                else
+                {
+                    v = accH[mi][nj][h];
+                    if (lrOut)
+                        v = rnPrelu(v & 0xffffu, so) | (rnPrelu(v >> 16, so) << 16);
+                }
+                const size_t pix = (size_t)oy * OW + ox;
+                if (y)
+                    *reinterpret_cast<unsigned*>(y + pix * cout + n0) = v;
+                if (ylin)
+                {
+                    const size_t plane = (size_t)OW * OH;
+                    ylin[(size_t)n0 * plane + pix] = (unsigned short)(v & 0xffffu);
+                    ylin[(size_t)(n0 + 1) * plane + pix] = (unsigned short)(v >> 16);
+                }
+            }
+        }
+    }
+}
+
+#define FN_CONV(name, S, CG, A32, NB)                                                                                  \
+    extern "C" __global__ void __launch_bounds__(128, 2)                                                               \
+        name(const unsigned short* __restrict__ x, int cin, int H, int W, unsigned short* __restrict__ y, int cout,  \
+             const uint4* __restrict__ wf, const float* __restrict__ bias, float aIn, float aOut,                      \
+             unsigned short* __restrict__ ylin)                                                                        \
+    {                                                                                                                  \
+        fnConvT<S, CG, A32, NB>(x, cin, H, W, y, cout, wf, bias, aIn, aOut, ylin);                                     \
+    }
+FN_CONV(k_fnConvS1A16N8, 1, 64, false, 8)
+FN_CONV(k_fnConvS2A16N16, 2, 32, false, 16)
+FN_CONV(k_fnConvS1A16N16, 1, 64, false, 16)
+FN_CONV(k_fnConvS2A16N24, 2, 32, false, 24)
+FN_CONV(k_fnConvS1A16N12, 1, 64, false, 12)
+)FNSRC";
+
+// the module's whole text: kFnHead, kFnConv, then k_fnConv0L with block 1's first conv as literals (per output: the
+// bias, then fmaf over channel, tap in PyTorch's order)
+static void fnKernelText(std::string& s, const std::vector<float>& w0, const std::vector<float>& b0)
+{
+    s.reserve((size_t)1 << 18);
+    s = kFnHead;
+    s += kFnConv;
+    s +=
+        "extern \"C\" __global__ void __launch_bounds__(256) k_fnConv0L(const float* __restrict__ x, int ps, int rs,\n"
+        "    int W, int H, unsigned short* __restrict__ y, float aIn, float aOut)\n{\n"
+        "    const int OW = W >> 1, OH = H >> 1;\n"
+        "    const int ox = blockIdx.x * 32 + (threadIdx.x & 31), oy = blockIdx.y * 8 + (threadIdx.x >> 5);\n"
+        "    if (ox >= OW || oy >= OH)\n        return;\n    float v[27];\n"
+        "#pragma unroll\n    for (int c = 0; c < 3; ++c)\n#pragma unroll\n        for (int t = 0; t < 9; ++t)\n        {\n"
+        "            const int gy = 2 * oy + t / 3 - 1, gx = 2 * ox + t % 3 - 1;\n"
+        "            v[c * 9 + t] = (gy >= 0 && gy < H && gx >= 0 && gx < W)\n"
+        "                               ? fnLr(x[(size_t)c * ps + (size_t)gy * rs + gx], aIn)\n"
+        "                               : 0.0f;\n        }\n"
+        "    unsigned short* o = y + ((size_t)oy * OW + ox) * 64;\n    unsigned r[4];\n    float a;\n";
+    char ln[96];
+    auto lit = [&](float v) {
+        uint32_t b = 0;
+        memcpy(&b, &v, sizeof b);
+        a4kLit(s, b);
+    };
+    for (int n = 0; n < 64; n++)
+    {
+        s += "    a = ";
+        lit(b0[n]);
+        s += ";";
+        for (int k = 0; k < 27; k++)
+        {
+            s += " a = fmaf(";
+            lit(w0[(size_t)n * 27 + k]);
+            sprintf_s(ln, ", v[%d], a);", k);
+            s += ln;
+        }
+        s += "\n";
+        if (n % 2 == 0)
+            sprintf_s(ln, "    r[%d] = (unsigned)f2h(fnLr(a, aOut));\n", (n % 8) / 2);
+        else
+            sprintf_s(ln, "    r[%d] |= (unsigned)f2h(fnLr(a, aOut)) << 16;\n", (n % 8) / 2);
+        s += ln;
+        if (n % 8 == 7)
+        {
+            sprintf_s(ln, "    *reinterpret_cast<uint4*>(o + %d) = make_uint4(r[0], r[1], r[2], r[3]);\n", n - 7);
+            s += ln;
+        }
+    }
+    s += "}\n";
+}
+
+// a conv's weights [co][ci][3][3] in fnConvT's fragment order [z][step][q][lane][8 halves] (8 nb outputs a z; lane's
+// B registers for n-tiles 2q, 2q + 1: n = 8 (2q (+ 1)) + lane / 4, k = 2 (lane % 4) (+ 1, + 8, + 9)), rounded to fp16
+static std::vector<uint16_t> fnFragOf(std::span<const float> w, int co, int ci, int cg, int nb)
+{
+    static const int kOfs[4] = {0, 1, 8, 9};
+    const int kcn = cg / 16, nq = nb / 2;
+    std::vector<uint16_t> out((size_t)(co / (8 * nb)) * (ci * 9 / 16) * nq * 32 * 8);
+    size_t o = 0;
+    for (int z = 0; z < co / (8 * nb); z++)
+        for (int gi = 0; gi < ci / cg; gi++)
+            for (int tap = 0; tap < 9; tap++)
+                for (int kc = 0; kc < kcn; kc++)
+                    for (int q = 0; q < nq; q++)
+                        for (int lane = 0; lane < 32; lane++)
+                            for (int hf = 0; hf < 2; hf++)
+                                for (int j = 0; j < 4; j++)
+                                {
+                                    const int n = z * nb * 8 + (2 * q + hf) * 8 + (lane >> 2);
+                                    const int c = gi * cg + kc * 16 + (lane & 3) * 2 + kOfs[j];
+                                    out[o++] = f2hRne(w[((size_t)n * ci + c) * 9 + tap]);
+                                }
+    return out;
+}
+
+// feat.pkl in the strict FeatureNet form (block{1,2,3}: .0 / .2 = scalar PReLU slopes up to 1, .1 = conv 3 x 3
+// stride 2, .3 = conv 3 x 3; 64 / 128 / 192): conv 0's weights and bias (fp32, for the text), the six slopes, and per
+// conv 1..5 (block1.3, block2.1, block2.3, block3.1, block3.3) its fragment-order weights and fp32 bias in one block
+// (256-byte aligned, off[2 c] / off[2 c + 1]). false = missing, or not this net (`why`).
+static bool fnNatLoad(std::vector<uint8_t>& blob, size_t* off, std::vector<float>& w0, std::vector<float>& b0,
+                      float* slope, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\feat.pkl", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    };
+    bool form = wts.size() == 18;
+    for (int b = 0; b < 3 && form; b++)
+    {
+        const std::string p = "block" + std::to_string(b + 1) + ".";
+        const int64_t ci = kFnCh[b], co = kFnCh[b + 1];
+        form = has(p + "0.weight", {1}) && has(p + "2.weight", {1}) && has(p + "1.weight", {co, ci, 3, 3}) &&
+               has(p + "1.bias", {co}) && has(p + "3.weight", {co, co, 3, 3}) && has(p + "3.bias", {co});
+        if (form)
+        {
+            slope[2 * b] = wts[p + "0.weight"][0];
+            slope[2 * b + 1] = wts[p + "2.weight"][0];
+            // the A fragments' LeakyRelu = max(x, a x), exact for a slope up to 1
+            form = slope[2 * b] <= 1.0f && slope[2 * b + 1] <= 1.0f;
+        }
+    }
+    if (!form)
+    {
+        why = "its weights are not GMFSS's FeatureNet";
+        return false;
+    }
+    w0.assign(wts["block1.1.weight"].begin(), wts["block1.1.weight"].end());
+    b0.assign(wts["block1.1.bias"].begin(), wts["block1.1.bias"].end());
+    blob.clear();
+    auto put = [&](const void* p, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, p, n);
+        return o;
+    };
+    static const char* const kConv[5] = {"block1.3", "block2.1", "block2.3", "block3.1", "block3.3"};
+    for (int c = 0; c < 5; c++)
+    {
+        const int ci = kFnCh[c / 2 + 1], co = kFnCh[(c + 1) / 2 + 1];
+        const std::vector<uint16_t> wf =
+            fnFragOf(wts[std::string(kConv[c]) + ".weight"], co, ci, (c & 1) ? 32 : 64, kFnNb[c]);
+        const std::span<const float> bs = wts[std::string(kConv[c]) + ".bias"];
+        off[2 * c] = put(wf.data(), wf.size() * sizeof(uint16_t));
+        off[2 * c + 1] = put(bs.data(), bs.size() * sizeof(float));
+    }
+    return true;
+}
+
+// feat_ext's scratch: t1 (64 channels at the half; t3 and t5 reuse it), and with planar levels the channels-last
+// copies of f1 / f2 the next convs read (64 more)
+static size_t fnNatBytes(const NativeRife& nr, bool hwc)
+{
+    return (size_t)(hwc ? 64 : 128) * (size_t)(nr.pw / 2) * (size_t)(nr.ph / 2) * sizeof(uint16_t);
+}
+
+// this session's feat_ext module: the weights read, its text compiled (or the cached cubin) and loaded, its six kernels
+// bound, the weight block uploaded; false = `why` (the session teardown unloads a module left in fnMod)
+static bool nativeFnModule(NativeRife& nr, std::string& why)
+{
+    if (nr.fnMod)
+        return true;
+    std::vector<uint8_t> blob;
+    std::vector<float> w0, b0;
+    if (!fnNatLoad(blob, nr.fnOff, w0, b0, nr.fnSlope, why))
+        return false;
+    std::string text;
+    fnKernelText(text, w0, b0);
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_featnet.cu", L"smv_featnet", "feat_ext kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.fnMod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.fnMod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    for (int i = 0; i < 6; i++)
+        if (cuModuleGetFunction(&nr.fFn[i], nr.fnMod, kFnKern[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kFnKern[i] + " is missing";
+            return false;
+        }
+    if (cudaMalloc(&nr.dFnW, blob.size()) != cudaSuccess ||
+        cudaMemcpy(nr.dFnW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
+    return true;
+}
+
+// feat_ext of one frame on st: x = 3 fp32 planes (plane stride ps, row stride rs) at the padded frame -> f[0..2]
+// (nr.gmFeatHwc: channels-last, else planes); false = a launch failed
+static bool nativeFnRun(NativeRife& nr, const float* x, int ps, int rs, void** f, cudaStream_t st)
+{
+    int fw = nr.pw, fh = nr.ph;
+    const int hw = fw / 2, hh = fh / 2;
+    const size_t hp = (size_t)hw * hh;
+    const bool lin = !nr.gmFeatHwc;
+    unsigned short* t = (unsigned short*)nr.dFnScr; // t1, then t3, then t5
+    unsigned short* cl = t + 64 * hp;               // planes only: f1's, then f2's channels-last copy
+    unsigned short* const nul = nullptr;
+    float a0 = nr.fnSlope[0], a1 = nr.fnSlope[1];
+    const float* xp = x;
+    void* c0[] = {(void*)&xp, &ps, &rs, &fw, &fh, (void*)&t, &a0, &a1};
+    if (cuLaunchKernel(nr.fFn[0], (hw + 31) / 32, (hh + 7) / 8, 1, 256, 1, 1, 0, (CUstream)st, c0, nullptr) !=
+        CUDA_SUCCESS)
+        return false;
+    unsigned short* f1 = (unsigned short*)f[0];
+    unsigned short* f2 = (unsigned short*)f[1];
+    unsigned short* f3 = (unsigned short*)f[2];
+    struct Conv
+    {
+        unsigned short* in;
+        int cin, h, w;
+        unsigned short* y;
+        int cout, s;
+        float ai, ao;
+        unsigned short* yl;
+    } cv[5] = {{t, 64, hh, hw, lin ? cl : f1, 64, 1, 1.0f, 1.0f, lin ? f1 : nul},
+               {lin ? cl : f1, 64, hh, hw, t, 128, 2, nr.fnSlope[2], nr.fnSlope[3], nul},
+               {t, 128, hh / 2, hw / 2, lin ? cl : f2, 128, 1, 1.0f, 1.0f, lin ? f2 : nul},
+               {lin ? cl : f2, 128, hh / 2, hw / 2, t, 192, 2, nr.fnSlope[4], nr.fnSlope[5], nul},
+               {t, 192, hh / 4, hw / 4, lin ? nul : f3, 192, 1, 1.0f, 1.0f, lin ? f3 : nul}};
+    for (int i = 0; i < 5; i++)
+    {
+        Conv& c = cv[i];
+        const int oh = c.h / c.s, ow = c.w / c.s, th = c.s == 1 ? 8 : 4;
+        const uint4* wf = (const uint4*)((const char*)nr.dFnW + nr.fnOff[2 * i]);
+        const float* bias = (const float*)((const char*)nr.dFnW + nr.fnOff[2 * i + 1]);
+        void* a[] = {(void*)&c.in, &c.cin,       &c.h,  &c.w,  (void*)&c.y, &c.cout,
+                     (void*)&wf,   (void*)&bias, &c.ai, &c.ao, (void*)&c.yl};
+        if (cuLaunchKernel(nr.fFn[1 + i], (ow + 31) / 32, (oh + th - 1) / th, c.cout / (8 * kFnNb[i]), 128, 1, 1,
+                           c.s == 1 ? kFnSmS1 : kFnSmS2, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+            return false;
+    }
+    return true;
+}
+
+// ---- DRBA's block0 (calc_flow's first pyramid level) on the host's kernels -----------------------------------------
+// RIFE 4.25's IFBlock(15, c = 192) at scale 16 (rife_backend.RIFE.calc_flow), weights from engine\rife\flownet.pkl
+// (the host's torch zip reader; no engine, no ONNX). The motion frame is W x H (a multiple of 64); the levels: L0 =
+// W / 16 x H / 16 (the block's input and its flow), L1 = W / 32 x H / 32, L2 = W / 64 x H / 64. Its own NVRTC module
+// (kFnHead's helpers + kB0In + kB0Conv):
+// k_b0In   cat(img0, img1, f0, f1, 0.5) at L0 by PyTorch's bilinear (align_corners = False): at an exact 1 / 16 each
+//          sample is the mean of the 2 x 2 source pixels at rows / columns 16 i + 7, 16 i + 8; 15 fp32 planes
+// k_b0C0   conv 15 -> 96, 3 x 3 stride 2, + LeakyRelu(0.2): fp32 FMAs, one rounding to channels-last fp16 at L1
+// k_b0C1   conv 96 -> 192 stride 2 + LeakyRelu, and k_b0Res the 8 ResConvs {LeakyRelu(conv(x) * beta + x)} at L2: an
+//          implicit GEMM on the tensor cores (mma.sync m16n8k16, fp32 accumulators started at the bias; M = 16-pixel
+//          row runs of a 4 x 32 output tile, N = 16 outputs a block, K = 9 taps x the input channels CG at a time:
+//          each group's halo (16-byte chunks XOR-swizzled so each ldmatrix reads 8 bank groups) and weights in shared
+//          memory, one cp.async wait a group); the residual stream R in fp32 channels-last beside the fp16 copy the
+//          next conv reads
+// k_b0Last ConvTranspose 192 -> 52 (4 x 4, stride 2, pad 1) for the 16 channels PixelShuffle(2) turns into the 4
+//          flow planes: fp32 FMAs on R, the 192 inputs split over a block's 8 warps, the partial sums added in a
+//          fixed order; the 4 planes at L0. The flow at W x H = these planes by PyTorch's bilinear, times 16: the one
+//          reader, DRBA's flow splat, samples it there (drbaFlowAt), so the full-size flow is never written.
+static const int kB0SmC1 = 9 * 65 * 4 * 16 + 9 * 2 * 32 * 16;  // k_b0C1's halo + one group's weights, bytes
+static const int kB0SmRes = 6 * 34 * 8 * 16 + 9 * 4 * 32 * 16; // k_b0Res's
+static const char* const kB0Kern[5] = {"k_b0In", "k_b0C0", "k_b0C1", "k_b0Res", "k_b0Last"};
+
+static const char kB0In[] = R"B0SRC(
+__device__ __forceinline__ float b0Lr(float v)
+{
+    return v < 0.0f ? v * 0.2f : v;
+}
+
+__device__ __forceinline__ float b0Ld(const void* p, size_t i, int half)
+{
+    return half ? h2f(reinterpret_cast<const unsigned short*>(p)[i]) : reinterpret_cast<const float*>(p)[i];
+}
+
+// out = 15 fp32 planes at L0; img0 / img1 = 3 planes (fp16 when imgHalf), f0 / f1 = 4 planes (fp16 when featHalf)
+extern "C" __global__ void __launch_bounds__(256) k_b0In(const void* __restrict__ img0, const void* __restrict__ img1,
+                                                         int imgHalf, const void* __restrict__ f0,
+                                                         const void* __restrict__ f1, int featHalf, int W, int H,
+                                                         float* __restrict__ out)
+{
+    const int w16 = W >> 4, h16 = H >> 4;
+    const int x = blockIdx.x * 32 + (threadIdx.x & 31), y = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (x >= w16 || y >= h16)
+        return;
+    const size_t plane = (size_t)W * H, po = (size_t)w16 * h16, o = (size_t)y * w16 + x;
+    const size_t s = (size_t)(16 * y + 7) * W + 16 * x + 7;
+#pragma unroll
+    for (int c = 0; c < 14; ++c)
+    {
+        const void* src = c < 3 ? img0 : c < 6 ? img1 : c < 10 ? f0 : f1;
+        const int k = c < 3 ? c : c < 6 ? c - 3 : c < 10 ? c - 6 : c - 10, hf = c < 6 ? imgHalf : featHalf;
+        const size_t b = (size_t)k * plane + s;
+        const float a0 = b0Ld(src, b, hf), a1 = b0Ld(src, b + 1, hf);
+        const float a2 = b0Ld(src, b + W, hf), a3 = b0Ld(src, b + W + 1, hf);
+        out[c * po + o] = 0.5f * (0.5f * a0 + 0.5f * a1) + 0.5f * (0.5f * a2 + 0.5f * a3);
+    }
+    out[14 * po + o] = 0.5f;
+}
+
+// one L1 pixel and 24 outputs a thread (blockIdx.z = the 24), the z's weights staged in shared memory; in = the 15
+// planes at L0 (w16 x h16); y = channels-last fp16 [h16 / 2][w16 / 2][96]; wb = w[96][15][9] then b[96], fp32
+extern "C" __global__ void __launch_bounds__(256) k_b0C0(const float* __restrict__ in, int w16, int h16,
+                                                         unsigned short* __restrict__ y, const float* __restrict__ wb)
+{
+    __shared__ float sw[24 * 135 + 24];
+    const int z = blockIdx.z;
+    for (int i = threadIdx.x; i < 24 * 135; i += 256)
+        sw[i] = wb[z * 24 * 135 + i];
+    if (threadIdx.x < 24)
+        sw[24 * 135 + threadIdx.x] = wb[96 * 135 + z * 24 + threadIdx.x];
+    __syncthreads();
+    const int OW = w16 >> 1, OH = h16 >> 1;
+    const int ox = blockIdx.x * 32 + (threadIdx.x & 31), oy = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (ox >= OW || oy >= OH)
+        return;
+    const size_t po = (size_t)w16 * h16;
+    float acc[24];
+#pragma unroll
+    for (int o = 0; o < 24; ++o)
+        acc[o] = sw[24 * 135 + o];
+#pragma unroll 1
+    for (int c = 0; c < 15; ++c)
+    {
+        float v[9];
+#pragma unroll
+        for (int t = 0; t < 9; ++t)
+        {
+            const int gy = 2 * oy + t / 3 - 1, gx = 2 * ox + t % 3 - 1;
+            v[t] = (gy >= 0 && gy < h16 && gx >= 0 && gx < w16) ? in[c * po + (size_t)gy * w16 + gx] : 0.0f;
+        }
+#pragma unroll
+        for (int o = 0; o < 24; ++o)
+#pragma unroll
+            for (int t = 0; t < 9; ++t)
+                acc[o] = fmaf(sw[o * 135 + c * 9 + t], v[t], acc[o]);
+    }
+    unsigned r[12];
+#pragma unroll
+    for (int o = 0; o < 24; o += 2)
+        r[o / 2] = (unsigned)f2h(b0Lr(acc[o])) | ((unsigned)f2h(b0Lr(acc[o + 1])) << 16);
+    uint4* d = reinterpret_cast<uint4*>(y + ((size_t)oy * OW + ox) * 96 + z * 24);
+    d[0] = make_uint4(r[0], r[1], r[2], r[3]);
+    d[1] = make_uint4(r[4], r[5], r[6], r[7]);
+    d[2] = make_uint4(r[8], r[9], r[10], r[11]);
+}
+)B0SRC";
+
+static const char kB0Conv[] = R"B0SRC(
+// the stored index of halo pixel sp and its chunk k's swizzled slot
+template <int NCH>
+__device__ __forceinline__ unsigned b0Slot(int sp, int k)
+{
+    const int sw = NCH == 8 ? (k ^ (sp & 7)) : (k ^ ((sp >> 1) & 3));
+    return (unsigned)((sp * NCH + sw) << 4);
+}
+
+__device__ __forceinline__ uint4 b0Lds(unsigned addr)
+{
+    uint4 v;
+    asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr));
+    return v;
+}
+
+// one conv, 128 threads: x = cin channels-last fp16 at W x H; y = cout channels-last fp16 at W / S x H / S (null =
+// skipped); R = the same values in fp32 channels-last (RES: read, then overwritten in place: each value is read and
+// written by the one thread that owns it); wf[z][step][lane] (step = (group * 9 + tap) * CG / 16 + kc, the B
+// registers of the z's two n-tiles); bias, beta fp32. The 4 x 32 output tile's CG-channel halo (a stride-2 halo row
+// keeps its even offsets before its odd ones, so a tap's 8 rows sit next to each other) and the group's weights are
+// loaded by cp.async into shared memory, one wait a group
+template <int S, int CG, bool RES>
+__device__ __forceinline__ void b0ConvT(const unsigned short* __restrict__ x, int cin, int H, int W,
+                                        unsigned short* __restrict__ y, int cout, const uint4* __restrict__ wf,
+                                        const float* __restrict__ bias, const float* __restrict__ beta,
+                                        float* __restrict__ R)
+{
+    constexpr int TH = 4, NB = 2;
+    constexpr int HR = S == 1 ? TH + 2 : 2 * TH + 1, HC = S == 1 ? 34 : 65;
+    constexpr int NCH = CG / 8, KC = CG / 16;
+    constexpr int HALO = HR * HC * NCH * 16, GQ = 9 * KC * 32;
+    extern __shared__ __align__(128) unsigned char b0Sm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(b0Sm), wsm = halo + HALO;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, z = blockIdx.z;
+    const int OW = W / S, OH = H / S;
+    wf += (size_t)z * (cin * 9 / 16) * 32;
+    const int g = lane >> 2, t4 = lane & 3;
+    float acc[2][NB][4];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[z * NB * 8 + nj * 8 + t4 * 2], b1 = bias[z * NB * 8 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            acc[mi][nj][0] = acc[mi][nj][2] = b0;
+            acc[mi][nj][1] = acc[mi][nj][3] = b1;
+        }
+    }
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+        {
+            const int p = i / NCH, k = i - p * NCH;
+            const int hr = p / HC, hc = p - hr * HC;
+            const int gy = S * ty0 - 1 + hr, gx = S * tx0 - 1 + hc;
+            const int sp = S == 1 ? p : hr * HC + ((hc & 1) ? 33 + (hc >> 1) : (hc >> 1));
+            const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + gi * CG + k * 8 : x;
+            rnCp16(halo + b0Slot<NCH>(sp, k), src, in ? 16 : 0);
+        }
+        for (int i = threadIdx.x; i < GQ; i += 128)
+            rnCp16(wsm + (unsigned)i * 16u, wf + (size_t)gi * GQ + i, 16);
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+#pragma unroll 1
+        for (int tap = 0; tap < 9; ++tap)
+        {
+            const int dy = tap / 3, dx = tap - dy * 3;
+            int pa[2];
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                const int col = mi * 16 + arow;
+                pa[mi] = S == 1 ? (warp + dy) * HC + col + dx : (2 * warp + dy) * HC + (dx == 1 ? 33 + col : col + (dx >> 1));
+            }
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                const uint4 bw = b0Lds(wsm + (unsigned)((tap * KC + kc) * 32 + lane) * 16u);
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+                {
+                    unsigned a[4];
+                    rnLdm4(halo + b0Slot<NCH>(pa[mi], kc * 2 + akc), a);
+#pragma unroll
+                    for (int q = 0; q < NB; ++q)
+                    {
+                        float* d = acc[mi][q];
+                        const unsigned b0 = q ? bw.z : bw.x, b1 = q ? bw.w : bw.y;
+                        asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                     "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const int n0 = z * NB * 8 + nj * 8 + t4 * 2;
+        const float be0 = RES ? beta[n0] : 1.0f, be1 = RES ? beta[n0 + 1] : 1.0f;
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            const int oy = ty0 + warp;
+            if (oy >= OH)
+                continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int ox = tx0 + mi * 16 + g + h * 8;
+                if (ox >= OW)
+                    continue;
+                float v0 = acc[mi][nj][2 * h], v1 = acc[mi][nj][2 * h + 1];
+                const size_t pix = (size_t)oy * OW + ox;
+                float2* rp = reinterpret_cast<float2*>(R + pix * cout + n0);
+                if (RES)
+                {
+                    const float2 r = *rp;
+                    v0 = __fadd_rn(__fmul_rn(v0, be0), r.x);
+                    v1 = __fadd_rn(__fmul_rn(v1, be1), r.y);
+                }
+                v0 = b0Lr(v0);
+                v1 = b0Lr(v1);
+                *rp = make_float2(v0, v1);
+                if (y)
+                    *reinterpret_cast<unsigned*>(y + pix * cout + n0) =
+                        (unsigned)f2h(v0) | ((unsigned)f2h(v1) << 16);
+            }
+        }
+    }
+}
+
+// conv 96 -> 192 stride 2 + LeakyRelu (L1 -> L2) and one ResConv (L2 -> L2); grid (W / S / 32, H / S / 4, 12),
+// shared memory kB0SmC1 / kB0SmRes
+extern "C" __global__ void __launch_bounds__(128, 2)
+    k_b0C1(const unsigned short* __restrict__ x, int cin, int H, int W, unsigned short* __restrict__ y, int cout,
+           const uint4* __restrict__ wf, const float* __restrict__ bias, const float* __restrict__ beta,
+           float* __restrict__ R)
+{
+    b0ConvT<2, 32, false>(x, cin, H, W, y, cout, wf, bias, beta, R);
+}
+extern "C" __global__ void __launch_bounds__(128, 2)
+    k_b0Res(const unsigned short* __restrict__ x, int cin, int H, int W, unsigned short* __restrict__ y, int cout,
+            const uint4* __restrict__ wf, const float* __restrict__ bias, const float* __restrict__ beta,
+            float* __restrict__ R)
+{
+    b0ConvT<1, 64, true>(x, cin, H, W, y, cout, wf, bias, beta, R);
+}
+
+// One L1 pixel (Y, X) = (2 yy + py, 2 xx + px) and its 4 channels of flow plane c, blockIdx.z = (c, py, px): such a
+// pixel takes kernel rows ky in {1, 3} (py 0, input rows yy, yy - 1) or {0, 2} (py 1, rows yy + 1, yy), the columns
+// the same way; PixelShuffle(2) (CRD) puts channel 4c + 2 dy + dx at (Y, X) on plane c at (2 Y + dy, 2 X + dx). A
+// block = one L2 row yy, 32 columns xx, the 192 inputs split over its 8 warps (24 each). R = the residual stream
+// [h64][w64][192] fp32; out = 4 fp32 planes at L0; wl[z][192][2 rows][2 columns][4 channels] then b[16], fp32
+extern "C" __global__ void __launch_bounds__(256) k_b0Last(const float* __restrict__ R, int w64, int h64,
+                                                           float* __restrict__ out, const float* __restrict__ wl)
+{
+    __shared__ float4 sw[192 * 4];
+    __shared__ float4 red[8][32];
+    const int z = blockIdx.z, c = z >> 2, py = (z >> 1) & 1, px = z & 1;
+    const float4* src = reinterpret_cast<const float4*>(wl + (size_t)z * 192 * 16);
+    for (int i = threadIdx.x; i < 192 * 4; i += 256)
+        sw[i] = src[i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const int xx = blockIdx.x * 32 + lane, yy = blockIdx.y;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (xx < w64)
+#pragma unroll
+        for (int ti = 0; ti < 2; ++ti)
+        {
+            const int iy = yy + (py ? 1 - ti : -ti);
+            if (iy < 0 || iy >= h64)
+                continue;
+#pragma unroll
+            for (int tj = 0; tj < 2; ++tj)
+            {
+                const int ix = xx + (px ? 1 - tj : -tj);
+                if (ix < 0 || ix >= w64)
+                    continue;
+                const float4* r = reinterpret_cast<const float4*>(R + ((size_t)iy * w64 + ix) * 192) + wp * 6;
+                const int tp = ti * 2 + tj;
+                float4 v[6];
+#pragma unroll
+                for (int c4 = 0; c4 < 6; ++c4)
+                    v[c4] = r[c4];
+#pragma unroll
+                for (int c4 = 0; c4 < 6; ++c4)
+                {
+                    const float vv[4] = {v[c4].x, v[c4].y, v[c4].z, v[c4].w};
+#pragma unroll
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const float4 w = sw[((wp * 6 + c4) * 4 + k) * 4 + tp];
+                        acc[0] = fmaf(vv[k], w.x, acc[0]);
+                        acc[1] = fmaf(vv[k], w.y, acc[1]);
+                        acc[2] = fmaf(vv[k], w.z, acc[2]);
+                        acc[3] = fmaf(vv[k], w.w, acc[3]);
+                    }
+                }
+            }
+        }
+    red[wp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    __syncthreads();
+    if (threadIdx.x >= 128)
+        return;
+    const int j = threadIdx.x >> 5, px2 = threadIdx.x & 31, x2 = blockIdx.x * 32 + px2;
+    if (x2 >= w64)
+        return;
+    const float* bias = wl + (size_t)16 * 192 * 16;
+    float s = reinterpret_cast<const float*>(&red[0][px2])[j];
+#pragma unroll
+    for (int k = 1; k < 8; ++k)
+        s += reinterpret_cast<const float*>(&red[k][px2])[j];
+    s += bias[4 * c + j];
+    const int w16 = w64 * 4, Y = 2 * yy + py, X = 2 * x2 + px;
+    out[(size_t)c * w16 * (h64 * 4) + (size_t)(2 * Y + (j >> 1)) * w16 + 2 * X + (j & 1)] = s;
+}
+)B0SRC";
+
+// flownet.pkl's block0 in the strict IFBlock(15, c = 192) form (module.block0.: conv0.0.0 [96, 15, 3, 3], conv0.1.0
+// [192, 96, 3, 3], convblock.0 .. 7 {conv [192, 192, 3, 3], beta [1, 192, 1, 1]}, lastconv.0 [192, 52, 4, 4], their
+// biases) as one weight block of 256-byte aligned pieces: off[0] conv 0's weights then bias (fp32), off[1] / off[2]
+// conv 1's fragment-order weights / bias, off[3 + 3 i] / [4 + 3 i] / [5 + 3 i] ResConv i's weights / bias / beta,
+// off[27] the lastconv per (plane, row parity, column parity) as [192][2][2][4] (parity 0 = kernel taps 1, 3, parity
+// 1 = 0, 2) then the 16 biases (fp32). false = missing, or not this net (`why`).
+static bool b0NatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\rife\\flownet.pkl", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
+    const std::string p = "module.block0.";
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        const auto it = S.find(p + n);
+        return it != S.end() && it->second == s;
+    };
+    bool form = has("conv0.0.0.weight", {96, 15, 3, 3}) && has("conv0.0.0.bias", {96}) &&
+                has("conv0.1.0.weight", {192, 96, 3, 3}) && has("conv0.1.0.bias", {192}) &&
+                has("lastconv.0.weight", {192, 52, 4, 4}) && has("lastconv.0.bias", {52}) &&
+                !S.count(p + "convblock.8.beta");
+    for (int i = 0; i < 8 && form; i++)
+    {
+        const std::string c = "convblock." + std::to_string(i) + ".";
+        form =
+            has(c + "conv.weight", {192, 192, 3, 3}) && has(c + "conv.bias", {192}) && has(c + "beta", {1, 192, 1, 1});
+    }
+    if (!form)
+    {
+        why = "its weights are not RIFE 4.25's block0";
+        return false;
+    }
+    blob.clear();
+    auto put = [&](const void* d, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, d, n);
+        return o;
+    };
+    auto w = [&](const std::string& n) -> std::span<const float> { return wts[p + n]; };
+    const std::span<const float> c0w = w("conv0.0.0.weight"), c0b = w("conv0.0.0.bias");
+    std::vector<float> c0(c0w.begin(), c0w.end());
+    c0.insert(c0.end(), c0b.begin(), c0b.end());
+    off[0] = put(c0.data(), c0.size() * sizeof(float));
+    const std::vector<uint16_t> f1 = fnFragOf(w("conv0.1.0.weight"), 192, 96, 32, 2);
+    off[1] = put(f1.data(), f1.size() * sizeof(uint16_t));
+    off[2] = put(w("conv0.1.0.bias").data(), 192 * sizeof(float));
+    for (int i = 0; i < 8; i++)
+    {
+        const std::string c = "convblock." + std::to_string(i) + ".";
+        const std::vector<uint16_t> fr = fnFragOf(w(c + "conv.weight"), 192, 192, 64, 2);
+        off[3 + 3 * i] = put(fr.data(), fr.size() * sizeof(uint16_t));
+        off[4 + 3 * i] = put(w(c + "conv.bias").data(), 192 * sizeof(float));
+        off[5 + 3 * i] = put(w(c + "beta").data(), 192 * sizeof(float));
+    }
+    static const int kTap[2][2] = {{1, 3}, {0, 2}};
+    const std::span<const float> lw = w("lastconv.0.weight");
+    const std::span<const float> lb = w("lastconv.0.bias");
+    std::vector<float> lp;
+    lp.reserve((size_t)16 * 192 * 16 + 16);
+    for (int z = 0; z < 16; z++)
+    {
+        const int c = z >> 2, py = (z >> 1) & 1, px = z & 1;
+        for (int ci = 0; ci < 192; ci++)
+            for (int ti = 0; ti < 2; ti++)
+                for (int tj = 0; tj < 2; tj++)
+                    for (int j = 0; j < 4; j++)
+                        lp.push_back(lw[(((size_t)ci * 52 + 4 * c + j) * 4 + kTap[py][ti]) * 4 + kTap[px][tj]]);
+    }
+    lp.insert(lp.end(), lb.begin(), lb.begin() + 16);
+    off[27] = put(lp.data(), lp.size() * sizeof(float));
+    return true;
+}
+
+// block0's scratch at the motion frame (M x N): the 15 input planes and the 4 flow planes at L0 (fp32), conv 0's
+// output at L1 (96 fp16), the ping-pong at L2 (2 x 192 fp16) and the residual stream (192 fp32), 256-byte pieces in
+// that order; 0 without DRBA
+static size_t b0NatPiece(size_t b)
+{
+    return (b + 255) & ~(size_t)255;
+}
+static size_t b0NatBytes(const NativeRife& nr)
+{
+    if (!nr.drba)
+        return 0;
+    const size_t w = (size_t)(nr.mph ? nr.mpw : nr.pw), h = (size_t)(nr.mph ? nr.mph : nr.ph);
+    const size_t n16 = (w / 16) * (h / 16), n32 = (w / 32) * (h / 32), n64 = (w / 64) * (h / 64);
+    return b0NatPiece(15 * n16 * 4) + b0NatPiece(4 * n16 * 4) + b0NatPiece(96 * n32 * 2) +
+           2 * b0NatPiece(192 * n64 * 2) + b0NatPiece(192 * n64 * 4);
+}
+
+// this session's block0 module: the weights read, its text compiled (or the cached cubin) and loaded, its five kernels
+// bound, the weight block uploaded; false = `why` (the session teardown unloads a module left in b0Mod)
+static bool nativeB0Module(NativeRife& nr, std::string& why)
+{
+    if (nr.b0Mod)
+        return true;
+    std::vector<uint8_t> blob;
+    if (!b0NatLoad(blob, nr.b0Off, why))
+        return false;
+    std::string text = kFnHead;
+    text += kB0In;
+    text += kB0Conv;
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_block0.cu", L"smv_block0", "block0 kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.b0Mod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.b0Mod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    for (int i = 0; i < 5; i++)
+        if (cuModuleGetFunction(&nr.fB0[i], nr.b0Mod, kB0Kern[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kB0Kern[i] + " is missing";
+            return false;
+        }
+    if (cudaMalloc(&nr.dB0W, blob.size()) != cudaSuccess ||
+        cudaMemcpy(nr.dB0W, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
+    return true;
+}
+
+// block0 on one frame pair on st (nr.stream: its scratch shares the activation block with the contexts that enqueue
+// there): img0 / img1 = 3 planes at the motion frame fw x fh (fp16 when imgHalf), f0 / f1 their encodes in the IFNet's
+// feature dtype; *lo = its 4 flow planes at L0 in that scratch, for the splat that follows on the same stream. false =
+// the scratch or a launch failed
+static bool nativeB0Run(NativeRife& nr, const void* img0, const void* img1, int imgHalf, const void* f0, const void* f1,
+                        int fw, int fh, float** lo, cudaStream_t st)
+{
+    const size_t need = b0NatBytes(nr);
+    uint8_t* s = nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= need ? (uint8_t*)nr.dGmCtxMem : (uint8_t*)nr.dB0Own;
+    if (!s && cudaMalloc(&nr.dB0Own, need) == cudaSuccess)
+        s = (uint8_t*)nr.dB0Own;
+    if (!s)
+        return false;
+    int w16 = fw / 16, h16 = fh / 16, w32 = fw / 32, h32 = fh / 32, w64 = fw / 64, h64 = fh / 64;
+    const size_t n16 = (size_t)w16 * h16, n32 = (size_t)w32 * h32, n64 = (size_t)w64 * h64;
+    float* in = (float*)s;
+    float* flo = (float*)(s + b0NatPiece(15 * n16 * 4));
+    unsigned short* y0 = (unsigned short*)((uint8_t*)flo + b0NatPiece(4 * n16 * 4));
+    unsigned short* ya = (unsigned short*)((uint8_t*)y0 + b0NatPiece(96 * n32 * 2));
+    unsigned short* yb = (unsigned short*)((uint8_t*)ya + b0NatPiece(192 * n64 * 2));
+    float* R = (float*)((uint8_t*)yb + b0NatPiece(192 * n64 * 2));
+    const char* wb = (const char*)nr.dB0W;
+    const float* c0w = (const float*)(wb + nr.b0Off[0]);
+    const float* lw = (const float*)(wb + nr.b0Off[27]);
+    int featHalf = nr.featHalf ? 1 : 0;
+    void* p0[] = {(void*)&img0, (void*)&img1, &imgHalf, (void*)&f0, (void*)&f1, &featHalf, &fw, &fh, &in};
+    void* p1[] = {&in, &w16, &h16, &y0, (void*)&c0w};
+    if (cuLaunchKernel(nr.fB0[0], (unsigned)(w16 + 31) / 32, (unsigned)(h16 + 7) / 8, 1, 256, 1, 1, 0, (CUstream)st, p0,
+                       nullptr) != CUDA_SUCCESS ||
+        cuLaunchKernel(nr.fB0[1], (unsigned)(w32 + 31) / 32, (unsigned)(h32 + 7) / 8, 4, 256, 1, 1, 0, (CUstream)st, p1,
+                       nullptr) != CUDA_SUCCESS)
+        return false;
+    const unsigned gx = (unsigned)(w64 + 31) / 32, gy = (unsigned)(h64 + 3) / 4;
+    int c96 = 96, c192 = 192;
+    float* const nulF = nullptr;
+    unsigned short* const nulH = nullptr;
+    {
+        const uint4* wf = (const uint4*)(wb + nr.b0Off[1]);
+        const float* bias = (const float*)(wb + nr.b0Off[2]);
+        void* a[] = {&y0, &c96, &h32, &w32, &ya, &c192, (void*)&wf, (void*)&bias, (void*)&nulF, &R};
+        if (cuLaunchKernel(nr.fB0[2], gx, gy, 12, 128, 1, 1, kB0SmC1, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+            return false;
+    }
+    for (int i = 0; i < 8; i++)
+    {
+        unsigned short* x = (i & 1) ? yb : ya;
+        unsigned short* y = i == 7 ? nulH : (i & 1) ? ya : yb;
+        const uint4* wf = (const uint4*)(wb + nr.b0Off[3 + 3 * i]);
+        const float* bias = (const float*)(wb + nr.b0Off[4 + 3 * i]);
+        const float* beta = (const float*)(wb + nr.b0Off[5 + 3 * i]);
+        void* a[] = {&x, &c192, &h64, &w64, &y, &c192, (void*)&wf, (void*)&bias, (void*)&beta, &R};
+        if (cuLaunchKernel(nr.fB0[3], gx, gy, 12, 128, 1, 1, kB0SmRes, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+            return false;
+    }
+    void* pl[] = {&R, &w64, &h64, &flo, (void*)&lw};
+    if (cuLaunchKernel(nr.fB0[4], gx, (unsigned)h64, 16, 256, 1, 1, 0, (CUstream)st, pl, nullptr) != CUDA_SUCCESS)
+        return false;
+    *lo = flo;
+    return true;
+}
+
+// ---- GMFSS's MetricNet on the host's kernels ----------------------------------------------------------------------
+// MetricNet at the GMFSS half (the two backward warps' photometric means, gmflow's forward-backward check, conv_in, the
+// three residual convs, conv_out, tanh x 10) as 6 launches of its own module smv_metric_*.cubin (kFnHead's helpers +
+// kMnText), weights = engine\GMFSS_Fortuna\train_log\metric.pkl through pthStateDict (mnNatLoad); no engine, no ONNX, no fallback (a missing / wrong pkl =
+// `metricnet unavailable (...)`, the session refuses). It takes the motion halves (3 fp32 planes each) and both flow
+// directions (2 fp32 planes each) and hands out m0 then m1 as fp16 planes. Its scratch (mnArena) lives in the shared
+// activation block (nativeGmShareMemory sizes it in; sound while every enqueue there runs serially on nr.stream), else
+// dMnOwn.
+static const char kMnText[] = R"MNSRC(
+// GMFSS's MetricNet on the host's own kernels at the half size W x H (the host's GMFSS half, a multiple of 32).
+// k_mnIn      per pixel: metric0 = mean_c |i0 - i1 at p + f01|, metric1 = mean_c |i1 - i0 at p + f10| (bilinear, zeros
+//             outside: grid_sample's align_corners point of linspace + f / ((W - 1) / 2) is p + f), the forward-backward
+//             check (|f01 + f10 at p + f01| > 0.01 (|f01| + |f10|) + 0.5, and the other way), the normalized flows; the
+//             14-channel input cat(i0, i1, -metric0, -metric1, f01 n, f10 n, occ fwd, occ bwd) channels-last fp16
+//             [H][W][16]
+// k_mnConv16  conv_in 14 -> 64 on the zero-padded 16 channels; k_mnRes64 the ResConvs y = conv(PReLU(x)) + x, k_mnRes64P
+//             the last one, its output stored through conv_out's PReLU (conv_out is its only reader); k_mnOut conv_out 64
+//             -> 2 (padded to 16) then tanh x 10 into the fp16 planes m0, m1: implicit GEMMs on the tensor cores (mma.sync
+//             m16n8k16, an 8 x 32 output tile, a warp = 2 rows = 4 m-tiles, 64 outputs a block (16 for conv_out), the
+//             weights from global memory in fragment order a k-step ahead), the halo in shared memory (PReLU applied
+//             to it once: fp16, the engine's LeakyRelu), fp16 accumulators from the bias (conv_out fp32), the residual =
+//             x at the output pixel added in fp32, one rounding to fp16
+
+struct MnTap
+{
+    int o[4];
+    float w[4];
+};
+
+// PyTorch's grid_sampler_2d bilinear corners and weights at (px, py), zeros padding: a corner outside = weight 0
+__device__ __forceinline__ MnTap mnTap(float px, float py, int W, int H)
+{
+    const float fx = floorf(px), fy = floorf(py);
+    const int x0 = (int)fx, y0 = (int)fy, x1 = x0 + 1, y1 = y0 + 1;
+    const float ex = fx + 1.0f, ey = fy + 1.0f;
+    const float nw = (ex - px) * (ey - py), ne = (px - fx) * (ey - py), sw = (ex - px) * (py - fy),
+                se = (px - fx) * (py - fy);
+    MnTap t;
+    const bool ix0 = x0 >= 0 && x0 < W, ix1 = x1 >= 0 && x1 < W, iy0 = y0 >= 0 && y0 < H, iy1 = y1 >= 0 && y1 < H;
+    t.o[0] = ix0 && iy0 ? y0 * W + x0 : 0;
+    t.w[0] = ix0 && iy0 ? nw : 0.0f;
+    t.o[1] = ix1 && iy0 ? y0 * W + x1 : 0;
+    t.w[1] = ix1 && iy0 ? ne : 0.0f;
+    t.o[2] = ix0 && iy1 ? y1 * W + x0 : 0;
+    t.w[2] = ix0 && iy1 ? sw : 0.0f;
+    t.o[3] = ix1 && iy1 ? y1 * W + x1 : 0;
+    t.w[3] = ix1 && iy1 ? se : 0.0f;
+    return t;
+}
+
+__device__ __forceinline__ float mnAt(const float* __restrict__ p, const MnTap& t)
+{
+    float v = 0.0f;
+    v += p[t.o[0]] * t.w[0];
+    v += p[t.o[1]] * t.w[1];
+    v += p[t.o[2]] * t.w[2];
+    v += p[t.o[3]] * t.w[3];
+    return v;
+}
+
+extern "C" __global__ void __launch_bounds__(128) k_mnIn(const float* __restrict__ i0, const float* __restrict__ i1,
+                                                          const float* __restrict__ f01, const float* __restrict__ f10,
+                                                          int W, int H, unsigned short* __restrict__ x)
+{
+    const int px = blockIdx.x * 128 + threadIdx.x, py = blockIdx.y;
+    if (px >= W)
+        return;
+    const size_t hw = (size_t)W * H, p = (size_t)py * W + px;
+    const float ax = f01[p], ay = f01[hw + p], bx = f10[p], by = f10[hw + p];
+    const MnTap ta = mnTap((float)px + ax, (float)py + ay, W, H), tb = mnTap((float)px + bx, (float)py + by, W, H);
+    float c[16];
+    float m0 = 0.0f, m1 = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 3; ++k)
+    {
+        const float a = i0[k * hw + p], b = i1[k * hw + p];
+        c[k] = a;
+        c[3 + k] = b;
+        m0 += fabsf(a - mnAt(i1 + k * hw, ta));
+        m1 += fabsf(b - mnAt(i0 + k * hw, tb));
+    }
+    c[6] = -__fdiv_rn(m0, 3.0f);
+    c[7] = -__fdiv_rn(m1, 3.0f);
+    const float nx = ((float)W - 1.0f) / 2.0f, ny = ((float)H - 1.0f) / 2.0f;
+    c[8] = __fdiv_rn(ax, nx);
+    c[9] = __fdiv_rn(ay, ny);
+    c[10] = __fdiv_rn(bx, nx);
+    c[11] = __fdiv_rn(by, ny);
+    const float wbx = mnAt(f10, ta), wby = mnAt(f10 + hw, ta), wfx = mnAt(f01, tb), wfy = mnAt(f01 + hw, tb);
+    const float mag = sqrtf(ax * ax + ay * ay) + sqrtf(bx * bx + by * by);
+    const float thr = 0.01f * mag + 0.5f;
+    const float dfx = ax + wbx, dfy = ay + wby, dbx = bx + wfx, dby = by + wfy;
+    c[12] = sqrtf(dfx * dfx + dfy * dfy) > thr ? 1.0f : 0.0f;
+    c[13] = sqrtf(dbx * dbx + dby * dby) > thr ? 1.0f : 0.0f;
+    c[14] = c[15] = 0.0f;
+    uint4 v[2];
+    unsigned* u = reinterpret_cast<unsigned*>(v);
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+        u[k] = (unsigned)f2h(c[2 * k]) | ((unsigned)f2h(c[2 * k + 1]) << 16);
+    uint4* dst = reinterpret_cast<uint4*>(x + p * 16);
+    dst[0] = v[0];
+    dst[1] = v[1];
+}
+
+// the stored index of halo pixel sp and its chunk k's swizzled slot (each ldmatrix's 8 rows in 8 bank groups)
+template <int NCH>
+__device__ __forceinline__ unsigned mnSlot(int sp, int k)
+{
+    const int sw = NCH == 8 ? (k ^ (sp & 7)) : (k ^ ((sp >> 2) & 1));
+    return (unsigned)((sp * NCH + sw) << 4);
+}
+
+__device__ __forceinline__ uint4 mnLds(unsigned addr)
+{
+    uint4 v;
+    asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr));
+    return v;
+}
+
+__device__ __forceinline__ void mnSts(unsigned addr, uint4 v)
+{
+    asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" ::"r"(addr), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
+}
+
+// PReLU in fp16 (the engine's LeakyRelu on an fp16 tensor: x >= 0 ? x : x * slope rounded once)
+__device__ __forceinline__ unsigned mnPrelu2(unsigned u, float a)
+{
+    const float lo = h2f((unsigned short)(u & 0xffffu)), hi = h2f((unsigned short)(u >> 16));
+    const unsigned short l = lo < 0.0f ? f2h(lo * a) : (unsigned short)(u & 0xffffu);
+    const unsigned short h = hi < 0.0f ? f2h(hi * a) : (unsigned short)(u >> 16);
+    return (unsigned)l | ((unsigned)h << 16);
+}
+
+// one 3 x 3 stride-1 conv cin -> cout, 128 threads, x / y channels-last fp16 at W x H; wf[z][step][q][lane] (step =
+// (group * 9 + tap) * CG / 16 + kc, q = an n-tile pair), bias fp32 (8 NB a slice). RES: the halo through PReLU(slope),
+// y = conv + x at the output pixel; POUT: y stored through PReLU(slopeOut); FIN (conv_out): fp32 sums, outputs 0 / 1
+// -> tanh x 10 -> the fp16 planes y and y1
+template <int CG, int NB, bool RES, bool POUT, bool FIN>
+__device__ __forceinline__ void mnConv(const unsigned short* __restrict__ x, int cin, int H, int W,
+                                       unsigned short* __restrict__ y, int cout, const uint4* __restrict__ wf,
+                                       const float* __restrict__ bias, float slope, float slopeOut,
+                                       unsigned short* __restrict__ y1)
+{
+    constexpr bool A32 = FIN;
+    constexpr int TH = 8, RW = 2, MI = 4, HR = TH + 2, HC = 34;
+    constexpr int NCH = CG / 8, KC = CG / 16, NQ = NB / 2;
+    extern __shared__ __align__(128) unsigned char mnSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(mnSm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, z = blockIdx.z;
+    const int ksteps = cin * 9 / 16;
+    wf += (size_t)z * ksteps * NQ * 32;
+    const int g = lane >> 2, t4 = lane & 3;
+    float accF[A32 ? MI : 1][NB][4];
+    unsigned accH[A32 ? 1 : MI][NB][2];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[z * NB * 8 + nj * 8 + t4 * 2], b1 = bias[z * NB * 8 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < MI; ++mi)
+        {
+            if constexpr (A32)
+            {
+                accF[mi][nj][0] = accF[mi][nj][2] = b0;
+                accF[mi][nj][1] = accF[mi][nj][3] = b1;
+            }
+            else
+                accH[mi][nj][0] = accH[mi][nj][1] = (unsigned)f2h(b0) | ((unsigned)f2h(b1) << 16);
+        }
+    }
+    uint4 bc[NQ], bn[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q)
+        bc[q] = __ldg(wf + q * 32 + lane);
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+        {
+            const int p = i / NCH, k = i - p * NCH;
+            const int hr = p / HC, hc = p - hr * HC;
+            const int gy = ty0 - 1 + hr, gx = tx0 - 1 + hc;
+            const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + gi * CG + k * 8 : x;
+            rnCp16(halo + mnSlot<NCH>(p, k), src, in ? 16 : 0);
+        }
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+        if (RES)
+        {
+            for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+            {
+                uint4 v = mnLds(halo + (unsigned)i * 16u);
+                v.x = mnPrelu2(v.x, slope);
+                v.y = mnPrelu2(v.y, slope);
+                v.z = mnPrelu2(v.z, slope);
+                v.w = mnPrelu2(v.w, slope);
+                mnSts(halo + (unsigned)i * 16u, v);
+            }
+            __syncthreads();
+        }
+#pragma unroll 1
+        for (int tap = 0; tap < 9; ++tap)
+        {
+            const int dy = tap / 3, dx = tap - dy * 3;
+            int pa[MI];
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi)
+                pa[mi] = (RW * warp + (mi >> 1) + dy) * HC + (mi & 1) * 16 + arow + dx;
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                const int step = (gi * 9 + tap) * KC + kc;
+                if (step + 1 < ksteps)
+#pragma unroll
+                    for (int q = 0; q < NQ; ++q)
+                        bn[q] = __ldg(wf + ((step + 1) * NQ + q) * 32 + lane);
+#pragma unroll
+                for (int mi = 0; mi < MI; ++mi)
+                {
+                    unsigned a[4];
+                    rnLdm4(halo + mnSlot<NCH>(pa[mi], kc * 2 + akc), a);
+#pragma unroll
+                    for (int q = 0; q < NB; ++q)
+                    {
+                        const unsigned b0 = (q & 1) ? bc[q >> 1].z : bc[q >> 1].x;
+                        const unsigned b1 = (q & 1) ? bc[q >> 1].w : bc[q >> 1].y;
+                        if constexpr (A32)
+                        {
+                            float* d = accF[mi][q];
+                            asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                        }
+                        else
+                            asm volatile(SMV_MMA_F16 "{%0,%1}, {%2,%3,%4,%5}, "
+                                         "{%6,%7}, {%0,%1};\n"
+                                         : "+r"(accH[mi][q][0]), "+r"(accH[mi][q][1])
+                                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < NQ; ++q)
+                    bc[q] = bn[q];
+            }
+        }
+    }
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const int n0 = z * NB * 8 + nj * 8 + t4 * 2;
+#pragma unroll
+        for (int mi = 0; mi < MI; ++mi)
+        {
+            const int oy = ty0 + RW * warp + (mi >> 1);
+            if (oy >= H)
+                continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int ox = tx0 + (mi & 1) * 16 + g + h * 8;
+                if (ox >= W)
+                    continue;
+                float v0, v1;
+                if constexpr (A32)
+                {
+                    v0 = accF[mi][nj][2 * h];
+                    v1 = accF[mi][nj][2 * h + 1];
+                }
+                else
+                {
+                    v0 = h2f((unsigned short)(accH[mi][nj][h] & 0xffffu));
+                    v1 = h2f((unsigned short)(accH[mi][nj][h] >> 16));
+                }
+                const size_t pix = (size_t)oy * W + ox;
+                if (FIN)
+                {
+                    if (n0 == 0)
+                    {
+                        y[pix] = f2h(tanhf(v0) * 10.0f);
+                        y1[pix] = f2h(tanhf(v1) * 10.0f);
+                    }
+                    continue;
+                }
+                if (RES)
+                {
+                    const unsigned u = *reinterpret_cast<const unsigned*>(x + pix * cin + n0);
+                    v0 = __fadd_rn(v0, h2f((unsigned short)(u & 0xffffu)));
+                    v1 = __fadd_rn(v1, h2f((unsigned short)(u >> 16)));
+                }
+                unsigned o = (unsigned)f2h(v0) | ((unsigned)f2h(v1) << 16);
+                if (POUT)
+                    o = mnPrelu2(o, slopeOut);
+                *reinterpret_cast<unsigned*>(y + pix * cout + n0) = o;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2)
+    k_mnConv16(const unsigned short* __restrict__ x, int H, int W, unsigned short* __restrict__ y,
+               const uint4* __restrict__ wf, const float* __restrict__ bias)
+{
+    mnConv<16, 8, false, false, false>(x, 16, H, W, y, 64, wf, bias, 0.0f, 0.0f, nullptr);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2)
+    k_mnRes64(const unsigned short* __restrict__ x, int H, int W, unsigned short* __restrict__ y,
+              const uint4* __restrict__ wf, const float* __restrict__ bias, float slope)
+{
+    mnConv<64, 8, true, false, false>(x, 64, H, W, y, 64, wf, bias, slope, 0.0f, nullptr);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2)
+    k_mnRes64P(const unsigned short* __restrict__ x, int H, int W, unsigned short* __restrict__ y,
+               const uint4* __restrict__ wf, const float* __restrict__ bias, float slope, float slopeOut)
+{
+    mnConv<64, 8, true, true, false>(x, 64, H, W, y, 64, wf, bias, slope, slopeOut, nullptr);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 2)
+    k_mnOut(const unsigned short* __restrict__ x, int H, int W, const uint4* __restrict__ wf,
+            const float* __restrict__ bias, unsigned short* __restrict__ m0, unsigned short* __restrict__ m1)
+{
+    mnConv<64, 2, false, false, true>(x, 64, H, W, m0, 16, wf, bias, 0.0f, 0.0f, m1);
+}
+)MNSRC";
+static const char* const kMnKern[] = {"k_mnIn", "k_mnConv16", "k_mnRes64", "k_mnRes64P", "k_mnOut"};
+static_assert(sizeof(kMnKern) / sizeof(kMnKern[0]) == sizeof(NativeRife::fMn) / sizeof(CUfunction),
+              "one fMn slot a metricnet kernel");
+enum
+{
+    kMnIn,
+    kMnC16,
+    kMnRes,
+    kMnResP,
+    kMnOut
+};
+// a conv kernel's dynamic shared memory: the 8 x 32 tile's halo of its cg input channels
+static constexpr int mnSm(int cg)
+{
+    return 10 * 34 * (cg / 8) * 16;
+}
+
+// metric.pkl in the strict MetricNet form (metric_in [64][14][3][3]; metric_net1 .. 3 = {a scalar PReLU, a conv [64]
+// [64][3][3]}; metric_out = {a scalar PReLU, a conv [2][64][3][3]}; their biases) as one weight block of 256-byte aligned
+// pieces: off[0] / off[1] conv_in's fragments (its 14 inputs zero-padded to 16) and bias, off[2 + 2 r] / off[3 + 2 r]
+// ResConv r's, off[8] / off[9] conv_out's (padded to 16 outputs); slope[0 .. 2] the ResConvs' PReLU slopes, slope[3]
+// conv_out's. false = missing, or not this net (`why`)
+static bool mnNatLoad(std::vector<uint8_t>& blob, size_t* off, float* slope, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\metric.pkl", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    };
+    bool form = has("metric_in.weight", {64, 14, 3, 3}) && has("metric_in.bias", {64}) &&
+                has("metric_out.0.weight", {1}) && has("metric_out.1.weight", {2, 64, 3, 3}) &&
+                has("metric_out.1.bias", {2}) && !S.count("metric_net4.0.weight");
+    for (int r = 1; r <= 3 && form; r++)
+    {
+        const std::string p = "metric_net" + std::to_string(r) + ".";
+        form = has(p + "0.weight", {1}) && has(p + "1.weight", {64, 64, 3, 3}) && has(p + "1.bias", {64});
+    }
+    if (!form)
+    {
+        why = "its weights are not GMFSS's MetricNet";
+        return false;
+    }
+    blob.clear();
+    auto put = [&](const void* d, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, d, n);
+        return o;
+    };
+    const std::span<const float> w0 = wts["metric_in.weight"];
+    std::vector<float> w0p((size_t)64 * 16 * 9, 0.0f);
+    for (int n = 0; n < 64; n++)
+        for (int i = 0; i < 14; i++)
+            for (int t = 0; t < 9; t++)
+                w0p[((size_t)n * 16 + i) * 9 + t] = w0[((size_t)n * 14 + i) * 9 + t];
+    const std::vector<uint16_t> f0 = fnFragOf(w0p, 64, 16, 16, 8);
+    off[0] = put(f0.data(), f0.size() * sizeof(uint16_t));
+    off[1] = put(wts["metric_in.bias"].data(), 64 * sizeof(float));
+    for (int r = 0; r < 3; r++)
+    {
+        const std::string p = "metric_net" + std::to_string(r + 1) + ".";
+        const std::vector<uint16_t> fr = fnFragOf(wts[p + "1.weight"], 64, 64, 64, 8);
+        off[2 + 2 * r] = put(fr.data(), fr.size() * sizeof(uint16_t));
+        off[3 + 2 * r] = put(wts[p + "1.bias"].data(), 64 * sizeof(float));
+        slope[r] = wts[p + "0.weight"][0];
+    }
+    const std::span<const float> wo = wts["metric_out.1.weight"], bo = wts["metric_out.1.bias"];
+    std::vector<float> wop((size_t)16 * 64 * 9, 0.0f), bop(16, 0.0f);
+    std::copy(wo.begin(), wo.end(), wop.begin());
+    std::copy(bo.begin(), bo.end(), bop.begin());
+    const std::vector<uint16_t> fo = fnFragOf(wop, 16, 64, 64, 2);
+    off[8] = put(fo.data(), fo.size() * sizeof(uint16_t));
+    off[9] = put(bop.data(), bop.size() * sizeof(float));
+    slope[3] = wts["metric_out.0.weight"][0];
+    return true;
+}
+
+// metricnet's scratch at the half W x H, 256-byte pieces: the [H][W][16] input, one [H][W][64] ping-pong pair (fp16)
+struct MnArena
+{
+    size_t x = 0, fa = 0, fb = 0, total = 0;
+};
+static MnArena mnArena(int w, int h)
+{
+    MnArena a;
+    const size_t n = (size_t)w * (size_t)h;
+    size_t o = 0;
+    auto put = [&](size_t b) {
+        const size_t at = o;
+        o += (b + 255) & ~(size_t)255;
+        return at;
+    };
+    a.x = put(16 * n * sizeof(uint16_t));
+    a.fa = put(64 * n * sizeof(uint16_t));
+    a.fb = put(64 * n * sizeof(uint16_t));
+    a.total = o;
+    return a;
+}
+
+static size_t mnNatBytes(const NativeRife& nr)
+{
+    return nr.gmfss && nr.hw > 0 && nr.hh > 0 ? mnArena(nr.hw, nr.hh).total : 0;
+}
+
+// this session's metricnet module: the weights read, its text compiled (or the cached cubin) and loaded, its kernels
+// bound, the weight block uploaded; false = `why` (the session teardown unloads a module left in mnMod)
+static bool nativeMnModule(NativeRife& nr, std::string& why)
+{
+    if (nr.mnMod)
+        return true;
+    std::vector<uint8_t> blob;
+    if (!mnNatLoad(blob, nr.mnOff, nr.mnSlope, why))
+        return false;
+    std::string text = kFnHead;
+    text += kMnText;
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_metric.cu", L"smv_metric", "metricnet kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.mnMod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.mnMod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    for (int i = 0; i < (int)(sizeof(kMnKern) / sizeof(kMnKern[0])); i++)
+        if (cuModuleGetFunction(&nr.fMn[i], nr.mnMod, kMnKern[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kMnKern[i] + " is missing";
+            return false;
+        }
+    if (cudaMalloc(&nr.dMnW, blob.size()) != cudaSuccess ||
+        cudaMemcpy(nr.dMnW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
+    return true;
+}
+
+// metricnet on one pair on st (nr.stream) at the half nr.hw x nr.hh: i0 / i1 = the motion halves (3 fp32 planes),
+// f01 / f10 = the flows (2 fp32 planes); m0 / m1 = its outputs (an fp16 plane each). false = the scratch or a launch
+// failed
+static bool nativeMnRun(NativeRife& nr, const float* i0, const float* i1, const float* f01, const float* f10, void* m0,
+                        void* m1, cudaStream_t st)
+{
+    int w = nr.hw, h = nr.hh;
+    const MnArena ar = mnArena(w, h);
+    uint8_t* s = nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= ar.total ? (uint8_t*)nr.dGmCtxMem : (uint8_t*)nr.dMnOwn;
+    if (!s && cudaMalloc(&nr.dMnOwn, ar.total) == cudaSuccess)
+        s = (uint8_t*)nr.dMnOwn;
+    if (!s)
+        return false;
+    void* x = s + ar.x;
+    void* fab[2] = {s + ar.fa, s + ar.fb};
+    const char* wb = (const char*)nr.dMnW;
+    auto go = [&](int f, int gx, int gy, int sm, void** a) {
+        return cuLaunchKernel(nr.fMn[f], (unsigned)gx, (unsigned)gy, 1, 128, 1, 1, (unsigned)sm, (CUstream)st, a,
+                              nullptr) == CUDA_SUCCESS;
+    };
+    {
+        void* a[] = {(void*)&i0, (void*)&i1, (void*)&f01, (void*)&f10, &w, &h, &x};
+        if (!go(kMnIn, (w + 127) / 128, h, 0, a))
+            return false;
+    }
+    const int gx = (w + 31) / 32, gy = (h + 7) / 8;
+    {
+        const void* cw = wb + nr.mnOff[0];
+        const void* cb = wb + nr.mnOff[1];
+        void* a[] = {&x, &h, &w, &fab[0], (void*)&cw, (void*)&cb};
+        if (!go(kMnC16, gx, gy, mnSm(16), a))
+            return false;
+    }
+    for (int r = 0; r < 3; r++)
+    {
+        const void* cw = wb + nr.mnOff[2 + 2 * r];
+        const void* cb = wb + nr.mnOff[3 + 2 * r];
+        float sl = nr.mnSlope[r], so = nr.mnSlope[3];
+        void* a[] = {&fab[r & 1], &h, &w, &fab[(r + 1) & 1], (void*)&cw, (void*)&cb, &sl, &so};
+        if (!go(r < 2 ? kMnRes : kMnResP, gx, gy, mnSm(64), a))
+            return false;
+    }
+    {
+        const void* ow = wb + nr.mnOff[8];
+        const void* ob = wb + nr.mnOff[9];
+        void* a[] = {&fab[1], &h, &w, (void*)&ow, (void*)&ob, &m0, &m1};
+        if (!go(kMnOut, gx, gy, mnSm(64), a))
+            return false;
+    }
+    return true;
+}
+
+static size_t giNatBytes(const NativeRife& nr);
+static size_t fuNatBytes(const NativeRife& nr);
+static size_t gbNatBytes(const NativeRife& nr);
+static size_t bbNatBytes(const NativeRife& nr);
+static size_t gaNatBytes(const NativeRife& nr);
+
+// GMFSS's one activation block: Restore (live and offline, before the model on the same stream), feat_ext's scratch
+// (the first of the pair's work on it), metricnet's, the GMFSS IFNet's, fusionnet's, gmflow B's, the backbone's and the
+// transformer's activations, all serial on nr.stream; it takes the largest
 static bool nativeGmShareMemory(NativeRife& nr)
 {
-    int64_t need = 0, sum = 0;
-    for (int i = 0; i < kGmN; i++)
-    {
-        const int64_t b = nr.engGm[i]->getDeviceMemorySizeV2();
-        need = (std::max)(need, b);
-        sum += b;
-    }
-    // Restore (live and offline, before the model on the same stream) takes the block too; it grows to Restore's size
-    // when that is the larger
-    const int64_t rb = nr.ctxRest ? nr.engRest->getDeviceMemorySizeV2() : (int64_t)restNatBytes(nr),
-                  blk = (std::max)(need, rb);
+    const int64_t rb = (int64_t)restNatBytes(nr), fb = (int64_t)fnNatBytes(nr, true), mb = (int64_t)mnNatBytes(nr),
+                  gb = (int64_t)giNatBytes(nr), ub = (int64_t)fuNatBytes(nr), bb = (int64_t)gbNatBytes(nr),
+                  kb = (int64_t)bbNatBytes(nr), ab = (int64_t)gaNatBytes(nr),
+                  blk = (std::max)((std::max)((std::max)(rb, (std::max)(fb, mb)), (std::max)((std::max)(gb, ub), bb)),
+                                   (std::max)(kb, ab));
     if (blk > 0 && cudaMalloc(&nr.dGmCtxMem, (size_t)blk) != cudaSuccess)
     {
         LOG("native: gmfss shared activation block (%.0f MB) alloc failed\n", blk / 1048576.0);
         return false;
     }
-    for (int i = 0; i < kGmN; i++)
-        nr.ctxGm[i]->setDeviceMemoryV2(nr.dGmCtxMem, need);
     nr.gmCtxMemB = blk;
-    LOG("native: gmfss contexts share one %.0f MB activation block (%.0f MB as eight)\n", need / 1048576.0,
-        sum / 1048576.0);
-    if (nr.ctxRest)
+    LOG("native: gmfss nets share one %.0f MB activation block\n", blk / 1048576.0);
+    return true;
+}
+
+// a chain's graph mode (live on, offline only with SMV_OFFLINE_GRAPH=1); its switch env = 0 turns it off, = fail
+// throws every capture away
+static int chainGraphMode(const char* env)
+{
+    const std::string v = lkEnv(env);
+    return v == "0" || (g_offline && !g_offlineGraph) ? 0 : v == "fail" ? 2 : 1;
+}
+
+static void chainGraphsFree(ChainGraphs& cg)
+{
+    for (ChainGraphs::Entry& x : cg.e)
     {
-        nr.ctxRest->setDeviceMemoryV2(nr.dGmCtxMem, nr.gmCtxMemB);
-        LOG("native: the restore context shares it (%.0f MB on its own)\n", rb / 1048576.0);
+        if (x.exec)
+            cudaGraphExecDestroy(x.exec);
+        x = ChainGraphs::Entry();
+    }
+    cg.next = cg.mode = cg.captures = 0;
+    cg.logged = false;
+}
+
+// the chain `launch` (its kernels on st, nothing else) through cg: the graph captured for key (the chain's buffers, up to
+// kKey - 2) at w x h replays; a new key captures one (ThreadLocal stream capture); a failed capture = direct launches
+// for the rest of the session (`native: NAME graph capture failed: direct launches`). Short kernels at small sizes leave
+// the GPU waiting between single launches; a graph replays them back to back
+template <class F>
+static bool chainGraphRun(ChainGraphs& cg, std::initializer_list<const void*> bufs, int w, int h, cudaStream_t st,
+                          const char* name, F&& launch)
+{
+    if (!cg.mode)
+        return launch();
+    const void* key[ChainGraphs::kKey] = {};
+    int n = 0;
+    for (const void* b : bufs)
+        if (n < ChainGraphs::kKey - 2)
+            key[n++] = b;
+    key[ChainGraphs::kKey - 2] = (const void*)(intptr_t)w;
+    key[ChainGraphs::kKey - 1] = (const void*)(intptr_t)h;
+    for (const ChainGraphs::Entry& x : cg.e)
+        if (x.exec && memcmp(x.key, key, sizeof(key)) == 0)
+            return cudaGraphLaunch(x.exec, st) == cudaSuccess;
+    if (++cg.captures > ChainGraphs::kMaxCaptures)
+    {
+        chainGraphsFree(cg);
+        LOG("native: %s keeps new buffers: direct launches\n", name);
+        return launch();
+    }
+    cudaGraph_t g = nullptr;
+    cudaGraphExec_t ex = nullptr;
+    bool ok = false;
+    if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess)
+    {
+        const bool launched = launch();
+        ok = cudaStreamEndCapture(st, &g) == cudaSuccess && launched && g;
+    }
+    ok = ok && cg.mode != 2 && cudaGraphInstantiate(&ex, g, 0) == cudaSuccess;
+    if (g)
+        cudaGraphDestroy(g);
+    if (!ok)
+    {
+        chainGraphsFree(cg);
+        cudaGetLastError();
+        LOG("native: %s graph capture failed: direct launches\n", name);
+        return launch();
+    }
+    ChainGraphs::Entry& slot = cg.e[cg.next];
+    cg.next = (cg.next + 1) % ChainGraphs::kN;
+    if (slot.exec)
+        cudaGraphExecDestroy(slot.exec);
+    memcpy(slot.key, key, sizeof(key));
+    slot.exec = ex;
+    if (!cg.logged)
+        LOG("native: %s as one CUDA graph (%dx%d)\n", name, w, h);
+    cg.logged = true;
+    return cudaGraphLaunch(ex, st) == cudaSuccess;
+}
+
+// ---- RIFE 4.25's IFNet on the host's kernels ----------------------------------------------------------------------
+// The whole IFNet (5 IFBlocks + the warps between them) as 59 launches of its own module smv_ifnet_*.cubin (kFnHead's
+// helpers + kIfnA / B / C), weights = engine\rife\flownet.pkl's module.block0 .. 4 through pthStateDict (ifnNatLoad);
+// no engine, no ONNX, no fallback (a missing / wrong pkl = `the IFNet unavailable (...)`, the session refuses). It
+// takes the fp16 frame pair, the fp16 timestep plane and the fp16 encodes at the motion frame and hands out the fp16
+// flow + mask RIFE's last step (nativeRifeBlend) reads. Its scratch (ifnArena) lives in the shared activation block
+// (nativeModelShareMemory sizes it in; sound while every enqueue there runs serially on nr.stream), else dIfnOwn.
+static const char kIfnA[] = R"IFNSRC(
+// RIFE 4.25's IFNet (IFNet_HDv3: 5 IFBlocks at scales 16, 8, 4, 2, 1 with c = 192, 128, 96, 64, 32) on the host's own
+// kernels. The frame is W x H (a multiple of 64). Block k (scale s = 16 >> k) works at L0 = W / s x H / s (its input
+// and its output tmp), L1 = L0 / 2, L2 = L0 / 4. Every block's tmp stays at its L0 as 4 float4 quads a pixel
+// ([quad][h][w][4]: quad 0 = the flow, quads 1..3 = the mask and the 8 features, channel 12's quad padded); the
+// author's full-size tensors (the flow summed over the blocks, the mask, the features, the warps) are read only where a
+// reader needs them, by PyTorch's bilinear from those quads. Nothing at the full size is written but the outputs.
+// k_ifIn0h     block 0's input cat(img0, img1, f0, f1, timestep) at L0: at an exact 1 / 16 each sample = PyTorch's
+//              bilinear mean of the 2 x 2 source pixels at rows / columns 16 i + 7, 16 i + 8; channels-last fp16 [L0][16]
+// k_ifIn<k>h   block k's input (k = 1..3) at L0: cat(warp(img0), warp(img1), warp(f0), warp(f1), timestep, mask,
+//              features, flow / s) where the author resizes the full-size cat to L0 = the mean of the 4 full-size taps at
+//              rows / columns s i + s / 2 - 1, + 1; at each tap the flow = the blocks before summed as the author sums
+//              them (block j's flow quad by bilinear x its scale, in block order, fp32), the warps = bilinear taps at the
+//              pixel + the flow clamped into the frame (grid_sample's border rule), the mask / features = the previous
+//              block's quads by bilinear; channels-last fp16 [L0][32] (28 channels + 4 zeros)
+// k_ifInC0_4   block 4's conv0[0] with its input (the pixel itself, s = 1) built straight into its halo: never written
+// k_ifS2g16 / k_ifS2g32   a 3 x 3 stride-2 conv + LeakyRelu (conv0[0] of blocks 0..3 on the padded fp16 input, conv0[1]
+//              of every block); k_ifResg32 / k_ifResg64 the ResConvs {LeakyRelu(conv(x) * beta + x)}, the residual =
+//              the conv's own fp16 input at the pixel: implicit GEMMs on the tensor cores (mma.sync m16n8k16, fp32
+//              accumulators from the bias, a 4 x 32 output tile, a CG-channel group's halo and weights by cp.async)
+// k_ifLastQ32 / 64   ConvTranspose c -> 52 (4 x 4, stride 2, pad 1) + PixelShuffle(2): per output parity class a 2 x 2-
+//              tap conv over L2 on the tensor cores, the 4 classes in one block, the L0 tile staged in shared memory and
+//              stored as the 16-output group's quad; k_ifLastQF32 (block 4, 20 outputs) = the IFNet's outputs: the flow
+//              + the blocks before and sigmoid(mask), 4 + 1 fp16 planes
+
+__device__ __forceinline__ float ifLr(float v)
+{
+    return v < 0.0f ? v * 0.2f : v;
+}
+
+// one axis of PyTorch's bilinear resize (align_corners False) from n source pixels to n x s at pixel x, s a power of 2
+// (the source point (2 x + 1 - s) / 2 s is exact): the two source pixels and the second one's weight (the last pixel
+// pairs with itself and keeps its weight, as PyTorch's h1p does)
+__device__ __forceinline__ void ifUpAxis(int x, int s, int n, int& i0, int& i1, float& l)
+{
+    const int num = 2 * x + 1 - s, den = 2 * s;
+    i0 = 0;
+    l = 0.0f;
+    if (num > 0)
+    {
+        i0 = num / den;
+        l = (float)(num - i0 * den) / (float)den;
+    }
+    i1 = i0 < n - 1 ? i0 + 1 : i0;
+}
+
+struct IfUp
+{
+    int o00, o01, o10, o11;
+    float lx, ly;
+};
+
+// full-size pixel (x, y) of a level s times smaller (w x h)
+__device__ __forceinline__ IfUp ifUp(int x, int y, int s, int w, int h)
+{
+    int x0, x1, y0, y1;
+    IfUp u;
+    ifUpAxis(x, s, w, x0, x1, u.lx);
+    ifUpAxis(y, s, h, y0, y1, u.ly);
+    u.o00 = y0 * w + x0;
+    u.o01 = y0 * w + x1;
+    u.o10 = y1 * w + x0;
+    u.o11 = y1 * w + x1;
+    return u;
+}
+
+// PyTorch's order on each channel of a quad: h0 (w0 v00 + w1 v01) + h1 (w0 v10 + w1 v11)
+__device__ __forceinline__ float4 ifUpAt4(const float4* __restrict__ p, const IfUp& u)
+{
+    const float wx0 = 1.0f - u.lx, wy0 = 1.0f - u.ly;
+    const float4 a = p[u.o00], b = p[u.o01], c = p[u.o10], d = p[u.o11];
+    return make_float4(wy0 * (wx0 * a.x + u.lx * b.x) + u.ly * (wx0 * c.x + u.lx * d.x),
+                       wy0 * (wx0 * a.y + u.lx * b.y) + u.ly * (wx0 * c.y + u.lx * d.y),
+                       wy0 * (wx0 * a.z + u.lx * b.z) + u.ly * (wx0 * c.z + u.lx * d.z),
+                       wy0 * (wx0 * a.w + u.lx * b.w) + u.ly * (wx0 * c.w + u.lx * d.w));
+}
+
+// the flow at full-size pixel (x, y) after blocks 0 .. NL - 1: tmp_j's flow quad by bilinear x 16 >> j, summed in block
+// order (block 0's flow = its own, each later one added)
+template <int NL>
+__device__ __forceinline__ void ifFlowAt(const float* __restrict__ t0, const float* __restrict__ t1,
+                                         const float* __restrict__ t2, const float* __restrict__ t3, int x, int y,
+                                         int W, int H, float f[4])
+{
+#pragma unroll
+    for (int j = 0; j < NL; ++j)
+    {
+        const float* t = j == 0 ? t0 : j == 1 ? t1 : j == 2 ? t2 : t3;
+        const int s = 16 >> j, w = W / s, h = H / s;
+        const float4 q = ifUpAt4(reinterpret_cast<const float4*>(t), ifUp(x, y, s, w, h));
+        const float v4[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+        {
+            const float v = v4[c] * (float)s;
+            f[c] = j == 0 ? v : f[c] + v;
+        }
+    }
+}
+
+// one axis of a warp tap at pixel x plus the offset u px, the point clamped into [0, n - 1] (the host's nvAxis)
+__device__ __forceinline__ void ifAxis(int x, float u, int n, int& x0, int& x1, float& l)
+{
+    u = fminf(fmaxf(u, -(float)(n + 1)), (float)(n + 1));
+    const float fl = floorf(u);
+    x0 = x + (int)fl;
+    l = u - fl;
+    if (x0 < 0)
+    {
+        x0 = 0;
+        l = 0.0f;
+    }
+    else if (x0 >= n - 1)
+    {
+        x0 = n - 1;
+        l = 0.0f;
+    }
+    x1 = x0 < n - 1 ? x0 + 1 : x0;
+}
+
+__device__ __forceinline__ IfUp ifTap(int x, int y, float ux, float uy, int W, int H)
+{
+    int x0, x1, y0, y1;
+    IfUp t;
+    ifAxis(x, ux, W, x0, x1, t.lx);
+    ifAxis(y, uy, H, y0, y1, t.ly);
+    t.o00 = y0 * W + x0;
+    t.o01 = y0 * W + x1;
+    t.o10 = y1 * W + x0;
+    t.o11 = y1 * W + x1;
+    return t;
+}
+
+__device__ __forceinline__ float ifTapH(const unsigned short* __restrict__ p, const IfUp& t)
+{
+    const float wx0 = 1.0f - t.lx, wy0 = 1.0f - t.ly;
+    return wy0 * (wx0 * h2f(p[t.o00]) + t.lx * h2f(p[t.o01])) + t.ly * (wx0 * h2f(p[t.o10]) + t.lx * h2f(p[t.o11]));
+}
+
+// block 0's input: x = 6 fp16 planes (img0, img1), f0 / f1 = 4 fp16 planes, ts = 1 fp16 plane, all W x H; out =
+// channels-last fp16 [W / 16 x H / 16][16] (the 15 channels + a zero)
+extern "C" __global__ void __launch_bounds__(256) k_ifIn0h(const unsigned short* __restrict__ x,
+                                                           const unsigned short* __restrict__ f0,
+                                                           const unsigned short* __restrict__ f1,
+                                                           const unsigned short* __restrict__ ts, int W, int H,
+                                                           unsigned short* __restrict__ out)
+{
+    const int w16 = W >> 4, h16 = H >> 4;
+    const int X = blockIdx.x * 32 + (threadIdx.x & 31), Y = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (X >= w16 || Y >= h16)
+        return;
+    const int plane = W * H, o = Y * w16 + X;
+    const int s = (16 * Y + 7) * W + 16 * X + 7;
+    unsigned short v[16];
+#pragma unroll
+    for (int c = 0; c < 15; ++c)
+    {
+        const unsigned short* src = c < 6 ? x + c * plane : c < 10 ? f0 + (c - 6) * plane : c < 14 ? f1 + (c - 10) * plane : ts;
+        const float a0 = h2f(src[s]), a1 = h2f(src[s + 1]), a2 = h2f(src[s + W]), a3 = h2f(src[s + W + 1]);
+        v[c] = f2h(0.5f * (0.5f * a0 + 0.5f * a1) + 0.5f * (0.5f * a2 + 0.5f * a3));
+    }
+    v[15] = 0;
+    uint4* d = reinterpret_cast<uint4*>(out + (size_t)o * 16);
+#pragma unroll
+    for (int q = 0; q < 2; ++q)
+        d[q] = make_uint4((unsigned)v[q * 8] | ((unsigned)v[q * 8 + 1] << 16), (unsigned)v[q * 8 + 2] | ((unsigned)v[q * 8 + 3] << 16),
+                          (unsigned)v[q * 8 + 4] | ((unsigned)v[q * 8 + 5] << 16), (unsigned)v[q * 8 + 6] | ((unsigned)v[q * 8 + 7] << 16));
+}
+
+// the 28 input channels of block K at full-size pixel (px, py)
+template <int K>
+__device__ __forceinline__ void ifInTap(const unsigned short* __restrict__ x, const unsigned short* __restrict__ f0,
+                                        const unsigned short* __restrict__ f1, const unsigned short* __restrict__ ts,
+                                        int W, int H, const float* __restrict__ t0, const float* __restrict__ t1,
+                                        const float* __restrict__ t2, const float* __restrict__ t3, int px, int py,
+                                        float v[28])
+{
+    const int plane = W * H;
+    float f[4];
+    ifFlowAt<K>(t0, t1, t2, t3, px, py, W, H, f);
+    const IfUp T0 = ifTap(px, py, f[0], f[1], W, H), T1 = ifTap(px, py, f[2], f[3], W, H);
+#pragma unroll
+    for (int c = 0; c < 3; ++c)
+    {
+        v[c] = ifTapH(x + c * plane, T0);
+        v[3 + c] = ifTapH(x + (3 + c) * plane, T1);
+    }
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+    {
+        v[6 + c] = ifTapH(f0 + c * plane, T0);
+        v[10 + c] = ifTapH(f1 + c * plane, T1);
+    }
+    v[14] = h2f(ts[py * W + px]);
+    const float* tp = K == 1 ? t0 : K == 2 ? t1 : K == 3 ? t2 : t3;
+    const int sp = 16 >> (K - 1), wp = W / sp, hp = H / sp, pl = wp * hp;
+    const IfUp u = ifUp(px, py, sp, wp, hp);
+    const float4* q4 = reinterpret_cast<const float4*>(tp);
+    const float4 m1 = ifUpAt4(q4 + pl, u), m2 = ifUpAt4(q4 + 2 * pl, u), m3 = ifUpAt4(q4 + 3 * pl, u);
+    v[15] = m1.x;
+    v[16] = m1.y;
+    v[17] = m1.z;
+    v[18] = m1.w;
+    v[19] = m2.x;
+    v[20] = m2.y;
+    v[21] = m2.z;
+    v[22] = m2.w;
+    v[23] = m3.x;
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+        v[24 + c] = f[c];
+}
+
+// block K's 28 input channels at L0 pixel (X, Y): the full-size taps the author's resize reads, averaged
+template <int K>
+__device__ __forceinline__ void ifInAt(const unsigned short* __restrict__ x, const unsigned short* __restrict__ f0,
+                                       const unsigned short* __restrict__ f1, const unsigned short* __restrict__ ts, int W,
+                                       int H, const float* __restrict__ t0, const float* __restrict__ t1,
+                                       const float* __restrict__ t2, const float* __restrict__ t3, int X, int Y,
+                                       float r[28])
+{
+    constexpr int S = 16 >> K;
+    if (S == 1)
+        ifInTap<K>(x, f0, f1, ts, W, H, t0, t1, t2, t3, X, Y, r);
+    else
+    {
+        constexpr int A = S / 2 - 1;
+        float v0[28], v1[28];
+        float r0[28];
+        ifInTap<K>(x, f0, f1, ts, W, H, t0, t1, t2, t3, S * X + A, S * Y + A, v0);
+        ifInTap<K>(x, f0, f1, ts, W, H, t0, t1, t2, t3, S * X + A + 1, S * Y + A, v1);
+#pragma unroll
+        for (int c = 0; c < 28; ++c)
+            r0[c] = 0.5f * v0[c] + 0.5f * v1[c];
+        ifInTap<K>(x, f0, f1, ts, W, H, t0, t1, t2, t3, S * X + A, S * Y + A + 1, v0);
+        ifInTap<K>(x, f0, f1, ts, W, H, t0, t1, t2, t3, S * X + A + 1, S * Y + A + 1, v1);
+#pragma unroll
+        for (int c = 0; c < 28; ++c)
+            r[c] = 0.5f * r0[c] + 0.5f * (0.5f * v0[c] + 0.5f * v1[c]);
+    }
+#pragma unroll
+    for (int c = 24; c < 28; ++c)
+        r[c] = r[c] * (1.0f / (float)S);
+}
+
+// block K's input at L0 into channels-last fp16 [L0][32] (the 28 channels + 4 zeros)
+template <int K>
+__device__ __forceinline__ void ifInBody(const unsigned short* __restrict__ x, const unsigned short* __restrict__ f0,
+                                         const unsigned short* __restrict__ f1, const unsigned short* __restrict__ ts,
+                                         int W, int H, const float* __restrict__ t0, const float* __restrict__ t1,
+                                         const float* __restrict__ t2, const float* __restrict__ t3,
+                                         unsigned short* __restrict__ out)
+{
+    constexpr int S = 16 >> K;
+    const int wl = W / S, hl = H / S;
+    const int X = blockIdx.x * 32 + (threadIdx.x & 31), Y = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (X >= wl || Y >= hl)
+        return;
+    float r[28];
+    ifInAt<K>(x, f0, f1, ts, W, H, t0, t1, t2, t3, X, Y, r);
+    uint4* d = reinterpret_cast<uint4*>(out + (size_t)(Y * wl + X) * 32);
+#pragma unroll
+    for (int q = 0; q < 4; ++q)
+    {
+        unsigned u[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+        {
+            const int c = q * 8 + 2 * k;
+            u[k] = (c < 28 ? (unsigned)f2h(r[c]) : 0u) | ((c + 1 < 28 ? (unsigned)f2h(r[c + 1]) : 0u) << 16);
+        }
+        d[q] = make_uint4(u[0], u[1], u[2], u[3]);
+    }
+}
+
+#define IF_IN(K)                                                                                                       \
+    extern "C" __global__ void __launch_bounds__(256)                                                                  \
+        k_ifIn##K##h(const unsigned short* __restrict__ x, const unsigned short* __restrict__ f0,                      \
+                     const unsigned short* __restrict__ f1, const unsigned short* __restrict__ ts, int W, int H,        \
+                     const float* __restrict__ t0, const float* __restrict__ t1, const float* __restrict__ t2,         \
+                     const float* __restrict__ t3, unsigned short* __restrict__ out)                                   \
+    {                                                                                                                  \
+        ifInBody<K>(x, f0, f1, ts, W, H, t0, t1, t2, t3, out);                                                         \
+    }
+IF_IN(1)
+IF_IN(2)
+IF_IN(3)
+
+)IFNSRC";
+static const char kIfnB[] = R"IFNSRC(
+// the stored index of halo pixel sp and its chunk k's swizzled slot (each ldmatrix's 8 rows in 8 bank groups)
+template <int NCH>
+__device__ __forceinline__ unsigned ifSlot(int sp, int k)
+{
+    const int sw = NCH == 8 ? (k ^ (sp & 7)) : NCH == 4 ? (k ^ ((sp >> 1) & 3)) : (k ^ ((sp >> 2) & 1));
+    return (unsigned)((sp * NCH + sw) << 4);
+}
+
+__device__ __forceinline__ uint4 ifLds(unsigned addr)
+{
+    uint4 v;
+    asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr));
+    return v;
+}
+
+// one conv, 128 threads: x = cin channels-last fp16 at W x H; y = cout channels-last fp16 at W / S x H / S; wf[z][step]
+// [lane] (step = (group * 9 + tap) * CG / 16 + kc, the B registers of the z's two n-tiles); bias, beta fp32. The 4 x 32
+// output tile's CG-channel halo (a stride-2 halo row keeps its even offsets before its odd ones, so a tap's 8 rows sit
+// next to each other) and the group's weights by cp.async into shared memory, one wait a group. RES: y = LeakyRelu(conv
+// x beta + x), x at the output pixel = the residual
+template <int S, int CG, bool RES>
+__device__ __forceinline__ void ifConvT(const unsigned short* __restrict__ x, int cin, int H, int W,
+                                        unsigned short* __restrict__ y, int cout, const uint4* __restrict__ wf,
+                                        const float* __restrict__ bias, const float* __restrict__ beta)
+{
+    constexpr int TH = 4, NB = 2;
+    constexpr int HR = S == 1 ? TH + 2 : 2 * TH + 1, HC = S == 1 ? 34 : 65;
+    constexpr int NCH = CG / 8, KC = CG / 16;
+    constexpr int HALO = HR * HC * NCH * 16, GQ = 9 * KC * 32;
+    extern __shared__ __align__(128) unsigned char ifSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(ifSm), wsm = halo + HALO;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, z = blockIdx.z;
+    const int OW = W / S, OH = H / S;
+    wf += (size_t)z * (cin * 9 / 16) * 32;
+    const int g = lane >> 2, t4 = lane & 3;
+    float acc[2][NB][4];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[z * NB * 8 + nj * 8 + t4 * 2], b1 = bias[z * NB * 8 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            acc[mi][nj][0] = acc[mi][nj][2] = b0;
+            acc[mi][nj][1] = acc[mi][nj][3] = b1;
+        }
+    }
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+        {
+            const int p = i / NCH, k = i - p * NCH;
+            const int hr = p / HC, hc = p - hr * HC;
+            const int gy = S * ty0 - 1 + hr, gx = S * tx0 - 1 + hc;
+            const int sp = S == 1 ? p : hr * HC + ((hc & 1) ? 33 + (hc >> 1) : (hc >> 1));
+            const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + gi * CG + k * 8 : x;
+            rnCp16(halo + ifSlot<NCH>(sp, k), src, in ? 16 : 0);
+        }
+        for (int i = threadIdx.x; i < GQ; i += 128)
+            rnCp16(wsm + (unsigned)i * 16u, wf + (size_t)gi * GQ + i, 16);
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+#pragma unroll 1
+        for (int tap = 0; tap < 9; ++tap)
+        {
+            const int dy = tap / 3, dx = tap - dy * 3;
+            int pa[2];
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                const int col = mi * 16 + arow;
+                pa[mi] = S == 1 ? (warp + dy) * HC + col + dx : (2 * warp + dy) * HC + (dx == 1 ? 33 + col : col + (dx >> 1));
+            }
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                const uint4 bw = ifLds(wsm + (unsigned)((tap * KC + kc) * 32 + lane) * 16u);
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+                {
+                    unsigned a[4];
+                    rnLdm4(halo + ifSlot<NCH>(pa[mi], kc * 2 + akc), a);
+#pragma unroll
+                    for (int q = 0; q < NB; ++q)
+                    {
+                        float* d = acc[mi][q];
+                        const unsigned b0 = q ? bw.z : bw.x, b1 = q ? bw.w : bw.y;
+                        asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                     "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const int n0 = z * NB * 8 + nj * 8 + t4 * 2;
+        const float be0 = RES ? beta[n0] : 1.0f, be1 = RES ? beta[n0 + 1] : 1.0f;
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            const int oy = ty0 + warp;
+            if (oy >= OH)
+                continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int ox = tx0 + mi * 16 + g + h * 8;
+                if (ox >= OW)
+                    continue;
+                float v0 = acc[mi][nj][2 * h], v1 = acc[mi][nj][2 * h + 1];
+                const size_t pix = (size_t)oy * OW + ox;
+                if (RES)
+                {
+                    const unsigned u = *reinterpret_cast<const unsigned*>(x + pix * cin + n0);
+                    v0 = __fadd_rn(__fmul_rn(v0, be0), h2f((unsigned short)(u & 0xffffu)));
+                    v1 = __fadd_rn(__fmul_rn(v1, be1), h2f((unsigned short)(u >> 16)));
+                }
+                v0 = ifLr(v0);
+                v1 = ifLr(v1);
+                *reinterpret_cast<unsigned*>(y + pix * cout + n0) = (unsigned)f2h(v0) | ((unsigned)f2h(v1) << 16);
+            }
+        }
+    }
+}
+
+#define IF_CONV(NAME, S, CG, RES)                                                                                      \
+    extern "C" __global__ void __launch_bounds__(128, 2)                                                               \
+        NAME(const unsigned short* __restrict__ x, int cin, int H, int W, unsigned short* __restrict__ y, int cout,    \
+             const uint4* __restrict__ wf, const float* __restrict__ bias, const float* __restrict__ beta)             \
+    {                                                                                                                  \
+        ifConvT<S, CG, RES>(x, cin, H, W, y, cout, wf, bias, beta);                                                    \
+    }
+IF_CONV(k_ifS2g16, 2, 16, false)
+IF_CONV(k_ifS2g32, 2, 32, false)
+IF_CONV(k_ifResg32, 1, 32, true)
+IF_CONV(k_ifResg64, 1, 64, true)
+
+)IFNSRC";
+static const char kIfnC2[] = R"IFNSRC(
+// ConvTranspose c -> 4 NP + PixelShuffle(2) on the tensor cores, the 4 output parity classes of a 4 x 32 L2 tile in one
+// block: class (py, px) = the L1 pixel (2 yy + py, 2 xx + px) reads rows yy - 1 + py + ti, columns xx - 1 + px + tj
+// (kernel taps ky = 3 - 2 (py + ti) + py, kx the same way), so each of the 9 halo positions' A fragments serves the
+// classes that read it; fp32 accumulators from the bias; the input = the 8th ResConv's fp16 output. blockIdx.z = the
+// 16-output group zc (4 NP padded to 16 nz, the pad's weights zero) = 4 shuffled planes = quad zc of the tmp; the
+// group's L0 tile (16 x 128) is staged in shared memory, then stored as quads [zc][h0][w0] (h0 = 4 H, w0 = 4 W).
+// FINAL (block 4, NP 5): group 0 (the flow) adds the blocks before (ifFlowAt<4>) and stores the fp16 flow planes, group
+// 1's plane 0 stores sigmoid(mask) in fp16. wf[zc][group][class][tap][kc][lane]
+template <int CG, bool FINAL>
+__device__ __forceinline__ void ifLastQ(const unsigned short* __restrict__ x, int cin, int H, int W,
+                                        float* __restrict__ out, const uint4* __restrict__ wf,
+                                        const float* __restrict__ bias, const float* __restrict__ t0,
+                                        const float* __restrict__ t1, const float* __restrict__ t2,
+                                        const float* __restrict__ t3, unsigned short* __restrict__ flow,
+                                        unsigned short* __restrict__ mask)
+{
+    constexpr int TH = 4, NB = 2, HR = TH + 2, HC = 34;
+    constexpr int NCH = CG / 8, KC = CG / 16;
+    constexpr int HALO = HR * HC * NCH * 16, GQ = 16 * KC * 32;
+    extern __shared__ __align__(128) unsigned char ifSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(ifSm), wsm = halo + HALO;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, zc = blockIdx.z;
+    wf += (size_t)zc * (cin / CG) * GQ;
+    const int g = lane >> 2, t4 = lane & 3;
+    float acc[4][2][NB][4];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[zc * 16 + nj * 8 + t4 * 2], b1 = bias[zc * 16 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int cl = 0; cl < 4; ++cl)
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                acc[cl][mi][nj][0] = acc[cl][mi][nj][2] = b0;
+                acc[cl][mi][nj][1] = acc[cl][mi][nj][3] = b1;
+            }
+    }
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+        {
+            const int p = i / NCH, k = i - p * NCH;
+            const int hr = p / HC, hc = p - hr * HC;
+            const int gy = ty0 - 1 + hr, gx = tx0 - 1 + hc;
+            const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + gi * CG + k * 8 : x;
+            rnCp16(halo + ifSlot<NCH>(p, k), src, in ? 16 : 0);
+        }
+        for (int i = threadIdx.x; i < GQ; i += 128)
+            rnCp16(wsm + (unsigned)i * 16u, wf + (size_t)gi * GQ + i, 16);
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+#pragma unroll
+        for (int pos = 0; pos < 9; ++pos)
+        {
+            const int dy = pos / 3, dx = pos % 3;
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                unsigned a[2][4];
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+                    rnLdm4(halo + ifSlot<NCH>((warp + dy) * HC + mi * 16 + arow + dx, kc * 2 + akc), a[mi]);
+#pragma unroll
+                for (int cl = 0; cl < 4; ++cl)
+                {
+                    const int ti = dy - (cl >> 1), tj = dx - (cl & 1);
+                    if (ti < 0 || ti > 1 || tj < 0 || tj > 1)
+                        continue;
+                    const uint4 bw = ifLds(wsm + (unsigned)(((cl * 4 + ti * 2 + tj) * KC + kc) * 32 + lane) * 16u);
+#pragma unroll
+                    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+                        for (int q = 0; q < NB; ++q)
+                        {
+                            float* d = acc[cl][mi][q];
+                            const unsigned b0 = q ? bw.z : bw.x, b1 = q ? bw.w : bw.y;
+                            asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                         : "r"(a[mi][0]), "r"(a[mi][1]), "r"(a[mi][2]), "r"(a[mi][3]), "r"(b0), "r"(b1));
+                        }
+                }
+            }
+        }
+    }
+    // the group's 4 planes of the L0 tile (16 rows x 128 columns) in shared memory (over the halo and weights)
+    __syncthreads();
+    float* st = reinterpret_cast<float*>(ifSm);
+#pragma unroll
+    for (int cl = 0; cl < 4; ++cl)
+#pragma unroll
+        for (int nj = 0; nj < NB; ++nj)
+#pragma unroll
+            for (int e = 0; e < 2; ++e)
+            {
+                const int lo = nj * 8 + t4 * 2 + e, lp = lo >> 2, j = lo & 3;
+                const int r = 2 * (2 * warp + (cl >> 1)) + (j >> 1);
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h)
+                    {
+                        const int cx = 2 * (2 * (mi * 16 + g + h * 8) + (cl & 1)) + (j & 1);
+                        st[(lp * 16 + r) * 128 + cx] = acc[cl][mi][nj][2 * h + e];
+                    }
+            }
+    __syncthreads();
+    const int w0 = 4 * W, h0 = 4 * H, r0 = 4 * ty0, c0 = 4 * tx0;
+    for (int i = threadIdx.x; i < 16 * 128; i += 128)
+    {
+        const int r = i >> 7, cx = i & 127, Y = r0 + r, X = c0 + cx;
+        if (Y >= h0 || X >= w0)
+            continue;
+        if (FINAL)
+        {
+            const int o = Y * w0 + X, plane = w0 * h0;
+            if (zc == 0)
+            {
+                float f[4];
+                ifFlowAt<4>(t0, t1, t2, t3, X, Y, w0, h0, f);
+#pragma unroll
+                for (int c = 0; c < 4; ++c)
+                    flow[c * plane + o] = f2h(f[c] + st[(c * 16 + r) * 128 + cx]);
+            }
+            else
+                mask[o] = f2h(1.0f / (1.0f + expf(-st[r * 128 + cx])));
+        }
+        else
+            reinterpret_cast<float4*>(out)[((size_t)zc * h0 + Y) * w0 + X] =
+                make_float4(st[r * 128 + cx], st[(16 + r) * 128 + cx], st[(32 + r) * 128 + cx], st[(48 + r) * 128 + cx]);
+    }
+}
+
+#define IF_LASTQ(CG)                                                                                                   \
+    extern "C" __global__ void __launch_bounds__(128)                                                                  \
+        k_ifLastQ##CG(const unsigned short* __restrict__ x, int cin, int H, int W, float* __restrict__ out,            \
+                      const uint4* __restrict__ wf, const float* __restrict__ bias)                                    \
+    {                                                                                                                  \
+        ifLastQ<CG, false>(x, cin, H, W, out, wf, bias, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);         \
+    }
+IF_LASTQ(32)
+IF_LASTQ(64)
+extern "C" __global__ void __launch_bounds__(128)
+    k_ifLastQF32(const unsigned short* __restrict__ x, int cin, int H, int W, const uint4* __restrict__ wf,
+                 const float* __restrict__ bias, const float* __restrict__ t0, const float* __restrict__ t1,
+                 const float* __restrict__ t2, const float* __restrict__ t3, unsigned short* __restrict__ flow,
+                 unsigned short* __restrict__ mask)
+{
+    ifLastQ<32, true>(x, cin, H, W, nullptr, wf, bias, t0, t1, t2, t3, flow, mask);
+}
+
+// block 4's conv0[0] (32 padded input channels -> 16, 3 x 3 stride 2) + LeakyRelu with its input built in the halo: each
+// halo pixel's 28 channels = ifInAt<4> (the pixel itself), rounded to fp16, 4 zeros; y = channels-last fp16 at L1
+// [H / 2][W / 2][16]; wf[tap * 2 + kc][lane]
+extern "C" __global__ void __launch_bounds__(128)
+    k_ifInC0_4(const unsigned short* __restrict__ x, const unsigned short* __restrict__ f0,
+               const unsigned short* __restrict__ f1, const unsigned short* __restrict__ ts, int W, int H,
+               const float* __restrict__ t0, const float* __restrict__ t1, const float* __restrict__ t2,
+               const float* __restrict__ t3, unsigned short* __restrict__ y, const uint4* __restrict__ wf,
+               const float* __restrict__ bias)
+{
+    constexpr int TH = 4, NB = 2, HR = 2 * TH + 1, HC = 65, NCH = 4, KC = 2;
+    constexpr int HALO = HR * HC * NCH * 16, GQ = 9 * KC * 32;
+    extern __shared__ __align__(128) unsigned char ifSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(ifSm), wsm = halo + HALO;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH;
+    const int OW = W / 2, OH = H / 2;
+    for (int i = threadIdx.x; i < GQ; i += 128)
+        rnCp16(wsm + (unsigned)i * 16u, wf + i, 16);
+    asm volatile(SMV_CP_COMMIT);
+    for (int p = threadIdx.x; p < HR * HC; p += 128)
+    {
+        const int hr = p / HC, hc = p - hr * HC;
+        const int gy = 2 * ty0 - 1 + hr, gx = 2 * tx0 - 1 + hc;
+        const int sp = hr * HC + ((hc & 1) ? 33 + (hc >> 1) : (hc >> 1));
+        float r[28];
+        const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+        if (in)
+            ifInAt<4>(x, f0, f1, ts, W, H, t0, t1, t2, t3, gx, gy, r);
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+        {
+            unsigned u[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+            {
+                const int c = k * 8 + 2 * q;
+                u[q] = in ? ((c < 28 ? (unsigned)f2h(r[c]) : 0u) | ((c + 1 < 28 ? (unsigned)f2h(r[c + 1]) : 0u) << 16))
+                          : 0u;
+            }
+            *reinterpret_cast<uint4*>(ifSm + ifSlot<NCH>(sp, k)) = make_uint4(u[0], u[1], u[2], u[3]);
+        }
+    }
+    asm volatile(SMV_CP_WAIT0);
+    __syncthreads();
+    const int g = lane >> 2, t4 = lane & 3;
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int oy = ty0 + warp;
+    float acc[2][NB][4];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[nj * 8 + t4 * 2], b1 = bias[nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            acc[mi][nj][0] = acc[mi][nj][2] = b0;
+            acc[mi][nj][1] = acc[mi][nj][3] = b1;
+        }
+    }
+#pragma unroll 1
+    for (int tap = 0; tap < 9; ++tap)
+    {
+        const int dy = tap / 3, dx = tap - dy * 3;
+        int pa[2];
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            const int col = mi * 16 + arow;
+            pa[mi] = (2 * warp + dy) * HC + (dx == 1 ? 33 + col : col + (dx >> 1));
+        }
+#pragma unroll
+        for (int kc = 0; kc < KC; ++kc)
+        {
+            const uint4 bw = ifLds(wsm + (unsigned)((tap * KC + kc) * 32 + lane) * 16u);
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                unsigned a[4];
+                rnLdm4(halo + ifSlot<NCH>(pa[mi], kc * 2 + akc), a);
+#pragma unroll
+                for (int q = 0; q < NB; ++q)
+                {
+                    float* d = acc[mi][q];
+                    const unsigned b0 = q ? bw.z : bw.x, b1 = q ? bw.w : bw.y;
+                    asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                 "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                }
+            }
+        }
+    }
+    if (oy >= OH)
+        return;
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const int n0 = nj * 8 + t4 * 2;
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int ox = tx0 + mi * 16 + g + h * 8;
+                if (ox >= OW)
+                    continue;
+                const float v0 = ifLr(acc[mi][nj][2 * h]), v1 = ifLr(acc[mi][nj][2 * h + 1]);
+                *reinterpret_cast<unsigned*>(y + ((size_t)oy * OW + ox) * 16 + n0) =
+                    (unsigned)f2h(v0) | ((unsigned)f2h(v1) << 16);
+            }
+    }
+}
+)IFNSRC";
+static const char* const kIfnKern[] = {"k_ifIn0h",   "k_ifIn1h",    "k_ifIn2h",    "k_ifIn3h",
+                                       "k_ifInC0_4", "k_ifS2g16",   "k_ifS2g32",   "k_ifResg32",
+                                       "k_ifResg64", "k_ifLastQ32", "k_ifLastQ64", "k_ifLastQF32"};
+enum
+{
+    kIfIn0,
+    kIfIn1,
+    kIfIn2,
+    kIfIn3,
+    kIfInC04,
+    kIfS2g16,
+    kIfS2g32,
+    kIfRes32,
+    kIfRes64,
+    kIfLq32,
+    kIfLq64,
+    kIfLqF
+};
+static const int kIfnC[5] = {192, 128, 96, 64, 32}; // each block's width c
+static const int kIfnCin[5] = {15, 28, 28, 28,
+                               28}; // conv0[0]'s input channels, padded to kIfnCp (the pad's weights zero)
+static const int kIfnCp[5] = {16, 32, 32, 32, 32};
+static const int kIfnC1G[5] = {32, 32, 16, 32, 16}; // conv0[1]'s input-channel group (its input = c / 2)
+static const int kIfnRsG[5] = {64, 64, 32, 64, 32}; // the ResConvs' and the transposed conv's group
+static const int kIfnNp[5] = {13, 13, 13, 13, 5}; // the shuffled planes kept (the last block's 5 = the flow + the mask)
+// a block's weight pieces: [0] conv0[0]'s fragments, [1] its bias, [2] / [3] conv0[1]'s, [4 + 3 r] / [5 + 3 r] / [6 + 3 r]
+// ResConv r's fragments / bias / beta, [28] the transposed conv's fragments, [29] its bias padded to 16 nz
+constexpr int kIfnPieces = 30;
+
+// dynamic shared memory: a stride-2 conv's halo + one group's weights, a ResConv's, the transposed conv's (its staged
+// L0 tile when larger), block 4's fused input + conv0[0]
+static int ifnSmS2(int cg)
+{
+    return (9 * 65 * (cg / 8) + 9 * (cg / 16) * 32) * 16;
+}
+static int ifnSmRes(int cg)
+{
+    return (6 * 34 * (cg / 8) + 9 * (cg / 16) * 32) * 16;
+}
+static int ifnSmLq(int cg)
+{
+    return (std::max)((6 * 34 * (cg / 8) + 16 * (cg / 16) * 32) * 16, 4 * 16 * 128 * 4);
+}
+constexpr int kIfnSmInC0 = 9 * 65 * 4 * 16 + 9 * 2 * 32 * 16;
+
+// the transposed conv's weights [c][nout][4][4] (PyTorch's layout; RIFE 4.25's nout = 52, GMFSS's 24) in ifLastQ's
+// fragment order [zc][group][class][tap][kc][lane][8 halves] for the first 4 np outputs, padded to 16 nz with zeros,
+// rounded to fp16: class (py, px), tap (ti, tj) = halo offset (py + ti, px + tj) = kernel tap (3 - 2 (py + ti) + py, 3 -
+// 2 (px + tj) + px); output o = 16 zc + 8 hf + lane / 4, channel = group cg + 16 kc + 2 (lane % 4) (+ 1, + 8, + 9)
+static std::vector<uint16_t> ifnLastFrags(std::span<const float> w, int c, int np, int cg, int nout = 52)
+{
+    static const int kOfs[4] = {0, 1, 8, 9};
+    const int nz = (4 * np + 15) / 16, kcn = cg / 16, ng = c / cg;
+    std::vector<uint16_t> out((size_t)nz * ng * 4 * 4 * kcn * 32 * 8);
+    size_t i = 0;
+    for (int zc = 0; zc < nz; zc++)
+        for (int gi = 0; gi < ng; gi++)
+            for (int cls = 0; cls < 4; cls++)
+                for (int t = 0; t < 4; t++)
+                {
+                    const int py = cls >> 1, px = cls & 1, dy = py + (t >> 1), dx = px + (t & 1);
+                    const int ky = 3 - 2 * dy + py, kx = 3 - 2 * dx + px;
+                    for (int kc = 0; kc < kcn; kc++)
+                        for (int l = 0; l < 32; l++)
+                            for (int hf = 0; hf < 2; hf++)
+                                for (int q = 0; q < 4; q++)
+                                {
+                                    const int o = zc * 16 + hf * 8 + (l >> 2);
+                                    const int ch = gi * cg + kc * 16 + (l & 3) * 2 + kOfs[q];
+                                    out[i++] = o < 4 * np ? f2hRne(w[(((size_t)ch * nout + o) * 4 + ky) * 4 + kx]) : 0;
+                                }
+                }
+    return out;
+}
+
+// flownet.pkl's IFNet in the strict IFNet_HDv3 form (module.block<k>.: conv0.0.0 [c / 2][cin][3][3], conv0.1.0
+// [c][c / 2][3][3], convblock.0 .. 7 {conv [c][c][3][3], beta [1][c][1][1]}, lastconv.0 [c][52][4][4], their biases;
+// c = kIfnC, cin = kIfnCin) as one weight block of 256-byte aligned pieces, off[kIfnPieces k + i]; false = missing, or not
+// this net (`why`)
+static bool ifnNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\rife\\flownet.pkl", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    };
+    bool form = true;
+    for (int k = 0; k < 5 && form; k++)
+    {
+        const std::string p = "module.block" + std::to_string(k) + ".";
+        const int64_t c = kIfnC[k], h = c / 2, ci = kIfnCin[k];
+        form = has(p + "conv0.0.0.weight", {h, ci, 3, 3}) && has(p + "conv0.0.0.bias", {h}) &&
+               has(p + "conv0.1.0.weight", {c, h, 3, 3}) && has(p + "conv0.1.0.bias", {c}) &&
+               has(p + "lastconv.0.weight", {c, 52, 4, 4}) && has(p + "lastconv.0.bias", {52}) &&
+               !S.count(p + "convblock.8.beta");
+        for (int r = 0; r < 8 && form; r++)
+        {
+            const std::string q = p + "convblock." + std::to_string(r) + ".";
+            form = has(q + "conv.weight", {c, c, 3, 3}) && has(q + "conv.bias", {c}) && has(q + "beta", {1, c, 1, 1});
+        }
+    }
+    if (!form)
+    {
+        why = "its weights are not RIFE 4.25's IFNet";
+        return false;
+    }
+    blob.clear();
+    off.assign((size_t)5 * kIfnPieces, 0);
+    auto put = [&](const void* d, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, d, n);
+        return o;
+    };
+    for (int k = 0; k < 5; k++)
+    {
+        const std::string p = "module.block" + std::to_string(k) + ".";
+        const int c = kIfnC[k], h = c / 2, ci = kIfnCin[k], cp = kIfnCp[k];
+        size_t* o = off.data() + (size_t)k * kIfnPieces;
+        const std::span<const float> w0 = wts[p + "conv0.0.0.weight"];
+        std::vector<float> w0p((size_t)h * cp * 9, 0.0f);
+        for (int n = 0; n < h; n++)
+            for (int i = 0; i < ci; i++)
+                for (int t = 0; t < 9; t++)
+                    w0p[((size_t)n * cp + i) * 9 + t] = w0[((size_t)n * ci + i) * 9 + t];
+        const std::vector<uint16_t> f0 = fnFragOf(w0p, h, cp, cp, 2);
+        o[0] = put(f0.data(), f0.size() * sizeof(uint16_t));
+        o[1] = put(wts[p + "conv0.0.0.bias"].data(), (size_t)h * sizeof(float));
+        const std::vector<uint16_t> f1 = fnFragOf(wts[p + "conv0.1.0.weight"], c, h, kIfnC1G[k], 2);
+        o[2] = put(f1.data(), f1.size() * sizeof(uint16_t));
+        o[3] = put(wts[p + "conv0.1.0.bias"].data(), (size_t)c * sizeof(float));
+        for (int r = 0; r < 8; r++)
+        {
+            const std::string q = p + "convblock." + std::to_string(r) + ".";
+            const std::vector<uint16_t> fr = fnFragOf(wts[q + "conv.weight"], c, c, kIfnRsG[k], 2);
+            o[4 + 3 * r] = put(fr.data(), fr.size() * sizeof(uint16_t));
+            o[5 + 3 * r] = put(wts[q + "conv.bias"].data(), (size_t)c * sizeof(float));
+            o[6 + 3 * r] = put(wts[q + "beta"].data(), (size_t)c * sizeof(float));
+        }
+        const std::vector<uint16_t> fl = ifnLastFrags(wts[p + "lastconv.0.weight"], c, kIfnNp[k], kIfnRsG[k]);
+        o[28] = put(fl.data(), fl.size() * sizeof(uint16_t));
+        const std::span<const float> lb = wts[p + "lastconv.0.bias"];
+        std::vector<float> lbp((size_t)16 * ((4 * kIfnNp[k] + 15) / 16), 0.0f);
+        for (int i = 0; i < 4 * kIfnNp[k]; i++)
+            lbp[i] = lb[i];
+        o[29] = put(lbp.data(), lbp.size() * sizeof(float));
     }
     return true;
+}
+
+// the IFNet's scratch at the motion frame fw x fh (multiples of 64), 256-byte pieces: the 4 tmp quads (16 fp32 a pixel
+// at blocks 0..3's L0), ONE input buffer (block 0's [L0][16] or blocks 1..3's [L0][32] fp16, the largest), ONE conv0[0]
+// output ([L1][c / 2] fp16, the largest), ONE ping-pong pair ([L2][c] fp16, the largest)
+struct IfnArena
+{
+    size_t tm[4] = {}, in = 0, y0 = 0, ya = 0, yb = 0, total = 0;
+};
+static IfnArena ifnArena(int fw, int fh)
+{
+    IfnArena a;
+    size_t o = 0, inB = 0, y0B = 0, yB = 0;
+    auto put = [&](size_t n) {
+        const size_t at = o;
+        o += (n + 255) & ~(size_t)255;
+        return at;
+    };
+    for (int k = 0; k < 5; k++)
+    {
+        const int s = 16 >> k;
+        const size_t n0 = (size_t)(fw / s) * (size_t)(fh / s);
+        if (k < 4)
+        {
+            a.tm[k] = put(16 * n0 * sizeof(float));
+            inB = (std::max)(inB, (size_t)kIfnCp[k] * n0 * sizeof(uint16_t));
+        }
+        y0B = (std::max)(y0B, (size_t)(kIfnC[k] / 2) * (n0 / 4) * sizeof(uint16_t));
+        yB = (std::max)(yB, (size_t)kIfnC[k] * (n0 / 16) * sizeof(uint16_t));
+    }
+    a.in = put(inB);
+    a.y0 = put(y0B);
+    a.ya = put(yB);
+    a.yb = put(yB);
+    a.total = o;
+    return a;
+}
+
+// the IFNet's frame: the motion frame (two domains), else the pictures' pad
+static void ifnFrame(const NativeRife& nr, int& fw, int& fh)
+{
+    fw = nr.mph ? nr.mpw : nr.pw;
+    fh = nr.mph ? nr.mph : nr.ph;
+}
+
+static size_t ifnNatBytes(const NativeRife& nr)
+{
+    if (!nr.ifnNat)
+        return 0;
+    int fw, fh;
+    ifnFrame(nr, fw, fh);
+    return ifnArena(fw, fh).total;
+}
+
+// this session's IFNet module: the weights read, its text compiled (or the cached cubin) and loaded, its kernels bound,
+// the weight block uploaded; false = `why` (the session teardown unloads a module left in ifnMod)
+static bool nativeIfnModule(NativeRife& nr, std::string& why)
+{
+    if (nr.ifnMod)
+        return true;
+    std::vector<uint8_t> blob;
+    if (!ifnNatLoad(blob, nr.ifnOff, why))
+        return false;
+    std::string text = kFnHead;
+    text += kIfnA;
+    text += kIfnB;
+    text += kIfnC2;
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_ifnet.cu", L"smv_ifnet", "IFNet kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.ifnMod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.ifnMod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    for (int i = 0; i < (int)(sizeof(kIfnKern) / sizeof(kIfnKern[0])); i++)
+        if (cuModuleGetFunction(&nr.fIfn[i], nr.ifnMod, kIfnKern[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kIfnKern[i] + " is missing";
+            return false;
+        }
+    // the one kernel above the default 48 KB of dynamic shared memory: the 64-channel transposed conv
+    if (cuFuncSetAttribute(nr.fIfn[kIfLq64], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, ifnSmLq(64)) !=
+        CUDA_SUCCESS)
+    {
+        why = "its transposed conv's shared memory was refused";
+        return false;
+    }
+    if (cudaMalloc(&nr.dIfnW, blob.size()) != cudaSuccess ||
+        cudaMemcpy(nr.dIfnW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
+    return true;
+}
+
+// the IFNet's 59 launches on st, its scratch at s (ifnArena's pieces). false = a launch failed
+static bool nativeIfnLaunch(NativeRife& nr, const void* x, const void* ts, const void* f0, const void* f1, int fw,
+                            int fh, void* flow, void* mask, uint8_t* s, cudaStream_t st)
+{
+    const IfnArena ar = ifnArena(fw, fh);
+    void* tm[4] = {s + ar.tm[0], s + ar.tm[1], s + ar.tm[2], s + ar.tm[3]};
+    void* inb = s + ar.in;
+    void* y0 = s + ar.y0;
+    void* yab[2] = {s + ar.ya, s + ar.yb};
+    void* nul = nullptr;
+    const char* wb = (const char*)nr.dIfnW;
+    int iw = fw, ih = fh;
+    auto go = [&](int f, int gx, int gy, int gz, int threads, int sm, void** a) {
+        return cuLaunchKernel(nr.fIfn[f], (unsigned)gx, (unsigned)gy, (unsigned)gz, (unsigned)threads, 1, 1,
+                              (unsigned)sm, (CUstream)st, a, nullptr) == CUDA_SUCCESS;
+    };
+    for (int k = 0; k < 5; k++)
+    {
+        const int sc = 16 >> k, c = kIfnC[k], hc = c / 2;
+        int w0 = fw / sc, h0 = fh / sc, w1 = w0 / 2, h1 = h0 / 2, w2 = w0 / 4, h2 = h0 / 4;
+        const size_t* o = nr.ifnOff.data() + (size_t)k * kIfnPieces;
+        const void* c0w = wb + o[0];
+        const void* c0b = wb + o[1];
+        const void* c1w = wb + o[2];
+        const void* c1b = wb + o[3];
+        const void* lw = wb + o[28];
+        const void* lb = wb + o[29];
+        if (k == 0)
+        {
+            void* a[] = {(void*)&x, (void*)&f0, (void*)&f1, (void*)&ts, &iw, &ih, &inb};
+            if (!go(kIfIn0, (w0 + 31) / 32, (h0 + 7) / 8, 1, 256, 0, a))
+                return false;
+        }
+        else if (k < 4)
+        {
+            void* a[] = {(void*)&x, (void*)&f0, (void*)&f1, (void*)&ts, &iw, &ih, &tm[0], &tm[1], &tm[2], &tm[3], &inb};
+            if (!go(kIfIn0 + k, (w0 + 31) / 32, (h0 + 7) / 8, 1, 256, 0, a))
+                return false;
+        }
+        if (k < 4)
+        {
+            int cin = kIfnCp[k], cout = hc;
+            void* a[] = {&inb, &cin, &h0, &w0, &y0, &cout, (void*)&c0w, (void*)&c0b, &nul};
+            if (!go(cin == 16 ? kIfS2g16 : kIfS2g32, (w1 + 31) / 32, (h1 + 3) / 4, hc / 16, 128, ifnSmS2(cin), a))
+                return false;
+        }
+        else
+        {
+            void* a[] = {(void*)&x, (void*)&f0, (void*)&f1, (void*)&ts, &iw,         &ih,        &tm[0],
+                         &tm[1],    &tm[2],     &tm[3],     &y0,        (void*)&c0w, (void*)&c0b};
+            if (!go(kIfInC04, (w1 + 31) / 32, (h1 + 3) / 4, 1, 128, kIfnSmInC0, a))
+                return false;
+        }
+        {
+            int cin = hc, cout = c;
+            void* a[] = {&y0, &cin, &h1, &w1, &yab[0], &cout, (void*)&c1w, (void*)&c1b, &nul};
+            if (!go(kIfnC1G[k] == 16 ? kIfS2g16 : kIfS2g32, (w2 + 31) / 32, (h2 + 3) / 4, c / 16, 128,
+                    ifnSmS2(kIfnC1G[k]), a))
+                return false;
+        }
+        for (int r = 0; r < 8; r++)
+        {
+            int cc = c;
+            void* xi = yab[r & 1];
+            void* yo = yab[(r & 1) ^ 1];
+            const void* rw = wb + o[4 + 3 * r];
+            const void* rb = wb + o[5 + 3 * r];
+            const void* rbe = wb + o[6 + 3 * r];
+            void* a[] = {&xi, &cc, &h2, &w2, &yo, &cc, (void*)&rw, (void*)&rb, (void*)&rbe};
+            if (!go(kIfnRsG[k] == 64 ? kIfRes64 : kIfRes32, (w2 + 31) / 32, (h2 + 3) / 4, c / 16, 128,
+                    ifnSmRes(kIfnRsG[k]), a))
+                return false;
+        }
+        // the 8th ResConv wrote its output into yab[0]
+        int cin = c;
+        if (k < 4)
+        {
+            void* a[] = {&yab[0], &cin, &h2, &w2, &tm[k], (void*)&lw, (void*)&lb};
+            if (!go(kIfnRsG[k] == 64 ? kIfLq64 : kIfLq32, (w2 + 31) / 32, (h2 + 3) / 4, 4, 128, ifnSmLq(kIfnRsG[k]), a))
+                return false;
+        }
+        else
+        {
+            void* a[] = {&yab[0], &cin, &h2, &w2, (void*)&lw, (void*)&lb, &tm[0], &tm[1], &tm[2], &tm[3], &flow, &mask};
+            if (!go(kIfLqF, (w2 + 31) / 32, (h2 + 3) / 4, 2, 128, ifnSmLq(32), a))
+                return false;
+        }
+    }
+    return true;
+}
+
+// the IFNet on one pair on st (nr.stream): x = the pair's 6 fp16 planes, ts = the timestep plane (fp16), f0 / f1 = the
+// encodes (kRifeFeatC fp16 planes), all fw x fh; flow / mask = its outputs (4 + 1 fp16 planes); the launches go through
+// nr.ifnGraphs (chainGraphRun). false = the scratch or a launch failed
+static bool nativeIfnRun(NativeRife& nr, const void* x, const void* ts, const void* f0, const void* f1, int fw, int fh,
+                         void* flow, void* mask, cudaStream_t st)
+{
+    const IfnArena ar = ifnArena(fw, fh);
+    uint8_t* s = nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= ar.total ? (uint8_t*)nr.dGmCtxMem : (uint8_t*)nr.dIfnOwn;
+    if (!s && cudaMalloc(&nr.dIfnOwn, ar.total) == cudaSuccess)
+        s = (uint8_t*)nr.dIfnOwn;
+    if (!s)
+        return false;
+    return chainGraphRun(nr.ifnGraphs, {s, x, ts, f0, f1, flow, mask}, fw, fh, st, "rife ifnet",
+                         [&] { return nativeIfnLaunch(nr, x, ts, f0, f1, fw, fh, flow, mask, s, st); });
 }
 
 // RIFE's encode on the host's kernels: cnn1's half-size planes (16 fp32) at the encode's frame (the motion frame, else
 // the pictures' pad), 0 = no IFNet in this session
 static size_t encNatBytes(const NativeRife& nr)
 {
-    if (!nr.engIf)
+    if (!nr.ifnNat)
         return 0;
     const size_t w = (size_t)(nr.mph ? nr.mpw : nr.pw), h = (size_t)(nr.mph ? nr.mph : nr.ph);
     return 16 * (w / 2) * (h / 2) * sizeof(float);
 }
 
-// The RIFE family's contexts (the IFNet, Restore, DRBA's block0) enqueue one after another on nr.stream too, so they
-// share ONE activation block, the largest one's, set before any warm-up (a whole-graph capture records its address);
-// the encode's planes (nativeEncodeRun, before the IFNet on the same stream) live in it too. SMV_CTXSHARE=0 = each
-// context its own (TensorRT's default).
+// The RIFE family's nets (the IFNet, Restore) enqueue one after another on nr.stream too, so they share ONE
+// activation block, the largest one's, set before any warm-up (a graph capture records its address); the encode's
+// planes (nativeEncodeRun, before the IFNet on the same stream) and DRBA block0's scratch (nativeB0Run, its flow read
+// by the splat right after it) live in it too. SMV_CTXSHARE=0 = each net its own.
 static bool nativeModelShareMemory(NativeRife& nr)
 {
-    std::pair<nvinfer1::ICudaEngine*, nvinfer1::IExecutionContext*> set[] = {
-        {nr.engIf, nr.ctxIf}, {nr.engRest, nr.ctxRest}, {nr.engB0, nr.ctxB0}};
     int64_t need = 0, sum = 0;
     int n = 0;
-    for (const auto& c : set)
-        if (c.second)
-        {
-            const int64_t b = c.first->getDeviceMemorySizeV2();
-            need = (std::max)(need, b);
-            sum += b;
-            n++;
-        }
     if (nr.restNat) // Restore on the host's kernels: its ping-pong takes the block too
     {
         const int64_t b = (int64_t)restNatBytes(nr);
@@ -17455,6 +18448,18 @@ static bool nativeModelShareMemory(NativeRife& nr)
         sum += b;
         n++;
     }
+    if (const int64_t b = (int64_t)b0NatBytes(nr))
+    {
+        need = (std::max)(need, b);
+        sum += b;
+        n++;
+    }
+    if (const int64_t b = (int64_t)ifnNatBytes(nr))
+    {
+        need = (std::max)(need, b);
+        sum += b;
+        n++;
+    }
     if (!n)
         return true;
     if (need > 0 && cudaMalloc(&nr.dGmCtxMem, (size_t)need) != cudaSuccess)
@@ -17462,13 +18467,4073 @@ static bool nativeModelShareMemory(NativeRife& nr)
         LOG("native: shared activation block (%.0f MB) alloc failed\n", need / 1048576.0);
         return false;
     }
-    for (const auto& c : set)
-        if (c.second)
-            c.second->setDeviceMemoryV2(nr.dGmCtxMem, need);
     nr.gmCtxMemB = need;
     LOG("native: the model contexts share one %.0f MB activation block (%.0f MB as %d)\n", need / 1048576.0,
         sum / 1048576.0, n);
     return true;
+}
+
+// ---- GMFSS's IFNet on the host's kernels --------------------------------------------------------------------------
+// The GMFSS IFNet (RIFE 4.6's IFNet_HDv3: 4 IFBlocks at 8, 4, 2, 1 of the half, c = 192, 128, 96, 64, the warps between
+// them, then the merge) as 47 launches of its own module smv_gmifnet_*.cubin (kFnHead's helpers + kGiA / kGiB), weights =
+// engine\GMFSS_Fortuna\train_log\rife.pkl through pthStateDict (giNatLoad); no engine, no ONNX, no fallback (a missing /
+// wrong pkl = `the GMFSS IFNet unavailable (...)`, the session refuses). It takes the 6 fp32 half planes and the fp32
+// timestep and hands out merged (3 fp32 planes) straight into fusionnet's a planes 3..5. Its scratch (giArena) lives in
+// the shared activation block (nativeGmShareMemory sizes it in; sound while every enqueue there runs serially on
+// nr.stream), else dGiOwn.
+static const char kGiA[] = R"GISRC(
+// GMFSS's IFNet (RIFE 4.6's IFNet_HDv3: 4 IFBlocks at scales 8, 4, 2, 1 of the GMFSS half with c = 192, 128, 96, 64)
+// on the host's own kernels; the RIFE IFNet module's design with GMFSS's inputs. The half is W x H (multiples of 32); block k (scale s = 8 >> k) works at L0 = W / s x H / s, L1 = L0 / 2, L2 = L0 / 4;
+// its tmp stays at its L0 as 2 float4 quads a pixel ([quad][h][w][4]: quad 0 = the flow, quad 1 = the mask, the sixth
+// channel and 2 zeros). The author's full-size tensors (the flow and the mask summed over the blocks, the warps) are
+// read only where a reader needs them, by PyTorch's bilinear from those quads.
+// k_giIn0     block 0's input cat(img0, img1, timestep) at L0: at an exact 1 / 8 each sample = PyTorch's bilinear mean of
+//             the 2 x 2 source pixels at rows / columns 8 i + 3, 8 i + 4; channels-last fp16 [L0][16] (7 + 9 zeros)
+// k_giIn<k>   block k's input (k = 1..3) at L0: cat(warp(img0), warp(img1), timestep, mask) resized + flow resized / s,
+//             where the author resizes = the mean of the 4 full-size taps at rows / columns s i + s / 2 - 1, + 1 (s = 1 the
+//             pixel); at each tap the flow = the earlier blocks' flow quads by bilinear x their scale summed in block
+//             order, the mask = their mask planes summed the same way (fp32), the warps = bilinear taps of the fp32
+//             frames at the pixel + the flow clamped into the frame (grid_sample's border rule); [L0][16] (12 + 4 zeros)
+// k_giS2g16 / k_giS2g32   a 3 x 3 stride-2 conv + LeakyRelu (conv0[0] on the padded input, conv0[1]); k_giResg32 /
+//             k_giResg64 the ResConvs {LeakyRelu(conv(x) * beta + x)}, the residual = the conv's own fp16 input at the
+//             pixel: implicit GEMMs on the tensor cores (mma.sync m16n8k16, fp32 accumulators from the bias, a 4 x 32
+//             output tile, a CG-channel group's halo and weights by cp.async)
+// k_giLastQ32 / 64   ConvTranspose c -> 24 (4 x 4, stride 2, pad 1) + PixelShuffle(2): per output parity class a 2 x 2-
+//             tap conv over L2 on the tensor cores, the 4 classes in one block, the L0 tile staged in shared memory and
+//             stored as the 16-output group's quad (24 outputs padded to 2 groups)
+// k_giOut     merged at the half: the 4 blocks' flows and masks summed at the pixel, sigmoid(mask), the two border warps
+//             of the fp32 frames, w0 m + w1 (1 - m): 3 fp32 planes
+
+__device__ __forceinline__ float giLr(float v)
+{
+    return v < 0.0f ? v * 0.2f : v;
+}
+
+// one axis of PyTorch's bilinear resize (align_corners False) from n source pixels to n x s at pixel x, s a power of 2
+// (the source point (2 x + 1 - s) / 2 s is exact): the two source pixels and the second one's weight (the last pixel
+// pairs with itself and keeps its weight, as PyTorch's h1p does)
+__device__ __forceinline__ void giUpAxis(int x, int s, int n, int& i0, int& i1, float& l)
+{
+    const int num = 2 * x + 1 - s, den = 2 * s;
+    i0 = 0;
+    l = 0.0f;
+    if (num > 0)
+    {
+        i0 = num / den;
+        l = (float)(num - i0 * den) / (float)den;
+    }
+    i1 = i0 < n - 1 ? i0 + 1 : i0;
+}
+
+struct GiUp
+{
+    int o00, o01, o10, o11;
+    float lx, ly;
+};
+
+// full-size pixel (x, y) of a level s times smaller (w x h)
+__device__ __forceinline__ GiUp giUp(int x, int y, int s, int w, int h)
+{
+    int x0, x1, y0, y1;
+    GiUp u;
+    giUpAxis(x, s, w, x0, x1, u.lx);
+    giUpAxis(y, s, h, y0, y1, u.ly);
+    u.o00 = y0 * w + x0;
+    u.o01 = y0 * w + x1;
+    u.o10 = y1 * w + x0;
+    u.o11 = y1 * w + x1;
+    return u;
+}
+
+// PyTorch's order on each channel of a quad: h0 (w0 v00 + w1 v01) + h1 (w0 v10 + w1 v11)
+__device__ __forceinline__ float4 giUpAt4(const float4* __restrict__ p, const GiUp& u)
+{
+    const float wx0 = 1.0f - u.lx, wy0 = 1.0f - u.ly;
+    const float4 a = p[u.o00], b = p[u.o01], c = p[u.o10], d = p[u.o11];
+    return make_float4(wy0 * (wx0 * a.x + u.lx * b.x) + u.ly * (wx0 * c.x + u.lx * d.x),
+                       wy0 * (wx0 * a.y + u.lx * b.y) + u.ly * (wx0 * c.y + u.lx * d.y),
+                       wy0 * (wx0 * a.z + u.lx * b.z) + u.ly * (wx0 * c.z + u.lx * d.z),
+                       wy0 * (wx0 * a.w + u.lx * b.w) + u.ly * (wx0 * c.w + u.lx * d.w));
+}
+
+// the flow and the mask at full-size pixel (x, y) after blocks 0 .. NL - 1: tmp_j's flow quad by bilinear x 8 >> j and
+// its mask plane by bilinear, each summed in block order (block 0's = its own, each later one added)
+template <int NL>
+__device__ __forceinline__ void giFlowMaskAt(const float* __restrict__ t0, const float* __restrict__ t1,
+                                             const float* __restrict__ t2, const float* __restrict__ t3, int x, int y,
+                                             int W, int H, float f[4], float& m)
+{
+#pragma unroll
+    for (int j = 0; j < NL; ++j)
+    {
+        const float* t = j == 0 ? t0 : j == 1 ? t1 : j == 2 ? t2 : t3;
+        const int s = 8 >> j, w = W / s, h = H / s;
+        const GiUp u = giUp(x, y, s, w, h);
+        const float4* q = reinterpret_cast<const float4*>(t);
+        const float4 qf = giUpAt4(q, u), qm = giUpAt4(q + w * h, u);
+        const float v4[4] = {qf.x, qf.y, qf.z, qf.w};
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+        {
+            const float v = v4[c] * (float)s;
+            f[c] = j == 0 ? v : f[c] + v;
+        }
+        m = j == 0 ? qm.x : m + qm.x;
+    }
+}
+
+// one axis of a warp tap at pixel x plus the offset u px, the point clamped into [0, n - 1] (grid_sample's border)
+__device__ __forceinline__ void giAxis(int x, float u, int n, int& x0, int& x1, float& l)
+{
+    u = fminf(fmaxf(u, -(float)(n + 1)), (float)(n + 1));
+    const float fl = floorf(u);
+    x0 = x + (int)fl;
+    l = u - fl;
+    if (x0 < 0)
+    {
+        x0 = 0;
+        l = 0.0f;
+    }
+    else if (x0 >= n - 1)
+    {
+        x0 = n - 1;
+        l = 0.0f;
+    }
+    x1 = x0 < n - 1 ? x0 + 1 : x0;
+}
+
+__device__ __forceinline__ GiUp giTap(int x, int y, float ux, float uy, int W, int H)
+{
+    int x0, x1, y0, y1;
+    GiUp t;
+    giAxis(x, ux, W, x0, x1, t.lx);
+    giAxis(y, uy, H, y0, y1, t.ly);
+    t.o00 = y0 * W + x0;
+    t.o01 = y0 * W + x1;
+    t.o10 = y1 * W + x0;
+    t.o11 = y1 * W + x1;
+    return t;
+}
+
+__device__ __forceinline__ float giTapF(const float* __restrict__ p, const GiUp& t)
+{
+    const float wx0 = 1.0f - t.lx, wy0 = 1.0f - t.ly;
+    return wy0 * (wx0 * p[t.o00] + t.lx * p[t.o01]) + t.ly * (wx0 * p[t.o10] + t.lx * p[t.o11]);
+}
+
+__device__ __forceinline__ void giStore16(unsigned short* __restrict__ out, const float* v, int n)
+{
+    uint4* d = reinterpret_cast<uint4*>(out);
+#pragma unroll
+    for (int q = 0; q < 2; ++q)
+    {
+        unsigned u[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+        {
+            const int c = q * 8 + 2 * k;
+            u[k] = (c < n ? (unsigned)f2h(v[c]) : 0u) | ((c + 1 < n ? (unsigned)f2h(v[c + 1]) : 0u) << 16);
+        }
+        d[q] = make_uint4(u[0], u[1], u[2], u[3]);
+    }
+}
+
+// block 0's input: x = 6 fp32 planes (img0, img1) at W x H, ts = the timestep (one fp32); out = [W / 8 x H / 8][16]
+extern "C" __global__ void __launch_bounds__(256) k_giIn0(const float* __restrict__ x, const float* __restrict__ ts,
+                                                           int W, int H, unsigned short* __restrict__ out)
+{
+    const int w8 = W >> 3, h8 = H >> 3;
+    const int X = blockIdx.x * 32 + (threadIdx.x & 31), Y = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (X >= w8 || Y >= h8)
+        return;
+    const int plane = W * H, s = (8 * Y + 3) * W + 8 * X + 3;
+    float v[7];
+#pragma unroll
+    for (int c = 0; c < 6; ++c)
+    {
+        const float* src = x + c * plane;
+        v[c] = 0.5f * (0.5f * src[s] + 0.5f * src[s + 1]) + 0.5f * (0.5f * src[s + W] + 0.5f * src[s + W + 1]);
+    }
+    v[6] = ts[0];
+    giStore16(out + (size_t)(Y * w8 + X) * 16, v, 7);
+}
+
+// the 12 input channels of block K at full-size pixel (px, py)
+template <int K>
+__device__ __forceinline__ void giInTap(const float* __restrict__ x, float tsv, int W, int H,
+                                        const float* __restrict__ t0, const float* __restrict__ t1,
+                                        const float* __restrict__ t2, int px, int py, float v[12])
+{
+    const int plane = W * H;
+    float f[4], m;
+    giFlowMaskAt<K>(t0, t1, t2, nullptr, px, py, W, H, f, m);
+    const GiUp T0 = giTap(px, py, f[0], f[1], W, H), T1 = giTap(px, py, f[2], f[3], W, H);
+#pragma unroll
+    for (int c = 0; c < 3; ++c)
+    {
+        v[c] = giTapF(x + c * plane, T0);
+        v[3 + c] = giTapF(x + (3 + c) * plane, T1);
+    }
+    v[6] = tsv;
+    v[7] = m;
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+        v[8 + c] = f[c];
+}
+
+// block K's 12 input channels at L0 pixel (X, Y): the full-size taps the author's resize reads, averaged; the flow / s
+template <int K>
+__device__ __forceinline__ void giInAt(const float* __restrict__ x, float tsv, int W, int H,
+                                       const float* __restrict__ t0, const float* __restrict__ t1,
+                                       const float* __restrict__ t2, int X, int Y, float r[12])
+{
+    constexpr int S = 8 >> K;
+    if (S == 1)
+        giInTap<K>(x, tsv, W, H, t0, t1, t2, X, Y, r);
+    else
+    {
+        constexpr int A = S / 2 - 1;
+        float v0[12], v1[12], r0[12];
+        giInTap<K>(x, tsv, W, H, t0, t1, t2, S * X + A, S * Y + A, v0);
+        giInTap<K>(x, tsv, W, H, t0, t1, t2, S * X + A + 1, S * Y + A, v1);
+#pragma unroll
+        for (int c = 0; c < 12; ++c)
+            r0[c] = 0.5f * v0[c] + 0.5f * v1[c];
+        giInTap<K>(x, tsv, W, H, t0, t1, t2, S * X + A, S * Y + A + 1, v0);
+        giInTap<K>(x, tsv, W, H, t0, t1, t2, S * X + A + 1, S * Y + A + 1, v1);
+#pragma unroll
+        for (int c = 0; c < 12; ++c)
+            r[c] = 0.5f * r0[c] + 0.5f * (0.5f * v0[c] + 0.5f * v1[c]);
+    }
+#pragma unroll
+    for (int c = 8; c < 12; ++c)
+        r[c] = r[c] * (1.0f / (float)S);
+}
+
+template <int K>
+__device__ __forceinline__ void giInBody(const float* __restrict__ x, const float* __restrict__ ts, int W, int H,
+                                         const float* __restrict__ t0, const float* __restrict__ t1,
+                                         const float* __restrict__ t2, unsigned short* __restrict__ out)
+{
+    constexpr int S = 8 >> K;
+    const int wl = W / S, hl = H / S;
+    const int X = blockIdx.x * 32 + (threadIdx.x & 31), Y = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (X >= wl || Y >= hl)
+        return;
+    float r[12];
+    giInAt<K>(x, ts[0], W, H, t0, t1, t2, X, Y, r);
+    giStore16(out + (size_t)(Y * wl + X) * 16, r, 12);
+}
+
+#define GI_IN(K)                                                                                                       \
+    extern "C" __global__ void __launch_bounds__(256)                                                                  \
+        k_giIn##K(const float* __restrict__ x, const float* __restrict__ ts, int W, int H,                             \
+                  const float* __restrict__ t0, const float* __restrict__ t1, const float* __restrict__ t2,            \
+                  unsigned short* __restrict__ out)                                                                    \
+    {                                                                                                                  \
+        giInBody<K>(x, ts, W, H, t0, t1, t2, out);                                                                     \
+    }
+GI_IN(1)
+GI_IN(2)
+GI_IN(3)
+
+)GISRC";
+static const char kGiB[] = R"GISRC(
+// the stored index of halo pixel sp and its chunk k's swizzled slot (each ldmatrix's 8 rows in 8 bank groups)
+template <int NCH>
+__device__ __forceinline__ unsigned giSlot(int sp, int k)
+{
+    const int sw = NCH == 8 ? (k ^ (sp & 7)) : NCH == 4 ? (k ^ ((sp >> 1) & 3)) : (k ^ ((sp >> 2) & 1));
+    return (unsigned)((sp * NCH + sw) << 4);
+}
+
+__device__ __forceinline__ uint4 giLds(unsigned addr)
+{
+    uint4 v;
+    asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr));
+    return v;
+}
+
+// one conv, 128 threads: x = cin channels-last fp16 at W x H; y = cout channels-last fp16 at W / S x H / S; wf[z][step]
+// [lane] (step = (group * 9 + tap) * CG / 16 + kc, the B registers of the z's two n-tiles); bias, beta fp32. The 4 x 32
+// output tile's CG-channel halo (a stride-2 halo row keeps its even offsets before its odd ones) and the group's weights
+// by cp.async into shared memory, one wait a group. RES: y = LeakyRelu(conv x beta + x), x at the output pixel = the
+// residual; else y = LeakyRelu(conv)
+template <int S, int CG, bool RES>
+__device__ __forceinline__ void giConvT(const unsigned short* __restrict__ x, int cin, int H, int W,
+                                        unsigned short* __restrict__ y, int cout, const uint4* __restrict__ wf,
+                                        const float* __restrict__ bias, const float* __restrict__ beta)
+{
+    constexpr int TH = 4, NB = 2;
+    constexpr int HR = S == 1 ? TH + 2 : 2 * TH + 1, HC = S == 1 ? 34 : 65;
+    constexpr int NCH = CG / 8, KC = CG / 16;
+    constexpr int HALO = HR * HC * NCH * 16, GQ = 9 * KC * 32;
+    extern __shared__ __align__(128) unsigned char giSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(giSm), wsm = halo + HALO;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, z = blockIdx.z;
+    const int OW = W / S, OH = H / S;
+    wf += (size_t)z * (cin * 9 / 16) * 32;
+    const int g = lane >> 2, t4 = lane & 3;
+    float acc[2][NB][4];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[z * NB * 8 + nj * 8 + t4 * 2], b1 = bias[z * NB * 8 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            acc[mi][nj][0] = acc[mi][nj][2] = b0;
+            acc[mi][nj][1] = acc[mi][nj][3] = b1;
+        }
+    }
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+        {
+            const int p = i / NCH, k = i - p * NCH;
+            const int hr = p / HC, hc = p - hr * HC;
+            const int gy = S * ty0 - 1 + hr, gx = S * tx0 - 1 + hc;
+            const int sp = S == 1 ? p : hr * HC + ((hc & 1) ? 33 + (hc >> 1) : (hc >> 1));
+            const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + gi * CG + k * 8 : x;
+            rnCp16(halo + giSlot<NCH>(sp, k), src, in ? 16 : 0);
+        }
+        for (int i = threadIdx.x; i < GQ; i += 128)
+            rnCp16(wsm + (unsigned)i * 16u, wf + (size_t)gi * GQ + i, 16);
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+#pragma unroll 1
+        for (int tap = 0; tap < 9; ++tap)
+        {
+            const int dy = tap / 3, dx = tap - dy * 3;
+            int pa[2];
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                const int col = mi * 16 + arow;
+                pa[mi] = S == 1 ? (warp + dy) * HC + col + dx : (2 * warp + dy) * HC + (dx == 1 ? 33 + col : col + (dx >> 1));
+            }
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                const uint4 bw = giLds(wsm + (unsigned)((tap * KC + kc) * 32 + lane) * 16u);
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+                {
+                    unsigned a[4];
+                    rnLdm4(halo + giSlot<NCH>(pa[mi], kc * 2 + akc), a);
+#pragma unroll
+                    for (int q = 0; q < NB; ++q)
+                    {
+                        float* d = acc[mi][q];
+                        const unsigned b0 = q ? bw.z : bw.x, b1 = q ? bw.w : bw.y;
+                        asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                     "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const int n0 = z * NB * 8 + nj * 8 + t4 * 2;
+        const float be0 = RES ? beta[n0] : 1.0f, be1 = RES ? beta[n0 + 1] : 1.0f;
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            const int oy = ty0 + warp;
+            if (oy >= OH)
+                continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int ox = tx0 + mi * 16 + g + h * 8;
+                if (ox >= OW)
+                    continue;
+                float v0 = acc[mi][nj][2 * h], v1 = acc[mi][nj][2 * h + 1];
+                const size_t pix = (size_t)oy * OW + ox;
+                if (RES)
+                {
+                    const unsigned u = *reinterpret_cast<const unsigned*>(x + pix * cin + n0);
+                    v0 = __fadd_rn(__fmul_rn(v0, be0), h2f((unsigned short)(u & 0xffffu)));
+                    v1 = __fadd_rn(__fmul_rn(v1, be1), h2f((unsigned short)(u >> 16)));
+                }
+                v0 = giLr(v0);
+                v1 = giLr(v1);
+                *reinterpret_cast<unsigned*>(y + pix * cout + n0) = (unsigned)f2h(v0) | ((unsigned)f2h(v1) << 16);
+            }
+        }
+    }
+}
+
+#define GI_CONV(NAME, S, CG, RES)                                                                                      \
+    extern "C" __global__ void __launch_bounds__(128, 2)                                                               \
+        NAME(const unsigned short* __restrict__ x, int cin, int H, int W, unsigned short* __restrict__ y, int cout,    \
+             const uint4* __restrict__ wf, const float* __restrict__ bias, const float* __restrict__ beta)             \
+    {                                                                                                                  \
+        giConvT<S, CG, RES>(x, cin, H, W, y, cout, wf, bias, beta);                                                    \
+    }
+GI_CONV(k_giS2g16, 2, 16, false)
+GI_CONV(k_giS2g32, 2, 32, false)
+GI_CONV(k_giResg32, 1, 32, true)
+GI_CONV(k_giResg64, 1, 64, true)
+
+// ConvTranspose c -> 24 + PixelShuffle(2) on the tensor cores, the 4 output parity classes of a 4 x 32 L2 tile in one
+// block: class (py, px) = the L1 pixel (2 yy + py, 2 xx + px) reads rows yy - 1 + py + ti, columns xx - 1 + px + tj
+// (kernel taps ky = 3 - 2 (py + ti) + py, kx the same way), so each of the 9 halo positions' A fragments serves the
+// classes that read it; fp32 accumulators from the bias; the input = the 8th ResConv's fp16 output. blockIdx.z = the
+// 16-output group zc (24 outputs padded to 32, the pad's weights zero) = 4 shuffled planes = quad zc of the tmp; the
+// group's L0 tile (16 x 128) is staged in shared memory, then stored as quads [zc][h0][w0] (h0 = 4 H, w0 = 4 W).
+// wf[zc][group][class][tap][kc][lane]
+template <int CG>
+__device__ __forceinline__ void giLastQ(const unsigned short* __restrict__ x, int cin, int H, int W,
+                                        float* __restrict__ out, const uint4* __restrict__ wf,
+                                        const float* __restrict__ bias)
+{
+    constexpr int TH = 4, NB = 2, HR = TH + 2, HC = 34;
+    constexpr int NCH = CG / 8, KC = CG / 16;
+    constexpr int HALO = HR * HC * NCH * 16, GQ = 16 * KC * 32;
+    extern __shared__ __align__(128) unsigned char giSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(giSm), wsm = halo + HALO;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, zc = blockIdx.z;
+    wf += (size_t)zc * (cin / CG) * GQ;
+    const int g = lane >> 2, t4 = lane & 3;
+    float acc[4][2][NB][4];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[zc * 16 + nj * 8 + t4 * 2], b1 = bias[zc * 16 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int cl = 0; cl < 4; ++cl)
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                acc[cl][mi][nj][0] = acc[cl][mi][nj][2] = b0;
+                acc[cl][mi][nj][1] = acc[cl][mi][nj][3] = b1;
+            }
+    }
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+        {
+            const int p = i / NCH, k = i - p * NCH;
+            const int hr = p / HC, hc = p - hr * HC;
+            const int gy = ty0 - 1 + hr, gx = tx0 - 1 + hc;
+            const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + gi * CG + k * 8 : x;
+            rnCp16(halo + giSlot<NCH>(p, k), src, in ? 16 : 0);
+        }
+        for (int i = threadIdx.x; i < GQ; i += 128)
+            rnCp16(wsm + (unsigned)i * 16u, wf + (size_t)gi * GQ + i, 16);
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+#pragma unroll
+        for (int pos = 0; pos < 9; ++pos)
+        {
+            const int dy = pos / 3, dx = pos % 3;
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                unsigned a[2][4];
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+                    rnLdm4(halo + giSlot<NCH>((warp + dy) * HC + mi * 16 + arow + dx, kc * 2 + akc), a[mi]);
+#pragma unroll
+                for (int cl = 0; cl < 4; ++cl)
+                {
+                    const int ti = dy - (cl >> 1), tj = dx - (cl & 1);
+                    if (ti < 0 || ti > 1 || tj < 0 || tj > 1)
+                        continue;
+                    const uint4 bw = giLds(wsm + (unsigned)(((cl * 4 + ti * 2 + tj) * KC + kc) * 32 + lane) * 16u);
+#pragma unroll
+                    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+                        for (int q = 0; q < NB; ++q)
+                        {
+                            float* d = acc[cl][mi][q];
+                            const unsigned b0 = q ? bw.z : bw.x, b1 = q ? bw.w : bw.y;
+                            asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                         : "r"(a[mi][0]), "r"(a[mi][1]), "r"(a[mi][2]), "r"(a[mi][3]), "r"(b0), "r"(b1));
+                        }
+                }
+            }
+        }
+    }
+    // the group's 4 planes of the L0 tile (16 rows x 128 columns) in shared memory (over the halo and weights)
+    __syncthreads();
+    float* st = reinterpret_cast<float*>(giSm);
+#pragma unroll
+    for (int cl = 0; cl < 4; ++cl)
+#pragma unroll
+        for (int nj = 0; nj < NB; ++nj)
+#pragma unroll
+            for (int e = 0; e < 2; ++e)
+            {
+                const int lo = nj * 8 + t4 * 2 + e, lp = lo >> 2, j = lo & 3;
+                const int r = 2 * (2 * warp + (cl >> 1)) + (j >> 1);
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h)
+                    {
+                        const int cx = 2 * (2 * (mi * 16 + g + h * 8) + (cl & 1)) + (j & 1);
+                        st[(lp * 16 + r) * 128 + cx] = acc[cl][mi][nj][2 * h + e];
+                    }
+            }
+    __syncthreads();
+    const int w0 = 4 * W, h0 = 4 * H, r0 = 4 * ty0, c0 = 4 * tx0;
+    for (int i = threadIdx.x; i < 16 * 128; i += 128)
+    {
+        const int r = i >> 7, cx = i & 127, Y = r0 + r, X = c0 + cx;
+        if (Y >= h0 || X >= w0)
+            continue;
+        reinterpret_cast<float4*>(out)[((size_t)zc * h0 + Y) * w0 + X] =
+            make_float4(st[r * 128 + cx], st[(16 + r) * 128 + cx], st[(32 + r) * 128 + cx], st[(48 + r) * 128 + cx]);
+    }
+}
+
+#define GI_LASTQ(CG)                                                                                                   \
+    extern "C" __global__ void __launch_bounds__(128)                                                                  \
+        k_giLastQ##CG(const unsigned short* __restrict__ x, int cin, int H, int W, float* __restrict__ out,            \
+                      const uint4* __restrict__ wf, const float* __restrict__ bias)                                    \
+    {                                                                                                                  \
+        giLastQ<CG>(x, cin, H, W, out, wf, bias);                                                                      \
+    }
+GI_LASTQ(32)
+GI_LASTQ(64)
+
+// merged at the half pixel: the 4 blocks' flows and masks summed (block order), sigmoid(mask), the border warps of the
+// fp32 frames x (img0 planes 0..2, img1 planes 3..5), w0 m + w1 (1 - m) into 3 fp32 planes
+extern "C" __global__ void __launch_bounds__(256) k_giOut(const float* __restrict__ x, int W, int H,
+                                                           const float* __restrict__ t0, const float* __restrict__ t1,
+                                                           const float* __restrict__ t2, const float* __restrict__ t3,
+                                                           float* __restrict__ merged)
+{
+    const int X = blockIdx.x * 32 + (threadIdx.x & 31), Y = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (X >= W || Y >= H)
+        return;
+    const int plane = W * H, o = Y * W + X;
+    float f[4], m;
+    giFlowMaskAt<4>(t0, t1, t2, t3, X, Y, W, H, f, m);
+    const float sg = 1.0f / (1.0f + expf(-m));
+    const GiUp T0 = giTap(X, Y, f[0], f[1], W, H), T1 = giTap(X, Y, f[2], f[3], W, H);
+#pragma unroll
+    for (int c = 0; c < 3; ++c)
+        merged[c * plane + o] = giTapF(x + c * plane, T0) * sg + giTapF(x + (3 + c) * plane, T1) * (1.0f - sg);
+}
+)GISRC";
+static const char* const kGiKern[] = {"k_giIn0",     "k_giIn1",     "k_giIn2",    "k_giIn3",
+                                      "k_giS2g16",   "k_giS2g32",   "k_giResg32", "k_giResg64",
+                                      "k_giLastQ32", "k_giLastQ64", "k_giOut"};
+static_assert(sizeof(kGiKern) / sizeof(kGiKern[0]) == sizeof(NativeRife::fGi) / sizeof(CUfunction),
+              "one fGi slot a GMFSS IFNet kernel");
+enum
+{
+    kGiIn0,
+    kGiS2g16 = 4,
+    kGiS2g32,
+    kGiResg32,
+    kGiResg64,
+    kGiLq32,
+    kGiLq64,
+    kGiOut
+};
+static const int kGiC[4] = {192, 128, 96, 64}, kGiCin[4] = {7, 12, 12, 12};
+static const int kGiPieces = 30;
+// a conv's dynamic shared memory: its 4 x 32 tile's halo of a cg-channel group + the group's weights (stride s); the
+// transposed conv's: the halo + its weights, at least the staged 16 x 128 x 4 fp32 tile
+static constexpr int giSmConv(int s, int cg)
+{
+    return ((s == 1 ? 6 * 34 : 9 * 65) * (cg / 8) + 9 * (cg / 16) * 32) * 16;
+}
+static constexpr int giSmLq(int cg)
+{
+    return (6 * 34 * (cg / 8) + 16 * (cg / 16) * 32) * 16 > 16 * 128 * 4 * 4
+               ? (6 * 34 * (cg / 8) + 16 * (cg / 16) * 32) * 16
+               : 16 * 128 * 4 * 4;
+}
+static int giCg1(int c)
+{
+    return (c / 2) % 32 == 0 ? 32 : 16;
+}
+static int giCgRes(int c)
+{
+    return c % 64 == 0 ? 64 : 32;
+}
+
+// rife.pkl in the strict GMFSS IFNet form (block<k>.: conv0.0.0 [c / 2][cin][3][3], conv0.1.0 [c][c / 2][3][3],
+// convblock.0 .. 7 {conv [c][c][3][3], beta [1][c][1][1]}, lastconv.0 [c][24][4][4], their biases; c = kGiC, cin =
+// kGiCin; no block4) as one weight block of 256-byte aligned pieces, off[kGiPieces k + i]: 0 / 1 conv0[0]'s fragments
+// (its inputs zero-padded to 16) and bias, 2 / 3 conv0[1]'s, 4 + 3 r .. 6 + 3 r ResConv r's fragments, bias and beta,
+// 28 / 29 the transposed conv's fragments and its bias padded to 32; false = missing, or not this net (`why`)
+static bool giNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\rife.pkl", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    };
+    bool form = !S.count("block4.conv0.0.0.weight");
+    for (int k = 0; k < 4 && form; k++)
+    {
+        const std::string p = "block" + std::to_string(k) + ".";
+        const int64_t c = kGiC[k], h = c / 2, ci = kGiCin[k];
+        form = has(p + "conv0.0.0.weight", {h, ci, 3, 3}) && has(p + "conv0.0.0.bias", {h}) &&
+               has(p + "conv0.1.0.weight", {c, h, 3, 3}) && has(p + "conv0.1.0.bias", {c}) &&
+               has(p + "lastconv.0.weight", {c, 24, 4, 4}) && has(p + "lastconv.0.bias", {24}) &&
+               !S.count(p + "convblock.8.beta");
+        for (int r = 0; r < 8 && form; r++)
+        {
+            const std::string q = p + "convblock." + std::to_string(r) + ".";
+            form = has(q + "conv.weight", {c, c, 3, 3}) && has(q + "conv.bias", {c}) && has(q + "beta", {1, c, 1, 1});
+        }
+    }
+    if (!form)
+    {
+        why = "its weights are not GMFSS's IFNet";
+        return false;
+    }
+    blob.clear();
+    off.assign((size_t)4 * kGiPieces, 0);
+    auto put = [&](const void* d, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, d, n);
+        return o;
+    };
+    for (int k = 0; k < 4; k++)
+    {
+        const std::string p = "block" + std::to_string(k) + ".";
+        const int c = kGiC[k], h = c / 2, ci = kGiCin[k];
+        size_t* o = off.data() + (size_t)k * kGiPieces;
+        const std::span<const float> w0 = wts[p + "conv0.0.0.weight"];
+        std::vector<float> w0p((size_t)h * 16 * 9, 0.0f);
+        for (int n = 0; n < h; n++)
+            for (int i = 0; i < ci; i++)
+                for (int t = 0; t < 9; t++)
+                    w0p[((size_t)n * 16 + i) * 9 + t] = w0[((size_t)n * ci + i) * 9 + t];
+        const std::vector<uint16_t> f0 = fnFragOf(w0p, h, 16, 16, 2);
+        o[0] = put(f0.data(), f0.size() * sizeof(uint16_t));
+        o[1] = put(wts[p + "conv0.0.0.bias"].data(), (size_t)h * sizeof(float));
+        const std::vector<uint16_t> f1 = fnFragOf(wts[p + "conv0.1.0.weight"], c, h, giCg1(c), 2);
+        o[2] = put(f1.data(), f1.size() * sizeof(uint16_t));
+        o[3] = put(wts[p + "conv0.1.0.bias"].data(), (size_t)c * sizeof(float));
+        for (int r = 0; r < 8; r++)
+        {
+            const std::string q = p + "convblock." + std::to_string(r) + ".";
+            const std::vector<uint16_t> fr = fnFragOf(wts[q + "conv.weight"], c, c, giCgRes(c), 2);
+            o[4 + 3 * r] = put(fr.data(), fr.size() * sizeof(uint16_t));
+            o[5 + 3 * r] = put(wts[q + "conv.bias"].data(), (size_t)c * sizeof(float));
+            o[6 + 3 * r] = put(wts[q + "beta"].data(), (size_t)c * sizeof(float));
+        }
+        const std::vector<uint16_t> fl = ifnLastFrags(wts[p + "lastconv.0.weight"], c, 6, giCgRes(c), 24);
+        o[28] = put(fl.data(), fl.size() * sizeof(uint16_t));
+        const std::span<const float> lb = wts[p + "lastconv.0.bias"];
+        std::vector<float> lbp(32, 0.0f);
+        for (int i = 0; i < 24; i++)
+            lbp[i] = lb[i];
+        o[29] = put(lbp.data(), lbp.size() * sizeof(float));
+    }
+    return true;
+}
+
+// the GMFSS IFNet's scratch at the half w x h, 256-byte pieces: ONE input buffer ([L0][16] fp16, the largest), ONE
+// conv0[0] output ([L1][c / 2] fp16, the largest), ONE ping-pong pair ([L2][c] fp16, the largest), the 4 tmps (2 fp32
+// quads a pixel at each block's L0)
+struct GiArena
+{
+    size_t in = 0, y0 = 0, ya = 0, yb = 0, tm[4] = {}, total = 0;
+};
+static GiArena giArena(int w, int h)
+{
+    GiArena a;
+    size_t o = 0, inB = 0, y0B = 0, yB = 0;
+    auto put = [&](size_t n) {
+        const size_t at = o;
+        o += (n + 255) & ~(size_t)255;
+        return at;
+    };
+    for (int k = 0; k < 4; k++)
+    {
+        const int s = 8 >> k;
+        const size_t n0 = (size_t)(w / s) * (size_t)(h / s);
+        a.tm[k] = put(8 * n0 * sizeof(float));
+        inB = (std::max)(inB, 16 * n0 * sizeof(uint16_t));
+        y0B = (std::max)(y0B, (size_t)(kGiC[k] / 2) * (n0 / 4) * sizeof(uint16_t));
+        yB = (std::max)(yB, (size_t)kGiC[k] * (n0 / 16) * sizeof(uint16_t));
+    }
+    a.in = put(inB);
+    a.y0 = put(y0B);
+    a.ya = put(yB);
+    a.yb = put(yB);
+    a.total = o;
+    return a;
+}
+
+static size_t giNatBytes(const NativeRife& nr)
+{
+    return nr.gmfss && nr.hw > 0 && nr.hh > 0 ? giArena(nr.hw, nr.hh).total : 0;
+}
+
+// this session's GMFSS IFNet module: the weights read, its text compiled (or the cached cubin) and loaded, its kernels
+// bound, the weight block uploaded; false = `why` (the session teardown unloads a module left in giMod)
+static bool nativeGiModule(NativeRife& nr, std::string& why)
+{
+    if (nr.giMod)
+        return true;
+    std::vector<uint8_t> blob;
+    if (!giNatLoad(blob, nr.giOff, why))
+        return false;
+    std::string text = kFnHead;
+    text += kGiA;
+    text += kGiB;
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_gmifnet.cu", L"smv_gmifnet", "GMFSS IFNet kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.giMod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.giMod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    for (int i = 0; i < (int)(sizeof(kGiKern) / sizeof(kGiKern[0])); i++)
+        if (cuModuleGetFunction(&nr.fGi[i], nr.giMod, kGiKern[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kGiKern[i] + " is missing";
+            return false;
+        }
+    // the one kernel above the default 48 KB of dynamic shared memory: the 64-channel transposed conv
+    if (cuFuncSetAttribute(nr.fGi[kGiLq64], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, giSmLq(64)) !=
+        CUDA_SUCCESS)
+    {
+        why = "its transposed conv's shared memory was refused";
+        return false;
+    }
+    if (cudaMalloc(&nr.dGiW, blob.size()) != cudaSuccess ||
+        cudaMemcpy(nr.dGiW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
+    return true;
+}
+
+// the GMFSS IFNet's 49 launches on st at the half nr.hw x nr.hh, its scratch at s (giArena's pieces). false = a launch
+// failed
+static bool nativeGiLaunch(NativeRife& nr, const float* x, const float* ts, float* merged, uint8_t* s, cudaStream_t st)
+{
+    int iw = nr.hw, ih = nr.hh;
+    const GiArena ar = giArena(iw, ih);
+    void* tm[4] = {s + ar.tm[0], s + ar.tm[1], s + ar.tm[2], s + ar.tm[3]};
+    void* inb = s + ar.in;
+    void* y0 = s + ar.y0;
+    void* yab[2] = {s + ar.ya, s + ar.yb};
+    const char* wb = (const char*)nr.dGiW;
+    auto go = [&](int f, int gx, int gy, int gz, int threads, int sm, void** a) {
+        return cuLaunchKernel(nr.fGi[f], (unsigned)gx, (unsigned)gy, (unsigned)gz, (unsigned)threads, 1, 1,
+                              (unsigned)sm, (CUstream)st, a, nullptr) == CUDA_SUCCESS;
+    };
+    for (int k = 0; k < 4; k++)
+    {
+        const int sc = 8 >> k, c = kGiC[k], hc = c / 2, cg1 = giCg1(c), cgr = giCgRes(c);
+        int w0 = iw / sc, h0 = ih / sc, w1 = w0 / 2, h1 = h0 / 2, w2 = w0 / 4, h2 = h0 / 4;
+        const size_t* o = nr.giOff.data() + (size_t)k * kGiPieces;
+        const void* c0w = wb + o[0];
+        const void* c0b = wb + o[1];
+        const void* c1w = wb + o[2];
+        const void* c1b = wb + o[3];
+        const void* lw = wb + o[28];
+        const void* lb = wb + o[29];
+        if (k == 0)
+        {
+            void* a[] = {(void*)&x, (void*)&ts, &iw, &ih, &inb};
+            if (!go(kGiIn0, (w0 + 31) / 32, (h0 + 7) / 8, 1, 256, 0, a))
+                return false;
+        }
+        else
+        {
+            void* a[] = {(void*)&x, (void*)&ts, &iw, &ih, &tm[0], &tm[1], &tm[2], &inb};
+            if (!go(kGiIn0 + k, (w0 + 31) / 32, (h0 + 7) / 8, 1, 256, 0, a))
+                return false;
+        }
+        {
+            int cin = 16, cout = hc;
+            void* a[] = {&inb, &cin, &h0, &w0, &y0, &cout, (void*)&c0w, (void*)&c0b, (void*)&c0b};
+            if (!go(kGiS2g16, (w1 + 31) / 32, (h1 + 3) / 4, hc / 16, 128, giSmConv(2, 16), a))
+                return false;
+        }
+        {
+            int cin = hc, cout = c;
+            void* a[] = {&y0, &cin, &h1, &w1, &yab[0], &cout, (void*)&c1w, (void*)&c1b, (void*)&c1b};
+            if (!go(cg1 == 32 ? kGiS2g32 : kGiS2g16, (w2 + 31) / 32, (h2 + 3) / 4, c / 16, 128, giSmConv(2, cg1), a))
+                return false;
+        }
+        for (int r = 0; r < 8; r++)
+        {
+            const void* rw = wb + o[4 + 3 * r];
+            const void* rb = wb + o[5 + 3 * r];
+            const void* rbe = wb + o[6 + 3 * r];
+            int cin = c, cout = c;
+            void* a[] = {&yab[r & 1], &cin, &h2, &w2, &yab[(r + 1) & 1], &cout, (void*)&rw, (void*)&rb, (void*)&rbe};
+            if (!go(cgr == 64 ? kGiResg64 : kGiResg32, (w2 + 31) / 32, (h2 + 3) / 4, c / 16, 128, giSmConv(1, cgr), a))
+                return false;
+        }
+        {
+            int cin = c;
+            void* a[] = {&yab[0], &cin, &h2, &w2, &tm[k], (void*)&lw, (void*)&lb};
+            if (!go(cgr == 64 ? kGiLq64 : kGiLq32, (w2 + 31) / 32, (h2 + 3) / 4, 2, 128, giSmLq(cgr), a))
+                return false;
+        }
+    }
+    void* a[] = {(void*)&x, &iw, &ih, &tm[0], &tm[1], &tm[2], &tm[3], (void*)&merged};
+    return go(kGiOut, (iw + 31) / 32, (ih + 7) / 8, 1, 256, 0, a);
+}
+
+// the GMFSS IFNet on one tween on st (nr.stream) at the half nr.hw x nr.hh: x = the 6 fp32 half planes, ts = the fp32
+// timestep (one device float, read when the kernels run); merged = its output (3 fp32 planes); the launches go through
+// nr.giGraphs (chainGraphRun). false = the scratch or a launch failed
+static bool nativeGiRun(NativeRife& nr, const float* x, const float* ts, float* merged, cudaStream_t st)
+{
+    const GiArena ar = giArena(nr.hw, nr.hh);
+    uint8_t* s = nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= ar.total ? (uint8_t*)nr.dGmCtxMem : (uint8_t*)nr.dGiOwn;
+    if (!s && cudaMalloc(&nr.dGiOwn, ar.total) == cudaSuccess)
+        s = (uint8_t*)nr.dGiOwn;
+    if (!s)
+        return false;
+    return chainGraphRun(nr.giGraphs, {s, x, ts, merged}, nr.hw, nr.hh, st, "gmfss ifnet",
+                         [&] { return nativeGiLaunch(nr, x, ts, merged, s, st); });
+}
+
+// GMFSS's fusionnet (FusionNet_u.GridNet at the half: 4 heads, 9 ResidualBlocks, 4 DownsampleBlocks, 4 UpsampleBlocks,
+// the tail up to its 64 -> 256 conv) as 45 launches (nativeFuRun) of its own module smv_fusion_*.cubin (kFnHead's
+// helpers + kFuA / kFuB), weights = engine\GMFSS_Fortuna\train_log\fusionnet.pkl through pthStateDict (fuNatLoad); no
+// engine, no ONNX, no fallback (a missing / wrong pkl = `fusionnet unavailable (...)`, the session refuses). Every
+// activation channels-last fp16 at its level (0 = the half, 64 channels; 1 = the quarter, 128; 2 = the eighth, 192), fp16
+// sums in every conv but head0's first. Its inputs: a = dGmFa's 9 fp32 planes (k_fuIn applies head0's first PReLU), b /
+// c / d = the feature splats' channels-last stores (the other heads' first PReLU applied there: gmLr); its output = the
+// 64 -> 256 conv before the pixel shuffle, channels-last fp16 into dGmAcc, which k_fuTailNhwc shuffles and runs
+// conv_last on (dGmWl / dGmBl). Its activations (fuArena: the buffers alive at once per level, fuPlan) live in the
+// shared activation block (sound while serial on nr.stream), else dFuOwn.
+static const char kFuA[] = R"FUSRC(
+// GMFSS's fusionnet (FusionNet_u.GridNet) on the host's own kernels at the GMFSS half W x H (multiples of 32): level 0
+// = W x H (64 channels), level 1 = W / 2 x H / 2 (128), level 2 = W / 4 x H / 4 (192); every tensor channels-last fp16
+// [h][w][c], the inputs b / c / d as the splat stores leave them (the heads' first PReLU already applied).
+// k_fuIn      a (9 fp32 planes) through head0's first PReLU (fp32, one rounding) into [H][W][16] (7 zeros)
+// k_fuC16     head0's first conv 16 -> 64 (the padded input): implicit GEMM on the tensor cores (mma.sync m16n8k16, fp32
+//             accumulators from the bias, a 4 x 32 output tile, 16 outputs a block), the halo and weights by cp.async
+// k_fuW64*    every other stride-1 conv (cin % 64 == 0): an 8 x 32 output tile (a warp = 2 rows = 4 m-tiles), 64 outputs
+//             a block, the weights from global memory in fragment order a k-step ahead, the halo in shared memory, fp16
+//             accumulators from the bias; P: the halo through PReLU(slope) in fp16 (the PReLU before the conv; zeros stay
+//             zeros); 1 / 2: y = conv + add0 (+ add1) at the output pixel in fp32, one rounding to fp16
+// k_fuW2PH    the stride-2 convs the same way with a 4 x 32 output tile (a warp = 1 row = 2 m-tiles), the halo 9 x 65 with
+//             each row's even offsets before its odd ones, fp16 accumulators
+// k_fuUp64H   ConvTranspose cin -> cout (4 x 4, stride 2, pad 1) from W x H to 2W x 2H through PReLU: per output parity
+//             class (py, px) a 2 x 2-tap conv (input row yy - 1 + py + ti, kernel row 3 - py - 2 ti, the columns the
+//             same way), the 4 classes of a 4 x 32 input tile in one block, fp16 accumulators from the bias
+
+// the stored index of halo pixel sp and its chunk k's swizzled slot (each ldmatrix's 8 rows in 8 bank groups)
+template <int NCH>
+__device__ __forceinline__ unsigned fuSlot(int sp, int k)
+{
+    const int sw = NCH == 8 ? (k ^ (sp & 7)) : NCH == 4 ? (k ^ ((sp >> 1) & 3)) : (k ^ ((sp >> 2) & 1));
+    return (unsigned)((sp * NCH + sw) << 4);
+}
+
+__device__ __forceinline__ uint4 fuLds(unsigned addr)
+{
+    uint4 v;
+    asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr));
+    return v;
+}
+
+// PReLU on two packed fp16 values (x >= 0 ? x : x * a rounded once)
+__device__ __forceinline__ unsigned fuPrelu2(unsigned u, float a)
+{
+    const unsigned short lo = (unsigned short)(u & 0xffffu), hi = (unsigned short)(u >> 16);
+    const float flo = h2f(lo), fhi = h2f(hi);
+    const unsigned short rlo = flo >= 0.0f ? lo : f2h(flo * a), rhi = fhi >= 0.0f ? hi : f2h(fhi * a);
+    return (unsigned)rlo | ((unsigned)rhi << 16);
+}
+
+// the halo (n uint4 chunks from smem byte address base) through PReLU(a), in place
+__device__ __forceinline__ void fuPreluHalo(unsigned char* base, int n, float a)
+{
+    uint4* p = reinterpret_cast<uint4*>(base);
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    {
+        uint4 v = p[i];
+        v.x = fuPrelu2(v.x, a);
+        v.y = fuPrelu2(v.y, a);
+        v.z = fuPrelu2(v.z, a);
+        v.w = fuPrelu2(v.w, a);
+        p[i] = v;
+    }
+}
+
+// head0's input: a = 9 fp32 planes at W x H; PReLU(slope) in fp32, one rounding; out = [H][W][16] fp16
+extern "C" __global__ void __launch_bounds__(256) k_fuIn(const float* __restrict__ a, int W, int H, float slope,
+                                                         unsigned short* __restrict__ out)
+{
+    const int x = blockIdx.x * 32 + (threadIdx.x & 31), y = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (x >= W || y >= H)
+        return;
+    const size_t plane = (size_t)W * H, pix = (size_t)y * W + x;
+    unsigned v[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+    {
+        unsigned short h[2];
+#pragma unroll
+        for (int e = 0; e < 2; ++e)
+        {
+            const int c = 2 * k + e;
+            float f = c < 9 ? a[c * plane + pix] : 0.0f;
+            f = f >= 0.0f ? f : f * slope;
+            h[e] = f2h(f);
+        }
+        v[k] = (unsigned)h[0] | ((unsigned)h[1] << 16);
+    }
+    uint4* o = reinterpret_cast<uint4*>(out + pix * 16);
+    o[0] = make_uint4(v[0], v[1], v[2], v[3]);
+    o[1] = make_uint4(v[4], v[5], v[6], v[7]);
+}
+
+// head0's first conv, 128 threads: x = 16 channels channels-last fp16 at W x H; y = cout channels-last fp16; wf[z][step]
+// [lane] (step = tap, the B registers of the z's two n-tiles); bias fp32
+extern "C" __global__ void __launch_bounds__(128, 2)
+    k_fuC16(const unsigned short* __restrict__ x, int H, int W, unsigned short* __restrict__ y, int cout,
+            const uint4* __restrict__ wf, const float* __restrict__ bias)
+{
+    constexpr int TH = 4, NB = 2, CG = 16, HR = TH + 2, HC = 34;
+    constexpr int NCH = CG / 8, KC = CG / 16;
+    constexpr int HALO = HR * HC * NCH * 16, GQ = 9 * KC * 32;
+    extern __shared__ __align__(128) unsigned char fuSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(fuSm), wsm = halo + HALO;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, z = blockIdx.z;
+    wf += (size_t)z * 9 * 32;
+    const int g = lane >> 2, t4 = lane & 3;
+    float acc[2][NB][4];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[z * NB * 8 + nj * 8 + t4 * 2], b1 = bias[z * NB * 8 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            acc[mi][nj][0] = acc[mi][nj][2] = b0;
+            acc[mi][nj][1] = acc[mi][nj][3] = b1;
+        }
+    }
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+    {
+        const int p = i / NCH, k = i - p * NCH;
+        const int hr = p / HC, hc = p - hr * HC;
+        const int gy = ty0 - 1 + hr, gx = tx0 - 1 + hc;
+        const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+        const unsigned short* src = in ? x + ((size_t)gy * W + gx) * CG + k * 8 : x;
+        rnCp16(halo + fuSlot<NCH>(p, k), src, in ? 16 : 0);
+    }
+    for (int i = threadIdx.x; i < GQ; i += 128)
+        rnCp16(wsm + (unsigned)i * 16u, wf + i, 16);
+    asm volatile(SMV_CP_COMMIT);
+    asm volatile(SMV_CP_WAIT0);
+    __syncthreads();
+#pragma unroll 1
+    for (int tap = 0; tap < 9; ++tap)
+    {
+        const int dy = tap / 3, dx = tap - dy * 3;
+        int pa[2];
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+            pa[mi] = (warp + dy) * HC + mi * 16 + arow + dx;
+#pragma unroll
+        for (int kc = 0; kc < KC; ++kc)
+        {
+            const uint4 bw = fuLds(wsm + (unsigned)((tap * KC + kc) * 32 + lane) * 16u);
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                unsigned a[4];
+                rnLdm4(halo + fuSlot<NCH>(pa[mi], kc * 2 + akc), a);
+#pragma unroll
+                for (int q = 0; q < NB; ++q)
+                {
+                    float* d = acc[mi][q];
+                    const unsigned b0 = q ? bw.z : bw.x, b1 = q ? bw.w : bw.y;
+                    asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                 "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const int n0 = z * NB * 8 + nj * 8 + t4 * 2;
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+        {
+            const int oy = ty0 + warp;
+            if (oy >= H)
+                continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int ox = tx0 + mi * 16 + g + h * 8;
+                if (ox >= W)
+                    continue;
+                const float v0 = acc[mi][nj][2 * h], v1 = acc[mi][nj][2 * h + 1];
+                *reinterpret_cast<unsigned*>(y + ((size_t)oy * W + ox) * cout + n0) =
+                    (unsigned)f2h(v0) | ((unsigned)f2h(v1) << 16);
+            }
+        }
+    }
+}
+
+)FUSRC";
+static const char kFuB[] = R"FUSRC(
+// the wide conv at stride S, 128 threads: x = cin channels-last fp16 at W x H; y = cout channels-last fp16 at W / S x
+// H / S; wf[z][step][q][lane] (step = (group * 9 + tap) * CG / 16 + kc, q = an n-tile pair); bias fp32; add0 / add1 =
+// cout channels-last fp16 at the output size (NADD of them); A32: fp32 accumulators, else fp16 ones
+template <int S, int CG, int NB, bool PRE, int NADD, bool A32>
+__device__ __forceinline__ void fuConvW(const unsigned short* __restrict__ x, int cin, int H, int W,
+                                        unsigned short* __restrict__ y, int cout, const uint4* __restrict__ wf,
+                                        const float* __restrict__ bias, float slope,
+                                        const unsigned short* __restrict__ add0, const unsigned short* __restrict__ add1)
+{
+    constexpr int TH = S == 1 ? 8 : 4, RW = S == 1 ? 2 : 1, MI = 2 * RW;
+    constexpr int HR = S == 1 ? TH + 2 : 2 * TH + 1, HC = S == 1 ? 34 : 65;
+    const int OW = W / S, OH = H / S;
+    constexpr int NCH = CG / 8, KC = CG / 16, NQ = NB / 2;
+    extern __shared__ __align__(128) unsigned char fuSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(fuSm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, z = blockIdx.z;
+    const int ksteps = cin * 9 / 16;
+    wf += (size_t)z * ksteps * NQ * 32;
+    const int g = lane >> 2, t4 = lane & 3;
+    float accF[A32 ? MI : 1][NB][4];
+    unsigned accH[A32 ? 1 : MI][NB][2];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[z * NB * 8 + nj * 8 + t4 * 2], b1 = bias[z * NB * 8 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < MI; ++mi)
+        {
+            if constexpr (A32)
+            {
+                accF[mi][nj][0] = accF[mi][nj][2] = b0;
+                accF[mi][nj][1] = accF[mi][nj][3] = b1;
+            }
+            else
+                accH[mi][nj][0] = accH[mi][nj][1] = (unsigned)f2h(b0) | ((unsigned)f2h(b1) << 16);
+        }
+    }
+    uint4 bc[NQ], bn[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q)
+        bc[q] = __ldg(wf + q * 32 + lane);
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+        {
+            const int p = i / NCH, k = i - p * NCH;
+            const int hr = p / HC, hc = p - hr * HC;
+            const int gy = S * ty0 - 1 + hr, gx = S * tx0 - 1 + hc;
+            const int sp = S == 1 ? p : hr * HC + ((hc & 1) ? 33 + (hc >> 1) : (hc >> 1));
+            const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + gi * CG + k * 8 : x;
+            rnCp16(halo + fuSlot<NCH>(sp, k), src, in ? 16 : 0);
+        }
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+        if (PRE)
+        {
+            fuPreluHalo(fuSm, HR * HC * NCH, slope);
+            __syncthreads();
+        }
+#pragma unroll 1
+        for (int tap = 0; tap < 9; ++tap)
+        {
+            const int dy = tap / 3, dx = tap - dy * 3;
+            int pa[MI];
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi)
+            {
+                const int col = (mi & 1) * 16 + arow;
+                pa[mi] = S == 1 ? (RW * warp + (mi >> 1) + dy) * HC + col + dx
+                                : (2 * warp + dy) * HC + (dx == 1 ? 33 + col : col + (dx >> 1));
+            }
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                const int step = (gi * 9 + tap) * KC + kc;
+                if (step + 1 < ksteps)
+#pragma unroll
+                    for (int q = 0; q < NQ; ++q)
+                        bn[q] = __ldg(wf + ((step + 1) * NQ + q) * 32 + lane);
+#pragma unroll
+                for (int mi = 0; mi < MI; ++mi)
+                {
+                    unsigned a[4];
+                    rnLdm4(halo + fuSlot<NCH>(pa[mi], kc * 2 + akc), a);
+#pragma unroll
+                    for (int q = 0; q < NB; ++q)
+                    {
+                        const unsigned b0 = (q & 1) ? bc[q >> 1].z : bc[q >> 1].x;
+                        const unsigned b1 = (q & 1) ? bc[q >> 1].w : bc[q >> 1].y;
+                        if constexpr (A32)
+                        {
+                            float* d = accF[mi][q];
+                            asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, "
+                                         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                        }
+                        else
+                            asm volatile(SMV_MMA_F16 "{%0,%1}, {%2,%3,%4,%5}, "
+                                         "{%6,%7}, {%0,%1};\n"
+                                         : "+r"(accH[mi][q][0]), "+r"(accH[mi][q][1])
+                                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < NQ; ++q)
+                    bc[q] = bn[q];
+            }
+        }
+    }
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const int n0 = z * NB * 8 + nj * 8 + t4 * 2;
+#pragma unroll
+        for (int mi = 0; mi < MI; ++mi)
+        {
+            const int oy = ty0 + RW * warp + (mi >> 1);
+            if (oy >= OH)
+                continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int ox = tx0 + (mi & 1) * 16 + g + h * 8;
+                if (ox >= OW)
+                    continue;
+                float v0, v1;
+                if constexpr (A32)
+                {
+                    v0 = accF[mi][nj][2 * h];
+                    v1 = accF[mi][nj][2 * h + 1];
+                }
+                else
+                {
+                    v0 = h2f((unsigned short)(accH[mi][nj][h] & 0xffffu));
+                    v1 = h2f((unsigned short)(accH[mi][nj][h] >> 16));
+                }
+                const size_t at = ((size_t)oy * OW + ox) * cout + n0;
+                if (NADD > 0)
+                {
+                    const unsigned u = *reinterpret_cast<const unsigned*>(add0 + at);
+                    v0 += h2f((unsigned short)(u & 0xffffu));
+                    v1 += h2f((unsigned short)(u >> 16));
+                }
+                if (NADD > 1)
+                {
+                    const unsigned u = *reinterpret_cast<const unsigned*>(add1 + at);
+                    v0 += h2f((unsigned short)(u & 0xffffu));
+                    v1 += h2f((unsigned short)(u >> 16));
+                }
+                *reinterpret_cast<unsigned*>(y + at) = (unsigned)f2h(v0) | ((unsigned)f2h(v1) << 16);
+            }
+        }
+    }
+}
+
+#define FU_CONVW(NAME, S, CG, PRE, NADD, A32)                                                                          \
+    extern "C" __global__ void __launch_bounds__(128)                                                                  \
+        NAME(const unsigned short* __restrict__ x, int cin, int H, int W, unsigned short* __restrict__ y, int cout,    \
+             const uint4* __restrict__ wf, const float* __restrict__ bias, float slope,                               \
+             const unsigned short* __restrict__ add0, const unsigned short* __restrict__ add1)                        \
+    {                                                                                                                  \
+        fuConvW<S, CG, 8, PRE, NADD, A32>(x, cin, H, W, y, cout, wf, bias, slope, add0, add1);                         \
+    }
+FU_CONVW(k_fuW64H, 1, 64, false, 0, false)
+FU_CONVW(k_fuW64PH, 1, 64, true, 0, false)
+FU_CONVW(k_fuW64P1H, 1, 64, true, 1, false)
+FU_CONVW(k_fuW64P2H, 1, 64, true, 2, false)
+FU_CONVW(k_fuW2PH, 2, 32, true, 0, false)
+
+// ConvTranspose cin -> cout (4 x 4, stride 2, pad 1) through PReLU(slope): x = cin channels-last fp16 at W x H, y = cout
+// channels-last fp16 at 2W x 2H; blockIdx.z = the 16-output group; wf[z][group][class][tap][kc][lane]
+extern "C" __global__ void __launch_bounds__(128)
+    k_fuUp64H(const unsigned short* __restrict__ x, int cin, int H, int W, unsigned short* __restrict__ y, int cout,
+              const uint4* __restrict__ wf, const float* __restrict__ bias, float slope)
+{
+    constexpr int TH = 4, NB = 2, CG = 64, HR = TH + 2, HC = 34;
+    constexpr int NCH = CG / 8, KC = CG / 16;
+    constexpr int HALO = HR * HC * NCH * 16, GQ = 16 * KC * 32;
+    extern __shared__ __align__(128) unsigned char fuSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(fuSm), wsm = halo + HALO;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, zc = blockIdx.z;
+    wf += (size_t)zc * (cin / CG) * GQ;
+    const int g = lane >> 2, t4 = lane & 3;
+    unsigned acc[4][2][NB][2];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const unsigned b = (unsigned)f2h(bias[zc * 16 + nj * 8 + t4 * 2]) |
+                           ((unsigned)f2h(bias[zc * 16 + nj * 8 + t4 * 2 + 1]) << 16);
+#pragma unroll
+        for (int cl = 0; cl < 4; ++cl)
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+                acc[cl][mi][nj][0] = acc[cl][mi][nj][1] = b;
+    }
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+        {
+            const int p = i / NCH, k = i - p * NCH;
+            const int hr = p / HC, hc = p - hr * HC;
+            const int gy = ty0 - 1 + hr, gx = tx0 - 1 + hc;
+            const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + gi * CG + k * 8 : x;
+            rnCp16(halo + fuSlot<NCH>(p, k), src, in ? 16 : 0);
+        }
+        for (int i = threadIdx.x; i < GQ; i += 128)
+            rnCp16(wsm + (unsigned)i * 16u, wf + (size_t)gi * GQ + i, 16);
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+        fuPreluHalo(fuSm, HR * HC * NCH, slope);
+        __syncthreads();
+#pragma unroll
+        for (int pos = 0; pos < 9; ++pos)
+        {
+            const int dy = pos / 3, dx = pos % 3;
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                unsigned a[2][4];
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+                    rnLdm4(halo + fuSlot<NCH>((warp + dy) * HC + mi * 16 + arow + dx, kc * 2 + akc), a[mi]);
+#pragma unroll
+                for (int cl = 0; cl < 4; ++cl)
+                {
+                    const int ti = dy - (cl >> 1), tj = dx - (cl & 1);
+                    if (ti < 0 || ti > 1 || tj < 0 || tj > 1)
+                        continue;
+                    const uint4 bw = fuLds(wsm + (unsigned)(((cl * 4 + ti * 2 + tj) * KC + kc) * 32 + lane) * 16u);
+#pragma unroll
+                    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+                        for (int q = 0; q < NB; ++q)
+                        {
+                            const unsigned b0 = q ? bw.z : bw.x, b1 = q ? bw.w : bw.y;
+                            asm volatile(SMV_MMA_F16 "{%0,%1}, "
+                                         "{%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                                         : "+r"(acc[cl][mi][q][0]), "+r"(acc[cl][mi][q][1])
+                                         : "r"(a[mi][0]), "r"(a[mi][1]), "r"(a[mi][2]), "r"(a[mi][3]), "r"(b0),
+                                           "r"(b1));
+                        }
+                }
+            }
+        }
+    }
+    const int OW = 2 * W, OH = 2 * H;
+#pragma unroll
+    for (int cl = 0; cl < 4; ++cl)
+    {
+        const int py = cl >> 1, px = cl & 1;
+        const int oy = 2 * (ty0 + warp) + py;
+        if (oy >= OH)
+            continue;
+#pragma unroll
+        for (int nj = 0; nj < NB; ++nj)
+        {
+            const int n0 = zc * 16 + nj * 8 + t4 * 2;
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+                {
+                    const int ox = 2 * (tx0 + mi * 16 + g + h * 8) + px;
+                    if (ox >= OW)
+                        continue;
+                    *reinterpret_cast<unsigned*>(y + ((size_t)oy * OW + ox) * cout + n0) = acc[cl][mi][nj][h];
+                }
+        }
+    }
+}
+)FUSRC";
+static const char* const kFuKern[] = {"k_fuIn",     "k_fuC16",    "k_fuW64H", "k_fuW64PH",
+                                      "k_fuW64P1H", "k_fuW64P2H", "k_fuW2PH", "k_fuUp64H"};
+static_assert(sizeof(kFuKern) / sizeof(kFuKern[0]) == sizeof(NativeRife::fFu) / sizeof(CUfunction),
+              "one fFu slot a fusionnet kernel");
+enum
+{
+    kFuIn,
+    kFuC16,
+    kFuW64,
+    kFuW64P,
+    kFuW64P1,
+    kFuW64P2,
+    kFuW2,
+    kFuUp
+};
+// fu_host.cu's dynamic shared memory: k_fuC16's halo + weights (a 4 x 32 tile), the wide stride-1 convs' halo (8 x 32),
+// the stride-2 ones' (9 x 65), the transposed conv's halo + one group's weights (above the default 48 KB)
+constexpr int kFuSmC16 = (6 * 34 * 2 + 9 * 32) * 16, kFuSmW64 = 10 * 34 * 8 * 16, kFuSmW2 = 9 * 65 * 4 * 16,
+              kFuSmUp = (6 * 34 * 8 + 16 * 4 * 32) * 16;
+// a level's channels and the most buffers one level may hold
+constexpr int kFuCh[3] = {64, 128, 192}, kFuMaxSlots = 8;
+// fuPlan's buffer codes: the chain's inputs and output, then level l's buffer i = kFuRefSlot + l kFuMaxSlots + i
+enum
+{
+    kFuRefA,
+    kFuRefB,
+    kFuRefC,
+    kFuRefD,
+    kFuRefOut,
+    kFuRefSlot = 8
+};
+
+// one step of the chain: kind ('i' = k_fuIn, 'c' = a stride-1 conv, 's' = a stride-2 conv, 'u' = the transposed conv),
+// buffers by code (add0 / add1 = -1: none), the input's level, the state-dict names of its conv and of the PReLU before
+// it ("" = none), the channels in and out
+struct FuStep
+{
+    char kind = 'c';
+    int src = 0, dst = 0, add0 = -1, add1 = -1, lv = 0, cin = 0, cout = 0;
+    std::string conv, prelu;
+};
+struct FuPlan
+{
+    std::vector<FuStep> steps;
+    int slots[3] = {};
+};
+
+// the GridNet's forward (FusionNet_u.GridNet's order) with every intermediate in a level buffer: a step's output takes a free buffer of its level, its inputs free theirs after their
+// last read, so no step writes a buffer it reads (4 / 4 / 3 buffers)
+static const FuPlan& fuPlan()
+{
+    static const FuPlan plan = [] {
+        struct Op
+        {
+            char kind;
+            std::string src, dst, conv, prelu;
+            std::vector<std::string> adds;
+            int lv;
+        };
+        std::vector<Op> ops;
+        const std::string h0 = "residual_model_head0.";
+        ops.push_back({'i', "a", "A16", "", h0 + "0", {}, 0});
+        ops.push_back({'c', "A16", "h0a", h0 + "1", "", {}, 0});
+        ops.push_back({'c', "h0a", "h0", h0 + "3", h0 + "2", {}, 0});
+        // a block {PReLU, conv (stride 1 / 2, or transposed), PReLU, conv}: the heads' first PReLU is the splats'
+        auto block = [&](const char* name, const char* src, const char* mid, const char* dst, int lv,
+                         std::vector<std::string> adds, char k0, bool pre0) {
+            const std::string m = std::string(name) + ".";
+            const int lv1 = k0 == 's' ? lv + 1 : k0 == 'u' ? lv - 1 : lv;
+            ops.push_back({k0, src, mid, m + "1", pre0 ? m + "0" : "", {}, lv});
+            ops.push_back({'c', mid, dst, m + "3", m + "2", std::move(adds), lv1});
+        };
+        block("residual_model_head1", "b", "h1a", "X00", 0, {"h0"}, 'c', false);
+        block("residual_model_01", "X00", "r01a", "X01", 0, {"X00"}, 'c', true);
+        block("downsample_model_10", "X00", "d10a", "d10", 0, {}, 's', true);
+        block("residual_model_head2", "c", "h2a", "X10", 1, {"d10"}, 'c', false);
+        block("downsample_model_20", "X10", "d20a", "d20", 1, {}, 's', true);
+        block("residual_model_head3", "d", "h3a", "X20", 2, {"d20"}, 'c', false);
+        block("residual_model_11", "X10", "r11a", "R11", 1, {"X10"}, 'c', true);
+        block("downsample_model_11", "X01", "d11a", "X11", 0, {"R11"}, 's', true);
+        block("residual_model_21", "X20", "r21a", "R21", 2, {"X20"}, 'c', true);
+        block("downsample_model_21", "X11", "d21a", "X21", 1, {"R21"}, 's', true);
+        block("residual_model_24", "X21", "r24a", "X24", 2, {"X21"}, 'c', true);
+        block("residual_model_25", "X24", "r25a", "X25", 2, {"X24"}, 'c', true);
+        block("upsample_model_14", "X24", "u14a", "U14", 2, {}, 'u', true);
+        block("residual_model_14", "X11", "r14a", "X14", 1, {"X11", "U14"}, 'c', true);
+        block("upsample_model_04", "X14", "u04a", "U04", 1, {}, 'u', true);
+        block("residual_model_04", "X01", "r04a", "X04", 0, {"X01", "U04"}, 'c', true);
+        block("upsample_model_15", "X25", "u15a", "U15", 2, {}, 'u', true);
+        block("residual_model_15", "X14", "r15a", "X15", 1, {"X14", "U15"}, 'c', true);
+        block("upsample_model_05", "X15", "u05a", "U05", 1, {}, 'u', true);
+        block("residual_model_05", "X04", "r05a", "X05", 0, {"X04", "U05"}, 'c', true);
+        const std::string t = "residual_model_tail.";
+        ops.push_back({'c', "X05", "t1", t + "conv_before_upsample.0", "", {}, 0});
+        ops.push_back({'c', "t1", "out", t + "upsample.0", t + "conv_before_upsample.1", {}, 0});
+        const std::map<std::string, int> ext = {
+            {"a", kFuRefA}, {"b", kFuRefB}, {"c", kFuRefC}, {"d", kFuRefD}, {"out", kFuRefOut}};
+        const std::map<std::string, int> extC = {{"a", 9}, {"b", 128}, {"c", 256}, {"d", 384}};
+        std::map<std::string, size_t> last;
+        for (size_t i = 0; i < ops.size(); i++)
+        {
+            last[ops[i].src] = i;
+            for (const std::string& a : ops[i].adds)
+                last[a] = i;
+        }
+        FuPlan p;
+        std::vector<int> freeSlot[3];
+        std::map<std::string, int> code;
+        for (const auto& e : ext)
+            code[e.first] = e.second;
+        for (size_t i = 0; i < ops.size(); i++)
+        {
+            const Op& o = ops[i];
+            const int olv = o.kind == 's' ? o.lv + 1 : o.kind == 'u' ? o.lv - 1 : o.lv;
+            if (!ext.count(o.dst))
+            {
+                int s = 0;
+                if (!freeSlot[olv].empty())
+                {
+                    s = freeSlot[olv].back();
+                    freeSlot[olv].pop_back();
+                }
+                else
+                    s = p.slots[olv]++;
+                code[o.dst] = kFuRefSlot + olv * kFuMaxSlots + s;
+            }
+            std::vector<std::string> reads = o.adds;
+            reads.push_back(o.src);
+            std::sort(reads.begin(), reads.end());
+            reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
+            for (const std::string& r : reads)
+                if (!ext.count(r) && last[r] == i)
+                {
+                    const int c = code[r] - kFuRefSlot;
+                    freeSlot[c / kFuMaxSlots].push_back(c % kFuMaxSlots);
+                }
+            FuStep st;
+            st.kind = o.kind;
+            st.src = code[o.src];
+            st.dst = code[o.dst];
+            st.add0 = o.adds.size() > 0 ? code[o.adds[0]] : -1;
+            st.add1 = o.adds.size() > 1 ? code[o.adds[1]] : -1;
+            st.lv = o.lv;
+            st.cin = extC.count(o.src) ? extC.at(o.src) : o.src == "A16" ? 9 : kFuCh[o.lv];
+            st.cout = o.dst == "out" ? 256 : o.kind == 'i' ? 16 : kFuCh[olv];
+            st.conv = o.conv;
+            st.prelu = o.prelu;
+            p.steps.push_back(st);
+        }
+        return p;
+    }();
+    return plan;
+}
+
+// fusionnet.pkl in the strict GridNet form (every step's conv [cout][cin][3][3] / the transposed ones [cin][cout][4][4]
+// with its bias, every PReLU one scalar, conv_last [3][64][3][3] + [3], nothing else) as one weight block of 256-byte
+// aligned pieces (ops[i] = step i's kernel, slope and pieces), conv_last in fp16 (wl / bl) and the heads' first PReLU
+// slopes on b / c / d (lr); false = missing, or not this net (`why`)
+static bool fuNatLoad(std::vector<uint8_t>& blob, std::vector<FuOp>& ops, std::vector<uint16_t>& wl,
+                      std::vector<uint16_t>& bl, float* lr, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\fusionnet.pkl", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
+    const FuPlan& pl = fuPlan();
+    std::map<std::string, bool> want;
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        want[n] = true;
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    };
+    bool form = true;
+    for (const FuStep& p : pl.steps)
+    {
+        if (!p.prelu.empty())
+            form = form && has(p.prelu + ".weight", {1});
+        if (p.kind == 'i')
+            continue;
+        const std::vector<int64_t> ws =
+            p.kind == 'u' ? std::vector<int64_t>{p.cin, p.cout, 4, 4} : std::vector<int64_t>{p.cout, p.cin, 3, 3};
+        form = form && has(p.conv + ".weight", ws) && has(p.conv + ".bias", {p.cout});
+    }
+    static const char* const kHeadLr[3] = {"residual_model_head1.0", "residual_model_head2.0",
+                                           "residual_model_head3.0"};
+    for (const char* h : kHeadLr)
+        form = form && has(std::string(h) + ".weight", {1});
+    const std::string cl = "residual_model_tail.conv_last.";
+    form = form && has(cl + "weight", {3, 64, 3, 3}) && has(cl + "bias", {3}) && S.size() == want.size();
+    if (!form)
+    {
+        why = "its weights are not GMFSS's fusionnet";
+        return false;
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        lr[i] = wts[std::string(kHeadLr[i]) + ".weight"][0];
+        if (!(lr[i] > 0.0f && lr[i] <= 1.0f))
+        {
+            why = "its b / c / d PReLU slopes are not in (0, 1]";
+            return false;
+        }
+    }
+    blob.clear();
+    ops.assign(pl.steps.size(), FuOp());
+    auto put = [&](const void* d, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, d, n);
+        return o;
+    };
+    for (size_t i = 0; i < pl.steps.size(); i++)
+    {
+        const FuStep& p = pl.steps[i];
+        FuOp& o = ops[i];
+        o.cin = p.cin;
+        o.cout = p.cout;
+        o.slope = p.prelu.empty() ? 0.0f : wts[p.prelu + ".weight"][0];
+        if (p.kind == 'i')
+        {
+            o.k = kFuIn;
+            continue;
+        }
+        const std::span<const float> w = wts[p.conv + ".weight"];
+        std::vector<uint16_t> fr;
+        if (p.kind == 'u')
+        {
+            o.k = kFuUp;
+            fr = ifnLastFrags(w, p.cin, p.cout / 4, 64, p.cout);
+        }
+        else if (p.kind == 's')
+        {
+            o.k = kFuW2;
+            fr = fnFragOf(w, p.cout, p.cin, 32, 8);
+        }
+        else if (p.cin == 9)
+        {
+            // head0's first conv: its 9 inputs zero-padded to k_fuIn's 16
+            o.k = kFuC16;
+            std::vector<float> wp((size_t)p.cout * 16 * 9, 0.0f);
+            for (int n = 0; n < p.cout; n++)
+                for (int c = 0; c < 9; c++)
+                    for (int t = 0; t < 9; t++)
+                        wp[((size_t)n * 16 + c) * 9 + t] = w[((size_t)n * 9 + c) * 9 + t];
+            fr = fnFragOf(wp, p.cout, 16, 16, 2);
+            o.cin = 16;
+        }
+        else
+        {
+            o.k = p.prelu.empty() ? kFuW64 : p.add1 >= 0 ? kFuW64P2 : p.add0 >= 0 ? kFuW64P1 : kFuW64P;
+            fr = fnFragOf(w, p.cout, p.cin, 64, 8);
+        }
+        o.wOff = put(fr.data(), fr.size() * sizeof(uint16_t));
+        o.bOff = put(wts[p.conv + ".bias"].data(), (size_t)p.cout * sizeof(float));
+    }
+    const std::span<const float> cw = wts[cl + "weight"], cb = wts[cl + "bias"];
+    wl.resize(cw.size());
+    bl.resize(cb.size());
+    for (size_t i = 0; i < cw.size(); i++)
+        wl[i] = f2hRne(cw[i]);
+    for (size_t i = 0; i < cb.size(); i++)
+        bl[i] = f2hRne(cb[i]);
+    return true;
+}
+
+// fusionnet's activations at the half w x h: level l's fuPlan buffers of kFuCh[l] fp16 channels each, 256-byte pieces
+struct FuArena
+{
+    size_t at[3][kFuMaxSlots] = {}, total = 0;
+};
+static FuArena fuArena(int w, int h)
+{
+    const FuPlan& pl = fuPlan();
+    FuArena a;
+    size_t o = 0;
+    for (int l = 0; l < 3; l++)
+        for (int i = 0; i < pl.slots[l] && i < kFuMaxSlots; i++)
+        {
+            a.at[l][i] = o;
+            o += ((size_t)(w >> l) * (size_t)(h >> l) * kFuCh[l] * sizeof(uint16_t) + 255) & ~(size_t)255;
+        }
+    a.total = o;
+    return a;
+}
+
+static size_t fuNatBytes(const NativeRife& nr)
+{
+    return nr.gmfss && nr.hw > 0 && nr.hh > 0 ? fuArena(nr.hw, nr.hh).total : 0;
+}
+
+// this session's fusionnet module: the weights read, its text compiled (or the cached cubin) and loaded, its kernels
+// bound, the weight block and conv_last uploaded, the b / c / d slopes into gmLr; false = `why` (the session teardown
+// unloads a module left in fuMod)
+static bool nativeFuModule(NativeRife& nr, std::string& why)
+{
+    if (nr.fuMod)
+        return true;
+    for (int l = 0; l < 3; l++)
+        if (fuPlan().slots[l] > kFuMaxSlots)
+        {
+            why = "its plan needs more buffers than a level holds";
+            return false;
+        }
+    std::vector<uint8_t> blob;
+    std::vector<uint16_t> wl, bl;
+    float lr[3] = {};
+    if (!fuNatLoad(blob, nr.fuOps, wl, bl, lr, why))
+        return false;
+    std::string text = kFnHead;
+    text += kFuA;
+    text += kFuB;
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_fusion.cu", L"smv_fusion", "fusionnet kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.fuMod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.fuMod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    for (int i = 0; i < (int)(sizeof(kFuKern) / sizeof(kFuKern[0])); i++)
+        if (cuModuleGetFunction(&nr.fFu[i], nr.fuMod, kFuKern[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kFuKern[i] + " is missing";
+            return false;
+        }
+    if (cuFuncSetAttribute(nr.fFu[kFuUp], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kFuSmUp) != CUDA_SUCCESS)
+    {
+        why = "its transposed conv's shared memory was refused";
+        return false;
+    }
+    if (cudaMalloc(&nr.dFuW, blob.size()) != cudaSuccess ||
+        cudaMemcpy(nr.dFuW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+        (!nr.dGmWl && cudaMalloc(&nr.dGmWl, wl.size() * sizeof(uint16_t)) != cudaSuccess) ||
+        (!nr.dGmBl && cudaMalloc(&nr.dGmBl, bl.size() * sizeof(uint16_t)) != cudaSuccess) ||
+        cudaMemcpy(nr.dGmWl, wl.data(), wl.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(nr.dGmBl, bl.data(), bl.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
+    memcpy(nr.gmLr, lr, sizeof(lr));
+    return true;
+}
+
+// fusionnet's 45 launches on st at the half nr.hw x nr.hh, its activations at s (fuArena's pieces). false = a launch
+// failed
+static bool nativeFuLaunch(NativeRife& nr, uint8_t* s, cudaStream_t st)
+{
+    const FuArena ar = fuArena(nr.hw, nr.hh);
+    const FuPlan& pl = fuPlan();
+    const char* wb = (const char*)nr.dFuW;
+    auto buf = [&](int code) -> void* {
+        switch (code)
+        {
+        case -1:
+            return nullptr;
+        case kFuRefA:
+            return nr.dGmFa;
+        case kFuRefB:
+            return nr.dGmFb;
+        case kFuRefC:
+            return nr.dGmFc;
+        case kFuRefD:
+            return nr.dGmFd;
+        case kFuRefOut:
+            return nr.dGmAcc;
+        default:
+            return s + ar.at[(code - kFuRefSlot) / kFuMaxSlots][(code - kFuRefSlot) % kFuMaxSlots];
+        }
+    };
+    auto go = [&](int f, int gx, int gy, int gz, int threads, int sm, void** a) {
+        return cuLaunchKernel(nr.fFu[f], (unsigned)gx, (unsigned)gy, (unsigned)gz, (unsigned)threads, 1, 1,
+                              (unsigned)sm, (CUstream)st, a, nullptr) == CUDA_SUCCESS;
+    };
+    for (size_t i = 0; i < pl.steps.size(); i++)
+    {
+        const FuStep& p = pl.steps[i];
+        const FuOp& o = nr.fuOps[i];
+        int iw = nr.hw >> p.lv, ih = nr.hh >> p.lv, cin = o.cin, cout = o.cout;
+        float sl = o.slope;
+        void* x = buf(p.src);
+        void* y = buf(p.dst);
+        void* a0 = buf(p.add0);
+        void* a1 = buf(p.add1);
+        const void* wf = wb + o.wOff;
+        const void* bias = wb + o.bOff;
+        bool ok = false;
+        if (o.k == kFuIn)
+        {
+            void* a[] = {&x, &iw, &ih, &sl, &y};
+            ok = go(kFuIn, (iw + 31) / 32, (ih + 7) / 8, 1, 256, 0, a);
+        }
+        else if (o.k == kFuUp)
+        {
+            void* a[] = {&x, &cin, &ih, &iw, &y, &cout, (void*)&wf, (void*)&bias, &sl};
+            ok = go(kFuUp, (iw + 31) / 32, (ih + 3) / 4, cout / 16, 128, kFuSmUp, a);
+        }
+        else if (o.k == kFuC16)
+        {
+            void* a[] = {&x, &ih, &iw, &y, &cout, (void*)&wf, (void*)&bias};
+            ok = go(kFuC16, (iw + 31) / 32, (ih + 3) / 4, cout / 16, 128, kFuSmC16, a);
+        }
+        else
+        {
+            const bool s2 = o.k == kFuW2;
+            const int ow = s2 ? iw / 2 : iw, oh = s2 ? ih / 2 : ih;
+            void* a[] = {&x, &cin, &ih, &iw, &y, &cout, (void*)&wf, (void*)&bias, &sl, &a0, &a1};
+            ok = go(o.k, (ow + 31) / 32, s2 ? (oh + 3) / 4 : (oh + 7) / 8, cout / 64, 128, s2 ? kFuSmW2 : kFuSmW64, a);
+        }
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+// fusionnet on one tween on st (nr.stream): dGmFa / dGmFb / dGmFc / dGmFd in, its out into dGmAcc; the launches go
+// through nr.fuGraphs (chainGraphRun). false = the activations or a launch failed
+static bool nativeFuRun(NativeRife& nr, cudaStream_t st)
+{
+    const FuArena ar = fuArena(nr.hw, nr.hh);
+    uint8_t* s = nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= ar.total ? (uint8_t*)nr.dGmCtxMem : (uint8_t*)nr.dFuOwn;
+    if (!s && cudaMalloc(&nr.dFuOwn, ar.total) == cudaSuccess)
+        s = (uint8_t*)nr.dFuOwn;
+    if (!s)
+        return false;
+    return chainGraphRun(nr.fuGraphs, {s, nr.dGmFa, nr.dGmFb, nr.dGmFc, nr.dGmFd, nr.dGmAcc}, nr.hw, nr.hh, st,
+                         "gmfss fusionnet", [&] { return nativeFuLaunch(nr, s, st); });
+}
+
+// gmflow's second half B (gmflow.py's last scale after the local correlation: the window's softmax, the flow
+// propagation, the convex upsampler) as 7 launches (nativeGbRun) of its own module smv_gmflowb_*.cubin (kFnHead's
+// helpers + fusionnet's kFuA / kFuB for k_fuW64H + kGb), weights = engine\GMFSS_Fortuna\train_log\flownet.pkl's
+// feature_flow_attn and upsampler through pthStateDict (gbNatLoad); no engine, no ONNX, no fallback (a missing / wrong
+// pkl = `gmflow B unavailable (...)`, the session refuses). At the quarter of the half (nr.gmH x nr.gmW), both directions
+// as the batch: corr (k_localCorr's raw sums, 81 taps) + A's qf / flow0 in, the half's flow (2, 2, hh, hw) out into
+// dGmFlow. k_gbFlow: corr / sqrt(128), the off-frame taps masked, softmax, flow0 + sum(prob x offset); k_gbProj: q / k
+// (a 1 x 1 mma GEMM, fp32 sums); k_gbProp: the 9 zero-padded neighbours' softmax over q . k / sqrt(128), the
+// propagated flow, the upsampler's input u0 (feat | flow | zeros, 192 channels); k_fuW64H per direction: the 3 x 3 conv
+// 130 -> 256 (fp16 sums); k_gbMask: the 1 x 1 conv on its ReLU (fp32 sums); k_gbUp: the softmax over the 9 taps per 4 x 4
+// sub-pixel and the convex combination of 4 x the flow. Its activations (gbArena) live in the shared activation block
+// (sound while serial on nr.stream), else dGbOwn.
+static const char kGb[] = R"GBSRC(
+// gmflow's second half B on the host's kernels, compiled after kFnHead and fusionnet's text (fuSlot, fuLds, fuConvW:
+// k_fuW64H = the upsampler's 3 x 3 conv with fp16 sums). Every tensor at the quarter of the GMFSS half, both flow
+// directions as the batch (B = 2), P = H W pixels an image.
+
+__device__ __forceinline__ void gbMma(float* d, const unsigned* a, unsigned b0, unsigned b1)
+{
+    asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// ReLU on two packed fp16 values (a set sign bit = 0)
+__device__ __forceinline__ unsigned gbRelu2(unsigned u)
+{
+    return ((u & 0x8000u) ? 0u : (u & 0xffffu)) | ((u & 0x80000000u) ? 0u : (u & 0xffff0000u));
+}
+
+// the local window's softmax: corr [B][P][81] = the host's raw fp32 sums (tap k = (dy + 4) 9 + dx + 4), / sqrt(128),
+// the taps outside the frame masked, softmax over the 81, flow = flow0 + sum(prob x (dx, dy)); flow0 / flow planar
+// fp32 [B][2][H][W]
+extern "C" __global__ void __launch_bounds__(256) k_gbFlow(const float* __restrict__ corr,
+                                                            const float* __restrict__ flow0, float* __restrict__ flow,
+                                                            int H, int W, int B)
+{
+    const int P = H * W;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= B * P)
+        return;
+    const int b = i / P, p = i - b * P, y = p / W, x = p - y * W;
+    const float* c = corr + (size_t)i * 81;
+    float s[81];
+    float m = -3.402823466e38f;
+#pragma unroll
+    for (int k = 0; k < 81; ++k)
+    {
+        const int dx = k % 9 - 4, dy = k / 9 - 4;
+        const bool v = x + dx >= 0 && x + dx < W && y + dy >= 0 && y + dy < H;
+        s[k] = v ? c[k] / 11.313708498984761f : -1.7014117331926443e38f;
+        m = fmaxf(m, s[k]);
+    }
+    float sum = 0.0f, fx = 0.0f, fy = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 81; ++k)
+    {
+        const float e = expf(s[k] - m);
+        sum += e;
+        fx += e * (float)(k % 9 - 4);
+        fy += e * (float)(k / 9 - 4);
+    }
+    const size_t o = (size_t)b * 2 * P + p;
+    flow[o] = flow0[o] + fx / sum;
+    flow[o + P] = flow0[o + P] + fy / sum;
+}
+
+// Y = act(A) W^T + bias on the tensor cores (mma m16n8k16, fp32 sums from the bias, fp16 out): A [M][K] fp16 rows (K a
+// multiple of 16 up to 256) staged in shared memory with 16-byte chunks XOR-swizzled by row, W in fragment order
+// wf[z][K / 16][NT / 2][lane] (blockIdx.y = z: NT n-tiles a block), bias fp32; Y [M][N] fp16; 128 threads = 4 warps x
+// 16 rows; RELU = ReLU on A as it is read
+template <int NT, bool RELU>
+__device__ __forceinline__ void gbGemmT(const unsigned short* __restrict__ A, int M, int K,
+                                        const uint4* __restrict__ wf, const float* __restrict__ bias,
+                                        unsigned short* __restrict__ Y, int N)
+{
+    extern __shared__ __align__(128) unsigned char gbSm[];
+    const unsigned sm = (unsigned)__cvta_generic_to_shared(gbSm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int m0 = blockIdx.x * 64, z = blockIdx.y;
+    const int nch = K / 8;
+    for (int i = threadIdx.x; i < 64 * nch; i += 128)
+    {
+        const int r = i / nch, k = i - r * nch;
+        const bool in = m0 + r < M;
+        rnCp16(sm + (unsigned)((r * nch + (k ^ (r & 7))) << 4), in ? A + (size_t)(m0 + r) * K + k * 8 : A, in ? 16 : 0);
+    }
+    asm volatile(SMV_CP_COMMIT);
+    asm volatile(SMV_CP_WAIT0);
+    __syncthreads();
+    const int g = lane >> 2, t4 = lane & 3;
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+    {
+        const int n0 = z * NT * 8 + j * 8 + t4 * 2;
+        acc[j][0] = acc[j][2] = bias[n0];
+        acc[j][1] = acc[j][3] = bias[n0 + 1];
+    }
+    const int arow = warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int ks = K / 16;
+    wf += (size_t)z * ks * (NT / 2) * 32;
+#pragma unroll 2
+    for (int s = 0; s < ks; ++s)
+    {
+        unsigned a[4];
+        const int kc = 2 * s + akc;
+        rnLdm4(sm + (unsigned)((arow * nch + (kc ^ (arow & 7))) << 4), a);
+        if (RELU)
+        {
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                a[e] = gbRelu2(a[e]);
+        }
+#pragma unroll
+        for (int q = 0; q < NT / 2; ++q)
+        {
+            const uint4 bw = wf[((size_t)s * (NT / 2) + q) * 32 + lane];
+            gbMma(acc[2 * q], a, bw.x, bw.y);
+            gbMma(acc[2 * q + 1], a, bw.z, bw.w);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+    {
+        const int n0 = z * NT * 8 + j * 8 + t4 * 2;
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            const int r = m0 + warp * 16 + g + h * 8;
+            if (r < M)
+                *reinterpret_cast<unsigned*>(Y + (size_t)r * N + n0) =
+                    (unsigned)f2h(acc[j][2 * h]) | ((unsigned)f2h(acc[j][2 * h + 1]) << 16);
+        }
+    }
+}
+
+// q / k projections: feat [B P][128] -> qk [B P][256] (q = 0..127, k = 128..255)
+extern "C" __global__ void __launch_bounds__(128) k_gbProj(const unsigned short* __restrict__ A, int M,
+                                                            const uint4* __restrict__ wf,
+                                                            const float* __restrict__ bias,
+                                                            unsigned short* __restrict__ Y)
+{
+    gbGemmT<8, false>(A, M, 128, wf, bias, Y, 256);
+}
+
+// the upsampler's 1 x 1 conv on ReLU(its 3 x 3 conv): y0 [B P][256] -> the mask logits [B P][144]
+extern "C" __global__ void __launch_bounds__(128) k_gbMask(const unsigned short* __restrict__ A, int M,
+                                                            const uint4* __restrict__ wf,
+                                                            const float* __restrict__ bias,
+                                                            unsigned short* __restrict__ Y)
+{
+    gbGemmT<6, true>(A, M, 256, wf, bias, Y, 144);
+}
+
+// the flow propagation (FeatureFlowAttention, radius 1), one warp a pixel: qk [B P][256] fp16, flow [B][2][H][W] fp32
+// in; the 9 neighbours' scores q . k (fp32 sums of the fp16 values; a neighbour outside the frame = a zero key, score
+// 0) / sqrt(128), softmax, the zero-padded flow summed -> prop [B][2][H][W] fp32; u0 [B P][192] fp16 = the
+// upsampler's input: 0..127 = feat (qf's rows 0..B - 1), 128..129 = prop, 130..191 = 0
+extern "C" __global__ void __launch_bounds__(256) k_gbProp(const unsigned short* __restrict__ qk,
+                                                            const unsigned short* __restrict__ feat,
+                                                            const float* __restrict__ flow, float* __restrict__ prop,
+                                                            unsigned short* __restrict__ u0, int H, int W, int B)
+{
+    const int lane = threadIdx.x & 31;
+    const int i = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int P = H * W;
+    if (i >= B * P)
+        return;
+    const int b = i / P, p = i - b * P, y = p / W, x = p - y * W;
+    const uint2 qu = *reinterpret_cast<const uint2*>(qk + (size_t)i * 256 + lane * 4);
+    const float q0 = h2f((unsigned short)(qu.x & 0xffffu)), q1 = h2f((unsigned short)(qu.x >> 16)),
+                q2 = h2f((unsigned short)(qu.y & 0xffffu)), q3 = h2f((unsigned short)(qu.y >> 16));
+    float s[9];
+    float m = -3.402823466e38f;
+#pragma unroll
+    for (int n = 0; n < 9; ++n)
+    {
+        const int yy = y + n / 3 - 1, xx = x + n % 3 - 1;
+        float d = 0.0f;
+        if (yy >= 0 && yy < H && xx >= 0 && xx < W)
+        {
+            const uint2 ku =
+                *reinterpret_cast<const uint2*>(qk + ((size_t)b * P + (size_t)yy * W + xx) * 256 + 128 + lane * 4);
+            d = q0 * h2f((unsigned short)(ku.x & 0xffffu));
+            d = fmaf(q1, h2f((unsigned short)(ku.x >> 16)), d);
+            d = fmaf(q2, h2f((unsigned short)(ku.y & 0xffffu)), d);
+            d = fmaf(q3, h2f((unsigned short)(ku.y >> 16)), d);
+        }
+#pragma unroll
+        for (int o = 16; o; o >>= 1)
+            d += __shfl_xor_sync(0xffffffffu, d, o);
+        s[n] = d / 11.313708498984761f;
+        m = fmaxf(m, s[n]);
+    }
+    const float* fl = flow + (size_t)b * 2 * P;
+    float sum = 0.0f, fx = 0.0f, fy = 0.0f;
+#pragma unroll
+    for (int n = 0; n < 9; ++n)
+    {
+        const int yy = y + n / 3 - 1, xx = x + n % 3 - 1;
+        const float e = expf(s[n] - m);
+        sum += e;
+        if (yy >= 0 && yy < H && xx >= 0 && xx < W)
+        {
+            fx = fmaf(e, fl[yy * W + xx], fx);
+            fy = fmaf(e, fl[P + yy * W + xx], fy);
+        }
+    }
+    const float px = fx / sum, py = fy / sum;
+    if (lane == 0)
+    {
+        prop[(size_t)b * 2 * P + p] = px;
+        prop[(size_t)b * 2 * P + P + p] = py;
+    }
+    if (lane < 24)
+    {
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (lane < 16)
+            v = *reinterpret_cast<const uint4*>(feat + (size_t)i * 128 + lane * 8);
+        else if (lane == 16)
+            v.x = (unsigned)f2h(px) | ((unsigned)f2h(py) << 16);
+        *reinterpret_cast<uint4*>(u0 + (size_t)i * 192 + lane * 8) = v;
+    }
+}
+
+// the convex upsampler's last step, one thread a quarter pixel's sub-pixel: lg [B P][144] fp16 = the mask logits
+// (channel k 16 + 4 ky + kx: tap k of the 3 x 3, sub-pixel (ky, kx)); the softmax over the 9 taps (fp32), the zero-padded
+// 3 x 3 of 4 x prop summed -> out [B][2][4H][4W] fp32 at (4 y + ky, 4 x + kx)
+extern "C" __global__ void __launch_bounds__(256) k_gbUp(const unsigned short* __restrict__ lg,
+                                                          const float* __restrict__ prop, float* __restrict__ out,
+                                                          int H, int W, int B)
+{
+    const int t = blockIdx.x * 256 + threadIdx.x;
+    const int P = H * W;
+    if (t >= B * P * 16)
+        return;
+    const int sub = t & 15, i = t >> 4;
+    const int b = i / P, p = i - b * P, y = p / W, x = p - y * W;
+    const unsigned short* l = lg + (size_t)i * 144 + sub;
+    float v[9];
+    float m = -3.402823466e38f;
+#pragma unroll
+    for (int k = 0; k < 9; ++k)
+    {
+        v[k] = h2f(l[k * 16]);
+        m = fmaxf(m, v[k]);
+    }
+    const float* f = prop + (size_t)b * 2 * P;
+    float sum = 0.0f, ux = 0.0f, uy = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 9; ++k)
+    {
+        const int yy = y + k / 3 - 1, xx = x + k % 3 - 1;
+        const float e = expf(v[k] - m);
+        sum += e;
+        if (yy >= 0 && yy < H && xx >= 0 && xx < W)
+        {
+            ux = fmaf(e, 4.0f * f[yy * W + xx], ux);
+            uy = fmaf(e, 4.0f * f[P + yy * W + xx], uy);
+        }
+    }
+    const int OW = 4 * W, OH = 4 * H, oy = 4 * y + (sub >> 2), ox = 4 * x + (sub & 3);
+    const size_t o = (size_t)b * 2 * OH * OW + (size_t)oy * OW + ox;
+    out[o] = ux / sum;
+    out[o + (size_t)OH * OW] = uy / sum;
+}
+)GBSRC";
+static const char* const kGbKern[] = {"k_gbFlow", "k_gbProj", "k_gbProp", "k_fuW64H", "k_gbMask", "k_gbUp"};
+static_assert(sizeof(kGbKern) / sizeof(kGbKern[0]) == sizeof(NativeRife::fGb) / sizeof(CUfunction),
+              "one fGb slot a gmflow B kernel");
+enum
+{
+    kGbFlow,
+    kGbProj,
+    kGbProp,
+    kGbConv,
+    kGbMask,
+    kGbUp
+};
+// the upsampler input's channels, the GEMMs' shared memory (a 64-row A tile)
+constexpr int kGbU0 = 192, kGbSmProj = 64 * 128 * 2, kGbSmMask = 64 * 256 * 2;
+
+// a 1 x 1 weight [n][k] in gbGemmT's fragment order [z][k / 16][nt / 2][lane][8 halves] (n-tiles 2q, 2q + 1 of z's nt:
+// row 8 (nt z + 2q (+ 1)) + lane / 4, column 16 s + 2 (lane % 4) (+ 1, + 8, + 9)), rounded to fp16
+static std::vector<uint16_t> gbFrag1(std::span<const float> w, int n, int k, int nt)
+{
+    static const int kOfs[4] = {0, 1, 8, 9};
+    std::vector<uint16_t> out((size_t)n * k);
+    size_t o = 0;
+    for (int z = 0; z < n / (8 * nt); z++)
+        for (int s = 0; s < k / 16; s++)
+            for (int q = 0; q < nt / 2; q++)
+                for (int l = 0; l < 32; l++)
+                    for (int hf = 0; hf < 2; hf++)
+                        for (int j = 0; j < 4; j++)
+                        {
+                            const int r = z * 8 * nt + (2 * q + hf) * 8 + (l >> 2);
+                            const int c = 16 * s + (l & 3) * 2 + kOfs[j];
+                            out[o++] = f2hRne(w[(size_t)r * k + c]);
+                        }
+    return out;
+}
+
+// flownet.pkl's B in its strict form (feature_flow_attn.q_proj / k_proj [128][128] + bias, upsampler.0 [256][130][3][3]
+// + bias, upsampler.2 [144][256][1][1] + bias) as one weight block of 256-byte aligned pieces: off[0] / [1] the q | k
+// projection's fragments (nt 8) and fp32 bias, [2] / [3] the 3 x 3 conv's (its input channels in u0's order: feat 0..127,
+// flow 128..129, zeros to 192) and bias, [4] / [5] the 1 x 1 conv's (nt 6) and bias; false = missing, or not this net
+static bool gbNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\flownet.pkl", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    };
+    const std::string fa = "feature_flow_attn.", up = "upsampler.";
+    if (!has(fa + "q_proj.weight", {128, 128}) || !has(fa + "q_proj.bias", {128}) ||
+        !has(fa + "k_proj.weight", {128, 128}) || !has(fa + "k_proj.bias", {128}) ||
+        !has(up + "0.weight", {256, 130, 3, 3}) || !has(up + "0.bias", {256}) ||
+        !has(up + "2.weight", {144, 256, 1, 1}) || !has(up + "2.bias", {144}) || S.count(up + "3.weight"))
+    {
+        why = "its weights are not gmflow's";
+        return false;
+    }
+    blob.clear();
+    auto put = [&](const void* d, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, d, n);
+        return o;
+    };
+    std::vector<float> qk((size_t)256 * 128), qkb(256);
+    const std::span<const float> qw = wts[fa + "q_proj.weight"], kw = wts[fa + "k_proj.weight"];
+    const std::span<const float> qb = wts[fa + "q_proj.bias"], kb = wts[fa + "k_proj.bias"];
+    for (size_t i = 0; i < (size_t)128 * 128; i++)
+    {
+        qk[i] = qw[i];
+        qk[(size_t)128 * 128 + i] = kw[i];
+    }
+    for (int i = 0; i < 128; i++)
+    {
+        qkb[i] = qb[i];
+        qkb[128 + i] = kb[i];
+    }
+    const std::vector<uint16_t> fp = gbFrag1(qk, 256, 128, 8);
+    off[0] = put(fp.data(), fp.size() * sizeof(uint16_t));
+    off[1] = put(qkb.data(), qkb.size() * sizeof(float));
+    const std::span<const float> w0 = wts[up + "0.weight"];
+    std::vector<float> w0p((size_t)256 * kGbU0 * 9, 0.0f);
+    for (int n = 0; n < 256; n++)
+        for (int c = 0; c < 130; c++)
+        {
+            const int u = c < 2 ? 128 + c : c - 2; // the model's cat(flow, feat) -> u0's feat | flow
+            for (int t = 0; t < 9; t++)
+                w0p[((size_t)n * kGbU0 + u) * 9 + t] = w0[((size_t)n * 130 + c) * 9 + t];
+        }
+    const std::vector<uint16_t> f0 = fnFragOf(w0p, 256, kGbU0, 64, 8);
+    off[2] = put(f0.data(), f0.size() * sizeof(uint16_t));
+    off[3] = put(wts[up + "0.bias"].data(), (size_t)256 * sizeof(float));
+    const std::vector<uint16_t> fm = gbFrag1(wts[up + "2.weight"], 144, 256, 6);
+    off[4] = put(fm.data(), fm.size() * sizeof(uint16_t));
+    off[5] = put(wts[up + "2.bias"].data(), (size_t)144 * sizeof(float));
+    return true;
+}
+
+// gmflow B's activations at the quarter w x h (P = w h, both directions), 256-byte pieces: the flow after the local
+// softmax and the propagated one (fp32 [2][2][P] each), q | k ([2P][256] fp16), u0 ([2P][192] fp16), the 3 x 3 conv's
+// output ([2P][256] fp16), the mask logits ([2P][144] fp16)
+struct GbArena
+{
+    size_t flow = 0, qk = 0, prop = 0, u0 = 0, y0 = 0, lg = 0, total = 0;
+};
+static GbArena gbArena(int w, int h)
+{
+    GbArena a;
+    const size_t P = (size_t)w * h;
+    size_t o = 0;
+    auto put = [&](size_t n) {
+        const size_t at = o;
+        o += (n + 255) & ~(size_t)255;
+        return at;
+    };
+    a.flow = put(4 * P * sizeof(float));
+    a.qk = put(2 * P * 256 * sizeof(uint16_t));
+    a.prop = put(4 * P * sizeof(float));
+    a.u0 = put(2 * P * kGbU0 * sizeof(uint16_t));
+    a.y0 = put(2 * P * 256 * sizeof(uint16_t));
+    a.lg = put(2 * P * 144 * sizeof(uint16_t));
+    a.total = o;
+    return a;
+}
+
+static size_t gbNatBytes(const NativeRife& nr)
+{
+    return nr.gmfss && nr.hw > 0 && nr.hh > 0 ? gbArena(nr.hw / 4, nr.hh / 4).total : 0;
+}
+
+// this session's gmflow B module: the weights read, its text compiled (or the cached cubin) and loaded, its kernels
+// bound, the weight block uploaded; false = `why` (the session teardown unloads a module left in gbMod)
+static bool nativeGbModule(NativeRife& nr, std::string& why)
+{
+    if (nr.gbMod)
+        return true;
+    std::vector<uint8_t> blob;
+    if (!gbNatLoad(blob, nr.gbOff, why))
+        return false;
+    std::string text = kFnHead;
+    text += kFuA;
+    text += kFuB;
+    text += kGb;
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_gmflowb.cu", L"smv_gmflowb", "gmflow B kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.gbMod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.gbMod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    for (int i = 0; i < (int)(sizeof(kGbKern) / sizeof(kGbKern[0])); i++)
+        if (cuModuleGetFunction(&nr.fGb[i], nr.gbMod, kGbKern[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kGbKern[i] + " is missing";
+            return false;
+        }
+    if (cudaMalloc(&nr.dGbW, blob.size()) != cudaSuccess ||
+        cudaMemcpy(nr.dGbW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
+    return true;
+}
+
+// gmflow B's 7 launches on st at the quarter nr.gmW x nr.gmH, its activations at s (gbArena's pieces): corr, A's qf
+// (rows 0..1 = feat) and flow0 in, the half's flow out. false = a launch failed
+static bool nativeGbLaunch(NativeRife& nr, const float* corr, const void* qf, const float* flow0, float* out,
+                           uint8_t* s, cudaStream_t st)
+{
+    int iw = nr.gmW, ih = nr.gmH, nb = 2, m = 2 * iw * ih, cin = kGbU0, cout = 256;
+    const GbArena ar = gbArena(iw, ih);
+    void* flow = s + ar.flow;
+    void* qk = s + ar.qk;
+    void* prop = s + ar.prop;
+    void* u0 = s + ar.u0;
+    void* y0 = s + ar.y0;
+    void* lg = s + ar.lg;
+    const char* wb = (const char*)nr.dGbW;
+    const void* wp = wb + nr.gbOff[0];
+    const void* bp = wb + nr.gbOff[1];
+    const void* w0 = wb + nr.gbOff[2];
+    const void* b0 = wb + nr.gbOff[3];
+    const void* wm = wb + nr.gbOff[4];
+    const void* bm = wb + nr.gbOff[5];
+    const void* nul = nullptr;
+    float zero = 0.0f;
+    auto go = [&](int f, int gx, int gy, int gz, int threads, int sm, void** a) {
+        return cuLaunchKernel(nr.fGb[f], (unsigned)gx, (unsigned)gy, (unsigned)gz, (unsigned)threads, 1, 1,
+                              (unsigned)sm, (CUstream)st, a, nullptr) == CUDA_SUCCESS;
+    };
+    {
+        void* a[] = {(void*)&corr, (void*)&flow0, &flow, &ih, &iw, &nb};
+        if (!go(kGbFlow, (m + 255) / 256, 1, 1, 256, 0, a))
+            return false;
+    }
+    {
+        void* a[] = {(void*)&qf, &m, (void*)&wp, (void*)&bp, &qk};
+        if (!go(kGbProj, (m + 63) / 64, 4, 1, 128, kGbSmProj, a))
+            return false;
+    }
+    {
+        void* a[] = {&qk, (void*)&qf, &flow, &prop, &u0, &ih, &iw, &nb};
+        if (!go(kGbProp, (m + 7) / 8, 1, 1, 256, 0, a))
+            return false;
+    }
+    for (int d = 0; d < 2; d++)
+    {
+        void* x = (uint8_t*)u0 + (size_t)d * iw * ih * kGbU0 * sizeof(uint16_t);
+        void* y = (uint8_t*)y0 + (size_t)d * iw * ih * 256 * sizeof(uint16_t);
+        void* a[] = {&x, &cin, &ih, &iw, &y, &cout, (void*)&w0, (void*)&b0, &zero, (void*)&nul, (void*)&nul};
+        if (!go(kGbConv, (iw + 31) / 32, (ih + 7) / 8, 4, 128, kFuSmW64, a))
+            return false;
+    }
+    {
+        void* a[] = {&y0, &m, (void*)&wm, (void*)&bm, &lg};
+        if (!go(kGbMask, (m + 63) / 64, 3, 1, 128, kGbSmMask, a))
+            return false;
+    }
+    void* a[] = {&lg, &prop, (void*)&out, &ih, &iw, &nb};
+    return go(kGbUp, (m * 16 + 255) / 256, 1, 1, 256, 0, a);
+}
+
+// gmflow B on one pair on st (nr.stream): corr (dGmCorr) and A's two outputs in, the half's flow into dGmFlow; the
+// launches go through nr.gbGraphs (chainGraphRun). false = the activations or a launch failed
+static bool nativeGbRun(NativeRife& nr, cudaStream_t st)
+{
+    const GbArena ar = gbArena(nr.gmW, nr.gmH);
+    uint8_t* s = nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= ar.total ? (uint8_t*)nr.dGmCtxMem : (uint8_t*)nr.dGbOwn;
+    if (!s && cudaMalloc(&nr.dGbOwn, ar.total) == cudaSuccess)
+        s = (uint8_t*)nr.dGbOwn;
+    if (!s)
+        return false;
+    const float* corr = nr.dGmCorr;
+    const void* qf = nr.dGmA[0];
+    const float* flow0 = (const float*)nr.dGmA[1];
+    return chainGraphRun(nr.gbGraphs, {s, corr, qf, flow0, nr.dGmFlow}, nr.gmW, nr.gmH, st, "gmfss gmflow B",
+                         [&] { return nativeGbLaunch(nr, corr, qf, flow0, nr.dGmFlow, s, st); });
+}
+
+// gmflow's CNN backbone (backbone.CNNEncoder, two output scales) as 54 launches (nativeBbRun) of its own module
+// smv_gmflowbb_*.cubin (kFnHead's helpers + kBbA / kBbB), weights = engine\GMFSS_Fortuna\train_log\flownet.pkl's
+// backbone.* through pthStateDict (bbNatLoad); no engine, no ONNX, no fallback (a missing / wrong pkl = `gmflow's
+// backbone unavailable (...)`, the session refuses). One frame a call: the half's 3 fp32 planes (0..1) in, map4 (the
+// quarter) and map8 (the eighth) out, planar fp16 [128][h][w] into A's map batch slot. k_bbC7: normalize_img + conv1
+// 7x7 s2 (fp32); every InstanceNorm = its statistics (k_bbStats: per-block Welford, k_bbStatsFin: a fixed-order merge,
+// bit-stable) applied where the next pass reads it (the next 3x3 conv's halo, or k_bbRes*); the residual blocks' 3x3
+// convs with fp16 sums (fusionnet's wide form), the downsamples and conv2 as 1 x 1 GEMMs (fp32 sums), the trident pair
+// (one weight at strides 1 and 2). Its activations (bbArena) live in the shared activation block (sound while serial
+// on nr.stream), else dBbOwn.
+static const char kBbA[] = R"BBSRC(
+// gmflow's CNN backbone on the host's kernels, after kFnHead: one frame at the GMFSS
+// half, every activation channels-last fp16 [H][W][C]; a conv writes its raw output and the InstanceNorm after it is
+// statistics (k_bbStats + k_bbStatsFin: per-block Welford partials merged in a fixed order, so every run is bit-stable)
+// applied where the next pass reads it (the next conv's halo, or k_bbRes).
+
+// the stored index of halo pixel sp and its chunk k's swizzled slot (each ldmatrix's 8 rows in 8 bank groups)
+template <int NCH>
+__device__ __forceinline__ unsigned bbSlot(int sp, int k)
+{
+    const int sw = NCH == 8 ? (k ^ (sp & 7)) : NCH == 4 ? (k ^ ((sp >> 1) & 3)) : (k ^ ((sp >> 2) & 1));
+    return (unsigned)((sp * NCH + sw) << 4);
+}
+
+__device__ __forceinline__ void bbMma(float* d, const unsigned* a, unsigned b0, unsigned b1)
+{
+    asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void bbMmaH(unsigned* d, const unsigned* a, unsigned b0, unsigned b1)
+{
+    asm volatile(SMV_MMA_F16 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(d[0]), "+r"(d[1])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// relu((v - m) inv) on two packed fp16 values in fp32, one rounding each
+__device__ __forceinline__ unsigned bbNorm2(unsigned u, float m0, float i0, float m1, float i1)
+{
+    const float a = fmaxf((h2f((unsigned short)(u & 0xffffu)) - m0) * i0, 0.0f);
+    const float b = fmaxf((h2f((unsigned short)(u >> 16)) - m1) * i1, 0.0f);
+    return (unsigned)f2h(a) | ((unsigned)f2h(b) << 16);
+}
+
+// conv1: 7 x 7 stride 2 pad 3, 3 -> 64, no bias, on the frame's 3 fp32 planes [3][H][W] (0..1) normalized as
+// normalize_img does ((x - mean) / std, in fp32, the padding zeros AFTER it), fp32 sums; out = the raw output
+// channels-last fp16 [H / 2][W / 2][64]; wt = [64][3][7][7] fp32. A 128-thread block = a 4 x 32 output tile, 32 outputs
+// a pass (two passes), its input tile (14 x 70 x 3) and that pass's weights in shared memory, tap-major (tw[t][n]: a
+// tap's 32 weights in 8 float4 reads)
+extern "C" __global__ void __launch_bounds__(128) k_bbC7(const float* __restrict__ img, int H, int W,
+                                                          const float* __restrict__ wt, unsigned short* __restrict__ out)
+{
+    __shared__ float tin[3][14][70];
+    __shared__ __align__(16) float tw[147][32];
+    const int OW = W / 2, OH = H / 2;
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    const int ox0 = blockIdx.x * 32, oy0 = blockIdx.y * 4;
+    const float mean[3] = {0.485f, 0.456f, 0.406f}, sd[3] = {0.229f, 0.224f, 0.225f};
+    for (int i = threadIdx.x; i < 3 * 14 * 70; i += 128)
+    {
+        const int c = i / (14 * 70), r = (i / 70) % 14, q = i % 70;
+        const int gy = 2 * oy0 - 3 + r, gx = 2 * ox0 - 3 + q;
+        tin[c][r][q] = gy >= 0 && gy < H && gx >= 0 && gx < W ? (img[((size_t)c * H + gy) * W + gx] - mean[c]) / sd[c]
+                                                              : 0.0f;
+    }
+    const int oy = oy0 + ty, ox = ox0 + tx;
+    for (int half = 0; half < 2; ++half)
+    {
+        __syncthreads();
+        for (int i = threadIdx.x; i < 32 * 147; i += 128)
+            tw[i % 147][i / 147] = wt[(size_t)(half * 32 + i / 147) * 147 + i % 147];
+        __syncthreads();
+        float acc[32];
+#pragma unroll
+        for (int n = 0; n < 32; ++n)
+            acc[n] = 0.0f;
+        for (int c = 0; c < 3; ++c)
+            for (int ky = 0; ky < 7; ++ky)
+#pragma unroll
+                for (int kx = 0; kx < 7; ++kx)
+                {
+                    const float v = tin[c][2 * ty + ky][2 * tx + kx];
+                    const float4* wv = reinterpret_cast<const float4*>(tw[(c * 7 + ky) * 7 + kx]);
+#pragma unroll
+                    for (int n4 = 0; n4 < 8; ++n4)
+                    {
+                        const float4 q = wv[n4];
+                        acc[4 * n4] = fmaf(v, q.x, acc[4 * n4]);
+                        acc[4 * n4 + 1] = fmaf(v, q.y, acc[4 * n4 + 1]);
+                        acc[4 * n4 + 2] = fmaf(v, q.z, acc[4 * n4 + 2]);
+                        acc[4 * n4 + 3] = fmaf(v, q.w, acc[4 * n4 + 3]);
+                    }
+                }
+        if (oy < OH && ox < OW)
+        {
+            unsigned short* o = out + ((size_t)oy * OW + ox) * 64 + half * 32;
+#pragma unroll
+            for (int n = 0; n < 32; n += 2)
+                *reinterpret_cast<unsigned*>(o + n) = (unsigned)f2h(acc[n]) | ((unsigned)f2h(acc[n + 1]) << 16);
+        }
+    }
+}
+
+// InstanceNorm statistics, pass 1: y = [P][C] fp16 channels-last; block b (256 threads = 256 / C pixel lanes x C
+// channels, C in 64 / 96 / 128 -> lanes 4 / 2 / 2 with 192 / 256 threads used) takes pixels [b PB, (b + 1) PB); each
+// thread runs Welford over its pixels, the lanes merge in shared memory; part[b][c] = (n, mean, M2)
+extern "C" __global__ void __launch_bounds__(256) k_bbStats(const unsigned short* __restrict__ y, int P, int C, int PB,
+                                                             float* __restrict__ part)
+{
+    __shared__ float sn[256], sm[256], s2[256];
+    const int lanes = C == 64 ? 4 : 2, c = threadIdx.x % C, l = threadIdx.x / C;
+    const bool act = l < lanes;
+    const int p0 = blockIdx.x * PB, p1 = min(P, p0 + PB);
+    float n = 0.0f, mean = 0.0f, m2 = 0.0f;
+    if (act)
+        for (int p = p0 + l; p < p1; p += lanes)
+        {
+            const float v = h2f(y[(size_t)p * C + c]);
+            n += 1.0f;
+            const float d = v - mean;
+            mean += d / n;
+            m2 = fmaf(d, v - mean, m2);
+        }
+    sn[threadIdx.x] = n;
+    sm[threadIdx.x] = mean;
+    s2[threadIdx.x] = m2;
+    __syncthreads();
+    if (l == 0)
+    {
+        for (int k = 1; k < lanes; ++k)
+        {
+            const int j = k * C + c;
+            const float nb = sn[j];
+            if (nb == 0.0f)
+                continue;
+            const float nn = n + nb, d = sm[j] - mean;
+            mean += d * (nb / nn);
+            m2 += s2[j] + d * d * (n * nb / nn);
+            n = nn;
+        }
+        float* o = part + ((size_t)blockIdx.x * C + c) * 3;
+        o[0] = n;
+        o[1] = mean;
+        o[2] = m2;
+    }
+}
+
+// Chan's merge of (nb, mb, qb) into (n, m, q)
+__device__ __forceinline__ void bbMerge(float& n, float& m, float& q, float nb, float mb, float qb)
+{
+    if (nb == 0.0f)
+        return;
+    const float nn = n + nb, d = mb - m;
+    m += d * (nb / nn);
+    q += qb + d * d * (n * nb / nn);
+    n = nn;
+}
+
+// pass 2: block c (128 threads) merges channel c's nb partials: thread t takes b = t, t + 128, ... in order, then a
+// fixed pairwise tree over the threads (the same order every run); st[c] = mean, st[C + c] = 1 / sqrt(var + 1e-5) (the
+// biased variance, InstanceNorm's)
+extern "C" __global__ void __launch_bounds__(128) k_bbStatsFin(const float* __restrict__ part, int nb, int C,
+                                                                float* __restrict__ st)
+{
+    __shared__ float sn[128], sm[128], sq[128];
+    const int c = blockIdx.x;
+    float n = 0.0f, mean = 0.0f, m2 = 0.0f;
+    for (int b = threadIdx.x; b < nb; b += 128)
+    {
+        const float* q = part + ((size_t)b * C + c) * 3;
+        bbMerge(n, mean, m2, q[0], q[1], q[2]);
+    }
+    sn[threadIdx.x] = n;
+    sm[threadIdx.x] = mean;
+    sq[threadIdx.x] = m2;
+    __syncthreads();
+    for (int s = 64; s; s >>= 1)
+    {
+        if (threadIdx.x < s)
+        {
+            float a = sn[threadIdx.x], b = sm[threadIdx.x], d = sq[threadIdx.x];
+            bbMerge(a, b, d, sn[threadIdx.x + s], sm[threadIdx.x + s], sq[threadIdx.x + s]);
+            sn[threadIdx.x] = a;
+            sm[threadIdx.x] = b;
+            sq[threadIdx.x] = d;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        st[c] = sm[0];
+        st[C + c] = 1.0f / sqrtf(sq[0] / sn[0] + 1e-5f);
+    }
+}
+
+// the residual block's end: out = relu(skip + relu(IN(y))), y raw with st (mean | inv); skip by MODE: 0 = x as it is,
+// 1 = relu(IN(x)) with sx (the first block of layer1: its input = conv1's raw output), 2 = IN(x) with sx (a downsample's
+// raw output); 8 channels a thread, P pixels x C channels
+template <int MODE>
+__device__ __forceinline__ void bbResT(const unsigned short* __restrict__ y, const float* __restrict__ st,
+                                       const unsigned short* __restrict__ x, const float* __restrict__ sx, int P, int C,
+                                       unsigned short* __restrict__ out)
+{
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    const int nch = C / 8;
+    if (i >= P * nch)
+        return;
+    const int c0 = (i % nch) * 8;
+    const uint4 yv = *reinterpret_cast<const uint4*>(y + (size_t)i * 8);
+    const uint4 xv = *reinterpret_cast<const uint4*>(x + (size_t)i * 8);
+    const unsigned yu[4] = {yv.x, yv.y, yv.z, yv.w}, xu[4] = {xv.x, xv.y, xv.z, xv.w};
+    unsigned o[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        float r[2];
+#pragma unroll
+        for (int e = 0; e < 2; ++e)
+        {
+            const int c = c0 + 2 * k + e;
+            const float yy = h2f((unsigned short)(e ? yu[k] >> 16 : yu[k] & 0xffffu));
+            float xx = h2f((unsigned short)(e ? xu[k] >> 16 : xu[k] & 0xffffu));
+            if (MODE == 1)
+                xx = fmaxf((xx - sx[c]) * sx[C + c], 0.0f);
+            else if (MODE == 2)
+                xx = (xx - sx[c]) * sx[C + c];
+            r[e] = fmaxf(xx + fmaxf((yy - st[c]) * st[C + c], 0.0f), 0.0f);
+        }
+        o[k] = (unsigned)f2h(r[0]) | ((unsigned)f2h(r[1]) << 16);
+    }
+    *reinterpret_cast<uint4*>(out + (size_t)i * 8) = make_uint4(o[0], o[1], o[2], o[3]);
+}
+#define BB_RES(NAME, MODE)                                                                                             \
+    extern "C" __global__ void __launch_bounds__(256)                                                                  \
+        NAME(const unsigned short* __restrict__ y, const float* __restrict__ st, const unsigned short* __restrict__ x, \
+             const float* __restrict__ sx, int P, int C, unsigned short* __restrict__ out)                             \
+    {                                                                                                                  \
+        bbResT<MODE>(y, st, x, sx, P, C, out);                                                                         \
+    }
+BB_RES(k_bbRes0, 0)
+BB_RES(k_bbRes1, 1)
+BB_RES(k_bbRes2, 2)
+
+)BBSRC";
+static const char kBbB[] = R"BBSRC(
+// the 3 x 3 conv at stride S (fusionnet's wide form): x = cin channels-last fp16 at W x H; y = cout fp16 at W / S x
+// H / S, channels-last or PLANAR [cout][H / S][W / S]; wf[z][step][q][lane] (step = (group 9 + tap) CG / 16 + kc);
+// bias fp32 (zeros for a conv without one); NORM: the halo through relu(IN) with st = mean | inv over cin (cells off
+// the frame stay the zero padding); A32: fp32 accumulators, else fp16
+template <int S, int CG, int NB, bool NORM, bool A32, bool PLANAR>
+__device__ __forceinline__ void bbConvW(const unsigned short* __restrict__ x, int cin, int H, int W,
+                                        unsigned short* __restrict__ y, int cout, const uint4* __restrict__ wf,
+                                        const float* __restrict__ bias, const float* __restrict__ st)
+{
+    constexpr int TH = S == 1 ? 8 : 4, RW = S == 1 ? 2 : 1, MI = 2 * RW;
+    constexpr int HR = S == 1 ? TH + 2 : 2 * TH + 1, HC = S == 1 ? 34 : 65;
+    const int OW = W / S, OH = H / S;
+    constexpr int NCH = CG / 8, KC = CG / 16, NQ = NB / 2;
+    extern __shared__ __align__(128) unsigned char bbSm[];
+    const unsigned halo = (unsigned)__cvta_generic_to_shared(bbSm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tx0 = blockIdx.x * 32, ty0 = blockIdx.y * TH, z = blockIdx.z;
+    const int ksteps = cin * 9 / 16;
+    wf += (size_t)z * ksteps * NQ * 32;
+    const int g = lane >> 2, t4 = lane & 3;
+    float accF[A32 ? MI : 1][NB][4];
+    unsigned accH[A32 ? 1 : MI][NB][2];
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const float b0 = bias[z * NB * 8 + nj * 8 + t4 * 2], b1 = bias[z * NB * 8 + nj * 8 + t4 * 2 + 1];
+#pragma unroll
+        for (int mi = 0; mi < MI; ++mi)
+        {
+            if constexpr (A32)
+            {
+                accF[mi][nj][0] = accF[mi][nj][2] = b0;
+                accF[mi][nj][1] = accF[mi][nj][3] = b1;
+            }
+            else
+                accH[mi][nj][0] = accH[mi][nj][1] = (unsigned)f2h(b0) | ((unsigned)f2h(b1) << 16);
+        }
+    }
+    uint4 bc[NQ], bn[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q)
+        bc[q] = __ldg(wf + q * 32 + lane);
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int groups = cin / CG;
+#pragma unroll 1
+    for (int gi = 0; gi < groups; ++gi)
+    {
+        if (gi)
+            __syncthreads();
+        for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+        {
+            const int p = i / NCH, k = i - p * NCH;
+            const int hr = p / HC, hc = p - hr * HC;
+            const int gy = S * ty0 - 1 + hr, gx = S * tx0 - 1 + hc;
+            const int sp = S == 1 ? p : hr * HC + ((hc & 1) ? 33 + (hc >> 1) : (hc >> 1));
+            const bool in = gy >= 0 && gy < H && gx >= 0 && gx < W;
+            const unsigned short* src = in ? x + ((size_t)gy * W + gx) * cin + gi * CG + k * 8 : x;
+            rnCp16(halo + bbSlot<NCH>(sp, k), src, in ? 16 : 0);
+        }
+        asm volatile(SMV_CP_COMMIT);
+        asm volatile(SMV_CP_WAIT0);
+        __syncthreads();
+        if (NORM)
+        {
+            for (int i = threadIdx.x; i < HR * HC * NCH; i += 128)
+            {
+                const int p = i / NCH, k = i - p * NCH;
+                const int hr = p / HC, hc = p - hr * HC;
+                const int gy = S * ty0 - 1 + hr, gx = S * tx0 - 1 + hc;
+                if (gy < 0 || gy >= H || gx < 0 || gx >= W)
+                    continue;
+                const int sp = S == 1 ? p : hr * HC + ((hc & 1) ? 33 + (hc >> 1) : (hc >> 1));
+                uint4* q = reinterpret_cast<uint4*>(bbSm + bbSlot<NCH>(sp, k));
+                const int c = gi * CG + k * 8;
+                uint4 v = *q;
+                v.x = bbNorm2(v.x, st[c], st[cin + c], st[c + 1], st[cin + c + 1]);
+                v.y = bbNorm2(v.y, st[c + 2], st[cin + c + 2], st[c + 3], st[cin + c + 3]);
+                v.z = bbNorm2(v.z, st[c + 4], st[cin + c + 4], st[c + 5], st[cin + c + 5]);
+                v.w = bbNorm2(v.w, st[c + 6], st[cin + c + 6], st[c + 7], st[cin + c + 7]);
+                *q = v;
+            }
+            __syncthreads();
+        }
+#pragma unroll 1
+        for (int tap = 0; tap < 9; ++tap)
+        {
+            const int dy = tap / 3, dx = tap - dy * 3;
+            int pa[MI];
+#pragma unroll
+            for (int mi = 0; mi < MI; ++mi)
+            {
+                const int col = (mi & 1) * 16 + arow;
+                pa[mi] = S == 1 ? (RW * warp + (mi >> 1) + dy) * HC + col + dx
+                                : (2 * warp + dy) * HC + (dx == 1 ? 33 + col : col + (dx >> 1));
+            }
+#pragma unroll
+            for (int kc = 0; kc < KC; ++kc)
+            {
+                const int step = (gi * 9 + tap) * KC + kc;
+                if (step + 1 < ksteps)
+#pragma unroll
+                    for (int q = 0; q < NQ; ++q)
+                        bn[q] = __ldg(wf + ((step + 1) * NQ + q) * 32 + lane);
+#pragma unroll
+                for (int mi = 0; mi < MI; ++mi)
+                {
+                    unsigned a[4];
+                    rnLdm4(halo + bbSlot<NCH>(pa[mi], kc * 2 + akc), a);
+#pragma unroll
+                    for (int q = 0; q < NB; ++q)
+                    {
+                        const unsigned b0 = (q & 1) ? bc[q >> 1].z : bc[q >> 1].x;
+                        const unsigned b1 = (q & 1) ? bc[q >> 1].w : bc[q >> 1].y;
+                        if constexpr (A32)
+                            bbMma(accF[mi][q], a, b0, b1);
+                        else
+                            bbMmaH(accH[mi][q], a, b0, b1);
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < NQ; ++q)
+                    bc[q] = bn[q];
+            }
+        }
+    }
+#pragma unroll
+    for (int nj = 0; nj < NB; ++nj)
+    {
+        const int n0 = z * NB * 8 + nj * 8 + t4 * 2;
+#pragma unroll
+        for (int mi = 0; mi < MI; ++mi)
+        {
+            const int oy = ty0 + RW * warp + (mi >> 1);
+            if (oy >= OH)
+                continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int ox = tx0 + (mi & 1) * 16 + g + h * 8;
+                if (ox >= OW)
+                    continue;
+                float v0, v1;
+                if constexpr (A32)
+                {
+                    v0 = accF[mi][nj][2 * h];
+                    v1 = accF[mi][nj][2 * h + 1];
+                }
+                else
+                {
+                    v0 = h2f((unsigned short)(accH[mi][nj][h] & 0xffffu));
+                    v1 = h2f((unsigned short)(accH[mi][nj][h] >> 16));
+                }
+                if (PLANAR)
+                {
+                    const size_t pl = (size_t)OH * OW, at = (size_t)oy * OW + ox;
+                    y[(size_t)n0 * pl + at] = f2h(v0);
+                    y[(size_t)(n0 + 1) * pl + at] = f2h(v1);
+                }
+                else
+                    *reinterpret_cast<unsigned*>(y + ((size_t)oy * OW + ox) * cout + n0) =
+                        (unsigned)f2h(v0) | ((unsigned)f2h(v1) << 16);
+            }
+        }
+    }
+}
+#define BB_CONV(NAME, S, CG, NB, NORM, A32, PLANAR)                                                                    \
+    extern "C" __global__ void __launch_bounds__(128)                                                                  \
+        NAME(const unsigned short* __restrict__ x, int cin, int H, int W, unsigned short* __restrict__ y, int cout,    \
+             const uint4* __restrict__ wf, const float* __restrict__ bias, const float* __restrict__ st)               \
+    {                                                                                                                  \
+        bbConvW<S, CG, NB, NORM, A32, PLANAR>(x, cin, H, W, y, cout, wf, bias, st);                                    \
+    }
+// layer1 (64), layer2's first conv (s2 64 -> 96) and its other convs (96), layer3's first (96 -> 128) and others
+// (128), the trident (128, planar out); all with fp16 sums; N = the halo normalized on load
+BB_CONV(k_bbC64H, 1, 64, 8, false, false, false)
+BB_CONV(k_bbC64NH, 1, 64, 8, true, false, false)
+BB_CONV(k_bbS64to96H, 2, 32, 4, false, false, false)
+BB_CONV(k_bbC96H, 1, 32, 4, false, false, false)
+BB_CONV(k_bbC96NH, 1, 32, 4, true, false, false)
+BB_CONV(k_bbC96to128H, 1, 32, 8, false, false, false)
+BB_CONV(k_bbTriH, 1, 64, 8, false, false, true)
+BB_CONV(k_bbTri2H, 2, 32, 8, false, false, true)
+
+// the 1 x 1 convs (the downsamples, conv2) on the tensor cores: Y[M][N] = A W^T + bias, fp32 sums, fp16 out; output
+// pixel m = (oy, ox) of OW reads A's pixel (S oy, S ox) of W = S OW: K channels a row, K a multiple of 16 up to 128;
+// 64 rows a block staged swizzled (a row = K / 8 chunks padded to a multiple of 8: 64 x 16 x 16 bytes of shared
+// memory at most), NT n-tiles a block (blockIdx.y), W in fragment order wf[z][K / 16][NT / 2][lane]
+template <int NT, int S>
+__device__ __forceinline__ void bbGemmT(const unsigned short* __restrict__ A, int M, int OW, int K,
+                                        const uint4* __restrict__ wf, const float* __restrict__ bias,
+                                        unsigned short* __restrict__ Y, int N)
+{
+    extern __shared__ __align__(128) unsigned char bbSm[];
+    const unsigned sm = (unsigned)__cvta_generic_to_shared(bbSm);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int m0 = blockIdx.x * 64, z = blockIdx.y;
+    const int nch = K / 8, nrow = (nch + 7) & ~7;
+    for (int i = threadIdx.x; i < 64 * nch; i += 128)
+    {
+        const int r = i / nch, k = i - r * nch, m = m0 + r;
+        const bool in = m < M;
+        const int oy = in ? m / OW : 0, ox = in ? m - oy * OW : 0;
+        const size_t src = ((size_t)(S * oy) * (S * OW) + S * ox) * K + k * 8;
+        rnCp16(sm + (unsigned)((r * nrow + (k ^ (r & 7))) << 4), in ? A + src : A, in ? 16 : 0);
+    }
+    asm volatile(SMV_CP_COMMIT);
+    asm volatile(SMV_CP_WAIT0);
+    __syncthreads();
+    const int g = lane >> 2, t4 = lane & 3;
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+    {
+        const int n0 = z * NT * 8 + j * 8 + t4 * 2;
+        acc[j][0] = acc[j][2] = bias[n0];
+        acc[j][1] = acc[j][3] = bias[n0 + 1];
+    }
+    const int arow = warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, akc = lane >> 4;
+    const int ks = K / 16;
+    wf += (size_t)z * ks * (NT / 2) * 32;
+    for (int s = 0; s < ks; ++s)
+    {
+        unsigned a[4];
+        const int kc = 2 * s + akc;
+        rnLdm4(sm + (unsigned)((arow * nrow + (kc ^ (arow & 7))) << 4), a);
+#pragma unroll
+        for (int q = 0; q < NT / 2; ++q)
+        {
+            const uint4 bw = wf[((size_t)s * (NT / 2) + q) * 32 + lane];
+            bbMma(acc[2 * q], a, bw.x, bw.y);
+            bbMma(acc[2 * q + 1], a, bw.z, bw.w);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+    {
+        const int n0 = z * NT * 8 + j * 8 + t4 * 2;
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            const int r = m0 + warp * 16 + g + h * 8;
+            if (r < M)
+                *reinterpret_cast<unsigned*>(Y + (size_t)r * N + n0) =
+                    (unsigned)f2h(acc[j][2 * h]) | ((unsigned)f2h(acc[j][2 * h + 1]) << 16);
+        }
+    }
+}
+#define BB_GEMM(NAME, NT, S)                                                                                           \
+    extern "C" __global__ void __launch_bounds__(128)                                                                  \
+        NAME(const unsigned short* __restrict__ A, int M, int OW, int K, const uint4* __restrict__ wf,                 \
+             const float* __restrict__ bias, unsigned short* __restrict__ Y, int N)                                    \
+    {                                                                                                                  \
+        bbGemmT<NT, S>(A, M, OW, K, wf, bias, Y, N);                                                                   \
+    }
+// layer2's downsample (s2, 64 -> 96: 2 z of 48), layer3's (96 -> 128) and conv2 (128 -> 128): 2 z of 64
+BB_GEMM(k_bbDs2, 6, 2)
+BB_GEMM(k_bbG1, 8, 1)
+)BBSRC";
+static const char* const kBbKern[] = {"k_bbC7",   "k_bbStats", "k_bbStatsFin", "k_bbRes0", "k_bbRes1",  "k_bbRes2",
+                                      "k_bbC64H", "k_bbC64NH", "k_bbS64to96H", "k_bbC96H", "k_bbC96NH", "k_bbC96to128H",
+                                      "k_bbTriH", "k_bbTri2H", "k_bbDs2",      "k_bbG1"};
+static_assert(sizeof(kBbKern) / sizeof(kBbKern[0]) == sizeof(NativeRife::fBb) / sizeof(CUfunction),
+              "one fBb slot a backbone kernel");
+enum
+{
+    kBbC7,
+    kBbStats,
+    kBbFin,
+    kBbRes0,
+    kBbRes1,
+    kBbRes2,
+    kBbC64,
+    kBbC64N,
+    kBbS64to96,
+    kBbC96,
+    kBbC96N,
+    kBbC96to128,
+    kBbTri,
+    kBbTri2,
+    kBbDs2,
+    kBbG1
+};
+// bbOff's pieces: conv1's fp32 weights, the 12 residual 3x3 convs (layer l, block b, conv c at 1 + 4 (l - 1) + 2 b + c -
+// 1), the downsamples' and conv2's fragments + biases, the trident's two fragment orders, a zero bias
+enum
+{
+    kBbW7,
+    kBbW3 = 1,
+    kBbWds2 = 13,
+    kBbBds2,
+    kBbWds3,
+    kBbBds3,
+    kBbWc2,
+    kBbBc2,
+    kBbWtri,
+    kBbWtri2,
+    kBbZero
+};
+// each residual 3x3 conv's (cin, cout, group, n-tiles) in the 12-conv order
+static const int kBbConvShape[12][4] = {{64, 64, 64, 8},  {64, 64, 64, 8},   {64, 64, 64, 8},   {64, 64, 64, 8},
+                                        {64, 96, 32, 4},  {96, 96, 32, 4},   {96, 96, 32, 4},   {96, 96, 32, 4},
+                                        {96, 128, 32, 8}, {128, 128, 64, 8}, {128, 128, 64, 8}, {128, 128, 64, 8}};
+
+// the statistics' pixels a block (about 256 blocks or more, 32 to 512, a multiple of 32: the kit's pb_of)
+static int bbPb(int p)
+{
+    return (std::max)(32, (std::min)(512, (p / 256) / 32 * 32));
+}
+
+// flownet.pkl's backbone in its strict form (conv1 [64][3][7][7], layer1..3 x 2 ResidualBlocks' conv1 / conv2 (no bias),
+// layer2.0 / layer3.0's downsample.0 [cout][cin][1][1] + bias, conv2 [128][128][1][1] + bias, trident_conv [128][128][3][3]
+// (no bias), every InstanceNorm without parameters) as one weight block of 256-byte aligned pieces (off = bbOff, see
+// kBbW7 ..); false = missing, or not this net (`why`)
+static bool bbNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\flownet.pkl", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    };
+    const std::string p = "backbone.";
+    bool form =
+        has(p + "conv1.weight", {64, 3, 7, 7}) && has(p + "conv2.weight", {128, 128, 1, 1}) &&
+        has(p + "conv2.bias", {128}) && has(p + "trident_conv.weight", {128, 128, 3, 3}) &&
+        has(p + "layer2.0.downsample.0.weight", {96, 64, 1, 1}) && has(p + "layer2.0.downsample.0.bias", {96}) &&
+        has(p + "layer3.0.downsample.0.weight", {128, 96, 1, 1}) && has(p + "layer3.0.downsample.0.bias", {128}) &&
+        !S.count(p + "layer1.0.downsample.0.weight") && !S.count(p + "norm1.weight");
+    for (int i = 0; i < 12 && form; i++)
+    {
+        const std::string c = p + "layer" + std::to_string(1 + i / 4) + "." + std::to_string((i / 2) % 2) + ".conv" +
+                              std::to_string(1 + i % 2) + ".weight";
+        form = has(c, {kBbConvShape[i][1], kBbConvShape[i][0], 3, 3});
+    }
+    if (!form)
+    {
+        why = "its weights are not gmflow's backbone";
+        return false;
+    }
+    blob.clear();
+    auto put = [&](const void* d, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, d, n);
+        return o;
+    };
+    off[kBbW7] = put(wts[p + "conv1.weight"].data(), (size_t)64 * 147 * sizeof(float));
+    for (int i = 0; i < 12; i++)
+    {
+        const std::string c = p + "layer" + std::to_string(1 + i / 4) + "." + std::to_string((i / 2) % 2) + ".conv" +
+                              std::to_string(1 + i % 2) + ".weight";
+        const int* sh = kBbConvShape[i];
+        const std::vector<uint16_t> f = fnFragOf(wts[c], sh[1], sh[0], sh[2], sh[3]);
+        off[kBbW3 + i] = put(f.data(), f.size() * sizeof(uint16_t));
+    }
+    const std::vector<uint16_t> d2 = gbFrag1(wts[p + "layer2.0.downsample.0.weight"], 96, 64, 6);
+    off[kBbWds2] = put(d2.data(), d2.size() * sizeof(uint16_t));
+    off[kBbBds2] = put(wts[p + "layer2.0.downsample.0.bias"].data(), (size_t)96 * sizeof(float));
+    const std::vector<uint16_t> d3 = gbFrag1(wts[p + "layer3.0.downsample.0.weight"], 128, 96, 8);
+    off[kBbWds3] = put(d3.data(), d3.size() * sizeof(uint16_t));
+    off[kBbBds3] = put(wts[p + "layer3.0.downsample.0.bias"].data(), (size_t)128 * sizeof(float));
+    const std::vector<uint16_t> c2 = gbFrag1(wts[p + "conv2.weight"], 128, 128, 8);
+    off[kBbWc2] = put(c2.data(), c2.size() * sizeof(uint16_t));
+    off[kBbBc2] = put(wts[p + "conv2.bias"].data(), (size_t)128 * sizeof(float));
+    const std::vector<uint16_t> t1 = fnFragOf(wts[p + "trident_conv.weight"], 128, 128, 64, 8);
+    off[kBbWtri] = put(t1.data(), t1.size() * sizeof(uint16_t));
+    const std::vector<uint16_t> t2 = fnFragOf(wts[p + "trident_conv.weight"], 128, 128, 32, 8);
+    off[kBbWtri2] = put(t2.data(), t2.size() * sizeof(uint16_t));
+    const std::vector<float> z(128, 0.0f);
+    off[kBbZero] = put(z.data(), z.size() * sizeof(float));
+    return true;
+}
+
+// the backbone's activations at the half w x h (P1 = the half's half, P2 = its quarter), 256-byte pieces: conv1's raw
+// output and layer1's four buffers ([P1][64] fp16), layer2's five ([P2][96]), layer3's five + conv2's ([P2][128]), the
+// statistics' partials and the four mean | inv sets
+struct BbArena
+{
+    size_t l1[5] = {}, l2[5] = {}, l3[6] = {}, part = 0, st[4] = {}, total = 0;
+};
+static BbArena bbArena(int w, int h)
+{
+    BbArena a;
+    const size_t p1 = (size_t)(w / 2) * (h / 2), p2 = (size_t)(w / 4) * (h / 4);
+    size_t o = 0;
+    auto put = [&](size_t n) {
+        const size_t at = o;
+        o += (n + 255) & ~(size_t)255;
+        return at;
+    };
+    for (size_t& x : a.l1)
+        x = put(p1 * 64 * sizeof(uint16_t));
+    for (size_t& x : a.l2)
+        x = put(p2 * 96 * sizeof(uint16_t));
+    for (size_t& x : a.l3)
+        x = put(p2 * 128 * sizeof(uint16_t));
+    a.part = put(((p1 + 31) / 32) * 128 * 3 * sizeof(float));
+    for (size_t& x : a.st)
+        x = put(256 * sizeof(float));
+    a.total = o;
+    return a;
+}
+
+static size_t bbNatBytes(const NativeRife& nr)
+{
+    return nr.gmfss && nr.hw > 0 && nr.hh > 0 ? bbArena(nr.hw, nr.hh).total : 0;
+}
+
+// this session's backbone module: the weights read, its text compiled (or the cached cubin) and loaded, its kernels
+// bound, the weight block uploaded; false = `why` (the session teardown unloads a module left in bbMod)
+static bool nativeBbModule(NativeRife& nr, std::string& why)
+{
+    if (nr.bbMod)
+        return true;
+    std::vector<uint8_t> blob;
+    if (!bbNatLoad(blob, nr.bbOff, why))
+        return false;
+    std::string text = kFnHead;
+    text += kBbA;
+    text += kBbB;
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_gmflowbb.cu", L"smv_gmflowbb", "gmflow backbone kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.bbMod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.bbMod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    for (int i = 0; i < (int)(sizeof(kBbKern) / sizeof(kBbKern[0])); i++)
+        if (cuModuleGetFunction(&nr.fBb[i], nr.bbMod, kBbKern[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kBbKern[i] + " is missing";
+            return false;
+        }
+    if (cudaMalloc(&nr.dBbW, blob.size()) != cudaSuccess ||
+        cudaMemcpy(nr.dBbW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
+    return true;
+}
+
+// the backbone's 54 launches on st for one frame at the half nr.hw x nr.hh: x = its 3 fp32 planes, map4 / map8 = A's
+// batch slot (planar fp16), the activations at s (bbArena's pieces). false = a launch failed
+static bool nativeBbLaunch(NativeRife& nr, const float* x, void* map4, void* map8, uint8_t* s, cudaStream_t st)
+{
+    int hh = nr.hh, hw = nr.hw, h1 = hh / 2, w1 = hw / 2, h2 = hh / 4, w2 = hw / 4, p1 = h1 * w1, p2 = h2 * w2;
+    const BbArena ar = bbArena(hw, hh);
+    const char* wb = (const char*)nr.dBbW;
+    auto wp = [&](int i) { return (const void*)(wb + nr.bbOff[i]); };
+    void* l1[5];
+    void* l2[5];
+    void* l3[6];
+    for (int i = 0; i < 5; i++)
+    {
+        l1[i] = s + ar.l1[i];
+        l2[i] = s + ar.l2[i];
+    }
+    for (int i = 0; i < 6; i++)
+        l3[i] = s + ar.l3[i];
+    void* part = s + ar.part;
+    float* sv[4];
+    for (int i = 0; i < 4; i++)
+        sv[i] = (float*)(s + ar.st[i]);
+    auto go = [&](int f, int gx, int gy, int gz, int threads, int sm, void** a) {
+        return cuLaunchKernel(nr.fBb[f], (unsigned)gx, (unsigned)gy, (unsigned)gz, (unsigned)threads, 1, 1,
+                              (unsigned)sm, (CUstream)st, a, nullptr) == CUDA_SUCCESS;
+    };
+    auto stats = [&](void* y, int P, int C, float* so) {
+        int pb = bbPb(P), nb = (P + pb - 1) / pb;
+        void* a[] = {&y, &P, &C, &pb, &part};
+        void* b[] = {&part, &nb, &C, (void*)&so};
+        return go(kBbStats, nb, 1, 1, 256, 0, a) && go(kBbFin, C, 1, 1, 128, 0, b);
+    };
+    // a 3 x 3 conv: kernel f, stride sd, group cg, n-tiles nb; bias = the zero piece unless given
+    auto conv = [&](int f, int sd, int cg, int nbt, void* xin, int cin, int ih, int iw, void* y, int cout, int wi,
+                    const float* sn) {
+        const void* w = wp(wi);
+        const void* bz = wp(kBbZero);
+        const float* sp = sn ? sn : sv[0];
+        const int oh = ih / sd, ow = iw / sd, sm = (sd == 1 ? 10 * 34 : 9 * 65) * (cg / 8) * 16;
+        void* a[] = {&xin, &cin, &ih, &iw, &y, &cout, (void*)&w, (void*)&bz, (void*)&sp};
+        return go(f, (ow + 31) / 32, sd == 1 ? (oh + 7) / 8 : (oh + 3) / 4, cout / (8 * nbt), 128, sm, a);
+    };
+    auto res = [&](int f, void* y, float* sy, void* xin, float* sx, int P, int C, void* out) {
+        void* a[] = {&y, (void*)&sy, &xin, (void*)&sx, &P, &C, &out};
+        return go(f, (P * C / 8 + 255) / 256, 1, 1, 256, 0, a);
+    };
+    auto gemm = [&](int f, void* a0, int M, int OW, int K, int wi, int bi, void* y, int N, int nt) {
+        const void* w = wp(wi);
+        const void* b = wp(bi);
+        const int nrow = ((K / 8) + 7) & ~7;
+        void* a[] = {&a0, &M, &OW, &K, (void*)&w, (void*)&b, &y, &N};
+        return go(f, (M + 63) / 64, N / (8 * nt), 1, 128, 64 * nrow * 16, a);
+    };
+    const void* w7 = wp(kBbW7);
+    void* y0 = l1[0];
+    {
+        void* a[] = {(void*)&x, &hh, &hw, (void*)&w7, &y0};
+        if (!go(kBbC7, (w1 + 31) / 32, (h1 + 3) / 4, 1, 128, 0, a) || !stats(y0, p1, 64, sv[0]))
+            return false;
+    }
+    // layer1 (64): block 0 takes relu(IN(conv1)) (normalized on load, its skip by k_bbRes1), block 1 its output x1
+    bool ok = conv(kBbC64N, 1, 64, 8, y0, 64, h1, w1, l1[1], 64, kBbW3 + 0, sv[0]) && stats(l1[1], p1, 64, sv[1]) &&
+              conv(kBbC64N, 1, 64, 8, l1[1], 64, h1, w1, l1[2], 64, kBbW3 + 1, sv[1]) && stats(l1[2], p1, 64, sv[2]) &&
+              res(kBbRes1, l1[2], sv[2], y0, sv[0], p1, 64, l1[3]) &&
+              conv(kBbC64, 1, 64, 8, l1[3], 64, h1, w1, l1[1], 64, kBbW3 + 2, nullptr) && stats(l1[1], p1, 64, sv[1]) &&
+              conv(kBbC64N, 1, 64, 8, l1[1], 64, h1, w1, l1[2], 64, kBbW3 + 3, sv[1]) && stats(l1[2], p1, 64, sv[2]) &&
+              res(kBbRes0, l1[2], sv[2], l1[3], sv[2], p1, 64, l1[4]);
+    // layer2 (stride 2, 64 -> 96, a 1 x 1 s2 downsample)
+    ok = ok && conv(kBbS64to96, 2, 32, 4, l1[4], 64, h1, w1, l2[0], 96, kBbW3 + 4, nullptr) &&
+         stats(l2[0], p2, 96, sv[1]) && conv(kBbC96N, 1, 32, 4, l2[0], 96, h2, w2, l2[1], 96, kBbW3 + 5, sv[1]) &&
+         stats(l2[1], p2, 96, sv[2]) && gemm(kBbDs2, l1[4], p2, w2, 64, kBbWds2, kBbBds2, l2[2], 96, 6) &&
+         stats(l2[2], p2, 96, sv[3]) && res(kBbRes2, l2[1], sv[2], l2[2], sv[3], p2, 96, l2[3]) &&
+         conv(kBbC96, 1, 32, 4, l2[3], 96, h2, w2, l2[0], 96, kBbW3 + 6, nullptr) && stats(l2[0], p2, 96, sv[1]) &&
+         conv(kBbC96N, 1, 32, 4, l2[0], 96, h2, w2, l2[1], 96, kBbW3 + 7, sv[1]) && stats(l2[1], p2, 96, sv[2]) &&
+         res(kBbRes0, l2[1], sv[2], l2[3], sv[2], p2, 96, l2[4]);
+    // layer3 (stride 1, 96 -> 128, a 1 x 1 downsample)
+    ok = ok && conv(kBbC96to128, 1, 32, 8, l2[4], 96, h2, w2, l3[0], 128, kBbW3 + 8, nullptr) &&
+         stats(l3[0], p2, 128, sv[1]) && conv(kBbC64N, 1, 64, 8, l3[0], 128, h2, w2, l3[1], 128, kBbW3 + 9, sv[1]) &&
+         stats(l3[1], p2, 128, sv[2]) && gemm(kBbG1, l2[4], p2, w2, 96, kBbWds3, kBbBds3, l3[2], 128, 8) &&
+         stats(l3[2], p2, 128, sv[3]) && res(kBbRes2, l3[1], sv[2], l3[2], sv[3], p2, 128, l3[3]) &&
+         conv(kBbC64, 1, 64, 8, l3[3], 128, h2, w2, l3[0], 128, kBbW3 + 10, nullptr) && stats(l3[0], p2, 128, sv[1]) &&
+         conv(kBbC64N, 1, 64, 8, l3[0], 128, h2, w2, l3[1], 128, kBbW3 + 11, sv[1]) && stats(l3[1], p2, 128, sv[2]) &&
+         res(kBbRes0, l3[1], sv[2], l3[3], sv[2], p2, 128, l3[4]);
+    // conv2 (1 x 1, bias), then the trident: map4 at stride 1, map8 at stride 2
+    return ok && gemm(kBbG1, l3[4], p2, w2, 128, kBbWc2, kBbBc2, l3[5], 128, 8) &&
+           conv(kBbTri, 1, 64, 8, l3[5], 128, h2, w2, map4, 128, kBbWtri, nullptr) &&
+           conv(kBbTri2, 2, 32, 8, l3[5], 128, h2, w2, map8, 128, kBbWtri2, nullptr);
+}
+
+// the backbone on one frame on st (nr.stream): x = its 3 fp32 half planes, map4 / map8 = A's batch slot; the launches go
+// through nr.bbGraphs (chainGraphRun). false = the activations or a launch failed
+static bool nativeBbRun(NativeRife& nr, const float* x, void* map4, void* map8, cudaStream_t st)
+{
+    const BbArena ar = bbArena(nr.hw, nr.hh);
+    uint8_t* s = nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= ar.total ? (uint8_t*)nr.dGmCtxMem : (uint8_t*)nr.dBbOwn;
+    if (!s && cudaMalloc(&nr.dBbOwn, ar.total) == cudaSuccess)
+        s = (uint8_t*)nr.dBbOwn;
+    if (!s)
+        return false;
+    return chainGraphRun(nr.bbGraphs, {s, x, map4, map8}, nr.hw, nr.hh, st, "gmfss gmflow backbone",
+                         [&] { return nativeBbLaunch(nr, x, map4, map8, s, st); });
+}
+
+// gmflow's transformer at both of GMFSS's scales on the host's kernels, the module smv_gmflowa_*.cubin (kFnHead's
+// helpers + kGaA / kGaB, the kernel text cut in two), weights = engine\GMFSS_Fortuna\train_log\flownet.pkl's transformer.* and
+// feature_flow_attn's two projections through pthStateDict (gaNatLoad); no engine, no ONNX, no fallback (a missing /
+// wrong pkl = `gmflow's transformer unavailable (...)`, the session refuses). A (scale 1, the quarter, 8 x 8 windows):
+// k_gaFlowUp (prop -> flow0), k_gaWarpPos (map4's rows, feature1 warped by flow0, + the window position), 6 layers of
+// k_gaProj (the folded q' / v' of both attentions), k_gaAttn self (+ norm1 + the residual), k_gaProj (the cross q'),
+// k_gaAttn cross (+ norm1), k_gaMlp (+ norm2 + the residual) -> qf (dGmA[0]) and flow0 (dGmA[1]); `_m` (scale 0, the
+// eighth, 2 x 2 windows, map8's pair, no warp) the same layers, then the propagation's projections -> mf / mq / mk
+// (dGmM). fp16 operands, fp16 sums but in P v' (fp32), LayerNorm, softmax and the residual stream in fp32; an RTX 20
+// card runs 32-key tiles and a 2-stage weight ring (64 KB of shared memory a block).
+static const char kGaA[] = R"GASRC(
+// gmflow A, GMFSS's scale 1: the prop flow upsampled, feature1 warped by it, the window position, then the 6-layer
+// transformer in 8 x 8 window splits (shifted windows on the odd layers). Tokens [4][P][128], P = H * W: rows 0..1 =
+// feature0 (img0, img1), rows 2..3 = feature1 (img1 warped by flow 0, img0 by flow 1); the cross attention of row b
+// reads row b ^ 2. Every matmul takes fp16 operands with fp32 sums; LayerNorm, softmax and the residual stream stay
+// fp32 (x32), with an fp16 copy of the stream for the matmuls.
+
+__device__ __forceinline__ unsigned gaSa(const void* p)
+{
+    return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void gaCommit()
+{
+    asm volatile(SMV_CP_COMMIT);
+}
+
+template <int N> __device__ __forceinline__ void gaWait()
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
+
+__device__ __forceinline__ void gaLdm4T(unsigned addr, unsigned* r)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+__device__ __forceinline__ void gaMma(float* c, const unsigned* a, unsigned b0, unsigned b1)
+{
+    asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ unsigned gaPack(float lo, float hi)
+{
+    return static_cast<unsigned>(f2h(lo)) | (static_cast<unsigned>(f2h(hi)) << 16);
+}
+
+// the same product on fp16 accumulators: c[0] = row g (two columns), c[1] = row g + 8
+__device__ __forceinline__ void gaMmaH(unsigned* c, const unsigned* a, unsigned b0, unsigned b1)
+{
+    asm volatile(SMV_MMA_F16 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ float gaLo(unsigned v)
+{
+    return h2f(static_cast<unsigned short>(v & 0xffffu));
+}
+
+__device__ __forceinline__ float gaHi(unsigned v)
+{
+    return h2f(static_cast<unsigned short>(v >> 16));
+}
+
+// the 16-byte chunk c of row r in a tile of 256-byte rows, swizzled so the 8 rows of an ldmatrix hit 8 bank groups
+__device__ __forceinline__ int gaSw(int r, int c)
+{
+    return r * 128 + ((c ^ (r & 7)) << 3);
+}
+
+// flow0 [2][2][H][W] fp32 = 2 x prop [2][h8 * w8][2] fp16 (x, y) upsampled 2x, bilinear with aligned corners
+extern "C" __global__ void __launch_bounds__(256) k_gaFlowUp(const unsigned short* __restrict__ prop, int h8, int w8,
+                                                             float* __restrict__ flow)
+{
+    const int H = 2 * h8, W = 2 * w8, P = H * W;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= 2 * P)
+        return;
+    const int d = i / P, p = i - d * P, y = p / W, x = p - y * W;
+    const float fy = (H > 1 ? static_cast<float>(h8 - 1) / static_cast<float>(H - 1) : 0.f) * y;
+    const float fx = (W > 1 ? static_cast<float>(w8 - 1) / static_cast<float>(W - 1) : 0.f) * x;
+    const int y0 = static_cast<int>(fy), x0 = static_cast<int>(fx);
+    const int y1 = y0 + (y0 < h8 - 1 ? 1 : 0), x1 = x0 + (x0 < w8 - 1 ? 1 : 0);
+    const float ly = fy - y0, lx = fx - x0;
+    const unsigned short* s = prop + static_cast<size_t>(d) * h8 * w8 * 2;
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        const float v00 = h2f(s[(y0 * w8 + x0) * 2 + c]), v01 = h2f(s[(y0 * w8 + x1) * 2 + c]);
+        const float v10 = h2f(s[(y1 * w8 + x0) * 2 + c]), v11 = h2f(s[(y1 * w8 + x1) * 2 + c]);
+        const float v = (1.f - ly) * ((1.f - lx) * v00 + lx * v01) + ly * ((1.f - lx) * v10 + lx * v11);
+        flow[(static_cast<size_t>(d) * 2 + c) * P + p] = 2.f * v;
+    }
+}
+
+// the tokens, each + the window's sine position (posY [wh][64] = channels 0..63, posX [ww][64] = 64..127), maps =
+// [2][128][H][W] fp16. warp (A, map4): rows 0 / 1 = maps[0] / [1], row 2 = maps[1] warped by flow 0, row 3 = maps[0]
+// warped by flow 1 (bilinear, zero outside); no warp (`_m`, map8): rows 0 / 1 = maps[0] / [1]. 32 tokens a block:
+// channel-planar reads, then token rows through shared memory.
+extern "C" __global__ void __launch_bounds__(256)
+    k_gaWarpPos(const unsigned short* __restrict__ m4, const float* __restrict__ flow, const float* __restrict__ posY,
+                const float* __restrict__ posX, int H, int W, int wh, int ww, int warp, float* __restrict__ x32,
+                unsigned short* __restrict__ x16)
+{
+    __shared__ float tile[32][129];
+    const int P = H * W, b = blockIdx.y, t0 = blockIdx.x * 32;
+    const int tx = threadIdx.x & 31, cy = threadIdx.x >> 5;
+    const int t = t0 + tx;
+    const bool ok = t < P;
+    const int y = ok ? t / W : 0, x = ok ? t - y * W : 0;
+    const bool warped = warp && b >= 2;
+    const unsigned short* plane = m4 + static_cast<size_t>(warp ? ((b == 0 || b == 3) ? 0 : 1) : b) * 128 * P;
+    int i00 = t, i01 = t, i10 = t, i11 = t;
+    float w00 = 0.f, w01 = 0.f, w10 = 0.f, w11 = 0.f;
+    if (warped && ok) {
+        const float* fl = flow + static_cast<size_t>(b - 2) * 2 * P;
+        const float sx = fminf(fmaxf(x + fl[t], -2.f), W + 1.f), sy = fminf(fmaxf(y + fl[P + t], -2.f), H + 1.f);
+        const float fx0 = floorf(sx), fy0 = floorf(sy);
+        const int xa = static_cast<int>(fx0), ya = static_cast<int>(fy0);
+        const float ax = sx - fx0, ay = sy - fy0;
+        const bool vx0 = xa >= 0 && xa < W, vx1 = xa + 1 >= 0 && xa + 1 < W;
+        const bool vy0 = ya >= 0 && ya < H, vy1 = ya + 1 >= 0 && ya + 1 < H;
+        const int cx0 = min(max(xa, 0), W - 1), cx1 = min(max(xa + 1, 0), W - 1);
+        const int cy0 = min(max(ya, 0), H - 1), cy1 = min(max(ya + 1, 0), H - 1);
+        w00 = (vx0 && vy0) ? (1.f - ax) * (1.f - ay) : 0.f;
+        w01 = (vx1 && vy0) ? ax * (1.f - ay) : 0.f;
+        w10 = (vx0 && vy1) ? (1.f - ax) * ay : 0.f;
+        w11 = (vx1 && vy1) ? ax * ay : 0.f;
+        i00 = cy0 * W + cx0;
+        i01 = cy0 * W + cx1;
+        i10 = cy1 * W + cx0;
+        i11 = cy1 * W + cx1;
+    }
+    const float* py = posY + (y % wh) * 64;
+    const float* px = posX + (x % ww) * 64;
+#pragma unroll 4
+    for (int j = 0; j < 16; ++j) {
+        const int c = cy + 8 * j;
+        float v = 0.f;
+        if (ok) {
+            const unsigned short* pl = plane + static_cast<size_t>(c) * P;
+            if (!warped)
+                v = h2f(pl[t]);
+            else
+                v = w00 * h2f(pl[i00]) + w01 * h2f(pl[i01]) + w10 * h2f(pl[i10]) + w11 * h2f(pl[i11]);
+            v += c < 64 ? py[c] : px[c - 64];
+        }
+        tile[tx][c] = v;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int idx = k * 256 + threadIdx.x, r = idx >> 5, q = idx & 31;
+        if (t0 + r >= P)
+            continue;
+        const float4 v = make_float4(tile[r][q * 4], tile[r][q * 4 + 1], tile[r][q * 4 + 2], tile[r][q * 4 + 3]);
+        const size_t row = (static_cast<size_t>(b) * P + t0 + r) * 128 + q * 4;
+        *reinterpret_cast<float4*>(x32 + row) = v;
+        *reinterpret_cast<uint2*>(x16 + row) = make_uint2(gaPack(v.x, v.y), gaPack(v.z, v.w));
+    }
+}
+
+// out[n / 128][m][n % 128] = a[m][:] . w[n][:] (+ bias[n] in fp32 when bias is set; K = 128, fp16 out): 64 rows x 128
+// outputs a CTA, 4 warps of 32 x 64, the two K halves loaded as two cp.async groups
+extern "C" __global__ void __launch_bounds__(128) k_gaProj(const unsigned short* __restrict__ a, int M,
+                                                           const unsigned short* __restrict__ w,
+                                                           unsigned short* __restrict__ out,
+                                                           const float* __restrict__ bias)
+{
+    extern __shared__ __align__(16) unsigned char sm[];
+    unsigned short* sA = reinterpret_cast<unsigned short*>(sm);
+    unsigned short* sW = sA + 64 * 128;
+    const int m0 = blockIdx.x * 64, nb = blockIdx.y;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const unsigned short* wb = w + static_cast<size_t>(nb) * 128 * 128;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int idx = k * 128 + tid, r = idx >> 3, c = (idx & 7) + h * 8, gr = m0 + r;
+            const bool ok = gr < M;
+            rnCp16(gaSa(sA + gaSw(r, c)), a + static_cast<size_t>(ok ? gr : 0) * 128 + c * 8, ok ? 16 : 0);
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int idx = k * 128 + tid, r = idx >> 3, c = (idx & 7) + h * 8;
+            rnCp16(gaSa(sW + gaSw(r, c)), wb + static_cast<size_t>(r) * 128 + c * 8, 16);
+        }
+        gaCommit();
+    }
+    const int wm = (warp >> 1) * 32, wn = (warp & 1) * 64;
+    unsigned acc[2][8][2];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt)
+            acc[mt][nt][0] = acc[mt][nt][1] = 0u;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        if (h == 0)
+            gaWait<1>();
+        else
+            gaWait<0>();
+        __syncthreads();
+#pragma unroll
+        for (int ks = h * 4; ks < h * 4 + 4; ++ks) {
+            unsigned af[2][4];
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                rnLdm4(gaSa(sA + gaSw(wm + mt * 16 + (lane & 15), ks * 2 + (lane >> 4))), af[mt]);
+#pragma unroll
+            for (int np = 0; np < 4; ++np) {
+                unsigned bf[4];
+                rnLdm4(gaSa(sW + gaSw(wn + np * 16 + (lane & 7) + ((lane >> 4) << 3), ks * 2 + ((lane >> 3) & 1))),
+                       bf);
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    gaMmaH(acc[mt][2 * np], af[mt], bf[0], bf[1]);
+                    gaMmaH(acc[mt][2 * np + 1], af[mt], bf[2], bf[3]);
+                }
+            }
+        }
+    }
+    unsigned short* o = out + static_cast<size_t>(nb) * M * 128;
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        const int r0 = m0 + wm + mt * 16 + (lane >> 2), r1 = r0 + 8;
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int col = wn + nt * 8 + (lane & 3) * 2;
+            unsigned v0 = acc[mt][nt][0], v1 = acc[mt][nt][1];
+            if (bias) {
+                const float b0 = bias[nb * 128 + col], b1 = bias[nb * 128 + col + 1];
+                v0 = gaPack(gaLo(v0) + b0, gaHi(v0) + b1);
+                v1 = gaPack(gaLo(v1) + b0, gaHi(v1) + b1);
+            }
+            if (r0 < M)
+                *reinterpret_cast<unsigned*>(o + static_cast<size_t>(r0) * 128 + col) = v0;
+            if (r1 < M)
+                *reinterpret_cast<unsigned*>(o + static_cast<size_t>(r1) * 128 + col) = v1;
+        }
+    }
+}
+
+// LayerNorm over the 128 channels of a warp's rows g and g + 8, in place: o[nt][0..1] = row g, o[nt][2..3] = row g + 8,
+// channel nt * 8 + 2 * t4 + e (a row's 128 values live in its quad)
+__device__ __forceinline__ void gaLn(float (*o)[4], const float* __restrict__ gam, const float* __restrict__ bet,
+                                     float eps, int t4)
+{
+    float mu[2] = {0.f, 0.f}, va[2] = {0.f, 0.f};
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) {
+        mu[0] += o[nt][0] + o[nt][1];
+        mu[1] += o[nt][2] + o[nt][3];
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        mu[r] += __shfl_xor_sync(0xffffffffu, mu[r], 1);
+        mu[r] += __shfl_xor_sync(0xffffffffu, mu[r], 2);
+        mu[r] *= 1.f / 128.f;
+    }
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float d = o[nt][e] - mu[e >> 1];
+            va[e >> 1] += d * d;
+        }
+    float rs[2];
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        va[r] += __shfl_xor_sync(0xffffffffu, va[r], 1);
+        va[r] += __shfl_xor_sync(0xffffffffu, va[r], 2);
+        rs[r] = rsqrtf(va[r] * (1.f / 128.f) + eps);
+    }
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) {
+        const int c = nt * 8 + 2 * t4;
+        const float g0 = gam[c], g1 = gam[c + 1], b0 = bet[c], b1 = bet[c + 1];
+        o[nt][0] = (o[nt][0] - mu[0]) * rs[0] * g0 + b0;
+        o[nt][1] = (o[nt][1] - mu[0]) * rs[0] * g1 + b1;
+        o[nt][2] = (o[nt][2] - mu[1]) * rs[1] * g0 + b0;
+        o[nt][3] = (o[nt][3] - mu[1]) * rs[1] * g1 + b1;
+    }
+}
+
+// the rows' stores (row = element offset of the token's 128 channels, -1 = none): add = x32 += o, o16 = fp16(x32);
+// else o16 = fp16(o)
+__device__ __forceinline__ void gaStore(float (*o)[4], long long row0, long long row1, int t4, bool add,
+                                        float* __restrict__ x32, unsigned short* __restrict__ o16)
+{
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const long long row = r ? row1 : row0;
+        if (row < 0)
+            continue;
+#pragma unroll
+        for (int nt = 0; nt < 16; ++nt) {
+            const long long i = row + nt * 8 + 2 * t4;
+            float v0 = o[nt][2 * r], v1 = o[nt][2 * r + 1];
+            if (add) {
+                const float2 s = *reinterpret_cast<const float2*>(x32 + i);
+                v0 += s.x;
+                v1 += s.y;
+                *reinterpret_cast<float2*>(x32 + i) = make_float2(v0, v1);
+            }
+            *reinterpret_cast<unsigned*>(o16 + i) = gaPack(v0, v1);
+        }
+    }
+}
+
+)GASRC";
+static const char kGaB[] = R"GASRC(
+// local index i of window (wy, wx) on the rolled grid -> its token y * W + x; lab = its shift region (0..8)
+__device__ __forceinline__ int gaTok(int i, int wy, int wx, int wh, int ww, int H, int W, int sh, int sw, int& lab)
+{
+    const int ly = i / ww, lx = i - ly * ww;
+    const int ry = wy * wh + ly, rx = wx * ww + lx;
+    lab = ((ry >= H - wh) + (ry >= H - sh)) * 3 + (rx >= W - ww) + (rx >= W - sw);
+    const int y = ry + sh < H ? ry + sh : ry + sh - H;
+    const int x = rx + sw < W ? rx + sw : rx + sw - W;
+    return y * W + x;
+}
+
+// the key tile: 64 keys double buffered (66 KB of shared memory); sm_75 (RTX 20: 64 KB a block) = 32 keys
+#if __CUDA_ARCH__ >= 800
+#define GA_KT 64
+#else
+#define GA_KT 32
+#endif
+#define GA_KN (GA_KT / 8)
+
+// one window's attention for 128 queries a CTA (8 warps of 16): S = q' k^T / sqrt(128) with the shifted layers' region
+// mask (pairs of different regions skipped), online softmax in fp32, O = P v' with P in fp16, then norm1. K / V tiles of
+// GA_KT keys, double buffered. The frame is split in S x S windows (blockIdx.y = the window); keys and values come from
+// row b ^ part. mode 0 (self) = x32 += norm1(O), o16 = fp16(x32); mode 1 (cross) = o16 = fp16(norm1(O)).
+extern "C" __global__ void __launch_bounds__(256, 1)
+    k_gaAttn(const unsigned short* __restrict__ q, const unsigned short* __restrict__ k,
+             const unsigned short* __restrict__ v, int H, int W, int S, int shift, int part,
+             const float* __restrict__ gam, const float* __restrict__ bet, float eps, int mode,
+             float* __restrict__ x32, unsigned short* __restrict__ o16)
+{
+    extern __shared__ __align__(16) unsigned char sm[];
+    unsigned short* sK = reinterpret_cast<unsigned short*>(sm);
+    unsigned short* sV = sK + 2 * GA_KT * 128;
+    int* sLab = reinterpret_cast<int*>(sV + 2 * GA_KT * 128);
+    const int wh = H / S, ww = W / S;
+    const int P = H * W, L = wh * ww, sh = shift ? wh / 2 : 0, sw = shift ? ww / 2 : 0;
+    const int b = blockIdx.z, wy = blockIdx.y / S, wx = blockIdx.y - wy * S, bk = b ^ part;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
+
+    int qlab[2];
+    long long qrow[2];
+    unsigned qa[8][4];
+    {
+        const unsigned* qp[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int li = blockIdx.x * 128 + warp * 16 + g + 8 * r;
+            int lab = 0, tok = 0;
+            if (li < L)
+                tok = gaTok(li, wy, wx, wh, ww, H, W, sh, sw, lab);
+            qlab[r] = lab;
+            qrow[r] = li < L ? (static_cast<long long>(b) * P + tok) * 128 : -1;
+            qp[r] = reinterpret_cast<const unsigned*>(q + (li < L ? qrow[r] : 0));
+        }
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            qa[ks][0] = qrow[0] >= 0 ? qp[0][ks * 8 + t4] : 0u;
+            qa[ks][1] = qrow[1] >= 0 ? qp[1][ks * 8 + t4] : 0u;
+            qa[ks][2] = qrow[0] >= 0 ? qp[0][ks * 8 + 4 + t4] : 0u;
+            qa[ks][3] = qrow[1] >= 0 ? qp[1][ks * 8 + 4 + t4] : 0u;
+        }
+    }
+
+    const int nkt = (L + GA_KT - 1) / GA_KT;
+    auto load = [&](int kt, int buf) {
+#pragma unroll
+        for (int j = 0; j < GA_KT / 16; ++j) {
+            const int idx = j * 256 + tid, r = idx >> 4, c = idx & 15, li = kt * GA_KT + r;
+            int lab = 0, tok = 0;
+            if (li < L)
+                tok = gaTok(li, wy, wx, wh, ww, H, W, sh, sw, lab);
+            const size_t off = (static_cast<size_t>(bk) * P + tok) * 128 + c * 8;
+            const int dst = (buf * GA_KT) * 128 + gaSw(r, c);
+            rnCp16(gaSa(sK + dst), k + off, li < L ? 16 : 0);
+            rnCp16(gaSa(sV + dst), v + off, li < L ? 16 : 0);
+            if (c == 0)
+                sLab[buf * GA_KT + r] = li < L ? (shift ? lab : 0) : -1;
+        }
+        gaCommit();
+    };
+
+    const float sc = 1.4426950408889634f * 0.08838834764831845f;
+    const float ninf = __int_as_float(0xff800000);
+    float m[2] = {-1e30f, -1e30f}, l[2] = {0.f, 0.f};
+    float o[16][4];
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            o[nt][e] = 0.f;
+
+    load(0, 0);
+    for (int kt = 0; kt < nkt; ++kt) {
+        const int buf = kt & 1;
+        gaWait<0>();
+        __syncthreads();
+        if (kt + 1 < nkt)
+            load(kt + 1, buf ^ 1);
+        const unsigned short* Kb = sK + buf * GA_KT * 128;
+        const unsigned short* Vb = sV + buf * GA_KT * 128;
+        const int* lb = sLab + buf * GA_KT;
+        float s[GA_KN][4];
+        {
+            unsigned sh[GA_KN][2];
+#pragma unroll
+            for (int j = 0; j < GA_KN; ++j)
+                sh[j][0] = sh[j][1] = 0u;
+#pragma unroll
+            for (int ks = 0; ks < 8; ++ks)
+#pragma unroll
+                for (int np = 0; np < GA_KN / 2; ++np) {
+                    unsigned bf[4];
+                    rnLdm4(gaSa(Kb + gaSw(np * 16 + (lane & 7) + ((lane >> 4) << 3), ks * 2 + ((lane >> 3) & 1))),
+                           bf);
+                    gaMmaH(sh[2 * np], qa[ks], bf[0], bf[1]);
+                    gaMmaH(sh[2 * np + 1], qa[ks], bf[2], bf[3]);
+                }
+#pragma unroll
+            for (int j = 0; j < GA_KN; ++j) {
+                s[j][0] = gaLo(sh[j][0]);
+                s[j][1] = gaHi(sh[j][0]);
+                s[j][2] = gaLo(sh[j][1]);
+                s[j][3] = gaHi(sh[j][1]);
+            }
+        }
+        float mx[2] = {m[0], m[1]};
+#pragma unroll
+        for (int j = 0; j < GA_KN; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int kl = lb[j * 8 + 2 * t4 + (e & 1)], r = e >> 1;
+                const float x = (kl < 0 || (shift && kl != qlab[r])) ? ninf : s[j][e] * sc;
+                s[j][e] = x;
+                mx[r] = fmaxf(mx[r], x);
+            }
+        float al[2], ps[2] = {0.f, 0.f};
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+            al[r] = exp2f(m[r] - mx[r]);
+            m[r] = mx[r];
+        }
+#pragma unroll
+        for (int j = 0; j < GA_KN; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float p = exp2f(s[j][e] - m[e >> 1]);
+                s[j][e] = p;
+                ps[e >> 1] += p;
+            }
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+            l[r] = l[r] * al[r] + ps[r];
+#pragma unroll
+        for (int nt = 0; nt < 16; ++nt) {
+            o[nt][0] *= al[0];
+            o[nt][1] *= al[0];
+            o[nt][2] *= al[1];
+            o[nt][3] *= al[1];
+        }
+#pragma unroll
+        for (int kk = 0; kk < GA_KN / 2; ++kk) {
+            const unsigned pa[4] = {gaPack(s[2 * kk][0], s[2 * kk][1]), gaPack(s[2 * kk][2], s[2 * kk][3]),
+                                    gaPack(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                                    gaPack(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+#pragma unroll
+            for (int ntp = 0; ntp < 8; ++ntp) {
+                unsigned bf[4];
+                gaLdm4T(gaSa(Vb + gaSw(kk * 16 + (lane & 7) + (((lane >> 3) & 1) << 3), ntp * 2 + (lane >> 4))), bf);
+                gaMma(o[2 * ntp], pa, bf[0], bf[1]);
+                gaMma(o[2 * ntp + 1], pa, bf[2], bf[3]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        l[r] += __shfl_xor_sync(0xffffffffu, l[r], 1);
+        l[r] += __shfl_xor_sync(0xffffffffu, l[r], 2);
+        l[r] = 1.f / l[r];
+    }
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) {
+        o[nt][0] *= l[0];
+        o[nt][1] *= l[0];
+        o[nt][2] *= l[1];
+        o[nt][3] *= l[1];
+    }
+    gaLn(o, gam, bet, eps, t4);
+    gaStore(o, qrow[0], qrow[1], t4, mode == 0, x32, o16);
+}
+
+#define GA_HC 32
+#define GA_MST (GA_HC * 256 + 128 * GA_HC)
+// the weight ring: 3 stages (72 KB of shared memory); sm_75 (RTX 20: 64 KB a block) = 2
+#if __CUDA_ARCH__ >= 800
+#define GA_MSTN 3
+#else
+#define GA_MSTN 2
+#endif
+
+// the cross layer's mlp on 128 tokens a CTA (8 warps of 16): mlp.0 (256 -> 1024, GELU) on cat(s16, m16) in 32-wide
+// hidden chunks that stay in registers as mlp.2's (1024 -> 128) operand, then norm2 and the residual: x32 += norm2(..),
+// x16 = fp16(x32). w0 = [1024][256]; w2c = mlp.2 in chunks [32][128][32]; weight chunks in a GA_MSTN-stage cp.async
+// ring.
+extern "C" __global__ void __launch_bounds__(256, 1)
+    k_gaMlp(const unsigned short* __restrict__ s16, const unsigned short* __restrict__ m16, int M,
+            const unsigned short* __restrict__ w0, const unsigned short* __restrict__ w2c,
+            const float* __restrict__ gam, const float* __restrict__ bet, float eps, float* __restrict__ x32,
+            unsigned short* __restrict__ x16)
+{
+    extern __shared__ __align__(16) unsigned char sm[];
+    unsigned short* st = reinterpret_cast<unsigned short*>(sm);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
+    const int r0 = blockIdx.x * 128 + warp * 16 + g, r1 = r0 + 8;
+    const bool ok0 = r0 < M, ok1 = r1 < M;
+
+    auto load = [&](int hc, int s) {
+        unsigned short* d0 = st + s * GA_MST;
+        unsigned short* d2 = d0 + GA_HC * 256;
+        const unsigned short* g0 = w0 + static_cast<size_t>(hc) * GA_HC * 256;
+        const unsigned short* g2 = w2c + static_cast<size_t>(hc) * 128 * GA_HC;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int idx = j * 256 + tid, r = idx >> 5, c = idx & 31;
+            rnCp16(gaSa(d0 + r * 256 + ((c ^ (r & 7)) << 3)), g0 + r * 256 + c * 8, 16);
+        }
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int idx = j * 256 + tid, r = idx >> 2, c = idx & 3;
+            rnCp16(gaSa(d2 + r * 32 + ((c ^ ((r >> 1) & 3)) << 3)), g2 + r * 32 + c * 8, 16);
+        }
+        gaCommit();
+    };
+#pragma unroll
+    for (int s = 0; s < GA_MSTN - 1; ++s)
+        load(s, s);
+
+    unsigned a[16][4];
+    {
+        const unsigned* p0 = reinterpret_cast<const unsigned*>(s16 + static_cast<size_t>(ok0 ? r0 : 0) * 128);
+        const unsigned* p1 = reinterpret_cast<const unsigned*>(s16 + static_cast<size_t>(ok1 ? r1 : 0) * 128);
+        const unsigned* n0 = reinterpret_cast<const unsigned*>(m16 + static_cast<size_t>(ok0 ? r0 : 0) * 128);
+        const unsigned* n1 = reinterpret_cast<const unsigned*>(m16 + static_cast<size_t>(ok1 ? r1 : 0) * 128);
+#pragma unroll
+        for (int ks = 0; ks < 16; ++ks) {
+            const unsigned* q0 = ks < 8 ? p0 : n0;
+            const unsigned* q1 = ks < 8 ? p1 : n1;
+            const int kc = (ks & 7) * 8;
+            a[ks][0] = ok0 ? q0[kc + t4] : 0u;
+            a[ks][1] = ok1 ? q1[kc + t4] : 0u;
+            a[ks][2] = ok0 ? q0[kc + 4 + t4] : 0u;
+            a[ks][3] = ok1 ? q1[kc + 4 + t4] : 0u;
+        }
+    }
+    float o[16][4];
+    unsigned oh[16][2];
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt)
+        oh[nt][0] = oh[nt][1] = 0u;
+
+    for (int hc = 0; hc < 1024 / GA_HC; ++hc) {
+        gaWait<GA_MSTN - 2>();
+        __syncthreads();
+        if (hc + GA_MSTN - 1 < 1024 / GA_HC)
+            load(hc + GA_MSTN - 1, (hc + GA_MSTN - 1) % GA_MSTN);
+        else
+            gaCommit();
+        const unsigned short* d0 = st + (hc % GA_MSTN) * GA_MST;
+        const unsigned short* d2 = d0 + GA_HC * 256;
+        float h[4][4];
+        {
+            unsigned hh[4][2];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                hh[j][0] = hh[j][1] = 0u;
+#pragma unroll
+            for (int ks = 0; ks < 16; ++ks)
+#pragma unroll
+                for (int np = 0; np < 2; ++np) {
+                    const int n = np * 16 + (lane & 7) + ((lane >> 4) << 3), c = ks * 2 + ((lane >> 3) & 1);
+                    unsigned bf[4];
+                    rnLdm4(gaSa(d0 + n * 256 + ((c ^ (n & 7)) << 3)), bf);
+                    gaMmaH(hh[2 * np], a[ks], bf[0], bf[1]);
+                    gaMmaH(hh[2 * np + 1], a[ks], bf[2], bf[3]);
+                }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                h[j][0] = gaLo(hh[j][0]);
+                h[j][1] = gaHi(hh[j][0]);
+                h[j][2] = gaLo(hh[j][1]);
+                h[j][3] = gaHi(hh[j][1]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                h[j][e] = 0.5f * h[j][e] * (1.f + erff(h[j][e] * 0.7071067811865476f));
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            const unsigned pa[4] = {gaPack(h[2 * kk][0], h[2 * kk][1]), gaPack(h[2 * kk][2], h[2 * kk][3]),
+                                    gaPack(h[2 * kk + 1][0], h[2 * kk + 1][1]),
+                                    gaPack(h[2 * kk + 1][2], h[2 * kk + 1][3])};
+#pragma unroll
+            for (int ntp = 0; ntp < 8; ++ntp) {
+                const int n = ntp * 16 + (lane & 7) + ((lane >> 4) << 3), c = kk * 2 + ((lane >> 3) & 1);
+                unsigned bf[4];
+                rnLdm4(gaSa(d2 + n * 32 + ((c ^ ((n >> 1) & 3)) << 3)), bf);
+                gaMmaH(oh[2 * ntp], pa, bf[0], bf[1]);
+                gaMmaH(oh[2 * ntp + 1], pa, bf[2], bf[3]);
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) {
+        o[nt][0] = gaLo(oh[nt][0]);
+        o[nt][1] = gaHi(oh[nt][0]);
+        o[nt][2] = gaLo(oh[nt][1]);
+        o[nt][3] = gaHi(oh[nt][1]);
+    }
+    gaLn(o, gam, bet, eps, t4);
+    gaStore(o, ok0 ? static_cast<long long>(r0) * 128 : -1, ok1 ? static_cast<long long>(r1) * 128 : -1, t4, true, x32,
+            x16);
+}
+)GASRC";
+
+static const char* const kGaKern[5] = {"k_gaFlowUp", "k_gaWarpPos", "k_gaProj", "k_gaAttn", "k_gaMlp"};
+enum
+{
+    kGaFlowUpK,
+    kGaWarpPosK,
+    kGaProjK,
+    kGaAttnK,
+    kGaMlpK
+};
+// the weight block (gaNatLoad): layer l's pieces at 7 l: g1 = the self attention's q' and v' folds and the cross one's v'
+// fold [384][128], g2 = the cross q' fold [128][128], mlp.0 [1024][256], mlp.2 in 32-wide hidden chunks [32][128][32]
+// (fp16), then the three LayerNorms' gamma | beta (fp32 [2][128]: self norm1, cross norm1, norm2); 42..45 =
+// feature_flow_attn's q_proj (fp16), its bias (fp32), k_proj, its bias
+constexpr int kGaQw = 42, kGaQb = 43, kGaKw = 44, kGaKb = 45;
+constexpr float kGaEps = 1e-5f;  // nn.LayerNorm's default (GMFlow's TransformerLayer)
+constexpr int kGaSmProj = 49152; // k_gaProj: 64 rows + 128 weights of 256 bytes
+
+static bool gaNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\flownet.pkl", pf, why))
+        return false;
+    auto& wts = pf.t;
+    const auto& S = pf.S;
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    };
+    const std::string fa = "feature_flow_attn.";
+    bool form = has(fa + "q_proj.weight", {128, 128}) && has(fa + "q_proj.bias", {128}) &&
+                has(fa + "k_proj.weight", {128, 128}) && has(fa + "k_proj.bias", {128}) &&
+                !S.count("transformer.layers.6.self_attn.q_proj.weight");
+    for (int l = 0; l < 6 && form; l++)
+    {
+        const std::string p = "transformer.layers." + std::to_string(l) + ".";
+        for (const char* a : {"self_attn.", "cross_attn_ffn."})
+        {
+            for (const char* w : {"q_proj", "k_proj", "v_proj", "merge"})
+                form = form && has(p + a + w + ".weight", {128, 128}) && !S.count(p + a + w + ".bias");
+            form = form && has(p + a + "norm1.weight", {128}) && has(p + a + "norm1.bias", {128});
+        }
+        form = form && has(p + "cross_attn_ffn.mlp.0.weight", {1024, 256}) &&
+               has(p + "cross_attn_ffn.mlp.2.weight", {128, 1024}) && has(p + "cross_attn_ffn.norm2.weight", {128}) &&
+               has(p + "cross_attn_ffn.norm2.bias", {128}) && !S.count(p + "self_attn.mlp.0.weight");
+    }
+    if (!form)
+    {
+        why = "its weights are not gmflow's transformer";
+        return false;
+    }
+    blob.clear();
+    auto put = [&](const void* d, size_t n) {
+        const size_t o = (blob.size() + 255) & ~(size_t)255;
+        blob.resize(o + n);
+        memcpy(blob.data() + o, d, n);
+        return o;
+    };
+    auto half = [](const float* v, size_t n) {
+        std::vector<uint16_t> h(n);
+        for (size_t i = 0; i < n; i++)
+            h[i] = f2hRne(v[i]);
+        return h;
+    };
+    // the export's folds: q' = s (Wk^T Wq)^T, v' = t (Wm Wv)^T, in double, then fp32 (then fp16 by half)
+    auto fold = [](std::span<const float> a, std::span<const float> b, bool kq, float* out) {
+        for (int i = 0; i < 128; i++)
+            for (int j = 0; j < 128; j++)
+            {
+                double s = 0.0;
+                for (int r = 0; r < 128; r++)
+                    s += kq ? (double)a[(size_t)r * 128 + i] * b[(size_t)r * 128 + j]
+                            : (double)a[(size_t)i * 128 + r] * b[(size_t)r * 128 + j];
+                out[i * 128 + j] = (float)s;
+            }
+    };
+    std::vector<float> g1((size_t)384 * 128), g2((size_t)128 * 128), w2c((size_t)128 * 1024);
+    for (int l = 0; l < 6; l++)
+    {
+        const std::string p = "transformer.layers." + std::to_string(l) + ".";
+        const std::string sa = p + "self_attn.", ca = p + "cross_attn_ffn.";
+        fold(wts[sa + "k_proj.weight"], wts[sa + "q_proj.weight"], true, g1.data());
+        fold(wts[sa + "merge.weight"], wts[sa + "v_proj.weight"], false, g1.data() + 128 * 128);
+        fold(wts[ca + "merge.weight"], wts[ca + "v_proj.weight"], false, g1.data() + 2 * 128 * 128);
+        fold(wts[ca + "k_proj.weight"], wts[ca + "q_proj.weight"], true, g2.data());
+        const std::vector<uint16_t> h1 = half(g1.data(), g1.size()), h2 = half(g2.data(), g2.size());
+        off[7 * l] = put(h1.data(), h1.size() * sizeof(uint16_t));
+        off[7 * l + 1] = put(h2.data(), h2.size() * sizeof(uint16_t));
+        const std::span<const float> w0 = wts[ca + "mlp.0.weight"], w2 = wts[ca + "mlp.2.weight"];
+        const std::vector<uint16_t> h0 = half(w0.data(), w0.size());
+        off[7 * l + 2] = put(h0.data(), h0.size() * sizeof(uint16_t));
+        for (int hc = 0; hc < 32; hc++)
+            for (int n = 0; n < 128; n++)
+                for (int j = 0; j < 32; j++)
+                    w2c[((size_t)hc * 128 + n) * 32 + j] = w2[(size_t)n * 1024 + hc * 32 + j];
+        const std::vector<uint16_t> hc2 = half(w2c.data(), w2c.size());
+        off[7 * l + 3] = put(hc2.data(), hc2.size() * sizeof(uint16_t));
+        const std::string ln[3] = {sa + "norm1.", ca + "norm1.", ca + "norm2."};
+        for (int k = 0; k < 3; k++)
+        {
+            float gb[256];
+            memcpy(gb, wts[ln[k] + "weight"].data(), 128 * sizeof(float));
+            memcpy(gb + 128, wts[ln[k] + "bias"].data(), 128 * sizeof(float));
+            off[7 * l + 4 + k] = put(gb, sizeof(gb));
+        }
+    }
+    const std::vector<uint16_t> qw = half(wts[fa + "q_proj.weight"].data(), 128 * 128),
+                                kw = half(wts[fa + "k_proj.weight"].data(), 128 * 128);
+    off[kGaQw] = put(qw.data(), qw.size() * sizeof(uint16_t));
+    off[kGaQb] = put(wts[fa + "q_proj.bias"].data(), 128 * sizeof(float));
+    off[kGaKw] = put(kw.data(), kw.size() * sizeof(uint16_t));
+    off[kGaKb] = put(wts[fa + "k_proj.bias"].data(), 128 * sizeof(float));
+    return true;
+}
+
+// PositionEmbeddingSine(64, normalize) of one window's n rows (or columns), in double: out = [n][64]
+static void gaPosTab(int n, float* out)
+{
+    for (int r = 0; r < n; r++)
+    {
+        const double a = (r + 1) / (n + 1e-6) * 2.0 * 3.14159265358979323846;
+        for (int i = 0; i < 64; i++)
+        {
+            const double v = a / pow(10000.0, 2.0 * (i / 2) / 64.0);
+            out[r * 64 + i] = (float)(i % 2 == 0 ? sin(v) : cos(v));
+        }
+    }
+}
+
+// the kernels' RTX 20 form (32-key tiles, a 2-stage weight ring) is the one NVRTC builds for sm_75 (or for
+// SMV_NATIVE_ARCH below 80): the shared memory the host grants must match it
+static bool gaTuring()
+{
+    if (g_nativeArch)
+        return g_nativeArch < 80;
+    int dev = 0, maj = 0;
+    return cudaGetDevice(&dev) == cudaSuccess &&
+           cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && maj < 8;
+}
+static int gaSmAttn()
+{
+    const int kt = gaTuring() ? 32 : 64;
+    return 4 * kt * 128 * 2 + 2 * kt * 4;
+}
+static int gaSmMlp()
+{
+    return (gaTuring() ? 2 : 3) * (32 * 256 + 128 * 32) * 2;
+}
+
+// the transformer's activations at A's scale (4 rows of the quarter's tokens; `_m`'s 2 rows of the eighth's fit
+// inside), 256-byte pieces: the fp32 residual stream, the fp16 copy after the self attention, the three projections,
+// the cross attention's normed message ([rows P][128] each)
+struct GaArena
+{
+    size_t x32 = 0, xb = 0, pj = 0, nm = 0, total = 0;
+};
+static GaArena gaArena(int w4, int h4)
+{
+    GaArena a;
+    const size_t m = (size_t)4 * w4 * h4;
+    size_t o = 0;
+    auto put = [&](size_t n) {
+        const size_t at = o;
+        o += (n + 255) & ~(size_t)255;
+        return at;
+    };
+    a.x32 = put(m * 128 * sizeof(float));
+    a.xb = put(m * 128 * sizeof(uint16_t));
+    a.pj = put(3 * m * 128 * sizeof(uint16_t));
+    a.nm = put(m * 128 * sizeof(uint16_t));
+    a.total = o;
+    return a;
+}
+
+static size_t gaNatBytes(const NativeRife& nr)
+{
+    return nr.gmfss && nr.gmW > 0 && nr.gmH > 0 ? gaArena(nr.gmW, nr.gmH).total : 0;
+}
+
+// this session's transformer module: the weights read and folded, its text compiled (or the cached cubin) and loaded,
+// its kernels bound and granted their shared memory, the weight block uploaded, the window position tables of both
+// scales uploaded (the quarter nr.gmW x nr.gmH); false = `why` (the session teardown unloads a module left in gaMod)
+static bool nativeGaModule(NativeRife& nr, std::string& why)
+{
+    if (nr.gaMod)
+        return true;
+    std::vector<uint8_t> blob;
+    if (!gaNatLoad(blob, nr.gaOff, why))
+        return false;
+    std::string text = kFnHead;
+    text += kGaA;
+    text += kGaB;
+    std::vector<char> cubin;
+    if (!nativeCubin(text.c_str(), "smv_gmflowa.cu", L"smv_gmflowa", "gmflow transformer kernels",
+                     nr.kernCacheDir.empty() ? std::wstring(L".") : nr.kernCacheDir, cubin))
+    {
+        why = "its kernels did not compile";
+        return false;
+    }
+    if (cuModuleLoadData(&nr.gaMod, cubin.data()) != CUDA_SUCCESS)
+    {
+        nr.gaMod = nullptr;
+        why = "its kernel module did not load";
+        return false;
+    }
+    for (int i = 0; i < 5; i++)
+        if (cuModuleGetFunction(&nr.fGa[i], nr.gaMod, kGaKern[i]) != CUDA_SUCCESS)
+        {
+            why = std::string("its kernel ") + kGaKern[i] + " is missing";
+            return false;
+        }
+    if (cuFuncSetAttribute(nr.fGa[kGaAttnK], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gaSmAttn()) !=
+            CUDA_SUCCESS ||
+        cuFuncSetAttribute(nr.fGa[kGaMlpK], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gaSmMlp()) != CUDA_SUCCESS)
+    {
+        why = "its kernels could not get their shared memory";
+        return false;
+    }
+    if (cudaMalloc(&nr.dGaW, blob.size()) != cudaSuccess ||
+        cudaMemcpy(nr.dGaW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its weights did not upload";
+        return false;
+    }
+    const int ah = nr.gmH / 8, aw = nr.gmW / 8, mh = nr.gmH / 4, mw = nr.gmW / 4;
+    std::vector<float> pos((size_t)(ah + aw + mh + mw) * 64);
+    gaPosTab(ah, pos.data());
+    gaPosTab(aw, pos.data() + (size_t)ah * 64);
+    gaPosTab(mh, pos.data() + (size_t)(ah + aw) * 64);
+    gaPosTab(mw, pos.data() + (size_t)(ah + aw + mh) * 64);
+    if (cudaMalloc((void**)&nr.dGaPos, pos.size() * sizeof(float)) != cudaSuccess ||
+        cudaMemcpy(nr.dGaPos, pos.data(), pos.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        why = "its position tables did not upload";
+        return false;
+    }
+    return true;
+}
+
+// one transformer scale's launches on st: scale 1 = A (maps = map4 [2][128][H][W] fp16 at the quarter, prop [2][N8][2]
+// fp16 -> xa = qf [4][P][128] fp16 + flow = flow0 [2][2][H][W] fp32), scale 0 = `_m` (maps = map8 at the eighth -> xa = mf
+// [2][P][128] + mq / mk); the activations at s (gaArena's pieces). false = a launch failed
+static bool nativeGaLaunch(NativeRife& nr, int scale, const void* maps, const void* prop, void* xa, void* flow,
+                           void* mq, void* mk, uint8_t* s, cudaStream_t st)
+{
+    int th = scale ? nr.gmH : nr.gmH / 2, tw = scale ? nr.gmW : nr.gmW / 2, S = scale ? 8 : 2; // the token grid
+    const int rows = scale ? 4 : 2, P = th * tw;
+    int M = rows * P, wh = th / S, ww = tw / S, part = scale ? 2 : 1, warp = scale, zero = 0, one = 1;
+    const unsigned att = (unsigned)((wh * ww + 127) / 128), smA = (unsigned)gaSmAttn(), smM = (unsigned)gaSmMlp();
+    float eps = kGaEps;
+    const GaArena ar = gaArena(nr.gmW, nr.gmH);
+    void *x32 = s + ar.x32, *xb = s + ar.xb, *pj0 = s + ar.pj, *nm = s + ar.nm;
+    void* pj1 = (uint8_t*)pj0 + (size_t)M * 128 * sizeof(uint16_t);
+    void* pj2 = (uint8_t*)pj0 + (size_t)M * 256 * sizeof(uint16_t);
+    const float* posY = nr.dGaPos + (scale ? 0 : (size_t)(nr.gmH / 8 + nr.gmW / 8) * 64);
+    const float* posX = posY + (size_t)wh * 64;
+    const uint8_t* wb = (const uint8_t*)nr.dGaW;
+    void* nul = nullptr;
+    auto go = [&](int k, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned sm, void** a) {
+        return cuLaunchKernel(nr.fGa[k], gx, gy, gz, bx, 1, 1, sm, (CUstream)st, a, nullptr) == CUDA_SUCCESS;
+    };
+    if (scale)
+    {
+        int h8 = th / 2, w8 = tw / 2;
+        void* a[] = {(void*)&prop, &h8, &w8, &flow};
+        if (!go(kGaFlowUpK, (unsigned)((2 * P + 255) / 256), 1, 1, 256, 0, a))
+            return false;
+    }
+    {
+        void* a[] = {(void*)&maps, &flow, (void*)&posY, (void*)&posX, &th, &tw, &wh, &ww, &warp, &x32, &xa};
+        if (!go(kGaWarpPosK, (unsigned)((P + 31) / 32), (unsigned)rows, 1, 256, 0, a))
+            return false;
+    }
+    const unsigned gm = (unsigned)((M + 63) / 64);
+    for (int l = 0; l < 6; l++)
+    {
+        int shift = l & 1;
+        const void* g1 = wb + nr.gaOff[7 * l];
+        const void* g2 = wb + nr.gaOff[7 * l + 1];
+        const void* w0 = wb + nr.gaOff[7 * l + 2];
+        const void* w2c = wb + nr.gaOff[7 * l + 3];
+        const float* lnS = (const float*)(wb + nr.gaOff[7 * l + 4]);
+        const float* lnC = (const float*)(wb + nr.gaOff[7 * l + 5]);
+        const float* ln2 = (const float*)(wb + nr.gaOff[7 * l + 6]);
+        const float *lnSb = lnS + 128, *lnCb = lnC + 128, *ln2b = ln2 + 128;
+        void* a1[] = {&xa, &M, (void*)&g1, &pj0, &nul};
+        void* a2[] = {&pj0, &xa, &pj1, &th, &tw, &S, &shift, &zero, (void*)&lnS, (void*)&lnSb, &eps, &zero, &x32, &xb};
+        void* a3[] = {&xb, &M, (void*)&g2, &pj0, &nul};
+        void* a4[] = {&pj0, &xa, &pj2, &th, &tw, &S, &shift, &part, (void*)&lnC, (void*)&lnCb, &eps, &one, &x32, &nm};
+        void* a5[] = {&xb, &nm, &M, (void*)&w0, (void*)&w2c, (void*)&ln2, (void*)&ln2b, &eps, &x32, &xa};
+        if (!go(kGaProjK, gm, 3, 1, 128, kGaSmProj, a1) ||
+            !go(kGaAttnK, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a2) ||
+            !go(kGaProjK, gm, 1, 1, 128, kGaSmProj, a3) ||
+            !go(kGaAttnK, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a4) ||
+            !go(kGaMlpK, (unsigned)((M + 127) / 128), 1, 1, 256, smM, a5))
+            return false;
+    }
+    if (!scale)
+    {
+        const void *qw = wb + nr.gaOff[kGaQw], *kw = wb + nr.gaOff[kGaKw];
+        const void *qb = wb + nr.gaOff[kGaQb], *kb = wb + nr.gaOff[kGaKb];
+        void* a6[] = {&xa, &M, (void*)&qw, &mq, (void*)&qb};
+        void* a7[] = {&mq, &M, (void*)&kw, &mk, (void*)&kb};
+        if (!go(kGaProjK, gm, 1, 1, 128, kGaSmProj, a6) || !go(kGaProjK, gm, 1, 1, 128, kGaSmProj, a7))
+            return false;
+    }
+    return true;
+}
+
+// one transformer scale on st (nr.stream) through nr.gaGraphs[scale] (chainGraphRun); the activations in the shared
+// activation block when it holds them, else dGaOwn. false = the activations or a launch failed
+static bool nativeGaRun(NativeRife& nr, int scale, const void* maps, const void* prop, void* xa, void* flow, void* mq,
+                        void* mk, cudaStream_t st)
+{
+    const GaArena ar = gaArena(nr.gmW, nr.gmH);
+    uint8_t* s = nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= ar.total ? (uint8_t*)nr.dGmCtxMem : (uint8_t*)nr.dGaOwn;
+    if (!s && cudaMalloc(&nr.dGaOwn, ar.total) == cudaSuccess)
+        s = (uint8_t*)nr.dGaOwn;
+    if (!s)
+        return false;
+    return chainGraphRun(nr.gaGraphs[scale], {s, maps, prop, xa, flow, mq, mk}, nr.gmW, nr.gmH, st,
+                         scale ? "gmfss gmflow A" : "gmfss gmflow _m",
+                         [&] { return nativeGaLaunch(nr, scale, maps, prop, xa, flow, mq, mk, s, st); });
 }
 
 static bool nativeGmfssSetup(NativeRife& nr)
@@ -17483,159 +22548,32 @@ static bool nativeGmfssSetup(NativeRife& nr)
         return bad("the half frame is not half of the padded frame");
     if (nr.ph < kGmMinPad || nr.pw < kGmMinPad)
         return bad("the padded frame is below 128 a side (gmflow's quarter-scale windows need 2 tokens a side)");
-    // one tensor: 4 dims, the expected dtype (kFLOAT unless dtOut takes the answer) and the
-    // expected shape (a negative expectation means "read it", n = the leading dim)
-    int dims[4]{};
-    auto tensor = [&](int e, const char* nm, int n, int c, int h, int w, bool* dtOut) -> bool {
-        const nvinfer1::Dims s = nr.engGm[e]->getTensorShape(nm);
-        if (s.nbDims != 4)
-        {
-            LOG("native: gmfss chain: %s %s is not a 4D tensor\n", kGmName[e], nm);
-            return false;
-        }
-        for (int i = 0; i < 4; i++)
-            dims[i] = (int)s.d[i];
-        const nvinfer1::DataType t = nr.engGm[e]->getTensorDataType(nm);
-        if (dtOut)
-            *dtOut = t == nvinfer1::DataType::kHALF;
-        if (!dtOut && t != nvinfer1::DataType::kFLOAT)
-        {
-            LOG("native: gmfss chain: %s %s is %s, the chain needs fp32\n", kGmName[e], nm, trtDtypeName(t));
-            return false;
-        }
-        if (dtOut && t != nvinfer1::DataType::kHALF && t != nvinfer1::DataType::kFLOAT)
-        {
-            LOG("native: gmfss chain: %s %s dtype %s unsupported\n", kGmName[e], nm, trtDtypeName(t));
-            return false;
-        }
-        if (dims[0] != n || (c >= 0 && dims[1] != c) || (h >= 0 && dims[2] != h) || (w >= 0 && dims[3] != w))
-        {
-            LOG("native: gmfss chain: %s %s is %dx%dx%dx%d, expected %dx%dx%dx%d\n", kGmName[e], nm, dims[0], dims[1],
-                dims[2], dims[3], n, c, h, w);
-            return false;
-        }
-        return true;
-    };
     const int hh = nr.hh, hw = nr.hw;
-    bool fh2 = false, fh3 = false, mh1 = false;
-    // feat_ext: the padded frame in, the three feature levels out (64 / 128 / 192 at stock)
-    if (!tensor(0, "x", 1, 3, nr.ph, nr.pw, nullptr))
+    // feat_ext on the host's kernels: the padded frame in, fp16 levels of 64 / 128 / 192 channels out
+    if (nr.ph % 64 || nr.pw % 64)
+        return bad("the padded frame is not a multiple of 64 (feat_ext's three stride-2 convs and the tiles)");
+    nr.gmC[0] = kFnCh[1];
+    nr.gmC[1] = kFnCh[2];
+    nr.gmC[2] = kFnCh[3];
+    nr.gmFeatHalf = true;
+    // the fused bidir GMFlow at the half, all on the host's kernels; B hands the flow out: row 0 = flow01, row 1 = flow10
+    // (so the pyramids take both at once)
+    if (!nativeGmSplitCheck(nr))
         return false;
-    if (!tensor(0, "f1", 1, -1, hh, hw, &nr.gmFeatHalf))
-        return false;
-    nr.gmC[0] = dims[1];
-    if (!tensor(0, "f2", 1, -1, hh / 2, hw / 2, &fh2))
-        return false;
-    nr.gmC[1] = dims[1];
-    if (!tensor(0, "f3", 1, -1, hh / 4, hw / 4, &fh3))
-        return false;
-    nr.gmC[2] = dims[1];
-    if (fh2 != nr.gmFeatHalf || fh3 != nr.gmFeatHalf)
-        return bad("the feature levels have mixed dtypes");
-    // the fused bidir GMFlow: both halves take the frames, B hands the flow out: row 0 = flow01, row 1 = flow10 (so
-    // the pyramids take both at once)
-    const int gh = hh, gw = hw;
-    if (!tensor(1, "img0", 1, 3, gh, gw, nullptr) || !tensor(1, "img1", 1, 3, gh, gw, nullptr) ||
-        !tensor(5, "img0", 1, 3, gh, gw, nullptr) || !tensor(5, "img1", 1, 3, gh, gw, nullptr) ||
-        !tensor(6, "img0", 1, 3, gh, gw, nullptr))
-        return false;
-    if (!tensor(5, "flow", 2, 2, gh, gw, nullptr) || !nativeGmSplitCheck(nr))
-        return false;
-    if (!tensor(2, "i0", 1, 3, hh, hw, nullptr) || !tensor(2, "i1", 1, 3, hh, hw, nullptr) ||
-        !tensor(2, "f01", 1, 2, hh, hw, nullptr) || !tensor(2, "f10", 1, 2, hh, hw, nullptr))
-        return false;
-    if (!tensor(2, "m0", 1, 1, hh, hw, &nr.gmMetricHalf))
-        return false;
-    if (!tensor(2, "m1", 1, 1, hh, hw, &mh1))
-        return false;
-    if (mh1 != nr.gmMetricHalf)
-        return bad("the two metrics have different dtypes");
-    // the GMFSS IFNet: the 6-plane half buffer and the scalar timestep in, `rife` out
-    if (!tensor(3, "x", 1, 6, hh, hw, nullptr) || !tensor(3, "merged", 1, 3, hh, hw, nullptr))
-        return false;
-    {
-        const nvinfer1::Dims s = nr.engGm[3]->getTensorShape("timestep");
-        if (s.nbDims != 4 || s.d[0] != 1 || s.d[1] != 1 || s.d[2] != 1 || s.d[3] != 1 ||
-            nr.engGm[3]->getTensorDataType("timestep") != nvinfer1::DataType::kFLOAT)
-            return bad("the ifnet timestep is not a 1x1x1x1 fp32 value");
-    }
-    // fusionnet: the concats are adjacent planes, so b / c / d are exactly 2x the feature levels; k_splatNorm writes
-    // them in the engine's dtype (fp16: its store rounds to nearest even, as an ONNX Cast to fp16 does)
-    bool ch = false, dh = false;
-    if (!tensor(4, "a", 1, 9, hh, hw, nullptr) || !tensor(4, "b", 1, 2 * nr.gmC[0], hh, hw, &nr.gmFuseHalf) ||
-        !tensor(4, "c", 1, 2 * nr.gmC[1], hh / 2, hw / 2, &ch) ||
-        !tensor(4, "d", 1, 2 * nr.gmC[2], hh / 4, hw / 4, &dh))
-        return false;
-    if (ch != nr.gmFuseHalf || dh != nr.gmFuseHalf)
-        return bad("the fusionnet feature inputs have mixed dtypes");
-    // the splats' layouts: feat_ext's f1 / f2 / f3 and fusionnet's b / c / d all linear (an engine built without
-    // lkBuild's channels-last request) or all channels-last fp16 (HWC8 / HWC16: plain NHWC at these channel counts, every
-    // one a multiple of 16), so the feature splats read and write [n][C] (k_gsGatherNhwc)
-    {
-        int nl = 0, nc = 0;
-        auto layout = [&](int e, const char* nm) {
-            const nvinfer1::TensorFormat f = nr.engGm[e]->getTensorFormat(nm);
-            nl += f == nvinfer1::TensorFormat::kLINEAR;
-            nc += (f == nvinfer1::TensorFormat::kHWC8 || f == nvinfer1::TensorFormat::kHWC16) &&
-                  nr.engGm[e]->getTensorDataType(nm) == nvinfer1::DataType::kHALF;
-        };
-        for (const char* nm : {"f1", "f2", "f3"})
-            layout(0, nm);
-        for (const char* nm : {"b", "c", "d"})
-            layout(4, nm);
-        const bool c16 = nr.gmC[0] % 16 == 0 && nr.gmC[1] % 16 == 0 && nr.gmC[2] % 16 == 0;
-        if (nl != 6 && (nc != 6 || !c16))
-            return bad("the feature levels and the fusionnet inputs are not all linear or all channels-last fp16");
-        nr.gmFeatHwc = nc == 6;
-    }
-    // fusionnet's tail: the full graph writes the frame (`out` 3 x ph x pw); the cut graph (trt_runtime's
-    // fusion_tail_cut) stops before its pixel shuffle (`out` = the 64 -> 256 conv at the half, fp16) and hands
-    // conv_last's weight and bias out as w_last / b_last, and k_fuTail does the shuffle + conv_last (fp32 sums, the
-    // frame in fp32, straight into dGmF)
-    {
-        const nvinfer1::Dims so = nr.engGm[4]->getTensorShape("out");
-        nr.gmTail = so.nbDims == 4 && so.d[1] == 256;
-    }
-    if (nr.gmTail)
-    {
-        auto out16 = [&](const char* nm, int nb, const int* d) {
-            const nvinfer1::Dims s = nr.engGm[4]->getTensorShape(nm);
-            if (s.nbDims != nb || nr.engGm[4]->getTensorIOMode(nm) != nvinfer1::TensorIOMode::kOUTPUT ||
-                nr.engGm[4]->getTensorDataType(nm) != nvinfer1::DataType::kHALF)
-                return false;
-            for (int i = 0; i < nb; i++)
-                if (s.d[i] != d[i])
-                    return false;
-            return true;
-        };
-        const int dOut[4] = {1, 256, hh, hw}, dW[4] = {3, 64, 3, 3}, dB[1] = {3};
-        // trt_runtime's fusion_input_lrelu: b / c / d without their LeakyRelus, the slopes as lr_bcd (fp32 [3])
-        const int nio = nr.engGm[4]->getNbIOTensors();
-        const bool lr = nio == 8;
-        if (lr)
-        {
-            const nvinfer1::Dims s = nr.engGm[4]->getTensorShape("lr_bcd");
-            if (s.nbDims != 1 || s.d[0] != 3 ||
-                nr.engGm[4]->getTensorIOMode("lr_bcd") != nvinfer1::TensorIOMode::kOUTPUT ||
-                nr.engGm[4]->getTensorDataType("lr_bcd") != nvinfer1::DataType::kFLOAT)
-                return bad("the cut fusionnet's eighth tensor is not lr_bcd, 3 fp32");
-        }
-        if ((nio != 7 && !lr) || !out16("out", 4, dOut) || !out16("w_last", 4, dW) || !out16("b_last", 1, dB))
-            return bad("the cut fusionnet's outputs are not out 1x256 at the half, w_last 3x64x3x3 and b_last 3, fp16");
-        // out's layout: linear [256][hh][hw] (an engine built without lkBuild's channels-last request) or HWC8 /
-        // HWC16, both plain NHWC [hh][hw][256] at 256 channels; SMV_FU_HWC=fail = an unknown one (the refusal's trigger)
-        const nvinfer1::TensorFormat of =
-            lkEnv("SMV_FU_HWC") == "fail" ? nvinfer1::TensorFormat::kCHW2 : nr.engGm[4]->getTensorFormat("out");
-        if (of != nvinfer1::TensorFormat::kLINEAR && of != nvinfer1::TensorFormat::kHWC8 &&
-            of != nvinfer1::TensorFormat::kHWC16)
-            return bad("the cut fusionnet's out is in a layout the fusion tail cannot read");
-        nr.gmTailHwc = of != nvinfer1::TensorFormat::kLINEAR;
-        nr.gmOutHalf = false;
-    }
-    else if (nr.engGm[4]->getNbIOTensors() != 5)
-        return bad("fusionnet has other tensors than a, b, c, d and out");
-    else if (!tensor(4, "out", 1, 3, nr.ph, nr.pw, &nr.gmOutHalf))
-        return false;
+    // metricnet on the host's kernels: the motion halves and both flows in, m0 / m1 fp16 out
+    nr.gmMetricHalf = true;
+    // the GMFSS IFNet on the host's kernels (the half = the /64 pad / 2, so its 1 / 32 level is whole): the 6-plane half
+    // buffer and the fp32 timestep in, `rife` (3 fp32 planes) out; its weights and module are loaded below
+    // fusionnet on the host's kernels (its module and weights are loaded below): the concats are adjacent planes, so b /
+    // c / d are exactly 2x the feature levels, written channels-last fp16 by the feature splats (k_gsGatherNhwc, the
+    // heads' first PReLU in their stores) beside feat_ext's channels-last levels; its out = the 64 -> 256 conv before
+    // the pixel shuffle, channels-last fp16, which k_fuTailNhwc shuffles and runs conv_last on (fp32 sums, the frame in
+    // fp32, straight into dGmF)
+    nr.gmFuseHalf = true;
+    nr.gmFeatHwc = true;
+    nr.gmTail = true;
+    nr.gmTailHwc = true;
+    nr.gmOutHalf = false;
 
     const size_t hp = (size_t)hh * hw, qp = hp / 4, ep = hp / 16;
     const size_t plane = (size_t)nr.ph * nr.pw;
@@ -17659,6 +22597,122 @@ static bool nativeGmfssSetup(NativeRife& nr)
         for (int l = 0; l < 3; l++)
             NCHK(cudaMalloc(&nr.dGmFeat[s][l], (size_t)nr.gmC[l] * (l == 0 ? hp : (l == 1 ? qp : ep)) * fe),
                  "alloc gmfss features");
+    // feat_ext's module and weights, its scratch in the shared activation block when that holds it
+    {
+        std::string why;
+        if (!nativeFnModule(nr, why))
+        {
+            LOG("native: gmfss chain: feat_ext unavailable (%s)\n", why.c_str());
+            return false;
+        }
+        const size_t fb = fnNatBytes(nr, nr.gmFeatHwc);
+        if (nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= fb)
+            nr.dFnScr = nr.dGmCtxMem;
+        else
+        {
+            NCHK(cudaMalloc(&nr.dFnOwn, fb), "alloc gmfss feat_ext scratch");
+            nr.dFnScr = nr.dFnOwn;
+        }
+        LOG("native: gmfss feat_ext on the host's kernels (fp16 sums, %s levels; its %.0f MB of activations %s)\n",
+            nr.gmFeatHwc ? "channels-last" : "planar", fb / 1048576.0,
+            nr.dFnOwn ? "on their own" : "in the shared activation block");
+    }
+    // metricnet's module and weights, its scratch in the shared activation block when that holds it
+    {
+        std::string why;
+        if (!nativeMnModule(nr, why))
+        {
+            LOG("native: gmfss chain: metricnet unavailable (%s)\n", why.c_str());
+            return false;
+        }
+        const size_t mb = mnNatBytes(nr);
+        if (!(nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= mb))
+            NCHK(cudaMalloc(&nr.dMnOwn, mb), "alloc gmfss metricnet scratch");
+        LOG("native: gmfss metricnet on the host's kernels (fp16 sums; its %.0f MB of activations %s)\n",
+            mb / 1048576.0, nr.dMnOwn ? "on their own" : "in the shared activation block");
+    }
+    // the GMFSS IFNet's module and weights, its scratch in the shared activation block when that holds it
+    {
+        std::string why;
+        if (!nativeGiModule(nr, why))
+        {
+            LOG("native: gmfss chain: the GMFSS IFNet unavailable (%s)\n", why.c_str());
+            return false;
+        }
+        const size_t gb = giNatBytes(nr);
+        if (!(nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= gb))
+            NCHK(cudaMalloc(&nr.dGiOwn, gb), "alloc gmfss ifnet scratch");
+        LOG("native: gmfss ifnet on the host's kernels (fp32 sums; its %.0f MB of activations %s)\n", gb / 1048576.0,
+            nr.dGiOwn ? "on their own" : "in the shared activation block");
+        nr.giGraphs.mode = chainGraphMode("SMV_GI_GRAPH");
+    }
+    // fusionnet's module, weights and conv_last, its activations in the shared activation block when that holds them
+    {
+        std::string why;
+        if (!nativeFuModule(nr, why))
+        {
+            LOG("native: gmfss chain: fusionnet unavailable (%s)\n", why.c_str());
+            return false;
+        }
+        const size_t ub = fuNatBytes(nr);
+        if (!(nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= ub))
+            NCHK(cudaMalloc(&nr.dFuOwn, ub), "alloc gmfss fusionnet activations");
+        LOG("native: gmfss fusionnet on the host's kernels (fp16 sums, head0's first conv fp32; its %.0f MB of "
+            "activations %s)\n",
+            ub / 1048576.0, nr.dFuOwn ? "on their own" : "in the shared activation block");
+        nr.fuGraphs.mode = chainGraphMode("SMV_FU_GRAPH");
+    }
+    // gmflow B's module and weights, its activations in the shared activation block when that holds them
+    {
+        std::string why;
+        if (!nativeGbModule(nr, why))
+        {
+            LOG("native: gmfss chain: gmflow B unavailable (%s)\n", why.c_str());
+            return false;
+        }
+        const size_t bb = gbNatBytes(nr);
+        if (!(nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= bb))
+            NCHK(cudaMalloc(&nr.dGbOwn, bb), "alloc gmfss gmflow B activations");
+        LOG("native: gmfss gmflow B on the host's kernels (fp16 sums in its 3 x 3 conv; its %.0f MB of activations %s)\n",
+            bb / 1048576.0, nr.dGbOwn ? "on their own" : "in the shared activation block");
+        nr.gbGraphs.mode = chainGraphMode("SMV_GB_GRAPH");
+    }
+    // gmflow backbone's module and weights, its activations in the shared activation block when that holds them
+    {
+        std::string why;
+        if (!nativeBbModule(nr, why))
+        {
+            LOG("native: gmfss chain: gmflow's backbone unavailable (%s)\n", why.c_str());
+            return false;
+        }
+        const size_t kb = bbNatBytes(nr);
+        if (!(nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= kb))
+            NCHK(cudaMalloc(&nr.dBbOwn, kb), "alloc gmfss gmflow backbone activations");
+        LOG("native: gmfss gmflow backbone on the host's kernels (fp16 sums in its 3 x 3 convs; its %.0f MB of "
+            "activations %s)\n",
+            kb / 1048576.0, nr.dBbOwn ? "on their own" : "in the shared activation block");
+        nr.bbGraphs.mode = chainGraphMode("SMV_BB_GRAPH");
+    }
+    // gmflow's transformer (A and `_m`): its module, weights and window tables; its activations in the shared activation
+    // block when that holds them; A takes the propagation's output in fp16
+    {
+        std::string why;
+        if (!nr.gmPropHalf)
+            why = "the propagated flow is not fp16";
+        if (!nr.gmPropHalf || !nativeGaModule(nr, why))
+        {
+            LOG("native: gmfss chain: gmflow's transformer unavailable (%s)\n", why.c_str());
+            return false;
+        }
+        const size_t ab = gaNatBytes(nr);
+        if (!(nr.dGmCtxMem && (size_t)nr.gmCtxMemB >= ab))
+            NCHK(cudaMalloc(&nr.dGaOwn, ab), "alloc gmfss gmflow transformer activations");
+        LOG("native: gmfss gmflow A and _m on the host's kernels (fp16 sums but in P v'; %s; their %.0f MB of activations "
+            "%s)\n",
+            gaTuring() ? "32-key tiles, a 2-stage weight ring" : "64-key tiles, a 3-stage weight ring", ab / 1048576.0,
+            nr.dGaOwn ? "on their own" : "in the shared activation block");
+        nr.gaGraphs[0].mode = nr.gaGraphs[1].mode = chainGraphMode("SMV_GA_GRAPH");
+    }
     NCHK(cudaMalloc((void**)&nr.dGmHalf, 6 * hp * sizeof(float)), "alloc gmfss halves");
     NCHK(cudaMalloc((void**)&nr.dGmFlow, 4 * hp * sizeof(float)), "alloc gmfss flow");
     NCHK(cudaMalloc(&nr.dGmMetric, 2 * hp * me), "alloc gmfss metric");
@@ -17686,70 +22740,27 @@ static bool nativeGmfssSetup(NativeRife& nr)
     if (!nr.gmTail)
         NCHK(cudaMalloc(&nr.dGmOut, 3 * plane * oe), "alloc gmfss fusion out");
     NCHK(cudaMalloc((void**)&nr.dGmF, 3 * plane * sizeof(float)), "alloc gmfss model frame");
-    if (nr.gmTail)
-    {
-        // conv_last's weight and bias reach k_fuTail as the engine's outputs, bound to these session buffers on every
-        // tween (the warm-up freed its own); one run here proves the engine writes them
-        const size_t wB = trtTensorBytes(nr.engGm[4], "w_last"), bB = trtTensorBytes(nr.engGm[4], "b_last");
-        NCHK(cudaMalloc(&nr.dGmWl, wB), "alloc gmfss conv_last weight");
-        NCHK(cudaMalloc(&nr.dGmBl, bB), "alloc gmfss conv_last bias");
-        NCHK(cudaMemset(nr.dGmWl, 0, wB), "clear gmfss conv_last weight");
-        NCHK(cudaMemset(nr.dGmBl, 0, bB), "clear gmfss conv_last bias");
-        nvinfer1::IExecutionContext* c = nr.ctxGm[4];
-        c->setTensorAddress("a", nr.dGmFa);
-        c->setTensorAddress("b", nr.dGmFb);
-        c->setTensorAddress("c", nr.dGmFc);
-        c->setTensorAddress("d", nr.dGmFd);
-        c->setTensorAddress("out", nr.dGmAcc);
-        c->setTensorAddress("w_last", nr.dGmWl);
-        c->setTensorAddress("b_last", nr.dGmBl);
-        const bool lr = nr.engGm[4]->getNbIOTensors() == 8;
-        if (lr)
-        {
-            NCHK(cudaMalloc(&nr.dGmLr, 3 * sizeof(float)), "alloc gmfss fusion input slopes");
-            NCHK(cudaMemset(nr.dGmLr, 0, 3 * sizeof(float)), "clear gmfss fusion input slopes");
-            c->setTensorAddress("lr_bcd", nr.dGmLr);
-        }
-        if (wB != 3 * 64 * 9 * 2 || bB != 3 * 2 || !c->enqueueV3(nr.stream))
-            return bad("the cut fusionnet's probe run did not start");
-        NCHK(cudaStreamSynchronize(nr.stream), "gmfss cut fusionnet probe run");
-        if (lr)
-        {
-            NCHK(cudaMemcpy(nr.gmLr, nr.dGmLr, 3 * sizeof(float), cudaMemcpyDeviceToHost), "read gmfss fusion slopes");
-            for (float a : nr.gmLr)
-                if (!(a > 0.0f && a <= 1.0f))
-                    return bad("the cut fusionnet's lr_bcd slopes are not in (0, 1]");
-        }
-        unsigned short wb[3 * 64 * 9 + 3] = {};
-        NCHK(cudaMemcpy(wb, nr.dGmWl, wB, cudaMemcpyDeviceToHost), "read gmfss conv_last weight");
-        NCHK(cudaMemcpy(wb + 3 * 64 * 9, nr.dGmBl, bB, cudaMemcpyDeviceToHost), "read gmfss conv_last bias");
-        bool any = false;
-        for (unsigned short v : wb)
-            any = any || v != 0;
-        if (!any)
-            return bad("the cut fusionnet wrote no conv_last weight");
-    }
     // the pair's scratch (A's qf / flow0, the local correlation, the matching operands and flow, the propagated flow;
     // with encPost the SDR view and the motion halves) is written and read inside nativeGmfssPair only, and the
     // accumulator under the gather splats inside nativeGmfssTween only (the cut out, written before it is read), both
     // on nr.stream: so the scratch is carved from the accumulator when it fits (256-B aligned), else it gets its own
     // buffers (SMV_GM_SCRATCH=own)
-    static const char* const kGmM[3] = {"mf", "mq", "mk"};
     struct Scratch
     {
         void** p;
         size_t bytes;
         const char* what;
     };
+    const size_t q4 = (size_t)nr.gmH * nr.gmW;
     std::vector<Scratch> scr;
-    for (int i = 0; i < kGmAn; i++)
-        scr.push_back({&nr.dGmA[i], trtTensorBytes(nr.engGm[1], kGmA[i]), "alloc gmfss split tensors"});
+    scr.push_back({&nr.dGmA[0], 4 * q4 * 128 * sizeof(uint16_t), "alloc gmfss split tensors"});
+    scr.push_back({&nr.dGmA[1], 2 * 2 * q4 * sizeof(float), "alloc gmfss split tensors"});
     scr.push_back(
         {(void**)&nr.dGmCorr, (size_t)2 * nr.gmH * nr.gmW * nr.gmK * sizeof(float), "alloc gmfss local correlation"});
     for (int i = 0; i < 3; i++)
-        scr.push_back({&nr.dGmM[i], trtTensorBytes(nr.engGm[7], kGmM[i]), "alloc gmfss matching operands"});
+        scr.push_back({&nr.dGmM[i], (size_t)2 * nr.gmN8 * 128 * sizeof(uint16_t), "alloc gmfss matching operands"});
     scr.push_back({(void**)&nr.dGmFlow8, (size_t)2 * nr.gmN8 * 2 * sizeof(float), "alloc gmfss matching flow"});
-    scr.push_back({&nr.dGmProp, trtTensorBytes(nr.engGm[1], "prop"), "alloc gmfss propagated flow"});
+    scr.push_back({&nr.dGmProp, (size_t)2 * nr.gmN8 * 2 * sizeof(uint16_t), "alloc gmfss propagated flow"});
     if (nr.encPost)
     {
         scr.push_back({(void**)&nr.dGmEnc, 3 * plane * sizeof(float), "alloc gmfss SDR view"});
@@ -17773,7 +22784,8 @@ static bool nativeGmfssSetup(NativeRife& nr)
         nr.gmScratchInAcc ? "inside the splat accumulator" : "in its own buffers");
     for (int i = 0; i < 2; i++)
     {
-        const size_t bytes = trtTensorBytes(nr.engGm[1], i ? "map8" : "map4");
+        // map4 / map8: both frames' [2, 128, H, W] fp16 at the quarter / the eighth
+        const size_t bytes = (size_t)2 * 128 * (i ? q4 / 4 : q4) * sizeof(uint16_t);
         NCHK(cudaMalloc(&nr.dGmMap[i], bytes), "alloc gmfss backbone maps");
         nr.gmMapSlot[i] = bytes / 2;
     }
@@ -17797,17 +22809,11 @@ static bool nativeGmfssSetup(NativeRife& nr)
                        : "on the host (k_fuTail: pixel shuffle + conv_last, fp32)");
     LOG("native: gmfss chain: feature splats %s\n",
         nr.gmFeatHwc ? "channels-last (k_gsGatherNhwc: feat_ext's levels and fusionnet's b / c / d NHWC)" : "planar");
-    if (nr.dGmLr)
-        LOG("native: gmfss chain: fusionnet's input LeakyRelu in the feature splats' stores (slopes %.9g / %.9g / "
-            "%.9g)\n",
-            nr.gmLr[0], nr.gmLr[1], nr.gmLr[2]);
-    else
-        LOG("native: gmfss chain: fusionnet's input LeakyRelu in the engine\n");
+    LOG("native: gmfss chain: fusionnet's input LeakyRelu in the feature splats' stores (slopes %.9g / %.9g / %.9g)\n",
+        nr.gmLr[0], nr.gmLr[1], nr.gmLr[2]);
     LOG("native: gmfss chain: gmflow split, its local correlation in one kernel (%dx%d, %d samples a pixel)\n", nr.gmW,
         nr.gmH, nr.gmK);
     LOG("native: gmfss chain: the global matching by k_attn2 (%d tokens a frame)\n", nr.gmN8);
-    LOG("native: gmfss chain: gmflow A in the %s form\n",
-        lkGmEdgeOf(nr.gmPath[kGmFlowSlot]).empty() ? "edge" : "masked");
     nr.gmProf = GetEnvironmentVariableW(L"SMV_LIVE_GMFSS_PROF", nullptr, 0) != 0;
     if (nr.gmProf)
         for (auto& e : nr.gmEv)
@@ -18067,392 +23073,128 @@ static bool nativeRifeBlendOut(NativeRife& nr, const void* pic, int half, int k,
                           (CUstream)st, half ? a : a32, nullptr) == CUDA_SUCCESS;
 }
 
-static bool nativeTrtInit(NativeRife& nr)
+static bool nativeModelInit(NativeRife& nr)
 {
-    // resident host: the same engine pair stays loaded across sessions, only the two
-    // execution contexts are recreated (measured: engine deserialize 0.10 s +
-    // jit cache 1.0 to 3.5 s per start against 0.3 to 0.8 s for the contexts alone)
-    // live Restore: a --restore-model engine loads beside the pair when the handoff
-    // named one, its dtypes read off the engine (fp16 or fp32), and one warm enqueue on zeros so the
-    // first presented frame pays no kernel specialisation (the merged jit cache makes that cheap);
-    // the bundled Real-ESRGAN = restNatSetup instead
-    auto dt = [](nvinfer1::ICudaEngine* e, const char* n) { return e->getTensorDataType(n); };
-    // Restore on the host's kernels: no engine to load
+    // every net runs on the host's kernels: per session their modules and weights (the ready steps below), the tween
+    // buffers and the shared activation block; the resident host keeps the dtypes across sessions
+    // Restore on the host's kernels: the bundled Real-ESRGAN or AnimeJaNai's form (restNatSetup)
     nr.restNatKind = nr.restorePath == kRestNative ? 1 : (nr.restorePath == kRestNativeAj ? 2 : 0);
     nr.restNat = nr.restNatKind != 0;
+    // RIFE's IFNet on the host's kernels: no engine either
+    nr.ifnNat = nr.ifnetPath == kIfnNative;
     auto restoreReady = [&]() -> bool {
         if (nr.restNat)
             return restNatSetup(nr);
-        if (!nr.engRest)
+        if (nr.restorePath.empty())
             return true;
-        // one input and one output, their names read off the engine (AnimeJaNai: input / output)
-        nr.restIn.clear();
-        nr.restOut.clear();
-        for (int i = 0; i < nr.engRest->getNbIOTensors(); i++)
-        {
-            const char* n = nr.engRest->getIOTensorName(i);
-            (nr.engRest->getTensorIOMode(n) == nvinfer1::TensorIOMode::kINPUT ? nr.restIn : nr.restOut) = n;
-        }
-        if (nr.engRest->getNbIOTensors() != 2 || nr.restIn.empty() || nr.restOut.empty())
-        {
-            LOG("native: restore engine is not one input and one output\n");
-            return false;
-        }
-        const auto xd = dt(nr.engRest, nr.restIn.c_str()), yd = dt(nr.engRest, nr.restOut.c_str());
-        if (xd == nvinfer1::DataType::kHALF)
-            nr.restHalfIn = true;
-        else if (xd == nvinfer1::DataType::kFLOAT)
-            nr.restHalfIn = false;
-        else
-        {
-            LOG("native: restore engine input dtype unsupported\n");
-            return false;
-        }
-        if (yd == nvinfer1::DataType::kHALF)
-            nr.restHalfOut = true;
-        else if (yd == nvinfer1::DataType::kFLOAT)
-            nr.restHalfOut = false;
-        else
-        {
-            LOG("native: restore engine output dtype unsupported\n");
-            return false;
-        }
-        nvinfer1::Dims4 din{1, 3, srcH(nr), srcW(nr)};
-        if (!nr.ctxRest->setInputShape(nr.restIn.c_str(), din))
-        {
-            LOG("native: restore setInputShape rejected (engine built for another size)\n");
-            return false;
-        }
-        // the scale = the output's width over the input's (one integer factor on both axes, at most 4: dRestTmp); an
-        // output of 3 s^2 planes at the input size = the graph ends before its PixelShuffle + nearest-base add,
-        // which the fold then does (k_restFoldHSub)
-        const nvinfer1::Dims od = nr.ctxRest->getTensorShape(nr.restOut.c_str());
-        nr.restSub = false;
-        if (od.nbDims == 4 && od.d[2] == srcH(nr) && od.d[3] == srcW(nr))
-            for (int s = 2; s <= 4; s++)
-                if (od.d[1] == 3LL * s * s)
-                {
-                    nr.restSub = true;
-                    nr.restScale = nr.restSubS = s;
-                    nr.restSubW = srcW(nr);
-                    nr.restSubH = srcH(nr);
-                    nr.restSubBase = true;
-                }
-        if (!nr.restSub)
-            nr.restScale = od.nbDims == 4 && od.d[3] % srcW(nr) == 0 ? (int)(od.d[3] / srcW(nr)) : 0;
-        if (!nr.restSub &&
-            (nr.restScale < 1 || nr.restScale > 4 || od.d[1] != 3 || od.d[2] != (int64_t)nr.restScale * srcH(nr)))
-        {
-            LOG("native: restore engine output shape is neither 3 x (s*h) x (s*w) nor 3 s^2 x h x w, s 1 to 4\n");
-            return false;
-        }
-        // the input and output in the engine's own dtypes (fp16 as exported), so they are sized here, once the engine
-        // is known
-        const size_t sp = (size_t)srcW(nr) * srcH(nr);
-        const size_t inBytes = 3 * sp * (nr.restHalfIn ? sizeof(uint16_t) : sizeof(float));
-        const size_t outBytes =
-            3 * (size_t)nr.restScale * nr.restScale * sp * (nr.restHalfOut ? sizeof(uint16_t) : sizeof(float));
-        if (!nr.dRestIn)
-            NCHK(cudaMalloc(&nr.dRestIn, inBytes), "alloc restore input");
-        if (!nr.dRestOut)
-            NCHK(cudaMalloc(&nr.dRestOut, outBytes), "alloc restore output");
-        NCHK(cudaMemsetAsync(nr.dRestIn, 0, inBytes, nr.stream), "restore warm-up clear");
-        nr.ctxRest->setTensorAddress(nr.restIn.c_str(), nr.dRestIn);
-        nr.ctxRest->setTensorAddress(nr.restOut.c_str(), nr.dRestOut);
-        if (!nr.ctxRest->enqueueV3(nr.stream))
-        {
-            LOG("native: restore warm-up enqueue failed\n");
-            return false;
-        }
-        NCHK(cudaStreamSynchronize(nr.stream), "restore warm-up sync");
-        return true;
+        LOG("native: the Restore model %s does not run on the host's kernels\n", nr.restorePath.c_str());
+        return false;
     };
-    // native DRBA: the block0 engine loads beside the pair like the restore
-    // engine (resident per path; any session without DRBA drops it, nothing of another route
-    // idles in VRAM), its fp32 contract read off the engine, one warm enqueue on zeros
+    // native DRBA: block0's module and weights (nativeB0Module), per session; it reads the IFNet's encode ring in the
+    // IFNet's feature dtype
     auto block0Ready = [&]() -> bool {
         if (!nr.drba)
-        {
-            if (g_res.engB0)
-            {
-                delete g_res.engB0;
-                g_res.engB0 = nullptr;
-                g_res.block0Path.clear();
-            }
             return true;
-        }
-        if (g_resident && g_res.engB0 && g_res.block0Path == nr.block0Path)
+        std::string why;
+        if (!nativeB0Module(nr, why))
         {
-            nr.engB0 = g_res.engB0;
-            if (!nativeMakeContext(nr, nr.engB0, &nr.cfgB0, &nr.ctxB0))
-                return false;
-        }
-        else
-        {
-            if (g_res.engB0)
-            {
-                delete g_res.engB0;
-                g_res.engB0 = nullptr;
-                g_res.block0Path.clear();
-            }
-            nr.engB0 = nativeLoadEngine(nr, nr.block0Path, &nr.cfgB0, &nr.ctxB0);
-            if (!nr.engB0)
-                return false;
-            if (g_resident)
-            {
-                g_res.engB0 = nr.engB0;
-                g_res.block0Path = nr.block0Path;
-            }
-        }
-        for (const char* n : {"img0", "img1", "flow"})
-            if (dt(nr.engB0, n) != nvinfer1::DataType::kFLOAT)
-            {
-                LOG("native: block0 tensor %s is not fp32\n", n);
-                return false;
-            }
-        // block0 reads the same encode ring as the IFNet: its f0 / f1 dtype must match
-        const auto bfd = nr.featHalf ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kFLOAT;
-        if (dt(nr.engB0, "f0") != bfd || dt(nr.engB0, "f1") != bfd)
-        {
-            LOG("native: block0 f0 / f1 dtype differs from the IFNet's\n");
+            LOG("native: drba: block0 unavailable (%s)\n", why.c_str());
             return false;
         }
+        LOG("native: drba: block0 on the host's kernels\n");
         return true;
     };
-    // the warm-up after the contexts' shared block is set (nativeModelShareMemory)
-    auto block0Warm = [&]() -> bool { return !nr.ctxB0 || nativeWarmEngine(nr, nr.engB0, nr.ctxB0, "block0", "drba"); };
-    // the RIFE family's contexts on one activation block: every context below is made user-managed, the block follows
-    // once they all exist
-    const bool modelShare = lkEnv("SMV_CTXSHARE") != "0";
-    auto shareReady = [&]() -> bool {
-        nr.ctxUserMem = false;
-        return !modelShare || nativeModelShareMemory(nr);
+    // RIFE's IFNet: its module and weights (nativeIfnModule), per session
+    auto ifnReady = [&]() -> bool {
+        if (!nr.ifnNat)
+            return true;
+        std::string why;
+        if (!nativeIfnModule(nr, why))
+        {
+            LOG("native: rife: the IFNet unavailable (%s)\n", why.c_str());
+            return false;
+        }
+        LOG("native: rife: the IFNet on the host's kernels\n");
+        nr.ifnGraphs.mode = chainGraphMode("SMV_IFN_GRAPH");
+        return true;
     };
-    // GMFSS: the five-engine set, resident like the pair (the same paths =
-    // reuse, contexts recreated; anything else frees whatever set was resident and loads this
-    // one), each engine warmed once on zeros; the restore engine is per session here. The warm
-    // enqueue also leaves every static input shape set on the context, which is why the chain
-    // itself only sets tensor ADDRESSES per group. nativeGmfssSetup then reads the contract off
-    // the engines and allocates the chain's buffers (per session, freed in nativeFree).
+    // the RIFE family's nets on one activation block, set once they all exist
+    const bool modelShare = lkEnv("SMV_CTXSHARE") != "0";
+    auto shareReady = [&]() -> bool { return !modelShare || nativeModelShareMemory(nr); };
+    // GMFSS: every net on the host's kernels. nativeGmfssSetup allocates the chain's buffers (per session, freed in
+    // nativeFree).
     if (nr.gmfss)
     {
         const int64_t t0 = nowQpc100();
         size_t freeB = 0, freeA = 0, totB = 0;
         cudaMemGetInfo(&freeB, &totB);
-        bool same = g_resident && g_res.rt;
-        for (int i = 0; i < kGmN && same; i++)
-            same = g_res.engGm[i] && g_res.gmPath[i] == nr.gmPath[i];
         const bool gmShare = lkEnv("SMV_GM_CTXSHARE") != "0";
-        nr.ctxUserMem = gmShare;
-        if (same)
-        {
-            nr.rt = g_res.rt;
-            nr.jit = g_res.jit;
-            for (int i = 0; i < kGmN; i++)
-            {
-                nr.engGm[i] = g_res.engGm[i];
-                if (!nativeMakeContext(nr, nr.engGm[i], &nr.cfgGm[i], &nr.ctxGm[i]))
-                    return false;
-            }
-        }
-        else
-        {
-            if (g_resident && g_res.rt)
-                residentFreeEngines(); // the RIFE pair or another set
-            nr.rt = nvinfer1::createInferRuntime(g_nativeTrtLogger);
-            if (!nr.rt)
-            {
-                LOG("native: createInferRuntime failed\n");
-                return false;
-            }
-            for (int i = 0; i < kGmN; i++)
-            {
-                nr.engGm[i] = nativeLoadEngine(nr, nr.gmPath[i], &nr.cfgGm[i], &nr.ctxGm[i]);
-                if (!nr.engGm[i])
-                    return false;
-            }
-        }
-        if (g_res.engRest)
-        {
-            delete g_res.engRest;
-            g_res.engRest = nullptr;
-            g_res.restorePath.clear();
-        }
-        if (!nr.restorePath.empty() && !nr.restNat)
-        {
-            nr.engRest = nativeLoadEngine(nr, nr.restorePath, &nr.cfgRest, &nr.ctxRest);
-            if (!nr.engRest)
-                return false;
-        }
-        nr.ctxUserMem = false;
         if (gmShare && !nativeGmShareMemory(nr))
             return false;
-        for (int i = 0; i < kGmN; i++)
-            if (!nativeWarmEngine(nr, nr.engGm[i], nr.ctxGm[i], kGmName[i]))
-                return false;
         if (!restoreReady())
             return false;
         cudaMemGetInfo(&freeA, &totB);
-        LOG("native: gmfss engine set %s in %.2f s, VRAM %+.0f MB\n",
-            same ? "reused (resident), contexts recreated" : "loaded", (nowQpc100() - t0) / 1e7,
+        LOG("native: gmfss ready in %.2f s, VRAM %+.0f MB\n", (nowQpc100() - t0) / 1e7,
             ((double)freeB - (double)freeA) / 1048576.0);
         if (!nativeGmfssSetup(nr))
             return false;
         if (g_resident)
         {
-            g_res.rt = nr.rt;
-            g_res.jit = nr.jit;
+            g_res.ready = true; // the host stays resident after a GMFSS session too (no IFNet to reuse)
             g_res.dev = nr.dev;
-            for (int i = 0; i < kGmN; i++)
-            {
-                g_res.engGm[i] = nr.engGm[i];
-                g_res.gmPath[i] = nr.gmPath[i];
-            }
             g_res.ifnetPath.clear();
-            g_res.jitPath.clear();
         }
         return true;
     }
-    nr.ctxUserMem = modelShare;
-    if (g_resident && g_res.rt && g_res.ifnetPath == nr.ifnetPath)
+    if (g_resident && g_res.ready && g_res.ifnetPath == nr.ifnetPath)
     {
         const int64_t t0 = nowQpc100();
-        nr.rt = g_res.rt;
-        nr.engIf = g_res.engIf;
-        nr.jit = g_res.jit;
         nr.featHalf = g_res.featHalf;
         nr.xHalf = g_res.xHalf;
         nr.outHalf = g_res.outHalf;
         nr.tHalf = g_res.tHalf;
-        // no-engine mode: the resident holds no pair (both paths empty on both sides), only
-        // the runtime, the jit cache and, per path, the restore engine
-        if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
-        {
-            if (!nativeMakeContext(nr, nr.engIf, &nr.cfgIf, &nr.ctxIf))
-                return false;
-            if (!nativeTweenBuffers(nr))
-                return false;
-        }
-        // the restore engine follows its own path: kept when the same one is asked for again,
-        // dropped for a session without Restore, loaded for one that brings a different path
-        if (g_res.restorePath != nr.restorePath)
-        {
-            if (g_res.engRest)
-            {
-                delete g_res.engRest;
-                g_res.engRest = nullptr;
-            }
-            g_res.restorePath.clear();
-            if (!nr.restorePath.empty() && !nr.restNat)
-            {
-                nr.engRest = nativeLoadEngine(nr, nr.restorePath, &nr.cfgRest, &nr.ctxRest);
-                if (!nr.engRest)
-                    return false;
-                g_res.engRest = nr.engRest;
-                g_res.restorePath = nr.restorePath;
-            }
-        }
-        else if (g_res.engRest)
-        {
-            nr.engRest = g_res.engRest;
-            if (!nativeMakeContext(nr, nr.engRest, &nr.cfgRest, &nr.ctxRest))
-                return false;
-        }
-        if (!block0Ready() || !shareReady() || !restoreReady() || !block0Warm())
+        if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg && !nativeTweenBuffers(nr))
+            return false;
+        if (!block0Ready() || !ifnReady() || !shareReady() || !restoreReady())
             return false;
         LOG("native: resident engines reused, contexts recreated in %.2f s\n", (nowQpc100() - t0) / 1e7);
         return true;
     }
-    if (g_resident && g_res.rt)
+    if (g_resident && g_res.ready)
         residentFreeEngines(); // a different pair (new window size)
-    nr.rt = nvinfer1::createInferRuntime(g_nativeTrtLogger);
-    if (!nr.rt)
-    {
-        LOG("native: createInferRuntime failed\n");
-        return false;
-    }
     if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
     {
-        nr.engIf = nativeLoadEngine(nr, nr.ifnetPath, &nr.cfgIf, &nr.ctxIf);
-        if (!nr.engIf)
-            return false;
-    }
-    if (!nr.restorePath.empty() && !nr.restNat)
-    {
-        nr.engRest = nativeLoadEngine(nr, nr.restorePath, &nr.cfgRest, &nr.ctxRest);
-        if (!nr.engRest)
-            return false;
-    }
-    if (!nr.noEngine && !nr.nvof && !nr.fruc && !nr.dlssg)
-    {
-        // dtype contract, read off the engines rather than trusted from the handoff line
-        // timestep: fp32 or fp16, read off the engine (fp16: the constant fills and DRBA's map are written in fp16)
-        const auto td = dt(nr.engIf, "timestep");
-        if (td != nvinfer1::DataType::kFLOAT && td != nvinfer1::DataType::kHALF)
+        if (!nr.ifnNat)
         {
-            LOG("native: IFNet timestep dtype unsupported\n");
+            LOG("native: rife: the handoff named no IFNet on the host's kernels (%s)\n", nr.ifnetPath.c_str());
             return false;
         }
-        nr.tHalf = td == nvinfer1::DataType::kHALF;
-        // flow / mask: fp16, the tween is made on the host by RIFE's last step (nativeRifeBlend); an engine
-        // without them is refused (a missing name reads as fp32)
-        if (dt(nr.engIf, "flow") != nvinfer1::DataType::kHALF || dt(nr.engIf, "mask") != nvinfer1::DataType::kHALF)
-        {
-            LOG("native: the IFNet engine hands out no fp16 flow / mask (built from an ONNX before rev 7): empty "
-                "the engine cache\n");
-            return false;
-        }
+        // the native IFNet's dtypes: the frame pair x, the timestep (the constant fills and DRBA's map are written in
+        // fp16) and the encodes f0 / f1 (nativeEncodeRun writes that dtype) in fp16; flow / mask out in fp16, the tween
+        // made by RIFE's last step (nativeRifeBlend)
+        nr.tHalf = nr.xHalf = nr.featHalf = true;
         // the tweens in fp32, each reader rounds once; SMV_TWEEN_FP16=1 = the fp16 store (a second rounding)
         nr.outHalf = lkEnv("SMV_TWEEN_FP16") == "1";
-        // x: fp32 or fp16, read off the engine (fp16: bound to the fp16 copy of the frame pair)
-        const auto xd = dt(nr.engIf, "x");
-        if (xd != nvinfer1::DataType::kFLOAT && xd != nvinfer1::DataType::kHALF)
-        {
-            LOG("native: IFNet x dtype unsupported\n");
-            return false;
-        }
-        nr.xHalf = xd == nvinfer1::DataType::kHALF;
-        // f0 / f1: fp32 or fp16, read off the engine (the encode, nativeEncodeRun, writes that dtype)
-        const auto fd = dt(nr.engIf, "f0");
-        if (dt(nr.engIf, "f1") != fd || (fd != nvinfer1::DataType::kFLOAT && fd != nvinfer1::DataType::kHALF))
-        {
-            LOG("native: IFNet f0 / f1 dtype unsupported\n");
-            return false;
-        }
-        nr.featHalf = fd == nvinfer1::DataType::kHALF;
         if (!nativeTweenBuffers(nr))
             return false;
     }
-    // RIFE's two domains live: the motion frames are fp16, the IFNet must take fp16 frames
     if (!g_offline && nr.mph)
-    {
-        if (!nr.xHalf)
-        {
-            LOG("native: RIFE's motion frames are fp16 but the IFNet takes fp32 frames (empty the engine cache)\n");
-            return false;
-        }
         LOG("native: RIFE finds the motion on the picture at %dx%d%s, its warp + blend runs on the %dx%d pictures\n",
             nr.mw, nr.mh,
             nr.hdr ? (nr.rtxHdr ? " (the SDR picture before RTX HDR)" : " (the HDR desktop's PQ read as SDR sRGB)")
                    : "",
             nr.w, nr.h);
-    }
-    if (!block0Ready() || !shareReady() || !restoreReady() || !block0Warm())
+    if (!block0Ready() || !ifnReady() || !shareReady() || !restoreReady())
         return false;
     if (g_resident)
     {
-        g_res.rt = nr.rt;
-        g_res.engIf = nr.engIf;
-        g_res.engRest = nr.engRest;
-        g_res.jit = nr.jit;
+        g_res.ready = true;
         g_res.featHalf = nr.featHalf;
         g_res.xHalf = nr.xHalf;
         g_res.outHalf = nr.outHalf;
         g_res.tHalf = nr.tHalf;
         g_res.dev = nr.dev;
         g_res.ifnetPath = nr.ifnetPath;
-        g_res.jitPath = nr.jitPath;
-        g_res.restorePath = nr.restorePath;
     }
     return true;
 }
@@ -18487,57 +23229,6 @@ static void nativeFree(NativeRife& nr)
         g_rtxb.shutdown();
         g_rtxb.created = false;
     }
-    if (nr.ctxIf)
-    {
-        delete nr.ctxIf;
-        nr.ctxIf = nullptr;
-    }
-    if (nr.ctxRest)
-    {
-        delete nr.ctxRest;
-        nr.ctxRest = nullptr;
-    }
-    if (nr.cfgIf)
-    {
-        delete nr.cfgIf;
-        nr.cfgIf = nullptr;
-    }
-    if (nr.cfgRest)
-    {
-        delete nr.cfgRest;
-        nr.cfgRest = nullptr;
-    }
-    // a session whose runtime never became the resident one (its init failed after block0Ready / the Restore load had
-    // published an engine) takes those engines with it: an engine must not outlive the runtime that made it
-    if (nr.rt && nr.rt != g_res.rt)
-    {
-        if (g_res.engB0 && g_res.engB0 == nr.engB0)
-        {
-            g_res.engB0 = nullptr;
-            g_res.block0Path.clear();
-        }
-        if (g_res.engRest && g_res.engRest == nr.engRest)
-        {
-            g_res.engRest = nullptr;
-            g_res.restorePath.clear();
-        }
-    }
-    if (nr.engRest && nr.engRest != g_res.engRest)
-        delete nr.engRest;
-    nr.engRest = nullptr;
-    if (nr.ctxB0)
-    {
-        delete nr.ctxB0;
-        nr.ctxB0 = nullptr;
-    }
-    if (nr.cfgB0)
-    {
-        delete nr.cfgB0;
-        nr.cfgB0 = nullptr;
-    }
-    if (nr.engB0 && nr.engB0 != g_res.engB0)
-        delete nr.engB0;
-    nr.engB0 = nullptr;
     if (nr.drTweens || nr.drHeads)
         LOG("native: drba %llu tweens (%llu head pairs), %llu block0 runs\n", (unsigned long long)nr.drTweens,
             (unsigned long long)nr.drHeads, (unsigned long long)nr.drBlock0);
@@ -18560,43 +23251,15 @@ static void nativeFree(NativeRife& nr)
     }
     nr.dDrX[0] = nr.dDrX[1] = nullptr;
     nr.dDrMX[0] = nr.dDrMX[1] = nullptr;
-    nr.dDrB0 = nullptr;
     for (auto& wn : nr.drWin)
         wn = NativeRife::DrWin{};
     nr.dDrAcc = nullptr;
-    for (int i = 0; i < kGmN; i++)
-    {
-        if (nr.ctxGm[i])
-        {
-            delete nr.ctxGm[i];
-            nr.ctxGm[i] = nullptr;
-        }
-        if (nr.cfgGm[i])
-        {
-            delete nr.cfgGm[i];
-            nr.cfgGm[i] = nullptr;
-        }
-        if (nr.engGm[i] && nr.engGm[i] != g_res.engGm[i])
-            delete nr.engGm[i];
-        nr.engGm[i] = nullptr;
-    }
     if (nr.dGmCtxMem) // after the contexts that ran on it
     {
         cudaFree(nr.dGmCtxMem);
         nr.dGmCtxMem = nullptr;
         nr.gmCtxMemB = 0;
     }
-    // the resident cache owns these in --resident mode (residentFree drops them); the
-    // pointer compare keeps the non-resident teardown byte for byte
-    if (nr.jit && nr.jit != g_res.jit)
-        delete nr.jit;
-    nr.jit = nullptr;
-    if (nr.engIf && nr.engIf != g_res.engIf)
-        delete nr.engIf;
-    nr.engIf = nullptr;
-    if (nr.rt && nr.rt != g_res.rt)
-        delete nr.rt;
-    nr.rt = nullptr;
     for (auto& e : nr.slotEv)
         if (e)
             cudaEventDestroy(e);
@@ -18756,7 +23419,6 @@ static void nativeFree(NativeRife& nr)
                     nr.dGmOut,
                     nr.dGmWl,
                     nr.dGmBl,
-                    nr.dGmLr,
                     (void*)nr.dGmF,
                     (void*)nr.dGmEnc,
                     (void*)nr.dGmHalfM,
@@ -18780,9 +23442,39 @@ static void nativeFree(NativeRife& nr)
                     (void*)nr.dGsSrc[0],
                     (void*)nr.dGsSrc[1],
                     (void*)nr.dGsBlk[0],
-                    (void*)nr.dGsBlk[1]})
+                    (void*)nr.dGsBlk[1],
+                    nr.dFnW,
+                    nr.dFnOwn,
+                    nr.dMnW,
+                    nr.dMnOwn,
+                    nr.dGiW,
+                    nr.dGiOwn,
+                    nr.dFuW,
+                    nr.dFuOwn,
+                    nr.dGbW,
+                    nr.dGbOwn,
+                    nr.dBbW,
+                    nr.dBbOwn,
+                    nr.dGaW,
+                    nr.dGaOwn,
+                    (void*)nr.dGaPos,
+                    nr.dB0W,
+                    nr.dB0Own,
+                    nr.dIfnW,
+                    nr.dIfnOwn})
         if (p)
             cudaFree(p);
+    nr.dFnW = nr.dFnOwn = nr.dFnScr = nullptr;
+    nr.dMnW = nr.dMnOwn = nullptr;
+    nr.dGiW = nr.dGiOwn = nullptr;
+    nr.dFuW = nr.dFuOwn = nullptr;
+    nr.fuOps.clear();
+    nr.dGbW = nr.dGbOwn = nullptr;
+    nr.dBbW = nr.dBbOwn = nullptr;
+    nr.dGaW = nr.dGaOwn = nullptr;
+    nr.dGaPos = nullptr;
+    nr.dB0W = nr.dB0Own = nullptr;
+    nr.dIfnW = nr.dIfnOwn = nullptr;
     for (int s = 0; s < 2; s++)
     {
         nr.dGsCnt[s] = nr.dGsOff[s] = nr.dGsList[s] = nr.dGsBlk[s] = nullptr;
@@ -18817,7 +23509,7 @@ static void nativeFree(NativeRife& nr)
     nr.dGmFd = nullptr;
     nr.dGmT = nullptr;
     nr.dGmOut = nullptr;
-    nr.dGmWl = nr.dGmBl = nr.dGmLr = nullptr;
+    nr.dGmWl = nr.dGmBl = nullptr;
     nr.gmLr[0] = nr.gmLr[1] = nr.gmLr[2] = -1.0f;
     nr.gmTail = nr.gmTailHwc = nr.gmFeatHwc = false;
     nr.dGmF = nullptr;
@@ -18860,6 +23552,59 @@ static void nativeFree(NativeRife& nr)
     nr.a4kMod = nullptr;
     for (CUfunction& f : nr.fA4k)
         f = nullptr;
+    if (nr.fnMod)
+        cuModuleUnload(nr.fnMod);
+    nr.fnMod = nullptr;
+    for (CUfunction& f : nr.fFn)
+        f = nullptr;
+    if (nr.mnMod)
+        cuModuleUnload(nr.mnMod);
+    nr.mnMod = nullptr;
+    for (CUfunction& f : nr.fMn)
+        f = nullptr;
+    chainGraphsFree(nr.giGraphs);
+    if (nr.giMod)
+        cuModuleUnload(nr.giMod);
+    nr.giMod = nullptr;
+    for (CUfunction& f : nr.fGi)
+        f = nullptr;
+    chainGraphsFree(nr.fuGraphs);
+    if (nr.fuMod)
+        cuModuleUnload(nr.fuMod);
+    nr.fuMod = nullptr;
+    for (CUfunction& f : nr.fFu)
+        f = nullptr;
+    chainGraphsFree(nr.gbGraphs);
+    if (nr.gbMod)
+        cuModuleUnload(nr.gbMod);
+    nr.gbMod = nullptr;
+    for (CUfunction& f : nr.fGb)
+        f = nullptr;
+    chainGraphsFree(nr.bbGraphs);
+    if (nr.bbMod)
+        cuModuleUnload(nr.bbMod);
+    nr.bbMod = nullptr;
+    for (CUfunction& f : nr.fBb)
+        f = nullptr;
+    for (ChainGraphs& g : nr.gaGraphs)
+        chainGraphsFree(g);
+    if (nr.gaMod)
+        cuModuleUnload(nr.gaMod);
+    nr.gaMod = nullptr;
+    for (CUfunction& f : nr.fGa)
+        f = nullptr;
+    if (nr.b0Mod)
+        cuModuleUnload(nr.b0Mod);
+    nr.b0Mod = nullptr;
+    for (CUfunction& f : nr.fB0)
+        f = nullptr;
+    chainGraphsFree(nr.ifnGraphs);
+    if (nr.ifnMod)
+        cuModuleUnload(nr.ifnMod);
+    nr.ifnMod = nullptr;
+    for (CUfunction& f : nr.fIfn)
+        f = nullptr;
+    nr.ifnNat = false;
     if (nr.stream)
     {
         cudaStreamDestroy(nr.stream);
@@ -18869,7 +23614,7 @@ static void nativeFree(NativeRife& nr)
 
 // ---- the GMFSS chain ------------------------------------------------------------------------
 // GMFSS_infer_u.Model.reuse() and .inference() as native launches on the group's stream: the
-// five engines and the glue kernels (k_half / k_pyr / k_splatSoft / k_splatNorm, gated against a
+// four engines, the native nets and the glue kernels (k_half / k_pyr / k_splatSoft / k_splatNorm, gated against a
 // float64 reference). Two differences from
 // live_server.Gmfss, both exact:
 //   * feat_ext runs ONCE per group (on the new frame) and the previous group's output is this
@@ -18897,8 +23642,6 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     // the backbone maps in batch slot 1 belong to this call's previous frame only when the last call was a pair
     const bool mapsPrev = nr.gmMapsNext;
     nr.gmMapsNext = false;
-    if (g_gmUpg.armed.load(std::memory_order_relaxed) && g_gmUpg.armed.exchange(false))
-        lkGmUpgradeStart(nr.gmPath[kGmFlowSlot]);
     if (profPair)
         cudaEventRecord(nr.gmEv[0], st);
     // feat_ext of the NEW frame, into the set the NEXT pair will read as feat0. HDR planes (the kernels' comment): a
@@ -18936,14 +23679,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     auto view = [&](float* src, float head) {
         return nativeHdrEnc(nr, src, 0, ps, rs, nr.pw, nr.ph, nr.dGmEnc, 0, ps, rs, nr.encPost, kMotionKnee, head);
     };
-    auto featExt = [&](float* x, void** f) {
-        nvinfer1::IExecutionContext* c = nr.ctxGm[0];
-        c->setTensorAddress("x", x);
-        c->setTensorAddress("f1", f[0]);
-        c->setTensorAddress("f2", f[1]);
-        c->setTensorAddress("f3", f[2]);
-        return c->enqueueV3(st);
-    };
+    auto featExt = [&](float* x, void** f) { return nativeFnRun(nr, x, ps, rs, f, st); };
     float* xCur = sdr ? nr.dGmEnc : dCur;
     if (!needFlow && nr.gmFeatLazy)
     {
@@ -18961,7 +23697,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     }
     if (!featExt(xCur, fs))
     {
-        nr.die("gmfss feat_ext enqueueV3 returned false");
+        nr.die("gmfss feat_ext launch failed");
         return false;
     }
     nr.gmFeatSdr[nr.gmCur] = sdr;
@@ -19013,7 +23749,6 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         nr.die("gmfss motion halves launch failed");
         return false;
     }
-    nvinfer1::IExecutionContext* ctx = nullptr;
     if (profPair)
         cudaEventRecord(nr.gmEv[2], st);
     // gmflow's backbone once a frame: the previous frame's maps are the last pair's new ones (batch slot 1 -> 0) when
@@ -19021,11 +23756,8 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     // the new frame's into slot 1
     const int kind = mview ? 2 : (sdr ? 1 : 0);
     auto backbone = [&](float* x, int slot) {
-        nvinfer1::IExecutionContext* c = nr.ctxGm[6];
-        c->setTensorAddress("img0", x);
-        c->setTensorAddress("map4", (uint8_t*)nr.dGmMap[0] + slot * nr.gmMapSlot[0]);
-        c->setTensorAddress("map8", (uint8_t*)nr.dGmMap[1] + slot * nr.gmMapSlot[1]);
-        return c->enqueueV3(st);
+        return nativeBbRun(nr, x, (uint8_t*)nr.dGmMap[0] + slot * nr.gmMapSlot[0],
+                           (uint8_t*)nr.dGmMap[1] + slot * nr.gmMapSlot[1], st);
     };
     bool mapsOk = true;
     if (mapsPrev && nr.gmMapsKind == kind)
@@ -19036,7 +23768,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         mapsOk = backbone(mv0, 0);
     if (!mapsOk || !backbone(mv1, 1))
     {
-        nr.die("gmfss gmflow_backbone enqueueV3 returned false");
+        nr.die("gmfss gmflow backbone's kernels (or the maps' copy) failed to launch");
         return false;
     }
     nr.gmMapsKind = kind;
@@ -19044,17 +23776,9 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     // (k_attn2 twice: the matching with the pixel grid as its value writes the flow, the propagation reads it), A, the
     // local correlation (k_localCorr: one warp a pixel, 4 a block) and B) and metricnet on the same halves
     const int64_t cpuF0 = profPair ? nowQpc100() : 0;
-    ctx = nr.ctxGm[7];
-    ctx->setTensorAddress("map4", nr.dGmMap[0]);
-    ctx->setTensorAddress("map8", nr.dGmMap[1]);
-    ctx->setTensorAddress("img0", mv0);
-    ctx->setTensorAddress("img1", mv1);
-    ctx->setTensorAddress("mf", nr.dGmM[0]);
-    ctx->setTensorAddress("mq", nr.dGmM[1]);
-    ctx->setTensorAddress("mk", nr.dGmM[2]);
-    if (!ctx->enqueueV3(st))
+    if (!nativeGaRun(nr, 0, nr.dGmMap[1], nullptr, nr.dGmM[0], nullptr, nr.dGmM[1], nr.dGmM[2], st))
     {
-        nr.die("gmfss gmflow_bidir_a_m enqueueV3 returned false");
+        nr.die("gmfss gmflow _m's kernels failed to launch");
         return false;
     }
     {
@@ -19088,17 +23812,9 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
             return false;
         }
     }
-    ctx = nr.ctxGm[1];
-    ctx->setTensorAddress("map4", nr.dGmMap[0]);
-    ctx->setTensorAddress("map8", nr.dGmMap[1]);
-    ctx->setTensorAddress("img0", mv0);
-    ctx->setTensorAddress("img1", mv1);
-    ctx->setTensorAddress("prop", nr.dGmProp);
-    for (int i = 0; i < kGmAn; i++)
-        ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
-    if (!ctx->enqueueV3(st))
+    if (!nativeGaRun(nr, 1, nr.dGmMap[0], nr.dGmProp, nr.dGmA[0], nr.dGmA[1], nullptr, nullptr, st))
     {
-        nr.die("gmfss gmflow_bidir_a enqueueV3 returned false");
+        nr.die("gmfss gmflow A's kernels failed to launch");
         return false;
     }
     int nb = 2, hw4 = nr.gmH * nr.gmW;
@@ -19109,16 +23825,9 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         nr.die("gmfss local correlation launch failed");
         return false;
     }
-    ctx = nr.ctxGm[5];
-    ctx->setTensorAddress("corr", nr.dGmCorr);
-    for (int i = 0; i < kGmAn; i++)
-        ctx->setTensorAddress(kGmA[i], nr.dGmA[i]);
-    ctx->setTensorAddress("img0", mv0);
-    ctx->setTensorAddress("img1", mv1);
-    ctx->setTensorAddress("flow", nr.dGmFlow);
-    if (!ctx->enqueueV3(st))
+    if (!nativeGbRun(nr, st))
     {
-        nr.die("gmfss gmflow_bidir_b enqueueV3 returned false");
+        nr.die("gmfss gmflow B's kernels failed to launch");
         return false;
     }
     nr.gmMapsNext = true; // slot 1 = the new frame's maps = the next pair's previous frame
@@ -19128,16 +23837,9 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
         cudaEventRecord(nr.gmEv[3], st);
     float* f10 = nr.dGmFlow + 2 * hp;
     void* m1 = (uint8_t*)nr.dGmMetric + hp * (nr.gmMetricHalf ? 2 : 4);
-    ctx = nr.ctxGm[2];
-    ctx->setTensorAddress("i0", mv0);
-    ctx->setTensorAddress("i1", mv1);
-    ctx->setTensorAddress("f01", nr.dGmFlow);
-    ctx->setTensorAddress("f10", f10);
-    ctx->setTensorAddress("m0", nr.dGmMetric);
-    ctx->setTensorAddress("m1", m1);
-    if (!ctx->enqueueV3(st))
+    if (!nativeMnRun(nr, mv0, mv1, nr.dGmFlow, f10, nr.dGmMetric, m1, st))
     {
-        nr.die("gmfss metricnet enqueueV3 returned false");
+        nr.die("gmfss metricnet's kernels failed to launch");
         return false;
     }
     if (profPair)
@@ -19290,20 +23992,16 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         nr.die("gmfss timestep fill failed");
         return false;
     }
-    nvinfer1::IExecutionContext* ctx = nr.ctxGm[3];
-    ctx->setTensorAddress("x", nr.dGmHalf);
-    ctx->setTensorAddress("timestep", nr.dGmT);
-    ctx->setTensorAddress("merged", nr.dGmFa + 3 * hp);
-    if (!ctx->enqueueV3(st))
+    if (!nativeGiRun(nr, nr.dGmHalf, nr.dGmT, nr.dGmFa + 3 * hp, st))
     {
-        nr.die("gmfss ifnet enqueueV3 returned false");
+        nr.die("gmfss ifnet's kernels failed to launch");
         return false;
     }
     if (prof)
         cudaEventRecord(nr.gmEv[8], st);
     // the three feature levels, both directions: the half from the engines' own flow and
     // metric, the quarter and the eighth from the pair's pyramids
-    // b / c / d in the engine's dtype and layout: the second direction starts gmC channels in
+    // b / c / d channels-last fp16 (fusionnet's layout): the second direction starts gmC channels in
     const int bHalf = nr.gmFuseHalf ? 1 : 0;
     const bool fx = nr.gmFeatHwc;
     const int c0 = nr.gmC[0], c1 = nr.gmC[1], c2 = nr.gmC[2];
@@ -19328,22 +24026,9 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         return false;
     if (prof)
         cudaEventRecord(nr.gmEv[9], st);
-    ctx = nr.ctxGm[4];
-    ctx->setTensorAddress("a", nr.dGmFa);
-    ctx->setTensorAddress("b", nr.dGmFb);
-    ctx->setTensorAddress("c", nr.dGmFc);
-    ctx->setTensorAddress("d", nr.dGmFd);
-    ctx->setTensorAddress("out", nr.gmTail ? (void*)nr.dGmAcc : nr.dGmOut);
-    if (nr.gmTail)
+    if (!nativeFuRun(nr, st))
     {
-        ctx->setTensorAddress("w_last", nr.dGmWl);
-        ctx->setTensorAddress("b_last", nr.dGmBl);
-        if (nr.dGmLr)
-            ctx->setTensorAddress("lr_bcd", nr.dGmLr);
-    }
-    if (!ctx->enqueueV3(st))
-    {
-        nr.die("gmfss fusionnet enqueueV3 returned false");
+        nr.die("gmfss fusionnet's kernels failed to launch");
         return false;
     }
     const int ps = (int)plane;
@@ -19526,46 +24211,20 @@ static bool nativeDrbaPush(NativeRife& nr, const float* dCur, bool same = false)
                   : nativeEncodeRun(nr, dst, 0, drbaMw(nr), drbaMh(nr), enc, st);
 }
 
-// calc_flow(frame a, frame b): block0 on the pair, then its tail (the DRBA glue kernels) into out
-// (4 planes: flow05 * 2 | flow15 * 2). block0 writes its flow into out, the splat reads it from there
-// into the accumulator and FlowNorm then overwrites every value of out. Two domains: block0 takes fp32
-// frames, so the two motion frames are widened into dDrB0 (the accumulator's first half) first.
+// calc_flow(frame a, frame b): block0 on the pair (nativeB0Run, its flow at 1/16), then its tail (the DRBA glue
+// kernels) into out (4 planes: flow05 * 2 | flow15 * 2): the splat samples block0's planes at the motion frame into the
+// accumulator, FlowNorm writes every value of out. Two domains: block0 reads the two motion frames (fp16).
 static bool nativeDrbaFlow(NativeRife& nr, uint32_t a, uint32_t b, float* out)
 {
     cudaStream_t st = nr.stream;
     int mw = drbaMw(nr), mh = drbaMh(nr);
     const size_t plane = (size_t)mh * mw;
-    nvinfer1::Dims4 di{1, 3, mh, mw}, df{1, kRifeFeatC, mh, mw};
-    if (!nr.ctxB0->setInputShape("img0", di) || !nr.ctxB0->setInputShape("img1", di) ||
-        !nr.ctxB0->setInputShape("f0", df) || !nr.ctxB0->setInputShape("f1", df))
+    const void* img0 = nr.mph ? (const void*)drbaMotion(nr, a) : (const void*)drbaFrame(nr, a);
+    const void* img1 = nr.mph ? (const void*)drbaMotion(nr, b) : (const void*)drbaFrame(nr, b);
+    float* lo = nullptr;
+    if (!nativeB0Run(nr, img0, img1, nr.mph ? 1 : 0, drbaEnc(nr, a), drbaEnc(nr, b), mw, mh, &lo, st))
     {
-        nr.die("block0 setInputShape rejected");
-        return false;
-    }
-    float *img0 = drbaFrame(nr, a), *img1 = drbaFrame(nr, b);
-    if (nr.mph)
-    {
-        img0 = nr.dDrB0;
-        img1 = nr.dDrB0 + 3 * plane;
-        int n = (int)(3 * plane);
-        const uint16_t *m0 = drbaMotion(nr, a), *m1 = drbaMotion(nr, b);
-        void* a0[] = {(void*)&m0, &img0, &n};
-        void* a1[] = {(void*)&m1, &img1, &n};
-        if (cuLaunchKernel(nr.fH2f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS ||
-            cuLaunchKernel(nr.fH2f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a1, nullptr) != CUDA_SUCCESS)
-        {
-            nr.die("block0 frame h2f launch failed");
-            return false;
-        }
-    }
-    nr.ctxB0->setTensorAddress("img0", img0);
-    nr.ctxB0->setTensorAddress("img1", img1);
-    nr.ctxB0->setTensorAddress("f0", drbaEnc(nr, a));
-    nr.ctxB0->setTensorAddress("f1", drbaEnc(nr, b));
-    nr.ctxB0->setTensorAddress("flow", out);
-    if (!nr.ctxB0->enqueueV3(st))
-    {
-        nr.die("block0 enqueueV3 returned false");
+        nr.die("block0 launch failed");
         return false;
     }
     if (cudaMemsetAsync(nr.dDrAcc, 0, 6 * plane * sizeof(long long), st) != cudaSuccess)
@@ -19573,7 +24232,7 @@ static bool nativeDrbaFlow(NativeRife& nr, uint32_t a, uint32_t b, float* out)
         nr.die("drba accumulator clear failed");
         return false;
     }
-    void* as[] = {&out, &mw, &mh, &nr.dDrAcc};
+    void* as[] = {&lo, &mw, &mh, &nr.dDrAcc};
     if (cuLaunchKernel(nr.fDrFlowSplat, (mw + 15) / 16, (mh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, as, nullptr) !=
         CUDA_SUCCESS)
     {
@@ -19840,22 +24499,10 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
             return false;
         }
     }
-    nvinfer1::Dims4 dx{1, 6, mh, mw}, dts{1, 1, mh, mw}, df{1, kRifeFeatC, mh, mw};
-    if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dts) ||
-        !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
+    if (!nativeIfnRun(nr, nr.mph ? (const void*)nr.dDrMX[xi] : (const void*)nr.dDrX[xi], nr.dT, drbaEnc(nr, i1),
+                      drbaEnc(nr, i0), mw, mh, nr.dFlow, nr.dMask, st))
     {
-        nr.die("IFNet setInputShape rejected (shape outside the engine profile)");
-        return false;
-    }
-    nr.ctxIf->setTensorAddress("x", nr.mph ? (void*)nr.dDrMX[xi] : (void*)nr.dDrX[xi]);
-    nr.ctxIf->setTensorAddress("timestep", nr.dT);
-    nr.ctxIf->setTensorAddress("f0", drbaEnc(nr, i1));
-    nr.ctxIf->setTensorAddress("f1", drbaEnc(nr, i0));
-    nr.ctxIf->setTensorAddress("flow", nr.dFlow);
-    nr.ctxIf->setTensorAddress("mask", nr.dMask);
-    if (!nr.ctxIf->enqueueV3(st))
-    {
-        nr.die("IFNet enqueueV3 returned false (outputs would be garbage)");
+        nr.die("IFNet launch failed");
         return false;
     }
     // the tween: RIFE's last step on the frames this enqueue read, in two domains on their pictures
@@ -19980,25 +24627,10 @@ static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, fl
                 return false;
             }
     }
-    if (nr.restNat)
+    if (!restNatRun(nr, st))
     {
-        if (!restNatRun(nr, st))
-        {
-            nr.die("restore kernel launch failed");
-            return false;
-        }
-    }
-    else
-    {
-        nvinfer1::Dims4 din{1, 3, sh, sw};
-        nr.ctxRest->setTensorAddress(nr.restIn.c_str(), nr.dRestIn);
-        nr.ctxRest->setTensorAddress(nr.restOut.c_str(), nr.dRestOut);
-        if (!nr.ctxRest->setInputShape(nr.restIn.c_str(), din) || !nr.ctxRest->enqueueV3(st))
-        {
-            LOG("native: restore failed, dropping the pass for the rest of the %s\n", g_offline ? "render" : "session");
-            nr.restFailed = true;
-            return true;
-        }
+        nr.die("restore kernel launch failed");
+        return false;
     }
     // w4 / h4 = the model's output size (restScale x the input: Real-ESRGAN 4, AnimeJaNai 2)
     int half = nr.restHalfOut ? 1 : 0, w4 = nr.restScale * sw, h4 = nr.restScale * sh, ps4 = w4 * h4;
@@ -21060,7 +25692,7 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
     const bool resize = tw != sw || th != sh;
     const bool vsrNow = vsrHere && nr.vsr && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp || nr.a4kUp);
     staged = false;
-    if (withRestore && nr.restore && (nr.ctxRest || nr.restNat) && !nr.restFailed)
+    if (withRestore && nr.restore && nr.restNat && !nr.restFailed)
     {
         if (vsrNow)
         {
@@ -21725,7 +26357,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // RTX HDR converts later), folded straight to the model size and into the model frame with the packers'
     // replicate pad, so every model reads restored frames; it replaces the resize below. When the
     // engine refuses, the pass is dropped for the session and the resize below runs instead.
-    if (!restored && !nrSame && nr.restPre && (nr.ctxRest || nr.restNat) && !nr.restFailed)
+    if (!restored && !nrSame && nr.restPre && nr.restNat && !nr.restFailed)
     {
         const int cps = nr.cw * nr.ch;
         if (!sdrPre)
@@ -22415,7 +27047,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
         else if (nr.gmfss)
         {
-            // GMFSS: one tween at a time (no batch axis anywhere in its five engines), the
+            // GMFSS: one tween at a time (no batch axis anywhere in its four engines), the
             // clamped fusionnet output then rides the shared effects and slot chain
             if (!nativeGmfssTween(nr, fr[i]))
             {
@@ -22498,25 +27130,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     break;
                 // the IFNet's frame: the motion frame (two domains), else the pictures' pad
                 const int iph = nr.mph ? nr.mph : nr.ph, ipw = nr.mph ? nr.mpw : nr.pw;
-                nvinfer1::Dims4 dx{1, 6, iph, ipw};
-                nvinfer1::Dims4 dtst{(int)chunkLen, 1, iph, ipw};
-                nvinfer1::Dims4 df{1, kRifeFeatC, iph, ipw};
-                if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dtst) ||
-                    !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
+                if (!nativeIfnRun(nr, nr.mph ? (const void*)nr.dM : (const void*)nr.dXh, nr.dT, nr.dF[nr.fCur ^ 1],
+                                  nr.dF[nr.fCur], ipw, iph, nr.dFlow, nr.dMask, st))
                 {
-                    nr.die("IFNet setInputShape rejected (shape outside the engine profile)");
-                    fail = true;
-                    break;
-                }
-                nr.ctxIf->setTensorAddress("x", nr.mph ? (void*)nr.dM : nr.xHalf ? (void*)nr.dXh : (void*)nr.dX);
-                nr.ctxIf->setTensorAddress("timestep", nr.dT);
-                nr.ctxIf->setTensorAddress("f0", nr.dF[nr.fCur ^ 1]);
-                nr.ctxIf->setTensorAddress("f1", nr.dF[nr.fCur]);
-                nr.ctxIf->setTensorAddress("flow", nr.dFlow);
-                nr.ctxIf->setTensorAddress("mask", nr.dMask);
-                if (!nr.ctxIf->enqueueV3(st))
-                {
-                    nr.die("IFNet enqueueV3 returned false (outputs would be garbage)");
+                    nr.die("IFNet launch failed");
                     fail = true;
                     break;
                 }
@@ -22587,7 +27204,7 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
         nativeVideoMemoryMark();
     bool ok = earlyDone ? nativeBindDevice(nr)
                         : nativeCudaDeviceInit(nr, adapter, hTex, hFence, (uint32_t)nr.cw, (uint32_t)nr.ch, nr.hdr) &&
-                              nativeCudaInitEarly(nr, nativeCacheDir(nr)) && nativeTrtInit(nr) && nativeRtxInit(nr) &&
+                              nativeCudaInitEarly(nr, nativeCacheDir(nr)) && nativeModelInit(nr) && nativeRtxInit(nr) &&
                               nativeLiveNrInit(nr);
     ok = ok && nativeCudaInitLate(nr, hOutBuf, outBytes);
     {
@@ -22612,7 +27229,7 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
                              : ", vsr=native")
                : "",
         nr.uw ? ", upscale=native" : "", nr.fitAa ? ", fit=native-aa" : "",
-        nr.restore && (nr.ctxRest || nr.restNat) ? ", restore=native" : "");
+        nr.restore && nr.restNat ? ", restore=native" : "");
     for (;;)
     {
         std::vector<uint8_t> msg;
@@ -22683,7 +27300,7 @@ static void nativeStop(NativeRife& nr)
 }
 
 // a NativeRife the early thread initialised but no compute thread ever owned (a refusal in
-// startNative, or a session that ends before it): free its CUDA and TRT state from the calling
+// startNative, or a session that ends before it): free its CUDA state from the calling
 // thread. Without a stream nothing CUDA was created (the stream is the first CUDA object), and
 // the runtime DLL may not even be loaded, so no CUDA call is made at all then.
 static void nativeDropEarly(NativeRife& nr)

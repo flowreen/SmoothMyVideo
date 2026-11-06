@@ -91,7 +91,7 @@ struct PipeServer
             if (ok && (early->rtxHdr || early->vsrWant || early->sharpen > 0.0f || early->fitAa || early->uw > 0 ||
                        early->restore || (early->encPost && (early->w != early->cw || early->h != early->ch))))
                 thdrTh = std::thread([&] { thdrOk = nativeBindDevice(*early) && nativeRtxInit(*early); });
-            ok = ok && nativeTrtInit(*early);
+            ok = ok && nativeModelInit(*early);
             if (thdrTh.joinable())
                 thdrTh.join();
             // live DLSS 5's NR core starts after the RTX Video bridge's NGX init, never beside it

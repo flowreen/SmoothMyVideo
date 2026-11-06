@@ -25,18 +25,11 @@ if "%VSDIR%"=="" (
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 :compile
 cd /d %~dp0
-rem smv-live.exe, the native host. TRT_RTX_SDK = the extracted TensorRT-RTX SDK (include\ + lib\).
+rem smv-live.exe, the native host.
 rem SMV_CU = the CUDA headers and import libs that already ship in the app's python runtime;
 rem it defaults to this checkout's own engine\runtime, so a plain build needs neither a CUDA
 rem toolkit nor any absolute path. cuda_shim supplies the one internal header the runtime wheel
 rem leaves out (see cuda_shim\crt\host_defines.h).
-if "%TRT_RTX_SDK%"=="" (
-  echo Set TRT_RTX_SDK to the extracted TensorRT-RTX SDK first, see DEVELOPMENT.md
-  exit /b 1
-)
-:trimtrt
-if "%TRT_RTX_SDK:~-1%"==" " set "TRT_RTX_SDK=%TRT_RTX_SDK:~0,-1%"
-if "%TRT_RTX_SDK:~-1%"==" " goto trimtrt
 if "%SMV_CU%"=="" set "SMV_CU=%~dp0..\..\runtime\Lib\site-packages\nvidia\cu13"
 rem The DLSS 5 Neural Rendering core (engine\dlssnr\build_src\nr_host.cpp) is compiled
 rem into the exe; NGX_SDK = the public NVIDIA DLSS SDK folder holding include\nvsdk_ngx.h, the
@@ -49,9 +42,9 @@ if "%NGX_SDK%"=="" (
 if "%NGX_SDK:~-1%"==" " set "NGX_SDK=%NGX_SDK:~0,-1%"
 if "%NGX_SDK:~-1%"==" " goto trimngx
 set "NRSRC=%~dp0..\..\dlssnr\build_src"
-rem Nothing below is a hard dependency of the exe: tensorrt_rtx_1_7.dll is delay loaded, and
-rem CUDA 13's cudart.lib and cuda.lib are lazy LOADER stubs that open their DLLs on first call,
-rem so the exe still starts on a machine that has none of them and no non-native route changes.
+rem Nothing below is a hard dependency of the exe: CUDA 13's cudart.lib and cuda.lib are lazy
+rem LOADER stubs that open their DLLs on first call, so the exe still starts on a machine that
+rem has none of them and no non-native route changes.
 rem nvofa\ = the MIT NVIDIA Optical Flow interface headers (the nvof model); nvofapi64.dll is
 rem driver-installed and opened at run time by full path, nothing to link or ship.
 rem No d3d12.lib on purpose: D3D12CreateDevice must keep resolving from sl.interposer.lib.
@@ -59,14 +52,13 @@ rem NVAPI (the free video memory, NvAPI_GPU_GetMemoryInfoEx) = the MIT headers a
 rem Streamline SDK (external\nvapi); the lib opens the driver's own nvapi64.dll at run time, nothing to ship.
 rem smv-live.manifest = the UTF-8 process code page, so a folder with a non-ASCII name works (its comment).
 cl /nologo /std:c++20 /EHsc /permissive- /O2 /W3 smv-live.cpp "%NRSRC%\nr_host.cpp" ^
-   /I "%SL_SDK%\include" /I "%SL_SDK%\external\nvapi" /I "%TRT_RTX_SDK%\include" /I "%SMV_CU%\include" /I cuda_shim ^
+   /I "%SL_SDK%\include" /I "%SL_SDK%\external\nvapi" /I "%SMV_CU%\include" /I cuda_shim ^
    /I "%NRSRC%" /I "%~dp0..\..\dlssg\build_src" /I "%NGX_SDK%\include" /I nvofa ^
-   /link /LIBPATH:"%SL_SDK%\lib\x64" /LIBPATH:"%SL_SDK%\external\nvapi\amd64" /LIBPATH:"%TRT_RTX_SDK%\lib" ^
+   /link /LIBPATH:"%SL_SDK%\lib\x64" /LIBPATH:"%SL_SDK%\external\nvapi\amd64" ^
    /LIBPATH:"%SMV_CU%\lib\x64" nvapi64.lib ^
-   sl.interposer.lib tensorrt_rtx_1_7.lib tensorrt_onnxparser_rtx_1_7.lib cudart.lib cuda.lib delayimp.lib ^
+   sl.interposer.lib cudart.lib cuda.lib ^
    user32.lib gdi32.lib ole32.lib windowscodecs.lib dxguid.lib advapi32.lib ^
    d3d11.lib d3dcompiler.lib dwmapi.lib shlwapi.lib winmm.lib windowsapp.lib ^
-   /DELAYLOAD:tensorrt_rtx_1_7.dll /DELAYLOAD:tensorrt_onnxparser_rtx_1_7.dll ^
    /MANIFEST:EMBED /MANIFESTINPUT:"%~dp0smv-live.manifest" /MANIFESTUAC:NO ^
    /SUBSYSTEM:CONSOLE /OUT:..\smv-live.exe
 exit /b %errorlevel%

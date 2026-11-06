@@ -120,13 +120,13 @@ third-party work.
 
 * **FFmpeg** (LGPL v3 shared build by BtbN, `engine/bin/`, license in `engine/bin/FFMPEG-LICENSE.txt`): source code at
   https://github.com/BtbN/FFmpeg-Builds (LGPL builds link their exact sources per release).
-* **NVIDIA TensorRT for RTX** (with its ONNX parser), the **CUDA runtime** and **NVRTC** (`engine/gpu_runtime/`):
+* The NVIDIA **CUDA runtime** and **NVRTC** (`engine/gpu_runtime/`):
   redistributed as permitted by the NVIDIA software license agreements covering runtime redistribution.
 
 ## Optional, user-installed (never bundled or redistributed)
 
-* **dovi_tool** and **hdr10plus_tool** (MIT, quietvoid): installed by the user via the app's
-  Dolby Vision / HDR10+ panels.
+* **dovi_tool** and **hdr10plus_tool** (MIT, quietvoid): downloaded on the user's click in the app's
+  Dolby Vision / HDR10+ panels (a pinned release from GitHub, its SHA256 checked).
 * **NVIDIA RTX Video feature models**: installed by the user from NVIDIA's RTX Video SDK
   download under NVIDIA's EULA.
 

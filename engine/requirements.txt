@@ -1,25 +1,7 @@
-# 1) torch first (Blackwell cu134 wheel):
-#    engine\runtime\python.exe -m pip install torch==2.15.0 torchvision --index-url https://download.pytorch.org/whl/cu134
-# 2) then: engine\runtime\python.exe -m pip install -r requirements.txt
-numpy
-opencv-python
-tqdm
-
-# Speed: cupy softsplat path (validated on RTX 5090 / sm_120). cupy-cuda13x uses cuda-pathfinder to
-# locate the CUDA 13 runtime, so the old nvrtc DLL-search shim is no longer load-bearing; the nvrtc +
-# runtime wheels are still listed so they are present. NOTE: the CUDA 13 wheels DROPPED the -cuXX
-# suffix - the nvidia-cuda-*-cu13 packages are deprecated placeholders that fail to build, so use the
-# unsuffixed names below (they resolve to 13.x).
-cupy-cuda13x
+# engine\runtime\python.exe -m pip install -r requirements.txt
+# The CUDA 13 wheels the repo needs: their DLLs are staged into engine\gpu_runtime (scripts/stage-gpu-runtime.ts) and
+# their headers / import libs build the native host (build.bat's SMV_CU). NOTE: the CUDA 13 wheels DROPPED the -cuXX
+# suffix - the nvidia-cuda-*-cu13 packages are deprecated placeholders that fail to build, so use the unsuffixed names
+# below (they resolve to 13.x).
 nvidia-cuda-nvrtc
 nvidia-cuda-runtime
-
-# TensorRT for RTX backend (default; --no-trt opts out): native engines for the 5 GMFSS sub nets, the
-# RIFE IFNet and the --restore pass, about 2.2x over the cupy fp16 path. cp314 wheels exist from
-# 1.6.1.120 up, never pin below; 1.6.1 is also free of the small-shape enqueue hang the live path
-# pads around (rife IFNet at 1024x640, 900 clean repro iterations). If the module is absent,
-# trt_runtime.py drops to the eager path. onnx + onnxscript drive the dynamo ONNX exporter used to
-# build the engines.
-tensorrt-rtx-cu13
-onnx
-onnxscript

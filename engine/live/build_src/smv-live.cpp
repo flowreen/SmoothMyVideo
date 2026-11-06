@@ -62,6 +62,8 @@
 #include <condition_variable>
 #include <algorithm>
 #include <map>
+#include <list>
+#include <span>
 #include <fstream>
 #include <memory>
 #include <wincrypt.h> // MD5 of the weights for the engine names (the host-side lookup)
@@ -116,6 +118,7 @@ static std::wstring g_modelLabel;    // user-facing model name for the loading m
                                      // (the GUI's effective-model label, e.g. "RIFE (DRBA)";
                                      // falls back to the raw backend name when absent)
 static std::wstring g_modelNote;     // substitution note appended to the loading log line
+static std::wstring g_hudNote;       // the HUD's opening note in the GUI language (--hud-note), shown as is
                                      // (e.g. Smooth Motion having no live mode runs GMFSS)
 static bool g_offline = false;       // --offline render mode (stdin frames in, stdout out)
 static bool g_offlineGraph = false;  // SMV_OFFLINE_GRAPH=1
@@ -239,9 +242,8 @@ static bool g_fill = false;        // --fit fill: fullscreen overlay on the targ
 // unaffected. SMV_LIVE_HDR overrides detection: 1 = force on, 0 = force off (test lever).
 static bool g_hdr = false;
 // Resident live host: --resident keeps this process alive
-// between sessions with the TensorRT runtime, the two RIFE engines, the JIT cache and the
-// kernel module loaded (about 300 MB of VRAM idle) and recreates only the per-session state
-// (capture, overlay, execution contexts, buffers). Sessions start and stop over stdin lines
+// between sessions with the kernel module loaded and recreates only the per-session state
+// (capture, overlay, buffers). Sessions start and stop over stdin lines
 // ("start<TAB>arg<TAB>arg...", "stop", "quit"; residentMain at the end of the file). A session
 // that touched Streamline, NGX (native DLSS 5) or the TrueHDR bridge still ends the process.
 static bool g_resident = false;
@@ -1613,7 +1615,9 @@ template <class F> struct OnReturn
 // pipes; namedPipes = flush hOut before closing it, a named pipe discards unread data otherwise)
 static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, bool namedPipes)
 {
-    NativeRife nr;
+    // the session state on the heap (it is larger than the analyzer's 32 KB stack bound)
+    const std::unique_ptr<NativeRife> nrOwn = std::make_unique<NativeRife>();
+    NativeRife& nr = *nrOwn;
     uint8_t* dRaw[2]{};
     uint8_t* dOutRaw = nullptr;
     OfflineIo io;
@@ -1796,20 +1800,14 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         // decoded size (the PQ encoding and an enlarge cost RIFE its motion, measured on an exact pan)
         // and its last step, the warp + blend, runs on the pictures at the working size.
         // SMV_RIFE_TWO_DOMAIN=0: the IFNet reads the pictures. DRBA: the unbatched IFNet (one tween per
-        // enqueue, its own DRM timestep map) plus the block0 flow engine, at the same frame
+        // enqueue, its own DRM timestep map) plus block0 on the host's kernels, at the same frame
         const bool two = lkEnv("SMV_RIFE_TWO_DOMAIN") != "0";
         // plain RIFE pads as its author does (NativeRife::zeroPad): zeros to a multiple of 128 in the motion frames
         nr.zeroPad = two && !oa.drba && lkEnv("SMV_RIFE_AUTHOR_PAD") != "0";
         if (!lkOfflineRife(script, two ? srcW : w, two ? srcH : h, oe, nr.zeroPad ? 128 : 64))
             return 2;
-        if (oa.drba)
-        {
-            if (!lkOfflineBlock0(script, two ? srcW : w, two ? srcH : h, nr.block0Path, nr.block0Jit))
-                return 2;
-            nr.drba = true;
-        }
+        nr.drba = oa.drba;
         nr.ifnetPath = oe.ifnet;
-        nr.jitPath = oe.jit;
         nr.ph = oe.ph;
         nr.pw = oe.pw;
         if (two)
@@ -1899,25 +1897,15 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     if (g_restore)
     {
         // python's rule: a Restore that cannot load drops the pass with a notice, never the render
-        LkSession ls;
-        if (lkSession(script, L"rife", (uint32_t)srcW, (uint32_t)srcH, ls) &&
-            lkEnsureRestore(script, ls, srcW, srcH, nr.restorePath, nr.rjitPath))
+        if (lkEnsureRestore(script, nr.restorePath))
             nr.restore = true;
         else
         {
             LOG("[restore] unavailable, skipping\n");
             nr.restorePath.clear();
-            nr.rjitPath.clear();
         }
     }
     std::wstring cacheDir = oa.cacheW.empty() ? std::wstring(L".") : oa.cacheW;
-    if (!nr.jitPath.empty())
-    {
-        std::wstring jp(nr.jitPath.begin(), nr.jitPath.end());
-        const size_t sl = jp.find_last_of(L"\\/");
-        if (sl != std::wstring::npos)
-            cacheDir = jp.substr(0, sl);
-    }
     if (nr.fsrfg && nr.cachePath.empty())
         nr.cachePath = wideToUtf8(cacheDir); // FSR 4's vkd3d-proton shader cache goes into the model cache too
     const int64_t tStart = nowQpc100();
@@ -1949,8 +1937,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         return true;
     };
-    // the IFNet's features, timestep and tween buffers follow once the engine's dtypes are known
-    // (nativeTrtInit's nativeTweenBuffers)
+    // the IFNet's features, timestep and tween buffers follow once the models' dtypes are known
+    // (nativeModelInit's nativeTweenBuffers)
     // the model's frame: the pictures' own (ph x pw), or RIFE's motion frame at the decoded size (mph x mpw,
     // never larger: the working size is at least the decoded one), which the IFNet reads instead of dX / dXh
     const size_t mplane = nr.mph ? (size_t)nr.mph * nr.mpw : plane;
@@ -1975,7 +1963,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     if (nr.restore)
     {
         // the fold's horizontal pass at the 4x height and the widest target, the fold back to the source size (VSR
-        // follows); the Restore engine's x / y follow its dtypes (nativeTrtInit's restoreReady)
+        // follows); Restore's own buffers follow in nativeModelInit's restoreReady
         const size_t mp = (size_t)srcW * srcH;
         const int maxTw = outW > srcW ? outW : srcW;
         if (!cm((void**)&nr.dRestTmp, (size_t)3 * 4 * srcH * maxTw * sizeof(float), "restore fold pass") ||
@@ -1985,21 +1973,16 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     // GMFSS and Restore on HDR video read it as SDR sRGB around BT.2408's reference white: Restore the decoded
     // frames, GMFSS the model frames (also PQ after RTX HDR's TrueHDR on an SDR source)
     nativeHdrModelSetup(nr, oa.srcHdr, oa.srcHdr ? oa.srcHdr : (nr.rtxHdr ? 1 : 0), 203.0f / 80.0f);
-    // nvof: the Optical Flow session instead of the engines (every failure is a refusal line);
-    // the TensorRT side still loads for Restore
+    // nvof: the Optical Flow session instead of the model (every failure is a refusal line);
+    // Restore still runs its own setup
     if (nr.nvof && !nativeNvofSetup(nr))
         return 2;
     if (nr.fruc && !nativeFrucSetup(nr))
         return 2; // the bridge's FRUC instance and surfaces
-    if ((!(nr.nvof || nr.noEngine || nr.fruc || oa.dlssg) || nr.restore) && !nativeTrtInit(nr))
+    if ((!(nr.nvof || nr.noEngine || nr.fruc || oa.dlssg) || nr.restore) && !nativeModelInit(nr))
         return 2;
     if (nr.mph)
     {
-        if (!nr.xHalf)
-        {
-            LOG("offline: RIFE's motion frames are fp16 but the IFNet takes fp32 frames (empty the engine cache)\n");
-            return 2;
-        }
         LOG("offline: RIFE finds the motion on the picture at the decoded %dx%d%s, its warp + blend runs on the "
             "%dx%d pictures\n",
             srcW, srcH, oa.srcHdr == 1 ? " (PQ read as SDR sRGB)" : (oa.srcHdr == 2 ? " (HLG read as SDR sRGB)" : ""),
@@ -3241,27 +3224,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                         break;
                     }
                     const int modelH = nr.mph ? nr.mph : nr.ph, modelW = nr.mph ? nr.mpw : nr.pw;
-                    nvinfer1::Dims4 dx{1, 6, modelH, modelW};
-                    nvinfer1::Dims4 dtst{1, 1, modelH, modelW};
-                    nvinfer1::Dims4 df{1, kRifeFeatC, modelH, modelW};
-                    if (!nr.ctxIf->setInputShape("x", dx) || !nr.ctxIf->setInputShape("timestep", dtst) ||
-                        !nr.ctxIf->setInputShape("f0", df) || !nr.ctxIf->setInputShape("f1", df))
+                    if (!nativeIfnRun(nr, nr.mph ? (const void*)nr.dM : (const void*)nr.dXh, nr.dT, nr.dF[nr.fCur ^ 1],
+                                      nr.dF[nr.fCur], modelW, modelH, nr.dFlow, nr.dMask, st))
                     {
-                        io.setFail("IFNet setInputShape rejected");
-                        failed = true;
-                        break;
-                    }
-                    const void* xin =
-                        nr.mph ? (const void*)nr.dM : (nr.xHalf ? (const void*)nr.dXh : (const void*)nr.dX);
-                    nr.ctxIf->setTensorAddress("x", const_cast<void*>(xin));
-                    nr.ctxIf->setTensorAddress("timestep", nr.dT);
-                    nr.ctxIf->setTensorAddress("f0", nr.dF[nr.fCur ^ 1]);
-                    nr.ctxIf->setTensorAddress("f1", nr.dF[nr.fCur]);
-                    nr.ctxIf->setTensorAddress("flow", nr.dFlow);
-                    nr.ctxIf->setTensorAddress("mask", nr.dMask);
-                    if (!nr.ctxIf->enqueueV3(st))
-                    {
-                        io.setFail("IFNet enqueueV3 returned false");
+                        io.setFail("IFNet launch failed");
                         failed = true;
                         break;
                     }
@@ -3706,11 +3672,6 @@ int wmain(int argc, wchar_t** argv)
         return runProbe(h, (frames < 1 || frames > cap) ? 3 : frames, dumpPath);
     }
 
-    // --build-engine LOG SCRIPT ONNX ENGINE WSMULT NAME=D0xD1x...: one engine built + warmed into the cache (the GMFSS
-    // build helper, runBuildEngine)
-    if (argc >= 2 && wcscmp(argv[1], L"--build-engine") == 0)
-        return runBuildEngine(argc, argv);
-
     if (argc >= 2 && wcscmp(argv[1], L"--offline") == 0)
     {
         wchar_t gv[8]{};
@@ -3763,6 +3724,7 @@ static void resetSessionGlobals()
     g_fgOver = false;
     g_modelLabel.clear();
     g_modelNote.clear();
+    g_hudNote.clear();
     g_script.clear();
     g_flowScale = 1.0;
     g_dlssMode = 0;
@@ -3878,6 +3840,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_modelLabel = argv[++i];
         else if (wcscmp(argv[i], L"--note") == 0 && i + 1 < argc)
             g_modelNote = argv[++i];
+        else if (wcscmp(argv[i], L"--hud-note") == 0 && i + 1 < argc)
+            g_hudNote = argv[++i];
         else if (wcscmp(argv[i], L"--sharpen") == 0 && i + 1 < argc)
             g_sharpen = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--rtx-vsr") == 0)
@@ -4092,10 +4056,10 @@ static int residentMain(LiveArgs first)
             idleSecs = _wtoi(v);
     }
     auto freeAll = [&] {
-        if (!g_res.rt && !g_res.cuMod)
+        if (!g_res.ready && !g_res.cuMod)
             return;
         cudaSetDevice(g_res.dev);
-        cudaFree(nullptr); // bind the device on this (main) thread before the TRT deletes
+        cudaFree(nullptr); // bind the device on this (main) thread before the module unload
         residentFree();
     };
     LiveArgs la = first;
@@ -4110,7 +4074,7 @@ static int residentMain(LiveArgs first)
         // the app itself) and an exit 7 before the teardown (the window was gone at the start) never
         // started anything, stay for them too. What the host holds: the engines (g_res), or an engine
         // build a session left running in the background.
-        const bool held = g_res.rt || nativeBuildPending();
+        const bool held = g_res.ready || nativeBuildPending();
         const bool stay = (g_sessionClean && (rc == 0 || rc == 4 || rc == 7) && held && !g_nrAttempted && !g_rtxUsed &&
                            g_backend != BK_DLSSG && !g_fgOver) ||
                           ((rc == 5 || (rc == 7 && !g_sessionClean)) && held);
@@ -4127,9 +4091,9 @@ static int residentMain(LiveArgs first)
         if (g_targetHwnd)
             snprintf(tgt, sizeof tgt, " target=0x%p", (void*)g_targetHwnd);
         LOG("live session ended: exit %d, host resident (%s%s kept, idle limit %d s)%s\n", rc,
-            g_res.rt ? "engines" : "",
-            nativeBuildPending() ? (g_res.rt ? " and a running engine build" : "a running engine build") : "", idleSecs,
-            tgt);
+            g_res.ready ? "engines" : "",
+            nativeBuildPending() ? (g_res.ready ? " and a running engine build" : "a running engine build") : "",
+            idleSecs, tgt);
         bool haveNext = false;
         while (!haveNext)
         {
@@ -4186,10 +4150,9 @@ static int residentMain(LiveArgs first)
 // ---------------------------------------------------------------- resident offline host
 //
 // smv-live.exe --offline --resident --pipe NAME [--script s]: the offline render host
-// stays alive between queue items with the TensorRT runtime, the engines, the JIT cache and the
-// kernel module loaded (g_res, the live resident host's cache), so a later render of the same
-// size and multiplier pays only the execution contexts instead of the process start plus the
-// engine load. render.py spawns it detached (it outlives the render) and finds it again through
+// stays alive between queue items with the kernel module loaded (g_res, the live resident host's
+// cache), so a later render pays only its own buffers instead of the process start plus the
+// module load. render.py spawns it detached (it outlives the render) and finds it again through
 // the control pipe \\.\pipe\NAME, one client at a time, one line per command:
 //   start<TAB>--w<TAB>1920<TAB>...   one item's flags (the --offline command line minus --offline)
 //   <- "offline pipes ready"         the host created \\.\pipe\NAME-in and \\.\pipe\NAME-out
@@ -4231,7 +4194,7 @@ static int offlineResidentMain(const OfflineArgs& base)
         LOG("offline host: runtime DLLs unavailable\n");
         return 2;
     }
-    g_resident = true; // nativeTrtInit / nativeBuildKernels / nativeFree keep g_res across items
+    g_resident = true; // nativeModelInit / nativeBuildKernels / nativeFree keep g_res across items
     g_offline = true;
     int idleSecs = 600;
     {
@@ -4413,10 +4376,10 @@ static int offlineResidentMain(const OfflineArgs& base)
     }
     stopTimer.store(true);
     timer.join();
-    if (g_res.rt || g_res.cuMod)
+    if (g_res.ready || g_res.cuMod)
     {
         cudaSetDevice(g_res.dev);
-        cudaFree(nullptr); // bind the device on this thread before the TRT deletes
+        cudaFree(nullptr); // bind the device on this thread before the module unload
         residentFree();
     }
     CloseHandle(ctl);

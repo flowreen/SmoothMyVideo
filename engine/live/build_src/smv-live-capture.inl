@@ -215,6 +215,19 @@ struct Capture
     bool sameRef = false;      // a reference exists: refFrame, else sameRefTex
     uint64_t sameN = 0;        // arrivals dropped as unchanged
     uint64_t sameKept = 0;     // unchanged arrivals kept by kSameKeepalive
+    // the HUD meter's new pictures: each kept arrival's capture stamp (100 ns) unless its test found it unchanged (a
+    // keepalive arrival is tested too, for this alone: it goes through whatever it shows), the newest kArrN, under lk
+    static constexpr uint32_t kArrN = 1024;
+    int64_t arrRing[kArrN]{};
+    uint64_t arrCount = 0;
+    // the HUD meter's presents: every arrival's stamp, an unchanged picture included (a window capture hands over each
+    // present of the target), but for the repaints our refresh requests draw (notePresent), the newest kArrN, under lk
+    int64_t presRing[kArrN]{};
+    uint64_t presCount = 0;
+    int64_t refreshAskTs = 0; // the newest requestRefresh's time (QPC 100 ns), under lk
+    int64_t askRing[64]{};    // the newest requests' times (SMV_LAT_TRACE's Q rows), under lk
+    uint64_t askCount = 0;
+    bool arrNew = true; // samePicture's verdict on the arrival it just tested
     double sameMsSum = 0, sameMsMax = 0;
     uint64_t sameTests = 0;
     SRWLOCK sameLk = SRWLOCK_INIT; // one takeFrames at a time while sameSkip (FrameArrived's), before lk
@@ -566,6 +579,7 @@ struct Capture
     bool samePicture(wgc::Direct3D11CaptureFrame const& f, ComPtr<ID3D11ShaderResourceView>& view)
     {
         view = nullptr;
+        arrNew = true;
         winrt::com_ptr<ID3D11Texture2D> tex;
         int64_t ts = 0;
         try
@@ -600,7 +614,7 @@ struct Capture
         ComPtr<ID3D11ShaderResourceView> arr;
         const bool refHeld = refFrame != nullptr;
         UINT off[8]{(UINT)cropX, (UINT)cropY, refHeld ? (UINT)cropX : 0u, refHeld ? (UINT)cropY : 0u, cw, ch, 0, 0};
-        const bool test = !keepalive && sameRef;
+        const bool test = sameRef;
         if (!sameCopy && FAILED(dev11->CreateShaderResourceView(tex.get(), nullptr, &arr)) && !sameViewFail)
         {
             sameViewFail = true;
@@ -613,9 +627,7 @@ struct Capture
             ctx11->CopySubresourceRegion(sameTmpTex.Get(), 0, 0, 0, 0, tex.get(), 0, &box);
             off[0] = off[1] = 0;
         }
-        if (keepalive)
-            sameKept++;
-        else if (test && (arr || sameTmpTex))
+        if (test && (arr || sameTmpTex))
         {
             ctx11->UpdateSubresource(sameCb.Get(), 0, nullptr, off, 0, 0);
             const UINT zero[4]{};
@@ -650,6 +662,12 @@ struct Capture
             sameMsMax = (std::max)(sameMsMax, ms);
             sameTests++;
         }
+        arrNew = !same;
+        if (keepalive)
+        {
+            sameKept++;
+            same = false; // the static hold's arrival goes through whatever it shows
+        }
         if (!same)
         {
             if (arr)
@@ -671,6 +689,10 @@ struct Capture
         closed = 0;
         arrived = 0;
         dropped = 0;
+        arrCount = 0;
+        presCount = 0;
+        refreshAskTs = 0;
+        askCount = 0;
         emaArrMs = 0;
         lastArrTs = 0;
         arrGap = 0;
@@ -950,6 +972,8 @@ struct Capture
                 ReleaseSRWLockExclusive(&lk);
                 const bool same = samePicture(f, view);
                 AcquireSRWLockExclusive(&lk);
+                if (!stopping)
+                    notePresent(f.SystemRelativeTime().count(), !arrNew);
                 if (same || stopping)
                 {
                     sameN += same;
@@ -957,6 +981,8 @@ struct Capture
                     continue;
                 }
             }
+            else
+                notePresent(f.SystemRelativeTime().count(), true);
             const int64_t ts = f.SystemRelativeTime().count();
             if (lastArrTs && ts > lastArrTs)
             {
@@ -967,6 +993,8 @@ struct Capture
             }
             arrGap = lastArrTs && ts > lastArrTs ? ts - lastArrTs : 0;
             lastArrTs = ts;
+            if (!sameSkip || arrNew)
+                arrRing[arrCount++ % kArrN] = ts;
             const auto oldHeld = held, oldRef = refFrame;
             held = f;
             if (sameSkip)
@@ -987,6 +1015,87 @@ struct Capture
         if (sameSkip)
             ReleaseSRWLockExclusive(&sameLk);
         return kept;
+    }
+
+    // one present of the source for the HUD meter (lk held); `unchanged` = its picture repeats the last one (or no test
+    // ran): such arrivals within 250 ms of our refresh request to a source idle for 300 ms are its repaints for us (a
+    // player can answer one request with several), not its own presents; a new picture there is a real frame (a
+    // slideshow's next picture can land in that window)
+    void notePresent(int64_t ts, bool unchanged)
+    {
+        const int64_t prev = presCount ? presRing[(presCount - 1) % kArrN] : 0;
+        if (unchanged && refreshAskTs && ts >= refreshAskTs && ts - refreshAskTs <= 2500000 &&
+            (!prev || refreshAskTs - prev >= 3000000))
+            return;
+        presRing[presCount++ % kArrN] = ts;
+    }
+
+    // SMV_LAT_TRACE's capture rows, oldest first: `A <stamp>` the presents, `N <stamp>` the new pictures, `Q <time>` our
+    // refresh requests (QPC 100 ns)
+    void dumpStamps(FILE* f)
+    {
+        AcquireSRWLockExclusive(&lk);
+        for (uint64_t i = presCount > kArrN ? presCount - kArrN : 0; i < presCount; ++i)
+            fprintf(f, "A %lld\n", (long long)presRing[i % kArrN]);
+        for (uint64_t i = arrCount > kArrN ? arrCount - kArrN : 0; i < arrCount; ++i)
+            fprintf(f, "N %lld\n", (long long)arrRing[i % kArrN]);
+        for (uint64_t i = askCount > 64 ? askCount - 64 : 0; i < askCount; ++i)
+            fprintf(f, "Q %lld\n", (long long)askRing[i % 64]);
+        ReleaseSRWLockExclusive(&lk);
+    }
+
+    // the HUD meter: the newest gap wider than `gap` between two consecutive presents (true) / new pictures (false)
+    // stamped at or after `from` (`before` / `after` = its two frames); false = none
+    bool latestGap(bool presents, int64_t from, int64_t gap, int64_t& before, int64_t& after)
+    {
+        AcquireSRWLockExclusive(&lk);
+        const int64_t* ring = presents ? presRing : arrRing;
+        const uint64_t count = presents ? presCount : arrCount;
+        const uint64_t lo = count > kArrN ? count - kArrN : 0;
+        bool found = false;
+        for (uint64_t i = count; i > lo + 1 && !found; --i)
+        {
+            const int64_t t = ring[(i - 1) % kArrN], t0 = ring[(i - 2) % kArrN];
+            if (t0 < from)
+                break;
+            if (t - t0 > gap)
+            {
+                before = t0;
+                after = t;
+                found = true;
+            }
+        }
+        ReleaseSRWLockExclusive(&lk);
+        return found;
+    }
+
+    // the HUD meter: the presents (true) or the new pictures (false) stamped from `from` to `to` (their count, the
+    // oldest and the newest of them), and the newest two stamps of all (0 = none)
+    int framesSince(bool presents, int64_t from, int64_t to, int64_t& first, int64_t& lastIn, int64_t& last,
+                    int64_t& prev)
+    {
+        AcquireSRWLockExclusive(&lk);
+        const int64_t* ring = presents ? presRing : arrRing;
+        const uint64_t count = presents ? presCount : arrCount;
+        int n = 0;
+        first = lastIn = 0;
+        last = count ? ring[(count - 1) % kArrN] : 0;
+        prev = count > 1 ? ring[(count - 2) % kArrN] : 0;
+        const uint64_t lo = count > kArrN ? count - kArrN : 0;
+        for (uint64_t i = count; i > lo; --i)
+        {
+            const int64_t t = ring[(i - 1) % kArrN];
+            if (t > to)
+                continue;
+            if (t < from)
+                break;
+            if (!n)
+                lastIn = t;
+            first = t;
+            n++;
+        }
+        ReleaseSRWLockExclusive(&lk);
+        return n;
     }
 
     // hand out the newest frame; -3 = none pending, -2 = resized, -1 = failure,
@@ -1064,7 +1173,13 @@ struct Capture
     void requestRefresh()
     {
         if (targetWnd)
+        {
+            AcquireSRWLockExclusive(&lk);
+            refreshAskTs = nowQpc100();
+            askRing[askCount++ % 64] = refreshAskTs;
+            ReleaseSRWLockExclusive(&lk);
             InvalidateRect(targetWnd, nullptr, FALSE);
+        }
     }
 
     // Copy the client sub-region of the full-window capture into dst (a cw x ch resource).
