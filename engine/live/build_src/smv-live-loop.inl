@@ -219,7 +219,7 @@ static const char* dlssgNth(int k)
 // frame by a writer thread (a frame arriving while the last one is still being written is dropped, counted), and every
 // present it shares read back on THIS process's D3D12 device: its queue waits the slot's fence value and copies the
 // slot into a scratch texture. Nothing it reads is presented: the overlay keeps today's direct route.
-struct Stage1HdrView // dlssg2f's Stage1Hdr (engine\dlssg\build_src\main.cpp), version 1
+struct Stage1HdrView // dlssg2f's Stage1Hdr (engine\dlssg\build_src\main.cpp), version 1 to 3
 {
     uint32_t magic, version;
     volatile uint64_t frames;
@@ -230,12 +230,18 @@ struct Stage1HdrView // dlssg2f's Stage1Hdr (engine\dlssg\build_src\main.cpp), v
     volatile uint64_t slotSeq[16];
     volatile int64_t slotQpc[16];
     volatile uint32_t slotInput[16];
+    volatile uint32_t wantGen, gen; // version 2: the multiple asked of a running stage, and the one it runs
 };
+static const uint32_t kStageOff = 0xFFFFFFFFu; // version 3's ask for 1x (dlssg2f's kGenOff): DLSS-G off, gen 0
 
 struct CascadeProbe
 {
     HANDLE job = nullptr, hProc = nullptr, hIn = nullptr, hOut = nullptr, hErr = nullptr, hMap = nullptr;
     const Stage1HdrView* hdr = nullptr;
+    Stage1HdrView* hdrW = nullptr; // the same view, written only for an ask (askGen)
+    bool inPlace = false;          // a version 2 stage: its multiple changes in place (askGen)
+    bool passOk = false;           // a version 3 stage: it also takes 1x, its input passed through as it is
+    uint32_t asked = 0;            // the numFramesToGenerate asked last (0 = none, kStageOff = 1x)
     std::thread errPump, writer, reader;
     std::mutex m;
     std::condition_variable cv;
@@ -293,13 +299,46 @@ struct CascadeProbe
         return false;
     }
 
+    // ask a running version 2 stage for another multiple mult (2..6; 1 on version 3): it applies it at its next
+    // present; false = it cannot
+    bool askGen(int mult)
+    {
+        if (!inPlace || !hdrW || mult < 1 || (mult == 1 && !passOk))
+            return false;
+        asked = mult == 1 ? kStageOff : (uint32_t)(mult - 1);
+        hdrW->wantGen = asked;
+        return true;
+    }
+    // the stage runs what was asked last (or nothing was asked); a refused ask clears wantGen
+    uint32_t askedGen() const
+    {
+        return asked == kStageOff ? 0 : asked;
+    }
+    bool genHeld() const
+    {
+        return !asked || hdr->gen == askedGen();
+    }
+    bool askRefused() const
+    {
+        return asked && hdr->wantGen == 0 && hdr->gen != askedGen();
+    }
+
+    // the probe's place in the chain before any start: its upstream and its share tag (a probe on another probe's ring:
+    // b, one on a b probe's ring, the final enlarge's third helper: c), so stages started at once name each other
+    void prepare(const CascadeProbe* upstream)
+    {
+        up = upstream;
+        tag = L"live" + std::to_wstring(GetCurrentProcessId()) + (up ? (up->up ? L"c" : L"b") : L"");
+    }
+
     // bgra: SDR frames in B8G8R8A8 order (the effects route's slots and back buffer), else R8G8B8A8; upstream = a
     // running probe whose ring this one takes as its input (its stage number 2, never fed by the session)
     bool start(ID3D12Device* dev, uint32_t w, uint32_t h, int gen, bool hdr10, bool presentMode, bool bgra,
                const CascadeProbe* upstream = nullptr)
     {
         present = presentMode;
-        up = upstream;
+        if (tag.empty())
+            prepare(upstream);
         fw = w;
         fh = h;
         wchar_t exePath[MAX_PATH]{};
@@ -313,8 +352,7 @@ struct CascadeProbe
         wchar_t full[MAX_PATH]{};
         if (GetFullPathNameW(dir.c_str(), MAX_PATH, full, nullptr))
             dir = full;
-        tag = L"live" + std::to_wstring(GetCurrentProcessId()) + (up ? L"b" : L"");
-        const int stageNo = up ? 2 : 1;
+        const int stageNo = up ? (up->up ? 3 : 2) : 1;
         job = CreateJobObjectW(nullptr, nullptr);
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
         li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -439,13 +477,17 @@ struct CascadeProbe
             return false;
         }
         const std::wstring mn = L"smv_dg1_" + tag + L"_hdr";
-        hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, mn.c_str());
-        hdr = hMap ? (const Stage1HdrView*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(Stage1HdrView)) : nullptr;
-        if (!hdr || hdr->magic != 0x31564D53 || hdr->version != 1 || hdr->ring > 16)
+        hMap = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, mn.c_str());
+        // the whole mapping (0): a version 1 stage's header is shorter than this view
+        hdrW = hMap ? (Stage1HdrView*)MapViewOfFile(hMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0) : nullptr;
+        hdr = hdrW;
+        if (!hdr || hdr->magic != 0x31564D53 || hdr->version < 1 || hdr->version > 3 || hdr->ring > 16)
         {
             LOG("cascade probe: no stage-1 header\n");
             return false;
         }
+        inPlace = hdr->version >= 2;
+        passOk = hdr->version >= 3;
         // stage 2 copies a ring frame straight into its back buffer: the same size and format or no cascade (a
         // dlssg2f that does not know --bgra shares R8G8B8A8)
         const uint32_t wantFmt = (uint32_t)(hdr10  ? DXGI_FORMAT_R10G10B10A2_UNORM
@@ -504,7 +546,7 @@ struct CascadeProbe
             reader = std::thread([this] { readLoop(); });
         LOG("cascade probe: stage %d up (%s), %ux%u x%d, its ring of %u opened on this device%s\n", stageNo,
             line.c_str(), w, h, gen + 1, n,
-            up        ? ", from stage 1's ring, the session presents it"
+            up        ? (up->up ? ", from stage 2's ring" : ", from stage 1's ring")
             : present ? ", stage 2 presents it"
                       : "");
         return true;
@@ -751,6 +793,7 @@ struct CascadeProbe
         if (hdr)
             UnmapViewOfFile((LPCVOID)hdr);
         hdr = nullptr;
+        hdrW = nullptr;
         for (HANDLE x : {hProc, hOut, hErr, hMap, ev, job})
             if (x)
                 CloseHandle(x);
@@ -2101,6 +2144,46 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 genFrames, genFrames + 1);
         }
 
+        // DLSS 4.5 AT THE WORKING SIZE (SMV_DLSSG_AT_WORK=0 = off): below DLAA with no upscaler picked (RTX VSR, AMD FSR
+        // 4, Anime4K and Upscale to make their frames at the presented size), DLSS-G runs at the working size itself
+        // (never more pixels than the share picked), which liveWorkSize then keeps at least kDlssgMinWork on the
+        // canvas's shorter side, so the capture is shrunk once, straight to it; every DLSS-G pass of a plan runs in a
+        // helper at that size and the session enlarges every frame, real or generated, to the presented size with the
+        // native fit's Lanczos (Host::lzOn): the order RIFE's tweens take. The session's own pass (a one-pass plan, the
+        // warm-up, a fallback) runs at the presented size on those enlarged frames
+        g_presW = g_presH = 0;
+        g_dlssgWorkFloor = false;
+        if (g_fgOver && !g_rtxVsr && !g_fsrUp && !g_a4kUp && g_upscaleH <= 0 && lkEnv("SMV_DLSSG_AT_WORK") != "0")
+        {
+            g_dlssgWorkFloor = true;
+            int pw = 0, ph = 0, md = 0, mw = 0, mh = 0, raised = 0;
+            liveWorkSize((int)capW, (int)capH, pw, ph, md, mw, mh, &raised);
+            const double k = pw > 0 ? (double)mw / pw : 1.0;
+            // the frames = the working size when the picture fills the canvas, else the canvas at the working size's
+            // scale (the nearest even sides) with the picture letterboxed inside
+            const bool fills = pw == (int)W && ph == (int)H;
+            const uint32_t sw = fills ? (uint32_t)mw : 2u * (uint32_t)lround(W * k / 2.0),
+                           sh = fills ? (uint32_t)mh : 2u * (uint32_t)lround(H * k / 2.0);
+            if (!(mw > 0 && k < 1.0 && sw < W && sh < H))
+                g_dlssgWorkFloor = false;
+            else
+            {
+                // SMV_DLSSG_STRETCH=1: DXGI's bilinear stretch of a swap chain at the frames' size instead (the
+                // session's own pass at that size, no enlarge here: the look A/B)
+                host.lzOn = lkEnv("SMV_DLSSG_STRETCH") != "1";
+                LOG("DLSS 4.5 at the working size: its frames %ux%u (the %dx%d working size%s), %s the %ux%u "
+                    "presented%s\n",
+                    sw, sh, mw, mh, raised == 3 ? ", raised to DLSS 4.5's minimum, 128 px a side" : "",
+                    host.lzOn ? "enlarged to" : "stretched over", W, H,
+                    host.lzOn ? " by the native fit's Lanczos" : " (SMV_DLSSG_STRETCH=1)");
+                g_presW = W;
+                g_presH = H;
+                host.winW = W;
+                host.winH = H;
+                W = sw;
+                H = sh;
+            }
+        }
         rc = host.init();
         if (rc)
             return rc;
@@ -2141,6 +2224,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                        loadingNote().c_str());
 
         PipeServer srv;
+        // the final enlarge's tap tables: the native k_rsTab once the native pipeline is up (SMV_DLSSG_LZ_TAB=cpu =
+        // the CPU port, the A/B of the two)
+        if (host.lzOn)
+            host.lzTabFn = [&srv, cpu = lkEnv("SMV_DLSSG_LZ_TAB") == "cpu"](int in, int out,
+                                                                            std::vector<uint8_t>& tab) {
+                return nativeRsTabHost(cpu ? nullptr : srv.nr, in, out, tab);
+            };
         double srcMeasFps = 0; // the source rate measured before the server spawns (0 = not measured)
         if (g_backend == BK_SERVER)
         {
@@ -2285,8 +2375,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     sl::DLSSGOptions on{};
                     on.mode = sl::DLSSGMode::eOn;
                     on.numFramesToGenerate = (uint32_t)want;
-                    on.mvecDepthWidth = panvec::vecSize(W);
-                    on.mvecDepthHeight = panvec::vecSize(H);
+                    on.mvecDepthWidth = panvec::vecSize(host.scW());
+                    on.mvecDepthHeight = panvec::vecSize(host.scH());
                     if (slDLSSGSetOptions(host.vp, on) == sl::Result::eOk)
                         host.genFrames = want;
                     LOG("measured ~%.1f fps source, target %d fps: DLSS-G %dx\n", srcMeasFps, g_targetFps,
@@ -2605,12 +2695,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 !host.presentTail(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, srv.shmPitch))
                 return false;
             if (gen <= 0)
-                return true; // no pass here: a kept cascade's ring frames are presented as they are
+            {
+                host.genFrames = 0; // the count a later input gap re-warms with: the plan makes no frames here
+                return true;        // no pass here: a kept cascade's ring frames are presented as they are
+            }
             sl::DLSSGOptions on{};
             on.mode = sl::DLSSGMode::eOn;
             on.numFramesToGenerate = (uint32_t)gen;
-            on.mvecDepthWidth = panvec::vecSize(W);
-            on.mvecDepthHeight = panvec::vecSize(H);
+            on.mvecDepthWidth = panvec::vecSize(host.scW());
+            on.mvecDepthHeight = panvec::vecSize(host.scH());
             if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
                 return false;
             host.genFrames = gen;
@@ -2692,8 +2785,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             sl::DLSSGOptions on{};
             on.mode = sl::DLSSGMode::eOn;
             on.numFramesToGenerate = (uint32_t)genFrames;
-            on.mvecDepthWidth = panvec::vecSize(W);
-            on.mvecDepthHeight = panvec::vecSize(H);
+            on.mvecDepthWidth = panvec::vecSize(host.scW());
+            on.mvecDepthHeight = panvec::vecSize(host.scH());
             if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
                 return false;
             for (int i = 0; i < 2; i++)
@@ -2790,7 +2883,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if (g_fill && !park && !g_noFillMouse)
             {
                 int dw = 0, dh = 0, x0 = 0, y0 = 0;
-                lkFitRect((int)capW, (int)capH, (int)W, (int)H, dw, dh, x0, y0);
+                lkFitRect((int)capW, (int)capH, (int)(g_presW ? g_presW : W), (int)(g_presH ? g_presH : H), dw, dh, x0,
+                          y0);
                 fillMouse.start(target, host.hwnd, mon,
                                 RECT{mon.left + x0, mon.top + y0, mon.left + x0 + dw, mon.top + y0 + dh});
             }
@@ -2829,9 +2923,24 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // 2 s derive when dlssgSnap's multiple exceeds the GPU's one-pass limit, or is an even one at or under it (the
         // 2x split, cascPlan), twice in a row (cascWantPrev), M = cascM1 x cascM2; cascWarm = stage 1 runs and is fed beside the direct pass until it shares a frame; cascShown =
         // the multiple the stats line reports while stage 2 presents its frames (0 = one pass). Past lim x lim three:
-        // cascM1 x cascM2 x cascM3 (cascM3 1 = two); cascLow = 2 s windows in a row three stages ran short of theirs;
-        // cascMaxM = three stages fell short: the next plan's multiple at most (what the GPU held, 0 = none)
+        // cascM1 x cascM2 x cascM3 (cascM3 1 = two); cascLow = 2 s windows in a row a watched plan (three stages, or
+        // two above the one-pass limit) ran short of its multiple; cascMaxM = such a plan fell short: the next plan's
+        // multiple at most (what the GPU held, 0 = none)
         int cascM = 0, cascM1 = 0, cascM2 = 0, cascM3 = 1, cascWantPrev = -1, cascShown = 0, cascLow = 0, cascMaxM = 0;
+        bool cascTwoTopShort = false; // the two-pass top (the limit x the limit) fell short this session
+        ULONGLONG cascStepTick = 0;   // an in-place step's ask (cascSwitch), until every helper runs it
+        // THE CLIMB (SMV_LIVE_DLSSG_CLIMB=0 = off: the target's rung first): a plan for a target past the panel's refresh
+        // whose rung (cascTopM) lies past the first rung above one pass starts its helpers at the target's multiples
+        // (their memory for the top), asks
+        // them down to that first rung before its takeover and climbs in place, a rung of at least 1.2 x at a time,
+        // while each holds its multiple (85 %, capture drops at most 3 a second); a rung that does not is the ceiling
+        // (cascCeilM): the plan steps back to the rung that held (cascHeld = M, m1, m2, m3) and the next try waits
+        // cascClimbWait (15 s, doubling to 240 s), so a ceiling check is one in-place switch, never a restart
+        const bool cascClimbOn = lkEnv("SMV_LIVE_DLSSG_CLIMB") != "0";
+        int cascTopM = 0, cascCeilM = 0, cascHoldWins = 0, cascClimbWins = 0;
+        int cascHeld[4] = {0, 0, 0, 0}, cascFirst[4] = {0, 0, 0, 0}; // cascFirst = the first rung, asked at takeover
+        bool cascClimbing = false; // the rung on show is a climb's try, judged on its second full window
+        ULONGLONG cascClimbTick = 0, cascClimbWait = 0;
         // a non-whole multiple (dlssgKeepPlan): the helpers make cascM, the session shows every cascKeep-th ring frame
         // and makes none itself; cascShown / cascKeep = the multiple presented
         int cascKeep = 1, cascKeepPrev = 1;
@@ -3607,8 +3716,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const bool cascAuto = cascMode.empty() && host.useSL && (g_fgOver ? xqRoute : !xqRoute) && !g_genExplicit &&
                               g_targetFps > 0 && cascW >= 128 && cascH >= 128;
         std::unique_ptr<CascadeProbe> cascPend; // stage 1 starting on cascTh (cascRes -1 = running, 1 = up, 0 = failed)
-        // three stages: cascUp = stage 1, fed by the session; casc = stage 2 on its ring (dlssg2f --from), presented
-        std::unique_ptr<CascadeProbe> cascUp, cascPendUp;
+        // three stages: cascUp = stage 1, fed by the session; casc = stage 2 on its ring (dlssg2f --from), presented.
+        // The final enlarge (host.lzOn) runs every pass in a helper: cascMid = stage 2 between them when a plan has
+        // three, casc then stage 3 on cascMid's ring
+        std::unique_ptr<CascadeProbe> cascUp, cascPendUp, cascMid, cascPendMid;
+        // the plan running has three passes in helpers or here (the shortfall rule's three-stage case)
+        auto cascThree = [&]() { return host.lzOn ? cascMid != nullptr : cascUp != nullptr; };
         std::thread cascTh;
         std::atomic<int> cascRes{-1};
         // the one-pass limit: numFramesToGenerateMax + 1 (6 on RTX 50, 2 on RTX 40), 6 while the driver has not said;
@@ -3650,11 +3763,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const int one = cascOnePass();
             LOG("DLSS 4.5's second %spass%s ended (%s): back to one pass at %dx\n", cascUp ? "and third " : "",
                 cascUp ? "es" : "", why, one);
+            cascStepTick = 0;
             casc->kill();
+            if (cascMid)
+                cascMid->kill();
             if (cascUp)
                 cascUp->kill();
             casc->stop();
             casc.reset();
+            if (cascMid)
+            {
+                cascMid->stop();
+                cascMid.reset();
+            }
             if (cascUp)
             {
                 cascUp->stop();
@@ -3677,108 +3798,42 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             return host.readSlot(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, (UINT64)srv.shmPitch * H,
                                  [&](const uint8_t* p) { to->feedRows(p, srv.shmPitch); });
         };
-        // every check covers both probes of three stages (the session feeds cascUp, presents casc)
-        auto cascDead = [&]() { return casc->dead() || (cascUp && cascUp->dead()); };
+        // every check covers every probe of a plan (the session feeds cascUp, presents casc)
+        auto cascDead = [&]() { return casc->dead() || (cascUp && cascUp->dead()) || (cascMid && cascMid->dead()); };
         auto cascStalled = [&]() {
-            const bool a = casc->stalled(), b = cascUp && cascUp->stalled();
-            return a || b;
+            const bool a = casc->stalled(), b = cascUp && cascUp->stalled(), c = cascMid && cascMid->stalled();
+            return a || b || c;
         };
         auto cascReport = [&](double secs) {
             if (cascUp)
                 cascUp->report(secs);
+            if (cascMid)
+                cascMid->report(secs);
             casc->report(secs);
         };
-        // three stages below 85 % of their multiple three 2 s windows in a row: what the GPU affords is less, so they
-        // end and the next plan takes the largest multiple at most what they held, with a tenth to spare (cascMaxM);
-        // false = that fallback's reset failed
-        auto cascShortCheck = [&](double capFps, double outFps) -> bool {
-            if (!cascUp || !cascShown || hidden || capFps < 0.5)
-            {
-                cascLow = 0;
-                return true;
-            }
-            cascLow = outFps < 0.85 * cascShown / cascKeep * capFps ? cascLow + 1 : 0;
-            if (cascLow < 3)
-                return true;
-            char why[96];
-            snprintf(why, sizeof(why), "%.2fx of %.2fx, what the GPU affords is less", outFps / capFps,
-                     (double)cascShown / cascKeep);
-            cascMaxM = (std::max)(2, (std::min)(cascShown - 1, (int)(outFps / capFps * cascKeep / 0.9)));
-            cascTried = false;
-            cascWantPrev = -1;
-            return cascFallback(why);
+        // the plan the rules give a captured rate (cascPlan starts it, a shortfall steps a running plan to it in place):
+        // the rung for target / captured (capped by cascMaxM after a shortfall), its passes m1, m2, m3 and its keep
+        // a whole rung with a DLSS-G stage whose output rate lands on the panel's refresh (within 2 %) paces at ~96 % of
+        // it: 15x of 24 fps on a 360 Hz panel presents 346 of 360, while 16x presents 384 of 384 and 18x 432 of 432. The
+        // stages: stage 1 at a, stage 2 (three stages) at a x b, the last at Mx
+        auto cascOnRefresh = [&](int a, int b, int c, int Mx, double capFps) {
+            auto on = [&](double rate) { return panelHzMode > 1.0 && fabs(rate - panelHzMode) <= 0.02 * panelHzMode; };
+            return on(a * capFps) || (c > 1 && on((double)a * b * capFps)) || on((double)Mx * capFps);
         };
-        // a plan's start done (cascRes >= 0): its probes join the session warming (fed, not shown yet), or end
-        auto cascTakePend = [&]() {
-            cascTh.join();
-            if (cascRes.load() == 1)
-            {
-                casc = std::move(cascPend);
-                cascUp = std::move(cascPendUp);
-                casc->present = false;
-                cascWarm = true;
-                return;
-            }
-            cascPend->stop();
-            cascPend.reset();
-            if (cascPendUp)
-            {
-                cascPendUp->stop();
-                cascPendUp.reset();
-            }
-            LOG("DLSS 4.5 stays at %dx: its second pass did not start\n", cascOnePass());
-        };
-        // the presented stage shared its first frame: the session presents its frames from now on; returns the
-        // session's own pass (its multiple between those frames)
-        auto cascTakeover = [&]() -> int {
-            cascWarm = false;
-            casc->present = true;
-            casc->keep = (uint32_t)cascKeep;
-            casc->skipToNewest();
-            cascStalled();
-            cascShown = cascM;
-            cascLow = 0;
-            if (cascKeep > 1)
-            {
-                char third[32] = "";
-                if (cascM2 > 1)
-                    snprintf(third, sizeof third, ", %dx in a third", cascM2);
-                LOG("DLSS 4.5 at %.2fx: %dx in a second process%s, every %s of its frames presented here, none made "
-                    "here\n",
-                    (double)cascM / cascKeep, cascM1, third, dlssgNth(cascKeep));
-            }
-            else if (cascM3 > 1)
-                LOG("DLSS 4.5 at %dx: %dx in a second process, %dx in a third, then %dx here between those frames\n",
-                    cascM, cascM1, cascM2, cascM3);
-            else
-                LOG("DLSS 4.5 at %dx: %dx in a second process, then %dx here between those frames\n", cascM, cascM1,
-                    cascM2);
-            return cascKeep > 1 ? 1 : cascM3 > 1 ? cascM3 : cascM2;
-        };
-        // more than one pass (above the limit, or an even multiple's 2x split at or under it): the plan, once a session,
-        // when the same multiple is derived twice in a row (either loop's 2 s window); one pass runs meanwhile. Stage 1 takes cascW x cascH frames in the back buffer's format:
-        // the capture's R8G8B8A8 / R10G10B10A2 packing on the direct route, the output slots' B8G8R8A8 / R10G10B10A2
-        // on the effects route. Past lim x lim three passes when the room holds both processes (else the best two); after
-        // three fell short of their multiple, at most what they held (cascMaxM)
-        auto cascPlan = [&](double capFps) {
+        auto cascChoose = [&](double capFps, int& m1, int& m2, int& m3, int& keep) -> int {
             const int lim = liveDlssgLimit();
-            int m1 = 0, m2 = 0, m3 = 1, keep = 1;
+            m1 = 0;
+            m2 = 0;
+            m3 = 1;
+            keep = 1;
             const double want = (double)g_targetFps / capFps;
             int M0 = dlssgSnap(want, lim, m1, m2, nullptr, &m3);
             if (cascMaxM && M0 > cascMaxM)
                 M0 = dlssgAtMost(cascMaxM, lim, m1, m2, &m3);
-            // a whole rung with a DLSS-G stage whose output rate lands on the panel's refresh (within 2 %) paces at
-            // ~96 % of it: 15x of 24 fps on a 360 Hz panel presents 346 of 360, while 16x presents 384 of 384 and
-            // 18x 432 of 432. Such a plan steps up to the next rung: the panel then shows its full rate. The stages:
-            // stage 1 at m1, stage 2 (three stages) at m1 x m2, the session's own pass at M. (A kept plan takes its
-            // first candidate: a 7.5x keep read 173.5 of 180 as 15x every 2nd and as 30x every 4th alike, so the
-            // refresh is not what it loses to.)
-            auto stageOnRefresh = [&](int a, int b, int c, int Mx) {
-                auto on = [&](double rate) {
-                    return panelHzMode > 1.0 && fabs(rate - panelHzMode) <= 0.02 * panelHzMode;
-                };
-                return on(a * capFps) || (c > 1 && on((double)a * b * capFps)) || on((double)Mx * capFps);
-            };
+            // a rung on the panel's refresh (cascOnRefresh) steps up to the next rung: the panel then shows its full
+            // rate. (A kept plan takes its first candidate: a 7.5x keep read 173.5 of 180 as 15x every 2nd and as 30x
+            // every 4th alike, so the refresh is not what it loses to.)
+            auto stageOnRefresh = [&](int a, int b, int c, int Mx) { return cascOnRefresh(a, b, c, Mx, capFps); };
             // no whole rung within 3 % of the want: a rung and a keep (dlssgKeepPlan), unless the keep plan is off or
             // the rung is above what a plan that fell short held (cascMaxM)
             if (cascKeepOn && fabs((double)M0 - want) > 0.03 * want)
@@ -3815,14 +3870,373 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 m1 = 2;
                 m2 = M0 / 2;
             }
+            return M0;
+        };
+        // a plan's multiples applied to the RUNNING passes when every helper takes an ask (dlssg2f's Stage1Hdr version
+        // 2): each helper switches its multiple at its next present, the session's own last pass (the DLAA route, whole
+        // plans) by the same slDLSSGSetOptions (DLSS-G's numFramesToGenerate changes in place, the frames byte-identical
+        // to a fresh run at that count: harness dlssg_gen_inplace), so the session keeps presenting instead of one pass
+        // for the ~11 s new helpers take to start. A plan of fewer passes than run gives the later ones 1x (version 3:
+        // DLSS-G off there, the frames passed through). SMV_LIVE_DLSSG_INPLACE=0 = the restart. False = not applicable
+        // (the caller restarts)
+        const bool cascInPlaceOn = lkEnv("SMV_LIVE_DLSSG_INPLACE") != "0";
+        // the passes running: host.lzOn = every pass a helper (stage 1 cascUp, stage 2 cascMid, the presented casc),
+        // else the session's own DLSS-G makes the last
+        auto cascRunning = [&]() { return host.lzOn ? (cascMid ? 3 : cascUp ? 2 : 1) : (cascUp ? 3 : 2); };
+        auto cascSwitch = [&](int M, int m1, int m2, int m3, int keep, const char* why) -> bool {
+            const auto inPl = [](const std::unique_ptr<CascadeProbe>& p) { return !p || p->inPlace; };
+            const auto pass = [](const std::unique_ptr<CascadeProbe>& p) { return !p || p->passOk; };
+            if (!cascInPlaceOn || !casc || !inPl(casc) || !inPl(cascUp) || !inPl(cascMid))
+                return false;
+            const int passes = m3 > 1 ? 3 : m2 > 1 ? 2 : 1;
+            const int running = cascRunning();
+            if (running < 1 || running > 3 || passes > running ||
+                (passes < running && !(pass(casc) && pass(cascUp) && pass(cascMid))) || M == cascM ||
+                (!host.lzOn && (keep > 1 || cascKeep > 1)))
+                return false;
+            // the running passes' multiples: the plan's on the LAST passes, 1x before them (only the source frames take
+            // the extra hop; the session's own pass, the cheapest per frame, keeps the last factor on the DLAA route)
+            int r[3] = {1, 1, 1};
+            const int pm[3] = {m1, m2, m3};
+            for (int i = 0; i < passes; i++)
+                r[running - passes + i] = pm[i];
+            bool ok;
+            if (host.lzOn) // stage 1 = cascUp (two or three), stage 2 = cascMid (three), the presented stage = casc
+                ok = running == 3   ? cascUp->askGen(r[0]) && cascMid->askGen(r[1]) && casc->askGen(r[2])
+                     : running == 2 ? cascUp->askGen(r[0]) && casc->askGen(r[1])
+                                    : casc->askGen(r[0]);
+            else // stage 1 = cascUp (three) or casc (two), stage 2 = casc (three), then the session's pass
+            {
+                ok = running == 3 ? cascUp->askGen(r[0]) && casc->askGen(r[1]) : casc->askGen(r[0]);
+                const int own =
+                    (running == 3 ? r[2] : r[1]) - 1; // the session's own pass's numFramesToGenerate (0 = off)
+                if (ok)
+                {
+                    sl::DLSSGOptions on{};
+                    on.mode = own ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+                    if (own)
+                    {
+                        on.numFramesToGenerate = (uint32_t)own;
+                        on.mvecDepthWidth = panvec::vecSize(host.scW());
+                        on.mvecDepthHeight = panvec::vecSize(host.scH());
+                    }
+                    else
+                        on.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+                    ok = slDLSSGSetOptions(host.vp, on) == sl::Result::eOk;
+                    if (ok)
+                    {
+                        host.genFrames = own;
+                        if (!g_fgOver)
+                            genFrames = own;
+                    }
+                }
+            }
+            if (!ok)
+                return false;
+            char passesTxt[64];
+            if (running == 3)
+                snprintf(passesTxt, sizeof passesTxt, "%dx, %dx, %dx", r[0], r[1], r[2]);
+            else if (running == 2)
+                snprintf(passesTxt, sizeof passesTxt, "%dx, %dx", r[0], r[1]);
+            else
+                snprintf(passesTxt, sizeof passesTxt, "%dx", r[0]);
+            LOG("DLSS 4.5 steps to %.2fx in place (%s in the running %s; %s): no restart\n", (double)M / keep,
+                passesTxt, host.lzOn ? "helpers" : "helpers and here", why);
+            cascM = M;
+            cascM1 = r[0];
+            cascM2 = r[1];
+            cascM3 = r[2];
+            cascKeep = keep;
+            casc->keep = (uint32_t)keep;
+            cascShown = M;
+            cascLow = 0;
+            cascStepTick = GetTickCount64();
+            return true;
+        };
+        // a shortfall's next plan (cascChoose), when it is smaller, in place
+        auto cascStepInPlace = [&](double capFps, const char* why) -> bool {
+            int m1 = 0, m2 = 0, m3 = 1, keep = 1;
+            const int M = cascChoose(capFps, m1, m2, m3, keep);
+            return M < cascM && cascSwitch(M, m1, m2, m3, keep, why);
+        };
+        // the climb's next rung above `from` within the running passes: the first of at least 1.2 x from, else the
+        // largest above it; at most the top, under the ceiling, never one on the panel's refresh; 0 = none
+        auto cascRungUp = [&](int from, double capFps, int& m1, int& m2, int& m3) -> int {
+            const int topM = cascCeilM ? (std::min)(cascTopM, cascCeilM - 1) : cascTopM;
+            const auto rs = dlssgRungs(liveDlssgLimit(), cascRunning());
+            const DlssgRung *step = nullptr, *largest = nullptr;
+            for (const auto& r : rs)
+            {
+                if (r.m <= from || r.m > topM || (largest && largest->m == r.m) ||
+                    cascOnRefresh(r.a, r.b, r.c, r.m, capFps))
+                    continue;
+                largest = &r;
+                if (!step && r.m >= 1.2 * from)
+                    step = &r;
+            }
+            const DlssgRung* pick = step ? step : largest;
+            if (!pick)
+                return 0;
+            m1 = pick->a;
+            m2 = pick->b;
+            m3 = pick->c;
+            return pick->m;
+        };
+        // the largest rung at most maxM within the running passes (the fewest passes for the same multiple); 0 = none
+        auto cascRungAtMost = [&](int maxM, int& m1, int& m2, int& m3) -> int {
+            const auto rs = dlssgRungs(liveDlssgLimit(), cascRunning());
+            const DlssgRung* pick = nullptr;
+            for (const auto& r : rs)
+                if (r.m <= maxM && (!pick || r.m > pick->m))
+                    pick = &r;
+            if (!pick)
+                return 0;
+            m1 = pick->a;
+            m2 = pick->b;
+            m3 = pick->c;
+            return pick->m;
+        };
+        // the climb's wait after a rung fell short: 15 s, doubling to 240 s
+        auto cascClimbBackOff = [&](int fell) {
+            cascCeilM = fell;
+            cascClimbWait = cascClimbWait ? (std::min)(cascClimbWait * 2, (ULONGLONG)240000) : 15000;
+            cascClimbTick = GetTickCount64() + cascClimbWait;
+        };
+        // three stages, or two above the one-pass limit (no keep: a keep is never capped by its cost), below 85 % of
+        // their multiple three 2 s windows in a row: what the GPU affords is less, so they end and the next plan takes
+        // the largest multiple at most what they held, with a tenth to spare (cascMaxM). Three stages that held less
+        // than the two-pass top (the limit x the limit) leave that rung its own try: the third stage's cost leaves
+        // with it (1 % of 2560x1440 from 21.5 fps: three passes held 28.5x, the next plan's 30x presented 634, 6x then
+        // 6x 723). False = that fallback's reset failed
+        auto cascShortCheck = [&](double capFps, double outFps, double dropRate) -> bool {
+            const int lim = liveDlssgLimit();
+            // an in-place step every helper took within 3 s, or the restart (a refused ask, or one never applied)
+            if (cascStepTick)
+            {
+                const auto held = [](const std::unique_ptr<CascadeProbe>& p) { return !p || p->genHeld(); };
+                const auto refused = [](const std::unique_ptr<CascadeProbe>& p) { return p && p->askRefused(); };
+                if (refused(casc) || refused(cascUp) || refused(cascMid) ||
+                    (GetTickCount64() - cascStepTick > 3000 && !(held(casc) && held(cascUp) && held(cascMid))))
+                {
+                    cascStepTick = 0;
+                    cascTried = false;
+                    cascWantPrev = -1;
+                    return cascFallback("a helper kept its multiple");
+                }
+                if (held(casc) && held(cascUp) && held(cascMid))
+                    cascStepTick = 0;
+            }
+            const bool watched = cascUp || (cascKeep == 1 && cascM > lim);
+            if (!watched || !cascShown || hidden || capFps < 0.5)
+            {
+                cascLow = 0;
+                return true;
+            }
+            // the climb (cascTopM): a rung holds when it presents 85 % of its multiple (the shortfall rule's own bar)
+            // with at most 3 capture drops a second; a climb's try is judged on its second full window (the first
+            // straddles the switch)
+            if (cascTopM && cascKeep == 1 && !cascStepTick)
+            {
+                const bool good = outFps >= 0.85 * cascShown * capFps && dropRate <= 3.0;
+                if (cascClimbing)
+                {
+                    if (++cascClimbWins < 2)
+                        return true;
+                    cascClimbing = false;
+                    if (good)
+                    {
+                        cascHeld[0] = cascShown;
+                        cascHeld[1] = cascM1;
+                        cascHeld[2] = cascM2;
+                        cascHeld[3] = cascM3;
+                        cascClimbWait = 0;
+                        cascHoldWins = 1; // the next window that holds climbs again
+                        return true;
+                    }
+                    cascClimbBackOff(cascShown);
+                    char why[128];
+                    snprintf(why, sizeof why,
+                             "%.2fx of %dx, %.1f capture drops a second: the GPU's ceiling, the next try in %llu s",
+                             outFps / capFps, cascShown, dropRate, (unsigned long long)(cascClimbWait / 1000));
+                    if (cascHeld[0] && cascSwitch(cascHeld[0], cascHeld[1], cascHeld[2], cascHeld[3], 1, why))
+                        return true;
+                    cascTopM = 0;
+                    cascTried = false;
+                    cascWantPrev = -1;
+                    return cascFallback(why);
+                }
+                cascHoldWins = good ? cascHoldWins + 1 : 0;
+                if (good && cascHoldWins >= 2)
+                {
+                    cascHeld[0] = cascShown;
+                    cascHeld[1] = cascM1;
+                    cascHeld[2] = cascM2;
+                    cascHeld[3] = cascM3;
+                    if (cascShown < cascTopM && GetTickCount64() >= cascClimbTick)
+                    {
+                        int m1 = 0, m2 = 0, m3 = 1;
+                        int up = cascRungUp(cascShown, capFps, m1, m2, m3);
+                        if (!up && cascCeilM)
+                        {
+                            cascCeilM = 0; // the wait is over: the ceiling is tried again
+                            up = cascRungUp(cascShown, capFps, m1, m2, m3);
+                        }
+                        char why[96];
+                        snprintf(why, sizeof why, "%.2fx held, the climb toward %dx", outFps / capFps, cascTopM);
+                        if (up && cascSwitch(up, m1, m2, m3, 1, why))
+                        {
+                            cascClimbing = true;
+                            cascClimbWins = 0;
+                            cascHoldWins = 0;
+                            return true;
+                        }
+                    }
+                }
+            }
+            cascLow = outFps < 0.85 * cascShown / cascKeep * capFps ? cascLow + 1 : 0;
+            if (cascLow < 3)
+                return true;
+            char why[96];
+            snprintf(why, sizeof(why), "%.2fx of %.2fx, what the GPU affords is less", outFps / capFps,
+                     (double)cascShown / cascKeep);
+            cascMaxM = (std::max)(2, (std::min)(cascShown - 1, (int)(outFps / capFps * cascKeep / 0.9)));
+            if (cascTopM && cascKeep == 1) // the climb: the largest rung under what held, in place; the climb waits
+            {
+                int m1 = 0, m2 = 0, m3 = 1;
+                const int fell = cascShown;
+                const int down = cascRungAtMost(cascMaxM, m1, m2, m3);
+                if (down && cascSwitch(down, m1, m2, m3, 1, why))
+                {
+                    cascClimbBackOff(fell);
+                    cascHeld[0] = 0;
+                    cascHoldWins = 0;
+                    cascClimbing = false;
+                    return true;
+                }
+            }
+            else
+            {
+                if (cascThree() && cascMaxM < lim * lim && !cascTwoTopShort)
+                    cascMaxM = lim * lim;
+                if (!cascThree() && cascShown == lim * lim)
+                    cascTwoTopShort = true; // the two-pass top fell short too: it is not tried again
+            }
+            if (cascStepInPlace(capFps, why))
+                return true;
+            cascTried = false;
+            cascWantPrev = -1;
+            return cascFallback(why);
+        };
+        // a plan's start done (cascRes >= 0): its probes join the session warming (fed, not shown yet), or end
+        auto cascTakePend = [&]() {
+            cascTh.join();
+            if (cascRes.load() == 1)
+            {
+                casc = std::move(cascPend);
+                cascUp = std::move(cascPendUp);
+                cascMid = std::move(cascPendMid);
+                casc->present = false;
+                cascWarm = true;
+                // the climb's first rung, asked of the helpers that started at the target's multiples (the session's
+                // own last pass on the DLAA route takes it at the takeover)
+                if (cascTopM && cascFirst[0])
+                {
+                    const int a = cascFirst[1], b = cascFirst[2], c = cascFirst[3];
+                    const bool ok = host.lzOn ? (cascMid  ? cascUp->askGen(a) && cascMid->askGen(b) && casc->askGen(c)
+                                                 : cascUp ? cascUp->askGen(a) && casc->askGen(b)
+                                                          : casc->askGen(a))
+                                              : (cascUp ? cascUp->askGen(a) && casc->askGen(b) : casc->askGen(a));
+                    if (ok)
+                    {
+                        LOG("DLSS 4.5 climbs from %dx: the GPU's ceiling is found in place, up to %dx\n", cascFirst[0],
+                            cascTopM);
+                        cascM = cascFirst[0];
+                        cascM1 = a;
+                        cascM2 = b;
+                        cascM3 = c;
+                        cascStepTick = GetTickCount64();
+                    }
+                    else
+                        cascTopM = 0;
+                }
+                return;
+            }
+            cascPend->stop();
+            cascPend.reset();
+            if (cascPendMid)
+            {
+                cascPendMid->stop();
+                cascPendMid.reset();
+            }
+            if (cascPendUp)
+            {
+                cascPendUp->stop();
+                cascPendUp.reset();
+            }
+            LOG("DLSS 4.5 stays at %dx: its second pass did not start\n", cascOnePass());
+        };
+        // the presented stage shared its first frame: the session presents its frames from now on; returns the
+        // session's own pass (its multiple between those frames)
+        auto cascTakeover = [&]() -> int {
+            cascWarm = false;
+            casc->present = true;
+            casc->keep = (uint32_t)cascKeep;
+            casc->skipToNewest();
+            cascStalled();
+            cascShown = cascM;
+            cascLow = 0;
+            if (host.lzOn)
+            {
+                char more[64] = "";
+                if (cascM3 > 1)
+                    snprintf(more, sizeof more, ", %dx in a third, %dx in a fourth", cascM2, cascM3);
+                else if (cascM2 > 1)
+                    snprintf(more, sizeof more, ", %dx in a third", cascM2);
+                char kept[48] = "every frame";
+                if (cascKeep > 1)
+                    snprintf(kept, sizeof kept, "every %s of its frames", dlssgNth(cascKeep));
+                LOG("DLSS 4.5 at %.2fx: %dx in a second process%s, %s enlarged here, none made here\n",
+                    (double)cascM / cascKeep, cascM1, more, kept);
+                return 1;
+            }
+            if (cascKeep > 1)
+            {
+                char third[32] = "";
+                if (cascM2 > 1)
+                    snprintf(third, sizeof third, ", %dx in a third", cascM2);
+                LOG("DLSS 4.5 at %.2fx: %dx in a second process%s, every %s of its frames presented here, none made "
+                    "here\n",
+                    (double)cascM / cascKeep, cascM1, third, dlssgNth(cascKeep));
+            }
+            else if (cascM3 > 1)
+                LOG("DLSS 4.5 at %dx: %dx in a second process, %dx in a third, then %dx here between those frames\n",
+                    cascM, cascM1, cascM2, cascM3);
+            else
+                LOG("DLSS 4.5 at %dx: %dx in a second process, then %dx here between those frames\n", cascM, cascM1,
+                    cascM2);
+            return cascKeep > 1 ? 1 : cascM3 > 1 ? cascM3 : cascM2;
+        };
+        // more than one pass (above the limit, or an even multiple's 2x split at or under it): the plan, once a session,
+        // when the same multiple is derived twice in a row (either loop's 2 s window); one pass runs meanwhile. Stage 1 takes cascW x cascH frames in the back buffer's format:
+        // the capture's R8G8B8A8 / R10G10B10A2 packing on the direct route, the output slots' B8G8R8A8 / R10G10B10A2
+        // on the effects route. Past lim x lim three passes when the room holds both processes (else the best two); after
+        // three fell short of their multiple, at most what they held (cascMaxM)
+        auto cascPlan = [&](double capFps) {
+            const int lim = liveDlssgLimit();
+            int m1 = 0, m2 = 0, m3 = 1, keep = 1;
+            const double want = (double)g_targetFps / capFps;
+            const int M0 = cascChoose(capFps, m1, m2, m3, keep);
             int M = M0;
             if ((M > lim || keep > 1 || m2 > 1) && M == cascWantPrev && keep == cascKeepPrev)
             {
                 cascTried = true;
                 const uint64_t room = nativeVideoMemoryRoom();
-                // the helpers: stage 1 at m1; for three stages, or a kept two-pass rung, stage 2 at m2 on its ring
-                bool two = m3 > 1 || (keep > 1 && m2 > 1);
-                uint64_t need = cascPrice(m1) + (two ? cascPrice(m2) : 0);
+                // the helpers: stage 1 at m1; for three stages, or a kept two-pass rung, stage 2 at m2 on its ring. The
+                // final enlarge (host.lzOn): every pass in a helper, m2 > 1 a second on stage 1's ring, m3 > 1 a third
+                // on the second's
+                bool two = host.lzOn ? m2 > 1 : (m3 > 1 || (keep > 1 && m2 > 1));
+                bool three = host.lzOn && m3 > 1;
+                uint64_t need = cascPrice(m1) + (two ? cascPrice(m2) : 0) + (three ? cascPrice(m3) : 0);
                 if (m3 > 1 && room && need > room)
                 {
                     LOG("DLSS 4.5: %dx (%dx, %dx, then %dx) needs ~%.0f MiB of video memory for its second and third "
@@ -3831,8 +4245,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     M = cascMaxM ? dlssgAtMost((std::min)(cascMaxM, lim * lim), lim, m1, m2)
                                  : dlssgSnap(want, lim, m1, m2);
                     m3 = 1;
-                    two = false;
-                    need = cascPrice(m1);
+                    two = host.lzOn && m2 > 1;
+                    three = false;
+                    need = cascPrice(m1) + (two ? cascPrice(m2) : 0);
                 }
                 if (room && need > room)
                 {
@@ -3853,7 +4268,52 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     cascM2 = m2;
                     cascM3 = m3;
                     cascKeep = keep;
-                    if (keep > 1)
+                    // the climb: the first rung above one pass with the plan's passes, when the target lies past it and
+                    // past the panel's refresh (a target at or under the refresh is a rate the user expects: its plan
+                    // runs as it is, a shortfall steps down in place; a target past it asks for what the GPU affords)
+                    cascTopM = cascCeilM = cascHoldWins = cascClimbWins = 0;
+                    cascHeld[0] = cascFirst[0] = 0;
+                    cascClimbing = false;
+                    cascClimbWait = cascClimbTick = 0;
+                    const int P = m3 > 1 ? 3 : m2 > 1 ? 2 : 1;
+                    const bool pastPanel = panelHzMode > 1.0 ? g_targetFps > 1.02 * panelHzMode : P == 3;
+                    if (cascClimbOn && cascInPlaceOn && keep == 1 && pastPanel)
+                    {
+                        const auto rs = dlssgRungs(lim, P);
+                        for (const auto& r : rs)
+                            if ((r.c > 1   ? 3
+                                 : r.b > 1 ? 2
+                                           : 1) == P &&
+                                r.m > lim && !cascOnRefresh(r.a, r.b, r.c, r.m, capFps))
+                            {
+                                if (r.m < M)
+                                {
+                                    cascTopM = M;
+                                    cascFirst[0] = r.m;
+                                    cascFirst[1] = r.a;
+                                    cascFirst[2] = r.b;
+                                    cascFirst[3] = r.c;
+                                }
+                                break;
+                            }
+                    }
+                    if (host.lzOn)
+                    {
+                        char passes[64], kept[40] = "";
+                        if (three)
+                            snprintf(passes, sizeof passes, "%dx, then %dx, then %dx", m1, m2, m3);
+                        else if (two)
+                            snprintf(passes, sizeof passes, "%dx, then %dx", m1, m2);
+                        else
+                            snprintf(passes, sizeof passes, "%dx", m1);
+                        if (keep > 1)
+                            snprintf(kept, sizeof kept, ", every %s frame shown", dlssgNth(keep));
+                        LOG("DLSS 4.5 plan: %.2fx for target %d fps at ~%.1f captured = %s in helpers%s, enlarged here "
+                            "(~%.0f MiB more video memory); starting %d helper%s\n",
+                            (double)M / keep, g_targetFps, capFps, passes, kept, need / 1048576.0,
+                            1 + (two ? 1 : 0) + (three ? 1 : 0), two ? "s" : "");
+                    }
+                    else if (keep > 1)
                     {
                         char passes[64];
                         if (two)
@@ -3876,18 +4336,46 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     cascPend = std::make_unique<CascadeProbe>();
                     if (two)
                         cascPendUp = std::make_unique<CascadeProbe>();
+                    if (three)
+                        cascPendMid = std::make_unique<CascadeProbe>();
                     cascRes = -1;
-                    CascadeProbe *p = cascPend.get(), *u = cascPendUp.get();
+                    CascadeProbe *p = cascPend.get(), *u = cascPendUp.get(), *mid = cascPendMid.get();
                     ID3D12Device* dev = host.device.Get();
                     const bool hdr10 = g_fgOver ? g_hdr : cap.hdrPack, bgra = g_fgOver && !g_hdr;
-                    // three: stage 1 first (the session feeds it), then stage 2 on its ring (the one presented)
-                    cascTh = std::thread([p, u, dev, w = cascW, h = cascH, m1, m2, hdr10, bgra, &cascRes] {
-                        cascRes = (u ? u->start(dev, w, h, m1 - 1, hdr10, true, bgra) &&
-                                           p->start(dev, w, h, m2 - 1, hdr10, true, bgra, u)
-                                     : p->start(dev, w, h, m1 - 1, hdr10, true, bgra))
-                                      ? 1
-                                      : 0;
-                    });
+                    // the presented probe's pass: the last of the plan's helpers
+                    const int mLast = !host.lzOn ? (u ? m2 : m1) : three ? m3 : two ? m2 : m1;
+                    // every stage starts at once (each one's Streamline + DLSS-G init, ~4 s, side by side instead of
+                    // one after another): the chain's tags first, so a later stage's --from names its upstream, whose
+                    // ring that dlssg2f waits for; SMV_LIVE_DLSSG_SERIAL_START=1 = one after another
+                    const bool serial = lkEnv("SMV_LIVE_DLSSG_SERIAL_START") == "1";
+                    cascTh = std::thread(
+                        [p, u, mid, dev, w = cascW, h = cascH, m1, m2, mLast, hdr10, bgra, serial, &cascRes] {
+                            if (u)
+                                u->prepare(nullptr);
+                            if (mid)
+                                mid->prepare(u);
+                            p->prepare(mid ? mid : u);
+                            bool okU = true, okM = true, okP = true;
+                            auto runU = [&] { okU = !u || u->start(dev, w, h, m1 - 1, hdr10, true, bgra); };
+                            auto runM = [&] { okM = !mid || mid->start(dev, w, h, m2 - 1, hdr10, true, bgra, u); };
+                            auto runP = [&] { okP = p->start(dev, w, h, mLast - 1, hdr10, true, bgra, mid ? mid : u); };
+                            if (serial)
+                            {
+                                runU();
+                                if (okU)
+                                    runM();
+                                if (okU && okM)
+                                    runP();
+                            }
+                            else
+                            {
+                                std::thread tu(runU), tm(runM);
+                                runP();
+                                tu.join();
+                                tm.join();
+                            }
+                            cascRes = okU && okM && okP ? 1 : 0;
+                        });
                 }
             }
             cascWantPrev = M0;
@@ -4682,7 +5170,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (casc)
                         cascReport(secs);
                     if (casc && casc->present && !hidden &&
-                        ((cascStalled() && !cascFallback("it stopped presenting")) || !cascShortCheck(capFps, outFps)))
+                        ((cascStalled() && !cascFallback("it stopped presenting")) ||
+                         !cascShortCheck(capFps, outFps, dropWin / secs)))
                     {
                         LOG("DLSS-G reset failed\n");
                         rc2 = 1;
@@ -5117,7 +5606,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (casc)
                         cascReport(secs);
                     if (casc && casc->present && !hidden &&
-                        ((cascStalled() && !cascFallback("it stopped presenting")) || !cascShortCheck(capFps, outFps)))
+                        ((cascStalled() && !cascFallback("it stopped presenting")) ||
+                         !cascShortCheck(capFps, outFps, dropWin / secs)))
                     {
                         LOG("DLSS-G reset failed\n");
                         rc2 = 1;
@@ -5257,14 +5747,20 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             cascPend->abortStart = true;
             if (cascPendUp)
                 cascPendUp->abortStart = true;
+            if (cascPendMid)
+                cascPendMid->abortStart = true;
             if (cascTh.joinable())
                 cascTh.join();
             cascPend->stop();
+            if (cascPendMid)
+                cascPendMid->stop();
             if (cascPendUp)
                 cascPendUp->stop();
         }
         if (casc)
             casc->stop(); // its reader queue lives on the host's device
+        if (cascMid)
+            cascMid->stop();
         if (cascUp)
             cascUp->stop();
         if (g_teardownTrace)

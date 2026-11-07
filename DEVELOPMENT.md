@@ -267,7 +267,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 
 ```
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
-  [--sharpen S] [--restore] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
+  [--sharpen S] [--restore | --restore-model ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--dlssg] [--no-gpu-fit]
   [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
@@ -511,7 +511,8 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   (the pad and the unshuffle folded into its loads), then folds the 48 sub-pixel planes at the half grid without a base
   add, 74.8 dB from the model in fp32. Any other graph (a 48-feature Performance file, another architecture, a file
   that is no ONNX) = no Restore the same way, with a line saying why (`Restore unavailable (...; a --restore-model runs
-  only in AnimeJaNai HD's SPAN-F3 form, the Balanced model's)`). On HDR planes (both routes) it
+  only in AnimeJaNai HD's SPAN-F3 form, the Balanced model's)`). `--restore-anime4k` = Anime4K's Restore CNN UL on
+  the Anime4K module's kernels (see `--anime4k` below). On HDR planes (all routes) it
   reads the frame's SDR view (`k_hdrEnc`, a brighter pixel scaled to white with its hue) and
   `k_hdrRestOut` adds back the light the view never held (the source fitted to the target when
   the size changes), DLSS 5's way: the SDR range comes out as from an SDR source (87 dB against
@@ -568,12 +569,26 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   pass (the sub-pixels + the source's bilinear 2x, added in fp32) while Restore's Lanczos fold reads them straight to
   the target with the clamp (no 8-bit round trip, the 2x frame never written; each 2x value computed once per block
   into shared memory for the taps that read it). An exact 2x target skips the Lanczos pair (the identity there):
-  `k_a4kFold2x` writes the clamped 2x values in one pass. No engine build and nothing in the
+  `k_a4kFold2x` writes the clamped 2x values in one pass. A target above 2x runs the net again on the exact 2x frame
+  (`k_a4kFold2x` into a planar buffer, the next pass's input): the fewest x2 passes whose 2^n reaches the ratio, at
+  most four, the buffers sized for the largest pass (too little video memory = one pass fewer, Lanczos covers the
+  rest), then the one Lanczos fit at the end; the setup line names the passes (`in 2 x2 passes`). Every Anime4K chain
+  ends with the shader set's Clamp_Highlights (`kA4kClampSrc`: before the first pass the 5 x 5 maximum of the
+  source's luma, two separable passes stored fp16 like its STATSMAX texture; after the last one every output pixel
+  whose luma exceeds the maximum's bilinear sample is lowered by the excess on all channels), `SMV_A4K_CLAMP=0`
+  leaves it out. No engine build and nothing in the
   model cache. HDR frames go in as their SDR view and come back to the codes the way RTX VSR's do. Its output equals
   the PyTorch net's within one 8-bit code (71 dB; the net equals libplacebo's run of the shader at 70 dB). A module
   that does not compile or load = Lanczos with the `Anime4K unavailable` line. A new upstream release: compare its UL
   shader's md5 with the one `kA4kWeights` names; a different file needs a new table (its weights in the same order,
   as fp32 bit patterns) and the identity gate. Downscales (F below 1) are folded into the decode.
+  `--restore-anime4k` (implies `--restore`; a `--restore-model` on the same command line wins) makes Restore Anime4K's
+  Restore CNN UL from the same release (`kA4kRestWeights`, md5 in its comment): the same kind of passes in the same
+  module (weights 6..12, seven 3 x 3 layers; `k_a4kRestFirst`, `k_a4kConvM16`, `k_a4kRestLast` = conv2d_7, the 1 x 1
+  over conv2d_3..7 to three channels and the shader's `result + MAIN`, clamped 0..1), at the source size, then
+  Restore's Lanczos pair when the target differs, and the clamp above (when the resize is Anime4K too, the statistics
+  are taken at Restore's input and the clamp waits for the resize's last pass: upstream's Mode A). The handoff names
+  it `NATIVE-PATH restore=native:anime4k`; nothing to look up, so it is always available.
 * `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame at the working size, after Restore and
   the resize, before the interpolation, DLAA (scaling
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
@@ -685,8 +700,10 @@ Output:
   own colour (an RGB source: 50.2 -> 65.2 dB against its own frames). AV1 and VVC write 4:2:0.
 * NVENC: constant-quality VBR at max effort, preset p7, full-resolution multipass, rc-lookahead 1,
   HEVC CQ 17, AV1 CQ 22 (verified against a lossless 8K master; CQ is saturated at max effort, the
-  effort ladder is what moves quality, and shallow lookahead beats deep). Above 120 fps output the
-  lookahead queue is dropped (it measured worse on tween-dense streams). `tune uhq` rejected (its
+  effort ladder is what moves quality, and shallow lookahead beats deep). HEVC adds lookahead level 1
+  (`-lookahead_level 1`, at depth 1, every output rate: smaller files at equal or better PSNR / VMAF
+  on most clips, and above 120 fps it beats no lookahead). AV1 and H.264 drop the lookahead queue
+  above 120 fps output (it measured worse on tween-dense streams). `tune uhq` rejected (its
   temporal filter rewrites content). VVC QP 17 with perceptual QP adaptation off; SVT-AV1 CRF 17
   preset 6. `SMV_CQ` overrides any CQ for measurement work.
 * HEVC and AV1 NVENC split-frame encoding is pinned OFF (`-split_encode_mode 15`; ffmpeg's `auto`
@@ -700,7 +717,11 @@ Output:
 * The Fast tier (`--enc-speed fast`, preset p4, GUI "Encoder speed") was dropped; the
   flag is refused.
 * Every audio, subtitle, chapter and font track is copied; the output auto-switches to `.mkv` when the tracks need it, and HDR into MKV keeps the
-  full metadata through a two-stage finalize. Source colour signalling rides through `setparams`;
+  full metadata through a two-stage finalize. Above 1000 fps it stays `.mp4`: ffmpeg's matroska muxer writes a 1 ms time
+  base (no finer scale), so MKV frames above 1000 fps share timestamps; `native.ts` then saves each subtitle track
+  beside the file (`encode.ts` saveSubsBeside: `<base>.<lang>.ass / .srt / .vtt / .sup`, mov_text as SRT, other kinds
+  skipped with a note), and an output named `.mkv` above 1000 fps is refused with the reason; the app's output name
+  follows the same rule (gates: harness `multi_cap_100x` `mkv1000_gate.py`, `gui_outname_check.py`). Source colour signalling rides through `setparams`;
   an RGB source (RGB, palette or gray pixels, or the `gbr` matrix) has no YUV matrix to carry, so
   its YUV output takes BT.709 (BT.601 below HD) at TV range and the encoder converts with it.
 * Renders write `<name>.part.<ext>` and promote by atomic rename at success, so a cancelled or
@@ -1140,12 +1161,25 @@ about 96 % of it (15x of 24 fps on a 360 Hz panel presents 346 of 360, in the se
 while 16x presents 384 of 384), so such a whole rung steps up to the next rung and the panel shows its full
 rate (a kept plan takes its first candidate). The host then prices the helpers' video memory (Streamline's own estimate + each ring) against the
 free memory (three passes the room does not hold = the best two), starts `--stage1` on a helper thread while
-the one pass keeps presenting, feeds it until it shares a frame, then presents its frames through the
+the one pass keeps presenting (every stage at once, each one's init side by side, a later stage waiting up to
+15 s for its upstream's ring; `SMV_LIVE_DLSSG_SERIAL_START=1` = one after another), feeds it until it shares a
+frame, then presents its frames through the
 session's own DLSS-G at the last factor. Three passes: a second helper `--stage1 ... --from <the first's
 share tag>` takes the first's ring on the GPU (in present order, the newest after a wrap) and the session
 presents the second's; three passes below 85 % of their multiple for three 2 s windows in a row end and the
 next plan holds two. One plan a session; a helper ending, failing or sharing nothing for 2 s returns the
-session to one pass (at L, or at the split multiple). A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
+session to one pass (at L, or at the split multiple). Plans change in place: `Stage1Hdr` version 3 carries the
+host's ask (`wantGen`), which a helper applies at its next present (1x = DLSS-G off there, its input passed
+through), so any rung of up to the passes running is reachable without a restart (`SMV_LIVE_DLSSG_INPLACE=0` =
+the restart); a rung of fewer passes runs on the last ones, the first at 1x, so only the source frames take the
+extra hop. A target past the panel's refresh whose rung lies past the first rung above one pass CLIMBS (a
+target at or under the refresh is a rate the user expects: its plan runs as it is): the helpers start at the target's
+multiples, are asked down to that first rung (8x = 2x, 2x, 2x, or 2x then 4x) before the takeover, then up a
+rung of at least 1.2x at a time while each presents 85 % of its multiple with at most 3 capture drops a
+second; a rung that does not is the ceiling, the plan steps back to the rung that held, and the next try
+waits 15 s, doubling to 240 s; a shortfall steps down to the largest rung under what held
+(`SMV_LIVE_DLSSG_CLIMB=0` = the target's rung first). Lines `DLSS 4.5 climbs from Mx ...`, `DLSS 4.5 steps to
+Mx in place (...)`. A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
 route's way: a rung R of one or two helper passes and a keep k of 2..6 with R / k within 3 % (the fewest passes,
 then the smallest R: 2.5x = 5x in a helper, 4.5x = 3x then 3x in two, 7.5x = 3x then 5x), the session presents every k-th frame of
 the presented ring and makes none itself, so the output stays evenly spaced (`SMV_LIVE_DLSSG_KEEP=0` = whole
@@ -1289,7 +1323,8 @@ wrapper forces python to fp32 for the comparison), and VSR spreads a single one-
 over about 6% of its output, which bounds the Restore then VSR cases. Resume and
 banking work on that route too: the same fragmented part file,
 sidecar and `_try_resume` mapping as the python route; the decoder starts at the resume source
-frame and `native.ts` tells the host `--resume-pair P --resume-out C --resume-drop D` (the render's
+frame (`decodeFilters`: `fps=num/den:start_time=0` before the `select`, so the cut counts the frames a plain decode
+emits, which repeats frame 0 when the video starts after the file does) and `native.ts` tells the host `--resume-pair P --resume-out C --resume-drop D` (the render's
 index of its first decoded frame for the `--fps` grid and the closing slot; the banked output
 count for PROGRESS / OUTFRAMES; the outputs this run would repeat, dropped at each emission point
 before any pass: on-grid the pair's real frame plus its banked tween slots, `--fps` and DRBA the
@@ -1306,6 +1341,31 @@ the writer thread drops a small copy of the frame it writes about once a second 
 2x2 taps per block, the output pixfmt) and logs `THUMB`, and native.ts turns it into the PNG
 (preview.ts's display math; a TrueHDR output is self-anchored). `SMV_OFFLINE_GRAPH=1` turns the IFNets' CUDA
 graphs on for it (off by default).
+
+File split (`native.ts` runSplit; `SMV_FILE_SPLIT=0` = off): a RIFE render at a whole multiple, SDR, without DLSS
+5, a constant rate and 600+ source frames runs two one-shot chains (decoder, host, encoder) at once, chunk A on the
+source frames 0..S (S = NB / 2) into the render's part file, chunk B from frame S as a resume at output S x multi + 1
+(its host drops the real frame S chunk A ends on) into its own `<work>.b.*` files; the finish joins chunk A's part,
+its continuation, chunk B's part and its continuation by stream copy. Chunk B starts only when a second chain fits:
+the CLI reads nvidia-smi's used memory before chunk A and after its second pair, and chunk B needs that much below the
+card minus max(512 MiB, 4 %) (`SMV_VRAM_MIB=N` emulates a smaller card), else the render runs one chain; no figure
+(nvidia-smi missing, several GPUs) = one chain. Chunk A's sidecar is the render's with `split: S` and both halves'
+progress (the GUI's resume probe reads it), chunk B's is signed apart; a start with both resumes each half from its
+own cut (a finished half does not run, two that no longer fit run one after the other), a start without the split
+resumes chunk A's cut as one chain and drops chunk B's files. Both hosts read the one pause flag; the first PAUSED /
+RESUMED of either reaches the log, the pause preview is chunk A's part. Gates: harness `file_split_render`
+(`split_gate.py` lossless identity, refusals, walls; `split_resume_gate.py` kills and resumes; `split_gui_gate.py`
+the app's Pause / preview / close / relaunch; `pause_tail_probe.py` a pause after chunk A ended).
+
+The encoder's conversion in the host (`encode.ts` encodePlan's `hostVf`, the host's `--out-vf FILTERS --out-sws
+FLAGS`, `FfConv` in smv-live.cpp; `SMV_OUT_CONV=0` = off): when the encode takes the zimg route to p010le with nothing
+cut, padded or stepped, and one host feeds the encoder (no DLSS 4.5 cascade), the host runs that `-vf` itself, with the
+encoder's `-sws_flags`, in ffmpeg's own `avutil-61.dll` / `avfilter-12.dll` from `engine\bin` (loaded at the first
+such render; another major version = the render stops before its first frame with the reason), and writes p010le;
+the encoder then takes p010le as raw input with no `-vf` (a `setsar` only for a non-square source). The bytes are the
+ones the encoder's own `-vf` made; the encoder's input is half of rgb48le's, the share of ffmpeg's raw-frame ingest that
+bounded large renders. Gates: harness `encode_8k_pipe` (`host_conv_ident.py` host-direct p010le byte for byte against
+the old route and the refusal; `prod_conv_ab.py` the CLI's video bitstream md5 both routes and the 8K walls).
 
 Resident offline host: the exe of that route stays alive between renders as
 `smv-live.exe --offline --resident --pipe NAME` with the kernel module loaded (the same per-process
@@ -1340,8 +1400,9 @@ the padded sizes):
   kernels (RIFE, DRBA and the whole GMFSS chain; a GMFSS session answers with its half size and the
   kernel cache folder); nvof, fruc and echo answer with geometry only (fruc checks its bridge folder
   and three DLLs). Live Restore adds `NATIVE-PATH restore=native:realesr-animevideov3` or
-  `restore=native:animejanai` (a `--restore-model` in AnimeJaNai's SPAN-F3 form), for every backend;
-  any other `--restore-model` graph = the session refuses with the Restore line.
+  `restore=native:animejanai` (a `--restore-model` in AnimeJaNai's SPAN-F3 form) or `restore=native:anime4k`
+  (`--restore-anime4k`), for every backend; any other `--restore-model` graph = the session refuses with the Restore
+  line.
 * `smv-live.exe --lookup-probe <engine folder>/live_server.py <backend> <outW> <outH> <capW>
   <capH> <image scale>` prints the lookup's lines (or `MISS`); the path is a marker
   for the engine folder, the file need not exist. A change to the naming or the geometry is gated
@@ -1427,8 +1488,9 @@ WxH` and `upscale=native`; gate `harness\eff\upto_equiv.py` (the two-stage chain
 `_Fit._upscale` run in fp64, the stores off by one in under 1% of bytes, plus a 9596-height sweep of
 the size derivation against the python expression) and the `upto_*` cases of `eff_native.py`. Restore
 runs natively too, on the host's kernels (see `--restore`): the handoff names the bundled Real-ESRGAN
-(`NATIVE-PATH restore=native:realesr-animevideov3`) or a `--restore-model` in AnimeJaNai's SPAN-F3 form
-(`restore=native:animejanai`); any other graph = the session refuses. The host runs it once per captured
+(`NATIVE-PATH restore=native:realesr-animevideov3`), a `--restore-model` in AnimeJaNai's SPAN-F3 form
+(`restore=native:animejanai`) or Anime4K's Restore CNN UL (`restore=native:anime4k`, `--restore-anime4k`); any other
+graph = the session refuses. The host runs it once per captured
 frame before the model (on the capture itself, as SDR planes when RTX HDR is on: TrueHDR runs later,
 after Restore, DLSS 5 and Sharpen; `k_restIn` = torch `.half()` of the frame), then folds the output
 straight to the model size into the model frame, in place of the capture shrink, so every model, DLSS 5

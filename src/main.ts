@@ -674,8 +674,10 @@ const AJ_DL = {
   archiveBytes: 42945210,
 };
 const ajPath = () => path.join(AJ_DIR, AJ_FILE);
-/** The host's --restore-model arguments for a Restore model id: 'animejanai' = the installed file; none = Real-ESRGAN. */
+/** The host's Restore model arguments for a model id: 'animejanai' = --restore-model with the installed file;
+ * 'anime4k' = --restore-anime4k (Anime4K's Restore CNN UL, inside the host); none = Real-ESRGAN. */
 function restoreModelArgs(id?: string): string[] {
+  if (id === 'anime4k') return ['--restore-anime4k'];
   return id === 'animejanai' && fileExists(ajPath()) ? ['--restore-model', ajPath()] : [];
 }
 
@@ -837,7 +839,7 @@ let liveFsrUp = false; // AMD FSR 4 as the live upscaler instead (its checkbox; 
 let liveA4kUp = false; // Anime4K as the live upscaler instead (its checkbox; RTX VSR and AMD FSR 4 clear it)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
-let liveRestoreModel = ''; // Restore's model id ('animejanai' = the installed AnimeJaNai file, '' = Real-ESRGAN)
+let liveRestoreModel = ''; // Restore's model id ('animejanai' = the installed AnimeJaNai file, 'anime4k', '' = Real-ESRGAN)
 let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inherited from the NVIDIA DLSS 5 checkbox
 let liveNrStructure = 1; // DLSS 5 Structure Intensity 0..2
 let liveNrTone = 1; // DLSS 5 Tone Intensity 0..2
@@ -1181,7 +1183,7 @@ ipcMain.on(
       anime4k?: boolean;
       uph?: number;
       restore?: boolean;
-      restoreModel?: string; // Restore's model id ('animejanai'; none = Real-ESRGAN)
+      restoreModel?: string; // Restore's model id ('animejanai' / 'anime4k'; none = Real-ESRGAN)
       dlssnr?: boolean;
       nrstructure?: number;
       nrtone?: number;
@@ -1594,7 +1596,7 @@ type RunOpts = {
   fps?: number;
   sharpen?: number;
   restore?: boolean;
-  restoreModel?: string; // Restore's model id ('animejanai'; none = Real-ESRGAN)
+  restoreModel?: string; // Restore's model id ('animejanai' / 'anime4k'; none = Real-ESRGAN)
   dlssmode?: string; // the DLSS mode (dlssScaleArg)
   dlssnr?: boolean;
   nrstructure?: number;
@@ -1849,7 +1851,9 @@ ipcMain.handle('cancel', async () => {
     '.resume.json',
     '.resume.json.tmp',
     '.concat.txt',
-  ].map((s) => part + s);
+  ]
+    .flatMap((s) => (s && s !== '.video.tmp.mp4' ? [s, '.b' + s] : [s])) // + the file split's chunk B (<part>.b.*)
+    .map((s) => part + s);
   for (let attempt = 0; attempt < 10 && remaining.length; attempt++) {
     await new Promise((r) => setTimeout(r, 300));
     remaining = remaining.filter((p) => {
@@ -1910,7 +1914,7 @@ type PreviewOpts = {
   fsrup?: boolean;
   anime4k?: boolean;
   restore?: boolean;
-  restoreModel?: string; // Restore's model id ('animejanai'; none = Real-ESRGAN)
+  restoreModel?: string; // Restore's model id ('animejanai' / 'anime4k'; none = Real-ESRGAN)
   dlssmode?: string; // the DLSS mode (dlssScaleArg)
   dlssnr?: boolean;
   nrstructure?: number;

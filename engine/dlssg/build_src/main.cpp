@@ -965,11 +965,14 @@ struct Host
 // ---------------------------------------------------------------- --stage1: the shared present ring
 
 // The header a reader maps (smv_dg1_TAG_hdr). A slot's copy is complete once the shared fence reaches its slotFence;
-// slotSeq = the present's number since the ring started (a reader that finds a newer number lost that slot)
+// slotSeq = the present's number since the ring started (a reader that finds a newer number lost that slot). Version 2
+// adds wantGen / gen: the live host asks a running stage for another multiple, applied in place at its next present;
+// version 3 adds the ask kGenOff = 1x (DLSS-G off, each input passed through as it is; gen 0)
+static const uint32_t kGenOff = 0xFFFFFFFFu;
 struct Stage1Hdr
 {
     uint32_t magic;   // 'SMV1'
-    uint32_t version; // 1
+    uint32_t version; // 3
     volatile uint64_t frames;
     uint32_t w, h, ring, fmt;
     uint64_t allocSize;
@@ -979,6 +982,8 @@ struct Stage1Hdr
     volatile uint64_t slotSeq[16];
     volatile int64_t slotQpc[16];    // QueryPerformanceCounter when the capture saw the present
     volatile uint32_t slotInput[16]; // lastInput at that moment
+    volatile uint32_t wantGen;       // the host's ask: numFramesToGenerate from the next present (0 = none)
+    volatile uint32_t gen;           // the stage's numFramesToGenerate now
 };
 
 // Every native present copied into a ring of shared textures on rbQueue, the queue the native chain presents on
@@ -1055,7 +1060,8 @@ struct Stage1Ring
         if (!hdr)
             return false;
         memset((void*)hdr, 0, sizeof(Stage1Hdr));
-        hdr->version = 1;
+        hdr->version = 3;
+        hdr->gen = (uint32_t)host.genFrames;
         hdr->w = W;
         hdr->h = H;
         hdr->ring = kRing;
@@ -1194,10 +1200,25 @@ struct UpstreamRing
 
     bool open(ID3D12Device* dev, const std::wstring& tag, DXGI_FORMAT fmt)
     {
+        // the upstream stage may still be starting (the live host starts every stage at once): its header's magic,
+        // written last by Stage1Ring::init, is waited for up to 15 s
         const std::wstring mn = L"smv_dg1_" + tag + L"_hdr";
-        map = OpenFileMappingW(FILE_MAP_READ, FALSE, mn.c_str());
-        hdr = map ? (const Stage1Hdr*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(Stage1Hdr)) : nullptr;
-        if (!hdr || hdr->magic != 0x31564D53 || hdr->version != 1 || hdr->ring > 16)
+        const ULONGLONG until = GetTickCount64() + 15000;
+        for (;;)
+        {
+            map = OpenFileMappingW(FILE_MAP_READ, FALSE, mn.c_str());
+            hdr = map ? (const Stage1Hdr*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(Stage1Hdr)) : nullptr;
+            if ((hdr && hdr->magic == 0x31564D53) || GetTickCount64() > until)
+                break;
+            if (hdr)
+                UnmapViewOfFile(hdr);
+            if (map)
+                CloseHandle(map);
+            hdr = nullptr;
+            map = nullptr;
+            Sleep(20);
+        }
+        if (!hdr || hdr->magic != 0x31564D53 || hdr->version < 1 || hdr->version > 3 || hdr->ring > 16)
         {
             LOG("--from %ls: no stage header\n", tag.c_str());
             return false;
@@ -1477,13 +1498,39 @@ static int runServer(int genFrames, bool hdr10)
                 n++;
         return n;
     };
-    // diffSamples == 0, stopping at the first differing sample
+    // every pixel's RGB equal (alpha skipped), 8 bytes at a time
+    const uint64_t rgbMask2 = (uint64_t)rgbMask | ((uint64_t)rgbMask << 32);
+    auto sameFull = [&](const uint8_t* a, const uint8_t* b) -> bool {
+        const size_t px = (size_t)W * H, words = px / 2;
+        uint64_t acc = 0;
+        for (size_t i = 0; i < words; i++)
+        {
+            uint64_t x, y;
+            memcpy(&x, a + i * 8, 8);
+            memcpy(&y, b + i * 8, 8);
+            acc |= (x ^ y) & rgbMask2;
+        }
+        if (px & 1)
+            acc |= rgbAt(a, px - 1) ^ rgbAt(b, px - 1);
+        return acc == 0;
+    };
+    // the pixels whose RGB differs, all of them (the sweep's multi-frame order on pairs that barely differ)
+    auto diffFull = [&](const uint8_t* a, const uint8_t* b) -> size_t {
+        const size_t px = (size_t)W * H;
+        size_t n = 0;
+        for (size_t i = 0; i < px; i++)
+            n += rgbAt(a, i) != rgbAt(b, i);
+        return n;
+    };
+    // identical image content: the samples first (most frames differ there), then every pixel, since a generated
+    // frame of a pair that barely moves (a later cascade pass's input) can differ from a real frame off every sample
+    // (350 of 2.1 M pixels, none on one), and a sampled match alone took it for a real-frame copy
     auto sameImage = [&](const uint8_t* a, const uint8_t* b) -> bool {
         const size_t px = (size_t)W * H;
         for (size_t i = 0; i < px; i += 397)
             if (rgbAt(a, i) != rgbAt(b, i))
                 return false;
-        return true;
+        return sameFull(a, b);
     };
     // sampled flat-colour test: a cleared swap chain buffer reads uniform on every sample
     auto uniformImage = [&](const uint8_t* f) -> bool {
@@ -1525,7 +1572,11 @@ static int runServer(int genFrames, bool hdr10)
     uint64_t emitted = 0;
     uint64_t resets = 0;
     bool first = true;
-    bool metered = false; // sticky: hardware flip metering detected, capture by buffer sweep
+    // the previous pair's real present did not come among its own window's presents: DLSS-G presents every real frame
+    // once, so it can still arrive first in the next pair's stream
+    bool realPending = false;
+    bool metered = false;  // sticky: hardware flip metering detected, capture by buffer sweep
+    bool gapReset = false; // SMV_DLSSG_GAP_RESET=1: a reset before every pair whose input came 500 ms after the last
     // SMV_DLSSG_SWEEP=1 latches the sweep tier at startup (hidden knob for measurement work: the
     // tier otherwise latches only when the fast tier misses its window, which no test can force).
     {
@@ -1543,6 +1594,12 @@ static int runServer(int genFrames, bool hdr10)
             host.waitMs = atoi(buf);
             LOG("SMV_DLSSG_WAITMS=%d: the newest present waits up to %d ms for a later one\n", host.waitMs,
                 host.waitMs);
+        }
+        n = GetEnvironmentVariableA("SMV_DLSSG_GAP_RESET", buf, (DWORD)sizeof(buf));
+        if (n == 1 && buf[0] == '1')
+        {
+            gapReset = true;
+            LOG("SMV_DLSSG_GAP_RESET=1: a pair whose input came over 500 ms after the last present resets DLSS-G first\n");
         }
     }
     std::vector<std::vector<uint32_t>> preSig(host.nativeBufCount);
@@ -1584,9 +1641,11 @@ static int runServer(int genFrames, bool hdr10)
             continue;
         }
 
-        // pair = (prevFrame, inFrame). A long input gap (GUI pause, encoder stall) is a
-        // near-certain pacer poisoning, so reset proactively instead of wasting an attempt.
-        if (GetTickCount64() - lastPresentTick > 500)
+        // pair = (prevFrame, inFrame). No reset on the clock: the wait for an input also counts a later cascade pass
+        // still starting (its full pipe stops this host's writer, then its feed), so a clock reset lands at a pair that
+        // depends on timing and changes the tweens after it; a pair whose generated frames do not come is reset and
+        // retried by the attempts below
+        if (gapReset && GetTickCount64() - lastPresentTick > 500)
         {
             LOG("input gap detected, resetting DLSS-G\n");
             resets++;
@@ -1595,6 +1654,7 @@ static int runServer(int genFrames, bool hdr10)
                 LOG("DLSS-G reset failed\n");
                 return 1;
             }
+            realPending = false;
         }
 
         // present + content-selected capture, two tiers:
@@ -1607,7 +1667,14 @@ static int runServer(int genFrames, bool hdr10)
         //     counted by DXGI - so sweep all buffers and select by content, using per-buffer
         //     signatures from before the present to reject stale frames, and distance-to-A
         //     ordering for multi-frame generation (it grows monotonically with the timestep).
-        const bool pairStatic = sameImage(prevFrame.data(), inFrame.data());
+        // a pair whose frames differ in at most 1 pixel of 2000 (a later cascade pass's input on footage that barely
+        // moves: 18 of 2.1 M pixels measured) counts as static for the capture: its generated frames can come out equal
+        // to a real frame, so presents are taken in order, not told apart by content (a real-frame copy there differs
+        // from the generated frame in those few pixels at most); the full count runs only when few samples differ
+        const int pairSampled = diffSamples(prevFrame.data(), inFrame.data());
+        const size_t pairDiff = pairSampled > 8 ? (size_t)W * H : diffFull(prevFrame.data(), inFrame.data());
+        const bool pairStatic = pairDiff == 0;
+        const bool pairNear = pairDiff * 2000 <= (size_t)W * H;
         const bool inputUniform = uniformImage(inFrame.data());
         bool good = false;
 
@@ -1642,6 +1709,7 @@ static int runServer(int genFrames, bool hdr10)
                     LOG("DLSS-G reset failed\n");
                     return 1;
                 }
+                realPending = false; // the reset's drain took every present before it
             }
             if (!host.presentFrame(inFrame.data()))
             {
@@ -1652,6 +1720,11 @@ static int runServer(int genFrames, bool hdr10)
             rawN = 0;
             size_t scanned = 0;
             int filled = 0;
+            // a near-static pair takes its presents in order: while the previous pair's real present is owed, the first
+            // exact copy of A is that present arriving late, set aside; it fills the pair only if the pair comes up short
+            // (a generated frame with A's pixels, the earliest tween)
+            bool skipA = pairNear && !pairStatic && realPending;
+            const uint8_t* asideA = nullptr;
             const ULONGLONG t0 = GetTickCount64();
             ULONGLONG nextSweep = t0 + (metered ? 50 : 350);
             while (filled < genFrames && GetTickCount64() < t0 + 1000)
@@ -1665,8 +1738,14 @@ static int runServer(int genFrames, bool hdr10)
                 for (; scanned < rawN && filled < genFrames; scanned++)
                 {
                     const uint8_t* f = raw[scanned].data();
-                    if (!pairStatic && (sameImage(f, inFrame.data()) || sameImage(f, prevFrame.data())))
+                    if (!pairNear && (sameImage(f, inFrame.data()) || sameImage(f, prevFrame.data())))
                         continue; // a real-frame present, not a generated frame
+                    if (skipA && sameImage(f, prevFrame.data()))
+                    {
+                        skipA = false;
+                        asideA = f;
+                        continue;
+                    }
                     outSrc[filled++] = f;
                 }
                 if (filled >= genFrames)
@@ -1706,15 +1785,18 @@ static int runServer(int genFrames, bool hdr10)
                     }
                     if ((int)cand.size() >= genFrames)
                     {
-                        // multi-frame order: distance to the left real frame grows with the timestep
-                        std::sort(cand.begin(), cand.end(),
-                                  [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
-                                      return diffSamples(a.data(), prevFrame.data()) <
-                                             diffSamples(b.data(), prevFrame.data());
-                                  });
+                        // multi-frame order: distance to the left real frame grows with the timestep (every pixel:
+                        // the samples tie on a pair that barely moves)
+                        std::vector<size_t> dist(cand.size()), ord(cand.size());
+                        for (size_t c = 0; c < cand.size(); c++)
+                        {
+                            dist[c] = diffFull(cand[c].data(), prevFrame.data());
+                            ord[c] = c;
+                        }
+                        std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return dist[a] < dist[b]; });
                         for (filled = 0; filled < genFrames; filled++)
                         {
-                            memcpy(outPtrs[filled], cand[filled].data(), frameBytes);
+                            memcpy(outPtrs[filled], cand[ord[filled]].data(), frameBytes);
                             outSrc[filled] = outPtrs[filled];
                         }
                         if (!metered)
@@ -1728,6 +1810,13 @@ static int runServer(int genFrames, bool hdr10)
                 }
                 if (added == 0)
                     Sleep(1);
+            }
+            if (filled < genFrames && asideA)
+            {
+                for (int k = filled; k > 0; k--)
+                    outSrc[k] = outSrc[k - 1];
+                outSrc[0] = asideA;
+                filled++;
             }
             good = (filled == genFrames);
             if (!good)
@@ -1765,6 +1854,12 @@ static int runServer(int genFrames, bool hdr10)
                 "enhancements in the NVIDIA App) and start the render again, or use GMFSS.\n");
             return 1;
         }
+        // this pair's real present owed = no exact copy of B among the presents its window received (the sweep tier
+        // reads buffers, not the present stream: nothing owed)
+        realPending = !metered;
+        for (size_t i = 0; i < rawN && realPending; i++)
+            if (sameImage(raw[i].data(), inFrame.data()))
+                realPending = false;
         lastPresentTick = GetTickCount64();
 
         // the pair to the writer (after the previous one is written), then this thread takes the other buffer set
@@ -1877,13 +1972,15 @@ static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& t
             }
         }
     };
-    // the same reset as --server's (off at a present, back on, two re-warm presents)
+    // the same reset as --server's (off at a present, back on, two re-warm presents); at 1x (genFrames 0) DLSS-G stays off
     auto resetFG = [&]() -> bool {
         sl::DLSSGOptions off{};
         off.mode = sl::DLSSGMode::eOff;
         off.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
         if (slDLSSGSetOptions(host.vp, off) != sl::Result::eOk || !presentAgain())
             return false;
+        if (genFrames <= 0)
+            return true;
         sl::DLSSGOptions on{};
         on.mode = sl::DLSSGMode::eOn;
         on.numFramesToGenerate = (uint32_t)genFrames;
@@ -1940,6 +2037,37 @@ static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& t
                 LOG("DLSS-G reset failed\n");
                 ring.finish(3);
                 return 1;
+            }
+        }
+        // the host's ask for another multiple (a plan stepping up or down): DLSS-G takes a new numFramesToGenerate at the
+        // next present, in place (the frames from it on are byte-identical to a fresh run at that count: harness
+        // dlssg_gen_inplace); kGenOff = 1x: DLSS-G off, the inputs presented as they are
+        const uint32_t ask = ring.hdr->wantGen;
+        const int askGen = ask == kGenOff ? 0 : (int)ask;
+        if (ask && askGen != genFrames)
+        {
+            sl::DLSSGOptions opt{};
+            opt.mode = askGen ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+            if (askGen)
+            {
+                opt.numFramesToGenerate = (uint32_t)askGen;
+                opt.mvecDepthWidth = panvec::vecSize(W);
+                opt.mvecDepthHeight = panvec::vecSize(H);
+            }
+            else
+                opt.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+            if ((uint32_t)askGen <= (host.maxGen ? host.maxGen : 5u) &&
+                slDLSSGSetOptions(host.vp, opt) == sl::Result::eOk)
+            {
+                LOG("stage1: %dx from input %llu on (asked)\n", askGen + 1, (unsigned long long)inputs);
+                genFrames = askGen;
+                host.genFrames = askGen;
+                ring.hdr->gen = (uint32_t)askGen;
+            }
+            else
+            {
+                LOG("stage1: %dx asked, refused: stays at %dx\n", askGen + 1, genFrames + 1);
+                ring.hdr->wantGen = 0;
             }
         }
         if (!presentInput())

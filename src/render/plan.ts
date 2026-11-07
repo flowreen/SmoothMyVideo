@@ -25,6 +25,7 @@ export interface RenderArgs {
   rtx_hdr: boolean;
   restore: boolean;
   restore_model: string | null; // --restore-model: Restore's model file (AnimeJaNai), null = Real-ESRGAN
+  restore_anime4k: boolean; // --restore-anime4k: Restore = Anime4K's Restore CNN UL (inside the host, no file)
   no_gpu_fit: boolean; // --no-gpu-fit: no video memory fit
   dlssnr: boolean;
   dv: boolean;
@@ -82,12 +83,17 @@ export interface WorkPlan {
  * same rule live). */
 export const NR_MIN_WORK_W = 128;
 
+/** DLSS 4.5 makes its frames at the working size and generates none below Streamline's minimum extent (100 px on the
+ * shorter side: it passes the frames through): with DLSS 4.5, a working size below the output keeps its shorter side
+ * at least this long (the host's kDlssgMinWork, the same rule live). */
+export const DLSSG_MIN_WORK = 128;
+
 /** The pass sizes for a w x h source: the output (the --upscale factor, clamped; with it an anamorphic source's
  * pixels are made square, without it the output keeps their shape, `sar`), the working size =
  * the DLSS mode (--scale) x the output (even, at most WORK_MAX_PX keeping the aspect; the share raised, aspect kept,
- * until the shorter side is 64 px and, with DLSS 5 (nr), the width NR_MIN_WORK_W),
- * and the decode (a working size below the source folds the downscale into the decode, Lanczos at radius 7).
- * A string = why --scale is refused. */
+ * to the largest minimum of the pipeline: the shorter side 64 px, with DLSS 5 (nr) the width NR_MIN_WORK_W, with
+ * DLSS 4.5 (dlssg) the shorter side DLSSG_MIN_WORK), and the decode (a working size below the source folds the
+ * downscale into the decode, Lanczos at radius 7: the one shrink). A string = why --scale is refused. */
 export function workPlan(
   st: Stream,
   w: number,
@@ -95,6 +101,7 @@ export function workPlan(
   upscaleF: number,
   scale: string | null,
   nr = false,
+  dlssg = false,
 ): WorkPlan | string {
   const srcSar = sourceSar(st);
   const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0, srcSar);
@@ -109,12 +116,16 @@ export function workPlan(
   if (wf.factor !== 1) {
     const fFloor = Math.max(64 / ow, 64 / oh);
     const fNr = nr ? NR_MIN_WORK_W / ow : 0;
-    const k = Math.max(wf.factor, fFloor, fNr);
+    const fDg = dlssg ? DLSSG_MIN_WORK / Math.min(ow, oh) : 0;
+    const fModel = Math.max(fFloor, fNr);
+    const k = Math.max(wf.factor, fDg, fModel);
     if (k > wf.factor)
       raised =
-        fNr >= fFloor
-          ? `, raised to DLSS 5's minimum width, ${NR_MIN_WORK_W} px, aspect kept`
-          : ', raised to the 64 px floor, aspect kept';
+        fDg >= fModel
+          ? `, raised to DLSS 4.5's minimum, ${DLSSG_MIN_WORK} px a side, aspect kept`
+          : fNr >= fFloor
+            ? `, raised to DLSS 5's minimum width, ${NR_MIN_WORK_W} px, aspect kept`
+            : ', raised to the 64 px floor, aspect kept';
     ww = Math.min(ow, Math.max(nr ? NR_MIN_WORK_W : 64, pyRound(ow * k) & ~1));
     wh = Math.min(oh, Math.max(64, pyRound(oh * k) & ~1));
   }

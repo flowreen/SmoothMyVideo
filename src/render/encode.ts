@@ -86,10 +86,19 @@ export function runChecked(cmd: string[]): void {
 }
 
 // --- decode -----------------------------------------------------------------------------------
-/** (the decode -vf chain, the frames to discard from the pipe instead). */
-export function decodeFilters(resumeSkip: number, vfrDec: string[], imgScaleVf: string[]): [string[], number] {
+/** (the decode -vf chain, the frames to discard from the pipe instead). select counts the stream's frames while the
+ * decoder's own rate conversion runs after it (a video that starts after the file gets its first frame repeated
+ * there): the fps filter first (rate = the source's num/den) puts select on the numbering of the frames a plain decode
+ * emits, so a cut at resumeSkip continues that decode exactly. */
+export function decodeFilters(
+  resumeSkip: number,
+  vfrDec: string[],
+  imgScaleVf: string[],
+  rate: string,
+): [string[], number] {
   const vfr = vfrDec.length > 0;
-  const filters = resumeSkip && !vfr ? [`select=gte(n\\,${resumeSkip}),setpts=PTS-STARTPTS`] : [];
+  const filters =
+    resumeSkip && !vfr ? [`fps=${rate}:start_time=0,select=gte(n\\,${resumeSkip}),setpts=PTS-STARTPTS`] : [];
   return [filters.concat(imgScaleVf), resumeSkip && vfr ? resumeSkip : 0];
 }
 
@@ -287,7 +296,11 @@ export function qualityArgs(
       ];
     }
     const cq = env.SMV_CQ || (venc === 'av1_nvenc' ? '22' : '17');
-    const la = outLabel > 120 ? '0' : '1';
+    // HEVC: lookahead level 1 at a lookahead depth of 1 at every output rate (smaller files at equal or better
+    // PSNR / VMAF on most clips; on tween-dense streams above 120 fps it beats no lookahead, where depth 1 alone
+    // loses ~3 dB). The level needs a lookahead frame, so HEVC keeps depth 1 above 120 fps.
+    const hevcLevel = venc === 'hevc_nvenc';
+    const la = hevcLevel || outLabel <= 120 ? '1' : '0';
     qargs = [
       '-preset',
       'p7',
@@ -308,6 +321,7 @@ export function qualityArgs(
       '-temporal-aq',
       '1',
     ];
+    if (hevcLevel) qargs.push('-lookahead_level', '1');
     // Split-frame encoding stays OFF, pinned so no driver's `auto` can turn it on. Two strips were
     // 1.15x (1080p) / 1.30x (4K) faster for RIFE 2x, but the strips are separate slices with the
     // loop filter off across them, which leaves an unfiltered line at the same row of every frame
@@ -401,6 +415,14 @@ export function colorArgs(
  * rings into the visible blocks. `cut` = [w, h]: the frame cropped to it before the conversion (an odd size into
  * 4:2:0, which zimg refuses). `hlg` = the PQ frames converted to HLG in the same zimg step, BT.2100's 1000-nit
  * nominal peak (203 nits = HLG 75 %, BT.2408); the HDR frames always take the zimg route (gbrp10le, BT.2020). */
+const PLANAR_IN: Record<string, string> = { rgb24: 'gbrp', rgb48le: 'gbrp16le', x2rgb10le: 'gbrp10le' };
+/** The host's RGB frames go through zimg (encodeVf's route for a known matrix and input format), not swscale. */
+export function zimgRoute(encInFmt: string, matrix: string): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(PLANAR_IN, encInFmt) &&
+    Object.prototype.hasOwnProperty.call(ZSC_MATRIX, matrix)
+  );
+}
 export function encodeVf(
   sp: string[],
   outPix: string,
@@ -416,8 +438,8 @@ export function encodeVf(
     ? [`pad=${pad[2]}:${pad[3]}:0:0`, `fillborders=right=${pad[2] - pad[0]}:bottom=${pad[3] - pad[1]}:mode=smear`]
     : [];
   const cutF = cut ? [`crop=${cut[0]}:${cut[1]}:0:0`] : [];
-  const planarIn = ({ rgb24: 'gbrp', rgb48le: 'gbrp16le', x2rgb10le: 'gbrp10le' } as Record<string, string>)[encInFmt];
-  if (!planarIn || !Object.prototype.hasOwnProperty.call(ZSC_MATRIX, matrix)) {
+  const planarIn = PLANAR_IN[encInFmt];
+  if (!zimgRoute(encInFmt, matrix)) {
     const planar = padF.length || cutF.length ? [`format=${planarOut}`, ...cutF, ...padF] : [];
     return tags.concat(planar, [`format=${outPix}`]).join(',');
   }
@@ -434,7 +456,13 @@ export function encodeVf(
 }
 
 /** [the passthrough -map argv, the stderr notes]. */
-export function trackMaps(outIsMkv: boolean, aud: Track[], sub: Track[], hasAttach: boolean): [string[], string[]] {
+export function trackMaps(
+  outIsMkv: boolean,
+  aud: Track[],
+  sub: Track[],
+  hasAttach: boolean,
+  subsBeside = false,
+): [string[], string[]] {
   const maps: string[] = [],
     drops: string[] = [],
     notes: string[] = [];
@@ -451,6 +479,8 @@ export function trackMaps(outIsMkv: boolean, aud: Track[], sub: Track[], hasAtta
     sub.forEach(([, c], j) => {
       if (!MKV_SUB_COPY_OK.has(c)) maps.push(`-c:s:${j}`, 'srt');
     });
+  } else if (sub.length && subsBeside) {
+    notes.push(`passthrough: ${sub.length} subtitle track(s) go beside the video (MKV cannot hold over 1000 fps)\n`);
   } else if (sub.length) {
     drops.push(`${sub.length} subtitle track(s) (mp4 output; use .mkv to keep them)`);
   }
@@ -483,6 +513,8 @@ export interface Encode {
   cmd: string[];
   notes: string[];
   crop: boolean;
+  hostVf: string; // the conversion the host runs itself (--out-vf), '' = the encoder converts as before
+  hostSws: string; // the host's --out-sws (the encoder's -sws_flags), '' with no hostVf
 }
 
 export interface EncodeInput {
@@ -512,6 +544,70 @@ export interface EncodeInput {
   hlg?: boolean; // the HDR video as HLG (Dolby Vision 8.4's base layer), converted from the host's PQ frames
   inRateStr?: string; // the host's frame rate when the file keeps only every `keep`-th frame (rateStr = the file's)
   keep?: number; // > 1: the encode keeps every keep-th frame (DLSS 4.5 at a target between whole multiples)
+  subsBeside?: boolean; // an MP4 above 1000 fps: its subtitle tracks are saved beside it (saveSubsBeside), not dropped
+  hostConv?: boolean; // the host may run the encoder's zimg conversion itself (ffmpeg's avfilter DLL in the host)
+}
+
+/** The source's subtitle tracks as files beside `out` (an MP4 above 1000 fps: MKV cannot time it, MP4 holds none of
+ * them): `<base>.<lang>.<ext>`, a later track of the same language `<base>.<lang>.<k>.<ext>`; ASS / SSA, SRT and
+ * WebVTT as they are, mov_text as SRT, PGS as .sup, any other kind skipped. Returns the log line. */
+export function saveSubsBeside(ffmpeg: string, ffprobe: string, inp: string, out: string, sub: Track[]): string {
+  const base = out.replace(/\.[^.\\/]+$/, '');
+  const langs = new Map<number, string>();
+  const pr = spawnSync(
+    ffprobe,
+    [
+      '-v',
+      'error',
+      '-select_streams',
+      's',
+      '-show_entries',
+      'stream=index:stream_tags=language',
+      '-of',
+      'csv=p=0',
+      inp,
+    ],
+    { encoding: 'utf8', windowsHide: true },
+  );
+  for (const ln of String(pr.stdout || '').split(/\r?\n/)) {
+    const [i, l] = ln.trim().split(',');
+    if (i && l && /^[A-Za-z-]{1,8}$/.test(l)) langs.set(Number(i), l.toLowerCase());
+  }
+  // codec -> (muxer, extension, -c:s)
+  const kinds: Record<string, [string, string, string]> = {
+    ass: ['ass', '.ass', 'copy'],
+    ssa: ['ass', '.ass', 'copy'],
+    subrip: ['srt', '.srt', 'copy'],
+    srt: ['srt', '.srt', 'copy'],
+    webvtt: ['webvtt', '.vtt', 'copy'],
+    mov_text: ['srt', '.srt', 'srt'],
+    hdmv_pgs_subtitle: ['sup', '.sup', 'copy'],
+  };
+  const count = new Map<string, number>();
+  const saved: string[] = [],
+    skipped: string[] = [];
+  for (const [i, c] of sub) {
+    const k = kinds[c];
+    if (!k || i === null) {
+      skipped.push(c);
+      continue;
+    }
+    const lang = langs.get(i) || 'und';
+    const n = (count.get(lang) || 0) + 1;
+    count.set(lang, n);
+    const dst = `${base}.${lang}${n > 1 ? '.' + n : ''}${k[1]}`;
+    const r = spawnSync(ffmpeg, ['-v', 'error', '-y', '-i', inp, '-map', `0:${i}`, '-c:s', k[2], '-f', k[0], dst], {
+      windowsHide: true,
+    });
+    if (r.status === 0 && fs.existsSync(dst)) saved.push(dst.slice(dst.lastIndexOf('\\') + 1));
+    else skipped.push(c);
+  }
+  return (
+    `subtitles: ${saved.length} track(s) saved beside the video (MKV cannot hold over 1000 fps)` +
+    (saved.length ? `: ${saved.join(', ')}` : '') +
+    (skipped.length ? `; not saved: ${skipped.join(', ')}` : '') +
+    '\n'
+  );
 }
 
 /** The encode command and everything it is built from (render_encode.encode_plan). */
@@ -536,11 +632,20 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   // container take it from there (the stream SAR, the bitstream's VUI)
   const sarTag = e.sar[0] !== e.sar[1] ? `,setsar=${e.sar[0]}/${e.sar[1]}` : '';
   const keep = e.keep && e.keep > 1 ? e.keep : 1;
-  const vf =
-    (keep > 1 ? `framestep=${keep},` : '') + encodeVf(sp, outPix, e.encInFmt, matrix, pad, cut, !!e.hlg) + sarTag;
+  // the host runs the zimg route to p010le itself (its --out-vf / --out-sws in ffmpeg's own avfilter DLL, the same bytes)
+  // for SDR when nothing is cut, padded or stepped: ffmpeg then ingests p010le, half the bytes of rgb48le, and its -vf
+  // only tags the frames (setparams, the colour the encoder's VUI and format negotiation read from them: untagged
+  // frames get the stream's transfer / primaries unknown and a colour conversion of their own)
+  const hostVf =
+    e.hostConv && !e.hdrActive && outPix === 'p010le' && !pad && !cut && keep === 1 && zimgRoute(e.encInFmt, matrix)
+      ? encodeVf(sp, outPix, e.encInFmt, matrix, null, null, false)
+      : '';
+  const vf = hostVf
+    ? (sp.length ? ['setparams=' + sp.join(':')] : []).concat(sarTag ? [sarTag.slice(1)] : []).join(',')
+    : (keep > 1 ? `framestep=${keep},` : '') + encodeVf(sp, outPix, e.encInFmt, matrix, pad, cut, !!e.hlg) + sarTag;
   const bsf = crop ? ['-bsf:v', `hevc_metadata=width=${encW}:height=${encH}`] : [];
   const tq = ultra ? ['-threads', '1', '-thread_queue_size', '1'] : [];
-  let [maps, trackNotes] = trackMaps(e.outIsMkv, e.aud, e.sub, e.hasAttach);
+  let [maps, trackNotes] = trackMaps(e.outIsMkv, e.aud, e.sub, e.hasAttach, !!e.subsBeside);
   const notes = (speedNote ? [speedNote] : []).concat(trackNotes);
   if (cut) notes.push(`encoder: 4:2:0 holds no odd size; ${e.outW}x${e.outH} is written as ${encW}x${encH}\n`);
   if (pad) {
@@ -572,7 +677,7 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
     '-f',
     'rawvideo',
     '-pix_fmt',
-    e.encInFmt,
+    hostVf ? outPix : e.encInFmt,
     '-s',
     `${e.outW}x${e.outH}`,
     '-r',
@@ -588,8 +693,7 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
     e.venc,
     '-sws_flags',
     SWS_ACCURATE,
-    '-vf',
-    vf,
+    ...(vf ? ['-vf', vf] : []),
     '-max_interleave_delta',
     '0',
     ...qargs,
@@ -600,7 +704,24 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
     ...frag,
     target,
   ];
-  return { outPix, qargs, prof, color, vf, tq, maps, stage2Maps, in2, target, frag, cmd, notes, crop };
+  return {
+    outPix,
+    qargs,
+    prof,
+    color,
+    vf,
+    tq,
+    maps,
+    stage2Maps,
+    in2,
+    target,
+    frag,
+    cmd,
+    notes,
+    crop,
+    hostVf,
+    hostSws: hostVf ? SWS_ACCURATE : '',
+  };
 }
 
 // --- the finish -------------------------------------------------------------------------------

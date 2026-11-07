@@ -21,9 +21,10 @@ third-party work.
 * **Real-ESRGAN** `realesr-animevideov3` architecture and weights (the `--restore` pass),
   vendored in `engine/realesr.py` / `engine/realesr-animevideov3.pth`. BSD 3-Clause License,
   Copyright (c) 2021 Xintao Wang.
-* **Anime4K** (the Anime4K upscaler): the weights of bloc97's Upscale CNN x2 UL shader from release
-  v4.0.1 (github.com/bloc97/Anime4K), carried in the native host (`engine/live/build_src/smv-live-native.inl`,
-  `kA4kWeights`), which runs its passes as CUDA kernels. MIT License:
+* **Anime4K** (the Anime4K upscaler and the Anime4K Restore): the weights of bloc97's Upscale CNN x2 UL and Restore
+  CNN UL shaders and the Clamp_Highlights algorithm from release v4.0.1 (github.com/bloc97/Anime4K), carried in the
+  native host (`engine/live/build_src/smv-live-native.inl`, `kA4kWeights`, `kA4kRestWeights`, `kA4kClampSrc`), which
+  runs their passes as CUDA kernels. MIT License:
 
   > Copyright (c) 2019 bloc97
   >

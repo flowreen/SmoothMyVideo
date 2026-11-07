@@ -327,7 +327,9 @@ function passTag(){
 function outName(){ if(!input) return ''; const i=input.lastIndexOf('.'); const b=i<0?input:input.slice(0,i);
   const d = upDims();                                   // upscale target ({w,h} or null); tag the new height
   const res = d ? '_' + d.h + 'p' : '';
-  const ext = (info && info.needMkv) ? '.mkv' : '.mp4';   // subtitles/extra tracks ride in mkv
+  // subtitles/extra tracks ride in mkv; above 1000 fps MKV cannot time the frames (whole milliseconds): .mp4, and the
+  // render saves the subtitles beside it
+  const ext = (info && info.needMkv && targetFps() <= 1000) ? '.mkv' : '.mp4';
   return interpOn() ? (b + '_' + Math.round(targetFps()) + 'fps' + res + ext)
                     : (b + (d ? res : passTag()) + ext); }
 // A custom name that STILL CARRIES an auto tag (_<n>fps or _<n>p) stays in sync with the settings:
@@ -520,8 +522,12 @@ $('sharpval').oninput = () => { localStorage.setItem('sharpenVal', $('sharpval')
 // (aj-ready), else its setup note shows (one click downloads the author's release, checked in main).
 let ajReady: any = { ready:false };
 function ajOn(){ return $('restoreaj').checked && !!ajReady.ready; }
-function restoreOn(){ return $('restore').checked || ajOn(); }
-function restoreModelId(){ return ajOn() ? 'animejanai' : ''; }
+// The third row, Anime4K: bloc97's Restore CNN UL, the line restore of the Anime4K shader set's Mode A (its weights
+// inside the host, always ready; the host's --restore-anime4k). Ticked together with the Anime4K upscaler, the two
+// are that mode; alone it keeps the frame's size.
+function a4kRestOn(){ return $('restorea4k').checked; }
+function restoreOn(){ return $('restore').checked || ajOn() || a4kRestOn(); }
+function restoreModelId(){ return ajOn() ? 'animejanai' : a4kRestOn() ? 'anime4k' : ''; }
 // Restore ALWAYS starts off: an expensive, look-altering pass you opt
 // into per session, so its state is deliberately NOT persisted; old key retired.
 localStorage.removeItem('restoreOn');
@@ -573,8 +579,9 @@ async function doAjDownload(){
 }
 $('ajdl').onclick = doAjDownload;
 // one Restore model at a time: ticking a row unticks the other
-$('restore').addEventListener('change', () => { if($('restore').checked && $('restoreaj').checked){ $('restoreaj').checked = false; syncAj(); } });
-$('restoreaj').addEventListener('change', () => { if($('restoreaj').checked) $('restore').checked = false; syncAj(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} });
+$('restore').addEventListener('change', () => { if($('restore').checked){ if($('restoreaj').checked){ $('restoreaj').checked = false; syncAj(); } $('restorea4k').checked = false; } });
+$('restoreaj').addEventListener('change', () => { if($('restoreaj').checked){ $('restore').checked = false; $('restorea4k').checked = false; } syncAj(); refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} });
+$('restorea4k').addEventListener('change', () => { if($('restorea4k').checked){ $('restore').checked = false; if($('restoreaj').checked){ $('restoreaj').checked = false; syncAj(); } } refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} });
 
 // The pass order in both modes: on each source or captured frame Restore and the resize to the
 // working size (the DLSS mode), DLSS 5, Sharpen and RTX HDR (with the Dolby Vision and HDR10+ metadata of
@@ -690,6 +697,7 @@ let dlssSettleT = null;
 function dlssChanged(){
   localStorage.setItem('dlssMode', dlssMode());
   syncDlssMode();
+  upFitHintUi();
   lvSendOpts();
   clearTimeout(dlssSettleT);
   dlssSettleT = setTimeout(() => {
@@ -1100,7 +1108,7 @@ function liveHdrOn(){ return !!(rtxReady.hdr && $('rtxhdr').checked); }
 // language's for the HUD)
 function liveLoadParts(mi, sharpen: string){
   const parts = mi.effectsOnly ? [] : [mi.name];
-  if(restoreOn()) parts.push(ajOn() ? 'AnimeJaNai HD' : 'Real-ESRGAN');
+  if(restoreOn()) parts.push(ajOn() ? 'AnimeJaNai HD' : a4kRestOn() ? 'Anime4K Restore' : 'Real-ESRGAN');
   if(nrOn()) parts.push('DLSS 5');
   const up = liveVsrOn() ? 'RTX VSR' : fsrUpOn() ? 'AMD FSR 4.1' : a4kUpOn() ? 'Anime4K' : '';
   if(up) parts.push(up);
@@ -1166,19 +1174,33 @@ function lvTargetUi(mi = liveModelInfo()){
   // of the captured window's own rate that reaches it, so say that instead of promising the exact number.
   const lvT = liveTargetFps();
   $('lvtarget').textContent = (mi.effectsOnly ? tr('lv.none') : mi.name)
-    + ' · ' + (mi.effectsOnly ? tr('lv.effectsOnly', { fps: lvT })
+    + ' · ' + (mi.effectsOnly ? tr('lv.effectsOnly', { fps: lvT, restore: tr('restore.k'), up: tr('up.k'),
+                                                       nr: tr('nr.k'), sharpen: tr('sharpen.k'), hdr: tr('hdr.k') })
        : mi.fixed ? tr('lv.fixed', { fps: lvT }) + (mi.model === 'dlssg' ? ' ' + tr('lv.fixed.dlssg') : '')
        : tr('lv.targets', { fps: lvT }))
     + (load ? ' · ' + load : '')
     + (liveHdrOn() && ['rife', 'rifedrba', 'gmfss', 'nvof', 'dlssg'].includes(mi.model) ? ' · ' + tr('lv.rtxhdr') : '')
     + (mi.note ? ' · ' + tr('lv.note.' + mi.model) : '') + '  ·  ';
 }
+// Live's upscalers enlarge only what reaches them: Whole screen captures the screen as the player shows it (a fullscreen
+// player has already stretched the video with its own scaler), and Original size at DLAA leaves nothing to enlarge; a
+// ticked upscaler says so under its rows, with the setup that hands it the video's own frames (a window at the video's
+// size, Fill screen). The names come from the Display row's own labels.
+function upFitHintUi(){
+  const fit = $('lvfit').value;
+  const key = !(liveVsrOn() || fsrUpOn() || a4kUpOn()) ? ''
+    : fit === 'monitor' ? 'up.live.monitor'
+    : fit === 'window' && dlssPct() >= 100 ? 'up.live.window' : '';
+  $('upfithint').textContent = key ? tr(key, { whole: tr('live.fit.monitor'), orig: tr('live.fit.window'),
+    fill: tr('live.fit.fill'), display: tr('live.display') }) : '';
+  $('upfithintrow').style.display = key ? '' : 'none';
+}
 function lvModelUi(){
   // every display mode works with every model (DLSS 4.5 with an effect, Fill included, runs the effects route
   // before its frame generation)
   $('lvfit').disabled = lvState === 'running';
   // Restore applies live too; named here like Upscale to
-  const resTxt = restoreOn() ? tr('lv.fit.restore', { model: tr(ajOn() ? 'restoreaj.label' : 'restore.label') }) : '';
+  const resTxt = restoreOn() ? tr('lv.fit.restore', { model: tr(ajOn() ? 'restoreaj.label' : a4kRestOn() ? 'restorea4k.label' : 'restore.label') }) : '';
   // DLSS 5 applies live too: once per captured frame
   const nrTxt = nrOn() ? tr('lv.fit.nr') : '';
   const effTxt = [resTxt, nrTxt].filter(Boolean).join(' · ');
@@ -1189,6 +1211,7 @@ function lvModelUi(){
     : $('lvfit').value === 'monitor' ? tr('lv.fit.monitor')
                                        + (effTxt ? ' · ' + effTxt : '')
     : effTxt;
+  upFitHintUi();
 }
 function lvUi(){
   const b = $('lvgo');
@@ -1324,7 +1347,17 @@ function lvLine(t){
   const pl = /^DLSS 4\.5 at (\d+)x: (\d+)x in a second process, (?:(\d+)x in a third, )?then (\d+)x/.exec(t);
   const one = /^DLSS 4\.5 stays at (\d+)x: (?:\d+x \(\d+x, then \d+x\) )?([^\r\n]+)/.exec(t);
   const lost = /^DLSS 4\.5's second (and third )?pass(?:es)? ended \(([^)]+)\): back to one pass at (\d+)x/.exec(t);
+  // every pass in helpers ("at 36.00x: 6x in a second process, 6x in a third, ..."), and a plan switched in place
+  // ("steps to 12.00x in place (2x, 6x, 1x in the running ..."): the multiple and its passes, a 1x pass left out
+  const lz = /^DLSS 4\.5 at ([\d.]+)x: (\d+)x in a second process(?:, (\d+)x in a third)?(?:, (\d+)x in a fourth)?, /.exec(t);
+  const st = /^DLSS 4\.5 steps to ([\d.]+)x in place \(([\dx, ]+) in the running/.exec(t);
+  const passNote = (m: string, passes: string[]) => {
+    const p = passes.filter(x => x && x !== '1');
+    return 'DLSS 4.5 ' + String(+m) + '×' + (p.length > 1 ? ' (' + p.join('×, ') + '×)' : '');
+  };
   if(pl){ const [, all, a, b, c] = pl; lvNote = () => 'DLSS 4.5 ' + all + '× (' + a + '×, ' + (b ? b + '×, ' : '') + tr('lv.then') + ' ' + c + '×)'; }
+  else if(lz){ const n = passNote(lz[1], [lz[2], lz[3], lz[4]]); lvNote = () => n; }
+  else if(st){ const n = passNote(st[1], st[2].split(',').map(x => x.trim().replace(/x$/, ''))); lvNote = () => n; }
   else if(one){ const n = one[1], why = one[2].trim().slice(0, 120); lvNote = () => tr('lv.stays', { n }) + ': ' + why; }
   else if(lost){ const key = lost[1] ? 'lv.lost2' : 'lv.lost1', n = lost[3], why = lost[2]; lvNote = () => tr(key, { n, why }); }
   // surface the exe's 2s stats lines; pass real failures through verbatim (trimmed)
@@ -1703,7 +1736,7 @@ $('sharpen').addEventListener('change', refreshPreviewIfOpen);
 $('restore').addEventListener('change', () => { refreshPreviewIfOpen(); try{ lvModelUi(); lvSendOpts(); }catch{} });
 // The interp-off output name tags the active pass (_restored/_dlss5/_sharpened/_hdr), so it must
 // re-resolve when any of them toggles (refresh() is a no-op until a video is selected).
-for(const _id of ['sharpen', 'sharpval', 'restore', 'restoreaj', 'rtxhdr', 'dlssnr'])
+for(const _id of ['sharpen', 'sharpval', 'restore', 'restoreaj', 'restorea4k', 'rtxhdr', 'dlssnr'])
   $(_id).addEventListener('change', () => refresh());
 
 // RTX HDR colour: TrueHDR's result as NVIDIA gives it (the engine's raw mode; the same colours as

@@ -60,6 +60,7 @@
 #include <deque>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 #include <algorithm>
 #include <map>
 #include <list>
@@ -95,6 +96,10 @@ namespace wgdx = winrt::Windows::Graphics::DirectX;
 
 static uint32_t W = 1920;
 static uint32_t H = 1080;
+// Live DLSS 4.5 at the working size: the presented rect while W x H holds its smaller frames (0 = W x H is presented)
+static uint32_t g_presW = 0, g_presH = 0;
+// Live DLSS 4.5 at the working size: the working size is at least kDlssgMinWork a side of the canvas (liveWorkSize)
+static bool g_dlssgWorkFloor = false;
 
 // Enhancement backend. BK_DLSSG = Streamline DLSS Frame Generation (SL interposes the swap
 // chain, its pacer presents generated frames, needs RTX 40/50 + foreground). BK_IDENTITY =
@@ -170,6 +175,8 @@ static int g_upscaleH = 0;                     // --upscale H: forwarded to the 
                                                // height as the internal render size before the fit)
 static bool g_restore = false;                 // --restore: forwarded to the server (Real-ESRGAN first on
                                                // every composed frame, the app's Restore checkbox)
+static bool g_restoreA4k = false;              // --restore-anime4k (implies --restore): Restore = Anime4K's Restore
+                                               // CNN UL on the host's kernels (a --restore-model wins over it)
 static std::string g_restoreModel;             // --restore-model PATH (implies --restore): Restore's model = this
                                                // ONNX file (the user's AnimeJaNai download); empty = Real-ESRGAN
 static bool g_dlssnr = false;                  // --dlssnr: forwarded to the server (DLSS 5 Neural Rendering
@@ -736,19 +743,321 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 //               --multi ignored)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
 //               (RIFE: the host finds or builds the engines itself, lkOfflineRife)
-//               the per-frame passes: [--out-w W --out-h H] [--restore | --restore-model ONNX]
+//               the per-frame passes: [--out-w W --out-h H] [--restore | --restore-model ONNX | --restore-anime4k]
 //               [--rtx-vsr [--vsr-quality N] | --fsr-upscale | --anime4k]
 //               [--dlssnr --nr-structure F --nr-tone F --nr-style N [--nr-delta PATH]] [--sharpen S] [--rtx-hdr ...]
+//               [--out-vf FILTERS [--out-sws FLAGS]] (the encoder's conversion to p010le run here, FfConv)
 // Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
-// stdout in the same pixfmt (the encoder pipe). Real frames go out from the host buffer they came
-// in (bit exact); the N-1 tweens of every pair run pack-in, Head encode, IFNet, pack-out and
-// a pinned download on the compute stream. stderr carries the log plus the PROGRESS k/total and
-// OUTFRAMES n lines src/render forwards to the GUI.
+// stdout in the same pixfmt (the encoder pipe), or with --out-vf as the encoder's p010le. Real frames go
+// out from the host buffer they came in (bit exact); the N-1 tweens of every pair run pack-in, Head
+// encode, IFNet, pack-out and a pinned download on the compute stream. stderr carries the log plus the
+// PROGRESS k/total and OUTFRAMES n lines src/render forwards to the GUI.
 static const uint64_t kProgressEvery = 10; // the offline host logs a PROGRESS line every 10 pairs
+
+// --out-vf / --out-sws: the encoder's own conversion (native.ts encodePlan's hostVf: the colour tags, zimg's RGB ->
+// YUV, the encoder's pixel format) runs here, in ffmpeg's avutil / avfilter DLLs from engine\bin (the LGPL build the
+// encoder itself runs), with the encoder's -sws_flags: the frames leave as the encoder's input (p010le, 3 bytes a pixel
+// instead of rgb48le's 6), the bytes its -vf made of them, and the encoder converts nothing. ffmpeg's ingest of raw
+// frames (~1.3 GiB/s) capped an 8K render; half the bytes = twice the frames through it. The DLLs load at the first
+// such session; avutil 61 / avfilter 12 (the declarations below) or the session ends before its first frame.
+struct FfFrameHead // AVFrame's leading fields (libavutil/frame.h, avutil 61; offsets read from its headers)
+{
+    uint8_t* data[8];
+    int linesize[8];
+    uint8_t** extendedData;
+    int width, height;
+    int nbSamples;
+    int format;
+    int pictType;
+    int sarNum, sarDen;
+    int64_t pts;
+    int64_t pktDts;
+    int tbNum, tbDen;
+    int quality;
+    void* opaque;
+    int repeatPict;
+    int sampleRate;
+    void* buf[8]; // AVBufferRef*: { AVBuffer* buffer; uint8_t* data; size_t size; }
+};
+static_assert(offsetof(FfFrameHead, pts) == 136 && offsetof(FfFrameHead, buf) == 184, "AVFrame's avutil 61 layout");
+static const int kFfEagain = -11, kFfEof = -0x20464F45; // AVERROR(EAGAIN) (the mingw build's EAGAIN 11), AVERROR_EOF
+struct FfApi
+{
+    bool tried = false, ok = false;
+    std::string why;
+    unsigned (*avutilVersion)() = nullptr;
+    unsigned (*avfilterVersion)() = nullptr;
+    void* (*frameAlloc)() = nullptr;
+    void (*frameFree)(void**) = nullptr;
+    void (*frameUnref)(void*) = nullptr;
+    int (*frameGetBuffer)(void*, int) = nullptr;
+    void* (*bufferCreate)(uint8_t*, size_t, void (*)(void*, uint8_t*), void*, int) = nullptr;
+    int (*pixFmt)(const char*) = nullptr;
+    void* (*graphAlloc)() = nullptr;
+    void (*graphFree)(void**) = nullptr;
+    int (*graphParse)(void*, const char*, void**, void**, void*) = nullptr;
+    int (*graphConfig)(void*, void*) = nullptr;
+    void* (*graphFilter)(void*, const char*) = nullptr;
+    int (*srcAdd)(void*, void*, int) = nullptr;
+    int (*sinkGet)(void*, void*) = nullptr;
+    void (*inoutFree)(void**) = nullptr;
+    void (*logLevel)(int) = nullptr;
+};
+static FfApi g_ff;
+static std::mutex g_ffM;
+static bool offlineWriteAll(HANDLE h, const uint8_t* src, size_t n);
+
+// avutil-61.dll + avfilter-12.dll from this exe's ..\bin (engine\bin), once a process; false = why says what failed
+static bool ffLoad(std::string& why)
+{
+    std::lock_guard<std::mutex> lk(g_ffM);
+    if (!g_ff.tried)
+    {
+        g_ff.tried = true;
+        wchar_t exe[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring dir(exe);
+        dir = dir.substr(0, dir.find_last_of(L"\\/"));
+        dir = dir.substr(0, dir.find_last_of(L"\\/")) + L"\\bin\\";
+        HMODULE au = LoadLibraryExW((dir + L"avutil-61.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        HMODULE af =
+            au ? LoadLibraryExW((dir + L"avfilter-12.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH) : nullptr;
+        if (!au || !af)
+            g_ff.why = "avutil-61.dll / avfilter-12.dll did not load from " + wideToUtf8(dir) + " (" +
+                       std::to_string(GetLastError()) + ")";
+        else
+        {
+            bool all = true;
+            auto get = [&](HMODULE m, const char* name, auto& fn) {
+                fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(GetProcAddress(m, name));
+                all = all && fn != nullptr;
+            };
+            get(au, "avutil_version", g_ff.avutilVersion);
+            get(af, "avfilter_version", g_ff.avfilterVersion);
+            get(au, "av_frame_alloc", g_ff.frameAlloc);
+            get(au, "av_frame_free", g_ff.frameFree);
+            get(au, "av_frame_unref", g_ff.frameUnref);
+            get(au, "av_frame_get_buffer", g_ff.frameGetBuffer);
+            get(au, "av_buffer_create", g_ff.bufferCreate);
+            get(au, "av_get_pix_fmt", g_ff.pixFmt);
+            get(au, "av_log_set_level", g_ff.logLevel);
+            get(af, "avfilter_graph_alloc", g_ff.graphAlloc);
+            get(af, "avfilter_graph_free", g_ff.graphFree);
+            get(af, "avfilter_graph_parse_ptr", g_ff.graphParse);
+            get(af, "avfilter_graph_config", g_ff.graphConfig);
+            get(af, "avfilter_graph_get_filter", g_ff.graphFilter);
+            get(af, "av_buffersrc_add_frame_flags", g_ff.srcAdd);
+            get(af, "av_buffersink_get_frame", g_ff.sinkGet);
+            get(af, "avfilter_inout_free", g_ff.inoutFree);
+            if (!all)
+                g_ff.why = "an ffmpeg export is missing";
+            else if ((g_ff.avutilVersion() >> 16) != 61 || (g_ff.avfilterVersion() >> 16) != 12)
+                g_ff.why = "ffmpeg's avutil " + std::to_string(g_ff.avutilVersion() >> 16) + " / avfilter " +
+                           std::to_string(g_ff.avfilterVersion() >> 16) + ", this host knows 61 / 12";
+            else
+            {
+                g_ff.logLevel(16); // AV_LOG_ERROR: ffmpeg's own errors reach the log, nothing else
+                g_ff.ok = true;
+            }
+        }
+    }
+    why = g_ff.why;
+    return g_ff.ok;
+}
+
+// one session's conversion: buffer (the host's frames, w x h at inFmt, the sample aspect unknown as ffmpeg's rawvideo
+// demuxer leaves it) -> the encoder's -vf -> buffersink; the scale filters ffmpeg inserts take the -sws_flags
+struct FfConv
+{
+    void* graph = nullptr;
+    void* src = nullptr;
+    void* sink = nullptr;
+    void* in = nullptr;
+    void* out = nullptr;
+    int w = 0, h = 0, inFmt = -1, outFmt = -1;
+    size_t rowIn = 0;
+    int64_t n = 0;
+    std::vector<uint8_t> stage;                      // a plane whose stride is wider than its row, packed
+    double msIn = 0.0, msGraph = 0.0, msWrite = 0.0; // the copy into the buffer source, the graph, the pipe writes
+    bool zeroCopy = false;            // the host's buffer goes in as a reference (ffConvOpen's layout check)
+    std::atomic<bool> released{true}; // ffmpeg let go of the last such buffer (ffHostRelease)
+    ~FfConv()
+    {
+        if (in)
+            g_ff.frameFree(&in);
+        if (out)
+            g_ff.frameFree(&out);
+        if (graph)
+            g_ff.graphFree(&graph);
+    }
+};
+
+static bool ffConvOpen(FfConv& c, int w, int h, const char* inFmt, size_t rowIn, const std::string& vf,
+                       const std::string& sws, std::string& why)
+{
+    if (!ffLoad(why))
+        return false;
+    c.w = w;
+    c.h = h;
+    c.rowIn = rowIn;
+    c.inFmt = g_ff.pixFmt(inFmt);
+    c.outFmt = g_ff.pixFmt("p010le");
+    c.graph = g_ff.graphAlloc();
+    c.in = g_ff.frameAlloc();
+    c.out = g_ff.frameAlloc();
+    if (c.inFmt < 0 || c.outFmt < 0 || !c.graph || !c.in || !c.out)
+    {
+        why = "the ffmpeg graph or frames did not allocate";
+        return false;
+    }
+    char head[200];
+    sprintf_s(head, "buffer@smvin=video_size=%dx%d:pix_fmt=%s:time_base=1/1:pixel_aspect=0/1,", w, h, inFmt);
+    const std::string desc =
+        (sws.empty() ? std::string() : "sws_flags=" + sws + ";") + head + vf + ",buffersink@smvout";
+    void* ins = nullptr;
+    void* outs = nullptr;
+    int r = g_ff.graphParse(c.graph, desc.c_str(), &ins, &outs, nullptr);
+    if (ins)
+        g_ff.inoutFree(&ins);
+    if (outs)
+        g_ff.inoutFree(&outs);
+    if (r >= 0)
+        r = g_ff.graphConfig(c.graph, nullptr);
+    if (r < 0)
+    {
+        why = "ffmpeg refused the graph (" + std::to_string(r) + "): " + desc;
+        return false;
+    }
+    for (const char* nm : {"buffer@smvin", "smvin"})
+        if (!c.src)
+            c.src = g_ff.graphFilter(c.graph, nm);
+    for (const char* nm : {"buffersink@smvout", "smvout"})
+        if (!c.sink)
+            c.sink = g_ff.graphFilter(c.graph, nm);
+    if (!c.src || !c.sink)
+    {
+        why = "the graph's source or sink was not found by name";
+        return false;
+    }
+    // the zero-copy input needs AVFrame.buf where FfFrameHead has it: a frame ffmpeg allocates must show its first
+    // buffer's data at data[0]; otherwise the host's frame is copied in (the buffer source's own copy)
+    FfFrameHead* p = static_cast<FfFrameHead*>(c.in);
+    p->width = 16;
+    p->height = 16;
+    p->format = c.inFmt;
+    if (g_ff.frameGetBuffer(c.in, 0) >= 0)
+    {
+        const uint8_t* const* ref = static_cast<const uint8_t* const*>(p->buf[0]);
+        c.zeroCopy = ref && p->data[0] && ref[1] == p->data[0];
+    }
+    g_ff.frameUnref(c.in);
+    return true;
+}
+
+// av_buffer_create's free callback for a host buffer: the graph is done with it (the host owns the memory)
+static void ffHostRelease(void* opaque, uint8_t*)
+{
+    static_cast<FfConv*>(opaque)->released = true;
+}
+
+// the converted frames the sink holds, out on h: p010le's two planes (Y, then the interleaved chroma at half the
+// height), each a row of w 16-bit pairs; false = a frame of another shape or a failed write
+static double ffMs(LARGE_INTEGER a, LARGE_INTEGER b)
+{
+    static const double f = [] {
+        LARGE_INTEGER q;
+        QueryPerformanceFrequency(&q);
+        return 1000.0 / (double)q.QuadPart;
+    }();
+    return (double)(b.QuadPart - a.QuadPart) * f;
+}
+
+static bool ffConvDrain(FfConv& c, HANDLE h)
+{
+    for (;;)
+    {
+        LARGE_INTEGER t0, t1, t2;
+        QueryPerformanceCounter(&t0);
+        const int r = g_ff.sinkGet(c.sink, c.out);
+        QueryPerformanceCounter(&t1);
+        c.msGraph += ffMs(t0, t1);
+        if (r == kFfEagain || r == kFfEof)
+            return true;
+        if (r < 0)
+            return false;
+        const FfFrameHead* o = static_cast<const FfFrameHead*>(c.out);
+        bool ok = o->format == c.outFmt && o->width == c.w && o->height == c.h;
+        for (int p = 0; ok && p < 2; p++)
+        {
+            const size_t row = (size_t)c.w * 2, rows = p ? (size_t)(c.h + 1) / 2 : (size_t)c.h;
+            if ((size_t)o->linesize[p] == row)
+                ok = offlineWriteAll(h, o->data[p], row * rows);
+            else
+            {
+                c.stage.resize(row * rows);
+                for (size_t y = 0; y < rows; y++)
+                    memcpy(c.stage.data() + y * row, o->data[p] + y * (size_t)o->linesize[p], row);
+                ok = offlineWriteAll(h, c.stage.data(), row * rows);
+            }
+        }
+        g_ff.frameUnref(c.out);
+        QueryPerformanceCounter(&t2);
+        c.msWrite += ffMs(t1, t2);
+        if (!ok)
+            return false;
+    }
+}
+
+// one host frame (c.rowIn bytes a row) through the graph and out on h. zeroCopy: the host's buffer goes in as a
+// reference (av_buffer_create, released by ffHostRelease), and it must be released once the graph has made the output
+// (this chain keeps no frame), so the buffer is the host's again on return; else the buffer source copies it
+static bool ffConvWrite(FfConv& c, HANDLE h, const uint8_t* rgb)
+{
+    FfFrameHead* in = static_cast<FfFrameHead*>(c.in);
+    in->data[0] = const_cast<uint8_t*>(rgb);
+    in->linesize[0] = (int)c.rowIn;
+    in->width = c.w;
+    in->height = c.h;
+    in->format = c.inFmt;
+    in->pts = c.n++;
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    if (c.zeroCopy)
+    {
+        c.released = false;
+        in->buf[0] = g_ff.bufferCreate(const_cast<uint8_t*>(rgb), c.rowIn * (size_t)c.h, ffHostRelease, &c, 0);
+        if (!in->buf[0])
+            return false;
+    }
+    const bool ok = g_ff.srcAdd(c.src, c.in, 0) >= 0;
+    if (!ok)
+        g_ff.frameUnref(c.in); // a reference the buffer source did not take
+    QueryPerformanceCounter(&t1);
+    c.msIn += ffMs(t0, t1);
+    if (!ok || !ffConvDrain(c, h))
+        return false;
+    if (!c.released)
+    {
+        LOG("offline: ffmpeg's graph still holds a host frame after its output\n");
+        return false;
+    }
+    return true;
+}
+
+// the stream's end into the graph, anything it still holds out on h; the per-frame times in the log
+static bool ffConvEnd(FfConv& c, HANDLE h)
+{
+    const bool ok = g_ff.srcAdd(c.src, nullptr, 0) >= 0 && ffConvDrain(c, h);
+    const double n = c.n ? (double)c.n : 1.0;
+    LOG("offline: conversion of %lld frames: %.1f ms copy-in, %.1f ms graph, %.1f ms pipe write a frame\n",
+        (long long)c.n, c.msIn / n, c.msGraph / n, c.msWrite / n);
+    return ok;
+}
 
 struct OfflineIo
 {
     size_t frameBytes = 0, frameBytesOut = 0;
+    FfConv* conv = nullptr; // --out-vf: every frame leaves through the encoder's conversion (p010le)
     int nIn = 0, nOut = 0;
     std::vector<uint8_t*> hIn, hOut;
     std::vector<cudaEvent_t> h2dEv, outEv;
@@ -976,7 +1285,8 @@ static void offlineWriter(OfflineIo* io)
             break;
         if (it.kind == 0)
         {
-            if (!offlineWriteAll(io->hStdout, io->hIn[it.idx], io->frameBytes))
+            if (io->conv ? !ffConvWrite(*io->conv, io->hStdout, io->hIn[it.idx])
+                         : !offlineWriteAll(io->hStdout, io->hIn[it.idx], io->frameBytes))
             {
                 io->setFail("writer: real frame write failed");
                 return;
@@ -997,7 +1307,8 @@ static void offlineWriter(OfflineIo* io)
                 io->setFail("writer: tween event sync failed");
                 return;
             }
-            if (!offlineWriteAll(io->hStdout, io->hOut[it.idx], io->frameBytesOut))
+            if (io->conv ? !ffConvWrite(*io->conv, io->hStdout, io->hOut[it.idx])
+                         : !offlineWriteAll(io->hStdout, io->hOut[it.idx], io->frameBytesOut))
             {
                 io->setFail("writer: tween write failed");
                 return;
@@ -1029,6 +1340,11 @@ static void offlineWriter(OfflineIo* io)
                 LOG("PROGRESS %llu/%llu\n", (unsigned long long)pairs, (unsigned long long)(total ? total : pairs));
             io->lastPairs = pairs;
         }
+    }
+    if (io->conv && !ffConvEnd(*io->conv, io->hStdout))
+    {
+        io->setFail("writer: the conversion's end failed");
+        return;
     }
     LOG("OUTFRAMES %llu\n", (unsigned long long)(io->outBase + io->framesOut));
 }
@@ -1385,6 +1701,7 @@ struct OfflineArgs
     std::wstring nrDeltaW;          // --nr-delta PATH: DLSS 5's per-pixel change, float32 (the preview's mask)
     int srcHdr = 0;                 // --src-hdr pq|hlg: the source is HDR video (1 PQ, 2 HLG), 0 = SDR
     std::wstring thumbW, thumbOffW; // --thumb PATH / --thumb-off FILE: the GUI's progress thumbnail (OfflineIo)
+    std::wstring outVfW, outSwsW;   // --out-vf FILTERS / --out-sws FLAGS: the encoder's conversion run here (FfConv)
 };
 
 // argv[first..] are the flags after --offline; 0 = parsed, else the exit code
@@ -1432,6 +1749,10 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_script = argv[++i];
         else if (wcscmp(argv[i], L"--pause-file") == 0 && i + 1 < argc)
             oa.pauseFile = argv[++i];
+        else if (wcscmp(argv[i], L"--out-vf") == 0 && i + 1 < argc)
+            oa.outVfW = argv[++i];
+        else if (wcscmp(argv[i], L"--out-sws") == 0 && i + 1 < argc)
+            oa.outSwsW = argv[++i];
         else if (wcscmp(argv[i], L"--resident") == 0)
             oa.resident = true;
         else if (wcscmp(argv[i], L"--pipe") == 0 && i + 1 < argc)
@@ -1495,6 +1816,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_restore = true;
             g_restoreModel = wideToUtf8(argv[++i]);
         }
+        else if (wcscmp(argv[i], L"--restore-anime4k") == 0)
+            g_restore = g_restoreA4k = true;
         // RTX HDR: TrueHDR once per decoded frame after DLSS 5 and Sharpen, before the model; x2rgb10le out
         else if (wcscmp(argv[i], L"--rtx-hdr") == 0)
             g_rtxHdr = true;
@@ -1555,9 +1878,9 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
 
 static bool offlineArgsValid(const OfflineArgs& oa)
 {
-    if (oa.w < 16 || oa.h < 16 || (!oa.echo && oa.fpsRatio == 0.0 && (oa.multi < 2 || oa.multi > 65)))
+    if (oa.w < 16 || oa.h < 16 || (!oa.echo && oa.fpsRatio == 0.0 && oa.multi < 2))
     {
-        LOG("offline: need --w --h (>= 16) and --multi 2..65 (or --no-interp or --fps-ratio)\n");
+        LOG("offline: need --w --h (>= 16) and --multi 2 or more (or --no-interp or --fps-ratio)\n");
         return false;
     }
     if ((int)oa.echo + (int)oa.nvof + (int)oa.gmfss + (int)oa.drba + (int)oa.fruc + (int)oa.fsrfg + (int)oa.dlssg > 1)
@@ -1621,6 +1944,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     uint8_t* dRaw[2]{};
     uint8_t* dOutRaw = nullptr;
     OfflineIo io;
+    std::unique_ptr<FfConv> ffConv; // --out-vf (io.conv); declared before freeItem, so it goes after it
     uint8_t* dDgRgba = nullptr;
     float* dDgF = nullptr;
     uint8_t* hDgIn[3]{};
@@ -2151,6 +2475,22 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
     }
 
+    if (!oa.outVfW.empty())
+    {
+        ffConv = std::make_unique<FfConv>();
+        std::string why;
+        const char* fmt = oa.outX2 ? "x2rgb10le" : (outIs16 ? "rgb48le" : "rgb24");
+        if (!ffConvOpen(*ffConv, outW, outH, fmt, frameBytesOut / (size_t)outH, wideToUtf8(oa.outVfW),
+                        wideToUtf8(oa.outSwsW), why))
+        {
+            LOG("offline: the encoder's conversion did not start here (%s)\n", why.c_str());
+            return 2;
+        }
+        LOG("offline: frames leave as p010le, converted here by ffmpeg's avfilter %u.%u (%s, %s)\n",
+            g_ff.avfilterVersion() >> 16, (g_ff.avfilterVersion() >> 8) & 0xff, fmt,
+            ffConv->zeroCopy ? "the host's frames as references" : "the host's frames copied in");
+        io.conv = ffConv.get();
+    }
     io.frameBytes = frameBytes;
     io.frameBytesOut = frameBytesOut;
     io.nIn = 4;
@@ -3738,6 +4078,7 @@ static void resetSessionGlobals()
     g_upscaleH = 0;
     g_restore = false;
     g_restoreModel.clear();
+    g_restoreA4k = false;
     g_dlssnr = false;
     g_nrStructure = 1.0;
     g_nrTone = 1.0;
@@ -3861,6 +4202,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_restore = true;
             g_restoreModel = wideToUtf8(argv[++i]);
         }
+        else if (wcscmp(argv[i], L"--restore-anime4k") == 0)
+            g_restore = g_restoreA4k = true;
         else if (wcscmp(argv[i], L"--dlssnr") == 0)
             g_dlssnr = true;
         else if (wcscmp(argv[i], L"--nr-structure") == 0 && i + 1 < argc)
@@ -4287,6 +4630,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_a4kUp = false;
             g_restore = false;
             g_restoreModel.clear();
+            g_restoreA4k = false;
             g_rtxHdr = false;
             wcscpy_s(g_hdrColor, L"raw");
             g_hdrSat = 100;

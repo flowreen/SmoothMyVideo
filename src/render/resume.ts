@@ -72,6 +72,7 @@ const OPTS: Record<string, Spec> = {
   '--restore': { dest: 'restore', kind: 'bool', def: false },
   // Restore's model file (the installed AnimeJaNai ONNX; the host's --restore-model), none = Real-ESRGAN
   '--restore-model': { dest: 'restore_model', kind: 'str', def: null },
+  '--restore-anime4k': { dest: 'restore_anime4k', kind: 'bool', def: false },
   '--no-gpu-fit': { dest: 'no_gpu_fit', kind: 'bool', def: false },
   '--dlssnr': { dest: 'dlssnr', kind: 'bool', def: false },
   '--nr-structure': { dest: 'nr_structure', kind: 'float', def: 1.0 },
@@ -250,7 +251,8 @@ export function resumeCleanup(p: Parts): void {
   }
 }
 
-/** render.py _write_resume_sidecar: atomic replace of the resume json; an OSError is ignored. */
+/** render.py _write_resume_sidecar: atomic replace of the resume json; an OSError is ignored. split > 0 = the file
+ * split's source frame S (both halves' sidecars carry it, native.ts resumes each half from its own work files). */
 export function writeResumeSidecar(
   resumeJson: string,
   sig: string,
@@ -259,10 +261,13 @@ export function writeResumeSidecar(
   venc: string,
   maxcll: number,
   maxfall: number,
+  split = 0,
 ): void {
   const text =
     `{"sig": ${pyJsonDumps(sig)}, "pair": ${pair}, "total": ${total}, "venc": ${pyJsonDumps(venc)}, ` +
-    `"maxcll": ${pyFloatJson(maxcll)}, "maxfall": ${pyFloatJson(maxfall)}}`;
+    `"maxcll": ${pyFloatJson(maxcll)}, "maxfall": ${pyFloatJson(maxfall)}` +
+    (split > 0 ? `, "split": ${split}` : '') +
+    '}';
   try {
     const tmp = resumeJson + '.tmp';
     fs.writeFileSync(tmp, text, 'utf8');

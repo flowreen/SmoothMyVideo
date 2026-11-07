@@ -33,6 +33,7 @@ export interface PreviewArgs {
   sharpen: number;
   restore: boolean;
   restore_model: string | null; // --restore-model: Restore's model file (AnimeJaNai), null = Real-ESRGAN
+  restore_anime4k: boolean; // --restore-anime4k: Restore = Anime4K's Restore CNN UL
   scale: string | null; // --scale: the render's DLSS mode or working-size share
   upscale: number;
   rtx_vsr: boolean;
@@ -85,6 +86,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     sharpen: 0,
     restore: false,
     restore_model: null,
+    restore_anime4k: false,
     scale: null,
     upscale: 1,
     rtx_vsr: false,
@@ -118,6 +120,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
   const flags: Record<string, keyof PreviewArgs> = {
     '--rtx-hdr': 'rtx_hdr',
     '--restore': 'restore',
+    '--restore-anime4k': 'restore_anime4k',
     '--rtx-vsr': 'rtx_vsr',
     '--fsr-upscale': 'fsr_upscale',
     '--anime4k': 'anime4k',
@@ -720,7 +723,14 @@ function passFlags(
     }
   }
   if (s.strength > 0) args.push('--sharpen', pyG(s.strength));
-  if (a.restore) args.push(...(a.restore_model ? ['--restore-model', a.restore_model] : ['--restore']));
+  if (a.restore)
+    args.push(
+      ...(a.restore_model
+        ? ['--restore-model', a.restore_model]
+        : a.restore_anime4k
+          ? ['--restore-anime4k']
+          : ['--restore']),
+    );
   if (s.WW !== s.W || s.WH !== s.H || a.restore) args.push('--work-w', String(s.WW), '--work-h', String(s.WH));
   if (s.nrOn) {
     args.push(

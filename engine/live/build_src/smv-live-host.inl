@@ -247,7 +247,42 @@ struct Host
     UINT syncInterval = 0;
     bool tearPresent = true; // pass DXGI_PRESENT_ALLOW_TEARING on sync-0 presents (server route)
     uint32_t maxGen = 0;
-    uint32_t minWH = 0;     // DLSS-G minimum width/height once known
+    uint32_t minWH = 0;          // DLSS-G minimum width/height once known
+    uint32_t winW = 0, winH = 0; // the window's size when the frames are smaller (0 = W x H)
+    // THE FINAL ENLARGE (lzOn, DLSS 4.5 at the working size: loop.inl sets it with winW x winH): the swap chain, the
+    // session's own DLSS-G pass and its tags at winW x winH, every W x H frame it presents (its own, a helper's ring
+    // slot) enlarged into the back buffer by the native fit's Lanczos: k_fitAaH / V's taps (the native k_rsTab tables,
+    // lzTabFn), a horizontal pass into lzTmp (winW x H, fp32), a vertical pass into the back buffer with k_packOutV's /
+    // k_packOutHdrV's rounding (lzRecord)
+    bool lzOn = false;
+    // one axis's tap table (in -> out): the RsTap array (fs x out entries of {float w, int i}); 1 = the native k_rsTab,
+    // 2 = its CPU port (the native pipeline not up), 0 = none
+    std::function<int(int in, int out, std::vector<uint8_t>& tab)> lzTabFn;
+    ComPtr<ID3D12RootSignature> lzRs;
+    ComPtr<ID3D12PipelineState> lzPsoH, lzPsoV;
+    ComPtr<ID3D12DescriptorHeap> lzSrv, lzRtv; // lzSrv: 8 source views (a ring: <= 3 lists in flight), lzTmp's;
+                                               // lzRtv: lzTmp's, the 3 back buffers'
+    ComPtr<ID3D12Resource> lzTmp, lzTabH, lzTabV;
+    UINT lzSrvInc = 0, lzRtvInc = 0, lzSrvNext = 0, lzFsH = 0, lzFsV = 0;
+    bool lzReady = false;
+    std::string lzDumpDir; // SMV_DLSSG_LZ_DUMP=DIR: the enlarge SMV_DLSSG_LZ_DUMP_AT=N (default 120): its source,
+                           // result and tables written there
+    uint64_t lzCount = 0, lzDumpAt = 120;
+    ComPtr<ID3D12Resource> lzRbSrc, lzRbOut; // that dump's readback buffers (lzDumpArm .. lzDumpWrite)
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT lzFpSrc{}, lzFpOut{};
+    bool lzDumpPend = false;
+    // a ring frame's present does not wait for the GPU (the allocator ring bounds the lists in flight at 3, lzSrv's 8
+    // views cover them; a 12-slot helper ring is overwritten under a read only when the session lags it by 9+ frames,
+    // where nextFrame skips anyway); SMV_DLSSG_LZ_PIPE=0 = the wait after every present
+    bool lzPipe = true;
+    uint32_t scW() const
+    {
+        return lzOn ? winW : W;
+    }
+    uint32_t scH() const
+    {
+        return lzOn ? winH : H;
+    }
     int posX = 0, posY = 0; // overlay position (target window frame bounds)
     bool clickthrough = true;
     bool park = false; // diagnostic: park the overlay offscreen like dlssg2f
@@ -374,8 +409,8 @@ struct Host
     bool createSwapchain(bool logIt)
     {
         DXGI_SWAP_CHAIN_DESC1 scd{};
-        scd.Width = W;
-        scd.Height = H;
+        scd.Width = scW();
+        scd.Height = scH();
         scd.Format = texFmt;
         scd.SampleDesc = {1, 0};
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -463,8 +498,8 @@ struct Host
         if (GetEnvironmentVariableW(L"SMV_EXSTYLE", exOverride, 16))
             ex = (DWORD)wcstoul(exOverride, nullptr, 16); // diagnostic bisect knob
         int px = park ? -32000 : posX, py = park ? -32000 : posY;
-        hwnd = CreateWindowExW(ex, L"smvlive", L"SMV Live", WS_POPUP, px, py, W, H, nullptr, nullptr, wc.hInstance,
-                               nullptr);
+        hwnd = CreateWindowExW(ex, L"smvlive", L"SMV Live", WS_POPUP, px, py, winW ? winW : W, winH ? winH : H, nullptr,
+                               nullptr, wc.hInstance, nullptr);
         if (!hwnd)
         {
             LOG("CreateWindow failed\n");
@@ -535,8 +570,8 @@ struct Host
             sl::DLSSGOptions go{};
             go.mode = sl::DLSSGMode::eOn;
             go.numFramesToGenerate = (uint32_t)genFrames;
-            go.mvecDepthWidth = panvec::vecSize(W);
-            go.mvecDepthHeight = panvec::vecSize(H);
+            go.mvecDepthWidth = panvec::vecSize(scW());
+            go.mvecDepthHeight = panvec::vecSize(scH());
             CHECK_SL(slDLSSGSetOptions(vp, go));
 
             sl::DLSSGState st{};
@@ -595,7 +630,7 @@ struct Host
                 device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&buf)));
         };
         // texFrame = the SL route's staging copy (the server route copies the footprint straight into the back buffer)
-        const uint32_t vw = panvec::vecSize(W), vh = panvec::vecSize(H);
+        const uint32_t vw = panvec::vecSize(scW()), vh = panvec::vecSize(scH());
         if ((useSL &&
              (!makeTex(texFmt, texFrame) ||
               !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth, D3D12_RESOURCE_FLAG_NONE, vw, vh) ||
@@ -609,21 +644,29 @@ struct Host
         }
         uploadBuf = uploadRing[0];
 
-        // fill depth (flat 0.5) + mvec (zero) once, via the shared upload buffer (SL tag inputs)
+        // fill depth (flat 0.5) + mvec (zero) once, via an upload buffer of their own size (SL tag inputs)
         if (useSL)
         {
-            std::vector<float> depthData((size_t)W * H, 0.5f);
+            const UINT tagPitch =
+                (vw * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+            ComPtr<ID3D12Resource> tagUp;
+            if (!makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)tagPitch * vh, D3D12_RESOURCE_STATE_GENERIC_READ, tagUp))
+            {
+                LOG("resource creation failed\n");
+                return 1;
+            }
+            const std::vector<float> depthRow(vw, 0.5f);
             uint8_t* dst = nullptr;
-            CHECK_HR(uploadBuf->Map(0, nullptr, (void**)&dst));
-            for (uint32_t y = 0; y < H; y++)
-                memcpy(dst + (size_t)y * rowPitch, depthData.data() + (size_t)y * W, W * 4);
-            uploadBuf->Unmap(0, nullptr);
+            CHECK_HR(tagUp->Map(0, nullptr, (void**)&dst));
+            for (uint32_t y = 0; y < vh; y++)
+                memcpy(dst + (size_t)y * tagPitch, depthRow.data(), (size_t)vw * 4);
+            tagUp->Unmap(0, nullptr);
 
             alloc->Reset();
             list->Reset(alloc.Get(), nullptr);
             D3D12_TEXTURE_COPY_LOCATION dl{texDepth.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            D3D12_TEXTURE_COPY_LOCATION sl_{uploadBuf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            sl_.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, vw, vh, 1, rowPitch};
+            D3D12_TEXTURE_COPY_LOCATION sl_{tagUp.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            sl_.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, vw, vh, 1, tagPitch};
             list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
             list->Close();
             ID3D12CommandList* ls[] = {list.Get()};
@@ -631,11 +674,10 @@ struct Host
             if (!waitQueue())
                 return 1;
 
-            std::vector<uint8_t> zero((size_t)W * H * 4, 0);
-            CHECK_HR(uploadBuf->Map(0, nullptr, (void**)&dst));
-            for (uint32_t y = 0; y < H; y++)
-                memcpy(dst + (size_t)y * rowPitch, zero.data() + (size_t)y * W * 4, W * 4);
-            uploadBuf->Unmap(0, nullptr);
+            CHECK_HR(tagUp->Map(0, nullptr, (void**)&dst));
+            for (uint32_t y = 0; y < vh; y++)
+                memset(dst + (size_t)y * tagPitch, 0, (size_t)vw * 4);
+            tagUp->Unmap(0, nullptr);
             alloc->Reset();
             list->Reset(alloc.Get(), nullptr);
             dl.pResource = texMvec.Get();
@@ -659,13 +701,396 @@ struct Host
         }
         if (useSL)
         {
-            panOn = panTex.init(device.Get(), texMvec.Get(), W, H);
+            panOn = panTex.init(device.Get(), texMvec.Get(), scW(), scH());
             if (!panOn)
                 LOG("pan vectors: the descriptor heaps did not allocate, zero vectors\n");
+        }
+        if (lzOn && !lzInit())
+        {
+            LOG("DLSS 4.5's final enlarge: its passes did not build\n");
+            return 1;
         }
 
         fillConstants(consts);
         return 0;
+    }
+
+    // a pan measured on a W x H frame, for the winW x winH vectors (lzOn): the shift scaled, a still rect outward
+    panvec::Result panForTags(const panvec::Result& r) const
+    {
+        if (!lzOn || !r.on)
+            return r;
+        const double sx = (double)winW / W, sy = (double)winH / H;
+        panvec::Result o = r;
+        o.mx = (float)(r.mx * sx);
+        o.my = (float)(r.my * sy);
+        for (D3D12_RECT& q : o.still)
+            q = {(LONG)floor(q.left * sx), (LONG)floor(q.top * sy), (LONG)ceil(q.right * sx),
+                 (LONG)ceil(q.bottom * sy)};
+        return o;
+    }
+
+    // ---- the final enlarge (lzOn) ----
+    // vs: one triangle over the target; psH / psV: k_fitAaH / aaVSum's sums (a tap = its weight times the source,
+    // fused into the running sum in tap order, as NVRTC's default fmad compiles them: so no IEEE strictness, which
+    // marks every mad precise = unfused), psV's store = k_packOutV (rintf(v 255)) / k_packOutHdrV (v 1023 + 0.5
+    // truncated) on the clamped sum; the root signature rides in the bytecode
+    static constexpr const char* kLzShader = R"lz(
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), SRV(t1, visibility = SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants = 4, b0, visibility = SHADER_VISIBILITY_PIXEL)"
+Texture2D<float4> src : register(t0);
+StructuredBuffer<uint2> tab : register(t1);
+cbuffer C : register(b0) { uint outN; uint fs; uint hdr; uint pad; };
+[RootSignature(RS)]
+float4 vs(uint id : SV_VertexID) : SV_Position
+{
+    const float2 p = float2((id << 1) & 2, id & 2);
+    return float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+}
+[RootSignature(RS)]
+float4 psH(float4 pos : SV_Position) : SV_Target
+{
+    const uint ox = (uint)pos.x, y = (uint)pos.y;
+    float3 a = float3(0.0, 0.0, 0.0);
+    for (uint k = 0; k < fs; k++)
+    {
+        const uint2 t = tab[k * outN + ox];
+        a = mad(asfloat(t.x).xxx, src.Load(int3(t.y, y, 0)).rgb, a);
+    }
+    return float4(a, 1.0);
+}
+[RootSignature(RS)]
+float4 psV(float4 pos : SV_Position) : SV_Target
+{
+    const uint x = (uint)pos.x, oy = (uint)pos.y;
+    float3 a = float3(0.0, 0.0, 0.0);
+    for (uint k = 0; k < fs; k++)
+    {
+        const uint2 t = tab[k * outN + oy];
+        a = mad(asfloat(t.x).xxx, src.Load(int3(x, t.y, 0)).rgb, a);
+    }
+    a = saturate(a);
+    const float3 q = hdr ? floor(mad(a, 1023.0.xxx, 0.5.xxx)) / 1023.0 : round(a * 255.0) / 255.0;
+    return float4(q, 1.0);
+}
+)lz";
+
+    // the passes' shaders, root signature, pipelines, views and lzTmp; the tables wait for the first enlarge (lzTables)
+    bool lzInit()
+    {
+        ComPtr<ID3DBlob> vsb, hb, vb, err;
+        const size_t n = strlen(kLzShader);
+        auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& out) {
+            err.Reset();
+            if (FAILED(D3DCompile(kLzShader, n, nullptr, nullptr, nullptr, entry, target,
+                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &out, &err)))
+            {
+                LOG("DLSS 4.5's final enlarge: %s did not compile: %s\n", entry,
+                    err ? (const char*)err->GetBufferPointer() : "?");
+                return false;
+            }
+            return true;
+        };
+        if (!compile("vs", "vs_5_1", vsb) || !compile("psH", "ps_5_1", hb) || !compile("psV", "ps_5_1", vb) ||
+            FAILED(device->CreateRootSignature(0, vsb->GetBufferPointer(), vsb->GetBufferSize(), IID_PPV_ARGS(&lzRs))))
+            return false;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = lzRs.Get();
+        pd.VS = {vsb->GetBufferPointer(), vsb->GetBufferSize()};
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.SampleDesc = {1, 0};
+        pd.PS = {hb->GetBufferPointer(), hb->GetBufferSize()};
+        pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        if (FAILED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&lzPsoH))))
+            return false;
+        pd.PS = {vb->GetBufferPointer(), vb->GetBufferSize()};
+        pd.RTVFormats[0] = texFmt;
+        if (FAILED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&lzPsoV))))
+            return false;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 9;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&lzSrv))))
+            return false;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 4;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&lzRtv))))
+            return false;
+        lzSrvInc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        lzRtvInc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = winW;
+        rd.Height = H;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        rd.SampleDesc = {1, 0};
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                                   IID_PPV_ARGS(&lzTmp))))
+            return false;
+        D3D12_CPU_DESCRIPTOR_HANDLE r = lzRtv->GetCPUDescriptorHandleForHeapStart();
+        device->CreateRenderTargetView(lzTmp.Get(), nullptr, r);
+        for (UINT i = 0; i < 3; i++)
+        {
+            r.ptr += lzRtvInc;
+            device->CreateRenderTargetView(backbuffers[i].Get(), nullptr, r);
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE s = lzSrv->GetCPUDescriptorHandleForHeapStart();
+        s.ptr += (SIZE_T)8 * lzSrvInc;
+        device->CreateShaderResourceView(lzTmp.Get(), &sd, s);
+        wchar_t dd[MAX_PATH]{};
+        if (GetEnvironmentVariableW(L"SMV_DLSSG_LZ_DUMP", dd, MAX_PATH) && dd[0])
+            lzDumpDir = wideToUtf8(dd);
+        if (GetEnvironmentVariableW(L"SMV_DLSSG_LZ_DUMP_AT", dd, MAX_PATH) && _wtoi64(dd) > 0)
+            lzDumpAt = (uint64_t)_wtoi64(dd);
+        lzPipe = !(GetEnvironmentVariableW(L"SMV_DLSSG_LZ_PIPE", dd, MAX_PATH) && dd[0] == L'0');
+        return true;
+    }
+
+    // both axes' tap tables in default-heap buffers, once (the first enlarge: the native k_rsTab needs the native
+    // pipeline up); false = no table
+    bool lzTables()
+    {
+        if (lzReady)
+            return true;
+        std::vector<uint8_t> th, tv;
+        const int kh = lzTabFn ? lzTabFn((int)W, (int)winW, th) : 0;
+        const int kv = kh ? lzTabFn((int)H, (int)winH, tv) : 0;
+        if (!kh || !kv || th.empty() || tv.empty())
+        {
+            LOG("DLSS 4.5's final enlarge: no tap table\n");
+            return false;
+        }
+        lzFsH = (UINT)(th.size() / 8 / winW);
+        lzFsV = (UINT)(tv.size() / 8 / winH);
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc = {1, 0};
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Width = th.size();
+        bool ok = SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON,
+                                                            nullptr, IID_PPV_ARGS(&lzTabH)));
+        bd.Width = tv.size();
+        ok = ok && SUCCEEDED(device->CreateCommittedResource(
+                       &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&lzTabV)));
+        ComPtr<ID3D12Resource> up;
+        D3D12_HEAP_PROPERTIES uh{D3D12_HEAP_TYPE_UPLOAD};
+        bd.Width = th.size() + tv.size();
+        ok = ok && SUCCEEDED(device->CreateCommittedResource(
+                       &uh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&up)));
+        uint8_t* p = nullptr;
+        ok = ok && SUCCEEDED(up->Map(0, nullptr, (void**)&p));
+        if (!ok)
+        {
+            LOG("DLSS 4.5's final enlarge: the tap tables did not allocate\n");
+            return false;
+        }
+        memcpy(p, th.data(), th.size());
+        memcpy(p + th.size(), tv.data(), tv.size());
+        up->Unmap(0, nullptr);
+        ComPtr<ID3D12CommandAllocator> a;
+        ComPtr<ID3D12GraphicsCommandList> l;
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a.Get(), nullptr, IID_PPV_ARGS(&l))))
+            return false;
+        l->CopyBufferRegion(lzTabH.Get(), 0, up.Get(), 0, th.size());
+        l->CopyBufferRegion(lzTabV.Get(), 0, up.Get(), th.size(), tv.size());
+        D3D12_RESOURCE_BARRIER b[2]{};
+        for (int i = 0; i < 2; i++)
+        {
+            b[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[i].Transition.pResource = i ? lzTabV.Get() : lzTabH.Get();
+            b[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b[i].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        }
+        l->ResourceBarrier(2, b);
+        l->Close();
+        ID3D12CommandList* ls[] = {l.Get()};
+        queue->ExecuteCommandLists(1, ls);
+        if (!waitQueue())
+            return false;
+        LOG("DLSS 4.5's final enlarge: %ux%u -> %ux%u by the native fit's Lanczos, %u / %u taps (%s)\n", W, H, winW,
+            winH, lzFsH, lzFsV, kh == 1 && kv == 1 ? "the native k_rsTab tables" : "the tables' CPU port");
+        lzReady = true;
+        return true;
+    }
+
+    // records the enlarge of `srcTex` (W x H, resting in PIXEL_SHADER_RESOURCE) into back buffer bb (PRESENT before
+    // and after)
+    void lzRecord(ID3D12GraphicsCommandList* l, ID3D12Resource* srcTex, UINT bb)
+    {
+        const UINT s = lzSrvNext;
+        lzSrvNext = (lzSrvNext + 1) % 8;
+        D3D12_CPU_DESCRIPTOR_HANDLE c = lzSrv->GetCPUDescriptorHandleForHeapStart();
+        c.ptr += (SIZE_T)s * lzSrvInc;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = srcTex->GetDesc().Format;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(srcTex, &sd, c);
+        D3D12_GPU_DESCRIPTOR_HANDLE g = lzSrv->GetGPUDescriptorHandleForHeapStart(), gt = g;
+        g.ptr += (UINT64)s * lzSrvInc;
+        gt.ptr += (UINT64)8 * lzSrvInc;
+        D3D12_CPU_DESCRIPTOR_HANDLE rt = lzRtv->GetCPUDescriptorHandleForHeapStart(), rb = rt;
+        rb.ptr += (SIZE_T)(1 + bb) * lzRtvInc;
+        const UINT hdr = texFmt == DXGI_FORMAT_R10G10B10A2_UNORM ? 1u : 0u;
+        const bool dump = !lzDumpDir.empty() && ++lzCount == lzDumpAt && lzDumpArm(srcTex);
+
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        auto to = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES z) {
+            b.Transition.pResource = r;
+            b.Transition.StateBefore = a;
+            b.Transition.StateAfter = z;
+            l->ResourceBarrier(1, &b);
+        };
+        if (dump)
+        {
+            to(srcTex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION d{lzRbSrc.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT},
+                sr{srcTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            d.PlacedFootprint = lzFpSrc;
+            l->CopyTextureRegion(&d, 0, 0, 0, &sr, nullptr);
+            to(srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        l->SetGraphicsRootSignature(lzRs.Get());
+        ID3D12DescriptorHeap* hs[] = {lzSrv.Get()};
+        l->SetDescriptorHeaps(1, hs);
+        l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        // horizontal: W x H -> lzTmp (winW x H)
+        to(lzTmp.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        D3D12_VIEWPORT v{0, 0, (float)winW, (float)H, 0, 1};
+        D3D12_RECT sc_{0, 0, (LONG)winW, (LONG)H};
+        l->RSSetViewports(1, &v);
+        l->RSSetScissorRects(1, &sc_);
+        l->OMSetRenderTargets(1, &rt, FALSE, nullptr);
+        l->SetPipelineState(lzPsoH.Get());
+        l->SetGraphicsRootDescriptorTable(0, g);
+        l->SetGraphicsRootShaderResourceView(1, lzTabH->GetGPUVirtualAddress());
+        const UINT ch[4] = {winW, lzFsH, hdr, 0};
+        l->SetGraphicsRoot32BitConstants(2, 4, ch, 0);
+        l->DrawInstanced(3, 1, 0, 0);
+        to(lzTmp.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        // vertical: lzTmp -> the back buffer (winW x winH)
+        to(backbuffers[bb].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        v.Height = (float)winH;
+        sc_.bottom = (LONG)winH;
+        l->RSSetViewports(1, &v);
+        l->RSSetScissorRects(1, &sc_);
+        l->OMSetRenderTargets(1, &rb, FALSE, nullptr);
+        l->SetPipelineState(lzPsoV.Get());
+        l->SetGraphicsRootDescriptorTable(0, gt);
+        l->SetGraphicsRootShaderResourceView(1, lzTabV->GetGPUVirtualAddress());
+        const UINT cv[4] = {winH, lzFsV, hdr, 0};
+        l->SetGraphicsRoot32BitConstants(2, 4, cv, 0);
+        l->DrawInstanced(3, 1, 0, 0);
+        if (dump)
+        {
+            to(backbuffers[bb].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION d{lzRbOut.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT},
+                sr{backbuffers[bb].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            d.PlacedFootprint = lzFpOut;
+            l->CopyTextureRegion(&d, 0, 0, 0, &sr, nullptr);
+            to(backbuffers[bb].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+            lzDumpPend = true;
+        }
+        else
+            to(backbuffers[bb].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    }
+
+    // SMV_DLSSG_LZ_DUMP: the readback buffers for one enlarge's source and result
+    bool lzDumpArm(ID3D12Resource* srcTex)
+    {
+        auto rbFor = [&](ID3D12Resource* t, D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp, ComPtr<ID3D12Resource>& rb) {
+            const D3D12_RESOURCE_DESC td = t->GetDesc();
+            UINT64 total = 0;
+            device->GetCopyableFootprints(&td, 0, 1, 0, &fp, nullptr, nullptr, &total);
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = total;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.SampleDesc = {1, 0};
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            return SUCCEEDED(device->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb)));
+        };
+        return rbFor(srcTex, lzFpSrc, lzRbSrc) && rbFor(backbuffers[0].Get(), lzFpOut, lzRbOut);
+    }
+
+    // after the dumped enlarge's present ran: its source, result and both tables as raw files (lz_src.bin W x H x 4,
+    // lz_out.bin winW x winH x 4, lz_tabh.bin / lz_tabv.bin the RsTap arrays) + lz_meta.txt
+    void lzDumpWrite()
+    {
+        if (!lzDumpPend)
+            return;
+        lzDumpPend = false;
+        if (!waitQueue())
+            return;
+        auto open = [&](const char* name, const char* mode) {
+            FILE* f = nullptr;
+            return fopen_s(&f, (lzDumpDir + "\\" + name).c_str(), mode) == 0 ? f : nullptr;
+        };
+        auto rows = [&](ID3D12Resource* rb, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp, uint32_t w, uint32_t h,
+                        const char* name) {
+            uint8_t* p = nullptr;
+            if (FAILED(rb->Map(0, nullptr, (void**)&p)))
+                return;
+            if (FILE* f = open(name, "wb"))
+            {
+                for (uint32_t y = 0; y < h; y++)
+                    fwrite(p + fp.Offset + (size_t)y * fp.Footprint.RowPitch, 1, (size_t)w * 4, f);
+                fclose(f);
+            }
+            D3D12_RANGE none{0, 0};
+            rb->Unmap(0, &none);
+        };
+        rows(lzRbSrc.Get(), lzFpSrc, W, H, "lz_src.bin");
+        rows(lzRbOut.Get(), lzFpOut, winW, winH, "lz_out.bin");
+        std::vector<uint8_t> th, tv;
+        const int kh = lzTabFn ? lzTabFn((int)W, (int)winW, th) : 0;
+        const int kv = lzTabFn ? lzTabFn((int)H, (int)winH, tv) : 0;
+        for (int i = 0; i < 2; i++)
+        {
+            const std::vector<uint8_t>& t = i ? tv : th;
+            if (FILE* f = open(i ? "lz_tabv.bin" : "lz_tabh.bin", "wb"))
+            {
+                fwrite(t.data(), 1, t.size(), f);
+                fclose(f);
+            }
+        }
+        if (FILE* f = open("lz_meta.txt", "w"))
+        {
+            fprintf(f, "W %u\nH %u\nwinW %u\nwinH %u\nfmt %d\nfsH %u\nfsV %u\ntabs %d %d\n", W, H, winW, winH,
+                    (int)texFmt, lzFsH, lzFsV, kh, kv);
+            fclose(f);
+        }
+        LOG("DLSS 4.5's final enlarge: enlarge %llu dumped to %s\n", (unsigned long long)lzCount, lzDumpDir.c_str());
     }
 
     // the session's pan vector summary
@@ -788,6 +1213,7 @@ struct Host
         const bool ok = presentTailInner(src, srcOffset, srcPitch);
         prMsTot += (nowQpc100() - t0) / 1e4;
         prN++;
+        lzDumpWrite();
         return ok;
     }
 
@@ -828,13 +1254,15 @@ struct Host
         }
 
         UINT bb = sc->GetCurrentBackBufferIndex();
+        if (lzOn && !lzTables())
+            return false;
 
         allocs[ai]->Reset();
         list->Reset(allocs[ai].Get(), nullptr);
         if (panOn)
         {
             // a frame presentFrame measured carries its vectors; a slot of the shared VRAM ring keeps zero
-            panTex.record(list.Get(), texMvec.Get(), panNext);
+            panTex.record(list.Get(), texMvec.Get(), panForTags(panNext));
             panNext = panvec::Result{};
         }
         D3D12_TEXTURE_COPY_LOCATION sl_{src, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
@@ -860,6 +1288,23 @@ struct Host
                 std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
             list->ResourceBarrier(2, bs);
             dgLast = pend;
+        }
+        else if (useSL && lzOn)
+        {
+            // the final enlarge: texFrame (W x H) into the back buffer
+            D3D12_TEXTURE_COPY_LOCATION dl{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            if (src)
+            {
+                list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
+                dgLast = -1;
+            }
+            b.Transition.pResource = texFrame.Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            list->ResourceBarrier(1, &b);
+            lzRecord(list.Get(), texFrame.Get(), bb);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            list->ResourceBarrier(1, &b);
         }
         else if (useSL)
         {
@@ -905,7 +1350,7 @@ struct Host
 
         if (useSL)
         {
-            sl::Extent vecExtent{0, 0, panvec::vecSize(W), panvec::vecSize(H)};
+            sl::Extent vecExtent{0, 0, panvec::vecSize(scW()), panvec::vecSize(scH())};
             sl::Resource depthRes(sl::ResourceType::eTex2d, texDepth.Get(),
                                   (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
@@ -1024,6 +1469,8 @@ struct Host
             return false;
         slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *tok);
         const UINT bb = sc->GetCurrentBackBufferIndex();
+        if (lzOn && !lzTables())
+            return false;
         allocs[ai]->Reset();
         list->Reset(allocs[ai].Get(), nullptr);
         if (panOn) // stage 1's frames are a fraction of a source frame apart: zero vectors
@@ -1034,19 +1481,33 @@ struct Host
             x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         }
-        b[0].Transition.pResource = tex;
-        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        b[1].Transition.pResource = backbuffers[bb].Get();
-        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        list->ResourceBarrier(2, b);
-        list->CopyResource(backbuffers[bb].Get(), tex);
-        for (auto& x : b)
-            std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
-        list->ResourceBarrier(2, b);
+        if (lzOn)
+        {
+            // the final enlarge: the slot (W x H) into the back buffer
+            b[0].Transition.pResource = tex;
+            b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            list->ResourceBarrier(1, b);
+            lzRecord(list.Get(), tex, bb);
+            std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
+            list->ResourceBarrier(1, b);
+        }
+        else
+        {
+            b[0].Transition.pResource = tex;
+            b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b[1].Transition.pResource = backbuffers[bb].Get();
+            b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            list->ResourceBarrier(2, b);
+            list->CopyResource(backbuffers[bb].Get(), tex);
+            for (auto& x : b)
+                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            list->ResourceBarrier(2, b);
+        }
         list->Close();
-        sl::Extent vecExtent{0, 0, panvec::vecSize(W), panvec::vecSize(H)};
+        sl::Extent vecExtent{0, 0, panvec::vecSize(scW()), panvec::vecSize(scH())};
         sl::Resource depthRes(
             sl::ResourceType::eTex2d, texDepth.Get(),
             (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
@@ -1081,7 +1542,7 @@ struct Host
         }
         queue->Signal(fence.Get(), ++fenceValue);
         allocFence[ai] = fenceValue;
-        if (fence->GetCompletedValue() < fenceValue)
+        if (!(lzOn && lzPipe) && fence->GetCompletedValue() < fenceValue)
         {
             fence->SetEventOnCompletion(fenceValue, fenceEvent);
             if (WaitForSingleObject(fenceEvent, 5000) != WAIT_OBJECT_0)
@@ -1089,6 +1550,7 @@ struct Host
         }
         prMsTot += (nowQpc100() - t0) / 1e4;
         prN++;
+        lzDumpWrite();
         return true;
     }
 
