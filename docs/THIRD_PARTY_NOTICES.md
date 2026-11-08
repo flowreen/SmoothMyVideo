@@ -135,7 +135,7 @@ third-party work.
   the corresponding source replaces them. Built into them, with their notices in `engine/fsrfg/licenses/`: dxil-spirv
   (MIT), its bc-decoder (MIT, Copyright (c) 2019-2020 Baldur Karlsson), the glslang SPIR-V builder (BSD 3-Clause) and
   SPIRV-Headers (MIT).
-* `engine/fsrfg/amdxc64.dll` is this project's own code (`engine/fsrfg/build_src/amdxc64_shim.cpp`, MIT): it answers
+* `engine/fsrfg/amdxc64.dll` is this project's own code (`engine/fsrfg/build_src/amdxc64_standin.cpp`, MIT): it answers
   the driver-extension queries of AMD's frame generation DLL so the DLL offers FSR 4; it contains no AMD code.
 * **NVIDIA RTX Video SDK sample code**: the compiled bridge `engine/rtxvideo/rtxvideo_cuda.dll`
   is built from NVIDIA's SDK convenience layer (sources in `engine/rtxvideo/build_src/`),

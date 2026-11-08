@@ -2,7 +2,7 @@
 // (amd_fidelityfx_framegeneration_dx12.dll 4.0.2, unmodified), its ML provider (FSR 4) only, behind a small C API for
 // the native host. FSR 4's shaders use AMD's WMMA FP8 driver intrinsics, so its D3D12 device comes from vkd3d-proton
 // (D3D12 on Vulkan, built from source with ..\source's patches: FP8 matrices emulated on FP16 cooperative matrices),
-// and amdxc64.dll beside this file (amdxc64_shim.cpp) answers the DLL's driver-extension queries. vkd3d-proton's two
+// and amdxc64.dll beside this file (amdxc64_standin.cpp) answers the DLL's driver-extension queries. vkd3d-proton's two
 // DLLs are renamed smv_vkd3d_*.dll so they never share a module name with the system D3D12 in the host's process.
 // Frames go in and out through three D3D12 textures shared with CUDA (vkd3d-proton shares textures, not buffers: NT
 // handles the host imports as external memory and maps as CUDA arrays) and one shared fence (vkd3d-proton exports it
@@ -144,7 +144,7 @@ HMODULE loadBeside(const std::wstring& dir, const wchar_t* name)
     return LoadLibraryExW((dir + name).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 }
 
-// once per process: the switches of the patched vkd3d-proton, the shim, vkd3d-proton and AMD's DLLs
+// once per process: the switches of the patched vkd3d-proton, the stand-in, vkd3d-proton and AMD's DLLs
 bool loadOnce()
 {
     if (g_loaded)
@@ -178,11 +178,11 @@ bool loadOnce()
     setEnv("VKD3D_DEBUG", "none", true);
     setEnv("VKD3D_SHADER_DEBUG", "none", true);
 
-    // AMD's DLL loads amdxc64.dll by name: the shim, loaded first, is the module it finds
-    HMODULE shim = loadBeside(dir, L"amdxc64.dll");
-    if (!shim)
-        return fail("amdxc64.dll (the driver-extension shim) did not load");
-    if (GetModuleHandleW(L"amdxc64.dll") != shim)
+    // AMD's DLL loads amdxc64.dll by name: the stand-in, loaded first, is the module it finds
+    HMODULE standIn = loadBeside(dir, L"amdxc64.dll");
+    if (!standIn)
+        return fail("amdxc64.dll (the driver-extension stand-in) did not load");
+    if (GetModuleHandleW(L"amdxc64.dll") != standIn)
         return fail("another amdxc64.dll (an AMD driver's) is loaded in this process");
     // the core first: the wrapper loads it by name
     if (!loadBeside(dir, L"smv_vkd3d_d3d12core.dll"))

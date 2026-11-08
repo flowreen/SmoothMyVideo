@@ -1,5 +1,5 @@
 @echo off
-rem Builds engine\fsrfg: smv_fsrfg_bridge.dll (fsrfg_bridge.cpp) and amdxc64.dll (amdxc64_shim.cpp), and copies beside
+rem Builds engine\fsrfg: smv_fsrfg_bridge.dll (fsrfg_bridge.cpp) and amdxc64.dll (amdxc64_standin.cpp), and copies beside
 rem them AMD's signed FSR SDK v2.4.0 loader + frame generation DLLs (signedbin, unmodified) and vkd3d-proton's two DLLs.
 rem
 rem vkd3d-proton (LGPL-2.1, built separately, MSYS2 UCRT64 with gcc, meson and ninja): github.com/HansKristian-Work/
@@ -50,7 +50,7 @@ cl /nologo /O2 /EHsc /W3 /MT /LD /D_WINDOWS /DNOMINMAX /DWIN32_LEAN_AND_MEAN /Fo
    /link dxgi.lib > "%LOG%" 2>&1
 if %errorlevel% neq 0 goto failed
 cl /nologo /O2 /EHsc /W3 /MT /LD /D_WINDOWS /DNOMINMAX /DWIN32_LEAN_AND_MEAN /Fo"%WORK%\\" /std:c++17 ^
-   /Fe"%WORK%\amdxc64.dll" "%~dp0amdxc64_shim.cpp" >> "%LOG%" 2>&1
+   /Fe"%WORK%\amdxc64.dll" "%~dp0amdxc64_standin.cpp" >> "%LOG%" 2>&1
 if %errorlevel% neq 0 goto failed
 echo dll: cl rc 0 (%LOG%)
 

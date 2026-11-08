@@ -547,7 +547,7 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   (1080p in, RTX 5090 Laptop: 4 = 5.4 ms, 3 = 3.9, 2 = 1.8, 1 = 1.4); the host logs the level when it is not 4. The bridge reads and writes R, G, B, A bytes, the order the host's VSR buffers hold;
   a live slot takes them as B, G, R, A in the store's one pass. `--fsr-upscale` puts AMD FSR 4.1.2 (its INT8 model) in that same resize instead
   (the two exclude each other; with both, RTX VSR keeps it and the host says so): AMD's signed FidelityFX loader +
-  upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, which opens the upscaler's GPU gate (see "AMD FSR
+  upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, which sets the upscaler's GPU check (see "AMD FSR
   upscaling bridge"), every frame of that resize's stream in order (the first resets), its motion vectors from
   NVIDIA optical flow (one direction, the slow perf level, grid 1; a vector shorter than 0.125 px is written as
   exactly zero: between consecutive emitted frames still detail reads a few 1/32 px of flow noise, and FSR
@@ -1511,8 +1511,16 @@ up as the session start does, after the room check, at the Structure / Tone / pa
 `(held for DLSS 5's start)`), `hud` / `hudlat` (the HUD and its latency segment; the loop thread owns the HUD window
 and makes it when the session started without one), and `up` / `restore` / `rtxhdr` (the upscaler, Restore and RTX
 HDR by kind: the kind the session runs switches off through its own fallback, Lanczos / no Restore / faithful PQ,
-and on again; another kind, or one the session started without, waits for the next session). A key the session cannot
-take logs `(the next session takes it: why)`; the next spawn carries the new value either way.
+and on again; another Restore kind, or Restore / RTX HDR in a session that started without them, waits for the next
+session). An upscaler kind the session does not run starts in place (`nativeUpSwitch`) where the fit after the model
+enlarges, on SDR or HDR planes: the checks that leave the running kind first (the route, `SMV_VSR_HDR` /
+`SMV_FSRUP_HDR`, the geometry, the DLLs; RTX VSR only while NGX holds its feature or does not exist yet), then the
+running kind's own state released (`nativeUpRelease`: the bridges' instances, Anime4K's resize buffers, ArtCNN's
+buffers and weights; RTX VSR keeps NGX, a switch back reuses its feature), the buffers the slot store reads, the room
+check and the kind's setup as the session start runs it. AMD FSR / Intel XeSS run their first two frames on a worker
+thread (`nativeFsrupWarmProc`): the driver compiles FSR's shaders inside them (about 30 s for an exe location and
+ratio it has not seen), and the session presents without the upscaler until they end. A key the session cannot take
+logs `(the next session takes it: why)`; the next spawn carries the new value either way.
 
 The host prints what
 it keeps in the `live session ended` line (`engines` = the model state). The exe imports its own
@@ -1835,7 +1843,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_VSR_SYNC=1` | RTX VSR runs through the bridge's blocking export (a drain of the stream before each call, a device-wide sync after it) instead of the event-ordered one, and the host times each call (`RTX VSR eval N ms mean`); the same path an older bridge without the async export takes; A/B lever, never a product setting |
 | `SMV_VRAM_MIB=<MiB>` | the GPU's memory as the app's memory checks see it, the free memory shrinks with it (both routes): a smaller card's trigger test of the cap and of the `video memory ran out` line on a card everything fits in |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_FSRFG_DIR`, `SMV_FSRUP_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
-| `SMV_FSRFG_SHIM_LOG=1`, `VKD3D_DEBUG=warn` | AMD FSR 4 frame generation's debug output: the driver-extension shim's calls, vkd3d-proton's log (the bridge sets `VKD3D_DEBUG=none` unless set) |
+| `SMV_FSRFG_STANDIN_LOG=1`, `VKD3D_DEBUG=warn` | AMD FSR 4 frame generation's debug output: the driver-extension stand-in's calls, vkd3d-proton's log (the bridge sets `VKD3D_DEBUG=none` unless set) |
 | `SMV_FSRFG_SDR_PAIRS=0` | on HDR planes AMD FSR frame generation gets every frame pair as the HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_OFVEC_BOTH=1` | AMD FSR's motion vectors (frame generation and upscaling) from NVIDIA Optical Flow in both directions, the backward field read, instead of the forward field with the two frames swapped (the same field, byte for byte, at about half the Optical Flow time); A/B lever, never a product setting |
 | `SMV_OF_LEVEL=fast\|medium` | Every NVIDIA Optical Flow session (the NVIDIA Optical Flow model, DLSS 5's motion vectors, AMD FSR's vectors for frame generation and upscaling) at that perf level instead of slow, the engine's highest quality level (frame generation at fast = the repro of its tweens turning to garbage after ~320 calls at 1080p; the FSR 4 gate's like-for-like pan against AMD's path, whose vectors are fast grid 1); A/B lever, never a product setting |
@@ -2074,7 +2082,7 @@ deprecation notice.
 
 ### AMD FSR frame generation bridge (`smv_fsrfg_bridge.dll`)
 
-Our `fsrfg_bridge.cpp` (the bridge) and `amdxc64_shim.cpp` (`amdxc64.dll`) beside AMD's signed FSR SDK v2.4.0
+Our `fsrfg_bridge.cpp` (the bridge) and `amdxc64_standin.cpp` (`amdxc64.dll`) beside AMD's signed FSR SDK v2.4.0
 loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd3d-proton's two DLLs, all in
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
@@ -2125,7 +2133,7 @@ reset, frameTimeMs)`: the bridge's queue waits for `wait`, runs configure, prepa
 and generate on the shared textures themselves (the output one is a UAV) and signals `signal` (non-blocking but for its two-list ring); `fsrfg_provider()` = the FSR version ("4.0.2");
 `fsrfg_destroy_i` / `fsrfg_destroy`; `fsrfg_last_error`. fmt 0 = RGBA8, 1 = RGBA16F (the host's). The host
 imports the textures as CUDA external memory (opaque Win32, dedicated) mapped as arrays and the fence as a
-timeline semaphore (stream signal odd, stream wait even). `SMV_FSRFG_SHIM_LOG=1` logs the shim's calls.
+timeline semaphore (stream signal odd, stream wait even). `SMV_FSRFG_STANDIN_LOG=1` logs the stand-in's calls.
 
 ### Intel XeSS-SR bridge (`smv_xess_bridge.dll`)
 
@@ -2183,15 +2191,15 @@ It compiles `fsrup_bridge.cpp` against the SDK's `api/include` and `upscalers/in
 and copies the two signed DLLs beside it. The bridge loads AMD's upscaler DLL by full path before the loader (the
 loader opens it by name, which the exe's folder would not resolve), then the loader.
 
-The upscaler DLL (4.1.2) carries FSR 4's models as providers, each behind a GPU gate (its class's third virtual,
+The upscaler DLL (4.1.2) carries FSR 4's models as providers, each behind a GPU check (its class's third virtual,
 `bool (context, ID3D12Device*)`): the full FP8 model (`ffxProvider_FSR4`, AMD's FP8 wave-matrix intrinsics), the
 full INT8 model (`ffxProvider_FSR4_Int8`, and `ffxProvider_FSR4_Int8_Navi2`, the same model in RX 6000 kernels) and
-a lightweight INT8 model for small APUs (`ffxProvider_FSR4Lite_Int8`). On a non-AMD GPU every gate says no and the
-DLL lists only 3.1.6 and 2.3.4. The bridge opens the full INT8 model's gate, RVA 0x9960 (true when the device has
-shader model 6.6 and AMD's GPU query reports one of the parts it lists): the SDK licence lists the DLL under MIT, so
-after loading it the bridge checks the build (PE timestamp 0x6ADB3B35, image size 0x036FF000, the function's first
-12 bytes) and makes that function return true in the process's copy (`mov al, 1; ret`), before the loader's first
-query; another build is refused (`fsrup_create` fails with the reason, the host's `not created` line). Measured on
+a lightweight INT8 model for small APUs (`ffxProvider_FSR4Lite_Int8`). On a non-AMD GPU every check says no and the
+DLL lists only 3.1.6 and 2.3.4. The bridge sets the full INT8 model's check, RVA 0x9960 (true when the device has
+shader model 6.6 and AMD's GPU query reports one of the parts it lists): the SDK licence lists the DLL under MIT, which
+allows modifying it, so after loading it the bridge checks the build (PE timestamp 0x6ADB3B35, image size 0x036FF000,
+the function's first 12 bytes) and makes that function return true in the process's in-memory copy (`mov al, 1;
+ret`), before the loader's first query; the file on disk stays AMD's signed one. Another build is refused (`fsrup_create` fails with the reason, the host's `not created` line). Measured on
 the RTX 5090 (harness `fsr_sdk_bump\fp8_up\fp8_probe.py`, `up412_probe.py`): ~1.2 ms a frame for 854x480 ->
 1920x1080, two processes byte for byte, the RX 6000 variant 52-61 dB from it at the same PSNR to the truth; the FP8
 model does not run on NVIDIA (on vkd3d-proton's FP8 emulation its shaders lose the device).

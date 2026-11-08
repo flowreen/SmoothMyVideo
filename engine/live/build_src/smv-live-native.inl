@@ -4841,6 +4841,7 @@ struct RtxBridge
     PFN_rtxEvalVsrAsync evalVsrAsync = nullptr;
     PFN_rtxShutdown shutdown = nullptr;
     bool created = false;
+    bool vsrMade = false; // the one create held RTX VSR's feature (an upscaler switch back to RTX VSR reuses it)
     std::wstring dir;
 };
 static RtxBridge g_rtxb;
@@ -5640,6 +5641,15 @@ struct NativeRife
     uint64_t fuProfN = 0, fuProfVecN = 0;
     char fuVersion[32] = {};
     OfVec fuOf;
+    // an FSR / XeSS upscaler ticked mid-session (nativeUpSwitch): its first two frames run on a worker thread
+    // (nativeFsrupWarmProc), so the driver's shader compile inside them (up to kFsrCompileMs on an exe location and
+    // upscale ratio it has not seen) blocks the worker, not the native thread, while the session presents without the
+    // upscaler. fuWarm: 1 = warming, 2 = warm, 3 = failed; nativeUpWarmEnd turns it on at the next group when the tick
+    // still stands (fuWarmWant: an `up 0` meanwhile clears it)
+    volatile LONG fuWarm = 0;
+    HANDLE fuWarmTh = nullptr;
+    bool fuWarmWant = false;
+    ULONGLONG fuWarmT0 = 0;
     // ArtCNN (acnUp, `--artcnn`): RTX VSR's resize too (vsr is set), on planar floats like Anime4K: C4F32_DN v1.6.2's
     // luma x2 in its own module (acnMod, kAcnA + kAcnB), the weights from engine\artcnn\artcnn_c4f32_dn_v1.6.2_fp16.pkl,
     // the colour from the frame's Lanczos enlargement (nativeAcnRun); x2 passes as Anime4K's (a4kPassesFor)
@@ -10181,10 +10191,12 @@ static bool nativeRtxInit(NativeRife& nr)
             nr.dh < fh ? "downscale" : "upscale");
     }
     // a resize stage's staging frame (nativeOfflineStage): Restore after the model, or RTX VSR before it (the
-    // working-size frame, from the capture's planes) or after it on HDR planes (VSR's way back to the codes); live's
-    // other stores never stage (RTX VSR straight into the slot, the Lanczos fit fused into the store, Upscale to
-    // through dUp), offline's emit allocates its own
-    if ((nr.restore && !nr.restPre) || nr.vsrPre || (nr.vsr && nr.hdr))
+    // working-size frame, from the capture's planes) or after it on HDR planes (VSR's way back to the codes), and live
+    // Anime4K / ArtCNN after the model without Upscale to (their nets write planes, the slot's store reads them back);
+    // live's other stores never stage (RTX VSR straight into the slot, the Lanczos fit fused into the store, Upscale
+    // to through dUp), offline's emit allocates its own
+    if ((nr.restore && !nr.restPre) || nr.vsrPre || (nr.vsr && nr.hdr) ||
+        (!g_offline && nr.vsr && (nr.a4kUp || nr.acnUp) && !nr.uw))
         NCHK(cudaMalloc((void**)&nr.dPres,
                         (size_t)3 * (std::max)(nr.dw * nr.dh, nr.vsrPre ? nr.w * nr.h : 0) * sizeof(float)),
              "alloc fit staging");
@@ -10338,6 +10350,7 @@ static bool nativeRtxInit(NativeRife& nr)
             return false;
         }
         g_rtxb.created = true;
+        g_rtxb.vsrMade = rtxVsrNow;
         g_rtxUsed = true; // resident host: NGX is single-instance per process, end it after this session
     }
     // AMD FSR upscaling on HDR planes runs in the bridge's HDR mode (linear light); with RTX HDR on, the frame before
@@ -13613,8 +13626,90 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     return true;
 }
 
+// nativeUpSwitch's warm-up (fuWarm): two black frames with zero vectors through every pass, the first a reset, on its
+// own stream, as the app's fsrWarm session runs them. The native thread touches none of these fields while fuWarm is 1
+// (every per-frame reader waits for nr.vsr, set by nativeUpWarmEnd); the session's first real frame resets again (fuN 0)
+static DWORD WINAPI nativeFsrupWarmProc(void* p)
+{
+    NativeRife& nr = *(NativeRife*)p;
+    FsrupBridge& br = g_fsrupK[nr.fuKind];
+    const int bpp = nr.fuHdr ? 8 : 4;
+    cudaStream_t st = nullptr;
+    bool ok = nativeBindDevice(nr) && cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess;
+    InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + kFsrCompileMs);
+    for (int f = 0; f < 2 && ok; f++)
+        for (int k = 0; k < nr.fuPasses && ok; k++)
+        {
+            NativeRife::FuPass* x = k ? &nr.fuX[k - 1] : nullptr;
+            uint8_t* in = k ? x->dIn : nr.dFuIn;
+            uint8_t* mv = k ? x->dMv : nr.dFuMv;
+            const size_t inP = (size_t)(k ? x->inPitch : nr.fuInPitch), mvP = (size_t)(k ? x->mvPitch : nr.fuMvPitch);
+            cudaExternalSemaphore_t sem = k ? x->sem : nr.fuSem;
+            uint64_t& val = k ? x->val : nr.fuVal;
+            const int kw = nr.fuPw[k], kh = nr.fuPh[k];
+            cudaExternalSemaphoreSignalParams sp{};
+            sp.params.fence.value = ++val;
+            const uint64_t ready = val, done = ++val;
+            cudaExternalSemaphoreWaitParams wp{};
+            wp.params.fence.value = done;
+            const int reset = f ? 0 : 1;
+            ok = cudaMemset2DAsync(in, inP, 0, (size_t)kw * bpp, kh, st) == cudaSuccess &&
+                 cudaMemset2DAsync(mv, mvP, 0, (size_t)kw * 4, kh, st) == cudaSuccess &&
+                 cudaSignalExternalSemaphoresAsync(&sem, &sp, 1, st) == cudaSuccess &&
+                 (k ? br.frameI(k, ready, done, reset, 1000.0 / 60.0) : br.frame(ready, done, reset, 1000.0 / 60.0)) ==
+                     0 &&
+                 cudaWaitExternalSemaphoresAsync(&sem, &wp, 1, st) == cudaSuccess;
+            if (!ok)
+                LOG("native: fsr upscale: warm-up frame %d, pass %d failed: %s\n", f + 1, k + 1, br.lastError());
+        }
+    ok = ok && cudaStreamSynchronize(st) == cudaSuccess;
+    if (st)
+        cudaStreamDestroy(st);
+    InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + 10000);
+    InterlockedExchange(&nr.fuWarm, ok ? 2 : 3);
+    return 0;
+}
+
+// the warm-up's end (nativeLiveSets, on the native thread): warm = the upscaler on, as nativeUpSwitch turns the other
+// kinds on; an `up 0` meanwhile = built and off (an `up N` of its kind turns it on); failed = Lanczos stays, and the
+// built bridge stays with the session (nativeUpSwitch refuses another start while fuMade)
+static void nativeUpWarmEnd(NativeRife& nr)
+{
+    WaitForSingleObject(nr.fuWarmTh, INFINITE);
+    CloseHandle(nr.fuWarmTh);
+    nr.fuWarmTh = nullptr;
+    const bool ok = InterlockedExchange(&nr.fuWarm, 0) == 2;
+    const char* name = nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling";
+    const double ms = (double)(GetTickCount64() - nr.fuWarmT0);
+    if (!ok)
+    {
+        LOG("native: live upscale: %s's first frames failed after %.0f ms, Lanczos stays\n", name, ms);
+        return;
+    }
+    const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
+    nr.vsrWant = nr.fsrUp = nr.vsr = true;
+    nr.vsrFailed = nr.vsrUserOff = !nr.fuWarmWant;
+    LOG("native: live upscale: %s %dx%d -> %dx%d, started in place (its first frames on a worker: %.0f ms)%s\n", name,
+        nr.w, nr.h, tw, th, ms, nr.fuWarmWant ? "" : ", off: unticked meanwhile");
+}
+
 static void nativeFsrupRelease(NativeRife& nr)
 {
+    if (nr.fuWarmTh)
+    {
+        // a start in place still warming (nativeUpSwitch): its frames end before the bridge goes; past the compile's
+        // bound the worker is still inside the bridge, so its state is left to the process exit
+        const DWORD w = WaitForSingleObject(nr.fuWarmTh, (DWORD)kFsrCompileMs + 10000);
+        if (w != WAIT_OBJECT_0)
+        {
+            LOG("native: fsr upscale: its warm-up still runs after %d s, its state is left to the process exit\n",
+                kFsrCompileMs / 1000 + 10);
+            return;
+        }
+        CloseHandle(nr.fuWarmTh);
+        nr.fuWarmTh = nullptr;
+        InterlockedExchange(&nr.fuWarm, 0);
+    }
     if (nr.stream)
         cudaStreamSynchronize(nr.stream);
     if (nr.fuMade)
@@ -27298,7 +27393,7 @@ static void nativeFree(NativeRife& nr)
     if (g_rtxb.created && g_rtxb.shutdown)
     {
         g_rtxb.shutdown();
-        g_rtxb.created = false;
+        g_rtxb.created = g_rtxb.vsrMade = false;
     }
     if (nr.drTweens || nr.drHeads)
         LOG("native: drba %llu tweens (%llu head pairs), %llu block0 runs\n", (unsigned long long)nr.drTweens,
@@ -31397,9 +31492,237 @@ static bool nativeNrSwitch(NativeRife& nr, bool on, std::string& why)
     return true;
 }
 
+// the running upscaler's own state released between two groups before another kind starts in place (nativeUpSwitch),
+// the GPU idle first (the slot store's streams read its buffers): AMD FSR / Intel XeSS free their instance, imports and
+// vector session (the DLL stays loaded; a bridge whose start failed too), Anime4K its resize buffers (the statistics
+// and Restore's stay), ArtCNN its buffers and weights; RTX VSR keeps NGX (one create a process, its VSR feature reused
+// by a switch back); the buffers every kind shares at this geometry (dVsrIn / dVsrOut, dPres, dVsrView / dVsrRem) stay
+static void nativeUpRelease(NativeRife& nr)
+{
+    const char* name = !nr.vsr    ? nullptr
+                       : nr.fsrUp ? (nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling")
+                       : nr.a4kUp ? "Anime4K"
+                       : nr.acnUp ? "ArtCNN"
+                                  : "RTX VSR";
+    cudaDeviceSynchronize();
+    if (nr.fuMade)
+        nativeFsrupRelease(nr);
+    if (nr.a4kUp)
+        nativeA4kUpFree(nr);
+    if (nr.acnUp)
+        nativeAcnRelease(nr);
+    nr.vsr = nr.vsrWant = nr.fsrUp = nr.fuHdr = nr.a4kUp = nr.acnUp = nr.vsrFailed = nr.vsrUserOff = false;
+    if (name)
+        LOG("native: live upscale: %s released in place\n", name);
+}
+
+// an upscaler ticked in a running session that started without one, or another kind than the one it runs (stdin `set
+// up N`, N = the kind the renderer picked: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS): the live case
+// where the fit after the model enlarges (the upscaler's resize under nativeRtxInit's rule), on SDR or HDR planes, set
+// up on the native thread between two groups the way the session start does (the DLL checks and HDR levers, the
+// buffers the slot store reads, the bridge or module, the warm-up; FSR / XeSS's first frames on a worker), when the
+// video memory room holds it; a running kind is released first (nativeUpRelease), after the checks that leave it
+// running. false = this session cannot (why says it); the next session takes it. Left to the next session, as at the
+// start: a resize that does not enlarge, the resize before the model (vsrPre), RTX VSR once NGX was created without it
+// (single-instance a process: TrueHDR holds it), another route; a setup that fails after the release = Lanczos
+static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
+{
+    if (g_offline || g_backend != BK_SERVER)
+    {
+        why = "this route runs no native pass";
+        return false;
+    }
+    if (nr.hdr)
+    {
+        // HDR planes as the session start runs them (nativeConfigHdr's levers): RTX VSR, Anime4K and ArtCNN on the
+        // frame's SDR view and back to the codes, AMD FSR / Intel XeSS in the bridge's HDR mode
+        wchar_t ev[8]{};
+        const bool vsrOff = want == 1 && GetEnvironmentVariableW(L"SMV_VSR_HDR", ev, 8) && ev[0] == L'0';
+        const bool fuOff =
+            (want == 2 || want == 5) && GetEnvironmentVariableW(L"SMV_FSRUP_HDR", ev, 8) && ev[0] == L'0';
+        if (vsrOff || fuOff)
+        {
+            why = vsrOff ? "HDR planes (SMV_VSR_HDR=0)" : "HDR planes (SMV_FSRUP_HDR=0)";
+            return false;
+        }
+    }
+    const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
+    if (!(tw > nr.w && th > nr.h))
+    {
+        why = nr.w > nr.cw && nr.h > nr.ch ? "the resize before the model" : "this resize does not enlarge";
+        return false;
+    }
+    const char* name = want == 1   ? "RTX VSR"
+                       : want == 2 ? "AMD FSR upscaling"
+                       : want == 3 ? "Anime4K"
+                       : want == 4 ? "ArtCNN"
+                       : want == 5 ? "Intel XeSS upscaling"
+                                   : nullptr;
+    if (!name)
+    {
+        why = "an unknown upscaler";
+        return false;
+    }
+    std::string dir;
+    if (want == 1)
+    {
+        if (g_rtxb.created && !g_rtxb.vsrMade)
+        {
+            why = "RTX Video is already created in this process without RTX VSR (RTX HDR holds it)";
+            return false;
+        }
+        std::wstring d;
+        wchar_t ov[MAX_PATH]{};
+        if (GetEnvironmentVariableW(L"SMV_RTXVIDEO_DIR", ov, MAX_PATH) && ov[0])
+            d = ov;
+        else if (!g_nativeEngineDir.empty())
+            d = g_nativeEngineDir + L"\\rtxvideo";
+        if (d.empty() || GetFileAttributesW((d + L"\\rtxvideo_cuda.dll").c_str()) == INVALID_FILE_ATTRIBUTES ||
+            GetFileAttributesW((d + L"\\nvngx_vsr.dll").c_str()) == INVALID_FILE_ATTRIBUTES || !rtxBridgeLoad())
+        {
+            why = "no rtxvideo bridge or nvngx_vsr.dll";
+            return false;
+        }
+    }
+    else if (want == 2 || want == 5)
+    {
+        dir = lkEnv(want == 2 ? "SMV_FSRUP_DIR" : "SMV_XESS_DIR");
+        if (dir.empty() && !g_nativeEngineDir.empty())
+            dir = wideToUtf8(g_nativeEngineDir) + (want == 2 ? "\\fsrup" : "\\xess");
+        bool have = !dir.empty();
+        if (want == 2)
+            for (const char* f :
+                 {"smv_fsrup_bridge.dll", "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll"})
+                have = have && lkFile(dir + "\\" + f);
+        else
+            for (const char* f : {"smv_xess_bridge.dll", "libxess.dll"})
+                have = have && lkFile(dir + "\\" + f);
+        if (!have)
+        {
+            why = want == 2 ? "AMD's FidelityFX DLLs are missing" : "Intel's XeSS DLLs are missing";
+            return false;
+        }
+    }
+    if (nr.vsr || nr.fuMade)
+        nativeUpRelease(nr); // the running kind (or a bridge whose start failed) first: its memory counts below
+    // the buffers the slot store reads at this geometry (nativeRtxInit's): Anime4K / ArtCNN write planar floats into
+    // the staging frame (under Upscale to the internal render frame, allocated), the bridges read and write BGRA
+    // buffers; HDR planes add the staging frame for every kind (the way back to the codes lands there), the frame's SDR
+    // view and the light the view never held at the target (dVsrView / dVsrRem)
+    const bool planar = want == 3 || want == 4;
+    const bool pres = (planar && !nr.uw) || nr.hdr;
+    const uint64_t fl = sizeof(float);
+    const uint64_t need = (pres && !nr.dPres ? 3 * fl * nr.dw * nr.dh : 0) +
+                          (planar ? 0 : (uint64_t)nr.w * nr.h * 4 + (uint64_t)tw * th * 4) +
+                          (nr.hdr && !nr.dVsrView ? 3 * fl * nr.w * nr.h : 0) +
+                          (nr.hdr && !nr.dVsrRem ? 3 * fl * tw * th : 0);
+    const uint64_t room = nativeVideoMemoryRoom();
+    if (room && room < need)
+    {
+        why = "not enough free video memory";
+        return false;
+    }
+    auto alloc = [](void** p, size_t bytes) {
+        if (*p)
+            return true;
+        if (cudaMalloc(p, bytes) == cudaSuccess)
+            return true;
+        *p = nullptr;
+        cudaGetLastError();
+        return false;
+    };
+    if ((pres && !alloc((void**)&nr.dPres, (size_t)3 * nr.dw * nr.dh * sizeof(float))) ||
+        (!planar &&
+         (!alloc((void**)&nr.dVsrIn, (size_t)nr.w * nr.h * 4) || !alloc((void**)&nr.dVsrOut, (size_t)tw * th * 4))) ||
+        (nr.hdr && (!alloc((void**)&nr.dVsrView, (size_t)3 * nr.w * nr.h * sizeof(float)) ||
+                    !alloc((void**)&nr.dVsrRem, (size_t)3 * tw * th * sizeof(float)))))
+    {
+        why = "an allocation failed";
+        return false;
+    }
+    nr.vsrWant = true;
+    nr.vsrPre = false;
+    nr.fsrUp = want == 2 || want == 5;
+    nr.fuHdr = nr.fsrUp && nr.hdr; // the start's rule (nativeRtxInit) with no resize before the model
+    nr.fuKind = want == 5 ? 1 : 0;
+    if (nr.fsrUp)
+        nr.fsrUpDir = dir;
+    nr.a4kUp = want == 3;
+    nr.acnUp = want == 4;
+    nr.vsrFailed = nr.vsrUserOff = false;
+    bool ok = true;
+    if (want == 1 && g_rtxb.vsrMade)
+        LOG("native: live upscale: RTX VSR runs the feature of this process's create (warmed then)\n");
+    else if (want == 1)
+    {
+        if (g_rtxb.create(nullptr, nullptr, 0, 0u, 1u) != 1u)
+        {
+            why = "rtx_video_api_cuda_create failed";
+            ok = false;
+        }
+        else
+        {
+            g_rtxb.created = g_rtxb.vsrMade = true;
+            g_rtxUsed = true; // resident host: NGX is single-instance per process, end it after this session
+            // the warm-up eval on an opaque black frame, as the session start runs it
+            const RtxRect ri{0, 0, (uint32_t)nr.w, (uint32_t)nr.h};
+            const RtxRect ro{0, 0, (uint32_t)tw, (uint32_t)th};
+            if (cuMemsetD32Async((CUdeviceptr)nr.dVsrIn, 0xFF000000u, (size_t)nr.w * nr.h, (CUstream)nr.stream) !=
+                    CUDA_SUCCESS ||
+                cudaStreamSynchronize(nr.stream) != cudaSuccess ||
+                g_rtxb.evalVsr(nr.dVsrIn, nr.dVsrOut, ri, ro, &nr.vsrSet) != 1u ||
+                cudaDeviceSynchronize() != cudaSuccess)
+            {
+                why = "the RTX VSR warm-up eval failed";
+                ok = false;
+            }
+        }
+    }
+    else if (nr.fsrUp)
+        ok = nativeFsrupSetup(nr, nr.w, nr.h, tw, th);
+    else
+        ok = (nr.a4kUp ? nativeA4kSetup(nr, nr.w, nr.h, tw, th, 0) : nativeAcnSetup(nr, nr.w, nr.h, tw, th, 0)) &&
+             !nr.vsrFailed;
+    if (!ok)
+    {
+        // Lanczos stays: the flags off (the kind's buffers go with the session's teardown)
+        nr.vsrWant = nr.fsrUp = nr.a4kUp = nr.acnUp = nr.vsrFailed = false;
+        if (!nr.fuMade) // a bridge built before the failure is destroyed at the teardown by its kind
+            nr.fuKind = 0;
+        if (why.empty())
+            why = "its setup failed (the line above)";
+        return false;
+    }
+    if (nr.fsrUp)
+    {
+        // the first frames on a worker (nativeFsrupWarmProc); the session presents without the upscaler meanwhile,
+        // nativeUpWarmEnd turns it on
+        nr.vsrWant = nr.fsrUp = false;
+        nr.fuWarmWant = true;
+        nr.fuWarmT0 = GetTickCount64();
+        InterlockedExchange(&nr.fuWarm, 1);
+        nr.fuWarmTh = CreateThread(nullptr, 0, nativeFsrupWarmProc, &nr, 0, nullptr);
+        if (!nr.fuWarmTh)
+        {
+            InterlockedExchange(&nr.fuWarm, 0);
+            why = "its warm-up thread did not start";
+            return false;
+        }
+        LOG("native: live upscale: %s %dx%d -> %dx%d, its first frames on a worker (the driver may compile its "
+            "shaders), the picture goes on without it\n",
+            name, nr.w, nr.h, tw, th);
+        return true;
+    }
+    nr.vsr = true;
+    LOG("native: live upscale: %s %dx%d -> %dx%d, started in place\n", name, nr.w, nr.h, tw, th);
+    return true;
+}
+
 static void nativeLiveSets(NativeRife& nr)
 {
     std::vector<std::pair<std::string, std::string>> q;
+    if (nr.fuWarmTh && InterlockedCompareExchange(&nr.fuWarm, 0, 0) >= 2)
+        nativeUpWarmEnd(nr); // an FSR / XeSS start in place: its first frames ended on the worker
     {
         std::lock_guard<std::mutex> lk(g_liveSets.m);
         if (g_liveSets.q.empty())
@@ -31495,6 +31818,21 @@ static void nativeLiveSets(NativeRife& nr)
             bool& failed = key == "up" ? nr.vsrFailed : key == "restore" ? nr.restFailed : nr.rtxFailed;
             bool& userOff = key == "up" ? nr.vsrUserOff : key == "restore" ? nr.restUserOff : nr.rtxUserOff;
             const int want = (int)clampU(v, 0.0, 9.0);
+            if (key == "up" && nr.fuWarmTh)
+            {
+                // an FSR / XeSS start in place still warming: the tick's last state decides at its end
+                const int pend = nr.fuKind ? 5 : 2;
+                if (want == 0 || want == pend)
+                {
+                    nr.fuWarmWant = want != 0;
+                    LOG("live set: up %s (%s)\n", val.c_str(),
+                        want ? "its start in place is under way" : "off once its start in place ends");
+                }
+                else
+                    LOG("live set: up %s (the next session takes it: another kind is starting in place)\n",
+                        val.c_str());
+                continue;
+            }
             const char* why = nullptr;
             if (want == 0 && kind)
             {
@@ -31510,14 +31848,33 @@ static void nativeLiveSets(NativeRife& nr)
             }
             else if (want != kind)
                 why = kind ? "another kind than this session runs" : "this session started without it";
+            // an upscaler the session started without, or another kind than it runs: its setup in place when this
+            // session can run it (the running kind released first, nativeUpRelease)
+            std::string whyUp;
+            const bool other = key == "up" && want && want != kind;
+            if (why && other && nativeUpSwitch(nr, want, whyUp))
+                why = nullptr;
+            else if (why && other)
+            {
+                whyUp = std::string(why) + ": " + whyUp;
+                why = whyUp.c_str();
+            }
             if (why)
             {
                 LOG("live set: %s %s (the next session takes it: %s)\n", key.c_str(), val.c_str(), why);
                 continue;
             }
         }
-        else if (key == "vsrq" && nr.vsr && !nr.fsrUp && !nr.a4kUp && !nr.acnUp)
+        else if (key == "vsrq" && !nr.fsrUp && !nr.a4kUp && !nr.acnUp)
+        {
+            // RTX VSR's level: read at every evaluate while it runs; held for its start in place (nativeUpSwitch)
             nr.vsrSet.QualityLevel = clampU(v, 1.0, 4.0);
+            if (!nr.vsr)
+            {
+                LOG("live set: vsrq %s (held for RTX VSR's start)\n", val.c_str());
+                continue;
+            }
+        }
         else if (key == "hdrsat" && nr.rtxHdr)
             nr.thdr.Saturation = clampU(v, 0.0, 200.0);
         else if (key == "hdrcon" && nr.rtxHdr)

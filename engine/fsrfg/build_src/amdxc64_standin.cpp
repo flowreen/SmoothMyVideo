@@ -4,7 +4,7 @@
 // wave matrix types, here FP8 x FP8 -> FP32 at 16 x 16 x 16) and IAmdExtD3DShaderIntrinsics (every intrinsic reported
 // supported: the ML shaders' WMMA FP8 operations, which the bridge's vkd3d-proton translates to Vulkan cooperative
 // matrices). Interface ids and vtable order as OptiScaler documents them (Amdxc64_Hooks.h); no OptiScaler or AMD code.
-// SMV_FSRFG_SHIM_LOG=1 logs every call to stderr.
+// SMV_FSRFG_STANDIN_LOG=1 logs every call to stderr.
 #include <windows.h>
 #include <unknwn.h>
 #include <cstdint>
@@ -33,7 +33,7 @@ static bool logOn()
     if (on < 0)
     {
         char b[4] = {};
-        on = GetEnvironmentVariableA("SMV_FSRFG_SHIM_LOG", b, sizeof(b)) == 1 && b[0] == '1';
+        on = GetEnvironmentVariableA("SMV_FSRFG_STANDIN_LOG", b, sizeof(b)) == 1 && b[0] == '1';
     }
     return on == 1;
 }
@@ -41,7 +41,7 @@ static bool logOn()
 static void logGuid(const char* what, REFIID g)
 {
     if (logOn())
-        fprintf(stderr, "[amdxc64 shim] %s {%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}\n", what, g.Data1,
+        fprintf(stderr, "[amdxc64 stand-in] %s {%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}\n", what, g.Data1,
                 g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6],
                 g.Data4[7]);
 }
@@ -49,10 +49,10 @@ static void logGuid(const char* what, REFIID g)
 static void logLine(const char* s)
 {
     if (logOn())
-        fprintf(stderr, "[amdxc64 shim] %s\n", s);
+        fprintf(stderr, "[amdxc64 stand-in] %s\n", s);
 }
 
-#define SHIM_STUB(n)                                                                                                   \
+#define STANDIN_STUB(n)                                                                                                \
     virtual HRESULT STDMETHODCALLTYPE unknown##n()                                                                     \
     {                                                                                                                  \
         logLine("IAmdExtD3DDevice8 slot " #n " + 2 called");                                                           \
@@ -76,19 +76,19 @@ struct Device8 : IUnknown
     {
         return 1;
     }
-    SHIM_STUB(1)
-    SHIM_STUB(2)
-    SHIM_STUB(3)
-    SHIM_STUB(4)
-    SHIM_STUB(5)
-    SHIM_STUB(6)
-    SHIM_STUB(7)
-    SHIM_STUB(8)
-    SHIM_STUB(9)
-    SHIM_STUB(10)
-    SHIM_STUB(11)
-    SHIM_STUB(12)
-    SHIM_STUB(13)
+    STANDIN_STUB(1)
+    STANDIN_STUB(2)
+    STANDIN_STUB(3)
+    STANDIN_STUB(4)
+    STANDIN_STUB(5)
+    STANDIN_STUB(6)
+    STANDIN_STUB(7)
+    STANDIN_STUB(8)
+    STANDIN_STUB(9)
+    STANDIN_STUB(10)
+    STANDIN_STUB(11)
+    STANDIN_STUB(12)
+    STANDIN_STUB(13)
     virtual HRESULT STDMETHODCALLTYPE GetWaveMatrixProperties(uint64_t* count, WaveMatrixProperties* p)
     {
         logLine("GetWaveMatrixProperties: one entry, FP8 x FP8 -> FP32");
@@ -130,7 +130,7 @@ struct Intrinsics : IUnknown
     virtual HRESULT STDMETHODCALLTYPE CheckSupport(int32_t intrinsic)
     {
         if (logOn())
-            fprintf(stderr, "[amdxc64 shim] ShaderIntrinsics::CheckSupport(%d) -> supported\n", intrinsic);
+            fprintf(stderr, "[amdxc64 stand-in] ShaderIntrinsics::CheckSupport(%d) -> supported\n", intrinsic);
         return S_OK;
     }
     virtual HRESULT STDMETHODCALLTYPE Enable()
@@ -163,13 +163,13 @@ struct Factory : IUnknown
     {
         if (riid == kIidDevice8)
         {
-            logLine("CreateInterface IAmdExtD3DDevice8 -> shim");
+            logLine("CreateInterface IAmdExtD3DDevice8 -> stand-in");
             *ppv = &g_device8;
             return S_OK;
         }
         if (riid == kIidIntrinsics)
         {
-            logLine("CreateInterface IAmdExtD3DShaderIntrinsics -> shim");
+            logLine("CreateInterface IAmdExtD3DShaderIntrinsics -> stand-in");
             *ppv = &g_intrinsics;
             return S_OK;
         }
@@ -185,7 +185,7 @@ extern "C" __declspec(dllexport) HRESULT __cdecl AmdExtD3DCreateInterface(IUnkno
 {
     if (riid == kIidFactory)
     {
-        logLine("AmdExtD3DCreateInterface IAmdExtD3DFactory -> shim");
+        logLine("AmdExtD3DCreateInterface IAmdExtD3DFactory -> stand-in");
         *ppv = &g_factory;
         return S_OK;
     }
