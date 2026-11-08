@@ -123,12 +123,19 @@
        states, the Go buttons, the preview labels) carry no key: app.ts sets them through t(). -->
   <div class="row" style="justify-content:space-between;margin:0">
     <h1>Smooth My Video</h1>
-    <select id="langsel" data-i18n-title="lang.tip" data-i18n-aria="lang.tip"></select>
+    <div class="row" style="margin:0">
+      <!-- the Update button, Chrome's pattern: shown once a newer version is downloaded and unpacked (main's
+           autoUpdate, app.ts); its click restarts into it, otherwise the next launch applies it -->
+      <button id="updbtn" style="display:none;background:var(--green);color:#0d0d0d;font-weight:700" data-i18n-title="update.btn.tip"></button>
+      <select id="langsel" data-i18n-title="lang.tip" data-i18n-aria="lang.tip"></select>
+    </div>
   </div>
   <div class="sub" data-i18n="app.tagline"></div>
-  <!-- One-line update notice; hidden unless main's launch-time release check finds a newer build. -->
+  <!-- One-line update notice; hidden unless main's launch-time release check finds a newer build. Its text follows the
+       background download (app.ts updLine); the tick turns the automatic update off and on. -->
   <div id="update" class="hint" style="display:none;margin:2px 0 6px">
-    <span data-i18n="update.pre"></span><span id="updatever"></span><span data-i18n="update.mid"></span><a id="updatelink" href="#" style="color:var(--green)" data-i18n="update.link"></a>
+    <span id="updtxt"></span> <a id="updatelink" href="#" style="color:var(--green)" data-i18n="update.link"></a>
+    <label style="margin-inline-start:12px;white-space:nowrap" data-i18n-title="update.auto.tip"><input type="checkbox" id="updauto"> <span data-i18n="update.auto"></span></label>
   </div>
 
   <!-- MODE SWITCH. The app does two unrelated things (render a video file, and smooth a live

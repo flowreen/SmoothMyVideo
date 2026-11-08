@@ -33,6 +33,11 @@ if (!fs.existsSync(unpacked)) {
 fs.rmSync(folder, { recursive: true, force: true });
 fs.renameSync(unpacked, folder);
 
+// The release's own file list (resources\release-files.txt), which the automatic update reads: release-files.ts.
+execFileSync(process.execPath, [path.join(import.meta.dirname, 'release-files.ts'), folder, version], {
+  stdio: 'inherit',
+});
+
 function tree(dir: string): { files: number; bytes: number } {
   let files = 0;
   let bytes = 0;

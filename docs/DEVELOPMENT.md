@@ -20,7 +20,11 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
   (`dist/render/cli.js` under the Electron binary with `ELECTRON_RUN_AS_NODE=1`, `SMV_ENGINE_DIR` =
   the engine folder) and streams its progress, kills the child tree on Cancel, runs the before /
   after preview and the Compare view (`dist/render/preview.js`, the same way), IPC for screen size / refresh rate, the
-  runtime installers (RTX, Smooth Motion, DLSS 5, Dolby Vision, HDR10+ tools) and the update check.
+  runtime installers (RTX, Smooth Motion, DLSS 5, Dolby Vision, HDR10+ tools), the update check and the automatic
+  update (what an update needs checked before any download; the release archive downloaded, resumed when cut,
+  unpacked by `engine\update\7zr.exe` under the app folder's `update\` and checked against its
+  `release-files.txt`; its listed files swapped in once the app has exited by the new version's
+  `engine\update\smv-update.exe` copied to `%TEMP%`: at the Update button, else at the next launch).
   Resolves `engine/bin/ffprobe.exe` (PATH fallback). Compiled by `tsc`; edit the `.ts`,
   never `dist/main.js`.
 * `src/render/`: the render orchestrator, moved from python to TypeScript (the
@@ -1816,6 +1820,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_LIVE_GRID_PACE=0` / `SMV_LIVE_GRID_LOCK=0` | the old present targets (slots spread at (idx + 1) / (n + 1) of the source period after the frame's arrival, a late slot at once) / the grid at every adaptive target, no whole-multiple ladder (A/B only) |
 | `SMV_LIVE_HDR` | force live HDR on or off |
 | `SMV_LIVE_RESIDENT=0` / `SMV_LIVE_RESIDENT_IDLE_S` | one `smv-live.exe` per live session instead of the resident host / the resident host's idle limit in seconds (default 600) |
+| `SMV_AUTO_UPDATE=0` / `SMV_UPDATE_API=URL` / `SMV_UPDATE_TRIES=N` / `SMV_UPDATE_7ZR=PATH` | the update notice without the background download / another latest-release JSON in place of GitHub's (the automatic-update gates' local server) / the swap helper's tries a file, two seconds apart (default 30) / another unpacker in place of `engine\update\7zr.exe` (the gates' failing-probe case) |
 | `SMV_LIVE_TEARDOWN_TRACE=1` | one log line per session teardown stage (reader, present queue, server, capture, host); for a Stop that hangs |
 | `SMV_LIVE_TIMING=1` / `SMV_LIVE_HITCH=1` | live present-loop diagnostics: an `[exe-timing] xq:` line on every 2 s stats tick (the pair interval EMA, tweens a pair, the pair position, degrades) / `[hitch]` lines from the present queue (the gap between presents, the slot, the time since the frame arrived, the pacing delay) |
 | `SMV_EXSTYLE=<hex>` | the live overlay window's extended style replaced by this value; a diagnostic bisect knob, never a product setting |
@@ -1901,6 +1906,41 @@ generation and upscaling bridges (`engine/fsrfg`, `engine/fsrup`) and three D3D1
 `engine/dlssnr`, `engine/live`), each with a `build_src/build.bat` that prints the missing environment variable. Nothing that needs MSVC is bundled; a recipient needs only
 the driver. Toolchain on the dev machine: VS 2019 Build Tools (`cl` 19.29) and VS 2026 Community
 (`cl` 19.51) with a Windows SDK.
+
+### Update helper (`smv-update.exe`)
+
+`engine\update\build_src\build.bat` compiles `smv_update.cpp` (Win32 only, static CRT, `/SUBSYSTEM:WINDOWS`,
+`/W4 /WX /analyze`) into `engine\update\smv-update.exe`, then packs `engine\update\probe.7z` (that exe, packed the
+release archive's way: LZMA2 level 9, solid, BCJ2) with the `7zr.exe` beside it. `7zr.exe` is the LZMA SDK's x64
+build, unmodified and public domain (`7zr-LICENSE.txt`); the app unpacks updates with it, so a Windows whose own
+`tar.exe` cannot read LZMA (Windows 10, Windows 11 before 23H2) updates too, and it unpacks the probe before any
+download to prove it runs on that PC.
+
+Every release carries `resources\release-files.txt` (`scripts\release-files.ts`, run by `pack-zip.ts`: the sha256,
+size and path of each file).
+The app checks an unpacked update's files against the new version's list, then copies the NEW version's
+`smv-update.exe` to `%TEMP%\smv-update-apply.exe` and runs it, detached, as it exits. The helper waits for the app's
+process, gives any process still running an exe from the app folder (the app's own hosts: a resident render host
+busy with a paused render, a Live host) ten seconds and then ends it, and replaces only the files the OLD version's
+list names: each moves into `update\<version>\old\`, the new
+version's listed files move in (`app.asar` and the exe last), and the folders the old files leave empty go. Anything
+else in the app folder (the user's videos and renders, the one-click downloads, the model cache) is never touched. A
+user's file at a path the new version now ships gives way to the shipped one (it waits in `old\`). Every move is
+written to `update\<version>\journal.txt` first; a move that fails after `SMV_UPDATE_TRIES` tries two seconds apart
+(default 30) rolls every earlier move back and writes `update\failed.txt`, and a journal left by a helper that stopped
+part-way is rolled back before the next attempt. The new version removes `update\<version>\` at its start. The helper
+is a GUI-subsystem exe run from outside the app folder: a detached console program gets no console and every console
+tool it runs opens a window. Log: `%TEMP%\smv-update.log`, where the app writes its own update lines too (the
+checks, the download and its resume, the unpack, the removal of the old files), one record of a whole update.
+
+Before any download the app checks, in milliseconds: its own list (none = no automatic update), the folder taking new
+files and letting go of its own (a folder made under `update\`, the list renamed and back: Program Files, Controlled
+Folder Access or a read-only drive stop it), five times the archive's size free, the probe unpacking, and
+`update\failed.json` (a version whose checksum, unpack or file check failed twice is not downloaded again). Anything
+missing = the notice names the reason, the Automatic updates tick greys out, the link stays. A cut download keeps its
+`.part` and asks for the rest at the next launch. The Update button pauses a running render first (main waits up to
+ten seconds for the host's `PAUSED`; the new version resumes the render from its partial output when the same video
+and settings run again) and stops a Live session.
 
 ### RTX Video bridge (`rtxvideo_cuda.dll`)
 
@@ -2430,6 +2470,10 @@ asset counts on the README's downloads badge, so the archive is the only asset.
 4. Create the GitHub release for the tag: notes with the hash, then attach the `.7z` only.
 
 The tag is what installed copies compare against (`checkForUpdate` in `main.ts`), so publishing
-the GitHub release lights up the in-app notice. Never re-upload different code under an existing
-version (the version is baked into the zip, the checksum stops matching, same-version installs
-never see the notice); fix-ups ship as a patch version. Release pages and their assets stay.
+the GitHub release lights up the in-app notice and starts the automatic update: it downloads the
+release's `.7z` asset and checks it against the notes' `sha256(win.7z): <hex>` line, so a release
+needs exactly that asset and that line (without either, installed copies get the notice alone), and
+the archive's `resources\release-files.txt`, which `npm run dist` writes.
+Never re-upload different code under an existing version (the version is baked into the archive,
+the checksum stops matching, same-version installs never see the notice); fix-ups ship as a patch
+version. Release pages and their assets stay.

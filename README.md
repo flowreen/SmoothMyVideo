@@ -276,7 +276,12 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
 * Zoom the interface with Ctrl+= / Ctrl+- / Ctrl+0, or Ctrl + mouse wheel.
 * The source panel shows the resolution, the frame rate (the exact fraction on hover), the duration and the codec,
   plus the track counts when there is more than one audio track or any subtitle.
-* A quiet one-line notice appears when a newer release is out (nothing auto-downloads).
+* A newer release downloads in the background and installs itself at the next start, or when you press the green
+  Update button that appears once it is ready; a quiet one-line notice shows the progress. Untick automatic updates
+  on that line to keep the notice and its link only. The update replaces only the app's own files: videos or anything
+  else you keep in the SmoothMyVideo folder stay. In a folder Windows does not let the app change (Program Files),
+  the notice says so and links the new build instead. Pressing Update during a render pauses it: open the same video
+  with the same settings after the restart and the button offers to resume it. A Live session stops.
 
 ## Under the hood
 
