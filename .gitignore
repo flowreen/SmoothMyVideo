@@ -33,6 +33,7 @@ engine/dlssnr/nvngx.lib
 engine/dlssnr/build_src/*.obj
 engine/dlssnr/build_src/*.lib
 engine/dlssnr/build_src/*.exp
+engine/animejanai/
 engine/restore/
 engine/runtime/
 engine/runtime_*_bak/

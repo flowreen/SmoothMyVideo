@@ -1,4 +1,4 @@
-# engine\runtime\python.exe -m pip install -r requirements.txt
+# engine\runtime\python.exe -m pip install -r scripts\requirements.txt
 # The CUDA 13 wheels the repo needs: their DLLs are staged into engine\gpu_runtime (scripts/stage-gpu-runtime.ts) and
 # their headers / import libs build the native host (build.bat's SMV_CU). NOTE: the CUDA 13 wheels DROPPED the -cuXX
 # suffix - the nvidia-cuda-*-cu13 packages are deprecated placeholders that fail to build, so use the unsuffixed names

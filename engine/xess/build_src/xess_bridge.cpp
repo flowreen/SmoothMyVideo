@@ -94,7 +94,10 @@ struct State
     XessupShared sh = {};
 };
 
-State g_s;
+// one per context: the host chains passes past XeSS-SR's 3x, each pass its own context, queue and shared buffers (the
+// xessup_*_i exports; the plain ones = instance 0)
+constexpr int kInst = 6;
+State g_s[kInst];
 
 bool fail(const char* what, HRESULT hr = S_OK)
 {
@@ -272,13 +275,12 @@ XESSUP_API const char* xessup_last_error()
 // the XeSS-SR context w x h -> ow x oh on the adapter with this LUID (`want` is unused: the FSR bridge's version pick);
 // hdr = the HDR mode (FP16 linear-light frames in and out), else RGBA8 sRGB. Fills *sh (the handles stay owned by the
 // bridge until xessup_destroy). 0 = ok, < 0 = xessup_last_error.
-XESSUP_API int xessup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t luidLow, int32_t luidHigh,
-                             const char* want, int hdr, XessupShared* sh)
+static int createAt(State& s, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t luidLow, int32_t luidHigh,
+                    const char* want, int hdr, XessupShared* sh)
 {
     (void)want;
     if (!sh || !w || !h || !ow || !oh)
         return fail("bad arguments"), -1;
-    State& s = g_s;
     if (s.live)
         destroy(s);
     s.hdr = hdr != 0;
@@ -426,13 +428,27 @@ XESSUP_API int xessup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, u
     return 0;
 }
 
+XESSUP_API int xessup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t luidLow, int32_t luidHigh,
+                             const char* want, int hdr, XessupShared* sh)
+{
+    return createAt(g_s[0], w, h, ow, oh, luidLow, luidHigh, want, hdr, sh);
+}
+
+// xessup_create on instance i (0 .. kInst - 1)
+XESSUP_API int xessup_create_i(int i, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t luidLow,
+                               int32_t luidHigh, const char* want, int hdr, XessupShared* sh)
+{
+    if (i < 0 || i >= kInst)
+        return fail("bad instance"), -1;
+    return createAt(g_s[i], w, h, ow, oh, luidLow, luidHigh, want, hdr, sh);
+}
+
 // the queue waits for `waitValue` (the caller wrote the frame into sh.in and its vectors into sh.mv), upscales it into
 // sh.out and signals `signalValue`. reset = the first frame of a stream (XeSS's history reset). Non-blocking but for
 // the command-list ring. 0 = ok.
-XESSUP_API int xessup_frame(uint64_t waitValue, uint64_t signalValue, int reset, double frameTimeMs)
+static int frameAt(State& s, uint64_t waitValue, uint64_t signalValue, int reset, double frameTimeMs)
 {
     (void)frameTimeMs;
-    State& s = g_s;
     if (!s.live)
         return fail("context not created"), -1;
     if (FAILED(s.q->Wait(s.fence, waitValue)))
@@ -485,7 +501,27 @@ XESSUP_API int xessup_frame(uint64_t waitValue, uint64_t signalValue, int reset,
     return 0;
 }
 
+XESSUP_API int xessup_frame(uint64_t waitValue, uint64_t signalValue, int reset, double frameTimeMs)
+{
+    return frameAt(g_s[0], waitValue, signalValue, reset, frameTimeMs);
+}
+
+// xessup_frame on instance i
+XESSUP_API int xessup_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int reset, double frameTimeMs)
+{
+    if (i < 0 || i >= kInst)
+        return fail("bad instance"), -1;
+    return frameAt(g_s[i], waitValue, signalValue, reset, frameTimeMs);
+}
+
 XESSUP_API void xessup_destroy()
 {
-    destroy(g_s);
+    destroy(g_s[0]);
+}
+
+// xessup_destroy on instance i
+XESSUP_API void xessup_destroy_i(int i)
+{
+    if (i >= 0 && i < kInst)
+        destroy(g_s[i]);
 }

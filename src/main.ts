@@ -659,11 +659,46 @@ ipcMain.handle('dlssnr-open-download', () => {
 });
 
 // "AnimeJaNai HD", Restore's second model: the author's 2x ONNX (CC BY-NC-SA 4.0, so never bundled: package.json's
-// filter drops engine/restore). One click downloads the pinned release archive, checks its SHA256, extracts the one
-// model with Windows' bsdtar and checks the model's SHA256 before the copy; the UI says when the installed file is not
-// the verified one. The host gets it as --restore-model.
-const AJ_DIR = path.join(ENGINE, 'restore');
+// filter drops engine/animejanai). One click downloads the pinned release archive, checks its SHA256, extracts the
+// one model with Windows' bsdtar, checks the model's SHA256 and has the host convert it into the .pkl the app keeps
+// like every other model's weights (--convert-restore-model: the same weights for the kernels, the frames identical);
+// the UI says when the installed .pkl is not the verified one. The host gets it as --restore-model.
 const AJ_FILE = '2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx';
+const AJ_PKL = AJ_FILE.replace(/\.onnx$/, '.pkl');
+// the host's conversion of the author's ONNX into the .pkl (written only when it reads back as the ONNX's weights)
+function ajConvert(onnx: string, pkl: string): boolean {
+  try {
+    execFileSync(path.join(ENGINE, 'live', 'smv-live.exe'), ['--convert-restore-model', onnx, pkl], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    return fileExists(pkl);
+  } catch {
+    return false;
+  }
+}
+// engine/animejanai, the model's own folder like engine/artcnn. An install that holds the author's ONNX (in
+// engine/restore, the folder's earlier name, or here) gets it moved here and converted once, at start, so an update
+// keeps the download; a read-only or locked install keeps the old file and the setup row offers the download.
+function ajDir(): string {
+  const dir = path.join(ENGINE, 'animejanai');
+  const oldDir = path.join(ENGINE, 'restore');
+  const old = path.join(oldDir, AJ_FILE);
+  const onnx = path.join(dir, AJ_FILE);
+  const pkl = path.join(dir, AJ_PKL);
+  try {
+    if (fs.existsSync(old) && !fs.existsSync(onnx)) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.renameSync(old, onnx);
+    }
+    if (fs.existsSync(oldDir) && fs.readdirSync(oldDir).length === 0) fs.rmdirSync(oldDir);
+    if (fs.existsSync(onnx) && (fs.existsSync(pkl) || ajConvert(onnx, pkl))) fs.rmSync(onnx);
+  } catch {
+    /* left as it is */
+  }
+  return dir;
+}
+const AJ_DIR = ajDir();
 const AJ_DL = {
   url: 'https://github.com/the-database/mpv-upscale-2x_animejanai/releases/download/3.9.0/mpv-upscale-2x_animejanai-overlay-3.9.0.7z',
   page: 'https://github.com/the-database/mpv-upscale-2x_animejanai/releases/tag/3.9.0',
@@ -671,9 +706,11 @@ const AJ_DL = {
   member: 'animejanai/onnx/' + AJ_FILE,
   archiveSha256: '8933e1003dc9bdf5bc9cd4bb8da91051c28e03129841846b17bb65f1c0446ab0',
   onnxSha256: 'b308e93c3dda3c4f9f968295b2b7b8d1c0583a711bca53a08d51134d9d1cbd5c',
+  // the host's conversion of that ONNX (the same bytes every time)
+  pklSha256: 'e48fd48fbafb752fad9db5c599bcdcc600a82a82de24ed496f13c96bdd843363',
   archiveBytes: 42945210,
 };
-const ajPath = () => path.join(AJ_DIR, AJ_FILE);
+const ajPath = () => path.join(AJ_DIR, AJ_PKL);
 /** The host's Restore model arguments for a model id: 'animejanai' = --restore-model with the installed file;
  * 'anime4k' = --restore-anime4k (Anime4K's Restore CNN UL, inside the host); none = Real-ESRGAN. */
 function restoreModelArgs(id?: string): string[] {
@@ -689,8 +726,8 @@ ipcMain.handle('aj-ready', () => {
   } catch {
     /* the hash is informational */
   }
-  const known = sha256 ? sha256 === AJ_DL.onnxSha256 : undefined;
-  return { ready, known, sha256, file: AJ_FILE, mb: Math.round(AJ_DL.archiveBytes / 1048576) };
+  const known = sha256 ? sha256 === AJ_DL.pklSha256 : undefined;
+  return { ready, known, sha256, file: AJ_PKL, mb: Math.round(AJ_DL.archiveBytes / 1048576) };
 });
 
 ipcMain.handle('aj-download', async () => {
@@ -729,8 +766,9 @@ ipcMain.handle('aj-download', async () => {
     if (mh !== AJ_DL.onnxSha256)
       return { ok: false, error: `model checksum mismatch (${mh.slice(0, 12)}...), nothing installed` };
     fs.mkdirSync(AJ_DIR, { recursive: true });
-    fs.copyFileSync(found, ajPath());
-    return { ok: true, sha256: mh, known: true };
+    if (!ajConvert(found, ajPath())) return { ok: false, error: 'the model did not convert, nothing installed' };
+    const ph = sha256File(ajPath());
+    return { ok: true, sha256: ph, known: ph === AJ_DL.pklSha256 };
   } catch (e) {
     return { ok: false, error: String(e) };
   } finally {

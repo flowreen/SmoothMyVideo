@@ -90,7 +90,7 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
   existing cache the old entries merge, its own entries win) and removes what an earlier version's
   TensorRT engines left in it (`*.engine`, `*.jit`, `*.warm`, `engine_stamp.txt`). Every net runs on
   the host's own kernels and reads its weights itself (no ONNX, no engine build); the dist ships those
-  weights (`realesr-animevideov3.pth`, `GMFSS_Fortuna/train_log/feat.pkl`, `metric.pkl`, `rife.pkl`,
+  weights (`realesrgan/realesr-animevideov3.pkl`, `GMFSS_Fortuna/train_log/feat.pkl`, `metric.pkl`, `rife.pkl`,
   `fusionnet.pkl` and `flownet.pkl`, `rife/flownet.pkl`). RIFE's IFNet: the five IFBlocks and the warps
   between them run on the host's kernels (`nativeIfnRun`, 59 launches
   of its own module `smv_ifnet_*.cubin`, the weights read from `engine/rife/flownet.pkl` with the same torch zip
@@ -191,8 +191,8 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
 * `engine/rtxvideo/`: RTX Video (VSR + TrueHDR) over the locally built `rtxvideo_cuda.dll`, called
   by the host. The NGX feature DLLs are user-installed through the in-app RTX setup box; the
   folder is gitignored and excluded from the zip.
-* `engine/realesr-animevideov3.pth`: the `--restore` Real-ESRGAN model's weights (SRVGGNetCompact, BSD-3), which
-  ship: the host reads them and runs the net on its own kernels.
+* `engine/realesrgan/`: the `--restore` Real-ESRGAN model's weights `realesr-animevideov3.pkl` (SRVGGNetCompact,
+  BSD-3) and their `LICENSE.txt`, which ship: the host reads the weights and runs the net on its own kernels.
 * `engine/live/`: the native host (Live mode, see below, and every offline render). The python live
   server and the python render engine (`render*.py`, `preview.py`,
   `hdr10_meta.py`, `rcas.py`, `rtxvideo.py`, `dlssg.py`, `dlssnr.py`, `nvoffruc.py`) were deleted;
@@ -229,7 +229,7 @@ it. All must exist before `npm run dist`.
      [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases)
      CPython 3.14 `install_only` win64 build to `engine/runtime`, then
      ```
-     engine\runtime\python.exe -m pip install -r engine\requirements.txt
+     engine\runtime\python.exe -m pip install -r scripts\requirements.txt
      ```
      `requirements.txt` pulls the unsuffixed `nvidia-cuda-nvrtc` / `nvidia-cuda-runtime` cu13 wheels (the `-cu13`
      names are dead placeholders). Never use a `venv`: a Windows venv is not relocatable.
@@ -238,7 +238,7 @@ it. All must exist before `npm run dist`.
 
 Refreshing bundled binaries: for ffmpeg delete `engine/bin` and re-run the fetch script, or drop a
 matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across builds). Weights
-(GMFSS `train_log` pkls, `realesr-animevideov3.pth`) are committed; replace the files to update.
+(GMFSS `train_log` pkls, `realesrgan/realesr-animevideov3.pkl`) are committed; replace the files to update.
 
 ## Scripts
 
@@ -271,7 +271,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 
 ```
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
-  [--sharpen S] [--restore | --restore-model ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
+  [--sharpen S] [--restore | --restore-model PKL|ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--xess-fg] [--dlssg] [--no-gpu-fit]
   [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
@@ -509,11 +509,11 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
 * `--restore`: Real-ESRGAN anime-video model once per source frame, first (a generative repaint;
   cleans compression noise, can flatten fine texture), folded straight to the working size, or
   back to the source size when RTX VSR runs the resize after it. The bundled model runs on the host's own CUDA
-  kernels: the host reads `engine/realesr-animevideov3.pth` itself (torch's stored zip and its pickle), runs the 16
+  kernels: the host reads `engine/realesrgan/realesr-animevideov3.pkl` itself (torch's stored zip and its pickle), runs the 16
   middle 3 x 3 convs as tensor-core implicit GEMMs with fp16 accumulators (`k_restConvMid`, between `k_restConv0` and
   `k_restConvLast`, the last one at fp32 accumulate) and folds the 48 sub-pixel planes as below, every output within
-  one 8-bit code of fp32 sums. A missing or wrong .pth = no Restore (`Restore unavailable (...)`; a render drops the
-  pass). A `--restore-model` ONNX in AnimeJaNai's SPAN-F3 form (64 features, any block
+  one 8-bit code of fp32 sums. A missing or wrong .pkl = no Restore (`Restore unavailable (...)`; a render drops the
+  pass). A `--restore-model` in AnimeJaNai's SPAN-F3 form (64 features, any block
   count up to 16: reflect pad, PixelUnshuffle(2), conv 12 -> 64, blocks of three 3 x 3 convs with a tanh attention, a
   1 x 1 concat conv, conv 64 -> 48, DepthToSpace 4) runs on the host's kernels as well: the host reads the ONNX file
   itself (its protobuf: the nodes and the fp16 initializers), checks that form node by node along the data path and
@@ -522,7 +522,12 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   (the pad and the unshuffle folded into its loads), then folds the 48 sub-pixel planes at the half grid without a base
   add, 74.8 dB from the model in fp32. Any other graph (a 48-feature Performance file, another architecture, a file
   that is no ONNX) = no Restore the same way, with a line saying why (`Restore unavailable (...; a --restore-model runs
-  only in AnimeJaNai HD's SPAN-F3 form, the Balanced model's)`). `--restore-anime4k` = Anime4K's Restore CNN UL on
+  only in AnimeJaNai HD's SPAN-F3 form, the Balanced model's)`). The app keeps the model as a .pkl like every other
+  model's weights: `smv-live.exe --convert-restore-model IN.onnx OUT.pkl` checks the ONNX's form and writes its weights
+  (fp16, as the author's file holds them) as conv_1, block_K.c1 .. c3 / .att, conv_cat and upsampler, then reads the
+  file back and keeps it only when it gives the kernels the ONNX's block byte for byte (the frames identical); a
+  `--restore-model` .pkl is read by name and shape. `src/main.ts` converts right after the download and once at start
+  for an install that still holds the ONNX (moved from `engine/restore` first), and keeps only the .pkl. `--restore-anime4k` = Anime4K's Restore CNN UL on
   the Anime4K module's kernels (see `--anime4k` below). On HDR planes (all routes) it
   reads the frame's SDR view (`k_hdrEnc`, a brighter pixel scaled to white with its hue) and
   `k_hdrRestOut` adds back the light the view never held (the source fitted to the target when
@@ -582,7 +587,8 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   into shared memory for the taps that read it). An exact 2x target skips the Lanczos pair (the identity there):
   `k_a4kFold2x` writes the clamped 2x values in one pass. A target above 2x runs the net again on the exact 2x frame
   (`k_a4kFold2x` into a planar buffer, the next pass's input): the fewest x2 passes whose 2^n reaches the ratio, at
-  most four, the buffers sized for the largest pass (too little video memory = one pass fewer, Lanczos covers the
+  most seven (Live's 64 px floor on an 8K panel = 67.5x), so the net makes every enlarged pixel and the fit only
+  shrinks the overshoot, the buffers sized for the largest pass (too little video memory = one pass fewer, Lanczos covers the
   rest), then the one Lanczos fit at the end; the setup line names the passes (`in 2 x2 passes`). Every Anime4K chain
   ends with the shader set's Clamp_Highlights (`kA4kClampSrc`: before the first pass the 5 x 5 maximum of the
   source's luma, two separable passes stored fp16 like its STATSMAX texture; after the last one every output pixel
@@ -616,7 +622,7 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   fp32 sums) with the DepthToSpace in its store and the clip. A pass takes the frame's BT.709 full-range luma (the
   author's Inferencer matrix) through the net to 2w x 2h; the colour = the frame's Lanczos 2x in the author's YCbCr
   with the net's luma, back to RGB the author's way (`k_acnMerge`). Passes as Anime4K's (the fewest x2 passes whose 2^n
-  reaches the ratio, at most four), then the one Lanczos fit unless the target is exactly 2^n. Video memory: whole
+  reaches the ratio, at most seven), then the one Lanczos fit unless the target is exactly 2^n. Video memory: whole
   frames when the room holds the three activation buffers, else the largest square tile that fits (each tile read
   with a 7-pixel halo, the net's conv count, so the tiles' cores are the whole frame's bits; the setup line names
   `N-px tiles`); no room for one tile = one pass fewer, then Lanczos with `ArtCNN ran out of video memory`. HDR frames
@@ -629,6 +635,14 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   upscaler on the command line wins over it, with a line. The preset = the one whose input range holds the render
   size with its optimal ratio nearest to the call's (Balanced at 2x). Without `libxess.dll` (the app's XeSS setup not
   run): `Intel XeSS upscaling unavailable (...)` and Lanczos. `SMV_XESS_DIR` points the host at another folder.
+  Past 3x a side (AMD's named presets end at 3.0x and FSR 4 leaves one dot an input pixel past about 9x; XeSS-SR
+  refuses past 3.0x) both run the fewest equal passes of at most 3x, the last landing on the target and the sizes
+  between even (the upscaler leaves an odd last column / row untouched), so the upscaler makes every enlarged pixel:
+  each pass its own bridge instance (`fsrup_create_i` / `frame_i` / `destroy_i`, the XeSS bridge's `xessup_*_i`; the
+  plain exports = instance 0), its vectors pass 0's scaled to its size (`k_fuMvScale`, exact zeros kept); the setup
+  line names them (`in 3 passes (244x136, 682x384 between)`). `SMV_FU_CHAIN=0` = one call at any ratio (A/B). An
+  older single-instance bridge past 3x refuses with its reason, which Live's `the early engine handoff failed: ...`
+  line names.
 * `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame at the working size, after Restore and
   the resize, before the interpolation, DLAA (scaling
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
@@ -888,6 +902,8 @@ smv-live.exe --hz              the exact refresh rate of every active display pa
                (QueryDisplayConfig; main.ts feeds "Screen refresh rate" with it, Electron only reports integers)
 smv-live.exe --peak-nits [X Y] the peak (nits) of the monitor at screen point X, Y (the primary one without a point) as
                Windows reports it, 0 when it is not in HDR mode; main.ts passes it to RTX HDR renders as --hdr-nits
+smv-live.exe --convert-restore-model IN.onnx OUT.pkl   AnimeJaNai's ONNX as the .pkl the app keeps (exit 0 = written
+               and read back as the ONNX's weights, 2 = refused with a `convert: refused: ...` line)
 smv-live.exe --restore-mouse   gives back the pointer speed and clip a killed or crashed Fill session held (main.ts
                runs it when %TMP%\smv-live-mouse.txt outlives the host; every live session start does the same)
 smv-live.exe --testsrc [ms|cycle] [--pan] [--onscreen]   verification source (100 ms = 10 fps; 16 for perf; cycle ramps
@@ -1825,6 +1841,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_OF_LEVEL=fast\|medium` | Every NVIDIA Optical Flow session (the NVIDIA Optical Flow model, DLSS 5's motion vectors, AMD FSR's vectors for frame generation and upscaling) at that perf level instead of slow, the engine's highest quality level (frame generation at fast = the repro of its tweens turning to garbage after ~320 calls at 1080p; the FSR 4 gate's like-for-like pan against AMD's path, whose vectors are fast grid 1); A/B lever, never a product setting |
 | `SMV_FSRFG_PROF=1` / `SMV_FSRUP_PROF=1` | AMD FSR frame generation / upscaling: CUDA events between a call's stages (the copies, the Optical Flow inputs, the Optical Flow, the vector kernels, the derived vectors, FSR itself, the unpack), `[fsrfg-prof]` / `[fsrup-prof]` ms a call at the session's end; every call then waits for its last event (profiling only, slower) |
 | `SMV_FSRUP_TEST=hang1` / `=hang2` | AMD FSR upscaling's first / second frame blocks past the Live stall watchdog: its trigger test. The watchdog holds up to 180 s during a session's first dispatch, where the driver compiles FSR's shaders (per exe location and upscale ratio), and its 10 s start over when that call returns |
+| `SMV_FU_CHAIN=0` | AMD FSR 4 / Intel XeSS-SR upscaling in one call at any ratio instead of the equal passes of at most 3x past 3x (XeSS-SR then refuses past 3x, FSR 4 breaks past about 9x). A/B lever, never a product setting |
 | `SMV_FSRUP_TEST=gateN` / `=zerovec` | AMD FSR upscaling's motion vectors: `gateN` = vectors shorter than N / 1000 px written as zero instead of the product's 0.125 px (`gate0` = no gate, the trigger test of the still-detail gate); `zerovec` = zero vectors on every frame. A/B levers, never a product setting |
 | `SMV_FSRFG_CHILDMV=0` | AMD FSR frame generation: level-2+ calls (x4 and up) run an optical flow pass each instead of taking vectors derived from their pair's level-1 field (the default; the session line says `level-2+ calls a pass a call` instead of `level-2+ calls derived from level 1`); A/B lever, never a product setting |
 | `SMV_FSRFG_DEVICE=own` / `=failown` | AMD FSR frame generation's bridge: every instance on its own vkd3d device instead of vkd3d's one (`fsrfg_devices()` = 1; the late price adds 300 MiB an instance past the first) / instance 0 on its own, the later ones on the shared device (the factory's failure path); the derived level-2+ vectors run on either; A/B levers, never a product setting |

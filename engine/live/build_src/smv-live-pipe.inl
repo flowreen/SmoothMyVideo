@@ -64,6 +64,7 @@ struct PipeServer
         nr = new NativeRife();
         NativeRife* early = nr;
         IDXGIAdapter1* adapter = h12->adapter.Get(); // owned by the Host, which outlives the server
+        g_earlyWhy[0] = 0;
         earlyTh = std::thread([this, early, script, backend, capW, capH, adapter, capTex, capFence] {
             const int64_t t0 = nowQpc100();
             // the cudart import library is a lazy loader stub that opens the DLL by name on the
@@ -185,7 +186,7 @@ struct PipeServer
         if (early && earlyRc.load() != 1)
         {
             dropEarly();
-            LOG("native host: the early engine handoff failed\n");
+            LOG("native host: the early engine handoff failed%s%s\n", g_earlyWhy[0] ? ": " : "", g_earlyWhy);
             return 1;
         }
         shmInBytes = ((size_t)capW * capH * 4 + 511) & ~(size_t)511;

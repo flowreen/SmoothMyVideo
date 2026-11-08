@@ -23,7 +23,9 @@ third-party work.
   `engine/rife/DRBA-LICENSE.txt`. Upstream components: Practical-RIFE (MIT, hzwer et al.),
   softmax splatting (Simon Niklaus).
 * **Real-ESRGAN** `realesr-animevideov3` architecture and weights (the `--restore` pass),
-  vendored in `engine/realesr.py` / `engine/realesr-animevideov3.pth`. BSD 3-Clause License,
+  the weights in `engine/realesrgan/realesr-animevideov3.pkl` (the author's .pth file, renamed; run on the host's
+  own kernels; the licence beside
+  them as `LICENSE.txt`). BSD 3-Clause License,
   Copyright (c) 2021 Xintao Wang.
 * **Anime4K** (the Anime4K upscaler and the Anime4K Restore): the weights of bloc97's Upscale CNN x2 UL and Restore
   CNN UL shaders and the Clamp_Highlights algorithm from release v4.0.1 (github.com/bloc97/Anime4K), carried in the

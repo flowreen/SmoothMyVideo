@@ -89,7 +89,10 @@ struct State
     FsrupShared sh = {};
 };
 
-State g_s;
+// one per context: the host chains passes past the upscaler's 3x, each pass its own context, queue and shared buffers
+// (the fsrup_*_i exports; the plain ones = instance 0)
+constexpr int kInst = 6;
+State g_s[kInst];
 
 bool fail(const char* what, HRESULT hr = S_OK)
 {
@@ -302,12 +305,11 @@ FSRUP_API const char* fsrup_last_error()
 // the upscaler context w x h -> ow x oh on the adapter with this LUID, the first upscaler version whose name starts with
 // `want` (e.g. "4."); hdr = the HDR mode (FP16 linear-light frames in and out, FSR's high dynamic range flag), else
 // RGBA8 sRGB. Fills *sh (the handles stay owned by the bridge until fsrup_destroy). 0 = ok, < 0 = fsrup_last_error.
-FSRUP_API int fsrup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t luidLow, int32_t luidHigh,
-                           const char* want, int hdr, FsrupShared* sh)
+static int createAt(State& s, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t luidLow, int32_t luidHigh,
+                    const char* want, int hdr, FsrupShared* sh)
 {
     if (!sh || !w || !h || !ow || !oh || !want)
         return fail("bad arguments"), -1;
-    State& s = g_s;
     if (s.live)
         destroy(s);
     if (!loadLoader(s))
@@ -473,12 +475,26 @@ FSRUP_API int fsrup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uin
     return 0;
 }
 
+FSRUP_API int fsrup_create(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t luidLow, int32_t luidHigh,
+                           const char* want, int hdr, FsrupShared* sh)
+{
+    return createAt(g_s[0], w, h, ow, oh, luidLow, luidHigh, want, hdr, sh);
+}
+
+// fsrup_create on instance i (0 .. kInst - 1)
+FSRUP_API int fsrup_create_i(int i, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, uint32_t luidLow,
+                             int32_t luidHigh, const char* want, int hdr, FsrupShared* sh)
+{
+    if (i < 0 || i >= kInst)
+        return fail("bad instance"), -1;
+    return createAt(g_s[i], w, h, ow, oh, luidLow, luidHigh, want, hdr, sh);
+}
+
 // the queue waits for `waitValue` (the caller wrote the frame into sh.in and its vectors into sh.mv), upscales it into
 // sh.out and signals `signalValue`. reset = the first frame of a stream. Non-blocking but for the command-list ring. 0 =
 // ok.
-FSRUP_API int fsrup_frame(uint64_t waitValue, uint64_t signalValue, int reset, double frameTimeMs)
+static int frameAt(State& s, uint64_t waitValue, uint64_t signalValue, int reset, double frameTimeMs)
 {
-    State& s = g_s;
     if (!s.live)
         return fail("context not created"), -1;
     if (FAILED(s.q->Wait(s.fence, waitValue)))
@@ -539,7 +555,27 @@ FSRUP_API int fsrup_frame(uint64_t waitValue, uint64_t signalValue, int reset, d
     return 0;
 }
 
+FSRUP_API int fsrup_frame(uint64_t waitValue, uint64_t signalValue, int reset, double frameTimeMs)
+{
+    return frameAt(g_s[0], waitValue, signalValue, reset, frameTimeMs);
+}
+
+// fsrup_frame on instance i
+FSRUP_API int fsrup_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int reset, double frameTimeMs)
+{
+    if (i < 0 || i >= kInst)
+        return fail("bad instance"), -1;
+    return frameAt(g_s[i], waitValue, signalValue, reset, frameTimeMs);
+}
+
 FSRUP_API void fsrup_destroy()
 {
-    destroy(g_s);
+    destroy(g_s[0]);
+}
+
+// fsrup_destroy on instance i
+FSRUP_API void fsrup_destroy_i(int i)
+{
+    if (i >= 0 && i < kInst)
+        destroy(g_s[i]);
 }

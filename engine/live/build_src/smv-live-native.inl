@@ -3293,6 +3293,23 @@ __global__ void k_mvHalfG1(const short* __restrict__ vec, int vecPitch, int w, i
     dst[(size_t)y * (dstPitch >> 2) + x] =
         fx * fx + fy * fy < gate * gate ? 0u : (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
 }
+// a chained upscale pass's vectors (AMD FSR / Intel XeSS-SR past 3x, fuChainPlan): the first pass's R16G16_FLOAT
+// texels (sw x sh, its render size) at this pass's render size dw x dh, the nearest texel times the size ratio (kx,
+// ky) = render pixels of this pass; an exact zero (k_mvHalf's gate) stays zero
+__global__ void k_fuMvScale(const unsigned int* __restrict__ src, int srcPitch, int sw, int sh,
+                            unsigned int* __restrict__ dst, int dstPitch, int dw, int dh, float kx, float ky)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dw || y >= dh) return;
+    const int sx = min(sw - 1, (int)(((float)x + 0.5f) * (float)sw / (float)dw));
+    const int sy = min(sh - 1, (int)(((float)y + 0.5f) * (float)sh / (float)dh));
+    const unsigned int v = src[(size_t)sy * (srcPitch >> 2) + sx];
+    dst[(size_t)y * (dstPitch >> 2) + x] =
+        v == 0u ? 0u
+                : (unsigned int)f2h(kx * h2f((unsigned short)(v & 0xFFFFu))) |
+                      ((unsigned int)f2h(ky * h2f((unsigned short)(v >> 16))) << 16);
+}
 // the engine's grid-1 field (short2, raw / 32 = px) bilinear at (x, y), clamped to the frame
 __device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch, int w, int h, float x, float y,
                                      float& vx, float& vy)
@@ -5594,6 +5611,27 @@ struct NativeRife
     bool fuMade = false;
     int fuCur = 0;    // the vector session's slot that holds this frame
     uint64_t fuN = 0; // frames upscaled
+    // past 3x a side (fuChainPlan): pass k = fuPw[k] x fuPh[k] -> fuPw[k + 1] x fuPh[k + 1] on bridge instance k; pass 0
+    // = the fields above (its output dFu0Out when chained), passes 1 .. fuPasses - 1 = fuX; dFuOut = the last pass's
+    // output, what the callers read; a pass's vectors = pass 0's scaled to its size (k_fuMvScale)
+    static constexpr int kFuMaxPass = 6;
+    struct FuPass
+    {
+        cudaExternalMemory_t emIn = nullptr, emMv = nullptr, emOut = nullptr;
+        uint8_t* dIn = nullptr;
+        uint8_t* dMv = nullptr;
+        uint8_t* dOut = nullptr; // null on the last pass (its output = dFuOut)
+        cudaExternalSemaphore_t sem = nullptr;
+        uint64_t val = 0;
+        int inPitch = 0, mvPitch = 0, outPitch = 0;
+        bool made = false;
+    };
+    int fuPasses = 1;
+    int fuPw[kFuMaxPass + 1] = {}, fuPh[kFuMaxPass + 1] = {};
+    FuPass fuX[kFuMaxPass - 1];
+    cudaExternalMemory_t fu0EmOut = nullptr;
+    uint8_t* dFu0Out = nullptr;
+    int fu0OutPitch = 0;
     // SMV_FSRUP_PROF=1: CUDA events between a frame's stages (the input pack, the Optical Flow, the vector kernels, FSR
     // on D3D12, the output unpack), means at the session's end; every frame then waits for its last event
     bool fuProf = false;
@@ -6006,6 +6044,7 @@ struct NativeRife
         fPackRgbaH = nullptr, fRgbaHAbgr = nullptr, fUnpackRgbaH = nullptr, // FSR frame generation: RGBA16F frames,
         fMvHalf = nullptr, fMvHalfG1 = nullptr, fMvDerive = nullptr,        // the Optical Flow input, the vectors
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr, fOddEdge = nullptr, // FSR upscaling: BGRA8 <-> RGBA8; VSR's slot
+        fFuMvScale = nullptr,                                            // its chained passes' vectors
         fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,  // offline DLSS 4.5 frames, RTX VSR
         fUnpackR10 = nullptr;
     CUfunction fFitAaH = nullptr, fFitAaV = nullptr, fRsTab = nullptr;           // the separable fit, its tap tables
@@ -6658,10 +6697,10 @@ static int lkField(const std::string& line, const char* key)
 }
 
 // ---- Restore on the host's own kernels -------------------------------------------------------------------------
-// The bundled Real-ESRGAN (realesr-animevideov3, BSD-3, engine\realesr-animevideov3.pth) runs as k_restConv0,
-// 16 x k_restConvMid and k_restConvLast, never as a TensorRT engine: no ONNX, no build. The handoff names it as
-// restorePath = kRestNative; weights that are missing or not this model = no Restore (offline: the pass is dropped
-// with its line).
+// The bundled Real-ESRGAN (realesr-animevideov3, BSD-3, engine\realesrgan\realesr-animevideov3.pkl) runs as
+// k_restConv0, 16 x k_restConvMid and k_restConvLast, never as a TensorRT engine: no ONNX, no build. The handoff
+// names it as restorePath = kRestNative; weights that are missing or not this model = no Restore (offline: the pass
+// is dropped with its line).
 static const char* const kRestNative = "native:realesr-animevideov3";
 // a --restore-model ONNX runs on the host's kernels in AnimeJaNai's SPAN-F3 form (64 features, ajNatLoad) only; any
 // other graph = no Restore, the same way (ajNatWanted's line names why)
@@ -7186,7 +7225,7 @@ static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, st
 {
     off.assign(3 + 16 * 3 + 2, 0);
     PthFile pf;
-    if (!pthStateDict(g_nativeEngineDir + L"\\realesr-animevideov3.pth", pf, why))
+    if (!pthStateDict(g_nativeEngineDir + L"\\realesrgan\\realesr-animevideov3.pkl", pf, why))
         return false;
     auto& wts = pf.t;
     const auto& S = pf.S;
@@ -7533,8 +7572,26 @@ static bool onnxRead(const std::vector<char>& file, OnnxGraph& g, std::string& w
 // pad 1 (3 x 3) / 0 (1 x 1). Anything else = not this form (`why`). The weights for the kernels, in one block (off: the
 // first conv's w[64][108] + b fp32; per block c1 / c2 / c3 fragment-order + bias + slope (0 = ReLU, 1 = none) fp16,
 // the 1 x 1's fragments + bias fp32; the concat conv's fragments (4 sources) + bias fp32; the last conv's + bias fp16).
-static bool ajNatLoad(const std::string& path, std::vector<uint8_t>& blob, std::vector<size_t>& off, int& nblocks,
-                      std::string& why)
+// AnimeJaNai's SPAN-F3 weights by layer, fp32 values (a weight stored as fp16 reads back exactly): conv_1 (64 x 12 x 3
+// x 3), per block three 3 x 3 convs and the 1 x 1 attention conv, conv_cat (64 x 256 x 1 x 1), upsampler (48 x 64 x 3
+// x 3); the .pkl the app keeps (--convert-restore-model) names them conv_1, block_K.c1 .. c3, block_K.att, conv_cat,
+// upsampler (.weight / .bias)
+struct AjT
+{
+    std::vector<float> w, b;
+};
+struct AjBlock
+{
+    AjT c[3], att;
+};
+struct AjWeights
+{
+    AjT first, cat, last;
+    std::vector<AjBlock> blocks;
+};
+
+// the weights out of the author's ONNX, after the graph's form check
+static bool ajFromOnnx(const std::string& path, AjWeights& aw, std::string& why)
 {
     std::vector<char> file;
     if (!lkReadFile(path, file) || file.empty())
@@ -7681,6 +7738,27 @@ static bool ajNatLoad(const std::string& path, std::vector<uint8_t>& blob, std::
     // the weights
     auto wOf = [&](int i) -> const std::vector<float>& { return g.inits[g.nodes[i].in[1]].f; };
     auto bOf = [&](int i) -> const std::vector<float>& { return g.inits[g.nodes[i].in[2]].f; };
+    auto tOf = [&](int i) { return AjT{wOf(i), bOf(i)}; };
+    aw.first = tOf(first);
+    aw.blocks.clear();
+    for (const Block& b : blocks)
+        aw.blocks.push_back(AjBlock{{tOf(b.c[0]), tOf(b.c[1]), tOf(b.c[2])}, tOf(b.att)});
+    aw.cat = tOf(cc);
+    aw.last = tOf(last);
+    return true;
+}
+
+// the kernels' block (offsets 256-byte aligned) from the weights; false = a weight of the wrong size (`why`)
+static bool ajBlob(const AjWeights& aw, std::vector<uint8_t>& blob, std::vector<size_t>& off, int& nblocks,
+                   std::string& why)
+{
+    const int n = (int)aw.blocks.size();
+    auto bad = [&](const std::string& where) {
+        why = "not AnimeJaNai's SPAN-F3 form (" + where + ")";
+        return false;
+    };
+    if (n < 1 || n > 16)
+        return bad("the blocks");
     blob.clear();
     off.assign((size_t)(6 + 11 * n), 0);
     auto put = [&](const void* p, size_t bytes) {
@@ -7695,43 +7773,305 @@ static bool ajNatLoad(const std::string& path, std::vector<uint8_t>& blob, std::
             h[i] = f2hRne(v[i]);
         return h;
     };
-    auto sizesOk = [&](int i, size_t nw, size_t nb) { return wOf(i).size() == nw && bOf(i).size() == nb; };
-    if (!sizesOk(first, 64 * 108, 64) || !sizesOk(cc, 64 * 256, 64) || !sizesOk(last, 48 * 64 * 9, 48))
+    auto sizesOk = [&](const AjT& t, size_t nw, size_t nb) { return t.w.size() == nw && t.b.size() == nb; };
+    if (!sizesOk(aw.first, 64 * 108, 64) || !sizesOk(aw.cat, 64 * 256, 64) || !sizesOk(aw.last, 48 * 64 * 9, 48))
         return bad("a weight's size");
-    off[0] = put(wOf(first).data(), wOf(first).size() * sizeof(float));
-    off[1] = put(bOf(first).data(), 64 * sizeof(float));
+    off[0] = put(aw.first.w.data(), aw.first.w.size() * sizeof(float));
+    off[1] = put(aw.first.b.data(), 64 * sizeof(float));
     const std::vector<uint16_t> zeros(64, 0), ones(64, 0x3c00);
     for (int k = 0; k < n; k++)
     {
-        const Block& b = blocks[(size_t)k];
+        const AjBlock& b = aw.blocks[(size_t)k];
         for (int j = 0; j < 3; j++)
         {
             if (!sizesOk(b.c[j], 64 * 64 * 9, 64))
                 return bad("a weight's size");
-            const std::vector<uint16_t> wf = restFragOf(wOf(b.c[j]), 64, 64, 0, 9), bs = halves(bOf(b.c[j]));
+            const std::vector<uint16_t> wf = restFragOf(b.c[j].w, 64, 64, 0, 9), bs = halves(b.c[j].b);
             off[(size_t)(2 + 11 * k + 3 * j)] = put(wf.data(), wf.size() * 2);
             off[(size_t)(3 + 11 * k + 3 * j)] = put(bs.data(), bs.size() * 2);
             off[(size_t)(4 + 11 * k + 3 * j)] = put(j < 2 ? zeros.data() : ones.data(), 64 * 2);
         }
         if (!sizesOk(b.att, 64 * 64, 64))
             return bad("a weight's size");
-        const std::vector<uint16_t> wa = restFragOf(wOf(b.att), 64, 64, 0, 1);
+        const std::vector<uint16_t> wa = restFragOf(b.att.w, 64, 64, 0, 1);
         off[(size_t)(11 + 11 * k)] = put(wa.data(), wa.size() * 2);
-        off[(size_t)(12 + 11 * k)] = put(bOf(b.att).data(), 64 * sizeof(float));
+        off[(size_t)(12 + 11 * k)] = put(b.att.b.data(), 64 * sizeof(float));
     }
     std::vector<uint16_t> wcat;
     for (int s = 0; s < 4; s++)
     {
-        const std::vector<uint16_t> part = restFragOf(wOf(cc), 64, 256, 64 * s, 1);
+        const std::vector<uint16_t> part = restFragOf(aw.cat.w, 64, 256, 64 * s, 1);
         wcat.insert(wcat.end(), part.begin(), part.end());
     }
     off[(size_t)(2 + 11 * n)] = put(wcat.data(), wcat.size() * 2);
-    off[(size_t)(3 + 11 * n)] = put(bOf(cc).data(), 64 * sizeof(float));
-    const std::vector<uint16_t> wlf = restFragOf(wOf(last), 48, 64, 0, 9), bl = halves(bOf(last));
+    off[(size_t)(3 + 11 * n)] = put(aw.cat.b.data(), 64 * sizeof(float));
+    const std::vector<uint16_t> wlf = restFragOf(aw.last.w, 48, 64, 0, 9), bl = halves(aw.last.b);
     off[(size_t)(4 + 11 * n)] = put(wlf.data(), wlf.size() * 2);
     off[(size_t)(5 + 11 * n)] = put(bl.data(), bl.size() * 2);
     nblocks = n;
     return true;
+}
+
+// the weights out of the .pkl the converter writes: every name with its exact shape, nothing else
+static bool ajFromPkl(const std::wstring& path, AjWeights& aw, std::string& why)
+{
+    PthFile pf;
+    if (!pthStateDict(path, pf, why))
+        return false;
+    auto bad = [&](const std::string& where) {
+        why = "not AnimeJaNai's SPAN-F3 form (" + where + ")";
+        return false;
+    };
+    auto get = [&](const std::string& n, const std::vector<int64_t>& wd, AjT& t) {
+        const auto w = pf.S.find(n + ".weight"), b = pf.S.find(n + ".bias");
+        if (w == pf.S.end() || b == pf.S.end() || w->second != wd || b->second != std::vector<int64_t>{wd[0]})
+            return false;
+        const std::span<const float> tw = pf.t.at(n + ".weight"), tb = pf.t.at(n + ".bias");
+        t.w.assign(tw.begin(), tw.end());
+        t.b.assign(tb.begin(), tb.end());
+        return true;
+    };
+    const std::vector<int64_t> w64 = {64, 64, 3, 3};
+    if (!get("conv_1", {64, 12, 3, 3}, aw.first))
+        return bad("conv_1");
+    aw.blocks.clear();
+    for (int k = 1; k <= 16 && pf.S.count("block_" + std::to_string(k) + ".c1.weight"); k++)
+    {
+        const std::string p = "block_" + std::to_string(k);
+        AjBlock b;
+        if (!get(p + ".c1", w64, b.c[0]) || !get(p + ".c2", w64, b.c[1]) || !get(p + ".c3", w64, b.c[2]) ||
+            !get(p + ".att", {64, 64, 1, 1}, b.att))
+            return bad(p);
+        aw.blocks.push_back(std::move(b));
+    }
+    if (aw.blocks.empty())
+        return bad("no block");
+    if (!get("conv_cat", {64, 256, 1, 1}, aw.cat) || !get("upsampler", {48, 64, 3, 3}, aw.last))
+        return bad("the tail");
+    if (pf.t.size() != 2 * (3 + 4 * aw.blocks.size()))
+        return bad("extra tensors");
+    return true;
+}
+
+// the .pkl (torch.save's zip, stored entries: archive/data.pkl + archive/data/<i>, version, byteorder): an OrderedDict
+// of _rebuild_tensor_v2 tensors, each fp16 when every value round-trips exactly (the author's fp16 ONNX: all), else
+// fp32; pthStateDict and torch.load read it; no timestamps, so one ONNX always gives the same bytes
+static bool ajWritePkl(const AjWeights& aw, const std::wstring& path, std::string& why)
+{
+    struct Ent
+    {
+        std::string name;
+        const std::vector<float>* v;
+        std::vector<int64_t> dims;
+    };
+    std::vector<Ent> ts;
+    auto add = [&](const std::string& n, const AjT& t, const std::vector<int64_t>& wd) {
+        ts.push_back({n + ".weight", &t.w, wd});
+        ts.push_back({n + ".bias", &t.b, {wd[0]}});
+    };
+    add("conv_1", aw.first, {64, 12, 3, 3});
+    for (size_t k = 0; k < aw.blocks.size(); k++)
+    {
+        const std::string p = "block_" + std::to_string(k + 1);
+        for (int j = 0; j < 3; j++)
+            add(p + ".c" + std::to_string(j + 1), aw.blocks[k].c[j], {64, 64, 3, 3});
+        add(p + ".att", aw.blocks[k].att, {64, 64, 1, 1});
+    }
+    add("conv_cat", aw.cat, {64, 256, 1, 1});
+    add("upsampler", aw.last, {48, 64, 3, 3});
+    std::string p = "\x80\x02";
+    auto glob = [&](const char* m, const char* n) {
+        p += 'c';
+        p += m;
+        p += '\n';
+        p += n;
+        p += '\n';
+    };
+    auto str = [&](const std::string& s) {
+        const uint32_t l = (uint32_t)s.size();
+        p += 'X';
+        p.append((const char*)&l, 4);
+        p += s;
+    };
+    auto i32 = [&](int64_t v) {
+        const int32_t x = (int32_t)v;
+        p += 'J';
+        p.append((const char*)&x, 4);
+    };
+    glob("collections", "OrderedDict");
+    p += ")R(";
+    std::vector<std::string> data;
+    for (size_t i = 0; i < ts.size(); i++)
+    {
+        const std::vector<float>& v = *ts[i].v;
+        int64_t numel = 1;
+        for (int64_t d : ts[i].dims)
+            numel *= d;
+        if (numel != (int64_t)v.size())
+        {
+            why = "a weight's size (" + ts[i].name + ")";
+            return false;
+        }
+        bool half = true;
+        for (float x : v)
+            if (h2fHost(f2hRne(x)) != x)
+            {
+                half = false;
+                break;
+            }
+        std::string d;
+        if (half)
+        {
+            d.resize(v.size() * 2);
+            for (size_t j = 0; j < v.size(); j++)
+            {
+                const uint16_t h = f2hRne(v[j]);
+                memcpy(&d[2 * j], &h, 2);
+            }
+        }
+        else
+            d.assign((const char*)v.data(), v.size() * sizeof(float));
+        data.push_back(std::move(d));
+        str(ts[i].name);
+        glob("torch._utils", "_rebuild_tensor_v2");
+        p += "((";
+        str("storage");
+        glob("torch", half ? "HalfStorage" : "FloatStorage");
+        str(std::to_string(i));
+        str("cpu");
+        i32(numel);
+        p += "tQ";
+        i32(0);
+        p += '(';
+        for (int64_t dd : ts[i].dims)
+            i32(dd);
+        p += "t(";
+        std::vector<int64_t> stride(ts[i].dims.size(), 1);
+        for (size_t s = stride.size(); s-- > 1;)
+            stride[s - 1] = stride[s] * ts[i].dims[s];
+        for (int64_t s : stride)
+            i32(s);
+        p += "t\x89";
+        glob("collections", "OrderedDict");
+        p += ")RtR";
+    }
+    p += "u.";
+    std::vector<std::pair<std::string, std::string>> files = {
+        {"archive/data.pkl", p}, {"archive/byteorder", "little"}, {"archive/version", "3\n"}};
+    for (size_t i = 0; i < data.size(); i++)
+        files.push_back({"archive/data/" + std::to_string(i), data[i]});
+    static uint32_t crcTab[256];
+    if (!crcTab[1])
+        for (uint32_t i = 0; i < 256; i++)
+        {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++)
+                c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            crcTab[i] = c;
+        }
+    auto crc32 = [](const std::string& s) {
+        uint32_t c = 0xFFFFFFFFu;
+        for (unsigned char ch : s)
+            c = crcTab[(c ^ ch) & 0xFF] ^ (c >> 8);
+        return c ^ 0xFFFFFFFFu;
+    };
+    std::string z, cd;
+    auto le = [](std::string& o, uint32_t v, int bytes) {
+        for (int i = 0; i < bytes; i++)
+            o += (char)((v >> (8 * i)) & 0xFF);
+    };
+    for (const auto& [name, body] : files)
+    {
+        const uint32_t at = (uint32_t)z.size(), crc = crc32(body), sz = (uint32_t)body.size();
+        le(z, 0x04034b50u, 4);
+        le(z, 20, 2);
+        le(z, 0, 2);
+        le(z, 0, 2);
+        le(z, 0, 2);
+        le(z, 0x21, 2);
+        le(z, crc, 4);
+        le(z, sz, 4);
+        le(z, sz, 4);
+        le(z, (uint32_t)name.size(), 2);
+        le(z, 0, 2);
+        z += name;
+        z += body;
+        le(cd, 0x02014b50u, 4);
+        le(cd, 20, 2);
+        le(cd, 20, 2);
+        le(cd, 0, 2);
+        le(cd, 0, 2);
+        le(cd, 0, 2);
+        le(cd, 0x21, 2);
+        le(cd, crc, 4);
+        le(cd, sz, 4);
+        le(cd, sz, 4);
+        le(cd, (uint32_t)name.size(), 2);
+        le(cd, 0, 2);
+        le(cd, 0, 2);
+        le(cd, 0, 2);
+        le(cd, 0, 2);
+        le(cd, 0, 4);
+        le(cd, at, 4);
+        cd += name;
+    }
+    const uint32_t cdAt = (uint32_t)z.size();
+    z += cd;
+    le(z, 0x06054b50u, 4);
+    le(z, 0, 2);
+    le(z, 0, 2);
+    le(z, (uint32_t)files.size(), 2);
+    le(z, (uint32_t)files.size(), 2);
+    le(z, (uint32_t)cd.size(), 4);
+    le(z, cdAt, 4);
+    le(z, 0, 2);
+    HANDLE fh = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD wrote = 0;
+    const bool ok = fh != INVALID_HANDLE_VALUE && WriteFile(fh, z.data(), (DWORD)z.size(), &wrote, nullptr) &&
+                    wrote == (DWORD)z.size();
+    if (fh != INVALID_HANDLE_VALUE)
+        CloseHandle(fh);
+    if (!ok)
+    {
+        DeleteFileW(path.c_str());
+        why = "the .pkl could not be written (" + wideToUtf8(path) + ")";
+    }
+    return ok;
+}
+
+// a --restore-model file's weights for the kernels: the .pkl the app keeps, or the author's ONNX
+static bool ajNatLoad(const std::string& path, std::vector<uint8_t>& blob, std::vector<size_t>& off, int& nblocks,
+                      std::string& why)
+{
+    AjWeights aw;
+    const bool pkl = path.size() > 4 && _stricmp(path.c_str() + path.size() - 4, ".pkl") == 0;
+    return (pkl ? ajFromPkl(utf8ToWide(path), aw, why) : ajFromOnnx(path, aw, why)) &&
+           ajBlob(aw, blob, off, nblocks, why);
+}
+
+// --convert-restore-model IN.onnx OUT.pkl: AnimeJaNai's ONNX after the form check as the .pkl the app keeps, read
+// back and checked to give the kernels the ONNX's block byte for byte; 0 = written, 2 = refused (the line says why)
+static int ajConvert(const std::string& in, const std::wstring& out)
+{
+    AjWeights aw, back;
+    std::vector<uint8_t> blob, blob2;
+    std::vector<size_t> off, off2;
+    int n = 0, n2 = 0;
+    std::string why;
+    if (!ajFromOnnx(in, aw, why) || !ajBlob(aw, blob, off, n, why) || !ajWritePkl(aw, out, why))
+    {
+        printf("convert: refused: %s\n", why.c_str());
+        return 2;
+    }
+    if (!ajFromPkl(out, back, why) || !ajBlob(back, blob2, off2, n2, why) || blob != blob2 || off != off2)
+    {
+        DeleteFileW(out.c_str());
+        printf("convert: refused: the .pkl does not read back as the ONNX's weights%s%s\n", why.empty() ? "" : ": ",
+               why.c_str());
+        return 2;
+    }
+    printf("convert: %d blocks, %zu tensors -> %s\n", n, (size_t)(2 * (3 + 4 * n)), wideToUtf8(out).c_str());
+    return 0;
 }
 
 // a --restore-model file on the host's kernels: AnimeJaNai's form, else no Restore (read once a path, the line once)
@@ -9313,6 +9653,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fMvHalfG1, "k_mvHalfG1"},
         {&nr.fMvDerive, "k_mvDerive"},
         {&nr.fBgraRgbaFsr, "k_bgraRgbaFsr"},
+        {&nr.fFuMvScale, "k_fuMvScale"},
         {&nr.fRgbaBgra, "k_rgbaBgra"},
         {&nr.fOddEdge, "k_oddEdge"},
         {&nr.fHdrRestOut, "k_hdrRestOut"},
@@ -12872,6 +13213,11 @@ struct FsrupBridge
     int (*create)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char*, int, FsrupShared*) = nullptr;
     int (*frame)(uint64_t, uint64_t, int, double) = nullptr;
     void (*destroy)() = nullptr;
+    // instance k of the same (the chained passes past 3x, fuChainPlan); an older bridge lacks them
+    int (*createI)(int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char*, int,
+                   FsrupShared*) = nullptr;
+    int (*frameI)(int, uint64_t, uint64_t, int, double) = nullptr;
+    void (*destroyI)(int) = nullptr;
 };
 static FsrupBridge g_fsrupK[2];
 static const char* const kFuDll[2] = {"smv_fsrup_bridge.dll", "smv_xess_bridge.dll"};
@@ -12903,17 +13249,82 @@ static bool nativeFsrupLoad(const std::string& dir, int kind)
         b = FsrupBridge{};
         return false;
     }
+    b.createI = (int (*)(int, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char*, int,
+                         FsrupShared*))GetProcAddress(m, (pre + "create_i").c_str());
+    b.frameI = (int (*)(int, uint64_t, uint64_t, int, double))GetProcAddress(m, (pre + "frame_i").c_str());
+    b.destroyI = (void (*)(int))GetProcAddress(m, (pre + "destroy_i").c_str());
     b.mod = m;
     return true;
 }
 
-// the upscaler at RTX VSR's resize (w x h -> ow x oh, nativeRtxInit's slot), its shared buffers and fence imported, and
-// the vectors' Optical Flow session at the render size
+// the reason an early (handoff-time) setup failed, named by the pipe's "the early engine handoff failed" line (cleared
+// when the early thread starts)
+static char g_earlyWhy[240];
+static void earlyWhy(const char* fmt, ...)
+{
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(g_earlyWhy, sizeof(g_earlyWhy), fmt, a);
+    va_end(a);
+}
+
+// AMD FSR / Intel XeSS-SR past 3x a side (FSR's named presets end at 3.0x and past about 9x it leaves one dot an input
+// pixel; XeSS-SR refuses past 3.0x): the fewest equal passes of at most 3x, the last landing on ow x oh, the sizes in
+// between even (the upscaler leaves an odd last column / row untouched). pw / ph [0 .. n] = the sizes; returns n (1 =
+// one call: within 3x, or a shrink), 0 = no chain within kFuMaxPass. SMV_FU_CHAIN=0: one call at any ratio (A/B)
+static int fuChainPlan(int w, int h, int ow, int oh, int* pw, int* ph)
+{
+    pw[0] = w;
+    ph[0] = h;
+    pw[1] = ow;
+    ph[1] = oh;
+    static const bool off = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("SMV_FU_CHAIN", v, sizeof(v)) > 0 && v[0] == '0';
+    }();
+    if (off || ow < w || oh < h || ((double)ow <= 3.0 * w && (double)oh <= 3.0 * h))
+        return 1;
+    const double rx = (double)ow / w, ry = (double)oh / h;
+    const int n0 = (std::max)(2, (int)std::ceil(std::log((std::max)(rx, ry)) / std::log(3.0) - 1e-9));
+    for (int n = n0; n <= NativeRife::kFuMaxPass; n++)
+    {
+        pw[n] = ow;
+        ph[n] = oh;
+        for (int k = 1; k < n; k++)
+        {
+            pw[k] = (std::min)(ow, ((int)std::ceil(w * std::pow(rx, (double)k / n)) + 1) & ~1);
+            ph[k] = (std::min)(oh, ((int)std::ceil(h * std::pow(ry, (double)k / n)) + 1) & ~1);
+        }
+        for (int k = n - 1; k >= 1; k--) // the step into k + 1 at most 3x a side
+        {
+            pw[k] = (std::max)(pw[k], ((pw[k + 1] + 2) / 3 + 1) & ~1);
+            ph[k] = (std::max)(ph[k], ((ph[k + 1] + 2) / 3 + 1) & ~1);
+        }
+        bool ok = true;
+        for (int k = 1; k <= n; k++)
+            ok = ok && pw[k] >= pw[k - 1] && ph[k] >= ph[k - 1] && pw[k] <= 3 * pw[k - 1] && ph[k] <= 3 * ph[k - 1];
+        if (ok)
+            return n;
+    }
+    return 0;
+}
+
+// the upscaler at RTX VSR's resize (w x h -> ow x oh, nativeRtxInit's slot; past 3x a side in fuChainPlan's passes),
+// its shared buffers and fences imported, and the vectors' Optical Flow session at the render size
 static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
 {
     if (!nativeFsrupLoad(nr.fsrUpDir, nr.fuKind))
         return false;
     FsrupBridge& br = g_fsrupK[nr.fuKind];
+    const int n = fuChainPlan(w, h, ow, oh, nr.fuPw, nr.fuPh);
+    if (!n || (n > 1 && (!br.createI || !br.frameI || !br.destroyI)))
+    {
+        earlyWhy("%s upscaling %dx%d -> %dx%d: %s", kFuName[nr.fuKind], w, h, ow, oh,
+                 n ? "its bridge has no chained passes (an older one)" : "no chain of passes of at most 3x reaches it");
+        LOG("native: fsr upscale: %s\n", g_earlyWhy);
+        return false;
+    }
+    nr.fuPasses = n;
     int dev = 0;
     cudaDeviceProp prop{};
     if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
@@ -12923,16 +13334,6 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
     }
     LUID luid;
     memcpy(&luid, prop.luid, sizeof(luid));
-    FsrupShared sh{};
-    // live HDR planes: the bridge's HDR mode (FP16 linear light in and out, k_fsrHdrIn / k_fsrHdrOut)
-    const int rc = br.create((uint32_t)w, (uint32_t)h, (uint32_t)ow, (uint32_t)oh, luid.LowPart, luid.HighPart, "4.",
-                             nr.fuHdr ? 1 : 0, &sh);
-    if (rc != 0)
-    {
-        LOG("native: fsr upscale: %dx%d -> %dx%d not created: %s (rc %d)\n", w, h, ow, oh, br.lastError(), rc);
-        return false;
-    }
-    nr.fuMade = true;
     auto imp = [](HANDLE hd, uint64_t bytes, cudaExternalMemory_t& em, uint8_t*& p) {
         cudaExternalMemoryHandleDesc md{};
         md.type = cudaExternalMemoryHandleTypeD3D12Resource;
@@ -12948,20 +13349,57 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
         bd.size = bytes;
         return cudaExternalMemoryGetMappedBuffer((void**)&p, em, &bd) == cudaSuccess;
     };
-    cudaExternalSemaphoreHandleDesc sd{};
-    sd.type = cudaExternalSemaphoreHandleTypeD3D12Fence;
-    sd.handle.win32.handle = sh.fence;
-    if (!imp(sh.in, sh.inBytes, nr.fuEmIn, nr.dFuIn) || !imp(sh.mv, sh.mvBytes, nr.fuEmMv, nr.dFuMv) ||
-        !imp(sh.out, sh.outBytes, nr.fuEmOut, nr.dFuOut) || cudaImportExternalSemaphore(&nr.fuSem, &sd) != cudaSuccess)
-    {
-        LOG("native: fsr upscale: the shared buffers or fence did not import into CUDA\n");
+    // pass k on bridge instance k (0 = the plain exports), its shared buffers and fence into the given fields
+    auto make = [&](int k, cudaExternalMemory_t& emIn, uint8_t*& dIn, int& inP, cudaExternalMemory_t& emMv,
+                    uint8_t*& dMv, int& mvP, cudaExternalMemory_t& emOut, uint8_t*& dOut, int& outP,
+                    cudaExternalSemaphore_t& sem, bool& made) {
+        const int pw = nr.fuPw[k], ph = nr.fuPh[k], qw = nr.fuPw[k + 1], qh = nr.fuPh[k + 1];
+        FsrupShared sh{};
+        // live HDR planes: the bridge's HDR mode (FP16 linear light in and out, k_fsrHdrIn / k_fsrHdrOut)
+        const int rc = k ? br.createI(k, (uint32_t)pw, (uint32_t)ph, (uint32_t)qw, (uint32_t)qh, luid.LowPart,
+                                      luid.HighPart, "4.", nr.fuHdr ? 1 : 0, &sh)
+                         : br.create((uint32_t)pw, (uint32_t)ph, (uint32_t)qw, (uint32_t)qh, luid.LowPart,
+                                     luid.HighPart, "4.", nr.fuHdr ? 1 : 0, &sh);
+        if (rc != 0)
+        {
+            earlyWhy("%s upscaling %dx%d -> %dx%d not created: %s (rc %d)", kFuName[nr.fuKind], pw, ph, qw, qh,
+                     br.lastError(), rc);
+            LOG("native: fsr upscale: %dx%d -> %dx%d not created: %s (rc %d)\n", pw, ph, qw, qh, br.lastError(), rc);
+            return false;
+        }
+        made = true;
+        cudaExternalSemaphoreHandleDesc sd{};
+        sd.type = cudaExternalSemaphoreHandleTypeD3D12Fence;
+        sd.handle.win32.handle = sh.fence;
+        if (!imp(sh.in, sh.inBytes, emIn, dIn) || !imp(sh.mv, sh.mvBytes, emMv, dMv) ||
+            !imp(sh.out, sh.outBytes, emOut, dOut) || cudaImportExternalSemaphore(&sem, &sd) != cudaSuccess)
+        {
+            LOG("native: fsr upscale: the shared buffers or fence did not import into CUDA\n");
+            return false;
+        }
+        inP = (int)sh.inPitch;
+        mvP = (int)sh.mvPitch;
+        outP = (int)sh.outPitch;
+        if (!k)
+        {
+            memcpy(nr.fuVersion, sh.version, sizeof(nr.fuVersion));
+            nr.fuVersion[sizeof(nr.fuVersion) - 1] = 0;
+        }
+        return true;
+    };
+    const bool chain = n > 1;
+    if (!make(0, nr.fuEmIn, nr.dFuIn, nr.fuInPitch, nr.fuEmMv, nr.dFuMv, nr.fuMvPitch, chain ? nr.fu0EmOut : nr.fuEmOut,
+              chain ? nr.dFu0Out : nr.dFuOut, chain ? nr.fu0OutPitch : nr.fuOutPitch, nr.fuSem, nr.fuMade))
         return false;
+    for (int k = 1; k < n; k++)
+    {
+        NativeRife::FuPass& p = nr.fuX[k - 1];
+        const bool last = k == n - 1;
+        p.val = 0;
+        if (!make(k, p.emIn, p.dIn, p.inPitch, p.emMv, p.dMv, p.mvPitch, last ? nr.fuEmOut : p.emOut,
+                  last ? nr.dFuOut : p.dOut, last ? nr.fuOutPitch : p.outPitch, p.sem, p.made))
+            return false;
     }
-    nr.fuInPitch = (int)sh.inPitch;
-    nr.fuMvPitch = (int)sh.mvPitch;
-    nr.fuOutPitch = (int)sh.outPitch;
-    memcpy(nr.fuVersion, sh.version, sizeof(nr.fuVersion));
-    nr.fuVersion[sizeof(nr.fuVersion) - 1] = 0;
     nr.fuVal = 0;
     nr.fuN = 0;
     nr.fuCur = 0;
@@ -12977,8 +13415,17 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
     }
     if (!nativeOfVecSetup(nr, nr.fuOf, w, h, "fsr upscale"))
         return false;
-    LOG("native: upscale: %s %s %dx%d -> %dx%d through %s, NVIDIA optical flow vectors (grid %d, %s)%s\n",
-        kFuName[nr.fuKind], nr.fuVersion, w, h, ow, oh, kFuDll[nr.fuKind], nr.fuOf.grid,
+    char via[160] = "";
+    if (chain)
+    {
+        int o = snprintf(via, sizeof(via), " in %d passes (", n);
+        for (int k = 1; k < n && o > 0 && o < (int)sizeof(via); k++)
+            o += snprintf(via + o, sizeof(via) - o, "%s%dx%d", k > 1 ? ", " : "", nr.fuPw[k], nr.fuPh[k]);
+        if (o > 0 && o < (int)sizeof(via))
+            snprintf(via + o, sizeof(via) - o, " between)");
+    }
+    LOG("native: upscale: %s %s %dx%d -> %dx%d%s through %s, NVIDIA optical flow vectors (grid %d, %s)%s\n",
+        kFuName[nr.fuKind], nr.fuVersion, w, h, ow, oh, via, kFuDll[nr.fuKind], nr.fuOf.grid,
         nativeOfLevelName(nr.fuOf.level), nr.fuHdr ? ", on the HDR planes' linear light (the bridge's HDR mode)" : "");
     return true;
 }
@@ -13082,6 +13529,55 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         nr.die("fsr upscale result failed");
         return false;
     }
+    // past 3x (fuChainPlan): passes 1.. on their own instances, each on the previous pass's output with pass 0's
+    // vectors scaled to its size (the stream's first frame: zero vectors and a reset, as pass 0)
+    for (int k = 1; k < nr.fuPasses; k++)
+    {
+        NativeRife::FuPass& p = nr.fuX[k - 1];
+        int kw = nr.fuPw[k], kh = nr.fuPh[k], sp = nr.fuMvPitch, dp = p.mvPitch;
+        float kx = (float)kw / (float)w, ky = (float)kh / (float)h;
+        const uint8_t* src = k == 1 ? nr.dFu0Out : nr.fuX[k - 2].dOut;
+        const size_t srcPitch = (size_t)(k == 1 ? nr.fu0OutPitch : nr.fuX[k - 2].outPitch);
+        void* v[] = {&nr.dFuMv, &sp, &w, &h, &p.dMv, &dp, &kw, &kh, &kx, &ky};
+        const bool vecOk = first || zeroVec
+                               ? cudaMemset2DAsync(p.dMv, p.mvPitch, 0, (size_t)kw * 4, kh, st) == cudaSuccess
+                               : cuLaunchKernel(nr.fFuMvScale, (kw + 15) / 16, (kh + 15) / 16, 1, 16, 16, 1, 0,
+                                                (CUstream)st, v, nullptr) == CUDA_SUCCESS;
+        if (cudaMemcpy2DAsync(p.dIn, p.inPitch, src, srcPitch, (size_t)kw * (nr.fuHdr ? 8 : 4), kh,
+                              cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
+            !vecOk)
+        {
+            nr.die("fsr upscale pass input failed");
+            return false;
+        }
+        cudaExternalSemaphoreSignalParams ps{};
+        ps.params.fence.value = ++p.val;
+        if (cudaSignalExternalSemaphoresAsync(&p.sem, &ps, 1, st) != cudaSuccess)
+        {
+            nr.die("fsr upscale fence signal failed");
+            return false;
+        }
+        const uint64_t pReady = p.val, pDone = ++p.val;
+        if (first)
+            InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + kFsrCompileMs);
+        const int prc = g_fsrupK[nr.fuKind].frameI(k, pReady, pDone, first ? 1 : 0, 1000.0 / 60.0);
+        if (first)
+            InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + 10000);
+        if (prc != 0)
+        {
+            LOG("native: fsr upscale: pass %d, frame %llu failed: %s (rc %d)\n", k + 1, (unsigned long long)nr.fuN,
+                g_fsrupK[nr.fuKind].lastError(), prc);
+            nr.die("fsr upscale failed");
+            return false;
+        }
+        cudaExternalSemaphoreWaitParams pw{};
+        pw.params.fence.value = pDone;
+        if (cudaWaitExternalSemaphoresAsync(&p.sem, &pw, 1, st) != cudaSuccess)
+        {
+            nr.die("fsr upscale result failed");
+            return false;
+        }
+    }
     mark(4);
     if (!nr.fuHdr)
     {
@@ -13141,6 +13637,41 @@ static void nativeFsrupRelease(NativeRife& nr)
             e = nullptr;
         }
     nr.fuProfN = 0;
+    for (int k = nr.fuPasses - 1; k >= 1; k--) // the chained passes past 3x (fuChainPlan), then pass 0's own output
+    {
+        NativeRife::FuPass& p = nr.fuX[k - 1];
+        for (uint8_t** b : {&p.dIn, &p.dMv, &p.dOut})
+            if (*b)
+            {
+                cudaFree(*b);
+                *b = nullptr;
+            }
+        if (p.sem)
+        {
+            cudaDestroyExternalSemaphore(p.sem);
+            p.sem = nullptr;
+        }
+        for (cudaExternalMemory_t* em : {&p.emIn, &p.emMv, &p.emOut})
+            if (*em)
+            {
+                cudaDestroyExternalMemory(*em);
+                *em = nullptr;
+            }
+        if (p.made && g_fsrupK[nr.fuKind].destroyI)
+            g_fsrupK[nr.fuKind].destroyI(k);
+        p.made = false;
+    }
+    nr.fuPasses = 1;
+    if (nr.dFu0Out)
+    {
+        cudaFree(nr.dFu0Out);
+        nr.dFu0Out = nullptr;
+    }
+    if (nr.fu0EmOut)
+    {
+        cudaDestroyExternalMemory(nr.fu0EmOut);
+        nr.fu0EmOut = nullptr;
+    }
     for (uint8_t** p : {&nr.dFuIn, &nr.dFuMv, &nr.dFuOut})
         if (*p)
         {
@@ -17430,11 +17961,14 @@ static bool nativeA4kPasses(NativeRife& nr, cudaStream_t st, const void* in, int
 }
 
 // the x2 passes a slot needs: the fewest whose 2^n reaches the enlarge ratio (up to 2x one, 3x two with Lanczos down
-// from 4x), at most four
+// from 4x), so the model makes every enlarged pixel and the fit only shrinks the overshoot; at most kA4kMaxPasses
+// (Live's 64 px floor on an 8K panel = 67.5x = 7 passes; too little video memory drops passes, the fit then enlarges
+// the rest)
+static constexpr int kA4kMaxPasses = 7;
 static int a4kPassesFor(int w, int h, int ow, int oh)
 {
     int n = 1;
-    while (n < 4 && ((w << n) < ow || (h << n) < oh))
+    while (n < kA4kMaxPasses && ((w << n) < ow || (h << n) < oh))
         n++;
     return n;
 }

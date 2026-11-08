@@ -4054,6 +4054,11 @@ int wmain(int argc, wchar_t** argv)
         return 0;
     }
 
+    // --convert-restore-model IN.onnx OUT.pkl: AnimeJaNai's ONNX as the .pkl the app keeps (ajConvert); main.ts runs it
+    // after the download and once for an install that still holds the .onnx
+    if (argc >= 4 && wcscmp(argv[1], L"--convert-restore-model") == 0)
+        return ajConvert(wideToUtf8(argv[2]), argv[3]);
+
     // --peak-nits [X Y]: the peak (nits) of the monitor at screen point (X, Y), physical px (the primary monitor
     // without a point) as Windows reports it, 0 when that monitor is not in HDR mode; main.ts passes it to a render
     // as --hdr-nits
