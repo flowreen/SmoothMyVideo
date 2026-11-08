@@ -152,6 +152,11 @@ third-party work.
 
 * **dovi_tool** and **hdr10plus_tool** (MIT, quietvoid): downloaded on the user's click in the app's
   Dolby Vision / HDR10+ panels (a pinned release from GitHub, its SHA256 checked).
+* **Intel XeSS SDK runtime** (`libxess.dll`, `libxess_fg.dll`, `libxell.dll`; Intel Simplified Software License,
+  Version October 2022, Copyright (C) 2025 Intel Corporation): downloaded on the user's click in the app's Intel
+  XeSS setup row (the pinned XeSS SDK 3.0.2 release from github.com/intel/xess, its SHA256 checked) and installed
+  unmodified into `engine/xess` with Intel's licence beside it as `XeSS_LICENSE.txt`. Intel and XeSS are trademarks
+  of Intel Corporation; this project is not affiliated with or endorsed by Intel.
 * **NVIDIA RTX Video feature models**: installed by the user from NVIDIA's RTX Video SDK
   download under NVIDIA's EULA.
 

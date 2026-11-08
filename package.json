@@ -11,7 +11,7 @@
     "start": "tsc && tsc -p tsconfig.renderer.json && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && electron .",
     "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.ts && node scripts/stage-gpu-runtime.ts && npm start",
     "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && tsc -p tsconfig.renderer.json && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && node scripts/stage-gpu-runtime.ts --required && electron-builder && node scripts/pack-zip.ts",
-    "lint": "prettier --write \"src/**/*.ts\" \"scripts/*.ts\" && tsc --noEmit && tsc -p tsconfig.scripts.json && tsc -p tsconfig.renderer.json && node scripts/clang-format.ts",
+    "lint": "prettier --write \"src/**/*.ts\" \"scripts/*.ts\" renderer/app.ts \"renderer/i18n/*.json\" && tsc --noEmit && tsc -p tsconfig.scripts.json && tsc -p tsconfig.renderer.json && node scripts/clang-format.ts",
     "postinstall": "node scripts/dev-icon.ts"
   },
   "devDependencies": {
@@ -65,7 +65,11 @@
           "!nvoffruc/NvOFFRUC.dll",
           "!nvoffruc/cudart64_110.dll",
           "!dvtools/**",
-          "!hptools/**"
+          "!hptools/**",
+          "!xess/libxess.dll",
+          "!xess/libxess_fg.dll",
+          "!xess/libxell.dll",
+          "!xess/XeSS_LICENSE.txt"
         ]
       }
     ],

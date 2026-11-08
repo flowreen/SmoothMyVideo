@@ -314,6 +314,14 @@
     </div>
     <div class="row">
       <span class="k"></span>
+      <label class="hint" id="modelxefglabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="xefg.tip">
+        <input type="checkbox" id="modelxefg"
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        <span style="white-space:nowrap;" data-i18n="xefg.name"></span> <span class="hint" data-i18n="xefg.hint"></span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
       <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="fruc.tip">
         <input type="checkbox" id="modelfruc"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
@@ -330,6 +338,15 @@
       <div class="row" id="frucbtns" style="flex-wrap:wrap;gap:6px">
         <button id="frucget" class="mini" data-i18n="common.getNvidia"></button>
         <button id="frucbrowsezip" class="mini" data-i18n="common.chooseZip"></button>
+      </div>
+    </div>
+    <div id="xefgsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px">
+        <span id="xefgstatus" class="v"></span>
+      </div>
+      <div class="hint" id="xefgsteps" style="line-height:1.6;margin-bottom:8px"></div>
+      <div class="row" id="xefgbtns" style="flex-wrap:wrap;gap:6px">
+        <button id="xefgdl" class="mini" data-i18n="xess.dl"></button>
       </div>
     </div>
     <div class="row">
@@ -453,6 +470,22 @@
         <input type="checkbox" id="fsrup" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
         <span style="white-space:nowrap;" data-i18n="fsrup.name"></span> <span class="hint" data-i18n="fsrup.hint"></span>
       </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
+      <label class="hint" id="xessuplabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="xess.tip">
+        <input type="checkbox" id="xessup" style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        <span style="white-space:nowrap;" data-i18n="xess.name"></span> <span class="hint" data-i18n="xess.hint"></span>
+      </label>
+    </div>
+    <div id="xesssetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px">
+        <span id="xessstatus" class="v"></span>
+      </div>
+      <div class="hint" id="xesssteps" style="line-height:1.6;margin-bottom:8px"></div>
+      <div class="row" id="xessbtns" style="flex-wrap:wrap;gap:6px">
+        <button id="xessdl" class="mini" data-i18n="xess.dl"></button>
+      </div>
     </div>
     <div class="row">
       <span class="k"></span>
@@ -646,6 +679,7 @@
         <option value="rife" data-i18n="cmp.rife"></option>
         <option value="dlssg" data-i18n="cmp.dlssg"></option>
         <option value="fsrfg" data-i18n="cmp.fsrfg"></option>
+        <option value="xefg" data-i18n="cmp.xefg"></option>
         <option value="fruc" data-i18n="cmp.fruc"></option>
       </select>
       <span class="hint" data-i18n="cmp.hint"></span>

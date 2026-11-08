@@ -2,31 +2,27 @@
 // `node scripts/clang-format.ts` rewrites the files in place.
 // Extra file arguments are formatted too (a working copy of the host sources outside the repo).
 // Uses CLANG_FORMAT, else the clang-format that ships with Visual Studio (found with vswhere), else PATH.
-// Out of scope: the vendored NVIDIA headers (nvofa, cuda_shim), the RTX Video SDK bridge sources and
-// sl_focus_shim.h, which keep their own layout.
+// Scope: every .cpp / .h / .inl directly in an engine/*/build_src folder, so a new bridge is formatted without a list
+// edit. Out of scope (they keep their own layout): the vendored NVIDIA headers in subfolders (nvofa, cuda_shim), the
+// RTX Video SDK bridge sources (engine/rtxvideo) and sl_focus_shim.h.
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
 const ROOT = path.join(import.meta.dirname, '..');
-const LIVE = 'engine/live/build_src';
-const FILES = [
-  `${LIVE}/smv-live.cpp`,
-  ...fs
-    .readdirSync(path.join(ROOT, LIVE))
-    .filter((f) => /^smv-live-.*\.inl$/.test(f))
-    .map((f) => `${LIVE}/${f}`),
-  'engine/dlssnr/build_src/nr_host.cpp',
-  'engine/dlssnr/build_src/nr_host.h',
-  'engine/dlssnr/build_src/shim.cpp',
-  'engine/dlssnr/build_src/shim_abi.h',
-  'engine/dlssg/build_src/main.cpp',
-  'engine/dlssg/build_src/pan_vectors.h',
-  'engine/nvoffruc/build_src/nvoffruc_bridge.cpp',
-  'engine/fsrfg/build_src/fsrfg_bridge.cpp',
-  'engine/fsrfg/build_src/amdxc64_shim.cpp',
-  'engine/fsrup/build_src/fsrup_bridge.cpp',
-];
+const SKIP_DIRS = new Set(['rtxvideo']);
+const SKIP_FILES = new Set(['sl_focus_shim.h']);
+const FILES = fs
+  .readdirSync(path.join(ROOT, 'engine'), { withFileTypes: true })
+  .filter((d) => d.isDirectory() && !SKIP_DIRS.has(d.name))
+  .map((d) => `engine/${d.name}/build_src`)
+  .filter((dir) => fs.existsSync(path.join(ROOT, dir)))
+  .flatMap((dir) =>
+    fs
+      .readdirSync(path.join(ROOT, dir))
+      .filter((f) => /\.(cpp|h|inl)$/.test(f) && !SKIP_FILES.has(f))
+      .map((f) => `${dir}/${f}`),
+  );
 
 function findClangFormat(): string {
   if (process.env.CLANG_FORMAT) return process.env.CLANG_FORMAT;

@@ -41,6 +41,7 @@ export interface PreviewArgs {
   fsr_upscale: boolean;
   anime4k: boolean;
   artcnn: boolean;
+  xess_upscale: boolean;
   dlssnr: boolean;
   nr_structure: number;
   nr_tone: number;
@@ -69,6 +70,7 @@ const MODEL_FLAGS: Record<string, string[]> = {
   nvof: ['--nvof'],
   dlssg: ['--dlssg'],
   fsrfg: ['--fsrfg'],
+  xefg: ['--xess-fg'],
   fruc: ['--fruc'],
 };
 
@@ -95,6 +97,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     fsr_upscale: false,
     anime4k: false,
     artcnn: false,
+    xess_upscale: false,
     dlssnr: false,
     nr_structure: 1,
     nr_tone: 1,
@@ -127,6 +130,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--fsr-upscale': 'fsr_upscale',
     '--anime4k': 'anime4k',
     '--artcnn': 'artcnn',
+    '--xess-upscale': 'xess_upscale',
     '--dlssnr': 'dlssnr',
     '--nr-mask': 'nr_mask',
   };
@@ -724,6 +728,7 @@ function passFlags(
       else if (a.fsr_upscale && o.outW > s.W && o.outH > s.H) args.push('--fsr-upscale');
       else if (a.anime4k && o.outW > s.W && o.outH > s.H) args.push('--anime4k');
       else if (a.artcnn && o.outW > s.W && o.outH > s.H) args.push('--artcnn');
+      else if (a.xess_upscale && o.outW > s.W && o.outH > s.H) args.push('--xess-upscale');
     }
   }
   if (s.strength > 0) args.push('--sharpen', pyG(s.strength));
@@ -1036,6 +1041,7 @@ export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         else if (a.fsr_upscale && OW > WW && OH > WH) st.push('--fsr-upscale');
         else if (a.anime4k && OW > WW && OH > WH) st.push('--anime4k');
         else if (a.artcnn && OW > WW && OH > WH) st.push('--artcnn');
+        else if (a.xess_upscale && OW > WW && OH > WH) st.push('--xess-upscale');
       }
       if (s.srcHdr) st.push('--src-hdr', s.transfer === 'arib-std-b67' ? 'hlg' : 'pq');
       stages.push(st);

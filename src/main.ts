@@ -838,6 +838,7 @@ function vsrQArgs(q: number): string[] {
 let liveFsrUp = false; // AMD FSR 4 as the live upscaler instead (its checkbox; the two exclude each other)
 let liveA4kUp = false; // Anime4K as the live upscaler instead (its checkbox; RTX VSR and AMD FSR 4 clear it)
 let liveAcnUp = false; // ArtCNN as the live upscaler instead (its checkbox; the other three clear it)
+let liveXessUp = false; // Intel XeSS as the live upscaler instead (its checkbox; the other four clear it)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
 let liveRestoreModel = ''; // Restore's model id ('animejanai' = the installed AnimeJaNai file, 'anime4k', '' = Real-ESRGAN)
@@ -973,7 +974,9 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   const target = String(Math.min(10000, Math.max(10, Math.round(Number(liveTarget) || 60))));
   // DLSS 4.5 is the exe's default backend (no --backend); with any effect below the exe runs the effects on every
   // captured frame and DLSS 4.5 generates from those frames
-  if (liveModel && liveModel !== 'dlssg') args.push('--backend', liveModel);
+  // Intel XeSS-FG rides the fsrfg backend with its own bridge (--xess-fg)
+  if (liveModel === 'xefg') args.push('--backend', 'fsrfg', '--xess-fg');
+  else if (liveModel && liveModel !== 'dlssg') args.push('--backend', liveModel);
   // user-facing name + substitution note for the exe's loading message/HUD (the raw
   // backend id read as the wrong model when live substitutes, e.g. Smooth Motion -> GMFSS)
   if (liveLabel) args.push('--label', liveLabel);
@@ -998,6 +1001,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   else if (liveFsrUp) args.push('--fsr-upscale');
   else if (liveA4kUp) args.push('--anime4k');
   else if (liveAcnUp) args.push('--artcnn');
+  else if (liveXessUp) args.push('--xess-upscale');
   // Restore: Real-ESRGAN first on every presented frame; costs most
   // of a 1080p frame budget, the panel hint says so
   if (liveRestore) args.push('--restore', ...restoreModelArgs(liveRestoreModel));
@@ -1184,6 +1188,7 @@ ipcMain.on(
       fsrup?: boolean;
       anime4k?: boolean;
       artcnn?: boolean;
+      xess?: boolean;
       uph?: number;
       restore?: boolean;
       restoreModel?: string; // Restore's model id ('animejanai' / 'anime4k'; none = Real-ESRGAN)
@@ -1216,6 +1221,7 @@ ipcMain.on(
     liveFsrUp = !!opts.fsrup;
     liveA4kUp = !!opts.anime4k;
     liveAcnUp = !!opts.artcnn;
+    liveXessUp = !!opts.xess;
     liveUpH = opts.uph ?? 0;
     liveRestore = !!opts.restore;
     liveRestoreModel = opts.restoreModel ?? '';
@@ -1441,8 +1447,14 @@ const findDvBin = (root: string, name: string): string | null => findFilesNamed(
 
 // One-click install of a pinned release zip: download into a temp dir (progress to the renderer as
 // `channel`), check the zip's SHA256 before anything is extracted (a replaced asset installs nothing),
-// extract it with bsdtar and copy `bin` into destDir. The temp dir is removed again.
-async function installPinnedZip(dl: PinnedZip, bin: string, destDir: string, channel: string): Promise<InstallResult> {
+// extract it with bsdtar and copy each wanted file into destDir: `files` = [name in the zip, name in
+// destDir] pairs, all found before any is copied. The temp dir is removed again.
+async function installPinnedZip(
+  dl: PinnedZip,
+  files: Array<[string, string]>,
+  destDir: string,
+  channel: string,
+): Promise<InstallResult> {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'smv-tool-'));
   const zip = path.join(tmp, 'tool.zip');
   const progress = (received: number, total: number, stage: string) => {
@@ -1468,17 +1480,21 @@ async function installPinnedZip(dl: PinnedZip, bin: string, destDir: string, cha
     if (zh !== dl.zipSha256)
       return { ok: false, error: `checksum mismatch (${zh.slice(0, 12)}...), nothing installed`, copied: [] };
     execFileSync(SYS_TAR, ['-xf', zip, '-C', tmp]);
-    const found = findDvBin(tmp, bin);
-    if (!found) return { ok: false, error: bin + ' not in the downloaded zip, nothing installed', copied: [] };
+    const found = files.map(([member]) => findDvBin(tmp, member));
+    const missing = files.filter((_, k) => !found[k]).map(([member]) => member);
+    if (missing.length)
+      return { ok: false, error: missing.join(', ') + ' not in the downloaded zip, nothing installed', copied: [] };
     fs.mkdirSync(destDir, { recursive: true });
-    const dest = path.join(destDir, bin);
-    try {
-      if (fileExists(dest)) fs.chmodSync(dest, 0o666);
-    } catch {
-      /* best effort */
-    }
-    fs.copyFileSync(found, dest);
-    return { ok: true, copied: [bin] };
+    files.forEach(([, name], k) => {
+      const dest = path.join(destDir, name);
+      try {
+        if (fileExists(dest)) fs.chmodSync(dest, 0o666);
+      } catch {
+        /* best effort */
+      }
+      fs.copyFileSync(found[k] as string, dest);
+    });
+    return { ok: true, copied: files.map(([, name]) => name) };
   } catch (e) {
     return { ok: false, error: String(e), copied: [] };
   } finally {
@@ -1501,7 +1517,7 @@ ipcMain.handle('dv-open-download', () => {
   return true;
 });
 
-ipcMain.handle('dv-download', () => installPinnedZip(DOVI_DL, DOVI_BIN, DV_DIR, 'dv-progress'));
+ipcMain.handle('dv-download', () => installPinnedZip(DOVI_DL, [[DOVI_BIN, DOVI_BIN]], DV_DIR, 'dv-progress'));
 
 ipcMain.handle('hp-ready', () => {
   const ready = fileExists(path.join(HP_DIR, HP_BIN));
@@ -1513,7 +1529,43 @@ ipcMain.handle('hp-open-download', () => {
   return true;
 });
 
-ipcMain.handle('hp-download', () => installPinnedZip(HP_DL, HP_BIN, HP_DIR, 'hp-progress'));
+ipcMain.handle('hp-download', () => installPinnedZip(HP_DL, [[HP_BIN, HP_BIN]], HP_DIR, 'hp-progress'));
+
+// --- Intel XeSS: readiness + one-click install ----------------------------------------------------
+// XeSS-SR runs through the bundled engine/xess/smv_xess_bridge.dll and Intel's libxess.dll, which is not
+// bundled: one click downloads Intel's pinned XeSS SDK release zip (github.com/intel/xess), checks its
+// SHA256 (the GitHub API digest) before anything is extracted, and copies libxess.dll (XeSS-SR),
+// libxess_fg.dll + libxell.dll (XeSS frame generation and its required XeLL) and Intel's licence into
+// engine/xess, unmodified (the licence allows redistribution without modification). "Ready" = libxess.dll
+// present (XeSS-SR); "fg" = libxess_fg.dll + libxell.dll present (XeSS-FG through the bundled
+// smv_xefg_bridge.dll). Bump version, url, page, hash and size together.
+const XESS_DIR = path.join(ENGINE, 'xess');
+const XESS_DL: PinnedZip = {
+  version: '3.0.2',
+  url: 'https://github.com/intel/xess/releases/download/v3.0.2/XeSS_SDK_3.0.2.zip',
+  page: 'https://github.com/intel/xess/releases/tag/v3.0.2',
+  zipSha256: '88b8a373f30e33f3558a77a93e634f11b8132fc3047ea1a8edeead32b8471990',
+  zipBytes: 76839749,
+};
+const XESS_FILES: Array<[string, string]> = [
+  ['libxess.dll', 'libxess.dll'],
+  ['libxess_fg.dll', 'libxess_fg.dll'],
+  ['libxell.dll', 'libxell.dll'],
+  ['LICENSE.txt', 'XeSS_LICENSE.txt'],
+];
+
+ipcMain.handle('xess-ready', () => {
+  const ready = fileExists(path.join(XESS_DIR, 'libxess.dll'));
+  const fg = ['libxess_fg.dll', 'libxell.dll'].every((f) => fileExists(path.join(XESS_DIR, f)));
+  return { ready, fg, dir: XESS_DIR, ver: XESS_DL.version, mb: toolMb(XESS_DL) };
+});
+
+ipcMain.handle('xess-open-download', () => {
+  shell.openExternal(XESS_DL.page);
+  return true;
+});
+
+ipcMain.handle('xess-download', () => installPinnedZip(XESS_DL, XESS_FILES, XESS_DIR, 'xess-progress'));
 
 let current: ChildProcess | null = null;
 let currentOut: string | null = null; // output path of the in-flight run, for .part cleanup on Cancel
@@ -1615,6 +1667,7 @@ type RunOpts = {
   fsrup?: boolean;
   anime4k?: boolean;
   artcnn?: boolean;
+  xess?: boolean;
   rtxhdr?: boolean;
   dv?: boolean;
   dvprofile?: string; // Dolby Vision 8.1 (HDR10 base, the default) or 8.4 (HLG base)
@@ -1652,6 +1705,7 @@ function engineArgs(opts: RunOpts): string[] {
     if (opts.model === 'dlssg') args.push('--dlssg'); // "DLSS 4.5" (Frame Generation) backend instead of GMFSS
     if (opts.model === 'fruc') args.push('--fruc'); // "NVIDIA Smooth Motion" backend instead of GMFSS
     if (opts.model === 'fsrfg') args.push('--fsrfg'); // AMD FSR frame generation (our bundled bridge)
+    if (opts.model === 'xefg') args.push('--xess-fg'); // Intel XeSS-FG (our bridge + Intel's downloaded DLLs)
     if (opts.model === 'nvof') args.push('--nvof'); // NVIDIA Optical Flow: hardware flow + splat, native host only
     if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
   }
@@ -1695,6 +1749,7 @@ function engineArgs(opts: RunOpts): string[] {
   else if (opts.fsrup) args.push('--fsr-upscale');
   else if (opts.anime4k) args.push('--anime4k');
   else if (opts.artcnn) args.push('--artcnn');
+  else if (opts.xess) args.push('--xess-upscale');
   // "Fit to the GPU" off: no video memory fit (the batch stays as planned, slower when memory runs short)
   if (opts.nogpufit) args.push('--no-gpu-fit');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
@@ -1921,6 +1976,7 @@ type PreviewOpts = {
   fsrup?: boolean;
   anime4k?: boolean;
   artcnn?: boolean;
+  xess?: boolean;
   restore?: boolean;
   restoreModel?: string; // Restore's model id ('animejanai' / 'anime4k'; none = Real-ESRGAN)
   dlssmode?: string; // the DLSS mode (dlssScaleArg)
@@ -1958,6 +2014,7 @@ function previewArgv(opts: PreviewOpts, prefix: string): string[] {
   else if (opts.fsrup) args.push('--fsr-upscale');
   else if (opts.anime4k) args.push('--anime4k');
   else if (opts.artcnn) args.push('--artcnn');
+  else if (opts.xess) args.push('--xess-upscale');
   if (opts.hdr)
     args.push(
       '--rtx-hdr',

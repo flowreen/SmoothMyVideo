@@ -7,6 +7,11 @@
     "types": ["node"],
     "strict": false,
     "noImplicitAny": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "allowUnreachableCode": false,
     "noEmit": true,
     "erasableSyntaxOnly": true,
     "skipLibCheck": true

@@ -5473,8 +5473,12 @@ struct NativeRife
     // a Vulkan timeline semaphore: the stream copies in, signals an odd value, the bridge's queue waits, generates,
     // signals the next even value, the stream waits for it and copies out. Instance 0 is fed every real frame in order
     // (FSR is built for one continuous stream); level L of a pair's tree on instance L - 1, as FRUC's. frLastKey 0 =
-    // never fed (its first call resets).
+    // never fed (its first call resets). Intel XeSS-FG (--xess-fg) runs on this route through its own bridge (fgKind 1:
+    // smv_xefg_bridge.dll with Intel's libxess_fg.dll + libxell.dll in engine\xess): D3D12 textures and a D3D12 fence
+    // instead of the Vulkan exports, the same calls.
     bool fsrfg = false;
+    int fgKind =
+        0; // the bridge on this route: 0 = AMD FSR 4 (smv_fsrfg_bridge.dll), 1 = Intel XeSS-FG (smv_xefg_bridge.dll)
     struct FgInst
     {
         cudaExternalMemory_t emIn = nullptr, emMv = nullptr, emOut = nullptr;
@@ -5552,6 +5556,8 @@ struct NativeRife
     bool fsrUp = false;
     bool fuHdr = false; // live HDR planes: the bridge in its HDR mode (linear light; off with RTX HDR before the model)
     std::string fsrUpDir;
+    int fuKind =
+        0; // the bridge on this route: 0 = AMD FSR (smv_fsrup_bridge.dll), 1 = Intel XeSS-SR (smv_xess_bridge.dll)
     cudaExternalMemory_t fuEmIn = nullptr, fuEmMv = nullptr, fuEmOut = nullptr;
     uint8_t* dFuIn = nullptr;
     uint8_t* dFuMv = nullptr;
@@ -6151,10 +6157,12 @@ static bool fileExistsA(const std::string& p)
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static bool lkXefgDir(const std::string& engDir, std::string& dir, const char* tag); // Intel XeSS-FG's folder, below
+
 // the server backends this host runs (PipeServer::nativeRefusal asks here): rife, echo (the
 // effects-only route, the no-engine mode above), gmfss (its chain on the host's kernels), nvof (the NVIDIA
-// Optical Flow model), fruc (Nvidia Smooth Motion), fsrfg (AMD FSR frame generation) and rifedrba
-// (RIFE with DRBA timing). Any other name is refused.
+// Optical Flow model), fruc (Nvidia Smooth Motion), fsrfg (AMD FSR frame generation; Intel XeSS-FG with --xess-fg)
+// and rifedrba (RIFE with DRBA timing). Any other name is refused.
 static bool nativeBackendOk(const std::wstring& backend)
 {
     return backend == L"rife" || backend == L"echo" || backend == L"gmfss" || backend == L"nvof" ||
@@ -6534,14 +6542,23 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
         if (backend == "fsrfg")
         {
             // AMD FSR frame generation: our bridge folder (SMV_FSRFG_DIR, else engine\fsrfg), no /64 pad (FSR and the
-            // Optical Flow engine take any size from 32x32)
-            std::string gdir = lkEnv("SMV_FSRFG_DIR");
-            if (gdir.empty())
-                gdir = engDir + "\\fsrfg";
-            if (!lkFile(gdir + "\\smv_fsrfg_bridge.dll"))
+            // Optical Flow engine take any size from 32x32); --xess-fg: Intel XeSS-FG's folder (lkXefgDir)
+            std::string gdir;
+            if (g_xessFg)
             {
-                LOG("native: AMD FSR frame generation needs smv_fsrfg_bridge.dll in %s\n", gdir.c_str());
-                return false;
+                if (!lkXefgDir(engDir, gdir, "native"))
+                    return false;
+            }
+            else
+            {
+                gdir = lkEnv("SMV_FSRFG_DIR");
+                if (gdir.empty())
+                    gdir = engDir + "\\fsrfg";
+                if (!lkFile(gdir + "\\smv_fsrfg_bridge.dll"))
+                {
+                    LOG("native: AMD FSR frame generation needs smv_fsrfg_bridge.dll in %s\n", gdir.c_str());
+                    return false;
+                }
             }
             lines.push_back("NATIVE-PATH cache=" + cacheDir);
             lines.push_back("NATIVE-PATH fsrfg=" + gdir);
@@ -7865,18 +7882,37 @@ static bool lkOfflineFruc(const std::wstring& script, std::string& dir)
     return true;
 }
 
-// offline AMD FSR frame generation: the bridge folder the live handoff names (SMV_FSRFG_DIR, else engine\fsrfg)
-static bool lkOfflineFsrfg(const std::wstring& script, std::string& dir)
+// Intel XeSS-FG's folder (SMV_XESS_DIR, else engDir\xess) holds the bridge and Intel's two DLLs (the app's XeSS setup
+// installs them); tag names the route in the refusal line
+static bool lkXefgDir(const std::string& engDir, std::string& dir, const char* tag)
 {
+    dir = lkEnv("SMV_XESS_DIR");
+    if (dir.empty())
+        dir = engDir + "\\xess";
+    for (const char* f : {"smv_xefg_bridge.dll", "libxess_fg.dll", "libxell.dll"})
+        if (!lkFile(dir + "\\" + f))
+        {
+            LOG("%s: Intel XeSS frame generation unavailable (smv_xefg_bridge.dll and Intel's libxess_fg.dll + "
+                "libxell.dll needed in %s; the app's XeSS setup installs them)\n",
+                tag, dir.c_str());
+            return false;
+        }
+    return true;
+}
+
+// offline AMD FSR frame generation (kind 0): the bridge folder the live handoff names (SMV_FSRFG_DIR, else
+// engine\fsrfg); Intel XeSS-FG (kind 1): lkXefgDir's
+static bool lkOfflineFsrfg(const std::wstring& script, std::string& dir, int kind)
+{
+    std::wstring eng = script.substr(0, script.find_last_of(L"\\/"));
+    for (auto& c : eng)
+        if (c == L'/')
+            c = L'\\';
+    if (kind == 1)
+        return lkXefgDir(wideToUtf8(eng), dir, "offline");
     dir = lkEnv("SMV_FSRFG_DIR");
     if (dir.empty())
-    {
-        std::wstring eng = script.substr(0, script.find_last_of(L"\\/"));
-        for (auto& c : eng)
-            if (c == L'/')
-                c = L'\\';
         dir = wideToUtf8(eng) + "\\fsrfg";
-    }
     if (!lkFile(dir + "\\smv_fsrfg_bridge.dll"))
     {
         LOG("offline: AMD FSR frame generation needs smv_fsrfg_bridge.dll in %s\n", dir.c_str());
@@ -7911,10 +7947,11 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
     // size, DLSS mode or share and HDR mode) gets the previous answer without a lookup,
     // as long as the engine files still exist (the user may empty the cache folder by hand);
     // live Restore rides in the key: its engine path is a fact of a restore session only; DLSS 5 too: it raises a
-    // small working size (liveWorkSizeFor)
+    // small working size (liveWorkSizeFor); --xess-fg too: its bridge folder is a fact of an fsrfg session
     wchar_t key[1024];
-    swprintf_s(key, L"%s|%s|%.2f|%d|%u|%u|%u|%u|%d|%d|%d|%d", script.c_str(), backend.c_str(), g_flowScale, g_dlssMode,
-               W, H, capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0, g_restoreA4k ? 1 : 0, g_dlssnr ? 1 : 0);
+    swprintf_s(key, L"%s|%s|%.2f|%d|%u|%u|%u|%u|%d|%d|%d|%d|%d", script.c_str(), backend.c_str(), g_flowScale,
+               g_dlssMode, W, H, capW, capH, g_hdr ? 1 : 0, g_restore ? 1 : 0, g_restoreA4k ? 1 : 0, g_dlssnr ? 1 : 0,
+               g_xessFg ? 1 : 0);
     bool factsOk = g_resident && g_res.haveFacts && g_res.handoffKey == key;
     if (factsOk)
     {
@@ -7935,6 +7972,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         nr.nvof = f.nvof;
         nr.fruc = f.fruc;
         nr.fsrfg = f.fsrfg;
+        nr.fgKind = f.fgKind;
         nr.frucDir = f.frucDir;
         nr.drba = f.drba;
         nr.gmfss = f.gmfss;
@@ -8106,6 +8144,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         LOG("native: fsrfg handoff named no cache or bridge folder\n");
         return false;
     }
+    nr.fgKind = nr.fsrfg && g_xessFg ? 1 : 0; // the folder above is XeSS-FG's then (nativeLocalHandoff)
     nr.fruc = nr.fruc || nr.fsrfg;
     // GMFSS: the half-frame grid and the cache folder for the kernel cubins (no engine, no jit path)
     nr.gmfss = all.find(" engine=gmfss") != std::string::npos;
@@ -8170,6 +8209,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         f.nvof = nr.nvof;
         f.fruc = nr.fruc;
         f.fsrfg = nr.fsrfg;
+        f.fgKind = nr.fgKind;
         f.frucDir = nr.frucDir;
         f.drba = nr.drba;
         f.gmfss = nr.gmfss;
@@ -9711,7 +9751,7 @@ static bool nativeRtxInit(NativeRife& nr)
         nr.vsrPost = nr.dw > nr.w && nr.dh > nr.h && !nr.rtxHdr;
         if (nr.vsrWant && nr.rtxHdr && nr.dw > nr.w && nr.dh > nr.h)
             LOG("native: %s takes SDR only and RTX HDR runs before the model: the resize after it is Lanczos\n",
-                nr.fsrUp   ? "AMD FSR upscaling"
+                nr.fsrUp   ? (nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling")
                 : nr.a4kUp ? "Anime4K"
                 : nr.acnUp ? "ArtCNN"
                            : "RTX VSR");
@@ -9728,7 +9768,10 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     if (nr.vsrWant)
     {
-        const char* up = nr.fsrUp ? "AMD FSR upscaling" : nr.a4kUp ? "Anime4K" : nr.acnUp ? "ArtCNN" : "RTX VSR";
+        const char* up = nr.fsrUp   ? (nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling")
+                         : nr.a4kUp ? "Anime4K"
+                         : nr.acnUp ? "ArtCNN"
+                                    : "RTX VSR";
         if (g_offline && !nr.nvPre && nr.rtxHdr)
             LOG("native: %s skipped (it takes SDR only, and the one resize follows RTX HDR and the model), Lanczos\n",
                 up);
@@ -11450,13 +11493,16 @@ static void nativeFrucFree(NativeRife& nr)
     nr.frSdrOn = nr.frPairSdr = false;
 }
 
-// ---- AMD FSR frame generation (fsrfg) ----------------------------------------------------------
-// smv_fsrfg_bridge.dll's C API (source: engine\fsrfg\build_src), loaded once per process by full path from the folder
-// the handoff named; up to 16 instances, each its own FSR context on vkd3d-proton's device for the CUDA device's
-// adapter
+// ---- AMD FSR / Intel XeSS frame generation (fsrfg) ----------------------------------------------
+// One C API, two bridges (fgKind): smv_fsrfg_bridge.dll (source engine\fsrfg\build_src, exports fsrfg_*; SMV_FSRFG_DIR,
+// else engine\fsrfg) and smv_xefg_bridge.dll (source engine\xess\build_src, exports xefg_*; SMV_XESS_DIR, else
+// engine\xess, Intel's libxess_fg.dll + libxell.dll beside it). Each loads once per process by full path from the folder
+// the handoff named; up to 16 instances, each its own context: FSR's on vkd3d-proton's device, XeSS-FG's on the
+// adapter's D3D12 device (with its own swap chain and parked window), both for the CUDA device's adapter
 struct FsrfgShared
 {
-    HANDLE in, mv, out, fence;           // three textures (Vulkan opaque Win32 exports) and a timeline semaphore
+    HANDLE in, mv, out, fence;           // three textures and a fence: Vulkan opaque Win32 exports and a timeline
+                                         // semaphore (FSR), D3D12 resources and a D3D12 fence (XeSS-FG)
     uint64_t inBytes, mvBytes, outBytes; // the textures' allocation sizes
     uint32_t rowPitch, mvRowPitch;       // the linear rows a caller keeps its frames / vectors in
 };
@@ -11470,52 +11516,61 @@ struct FsrfgBridge
     int (*frameI)(int, uint64_t, uint64_t, int, double) = nullptr;
     void (*destroy)() = nullptr;
     int (*devices)() = nullptr; // 1 = an own vkd3d device for every instance (optional; an older bridge has none)
+    // XeSS-FG's counters of instance i: calls, calls with no frame presented, presents with no call, frames out
+    int (*stats)(int, uint64_t*, uint64_t*, uint64_t*, uint64_t*) = nullptr; // optional (the XeSS-FG bridge's)
 };
-static FsrfgBridge g_fsrfg;
+static FsrfgBridge g_fsrfgK[2];
+static const char* const kFgDll[2] = {"smv_fsrfg_bridge.dll", "smv_xefg_bridge.dll"};
+static const char* const kFgPrefix[2] = {"fsrfg_", "xefg_"};
 
-// the bridge, its vkd3d-proton shader cache in cacheDir\fsr4_shaders (the model cache: users may delete it); its
-// instances share vkd3d's one device (SMV_FSRFG_DEVICE=own = an own device each, ~235 MiB + ~0.3 s an instance)
-static bool nativeFsrfgLoad(const std::string& dir, const std::string& cacheDir)
+// the bridge of this kind; FSR's vkd3d-proton shader cache in cacheDir\fsr4_shaders (the model cache: users may delete
+// it); FSR's instances share vkd3d's one device (SMV_FSRFG_DEVICE=own = an own device each, ~235 MiB + ~0.3 s an
+// instance)
+static bool nativeFsrfgLoad(const std::string& dir, const std::string& cacheDir, int kind)
 {
-    if (g_fsrfg.mod)
+    FsrfgBridge& b = g_fsrfgK[kind];
+    if (b.mod)
         return true;
-    const std::wstring p = utf8ToWide(dir) + L"\\smv_fsrfg_bridge.dll";
+    const std::wstring p = utf8ToWide(dir) + L"\\" + utf8ToWide(kFgDll[kind]);
     HMODULE m = LoadLibraryExW(p.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!m)
     {
-        LOG("native: fsrfg: smv_fsrfg_bridge.dll did not load from %s (err %lu)\n", dir.c_str(), GetLastError());
+        LOG("native: fsrfg: %s did not load from %s (err %lu)\n", kFgDll[kind], dir.c_str(), GetLastError());
         return false;
     }
-    g_fsrfg.lastError = (const char* (*)())GetProcAddress(m, "fsrfg_last_error");
-    g_fsrfg.setCacheDir = (void (*)(const char*))GetProcAddress(m, "fsrfg_set_cache_dir");
-    g_fsrfg.provider = (const char* (*)())GetProcAddress(m, "fsrfg_provider");
-    g_fsrfg.createI =
-        (int (*)(int, uint32_t, uint32_t, uint32_t, int32_t, int, FsrfgShared*))GetProcAddress(m, "fsrfg_create_i");
-    g_fsrfg.frameI = (int (*)(int, uint64_t, uint64_t, int, double))GetProcAddress(m, "fsrfg_frame_i");
-    g_fsrfg.destroy = (void (*)())GetProcAddress(m, "fsrfg_destroy");
-    g_fsrfg.devices = (int (*)())GetProcAddress(m, "fsrfg_devices");
-    if (!g_fsrfg.lastError || !g_fsrfg.setCacheDir || !g_fsrfg.provider || !g_fsrfg.createI || !g_fsrfg.frameI ||
-        !g_fsrfg.destroy)
+    const std::string pre = kFgPrefix[kind];
+    auto fn = [&](const char* name) { return GetProcAddress(m, (pre + name).c_str()); };
+    b.lastError = (const char* (*)())fn("last_error");
+    b.setCacheDir = (void (*)(const char*))fn("set_cache_dir");
+    b.provider = (const char* (*)())fn("provider");
+    b.createI = (int (*)(int, uint32_t, uint32_t, uint32_t, int32_t, int, FsrfgShared*))fn("create_i");
+    b.frameI = (int (*)(int, uint64_t, uint64_t, int, double))fn("frame_i");
+    b.destroy = (void (*)())fn("destroy");
+    b.devices = (int (*)())fn("devices");
+    b.stats = (int (*)(int, uint64_t*, uint64_t*, uint64_t*, uint64_t*))fn("stats");
+    if (!b.lastError || !b.setCacheDir || !b.provider || !b.createI || !b.frameI || !b.destroy)
     {
-        LOG("native: fsrfg: smv_fsrfg_bridge.dll lacks an expected export\n");
+        LOG("native: fsrfg: %s lacks an expected export\n", kFgDll[kind]);
         FreeLibrary(m);
+        b = FsrfgBridge{};
         return false;
     }
     if (!cacheDir.empty())
-        g_fsrfg.setCacheDir((cacheDir + "\\fsr4_shaders").c_str());
-    g_fsrfg.mod = m;
+        b.setCacheDir((cacheDir + "\\fsr4_shaders").c_str());
+    b.mod = m;
     return true;
 }
 
-// FSR instance i at w x h (RGBA16F) with its shared textures (as CUDA arrays) and fence imported into this CUDA context
+// instance i at w x h (RGBA16F) with its shared textures (as CUDA arrays) and fence imported into this CUDA context
 static bool nativeFsrfgCreate(NativeRife& nr, int i)
 {
     NativeRife::FgInst& g = nr.fg[i];
     FsrfgShared sh{};
-    const int rc = g_fsrfg.createI(i, (uint32_t)nr.w, (uint32_t)nr.h, nr.fgLuid.LowPart, nr.fgLuid.HighPart, 1, &sh);
+    const FsrfgBridge& br = g_fsrfgK[nr.fgKind];
+    const int rc = br.createI(i, (uint32_t)nr.w, (uint32_t)nr.h, nr.fgLuid.LowPart, nr.fgLuid.HighPart, 1, &sh);
     if (rc != 0)
     {
-        LOG("native: fsrfg: instance %d at %dx%d not created: %s (rc %d)\n", i, nr.w, nr.h, g_fsrfg.lastError(), rc);
+        LOG("native: fsrfg: instance %d at %dx%d not created: %s (rc %d)\n", i, nr.w, nr.h, br.lastError(), rc);
         return false;
     }
     g.made = true;
@@ -11528,10 +11583,11 @@ static bool nativeFsrfgCreate(NativeRife& nr, int i)
     nr.fgPitch = (int)sh.rowPitch;
     nr.fgMvPitch = (int)sh.mvRowPitch;
     const int w = nr.w, h = nr.h;
-    auto imp = [w, h](HANDLE hd, uint64_t bytes, const cudaChannelFormatDesc& fd, cudaExternalMemory_t& em,
-                      cudaMipmappedArray_t& mm, cudaArray_t& a) {
+    const bool d3d = nr.fgKind == 1;
+    auto imp = [w, h, d3d](HANDLE hd, uint64_t bytes, const cudaChannelFormatDesc& fd, cudaExternalMemory_t& em,
+                           cudaMipmappedArray_t& mm, cudaArray_t& a) {
         cudaExternalMemoryHandleDesc md{};
-        md.type = cudaExternalMemoryHandleTypeOpaqueWin32;
+        md.type = d3d ? cudaExternalMemoryHandleTypeD3D12Resource : cudaExternalMemoryHandleTypeOpaqueWin32;
         md.size = bytes;
         md.flags = cudaExternalMemoryDedicated;
         md.handle.win32.handle = hd;
@@ -11551,7 +11607,7 @@ static bool nativeFsrfgCreate(NativeRife& nr, int i)
     const cudaChannelFormatDesc rgba = cudaCreateChannelDesc(16, 16, 16, 16, cudaChannelFormatKindFloat);
     const cudaChannelFormatDesc rg = cudaCreateChannelDesc(16, 16, 0, 0, cudaChannelFormatKindFloat);
     cudaExternalSemaphoreHandleDesc sd{};
-    sd.type = cudaExternalSemaphoreHandleTypeTimelineSemaphoreWin32;
+    sd.type = d3d ? cudaExternalSemaphoreHandleTypeD3D12Fence : cudaExternalSemaphoreHandleTypeTimelineSemaphoreWin32;
     sd.handle.win32.handle = sh.fence;
     if (!imp(sh.in, sh.inBytes, rgba, g.emIn, g.mmIn, g.in) || !imp(sh.mv, sh.mvBytes, rg, g.emMv, g.mmMv, g.mv) ||
         !imp(sh.out, sh.outBytes, rgba, g.emOut, g.mmOut, g.out) ||
@@ -11933,13 +11989,15 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
     }
     const uint64_t ready = g.val, done = ++g.val;
     const int64_t c0 = nr.fgProf ? nowQpc100() : 0;
-    // the frame time does not change FSR 4's output (a 24 and a 60 fps run byte for byte the same): one 60 Hz frame
-    const int rc = g_fsrfg.frameI(i, ready, done, reset ? 1 : 0, 1000.0 / 60.0);
+    // the frame time changes neither FSR 4's output (a 24 and a 60 fps run byte for byte the same) nor XeSS-FG's (33 and
+    // 0 ms the same): one 60 Hz frame
+    const FsrfgBridge& br = g_fsrfgK[nr.fgKind];
+    const int rc = br.frameI(i, ready, done, reset ? 1 : 0, 1000.0 / 60.0);
     if (nr.fgProf)
         nr.fgCpuMs += (double)(nowQpc100() - c0) / 10000.0;
     if (rc != 0)
     {
-        LOG("native: fsrfg: instance %d call failed: %s (rc %d)\n", i, g_fsrfg.lastError(), rc);
+        LOG("native: fsrfg: instance %d call failed: %s (rc %d)\n", i, br.lastError(), rc);
         nr.die("fsrfg call failed");
         return false;
     }
@@ -12236,7 +12294,7 @@ static void nativeFsrfgChainFree(NativeRife& nr)
 
 static bool nativeFsrfgSetup(NativeRife& nr)
 {
-    if (!nativeFsrfgLoad(nr.frucDir, nr.cachePath))
+    if (!nativeFsrfgLoad(nr.frucDir, nr.cachePath, nr.fgKind))
         return false;
     int dev = 0;
     cudaDeviceProp prop{};
@@ -12325,9 +12383,14 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     nr.frNodeCalls = nr.frTweens = nr.frPrimed = nr.frRepeats = 0;
     for (bool& ok : nr.frNodeOk)
         ok = false;
-    LOG("native: fsrfg session %dx%d, AMD FSR %s frame generation (ML) through smv_fsrfg_bridge.dll on vkd3d-proton, RGBA16F, NVIDIA optical flow vectors (grid %d, %s; level-2+ calls %s), recursive midpoints (depth cap %d)\n",
-        nr.w, nr.h, g_fsrfg.provider(), nr.fgOf.grid, nativeOfLevelName(nr.fgOf.level),
-        fsrfgDeriveOn(nr) ? "derived from level 1" : "a pass a call", nr.frMpCap);
+    if (nr.fgKind == 1)
+        LOG("native: fsrfg session %dx%d, Intel %s frame generation through smv_xefg_bridge.dll on D3D12, RGBA16F, NVIDIA optical flow vectors (grid %d, %s; level-2+ calls %s), recursive midpoints (depth cap %d)\n",
+            nr.w, nr.h, g_fsrfgK[1].provider(), nr.fgOf.grid, nativeOfLevelName(nr.fgOf.level),
+            fsrfgDeriveOn(nr) ? "derived from level 1" : "a pass a call", nr.frMpCap);
+    else
+        LOG("native: fsrfg session %dx%d, AMD FSR %s frame generation (ML) through smv_fsrfg_bridge.dll on vkd3d-proton, RGBA16F, NVIDIA optical flow vectors (grid %d, %s; level-2+ calls %s), recursive midpoints (depth cap %d)\n",
+            nr.w, nr.h, g_fsrfgK[0].provider(), nr.fgOf.grid, nativeOfLevelName(nr.fgOf.level),
+            fsrfgDeriveOn(nr) ? "derived from level 1" : "a pass a call", nr.frMpCap);
     if (nr.encPost)
         LOG("native: fsrfg: HDR planes: %s\n",
             nr.frSdrOn ? "frame pairs inside the SDR range go to FSR as their SDR view, any other pair as the HDR codes"
@@ -12684,6 +12747,17 @@ static void nativeFsrfgRelease(NativeRife& nr)
             (unsigned long long)nr.frTweens, (unsigned long long)nr.frNodeCalls, (unsigned long long)nr.frPrimed,
             nr.frPipeGroups ? (", " + std::to_string(nr.frPipeGroups) + " groups pipelined").c_str() : "", nr.frInst,
             nr.frInst > 1 ? "s" : "");
+    // XeSS-FG's own counts per instance: a call with no frame presented keeps the previous output (none expected after
+    // a sequence's first call)
+    if (nr.fgKind == 1 && g_fsrfgK[1].stats)
+        for (int i = 0; i < nr.frInst && i < (int)(sizeof(nr.fg) / sizeof(nr.fg[0])); i++)
+        {
+            uint64_t c = 0, nf = 0, ex = 0, cap = 0;
+            if (nr.fg[i].made && g_fsrfgK[1].stats(i, &c, &nf, &ex, &cap) == 0)
+                LOG("native: fsrfg: XeSS-FG instance %d: %llu calls, %llu frames out, %llu calls without a frame, %llu "
+                    "presents without a call\n",
+                    i, (unsigned long long)c, (unsigned long long)cap, (unsigned long long)nf, (unsigned long long)ex);
+        }
     if (nr.fgProfN)
     {
         const double n = (double)nr.fgProfN, nv = nr.fgProfVecN ? (double)nr.fgProfVecN : 1.0,
@@ -12726,8 +12800,8 @@ static void nativeFsrfgRelease(NativeRife& nr)
         any = any || g.made;
         g = NativeRife::FgInst{};
     }
-    if (any && g_fsrfg.destroy)
-        g_fsrfg.destroy(); // every instance
+    if (any && g_fsrfgK[nr.fgKind].destroy)
+        g_fsrfgK[nr.fgKind].destroy(); // every instance
     if (nr.dFgMv)
     {
         cudaFree(nr.dFgMv);
@@ -12746,9 +12820,11 @@ static void nativeFsrfgRelease(NativeRife& nr)
     nr.frInst = 1;
 }
 
-// ---- AMD FSR upscaling (fsrUp) -------------------------------------------------------------------
-// smv_fsrup_bridge.dll's C API (source: engine\fsrup\build_src), loaded once per process by full path from the folder
-// the config named (SMV_FSRUP_DIR, else engine\fsrup), AMD's signed loader + upscaler beside it
+// ---- AMD FSR / Intel XeSS-SR upscaling (fsrUp) ---------------------------------------------------
+// One C API, two bridges (fuKind): smv_fsrup_bridge.dll (source engine\fsrup\build_src, exports fsrup_*; SMV_FSRUP_DIR,
+// else engine\fsrup, AMD's signed loader + upscaler beside it) and smv_xess_bridge.dll (source engine\xess\build_src,
+// exports xessup_*; SMV_XESS_DIR, else engine\xess, Intel's libxess.dll beside it). Each loads once per process by full
+// path from its folder
 struct FsrupShared
 {
     HANDLE in, mv, out, fence;
@@ -12764,31 +12840,37 @@ struct FsrupBridge
     int (*frame)(uint64_t, uint64_t, int, double) = nullptr;
     void (*destroy)() = nullptr;
 };
-static FsrupBridge g_fsrup;
+static FsrupBridge g_fsrupK[2];
+static const char* const kFuDll[2] = {"smv_fsrup_bridge.dll", "smv_xess_bridge.dll"};
+static const char* const kFuPrefix[2] = {"fsrup_", "xessup_"};
+static const char* const kFuName[2] = {"AMD FSR", "Intel"};
 
-static bool nativeFsrupLoad(const std::string& dir)
+static bool nativeFsrupLoad(const std::string& dir, int kind)
 {
-    if (g_fsrup.mod)
+    FsrupBridge& b = g_fsrupK[kind];
+    if (b.mod)
         return true;
-    const std::wstring p = utf8ToWide(dir) + L"\\smv_fsrup_bridge.dll";
+    const std::wstring p = utf8ToWide(dir) + L"\\" + utf8ToWide(kFuDll[kind]);
     HMODULE m = LoadLibraryExW(p.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!m)
     {
-        LOG("native: fsr upscale: smv_fsrup_bridge.dll did not load from %s (err %lu)\n", dir.c_str(), GetLastError());
+        LOG("native: upscale bridge: %s did not load from %s (err %lu)\n", kFuDll[kind], dir.c_str(), GetLastError());
         return false;
     }
-    g_fsrup.lastError = (const char* (*)())GetProcAddress(m, "fsrup_last_error");
-    g_fsrup.create = (int (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char*, int,
-                              FsrupShared*))GetProcAddress(m, "fsrup_create");
-    g_fsrup.frame = (int (*)(uint64_t, uint64_t, int, double))GetProcAddress(m, "fsrup_frame");
-    g_fsrup.destroy = (void (*)())GetProcAddress(m, "fsrup_destroy");
-    if (!g_fsrup.lastError || !g_fsrup.create || !g_fsrup.frame || !g_fsrup.destroy)
+    const std::string pre = kFuPrefix[kind];
+    b.lastError = (const char* (*)())GetProcAddress(m, (pre + "last_error").c_str());
+    b.create = (int (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int32_t, const char*, int,
+                        FsrupShared*))GetProcAddress(m, (pre + "create").c_str());
+    b.frame = (int (*)(uint64_t, uint64_t, int, double))GetProcAddress(m, (pre + "frame").c_str());
+    b.destroy = (void (*)())GetProcAddress(m, (pre + "destroy").c_str());
+    if (!b.lastError || !b.create || !b.frame || !b.destroy)
     {
-        LOG("native: fsr upscale: smv_fsrup_bridge.dll lacks an expected export\n");
+        LOG("native: upscale bridge: %s lacks an expected export\n", kFuDll[kind]);
         FreeLibrary(m);
+        b = FsrupBridge{};
         return false;
     }
-    g_fsrup.mod = m;
+    b.mod = m;
     return true;
 }
 
@@ -12796,8 +12878,9 @@ static bool nativeFsrupLoad(const std::string& dir)
 // the vectors' Optical Flow session at the render size
 static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
 {
-    if (!nativeFsrupLoad(nr.fsrUpDir))
+    if (!nativeFsrupLoad(nr.fsrUpDir, nr.fuKind))
         return false;
+    FsrupBridge& br = g_fsrupK[nr.fuKind];
     int dev = 0;
     cudaDeviceProp prop{};
     if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
@@ -12809,11 +12892,11 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
     memcpy(&luid, prop.luid, sizeof(luid));
     FsrupShared sh{};
     // live HDR planes: the bridge's HDR mode (FP16 linear light in and out, k_fsrHdrIn / k_fsrHdrOut)
-    const int rc = g_fsrup.create((uint32_t)w, (uint32_t)h, (uint32_t)ow, (uint32_t)oh, luid.LowPart, luid.HighPart,
-                                  "4.", nr.fuHdr ? 1 : 0, &sh);
+    const int rc = br.create((uint32_t)w, (uint32_t)h, (uint32_t)ow, (uint32_t)oh, luid.LowPart, luid.HighPart, "4.",
+                             nr.fuHdr ? 1 : 0, &sh);
     if (rc != 0)
     {
-        LOG("native: fsr upscale: %dx%d -> %dx%d not created: %s (rc %d)\n", w, h, ow, oh, g_fsrup.lastError(), rc);
+        LOG("native: fsr upscale: %dx%d -> %dx%d not created: %s (rc %d)\n", w, h, ow, oh, br.lastError(), rc);
         return false;
     }
     nr.fuMade = true;
@@ -12861,10 +12944,9 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
     }
     if (!nativeOfVecSetup(nr, nr.fuOf, w, h, "fsr upscale"))
         return false;
-    LOG("native: upscale: AMD FSR %s %dx%d -> %dx%d through smv_fsrup_bridge.dll, NVIDIA optical flow vectors (grid "
-        "%d, %s)%s\n",
-        nr.fuVersion, w, h, ow, oh, nr.fuOf.grid, nativeOfLevelName(nr.fuOf.level),
-        nr.fuHdr ? ", on the HDR planes' linear light (the bridge's HDR mode)" : "");
+    LOG("native: upscale: %s %s %dx%d -> %dx%d through %s, NVIDIA optical flow vectors (grid %d, %s)%s\n",
+        kFuName[nr.fuKind], nr.fuVersion, w, h, ow, oh, kFuDll[nr.fuKind], nr.fuOf.grid,
+        nativeOfLevelName(nr.fuOf.level), nr.fuHdr ? ", on the HDR planes' linear light (the bridge's HDR mode)" : "");
     return true;
 }
 
@@ -12948,13 +13030,13 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     if (testHang && nr.fuN + 1 == (uint64_t)testHang)
         Sleep(kFsrCompileMs + 20000);
     // FSR 4.1.1 gives byte-identical frames at any frame time (measured, harness fsr4_int8_upscaler): one 60 Hz frame
-    const int rc = g_fsrup.frame(ready, done, first ? 1 : 0, 1000.0 / 60.0);
+    const int rc = g_fsrupK[nr.fuKind].frame(ready, done, first ? 1 : 0, 1000.0 / 60.0);
     if (first)
         InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + 10000);
     if (rc != 0)
     {
-        LOG("native: fsr upscale: frame %llu failed: %s (rc %d)\n", (unsigned long long)nr.fuN, g_fsrup.lastError(),
-            rc);
+        LOG("native: fsr upscale: frame %llu failed: %s (rc %d)\n", (unsigned long long)nr.fuN,
+            g_fsrupK[nr.fuKind].lastError(), rc);
         nr.die("fsr upscale failed");
         return false;
     }
@@ -13007,7 +13089,7 @@ static void nativeFsrupRelease(NativeRife& nr)
     if (nr.stream)
         cudaStreamSynchronize(nr.stream);
     if (nr.fuMade)
-        LOG("native: fsr upscale: %llu frames (AMD FSR %s)\n", (unsigned long long)nr.fuN, nr.fuVersion);
+        LOG("native: fsr upscale: %llu frames (%s %s)\n", (unsigned long long)nr.fuN, kFuName[nr.fuKind], nr.fuVersion);
     if (nr.fuProfN)
     {
         const double n = (double)nr.fuProfN, nv = nr.fuProfVecN ? (double)nr.fuProfVecN : 1.0;
@@ -13043,8 +13125,8 @@ static void nativeFsrupRelease(NativeRife& nr)
             cudaDestroyExternalMemory(*em);
             *em = nullptr;
         }
-    if (nr.fuMade && g_fsrup.destroy)
-        g_fsrup.destroy();
+    if (nr.fuMade && g_fsrupK[nr.fuKind].destroy)
+        g_fsrupK[nr.fuKind].destroy();
     nr.fuMade = false;
     nativeOfVecFree(nr.fuOf);
 }
@@ -18674,6 +18756,38 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
     {
         nr.vsrWant = true;
         nr.acnUp = true;
+    }
+    // Intel XeSS-SR (--xess-upscale) runs on AMD FSR upscaling's route through its own bridge (fuKind 1:
+    // smv_xess_bridge.dll with Intel's libxess.dll, which the app's XeSS setup installs into engine\xess); every other
+    // upscaler on the command line wins over it; SMV_FSRUP_HDR=0 turns the route off on HDR for both bridges
+    if (g_xessUp && (g_rtxVsr || nr.fsrUp || nr.a4kUp || nr.acnUp))
+        LOG("native: --xess-upscale ignored: %s holds the resize (the upscalers exclude each other)\n",
+            g_rtxVsr   ? "RTX VSR"
+            : nr.fsrUp ? "AMD FSR upscaling"
+            : nr.a4kUp ? "Anime4K"
+                       : "ArtCNN");
+    else if (g_xessUp && (g_hdr || srcHdr) && GetEnvironmentVariableW(L"SMV_FSRUP_HDR", fh, 8) && fh[0] == L'0')
+        LOG(g_hdr ? "native: Intel XeSS upscaling off on HDR planes (SMV_FSRUP_HDR=0), Lanczos\n"
+                  : "native: Intel XeSS upscaling off on HDR video (SMV_FSRUP_HDR=0), Lanczos\n");
+    else if (g_xessUp)
+    {
+        std::string dir = lkEnv("SMV_XESS_DIR");
+        if (dir.empty() && !g_nativeEngineDir.empty())
+            dir = wideToUtf8(g_nativeEngineDir) + "\\xess";
+        bool have = !dir.empty();
+        for (const char* f : {"smv_xess_bridge.dll", "libxess.dll"})
+            have = have && lkFile(dir + "\\" + f);
+        if (!have)
+            LOG("native: Intel XeSS upscaling unavailable (smv_xess_bridge.dll and Intel's libxess.dll needed in %s; the "
+                "app's XeSS setup installs them), Lanczos\n",
+                dir.c_str());
+        else
+        {
+            nr.vsrWant = true;
+            nr.fsrUp = true;
+            nr.fsrUpDir = dir;
+            nr.fuKind = 1;
+        }
     }
     if (!(g_hdr && g_rtxHdr))
         return true;
@@ -28407,7 +28521,7 @@ static uint64_t nativeLiveLateNeed(const NativeRife& nr, uint32_t slots)
             need += nr.fsrfg ? kFsrfgDeepBase[levels - 3] + kFsrfgDeepMp[levels - 3] * mp
                              : kFrucDeepBase[levels - 3] + kFrucDeepMp[levels - 3] * mp;
         // an own vkd3d device for every FSR 4 instance past the first (x4 = 2 instances, x2^L = L)
-        if (nr.fsrfg && g_fsrfg.devices && g_fsrfg.devices() == 1)
+        if (nr.fsrfg && g_fsrfgK[nr.fgKind].devices && g_fsrfgK[nr.fgKind].devices() == 1)
             need += ((std::max)(levels, (std::min)(2, nr.frInstMax)) - 1) * kFsrfgOwnDevice;
         // a pipelined group's second tree: the shown pair's nodes beside the new pair's (BGRA8, 4 bytes a pixel)
         if (nr.frMp && !nr.fsrfg)
@@ -30475,7 +30589,7 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
         nr.gmfss ? ", engine=gmfss" : "", nr.nvof ? ", engine=nvof" : "",
         nr.fruc ? (nr.fsrfg ? ", engine=fsrfg" : ", engine=fruc") : "", nr.drba ? ", engine=drba (lag 1)" : "",
         nr.rtxHdr ? ", rtxhdr=native" : "", nr.sharpen > 0.0f ? ", sharpen=native" : "",
-        nr.vsr ? (nr.fsrUp   ? ", fsrup=native"
+        nr.vsr ? (nr.fsrUp   ? (nr.fuKind ? ", xessup=native" : ", fsrup=native")
                   : nr.a4kUp ? ", anime4k=native"
                   : nr.acnUp ? ", artcnn=native"
                              : ", vsr=native")

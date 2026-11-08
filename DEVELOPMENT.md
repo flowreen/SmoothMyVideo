@@ -177,6 +177,9 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
   the recipe in `build_src/`; called by the host.
 * `engine/fsrup/`: the AMD FSR upscaling bridge (`smv_fsrup_bridge.dll`, ours) beside AMD's signed
   FidelityFX loader + upscaler DLLs (MIT), all committed and shipped; the recipe in `build_src/`.
+* `engine/xess/`: the Intel XeSS-SR and XeSS-FG bridges (`smv_xess_bridge.dll`, `smv_xefg_bridge.dll`, ours,
+  committed and shipped; the recipe in `build_src/`). Intel's `libxess.dll`, `libxess_fg.dll`, `libxell.dll` and `XeSS_LICENSE.txt` are NOT in the repo or
+  the release: the GUI's XeSS setup row downloads them (git-ignored, filtered out of the package).
 * `engine/dlssg/`: the DLSS 4.5 frame generation host (`dlssg2f.exe`, D3D12, Streamline runtime
   bundled), driven by the native host.
 * `engine/dlssnr/`: the DLSS 5 Neural Rendering pass (`--dlssnr`): the NR core around NGX feature
@@ -253,7 +256,7 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
   `%ProgramFiles%\7-Zip`, or `SMV_7Z` naming it). The staging folder is deleted after 7-Zip's
   own test reads every file back and finds the folder's file count and bytes. `extraResources` copies `engine/**` minus `runtime/**` and
   the other filtered paths, so no stray folders may sit under `engine` at build time.
-* `npm run lint`: Prettier writes `src/**/*.ts` and `scripts/*.ts`, then `tsc --noEmit` and
+* `npm run lint`: Prettier writes `src/**/*.ts`, `scripts/*.ts`, `renderer/app.ts` and `renderer/i18n/*.json`, then `tsc --noEmit` and
   `tsc -p tsconfig.scripts.json` (the build scripts) and `tsc -p tsconfig.renderer.json` (the
   renderer), then clang-format writes our own C++ (see Linting and formatting).
   Stops at the first failure.
@@ -268,8 +271,8 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 ```
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore | --restore-model ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
-  [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--dlssg] [--no-gpu-fit]
-  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k | --artcnn] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
+  [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--xess-fg] [--dlssg] [--no-gpu-fit]
+  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k | --artcnn | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
@@ -423,6 +426,13 @@ the CLI's default with no model flag stays GMFSS):
   CUDA refuses an export vkd3d-proton has itself opened through D3DKMT); FSR reads the frame and the
   vectors from them and writes the generated frame into them (no copies). HDR planes follow Smooth Motion's SDR-pair rule at fp16
   (`SMV_FSRFG_SDR_PAIRS=0` = every pair as the codes).
+* `--xess-fg` "Intel XeSS-FG": Intel's XeSS frame generation (XeSS-FG 1.3.1 with XeLL 1.3.2, XeSS SDK 3.0.2,
+  `libxess_fg.dll` + `libxell.dll` unmodified) on `--fsrfg`'s route through our `engine/xess/smv_xefg_bridge.dll`
+  (see "Intel XeSS-FG bridge"): the same instances, ladders, tree levels, pricing and HDR rule, x2 a call (on
+  non-Intel GPUs XeSS-FG makes one frame per present). Live: `--backend fsrfg --xess-fg`. Without Intel's two DLLs
+  (the app's XeSS setup not run): `Intel XeSS frame generation unavailable (...)` and the session refuses.
+  `SMV_XESS_DIR` points the host at another folder; `SMV_XEFG_BB=8` = RGBA8 swap chains instead of R10G10B10A2 (an
+  A/B lever).
 * SVP (`--svp` / `--svp-nvof`, live `svp` / `svpnvof`, svpflow from a local SVP 4 install in the
   runtime's VapourSynth) was REMOVED so the app no longer depends on SVP 4, SVP Manager
   or VapourSynth; `--nvof` is its replacement. To bring it back, revert the commit "remove the SVP
@@ -606,6 +616,12 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   go in as their SDR view like Anime4K's. A missing or other .pkl = `ArtCNN unavailable (...)` and Lanczos. A new
   upstream release: rebuild the .pkl from its C4F32_DN ONNX (the same keys, the five middle layers as fp16) and rerun
   the kernel and host gates.
+  `--xess-upscale` puts Intel XeSS-SR (2.0.2, XeSS SDK 3.0.2) in that same resize instead, on AMD FSR upscaling's
+  route (the same staging, HDR mode, Optical Flow vectors and 0.125 px gate, constant depth, no jitter) through our
+  `engine/xess/smv_xess_bridge.dll` and Intel's `libxess.dll` beside it (see "Intel XeSS-SR bridge"); every other
+  upscaler on the command line wins over it, with a line. The preset = the one whose input range holds the render
+  size with its optimal ratio nearest to the call's (Balanced at 2x). Without `libxess.dll` (the app's XeSS setup not
+  run): `Intel XeSS upscaling unavailable (...)` and Lanczos. `SMV_XESS_DIR` points the host at another folder.
 * `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame at the working size, after Restore and
   the resize, before the interpolation, DLAA (scaling
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
@@ -857,7 +873,7 @@ mean); a Reset on every evaluate made the pass a pure function of the frame (0 o
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k | --artcnn --upscale H --restore
+  --backend NAME [--xess-fg] --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k | --artcnn | --xess-upscale --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --nr-passes 1..20 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
@@ -2060,6 +2076,48 @@ and generate on the shared textures themselves (the output one is a UAV) and sig
 imports the textures as CUDA external memory (opaque Win32, dedicated) mapped as arrays and the fence as a
 timeline semaphore (stream signal odd, stream wait even). `SMV_FSRFG_SHIM_LOG=1` logs the shim's calls.
 
+### Intel XeSS-SR bridge (`smv_xess_bridge.dll`)
+
+Our C API over Intel's XeSS-SR (`libxess.dll`, unmodified), the AMD FSR upscaling bridge's API under the prefix
+`xessup_` (`xessup_create / _frame / _destroy / _last_error`, the same shared buffers, fence and HDR mode; the host
+picks the bridge per session, `fuKind`). In `engine/xess/build_src/`:
+
+```
+set XESS_SDK=C:\path\to\XeSS_SDK_3.0.2
+build.bat
+```
+
+It compiles `xess_bridge.cpp` against the SDK's `inc/` and `lib/libxess.lib` into `..\smv_xess_bridge.dll` (it
+imports `libxess.dll`, so the host loads it only when that DLL is there). Intel's files come from the app: main.ts
+`XESS_DL` pins the release zip (github.com/intel/xess, its version, URL, page, SHA256 and size; a bump changes all
+five and reruns the XeSS checks), and the setup row's one click downloads it, checks the hash before anything is
+extracted, and copies `bin/libxess.dll`, `bin/libxess_fg.dll`, `bin/libxell.dll` and `LICENSE.txt` (as
+`XeSS_LICENSE.txt`) into `engine/xess`. Intel's licence allows redistribution without modification; nothing of
+Intel's is modified or patched. On NVIDIA XeSS-SR runs Intel's cross-vendor DP4a path (Shader Model 6.4).
+
+### Intel XeSS-FG bridge (`smv_xefg_bridge.dll`)
+
+Our C API over Intel's XeSS-FG + XeLL (`libxess_fg.dll`, `libxell.dll`, unmodified), the AMD FSR frame generation
+bridge's API under the prefix `xefg_` (`xefg_create_i / _frame_i / _destroy_i / _destroy / _provider / _devices /
+_set_cache_dir / _last_error`, plus `xefg_stats`; the host picks the bridge per session, `fgKind`). The shared
+textures and fence are D3D12 objects the host imports as `cudaExternalMemoryHandleTypeD3D12Resource` /
+`cudaExternalSemaphoreHandleTypeD3D12Fence` (FSR's are Vulkan exports). `build.bat fg` in `engine/xess/build_src/`
+(with `XESS_SDK` set as above) compiles `xefg_bridge.cpp` against the SDK's `inc/` and `lib/libxess_fg.lib` +
+`lib/libxell.lib` into `..\smv_xefg_bridge.dll`; plain `build.bat` builds both XeSS bridges.
+
+XeSS-FG is a swap chain with no readback: the app presents real frames to its proxy swap chain and XeSS-FG presents
+the generated ones to a real swap chain it creates through the DXGI factory it is given. The bridge gives it a
+forwarding factory whose swap chain copies each presented back buffer into the shared output texture (on the queue
+XeSS-FG presents with), signals the host's fence and then presents. XeSS-FG runs with its debug feature
+`SHOW_ONLY_INTERPOLATION`, so every call after a sequence's first presents exactly one frame: the generated one (a
+failed interpolation presents the real frame instead). Each instance has its own context, XeLL context, swap chains
+and window: a no-activate popup parked on the primary monitor's last pixel, excluded from screen capture
+(`WDA_EXCLUDEFROMCAPTURE`), on its own message thread. XeSS-FG takes no FP16 back buffer, so the swap chains are
+R10G10B10A2 and one compute pass (HLSL compiled once by the system's `d3dcompiler_47.dll`) converts the host's RGBA16F
+frame on the way in and the generated frame back on the way out. Vectors are tagged `RV_ONLY_NOW` (XeSS-FG copies
+them at the tag), the constant depth `RV_UNTIL_NEXT_PRESENT`; identity matrices, no jitter. The frame time changes
+nothing (33 and 0 ms a frame gave the same bytes), and the output is the same run to run.
+
 ### AMD FSR upscaling bridge (`smv_fsrup_bridge.dll`)
 
 Our C API over AMD's signed FidelityFX loader + upscaler (FSR SDK v2.4.0, `Kits/FidelityFX/signedbin`, both in the
@@ -2273,18 +2331,23 @@ Rules (hard-won, do not regress):
 ## Linting and formatting
 
 Standard presets, applied by tools, so whoever edits (a person or an agent) never matches a house style
-by hand: run `npm run lint` after a change. The renderer's inline JS is not reformatted.
+by hand: run `npm run lint` after a change. One statement a line and every source under a formatter keep the
+code easy to search and to read in slices (for people and agents alike).
 * Prettier (`.prettierrc.json`: Prettier's defaults plus single quotes and printWidth 120) formats
-  `src/**/*.ts` and `scripts/*.ts` only; `.prettierignore` guards `engine/`, `renderer/` and build dirs.
-* `tsc --noEmit` with `strict` on is the TypeScript bug gate. ESLint was dropped when moving to
-  TypeScript 7 (typescript-eslint pinned the old compiler).
+  `src/**/*.ts`, `scripts/*.ts`, `renderer/app.ts` and the language files `renderer/i18n/*.json`;
+  `.prettierignore` guards `engine/`, build dirs, `renderer/app.js` (the build) and `renderer/index.html`
+  (whitespace-sensitive markup, formatted by hand).
+* `tsc --noEmit` with `strict` on is the TypeScript bug gate. All three tsconfigs also refuse dead code:
+  `noUnusedLocals`, `noUnusedParameters`, `noImplicitReturns`, `noFallthroughCasesInSwitch` and
+  `allowUnreachableCode: false` (prefix a parameter a callback must take but never reads with `_`). ESLint was
+  dropped when moving to TypeScript 7 (typescript-eslint pinned the old compiler).
 * clang-format (`.clang-format`: Visual Studio's own `Microsoft` preset with `Type* p`; includes keep
   their order, string literals are never split and comments never re-wrapped, so a pass changes
   whitespace only) formats our own C++ through `scripts/clang-format.ts` (in place;
-  extra file arguments are formatted too): the native host (`engine/live/build_src`), the DLSS 5 core
-  and its caller shim (`engine/dlssnr/build_src`), the DLSS 4.5 host's `main.cpp` and the FRUC bridge.
-  Left as they are: the vendored NVIDIA headers (`nvofa`, `cuda_shim`), the RTX Video SDK bridge
-  sources and `sl_focus_shim.h`. It uses the clang-format that ships with Visual Studio 2026 (the
+  extra file arguments are formatted too): every `.cpp`, `.h` and `.inl` directly in an `engine/*/build_src`
+  folder (the native host, the DLSS 5 core and shim, the DLSS 4.5 host and every bridge), so a new bridge needs
+  no list edit. Left as they are: the vendored NVIDIA headers (`nvofa`, `cuda_shim`), the RTX Video SDK bridge
+  sources (`engine/rtxvideo`) and `sl_focus_shim.h`. It uses the clang-format that ships with Visual Studio 2026 (the
   "C++ Clang tools for Windows" component, found through vswhere); `CLANG_FORMAT` overrides it.
 * `node scripts/cpp-check.ts analyze` / `w4`: MSVC `/analyze` and warning level 4 over the native
   host's build line (compile only, into a temporary folder; the SDK headers external), with the

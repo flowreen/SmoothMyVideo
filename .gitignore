@@ -38,6 +38,11 @@ engine/gpu_runtime/
 /model_cache_safe_to_delete/
 engine/dvtools/
 engine/hptools/
+engine/xess/build_src/work/
+engine/xess/libxess.dll
+engine/xess/libxess_fg.dll
+engine/xess/libxell.dll
+engine/xess/XeSS_LICENSE.txt
 
 # samples: everything is local test material except the two small committed clips
 # (test.mp4 = the 24fps test/CI clip, example.mp4 = the first-page example preview, shipped)

@@ -1,8 +1,10 @@
-# Only src/**/*.ts and scripts/*.ts are formatted (the "lint" script). Everything below is intentionally
-# hand-formatted or generated and must never be reflowed by a stray `prettier .`:
+# The "lint" script formats src/**/*.ts, scripts/*.ts, renderer/app.ts and renderer/i18n/*.json. Everything below is
+# hand-formatted or generated and must never be reflowed by a stray `prettier .`: index.html's markup is whitespace
+# sensitive (a reflow can move inline text), app.js is the build of app.ts.
 node_modules
 dist
 release
 engine
-renderer
+renderer/index.html
+renderer/app.js
 package-lock.json

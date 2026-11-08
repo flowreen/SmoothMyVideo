@@ -115,6 +115,7 @@ picture, without adding frames. Hover a row in the app to see its exact version.
 | **RIFE** (Practical-RIFE 4.25) | Live action, filmed content | Any RTX GPU | A strong all-round model. Its **DRBA** option (for anime) keeps characters moving at their drawn pace while camera pans get fully smooth; in Live it adds one frame of delay. |
 | **NVIDIA Optical Flow** | Slower PCs, fast renders, moderate motion | Any RTX GPU | Runs on a dedicated part of the GPU, so it is fast. Very fast motion turns into a soft double image instead of breaking up. Videos need a whole multiplier (2&times;, 3&times; ...). |
 | **AMD FSR 4** frame generation | A different AI look | Any RTX GPU | AMD's AI frame generation, running on NVIDIA GPUs. Fine edges can break up on fast anime motion, where GMFSS stays clean. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
+| **Intel XeSS-FG** frame generation | Filmed content, a different AI look | Any RTX GPU (Intel's files are downloaded on request) | Intel's AI frame generation from games, running on NVIDIA GPUs. In SMV's test on real footage its new frames came out as close to the real ones as RIFE's, closer than AMD FSR 4's and DLSS 4.5's. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
 | **NVIDIA Smooth Motion** | Legacy: a non-AI reference | Any RTX GPU | The same technology as the NVIDIA driver's Smooth Motion. The lowest quality of the models. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
 
 **Compare to**, in the preview, puts the model you ticked next to another one on the same moment of your video: the
@@ -133,9 +134,9 @@ These run before the new frames are made, in videos and in Live:
   HD (downloaded on request) or Anime4K's line restore (light, made for anime, keeps the frame's size). Off by
   default.
 * 📐 **Upscale**: makes the picture bigger and sharper with NVIDIA RTX Video Super Resolution (on by default), AMD
-  FSR 4.1, Anime4K or ArtCNN (both made for anime; each upscale pass doubles the picture, so 720p to 4K takes two
-  passes; with Restore set to Anime4K too, Anime4K makes its Mode A); with none ticked, a standard resize. They only run
-  when the picture is enlarged.
+  FSR 4.1, Intel XeSS (Intel's files are downloaded on request), Anime4K or ArtCNN (both made for anime; each upscale
+  pass doubles the picture, so 720p to 4K takes two passes; with Restore set to Anime4K too, Anime4K makes its Mode
+  A); with none ticked, a standard resize. They only run when the picture is enlarged.
 * 🧠 **NVIDIA DLSS 5** (optional): NVIDIA's Neural Rendering, an AI picture enhancement on every original frame.
   [Details](#nvidia-dlss-5).
 * ✏️ **Sharpen**: bacondither's Adaptive Sharpen, strength 0 to 2 (on at 1.00 by default).
@@ -211,10 +212,11 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
 * **Stop:** press the hotkey again, or click **Stop**. The hotkey is reserved system-wide while the app runs.
 * **Display:** **Whole screen** (the default) smooths the whole monitor the active window is on, everything on it, and
   works with every model including DLSS 4.5. **Original size** smooths only the window. **Fill screen** fills its
-  monitor with the window (aspect kept), upscaled with RTX VSR, AMD FSR 4.1, Anime4K or ArtCNN when ticked.
+  monitor with the window (aspect kept), upscaled with RTX VSR, AMD FSR 4.1, Intel XeSS, Anime4K or ArtCNN when
+  ticked.
 * **Adaptive:** with GMFSS, RIFE or NVIDIA Optical Flow the output holds your fps target whatever the source does (a
-  game dropping from 30 to 10 fps still plays at the same smooth rate). AMD FSR 4 and Smooth Motion double the frame
-  rate per pass, so they pick the doubling that reaches your target (60 fps from 24 shows 96). DLSS 4.5 makes extra
+  game dropping from 30 to 10 fps still plays at the same smooth rate). AMD FSR 4, Intel XeSS-FG and Smooth Motion
+  double the frame rate per pass, so they pick the doubling that reaches your target (60 fps from 24 shows 96). DLSS 4.5 makes extra
   frames and keeps an even share of them (60 fps from 24 = 5&times;, every 2nd frame).
 * **Fit to the GPU** (on by default) lowers the frame rate to what your GPU can keep up with, never below the source,
   with every effect kept. Unticked, a target the GPU can't reach makes it skip frames.

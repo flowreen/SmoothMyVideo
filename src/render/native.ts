@@ -374,13 +374,14 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const NO_INTERP = args.no_interp,
     FRUC_MODE = args.fruc,
     FSRFG_MODE = args.fsrfg,
+    XEFG_MODE = args.xess_fg,
     DLSSG_MODE = args.dlssg;
   const RIFE_MODE = args.rife || args.rife_drba,
     DRBA_MODE = args.rife_drba;
   const NVOF_MODE = args.nvof;
-  if ([FRUC_MODE, FSRFG_MODE, DLSSG_MODE, RIFE_MODE, NVOF_MODE].filter(Boolean).length > 1) {
+  if ([FRUC_MODE, FSRFG_MODE, XEFG_MODE, DLSSG_MODE, RIFE_MODE, NVOF_MODE].filter(Boolean).length > 1) {
     throw new RenderExit(
-      '--fruc, --fsrfg, --dlssg, --rife/--rife-drba and --nvof are ' +
+      '--fruc, --fsrfg, --xess-fg, --dlssg, --rife/--rife-drba and --nvof are ' +
         'mutually exclusive interpolation backends; pick one',
     );
   }
@@ -392,6 +393,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const FSR_UP = args.fsr_upscale && !RTX_VSR;
   const A4K_UP = args.anime4k && !RTX_VSR && !FSR_UP;
   const ACN_UP = args.artcnn && !RTX_VSR && !FSR_UP && !A4K_UP;
+  const XESS_UP = args.xess_upscale && !RTX_VSR && !FSR_UP && !A4K_UP && !ACN_UP;
   let RTX_HDR = args.rtx_hdr;
   const DV_EXPORT = args.dv,
     HP_EXPORT = args.hdr10plus,
@@ -520,9 +522,11 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
             ? 'fruc'
             : FSRFG_MODE
               ? 'fsrfg'
-              : DLSSG_MODE
-                ? 'dlssg'
-                : 'rife';
+              : XEFG_MODE
+                ? 'xefg'
+                : DLSSG_MODE
+                  ? 'dlssg'
+                  : 'rife';
   // W x H = the decode, WORK = the DLSS mode x the output (DLSS 5 and the model)
   const plan = workPlan(ST, W, H, UPSCALE_F, args.work_scale, !!args.dlssnr, kind === 'dlssg');
   if (typeof plan === 'string') throw new RenderExit(plan);
@@ -551,6 +555,14 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     const fgdir = env.SMV_FSRFG_DIR || path.join(ENGINE, 'fsrfg');
     if (!isFile(path.join(fgdir, 'smv_fsrfg_bridge.dll')))
       throw new RenderExit(`AMD FSR frame generation unavailable: smv_fsrfg_bridge.dll not found in ${fgdir}`);
+  } else if (kind === 'xefg') {
+    const xdir = env.SMV_XESS_DIR || path.join(ENGINE, 'xess');
+    const miss = ['smv_xefg_bridge.dll', 'libxess_fg.dll', 'libxell.dll'].filter((d) => !isFile(path.join(xdir, d)));
+    if (miss.length)
+      throw new RenderExit(
+        `Intel XeSS frame generation unavailable: ${miss[0]} not found in ${xdir} ` +
+          "(the app's Intel XeSS setup installs Intel's files)",
+      );
   } else if (kind === 'dlssg') {
     const dgdir = env.SMV_DLSSG_DIR || path.join(ENGINE, 'dlssg');
     const miss = [
@@ -596,6 +608,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     say('no-interp mode: GMFSS interpolation disabled (re-encode at source fps with optional Adaptive Sharpen)\n');
   else if (FRUC_MODE) say('Using the NVIDIA Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n');
   else if (FSRFG_MODE) say('Using the AMD FSR frame generation backend for interpolation (FSR 4, native host)\n');
+  else if (XEFG_MODE) say('Using the Intel XeSS frame generation backend for interpolation (XeSS-FG, native host)\n');
   else if (DLSSG_MODE) say('Using the DLSS Frame Generation backend for interpolation (DLSS 4.5)\n');
   else if (NVOF_MODE) say('Using the NVIDIA Optical Flow backend for interpolation (native host)\n');
   else if (RIFE_MODE) say('Using the RIFE backend for interpolation (4.25, native host)\n');
@@ -873,6 +886,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (kind === 'drba') nargs.push('--drba');
   if (kind === 'fruc') nargs.push('--fruc');
   if (kind === 'fsrfg') nargs.push('--fsrfg');
+  if (kind === 'xefg') nargs.push('--xess-fg');
   if (kind === 'dlssg') nargs.push('--dlssg');
   if (FPS_MODE && !NO_INTERP) nargs.push('--fps-ratio', pyFloatRepr(ratio as number));
   // a cascade's first pass ends at the working size: its last pass makes the final resize, and RTX VSR / the FSR
@@ -886,6 +900,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       if (FSR_UP) nargs.push('--fsr-upscale');
       if (A4K_UP) nargs.push('--anime4k');
       if (ACN_UP) nargs.push('--artcnn');
+      if (XESS_UP) nargs.push('--xess-upscale');
     }
   }
   if (SHARPEN > 0) nargs.push('--sharpen', pyG(SHARPEN));
@@ -1001,6 +1016,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       if (FSR_UP) a.push('--fsr-upscale');
       if (A4K_UP) a.push('--anime4k');
       if (ACN_UP) a.push('--artcnn');
+      if (XESS_UP) a.push('--xess-upscale');
     }
     // PQ / HLG frames go to DLSS 4.5 as HDR10, as in the first pass
     if (SRC_HDR_IN) a.push('--src-hdr', String(tag(ST, 'color_transfer') || '') === 'arib-std-b67' ? 'hlg' : 'pq');
