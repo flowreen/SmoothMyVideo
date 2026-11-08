@@ -145,6 +145,9 @@
   "a4k.tip": "वर्ज़न: Anime4K 4.0.1, Upscale CNN x2 UL (उसका सबसे बड़ा मॉडल) अपने रिंगिंग-रोक क्लैंप (Clamp_Highlights) के साथ। हर पास में 2x बड़ा करता है, जितने पास आकार को चाहिए (2x से ऊपर दूसरा पास), फिर Lanczos आकार में फ़िट करता है। Restore: Anime4K के साथ टिक करने पर दोनों मिलकर Anime4K का Mode A हैं। SMV के फ़िडेलिटी टेस्ट (1.5x और 2x, चार क्लिप) में यह औसतन RTX VSR और AMD FSR से ज़्यादा पूरे आकार के ओरिजिनल के क़रीब रहा।",
   "a4k.name": "Anime4K",
   "a4k.hint": "(एनिमे के लिए बना CNN अपस्केलर, तब इस्तेमाल होता है जब <span class='vonly'>आकार सोर्स से बड़ा हो</span><span class='lonly'>स्क्रीन भरें या DLAA से नीचे का DLSS मोड तस्वीर बड़ी करे</span>)",
+  "acn.tip": "वर्ज़न: ArtCNN 1.6.2, C4F32_DN (उसका नॉइज़ घटाने वाला मॉडल) चमक पर, रंग Lanczos से। हर पास में 2x बड़ा करता है, जितने पास आकार को चाहिए (2x से ऊपर दूसरा पास), फिर Lanczos आकार में फ़िट करता है। SMV के एनिमे टेस्ट (2x, चार क्लिप) में यह औसतन पूरे आकार वाले मूल के सबसे करीब रहा, Anime4K, Lanczos, RTX VSR और AMD FSR से आगे।",
+  "acn.name": "ArtCNN",
+  "acn.hint": "(एनिमे पर ट्रेन किया गया CNN अपस्केलर, तब इस्तेमाल होता है जब <span class='vonly'>आकार सोर्स से बड़ा हो</span><span class='lonly'>स्क्रीन भरें या DLAA से नीचे का DLSS मोड तस्वीर बड़ी करे</span>)",
 
   "sharpen.k": "शार्पन",
   "sharpen.tip": "वर्ज़न: bacondither का Adaptive Sharpen, 2021-09-10 का DX11 टू-पास HQ वर्ज़न",
@@ -316,6 +319,7 @@
   "lv.fit.vsr": "RTX VSR अपस्केल",
   "lv.fit.fsr": "AMD FSR अपस्केल",
   "lv.fit.a4k": "Anime4K अपस्केल",
+  "lv.fit.acn": "ArtCNN अपस्केल",
   "lv.fit.up": "अपस्केल",
   "lv.fit.monitor": "विंडो वाले मॉनिटर पर सब कुछ स्मूथ करता है",
   "lv.stop": "रोकें",

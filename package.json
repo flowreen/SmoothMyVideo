@@ -53,6 +53,7 @@
           "GMFSS_Fortuna/train_log/fusionnet.pkl",
           "GMFSS_Fortuna/train_log/flownet.pkl",
           "rife/flownet.pkl",
+          "artcnn/artcnn_c4f32_dn_v1.6.2_fp16.pkl",
           "!runtime_*_bak/**",
           "!rtxvideo/nvngx_vsr.dll",
           "!rtxvideo/nvngx_truehdr.dll",

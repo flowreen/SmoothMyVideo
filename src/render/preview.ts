@@ -40,6 +40,7 @@ export interface PreviewArgs {
   vsr_quality: number; // --vsr-quality: RTX VSR's quality level 1..4, 4 = Ultra
   fsr_upscale: boolean;
   anime4k: boolean;
+  artcnn: boolean;
   dlssnr: boolean;
   nr_structure: number;
   nr_tone: number;
@@ -93,6 +94,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     vsr_quality: 4,
     fsr_upscale: false,
     anime4k: false,
+    artcnn: false,
     dlssnr: false,
     nr_structure: 1,
     nr_tone: 1,
@@ -124,6 +126,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--rtx-vsr': 'rtx_vsr',
     '--fsr-upscale': 'fsr_upscale',
     '--anime4k': 'anime4k',
+    '--artcnn': 'artcnn',
     '--dlssnr': 'dlssnr',
     '--nr-mask': 'nr_mask',
   };
@@ -720,6 +723,7 @@ function passFlags(
       if (s.needVsr) args.push('--rtx-vsr', ...vsrQuality(a));
       else if (a.fsr_upscale && o.outW > s.W && o.outH > s.H) args.push('--fsr-upscale');
       else if (a.anime4k && o.outW > s.W && o.outH > s.H) args.push('--anime4k');
+      else if (a.artcnn && o.outW > s.W && o.outH > s.H) args.push('--artcnn');
     }
   }
   if (s.strength > 0) args.push('--sharpen', pyG(s.strength));
@@ -1031,6 +1035,7 @@ export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         if (s.needVsr) st.push('--rtx-vsr', ...vsrQuality(a));
         else if (a.fsr_upscale && OW > WW && OH > WH) st.push('--fsr-upscale');
         else if (a.anime4k && OW > WW && OH > WH) st.push('--anime4k');
+        else if (a.artcnn && OW > WW && OH > WH) st.push('--artcnn');
       }
       if (s.srcHdr) st.push('--src-hdr', s.transfer === 'arib-std-b67' ? 'hlg' : 'pq');
       stages.push(st);

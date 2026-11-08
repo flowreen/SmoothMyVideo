@@ -145,6 +145,9 @@
   "a4k.tip": "版本：Anime4K 4.0.1，Upscale CNN x2 UL（其最大的模型），带去振铃钳制（Clamp_Highlights）。每遍放大 2 倍，按目标尺寸需要的遍数处理（超过 2 倍时第二遍），再用 Lanczos 缩放到目标尺寸。与 Restore: Anime4K 一起勾选，两者就是 Anime4K 的 Mode A。在 SMV 的保真度测试（1.5 倍和 2 倍，四段视频）中，它平均比 RTX VSR 和 AMD FSR 更接近完整尺寸的原图。",
   "a4k.name": "Anime4K",
   "a4k.hint": "（面向动画的 CNN 放大，在<span class='vonly'>尺寸大于源视频</span><span class='lonly'>填满屏幕或 DLSS 模式低于 DLAA 需要放大</span>时使用）",
+  "acn.tip": "版本：ArtCNN 1.6.2，C4F32_DN（其降噪模型）处理亮度，色彩用 Lanczos。每遍放大 2 倍，按目标尺寸需要的遍数处理（超过 2 倍时第二遍），再用 Lanczos 缩放到目标尺寸。在 SMV 的动画测试（2 倍，四段视频）中，它平均最接近完整尺寸的原图，领先 Anime4K、Lanczos、RTX VSR 和 AMD FSR。",
+  "acn.name": "ArtCNN",
+  "acn.hint": "（用动画训练的 CNN 放大，在<span class='vonly'>尺寸大于源视频</span><span class='lonly'>填满屏幕或 DLSS 模式低于 DLAA 需要放大</span>时使用）",
 
   "sharpen.k": "锐化",
   "sharpen.tip": "版本：bacondither 的 Adaptive Sharpen，DX11 双遍 HQ 版（2021-09-10）",
@@ -316,6 +319,7 @@
   "lv.fit.vsr": "RTX VSR 放大",
   "lv.fit.fsr": "AMD FSR 放大",
   "lv.fit.a4k": "Anime4K 放大",
+  "lv.fit.acn": "ArtCNN 放大",
   "lv.fit.up": "放大",
   "lv.fit.monitor": "让窗口所在显示器上的所有内容变顺滑",
   "lv.stop": "停止",

@@ -145,6 +145,9 @@
   "a4k.tip": "Versi: Anime4K 4.0.1, Upscale CNN x2 UL (model terbesarnya) dengan klem anti-ringing-nya (Clamp_Highlights). Memperbesar 2x per pass, sebanyak pass yang Ukuran butuhkan (di atas 2x, pass kedua), lalu Lanczos menyesuaikan Ukuran. Dicentang bersama Restore: Anime4K, keduanya adalah Mode A Anime4K. Dalam uji fidelitas SMV (1,5x dan 2x, empat klip) hasilnya rata-rata lebih dekat ke aslinya berukuran penuh daripada RTX VSR dan AMD FSR.",
   "a4k.name": "Anime4K",
   "a4k.hint": "(upscaler CNN khusus anime, dipakai saat <span class='vonly'>Ukuran lebih besar dari sumber</span><span class='lonly'>Penuhi layar atau mode DLSS di bawah DLAA memperbesar gambar</span>)",
+  "acn.tip": "Versi: ArtCNN 1.6.2, C4F32_DN (model peredam derau-nya) pada kecerahan, warnanya dari Lanczos. Memperbesar 2x per pass, sebanyak pass yang Ukuran butuhkan (di atas 2x, pass kedua), lalu Lanczos menyesuaikan Ukuran. Dalam uji anime SMV (2x, empat klip) hasilnya rata-rata paling dekat ke aslinya berukuran penuh, di depan Anime4K, Lanczos, RTX VSR dan AMD FSR.",
+  "acn.name": "ArtCNN",
+  "acn.hint": "(upscaler CNN yang dilatih dengan anime, dipakai saat <span class='vonly'>Ukuran lebih besar dari sumber</span><span class='lonly'>Penuhi layar atau mode DLSS di bawah DLAA memperbesar gambar</span>)",
 
   "sharpen.k": "Pertajam",
   "sharpen.tip": "Versi: Adaptive Sharpen oleh bacondither, versi HQ dua lintasan DX11 tanggal 2021-09-10",
@@ -316,6 +319,7 @@
   "lv.fit.vsr": "upscale RTX VSR",
   "lv.fit.fsr": "upscale AMD FSR",
   "lv.fit.a4k": "upscale Anime4K",
+  "lv.fit.acn": "upscale ArtCNN",
   "lv.fit.up": "upscale",
   "lv.fit.monitor": "menghaluskan semua yang ada di monitor tempat jendela berada",
   "lv.stop": "Berhenti",

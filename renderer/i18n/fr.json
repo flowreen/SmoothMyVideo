@@ -145,6 +145,9 @@
   "a4k.tip": "Version : Anime4K 4.0.1, Upscale CNN x2 UL (son plus grand modèle) avec sa limite anti-halo (Clamp_Highlights). Il agrandit 2x par passe, autant de passes que la Taille le demande (au-dessus de 2x, une seconde), puis Lanczos ajuste la Taille. Coché avec Restore : Anime4K, les deux forment le Mode A d'Anime4K. Dans le test de fidélité de SMV (1,5x et 2x, quatre extraits), il s'est approché en moyenne davantage de l'original en pleine taille que RTX VSR et AMD FSR.",
   "a4k.name": "Anime4K",
   "a4k.hint": "(un agrandisseur CNN conçu pour l'anime, utilisé quand <span class='vonly'>la Taille dépasse la source</span><span class='lonly'>Remplir l'écran ou un mode DLSS sous DLAA agrandit l'image</span>)",
+  "acn.tip": "Version : ArtCNN 1.6.2, C4F32_DN (son modèle débruiteur) sur la luminosité, la couleur par Lanczos. Il agrandit 2x par passe, autant de passes que la Taille le demande (au-dessus de 2x, une seconde), puis Lanczos ajuste la Taille. Dans le test anime de SMV (2x, quatre extraits), il s'est approché en moyenne le plus de l'original en pleine taille, devant Anime4K, Lanczos, RTX VSR et AMD FSR.",
+  "acn.name": "ArtCNN",
+  "acn.hint": "(un agrandisseur CNN entraîné sur l'anime, utilisé quand <span class='vonly'>la Taille dépasse la source</span><span class='lonly'>Remplir l'écran ou un mode DLSS sous DLAA agrandit l'image</span>)",
 
   "sharpen.k": "Netteté",
   "sharpen.tip": "Version : Adaptive Sharpen de bacondither, la version HQ en deux passes pour DX11 du 2021-09-10",
@@ -316,6 +319,7 @@
   "lv.fit.vsr": "mise à l'échelle RTX VSR",
   "lv.fit.fsr": "mise à l'échelle AMD FSR",
   "lv.fit.a4k": "mise à l'échelle Anime4K",
+  "lv.fit.acn": "mise à l'échelle ArtCNN",
   "lv.fit.up": "mise à l'échelle",
   "lv.fit.monitor": "fluidifie tout ce qui est sur le moniteur de la fenêtre",
   "lv.stop": "Arrêter",

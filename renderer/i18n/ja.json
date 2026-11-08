@@ -145,6 +145,9 @@
   "a4k.tip": "バージョン: Anime4K 4.0.1、Upscale CNN x2 UL (最大のモデル)、リンギング抑制クランプ (Clamp_Highlights) 付き。1 パスで 2 倍に拡大し、サイズに必要なだけパスを重ね (2 倍超では 2 パス目)、最後に Lanczos でサイズに合わせます。Restore: Anime4K と一緒にオンにすると、その 2 つが Anime4K の Mode A になります。SMV の忠実度テスト (1.5 倍と 2 倍、4 本のクリップ) では、平均して RTX VSR や AMD FSR より元のフルサイズ画像に近い結果でした。",
   "a4k.name": "Anime4K",
   "a4k.hint": "(アニメ向けの CNN アップスケーラー。<span class='vonly'>サイズが元より大きいとき</span><span class='lonly'>画面に合わせる、または DLAA 未満の DLSS モードで拡大するとき</span>に使われます)",
+  "acn.tip": "バージョン: ArtCNN 1.6.2、C4F32_DN (ノイズ除去モデル) を明るさに、色は Lanczos で。1 パスで 2 倍に拡大し、サイズに必要なだけパスを重ね (2 倍超では 2 パス目)、最後に Lanczos でサイズに合わせます。SMV のアニメテスト (2 倍、4 本のクリップ) では、平均して元のフルサイズ画像に最も近く、Anime4K、Lanczos、RTX VSR、AMD FSR を上回りました。",
+  "acn.name": "ArtCNN",
+  "acn.hint": "(アニメで学習した CNN アップスケーラー。<span class='vonly'>サイズが元より大きいとき</span><span class='lonly'>画面に合わせる、または DLAA 未満の DLSS モードで拡大するとき</span>に使われます)",
 
   "sharpen.k": "シャープ",
   "sharpen.tip": "バージョン: bacondither の Adaptive Sharpen、DX11 2 パス HQ 版 (2021-09-10)",
@@ -316,6 +319,7 @@
   "lv.fit.vsr": "RTX VSR でアップスケール",
   "lv.fit.fsr": "AMD FSR でアップスケール",
   "lv.fit.a4k": "Anime4K でアップスケール",
+  "lv.fit.acn": "ArtCNN でアップスケール",
   "lv.fit.up": "アップスケール",
   "lv.fit.monitor": "ウィンドウがあるモニター上のすべてをなめらかに",
   "lv.stop": "停止",

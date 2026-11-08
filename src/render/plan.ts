@@ -22,6 +22,7 @@ export interface RenderArgs {
   vsr_quality: number; // --vsr-quality: RTX VSR's quality level 1..4, 4 = Ultra
   fsr_upscale: boolean; // --fsr-upscale: AMD FSR 4 in RTX VSR's resize (the two exclude each other)
   anime4k: boolean; // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (RTX VSR and AMD FSR 4 win over it)
+  artcnn: boolean; // --artcnn: ArtCNN C4F32_DN's x2 in RTX VSR's resize (RTX VSR, AMD FSR 4 and Anime4K win over it)
   rtx_hdr: boolean;
   restore: boolean;
   restore_model: string | null; // --restore-model: Restore's model file (AnimeJaNai), null = Real-ESRGAN

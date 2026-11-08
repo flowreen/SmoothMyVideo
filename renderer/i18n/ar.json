@@ -145,6 +145,9 @@
   "a4k.tip": "الإصدار: Anime4K 4.0.1، Upscale CNN x2 UL (أكبر نماذجه) مع قاطع الهالات الخاص به (Clamp_Highlights). يكبّر 2x في كل تمريرة، بعدد التمريرات التي يحتاجها الحجم (فوق 2x تمريرة ثانية)، ثم يضبط Lanczos الحجم. عند تفعيله مع Restore: Anime4K يصبح الاثنان الوضع A من Anime4K. في اختبار الدقة في SMV (1.5x و2x، أربعة مقاطع) كان في المتوسط أقرب إلى الأصل كامل الحجم من RTX VSR وAMD FSR.",
   "a4k.name": "Anime4K",
   "a4k.hint": "(مكبّر CNN مصمم للأنمي، يُستخدم عندما <span class='vonly'>يكون الحجم أكبر من المصدر</span><span class='lonly'>يكبّر ملء الشاشة أو وضع DLSS أقل من DLAA</span>)",
+  "acn.tip": "الإصدار: ArtCNN 1.6.2، C4F32_DN (نموذجه المزيل للتشويش) على السطوع، واللون من Lanczos. يكبّر 2x في كل تمريرة، بعدد التمريرات التي يحتاجها الحجم (فوق 2x تمريرة ثانية)، ثم يضبط Lanczos الحجم. في اختبار الأنمي في SMV (2x، أربعة مقاطع) كان في المتوسط الأقرب إلى الأصل كامل الحجم، متقدمًا على Anime4K وLanczos وRTX VSR وAMD FSR.",
+  "acn.name": "ArtCNN",
+  "acn.hint": "(مكبّر CNN مدرَّب على الأنمي، يُستخدم عندما <span class='vonly'>يكون الحجم أكبر من المصدر</span><span class='lonly'>يكبّر ملء الشاشة أو وضع DLSS أقل من DLAA</span>)",
 
   "sharpen.k": "الحدة",
   "sharpen.tip": "الإصدار: Adaptive Sharpen من bacondither، نسخة DX11 الثنائية التمريرة HQ بتاريخ 2021-09-10",
@@ -316,6 +319,7 @@
   "lv.fit.vsr": "تكبير RTX VSR",
   "lv.fit.fsr": "تكبير AMD FSR",
   "lv.fit.a4k": "تكبير Anime4K",
+  "lv.fit.acn": "تكبير ArtCNN",
   "lv.fit.up": "تكبير",
   "lv.fit.monitor": "ينعّم كل ما على الشاشة التي عليها النافذة",
   "lv.stop": "إيقاف",

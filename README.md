@@ -133,9 +133,9 @@ These run before the new frames are made, in videos and in Live:
   HD (downloaded on request) or Anime4K's line restore (light, made for anime, keeps the frame's size). Off by
   default.
 * 📐 **Upscale**: makes the picture bigger and sharper with NVIDIA RTX Video Super Resolution (on by default), AMD
-  FSR 4.1 or Anime4K (made for anime; each upscale pass doubles the picture, so 720p to 4K takes two passes; with
-  Restore set to Anime4K too, they make Anime4K's Mode A); with none ticked, a standard resize. They only run when the picture
-  is enlarged.
+  FSR 4.1, Anime4K or ArtCNN (both made for anime; each upscale pass doubles the picture, so 720p to 4K takes two
+  passes; with Restore set to Anime4K too, Anime4K makes its Mode A); with none ticked, a standard resize. They only run
+  when the picture is enlarged.
 * 🧠 **NVIDIA DLSS 5** (optional): NVIDIA's Neural Rendering, an AI picture enhancement on every original frame.
   [Details](#nvidia-dlss-5).
 * ✏️ **Sharpen**: bacondither's Adaptive Sharpen, strength 0 to 2 (on at 1.00 by default).
@@ -211,7 +211,7 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
 * **Stop:** press the hotkey again, or click **Stop**. The hotkey is reserved system-wide while the app runs.
 * **Display:** **Whole screen** (the default) smooths the whole monitor the active window is on, everything on it, and
   works with every model including DLSS 4.5. **Original size** smooths only the window. **Fill screen** fills its
-  monitor with the window (aspect kept), upscaled with RTX VSR, AMD FSR 4.1 or Anime4K when ticked.
+  monitor with the window (aspect kept), upscaled with RTX VSR, AMD FSR 4.1, Anime4K or ArtCNN when ticked.
 * **Adaptive:** with GMFSS, RIFE or NVIDIA Optical Flow the output holds your fps target whatever the source does (a
   game dropping from 30 to 10 fps still plays at the same smooth rate). AMD FSR 4 and Smooth Motion double the frame
   rate per pass, so they pick the doubling that reaches your target (60 fps from 24 shows 96). DLSS 4.5 makes extra
@@ -277,7 +277,7 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
 ## Under the hood
 
 The UI is Electron + TypeScript. Every render and Live session runs in one native host (`smv-live.exe`, C++ on
-CUDA: GMFSS, RIFE, Restore and Anime4K run on its own CUDA kernels, their heavy layers on the Tensor Cores),
+CUDA: GMFSS, RIFE, Restore, Anime4K and ArtCNN run on its own CUDA kernels, their heavy layers on the Tensor Cores),
 driven by a TypeScript orchestrator that handles probing, encoding (ffmpeg) and resume;
 DLSS 4.5 file renders run NVIDIA's frame generation in a small separate helper. No Python ships. The default model on
 GPUs without DLSS 4.5, **GMFSS_Fortuna**, is a "union" interpolator: GMFlow optical flow, an IFNet/RIFE refiner, plus MetricNet, FeatureNet,

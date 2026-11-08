@@ -45,6 +45,30 @@ third-party work.
   > LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
   > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   > SOFTWARE.
+* **ArtCNN** (the ArtCNN upscaler): the weights of Artoriuz's C4F32_DN model from release v1.6.2
+  (github.com/Artoriuz/ArtCNN), in `engine/artcnn/artcnn_c4f32_dn_v1.6.2_fp16.pkl` (the release's ONNX weights, the
+  3 x 3 layers stored as fp16), run by the native host as CUDA kernels (`engine/live/build_src/smv-live-native.inl`,
+  `kAcnA` / `kAcnB`). MIT License:
+
+  > Copyright (c) 2024 João Chrisóstomo
+  >
+  > Permission is hereby granted, free of charge, to any person obtaining a copy
+  > of this software and associated documentation files (the "Software"), to deal
+  > in the Software without restriction, including without limitation the rights
+  > to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  > copies of the Software, and to permit persons to whom the Software is
+  > furnished to do so, subject to the following conditions:
+  >
+  > The above copyright notice and this permission notice shall be included in all
+  > copies or substantial portions of the Software.
+  >
+  > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  > IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  > FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  > AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  > LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  > SOFTWARE.
 * **Adaptive Sharpen** (the Sharpen pass): bacondither's DX11 two-pass HQ version (2021-09-10, from
   github.com/bacondither/Miscellaneous-shaders), ported to CUDA in the native host
   (`engine/live/build_src/smv-live-native.inl`, `k_sharpPlanar` / `k_sharpThdrIn`). BSD 2-Clause License:

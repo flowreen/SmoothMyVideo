@@ -2153,7 +2153,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // warm-up, a fallback) runs at the presented size on those enlarged frames
         g_presW = g_presH = 0;
         g_dlssgWorkFloor = false;
-        if (g_fgOver && !g_rtxVsr && !g_fsrUp && !g_a4kUp && g_upscaleH <= 0 && lkEnv("SMV_DLSSG_AT_WORK") != "0")
+        if (g_fgOver && !g_rtxVsr && !g_fsrUp && !g_a4kUp && !g_acnUp && g_upscaleH <= 0 &&
+            lkEnv("SMV_DLSSG_AT_WORK") != "0")
         {
             g_dlssgWorkFloor = true;
             int pw = 0, ph = 0, md = 0, mw = 0, mh = 0, raised = 0;

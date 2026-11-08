@@ -145,6 +145,9 @@
   "a4k.tip": "버전: Anime4K 4.0.1, Upscale CNN x2 UL(가장 큰 모델), 링잉 억제 클램프(Clamp_Highlights) 포함. 한 패스에 2배씩, 크기에 필요한 만큼 패스를 거친 뒤(2배 초과면 두 번째 패스) Lanczos로 크기에 맞춥니다. Restore: Anime4K와 함께 켜면 그 둘이 Anime4K의 Mode A입니다. SMV의 충실도 테스트(1.5배와 2배, 클립 4개)에서 평균적으로 RTX VSR과 AMD FSR보다 원본 전체 크기 이미지에 더 가까웠습니다.",
   "a4k.name": "Anime4K",
   "a4k.hint": "(애니메이션용 CNN 업스케일러. <span class='vonly'>크기가 원본보다 클 때</span><span class='lonly'>화면 채우기나 DLAA 미만의 DLSS 모드로 확대할 때</span> 사용됩니다)",
+  "acn.tip": "버전: ArtCNN 1.6.2, C4F32_DN(노이즈 제거 모델)을 밝기에, 색은 Lanczos로. 한 패스에 2배씩, 크기에 필요한 만큼 패스를 거친 뒤(2배 초과면 두 번째 패스) Lanczos로 크기에 맞춥니다. SMV의 애니메이션 테스트(2배, 클립 4개)에서 평균적으로 원본 전체 크기 이미지에 가장 가까웠고, Anime4K, Lanczos, RTX VSR, AMD FSR보다 앞섰습니다.",
+  "acn.name": "ArtCNN",
+  "acn.hint": "(애니메이션으로 학습한 CNN 업스케일러. <span class='vonly'>크기가 원본보다 클 때</span><span class='lonly'>화면 채우기나 DLAA 미만의 DLSS 모드로 확대할 때</span> 사용됩니다)",
 
   "sharpen.k": "샤프닝",
   "sharpen.tip": "버전: bacondither의 Adaptive Sharpen, DX11 2패스 HQ 버전(2021-09-10)",
@@ -316,6 +319,7 @@
   "lv.fit.vsr": "RTX VSR 업스케일",
   "lv.fit.fsr": "AMD FSR 업스케일",
   "lv.fit.a4k": "Anime4K 업스케일",
+  "lv.fit.acn": "ArtCNN 업스케일",
   "lv.fit.up": "업스케일",
   "lv.fit.monitor": "창이 있는 모니터의 모든 것을 부드럽게",
   "lv.stop": "중지",

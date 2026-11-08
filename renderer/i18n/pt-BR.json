@@ -145,6 +145,9 @@
   "a4k.tip": "Versão: Anime4K 4.0.1, Upscale CNN x2 UL (seu maior modelo) com seu limitador anti-halo (Clamp_Highlights). Amplia 2x por passada, tantas passadas quanto o Tamanho pedir (acima de 2x, uma segunda), e depois o Lanczos ajusta ao Tamanho. Marcado junto com Restore: Anime4K, os dois são o Modo A do Anime4K. No teste de fidelidade do SMV (1,5x e 2x, quatro clipes) ficou, em média, mais perto do original em tamanho cheio do que RTX VSR e AMD FSR.",
   "a4k.name": "Anime4K",
   "a4k.hint": "(um ampliador CNN feito para anime, usado quando <span class='vonly'>o Tamanho é maior que a origem</span><span class='lonly'>Preencher tela ou um modo DLSS abaixo de DLAA amplia a imagem</span>)",
+  "acn.tip": "Versão: ArtCNN 1.6.2, C4F32_DN (seu modelo com redução de ruído) no brilho, a cor pelo Lanczos. Amplia 2x por passada, tantas passadas quanto o Tamanho pedir (acima de 2x, uma segunda), e depois o Lanczos ajusta ao Tamanho. No teste de anime do SMV (2x, quatro clipes) ficou, em média, o mais perto do original em tamanho cheio, à frente de Anime4K, Lanczos, RTX VSR e AMD FSR.",
+  "acn.name": "ArtCNN",
+  "acn.hint": "(um ampliador CNN treinado com anime, usado quando <span class='vonly'>o Tamanho é maior que a origem</span><span class='lonly'>Preencher tela ou um modo DLSS abaixo de DLAA amplia a imagem</span>)",
 
   "sharpen.k": "Nitidez",
   "sharpen.tip": "Versão: Adaptive Sharpen de bacondither, a versão HQ de duas passagens para DX11 de 2021-09-10",
@@ -316,6 +319,7 @@
   "lv.fit.vsr": "ampliação com RTX VSR",
   "lv.fit.fsr": "ampliação com AMD FSR",
   "lv.fit.a4k": "ampliação com Anime4K",
+  "lv.fit.acn": "ampliação com ArtCNN",
   "lv.fit.up": "ampliação",
   "lv.fit.monitor": "suaviza tudo o que está no monitor da janela",
   "lv.stop": "Parar",

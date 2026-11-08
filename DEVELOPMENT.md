@@ -269,7 +269,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore | --restore-model ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--dlssg] [--no-gpu-fit]
-  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
+  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k | --artcnn] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
@@ -589,6 +589,23 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   Restore's Lanczos pair when the target differs, and the clamp above (when the resize is Anime4K too, the statistics
   are taken at Restore's input and the clamp waits for the resize's last pass: upstream's Mode A). The handoff names
   it `NATIVE-PATH restore=native:anime4k`; nothing to look up, so it is always available.
+  `--artcnn` puts ArtCNN's C4F32_DN (Artoriuz, v1.6.2, a luma doubler) in that same resize instead (RTX VSR, AMD FSR
+  and Anime4K win over it, with a line). Its weights = `engine/artcnn/artcnn_c4f32_dn_v1.6.2_fp16.pkl`, read with the
+  host's .pkl reader (`nativeAcnWeights`: every key of the C4 form with its shape, no other key): the release's ONNX
+  values with the five 32 -> 32 3 x 3 layers stored as fp16, exactly what the tensor cores take (the first and last
+  layers and every bias stay fp32), so the frames equal a run on the ONNX's fp32 file. The kernel text (`kAcnA` +
+  `kAcnB`, compiled once into its own module, `smv_artcnn_*.cubin`): conv0 (1 -> 32, fp32 sums, one pixel a thread),
+  conv1 .. conv4 + ReLU and conv5 + conv0's output on the tensor cores (4 x 32 pixel tiles, fp16 sums), conv6 (32 -> 4,
+  fp32 sums) with the DepthToSpace in its store and the clip. A pass takes the frame's BT.709 full-range luma (the
+  author's Inferencer matrix) through the net to 2w x 2h; the colour = the frame's Lanczos 2x in the author's YCbCr
+  with the net's luma, back to RGB the author's way (`k_acnMerge`). Passes as Anime4K's (the fewest x2 passes whose 2^n
+  reaches the ratio, at most four), then the one Lanczos fit unless the target is exactly 2^n. Video memory: whole
+  frames when the room holds the three activation buffers, else the largest square tile that fits (each tile read
+  with a 7-pixel halo, the net's conv count, so the tiles' cores are the whole frame's bits; the setup line names
+  `N-px tiles`); no room for one tile = one pass fewer, then Lanczos with `ArtCNN ran out of video memory`. HDR frames
+  go in as their SDR view like Anime4K's. A missing or other .pkl = `ArtCNN unavailable (...)` and Lanczos. A new
+  upstream release: rebuild the .pkl from its C4F32_DN ONNX (the same keys, the five middle layers as fp16) and rerun
+  the kernel and host gates.
 * `--dlssnr`: DLSS 5 Neural Rendering once per decoded frame at the working size, after Restore and
   the resize, before the interpolation, DLAA (scaling
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
@@ -840,7 +857,7 @@ mean); a Reset on every evaluate made the pass a pure function of the frame (0 o
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k --upscale H --restore
+  --backend NAME --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k | --artcnn --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --nr-passes 1..20 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title

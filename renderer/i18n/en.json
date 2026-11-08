@@ -145,6 +145,9 @@
   "a4k.tip": "Version: Anime4K 4.0.1, Upscale CNN x2 UL (the largest of its models) with its de-ringing clamp (Clamp_Highlights). It enlarges 2x per pass, as many passes as the Size needs (above 2x a second pass), then Lanczos fits the Size. Ticked together with Restore: Anime4K, the two are Anime4K's Mode A. In SMV's fidelity test (1.5x and 2x, four clips) it came closer on average to the full-size original than RTX VSR and AMD FSR.",
   "a4k.name": "Anime4K",
   "a4k.hint": "(a CNN upscaler made for anime, used when <span class='vonly'>the Size is above the source</span><span class='lonly'>Fill screen or a DLSS mode below DLAA enlarges</span>)",
+  "acn.tip": "Version: ArtCNN 1.6.2, C4F32_DN (its denoising model) on the brightness, the colour from Lanczos. It enlarges 2x per pass, as many passes as the Size needs (above 2x a second pass), then Lanczos fits the Size. In SMV's anime test (2x, four clips) it came closest on average to the full-size original, ahead of Anime4K, Lanczos, RTX VSR and AMD FSR.",
+  "acn.name": "ArtCNN",
+  "acn.hint": "(a CNN upscaler trained on anime, used when <span class='vonly'>the Size is above the source</span><span class='lonly'>Fill screen or a DLSS mode below DLAA enlarges</span>)",
 
   "sharpen.k": "Sharpen",
   "sharpen.tip": "Version: Adaptive Sharpen by bacondither, the DX11 two-pass HQ version of 2021-09-10",
@@ -317,6 +320,7 @@
   "lv.fit.vsr": "RTX VSR upscale",
   "lv.fit.fsr": "AMD FSR upscale",
   "lv.fit.a4k": "Anime4K upscale",
+  "lv.fit.acn": "ArtCNN upscale",
   "lv.fit.up": "upscale",
   "lv.fit.monitor": "smooths everything on the monitor the window is on",
   "lv.stop": "Stop",
