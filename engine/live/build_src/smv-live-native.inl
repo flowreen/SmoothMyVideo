@@ -13534,11 +13534,11 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     for (int k = 1; k < nr.fuPasses; k++)
     {
         NativeRife::FuPass& p = nr.fuX[k - 1];
-        int kw = nr.fuPw[k], kh = nr.fuPh[k], sp = nr.fuMvPitch, dp = p.mvPitch;
+        int kw = nr.fuPw[k], kh = nr.fuPh[k], mvSrcPitch = nr.fuMvPitch, dp = p.mvPitch;
         float kx = (float)kw / (float)w, ky = (float)kh / (float)h;
         const uint8_t* src = k == 1 ? nr.dFu0Out : nr.fuX[k - 2].dOut;
         const size_t srcPitch = (size_t)(k == 1 ? nr.fu0OutPitch : nr.fuX[k - 2].outPitch);
-        void* v[] = {&nr.dFuMv, &sp, &w, &h, &p.dMv, &dp, &kw, &kh, &kx, &ky};
+        void* v[] = {&nr.dFuMv, &mvSrcPitch, &w, &h, &p.dMv, &dp, &kw, &kh, &kx, &ky};
         const bool vecOk = first || zeroVec
                                ? cudaMemset2DAsync(p.dMv, p.mvPitch, 0, (size_t)kw * 4, kh, st) == cudaSuccess
                                : cuLaunchKernel(nr.fFuMvScale, (kw + 15) / 16, (kh + 15) / 16, 1, 16, 16, 1, 0,
