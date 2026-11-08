@@ -8,10 +8,10 @@
     "node": ">=24"
   },
   "scripts": {
-    "start": "tsc && tsc -p tsconfig.renderer.json && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && electron .",
+    "start": "tsc && tsc -p renderer && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && electron .",
     "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.ts && node scripts/stage-gpu-runtime.ts && npm start",
-    "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && tsc -p tsconfig.renderer.json && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && node scripts/stage-gpu-runtime.ts --required && electron-builder && node scripts/pack-zip.ts",
-    "lint": "prettier --write \"src/**/*.ts\" \"scripts/*.ts\" renderer/app.ts \"renderer/i18n/*.json\" && tsc --noEmit && tsc -p tsconfig.scripts.json && tsc -p tsconfig.renderer.json && node scripts/clang-format.ts",
+    "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && tsc -p renderer && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && node scripts/stage-gpu-runtime.ts --required && electron-builder && node scripts/pack-zip.ts",
+    "lint": "prettier --write \"src/**/*.ts\" \"scripts/*.ts\" renderer/app.ts \"renderer/i18n/*.json\" && tsc --noEmit && tsc -p scripts && tsc -p renderer && node scripts/clang-format.ts",
     "postinstall": "node scripts/dev-icon.ts"
   },
   "devDependencies": {
@@ -23,6 +23,14 @@
     "typescript": "^7.0.2"
   },
   "private": true,
+  "prettier": {
+    "printWidth": 120,
+    "singleQuote": true,
+    "semi": true,
+    "tabWidth": 2,
+    "trailingComma": "all",
+    "arrowParens": "always"
+  },
   "build": {
     "appId": "com.smoothmyvideo.app",
     "productName": "SmoothMyVideo",
@@ -33,8 +41,9 @@
       "dist/**/*",
       "renderer/**/*",
       "!renderer/app.ts",
-      "icon.ico",
-      "icon.png"
+      "!renderer/tsconfig.json",
+      "assets/icon.ico",
+      "assets/icon.png"
     ],
     "extraResources": [
       {
@@ -69,17 +78,21 @@
           "!xess/libxess.dll",
           "!xess/libxess_fg.dll",
           "!xess/libxell.dll",
-          "!xess/XeSS_LICENSE.txt"
+          "!xess/XeSS_LICENSE.txt",
+          "!.clang-format"
         ]
       }
     ],
     "extraFiles": [
       "LICENSE",
-      "THIRD_PARTY_NOTICES.md"
+      {
+        "from": "docs/THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      }
     ],
     "win": {
       "target": "dir",
-      "icon": "icon.ico"
+      "icon": "assets/icon.ico"
     }
   }
 }

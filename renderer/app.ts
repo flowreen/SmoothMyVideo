@@ -1035,6 +1035,7 @@ function upFactor() {
   return d ? d.h / info.h : 0;
 } // arbitrary factor (0 = off)
 function syncUpscale() {
+  a4kAaUi();
   $('upcustomwrap').style.display = $('upres').value === 'custom' ? 'inline-flex' : 'none';
   if (info && info.w && info.h) {
     // bound the custom slider to what this source + encoder can reach
@@ -1270,6 +1271,26 @@ function fsrUpOn() {
 function a4kUpOn() {
   return $('a4kup').checked && !$('rtxvsr').checked && !$('fsrup').checked;
 }
+// Anime4K's Mode A+A box (default off): Restore CNN UL on the first x2 pass's 2x frame too; it acts only with the
+// Anime4K upscaler, greyed out otherwise (syncUpscale)
+$('a4kaa').checked = localStorage.getItem('a4kAA') === '1';
+function a4kAaOn() {
+  return a4kUpOn() && $('a4kaa').checked;
+}
+function a4kAaUi() {
+  const on = a4kUpOn();
+  $('a4kaa').disabled = !on;
+  $('a4kaalbl').style.opacity = on ? '1' : '0.45';
+  $('a4kaalbl').style.cursor = on ? 'pointer' : 'default';
+}
+$('a4kaa').onchange = () => {
+  localStorage.setItem('a4kAA', $('a4kaa').checked ? '1' : '0');
+  refreshPreviewIfOpen();
+  try {
+    lvModelUi();
+    lvSendOpts();
+  } catch {}
+};
 function acnUpOn() {
   return $('acnup').checked && !$('rtxvsr').checked && !$('fsrup').checked && !$('a4kup').checked;
 }
@@ -1972,7 +1993,9 @@ function liveLoadParts(mi, sharpen: string) {
     : fsrUpOn()
       ? 'AMD FSR 4.1'
       : a4kUpOn()
-        ? 'Anime4K'
+        ? a4kAaOn()
+          ? 'Anime4K A+A'
+          : 'Anime4K'
         : acnUpOn()
           ? 'ArtCNN'
           : xessUpOn()
@@ -2018,6 +2041,7 @@ function lvSendOpts() {
     vsrquality: vsrQuality(),
     fsrup: fsrUpOn(), // AMD FSR 4 takes the same resize when ticked instead of RTX VSR
     anime4k: a4kUpOn(), // Anime4K the same way
+    a4kaa: a4kAaOn(), // its Mode A+A
     artcnn: acnUpOn(), // ArtCNN the same way
     xess: xessUpOn(), // Intel XeSS the same way
     // no "Upscale to": Live's size is what Display presents (the window or the screen), the DLSS mode its speed
@@ -2740,6 +2764,7 @@ function prevSettingsSig() {
     vsrQuality(),
     fsrUpOn(),
     a4kUpOn(),
+    a4kAaOn(),
     acnUpOn(),
     xessUpOn(),
     nrOn(),
@@ -2812,6 +2837,7 @@ async function loadPreview(frame, bg?) {
           vsrquality: vsrQuality(),
           fsrup: useFsr,
           anime4k: useA4k,
+          a4kaa: useA4k && a4kAaOn(),
           artcnn: useAcn,
           xess: useXess,
           dlssnr: useNr,
@@ -3317,6 +3343,7 @@ function cmpOpts(frame, a, b, multi, pairs) {
       vsrquality: vsrQuality(),
       fsrup: fsrUpOn() && upFactor() > 1,
       anime4k: a4kUpOn() && upFactor() > 1,
+      a4kaa: a4kAaOn() && upFactor() > 1,
       artcnn: acnUpOn() && upFactor() > 1,
       xess: xessUpOn() && upFactor() > 1,
       dlssnr: nrOn(),
@@ -3828,6 +3855,7 @@ function startRun() {
   $('vsrq').disabled = true;
   $('fsrup').disabled = true;
   $('a4kup').disabled = true;
+  $('a4kaa').disabled = true;
   $('acnup').disabled = true;
   $('xessup').disabled = true;
   $('gpufit').disabled = true;
@@ -3908,6 +3936,7 @@ function startRun() {
   } // AI upscale via the RTX Video SDK (else Lanczos3)
   if (useFsrUp) payload.fsrup = true; // AMD FSR 4 upscaling (engine/fsrup)
   if (useA4kUp) payload.anime4k = true; // Anime4K upscaling (inside the host)
+  if (useA4kUp && a4kAaOn()) payload.a4kaa = true; // its Mode A+A
   if (useAcnUp) payload.artcnn = true; // ArtCNN upscaling (engine/artcnn)
   if (useXessUp) payload.xess = true; // Intel XeSS upscaling (engine/xess)
   if (!$('gpufit').checked) payload.nogpufit = true; // no video memory fit: the same fps, slower when memory runs short
@@ -4148,6 +4177,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   $('vsrq').disabled = false;
   $('fsrup').disabled = false;
   $('a4kup').disabled = false;
+  a4kAaUi();
   $('acnup').disabled = false;
   $('xessup').disabled = false;
   $('gpufit').disabled = false;

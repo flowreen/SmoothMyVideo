@@ -899,6 +899,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       if (RTX_VSR) nargs.push('--rtx-vsr', ...VSR_Q);
       if (FSR_UP) nargs.push('--fsr-upscale');
       if (A4K_UP) nargs.push('--anime4k');
+      if (A4K_UP && args.anime4k_aa) nargs.push('--anime4k-aa');
       if (ACN_UP) nargs.push('--artcnn');
       if (XESS_UP) nargs.push('--xess-upscale');
     }
@@ -1015,6 +1016,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       if (RTX_VSR) a.push('--rtx-vsr', ...VSR_Q);
       if (FSR_UP) a.push('--fsr-upscale');
       if (A4K_UP) a.push('--anime4k');
+      if (A4K_UP && args.anime4k_aa) a.push('--anime4k-aa');
       if (ACN_UP) a.push('--artcnn');
       if (XESS_UP) a.push('--xess-upscale');
     }

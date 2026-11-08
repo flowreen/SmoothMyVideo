@@ -838,9 +838,78 @@ int Host::initNgx(std::string& err)
     // keeps the one it was created with)
     for (int k = m_passes; k + 1 < kMaxPasses; ++k)
         m_passOut[k].Reset();
+    m_run = m_passes;
     if (!runCommandList(err))
         return 2;
     return 0;
+}
+
+int Host::runPasses(int n)
+{
+    m_run = n < 1 ? 1 : (n > m_passes ? m_passes : n);
+    return m_run;
+}
+
+int Host::growPasses(int n, std::string& note)
+{
+    n = n > kMaxPasses ? kMaxPasses : n;
+    if (n <= m_passes || !m_ngxUp || !m_feature)
+        return m_passes;
+    void* pAlloc = (void*)GetProcAddress(m_core, "NVSDK_NGX_D3D12_AllocateParameters");
+    void* pCreate = (void*)GetProcAddress(m_snippet, "NVSDK_NGX_D3D12_CreateFeature");
+    auto sAlloc = m_shim ? (PFN_ShimAllocParams)GetProcAddress(m_shim, "DLSSNR_CallAllocParams") : nullptr;
+    auto sCreate = m_shim ? (PFN_ShimCreate)GetProcAddress(m_shim, "DLSSNR_CallCreate") : nullptr;
+    if (!pAlloc || !pCreate || !sAlloc || !sCreate)
+    {
+        note = "an NGX entry point is missing";
+        return m_passes;
+    }
+    if (FAILED(m_alloc->Reset()) || FAILED(m_list->Reset(m_alloc.Get(), nullptr)))
+    {
+        note = "command list Reset failed";
+        return m_passes;
+    }
+    D3D12_HEAP_PROPERTIES def = {};
+    def.Type = D3D12_HEAP_TYPE_DEFAULT;
+    const D3D12_RESOURCE_DESC td = m_output->GetDesc();
+    int built = m_passes;
+    for (int k = m_passes; k < n; ++k)
+    {
+        // pass k reads the frame pass k - 1 writes from now on (the chain's last pass wrote Output, no frame of its own)
+        if (FAILED(m_dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                  IID_PPV_ARGS(&m_passOut[k - 1]))))
+        {
+            note = "pass " + std::to_string(k + 1) + " frame: CreateCommittedResource failed";
+            break;
+        }
+        NVSDK_NGX_Parameter* p = nullptr;
+        NVSDK_NGX_Result r = sAlloc(pAlloc, &p);
+        if (r != NVSDK_NGX_Result_Success || !p)
+        {
+            m_passOut[k - 1].Reset();
+            note = "pass " + std::to_string(k + 1) + " AllocateParameters " + resultString(r);
+            break;
+        }
+        m_pparams[k] = p;
+        setPassParams(k, k);
+        NVSDK_NGX_Handle* f = nullptr;
+        bool faulted = false;
+        r = guardedCreate(sCreate, pCreate, m_list.Get(), kFeatureId, p, &f, false, faulted);
+        if (faulted || r != NVSDK_NGX_Result_Success || !f)
+        {
+            m_passOut[k - 1].Reset();
+            note = "pass " + std::to_string(k + 1) + " CreateFeature " + (faulted ? "faulted" : resultString(r));
+            break;
+        }
+        m_pfeature[k] = f;
+        built = k + 1;
+    }
+    std::string e;
+    if (!runCommandList(e) && note.empty())
+        note = e;
+    m_passes = built;
+    return m_passes;
 }
 
 // Minimum resource and parameter set for feature 18 (DLAA style, ratio 1.0), pass k of the chain
@@ -910,12 +979,21 @@ bool Host::evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& 
     }
 
     // the chain: pass k reads pass k - 1's output (UAV while written, a shader resource while read,
-    // back to UAV for the next frame's write), the last pass writes Output
-    for (int k = 0; k < m_passes; ++k)
+    // back to UAV for the next frame's write), the last pass that runs (m_run) writes Output
+    const uint64_t e = ++m_evals;
+    // SMV_NR_HIST_PASSES=N (an A/B): the passes after the first N start from a Reset on every frame (no history)
+    static const int histPasses = [] {
+        const std::string v = envValue("SMV_NR_HIST_PASSES");
+        return v.empty() ? kMaxPasses : atoi(v.c_str());
+    }();
+    for (int k = 0; k < m_run; ++k)
     {
         NVSDK_NGX_Parameter* p = m_pparams[k];
+        p->Set("DLSSNR.Style", m_set.style); // read at every evaluate (a create at 0 + 2 here = a create at 2)
         ID3D12Resource* in = k == 0 ? m_color.Get() : m_passOut[k - 1].Get();
-        ID3D12Resource* out = k == m_passes - 1 ? m_output.Get() : m_passOut[k].Get();
+        ID3D12Resource* out = k == m_run - 1 ? m_output.Get() : m_passOut[k].Get();
+        const bool skipped = e > 1 && m_passEval[k] + 1 != e;
+        m_passEval[k] = e;
         if (k > 0)
         {
             const D3D12_RESOURCE_BARRIER b =
@@ -925,7 +1003,7 @@ bool Host::evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& 
         p->Set("DLSSNR.Color", in);
         p->Set("DLSSNR.Output", out);
         p->Set("DLSSNR.Backbuffer", out);
-        p->Set("DLSSNR.Reset", reset ? 1 : 0);
+        p->Set("DLSSNR.Reset", reset || skipped || k >= histPasses ? 1 : 0);
         p->Set("DLSSNR.Intensity", m_set.intensity);
         p->Set("DLSSNR.LocalStructureStrength", m_set.structure);
         p->Set("DLSSNR.LocalToneStrength", passTone(k));
@@ -1243,6 +1321,7 @@ void Host::abandon()
     for (int k = 0; k + 1 < kMaxPasses; ++k)
         m_passOut[k].Reset();
     m_passes = 1;
+    m_run = 1;
     m_ngxUp = false;
     for (int k = 0; k < kSharedLists; ++k)
     {

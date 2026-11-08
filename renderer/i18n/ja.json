@@ -147,6 +147,8 @@
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(AMD の AI アップスケーラー。<span class='vonly'>サイズが元より大きいとき</span><span class='lonly'>画面に合わせる、または DLAA 未満の DLSS モードで拡大するとき</span>に使われます)",
   "a4k.tip": "バージョン: Anime4K 4.0.1、Upscale CNN x2 UL (最大のモデル)、リンギング抑制クランプ (Clamp_Highlights) 付き。1 パスで 2 倍に拡大し、サイズに必要なだけパスを重ね (2 倍超では 2 パス目)、最後に Lanczos でサイズに合わせます。Restore: Anime4K と一緒にオンにすると、その 2 つが Anime4K の Mode A になります。SMV の忠実度テスト (1.5 倍と 2 倍、4 本のクリップ) では、平均して RTX VSR や AMD FSR より元のフルサイズ画像に近い結果でした。",
+  "a4kaa.name": "A+A",
+  "a4kaa.tip": "バージョン: Anime4K 4.0.1、Mode A+A: 最初の 2x パスの後、拡大したフレームに Restore CNN UL をもう一度かけてから、次のパスまたは最終リサイズに進みます。Anime4K の説明では、知覚品質が最も高く線の復元も最も多い一方、リンギング・バンディング・エイリアシングが出ることがあり、処理も遅くなります (2 回目の Restore は 4 倍の画素を処理)。2x 以上の拡大向けです。Restore: Anime4K と一緒にオンにすると完全な A+A チェーンになります。",
   "a4k.name": "Anime4K",
   "a4k.hint": "(アニメ向けの CNN アップスケーラー。<span class='vonly'>サイズが元より大きいとき</span><span class='lonly'>画面に合わせる、または DLAA 未満の DLSS モードで拡大するとき</span>に使われます)",
   "acn.tip": "バージョン: ArtCNN 1.6.2、C4F32_DN (ノイズ除去モデル) を明るさに、色は Lanczos で。1 パスで 2 倍に拡大し、サイズに必要なだけパスを重ね (2 倍超では 2 パス目)、最後に Lanczos でサイズに合わせます。SMV のアニメテスト (2 倍、4 本のクリップ) では、平均して元のフルサイズ画像に最も近く、Anime4K、Lanczos、RTX VSR、AMD FSR を上回りました。",

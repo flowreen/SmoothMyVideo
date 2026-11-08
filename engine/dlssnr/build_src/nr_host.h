@@ -130,6 +130,28 @@ class Host
         return m_passNote;
     }
 
+    // Changes while the chain runs (smv-live.exe's Live settings): Structure and Tone reach the next evaluate (both
+    // are set on every evaluate); runPasses(n) runs the first n built passes (1..passes()), the last of them writing
+    // Output, and returns the passes that run now. A pass left out keeps no history: when it comes back, its first
+    // evaluate is a Reset (its last frame is older than the motion field describes)
+    void setStructure(float v)
+    {
+        m_set.structure = v;
+    }
+    void setTone(float v)
+    {
+        m_set.tone = v;
+    }
+    void setStyle(int v) // DLSSNR.Style is read at every evaluate too
+    {
+        m_set.style = v;
+    }
+    int runPasses(int n);
+    // More passes than startup built, while the chain runs: each new pass's frame, parameter block and feature
+    // (startup's create on one command list, waited for); a pass that cannot be made ends the growth at the passes
+    // built (note says why). Returns passes(); the caller runs them with runPasses and fits the memory first
+    int growPasses(int n, std::string& note);
+
     void shutdown();
     void ngxShutdown(); // the NGX-only teardown, called under SEH by shutdown()
 
@@ -204,6 +226,9 @@ class Host
     NVSDK_NGX_Handle* m_pfeature[kMaxPasses] = {};
     CP<ID3D12Resource> m_passOut[kMaxPasses - 1]; // pass k's output = pass k + 1's input (UAV between frames)
     int m_passes = 1;
+    int m_run = 1;                        // the passes evaluateOn runs (runPasses), 1..m_passes
+    uint64_t m_evals = 0;                 // evaluateOn calls
+    uint64_t m_passEval[kMaxPasses] = {}; // m_evals at each pass's last evaluate (one that skipped = a Reset)
     std::string m_passNote;
     NVSDK_NGX_Result m_last = NVSDK_NGX_Result_Success;
     bool m_ngxUp = false;

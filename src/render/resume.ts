@@ -64,6 +64,7 @@ const OPTS: Record<string, Spec> = {
   '--vsr-quality': { dest: 'vsr_quality', kind: 'int', def: 4, choices: [1, 2, 3, 4] },
   '--fsr-upscale': { dest: 'fsr_upscale', kind: 'bool', def: false },
   '--anime4k': { dest: 'anime4k', kind: 'bool', def: false },
+  '--anime4k-aa': { dest: 'anime4k_aa', kind: 'bool', def: false },
   '--artcnn': { dest: 'artcnn', kind: 'bool', def: false },
   '--xess-upscale': { dest: 'xess_upscale', kind: 'bool', def: false },
   '--rtx-hdr': { dest: 'rtx_hdr', kind: 'bool', def: false },

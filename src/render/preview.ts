@@ -40,6 +40,7 @@ export interface PreviewArgs {
   vsr_quality: number; // --vsr-quality: RTX VSR's quality level 1..4, 4 = Ultra
   fsr_upscale: boolean;
   anime4k: boolean;
+  anime4k_aa: boolean; // --anime4k-aa: Anime4K's Mode A+A
   artcnn: boolean;
   xess_upscale: boolean;
   dlssnr: boolean;
@@ -96,6 +97,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     vsr_quality: 4,
     fsr_upscale: false,
     anime4k: false,
+    anime4k_aa: false,
     artcnn: false,
     xess_upscale: false,
     dlssnr: false,
@@ -129,6 +131,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--rtx-vsr': 'rtx_vsr',
     '--fsr-upscale': 'fsr_upscale',
     '--anime4k': 'anime4k',
+    '--anime4k-aa': 'anime4k_aa',
     '--artcnn': 'artcnn',
     '--xess-upscale': 'xess_upscale',
     '--dlssnr': 'dlssnr',
@@ -726,7 +729,8 @@ function passFlags(
     if (o.upscaler) {
       if (s.needVsr) args.push('--rtx-vsr', ...vsrQuality(a));
       else if (a.fsr_upscale && o.outW > s.W && o.outH > s.H) args.push('--fsr-upscale');
-      else if (a.anime4k && o.outW > s.W && o.outH > s.H) args.push('--anime4k');
+      else if (a.anime4k && o.outW > s.W && o.outH > s.H)
+        args.push('--anime4k', ...(a.anime4k_aa ? ['--anime4k-aa'] : []));
       else if (a.artcnn && o.outW > s.W && o.outH > s.H) args.push('--artcnn');
       else if (a.xess_upscale && o.outW > s.W && o.outH > s.H) args.push('--xess-upscale');
     }
@@ -1039,7 +1043,7 @@ export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         st.push('--out-w', String(OW), '--out-h', String(OH));
         if (s.needVsr) st.push('--rtx-vsr', ...vsrQuality(a));
         else if (a.fsr_upscale && OW > WW && OH > WH) st.push('--fsr-upscale');
-        else if (a.anime4k && OW > WW && OH > WH) st.push('--anime4k');
+        else if (a.anime4k && OW > WW && OH > WH) st.push('--anime4k', ...(a.anime4k_aa ? ['--anime4k-aa'] : []));
         else if (a.artcnn && OW > WW && OH > WH) st.push('--artcnn');
         else if (a.xess_upscale && OW > WW && OH > WH) st.push('--xess-upscale');
       }

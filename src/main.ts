@@ -77,7 +77,7 @@ function createWindow() {
     minHeight: 640,
     title: 'Smooth My Video',
     backgroundColor: '#1b1b1b',
-    icon: path.join(ROOT, 'icon.ico'),
+    icon: path.join(ROOT, 'assets', 'icon.ico'),
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
   if (st.maximized) win.maximize();
@@ -837,6 +837,7 @@ function vsrQArgs(q: number): string[] {
 }
 let liveFsrUp = false; // AMD FSR 4 as the live upscaler instead (its checkbox; the two exclude each other)
 let liveA4kUp = false; // Anime4K as the live upscaler instead (its checkbox; RTX VSR and AMD FSR 4 clear it)
+let liveA4kAA = false; // its Mode A+A box: Restore CNN UL on the first x2 pass's 2x frame too
 let liveAcnUp = false; // ArtCNN as the live upscaler instead (its checkbox; the other three clear it)
 let liveXessUp = false; // Intel XeSS as the live upscaler instead (its checkbox; the other four clear it)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
@@ -999,7 +1000,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   // working size before it) and skips it with a line when neither does
   if (liveVsr) args.push('--rtx-vsr', ...vsrQArgs(liveVsrQ));
   else if (liveFsrUp) args.push('--fsr-upscale');
-  else if (liveA4kUp) args.push('--anime4k');
+  else if (liveA4kUp) args.push('--anime4k', ...(liveA4kAA ? ['--anime4k-aa'] : []));
   else if (liveAcnUp) args.push('--artcnn');
   else if (liveXessUp) args.push('--xess-upscale');
   // Restore: Real-ESRGAN first on every presented frame; costs most
@@ -1039,6 +1040,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   if (!liveHud) args.push('--no-hud');
   else if (!liveHudLat) args.push('--no-hud-latency'); // meter on, latency segment hidden
   if (!liveGpuFit) args.push('--no-gpu-fit');
+  liveSetVals = liveSetNow();
   // Every server backend runs inside smv-live.exe (its native host), the only live route; a
   // session the host cannot run ends with its reason on the status line.
   // resident host: every server backend has something worth keeping (the native engines); the
@@ -1187,6 +1189,7 @@ ipcMain.on(
       vsrquality?: number; // RTX VSR's quality level 1..4
       fsrup?: boolean;
       anime4k?: boolean;
+      a4kaa?: boolean; // its Mode A+A box
       artcnn?: boolean;
       xess?: boolean;
       uph?: number;
@@ -1220,6 +1223,7 @@ ipcMain.on(
     liveVsrQ = vsrQ(opts.vsrquality);
     liveFsrUp = !!opts.fsrup;
     liveA4kUp = !!opts.anime4k;
+    liveA4kAA = !!opts.a4kaa;
     liveAcnUp = !!opts.artcnn;
     liveXessUp = !!opts.xess;
     liveUpH = opts.uph ?? 0;
@@ -1243,8 +1247,45 @@ ipcMain.on(
     // engines) goes right away (user rule: a model must not hold VRAM
     // through a session of another model)
     if (liveIdle && liveModel !== liveHeld) liveQuitIdle();
+    liveSendSets();
   },
 );
+
+// the running session's values a stdin `set` line changes in place (the host's nativeLiveSets): the Sharpen strength
+// (0 = off), RTX VSR's quality while RTX VSR is the upscaler, the RTX HDR sliders while RTX HDR runs, DLSS
+// 5 on / off and its Structure / Tone / passes (the host builds more passes in place, memory permitting), the
+// HUD's latency segment while the HUD shows; a value whose effect the session does not run takes effect with the next
+// session's arguments
+let liveSetVals: Record<string, number> | null = null;
+function liveSetNow(): Record<string, number> {
+  const out: Record<string, number> = {};
+  out.sharpen = Math.min(2, Math.max(0, Number(liveSharpen) || 0));
+  if (liveVsr) out.vsrq = liveVsrQ;
+  if (liveRtxHdr) Object.assign(out, { hdrsat: liveHdrSat, hdrcon: liveHdrCon, hdrvib: liveHdrVib, hdrsb: liveHdrSb });
+  // DLSS 5's values always (held by the host while DLSS 5 is off, for its start in place), then DLSS 5 on / off
+  Object.assign(out, {
+    nrstyle: liveNrStyle,
+    nrstruct: liveNrStructure,
+    nrtone: liveNrTone,
+    nrpasses: liveNrPasses,
+    dlssnr: liveDlssnr ? 1 : 0,
+  });
+  // the upscaler, Restore and RTX HDR by kind (the host switches the kind its session runs off and on again in place)
+  out.up = liveVsr ? 1 : liveFsrUp ? 2 : liveA4kUp ? 3 : liveAcnUp ? 4 : liveXessUp ? 5 : 0;
+  out.restore = liveRestore ? (liveRestoreModel === 'animejanai' ? 2 : liveRestoreModel === 'anime4k' ? 3 : 1) : 0;
+  out.rtxhdr = liveRtxHdr ? 1 : 0;
+  out.hud = liveHud ? 1 : 0;
+  if (liveHud) out.hudlat = liveHudLat ? 1 : 0;
+  return out;
+}
+function liveSendSets() {
+  if (!liveProc || liveIdle || liveStopping || !liveSetVals) return;
+  // a key the spawn did not carry (an effect ticked since) goes too: the host takes it in place or says why not
+  for (const [k, v] of Object.entries(liveSetNow())) {
+    if (liveSetVals[k] === v) continue;
+    if (liveCommand(`set\t${k}\t${k === 'sharpen' ? v.toFixed(2) : v}`)) liveSetVals[k] = v;
+  }
+}
 
 // The global Live toggle hotkey, Lossless-Scaling-style: press it in any app and the window
 // you are in goes live; press it again to stop. Global shortcuts swallow the key system-wide
@@ -1666,6 +1707,7 @@ type RunOpts = {
   vsrquality?: number; // RTX VSR's quality level 1..4
   fsrup?: boolean;
   anime4k?: boolean;
+  a4kaa?: boolean; // its Mode A+A box
   artcnn?: boolean;
   xess?: boolean;
   rtxhdr?: boolean;
@@ -1747,7 +1789,7 @@ function engineArgs(opts: RunOpts): string[] {
   // instead.
   if (opts.rtxvsr) args.push('--rtx-vsr', ...vsrQArgs(vsrQ(opts.vsrquality)));
   else if (opts.fsrup) args.push('--fsr-upscale');
-  else if (opts.anime4k) args.push('--anime4k');
+  else if (opts.anime4k) args.push('--anime4k', ...(opts.a4kaa ? ['--anime4k-aa'] : []));
   else if (opts.artcnn) args.push('--artcnn');
   else if (opts.xess) args.push('--xess-upscale');
   // "Fit to the GPU" off: no video memory fit (the batch stays as planned, slower when memory runs short)
@@ -1975,6 +2017,7 @@ type PreviewOpts = {
   vsrquality?: number; // RTX VSR's quality level 1..4
   fsrup?: boolean;
   anime4k?: boolean;
+  a4kaa?: boolean; // its Mode A+A box
   artcnn?: boolean;
   xess?: boolean;
   restore?: boolean;
@@ -2012,7 +2055,7 @@ function previewArgv(opts: PreviewOpts, prefix: string): string[] {
   if (opts.rtxvsr)
     args.push('--rtx-vsr', ...vsrQArgs(vsrQ(opts.vsrquality))); // the plan runs it on an enlarging resize only
   else if (opts.fsrup) args.push('--fsr-upscale');
-  else if (opts.anime4k) args.push('--anime4k');
+  else if (opts.anime4k) args.push('--anime4k', ...(opts.a4kaa ? ['--anime4k-aa'] : []));
   else if (opts.artcnn) args.push('--artcnn');
   else if (opts.xess) args.push('--xess-upscale');
   if (opts.hdr)

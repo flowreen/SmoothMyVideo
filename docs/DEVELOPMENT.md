@@ -2,7 +2,7 @@
 
 How the project is put together, how to set it up from a clone, the engine CLI, Live mode, the
 build recipes for the native parts, and the rules that keep releases working. For the product
-overview see [README.md](README.md).
+overview see [README.md](../README.md).
 
 ## Overview
 
@@ -64,7 +64,7 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
 * `renderer/index.html` + `renderer/app.ts`: the whole UI (markup and CSS in the HTML, a small
   inline script that sets the mode class before the body renders) plus its progress / ETA / IPC
   logic in `app.ts`, loaded as `app.js` by a plain `<script src="app.js">` at the end of the body.
-  `app.ts` is a classic script (no imports), type-checked by `tsc -p tsconfig.renderer.json` (no emit;
+  `app.ts` is a classic script (no imports), type-checked by `tsc -p renderer` (renderer/tsconfig.json, no emit;
   `$()` returns `any`, so DOM element properties are not checked yet) and turned into the git-ignored
   `app.js` by `scripts/build-renderer.ts`: Node's type stripper blanks the annotations and changes
   nothing else, so `app.js` is the program as written, line for line (tsc's own emit would prepend
@@ -203,7 +203,7 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
 * `engine/bin/`: bundled `ffmpeg.exe` + `ffprobe.exe` + DLLs, fetched, not committed.
 * `scripts/`: the build scripts `fetch-ffmpeg.ts`, `stage-gpu-runtime.ts`, `dev-icon.ts`,
   `clang-format.ts`, `pack-zip.ts`, `build-renderer.ts`, `scan-index.ts`, `cpp-check.ts` (TypeScript that Node 24 runs
-  directly, no build step: `scripts/package.json` makes them ES modules, `tsconfig.scripts.json` type-checks them).
+  directly, no build step: `scripts/package.json` makes them ES modules, `scripts/tsconfig.json` type-checks them).
 
 Doc policy: README.md and this file are the only docs. No per-component BUILD.md files (a
 provenance note beside vendored third-party headers, `engine/live/build_src/nvofa/README.md`, is
@@ -257,10 +257,11 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
   own test reads every file back and finds the folder's file count and bytes. `extraResources` copies `engine/**` minus `runtime/**` and
   the other filtered paths, so no stray folders may sit under `engine` at build time.
 * `npm run lint`: Prettier writes `src/**/*.ts`, `scripts/*.ts`, `renderer/app.ts` and `renderer/i18n/*.json`, then `tsc --noEmit` and
-  `tsc -p tsconfig.scripts.json` (the build scripts) and `tsc -p tsconfig.renderer.json` (the
+  `tsc -p scripts` (the build scripts) and `tsc -p renderer` (the
   renderer), then clang-format writes our own C++ (see Linting and formatting).
   Stops at the first failure.
-* `postinstall` runs `scripts/dev-icon.ts`, stamping `icon.ico` into the dev Electron exe so
+* `postinstall` runs `scripts/dev-icon.ts`, making `Smooth My Video.lnk` in the root (git-ignored: the app icon on a
+  shortcut to the `SmoothMyVideo.cmd` launcher) and stamping `assets/icon.ico` into the dev Electron exe so
   `npm start` shows the app icon (a stale Explorer icon cache refreshes on the next reboot).
 * `node scripts/scan-index.ts`: the renderer scan described above (`index.html` + `app.ts`, built into `app.js` first).
 
@@ -272,7 +273,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore | --restore-model ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--xess-fg] [--dlssg] [--no-gpu-fit]
-  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k | --artcnn | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
+  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
@@ -586,7 +587,13 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   ends with the shader set's Clamp_Highlights (`kA4kClampSrc`: before the first pass the 5 x 5 maximum of the
   source's luma, two separable passes stored fp16 like its STATSMAX texture; after the last one every output pixel
   whose luma exceeds the maximum's bilinear sample is lowered by the excess on all channels), `SMV_A4K_CLAMP=0`
-  leaves it out. No engine build and nothing in the
+  leaves it out. `--anime4k-aa` (the app's A+A box beside Anime4K) adds upstream's Mode A+A: after the first x2 pass
+  the exact 2x frame (`k_a4kFold2x`, unclamped) goes through Restore CNN UL too (`nativeA4kPasses` with the Restore
+  net at that size), then on to the next pass, or, in a one-pass chain, Clamp_Highlights on that frame (`k_a4kClamp`
+  without its clip) and the Lanczos fit (`k_fitAaH` reading the values unclipped, `k_restFoldV` clipping once, as the
+  fold does), a copy at an exact 2x target; the buffers hold the 2x frame for it, the video memory room is taken
+  first and too little runs Mode A with a line; the setup line names it (`A+A (Restore CNN UL on the WxH frame)`).
+  No engine build and nothing in the
   model cache. HDR frames go in as their SDR view and come back to the codes the way RTX VSR's do. Its output equals
   the PyTorch net's within one 8-bit code (71 dB; the net equals libplacebo's run of the shader at 70 dB). A module
   that does not compile or load = Lanczos with the `Anime4K unavailable` line. A new upstream release: compare its UL
@@ -873,7 +880,7 @@ mean); a Reset on every evaluate made the pass a pure function of the frame (0 o
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME [--xess-fg] --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k | --artcnn | --xess-upscale --upscale H --restore
+  --backend NAME [--xess-fg] --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --nr-passes 1..20 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
@@ -1272,9 +1279,15 @@ Motion vectors and the auto mask: the runtime is conditioned on current -> previ
 motion and every reference host feeds it (NeuralScreen, 2600th's player, OptiScaler), so on the
 zero-copy route the host runs its own Optical Flow session at the NR size on the NR input frames
 (forward, grid 4, the current frame as input and the previous one as reference), upsamples the
-field (`k_nvofUp`) and keeps a vector only where it explains its 5x5 window better than no motion
-by one 8-bit level per pixel (`k_nrMv`: zero on still content and grain, what a game gives a
-still pixel), then stores it as `R16G16_FLOAT` texels straight into the shared `DLSSNR.MVec`
+field (`k_nvofUp`) and keeps a vector where it explains its 5x5 window better than no motion
+by one 8-bit level per pixel, or where the window changed by more than half a level per pixel and the vector removes
+at least 40 % of that change (`k_nrMv`: zero on still content and grain, what a game gives a still pixel; an absolute
+margin alone zeroes a dark, low-contrast moving edge's vector, DLSS 5's history then stays where the edge was, and a
+pass chain stacks a trail per pass); a window neither test decides (flat content: the
+sky a moving edge just left) keeps a vector of 1 px or more unless no motion explains it clearly better (still text
+over a pan), when the field 8 px away agrees with it within 1 px on all four sides (a pan moves its neighbours alike;
+the flow's vectors on grain are as long but scattered), because the history there still holds what moved through it.
+Then it stores the field as `R16G16_FLOAT` texels straight into the shared `DLSSNR.MVec`
 texture (bound at create, `MVecScale` 1) before each evaluate; the first frame (the Reset) gets
 zeros (`k_nrMvClear`). History is never reset at scene cuts (the detectors fire on grain and fast
 action: NeuralScreen's reset 42 of 120 frames of a fast anime clip). `DLSSNR.UseAutoMask` is 1, as
@@ -1467,6 +1480,23 @@ released`). The host exits on its own after a session it cannot keep (an error e
 DLSS 5, the TrueHDR bridge, no model state held), when stdin closes, and after
 `SMV_LIVE_RESIDENT_IDLE_S` seconds idle (default 600); the app quits it when another model starts or
 is selected in the panel and at app exit, and kills it when a `stop` gets no answer within 3 s.
+
+Live settings in place: while a session runs, the app sends `set<TAB>key<TAB>value` on the same stdin (the resident
+host's reader; a one-shot session, DLSS 4.5's, starts one reader of its own) for each value that changed since the
+spawn (`main.ts` `liveSetNow` / `liveSendSets`). The native thread applies them before its next frame group
+(`nativeLiveSets`) and logs `live set: KEY VALUE`: `sharpen` (0 = off; turning it on allocates its two frames, when the
+video memory room holds them), `vsrq` (RTX VSR proper), `hdrsat` / `hdrcon` / `hdrvib` / `hdrsb` (while RTX HDR runs),
+`nrstruct` / `nrtone` / `nrstyle` (DLSS 5's Structure / Tone / Style, all three read at every evaluate), `nrpasses`
+(DLSS 5 runs the first N passes it holds; more than it holds = `nr::Host::growPasses` builds the extra features and
+frames in place, as many as the room holds at `nr::kFrameMp` a megapixel a pass, `live DLSS 5: N more passes built in
+X ms`; a pass that comes back after being left out starts from a Reset), `dlssnr` (DLSS 5 off = the pass skips, its core
+stays; on again = it resumes from a Reset; on in a session that started without it = `nativeNrSwitch` brings the core
+up as the session start does, after the room check, at the Structure / Tone / passes / Style held meanwhile:
+`(held for DLSS 5's start)`), `hud` / `hudlat` (the HUD and its latency segment; the loop thread owns the HUD window
+and makes it when the session started without one), and `up` / `restore` / `rtxhdr` (the upscaler, Restore and RTX
+HDR by kind: the kind the session runs switches off through its own fallback, Lanczos / no Restore / faithful PQ,
+and on again; another kind, or one the session started without, waits for the next session). A key the session cannot
+take logs `(the next session takes it: why)`; the next spawn carries the new value either way.
 
 The host prints what
 it keeps in the `live session ended` line (`engines` = the model state). The exe imports its own
@@ -1776,6 +1806,10 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_NR_MV=0` | DLSS 5 gets no motion vectors (both routes; offline: the pass as it ran before motion vectors, live: every frame a Reset); a measurement lever, never a product setting |
 | `SMV_NR_REUSE=0` | DLSS 5 evaluates every frame, also one identical to the previous one (both routes; by default an identical frame reuses the last output, so a paused picture stays still); the A/B and trigger-test lever, never a product setting |
 | `SMV_NR_AUTOMASK=0` | DLSS 5 runs with `DLSSNR.UseAutoMask` 0 (both routes, read by the NR core); a measurement lever, never a product setting |
+| `SMV_NR_MV_MARGIN=F` | the margin of DLSS 5's motion check (`k_nrMv`, default 25: a vector stays only where it explains its 5 x 5 window better than no motion by more than F summed 8-bit levels; a large negative value keeps every Optical Flow vector); an A/B lever, never a product setting |
+| `SMV_NR_MV_REAL=F` / `SMV_NR_MV_SHARE=F` | the relative keep of `k_nrMv` (defaults 0.5 / 0.4: a window that changed by more than F 8-bit levels a pixel keeps a vector that removes at least that share of the change); `SMV_NR_MV_SHARE=0` = the absolute test alone; A/B levers, never product settings |
+| `SMV_NR_MV_FLAT=F` / `SMV_NR_MV_COH=F` | the undecided-window keep of `k_nrMv` (defaults 1 / 1 px: a vector of at least F px, agreeing with the field 8 px away within the COH tolerance); `SMV_NR_MV_FLAT=0` = such a window gets zero, `SMV_NR_MV_COH=0` = no agreement test; A/B levers, never product settings |
+| `SMV_NR_HIST_PASSES=N` | DLSS 5's passes after the first N start from a Reset on every frame (no history; read by the NR core); an A/B lever, never a product setting |
 | `SMV_VRAM_CAP=0` | no video memory limit: live's output ring the slots the fps target asks for (a quarter of the card at most), whatever the GPU has free; the A/B lever of the cap, never a product setting (the product's switch is `--no-gpu-fit`) |
 | `SMV_HDR_MODEL_ENC=0` / `SMV_GMFSS_SDR_PAIRS=0` | on HDR planes GMFSS, Restore and Sharpen read the PQ / HLG codes as they are instead of their SDR view / GMFSS runs every frame pair as one outside the SDR range (the pictures, the motion nets on the motion view); A/B levers, never product settings |
 | `SMV_HDR_SHARPEN_VIEW=0` | on HDR planes Sharpen runs on the PQ / HLG codes instead of their SDR view (SDR content then leaves the SDR range, so no SDR pair forms with Sharpen on); A/B lever, never a product setting |
@@ -2333,7 +2367,7 @@ Rules (hard-won, do not regress):
 Standard presets, applied by tools, so whoever edits (a person or an agent) never matches a house style
 by hand: run `npm run lint` after a change. One statement a line and every source under a formatter keep the
 code easy to search and to read in slices (for people and agents alike).
-* Prettier (`.prettierrc.json`: Prettier's defaults plus single quotes and printWidth 120) formats
+* Prettier (package.json's `prettier`: Prettier's defaults plus single quotes and printWidth 120) formats
   `src/**/*.ts`, `scripts/*.ts`, `renderer/app.ts` and the language files `renderer/i18n/*.json`;
   `.prettierignore` guards `engine/`, build dirs, `renderer/app.js` (the build) and `renderer/index.html`
   (whitespace-sensitive markup, formatted by hand).
@@ -2341,7 +2375,7 @@ code easy to search and to read in slices (for people and agents alike).
   `noUnusedLocals`, `noUnusedParameters`, `noImplicitReturns`, `noFallthroughCasesInSwitch` and
   `allowUnreachableCode: false` (prefix a parameter a callback must take but never reads with `_`). ESLint was
   dropped when moving to TypeScript 7 (typescript-eslint pinned the old compiler).
-* clang-format (`.clang-format`: Visual Studio's own `Microsoft` preset with `Type* p`; includes keep
+* clang-format (`engine/.clang-format`: Visual Studio's own `Microsoft` preset with `Type* p`; includes keep
   their order, string literals are never split and comments never re-wrapped, so a pass changes
   whitespace only) formats our own C++ through `scripts/clang-format.ts` (in place;
   extra file arguments are formatted too): every `.cpp`, `.h` and `.inl` directly in an `engine/*/build_src`

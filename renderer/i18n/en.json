@@ -147,6 +147,8 @@
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(AMD's AI upscaler, used when <span class='vonly'>the Size is above the source</span><span class='lonly'>Fill screen or a DLSS mode below DLAA enlarges</span>)",
   "a4k.tip": "Version: Anime4K 4.0.1, Upscale CNN x2 UL (the largest of its models) with its de-ringing clamp (Clamp_Highlights). It enlarges 2x per pass, as many passes as the Size needs (above 2x a second pass), then Lanczos fits the Size. Ticked together with Restore: Anime4K, the two are Anime4K's Mode A. In SMV's fidelity test (1.5x and 2x, four clips) it came closer on average to the full-size original than RTX VSR and AMD FSR.",
+  "a4kaa.name": "A+A",
+  "a4kaa.tip": "Version: Anime4K 4.0.1, Mode A+A: after the first 2x pass, Restore CNN UL runs again on the enlarged frame, before the next pass or the final resize. Anime4K's notes: the highest perceptual quality and the most rebuilt lines, but it can add ringing, banding or aliasing, and it is slower (that second Restore works on 4x the pixels). Meant for enlarging 2x or more; with Restore: Anime4K ticked too, it is the full A+A chain.",
   "a4k.name": "Anime4K",
   "a4k.hint": "(a CNN upscaler made for anime, used when <span class='vonly'>the Size is above the source</span><span class='lonly'>Fill screen or a DLSS mode below DLAA enlarges</span>)",
   "acn.tip": "Version: ArtCNN 1.6.2, C4F32_DN (its denoising model) on the brightness, the colour from Lanczos. It enlarges 2x per pass, as many passes as the Size needs (above 2x a second pass), then Lanczos fits the Size. In SMV's anime test (2x, four clips) it came closest on average to the full-size original, ahead of Anime4K, Lanczos, RTX VSR and AMD FSR.",

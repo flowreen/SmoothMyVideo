@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icon.png" alt="Smooth My Video logo" width="128">
+  <img src="assets/icon.png" alt="Smooth My Video logo" width="128">
 </p>
 
 <h1 align="center">Smooth My Video</h1>
@@ -100,7 +100,8 @@ those yourself.
 | NVIDIA Smooth Motion | `NvOFFRUC.dll` from NVIDIA's Optical Flow SDK | **Get from NVIDIA** (free developer login), then **Choose .zip&hellip;**. GMFSS is used until it is installed. |
 | Dolby Vision, HDR10+ | The open-source [dovi_tool](https://github.com/quietvoid/dovi_tool) / [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool) | One click: **Download dovi_tool** / **Download hdr10plus_tool** (a fixed release, checked and installed). |
 
-**From source:** `npm start`. See **[DEVELOPMENT.md](DEVELOPMENT.md)** for the full setup.
+**From source:** `npm start`, or double-click `SmoothMyVideo.cmd` (after `npm install`, the `Smooth My Video`
+shortcut beside it shows the app icon). See **[DEVELOPMENT.md](docs/DEVELOPMENT.md)** for the full setup.
 
 ## Models
 
@@ -136,7 +137,8 @@ These run before the new frames are made, in videos and in Live:
 * 📐 **Upscale**: makes the picture bigger and sharper with NVIDIA RTX Video Super Resolution (on by default), AMD
   FSR 4.1, Intel XeSS (Intel's files are downloaded on request), Anime4K or ArtCNN (both made for anime; each upscale
   pass doubles the picture, so 720p to 4K takes two passes; with Restore set to Anime4K too, Anime4K makes its Mode
-  A); with none ticked, a standard resize. They only run when the picture is enlarged.
+  A, and its A+A box runs Anime4K's Restore again on the enlarged picture: crisper lines, slower, and it can add
+  ringing); with none ticked, a standard resize. They only run when the picture is enlarged.
 * 🧠 **NVIDIA DLSS 5** (optional): NVIDIA's Neural Rendering, an AI picture enhancement on every original frame.
   [Details](#nvidia-dlss-5).
 * ✏️ **Sharpen**: bacondither's Adaptive Sharpen, strength 0 to 2 (on at 1.00 by default).
@@ -288,7 +290,7 @@ FusionNet and softsplat warping.
 File renders also run without the window: `node dist\render\cli.js <input> <multiplier> [output] [flags]` takes the
 same settings the GUI builds, and the native host can start Live on a window by its title.
 
-📖 **Every flag, the build and the design rationale: [DEVELOPMENT.md](DEVELOPMENT.md)**
+📖 **Every flag, the build and the design rationale: [DEVELOPMENT.md](docs/DEVELOPMENT.md)**
 
 ## Contributing
 

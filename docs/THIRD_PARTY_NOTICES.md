@@ -1,6 +1,6 @@
 # Third-party notices
 
-Smooth My Video is MIT licensed (see [LICENSE](LICENSE)). It builds on the following
+Smooth My Video is MIT licensed (see [LICENSE](../LICENSE)). It builds on the following
 third-party work.
 
 ## Vendored in this repository
@@ -10,6 +10,10 @@ third-party work.
   vendored under `engine/GMFSS_Fortuna/`. MIT License, Copyright (c) 2023 98mxr; see
   `engine/GMFSS_Fortuna/LICENSE`. Upstream components it builds on: GMFlow (Apache-2.0,
   Haofei Xu et al.), RIFE/IFNet (MIT, hzwer et al.), softmax splatting (Simon Niklaus).
+  The `train_log` weights are GMFSS's fine-tune on the AnimeRun dataset (Li Siyao et al.,
+  github.com/lisiyao21/AnimeRun). The GMFSS author's MIT grant covers the code and the weights;
+  the AnimeRun repository publishes no license, so whether the dataset's terms reach models
+  trained on it is undetermined.
 * **Practical-RIFE 4.25** (the RIFE interpolation model: the `flownet.pkl` weights in
   `engine/rife/`), from hzwer's Practical-RIFE. MIT License, Copyright (c) 2021 hzwer; see
   `engine/rife/PRACTICAL-RIFE-LICENSE.txt`.

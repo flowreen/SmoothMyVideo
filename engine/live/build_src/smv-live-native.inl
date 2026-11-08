@@ -1624,15 +1624,19 @@ __global__ void k_sdrPq(float* __restrict__ dst, int pw, int ph, int planeStride
 
 // offline DLSS 5 motion (DLSSNR.MVec): the Optical Flow field current -> previous of the NR input
 // frames (px, two w x h planes, k_nvofUp's output) as R16G16_FLOAT texels stored into the core's
-// MVec texture (its surface object dst, x in bytes). A vector is kept only where it explains its 5x5 window of the current frame better than
-// no motion by more than margin (the summed 8-bit luma error: the previous frame bilinear at the
-// moved position against the same window unmoved, border clamped); an estimated field reports
-// small vectors on still content and grain, and DLSS 5 would pull its history along them. Zero
-// elsewhere: what a still pixel gets from a game engine. The moved tap is the pixel plus the
-// floor and the exact fraction of the vector, never an fp32 absolute coordinate.
+// MVec texture (its surface object dst, x in bytes). A vector is kept where it explains its 5x5 window of the current
+// frame better than no motion by more than margin (the summed 8-bit luma error: the previous frame bilinear at the
+// moved position against the same window unmoved, border clamped), or where the window really changed (its no-motion
+// error above realChange) and the vector removes at least keepShare of that change: a dark, low-contrast moving edge
+// changes its window by less than the margin, the absolute test alone zeroed its right vector, and DLSS 5 then held
+// its history where the edge was (a trail per pass in a chain). An estimated field reports small vectors on still
+// content and grain, and DLSS 5 would pull its history along them: a still window does not change (no relative keep)
+// and grain's change is not explained by a vector. Zero elsewhere: what a still pixel gets from a game engine. The
+// moved tap is the pixel plus the floor and the exact fraction of the vector, never an fp32 absolute coordinate.
 __global__ void k_nrMv(const float* __restrict__ flow, const unsigned char* __restrict__ cur,
                        const unsigned char* __restrict__ prev, int lumaPitch, int w, int h,
-                       float margin, unsigned long long dst)
+                       float margin, float realChange, float keepShare, float flatMin, float cohTol,
+                       unsigned long long dst)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1662,7 +1666,27 @@ __global__ void k_nrMv(const float* __restrict__ flow, const unsigned char* __re
                 e1 += fabsf(c - ((1.0f - ly) * a + ly * b));
             }
         }
-        if (e1 + margin < e0) out = (unsigned int)f2h(u) | ((unsigned int)f2h(v) << 16);
+        // a window neither test decides (flat content: the sky behind a moving edge changes too little to tell) keeps
+        // a vector of flatMin px or more unless no motion explains it clearly better (still text over a pan), when
+        // the field agrees with it 8 px away on all four sides within cohTol px (a pan moves its neighbours alike;
+        // the vectors the flow reports on grain are as long but scattered): the history there still holds what moved
+        // through it, and zero motion would keep that image in place
+        const bool vecWins = e1 + margin < e0 || (keepShare > 0.0f && e0 > realChange && e1 <= (1.0f - keepShare) * e0);
+        const bool zeroWins = e0 + margin < e1;
+        bool flatKeep = flatMin > 0.0f && !zeroWins && u * u + v * v >= flatMin * flatMin;
+        if (flatKeep && cohTol > 0.0f)
+        {
+            const int nx[4] = {max(x - 8, 0), min(x + 8, w - 1), x, x};
+            const int ny[4] = {y, y, max(y - 8, 0), min(y + 8, h - 1)};
+            for (int k = 0; k < 4; k++)
+            {
+                const size_t q = (size_t)ny[k] * w + nx[k];
+                const float du = flow[q] - u, dv = flow[(size_t)w * h + q] - v;
+                if (du * du + dv * dv > cohTol * cohTol) flatKeep = false;
+            }
+        }
+        if (vecWins || flatKeep)
+            out = (unsigned int)f2h(u) | ((unsigned int)f2h(v) << 16);
     }
     asm volatile("sust.b.2d.b32.trap [%0, {%1, %2}], {%3};" ::"l"(dst), "r"(x * 4), "r"(y), "r"(out) : "memory");
 }
@@ -5316,7 +5340,8 @@ struct NativeRife
     // fusionnet on the host's kernels (nativeFuModule): its module and kernels, one FuOp a launch, the weight block, the
     // activations (fuArena; in the shared activation block, else dFuOwn)
     CUmodule fuMod = nullptr;
-    CUfunction fFu[8] = {};
+    CUfunction fFu[11] = {};
+    int fuR4Min = 0; // the 8-row grid's CTAs from which a PReLU wide conv runs as its 4-row twin (8 an SM; 0 = never)
     void* dFuW = nullptr;
     std::vector<FuOp> fuOps;
     void* dFuOwn = nullptr;
@@ -5341,7 +5366,8 @@ struct NativeRife
     // block (gaOff, see gaNatLoad), the window position tables (dGaPos: A's posY | posX, then `_m`'s), the activations
     // (gaArena; in the shared activation block, else dGaOwn)
     CUmodule gaMod = nullptr;
-    CUfunction fGa[5] = {};
+    CUfunction fGa[6] = {};
+    int gaMlp2Min = 0; // the CTAs from which the mlp runs as k_gaMlp2 (3 an SM; 0 = never: RTX 20, SMV_GA_MLP2=0)
     void* dGaW = nullptr;
     size_t gaOff[46] = {};
     float* dGaPos = nullptr;
@@ -5612,6 +5638,7 @@ struct NativeRife
     CUfunction fA4k[8] = {};
     int a4kW = 0, a4kH = 0;   // the first pass's input size (the slot's)
     int a4kN = 1;             // x2 passes a frame: the fewest whose 2^n reaches the slot's ratio, memory permitting
+    bool a4kAA = false;       // Mode A+A (--anime4k-aa, memory permitting): Restore on the first pass's 2x frame
     int a4kOw = 0;            // the widest fold target dA4kTmp holds
     void* dA4kIn = nullptr;   // NCHW fp16, the largest pass's input size
     void* dA4kT = nullptr;    // four layer slots, 3 textures x 4 fp16 a pixel each (nativeA4kRun), the largest pass's
@@ -5869,7 +5896,12 @@ struct NativeRife
     int* hRsRange = nullptr;
     int rsModeLogs = 0;
     bool rsLastView = false;
-    bool nrSdrIn = false; // live: DLSS 5's input is SDR this frame (RTX HDR converts after it)
+    bool nrSdrIn = false;  // live: DLSS 5's input is SDR this frame (RTX HDR converts after it)
+    bool nrPaused = false; // live DLSS 5 switched off in a running session (stdin set): the core stays, the pass skips
+    // an effect switched off in a running session (stdin set) through its own fallback (vsrFailed = Lanczos, restFailed =
+    // no Restore, rtxFailed = faithful PQ): set when the switch set that flag, so on again clears only a switch, never a
+    // real failure
+    bool vsrUserOff = false, restUserOff = false, rtxUserOff = false;
     // offline: Restore and the resize run on the decoded frame (the pre-model
     // SOURCE, sw x sh, in dSrcPl) before DLSS 5 and the model, which then run at the working
     // size w x h, and the emit's final resize takes it to dw x dh; sw / sh = 0 = the source is the
@@ -9714,6 +9746,7 @@ static int srcH(const NativeRife& nr)
 static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh);
 static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, cudaStream_t st, unsigned int& rv);
 static void nativeFsrupRelease(NativeRife& nr);
+static uint64_t nativeVideoMemoryRoom();
 static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc);
 static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th);
 static void nativeA4kRelease(NativeRife& nr);
@@ -17036,8 +17069,9 @@ static const char kA4kLastStage[] = R"A4KSRC(    __syncthreads();
 // shader's STATSMAX texture is; after the chain, every pixel of the planar fp32 output (the nets' values as they made
 // them, outside 0..1 too, as the shader's rgba16f textures hold them) whose luma exceeds the maximum sampled
 // bilinearly at its position (texel centres, clamp-to-edge, the shader's `STATSMAX_tex(HOOKED_pos)`) is lowered by the
-// excess on all three channels (`HOOKED - (luma - min(luma, max))`), then every channel clipped to 0..1 (the output).
-// k_a4kClamp = Restore's chain; the resize's chain clamps inside its last fold (a4kFoldPx, before the Lanczos fit).
+// excess on all three channels (`HOOKED - (luma - min(luma, max))`), then every channel clipped to 0..1 (the output;
+// clip 0 = the values go on to a Lanczos fit that clips). k_a4kClamp = Restore's chain and the resize's after Mode A+A's
+// second Restore; the resize's chain otherwise clamps inside its last fold (a4kFoldPx, before the Lanczos fit).
 static const char kA4kClampSrc[] = R"A4KSRC(
 __device__ __forceinline__ float a4kLuma(float r, float g, float b)
 {
@@ -17068,7 +17102,7 @@ __global__ void k_a4kStatV(const unsigned short* __restrict__ tmp, int w, int h,
     stat[(size_t)y * w + x] = f2h(m);
 }
 __global__ void k_a4kClamp(float* __restrict__ img, int tw, int th, const unsigned short* __restrict__ stat, int sw,
-                           int sh)
+                           int sh, int clip)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= tw || y >= th)
@@ -17088,7 +17122,7 @@ __global__ void k_a4kClamp(float* __restrict__ img, int tw, int th, const unsign
     const float d = cur - fminf(cur, mx);
     const float o[3] = {r - d, g - d, b - d};
     for (int c = 0; c < 3; c++)
-        img[(size_t)c * ps + i] = o[c] < 0.0f ? 0.0f : (o[c] > 1.0f ? 1.0f : o[c]);
+        img[(size_t)c * ps + i] = !clip ? o[c] : (o[c] < 0.0f ? 0.0f : (o[c] > 1.0f ? 1.0f : o[c]));
 }
 )A4KSRC";
 
@@ -17458,18 +17492,22 @@ static bool nativeA4kStats(NativeRife& nr, const void* in, int w, int h, cudaStr
     return true;
 }
 
-// Restore's chain end: img (planar fp32, tw x th, the net's values) lowered where its luma exceeds the maximum's
-// bilinear sample, then clipped to 0..1 (with SMV_A4K_CLAMP=0 only the clip)
-static bool nativeA4kClamp(NativeRife& nr, float* img, int tw, int th, cudaStream_t st)
+// a chain's end on a planar frame: img (planar fp32, tw x th, the net's values) lowered where its luma exceeds the
+// maximum's bilinear sample, then clipped to 0..1 (with SMV_A4K_CLAMP=0 only the clip); clip false = the values go on to
+// a Lanczos fit that clips (Mode A+A's 2x frame)
+static bool nativeA4kClamp(NativeRife& nr, float* img, int tw, int th, cudaStream_t st, bool clip = true)
 {
     if (!a4kClampOn())
     {
+        if (!clip)
+            return true;
         int n = 3 * tw * th;
         void* c[] = {&img, &n};
         return cuLaunchKernel(nr.fClamp01, (n + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, c, nullptr) ==
                CUDA_SUCCESS;
     }
-    void* a[] = {&img, &tw, &th, &nr.dA4kStat, &nr.a4kStatW, &nr.a4kStatH};
+    int clipI = clip ? 1 : 0;
+    void* a[] = {&img, &tw, &th, &nr.dA4kStat, &nr.a4kStatW, &nr.a4kStatH, &clipI};
     return cuLaunchKernel(nr.fA4k[7], (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) ==
            CUDA_SUCCESS;
 }
@@ -17485,6 +17523,7 @@ static void nativeA4kUpFree(NativeRife& nr)
         }
     nr.a4kW = nr.a4kH = nr.a4kOw = 0;
     nr.a4kN = 1;
+    nr.a4kAA = false;
 }
 
 // Anime4K at the slot's input size w x h (-> ow x oh after the fold): its kernel module (nativeA4kModule), the x2
@@ -17503,46 +17542,65 @@ static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upE
         return true;
     }
     int n = a4kPassesFor(w, h, ow, oh);
-    for (;; n--)
+    // Mode A+A: Restore runs on the first pass's 2x frame too, so the input, layer slots and the 2x frame hold it; it
+    // goes first when the memory is short (the room taken before allocating, no spill), then a pass
+    bool aa = g_a4kAA;
+    for (;;)
     {
         const int wm = w << (n - 1), hm = h << (n - 1);
-        const size_t sp = (size_t)wm * hm;
-        if (cudaMalloc(&nr.dA4kIn, 3 * sp * sizeof(uint16_t)) == cudaSuccess &&
-            cudaMalloc(&nr.dA4kT, 4 * 3 * sp * 8) == cudaSuccess &&
+        const size_t sp = (size_t)wm * hm, spa = (std::max)(sp, aa ? (size_t)4 * w * h : 0);
+        const bool mid = n > 1 || aa;
+        const uint64_t need = 3 * spa * sizeof(uint16_t) + 4 * 3 * spa * 8 + 12 * sp * sizeof(uint16_t) +
+                              (mid ? 3 * spa * sizeof(float) : 0) + (uint64_t)3 * ow * 2 * hm * sizeof(float);
+        const uint64_t room = aa ? nativeVideoMemoryRoom() : 0;
+        if ((!aa || !room || room >= need) && cudaMalloc(&nr.dA4kIn, 3 * spa * sizeof(uint16_t)) == cudaSuccess &&
+            cudaMalloc(&nr.dA4kT, 4 * 3 * spa * 8) == cudaSuccess &&
             cudaMalloc(&nr.dA4kOut, 12 * sp * sizeof(uint16_t)) == cudaSuccess &&
-            (n == 1 || cudaMalloc((void**)&nr.dA4kMid, 3 * sp * sizeof(float)) == cudaSuccess) &&
+            (!mid || cudaMalloc((void**)&nr.dA4kMid, 3 * spa * sizeof(float)) == cudaSuccess) &&
             cudaMalloc((void**)&nr.dA4kTmp, (size_t)3 * ow * 2 * hm * sizeof(float)) == cudaSuccess &&
             nativeA4kStatAlloc(nr, w, h))
             break;
         cudaGetLastError();
         nativeA4kUpFree(nr);
+        if (aa)
+        {
+            LOG("native: Anime4K A+A needs %.0f MiB of video memory, more than is free: Mode A for the %s\n",
+                need / 1048576.0, g_offline ? "render" : "session");
+            aa = false;
+            continue;
+        }
         if (n == 1)
         {
             LOG("native: Anime4K ran out of video memory, Lanczos for the %s\n", g_offline ? "render" : "session");
             nr.vsrFailed = true;
             return true;
         }
+        n--;
     }
     nr.a4kW = w;
     nr.a4kH = h;
     nr.a4kN = n;
     nr.a4kOw = ow;
+    nr.a4kAA = aa;
     const size_t sp0 = (size_t)w * h;
-    NCHK(cudaMemsetAsync(nr.dA4kIn, 0, 3 * sp0 * sizeof(uint16_t), nr.stream), "Anime4K warm-up clear");
+    NCHK(cudaMemsetAsync(nr.dA4kIn, 0, (aa ? 4 : 1) * 3 * sp0 * sizeof(uint16_t), nr.stream), "Anime4K warm-up clear");
     if (!nativeA4kStats(nr, nr.dA4kIn, w, h, nr.stream) ||
-        !nativeA4kPasses(nr, nr.stream, nr.dA4kIn, w, h, nr.dA4kT, nr.dA4kOut, false))
+        !nativeA4kPasses(nr, nr.stream, nr.dA4kIn, w, h, nr.dA4kT, nr.dA4kOut, false) ||
+        (aa && !nativeA4kPasses(nr, nr.stream, nr.dA4kIn, 2 * w, 2 * h, nr.dA4kT, nr.dA4kMid, true)))
     {
         LOG("native: Anime4K warm-up launch failed\n");
         return false;
     }
     NCHK(cudaStreamSynchronize(nr.stream), "Anime4K warm-up sync");
-    char passes[48] = "";
+    char passes[48] = "", aaNote[64] = "";
     if (n > 1)
         sprintf_s(passes, " in %d x2 passes", n);
-    LOG("native: %s upscale: Anime4K Upscale CNN x2 UL %dx%d -> %dx%d%s -> Lanczos %dx%d%s%s%s (CUDA passes, "
+    if (aa)
+        sprintf_s(aaNote, ", A+A (Restore CNN UL on the %dx%d frame)", 2 * w, 2 * h);
+    LOG("native: %s upscale: Anime4K Upscale CNN x2 UL %dx%d -> %dx%d%s%s -> Lanczos %dx%d%s%s%s (CUDA passes, "
         "tensor-core layers with fp16 sums, %.1fs)\n",
-        g_offline ? "offline" : "live", w, h, w << n, h << n, passes, ow, oh, a4kClampOn() ? ", Clamp_Highlights" : "",
-        nr.vsrPre ? ", the captured frame before the model" : "",
+        g_offline ? "offline" : "live", w, h, w << n, h << n, passes, aaNote, ow, oh,
+        a4kClampOn() ? ", Clamp_Highlights" : "", nr.vsrPre ? ", the captured frame before the model" : "",
         nr.hdr ? ", on the HDR planes' SDR view" : (upEnc ? ", on the HDR video's SDR view" : ""),
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return true;
@@ -17588,7 +17646,8 @@ static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int 
             return false;
         }
         int one = 1, h2 = 2 * h;
-        if (k + 1 < nr.a4kN)
+        const bool aaHere = nr.a4kAA && k == 0; // Mode A+A: Restore on this pass's 2x frame before the chain goes on
+        if (k + 1 < nr.a4kN || aaHere)
         {
             void* a2[] = {&nr.dA4kOut, &one, &nr.dA4kIn, &w, &h, &nr.dA4kMid, &noStat, &zero, &zero, &zero};
             if (cuLaunchKernel(nr.fA4kFold2x, (2 * w + 15) / 16, (h2 + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a2,
@@ -17601,7 +17660,61 @@ static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int 
             half = 0;
             ps = 4 * w * h;
             rs = 2 * w;
-            continue;
+            if (aaHere)
+            {
+                // the 2x frame as fp16 planes, Restore CNN UL's passes on it, its output (the net's values, unclipped)
+                // back into dA4kMid: the next pass's input, or the chain's end below
+                int w2 = 2 * w;
+                void* ai[] = {(void*)&src, &half, &ps, &rs, &w2, &h2, &nr.dA4kIn};
+                if (cuLaunchKernel(nr.fRestIn, (w2 + 15) / 16, (h2 + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ai,
+                                   nullptr) != CUDA_SUCCESS ||
+                    !nativeA4kPasses(nr, st, nr.dA4kIn, w2, h2, nr.dA4kT, nr.dA4kMid, true))
+                {
+                    nr.die("Anime4K A+A restore launch failed");
+                    return false;
+                }
+            }
+            if (k + 1 < nr.a4kN)
+                continue;
+            // a one-pass chain's end after A+A: Clamp_Highlights on the 2x frame (the shader's PREKERNEL hook), then
+            // the clip alone at an exact 2x target, else the Lanczos pair, which clips
+            const bool exact = tw == 2 * w && th == h2;
+            if (!nativeA4kClamp(nr, nr.dA4kMid, 2 * w, h2, st, exact))
+            {
+                nr.die("Anime4K A+A clamp launch failed");
+                return false;
+            }
+            if (exact)
+            {
+                if (cudaMemcpyAsync(dst, nr.dA4kMid, (size_t)3 * tw * th * sizeof(float), cudaMemcpyDeviceToDevice,
+                                    st) != cudaSuccess)
+                {
+                    nr.die("Anime4K A+A copy failed");
+                    return false;
+                }
+                break;
+            }
+            const void* tabH = rsTabFor(nr, 2 * w, tw, st);
+            const void* tabV = rsTabFor(nr, h2, th, st);
+            if (!tabH || !tabV)
+            {
+                nr.die("Anime4K fold tap tables failed");
+                return false;
+            }
+            // unclipped taps across (k_fitAaH; k_restFoldH would clip each), the one clip in the vertical pass, as
+            // Mode A's last fold does
+            int w2 = 2 * w;
+            void* ah[] = {(void*)&src, &half, &ps, &rs, &w2, &h2, &nr.dA4kTmp, &tw, (void*)&tabH};
+            void* av[] = {&nr.dA4kTmp, &tw, &h2, &dst, &th, (void*)&tabV};
+            if (cuLaunchKernel(nr.fFitAaH, (tw + 15) / 16, (h2 + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah,
+                               nullptr) != CUDA_SUCCESS ||
+                cuLaunchKernel(nr.fRestFoldV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av,
+                               nullptr) != CUDA_SUCCESS)
+            {
+                nr.die("Anime4K A+A fit launch failed");
+                return false;
+            }
+            break;
         }
         if (tw == 2 * w && th == h2)
         {
@@ -22696,6 +22809,8 @@ static const char kFuA[] = R"FUSRC(
 //             a block, the weights from global memory in fragment order a k-step ahead, the halo in shared memory, fp16
 //             accumulators from the bias; P: the halo through PReLU(slope) in fp16 (the PReLU before the conv; zeros stay
 //             zeros); 1 / 2: y = conv + add0 (+ add1) at the output pixel in fp32, one rounding to fp16
+// k_fuW64P*4  the PReLU ones on a 4 x 32 output tile (a warp = 1 row = 2 m-tiles): a 6-row halo (26 KB), three CTAs an
+//             SM; every output the same sum in the same order as its 8-row twin (the same bytes)
 // k_fuW2PH    the stride-2 convs the same way with a 4 x 32 output tile (a warp = 1 row = 2 m-tiles), the halo 9 x 65 with
 //             each row's even offsets before its odd ones, fp16 accumulators
 // k_fuUp64H   ConvTranspose cin -> cout (4 x 4, stride 2, pad 1) from W x H to 2W x 2H through PReLU: per output parity
@@ -22870,13 +22985,14 @@ static const char kFuB[] = R"FUSRC(
 // the wide conv at stride S, 128 threads: x = cin channels-last fp16 at W x H; y = cout channels-last fp16 at W / S x
 // H / S; wf[z][step][q][lane] (step = (group * 9 + tap) * CG / 16 + kc, q = an n-tile pair); bias fp32; add0 / add1 =
 // cout channels-last fp16 at the output size (NADD of them); A32: fp32 accumulators, else fp16 ones
-template <int S, int CG, int NB, bool PRE, int NADD, bool A32>
+// TH1 = the output rows of a stride-1 tile (8, or 4 = a warp = 1 row); the stride-2 tile is always 4 rows
+template <int S, int CG, int NB, bool PRE, int NADD, bool A32, int TH1 = 8>
 __device__ __forceinline__ void fuConvW(const unsigned short* __restrict__ x, int cin, int H, int W,
                                         unsigned short* __restrict__ y, int cout, const uint4* __restrict__ wf,
                                         const float* __restrict__ bias, float slope,
                                         const unsigned short* __restrict__ add0, const unsigned short* __restrict__ add1)
 {
-    constexpr int TH = S == 1 ? 8 : 4, RW = S == 1 ? 2 : 1, MI = 2 * RW;
+    constexpr int TH = S == 1 ? TH1 : 4, RW = TH / 4, MI = 2 * RW;
     constexpr int HR = S == 1 ? TH + 2 : 2 * TH + 1, HC = S == 1 ? 34 : 65;
     const int OW = W / S, OH = H / S;
     constexpr int NCH = CG / 8, KC = CG / 16, NQ = NB / 2;
@@ -23044,6 +23160,17 @@ FU_CONVW(k_fuW64PH, 1, 64, true, 0, false)
 FU_CONVW(k_fuW64P1H, 1, 64, true, 1, false)
 FU_CONVW(k_fuW64P2H, 1, 64, true, 2, false)
 FU_CONVW(k_fuW2PH, 2, 32, true, 0, false)
+#define FU_CONVW4(NAME, PRE, NADD)                                                                                     \
+    extern "C" __global__ void __launch_bounds__(128)                                                                  \
+        NAME(const unsigned short* __restrict__ x, int cin, int H, int W, unsigned short* __restrict__ y, int cout,    \
+             const uint4* __restrict__ wf, const float* __restrict__ bias, float slope,                               \
+             const unsigned short* __restrict__ add0, const unsigned short* __restrict__ add1)                        \
+    {                                                                                                                  \
+        fuConvW<1, 64, 8, PRE, NADD, false, 4>(x, cin, H, W, y, cout, wf, bias, slope, add0, add1);                    \
+    }
+FU_CONVW4(k_fuW64PH4, true, 0)
+FU_CONVW4(k_fuW64P1H4, true, 1)
+FU_CONVW4(k_fuW64P2H4, true, 2)
 
 // ConvTranspose cin -> cout (4 x 4, stride 2, pad 1) through PReLU(slope): x = cin channels-last fp16 at W x H, y = cout
 // channels-last fp16 at 2W x 2H; blockIdx.z = the 16-output group; wf[z][group][class][tap][kc][lane]
@@ -23155,8 +23282,8 @@ extern "C" __global__ void __launch_bounds__(128)
     }
 }
 )FUSRC";
-static const char* const kFuKern[] = {"k_fuIn",     "k_fuC16",    "k_fuW64H", "k_fuW64PH",
-                                      "k_fuW64P1H", "k_fuW64P2H", "k_fuW2PH", "k_fuUp64H"};
+static const char* const kFuKern[] = {"k_fuIn",   "k_fuC16",   "k_fuW64H",   "k_fuW64PH",   "k_fuW64P1H", "k_fuW64P2H",
+                                      "k_fuW2PH", "k_fuUp64H", "k_fuW64PH4", "k_fuW64P1H4", "k_fuW64P2H4"};
 static_assert(sizeof(kFuKern) / sizeof(kFuKern[0]) == sizeof(NativeRife::fFu) / sizeof(CUfunction),
               "one fFu slot a fusionnet kernel");
 enum
@@ -23168,12 +23295,16 @@ enum
     kFuW64P1,
     kFuW64P2,
     kFuW2,
-    kFuUp
+    kFuUp,
+    kFuW64PR4, // the 4-row twins of kFuW64P / kFuW64P1 / kFuW64P2, in that order
+    kFuW64P1R4,
+    kFuW64P2R4
 };
-// fu_host.cu's dynamic shared memory: k_fuC16's halo + weights (a 4 x 32 tile), the wide stride-1 convs' halo (8 x 32),
-// the stride-2 ones' (9 x 65), the transposed conv's halo + one group's weights (above the default 48 KB)
-constexpr int kFuSmC16 = (6 * 34 * 2 + 9 * 32) * 16, kFuSmW64 = 10 * 34 * 8 * 16, kFuSmW2 = 9 * 65 * 4 * 16,
-              kFuSmUp = (6 * 34 * 8 + 16 * 4 * 32) * 16;
+// fu_host.cu's dynamic shared memory: k_fuC16's halo + weights (a 4 x 32 tile), the wide stride-1 convs' halo (8 x 32)
+// and their 4-row twins' (4 x 32), the stride-2 ones' (9 x 65), the transposed conv's halo + one group's weights (above
+// the default 48 KB)
+constexpr int kFuSmC16 = (6 * 34 * 2 + 9 * 32) * 16, kFuSmW64 = 10 * 34 * 8 * 16, kFuSmW64R4 = 6 * 34 * 8 * 16,
+              kFuSmW2 = 9 * 65 * 4 * 16, kFuSmUp = (6 * 34 * 8 + 16 * 4 * 32) * 16;
 // a level's channels and the most buffers one level may hold
 constexpr int kFuCh[3] = {64, 128, 192}, kFuMaxSlots = 8;
 // fuPlan's buffer codes: the chain's inputs and output, then level l's buffer i = kFuRefSlot + l kFuMaxSlots + i
@@ -23446,6 +23577,8 @@ static size_t fuNatBytes(const NativeRife& nr)
     return nr.gmfss && nr.hw > 0 && nr.hh > 0 ? fuArena(nr.hw, nr.hh).total : 0;
 }
 
+static bool gaTuring();
+
 // this session's fusionnet module: the weights read, its text compiled (or the cached cubin) and loaded, its kernels
 // bound, the weight block and conv_last uploaded, the b / c / d slopes into gmLr; false = `why` (the session teardown
 // unloads a module left in fuMod)
@@ -23490,6 +23623,16 @@ static bool nativeFuModule(NativeRife& nr, std::string& why)
     {
         why = "its transposed conv's shared memory was refused";
         return false;
+    }
+    // a PReLU wide conv below 256 outputs whose 8-row grid holds 8+ CTAs an SM runs as its 4-row twin (the same bytes,
+    // three CTAs an SM where the 8-row halo allows two: 1.01x to 1.20x a launch on 82 SMs; a tie or slower on smaller
+    // grids, at 256 outputs and on the head convs without PReLU); never on RTX 20 (unmeasured); SMV_FU_R4=0 = never
+    {
+        int dev = 0, sms = 0;
+        nr.fuR4Min = !gaTuring() && lkEnv("SMV_FU_R4") != "0" && cudaGetDevice(&dev) == cudaSuccess &&
+                             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess
+                         ? 8 * sms
+                         : 0;
     }
     if (cudaMalloc(&nr.dFuW, blob.size()) != cudaSuccess ||
         cudaMemcpy(nr.dFuW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
@@ -23567,8 +23710,14 @@ static bool nativeFuLaunch(NativeRife& nr, uint8_t* s, cudaStream_t st)
         {
             const bool s2 = o.k == kFuW2;
             const int ow = s2 ? iw / 2 : iw, oh = s2 ? ih / 2 : ih;
+            const bool r4 = (o.k == kFuW64P || o.k == kFuW64P1 || o.k == kFuW64P2) && cout < 256 && nr.fuR4Min > 0 &&
+                            ((ow + 31) / 32) * ((oh + 7) / 8) * (cout / 64) >= nr.fuR4Min;
             void* a[] = {&x, &cin, &ih, &iw, &y, &cout, (void*)&wf, (void*)&bias, &sl, &a0, &a1};
-            ok = go(o.k, (ow + 31) / 32, s2 ? (oh + 3) / 4 : (oh + 7) / 8, cout / 64, 128, s2 ? kFuSmW2 : kFuSmW64, a);
+            if (r4)
+                ok = go(kFuW64PR4 + (o.k - kFuW64P), (ow + 31) / 32, (oh + 3) / 4, cout / 64, 128, kFuSmW64R4, a);
+            else
+                ok = go(o.k, (ow + 31) / 32, s2 ? (oh + 3) / 4 : (oh + 7) / 8, cout / 64, 128, s2 ? kFuSmW2 : kFuSmW64,
+                        a);
         }
         if (!ok)
             return false;
@@ -25432,13 +25581,16 @@ extern "C" __global__ void __launch_bounds__(256, 1)
 
 // the cross layer's mlp on 128 tokens a CTA (8 warps of 16): mlp.0 (256 -> 1024, GELU) on cat(s16, m16) in 32-wide
 // hidden chunks that stay in registers as mlp.2's (1024 -> 128) operand, then norm2 and the residual: x32 += norm2(..),
-// x16 = fp16(x32). w0 = [1024][256]; w2c = mlp.2 in chunks [32][128][32]; weight chunks in a GA_MSTN-stage cp.async
-// ring.
-extern "C" __global__ void __launch_bounds__(256, 1)
-    k_gaMlp(const unsigned short* __restrict__ s16, const unsigned short* __restrict__ m16, int M,
-            const unsigned short* __restrict__ w0, const unsigned short* __restrict__ w2c,
-            const float* __restrict__ gam, const float* __restrict__ bet, float eps, float* __restrict__ x32,
-            unsigned short* __restrict__ x16)
+// x16 = fp16(x32). w0 = [1024][256]; w2c = mlp.2 in chunks [32][128][32]; weight chunks in an NST-stage cp.async
+// ring. Two entry points, the same arithmetic in the same order (the same bytes): k_gaMlp (one CTA an SM, the GA_MSTN
+// ring) and k_gaMlp2 (two CTAs an SM: a 2-stage ring of 48 KB, 128 registers) for grids of 3+ CTAs an SM, where the
+// second CTA hides the first one's waits.
+template <int NST>
+__device__ __forceinline__ void gaMlpBody(const unsigned short* __restrict__ s16, const unsigned short* __restrict__ m16,
+                                          int M, const unsigned short* __restrict__ w0,
+                                          const unsigned short* __restrict__ w2c, const float* __restrict__ gam,
+                                          const float* __restrict__ bet, float eps, float* __restrict__ x32,
+                                          unsigned short* __restrict__ x16)
 {
     extern __shared__ __align__(16) unsigned char sm[];
     unsigned short* st = reinterpret_cast<unsigned short*>(sm);
@@ -25464,7 +25616,7 @@ extern "C" __global__ void __launch_bounds__(256, 1)
         gaCommit();
     };
 #pragma unroll
-    for (int s = 0; s < GA_MSTN - 1; ++s)
+    for (int s = 0; s < NST - 1; ++s)
         load(s, s);
 
     unsigned a[16][4];
@@ -25491,13 +25643,13 @@ extern "C" __global__ void __launch_bounds__(256, 1)
         oh[nt][0] = oh[nt][1] = 0u;
 
     for (int hc = 0; hc < 1024 / GA_HC; ++hc) {
-        gaWait<GA_MSTN - 2>();
+        gaWait<NST - 2>();
         __syncthreads();
-        if (hc + GA_MSTN - 1 < 1024 / GA_HC)
-            load(hc + GA_MSTN - 1, (hc + GA_MSTN - 1) % GA_MSTN);
+        if (hc + NST - 1 < 1024 / GA_HC)
+            load(hc + NST - 1, (hc + NST - 1) % NST);
         else
             gaCommit();
-        const unsigned short* d0 = st + (hc % GA_MSTN) * GA_MST;
+        const unsigned short* d0 = st + (hc % NST) * GA_MST;
         const unsigned short* d2 = d0 + GA_HC * 256;
         float h[4][4];
         {
@@ -25554,16 +25706,36 @@ extern "C" __global__ void __launch_bounds__(256, 1)
     gaStore(o, ok0 ? static_cast<long long>(r0) * 128 : -1, ok1 ? static_cast<long long>(r1) * 128 : -1, t4, true, x32,
             x16);
 }
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+    k_gaMlp(const unsigned short* __restrict__ s16, const unsigned short* __restrict__ m16, int M,
+            const unsigned short* __restrict__ w0, const unsigned short* __restrict__ w2c,
+            const float* __restrict__ gam, const float* __restrict__ bet, float eps, float* __restrict__ x32,
+            unsigned short* __restrict__ x16)
+{
+    gaMlpBody<GA_MSTN>(s16, m16, M, w0, w2c, gam, bet, eps, x32, x16);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2)
+    k_gaMlp2(const unsigned short* __restrict__ s16, const unsigned short* __restrict__ m16, int M,
+             const unsigned short* __restrict__ w0, const unsigned short* __restrict__ w2c,
+             const float* __restrict__ gam, const float* __restrict__ bet, float eps, float* __restrict__ x32,
+             unsigned short* __restrict__ x16)
+{
+    gaMlpBody<2>(s16, m16, M, w0, w2c, gam, bet, eps, x32, x16);
+}
 )GASRC";
 
-static const char* const kGaKern[5] = {"k_gaFlowUp", "k_gaWarpPos", "k_gaProj", "k_gaAttn", "k_gaMlp"};
+static const char* const kGaKern[] = {"k_gaFlowUp", "k_gaWarpPos", "k_gaProj", "k_gaAttn", "k_gaMlp", "k_gaMlp2"};
 enum
 {
     kGaFlowUpK,
     kGaWarpPosK,
     kGaProjK,
     kGaAttnK,
-    kGaMlpK
+    kGaMlpK,
+    kGaMlp2K,
+    kGaKernN
 };
 // the weight block (gaNatLoad): layer l's pieces at 7 l: g1 = the self attention's q' and v' folds and the cross one's v'
 // fold [384][128], g2 = the cross q' fold [128][128], mlp.0 [1024][256], mlp.2 in 32-wide hidden chunks [32][128][32]
@@ -25699,9 +25871,9 @@ static int gaSmAttn()
     const int kt = gaTuring() ? 32 : 64;
     return 4 * kt * 128 * 2 + 2 * kt * 4;
 }
-static int gaSmMlp()
+static int gaSmMlp(bool two = false)
 {
-    return (gaTuring() ? 2 : 3) * (32 * 256 + 128 * 32) * 2;
+    return (two || gaTuring() ? 2 : 3) * (32 * 256 + 128 * 32) * 2;
 }
 
 // the transformer's activations at A's scale (4 rows of the quarter's tokens; `_m`'s 2 rows of the eighth's fit
@@ -25760,7 +25932,9 @@ static bool nativeGaModule(NativeRife& nr, std::string& why)
         why = "its kernel module did not load";
         return false;
     }
-    for (int i = 0; i < 5; i++)
+    static_assert(sizeof(kGaKern) / sizeof(kGaKern[0]) == kGaKernN && kGaKernN <= sizeof(nr.fGa) / sizeof(nr.fGa[0]),
+                  "the gmflow kernel names, enum and handles agree");
+    for (int i = 0; i < kGaKernN; i++)
         if (cuModuleGetFunction(&nr.fGa[i], nr.gaMod, kGaKern[i]) != CUDA_SUCCESS)
         {
             why = std::string("its kernel ") + kGaKern[i] + " is missing";
@@ -25768,10 +25942,23 @@ static bool nativeGaModule(NativeRife& nr, std::string& why)
         }
     if (cuFuncSetAttribute(nr.fGa[kGaAttnK], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gaSmAttn()) !=
             CUDA_SUCCESS ||
-        cuFuncSetAttribute(nr.fGa[kGaMlpK], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gaSmMlp()) != CUDA_SUCCESS)
+        cuFuncSetAttribute(nr.fGa[kGaMlpK], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gaSmMlp()) !=
+            CUDA_SUCCESS ||
+        cuFuncSetAttribute(nr.fGa[kGaMlp2K], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gaSmMlp(true)) !=
+            CUDA_SUCCESS)
     {
         why = "its kernels could not get their shared memory";
         return false;
+    }
+    // the mlp's two-CTA form (k_gaMlp2: the same bytes) from 3 CTAs an SM, where a second CTA hides the first one's
+    // waits (1.04x at 256 CTAs on 82 SMs, 1.10x at 512 and 1020, 1.14x at 4080; 0.98x at 128); never on RTX 20 (two
+    // 48 KB rings do not fit its 64 KB); SMV_GA_MLP2=0 = never
+    {
+        int dev = 0, sms = 0;
+        nr.gaMlp2Min = !gaTuring() && lkEnv("SMV_GA_MLP2") != "0" && cudaGetDevice(&dev) == cudaSuccess &&
+                               cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess
+                           ? 3 * sms
+                           : 0;
     }
     if (cudaMalloc(&nr.dGaW, blob.size()) != cudaSuccess ||
         cudaMemcpy(nr.dGaW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
@@ -25828,7 +26015,9 @@ static bool nativeGaLaunch(NativeRife& nr, int scale, const void* maps, const vo
         if (!go(kGaWarpPosK, (unsigned)((P + 31) / 32), (unsigned)rows, 1, 256, 0, a))
             return false;
     }
-    const unsigned gm = (unsigned)((M + 63) / 64);
+    const unsigned gm = (unsigned)((M + 63) / 64), mlpCtas = (unsigned)((M + 127) / 128),
+                   smM2 = (unsigned)gaSmMlp(true);
+    const bool mlp2 = nr.gaMlp2Min > 0 && mlpCtas >= (unsigned)nr.gaMlp2Min;
     for (int l = 0; l < 6; l++)
     {
         int shift = l & 1;
@@ -25849,7 +26038,7 @@ static bool nativeGaLaunch(NativeRife& nr, int scale, const void* maps, const vo
             !go(kGaAttnK, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a2) ||
             !go(kGaProjK, gm, 1, 1, 128, kGaSmProj, a3) ||
             !go(kGaAttnK, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a4) ||
-            !go(kGaMlpK, (unsigned)((M + 127) / 128), 1, 1, 256, smM, a5))
+            !(mlp2 ? go(kGaMlp2K, mlpCtas, 1, 1, 256, smM2, a5) : go(kGaMlpK, mlpCtas, 1, 1, 256, smM, a5)))
             return false;
     }
     if (!scale)
@@ -28317,6 +28506,10 @@ static void nativeNrMotionFree(NativeRife& nr)
 // (k_nvofUp) and validated (k_nrMv) into the core's MVec texture; the stream's first frame
 // (a Reset) gets a zero field. The slots alternate, so the previous frame's luma stays in place.
 static const float kNrMvMargin = 25.0f; // one 8-bit level per pixel of the 5x5 window (k_nrMv)
+static const float kNrMvReal = 0.5f;    // a window that changed by more than half a level a pixel ...
+static const float kNrMvShare = 0.4f;   // ... keeps a vector that removes at least 40 % of that change (k_nrMv)
+static const float kNrMvFlat = 1.0f;    // a window neither test decides keeps a vector of 1 px or more ...
+static const float kNrMvCoh = 1.0f;     // ... when the field 8 px away agrees within 1 px (k_nrMv)
 static bool nativeNrMotion(NativeRife& nr, const float* frame, int pw, int ps)
 {
     cudaStream_t st = nr.stream;
@@ -28359,9 +28552,37 @@ static bool nativeNrMotion(NativeRife& nr, const float* frame, int pw, int ps)
     CUdeviceptr v = nr.nrOfOutP, c = 0;
     float* flow = nr.dNrFlow;
     float* cost = nullptr; // flow only
-    float margin = kNrMvMargin;
+    // SMV_NR_MV_MARGIN=F: the validation's margin for an A/B (a large negative value keeps every Optical Flow vector)
+    static const float marginSet = [] {
+        const std::string m = lkEnv("SMV_NR_MV_MARGIN");
+        return m.empty() ? kNrMvMargin : (float)atof(m.c_str());
+    }();
+    float margin = marginSet;
+    // the relative keep (k_nrMv): a window that changed by more than kNrMvReal 8-bit levels a pixel keeps a vector that
+    // removes at least kNrMvShare of that change; SMV_NR_MV_REAL=F / SMV_NR_MV_SHARE=F for an A/B (SHARE 0 = off: the
+    // absolute test alone, the earlier field)
+    static const float realSet = [] {
+        const std::string m = lkEnv("SMV_NR_MV_REAL");
+        return 25.0f * (m.empty() ? kNrMvReal : (float)atof(m.c_str()));
+    }();
+    static const float shareSet = [] {
+        const std::string m = lkEnv("SMV_NR_MV_SHARE");
+        return m.empty() ? kNrMvShare : (float)atof(m.c_str());
+    }();
+    // a window neither test decides keeps a vector of kNrMvFlat px or more (k_nrMv); SMV_NR_MV_FLAT=F for an A/B (0 =
+    // off: such a window gets zero)
+    static const float flatSet = [] {
+        const std::string m = lkEnv("SMV_NR_MV_FLAT");
+        return m.empty() ? kNrMvFlat : (float)atof(m.c_str());
+    }();
+    // ... when the field 8 px away agrees within kNrMvCoh px (k_nrMv); SMV_NR_MV_COH=F for an A/B (0 = no agreement test)
+    static const float cohSet = [] {
+        const std::string m = lkEnv("SMV_NR_MV_COH");
+        return m.empty() ? kNrMvCoh : (float)atof(m.c_str());
+    }();
+    float real = realSet, share = shareSet, flat = flatSet, coh = cohSet;
     void* b[] = {&v, &vp, &c, &cp, &nr.nrOfGw, &nr.nrOfGh, &grid, &w, &h, &flow, &cost};
-    void* m[] = {&flow, &lc, &lp, &lpitch, &w, &h, &margin, &nr.sfNrMv};
+    void* m[] = {&flow, &lc, &lp, &lpitch, &w, &h, &margin, &real, &share, &flat, &coh, &nr.sfNrMv};
     if (cuLaunchKernel(nr.fNvofUp, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) !=
             CUDA_SUCCESS ||
         cuLaunchKernel(nr.fNrMv, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, m, nullptr) !=
@@ -29590,7 +29811,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // last DLSS 5 output and skips TrueHDR, Restore, the resize and the evaluate (the history stays
     // untouched, so a paused picture stays exactly still)
     bool nrSame = false;
-    if (nr.liveNr && !nr.nrFailed)
+    if (nr.liveNr && !nr.nrPaused && !nr.nrFailed)
     {
         if (g_liveNrReset.exchange(false))
             nr.nrFirst = true; // the overlay was hidden: a new stream
@@ -29868,7 +30089,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // DLSS 5: once per captured frame on the model frame, after Restore and the
     // resize and before any model reads it; then Sharpen and RTX TrueHDR (nativePreModelPost), and the
     // frame the model reads is kept for the reuse above
-    if (nr.liveNr && !nr.nrFailed && !nrSame && !nativeNrFrame(nr, dCur, nr.pw, nr.ph, (int)plane))
+    if (nr.liveNr && !nr.nrPaused && !nr.nrFailed && !nrSame && !nativeNrFrame(nr, dCur, nr.pw, nr.ph, (int)plane))
         return false;
     // RIFE's motion frame (two domains): the finished picture as the IFNet would have read it, minus
     // what costs RIFE its motion: the HDR desktop's PQ encoding (read as SDR sRGB over the desktop's
@@ -29914,7 +30135,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         nr.die("motion frame launch failed");
         return false;
     }
-    if (nr.liveNr && !nr.nrFailed && !nrSame)
+    if (nr.liveNr && !nr.nrPaused && !nr.nrFailed && !nrSame)
         nr.nrHaveLast = true;
 
     // native DRBA: the new frame and its encode into the history ring; the group then shows
@@ -30559,6 +30780,224 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
 }
 // ---- part 4: the compute thread and the public entry point --------------------------------
 
+// the stdin `set` lines that arrived since the last frame group (g_liveSets), on the native thread that reads these
+// values: the Sharpen strength (0 = off, on = its buffers first), RTX VSR's quality while RTX VSR is the upscaler, the RTX HDR
+// sliders while RTX HDR runs, DLSS 5's Structure / Tone and its passes (more are built in place, memory permitting) while
+// DLSS 5 runs (held for its start while it does not), DLSS 5 itself on / off (nativeNrSwitch), the HUD (the loop
+// thread's), the upscaler / Restore / RTX HDR kind this session runs off and on again (their fallbacks); each read
+// again at its next launch / evaluate; the HUD's latency segment (the loop thread's next paint). Any other key, or one
+// whose effect this session does not run, waits for the next session's arguments (the app passes the new value there)
+// Sharpen turned on in a running session: its tight result (and the HDR planes' SDR view) at the model frame's size,
+// when the video memory room holds them; false = the next session takes it (its own fit gives the picked effects room)
+static bool nativeSharpenOn(NativeRife& nr)
+{
+    const bool view = nr.encPost && nr.shHdrView;
+    const size_t one = (size_t)3 * nr.w * nr.h * sizeof(float);
+    const uint64_t need = (nr.dShOut ? 0 : one) + (view && !nr.dShIn ? one : 0);
+    const uint64_t room = nativeVideoMemoryRoom();
+    if (need && room && room < need)
+        return false;
+    if (!nr.dShOut && cudaMalloc((void**)&nr.dShOut, one) != cudaSuccess)
+    {
+        nr.dShOut = nullptr;
+        return false;
+    }
+    if (view && !nr.dShIn && cudaMalloc((void**)&nr.dShIn, one) != cudaSuccess)
+    {
+        nr.dShIn = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// DLSS 5 switched in a running session: off = the pass skips (the core and its memory stay for the session); on again
+// = it resumes from a Reset (the history stopped with it); on in a session that started without it = the core brought
+// up as the session start does (nativeLiveNrInit, at the held Structure / Tone / passes / Style), when the video memory
+// room holds its working memory. false = this session cannot (why says it); the next session takes it
+static bool nativeNrSwitch(NativeRife& nr, bool on, std::string& why)
+{
+    if (!on)
+    {
+        nr.nrPaused = nr.liveNr;
+        return true;
+    }
+    if (nr.liveNr && nr.nrHost && !nr.nrFailed)
+    {
+        if (nr.nrPaused)
+        {
+            nr.nrPaused = false;
+            nr.nrFirst = true;
+            nr.nrHaveLast = false;
+        }
+        return true;
+    }
+    if (nr.nrFailed)
+    {
+        why = "DLSS 5 stopped earlier in this session";
+        return false;
+    }
+    if (g_backend != BK_SERVER)
+    {
+        why = "this route runs no native pass";
+        return false;
+    }
+    const int p = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
+    const uint64_t need = (uint64_t)((kNrLiveLateBase + nr::kFrameMp * nr.w * nr.h / 1e6 * p) * 1048576.0);
+    const uint64_t room = nativeVideoMemoryRoom();
+    if (room && room < need)
+    {
+        why = "not enough free video memory";
+        return false;
+    }
+    g_liveNrCuda = g_nrNative = g_nrAttempted = true;
+    if (!nativeLiveNrInit(nr))
+    {
+        why = "an allocation failed";
+        return false;
+    }
+    if (!nr.liveNr)
+    {
+        why = "the core did not start (the line above)";
+        return false;
+    }
+    return true;
+}
+
+static void nativeLiveSets(NativeRife& nr)
+{
+    std::vector<std::pair<std::string, std::string>> q;
+    {
+        std::lock_guard<std::mutex> lk(g_liveSets.m);
+        if (g_liveSets.q.empty())
+            return;
+        q.swap(g_liveSets.q);
+    }
+    for (const auto& [key, val] : q)
+    {
+        const double v = atof(val.c_str());
+        auto clampU = [](double x, double lo, double hi) { return (uint32_t)(x < lo ? lo : (x > hi ? hi : x)); };
+        auto clampF = [](double x, double lo, double hi) { return (float)(x < lo ? lo : (x > hi ? hi : x)); };
+        bool done = true;
+        const bool nrOn = nr.liveNr && nr.nrHost && !nr.nrFailed;
+        if (key == "sharpen" && v > 0.0 && (nr.sharpen > 0.0f || nativeSharpenOn(nr)))
+            nr.sharpen = clampF(v, 0.0, 2.0);
+        else if (key == "sharpen" && v <= 0.0)
+            nr.sharpen = 0.0f;
+        else if (key == "nrstruct" && nrOn)
+            nr.nrHost->setStructure(clampF(v, 0.0, 2.0));
+        else if (key == "nrtone" && nrOn)
+            nr.nrHost->setTone(clampF(v, 0.0, 2.0));
+        else if (key == "nrstyle" && nrOn)
+            nr.nrHost->setStyle((int)clampU(v, 0.0, 2.0));
+        else if (key == "nrpasses" && nrOn)
+        {
+            // more passes than the session built: their features and frames now (nr::Host::growPasses, a few frames'
+            // pause), as many as the video memory room holds (each pass's working memory, nr::kFrameMp a megapixel)
+            const int want = (int)clampU(v, 1.0, (double)nr::kMaxPasses);
+            const int had = nr.nrHost->passes();
+            std::string why;
+            if (want > had)
+            {
+                const uint64_t per = (uint64_t)(nr::kFrameMp * nr.nrW * nr.nrH / 1e6 * 1048576.0);
+                const uint64_t room = nativeVideoMemoryRoom();
+                const int fit = room && per ? had + (int)(room / per) : want;
+                const int to = (std::min)(want, fit);
+                if (to > had)
+                {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const int now = nr.nrHost->growPasses(to, why);
+                    LOG("live DLSS 5: %d more passes built in %.0f ms (%d now)%s%s\n", now - had,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), now,
+                        why.empty() ? "" : ": ", why.c_str());
+                }
+                if (to < want && why.empty())
+                    why = "no video memory for more";
+            }
+            const int run = nr.nrHost->runPasses(want);
+            if (run < want)
+            {
+                LOG("live set: nrpasses %s (%d run: %s)\n", val.c_str(), run, why.c_str());
+                continue;
+            }
+        }
+        else if ((key == "nrstruct" || key == "nrtone" || key == "nrpasses" || key == "nrstyle") && !nrOn)
+        {
+            // DLSS 5 not running here: held for its start in place (key dlssnr)
+            if (key == "nrstruct")
+                g_nrStructure = clampF(v, 0.0, 2.0);
+            else if (key == "nrtone")
+                g_nrTone = clampF(v, 0.0, 2.0);
+            else if (key == "nrpasses")
+                g_nrPasses = (int)clampU(v, 1.0, (double)nr::kMaxPasses);
+            else
+                g_nrStyle = (int)clampU(v, 0.0, 2.0);
+            LOG("live set: %s %s (held for DLSS 5's start)\n", key.c_str(), val.c_str());
+            continue;
+        }
+        else if (key == "dlssnr")
+        {
+            std::string why;
+            if (!nativeNrSwitch(nr, v != 0.0, why))
+            {
+                LOG("live set: dlssnr %s (the next session takes it: %s)\n", val.c_str(), why.c_str());
+                continue;
+            }
+        }
+        else if (key == "hudlat" && !g_noHud)
+            g_noHudLat.store(v == 0.0);
+        else if (key == "hud")
+            g_hudWant.store(v != 0.0 ? 1 : 0); // the loop thread owns the window (applyHudWant)
+        else if (key == "up" || key == "restore" || key == "rtxhdr")
+        {
+            // the session's own kind (up: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS; restore: 1
+            // Real-ESRGAN, 2 AnimeJaNai, 3 Anime4K; rtxhdr: 1), 0 = it runs none
+            const int kind = key == "up"        ? (!nr.vsr    ? 0
+                                                   : nr.fsrUp ? (nr.fuKind ? 5 : 2)
+                                                   : nr.a4kUp ? 3
+                                                   : nr.acnUp ? 4
+                                                              : 1)
+                             : key == "restore" ? (nr.restore && nr.restNat ? nr.restNatKind : 0)
+                                                : (nr.rtxHdr ? 1 : 0);
+            bool& failed = key == "up" ? nr.vsrFailed : key == "restore" ? nr.restFailed : nr.rtxFailed;
+            bool& userOff = key == "up" ? nr.vsrUserOff : key == "restore" ? nr.restUserOff : nr.rtxUserOff;
+            const int want = (int)clampU(v, 0.0, 9.0);
+            const char* why = nullptr;
+            if (want == 0 && kind)
+            {
+                if (!failed)
+                    failed = userOff = true;
+            }
+            else if (want && want == kind)
+            {
+                if (userOff)
+                    failed = userOff = false;
+                else if (failed)
+                    why = "it stopped earlier in this session";
+            }
+            else if (want != kind)
+                why = kind ? "another kind than this session runs" : "this session started without it";
+            if (why)
+            {
+                LOG("live set: %s %s (the next session takes it: %s)\n", key.c_str(), val.c_str(), why);
+                continue;
+            }
+        }
+        else if (key == "vsrq" && nr.vsr && !nr.fsrUp && !nr.a4kUp && !nr.acnUp)
+            nr.vsrSet.QualityLevel = clampU(v, 1.0, 4.0);
+        else if (key == "hdrsat" && nr.rtxHdr)
+            nr.thdr.Saturation = clampU(v, 0.0, 200.0);
+        else if (key == "hdrcon" && nr.rtxHdr)
+            nr.thdr.Contrast = clampU(v, 0.0, 200.0);
+        else if (key == "hdrvib" && nr.rtxHdr)
+            nr.rtxVib = clampF(v, 0.0, 1.0);
+        else if (key == "hdrsb" && nr.rtxHdr)
+            nr.rtxSb = clampF(v, 0.0, 1.0);
+        else
+            done = false;
+        LOG("live set: %s %s%s\n", key.c_str(), val.c_str(), done ? "" : " (the next session takes it)");
+    }
+}
+
 static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, HANDLE hFence, HANDLE hOutBuf,
                          uint64_t outBytes, bool earlyDone)
 {
@@ -30607,6 +31046,7 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
             msg = std::move(nr.msgs.front());
             nr.msgs.pop_front();
         }
+        nativeLiveSets(nr);
         if (!nativeGroup(nr, msg))
             break;
     }

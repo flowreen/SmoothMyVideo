@@ -1052,7 +1052,7 @@ struct Hud
     void show(bool visible)
     {
         if (hwnd)
-            ShowWindow(hwnd, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+            ShowWindow(hwnd, visible && !g_noHud ? SW_SHOWNOACTIVATE : SW_HIDE);
     }
     void move(int x, int y)
     {
@@ -2947,6 +2947,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         int cascKeep = 1, cascKeepPrev = 1;
         bool cascTried = false, cascWarm = false;
         bool hidden = false;
+        // the HUD switched by a stdin set (nativeLiveSets flags it, this thread owns the window): off hides it, on shows
+        // it, made here when the session started without one; read at the top of both loops
+        auto applyHudWant = [&] {
+            const int hw = g_hudWant.exchange(-1);
+            if (hw < 0)
+                return;
+            g_noHud = hw == 0;
+            if (hw && !hud.hwnd && !park)
+                hud.create((g_fill ? cap.clientScreenX : host.posX) + 16, (g_fill ? cap.clientScreenY : host.posY) + 16,
+                           L"");
+            hud.show(!hidden);
+            LOG("live HUD %s%s\n", hw ? "on" : "off", hw && park ? " (parked: no window)" : "");
+        };
         int rc2 = 0;
         // STATIC-SOURCE HOLD (server route): a paused video emits no WGC frames, so the session
         // used to sit at 0 fps (and die at warmup if started paused). Instead, once no frame has
@@ -4686,6 +4699,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     phT = nowQpc100();
                 }
                 pumpMessages();
+                applyHudWant();
                 if (g_stopReq.load())
                 {
                     LOG("stop requested, ending the session\n");
@@ -5336,6 +5350,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 else
                     WaitForSingleObject(cap.evt, waitMs);
                 pumpMessages();
+                applyHudWant();
 
                 if (g_stopReq.load())
                 {

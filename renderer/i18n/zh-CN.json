@@ -147,6 +147,8 @@
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "（AMD 的 AI 放大，在<span class='vonly'>尺寸大于源视频</span><span class='lonly'>填满屏幕或 DLSS 模式低于 DLAA 需要放大</span>时使用）",
   "a4k.tip": "版本：Anime4K 4.0.1，Upscale CNN x2 UL（其最大的模型），带去振铃钳制（Clamp_Highlights）。每遍放大 2 倍，按目标尺寸需要的遍数处理（超过 2 倍时第二遍），再用 Lanczos 缩放到目标尺寸。与 Restore: Anime4K 一起勾选，两者就是 Anime4K 的 Mode A。在 SMV 的保真度测试（1.5 倍和 2 倍，四段视频）中，它平均比 RTX VSR 和 AMD FSR 更接近完整尺寸的原图。",
+  "a4kaa.name": "A+A",
+  "a4kaa.tip": "版本：Anime4K 4.0.1，Mode A+A：第一次 2x 放大之后，在放大后的画面上再运行一次 Restore CNN UL，然后进入下一次放大或最终缩放。Anime4K 的说明：感知画质最高、修复的线条最多，但可能带来振铃、色带或锯齿，而且更慢（第二次 Restore 处理 4 倍像素）。适用于 2 倍及以上的放大；与 Restore: Anime4K 一起勾选即为完整的 A+A 链。",
   "a4k.name": "Anime4K",
   "a4k.hint": "（面向动画的 CNN 放大，在<span class='vonly'>尺寸大于源视频</span><span class='lonly'>填满屏幕或 DLSS 模式低于 DLAA 需要放大</span>时使用）",
   "acn.tip": "版本：ArtCNN 1.6.2，C4F32_DN（其降噪模型）处理亮度，色彩用 Lanczos。每遍放大 2 倍，按目标尺寸需要的遍数处理（超过 2 倍时第二遍），再用 Lanczos 缩放到目标尺寸。在 SMV 的动画测试（2 倍，四段视频）中，它平均最接近完整尺寸的原图，领先 Anime4K、Lanczos、RTX VSR 和 AMD FSR。",

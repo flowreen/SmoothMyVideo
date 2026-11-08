@@ -1,4 +1,4 @@
-// Formats our own C++ with the repo's .clang-format, the way the lint's Prettier step formats TypeScript:
+// Formats our own C++ with engine/.clang-format, the way the lint's Prettier step formats TypeScript:
 // `node scripts/clang-format.ts` rewrites the files in place.
 // Extra file arguments are formatted too (a working copy of the host sources outside the repo).
 // Uses CLANG_FORMAT, else the clang-format that ships with Visual Studio (found with vswhere), else PATH.
@@ -44,7 +44,7 @@ const extra = process.argv.slice(2);
 const exe = findClangFormat();
 const files = FILES.map((f) => path.join(ROOT, f)).concat(extra);
 const run = () =>
-  spawnSync(exe, ['-i', `--style=file:${path.join(ROOT, '.clang-format')}`, ...files], { stdio: 'inherit' });
+  spawnSync(exe, ['-i', `--style=file:${path.join(ROOT, 'engine', '.clang-format')}`, ...files], { stdio: 'inherit' });
 let r = run();
 // a trailing comment after `};` can move again on a second pass: a second write settles it
 if (!r.error && r.status === 0) r = run();

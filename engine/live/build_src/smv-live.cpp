@@ -163,16 +163,18 @@ static bool parseLiveScale(const wchar_t* v)
     g_flowScale = _wtof(v);
     return g_flowScale >= 0.01 && g_flowScale <= 1.0;
 }
-static bool g_noHud = false;       // --no-hud: suppress the on-screen fps/latency readout
-static bool g_noHudLat = false;    // --no-hud-latency: keep the readout, drop the "~X ms behind" part
-static bool g_noFillMouse = false; // --no-fill-mouse: Fill leaves the mouse alone (FillMouse)
-static double g_sharpen = 0.0;     // --sharpen S: Adaptive Sharpen strength 0..2 (both routes)
-static bool g_rtxVsr = false;      // --rtx-vsr: forwarded to the server (VSR fill upscaler)
-static int g_vsrQuality = 4;       // --vsr-quality N: RTX VSR's quality level 1..4, 4 = Ultra (both routes)
-static bool g_fsrUp = false;       // --fsr-upscale: AMD FSR upscaling in RTX VSR's resize (both routes)
-static bool g_a4kUp = false;       // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (both routes)
-static bool g_acnUp = false;       // --artcnn: ArtCNN C4F32_DN's x2 in RTX VSR's resize (both routes)
-static bool g_xessUp = false;      // --xess-upscale: Intel XeSS-SR in RTX VSR's resize (both routes)
+static std::atomic<bool> g_noHud{false};    // --no-hud: suppress the on-screen fps/latency readout (a set: the loop)
+static std::atomic<int> g_hudWant{-1};      // a stdin set: the HUD on (1) / off (0), applied by the loop thread
+static std::atomic<bool> g_noHudLat{false}; // --no-hud-latency: keep the readout, drop the "~X ms behind" part (a set)
+static bool g_noFillMouse = false;          // --no-fill-mouse: Fill leaves the mouse alone (FillMouse)
+static double g_sharpen = 0.0;              // --sharpen S: Adaptive Sharpen strength 0..2 (both routes)
+static bool g_rtxVsr = false;               // --rtx-vsr: forwarded to the server (VSR fill upscaler)
+static int g_vsrQuality = 4;                // --vsr-quality N: RTX VSR's quality level 1..4, 4 = Ultra (both routes)
+static bool g_fsrUp = false;                // --fsr-upscale: AMD FSR upscaling in RTX VSR's resize (both routes)
+static bool g_a4kUp = false;                // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (both routes)
+static bool g_a4kAA = false;   // --anime4k-aa: Anime4K's Mode A+A, Restore CNN UL on the first x2 pass's 2x frame too
+static bool g_acnUp = false;   // --artcnn: ArtCNN C4F32_DN's x2 in RTX VSR's resize (both routes)
+static bool g_xessUp = false;  // --xess-upscale: Intel XeSS-SR in RTX VSR's resize (both routes)
 static bool g_xessFg = false;  // --xess-fg: Intel XeSS-FG on AMD FSR frame generation's route (both routes; offline it
                                // picks that route itself, live it rides the fsrfg backend)
 static int g_upscaleH = 0;     // --upscale H: forwarded to the server (the app's "Upscale to"
@@ -259,6 +261,68 @@ static bool g_hdr = false;
 // that touched Streamline, NGX (native DLSS 5) or the TrueHDR bridge still ends the process.
 static bool g_resident = false;
 static std::atomic<bool> g_stopReq{false}; // stdin "stop": the session loops exit cleanly
+// stdin "set<TAB>key<TAB>value" during a session: a Live setting changed in place (nativeLiveSets lists the keys);
+// the native thread applies the queue before its next frame group, a key the session cannot change in place waits
+// for the next session's arguments
+struct LiveSets
+{
+    std::mutex m;
+    std::vector<std::pair<std::string, std::string>> q;
+    void clear()
+    {
+        std::lock_guard<std::mutex> lk(m);
+        q.clear();
+    }
+    // a stdin line: "set<TAB>key<TAB>value" is queued (true); any other line = false
+    bool take(const std::string& line)
+    {
+        if (line.compare(0, 4, "set\t") != 0)
+            return false;
+        const size_t tab = line.find('\t', 4);
+        if (tab != std::string::npos)
+        {
+            // a session with no native thread never drains the queue (DLSS 4.5's GPU handoff): bounded
+            std::lock_guard<std::mutex> lk(m);
+            if (q.size() < 1024)
+                q.emplace_back(line.substr(4, tab - 4), line.substr(tab + 1));
+        }
+        return true;
+    }
+};
+static LiveSets g_liveSets;
+
+// stdin for a session that is not resident (DLSS 4.5's): "set" lines into g_liveSets, "stop" = g_stopReq; the thread
+// blocks in ReadFile for the life of the process, never joined, so one is started at most (stdin has one reader)
+static void liveSetReader()
+{
+    static bool started = false;
+    if (started)
+        return;
+    started = true;
+    std::thread([] {
+        HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+        std::string line;
+        char buf[256];
+        DWORD got = 0;
+        while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got)
+            for (DWORD i = 0; i < got; i++)
+            {
+                const char c = buf[i];
+                if (c == '\r')
+                    continue;
+                if (c != '\n')
+                {
+                    line += c;
+                    continue;
+                }
+                if (line == "stop")
+                    g_stopReq.store(true);
+                else
+                    g_liveSets.take(line);
+                line.clear();
+            }
+    }).detach();
+}
 static std::atomic<bool> g_resizeReq{
     false};                          // the target resized during the model load: end with exit 4 (the app revives)
 static bool g_sessionClean = false;  // runLive left through its full teardown block
@@ -1818,6 +1882,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_fsrUp = true;
         else if (wcscmp(argv[i], L"--anime4k") == 0)
             g_a4kUp = true;
+        else if (wcscmp(argv[i], L"--anime4k-aa") == 0)
+            g_a4kAA = true;
         else if (wcscmp(argv[i], L"--artcnn") == 0)
             g_acnUp = true;
         else if (wcscmp(argv[i], L"--xess-upscale") == 0)
@@ -4092,6 +4158,7 @@ static void resetSessionGlobals()
     g_vsrQuality = 4;
     g_fsrUp = false;
     g_a4kUp = false;
+    g_a4kAA = false;
     g_acnUp = false;
     g_xessUp = false;
     g_xessFg = false;
@@ -4125,6 +4192,7 @@ static void resetSessionGlobals()
     g_fill = false;
     g_hdr = false;
     g_stopReq.store(false);
+    g_liveSets.clear();
     g_sessionClean = false;
     g_targetHwnd = nullptr; // runLive resolves it again; a session that never gets there reports none
     g_staticHeld = 0;       // per session; g_staticHold is the process-wide env lever, kept
@@ -4213,6 +4281,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_fsrUp = true;
         else if (wcscmp(argv[i], L"--anime4k") == 0)
             g_a4kUp = true;
+        else if (wcscmp(argv[i], L"--anime4k-aa") == 0)
+            g_a4kAA = true;
         else if (wcscmp(argv[i], L"--artcnn") == 0)
             g_acnUp = true;
         else if (wcscmp(argv[i], L"--xess-upscale") == 0)
@@ -4333,6 +4403,11 @@ static int runLiveArgs(LiveArgs& la)
     }
     if ((g_backend == BK_DLSSG || g_fgOver) && slInitCommon())
         return 1;
+    // the app's live slider changes reach a single session too; a console stdin (a manual run) is left alone. The
+    // resident host reads its stdin in ResidentIo only: a second reader there takes whole chunks, so a "start" line it
+    // read was lost and the next session never began
+    if (!g_resident && GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE)
+        liveSetReader();
     return runLive(la.needle, la.targetOverride, la.genFrames, la.vsync, la.clickthrough, la.diagSecs, la.park);
 }
 
@@ -4377,6 +4452,10 @@ struct ResidentIo
                     }
                     if (line == "stop")
                         g_stopReq.store(true); // reaches the running loop directly
+                    else if (g_liveSets.take(line))
+                    {
+                        // a set line reaches the running session directly too (the native thread's next group)
+                    }
                     else if (!line.empty())
                     {
                         std::lock_guard<std::mutex> lk(m);
@@ -4436,6 +4515,7 @@ static int residentMain(LiveArgs first)
     for (;;)
     {
         g_stopReq.store(false);
+        g_liveSets.clear();
         g_resizeReq.store(false);
         g_sessionClean = false;
         const int rc = runLiveArgs(la);
@@ -4654,6 +4734,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_vsrQuality = 4;
             g_fsrUp = false;
             g_a4kUp = false;
+            g_a4kAA = false;
             g_acnUp = false;
             g_xessUp = false;
             g_xessFg = false;

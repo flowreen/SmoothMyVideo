@@ -23,6 +23,7 @@ export interface RenderArgs {
   vsr_quality: number; // --vsr-quality: RTX VSR's quality level 1..4, 4 = Ultra
   fsr_upscale: boolean; // --fsr-upscale: AMD FSR 4 in RTX VSR's resize (the two exclude each other)
   anime4k: boolean; // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (RTX VSR and AMD FSR 4 win over it)
+  anime4k_aa: boolean; // --anime4k-aa: Anime4K's Mode A+A, Restore CNN UL on the first x2 pass's 2x frame too
   artcnn: boolean; // --artcnn: ArtCNN C4F32_DN's x2 in RTX VSR's resize (RTX VSR, AMD FSR 4 and Anime4K win over it)
   xess_upscale: boolean; // --xess-upscale: Intel XeSS-SR in RTX VSR's resize (every other upscaler wins over it)
   rtx_hdr: boolean;

@@ -2,6 +2,8 @@
 /dist
 /release
 /renderer/app.js
+# the double-click shortcut npm install makes (scripts/dev-icon.ts; absolute paths, one per clone)
+/Smooth My Video.lnk
 
 # dependencies
 /node_modules

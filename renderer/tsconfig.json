@@ -1,9 +1,12 @@
 {
   "compilerOptions": {
     "target": "es2023",
-    "module": "nodenext",
-    "moduleResolution": "nodenext",
-    "strict": true,
+    "module": "commonjs",
+    "moduleDetection": "auto",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "types": ["node"],
+    "strict": false,
+    "noImplicitAny": false,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noImplicitReturns": true,
@@ -11,8 +14,7 @@
     "allowUnreachableCode": false,
     "noEmit": true,
     "erasableSyntaxOnly": true,
-    "skipLibCheck": true,
-    "types": ["node"]
+    "skipLibCheck": true
   },
-  "include": ["scripts/*.ts"]
+  "files": ["app.ts"]
 }
