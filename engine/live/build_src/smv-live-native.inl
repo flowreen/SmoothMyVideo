@@ -5384,8 +5384,9 @@ struct NativeRife
     // block (gaOff, see gaNatLoad), the window position tables (dGaPos: A's posY | posX, then `_m`'s), the activations
     // (gaArena; in the shared activation block, else dGaOwn)
     CUmodule gaMod = nullptr;
-    CUfunction fGa[6] = {};
-    int gaMlp2Min = 0; // the CTAs from which the mlp runs as k_gaMlp2 (3 an SM; 0 = never: RTX 20, SMV_GA_MLP2=0)
+    CUfunction fGa[7] = {};
+    int gaMlp2Min = 0;    // the CTAs from which the mlp runs as k_gaMlp2 (3 an SM; 0 = never: RTX 20, SMV_GA_MLP2=0)
+    bool gaAttn2 = false; // gmflow A's attention as k_gaAttn2 (never on RTX 20; SMV_GA_ATTN2=0 = never)
     void* dGaW = nullptr;
     size_t gaOff[46] = {};
     float* dGaPos = nullptr;
@@ -5687,7 +5688,7 @@ struct NativeRife
     int a4kW = 0, a4kH = 0;   // the first pass's input size (the slot's)
     int a4kN = 1;             // x2 passes a frame: the fewest whose 2^n reaches the slot's ratio, memory permitting
     bool a4kAA = false;       // Mode A+A (--anime4k-aa, memory permitting): Restore on the first pass's 2x frame
-    int a4kOw = 0;            // the widest fold target dA4kTmp holds
+    int a4kOw = 0, a4kOh = 0; // the fold target dA4kTmp holds (the widest; a live A+A switch sets up again at it)
     void* dA4kIn = nullptr;   // NCHW fp16, the largest pass's input size
     void* dA4kT = nullptr;    // four layer slots, 3 textures x 4 fp16 a pixel each (nativeA4kRun), the largest pass's
     void* dA4kOut = nullptr;  // the three last textures as 12 fp16 planes, the largest pass's
@@ -5946,6 +5947,11 @@ struct NativeRife
     bool rsLastView = false;
     bool nrSdrIn = false;  // live: DLSS 5's input is SDR this frame (RTX HDR converts after it)
     bool nrPaused = false; // live DLSS 5 switched off in a running session (stdin set): the core stays, the pass skips
+    // a DLSS 5 pass growth in progress (stdin nrpasses above the passes built, nativeNrGrowStep): nrGrowWant = the run
+    // count asked (0 = none), nrGrowFrom = the passes before it, the build time so far, the set's value and the note
+    int nrGrowWant = 0, nrGrowFrom = 0;
+    double nrGrowMs = 0.0;
+    std::string nrGrowVal, nrGrowWhy;
     // an effect switched off in a running session (stdin set) through its own fallback (vsrFailed = Lanczos, restFailed =
     // no Restore, rtxFailed = faithful PQ): set when the switch set that flag, so on again clears only a switch, never a
     // real failure
@@ -18150,7 +18156,7 @@ static void nativeA4kUpFree(NativeRife& nr)
             cudaFree(*p);
             *p = nullptr;
         }
-    nr.a4kW = nr.a4kH = nr.a4kOw = 0;
+    nr.a4kW = nr.a4kH = nr.a4kOw = nr.a4kOh = 0;
     nr.a4kN = 1;
     nr.a4kAA = false;
 }
@@ -18210,6 +18216,7 @@ static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upE
     nr.a4kH = h;
     nr.a4kN = n;
     nr.a4kOw = ow;
+    nr.a4kOh = oh;
     nr.a4kAA = aa;
     const size_t sp0 = (size_t)w * h;
     NCHK(cudaMemsetAsync(nr.dA4kIn, 0, (aa ? 4 : 1) * 3 * sp0 * sizeof(uint16_t), nr.stream), "Anime4K warm-up clear");
@@ -26025,22 +26032,25 @@ __device__ __forceinline__ int gaTok(int i, int wy, int wx, int wh, int ww, int 
 #else
 #define GA_KT 32
 #endif
-#define GA_KN (GA_KT / 8)
 
 // one window's attention for 128 queries a CTA (8 warps of 16): S = q' k^T / sqrt(128) with the shifted layers' region
 // mask (pairs of different regions skipped), online softmax in fp32, O = P v' with P in fp16, then norm1. K / V tiles of
-// GA_KT keys, double buffered. The frame is split in S x S windows (blockIdx.y = the window); keys and values come from
-// row b ^ part. mode 0 (self) = x32 += norm1(O), o16 = fp16(x32); mode 1 (cross) = o16 = fp16(norm1(O)).
-extern "C" __global__ void __launch_bounds__(256, 1)
-    k_gaAttn(const unsigned short* __restrict__ q, const unsigned short* __restrict__ k,
-             const unsigned short* __restrict__ v, int H, int W, int S, int shift, int part,
-             const float* __restrict__ gam, const float* __restrict__ bet, float eps, int mode,
-             float* __restrict__ x32, unsigned short* __restrict__ o16)
+// KT keys, double buffered. The frame is split in S x S windows (blockIdx.y = the window); keys and values come from
+// row b ^ part. mode 0 (self) = x32 += norm1(O), o16 = fp16(x32); mode 1 (cross) = o16 = fp16(norm1(O)). Two entry
+// points: k_gaAttn (GA_KT-key tiles, one CTA an SM) and k_gaAttn2 (32-key tiles, two CTAs an SM in 33 KB, 128
+// registers) for gmflow A's calls, where the second CTA hides the first one's waits (1.02-1.17x from 540p to 4K); the
+// 32-key tiles split the online softmax differently (1-2 fp16 ulps of the output, as near the fp64 result as 64 keys).
+template <int KT>
+__device__ __forceinline__ void gaAttnBody(const unsigned short* __restrict__ q, const unsigned short* __restrict__ k,
+                                           const unsigned short* __restrict__ v, int H, int W, int S, int shift,
+                                           int part, const float* __restrict__ gam, const float* __restrict__ bet,
+                                           float eps, int mode, float* __restrict__ x32, unsigned short* __restrict__ o16)
 {
+    constexpr int KN = KT / 8;
     extern __shared__ __align__(16) unsigned char sm[];
     unsigned short* sK = reinterpret_cast<unsigned short*>(sm);
-    unsigned short* sV = sK + 2 * GA_KT * 128;
-    int* sLab = reinterpret_cast<int*>(sV + 2 * GA_KT * 128);
+    unsigned short* sV = sK + 2 * KT * 128;
+    int* sLab = reinterpret_cast<int*>(sV + 2 * KT * 128);
     const int wh = H / S, ww = W / S;
     const int P = H * W, L = wh * ww, sh = shift ? wh / 2 : 0, sw = shift ? ww / 2 : 0;
     const int b = blockIdx.z, wy = blockIdx.y / S, wx = blockIdx.y - wy * S, bk = b ^ part;
@@ -26070,20 +26080,20 @@ extern "C" __global__ void __launch_bounds__(256, 1)
         }
     }
 
-    const int nkt = (L + GA_KT - 1) / GA_KT;
+    const int nkt = (L + KT - 1) / KT;
     auto load = [&](int kt, int buf) {
 #pragma unroll
-        for (int j = 0; j < GA_KT / 16; ++j) {
-            const int idx = j * 256 + tid, r = idx >> 4, c = idx & 15, li = kt * GA_KT + r;
+        for (int j = 0; j < KT / 16; ++j) {
+            const int idx = j * 256 + tid, r = idx >> 4, c = idx & 15, li = kt * KT + r;
             int lab = 0, tok = 0;
             if (li < L)
                 tok = gaTok(li, wy, wx, wh, ww, H, W, sh, sw, lab);
             const size_t off = (static_cast<size_t>(bk) * P + tok) * 128 + c * 8;
-            const int dst = (buf * GA_KT) * 128 + gaSw(r, c);
+            const int dst = (buf * KT) * 128 + gaSw(r, c);
             rnCp16(gaSa(sK + dst), k + off, li < L ? 16 : 0);
             rnCp16(gaSa(sV + dst), v + off, li < L ? 16 : 0);
             if (c == 0)
-                sLab[buf * GA_KT + r] = li < L ? (shift ? lab : 0) : -1;
+                sLab[buf * KT + r] = li < L ? (shift ? lab : 0) : -1;
         }
         gaCommit();
     };
@@ -26105,19 +26115,19 @@ extern "C" __global__ void __launch_bounds__(256, 1)
         __syncthreads();
         if (kt + 1 < nkt)
             load(kt + 1, buf ^ 1);
-        const unsigned short* Kb = sK + buf * GA_KT * 128;
-        const unsigned short* Vb = sV + buf * GA_KT * 128;
-        const int* lb = sLab + buf * GA_KT;
-        float s[GA_KN][4];
+        const unsigned short* Kb = sK + buf * KT * 128;
+        const unsigned short* Vb = sV + buf * KT * 128;
+        const int* lb = sLab + buf * KT;
+        float s[KN][4];
         {
-            unsigned sh[GA_KN][2];
+            unsigned sh[KN][2];
 #pragma unroll
-            for (int j = 0; j < GA_KN; ++j)
+            for (int j = 0; j < KN; ++j)
                 sh[j][0] = sh[j][1] = 0u;
 #pragma unroll
             for (int ks = 0; ks < 8; ++ks)
 #pragma unroll
-                for (int np = 0; np < GA_KN / 2; ++np) {
+                for (int np = 0; np < KN / 2; ++np) {
                     unsigned bf[4];
                     rnLdm4(gaSa(Kb + gaSw(np * 16 + (lane & 7) + ((lane >> 4) << 3), ks * 2 + ((lane >> 3) & 1))),
                            bf);
@@ -26125,7 +26135,7 @@ extern "C" __global__ void __launch_bounds__(256, 1)
                     gaMmaH(sh[2 * np + 1], qa[ks], bf[2], bf[3]);
                 }
 #pragma unroll
-            for (int j = 0; j < GA_KN; ++j) {
+            for (int j = 0; j < KN; ++j) {
                 s[j][0] = gaLo(sh[j][0]);
                 s[j][1] = gaHi(sh[j][0]);
                 s[j][2] = gaLo(sh[j][1]);
@@ -26134,7 +26144,7 @@ extern "C" __global__ void __launch_bounds__(256, 1)
         }
         float mx[2] = {m[0], m[1]};
 #pragma unroll
-        for (int j = 0; j < GA_KN; ++j)
+        for (int j = 0; j < KN; ++j)
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int kl = lb[j * 8 + 2 * t4 + (e & 1)], r = e >> 1;
@@ -26151,7 +26161,7 @@ extern "C" __global__ void __launch_bounds__(256, 1)
             m[r] = mx[r];
         }
 #pragma unroll
-        for (int j = 0; j < GA_KN; ++j)
+        for (int j = 0; j < KN; ++j)
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float p = exp2f(s[j][e] - m[e >> 1]);
@@ -26169,7 +26179,7 @@ extern "C" __global__ void __launch_bounds__(256, 1)
             o[nt][3] *= al[1];
         }
 #pragma unroll
-        for (int kk = 0; kk < GA_KN / 2; ++kk) {
+        for (int kk = 0; kk < KN / 2; ++kk) {
             const unsigned pa[4] = {gaPack(s[2 * kk][0], s[2 * kk][1]), gaPack(s[2 * kk][2], s[2 * kk][3]),
                                     gaPack(s[2 * kk + 1][0], s[2 * kk + 1][1]),
                                     gaPack(s[2 * kk + 1][2], s[2 * kk + 1][3])};
@@ -26197,6 +26207,24 @@ extern "C" __global__ void __launch_bounds__(256, 1)
     }
     gaLn(o, gam, bet, eps, t4);
     gaStore(o, qrow[0], qrow[1], t4, mode == 0, x32, o16);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+    k_gaAttn(const unsigned short* __restrict__ q, const unsigned short* __restrict__ k,
+             const unsigned short* __restrict__ v, int H, int W, int S, int shift, int part,
+             const float* __restrict__ gam, const float* __restrict__ bet, float eps, int mode,
+             float* __restrict__ x32, unsigned short* __restrict__ o16)
+{
+    gaAttnBody<GA_KT>(q, k, v, H, W, S, shift, part, gam, bet, eps, mode, x32, o16);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2)
+    k_gaAttn2(const unsigned short* __restrict__ q, const unsigned short* __restrict__ k,
+              const unsigned short* __restrict__ v, int H, int W, int S, int shift, int part,
+              const float* __restrict__ gam, const float* __restrict__ bet, float eps, int mode,
+              float* __restrict__ x32, unsigned short* __restrict__ o16)
+{
+    gaAttnBody<32>(q, k, v, H, W, S, shift, part, gam, bet, eps, mode, x32, o16);
 }
 
 #define GA_HC 32
@@ -26355,7 +26383,8 @@ extern "C" __global__ void __launch_bounds__(256, 2)
 }
 )GASRC";
 
-static const char* const kGaKern[] = {"k_gaFlowUp", "k_gaWarpPos", "k_gaProj", "k_gaAttn", "k_gaMlp", "k_gaMlp2"};
+static const char* const kGaKern[] = {"k_gaFlowUp", "k_gaWarpPos", "k_gaProj", "k_gaAttn",
+                                      "k_gaMlp",    "k_gaMlp2",    "k_gaAttn2"};
 enum
 {
     kGaFlowUpK,
@@ -26364,6 +26393,7 @@ enum
     kGaAttnK,
     kGaMlpK,
     kGaMlp2K,
+    kGaAttn2K,
     kGaKernN
 };
 // the weight block (gaNatLoad): layer l's pieces at 7 l: g1 = the self attention's q' and v' folds and the cross one's v'
@@ -26495,9 +26525,9 @@ static bool gaTuring()
     return cudaGetDevice(&dev) == cudaSuccess &&
            cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && maj < 8;
 }
-static int gaSmAttn()
+static int gaSmAttn(bool two = false)
 {
-    const int kt = gaTuring() ? 32 : 64;
+    const int kt = two || gaTuring() ? 32 : 64;
     return 4 * kt * 128 * 2 + 2 * kt * 4;
 }
 static int gaSmMlp(bool two = false)
@@ -26574,6 +26604,8 @@ static bool nativeGaModule(NativeRife& nr, std::string& why)
         cuFuncSetAttribute(nr.fGa[kGaMlpK], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gaSmMlp()) !=
             CUDA_SUCCESS ||
         cuFuncSetAttribute(nr.fGa[kGaMlp2K], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gaSmMlp(true)) !=
+            CUDA_SUCCESS ||
+        cuFuncSetAttribute(nr.fGa[kGaAttn2K], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, gaSmAttn(true)) !=
             CUDA_SUCCESS)
     {
         why = "its kernels could not get their shared memory";
@@ -26589,6 +26621,10 @@ static bool nativeGaModule(NativeRife& nr, std::string& why)
                            ? 3 * sms
                            : 0;
     }
+    // gmflow A's attention in its two-CTA form (k_gaAttn2: 32-key tiles, 1.02-1.17x from 540p to 4K, as near gmflow's
+    // fp64 output as k_gaAttn); `_m` keeps k_gaAttn (its random-map case fell 0.06-0.09 dB short there); never on RTX 20
+    // (its k_gaAttn is the 32-key form already); SMV_GA_ATTN2=0 = never
+    nr.gaAttn2 = !gaTuring() && lkEnv("SMV_GA_ATTN2") != "0";
     if (cudaMalloc(&nr.dGaW, blob.size()) != cudaSuccess ||
         cudaMemcpy(nr.dGaW, blob.data(), blob.size(), cudaMemcpyHostToDevice) != cudaSuccess)
     {
@@ -26619,7 +26655,9 @@ static bool nativeGaLaunch(NativeRife& nr, int scale, const void* maps, const vo
     int th = scale ? nr.gmH : nr.gmH / 2, tw = scale ? nr.gmW : nr.gmW / 2, S = scale ? 8 : 2; // the token grid
     const int rows = scale ? 4 : 2, P = th * tw;
     int M = rows * P, wh = th / S, ww = tw / S, part = scale ? 2 : 1, warp = scale, zero = 0, one = 1;
-    const unsigned att = (unsigned)((wh * ww + 127) / 128), smA = (unsigned)gaSmAttn(), smM = (unsigned)gaSmMlp();
+    const bool att2 = scale && nr.gaAttn2;
+    const int kAtt = att2 ? kGaAttn2K : kGaAttnK;
+    const unsigned att = (unsigned)((wh * ww + 127) / 128), smA = (unsigned)gaSmAttn(att2), smM = (unsigned)gaSmMlp();
     float eps = kGaEps;
     const GaArena ar = gaArena(nr.gmW, nr.gmH);
     void *x32 = s + ar.x32, *xb = s + ar.xb, *pj0 = s + ar.pj, *nm = s + ar.nm;
@@ -26664,9 +26702,9 @@ static bool nativeGaLaunch(NativeRife& nr, int scale, const void* maps, const vo
         void* a4[] = {&pj0, &xa, &pj2, &th, &tw, &S, &shift, &part, (void*)&lnC, (void*)&lnCb, &eps, &one, &x32, &nm};
         void* a5[] = {&xb, &nm, &M, (void*)&w0, (void*)&w2c, (void*)&ln2, (void*)&ln2b, &eps, &x32, &xa};
         if (!go(kGaProjK, gm, 3, 1, 128, kGaSmProj, a1) ||
-            !go(kGaAttnK, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a2) ||
+            !go(kAtt, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a2) ||
             !go(kGaProjK, gm, 1, 1, 128, kGaSmProj, a3) ||
-            !go(kGaAttnK, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a4) ||
+            !go(kAtt, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a4) ||
             !(mlp2 ? go(kGaMlp2K, mlpCtas, 1, 1, 256, smM2, a5) : go(kGaMlpK, mlpCtas, 1, 1, 256, smM, a5)))
             return false;
     }
@@ -26871,8 +26909,10 @@ static bool nativeGmfssSetup(NativeRife& nr)
             NCHK(cudaMalloc(&nr.dGaOwn, ab), "alloc gmfss gmflow transformer activations");
         LOG("native: gmfss gmflow A and _m on the host's kernels (fp16 sums but in P v'; %s; their %.0f MB of activations "
             "%s)\n",
-            gaTuring() ? "32-key tiles, a 2-stage weight ring" : "64-key tiles, a 3-stage weight ring", ab / 1048576.0,
-            nr.dGaOwn ? "on their own" : "in the shared activation block");
+            gaTuring()   ? "32-key tiles, a 2-stage weight ring"
+            : nr.gaAttn2 ? "64-key tiles (A's attention 32-key, two CTAs an SM), a 3-stage weight ring"
+                         : "64-key tiles, a 3-stage weight ring",
+            ab / 1048576.0, nr.dGaOwn ? "on their own" : "in the shared activation block");
         nr.gaGraphs[0].mode = nr.gaGraphs[1].mode = chainGraphMode("SMV_GA_GRAPH");
     }
     NCHK(cudaMalloc((void**)&nr.dGmHalf, 6 * hp * sizeof(float)), "alloc gmfss halves");
@@ -31718,11 +31758,219 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
     return true;
 }
 
+// Restore ticked in a running session that started without it (stdin `set restore N`: 1 Real-ESRGAN, 2 AnimeJaNai =
+// the file the `restoremodel` key holds, 3 Anime4K's Restore CNN UL), set up on the native thread between two groups
+// the way the session start does: the capture as Restore's source (restPre, srcW / srcH = the capture; every reader
+// of those is Restore's own), the fold to the model size, the buffers the handoff allocates (dRestTmp, dRest, dCapF,
+// dRestRem on HDR planes at a size change), then restNatSetup (weights, activations, warm-up), when the video memory
+// room holds them. Left to the next session: another route, an upscaler before the model (it moves Restore's fold
+// target), a start in place that failed earlier (its buffers stay for the teardown). false = why says it
+static bool nativeRestoreSwitch(NativeRife& nr, int want, std::string& why)
+{
+    if (g_offline || g_backend != BK_SERVER)
+    {
+        why = "this route runs no native pass";
+        return false;
+    }
+    if (want < 1 || want > 3)
+    {
+        why = "an unknown Restore kind";
+        return false;
+    }
+    if (nr.vsrPre)
+    {
+        why = "an upscaler runs before the model";
+        return false;
+    }
+    if (nr.dRest)
+    {
+        why = "its start in place failed earlier in this session";
+        return false;
+    }
+    // the kind's model: Real-ESRGAN's weights readable, the held AnimeJaNai file in its form, the Anime4K module
+    if (want == 1)
+    {
+        std::vector<uint8_t> blob;
+        std::vector<size_t> off;
+        if (!restNatLoad(blob, off, why))
+            return false;
+    }
+    else if (want == 2 && g_restoreModel.empty())
+    {
+        why = "no AnimeJaNai file named (restoremodel)";
+        return false;
+    }
+    else if (want == 2 && !ajNatWanted())
+    {
+        why = "the AnimeJaNai file is not in its SPAN-F3 form (the line above)";
+        return false;
+    }
+    else if (want == 3 && !nativeA4kModule(nr, why))
+        return false;
+    const int cw = nr.cw, ch = nr.ch;
+    const uint64_t fl = sizeof(float), cp = (uint64_t)cw * ch, mp = (uint64_t)nr.w * nr.h;
+    const bool rem = (nr.encPre || nr.encPost) && (nr.w != cw || nr.h != ch);
+    // the kind's buffers at the capture size (restNatSetup / nativeA4kRestSetup reads srcW / srcH): the input planes,
+    // Real-ESRGAN / AnimeJaNai's sub-pixel output and activations (none where the shared activation block holds
+    // them), Anime4K's layer slots, output and statistics; the weights (a few MB) sit inside the room's reserve
+    nr.restNatKind = want;
+    nr.restNat = true;
+    nr.sw = cw;
+    nr.sh = ch;
+    auto undo = [&nr]() {
+        nr.restNatKind = 0;
+        nr.restNat = false;
+        nr.sw = nr.sh = 0;
+    };
+    uint64_t kindB = nr.dRestIn ? 0 : 3 * cp * sizeof(uint16_t);
+    if (want == 3)
+        kindB += 4 * 3 * cp * 8 + 3 * cp * fl + (nr.a4kStatCap >= cp ? 0 : 2 * cp * sizeof(uint16_t));
+    else
+    {
+        const uint64_t sub = want == 2 ? (uint64_t)((cw + 1) / 2) * ((ch + 1) / 2) : cp;
+        const uint64_t pp = restNatBytes(nr);
+        kindB += 48 * sub * sizeof(uint16_t) + (nr.dGmCtxMem && nr.gmCtxMemB >= (int64_t)pp ? 0 : pp);
+    }
+    const uint64_t need = 3 * 4 * (uint64_t)ch * nr.w * fl + 3 * mp * fl + (nr.dCapF ? 0 : 3 * cp * fl) +
+                          (rem && !nr.dRestRem ? 3 * mp * fl : 0) + kindB;
+    const uint64_t room = nativeVideoMemoryRoom();
+    if (room && room < need)
+    {
+        undo();
+        why = "not enough free video memory";
+        return false;
+    }
+    auto alloc = [](void** p, size_t bytes) {
+        if (*p)
+            return true;
+        if (cudaMalloc(p, bytes) == cudaSuccess)
+            return true;
+        *p = nullptr;
+        cudaGetLastError();
+        return false;
+    };
+    if (!alloc((void**)&nr.dRestTmp, (size_t)3 * 4 * ch * nr.w * sizeof(float)) ||
+        !alloc((void**)&nr.dRest, (size_t)3 * mp * sizeof(float)) ||
+        !alloc((void**)&nr.dCapF, (size_t)3 * cp * sizeof(float)) ||
+        (rem && !alloc((void**)&nr.dRestRem, (size_t)3 * mp * sizeof(float))))
+    {
+        undo();
+        why = "an allocation failed";
+        return false;
+    }
+    nr.restTw = nr.w;
+    nr.restTh = nr.h;
+    nr.restFailed = nr.restUserOff = false;
+    // the frames in flight first: Anime4K's statistics buffers, shared with its upscaler, may grow to the capture size
+    cudaStreamSynchronize(nr.stream);
+    if (!restNatSetup(nr))
+    {
+        cudaGetLastError();
+        undo();
+        why = "its setup failed (the line above)";
+        return false;
+    }
+    nr.restore = nr.restPre = true;
+    const std::string name = want == 1   ? std::string("Real-ESRGAN animevideov3")
+                             : want == 3 ? std::string("Anime4K Restore CNN UL")
+                                         : g_restoreModel.substr(g_restoreModel.find_last_of("\\/") + 1);
+    LOG("native: live restore: %s at %dx%d -> %dx%d, started in place on the captured frame before the model\n",
+        name.c_str(), cw, ch, nr.w, nr.h);
+    return true;
+}
+
+// Anime4K's Mode A+A in a running session (stdin `set a4kaa 0|1`): off = the per-pass flag (the buffers stay for the
+// session), on = Anime4K's resize buffers freed and set up again at the session's geometry with g_a4kAA set, the way
+// the session start runs it (the room first: short = Mode A, nativeA4kSetup's line); Anime4K not set up in this
+// session = held for its start in place (nativeUpSwitch's setup reads g_a4kAA). An Anime4K the user unticked stays
+// off; a setup that fails = Lanczos for the session (vsrFailed, its buffers freed). The `live set` line's note, "" =
+// applied
+static std::string nativeA4kAaSwitch(NativeRife& nr, bool on)
+{
+    g_a4kAA = on;
+    if (!nr.a4kUp || !nr.a4kW)
+        return " (held for Anime4K's start)";
+    if (!on || nr.a4kAA)
+    {
+        nr.a4kAA = on;
+        return "";
+    }
+    if (nr.vsrFailed && !nr.vsrUserOff)
+        return " (the next session takes it: Anime4K stopped earlier in this session)";
+    const int w = nr.a4kW, h = nr.a4kH, ow = nr.a4kOw, oh = nr.a4kOh;
+    const bool userOff = nr.vsrUserOff;
+    cudaDeviceSynchronize();
+    nativeA4kUpFree(nr);
+    nr.vsrFailed = false;
+    if (!nativeA4kSetup(nr, w, h, ow, oh, 0) || nr.vsrFailed)
+    {
+        cudaDeviceSynchronize();
+        nativeA4kUpFree(nr);
+        nr.vsrFailed = true;
+        nr.vsrUserOff = false;
+        return " (Anime4K stopped: its setup failed, the line above; Lanczos for the session)";
+    }
+    nr.vsrFailed = userOff;
+    return nr.a4kAA ? "" : " (the next session takes it: not enough free video memory, Mode A runs)";
+}
+
+// the end of a DLSS 5 pass growth: the lines a growth in one go logs (the passes built, then the set), the run count
+// set once to the passes asked (as many as were built); cut = why it ended before its last pass, nullptr = it ran out
+static void nativeNrGrowEnd(NativeRife& nr, const char* cut)
+{
+    const int now = nr.nrHost ? nr.nrHost->passes() : nr.nrGrowFrom;
+    if (now > nr.nrGrowFrom)
+        LOG("live DLSS 5: %d more passes built in %.0f ms (%d now)%s%s\n", now - nr.nrGrowFrom, nr.nrGrowMs, now,
+            nr.nrGrowWhy.empty() ? "" : ": ", nr.nrGrowWhy.c_str());
+    std::string why = cut ? std::string(cut) : nr.nrGrowWhy;
+    if (why.empty() && now < nr.nrGrowWant)
+        why = "no video memory for more";
+    const int run = nr.nrHost ? nr.nrHost->runPasses(nr.nrGrowWant) : 0;
+    if (run < nr.nrGrowWant)
+        LOG("live set: nrpasses %s (%d run: %s)\n", nr.nrGrowVal.c_str(), run, why.c_str());
+    else
+        LOG("live set: nrpasses %s\n", nr.nrGrowVal.c_str());
+    nr.nrGrowWant = 0;
+    nr.nrGrowVal.clear();
+    nr.nrGrowWhy.clear();
+}
+
+// one step of a DLSS 5 pass growth, on the native thread before a frame group: ONE more pass (its feature and frame,
+// nr::Host::growPasses) when the video memory room holds its working memory (nr::kFrameMp a megapixel), so the picture
+// moves between the builds (a pass's build holds it ~100 ms at 640x360, 17 in one go ~1.9 s); the run count stays
+// until the end (nativeNrGrowEnd), so the picture changes once, as a growth in one go does
+static void nativeNrGrowStep(NativeRife& nr)
+{
+    if (!nr.nrGrowWant)
+        return;
+    if (!nr.liveNr || !nr.nrHost || nr.nrFailed)
+    {
+        nativeNrGrowEnd(nr, "DLSS 5 stopped");
+        return;
+    }
+    const int had = nr.nrHost->passes();
+    if (had < nr.nrGrowWant)
+    {
+        const uint64_t per = (uint64_t)(nr::kFrameMp * nr.nrW * nr.nrH / 1e6 * 1048576.0);
+        const uint64_t room = nativeVideoMemoryRoom();
+        if (!room || !per || room >= per)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int now = nr.nrHost->growPasses(had + 1, nr.nrGrowWhy);
+            nr.nrGrowMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (now > had && now < nr.nrGrowWant && nr.nrGrowWhy.empty())
+                return; // the next group builds the next pass
+        }
+    }
+    nativeNrGrowEnd(nr, nullptr);
+}
+
 static void nativeLiveSets(NativeRife& nr)
 {
     std::vector<std::pair<std::string, std::string>> q;
     if (nr.fuWarmTh && InterlockedCompareExchange(&nr.fuWarm, 0, 0) >= 2)
         nativeUpWarmEnd(nr); // an FSR / XeSS start in place: its first frames ended on the worker
+    nativeNrGrowStep(nr);    // a DLSS 5 pass growth: one pass a frame group
     {
         std::lock_guard<std::mutex> lk(g_liveSets.m);
         if (g_liveSets.q.empty())
@@ -31748,34 +31996,23 @@ static void nativeLiveSets(NativeRife& nr)
             nr.nrHost->setStyle((int)clampU(v, 0.0, 2.0));
         else if (key == "nrpasses" && nrOn)
         {
-            // more passes than the session built: their features and frames now (nr::Host::growPasses, a few frames'
-            // pause), as many as the video memory room holds (each pass's working memory, nr::kFrameMp a megapixel)
+            // more passes than the session built: their features and frames one pass a frame group
+            // (nativeNrGrowStep), as many as the video memory room holds; the growth's end logs this set's line. A new
+            // value during a growth ends it first (its line names the cut)
             const int want = (int)clampU(v, 1.0, (double)nr::kMaxPasses);
-            const int had = nr.nrHost->passes();
-            std::string why;
-            if (want > had)
+            if (nr.nrGrowWant)
+                nativeNrGrowEnd(nr, "another nrpasses arrived");
+            if (want > nr.nrHost->passes())
             {
-                const uint64_t per = (uint64_t)(nr::kFrameMp * nr.nrW * nr.nrH / 1e6 * 1048576.0);
-                const uint64_t room = nativeVideoMemoryRoom();
-                const int fit = room && per ? had + (int)(room / per) : want;
-                const int to = (std::min)(want, fit);
-                if (to > had)
-                {
-                    const auto t0 = std::chrono::steady_clock::now();
-                    const int now = nr.nrHost->growPasses(to, why);
-                    LOG("live DLSS 5: %d more passes built in %.0f ms (%d now)%s%s\n", now - had,
-                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), now,
-                        why.empty() ? "" : ": ", why.c_str());
-                }
-                if (to < want && why.empty())
-                    why = "no video memory for more";
-            }
-            const int run = nr.nrHost->runPasses(want);
-            if (run < want)
-            {
-                LOG("live set: nrpasses %s (%d run: %s)\n", val.c_str(), run, why.c_str());
+                nr.nrGrowWant = want;
+                nr.nrGrowFrom = nr.nrHost->passes();
+                nr.nrGrowMs = 0.0;
+                nr.nrGrowVal = val;
+                nr.nrGrowWhy.clear();
+                nativeNrGrowStep(nr); // the first pass before this group
                 continue;
             }
+            nr.nrHost->runPasses(want);
         }
         else if ((key == "nrstruct" || key == "nrtone" || key == "nrpasses" || key == "nrstyle") && !nrOn)
         {
@@ -31804,6 +32041,32 @@ static void nativeLiveSets(NativeRife& nr)
             g_noHudLat.store(v == 0.0);
         else if (key == "hud")
             g_hudWant.store(v != 0.0 ? 1 : 0); // the loop thread owns the window (applyHudWant)
+        else if (key == "restoremodel")
+        {
+            // AnimeJaNai's file (a path): held for Restore's start in place (`restore 2`); a running AnimeJaNai keeps
+            // the file it loaded
+            const bool ajRuns = nr.restore && nr.restNatKind == 2;
+            if (ajRuns && val != g_restoreModel)
+            {
+                LOG("live set: restoremodel %s (the next session takes it: AnimeJaNai runs its file)\n", val.c_str());
+                continue;
+            }
+            g_restoreModel = val;
+            if (!ajRuns)
+            {
+                LOG("live set: restoremodel %s (held for Restore's start)\n", val.c_str());
+                continue;
+            }
+        }
+        else if (key == "a4kaa")
+        {
+            const std::string note = nativeA4kAaSwitch(nr, v != 0.0);
+            if (!note.empty())
+            {
+                LOG("live set: a4kaa %s%s\n", val.c_str(), note.c_str());
+                continue;
+            }
+        }
         else if (key == "up" || key == "restore" || key == "rtxhdr")
         {
             // the session's own kind (up: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS; restore: 1
@@ -31848,13 +32111,20 @@ static void nativeLiveSets(NativeRife& nr)
             }
             else if (want != kind)
                 why = kind ? "another kind than this session runs" : "this session started without it";
+            // RTX HDR on stays a session start: its start sets the picture path (the HDR route, an upscaler before the
+            // model, the model's colour domain, the one NGX create)
+            if (why && key == "rtxhdr" && want && !kind)
+                why = "this session started without it: RTX HDR sets the picture path at the session's start";
             // an upscaler the session started without, or another kind than it runs: its setup in place when this
             // session can run it (the running kind released first, nativeUpRelease)
             std::string whyUp;
             const bool other = key == "up" && want && want != kind;
+            const bool restIn = key == "restore" && want && !kind; // Restore in a session that started without it
             if (why && other && nativeUpSwitch(nr, want, whyUp))
                 why = nullptr;
-            else if (why && other)
+            else if (why && restIn && nativeRestoreSwitch(nr, want, whyUp))
+                why = nullptr;
+            else if (why && (other || restIn))
             {
                 whyUp = std::string(why) + ": " + whyUp;
                 why = whyUp.c_str();

@@ -1575,6 +1575,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   else if (!liveHudLat) args.push('--no-hud-latency'); // meter on, latency segment hidden
   if (!liveGpuFit) args.push('--no-gpu-fit');
   liveSetVals = liveSetNow();
+  liveSetAj = liveAjFile();
   // Every server backend runs inside smv-live.exe (its native host), the only live route; a
   // session the host cannot run ends with its reason on the status line.
   // resident host: every server backend has something worth keeping (the native engines); the
@@ -1787,10 +1788,15 @@ ipcMain.on(
 
 // the running session's values a stdin `set` line changes in place (the host's nativeLiveSets): the Sharpen strength
 // (0 = off), RTX VSR's quality while RTX VSR is the upscaler, the RTX HDR sliders while RTX HDR runs, DLSS
-// 5 on / off and its Structure / Tone / passes (the host builds more passes in place, memory permitting), the
-// HUD's latency segment while the HUD shows; a value whose effect the session does not run takes effect with the next
-// session's arguments
+// 5 on / off and its Structure / Tone / passes (the host builds more passes in place, memory permitting), Anime4K's
+// Mode A+A, the upscaler / Restore by kind (a Restore the session started without starts in place), the HUD's latency
+// segment while the HUD shows; a value whose effect the session does not run takes effect with the next session's
+// arguments
 let liveSetVals: Record<string, number> | null = null;
+// AnimeJaNai's file as the host holds it (the spawn's --restore-model, or the last `restoremodel` sent): the host needs
+// it before `restore 2` to start AnimeJaNai in place
+let liveSetAj = '';
+const liveAjFile = () => (liveRestore && liveRestoreModel === 'animejanai' && fileExists(ajPath()) ? ajPath() : '');
 function liveSetNow(): Record<string, number> {
   const out: Record<string, number> = {};
   out.sharpen = Math.min(2, Math.max(0, Number(liveSharpen) || 0));
@@ -1804,6 +1810,9 @@ function liveSetNow(): Record<string, number> {
     nrpasses: liveNrPasses,
     dlssnr: liveDlssnr ? 1 : 0,
   });
+  // Anime4K's Mode A+A as the spawn passes it, before the upscaler's kind: an Anime4K started in place takes the
+  // value the host holds
+  out.a4kaa = liveA4kUp && liveA4kAA ? 1 : 0;
   // the upscaler, Restore and RTX HDR by kind (the host switches the kind its session runs off and on again in place)
   out.up = liveVsr ? 1 : liveFsrUp ? 2 : liveA4kUp ? 3 : liveAcnUp ? 4 : liveXessUp ? 5 : 0;
   out.restore = liveRestore ? (liveRestoreModel === 'animejanai' ? 2 : liveRestoreModel === 'anime4k' ? 3 : 1) : 0;
@@ -1814,6 +1823,8 @@ function liveSetNow(): Record<string, number> {
 }
 function liveSendSets() {
   if (!liveProc || liveIdle || liveStopping || !liveSetVals) return;
+  const aj = liveAjFile();
+  if (aj && aj !== liveSetAj && liveCommand(`set\trestoremodel\t${aj}`)) liveSetAj = aj;
   // a key the spawn did not carry (an effect ticked since) goes too: the host takes it in place or says why not
   for (const [k, v] of Object.entries(liveSetNow())) {
     if (liveSetVals[k] === v) continue;

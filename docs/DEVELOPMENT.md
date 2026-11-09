@@ -1508,23 +1508,33 @@ spawn (`main.ts` `liveSetNow` / `liveSendSets`). The native thread applies them 
 video memory room holds them), `vsrq` (RTX VSR proper), `hdrsat` / `hdrcon` / `hdrvib` / `hdrsb` (while RTX HDR runs),
 `nrstruct` / `nrtone` / `nrstyle` (DLSS 5's Structure / Tone / Style, all three read at every evaluate), `nrpasses`
 (DLSS 5 runs the first N passes it holds; more than it holds = `nr::Host::growPasses` builds the extra features and
-frames in place, as many as the room holds at `nr::kFrameMp` a megapixel a pass, `live DLSS 5: N more passes built in
-X ms`; a pass that comes back after being left out starts from a Reset), `dlssnr` (DLSS 5 off = the pass skips, its core
+frames in place, one pass a frame group (`nativeNrGrowStep`, so the picture keeps moving between the builds), as many
+as the room holds at `nr::kFrameMp` a megapixel a pass; the run count changes once, at the growth's end, which logs
+`live DLSS 5: N more passes built in X ms` and the set line; a new `nrpasses` during a growth ends it first, `(N run:
+another nrpasses arrived)`; a pass that comes back after being left out starts from a Reset), `dlssnr` (DLSS 5 off = the pass skips, its core
 stays; on again = it resumes from a Reset; on in a session that started without it = `nativeNrSwitch` brings the core
 up as the session start does, after the room check, at the Structure / Tone / passes / Style held meanwhile:
 `(held for DLSS 5's start)`), `hud` / `hudlat` (the HUD and its latency segment; the loop thread owns the HUD window
 and makes it when the session started without one), and `up` / `restore` / `rtxhdr` (the upscaler, Restore and RTX
 HDR by kind: the kind the session runs switches off through its own fallback, Lanczos / no Restore / faithful PQ,
-and on again; another Restore kind, or Restore / RTX HDR in a session that started without them, waits for the next
-session). An upscaler kind the session does not run starts in place (`nativeUpSwitch`) where the fit after the model
+and on again; another Restore kind, or RTX HDR in a session that started without it, waits for the next session). An
+upscaler kind the session does not run starts in place (`nativeUpSwitch`) where the fit after the model
 enlarges, on SDR or HDR planes: the checks that leave the running kind first (the route, `SMV_VSR_HDR` /
 `SMV_FSRUP_HDR`, the geometry, the DLLs; RTX VSR only while NGX holds its feature or does not exist yet), then the
 running kind's own state released (`nativeUpRelease`: the bridges' instances, Anime4K's resize buffers, ArtCNN's
 buffers and weights; RTX VSR keeps NGX, a switch back reuses its feature), the buffers the slot store reads, the room
 check and the kind's setup as the session start runs it. AMD FSR / Intel XeSS run their first two frames on a worker
 thread (`nativeFsrupWarmProc`): the driver compiles FSR's shaders inside them (about 30 s for an exe location and
-ratio it has not seen), and the session presents without the upscaler until they end. A key the session cannot take
-logs `(the next session takes it: why)`; the next spawn carries the new value either way.
+ratio it has not seen), and the session presents without the upscaler until they end. `a4kaa` (Anime4K's Mode A+A,
+sent before `up`): off = Anime4K's first pass skips the Restore CNN on its 2x frame (the buffers stay); on = Anime4K's
+resize buffers set up again with the A+A sizes at the session's geometry (`nativeA4kAaSwitch`, the room check first:
+short = Mode A with its reason); while Anime4K is not set up the value is held for its start in place. Restore in a
+session that started without it starts in place (`nativeRestoreSwitch`): `restoremodel` (AnimeJaNai's file, a path,
+sent before `restore 2`; held for Restore's start, a running AnimeJaNai keeps the file it loaded), then `restore N`
+runs the checks first (the route, an upscaler before the model, the kind's weights or file, an earlier start in place
+that failed), the room check for Restore's frames and the kind's buffers (the activations go into the shared GMFSS
+block when it holds them), and the kind's setup and warm-up as the session start runs them, with the capture as
+Restore's source and the model size as its fold target. A key the session cannot take logs `(the next session takes it: why)`; the next spawn carries the new value either way.
 
 The host prints what
 it keeps in the `live session ended` line (`engines` = the model state). The exe imports its own
