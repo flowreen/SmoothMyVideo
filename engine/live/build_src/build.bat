@@ -26,11 +26,17 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 :compile
 cd /d %~dp0
 rem smv-live.exe, the native host.
-rem SMV_CU = the CUDA headers and import libs that already ship in the app's python runtime;
-rem it defaults to this checkout's own engine\runtime, so a plain build needs neither a CUDA
-rem toolkit nor any absolute path. cuda_shim supplies the one internal header the runtime wheel
-rem leaves out (see cuda_shim\crt\host_defines.h).
-if "%SMV_CU%"=="" set "SMV_CU=%~dp0..\..\runtime\Lib\site-packages\nvidia\cu13"
+rem SMV_CU = NVIDIA's CUDA headers and import libs. It defaults to this folder's cuda\, which
+rem "node scripts\stage-gpu-runtime.ts --sdk" fills from NVIDIA's pinned wheels, so a plain build needs
+rem neither a CUDA toolkit nor any absolute path. cuda_shim supplies the one internal header the
+rem runtime wheel leaves out (see cuda_shim\crt\host_defines.h).
+if "%SMV_CU%"=="" set "SMV_CU=%~dp0cuda"
+if not exist "%SMV_CU%\include\cuda.h" goto nocuda
+goto havecuda
+:nocuda
+echo CUDA headers not found in %SMV_CU%: run "node scripts\stage-gpu-runtime.ts --sdk" first, see DEVELOPMENT.md
+exit /b 1
+:havecuda
 rem The DLSS 5 Neural Rendering core (engine\dlssnr\build_src\nr_host.cpp) is compiled
 rem into the exe; NGX_SDK = the public NVIDIA DLSS SDK folder holding include\nvsdk_ngx.h, the
 rem same variable the dlssnr build uses (see DEVELOPMENT.md). Build time only, nothing shipped.

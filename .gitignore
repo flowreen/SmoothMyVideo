@@ -13,7 +13,8 @@ npm-debug.log*
 .idea/
 .vscode/
 
-# engine: generated, fetched, and non-redistributable files kept out of git (caches, the Python runtime, ffmpeg, NVIDIA DLLs)
+# engine: generated, fetched, and non-redistributable files kept out of git (caches, ffmpeg, NVIDIA's DLLs and build headers)
+engine/live/build_src/cuda/
 engine/bin/
 engine/nvoffruc/NvOFFRUC.dll
 engine/nvoffruc/cudart64_110.dll

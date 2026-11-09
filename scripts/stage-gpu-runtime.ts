@@ -1,17 +1,14 @@
 // scripts/stage-gpu-runtime.ts
 //
-// npm setup, dist and the first start of SmoothMyVideo.cmd: put the CUDA 13 DLLs the native host
-// (engine/live/smv-live.exe) loads (the CUDA runtime, NVRTC and its builtins) into engine/gpu_runtime
-// (shipped, gitignored). Two sources, the same DLLs:
-//   * the dev python's wheels when engine/runtime exists (never shipped; the harness then runs the
-//     CUDA version the app ships);
-//   * else NVIDIA's own two wheels straight from PyPI (a wheel is a zip), pinned below by URL and
-//     SHA-256, so a fresh clone needs no python at all.
+// npm setup, dist and the first start of SmoothMyVideo.cmd: put NVIDIA's CUDA 13 DLLs the native host
+// (engine/live/smv-live.exe) loads (the CUDA runtime, NVRTC and its builtins) into engine/gpu_runtime (shipped,
+// gitignored). With --sdk also the CUDA headers and import libs the host's build.bat compiles against, into
+// engine/live/build_src/cuda (gitignored, never shipped). Both come out of NVIDIA's own two wheels on PyPI (a wheel
+// is a zip), pinned below by URL and SHA-256, so neither running nor building needs a CUDA toolkit.
 //
-// Behaviour: a file already staged with the same size and mtime is skipped, so a rerun is cheap; any
-// other file in the folder is removed; the PyPI source is not asked again while the folder holds the
-// pinned files. setup is NON-FATAL (a failed download leaves a warning); `--required` (dist) fails the
-// build instead, so a release never ships without them.
+// Behaviour: nothing is downloaded while the folders hold the pinned version; any other file in engine/gpu_runtime
+// is removed. setup is NON-FATAL (a failed download leaves a warning); `--required` (dist) fails the build instead,
+// so a release never ships without the DLLs.
 
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -20,13 +17,13 @@ import os from 'node:os';
 import path from 'node:path';
 
 const ENGINE = path.resolve(import.meta.dirname, '..', 'engine');
-const WHEEL_BIN = path.join('nvidia', 'cu13', 'bin', 'x86_64');
-const DEV_WHEELS = path.join(ENGINE, 'runtime', 'Lib', 'site-packages', WHEEL_BIN);
 const OUT = path.join(ENGINE, 'gpu_runtime');
+const SDK = path.join(ENGINE, 'live', 'build_src', 'cuda');
 const required = process.argv.includes('--required');
+const wantSdk = process.argv.includes('--sdk');
 
-// A CUDA bump = pip in the dev python AND these pins (the version, each wheel's URL and SHA-256 from
-// https://pypi.org/pypi/<package>/<version>/json, each DLL's size).
+// A CUDA bump changes these pins together: the version, each wheel's URL and SHA-256 (from
+// https://pypi.org/pypi/<package>/<version>/json), each DLL's name and size.
 const PYPI_VERSION = '13.5.37';
 const PYPI_WHEELS: { url: string; sha256: string; mb: number }[] = [
   {
@@ -45,6 +42,14 @@ const PYPI_DLLS: [name: string, size: number][] = [
   ['nvrtc64_130_0.dll', 111767152],
   ['nvrtc-builtins64_135.dll', 7407216],
 ];
+// what the host's build must find in the SDK: the headers it includes by name and the two loader libs
+const SDK_FILES = [
+  path.join('include', 'cuda.h'),
+  path.join('include', 'cuda_runtime_api.h'),
+  path.join('include', 'nvrtc.h'),
+  path.join('lib', 'x64', 'cuda.lib'),
+  path.join('lib', 'x64', 'cudart.lib'),
+];
 
 function fail(msg: string): void {
   if (required) {
@@ -54,45 +59,49 @@ function fail(msg: string): void {
   console.warn(`[stage-gpu-runtime] ${msg} - skipping; renders need engine/gpu_runtime.`);
 }
 
-function stageFrom(cuda: string, source: string): void {
-  if (!fs.existsSync(cuda)) return fail(`no CUDA 13 DLL folder in ${source}`);
-  const builtins = fs.readdirSync(cuda).filter((n) => /^nvrtc-builtins64_\d+\.dll$/i.test(n));
-  const want: [string, string][] = [
-    [cuda, 'cudart64_13.dll'],
-    [cuda, 'nvrtc64_130_0.dll'],
-    ...builtins.map((n): [string, string] => [cuda, n]),
-  ];
-  const missing = want.filter(([d, n]) => !fs.existsSync(path.join(d, n))).map(([, n]) => n);
-  if (missing.length || !builtins.length)
-    return fail(`missing in ${source}: ${missing.join(', ') || 'nvrtc-builtins64_*.dll'}`);
-  fs.mkdirSync(OUT, { recursive: true });
-  const keep = new Set(want.map(([, n]) => n.toLowerCase()));
-  for (const n of fs.readdirSync(OUT)) {
-    if (!keep.has(n.toLowerCase())) fs.rmSync(path.join(OUT, n), { recursive: true, force: true });
-  }
-  let copied = 0;
-  for (const [d, n] of want) {
-    const src = path.join(d, n),
-      dst = path.join(OUT, n);
-    if (fs.existsSync(dst)) {
-      // size AND mtime (copyFileSync keeps it): a CUDA patch bump can keep a DLL's size
-      const a = fs.statSync(src),
-        b = fs.statSync(dst);
-      if (a.size === b.size && a.mtimeMs === b.mtimeMs) continue;
-    }
-    fs.copyFileSync(src, dst);
-    copied++;
-  }
-  console.log(`[stage-gpu-runtime] ${want.length} DLLs in engine/gpu_runtime from ${source} (${copied} copied)`);
-}
-
-function fromPyPI(): void {
-  const staged = PYPI_DLLS.every(([n, size]) => {
+function dllsStaged(): boolean {
+  return PYPI_DLLS.every(([n, size]) => {
     const f = path.join(OUT, n);
     return fs.existsSync(f) && fs.statSync(f).size === size;
   });
-  if (staged) {
-    console.log(`[stage-gpu-runtime] engine/gpu_runtime already holds CUDA ${PYPI_VERSION} - skipping.`);
+}
+
+function sdkStaged(): boolean {
+  const stamp = path.join(SDK, 'VERSION');
+  return (
+    fs.existsSync(stamp) &&
+    fs.readFileSync(stamp, 'utf8').trim() === PYPI_VERSION &&
+    SDK_FILES.every((f) => fs.existsSync(path.join(SDK, f)))
+  );
+}
+
+function stageDlls(bin: string): void {
+  const missing = PYPI_DLLS.filter(([n]) => !fs.existsSync(path.join(bin, n))).map(([n]) => n);
+  if (missing.length) throw new Error(`missing in the wheels: ${missing.join(', ')}`);
+  fs.mkdirSync(OUT, { recursive: true });
+  const keep = new Set(PYPI_DLLS.map(([n]) => n.toLowerCase()));
+  for (const n of fs.readdirSync(OUT)) {
+    if (!keep.has(n.toLowerCase())) fs.rmSync(path.join(OUT, n), { recursive: true, force: true });
+  }
+  for (const [n] of PYPI_DLLS) fs.copyFileSync(path.join(bin, n), path.join(OUT, n));
+  console.log(`[stage-gpu-runtime] ${PYPI_DLLS.length} DLLs in engine/gpu_runtime (CUDA ${PYPI_VERSION})`);
+}
+
+function stageSdk(cu: string): void {
+  const missing = SDK_FILES.filter((f) => !fs.existsSync(path.join(cu, f)));
+  if (missing.length) throw new Error(`missing in the wheels: ${missing.join(', ')}`);
+  fs.rmSync(SDK, { recursive: true, force: true });
+  fs.mkdirSync(SDK, { recursive: true });
+  for (const d of ['include', 'lib']) fs.cpSync(path.join(cu, d), path.join(SDK, d), { recursive: true });
+  fs.writeFileSync(path.join(SDK, 'VERSION'), PYPI_VERSION + '\n');
+  console.log(`[stage-gpu-runtime] CUDA ${PYPI_VERSION} headers and libs in engine/live/build_src/cuda`);
+}
+
+function run(): void {
+  const needDlls = !dllsStaged();
+  const needSdk = wantSdk && !sdkStaged();
+  if (!needDlls && !needSdk) {
+    console.log(`[stage-gpu-runtime] CUDA ${PYPI_VERSION} already staged - skipping.`);
     return;
   }
   const sys32 = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32');
@@ -111,15 +120,16 @@ function fromPyPI(): void {
       if (got !== w.sha256) throw new Error(`${name}: SHA-256 ${got} is not the pinned ${w.sha256}`);
       execFileSync(tar, ['-xf', whl, '-C', tmp], { stdio: 'inherit' });
     }
-    stageFrom(path.join(tmp, WHEEL_BIN), `NVIDIA's PyPI wheels ${PYPI_VERSION}`);
+    const cu = path.join(tmp, 'nvidia', 'cu13');
+    if (needDlls) stageDlls(path.join(cu, 'bin', 'x86_64'));
+    if (needSdk) stageSdk(cu);
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
-  if (error) fail(`the CUDA DLLs could not be fetched from PyPI (${error})`);
+  if (error) fail(`CUDA ${PYPI_VERSION} could not be fetched from PyPI (${error})`);
 }
 
 if (process.platform !== 'win32') fail('not Windows (this build is win64 only)');
-else if (fs.existsSync(DEV_WHEELS)) stageFrom(DEV_WHEELS, "the dev python's wheels");
-else fromPyPI();
+else run();

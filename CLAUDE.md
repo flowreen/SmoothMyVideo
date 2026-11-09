@@ -55,8 +55,8 @@ kernel text that does not change keeps its cache entry.
 
 ## Never read or search these
 
-`node_modules/`, `dist/`, `release/`, `renderer/app.js`, `engine/runtime/` (a multi-gigabyte dev Python),
-`engine/bin/`, `engine/gpu_runtime/`, `model_cache_safe_to_delete/`, any `.exe`, `.dll`, `.pkl`, `.pth`, and the
+`node_modules/`, `dist/`, `release/`, `renderer/app.js`, `engine/runtime/` (git-ignored local tooling, thousands
+of files), `engine/bin/`, `engine/gpu_runtime/`, `engine/live/build_src/cuda/`, `model_cache_safe_to_delete/`, any `.exe`, `.dll`, `.pkl`, `.pth`, and the
 vendored trees `engine/GMFSS_Fortuna/`, `engine/rife/`, `engine/live/build_src/nvofa/`. Scope every search to the
 source paths in the table above; never search from the repo root.
 

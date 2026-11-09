@@ -292,7 +292,7 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
 The UI is Electron + TypeScript. Every render and Live session runs in one native host (`smv-live.exe`, C++ on
 CUDA: GMFSS, RIFE, Restore, Anime4K and ArtCNN run on its own CUDA kernels, their heavy layers on the Tensor Cores),
 driven by a TypeScript orchestrator that handles probing, encoding (ffmpeg) and resume;
-DLSS 4.5 file renders run NVIDIA's frame generation in a small separate helper. No Python ships. The default model on
+DLSS 4.5 file renders run NVIDIA's frame generation in a small separate helper. The default model on
 GPUs without DLSS 4.5, **GMFSS_Fortuna**, is a "union" interpolator: GMFlow optical flow, an IFNet/RIFE refiner, plus MetricNet, FeatureNet,
 FusionNet and softsplat warping.
 

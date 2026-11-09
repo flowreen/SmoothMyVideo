@@ -3,8 +3,8 @@
 // engine/live/smv-live.exe is never touched:
 //   analyze  MSVC /analyze (the C6xxx / C26xxx / C28xxx checks; the SDK headers are external, not analysed)
 //   w4       warning level 4 (the ship build uses /W3), the SDK headers external
-// Needs what build.bat needs: SL_SDK, TRT_RTX_SDK and NGX_SDK (SMV_CU defaults to the dev runtime's CUDA wheel) and
-// Visual Studio 2026 (vcvars64 through vswhere). Prints the warnings grouped by code and every warning line of our own
+// Needs what build.bat needs: SL_SDK and NGX_SDK (SMV_CU defaults to build_src\cuda, which
+// `node scripts/stage-gpu-runtime.ts --sdk` fills) and Visual Studio 2026 (vcvars64 through vswhere). Prints the warnings grouped by code and every warning line of our own
 // sources; exit 0 = none in our sources. --keep DIR writes the objects and the log there instead; --root DIR reads
 // engine/live/build_src and engine/dlssnr/build_src from another tree laid out like the repo (a working copy).
 // Usage: node scripts/cpp-check.ts analyze|w4 [--keep DIR] [--root DIR]
@@ -34,19 +34,17 @@ const OWN = ['smv-live.cpp', 'smv-live-', 'nr_host.', 'sl_focus_shim.h'];
 function main(): number {
   const mode = args[0] ?? '';
   if (mode !== 'analyze' && mode !== 'w4') {
-    console.log(
-      'usage: node scripts/cpp-check.ts analyze|w4 [--keep DIR] [--root DIR] (needs SL_SDK, TRT_RTX_SDK, NGX_SDK)',
-    );
+    console.log('usage: node scripts/cpp-check.ts analyze|w4 [--keep DIR] [--root DIR] (needs SL_SDK, NGX_SDK)');
     return 2;
   }
   const env: Record<string, string> = {};
-  for (const k of ['SL_SDK', 'TRT_RTX_SDK', 'NGX_SDK']) env[k] = (process.env[k] ?? '').trim();
+  for (const k of ['SL_SDK', 'NGX_SDK']) env[k] = (process.env[k] ?? '').trim();
   const missing = Object.keys(env).filter((k) => !env[k]);
   if (missing.length) {
     console.log(`set ${missing.join(', ')} first (the same variables build.bat needs, see Building the native host)`);
     return 2;
   }
-  env.SMV_CU = process.env.SMV_CU || path.join(REPO, 'engine', 'runtime', 'Lib', 'site-packages', 'nvidia', 'cu13');
+  env.SMV_CU = process.env.SMV_CU || path.join(REPO, 'engine', 'live', 'build_src', 'cuda');
   env.NRSRC = NRSRC;
   const bat = fs.readFileSync(path.join(BSRC, 'build.bat'), 'utf8');
   const m = /^cl \/nologo [\s\S]*?\/OUT:\.\.\\smv-live\.exe/m.exec(bat);
@@ -71,7 +69,6 @@ function main(): number {
   fs.mkdirSync(work, { recursive: true });
   const external = [
     `${env.SL_SDK}\\include`,
-    `${env.TRT_RTX_SDK}\\include`,
     `${env.SMV_CU}\\include`,
     `${env.NGX_SDK}\\include`,
     path.join(BSRC, 'nvofa'),
