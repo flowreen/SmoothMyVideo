@@ -1380,6 +1380,8 @@ let liveRestoreModel = ''; // Restore's model id ('animejanai' = the installed A
 let liveDlssnr = false; // DLSS 5 Neural Rendering once per captured frame, inherited from the NVIDIA DLSS 5 checkbox
 let liveNrStructure = 1; // DLSS 5 Structure Intensity 0..2
 let liveNrTone = 1; // DLSS 5 Tone Intensity 0..2
+let liveNrSkin = -1; // DLSS 5 Skin Structure 0..2, -1 = NVIDIA's default (follows Structure)
+let liveNrAutoMask = 1; // DLSS 5 Auto mask (NVIDIA's character mask) 1 on / 0 off
 let liveNrStyle = 0; // DLSS 5 Style: 0 Default (NVIDIA's, the app's default), 1 Natural, 2 Cinematic
 let liveNrPasses = 1; // DLSS 5 passes, 1..20 (chained per frame)
 let liveRtxHdr = false; // live TrueHDR, inherited from the RTX HDR checkbox
@@ -1555,6 +1557,8 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
       String(liveNrStyle),
     );
   if (liveDlssnr && liveNrPasses > 1) args.push('--nr-passes', String(liveNrPasses));
+  if (liveDlssnr && liveNrSkin >= 0) args.push('--nr-skin', String(liveNrSkin));
+  if (liveDlssnr && !liveNrAutoMask) args.push('--nr-automask', '0');
   // live TrueHDR: SDR window expanded to HDR out, inherited from the RTX HDR
   // controls; the exe forwards these to the server only when its HDR live mode is on
   if (liveRtxHdr) {
@@ -1733,6 +1737,8 @@ ipcMain.on(
       dlssnr?: boolean;
       nrstructure?: number;
       nrtone?: number;
+      nrskin?: number; // DLSS 5 Skin Structure 0..2, -1 = NVIDIA's default
+      nrautomask?: number; // DLSS 5 Auto mask 1 / 0
       nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
       nrpasses?: number; // DLSS 5 passes 1..20
       rtxhdr?: boolean;
@@ -1767,6 +1773,8 @@ ipcMain.on(
     liveDlssnr = !!opts.dlssnr;
     liveNrStructure = opts.nrstructure ?? 1;
     liveNrTone = opts.nrtone ?? 1;
+    liveNrSkin = opts.nrskin ?? -1;
+    liveNrAutoMask = opts.nrautomask === 0 ? 0 : 1;
     liveNrStyle = opts.nrstyle ?? 0;
     liveNrPasses = Math.min(20, Math.max(1, Math.round(opts.nrpasses ?? 1)));
     liveRtxHdr = !!opts.rtxhdr;
@@ -1807,6 +1815,8 @@ function liveSetNow(): Record<string, number> {
     nrstyle: liveNrStyle,
     nrstruct: liveNrStructure,
     nrtone: liveNrTone,
+    nrskin: liveNrSkin,
+    nrautomask: liveNrAutoMask,
     nrpasses: liveNrPasses,
     dlssnr: liveDlssnr ? 1 : 0,
   });
@@ -2243,6 +2253,8 @@ type RunOpts = {
   dlssnr?: boolean;
   nrstructure?: number;
   nrtone?: number;
+  nrskin?: number; // DLSS 5 Skin Structure 0..2, -1 = NVIDIA's default
+  nrautomask?: number; // DLSS 5 Auto mask 1 / 0
   nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
   nrpasses?: number; // DLSS 5 passes 1..20
   interp?: boolean;
@@ -2321,6 +2333,8 @@ function engineArgs(opts: RunOpts): string[] {
     );
   if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
     args.push('--nr-passes', String(Math.min(20, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
+  if (opts.dlssnr && (opts.nrskin ?? -1) >= 0) args.push('--nr-skin', String(opts.nrskin));
+  if (opts.dlssnr && opts.nrautomask === 0) args.push('--nr-automask', '0');
   // Resize factor (an arbitrary float, source height -> chosen target height), computed by the
   // renderer from the resolution selector. >1 enables the upscale pass; <1 is a downscale the
   // engine FOLDS into the decode (whole pipeline runs at the output size - also what keeps 4K
@@ -2571,6 +2585,8 @@ type PreviewOpts = {
   dlssnr?: boolean;
   nrstructure?: number;
   nrtone?: number;
+  nrskin?: number; // DLSS 5 Skin Structure 0..2, -1 = NVIDIA's default
+  nrautomask?: number; // DLSS 5 Auto mask 1 / 0
   nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
   nrpasses?: number; // DLSS 5 passes 1..20
   nrmask?: boolean;
@@ -2595,6 +2611,8 @@ function previewArgv(opts: PreviewOpts, prefix: string): string[] {
     );
   if (opts.dlssnr && (opts.nrpasses ?? 1) > 1)
     args.push('--nr-passes', String(Math.min(20, Math.max(1, Math.round(opts.nrpasses ?? 1)))));
+  if (opts.dlssnr && (opts.nrskin ?? -1) >= 0) args.push('--nr-skin', String(opts.nrskin));
+  if (opts.dlssnr && opts.nrautomask === 0) args.push('--nr-automask', '0');
   if (opts.dlssnr && opts.nrmask) args.push('--nr-mask'); // heat map of the DLSS 5 change, <prefix>_nrmask.png
   if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) args.push('--upscale', String(opts.upscale));
   if (opts.rtxvsr)

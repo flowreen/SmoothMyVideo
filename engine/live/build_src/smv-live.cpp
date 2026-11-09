@@ -189,6 +189,8 @@ static bool g_dlssnr = false;                  // --dlssnr: forwarded to the ser
                                                // once per captured frame, the app's NVIDIA DLSS 5 checkbox)
 static double g_nrStructure = 1.0;             // --nr-structure F (0..2, the DLSS 5 Structure Intensity)
 static double g_nrTone = 1.0;                  // --nr-tone F (0..2, the DLSS 5 Tone Intensity)
+static double g_nrSkin = -1.0;                 // --nr-skin F (DLSSNR.SkinStructureStrength: < 0 follows structure)
+static int g_nrAutoMask = 1;                   // --nr-automask 0|1 (DLSSNR.UseAutoMask, NVIDIA's character mask)
 static int g_nrStyle = 0;                      // --nr-style N (DLSSNR.Style: 0 Default, 1 Natural, 2 Cinematic)
 static int g_nrPasses = 1;                     // --nr-passes N (1..nr::kMaxPasses: DLSS 5 chained N times per frame)
 static bool g_nrNative = false;                // DLSS 5 NR runs inside this exe (the native host's pass); the
@@ -813,7 +815,9 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 //               (RIFE: the host finds or builds the engines itself, lkOfflineRife)
 //               the per-frame passes: [--out-w W --out-h H] [--restore | --restore-model ONNX | --restore-anime4k]
 //               [--rtx-vsr [--vsr-quality N] | --fsr-upscale | --anime4k | --artcnn | --xess-upscale]
-//               [--dlssnr --nr-structure F --nr-tone F --nr-style N [--nr-delta PATH]] [--sharpen S] [--rtx-hdr ...]
+//               [--dlssnr --nr-structure F --nr-tone F [--nr-skin F] [--nr-automask 0|1] --nr-style N
+//               [--nr-delta PATH]] [--sharpen S]
+//               [--rtx-hdr ...]
 //               [--out-vf FILTERS [--out-sws FLAGS]] (the encoder's conversion to p010le run here, FfConv)
 // Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
 // stdout in the same pixfmt (the encoder pipe), or with --out-vf as the encoder's p010le. Real frames go
@@ -1440,6 +1444,8 @@ struct DgChild
     std::atomic<bool> stalled{false}, closing{false};
     uint64_t pairs = 0;     // pairs done (the RTSS check's schedule)
     bool rtssNamed = false; // the RTSS hook already named in this render's log
+    HANDLE hCut = nullptr;  // the server's cut event (its --cut-event): set = the next frame starts a new clip
+    bool cut = false;       // the server watches it (handshake " cut=1"): only such a server is kept (g_dgKept)
 };
 
 static const int kDgMaxRestarts = 4;
@@ -1505,12 +1511,68 @@ static void dgEnd(DgChild& c, bool kill)
         CloseHandle(c.hErr);
         c.hErr = nullptr;
     }
+    if (c.hCut)
+    {
+        CloseHandle(c.hCut);
+        c.hCut = nullptr;
+    }
     {
         std::lock_guard<std::mutex> lk(c.m);
         if (c.hProc)
             CloseHandle(c.hProc);
         c.hProc = nullptr;
     }
+}
+
+// The resident offline host keeps the server of a clean DLSS 4.5 render: Streamline and NGX take about three seconds
+// to come up in every new server, and the next render of the same folder, padded size, multiplier and frame format
+// takes this one (dgTakeKept) and sets its cut event, so that render's first frame starts a new clip there and its
+// tweens are a new server's. Any other render ends it before its own video memory fits, and so does the host's exit
+// (dgDropKept). SMV_DLSSG_KEEP=0 = a new server every render
+static std::unique_ptr<DgChild> g_dgKept;
+
+static void dgDropKept()
+{
+    if (!g_dgKept)
+        return;
+    dgEnd(*g_dgKept, false);
+    g_dgKept.reset();
+}
+
+// the kept server when it is alive and runs what this render needs; any other kept server is ended here
+static std::unique_ptr<DgChild> dgTakeKept(const std::wstring& dir, int w, int h, int gen, bool hdr10)
+{
+    if (!g_dgKept)
+        return nullptr;
+    const DgChild& k = *g_dgKept;
+    const bool up = k.hProc && WaitForSingleObject(k.hProc, 0) == WAIT_TIMEOUT;
+    if (!up || k.dir != dir || k.w != w || k.h != h || k.gen != gen || k.hdr10 != hdr10)
+    {
+        dgDropKept();
+        return nullptr;
+    }
+    return std::move(g_dgKept);
+}
+
+// the server's folder: the shipped layout (engine\live -> engine\dlssg), SMV_DLSSG_DIR = another one
+static std::wstring dgServerDir(const std::wstring& exeDir)
+{
+    std::wstring dir = exeDir + L"\\..\\dlssg";
+    wchar_t ov[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"SMV_DLSSG_DIR", ov, MAX_PATH) && ov[0])
+        dir = ov;
+    wchar_t full[MAX_PATH]{};
+    if (GetFullPathNameW(dir.c_str(), MAX_PATH, full, nullptr))
+        dir = full;
+    return dir;
+}
+
+// the order of a pair's transfers, said once a render
+static void dgSayOrder(const DgChild& c)
+{
+    LOG("dlss: %s\n", c.wq ? "the server streams each pair from its own thread: a frame goes out before the previous "
+                             "pair is read"
+                           : "a frame goes out after the previous pair is read");
 }
 
 // start the server and read its handshake; 0 = up, else the child's exit code (-1 = no process,
@@ -1528,8 +1590,21 @@ static int dgSpawn(DgChild& c)
     SetHandleInformation(inW, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(errR, HANDLE_FLAG_INHERIT, 0);
-    // the child inherits exactly its three pipe ends (never a frame pipe of the resident host)
-    HANDLE inherit[3] = {inR, outW, errW};
+    // the cut event (auto-reset): the server takes the frame that follows a set as a new clip's first
+    HANDLE cutEv = CreateEventW(&sa, FALSE, FALSE, nullptr);
+    if (!cutEv)
+    {
+        LOG("dlss: the cut event failed (%lu)\n", GetLastError());
+        CloseHandle(inR);
+        CloseHandle(inW);
+        CloseHandle(outR);
+        CloseHandle(outW);
+        CloseHandle(errR);
+        CloseHandle(errW);
+        return -1;
+    }
+    // the child inherits exactly its three pipe ends and the event (never a frame pipe of the resident host)
+    HANDLE inherit[4] = {inR, outW, errW, cutEv};
     SIZE_T attrSize = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
     std::vector<uint8_t> attrBuf(attrSize);
@@ -1546,7 +1621,8 @@ static int dgSpawn(DgChild& c)
     si.lpAttributeList = attrs;
     const std::wstring exe = c.dir + L"\\dlssg2f.exe";
     std::wstring cmd = L"\"" + exe + L"\" --server " + std::to_wstring(c.w) + L" " + std::to_wstring(c.h) + L" --gen " +
-                       std::to_wstring(c.gen) + (c.hdr10 ? L" --hdr10" : L"");
+                       std::to_wstring(c.gen) + (c.hdr10 ? L" --hdr10" : L"") + L" --cut-event " +
+                       std::to_wstring((uint64_t)(uintptr_t)cutEv);
     PROCESS_INFORMATION pi{};
     ok = ok &&
          CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
@@ -1561,6 +1637,7 @@ static int dgSpawn(DgChild& c)
         CloseHandle(inW);
         CloseHandle(outR);
         CloseHandle(errR);
+        CloseHandle(cutEv);
         LOG("dlss: cannot start %s (%lu)\n", wideToUtf8(exe).c_str(), err);
         return -1;
     }
@@ -1572,6 +1649,8 @@ static int dgSpawn(DgChild& c)
     c.hIn = inW;
     c.hOut = outR;
     c.hErr = errR;
+    c.hCut = cutEv;
+    c.cut = false;
     c.errPump = std::thread([h = errR]() {
         // the server's own log (the "DLSS-G ready: SL x.y.z" line, resets, errors), line by line
         std::string acc;
@@ -1606,12 +1685,11 @@ static int dgSpawn(DgChild& c)
         wchar_t wq[8]{};
         c.wq = line.find(" wq=1") != std::string::npos &&
                !(GetEnvironmentVariableW(L"SMV_DLSSG_WQ", wq, 8) && wq[0] == L'0');
+        c.cut = line.find(" cut=1") != std::string::npos;
         if (!c.hdr10 || line.find(" hdr10=1") != std::string::npos)
         {
             if (c.spawns++ == 0)
-                LOG("dlss: %s\n", c.wq ? "the server streams each pair from its own thread: a frame goes out before "
-                                         "the previous pair is read"
-                                       : "a frame goes out after the previous pair is read");
+                dgSayOrder(c);
             return 0;
         }
         dgEnd(c, true); // an older dlssg2f.exe ignores --hdr10 and would read the words as RGBA8
@@ -1925,6 +2003,10 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_nrStructure = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-tone") == 0 && i + 1 < argc)
             g_nrTone = _wtof(argv[++i]);
+        else if (wcscmp(argv[i], L"--nr-skin") == 0 && i + 1 < argc)
+            g_nrSkin = _wtof(argv[++i]);
+        else if (wcscmp(argv[i], L"--nr-automask") == 0 && i + 1 < argc)
+            g_nrAutoMask = _wtoi(argv[++i]) != 0 ? 1 : 0;
         else if (wcscmp(argv[i], L"--nr-style") == 0 && i + 1 < argc)
             g_nrStyle = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-passes") == 0 && i + 1 < argc)
@@ -2028,14 +2110,23 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     float* dDgF = nullptr;
     uint8_t* hDgIn[3]{};
     uint8_t* hDgOut = nullptr;
-    bool outClosed = false;       // the run's end closed hOut (EOF to the encoder)
-    cudaEvent_t pairEv = nullptr; // the identical-pair test's flag copy (pairEnqueue / pairCollect)
+    std::unique_ptr<DgChild> dgHold; // the DLSS 4.5 server of this render (taken from g_dgKept, or its own)
+    bool outClosed = false;          // the run's end closed hOut (EOF to the encoder)
+    cudaEvent_t pairEv = nullptr;    // the identical-pair test's flag copy (pairEnqueue / pairCollect)
     // A resident offline host outlives a failed item, so every return frees what the item made: the
     // DLSS 5 handoff, the frame buffers, the session (nativeFree) and hOut, which the caller leaves to
-    // this function.
+    // this function. A DLSS 4.5 server this return still holds (a return before the render's own end, or a render that
+    // did not hand it to g_dgKept) is ended with its watchdog
     OnReturn freeItem{[&] {
         if (namedPipes && !outClosed)
             CloseHandle(hOut);
+        if (dgHold)
+        {
+            dgEnd(*dgHold, true);
+            dgHold->closing = true;
+            if (dgHold->watch.joinable())
+                dgHold->watch.join();
+        }
         if (!nr.stream)
             return; // the stream is the item's first CUDA object: nothing CUDA was made before it
         if (pairEv)
@@ -2074,6 +2165,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         cudaFreeHost(hDgOut);
         nativeFree(nr);
     }};
+    if (!oa.dlssg)
+        dgDropKept(); // another model: the kept DLSS 4.5 server gives its video memory back before this render's fits
     int w = oa.w, h = oa.h; // not const: kernel argument arrays take their addresses as void*
     // The passes at the working size (--work-w / --work-h, the DLSS mode x the output): the
     // decoded frame (srcW x srcH) goes through Restore and the resize to the working size first, the
@@ -2197,6 +2290,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.ch = h;
         nr.dw = w;
         nr.dh = h;
+        // the kept server: taken when it runs this size, multiplier and frame format, else ended, here = before any
+        // video memory fit of this render
+        dgHold = dgTakeKept(dgServerDir(exeDir), nr.pw, nr.ph, multi - 1,
+                            (oa.srcHdr || g_rtxHdr) && lkEnv("SMV_DLSSG_HDR10") != "0");
     }
     else if (!oa.nvof && !oa.echo)
     {
@@ -2460,6 +2557,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr::Settings set;
         set.structure = (float)(g_nrStructure < 0.0 ? 0.0 : (g_nrStructure > 2.0 ? 2.0 : g_nrStructure));
         set.tone = (float)(g_nrTone < 0.0 ? 0.0 : (g_nrTone > 2.0 ? 2.0 : g_nrTone));
+        set.skin = (float)(g_nrSkin < 0.0 ? -1.0 : (g_nrSkin > 2.0 ? 2.0 : g_nrSkin));
+        set.automask = g_nrAutoMask ? 1 : 0;
         set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 0;
         set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
         // Zero-copy unless the preview's change map needs the host copies or SMV_NR_STAGED=1
@@ -2469,7 +2568,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         wchar_t sg[8]{}, mvv[8]{}, amv[8]{};
         const bool staged = !oa.nrDeltaW.empty() || (GetEnvironmentVariableW(L"SMV_NR_STAGED", sg, 8) && sg[0] == L'1');
         set.motion = !staged && !(GetEnvironmentVariableW(L"SMV_NR_MV", mvv, 8) && mvv[0] == L'0');
-        const bool autoMask = !(GetEnvironmentVariableW(L"SMV_NR_AUTOMASK", amv, 8) && amv[0] == L'0');
+        const bool autoMask = g_nrAutoMask && !(GetEnvironmentVariableW(L"SMV_NR_AUTOMASK", amv, 8) && amv[0] == L'0');
         std::string err;
         g_nrAttempted = true;
         nr::Host* host = new nr::Host();
@@ -2539,9 +2638,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 LOG("offline: DLSS 5 buffers failed\n");
                 return 2;
             }
-            LOG("DLSS 5 Neural Rendering ready (DLAA, structure %.2f, tone %.2f, style %d, %s, before the "
+            char skinTxt[24] = ""; // the skin value when it is set apart from the structure
+            if (set.skin >= 0.0f)
+                sprintf_s(skinTxt, ", skin %.2f", set.skin);
+            LOG("DLSS 5 Neural Rendering ready (DLAA, structure %.2f, tone %.2f%s, style %d, %s, before the "
                 "interpolation%s%s, passes %d%s%s%s) @ %dx%d\n",
-                set.structure, set.tone, set.style, nr.nrZeroCopy ? "zero-copy" : "CPU staging",
+                set.structure, set.tone, skinTxt, set.style, nr.nrZeroCopy ? "zero-copy" : "CPU staging",
                 nr.nrMotion ? ", motion vectors" : ", no motion vectors", autoMask ? ", auto mask" : "", host->passes(),
                 nr.nrResetEvery ? ", SMV_NR_RESET_EVERY" : "",
                 nr.nrReuse ? ", identical frames reuse the last output" : "",
@@ -2616,7 +2718,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     // DLSS 4.5: the RGBA8 staging (device + pinned: the three latest frames, so a restart can send
     // the pair being read again while the next frame is staged, and the pair's generated frames),
     // then the server itself; its handshake decides "up" vs "unsupported"
-    DgChild dgc;
+    const bool dgTaken = dgHold != nullptr; // the last render's server (dgTakeKept above)
+    if (!dgHold)
+        dgHold = std::make_unique<DgChild>();
+    DgChild& dgc = *dgHold;
     const size_t dgBytes = (size_t)nr.pw * nr.ph * 4;
     int dgHlg = oa.srcHdr == 2 ? 1 : 0; // HDR10 frames: the HLG picture goes as PQ and comes back as HLG
     if (oa.dlssg)
@@ -2631,43 +2736,51 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             LOG("offline: DLSS 4.5 buffers failed\n");
             return 2;
         }
-        dgc.dir = exeDir + L"\\..\\dlssg"; // shipped layout (engine\live -> engine\dlssg), as dlssg.py
-        wchar_t ov[MAX_PATH]{};
-        if (GetEnvironmentVariableW(L"SMV_DLSSG_DIR", ov, MAX_PATH) && ov[0])
-            dgc.dir = ov;
-        wchar_t full[MAX_PATH]{};
-        if (GetFullPathNameW(dgc.dir.c_str(), MAX_PATH, full, nullptr))
-            dgc.dir = full;
-        dgc.w = nr.pw;
-        dgc.h = nr.ph;
-        dgc.gen = multi - 1;
-        dgc.pauseFile = pauseFile;
-        // HDR planes (PQ or HLG video, RTX HDR's PQ) go as HDR10, the DLSS-G guide's HDR input; SMV_DLSSG_HDR10=0 =
-        // RGBA8 of the codes
-        dgc.hdr10 = (oa.srcHdr || nr.rtxHdr) && lkEnv("SMV_DLSSG_HDR10") != "0";
-        int spawnRc = dgSpawn(dgc);
-        if (dgc.hdr10 && (spawnRc == 5 || spawnRc == -2))
+        if (dgTaken)
         {
-            LOG("DLSS 4.5: %s, 8-bit frames\n",
-                spawnRc == 5 ? "the swap chain refused the HDR10 colour space" : "this dlssg2f.exe has no HDR10 mode");
-            dgc.hdr10 = false;
-            spawnRc = dgSpawn(dgc);
+            dgc.pauseFile = pauseFile;
+            dgc.closing = false;
+            dgc.stalled = false;
+            dgc.pairs = 0;
+            dgc.rtssNamed = false;
+            SetEvent(dgc.hCut); // this render's first frame = a new clip in the server
+            LOG("dlss: the last render's server is still up at this size, multiplier and frame format: no start\n");
+            dgSayOrder(dgc);
         }
-        if (spawnRc == 3 || (spawnRc == 0 && dgc.maxGen && (unsigned)dgc.gen > dgc.maxGen))
+        else
         {
-            if (spawnRc == 0)
-                dgEnd(dgc, true);
-            LOG("DLSS Frame Generation unavailable: this GPU does not support %dx DLSS multi-frame generation "
-                "(RTX 50 series does up to 6x, RTX 40 series only 2x); pick a lower multiplier or GMFSS\n",
-                multi);
-            return 3;
-        }
-        if (spawnRc != 0)
-        {
-            LOG("DLSS Frame Generation unavailable: DLSS Frame Generation host failed to start%s; it needs an "
-                "RTX 40/50 GPU, a recent driver and Windows HW-accelerated GPU scheduling ON\n",
-                spawnRc == 2 ? " (GPU/driver/OS unsupported)" : "");
-            return 2;
+            dgc.dir = dgServerDir(exeDir);
+            dgc.w = nr.pw;
+            dgc.h = nr.ph;
+            dgc.gen = multi - 1;
+            dgc.pauseFile = pauseFile;
+            // HDR planes (PQ or HLG video, RTX HDR's PQ) go as HDR10, the DLSS-G guide's HDR input; SMV_DLSSG_HDR10=0
+            // = RGBA8 of the codes
+            dgc.hdr10 = (oa.srcHdr || nr.rtxHdr) && lkEnv("SMV_DLSSG_HDR10") != "0";
+            int spawnRc = dgSpawn(dgc);
+            if (dgc.hdr10 && (spawnRc == 5 || spawnRc == -2))
+            {
+                LOG("DLSS 4.5: %s, 8-bit frames\n", spawnRc == 5 ? "the swap chain refused the HDR10 colour space"
+                                                                 : "this dlssg2f.exe has no HDR10 mode");
+                dgc.hdr10 = false;
+                spawnRc = dgSpawn(dgc);
+            }
+            if (spawnRc == 3 || (spawnRc == 0 && dgc.maxGen && (unsigned)dgc.gen > dgc.maxGen))
+            {
+                if (spawnRc == 0)
+                    dgEnd(dgc, true);
+                LOG("DLSS Frame Generation unavailable: this GPU does not support %dx DLSS multi-frame generation "
+                    "(RTX 50 series does up to 6x, RTX 40 series only 2x); pick a lower multiplier or GMFSS\n",
+                    multi);
+                return 3;
+            }
+            if (spawnRc != 0)
+            {
+                LOG("DLSS Frame Generation unavailable: DLSS Frame Generation host failed to start%s; it needs an "
+                    "RTX 40/50 GPU, a recent driver and Windows HW-accelerated GPU scheduling ON\n",
+                    spawnRc == 2 ? " (GPU/driver/OS unsupported)" : "");
+                return 2;
+            }
         }
         dgc.watch = std::thread(dgWatch, &dgc);
         LOG("DLSS Frame Generation ready (%dx%d, %dx, server max %u%s)\n", nr.pw, nr.ph, multi, dgc.maxGen,
@@ -3897,12 +4010,28 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     reader.join();
     if (oa.dlssg)
     {
-        // EOF to the server (it logs "server done" and exits), then the watchdog; a failed pipelined
-        // render can leave the server writing a pair nobody reads, so it is ended at once
-        dgEnd(dgc, dgLag && (failed || io.fail));
+        // A clean render in the resident host leaves its server up for the next one (g_dgKept). Else EOF to the
+        // server (it logs "server done" and exits); a failed pipelined render can leave the server writing a pair
+        // nobody reads, so it is ended at once. Then the watchdog
+        // (a host that leaves after this item, the RTX Video bridge's and DLSS 5's rule, keeps none; a server without
+        // the cut event, an older dlssg2f.exe, cannot start a new clip)
+        bool keep = g_resident && dgc.cut && !failed && !io.fail && !g_rtxUsed && !g_nrAttempted &&
+                    lkEnv("SMV_DLSSG_KEEP") != "0";
+        if (keep)
+        {
+            std::lock_guard<std::mutex> lk(dgc.m);
+            keep = dgc.hProc && WaitForSingleObject(dgc.hProc, 0) == WAIT_TIMEOUT;
+        }
+        if (!keep)
+            dgEnd(dgc, dgLag && (failed || io.fail));
         dgc.closing = true;
         if (dgc.watch.joinable())
             dgc.watch.join();
+        if (keep)
+        {
+            LOG("dlss: the server stays up for the next render of this size, multiplier and frame format\n");
+            g_dgKept = std::move(dgHold);
+        }
     }
     cudaStreamSynchronize(st);
     if (namedPipes)
@@ -4174,6 +4303,8 @@ static void resetSessionGlobals()
     g_dlssnr = false;
     g_nrStructure = 1.0;
     g_nrTone = 1.0;
+    g_nrSkin = -1.0;
+    g_nrAutoMask = 1;
     g_nrStyle = 0;
     g_nrPasses = 1;
     g_nrNative = false;
@@ -4311,6 +4442,10 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_nrStructure = _wtof(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-tone") == 0 && i + 1 < argc)
             g_nrTone = _wtof(argv[++i]);
+        else if (wcscmp(argv[i], L"--nr-skin") == 0 && i + 1 < argc)
+            g_nrSkin = _wtof(argv[++i]);
+        else if (wcscmp(argv[i], L"--nr-automask") == 0 && i + 1 < argc)
+            g_nrAutoMask = _wtoi(argv[++i]) != 0 ? 1 : 0;
         else if (wcscmp(argv[i], L"--nr-style") == 0 && i + 1 < argc)
             g_nrStyle = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--nr-passes") == 0 && i + 1 < argc)
@@ -4756,6 +4891,8 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_dlssnr = false;
             g_nrStructure = 1.0;
             g_nrTone = 1.0;
+            g_nrSkin = -1.0;
+            g_nrAutoMask = 1;
             g_nrStyle = 0;
             g_nrPasses = 1;
             g_noGpuFit = false;
@@ -4835,6 +4972,7 @@ static int offlineResidentMain(const OfflineArgs& base)
     }
     stopTimer.store(true);
     timer.join();
+    dgDropKept();
     if (g_res.ready || g_res.cuMod)
     {
         cudaSetDevice(g_res.dev);

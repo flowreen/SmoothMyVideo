@@ -43,6 +43,8 @@ export interface RenderArgs {
   hdr_satboost: number; // float
   nr_structure: number; // float
   nr_tone: number; // float
+  nr_skin: number; // float, < 0 = NVIDIA's default (the skin follows the structure)
+  nr_automask: number; // int, 1 = NVIDIA's character mask on (the default), 0 = off
   nr_style: number; // int
   nr_passes: number; // int, 1..20: DLSS 5 chained per frame
 }

@@ -261,7 +261,9 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
 * **How:** fed the way games feed it, so it follows the motion, and a paused picture stays perfectly still.
 * **Controls:** NVIDIA's three looks as a **Style** selector (Default, Natural, Cinematic; Default is preselected),
   **Structure Intensity** and **Tone Intensity** sliders, and **Passes** (1 to 20): DLSS 5 again on its own result,
-  for a stronger effect at that many times the time and video memory.
+  for a stronger effect at that many times the time and video memory. **Auto mask** (on by default) is NVIDIA's
+  character mask: DLSS 5 finds the characters and treats their skin on its own, as much as the **Skin Structure**
+  slider says (at 1.00, the default, skin follows Structure Intensity).
 * **The download:** NVIDIA's Neural Rendering file (`nvngx_dlssnr.dll`) isn't included, and NVIDIA offers no download for it.
   The one-click **Download the DLSS 5 runtime** button fetches the community RTX 40 + 50 build
   ([rhi-repo](https://github.com/RankFTW/rhi-repo/releases) on GitHub), checks it and installs it.

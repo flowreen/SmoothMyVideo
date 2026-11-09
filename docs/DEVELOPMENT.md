@@ -275,7 +275,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 
 ```
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
-  [--sharpen S] [--restore | --restore-model PKL|ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
+  [--sharpen S] [--restore | --restore-model PKL|ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-skin F] [--nr-automask 0|1] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--xess-fg] [--dlssg] [--no-gpu-fit]
   [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
@@ -652,7 +652,10 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   ratio 1.0), `--nr-structure F` / `--nr-tone F` 0..2 default 1.0, `--nr-style 0|1|2` = NVIDIA's
   Default (default) / Natural / Cinematic looks (DLSSNR.Style; measured: same cost, 0 is
   the lightest touch, 1 the smoothest, 2 keeps the most detail; Intensity stays 1.0, the runtime
-  clamps it there and drifts below it). With `--nr-passes` above 1 the tone runs on the first pass
+  clamps it there and drifts below it). `--nr-skin F` 0..2 = DLSSNR.SkinStructureStrength on the skin
+  NVIDIA's automatic character mask finds (unset = NVIDIA's default: the skin follows the structure
+  value; the GUI's Skin Structure at 1.00 sends nothing); `--nr-automask 0` turns that mask off (default
+  1), and the skin value then has no effect. With `--nr-passes` above 1 the tone runs on the first pass
   only and passes 2+ at tone 0: the local tone darkens the frame again on every pass it runs (mean
   luma x0.95 a pass at tone 1, Natural; `harness\nr_tone_per_pass`). Needs the runtime in
   `engine/dlssnr`, otherwise the frame passes through with a notice. About 10 ms per 1080p frame
@@ -859,7 +862,7 @@ it, the captured frames pass through at their own rate and the live effects (Res
 Upscale to, RTX VSR, RTX HDR, DLSS 5) apply to each of them (with no effect on at 1:1, an SDR frame
 comes back with the capture's colour bytes through the slot store, alpha 255: the transport test).
 
-Live DLSS 5 (`--dlssnr --nr-structure F --nr-tone F --nr-style N --nr-passes N`, the pass chained 1..20
+Live DLSS 5 (`--dlssnr --nr-structure F --nr-tone F [--nr-skin F] [--nr-automask 0] --nr-style N --nr-passes N`, the pass chained 1..20
 times on every frame): ONCE per captured frame,
 on the model frame after Restore and the resize to the working size and before the
 model, so the generated frames inherit the pass. The native host runs it with the offline route's
@@ -899,7 +902,7 @@ CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
   --backend NAME [--xess-fg] --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale --upscale H --restore
-  --dlssnr --nr-structure F --nr-tone F --nr-style 0|1|2 --nr-passes 1..20 --rtx-hdr
+  --dlssnr --nr-structure F --nr-tone F --nr-skin F --nr-automask 0|1 --nr-style 0|1|2 --nr-passes 1..20 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
 smv-live.exe --hz              the exact refresh rate of every active display path as "numerator denominator" lines
@@ -1137,6 +1140,13 @@ presents it meanwhile), and the host then sends frame k before it reads the pair
 once the previous frame reached the server; a respawn or a failed send sends frame k again, the respawn having
 re-sent only its own pair). Without the token the host reads the pair first, then sends; `SMV_DLSSG_WQ=0` forces that
 order. The frames are the same either way (1080p x6: about x0.75 the time a pair, host-direct).
+The resident host keeps that server after a clean render: Streamline and NGX take about three seconds to come up in
+every new `dlssg2f`, so the next DLSS 4.5 render of the same padded size, multiplier and frame format takes the kept
+server instead of starting one. The host sets the server's cut event first (`--cut-event`, ` cut=1` in the handshake),
+which makes that render's first frame a new clip in the server (DLSS-G off and on, the pan estimator from nothing, the
+first frame's warm-up), so the frames are those of a new server. Any other render ends the kept server before its own
+video memory fits, a failed render keeps none, and the host's exit ends it; `SMV_DLSSG_KEEP=0` starts a new server for
+every render.
 HDR planes (PQ or HLG video, RTX HDR's PQ output) go to it as HDR10, the input the DLSS-G guide asks
 for (its section 11.0): the host starts `dlssg2f.exe --server ... --hdr10`, which presents R10G10B10A2
 on a swap chain with the G2084 / P2020 colour space and confirms with ` hdr10=1` in its handshake;
@@ -1275,7 +1285,8 @@ the item (NGX is single-instance per process; the next render spawns a fresh hos
 there too (`nativeOfflineNr`, once per decoded frame at its size, BEFORE the interpolation, so every
 model and every output frame reads DLSS 5 output: frame generation after DLSS 5, the
 same place live runs it):
-`native.ts` passes `--dlssnr --nr-structure --nr-tone --nr-style --nr-passes` when `nvngx.dll` and
+`native.ts` passes `--dlssnr --nr-structure --nr-tone --nr-style --nr-passes` (plus `--nr-skin` / `--nr-automask 0`
+when set) when `nvngx.dll` and
 `nvngx_dlssnr.dll` are in `SMV_DLSSNR_DIR` / `engine\dlssnr`, and the host runs the NR core with its own bring-up (`nr::Host::startup` on a
 private D3D12 device made from the System32 DLLs, not Streamline's interposer) on one RGBA16F
 frame per decoded frame, in place on the padded model input (the pad refilled from the edge like
@@ -1506,7 +1517,8 @@ host's reader; a one-shot session, DLSS 4.5's, starts one reader of its own) for
 spawn (`main.ts` `liveSetNow` / `liveSendSets`). The native thread applies them before its next frame group
 (`nativeLiveSets`) and logs `live set: KEY VALUE`: `sharpen` (0 = off; turning it on allocates its two frames, when the
 video memory room holds them), `vsrq` (RTX VSR proper), `hdrsat` / `hdrcon` / `hdrvib` / `hdrsb` (while RTX HDR runs),
-`nrstruct` / `nrtone` / `nrstyle` (DLSS 5's Structure / Tone / Style, all three read at every evaluate), `nrpasses`
+`nrstruct` / `nrtone` / `nrstyle` / `nrskin` / `nrautomask` (DLSS 5's Structure / Tone / Style / Skin Structure, -1 =
+follows the structure / the automatic character mask 1 or 0, all read at every evaluate), `nrpasses`
 (DLSS 5 runs the first N passes it holds; more than it holds = `nr::Host::growPasses` builds the extra features and
 frames in place, one pass a frame group (`nativeNrGrowStep`, so the picture keeps moving between the builds), as many
 as the room holds at `nr::kFrameMp` a megapixel a pass; the run count changes once, at the growth's end, which logs
@@ -1889,6 +1901,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_DLSSG_WAITMS=N` | on Streamline's queue without the `Present` wrap (or before it is seen to catch every present), the newest native present waits up to N ms for a later one before it is read back anyway; on the host's own queue, the settle before each readback (default 5); an A/B lever, never a product setting |
 | `SMV_DLSSG_LIMIT=N` | the most DLSS 4.5 makes in one pass (2..6) instead of the GPU's measured limit (`dlssg_limit.json`; Live: numFramesToGenerateMax + 1): `2` renders and runs Live with an RTX 40's passes on an RTX 50 (the cascade's trigger test) |
 | `SMV_DLSSG_WQ=0` | a file render's host reads each DLSS 4.5 pair before it sends the next frame, even to a `dlssg2f` with a pair writer (` wq=1`); the A/B and fallback test only, never a product setting |
+| `SMV_DLSSG_KEEP=0` | the resident file-render host starts a new `dlssg2f` for every DLSS 4.5 render instead of keeping the last render's server for the next one of the same padded size, multiplier and frame format; the A/B and fallback test only, never a product setting |
 | `SMV_DLSSG_HDR10=0` | DLSS 4.5 gets HDR planes as 8-bit codes on an RGBA8 swap chain (labelled SDR) instead of HDR10; an A/B lever, never a product setting |
 | `SMV_DLSSG_REFUSE_HDR10=1` | the DLSS 4.5 host treats the HDR10 colour space as refused (exit 5): the trigger test of the host's 8-bit fallback |
 | `SMV_DLSSG_FOCUS_SHIM=0` | the DLSS 4.5 host's focus shim off: by default `dlssg2f` points the Streamline modules' `GetForegroundWindow` imports at its own off-screen window, because Streamline 2.14 pauses frame generation whenever another window has focus (a render then stopped with `DLSS_PREEMPTED` while the user worked in another window); the A/B and trigger test only, never a product setting |
@@ -2290,7 +2303,11 @@ window is on screen. DLSS-FG requires hardware-accelerated GPU scheduling and an
 (exit code 2 otherwise). With `--hdr10` (HDR video) the swap chain is R10G10B10A2 and the G2084 / P2020
 colour space is set on the native AND the proxy chain: the interposer learns it only from calls it
 hooks, and an R10G10B10A2 chain without it passes through ungenerated (exit code 5 when the swap
-chain refuses the colour space).
+chain refuses the colour space). With `--cut-event HANDLE` (an inherited auto-reset event, ` cut=1` in the
+handshake) a set event makes the next frame the first of a new clip on the running server: DLSS-G goes off
+(`eRetainResourcesWhenOff`, applied by a present of the old clip's last frame) and on, the pan estimator starts
+from nothing and the frame takes the first frame's warm-up. The warm-up alone, or the constants' reset flag,
+leaves a panning clip's tweens different from a new server's.
 
 ### DLSS 5 Neural Rendering core and caller shim (`nvngx.dll`)
 

@@ -912,6 +912,16 @@ int Host::growPasses(int n, std::string& note)
     return m_passes;
 }
 
+// DLSSNR.UseAutoMask: the setting, unless the measurement lever SMV_NR_AUTOMASK=0 turns it off
+static unsigned int autoMaskParam(int setting)
+{
+    static const bool off = [] {
+        const std::string am = envValue("SMV_NR_AUTOMASK");
+        return !am.empty() && am[0] == '0';
+    }();
+    return (off || !setting) ? 0u : 1u;
+}
+
 // Minimum resource and parameter set for feature 18 (DLAA style, ratio 1.0), pass k of the chain
 // 0..last: pass 0 reads Color, pass k reads pass k - 1's output, the last one writes Output
 // (evaluateOn re-binds both per frame, so a chain cut short still ends in Output).
@@ -938,8 +948,7 @@ void Host::setPassParams(int k, int last)
     p->Set("DLSSNR.Enabled", 1);
     p->Set("DLSSNR.UICorrection", 0);
     p->Set("DLSSNR.DepthInverted", 1);
-    const std::string am = envValue("SMV_NR_AUTOMASK"); // measurement lever: 0 = the mask off
-    p->Set("DLSSNR.UseAutoMask", (unsigned int)((!am.empty() && am[0] == '0') ? 0 : m_set.automask));
+    p->Set("DLSSNR.UseAutoMask", autoMaskParam(m_set.automask));
     p->Set("DLSSNR.MVecScaleX", 1.0f);
     p->Set("DLSSNR.MVecScaleY", 1.0f);
     if (m_mv)
@@ -957,7 +966,7 @@ void Host::setPassParams(int k, int last)
     p->Set("DLSSNR.Intensity", m_set.intensity);
     p->Set("DLSSNR.LocalStructureStrength", m_set.structure);
     p->Set("DLSSNR.LocalToneStrength", passTone(k));
-    p->Set("DLSSNR.SkinStructureStrength", -1.0f);
+    p->Set("DLSSNR.SkinStructureStrength", m_set.skin < 0.0f ? -1.0f : m_set.skin);
     // Depth and ControlMask are deliberately not set (video has no depth); MVec only with Settings::motion.
 }
 
@@ -1007,6 +1016,8 @@ bool Host::evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& 
         p->Set("DLSSNR.Intensity", m_set.intensity);
         p->Set("DLSSNR.LocalStructureStrength", m_set.structure);
         p->Set("DLSSNR.LocalToneStrength", passTone(k));
+        p->Set("DLSSNR.SkinStructureStrength", m_set.skin < 0.0f ? -1.0f : m_set.skin);
+        p->Set("DLSSNR.UseAutoMask", autoMaskParam(m_set.automask));
         m_last = sEval(pEval, list, m_pfeature[k], p);
         if (m_last != NVSDK_NGX_Result_Success)
         {

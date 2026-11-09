@@ -3880,31 +3880,88 @@ extern "C" __global__ void k_splatNvofNorm(const long long* __restrict__ acc, in
 // frame 0 at x - t V and frame 1 at x + (1 - t) V (bilinear, clamped), weighs them by time and
 // visibility, and mixes the result with the plain blend by the mask: failed vectors become
 // ghosting, never speckle. Checked against a reference implementation of the same tween.
-extern "C" __global__ void k_splatVel(const float* __restrict__ flow, const float* __restrict__ Z,
-                                      float s, float bias, float sign, int covPlane, int w, int h,
-                                      long long* __restrict__ acc)
+// Launched 16 x 16 only: each block sums its landings in a shared window (the block's tile plus kSvMg px a side,
+// moved by the block's mean landing offset) and adds each non-zero sum to global once; a landing outside the
+// window goes to global directly. The sums are integers, so every total equals one global add a landing.
+#define kSvMg 4
+extern "C" __global__ void __launch_bounds__(256) k_splatVel(const float* __restrict__ flow,
+                                                             const float* __restrict__ Z, float s, float bias,
+                                                             float sign, int covPlane, int w, int h,
+                                                             long long* __restrict__ acc)
 {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
+    constexpr int RW = 16 + 2 * kSvMg, RN = RW * RW;
+    __shared__ unsigned long long sa[4 * RN];
+    __shared__ int sSum[3];
+    const int tid = threadIdx.y * 16 + threadIdx.x;
+    for (int i = tid; i < 4 * RN; i += 256) sa[i] = 0ull;
+    if (tid < 3) sSum[tid] = 0;
+    const int x = blockIdx.x * 16 + threadIdx.x;
+    const int y = blockIdx.y * 16 + threadIdx.y;
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
-    int nwX, nwY;
-    float dx, dy;
-    if (!land(x, s, flow[o], nwX, dx) || !land(y, s, flow[plane + o], nwY, dy)) return;
-    const float e = expf(Z[o] + bias);
-    const float vx = sign * flow[o], vy = sign * flow[plane + o];
-    const float wt[4] = { (1.0f - dx) * (1.0f - dy), dx * (1.0f - dy), (1.0f - dx) * dy, dx * dy };
-    const int ox[4] = { 0, 1, 0, 1 }, oy[4] = { 0, 0, 1, 1 };
-    for (int k = 0; k < 4; k++)
+    int nwX = 0, nwY = 0;
+    float dx = 0.0f, dy = 0.0f;
+    const bool ok = x < w && y < h && land(x, s, flow[o], nwX, dx) && land(y, s, flow[plane + o], nwY, dy);
+    __syncthreads();
+    if (ok)
     {
-        const int tx = nwX + ox[k], ty = nwY + oy[k];
+        atomicAdd(&sSum[0], min(max(nwX - x, -64), 64));
+        atomicAdd(&sSum[1], min(max(nwY - y, -64), 64));
+        atomicAdd(&sSum[2], 1);
+    }
+    __syncthreads();
+    int offX = 0, offY = 0;
+    if (sSum[2])
+    {
+        offX = (int)floorf((float)sSum[0] / (float)sSum[2] + 0.5f);
+        offY = (int)floorf((float)sSum[1] / (float)sSum[2] + 0.5f);
+    }
+    const int rx0 = blockIdx.x * 16 - kSvMg + offX, ry0 = blockIdx.y * 16 - kSvMg + offY;
+    unsigned long long* a = (unsigned long long*)acc;
+    if (ok)
+    {
+        const float e = expf(Z[o] + bias);
+        const float vx = sign * flow[o], vy = sign * flow[plane + o];
+        const float wt[4] = { (1.0f - dx) * (1.0f - dy), dx * (1.0f - dy), (1.0f - dx) * dy, dx * dy };
+        const int ox[4] = { 0, 1, 0, 1 }, oy[4] = { 0, 0, 1, 1 };
+        for (int k = 0; k < 4; k++)
+        {
+            const int tx = nwX + ox[k], ty = nwY + oy[k];
+            if (tx < 0 || tx >= w || ty < 0 || ty >= h) continue;
+            const float we = e * wt[k];
+            const unsigned long long a0 = (unsigned long long)llrintf(vx * we * NV_FIX);
+            const unsigned long long a1 = (unsigned long long)llrintf(vy * we * NV_FIX);
+            const unsigned long long a2 = (unsigned long long)llrintf(we * NV_FIX);
+            const unsigned long long a3 = (unsigned long long)llrintf(wt[k] * NV_FIX);
+            const int lx = tx - rx0, ly = ty - ry0;
+            if ((unsigned)lx < (unsigned)RW && (unsigned)ly < (unsigned)RW)
+            {
+                const int li = ly * RW + lx;
+                atomicAdd(&sa[li], a0);
+                atomicAdd(&sa[RN + li], a1);
+                atomicAdd(&sa[2 * RN + li], a2);
+                atomicAdd(&sa[3 * RN + li], a3);
+            }
+            else
+            {
+                const size_t t = (size_t)ty * w + tx;
+                atomicAdd(a + t, a0);
+                atomicAdd(a + plane + t, a1);
+                atomicAdd(a + 2 * plane + t, a2);
+                atomicAdd(a + (size_t)covPlane * plane + t, a3);
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < RN; i += 256)
+    {
+        const int tx = rx0 + i % RW, ty = ry0 + i / RW;
         if (tx < 0 || tx >= w || ty < 0 || ty >= h) continue;
         const size_t t = (size_t)ty * w + tx;
-        const float we = e * wt[k];
-        atomicAdd((unsigned long long*)acc + t, (unsigned long long)llrintf(vx * we * NV_FIX));
-        atomicAdd((unsigned long long*)acc + plane + t, (unsigned long long)llrintf(vy * we * NV_FIX));
-        atomicAdd((unsigned long long*)acc + 2 * plane + t, (unsigned long long)llrintf(we * NV_FIX));
-        atomicAdd((unsigned long long*)acc + (size_t)covPlane * plane + t, (unsigned long long)llrintf(wt[k] * NV_FIX));
+        unsigned long long v;
+        if ((v = sa[i]) != 0ull) atomicAdd(a + t, v);
+        if ((v = sa[RN + i]) != 0ull) atomicAdd(a + plane + t, v);
+        if ((v = sa[2 * RN + i]) != 0ull) atomicAdd(a + 2 * plane + t, v);
+        if ((v = sa[3 * RN + i]) != 0ull) atomicAdd(a + (size_t)covPlane * plane + t, v);
     }
 }
 
@@ -3999,24 +4056,39 @@ extern "C" __global__ void k_ppUp(const float* __restrict__ n, const float* __re
 // (scipy's mode 'reflect': d c b a | a b c d), weights exp(-x^2 / (2 sigma^2)) normalised.
 // The weights and their sum depend only on k, so each block computes them ONCE into shared
 // memory (the sum in k order, as the per-pixel form adds them) instead of 2r + 1 exps per
-// pixel, then every pixel accumulates in fp32. A radius above kBlurMaxR keeps the per-pixel
-// form.
+// pixel, and loads its source span (16 lines of 16 + 2r samples, the reflection applied at the
+// load) into shared memory once; every pixel then accumulates in fp32 in k order. Launched
+// 16 x 16 only. A radius above kBlurMaxR keeps the per-pixel form.
 #define kBlurMaxR 64
-extern "C" __global__ void k_blur1(const float* __restrict__ src, int w, int h, float sigma, int dir,
-                                   float* __restrict__ dst)
+extern "C" __global__ void __launch_bounds__(256) k_blur1(const float* __restrict__ src, int w, int h, float sigma,
+                                                          int dir, float* __restrict__ dst)
 {
     __shared__ float wtab[2 * kBlurMaxR + 1];
     __shared__ float wsum;
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    __shared__ float tile[16 * (16 + 2 * kBlurMaxR + 1)];
+    const int x = blockIdx.x * 16 + threadIdx.x;
+    const int y = blockIdx.y * 16 + threadIdx.y;
     const int r = (int)(4.0f * sigma + 0.5f);
     const bool tab = r <= kBlurMaxR;
     const float g = -0.5f / (sigma * sigma);
+    const int n = dir ? h : w;
     if (tab)
     {
-        const int tid = threadIdx.y * blockDim.x + threadIdx.x, nt = blockDim.x * blockDim.y;
-        for (int k = tid; k <= 2 * r; k += nt)
+        const int tid = threadIdx.y * 16 + threadIdx.x;
+        for (int k = tid; k <= 2 * r; k += 256)
             wtab[k] = expf(g * (float)((k - r) * (k - r)));
+        // the x pass holds 16 rows of L samples (row stride Lp, odd), the y pass L rows of 16 columns
+        const int L = 16 + 2 * r, Lp = L | 1;
+        const int base = (dir ? blockIdx.y : blockIdx.x) * 16 - r;
+        for (int q = tid; q < 16 * L; q += 256)
+        {
+            const int j = dir ? q / 16 : q % L, line = dir ? q % 16 : q / L;
+            int i = base + j;
+            // reflect about the edge sample boundary, repeated for kernels wider than the axis
+            while (i < 0 || i >= n) i = i < 0 ? -i - 1 : 2 * n - i - 1;
+            const int sx = dir ? blockIdx.x * 16 + line : i, sy = dir ? i : blockIdx.y * 16 + line;
+            tile[dir ? j * 16 + line : line * Lp + j] = sx < w && sy < h ? src[(size_t)sy * w + sx] : 0.0f;
+        }
         __syncthreads();
         if (tid == 0)
         {
@@ -4025,21 +4097,27 @@ extern "C" __global__ void k_blur1(const float* __restrict__ src, int w, int h, 
             wsum = ws;
         }
         __syncthreads();
+        if (x >= w || y >= h) return;
+        const float* t = dir ? tile + threadIdx.y * 16 + threadIdx.x : tile + threadIdx.y * Lp + threadIdx.x;
+        const int st = dir ? 16 : 1;
+        float acc = 0.0f;
+        for (int k = -r; k <= r; k++)
+            acc += wtab[k + r] * t[(k + r) * st];
+        dst[(size_t)y * w + x] = acc / wsum;
+        return;
     }
     if (x >= w || y >= h) return;
-    const int n = dir ? h : w;
     const int c = dir ? y : x;
     float acc = 0.0f, ws = 0.0f;
     for (int k = -r; k <= r; k++)
     {
         int i = c + k;
-        // reflect about the edge sample boundary, repeated for kernels wider than the axis
         while (i < 0 || i >= n) i = i < 0 ? -i - 1 : 2 * n - i - 1;
-        const float wk = tab ? wtab[k + r] : expf(g * (float)(k * k));
+        const float wk = expf(g * (float)(k * k));
         acc += wk * (dir ? src[(size_t)i * w + x] : src[(size_t)y * w + i]);
-        if (!tab) ws += wk;
+        ws += wk;
     }
-    dst[(size_t)y * w + x] = acc / (tab ? wsum : ws);
+    dst[(size_t)y * w + x] = acc / ws;
 }
 
 // the tween: V (2 planes, filled), vis (2 planes), m (the blurred mask), both frames at
@@ -4101,26 +4179,73 @@ extern "C" __global__ void k_nvofCompose(const float* __restrict__ i0, const flo
 // hole = w / (w + 1e-7) < 0.999 = w < 9.99e-5 = acc < 9.99e-5 * 2^32 = 429067.23
 #define DRBA_HOLE 429068LL
 
-// the value(s) v of pixel (x, y) splatted at (x + ax * m, y + ay * m) (land) into nv value planes +
-// the weight plane
-__device__ __forceinline__ void drbaSplat4(unsigned long long* p, size_t plane, int nv,
-                                           const float* v, int x, int y, float ax, float ay, float m,
-                                           int w, int h)
+// the nv value(s) v of pixel (x, y) splatted at (x + ax * m, y + ay * m) (land) into nv value planes + the weight
+// plane, through the 16 x 16 block's shared window sa ((nv + 1) planes of the tile plus kDrMg px a side, moved by the
+// block's mean landing offset): every thread of the block calls it (ok = this pixel takes part); each non-zero window
+// sum goes to global once, a landing outside the window goes to global directly. The sums are integers, so every total
+// equals one global add a landing.
+#define kDrMg 4
+__device__ __forceinline__ void drbaSplatW(unsigned long long* p, size_t plane, int nv, const float* v, bool ok, int x,
+                                           int y, float ax, float ay, float m, int w, int h, unsigned long long* sa,
+                                           int* sSum)
 {
-    int nwX, nwY;
-    float dx, dy;
-    if (!land(x, ax, m, nwX, dx) || !land(y, ay, m, nwY, dy)) return;
-    const float wt[4] = {(1.0f - dx) * (1.0f - dy), dx * (1.0f - dy), (1.0f - dx) * dy, dx * dy};
-    const int cx[4] = {nwX, nwX + 1, nwX, nwX + 1}, cy[4] = {nwY, nwY, nwY + 1, nwY + 1};
-    for (int k = 0; k < 4; k++)
+    constexpr int RW = 16 + 2 * kDrMg, RN = RW * RW;
+    const int tid = threadIdx.y * 16 + threadIdx.x;
+    for (int i = tid; i < (nv + 1) * RN; i += 256) sa[i] = 0ull;
+    if (tid < 3) sSum[tid] = 0;
+    int nwX = 0, nwY = 0;
+    float dx = 0.0f, dy = 0.0f;
+    ok = ok && land(x, ax, m, nwX, dx) && land(y, ay, m, nwY, dy);
+    __syncthreads();
+    if (ok)
     {
-        if (cx[k] < 0 || cx[k] >= w || cy[k] < 0 || cy[k] >= h) continue;
-        const size_t o = (size_t)cy[k] * w + cx[k];
-        for (int c = 0; c < nv; c++)
-            atomicAdd(p + (size_t)c * plane + o,
-                      (unsigned long long)(long long)llrintf(v[c] * wt[k] * DRBA_FIX));
-        atomicAdd(p + (size_t)nv * plane + o, (unsigned long long)(long long)llrintf(wt[k] * DRBA_FIX));
+        atomicAdd(&sSum[0], min(max(nwX - x, -64), 64));
+        atomicAdd(&sSum[1], min(max(nwY - y, -64), 64));
+        atomicAdd(&sSum[2], 1);
     }
+    __syncthreads();
+    int offX = 0, offY = 0;
+    if (sSum[2])
+    {
+        offX = (int)floorf((float)sSum[0] / (float)sSum[2] + 0.5f);
+        offY = (int)floorf((float)sSum[1] / (float)sSum[2] + 0.5f);
+    }
+    const int rx0 = blockIdx.x * 16 - kDrMg + offX, ry0 = blockIdx.y * 16 - kDrMg + offY;
+    if (ok)
+    {
+        const float wt[4] = {(1.0f - dx) * (1.0f - dy), dx * (1.0f - dy), (1.0f - dx) * dy, dx * dy};
+        const int cx[4] = {nwX, nwX + 1, nwX, nwX + 1}, cy[4] = {nwY, nwY, nwY + 1, nwY + 1};
+        for (int k = 0; k < 4; k++)
+        {
+            if (cx[k] < 0 || cx[k] >= w || cy[k] < 0 || cy[k] >= h) continue;
+            const int lx = cx[k] - rx0, ly = cy[k] - ry0;
+            const bool in = (unsigned)lx < (unsigned)RW && (unsigned)ly < (unsigned)RW;
+            const int li = ly * RW + lx;
+            const size_t o = (size_t)cy[k] * w + cx[k];
+            for (int c = 0; c < nv; c++)
+            {
+                const unsigned long long a = (unsigned long long)(long long)llrintf(v[c] * wt[k] * DRBA_FIX);
+                if (in) atomicAdd(&sa[c * RN + li], a);
+                else atomicAdd(p + (size_t)c * plane + o, a);
+            }
+            const unsigned long long a = (unsigned long long)(long long)llrintf(wt[k] * DRBA_FIX);
+            if (in) atomicAdd(&sa[nv * RN + li], a);
+            else atomicAdd(p + (size_t)nv * plane + o, a);
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < RN; i += 256)
+    {
+        const int tx = rx0 + i % RW, ty = ry0 + i / RW;
+        if (tx < 0 || tx >= w || ty < 0 || ty >= h) continue;
+        const size_t o = (size_t)ty * w + tx;
+        for (int c = 0; c <= nv; c++)
+        {
+            const unsigned long long s = sa[c * RN + i];
+            if (s != 0ull) atomicAdd(p + (size_t)c * plane + o, s);
+        }
+    }
+    __syncthreads();
 }
 
 // block0's flow at pixel (x, y) of the w x h motion frame: block0 hands over its 4 planes at w / 16 x h / 16 (lo),
@@ -4146,21 +4271,23 @@ __device__ __forceinline__ void drbaFlowAt(const float* __restrict__ lo, int w, 
 }
 
 // block0's flow (its 4 planes at w / 16 x h / 16, drbaFlowAt) -> acc (6 int64 planes, zeroed by the caller): half j
-// = planes 3j, 3j+1 (x, y) + 3j+2 (weight)
-extern "C" __global__ void k_drbaFlowSplat(const float* __restrict__ lo, int w, int h,
-                                           long long* __restrict__ acc)
+// = planes 3j, 3j+1 (x, y) + 3j+2 (weight); launched 16 x 16 only, the two halves through one window in turn
+extern "C" __global__ void __launch_bounds__(256) k_drbaFlowSplat(const float* __restrict__ lo, int w, int h,
+                                                                  long long* __restrict__ acc)
 {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
+    __shared__ unsigned long long sa[3 * (16 + 2 * kDrMg) * (16 + 2 * kDrMg)];
+    __shared__ int sSum[3];
+    const int x = blockIdx.x * 16 + threadIdx.x;
+    const int y = blockIdx.y * 16 + threadIdx.y;
+    const bool in = x < w && y < h;
     const size_t plane = (size_t)w * h;
-    float f[4];
-    drbaFlowAt(lo, w, h, x, y, f);
+    float f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (in) drbaFlowAt(lo, w, h, x, y, f);
     for (int j = 0; j < 2; j++)
     {
         const float v[2] = {f[2 * j], f[2 * j + 1]};
-        drbaSplat4((unsigned long long*)(acc + (size_t)(3 * j) * plane), plane, 2, v,
-                   x, y, v[0], v[1], 1.0f, w, h);
+        drbaSplatW((unsigned long long*)(acc + (size_t)(3 * j) * plane), plane, 2, v, in, x, y, v[0], v[1], 1.0f, w, h,
+                   sa, sSum);
     }
 }
 
@@ -4192,18 +4319,22 @@ __device__ __forceinline__ float drbaDrmUn(const float* f10, const float* f12, s
     return (side < 0 ? d12 : d10) / (d10 + d12) * tt * 2.0f;
 }
 
-// f10, f12 (2 planes each, calc_flow's flow05 * 2) -> acc (2 int64 planes, zeroed): drm, weight
-extern "C" __global__ void k_drbaDrmSplat(const float* __restrict__ f10, const float* __restrict__ f12,
-                                          int side, float tt, int w, int h, long long* __restrict__ acc)
+// f10, f12 (2 planes each, calc_flow's flow05 * 2) -> acc (2 int64 planes, zeroed): drm, weight; launched 16 x 16 only
+extern "C" __global__ void __launch_bounds__(256) k_drbaDrmSplat(const float* __restrict__ f10,
+                                                                 const float* __restrict__ f12, int side, float tt,
+                                                                 int w, int h, long long* __restrict__ acc)
 {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-    const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
-    const float d = drbaDrmUn(f10, f12, plane, o, side, tt);
+    __shared__ unsigned long long sa[2 * (16 + 2 * kDrMg) * (16 + 2 * kDrMg)];
+    __shared__ int sSum[3];
+    const int x = blockIdx.x * 16 + threadIdx.x;
+    const int y = blockIdx.y * 16 + threadIdx.y;
+    const bool in = x < w && y < h;
+    const size_t plane = (size_t)w * h, o = in ? (size_t)y * w + x : 0;
+    const float d = in ? drbaDrmUn(f10, f12, plane, o, side, tt) : 0.0f;
     const float* fa = side < 0 ? f10 : f12;
     const float v[1] = {d};
-    drbaSplat4((unsigned long long*)acc, plane, 1, v, x, y, fa[o], fa[plane + o], d, w, h);
+    drbaSplatW((unsigned long long*)acc, plane, 1, v, in, x, y, in ? fa[o] : 0.0f, in ? fa[plane + o] : 0.0f, d, w, h,
+               sa, sSum);
 }
 
 // acc (2 planes) -> the (1, H, W) timestep map for the IFNet, in the engine's timestep dtype: fp32,
@@ -29679,13 +29810,16 @@ static bool nativeLiveNrInit(NativeRife& nr)
     nr::Settings set;
     set.structure = (float)(g_nrStructure < 0.0 ? 0.0 : (g_nrStructure > 2.0 ? 2.0 : g_nrStructure));
     set.tone = (float)(g_nrTone < 0.0 ? 0.0 : (g_nrTone > 2.0 ? 2.0 : g_nrTone));
+    set.skin = (float)(g_nrSkin < 0.0 ? -1.0 : (g_nrSkin > 2.0 ? 2.0 : g_nrSkin));
+    set.automask = g_nrAutoMask ? 1 : 0;
     set.style = (g_nrStyle >= 0 && g_nrStyle <= 2) ? g_nrStyle : 0;
     set.passes = g_nrPasses < 1 ? 1 : (g_nrPasses > nr::kMaxPasses ? nr::kMaxPasses : g_nrPasses);
     // SMV_NR_MV=0 = no motion (a measurement lever); without motion every frame is a Reset, since kept
     // history with no motion slides; SMV_NR_AUTOMASK=0 = the mask off (read by the core)
     wchar_t mvv[8]{}, amv[8]{}, ru[8]{}, re[8]{};
     set.motion = !(GetEnvironmentVariableW(L"SMV_NR_MV", mvv, 8) && mvv[0] == L'0');
-    const bool autoMask = !(GetEnvironmentVariableW(L"SMV_NR_AUTOMASK", amv, 8) && amv[0] == L'0');
+    const bool autoMaskEnvOff = GetEnvironmentVariableW(L"SMV_NR_AUTOMASK", amv, 8) && amv[0] == L'0';
+    const bool autoMask = g_nrAutoMask && !autoMaskEnvOff;
     LUID luid{};
     const bool haveLuid = nativeCudaLuid(luid);
     std::string err;
@@ -29719,13 +29853,16 @@ static bool nativeLiveNrInit(NativeRife& nr)
     nr.nrSdrWhite = (float)(g_sdrWhite / 80.0);
     nr.nrFirst = true;
     nr.liveNr = true;
+    char skinTxt[24] = ""; // the skin value when it is set apart from the structure
+    if (set.skin >= 0.0f)
+        sprintf_s(skinTxt, " skin %.2f", set.skin);
     LOG("live DLSS 5 native: on, %dx%d per captured frame on the model frame after Restore and the resize, "
-        "zero-copy, structure %.2f tone %.2f style %d, passes %d, %s, %s, %s%s\n",
-        w, h, set.structure, set.tone, set.style, host->passes(),
+        "zero-copy, structure %.2f tone %.2f%s style %d, passes %d, %s, %s, %s%s\n",
+        w, h, set.structure, set.tone, skinTxt, set.style, host->passes(),
         nr.nrMotion ? "motion vectors (NVOFA grid 4), history kept"
                     : (set.motion ? "no motion vectors, every frame a Reset"
                                   : "no motion vectors (SMV_NR_MV=0), every frame a Reset"),
-        autoMask ? "auto mask" : "no auto mask (SMV_NR_AUTOMASK=0)",
+        autoMask ? "auto mask" : (autoMaskEnvOff ? "no auto mask (SMV_NR_AUTOMASK=0)" : "no auto mask"),
         nr.hdr ? "SDR range of the window (HDR highlights keep their light above white)" : "SDR window",
         nr.nrReuse ? ", identical frames reuse the last output" : "");
     if (host->passes() < set.passes)
@@ -32025,6 +32162,10 @@ static void nativeLiveSets(NativeRife& nr)
             nr.nrHost->setStructure(clampF(v, 0.0, 2.0));
         else if (key == "nrtone" && nrOn)
             nr.nrHost->setTone(clampF(v, 0.0, 2.0));
+        else if (key == "nrskin" && nrOn) // < 0 = follows the structure value
+            nr.nrHost->setSkin(v < 0.0 ? -1.0f : clampF(v, 0.0, 2.0));
+        else if (key == "nrautomask" && nrOn)
+            nr.nrHost->setAutoMask(v != 0.0);
         else if (key == "nrstyle" && nrOn)
             nr.nrHost->setStyle((int)clampU(v, 0.0, 2.0));
         else if (key == "nrpasses" && nrOn)
@@ -32047,13 +32188,19 @@ static void nativeLiveSets(NativeRife& nr)
             }
             nr.nrHost->runPasses(want);
         }
-        else if ((key == "nrstruct" || key == "nrtone" || key == "nrpasses" || key == "nrstyle") && !nrOn)
+        else if ((key == "nrstruct" || key == "nrtone" || key == "nrskin" || key == "nrautomask" || key == "nrpasses" ||
+                  key == "nrstyle") &&
+                 !nrOn)
         {
             // DLSS 5 not running here: held for its start in place (key dlssnr)
             if (key == "nrstruct")
                 g_nrStructure = clampF(v, 0.0, 2.0);
             else if (key == "nrtone")
                 g_nrTone = clampF(v, 0.0, 2.0);
+            else if (key == "nrskin")
+                g_nrSkin = v < 0.0 ? -1.0 : (double)clampF(v, 0.0, 2.0);
+            else if (key == "nrautomask")
+                g_nrAutoMask = v != 0.0 ? 1 : 0;
             else if (key == "nrpasses")
                 g_nrPasses = (int)clampU(v, 1.0, (double)nr::kMaxPasses);
             else

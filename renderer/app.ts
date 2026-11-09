@@ -1477,6 +1477,16 @@ function nrStructure() {
 function nrTone() {
   return parseFloat($('nrtone').value) || 0;
 }
+function nrSkin() {
+  const v = parseFloat($('nrskin').value);
+  return v >= 0 && v !== 1 ? v : -1;
+} // DLSSNR.SkinStructureStrength: the slider's 1.00 (its default) = -1 = NVIDIA's default, skin follows Structure
+function nrAutoMask() {
+  return $('nrautomask').checked ? 1 : 0;
+} // DLSSNR.UseAutoMask, NVIDIA's character mask (Skin Structure acts only with it)
+function syncNrSkin() {
+  $('nrskin').disabled = !$('nrautomask').checked;
+}
 function nrStyle() {
   const b = $('nrstyleseg').querySelector('button.on');
   return b ? parseInt(b.dataset.style, 10) : 0;
@@ -1585,6 +1595,7 @@ $('dlssnr').onchange = () => {
 for (const [id, key] of [
   ['nrstructure', 'nrStructure'],
   ['nrtone', 'nrTone'],
+  ['nrskin', 'nrSkin'],
 ]) {
   const saved = localStorage.getItem(key);
   if (saved !== null) $(id).value = saved;
@@ -1600,6 +1611,16 @@ for (const [id, key] of [
     } catch {}
   });
 }
+if (localStorage.getItem('nrAutoMask') === '0') $('nrautomask').checked = false; // default ON, NVIDIA's mask
+syncNrSkin();
+$('nrautomask').onchange = () => {
+  localStorage.setItem('nrAutoMask', $('nrautomask').checked ? '1' : '0');
+  syncNrSkin();
+  refreshPreviewIfOpen();
+  try {
+    lvSendOpts();
+  } catch {}
+};
 {
   const saved = localStorage.getItem('nrStyle'); // Style selector: persisted, default NVIDIA's Default (0)
   if (saved !== null)
@@ -2052,6 +2073,8 @@ function lvSendOpts() {
     dlssnr: nrOn(),
     nrstructure: nrStructure(),
     nrtone: nrTone(),
+    nrskin: nrSkin(),
+    nrautomask: nrAutoMask(),
     nrstyle: nrStyle(),
     nrpasses: nrPasses(),
     // live TrueHDR (SDR window -> HDR out) + the RTX HDR tone/colour knobs it inherits
@@ -2770,6 +2793,8 @@ function prevSettingsSig() {
     nrOn(),
     nrStructure(),
     nrTone(),
+    nrSkin(),
+    nrAutoMask(),
     nrStyle(),
     nrPasses(),
     nrMaskOn(),
@@ -2844,6 +2869,8 @@ async function loadPreview(frame, bg?) {
           nrmask: useNr && nrMaskOn(),
           nrstructure: nrStructure(),
           nrtone: nrTone(),
+          nrskin: nrSkin(),
+          nrautomask: nrAutoMask(),
           nrstyle: nrStyle(),
           nrpasses: nrPasses(),
         },
@@ -3349,6 +3376,8 @@ function cmpOpts(frame, a, b, multi, pairs) {
       dlssnr: nrOn(),
       nrstructure: nrStructure(),
       nrtone: nrTone(),
+      nrskin: nrSkin(),
+      nrautomask: nrAutoMask(),
       nrstyle: nrStyle(),
       nrpasses: nrPasses(),
     },
@@ -3845,6 +3874,8 @@ function startRun() {
   $('dlssnr').disabled = true;
   $('nrstructure').disabled = true;
   $('nrtone').disabled = true;
+  $('nrskin').disabled = true;
+  $('nrautomask').disabled = true;
   for (const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = true;
   $('nrpasses').disabled = true;
   $('nrmask').disabled = true;
@@ -3923,6 +3954,8 @@ function startRun() {
     payload.dlssnr = true;
     payload.nrstructure = nrStructure();
     payload.nrtone = nrTone();
+    payload.nrskin = nrSkin();
+    payload.nrautomask = nrAutoMask();
     payload.nrstyle = nrStyle();
     payload.nrpasses = nrPasses();
   } // DLSS 5 (runtime installed)
@@ -4225,6 +4258,8 @@ ipcRenderer.on('engine-done', (_e, code) => {
   $('dlssnr').disabled = false;
   $('nrstructure').disabled = false;
   $('nrtone').disabled = false;
+  $('nrautomask').disabled = false;
+  syncNrSkin(); // Skin Structure stays off while the Auto mask is
   for (const b of $('nrstyleseg').querySelectorAll('button')) b.disabled = false;
   $('nrpasses').disabled = false;
   $('nrmask').disabled = false;

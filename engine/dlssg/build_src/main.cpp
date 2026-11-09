@@ -9,11 +9,15 @@
 // back from the last-presented buffer.
 //
 // Usage:
-//   dlssg2f.exe --server W H [--gen N] [--hdr10]
+//   dlssg2f.exe --server W H [--gen N] [--hdr10] [--cut-event HANDLE]
 //       streaming: raw RGBA8 frames (W*H*4) on stdin; for every frame after the
 //       first, the N (default 1, max 5) DLSS-G frames generated between it and
 //       its predecessor - evenly spaced, in temporal order - are written to
 //       stdout as raw RGBA8 (multi-frame generation: N=1 is 2x, N=5 is 6x).
+//       --cut-event: an inherited auto-reset event (its handle value in decimal). Set
+//       before a frame is sent, it makes that frame the first of a new clip: no
+//       frames come back for it and the tweens after it are a fresh server's. The
+//       handshake then ends in " cut=1".
 //       --hdr10: HDR10 frames both ways instead (PQ BT.2020 as R10G10B10A2 words,
 //       still W*H*4 bytes), presented the way the DLSS-G guide asks for HDR
 //       (section 11.0): an R10G10B10A2 swap chain with the G2084 / P2020 colour
@@ -1405,7 +1409,7 @@ struct PairWriterGuard
     }
 };
 
-static int runServer(int genFrames, bool hdr10)
+static int runServer(int genFrames, bool hdr10, HANDLE cutEv)
 {
     Host host;
     host.nativeCapture = true;
@@ -1419,8 +1423,9 @@ static int runServer(int genFrames, bool hdr10)
     _setmode(_fileno(stdout), _O_BINARY);
 
     // handshake so the driving process can distinguish "up" from "unsupported"; wq=1 = the pair writer: the host may
-    // send the next frame before it reads this pair
-    fprintf(stdout, "DLSSG READY gen=%d max=%u%s wq=1\n", genFrames, host.maxGen, host.hdr10 ? " hdr10=1" : "");
+    // send the next frame before it reads this pair; cut=1 = the cut event is watched (a new clip on this server)
+    fprintf(stdout, "DLSSG READY gen=%d max=%u%s wq=1%s\n", genFrames, host.maxGen, host.hdr10 ? " hdr10=1" : "",
+            cutEv ? " cut=1" : "");
     fflush(stdout);
 
     const size_t frameBytes = (size_t)W * H * 4;
@@ -1607,6 +1612,37 @@ static int runServer(int genFrames, bool hdr10)
     ULONGLONG lastPresentTick = 0;
     while (readFull(inFrame.data(), frameBytes))
     {
+        // A new clip (the host set the cut event before it sent this frame): this frame makes no pair with the clip
+        // before, and nothing of that clip may reach the new one's tweens. DLSS-G keeps more than the last frame once
+        // a pan was tagged, so it goes off (its resources kept; a present of the old clip's last frame applies it) and
+        // on, the pan estimator starts from nothing and this frame takes the first frame's warm-up below: the tweens
+        // after it are those of a server that just started
+        if (!first && cutEv && WaitForSingleObject(cutEv, 0) == WAIT_OBJECT_0)
+        {
+            sl::DLSSGOptions off{};
+            off.mode = sl::DLSSGMode::eOff;
+            off.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+            if (slDLSSGSetOptions(host.vp, off) != sl::Result::eOk || !host.presentFrame(prevFrame.data()))
+            {
+                LOG("new clip: DLSS-G did not go off\n");
+                return 1;
+            }
+            sl::DLSSGOptions on{};
+            on.mode = sl::DLSSGMode::eOn;
+            on.numFramesToGenerate = (uint32_t)genFrames;
+            on.mvecDepthWidth = panvec::vecSize(W);
+            on.mvecDepthHeight = panvec::vecSize(H);
+            if (slDLSSGSetOptions(host.vp, on) != sl::Result::eOk)
+            {
+                LOG("new clip: DLSS-G did not come back on\n");
+                return 1;
+            }
+            LOG("new clip: DLSS-G off and on, this frame warms it up; the clip before it:\n");
+            host.logPan();
+            host.pan = panvec::Estimator();
+            realPending = false;
+            first = true;
+        }
         if (first)
         {
             // warm-up: FG feature builds on the first present; interp(f0,f0)=f0
@@ -2119,12 +2155,15 @@ int wmain(int argc, wchar_t** argv)
         }
         int genFrames = 1;
         bool hdr10 = false;
+        HANDLE cutEv = nullptr;
         for (int i = 4; i < argc; i++)
         {
             if (wcscmp(argv[i], L"--gen") == 0 && i + 1 < argc)
                 genFrames = _wtoi(argv[++i]);
             else if (wcscmp(argv[i], L"--hdr10") == 0)
                 hdr10 = true;
+            else if (wcscmp(argv[i], L"--cut-event") == 0 && i + 1 < argc)
+                cutEv = (HANDLE)(uintptr_t)_wcstoui64(argv[++i], nullptr, 10);
         }
         if (genFrames < 1 || genFrames > 5)
         {
@@ -2133,7 +2172,7 @@ int wmain(int argc, wchar_t** argv)
         }
         if (slInitCommon())
             return 1;
-        return runServer(genFrames, hdr10);
+        return runServer(genFrames, hdr10, cutEv);
     }
     if (argc >= 4 && wcscmp(argv[1], L"--stage1") == 0)
     {

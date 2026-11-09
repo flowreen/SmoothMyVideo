@@ -30,15 +30,18 @@ const int kFeatureId = 18;
 // CreateFeature(18) refused.
 extern const char* const kProjectId;
 
-// Fixed internally, not exposed in the GUI: only structure and tone are user facing.
+// Structure, tone, style and skin come from the GUI; the rest is fixed internally.
 struct Settings
 {
     float structure = 1.0f; // DLSSNR.LocalStructureStrength, 0..2
     float tone = 1.0f;      // DLSSNR.LocalToneStrength, 0..2
+    float skin = -1.0f;     // DLSSNR.SkinStructureStrength: < 0 = follows structure (the DLL's default), else 0..2;
+                            // it acts on the skin the automatic mask finds
     float intensity = 1.0f; // DLSSNR.Intensity, 0..2
     int style = 0;          // DLSSNR.Style, 0 default / 1 natural / 2 cinematic
     int preset = 2;         // DLSSNR.Hint.Render.Preset, 1 WEIGHTS_HT / 2 WEIGHTS_CC_SMALL_FP8 (else the DLL's default)
-    int automask = 1;       // DLSSNR.UseAutoMask, as every reference host sets it (SMV_NR_AUTOMASK=0 = off)
+    int automask = 1;       // DLSSNR.UseAutoMask, NVIDIA's character mask: on unless the GUI's Auto mask is off
+                            // (SMV_NR_AUTOMASK=0 = off whatever the setting)
     // DLSSNR.MVec: a per-frame R16G16_FLOAT motion field (current -> previous, px) that the caller
     // writes into the shared MVec texture (startShared); without it the runtime gets no motion
     bool motion = false;
@@ -141,6 +144,14 @@ class Host
     void setTone(float v)
     {
         m_set.tone = v;
+    }
+    void setSkin(float v) // < 0 = follows structure
+    {
+        m_set.skin = v;
+    }
+    void setAutoMask(bool on) // DLSSNR.UseAutoMask (SMV_NR_AUTOMASK=0 keeps it off)
+    {
+        m_set.automask = on ? 1 : 0;
     }
     void setStyle(int v) // DLSSNR.Style is read at every evaluate too
     {

@@ -21,7 +21,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const FFMPEG_URL =
-  'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip';
+  'https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip';
 const ENGINE_BIN = path.resolve(import.meta.dirname, '..', 'engine', 'bin');
 const SYS32 = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32');
 const CURL = path.join(SYS32, 'curl.exe');

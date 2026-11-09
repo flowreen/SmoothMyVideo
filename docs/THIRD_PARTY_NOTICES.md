@@ -150,7 +150,7 @@ third-party work.
 ## Bundled in the release archive (not in this repository)
 
 * **FFmpeg** (LGPL v3 shared build by BtbN, `engine/bin/`, license in `engine/bin/FFMPEG-LICENSE.txt`): source code at
-  https://github.com/BtbN/FFmpeg-Builds (LGPL builds link their exact sources per release).
+  https://github.com/FFmpeg-Builds/FFmpeg-Builds (LGPL builds link their exact sources per release).
 * The NVIDIA **CUDA runtime** and **NVRTC** (`engine/gpu_runtime/`):
   redistributed as permitted by the NVIDIA software license agreements covering runtime redistribution.
 

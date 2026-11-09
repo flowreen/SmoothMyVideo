@@ -80,6 +80,8 @@ const OPTS: Record<string, Spec> = {
   '--dlssnr': { dest: 'dlssnr', kind: 'bool', def: false },
   '--nr-structure': { dest: 'nr_structure', kind: 'float', def: 1.0 },
   '--nr-tone': { dest: 'nr_tone', kind: 'float', def: 1.0 },
+  '--nr-skin': { dest: 'nr_skin', kind: 'float', def: -1.0 },
+  '--nr-automask': { dest: 'nr_automask', kind: 'int', def: 1, choices: [0, 1] },
   '--nr-style': { dest: 'nr_style', kind: 'int', def: 0, choices: [0, 1, 2] },
   '--nr-passes': {
     dest: 'nr_passes',

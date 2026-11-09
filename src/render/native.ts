@@ -687,7 +687,8 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       `DLSS Frame Generation at ${args.multi}x runs ${DG_PASSES.length} passes, which RTX HDR does not join yet: ` +
         `turn RTX HDR off, or pick ${DG_LIMIT}x or less.`,
     );
-  let nr: { structure: number; tone: number; style: number; passes: number } | null = null;
+  let nr: { structure: number; tone: number; skin: number; automask: number; style: number; passes: number } | null =
+    null;
   if (args.dlssnr) {
     const nrDir = env.SMV_DLSSNR_DIR || path.join(ENGINE, 'dlssnr');
     const miss = ['nvngx.dll', 'nvngx_dlssnr.dll'].filter((f) => !isFile(path.join(nrDir, f)));
@@ -696,6 +697,8 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       nr = {
         structure: clamp(args.nr_structure, 0.0, 2.0),
         tone: clamp(args.nr_tone, 0.0, 2.0),
+        skin: args.nr_skin >= 0 ? clamp(args.nr_skin, 0.0, 2.0) : -1,
+        automask: args.nr_automask === 0 ? 0 : 1,
         style: [0, 1, 2].includes(args.nr_style) ? args.nr_style : 0,
         passes: Math.min(20, Math.max(1, Math.round(args.nr_passes ?? 1))),
       };
@@ -852,7 +855,10 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const sharpNote = SHARPEN > 0 ? `  sharpen(adaptive)=${pyG(SHARPEN)}` : '';
   const upNote = UPSCALE ? `  upscale=${pyG(UPSCALE_F)}x->${OUT_W}x${OUT_H}` : '';
   const hdrNote = HDR_ACTIVE ? '  HDR10(TrueHDR,BT.2020 PQ)' : '';
-  const nrNote = nr ? `  dlss5(structure ${pyG(nr.structure)}, tone ${pyG(nr.tone)})` : '';
+  const nrNote = nr
+    ? `  dlss5(structure ${pyG(nr.structure)}, tone ${pyG(nr.tone)}` +
+      `${nr.skin >= 0 ? `, skin ${pyG(nr.skin)}` : ''}${nr.automask ? '' : ', no auto mask'})`
+    : '';
   say(
     `encode: ${venc} visually-lossless -> ${enc.outPix}  (source ${SRC_CODEC || '?'} ${SRC_BITS}bit ${SRC_PIX})` +
       `${nrNote}${sharpNote}${upNote}${hdrNote}\n`,
@@ -929,6 +935,8 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       String(nr.style),
     );
   if (nr && nr.passes > 1) nargs.push('--nr-passes', String(nr.passes));
+  if (nr && nr.skin >= 0) nargs.push('--nr-skin', pyG(nr.skin));
+  if (nr && !nr.automask) nargs.push('--nr-automask', '0');
   // HDR video (PQ or HLG): DLSS 5 sees its SDR range, as Live does on an HDR desktop, and RIFE finds
   // the motion on the same SDR view of the decoded picture
   if (SRC_HDR_IN) nargs.push('--src-hdr', String(tag(ST, 'color_transfer') || '') === 'arib-std-b67' ? 'hlg' : 'pq');

@@ -46,6 +46,8 @@ export interface PreviewArgs {
   dlssnr: boolean;
   nr_structure: number;
   nr_tone: number;
+  nr_skin: number;
+  nr_automask: number;
   nr_style: number;
   nr_passes: number;
   nr_mask: boolean;
@@ -103,6 +105,8 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     dlssnr: false,
     nr_structure: 1,
     nr_tone: 1,
+    nr_skin: -1,
+    nr_automask: 1,
     nr_style: 0,
     nr_passes: 1,
     nr_mask: false,
@@ -142,6 +146,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--upscale': 'upscale',
     '--nr-structure': 'nr_structure',
     '--nr-tone': 'nr_tone',
+    '--nr-skin': 'nr_skin',
     '--hdr-vibrance': 'hdr_vibrance',
     '--hdr-satboost': 'hdr_satboost',
   };
@@ -149,6 +154,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--vsr-quality': 'vsr_quality',
     '--nr-style': 'nr_style',
     '--nr-passes': 'nr_passes',
+    '--nr-automask': 'nr_automask',
     '--hdr-saturation': 'hdr_saturation',
     '--hdr-contrast': 'hdr_contrast',
     '--hdr-nits': 'hdr_nits',
@@ -756,6 +762,8 @@ function passFlags(
       String(a.nr_style),
     );
     if (a.nr_passes > 1) args.push('--nr-passes', String(a.nr_passes));
+    if (a.nr_skin >= 0) args.push('--nr-skin', pyG(clamp(a.nr_skin, 0.0, 2.0)));
+    if (a.nr_automask === 0) args.push('--nr-automask', '0');
   }
   // HDR video (PQ or HLG): DLSS 5 sees its SDR range, as Live does on an HDR desktop, and RIFE finds the motion on
   // the same SDR view of the decoded picture
