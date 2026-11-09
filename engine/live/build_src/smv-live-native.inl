@@ -29349,8 +29349,9 @@ static uint64_t nativeVideoMemoryRoom()
 // at 854x480 with 3 / 10: its per-size buffers exist before the ring on this route, so they are not added), and
 // FRUC's NvOFFRUC buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel of the model
 // frame (296 / 521 MiB at 896x512 / 1920x1088), and AMD FSR 4 frame generation's second midpoint instance with its node
-// frames, 45 MiB + 335 a megapixel of the (unpadded) model frame (a parked live session's own memory, x4 against x2: 146
-// / 476 MiB at 854x480 / 1708x960, a quarter on top) + its side Optical Flow session (nativeFsrfgAhead, x4 and up: 34 /
+// frames, 949 MiB + 163 a megapixel of the model frame (a parked live session's own memory, x4 against x2: 816 / 986 MiB
+// at 854x480 / 1708x960, a quarter on top; Intel XeSS-FG's, fgKind 1, 62 + 289: 148 / 442 MiB) + its side Optical Flow
+// session (nativeFsrfgAhead, x4 and up: 34 /
 // 74 MiB at 854x480 / 1280x720 = 2 + 98 a megapixel with a quarter, where both sides hold x4), or with derived level-2+
 // vectors (fsrfgDeriveOn) only the side stream's two vector buffers (8 bytes a pixel, 10 a megapixel with a quarter),
 // plus, while the bridge gives every instance its own vkd3d device (fsrfg_devices), 300 MiB an instance past the first
@@ -29364,17 +29365,23 @@ static uint64_t nativeVideoMemoryRoom()
 // measure less the ring's slots past x32's (priced apart), a quarter on top: FRUC 1052 + 2453, 1264 + 4260, 1396 +
 // 7733; FSR 4 1663 + 1826, 1869 + 3803, 2126 + 7652 a megapixel. x512 (level 9): x128 to x256's step twice over (the
 // fixed 1708x960 x512 run clamps its slots, so one size measured it: FRUC 6431 MiB at 854x480 against 6717 so priced,
-// FSR 4 7054 against 7149).
+// FSR 4 7054 against 7149). Intel XeSS-FG's levels from its own rows (the same measure and rule; its node frames are
+// smaller than FSR 4's at x8 / x16 and at every level at 854x480, larger at x32 and up at 1708x960): 68 + 362, 139 +
+// 880, 222 + 1709, 330 + 2851, 482 + 4927, 723 + 8876, x512 1205 + 16774 a megapixel.
 constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 290.0, kFrucLateMp = 173.0;
-constexpr double kFsrfgLateBase = 47.0, kFsrfgLateMp = 433.0, kFsrfgLateDerBase = 45.0, kFsrfgLateDerMp = 345.0,
+constexpr double kFsrfgLateBase = 951.0, kFsrfgLateMp = 261.0, kFsrfgLateDerBase = 949.0, kFsrfgLateDerMp = 173.0,
                  kFsrfgOwnDevice = 300.0;
+constexpr double kXefgLateBase = 64.0, kXefgLateMp = 387.0, kXefgLateDerBase = 62.0, kXefgLateDerMp = 299.0;
+constexpr double kXefgDeepBase[] = {68.0, 139.0, 222.0, 330.0, 482.0, 723.0, 1205.0},
+                 kXefgDeepMp[] = {362.0, 880.0, 1709.0, 2851.0, 4927.0, 8876.0, 16774.0};
 constexpr double kFrucDeepBase[] = {277.0, 549.0, 806.0, 1052.0, 1264.0, 1396.0, 1659.0},
                  kFrucDeepMp[] = {300.0, 742.0, 1470.0, 2453.0, 4260.0, 7733.0, 14678.0};
 constexpr double kFsrfgDeepBase[] = {278.0, 580.0, 381.0, 1663.0, 1869.0, 2126.0, 2641.0},
                  kFsrfgDeepMp[] = {333.0, 820.0, 1446.0, 1826.0, 3803.0, 7652.0, 15353.0};
 static_assert(sizeof(kFrucDeepBase) == sizeof(double) * (kFrDepth - 2) &&
                   sizeof(kFrucDeepMp) == sizeof(kFrucDeepBase) && sizeof(kFsrfgDeepBase) == sizeof(kFrucDeepBase) &&
-                  sizeof(kFsrfgDeepMp) == sizeof(kFrucDeepBase),
+                  sizeof(kFsrfgDeepMp) == sizeof(kFrucDeepBase) && sizeof(kXefgDeepBase) == sizeof(kFrucDeepBase) &&
+                  sizeof(kXefgDeepMp) == sizeof(kFrucDeepBase),
               "one memory term a tree level from x8 to the deepest");
 
 // the deepest midpoint-tree level `slots` output frames a source frame reach (x2^L needs 2^L slots; 2 at least, the
@@ -29402,14 +29409,19 @@ static uint64_t nativeLiveLateNeed(const NativeRife& nr, uint32_t slots)
     if (nr.fruc)
     {
         const double mp = (double)nr.pw * nr.ph / 1e6;
-        need += !nr.fsrfg           ? kFrucLateBase + kFrucLateMp * mp
-                : fsrfgDeriveOn(nr) ? kFsrfgLateDerBase + kFsrfgLateDerMp * mp
-                                    : kFsrfgLateBase + kFsrfgLateMp * mp;
+        const bool xe = nr.fsrfg && nr.fgKind == 1;
+        if (!nr.fsrfg)
+            need += kFrucLateBase + kFrucLateMp * mp;
+        else if (fsrfgDeriveOn(nr))
+            need += xe ? kXefgLateDerBase + kXefgLateDerMp * mp : kFsrfgLateDerBase + kFsrfgLateDerMp * mp;
+        else
+            need += xe ? kXefgLateBase + kXefgLateMp * mp : kFsrfgLateBase + kFsrfgLateMp * mp;
         // the deepest ladder the slots and the instances reach: x8 = 3 levels, x16 = 4, .. x512 = 9
         const int levels = nativeTreeLevels(nr, slots);
         if (nr.frMp && levels > 2)
-            need += nr.fsrfg ? kFsrfgDeepBase[levels - 3] + kFsrfgDeepMp[levels - 3] * mp
-                             : kFrucDeepBase[levels - 3] + kFrucDeepMp[levels - 3] * mp;
+            need += !nr.fsrfg ? kFrucDeepBase[levels - 3] + kFrucDeepMp[levels - 3] * mp
+                    : xe      ? kXefgDeepBase[levels - 3] + kXefgDeepMp[levels - 3] * mp
+                              : kFsrfgDeepBase[levels - 3] + kFsrfgDeepMp[levels - 3] * mp;
         // an own vkd3d device for every FSR 4 instance past the first (x4 = 2 instances, x2^L = L)
         if (nr.fsrfg && g_fsrfgK[nr.fgKind].devices && g_fsrfgK[nr.fgKind].devices() == 1)
             need += ((std::max)(levels, (std::min)(2, nr.frInstMax)) - 1) * kFsrfgOwnDevice;
