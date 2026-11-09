@@ -25865,16 +25865,17 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 
 // out[n / 128][m][n % 128] = a[m][:] . w[n][:] (+ bias[n] in fp32 when bias is set; K = 128, fp16 out): 64 rows x 128
-// outputs a CTA, 4 warps of 32 x 64, the two K halves loaded as two cp.async groups
+// outputs a CTA, 4 warps of 32 x 64, the two K halves loaded as two cp.async groups; a 1D grid of row tiles x nbc
+// output blocks with a row tile's nbc CTAs adjacent, so the later ones read its 64 rows from L2 instead of DRAM
 extern "C" __global__ void __launch_bounds__(128) k_gaProj(const unsigned short* __restrict__ a, int M,
                                                            const unsigned short* __restrict__ w,
                                                            unsigned short* __restrict__ out,
-                                                           const float* __restrict__ bias)
+                                                           const float* __restrict__ bias, int nbc)
 {
     extern __shared__ __align__(16) unsigned char sm[];
     unsigned short* sA = reinterpret_cast<unsigned short*>(sm);
     unsigned short* sW = sA + 64 * 128;
-    const int m0 = blockIdx.x * 64, nb = blockIdx.y;
+    const int m0 = static_cast<int>(blockIdx.x) / nbc * 64, nb = static_cast<int>(blockIdx.x) % nbc;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const unsigned short* wb = w + static_cast<size_t>(nb) * 128 * 128;
 #pragma unroll
@@ -26654,7 +26655,7 @@ static bool nativeGaLaunch(NativeRife& nr, int scale, const void* maps, const vo
 {
     int th = scale ? nr.gmH : nr.gmH / 2, tw = scale ? nr.gmW : nr.gmW / 2, S = scale ? 8 : 2; // the token grid
     const int rows = scale ? 4 : 2, P = th * tw;
-    int M = rows * P, wh = th / S, ww = tw / S, part = scale ? 2 : 1, warp = scale, zero = 0, one = 1;
+    int M = rows * P, wh = th / S, ww = tw / S, part = scale ? 2 : 1, warp = scale, zero = 0, one = 1, three = 3;
     const bool att2 = scale && nr.gaAttn2;
     const int kAtt = att2 ? kGaAttn2K : kGaAttnK;
     const unsigned att = (unsigned)((wh * ww + 127) / 128), smA = (unsigned)gaSmAttn(att2), smM = (unsigned)gaSmMlp();
@@ -26696,12 +26697,12 @@ static bool nativeGaLaunch(NativeRife& nr, int scale, const void* maps, const vo
         const float* lnC = (const float*)(wb + nr.gaOff[7 * l + 5]);
         const float* ln2 = (const float*)(wb + nr.gaOff[7 * l + 6]);
         const float *lnSb = lnS + 128, *lnCb = lnC + 128, *ln2b = ln2 + 128;
-        void* a1[] = {&xa, &M, (void*)&g1, &pj0, &nul};
+        void* a1[] = {&xa, &M, (void*)&g1, &pj0, &nul, &three};
         void* a2[] = {&pj0, &xa, &pj1, &th, &tw, &S, &shift, &zero, (void*)&lnS, (void*)&lnSb, &eps, &zero, &x32, &xb};
-        void* a3[] = {&xb, &M, (void*)&g2, &pj0, &nul};
+        void* a3[] = {&xb, &M, (void*)&g2, &pj0, &nul, &one};
         void* a4[] = {&pj0, &xa, &pj2, &th, &tw, &S, &shift, &part, (void*)&lnC, (void*)&lnCb, &eps, &one, &x32, &nm};
         void* a5[] = {&xb, &nm, &M, (void*)&w0, (void*)&w2c, (void*)&ln2, (void*)&ln2b, &eps, &x32, &xa};
-        if (!go(kGaProjK, gm, 3, 1, 128, kGaSmProj, a1) ||
+        if (!go(kGaProjK, gm * 3, 1, 1, 128, kGaSmProj, a1) ||
             !go(kAtt, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a2) ||
             !go(kGaProjK, gm, 1, 1, 128, kGaSmProj, a3) ||
             !go(kAtt, att, (unsigned)(S * S), (unsigned)rows, 256, smA, a4) ||
@@ -26712,8 +26713,8 @@ static bool nativeGaLaunch(NativeRife& nr, int scale, const void* maps, const vo
     {
         const void *qw = wb + nr.gaOff[kGaQw], *kw = wb + nr.gaOff[kGaKw];
         const void *qb = wb + nr.gaOff[kGaQb], *kb = wb + nr.gaOff[kGaKb];
-        void* a6[] = {&xa, &M, (void*)&qw, &mq, (void*)&qb};
-        void* a7[] = {&mq, &M, (void*)&kw, &mk, (void*)&kb};
+        void* a6[] = {&xa, &M, (void*)&qw, &mq, (void*)&qb, &one};
+        void* a7[] = {&mq, &M, (void*)&kw, &mk, (void*)&kb, &one};
         if (!go(kGaProjK, gm, 1, 1, 128, kGaSmProj, a6) || !go(kGaProjK, gm, 1, 1, 128, kGaSmProj, a7))
             return false;
     }
@@ -29349,35 +29350,40 @@ static uint64_t nativeVideoMemoryRoom()
 // at 854x480 with 3 / 10: its per-size buffers exist before the ring on this route, so they are not added), and
 // FRUC's NvOFFRUC buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel of the model
 // frame (296 / 521 MiB at 896x512 / 1920x1088), and AMD FSR 4 frame generation's second midpoint instance with its node
-// frames, 949 MiB + 163 a megapixel of the model frame (a parked live session's own memory, x4 against x2: 816 / 986 MiB
-// at 854x480 / 1708x960, a quarter on top; Intel XeSS-FG's, fgKind 1, 62 + 289: 148 / 442 MiB) + its side Optical Flow
-// session (nativeFsrfgAhead, x4 and up: 34 /
-// 74 MiB at 854x480 / 1280x720 = 2 + 98 a megapixel with a quarter, where both sides hold x4), or with derived level-2+
-// vectors (fsrfgDeriveOn) only the side stream's two vector buffers (8 bytes a pixel, 10 a megapixel with a quarter),
+// frames and derived level-2+ vectors (fsrfgDeriveOn: the side stream's two vector buffers), 1249 MiB at any size (the
+// whole GPU's rise, x4 against x2, at five sizes from 854x480 to 3840x2160: 538 to 999 MiB, 161 to 230 at 2560x1440,
+// a quarter on top; the card's figure, not the process's own memory counter, which counts a D3D12 buffer CUDA imports
+// twice and reads up to 1.7x the card's rise: a session whose own counter passes the free memory while the card's
+// figure fits moves nothing out), or without derived vectors its side Optical Flow session instead of the vector
+// buffers (nativeFsrfgAhead, x4 and up, 2 + 98 a megapixel with a quarter less the vectors' 10: 1251 + 88); Intel
+// XeSS-FG's, fgKind 1, by the card's figure at the same five sizes: 247 + 265 a megapixel (without derived vectors
+// 249 + 353),
 // plus, while the bridge gives every instance its own vkd3d device (fsrfg_devices), 300 MiB an instance past the first
 // (x4 parked, shared vs own devices: +243 / +49 MiB at 854x480 / 1708x960, x8 at 1280x720 +471 for two: the largest,
 // flat, a quarter on top); the other routes add nothing the reserve does not cover. The x8 /
 // x16 / x32 ladders' third, fourth and fifth tree levels (an instance and twice the node frames a level) come on top
-// when the session's slots reach them (the process's own memory over x4 at 854x480 / 1708x960, a quarter on top, FRUC
-// by the padded megapixel: FRUC x8 +332 / +620 MiB, x16 +711 / +1423, x32 +1184 / +2595; FSR 4 x8 +282 / +462, x16
-// +627 / +1115, but FSR 4 held only ~x3.7 at 1708x960 and leaves those levels' node frames partly unmade: the x8 / x16
-// per-megapixel terms are FSR 3.1's larger fit; FSR 4 x32 +779 / +2202). x64 / x128 / x256 (levels 6 to 8): the same
-// measure less the ring's slots past x32's (priced apart), a quarter on top: FRUC 1052 + 2453, 1264 + 4260, 1396 +
-// 7733; FSR 4 1663 + 1826, 1869 + 3803, 2126 + 7652 a megapixel. x512 (level 9): x128 to x256's step twice over (the
-// fixed 1708x960 x512 run clamps its slots, so one size measured it: FRUC 6431 MiB at 854x480 against 6717 so priced,
-// FSR 4 7054 against 7149). Intel XeSS-FG's levels from its own rows (the same measure and rule; its node frames are
-// smaller than FSR 4's at x8 / x16 and at every level at 854x480, larger at x32 and up at 1708x960): 68 + 362, 139 +
-// 880, 222 + 1709, 330 + 2851, 482 + 4927, 723 + 8876, x512 1205 + 16774 a megapixel.
+// when the session's slots reach them (FRUC: the whole GPU's rise over x4 at five sizes, 854x480 to 3840x2160 with the
+// fit off, a quarter on top, less the ring's slots past x32's and the pipelined second tree priced below, as a line by
+// the padded megapixel that covers every size and never falls with depth: x8 884 + 224, x16 985 + 378, x32 1207 + 784,
+// x64 1678 + 879, x128 1873 + 1363, x256 1873 + 2234 a megapixel). x512 (level 9): x128 to x256's step twice over,
+// raised to cover its measures (FRUC 854x480 / 1280x720: 1873 + 3977). AMD FSR 4 frame generation's levels
+// come from the whole GPU's rise over x2 at five sizes, 854x480 to 3840x2160 (x2 varies by up to ~330 MiB run to run,
+// so a size takes the largest of its runs; 3840x2160 to x64 with the fit off): a level's term = that rise, a quarter on
+// top, less the late term and the ring's slots past x32's, as a line that covers every size and never falls with depth
+// (x8 155 + 86, x16 441 + 260, x32 441 + 626, x64 636 + 1023, x128 996 + 1712, x256 1134 + 3245 a megapixel; x512 by
+// the step rule above, raised to cover its 854x480 measure: 1555 + 6309). Intel XeSS-FG's levels by the same measure
+// and rule from its own rows (3840x2160 to x64, 2560x1440 to x128, with the fit off): 362 + 103, 362 + 511, 362 + 928,
+// 362 + 1506, 362 + 2589, 596 + 4063, x512 1275 + 7011 a megapixel.
 constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 290.0, kFrucLateMp = 173.0;
-constexpr double kFsrfgLateBase = 951.0, kFsrfgLateMp = 261.0, kFsrfgLateDerBase = 949.0, kFsrfgLateDerMp = 173.0,
+constexpr double kFsrfgLateBase = 1251.0, kFsrfgLateMp = 88.0, kFsrfgLateDerBase = 1249.0, kFsrfgLateDerMp = 0.0,
                  kFsrfgOwnDevice = 300.0;
-constexpr double kXefgLateBase = 64.0, kXefgLateMp = 387.0, kXefgLateDerBase = 62.0, kXefgLateDerMp = 299.0;
-constexpr double kXefgDeepBase[] = {68.0, 139.0, 222.0, 330.0, 482.0, 723.0, 1205.0},
-                 kXefgDeepMp[] = {362.0, 880.0, 1709.0, 2851.0, 4927.0, 8876.0, 16774.0};
-constexpr double kFrucDeepBase[] = {277.0, 549.0, 806.0, 1052.0, 1264.0, 1396.0, 1659.0},
-                 kFrucDeepMp[] = {300.0, 742.0, 1470.0, 2453.0, 4260.0, 7733.0, 14678.0};
-constexpr double kFsrfgDeepBase[] = {278.0, 580.0, 381.0, 1663.0, 1869.0, 2126.0, 2641.0},
-                 kFsrfgDeepMp[] = {333.0, 820.0, 1446.0, 1826.0, 3803.0, 7652.0, 15353.0};
+constexpr double kXefgLateBase = 249.0, kXefgLateMp = 353.0, kXefgLateDerBase = 247.0, kXefgLateDerMp = 265.0;
+constexpr double kXefgDeepBase[] = {362.0, 362.0, 362.0, 362.0, 362.0, 596.0, 1275.0},
+                 kXefgDeepMp[] = {103.0, 511.0, 928.0, 1506.0, 2589.0, 4063.0, 7011.0};
+constexpr double kFrucDeepBase[] = {884.0, 985.0, 1207.0, 1678.0, 1873.0, 1873.0, 1873.0},
+                 kFrucDeepMp[] = {224.0, 378.0, 784.0, 879.0, 1363.0, 2234.0, 3977.0};
+constexpr double kFsrfgDeepBase[] = {155.0, 441.0, 441.0, 636.0, 996.0, 1134.0, 1555.0},
+                 kFsrfgDeepMp[] = {86.0, 260.0, 626.0, 1023.0, 1712.0, 3245.0, 6309.0};
 static_assert(sizeof(kFrucDeepBase) == sizeof(double) * (kFrDepth - 2) &&
                   sizeof(kFrucDeepMp) == sizeof(kFrucDeepBase) && sizeof(kFsrfgDeepBase) == sizeof(kFrucDeepBase) &&
                   sizeof(kFsrfgDeepMp) == sizeof(kFrucDeepBase) && sizeof(kXefgDeepBase) == sizeof(kFrucDeepBase) &&
@@ -29473,28 +29479,43 @@ static uint32_t nativeRingFit(const NativeRife& nr, size_t slotBytes, uint32_t s
 // A session's video memory check, for every route: nativeVideoMemoryMark at its start (before the engines and
 // buffers), nativeVideoMemoryNote once its first frames are out. One line when the driver moved allocations out of
 // video memory meanwhile: the session did not fit in what was free, so part of it, or of another app, now lives in
-// system memory and runs slower there (the pixels are the same).
+// system memory and runs slower there (the pixels are the same). A live session keeps allocating after its first
+// frames (AMD FSR 4 frame generation's second instance and deeper tree levels, a ladder the throttle raises), so when
+// the first check found nothing, nativeVideoMemoryLate repeats it at every 2 s stat line until the line is said once.
 static uint64_t g_vramMoved = 0, g_vramFree = 0;
-static bool g_vramMarked = false;
+static bool g_vramMarked = false, g_vramLate = false;
 static void nativeVideoMemoryMark()
 {
     uint64_t cardB = 0;
+    g_vramLate = false;
     g_vramMarked = nativeVideoMemory(g_vramFree, cardB, &g_vramMoved);
+}
+// true = the driver moved memory out since the mark (the line said)
+static bool nativeVideoMemoryCheck()
+{
+    uint64_t freeB = 0, cardB = 0, moved = 0;
+    if (!nativeVideoMemory(freeB, cardB, &moved) || !(moved > g_vramMoved || (nativeVideoCardLever() && !freeB)))
+        return false;
+    const double gb = 1024.0 * 1024.0 * 1024.0;
+    LOG("%s: video memory ran out: %.1f GB of the GPU's %.1f GB were free when this %s started and it needs "
+        "more, so the driver moved memory out to system memory, which slows it and other apps down (the pixels "
+        "stay the same); a smaller picture, a lower DLSS mode, fewer DLSS 5 passes or closing other apps leave "
+        "more room\n",
+        g_offline ? "offline" : "native", (double)g_vramFree / gb, (double)cardB / gb,
+        g_offline ? "render" : "session");
+    return true;
 }
 static void nativeVideoMemoryNote()
 {
-    uint64_t freeB = 0, cardB = 0, moved = 0;
-    if (!g_vramMarked || !nativeVideoMemory(freeB, cardB, &moved))
+    if (!g_vramMarked)
         return;
     g_vramMarked = false;
-    const double gb = 1024.0 * 1024.0 * 1024.0;
-    if (moved > g_vramMoved || (nativeVideoCardLever() && !freeB))
-        LOG("%s: video memory ran out: %.1f GB of the GPU's %.1f GB were free when this %s started and it needs "
-            "more, so the driver moved memory out to system memory, which slows it and other apps down (the pixels "
-            "stay the same); a smaller picture, a lower DLSS mode, fewer DLSS 5 passes or closing other apps leave "
-            "more room\n",
-            g_offline ? "offline" : "native", (double)g_vramFree / gb, (double)cardB / gb,
-            g_offline ? "render" : "session");
+    g_vramLate = !nativeVideoMemoryCheck() && !g_offline;
+}
+static void nativeVideoMemoryLate()
+{
+    if (g_vramLate && nativeVideoMemoryCheck())
+        g_vramLate = false;
 }
 
 static bool nativeNrFrame(NativeRife& nr, float* frame, int pw, int ph, int ps)

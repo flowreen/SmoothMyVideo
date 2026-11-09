@@ -3681,6 +3681,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     "None in RTSS\n",
                     rtssModule);
             }
+            nativeVideoMemoryLate();
             LOG("live: %.1f captured fps -> %.1f presented fps (ratio %.2f, target %.1f) "
                 "%s ~%.0fms%s present %.2fms (wait %.2f flip %.2f) drop %.1f "
                 "panel %.1fHz dwm %.1fHz disp %.1f/s bunch %.1f/s%s%s\n",
