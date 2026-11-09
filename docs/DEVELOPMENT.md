@@ -215,9 +215,13 @@ not a doc in this sense).
 
 ## Setup (fresh clone)
 
-Weights ship in git. Fetched or copied: `engine/bin` (ffmpeg, about 137 MB) and the DEV python
-`engine/runtime` (about 5.7 GB, never shipped); `engine/gpu_runtime` (about 115 MB) is staged from
-it. All must exist before `npm run dist`.
+Running the app needs Node 24 or later and nothing else: double-click `SmoothMyVideo.cmd`. It checks for Node, and
+when `node_modules`, `engine/bin` or `engine/gpu_runtime` is missing it runs steps 1 and 3 below in its window, then
+starts the app hidden (`SMV_LAUNCH_DRY=1` does everything but the start). Its line ends stay CRLF in every checkout
+(`.gitattributes`: cmd.exe can miss a label in a batch file with bare LF line ends).
+
+Weights ship in git. Fetched: `engine/bin` (ffmpeg, about 137 MB) and `engine/gpu_runtime` (the CUDA DLLs, about
+115 MB). The DEV python `engine/runtime` (about 5.7 GB, never shipped) is only for the harness and for bumping CUDA.
 
 1. Dependencies and ffmpeg (Node 24 or later: the build scripts, `postinstall`'s included, are TypeScript
    that Node runs directly; `package.json` `engines` says so):
@@ -227,7 +231,7 @@ it. All must exist before `npm run dist`.
    ```
    `fetch-ffmpeg.ts` downloads the BtbN win64 LGPL shared build into `engine/bin` (idempotent). If
    the Electron binary did not download: `node node_modules/electron/install.js`.
-2. The dev python into `engine/runtime` (release zips up to 1.0.3 carry a copy in
+2. Optional, the dev python into `engine/runtime` (release zips up to 1.0.3 carry a copy in
    `resources/engine/runtime`; later ones ship none):
    * Unpack a
      [python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases)
@@ -238,7 +242,9 @@ it. All must exist before `npm run dist`.
      `requirements.txt` pulls the unsuffixed `nvidia-cuda-nvrtc` / `nvidia-cuda-runtime` cu13 wheels (the `-cu13`
      names are dead placeholders). Never use a `venv`: a Windows venv is not relocatable.
 3. `node scripts/stage-gpu-runtime.ts` (the host's DLLs into `engine/gpu_runtime`); `npm run setup`
-   runs it.
+   runs it. With a dev python it copies them from its wheels; without one it downloads NVIDIA's two wheels
+   (`nvidia-cuda-runtime`, `nvidia-cuda-nvrtc`, about 50 MB) from PyPI, pinned in the script by URL and SHA-256, and
+   takes the same three DLLs out of them. A CUDA bump = `pip` in the dev python and the script's pins together.
 
 Refreshing bundled binaries: for ffmpeg delete `engine/bin` and re-run the fetch script, or drop a
 matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across builds). Weights
@@ -248,8 +254,7 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
 
 * `npm start`: `tsc`, the renderer's type check and build (`app.ts` -> `app.js`), then launch.
 * `npm run setup`: clean `node_modules` + `engine/bin`, `npm install`, fetch ffmpeg, stage
-  `engine/gpu_runtime` (skipped with a warning when `engine/runtime` is not there yet; run step 3 of
-  Setup by hand after step 2), start. Never
+  `engine/gpu_runtime` (a failed download leaves a warning: run `node scripts/stage-gpu-runtime.ts` again), start. Never
   name a wrapper script `install` / `preinstall` / `postinstall` (npm lifecycle names; a script named
   `install` that runs `npm install` recurses).
 * `npm run dist`: wipes `release/`, compiles, stages `engine/gpu_runtime` (`--required`, a failure

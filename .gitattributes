@@ -5,3 +5,7 @@ engine/rife/** linguist-vendored
 engine/live/build_src/nvofa/** linguist-vendored
 # Our headers are C++ (linguist reads a bare .h as C):
 *.h linguist-language=C++
+
+# The double-click launcher keeps its CRLF line ends in every checkout and in GitHub's "Download ZIP" (cmd.exe can
+# miss a label in a batch file with bare LF line ends), so git stores its bytes as they are:
+/SmoothMyVideo.cmd -text
