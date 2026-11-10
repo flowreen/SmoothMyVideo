@@ -99,7 +99,7 @@
   /* --def on the wrapper moves the tick for an off-centre default (the DLSS mode slider's DLAA
      sits at the right end, inset by the half thumb) */
   .defmark:has(input:disabled)::before { opacity:.45; }
-  /* Right to left (Arabic, app.ts applyI18n sets <html dir>): the layout mirrors, the sliders and their default tick
+  /* Right to left (Arabic, app-i18n.ts applyI18n sets <html dir>): the layout mirrors, the sliders and their default tick
      with it; the before / after pair and the Compare grid stay left to right (their zoom scrolls by scrollLeft, Save
      image draws the grid left to right), so do the log and the output path; the file line reads in its own direction */
   html[dir=rtl] #prevpair, html[dir=rtl] #cmpgrid, html[dir=rtl] #log, html[dir=rtl] #out { direction:ltr; }
@@ -119,20 +119,20 @@
 </head>
 <body>
   <!-- Every visible text lives in i18n\<lang>.json: data-i18n = the element's content, data-i18n-title / -ph / -aria /
-       -alt = that attribute (app.ts applyI18n). Elements the code relabels at run time (status lines, the setup
-       states, the Go buttons, the preview labels) carry no key: app.ts sets them through t(). -->
+       -alt = that attribute (app-i18n.ts applyI18n). Elements the code relabels at run time (status lines, the setup
+       states, the Go buttons, the preview labels) carry no key: the code sets them through t(). -->
   <div class="row" style="justify-content:space-between;margin:0">
     <h1>Smooth My Video</h1>
     <div class="row" style="margin:0">
       <!-- the Update button, Chrome's pattern: shown once a newer version is downloaded and unpacked (main's
-           autoUpdate, app.ts); its click restarts into it, otherwise the next launch applies it -->
+           autoUpdate, app-update.ts); its click restarts into it, otherwise the next launch applies it -->
       <button id="updbtn" style="display:none;background:var(--green);color:#0d0d0d;font-weight:700" data-i18n-title="update.btn.tip"></button>
       <select id="langsel" data-i18n-title="lang.tip" data-i18n-aria="lang.tip"></select>
     </div>
   </div>
   <div class="sub" data-i18n="app.tagline"></div>
   <!-- One-line update notice; hidden unless main's launch-time release check finds a newer build. Its text follows the
-       background download (app.ts updLine); the tick turns the automatic update off and on. -->
+       background download (app-update.ts updLine); the tick turns the automatic update off and on. -->
   <div id="update" class="hint" style="display:none;margin:2px 0 6px">
     <span id="updtxt"></span> <a id="updatelink" href="#" style="color:var(--green)" data-i18n="update.link"></a>
     <label style="margin-inline-start:12px;white-space:nowrap" data-i18n-title="update.auto.tip"><input type="checkbox" id="updauto"> <span data-i18n="update.auto"></span></label>

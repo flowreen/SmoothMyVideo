@@ -63,14 +63,20 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
   code and real dovi_tool / hdr10plus_tool runs, files byte-exact) and `ts6d2\gate_6d2.py` (9,130
   cases incl. real salvage / trim / concat of torn part files and
   pause previews, files byte-exact), all 0 differences.
-* `renderer/index.html` + `renderer/app.ts`: the whole UI (markup and CSS in the HTML, a small
-  inline script that sets the mode class before the body renders) plus its progress / ETA / IPC
-  logic in `app.ts`, loaded as `app.js` by a plain `<script src="app.js">` at the end of the body.
-  `app.ts` is a classic script (no imports), type-checked by `tsc -p renderer` (renderer/tsconfig.json, no emit;
-  `$()` returns `any`, so DOM element properties are not checked yet) and turned into the git-ignored
-  `app.js` by `scripts/build-renderer.ts`: Node's type stripper blanks the annotations and changes
-  nothing else, so `app.js` is the program as written, line for line (tsc's own emit would prepend
-  `"use strict"`). `npm start` and `dist` run both steps. Panels sit in engine pass order and
+* `renderer/index.html` + `renderer/app.ts` and its parts `renderer/app-<name>.ts`: the whole UI (markup and CSS in
+  the HTML, a small inline script that sets the mode class before the body renders) plus its progress / ETA / IPC
+  logic in the `.ts` files, loaded as ONE `app.js` by a plain `<script src="app.js">` at the end of the body.
+  `app.ts` (start-up, zoom, the shared state and helpers) and the parts, one concern each (`i18n`, `video`, `effects`,
+  `upscalers`, `dlss5`, `models`, `live`, `hdr-tools`, `preview`, `compare`, `run`, `update`, `done`), are one classic
+  script (no imports): a name declared in one is visible in the others. Their order is the `files` list in
+  `renderer/tsconfig.json`, and it matters: a top-level `const` or `let` exists only once its line has run, so the code
+  a part runs while loading may use the constants of the parts before it (functions are callable from anywhere).
+  `tsc -p renderer`
+  type-checks them (no emit; `$()` returns `any`, so DOM element properties are not checked yet) and
+  `scripts/build-renderer.ts` joins them in that order into the git-ignored `app.js`: Node's type stripper blanks the
+  annotations and changes nothing else, so each part is in `app.js` as written (tsc's own emit would prepend
+  `"use strict"`); `node scripts/build-renderer.ts --where N` names the part and line of `app.js` line N.
+  `npm start` and `dist` run both steps. Panels sit in engine pass order and
   are numbered by a CSS counter that skips hidden panels (`.panel.step`): Restore, Interpolate,
   Upscale, DLSS 5, Sharpen, HDR, Dolby Vision, HDR10+, Output. A Video / Live switch
   (`localStorage.uiMode`) puts `mode-video` or `mode-live` on `<html>`; `.vonly` and `.lonly`
@@ -240,7 +246,7 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
 
 ## Scripts
 
-* `npm start`: `tsc`, the renderer's type check and build (`app.ts` -> `app.js`), then launch.
+* `npm start`: `tsc`, the renderer's type check and build (`app.ts` and its parts -> `app.js`), then launch.
 * `npm run setup`: clean `node_modules` + `engine/bin`, `npm install`, fetch ffmpeg, stage
   `engine/gpu_runtime` (a failed download leaves a warning: run `node scripts/stage-gpu-runtime.ts` again), start. Never
   name a wrapper script `install` / `preinstall` / `postinstall` (npm lifecycle names; a script named
@@ -253,14 +259,16 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
   `%ProgramFiles%\7-Zip`, or `SMV_7Z` naming it). The staging folder is deleted after 7-Zip's
   own test reads every file back and finds the folder's file count and bytes. `extraResources` copies `engine/**` minus `runtime/**` and
   the other filtered paths, so no stray folders may sit under `engine` at build time.
-* `npm run lint`: Prettier writes `src/**/*.ts`, `scripts/*.ts`, `renderer/app.ts` and `renderer/i18n/*.json`, then `tsc --noEmit` and
+* `npm run lint`: Prettier writes `src/**/*.ts`, `scripts/*.ts`, `renderer/*.ts` and `renderer/i18n/*.json`, then `tsc --noEmit` and
   `tsc -p scripts` (the build scripts) and `tsc -p renderer` (the
-  renderer), then clang-format writes our own C++ (see Linting and formatting).
+  renderer), the lever check (`node scripts/check-levers.ts`, see Environment variables), then clang-format writes our
+  own C++ (see Linting and formatting).
   Stops at the first failure.
 * `postinstall` runs `scripts/dev-icon.ts`, making `Smooth My Video.lnk` in the root (git-ignored: the app icon on a
   shortcut to the `SmoothMyVideo.cmd` launcher) and stamping `assets/icon.ico` into the dev Electron exe so
   `npm start` shows the app icon (a stale Explorer icon cache refreshes on the next reboot).
-* `node scripts/scan-index.ts`: the renderer scan described above (`index.html` + `app.ts`, built into `app.js` first).
+* `node scripts/scan-index.ts`: the renderer scan described above (`index.html` + `app.ts` and its parts, built into
+  `app.js` first).
 
 ## Engine CLI
 
@@ -1814,13 +1822,19 @@ three runs per config, deltas under about 5% mean nothing.
 
 ## Environment variables
 
-All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
+All optional; the GUI sets none of the tuning ones. `0` disables unless stated. This section is the one list of the
+`SMV_*` levers: `node scripts/check-levers.ts` (part of `npm run lint`) fails on a lever a source reads that is not
+named here, and on a name here that no source holds.
 
 | Variable | Effect |
 |---|---|
 | `SMV_TRT_CACHE` | the model cache's location (the kernels' cubins; default `model_cache_safe_to_delete` in the app's top folder) |
 | `SMV_GM_SPLAT=old` | GMFSS's splats by the scatter kernels (k_splatSoft + k_splatNorm) instead of the gather ones (A/B; the same output) |
 | `SMV_GM_SCRATCH=own` | GMFSS's pair scratch in its own buffers instead of carved from the splat accumulator (A/B; the same output) |
+| `SMV_GM_CTXSHARE=0` | each of GMFSS's nets on its own activation block instead of the one block they share (A/B) |
+| `SMV_FU_R4=0` | GMFSS's fusion net never runs a wide conv as its 4-row twin (A/B; the same output) |
+| `SMV_GA_MLP2=0` | GMFlow's transformer never runs its MLP in the two-CTA form (A/B; the same output) |
+| `SMV_GA_ATTN2=0` | GMFlow's transformer never runs its attention in the two-CTA form (A/B) |
 | `SMV_GM_FEAT_LAZY=0` | GMFSS's feat_ext on every new frame, also in groups without tweens (A/B; the same output) |
 | `SMV_CTXSHARE=0` | Restore's context, the encode's planes and the scratch of DRBA's block0 and of the IFNet each on their own activation block instead of one shared block (A/B; the same output) |
 | `SMV_IFN_GRAPH=0` / `=fail`, `SMV_GI_GRAPH=0` / `=fail`, `SMV_FU_GRAPH=0` / `=fail`, `SMV_GB_GRAPH=0` / `=fail`, `SMV_BB_GRAPH=0` / `=fail`, `SMV_GA_GRAPH=0` / `=fail` | RIFE's IFNet / the GMFSS IFNet / fusionnet / gmflow B / gmflow's backbone / gmflow's transformer (A and `_m`) launched kernel by kernel instead of replayed as CUDA graphs (A/B; the same output) / every capture thrown away, the session falls back to kernel-by-kernel launches (the fallback line's trigger) |
@@ -1877,6 +1891,8 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_FRUC_PIPE=0` / `=force` | Live Smooth Motion: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder, the fixed multipliers too (gates; see "Pipelined across pairs") |
 | `SMV_FSRFG_PIPE=0` / `=force` / `=serial` | Live AMD FSR frame generation: never pipeline the midpoint tree across pairs / pipeline every ladder and fixed multiplier, x2 included (gates) / the same with the new pair's level-1 Optical Flow after the shown pair's deeper calls (an A/B lever); unset = the priced automatic route (see "Pipelined across pairs") |
 | `SMV_FRUC_STEPUP=0` | Live Smooth Motion / AMD FSR 4 FG: a target between two ladder nodes runs the largest node that fits instead of the node above it (gates; see "The node above the target") |
+| `SMV_FRUC_PIPE_K=N` | Live Smooth Motion, pipelined: the most levels of a pair's midpoint tree the first instance's worker takes (1 = the level-1 call alone) |
+| `SMV_FRUC_PIPE_GATE=0` | Live Smooth Motion, pipelined: the worker never waits on the level gate (a test lever: the trigger of the `entered by two threads` log line) |
 | `SMV_LIVE_DGPU=0` / `=fail` | Live DLSS 4.5's direct pass hands its frames to DLSS-G through the CPU and an upload copy instead of on the GPU (the A/B lever) / the GPU handoff's setup fails (its trigger test: `note: the GPU handoff is unavailable ...`, the session runs the upload route); never a product setting |
 | `SMV_LIVE_INPLACE=0` / `=fail` | the HDR10 pack (the GPU handoff's and the upload route's) reads a copy of the client crop instead of the WGC frame in place (the A/B lever) / the frame's view fails (its trigger test: `note: the frame cannot be read in place ...`, the session copies each crop); never a product setting |
 | `SMV_LIVE_CASCADE=off` / `=probe` / `=present`, `SMV_LIVE_CASCADE_GEN` | Live DLSS 4.5: `off` = one pass only (no plan above the limit); development only (the direct route): `probe` starts `dlssg2f.exe --stage1` beside the session (in a job object that ends it with the host), feeds it every captured frame and reads every frame it shares on the host's own D3D12 device, presenting nothing of it; `present` = the cascade: the session's DLSS-G (`--gen`) presents stage 1's frames instead of the captured ones (x6 x x2 = x12); `_GEN` = stage 1's generated frames (1..5, default 5). Lines `cascade probe: ...` / `cascade stage 1: ...` (harness `dlssg_cascade\probe_gate.py`) |
@@ -1888,14 +1904,23 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_DLSSG_RB_QUEUE=own` | the DLSS 4.5 host reads frames back (and `--stage1` fills its shared ring) on its own command queue instead of the one Streamline created the native swap chain on (it learns that queue by wrapping the real DXGI factory's swap chain creation), a file render with a settle before each readback, `--stage1` copying each present as soon as it is counted; its copies then run in no order with the presents and can read a back buffer's previous frame. The same capture is the automatic fallback when that queue is not seen; the A/B and trigger test only, never a product setting |
 | `SMV_DLSSG_WAITMS=N` | on Streamline's queue without the `Present` wrap (or before it is seen to catch every present), the newest native present waits up to N ms for a later one before it is read back anyway; on the host's own queue, the settle before each readback (default 5); an A/B lever, never a product setting |
 | `SMV_DLSSG_LIMIT=N` | the most DLSS 4.5 makes in one pass (2..6) instead of the GPU's measured limit (`dlssg_limit.json`; Live: numFramesToGenerateMax + 1): `2` renders and runs Live with an RTX 40's passes on an RTX 50 (the cascade's trigger test) |
+| `SMV_DLSSG_AT_WORK=0` | Live DLSS 4.5 never runs at the working size: below DLAA it generates at the presented size (A/B) |
+| `SMV_DLSSG_STRETCH=1` | Live DLSS 4.5 at the working size: DXGI's bilinear stretch of a swap chain at the frames' size instead of the session's own enlarge (the look A/B) |
+| `SMV_DLSSG_LZ_TAB=cpu` | that enlarge's tap tables from the CPU port instead of the native table kernel (the A/B of the two) |
+| `SMV_DLSSG_LZ_PIPE=0` | that enlarge waits for the GPU after every present instead of leaving frames in flight |
+| `SMV_DLSSG_LZ_DUMP=DIR`, `SMV_DLSSG_LZ_DUMP_AT=N` | that enlarge's call number N (default 120) written to DIR: its source, its result and its tap tables |
 | `SMV_DLSSG_WQ=0` | a file render's host reads each DLSS 4.5 pair before it sends the next frame, even to a `dlssg2f` with a pair writer (` wq=1`); the A/B and fallback test only, never a product setting |
 | `SMV_DLSSG_KEEP=0` | the resident file-render host starts a new `dlssg2f` for every DLSS 4.5 render instead of keeping the last render's server for the next one of the same padded size, multiplier and frame format; the A/B and fallback test only, never a product setting |
+| `SMV_DLSSG_GAP_RESET=1` | `dlssg2f` resets DLSS 4.5 before every pair whose input came 500 ms after the last one (A/B) |
 | `SMV_DLSSG_HDR10=0` | DLSS 4.5 gets HDR planes as 8-bit codes on an RGBA8 swap chain (labelled SDR) instead of HDR10; an A/B lever, never a product setting |
 | `SMV_DLSSG_REFUSE_HDR10=1` | the DLSS 4.5 host treats the HDR10 colour space as refused (exit 5): the trigger test of the host's 8-bit fallback |
 | `SMV_DLSSG_FOCUS_SHIM=0` | the DLSS 4.5 host's focus shim off: by default `dlssg2f` points the Streamline modules' `GetForegroundWindow` imports at its own off-screen window, because Streamline 2.14 pauses frame generation whenever another window has focus (a render then stopped with `DLSS_PREEMPTED` while the user worked in another window); the A/B and trigger test only, never a product setting |
 | `SMV_RTSS_MODULE=<name>` | the module the RTSS check looks for instead of `RTSSHooks64.dll` (RivaTuner Statistics Server's hook, which limits a process's presents inside Present): a live session checks its own process at every stats line, an offline DLSS 4.5 render the `dlssg2f` child at its 30th pair and every 600th, and either names a found hook once (`RTSS (RivaTuner Statistics Server) has hooked ...`, the remedy: that exe's Application detection level None in RTSS); `dxgi.dll` = the trigger test, never a product setting |
 | `SMV_NR_TEST=outofdate` / `=fault` | the trigger tests of DLSS 5's two driver refusals: the NR core asks NGX for the feature's requirements before its init (OutOfDate or the driver-version bit = `the NVIDIA driver <version> is too old for DLSS 5 ...: update the driver`) and runs every CreateFeature under a fault guard (a fault inside NVIDIA's runtime, as on drivers too old for DLSS 5 = `DLSS 5's create faulted inside NVIDIA's runtime ...`); `outofdate` forces the first answer, `fault` raises an access violation inside the guarded create; either way the render or session runs without DLSS 5 (offline `[dlss5] unavailable, skipping: ...`, live `live DLSS 5 skipped for this session: ...`); never a product setting |
 | `SMV_NO_STATIC_HOLD=1` | identical-pair passthrough off: a byte-identical pair is interpolated like any other (offline renders and the native hosts read it) |
+| `SMV_HUD_CAPTURE=1` | the Live HUD stays capturable, so a test can read it off the screen (a measurement aid) |
+| `SMV_LAT_TRACE=FILE` | Live writes its latency trace to FILE at the session's end: every served present, each frame statistics reading, every HUD refresh and the capture's stamps (a measurement aid) |
+| `SMV_LIVE_TEST=noframe` | Live's warm-up sees no frame (a test lever: the trigger of the no-frame exit) |
 | `SMV_NO_RESUME` | disable crash-resume |
 | `SMV_TRACE=1` | on-screen tracebacks instead of the one-line pointer |
 | `SMV_CU` | CUDA header / lib location for the live exe build |
@@ -2446,7 +2471,7 @@ Standard presets, applied by tools, so whoever edits (a person or an agent) neve
 by hand: run `npm run lint` after a change. One statement a line and every source under a formatter keep the
 code easy to search and to read in slices (for people and agents alike).
 * Prettier (package.json's `prettier`: Prettier's defaults plus single quotes and printWidth 120) formats
-  `src/**/*.ts`, `scripts/*.ts`, `renderer/app.ts` and the language files `renderer/i18n/*.json`;
+  `src/**/*.ts`, `scripts/*.ts`, `renderer/*.ts` and the language files `renderer/i18n/*.json`;
   `.prettierignore` guards `engine/`, build dirs, `renderer/app.js` (the build) and `renderer/index.html`
   (whitespace-sensitive markup, formatted by hand).
 * `tsc --noEmit` with `strict` on is the TypeScript bug gate. All three tsconfigs also refuse dead code:

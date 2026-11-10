@@ -16,5 +16,20 @@
     "erasableSyntaxOnly": true,
     "skipLibCheck": true
   },
-  "files": ["app.ts"]
+  "files": [
+    "app.ts",
+    "app-i18n.ts",
+    "app-video.ts",
+    "app-effects.ts",
+    "app-upscalers.ts",
+    "app-dlss5.ts",
+    "app-models.ts",
+    "app-live.ts",
+    "app-hdr-tools.ts",
+    "app-preview.ts",
+    "app-compare.ts",
+    "app-run.ts",
+    "app-update.ts",
+    "app-done.ts"
+  ]
 }

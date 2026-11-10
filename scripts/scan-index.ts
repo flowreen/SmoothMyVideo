@@ -1,7 +1,7 @@
-// Post-edit scan for the renderer (run after EVERY edit of renderer/index.html or renderer/app.ts, see the project
-// rules): builds app.js from app.ts first (scripts/build-renderer.ts), then duplicate element ids, dangling $('id')
-// references from either file, every <script src> resolving to a file, and node --check on the inline scripts and on
-// app.js. Exit 1 on any finding. Usage: node scripts/scan-index.ts
+// Post-edit scan for the renderer (run after EVERY edit of renderer/index.html or renderer/app*.ts, see the project
+// rules): builds app.js from app.ts and its parts first (scripts/build-renderer.ts), then duplicate element ids,
+// dangling $('id') references from the HTML or app.js, every <script src> resolving to a file, and node --check on
+// the inline scripts and on app.js. Exit 1 on any finding. Usage: node scripts/scan-index.ts
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';

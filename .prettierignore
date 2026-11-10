@@ -1,6 +1,6 @@
-# The "lint" script formats src/**/*.ts, scripts/*.ts, renderer/app.ts and renderer/i18n/*.json. Everything below is
+# The "lint" script formats src/**/*.ts, scripts/*.ts, renderer/*.ts and renderer/i18n/*.json. Everything below is
 # hand-formatted or generated and must never be reflowed by a stray `prettier .`: index.html's markup is whitespace
-# sensitive (a reflow can move inline text), app.js is the build of app.ts.
+# sensitive (a reflow can move inline text), app.js is the build of app.ts and its parts.
 node_modules
 dist
 release
