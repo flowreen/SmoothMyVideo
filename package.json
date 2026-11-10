@@ -8,7 +8,8 @@
     "node": ">=24"
   },
   "scripts": {
-    "start": "tsc && tsc -p renderer && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && electron .",
+    "build": "tsc && tsc -p renderer && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts",
+    "start": "npm run build && electron .",
     "setup": "node -e \"const fs=require('fs'); fs.rmSync('node_modules', { recursive: true, force: true }); fs.rmSync('package-lock.json', { force: true }); fs.rmSync('engine/bin', { recursive: true, force: true })\" && npm install && node scripts/fetch-ffmpeg.ts && node scripts/stage-gpu-runtime.ts && npm start",
     "dist": "node -e \"require('fs').rmSync('release', { recursive: true, force: true })\" && tsc && tsc -p renderer && node --disable-warning=ExperimentalWarning scripts/build-renderer.ts && node scripts/stage-gpu-runtime.ts --required && electron-builder && node scripts/pack-zip.ts",
     "lint": "prettier --write \"src/**/*.ts\" \"scripts/*.ts\" \"renderer/*.ts\" \"renderer/i18n/*.json\" && tsc --noEmit && tsc -p scripts && tsc -p renderer && node scripts/check-levers.ts && node scripts/clang-format.ts",

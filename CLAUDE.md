@@ -9,13 +9,14 @@ which rules a change must keep. These three are the only docs: add to them, neve
 
 | Command | What it does |
 |---|---|
-| `npm start` | `tsc`, the renderer's type check, the renderer build (`app.ts` and its parts -> `app.js`), then the app |
+| `npm run build` | `tsc`, the renderer's type check, the renderer build (`app.ts` and its parts -> `app.js`) |
+| `npm start` | `npm run build`, then the app |
 | `npm run lint` | prettier (writes) on `src/**/*.ts`, `scripts/*.ts`, `renderer/*.ts`, `renderer/i18n/*.json`; `tsc --noEmit`; `tsc -p scripts`; `tsc -p renderer`; the lever check; clang-format (writes) on every `engine/*/build_src` |
 | `node scripts/check-levers.ts` | every `SMV_*` environment lever a source reads has its row in DEVELOPMENT.md's "Environment variables", and no row names a lever that is gone |
 | `node scripts/scan-index.ts` | after ANY edit of `renderer/index.html` or `renderer/app*.ts`: builds `app.js`, checks duplicate ids and `$()` lookups |
 | `node scripts/build-renderer.ts --where N` | the part and line that line N of `renderer/app.js` comes from (an error's line number) |
 | `node scripts/cpp-check.ts analyze` (or `w4`) | static checks of the native host; needs what `build.bat` needs (Visual Studio, the SDK paths in DEVELOPMENT.md) |
-| `SmoothMyVideo.cmd` | the double-click entrance; sets a fresh folder up first |
+| `SmoothMyVideo.cmd` | the double-click entrance; sets a fresh folder up first, builds and starts the app hidden, shows a failed build's last lines |
 
 Never run unasked: `npm run setup` (it deletes `node_modules` and `engine/bin`), `npm run dist` (the release build),
 a version bump in `package.json`.

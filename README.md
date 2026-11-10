@@ -102,7 +102,8 @@ those yourself.
 
 **From source:** install [Node.js](https://nodejs.org) 24 or later, then double-click `SmoothMyVideo.cmd`. The first
 run sets the folder up by itself (the app's packages, ffmpeg and NVIDIA's CUDA runtime, under 1 GB) and starts the
-app; later runs start it at once. The `Smooth My Video` shortcut that appears beside it shows the app icon. See
+app; later runs start it at once. A start that cannot build the app opens a window that shows why. The
+`Smooth My Video` shortcut that appears beside it shows the app icon. See
 **[DEVELOPMENT.md](docs/DEVELOPMENT.md)** for the rest.
 
 ## Models

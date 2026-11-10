@@ -224,7 +224,11 @@ not a doc in this sense).
 
 Running the app needs Node 24 or later and nothing else: double-click `SmoothMyVideo.cmd`. It checks for Node, and
 when `node_modules`, `engine/bin` or `engine/gpu_runtime` is missing it runs the two steps below in its window, then
-starts the app hidden (`SMV_LAUNCH_DRY=1` does everything but the start). Its line ends stay CRLF in every checkout
+starts the app hidden: a second, hidden run of the file does `npm run build` and starts Electron
+(`SMV_LAUNCH_DRY=1` does everything but the start; `SMV_LAUNCH_ARGS` = extra arguments for the app, such as a test's
+`--user-data-dir`). A build that fails opens a window with the build's last lines; the whole text is
+`%TEMP%\smv-start.log`. The app's own exit code is never judged. A folder whose path holds `&` is refused with a
+message before anything runs: npm's command shims split such a path. Its line ends stay CRLF in every checkout
 (`.gitattributes`: cmd.exe can miss a label in a batch file with bare LF line ends).
 
 Weights ship in git. Fetched: `engine/bin` (ffmpeg, about 137 MB) and `engine/gpu_runtime` (the CUDA DLLs, about
@@ -251,7 +255,8 @@ matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across
 
 ## Scripts
 
-* `npm start`: `tsc`, the renderer's type check and build (`app.ts` and its parts -> `app.js`), then launch.
+* `npm run build`: `tsc`, the renderer's type check and build (`app.ts` and its parts -> `app.js`).
+* `npm start`: `npm run build`, then launch.
 * `npm run setup`: clean `node_modules` + `engine/bin`, `npm install`, fetch ffmpeg, stage
   `engine/gpu_runtime` (a failed download leaves a warning: run `node scripts/stage-gpu-runtime.ts` again), start. Never
   name a wrapper script `install` / `preinstall` / `postinstall` (npm lifecycle names; a script named

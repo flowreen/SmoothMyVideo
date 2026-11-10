@@ -1,11 +1,20 @@
 @echo off
 rem Double-click launcher for SmoothMyVideo from its source folder. A folder that is set up starts the app at once:
-rem PowerShell starts `npm start` (build, then the Electron app) hidden, so no console window stays open.
+rem a hidden second run of this file (:run) builds the app and starts it, so no console window stays open. A build
+rem that fails opens a window with its last lines (:startfailed) instead of nothing.
 rem A fresh download is set up first, in this window: the app's packages (npm install), ffmpeg and NVIDIA's CUDA
-rem runtime DLLs. It needs Node.js 24 or later and nothing else. SMV_LAUNCH_DRY=1 does everything but the start.
+rem runtime DLLs. It needs Node.js 24 or later and nothing else. SMV_LAUNCH_DRY=1 does everything but the start;
+rem SMV_LAUNCH_ARGS = extra arguments for the app (a test's own profile folder).
 setlocal
 cd /d "%~dp0"
 set "LAUNCH_DIR=%~dp0."
+set "LAUNCH_SELF=%~f0"
+set "START_LOG=%TEMP%\smv-start.log"
+if "%~1"==":run" goto run
+if "%~1"==":startfailed" goto startfailed
+
+rem npm's command shims split a path at an ampersand, so nothing can be built from such a folder.
+if not "%LAUNCH_DIR:&=%"=="%LAUNCH_DIR%" goto badpath
 
 where node >nul 2>nul
 if errorlevel 1 goto nonode
@@ -49,7 +58,48 @@ if not exist "engine\gpu_runtime\cudart64_13.dll" timeout /t 8 >nul
 :start
 if defined SMV_LAUNCH_DRY echo   SMV_LAUNCH_DRY: the app would start now.
 if defined SMV_LAUNCH_DRY goto end
-powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath cmd.exe -ArgumentList '/c npm start' -WorkingDirectory $env:LAUNCH_DIR -WindowStyle Hidden"
+powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath cmd.exe -ArgumentList '/c call \"%%LAUNCH_SELF%%\" :run' -WorkingDirectory $env:LAUNCH_DIR -WindowStyle Hidden"
+goto end
+
+rem The hidden half of a start: the build, then the app. Only the build's result is judged: a failed build opens the
+rem :startfailed window, the app's own exit code never does.
+:run
+call npm run build > "%START_LOG%" 2>&1
+if errorlevel 1 goto runfailed
+start "" "node_modules\electron\dist\electron.exe" . %SMV_LAUNCH_ARGS%
+goto end
+
+:runfailed
+start "Smooth My Video: start failed" cmd /c call "%LAUNCH_SELF%" :startfailed
+goto end
+
+:startfailed
+title Smooth My Video: start failed
+echo.
+echo   Smooth My Video did not start: building it from this folder failed.
+echo   The build's last lines:
+echo.
+powershell -NoProfile -Command "Get-Content -LiteralPath $env:START_LOG -Tail 25"
+echo.
+echo   The whole text: %START_LOG%
+echo   If a file in this folder was changed, undo the change or download the folder again.
+echo   The ready-made app needs no build:
+echo     https://github.com/flowreen/SmoothMyVideo/releases/latest
+echo.
+pause
+goto end
+
+:badpath
+echo.
+echo   Smooth My Video cannot run from this folder: its path holds the character ^&
+echo     "%LAUNCH_DIR%"
+echo   The tools that build the app cannot handle that character. Move or rename the folder
+echo   so that its path has no ^&, then double-click this file again.
+echo.
+echo   The ready-made app runs from any folder:
+echo     https://github.com/flowreen/SmoothMyVideo/releases/latest
+echo.
+pause
 goto end
 
 :nonode
