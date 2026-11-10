@@ -105,7 +105,7 @@ static bool g_dlssgWorkFloor = false;
 // chain, its pacer presents generated frames, needs RTX 40/50 + foreground). BK_IDENTITY =
 // no Streamline at all: captured frames are presented directly (the SL-free base of the
 // backend-agnostic server route). BK_SERVER = a model backend (rife, gmfss, nvof, fruc,
-// fsrfg, rifedrba, echo) run by the in-process native host (smv-live-native.inl); it returns N output
+// fsrfg, nvvfg, rifedrba, echo) run by the in-process native host (smv-live-native.inl); it returns N output
 // frames per input and this host paces their presentation across the measured capture
 // interval.
 enum Backend
@@ -812,8 +812,9 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 // ---- offline render through this host --------------------------------------------------------
 // smv-live.exe --offline --w W --h H --multi N [--frames T] [--pixfmt rgb48le|rgb24]
 //               [--script s] [--pause-file P]
-//               [--nvof | --no-interp | --gmfss | --drba | --fruc | --fsrfg | --xess-fg] [--cache DIR] (--no-interp =
-//               no model, --multi ignored; --xess-fg = Intel XeSS-FG on --fsrfg's route)
+//               [--nvof | --no-interp | --gmfss | --drba | --fruc | --fsrfg | --xess-fg | --nvvfg] [--cache DIR]
+//               (--no-interp = no model, --multi ignored; --xess-fg = Intel XeSS-FG on --fsrfg's route; --nvvfg =
+//               NVIDIA Video Frame Generation on --fruc's route)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
 //               (RIFE: the host finds or builds the engines itself, lkOfflineRife)
 //               the per-frame passes: [--out-w W --out-h H] [--restore | --restore-model FILE | --restore-anime4k]
@@ -1834,6 +1835,7 @@ struct OfflineArgs
     bool drba = false;                 // --drba: RIFE with DRBA timing (live's lag-1 windows, the offset grid)
     bool fruc = false;                 // --fruc: Nvidia Smooth Motion (live's nvoffruc bridge path, no engine)
     bool fsrfg = false;                // --fsrfg: AMD FSR frame generation (FRUC's route, our smv_fsrfg_bridge.dll)
+    bool vfg = false;                  // --nvvfg: NVIDIA Video Frame Generation (FRUC's route, NVIDIA's own runtime)
     double fpsRatio = 0.0; // --fps-ratio R: --fps mode, the render's ratio (round-trip text: the same double)
     bool dlssg = false;    // --dlssg: DLSS 4.5, the dlssg2f.exe --server child (DgChild), 2x..6x
     // resume: the render's mapping (src/render/resume.ts). The decoder already skipped
@@ -1918,6 +1920,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.fruc = true;
         else if (wcscmp(argv[i], L"--fsrfg") == 0)
             oa.fsrfg = true;
+        else if (wcscmp(argv[i], L"--nvvfg") == 0)
+            oa.vfg = true;
         else if (wcscmp(argv[i], L"--xess-fg") == 0)
         {
             oa.fsrfg = true;
@@ -2047,9 +2051,11 @@ static bool offlineArgsValid(const OfflineArgs& oa)
         LOG("offline: need --w --h (>= 16) and --multi 2 or more (or --no-interp or --fps-ratio)\n");
         return false;
     }
-    if ((int)oa.echo + (int)oa.nvof + (int)oa.gmfss + (int)oa.drba + (int)oa.fruc + (int)oa.fsrfg + (int)oa.dlssg > 1)
+    if ((int)oa.echo + (int)oa.nvof + (int)oa.gmfss + (int)oa.drba + (int)oa.fruc + (int)oa.fsrfg + (int)oa.vfg +
+            (int)oa.dlssg >
+        1)
     {
-        LOG("offline: --no-interp, --nvof, --gmfss, --drba, --fruc, --fsrfg and --dlssg exclude each other\n");
+        LOG("offline: --no-interp, --nvof, --gmfss, --drba, --fruc, --fsrfg, --nvvfg and --dlssg exclude each other\n");
         return false;
     }
     if (oa.fpsRatio != 0.0 && (oa.echo || oa.nvof || oa.dlssg || !(oa.fpsRatio > 0.0 && oa.fpsRatio <= 1000.0)))
@@ -2271,6 +2277,23 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             return 2;
         nr.fruc = true;
         nr.fsrfg = true;
+        nr.ph = h;
+        nr.pw = w;
+        nr.w = w;
+        nr.h = h;
+        nr.cw = w;
+        nr.ch = h;
+        nr.dw = w;
+        nr.dh = h;
+    }
+    else if (oa.vfg)
+    {
+        // NVIDIA Video Frame Generation: FRUC's route with NVIDIA's own runtime (NativeRife's vfg notes), unpadded:
+        // the effect takes the frames at their own size
+        if (!lkOfflineVfg(script, nr.frucDir))
+            return 2;
+        nr.fruc = true;
+        nr.vfg = true;
         nr.ph = h;
         nr.pw = w;
         nr.w = w;
@@ -2800,7 +2823,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                        : (nr.gmfss ? ", model gmfss"
                                    : (nr.drba ? ", model rife drba"
                                               : (nr.fruc ? (nr.fsrfg ? (nr.fgKind ? ", model xess fg" : ", model fsrfg")
-                                                                     : ", model fruc")
+                                                                     : (nr.vfg ? ", model nvidia vfg" : ", model fruc"))
                                                          : (oa.dlssg ? ", model dlss 4.5" : ""))))),
         nr.restore ? ", restore" : "",
         nr.vsr ? (nr.fsrUp   ? (nr.fuKind ? ", intel xess upscale" : ", amd fsr upscale")
@@ -4167,7 +4190,7 @@ int wmain(int argc, wchar_t** argv)
 
     // --hz: the exact refresh rate of every active display path, one "numerator denominator" line each
     // (QueryDisplayConfig's rational: 359.98 Hz where Electron's integer display.displayFrequency reads 360);
-    // main.ts matches the lines to a display by nearest integer for "Screen refresh rate"
+    // main-dialogs.ts matches the lines to a display by nearest integer for "Screen refresh rate"
     if (argc >= 2 && wcscmp(argv[1], L"--hz") == 0)
     {
         UINT32 nPath = 0, nMode = 0;
@@ -4187,13 +4210,13 @@ int wmain(int argc, wchar_t** argv)
         return 0;
     }
 
-    // --convert-restore-model IN.onnx OUT.pkl: AnimeJaNai's ONNX as the .pkl the app keeps (ajConvert); main.ts runs it
+    // --convert-restore-model IN.onnx OUT.pkl: AnimeJaNai's ONNX as the .pkl the app keeps (ajConvert); main-setup.ts runs it
     // after the download and once for an install that still holds the .onnx
     if (argc >= 4 && wcscmp(argv[1], L"--convert-restore-model") == 0)
         return ajConvert(wideToUtf8(argv[2]), argv[3]);
 
     // --peak-nits [X Y]: the peak (nits) of the monitor at screen point (X, Y), physical px (the primary monitor
-    // without a point) as Windows reports it, 0 when that monitor is not in HDR mode; main.ts passes it to a render
+    // without a point) as Windows reports it, 0 when that monitor is not in HDR mode; main-render.ts passes it to a render
     // as --hdr-nits
     if (argc >= 2 && wcscmp(argv[1], L"--peak-nits") == 0)
     {
@@ -4340,7 +4363,7 @@ static void resetSessionGlobals()
     g_staticHeld = 0;       // per session; g_staticHold is the process-wide env lever, kept
 }
 
-// argv[1] is --live / --hwnd / --fg, the rest are the session flags (main.ts builds them,
+// argv[1] is --live / --hwnd / --fg, the rest are the session flags (main-live.ts builds them,
 // the resident "start" command carries the same tokens). 0 = parsed, else the exit code.
 static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
 {
@@ -4565,7 +4588,7 @@ static int runLiveArgs(LiveArgs& la)
 //   stop                                                     end the running session (exit 0)
 //   quit                                                     release everything and exit
 // Every session prints "live session ended: exit N, host resident" when the process stays
-// (main.ts reads that line the way it read the exit code before); a session the host cannot
+// (main-live.ts reads that line the way it read the exit code before); a session the host cannot
 // stay after (an error exit, DLSS-G, native DLSS 5, the TrueHDR bridge, no engines kept)
 // exits the process with the session's code exactly as a non-resident run does. stdin EOF
 // (the app is gone) and the idle limit (SMV_LIVE_RESIDENT_IDLE_S, default 600) exit too.
@@ -4788,7 +4811,7 @@ static int residentMain(LiveArgs first)
             g_resident = true; // resetSessionGlobals does not touch it, the flag is process-wide
             if (prc)
             {
-                // main.ts treats this line as the session's end (no session ran)
+                // main-live.ts treats this line as the session's end (no session ran)
                 LOG("live session ended: exit %d, host resident (bad start command)\n", prc);
                 continue;
             }

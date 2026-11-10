@@ -5036,6 +5036,8 @@ static bool nativeLoadDlls(const std::wstring& scriptPath)
 
 #include "smv-live-native-fsrfg.inl"
 
+#include "smv-live-native-nvvfg.inl"
+
 #include "smv-live-native-fsrup.inl"
 
 #include "smv-live-native-anime4k.inl"

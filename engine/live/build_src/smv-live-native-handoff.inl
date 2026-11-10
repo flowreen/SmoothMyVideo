@@ -56,15 +56,16 @@ static bool fileExistsA(const std::string& p)
 }
 
 static bool lkXefgDir(const std::string& engDir, std::string& dir, const char* tag); // Intel XeSS-FG's folder, below
+static bool lkVfgDir(const std::string& engDir, std::string& dir, const char* tag);  // NVIDIA's Video Effects runtime
 
 // the server backends this host runs (PipeServer::nativeRefusal asks here): rife, echo (the
 // effects-only route, the no-engine mode above), gmfss (its chain on the host's kernels), nvof (the NVIDIA
-// Optical Flow model), fruc (Nvidia Smooth Motion), fsrfg (AMD FSR frame generation; Intel XeSS-FG with --xess-fg)
-// and rifedrba (RIFE with DRBA timing). Any other name is refused.
+// Optical Flow model), fruc (Nvidia Smooth Motion), fsrfg (AMD FSR frame generation; Intel XeSS-FG with --xess-fg),
+// nvvfg (NVIDIA Video Frame Generation) and rifedrba (RIFE with DRBA timing). Any other name is refused.
 static bool nativeBackendOk(const std::wstring& backend)
 {
     return backend == L"rife" || backend == L"echo" || backend == L"gmfss" || backend == L"nvof" ||
-           backend == L"fruc" || backend == L"fsrfg" || backend == L"rifedrba";
+           backend == L"fruc" || backend == L"fsrfg" || backend == L"nvvfg" || backend == L"rifedrba";
 }
 
 // the smallest GMFSS pad a side (lkSession): gmflow's quarter-scale windows are the pad / 64 a side and its shifted
@@ -380,7 +381,8 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
     if (!lkSession(script, backendW, capW, capH, s))
         return false;
     const std::string& backend = s.backend;
-    const bool geoOnly = backend == "nvof" || backend == "fruc" || backend == "fsrfg"; // no engine: geometry only
+    // no engine: geometry only
+    const bool geoOnly = backend == "nvof" || backend == "fruc" || backend == "fsrfg" || backend == "nvvfg";
     if (!geoOnly && backend != "rife" && backend != "echo" && backend != "gmfss" && backend != "rifedrba")
         return false;
     const std::string& engDir = s.engDir;
@@ -459,6 +461,18 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
             }
             lines.push_back("NATIVE-PATH cache=" + cacheDir);
             lines.push_back("NATIVE-PATH fsrfg=" + gdir);
+            lines.push_back("LIVE READY native=1 " + geo(gh, gw, gw, gh, dw, dh, x0, y0) + tail);
+            return true;
+        }
+        if (backend == "nvvfg")
+        {
+            // NVIDIA Video Frame Generation: the folder of NVIDIA's Video Effects runtime (lkVfgDir), no /64 pad (the
+            // effect takes the frame at its own size)
+            std::string vdir;
+            if (!lkVfgDir(engDir, vdir, "native"))
+                return false;
+            lines.push_back("NATIVE-PATH cache=" + cacheDir);
+            lines.push_back("NATIVE-PATH nvvfg=" + vdir);
             lines.push_back("LIVE READY native=1 " + geo(gh, gw, gw, gh, dw, dh, x0, y0) + tail);
             return true;
         }

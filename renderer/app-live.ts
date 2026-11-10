@@ -36,6 +36,9 @@ function liveModelInfo() {
   if (modelIsFsrfg()) return { model: 'fsrfg', name: 'AMD FSR 4', note: '' };
   // Intel XeSS-FG live: AMD FSR frame generation's route with its own bridge (main passes --backend fsrfg --xess-fg)
   if (modelIsXefg()) return { model: 'xefg', name: 'Intel XeSS-FG', note: '' };
+  // NVIDIA Video Frame Generation live: Smooth Motion's route with NVIDIA's own runtime; it makes a frame at any time
+  // between a pair, so the nvvfg backend is adaptive like rife; its frames go through the model at 8-bit precision
+  if (modelIsVfg()) return { model: 'nvvfg', name: 'NVIDIA Video Frame Generation', note: 'tweens at 8-bit precision' };
   // NVIDIA Optical Flow: adaptive like rife (the splat takes any fraction), native only
   if (modelIsNvof()) return { model: 'nvof', name: 'NVIDIA Optical Flow', note: '' };
   // nothing ticked = interpolation off (same meaning as file renders): the echo backend passes
@@ -156,7 +159,7 @@ function lvTargetUi(mi = liveModelInfo()) {
         ? tr('lv.load.drba')
         : mi.model === 'gmfss'
           ? tr('lv.load.gmfss')
-          : mi.model === 'nvof' || mi.model === 'fsrfg' || mi.model === 'xefg'
+          : mi.model === 'nvof' || mi.model === 'fsrfg' || mi.model === 'xefg' || mi.model === 'nvvfg'
             ? tr('lv.load.fast')
             : '';
   // A fixed model cannot hit an arbitrary target exactly: it picks the first whole multiple

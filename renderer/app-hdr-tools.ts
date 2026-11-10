@@ -110,6 +110,20 @@ $('xefgdl').onclick = toolDownloader('xefg', 'xess-download', async () => {
     $('xefgstatus').style.color = 'var(--green)';
   }
 });
+// NVIDIA Video Frame Generation's row downloads NVIDIA's pinned package; once its runtime is in, a render uses it
+$('nvvfgdl').onclick = toolDownloader('nvvfg', 'nvvfg-download', async () => {
+  await refreshVfgState();
+  syncModel();
+  syncCompareUi();
+  try {
+    lvModelUi();
+    lvSendOpts();
+  } catch {}
+  if (vfgReady) {
+    $('nvvfgstatus').textContent = tr('setup.ready');
+    $('nvvfgstatus').style.color = 'var(--green)';
+  }
+});
 syncXess();
 i18nRelabel.push(syncXess);
 if (localStorage.getItem('dvOn') === '1') $('dvexport').checked = true; // default OFF

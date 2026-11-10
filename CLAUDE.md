@@ -60,6 +60,7 @@ table is the include order, which is the source order and matters: a later part 
 | `nvof` | the nvof model (NVIDIA Optical Flow) |
 | `fruc` | Smooth Motion (FRUC): its bridge, workers and tween tree |
 | `fsrfg` | AMD FSR 4 / Intel XeSS frame generation |
+| `nvvfg` | NVIDIA Video Frame Generation: NVIDIA's Video Effects runtime on Smooth Motion's route |
 | `fsrup` | AMD FSR 4 / Intel XeSS-SR upscaling |
 | `anime4k`, `artcnn`, `anime4k-restore` | Anime4K: weight tables, kernel-text builder, upscale passes; ArtCNN (`kAcnA`); Anime4K's Restore pass |
 | `model-setup` | DRBA's buffers, the early CUDA init, the HDR config, Restore's own nets (`restNatSetup`) |
@@ -95,7 +96,7 @@ loading is not set yet.
 | `main-window.ts` | the window: its saved size, its creation |
 | `main-update.ts` | the update check and the automatic update |
 | `main-dialogs.ts` | the file dialogs, the source probe, the display's refresh rate, peak brightness and size |
-| `main-setup.ts` | readiness and one-click installs: RTX Video, Smooth Motion, DLSS 4.5 support, DLSS 5, AnimeJaNai, the Dolby Vision and HDR10+ tools, Intel XeSS |
+| `main-setup.ts` | readiness and one-click installs: RTX Video, NVIDIA Video Frame Generation, Smooth Motion, DLSS 4.5 support, DLSS 5, AnimeJaNai, the Dolby Vision and HDR10+ tools, Intel XeSS |
 | `main-live.ts` | Live mode: the host process and its spare, settings in place, the hotkey, the FSR 4 warm-up |
 | `main-render.ts` | a file render: the progress thumbnail, pause and resume, the engine's arguments and output, cancel, the resume check |
 | `main-preview.ts` | the before / after preview, Compare's Save image and Save clip |

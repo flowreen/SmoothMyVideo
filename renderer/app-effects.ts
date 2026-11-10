@@ -372,6 +372,13 @@ if (savedUpres === '540' || savedUpres === '480') {
   localStorage.setItem('upres', savedUpres);
 }
 if (savedUpres && [...$('upres').options].some((o) => o.value === savedUpres)) $('upres').value = savedUpres;
+// No saved pick: 2160p (4K) is the default Size for a video below 4K; a video that is already 4K or larger keeps its own
+// size, so the default never shrinks a picture. A pick made in the list is saved and stands for every video.
+function upDefaultSize() {
+  if (localStorage.getItem('upres') !== null) return;
+  $('upres').value = info && (info.h >= 2160 || info.w >= 3840) ? '0' : '2160';
+}
+upDefaultSize();
 const savedUpcustom = localStorage.getItem('upcustom');
 if (savedUpcustom) $('upcustom').value = savedUpcustom;
 $('upres').onchange = () => {

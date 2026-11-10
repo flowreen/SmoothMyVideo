@@ -12,6 +12,7 @@ const CMP_NAMES = {
   dlssg: 'NVIDIA DLSS 4.5',
   fsrfg: 'AMD FSR 4',
   xefg: 'Intel XeSS-FG',
+  nvvfg: 'NVIDIA Video Frame Generation',
   fruc: 'NVIDIA Smooth Motion',
 };
 const CMP_ZOOMS = [0, 1, 2, 4]; // 0 = fit, else pixels per image pixel
@@ -47,7 +48,8 @@ function syncCompareUi() {
         o.value === fam(a) ||
         (o.value === 'dlssg' && !dlssReady) ||
         (o.value === 'fruc' && !frucReady) ||
-        (o.value === 'xefg' && !xefgReady);
+        (o.value === 'xefg' && !xefgReady) ||
+        (o.value === 'nvvfg' && !vfgReady);
   // nothing ticked = nothing to compare; A moved onto B (or B's runtime is missing) = GMFSS, or RIFE when A is GMFSS
   if (!a) sel.value = '';
   else if (sel.value && sel.selectedOptions[0].disabled) sel.value = fam(a) === 'gmfss' ? 'rife' : 'gmfss';

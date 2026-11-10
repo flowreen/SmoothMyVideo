@@ -166,6 +166,10 @@ third-party work.
 * **NVIDIA RTX Video feature models** (`nvngx_vsr.dll`, `nvngx_truehdr.dll`; NVIDIA Software License Agreement):
   downloaded on the user's click in the app's RTX Video setup row (NVIDIA's pinned `nvidia-vfx` 0.2.0.0 package
   from NVIDIA's package index pypi.nvidia.com, its SHA256 checked) and installed unmodified into `engine/rtxvideo`.
+* **NVIDIA Video Frame Generation runtime** (`NVVideoEffects.dll`, `NVCVImage.dll`, `nvVFXVideoFrameGeneration.dll`,
+  `cudart64_12.dll`; NVIDIA Software License Agreement, the model under the NVIDIA Open Model License): downloaded
+  on the user's click in the app's NVIDIA Video Frame Generation setup row (the same pinned `nvidia-vfx` package)
+  and installed unmodified into `engine/nvvfx`.
 
 Dolby and Dolby Vision are trademarks of Dolby Laboratories. HDR10+ is a trademark of HDR10+
 Technologies, LLC. This project is not affiliated with, endorsed by, or certified by either.

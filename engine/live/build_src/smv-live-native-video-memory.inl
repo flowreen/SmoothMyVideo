@@ -82,7 +82,11 @@ static uint64_t nativeVideoMemoryRoom()
 // 249 + 353),
 // plus, while the bridge gives every instance its own vkd3d device (fsrfg_devices), 300 MiB an instance past the first
 // (x4 parked, shared vs own devices: +243 / +49 MiB at 854x480 / 1708x960, x8 at 1280x720 +471 for two: the largest,
-// flat, a quarter on top); the other routes add nothing the reserve does not cover. The x8 /
+// flat, a quarter on top); NVIDIA Video Frame Generation, whose model builds its working memory at its first frames
+// and not at its load: 770 / 938 / 1047 / 1194 / 1516 MiB at 854x480 / 1280x720 / 1920x1080 / 2560x1440 / 3840x2160
+// (the larger of two sessions a size, the same at x2 and x4: nothing grows with the multiple), a quarter on top, as a
+// line by the megapixel of the model frame that covers every size, 1095 + 108; the other routes add nothing the
+// reserve does not cover. The x8 /
 // x16 / x32 ladders' third, fourth and fifth tree levels (an instance and twice the node frames a level) come on top
 // when the session's slots reach them (FRUC: the whole GPU's rise over x4 at five sizes, 854x480 to 3840x2160 with the
 // fit off, a quarter on top, less the ring's slots past x32's and the pipelined second tree priced below, as a line by
@@ -97,6 +101,7 @@ static uint64_t nativeVideoMemoryRoom()
 // and rule from its own rows (3840x2160 to x64, 2560x1440 to x128, with the fit off): 362 + 103, 362 + 511, 362 + 928,
 // 362 + 1506, 362 + 2589, 596 + 4063, x512 1275 + 7011 a megapixel.
 constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 290.0, kFrucLateMp = 173.0;
+constexpr double kVfgLateBase = 1095.0, kVfgLateMp = 108.0;
 constexpr double kFsrfgLateBase = 1251.0, kFsrfgLateMp = 88.0, kFsrfgLateDerBase = 1249.0, kFsrfgLateDerMp = 0.0,
                  kFsrfgOwnDevice = 300.0;
 constexpr double kXefgLateBase = 249.0, kXefgLateMp = 353.0, kXefgLateDerBase = 247.0, kXefgLateDerMp = 265.0;
@@ -138,7 +143,9 @@ static uint64_t nativeLiveLateNeed(const NativeRife& nr, uint32_t slots)
     {
         const double mp = (double)nr.pw * nr.ph / 1e6;
         const bool xe = nr.fsrfg && nr.fgKind == 1;
-        if (!nr.fsrfg)
+        if (nr.vfg)
+            need += kVfgLateBase + kVfgLateMp * mp;
+        else if (!nr.fsrfg)
             need += kFrucLateBase + kFrucLateMp * mp;
         else if (fsrfgDeriveOn(nr))
             need += xe ? kXefgLateDerBase + kXefgLateDerMp * mp : kFsrfgLateDerBase + kFsrfgLateDerMp * mp;

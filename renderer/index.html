@@ -362,6 +362,14 @@
     </div>
     <div class="row">
       <span class="k"></span>
+      <label class="hint" id="modelnvvfglabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="nvvfg.tip">
+        <input type="checkbox" id="modelnvvfg"
+               style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
+        <span style="white-space:nowrap;" data-i18n="nvvfg.name"></span> <span class="hint" data-i18n="nvvfg.hint"></span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="k"></span>
       <label class="hint" id="modelfruclabel" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;" data-i18n-title="fruc.tip">
         <input type="checkbox" id="modelfruc"
                style="width:auto;padding:0;margin-top:2px;accent-color:var(--green);">
@@ -387,6 +395,15 @@
       <div class="hint" id="xefgsteps" style="line-height:1.6;margin-bottom:8px"></div>
       <div class="row" id="xefgbtns" style="flex-wrap:wrap;gap:6px">
         <button id="xefgdl" class="mini" data-i18n="xess.dl"></button>
+      </div>
+    </div>
+    <div id="nvvfgsetup" style="display:none;background:#101010;border-radius:6px;padding:10px 12px;margin-top:6px;">
+      <div class="row" style="margin:0 0 6px">
+        <span id="nvvfgstatus" class="v"></span>
+      </div>
+      <div class="hint" id="nvvfgsteps" style="line-height:1.6;margin-bottom:8px"></div>
+      <div class="row" id="nvvfgbtns" style="flex-wrap:wrap;gap:6px">
+        <button id="nvvfgdl" class="mini" data-i18n="nvvfg.dl"></button>
       </div>
     </div>
     <div class="row">
@@ -723,6 +740,7 @@
         <option value="dlssg" data-i18n="cmp.dlssg"></option>
         <option value="fsrfg" data-i18n="cmp.fsrfg"></option>
         <option value="xefg" data-i18n="cmp.xefg"></option>
+        <option value="nvvfg" data-i18n="cmp.nvvfg"></option>
         <option value="fruc" data-i18n="cmp.fruc"></option>
       </select>
       <span class="hint" data-i18n="cmp.hint"></span>

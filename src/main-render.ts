@@ -161,6 +161,7 @@ function engineArgs(opts: RunOpts): string[] {
     if (opts.model === 'fruc') args.push('--fruc'); // "NVIDIA Smooth Motion" backend instead of GMFSS
     if (opts.model === 'fsrfg') args.push('--fsrfg'); // AMD FSR frame generation (our bundled bridge)
     if (opts.model === 'xefg') args.push('--xess-fg'); // Intel XeSS-FG (our bridge + Intel's downloaded DLLs)
+    if (opts.model === 'nvvfg') args.push('--nvvfg'); // NVIDIA Video Frame Generation (NVIDIA's downloaded runtime)
     if (opts.model === 'nvof') args.push('--nvof'); // NVIDIA Optical Flow: hardware flow + splat, native host only
     if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
   }

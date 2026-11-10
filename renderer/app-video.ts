@@ -93,7 +93,16 @@ function fmtBytes(b) {
 // the Speed controls. Ids are inlined rather than using MODEL_BOXES() so this stays callable before
 // that const is initialised.
 function interpOn() {
-  return ['modelgmfss', 'modelrife', 'modeldlss', 'modelfruc', 'modelfsrfg', 'modelxefg', 'modelnvof'].some((id) => {
+  return [
+    'modelgmfss',
+    'modelrife',
+    'modeldlss',
+    'modelfruc',
+    'modelfsrfg',
+    'modelxefg',
+    'modelnvvfg',
+    'modelnvof',
+  ].some((id) => {
     const e = $(id);
     return !!e && e.checked;
   });
@@ -481,6 +490,7 @@ async function loadVideo(f) {
   $('live').style.display = 'none'; // stale live thumbnail belongs to the previous video
   setStatus('run.status.ready');
   applyScreenFps(); // re-asserts the interp / screen-rate state and recomputes the output name
+  upDefaultSize(); // with no saved pick, the default Size depends on this video's resolution
   syncUpscale(); // recompute the upscale target + output dims for this video's resolution
   // The preview starts the native host and a CUDA context, a GPU load that can stall Chromium's
   // compositor - so if it spawns before the

@@ -97,6 +97,7 @@ download that one yourself.
 |---|---|---|
 | RTX Video Super Resolution, RTX HDR | NVIDIA's RTX Video runtime | One click: **Download RTX Video** (NVIDIA's own package from NVIDIA's server, about 416 MB, checked and installed). Without it, upscaling uses a standard resize and RTX HDR is off. |
 | NVIDIA DLSS 5 | The Neural Rendering runtime (`nvngx_dlssnr.dll`) | One click: **Download the DLSS 5 runtime** ([details](#nvidia-dlss-5)). |
+| NVIDIA Video Frame Generation | NVIDIA's Video Frame Generation runtime | One click: **Download Video Frame Generation** (the same NVIDIA package as RTX Video, about 416 MB, checked and installed). Needs an RTX 40 or 50. |
 | NVIDIA Smooth Motion | `NvOFFRUC.dll` from NVIDIA's Optical Flow SDK | **Get from NVIDIA** (free developer login), then **Choose .zip&hellip;**. GMFSS is used until it is installed. |
 | Dolby Vision, HDR10+ | The open-source [dovi_tool](https://github.com/quietvoid/dovi_tool) / [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool) | One click: **Download dovi_tool** / **Download hdr10plus_tool** (a fixed release, checked and installed). |
 
@@ -120,6 +121,7 @@ picture, without adding frames. Hover a row in the app to see its exact version.
 | **NVIDIA Optical Flow** | Slower PCs, fast renders, moderate motion | Any RTX GPU | Runs on a dedicated part of the GPU, so it is fast. Very fast motion turns into a soft double image instead of breaking up. Videos need a whole multiplier (2&times;, 3&times; ...). |
 | **AMD FSR 4** frame generation | A different AI look | Any RTX GPU | AMD's AI frame generation, running on NVIDIA GPUs. Fine edges can break up on fast anime motion, where GMFSS stays clean. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
 | **Intel XeSS-FG** frame generation | Filmed content, a different AI look | Any RTX GPU (Intel's files are downloaded on request) | Intel's AI frame generation from games, running on NVIDIA GPUs. In SMV's test on real footage its new frames came out as close to the real ones as RIFE's, closer than AMD FSR 4's and DLSS 4.5's. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
+| **NVIDIA Video Frame Generation** | Any target frame rate on RTX 40 and 50 | RTX 40 or 50 (NVIDIA's files are downloaded on request) | NVIDIA's AI frame generation made for video rather than games. It makes a new frame at any point between two frames, so any target frame rate works. HDR video goes through it at 8-bit precision. |
 | **NVIDIA Smooth Motion** | Legacy: a non-AI reference | Any RTX GPU | The same technology as the NVIDIA driver's Smooth Motion. The lowest quality of the models. Each pass doubles the frame rate (2&times;, 4&times;, 8&times; ...). |
 
 **Compare to**, in the preview, puts the model you ticked next to another one on the same moment of your video: the

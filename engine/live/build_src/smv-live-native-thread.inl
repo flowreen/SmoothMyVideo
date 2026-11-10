@@ -749,8 +749,12 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
     LOG("native host ready: model %dx%d padded %dx%d, out %dx%d at (%d,%d), batch max %d%s%s%s%s%s%s%s%s%s%s%s\n", nr.w,
         nr.h, nr.pw, nr.ph, nr.dw, nr.dh, nr.x0, nr.y0, nr.batchMax, nr.noEngine ? ", engine=none (effects only)" : "",
         nr.gmfss ? ", engine=gmfss" : "", nr.nvof ? ", engine=nvof" : "",
-        nr.fruc ? (nr.fsrfg ? ", engine=fsrfg" : ", engine=fruc") : "", nr.drba ? ", engine=drba (lag 1)" : "",
-        nr.rtxHdr ? ", rtxhdr=native" : "", nr.sharpen > 0.0f ? ", sharpen=native" : "",
+        nr.fruc ? (nr.fsrfg ? ", engine=fsrfg"
+                   : nr.vfg ? ", engine=nvvfg"
+                            : ", engine=fruc")
+                : "",
+        nr.drba ? ", engine=drba (lag 1)" : "", nr.rtxHdr ? ", rtxhdr=native" : "",
+        nr.sharpen > 0.0f ? ", sharpen=native" : "",
         nr.vsr ? (nr.fsrUp   ? (nr.fuKind ? ", xessup=native" : ", fsrup=native")
                   : nr.a4kUp ? ", anime4k=native"
                   : nr.acnUp ? ", artcnn=native"

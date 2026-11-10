@@ -374,13 +374,14 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     FRUC_MODE = args.fruc,
     FSRFG_MODE = args.fsrfg,
     XEFG_MODE = args.xess_fg,
+    VFG_MODE = args.nvvfg,
     DLSSG_MODE = args.dlssg;
   const RIFE_MODE = args.rife || args.rife_drba,
     DRBA_MODE = args.rife_drba;
   const NVOF_MODE = args.nvof;
-  if ([FRUC_MODE, FSRFG_MODE, XEFG_MODE, DLSSG_MODE, RIFE_MODE, NVOF_MODE].filter(Boolean).length > 1) {
+  if ([FRUC_MODE, FSRFG_MODE, XEFG_MODE, VFG_MODE, DLSSG_MODE, RIFE_MODE, NVOF_MODE].filter(Boolean).length > 1) {
     throw new RenderExit(
-      '--fruc, --fsrfg, --xess-fg, --dlssg, --rife/--rife-drba and --nvof are ' +
+      '--fruc, --fsrfg, --xess-fg, --nvvfg, --dlssg, --rife/--rife-drba and --nvof are ' +
         'mutually exclusive interpolation backends; pick one',
     );
   }
@@ -523,9 +524,11 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
               ? 'fsrfg'
               : XEFG_MODE
                 ? 'xefg'
-                : DLSSG_MODE
-                  ? 'dlssg'
-                  : 'rife';
+                : VFG_MODE
+                  ? 'nvvfg'
+                  : DLSSG_MODE
+                    ? 'dlssg'
+                    : 'rife';
   // W x H = the decode, WORK = the DLSS mode x the output (DLSS 5 and the model)
   const plan = workPlan(ST, W, H, UPSCALE_F, args.work_scale, !!args.dlssnr, kind === 'dlssg');
   if (typeof plan === 'string') throw new RenderExit(plan);
@@ -561,6 +564,16 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       throw new RenderExit(
         `Intel XeSS frame generation unavailable: ${miss[0]} not found in ${xdir} ` +
           "(the app's Intel XeSS setup installs Intel's files)",
+      );
+  } else if (kind === 'nvvfg') {
+    const vdir = env.SMV_NVVFX_DIR || path.join(ENGINE, 'nvvfx');
+    const miss = ['NVVideoEffects.dll', 'NVCVImage.dll', 'nvVFXVideoFrameGeneration.dll', 'cudart64_12.dll'].filter(
+      (d) => !isFile(path.join(vdir, d)),
+    );
+    if (miss.length)
+      throw new RenderExit(
+        `NVIDIA Video Frame Generation unavailable: ${miss[0]} not found in ${vdir} ` +
+          "(the four files of NVIDIA's Video Effects runtime; it needs an RTX 40 or 50 GPU)",
       );
   } else if (kind === 'dlssg') {
     const dgdir = env.SMV_DLSSG_DIR || path.join(ENGINE, 'dlssg');
@@ -608,6 +621,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   else if (FRUC_MODE) say('Using the NVIDIA Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n');
   else if (FSRFG_MODE) say('Using the AMD FSR frame generation backend for interpolation (FSR 4, native host)\n');
   else if (XEFG_MODE) say('Using the Intel XeSS frame generation backend for interpolation (XeSS-FG, native host)\n');
+  else if (VFG_MODE) say('Using the NVIDIA Video Frame Generation backend for interpolation (native host)\n');
   else if (DLSSG_MODE) say('Using the DLSS Frame Generation backend for interpolation (DLSS 4.5)\n');
   else if (NVOF_MODE) say('Using the NVIDIA Optical Flow backend for interpolation (native host)\n');
   else if (RIFE_MODE) say('Using the RIFE backend for interpolation (4.25, native host)\n');
@@ -893,6 +907,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (kind === 'fruc') nargs.push('--fruc');
   if (kind === 'fsrfg') nargs.push('--fsrfg');
   if (kind === 'xefg') nargs.push('--xess-fg');
+  if (kind === 'nvvfg') nargs.push('--nvvfg');
   if (kind === 'dlssg') nargs.push('--dlssg');
   if (FPS_MODE && !NO_INTERP) nargs.push('--fps-ratio', pyFloatRepr(ratio as number));
   // a cascade's first pass ends at the working size: its last pass makes the final resize, and RTX VSR / the FSR

@@ -15,6 +15,7 @@ export interface RenderArgs {
   fruc: boolean;
   fsrfg: boolean;
   xess_fg: boolean; // --xess-fg: Intel XeSS-FG (AMD FSR frame generation's route, Intel's DLLs in engine/xess)
+  nvvfg: boolean; // --nvvfg: NVIDIA Video Frame Generation (Smooth Motion's route, NVIDIA's runtime in engine/nvvfx)
   dlssg: boolean;
   nvof: boolean;
   no_interp: boolean;
@@ -180,6 +181,7 @@ export function isGmfss(args: RenderArgs): boolean {
     args.fruc ||
     args.fsrfg ||
     args.xess_fg ||
+    args.nvvfg ||
     args.dlssg ||
     args.nvof ||
     args.no_interp

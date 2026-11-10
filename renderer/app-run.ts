@@ -208,7 +208,8 @@ function startRun() {
   if (interpOn() && !gm) payload.fps = t; // resample only: non-integer-multiple target
   // rifedrba = RIFE with the DRBA sub-option on, rife = plain RIFE (bundled, always ready), dlssg = "DLSS 4.5" (Frame
   // Generation), fruc = "NVIDIA Smooth Motion" (NvOFFRUC), nvof = NVIDIA Optical Flow (engine --nvof), fsrfg = AMD FSR
-  // frame generation (engine --fsrfg), xefg = Intel XeSS-FG (engine --xess-fg); none = GMFSS
+  // frame generation (engine --fsrfg), xefg = Intel XeSS-FG (engine --xess-fg), nvvfg = NVIDIA Video Frame Generation
+  // (engine --nvvfg); none = GMFSS
   const model = renderModel();
   if (model) payload.model = model;
   payload.sharpen = sharpenStrength; // 0 = engine leaves frames untouched

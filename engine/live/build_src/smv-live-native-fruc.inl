@@ -5,6 +5,11 @@ static bool nativeFsrfgSetup(NativeRife& nr);
 static bool nativeFsrfgPair(NativeRife& nr, const float* dCur, uint32_t nTween);
 static bool nativeFsrfgTween(NativeRife& nr, double t);
 static void nativeFsrfgRelease(NativeRife& nr);
+// NVIDIA Video Frame Generation (vfg) runs on the FRUC route too, with NVIDIA's own runtime: FRUC's surfaces and packs
+// feed it, these three take over the bridge's setup, tween and release when nr.vfg (defined after nativeFsrfgRelease)
+static bool nativeVfgSetup(NativeRife& nr);
+static bool nativeVfgTween(NativeRife& nr, double t);
+static void nativeVfgRelease(NativeRife& nr);
 
 // NVIDIA Smooth Motion (fruc): the shipped nvoffruc_bridge.dll,
 // loaded once per process by full path from the folder the handoff named (NvOFFRUC.dll and its
@@ -172,18 +177,26 @@ static bool nativeFrucSetup(NativeRife& nr)
 {
     if (nr.fsrfg)
         return nativeFsrfgSetup(nr);
-    if (!nativeFrucLoad(nr.frucDir))
-        return false;
-    const int rc = g_fruc.create((unsigned)nr.pw, (unsigned)nr.ph);
-    // the bridge points the DLL search at its folder while it loads NvOFFRUC.dll (its
-    // secure_load); give the process its default search back
-    SetDllDirectoryW(nullptr);
-    if (rc != 0)
+    if (nr.vfg)
     {
-        LOG("native: fruc: nvoffruc_create %dx%d failed: %s (rc %d)\n", nr.pw, nr.ph, g_fruc.lastError(), rc);
-        return false;
+        if (!nativeVfgSetup(nr))
+            return false;
     }
-    nr.frCreated = true;
+    else
+    {
+        if (!nativeFrucLoad(nr.frucDir))
+            return false;
+        const int rc = g_fruc.create((unsigned)nr.pw, (unsigned)nr.ph);
+        // the bridge points the DLL search at its folder while it loads NvOFFRUC.dll (its
+        // secure_load); give the process its default search back
+        SetDllDirectoryW(nullptr);
+        if (rc != 0)
+        {
+            LOG("native: fruc: nvoffruc_create %dx%d failed: %s (rc %d)\n", nr.pw, nr.ph, g_fruc.lastError(), rc);
+            return false;
+        }
+        nr.frCreated = true;
+    }
     const size_t bytes = (size_t)nr.pw * nr.ph * 4, plane = (size_t)nr.ph * nr.pw;
     for (auto& s : nr.dFrSurf)
         NCHK(cudaMalloc((void**)&s, bytes), "alloc fruc surface");
@@ -191,7 +204,9 @@ static bool nativeFrucSetup(NativeRife& nr)
     NCHK(cudaMalloc((void**)&nr.dFrOut, 3 * plane * sizeof(float)), "alloc fruc tween");
     {
         char ev[8] = {};
-        nr.frSdrOn = nr.encPost && !(GetEnvironmentVariableA("SMV_FRUC_SDR_PAIRS", ev, sizeof(ev)) > 0 && ev[0] == '0');
+        // (the SDR view's kernels write B G R A: a vfg session sends every pair as the codes)
+        nr.frSdrOn = !nr.vfg && nr.encPost &&
+                     !(GetEnvironmentVariableA("SMV_FRUC_SDR_PAIRS", ev, sizeof(ev)) > 0 && ev[0] == '0');
     }
     if (nr.frSdrOn)
     {
@@ -220,7 +235,7 @@ static bool nativeFrucSetup(NativeRife& nr)
     // are created by the first pair that needs them (nativeFrucGrow)
     nr.frMp = false;
     nr.frInstMax = 1;
-    if (g_fruc.stepI)
+    if (!nr.vfg && g_fruc.stepI)
     {
         char ev[8] = {};
         nr.frMp = !(GetEnvironmentVariableA("SMV_FRUC_MIDPOINTS", ev, sizeof(ev)) > 0 && ev[0] == '0');
@@ -263,13 +278,16 @@ static bool nativeFrucSetup(NativeRife& nr)
     nr.gFgOfUs.store(0);
     nr.gFgL1Us.store(0);
     g_frInUseLogged = false;
-    if (nr.frMp)
+    // (a vfg session is named by nativeVfgSetup)
+    if (!nr.vfg && nr.frMp)
         LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA, feed-once, recursive midpoints (depth cap %d)\n",
             nr.pw, nr.ph, nr.w, nr.h, nr.frMpCap);
-    else
+    else if (!nr.vfg)
         LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA%s, up to %d instance%s\n",
             nr.pw, nr.ph, nr.w, nr.h, g_fruc.step ? ", feed-once" : "", nr.frInstMax, nr.frInstMax > 1 ? "s" : "");
-    if (nr.encPost)
+    if (nr.encPost && nr.vfg)
+        LOG("native: vfg: HDR planes: every pair as the 8-bit HDR codes\n");
+    else if (nr.encPost)
         LOG("native: fruc: HDR planes: %s\n",
             nr.frSdrOn
                 ? "frame pairs inside the SDR range go to FRUC as their SDR view, any other pair as the 8-bit HDR codes"
@@ -446,7 +464,8 @@ static bool nativeFrucPack(NativeRife& nr, const float* src, int n, bool sdr)
     int ps = nr.ph * nr.pw, f32 = 0;
     void* a[] = {(void*)&src, &f32, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.dFrSurf[n]};
     void* b[] = {(void*)&src, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &nr.dFrSurf[n]};
-    const CUfunction f = sdr ? nr.fPackBgraSdr : nr.fPackBgraRgb;
+    // NVIDIA Video Frame Generation reads its surfaces as R G B A bytes (k_packBgra's order), whatever their descriptor says
+    const CUfunction f = sdr ? nr.fPackBgraSdr : (nr.vfg ? nr.fPackBgra : nr.fPackBgraRgb);
     if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, sdr ? b : a,
                        nullptr) != CUDA_SUCCESS)
     {
@@ -522,6 +541,12 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
         ok = false;
     if (!nTween || nr.frA < 0)
         return true;
+    if (nr.vfg)
+    {
+        // nothing to feed or prime: the effect takes both surfaces at every tween
+        nr.frLast = nr.frB;
+        return true;
+    }
     if (g_fruc.step)
     {
         // feed-once bridge: no priming warp; an instance's first tween of the pair says whether
@@ -712,7 +737,7 @@ static bool nativeFrucUnpack(NativeRife& nr, uint8_t* src, bool sdr)
 {
     void* a[] = {&src, &nr.pw, &nr.ph, &nr.dFrOut};
     void* b[] = {&src, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &nr.dFrOut};
-    const CUfunction f = sdr ? nr.fUnpackBgraSdr : nr.fUnpackBgraRgb;
+    const CUfunction f = sdr ? nr.fUnpackBgraSdr : (nr.vfg ? nr.fUnpackRgba : nr.fUnpackBgraRgb);
     if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, sdr ? b : a,
                        nullptr) != CUDA_SUCCESS)
     {
@@ -726,6 +751,8 @@ static bool nativeFrucTween(NativeRife& nr, double t)
 {
     if (nr.fsrfg)
         return nativeFsrfgTween(nr, t);
+    if (nr.vfg)
+        return nativeVfgTween(nr, t);
     if (nr.frMp)
     {
         // recursive midpoints: the pair's WHOLE tree to its depth first, level by level, left to
@@ -918,6 +945,8 @@ static void nativeFrucFree(NativeRife& nr)
 {
     if (nr.fsrfg)
         nativeFsrfgRelease(nr); // the bridge's instances and the Optical Flow session; the frames below are shared
+    if (nr.vfg)
+        nativeVfgRelease(nr); // the effect; the frames below are shared
     nativeFrucDrain(nr);
     for (int i = 0; i < kFrDepth; i++)
     {

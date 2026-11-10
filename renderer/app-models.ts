@@ -46,6 +46,12 @@ let xefgReady = false;
 function modelIsXefg() {
   return $('modelxefg').checked && xefgReady;
 }
+// NVIDIA Video Frame Generation: NVIDIA's Video Effects runtime in engine/nvvfx (engine --nvvfg), installed by its
+// setup row's one click (nvvfg-ready), so it is ready once the four files are there (live backend nvvfg)
+let vfgReady = false;
+function modelIsVfg() {
+  return $('modelnvvfg').checked && vfgReady;
+}
 const MODEL_BOXES = () => [
   $('modelgmfss'),
   $('modelrife'),
@@ -53,6 +59,7 @@ const MODEL_BOXES = () => [
   $('modelfruc'),
   $('modelfsrfg'),
   $('modelxefg'),
+  $('modelnvvfg'),
   $('modelnvof'),
 ];
 // The run payload's model ('' = GMFSS, the CLI's default, or interpolation off); Compare's model A reads it too, so a
@@ -73,7 +80,9 @@ function renderModel() {
               ? 'fsrfg'
               : modelIsXefg()
                 ? 'xefg'
-                : '';
+                : modelIsVfg()
+                  ? 'nvvfg'
+                  : '';
 }
 function frucSetupHtml() {
   return tr('fruc.intro') + '<br>' + (!frucBridge ? tr('fruc.noBridge') : tr('fruc.howto'));
@@ -100,6 +109,37 @@ async function refreshFrucState() {
     dlssDefault = false;
   }
   await refreshXefgState();
+  await refreshVfgState();
+}
+let vfgInfo: any = { ready: false };
+async function refreshVfgState() {
+  try {
+    vfgInfo = await ipcRenderer.invoke('nvvfg-ready');
+  } catch {
+    vfgInfo = { ready: false };
+  }
+  vfgReady = !!(vfgInfo && vfgInfo.ready);
+}
+// NVIDIA Video Frame Generation's setup row: shown while its box is ticked and the runtime is missing; one click
+// downloads NVIDIA's pinned package (main checks its hash, then installs the runtime's four files)
+function syncVfgSetup() {
+  if (!$('modelnvvfg').checked || vfgReady) {
+    $('nvvfgsetup').style.display = 'none';
+    return;
+  }
+  $('nvvfgstatus').textContent = tr('dlss.notReady');
+  $('nvvfgstatus').style.color = '#e85c5c';
+  $('nvvfgsteps').innerHTML =
+    '✗ ' +
+    tr('nvvfg.line') +
+    '<br>' +
+    tr('nvvfg.howto', {
+      ver: vfgInfo.ver || '',
+      mb: vfgInfo.mb || '415.6',
+      link: toolPageLink('rtx-open-download', 'pypi.nvidia.com'),
+    });
+  $('nvvfgbtns').style.display = '';
+  $('nvvfgsetup').style.display = 'block';
 }
 let xefgInfo: any = { fg: false };
 async function refreshXefgState() {
@@ -140,13 +180,15 @@ function syncModel() {
           ? 'fsrfg'
           : $('modelxefg').checked
             ? 'xefg'
-            : $('modeldlss').checked
-              ? 'dlssg'
-              : $('modelrife').checked
-                ? 'rife'
-                : $('modelnvof').checked
-                  ? 'nvof'
-                  : 'gmfss',
+            : $('modelnvvfg').checked
+              ? 'nvvfg'
+              : $('modeldlss').checked
+                ? 'dlssg'
+                : $('modelrife').checked
+                  ? 'rife'
+                  : $('modelnvof').checked
+                    ? 'nvof'
+                    : 'gmfss',
   );
   // The DRBA sub-option only makes sense while RIFE is the chosen model (always ready: bundled).
   $('rifedrbarow').style.display = $('modelrife').checked ? '' : 'none';
@@ -166,6 +208,7 @@ function syncModel() {
     $('frucsetup').style.display = 'none';
   }
   syncXefgSetup();
+  syncVfgSetup();
 }
 // Exclusive-group behaviour: ticking a box clears the others. Unticking the ACTIVE box now leaves
 // NOTHING checked, and that is the "no interpolation" state (the group replaced the old separate
@@ -216,8 +259,7 @@ $('frucbrowsezip').onclick = async () => {
   const p = await ipcRenderer.invoke('fruc-choose');
   if (p) doFrucInstall(p);
 }; // selecting a .zip auto-installs
-for (const b of ['modelgmfss', 'modelrife', 'modeldlss', 'modelfruc', 'modelfsrfg', 'modelxefg', 'modelnvof'])
-  $(b).onchange = () => pickModel($(b));
+for (const b of MODEL_BOXES()) b.onchange = () => pickModel(b);
 // The DRBA sub-option persists on its own key (default OFF: max fluidity is the app's default
 // philosophy; DRBA deliberately keeps character cadence); toggling it never clears RIFE.
 $('rifedrba').checked = localStorage.getItem('rifeDrba') === '1';
@@ -249,13 +291,15 @@ function restoreModelChoice() {
           ? 'modelfsrfg'
           : saved === 'xefg'
             ? 'modelxefg'
-            : saved === 'dlssg'
-              ? 'modeldlss'
-              : saved === 'rife'
-                ? 'modelrife'
-                : saved === 'nvof'
-                  ? 'modelnvof'
-                  : 'modelgmfss';
+            : saved === 'nvvfg'
+              ? 'modelnvvfg'
+              : saved === 'dlssg'
+                ? 'modeldlss'
+                : saved === 'rife'
+                  ? 'modelrife'
+                  : saved === 'nvof'
+                    ? 'modelnvof'
+                    : 'modelgmfss';
   for (const b of MODEL_BOXES()) b.checked = false;
   $(box).checked = true;
 }

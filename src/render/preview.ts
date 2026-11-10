@@ -73,6 +73,7 @@ const MODEL_FLAGS: Record<string, string[]> = {
   dlssg: ['--dlssg'],
   fsrfg: ['--fsrfg'],
   xefg: ['--xess-fg'],
+  nvvfg: ['--nvvfg'],
   fruc: ['--fruc'],
 };
 

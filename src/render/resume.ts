@@ -96,6 +96,7 @@ const OPTS: Record<string, Spec> = {
   '--fruc': { dest: 'fruc', kind: 'bool', def: false },
   '--fsrfg': { dest: 'fsrfg', kind: 'bool', def: false },
   '--xess-fg': { dest: 'xess_fg', kind: 'bool', def: false },
+  '--nvvfg': { dest: 'nvvfg', kind: 'bool', def: false },
   '--dlssg': { dest: 'dlssg', kind: 'bool', def: false },
   '--rife': { dest: 'rife', kind: 'bool', def: false },
   '--rife-drba': { dest: 'rife_drba', kind: 'bool', def: false },

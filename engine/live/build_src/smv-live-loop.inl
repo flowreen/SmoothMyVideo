@@ -2013,12 +2013,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // quantises them to 8-bit BGRA for the flow and the warp, so only the TWEENS carry 8-bit
         // PQ precision (the real frames stay full precision); far better than the SDR capture
         // of an HDR-presented window, which is 2-3x over-bright and clipped (below). "fsrfg" (AMD FSR frame
-        // generation) takes FRUC's HDR rule at fp16 (nativeFsrfgPair).
-        const bool hdrCapable = g_backend == BK_DLSSG ||
-                                (g_backend == BK_SERVER && (g_serverBackend == L"echo" || g_serverBackend == L"rife" ||
-                                                            g_serverBackend == L"gmfss" || g_serverBackend == L"nvof" ||
-                                                            g_serverBackend == L"rifedrba" ||
-                                                            g_serverBackend == L"fruc" || g_serverBackend == L"fsrfg"));
+        // generation) takes FRUC's HDR rule at fp16 (nativeFsrfgPair). "nvvfg" (NVIDIA Video Frame Generation) gets
+        // every pair as its 8-bit PQ codes, so its tweens carry that precision too.
+        const bool hdrCapable =
+            g_backend == BK_DLSSG ||
+            (g_backend == BK_SERVER &&
+             (g_serverBackend == L"echo" || g_serverBackend == L"rife" || g_serverBackend == L"gmfss" ||
+              g_serverBackend == L"nvof" || g_serverBackend == L"rifedrba" || g_serverBackend == L"fruc" ||
+              g_serverBackend == L"fsrfg" || g_serverBackend == L"nvvfg"));
         // AUTO: HDR runs whenever the display has Windows HDR on and the mode supports it. A
         // "purple screen" at the start was the model-load passthrough presenting raw FP16 capture
         // bytes into the R10A2 swap chain (a startup transient, suppressed below); the

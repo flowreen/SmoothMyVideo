@@ -287,7 +287,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 ```
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore | --restore-model PKL|ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-skin F] [--nr-automask 0|1] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
-  [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--xess-fg] [--dlssg] [--no-gpu-fit]
+  [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--xess-fg] [--nvvfg] [--dlssg] [--no-gpu-fit]
   [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
@@ -375,6 +375,14 @@ the CLI's default with no model flag stays GMFSS):
   size keep SDR content inside the range (both edit its SDR view, see `--sharpen` and the Passes
   paragraph below). GMFSS's SDR pairs use the same test. `SMV_FRUC_SDR_PAIRS=0` = every pair as
   the codes.
+* `--nvvfg` "NVIDIA Video Frame Generation": the two-frame video interpolator of NVIDIA's Video Effects runtime, on
+  Smooth Motion's route in the host. It needs the runtime's four files (`NVVideoEffects.dll`, `NVCVImage.dll`,
+  `nvVFXVideoFrameGeneration.dll`, `cudart64_12.dll`, all from NVIDIA's `nvidia-vfx` package, the one the RTX Video
+  row downloads) in `engine/nvvfx` or the folder `SMV_NVVFX_DIR` names; `native.ts` checks them by name and refuses
+  the render with a message naming the missing one. The model runs in its highest quality mode with its automatic
+  shot-change answer off, one call a new frame at any time between a pair. The app's NVIDIA Video Frame Generation
+  row installs the four files with one click (main-setup.ts `VFG_FILES` out of `NVVFX_DL`). Live: `--backend nvvfg`
+  (the live host's backends below). NVIDIA lists RTX 40 and 50 GPUs for this model.
 * `--fsrfg` "AMD FSR frame generation": AMD's FSR 4 frame generation (the ML provider 4.0.2 of the FSR SDK
   v2.4.0's signed `amd_fidelityfx_framegeneration_dx12.dll`, unmodified) through our
   `engine/fsrfg/smv_fsrfg_bridge.dll`. The DLL offers FSR 4 only when AMD's driver extension reports its FP8
@@ -869,7 +877,12 @@ bridge section), `k_unpackBgraRgb` back, the same skipped-pair priming. A missin
 the file. `fsrfg` is AMD FSR frame generation's live twin on Smooth Motion's route (its ladders, x2 to
 x512, see `--fsrfg` above): the handoff answers with the unpadded geometry, `engine=fsrfg` and `NATIVE-PATH
 fsrfg=` (`engine/fsrfg`, or `SMV_FSRFG_DIR`); a missing `smv_fsrfg_bridge.dll` refuses the session and names
-the folder. `echo` is
+the folder. `nvvfg` is NVIDIA Video Frame Generation's live twin on the same route, without the midpoint tree: the
+model makes a tween at any time between a pair, so a session takes the ladders and the prices of the any-time
+models (a tween's own time, like `nvof`). Its handoff answers with the unpadded geometry, `engine=nvvfg` and
+`NATIVE-PATH nvvfg=` (`engine/nvvfx`, or `SMV_NVVFX_DIR`); a missing file of NVIDIA's runtime refuses the session
+and names it. On an HDR display every pair goes in as its 8-bit PQ codes, so the tweens carry that precision while
+the real frames stay full precision. `echo` is
 the effects-only route: no interpolation model ticked in the app sends
 it, the captured frames pass through at their own rate and the live effects (Restore, sharpen,
 Upscale to, RTX VSR, RTX HDR, DLSS 5) apply to each of them (with no effect on at 1:1, an SDR frame
@@ -1122,7 +1135,14 @@ not fed to NvOFFRUC, and the next pair gets no priming warp (harness
 `offline\gate_fruc.py`). AMD FSR frame generation (`--fsrfg`) takes the same route with its own bridge
 (`lkOfflineFsrfg`: `SMV_FSRFG_DIR` or `engine\fsrfg`), unpadded, every frame fed (harness
 `fsr_framegen\host\host_gate.py`: against AMD's frame generation driven directly on the same frames and
-vectors, inside FSR's own run-to-run spread). `--fps` mode runs there for every one of these models:
+vectors, inside FSR's own run-to-run spread). NVIDIA Video Frame Generation (`--nvvfg`) takes the same route with
+NVIDIA's own Video Effects runtime in place of a bridge
+(`lkOfflineVfg`: `SMV_NVVFX_DIR` or `engine\nvvfx`, holding `NVVideoEffects.dll`, `NVCVImage.dll`,
+`nvVFXVideoFrameGeneration.dll` and their `cudart64_12.dll`, opened by full path and called through
+`GetProcAddress`): unpadded, one call a tween at any time between the pair, the model's highest quality mode, its
+automatic shot-change answer off. The effect reads its surfaces as R G B A bytes whatever their descriptor says, so
+the route packs a session's surfaces in that order; HDR planes go in as their 8-bit codes.
+`--fps` mode runs there for every one of these models:
 `native.ts` hands `--fps-ratio` (its ratio as the shortest text that parses back to the same double) and the
 host renders the fps loop (DRBA: its offset loop) on the same grid of pair fractions in the
 same double arithmetic: every output an interior slot, zero or more per pair, one tween per
@@ -1887,7 +1907,7 @@ named here, and on a name here that no source holds.
 | `SMV_TWEEN_FP16=1` | RIFE and DRBA store their tweens in fp16 (`k_rifeBlend`) instead of fp32 (`k_rifeBlendF`), half the tween buffer and a second rounding (about 9 % of 10-bit codes one off); the host logs `RIFE's tweens are stored in fp16`; A/B lever, never a product setting |
 | `SMV_VSR_SYNC=1` | RTX VSR runs through the bridge's blocking export (a drain of the stream before each call, a device-wide sync after it) instead of the event-ordered one, and the host times each call (`RTX VSR eval N ms mean`); the same path an older bridge without the async export takes; A/B lever, never a product setting |
 | `SMV_VRAM_MIB=<MiB>` | the GPU's memory as the app's memory checks see it, the free memory shrinks with it (both routes): a smaller card's trigger test of the cap and of the `video memory ran out` line on a card everything fits in |
-| `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_FSRFG_DIR`, `SMV_FSRUP_DIR`, `SMV_RTXVIDEO_DIR` | override the runtime folders |
+| `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_FSRFG_DIR`, `SMV_FSRUP_DIR`, `SMV_RTXVIDEO_DIR`, `SMV_NVVFX_DIR` | override the runtime folders |
 | `SMV_FSRFG_STANDIN_LOG=1`, `VKD3D_DEBUG=warn` | AMD FSR 4 frame generation's debug output: the driver-extension stand-in's calls, vkd3d-proton's log (the bridge sets `VKD3D_DEBUG=none` unless set) |
 | `SMV_FSRFG_SDR_PAIRS=0` | on HDR planes AMD FSR frame generation gets every frame pair as the HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_OFVEC_BOTH=1` | AMD FSR's motion vectors (frame generation and upscaling) from NVIDIA Optical Flow in both directions, the backward field read, instead of the forward field with the two frames swapped (the same field, byte for byte, at about half the Optical Flow time); A/B lever, never a product setting |

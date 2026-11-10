@@ -1,5 +1,5 @@
-// Main process: readiness and one-click installs (RTX Video, Smooth Motion, DLSS 4.5 support, DLSS 5, AnimeJaNai,
-// the Dolby Vision and HDR10+ tools, Intel XeSS).
+// Main process: readiness and one-click installs (RTX Video, NVIDIA Video Frame Generation, Smooth Motion, DLSS 4.5
+// support, DLSS 5, AnimeJaNai, the Dolby Vision and HDR10+ tools, Intel XeSS).
 import { ipcMain, dialog, shell } from 'electron';
 import { execFile, execFileSync } from 'child_process';
 import * as path from 'path';
@@ -282,6 +282,26 @@ ipcMain.handle('rtx-open-download', () => {
 });
 
 ipcMain.handle('rtx-download', () => installPinnedZip(NVVFX_DL, RTX_FILES, RTX_DIR, 'rtx-progress'));
+
+// NVIDIA Video Frame Generation: the four files of NVIDIA's Video Effects runtime the host opens in engine/nvvfx
+// (never bundled). They come from the same nvidia-vfx package as the RTX Video pair: one click downloads it,
+// checks its SHA256 and copies the four files. "Ready" = all four present.
+const NVVFX_DIR = path.join(ENGINE, 'nvvfx');
+const VFG_FILES: Array<[string, string]> = [
+  'NVVideoEffects.dll',
+  'NVCVImage.dll',
+  'nvVFXVideoFrameGeneration.dll',
+  'cudart64_12.dll',
+].map((file) => [file, file]);
+
+ipcMain.handle('nvvfg-ready', () => ({
+  ready: VFG_FILES.every(([file]) => fileExists(path.join(NVVFX_DIR, file))),
+  dir: NVVFX_DIR,
+  ver: NVVFX_DL.version,
+  mb: toolMb(NVVFX_DL),
+}));
+
+ipcMain.handle('nvvfg-download', () => installPinnedZip(NVVFX_DL, VFG_FILES, NVVFX_DIR, 'nvvfg-progress'));
 
 // "NVIDIA Smooth Motion" (NvOFFRUC) runtime: ready only when our bridge AND NvOFFRUC.dll are present.
 // "DLSS 4.5" (DLSS Frame Generation): bundled, so this only guards against a broken install.

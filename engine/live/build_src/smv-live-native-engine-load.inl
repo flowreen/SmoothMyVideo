@@ -193,6 +193,32 @@ static bool lkOfflineFsrfg(const std::wstring& script, std::string& dir, int kin
     return true;
 }
 
+// NVIDIA Video Frame Generation: the folder holding NVIDIA's Video Effects runtime (SMV_NVVFX_DIR, else engDir\nvvfx)
+// and its four files (the app's setup row installs them); tag names the route in the refusal line
+static bool lkVfgDir(const std::string& engDir, std::string& dir, const char* tag)
+{
+    dir = lkEnv("SMV_NVVFX_DIR");
+    if (dir.empty())
+        dir = engDir + "\\nvvfx";
+    for (const char* dll : {"NVVideoEffects.dll", "NVCVImage.dll", "nvVFXVideoFrameGeneration.dll", "cudart64_12.dll"})
+        if (!lkFile(dir + "\\" + dll))
+        {
+            LOG("%s: NVIDIA Video Frame Generation needs %s in %s\n", tag, dll, dir.c_str());
+            return false;
+        }
+    return true;
+}
+
+// offline NVIDIA Video Frame Generation: the folder the live handoff names
+static bool lkOfflineVfg(const std::wstring& script, std::string& dir)
+{
+    std::wstring eng = script.substr(0, script.find_last_of(L"\\/"));
+    for (auto& c : eng)
+        if (c == L'/')
+            c = L'\\';
+    return lkVfgDir(wideToUtf8(eng), dir, "offline");
+}
+
 // The engine handoff: the session's geometry and model paths, from the host's own lookup
 // (nativeLocalHandoff), after the cold-start check (nativeLocalBuild) on a worker thread when the
 // lookup misses. Blocking (the caller is srv.start() on the loader thread or the early handoff
@@ -245,6 +271,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         nr.fruc = f.fruc;
         nr.fsrfg = f.fsrfg;
         nr.fgKind = f.fgKind;
+        nr.vfg = f.vfg;
         nr.frucDir = f.frucDir;
         nr.drba = f.drba;
         nr.gmfss = f.gmfss;
@@ -300,7 +327,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
             nr.cachePath = line.substr(18);
         else if (line.rfind("NATIVE-PATH fruc=", 0) == 0)
             nr.frucDir = line.substr(17);
-        else if (line.rfind("NATIVE-PATH fsrfg=", 0) == 0)
+        else if (line.rfind("NATIVE-PATH fsrfg=", 0) == 0 || line.rfind("NATIVE-PATH nvvfg=", 0) == 0)
             nr.frucDir = line.substr(18);
         else if (line.rfind("LIVE READY", 0) == 0)
         {
@@ -417,7 +444,15 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         return false;
     }
     nr.fgKind = nr.fsrfg && g_xessFg ? 1 : 0; // the folder above is XeSS-FG's then (nativeLocalHandoff)
-    nr.fruc = nr.fruc || nr.fsrfg;
+    // NVIDIA Video Frame Generation: the same shape with NVIDIA's own runtime, on the FRUC route (NativeRife's vfg
+    // notes)
+    nr.vfg = all.find(" engine=nvvfg") != std::string::npos;
+    if (nr.vfg && (nr.cachePath.empty() || nr.frucDir.empty()))
+    {
+        LOG("native: nvvfg handoff named no cache or runtime folder\n");
+        return false;
+    }
+    nr.fruc = nr.fruc || nr.fsrfg || nr.vfg;
     // GMFSS: the half-frame grid and the cache folder for the kernel cubins (no engine, no jit path)
     nr.gmfss = all.find(" engine=gmfss") != std::string::npos;
     if (nr.gmfss)
@@ -482,6 +517,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         f.fruc = nr.fruc;
         f.fsrfg = nr.fsrfg;
         f.fgKind = nr.fgKind;
+        f.vfg = nr.vfg;
         f.frucDir = nr.frucDir;
         f.drba = nr.drba;
         f.gmfss = nr.gmfss;
