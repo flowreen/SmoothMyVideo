@@ -259,6 +259,9 @@ function setMode(m) {
   try {
     localStorage.setItem('uiMode', uiMode);
   } catch {}
+  try {
+    lvSendOpts(); // the tab is part of the Live options; the first call comes before they exist
+  } catch {}
   lvUnavailUi();
   // the numbered panels follow the processing order, NVIDIA's, the same in both modes
   applyOrder();
@@ -2049,6 +2052,7 @@ function lvSendOpts() {
     // it; fixed models (DLSS 4.5) approximate it with a whole multiplier the exe derives
     // from the captured window's measured rate.
     model: mi.model,
+    live: uiMode === 'live', // main keeps a spare DLSS 4.5 host while the Live tab shows
     label: liveLoadLabel(mi), // what is ticked, for the exe's loading note + substitution note
     hudnote: liveHudNote(mi),
     note: mi.note, // message/HUD (the raw backend id reads as the wrong model)

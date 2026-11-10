@@ -1493,6 +1493,19 @@ DLSS 5, the TrueHDR bridge, no model state held), when stdin closes, and after
 `SMV_LIVE_RESIDENT_IDLE_S` seconds idle (default 600); the app quits it when another model starts or
 is selected in the panel and at app exit, and kills it when a `stop` gets no answer within 3 s.
 
+Spare host (`smv-live.exe --prewarm`, no other argument): a session that runs DLSS 4.5 spends about three seconds in
+Streamline's start (`slInit`, then the device, `slSetD3DDevice` and the DLSS-G support check) before its overlay
+shows. A spare pays that start at once, prints `live host: prewarmed for DLSS 4.5 in N s, waiting for its session`
+and waits on stdin for ONE `start<TAB>...` line, the resident host's; the session then needs only the window, the
+capture and the swap chain (`Host::init` adopts the spare's device, `slDeviceInit` in `smv-live-host.inl`), and the
+process ends with that session's exit code like every DLSS 4.5 host. `quit` or a closed stdin ends a spare nobody
+took; a `start` line for a session without Streamline is refused with exit 8. Idle it holds about 240 MB of memory
+and 32 MB of video memory, no window and no swap chain. `main.ts` keeps one spare while DLSS 4.5 is the panel's
+interpolator and Live is in use (the Live tab shows, or a session ran since the app started), hands the next DLSS 4.5
+session to it when it is ready, starts the next spare five seconds into that session (a resize or stall revive then
+finds one), and ends the spare when another model is picked, a file render starts or the app quits.
+`SMV_LIVE_PREWARM=0` on the app = no spare.
+
 Live settings in place: while a session runs, the app sends `set<TAB>key<TAB>value` on the same stdin (the resident
 host's reader; a one-shot session, DLSS 4.5's, starts one reader of its own) for each value that changed since the
 spawn (`main.ts` `liveSetNow` / `liveSendSets`). The native thread applies them before its next frame group
@@ -1818,6 +1831,7 @@ All optional; the GUI sets none of the tuning ones. `0` disables unless stated.
 | `SMV_LIVE_GRID_PACE=0` / `SMV_LIVE_GRID_LOCK=0` | the old present targets (slots spread at (idx + 1) / (n + 1) of the source period after the frame's arrival, a late slot at once) / the grid at every adaptive target, no whole-multiple ladder (A/B only) |
 | `SMV_LIVE_HDR` | force live HDR on or off |
 | `SMV_LIVE_RESIDENT=0` / `SMV_LIVE_RESIDENT_IDLE_S` | one `smv-live.exe` per live session instead of the resident host / the resident host's idle limit in seconds (default 600) |
+| `SMV_LIVE_PREWARM=0` | no spare DLSS 4.5 host (`--prewarm`): every Live DLSS 4.5 session starts its own process and pays Streamline's start |
 | `SMV_AUTO_UPDATE=0` / `SMV_UPDATE_API=URL` / `SMV_UPDATE_TRIES=N` / `SMV_UPDATE_7ZR=PATH` | the update notice without the background download / another latest-release JSON in place of GitHub's (the automatic-update gates' local server) / the swap helper's tries a file, two seconds apart (default 30) / another unpacker in place of `engine\update\7zr.exe` (the gates' failing-probe case) |
 | `SMV_LIVE_TEARDOWN_TRACE=1` | one log line per session teardown stage (reader, present queue, server, capture, host); for a Stop that hangs |
 | `SMV_LIVE_TIMING=1` / `SMV_LIVE_HITCH=1` | live present-loop diagnostics: an `[exe-timing] xq:` line on every 2 s stats tick (the pair interval EMA, tweens a pair, the pair position, degrades) / `[hitch]` lines from the present queue (the gap between presents, the slot, the time since the frame arrived, the pacing delay) |

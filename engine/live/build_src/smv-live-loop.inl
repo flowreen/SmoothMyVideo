@@ -1590,6 +1590,8 @@ static DWORD WINAPI diagThread(LPVOID p)
 
 static int slInitCommon()
 {
+    if (g_slReady)
+        return 0;
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     static std::wstring exeDir(exePath);
@@ -1615,7 +1617,14 @@ static int slInitCommon()
     pref.flags &= ~(sl::PreferenceFlags::eAllowOTA | sl::PreferenceFlags::eLoadDownloadedPlugins);
     pref.renderAPI = sl::RenderAPI::eD3D12;
     CHECK_SL(slInit(pref, sl::kSDKVersion));
+    g_slReady = true;
     return 0;
+}
+
+static void slShutdownCommon()
+{
+    slShutdown();
+    g_slReady = false;
 }
 
 // diagnostic: no WGC at all, present synthetic moving-square frames at ~30fps through the
@@ -1687,7 +1696,7 @@ static int runSynth(int genFrames, bool vsync)
     LOG("synth done: %d app presents -> %u native presents (ratio %.2f)\n", presented, c - base,
         (double)(c - base) / presented);
     host.shutdown();
-    slShutdown();
+    slShutdownCommon();
     return 0;
 }
 
@@ -2495,7 +2504,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 cap.stop();
                 host.shutdown();
                 if (host.useSL)
-                    slShutdown();
+                    slShutdownCommon();
                 timeEndPeriod(1);
                 if (g_nrAttempted)
                 {
@@ -5787,7 +5796,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         if (g_teardownTrace)
             LOG("teardown: host down\n");
         if (host.useSL)
-            slShutdown();
+            slShutdownCommon();
         timeEndPeriod(1);
         // With the NR snippet loaded, the process-exit teardown after main returns
         // faults (0xC0000005 on a clean "target window closed" exit;

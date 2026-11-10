@@ -134,6 +134,7 @@ if (!app.requestSingleInstanceLock()) {
 }
 app.on('window-all-closed', () => {
   stopLive(true); // never leave a headless FG overlay (or an idle resident host) running after the GUI is gone
+  liveSpareDrop();
   offlineHostQuit();
   fsrWarmProc?.kill();
   if (process.platform !== 'darwin') app.quit();
@@ -665,6 +666,7 @@ ipcMain.on('update-apply', async () => {
   }
   // app.quit() skips window-all-closed, where these go at a normal close; a host still busy with the paused render
   // is ended by the helper (it ends whatever still runs from the app folder)
+  liveSpareDrop();
   offlineHostQuit();
   fsrWarmProc?.kill();
   if (!launchSwap(top, ready.rel, true)) return;
@@ -1495,6 +1497,80 @@ function onLiveSessionEnd(code: number | null) {
   if (code === 6) sendLive('lv-out', 'live engine keeps stalling, giving up on this session\n');
   liveLog(`stopped (exit ${code})`);
   sendLive('lv-done', code);
+  liveSpareEnsure();
+}
+
+// The spare host. A Live session that runs DLSS 4.5 spends about three seconds in Streamline's start before its
+// overlay shows. While DLSS 4.5 is the panel's interpolator and Live is in use (the Live tab is open, or a session ran
+// since the app started) the app keeps ONE `smv-live.exe --prewarm` waiting with that start already paid: about 240 MB
+// of memory, 32 MB of video memory, no window. The next DLSS 4.5 session goes to it as the resident host's "start"
+// line and it ends with that session, like every DLSS 4.5 host. A spare nobody took ends when another model is
+// picked, a file render starts or the app quits. SMV_LIVE_PREWARM=0 = no spare (every session starts its own host).
+let liveSpare: ChildProcess | null = null;
+let liveSpareReady = false; // it printed its "prewarmed" line: a session can go to it
+let liveSpareOut = ''; // what it printed so far: the session that takes it shows these lines first
+let liveSpareFails = 0; // spares that ended before they were ready (a GPU without DLSS 4.5): two = no more tries
+let liveUiLive = false; // the window shows the Live tab (lv-opts)
+let liveUsed = false; // a Live session started since the app did
+let liveSpareHold = 0; // no new spare before this time (ms): a session's own start comes first
+function liveSpareWanted(): boolean {
+  return (
+    liveModel === 'dlssg' &&
+    (liveUiLive || liveUsed) &&
+    !current &&
+    liveSpareFails < 2 &&
+    process.env.SMV_LIVE_PREWARM !== '0' &&
+    fileExists(LIVE_EXE)
+  );
+}
+function liveSpareEnsure() {
+  if (liveSpare || !liveSpareWanted() || Date.now() < liveSpareHold) return;
+  const p = spawn(LIVE_EXE, ['--prewarm'], { cwd: LIVE_DIR, windowsHide: true });
+  liveSpare = p;
+  liveSpareReady = false;
+  liveSpareOut = '';
+  liveLog('spare host started: smv-live.exe --prewarm');
+  p.stdin?.on('error', () => {});
+  p.stderr?.on('data', (b: Buffer) => {
+    if (liveSpare !== p) return;
+    liveSpareOut += b.toString();
+    if (!liveSpareReady && liveSpareOut.includes('prewarmed for DLSS 4.5')) {
+      liveSpareReady = true;
+      liveSpareFails = 0;
+      liveLog('spare host ready');
+    }
+  });
+  const gone = (why: string) => {
+    if (liveSpare !== p) return; // a session took it: that session's handlers report its end
+    if (!liveSpareReady) liveSpareFails++;
+    liveLog(`spare host ${why}\n${liveSpareOut}`);
+    liveSpare = null;
+    liveSpareReady = false;
+    liveSpareOut = '';
+  };
+  p.on('close', (code) => gone(`exited (${code})`));
+  p.on('error', (err) => gone('spawn error: ' + err));
+}
+function liveSpareDrop() {
+  if (!liveSpare) return;
+  const p = liveSpare;
+  liveSpare = null;
+  liveSpareReady = false;
+  liveSpareOut = '';
+  liveLog('spare host ended (not wanted now)');
+  try {
+    p.stdin?.write('quit\n');
+  } catch {
+    /* gone */
+  }
+  const t = setTimeout(() => {
+    try {
+      if (p.exitCode === null) p.kill();
+    } catch {
+      /* gone */
+    }
+  }, 2000);
+  t.unref();
 }
 
 // one overlay session; explicit hwnd (GUI picker) or the foreground window (` hotkey)
@@ -1600,18 +1676,27 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     liveQuitIdle();
   }
   if (resident) args.push('--resident');
+  // a DLSS 4.5 session goes to the spare host when one is ready
+  const spare = liveModel === 'dlssg' && !resident && liveSpare && liveSpareReady ? liveSpare : null;
+  const spareOut = spare ? liveSpareOut : '';
+  if (spare) {
+    liveSpare = null;
+    liveSpareReady = false;
+    liveSpareOut = '';
+    spare.stderr?.removeAllListeners('data');
+  }
   // windowsHide: a packaged app has no console, so a console-subsystem child would get a window of its own
-  const p = spawn(LIVE_EXE, args, { cwd: LIVE_DIR, windowsHide: true });
+  const p = spare ?? spawn(LIVE_EXE, args, { cwd: LIVE_DIR, windowsHide: true });
   liveProc = p;
   liveResident = resident;
   liveIdle = false;
+  liveUsed = true;
   let errBuf = ''; // partial trailing line, so the hwnd is only parsed out of COMPLETE lines
-  liveLog(`session started: smv-live.exe ${args.join(' ')}`);
+  liveLog(`session started${spare ? ' on the spare host' : ''}: smv-live.exe ${args.join(' ')}`);
   sendLive('lv-started');
   // a write into a host that just exited raises EPIPE on the stream: never let it throw
   p.stdin?.on('error', () => {});
-  p.stderr?.on('data', (b: Buffer) => {
-    const t = b.toString();
+  const onErr = (t: string) => {
     // a chunk boundary inside "target window: hwnd=0x..." used to resolve a TRUNCATED handle,
     // and the next settings restart then respawned on a window that does not exist
     errBuf += t;
@@ -1640,7 +1725,22 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
     }
     liveLog(t);
     sendLive('lv-out', t);
-  });
+  };
+  if (spareOut) onErr(spareOut);
+  p.stderr?.on('data', (b: Buffer) => onErr(b.toString()));
+  if (spare) {
+    try {
+      spare.stdin?.write('start\t' + args.join('\t') + '\n');
+    } catch {
+      /* the spare died under us; its close handler below reports the session's end */
+    }
+  }
+  // the next spare only once this session's own start is over (two Streamline starts at once slow both): a resize
+  // or stall revive then finds one ready
+  if (liveModel === 'dlssg') {
+    liveSpareHold = Date.now() + 5000;
+    setTimeout(liveSpareEnsure, 5100).unref();
+  }
   p.on('close', (code) => {
     liveRestoreMouse(false);
     if (liveProc !== p) return; // an idle host quit by liveQuitIdle, already forgotten
@@ -1750,6 +1850,7 @@ ipcMain.on(
       hud?: boolean;
       hudlat?: boolean;
       gpufit?: boolean;
+      live?: boolean; // the window shows the Live tab
     },
   ) => {
     liveModel = opts.model;
@@ -1791,6 +1892,9 @@ ipcMain.on(
     // through a session of another model)
     if (liveIdle && liveModel !== liveHeld) liveQuitIdle();
     liveSendSets();
+    liveUiLive = !!opts.live;
+    if (liveSpareWanted()) liveSpareEnsure();
+    else liveSpareDrop();
   },
 );
 
@@ -2429,6 +2533,7 @@ function pipeEngineOutput(proc: ChildProcess, send: (channel: string, ...payload
   };
   const finish = () => {
     current = null;
+    liveSpareEnsure();
     clearPause();
     keepAwake(false);
     taskbarProgress(-1);
@@ -2455,6 +2560,7 @@ ipcMain.on('run', (e, opts: RunOpts) => {
   // an idle resident live host gives its VRAM to the render, unless a restart / revive is about to reuse it or it
   // stayed to finish an engine build (that build makes the next Live start warm)
   if (!liveRevivePending && !liveBuildHeld) liveQuitIdle();
+  liveSpareDrop(); // the render gets the spare host's memory too; one starts again when the render is over
   clearPause(); // start unpaused: never inherit a stale flag from a previous (e.g. killed) run
   // The render orchestrator is TypeScript: this Electron binary run as plain
   // node on dist/render/cli.js, which speaks render.py's stderr protocol and exit codes and runs

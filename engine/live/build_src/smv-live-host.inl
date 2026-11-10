@@ -183,6 +183,61 @@ static void fillConstants(sl::Constants& c)
     c.motionVectorsJittered = sl::Boolean::eFalse;
 }
 
+// The part of a session's start that needs no window and no size: the NVIDIA adapter, the D3D12 device and, with
+// Streamline, slSetD3DDevice plus the DLSS-G support check. Host::init runs it, or adopts what a prewarmed host
+// (--prewarm) ran before its session's arguments arrived.
+struct SlWarm
+{
+    ComPtr<IDXGIFactory2> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    ComPtr<ID3D12Device> device;
+    bool ok = false;
+};
+static SlWarm g_slWarm;
+
+// 0 = ok, else Host::init's exit code
+static int slDeviceInit(SlWarm& w, bool useSL)
+{
+    CHECK_HR(CreateDXGIFactory2(0, IID_PPV_ARGS(&w.factory)));
+    DXGI_ADAPTER_DESC1 adesc{};
+    for (UINT i = 0; w.factory->EnumAdapters1(i, &w.adapter) != DXGI_ERROR_NOT_FOUND; i++)
+    {
+        w.adapter->GetDesc1(&adesc);
+        if (adesc.VendorId == 0x10DE)
+            break;
+        w.adapter.Reset();
+    }
+    if (!w.adapter)
+    {
+        LOG("no NVIDIA adapter found\n");
+        return 1;
+    }
+    LOG("adapter: %ls\n", adesc.Description);
+
+    CHECK_HR(D3D12CreateDevice(w.adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&w.device)));
+    if (useSL)
+    {
+        CHECK_SL(slSetD3DDevice(w.device.Get()));
+
+        sl::AdapterInfo ai{};
+        ai.deviceLUID = (uint8_t*)&adesc.AdapterLuid;
+        ai.deviceLUIDSizeInBytes = sizeof(LUID);
+        sl::Result sup = slIsFeatureSupported(sl::kFeatureDLSS_G, ai);
+        if (sup != sl::Result::eOk)
+        {
+            LOG("DLSS-G not supported on this system (sl::Result=%d)\n", (int)sup);
+            return 2;
+        }
+
+        sl::FeatureVersion ver{};
+        if (slGetFeatureVersion(sl::kFeatureDLSS_G, ver) == sl::Result::eOk)
+            LOG("DLSS-G ready: SL %u.%u.%u, NGX model %u.%u.%u\n", ver.versionSL.major, ver.versionSL.minor,
+                ver.versionSL.build, ver.versionNGX.major, ver.versionNGX.minor, ver.versionNGX.build);
+    }
+    w.ok = true;
+    return 0;
+}
+
 // ---------------------------------------------------------------- host (fork of dlssg2f Host)
 
 struct Host
@@ -517,43 +572,19 @@ struct Host
         }
         pumpMessages();
 
-        CHECK_HR(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
-        DXGI_ADAPTER_DESC1 adesc{};
-        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++)
+        // a prewarmed host made the device and asked Streamline before this session existed
+        if (!(useSL && g_slWarm.ok))
         {
-            adapter->GetDesc1(&adesc);
-            if (adesc.VendorId == 0x10DE)
-                break;
-            adapter.Reset();
+            g_slWarm = SlWarm{};
+            if (const int rc = slDeviceInit(g_slWarm, useSL))
+                return rc;
         }
-        if (!adapter)
-        {
-            LOG("no NVIDIA adapter found\n");
-            return 1;
-        }
-        LOG("adapter: %ls\n", adesc.Description);
-
-        CHECK_HR(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+        factory = g_slWarm.factory;
+        adapter = g_slWarm.adapter;
+        device = g_slWarm.device;
+        g_slWarm = SlWarm{};
         if (useSL)
-        {
-            CHECK_SL(slSetD3DDevice(device.Get()));
-
-            sl::AdapterInfo ai{};
-            ai.deviceLUID = (uint8_t*)&adesc.AdapterLuid;
-            ai.deviceLUIDSizeInBytes = sizeof(LUID);
-            sl::Result sup = slIsFeatureSupported(sl::kFeatureDLSS_G, ai);
-            if (sup != sl::Result::eOk)
-            {
-                LOG("DLSS-G not supported on this system (sl::Result=%d)\n", (int)sup);
-                return 2;
-            }
-
-            sl::FeatureVersion ver{};
-            if (slGetFeatureVersion(sl::kFeatureDLSS_G, ver) == sl::Result::eOk)
-                LOG("DLSS-G ready: SL %u.%u.%u, NGX model %u.%u.%u\n", ver.versionSL.major, ver.versionSL.minor,
-                    ver.versionSL.build, ver.versionNGX.major, ver.versionNGX.minor, ver.versionNGX.build);
             installFocusShim(hwnd);
-        }
 
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;

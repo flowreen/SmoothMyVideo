@@ -262,6 +262,10 @@ static bool g_hdr = false;
 // ("start<TAB>arg<TAB>arg...", "stop", "quit"; residentMain at the end of the file). A session
 // that touched Streamline, NGX (native DLSS 5) or the TrueHDR bridge still ends the process.
 static bool g_resident = false;
+// --prewarm: this process paid Streamline's start before its one session's arguments arrived (prewarmMain); its
+// stdin is read by ResidentIo, as a resident host's is
+static bool g_prewarmed = false;
+static bool g_slReady = false;             // slInit ran and slShutdown has not: slInitCommon is then a no-op
 static std::atomic<bool> g_stopReq{false}; // stdin "stop": the session loops exit cleanly
 // stdin "set<TAB>key<TAB>value" during a session: a Live setting changed in place (nativeLiveSets lists the keys);
 // the native thread applies the queue before its next frame group, a key the session cannot change in place waits
@@ -4087,6 +4091,7 @@ struct LiveArgs
 static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la);
 static int runLiveArgs(LiveArgs& la);
 static int residentMain(LiveArgs first);
+static int prewarmMain();
 
 int wmain(int argc, wchar_t** argv)
 {
@@ -4243,6 +4248,8 @@ int wmain(int argc, wchar_t** argv)
         }
         return orc;
     }
+    if (argc >= 2 && wcscmp(argv[1], L"--prewarm") == 0)
+        return prewarmMain();
     const bool byLive = argc >= 3 && wcscmp(argv[1], L"--live") == 0;
     const bool byHwnd = argc >= 3 && wcscmp(argv[1], L"--hwnd") == 0;
     const bool byFg = argc >= 2 && wcscmp(argv[1], L"--fg") == 0;
@@ -4544,9 +4551,9 @@ static int runLiveArgs(LiveArgs& la)
     if ((g_backend == BK_DLSSG || g_fgOver) && slInitCommon())
         return 1;
     // the app's live slider changes reach a single session too; a console stdin (a manual run) is left alone. The
-    // resident host reads its stdin in ResidentIo only: a second reader there takes whole chunks, so a "start" line it
-    // read was lost and the next session never began
-    if (!g_resident && GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE)
+    // resident host and a prewarmed one read their stdin in ResidentIo only: a second reader there takes whole chunks,
+    // so a "start" line it read was lost and the next session never began
+    if (!g_resident && !g_prewarmed && GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE)
         liveSetReader();
     return runLive(la.needle, la.targetOverride, la.genFrames, la.vsync, la.clickthrough, la.diagSecs, la.park);
 }
@@ -4633,6 +4640,80 @@ struct ResidentIo
 };
 static ResidentIo* g_rio = nullptr; // heap, never freed: its reader thread outlives main
 
+// one "start<TAB>arg<TAB>arg..." line into a session's arguments (toks keeps the strings la points into); returns
+// the parse's exit code, 0 = a session to run
+static int parseStartLine(const std::string& line, std::vector<std::wstring>& toks, LiveArgs& la)
+{
+    toks.clear();
+    toks.push_back(L"smv-live.exe");
+    size_t p = 6;
+    while (p <= line.size())
+    {
+        size_t q = line.find('\t', p);
+        if (q == std::string::npos)
+            q = line.size();
+        toks.push_back(utf8ToWide(line.substr(p, q - p)));
+        p = q + 1;
+    }
+    std::vector<wchar_t*> av;
+    for (auto& t : toks)
+        av.push_back(&t[0]);
+    resetSessionGlobals();
+    const bool byLive = av.size() >= 2 && wcscmp(av[1], L"--live") == 0;
+    const bool byHwnd = av.size() >= 2 && wcscmp(av[1], L"--hwnd") == 0;
+    const bool byFg = av.size() >= 2 && wcscmp(av[1], L"--fg") == 0;
+    return (byLive || byHwnd || byFg) ? parseLiveArgs((int)av.size(), av.data(), la) : 1;
+}
+
+// --prewarm: a spare host for the next Live session that runs DLSS 4.5. It pays Streamline's start now (slInit, the
+// device, the DLSS-G support check: most of such a session's start), then waits on stdin for that session's
+// "start<TAB>args" line, the resident host's. It runs that ONE session and ends with its exit code, as every DLSS 4.5
+// session's process does. "quit" or a closed stdin ends a spare nobody took; exit 8 = the line asked for a session
+// without Streamline, which a spare does not run.
+static int prewarmMain()
+{
+    g_prewarmed = true;
+    g_rio = new ResidentIo();
+    g_rio->start();
+    const ULONGLONG t0 = GetTickCount64();
+    if (slInitCommon())
+        return 1;
+    if (const int rc = slDeviceInit(g_slWarm, true))
+    {
+        g_slWarm = SlWarm{};
+        slShutdownCommon();
+        return rc;
+    }
+    LOG("live host: prewarmed for DLSS 4.5 in %.2f s, waiting for its session\n", (GetTickCount64() - t0) / 1000.0);
+    const int waitSecs = 30 * 24 * 3600; // the app ends a spare it no longer wants; a closed stdin ends it too
+    LiveArgs la;
+    std::vector<std::wstring> toks;
+    for (;;)
+    {
+        std::string line;
+        const bool got = g_rio->next(line, waitSecs);
+        if (got && line.rfind("start\t", 0) == 0)
+        {
+            const int prc = parseStartLine(line, toks, la);
+            if (!prc && (g_backend == BK_DLSSG || g_fgOver))
+                break;
+            LOG(prc ? "live host: bad start command\n"
+                    : "live host: prewarmed for DLSS 4.5, this session needs another host\n");
+            g_slWarm = SlWarm{};
+            slShutdownCommon();
+            return prc ? prc : 8;
+        }
+        if (!got || line == "quit")
+        {
+            g_slWarm = SlWarm{};
+            slShutdownCommon();
+            return 0;
+        }
+        LOG("live host: unknown command \"%s\"\n", line.c_str());
+    }
+    return runLiveArgs(la);
+}
+
 static int residentMain(LiveArgs first)
 {
     g_rio = new ResidentIo();
@@ -4703,27 +4784,9 @@ static int residentMain(LiveArgs first)
                 LOG("live host: unknown command \"%s\"\n", line.c_str());
                 continue;
             }
-            toks.clear();
-            toks.push_back(L"smv-live.exe");
-            size_t p = 6;
-            while (p <= line.size())
-            {
-                size_t q = line.find('\t', p);
-                if (q == std::string::npos)
-                    q = line.size();
-                toks.push_back(utf8ToWide(line.substr(p, q - p)));
-                p = q + 1;
-            }
-            std::vector<wchar_t*> av;
-            for (auto& t : toks)
-                av.push_back(&t[0]);
-            resetSessionGlobals();
-            g_resident = true; // resetSessionGlobals does not touch it, the flag is process-wide
             LiveArgs nla;
-            const bool byLive = av.size() >= 2 && wcscmp(av[1], L"--live") == 0;
-            const bool byHwnd = av.size() >= 2 && wcscmp(av[1], L"--hwnd") == 0;
-            const bool byFg = av.size() >= 2 && wcscmp(av[1], L"--fg") == 0;
-            const int prc = (byLive || byHwnd || byFg) ? parseLiveArgs((int)av.size(), av.data(), nla) : 1;
+            const int prc = parseStartLine(line, toks, nla);
+            g_resident = true; // resetSessionGlobals does not touch it, the flag is process-wide
             if (prc)
             {
                 // main.ts treats this line as the session's end (no session ran)
