@@ -569,7 +569,7 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   kills a running one (no key). Gate `harness\fsr4_warmup\app_gate.py` (`npx tsc` first; a driver-cold Vulkan cache
   via `__GL_SHADER_DISK_CACHE_PATH`). `--anime4k` puts Anime4K's Upscale CNN x2 UL (bloc97, v4.0.1) in that same
   resize instead (RTX VSR and AMD FSR win over it, with a line). The shader's weights live in the host as fp32 bit
-  patterns (`kA4kWeights` in `smv-live-native.inl`, with the source shader's md5; no shader file ships), and the host
+  patterns (`kA4kWeights` in `smv-live-native-anime4k.inl`, with the source shader's md5; no shader file ships), and the host
   runs its conv passes as three CUDA kernels, every texture stored as fp16 like the shader's: the six 3 x 3 middle
   layers on the tensor cores (the stored fp16 values times the weights rounded to fp16, fp16 sums), the first layer
   computed inside the first middle layer's kernel (`k_a4kConvM16First`) and the 1 x 1 inside the last one's
@@ -795,8 +795,8 @@ Output:
 
 `engine/live/smv-live.exe` (C++ / D3D12) captures a window or monitor with Windows.Graphics.Capture
 and presents interpolated output through a click-through topmost overlay placed over the target.
-Dev home for its source is a separate repo synced into `engine/live/build_src` (`smv-live.cpp` plus
-five `smv-live-*.inl` parts, see the build section below).
+Its source is `engine/live/build_src` (`smv-live.cpp` plus its `smv-live-*.inl` parts, see the build
+section below).
 
 Backends: `dlssg` (Streamline DLSS Frame Generation, fixed 2x..6x, RTX 40 / 50, NVIDIA's pacer
 presents real + generated frames) or the native host (`rife`, `rifedrba`, `gmfss`, `fruc`,
@@ -2359,7 +2359,8 @@ from the GUI.
 Built from `smv-live.cpp` plus the DLSS 5 core `../../dlssnr/build_src/nr_host.cpp` via `build.bat`
 in `engine/live/build_src/`. `smv-live.cpp` is one translation unit that `#include`s its five parts
 in order (`smv-live-host.inl` swap chain and overlay, `smv-live-capture.inl` WGC capture and the
-DLSS 5 hook, `smv-live-native.inl` the native model host, `smv-live-pipe.inl` the present loop's interface
+DLSS 5 hook, `smv-live-native.inl` the native model host (Anime4K and each ported network sit in their own
+`smv-live-native-<name>.inl`, included from it), `smv-live-pipe.inl` the present loop's interface
 to it, `smv-live-loop.inl` window finding, HUD and the present loops; the file map is in its header
 comment); the parts are not standalone sources and `build.bat` compiles only `smv-live.cpp`. The
 NVIDIA Optical Flow interface headers (the nvof model) are vendored in `build_src/nvofa` (MIT, with

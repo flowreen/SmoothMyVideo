@@ -38,17 +38,24 @@ a version bump in `package.json`.
 `smv-live-capture.inl` (window capture), `smv-live-native.inl` (every model and pass, CUDA), `smv-live-pipe.inl`,
 `smv-live-loop.inl` (the live loop, pacing, the HUD). A name defined in an earlier file is visible in the later ones.
 
-`smv-live-native.inl` is far too long to read whole (over 30,000 lines). Find a symbol with a search, then read around
+`smv-live-native.inl` is too long to read whole (about 20,000 lines). Find a symbol with a search, then read around
 it. Its layout, top to bottom:
 
 1. `kNativeKernels`: the shared CUDA kernel text (packs, resizes, splats, blends, sharpen, HDR, optical flow).
 2. Host code: resize tables, the vendor bridges, the weight readers, kernel compilation and its cache.
-3. Anime4K: its weight tables and kernel-text builder.
-4. One run per network, each with its kernel text, loader and launch code: ArtCNN (`kAcnA`), GMFSS's feature net
-   (`kFnConv`), DRBA's block 0 (`kB0Conv`), GMFSS's metric net (`kMnText`), RIFE's IFNet (`kIfnA`), GMFSS's IFNet
-   (`kGiA`), GMFSS's fusion net (`kFuA`), GMFlow's second half (`kGb`), its backbone (`kBbA`) and its transformer
-   (`kGaA`).
-5. Session code: the tween and emit paths, `nativeGroup`, `nativeThread`.
+3. The `#include` lines of the parts below. Their order matters: a later part uses names an earlier one defines.
+4. Session code: the tween and emit paths, `nativeGroup`, `nativeThread`.
+
+Anime4K and each ported network live in their own part, `smv-live-native-<name>.inl`, with the kernel text, the
+loader and the launch code together. A part is small enough to read whole, except `anime4k` (weight tables).
+
+| Part `<name>` | What |
+|---|---|
+| `anime4k`, `anime4k-restore` | Anime4K: weight tables, kernel-text builder, upscale passes; its Restore pass |
+| `artcnn` | ArtCNN (`kAcnA`) |
+| `rife-ifnet`, `drba-block0` | RIFE's IFNet (`kIfnA`), DRBA's block 0 (`kB0Conv`) |
+| `gmfss-featnet`, `gmfss-metricnet`, `gmfss-ifnet`, `gmfss-fusionnet` | GMFSS's feature net (`kFnConv`), metric net (`kMnText`), IFNet (`kGiA`), fusion net (`kFuA`) |
+| `gmflow-backbone`, `gmflow-a`, `gmflow-b` | GMFlow's backbone (`kBbA`), transformer (`kGaA`), second half (`kGb`) |
 
 CUDA kernels are C++ raw strings compiled at run time; the compiled result is cached by a hash of the text, so a
 kernel text that does not change keeps its cache entry.

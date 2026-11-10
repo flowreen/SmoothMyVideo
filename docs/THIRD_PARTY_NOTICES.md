@@ -29,7 +29,7 @@ third-party work.
   Copyright (c) 2021 Xintao Wang.
 * **Anime4K** (the Anime4K upscaler and the Anime4K Restore): the weights of bloc97's Upscale CNN x2 UL and Restore
   CNN UL shaders and the Clamp_Highlights algorithm from release v4.0.1 (github.com/bloc97/Anime4K), carried in the
-  native host (`engine/live/build_src/smv-live-native.inl`, `kA4kWeights`, `kA4kRestWeights`, `kA4kClampSrc`), which
+  native host (`engine/live/build_src/smv-live-native-anime4k.inl`, `kA4kWeights`, `kA4kRestWeights`, `kA4kClampSrc`), which
   runs their passes as CUDA kernels. MIT License:
 
   > Copyright (c) 2019 bloc97
@@ -53,7 +53,7 @@ third-party work.
   > SOFTWARE.
 * **ArtCNN** (the ArtCNN upscaler): the weights of Artoriuz's C4F32_DN model from release v1.6.2
   (github.com/Artoriuz/ArtCNN), in `engine/artcnn/artcnn_c4f32_dn_v1.6.2_fp16.pkl` (the release's ONNX weights, the
-  3 x 3 layers stored as fp16), run by the native host as CUDA kernels (`engine/live/build_src/smv-live-native.inl`,
+  3 x 3 layers stored as fp16), run by the native host as CUDA kernels (`engine/live/build_src/smv-live-native-artcnn.inl`,
   `kAcnA` / `kAcnB`). MIT License:
 
   > Copyright (c) 2024 João Chrisóstomo
