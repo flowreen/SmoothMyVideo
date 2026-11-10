@@ -4,8 +4,8 @@
 // The present loop's view of the model backend. The backend is the in-process native host
 // (NativeRife, smv-live-native.inl): the loop writes one group message per captured frame and
 // reads per-slot tokens back, both through nr->write / nr->read; frames never cross a pipe, the
-// capture texture and the output ring are shared GPU memory. The struct keeps the message
-// interface of the python live server it replaced, which is why the loop talks to a "server".
+// capture texture and the output ring are shared GPU memory. The struct has a server's message
+// interface (a group message out, slot tokens back), which is why the loop talks to a "server".
 struct PipeServer
 {
     // output ring geometry (the present loop's slotOffset math reads these)
@@ -26,7 +26,7 @@ struct PipeServer
     volatile LONGLONG ioSince = 0; // tick since a group is outstanding (armed by the present
                                    // loop), 0 = idle
     volatile LONG wdogStop = 0;
-    volatile LONG stalled = 0; // the watchdog ended a stalled host (TRT shape-bug class)
+    volatile LONG stalled = 0; // the watchdog ended a stalled host
     NativeRife* nr = nullptr;
     void nativeAbort()
     {
@@ -109,14 +109,14 @@ struct PipeServer
     }
     // every way out of a session stops the host here, the early returns of runLive's warm-up included: a
     // compute thread left running keeps its execution contexts, and the resident host's freeAll then
-    // deletes the engines under them (TensorRT "Error Code 3", then an access violation)
+    // deletes the engines under them (an access violation)
     ~PipeServer()
     {
         stop();
     }
 
-    // A TRT-RTX engine at an unlucky shape can hang the host PERMANENTLY mid-stream (a GPU sync
-    // that never completes). The token read then blocks forever and the overlay freezes on its
+    // A GPU sync that never completes hangs the host PERMANENTLY mid-stream.
+    // The token read then blocks forever and the overlay freezes on its
     // last frame. The watchdog turns that failure mode into a detectable one: the host's waits
     // are aborted, the read fails, the exe exits with code 6 and the app revives the session.
     static DWORD WINAPI wdogProc(LPVOID p)

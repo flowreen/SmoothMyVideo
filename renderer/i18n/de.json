@@ -438,7 +438,6 @@
   "run.status.cancelling": "Wird abgebrochen...",
   "run.status.prevReady": "Pausiert. Eine Vorschau des bisher gerenderten Teils (mit Ton & Untertiteln) ist bereit - klick auf „Vorschau abspielen“.",
   "run.status.prevPending": "Pausiert; die Vorschau ist noch nicht bereit (zu wenige Bilder gerendert) - fortsetzen und etwas später erneut pausieren.",
-  "run.status.building": "TensorRT-Engines werden gebaut (einmalig für diese Auflösung)...",
   "run.status.cancelled": "Abgebrochen.",
   "run.status.done": "Fertig!",
   "run.status.preempted": "Gestoppt: DLSS wurde von einer anderen App belegt (RTX Video). ~{pct}% gespeichert - schließ das Video und klick auf Fortsetzen.",

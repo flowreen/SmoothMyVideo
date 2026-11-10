@@ -1,11 +1,9 @@
-// Resume, pause preview and progress: render.py's crash / exit resume
-// helpers ported line by line, the comments there carry the reasoning (the fragmented stage-1
+// Resume, pause preview and progress: the resume after a crash or an exit (the fragmented stage-1
 // file, the settings signature, the salvage + decode-verified gapless cut, the output-index to
-// source-grid mapping, the native host's per-frame HDR statistics prefix, the pause preview, the
-// PROGRESS / SIZE heartbeat). The python route's torch-side HDR stats rebuild is not ported: the
-// TS orchestrator drives the native host only, which keeps the per-frame records itself. Every
+// source-grid mapping, the native host's per-frame HDR statistics prefix), the pause preview, the
+// PROGRESS / SIZE heartbeat. The native host keeps the per-frame HDR records itself. Every
 // stderr line goes through `say`; child processes run synchronously with no console window and
-// their output dropped, as in python (see encode.runChecked).
+// their output dropped (see encode.runChecked).
 import { spawnSync, SpawnSyncOptions, SpawnSyncReturns } from 'child_process';
 import { createHash } from 'crypto';
 import * as fs from 'fs';
@@ -14,13 +12,13 @@ import { PyRuntimeError, pyExcRepr, pyJsonDumps } from './dvhp';
 import { CalledProcessError, Env, HpFrame, pyErrText, pyReprStr, Say } from './encode';
 import { pyFixed, pyFloatRepr } from './pyfmt';
 
-// --- python value parsing -----------------------------------------------------------------------
+// --- argument value parsing ---------------------------------------------------------------------
 export class PyValueError extends Error {}
 
 const PY_FLOAT_RE =
   /^[+-]?(?:(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:[eE][+-]?\d(?:_?\d)*)?|inf(?:inity)?|nan)$/i;
 
-/** python float(s) for a str. */
+/** A float argument's text as a number (Python's float literal forms: `_` separators, inf, nan). */
 export function pyFloatParse(s: string): number {
   const t = s.trim();
   if (!PY_FLOAT_RE.test(t)) throw new PyValueError(`could not convert string to float: ${pyReprStr(s)}`);
@@ -30,7 +28,7 @@ export function pyFloatParse(s: string): number {
   return Number(u);
 }
 
-/** python int(s) for a str (base 10). */
+/** An int argument's text as a number (base 10, `_` separators allowed). */
 export function pyIntParse(s: string): number {
   const t = s.trim();
   if (!/^[+-]?\d(?:_?\d)*$/.test(t)) throw new PyValueError(`invalid literal for int() with base 10: ${pyReprStr(s)}`);
@@ -38,10 +36,10 @@ export function pyIntParse(s: string): number {
 }
 
 function pyMax(a: number, b: number): number {
-  return b > a ? b : a; // python max(a, b): the first one unless the second is larger
+  return b > a ? b : a; // the first one unless the second is larger (a NaN first stays)
 }
 
-// --- the render.py arguments ----------------------------------------------------------------------
+// --- the render's arguments -----------------------------------------------------------------------
 type Kind = 'str' | 'int' | 'float' | 'bool';
 interface Spec {
   dest: string;
@@ -51,7 +49,7 @@ interface Spec {
   choices?: (string | number)[];
 }
 
-/** render.py's argparse options in declaration order (flag -> dest, type, default, const). */
+/** The render's options in declaration order (flag -> dest, type, default, the bare flag's value). */
 const OPTS: Record<string, Spec> = {
   // the DLSS mode (auto, dlaa, quality, balanced, performance, ultra) or a number in (0, 1]: the
   // working size's share of the output (plan.ts workPlan checks it)
@@ -73,7 +71,7 @@ const OPTS: Record<string, Spec> = {
   '--hdr10plus': { dest: 'hdr10plus', kind: 'bool', def: false },
   '--codec': { dest: 'codec', kind: 'str', def: 'hevc', choices: ['hevc', 'av1', 'vvc'] },
   '--restore': { dest: 'restore', kind: 'bool', def: false },
-  // Restore's model file (the installed AnimeJaNai ONNX; the host's --restore-model), none = Real-ESRGAN
+  // Restore's model file (the installed AnimeJaNai model; the host's --restore-model), none = Real-ESRGAN
   '--restore-model': { dest: 'restore_model', kind: 'str', def: null },
   '--restore-anime4k': { dest: 'restore_anime4k', kind: 'bool', def: false },
   '--no-gpu-fit': { dest: 'no_gpu_fit', kind: 'bool', def: false },
@@ -111,7 +109,7 @@ const POS: Spec[] = [
 const KIND: Record<string, Kind> = Object.fromEntries([...POS, ...Object.values(OPTS)].map((s) => [s.dest, s.kind]));
 
 export type ArgValue = string | number | boolean | null;
-/** vars(args): every dest, typed by its spec (KIND says which numbers are python floats). */
+/** The parsed arguments: every dest, typed by its spec (KIND says which numbers are floats). */
 export type ArgNs = Record<string, ArgValue>;
 
 function convert(spec: Spec, flag: string, s: string): ArgValue {
@@ -121,17 +119,17 @@ function convert(spec: Spec, flag: string, s: string): ArgValue {
   return v;
 }
 
-/** argparse's "looks like an option" test for a token (render.py has no negative-number flags). */
+/** Whether a token looks like an option (a negative number does not: no flag is a number). */
 function isOption(t: string): boolean {
   if (!t.startsWith('-') || t === '-') return false;
   if (/^-\d+$|^-\d*\.\d+$/.test(t)) return false;
   return !t.includes(' ') || (t.startsWith('--') && t.split('=')[0] in OPTS);
 }
 
-/** render.py's `ap.parse_args(argv)` for the command lines the app builds: exact long flags,
- * `--flag value` / `--flag=value`, the two bare-flag consts, and the positionals as ONE block
- * (input multi [output]). Anything argparse would reject throws; forms it accepts that the app never
- * builds (abbreviated flags, positionals split around options, `--`) throw too. */
+/** The render's command line parser, for the command lines the app builds: exact long flags,
+ * `--flag value` / `--flag=value`, the two bare-flag values, and the positionals as ONE block
+ * (input multi [output]). Anything else throws: an unknown or malformed argument, and the forms the
+ * app never builds (abbreviated flags, positionals split around options, `--`). */
 export function parseRenderArgv(argv: string[]): ArgNs {
   const ns: ArgNs = {};
   for (const s of Object.values(OPTS)) ns[s.dest] = s.def;
@@ -177,19 +175,20 @@ function argJson(dest: string, v: ArgValue): string {
   return pyJsonDumps(v);
 }
 
-/** os.path.normcase(os.path.abspath(p)) on Windows. */
+/** A path's identity on Windows: absolute, backslashes, lower case. */
 export function winNormAbs(p: string): string {
   return path.win32.resolve(p).replace(/\//g, '\\').toLowerCase();
 }
 
-/** int(os.path.getmtime(p)): python builds st_mtime as sec + nsec * 1e-9 in double. */
+/** A file's modification time in whole seconds, from sec + nsec * 1e-9 in double (the resume
+ * signature's form). */
 function pyMtimeInt(p: string): number {
   const ns = fs.statSync(p, { bigint: true }).mtimeNs;
   return Math.trunc(Number(ns / 1000000000n) + Number(ns % 1000000000n) * 1e-9);
 }
 
-/** render.py _resume_sig: sha1 of json.dumps(vars(args) + the source identity + SMV_CQ,
- * sort_keys=True). A mismatch means the partial video came from other settings. */
+/** The resume signature: sha1 of the JSON text (pyJsonDumps, keys sorted) of the parsed arguments
+ * + the source identity + SMV_CQ. A mismatch means the partial video came from other settings. */
 export function resumeSig(ns: ArgNs, env: Env = process.env): string {
   const inp = path.win32.resolve(ns.input as string);
   const d: Record<string, string> = {};
@@ -235,7 +234,7 @@ export function partsOf(workPath: string, ob: string, outIsMkv: boolean): Parts 
   };
 }
 
-/** render.py _resume_cleanup: drop every resume artifact. */
+/** Drop every resume artifact. */
 export function resumeCleanup(p: Parts): void {
   for (const f of [
     p.vidPart,
@@ -252,12 +251,12 @@ export function resumeCleanup(p: Parts): void {
     try {
       fs.unlinkSync(f);
     } catch {
-      /* except OSError: pass */
+      /* a file that is missing or cannot be removed is skipped */
     }
   }
 }
 
-/** render.py _write_resume_sidecar: atomic replace of the resume json; an OSError is ignored. split > 0 = the file
+/** Atomic replace of the resume json; a failed write is ignored. split > 0 = the file
  * split's source frame S (both halves' sidecars carry it, native.ts resumes each half from its own work files). */
 export function writeResumeSidecar(
   resumeJson: string,
@@ -279,11 +278,12 @@ export function writeResumeSidecar(
     fs.writeFileSync(tmp, text, 'utf8');
     fs.renameSync(tmp, resumeJson);
   } catch {
-    /* except OSError: pass */
+    /* the previous sidecar stays */
   }
 }
 
-/** An OSError from os.replace / os.remove on Windows: str() and repr() as python prints them. */
+/** A failed rename / delete on Windows, with the two texts the render's lines quote: the message
+ * ("[WinError N] text: 'path'") and the repr form ("PermissionError(13, 'text')"). */
 class PyOSError extends Error {
   constructor(
     text: string,
@@ -321,7 +321,7 @@ function pyRemove(p: string): void {
   }
 }
 
-/** str(e) of whatever _try_resume's broad except catches. */
+/** The message text of whatever tryResume catches. */
 function pyStr(e: unknown): string {
   const x = e as NodeJS.ErrnoException;
   if (x && x.code === 'ENOENT' && x.syscall && x.syscall.startsWith('spawn'))
@@ -336,7 +336,7 @@ function pyStr(e: unknown): string {
   return pyErrText(e);
 }
 
-/** repr(e) of whatever the pause preview's broad except catches. */
+/** The repr-form text of whatever the pause preview catches. */
 function pyRepr(e: unknown): string {
   if (e instanceof PyOSError) return e.repr;
   if (e instanceof PyValueError) return `ValueError(${pyReprStr(e.message)})`;
@@ -350,7 +350,7 @@ function run(cmd: string[], opts: SpawnSyncOptions): SpawnSyncReturns<Buffer> {
     maxBuffer: Infinity,
     ...opts,
   }) as SpawnSyncReturns<Buffer>;
-  if (r.error) throw r.error; // python: the OSError of a program that cannot start
+  if (r.error) throw r.error; // a program that cannot start
   return r;
 }
 
@@ -366,7 +366,7 @@ function fragFor(c: FfCtx, dst: string): string[] {
   return c.fragCopy && dst.toLowerCase().endsWith('.mp4') ? c.fragFlags : [];
 }
 
-/** render.py _ff_copy: error-tolerant video-only stream copy; true on success. +discardcorrupt drops
+/** Error-tolerant video-only stream copy; true on success. +discardcorrupt drops
  * the torn tail packet the demuxer flags corrupt: av1 muxing chokes on its cut OBU and
  * leaves an mp4 with no moov while ffmpeg exits 0, so a killed AV1 render never resumed; hevc
  * decoded around it (at most one decodable packet is dropped now, one frame re-rendered). */
@@ -393,7 +393,7 @@ export function ffCopy(c: FfCtx, src: string, dst: string, extra: string[] = [])
   return run(cmd, { stdio: 'ignore' }).status === 0 && fs.existsSync(dst);
 }
 
-/** render.py _ff_packets: [pts in decode order, keyframe packet indices, stream time_base]. */
+/** A file's video packets: [pts in decode order, keyframe packet indices, stream time_base]. */
 export function ffPackets(ffprobe: string, file: string): [number[], number[], number] {
   const cmd = [
     ffprobe,
@@ -428,7 +428,7 @@ export function ffPackets(ffprobe: string, file: string): [number[], number[], n
   return [pts, keys, tb];
 }
 
-/** render.py _decoded_count: frames that decode from startTime to EOF. */
+/** The number of frames that decode from startTime to EOF. */
 export function decodedCount(ffmpeg: string, file: string, startTime: number): number {
   const r = run(
     [
@@ -456,7 +456,7 @@ export function decodedCount(ffmpeg: string, file: string, startTime: number): n
   return Math.floor(r.stdout.length / (64 * 36));
 }
 
-/** render.py _clean_cut: the largest packet count c <= cap whose decode-order prefix displays gaplessly. */
+/** The largest packet count c <= cap whose decode-order prefix displays gaplessly. */
 export function cleanCut(pts: number[], cap: number): number {
   if (pts.length < 2) return 0;
   const s = [...pts].sort((a, b) => a - b);
@@ -473,9 +473,9 @@ export function cleanCut(pts: number[], cap: number): number {
   return best;
 }
 
-/** render.py _concat_copy: stream-copy concat of same-parameter video parts. */
+/** Stream-copy concat of same-parameter video parts. */
 export function concatCopy(c: FfCtx, parts: string[], dst: string): boolean {
-  // python's text-mode write turns each "\n" into "\r\n" on Windows
+  // the list file ends each line with "\r\n"
   fs.writeFileSync(
     c.concatTxt,
     parts.map((p) => "file '" + path.win32.resolve(p).replace(/\\/g, '/').replace(/'/g, "'\\''") + "'\r\n").join(''),
@@ -506,14 +506,14 @@ export function concatCopy(c: FfCtx, parts: string[], dst: string): boolean {
     try {
       fs.unlinkSync(c.concatTxt);
     } catch {
-      /* except OSError: pass */
+      /* a list file that cannot be removed stays */
     }
   }
   return ok;
 }
 
 // --- the resume point ------------------------------------------------------------------------------
-/** The render's emission grid, as _try_resume reads it. ratio = output / source rate (--fps, DRBA). */
+/** The render's emission grid, as tryResume reads it. ratio = output / source rate (--fps, DRBA). */
 export interface Grid {
   noInterp: boolean;
   fpsMode: boolean;
@@ -563,9 +563,9 @@ function metaNum(v: unknown): number {
   return typeof v === 'string' ? pyFloatParse(v) : Number(v);
 }
 
-/** render.py _try_resume: salvage and trim a partial render, map the cut to the source grid; null =
+/** Salvage and trim a partial render, map the cut to the source grid; null =
  * render fresh (the partial is cleaned up when it cannot be used). A libvvenc prefix turns
- * ctx.fragCopy on, as python flips FRAG_COPY. */
+ * ctx.fragCopy on. */
 export function tryResume(x: ResumeCtx): Resume | null {
   const P = x.parts;
   if (!(x.resumable && fs.existsSync(P.resumeJson) && (fs.existsSync(P.vidPart) || fs.existsSync(P.vidPart2))))
@@ -637,8 +637,8 @@ export interface ResumeState {
   baseBytes: number;
 }
 
-/** render.py's block after _try_resume: the resume state and the two lines that announce it
- * (the python route's HDR re-seed / stats rebuild is torch-only, see nativeHdrPrefix). */
+/** What follows tryResume: the resume state and the two lines that announce it
+ * (the HDR statistics of the banked frames: see nativeHdrPrefix). */
 export function applyResume(rz: Resume | null, vidPart: string, nb: number, totalUnits: number, say: Say): ResumeState {
   if (!rz) return { active: false, outBase: 0, skipSrc: 0, pairSkip: 0, venc: '', baseBytes: 0 };
   const baseBytes = fs.statSync(vidPart).size;
@@ -657,7 +657,7 @@ export interface HdrPrefix {
   hp: HpFrame[];
 }
 
-/** render.py's native HDR prefix block (a native HDR resumable render): a resumed render keeps the
+/** The HDR statistics prefix of a resumable HDR render: a resumed render keeps the
  * banked frames' records of the host's per-frame statistics file (rewritten to exactly those lines,
  * the host appends after them) and takes their maxima; a fresh one deletes the file. `note` = the
  * RESUME_DVHP_NOTE a short file sets (null = unchanged). */
@@ -673,7 +673,7 @@ export function nativeHdrPrefix(
     try {
       fs.unlinkSync(hdrFrames);
     } catch {
-      /* except OSError: pass */
+      /* no statistics file to delete */
     }
     return { prefix: null, note: null };
   }
@@ -707,7 +707,7 @@ export function nativeHdrPrefix(
       kept.push(ln);
     }
   } catch {
-    /* except (OSError, ValueError, IndexError): pass */
+    /* an unreadable file or a malformed line: the records read so far are kept */
   }
   let note: string | null = null;
   if ((dv || hp) && kept.length !== outBase) {
@@ -741,7 +741,7 @@ function lastChars(s: string, n: number): string {
   return a.slice(Math.max(0, a.length - n)).join('');
 }
 
-/** render.py _emit_pause_preview: on pause, the frames so far + the source's audio / subtitles into a
+/** On pause, the frames so far + the source's audio / subtitles into a
  * playable <output>.preview file (PREVIEW_READY), best-effort. */
 export function emitPausePreview(x: PreviewCtx): void {
   if (!x.resumable || !x.stage2Maps.length) return;
@@ -792,7 +792,7 @@ export function emitPausePreview(x: PreviewCtx): void {
     try {
       fs.unlinkSync(tmp);
     } catch {
-      /* except OSError: pass */
+      /* no half-built preview to remove */
     }
     x.say(`[preview] partial preview skipped (${Array.from(pyRepr(e)).slice(0, 200).join('')})\n`);
   } finally {
@@ -800,7 +800,7 @@ export function emitPausePreview(x: PreviewCtx): void {
       try {
         fs.unlinkSync(cat);
       } catch {
-        /* except OSError: pass */
+        /* a concat file that cannot be removed stays */
       }
     }
   }
@@ -817,7 +817,7 @@ export interface ProgressCtx {
   say: Say;
 }
 
-/** render.py _progress: the PROGRESS heartbeat, the resume sidecar refresh, the SIZE projection and
+/** The PROGRESS heartbeat, the resume sidecar refresh, the SIZE projection and
  * the one-time free-space warning. */
 export class Progress {
   private diskWarned = false;
@@ -830,8 +830,8 @@ export class Progress {
     const frac = total ? k / total : 0.0;
     if (frac < 0.01) return;
     try {
-      const st0 = fs.statSync(x.encTarget); // python opens and seeks; libuv's stat reads the live size through a handle
-      if (!st0.isFile()) return; // python: opening a directory raises
+      const st0 = fs.statSync(x.encTarget); // libuv's stat reads the live size through a handle
+      if (!st0.isFile()) return; // a directory has no size to project
       const cur = st0.size + x.baseBytes;
       if (cur < 1 << 20) return;
       const proj = Math.trunc(cur / frac);
@@ -851,7 +851,7 @@ export class Progress {
         }
       }
     } catch {
-      /* except OSError: pass */
+      /* no size this time: the heartbeat goes on */
     }
   }
 }

@@ -1,7 +1,7 @@
 // HDR10 static metadata (mdcv + clli) and the Dolby Vision configuration box (dvvC) injected
-// into an MP4's video sample entry: engine/hdr10_meta.py ported line by
-// line, the module docstring there carries the reasoning (why the LGPL ffmpeg cannot write
-// these, the box layouts, the moov-tail-only rewrite, idempotence). All fields big-endian.
+// into an MP4's video sample entry (the LGPL ffmpeg cannot write these). Only the file's tail
+// from the moov box on is rewritten, and a box that is present already is left alone. All fields
+// big-endian.
 import * as fs from 'fs';
 import { pyRound } from './pyfmt';
 
@@ -71,7 +71,7 @@ function find(buf: Buffer, start: number, end: number, typ: string): [number, nu
 }
 
 /** (base, buf): the file from the first top-level moov box to the end, and that box's absolute
- * offset; null without a moov. Reads only box headers until moov (see hdr10_meta._read_tail). */
+ * offset; null without a moov. Reads only box headers until moov. */
 function readTail(path: string): [number, Buffer] | null {
   const fd = fs.openSync(path, 'r');
   try {
@@ -134,7 +134,7 @@ function videoTrak(buf: Buffer, moovPs: number, moovBe: number): [number, number
   return null;
 }
 
-/** python struct ">H" / ">I" refuse out-of-range values; so does this, with struct.error's text. */
+/** v as a big-endian unsigned 16 / 32 bit field; an out-of-range value throws. */
 function packU(buf: Buffer, v: number, off: number, bytes: 2 | 4): void {
   if (!Number.isInteger(v) || v < 0 || v >= 2 ** (8 * bytes)) {
     throw new Error(
@@ -173,7 +173,7 @@ function mdcvClli(
   return Buffer.concat([mdcv, clli]);
 }
 
-/** The shared box surgery (hdr10_meta._insert_into_sample_entry): append buildBox() to the video
+/** The shared box surgery: append buildBox() to the video
  * sample entry in place, patch every stco / co64 offset past the insert, grow the ancestors up to
  * moov, rewrite the tail from moov on. False when skipped (present already, or not the expected
  * moov / trak / ... / stsd shape); throws only on real I/O errors. */
@@ -249,7 +249,7 @@ export function injectHdr10(
   ]);
 }
 
-// Dolby Vision Profile 8.1 signalling: the reasoning sits on hdr10_meta.py's dvvC block
+// Dolby Vision Profile 8.1 signalling: each level's cap on the luminance pixel rate
 const DV_LEVEL_CAPS = [
   22118400, 27648000, 49766400, 62208000, 124416000, 199065600, 248832000, 398131200, 497664000, 995328000, 1990656000,
 ];

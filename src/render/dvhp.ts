@@ -1,10 +1,9 @@
-// Dolby Vision Profile 8.1 and HDR10+ exports of a finished HDR10 MP4:
-// render_encode.py's dv_export / hp_export and their scene-shot grouping ported line by line, the
-// comments there carry the reasoning (one metadata block per SHOT, the L1 / SceneInfo layouts,
-// HDR10+ before DV, why the remux re-stamps the HDR10 boxes). Both are best-effort: any failure is
-// one "[dv]" / "[hdr10+]" line quoting python's repr() of the error, and the HDR10 file stays.
-// The stats are ints (rtxvideo / the native host's TrueHDR pass), so the configs hold only ints and
-// strings; pyJsonDumps writes them as python's json.dump does.
+// Dolby Vision Profile 8.1 and HDR10+ exports of a finished HDR10 MP4, with their scene-shot
+// grouping: one metadata block per SHOT, HDR10+ before DV, and the remux re-stamps the HDR10
+// boxes. Both are best-effort: any failure is
+// one "[dv]" / "[hdr10+]" line quoting the error (pyExcRepr), and the HDR10 file stays.
+// The stats are ints (the native host's TrueHDR pass), so the configs hold only ints and
+// strings; pyJsonDumps writes them.
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import { CalledProcessError, hdrLight, HdrStats, HpFrame, pyReprStr, runChecked, Say } from './encode';
@@ -17,7 +16,7 @@ export const SHOT_MIN_S = 0.2; // minimum shot length, seconds
 
 /** Scene-shot [start, end) ranges of a per-frame average-brightness series (12-bit PQ codes). */
 export function sceneBounds(avgs: number[], fps: number): [number, number][] {
-  if (!avgs.length) throw new Error('list index out of range'); // python: avgs[0] raises
+  if (!avgs.length) throw new Error('list index out of range'); // an empty series has no shot
   const minLen = Math.max(2, pyRound(fps * SHOT_MIN_S));
   const bounds: [number, number][] = [];
   let s = 0,
@@ -38,7 +37,7 @@ export function sceneBounds(avgs: number[], fps: number): [number, number][] {
   return bounds;
 }
 
-// python min() / max() over a shot; a loop, since a spread call caps near 100k frames
+// the smallest / largest value of a shot; a loop, since a spread call caps near 100k frames
 function minOf(xs: number[]): number {
   let m = xs[0];
   for (const x of xs) if (x < m) m = x;
@@ -73,8 +72,8 @@ export function pq12(tenths: number): number {
   return pyRound(4095.0 * Math.pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375));
 }
 
-/** python json.dumps with the default separators and ensure_ascii; integral numbers print as
- * ints (every value here is a python int), others as python's float repr. */
+/** JSON text in the layout of Python's json.dumps (", " and ": " separators, non-ASCII escaped);
+ * integral numbers print as ints (every value here is an integer), others as pyFloatRepr. */
 export function pyJsonDumps(v: unknown): string {
   if (v === null || v === undefined) return 'null';
   if (typeof v === 'boolean') return v ? 'true' : 'false';
@@ -111,7 +110,8 @@ export function pyJsonDumps(v: unknown): string {
   );
 }
 
-/** python repr() of the errors these exports can raise (the failure line quotes repr(e)[:200]). */
+/** The errors these exports can raise, as text in Python's repr form (the failure line quotes its
+ * first 200 characters). */
 export class PyRuntimeError extends Error {}
 export function pyExcRepr(e: unknown): string {
   if (e instanceof CalledProcessError)
@@ -119,7 +119,7 @@ export function pyExcRepr(e: unknown): string {
   if (e instanceof PyRuntimeError) return `RuntimeError(${pyReprStr(e.message)})`;
   const x = e as NodeJS.ErrnoException;
   if (x && x.code === 'ENOENT') {
-    // a program that cannot start (CreateProcess, WinError 2) vs a file call (os.replace etc.)
+    // a program that cannot start (CreateProcess, WinError 2) vs a file call (a rename, a delete)
     return x.syscall && x.syscall.startsWith('spawn')
       ? "FileNotFoundError(2, 'The system cannot find the file specified', None, 2, None)"
       : "FileNotFoundError(2, 'The system cannot find the file specified')";
@@ -136,7 +136,7 @@ function removeQuiet(p: string): void {
   try {
     fs.unlinkSync(p);
   } catch {
-    /* python: except OSError: pass */
+    /* a file that cannot be removed stays */
   }
 }
 
@@ -276,7 +276,7 @@ function remuxCmd(
   ];
 }
 
-/** The finished HDR10 MP4 -> Dolby Vision Profile 8.1 in place (render_encode.dv_export); `profile` '8.4' = the
+/** The finished HDR10 MP4 -> Dolby Vision Profile 8.1 in place; `profile` '8.4' = the
  * finished HLG MP4 -> Profile 8.4 (HLG-compatible: the stream tagged HLG, dvvC compatibility 4, no HDR10 boxes). */
 export function dvExport(
   mp4Path: string,
@@ -323,7 +323,7 @@ export function dvExport(
   }
 }
 
-/** HDR10+ (ST 2094-40) dynamic metadata into the finished HDR10 MP4 in place (render_encode.hp_export). */
+/** HDR10+ (ST 2094-40) dynamic metadata into the finished HDR10 MP4 in place. */
 export function hpExport(
   mp4Path: string,
   ffmpeg: string,

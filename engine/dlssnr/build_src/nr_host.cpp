@@ -693,8 +693,8 @@ int Host::initNgx(std::string& err)
         return 2;
     }
 
-    // The snippet's own folder is offered to NGX as an extra search path, the
-    // same reason rtxvideo.py calls os.add_dll_directory.
+    // The snippet's own folder is offered to NGX as an extra search path:
+    // its feature DLLs sit there.
     std::wstring snipDir = m_snippetPath.substr(0, m_snippetPath.find_last_of(L"\\/"));
     const wchar_t* paths[1] = {snipDir.c_str()};
     NVSDK_NGX_FeatureCommonInfo fci = {};

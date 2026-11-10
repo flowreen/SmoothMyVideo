@@ -1,11 +1,10 @@
-// The source probe: engine/render_probe.py ported line by line, the
-// comments there carry the reasoning. Pure functions over the ffprobe stream record or the
-// input path; the callers write every stderr line themselves. ffprobe runs synchronously, as
-// in python (subprocess.check_output), with no console window.
+// The source probe. Pure functions over the ffprobe stream record or the
+// input path; the callers write every stderr line themselves. ffprobe runs synchronously,
+// with no console window.
 import { execFileSync } from 'child_process';
 import { pyG, pyRound } from './pyfmt';
 
-/** One ffprobe stream record (the fields render.py reads; values as ffprobe's JSON has them). */
+/** One ffprobe stream record (the fields the render reads; values as ffprobe's JSON has them). */
 export type Stream = Record<string, string | number | undefined>;
 
 export interface Probe {
@@ -21,13 +20,13 @@ function ffprobeText(ffprobe: string, args: string[]): string {
   return execFileSync(ffprobe, args, { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-/** python int() of a digit string ("" and junk are errors in python; callers guard as it did). */
+/** A digit string as an integer ("" and junk throw; callers guard). */
 function toInt(s: string): number {
   if (!/^\s*[+-]?\d+\s*$/.test(s)) throw new Error(`invalid literal for int(): '${s}'`);
   return parseInt(s, 10);
 }
 
-/** (str(v or dflt).split("/") + ["1"])[:2] */
+/** A rate "num/den" (v, or dflt when v is empty) as its two parts; a missing den = "1". */
 function splitRate(v: unknown, dflt: string): [string, string] {
   const parts = String(v || dflt)
     .split('/')
@@ -91,7 +90,7 @@ export function frameCount(ffprobe: string, path: string, nb: number, srcFps: nu
   try {
     const s = ffprobeText(ffprobe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', path]).trim();
     const dur = Number(s);
-    if (s === '' || Number.isNaN(dur)) return 0; // python float() raises ValueError
+    if (s === '' || Number.isNaN(dur)) return 0; // no readable duration
     return Math.max(0, pyRound(dur * srcFps));
   } catch {
     return 0;
@@ -163,7 +162,7 @@ export function outputRate(multi: number, fps: number | null, noInterp: boolean,
   return { rateStr, outLabel, ratio, tgtNum, tgtDen };
 }
 
-// track passthrough: the container rule sits on render_probe.py's comment block
+// track passthrough: the audio codecs an MP4 takes and the subtitle codecs an MKV copies
 export const MP4_AUDIO_OK = new Set(['aac', 'ac3', 'eac3', 'mp3', 'alac', 'opus', 'flac']);
 export const MKV_SUB_COPY_OK = new Set(['ass', 'ssa', 'subrip', 'srt', 'hdmv_pgs_subtitle', 'dvd_subtitle', 'webvtt']);
 

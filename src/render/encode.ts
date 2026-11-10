@@ -1,10 +1,9 @@
-// The encoder: engine/render_encode.py ported line by line, the comments
-// there carry the reasoning (the codec ladder, the CPU fallbacks and the RAM preflight, the
+// The encoder: the codec ladder, the CPU fallbacks and the RAM preflight, the
 // quality-first flags, the colour signalling, the track passthrough, the two-stage HDR / resume
-// finish). Every function is fed the decisions the orchestrator already made and returns a record
+// finish. Every function is fed the decisions the orchestrator already made and returns a record
 // or an argv; the ones that talk while they work take its `say` / `fatal` callables. The DV and
 // HDR10+ exports and the resume concat / cleanup arrive as callables in the
-// Finalize record. Child processes run synchronously with no console window, as in python.
+// Finalize record. Child processes run synchronously with no console window.
 import { spawn, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -27,7 +26,7 @@ export function belowNvencMin(venc: string, w: number, h: number): boolean {
   return m !== undefined && (w < m[0] || h < m[1]);
 }
 
-/** python subprocess.CalledProcessError, message included (it reaches the GUI log verbatim). */
+/** A child process that ended with a non-zero exit code; the message reaches the GUI log verbatim. */
 export class CalledProcessError extends Error {
   constructor(
     public returncode: number,
@@ -37,7 +36,7 @@ export class CalledProcessError extends Error {
   }
 }
 
-/** python repr() of a str: quote choice and escapes as CPython prints them. */
+/** A string in Python's repr form: its quote choice and its escapes. */
 export function pyReprStr(s: string): string {
   const q = s.includes("'") && !s.includes('"') ? '"' : "'";
   let out = q;
@@ -67,7 +66,7 @@ const PY_ERRNO: Record<string, [number, string]> = {
   ENOSPC: [28, 'No space left on device'],
 };
 
-/** str(e) as python prints the exception: an fs error as OSError's "[Errno N] text: 'path'". */
+/** An error's text for the log: an fs error as "[Errno N] text: 'path'". */
 export function pyErrText(e: unknown): string {
   const x = e as NodeJS.ErrnoException;
   const m = x && x.code ? PY_ERRNO[x.code] : undefined;
@@ -75,10 +74,9 @@ export function pyErrText(e: unknown): string {
   return x instanceof Error ? x.message : String(e);
 }
 
-/** subprocess.run(cmd, check=True, creationflags=CREATE_NO_WINDOW): throws CalledProcessError on
- * a non-zero exit (or when the program cannot start, which python raises as OSError). The child's
- * output is dropped: under CREATE_NO_WINDOW with no std handles passed, python's child wrote to
- * its own hidden console, so none of it ever reached the log (measured by the 6b gate). */
+/** Runs cmd to its end with no console window: throws CalledProcessError on a non-zero exit, or
+ * the spawn error when the program cannot start. The child's output is dropped, so none of it
+ * reaches the log. */
 export function runChecked(cmd: string[]): void {
   const r = spawnSync(cmd[0], cmd.slice(1), { windowsHide: true, stdio: 'ignore' });
   if (r.error) throw r.error;
@@ -180,7 +178,7 @@ export function codecEncoder(codec: string): string {
   return ({ av1: 'av1_nvenc', vvc: 'libvvenc' } as Record<string, string>)[codec] ?? 'hevc_nvenc';
 }
 
-/** Available physical RAM in GB (libuv reads GlobalMemoryStatusEx ullAvailPhys, as python did). */
+/** Available physical RAM in GB (libuv reads GlobalMemoryStatusEx ullAvailPhys). */
 export function availRamGb(): number {
   try {
     return os.freemem() / 1e9;
@@ -277,8 +275,7 @@ export function outPixfmt(venc: string, useNvenc: boolean, hdrActive: boolean, c
   return useNvenc ? 'p010le' : 'yuv420p10le';
 }
 
-/** [the encoder's quality argv, the stderr note or null]; the measured policy sits on
- * render_encode.quality_args. */
+/** [the encoder's quality argv, the stderr note or null]. */
 export function qualityArgs(
   venc: string,
   useNvenc: boolean,
@@ -610,7 +607,7 @@ export function saveSubsBeside(ffmpeg: string, ffprobe: string, inp: string, out
   );
 }
 
-/** The encode command and everything it is built from (render_encode.encode_plan). */
+/** The encode command and everything it is built from. */
 export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   const outPix = outPixfmt(e.venc, e.useNvenc, e.hdrActive, e.chroma444);
   const ultra = e.outW > NVENC_MAX || e.outH > NVENC_MAX;
@@ -802,7 +799,7 @@ export function remuxTracks(
   }
 }
 
-/** Everything the finish reads, captured by the orchestrator at call time (render_encode.Finalize).
+/** Everything the finish reads, captured by the orchestrator at call time.
  * hpExport / dvExport = the HDR10+ and DV exports of the finished work path. */
 export interface Finalize {
   ffmpeg: string;
@@ -838,11 +835,11 @@ function removeQuiet(p: string): void {
   try {
     fs.unlinkSync(p);
   } catch {
-    /* python: except OSError: pass */
+    /* a file that cannot be removed stays */
   }
 }
 
-/** Finish the container (the routes sit on render_encode.finalize_output). */
+/** Finish the container. */
 export function finalizeOutput(f: Finalize): void {
   const hdr10 = (target: string) =>
     writeHdr10Metadata(target, f.hdrActive && !f.hlg, f.rtx, f.nits, f.masterPrim, f.say);

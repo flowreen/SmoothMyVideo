@@ -438,7 +438,6 @@
   "run.status.cancelling": "취소 중...",
   "run.status.prevReady": "일시정지됨. 지금까지 렌더된 부분의 미리보기(소리와 자막 포함)가 준비되었습니다 - \"미리보기 재생\"을 클릭하세요.",
   "run.status.prevPending": "일시정지됨. 미리보기가 아직 준비되지 않았습니다(렌더된 프레임이 너무 적음) - 이어서 렌더한 뒤 잠시 후 다시 일시정지하세요.",
-  "run.status.building": "TensorRT 엔진 빌드 중(이 해상도에서 한 번만)...",
   "run.status.cancelled": "취소되었습니다.",
   "run.status.done": "완료!",
   "run.status.preempted": "중지됨: DLSS가 다른 곳에 선점되었습니다(RTX Video). 약 {pct}% 저장됨 - 그 동영상을 닫고 이어서를 클릭하세요.",

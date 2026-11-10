@@ -1,11 +1,10 @@
-// The render plan: engine/render_plan.py ported line by line, the
-// comments there carry the reasoning (the image scale / downscale fold, the output size, the
-// native offline eligibility). Pure functions; the callers write every stderr line.
+// The render plan: the image scale / downscale fold, the output size, the
+// native offline eligibility. Pure functions; the callers write every stderr line.
 import { dscaleVf, sourceSar, Stream } from './probe';
 import { pyFixed, pyRound } from './pyfmt';
 
-/** The render.py arguments the plan reads, typed as argparse has them (floats vs ints matter:
- * python prints a float argument as "2.0"). */
+/** The render arguments the plan reads, typed as the command line declares them (floats vs ints
+ * matter: a float argument prints as "2.0"). */
 export interface RenderArgs {
   multi: number; // int
   work_scale: string | null; // --scale: a DLSS mode or a number, the working size's share of the output

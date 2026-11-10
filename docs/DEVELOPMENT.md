@@ -326,7 +326,7 @@ the CLI's default with no model flag stays GMFSS):
   mask blurred 6 px) the output fades to the plain blend, so failed vectors show as ghosting,
   never as speckle (the first cut, a forward splat of the colours, shredded fast non-rigid
   motion into speckle; every warp built on the same vectors did, the fallback is what fixed it).
-  NATIVE HOST ONLY, torch-free, no
+  NATIVE HOST ONLY, no
   engine to build: integer `<multi>`, Sharpen, the upscale (Lanczos or RTX VSR, image scale
   included), Restore, DLSS 5 and RTX HDR run in the host's pass chain, the
   `--fps` mode is refused with its reason. Identical pairs pass through held like
@@ -838,8 +838,8 @@ HDR-presented window would be 2-3x over-bright instead), and a pair skipped by a
 is fed to the bridge once (result dropped) so NVIDIA's temporal hints stay consecutive. The
 host answers its handoff with the geometry (Image scale, the /64 pad the bridge instance is
 sized to, `engine=fruc`) plus `NATIVE-PATH fruc=` (the `engine/nvoffruc` folder, or
-`SMV_NVOFFRUC_DIR`), and the exe loads `nvoffruc_bridge.dll` from there and drives the same flat C
-API the ctypes class uses: the (R, G, B) model planes packed to true BGRA8 by the VSR bridge's
+`SMV_NVOFFRUC_DIR`), and the exe loads `nvoffruc_bridge.dll` from there and drives its flat C
+API: the (R, G, B) model planes packed to true BGRA8 by the VSR bridge's
 `k_packBgraRgb`, one bridge step per tween (feed-once, up to four FRUC instances in parallel, see the
 bridge section), `k_unpackBgraRgb` back, the same skipped-pair priming. A missing bridge / NvOFFRUC / cudart DLL refuses the session and names
 the file. `fsrfg` is AMD FSR frame generation's live twin on Smooth Motion's route (its ladders, x2 to
@@ -1585,14 +1585,14 @@ frames (`nativeFitPlanar`, its horizontal pass in `dTmp`); the 1:1 stores (`samp
 are `native: fit: WxH -> WxH, Lanczos (downscale|upscale)` and `fit=native-aa`; gates `rs_gate.py` and the
 `fitdown_*` / `*_upto_nat` cases of `eff_native.py`. Upscale to
 runs natively too: the host derives the internal render size from its own `--upscale H`
-exactly like `_Fit.__init__` (factor clamp 1/16..16, even dims, dropped when it equals the fit
+(factor clamp 1/16..16, even dims, dropped when it equals the fit
 rect), resizes the model frame there first (RTX VSR when it enlarges and VSR is on, else
 Lanczos, the separable pair) into a second planar frame, then fits that
 to the presented rect (the Lanczos pair with its vertical pass in the slot store, or the 1:1 store when the size
 stays); real frames go through the store like every other frame; the log lines are `native: live
 upscale to: model WxH -> WxH first, then 1:1|fit to
 WxH` and `upscale=native`; gate `harness\eff\upto_equiv.py` (the two-stage chain within 5e-5 of
-`_Fit._upscale` run in fp64, the stores off by one in under 1% of bytes, plus a 9596-height sweep of
+the reference resize run in fp64, the stores off by one in under 1% of bytes, plus a 9596-height sweep of
 the size derivation) and the `upto_*` cases of `eff_native.py`. Restore
 runs natively too, on the host's kernels (see `--restore`): the handoff names the bundled Real-ESRGAN
 (`NATIVE-PATH restore=native:realesr-animevideov3`), a `--restore-model` in AnimeJaNai's SPAN-F3 form
@@ -1612,9 +1612,8 @@ in fp64) and the `restore_*` cases of `eff_native.py`. The effects-only route ru
 natively too:
 `echo` (no
 model ticked) runs the host's no-engine mode: the handoff answers with the geometry only (`engine=none`,
-`NATIVE-PATH cache=` for the kernel cubin, the Restore line when Restore is on; without Restore
-it is torch-free on every start), no IFNet or encode engine is loaded, and every group stores its one
-real frame through the same effects chain (Identity's rule: an empty adaptive group presents nothing,
+`NATIVE-PATH cache=` for the kernel cubin, the Restore line when Restore is on), no IFNet or encode engine is loaded, and every group stores its one
+real frame through the same effects chain (an empty adaptive group presents nothing,
 any other group exactly one frame), `engine=none (effects only)` on the `native host ready` line.
 
 GMFSS on the native host. Both handoffs know the `gmfss` backend: `engine=gmfss` on the LIVE READY line with the half
@@ -1723,8 +1722,7 @@ three runs per config, deltas under about 5% mean nothing.
 ## Performance notes
 
 * The offline pipeline is GPU-compute-bound on this hardware. I/O and host-sync changes are
-  perf-neutral, batching the per-timestep nets does not help, `torch.compile` is out (shipping a JIT
-  breaks the no-deps promise), calibrated FP8 is closed (FusionNet no speedup, GMFlow 1.3x with
+  perf-neutral, batching the per-timestep nets does not help, calibrated FP8 is closed (FusionNet no speedup, GMFlow 1.3x with
   disqualifying flow outliers). The engine warns at startup when the GPU power limit sits below the
   board default (a laptop Silent profile costs 2..3x wall time).
 * Flow always runs at the model's native half resolution, at every source size. The old flow
@@ -1914,7 +1912,7 @@ at it.
 
 ## Building the native components
 
-Two ctypes bridges (`engine/rtxvideo/build_src/`, `engine/nvoffruc/build_src/`), the FSR frame
+Two flat C API bridges (`engine/rtxvideo/build_src/`, `engine/nvoffruc/build_src/`), the FSR frame
 generation and upscaling bridges (`engine/fsrfg`, `engine/fsrup`) and three D3D12 hosts (`engine/dlssg`,
 `engine/dlssnr`, `engine/live`), each with a `build_src/build.bat` that prints the missing environment variable. Nothing that needs MSVC is bundled; a recipient needs only
 the driver. Toolchain on the dev machine: VS 2019 Build Tools (`cl` 19.29) and VS 2026 Community
@@ -1989,7 +1987,7 @@ Rules: `/MT` is required (the NGX lib uses the static CRT). `cudart.lib`, `user3
 `advapi32` are all needed. **Never rebuild against CUDA 13**: `nvsdk_ngx_s.lib` calls
 `cudaGetDeviceProperties` with a CUDA 12 sized struct, a CUDA 13 cudart overruns it and the process
 dies with `0xC0000409` inside NGX `create()`. Keep the cu12 bridge as built and ship
-`cudart64_12.dll` beside it; torch uses cu13 cudart separately, the driver context is shared.
+`cudart64_12.dll` beside it; the host uses the cu13 cudart separately, the driver context is shared.
 
 ### NVIDIA Smooth Motion bridge (`nvoffruc_bridge.dll`)
 
@@ -2438,9 +2436,6 @@ Rules (hard-won, do not regress):
 
 ## Constraints
 
-* CUDA 13 (Blackwell): torch is the cu134 build; cupy finds the runtime through `cuda-pathfinder`.
-  cupy's NVRTC kernels only compile once torch has been imported first (it primes the DLL search
-  path for `nvrtc-builtins64_133.dll`): a dev script that uses both imports torch before cupy.
 * The RTX bridge stays cu12-built with `cudart64_12.dll` beside it (see its build section).
 * The renderer cannot run in a plain browser; launch through `npm start`.
 

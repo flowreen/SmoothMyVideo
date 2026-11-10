@@ -438,7 +438,6 @@
   "run.status.cancelling": "Cancelling...",
   "run.status.prevReady": "Paused. A preview of the part rendered so far (with sound & subtitles) is ready - click \"Play preview\".",
   "run.status.prevPending": "Paused; preview not ready yet (too few frames rendered) - Resume, then Pause again a bit later.",
-  "run.status.building": "Building TensorRT engines (one time for this resolution)...",
   "run.status.cancelled": "Cancelled.",
   "run.status.done": "Done!",
   "run.status.preempted": "Stopped: DLSS was preempted (RTX Video). ~{pct}% saved - close the video and click Resume.",

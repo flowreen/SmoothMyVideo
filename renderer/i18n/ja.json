@@ -438,7 +438,6 @@
   "run.status.cancelling": "キャンセル中...",
   "run.status.prevReady": "一時停止中。ここまでにレンダーされた部分のプレビュー (音声と字幕付き) ができました。「プレビューを再生」をクリックしてください。",
   "run.status.prevPending": "一時停止中。プレビューはまだ準備できていません (レンダーされたフレームが少なすぎます)。再開して、少し後でもう一度一時停止してください。",
-  "run.status.building": "TensorRT エンジンを構築中 (この解像度で 1 回のみ)...",
   "run.status.cancelled": "キャンセルしました。",
   "run.status.done": "完了!",
   "run.status.preempted": "停止: DLSS が横取りされました (RTX Video)。約 {pct}% 保存済み。動画を閉じて再開をクリックしてください。",

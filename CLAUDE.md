@@ -74,5 +74,5 @@ source paths in the table above; never search from the repo root.
   the look runs unless the user ticked it.
 * Comments and these docs say what the code does and why. No history: no dates, no task names, no "used to".
 * Prettier never touches `engine/`, `renderer/index.html` or `renderer/app.js` (`.prettierignore`).
-* Git: the maintainer commits and pushes. An agent stages only work that passed its checks, and never commits,
-  pushes, stashes or reverts.
+* Git: the maintainer commits and pushes. An agent stages only work that passed its checks and never commits,
+  pushes or reverts.

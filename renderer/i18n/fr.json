@@ -438,7 +438,6 @@
   "run.status.cancelling": "Annulation...",
   "run.status.prevReady": "En pause. Un aperçu de la partie déjà rendue (avec son et sous-titres) est prêt - cliquez sur «Lire l'aperçu ».",
   "run.status.prevPending": "En pause ; l'aperçu n'est pas encore prêt (trop peu d'images rendues) - reprenez, puis remettez en pause un peu plus tard.",
-  "run.status.building": "Construction des moteurs TensorRT (une seule fois pour cette résolution)...",
   "run.status.cancelled": "Annulé.",
   "run.status.done": "Terminé !",
   "run.status.preempted": "Arrêté : DLSS a été pris par une autre application (RTX Video). ~{pct}% enregistré - fermez la vidéo et cliquez sur Reprendre.",

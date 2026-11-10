@@ -438,7 +438,6 @@
   "run.status.cancelling": "Membatalkan...",
   "run.status.prevReady": "Dijeda. Pratinjau bagian yang sudah dirender (dengan suara & subtitle) sudah siap - klik \"Putar pratinjau\".",
   "run.status.prevPending": "Dijeda; pratinjau belum siap (frame yang dirender terlalu sedikit) - Lanjutkan, lalu Jeda lagi sebentar kemudian.",
-  "run.status.building": "Membangun mesin TensorRT (sekali saja untuk resolusi ini)...",
   "run.status.cancelled": "Dibatalkan.",
   "run.status.done": "Selesai!",
   "run.status.preempted": "Berhenti: DLSS diambil alih aplikasi lain (RTX Video). ~{pct}% tersimpan - tutup videonya dan klik Lanjutkan.",

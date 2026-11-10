@@ -22,7 +22,7 @@ import { checkEngineCache, engineCacheDir } from './render/cache';
 
 const ROOT = path.join(__dirname, '..');
 // When packaged, the engine ships as an unpacked extraResource (the host exe, its DLLs and
-// the ONNX must be real files on disk, not inside app.asar). The renderer and icon stay
+// the model weights must be real files on disk, not inside app.asar). The renderer and icon stay
 // under ROOT (Electron reads those from the asar fine).
 const ENGINE = app.isPackaged ? path.join(process.resourcesPath, 'engine') : path.join(ROOT, 'engine');
 // The render orchestrator and the before/after preview, compiled next to this file.
@@ -106,7 +106,7 @@ app.setAppUserModelId('com.smoothmyvideo.app');
 // Single instance only. A second launch shares this profile dir, and Chromium's disk/GPU cache and
 // Local Storage locks (held by the first instance) make the second window come up empty ("Unable to
 // move the cache: Access is denied", "Gpu Cache Creation failed"); it would also fight the first
-// instance over the preview PNGs and the TRT cache. So a second launch focuses the running window.
+// instance over the preview PNGs and the model cache. So a second launch focuses the running window.
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
@@ -2115,10 +2115,10 @@ ipcMain.handle('fruc-choose', async () => {
 
 // --- Dolby Vision + HDR10+ export tools: readiness + one-click install -----------------------------
 // DV Profile 8.1 export layers a Dolby Vision RPU on top of the HDR10 render, then tags the MP4 with a
-// dvvC box the engine writes itself (see hdr10_meta.inject_dv_config) - so the bundled ffmpeg is enough
+// dvvC box the engine writes itself (src/render/hdr10meta.ts injectDvConfig) - so the bundled ffmpeg is enough
 // to mux DV and NO GPAC/MP4Box is needed. HDR10+ export embeds ST 2094-40 dynamic metadata into the
-// HDR10 render; the engine collects the per-frame stats itself and hdr10plus_tool injects the SEI (see
-// _hp_export). The two non-bundled pieces are quietvoid's MIT tools: one click downloads the pinned
+// HDR10 render; the engine collects the per-frame stats itself and hdr10plus_tool injects the SEI
+// (src/render/dvhp.ts hpExport). The two non-bundled pieces are quietvoid's MIT tools: one click downloads the pinned
 // Windows x64 release zip, checks its SHA256 (the GitHub API digest) before anything is extracted,
 // extracts the exe with Windows' bsdtar and copies it into engine/dvtools / engine/hptools. "Ready" =
 // the exe present. Bump version, url, page, hash and size together.
@@ -2393,8 +2393,8 @@ function dlssScaleArg(mode?: string): string | null {
   return pct >= 1 && pct <= 99 ? (pct / 100).toFixed(2) : null;
 }
 
-// The render command line for one request (pure: the GUI state in, render.py's argv out; the TS
-// orchestrator dist/render/cli.js takes the same argv).
+// The render command line for one request (pure: the GUI state in, the argv of the render
+// orchestrator dist/render/cli.js out).
 function engineArgs(opts: RunOpts): string[] {
   const args = [opts.input, String(opts.multi), opts.output];
   // Output codec family (hevc default / av1 / vvc); the engine owns encoder pick + fallbacks.
@@ -2441,8 +2441,7 @@ function engineArgs(opts: RunOpts): string[] {
   if (opts.dlssnr && opts.nrautomask === 0) args.push('--nr-automask', '0');
   // Resize factor (an arbitrary float, source height -> chosen target height), computed by the
   // renderer from the resolution selector. >1 enables the upscale pass; <1 is a downscale the
-  // engine FOLDS into the decode (whole pipeline runs at the output size - also what keeps 4K
-  // sources inside TRT-safe flow shapes, so dropping it here re-breaks 4K GMFSS renders).
+  // engine FOLDS into the decode (the whole pipeline runs at the output size).
   // Without --rtx-vsr an upscale is a Lanczos3 resize; with it, RTX Video Super Resolution.
   if (opts.upscale && opts.upscale > 0 && opts.upscale !== 1) args.push('--upscale', String(opts.upscale));
   // RTX VSR: the real RTX Video SDK (the engine/rtxvideo CUDA bridge) for an enlarging resize: the
@@ -2481,11 +2480,10 @@ function engineArgs(opts: RunOpts): string[] {
   return args;
 }
 
-// The engine's environment. PYTHONUTF8 keeps the dynamo ONNX exporter's unicode logs from
-// crashing the engine during first-run TRT builds. The TRT cache deliberately gets NO override
+// The engine's environment. The model cache deliberately gets NO override
 // here: GUI and CLI runs share the one in-app cache in the app's top folder
 // (model_cache_safe_to_delete); a separate AppData cache would split them, so GUI renders
-// would rebuild engines the CLI cache already has. SMV_LIVE_PREVIEW makes the render drop a small PNG
+// would rebuild what the CLI cache already has. SMV_LIVE_PREVIEW makes the render drop a small PNG
 // of the frame being written about once a second; the renderer polls it for the live progress
 // thumbnail.
 function engineEnv(): NodeJS.ProcessEnv {
@@ -2563,7 +2561,7 @@ ipcMain.on('run', (e, opts: RunOpts) => {
   liveSpareDrop(); // the render gets the spare host's memory too; one starts again when the render is over
   clearPause(); // start unpaused: never inherit a stale flag from a previous (e.g. killed) run
   // The render orchestrator is TypeScript: this Electron binary run as plain
-  // node on dist/render/cli.js, which speaks render.py's stderr protocol and exit codes and runs
+  // node on dist/render/cli.js, which runs
   // every render on the native host. SMV_ENGINE_DIR = the engine folder
   // (packaged: resources/engine, outside the asar the script is read from).
   const proc = spawn(process.execPath, [RENDER_CLI, ...args], {
@@ -2761,13 +2759,13 @@ function previewPrefix(name: string): string {
 // Before/after preview: render ONE source frame at the current spatial settings (RTX HDR when opts.hdr,
 // Adaptive Sharpen when opts.sharpen > 0; no interpolation, no encode) and hand back the two PNG paths
 // for the renderer's side-by-side pane. render/preview.js (the render's decode and
-// the native host's pass chain, no python) writes <prefix>_original.png and _processed.png.
+// the native host's pass chain) writes <prefix>_original.png and _processed.png.
 // Resolves with { error } instead when the frame or the RTX bridge is unavailable.
 ipcMain.handle('preview', (_e, opts: PreviewOpts) => {
   return new Promise((resolve) => {
     const prefix = previewPrefix('frame');
     const args = previewArgv(opts, prefix);
-    // like the render: Electron's own node runs the compiled module (no python)
+    // like the render: Electron's own node runs the compiled module
     const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', SMV_ENGINE_DIR: ENGINE };
     execFile(process.execPath, args, { cwd: ENGINE, env, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
       if (err) {

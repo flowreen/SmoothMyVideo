@@ -1,8 +1,8 @@
-// Python's number rounding and formatting, reproduced exactly (the TypeScript render writes every
-// stderr note and pass argument exactly as the python render did). JavaScript differs from python on all of them:
-// Math.round and toFixed round a tie away from zero where python rounds half to even on the
-// double's EXACT value, `f"{x:g}"` switches to exponent form at other thresholds than
-// toPrecision, and `str(2.0)` is "2.0" where String(2.0) is "2". So the value is expanded to
+// The number rounding and formatting of the render's stderr notes, pass arguments and resume
+// records: Python's float formats, reproduced exactly. JavaScript differs on all of them:
+// Math.round and toFixed round a tie away from zero where these round half to even on the
+// double's EXACT value, the `g` format switches to exponent form at other thresholds than
+// toPrecision, and 2.0 prints as "2.0" where String(2.0) is "2". So the value is expanded to
 // its exact decimal (a double is m * 2^e, exactly m * 5^-e / 10^-e) and rounded on that.
 
 /** |x| = int / 10^scale, exactly (x finite). */
@@ -34,14 +34,14 @@ function rescale(int: bigint, scale: number, target: number): bigint {
   return q;
 }
 
-/** python round(x) for a float: the nearest integer, a tie to even. */
+/** The nearest integer, a tie to even (Python's round). */
 export function pyRound(x: number): number {
   const { int, scale } = exactDecimal(x);
   const q = Number(rescale(int, scale, 0));
   return x < 0 ? -q : q;
 }
 
-/** python format(x, `.{d}f`). */
+/** Fixed notation with d decimals (Python's `.{d}f` format). */
 export function pyFixed(x: number, d: number): string {
   const { int, scale } = exactDecimal(x);
   let s = rescale(int, scale, d).toString();
@@ -52,7 +52,7 @@ export function pyFixed(x: number, d: number): string {
   return (x < 0 || Object.is(x, -0) ? '-' : '') + s;
 }
 
-/** python format(x, `.{p}g`) (`:g` = p 6). */
+/** General notation with p significant digits (Python's `.{p}g` format; `:g` = p 6). */
 export function pyG(x: number, p = 6): string {
   const sign = x < 0 || Object.is(x, -0) ? '-' : '';
   if (x === 0) return sign + '0';
@@ -76,7 +76,7 @@ export function pyG(x: number, p = 6): string {
   return sign + s;
 }
 
-/** python repr(x) / str(x) for a float: the shortest round-trip digits, python's layout. */
+/** A float's shortest round-trip digits in Python's repr layout ("2.0", "1e-05"). */
 export function pyFloatRepr(x: number): string {
   if (!Number.isFinite(x)) return Number.isNaN(x) ? 'nan' : x < 0 ? '-inf' : 'inf';
   const sign = x < 0 || Object.is(x, -0) ? '-' : '';

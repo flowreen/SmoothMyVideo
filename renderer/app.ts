@@ -725,14 +725,14 @@ async function loadVideo(f) {
   setStatus('run.status.ready');
   applyScreenFps(); // re-asserts the interp / screen-rate state and recomputes the output name
   syncUpscale(); // recompute the upscale target + output dims for this video's resolution
-  // The preview cold-starts Python + torch + a CUDA context (several seconds on the first video of a
-  // session), which SATURATES the GPU and stalls Chromium's compositor - so if it spawns before the
+  // The preview starts the native host and a CUDA context, a GPU load that can stall Chromium's
+  // compositor - so if it spawns before the
   // file info has actually painted, the info (already probed in ~100ms, DOM updated synchronously
-  // above) can't reach the screen until that Python eases, which is the "video info loads slowly"
+  // above) can't reach the screen until that load eases, which is the "video info loads slowly"
   // bug. So: reveal the menu + file info now (showWorkspace above, synchronous), paint a loading
   // wheel on the preview panes (showPreviewInitializing, synchronous), then wait for a REAL composited
   // frame (two rAFs = one full paint) so the info is guaranteed on screen BEFORE the heavy preview
-  // Python starts. Skipped when a batch auto-advances (no per-item preview).
+  // starts. Skipped when a batch auto-advances (no per-item preview).
   if (!batchAuto) {
     showPreviewInitializing();
     requestAnimationFrame(() => requestAnimationFrame(openPreviewForVideo));
@@ -1003,7 +1003,7 @@ ipcRenderer.invoke('refresh-rate').then((hz) => {
 // upDims() honour both, so the long side never exceeds 15360px and the factor never exceeds 16x.
 const ENC_MAX = 15360; // 16K long side: the last encoder standing (libvvenc)
 const NVENC_MAX = 8192; // above this the engine encodes on the CPU (slower)
-const MAX_FACTOR = 16; // engine UPSCALE_F clamp (gmfss_interp.py)
+const MAX_FACTOR = 16; // the engine clamps the upscale factor here
 let screenW = 0,
   screenH = 0,
   rtxReady = { vsr: false, hdr: false, bridge: false };
@@ -2073,7 +2073,7 @@ function lvSendOpts() {
     // Restore (AI detail): Real-ESRGAN or AnimeJaNai first on every presented frame
     restore: restoreOn(),
     restoreModel: restoreModelId(),
-    // NVIDIA DLSS 5: Neural Rendering once per captured frame (runtime installed), python route
+    // NVIDIA DLSS 5: Neural Rendering once per captured frame (runtime installed)
     dlssnr: nrOn(),
     nrstructure: nrStructure(),
     nrtone: nrTone(),
@@ -4150,7 +4150,6 @@ ipcRenderer.on('engine-out', (_e, t) => {
     paint();
   } else if (!m) {
     // PROGRESS chunks are never logged; while cancelled they are dropped entirely
-    if (/\[trt\] building/.test(t)) setStatus('run.status.building');
     // OUTFRAMES is machine-only, and the engine's "done ..." line duplicates the ">> Saved: <path>"
     // the GUI prints on engine-done - strip both from the GUI log (they still show in CLI output).
     const shown = t

@@ -1,16 +1,15 @@
-// The before/after preview: engine/preview.py's job without python. ONE
+// The before/after preview. ONE
 // source frame at the current spatial settings -> <out>_original.png and <out>_processed.png
-// (+ <out>_nrmask.png), and preview.py's one stdout line. The frame comes from the render's own
+// (+ <out>_nrmask.png), and one stdout line. The frame comes from the render's own
 // decode (ffmpeg at the render's pixel format, the downscale folded in exactly as the render
 // folds it), the processed side runs the render's own pass chain in the native host
 // (smv-live.exe --offline --no-interp, one frame at the render's working size:
 // restore -> resize to the working size -> DLSS 5 -> the final resize / RTX VSR -> Adaptive Sharpen ->
 // TrueHDR), so the pane is the render's frame. This process only converts for display: the
 // PQ tonemaps, the 1:1 resize of the original pane, the DLSS 5 change mask and the PNG files;
-// that arithmetic follows preview.py's numpy float32 (Math.fround), whose comments carry the
-// reasoning. Two deliberate changes: the frame is decoded by ffmpeg like the render (preview.py
-// used cv2's own decode), and a 10-bit source keeps its 16-bit samples up to the display encode.
-// `node dist/render/preview.js <preview.py's arguments>`; main.ts runs it under Electron's node.
+// that arithmetic runs in float32 (Math.fround). The frame is decoded by ffmpeg like the render,
+// and a 10-bit source keeps its 16-bit samples up to the display encode.
+// `node dist/render/preview.js <the preview's arguments>`; main.ts runs it under Electron's node.
 // With --model-a / --model-b / --multi it runs a compare instead (compare() below).
 import { spawn } from 'child_process';
 import * as fs from 'fs';
@@ -82,7 +81,7 @@ function vsrQuality(a: PreviewArgs): string[] {
   return a.vsr_quality !== 4 ? ['--vsr-quality', String(a.vsr_quality)] : [];
 }
 
-/** preview.py's argparse flags. */
+/** The preview's command line flags. */
 export function parsePreviewArgv(argv: string[]): PreviewArgs {
   const a: PreviewArgs = {
     input: '',
@@ -249,7 +248,7 @@ function run(
   });
 }
 
-// ---- display arithmetic (preview.py, numpy float32) -----------------------------------------
+// ---- display arithmetic (float32) -----------------------------------------------------------
 const M2020_709 = [
   [1.6605, -0.5876, -0.0728],
   [-0.1246, 1.1329, -0.0083],
@@ -279,7 +278,7 @@ function table(levels: number, fn: (i: number) => number): Float32Array {
   return t;
 }
 
-/** numpy's float32 median (the mean of the two middle values for an even count), by selection. */
+/** The float32 median (the mean of the two middle values for an even count), by selection. */
 function median(v: Float32Array, n: number): number {
   const a = v.subarray(0, n);
   const k = n >> 1;
@@ -332,7 +331,7 @@ function to709(lin: Float32Array, lum: Float32Array): void {
   }
 }
 
-/** _shoulder_srgb: exposure k applied, the Reinhard shoulder above the knee, sRGB uint8. */
+/** Exposure k applied, the Reinhard shoulder above the knee, sRGB uint8. */
 function shoulderSrgb(lin: Float32Array, k: number): Buffer {
   const out = Buffer.alloc(lin.length),
     kf = f(k),
@@ -427,19 +426,19 @@ function pqLinear(fr: Frame): { lin: Float32Array; lum: Float32Array } {
   return { lin, lum };
 }
 
-/** _tonemap_pq's exposure: the lit median luminance at 0.2 linear. */
+/** tonemapPq's exposure: the lit median luminance at 0.2 linear. */
 function pqExposure(lum: Float32Array): number {
   const m = litMedian(lum, f(1e-5));
   return m !== null ? 0.2 / Math.max(1e-9, m) : 1.0;
 }
 
-/** _tonemap_pq: an already-PQ frame to sRGB, self-anchored (median luminance at 0.2 linear). */
+/** An already-PQ frame to sRGB, self-anchored (median luminance at 0.2 linear). */
 function tonemapPq(fr: Frame): Buffer {
   const { lin, lum } = pqLinear(fr);
   return shoulderSrgb(lin, pqExposure(lum));
 }
 
-/** A frame as display uint8 (torch's clamp * 255 then round half to even for 16-bit samples). */
+/** A frame as display uint8 (16-bit samples: clamp, * 255, then round half to even). */
 function toU8(fr: Frame): Buffer {
   if (fr.bits === 8) return fr.px;
   const c = codes(fr),
@@ -542,12 +541,12 @@ export function writePng(file: string, rgb: Buffer, w: number, h: number): void 
 }
 
 /** The DLSS 5 change mask: the processed pane dimmed to grey under a heat map of the change. */
-/** The render's progress thumbnail (render.py _live_preview's formatting worker): the
+/** The render's progress thumbnail: the
  * host's "SMVT" dump (smv-live.exe --thumb: uint32 w, h, fmt 0 rgb24 / 1 rgb48le / 2 x2rgb10le,
  * then the samples) to the GUI's PNG, tmp then replace. SDR as is; a PQ source carried through
- * gets the pane's self-anchored _tonemap_pq; a TrueHDR output the same self-anchored exposure
- * (deviation: python anchored it to the SDR frame before TrueHDR, which the host's writer thread
- * never holds). Never throws: a thumbnail must never break the render. */
+ * gets the pane's self-anchored tonemapPq; a TrueHDR output the same self-anchored exposure
+ * (the SDR frame before TrueHDR cannot anchor it: the host's writer thread
+ * never holds that frame). Never throws: a thumbnail must never break the render. */
 export function thumbPng(raw: string, png: string, srcPq: boolean): void {
   try {
     const b = fs.readFileSync(raw);
@@ -570,7 +569,7 @@ export function thumbPng(raw: string, png: string, srcPq: boolean): void {
     writePng(tmp, rgb, w, h);
     fs.renameSync(tmp, png);
   } catch {
-    /* except Exception: pass */
+    /* no thumbnail this time */
   }
 }
 
@@ -788,14 +787,14 @@ function passFlags(
   return args;
 }
 
-/** preview.py main(): writes the PNGs and resolves to its stdout line. */
+/** The preview: writes the PNGs and resolves to its stdout line. */
 export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.env): Promise<string> {
   const s = await setup(a, env);
   const { ENGINE, idx, n, W, H, OW, OH, WW, WH, bits, DEC_FMT, bpp, strength, srcHdr, transfer, up } = s;
   const { needVsr, nrOn, doHdr } = s;
   let at = idx;
   let px = await s.decode(at);
-  if (!px && idx > 0) px = await s.decode((at = 0)); // a missed seek: frame 0, like preview.py
+  if (!px && idx > 0) px = await s.decode((at = 0)); // a missed seek: frame 0
   if (!px) throw new Error('could not read a frame from ' + a.input);
   const orig: Frame = { w: W, h: H, bits, px };
   // the before pane: the source itself when the working size folds the decode
@@ -868,7 +867,7 @@ export async function preview(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
     }
   } else proc = orig; // nothing enabled: the render would leave the frame as is
 
-  // display conversion (preview.py: a PQ source gets the self-anchored tonemap on both panes)
+  // display conversion (a PQ source gets the self-anchored tonemap on both panes)
   const pq = transfer === 'smpte2084';
   let origDisp = pq ? tonemapPq(before) : toU8(before);
   const procDisp = hdrWords ? tonemapHdr(hdrWords, OW, OH, before) : pq ? tonemapPq(proc!) : toU8(proc!);

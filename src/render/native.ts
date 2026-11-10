@@ -1,5 +1,4 @@
-// The offline render: ported from render.py,
-// every stderr line as render.py wrote it. This process probes, plans, picks the encoder, resumes,
+// The offline render and every stderr line it writes. This process probes, plans, picks the encoder, resumes,
 // spawns the decoder / encoder and the host (smv-live.exe --offline, one-shot or the resident host
 // behind its named pipe), relays the host's lines and finishes the container; no frame passes
 // through it (only the progress thumbnail's small dump, thumbPng).
@@ -95,7 +94,7 @@ function clamp(x: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, x));
 }
 
-/** The resident offline host's control pipe name (render.py _offline_pipe_name). */
+/** The resident offline host's control pipe name. */
 function offlinePipeName(exe: string): string {
   return (
     process.env.SMV_OFFLINE_HOST_PIPE ||
@@ -111,14 +110,14 @@ function openPipe(p: string, flags: string): number | null | -1 {
   }
 }
 
-/** Ask an idle resident offline host to exit (render.py _offline_host_quit). */
+/** Ask an idle resident offline host to exit. */
 export function offlineHostQuit(exe: string): void {
   const fd = openPipe('\\\\.\\pipe\\' + offlinePipeName(exe), 'r+');
   if (fd === null || fd === -1) return;
   try {
     fs.writeSync(fd, 'quit\n');
   } catch {
-    /* except OSError: pass */
+    /* a host that left meanwhile needs no quit */
   } finally {
     fs.closeSync(fd);
   }
@@ -603,7 +602,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       );
   }
   const CASCADE = DG_PASSES.length > 1;
-  // the model lines render.py writes on this route
+  // the line that names the interpolation model
   if (NO_INTERP)
     say('no-interp mode: GMFSS interpolation disabled (re-encode at source fps with optional Adaptive Sharpen)\n');
   else if (FRUC_MODE) say('Using the NVIDIA Smooth Motion backend for interpolation (NVIDIA Optical Flow)\n');
@@ -614,7 +613,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   else if (RIFE_MODE) say('Using the RIFE backend for interpolation (4.25, native host)\n');
   if (kind === 'gmfss') say('Using the GMFSS backend for interpolation (native host)\n');
 
-  // RTX HDR / DV / HDR10+ (render.py's upscale / HDR backend block, native half)
+  // RTX HDR / DV / HDR10+
   const SRC_HDR_IN = ['smpte2084', 'arib-std-b67'].includes(String(tag(ST, 'color_transfer') || ''));
   if (RTX_HDR && (OUT_W > 8192 || OUT_H > 8192)) {
     say(
@@ -704,7 +703,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       };
   }
 
-  // resume (render.py's _try_resume block + the native HDR prefix)
+  // resume (tryResume + the HDR prefix)
   const grid = {
     noInterp: NO_INTERP,
     fpsMode: FPS_MODE,
@@ -964,7 +963,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     try {
       fs.unlinkSync(hdrStats);
     } catch {
-      /* except OSError: pass */
+      /* no statistics file from an earlier run */
     }
   }
   const PAUSE_FILE = env.SMV_PAUSE_FILE;
@@ -1120,7 +1119,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     return s;
   };
 
-  // the resident host (render.py _native_resident_render), else one exe for this render
+  // the resident host (residentRender), else one exe for this render
   let nrc: number | null = null;
   // the encoder's exit code: a host can finish writing every frame before a dying encoder closes
   // its pipe (NVENC refusing a tiny frame), so the host's code alone cannot tell a good render
@@ -1475,7 +1474,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   return 0;
 }
 
-/** render.py _offline_host_connect + _native_resident_render: the item over the control pipe, the
+/** One render on the resident host: the item over the control pipe, the
  * decoder and the encoder on the host's frame pipes. null = no host served it (nothing spawned). */
 async function residentRender(
   exe: string,
@@ -1600,7 +1599,7 @@ function powerQuery(): Promise<string | null> {
   });
 }
 
-/** render.py _power_notice: one line when the GPU runs under a reduced power limit (`report` = powerQuery's). */
+/** One line when the GPU runs under a reduced power limit (`report` = powerQuery's). */
 export function powerNotice(report: string | null, say: Say): void {
   if (report === null) return;
   try {
@@ -1617,7 +1616,7 @@ export function powerNotice(report: string | null, say: Say): void {
         try {
           vals[k] = pyFloatParse(v);
         } catch {
-          /* except ValueError: pass */
+          /* not a number: the key stays unset */
         }
       }
     }
@@ -1640,13 +1639,13 @@ export function powerNotice(report: string | null, say: Say): void {
 
 export const SESSION_LOG = path.join(os.tmpdir(), 'smv-engine.log');
 
-/** render.py's crash policy: the full stack into the session log, one short line for the GUI. */
+/** A crash: the full stack into the session log, one short line for the GUI. */
 function crashLine(e: unknown, argv: string[]): string {
   const x = e as Error;
   try {
     fs.appendFileSync(SESSION_LOG, `[${stamp()}] ${pyArgv(argv)}\n${x && x.stack ? x.stack : String(e)}\n\n`, 'utf8');
   } catch {
-    /* except OSError: pass */
+    /* a log that cannot be written never hides the crash line */
   }
   if (process.env.SMV_TRACE === '1' && x && x.stack) return x.stack + '\n';
   return `ERROR: ${x && x.name ? x.name : 'Error'}: ${Array.from(String(x && x.message !== undefined ? x.message : e))
@@ -1660,17 +1659,17 @@ export function stamp(): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-/** sys.argv as python prints it in the session log header. */
+/** The command line as the session log's header prints it: a bracketed list of quoted strings. */
 export function pyArgv(argv: string[]): string {
   return '[' + [path.join(__dirname, 'cli.js'), ...argv].map(pyReprStr).join(', ') + ']';
 }
 
-/** One render, render.py's contract. Resolves to the exit code; every line goes through say. */
+/** One render. Resolves to the exit code; every line goes through say. */
 export async function renderRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv = process.env): Promise<number> {
   try {
     parseRenderArgv(argv);
   } catch (e) {
-    say(`render: error: ${(e as Error).message}\n`); // argparse's exit code
+    say(`render: error: ${(e as Error).message}\n`); // exit code 2 = a bad command line
     return 2;
   }
   try {

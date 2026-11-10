@@ -1,26 +1,25 @@
 // nvoffruc_bridge.cpp
 //
-// Bridge between SmoothMyVideo's Python engine and NVIDIA's NvOFFRUC.dll (the Frame Rate Up
+// Bridge between SmoothMyVideo's native host and NVIDIA's NvOFFRUC.dll (the Frame Rate Up
 // Conversion library in the NVIDIA Optical Flow SDK). This is the "Nvidia Smooth Motion" model:
 // hardware optical-flow interpolation on the OFA engine, deliberately offered as the inferior /
 // faster alternative to GMFSS.
 //
 // This software contains source code provided by NVIDIA Corporation.
 //
-// Derivative of the NvOFFRUCSample, reduced to the CUDA path and exposed as a flat cdecl C API for
-// ctypes, mirroring engine/rtxvideo/build_src. It loads NvOFFRUC.dll from its own folder only after
+// Derivative of the NvOFFRUCSample, reduced to the CUDA path and exposed as a flat cdecl C API,
+// mirroring engine/rtxvideo/build_src. It loads NvOFFRUC.dll from its own folder only after
 // an Authenticode check that NVIDIA signed it (signed_by_nvidia; never a plain LoadLibrary).
 //
 // NO CUDA TOOLKIT NEEDED TO BUILD. The bridge uses only the CUDA *driver* API from nvcuda.dll (the
 // always-present driver). Like the SDK sample, it creates its OWN CUDA context (cuCtxCreate) and runs
-// FRUC there, with three DEDICATED cuMemAlloc surfaces registered with FRUC; the engine's torch
-// frames (in torch's primary context) are copied in/out with cuMemcpyDtoD, which works across
-// contexts via CUDA unified addressing. (Historical note: the earlier "access violation" in Process
-// was NOT a context issue - it was a pointer-indirection bug. FRUC's pFrame and registered resources
+// FRUC there, with three DEDICATED cuMemAlloc surfaces registered with FRUC; the host's
+// frames (in the primary context) are copied in/out with cuMemcpyDtoD, which works across
+// contexts via CUDA unified addressing. FRUC's pFrame and registered resources
 // must be CUdeviceptr* i.e. the HOST address of the variable holding the device pointer, exactly as
-// NvOFFRUCSample passes &m_pRenderFrameCudaMemPtr[i], NOT the device-pointer value; the library
-// dereferences pFrame host-side at Process, so a raw device value AV'd. The dedicated context is kept
-// only because it mirrors the sample and is harmless.) FRUC carries its own cudart64_110.dll.
+// NvOFFRUCSample passes &m_pRenderFrameCudaMemPtr[i], NOT the device-pointer value: the library
+// dereferences pFrame host-side at Process, so a raw device value is an access violation. The
+// dedicated context mirrors the sample. FRUC carries its own cudart64_110.dll.
 //
 // INSTANCES: up to kMaxInst FRUC instances live in this one module, each with its own CUDA
 // context, surfaces and NvOFFRUC handle, so callers on different threads run them concurrently
@@ -245,7 +244,7 @@ static bool load_driver()
     return true;
 }
 
-// FRUC's context current for a call; returns the caller's context (torch's / the host's) to restore
+// FRUC's context current for a call; returns the caller's context (the host's) to restore
 static void* enter_ctx(Inst& s)
 {
     void* p = nullptr;
@@ -289,7 +288,7 @@ static int create_inst(Inst& s, unsigned width, unsigned height)
         return -8;
     }
     void* caller = nullptr;
-    cuCtxGetCurrentFn(&caller); // remember torch's context
+    cuCtxGetCurrentFn(&caller); // remember the caller's context
     if (cuCtxCreateFn(&s.ctx, 0, dev) != 0)
     {
         set_err("cuCtxCreate failed");
@@ -344,7 +343,7 @@ static int create_inst(Inst& s, unsigned width, unsigned height)
         return -5;
     }
 
-    cuCtxSetCurrentFn(caller); // restore torch's context
+    cuCtxSetCurrentFn(caller); // restore the caller's context
     s.ts = 0.0;
     s.last = -1;
     return 0;
@@ -574,13 +573,13 @@ extern "C"
             return -1;
         }
         // SYNC FENCE (in): CUDA does not order this context's null-stream copies against the CALLER's
-        // context/streams (torch packs the input surfaces with kernels of its own). Drain the caller's
-        // context while it is still current, or the DtoD below can copy half-written surfaces - every
-        // tween came out sliced at horizontal seams under torch 2.13 (2.12 won the race by luck).
+        // context/streams (the caller packs the input surfaces with kernels of its own). Drain the caller's
+        // context while it is still current, or the DtoD below can copy half-written surfaces: a
+        // tween then comes out sliced at horizontal seams.
         cuCtxSynchronizeFn();
         void* caller = enter_ctx(s); // FRUC's context current for the duration
 
-        // cuMemcpyDtoD works across contexts via unified addressing (source is torch's pointer).
+        // cuMemcpyDtoD works across contexts via unified addressing (the source is the caller's pointer).
         if (cuMemcpyDtoDFn(s.prev, (unsigned long long)(uintptr_t)prevPtr, s.bytes) != 0 ||
             cuMemcpyDtoDFn(s.cur, (unsigned long long)(uintptr_t)curPtr, s.bytes) != 0)
         {

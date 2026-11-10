@@ -115,7 +115,7 @@ class cuda_api_impl
 
     // Dedicated, persistent arrays for the split single-feature deviceptr paths (VSR-only and
     // TrueHDR-only). Keeping them separate from the combined m_cuArray* above means that running
-    // VSR then (a Python-side RCAS sharpen) then TrueHDR as two evals does not thrash one shared
+    // VSR, then a pass of the caller's own, then TrueHDR as two evals does not thrash one shared
     // array between the two stages' differing dims/formats; each stays at a stable size.
     CUarray                     m_vsrSrcArr                 = nullptr;
     CUtexObject                 m_vsrSrcTex                 = 0;
@@ -140,7 +140,7 @@ public:
     API_BOOL evaluate(uint64_t cuTexObject_Input, uint64_t cuSurfObject_Output, API_RECT inputRect, API_RECT outputRect, API_VSR_Setting* pVSRSetting, API_THDR_Setting* pTHDRSetting, bool runVSR, bool runTHDR);
     API_BOOL evaluate_deviceptr(void* cuDeviceptr_Input, void* cuDeviceptr_Output, API_RECT inputRect, API_RECT outputRect, API_VSR_Setting* pVSRSetting, API_THDR_Setting* pTHDRSetting);
     API_BOOL evaluate_hostptr(void* hostptr_Input, void* hostptr_Output, API_RECT inputRect, API_RECT outputRect, API_VSR_Setting* pVSRSetting, API_THDR_Setting* pTHDRSetting);
-    // Single-feature deviceptr paths so a Python-side RCAS sharpen can run between VSR and TrueHDR
+    // Single-feature deviceptr paths so a pass of the caller's own can run between VSR and TrueHDR
     // at the output resolution. VSR: 8-bit RGBA in (inputRect) -> 8-bit RGBA out (outputRect).
     // TrueHDR: 8-bit RGBA in -> packed 10:10:10:2 out, both at the same (output) rect.
     API_BOOL evaluate_vsr_deviceptr(void* cuDeviceptr_Input, void* cuDeviceptr_Output, API_RECT inputRect, API_RECT outputRect, API_VSR_Setting* pVSRSetting);

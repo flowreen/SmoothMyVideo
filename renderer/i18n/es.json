@@ -438,7 +438,6 @@
   "run.status.cancelling": "Cancelando...",
   "run.status.prevReady": "En pausa. Hay una vista previa de lo renderizado hasta ahora (con sonido y subtítulos) - haz clic en \"Reproducir vista previa\".",
   "run.status.prevPending": "En pausa; la vista previa aún no está lista (se han renderizado muy pocos fotogramas) - reanuda y vuelve a pausar un poco más tarde.",
-  "run.status.building": "Creando los motores TensorRT (una sola vez para esta resolución)...",
   "run.status.cancelled": "Cancelado.",
   "run.status.done": "¡Listo!",
   "run.status.preempted": "Detenido: otra aplicación tomó DLSS (RTX Video). ~{pct}% guardado - cierra el video y haz clic en Reanudar.",

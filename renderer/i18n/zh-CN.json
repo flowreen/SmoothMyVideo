@@ -438,7 +438,6 @@
   "run.status.cancelling": "正在取消...",
   "run.status.prevReady": "已暂停。已渲染部分的预览（含音频和字幕）已就绪 - 点击“播放预览”。",
   "run.status.prevPending": "已暂停；预览尚未就绪（已渲染的帧太少）- 继续渲染，稍后再暂停一次。",
-  "run.status.building": "正在构建 TensorRT 引擎（此分辨率只需一次）...",
   "run.status.cancelled": "已取消。",
   "run.status.done": "完成!",
   "run.status.preempted": "已停止：DLSS 被抢占（RTX Video）。已保存约 {pct}% - 关闭该视频后点击继续。",

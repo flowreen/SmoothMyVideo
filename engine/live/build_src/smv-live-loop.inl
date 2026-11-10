@@ -2399,10 +2399,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // current value. An explicit --gen (harness/perf use) keeps the exact classic spawn.
             const bool fixedDerived = g_noAdapt && g_targetFps > 0 && !g_genExplicit && !g_fgOver;
             const int spawnGen = fixedDerived ? ceilGen : genFrames;
-            // The backend's model + TRT engines can take tens of seconds to build the FIRST time
-            // at a new resolution (a fullscreen capture is often a never-before-built size:
-            // measured ~6s RIFE, ~35s GMFSS). srv.start() blocks for that whole cold start, and
-            // server backends do no warmup pre-present, so the overlay used to show nothing until
+            // The backend's start can take seconds (its kernels are compiled on a first run, then
+            // the weights and the buffers). srv.start() blocks for that whole cold start, and
+            // server backends do no warmup pre-present, so the overlay would show nothing until
             // it finished - which reads as "it never turned on" (while DLSS-G, no server, feels
             // instant). Load on a BACKGROUND thread and present the raw captured frames meanwhile,
             // so the overlay is visibly LIVE from the first second; it just isn't smoothed yet.
@@ -3621,7 +3620,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             prevSentTs = sentTs;
             return nfr;
         };
-        // The 2s stats line, shared by both loops below. scripts/smoke.py and the GUI parse
+        // The 2s stats line, shared by both loops below. The GUI and test scripts parse
         // "live: A captured fps -> B presented fps (ratio R, ...) latency ~Nms"; DLSS-G
         // reports its SL handoff instead of a latency (SL paces and presents internally
         // after it) and the GUI omits that. target = output frames per source frame the
@@ -3672,7 +3671,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if (st)
                 sprintf_s(slf, " status=%d actuallyPresented=%u", (int)st->status, st->numFramesActuallyPresented);
             // identical-pair passthrough: the native host's held count, APPENDED (the GUI and
-            // scripts/smoke.py read the fields before it).
+            // test scripts read the fields before it).
             char stc[32] = "";
             if (g_staticHold)
                 sprintf_s(stc, " static=%llu", (unsigned long long)g_staticHeld);
@@ -5647,7 +5646,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         {
                             double avg = 0, l1 = 0, l01 = 0;
                             Host::histStats(host.prHist, hn, avg, l1, l01);
-                            // NOT "live: " - scripts/smoke.py reads the LAST line with that exact
+                            // NOT "live: " - test scripts read the LAST line with that exact
                             // prefix as the captured/presented stats line
                             LOG("live pacing: present spacing %.0f fps avg | 1%% low %.0f | 0.1%% low %.0f "
                                 "(%llu presents, effective target %.0f of %.0f)\n",

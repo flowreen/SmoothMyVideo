@@ -1,9 +1,9 @@
-// `node dist/render/cli.js <render.py's arguments>`: the render's command
-// line, speaking render.py's stderr protocol and exit codes; every render runs in this process
+// `node dist/render/cli.js <the render's arguments>`: the render's command
+// line, with its stderr protocol and exit codes; every render runs in this process
 // (native.ts) on the native host.
-// Like render.py it appends its session to THE log (%TEMP%\smv-engine.log, truncated past 8 MB):
+// It appends its session to THE log (%TEMP%\smv-engine.log, truncated past 8 MB):
 // a header line, every line it writes, and a crash's full stack. The ffmpeg / host children write
-// their own stderr straight to the GUI (python's fd-level tee also copied that into the log; a
+// their own stderr straight to the GUI and not into the log (a
 // node tee would have to pipe it through this process, which blocks on the resident host's
 // control pipe, so a chatty child could stall).
 import * as fs from 'fs';
@@ -17,7 +17,7 @@ function openLog(argv: string[]): number | null {
     try {
       if (fs.statSync(SESSION_LOG).size > LOG_CAP) fs.writeFileSync(SESSION_LOG, '');
     } catch {
-      /* except OSError: pass */
+      /* no log yet, or one that cannot be truncated: append anyway */
     }
     const fd = fs.openSync(SESSION_LOG, 'a');
     fs.writeSync(fd, `[${stamp()}] ${pyArgv(argv)}\n`);
@@ -36,7 +36,7 @@ if (require.main === module) {
       try {
         fs.writeSync(log, s);
       } catch {
-        /* except OSError: pass */
+        /* a failed log write never stops the render */
       }
     }
   };

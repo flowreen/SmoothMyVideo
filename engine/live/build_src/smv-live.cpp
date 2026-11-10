@@ -107,8 +107,7 @@ static bool g_dlssgWorkFloor = false;
 // backend-agnostic server route). BK_SERVER = a model backend (rife, gmfss, nvof, fruc,
 // fsrfg, rifedrba, echo) run by the in-process native host (smv-live-native.inl); it returns N output
 // frames per input and this host paces their presentation across the measured capture
-// interval. Comments that name functions of engine/live_server.py (the python server this host
-// replaced) record where the math was ported from.
+// interval.
 enum Backend
 {
     BK_DLSSG,
@@ -136,9 +135,9 @@ static bool g_staticHold = true;  // the passthrough is on (SMV_NO_STATIC_HOLD=1
 static uint64_t g_staticHeld = 0; // pairs held this session, reported as `static=N`
 static std::wstring g_script;     // --script: any path inside the engine folder (see engineScript)
 
-// The host finds the runtime DLLs, the engine cache, engine\onnx and the weights relative to
+// The host finds the runtime DLLs, the model cache and the weights relative to
 // the engine folder, which it takes as the folder of this path. The file name is never opened:
-// callers (src/render, harnesses) pass engine/live_server.py, the old live server's path.
+// callers (src/render, harnesses) pass engine/live_server.py, a name only (no such file exists).
 // Shipped layout: engine\live\smv-live.exe, so the default is one level up.
 static std::wstring engineScript(const std::wstring& exeDir)
 {
@@ -181,22 +180,22 @@ static int g_upscaleH = 0;     // --upscale H: forwarded to the server (the app'
                                // height as the internal render size before the fit)
 static bool g_restore = false; // --restore: forwarded to the server (Real-ESRGAN first on
                                // every composed frame, the app's Restore checkbox)
-static bool g_restoreA4k = false;              // --restore-anime4k (implies --restore): Restore = Anime4K's Restore
-                                               // CNN UL on the host's kernels (a --restore-model wins over it)
-static std::string g_restoreModel;             // --restore-model PATH (implies --restore): Restore's model = this
-                                               // ONNX file (the user's AnimeJaNai download); empty = Real-ESRGAN
-static bool g_dlssnr = false;                  // --dlssnr: forwarded to the server (DLSS 5 Neural Rendering
-                                               // once per captured frame, the app's NVIDIA DLSS 5 checkbox)
-static double g_nrStructure = 1.0;             // --nr-structure F (0..2, the DLSS 5 Structure Intensity)
-static double g_nrTone = 1.0;                  // --nr-tone F (0..2, the DLSS 5 Tone Intensity)
-static double g_nrSkin = -1.0;                 // --nr-skin F (DLSSNR.SkinStructureStrength: < 0 follows structure)
-static int g_nrAutoMask = 1;                   // --nr-automask 0|1 (DLSSNR.UseAutoMask, NVIDIA's character mask)
-static int g_nrStyle = 0;                      // --nr-style N (DLSSNR.Style: 0 Default, 1 Natural, 2 Cinematic)
-static int g_nrPasses = 1;                     // --nr-passes N (1..nr::kMaxPasses: DLSS 5 chained N times per frame)
-static bool g_nrNative = false;                // DLSS 5 NR runs inside this exe (the native host's pass); the
-                                               // server is then NOT told --dlssnr
-static bool g_liveNrCuda = false;              // live DLSS 5: the native host runs it on the
-                                               // model frame after Restore and the resize (nativeLiveNrInit)
+static bool g_restoreA4k = false;  // --restore-anime4k (implies --restore): Restore = Anime4K's Restore
+                                   // CNN UL on the host's kernels (a --restore-model wins over it)
+static std::string g_restoreModel; // --restore-model PATH (implies --restore): Restore's model = this
+                                   // file (AnimeJaNai: the app's .pkl or the author's ONNX); empty = Real-ESRGAN
+static bool g_dlssnr = false;      // --dlssnr: forwarded to the server (DLSS 5 Neural Rendering
+                                   // once per captured frame, the app's NVIDIA DLSS 5 checkbox)
+static double g_nrStructure = 1.0; // --nr-structure F (0..2, the DLSS 5 Structure Intensity)
+static double g_nrTone = 1.0;      // --nr-tone F (0..2, the DLSS 5 Tone Intensity)
+static double g_nrSkin = -1.0;     // --nr-skin F (DLSSNR.SkinStructureStrength: < 0 follows structure)
+static int g_nrAutoMask = 1;       // --nr-automask 0|1 (DLSSNR.UseAutoMask, NVIDIA's character mask)
+static int g_nrStyle = 0;          // --nr-style N (DLSSNR.Style: 0 Default, 1 Natural, 2 Cinematic)
+static int g_nrPasses = 1;         // --nr-passes N (1..nr::kMaxPasses: DLSS 5 chained N times per frame)
+static bool g_nrNative = false;    // DLSS 5 NR runs inside this exe (the native host's pass); the
+                                   // server is then NOT told --dlssnr
+static bool g_liveNrCuda = false;  // live DLSS 5: the native host runs it on the
+                                   // model frame after Restore and the resize (nativeLiveNrInit)
 static std::atomic<bool> g_liveNrReset{false}; // the overlay was hidden: the next evaluate starts a new stream
 static bool g_nrAttempted = false;             // NGX was initialised in this process (even if it then
                                                // refused): leave through ExitProcess, see the end of run()
@@ -817,7 +816,7 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 //               no model, --multi ignored; --xess-fg = Intel XeSS-FG on --fsrfg's route)
 //               [--fps-ratio R] (--fps mode: R output frames per source frame, --multi ignored)
 //               (RIFE: the host finds or builds the engines itself, lkOfflineRife)
-//               the per-frame passes: [--out-w W --out-h H] [--restore | --restore-model ONNX | --restore-anime4k]
+//               the per-frame passes: [--out-w W --out-h H] [--restore | --restore-model FILE | --restore-anime4k]
 //               [--rtx-vsr [--vsr-quality N] | --fsr-upscale | --anime4k | --artcnn | --xess-upscale]
 //               [--dlssnr --nr-structure F --nr-tone F [--nr-skin F] [--nr-automask 0|1] --nr-style N
 //               [--nr-delta PATH]] [--sharpen S]
@@ -1151,13 +1150,13 @@ struct OfflineIo
     bool readerEof = false, fail = false;
     uint64_t framesIn = 0, framesOut = 0, totalFrames = 0, lastPairs = 0;
     int multi = 2;
-    bool frameUnits = false; // --no-interp: PROGRESS counts frames over --frames (render.py's NB)
-    double fpsRatio = 0.0;   // --fps mode: pairs close on render.py's _pair_fracs grid, not per multi
+    bool frameUnits = false; // --no-interp: PROGRESS counts frames over --frames
+    double fpsRatio = 0.0;   // --fps mode: pairs close on the output rate's slot grid, not per multi
     uint64_t fpsPairs = 0;
     uint64_t outBase = 0; // --resume-out: the banked output frames, so PROGRESS / OUTFRAMES count the whole render
     uint64_t skipIn = 0;  // --skip-in: input frames the reader discards before the first real one
     HANDLE hStdin = nullptr, hStdout = nullptr;
-    // --thumb PATH: the GUI's render progress thumbnail, render.py's _live_preview.
+    // --thumb PATH: the GUI's render progress thumbnail.
     // About once a second the writer drops a small copy of the frame it is writing (the output
     // pixfmt kept, the TS side tonemaps and encodes it) and logs THUMB; --thumb-off FILE present =
     // the GUI's Hide, nothing is made. outFmt: 0 rgb24, 1 rgb48le, 2 x2rgb10le
@@ -1398,7 +1397,7 @@ static void offlineWriter(OfflineIo* io)
             io->cv.notify_all();
         }
         // PROGRESS in pairs: every (multi) output frames close one pair, whichever kind they are
-        // (--no-interp: in frames, python's frames_loop unit; --fps: pair p closes once
+        // (--no-interp: in frames; --fps: pair p closes once
         // ceil((p + 1) * ratio - 0.5) frames are out, and a jump over a multiple still reports)
         {
             const uint64_t outN = io->outBase + io->framesOut;
@@ -1426,12 +1425,12 @@ static void offlineWriter(OfflineIo* io)
 }
 
 // ---- DLSS 4.5 = engine\dlssg\dlssg2f.exe --server as this process's child ---------------------
-// dlssg.py's DLSSG class in C++: raw RGBA8 frames at the padded size on the child's stdin (hdr10:
+// The DLSS 4.5 server's client: raw RGBA8 frames at the padded size on the child's stdin (hdr10:
 // R10G10B10A2 words of PQ BT.2020, --hdr10), after the first one the gen generated frames of every
 // pair on its stdout; its stderr lines are forwarded to the log. A read that blocks over 10 s (or
-// over 1 s while the GUI holds Pause) kills the child (the watchdog = python's _pause_watch), and a
-// failed pair restarts it and re-primes with the pair's left frame, up to 4 times (python's
-// _MAX_RESTARTS, 3 s apart).
+// over 1 s while the GUI holds Pause) kills the child (the watchdog, dgWatch), and a
+// failed pair restarts it and re-primes with the pair's left frame, up to 4 times
+// (3 s apart).
 struct DgChild
 {
     std::wstring dir, pauseFile;
@@ -1722,7 +1721,7 @@ static bool dgWrite(DgChild& c, const uint8_t* p, size_t n)
     return ok;
 }
 
-// the watchdog (python's _pause_watch): a stuck read gets its server killed, so the pair's
+// the watchdog: a stuck read gets its server killed, so the pair's
 // restart loop takes over
 static void dgWatch(DgChild* c)
 {
@@ -1745,9 +1744,9 @@ static void dgWatch(DgChild* c)
     }
 }
 
-// one pair through the server (dlssg.py interpolate): prev once when the server has not seen it
+// one pair through the server: prev once when the server has not seen it
 // (primed = it has), then cur, then the gen frames into out. 0 = ok, 3 = the multiplier is beyond
-// this GPU, 4 = the server stayed lost through its restarts (python's DLSSHostLost)
+// this GPU, 4 = the server stayed lost through its restarts
 static int dgPair(DgChild& c, const uint8_t* prev, const uint8_t* cur, uint8_t* out, bool& primed, bool sent = false)
 {
     const size_t fb = (size_t)c.w * c.h * 4;
@@ -1818,34 +1817,34 @@ struct OfflineArgs
 {
     int w = 0, h = 0, multi = 2;
     uint64_t frames = 0;
-    bool fmt16 = true; // input pipe format (render.py's DEC_FMT)
+    bool fmt16 = true; // input pipe format (--pixfmt): rgb48le, false = rgb24
     int out16 = -1;    // output pipe format, -1 = same as input
     std::wstring pauseFile;
     bool resident = false;             // --resident: stay alive between renders (offlineResidentMain)
     std::wstring pipeName;             // --pipe NAME: the resident host's control pipe, \\.\pipe\NAME
     bool nvof = false;                 // --nvof: the NVIDIA Optical Flow model (no engines, no handoff)
     std::wstring cacheW;               // --cache DIR: the kernel cubin folder when no jit path names one
-    int outW = 0, outH = 0;            // --out-w / --out-h: the output size (render.py's OUT_W x OUT_H), 0 = w x h
+    int outW = 0, outH = 0;            // --out-w / --out-h: the output size, 0 = w x h
     int workW = 0, workH = 0;          // --work-w / --work-h: the working size (the DLSS mode x the output), 0 = none
     bool outX2 = false;                // --out-pixfmt x2rgb10le: the RTX HDR encode pipe (needs --rtx-hdr)
-    std::wstring hdrStatsW;            // --hdr-stats PATH: the light statistics JSON render.py reads at the finalize
+    std::wstring hdrStatsW;            // --hdr-stats PATH: the light statistics JSON the render reads at the finalize
     bool hdrDv = false, hdrHp = false; // --hdr-dv / --hdr-hp: add the DV L1 / HDR10+ per-frame records
     bool echo = false;                 // --no-interp: no model, every frame a real frame (live's echo, noEngine)
     bool gmfss = false;                // --gmfss: the GMFSS model (live's engine set and chain, lkOfflineGmfss)
-    bool drba = false;                 // --drba: RIFE with DRBA timing (live's lag-1 windows, drba_loop's grid)
+    bool drba = false;                 // --drba: RIFE with DRBA timing (live's lag-1 windows, the offset grid)
     bool fruc = false;                 // --fruc: Nvidia Smooth Motion (live's nvoffruc bridge path, no engine)
     bool fsrfg = false;                // --fsrfg: AMD FSR frame generation (FRUC's route, our smv_fsrfg_bridge.dll)
-    double fpsRatio = 0.0;             // --fps-ratio R: --fps mode, render.py's ratio (repr, so the same double)
-    bool dlssg = false;                // --dlssg: DLSS 4.5, the dlssg2f.exe --server child (DgChild), 2x..6x
-    // resume: render.py's _try_resume mapping. The decoder already skipped
+    double fpsRatio = 0.0; // --fps-ratio R: --fps mode, the render's ratio (round-trip text: the same double)
+    bool dlssg = false;    // --dlssg: DLSS 4.5, the dlssg2f.exe --server child (DgChild), 2x..6x
+    // resume: the render's mapping (src/render/resume.ts). The decoder already skipped
     // to source frame P, so this run's pair i is the render's pair P + i (the --fps grid, the
     // closing slot); its first D outputs are banked already and are dropped BEFORE any pass (no
-    // DLSS 5 history, no statistics record), exactly python's resume_active / skip / pend rule
+    // DLSS 5 history, no statistics record)
     bool resumed = false;    // --resume-pair given
     uint64_t resumePair = 0; // --resume-pair P
     uint64_t resumeOut = 0;  // --resume-out C: output frames banked (PROGRESS / OUTFRAMES count the whole render)
     int resumeDrop = 0;      // --resume-drop D
-    uint64_t skipIn = 0; // --skip-in N: input frames to discard first (a resumed VFR source, render.py's _PIPE_DISCARD)
+    uint64_t skipIn = 0;     // --skip-in N: input frames to discard first (a resumed VFR source)
     std::wstring
         hdrFramesW; // --hdr-frames PATH: one statistics line per output frame, appended + flushed (the resume prefix)
     std::wstring nrDeltaW;          // --nr-delta PATH: DLSS 5's per-pixel change, float32 (the preview's mask)
@@ -2203,9 +2202,9 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 srcW, srcH, w, h, (w != ow || h != oh) ? ", then the final resize" : "");
         }
     }
-    // --fps mode: render_loops.fps_loop / drba_loop at render.py's ratio,
-    // every output an interior slot of _pair_fracs, no real frame passes through; one tween
-    // per enqueue (python's per-tween inference)
+    // --fps mode: the output rate's slot grid at the render's ratio,
+    // every output an interior slot of its pair, no real frame passes through; one tween
+    // per enqueue
     const bool fpsMode = oa.fpsRatio > 0.0;
     const double ratio = oa.fpsRatio;
     const int multi = oa.echo ? 1 : (fpsMode ? 2 : oa.multi);
@@ -2249,8 +2248,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     else if (oa.fruc)
     {
-        // Smooth Motion: live's bridge path at the /64 pad of the source (render.py
-        // sizes NvOFFRUC to pw x ph the same way), true BGRA from the (R, G, B) planes
+        // Smooth Motion: live's bridge path at the /64 pad of the source,
+        // true BGRA from the (R, G, B) planes
         if (!lkOfflineFruc(script, nr.frucDir))
             return 2;
         nr.fruc = true;
@@ -2283,8 +2282,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     else if (oa.dlssg)
     {
-        // DLSS 4.5: the server sized to the /64 pad of the source (render.py's pw x ph,
-        // dlssg.py sends the padded frame), RGBA8 from the (R, G, B) planes, no engine
+        // DLSS 4.5: the server sized to the /64 pad of the source (it gets the
+        // padded frame), RGBA8 from the (R, G, B) planes, no engine
         nr.dlssg = true;
         nr.ph = (h + 63) / 64 * 64;
         nr.pw = (w + 63) / 64 * 64;
@@ -2351,7 +2350,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     nr.sw = srcW;
     nr.sh = srcH; // Restore and the first resize read the decoded frame's size
     nr.nvPre = nvPre;
-    // the per-frame passes: render.py's output size (only an enlarge: a
+    // the per-frame passes: the render's output size (only an enlarge: a
     // downscale folds into the decode), Sharpen, RTX VSR and Restore, on every output frame
     const int outW = oa.outW > 0 ? oa.outW : w, outH = oa.outH > 0 ? oa.outH : h;
     if (outW < w || outH < h)
@@ -2390,7 +2389,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         thdrAcc.wantL1 = oa.hdrDv;
         thdrAcc.wantHp = oa.hdrHp;
         nr.thdrAcc = &thdrAcc;
-        // appended: a resumed render's file already holds the banked prefix's lines (render.py
+        // appended: a resumed render's file already holds the banked prefix's lines (the render
         // rewrites it to exactly those before the start); a failed open only costs the resume
         if (!oa.hdrFramesW.empty() && (_wfopen_s(&thdrAcc.lines, oa.hdrFramesW.c_str(), L"ab") || !thdrAcc.lines))
         {
@@ -2401,7 +2400,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     if (g_restore)
     {
-        // python's rule: a Restore that cannot load drops the pass with a notice, never the render
+        // a Restore that cannot load drops the pass with a notice, never the render
         if (lkEnsureRestore(script, nr.restorePath))
             nr.restore = true;
         else
@@ -2826,11 +2825,11 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     bool dgPrimed = false; // the DLSS 4.5 server has seen the pair's left frame
     const int64_t tLoop = nowQpc100();
     bool paused = false;
-    // --fps mode: render.py's _pair_fracs(p) in the same double arithmetic (the output times
-    // (j + 0.5) / ratio inside [p, p + 1), zero or more per pair), and closing_slot's count for
-    // the last source frame's own interval (n = source frames, python's i = n - 1)
+    // --fps mode: pairFracs(p) = pair p's slots in the double arithmetic of the render's resume
+    // mapping (the output times (j + 0.5) / ratio inside [p, p + 1), zero or more per pair), and
+    // closingCount = the slots of the last source frame's own interval (n = source frames).
     // Both take this run's local index; a resumed run adds --resume-pair, the render's own
-    // source index of its first decoded frame (python's i / RESUME_SKIP_SRC).
+    // source index of its first decoded frame.
     std::vector<double> fr;
     bool realOutFresh = false; // the real-frame output slot holds the pair's left frame through the chain
     const uint64_t pairBase = oa.resumePair;
@@ -2849,7 +2848,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     };
     // resume: the first --resume-drop outputs are banked already. Every emission point asks
     // before it runs any pass, so a dropped frame never reaches DLSS 5's history, the TrueHDR
-    // statistics or the encoder (python never generates them: resume_active, skip, pend)
+    // statistics or the encoder
     int dropLeft = oa.resumeDrop > 0 ? oa.resumeDrop : 0;
     auto dropOne = [&]() -> bool {
         if (!dropLeft)
@@ -2861,13 +2860,13 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         LOG("offline: resumed at source frame %llu, %llu output frames banked, dropping the first %d\n",
             (unsigned long long)pairBase, (unsigned long long)oa.resumeOut, dropLeft);
     uint64_t nFrames = 0;
-    // ---- DRBA: render_loops.drba_loop on live's lag-1 windows --------------------------------
+    // ---- DRBA on live's lag-1 windows --------------------------------------------------------
     // Every output sits on the uniform offset grid f = (j + 0.5) / multi of its pair; no real
     // frame passes through. Pair (k-2, k-1) goes out once frame k is in the ring (live's group
     // order: f < 0.5 from window k-2 side +1, f >= 0.5 from window k-1 side -1, the first pair's
-    // f < 0.5 plain pair RIFE = python's head window). An identical pair holds its frame (one
-    // processing per pair side, python's held_out per window). At EOF the last pair's f >= 0.5
-    // is plain pair RIFE (python's tail window), then the closing slot repeats the last output
+    // f < 0.5 plain pair RIFE = the head window). An identical pair holds its frame (one
+    // processing per pair side). At EOF the last pair's f >= 0.5
+    // is plain pair RIFE (the tail window), then the closing slot repeats the last output
     // multi times; a lone frame goes out once.
     uint8_t* const dHeldOut = dOutRaw + frameBytesOut;
     const uint8_t* drLastOut = nullptr;
@@ -2911,7 +2910,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                               0, (CUstream)nr.stream, a, nullptr) == CUDA_SUCCESS;
     };
     // pair (drFid - 2, drFid - 1); tailPlain = its f >= 0.5 as plain pair RIFE (the EOF window).
-    // --fps: the pair's _pair_fracs (0-based pair drFid - 3); a slot at f = 0 is DRBA's t == 1
+    // --fps: the pair's pairFracs slots (0-based pair drFid - 3); a slot at f = 0 is DRBA's t == 1
     // (the window's centre frame, or the head window's t - 1 = 0): the pair's left frame
     auto drPair = [&](bool held, bool tailPlain) -> bool {
         const int nHist = nr.drFid >= 4 ? 4 : (int)nr.drFid;
@@ -2922,11 +2921,11 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         for (int j = 0; j < nF; j++)
         {
             if (dropOne())
-                continue; // resume: drba_loop's pend, the pair's banked slots in order
+                continue; // resume: the pair's banked slots, in order
             float f = fpsMode ? (float)fr[j] : ((float)j + 0.5f) / (float)multi;
             const int side = (fpsMode ? fr[j] < 0.5 : f < 0.5f) ? 0 : 1;
             if (side == 0 && f >= 0.5f)
-                f = nextafterf(0.5f, 0.0f); // python splits on the double
+                f = nextafterf(0.5f, 0.0f); // the side was picked on the double
             bool h = held;
             if (!h && fpsMode && side == 0 && 1.0 + fr[j] == 1.0)
             {
@@ -3112,7 +3111,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     {
         if (i == 3)
             nativeVideoMemoryNote(); // the first frames are through every pass
-        // cooperative pause, render.py's contract: the GUI creates the file to pause and
+        // cooperative pause: the GUI creates the file to pause and
         // deletes it to resume; checked at the pair boundary, queued output keeps draining
         if (!pauseFile.empty())
         {
@@ -3403,7 +3402,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             failed = true;
             break;
         }
-        // the pair's slots: the N-1 on-grid tweens, or --fps mode's _pair_fracs (maybe none)
+        // the pair's slots: the N-1 on-grid tweens, or --fps mode's pairFracs (maybe none)
         int nT = multi - 1;
         if (fpsMode)
         {
@@ -3415,7 +3414,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         const bool makesTweens = havePrev && !pairStatic && nT > 0;
         // GMFSS: feat_ext of every new frame (the next pair's feat0), the flow, metric and
-        // pyramids only for a pair that makes tweens (live's nativeGroup; python skips reuse)
+        // pyramids only for a pair that makes tweens (live's nativeGroup)
         if (nr.gmfss && !nativeGmfssPair(nr, nativeXPrev(nr), dCur, makesTweens))
         {
             io.setFail("gmfss pair failed");
@@ -3425,10 +3424,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         if (nr.fruc)
         {
             // Smooth Motion: every new frame into a BGRA surface; the pair is interpolated only
-            // when it makes tweens (python's hold skips NvOFFRUC, and so does an --fps pair with
-            // no slot). The bridge primes I0 itself on every call, so python never warps a
-            // skipped pair: marking the end of a pair without tweens as the last tweened end
-            // skips live's priming warp and the bridge sees python's call sequence (no reset, ever)
+            // when it makes tweens (a held pair skips NvOFFRUC, and so does an --fps pair with
+            // no slot). The bridge primes I0 itself on every call, so a skipped pair needs no
+            // warp: marking the end of a pair without tweens as the last tweened end
+            // skips live's priming warp (no reset, ever)
             if (!nativeFrucPair(nr, dCur, makesTweens ? (uint32_t)nT : 0u))
             {
                 io.setFail("fruc pair failed");
@@ -3440,8 +3439,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         if (oa.dlssg)
         {
-            // DLSS 4.5: every frame to RGBA8 (hdr10: R10G10B10A2) at the padded size (dlssg.py _send), then
-            // for a pair the server's generated frames (dlssg.py interpolate; the sync also retires the last
+            // DLSS 4.5: every frame to RGBA8 (hdr10: R10G10B10A2) at the padded size, then
+            // for a pair the server's generated frames (dgPair; the sync also retires the last
             // pair's uploads from hDgOut before it is refilled)
             uint8_t* hCur = hDgIn[i % 3];
             int f32 = 0;
@@ -3533,13 +3532,13 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         if (fpsMode && havePrev && pairStatic)
         {
-            // --fps held pair (fps_loop): every slot of the pair is the frame itself, through
-            // the passes once (to_bytes(I0)), repeated
+            // --fps held pair: every slot of the pair is the frame itself, through
+            // the passes once, repeated
             bool emitted = false;
             for (int j = 0; j < nT; j++)
             {
                 if (dropOne())
-                    continue; // resume: fps_loop's fracs[skip:]
+                    continue; // resume: a banked slot
                 if (!emitted && !drEmit(dCur, dHeldOut))
                 {
                     io.setFail("held emit (fps) failed");
@@ -3581,11 +3580,11 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 const uint8_t* srcOut = dR;
                 if (passes && nr.nrHost)
                 {
-                    // DLSS 5 is temporal: python's held slots carry the real frame's finished
-                    // bytes (render_loops out_cur) with no second NR call, so the history sees
+                    // DLSS 5 is temporal: the held slots carry the real frame's finished
+                    // bytes with no second NR call, so the history sees
                     // each real frame once. That output still sits in the real-frame slot,
-                    // unless a resume dropped that real frame: python's out_cur is None then
-                    // and its to_bytes runs the chain on the frame once, here
+                    // unless a resume dropped that real frame: then
+                    // the chain runs on the frame once, here
                     uint8_t* dO = dOutRaw + frameBytesOut;
                     srcOut = dO;
                     if (!realOutFresh)
@@ -3603,7 +3602,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
                 }
                 else if (passes)
                 {
-                    // with passes the held slot is the real frame through the chain, as python
+                    // with passes the held slot is the real frame through the chain
                     uint8_t* dO = dOutRaw + frameBytesOut;
                     if (!nativeOfflineEmit(nr, dCur, ps, rs, dO, outIs16))
                     {
@@ -3668,8 +3667,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             }
             for (int j = 0; j < nT && !failed; j++)
             {
-                // resume: the banked slots are never generated (python's fracs[skip:]); DLSS 4.5
-                // still got the whole pair above, its temporal stream stays intact (tws[-take:])
+                // resume: the banked slots are never generated; DLSS 4.5
+                // still got the whole pair above, its temporal stream stays intact
                 if (dropOne())
                     continue;
                 const float t = fpsMode ? (float)fr[j] : (float)(j + 1) / (float)multi;
@@ -3873,8 +3872,8 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         }
         else
         {
-            // rgb24 in, rgb48le out: render.py's to_tensor / to_bytes round trip of a real frame
-            // is exactly x * 257 per sample; done on the GPU from the staged input, then written
+            // rgb24 in, rgb48le out: a real frame's 8-bit sample x goes out as
+            // exactly x * 257; done on the GPU from the staged input, then written
             // like a tween. The input slot needs no writer release then.
             int o = -1;
             {
@@ -3891,7 +3890,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             uint8_t* dO = dOutRaw + frameBytesOut;
             if (passes)
             {
-                // the real frame through the pass chain (python's to_bytes on every frame)
+                // the real frame through the pass chain
                 if (!nativeOfflineEmit(nr, dCur, ps, rs, dO, outIs16))
                 {
                     io.setFail("passes (real) failed");
@@ -3952,7 +3951,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     if (!failed && !io.fail && nr.drba && nr.drFid >= 1)
     {
-        // EOF (drba_loop's tail): the last pair with a virtual next frame id (never read), its
+        // EOF: the last pair with a virtual next frame id (never read), its
         // f < 0.5 from window N-1 side +1 (plain when N-1 is the head), its f >= 0.5 plain
         // pair RIFE; then the closing slot, or the lone frame of a one-frame source
         if (nr.drFid >= 2)
@@ -3962,7 +3961,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             nr.drFid--;
             if (ok && !drLastOut)
             {
-                // --fps: no pair had a slot (closing_slot's last_out None): the last frame once,
+                // --fps: no pair had a slot: the last frame once,
                 // never on a resumed run (that frame is banked already)
                 if (!oa.resumed && (!drEmit(drReal(drbaFrame(nr, nr.drFid)), dHeldOut) || !drSend(dHeldOut, false)))
                     failed = true;
@@ -3982,7 +3981,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     }
     if (!failed && !io.fail && fpsMode && !nr.drba && nFrames >= 1)
     {
-        // --fps EOF (fps_loop + closing_slot): the last source frame's interval holds the last
+        // --fps EOF: the last source frame's interval holds the last
         // output; a source whose pairs made no slot (or a lone frame) sends its last frame once
         if (drLastOut)
         {
@@ -4404,7 +4403,7 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             {
                 g_backend = BK_SERVER;
                 g_serverBackend = argv[i];
-            } // resolved by live_server.py
+            } // a model backend's name: the native host resolves it
         }
         else if (wcscmp(argv[i], L"--script") == 0 && i + 1 < argc)
             g_script = argv[++i];
@@ -4804,7 +4803,7 @@ static int residentMain(LiveArgs first)
 // smv-live.exe --offline --resident --pipe NAME [--script s]: the offline render host
 // stays alive between queue items with the kernel module loaded (g_res, the live resident host's
 // cache), so a later render pays only its own buffers instead of the process start plus the
-// module load. render.py spawns it detached (it outlives the render) and finds it again through
+// module load. native.ts spawns it detached (it outlives the render) and finds it again through
 // the control pipe \\.\pipe\NAME, one client at a time, one line per command:
 //   start<TAB>--w<TAB>1920<TAB>...   one item's flags (the --offline command line minus --offline)
 //   <- "offline pipes ready"         the host created \\.\pipe\NAME-in and \\.\pipe\NAME-out

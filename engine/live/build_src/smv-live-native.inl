@@ -3,9 +3,7 @@
 //
 // Every live model runs INSIDE this process: the host's own CUDA kernels for every net (NVRTC-compiled,
 // their cubins cached by source hash), the driver's Optical Flow API for nvof, the shipped bridge DLL for
-// fruc. No python process is part of a live session. The python live server this host replaced (engine/live_server.py, in
-// the git history) is where most of the math below was ported from; comments that name its
-// classes and functions record that origin.
+// fruc.
 //
 // NativeRife sits behind the PipeServer boundary: writeFull() hands it one group message per
 // captured frame ([u32 N][N f32 fractions]) and readFullRaw() hands back the tokens the
@@ -13,12 +11,12 @@
 // 0x80000000 end marker).
 //
 // Everything CUDA happens on ONE compute thread and ONE non-default stream:
-//   * the default stream is never used (it synchronises with every other stream, SMV's
-//     permanent-hang class, see live_server.py's stream comment);
+//   * the default stream is never used (it synchronises with every other stream, a
+//     permanent-hang risk);
 //   * the kernel chains replay as CUDA graphs captured on that stream (chainGraphRun).
 //
-// cudart64_13.dll and nvrtc64_130_0.dll ship in engine\gpu_runtime (staged from the dev
-// python's wheels by scripts/stage-gpu-runtime.ts).
+// cudart64_13.dll and nvrtc64_130_0.dll ship in engine\gpu_runtime (staged from NVIDIA's
+// two pinned wheels by scripts/stage-gpu-runtime.ts).
 
 // cuda_runtime.h pulls the internal crt\ headers the runtime WHEEL does not ship; the host
 // side only ever needs the API declarations, so cuda_runtime_api.h plus the one-macro shim in
@@ -4938,7 +4936,7 @@ static std::wstring g_nativeEngineDir;  // ...\engine itself, the parent of the 
 
 // ---- the RTX Video SDK CUDA bridge (engine\rtxvideo\rtxvideo_cuda.dll) --------------------
 // The TrueHDR bridge is NOT an NGX D3D11 bridge: it is a plain C ABI over CUDA device
-// pointers, the same DLL and the same entry points rtxvideo.py drives. The NGX feature DLLs
+// pointers. The NGX feature DLLs
 // (nvngx_truehdr.dll, nvngx_vsr.dll) resolve relative to the LOADING module's directory, so
 // the bridge is loaded by full path out of its own folder and nothing is copied or split.
 struct RtxRect
@@ -4977,7 +4975,7 @@ struct RtxBridge
 };
 static RtxBridge g_rtxb;
 
-// Resolve the bridge folder exactly as rtxvideo.py does (SMV_RTXVIDEO_DIR, else
+// Resolve the bridge folder (SMV_RTXVIDEO_DIR, else
 // <engine>\rtxvideo) and bind the four entry points. Any failure logs one line naming the
 // file.
 static bool rtxBridgeLoad()
@@ -5026,10 +5024,10 @@ static bool rtxBridgeLoad()
     return true;
 }
 
-// Offline TrueHDR's light statistics, python's RTXVideo _cll / _fall / _l1
-// / _hp (rtxvideo.py _pack_out, _measure_light, _accum_l1, _accum_hp), accumulated per output
+// Offline TrueHDR's light statistics (MaxCLL, MaxFALL, the Dolby Vision L1 triples, the HDR10+
+// records), accumulated per output
 // frame from k_pqOut's block (hist[1024] u32, misc[4] u32, vSum int64 2^24 fixed point) and written as one
-// JSON file render.py reads at the finalize: maxcll / maxfall always, the Dolby Vision L1
+// JSON file the render reads at the finalize: maxcll / maxfall always, the Dolby Vision L1
 // triples and the HDR10+ records when asked for (--hdr-dv / --hdr-hp).
 static const size_t kThdrStatsBytes = 1024 * 4 + 4 * 4 + 8;
 struct ThdrL1
@@ -5044,8 +5042,8 @@ struct ThdrHp
 };
 struct ThdrAcc
 {
-    float lut[1024]{};  // _pq_lut (k_pqLut, the kernel's own PQ EOTF)
-    int brightCode = 0; // _hp_bright_code: the first code brighter than 100 nits
+    float lut[1024]{};  // the light of every PQ code (k_pqLut, the kernel's own PQ EOTF)
+    int brightCode = 0; // HDR10+: the first code brighter than 100 nits
     double cll = 0.0, fall = 0.0;
     bool raw = false; // --hdr-color raw: the stats read nits, not linear
     bool wantL1 = false, wantHp = false;
@@ -5054,7 +5052,7 @@ struct ThdrAcc
     // --hdr-frames: one line per output frame, appended and flushed as the
     // record lands, "<frame MaxCLL> <frame MaxFALL>[ L <l1 x3>][ H <avg> <maxscl x3> <dist x9>]":
     // a killed render keeps every record of the frames it wrote, and a resumed render reads the
-    // banked prefix back from it instead of decoding the banked video (python's _rebuild_hdr_stats)
+    // banked prefix back from it instead of decoding the banked video
     FILE* lines = nullptr;
     double lastCll = 0.0, lastFall = 0.0;
     bool haveLast = false;
@@ -5096,8 +5094,8 @@ struct ThdrAcc
         const double vSum = (double)vFix * (1.0 / 16777216.0);
         float vMax = 0.0f;
         memcpy(&vMax, &misc[3], 4);
-        // _pack_out: float(mx.max()) * 10000 and float(mx.mean()) * 10000 (the mean is fp32 in
-        // torch); _measure_light (raw) reads nits already
+        // the frame's largest value and its mean, x 10000 to nits (the mean rounded to fp32
+        // first); --hdr-color raw reads nits already
         const double sc = raw ? 1.0 : 10000.0;
         const double fc = (double)vMax * sc;
         if (fc > cll)
@@ -5350,7 +5348,7 @@ struct FuOp
 
 struct NativeRife
 {
-    // ---- handoff facts, straight off live_server.py's --native-handoff lines
+    // ---- handoff facts (nativeHandoff)
     std::string ifnetPath;
     int ph = 0, pw = 0, w = 0, h = 0, cw = 0, ch = 0;
     int dw = 0, dh = 0, x0 = 0, y0 = 0;
@@ -5387,8 +5385,8 @@ struct NativeRife
     bool upAa = false; // the first resize shrinks the height (uh < h)
     // live Restore: the handoff names the bundled Real-ESRGAN or a --restore-model in AnimeJaNai's
     // SPAN-F3 form, both on the host's kernels; the host runs it on every presented frame before the
-    // upscale, then folds the s x output to the first resize target (_Fit._load_restore's
-    // restore_target rule: back to the model size when RTX VSR follows, else straight to the internal
+    // upscale, then folds the s x output to the first resize target (the
+    // rule: back to the model size when RTX VSR follows, else straight to the internal
     // render size or the fit rect). A mid-run failure drops the pass for the rest of the session with
     // one line.
     std::string restorePath;
@@ -5397,7 +5395,7 @@ struct NativeRife
     // app's `echo` backend, no model ticked) runs here too. The handoff answers with the
     // geometry only (`engine=none`, plus the restore engine when asked for): no IFNet, no
     // encode, no tween; every group stores its one real frame through the same effects
-    // chain, exactly live_server.py's Identity.process_shm. The cubin cache folder comes
+    // chain. The cubin cache folder comes
     // from `NATIVE-PATH cache=` since no jit path names it.
     bool noEngine = false;
     std::string cachePath;
@@ -5553,7 +5551,7 @@ struct NativeRife
     uint32_t gmFeatSkips = 0, gmCatchUps = 0;
     int gmModeLogs = 0; // the mode lines this session printed (the first pair's and up to 3 switches)
     // SMV_LIVE_GMFSS_PROF=1: per-phase CUDA-event breakdown of the chain, printed every 32
-    // groups (the native answer to the python route's [timing] line; nine spans, the tween ones
+    // groups (nine spans, the tween ones
     // measured on the group's FIRST tween). The pair span splits into half | flow | metric |
     // pyr, with the CPU (QPC) enqueue spans beside the GPU ones: the pair
     // block, the gmflow enqueue inside it, and every tween. The exe runs a group ahead of the
@@ -5567,8 +5565,8 @@ struct NativeRife
     // NVIDIA Smooth Motion (fruc): the handoff answers
     // `engine=fruc` with the /64 padded geometry and `NATIVE-PATH fruc=` (the folder holding the
     // shipped nvoffruc_bridge.dll beside the user-installed NvOFFRUC.dll + cudart64_110.dll);
-    // this host drives that bridge's flat C API exactly as live_server.py's Fruc class does
-    // through ctypes: the (R, G, B) model planes packed to true BGRA8 at pw x ph (k_packBgraRgb),
+    // this host drives that bridge's flat C API:
+    // the (R, G, B) model planes packed to true BGRA8 at pw x ph (k_packBgraRgb),
     // one bridge call per tween, the BGRA8 result unpacked (k_unpackBgraRgb).
     bool fruc = false;
     bool dlssg = false;           // offline DLSS 4.5: no IFNet, a child server
@@ -5842,7 +5840,7 @@ struct NativeRife
     int a4kRTmpW = 0;
     // RIFE with DRBA timing (rifedrba): the RIFE
     // handoff plus `engine=drba lag=1` (calc_flow's block0 runs on the host's kernels,
-    // nativeB0Module). live_server.RifeDrba natively: a four-frame history of padded frames and their
+    // nativeB0Module): a four-frame history of padded frames and their
     // encodes, windows centred on a frame id (two kept, chained: a window's left flow is the
     // previous window's right one, reversed), the lag-1 group (every slot shows time (k-2) + f,
     // the real slot is frame k-1), one IFNet enqueue per tween with its own DRM timestep map
@@ -5904,7 +5902,7 @@ struct NativeRife
                             // 36 B a motion pixel when the picture fits there, else its own block (drRtOwn)
     bool drRtOwn = false;
     // NVIDIA Optical Flow model: the handoff answers
-    // `engine=nvof` with the geometry only (like echo, no TensorRT engine at all); this host runs
+    // `engine=nvof` with the geometry only (like echo); this host runs
     // the Optical Flow Accelerator itself through the driver's nvofapi64.dll (grid 4, fast,
     // BOTH directions in one Execute, gray8 of the two model frames at the true w x h) and the
     // glue kernels k_nvofLuma / k_nvofUp / k_nvofMetric (checked against fp64 references;
@@ -5952,7 +5950,7 @@ struct NativeRife
     // ping-pong (64 halves a pixel each; inside the shared activation block when it holds them, else restNatOwn),
     // dRestW = the weights (restNatOff offsets)
     bool restNat = false, restNatOwn = false;
-    int restNatKind = 0;   // 1 = the bundled Real-ESRGAN, 2 = AnimeJaNai (SPAN-F3 64, the --restore-model ONNX),
+    int restNatKind = 0;   // 1 = the bundled Real-ESRGAN, 2 = AnimeJaNai (SPAN-F3 64, the --restore-model file),
                            // 3 = Anime4K's Restore CNN UL (--restore-anime4k: the Anime4K module's passes)
     int restNatBlocks = 0; // AnimeJaNai's block count
     void *dRestA = nullptr, *dRestB = nullptr, *dRestW = nullptr; // dRestA = the whole activation region
@@ -6392,11 +6390,11 @@ static bool nativeBackendOk(const std::wstring& backend)
 // export's roll, transformer._roll_hw, untested); the coarse scale's per-region blocks (`_m`) need 2 at the pad / 32
 static constexpr int kGmMinPad = 128;
 
-// Upscale to: _Fit.__init__'s derivation of the
+// Upscale to: the
 // internal render size from the exe's own --upscale H and the handoff geometry: the factor
-// up_h / h clamped to 1/16..16 (render.py's UPSCALE_F clamp), even dims, dropped when it
-// equals the fit rect (one resize, not two). Python rounds half to even and this rounds half
-// away, but the & ~1 lands both on the same even number. Runs after (w, h, dw, dh) are known,
+// up_h / h clamped to 1/16..16, even dims, dropped when it
+// equals the fit rect (one resize, not two). lround rounds half away from zero; the & ~1 lands a
+// tie on the same even number as rounding half to even. Runs after (w, h, dw, dh) are known,
 // on the resident facts too (uw is never a stored fact, the flag is per session).
 static void nativeDeriveUpscale(NativeRife& nr)
 {
@@ -6438,7 +6436,7 @@ static std::string lkEnv(const char* name)
 // SMV_HANDOFF_DUMP=1: log every handoff line the host produces as `handoff-line ...`
 static const bool g_handoffDump = lkEnv("SMV_HANDOFF_DUMP") == "1";
 
-// python's round(): ties to even (the default FP rounding mode), then int()
+// round half to even (the default FP rounding mode)
 static int lkRound(double x)
 {
     return (int)std::nearbyint(x);
@@ -6459,9 +6457,8 @@ static std::string lkF4(double v)
     return b;
 }
 
-// Everything the lookup and the build derive from a session's arguments, in ONE place: a name
-// or a size that differed between the two would be an engine the build writes and the lookup
-// never finds. Sizes follow trt_lookup / the engine classes in trt_runtime.py.
+// Everything the lookup and the cold-start check derive from a session's arguments, in ONE
+// place: both must see the same names and sizes.
 struct LkSession
 {
     std::string backend, engDir, cacheDir;
@@ -6499,7 +6496,7 @@ static void ensureDirW(const std::wstring& dir)
         LOG("cache: cannot create %ls (error %lu)\n", dir.c_str(), GetLastError());
 }
 
-// the rect a w x h frame takes in the outW x outH canvas: aspect-fit, even, centred (_Fit's fit rect)
+// the rect a w x h frame takes in the outW x outH canvas: aspect-fit, even, centred
 static void lkFitRect(int w, int h, int outW, int outH, int& dw, int& dh, int& x0, int& y0)
 {
     if (outW == w && outH == h)
@@ -6514,7 +6511,7 @@ static void lkFitRect(int w, int h, int outW, int outH, int& dw, int& dh, int& x
     dw = (std::max)(2, lkRound(w * s) & ~1);
     dh = (std::max)(2, lkRound(h * s) & ~1);
     x0 = (outW - dw) / 2;
-    y0 = (outH - dh) / 2; // python // on non-negative values
+    y0 = (outH - dh) / 2; // both non-negative: the division floors
 }
 
 // NVIDIA's DLSS modes as plan.ts has them (DLSS_MODES): the working size's share of the output per kDlssModeName entry
@@ -6696,7 +6693,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
                           std::vector<std::string>& lines)
 {
     if (g_offline)
-        return false; // the offline host gets its engine paths from render.py
+        return false; // the offline host has its own lookups (lkOffline*)
     LkSession s;
     if (!lkSession(script, backendW, capW, capH, s))
         return false;
@@ -6783,7 +6780,7 @@ static bool lkBaseHandoff(const std::wstring& script, const std::wstring& backen
             lines.push_back("LIVE READY native=1 " + geo(gh, gw, gw, gh, dw, dh, x0, y0) + tail);
             return true;
         }
-        // fruc: the bridge folder (SMV_NVOFFRUC_DIR as nvoffruc.py reads it) and its three DLLs
+        // fruc: the bridge folder (SMV_NVOFFRUC_DIR, else engine\nvoffruc) and its three DLLs
         std::string fdir = lkEnv("SMV_NVOFFRUC_DIR");
         if (fdir.empty())
             fdir = engDir + "\\nvoffruc";
@@ -6845,11 +6842,11 @@ static int lkField(const std::string& line, const char* key)
 
 // ---- Restore on the host's own kernels -------------------------------------------------------------------------
 // The bundled Real-ESRGAN (realesr-animevideov3, BSD-3, engine\realesrgan\realesr-animevideov3.pkl) runs as
-// k_restConv0, 16 x k_restConvMid and k_restConvLast, never as a TensorRT engine: no ONNX, no build. The handoff
+// k_restConv0, 16 x k_restConvMid and k_restConvLast. The handoff
 // names it as restorePath = kRestNative; weights that are missing or not this model = no Restore (offline: the pass
 // is dropped with its line).
 static const char* const kRestNative = "native:realesr-animevideov3";
-// a --restore-model ONNX runs on the host's kernels in AnimeJaNai's SPAN-F3 form (64 features, ajNatLoad) only; any
+// a --restore-model file runs on the host's kernels in AnimeJaNai's SPAN-F3 form (64 features, ajNatLoad) only; any
 // other graph = no Restore, the same way (ajNatWanted's line names why)
 static const char* const kRestNativeAj = "native:animejanai";
 // --restore-anime4k: Anime4K's Restore CNN UL on the Anime4K module's passes (kA4kRestWeights, no file to look up); a
@@ -8270,7 +8267,7 @@ static bool nativeLocalHandoff(const std::wstring& script, const std::wstring& b
         lines.push_back(ready);
         return true;
     }
-    if (g_restoreModel.empty()) // the bundled Real-ESRGAN on the host's kernels: no engine, no jit
+    if (g_restoreModel.empty()) // the bundled Real-ESRGAN on the host's kernels
     {
         if (!restNatWanted())
         {
@@ -8561,8 +8558,8 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         bool hit = nativeLocalHandoff(script, backend, capW, capH, local);
         if (!hit)
         {
-            // no warm engines: build them from engine\onnx on a worker thread; a session
-            // ending mid-build leaves it running under g_bgHandoff (see the comment above)
+            // the lookup missed: the cold-start check (nativeLocalBuild) on a worker thread; a session
+            // ending meanwhile leaves it running under g_bgHandoff (see the comment above)
             auto state = std::make_shared<std::atomic<int>>(0); // 0 running, 1 built, 2 not
             g_bgHandoff.pending.store(true);
             std::thread([state, script, backend, capW, capH] {
@@ -8590,17 +8587,17 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
                 if (g_handoffDump)
                     LOG("handoff-line %s\n", l.c_str());
             }
-            LOG("native: warm engines found by the host, no python process (%.2fs)\n",
+            LOG("native: warm engines found by the host (%.2fs)\n",
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         }
     }
     if (!ready)
     {
-        // the lookup and the build cover every product case; what is left (a missing
-        // engine\onnx file or ONNX parser, a non-memory build failure, unreadable name tags)
+        // the lookup and the cold-start check cover every product case; what is left (a lookup
+        // that failed: its own line says why)
         // ends the session here
         LOG("native: the host could not find or build the engines for this session (see the lines above; "
-            "engine\\onnx and engine\\gpu_runtime must be intact)\n");
+            "the engine folder's weights and engine\\gpu_runtime must be intact)\n");
         return false;
     }
     LOG("%s\n", all.c_str());
@@ -8641,7 +8638,7 @@ static bool nativeHandoff(const std::wstring& script, const std::wstring& backen
         LOG("native: no-engine handoff named no cache folder\n");
         return false;
     }
-    // the nvof model: the same geometry-only answer with `engine=nvof` (no TensorRT engine; the
+    // the nvof model: the same geometry-only answer with `engine=nvof` (the
     // cache folder holds the kernel cubin)
     nr.nvof = all.find(" engine=nvof") != std::string::npos;
     if (nr.nvof && nr.cachePath.empty())
@@ -10093,8 +10090,7 @@ static bool nativeBuildKernels(NativeRife& nr, const std::wstring& cacheDir)
 }
 // ---- part 3: CUDA init, the compute thread, shutdown --------------------------------------
 
-// python inverts the two ICtCp matrices in float64 and casts the result to fp32
-// (rtxvideo.py ~226), so the inverse is computed in double here and uploaded as fp32.
+// the two ICtCp matrices are inverted in double and uploaded as fp32
 static bool inv3d(const double* m, float* out)
 {
     const double d =
@@ -10145,7 +10141,7 @@ static bool nativeCudaDeviceInit(NativeRife& nr, IDXGIAdapter1* adapter, HANDLE 
     NCHK(cudaStreamCreateWithFlags(&nr.stream, cudaStreamNonBlocking), "cudaStreamCreate");
 
     // capture texture: D3D11 resource, DEDICATED (mandatory for this handle type), read as a
-    // mipmapped array exactly as live_server.py's _CapTex does.
+    // mipmapped array.
     cudaExternalMemoryHandleDesc md{};
     md.type = cudaExternalMemoryHandleTypeD3D11Resource;
     md.handle.win32.handle = hTex;
@@ -10156,7 +10152,7 @@ static bool nativeCudaDeviceInit(NativeRife& nr, IDXGIAdapter1* adapter, HANDLE 
     NCHK(cudaImportExternalMemory(&nr.emCap, &md), "import capture texture");
     cudaExternalMemoryMipmappedArrayDesc ad{};
     ad.offset = 0;
-    // exactly what _CapTex asks cudart for: uchar4 in SDR, half4 with channel kind FLOAT in
+    // the capture's format: uchar4 in SDR, half4 with channel kind FLOAT in
     // HDR (PG p.143's sample table has no float16 four-channel case; the working half4 import is
     // the truth, do not "fix" it to match the table)
     ad.formatDesc = hdr ? cudaChannelFormatDesc{16, 16, 16, 16, cudaChannelFormatKindFloat}
@@ -10203,7 +10199,7 @@ static bool nativeCudaInitLate(NativeRife& nr, HANDLE hOutBuf, uint64_t outBytes
     bd.flags = 0;
     NCHK(cudaExternalMemoryGetMappedBuffer((void**)&nr.dOutRing, nr.emOut, &bd), "map output buffer");
     // letterbox bars and alpha, written once: opaque black is 0xFF000000 in BGRA8 and
-    // 0xC0000000 in R10G10B10A2 with A = 3 (python's -1073741824 canvas fill)
+    // 0xC0000000 in R10G10B10A2 with A = 3
     if (cuMemsetD32Async((CUdeviceptr)nr.dOutRing, nr.hdr ? 0xC0000000u : 0xFF000000u, (size_t)(outBytes / 4),
                          (CUstream)nr.stream) != CUDA_SUCCESS)
     {
@@ -10245,9 +10241,9 @@ static void nativeAcnRelease(NativeRife& nr);
 static bool nativeRtxInit(NativeRife& nr)
 {
     // live Sharpen and RTX VSR: the fit is known now, so the rule "VSR
-    // only when the resize enlarges in both axes" (_Fit._setup_resize) decides here
+    // only when the resize enlarges in both axes" decides here
     // Upscale to: the first resize target is the internal render size when set, else
-    // the fit rect (_Fit._setup_resize); VSR and the aa rule read that target
+    // the fit rect; VSR and the aa rule read that target
     const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
     const int sw = srcW(nr), sh = srcH(nr);
     // the resize RTX VSR runs (vw x vh -> vtw x vth): the first one; offline with a working size there
@@ -10354,7 +10350,7 @@ static bool nativeRtxInit(NativeRife& nr)
                       "outside the view is added back"
                     : "the sharpen on the PQ / HLG codes (SMV_HDR_SHARPEN_VIEW=0)");
     }
-    // Restore's fold target (_Fit._load_restore's restore_target). Offline with a
+    // Restore's fold target. Offline with a
     // working size, and live, Restore runs before the model: the target is the working / model size,
     // or the source (the capture live) when VSR runs the pre-model resize right after it. Offline without a
     // working size restores the model output: back to its size when VSR follows (so VSR sees the
@@ -10476,8 +10472,8 @@ static bool nativeRtxInit(NativeRife& nr)
     if (nr.rtxHdr || rtxVsrNow)
     {
         // the bridge retains the PRIMARY context (cuContext = NULL), which is the context this
-        // thread just bound with cudaSetDevice. cuStream is NULL exactly as rtxvideo.py passes
-        // it: the bridge wraps every eval in host-synchronous cuMemcpy2D calls on the legacy
+        // thread just bound with cudaSetDevice. cuStream is NULL:
+        // the bridge wraps every eval in host-synchronous cuMemcpy2D calls on the legacy
         // default stream, and the host's own stream is cudaStreamNonBlocking, so an NGX eval
         // placed on it would not be ordered against the bridge's own output copy. ONE create
         // per process (NGX is single-instance), so both features are asked for at once.
@@ -10522,7 +10518,7 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     if (nr.rtxHdr)
     {
-        // warm-up eval on a zero frame (opaque black RGBA), python live_server.py ~1859
+        // warm-up eval on a zero frame (opaque black RGBA)
         if (cuMemsetD32Async((CUdeviceptr)nr.dThdrIn, 0xFF000000u, (size_t)nr.w * nr.h, (CUstream)nr.stream) !=
             CUDA_SUCCESS)
         {
@@ -11185,7 +11181,7 @@ static bool nativeFrucLoad(const std::string& dir)
     return true;
 }
 
-// the FRUC instance at the padded model size (python sizes it to pw x ph the same way) and the
+// the FRUC instance at the padded model size (pw x ph) and the
 // BGRA8 surfaces; the calling thread has the device bound
 static bool nativeFrucSetup(NativeRife& nr)
 {
@@ -11456,7 +11452,7 @@ static void nativeFrucPlan(NativeRife& nr, const double* ts, uint32_t n)
 }
 
 // the pair: the new frame packed into a surface that holds neither the previous frame nor the
-// last tweened pair's end. python's Fruc._reuse, only when this group has tweens: a pair that
+// last tweened pair's end. Only when this group has tweens: a pair that
 // does not continue the last interpolated one first gets one dropped warp at 0.5 of the
 // skipped pair (last end, previous frame), so the OFA hints stay consecutive
 // one frame's planes into surface n: the SDR view (sdr, k_packBgraSdr) or the planes as stored (true BGRA)
@@ -11566,8 +11562,8 @@ static bool nativeFrucPair(NativeRife& nr, const float* dCur, uint32_t nTween)
     return true;
 }
 
-// one tween at t into dFrOut (3, ph, pw), python's Fruc._infer + NvOFFRUC.interpolate (a
-// double, the bridge's own type: offline --fps hands python's double fraction over unrounded)
+// one tween at t into dFrOut (3, ph, pw) (t is a
+// double, the bridge's own type: offline --fps hands its double fraction over unrounded)
 // the feed-once mode of instance i's next call on this pair; a mode 0 after the instance's first
 // call is a pair that does not continue the one it was fed last (a repack of the fed surface
 // clears frFed, so frFed alone would miss those primes)
@@ -19676,7 +19672,7 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
     nr.rtxHdr = true;
     nr.thdr.Contrast = (uint32_t)(g_hdrCon < 0 ? 0 : (g_hdrCon > 200 ? 200 : g_hdrCon));
     nr.thdr.Saturation = (uint32_t)(g_hdrSat < 0 ? 0 : (g_hdrSat > 200 ? 200 : g_hdrSat));
-    nr.thdr.MiddleGray = 50; // the live defaults, rtxvideo.py ~173
+    nr.thdr.MiddleGray = 50; // the live default
     nr.thdr.MaxLuminance = g_thdrPeak;
     nr.sdrScale = (float)(g_sdrWhite / 80.0 < 0.5 ? 0.5 : g_sdrWhite / 80.0);
     nr.rtxMode = !wcscmp(g_hdrColor, L"rtx") ? 1 : (!wcscmp(g_hdrColor, L"raw") ? 2 : 0);
@@ -19858,7 +19854,7 @@ static bool restNatSetup(NativeRife& nr)
 // ---- GMFSS's feat_ext (FeatureNet) on the host's kernels -----------------------------------------------------------
 // FeatureNet = 3 blocks {LeakyRelu, conv 3 x 3 stride 2, LeakyRelu, conv 3 x 3}: 3 -> 64 -> 64 (f1, at the half),
 // -> 128 -> 128 (f2, the quarter), -> 192 -> 192 (f3, the eighth); its PReLUs are scalar. Weights from
-// engine\GMFSS_Fortuna\train_log\feat.pkl (the host's torch zip reader; no engine, no ONNX). Its own NVRTC module
+// engine\GMFSS_Fortuna\train_log\feat.pkl (the host's torch zip reader). Its own NVRTC module
 // (fnKernelText): k_fnConv0L = block 1's first conv on the fp32 frame planes, both LeakyRelus in fp32, its weights as
 // float literals, one rounding to channels-last fp16; the five other convs on the tensor cores (fnConvT: an implicit
 // GEMM, mma.sync m16n8k16 with fp16 sums started at the bias; M = 16-pixel row runs of a TH x 32 output tile, N = 8 NB
@@ -20392,8 +20388,8 @@ static bool nativeFnRun(NativeRife& nr, const float* x, int ps, int rs, void** f
 }
 
 // ---- DRBA's block0 (calc_flow's first pyramid level) on the host's kernels -----------------------------------------
-// RIFE 4.25's IFBlock(15, c = 192) at scale 16 (rife_backend.RIFE.calc_flow), weights from engine\rife\flownet.pkl
-// (the host's torch zip reader; no engine, no ONNX). The motion frame is W x H (a multiple of 64); the levels: L0 =
+// RIFE 4.25's IFBlock(15, c = 192) at scale 16 (calc_flow's first level), weights from engine\rife\flownet.pkl
+// (the host's torch zip reader). The motion frame is W x H (a multiple of 64); the levels: L0 =
 // W / 16 x H / 16 (the block's input and its flow), L1 = W / 32 x H / 32, L2 = W / 64 x H / 64. Its own NVRTC module
 // (kFnHead's helpers + kB0In + kB0Conv):
 // k_b0In   cat(img0, img1, f0, f1, 0.5) at L0 by PyTorch's bilinear (align_corners = False): at an exact 1 / 16 each
@@ -20925,7 +20921,7 @@ static bool nativeB0Run(NativeRife& nr, const void* img0, const void* img1, int 
 // ---- GMFSS's MetricNet on the host's kernels ----------------------------------------------------------------------
 // MetricNet at the GMFSS half (the two backward warps' photometric means, gmflow's forward-backward check, conv_in, the
 // three residual convs, conv_out, tanh x 10) as 6 launches of its own module smv_metric_*.cubin (kFnHead's helpers +
-// kMnText), weights = engine\GMFSS_Fortuna\train_log\metric.pkl through pthStateDict (mnNatLoad); no engine, no ONNX, no fallback (a missing / wrong pkl =
+// kMnText), weights = engine\GMFSS_Fortuna\train_log\metric.pkl through pthStateDict (mnNatLoad); no fallback (a missing / wrong pkl =
 // `metricnet unavailable (...)`, the session refuses). It takes the motion halves (3 fp32 planes each) and both flow
 // directions (2 fp32 planes each) and hands out m0 then m1 as fp16 planes. Its scratch (mnArena) lives in the shared
 // activation block (nativeGmShareMemory sizes it in; sound while every enqueue there runs serially on nr.stream), else
@@ -21561,7 +21557,7 @@ static bool chainGraphRun(ChainGraphs& cg, std::initializer_list<const void*> bu
 // ---- RIFE 4.25's IFNet on the host's kernels ----------------------------------------------------------------------
 // The whole IFNet (5 IFBlocks + the warps between them) as 59 launches of its own module smv_ifnet_*.cubin (kFnHead's
 // helpers + kIfnA / B / C), weights = engine\rife\flownet.pkl's module.block0 .. 4 through pthStateDict (ifnNatLoad);
-// no engine, no ONNX, no fallback (a missing / wrong pkl = `the IFNet unavailable (...)`, the session refuses). It
+// no fallback (a missing / wrong pkl = `the IFNet unavailable (...)`, the session refuses). It
 // takes the fp16 frame pair, the fp16 timestep plane and the fp16 encodes at the motion frame and hands out the fp16
 // flow + mask RIFE's last step (nativeRifeBlend) reads. Its scratch (ifnArena) lives in the shared activation block
 // (nativeModelShareMemory sizes it in; sound while every enqueue there runs serially on nr.stream), else dIfnOwn.
@@ -22700,7 +22696,7 @@ static bool nativeModelShareMemory(NativeRife& nr)
 // ---- GMFSS's IFNet on the host's kernels --------------------------------------------------------------------------
 // The GMFSS IFNet (RIFE 4.6's IFNet_HDv3: 4 IFBlocks at 8, 4, 2, 1 of the half, c = 192, 128, 96, 64, the warps between
 // them, then the merge) as 47 launches of its own module smv_gmifnet_*.cubin (kFnHead's helpers + kGiA / kGiB), weights =
-// engine\GMFSS_Fortuna\train_log\rife.pkl through pthStateDict (giNatLoad); no engine, no ONNX, no fallback (a missing /
+// engine\GMFSS_Fortuna\train_log\rife.pkl through pthStateDict (giNatLoad); no fallback (a missing /
 // wrong pkl = `the GMFSS IFNet unavailable (...)`, the session refuses). It takes the 6 fp32 half planes and the fp32
 // timestep and hands out merged (3 fp32 planes) straight into fusionnet's a planes 3..5. Its scratch (giArena) lives in
 // the shared activation block (nativeGmShareMemory sizes it in; sound while every enqueue there runs serially on
@@ -23558,7 +23554,7 @@ static bool nativeGiRun(NativeRife& nr, const float* x, const float* ts, float* 
 // GMFSS's fusionnet (FusionNet_u.GridNet at the half: 4 heads, 9 ResidualBlocks, 4 DownsampleBlocks, 4 UpsampleBlocks,
 // the tail up to its 64 -> 256 conv) as 45 launches (nativeFuRun) of its own module smv_fusion_*.cubin (kFnHead's
 // helpers + kFuA / kFuB), weights = engine\GMFSS_Fortuna\train_log\fusionnet.pkl through pthStateDict (fuNatLoad); no
-// engine, no ONNX, no fallback (a missing / wrong pkl = `fusionnet unavailable (...)`, the session refuses). Every
+// fallback (a missing / wrong pkl = `fusionnet unavailable (...)`, the session refuses). Every
 // activation channels-last fp16 at its level (0 = the half, 64 channels; 1 = the quarter, 128; 2 = the eighth, 192), fp16
 // sums in every conv but head0's first. Its inputs: a = dGmFa's 9 fp32 planes (k_fuIn applies head0's first PReLU), b /
 // c / d = the feature splats' channels-last stores (the other heads' first PReLU applied there: gmLr); its output = the
@@ -24506,10 +24502,10 @@ static bool nativeFuRun(NativeRife& nr, cudaStream_t st)
                          "gmfss fusionnet", [&] { return nativeFuLaunch(nr, s, st); });
 }
 
-// gmflow's second half B (gmflow.py's last scale after the local correlation: the window's softmax, the flow
+// gmflow's second half B (gmflow's last scale after the local correlation: the window's softmax, the flow
 // propagation, the convex upsampler) as 7 launches (nativeGbRun) of its own module smv_gmflowb_*.cubin (kFnHead's
 // helpers + fusionnet's kFuA / kFuB for k_fuW64H + kGb), weights = engine\GMFSS_Fortuna\train_log\flownet.pkl's
-// feature_flow_attn and upsampler through pthStateDict (gbNatLoad); no engine, no ONNX, no fallback (a missing / wrong
+// feature_flow_attn and upsampler through pthStateDict (gbNatLoad); no fallback (a missing / wrong
 // pkl = `gmflow B unavailable (...)`, the session refuses). At the quarter of the half (nr.gmH x nr.gmW), both directions
 // as the batch: corr (k_localCorr's raw sums, 81 taps) + A's qf / flow0 in, the half's flow (2, 2, hh, hw) out into
 // dGmFlow. k_gbFlow: corr / sqrt(128), the off-frame taps masked, softmax, flow0 + sum(prob x offset); k_gbProj: q / k
@@ -25026,7 +25022,7 @@ static bool nativeGbRun(NativeRife& nr, cudaStream_t st)
 
 // gmflow's CNN backbone (backbone.CNNEncoder, two output scales) as 54 launches (nativeBbRun) of its own module
 // smv_gmflowbb_*.cubin (kFnHead's helpers + kBbA / kBbB), weights = engine\GMFSS_Fortuna\train_log\flownet.pkl's
-// backbone.* through pthStateDict (bbNatLoad); no engine, no ONNX, no fallback (a missing / wrong pkl = `gmflow's
+// backbone.* through pthStateDict (bbNatLoad); no fallback (a missing / wrong pkl = `gmflow's
 // backbone unavailable (...)`, the session refuses). One frame a call: the half's 3 fp32 planes (0..1) in, map4 (the
 // quarter) and map8 (the eighth) out, planar fp16 [128][h][w] into A's map batch slot. k_bbC7: normalize_img + conv1
 // 7x7 s2 (fp32); every InstanceNorm = its statistics (k_bbStats: per-block Welford, k_bbStatsFin: a fixed-order merge,
@@ -25828,7 +25824,7 @@ static bool nativeBbRun(NativeRife& nr, const float* x, void* map4, void* map8, 
 
 // gmflow's transformer at both of GMFSS's scales on the host's kernels, the module smv_gmflowa_*.cubin (kFnHead's
 // helpers + kGaA / kGaB, the kernel text cut in two), weights = engine\GMFSS_Fortuna\train_log\flownet.pkl's transformer.* and
-// feature_flow_attn's two projections through pthStateDict (gaNatLoad); no engine, no ONNX, no fallback (a missing /
+// feature_flow_attn's two projections through pthStateDict (gaNatLoad); no fallback (a missing /
 // wrong pkl = `gmflow's transformer unavailable (...)`, the session refuses). A (scale 1, the quarter, 8 x 8 windows):
 // k_gaFlowUp (prop -> flow0), k_gaWarpPos (map4's rows, feature1 warped by flow0, + the window position), 6 layers of
 // k_gaProj (the folded q' / v' of both attentions), k_gaAttn self (+ norm1 + the residual), k_gaProj (the cross q'),
@@ -27959,13 +27955,13 @@ static void nativeFree(NativeRife& nr)
 // GMFSS_infer_u.Model.reuse() and .inference() as native launches on the group's stream: the
 // four engines, the native nets and the glue kernels (k_half / k_pyr / k_splatSoft / k_splatNorm, gated against a
 // float64 reference). Two differences from
-// live_server.Gmfss, both exact:
+// the author's code, both exact:
 //   * feat_ext runs ONCE per group (on the new frame) and the previous group's output is this
 //     pair's feat0: the same reuse the native RIFE route does with the encode (feat_ext is a
-//     pure function of the frame); python recomputes both sets per pair.
+//     pure function of the frame); the author's code recomputes both sets per pair.
 //   * the flow and metric pyramids are built once per PAIR and the timestep is applied by the
-//     splat: python's interp(t * flow) * 0.5 equals t * (interp(flow) * 0.5).
-// Everything else follows python's op order literally, including which splat takes s = t and
+//     splat: the author's interp(t * flow) * 0.5 equals t * (interp(flow) * 0.5).
+// Everything else follows the author's op order literally, including which splat takes s = t and
 // which takes s = 1 - t. Shapes come from the engines (nativeGmfssSetup),
 // and the warm-up there left every static input shape set on these contexts, so only addresses
 // are set here.
@@ -28046,7 +28042,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     nr.gmFeatSdr[nr.gmCur] = sdr;
     nr.gmFeatOk[nr.gmCur] = true;
     if (!needFlow)
-        return true; // no tween in this group: python skips reuse() as well
+        return true; // no tween in this group: the pair-level work is skipped
     if (profPair)
         cudaEventRecord(nr.gmEv[1], st);
     // both halves into one (6, hh, hw) buffer: the ifnet's x as it is, gmflow's and
@@ -28213,7 +28209,7 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
 }
 
 // one tween at timestep t, into nr.dGmF (the clamped fp32 model frame storeSlot consumes).
-// python's inference(): I1t, I2t, the ifnet, the six feature splats, fusionnet, clamp.
+// The author's inference(): I1t, I2t, the ifnet, the six feature splats, fusionnet, clamp.
 static bool nativeGmfssTween(NativeRife& nr, float t)
 {
     cudaStream_t st = nr.stream;
@@ -28304,7 +28300,7 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         }
         return true;
     };
-    void** f0 = nr.dGmFeat[nr.gmCur ^ 1]; // the PREV frame's features (python's feat1x)
+    void** f0 = nr.dGmFeat[nr.gmCur ^ 1]; // the PREV frame's features (the author's feat1x)
     void** f1 = nr.dGmFeat[nr.gmCur];     // the new frame's (feat2x)
     void* met0 = nr.dGmMetric;
     void* met1 = (uint8_t*)nr.dGmMetric + hp * me;
@@ -28327,7 +28323,7 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
         return false;
     if (prof)
         cudaEventRecord(nr.gmEv[7], st);
-    // the GMFSS IFNet, straight into a's middle three planes (python's cat([I1t, rife, I2t]))
+    // the GMFSS IFNet, straight into a's middle three planes (the author's cat([I1t, rife, I2t]))
     unsigned int bits;
     memcpy(&bits, &t, 4);
     if (cuMemsetD32Async((CUdeviceptr)nr.dGmT, bits, 1, (CUstream)st) != CUDA_SUCCESS)
@@ -28377,7 +28373,7 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     const int ps = (int)plane;
     if (nr.gmTail)
     {
-        // the cut graph's out (in the splat accumulator) -> k_fuTail into dGmF: the frame clamped (python's
+        // the cut graph's out (in the splat accumulator) -> k_fuTail into dGmF: the frame clamped (the author's
         // torch.clamp(out, 0, 1)), or for an SDR pair unclamped, which k_hdrFromSdr then clamps and takes back to the
         // HDR codes in place (each pixel's three planes are read before it writes them)
         const void* pre = nr.dGmAcc;
@@ -28396,7 +28392,7 @@ static bool nativeGmfssTween(NativeRife& nr, float t)
     }
     else
     {
-        // python's torch.clamp(out, 0, 1) on the fp16 engine output: k_restToF is exactly that; an SDR pair's tween
+        // the author's torch.clamp(out, 0, 1) on the fp16 output: k_restToF is exactly that; an SDR pair's tween
         // (the SDR view) goes back to the HDR codes in the same step (k_hdrFromSdr)
         int n = (int)(3 * plane), half = nr.gmOutHalf ? 1 : 0;
         void* ac[] = {(void*)&nr.dGmOut, &half, &n, (void*)&nr.dGmF};
@@ -28450,17 +28446,17 @@ static void nativeGmfssProfile(NativeRife& nr)
     nr.gmCpuPairN = nr.gmCpuTweenN = 0;
 }
 
-// one group. Mirrors live_server.py's process_shm step for step: capture wait and read, the
+// one group: capture wait and read, the
 // capture-release announcement, the pair encode, the tween chunks through the dynamic-batch
 // engine, one pack-out per slot with its own event, then the bare end marker.
 // ---- native DRBA ----------------------------------------------------------------------------
-// live_server.RifeDrba as native launches on the group's stream. Frame ids count from 1 per
-// session (drFid = the newest, python's k); id i sits in ring slot i & 3, four kept like
-// python's hist. Every frame is encoded once when pushed (encode is a pure function of the
-// frame; python encodes inside calc_flow). A window centred on c holds flow10 (2 planes) and
+// DRBA as native launches on the group's stream. Frame ids count from 1 per
+// session (drFid = the newest, k); id i sits in ring slot i & 3, four kept.
+// Every frame is encoded once when pushed (encode is a pure function of the
+// frame). A window centred on c holds flow10 (2 planes) and
 // r = calc_flow(I1 = c, I2 = c + 1)'s flow12 | flow21 (4 planes); two slots, the one holding
-// c - 1 is kept when c is built (python deletes every window below c - 1), and a kept left
-// neighbour chains: this window's flow10 = its flow21 (python: left['flow21']), else block0 on
+// c - 1 is kept when c is built, and a kept left
+// neighbour chains: this window's flow10 = its flow21, else block0 on
 // (c, c - 1) computes it. The group presents time (k - 2) + f: f >= 0.5 from window k - 1 side
 // -1 (x = [k-1, k-2], tt = 1 - f), f < 0.5 from window k - 2 side +1 (x = [k-2, k-1], tt = f);
 // the head (three frames) runs plain pair RIFE on (k-2, k-1), fewer frames hold the lagged real
@@ -28593,14 +28589,14 @@ static bool nativeDrbaFlow(NativeRife& nr, uint32_t a, uint32_t b, float* out)
     return true;
 }
 
-// RifeDrba._window(c): cached, or built (chained on a kept c - 1 window); nullptr = died
+// the window centred on c: cached, or built (chained on a kept c - 1 window); nullptr = died
 static NativeRife::DrWin* nativeDrbaWindow(NativeRife& nr, uint32_t c)
 {
     for (auto& wn : nr.drWin)
         if (wn.c == c)
             return &wn;
     const size_t plane = (size_t)drbaMh(nr) * drbaMw(nr);
-    // keep the left neighbour (the chain), else a right one (python keeps every window >= c - 1;
+    // keep the left neighbour (the chain), else a right one (every window >= c - 1 is needed;
     // the group builds k - 2 before k - 1 because the exe's fractions ascend, so both fit)
     const int s = (c > 1 && nr.drWin[0].c == c - 1)   ? 1
                   : (c > 1 && nr.drWin[1].c == c - 1) ? 0
@@ -28636,10 +28632,10 @@ static NativeRife::DrWin* nativeDrbaWindow(NativeRife& nr, uint32_t c)
     return &wn;
 }
 
-// one tween of the group at fraction f into dMerged; held = python's None (the slot shows the
-// lagged real frame). nHist = frames in the history (python's len(hist), at most 4). plain =
+// one tween of the group at fraction f into dMerged; held = no tween (the slot shows the
+// lagged real frame). nHist = frames in the history (at most 4). plain =
 // plain pair RIFE on (k-2, k-1) at t = f whatever f is (the offline tail window:
-// render_loops.drba_loop's last window has no right frame). slot = blendOut's output slot: the tween
+// the last window has no right frame). slot = blendOut's output slot: the tween
 // goes straight into it instead of dMerged.
 // two domains: the blend's frame pair [k-2, k-1] read straight from the ring, whose slots are one block: slots
 // (k-2) & 3 and (k-1) & 3 are neighbours unless (k-2) & 3 == 3; then frame k - 1 is copied once per k into slot
@@ -28810,7 +28806,7 @@ static bool nativeDrbaTween(NativeRife& nr, float f, int nHist, bool& held, bool
     }
     if (!wn)
     {
-        // the head: plain pair RIFE at t = f, a constant timestep map (python: base + float(t))
+        // the head: plain pair RIFE at t = f, a constant timestep map
         if (!nativeFillT(nr, 0, f, mplane, st))
         {
             nr.die("timestep fill failed");
@@ -28878,7 +28874,7 @@ static const void* mergedAt(const NativeRife& nr, size_t k, size_t plane)
     return nr.outHalf ? (const void*)((const uint16_t*)nr.dMerged + n) : (const void*)(nr.dMerged + n);
 }
 
-// Restore (live and offline): _Fit._restore / render_passes.restore on one
+// Restore (live and offline) on one
 // source-size planar frame (srcW x srcH: live the captured frame, offline the decoded one with
 // a working size, else the model frame; fp16 when sHalf: a tween as the IFNet wrote it), the
 // result folded into dst (tw x th).
@@ -28921,7 +28917,7 @@ static bool nativeHdrRestOut(NativeRife& nr, float* dst, int tw, int th, const v
 }
 
 // false = a launch failed (die was called); an engine enqueue refusal drops the pass for the rest
-// of the session instead (python's rule), the caller then continues with the unrestored source.
+// of the session instead, the caller then continues with the unrestored source.
 // HDR planes (enc 1 PQ, 2 HLG): the engine reads the frame's SDR view (hdrToModel, knee 1, head 0, the sign
 // clipped), the fold is the SDR one, and k_hdrRestOut adds back the light the view never held.
 // Restore = Anime4K (restNatKind 3): its passes on the same input, then its de-ringing clamp, unless the resize's Anime4K
@@ -30422,7 +30418,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         nfr = nr.slots;
     const bool pipe =
         pipeAsk && nr.fruc && nr.frMp && nr.havePrev && (nr.fsrfg ? fsrfgPipeOk(nr) : g_fruc.stepI != nullptr);
-    // no-engine mode (Identity.process_shm): an empty group stays empty (the pair advances,
+    // no-engine mode: an empty group stays empty (the pair advances,
     // nothing presented), any other group is exactly ONE real frame through the effects
     // chain, whatever fractions the pair clock asked for
     static const float kReal = 1.0f;
@@ -30978,8 +30974,8 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         nr.nrHaveLast = true;
 
     // native DRBA: the new frame and its encode into the history ring; the group then shows
-    // the LAGGED frame k - 1 as its real frame (the first capture: itself, one slot, exactly
-    // RifeDrba's first group)
+    // the LAGGED frame k - 1 as its real frame (the first capture: itself, one slot:
+    // DRBA's first group)
     int drHist = 0;
     float* drLag = dCur;
     if (nr.drba)
@@ -30994,7 +30990,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     }
 
     // (4) the pair. How many tweens this group asks for, in fracs order, decides whether the
-    // pair-level work is needed at all (python skips reuse() for a tween-less group).
+    // pair-level work is needed at all.
     uint32_t nTween = 0;
     for (uint32_t i = 0; i < nfr; i++)
         if (fr[i] < 0.999f)
@@ -31010,7 +31006,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     // for the whole group in drainReady(true) before it takes the next message.
     bool pairStatic = false;
     // native DRBA tests the LAGGED pair (k-2, k-1): every tween of its group lies inside it
-    // (RifeDrba's static rule, three frames of history needed)
+    // (DRBA's static rule, three frames of history needed)
     if (nTween && g_staticHold && nr.fPairDiff && nr.dStaticFlag && nr.hStaticFlag && (!nr.drba || drHist >= 3))
     {
         const int n = (int)(3 * plane);
@@ -31042,7 +31038,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         }
     }
     // RIFE: the pair encode. The previous frame's encode is REUSED (encode is a pure function
-    // of the frame, so this is exact and halves the Head work python does per pair).
+    // of the frame, so this is exact and halves the Head work per pair).
     nr.fCur ^= 1;
     if (nr.gmfss)
     {
@@ -31453,7 +31449,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         else if (nr.drba)
         {
             // native DRBA: one IFNet enqueue per tween with its own DRM timestep map, or the
-            // lagged real frame where python's group holds (a head without enough history)
+            // lagged real frame where the group holds (a head without enough history)
             bool held = false;
             if (!nativeDrbaTween(nr, fr[i], drHist, held, false, nr.blendOut ? slot : nullptr))
             {
@@ -31528,7 +31524,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 chunkLen = nTween - chunkBase;
                 if (chunkLen > (uint32_t)nr.batchMax)
                     chunkLen = (uint32_t)nr.batchMax;
-                // timestep planes are constant maps of t (python: base + float(t))
+                // timestep planes are constant maps of t
                 // collect the chunk's t values in tween order
                 float ts[64];
                 if (chunkLen > 64)
