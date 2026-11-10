@@ -26,8 +26,8 @@
 // offline render, the argument parsing, wmain and the resident hosts):
 //   smv-live-host.inl      WIC / GDI and D3D helpers, Host (swap chain, overlay, present ring)
 //   smv-live-capture.inl   WGC Capture (shared texture + fence, HDR pack shader)
-//   smv-live-native.inl    the native RIFE host: NVRTC kernels, TrueHDR math, the RTX bridge,
-//                          NativeRife (handoff, engine load, compute thread, resident state)
+//   smv-live-native.inl    the native model host: the shared NVRTC kernel text, then its parts
+//                          smv-live-native-<name>.inl (bridges, models, NativeRife, handoff, compute thread)
 //   smv-live-pipe.inl      PipeServer (the present loop's message interface to the native host)
 //   smv-live-loop.inl      window finding, the HUD, the diag thread, runLive (the present loops)
 

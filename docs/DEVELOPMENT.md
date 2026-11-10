@@ -1450,7 +1450,7 @@ A session the host cannot start ends on its reason line (log: `native host: <rea
 refused native DLSS 5 pass (above 3840x2160, `SMV_LIVE_NR_NATIVE=0`, no zero-copy capture) runs
 the session WITHOUT DLSS 5 and logs `live DLSS 5 skipped for this session: <why>`.
 
-The engine handoff (`nativeHandoff` in `smv-live-native.inl`) gives a session its geometry and
+The engine handoff (`nativeHandoff` in `smv-live-native-engine-load.inl`) gives a session its geometry and
 model paths as `NATIVE-PATH` lines plus one `LIVE READY native=1` line (`SMV_HANDOFF_DUMP=1` logs
 them). `lkSession` derives everything from the session's arguments (the folders, the Image scale,
 the padded sizes):
@@ -2019,7 +2019,7 @@ Feed once: `nvoffruc_step(prev, cur, out, t, mode, &rep)` feeds each source fram
 FRUC once. Mode 0 primes `prev` (`bSkipWarp = 1`) and feeds `cur`; mode 1 feeds `cur` only (FRUC
 was fed `prev` last); mode 2 asks the same pair again for another `t` by feeding `cur` again at its
 same timestamp. Its two input surfaces alternate, so the frame FRUC was fed last is never
-overwritten. The host picks the mode per tween (`frFed`, `frFirst` in `smv-live-native.inl`); a
+overwritten. The host picks the mode per tween (`frFed`, `frFirst` in `smv-live-native-fruc.inl`); a
 bridge without `nvoffruc_step` falls back to `nvoffruc_interpolate`, which feeds both frames per
 tween (the priming call costs a full optical flow). Measured at 2560x1472: 1.51x the tweens per
 second at one tween per pair, 1.95x at four, pixels inside NvOFFRUC's run-to-run noise.
@@ -2359,8 +2359,8 @@ from the GUI.
 Built from `smv-live.cpp` plus the DLSS 5 core `../../dlssnr/build_src/nr_host.cpp` via `build.bat`
 in `engine/live/build_src/`. `smv-live.cpp` is one translation unit that `#include`s its five parts
 in order (`smv-live-host.inl` swap chain and overlay, `smv-live-capture.inl` WGC capture and the
-DLSS 5 hook, `smv-live-native.inl` the native model host (Anime4K and each ported network sit in their own
-`smv-live-native-<name>.inl`, included from it), `smv-live-pipe.inl` the present loop's interface
+DLSS 5 hook, `smv-live-native.inl` the native model host (its code sits in parts, `smv-live-native-<name>.inl`,
+included from it in order; the repo's `CLAUDE.md` lists them), `smv-live-pipe.inl` the present loop's interface
 to it, `smv-live-loop.inl` window finding, HUD and the present loops; the file map is in its header
 comment); the parts are not standalone sources and `build.bat` compiles only `smv-live.cpp`. The
 NVIDIA Optical Flow interface headers (the nvof model) are vendored in `build_src/nvofa` (MIT, with

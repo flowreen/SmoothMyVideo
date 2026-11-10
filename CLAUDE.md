@@ -38,24 +38,41 @@ a version bump in `package.json`.
 `smv-live-capture.inl` (window capture), `smv-live-native.inl` (every model and pass, CUDA), `smv-live-pipe.inl`,
 `smv-live-loop.inl` (the live loop, pacing, the HUD). A name defined in an earlier file is visible in the later ones.
 
-`smv-live-native.inl` is too long to read whole (about 20,000 lines). Find a symbol with a search, then read around
-it. Its layout, top to bottom:
-
-1. `kNativeKernels`: the shared CUDA kernel text (packs, resizes, splats, blends, sharpen, HDR, optical flow).
-2. Host code: resize tables, the vendor bridges, the weight readers, kernel compilation and its cache.
-3. The `#include` lines of the parts below. Their order matters: a later part uses names an earlier one defines.
-4. Session code: the tween and emit paths, `nativeGroup`, `nativeThread`.
-
-Anime4K and each ported network live in their own part, `smv-live-native-<name>.inl`, with the kernel text, the
-loader and the launch code together. A part is small enough to read whole, except `anime4k` (weight tables).
+`smv-live-native.inl` (about 5,200 lines) keeps `kNativeKernels`, the shared CUDA kernel text (packs, resizes,
+splats, blends, sharpen, HDR, optical flow; find a kernel with a search, then read around it), the CUDA runtime's
+entry points and loader (`nativeLoadDlls`), the glue between parts (`nativeGmShareMemory`, `nativeModelShareMemory`,
+the CUDA graphs `chainGraphRun`), and an `#include` line for each part below. All other native code lives in a part,
+`smv-live-native-<name>.inl`, one concern each and small enough to read whole, except `anime4k` (weight tables). The
+table is the include order, which is the source order and matters: a later part uses names an earlier one defines.
 
 | Part `<name>` | What |
 |---|---|
-| `anime4k`, `anime4k-restore` | Anime4K: weight tables, kernel-text builder, upscale passes; its Restore pass |
-| `artcnn` | ArtCNN (`kAcnA`) |
-| `rife-ifnet`, `drba-block0` | RIFE's IFNet (`kIfnA`), DRBA's block 0 (`kB0Conv`) |
-| `gmfss-featnet`, `gmfss-metricnet`, `gmfss-ifnet`, `gmfss-fusionnet` | GMFSS's feature net (`kFnConv`), metric net (`kMnText`), IFNet (`kGiA`), fusion net (`kFuA`) |
-| `gmflow-backbone`, `gmflow-a`, `gmflow-b` | GMFlow's backbone (`kBbA`), transformer (`kGaA`), second half (`kGb`) |
+| `rtxvideo` | the RTX Video SDK bridge (RTX VSR, TrueHDR) and TrueHDR's statistics |
+| `state` | `NativeRife` (a session's whole state) and the constants it is sized by |
+| `handoff` | the resident host's kept state, the session lookup (`lkSession`), the live working size |
+| `weights` | the weight readers: `.pkl` / `.pth` (`pthStateDict`), ONNX, AnimeJaNai's weights |
+| `engine-load` | the full handoff (`nativeHandoff`), the offline lookups, the background build |
+| `kernel-build` | RIFE's encode weights and kernel text, the kernel bindings, the resize tap tables, compiling and caching the cubins (`nativeCubin`, `nativeBuildKernels`) |
+| `cuda-init` | the CUDA device init, the RTX bridge's session init (`nativeRtxInit`) |
+| `nvof` | the nvof model (NVIDIA Optical Flow) |
+| `fruc` | Smooth Motion (FRUC): its bridge, workers and tween tree |
+| `fsrfg` | AMD FSR 4 / Intel XeSS frame generation |
+| `fsrup` | AMD FSR 4 / Intel XeSS-SR upscaling |
+| `anime4k`, `artcnn`, `anime4k-restore` | Anime4K: weight tables, kernel-text builder, upscale passes; ArtCNN (`kAcnA`); Anime4K's Restore pass |
+| `model-setup` | DRBA's buffers, the early CUDA init, the HDR config, Restore's own nets (`restNatSetup`) |
+| `gmfss-featnet`, `drba-block0`, `gmfss-metricnet` | GMFSS's feature net (`kFnConv`), DRBA's block 0 (`kB0Conv`), GMFSS's metric net (`kMnText`) |
+| `rife-ifnet` | RIFE's IFNet (`kIfnA`) |
+| `gmfss-ifnet`, `gmfss-fusionnet`, `gmflow-b`, `gmflow-backbone`, `gmflow-a` | GMFSS's IFNet (`kGiA`), fusion net (`kFuA`), GMFlow's second half (`kGb`), backbone (`kBbA`), transformer (`kGaA`) |
+| `model-init` | GMFSS's setup, the tween buffers, the HDR model steps, the fits and blends, `nativeModelInit`, `nativeFree` |
+| `gmfss-chain` | the GMFSS pair and tween |
+| `drba` | DRBA's frame ring, windows and tween |
+| `restore-run` | the Restore run, TrueHDR's offline statistics |
+| `dlss5` | DLSS 5's change mask (`--nr-delta`), texture imports and motion field |
+| `video-memory` | the free video memory figure and the live ring's fit |
+| `dlss5-frame` | DLSS 5 on one frame (`nativeNrFrame`), its live init |
+| `emit` | after DLSS 5: Sharpen and RTX HDR, RTX VSR, the offline stage and emit |
+| `group` | `nativeGroup`: one group of tweens |
+| `thread` | the live switches (`nativeLiveSets`), the compute thread, `nativeStart` / `nativeStop` |
 
 CUDA kernels are C++ raw strings compiled at run time; the compiled result is cached by a hash of the text, so a
 kernel text that does not change keeps its cache entry.
