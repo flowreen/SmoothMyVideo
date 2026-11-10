@@ -90,12 +90,12 @@ to 10000.
 upload, and it is free. Built and tested on an RTX 5090 Laptop.
 
 **Optional extras.** A few features need a file the app can't include. Tick the feature and the app shows a short
-setup box. Most install with one click. NVIDIA's two SDKs sit behind a free NVIDIA developer login, so you download
-those yourself.
+setup box. Most install with one click. NVIDIA's Optical Flow SDK sits behind a free NVIDIA developer login, so you
+download that one yourself.
 
 | Feature | What to get | How |
 |---|---|---|
-| RTX Video Super Resolution, RTX HDR | NVIDIA's RTX Video SDK | **Get from NVIDIA** (free developer login), then **Choose .zip&hellip;** (or drop the zip). Without it, upscaling uses a standard resize and RTX HDR is off. |
+| RTX Video Super Resolution, RTX HDR | NVIDIA's RTX Video runtime | One click: **Download RTX Video** (NVIDIA's own package from NVIDIA's server, about 416 MB, checked and installed). Without it, upscaling uses a standard resize and RTX HDR is off. |
 | NVIDIA DLSS 5 | The Neural Rendering runtime (`nvngx_dlssnr.dll`) | One click: **Download the DLSS 5 runtime** ([details](#nvidia-dlss-5)). |
 | NVIDIA Smooth Motion | `NvOFFRUC.dll` from NVIDIA's Optical Flow SDK | **Get from NVIDIA** (free developer login), then **Choose .zip&hellip;**. GMFSS is used until it is installed. |
 | Dolby Vision, HDR10+ | The open-source [dovi_tool](https://github.com/quietvoid/dovi_tool) / [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool) | One click: **Download dovi_tool** / **Download hdr10plus_tool** (a fixed release, checked and installed). |

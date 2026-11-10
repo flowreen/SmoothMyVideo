@@ -2025,6 +2025,14 @@ cl /nologo /LD /EHsc /MT /DNDEBUG ^
 Copy the DLL up into `engine/rtxvideo/` next to `nvngx_vsr.dll` + `nvngx_truehdr.dll` (NGX resolves
 the feature DLLs relative to the loading module).
 
+NVIDIA's two feature DLLs come from the app: main-setup.ts `NVVFX_DL` pins NVIDIA's `nvidia-vfx` package (a Python
+wheel, which is a zip, on NVIDIA's package index pypi.nvidia.com: its version, URL, page, SHA256 and size; a bump
+changes all five, plus the two files' sizes and hashes in `RTX_PINNED`), and the setup row's one click downloads it,
+checks the hash before anything is extracted, and copies `nvngx_vsr.dll` and `nvngx_truehdr.dll` into
+`engine/rtxvideo`. They are newer than the SDK the bridge is built against and load through it as they are. An
+installed file that is not the pinned one is removed at app start, so the row offers the pinned pair; to try another
+build, point `SMV_RTXVIDEO_DIR` at a folder that holds the bridge and that build.
+
 Rules: `/MT` is required (the NGX lib uses the static CRT). `cudart.lib`, `user32`, `shell32`,
 `advapi32` are all needed. **Never rebuild against CUDA 13**: `nvsdk_ngx_s.lib` calls
 `cudaGetDeviceProperties` with a CUDA 12 sized struct, a CUDA 13 cudart overruns it and the process

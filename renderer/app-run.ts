@@ -19,8 +19,7 @@ function syncInterp() {
 }
 syncInterp();
 
-// Drop anything onto the window: a video loads for processing, a .zip installs the RTX Video SDK (the
-// other tools download in one click). All drops are ignored while a job is running.
+// Drop videos onto the window: they load for processing. All drops are ignored while a job is running.
 document.addEventListener('dragover', (e) => {
   e.preventDefault();
   if ($('cancel').disabled) document.body.classList.add('drag');
@@ -34,20 +33,11 @@ document.addEventListener('drop', (e) => {
   if (!$('cancel').disabled) return; // a job is in progress
   const files = [...(e.dataTransfer.files || [])];
   if (!files.length) return;
-  const nm = files[0].name,
-    p = webUtils.getPathForFile(files[0]);
-  if (/\.zip$/i.test(nm)) {
-    // a .zip is the RTX Video SDK: install the RTX runtime
-    showWorkspace(); // RTX install feedback lives in #workspace, so reveal it even before a video is loaded
-    if ($('rtxsetup').style.display === 'none') $('rtxsetup').style.display = 'block'; // reveal install feedback
-    doInstall(p);
-  } else {
-    // Anything else: load it as a video; several dropped files become a batch queue. Both the
-    // Select video button and the file rows are hidden in Live mode, but a drop still fires, so
-    // switch to Video mode first or the loaded file would land on an invisible workspace.
-    setMode('video');
-    queueVideos(files.map((f) => webUtils.getPathForFile(f)));
-  }
+  // Several dropped files become a batch queue. Both the Select video button and the file rows are hidden
+  // in Live mode, but a drop still fires, so switch to Video mode first or the loaded file would land on an
+  // invisible workspace.
+  setMode('video');
+  queueVideos(files.map((f) => webUtils.getPathForFile(f)));
 });
 
 // Resume an interrupted batch: if the previous session died mid-run (crash, forced close), its

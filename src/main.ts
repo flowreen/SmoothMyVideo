@@ -7,7 +7,7 @@ import { ENGINE } from './main-paths';
 import { createWindow, win } from './main-window';
 import { applyPendingUpdate, checkForUpdate, finishUpdate } from './main-update';
 import './main-dialogs';
-import { retireOldDlssnr } from './main-setup';
+import { retireOldRuntimes } from './main-setup';
 import { fsrWarmProc, liveSpareDrop, offlineHostQuit, stopLive } from './main-live';
 import './main-render';
 import './main-preview';
@@ -33,9 +33,9 @@ if (!app.requestSingleInstanceLock()) {
     // render starts; a cache an earlier version kept elsewhere (the engine folder, 1.0.x's AppData)
     // is moved or removed (src/render/cache.ts)
     console.log(checkEngineCache(ENGINE, [path.join(app.getPath('userData'), 'trt_cache')]));
-    // a retired DLSS 5 runtime (DLSSNR_RETIRED) goes before any host can load it
-    const nr = retireOldDlssnr();
-    if (nr) console.log(nr);
+    // superseded runtimes (DLSS 5's retired builds, an RTX Video file that is not the pinned one) go before
+    // any host can load them
+    for (const line of retireOldRuntimes()) console.log(line);
     createWindow();
     finishUpdate();
     checkForUpdate();

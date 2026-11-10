@@ -11,18 +11,45 @@ import { pipeline } from 'stream/promises';
 import { ENGINE } from './main-paths';
 import { win } from './main-window';
 
+// A release archive a setup row downloads in one click (installPinnedZip): its fields move together.
+type PinnedZip = { version: string; url: string; page: string; zipSha256: string; zipBytes: number };
+// A superseded runtime build, known by its file's size and SHA256 (retireOldRuntimes).
+type Retired = { label: string; bytes: number; sha256: string };
+
 // --- RTX Video runtime: readiness + one-click install --------------------------------------------
 // The opt-in RTX features (VSR / TrueHDR) run through the compiled CUDA bridge (rtxvideo_cuda.dll,
 // which ships with the app) plus NVIDIA's two RTX Video feature DLLs. Those feature DLLs are NVIDIA
-// proprietary and NON-redistributable, so they are never bundled; the user downloads NVIDIA's RTX
-// Video SDK (a deliberate, EULA-gated action) and this app drops the two DLLs into engine/rtxvideo
-// for them. A feature is "ready" only when the bridge AND its feature DLL are present there.
+// proprietary and NON-redistributable, so they are never bundled: one click downloads NVIDIA's own
+// nvidia-vfx package (a Python wheel, which is a zip) from NVIDIA's package index, checks its SHA256
+// before anything is extracted and copies the two DLLs into engine/rtxvideo. A feature is "ready" only
+// when the bridge AND its feature DLL are present there. Bump version, url, hash and size together when
+// moving to a newer package, and RTX_PINNED and RTX_LABEL with them.
 const RTX_DIR = path.join(ENGINE, 'rtxvideo');
-const RTX_FEATURE_DLLS = ['nvngx_vsr.dll', 'nvngx_truehdr.dll'];
-const RTX_SDK_URL = 'https://developer.nvidia.com/rtx-video-sdk/getting-started';
+const NVVFX_DL: PinnedZip = {
+  version: '0.2.0.0',
+  url: 'https://pypi.nvidia.com/nvidia-vfx/nvidia_vfx-0.2.0.0-cp312-abi3-win_amd64.whl',
+  page: 'https://pypi.nvidia.com/nvidia-vfx/',
+  zipSha256: 'cebaa12411f7e22b39293205c5c4d07b8073d14ca1e0e7727ee4375207a36445',
+  zipBytes: 435807359,
+};
+// The pair NVVFX_DL installs, each file by its size and SHA256. An installed file that is not it is removed at
+// app start (retireOldRuntimes), so the RTX row offers the download: SMV runs this pair only.
+const RTX_PINNED: Record<string, { bytes: number; sha256: string }> = {
+  'nvngx_vsr.dll': {
+    bytes: 59120752,
+    sha256: '0cc98643a76c05ca6d73ec81a898d545b18e5c080667d72854a1bfaebd56e1ed',
+  },
+  'nvngx_truehdr.dll': {
+    bytes: 3692144,
+    sha256: '90e1d0884276f3e9b5f17756df46667c7b16aab0413bb56e27de7c8a0cf10d75',
+  },
+};
+const RTX_FILES: Array<[string, string]> = Object.keys(RTX_PINNED).map((file) => [file, file]);
+// the pair as the retire lines name it
+const RTX_LABEL = 'RTX VSR 1.8.3 + RTX HDR 1.2.3';
 // NvOFFRUC ("NVIDIA Smooth Motion"): our bridge (nvoffruc_bridge.dll) is locally built and ships,
 // but NvOFFRUC.dll + cudart64_110.dll are NVIDIA proprietary and user-installed from the Optical
-// Flow SDK .zip - same EULA-gated, non-redistributable pattern as the RTX feature DLLs.
+// Flow SDK .zip, which NVIDIA serves behind a developer login.
 const NVOFFRUC_DIR = path.join(ENGINE, 'nvoffruc');
 const NVOFFRUC_DLLS = ['NvOFFRUC.dll', 'cudart64_110.dll'];
 const OF_SDK_URL = 'https://developer.nvidia.com/opticalflow/download';
@@ -66,31 +93,43 @@ const DLSSNR_DL = {
 };
 // Superseded one-click builds (size + SHA256 of nvngx_dlssnr.dll). An installed copy, downloaded or dropped, is
 // removed at app start so the DLSS 5 row offers DLSSNR_DL's build: SMV offers one build only.
-const DLSSNR_RETIRED = [
+const DLSSNR_RETIRED: Retired[] = [
   {
     label: '310.8.SF-v2',
     bytes: 165830144,
     sha256: '6eb209e764f39872625debd6abaf45e2bb6322f6f270f781f70c059ae30b3927',
   },
 ];
-/** Remove an installed retired runtime; '' when there is none. One held by a running host stays and is
- *  retried next start. The size test comes first, so only a same-size file gets hashed. */
-export function retireOldDlssnr(): string {
-  const p = path.join(DLSSNR_DIR, DLSSNR_RUNTIME);
-  let old: (typeof DLSSNR_RETIRED)[number] | undefined;
+// whether the file `p` is exactly this build; the size test comes first, so only a same-size file gets hashed
+function isBuild(p: string, bytes: number, sha256: string): boolean {
   try {
-    const size = fs.statSync(p).size;
-    old = DLSSNR_RETIRED.find((r) => r.bytes === size && r.sha256 === sha256File(p));
+    return fs.statSync(p).size === bytes && sha256File(p) === sha256;
   } catch {
-    return '';
+    return false;
   }
-  if (!old) return '';
+}
+/** Remove the superseded runtime file `p`: the line says it went, or that a running host still holds it (it
+ *  stays and is retried next start). */
+function retire(what: string, p: string, label: string, offer: string): string {
   try {
     fs.rmSync(p);
   } catch {
-    return `DLSS 5: the retired ${old.label} runtime is in use, retried next start`;
+    return `${what}: the retired ${label} runtime is in use, retried next start`;
   }
-  return `DLSS 5: removed the retired ${old.label} runtime, the download offers ${DLSSNR_DL.label}`;
+  return `${what}: removed the retired ${label} runtime, the download offers ${offer}`;
+}
+/** Remove every installed superseded runtime, one line for each: DLSS 5's when it is a build of DLSSNR_RETIRED
+ *  (a runtime the user dropped in stays), an RTX Video file when it is not RTX_PINNED's. */
+export function retireOldRuntimes(): string[] {
+  const lines: string[] = [];
+  const nr = path.join(DLSSNR_DIR, DLSSNR_RUNTIME);
+  const old = DLSSNR_RETIRED.find((r) => isBuild(nr, r.bytes, r.sha256));
+  if (old) lines.push(retire('DLSS 5', nr, old.label, DLSSNR_DL.label));
+  for (const [file, pin] of Object.entries(RTX_PINNED)) {
+    const p = path.join(RTX_DIR, file);
+    if (fileExists(p) && !isBuild(p, pin.bytes, pin.sha256)) lines.push(retire('RTX Video', p, file, RTX_LABEL));
+  }
+  return lines;
 }
 export function sha256File(p: string): string {
   const h = crypto.createHash('sha256');
@@ -141,12 +180,11 @@ function findFilesNamed(root: string, names: string[]): string[] {
   return hits;
 }
 
-// The one zip-extract-and-copy flow behind every user-installed runtime (the RTX feature DLLs,
-// the NvOFFRUC pair, dovi_tool / hdr10plus_tool, the DLSS 5 runtime). `source` is a .zip (only
-// the wanted members are extracted, with Windows' bundled bsdtar, into a temp dir that is removed
-// again), an extracted folder, or a picked file (its folder is searched). `prefer` breaks ties
-// when an archive ships several copies of a name (the RTX SDK's arm64 / x64 dev / rel builds, the
-// Optical Flow SDK's win32 / win64). Every wanted name must be found, else nothing is copied.
+// The zip-extract-and-copy flow behind a runtime the user picks as a file (the NvOFFRUC pair). `source`
+// is a .zip (only the wanted members are extracted, with Windows' bundled bsdtar, into a temp dir that
+// is removed again), an extracted folder, or a picked file (its folder is searched). `prefer` breaks
+// ties when an archive ships several copies of a name (the Optical Flow SDK's win32 / win64). Every
+// wanted name must be found, else nothing is copied.
 function installFiles(
   source: string,
   names: string[],
@@ -217,15 +255,6 @@ function installFiles(
   }
 }
 
-// The two RTX Video feature DLLs into engine/rtxvideo (the SDK ships arm64 + x64 dev/rel copies;
-// take the x64 release build).
-const installRtx = (source: string): InstallResult =>
-  installFiles(source, RTX_FEATURE_DLLS, RTX_DIR, {
-    what: 'the selected RTX Video SDK',
-    where: 'the RTX DLLs in engine/rtxvideo',
-    prefer: /x64[\\/]+rel/i,
-  });
-
 // NvOFFRUC.dll + cudart64_110.dll into engine/nvoffruc, beside the locally built bridge (the SDK
 // ships win32 + win64 copies; take the x64 build).
 const installFruc = (source: string): InstallResult =>
@@ -242,26 +271,17 @@ ipcMain.handle('rtx-ready', () => {
     hdr: bridge && fileExists(path.join(RTX_DIR, 'nvngx_truehdr.dll')),
     bridge,
     dir: RTX_DIR,
+    ver: NVVFX_DL.version,
+    mb: toolMb(NVVFX_DL),
   };
 });
 
 ipcMain.handle('rtx-open-download', () => {
-  shell.openExternal(RTX_SDK_URL);
+  shell.openExternal(NVVFX_DL.page);
   return true;
 });
 
-// Install from the picked or dropped .zip.
-ipcMain.handle('rtx-install', (_e, source: string) => installRtx(source));
-
-// Manual picker: the RTX Video SDK .zip.
-ipcMain.handle('rtx-choose', async () => {
-  const r = await dialog.showOpenDialog(win!, {
-    title: 'Select the RTX Video SDK .zip',
-    properties: ['openFile'],
-    filters: [{ name: 'Zip', extensions: ['zip'] }],
-  });
-  return r.canceled ? null : r.filePaths[0] || null;
-});
+ipcMain.handle('rtx-download', () => installPinnedZip(NVVFX_DL, RTX_FILES, RTX_DIR, 'rtx-progress'));
 
 // "NVIDIA Smooth Motion" (NvOFFRUC) runtime: ready only when our bridge AND NvOFFRUC.dll are present.
 // "DLSS 4.5" (DLSS Frame Generation): bundled, so this only guards against a broken install.
@@ -532,7 +552,6 @@ ipcMain.handle('fruc-choose', async () => {
 // Windows x64 release zip, checks its SHA256 (the GitHub API digest) before anything is extracted,
 // extracts the exe with Windows' bsdtar and copies it into engine/dvtools / engine/hptools. "Ready" =
 // the exe present. Bump version, url, page, hash and size together.
-type PinnedZip = { version: string; url: string; page: string; zipSha256: string; zipBytes: number };
 const DV_DIR = path.join(ENGINE, 'dvtools');
 const DOVI_BIN = 'dovi_tool.exe';
 const DOVI_DL: PinnedZip = {
@@ -556,9 +575,10 @@ const HP_DL: PinnedZip = {
 const findDvBin = (root: string, name: string): string | null => findFilesNamed(root, [name])[0] || null;
 
 // One-click install of a pinned release zip: download into a temp dir (progress to the renderer as
-// `channel`), check the zip's SHA256 before anything is extracted (a replaced asset installs nothing),
-// extract it with bsdtar and copy each wanted file into destDir: `files` = [name in the zip, name in
-// destDir] pairs, all found before any is copied. The temp dir is removed again.
+// `channel`, at most 200 lines a download), check the zip's SHA256 before anything is extracted (a
+// replaced asset installs nothing), extract the wanted members with bsdtar and copy each into destDir:
+// `files` = [name in the zip, name in destDir] pairs, all found before any is copied. The temp dir is
+// removed again.
 async function installPinnedZip(
   dl: PinnedZip,
   files: Array<[string, string]>,
@@ -579,17 +599,27 @@ async function installPinnedZip(
     if (!res.ok || !res.body) return { ok: false, error: `download failed: HTTP ${res.status}`, copied: [] };
     const total = parseInt(res.headers.get('content-length') || '0', 10) || dl.zipBytes;
     let received = 0;
+    let shown = 0;
     const src = Readable.fromWeb(res.body as never);
     src.on('data', (chunk: Buffer) => {
       received += chunk.length;
-      progress(received, total, 'download');
+      if (received - shown >= total / 200 || received >= total) {
+        shown = received;
+        progress(received, total, 'download');
+      }
     });
     await pipeline(src, fs.createWriteStream(zip));
     progress(received, total, 'verify');
     const zh = sha256File(zip);
     if (zh !== dl.zipSha256)
       return { ok: false, error: `checksum mismatch (${zh.slice(0, 12)}...), nothing installed`, copied: [] };
-    execFileSync(SYS_TAR, ['-xf', zip, '-C', tmp]);
+    try {
+      execFileSync(SYS_TAR, ['-xf', zip, '-C', tmp, ...files.map(([member]) => '*' + member)]);
+    } catch {
+      // bsdtar fails when a member pattern matches nothing (its patterns are case-sensitive): take the
+      // whole archive and let the search below decide
+      execFileSync(SYS_TAR, ['-xf', zip, '-C', tmp]);
+    }
     const found = files.map(([member]) => findDvBin(tmp, member));
     const missing = files.filter((_, k) => !found[k]).map(([member]) => member);
     if (missing.length)

@@ -1,7 +1,7 @@
 // NVIDIA RTX: real RTX Video Super Resolution (ON by default) + RTX HDR (OFF by default) via the
 // engine/rtxvideo CUDA bridge + NVIDIA's feature DLLs. The feature DLLs are non-redistributable, so the app
-// can't bundle them; instead you pick the downloaded RTX Video SDK .zip and the app copies the two
-// DLLs into engine/rtxvideo for you. Readiness = the bridge + the feature's model DLL present.
+// can't bundle them; instead one click downloads NVIDIA's own package (main checks its hash, then copies the
+// two DLLs into engine/rtxvideo). Readiness = the bridge + the feature's model DLL present.
 function syncRtx() {
   const on = $('rtxvsr').checked || $('rtxhdr').checked;
   // The setup box appears only when a requested feature's runtime is missing (or while installing);
@@ -31,10 +31,17 @@ async function checkRtxReady() {
   } else {
     $('rtxstatus').textContent = tr('dlss.notReady');
     $('rtxstatus').style.color = '#e85c5c';
-    const detail = rtxReady.bridge === false ? tr('rtx.noBridge') : tr('rtx.howto');
+    const detail =
+      rtxReady.bridge === false
+        ? tr('rtx.noBridge')
+        : tr('rtx.howto', {
+            ver: rtxReady.ver || '',
+            mb: rtxReady.mb || '415.6',
+            link: toolPageLink('rtx-open-download', 'pypi.nvidia.com'),
+          });
     $('rtxsteps').innerHTML = lines.join('<br>') + '<br>' + detail;
   }
-  $('rtxbtns').style.display = ok ? 'none' : ''; // hide Get / Choose once the runtime is ready
+  $('rtxbtns').style.display = ok ? 'none' : ''; // hide the Download button once the runtime is ready
   // One setup box serves both RTX features, which now live in different panels: park it under
   // the first checkbox that still needs it (VSR in Upscale, else HDR in HDR).
   const host = (needVsr && !rtxReady.vsr) || !needHdr ? $('uppanel') : $('hdrpanel');
@@ -46,25 +53,6 @@ async function checkRtxReady() {
   syncHdrColor(); // so do the RTX HDR colour controls
   refreshPreviewIfOpen(); // re-render the open preview now that HDR readiness is known
 }
-async function doInstall(source) {
-  $('rtxsetup').style.display = 'block'; // show install progress (checkRtxReady collapses it again on success)
-  $('rtxstatus').textContent = tr('common.installing');
-  $('rtxstatus').style.color = 'var(--sub)';
-  let r: any = {};
-  try {
-    r = await ipcRenderer.invoke('rtx-install', source);
-  } catch (e) {
-    r = { ok: false, error: String(e) };
-  }
-  if (!r.ok) $('rtxsteps').innerHTML = '✗ ' + (r.error || tr('common.installFailed')) + '<br>' + tr('rtx.pickAgain');
-  await checkRtxReady();
-  if (!r.ok) $('rtxsetup').style.display = 'block'; // keep an install error visible even if no toggle needs the feature
-}
-$('rtxget').onclick = () => ipcRenderer.invoke('rtx-open-download');
-$('rtxbrowsezip').onclick = async () => {
-  const p = await ipcRenderer.invoke('rtx-choose');
-  if (p) doInstall(p);
-}; // selecting a .zip auto-installs
 localStorage.removeItem('supersampleOn'); // retired: supersample removed (measured imperceptible)
 localStorage.removeItem('encspeed'); // retired: no Encoder speed selector (every render uses the Quality encoder)
 localStorage.removeItem('rtxvsrOn'); // retired: its stored choice was made while RTX VSR defaulted off

@@ -54,9 +54,10 @@ async function checkDvReady() {
   $('dvbtns').style.display = dvReady.ready ? 'none' : ''; // hide the Download button once dovi_tool is installed
   $('dvsetup').style.display = dvReady.ready ? 'none' : 'block';
 }
-// a tool's pinned release page as a link (main opens it): its text is the language's, its action the code's
-function toolPageLink(channel) {
-  return '<a href="#" onclick="ipcRenderer.invoke(\'' + channel + '\');return false;">' + tr('aj.repoLink') + '</a>';
+// a tool's pinned release page as a link (main opens it): its text is the language's, or the site's own name when
+// the page is not on GitHub; its action is the code's
+function toolPageLink(channel, text = tr('aj.repoLink')) {
+  return '<a href="#" onclick="ipcRenderer.invoke(\'' + channel + '\');return false;">' + text + '</a>';
 }
 // One-click download of a pinned tool release (main does fetch + checksum + extract + copy): progress lands in the
 // status line, a failure keeps the note open with the retry line; `ready` re-reads the row afterwards.
@@ -94,6 +95,7 @@ function toolDownloader(id, channel, ready) {
 }
 $('dvdl').onclick = toolDownloader('dv', 'dv-download', () => checkDvReady());
 $('xessdl').onclick = toolDownloader('xess', 'xess-download', () => checkXessReady());
+$('rtxdl').onclick = toolDownloader('rtx', 'rtx-download', () => checkRtxReady());
 // Intel XeSS-FG's row downloads the same pinned SDK release; once Intel's files are in, a render or Live uses it
 $('xefgdl').onclick = toolDownloader('xefg', 'xess-download', async () => {
   await refreshXefgState();

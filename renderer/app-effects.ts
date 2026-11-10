@@ -218,7 +218,7 @@ const NVENC_MAX = 8192; // above this the engine encodes on the CPU (slower)
 const MAX_FACTOR = 16; // the engine clamps the upscale factor here
 let screenW = 0,
   screenH = 0,
-  rtxReady = { vsr: false, hdr: false, bridge: false };
+  rtxReady: any = { vsr: false, hdr: false, bridge: false };
 function upTargetH() {
   // chosen output height (0 = off)
   const v = $('upres').value;

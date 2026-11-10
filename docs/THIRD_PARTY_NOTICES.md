@@ -163,8 +163,9 @@ third-party work.
   XeSS setup row (the pinned XeSS SDK 3.0.2 release from github.com/intel/xess, its SHA256 checked) and installed
   unmodified into `engine/xess` with Intel's licence beside it as `XeSS_LICENSE.txt`. Intel and XeSS are trademarks
   of Intel Corporation; this project is not affiliated with or endorsed by Intel.
-* **NVIDIA RTX Video feature models**: installed by the user from NVIDIA's RTX Video SDK
-  download under NVIDIA's EULA.
+* **NVIDIA RTX Video feature models** (`nvngx_vsr.dll`, `nvngx_truehdr.dll`; NVIDIA Software License Agreement):
+  downloaded on the user's click in the app's RTX Video setup row (NVIDIA's pinned `nvidia-vfx` 0.2.0.0 package
+  from NVIDIA's package index pypi.nvidia.com, its SHA256 checked) and installed unmodified into `engine/rtxvideo`.
 
 Dolby and Dolby Vision are trademarks of Dolby Laboratories. HDR10+ is a trademark of HDR10+
 Technologies, LLC. This project is not affiliated with, endorsed by, or certified by either.
