@@ -765,11 +765,17 @@ Output:
   dark on every plane): a 4:4:4 YUV source and an RGB or palette source, whose every pixel has its
   own colour (an RGB source: 50.2 -> 65.2 dB against its own frames). AV1 and VVC write 4:2:0.
 * NVENC: constant-quality VBR at max effort, preset p7, full-resolution multipass, rc-lookahead 1,
-  HEVC CQ 17, AV1 CQ 22 (verified against a lossless 8K master; CQ is saturated at max effort, the
-  effort ladder is what moves quality, and shallow lookahead beats deep). HEVC adds lookahead level 1
-  (`-lookahead_level 1`, at depth 1, every output rate: smaller files at equal or better PSNR / VMAF
-  on most clips, and above 120 fps it beats no lookahead). AV1 and H.264 drop the lookahead queue
-  above 120 fps output (it measured worse on tween-dense streams). `tune uhq` rejected (its
+  HEVC CQ 17, AV1 CQ 19 (HEVC's 17 and AV1's 22 without a lookahead level verified against a
+  lossless 8K master; HEVC's CQ is saturated at max effort, the effort ladder is what moves quality,
+  and shallow lookahead beats deep). HEVC and AV1 add lookahead level 1 (`-lookahead_level 1`, at
+  depth 1, every output rate: fewer bits at equal PSNR / VMAF on most clips, and above 120 fps it
+  beats no lookahead). On AV1 the level makes a CQ spend fewer bits and lose quality on anime (1.7
+  to 2.7 dB at CQ 22), so AV1's CQ is 19: the highest that keeps, on every test clip, the PSNR and
+  VMAF of 22 without the level. The level is a device capability, and ffmpeg refuses to open an
+  encoder asked for a level the device lacks: the encoder check opens NVENC with the level first,
+  and a device without it encodes without it (HEVC CQ 17, AV1 CQ 22; `SMV_NVENC_LEVEL=0` forces
+  that call). Without the level, NVENC drops the lookahead queue above 120 fps output (it measured
+  worse on tween-dense streams). `tune uhq` rejected (its
   temporal filter rewrites content). VVC QP 17 with perceptual QP adaptation off; SVT-AV1 CRF 17
   preset 6. `SMV_CQ` overrides any CQ for measurement work.
 * HEVC and AV1 NVENC split-frame encoding is pinned OFF (`-split_encode_mode 15`; ffmpeg's `auto`
@@ -1903,6 +1909,7 @@ named here, and on a name here that no source holds.
 | `SMV_LIVE_CASCADE=off` / `=probe` / `=present`, `SMV_LIVE_CASCADE_GEN` | Live DLSS 4.5: `off` = one pass only (no plan above the limit); development only (the direct route): `probe` starts `dlssg2f.exe --stage1` beside the session (in a job object that ends it with the host), feeds it every captured frame and reads every frame it shares on the host's own D3D12 device, presenting nothing of it; `present` = the cascade: the session's DLSS-G (`--gen`) presents stage 1's frames instead of the captured ones (x6 x x2 = x12); `_GEN` = stage 1's generated frames (1..5, default 5). Lines `cascade probe: ...` / `cascade stage 1: ...` (harness `dlssg_cascade\probe_gate.py`) |
 | `SMV_FRUC_MIDPOINTS=0` / `SMV_FRUC_DEPTH` | Smooth Motion: the direct-t scheme instead of recursive midpoints (A/B only) / the midpoint depth for a tween time that is no tree node (1..9, default 3 offline, 2 live; exact nodes go to depth 9 either way) |
 | `SMV_CQ` | override the encoder CQ for measurement |
+| `SMV_NVENC_LEVEL=0` | NVENC without the lookahead level, the call a device without the level gets (HEVC CQ 17, AV1 CQ 22), for an A/B |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
 | `SMV_DLSSG_SWEEP=1` | the DLSS 4.5 host latches its buffer-sweep capture tier at startup instead of waiting for hardware flip metering, so the sweep path can be tested on demand |
 | `SMV_DLSSG_PRESENT_WRAP=0` | the DLSS 4.5 host leaves the native swap chain's `Present` / `Present1` unwrapped: by default it wraps them (in its own process) to learn when each present is queued and reads that frame back (a file render) or copies it into the live cascade's shared ring (`--stage1`) at once; without the wrap a present is copied only once a later one shows; the A/B and fallback test only, never a product setting |

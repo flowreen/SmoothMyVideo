@@ -122,8 +122,12 @@ export function decodeCmd(ffmpeg: string, inp: string, vfrDec: string[], filters
 }
 
 // --- the encoder ------------------------------------------------------------------------------
-/** encWorks's ffmpeg arguments: one black frame of `size` through the encoder into the null muxer. */
-function encWorksArgs(name: string, size: string, fast: boolean): string[] {
+/** The NVENC encoders whose quality call asks for lookahead level 1 (qualityArgs). */
+const NVENC_LEVEL = new Set(['hevc_nvenc', 'av1_nvenc']);
+
+/** encWorks's ffmpeg arguments: one black frame of `size` through the encoder into the null muxer; `level` opens
+ * the encoder as the quality call does, with a lookahead frame and lookahead level 1. */
+function encWorksArgs(name: string, size: string, fast: boolean, level: boolean): string[] {
   const args = [
     '-hide_banner',
     '-v',
@@ -140,25 +144,29 @@ function encWorksArgs(name: string, size: string, fast: boolean): string[] {
     if (name === 'libsvtav1') args.push('-preset', '12');
     else if (name === 'libvvenc') args.push('-preset', 'faster');
   }
-  return args.concat(['-c:v', name, '-f', 'null', '-']);
+  const enc = ['-c:v', name];
+  if (level) enc.push('-rc-lookahead', '1', '-lookahead_level', '1');
+  return args.concat(enc, ['-f', 'null', '-']);
 }
 
 /** Real availability check: open the encoder on one black frame of `size`. */
-export function encWorks(ffmpeg: string, name: string, size = '256x256', fast = false): boolean {
+export function encWorks(ffmpeg: string, name: string, size = '256x256', fast = false, level = false): boolean {
   try {
-    const r = spawnSync(ffmpeg, encWorksArgs(name, size, fast), { windowsHide: true, stdio: 'ignore' });
+    const r = spawnSync(ffmpeg, encWorksArgs(name, size, fast, level), { windowsHide: true, stdio: 'ignore' });
     return !r.error && r.status === 0;
   } catch {
     return false;
   }
 }
 
-/** encWorks at the default size, started now and answered when its ffmpeg exits: the route starts it before
- * the probes, so the check's ~0.2 s runs beside them instead of after. */
+/** encWorks at the default size, with the lookahead level where the encoder's quality call takes one, started now
+ * and answered when its ffmpeg exits: the route starts it before the probes, so the check's ~0.2 s runs beside them
+ * instead of after. */
 export function encWorksAsync(ffmpeg: string, name: string): Promise<boolean> {
   return new Promise((resolve) => {
     try {
-      const p = spawn(ffmpeg, encWorksArgs(name, '256x256', false), { windowsHide: true, stdio: 'ignore' });
+      const args = encWorksArgs(name, '256x256', false, NVENC_LEVEL.has(name));
+      const p = spawn(ffmpeg, args, { windowsHide: true, stdio: 'ignore' });
       p.once('error', () => resolve(false));
       p.once('exit', (code) => resolve(code === 0));
     } catch {
@@ -167,10 +175,13 @@ export function encWorksAsync(ffmpeg: string, name: string): Promise<boolean> {
   });
 }
 
-/** chooseEncoder's `works` with one answer known: `name` at the default size and mode returns `ok`, every
- * other check runs encWorks. */
+/** chooseEncoder's `works` with one answer known: `name` at the default size and mode, opened the way encWorksAsync
+ * opens it, returns `ok`; every other check runs encWorks. */
 export function presetWorks(name: string, ok: boolean): typeof encWorks {
-  return (ffmpeg, n, size, fast) => (n === name && size === undefined && !fast ? ok : encWorks(ffmpeg, n, size, fast));
+  return (ffmpeg, n, size, fast, level) =>
+    n === name && size === undefined && !fast && !!level === NVENC_LEVEL.has(name)
+      ? ok
+      : encWorks(ffmpeg, n, size, fast, level);
 }
 
 /** The encoder a codec asks for first (chooseEncoder's start, before the size and availability fallbacks). */
@@ -187,8 +198,8 @@ export function availRamGb(): number {
   }
 }
 
-/** [venc, useNvenc]: the encoder this render runs after the probes and fallbacks. works / ram
- * default to the real probes (a gate substitutes them). */
+/** [venc, useNvenc, nvencLevel]: the encoder this render runs after the probes and fallbacks, and whether NVENC
+ * opens with the quality call's lookahead level. works / ram default to the real probes (a gate substitutes them). */
 export function chooseEncoder(
   ffmpeg: string,
   codec: string,
@@ -201,7 +212,7 @@ export function chooseEncoder(
   fatal: Fatal,
   works: typeof encWorks = encWorks,
   ram: typeof availRamGb = availRamGb,
-): [string, boolean] {
+): [string, boolean, boolean] {
   let venc = codecEncoder(codec);
   if (outW > NVENC_MAX || outH > NVENC_MAX) {
     const order = codec === 'vvc' || outW * outH > 90_000_000 ? ['libvvenc', 'libsvtav1'] : ['libsvtav1', 'libvvenc'];
@@ -239,10 +250,17 @@ export function chooseEncoder(
     venc = 'libsvtav1';
   }
   let useNvenc = venc.endsWith('_nvenc');
-  if (useNvenc && !works(ffmpeg, venc)) {
-    say(`NVENC (${venc}) unavailable on this device; falling back to CPU libsvtav1\n`);
-    venc = 'libsvtav1';
-    useNvenc = false;
+  // The lookahead level is a device capability, and ffmpeg refuses to open an encoder asked for a level the device
+  // lacks: NVENC is opened with the level first, then without it.
+  const nvencLevel = useNvenc && NVENC_LEVEL.has(venc) && works(ffmpeg, venc, undefined, false, true);
+  if (useNvenc && !nvencLevel) {
+    if (!works(ffmpeg, venc)) {
+      say(`NVENC (${venc}) unavailable on this device; falling back to CPU libsvtav1\n`);
+      venc = 'libsvtav1';
+      useNvenc = false;
+    } else if (NVENC_LEVEL.has(venc)) {
+      say(`NVENC (${venc}) has no lookahead level on this device; encoding without it\n`);
+    }
   }
   if (venc === 'libsvtav1' && outLabel > 240) {
     if (works(ffmpeg, 'libvvenc', `${outW}x${outH}`, true)) {
@@ -263,7 +281,7 @@ export function chooseEncoder(
         'to the output to render fresh.',
     );
   }
-  return [venc, useNvenc];
+  return [venc, useNvenc, nvencLevel];
 }
 
 /** Output pixel format: always 10 bit, 4:4:4 kept where the encoder allows it (NVENC takes its 10 bits in the
@@ -283,6 +301,7 @@ export function qualityArgs(
   dvOrHp: boolean,
   ultra: boolean,
   env: Env = process.env,
+  nvencLevel = true,
 ): [string[], string | null] {
   let qargs: string[];
   if (useNvenc) {
@@ -292,12 +311,15 @@ export function qualityArgs(
         `encoder: SMV_ENC_LOSSLESS=1, ${venc} constant QP 0 lossless\n`,
       ];
     }
-    const cq = env.SMV_CQ || (venc === 'av1_nvenc' ? '22' : '17');
-    // HEVC: lookahead level 1 at a lookahead depth of 1 at every output rate (smaller files at equal or better
-    // PSNR / VMAF on most clips; on tween-dense streams above 120 fps it beats no lookahead, where depth 1 alone
-    // loses ~3 dB). The level needs a lookahead frame, so HEVC keeps depth 1 above 120 fps.
-    const hevcLevel = venc === 'hevc_nvenc';
-    const la = hevcLevel || outLabel <= 120 ? '1' : '0';
+    // HEVC and AV1: lookahead level 1 at a lookahead depth of 1 at every output rate (fewer bits at equal PSNR /
+    // VMAF on most clips; on tween-dense streams above 120 fps it beats no lookahead, where depth 1 alone loses
+    // ~3 dB on HEVC and changes nothing on AV1). The level needs a lookahead frame, so both keep depth 1 above
+    // 120 fps. A device without the level, and SMV_NVENC_LEVEL=0, encode without it.
+    const level = nvencLevel && env.SMV_NVENC_LEVEL !== '0' && NVENC_LEVEL.has(venc);
+    // AV1's CQ goes with its lookahead level: the level makes a CQ spend fewer bits and, on anime, lose 1.7 to
+    // 2.7 dB, so 19 is the highest CQ that keeps, on every test clip, the PSNR and VMAF of 22 without the level.
+    const cq = env.SMV_CQ || (venc === 'av1_nvenc' ? (level ? '19' : '22') : '17');
+    const la = level || outLabel <= 120 ? '1' : '0';
     qargs = [
       '-preset',
       'p7',
@@ -318,7 +340,7 @@ export function qualityArgs(
       '-temporal-aq',
       '1',
     ];
-    if (hevcLevel) qargs.push('-lookahead_level', '1');
+    if (level) qargs.push('-lookahead_level', '1');
     // Split-frame encoding stays OFF, pinned so no driver's `auto` can turn it on. Two strips were
     // 1.15x (1080p) / 1.30x (4K) faster for RIFE 2x, but the strips are separate slices with the
     // loop filter off across them, which leaves an unfiltered line at the same row of every frame
@@ -519,6 +541,7 @@ export interface EncodeInput {
   inp: string;
   venc: string;
   useNvenc: boolean;
+  nvencLevel: boolean; // NVENC opens with the quality call's lookahead level (chooseEncoder)
   hdrActive: boolean;
   chroma444: boolean;
   st: Stream;
@@ -611,7 +634,7 @@ export function saveSubsBeside(ffmpeg: string, ffprobe: string, inp: string, out
 export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   const outPix = outPixfmt(e.venc, e.useNvenc, e.hdrActive, e.chroma444);
   const ultra = e.outW > NVENC_MAX || e.outH > NVENC_MAX;
-  const [qargs, speedNote] = qualityArgs(e.venc, e.useNvenc, e.outLabel, e.dvOrHp, ultra, env);
+  const [qargs, speedNote] = qualityArgs(e.venc, e.useNvenc, e.outLabel, e.dvOrHp, ultra, env, e.nvencLevel);
   const prof = profileArgs(e.venc, outPix);
   const [sp, color, matrix] = colorArgs(e.hdrActive, e.st, e.outW, e.outH, !!e.hlg);
   // 4:2:0 holds no odd size (HEVC and VVC crop in steps of 2, zimg refuses it, NVENC rounds it down itself): an odd

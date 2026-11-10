@@ -783,7 +783,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const fatal = (m: string): never => {
     throw new RenderExit(m);
   };
-  const [venc, useNvenc] = chooseEncoder(
+  const [venc, useNvenc, nvencLevel] = chooseEncoder(
     FFMPEG,
     CODEC,
     OUT_W,
@@ -812,6 +812,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     inp,
     venc,
     useNvenc,
+    nvencLevel,
     hdrActive: HDR_ACTIVE,
     chroma444: CHROMA444,
     st: ST,
