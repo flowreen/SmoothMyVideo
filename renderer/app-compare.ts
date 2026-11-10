@@ -60,7 +60,7 @@ function syncCompareUi() {
     cmpRes = null;
   }
   cmpShown = on;
-  $('prevpair').style.display = on ? 'none' : 'flex';
+  $('prevpair').style.display = on ? 'none' : 'block';
   $('prevnav').style.display = on ? 'none' : '';
   $('cmpgrid').style.display = on ? '' : 'none';
   $('cmpnav').style.display = on ? '' : 'none';

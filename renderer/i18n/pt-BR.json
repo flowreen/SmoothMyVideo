@@ -240,6 +240,7 @@
   "prev.proc.alt": "quadro processado",
   "prev.back": "‹ voltar",
   "prev.random": "quadro aleatório ›",
+  "prev.split.tip": "Arraste para comparar: o original à esquerda, o resultado à direita",
   "cmp.alt0": "quadro real anterior",
   "cmp.alt1": "quadro novo do primeiro modelo",
   "cmp.alt2": "quadro real seguinte",

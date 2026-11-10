@@ -150,7 +150,7 @@ These run before the new frames are made, in videos and in Live:
   Its brightest white matches your HDR display; type a **Peak** in nits to make a file for another screen. HDR sources
   stay as they are.
 
-In the preview, **Show changed pixels** turns the Processed pane into a heat map of where DLSS 5 changed the picture.
+In the preview, **Show changed pixels** turns the processed side into a heat map of where DLSS 5 changed the picture.
 
 ## File renders
 
@@ -190,9 +190,9 @@ In the preview, **Show changed pixels** turns the Processed pane into a heat map
 <details>
 <summary><b>More: preview, output names, very large outputs, first runs</b></summary>
 
-* **Before / after preview:** a still frame with your Restore, resize, DLSS 5, Sharpen and HDR settings, next to the
-  original. It updates as you change settings; step to a random frame, and click either image for a synced 1:1 pixel
-  view.
+* **Before / after preview:** a still frame with your Restore, resize, DLSS 5, Sharpen and HDR settings over the
+  original, with a divider you drag to compare the two. It updates as you change settings; step to a random frame,
+  and click the picture for a 1:1 pixel view.
 * **Output name:** `<name>_<fps>fps` (the fps rounded, so 59.94 gives `_60fps`; plus `_<height>p` when resized) next
   to the source, `.mp4` or `.mkv` as needed. With no model ticked it is `_<height>p`, or `_restored` / `_dlss5` /
   `_sharpened` / `_hdr` after the pass that runs. Edit the **Saves to** path in place or with **Change&hellip;**;

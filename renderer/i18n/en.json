@@ -240,6 +240,7 @@
   "prev.proc.alt": "processed frame",
   "prev.back": "‹ back",
   "prev.random": "random frame ›",
+  "prev.split.tip": "Drag to compare: the original on the left, the result on the right",
   "cmp.alt0": "real frame before",
   "cmp.alt1": "first model's new frame",
   "cmp.alt2": "real frame after",

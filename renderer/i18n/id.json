@@ -240,6 +240,7 @@
   "prev.proc.alt": "frame hasil proses",
   "prev.back": "‹ kembali",
   "prev.random": "frame acak ›",
+  "prev.split.tip": "Seret untuk membandingkan: asli di kiri, hasil di kanan",
   "cmp.alt0": "frame asli sebelumnya",
   "cmp.alt1": "frame baru model pertama",
   "cmp.alt2": "frame asli sesudahnya",

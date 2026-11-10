@@ -240,6 +240,7 @@
   "prev.proc.alt": "bearbeitetes Bild",
   "prev.back": "‹ zurück",
   "prev.random": "Zufallsbild ›",
+  "prev.split.tip": "Zum Vergleichen ziehen: links das Original, rechts das Ergebnis",
   "cmp.alt0": "echtes Bild davor",
   "cmp.alt1": "neues Bild des ersten Modells",
   "cmp.alt2": "echtes Bild danach",

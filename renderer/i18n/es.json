@@ -240,6 +240,7 @@
   "prev.proc.alt": "fotograma procesado",
   "prev.back": "‹ atrás",
   "prev.random": "fotograma al azar ›",
+  "prev.split.tip": "Arrastra para comparar: el original a la izquierda, el resultado a la derecha",
   "cmp.alt0": "fotograma real anterior",
   "cmp.alt1": "fotograma nuevo del primer modelo",
   "cmp.alt2": "fotograma real siguiente",

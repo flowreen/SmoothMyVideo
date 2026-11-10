@@ -497,11 +497,16 @@ $('hdrvib').oninput = () => {
 $('hdrvib').addEventListener('change', refreshPreviewIfOpen);
 syncHdrColor();
 
-// 1:1 zoom: the pane shrinks 1080p+ frames ~6x, which visually erases sharpening, so clicking either
-// image toggles both to native pixels inside scrollable boxes with mirrored scrolling for A/B compare.
+// 1:1 zoom: the pane shrinks 1080p+ frames, which visually erases sharpening, so clicking either image toggles
+// both layers to the result's native pixels inside scrollable boxes with mirrored scrolling. The original is drawn
+// at the result's size (an upscale's result is larger than its source), so the two sides of the divider cover the
+// same part of the scene.
 let prevZoom = false,
   prevSyncing = false;
 function applyPrevZoom() {
+  const procW = $('prevproc').naturalWidth;
+  $('prevpair').classList.toggle('zoomed', prevZoom);
+  if (procW) $('prevpair').style.setProperty('--natw', procW + 'px');
   for (const [w, i] of [
     ['prevorigwrap', 'prevorig'],
     ['prevprocwrap', 'prevproc'],
@@ -509,8 +514,8 @@ function applyPrevZoom() {
     const wrap = $(w),
       img = $(i);
     wrap.style.overflow = prevZoom ? 'auto' : 'hidden';
-    wrap.style.maxHeight = prevZoom ? '320px' : '';
-    img.style.width = prevZoom ? 'auto' : '100%';
+    wrap.style.maxHeight = prevZoom ? 'var(--prevh)' : '';
+    img.style.width = prevZoom ? (i === 'prevorig' && procW ? procW + 'px' : 'auto') : '100%';
     img.style.maxWidth = prevZoom ? 'none' : '';
     img.style.cursor = prevZoom ? 'zoom-out' : 'zoom-in';
   }
@@ -531,17 +536,17 @@ function prevScrollSync(src, dst) {
   prevSyncing = false;
 }
 function setSpin(wrap, spin, on) {
-  // Sized/positioned to the VISIBLE window of the scroll box, so the wheel stays centred in view
-  // when the pane is zoomed 1:1 and scrolled (an inset-0 overlay would sit at the scroll origin).
-  if (!on) {
-    spin.style.display = 'none';
-    return;
+  // The wheels sit above both layers of the pane, sized to the visible window of the scroll box (without its
+  // scrollbars), so a wheel stays centred in view when the pane is zoomed 1:1. The two would overlap: the
+  // original's hides while the result's shows.
+  spin.style.display = on ? 'flex' : 'none';
+  if (on) {
+    spin.style.left = '0';
+    spin.style.top = '0';
+    spin.style.width = wrap.clientWidth + 'px';
+    spin.style.height = wrap.clientHeight + 'px';
   }
-  spin.style.left = wrap.scrollLeft + 'px';
-  spin.style.top = wrap.scrollTop + 'px';
-  spin.style.width = wrap.clientWidth + 'px';
-  spin.style.height = wrap.clientHeight + 'px';
-  spin.style.display = 'flex';
+  $('prevorigspin').firstElementChild.style.visibility = $('prevspin').style.display === 'none' ? '' : 'hidden';
 }
 function repositionSpins() {
   // keep a visible wheel glued to the viewport while scrolling
@@ -581,3 +586,37 @@ function togglePrevZoom(e) {
 }
 $('prevorig').onclick = togglePrevZoom;
 $('prevproc').onclick = togglePrevZoom;
+$('prevproc').addEventListener('load', () => {
+  const img = $('prevproc');
+  if (img.naturalWidth && img.naturalHeight) {
+    $('prevpair').style.setProperty('--ar', String(img.naturalWidth / img.naturalHeight)); // the pane takes its shape
+  }
+  if (prevZoom) applyPrevZoom(); // a new result may have another size: the original follows it
+});
+
+// The before / after divider: --split on the pane is the share of its width that shows the original. The handle
+// drags it, the arrow keys step it, Home and End jump to the sides.
+function setPrevSplit(pct) {
+  const v = Math.min(100, Math.max(0, pct));
+  $('prevpair').style.setProperty('--split', v + '%');
+  $('prevsplit').setAttribute('aria-valuenow', String(Math.round(v)));
+}
+function prevSplitAt(clientX) {
+  const r = $('prevpair').getBoundingClientRect();
+  setPrevSplit(((clientX - r.left) / Math.max(1, r.width)) * 100);
+}
+$('prevsplit').addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  $('prevsplit').setPointerCapture(e.pointerId);
+  $('prevsplit').focus();
+  prevSplitAt(e.clientX);
+});
+$('prevsplit').addEventListener('pointermove', (e) => {
+  if ($('prevsplit').hasPointerCapture(e.pointerId)) prevSplitAt(e.clientX);
+});
+$('prevsplit').addEventListener('keydown', (e) => {
+  const step = { ArrowLeft: -2, ArrowRight: 2, Home: -100, End: 100 }[e.key];
+  if (!step) return;
+  e.preventDefault();
+  setPrevSplit((parseFloat($('prevpair').style.getPropertyValue('--split')) || 50) + step);
+});

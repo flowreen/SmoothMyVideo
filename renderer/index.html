@@ -80,6 +80,29 @@
   button.mini { padding:3px 9px; font-size:16px; background:#353534; color:var(--text); }
   /* Compare: the 2x2 of real frames (left) and the two models' new frames (right) */
   #cmpgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:6px; }
+  /* The before / after preview: the original is drawn over the result and clipped at --split, a share of the
+     pane's width; #prevsplit is the divider that drags it. The pane stays left-to-right in every language. */
+  #prevpair { position:relative; direction:ltr; overflow:hidden; border-radius:6px; --split:50%;
+              --ar:1.7778; --prevh:60vh; width:min(100%, calc(var(--prevh) * var(--ar))); margin-inline:auto; }
+  /* The pane is the picture's own box, centred: as large as fits the row and --prevh of the window at the
+     picture's aspect (--ar); zoomed 1:1, no wider than the result's native width (--natw) plus a scrollbar. */
+  #prevpair.zoomed { width:min(100%, calc(var(--natw, 100%) + 17px)); }
+  #prevorigwrap { position:absolute; inset:0; clip-path:inset(0 calc(100% - var(--split)) 0 0); }
+  .prevtag { position:absolute; top:8px; max-width:44%; padding:2px 10px; border:1px solid var(--green);
+             border-radius:999px; background:rgba(13,13,13,.72); color:var(--text); font-size:14px;
+             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; pointer-events:none; }
+  .prevtag:empty { display:none; }
+  #prevoriglabel { inset-inline-start:8px; }
+  #prevproclabel { inset-inline-end:8px; }
+  #prevsplit { position:absolute; top:0; bottom:0; inset-inline-start:var(--split); width:2px; translate:-1px 0;
+               background:var(--green); box-shadow:0 0 0 1px rgba(0,0,0,.45); cursor:ew-resize; touch-action:none;
+               outline:none; }
+  #prevsplit::before { content:""; position:absolute; top:0; bottom:0; inset-inline:-10px; }
+  #prevsplit span { position:absolute; top:50%; inset-inline-start:50%; translate:-50% -50%; width:34px; height:34px;
+                    display:flex; align-items:center; justify-content:center; border-radius:50%;
+                    background:var(--green); color:#0d0d0d; box-shadow:0 0 0 2px rgba(0,0,0,.45); }
+  #prevsplit:focus-visible span { box-shadow:0 0 0 2px #fff; }
+  .prevspin { position:absolute; inset:0; align-items:center; justify-content:center; pointer-events:none; }
   .cmpwrap { overflow:hidden; border-radius:6px; position:relative; }
   .cmpwrap img { width:100%; display:block; cursor:zoom-in; }
   .cmpspin { display:none; position:absolute; align-items:center; justify-content:center; pointer-events:none; }
@@ -706,22 +729,18 @@
       <span class="hint" data-i18n="cmp.hint"></span>
     </div>
     <div id="hdrpreview" style="display:none;margin-top:6px">
-      <div id="prevpair" style="display:flex;align-items:center;gap:8px">
-        <div style="flex:1;text-align:center;min-width:0">
-          <div class="hint" id="prevoriglabel" style="margin-bottom:4px"></div>
-          <div id="prevorigwrap" style="overflow:hidden;border-radius:6px;position:relative">
-            <img id="prevorig" data-i18n-alt="prev.orig.alt" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
-            <div id="prevorigspin" style="display:none;position:absolute;align-items:center;justify-content:center;pointer-events:none"><div class="spinwheel"></div></div>
-          </div>
+      <div id="prevpair">
+        <div id="prevprocwrap" style="overflow:hidden;position:relative">
+          <img id="prevproc" data-i18n-alt="prev.proc.alt" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
         </div>
-        <div style="flex:0 0 auto;font-size:30px;line-height:1;color:var(--green);font-weight:700">&rarr;</div>
-        <div style="flex:1;text-align:center;min-width:0">
-          <div class="hint" id="prevproclabel" style="margin-bottom:4px"></div>
-          <div id="prevprocwrap" style="overflow:hidden;border-radius:6px;position:relative">
-            <img id="prevproc" data-i18n-alt="prev.proc.alt" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
-            <div id="prevspin" style="display:none;position:absolute;align-items:center;justify-content:center;pointer-events:none"><div class="spinwheel"></div></div>
-          </div>
+        <div id="prevorigwrap" style="overflow:hidden">
+          <img id="prevorig" data-i18n-alt="prev.orig.alt" style="width:100%;display:block;cursor:zoom-in;visibility:hidden">
         </div>
+        <div class="prevtag" id="prevoriglabel"></div>
+        <div class="prevtag" id="prevproclabel"></div>
+        <div id="prevsplit" role="slider" tabindex="0" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" data-i18n-title="prev.split.tip" data-i18n-aria="prev.split.tip"><span><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M9 6 3 12l6 6zM15 6l6 6-6 6z" fill="currentColor"/></svg></span></div>
+        <div id="prevorigspin" class="prevspin" style="display:none"><div class="spinwheel"></div></div>
+        <div id="prevspin" class="prevspin" style="display:none"><div class="spinwheel"></div></div>
       </div>
       <div class="row" id="prevnav" style="justify-content:center;gap:10px;margin-top:6px">
         <button id="prevprev" class="mini" style="visibility:hidden" data-i18n="prev.back"></button>

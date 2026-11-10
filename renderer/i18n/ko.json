@@ -240,6 +240,7 @@
   "prev.proc.alt": "처리된 프레임",
   "prev.back": "‹ 뒤로",
   "prev.random": "무작위 프레임 ›",
+  "prev.split.tip": "드래그하여 비교: 왼쪽은 원본, 오른쪽은 결과",
   "cmp.alt0": "앞의 실제 프레임",
   "cmp.alt1": "첫 번째 모델의 새 프레임",
   "cmp.alt2": "뒤의 실제 프레임",

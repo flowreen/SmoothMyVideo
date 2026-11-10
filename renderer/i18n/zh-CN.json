@@ -240,6 +240,7 @@
   "prev.proc.alt": "处理后的帧",
   "prev.back": "‹ 返回",
   "prev.random": "随机帧 ›",
+  "prev.split.tip": "拖动以比较：左侧为原始画面，右侧为结果",
   "cmp.alt0": "之前的真实帧",
   "cmp.alt1": "第一个模型的新帧",
   "cmp.alt2": "之后的真实帧",
