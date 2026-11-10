@@ -660,8 +660,11 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
     e.hostConv && !e.hdrActive && outPix === 'p010le' && !pad && !cut && keep === 1 && zimgRoute(e.encInFmt, matrix)
       ? encodeVf(sp, outPix, e.encInFmt, matrix, null, null, false)
       : '';
+  // the encoder-side zimg step stamps its matrix on the frames; with the host converting, setparams does, so an
+  // untagged source's output still names the matrix its conversion used
+  const hostSp = sp.some((s) => s.startsWith('colorspace=')) ? sp : sp.concat(`colorspace=${matrix}`);
   const vf = hostVf
-    ? (sp.length ? ['setparams=' + sp.join(':')] : []).concat(sarTag ? [sarTag.slice(1)] : []).join(',')
+    ? ['setparams=' + hostSp.join(':')].concat(sarTag ? [sarTag.slice(1)] : []).join(',')
     : (keep > 1 ? `framestep=${keep},` : '') + encodeVf(sp, outPix, e.encInFmt, matrix, pad, cut, !!e.hlg) + sarTag;
   const bsf = crop ? ['-bsf:v', `hevc_metadata=width=${encW}:height=${encH}`] : [];
   const tq = ultra ? ['-threads', '1', '-thread_queue_size', '1'] : [];
