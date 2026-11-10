@@ -12,7 +12,7 @@
 // Behaviour: idempotent (skips when engine/bin already has ffmpeg), Windows only, and NON-FATAL - any
 // failure just warns and lets `npm install` finish. The engine already falls back to ffmpeg on PATH,
 // and the GUI has a "Choose .zip" installer, so a missing download is a soft state, never a broken
-// install. Uses the Windows-bundled curl.exe + tar.exe (the same System32 tools main.ts uses), so it
+// install. Uses the Windows-bundled curl.exe + tar.exe (the same System32 tools main-setup.ts uses), so it
 // adds no npm dependencies.
 
 import { execFileSync } from 'node:child_process';

@@ -9,7 +9,7 @@
 // PQ tonemaps, the 1:1 resize of the original pane, the DLSS 5 change mask and the PNG files;
 // that arithmetic runs in float32 (Math.fround). The frame is decoded by ffmpeg like the render,
 // and a 10-bit source keeps its 16-bit samples up to the display encode.
-// `node dist/render/preview.js <the preview's arguments>`; main.ts runs it under Electron's node.
+// `node dist/render/preview.js <the preview's arguments>`; main-preview.ts runs it under Electron's node.
 // With --model-a / --model-b / --multi it runs a compare instead (compare() below).
 import { spawn } from 'child_process';
 import * as fs from 'fs';

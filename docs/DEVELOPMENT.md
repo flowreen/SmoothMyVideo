@@ -16,7 +16,12 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
 
 ## Project layout
 
-* `src/main.ts`: Electron main. Dialogs, ffprobe (`-of json`), spawns the render orchestrator
+* `src/main.ts` and its modules `src/main-<name>.ts`: Electron main. `main.ts` is the entry (one instance only, the
+  start-up, the app's lifecycle); the modules hold one concern each and import each other's names: `paths` (where the
+  app's files are), `window`, `update`, `dialogs` (file dialogs, the probe, the display's figures), `setup` (readiness
+  and one-click installs), `live`, `render`, `preview`. A module may call another's functions freely, but while it
+  loads it reads only `main-paths.ts`'s constants and those of modules that do not import it back. Together they do
+  this: dialogs, ffprobe (`-of json`), spawns the render orchestrator
   (`dist/render/cli.js` under the Electron binary with `ELECTRON_RUN_AS_NODE=1`, `SMV_ENGINE_DIR` =
   the engine folder) and streams its progress, kills the child tree on Cancel, runs the before /
   after preview and the Compare view (`dist/render/preview.js`, the same way), IPC for screen size / refresh rate, the
@@ -193,7 +198,7 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
 * `engine/dlssnr/`: the DLSS 5 Neural Rendering pass (`--dlssnr`): the NR core around NGX feature
   18 (`build_src/nr_host.*`, compiled into the native host) and the `nvngx.dll` caller shim it
   loads (built from `build_src/`, shipped). The runtime `nvngx_dlssnr.dll` is gitignored and never shipped: the DLSS 5
-  panel downloads the pinned community build (`DLSSNR_DL` in `src/main.ts`, one rhi-repo release
+  panel downloads the pinned community build (`DLSSNR_DL` in `src/main-setup.ts`, one rhi-repo release
   asset, the DLL's SHA256 checked before the copy) or installs a dropped copy (other builds install
   with an "unverified" notice). `nvngx_dlss.dll` is optional (the NGX core only warns without it).
 * `engine/rtxvideo/`: RTX Video (VSR + TrueHDR) over the locally built `rtxvideo_cuda.dll`, called
@@ -491,7 +496,7 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   1 / 1.724, `performance` 1 / 2, `ultra` 1 / 3, or any number in (0, 1]
   (the GUI's Live slider offers 1..100 % in 1 % steps: on a mode's rounded share, 100 / 67 / 58 / 50
   / 33, it sends that mode, anywhere else that share, which the dropdown shows as a hidden, unpickable
-  `Custom (N%)` entry; main.ts `dlssScaleArg`). `plan.ts` `workPlan` computes it once (even, at least 64,
+  `Custom (N%)` entry; main-render.ts `dlssScaleArg`). `plan.ts` `workPlan` computes it once (even, at least 64,
   capped at 3840x2160 keeping the aspect: the interpolation's reach) and prints `DLSS mode ...:
   working size WxH for the WxH output`. A working size below the source folds the downscale into
   the decode (`zscale` Lanczos at radius 7 on the decoded RGB, in the source's own transfer: through
@@ -530,7 +535,7 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   model's weights: `smv-live.exe --convert-restore-model IN.onnx OUT.pkl` checks the ONNX's form and writes its weights
   (fp16, as the author's file holds them) as conv_1, block_K.c1 .. c3 / .att, conv_cat and upsampler, then reads the
   file back and keeps it only when it gives the kernels the ONNX's block byte for byte (the frames identical); a
-  `--restore-model` .pkl is read by name and shape. `src/main.ts` converts right after the download and once at start
+  `--restore-model` .pkl is read by name and shape. `src/main-setup.ts` converts right after the download and once at start
   for an install that still holds the ONNX (moved from `engine/restore` first), and keeps only the .pkl. `--restore-anime4k` = Anime4K's Restore CNN UL on
   the Anime4K module's kernels (see `--anime4k` below). On HDR planes (all routes) it
   reads the frame's SDR view (`k_hdrEnc`, a brighter pixel scaled to white with its hue) and
@@ -569,7 +574,7 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   PSNR of the upscalers (Tsuihou 32.6 dB vs RTX VSR 29.6 / Lanczos3 30.1 / FSR 3.1.5 31.5; dragon 35.3 vs 34.0 /
   33.9 / 34.5), LPIPS Tsuihou 0.127 (0.124 / 0.169 / 0.176), dragon 0.118 (0.120 / 0.116 / 0.134) (harness
   `fsr4_int8_upscaler\score_steady.py`). Its first session after a driver update spends ~30 s while the driver
-  compiles AMD's shaders, at any size, cached by the driver after. FSR WARM-UP (both FSR routes, `src/main.ts`
+  compiles AMD's shaders, at any size, cached by the driver after. FSR WARM-UP (both FSR routes, `src/main-live.ts`
   fsrWarm): while FSR frame generation or the FSR upscale box is picked (at the first paint, then on a pick), the
   app runs ONE tiny offline host (2 black 320x180 frames, the upscaler to 640x360) at below-normal priority, once
   per driver and FSR build: each route's key (System32's `nvapi64.dll` + the route's DLLs, by size and write
@@ -696,7 +701,7 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   luminance-coupled.
 * `--dv`: adds a Dolby Vision Profile 8.1 RPU on top of the HDR10 render (HDR10-compatible
   fallback). Needs `--rtx-hdr`, HEVC, MP4 out and `dovi_tool` in `engine/dvtools` (the GUI panel's
-  one-click download of a pinned release, as for `hdr10plus_tool`: main.ts `DOVI_DL` / `HP_DL`, whose version, URL,
+  one-click download of a pinned release, as for `hdr10plus_tool`: main-setup.ts `DOVI_DL` / `HP_DL`, whose version, URL,
   zip SHA256 and size move together). Per-frame L1 is accumulated during the HDR render, then after encode: extract
   HEVC, `dovi_tool generate` + `inject-rpu`, ffmpeg remux with audio, `dvvC` + HDR10 boxes written
   in-engine. The RPU's `source_max_pq` and L6 take the render's `--hdr-nits` peak (dovi_tool's own pick from L6
@@ -903,12 +908,12 @@ smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
 smv-live.exe --hz              the exact refresh rate of every active display path as "numerator denominator" lines
-               (QueryDisplayConfig; main.ts feeds "Screen refresh rate" with it, Electron only reports integers)
+               (QueryDisplayConfig; main-dialogs.ts feeds "Screen refresh rate" with it, Electron only reports integers)
 smv-live.exe --peak-nits [X Y] the peak (nits) of the monitor at screen point X, Y (the primary one without a point) as
-               Windows reports it, 0 when it is not in HDR mode; main.ts passes it to RTX HDR renders as --hdr-nits
+               Windows reports it, 0 when it is not in HDR mode; main-render.ts passes it to RTX HDR renders as --hdr-nits
 smv-live.exe --convert-restore-model IN.onnx OUT.pkl   AnimeJaNai's ONNX as the .pkl the app keeps (exit 0 = written
                and read back as the ONNX's weights, 2 = refused with a `convert: refused: ...` line)
-smv-live.exe --restore-mouse   gives back the pointer speed and clip a killed or crashed Fill session held (main.ts
+smv-live.exe --restore-mouse   gives back the pointer speed and clip a killed or crashed Fill session held (main-live.ts
                runs it when %TMP%\smv-live-mouse.txt outlives the host; every live session start does the same)
 smv-live.exe --testsrc [ms|cycle] [--pan] [--onscreen]   verification source (100 ms = 10 fps; 16 for perf; cycle ramps
                10/30/60/30); parked by default: a layered popup with one pixel on the primary monitor's last pixel
@@ -989,7 +994,7 @@ N fps until a group is timed`): a start the GPU cannot afford fills the queue, a
 outlast the move's 2 s window and cut the budget for about a minute (1440p RIFE x5 at target 1000: three cuts to 69 %,
 48.5 presented fps over the first 50 s instead of 56).
 The static-source hold keys on the source's arrivals (`sourceQuiet` / `sourceCadence`), not on the loop's sends.
-`--no-gpu-fit` (the GUI's "Fit to the GPU" unticked, main.ts `liveGpuFit`) holds the user's target (no throttle) and
+`--no-gpu-fit` (the GUI's "Fit to the GPU" unticked, main-live.ts `liveGpuFit`) holds the user's target (no throttle) and
 drops every video memory fit (`nativeVideoMemoryRoom` answers "no limit": the ring), logging `GPU fit off
 (--no-gpu-fit)`. Gate `harness\live_capture_drops\drops_ab.py OLD_EXE NEW_EXE [case ...]` (a parked 2560x1440 mpv
 looping a 23.976 fps clip; GMFSS + Sharpen + RTX HDR, Fill, Quality at the targets 60 / 1000 / 10000, every other
@@ -1064,7 +1069,7 @@ How the server route works:
   expanded with the same TrueHDR bridge and colour step as a file render. An HDR-presenting source
   window clips at SDR white, so live RTX HDR is for SDR sources.
 * Mid-session Speed or DLSS mode changes send `lv-restart`: the exe is killed and respawned on
-  the same window (700 ms debounce, not counted against the restart cap). `src/main.ts` learns the
+  the same window (700 ms debounce, not counted against the restart cap). `src/main-live.ts` learns the
   window handle from the exe's `target window: hwnd=0x... "title"` line, parsed from complete lines
   only (a split stderr chunk once yielded a truncated handle and a respawn on a window that did not
   exist). Hotkey (`--fg`) mode has no other source for the handle, so that line must never fail to
@@ -1490,7 +1495,7 @@ kernel module loaded (every buffer is freed) and reads one command per line from
 `start<TAB>--hwnd<TAB>0x...<TAB>--backend<TAB>rife ...` (the next session's arguments, tab separated,
 the same tokens the command line takes), `stop` (ends the running session, exit 0) and `quit`. Where
 a one-shot run exits, the resident host prints `live session ended: exit N, host resident (... kept,
-idle limit S s) target=0x...` and `main.ts` treats that line as the exit code (the exit 4 / 6 revive
+idle limit S s) target=0x...` and `main-live.ts` treats that line as the exit code (the exit 4 / 6 revive
 and the settings restart go through it too). The trailing `target=` field (present once a session
 resolved a window) is the revive's fallback source for the handle when no `target window:` line
 reached the app. The next session on the same window skips the handoff entirely (`engine handoff
@@ -1508,7 +1513,7 @@ and waits on stdin for ONE `start<TAB>...` line, the resident host's; the sessio
 capture and the swap chain (`Host::init` adopts the spare's device, `slDeviceInit` in `smv-live-host.inl`), and the
 process ends with that session's exit code like every DLSS 4.5 host. `quit` or a closed stdin ends a spare nobody
 took; a `start` line for a session without Streamline is refused with exit 8. Idle it holds about 240 MB of memory
-and 32 MB of video memory, no window and no swap chain. `main.ts` keeps one spare while DLSS 4.5 is the panel's
+and 32 MB of video memory, no window and no swap chain. `main-live.ts` keeps one spare while DLSS 4.5 is the panel's
 interpolator and Live is in use (the Live tab shows, or a session ran since the app started), hands the next DLSS 4.5
 session to it when it is ready, starts the next spare five seconds into that session (a resize or stall revive then
 finds one), and ends the spare when another model is picked, a file render starts or the app quits.
@@ -1516,7 +1521,7 @@ finds one), and ends the spare when another model is picked, a file render start
 
 Live settings in place: while a session runs, the app sends `set<TAB>key<TAB>value` on the same stdin (the resident
 host's reader; a one-shot session, DLSS 4.5's, starts one reader of its own) for each value that changed since the
-spawn (`main.ts` `liveSetNow` / `liveSendSets`). The native thread applies them before its next frame group
+spawn (`main-live.ts` `liveSetNow` / `liveSendSets`). The native thread applies them before its next frame group
 (`nativeLiveSets`) and logs `live set: KEY VALUE`: `sharpen` (0 = off; turning it on allocates its two frames, when the
 video memory room holds them), `vsrq` (RTX VSR proper), `hdrsat` / `hdrcon` / `hdrvib` / `hdrsb` (while RTX HDR runs),
 `nrstruct` / `nrtone` / `nrstyle` / `nrskin` / `nrautomask` (DLSS 5's Structure / Tone / Style / Skin Structure, -1 =
@@ -2223,7 +2228,7 @@ build.bat
 ```
 
 It compiles `xess_bridge.cpp` against the SDK's `inc/` and `lib/libxess.lib` into `..\smv_xess_bridge.dll` (it
-imports `libxess.dll`, so the host loads it only when that DLL is there). Intel's files come from the app: main.ts
+imports `libxess.dll`, so the host loads it only when that DLL is there). Intel's files come from the app: main-setup.ts
 `XESS_DL` pins the release zip (github.com/intel/xess, its version, URL, page, SHA256 and size; a bump changes all
 five and reruns the XeSS checks), and the setup row's one click downloads it, checks the hash before anything is
 extracted, and copies `bin/libxess.dll`, `bin/libxess_fg.dll`, `bin/libxell.dll` and `LICENSE.txt` (as
@@ -2507,7 +2512,7 @@ asset counts on the README's downloads badge, so the archive is the only asset.
 3. Tag `v<v>` on the release commit and push the tag.
 4. Create the GitHub release for the tag: notes with the hash, then attach the `.7z` only.
 
-The tag is what installed copies compare against (`checkForUpdate` in `main.ts`), so publishing
+The tag is what installed copies compare against (`checkForUpdate` in `main-update.ts`), so publishing
 the GitHub release lights up the in-app notice and starts the automatic update: it downloads the
 release's `.7z` asset and checks it against the notes' `sha256(win.7z): <hex>` line, so a release
 needs exactly that asset and that line (without either, installed copies get the notice alone), and

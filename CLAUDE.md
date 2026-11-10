@@ -24,7 +24,7 @@ a version bump in `package.json`.
 
 | Path | What |
 |---|---|
-| `src/main.ts` | the Electron main process: windows, dialogs, setup downloads, the update, spawning and talking to the live host |
+| `src/main.ts` + `src/main-<name>.ts` | the Electron main process: the entry and its modules (table below) |
 | `src/render/*.ts` | file renders and the CLI: `cli.ts` (entry), `native.ts` (drives the host), `plan.ts`, `probe.ts`, `encode.ts`, `resume.ts`, `preview.ts`, `dvhp.ts` + `hdr10meta.ts` (Dolby Vision, HDR10+), `cache.ts` |
 | `renderer/index.html` | the window's markup and CSS |
 | `renderer/app.ts` + `renderer/app-<name>.ts` | the window's logic: one classic script in parts (table below). `renderer/app.js` is its build: never edit or read it |
@@ -78,6 +78,26 @@ table is the include order, which is the source order and matters: a later part 
 
 CUDA kernels are C++ raw strings compiled at run time; the compiled result is cached by a hash of the text, so a
 kernel text that does not change keeps its cache entry.
+
+### The main process is an entry and modules
+
+`src/main.ts` is the entry; each `src/main-<name>.ts` is a CommonJS module holding one concern, and they import each
+other's names (`tsc` reports a missing or unused import). They stay in one folder: paths are built from `__dirname`.
+A module may call another's functions anywhere. While it loads (code outside every function) it may read only
+`main-paths.ts`'s constants and those of modules that do not import it back: a constant of a module that is still
+loading is not set yet.
+
+| File | What |
+|---|---|
+| `main.ts` | one instance only, the start-up (a pending update, the cache check, the window), the app's lifecycle |
+| `main-paths.ts` | where the app's files are: the engine folder, the render and preview CLIs, ffprobe |
+| `main-window.ts` | the window: its saved size, its creation |
+| `main-update.ts` | the update check and the automatic update |
+| `main-dialogs.ts` | the file dialogs, the source probe, the display's refresh rate, peak brightness and size |
+| `main-setup.ts` | readiness and one-click installs: RTX Video, Smooth Motion, DLSS 4.5 support, DLSS 5, AnimeJaNai, the Dolby Vision and HDR10+ tools, Intel XeSS |
+| `main-live.ts` | Live mode: the host process and its spare, settings in place, the hotkey, the FSR 4 warm-up |
+| `main-render.ts` | a file render: the progress thumbnail, pause and resume, the engine's arguments and output, cancel, the resume check |
+| `main-preview.ts` | the before / after preview, Compare's Save image and Save clip |
 
 ### The window's logic is one script in parts
 

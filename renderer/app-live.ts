@@ -266,7 +266,7 @@ function lvDisarm() {
 // The fps target is a spawn-time argument (--target, and the exe derives the slot
 // count from it), so a Speed change during a running session relaunches the session like a DLSS
 // mode change: a 700 ms debounce, 'lv-restart', same target window. Only a real
-// change of the EFFECTIVE target (what main.ts would pass) restarts anything.
+// change of the EFFECTIVE target (what main-live.ts would pass) restarts anything.
 function lvEffTarget() {
   return Math.min(FPS_TOP, Math.max(10, Math.round(liveTargetFps())));
 }

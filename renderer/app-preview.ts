@@ -380,7 +380,7 @@ for (const _id of ['sharpen', 'sharpval', 'restore', 'restoreaj', 'restorea4k', 
 // RTX HDR colour: TrueHDR's result as NVIDIA gives it (the engine's raw mode; the same colours as
 // NVIDIA's own RTX Video HDR in a player), its Contrast and Saturation sliders = the SDK's, as the
 // NVIDIA App's RTX HDR filter. The engine's vivid / rtx modes stay CLI-only. nits = the file
-// renders' Peak box (0 = empty: main.ts takes the peak of the display the window is on).
+// renders' Peak box (0 = empty: the main process takes the peak of the display the window is on).
 function hdrColorPayload() {
   return { color: 'raw', saturation: sdkSat(), nits: hdrNitsAsked() };
 }
