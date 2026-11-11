@@ -177,8 +177,12 @@ static bool nativeFrucSetup(NativeRife& nr)
 {
     if (nr.fsrfg)
         return nativeFsrfgSetup(nr);
+    nr.vfR10 = false;
     if (nr.vfg)
     {
+        // HDR planes go to the effect as R10G10B10A2 words (SMV_VFG_HDR10=0: as their 8-bit codes)
+        char ev[8] = {};
+        nr.vfR10 = nr.encPost && !(GetEnvironmentVariableA("SMV_VFG_HDR10", ev, sizeof(ev)) > 0 && ev[0] == '0');
         if (!nativeVfgSetup(nr))
             return false;
     }
@@ -285,8 +289,10 @@ static bool nativeFrucSetup(NativeRife& nr)
     else if (!nr.vfg)
         LOG("native: fruc session %dx%d (model %dx%d), NvOFFRUC through nvoffruc_bridge.dll, 8-bit BGRA%s, up to %d instance%s\n",
             nr.pw, nr.ph, nr.w, nr.h, g_fruc.step ? ", feed-once" : "", nr.frInstMax, nr.frInstMax > 1 ? "s" : "");
-    if (nr.encPost && nr.vfg)
-        LOG("native: vfg: HDR planes: every pair as the 8-bit HDR codes\n");
+    if (nr.encPost && nr.vfR10)
+        LOG("native: vfg: HDR planes: every pair as its 10-bit HDR codes\n");
+    else if (nr.encPost && nr.vfg)
+        LOG("native: vfg: HDR planes: every pair as the 8-bit HDR codes (SMV_VFG_HDR10=0)\n");
     else if (nr.encPost)
         LOG("native: fruc: HDR planes: %s\n",
             nr.frSdrOn
@@ -461,13 +467,16 @@ static void nativeFrucPlan(NativeRife& nr, const double* ts, uint32_t n)
 // one frame's planes into surface n: the SDR view (sdr, k_packBgraSdr) or the planes as stored (true BGRA)
 static bool nativeFrucPack(NativeRife& nr, const float* src, int n, bool sdr)
 {
-    int ps = nr.ph * nr.pw, f32 = 0;
+    int ps = nr.ph * nr.pw, f32 = 0, asStored = 0;
     void* a[] = {(void*)&src, &f32, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.dFrSurf[n]};
     void* b[] = {(void*)&src, &ps, &nr.pw, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &nr.dFrSurf[n]};
-    // NVIDIA Video Frame Generation reads its surfaces as R G B A bytes (k_packBgra's order), whatever their descriptor says
-    const CUfunction f = sdr ? nr.fPackBgraSdr : (nr.vfg ? nr.fPackBgra : nr.fPackBgraRgb);
-    if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, sdr ? b : a,
-                       nullptr) != CUDA_SUCCESS)
+    void* r[] = {(void*)&src, &f32, &ps, &nr.pw, &nr.pw, &nr.ph, &asStored, &nr.dFrSurf[n]};
+    // NVIDIA Video Frame Generation reads its surfaces as R G B A bytes (k_packBgra's order), whatever their descriptor
+    // says; on HDR planes as R10G10B10A2 words of the planes' own codes (k_packR10 without its HLG step)
+    const CUfunction f = sdr ? nr.fPackBgraSdr : nr.vfR10 ? nr.fPackR10 : nr.vfg ? nr.fPackBgra : nr.fPackBgraRgb;
+    void** args = sdr ? b : nr.vfR10 ? r : a;
+    if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, args, nullptr) !=
+        CUDA_SUCCESS)
     {
         nr.die("packBgra (fruc) launch failed");
         return false;
@@ -732,14 +741,20 @@ static int nativeFrucSpecLevels(NativeRife& nr, FrucWorker& w)
 }
 
 // a FRUC output (true BGRA8) into dFrOut (3, ph, pw) as (R, G, B) planes; an SDR pair's tween back to the HDR
-// codes (k_unpackBgraSdr)
+// codes (k_unpackBgraSdr); a 10-bit vfg session's R10G10B10A2 words back to the planes' codes (k_unpackR10)
 static bool nativeFrucUnpack(NativeRife& nr, uint8_t* src, bool sdr)
 {
+    int asStored = 0;
     void* a[] = {&src, &nr.pw, &nr.ph, &nr.dFrOut};
     void* b[] = {&src, &nr.pw, &nr.ph, &nr.encPost, &nr.encWhite, &nr.dFrOut};
-    const CUfunction f = sdr ? nr.fUnpackBgraSdr : (nr.vfg ? nr.fUnpackRgba : nr.fUnpackBgraRgb);
-    if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, sdr ? b : a,
-                       nullptr) != CUDA_SUCCESS)
+    void* r[] = {&src, &nr.pw, &nr.ph, &asStored, &nr.dFrOut};
+    const CUfunction f = sdr        ? nr.fUnpackBgraSdr
+                         : nr.vfR10 ? nr.fUnpackR10
+                         : nr.vfg   ? nr.fUnpackRgba
+                                    : nr.fUnpackBgraRgb;
+    void** args = sdr ? b : nr.vfR10 ? r : a;
+    if (cuLaunchKernel(f, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, args, nullptr) !=
+        CUDA_SUCCESS)
     {
         nr.die("unpackBgra (fruc) launch failed");
         return false;
@@ -1024,5 +1039,5 @@ static void nativeFrucFree(NativeRife& nr)
         cudaFreeHost(nr.hFrRange);
         nr.hFrRange = nullptr;
     }
-    nr.frSdrOn = nr.frPairSdr = false;
+    nr.frSdrOn = nr.frPairSdr = nr.vfR10 = false;
 }

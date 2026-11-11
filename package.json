@@ -17,7 +17,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
-    "electron": "^45.2.3",
+    "electron": "^45.3.0",
     "electron-builder": "^26.18.0",
     "prettier": "^3.9.10",
     "rcedit": "^5.0.2",

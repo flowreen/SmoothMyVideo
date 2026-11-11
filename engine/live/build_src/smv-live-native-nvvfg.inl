@@ -5,10 +5,13 @@
 // user-installed in one folder (the session's frucDir): NVVideoEffects.dll (the C API), NVCVImage.dll (its image
 // descriptor), nvVFXVideoFrameGeneration.dll (the model) and the cudart64_12.dll they import. They are opened there by
 // full path and called through GetProcAddress, so the host builds without NVIDIA's SDK. The effect runs on the
-// session's stream in the host's context: it reads two 8-bit device surfaces and writes a third, one call a tween at
+// session's stream in the host's context: it reads two device surfaces and writes a third, one call a tween at
 // any time between the pair, and keeps nothing from one pair to the next. It takes every surface's bytes as R G B A,
 // whatever pixel format the descriptor names (B G R A bytes give the model red and blue swapped: another picture),
-// so the route packs and unpacks a vfg session's surfaces in that order.
+// so the route packs and unpacks a vfg session's surfaces in that order. Its other image family is RGB10A2, one
+// 32-bit word a pixel with red in the low ten bits, then green, blue and two alpha bits; all three surfaces of a
+// session are of one family. A session on HDR planes uses that one (nr.vfR10): the planes' codes go in at 10 bits as
+// they are stored, PQ or HLG, and the tween comes back at 10 bits.
 //
 // Pinned: the model's highest quality mode, and NVIDIA's automatic shot-change answer off (with it on, a pair it
 // takes for a cut gets a copy of a real frame in place of a tween).
@@ -26,8 +29,9 @@ struct VfgImage
     unsigned long long bufferBytes;
 };
 static_assert(sizeof(VfgImage) == 64 && offsetof(VfgImage, pixels) == 32, "NVCVImage.dll's image descriptor");
-// the descriptor's values for an RGBA8 interleaved image in CUDA device memory
-constexpr int kVfgRgba = 6, kVfgU8 = 1;
+// the descriptor's values for an interleaved image in CUDA device memory: RGBA8, or RGB10A2 in its one packed 32-bit
+// component (4 bytes a pixel either way)
+constexpr int kVfgRgba = 6, kVfgU8 = 1, kVfgRgb10a2 = 13, kVfgP32 = 11;
 constexpr unsigned kVfgInterleaved = 0, kVfgCuda = 1;
 constexpr unsigned kVfgModeHigh = 2;
 
@@ -125,8 +129,8 @@ static bool nativeVfgSetup(NativeRife& nr)
         !nativeVfgOk(g_vfg.setU32(nr.vfEff, "FrameMultiplier", 0), "the free-time mode"))
         return false;
     LOG("native: vfg session %dx%d, NVIDIA Video Frame Generation (highest quality mode, every pair interpolated), "
-        "8-bit RGBA, loaded in %.0f ms\n",
-        nr.pw, nr.ph, (double)(nowQpc100() - t0) / 1e4);
+        "%s, loaded in %.0f ms\n",
+        nr.pw, nr.ph, nr.vfR10 ? "10-bit R10G10B10A2" : "8-bit RGBA", (double)(nowQpc100() - t0) / 1e4);
     return true;
 }
 
@@ -135,9 +139,10 @@ static bool nativeVfgTween(NativeRife& nr, double t)
 {
     void* px[3] = {nr.dFrSurf[nr.frA], nr.dFrSurf[nr.frB], nr.dFrOutB};
     const char* slot[3] = {"SrcImage0", "SrcImage1", "DstImage0"};
+    const int fmt = nr.vfR10 ? kVfgRgb10a2 : kVfgRgba, comp = nr.vfR10 ? kVfgP32 : kVfgU8;
     for (int i = 0; i < 3; i++)
-        if (!nativeVfgOk(g_vfg.imageInit(&g_vfg.img[i], (unsigned)nr.pw, (unsigned)nr.ph, nr.pw * 4, px[i], kVfgRgba,
-                                         kVfgU8, kVfgInterleaved, kVfgCuda),
+        if (!nativeVfgOk(g_vfg.imageInit(&g_vfg.img[i], (unsigned)nr.pw, (unsigned)nr.ph, nr.pw * 4, px[i], fmt, comp,
+                                         kVfgInterleaved, kVfgCuda),
                          "an image descriptor") ||
             !nativeVfgOk(g_vfg.setImage(nr.vfEff, slot[i], &g_vfg.img[i]), slot[i]))
         {

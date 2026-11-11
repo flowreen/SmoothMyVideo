@@ -2014,7 +2014,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // PQ precision (the real frames stay full precision); far better than the SDR capture
         // of an HDR-presented window, which is 2-3x over-bright and clipped (below). "fsrfg" (AMD FSR frame
         // generation) takes FRUC's HDR rule at fp16 (nativeFsrfgPair). "nvvfg" (NVIDIA Video Frame Generation) gets
-        // every pair as its 8-bit PQ codes, so its tweens carry that precision too.
+        // every pair as its PQ codes in R10G10B10A2 words, so its tweens carry 10 bits, the swap chain's own depth.
         const bool hdrCapable =
             g_backend == BK_DLSSG ||
             (g_backend == BK_SERVER &&

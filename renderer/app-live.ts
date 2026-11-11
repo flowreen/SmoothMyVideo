@@ -37,8 +37,8 @@ function liveModelInfo() {
   // Intel XeSS-FG live: AMD FSR frame generation's route with its own bridge (main passes --backend fsrfg --xess-fg)
   if (modelIsXefg()) return { model: 'xefg', name: 'Intel XeSS-FG', note: '' };
   // NVIDIA Video Frame Generation live: Smooth Motion's route with NVIDIA's own runtime; it makes a frame at any time
-  // between a pair, so the nvvfg backend is adaptive like rife; its frames go through the model at 8-bit precision
-  if (modelIsVfg()) return { model: 'nvvfg', name: 'NVIDIA Video Frame Generation', note: 'tweens at 8-bit precision' };
+  // between a pair, so the nvvfg backend is adaptive like rife; an HDR display's frames go through the model at 10 bits
+  if (modelIsVfg()) return { model: 'nvvfg', name: 'NVIDIA Video Frame Generation', note: '' };
   // NVIDIA Optical Flow: adaptive like rife (the splat takes any fraction), native only
   if (modelIsNvof()) return { model: 'nvof', name: 'NVIDIA Optical Flow', note: '' };
   // nothing ticked = interpolation off (same meaning as file renders): the echo backend passes

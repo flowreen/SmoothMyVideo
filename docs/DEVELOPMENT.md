@@ -881,8 +881,8 @@ the folder. `nvvfg` is NVIDIA Video Frame Generation's live twin on the same rou
 model makes a tween at any time between a pair, so a session takes the ladders and the prices of the any-time
 models (a tween's own time, like `nvof`). Its handoff answers with the unpadded geometry, `engine=nvvfg` and
 `NATIVE-PATH nvvfg=` (`engine/nvvfx`, or `SMV_NVVFX_DIR`); a missing file of NVIDIA's runtime refuses the session
-and names it. On an HDR display every pair goes in as its 8-bit PQ codes, so the tweens carry that precision while
-the real frames stay full precision. `echo` is
+and names it. On an HDR display every pair goes in as its PQ codes in R10G10B10A2 words, so the tweens carry 10
+bits, the swap chain's own depth. `echo` is
 the effects-only route: no interpolation model ticked in the app sends
 it, the captured frames pass through at their own rate and the live effects (Restore, sharpen,
 Upscale to, RTX VSR, RTX HDR, DLSS 5) apply to each of them (with no effect on at 1:1, an SDR frame
@@ -1141,7 +1141,9 @@ NVIDIA's own Video Effects runtime in place of a bridge
 `nvVFXVideoFrameGeneration.dll` and their `cudart64_12.dll`, opened by full path and called through
 `GetProcAddress`): unpadded, one call a tween at any time between the pair, the model's highest quality mode, its
 automatic shot-change answer off. The effect reads its surfaces as R G B A bytes whatever their descriptor says, so
-the route packs a session's surfaces in that order; HDR planes go in as their 8-bit codes.
+the route packs a session's surfaces in that order. HDR planes use the effect's other image family, RGB10A2 (one
+32-bit word a pixel, red in the low ten bits): their codes go in at 10 bits as they are stored, PQ or HLG, and the
+tween comes back at 10 bits (`SMV_VFG_HDR10=0` sends the 8-bit codes instead).
 `--fps` mode runs there for every one of these models:
 `native.ts` hands `--fps-ratio` (its ratio as the shortest text that parses back to the same double) and the
 host renders the fps loop (DRBA: its offset loop) on the same grid of pair fractions in the
@@ -1924,6 +1926,7 @@ named here, and on a name here that no source holds.
 | `SMV_FSRFG_OVERLAP=0` / `SMV_FSRFG_OVERLAP=fail` | AMD FSR frame generation: every call's vectors in its turn instead of the next call's on a side stream during each FSR call (tree levels with two or more calls, x4 and up) / the side stream's setup fails after a whole one, the trigger of its fallback (`the side stream did not start` with derived vectors, `the side Optical Flow session did not start` with `SMV_FSRFG_CHILDMV=0`; route gate only); A/B levers, never a product setting |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion (the first one AMD FSR frame generation too): the most bridge instances (1..9; recursive midpoints use one per tree level on both routes, default 9 = to x512, 5 = to x32; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
+| `SMV_VFG_HDR10=0` | on HDR planes NVIDIA Video Frame Generation gets every frame pair as the 8-bit HDR codes instead of 10-bit R10G10B10A2 words; A/B lever, never a product setting |
 | `SMV_FRUC_PIPE=0` / `=force` | Live Smooth Motion: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder, the fixed multipliers too (gates; see "Pipelined across pairs") |
 | `SMV_FSRFG_PIPE=0` / `=force` / `=serial` | Live AMD FSR frame generation: never pipeline the midpoint tree across pairs / pipeline every ladder and fixed multiplier, x2 included (gates) / the same with the new pair's level-1 Optical Flow after the shown pair's deeper calls (an A/B lever); unset = the priced automatic route (see "Pipelined across pairs") |
 | `SMV_FRUC_STEPUP=0` | Live Smooth Motion / AMD FSR 4 FG: a target between two ladder nodes runs the largest node that fits instead of the node above it (gates; see "The node above the target") |
