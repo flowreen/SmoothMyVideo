@@ -91,12 +91,17 @@ struct PipeServer
             // (a capture resize of HDR planes needs it too: its SDR-view buffer and range flag)
             if (ok && (early->rtxHdr || early->vsrWant || early->sharpen > 0.0f || early->fitAa || early->uw > 0 ||
                        early->restore || (early->encPost && (early->w != early->cw || early->h != early->ch))))
+            {
+                // the model's buffers do not exist yet: Anime4K's and ArtCNN's setups fit theirs to the free video
+                // memory, so the helper leaves them for nativeUpHeldSetup below
+                early->upHold = true;
                 thdrTh = std::thread([&] { thdrOk = nativeBindDevice(*early) && nativeRtxInit(*early); });
+            }
             ok = ok && nativeModelInit(*early);
             if (thdrTh.joinable())
                 thdrTh.join();
             // live DLSS 5's NR core starts after the RTX Video bridge's NGX init, never beside it
-            ok = ok && thdrOk && nativeLiveNrInit(*early);
+            ok = ok && thdrOk && nativeUpHeldSetup(*early) && nativeLiveNrInit(*early);
             const int64_t t2 = nowQpc100();
             if (ok)
                 LOG("native: early init done: handoff %.2f s, kernels + engines + contexts%s %.2f s\n", (t1 - t0) / 1e7,

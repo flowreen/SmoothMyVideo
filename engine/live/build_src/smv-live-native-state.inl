@@ -78,6 +78,11 @@ struct NativeRife
     bool vsrWant = false;   // --rtx-vsr on an SDR session with the bridge and its DLL present
     bool vsr = false;       // ...and the fit enlarges in both axes (decided after the handoff)
     bool vsrFailed = false; // a mid-run eval failed: Lanczos for the rest of the run
+    // the live early start runs nativeRtxInit beside the model's init, while the free video memory still misses the
+    // model's buffers: Anime4K's and ArtCNN's setups size their buffers to that memory, so they are held there
+    // (upHold; their arguments in upHeld) and run once the model's init is done (nativeUpHeldSetup)
+    bool upHold = false, upHeldSet = false;
+    int upHeld[5] = {};
     RtxVsrSetting vsrSet{4};
     double vsrMs = 0.0, vsrMaxMs = 0.0;
     bool vsrAsync = false; // the evals ran through the bridge's event-ordered export (vsrMs not timed)

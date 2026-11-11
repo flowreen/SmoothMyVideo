@@ -402,10 +402,19 @@ static bool nativeRtxInit(NativeRife& nr)
     nr.fuHdr = nr.fsrUp && (g_offline ? upEnc != 0 : nr.hdr && !(nr.vsrPre && nr.rtxHdr));
     if (nr.fsrUp && !nativeFsrupSetup(nr, vw, vh, vtw, vth))
         return false;
-    if (nr.a4kUp && !nativeA4kSetup(nr, vw, vh, vtw, vth, upEnc))
-        return false;
-    if (nr.acnUp && !nativeAcnSetup(nr, vw, vh, vtw, vth, upEnc))
-        return false;
+    if ((nr.a4kUp || nr.acnUp) && nr.upHold)
+    {
+        const int held[5] = {vw, vh, vtw, vth, upEnc};
+        memcpy(nr.upHeld, held, sizeof(held));
+        nr.upHeldSet = true;
+    }
+    else
+    {
+        if (nr.a4kUp && !nativeA4kSetup(nr, vw, vh, vtw, vth, upEnc))
+            return false;
+        if (nr.acnUp && !nativeAcnSetup(nr, vw, vh, vtw, vth, upEnc))
+            return false;
+    }
     if (rtxVsrNow)
     {
         // warm-up eval on an opaque black frame, so the first presented frame pays nothing
@@ -455,4 +464,17 @@ static bool nativeRtxInit(NativeRife& nr)
                 nr.thdr.MaxLuminance);
     }
     return true;
+}
+
+// Anime4K's or ArtCNN's setup that nativeRtxInit held back (NativeRife's upHold), on the thread that ran the model's
+// init, after it: the memory fit of either now sees the model's buffers. true when nothing was held
+static bool nativeUpHeldSetup(NativeRife& nr)
+{
+    nr.upHold = false;
+    if (!nr.upHeldSet)
+        return true;
+    nr.upHeldSet = false;
+    const int* a = nr.upHeld;
+    return nr.a4kUp ? nativeA4kSetup(nr, a[0], a[1], a[2], a[3], a[4])
+                    : nativeAcnSetup(nr, a[0], a[1], a[2], a[3], a[4]);
 }

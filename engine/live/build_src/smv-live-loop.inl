@@ -4255,7 +4255,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             if ((M > lim || keep > 1 || m2 > 1) && M == cascWantPrev && keep == cascKeepPrev)
             {
                 cascTried = true;
-                const uint64_t room = nativeVideoMemoryRoom();
+                const uint64_t room = nativeVideoMemoryRoomOf(false);
                 // the helpers: stage 1 at m1; for three stages, or a kept two-pass rung, stage 2 at m2 on its ring. The
                 // final enlarge (host.lzOn): every pass in a helper, m2 > 1 a second on stage 1's ring, m3 > 1 a third
                 // on the second's

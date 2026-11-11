@@ -1375,7 +1375,13 @@ Video memory: DLSS 5 always builds the passes the user asked for (a pass costs a
 them in what the GPU has free (`nativeVideoMemoryRoom`: the driver's own figure for every process,
 `NvAPI_GPU_GetMemoryInfoEx`'s `curAvailableDedicatedVideoMemory`, the number `nvidia-smi` shows, less
 a reserve of 4 % of the card, 512 MiB at least; `cudaMemGetInfo` and the DXGI budget describe this
-process alone: with 15 GB held by another process a second process still read 23 GB free). Memory
+process alone: with 15 GB held by another process a second process still read 23 GB free). The
+driver's figure trails an allocation by a few milliseconds, so a read that follows a session's own
+buffers still misses part of them (up to 718 MiB measured, counted in full 1 to 8 ms later): every fit reads
+the figure every 3 ms until it has not moved over four reads (`nativeVideoMemorySettled`, 100 ms at most); only
+the present loop reads it once. A Live start runs the RTX Video setup beside the model's init; Anime4K's and
+ArtCNN's setups fit their buffers to the room, so they wait there until the model's buffers exist
+(`nativeUpHeldSetup`). Memory
 past the limit does not fail: Windows moves what does not fit into system memory, which slows the
 render and every other app on the GPU (measured at 4K, 10 passes, 15 GB held by a second process:
 all 10 passes ran, 3.2x slower than on a free GPU, and the second process read its memory in 578 ms

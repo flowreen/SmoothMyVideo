@@ -52,17 +52,52 @@ static bool nativeVideoMemory(uint64_t& freeB, uint64_t& cardB, uint64_t* moved 
     return true;
 }
 
-// The video memory a session may still take, in bytes: what is free right now less a reserve of 4 % of the card
-// (512 MiB at least) for what the desktop and other apps take next. Memory past it would not fail: Windows moves
-// what does not fit into system memory, which slows the session and every other app on the GPU. 0 = no limit
-// (--no-gpu-fit, SMV_VRAM_CAP=0, or the driver does not report its memory); 1 = nothing is free.
-static uint64_t nativeVideoMemoryRoom()
+// The same figures once this process's own last allocations count in them. The driver's free figure trails an
+// allocation by a few milliseconds: read right after a session's buffers were made, it still misses part of them
+// (170 to 718 MiB of a session's own buffers in the read that followed its init; the figure then fell in steps for 1.2
+// to 8.0 ms, pausing up to 3.1 ms on the way, and stayed flat from there on), and a fit sized on that read hands out
+// memory the session already holds. So the figure is read every 3 ms until it has not moved by 1 MiB over four reads
+// in a row (12 ms), for 100 ms at most (another app allocating meanwhile, or a coarse system timer): the lowest
+// figure read is the answer then.
+static bool nativeVideoMemorySettled(uint64_t& freeB, uint64_t& cardB)
+{
+    if (!nativeVideoMemory(freeB, cardB))
+        return false;
+    uint64_t low = freeB;
+    int same = 0;
+    for (const int64_t until = nowQpc100() + 1000000; same < 4 && nowQpc100() < until;)
+    {
+        Sleep(3);
+        uint64_t f = 0, c = 0;
+        if (!nativeVideoMemory(f, c))
+            break;
+        same = (f > freeB ? f - freeB : freeB - f) < ((uint64_t)1 << 20) ? same + 1 : 0;
+        freeB = f;
+        low = (std::min)(low, f);
+    }
+    if (same < 4)
+        freeB = low;
+    return true;
+}
+
+// The video memory a session may still take, in bytes: what is free less a reserve of 4 % of the card (512 MiB at
+// least) for what the desktop and other apps take next. Memory past it would not fail: Windows moves what does not
+// fit into system memory, which slows the session and every other app on the GPU. 0 = no limit (--no-gpu-fit,
+// SMV_VRAM_CAP=0, or the driver does not report its memory); 1 = nothing is free. settled = the figure once this
+// process's last allocations count in it (every fit: it follows the session's own buffers); false = the figure as it
+// reads right now, for the present loop, which must not wait and follows no allocation of its own.
+static uint64_t nativeVideoMemoryRoomOf(bool settled)
 {
     uint64_t freeB = 0, cardB = 0;
-    if (g_noGpuFit || lkEnv("SMV_VRAM_CAP") == "0" || !nativeVideoMemory(freeB, cardB))
+    if (g_noGpuFit || lkEnv("SMV_VRAM_CAP") == "0" ||
+        !(settled ? nativeVideoMemorySettled(freeB, cardB) : nativeVideoMemory(freeB, cardB)))
         return 0;
     const uint64_t reserve = (std::max)((uint64_t)512 << 20, cardB / 25);
     return freeB > reserve ? freeB - reserve : 1;
+}
+static uint64_t nativeVideoMemoryRoom()
+{
+    return nativeVideoMemoryRoomOf(true);
 }
 
 // What a live session still takes after its output ring, in bytes. The ring is its last allocation (the engines,
@@ -83,10 +118,11 @@ static uint64_t nativeVideoMemoryRoom()
 // plus, while the bridge gives every instance its own vkd3d device (fsrfg_devices), 300 MiB an instance past the first
 // (x4 parked, shared vs own devices: +243 / +49 MiB at 854x480 / 1708x960, x8 at 1280x720 +471 for two: the largest,
 // flat, a quarter on top); NVIDIA Video Frame Generation, whose model builds its working memory at its first frames
-// and not at its load: 770 / 938 / 1047 / 1194 / 1516 MiB at 854x480 / 1280x720 / 1920x1080 / 2560x1440 / 3840x2160
-// (the larger of two sessions a size, the same at x2 and x4: nothing grows with the multiple), a quarter on top, as a
-// line by the megapixel of the model frame that covers every size, 1095 + 108; the other routes add nothing the
-// reserve does not cover. The x8 /
+// and not at its load: 764 / 923 / 1007 / 1102 / 1356 MiB at 854x480 / 1280x720 / 1920x1080 / 2560x1440 / 3840x2160
+// (the larger of two sessions a size, the same at x2 and x4: nothing grows with the multiple; from the settled figure
+// at the ring's fit), a quarter on top, as a line by the megapixel of the model frame that covers every size, 1085 +
+// 84; the other routes add nothing the reserve does not cover (NVIDIA Optical Flow's first run: 40 MiB at 3840x2160).
+// The x8 /
 // x16 / x32 ladders' third, fourth and fifth tree levels (an instance and twice the node frames a level) come on top
 // when the session's slots reach them (FRUC: the whole GPU's rise over x4 at five sizes, 854x480 to 3840x2160 with the
 // fit off, a quarter on top, less the ring's slots past x32's and the pipelined second tree priced below, as a line by
@@ -101,7 +137,7 @@ static uint64_t nativeVideoMemoryRoom()
 // and rule from its own rows (3840x2160 to x64, 2560x1440 to x128, with the fit off): 362 + 103, 362 + 511, 362 + 928,
 // 362 + 1506, 362 + 2589, 596 + 4063, x512 1275 + 7011 a megapixel.
 constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 290.0, kFrucLateMp = 173.0;
-constexpr double kVfgLateBase = 1095.0, kVfgLateMp = 108.0;
+constexpr double kVfgLateBase = 1085.0, kVfgLateMp = 84.0;
 constexpr double kFsrfgLateBase = 1251.0, kFsrfgLateMp = 88.0, kFsrfgLateDerBase = 1249.0, kFsrfgLateDerMp = 0.0,
                  kFsrfgOwnDevice = 300.0;
 constexpr double kXefgLateBase = 249.0, kXefgLateMp = 353.0, kXefgLateDerBase = 247.0, kXefgLateDerMp = 265.0;
