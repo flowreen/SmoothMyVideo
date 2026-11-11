@@ -1176,6 +1176,35 @@ struct OfflineIo
     }
 };
 
+// One ReadFile / WriteFile on h that is right whichever way h was opened. A pipe end made for overlapped I/O (the end
+// of a stdio pipe that the process starting this one made for itself and handed on, as node does) must not be read
+// or written the plain way: a plain call waits on the file object, any other operation that completes on that object
+// (a query through another handle to it, from any process) ends that wait, and the call reports 0 bytes while its
+// request stays queued and takes the next data that comes. With an OVERLAPPED the wait is on this request's own
+// event; the event's low bit keeps the completion out of a completion port the other process tied the pipe to. A
+// pipe end opened for synchronous I/O finishes the call before it returns. Anything that is not a pipe keeps the
+// plain call (on a disk file an OVERLAPPED would carry the file offset).
+static bool offlinePipeIo(HANDLE h, bool write, uint8_t* p, DWORD n, DWORD& done)
+{
+    struct Seen
+    {
+        HANDLE h = nullptr;
+        bool pipe = false;
+    };
+    thread_local Seen seen;
+    thread_local const HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    done = 0;
+    if (seen.h != h)
+        seen = {h, GetFileType(h) == FILE_TYPE_PIPE};
+    if (!seen.pipe || !ev)
+        return (write ? WriteFile(h, p, n, &done, nullptr) : ReadFile(h, p, n, &done, nullptr)) != 0;
+    OVERLAPPED ov{};
+    ov.hEvent = (HANDLE)((ULONG_PTR)ev | 1);
+    const BOOL ok = write ? WriteFile(h, p, n, nullptr, &ov) : ReadFile(h, p, n, nullptr, &ov);
+    if (!ok && GetLastError() != ERROR_IO_PENDING)
+        return false;
+    return GetOverlappedResult(h, &ov, &done, TRUE) != 0;
+}
 static bool offlineReadFrame(HANDLE h, uint8_t* dst, size_t n)
 {
     size_t got = 0;
@@ -1183,7 +1212,7 @@ static bool offlineReadFrame(HANDLE h, uint8_t* dst, size_t n)
     {
         DWORD chunk = (DWORD)((n - got) > (1u << 24) ? (1u << 24) : (n - got));
         DWORD rd = 0;
-        if (!ReadFile(h, dst + got, chunk, &rd, nullptr) || rd == 0)
+        if (!offlinePipeIo(h, false, dst + got, chunk, rd) || rd == 0)
             return false;
         got += rd;
     }
@@ -1196,7 +1225,7 @@ static bool offlineWriteAll(HANDLE h, const uint8_t* src, size_t n)
     {
         DWORD chunk = (DWORD)((n - done) > (1u << 24) ? (1u << 24) : (n - done));
         DWORD wr = 0;
-        if (!WriteFile(h, src + done, chunk, &wr, nullptr) || wr == 0)
+        if (!offlinePipeIo(h, true, const_cast<uint8_t*>(src + done), chunk, wr) || wr == 0)
             return false;
         done += wr;
     }

@@ -372,7 +372,7 @@ ipcMain.handle('cancel', async () => {
     '.resume.json.tmp',
     '.concat.txt',
   ]
-    .flatMap((s) => (s && s !== '.video.tmp.mp4' ? [s, '.b' + s] : [s])) // + the file split's chunk B (<part>.b.*)
+    .flatMap((s) => (s && s !== '.video.tmp.mp4' ? [s, '.b' + s, '.c' + s] : [s])) // + the file split's later chunks (<part>.b.*, <part>.c.*)
     .map((s) => part + s);
   for (let attempt = 0; attempt < 10 && remaining.length; attempt++) {
     await new Promise((r) => setTimeout(r, 300));

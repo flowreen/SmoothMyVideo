@@ -257,8 +257,8 @@ export function resumeCleanup(p: Parts): void {
   }
 }
 
-/** Atomic replace of the resume json; a failed write is ignored. split > 0 = the file
- * split's source frame S (both halves' sidecars carry it, native.ts resumes each half from its own work files). */
+/** Atomic replace of the resume json; a failed write is ignored. split > 0 = the file split's first cut, a source
+ * frame (every chunk's sidecar carries it, native.ts resumes each chunk from its own work files). */
 export function writeResumeSidecar(
   resumeJson: string,
   sig: string,

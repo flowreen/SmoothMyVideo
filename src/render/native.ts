@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
-import { Readable } from 'stream';
+import { Readable, Writable } from 'stream';
 import { engineCacheDir } from './cache';
 import { dvExport, hpExport } from './dvhp';
 import {
@@ -197,12 +197,12 @@ function gpuDriverId(): Promise<string> {
   });
 }
 
-/** The card's used and total video memory in MiB from nvidia-smi (every process's, as NVAPI counts it); null when it is
- * missing, fails, takes over 5 s or lists more than one GPU. */
-function gpuMemory(): Promise<{ used: number; total: number } | null> {
+/** The card's name and its used and total video memory in MiB from nvidia-smi (every process's memory, as NVAPI counts
+ * it); null when it is missing, fails, takes over 5 s or lists more than one GPU. */
+function gpuMemory(): Promise<{ name: string; used: number; total: number } | null> {
   return new Promise((resolve) => {
     try {
-      const p = spawn('nvidia-smi', ['--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'], {
+      const p = spawn('nvidia-smi', ['--query-gpu=memory.used,memory.total,name', '--format=csv,noheader,nounits'], {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'ignore'],
       });
@@ -217,13 +217,34 @@ function gpuMemory(): Promise<{ used: number; total: number } | null> {
       p.once('close', (code) => {
         clearTimeout(timer);
         const rows = out.split(/\r?\n/).filter((l) => l.trim());
-        const v = rows.length === 1 ? rows[0].split(',').map((s) => parseInt(s, 10)) : [];
-        resolve(code === 0 && v.length === 2 && v.every((n) => n > 0) ? { used: v[0], total: v[1] } : null);
+        const f = rows.length === 1 ? rows[0].split(',') : [];
+        const v = f.slice(0, 2).map((s) => parseInt(s, 10));
+        resolve(
+          code === 0 && f.length >= 3 && v.every((n) => n > 0)
+            ? { name: f.slice(2).join(',').trim(), used: v[0], total: v[1] }
+            : null,
+        );
       });
     } catch {
       resolve(null);
     }
   });
+}
+
+/** THE FILE SPLIT's limits: at least SPLIT_MIN source frames a chunk (a shorter chunk's fresh encoder start costs more
+ * bytes than its speed is worth), at most SPLIT_CAP chunks, each after the first with its own work files
+ * `<work>.<tag>.*`. */
+const SPLIT_MIN = 300;
+const SPLIT_CAP = 3;
+const SPLIT_TAGS = ['b', 'c'];
+
+/** How many chunks a fresh file split takes on the card `gpu` (nvidia-smi's name): two, and three where the card has
+ * three hardware encoders, which is how far encoding at once scales. NVIDIA's "Video Encode and Decode GPU Support
+ * Matrix" lists three on an RTX 5090 (desktop and laptop). SMV_FILE_SPLIT=2..3 sets the count. */
+function splitChunks(gpu: string, env: NodeJS.ProcessEnv): number {
+  const set = parseInt(env.SMV_FILE_SPLIT || '', 10);
+  if (set >= 2) return Math.min(set, SPLIT_CAP);
+  return /\bRTX 5090\b/.test(gpu) ? 3 : 2;
 }
 
 /** The most DLSS 4.5 makes in one pass on this GPU and driver = Streamline's numFramesToGenerateMax + 1 (the host's
@@ -740,9 +761,10 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     say,
   };
   // THE FILE SPLIT's eligibility (on unless SMV_FILE_SPLIT=0; RIFE at a whole multiple, SDR, no DLSS 5, a constant
-  // rate, 600+ frames) and its resume: chunk A keeps the render's work files (P, its sidecar the render's with the
-  // split's S, so a one-chain resume can still continue it), chunk B has its own (Q = <work>.b.*, sidecar signed
-  // sigB); a later start with both sidecars on the same S resumes each half from its own cut
+  // rate, SPLIT_MIN frames a chunk) and its resume: an n-chunk split cuts the source at the frames NB x i / n. Chunk 1
+  // keeps the render's work files (P, its sidecar the render's with the split's first cut, so a one-chain resume can
+  // still continue it), each later chunk has its own (<work>.b.*, <work>.c.*, a sidecar signed apart); a later start
+  // with every chunk's sidecar on the same first cut resumes each chunk from its own cut
   const SPLIT_OK =
     env.SMV_FILE_SPLIT !== '0' &&
     kind === 'rife' &&
@@ -753,10 +775,11 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     DG_KEEP === 1 &&
     !nr &&
     VFR_DEC.length === 0 &&
-    NB >= 600;
-  const S0 = SPLIT_OK ? Math.floor(NB / 2) : 0;
-  const Q = partsOf(WORK_PATH + '.b', ob + '.b', OUT_IS_MKV);
-  const sigB = sig + '|split-b';
+    NB >= 2 * SPLIT_MIN;
+  const splitCuts = (n: number) => Array.from({ length: n }, (_, i) => Math.floor((NB * i) / n));
+  const chunkParts = (i: number) =>
+    i ? partsOf(`${WORK_PATH}.${SPLIT_TAGS[i - 1]}`, `${ob}.${SPLIT_TAGS[i - 1]}`, OUT_IS_MKV) : P;
+  const chunkSig = (i: number) => (i ? `${sig}|split-${SPLIT_TAGS[i - 1]}` : sig);
   const metaOf = (f: string): Record<string, unknown> | null => {
     try {
       const m = JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -765,16 +788,28 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       return null;
     }
   };
-  const mA = metaOf(P.resumeJson),
-    mB = metaOf(Q.resumeJson);
-  const SPLIT_RESUME = S0 > 0 && mA?.sig === sig && mB?.sig === sigB && mA?.split === S0 && mB?.split === S0;
-  const halfResume = (parts: typeof P, hsig: string, pairs: number) =>
-    tryResume({ ...rctx, totalPairs: pairs, concatTxt: parts.concatTxt, parts, sig: hsig });
-  // a half's banked frames (chunk A: outputs 0.., chunk B: its own from output S x multi + 1 on); a part that cannot be
-  // continued is cleaned by tryResume and that half starts over
-  const rzA = SPLIT_RESUME ? halfResume(P, sig, S0 + 1) : null;
-  const rzB = SPLIT_RESUME ? halfResume(Q, sigB, NB - S0) : null;
-  if (!SPLIT_RESUME) resumeCleanup(Q); // a split no longer resumed as one: chunk B's leftovers go (A's may resume below)
+  // the split to resume = the chunk count whose first cut every one of its chunks' sidecars carries (0 = none)
+  let SPLIT_N = 0;
+  for (let n = SPLIT_CAP; SPLIT_OK && n >= 2 && !SPLIT_N; n--) {
+    const cut = splitCuts(n)[1];
+    const mine = (i: number) => {
+      const m = metaOf(chunkParts(i).resumeJson);
+      return m?.sig === chunkSig(i) && m?.split === cut;
+    };
+    if (Array.from({ length: n }, (_, i) => i).every(mine)) SPLIT_N = n;
+  }
+  const SPLIT_RESUME = SPLIT_N > 0;
+  // a chunk's banked frames (chunk 1: outputs 0.., a later one: its own from its first output frame on), over the
+  // source frames from its cut to the next chunk's (the last chunk: to the end); a part that cannot be continued is
+  // cleaned by tryResume and that chunk starts over
+  const rzs = splitCuts(SPLIT_N).map((s, i, cuts) => {
+    const parts = chunkParts(i);
+    const pairs = (i + 1 < cuts.length ? cuts[i + 1] : NB - 1) - s + 1;
+    return tryResume({ ...rctx, totalPairs: pairs, concatTxt: parts.concatTxt, parts, sig: chunkSig(i) });
+  });
+  // the later chunks' leftovers of a split that is not resumed (as a whole, or past its chunk count) go; chunk 1's
+  // may resume below as one chain
+  for (let i = Math.max(1, SPLIT_N); i < SPLIT_CAP; i++) resumeCleanup(chunkParts(i));
   const rz = SPLIT_RESUME ? null : tryResume(rctx);
   fragCopy = rctx.fragCopy;
   const R = applyResume(rz, P.vidPart, NB, totalUnits, say);
@@ -854,18 +889,20 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   };
   const enc = encodePlan(encArgs, env);
   for (const n of enc.notes) say(n);
-  // THE FILE SPLIT: two chains at once on the source frames [0, S] and [S, NB), chunk B a resume at output frame
-  // S x multi + 1 (its host drops its first frame, the real frame S chunk A ends on); a fresh one only when no one-chain
-  // resume is pending, and chunk B only when a second chain fits the card's video memory (else one chain as usual).
-  // Each half writes its own part and, once continued, its own continuation; runSplit's caller joins the four in order
-  const SPLIT_S = SPLIT_RESUME || (SPLIT_OK && !R.active) ? S0 : 0;
-  const encQ = { ...encArgs, vidPart: Q.vidPart, vidPart2: Q.vidPart2 };
-  const encAr = SPLIT_S ? encodePlan({ ...encArgs, resumeActive: true }, env) : null; // chunk A continued -> P.vidPart2
-  const encBf = SPLIT_S ? encodePlan({ ...encQ, resumeActive: false }, env) : null; // chunk B -> Q.vidPart
-  const encBr = SPLIT_S ? encodePlan({ ...encQ, resumeActive: true }, env) : null; // chunk B continued -> Q.vidPart2
+  // THE FILE SPLIT: one chain a chunk, all at once, on the source frames [cut, next cut]; a chunk after the first is a
+  // resume at output frame cut x multi + 1 (its host drops its first frame, the real frame the chunk before ends on).
+  // A fresh one only when no one-chain resume is pending, and only as many chains as fit the card's video memory (one
+  // = one chain as usual). Each chunk writes its own part and, once continued, its own continuation (chunkEnc);
+  // runSplit's caller joins them in order
+  const SPLIT_ON = SPLIT_RESUME || (SPLIT_OK && !R.active);
+  const chunkEnc = (i: number, continued: boolean) => {
+    const parts = chunkParts(i);
+    return encodePlan({ ...encArgs, vidPart: parts.vidPart, vidPart2: parts.vidPart2, resumeActive: continued }, env)
+      .cmd;
+  };
   const HDR_MKV_2STAGE = HDR_ACTIVE && OUT_IS_MKV;
   const sidecar = (k: number, t: number) => writeResumeSidecar(P.resumeJson, sig, k, t, venc, 0, 0);
-  if (RESUMABLE && !SPLIT_RESUME) sidecar(R.skipSrc, totalUnits); // a split resume keeps both halves' sidecars
+  if (RESUMABLE && !SPLIT_RESUME) sidecar(R.skipSrc, totalUnits); // a split resume keeps every chunk's sidecar
   const sharpNote = SHARPEN > 0 ? `  sharpen(adaptive)=${pyG(SHARPEN)}` : '';
   const upNote = UPSCALE ? `  upscale=${pyG(UPSCALE_F)}x->${OUT_W}x${OUT_H}` : '';
   const hdrNote = HDR_ACTIVE ? '  HDR10(TrueHDR,BT.2020 PQ)' : '';
@@ -1064,7 +1101,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     baseBytes: R.baseBytes,
     outPath,
     hdrMkv2stage: HDR_MKV_2STAGE,
-    resumable: RESUMABLE, // off while the file split decides and once it runs two chains
+    resumable: RESUMABLE, // off while the file split decides how many chains fit
     sidecar,
     say,
   };
@@ -1109,17 +1146,34 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   };
   const decCmd = decodeCmd(FFMPEG, inp, VFR_DEC, decFilters, DEC_FMT);
   const spawnOpts = { cwd: ENGINE, windowsHide: true };
+  /** One decoder, one host of its own (`--offline hargs`) and one encoder, joined by two pipes. Each ffmpeg keeps the
+   * end of its pipe that was made for it, which is opened for synchronous I/O; the host takes node's two ends, which
+   * are opened for overlapped I/O, and reads and writes them that way (offlinePipeIo). A process with plain reads on
+   * an overlapped end loses data whenever anything else touches that pipe (a security tool that looks at a new
+   * process's handles is enough), so an ffmpeg never gets one. */
+  const hostChain = (dec: string[], hargs: string[], ecmd: string[]) => {
+    const d = spawn(dec[0], dec.slice(1), { ...spawnOpts, stdio: ['inherit', 'pipe', 'inherit'] });
+    const e = spawn(ecmd[0], ecmd.slice(1), { ...spawnOpts, stdio: ['pipe', 'inherit', 'inherit'] });
+    const x = spawn(NATIVE_EXE, ['--offline', ...hargs], { ...spawnOpts, stdio: [d.stdout!, e.stdin!, 'pipe'] });
+    d.stdout!.destroy(); // the host holds its own ends
+    e.stdin!.destroy();
+    return { d, x, e };
+  };
   // in a cascade the first pass's PROGRESS counts the render and the last pass's OUTFRAMES its frames
   const onLine1 = CASCADE ? (ln: string) => (ln.startsWith('OUTFRAMES ') ? undefined : onLine(ln)) : onLine;
   const passKids: ChildProcess[] = [];
   const passRead: Promise<void>[] = [];
-  /** a cascade's later passes after `src` (the first pass's frames), each fed the one before; returns the last
-   * pass's frames for the encoder */
-  const spawnPasses = (src: number | Readable): number | Readable => {
+  /** a cascade's later passes after `src` (the first pass's frames), each fed the one before, the last one writing
+   * into `sink`, the stdin pipe of an encoder that already runs: the encoder keeps the synchronous end of its pipe
+   * and a host takes node's end, as in hostChain */
+  const spawnPasses = (src: number | Readable, sink: Writable): void => {
     let s = src;
     for (let k = 1; k < DG_PASSES.length; k++) {
       const last = k === DG_PASSES.length - 1;
-      const p = spawn(NATIVE_EXE, ['--offline', ...passArgs(k)], { ...spawnOpts, stdio: [s, 'pipe', 'pipe'] });
+      const p = spawn(NATIVE_EXE, ['--offline', ...passArgs(k)], {
+        ...spawnOpts,
+        stdio: [s, last ? sink : 'pipe', 'pipe'],
+      });
       if (typeof s !== 'number') s.destroy(); // the pass holds its own end
       const rl = readline.createInterface({ input: p.stderr!, crlfDelay: Infinity });
       rl.on('line', (l) => {
@@ -1130,9 +1184,9 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       });
       passRead.push(new Promise<void>((res) => rl.once('close', () => res())));
       passKids.push(p);
-      s = p.stdout!;
+      if (!last) s = p.stdout!;
     }
-    return s;
+    sink.destroy(); // the last pass holds its own end
   };
 
   // the resident host (residentRender), else one exe for this render
@@ -1144,63 +1198,68 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   // the decoder's exit code: a decode that dies at its first frame leaves the host 0 frames and a clean exit
   let decRc = 0;
   let decRes: ChildProcess | null = null;
-  /** THE FILE SPLIT's two chains (one-shot hosts): chunk A = the source frames 0..S (outputs 0..S x multi) into
-   * P.vidPart (continued: P.vidPart2), chunk B = from frame S as a resume at output S x multi + 1 into Q.vidPart
-   * (continued: Q.vidPart2); a resumed half starts at its own banked frames (rzA / rzB), a finished one does not run;
-   * PROGRESS = A's pairs + B's past S, OUTFRAMES = both, chunk A alone keeps the thumbnail; null = a fresh split whose
-   * chunk B would not fit the card's video memory: chunk A stopped, the caller renders one chain */
-  const runSplit = async (): Promise<{ nrc: number; encRc: number; decRc: number } | null> => {
-    const S = SPLIT_S,
-      m = Math.trunc(args.multi);
-    const aEnd = S * m + 1, // chunk A's outputs 0..S x multi, chunk B's from aEnd on
-      bLen = (NB - S - 1) * m;
-    const cA = rzA ? rzA.c : 0,
-      cB = rzB ? rzB.c : 0;
-    const aDone = cA >= aEnd,
-      bDone = cB >= bLen;
+  /** THE FILE SPLIT's chains (one-shot hosts) for the n chunks cut at splitCuts(n): chunk 1 = the source frames from 0
+   * to the second cut (outputs 0..cut x multi) into P.vidPart, each later chunk = from its cut as a resume at output
+   * cut x multi + 1 into its own part, up to the next chunk's cut (the last: to the end); a continued chunk writes
+   * its vidPart2. A resumed chunk starts at its own banked frames (rzs), a finished one does not run. PROGRESS = every
+   * chunk's pairs past its cut, OUTFRAMES = every chunk's, chunk 1 alone keeps the thumbnail. `before` = the card's
+   * memory with no chain running. Returns the exit codes, or the number of chains that fit the card's video memory
+   * when a fresh split's do not all fit (its first chain stopped: the caller splits in that many, 1 = one chain) */
+  const runSplit = async (
+    n: number,
+    before: Awaited<ReturnType<typeof gpuMemory>>,
+  ): Promise<{ nrc: number; encRc: number; decRc: number } | number> => {
+    const m = Math.trunc(args.multi);
+    const cuts = splitCuts(n);
     // the next output frame c on the render's grid -> its source pair and the leading outputs its host drops (the real
     // frame + the slots already banked), as the one-chain resume (resumeMap + drop)
     const at = (c: number) => ({ p: Math.floor((c - 1) / m), drop: 1 + ((c - 1) % m) });
-    const ra = at(cA || 1),
-      rb = at(aEnd + cB);
+    const chunks = cuts.map((s, i) => {
+      const end = i + 1 < n ? cuts[i + 1] : NB - 1; // its last source frame = the next chunk's first
+      const base = i ? s * m + 1 : 0; // the outputs before it on the render's grid
+      const len = (end - s) * m + (i ? 0 : 1); // its own outputs (chunk 1's include the real frame 0)
+      const c = rzs[i]?.c ?? 0; // its banked outputs
+      const done = c >= len;
+      const r = at(base + c || 1);
+      const p = i || c ? r.p : 0; // the source frame its decoder starts at
+      return { i, s, end, base, c, done, r, p, pair: done ? end : p, out: done ? base + c : 0, lines: 0, up: () => {} };
+    });
+    type Chunk = (typeof chunks)[number];
     if (SPLIT_RESUME)
       say(
-        `resume: continuing the previous split render: chunk 1 ${aDone ? 'done' : 'from output frame ' + cA}, ` +
-          `chunk 2 ${bDone ? 'done' : 'from output frame ' + (aEnd + cB)}\n`,
+        'resume: continuing the previous split render: ' +
+          chunks.map((k) => `chunk ${k.i + 1} ${k.done ? 'done' : 'from output frame ' + (k.base + k.c)}`).join(', ') +
+          '\n',
       );
     const vf = IMG_SCALE_VF.length ? IMG_SCALE_VF : decodeRgbVf(ST, W, H);
-    // chunk A = the whole render's decode cut after frame S (a resumed one decodeFilters' cut at its pair), chunk B =
-    // decodeFilters' cut at its pair: one numbering
     const rate = `${num}/${den}`;
-    const pA = cA ? ra.p : 0;
-    const decA = decodeCmd(FFMPEG, inp, VFR_DEC, decodeFilters(pA, VFR_DEC, vf, rate)[0], DEC_FMT);
-    decA.splice(decA.lastIndexOf('-f'), 0, '-frames:v', String(S + 1 - pA));
-    const [fB, discB] = decodeFilters(rb.p, VFR_DEC, vf, rate);
-    const decB = decodeCmd(FFMPEG, inp, VFR_DEC, fB, DEC_FMT);
-    const argsA = [...nargs];
-    argsA[argsA.indexOf('--frames') + 1] = String(S + 1);
-    if (cA) argsA.push('--resume-pair', String(pA), '--resume-out', String(cA), '--resume-drop', String(ra.drop));
-    const argsB: string[] = [];
-    for (let i = 0; i < nargs.length; i++) {
-      if (nargs[i] === '--thumb' || nargs[i] === '--thumb-off') i++;
-      else argsB.push(nargs[i]);
-    }
-    argsB.push('--resume-pair', String(rb.p), '--resume-out', String(aEnd + cB), '--resume-drop', String(rb.drop));
-    if (discB) argsB.push('--skip-in', String(discB));
-    let pa = aDone ? S : pA,
-      pb = bDone ? NB - 1 : rb.p,
-      outA = aDone ? aEnd : 0,
-      outB = bDone ? aEnd + cB : 0,
-      aLines = 0;
-    const step = () => progress.step(pa + Math.max(0, pb - S), totalUnits);
-    let chainUp: () => void = () => {};
-    const up = new Promise<void>((res) => (chainUp = res));
+    // a chunk's decoder = the whole render's decode from its first frame (decodeFilters' cut at that pair: one
+    // numbering), cut after its last frame
+    const decOf = (k: Chunk) => {
+      const dec = decodeCmd(FFMPEG, inp, VFR_DEC, decodeFilters(k.p, VFR_DEC, vf, rate)[0], DEC_FMT);
+      if (k.i + 1 < n) dec.splice(dec.lastIndexOf('-f'), 0, '-frames:v', String(k.end + 1 - k.p));
+      return dec;
+    };
+    // its host = the render's arguments up to its last frame; a later or continued chunk as a resume, a later one
+    // without the thumbnail
+    const argsOf = (k: Chunk) => {
+      const a: string[] = [];
+      for (let j = 0; j < nargs.length; j++) {
+        if (k.i && (nargs[j] === '--thumb' || nargs[j] === '--thumb-off')) j++;
+        else a.push(nargs[j]);
+      }
+      if (k.i + 1 < n) a[a.indexOf('--frames') + 1] = String(k.end + 1);
+      if (k.i || k.c)
+        a.push('--resume-pair', String(k.p), '--resume-out', String(k.base + k.c), '--resume-drop', String(k.r.drop));
+      return a;
+    };
+    const units = () => chunks.reduce((t, k) => t + Math.max(0, k.pair - k.s), 0);
     const outOf = (ln: string) => {
       const v = ln.split(/\s+/)[1];
       return v !== undefined && /^\s*[+-]?\d+\s*$/.test(v) ? parseInt(v, 10) : 0;
     };
-    // both hosts read the one pause flag: the first PAUSED of a pause (from either chunk, chunk B's too once chunk A is
-    // done) and the first RESUMED after it reach the render, the other chunk's copy is dropped; the preview = chunk A's
+    // every host reads the one pause flag: the first PAUSED of a pause (from any chunk) and the first RESUMED after it
+    // reach the render, the other chunks' copies are dropped; the preview = chunk 1's
     let pausedShown = false;
     const pauseLine = (ln: string) => {
       const paused = ln.startsWith('PAUSED');
@@ -1209,110 +1268,123 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
         onLine(ln);
       }
     };
-    const lineA = (ln: string) => {
+    const lineOf = (k: Chunk) => (ln: string) => {
       if (ln.startsWith('PROGRESS ')) {
-        pa = parseInt(ln.slice(9), 10) || pa;
-        step();
-        if (++aLines >= 2) chainUp(); // its second pair: every part of chunk A's chain holds its memory
-      } else if (ln.startsWith('OUTFRAMES ')) outA = outOf(ln);
+        k.pair = parseInt(ln.slice(9), 10) || k.pair;
+        progress.step(units(), totalUnits);
+        if (++k.lines >= 2) k.up(); // its second pair: every part of its chain holds its memory
+      } else if (ln.startsWith('OUTFRAMES ')) k.out = outOf(ln);
       else if (ln.startsWith('PAUSED') || ln.startsWith('RESUMED')) pauseLine(ln);
-      else onLine(ln);
-    };
-    const lineB = (ln: string) => {
-      if (ln.startsWith('PROGRESS ')) {
-        pb = parseInt(ln.slice(9), 10) || pb;
-        step();
-      } else if (ln.startsWith('OUTFRAMES ')) outB = outOf(ln);
-      else if (ln.startsWith('PAUSED') || ln.startsWith('RESUMED')) pauseLine(ln);
-      else if (ln && ln !== 'THUMB') say(`[native] chunk 2: ${ln}\n`);
+      else if (!k.i) onLine(ln);
+      else if (ln && ln !== 'THUMB') say(`[native] chunk ${k.i + 1}: ${ln}\n`);
     };
     const chain = (dec: string[], hargs: string[], ecmd: string[], lineFn: (ln: string) => void) => {
-      const d = spawn(dec[0], dec.slice(1), { ...spawnOpts, stdio: ['inherit', 'pipe', 'inherit'] });
-      const x = spawn(NATIVE_EXE, ['--offline', ...hargs], { ...spawnOpts, stdio: [d.stdout!, 'pipe', 'pipe'] });
-      const e = spawn(ecmd[0], ecmd.slice(1), { ...spawnOpts, stdio: [x.stdout!, 'inherit', 'inherit'] });
-      d.stdout!.destroy(); // the exe and the encoder hold their own ends
-      x.stdout!.destroy();
+      const { d, x, e } = hostChain(dec, hargs, ecmd);
       const rl = readline.createInterface({ input: x.stderr!, crlfDelay: Infinity });
       rl.on('line', (l) => lineFn(l.replace(/\r+$/, '')));
       return { d, x, e, closed: new Promise<void>((res) => rl.once('close', () => res())) };
     };
-    const cmdA = cA ? (encAr as typeof enc).cmd : enc.cmd,
-      cmdB = cB ? (encBr as typeof enc).cmd : (encBf as typeof enc).cmd;
-    // the sidecars while the halves run: chunk A's = the render's with S and both halves' progress (the GUI's resume
-    // probe reads it), chunk B's = sigB with S; a kill from here on resumes each half
-    const commit = () => {
-      writeResumeSidecar(Q.resumeJson, sigB, 0, 0, venc, 0, 0, S);
-      progCtx.sidecar = (k: number, t: number) => writeResumeSidecar(P.resumeJson, sig, k, t, venc, 0, 0, S);
-      progCtx.resumable = RESUMABLE;
-      progCtx.sidecar(pa + Math.max(0, pb - S), totalUnits);
+    const run = (k: Chunk) => chain(decOf(k), argsOf(k), chunkEnc(k.i, k.c > 0), lineOf(k));
+    const codes: { x: number; e: number; d: number }[] = [];
+    const finish = async (s: ReturnType<typeof chain>) => {
+      const x = await waitExit(s.x);
+      await s.closed;
+      const [e, d] = await Promise.all([waitExit(s.e), waitExit(s.d)]);
+      codes.push({ x, e, d });
     };
-    const sides: ReturnType<typeof chain>[] = [];
-    if (aDone || bDone) {
-      // one half left (or none): it runs alone, no memory fit to decide
+    // the chunks of `list` in order, `slots` chains at once; `first` = a chain that already runs in one of the slots
+    const runAll = async (list: Chunk[], slots: number, first?: ReturnType<typeof chain>) => {
+      let next = 0;
+      const lane = async (s?: ReturnType<typeof chain>) => {
+        if (s) await finish(s);
+        while (next < list.length) await finish(run(list[next++]));
+      };
+      await Promise.all(Array.from({ length: slots }, (_, j) => lane(j ? undefined : first)));
+    };
+    // the sidecars while the chunks run: chunk 1's = the render's with the first cut and every chunk's progress (the
+    // GUI's resume probe reads it), a later chunk's = its own signature with that cut; a kill from here on resumes
+    // each chunk
+    const commit = () => {
+      for (const k of chunks.slice(1))
+        writeResumeSidecar(chunkParts(k.i).resumeJson, chunkSig(k.i), 0, 0, venc, 0, 0, cuts[1]);
+      progCtx.sidecar = (u: number, t: number) => writeResumeSidecar(P.resumeJson, sig, u, t, venc, 0, 0, cuts[1]);
+      progCtx.resumable = RESUMABLE;
+      progCtx.sidecar(units(), totalUnits);
+    };
+    const todo = chunks.filter((k) => !k.done);
+    if (todo.length <= 1) {
+      // one chunk left (or none): it runs alone, no memory fit to decide
       commit();
-      if (!aDone) sides.push(chain(decA, argsA, cmdA, lineA));
-      if (!bDone) sides.push(chain(decB, argsB, cmdB, lineB));
+      await runAll(todo, 1);
     } else {
-      // chunk B beside chunk A only when a second chain of chunk A's size fits with the host's reserve (max(512 MiB,
-      // 4 %); SMV_VRAM_MIB=N = a smaller card): measured on chunk A's own chain after its second pair (decoder, host
-      // and encoder all holding their memory); else a fresh split stops chunk A and the render runs one chain, a
-      // resumed one runs chunk B after chunk A (both halves' work kept)
-      const before = await gpuMemory();
+      // as many chains at once as fit beside the first with the host's reserve (max(512 MiB, 4 %); SMV_VRAM_MIB=N = a
+      // smaller card): measured on the first chain after its second pair (decoder, host and encoder all holding their
+      // memory). Fewer than the chunks left: a fresh split stops that chain and returns the count, a resumed one runs
+      // that many at a time (every chunk's work kept)
       progCtx.resumable = false;
-      const a = chain(decA, argsA, cmdA, lineA);
-      a.x.once('exit', () => chainUp());
+      const k0 = todo[0];
+      const up = new Promise<void>((res) => (k0.up = res));
+      const a = run(k0);
+      a.x.once('exit', () => k0.up());
       await up;
       const after = before && a.x.exitCode === null ? await gpuMemory() : null;
       const cap = after ? Math.min(after.total, parseInt(env.SMV_VRAM_MIB || '', 10) || after.total) : 0;
       const held = before && after ? after.used - before.used : 0;
       const left = after ? Math.round(cap - after.used - Math.max(512, cap * 0.04)) : 0;
-      const fits = !!after && held > 0 && held <= left;
+      const fit = after && held > 0 ? Math.min(todo.length, 1 + Math.max(0, Math.floor(left / held))) : 1;
       const why =
         after && held > 0
           ? `file split: one chain holds ${held} MiB of video memory, ${Math.max(0, left)} MiB left beside it: `
           : 'file split: no video memory figure for a second chain: ';
-      if (!fits && !SPLIT_RESUME) {
+      const chains = (c: number) => `${['one', 'two', 'three'][c - 1]} chain${c > 1 ? 's' : ''}`;
+      if (fit < todo.length && !SPLIT_RESUME) {
         for (const p of [a.d, a.x, a.e]) if (p.exitCode === null) p.kill();
         await Promise.all([waitExit(a.x), waitExit(a.e), waitExit(a.d), a.closed]);
         try {
-          fs.unlinkSync(P.vidPart);
+          fs.unlinkSync(chunkParts(k0.i).vidPart);
         } catch {
           /* none written */
         }
         progCtx.resumable = RESUMABLE;
         nout = 0;
-        say(why + 'one chain\n');
-        return null;
+        say(why + chains(fit) + '\n');
+        return fit;
       }
       commit();
-      sides.push(a);
-      if (fits) say(why + `two chains at once on source frames 0..${S} and ${S}..${NB - 1}\n`);
-      else {
-        say(why + 'chunk 2 after chunk 1\n');
-        await Promise.all([waitExit(a.x), a.closed]);
-      }
-      sides.push(chain(decB, argsB, cmdB, lineB));
+      if (fit === todo.length) {
+        const runs = todo.map((k) => `${k.s}..${k.end}`);
+        say(`${why}${chains(fit)} at once on source frames ${runs.slice(0, -1).join(', ')} and ${runs[fit - 1]}\n`);
+      } else if (fit === 1)
+        say(
+          why +
+            todo
+              .slice(1)
+              .map((k, j) => `chunk ${k.i + 1} after chunk ${todo[j].i + 1}`)
+              .join(', ') +
+            '\n',
+        );
+      else say(`${why}${chains(fit)} at a time\n`);
+      await runAll(todo.slice(1), fit, a);
     }
-    const codes = await Promise.all(
-      sides.map(async (s) => {
-        const x = await waitExit(s.x);
-        await s.closed;
-        const [e, d] = await Promise.all([waitExit(s.e), waitExit(s.d)]);
-        return { x, e, d };
-      }),
-    );
-    nout = outA + Math.max(0, outB - aEnd); // chunk B's OUTFRAMES counts the aEnd frames before it too
+    nout = chunks.reduce((t, k) => t + Math.max(0, k.out - k.base), 0); // a later chunk's OUTFRAMES counts the frames before it too
     const first = (k: 'x' | 'e' | 'd') => codes.map((c) => c[k]).find((v) => v !== 0) ?? 0;
     return { nrc: first('x'), encRc: first('e'), decRc: first('d') };
   };
   let splitRan = false;
-  if (SPLIT_S) {
-    const r = await runSplit();
-    if (r) {
-      nrc = r.nrc;
-      encRc = r.encRc;
-      decRc = r.decRc;
-      splitRan = true;
+  if (SPLIT_ON) {
+    // a resumed split keeps its chunk count; a fresh one takes the card's (splitChunks) as far as the clip's length
+    // allows, then as many as fit the card's video memory
+    const before = await gpuMemory();
+    let n = SPLIT_RESUME ? SPLIT_N : Math.min(splitChunks(before?.name ?? '', env), Math.floor(NB / SPLIT_MIN));
+    while (n >= 2 && !splitRan) {
+      const r = await runSplit(n, before);
+      if (typeof r === 'number') n = r;
+      else {
+        nrc = r.nrc;
+        encRc = r.encRc;
+        decRc = r.decRc;
+        splitRan = true;
+      }
     }
   }
   if (!splitRan && (env.SMV_OFFLINE_RESIDENT || '') !== '0')
@@ -1324,9 +1396,11 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       say,
       (fin, fout) => {
         decRes = spawn(decCmd[0], decCmd.slice(1), { ...spawnOpts, stdio: ['inherit', fin, 'inherit'] });
-        const src = CASCADE ? spawnPasses(fout) : fout;
-        encRes = spawn(enc.cmd[0], enc.cmd.slice(1), { ...spawnOpts, stdio: [src, 'inherit', 'inherit'] });
-        if (typeof src !== 'number') src.destroy();
+        encRes = spawn(enc.cmd[0], enc.cmd.slice(1), {
+          ...spawnOpts,
+          stdio: [CASCADE ? 'pipe' : fout, 'inherit', 'inherit'],
+        });
+        if (CASCADE) spawnPasses(fout, encRes.stdin!);
         return [decRes, ...passKids, encRes];
       },
       env,
@@ -1335,12 +1409,14 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (encRes !== null) encRc = (encRes as ChildProcess).exitCode ?? 1;
   if (decRes !== null) decRc = (decRes as ChildProcess).exitCode ?? 1;
   if (nrc === null) {
-    const dec = spawn(decCmd[0], decCmd.slice(1), { ...spawnOpts, stdio: ['inherit', 'pipe', 'inherit'] });
-    const exe = spawn(NATIVE_EXE, ['--offline', ...nargs], { ...spawnOpts, stdio: [dec.stdout!, 'pipe', 'pipe'] });
-    const src = CASCADE ? spawnPasses(exe.stdout!) : exe.stdout!;
-    const encp = spawn(enc.cmd[0], enc.cmd.slice(1), { ...spawnOpts, stdio: [src, 'inherit', 'inherit'] });
-    dec.stdout!.destroy(); // the exe and the encoder hold their own ends
-    if (typeof src !== 'number') src.destroy();
+    let dec: ChildProcess, exe: ChildProcess, encp: ChildProcess;
+    if (CASCADE) {
+      dec = spawn(decCmd[0], decCmd.slice(1), { ...spawnOpts, stdio: ['inherit', 'pipe', 'inherit'] });
+      encp = spawn(enc.cmd[0], enc.cmd.slice(1), { ...spawnOpts, stdio: ['pipe', 'inherit', 'inherit'] });
+      exe = spawn(NATIVE_EXE, ['--offline', ...nargs], { ...spawnOpts, stdio: [dec.stdout!, 'pipe', 'pipe'] });
+      dec.stdout!.destroy(); // the first pass holds its own end
+      spawnPasses(exe.stdout!, encp.stdin!);
+    } else ({ d: dec, x: exe, e: encp } = hostChain(decCmd, nargs, enc.cmd));
     const rl = readline.createInterface({ input: exe.stderr!, crlfDelay: Infinity });
     rl.on('line', (l) => onLine1(l.replace(/\r+$/, '')));
     const closed = new Promise<void>((res) => rl.once('close', () => res()));
@@ -1416,13 +1492,14 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     }
   }
 
-  // the split's video = its pieces in order (chunk A's part, its continuation, chunk B's part, its continuation), one
-  // stream copy into P.vidFull, which the finish remuxes as a one-part render's
+  // the split's video = its pieces in order (each chunk's part, then its continuation), one stream copy into
+  // P.vidFull, which the finish remuxes as a one-part render's; a chunk past the split's count left no file
+  const splitParts = Array.from({ length: SPLIT_CAP }, (_, i) => chunkParts(i));
   if (splitRan) {
-    const pieces = [P.vidPart, P.vidPart2, Q.vidPart, Q.vidPart2].filter((f) => fs.existsSync(f));
+    const pieces = splitParts.flatMap((p) => [p.vidPart, p.vidPart2]).filter((f) => fs.existsSync(f));
     const fc = { ffmpeg: FFMPEG, ffprobe: FFPROBE, fragCopy, fragFlags: FRAG_FLAGS, concatTxt: P.concatTxt };
     if (!concatCopy(fc, pieces, P.vidFull))
-      throw new RenderExit('file split: joining the two halves failed; the render stays resumable');
+      throw new RenderExit('file split: joining the chunks failed; the render stays resumable');
   }
   // _finish
   finalizeOutput({
@@ -1470,10 +1547,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
         parts,
         dst,
       ),
-    resumeCleanup: () => {
-      resumeCleanup(P);
-      resumeCleanup(Q); // the file split's chunk B
-    },
+    resumeCleanup: () => splitParts.forEach(resumeCleanup), // the render's own files and the file split's later chunks'
     say,
   });
   if (fs.existsSync(WORK_PATH)) fs.renameSync(WORK_PATH, outPath);

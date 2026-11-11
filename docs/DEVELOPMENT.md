@@ -1474,20 +1474,34 @@ the writer thread drops a small copy of the frame it writes about once a second 
 (preview.ts's display math; a TrueHDR output is self-anchored). `SMV_OFFLINE_GRAPH=1` turns the IFNets' CUDA
 graphs on for it (off by default).
 
-File split (`native.ts` runSplit; `SMV_FILE_SPLIT=0` = off): a RIFE render at a whole multiple, SDR, without DLSS
-5, a constant rate and 600+ source frames runs two one-shot chains (decoder, host, encoder) at once, chunk A on the
-source frames 0..S (S = NB / 2) into the render's part file, chunk B from frame S as a resume at output S x multi + 1
-(its host drops the real frame S chunk A ends on) into its own `<work>.b.*` files; the finish joins chunk A's part,
-its continuation, chunk B's part and its continuation by stream copy. Chunk B starts only when a second chain fits:
-the CLI reads nvidia-smi's used memory before chunk A and after its second pair, and chunk B needs that much below the
-card minus max(512 MiB, 4 %) (`SMV_VRAM_MIB=N` emulates a smaller card), else the render runs one chain; no figure
-(nvidia-smi missing, several GPUs) = one chain. Chunk A's sidecar is the render's with `split: S` and both halves'
-progress (the GUI's resume probe reads it), chunk B's is signed apart; a start with both resumes each half from its
-own cut (a finished half does not run, two that no longer fit run one after the other), a start without the split
-resumes chunk A's cut as one chain and drops chunk B's files. Both hosts read the one pause flag; the first PAUSED /
-RESUMED of either reaches the log, the pause preview is chunk A's part. Gates: harness `file_split_render`
-(`split_gate.py` lossless identity, refusals, walls; `split_resume_gate.py` kills and resumes; `split_gui_gate.py`
-the app's Pause / preview / close / relaunch; `pause_tail_probe.py` a pause after chunk A ended).
+File split (`native.ts` runSplit; `SMV_FILE_SPLIT=0` = off, `=2` / `=3` = that many chunks): a RIFE render at a
+whole multiple, SDR, without DLSS 5, a constant rate and 600+ source frames runs several one-shot chains (decoder,
+host, encoder) at once, one a chunk. A card takes two chunks, and three where it has three hardware encoders, which
+is how far encoding at once scales (`splitChunks`: an RTX 5090, by NVIDIA's Video Encode and Decode GPU Support
+Matrix), never more than one chunk a 300 source frames. An n-chunk split cuts the source at the frames NB x i / n:
+chunk 1 on the frames from 0 to the second cut into the render's part file, each later chunk from its cut as a resume
+at output cut x multi + 1 (its host drops the real frame the chunk before ends on) into its own `<work>.b.*` /
+`<work>.c.*` files, up to the next cut; the finish joins every chunk's part and its continuation, in order, by stream
+copy. The later chains start only when they fit: the CLI reads nvidia-smi's used memory before chunk 1 and after its
+second pair, and each further chain needs that much below the card minus max(512 MiB, 4 %) (`SMV_VRAM_MIB=N` emulates
+a smaller card). When fewer fit than the chunks planned, that first chain is stopped and the render starts over with
+as many chunks as fit (one = one chain); no figure (nvidia-smi missing, several GPUs) = one chain. Chunk 1's sidecar
+is the render's with `split:` the first cut and every chunk's progress (the GUI's resume probe reads it), a later
+chunk's is signed apart; a start with all of them resumes each chunk from its own cut, whatever `SMV_FILE_SPLIT` says
+(a finished chunk does not run, chunks that no longer all fit run as many at a time as fit), a start without the
+split resumes chunk 1's cut as one chain and drops the later chunks' files. Every host reads the one pause flag; the
+first PAUSED / RESUMED of any reaches the log, the pause preview is chunk 1's part.
+
+A one-shot chain's pipes (`hostChain`): node makes each pipe with one end opened for overlapped I/O (its own) and one
+for synchronous I/O (the child's). Each ffmpeg keeps the synchronous end of its pipe and the host takes node's two
+ends, which it reads and writes with an OVERLAPPED of its own (`offlinePipeIo` in smv-live.cpp). A process that does
+plain blocking reads on an overlapped end loses data: any other operation that completes on that pipe's object (a
+query of the handle from another process is enough) ends the read's wait, the read reports 0 bytes, and its request
+stays queued and takes the next data written. Gates: harness `file_split_render` (`split_gate.py` lossless identity,
+refusals, walls; `split3_gate.py` the same for three chunks, the count by the card, both fallbacks;
+`split_resume_gate.py [three]` kills and resumes; `split_gui_gate.py` the app's Pause / preview / close / relaunch;
+`pause_tail_probe.py` a pause after chunk 1 ended; `pipe_trace_run.py` in its snapshot mode = an outside process
+queries the chains' pipe handles mid-render; `pipe_race.cjs query` = the loss itself, without the product).
 
 The encoder's conversion in the host (`encode.ts` encodePlan's `hostVf`, the host's `--out-vf FILTERS --out-sws
 FLAGS`, `FfConv` in smv-live.cpp; `SMV_OUT_CONV=0` = off): when the encode takes the zimg route to p010le with nothing
