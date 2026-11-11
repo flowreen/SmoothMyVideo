@@ -62,17 +62,6 @@ static bool nativeFsrupLoad(const std::string& dir, int kind)
     return true;
 }
 
-// the reason an early (handoff-time) setup failed, named by the pipe's "the early engine handoff failed" line (cleared
-// when the early thread starts)
-static char g_earlyWhy[240];
-static void earlyWhy(const char* fmt, ...)
-{
-    va_list a;
-    va_start(a, fmt);
-    vsnprintf(g_earlyWhy, sizeof(g_earlyWhy), fmt, a);
-    va_end(a);
-}
-
 // AMD FSR / Intel XeSS-SR past 3x a side (FSR's named presets end at 3.0x and past about 9x it leaves one dot an input
 // pixel; XeSS-SR refuses past 3.0x): the fewest equal passes of at most 3x, the last landing on ow x oh, the sizes in
 // between even (the upscaler leaves an odd last column / row untouched). pw / ph [0 .. n] = the sizes; returns n (1 =

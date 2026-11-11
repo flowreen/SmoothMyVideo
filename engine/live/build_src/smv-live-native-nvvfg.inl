@@ -67,7 +67,9 @@ static bool nativeVfgLoad(const std::string& dir)
         mods[i] = LoadLibraryExW(p.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (!mods[i])
         {
-            LOG("native: vfg: %ls did not load from %s (err %lu)\n", names[i], dir.c_str(), GetLastError());
+            const DWORD err = GetLastError();
+            LOG("native: vfg: %ls did not load from %s (err %lu)\n", names[i], dir.c_str(), err);
+            earlyWhy("NVIDIA Video Frame Generation: %ls did not load (error %lu)", names[i], err);
             for (int k = i - 1; k >= 0; k--)
                 FreeLibrary(mods[k]);
             return false;
@@ -88,6 +90,7 @@ static bool nativeVfgLoad(const std::string& dir)
         !r.setStream || !r.load || !r.run)
     {
         LOG("native: vfg: NVIDIA's Video Effects runtime in %s lacks an expected export\n", dir.c_str());
+        earlyWhy("NVIDIA Video Frame Generation: its runtime lacks an expected export");
         for (HMODULE m : mods)
             FreeLibrary(m);
         return false;
@@ -99,12 +102,14 @@ static bool nativeVfgLoad(const std::string& dir)
     return true;
 }
 
-// one runtime call's status: 0 passes, anything else is logged with NVIDIA's own text
+// one runtime call's status: 0 passes, anything else is logged with NVIDIA's own text, which also becomes the reason
+// a Live start that fails here names (a GPU the model does not run on: "The GPU is not supported")
 static bool nativeVfgOk(int rc, const char* what)
 {
     if (rc == 0)
         return true;
     LOG("native: vfg: %s failed: %s (status %d)\n", what, g_vfg.errorString(rc), rc);
+    earlyWhy("NVIDIA Video Frame Generation: %s (%s, status %d)", g_vfg.errorString(rc), what, rc);
     return false;
 }
 

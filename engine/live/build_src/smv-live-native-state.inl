@@ -1040,3 +1040,14 @@ static float* nativeXCur(const NativeRife& nr)
 {
     return nr.dX + (nr.xSwap ? 0 : 3 * (size_t)nr.ph * nr.pw);
 }
+
+// the reason an early (handoff-time) setup failed, named by the pipe's "the early engine handoff failed" line (cleared
+// when the early thread starts): the one line of a failed Live start the app's panel keeps
+static char g_earlyWhy[240];
+static void earlyWhy(const char* fmt, ...)
+{
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(g_earlyWhy, sizeof(g_earlyWhy), fmt, a);
+    va_end(a);
+}
