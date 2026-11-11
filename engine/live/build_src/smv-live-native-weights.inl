@@ -35,10 +35,50 @@ static uint16_t f2hRne(float f)
 static float h2fHost(uint16_t h)
 {
     const uint32_t e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
-    float f = e == 0 ? std::ldexp((float)m, -24)
-                     : (e == 31 ? (m ? NAN : INFINITY) : std::ldexp((float)(m | 0x400u), (int)e - 25));
-    return (h & 0x8000u) ? -f : f;
+    if (e == 0 || e == 31) // zero, a subnormal, inf or NaN
+    {
+        const float f = e == 0 ? std::ldexp((float)m, -24) : (m ? NAN : INFINITY);
+        return (h & 0x8000u) ? -f : f;
+    }
+    // a normal half = the same sign, exponent and mantissa bits at fp32's places
+    const uint32_t x = ((uint32_t)(h & 0x8000u) << 16) | ((e + 112u) << 23) | (m << 13);
+    float f = 0.0f;
+    memcpy(&f, &x, sizeof f);
+    return f;
 }
+
+// One tensor of a torch.save file as the file stores it: n fp32 values at f, or n fp16 values at h. A weight the
+// kernels take as fp16 is read through half(), which hands a stored fp16 value over as it is; a weight a kernel takes
+// as fp32 is read through PthFile::f32, which a file that stores it as fp16 does not answer.
+struct PthW
+{
+    const float* f = nullptr;
+    const uint16_t* h = nullptr;
+    size_t n = 0;
+    PthW() = default;
+    PthW(const float* p, size_t c) : f(p), n(c)
+    {
+    }
+    PthW(const uint16_t* p, size_t c) : h(p), n(c)
+    {
+    }
+    explicit PthW(const std::vector<float>& v) : f(v.data()), n(v.size())
+    {
+    }
+    explicit PthW(const std::vector<uint16_t>& v) : h(v.data()), n(v.size())
+    {
+    }
+    // value i rounded to fp16 (torch's .half())
+    uint16_t half(size_t i) const
+    {
+        return h ? h[i] : f2hRne(f[i]);
+    }
+    // value i exactly, whatever the storage (for a file whose fp16 values are its author's own precision)
+    float val(size_t i) const
+    {
+        return f ? f[i] : h2fHost(h[i]);
+    }
+};
 
 // torch.save's file = a stored zip: <dir>/data.pkl, a protocol-2 pickle of the saved object (each tensor =
 // torch._utils._rebuild_tensor_v2(its persistent storage ('storage', <dtype class>, key, location, numel), offset,
@@ -390,15 +430,48 @@ static bool pthZip(const unsigned char* f, size_t fn, std::map<std::string, std:
 }
 
 // A torch.save file's state dict (BasicSR's {"params": ...} unwrapped) read in place: the file mapped read-only, each
-// tensor in t a view of its stored fp32 values (an fp16 or misaligned tensor converted into own), its shape in S; every
-// tensor contiguous. The views live as long as the PthFile.
+// tensor in t a view of its stored fp32 or fp16 values (a misaligned tensor copied into own / ownH), its shape in S;
+// every tensor contiguous. The views live as long as the PthFile.
 struct PthFile
 {
     HANDLE fh = INVALID_HANDLE_VALUE, mh = nullptr;
     const unsigned char* base = nullptr;
-    std::map<std::string, std::span<const float>> t;
+    std::map<std::string, PthW> t;
     std::map<std::string, std::vector<int64_t>> S;
     std::list<std::vector<float>> own;
+    std::list<std::vector<uint16_t>> ownH;
+    std::string lost; // the first tensor is32 found stored as fp16
+    // tensor n has shape s
+    bool is(const std::string& n, const std::vector<int64_t>& s) const
+    {
+        const auto it = S.find(n);
+        return it != S.end() && it->second == s;
+    }
+    // ... and the file stores it as fp32: what a kernel that reads it as fp32 needs (rounded to fp16 in the file, its
+    // low bits are gone)
+    bool is32(const std::string& n, const std::vector<int64_t>& s)
+    {
+        if (!is(n, s))
+            return false;
+        if (t.at(n).f)
+            return true;
+        if (lost.empty())
+            lost = n;
+        return false;
+    }
+    // a loader's refusal: the file stores a tensor as fp16 that the kernels read as fp32, else it is not `what`
+    std::string notForm(const char* what) const
+    {
+        return lost.empty() ? std::string("its weights are not ") + what
+                            : "its weights store " + lost + " as fp16, which the kernels read as fp32";
+    }
+    // tensor n's fp32 values in place (a tensor is32 answered for)
+    std::span<const float> f32(const std::string& n) const
+    {
+        const auto it = t.find(n);
+        return it != t.end() && it->second.f ? std::span<const float>(it->second.f, it->second.n)
+                                             : std::span<const float>();
+    }
     PthFile() = default;
     PthFile(const PthFile&) = delete;
     PthFile& operator=(const PthFile&) = delete;
@@ -495,23 +568,20 @@ static bool pthStateDict(const std::wstring& path, PthFile& wf, std::string& why
             return false;
         }
         const unsigned char* src = f + e->second.first + (size_t)t.off * (size_t)t.bytes;
-        if (t.bytes == 4 && ((uintptr_t)src & 3) == 0)
-            wf.t[k.s] = std::span<const float>(reinterpret_cast<const float*>(src), (size_t)n);
-        else
+        if (((uintptr_t)src & (uintptr_t)(t.bytes - 1)) == 0)
+            wf.t[k.s] = t.bytes == 4 ? PthW(reinterpret_cast<const float*>(src), (size_t)n)
+                                     : PthW(reinterpret_cast<const uint16_t*>(src), (size_t)n);
+        else if (t.bytes == 4)
         {
             std::vector<float>& v = wf.own.emplace_back((size_t)n);
-            for (size_t j = 0; j < (size_t)n; j++)
-            {
-                if (t.bytes == 4)
-                    memcpy(&v[j], src + 4 * j, 4);
-                else
-                {
-                    uint16_t h = 0;
-                    memcpy(&h, src + 2 * j, 2);
-                    v[j] = h2fHost(h);
-                }
-            }
-            wf.t[k.s] = std::span<const float>(v);
+            memcpy(v.data(), src, (size_t)n * 4);
+            wf.t[k.s] = PthW(v);
+        }
+        else
+        {
+            std::vector<uint16_t>& v = wf.ownH.emplace_back((size_t)n);
+            memcpy(v.data(), src, (size_t)n * 2);
+            wf.t[k.s] = PthW(v);
         }
         wf.S[k.s] = t.size;
     }
@@ -523,7 +593,7 @@ static bool pthStateDict(const std::wstring& path, PthFile& wf, std::string& why
 // (lane's B registers for n-tiles 2q, 2q + 1 at channels 16 kc .. + 15: n = 16 q + lane / 4 (+ 8), k = 2 (lane % 4)
 // (+ 1, + 8, + 9)), bias and slopes fp16; the last layer's wf[tap][kc][q 3][lane][8] and bias fp16. Every value is
 // first rounded to fp16, as the model runs (.half()). false = missing, or not this model (`why`).
-static std::vector<uint16_t> restFragOf(std::span<const float> w, int nout, int cin, int coff, int taps);
+static std::vector<uint16_t> restFragOf(const PthW& w, int nout, int cin, int coff, int taps);
 static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std::string& why)
 {
     off.assign(3 + 16 * 3 + 2, 0);
@@ -531,12 +601,8 @@ static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, st
     if (!pthStateDict(g_nativeEngineDir + L"\\realesrgan\\realesr-animevideov3.pkl", pf, why))
         return false;
     auto& wts = pf.t;
-    const auto& S = pf.S;
     // the form: body.0 conv 3 -> 64, body.1 PReLU 64, 16 x (conv 64 -> 64, PReLU 64), body.34 conv 64 -> 48, 3 x 3
-    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
-        const auto it = S.find(n);
-        return it != S.end() && it->second == s;
-    };
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) { return pf.is(n, s); };
     bool form = wts.size() == 53 && has("body.0.weight", {64, 3, 3, 3}) && has("body.0.bias", {64}) &&
                 has("body.1.weight", {64}) && has("body.34.weight", {48, 64, 3, 3}) && has("body.34.bias", {48});
     for (int L = 0; L < 16 && form; L++)
@@ -556,21 +622,20 @@ static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, st
         memcpy(blob.data() + o, p, n);
         return o;
     };
-    auto halves = [](std::span<const float> v) {
-        std::vector<uint16_t> h(v.size());
-        for (size_t i = 0; i < v.size(); i++)
-            h[i] = f2hRne(v[i]);
+    auto halves = [](const PthW& v) {
+        std::vector<uint16_t> h(v.n);
+        for (size_t i = 0; i < v.n; i++)
+            h[i] = v.half(i);
         return h;
     };
-    // conv 0 keeps fp32 storage of the fp16-rounded values; every other weight goes through f2hRne once (rounding an
-    // fp16 value again changes nothing)
-    auto rounded = [](std::span<const float> v) {
-        std::vector<float> r(v.begin(), v.end());
-        for (float& x : r)
-            x = h2fHost(f2hRne(x));
+    // conv 0 keeps fp32 storage of the fp16-rounded values; every other weight is rounded to fp16 once
+    auto rounded = [](const PthW& v) {
+        std::vector<float> r(v.n);
+        for (size_t i = 0; i < v.n; i++)
+            r[i] = h2fHost(v.half(i));
         return r;
     };
-    auto fragOf = [](std::span<const float> w, int nout) { return restFragOf(w, nout, 64, 0, 9); };
+    auto fragOf = [](const PthW& w, int nout) { return restFragOf(w, nout, 64, 0, 9); };
     const std::vector<float> w0 = rounded(wts["body.0.weight"]), b0 = rounded(wts["body.0.bias"]);
     off[0] = put(w0.data(), w0.size() * sizeof(float));
     off[1] = put(b0.data(), b0.size() * sizeof(float));
@@ -594,7 +659,7 @@ static bool restNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, st
 // a conv's fp16 fragment-order weights for the tensor-core kernels: w[o][cin][taps] (PyTorch's layout) -> per tap, per
 // 16-channel step kc of the 64 channels from coff, per n-tile pair q of nout, per lane the 8 halves of its B registers
 // (n = 16 q + lane / 4 (+ 8), k = 2 (lane % 4) (+ 1, + 8, + 9))
-static std::vector<uint16_t> restFragOf(std::span<const float> w, int nout, int cin, int coff, int taps)
+static std::vector<uint16_t> restFragOf(const PthW& w, int nout, int cin, int coff, int taps)
 {
     const int nq = nout / 16;
     std::vector<uint16_t> fr((size_t)taps * 4 * nq * 32 * 8);
@@ -608,7 +673,7 @@ static std::vector<uint16_t> restFragOf(std::span<const float> w, int nout, int 
                     const int ns[8] = {n0, n0, n0, n0, n0 + 8, n0 + 8, n0 + 8, n0 + 8};
                     const int cs[8] = {c0, c0 + 1, c0 + 8, c0 + 9, c0, c0 + 1, c0 + 8, c0 + 9};
                     for (int j = 0; j < 8; j++)
-                        fr[i++] = f2hRne(w[((size_t)ns[j] * cin + (size_t)cs[j]) * taps + (size_t)t]);
+                        fr[i++] = w.half(((size_t)ns[j] * cin + (size_t)cs[j]) * taps + (size_t)t);
                 }
     return fr;
 }
@@ -1089,26 +1154,26 @@ static bool ajBlob(const AjWeights& aw, std::vector<uint8_t>& blob, std::vector<
         {
             if (!sizesOk(b.c[j], 64 * 64 * 9, 64))
                 return bad("a weight's size");
-            const std::vector<uint16_t> wf = restFragOf(b.c[j].w, 64, 64, 0, 9), bs = halves(b.c[j].b);
+            const std::vector<uint16_t> wf = restFragOf(PthW(b.c[j].w), 64, 64, 0, 9), bs = halves(b.c[j].b);
             off[(size_t)(2 + 11 * k + 3 * j)] = put(wf.data(), wf.size() * 2);
             off[(size_t)(3 + 11 * k + 3 * j)] = put(bs.data(), bs.size() * 2);
             off[(size_t)(4 + 11 * k + 3 * j)] = put(j < 2 ? zeros.data() : ones.data(), 64 * 2);
         }
         if (!sizesOk(b.att, 64 * 64, 64))
             return bad("a weight's size");
-        const std::vector<uint16_t> wa = restFragOf(b.att.w, 64, 64, 0, 1);
+        const std::vector<uint16_t> wa = restFragOf(PthW(b.att.w), 64, 64, 0, 1);
         off[(size_t)(11 + 11 * k)] = put(wa.data(), wa.size() * 2);
         off[(size_t)(12 + 11 * k)] = put(b.att.b.data(), 64 * sizeof(float));
     }
     std::vector<uint16_t> wcat;
     for (int s = 0; s < 4; s++)
     {
-        const std::vector<uint16_t> part = restFragOf(aw.cat.w, 64, 256, 64 * s, 1);
+        const std::vector<uint16_t> part = restFragOf(PthW(aw.cat.w), 64, 256, 64 * s, 1);
         wcat.insert(wcat.end(), part.begin(), part.end());
     }
     off[(size_t)(2 + 11 * n)] = put(wcat.data(), wcat.size() * 2);
     off[(size_t)(3 + 11 * n)] = put(aw.cat.b.data(), 64 * sizeof(float));
-    const std::vector<uint16_t> wlf = restFragOf(aw.last.w, 48, 64, 0, 9), bl = halves(aw.last.b);
+    const std::vector<uint16_t> wlf = restFragOf(PthW(aw.last.w), 48, 64, 0, 9), bl = halves(aw.last.b);
     off[(size_t)(4 + 11 * n)] = put(wlf.data(), wlf.size() * 2);
     off[(size_t)(5 + 11 * n)] = put(bl.data(), bl.size() * 2);
     nblocks = n;
@@ -1129,9 +1194,14 @@ static bool ajFromPkl(const std::wstring& path, AjWeights& aw, std::string& why)
         const auto w = pf.S.find(n + ".weight"), b = pf.S.find(n + ".bias");
         if (w == pf.S.end() || b == pf.S.end() || w->second != wd || b->second != std::vector<int64_t>{wd[0]})
             return false;
-        const std::span<const float> tw = pf.t.at(n + ".weight"), tb = pf.t.at(n + ".bias");
-        t.w.assign(tw.begin(), tw.end());
-        t.b.assign(tb.begin(), tb.end());
+        const PthW& tw = pf.t.at(n + ".weight");
+        const PthW& tb = pf.t.at(n + ".bias");
+        t.w.resize(tw.n);
+        t.b.resize(tb.n);
+        for (size_t i = 0; i < tw.n; i++)
+            t.w[i] = tw.val(i);
+        for (size_t i = 0; i < tb.n; i++)
+            t.b[i] = tb.val(i);
         return true;
     };
     const std::vector<int64_t> w64 = {64, 64, 3, 3};

@@ -770,7 +770,7 @@ constexpr int kIfnSmInC0 = 9 * 65 * 4 * 16 + 9 * 2 * 32 * 16;
 // fragment order [zc][group][class][tap][kc][lane][8 halves] for the first 4 np outputs, padded to 16 nz with zeros,
 // rounded to fp16: class (py, px), tap (ti, tj) = halo offset (py + ti, px + tj) = kernel tap (3 - 2 (py + ti) + py, 3 -
 // 2 (px + tj) + px); output o = 16 zc + 8 hf + lane / 4, channel = group cg + 16 kc + 2 (lane % 4) (+ 1, + 8, + 9)
-static std::vector<uint16_t> ifnLastFrags(std::span<const float> w, int c, int np, int cg, int nout = 52)
+static std::vector<uint16_t> ifnLastFrags(const PthW& w, int c, int np, int cg, int nout = 52)
 {
     static const int kOfs[4] = {0, 1, 8, 9};
     const int nz = (4 * np + 15) / 16, kcn = cg / 16, ng = c / cg;
@@ -790,7 +790,7 @@ static std::vector<uint16_t> ifnLastFrags(std::span<const float> w, int c, int n
                                 {
                                     const int o = zc * 16 + hf * 8 + (l >> 2);
                                     const int ch = gi * cg + kc * 16 + (l & 3) * 2 + kOfs[q];
-                                    out[i++] = o < 4 * np ? f2hRne(w[(((size_t)ch * nout + o) * 4 + ky) * 4 + kx]) : 0;
+                                    out[i++] = o < 4 * np ? w.half((((size_t)ch * nout + o) * 4 + ky) * 4 + kx) : 0;
                                 }
                 }
     return out;
@@ -806,29 +806,26 @@ static bool ifnNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std
     if (!pthStateDict(g_nativeEngineDir + L"\\rife\\flownet.pkl", pf, why))
         return false;
     auto& wts = pf.t;
-    const auto& S = pf.S;
-    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
-        const auto it = S.find(n);
-        return it != S.end() && it->second == s;
-    };
+    // the biases and the betas go to the kernels as fp32
     bool form = true;
     for (int k = 0; k < 5 && form; k++)
     {
         const std::string p = "module.block" + std::to_string(k) + ".";
         const int64_t c = kIfnC[k], h = c / 2, ci = kIfnCin[k];
-        form = has(p + "conv0.0.0.weight", {h, ci, 3, 3}) && has(p + "conv0.0.0.bias", {h}) &&
-               has(p + "conv0.1.0.weight", {c, h, 3, 3}) && has(p + "conv0.1.0.bias", {c}) &&
-               has(p + "lastconv.0.weight", {c, 52, 4, 4}) && has(p + "lastconv.0.bias", {52}) &&
-               !S.count(p + "convblock.8.beta");
+        form = pf.is(p + "conv0.0.0.weight", {h, ci, 3, 3}) && pf.is32(p + "conv0.0.0.bias", {h}) &&
+               pf.is(p + "conv0.1.0.weight", {c, h, 3, 3}) && pf.is32(p + "conv0.1.0.bias", {c}) &&
+               pf.is(p + "lastconv.0.weight", {c, 52, 4, 4}) && pf.is32(p + "lastconv.0.bias", {52}) &&
+               !pf.S.count(p + "convblock.8.beta");
         for (int r = 0; r < 8 && form; r++)
         {
             const std::string q = p + "convblock." + std::to_string(r) + ".";
-            form = has(q + "conv.weight", {c, c, 3, 3}) && has(q + "conv.bias", {c}) && has(q + "beta", {1, c, 1, 1});
+            form = pf.is(q + "conv.weight", {c, c, 3, 3}) && pf.is32(q + "conv.bias", {c}) &&
+                   pf.is32(q + "beta", {1, c, 1, 1});
         }
     }
     if (!form)
     {
-        why = "its weights are not RIFE 4.25's IFNet";
+        why = pf.notForm("RIFE 4.25's IFNet");
         return false;
     }
     blob.clear();
@@ -844,29 +841,29 @@ static bool ifnNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std
         const std::string p = "module.block" + std::to_string(k) + ".";
         const int c = kIfnC[k], h = c / 2, ci = kIfnCin[k], cp = kIfnCp[k];
         size_t* o = off.data() + (size_t)k * kIfnPieces;
-        const std::span<const float> w0 = wts[p + "conv0.0.0.weight"];
-        std::vector<float> w0p((size_t)h * cp * 9, 0.0f);
+        const PthW& w0 = wts[p + "conv0.0.0.weight"];
+        std::vector<uint16_t> w0p((size_t)h * cp * 9, 0);
         for (int n = 0; n < h; n++)
             for (int i = 0; i < ci; i++)
                 for (int t = 0; t < 9; t++)
-                    w0p[((size_t)n * cp + i) * 9 + t] = w0[((size_t)n * ci + i) * 9 + t];
-        const std::vector<uint16_t> f0 = fnFragOf(w0p, h, cp, cp, 2);
+                    w0p[((size_t)n * cp + i) * 9 + t] = w0.half(((size_t)n * ci + i) * 9 + t);
+        const std::vector<uint16_t> f0 = fnFragOf(PthW(w0p), h, cp, cp, 2);
         o[0] = put(f0.data(), f0.size() * sizeof(uint16_t));
-        o[1] = put(wts[p + "conv0.0.0.bias"].data(), (size_t)h * sizeof(float));
+        o[1] = put(pf.f32(p + "conv0.0.0.bias").data(), (size_t)h * sizeof(float));
         const std::vector<uint16_t> f1 = fnFragOf(wts[p + "conv0.1.0.weight"], c, h, kIfnC1G[k], 2);
         o[2] = put(f1.data(), f1.size() * sizeof(uint16_t));
-        o[3] = put(wts[p + "conv0.1.0.bias"].data(), (size_t)c * sizeof(float));
+        o[3] = put(pf.f32(p + "conv0.1.0.bias").data(), (size_t)c * sizeof(float));
         for (int r = 0; r < 8; r++)
         {
             const std::string q = p + "convblock." + std::to_string(r) + ".";
             const std::vector<uint16_t> fr = fnFragOf(wts[q + "conv.weight"], c, c, kIfnRsG[k], 2);
             o[4 + 3 * r] = put(fr.data(), fr.size() * sizeof(uint16_t));
-            o[5 + 3 * r] = put(wts[q + "conv.bias"].data(), (size_t)c * sizeof(float));
-            o[6 + 3 * r] = put(wts[q + "beta"].data(), (size_t)c * sizeof(float));
+            o[5 + 3 * r] = put(pf.f32(q + "conv.bias").data(), (size_t)c * sizeof(float));
+            o[6 + 3 * r] = put(pf.f32(q + "beta").data(), (size_t)c * sizeof(float));
         }
         const std::vector<uint16_t> fl = ifnLastFrags(wts[p + "lastconv.0.weight"], c, kIfnNp[k], kIfnRsG[k]);
         o[28] = put(fl.data(), fl.size() * sizeof(uint16_t));
-        const std::span<const float> lb = wts[p + "lastconv.0.bias"];
+        const std::span<const float> lb = pf.f32(p + "lastconv.0.bias");
         std::vector<float> lbp((size_t)16 * ((4 * kIfnNp[k] + 15) / 16), 0.0f);
         for (int i = 0; i < 4 * kIfnNp[k]; i++)
             lbp[i] = lb[i];

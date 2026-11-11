@@ -662,39 +662,42 @@ static bool fuNatLoad(std::vector<uint8_t>& blob, std::vector<FuOp>& ops, std::v
     if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\fusionnet.pkl", pf, why))
         return false;
     auto& wts = pf.t;
-    const auto& S = pf.S;
     const FuPlan& pl = fuPlan();
     std::map<std::string, bool> want;
     auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
         want[n] = true;
-        const auto it = S.find(n);
-        return it != S.end() && it->second == s;
+        return pf.is(n, s);
+    };
+    // the PReLU slopes and the convs' biases go to the kernels as fp32 (conv_last's are rounded to fp16)
+    auto has32 = [&](const std::string& n, const std::vector<int64_t>& s) {
+        want[n] = true;
+        return pf.is32(n, s);
     };
     bool form = true;
     for (const FuStep& p : pl.steps)
     {
         if (!p.prelu.empty())
-            form = form && has(p.prelu + ".weight", {1});
+            form = form && has32(p.prelu + ".weight", {1});
         if (p.kind == 'i')
             continue;
         const std::vector<int64_t> ws =
             p.kind == 'u' ? std::vector<int64_t>{p.cin, p.cout, 4, 4} : std::vector<int64_t>{p.cout, p.cin, 3, 3};
-        form = form && has(p.conv + ".weight", ws) && has(p.conv + ".bias", {p.cout});
+        form = form && has(p.conv + ".weight", ws) && has32(p.conv + ".bias", {p.cout});
     }
     static const char* const kHeadLr[3] = {"residual_model_head1.0", "residual_model_head2.0",
                                            "residual_model_head3.0"};
     for (const char* h : kHeadLr)
-        form = form && has(std::string(h) + ".weight", {1});
+        form = form && has32(std::string(h) + ".weight", {1});
     const std::string cl = "residual_model_tail.conv_last.";
-    form = form && has(cl + "weight", {3, 64, 3, 3}) && has(cl + "bias", {3}) && S.size() == want.size();
+    form = form && has(cl + "weight", {3, 64, 3, 3}) && has(cl + "bias", {3}) && pf.S.size() == want.size();
     if (!form)
     {
-        why = "its weights are not GMFSS's fusionnet";
+        why = pf.notForm("GMFSS's fusionnet");
         return false;
     }
     for (int i = 0; i < 3; i++)
     {
-        lr[i] = wts[std::string(kHeadLr[i]) + ".weight"][0];
+        lr[i] = pf.f32(std::string(kHeadLr[i]) + ".weight")[0];
         if (!(lr[i] > 0.0f && lr[i] <= 1.0f))
         {
             why = "its b / c / d PReLU slopes are not in (0, 1]";
@@ -715,13 +718,13 @@ static bool fuNatLoad(std::vector<uint8_t>& blob, std::vector<FuOp>& ops, std::v
         FuOp& o = ops[i];
         o.cin = p.cin;
         o.cout = p.cout;
-        o.slope = p.prelu.empty() ? 0.0f : wts[p.prelu + ".weight"][0];
+        o.slope = p.prelu.empty() ? 0.0f : pf.f32(p.prelu + ".weight")[0];
         if (p.kind == 'i')
         {
             o.k = kFuIn;
             continue;
         }
-        const std::span<const float> w = wts[p.conv + ".weight"];
+        const PthW& w = wts[p.conv + ".weight"];
         std::vector<uint16_t> fr;
         if (p.kind == 'u')
         {
@@ -737,12 +740,12 @@ static bool fuNatLoad(std::vector<uint8_t>& blob, std::vector<FuOp>& ops, std::v
         {
             // head0's first conv: its 9 inputs zero-padded to k_fuIn's 16
             o.k = kFuC16;
-            std::vector<float> wp((size_t)p.cout * 16 * 9, 0.0f);
+            std::vector<uint16_t> wp((size_t)p.cout * 16 * 9, 0);
             for (int n = 0; n < p.cout; n++)
                 for (int c = 0; c < 9; c++)
                     for (int t = 0; t < 9; t++)
-                        wp[((size_t)n * 16 + c) * 9 + t] = w[((size_t)n * 9 + c) * 9 + t];
-            fr = fnFragOf(wp, p.cout, 16, 16, 2);
+                        wp[((size_t)n * 16 + c) * 9 + t] = w.half(((size_t)n * 9 + c) * 9 + t);
+            fr = fnFragOf(PthW(wp), p.cout, 16, 16, 2);
             o.cin = 16;
         }
         else
@@ -751,15 +754,16 @@ static bool fuNatLoad(std::vector<uint8_t>& blob, std::vector<FuOp>& ops, std::v
             fr = fnFragOf(w, p.cout, p.cin, 64, 8);
         }
         o.wOff = put(fr.data(), fr.size() * sizeof(uint16_t));
-        o.bOff = put(wts[p.conv + ".bias"].data(), (size_t)p.cout * sizeof(float));
+        o.bOff = put(pf.f32(p.conv + ".bias").data(), (size_t)p.cout * sizeof(float));
     }
-    const std::span<const float> cw = wts[cl + "weight"], cb = wts[cl + "bias"];
-    wl.resize(cw.size());
-    bl.resize(cb.size());
-    for (size_t i = 0; i < cw.size(); i++)
-        wl[i] = f2hRne(cw[i]);
-    for (size_t i = 0; i < cb.size(); i++)
-        bl[i] = f2hRne(cb[i]);
+    const PthW& cw = wts[cl + "weight"];
+    const PthW& cb = wts[cl + "bias"];
+    wl.resize(cw.n);
+    bl.resize(cb.n);
+    for (size_t i = 0; i < cw.n; i++)
+        wl[i] = cw.half(i);
+    for (size_t i = 0; i < cb.n; i++)
+        bl[i] = cb.half(i);
     return true;
 }
 

@@ -104,7 +104,17 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
   TensorRT engines left in it (`*.engine`, `*.jit`, `*.warm`, `engine_stamp.txt`). Every net runs on
   the host's own kernels and reads its weights itself; the dist ships those
   weights (`realesrgan/realesr-animevideov3.pkl`, `GMFSS_Fortuna/train_log/feat.pkl`, `metric.pkl`, `rife.pkl`,
-  `fusionnet.pkl` and `flownet.pkl`, `rife/flownet.pkl`). RIFE's IFNet: the five IFBlocks and the warps
+  `fusionnet.pkl` and `flownet.pkl`, `rife/flownet.pkl`). These seven files hold their authors' values with each
+  tensor stored the way the host reads it: as fp16 where the loader rounds it to fp16 before anything else (most
+  conv weights; every Real-ESRGAN tensor), as fp32 where a kernel reads fp32 or the host computes first (every other
+  bias and beta, the PReLU slopes, the LayerNorm parameters, DRBA block0's first and transposed convs, feat_ext's
+  first conv, gmflow's 7 x 7 conv and its attentions' projections, and RIFE's `encode.*`, the source of the inline
+  `kRifeEncW`). The frames are the fp32 originals' byte for byte and the files are about half the size. The reader
+  (`pthStateDict`) maps a file and hands each tensor out as stored (`PthW`): `half(i)` gives a stored fp16 value as
+  it is and an fp32 one rounded to fp16, `PthFile::f32` gives fp32 values in place, and a loader's form test asks
+  `is32` for every tensor it needs as fp32, so a file that stores such a tensor as fp16 is refused (`... unavailable
+  (its weights store <tensor> as fp16, which the kernels read as fp32)`). An author's all-fp32 file loads too and
+  gives the same frames. RIFE's IFNet: the five IFBlocks and the warps
   between them run on the host's kernels (`nativeIfnRun`, 59 launches
   of its own module `smv_ifnet_*.cubin`, the weights read from `engine/rife/flownet.pkl` with the same torch zip
   reader as Restore, feat_ext and block0, the IFNet_HDv3 form checked; no fallback: a missing or
@@ -251,7 +261,11 @@ Weights ship in git. Fetched: `engine/bin` (ffmpeg, about 137 MB) and `engine/gp
 
 Refreshing bundled binaries: for ffmpeg delete `engine/bin` and re-run the fetch script, or drop a
 matched `ffmpeg.exe` + `ffprobe.exe` + DLL set in by hand (never mix DLLs across builds). Weights
-(GMFSS `train_log` pkls, `realesrgan/realesr-animevideov3.pkl`) are committed; replace the files to update.
+(`rife/flownet.pkl`, GMFSS `train_log` pkls, `realesrgan/realesr-animevideov3.pkl`) are committed in the stored form
+described under "Every net runs on the host's own kernels" above. To update one, take the author's file, store as
+fp16 exactly the tensors every loader reads through `PthW::half` (keep every tensor a loader asks `is32` of as
+fp32), and check that a render on the new file gives the frames of a render on the author's file. The author's
+all-fp32 file also works as it is, at twice the size.
 
 ## Scripts
 

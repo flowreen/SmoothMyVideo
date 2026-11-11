@@ -285,7 +285,7 @@ constexpr int kGbU0 = 192, kGbSmProj = 64 * 128 * 2, kGbSmMask = 64 * 256 * 2;
 
 // a 1 x 1 weight [n][k] in gbGemmT's fragment order [z][k / 16][nt / 2][lane][8 halves] (n-tiles 2q, 2q + 1 of z's nt:
 // row 8 (nt z + 2q (+ 1)) + lane / 4, column 16 s + 2 (lane % 4) (+ 1, + 8, + 9)), rounded to fp16
-static std::vector<uint16_t> gbFrag1(std::span<const float> w, int n, int k, int nt)
+static std::vector<uint16_t> gbFrag1(const PthW& w, int n, int k, int nt)
 {
     static const int kOfs[4] = {0, 1, 8, 9};
     std::vector<uint16_t> out((size_t)n * k);
@@ -299,7 +299,7 @@ static std::vector<uint16_t> gbFrag1(std::span<const float> w, int n, int k, int
                         {
                             const int r = z * 8 * nt + (2 * q + hf) * 8 + (l >> 2);
                             const int c = 16 * s + (l & 3) * 2 + kOfs[j];
-                            out[o++] = f2hRne(w[(size_t)r * k + c]);
+                            out[o++] = w.half((size_t)r * k + c);
                         }
     return out;
 }
@@ -314,18 +314,14 @@ static bool gbNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
     if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\flownet.pkl", pf, why))
         return false;
     auto& wts = pf.t;
-    const auto& S = pf.S;
-    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
-        const auto it = S.find(n);
-        return it != S.end() && it->second == s;
-    };
     const std::string fa = "feature_flow_attn.", up = "upsampler.";
-    if (!has(fa + "q_proj.weight", {128, 128}) || !has(fa + "q_proj.bias", {128}) ||
-        !has(fa + "k_proj.weight", {128, 128}) || !has(fa + "k_proj.bias", {128}) ||
-        !has(up + "0.weight", {256, 130, 3, 3}) || !has(up + "0.bias", {256}) ||
-        !has(up + "2.weight", {144, 256, 1, 1}) || !has(up + "2.bias", {144}) || S.count(up + "3.weight"))
+    // the biases go to the kernels as fp32
+    if (!pf.is(fa + "q_proj.weight", {128, 128}) || !pf.is32(fa + "q_proj.bias", {128}) ||
+        !pf.is(fa + "k_proj.weight", {128, 128}) || !pf.is32(fa + "k_proj.bias", {128}) ||
+        !pf.is(up + "0.weight", {256, 130, 3, 3}) || !pf.is32(up + "0.bias", {256}) ||
+        !pf.is(up + "2.weight", {144, 256, 1, 1}) || !pf.is32(up + "2.bias", {144}) || pf.S.count(up + "3.weight"))
     {
-        why = "its weights are not gmflow's";
+        why = pf.notForm("gmflow's");
         return false;
     }
     blob.clear();
@@ -335,37 +331,39 @@ static bool gbNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
         memcpy(blob.data() + o, d, n);
         return o;
     };
-    std::vector<float> qk((size_t)256 * 128), qkb(256);
-    const std::span<const float> qw = wts[fa + "q_proj.weight"], kw = wts[fa + "k_proj.weight"];
-    const std::span<const float> qb = wts[fa + "q_proj.bias"], kb = wts[fa + "k_proj.bias"];
+    std::vector<uint16_t> qk((size_t)256 * 128);
+    std::vector<float> qkb(256);
+    const PthW& qw = wts[fa + "q_proj.weight"];
+    const PthW& kw = wts[fa + "k_proj.weight"];
+    const std::span<const float> qb = pf.f32(fa + "q_proj.bias"), kb = pf.f32(fa + "k_proj.bias");
     for (size_t i = 0; i < (size_t)128 * 128; i++)
     {
-        qk[i] = qw[i];
-        qk[(size_t)128 * 128 + i] = kw[i];
+        qk[i] = qw.half(i);
+        qk[(size_t)128 * 128 + i] = kw.half(i);
     }
     for (int i = 0; i < 128; i++)
     {
         qkb[i] = qb[i];
         qkb[128 + i] = kb[i];
     }
-    const std::vector<uint16_t> fp = gbFrag1(qk, 256, 128, 8);
+    const std::vector<uint16_t> fp = gbFrag1(PthW(qk), 256, 128, 8);
     off[0] = put(fp.data(), fp.size() * sizeof(uint16_t));
     off[1] = put(qkb.data(), qkb.size() * sizeof(float));
-    const std::span<const float> w0 = wts[up + "0.weight"];
-    std::vector<float> w0p((size_t)256 * kGbU0 * 9, 0.0f);
+    const PthW& w0 = wts[up + "0.weight"];
+    std::vector<uint16_t> w0p((size_t)256 * kGbU0 * 9, 0);
     for (int n = 0; n < 256; n++)
         for (int c = 0; c < 130; c++)
         {
             const int u = c < 2 ? 128 + c : c - 2; // the model's cat(flow, feat) -> u0's feat | flow
             for (int t = 0; t < 9; t++)
-                w0p[((size_t)n * kGbU0 + u) * 9 + t] = w0[((size_t)n * 130 + c) * 9 + t];
+                w0p[((size_t)n * kGbU0 + u) * 9 + t] = w0.half(((size_t)n * 130 + c) * 9 + t);
         }
-    const std::vector<uint16_t> f0 = fnFragOf(w0p, 256, kGbU0, 64, 8);
+    const std::vector<uint16_t> f0 = fnFragOf(PthW(w0p), 256, kGbU0, 64, 8);
     off[2] = put(f0.data(), f0.size() * sizeof(uint16_t));
-    off[3] = put(wts[up + "0.bias"].data(), (size_t)256 * sizeof(float));
+    off[3] = put(pf.f32(up + "0.bias").data(), (size_t)256 * sizeof(float));
     const std::vector<uint16_t> fm = gbFrag1(wts[up + "2.weight"], 144, 256, 6);
     off[4] = put(fm.data(), fm.size() * sizeof(uint16_t));
-    off[5] = put(wts[up + "2.bias"].data(), (size_t)144 * sizeof(float));
+    off[5] = put(pf.f32(up + "2.bias").data(), (size_t)144 * sizeof(float));
     return true;
 }
 

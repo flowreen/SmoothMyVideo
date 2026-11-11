@@ -362,22 +362,18 @@ static bool mnNatLoad(std::vector<uint8_t>& blob, size_t* off, float* slope, std
     if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\metric.pkl", pf, why))
         return false;
     auto& wts = pf.t;
-    const auto& S = pf.S;
-    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
-        const auto it = S.find(n);
-        return it != S.end() && it->second == s;
-    };
-    bool form = has("metric_in.weight", {64, 14, 3, 3}) && has("metric_in.bias", {64}) &&
-                has("metric_out.0.weight", {1}) && has("metric_out.1.weight", {2, 64, 3, 3}) &&
-                has("metric_out.1.bias", {2}) && !S.count("metric_net4.0.weight");
+    // the biases and the PReLU slopes go to the kernels as fp32
+    bool form = pf.is("metric_in.weight", {64, 14, 3, 3}) && pf.is32("metric_in.bias", {64}) &&
+                pf.is32("metric_out.0.weight", {1}) && pf.is("metric_out.1.weight", {2, 64, 3, 3}) &&
+                pf.is32("metric_out.1.bias", {2}) && !pf.S.count("metric_net4.0.weight");
     for (int r = 1; r <= 3 && form; r++)
     {
         const std::string p = "metric_net" + std::to_string(r) + ".";
-        form = has(p + "0.weight", {1}) && has(p + "1.weight", {64, 64, 3, 3}) && has(p + "1.bias", {64});
+        form = pf.is32(p + "0.weight", {1}) && pf.is(p + "1.weight", {64, 64, 3, 3}) && pf.is32(p + "1.bias", {64});
     }
     if (!form)
     {
-        why = "its weights are not GMFSS's MetricNet";
+        why = pf.notForm("GMFSS's MetricNet");
         return false;
     }
     blob.clear();
@@ -387,31 +383,34 @@ static bool mnNatLoad(std::vector<uint8_t>& blob, size_t* off, float* slope, std
         memcpy(blob.data() + o, d, n);
         return o;
     };
-    const std::span<const float> w0 = wts["metric_in.weight"];
-    std::vector<float> w0p((size_t)64 * 16 * 9, 0.0f);
+    const PthW& w0 = wts["metric_in.weight"];
+    std::vector<uint16_t> w0p((size_t)64 * 16 * 9, 0);
     for (int n = 0; n < 64; n++)
         for (int i = 0; i < 14; i++)
             for (int t = 0; t < 9; t++)
-                w0p[((size_t)n * 16 + i) * 9 + t] = w0[((size_t)n * 14 + i) * 9 + t];
-    const std::vector<uint16_t> f0 = fnFragOf(w0p, 64, 16, 16, 8);
+                w0p[((size_t)n * 16 + i) * 9 + t] = w0.half(((size_t)n * 14 + i) * 9 + t);
+    const std::vector<uint16_t> f0 = fnFragOf(PthW(w0p), 64, 16, 16, 8);
     off[0] = put(f0.data(), f0.size() * sizeof(uint16_t));
-    off[1] = put(wts["metric_in.bias"].data(), 64 * sizeof(float));
+    off[1] = put(pf.f32("metric_in.bias").data(), 64 * sizeof(float));
     for (int r = 0; r < 3; r++)
     {
         const std::string p = "metric_net" + std::to_string(r + 1) + ".";
         const std::vector<uint16_t> fr = fnFragOf(wts[p + "1.weight"], 64, 64, 64, 8);
         off[2 + 2 * r] = put(fr.data(), fr.size() * sizeof(uint16_t));
-        off[3 + 2 * r] = put(wts[p + "1.bias"].data(), 64 * sizeof(float));
-        slope[r] = wts[p + "0.weight"][0];
+        off[3 + 2 * r] = put(pf.f32(p + "1.bias").data(), 64 * sizeof(float));
+        slope[r] = pf.f32(p + "0.weight")[0];
     }
-    const std::span<const float> wo = wts["metric_out.1.weight"], bo = wts["metric_out.1.bias"];
-    std::vector<float> wop((size_t)16 * 64 * 9, 0.0f), bop(16, 0.0f);
-    std::copy(wo.begin(), wo.end(), wop.begin());
+    const PthW& wo = wts["metric_out.1.weight"];
+    const std::span<const float> bo = pf.f32("metric_out.1.bias");
+    std::vector<uint16_t> wop((size_t)16 * 64 * 9, 0);
+    std::vector<float> bop(16, 0.0f);
+    for (size_t i = 0; i < wo.n; i++)
+        wop[i] = wo.half(i);
     std::copy(bo.begin(), bo.end(), bop.begin());
-    const std::vector<uint16_t> fo = fnFragOf(wop, 16, 64, 64, 2);
+    const std::vector<uint16_t> fo = fnFragOf(PthW(wop), 16, 64, 64, 2);
     off[8] = put(fo.data(), fo.size() * sizeof(uint16_t));
     off[9] = put(bop.data(), bop.size() * sizeof(float));
-    slope[3] = wts["metric_out.0.weight"][0];
+    slope[3] = pf.f32("metric_out.0.weight")[0];
     return true;
 }
 

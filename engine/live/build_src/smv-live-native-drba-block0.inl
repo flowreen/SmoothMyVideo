@@ -348,26 +348,23 @@ static bool b0NatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
     PthFile pf;
     if (!pthStateDict(g_nativeEngineDir + L"\\rife\\flownet.pkl", pf, why))
         return false;
-    auto& wts = pf.t;
-    const auto& S = pf.S;
     const std::string p = "module.block0.";
-    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
-        const auto it = S.find(p + n);
-        return it != S.end() && it->second == s;
-    };
-    bool form = has("conv0.0.0.weight", {96, 15, 3, 3}) && has("conv0.0.0.bias", {96}) &&
-                has("conv0.1.0.weight", {192, 96, 3, 3}) && has("conv0.1.0.bias", {192}) &&
-                has("lastconv.0.weight", {192, 52, 4, 4}) && has("lastconv.0.bias", {52}) &&
-                !S.count(p + "convblock.8.beta");
+    // conv 0 and the transposed conv run on fp32 weights; the biases and the betas are fp32 too
+    auto has = [&](const std::string& n, const std::vector<int64_t>& s) { return pf.is(p + n, s); };
+    auto has32 = [&](const std::string& n, const std::vector<int64_t>& s) { return pf.is32(p + n, s); };
+    bool form = has32("conv0.0.0.weight", {96, 15, 3, 3}) && has32("conv0.0.0.bias", {96}) &&
+                has("conv0.1.0.weight", {192, 96, 3, 3}) && has32("conv0.1.0.bias", {192}) &&
+                has32("lastconv.0.weight", {192, 52, 4, 4}) && has32("lastconv.0.bias", {52}) &&
+                !pf.S.count(p + "convblock.8.beta");
     for (int i = 0; i < 8 && form; i++)
     {
         const std::string c = "convblock." + std::to_string(i) + ".";
-        form =
-            has(c + "conv.weight", {192, 192, 3, 3}) && has(c + "conv.bias", {192}) && has(c + "beta", {1, 192, 1, 1});
+        form = has(c + "conv.weight", {192, 192, 3, 3}) && has32(c + "conv.bias", {192}) &&
+               has32(c + "beta", {1, 192, 1, 1});
     }
     if (!form)
     {
-        why = "its weights are not RIFE 4.25's block0";
+        why = pf.notForm("RIFE 4.25's block0");
         return false;
     }
     blob.clear();
@@ -377,18 +374,18 @@ static bool b0NatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
         memcpy(blob.data() + o, d, n);
         return o;
     };
-    auto w = [&](const std::string& n) -> std::span<const float> { return wts[p + n]; };
+    auto w = [&](const std::string& n) { return pf.f32(p + n); };
     const std::span<const float> c0w = w("conv0.0.0.weight"), c0b = w("conv0.0.0.bias");
     std::vector<float> c0(c0w.begin(), c0w.end());
     c0.insert(c0.end(), c0b.begin(), c0b.end());
     off[0] = put(c0.data(), c0.size() * sizeof(float));
-    const std::vector<uint16_t> f1 = fnFragOf(w("conv0.1.0.weight"), 192, 96, 32, 2);
+    const std::vector<uint16_t> f1 = fnFragOf(pf.t[p + "conv0.1.0.weight"], 192, 96, 32, 2);
     off[1] = put(f1.data(), f1.size() * sizeof(uint16_t));
     off[2] = put(w("conv0.1.0.bias").data(), 192 * sizeof(float));
     for (int i = 0; i < 8; i++)
     {
         const std::string c = "convblock." + std::to_string(i) + ".";
-        const std::vector<uint16_t> fr = fnFragOf(w(c + "conv.weight"), 192, 192, 64, 2);
+        const std::vector<uint16_t> fr = fnFragOf(pf.t[p + c + "conv.weight"], 192, 192, 64, 2);
         off[3 + 3 * i] = put(fr.data(), fr.size() * sizeof(uint16_t));
         off[4 + 3 * i] = put(w(c + "conv.bias").data(), 192 * sizeof(float));
         off[5 + 3 * i] = put(w(c + "beta").data(), 192 * sizeof(float));

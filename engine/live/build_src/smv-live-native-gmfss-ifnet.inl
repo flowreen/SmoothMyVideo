@@ -617,29 +617,26 @@ static bool giNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std:
     if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\rife.pkl", pf, why))
         return false;
     auto& wts = pf.t;
-    const auto& S = pf.S;
-    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
-        const auto it = S.find(n);
-        return it != S.end() && it->second == s;
-    };
-    bool form = !S.count("block4.conv0.0.0.weight");
+    // the biases and the betas go to the kernels as fp32
+    bool form = !pf.S.count("block4.conv0.0.0.weight");
     for (int k = 0; k < 4 && form; k++)
     {
         const std::string p = "block" + std::to_string(k) + ".";
         const int64_t c = kGiC[k], h = c / 2, ci = kGiCin[k];
-        form = has(p + "conv0.0.0.weight", {h, ci, 3, 3}) && has(p + "conv0.0.0.bias", {h}) &&
-               has(p + "conv0.1.0.weight", {c, h, 3, 3}) && has(p + "conv0.1.0.bias", {c}) &&
-               has(p + "lastconv.0.weight", {c, 24, 4, 4}) && has(p + "lastconv.0.bias", {24}) &&
-               !S.count(p + "convblock.8.beta");
+        form = pf.is(p + "conv0.0.0.weight", {h, ci, 3, 3}) && pf.is32(p + "conv0.0.0.bias", {h}) &&
+               pf.is(p + "conv0.1.0.weight", {c, h, 3, 3}) && pf.is32(p + "conv0.1.0.bias", {c}) &&
+               pf.is(p + "lastconv.0.weight", {c, 24, 4, 4}) && pf.is32(p + "lastconv.0.bias", {24}) &&
+               !pf.S.count(p + "convblock.8.beta");
         for (int r = 0; r < 8 && form; r++)
         {
             const std::string q = p + "convblock." + std::to_string(r) + ".";
-            form = has(q + "conv.weight", {c, c, 3, 3}) && has(q + "conv.bias", {c}) && has(q + "beta", {1, c, 1, 1});
+            form = pf.is(q + "conv.weight", {c, c, 3, 3}) && pf.is32(q + "conv.bias", {c}) &&
+                   pf.is32(q + "beta", {1, c, 1, 1});
         }
     }
     if (!form)
     {
-        why = "its weights are not GMFSS's IFNet";
+        why = pf.notForm("GMFSS's IFNet");
         return false;
     }
     blob.clear();
@@ -655,29 +652,29 @@ static bool giNatLoad(std::vector<uint8_t>& blob, std::vector<size_t>& off, std:
         const std::string p = "block" + std::to_string(k) + ".";
         const int c = kGiC[k], h = c / 2, ci = kGiCin[k];
         size_t* o = off.data() + (size_t)k * kGiPieces;
-        const std::span<const float> w0 = wts[p + "conv0.0.0.weight"];
-        std::vector<float> w0p((size_t)h * 16 * 9, 0.0f);
+        const PthW& w0 = wts[p + "conv0.0.0.weight"];
+        std::vector<uint16_t> w0p((size_t)h * 16 * 9, 0);
         for (int n = 0; n < h; n++)
             for (int i = 0; i < ci; i++)
                 for (int t = 0; t < 9; t++)
-                    w0p[((size_t)n * 16 + i) * 9 + t] = w0[((size_t)n * ci + i) * 9 + t];
-        const std::vector<uint16_t> f0 = fnFragOf(w0p, h, 16, 16, 2);
+                    w0p[((size_t)n * 16 + i) * 9 + t] = w0.half(((size_t)n * ci + i) * 9 + t);
+        const std::vector<uint16_t> f0 = fnFragOf(PthW(w0p), h, 16, 16, 2);
         o[0] = put(f0.data(), f0.size() * sizeof(uint16_t));
-        o[1] = put(wts[p + "conv0.0.0.bias"].data(), (size_t)h * sizeof(float));
+        o[1] = put(pf.f32(p + "conv0.0.0.bias").data(), (size_t)h * sizeof(float));
         const std::vector<uint16_t> f1 = fnFragOf(wts[p + "conv0.1.0.weight"], c, h, giCg1(c), 2);
         o[2] = put(f1.data(), f1.size() * sizeof(uint16_t));
-        o[3] = put(wts[p + "conv0.1.0.bias"].data(), (size_t)c * sizeof(float));
+        o[3] = put(pf.f32(p + "conv0.1.0.bias").data(), (size_t)c * sizeof(float));
         for (int r = 0; r < 8; r++)
         {
             const std::string q = p + "convblock." + std::to_string(r) + ".";
             const std::vector<uint16_t> fr = fnFragOf(wts[q + "conv.weight"], c, c, giCgRes(c), 2);
             o[4 + 3 * r] = put(fr.data(), fr.size() * sizeof(uint16_t));
-            o[5 + 3 * r] = put(wts[q + "conv.bias"].data(), (size_t)c * sizeof(float));
-            o[6 + 3 * r] = put(wts[q + "beta"].data(), (size_t)c * sizeof(float));
+            o[5 + 3 * r] = put(pf.f32(q + "conv.bias").data(), (size_t)c * sizeof(float));
+            o[6 + 3 * r] = put(pf.f32(q + "beta").data(), (size_t)c * sizeof(float));
         }
         const std::vector<uint16_t> fl = ifnLastFrags(wts[p + "lastconv.0.weight"], c, 6, giCgRes(c), 24);
         o[28] = put(fl.data(), fl.size() * sizeof(uint16_t));
-        const std::span<const float> lb = wts[p + "lastconv.0.bias"];
+        const std::span<const float> lb = pf.f32(p + "lastconv.0.bias");
         std::vector<float> lbp(32, 0.0f);
         for (int i = 0; i < 24; i++)
             lbp[i] = lb[i];

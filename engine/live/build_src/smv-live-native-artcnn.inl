@@ -325,9 +325,9 @@ __global__ void k_acnMerge(const float* __restrict__ y, const float* __restrict_
 )ACNSRC";
 static uint64_t nativeVideoMemoryRoom();
 
-// one 32 -> 32 conv's weights [o][c][3][3] (fp32 copies of fp16 values) -> the fragment order the body kernels load:
+// one 32 -> 32 conv's weights [o][c][3][3] (fp16 as the file stores them) -> the fragment order the body kernels load:
 // [tap][kc 2][q 2][lane 32][8 halves] = n-tiles 2q and 2q + 1, each b0 (k 2t, 2t + 1) then b1 (k 2t + 8, 2t + 9)
-static void acnFrag(const float* w, uint16_t* out)
+static void acnFrag(const PthW& w, uint16_t* out)
 {
     for (int tap = 0; tap < 9; tap++)
         for (int kc = 0; kc < 2; kc++)
@@ -339,11 +339,14 @@ static void acnFrag(const float* w, uint16_t* out)
                     for (int j = 0; j < 2; j++)
                     {
                         const size_t n = (size_t)(2 * q + j) * 8 + g;
-                        auto at = [&](int c) { return w[(n * 32 + c) * 9 + tap]; };
-                        o[4 * j + 0] = halfBitsRne(at(k0));
-                        o[4 * j + 1] = halfBitsRne(at(k0 + 1));
-                        o[4 * j + 2] = halfBitsRne(at(k0 + 8));
-                        o[4 * j + 3] = halfBitsRne(at(k0 + 9));
+                        auto at = [&](int c) {
+                            const size_t i = (n * 32 + c) * 9 + tap;
+                            return w.h ? w.h[i] : halfBitsRne(w.f[i]);
+                        };
+                        o[4 * j + 0] = at(k0);
+                        o[4 * j + 1] = at(k0 + 1);
+                        o[4 * j + 2] = at(k0 + 8);
+                        o[4 * j + 3] = at(k0 + 9);
                     }
                 }
 }
@@ -387,26 +390,29 @@ static bool nativeAcnWeights(NativeRife& nr, std::string& why)
     PthFile wf;
     if (!pthStateDict(g_nativeEngineDir + L"\\artcnn\\artcnn_c4f32_dn_v1.6.2_fp16.pkl", wf, why))
         return false;
+    // a tensor the kernels take as fp32, in place (nullptr = `why`)
     auto get = [&](const std::string& k, const std::vector<int64_t>& shape) -> const float* {
-        const auto t = wf.t.find(k);
-        const auto s = wf.S.find(k);
-        if (t == wf.t.end() || s == wf.S.end() || s->second != shape)
+        if (!wf.is32(k, shape))
         {
-            why = "its weights are not ArtCNN C4's (" + k + ")";
+            why = wf.lost.empty() ? "its weights are not ArtCNN C4's (" + k + ")" : wf.notForm("ArtCNN C4's");
             return nullptr;
         }
-        return t->second.data();
+        return wf.f32(k).data();
     };
     std::vector<uint16_t> frags((size_t)5 * 9 * 32 * 32);
     std::vector<float> bias(5 * 32), w0(32 * 9 + 32), wz(4 * 32 * 9 + 4);
     for (int i = 0; i < 5; i++)
     {
         const std::string k = "conv" + std::to_string(i + 1);
-        const float* w = get(k + ".weight", {32, 32, 3, 3});
-        const float* b = w ? get(k + ".bias", {32}) : nullptr;
+        if (!wf.is(k + ".weight", {32, 32, 3, 3}))
+        {
+            why = "its weights are not ArtCNN C4's (" + k + ".weight)";
+            return false;
+        }
+        const float* b = get(k + ".bias", {32});
         if (!b)
             return false;
-        acnFrag(w, frags.data() + (size_t)i * 9 * 32 * 32);
+        acnFrag(wf.t[k + ".weight"], frags.data() + (size_t)i * 9 * 32 * 32);
         memcpy(bias.data() + (size_t)i * 32, b, 32 * sizeof(float));
     }
     const float* fw = get("first.weight", {32, 1, 3, 3});

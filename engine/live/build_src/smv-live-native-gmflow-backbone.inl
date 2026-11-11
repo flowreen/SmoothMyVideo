@@ -566,27 +566,24 @@ static bool bbNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
     if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\flownet.pkl", pf, why))
         return false;
     auto& wts = pf.t;
-    const auto& S = pf.S;
-    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
-        const auto it = S.find(n);
-        return it != S.end() && it->second == s;
-    };
     const std::string p = "backbone.";
-    bool form =
-        has(p + "conv1.weight", {64, 3, 7, 7}) && has(p + "conv2.weight", {128, 128, 1, 1}) &&
-        has(p + "conv2.bias", {128}) && has(p + "trident_conv.weight", {128, 128, 3, 3}) &&
-        has(p + "layer2.0.downsample.0.weight", {96, 64, 1, 1}) && has(p + "layer2.0.downsample.0.bias", {96}) &&
-        has(p + "layer3.0.downsample.0.weight", {128, 96, 1, 1}) && has(p + "layer3.0.downsample.0.bias", {128}) &&
-        !S.count(p + "layer1.0.downsample.0.weight") && !S.count(p + "norm1.weight");
+    // conv1 runs on fp32 weights; the biases are fp32 too
+    bool form = pf.is32(p + "conv1.weight", {64, 3, 7, 7}) && pf.is(p + "conv2.weight", {128, 128, 1, 1}) &&
+                pf.is32(p + "conv2.bias", {128}) && pf.is(p + "trident_conv.weight", {128, 128, 3, 3}) &&
+                pf.is(p + "layer2.0.downsample.0.weight", {96, 64, 1, 1}) &&
+                pf.is32(p + "layer2.0.downsample.0.bias", {96}) &&
+                pf.is(p + "layer3.0.downsample.0.weight", {128, 96, 1, 1}) &&
+                pf.is32(p + "layer3.0.downsample.0.bias", {128}) && !pf.S.count(p + "layer1.0.downsample.0.weight") &&
+                !pf.S.count(p + "norm1.weight");
     for (int i = 0; i < 12 && form; i++)
     {
         const std::string c = p + "layer" + std::to_string(1 + i / 4) + "." + std::to_string((i / 2) % 2) + ".conv" +
                               std::to_string(1 + i % 2) + ".weight";
-        form = has(c, {kBbConvShape[i][1], kBbConvShape[i][0], 3, 3});
+        form = pf.is(c, {kBbConvShape[i][1], kBbConvShape[i][0], 3, 3});
     }
     if (!form)
     {
-        why = "its weights are not gmflow's backbone";
+        why = pf.notForm("gmflow's backbone");
         return false;
     }
     blob.clear();
@@ -596,7 +593,7 @@ static bool bbNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
         memcpy(blob.data() + o, d, n);
         return o;
     };
-    off[kBbW7] = put(wts[p + "conv1.weight"].data(), (size_t)64 * 147 * sizeof(float));
+    off[kBbW7] = put(pf.f32(p + "conv1.weight").data(), (size_t)64 * 147 * sizeof(float));
     for (int i = 0; i < 12; i++)
     {
         const std::string c = p + "layer" + std::to_string(1 + i / 4) + "." + std::to_string((i / 2) % 2) + ".conv" +
@@ -607,13 +604,13 @@ static bool bbNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
     }
     const std::vector<uint16_t> d2 = gbFrag1(wts[p + "layer2.0.downsample.0.weight"], 96, 64, 6);
     off[kBbWds2] = put(d2.data(), d2.size() * sizeof(uint16_t));
-    off[kBbBds2] = put(wts[p + "layer2.0.downsample.0.bias"].data(), (size_t)96 * sizeof(float));
+    off[kBbBds2] = put(pf.f32(p + "layer2.0.downsample.0.bias").data(), (size_t)96 * sizeof(float));
     const std::vector<uint16_t> d3 = gbFrag1(wts[p + "layer3.0.downsample.0.weight"], 128, 96, 8);
     off[kBbWds3] = put(d3.data(), d3.size() * sizeof(uint16_t));
-    off[kBbBds3] = put(wts[p + "layer3.0.downsample.0.bias"].data(), (size_t)128 * sizeof(float));
+    off[kBbBds3] = put(pf.f32(p + "layer3.0.downsample.0.bias").data(), (size_t)128 * sizeof(float));
     const std::vector<uint16_t> c2 = gbFrag1(wts[p + "conv2.weight"], 128, 128, 8);
     off[kBbWc2] = put(c2.data(), c2.size() * sizeof(uint16_t));
-    off[kBbBc2] = put(wts[p + "conv2.bias"].data(), (size_t)128 * sizeof(float));
+    off[kBbBc2] = put(pf.f32(p + "conv2.bias").data(), (size_t)128 * sizeof(float));
     const std::vector<uint16_t> t1 = fnFragOf(wts[p + "trident_conv.weight"], 128, 128, 64, 8);
     off[kBbWtri] = put(t1.data(), t1.size() * sizeof(uint16_t));
     const std::vector<uint16_t> t2 = fnFragOf(wts[p + "trident_conv.weight"], 128, 128, 32, 8);

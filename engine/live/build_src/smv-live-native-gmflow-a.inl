@@ -715,31 +715,29 @@ static bool gaNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
     if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\flownet.pkl", pf, why))
         return false;
     auto& wts = pf.t;
-    const auto& S = pf.S;
-    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
-        const auto it = S.find(n);
-        return it != S.end() && it->second == s;
-    };
     const std::string fa = "feature_flow_attn.";
-    bool form = has(fa + "q_proj.weight", {128, 128}) && has(fa + "q_proj.bias", {128}) &&
-                has(fa + "k_proj.weight", {128, 128}) && has(fa + "k_proj.bias", {128}) &&
-                !S.count("transformer.layers.6.self_attn.q_proj.weight");
+    // the attentions' projections are folded pairwise before any rounding, and the LayerNorms and the biases go to the
+    // kernels as fp32
+    bool form = pf.is(fa + "q_proj.weight", {128, 128}) && pf.is32(fa + "q_proj.bias", {128}) &&
+                pf.is(fa + "k_proj.weight", {128, 128}) && pf.is32(fa + "k_proj.bias", {128}) &&
+                !pf.S.count("transformer.layers.6.self_attn.q_proj.weight");
     for (int l = 0; l < 6 && form; l++)
     {
         const std::string p = "transformer.layers." + std::to_string(l) + ".";
         for (const char* a : {"self_attn.", "cross_attn_ffn."})
         {
             for (const char* w : {"q_proj", "k_proj", "v_proj", "merge"})
-                form = form && has(p + a + w + ".weight", {128, 128}) && !S.count(p + a + w + ".bias");
-            form = form && has(p + a + "norm1.weight", {128}) && has(p + a + "norm1.bias", {128});
+                form = form && pf.is32(p + a + w + ".weight", {128, 128}) && !pf.S.count(p + a + w + ".bias");
+            form = form && pf.is32(p + a + "norm1.weight", {128}) && pf.is32(p + a + "norm1.bias", {128});
         }
-        form = form && has(p + "cross_attn_ffn.mlp.0.weight", {1024, 256}) &&
-               has(p + "cross_attn_ffn.mlp.2.weight", {128, 1024}) && has(p + "cross_attn_ffn.norm2.weight", {128}) &&
-               has(p + "cross_attn_ffn.norm2.bias", {128}) && !S.count(p + "self_attn.mlp.0.weight");
+        form = form && pf.is(p + "cross_attn_ffn.mlp.0.weight", {1024, 256}) &&
+               pf.is(p + "cross_attn_ffn.mlp.2.weight", {128, 1024}) &&
+               pf.is32(p + "cross_attn_ffn.norm2.weight", {128}) && pf.is32(p + "cross_attn_ffn.norm2.bias", {128}) &&
+               !pf.S.count(p + "self_attn.mlp.0.weight");
     }
     if (!form)
     {
-        why = "its weights are not gmflow's transformer";
+        why = pf.notForm("gmflow's transformer");
         return false;
     }
     blob.clear();
@@ -749,10 +747,10 @@ static bool gaNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
         memcpy(blob.data() + o, d, n);
         return o;
     };
-    auto half = [](const float* v, size_t n) {
-        std::vector<uint16_t> h(n);
-        for (size_t i = 0; i < n; i++)
-            h[i] = f2hRne(v[i]);
+    auto half = [](const PthW& v) {
+        std::vector<uint16_t> h(v.n);
+        for (size_t i = 0; i < v.n; i++)
+            h[i] = v.half(i);
         return h;
     };
     // the export's folds: q' = s (Wk^T Wq)^T, v' = t (Wm Wv)^T, in double, then fp32 (then fp16 by half)
@@ -767,42 +765,41 @@ static bool gaNatLoad(std::vector<uint8_t>& blob, size_t* off, std::string& why)
                 out[i * 128 + j] = (float)s;
             }
     };
-    std::vector<float> g1((size_t)384 * 128), g2((size_t)128 * 128), w2c((size_t)128 * 1024);
+    std::vector<float> g1((size_t)384 * 128), g2((size_t)128 * 128);
+    std::vector<uint16_t> w2c((size_t)128 * 1024);
     for (int l = 0; l < 6; l++)
     {
         const std::string p = "transformer.layers." + std::to_string(l) + ".";
         const std::string sa = p + "self_attn.", ca = p + "cross_attn_ffn.";
-        fold(wts[sa + "k_proj.weight"], wts[sa + "q_proj.weight"], true, g1.data());
-        fold(wts[sa + "merge.weight"], wts[sa + "v_proj.weight"], false, g1.data() + 128 * 128);
-        fold(wts[ca + "merge.weight"], wts[ca + "v_proj.weight"], false, g1.data() + 2 * 128 * 128);
-        fold(wts[ca + "k_proj.weight"], wts[ca + "q_proj.weight"], true, g2.data());
-        const std::vector<uint16_t> h1 = half(g1.data(), g1.size()), h2 = half(g2.data(), g2.size());
+        fold(pf.f32(sa + "k_proj.weight"), pf.f32(sa + "q_proj.weight"), true, g1.data());
+        fold(pf.f32(sa + "merge.weight"), pf.f32(sa + "v_proj.weight"), false, g1.data() + 128 * 128);
+        fold(pf.f32(ca + "merge.weight"), pf.f32(ca + "v_proj.weight"), false, g1.data() + 2 * 128 * 128);
+        fold(pf.f32(ca + "k_proj.weight"), pf.f32(ca + "q_proj.weight"), true, g2.data());
+        const std::vector<uint16_t> h1 = half(PthW(g1)), h2 = half(PthW(g2));
         off[7 * l] = put(h1.data(), h1.size() * sizeof(uint16_t));
         off[7 * l + 1] = put(h2.data(), h2.size() * sizeof(uint16_t));
-        const std::span<const float> w0 = wts[ca + "mlp.0.weight"], w2 = wts[ca + "mlp.2.weight"];
-        const std::vector<uint16_t> h0 = half(w0.data(), w0.size());
+        const PthW& w2 = wts[ca + "mlp.2.weight"];
+        const std::vector<uint16_t> h0 = half(wts[ca + "mlp.0.weight"]);
         off[7 * l + 2] = put(h0.data(), h0.size() * sizeof(uint16_t));
         for (int hc = 0; hc < 32; hc++)
             for (int n = 0; n < 128; n++)
                 for (int j = 0; j < 32; j++)
-                    w2c[((size_t)hc * 128 + n) * 32 + j] = w2[(size_t)n * 1024 + hc * 32 + j];
-        const std::vector<uint16_t> hc2 = half(w2c.data(), w2c.size());
-        off[7 * l + 3] = put(hc2.data(), hc2.size() * sizeof(uint16_t));
+                    w2c[((size_t)hc * 128 + n) * 32 + j] = w2.half((size_t)n * 1024 + hc * 32 + j);
+        off[7 * l + 3] = put(w2c.data(), w2c.size() * sizeof(uint16_t));
         const std::string ln[3] = {sa + "norm1.", ca + "norm1.", ca + "norm2."};
         for (int k = 0; k < 3; k++)
         {
             float gb[256];
-            memcpy(gb, wts[ln[k] + "weight"].data(), 128 * sizeof(float));
-            memcpy(gb + 128, wts[ln[k] + "bias"].data(), 128 * sizeof(float));
+            memcpy(gb, pf.f32(ln[k] + "weight").data(), 128 * sizeof(float));
+            memcpy(gb + 128, pf.f32(ln[k] + "bias").data(), 128 * sizeof(float));
             off[7 * l + 4 + k] = put(gb, sizeof(gb));
         }
     }
-    const std::vector<uint16_t> qw = half(wts[fa + "q_proj.weight"].data(), 128 * 128),
-                                kw = half(wts[fa + "k_proj.weight"].data(), 128 * 128);
+    const std::vector<uint16_t> qw = half(wts[fa + "q_proj.weight"]), kw = half(wts[fa + "k_proj.weight"]);
     off[kGaQw] = put(qw.data(), qw.size() * sizeof(uint16_t));
-    off[kGaQb] = put(wts[fa + "q_proj.bias"].data(), 128 * sizeof(float));
+    off[kGaQb] = put(pf.f32(fa + "q_proj.bias").data(), 128 * sizeof(float));
     off[kGaKw] = put(kw.data(), kw.size() * sizeof(uint16_t));
-    off[kGaKb] = put(wts[fa + "k_proj.bias"].data(), 128 * sizeof(float));
+    off[kGaKb] = put(pf.f32(fa + "k_proj.bias").data(), 128 * sizeof(float));
     return true;
 }
 

@@ -360,7 +360,7 @@ static void fnKernelText(std::string& s, const std::vector<float>& w0, const std
 
 // a conv's weights [co][ci][3][3] in fnConvT's fragment order [z][step][q][lane][8 halves] (8 nb outputs a z; lane's
 // B registers for n-tiles 2q, 2q + 1: n = 8 (2q (+ 1)) + lane / 4, k = 2 (lane % 4) (+ 1, + 8, + 9)), rounded to fp16
-static std::vector<uint16_t> fnFragOf(std::span<const float> w, int co, int ci, int cg, int nb)
+static std::vector<uint16_t> fnFragOf(const PthW& w, int co, int ci, int cg, int nb)
 {
     static const int kOfs[4] = {0, 1, 8, 9};
     const int kcn = cg / 16, nq = nb / 2;
@@ -377,7 +377,7 @@ static std::vector<uint16_t> fnFragOf(std::span<const float> w, int co, int ci, 
                                 {
                                     const int n = z * nb * 8 + (2 * q + hf) * 8 + (lane >> 2);
                                     const int c = gi * cg + kc * 16 + (lane & 3) * 2 + kOfs[j];
-                                    out[o++] = f2hRne(w[((size_t)n * ci + c) * 9 + tap]);
+                                    out[o++] = w.half(((size_t)n * ci + c) * 9 + tap);
                                 }
     return out;
 }
@@ -393,33 +393,30 @@ static bool fnNatLoad(std::vector<uint8_t>& blob, size_t* off, std::vector<float
     if (!pthStateDict(g_nativeEngineDir + L"\\GMFSS_Fortuna\\train_log\\feat.pkl", pf, why))
         return false;
     auto& wts = pf.t;
-    const auto& S = pf.S;
-    auto has = [&](const std::string& n, const std::vector<int64_t>& s) {
-        const auto it = S.find(n);
-        return it != S.end() && it->second == s;
-    };
-    bool form = wts.size() == 18;
+    // the slopes, the biases and conv 0's weights go to the kernels as fp32
+    bool form = wts.size() == 18 && pf.is32("block1.1.weight", {kFnCh[1], kFnCh[0], 3, 3});
     for (int b = 0; b < 3 && form; b++)
     {
         const std::string p = "block" + std::to_string(b + 1) + ".";
         const int64_t ci = kFnCh[b], co = kFnCh[b + 1];
-        form = has(p + "0.weight", {1}) && has(p + "2.weight", {1}) && has(p + "1.weight", {co, ci, 3, 3}) &&
-               has(p + "1.bias", {co}) && has(p + "3.weight", {co, co, 3, 3}) && has(p + "3.bias", {co});
+        form = pf.is32(p + "0.weight", {1}) && pf.is32(p + "2.weight", {1}) && pf.is(p + "1.weight", {co, ci, 3, 3}) &&
+               pf.is32(p + "1.bias", {co}) && pf.is(p + "3.weight", {co, co, 3, 3}) && pf.is32(p + "3.bias", {co});
         if (form)
         {
-            slope[2 * b] = wts[p + "0.weight"][0];
-            slope[2 * b + 1] = wts[p + "2.weight"][0];
+            slope[2 * b] = pf.f32(p + "0.weight")[0];
+            slope[2 * b + 1] = pf.f32(p + "2.weight")[0];
             // the A fragments' LeakyRelu = max(x, a x), exact for a slope up to 1
             form = slope[2 * b] <= 1.0f && slope[2 * b + 1] <= 1.0f;
         }
     }
     if (!form)
     {
-        why = "its weights are not GMFSS's FeatureNet";
+        why = pf.notForm("GMFSS's FeatureNet");
         return false;
     }
-    w0.assign(wts["block1.1.weight"].begin(), wts["block1.1.weight"].end());
-    b0.assign(wts["block1.1.bias"].begin(), wts["block1.1.bias"].end());
+    const std::span<const float> c0w = pf.f32("block1.1.weight"), c0b = pf.f32("block1.1.bias");
+    w0.assign(c0w.begin(), c0w.end());
+    b0.assign(c0b.begin(), c0b.end());
     blob.clear();
     auto put = [&](const void* p, size_t n) {
         const size_t o = (blob.size() + 255) & ~(size_t)255;
@@ -433,7 +430,7 @@ static bool fnNatLoad(std::vector<uint8_t>& blob, size_t* off, std::vector<float
         const int ci = kFnCh[c / 2 + 1], co = kFnCh[(c + 1) / 2 + 1];
         const std::vector<uint16_t> wf =
             fnFragOf(wts[std::string(kConv[c]) + ".weight"], co, ci, (c & 1) ? 32 : 64, kFnNb[c]);
-        const std::span<const float> bs = wts[std::string(kConv[c]) + ".bias"];
+        const std::span<const float> bs = pf.f32(std::string(kConv[c]) + ".bias");
         off[2 * c] = put(wf.data(), wf.size() * sizeof(uint16_t));
         off[2 * c + 1] = put(bs.data(), bs.size() * sizeof(float));
     }

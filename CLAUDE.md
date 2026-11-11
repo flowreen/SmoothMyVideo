@@ -33,7 +33,7 @@ a version bump in `package.json`.
 | `scripts/*.ts` | build and setup scripts; Node runs them directly, no compile step |
 | `engine/live/build_src/` | the native host's source; `build.bat` there builds `engine/live/smv-live.exe` |
 | `engine/<name>/build_src/` | one bridge each, built into the DLL or exe beside it: `dlssg` (DLSS frame generation helper), `dlssnr` (DLSS 5), `fsrfg` + `fsrup` (AMD FSR), `xess` (Intel XeSS), `rtxvideo` (RTX VSR, RTX HDR), `nvoffruc` (Smooth Motion), `update` (the updater) |
-| `engine/rife`, `engine/GMFSS_Fortuna`, `engine/realesrgan`, `engine/artcnn` | the models' weights as their authors publish them, read in place |
+| `engine/rife`, `engine/GMFSS_Fortuna`, `engine/realesrgan`, `engine/artcnn` | the models' weights, read in place: their authors' values, each tensor stored as fp16 where the host's loader rounds it to fp16 first and as fp32 where a kernel reads fp32 |
 
 ### The native host is one translation unit
 
@@ -144,6 +144,11 @@ source paths in the table above; never search from the repo root.
 * A new, renamed or removed `SMV_*` environment lever changes its row in DEVELOPMENT.md's "Environment variables"
   table in the same change: that table is the one list of the levers, and the lint fails when it is not complete.
 * CUDA kernels use no 64-bit floats.
+* A weight a kernel reads as fp32, or the host computes with before rounding, is checked with `PthFile::is32` in its
+  loader's form test and read with `f32`; a weight the loader rounds to fp16 goes through `PthW::half`. A weight file
+  may store a tensor as fp16 only when every loader reads it through `half`: a loader that asks `is32` of an
+  fp16-stored tensor refuses the file, so a loader that starts reading a tensor as fp32 needs that tensor stored as
+  fp32 again first.
 * A speed change must not change the picture. A model is called the way its author calls it. Nothing that changes
   the look runs unless the user ticked it.
 * Comments and these docs say what the code does and why. No history: no dates, no task names, no "used to".
