@@ -150,6 +150,7 @@ function startRun() {
   $('outcodec').disabled = true;
   $('rtxvsr').disabled = true;
   $('vsrq').disabled = true;
+  $('vsrclean').disabled = true;
   $('fsrup').disabled = true;
   $('a4kup').disabled = true;
   $('a4kaa').disabled = true;

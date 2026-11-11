@@ -288,7 +288,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore | --restore-model PKL|ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-skin F] [--nr-automask 0|1] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--xess-fg] [--nvvfg] [--dlssg] [--no-gpu-fit]
-  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
+  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4|16..19] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
@@ -566,7 +566,11 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   `--rtx-vsr` uses RTX Video Super Resolution for an enlarging resize (the GUI ticks it by
   default), otherwise Lanczos. `--vsr-quality N` picks its quality level, 1..4 (default 4 = Ultra, the GUI's slider
   beside the box): the network runs at the input size, so a level's GPU time per frame is the same at any output size
-  (1080p in, RTX 5090 Laptop: 4 = 5.4 ms, 3 = 3.9, 2 = 1.8, 1 = 1.4); the host logs the level when it is not 4. The bridge reads and writes R, G, B, A bytes, the order the host's VSR buffers hold;
+  (1080p in, RTX 5090 Laptop: 4 = 5.4 ms, 3 = 3.9, 2 = 1.8, 1 = 1.4); the host logs the level when it is not 4.
+  `--vsr-quality 16..19` (the GUI's Disable artifact removal tick: the slider's level + 15) asks the same four levels of NVIDIA's
+  high-bitrate models, made for high-bitrate or lossless sources with few compression artifacts: they skip the
+  standard models' removal of compression artifacts, so clean detail is not degraded (16 = 1.4 ms, 17 = 2.3, 18 =
+  4.7, 19 = 8.1 on the same GPU); the host logs `RTX VSR for a high quality source`. Any other value runs 4. The bridge reads and writes R, G, B, A bytes, the order the host's VSR buffers hold;
   a live slot takes them as B, G, R, A in the store's one pass. `--fsr-upscale` puts AMD FSR 4.1.2 (its INT8 model) in that same resize instead
   (the two exclude each other; with both, RTX VSR keeps it and the host says so): AMD's signed FidelityFX loader +
   upscaler in `engine/fsrup` behind our `smv_fsrup_bridge.dll`, which sets the upscaler's GPU check (see "AMD FSR
@@ -927,7 +931,7 @@ mean); a Reset on every evaluate made the pass a pure function of the frame (0 o
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME [--xess-fg] --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale --upscale H --restore
+  --backend NAME [--xess-fg] --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4|16..19] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --xess-upscale --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-skin F --nr-automask 0|1 --nr-style 0|1|2 --nr-passes 1..20 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title
@@ -1143,7 +1147,9 @@ NVIDIA's own Video Effects runtime in place of a bridge
 automatic shot-change answer off. The effect reads its surfaces as R G B A bytes whatever their descriptor says, so
 the route packs a session's surfaces in that order. HDR planes use the effect's other image family, RGB10A2 (one
 32-bit word a pixel, red in the low ten bits): their codes go in at 10 bits as they are stored, PQ or HLG, and the
-tween comes back at 10 bits (`SMV_VFG_HDR10=0` sends the 8-bit codes instead).
+tween comes back at 10 bits. SDR frames that come in at more than 8 bits (`--pixfmt rgb48le`) take the same family,
+so a 10-bit file's tweens keep its precision; 8-bit frames go as bytes, which hold all of them
+(`SMV_VFG_HDR10=0` sends 8-bit codes in both cases).
 `--fps` mode runs there for every one of these models:
 `native.ts` hands `--fps-ratio` (its ratio as the shortest text that parses back to the same double) and the
 host renders the fps loop (DRBA: its offset loop) on the same grid of pair fractions in the
@@ -1932,7 +1938,7 @@ named here, and on a name here that no source holds.
 | `SMV_FSRFG_OVERLAP=0` / `SMV_FSRFG_OVERLAP=fail` | AMD FSR frame generation: every call's vectors in its turn instead of the next call's on a side stream during each FSR call (tree levels with two or more calls, x4 and up) / the side stream's setup fails after a whole one, the trigger of its fallback (`the side stream did not start` with derived vectors, `the side Optical Flow session did not start` with `SMV_FSRFG_CHILDMV=0`; route gate only); A/B levers, never a product setting |
 | `SMV_FRUC_INSTANCES` / `SMV_FRUC_INST_FAILAT` | Smooth Motion (the first one AMD FSR frame generation too): the most bridge instances (1..9; recursive midpoints use one per tree level on both routes, default 9 = to x512, 5 = to x32; the direct-t scheme defaults to 4 live, 1 offline; 1 = one instance, which caps the midpoint depth at 1) / the instance index whose create fails, the trigger of the fallback (route gate only) |
 | `SMV_FRUC_SDR_PAIRS=0` | on HDR planes Smooth Motion gets every frame pair as the 8-bit HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
-| `SMV_VFG_HDR10=0` | on HDR planes NVIDIA Video Frame Generation gets every frame pair as the 8-bit HDR codes instead of 10-bit R10G10B10A2 words; A/B lever, never a product setting |
+| `SMV_VFG_HDR10=0` | NVIDIA Video Frame Generation gets every frame pair as 8-bit codes where it would take 10-bit R10G10B10A2 words (HDR planes, SDR frames of more than 8 bits); A/B lever, never a product setting |
 | `SMV_FRUC_PIPE=0` / `=force` | Live Smooth Motion: never pipeline the midpoint tree across pairs / pipeline every x4 or deeper ladder, the fixed multipliers too (gates; see "Pipelined across pairs") |
 | `SMV_FSRFG_PIPE=0` / `=force` / `=serial` | Live AMD FSR frame generation: never pipeline the midpoint tree across pairs / pipeline every ladder and fixed multiplier, x2 included (gates) / the same with the new pair's level-1 Optical Flow after the shown pair's deeper calls (an A/B lever); unset = the priced automatic route (see "Pipelined across pairs") |
 | `SMV_FRUC_STEPUP=0` | Live Smooth Motion / AMD FSR 4 FG: a target between two ladder nodes runs the largest node that fits instead of the node above it (gates; see "The node above the target") |

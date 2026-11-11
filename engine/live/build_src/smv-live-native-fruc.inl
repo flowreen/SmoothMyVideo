@@ -180,9 +180,11 @@ static bool nativeFrucSetup(NativeRife& nr)
     nr.vfR10 = false;
     if (nr.vfg)
     {
-        // HDR planes go to the effect as R10G10B10A2 words (SMV_VFG_HDR10=0: as their 8-bit codes)
+        // HDR planes, and SDR frames that came in at more than 8 bits, go to the effect as R10G10B10A2 words
+        // (SMV_VFG_HDR10=0: as their 8-bit codes); 8-bit frames stay R G B A bytes, which hold all of them
         char ev[8] = {};
-        nr.vfR10 = nr.encPost && !(GetEnvironmentVariableA("SMV_VFG_HDR10", ev, sizeof(ev)) > 0 && ev[0] == '0');
+        nr.vfR10 = (nr.encPost || nr.vfIn16) &&
+                   !(GetEnvironmentVariableA("SMV_VFG_HDR10", ev, sizeof(ev)) > 0 && ev[0] == '0');
         if (!nativeVfgSetup(nr))
             return false;
     }
@@ -293,6 +295,8 @@ static bool nativeFrucSetup(NativeRife& nr)
         LOG("native: vfg: HDR planes: every pair as its 10-bit HDR codes\n");
     else if (nr.encPost && nr.vfg)
         LOG("native: vfg: HDR planes: every pair as the 8-bit HDR codes (SMV_VFG_HDR10=0)\n");
+    else if (nr.vfR10)
+        LOG("native: vfg: frames of more than 8 bits: every pair as its 10-bit codes\n");
     else if (nr.encPost)
         LOG("native: fruc: HDR planes: %s\n",
             nr.frSdrOn

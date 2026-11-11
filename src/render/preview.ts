@@ -187,8 +187,10 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     );
   a.input = pos[0];
   if (!a.out) throw new Error('the following arguments are required: --out');
-  if (![1, 2, 3, 4].includes(a.vsr_quality))
-    throw new Error(`argument --vsr-quality: invalid choice: ${a.vsr_quality} (choose from 1, 2, 3, 4)`);
+  if (![1, 2, 3, 4, 16, 17, 18, 19].includes(a.vsr_quality))
+    throw new Error(
+      `argument --vsr-quality: invalid choice: ${a.vsr_quality} (choose from 1, 2, 3, 4, 16, 17, 18, 19)`,
+    );
   if (![0, 1, 2].includes(a.nr_style))
     throw new Error(`argument --nr-style: invalid choice: ${a.nr_style} (choose from 0, 1, 2)`);
   if (!(a.nr_passes >= 1 && a.nr_passes <= 20))

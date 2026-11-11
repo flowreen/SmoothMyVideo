@@ -168,9 +168,9 @@ static std::atomic<bool> g_noHudLat{false}; // --no-hud-latency: keep the readou
 static bool g_noFillMouse = false;          // --no-fill-mouse: Fill leaves the mouse alone (FillMouse)
 static double g_sharpen = 0.0;              // --sharpen S: Adaptive Sharpen strength 0..2 (both routes)
 static bool g_rtxVsr = false;               // --rtx-vsr: forwarded to the server (VSR fill upscaler)
-static int g_vsrQuality = 4;                // --vsr-quality N: RTX VSR's quality level 1..4, 4 = Ultra (both routes)
-static bool g_fsrUp = false;                // --fsr-upscale: AMD FSR upscaling in RTX VSR's resize (both routes)
-static bool g_a4kUp = false;                // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (both routes)
+static int g_vsrQuality = 4;   // --vsr-quality N: RTX VSR's level 1..4, 4 = Ultra; 16..19 = its high-bitrate models
+static bool g_fsrUp = false;   // --fsr-upscale: AMD FSR upscaling in RTX VSR's resize (both routes)
+static bool g_a4kUp = false;   // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (both routes)
 static bool g_a4kAA = false;   // --anime4k-aa: Anime4K's Mode A+A, Restore CNN UL on the first x2 pass's 2x frame too
 static bool g_acnUp = false;   // --artcnn: ArtCNN C4F32_DN's x2 in RTX VSR's resize (both routes)
 static bool g_xessUp = false;  // --xess-upscale: Intel XeSS-SR in RTX VSR's resize (both routes)
@@ -2294,6 +2294,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
             return 2;
         nr.fruc = true;
         nr.vfg = true;
+        nr.vfIn16 = oa.fmt16;
         nr.ph = h;
         nr.pw = w;
         nr.w = w;

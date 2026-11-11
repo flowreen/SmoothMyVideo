@@ -166,6 +166,8 @@
   "vsrq.tip": "RTX VSR's quality level. 4 = Ultra, the highest (the default); a lower level costs less GPU time a frame: 3 about 3/4 of level 4's, 2 about 1/3, 1 about 1/4.",
   "vsrq.label": "Quality",
   "vsrq.aria": "RTX VSR quality",
+  "vsrclean.label": "Disable artifact removal (for high quality sources)",
+  "vsrclean.tip": "For high-bitrate or lossless sources (for example ProRes or high-quality H.265) that have few compression artifacts. NVIDIA's high-bitrate models then upscale without removing compression artifacts, so detail that is already clean is not degraded. Leave it off for typical compressed video (streams, web video): RTX VSR's standard models remove compression artifacts while upscaling. At level 4 the high-bitrate models take about 1.5 times the GPU time a frame.",
   "fsrup.tip": "Version: AMD FSR 4.1.2 upscaling (FidelityFX SDK 2.4.0). Motion vectors: NVIDIA Optical Flow at Slow, its highest quality level.",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(AMD's AI upscaler, used when <span class='vonly'>the Size is above the source</span><span class='lonly'>Fill screen or a DLSS mode below DLAA enlarges</span>)",

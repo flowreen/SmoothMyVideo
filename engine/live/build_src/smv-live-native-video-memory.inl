@@ -105,8 +105,10 @@ static uint64_t nativeVideoMemoryRoom()
 // (NVAPI's free figure from the ring's creation to the steady session, a quarter on top of the measured): DLSS 5's
 // first frames, 120 MiB + 16.6 a megapixel a pass (157 / 226 / 465 MiB at 1920x1080 with 1 / 3 / 10 passes, 139 / 190
 // at 854x480 with 3 / 10: its per-size buffers exist before the ring on this route, so they are not added), and
-// FRUC's NvOFFRUC buffers with its second midpoint instance, 233 MiB + 138 a padded megapixel of the model
-// frame (296 / 521 MiB at 896x512 / 1920x1088), and AMD FSR 4 frame generation's second midpoint instance with its node
+// FRUC's second midpoint instance with NvOFFRUC's buffers for it, 297 / 353 / 511 / 716 / 1222 MiB at 854x480 /
+// 1280x720 / 1920x1080 / 2560x1440 / 3840x2160 (x4, the same in both sessions of a size, from the settled figure at
+// the ring's fit; x2 runs one instance and adds 8 to 72 MiB), a quarter on top, as a line by the padded megapixel of
+// the model frame that covers every size, 341 + 147, and AMD FSR 4 frame generation's second midpoint instance with its node
 // frames and derived level-2+ vectors (fsrfgDeriveOn: the side stream's two vector buffers), 1249 MiB at any size (the
 // whole GPU's rise, x4 against x2, at five sizes from 854x480 to 3840x2160: 538 to 999 MiB, 161 to 230 at 2560x1440,
 // a quarter on top; the card's figure, not the process's own memory counter, which counts a D3D12 buffer CUDA imports
@@ -136,7 +138,7 @@ static uint64_t nativeVideoMemoryRoom()
 // the step rule above, raised to cover its 854x480 measure: 1555 + 6309). Intel XeSS-FG's levels by the same measure
 // and rule from its own rows (3840x2160 to x64, 2560x1440 to x128, with the fit off): 362 + 103, 362 + 511, 362 + 928,
 // 362 + 1506, 362 + 2589, 596 + 4063, x512 1275 + 7011 a megapixel.
-constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 290.0, kFrucLateMp = 173.0;
+constexpr double kNrLiveLateBase = 150.0, kFrucLateBase = 341.0, kFrucLateMp = 147.0;
 constexpr double kVfgLateBase = 1085.0, kVfgLateMp = 84.0;
 constexpr double kFsrfgLateBase = 1251.0, kFsrfgLateMp = 88.0, kFsrfgLateDerBase = 1249.0, kFsrfgLateDerMp = 0.0,
                  kFsrfgOwnDevice = 300.0;

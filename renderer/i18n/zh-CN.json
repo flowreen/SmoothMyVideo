@@ -166,6 +166,8 @@
   "vsrq.tip": "RTX VSR 的质量级别。4 = Ultra，最高（默认）；级别越低，每帧 GPU 耗时越少：3 约为级别 4 的 3/4，2 约 1/3，1 约 1/4。",
   "vsrq.label": "质量",
   "vsrq.aria": "RTX VSR 质量",
+  "vsrclean.label": "关闭伪影去除（适用于高质量片源）",
+  "vsrclean.tip": "适用于几乎没有压缩伪影的高码率或无损片源（例如 ProRes 或高质量 H.265）。此时 NVIDIA 的高码率模型在放大时不去除压缩伪影，以免损伤本来就干净的细节。普通压缩视频（流媒体、网络视频）请保持关闭：RTX VSR 的标准模型会在放大的同时去除压缩伪影。在等级 4 下，高码率模型每帧约需 1.5 倍的 GPU 时间。",
   "fsrup.tip": "版本：AMD FSR 4.1.2 放大（FidelityFX SDK 2.4.0）。运动矢量：NVIDIA Optical Flow 的 Slow 档（最高质量级别）。",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "（AMD 的 AI 放大，在<span class='vonly'>尺寸大于源视频</span><span class='lonly'>填满屏幕或 DLSS 模式低于 DLAA 需要放大</span>时使用）",

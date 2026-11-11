@@ -40,6 +40,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   $('outcodec').disabled = false;
   $('rtxvsr').disabled = false;
   $('vsrq').disabled = false;
+  $('vsrclean').disabled = false;
   $('fsrup').disabled = false;
   $('a4kup').disabled = false;
   a4kAaUi();

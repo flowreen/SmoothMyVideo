@@ -166,6 +166,8 @@
   "vsrq.tip": "Die Qualitätsstufe von RTX VSR. 4 = Ultra, die höchste (Standard); eine niedrigere Stufe kostet weniger GPU-Zeit pro Bild: 3 etwa 3/4 von Stufe 4, 2 etwa 1/3, 1 etwa 1/4.",
   "vsrq.label": "Qualität",
   "vsrq.aria": "RTX-VSR-Qualität",
+  "vsrclean.label": "Artefaktentfernung aus (für hochwertige Quellen)",
+  "vsrclean.tip": "Für Quellen mit hoher Bitrate oder ohne Verlust (zum Beispiel ProRes oder hochwertiges H.265), die kaum Kompressionsartefakte haben. NVIDIAs High-Bitrate-Modelle skalieren dann hoch, ohne Kompressionsartefakte zu entfernen, damit bereits saubere Details nicht leiden. Für übliches komprimiertes Video (Streams, Webvideo) aus lassen: Die Standardmodelle von RTX VSR entfernen Kompressionsartefakte beim Hochskalieren. Auf Stufe 4 brauchen die High-Bitrate-Modelle etwa das 1,5-Fache an GPU-Zeit pro Bild.",
   "fsrup.tip": "Version: AMD FSR 4.1.2 Upscaling (FidelityFX SDK 2.4.0). Bewegungsvektoren: NVIDIA Optical Flow auf Slow, der höchsten Qualitätsstufe.",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(AMDs KI-Hochskalierer, genutzt wenn <span class='vonly'>die Größe über der Quelle liegt</span><span class='lonly'>Bildschirm füllen oder ein DLSS-Modus unter DLAA vergrößert</span>)",

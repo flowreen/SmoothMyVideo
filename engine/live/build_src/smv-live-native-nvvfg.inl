@@ -11,7 +11,8 @@
 // so the route packs and unpacks a vfg session's surfaces in that order. Its other image family is RGB10A2, one
 // 32-bit word a pixel with red in the low ten bits, then green, blue and two alpha bits; all three surfaces of a
 // session are of one family. A session on HDR planes uses that one (nr.vfR10): the planes' codes go in at 10 bits as
-// they are stored, PQ or HLG, and the tween comes back at 10 bits.
+// they are stored, PQ or HLG, and the tween comes back at 10 bits. So does a file render whose SDR frames came in at
+// more than 8 bits; 8-bit frames (and Live's SDR capture) use the R G B A bytes.
 //
 // Pinned: the model's highest quality mode, and NVIDIA's automatic shot-change answer off (with it on, a pair it
 // takes for a cut gets a copy of a real frame in place of a tween).

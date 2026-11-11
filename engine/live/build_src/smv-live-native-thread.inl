@@ -700,7 +700,7 @@ static void nativeLiveSets(NativeRife& nr)
         else if (key == "vsrq" && !nr.fsrUp && !nr.a4kUp && !nr.acnUp)
         {
             // RTX VSR's level: read at every evaluate while it runs; held for its start in place (nativeUpSwitch)
-            nr.vsrSet.QualityLevel = clampU(v, 1.0, 4.0);
+            nr.vsrSet.QualityLevel = vsrLevelOk((int)v) ? (uint32_t)v : clampU(v, 1.0, 4.0);
             if (!nr.vsr)
             {
                 LOG("live set: vsrq %s (held for RTX VSR's start)\n", val.c_str());

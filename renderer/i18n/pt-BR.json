@@ -166,6 +166,8 @@
   "vsrq.tip": "O nível de qualidade do RTX VSR. 4 = Ultra, o mais alto (padrão); um nível menor custa menos tempo de GPU por quadro: 3 cerca de 3/4 do nível 4, 2 cerca de 1/3, 1 cerca de 1/4.",
   "vsrq.label": "Qualidade",
   "vsrq.aria": "Qualidade do RTX VSR",
+  "vsrclean.label": "Desativar a remoção de artefatos (para fontes de alta qualidade)",
+  "vsrclean.tip": "Para fontes de alta taxa de bits ou sem perdas (por exemplo ProRes ou H.265 de alta qualidade) com poucos artefatos de compressão. Os modelos de alta taxa de bits da NVIDIA ampliam então sem remover artefatos de compressão, para não degradar detalhes que já estão limpos. Deixe desmarcado para vídeo comprimido comum (streaming, vídeo da web): os modelos padrão do RTX VSR removem os artefatos de compressão ao ampliar. No nível 4, os modelos de alta taxa de bits levam cerca de 1,5 vez o tempo de GPU por quadro.",
   "fsrup.tip": "Versão: ampliação AMD FSR 4.1.2 (FidelityFX SDK 2.4.0). Vetores de movimento: NVIDIA Optical Flow em Slow, seu nível de maior qualidade.",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(o ampliador por IA da AMD, usado quando <span class='vonly'>o Tamanho é maior que a origem</span><span class='lonly'>Preencher tela ou um modo DLSS abaixo de DLAA amplia a imagem</span>)",

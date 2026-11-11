@@ -197,13 +197,17 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
     nr.sharpen = (float)(g_sharpen < 0.0 ? 0.0 : (g_sharpen > 2.0 ? 2.0 : g_sharpen));
     // RTX VSR's quality level (--vsr-quality, the app's slider): 1..4, 4 = Ultra by default; level 0 (bicubic) is left
     // out, since an unticked box already gives Lanczos. The network runs at the input size, so a level's price is the same
-    // at any output size
-    nr.vsrSet.QualityLevel = (uint32_t)(g_vsrQuality < 1 ? 1 : (g_vsrQuality > 4 ? 4 : g_vsrQuality));
+    // at any output size. 16..19 = the same levels of NVIDIA's high-bitrate models (the app's High quality source tick)
+    nr.vsrSet.QualityLevel = (uint32_t)(vsrLevelOk(g_vsrQuality) ? g_vsrQuality : (g_vsrQuality < 1 ? 1 : 4));
     if (g_rtxVsr)
     {
         if (g_vsrQuality != (int)nr.vsrSet.QualityLevel)
             LOG("native: --vsr-quality %d is outside 1..4, RTX VSR runs quality %u\n", g_vsrQuality,
                 nr.vsrSet.QualityLevel);
+        else if (nr.vsrSet.QualityLevel > 4)
+            LOG("native: RTX VSR for a high quality source: quality %u of 4 of NVIDIA's high-bitrate models, no removal of "
+                "compression artifacts\n",
+                nr.vsrSet.QualityLevel - 15);
         else if (nr.vsrSet.QualityLevel != 4)
             LOG("native: RTX VSR quality %u of 4\n", nr.vsrSet.QualityLevel);
         wchar_t vh[8]{};

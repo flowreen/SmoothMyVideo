@@ -15,7 +15,15 @@ struct RtxThdrSetting
 struct RtxVsrSetting
 {
     uint32_t QualityLevel;
-}; // 0 bicubic .. 4 Ultra; the host asks --vsr-quality's level, 1..4 (vsrSet, default 4)
+}; // NVIDIA's value; the host asks --vsr-quality's level (vsrSet, default 4)
+
+// a --vsr-quality value RTX VSR runs: 1..4 = low .. Ultra of NVIDIA's standard models (made for typical compressed
+// video: they remove compression artifacts while upscaling), 16..19 = the same four levels of its high-bitrate
+// models (for sources with few compression artifacts: they skip that removal, so clean detail is not degraded)
+static bool vsrLevelOk(int q)
+{
+    return (q >= 1 && q <= 4) || (q >= 16 && q <= 19);
+}
 typedef void (*PFN_rtxvSetModelPath)(const wchar_t*);
 typedef unsigned int (*PFN_rtxCreate)(void*, void*, int, unsigned int, unsigned int);
 typedef unsigned int (*PFN_rtxEvalThdr)(void*, void*, RtxRect, RtxRect, RtxThdrSetting*);

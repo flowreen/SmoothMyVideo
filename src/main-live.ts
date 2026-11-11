@@ -89,10 +89,11 @@ let liveTarget = 60; // adaptive output fps target, inherited from the renderer'
 let liveSharpen = 0; // live Adaptive Sharpen strength 0..2, inherited from the Sharpen controls (0 = off)
 let liveVsr = false; // RTX VSR as the live upscaler, inherited from the RTX VSR checkbox
 let liveVsrQ = 4; // RTX VSR's quality level 1..4, inherited from its slider (4 = Ultra)
-/** RTX VSR's quality level from the renderer's slider: 1..4, anything else = 4 (Ultra, the default). */
+/** RTX VSR's quality level from the renderer: 1..4 (its slider), or 16..19 = the same levels of NVIDIA's
+ * high-bitrate models (the Disable artifact removal tick); anything else = 4 (Ultra, the default). */
 export function vsrQ(v: number | undefined): number {
   const q = Math.round(Number(v));
-  return q >= 1 && q <= 4 ? q : 4;
+  return (q >= 1 && q <= 4) || (q >= 16 && q <= 19) ? q : 4;
 }
 /** The host flag for a quality level; none for 4, the host's own default. */
 export function vsrQArgs(q: number): string[] {

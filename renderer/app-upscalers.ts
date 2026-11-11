@@ -214,18 +214,30 @@ async function checkXessReady() {
   $('xesssetup').style.display = xessReady.ready ? 'none' : 'block';
 }
 // RTX VSR's quality level 1..4 (default 4 = Ultra, the highest): the slider beside the box, shown while it is ticked; it
-// persists, and goes to the host as --vsr-quality when it is not 4
-function vsrQuality() {
+// persists, and goes to the host as --vsr-quality when it is not 4. The Disable artifact removal tick beside it asks the same
+// level of NVIDIA's high-bitrate models (16..19), which skip the removal of compression artifacts
+function vsrLevel() {
   const q = Math.round(+$('vsrq').value);
   return q >= 1 && q <= 4 ? q : 4;
 }
+function vsrQuality() {
+  return vsrLevel() + ($('vsrclean').checked ? 15 : 0);
+}
 function syncVsrQ() {
   $('vsrqwrap').style.display = $('rtxvsr').checked ? 'flex' : 'none';
-  $('vsrqnum').textContent = String(vsrQuality());
+  $('vsrqnum').textContent = String(vsrLevel());
 }
 const savedVsrQ = localStorage.getItem('vsrQuality');
 if (savedVsrQ !== null) $('vsrq').value = savedVsrQ;
+$('vsrclean').checked = localStorage.getItem('vsrClean') === '1';
 syncVsrQ();
+$('vsrclean').onchange = () => {
+  localStorage.setItem('vsrClean', $('vsrclean').checked ? '1' : '0');
+  try {
+    lvSendOpts();
+  } catch {}
+  refreshPreviewIfOpen();
+};
 $('vsrq').oninput = () => {
   localStorage.setItem('vsrQuality', $('vsrq').value);
   syncVsrQ();

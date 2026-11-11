@@ -354,12 +354,12 @@ struct NativeRife
     // NVIDIA Video Frame Generation (vfg, `--nvvfg`): the FRUC route above (fruc is set too: its surfaces and their
     // rotation) with the "VideoFrameGeneration" effect of NVIDIA's Video Effects runtime in place of NvOFFRUC (frucDir
     // = the folder holding the runtime's four files). The surfaces hold R G B A bytes (the effect's order); on HDR
-    // planes they hold one R10G10B10A2 word a pixel instead (vfR10: the planes' codes at 10 bits, as stored;
-    // SMV_VFG_HDR10=0 = their 8-bit codes). One call a tween at any time between the pair: no midpoint tree, one
-    // instance, the unpadded geometry. Live: the handoff answers `engine=nvvfg` with that geometry and `NATIVE-PATH
-    // nvvfg=` (the runtime's folder); with no tree, a session's ladders and prices are the any-time models' (a tween's
-    // own time).
-    bool vfg = false, vfR10 = false;
+    // planes, and for a file whose frames came in at more than 8 bits (vfIn16), they hold one R10G10B10A2 word a pixel
+    // instead (vfR10: the planes' codes at 10 bits, as stored; SMV_VFG_HDR10=0 = their 8-bit codes). One call a tween
+    // at any time between the pair: no midpoint tree, one instance, the unpadded geometry. Live: the handoff answers
+    // `engine=nvvfg` with that geometry and `NATIVE-PATH nvvfg=` (the runtime's folder); with no tree, a session's
+    // ladders and prices are the any-time models' (a tween's own time).
+    bool vfg = false, vfR10 = false, vfIn16 = false;
     void* vfEff = nullptr; // this session's effect
     // AMD FSR frame generation (fsrfg): the FRUC route above (fruc is set too: its ladders, its midpoint tree, its
     // surfaces) with our smv_fsrfg_bridge.dll (AMD's FSR 4 ML frame generation on vkd3d-proton) in place of NvOFFRUC.

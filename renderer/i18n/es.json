@@ -166,6 +166,8 @@
   "vsrq.tip": "El nivel de calidad de RTX VSR. 4 = Ultra, el más alto (predeterminado); un nivel más bajo cuesta menos tiempo de GPU por fotograma: 3 cerca de 3/4 del nivel 4, 2 cerca de 1/3, 1 cerca de 1/4.",
   "vsrq.label": "Calidad",
   "vsrq.aria": "Calidad de RTX VSR",
+  "vsrclean.label": "Desactivar la eliminación de artefactos (para fuentes de alta calidad)",
+  "vsrclean.tip": "Para fuentes de alta tasa de bits o sin pérdida (por ejemplo ProRes o H.265 de alta calidad) con pocos artefactos de compresión. Los modelos de alta tasa de bits de NVIDIA escalan entonces sin eliminar artefactos de compresión, para no degradar el detalle que ya está limpio. Déjalo desactivado para vídeo comprimido habitual (streaming, vídeo web): los modelos estándar de RTX VSR eliminan los artefactos de compresión al escalar. En el nivel 4, los modelos de alta tasa de bits tardan unas 1,5 veces más tiempo de GPU por fotograma.",
   "fsrup.tip": "Versión: escalado AMD FSR 4.1.2 (FidelityFX SDK 2.4.0). Vectores de movimiento: NVIDIA Optical Flow en Slow, su nivel de mayor calidad.",
   "fsrup.name": "AMD FSR 4.1",
   "fsrup.hint": "(el escalador por IA de AMD, se usa cuando <span class='vonly'>el Tamaño es mayor que el origen</span><span class='lonly'>Llenar pantalla o un modo DLSS por debajo de DLAA amplía la imagen</span>)",

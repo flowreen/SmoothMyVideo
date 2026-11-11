@@ -59,7 +59,7 @@ const OPTS: Record<string, Spec> = {
   '--no-interp': { dest: 'no_interp', kind: 'bool', def: false },
   '--upscale': { dest: 'upscale', kind: 'float', def: 1.0, nargsOpt: 1.5 },
   '--rtx-vsr': { dest: 'rtx_vsr', kind: 'bool', def: false },
-  '--vsr-quality': { dest: 'vsr_quality', kind: 'int', def: 4, choices: [1, 2, 3, 4] },
+  '--vsr-quality': { dest: 'vsr_quality', kind: 'int', def: 4, choices: [1, 2, 3, 4, 16, 17, 18, 19] },
   '--fsr-upscale': { dest: 'fsr_upscale', kind: 'bool', def: false },
   '--anime4k': { dest: 'anime4k', kind: 'bool', def: false },
   '--anime4k-aa': { dest: 'anime4k_aa', kind: 'bool', def: false },
