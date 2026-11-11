@@ -33,6 +33,7 @@ a version bump in `package.json`.
 | `scripts/*.ts` | build and setup scripts; Node runs them directly, no compile step |
 | `engine/live/build_src/` | the native host's source; `build.bat` there builds `engine/live/smv-live.exe` |
 | `engine/<name>/build_src/` | one bridge each, built into the DLL or exe beside it: `dlssg` (DLSS frame generation helper), `dlssnr` (DLSS 5), `fsrfg` + `fsrup` (AMD FSR), `xess` (Intel XeSS), `rtxvideo` (RTX VSR, RTX HDR), `nvoffruc` (Smooth Motion), `update` (the updater) |
+| `engine/fsrup/shader_rewrites/` | our rewrites of FSR 4.1.2's last-pass shaders, one `.dxil` each, named by the digest of the AMD shader it replaces; the bridge reads them at run time, and they are made outside the repo (DEVELOPMENT.md, "AMD FSR upscaling bridge") |
 | `engine/rife`, `engine/GMFSS_Fortuna`, `engine/realesrgan`, `engine/artcnn` | the models' weights, read in place: their authors' values, each tensor stored as fp16 where the host's loader rounds it to fp16 first and as fp32 where a kernel reads fp32 |
 
 ### The native host is one translation unit
@@ -128,7 +129,7 @@ top-level `const` or `let` exists only once its line has run. A new part is a ne
 ## Never read or search these
 
 `node_modules/`, `dist/`, `release/`, `renderer/app.js`, `engine/runtime/` (git-ignored local tooling, thousands
-of files), `engine/bin/`, `engine/gpu_runtime/`, `engine/live/build_src/cuda/`, `model_cache_safe_to_delete/`, any `.exe`, `.dll`, `.pkl`, `.pth`, and the
+of files), `engine/bin/`, `engine/gpu_runtime/`, `engine/live/build_src/cuda/`, `model_cache_safe_to_delete/`, any `.exe`, `.dll`, `.dxil`, `.pkl`, `.pth`, and the
 vendored trees `engine/GMFSS_Fortuna/`, `engine/rife/`, `engine/live/build_src/nvofa/`. Scope every search to the
 source paths in the table above; never search from the repo root.
 

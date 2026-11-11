@@ -108,7 +108,10 @@ third-party work.
   `engine/fsrup/`), redistributed unmodified beside our bridges `smv_fsrfg_bridge.dll` and `smv_fsrup_bridge.dll`
   (the recipes: `engine/fsrfg/build_src/`, `engine/fsrup/build_src/`). At run time `smv_fsrup_bridge.dll` changes
   one function of the upscaler DLL in memory (its GPU check), so FSR 4's model runs on NVIDIA GPUs; the files on
-  disk are AMD's. Every one of these files is listed in the MIT section of the SDK's
+  disk are AMD's. `engine/fsrup/shader_rewrites/` holds copies of the last-pass compute shaders of that upscaler DLL
+  (FSR 4.1.2) modified by this project: they read and decode the input colour samples a thread needs once instead of
+  once per output pixel and write the same result; the bridge gives them to the GPU in place of AMD's. They stay under
+  AMD's MIT licence below. Every one of AMD's files is listed in the MIT section of the SDK's
   `Kits/FidelityFX/docs/license.md` (reproduced in `engine/fsrfg/licenses/`). MIT License:
 
   > Copyright (C) Advanced Micro Devices, Inc.

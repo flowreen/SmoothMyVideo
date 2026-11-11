@@ -1,6 +1,7 @@
 // SmoothMyVideo's AMD FSR upscaling bridge: AMD's signed FidelityFX loader + upscaler DLLs (FSR SDK v2.4.0, MIT, beside
 // this DLL) behind a small C API for the native host, the upscaler version picked by name (FSR 4.1.2 with its INT8 model:
-// enableInt8Model sets AMD's GPU check true in this process's in-memory copy of the upscaler DLL). Frames
+// enableInt8Model sets AMD's GPU check true in this process's in-memory copy of the upscaler DLL; FSR 4's last pass runs
+// this project's rewrite of AMD's shader where one applies, see ownCreateCps). Frames
 // go in and out through D3D12 buffers shared with CUDA (NT handles the host imports as external memory) and one shared
 // fence (an external semaphore), so the GPU waits on the GPU: the host writes the frame and its motion vectors, signals
 // `wait`; the bridge's queue waits for it, copies the buffers into textures, runs the upscale, copies the result out and
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -64,7 +66,8 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3
 struct State
 {
     bool live = false;
-    bool hdr = false; // the HDR mode: FP16 linear-light frames, FSR's high dynamic range flag
+    bool hdr = false;     // the HDR mode: FP16 linear-light frames, FSR's high dynamic range flag
+    bool rewrite = false; // this context's pipelines take this project's shader rewrites (hookCreateCps)
     uint32_t w = 0, h = 0, ow = 0, oh = 0;
     HMODULE loader = nullptr;
     ffxFunctions ffx = {};
@@ -265,19 +268,27 @@ bool enableInt8Model(HMODULE up)
     return true;
 }
 
+// this DLL's folder with its trailing separator; empty = unknown
+std::wstring ownFolder()
+{
+    HMODULE self = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)&ownFolder, &self) ||
+        !GetModuleFileNameW(self, path, MAX_PATH))
+        return {};
+    const std::wstring file(path);
+    return file.substr(0, file.find_last_of(L"\\/") + 1);
+}
+
 // AMD's loader from this DLL's own folder (it finds the upscaler DLL beside it)
 bool loadLoader(State& s)
 {
     if (s.loader)
         return true;
-    HMODULE self = nullptr;
-    wchar_t path[MAX_PATH] = {};
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            (LPCWSTR)&loadLoader, &self) ||
-        !GetModuleFileNameW(self, path, MAX_PATH))
+    const std::wstring dir = ownFolder();
+    if (dir.empty())
         return fail("this DLL's folder is unknown");
-    std::wstring dir(path);
-    dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
     // the loader opens the upscaler DLL by name, which the process's search path (the exe's folder) does not reach:
     // loaded first by full path, the by-name load finds the module already in memory
     HMODULE up =
@@ -295,6 +306,110 @@ bool loadLoader(State& s)
     ffxLoadFunctions(&s.ffx, s.loader);
     if (!s.ffx.CreateContext || !s.ffx.DestroyContext || !s.ffx.Query || !s.ffx.Dispatch)
         return fail("the FidelityFX loader lacks an entry point");
+    return true;
+}
+
+// This project's rewrites of FSR 4.1.2's last-pass shaders: shader_rewrites\<digest>.dxil beside this DLL, the name =
+// the digest in the header of the AMD shader the file replaces. AMD's last pass writes 2 x 2 output pixels a thread and
+// resamples the input colour for each pixel from that pixel's own 3 x 3 texels, every one through the same decode: 36
+// loads and decodes of at most 16 different texels. A rewrite loads and decodes that 4 x 4 block once and lets each
+// pixel pick its nine values from it. The bits are the same while the four pixels' centre texels lie within one texel
+// of the first pixel's, which an upscale on both axes at zero jitter (this bridge's only jitter) guarantees: a context
+// takes the rewrites only when both axes enlarge by 1 % or more. SMV_FSRUP_REWRITE=0 = AMD's shaders everywhere.
+// AMD's DLL hands each shader to the device's CreateComputePipelineState, entry kCreateCps of ID3D12Device's method
+// table (the method order of d3d12.h). That entry runs ownCreateCps for the rest of the process: it passes every call
+// on untouched, except a call made on a thread that is inside this bridge's own ffxCreateContext or ffxDispatch of such
+// a context, for a shader a file replaces. A replacement the device refuses gives way to AMD's shader.
+struct Rewrite
+{
+    uint8_t amd[16]; // the digest of the AMD shader it replaces
+    std::vector<uint8_t> dxil;
+};
+using CreateCps = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+constexpr int kCreateCps = 11;
+constexpr size_t kShaderHeader = 32; // "DXBC", the 16-byte digest, the version, the size and the part count
+std::vector<Rewrite> g_rewrites;
+std::once_flag g_rewritesOnce;
+std::mutex g_cpsLock;
+void** g_cpsTable = nullptr;
+CreateCps g_cpsReal = nullptr;
+thread_local bool t_rewrite = false;
+
+void loadRewrites()
+{
+    char off[4] = {};
+    if (GetEnvironmentVariableA("SMV_FSRUP_REWRITE", off, sizeof off) == 1 && off[0] == '0')
+        return;
+    const std::wstring dir = ownFolder() + L"shader_rewrites\\";
+    WIN32_FIND_DATAW fd;
+    const HANDLE find = FindFirstFileW((dir + L"*.dxil").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE)
+        return;
+    do
+    {
+        Rewrite r = {};
+        bool named = wcslen(fd.cFileName) == 2 * sizeof r.amd + 5;
+        for (size_t i = 0; named && i < 2 * sizeof r.amd; ++i)
+        {
+            const wchar_t c = fd.cFileName[i];
+            const int v = c >= L'0' && c <= L'9' ? c - L'0' : c >= L'a' && c <= L'f' ? c - L'a' + 10 : -1;
+            named = v >= 0;
+            r.amd[i / 2] = (uint8_t)(r.amd[i / 2] << 4 | (v & 15));
+        }
+        FILE* f = nullptr;
+        if (!named || fd.nFileSizeHigh || fd.nFileSizeLow < kShaderHeader ||
+            _wfopen_s(&f, (dir + fd.cFileName).c_str(), L"rb") != 0 || !f)
+            continue;
+        r.dxil.resize(fd.nFileSizeLow);
+        const bool whole =
+            fread(r.dxil.data(), 1, r.dxil.size(), f) == r.dxil.size() && memcmp(r.dxil.data(), "DXBC", 4) == 0;
+        fclose(f);
+        if (whole)
+            g_rewrites.push_back(std::move(r));
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+}
+
+HRESULT STDMETHODCALLTYPE ownCreateCps(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID riid,
+                                       void** out)
+{
+    if (t_rewrite && d && d->CS.pShaderBytecode && d->CS.BytecodeLength >= kShaderHeader)
+        for (const Rewrite& r : g_rewrites)
+            if (memcmp(r.amd, (const uint8_t*)d->CS.pShaderBytecode + 4, sizeof r.amd) == 0)
+            {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC mine = *d;
+                mine.CS.pShaderBytecode = r.dxil.data();
+                mine.CS.BytecodeLength = r.dxil.size();
+                mine.CachedPSO = {};
+                const HRESULT hr = g_cpsReal(dev, &mine, riid, out);
+                if (SUCCEEDED(hr))
+                    return hr;
+                break;
+            }
+    return g_cpsReal(dev, d, riid, out);
+}
+
+// true when dev's method table runs ownCreateCps (set the first time, never undone, this DLL then pinned in the
+// process: the entry points into it). A device with another table than the first one keeps AMD's shaders.
+bool hookCreateCps(ID3D12Device* dev)
+{
+    std::call_once(g_rewritesOnce, loadRewrites);
+    if (g_rewrites.empty())
+        return false;
+    const std::lock_guard<std::mutex> lock(g_cpsLock);
+    void** table = *(void***)dev;
+    if (g_cpsTable)
+        return table == g_cpsTable;
+    HMODULE self = nullptr;
+    DWORD old = 0;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)&ownFolder,
+                            &self) ||
+        !VirtualProtect(&table[kCreateCps], sizeof(void*), PAGE_READWRITE, &old))
+        return false;
+    g_cpsReal = (CreateCps)table[kCreateCps];
+    table[kCreateCps] = (void*)&ownCreateCps;
+    VirtualProtect(&table[kCreateCps], sizeof(void*), old, &old);
+    g_cpsTable = table;
     return true;
 }
 } // namespace
@@ -470,7 +585,12 @@ static int createAt(State& s, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, 
     create.flags = s.hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
     create.maxRenderSize = {w, h};
     create.maxUpscaleSize = {ow, oh};
-    if (s.ffx.CreateContext(&s.ctx, &create.header, nullptr) != FFX_API_RETURN_OK)
+    s.rewrite =
+        (uint64_t)ow * 100 >= (uint64_t)w * 101 && (uint64_t)oh * 100 >= (uint64_t)h * 101 && hookCreateCps(s.dev);
+    t_rewrite = s.rewrite;
+    const auto made = s.ffx.CreateContext(&s.ctx, &create.header, nullptr);
+    t_rewrite = false;
+    if (made != FFX_API_RETURN_OK)
         return destroy(s), fail("ffxCreateContext(upscale) failed"), -16;
     s.live = true;
     *sh = s.sh;
@@ -537,7 +657,10 @@ static int frameAt(State& s, uint64_t waitValue, uint64_t signalValue, int reset
     up.cameraFovAngleVertical = 1.0f;
     up.viewSpaceToMetersFactor = 1.0f;
     up.flags = s.hdr ? 0 : FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
-    if (s.ffx.Dispatch(&s.ctx, &up.header) != FFX_API_RETURN_OK)
+    t_rewrite = s.rewrite;
+    const auto dispatched = s.ffx.Dispatch(&s.ctx, &up.header);
+    t_rewrite = false;
+    if (dispatched != FFX_API_RETURN_OK)
         return l->Close(), fail("ffxDispatch(upscale) failed"), -4;
 
     D3D12_RESOURCE_BARRIER ob =

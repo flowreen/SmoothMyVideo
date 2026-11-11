@@ -199,7 +199,8 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
   `smv_vkd3d_*.dll`, our patches in `source/`), our `amdxc64.dll` and `licenses/`, all committed and shipped;
   the recipe in `build_src/`; called by the host.
 * `engine/fsrup/`: the AMD FSR upscaling bridge (`smv_fsrup_bridge.dll`, ours) beside AMD's signed
-  FidelityFX loader + upscaler DLLs (MIT), all committed and shipped; the recipe in `build_src/`.
+  FidelityFX loader + upscaler DLLs (MIT) and `shader_rewrites/` (our rewrites of the upscaler's last-pass shaders, see
+  "AMD FSR upscaling bridge"), all committed and shipped; the recipe in `build_src/`.
 * `engine/xess/`: the Intel XeSS-SR and XeSS-FG bridges (`smv_xess_bridge.dll`, `smv_xefg_bridge.dll`, ours,
   committed and shipped; the recipe in `build_src/`). Intel's `libxess.dll`, `libxess_fg.dll`, `libxell.dll` and `XeSS_LICENSE.txt` are NOT in the repo or
   the release: the GUI's XeSS setup row downloads them (git-ignored, filtered out of the package).
@@ -1944,6 +1945,7 @@ named here, and on a name here that no source holds.
 | `SMV_FSRUP_TEST=hang1` / `=hang2` | AMD FSR upscaling's first / second frame blocks past the Live stall watchdog: its trigger test. The watchdog holds up to 180 s during a session's first dispatch, where the driver compiles FSR's shaders (per exe location and upscale ratio), and its 10 s start over when that call returns |
 | `SMV_FU_CHAIN=0` | AMD FSR 4 / Intel XeSS-SR upscaling in one call at any ratio instead of the equal passes of at most 3x past 3x (XeSS-SR then refuses past 3x, FSR 4 breaks past about 9x). A/B lever, never a product setting |
 | `SMV_FSRUP_TEST=gateN` / `=zerovec` | AMD FSR upscaling's motion vectors: `gateN` = vectors shorter than N / 1000 px written as zero instead of the product's 0.125 px (`gate0` = no gate, the trigger test of the still-detail gate); `zerovec` = zero vectors on every frame. A/B levers, never a product setting |
+| `SMV_FSRUP_REWRITE=0` | AMD FSR 4 upscaling runs AMD's own shader in its last pass instead of our rewrite from `engine/fsrup/shader_rewrites` (the same frames, the pass slower; see "AMD FSR upscaling bridge"); A/B lever, never a product setting |
 | `SMV_FSRFG_CHILDMV=0` | AMD FSR frame generation: level-2+ calls (x4 and up) run an optical flow pass each instead of taking vectors derived from their pair's level-1 field (the default; the session line says `level-2+ calls a pass a call` instead of `level-2+ calls derived from level 1`); A/B lever, never a product setting |
 | `SMV_FSRFG_DEVICE=own` / `=failown` | AMD FSR frame generation's bridge: every instance on its own vkd3d device instead of vkd3d's one (`fsrfg_devices()` = 1; the late price adds 300 MiB an instance past the first) / instance 0 on its own, the later ones on the shared device (the factory's failure path); the derived level-2+ vectors run on either; A/B levers, never a product setting |
 | `SMV_VKD3D_COOPMAT2=0` | AMD FSR frame generation's bridge hides VK_NV_cooperative_matrix2 from vkd3d-proton (the FP8 tiles take the staged loads through shared memory: the same frames, ~7 % more FSR time), with a vkd3d cache folder of its own (`_nc2`); A/B lever |
@@ -2353,6 +2355,32 @@ ret`), before the loader's first query; the file on disk stays AMD's signed one.
 the RTX 5090 (harness `fsr_sdk_bump\fp8_up\fp8_probe.py`, `up412_probe.py`): ~1.2 ms a frame for 854x480 ->
 1920x1080, two processes byte for byte, the RX 6000 variant 52-61 dB from it at the same PSNR to the truth; the FP8
 model does not run on NVIDIA (on vkd3d-proton's FP8 emulation its shaders lose the device).
+
+FSR 4's last pass runs our rewrite of AMD's shader. That pass writes 2 x 2 output pixels a thread and resamples the
+input colour for each pixel from the pixel's own 3 x 3 texels, every one through the same decode (in the sRGB form 43
+instructions with nine `log` / `exp` calls): 36 loads and decodes of at most 16 different texels. A rewrite loads and
+decodes that 4 x 4 block once and lets each pixel pick its nine values from it. The values are the same bits while the
+four pixels' centre texels lie within one texel of the first pixel's, which an upscale on both axes at zero jitter
+guarantees, so a context takes the rewrites only when both axes enlarge by 1 % or more (`SMV_FSRUP_REWRITE=0` = AMD's
+shaders everywhere). `engine/fsrup/shader_rewrites/` holds one `.dxil` for each variant of the pass in AMD's DLL that
+the bridge's two modes reach, 24 in the sRGB form and 24 in the HDR form (there the decode is 19 instructions with
+three `log` calls, and the exposure scale every tap reads is computed once before the block), each named by the digest
+in the header of the AMD shader it replaces. AMD's DLL hands each shader to the device's `CreateComputePipelineState`; the bridge points that entry of
+the device's method table at its own function, which passes every call on untouched except one made inside the bridge's
+own `ffxCreateContext` / `ffxDispatch` of such a context for a shader a file replaces (a replacement the device refuses
+gives way to AMD's shader). Measured on the RTX 5090 (D3D12 timestamps around each pass, six alternating runs a side):
+at 1920x1080 -> 3840x2160 the last pass 0.604 -> 0.514 ms and FSR 4's whole GPU time 4.164 -> 4.071 ms (-2.2 %); at
+854x480 -> 1920x1080 0.143 -> 0.124 ms and 1.215 -> 1.194 ms (-1.7 %); in the HDR mode, whose decode is the cheaper
+one, 0.508 -> 0.484 ms and 4.015 -> 3.991 ms (-0.6 %) at 3840x2160 and no measurable difference at 1920x1080. The
+frames equal AMD's byte for byte in both modes at eight ratios from 1.01x to 3.0x, at 4K, through two chained passes
+and with a file the device refuses (harness
+`fsr4_exact_shaders`: `product_gate.py` = the built bridge against a bridge without the rewrites, with a set of trigger
+files that must change the picture; `swap_wide.py repo` = which pass of which context runs a rewrite; `swap_gate.py repo
+6` = the timing). The files are made by that harness, not by a build step here: the shaders out of AMD's DLL
+(`dxil_extract.py`), `dxc -dumpbin` of each with Microsoft's DXC v1.9.2602.24 (the build AMD's shaders name), the
+rewrite of the listing (`ir_passes.py` `taps16`: it checks the shader's shape first and leaves a variant it does not
+know alone), then dxcompiler's assembler and dxil.dll's validator (`ir_build.py`). A file is named by AMD's digest, so
+after an SDK bump no file matches the DLL's shaders and AMD's run until the files are rebuilt from that DLL.
 
 `fsrup_create(w, h, ow, oh, luidLow, luidHigh, want, hdr, FsrupShared*)`: a D3D12 device on the adapter with the CUDA
 device's LUID, the first upscaler version whose name starts with `want` (the host asks for "4."; with the gate open
