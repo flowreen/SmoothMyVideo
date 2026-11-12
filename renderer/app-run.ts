@@ -240,7 +240,6 @@ function startRun() {
   if (useA4kUp && a4kAaOn()) payload.a4kaa = true; // its Mode A+A
   if (useAcnUp) payload.artcnn = true; // ArtCNN upscaling (engine/artcnn)
   if (useXessUp) payload.xess = true; // Intel XeSS upscaling (engine/xess)
-  if (!$('gpufit').checked) payload.nogpufit = true; // no video memory fit: the same fps, slower when memory runs short
   if (rtxhdr) {
     payload.rtxhdr = true; // HDR10 at the Peak box's nits or the app window's display's
     const hp = hdrColorPayload();

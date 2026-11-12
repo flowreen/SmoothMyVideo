@@ -125,7 +125,7 @@
   "speed.unit": "fps",
   "speed.matching": "gleich",
   "speed.hz": "Hz",
-  "gpufit.tip": "An (Standard): zielt auf die höchste Bildrate, die deine GPU halten kann, bei geringster Latenz. Wenn GPU oder Speicher knapp werden, erzeugt Live weniger Zwischenbilder (bis zur Quell-Bildrate), damit jedes Bild angezeigt wird; Datei-Renderings behalten ihre genauen FPS. Aus: alles läuft wie eingestellt; Live kann Bilder auslassen.",
+  "gpufit.tip": "An (Standard): Live darf deine Ziel-FPS auf das senken, was deine GPU halten kann (nie unter die Quell-Bildrate), damit kein Bild ausgelassen wird. Aus: Live zeigt deine Ziel-FPS oder mehr, egal was es kostet. Kommt die GPU nicht mit, werden Bilder ausgelassen.",
   "gpufit.label": "An die GPU anpassen",
 
   "restore.k": "Wiederherstellen",

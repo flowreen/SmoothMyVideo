@@ -125,7 +125,7 @@
   "speed.unit": "fps",
   "speed.matching": "igual a",
   "speed.hz": "Hz",
-  "gpufit.tip": "Activado (predeterminado): busca la tasa de fotogramas más alta que tu GPU pueda mantener, con la menor latencia. Cuando la GPU o su memoria no dan abasto, el modo en vivo genera menos fotogramas intermedios (hasta la tasa de origen) para que se vean todos; los renders de archivo mantienen sus fps exactos. Desactivado: todo funciona tal como está configurado; el modo en vivo puede saltarse fotogramas.",
+  "gpufit.tip": "Activado (predeterminado): el modo en vivo puede bajar tus fps objetivo a lo que tu GPU pueda mantener (nunca por debajo de la tasa de origen), para que no se salte ningún fotograma. Desactivado: el modo en vivo muestra tus fps objetivo o más, cueste lo que cueste. Cuando la GPU no da abasto, se saltan fotogramas.",
   "gpufit.label": "Ajustar a la GPU",
 
   "restore.k": "Restaurar",

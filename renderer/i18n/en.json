@@ -125,7 +125,7 @@
   "speed.unit": "fps",
   "speed.matching": "matching",
   "speed.hz": "Hz",
-  "gpufit.tip": "On (default): targets the highest frame rate your GPU can hold, at the lowest latency. When the GPU or its memory runs short, Live makes fewer in-between frames (down to the source rate) so every frame still shows; file renders keep their exact fps. Off: everything runs as set; Live may skip frames.",
+  "gpufit.tip": "On (default): Live may lower your target fps to what your GPU can hold (never below the source rate), so no frame is skipped. Off: Live shows your target fps or more, whatever it costs. When the GPU cannot keep up, frames are skipped.",
   "gpufit.label": "Fit to the GPU",
 
   "restore.k": "Restore",

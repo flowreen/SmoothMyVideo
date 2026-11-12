@@ -1414,7 +1414,7 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *tok);
 
             slPCLSetMarker(sl::PCLMarker::ePresentStart, *tok);
-            HRESULT hr = sc->Present(syncInterval, 0);
+            HRESULT hr = presentSl();
             slPCLSetMarker(sl::PCLMarker::ePresentEnd, *tok);
             if (FAILED(hr))
             {
@@ -1473,6 +1473,27 @@ float4 psV(float4 pos : SV_Position) : SV_Target
                 return false;
         }
         return true;
+    }
+
+    // A present through Streamline's proxy (the DLSS-G route). Sync interval 0 passes ALLOW_TEARING, as the server
+    // route's presents do: a rate past the panel's refresh is allowed to tear on every route. (The flag does not lift
+    // the hold of this session's own DLSS-G pass to the refresh on a 60 Hz mode: the live loop's refresh hold does.)
+    // A runtime that rejects the flag gets plain sync-0 presents from then on. SMV_LIVE_SL_TEAR=0 = without the flag
+    // (the A/B)
+    bool slTear = [] {
+        wchar_t v[4]{};
+        return !(GetEnvironmentVariableW(L"SMV_LIVE_SL_TEAR", v, 4) == 1 && v[0] == L'0');
+    }();
+    HRESULT presentSl()
+    {
+        HRESULT hr = sc->Present(syncInterval, syncInterval == 0 && slTear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        if (hr == DXGI_ERROR_INVALID_CALL && syncInterval == 0 && slTear)
+        {
+            slTear = false;
+            LOG("present: ALLOW_TEARING rejected on the DLSS-G route, falling back to plain sync-0 presents\n");
+            hr = sc->Present(0, 0);
+        }
+        return hr;
     }
 
     // The live cascade's stage 2: present a texture another device fills (a stage-1
@@ -1564,7 +1585,7 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         queue->ExecuteCommandLists(1, ls);
         slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *tok);
         slPCLSetMarker(sl::PCLMarker::ePresentStart, *tok);
-        const HRESULT hr = sc->Present(syncInterval, 0);
+        const HRESULT hr = presentSl();
         slPCLSetMarker(sl::PCLMarker::ePresentEnd, *tok);
         if (FAILED(hr))
         {

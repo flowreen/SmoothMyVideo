@@ -125,7 +125,7 @@
   "speed.unit": "fps",
   "speed.matching": "égal à",
   "speed.hz": "Hz",
-  "gpufit.tip": "Activé (par défaut) : vise la fréquence d'images la plus élevée que votre GPU peut tenir, avec la latence la plus faible. Quand le GPU ou sa mémoire manquent, le mode en direct crée moins d'images intermédiaires (jusqu'à la fréquence source) pour que chaque image s'affiche ; les rendus de fichiers gardent leurs fps exacts. Désactivé : tout tourne comme réglé ; le mode en direct peut sauter des images.",
+  "gpufit.tip": "Activé (par défaut) : le mode en direct peut abaisser vos fps cibles à ce que votre GPU peut tenir (jamais sous la fréquence source), pour qu'aucune image ne soit sautée. Désactivé : le mode en direct affiche vos fps cibles ou plus, quel qu'en soit le coût. Quand le GPU ne suit pas, des images sont sautées.",
   "gpufit.label": "S'adapter au GPU",
 
   "restore.k": "Restaurer",

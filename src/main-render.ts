@@ -128,7 +128,6 @@ type RunOpts = {
   dvprofile?: string; // Dolby Vision 8.1 (HDR10 base, the default) or 8.4 (HLG base)
   hp?: boolean;
   codec?: string;
-  nogpufit?: boolean;
   hdrcolor?: string;
   hdrsat?: number;
   hdrcon?: number;
@@ -207,8 +206,6 @@ function engineArgs(opts: RunOpts): string[] {
   else if (opts.anime4k) args.push('--anime4k', ...(opts.a4kaa ? ['--anime4k-aa'] : []));
   else if (opts.artcnn) args.push('--artcnn');
   else if (opts.xess) args.push('--xess-upscale');
-  // "Fit to the GPU" off: no video memory fit (the batch stays as planned, slower when memory runs short)
-  if (opts.nogpufit) args.push('--no-gpu-fit');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
   // on, the RTX bridge does VSR then TrueHDR in one pass). The peak = the Peak box, else the app
   // window's display (as NVIDIA's own RTX Video HDR does), the HDR10 metadata follows it; it falls

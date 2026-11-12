@@ -1016,6 +1016,7 @@ struct Stage1Ring
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> frames{0};
     std::thread th;
+    HANDLE wake = nullptr; // the named event a publish sets
 
     // the ring of `ringSlots` textures, its fence and the header on dev, each shared by name (smv_dg1_TAG_...);
     // ready() then lets the readers in
@@ -1054,6 +1055,10 @@ struct Stage1Ring
         }
         handles.push_back(fh);
         ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        // set at every publish: a stage that takes this ring as its input waits on it (smv_dg1_TAG_wake)
+        wake = CreateEventW(nullptr, FALSE, FALSE, (L"smv_dg1_" + tag + L"_wake").c_str());
+        if (wake)
+            handles.push_back(wake);
         const std::wstring mn = L"smv_dg1_" + tag + L"_hdr";
         HANDLE mh = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Stage1Hdr), mn.c_str());
         if (!mh)
@@ -1092,6 +1097,8 @@ struct Stage1Ring
         MemoryBarrier();
         hdr->frames = ++count;
         frames++;
+        if (wake)
+            SetEvent(wake);
     }
 
     bool init(Host& host, const std::wstring& tag)
@@ -1228,6 +1235,7 @@ struct UpstreamRing
     ComPtr<ID3D12Fence> fence;
     uint32_t n = 0;
     uint64_t nextSeq = 0, skipped = 0;
+    HANDLE wake = nullptr; // the upstream stage's publish event; null = it has none, its ring is polled
 
     bool open(ID3D12Device* dev, const std::wstring& tag, DXGI_FORMAT fmt)
     {
@@ -1261,6 +1269,7 @@ struct UpstreamRing
             return false;
         }
         n = hdr->ring;
+        wake = OpenEventW(SYNCHRONIZE, FALSE, (L"smv_dg1_" + tag + L"_wake").c_str());
         for (uint32_t i = 0; i <= n; i++)
         {
             HANDLE sh = nullptr;
@@ -1301,6 +1310,8 @@ struct UpstreamRing
 
     ~UpstreamRing()
     {
+        if (wake)
+            CloseHandle(wake);
         if (hdr)
             UnmapViewOfFile(hdr);
         if (map)
@@ -2284,6 +2295,9 @@ static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wst
         return true;
     };
 
+    // set when an input arrives: the stdin reader's hand-over, or the upstream stage's publish (null = an upstream
+    // without that event: its ring is polled)
+    const HANDLE inputEv = from.empty() ? in->ev : up.wake;
     double at = 0;
     bool ended = false;
     while (!takeInput(at, ended))
@@ -2293,8 +2307,8 @@ static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wst
             rc = 0;
             return true;
         }
-        if (from.empty())
-            WaitForSingleObject(in->ev, 250);
+        if (inputEv)
+            WaitForSingleObject(inputEv, 250);
         else
             SwitchToThread();
     }
@@ -2438,25 +2452,25 @@ static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wst
         }
         if (ended)
             break;
-        // until an input, the GPU or the next frame's time. A stage fed by another stage's ring has no event for an
-        // input and polls; the last half millisecond before a frame's time is spun
-        if (!from.empty())
+        // until an input, the GPU or the next frame's time (the end of a stage fed by a ring shows at a wait's
+        // timeout); the last half millisecond before a frame's time is spun
+        if (!inputEv)
             SwitchToThread();
         else if (gpuWait)
         {
             ring.fence->SetEventOnCompletion(made.front().value, gpuEv);
-            const HANDLE hs[2] = {in->ev, gpuEv};
+            const HANDLE hs[2] = {inputEv, gpuEv};
             WaitForMultipleObjects(2, hs, FALSE, 100);
         }
         else if (wait < 0)
-            WaitForSingleObject(in->ev, 250);
+            WaitForSingleObject(inputEv, 250);
         else if (wait > 0.6 && timer)
         {
             LARGE_INTEGER due;
             due.QuadPart = -(LONGLONG)((wait - 0.4) * 10000.0);
             SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
-            const HANDLE hs[2] = {in->ev, timer};
-            WaitForMultipleObjects(2, hs, FALSE, INFINITE);
+            const HANDLE hs[2] = {inputEv, timer};
+            WaitForMultipleObjects(2, hs, FALSE, 250);
         }
         else
             YieldProcessor();

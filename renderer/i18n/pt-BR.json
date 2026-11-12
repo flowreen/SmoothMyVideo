@@ -125,7 +125,7 @@
   "speed.unit": "fps",
   "speed.matching": "igual a",
   "speed.hz": "Hz",
-  "gpufit.tip": "Ligado (padrão): busca a maior taxa de quadros que a sua GPU consegue manter, com a menor latência. Quando a GPU ou a memória dela não dão conta, o modo ao vivo gera menos quadros intermediários (até a taxa de origem) para que todos os quadros apareçam; as renderizações de arquivo mantêm o fps exato. Desligado: tudo roda como configurado; o modo ao vivo pode pular quadros.",
+  "gpufit.tip": "Ligado (padrão): o modo ao vivo pode baixar o seu fps alvo para o que a sua GPU consegue manter (nunca abaixo da taxa de origem), para que nenhum quadro seja pulado. Desligado: o modo ao vivo mostra o seu fps alvo ou mais, custe o que custar. Quando a GPU não dá conta, quadros são pulados.",
   "gpufit.label": "Ajustar à GPU",
 
   "restore.k": "Restaurar",

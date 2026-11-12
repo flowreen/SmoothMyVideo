@@ -1037,7 +1037,8 @@ N fps until a group is timed`): a start the GPU cannot afford fills the queue, a
 outlast the move's 2 s window and cut the budget for about a minute (1440p RIFE x5 at target 1000: three cuts to 69 %,
 48.5 presented fps over the first 50 s instead of 56).
 The static-source hold keys on the source's arrivals (`sourceQuiet` / `sourceCadence`), not on the loop's sends.
-`--no-gpu-fit` (the GUI's "Fit to the GPU" unticked, main-live.ts `liveGpuFit`) holds the user's target (no throttle) and
+`--no-gpu-fit` (the GUI's "Fit to the GPU" unticked, main-live.ts `liveGpuFit`) holds the user's target (no throttle; a
+model that only doubles runs the first doubling that reaches it, "The node above the target") and
 drops every video memory fit (`nativeVideoMemoryRoom` answers "no limit": the ring), logging `GPU fit off
 (--no-gpu-fit)`. Gate `harness\live_capture_drops\drops_ab.py OLD_EXE NEW_EXE [case ...]` (a parked 2560x1440 mpv
 looping a 23.976 fps clip; GMFSS + Sharpen + RTX HDR, Fill, Quality at the targets 60 / 1000 / 10000, every other
@@ -1268,7 +1269,8 @@ cascade (frames of 128 px a side and up; `--bgra` = SDR frames and ring in B8G8R
 `--from` = another stage's ring as its input, copied on the GPU after a queue wait on that stage's fence, stdin then
 only ends it): the same frames on stdin, each taken the moment it arrives, and for every input its generated frames
 and then the input itself shared in a ring of textures by name (`smv_dg1_TAG_ring0..`, resting in COMMON; the header
-says how many) with a shared fence (`smv_dg1_TAG_fence`) and the header `Stage1Hdr` (file mapping `smv_dg1_TAG_hdr`:
+says how many) with a shared fence (`smv_dg1_TAG_fence`), an event set at every shared frame (`smv_dg1_TAG_wake`: a
+stage that takes this ring as its input waits on it and uses no CPU between frames) and the header `Stage1Hdr` (file mapping `smv_dg1_TAG_hdr`:
 per slot the fence value its copy signals, the frame's number, when it was shared and the source frame; a status
 word). stdout carries only `DLSSG STAGE1 READY gen=N max=M share=TAG`. A reader opens the textures by name in CUDA or
 another D3D12 device and waits each slot's fence value (harness `dlssg_gpu_transport`: x6 of 24 fps at 2560x1472 =
@@ -1314,7 +1316,7 @@ the one pass keeps presenting (every stage at once, each one's init side by side
 frame, then presents its frames through the
 session's own DLSS-G at the last factor. Three passes: a second helper `--stage1 ... --from <the first's
 share tag>` takes the first's ring on the GPU (in present order, the newest after a wrap) and the session
-presents the second's; three passes below 85 % of their multiple for three 2 s windows in a row end and the
+presents the second's; three passes below the hold share of their multiple (90 %, below) for three 2 s windows in a row end and the
 next plan holds two. One plan a session; a helper ending, failing or sharing nothing for 2 s returns the
 session to one pass (at L, or at the split multiple). Plans change in place: `Stage1Hdr` version 3 carries the
 host's ask (`wantGen`), which a helper applies at its next input (1x = no frame generated there, its input passed
@@ -1325,15 +1327,26 @@ the restart); a rung of fewer passes runs on the last ones, the first at 1x, so 
 extra hop. A target past the panel's refresh whose rung lies past the first rung above one pass CLIMBS (a
 target at or under the refresh is a rate the user expects: its plan runs as it is): the helpers start at the target's
 multiples, are asked down to that first rung (8x = 2x, 2x, 2x, or 2x then 4x) before the takeover, then up a
-rung of at least 1.2x at a time while each presents 85 % of its multiple with at most 3 capture drops a
-second; a rung that does not is the ceiling, the plan steps back to the rung that held, and the next try
+rung of at least 1.2x at a time while each HOLDS: it presents 90 % of its multiple with at most 3 capture drops a
+second (a rung in good order presents 95 % and more, DLSS-G's own pacing taking the rest; one past what the session
+can show presents less at the rate of the rung below, its other frames made and never shown;
+`SMV_LIVE_DLSSG_HOLD=0.85` = another share, 0.50 to 0.99, the A/B); a rung that does not is the ceiling, the plan
+steps back to the rung that held, and the next try
 waits 15 s, doubling to 240 s; a shortfall steps down to the largest rung under what held
 (`SMV_LIVE_DLSSG_CLIMB=0` = the target's rung first). Lines `DLSS 4.5 climbs from Mx ...`, `DLSS 4.5 steps to
 Mx in place (...)`. A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
 route's way: a rung R of one or two helper passes and a keep k of 2..6 with R / k within 3 % (the fewest passes,
 then the smallest R: 2.5x = 5x in a helper, 4.5x = 3x then 3x in two, 7.5x = 3x then 5x), the session presents every k-th frame of
 the presented ring and makes none itself, so the output stays evenly spaced (`SMV_LIVE_DLSSG_KEEP=0` = whole
-multiples only). Lines `DLSS 4.5 plan: ...`, `DLSS 4.5 at Mx: ... in a second process, [.. in a
+multiples only). THE REFRESH HOLD: on some display modes (measured at 60 Hz, not at 360 Hz) the session's own DLSS-G
+pass presents exactly the panel's refresh whatever its multiple, each present call lasting its frames' refresh
+periods and the captures behind it dropped, while frames made in helpers and presented by the session with its pass
+off are not held. The session reads the hold from its 2 s windows (its pass asked past the refresh, 85 % to 103 % of
+the refresh presented, the present calls that long, twice in a row; line `DLSS 4.5: this display holds the pass made
+here ...`), and from then on a whole plan past the refresh runs every pass in a helper, a one-pass multiple too
+(`DLSS 4.5 at 5.00x: 5x in a second process, every frame presented here, none made here`); a plan that runs with a
+held pass ends and is planned again in the same window (`SMV_LIVE_DLSSG_REFHOLD=0` = the pass stays, `=force` = held
+from the start at any rate). Lines `DLSS 4.5 plan: ...`, `DLSS 4.5 at Mx: ... in a second process, [.. in a
 third, ]then ...` (a kept plan: `DLSS 4.5 at 2.50x: 5x in a second process, every 2nd of its frames presented
 here, none made here`), `DLSS 4.5 stays at Mx: ...`, `DLSS 4.5's second [and third] pass[es] ended (...)`; the
 app shows them beside the stats. Gates: harness `dlssg_cascade\s2_gate.py`, `dlssg_third_stage\three_gate.py`,
@@ -1454,10 +1467,11 @@ next power of two (`native: video memory: the midpoint tree stops at xN ...`). F
 only the output's ceiling (at most `slots` frames a captured frame) and the host says `native: video
 memory: the output ring holds N output frames per source frame instead of M ...`; 2 at least. Gate
 `harness\live_ring_memory\ring_gate.py OLD_ENGINE NEW_ENGINE` (`ring_mem.py` = the measurement).
-The offline route has no video memory fit: a render that does not fit only runs slower. `--no-gpu-fit` (the GUI's
-"Fit to the GPU" unticked; the render CLI and the host) only logs `offline: GPU fit off (--no-gpu-fit): no video
-memory fit` there (gate `harness\live_capture_drops\offline_nofit_check.py`). It is not part of the resume
-signature.
+The offline route fits video memory in two places only: ArtCNN runs in tiles and Anime4K A+A falls back to Mode A
+when the free memory does not hold their whole-frame form; any other render that does not fit only runs slower.
+"Fit to the GPU" is a Live setting (its checkbox shows in Live mode only) and the app never passes `--no-gpu-fit`
+for a file render; on the render CLI and the host the flag drops those two fits and logs `offline: GPU fit off
+(--no-gpu-fit): no video memory fit`. It is not part of the resume signature.
 `SMV_NR_STAGED=1` and the preview's `--nr-delta` (it needs the host copies) keep `renderFrame`
 through its upload / readback staging; a handoff that cannot start falls back to it with an
 `offline: DLSS 5 zero-copy handoff unavailable` line (no `[dlss5]` tag: the pass still runs). The
@@ -2019,6 +2033,8 @@ named here, and on a name here that no source holds.
 | `SMV_DLSSG_WQ=0` | a file render's host reads each DLSS 4.5 pair before it sends the next frame, even to a `dlssg2f` with a pair writer (` wq=1`); the A/B and fallback test only, never a product setting |
 | `SMV_DLSSG_KEEP=0` | the resident file-render host starts a new `dlssg2f` for every DLSS 4.5 render instead of keeping the last render's server for the next one of the same padded size, multiplier and frame format; the A/B and fallback test only, never a product setting |
 | `SMV_DLSSG_GAP_RESET=1` | `dlssg2f` resets DLSS 4.5 before every pair whose input came 500 ms after the last one (A/B) |
+| `SMV_LIVE_SL_TEAR=0` | the Live session's own DLSS 4.5 presents go out without `DXGI_PRESENT_ALLOW_TEARING`: by default a sync-0 present on that route passes the flag, as every other route's presents do (the flag alone does not lift the refresh hold below); the A/B only |
+| `SMV_LIVE_DLSSG_REFHOLD=0` / `=force` | the refresh hold of Live DLSS 4.5 (a display mode that holds the session's own pass to the panel's refresh): `0` = the pass stays in the session when the hold is seen, `force` = the hold counts as seen from the start at any rate, so every whole plan runs all its passes in helpers (a parked session's way to those plans); the A/B and gate lever |
 | `SMV_DLSSG_NGX=0` / `=fail` | `dlssg2f` (`--server` and Live's `--stage1`) makes its frames through Streamline's swap chain instead of NGX's own calls (the A/B of the two routes: the same frames); `fail` = NGX's route treated as unavailable after its full start, the trigger test of the automatic fallback to Streamline's |
 | `SMV_DLSSG_HDR10=0` | DLSS 4.5 gets HDR planes as 8-bit codes on an RGBA8 swap chain (labelled SDR) instead of HDR10; an A/B lever, never a product setting |
 | `SMV_DLSSG_REFUSE_HDR10=1` | the DLSS 4.5 host treats the HDR10 colour space as refused (exit 5): the trigger test of the host's 8-bit fallback |
@@ -2259,7 +2275,11 @@ and 2 s since the last lock change to enter, 3 % to hold, and while its slots fi
 however far past the target or the panel that node lands. The present floor follows a node above the
 target (0.95 x the node's own period, from the faster of the two source clocks), so its slots are all
 presented (tear-allowed past the panel) and no group overruns its source period. Otherwise the largest
-node that fits. A target on a node (within 3 %) never steps up. Log: `present grid: locked
+node that fits. A target on a node (within 3 %) never steps up. With `--no-gpu-fit` the first node
+that reaches the target runs at once and unpriced (Fit to the GPU off = the target is reached whatever
+it costs: 120 fps from 24 = x8, even where that node skips source frames), with no step, hold band or
+back-off, and on the pipelined route whenever the direct tree cannot hold the node and the pipelined
+one affords more of it. Log: `present grid: locked
 to xM (...), the node above the target`. `SMV_FRUC_STEPUP=0` = the largest node that fits (gates:
 harness ladder_gate.py's stepup cases).
 

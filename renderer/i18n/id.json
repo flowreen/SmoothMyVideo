@@ -125,7 +125,7 @@
   "speed.unit": "fps",
   "speed.matching": "sama dengan",
   "speed.hz": "Hz",
-  "gpufit.tip": "Aktif (bawaan): mengejar frame rate tertinggi yang sanggup ditahan GPU Anda, dengan latensi terendah. Saat GPU atau memorinya kurang, mode langsung membuat lebih sedikit frame sisipan (sampai frame rate sumber) agar setiap frame tetap tampil; render file tetap di fps yang tepat. Nonaktif: semua berjalan sesuai pengaturan; mode langsung bisa melewatkan frame.",
+  "gpufit.tip": "Aktif (bawaan): mode langsung boleh menurunkan fps target Anda ke yang sanggup ditahan GPU Anda (tidak pernah di bawah frame rate sumber), agar tidak ada frame yang dilewatkan. Nonaktif: mode langsung menampilkan fps target Anda atau lebih, berapa pun bebannya. Saat GPU tidak sanggup mengikuti, frame dilewatkan.",
   "gpufit.label": "Sesuaikan dengan GPU",
 
   "restore.k": "Pulihkan",
