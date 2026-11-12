@@ -27,13 +27,14 @@
 //       This is the SmoothMyVideo backend.
 //   dlssg2f.exe --stage1 W H [--gen N] [--hdr10 | --bgra] --share TAG [--from TAG]
 //       a stage of a live cascade before the host's own: --from = another stage's ring as its input (on the GPU,
-//       in present order; stdin then only ends it), else the same frames on stdin (--bgra: SDR frames in B8G8R8A8 order, on a
-//       B8G8R8A8 swap chain and ring, the order of Live's effects route), each presented the moment it arrives
-//       (the cadence of a game, so DLSS-G's pacer spreads its frames over the source's own interval); every
-//       native present, generated and real alike in present order, is copied on the GPU into a ring of
+//       in order; stdin then only ends it), else the same frames on stdin (--bgra: SDR frames in B8G8R8A8 order, the
+//       order of Live's effects route). An input's generated frames and then the input itself go into a ring of
 //       textures shared by name with the process that reads them (smv_dg1_TAG_ring0.., a shared fence
-//       smv_dg1_TAG_fence, the header Stage1Hdr in the file mapping smv_dg1_TAG_hdr). stdout carries only
-//       the handshake line.
+//       smv_dg1_TAG_fence, the header Stage1Hdr in the file mapping smv_dg1_TAG_hdr), spread over the source's own
+//       interval (the cadence DLSS-G's pacer gives a game). NGX's own calls make them (runStage1Direct, the
+//       handshake ends in " ngx=1"); on Streamline's route (runStage1) each input is presented the moment it
+//       arrives on a swap chain in the frames' order, DLSS-G's pacer spreads the presents, and every native present
+//       is copied into the ring. stdout carries only the handshake line.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -54,6 +55,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -125,6 +127,7 @@ static void slLog(sl::LogType type, const char* msg)
 
 #include "sl_focus_shim.h"
 #include "pan_vectors.h"
+#include "ngx_direct.h"
 
 // milliseconds on the performance counter (GetTickCount64 steps in ~16 ms)
 static double qpcMs()
@@ -999,22 +1002,26 @@ struct Stage1Ring
     static const int kRing = 12, kAllocs = 16;
     Host* h = nullptr;
     Stage1Hdr* hdr = nullptr;
-    ComPtr<ID3D12Resource> ring[kRing];
+    int slots = kRing; // the ring's textures (the header's arrays hold 16)
+    ComPtr<ID3D12Resource> ring[16];
     ComPtr<ID3D12CommandAllocator> alloc[kAllocs];
     ComPtr<ID3D12GraphicsCommandList> list[kAllocs];
     uint64_t allocUse[kAllocs] = {};
     ComPtr<ID3D12Fence> fence;
     HANDLE ev{};
     uint64_t fv = 0;
+    uint64_t count = 0; // frames shared so far: the next one's number
     std::vector<ComPtr<ID3D12Resource>> native;
     std::vector<HANDLE> handles;
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> frames{0};
     std::thread th;
 
-    bool init(Host& host, const std::wstring& tag)
+    // the ring of `ringSlots` textures, its fence and the header on dev, each shared by name (smv_dg1_TAG_...);
+    // ready() then lets the readers in
+    bool share(ID3D12Device* dev, DXGI_FORMAT fmt, int gen, int ringSlots, const std::wstring& tag)
     {
-        h = &host;
+        slots = ringSlots;
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC rd{};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -1022,33 +1029,25 @@ struct Stage1Ring
         rd.Height = H;
         rd.DepthOrArraySize = 1;
         rd.MipLevels = 1;
-        rd.Format = host.frameFormat();
+        rd.Format = fmt;
         rd.SampleDesc = {1, 0};
-        for (int i = 0; i < kRing; i++)
+        for (int i = 0; i < slots; i++)
         {
             HANDLE sh = nullptr;
             const std::wstring nm = L"smv_dg1_" + tag + L"_ring" + std::to_wstring(i);
-            if (FAILED(host.device->CreateCommittedResource(
-                    &hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ring[i]))) ||
-                FAILED(host.device->CreateSharedHandle(ring[i].Get(), nullptr, GENERIC_ALL, nm.c_str(), &sh)))
+            if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                    nullptr, IID_PPV_ARGS(&ring[i]))) ||
+                FAILED(dev->CreateSharedHandle(ring[i].Get(), nullptr, GENERIC_ALL, nm.c_str(), &sh)))
             {
                 LOG("stage1: ring texture %d not shared\n", i);
                 return false;
             }
             handles.push_back(sh);
         }
-        const D3D12_COMMAND_LIST_TYPE t = host.rbQueue->GetDesc().Type;
-        for (int i = 0; i < kAllocs; i++)
-        {
-            if (FAILED(host.device->CreateCommandAllocator(t, IID_PPV_ARGS(&alloc[i]))) ||
-                FAILED(host.device->CreateCommandList(0, t, alloc[i].Get(), nullptr, IID_PPV_ARGS(&list[i]))))
-                return false;
-            list[i]->Close();
-        }
         HANDLE fh = nullptr;
         const std::wstring fn = L"smv_dg1_" + tag + L"_fence";
-        if (FAILED(host.device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence))) ||
-            FAILED(host.device->CreateSharedHandle(fence.Get(), nullptr, GENERIC_ALL, fn.c_str(), &fh)))
+        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence))) ||
+            FAILED(dev->CreateSharedHandle(fence.Get(), nullptr, GENERIC_ALL, fn.c_str(), &fh)))
         {
             LOG("stage1: fence not shared\n");
             return false;
@@ -1065,18 +1064,54 @@ struct Stage1Ring
             return false;
         memset((void*)hdr, 0, sizeof(Stage1Hdr));
         hdr->version = 3;
-        hdr->gen = (uint32_t)host.genFrames;
+        hdr->gen = (uint32_t)gen;
         hdr->w = W;
         hdr->h = H;
-        hdr->ring = kRing;
-        hdr->fmt = (uint32_t)host.frameFormat();
-        hdr->allocSize = host.device->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+        hdr->ring = (uint32_t)slots;
+        hdr->fmt = (uint32_t)fmt;
+        hdr->allocSize = dev->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+        return true;
+    }
+
+    // the header's magic, written last: a reader waits for it
+    void ready()
+    {
+        MemoryBarrier();
+        hdr->magic = 0x31564D53; // 'SMV1'
+    }
+
+    // the ring's next frame is in its slot (number % slots) once the fence reaches value; qpc = when it was seen
+    // (Streamline's stage) or shared (NGX's), input = the source frame it belongs to
+    void publish(uint64_t value, int64_t qpc, uint32_t input)
+    {
+        const int s = (int)(count % slots);
+        hdr->slotFence[s] = value;
+        hdr->slotSeq[s] = count;
+        hdr->slotQpc[s] = qpc;
+        hdr->slotInput[s] = input;
+        MemoryBarrier();
+        hdr->frames = ++count;
+        frames++;
+    }
+
+    bool init(Host& host, const std::wstring& tag)
+    {
+        h = &host;
+        if (!share(host.device.Get(), host.frameFormat(), host.genFrames, kRing, tag))
+            return false;
+        const D3D12_COMMAND_LIST_TYPE t = host.rbQueue->GetDesc().Type;
+        for (int i = 0; i < kAllocs; i++)
+        {
+            if (FAILED(host.device->CreateCommandAllocator(t, IID_PPV_ARGS(&alloc[i]))) ||
+                FAILED(host.device->CreateCommandList(0, t, alloc[i].Get(), nullptr, IID_PPV_ARGS(&list[i]))))
+                return false;
+            list[i]->Close();
+        }
         native.resize(host.nativeBufCount);
         for (UINT i = 0; i < host.nativeBufCount; i++)
             if (FAILED(host.scNative->GetBuffer(i, IID_PPV_ARGS(&native[i]))))
                 return false;
-        MemoryBarrier();
-        hdr->magic = 0x31564D53; // 'SMV1', last: a reader waits for it
+        ready();
         return true;
     }
 
@@ -1100,7 +1135,6 @@ struct Stage1Ring
         int64_t seenQpc[kRing] = {};    // when the capture first counted present p (slot p % kRing)
         uint32_t seenInput[kRing] = {}; // lastInput at that moment
         ID3D12CommandQueue* q = h->rbQueue.Get();
-        uint64_t n = 0;
         while (!stop.load())
         {
             UINT c = 0, c2 = 0;
@@ -1136,7 +1170,7 @@ struct Stage1Ring
             for (UINT p = copied + 1; p <= last; p++)
             {
                 const UINT idx = (cur + h->nativeBufCount - 1 - (c - p)) % h->nativeBufCount;
-                const int a = (int)(n % kAllocs);
+                const int a = (int)(count % kAllocs);
                 if (fence->GetCompletedValue() < allocUse[a])
                 {
                     fence->SetEventOnCompletion(allocUse[a], ev);
@@ -1146,7 +1180,7 @@ struct Stage1Ring
                 ID3D12GraphicsCommandList* l = list[a].Get();
                 l->Reset(alloc[a].Get(), nullptr);
                 ID3D12Resource* src = native[idx].Get();
-                ID3D12Resource* dst = ring[n % kRing].Get();
+                ID3D12Resource* dst = ring[count % slots].Get();
                 barrier(l, src, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 barrier(l, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
                 l->CopyResource(dst, src);
@@ -1157,14 +1191,7 @@ struct Stage1Ring
                 q->ExecuteCommandLists(1, ls);
                 q->Signal(fence.Get(), ++fv);
                 allocUse[a] = fv;
-                const int s = (int)(n % kRing);
-                hdr->slotFence[s] = fv;
-                hdr->slotSeq[s] = n;
-                hdr->slotQpc[s] = seenQpc[p % kRing];
-                hdr->slotInput[s] = seenInput[p % kRing];
-                MemoryBarrier();
-                hdr->frames = ++n;
-                frames++;
+                publish(fv, seenQpc[p % kRing], seenInput[p % kRing]);
             }
             copied = last;
         }
@@ -1408,6 +1435,121 @@ struct PairWriterGuard
             w->finish();
     }
 };
+
+// SMV_DLSSG_NGX is set to value: 0 = Streamline's route, fail = NGX's own route treated as unavailable after its full
+// start (the trigger test of the fallback to Streamline's)
+static bool ngxLever(const wchar_t* value)
+{
+    wchar_t v[8] = {0};
+    return GetEnvironmentVariableW(L"SMV_DLSSG_NGX", v, _countof(v)) == wcslen(value) && wcscmp(v, value) == 0;
+}
+
+// --server on NGX's own calls (ngx_direct.h): runServer's protocol and frames without Streamline, its swap chain and
+// its pacer. false = this route did not come up and nothing went to stdout: the caller starts Streamline's route.
+static bool runServerDirect(int genFrames, bool hdr10, HANDLE cutEv, int& rc)
+{
+    ngxfg::Direct fg;
+    if (!fg.init(genFrames, hdr10))
+        return false;
+    if (ngxLever(L"fail"))
+    {
+        LOG("SMV_DLSSG_NGX=fail: NGX's own route treated as unavailable\n");
+        fg.shutdown();
+        return false;
+    }
+    rc = 1;
+    if (fg.maxGen && (uint32_t)genFrames > fg.maxGen)
+    {
+        LOG("multi-frame generation beyond %ux is not supported on this GPU (requested %ux)\n", fg.maxGen + 1,
+            genFrames + 1);
+        rc = 3;
+        return true;
+    }
+    LOG("DLSS-G ready: NGX's own calls, no Streamline\n");
+
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    // runServer's handshake, plus ngx=1 = this route
+    fprintf(stdout, "DLSSG READY gen=%d max=%u%s wq=1%s ngx=1\n", genFrames, fg.maxGen, hdr10 ? " hdr10=1" : "",
+            cutEv ? " cut=1" : "");
+    fflush(stdout);
+
+    const size_t frameBytes = (size_t)W * H * 4;
+    std::vector<uint8_t> inFrame(frameBytes);
+    const auto frames = std::make_shared<ServerFrames>();
+    auto& outFrames = frames->outFrames;
+    auto& outFramesW = frames->outFramesW;
+    outFrames.assign((size_t)genFrames, std::vector<uint8_t>(frameBytes));
+    outFramesW.assign((size_t)genFrames, std::vector<uint8_t>(frameBytes));
+    std::vector<uint8_t*> outPtrs, outPtrsW;
+    for (auto& f : outFrames)
+        outPtrs.push_back(f.data());
+    for (auto& f : outFramesW)
+        outPtrsW.push_back(f.data());
+    const auto writerP = std::make_shared<PairWriter>();
+    writerP->keep = frames;
+    writerP->start();
+    PairWriterGuard writerGuard{writerP};
+    PairWriter& writer = *writerP;
+
+    auto readFull = [&](uint8_t* p, size_t n) -> bool {
+        size_t got = 0;
+        while (got < n)
+        {
+            size_t r = fread(p + got, 1, n - got, stdin);
+            if (r == 0)
+                return false;
+            got += r;
+        }
+        return true;
+    };
+
+    uint64_t emitted = 0;
+    bool first = true;
+    while (readFull(inFrame.data(), frameBytes))
+    {
+        // a new clip (the host set the cut event before it sent this frame): nothing of the clip before may reach
+        // its tweens, so the feature is made again and this frame takes a first frame's warm-up
+        if (!first && cutEv && WaitForSingleObject(cutEv, 0) == WAIT_OBJECT_0)
+        {
+            LOG("new clip: DLSS-G's feature made again, this frame warms it up; the clip before it:\n");
+            fg.logPan();
+            if (!fg.newClip())
+            {
+                LOG("new clip: the DLSS-G feature did not come back\n");
+                return true;
+            }
+            first = true;
+        }
+        if (first)
+        {
+            // the first frame three times, as the three warm-up presents of Streamline's route: the frames after it
+            // depend on how many evaluates came before
+            for (int i = 0; i < 3; i++)
+                if (!fg.frame(inFrame.data(), nullptr))
+                {
+                    LOG("warmup evaluate failed\n");
+                    return true;
+                }
+            first = false;
+            continue;
+        }
+        if (!fg.frame(inFrame.data(), outPtrs.data()))
+            return true;
+        // the pair to the writer (after the previous one is written), then this thread takes the other buffer set
+        const std::vector<const uint8_t*> outSrc(outPtrs.begin(), outPtrs.end());
+        writer.post(outSrc, frameBytes);
+        outFrames.swap(outFramesW);
+        outPtrs.swap(outPtrsW);
+        emitted += genFrames;
+    }
+    writer.waitIdle();
+    fg.logPan();
+    LOG("server done, %llu interpolated frames\n", (unsigned long long)emitted);
+    fg.shutdown();
+    rc = 0;
+    return true;
+}
 
 static int runServer(int genFrames, bool hdr10, HANDLE cutEv)
 {
@@ -1916,6 +2058,422 @@ static int runServer(int genFrames, bool hdr10, HANDLE cutEv)
     return 0;
 }
 
+// --stage1 --from: stdin carries no frame, only the end (the host closes it). The first call starts a reader that
+// outlives its caller and sets the flag returned
+static std::atomic<bool>& stdinEnd()
+{
+    static std::atomic<bool> end{false};
+    std::thread([] {
+        char c;
+        while (fread(&c, 1, 1, stdin) == 1)
+        {
+        }
+        end = true;
+    }).detach();
+    return end;
+}
+
+// --stage1's frames on stdin, read by a thread of their own: NGX's stage shares a pair's frames at their times while
+// the next input arrives. One frame is handed over at a time: the reader waits until the stage took the one before
+// (which holds the feeding pipe back, as a blocking read does) and never fills the buffer the stage still works from
+struct StdinFrames
+{
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<uint8_t> buf[2];
+    int have = -1; // the buffer holding a frame the stage has not taken
+    int held = -1; // the buffer the stage works from
+    double haveMs = 0;
+    bool end = false;
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr); // set at every hand-over and at the end
+
+    // the reader holds the frames (self): it outlives its caller, blocked in a read
+    static void start(const std::shared_ptr<StdinFrames>& self, size_t bytes)
+    {
+        self->buf[0].resize(bytes);
+        self->buf[1].resize(bytes);
+        std::thread([self, bytes] {
+            int w = 0;
+            for (;;)
+            {
+                {
+                    std::unique_lock<std::mutex> lk(self->m);
+                    self->cv.wait(lk, [&] { return self->held != w; });
+                }
+                size_t got = 0;
+                while (got < bytes)
+                {
+                    const size_t r = fread(self->buf[w].data() + got, 1, bytes - got, stdin);
+                    if (r == 0)
+                        break;
+                    got += r;
+                }
+                const double t = qpcMs();
+                std::unique_lock<std::mutex> lk(self->m);
+                if (got < bytes)
+                {
+                    self->end = true;
+                    SetEvent(self->ev);
+                    return;
+                }
+                self->cv.wait(lk, [&] { return self->have < 0; });
+                self->have = w;
+                self->haveMs = t;
+                w ^= 1;
+                SetEvent(self->ev);
+            }
+        }).detach();
+    }
+
+    // 1 = a frame (its bytes and when it arrived; done() gives its buffer back), 0 = none yet, -1 = stdin ended
+    int take(const uint8_t*& p, double& at)
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (have < 0)
+            return end ? -1 : 0;
+        held = have;
+        have = -1;
+        p = buf[held].data();
+        at = haveMs;
+        cv.notify_all();
+        return 1;
+    }
+    void done()
+    {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            held = -1;
+        }
+        cv.notify_all();
+    }
+};
+
+// The source's frame interval, which a pair's frames are spaced over: the mean of the last four gaps between inputs
+// (a 24 fps video on a 60 Hz desktop arrives 33 and 50 ms apart), at most 1.25 x the last gap (a source that sped up
+// is followed at once). One gap far off the mean stays out of it (a dropped frame, a stall); a second one like it is
+// the source's new rate.
+struct SourceClock
+{
+    double win[4] = {};
+    int n = 0, at = 0;
+    double held = 0; // a gap far off the mean, waiting for a second like it
+
+    double mean() const
+    {
+        double s = 0;
+        for (int i = 0; i < n; i++)
+            s += win[i];
+        return n ? s / n : 0;
+    }
+    void push(double gap)
+    {
+        win[at] = gap;
+        at = (at + 1) % 4;
+        n = (std::min)(n + 1, 4);
+    }
+    // the interval for the pair an input closes, gap = the time since the input before it
+    double add(double gap)
+    {
+        const double m = mean();
+        if (n && (gap > 1.6 * m || gap < 0.6 * m))
+        {
+            if (held > 0 && fabs(gap - held) <= 0.3 * held)
+            {
+                n = at = 0;
+                push(held);
+                push(gap);
+                held = 0;
+            }
+            else
+                held = gap;
+        }
+        else
+        {
+            push(gap);
+            held = 0;
+        }
+        return (std::min)(mean(), 1.25 * gap);
+    }
+};
+
+// --stage1 on NGX's own calls (ngx_direct.h): runStage1's ring, header and frames without Streamline, its swap chain,
+// its window and its pacer. An input is evaluated the moment it arrives and its frames are shared one by one at their
+// places in the source's interval (SourceClock), the first as soon as it is made: the cadence Streamline's pacer gives
+// a game. No clock runs inside the frames, so an input gap needs no reset. false = this route did not come up and
+// nothing was shared or written: the caller starts Streamline's stage.
+static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wstring& tag, const std::wstring& from,
+                            int& rc)
+{
+    ngxfg::Direct fg;
+    if (!fg.init(genFrames, hdr10, bgra, false))
+        return false;
+    if (ngxLever(L"fail"))
+    {
+        LOG("SMV_DLSSG_NGX=fail: NGX's own route treated as unavailable\n");
+        fg.shutdown();
+        return false;
+    }
+    rc = 1;
+    if (fg.maxGen && (uint32_t)genFrames > fg.maxGen)
+    {
+        LOG("multi-frame generation beyond %ux is not supported on this GPU (requested %ux)\n", fg.maxGen + 1,
+            genFrames + 1);
+        rc = 3;
+        return true;
+    }
+    LOG("DLSS-G ready: NGX's own calls, no Streamline\n");
+    // 16 slots: an input's frames are made ahead of their times, so up to six slots a reader has not been given yet
+    // are already written
+    Stage1Ring ring;
+    UpstreamRing up;
+    if (!ring.share(fg.device.Get(), fg.frameFormat(), genFrames, 16, tag) || !fg.stageInit(ring.fence.Get()) ||
+        (!from.empty() && !up.open(fg.device.Get(), from, fg.frameFormat())))
+        return true;
+    ring.ready();
+    _setmode(_fileno(stdin), _O_BINARY);
+    // runStage1's handshake, plus ngx=1 = this route
+    fprintf(stdout, "DLSSG STAGE1 READY gen=%d max=%u share=%ls%s ngx=1\n", genFrames, fg.maxGen, tag.c_str(),
+            fg.hdr10  ? " hdr10=1"
+            : fg.bgra ? " bgra=1"
+                      : "");
+    fflush(stdout);
+
+    const auto in = std::make_shared<StdinFrames>();
+    const std::atomic<bool>* inEnd = nullptr;
+    if (from.empty())
+        StdinFrames::start(in, (size_t)W * H * 4);
+    else
+        inEnd = &stdinEnd();
+    const uint8_t* cpu = nullptr;
+    uint32_t upSlot = 0;
+    uint64_t upValue = 0;
+    // the next input if one is there: at = when it arrived; ended = none will come
+    auto takeInput = [&](double& at, bool& ended) -> bool {
+        ended = false;
+        if (from.empty())
+        {
+            const int r = in->take(cpu, at);
+            ended = r < 0;
+            return r > 0;
+        }
+        if (up.next(upSlot, upValue))
+        {
+            at = qpcMs();
+            return true;
+        }
+        ended = *inEnd || up.hdr->status >= 2;
+        return false;
+    };
+    auto input = [&]() -> bool {
+        return from.empty() ? fg.stageInput(cpu)
+                            : fg.stageInput(nullptr, up.ring[upSlot].Get(), up.fence.Get(), upValue);
+    };
+    // a clip's first input three times, each with its evaluates (the three warm-up presents of Streamline's stage;
+    // --server's rule): the frame texture is left for stageEnd
+    auto warm = [&]() -> bool {
+        for (int i = 0; i < 3; i++)
+        {
+            if (!(i && !from.empty() ? fg.stageInput(nullptr) : input()))
+                return false;
+            for (int k = 1; k <= fg.gen; k++)
+                if (!fg.stageTween(k, nullptr))
+                    return false;
+            if (i < 2 && !fg.stageEnd(nullptr))
+                return false;
+        }
+        return true;
+    };
+
+    double at = 0;
+    bool ended = false;
+    while (!takeInput(at, ended))
+    {
+        if (ended)
+        {
+            rc = 0;
+            return true;
+        }
+        if (from.empty())
+            WaitForSingleObject(in->ev, 250);
+        else
+            SwitchToThread();
+    }
+    if (!warm() || !fg.stageEnd(nullptr))
+    {
+        LOG("warmup evaluate failed\n");
+        return true;
+    }
+    if (from.empty())
+        in->done();
+    ring.hdr->status = 1;
+
+    // a frame made and not shared yet: complete at the fence's `value`; the first of its input goes out as soon as it
+    // is complete, the others `after` ms behind that one
+    struct Made
+    {
+        uint64_t value;
+        double after;
+        bool first;
+        uint32_t input;
+    };
+    std::deque<Made> made;
+    uint64_t slotNo = 0; // frames written into the ring, shared or not
+    auto slot = [&]() { return ring.ring[slotNo++ % ring.slots].Get(); };
+    auto shareIt = [&](const Made& f) {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        ring.publish(f.value, t.QuadPart, f.input);
+    };
+    SourceClock clock;
+    double lastAt = at, base = 0;
+    bool rewarm = false; // DLSS-G saw none of the inputs passed through at 1x: the next one starts a clip
+    uint64_t inputs = 1, statInputs = 0, statFrames = 0;
+    ULONGLONG statTick = GetTickCount64();
+    // an input: its generated frames and itself into the ring, each with its place in the source's interval
+    auto take = [&]() -> bool {
+        const double interval = clock.add(at - lastAt);
+        lastAt = at;
+        // the host's ask for another multiple (a plan stepping up or down): the count is an argument of every
+        // evaluate, so it changes in place; kGenOff = 1x, the inputs shared as they are
+        const uint32_t ask = ring.hdr->wantGen;
+        const int askGen = ask == kGenOff ? 0 : (int)ask;
+        if (ask && askGen != fg.gen)
+        {
+            if ((uint32_t)askGen <= (fg.maxGen ? fg.maxGen : 5u))
+            {
+                LOG("stage1: %dx from input %llu on (asked)\n", askGen + 1, (unsigned long long)inputs);
+                rewarm = fg.gen == 0;
+                fg.gen = askGen;
+                ring.hdr->gen = (uint32_t)askGen;
+            }
+            else
+            {
+                LOG("stage1: %dx asked, refused: stays at %dx\n", askGen + 1, fg.gen + 1);
+                ring.hdr->wantGen = 0;
+            }
+        }
+        const uint32_t no = (uint32_t)inputs++;
+        ring.hdr->lastInput = no;
+        uint64_t v = 0;
+        if (fg.gen > 0 && rewarm)
+        {
+            fg.resetNext = true;
+            if (!warm() || !(v = fg.stageEnd(slot())))
+                return false;
+            rewarm = false;
+            made.push_back({v, 0, true, no});
+        }
+        else
+        {
+            if (!input())
+                return false;
+            const double step = interval / (fg.gen + 1);
+            for (int k = 1; k <= fg.gen; k++)
+            {
+                if (!(v = fg.stageTween(k, slot())))
+                    return false;
+                made.push_back({v, (k - 1) * step, k == 1, no});
+            }
+            if (!(v = fg.stageEnd(slot())))
+                return false;
+            made.push_back({v, fg.gen * step, fg.gen == 0, no});
+        }
+        if (from.empty())
+            in->done();
+        return true;
+    };
+
+    // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: a wait ends within about half a millisecond of its time
+    const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002, TIMER_ALL_ACCESS);
+    const HANDLE gpuEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    for (;;)
+    {
+        // share the frames whose time has come, in order
+        double wait = -1; // ms until the first waiting frame's time; -1 = none waits for a time
+        bool gpuWait = false;
+        while (!made.empty())
+        {
+            const Made& f = made.front();
+            if (ring.fence->GetCompletedValue() < f.value)
+            {
+                gpuWait = true;
+                break;
+            }
+            const double now = qpcMs();
+            if (f.first)
+                base = now;
+            else if (now < base + f.after)
+            {
+                wait = base + f.after - now;
+                break;
+            }
+            shareIt(f);
+            made.pop_front();
+        }
+        if (takeInput(at, ended))
+        {
+            // frames still waiting: the source came sooner than its interval said, they go out now
+            for (const Made& f : made)
+                shareIt(f);
+            made.clear();
+            if (!take())
+            {
+                LOG("stage1: an input's frames were not made\n");
+                ring.finish(3);
+                return true;
+            }
+            const ULONGLONG tick = GetTickCount64();
+            if (tick - statTick >= 5000)
+            {
+                const double s = (tick - statTick) / 1000.0;
+                const uint64_t f = ring.frames, n = inputs - statInputs;
+                LOG("stage1: %.1f inputs/s, %.1f shared presents/s (%.2f an input)%s\n", n / s, (f - statFrames) / s,
+                    n ? (double)(f - statFrames) / n : 0.0,
+                    from.empty() ? "" : (", " + std::to_string(up.skipped) + " upstream frames skipped").c_str());
+                statTick = tick;
+                statInputs = inputs;
+                statFrames = f;
+            }
+            continue;
+        }
+        if (ended)
+            break;
+        // until an input, the GPU or the next frame's time. A stage fed by another stage's ring has no event for an
+        // input and polls; the last half millisecond before a frame's time is spun
+        if (!from.empty())
+            SwitchToThread();
+        else if (gpuWait)
+        {
+            ring.fence->SetEventOnCompletion(made.front().value, gpuEv);
+            const HANDLE hs[2] = {in->ev, gpuEv};
+            WaitForMultipleObjects(2, hs, FALSE, 100);
+        }
+        else if (wait < 0)
+            WaitForSingleObject(in->ev, 250);
+        else if (wait > 0.6 && timer)
+        {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)((wait - 0.4) * 10000.0);
+            SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+            const HANDLE hs[2] = {in->ev, timer};
+            WaitForMultipleObjects(2, hs, FALSE, INFINITE);
+        }
+        else
+            YieldProcessor();
+    }
+    for (const Made& f : made)
+        shareIt(f);
+    // every shared frame's fence value is reached before the stage ends: a reader waits on it
+    fg.stageWait(fg.sValue);
+    ring.finish(2);
+    fg.logPan();
+    LOG("stage1 done, %llu inputs, %llu shared presents\n", (unsigned long long)inputs,
+        (unsigned long long)ring.frames.load());
+    fg.shutdown();
+    rc = 0;
+    return true;
+}
+
 // --stage1 (see the usage at the top): present every input as it arrives, share every native present
 static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& tag, const std::wstring& from)
 {
@@ -1959,15 +2517,7 @@ static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& t
     };
     // --from: the frames come from the upstream ring, stdin only carries the end (the host closes it); the warm-up
     // and a reset present the input presented last again (texFrame still holds it)
-    static std::atomic<bool> inEnd{false}; // static: the detached reader outlives this function
-    if (!from.empty())
-        std::thread([] {
-            char c;
-            while (fread(&c, 1, 1, stdin) == 1)
-            {
-            }
-            inEnd = true;
-        }).detach();
+    const std::atomic<bool>* inEnd = from.empty() ? nullptr : &stdinEnd();
     uint32_t upSlot = 0;
     uint64_t upValue = 0;
     auto nextInput = [&]() -> bool {
@@ -1975,7 +2525,7 @@ static int runStage1(int genFrames, bool hdr10, bool bgra, const std::wstring& t
             return readFull(inFrame.data(), frameBytes);
         while (!up.next(upSlot, upValue))
         {
-            if (inEnd || up.hdr->status >= 2)
+            if (*inEnd || up.hdr->status >= 2)
                 return false;
             SwitchToThread();
         }
@@ -2170,6 +2720,12 @@ int wmain(int argc, wchar_t** argv)
             LOG("--gen must be 1..5 (got %d)\n", genFrames);
             return 1;
         }
+        // NGX's own calls first; Streamline's route when they do not come up here, with SMV_DLSSG_NGX=0, and for the
+        // HDR10 refusal's trigger (a swap chain's answer)
+        const bool refuseHdr = hdr10 && GetEnvironmentVariableW(L"SMV_DLSSG_REFUSE_HDR10", nullptr, 0) != 0;
+        int rc = 1;
+        if (!ngxLever(L"0") && !refuseHdr && runServerDirect(genFrames, hdr10, cutEv, rc))
+            return rc;
         if (slInitCommon())
             return 1;
         return runServer(genFrames, hdr10, cutEv);
@@ -2206,6 +2762,11 @@ int wmain(int argc, wchar_t** argv)
                 genFrames);
             return 1;
         }
+        // NGX's own calls first, as --server; Streamline's stage when they do not come up here and with
+        // SMV_DLSSG_NGX=0
+        int rc = 1;
+        if (!ngxLever(L"0") && runStage1Direct(genFrames, hdr10, bgra, tag, from, rc))
+            return rc;
         if (slInitCommon())
             return 1;
         return runStage1(genFrames, hdr10, bgra, tag, from);

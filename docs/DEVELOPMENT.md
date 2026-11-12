@@ -1188,8 +1188,19 @@ exit 1, the part files kept; exit 3 = the multiplier is beyond the GPU). Gates: 
 `offline\gate_dlssg.py`; the failure paths through a stub
 server, `offline\gate_dlssg_restart.py`. RTX passes and DLSS 5 run in the same host as the
 frame generation.
-The pipes carry a pair of frames out per frame in, and DLSS-G paces its presents over the time between the
-server's inputs, so the host keeps the transfers off that interval. A `dlssg2f` that announces ` wq=1` in its
+`dlssg2f --server` makes the frames with NGX's own D3D12 calls (`ngx_direct.h`: the DLSS SDK's
+`NGX_D3D12_CREATE_DLSSG` / `NGX_D3D12_EVALUATE_DLSSG`): the frame, a flat depth and the pan vectors in, each generated
+frame into a texture of its own device, one evaluate per generated frame. That route has no swap chain, no window and
+no pacer, so a pair costs its evaluates and nothing on the desktop (another app's presents, a focus change) can stop
+the frames; the handshake says ` ngx=1`. The frames are byte for byte those of Streamline's route: the vector scale
+is the vector texture's size, and a clip's first frame is evaluated three times, the first with the reset flag
+(DLSS-G's later frames depend on how many evaluates came before). When NGX's calls do not come up (the reason is
+logged), and with `SMV_DLSSG_NGX=0`, the same exe uses Streamline's route: a flip-model swap chain through
+`sl.interposer`, the generated presents read back from the native chain. The capture levers (`SMV_DLSSG_SWEEP`,
+`_PRESENT_WRAP`, `_RB_QUEUE`, `_WAITMS`, `_GAP_RESET`, `_FOCUS_SHIM`, `_STAGE1_VSYNC`) act on that route only. Live's
+helper stage (`--stage1`, below) takes NGX's calls the same way. Harness `dlssg_direct_ngx`.
+The pipes carry a pair of frames out per frame in; on Streamline's route DLSS-G paces its presents over the time
+between the server's inputs, so the host keeps the transfers off that interval. A `dlssg2f` that announces ` wq=1` in its
 handshake streams each pair from a writer thread (a second buffer set; the server thread reads the next frame and
 presents it meanwhile), and the host then sends frame k before it reads the pair before it (from the third frame on,
 once the previous frame reached the server; a respawn or a failed send sends frame k again, the respawn having
@@ -1198,13 +1209,14 @@ order. The frames are the same either way (1080p x6: about x0.75 the time a pair
 The resident host keeps that server after a clean render: Streamline and NGX take about three seconds to come up in
 every new `dlssg2f`, so the next DLSS 4.5 render of the same padded size, multiplier and frame format takes the kept
 server instead of starting one. The host sets the server's cut event first (`--cut-event`, ` cut=1` in the handshake),
-which makes that render's first frame a new clip in the server (DLSS-G off and on, the pan estimator from nothing, the
-first frame's warm-up), so the frames are those of a new server. Any other render ends the kept server before its own
+which makes that render's first frame a new clip in the server (DLSS-G's feature made again, on Streamline's route
+DLSS-G off and on; the pan estimator from nothing, the first frame's warm-up), so the frames are those of a new server. Any other render ends the kept server before its own
 video memory fits, a failed render keeps none, and the host's exit ends it; `SMV_DLSSG_KEEP=0` starts a new server for
 every render.
 HDR planes (PQ or HLG video, RTX HDR's PQ output) go to it as HDR10, the input the DLSS-G guide asks
-for (its section 11.0): the host starts `dlssg2f.exe --server ... --hdr10`, which presents R10G10B10A2
-on a swap chain with the G2084 / P2020 colour space and confirms with ` hdr10=1` in its handshake;
+for (its section 11.0): the host starts `dlssg2f.exe --server ... --hdr10`, which takes R10G10B10A2 frames
+(NGX's route: the textures' format and the HDR flag; Streamline's route: a swap chain with the G2084 / P2020
+colour space) and confirms with ` hdr10=1` in its handshake;
 `k_packR10` packs the planes into 10-bit words (HLG as PQ on BT.2100's 1000-nit reference display,
 system gamma 1.2) and `k_unpackR10` reads the generated frames back (x / 1023, HLG through the exact
 inverse). Before, HDR went as 8-bit codes labelled SDR: an exact pan's PQ tweens sat 1.8 dB under the
@@ -1252,23 +1264,34 @@ the render; a resume restarts every pass at the banked source frame and the last
 encoder holds; a later pass's exit 3 / 4 is handled like the first's. RTX HDR (its per-frame statistics)
 does not combine with passes yet: refused with a line. Gate: harness `dlssg_cascade\cascade_gate.py`.
 `dlssg2f.exe --stage1 W H [--gen N] [--hdr10 | --bgra] --share TAG [--from TAG]` is a helper stage of the LIVE
-cascade (frames of 128 px a side and up; `--bgra` = SDR frames, swap chain and ring in B8G8R8A8, the effects route's
-order; an input gap past 700 ms resets its DLSS-G, above the capture's 500 ms repeat of a still picture; `--from` =
-another stage's ring as its input, copied on the GPU after a queue wait on that stage's fence, stdin then only ends
-it): the same frames on stdin,
-each presented the moment it arrives (a game's cadence: DLSS-G's
-pacer spreads a pair's frames over the source's own interval; the lockstep `--server` loop, which presents
-a frame only after the last pair's frames are read back, lets the pacer spread over that loop and tops out
-near x4 of 24 fps at 1080p), free-running (a sync-0 present with tearing allowed, so the stage's rate follows
-the GPU, not the panel's refresh: a vsync-paced stage capped at 360 presents a second on a 360 Hz panel and
+cascade (frames of 128 px a side and up; `--bgra` = SDR frames and ring in B8G8R8A8, the effects route's order;
+`--from` = another stage's ring as its input, copied on the GPU after a queue wait on that stage's fence, stdin then
+only ends it): the same frames on stdin, each taken the moment it arrives, and for every input its generated frames
+and then the input itself shared in a ring of textures by name (`smv_dg1_TAG_ring0..`, resting in COMMON; the header
+says how many) with a shared fence (`smv_dg1_TAG_fence`) and the header `Stage1Hdr` (file mapping `smv_dg1_TAG_hdr`:
+per slot the fence value its copy signals, the frame's number, when it was shared and the source frame; a status
+word). stdout carries only `DLSSG STAGE1 READY gen=N max=M share=TAG`. A reader opens the textures by name in CUDA or
+another D3D12 device and waits each slot's fence value (harness `dlssg_gpu_transport`: x6 of 24 fps at 2560x1472 =
+144 frames a second).
+The stage makes its frames with NGX's own calls, as `--server` does (the handshake ends in ` ngx=1`; the same
+evaluates, so the same frames: byte for byte Streamline's stage's and the file route's): an input is evaluated at
+once and its frames are shared one by one over the source's interval, the first as soon as it is made, the others at
+equal steps behind it. That is the cadence DLSS-G's pacer gives a game, and what the next stage or the session's
+presents take their timing from. The interval is the mean of the last four gaps between inputs (a 24 fps video on a
+60 Hz desktop arrives 33 and 50 ms apart), at most 1.25 x the last gap; one gap far off the mean stays out of it (a
+dropped frame, a stall), a second one like it is the source's new rate; an input that arrives while frames of the
+pair before it still wait sends them out at once. The ring holds 16 textures there: an input's frames are written
+ahead of their times. No clock runs inside the frames, so an input gap needs no reset. When NGX's calls do not come
+up, and with `SMV_DLSSG_NGX=0`, the same exe runs Streamline's stage: each input is presented the moment it arrives
+(DLSS-G's pacer spreads the pair's presents over the source's own interval; that route's lockstep `--server` loop,
+which presents a frame only after the last pair's frames are read back, lets the pacer spread over that loop and
+tops out near x4 of 24 fps at 1080p), free-running (a sync-0 present with tearing allowed, so the stage's rate
+follows the GPU, not the panel's refresh: a vsync-paced stage capped at 360 presents a second on a 360 Hz panel and
 would cap at 60 on a 60 Hz one, under the 144 that 6x of 24 fps asks; `SMV_DLSSG_STAGE1_VSYNC=1` = the paced
-presents, which `--server` keeps), and every native present, generated and real in present order, copied on
-the swap chain's own queue (ordered behind the present, no settle) into 12 textures shared by name
-(`smv_dg1_TAG_ring0..11`, resting in COMMON) with a shared fence (`smv_dg1_TAG_fence`) and the header
-`Stage1Hdr` (file mapping `smv_dg1_TAG_hdr`: per slot the fence value its copy signals, its present number,
-the capture time and the source frame; a status word). stdout carries only `DLSSG STAGE1 READY gen=N max=M
-share=TAG`. A reader opens the textures by name in CUDA or another D3D12 device and waits each slot's fence
-value (harness `dlssg_gpu_transport`: x6 of 24 fps at 2560x1472 = 144 presents a second, read exact).
+presents, which that route's `--server` keeps), every native present, generated and real in present order, copied on
+the swap chain's own queue (ordered behind the present, no settle) into 12 textures; an input gap past 700 ms
+resets its DLSS-G (the pacer's clock), above the capture's 500 ms repeat of a still picture. Harness
+`dlssg_direct_ngx` (`stage_ident.py`, `stage_rows.sh`).
 Live uses it on both DLSS-G routes: the direct one feeds it the captured frames, the effects route (any effect or a
 DLSS mode below DLAA) its output slots, read back at the presented size (`--bgra` in SDR), so every frame it
 generates from carries the effects; a stage 1 whose ring is not the back buffer's size and format is refused. When
@@ -1294,8 +1317,10 @@ share tag>` takes the first's ring on the GPU (in present order, the newest afte
 presents the second's; three passes below 85 % of their multiple for three 2 s windows in a row end and the
 next plan holds two. One plan a session; a helper ending, failing or sharing nothing for 2 s returns the
 session to one pass (at L, or at the split multiple). Plans change in place: `Stage1Hdr` version 3 carries the
-host's ask (`wantGen`), which a helper applies at its next present (1x = DLSS-G off there, its input passed
-through), so any rung of up to the passes running is reachable without a restart (`SMV_LIVE_DLSSG_INPLACE=0` =
+host's ask (`wantGen`), which a helper applies at its next input (1x = no frame generated there, its input passed
+through; on NGX's calls the count is an argument of every evaluate, and the first input after 1x is evaluated as a
+clip's first and shared without generated frames, since DLSS-G saw none of the inputs passed through), so any rung
+of up to the passes running is reachable without a restart (`SMV_LIVE_DLSSG_INPLACE=0` =
 the restart); a rung of fewer passes runs on the last ones, the first at 1x, so only the source frames take the
 extra hop. A target past the panel's refresh whose rung lies past the first rung above one pass CLIMBS (a
 target at or under the refresh is a rate the user expects: its plan runs as it is): the helpers start at the target's
@@ -1994,6 +2019,7 @@ named here, and on a name here that no source holds.
 | `SMV_DLSSG_WQ=0` | a file render's host reads each DLSS 4.5 pair before it sends the next frame, even to a `dlssg2f` with a pair writer (` wq=1`); the A/B and fallback test only, never a product setting |
 | `SMV_DLSSG_KEEP=0` | the resident file-render host starts a new `dlssg2f` for every DLSS 4.5 render instead of keeping the last render's server for the next one of the same padded size, multiplier and frame format; the A/B and fallback test only, never a product setting |
 | `SMV_DLSSG_GAP_RESET=1` | `dlssg2f` resets DLSS 4.5 before every pair whose input came 500 ms after the last one (A/B) |
+| `SMV_DLSSG_NGX=0` / `=fail` | `dlssg2f` (`--server` and Live's `--stage1`) makes its frames through Streamline's swap chain instead of NGX's own calls (the A/B of the two routes: the same frames); `fail` = NGX's route treated as unavailable after its full start, the trigger test of the automatic fallback to Streamline's |
 | `SMV_DLSSG_HDR10=0` | DLSS 4.5 gets HDR planes as 8-bit codes on an RGBA8 swap chain (labelled SDR) instead of HDR10; an A/B lever, never a product setting |
 | `SMV_DLSSG_REFUSE_HDR10=1` | the DLSS 4.5 host treats the HDR10 colour space as refused (exit 5): the trigger test of the host's 8-bit fallback |
 | `SMV_DLSSG_FOCUS_SHIM=0` | the DLSS 4.5 host's focus shim off: by default `dlssg2f` points the Streamline modules' `GetForegroundWindow` imports at its own off-screen window, because Streamline 2.14 pauses frame generation whenever another window has focus (a render then stopped with `DLSS_PREEMPTED` while the user worked in another window); the A/B and trigger test only, never a product setting |
@@ -2410,22 +2436,35 @@ the frame) and computes the vectors with the FSR FG route's Optical Flow session
 
 ### DLSS 4.5 Frame Generation host (`dlssg2f.exe`)
 
-An offline D3D12 presentation loop that lets DLSS-FG (a game-only SDK) interpolate two video
-frames. Built from `main.cpp`; ships prebuilt with NVIDIA's redistributable Streamline runtime
+Feeds video frames to DLSS-FG (a game SDK) and returns the generated frames. `--server` (file renders) and
+`--stage1` (Live's helper stage) call NGX's frame generation themselves (`ngx_direct.h`), each with a D3D12
+presentation loop through Streamline as its fallback.
+Built from `main.cpp`; ships prebuilt with NVIDIA's redistributable Streamline runtime
 (`sl.*.dll` + `nvngx_dlssg.dll` from the SDK's `bin/x64` production set, licenses alongside;
 the bundled runtime is Streamline 2.14.16 with DLSS-G 310.9.16, the same set ships in `engine/live`).
 
 Requirements: Visual Studio 2022+ with the C++ workload, the NVIDIA Streamline SDK v2.14.16
 (https://github.com/NVIDIA-RTX/Streamline/releases, the `streamline-sdk-<tag>.zip` asset; 2.12.0
-builds too, but ship the runtime DLLs of the SDK you built against). In `engine/dlssg/build_src/`:
+builds too, but ship the runtime DLLs of the SDK you built against), and the public NVIDIA DLSS SDK
+(`NGX_SDK`, the folder the DLSS 5 build uses: `include\nvsdk_ngx_helpers_dlssg_d3d.h` and the static
+`lib\Windows_x86_64\x64\nvsdk_ngx_s.lib`, NGX's loader, linked into the exe). In `engine/dlssg/build_src/`:
 ```
 set SL_SDK=D:\path\to\extracted\streamline-sdk
+set NGX_SDK=D:\path\to\DLSS
 build.bat
 ```
 It links `sl.interposer.lib` instead of `d3d12.lib` / `dxgi.lib` (that is how Streamline
 interposes; check with `dumpbin /dependents` that neither appears) and writes `..\dlssg2f.exe`.
+NGX's route takes `D3D12CreateDevice` and `CreateDXGIFactory1` from the system DLLs by name, so its
+device never passes through the interposer.
 
-Rules: the swap chain must be created with `FRAME_LATENCY_WAITABLE_OBJECT | ALLOW_TEARING` or the
+Rules, NGX's route: the colour, depth and vector textures are evaluated in both shader-resource states,
+the output texture in `UNORDERED_ACCESS`; `DLSSG.MvecScaleX / Y` is the vector texture's size, for vectors
+stored as a share of the frame (Streamline makes the same of `mvecScale {1, 1}`); NGX starts with the
+application id Streamline's route uses; a new clip (the cut event) is the feature released and created
+again, since what DLSS-G keeps between frames belongs to the feature.
+
+Rules, Streamline's route: the swap chain must be created with `FRAME_LATENCY_WAITABLE_OBJECT | ALLOW_TEARING` or the
 first Present fails inside the SL hook. `eShowOnlyInterpolatedFrame` makes every native present a
 generated frame, read back from the native swap chain after polling `GetLastPresentCount`, so no
 window is on screen. DLSS-FG requires hardware-accelerated GPU scheduling and an RTX 40 / 50 GPU
