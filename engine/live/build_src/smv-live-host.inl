@@ -85,27 +85,12 @@ static void pumpMessages()
     }
 }
 
-// h rows of w 4-byte pixels from src to dst in two halves, the lower one on a pool thread; swz = swap bytes 0 and 2 of
-// every pixel (BGRA <-> RGBA)
-static void copyRows(uint8_t* dst, size_t dstPitch, const uint8_t* src, size_t srcPitch, uint32_t w, uint32_t h,
-                     bool swz)
+// h rows of w 4-byte pixels from src to dst in two halves, the lower one on a pool thread
+static void copyRows(uint8_t* dst, size_t dstPitch, const uint8_t* src, size_t srcPitch, uint32_t w, uint32_t h)
 {
     auto rows = [&](uint32_t y0, uint32_t y1) {
         for (uint32_t y = y0; y < y1; y++)
-        {
-            const uint8_t* s = src + (size_t)y * srcPitch;
-            if (!swz)
-            {
-                memcpy(dst + (size_t)y * dstPitch, s, (size_t)w * 4);
-                continue;
-            }
-            uint32_t* d = (uint32_t*)(dst + (size_t)y * dstPitch);
-            for (uint32_t x = 0; x < w; x++)
-            {
-                uint32_t v = ((const uint32_t*)s)[x]; // BGRA in memory = 0xAARRGGBB little-endian
-                d[x] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16);
-            }
-        }
+            memcpy(dst + (size_t)y * dstPitch, src + (size_t)y * srcPitch, (size_t)w * 4);
     };
     panvec::beside([&] { rows(h / 2, h); }, [&] { rows(0, h / 2); });
 }
@@ -130,73 +115,19 @@ static int64_t nowQpc100()
     return (c.QuadPart / f) * 10000000LL + (c.QuadPart % f) * 10000000LL / f;
 }
 
-// row-major perspective (v * M convention, D3D clip space)
-static void fillConstants(sl::Constants& c)
-{
-    const float fovY = 60.0f * 3.14159265f / 180.0f;
-    const float aspect = (float)W / (float)H;
-    const float zn = 0.1f, zf = 100.0f;
-    const float f = 1.0f / tanf(fovY * 0.5f);
-    const float a = f / aspect, b = f;
-    const float cc = zf / (zf - zn);
-    const float d = -zn * zf / (zf - zn);
-
-    sl::float4x4 ident{};
-    ident.setRow(0, {1, 0, 0, 0});
-    ident.setRow(1, {0, 1, 0, 0});
-    ident.setRow(2, {0, 0, 1, 0});
-    ident.setRow(3, {0, 0, 0, 1});
-
-    sl::float4x4 proj{};
-    proj.setRow(0, {a, 0, 0, 0});
-    proj.setRow(1, {0, b, 0, 0});
-    proj.setRow(2, {0, 0, cc, 1});
-    proj.setRow(3, {0, 0, d, 0});
-
-    sl::float4x4 projInv{};
-    projInv.setRow(0, {1.0f / a, 0, 0, 0});
-    projInv.setRow(1, {0, 1.0f / b, 0, 0});
-    projInv.setRow(2, {0, 0, 0, 1.0f / d});
-    projInv.setRow(3, {0, 0, 1, -cc / d});
-
-    c.cameraViewToClip = proj;
-    c.clipToCameraView = projInv;
-    c.clipToPrevClip = ident; // static camera
-    c.prevClipToClip = ident;
-    c.jitterOffset = {0, 0};
-    c.mvecScale = {1, 1}; // MVs already in [-1,1] (they are all zero)
-    c.cameraPinholeOffset = {0, 0};
-    c.cameraPos = {0, 0, 0};
-    c.cameraUp = {0, 1, 0};
-    c.cameraRight = {1, 0, 0};
-    c.cameraFwd = {0, 0, 1};
-    c.cameraNear = zn;
-    c.cameraFar = zf;
-    c.cameraFOV = fovY;
-    c.cameraAspectRatio = aspect;
-    c.depthInverted = sl::Boolean::eFalse;
-    c.cameraMotionIncluded = sl::Boolean::eTrue;
-    c.motionVectors3D = sl::Boolean::eFalse;
-    c.reset = sl::Boolean::eFalse;
-    c.orthographicProjection = sl::Boolean::eFalse;
-    c.motionVectorsDilated = sl::Boolean::eFalse;
-    c.motionVectorsJittered = sl::Boolean::eFalse;
-}
-
-// The part of a session's start that needs no window and no size: the NVIDIA adapter, the D3D12 device and, with
-// Streamline, slSetD3DDevice plus the DLSS-G support check. Host::init runs it, or adopts what a prewarmed host
-// (--prewarm) ran before its session's arguments arrived.
-struct SlWarm
+// The part of a session's start that needs no window and no size: the NVIDIA adapter and the D3D12 device.
+// Host::init runs it, or adopts what a prewarmed host (--prewarm) ran before its session's arguments arrived.
+struct DeviceWarm
 {
     ComPtr<IDXGIFactory2> factory;
     ComPtr<IDXGIAdapter1> adapter;
     ComPtr<ID3D12Device> device;
     bool ok = false;
 };
-static SlWarm g_slWarm;
+static DeviceWarm g_devWarm;
 
 // 0 = ok, else Host::init's exit code
-static int slDeviceInit(SlWarm& w, bool useSL)
+static int deviceInit(DeviceWarm& w)
 {
     CHECK_HR(CreateDXGIFactory2(0, IID_PPV_ARGS(&w.factory)));
     DXGI_ADAPTER_DESC1 adesc{};
@@ -215,30 +146,11 @@ static int slDeviceInit(SlWarm& w, bool useSL)
     LOG("adapter: %ls\n", adesc.Description);
 
     CHECK_HR(D3D12CreateDevice(w.adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&w.device)));
-    if (useSL)
-    {
-        CHECK_SL(slSetD3DDevice(w.device.Get()));
-
-        sl::AdapterInfo ai{};
-        ai.deviceLUID = (uint8_t*)&adesc.AdapterLuid;
-        ai.deviceLUIDSizeInBytes = sizeof(LUID);
-        sl::Result sup = slIsFeatureSupported(sl::kFeatureDLSS_G, ai);
-        if (sup != sl::Result::eOk)
-        {
-            LOG("DLSS-G not supported on this system (sl::Result=%d)\n", (int)sup);
-            return 2;
-        }
-
-        sl::FeatureVersion ver{};
-        if (slGetFeatureVersion(sl::kFeatureDLSS_G, ver) == sl::Result::eOk)
-            LOG("DLSS-G ready: SL %u.%u.%u, NGX model %u.%u.%u\n", ver.versionSL.major, ver.versionSL.minor,
-                ver.versionSL.build, ver.versionNGX.major, ver.versionNGX.minor, ver.versionNGX.build);
-    }
     w.ok = true;
     return 0;
 }
 
-// ---------------------------------------------------------------- host (fork of dlssg2f Host)
+// ---------------------------------------------------------------- host
 
 struct Host
 {
@@ -247,37 +159,17 @@ struct Host
     ComPtr<IDXGIAdapter1> adapter;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<IDXGISwapChain3> sc;       // SL proxy
-    ComPtr<IDXGISwapChain3> scNative; // real swap chain behind the proxy
+    ComPtr<IDXGISwapChain3> sc;
     UINT nativeBufCount = 0;
-    ComPtr<ID3D12Resource> backbuffers[3];
-    ComPtr<ID3D12Resource> texFrame;
-    ComPtr<ID3D12Resource> texDepth;
-    ComPtr<ID3D12Resource> texMvec;
-    bool panOn = false;       // the pan as motion vectors (pan_vectors.h), set once its writer is up on the SL route
-    panvec::Estimator pan;    // measures each CPU frame against the one presented before
-    panvec::Writer panTex;    // writes texMvec
-    panvec::Result panNext;   // the next SL present's vectors (zero unless presentFrame measured its frame)
-    HANDLE panDone = nullptr; // set by the pool thread presentFrame hands its estimate to
-    struct
-    {
-        const uint8_t* src;
-        UINT pitch;
-        unsigned csr; // the presenting thread's float mode, so the pool thread's Result is the inline one
-    } panJob{};
-    ComPtr<ID3D12Resource> uploadBuf;     // the upload buffer presentFrame filled last (the init uploads use it too)
-    ComPtr<ID3D12Resource> uploadRing[2]; // the SL route's two: one fills while the GPU still copies from the other
-    uint64_t uploadFence[2]{};            // the fence value of the present that last copied from each
-    UINT uploadIdx = 0;
-    // the GPU handoff (Capture::dgInit): the capture device's two shared slots and its dgWrote opened here; dgCopied =
-    // this queue's fence the capture device waits on before rewriting a slot (dgCopiedH = its handle there)
-    ComPtr<ID3D12Resource> dgTex[2];
-    ComPtr<ID3D12Fence> dgWrote, dgCopied;
-    HANDLE dgCopiedH{};
-    uint64_t dgCopiedVal = 0;
-    int dgPend = -1;          // the slot the next present copies into the back buffer (presentShared), -1 = none
-    int dgLast = -1;          // the slot presented last (presentLast presents it again), -1 = a CPU frame was
-    uint64_t dgPendWrote = 0; // the dgWrote value that present waits for (still dgLast's when presentLast runs)
+    // the swap chain's buffers: 3, or a flip queue (flipQueue, set before init) for the display-timed presents
+    // (dtSet): a source frame's whole set of frames and the frames that wait ahead of it (dtSlack). DXGI's most: at
+    // one refresh a frame a set of six behind a wait of five fills a queue of 8, and its presents then block
+    static const UINT kFlipQueue = 16;
+    bool flipQueue = false;
+    UINT bufCount = 3;
+    ComPtr<ID3D12Resource> backbuffers[kFlipQueue];
+    ComPtr<ID3D12Resource> texFrame;  // the final enlarge's source for a frame that comes as a buffer (lzOn)
+    ComPtr<ID3D12Resource> uploadBuf; // the upload buffer presentFrame fills
     UINT rowPitch = 0;
     // Ring of 3 allocators so the slot-buffer presents can be PIPELINED (recorded while earlier
     // presents still execute); allocFence[i] gates reuse of allocs[i]. alloc stays an alias
@@ -295,20 +187,15 @@ struct Host
     // presents from it are still executing).
     uint64_t halfFence[2]{};
     HANDLE fenceEvent{};
-    sl::ViewportHandle vp{0u};
-    sl::Constants consts{};
-    uint32_t frameIndex = 1;
-    int genFrames = 1;
     UINT syncInterval = 0;
-    bool tearPresent = true; // pass DXGI_PRESENT_ALLOW_TEARING on sync-0 presents (server route)
-    uint32_t maxGen = 0;
-    uint32_t minWH = 0;          // DLSS-G minimum width/height once known
+    bool tearPresent = true;     // pass DXGI_PRESENT_ALLOW_TEARING on sync-0 presents
+    uint32_t maxGen = 0;         // DLSS frame generation's most frames a pair on this GPU, once NGX said (0 = not yet)
     uint32_t winW = 0, winH = 0; // the window's size when the frames are smaller (0 = W x H)
-    // THE FINAL ENLARGE (lzOn, DLSS 4.5 at the working size: loop.inl sets it with winW x winH): the swap chain, the
-    // session's own DLSS-G pass and its tags at winW x winH, every W x H frame it presents (its own, a helper's ring
-    // slot) enlarged into the back buffer by the native fit's Lanczos: k_fitAaH / V's taps (the native k_rsTab tables,
-    // lzTabFn), a horizontal pass into lzTmp (winW x H, fp32), a vertical pass into the back buffer with k_packOutV's /
-    // k_packOutHdrV's rounding (lzRecord)
+    // THE FINAL ENLARGE (lzOn, DLSS 4.5 at the working size: loop.inl sets it with winW x winH): the swap chain at
+    // winW x winH, every W x H frame the session presents (an effects slot, a stage's ring slot) enlarged into the
+    // back buffer by the native fit's Lanczos: k_fitAaH / V's taps (the native k_rsTab tables, lzTabFn), a horizontal
+    // pass into lzTmp (winW x H, fp32), a vertical pass into the back buffer with k_packOutV's / k_packOutHdrV's
+    // rounding (lzRecord)
     bool lzOn = false;
     // one axis's tap table (in -> out): the RsTap array (fs x out entries of {float w, int i}); 1 = the native k_rsTab,
     // 2 = its CPU port (the native pipeline not up), 0 = none
@@ -340,11 +227,9 @@ struct Host
     }
     int posX = 0, posY = 0; // overlay position (target window frame bounds)
     bool clickthrough = true;
-    bool park = false; // diagnostic: park the overlay offscreen like dlssg2f
-    bool useSL = true; // false = no Streamline anywhere (identity/server backends)
-    // Frame/swapchain pixel format. Server/identity routes run BGRA end-to-end (WGC's native
-    // order, no CPU swizzle anywhere); the DLSS-G route keeps its verified RGBA pipeline.
-    DXGI_FORMAT texFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    bool park = false; // diagnostic: park the overlay offscreen
+    // Frame/swapchain pixel format: BGRA end-to-end (WGC's native order, no CPU swizzle anywhere), R10G10B10A2 in HDR
+    DXGI_FORMAT texFmt = DXGI_FORMAT_B8G8R8A8_UNORM;
     // Direct-present path: a SHARED committed buffer in VRAM the server imports as CUDA external
     // memory and writes output slots into, so a presented frame never leaves the GPU.
     ComPtr<ID3D12Resource> outBuf;
@@ -418,6 +303,7 @@ struct Host
     int64_t refreshQpc100 = 0;
     DXGI_FRAME_STATISTICS fsPrev{};
     bool fsValid = false;
+    uint32_t fsPrevRepeats = 0; // dtRepeats at fsPrev
     // DWM's own vblank counter (DwmGetCompositionTimingInfo): the desktop-wide refresh
     // cadence, independent of this swapchain's stats - separates "panel dropped below
     // its mode (VRR)" from "our swapchain misses refreshes".
@@ -469,52 +355,36 @@ struct Host
         scd.Format = texFmt;
         scd.SampleDesc = {1, 0};
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        scd.BufferCount = 3;
+        scd.BufferCount = bufCount = flipQueue ? kFlipQueue : 3;
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        // SL's pacer calls SetMaximumFrameLatency and presents with DXGI_PRESENT_ALLOW_TEARING
+        // the flip queue sets its frame latency (SetMaximumFrameLatency), sync-0 presents pass ALLOW_TEARING
         scd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
         ComPtr<IDXGISwapChain1> sc1;
         if (FAILED(factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &scd, nullptr, nullptr, &sc1)))
             return false;
         if (FAILED(sc1.As(&sc)))
             return false;
-        for (UINT i = 0; i < 3; i++)
+        // a waitable swap chain starts at a frame latency of 1: the flip queue takes a source frame's whole set
+        if (flipQueue && FAILED(sc->SetMaximumFrameLatency(kFlipQueue)))
+            return false;
+        for (UINT i = 0; i < bufCount; i++)
             if (FAILED(sc->GetBuffer(i, IID_PPV_ARGS(&backbuffers[i]))))
                 return false;
 
-        if (useSL)
-        {
-            ComPtr<IUnknown> nativeUnk;
-            if (slGetNativeInterface(sc.Get(), (void**)nativeUnk.GetAddressOf()) != sl::Result::eOk)
-                return false;
-            if (FAILED(nativeUnk.As(&scNative)))
-                return false;
-        }
-        else
-        {
-            scNative = sc; // no SL proxy in the way: the swap chain IS the native one
-        }
         // Declare the color space explicitly rather than letting DXGI infer it. SDR = G22/P709
         // (correct intent for the 8-bit present, removes the HDR-desktop ambiguity); HDR = G2084/P2020
-        // (PQ) so DWM composites our R10G10B10A2 buffer as HDR. On the SL route set it on
-        // the PROXY swapchain too - the interposer only learns the colorspace from calls it can
-        // hook, and DLSS-G with an R10A2 backbuffer but no declared HDR10 colorspace silently
-        // passes through (measured: status=0 yet actuallyPresented stuck at 1 until this call).
+        // (PQ) so DWM composites our R10G10B10A2 buffer as HDR.
         const DXGI_COLOR_SPACE_TYPE cs =
             g_hdr ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         UINT csSupport = 0;
-        if (SUCCEEDED(scNative->CheckColorSpaceSupport(cs, &csSupport)) &&
+        if (SUCCEEDED(sc->CheckColorSpaceSupport(cs, &csSupport)) &&
             (csSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
-        {
-            scNative->SetColorSpace1(cs);
-            if (useSL)
-                sc->SetColorSpace1(cs);
-        }
+            sc->SetColorSpace1(cs);
         else if (g_hdr)
             LOG("WARNING: PQ color space not accepted by the swapchain; HDR present may look wrong\n");
 
         DXGI_SWAP_CHAIN_DESC1 nd{};
-        scNative->GetDesc1(&nd);
+        sc->GetDesc1(&nd);
         nativeBufCount = nd.BufferCount;
         if (logIt)
             LOG("native swap chain: %ux%u fmt=%d buffers=%u (colorspace: %s)\n", nd.Width, nd.Height, (int)nd.Format,
@@ -524,13 +394,9 @@ struct Host
 
     int init()
     {
-        // HDR presents R10G10B10A2 (PQ, still 4 bytes/px) on a G2084 swapchain, BOTH
-        // routes: DLSS-G mandates exactly RGB10 + BT.2100 PQ for HDR (SL guide 11.0, FP16
-        // scRGB explicitly unsupported), so the DLSS-G route rides the same format as the server route.
-        // DLSS-G over the echo route presents the server's BGRA slots (DLSS-G takes any UNORM colour format)
-        texFmt = g_hdr                  ? DXGI_FORMAT_R10G10B10A2_UNORM
-                 : (useSL && !g_fgOver) ? DXGI_FORMAT_R8G8B8A8_UNORM
-                                        : DXGI_FORMAT_B8G8R8A8_UNORM;
+        // HDR presents R10G10B10A2 (PQ, still 4 bytes/px) on a G2084 swapchain on every route: DLSS frame
+        // generation takes exactly RGB10 + BT.2100 PQ for HDR (FP16 scRGB is not supported there)
+        texFmt = g_hdr ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
         WNDCLASSW wc{};
         wc.lpfnWndProc = wndProc;
         wc.hInstance = GetModuleHandleW(nullptr);
@@ -540,12 +406,9 @@ struct Host
         // click-through: WS_EX_TRANSPARENT + WS_EX_LAYERED at full alpha lets input fall
         // through to the real window underneath while DWM still composits our presents.
         // The overlay NEVER activates (WS_EX_NOACTIVATE, shown with SW_SHOWNOACTIVATE), so a
-        // live start or resume never takes the user's focus. Streamline pauses DLSS-G while its
-        // window is not the foreground; the focus shim (sl_focus_shim.h, installed after the
-        // "DLSS-G ready" line) answers that test with this window, and SMV_DLSSG_FOCUS_SHIM=0
-        // leaves the pacer in passthrough (numFramesActuallyPresented=1) whenever another window
-        // has focus. TOOLWINDOW keeps the overlay out of alt-tab and the taskbar: the user
-        // alt-tabs between real apps, and the pause below handles the rest.
+        // live start or resume never takes the user's focus. TOOLWINDOW keeps the overlay out of
+        // alt-tab and the taskbar: the user alt-tabs between real apps, and the pause below
+        // handles the rest.
         DWORD ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
         if (clickthrough)
             ex |= WS_EX_LAYERED | WS_EX_TRANSPARENT;
@@ -572,52 +435,23 @@ struct Host
         }
         pumpMessages();
 
-        // a prewarmed host made the device and asked Streamline before this session existed
-        if (!(useSL && g_slWarm.ok))
+        // a prewarmed host made the device before this session existed
+        if (!g_devWarm.ok)
         {
-            g_slWarm = SlWarm{};
-            if (const int rc = slDeviceInit(g_slWarm, useSL))
+            g_devWarm = DeviceWarm{};
+            if (const int rc = deviceInit(g_devWarm))
                 return rc;
         }
-        factory = g_slWarm.factory;
-        adapter = g_slWarm.adapter;
-        device = g_slWarm.device;
-        g_slWarm = SlWarm{};
-        if (useSL)
-            installFocusShim(hwnd);
+        factory = g_devWarm.factory;
+        adapter = g_devWarm.adapter;
+        device = g_devWarm.device;
+        g_devWarm = DeviceWarm{};
 
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         CHECK_HR(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)));
         if (!createSwapchain(true))
             return 1;
-
-        if (useSL)
-        {
-            sl::ReflexOptions ro{};
-            ro.mode = sl::ReflexMode::eLowLatency;
-            CHECK_SL(slReflexSetOptions(ro));
-
-            sl::DLSSGOptions go{};
-            go.mode = sl::DLSSGMode::eOn;
-            go.numFramesToGenerate = (uint32_t)genFrames;
-            go.mvecDepthWidth = panvec::vecSize(scW());
-            go.mvecDepthHeight = panvec::vecSize(scH());
-            CHECK_SL(slDLSSGSetOptions(vp, go));
-
-            sl::DLSSGState st{};
-            if (slDLSSGGetState(vp, st, nullptr) == sl::Result::eOk)
-            {
-                maxGen = st.numFramesToGenerateMax;
-                minWH = st.minWidthOrHeight;
-            }
-            if (maxGen && (uint32_t)genFrames > maxGen)
-            {
-                LOG("multi-frame generation beyond %ux is not supported on this GPU (requested %ux)\n", maxGen + 1,
-                    genFrames + 1);
-                return 3;
-            }
-        }
 
         for (int i = 0; i < 3; i++)
             CHECK_HR(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocs[i])));
@@ -630,19 +464,16 @@ struct Host
 
         rowPitch = (W * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
 
-        auto makeTex = [&](DXGI_FORMAT fmt, ComPtr<ID3D12Resource>& tex,
-                           D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE, uint32_t tw = W,
-                           uint32_t th = H) -> bool {
+        auto makeTex = [&](DXGI_FORMAT fmt, ComPtr<ID3D12Resource>& tex) -> bool {
             D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
             D3D12_RESOURCE_DESC rd{};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            rd.Width = tw;
-            rd.Height = th;
+            rd.Width = W;
+            rd.Height = H;
             rd.DepthOrArraySize = 1;
             rd.MipLevels = 1;
             rd.Format = fmt;
             rd.SampleDesc = {1, 0};
-            rd.Flags = flags;
             return SUCCEEDED(device->CreateCommittedResource(
                 &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)));
         };
@@ -660,105 +491,20 @@ struct Host
             return SUCCEEDED(
                 device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(&buf)));
         };
-        // texFrame = the SL route's staging copy (the server route copies the footprint straight into the back buffer)
-        const uint32_t vw = panvec::vecSize(scW()), vh = panvec::vecSize(scH());
-        if ((useSL &&
-             (!makeTex(texFmt, texFrame) ||
-              !makeTex(DXGI_FORMAT_R32_FLOAT, texDepth, D3D12_RESOURCE_FLAG_NONE, vw, vh) ||
-              !makeTex(DXGI_FORMAT_R16G16_FLOAT, texMvec, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, vw, vh))) ||
-            !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadRing[0]) ||
-            (useSL &&
-             !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadRing[1])))
+        // texFrame = the final enlarge's staging copy of a frame that comes as a buffer (every other frame's footprint
+        // is copied straight into the back buffer)
+        if ((lzOn && !makeTex(texFmt, texFrame)) ||
+            !makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)rowPitch * H, D3D12_RESOURCE_STATE_GENERIC_READ, uploadBuf))
         {
             LOG("resource creation failed\n");
             return 1;
-        }
-        uploadBuf = uploadRing[0];
-
-        // fill depth (flat 0.5) + mvec (zero) once, via an upload buffer of their own size (SL tag inputs)
-        if (useSL)
-        {
-            const UINT tagPitch =
-                (vw * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-            ComPtr<ID3D12Resource> tagUp;
-            if (!makeBuf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)tagPitch * vh, D3D12_RESOURCE_STATE_GENERIC_READ, tagUp))
-            {
-                LOG("resource creation failed\n");
-                return 1;
-            }
-            const std::vector<float> depthRow(vw, 0.5f);
-            uint8_t* dst = nullptr;
-            CHECK_HR(tagUp->Map(0, nullptr, (void**)&dst));
-            for (uint32_t y = 0; y < vh; y++)
-                memcpy(dst + (size_t)y * tagPitch, depthRow.data(), (size_t)vw * 4);
-            tagUp->Unmap(0, nullptr);
-
-            alloc->Reset();
-            list->Reset(alloc.Get(), nullptr);
-            D3D12_TEXTURE_COPY_LOCATION dl{texDepth.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            D3D12_TEXTURE_COPY_LOCATION sl_{tagUp.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-            sl_.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, vw, vh, 1, tagPitch};
-            list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
-            list->Close();
-            ID3D12CommandList* ls[] = {list.Get()};
-            queue->ExecuteCommandLists(1, ls);
-            if (!waitQueue())
-                return 1;
-
-            CHECK_HR(tagUp->Map(0, nullptr, (void**)&dst));
-            for (uint32_t y = 0; y < vh; y++)
-                memset(dst + (size_t)y * tagPitch, 0, (size_t)vw * 4);
-            tagUp->Unmap(0, nullptr);
-            alloc->Reset();
-            list->Reset(alloc.Get(), nullptr);
-            dl.pResource = texMvec.Get();
-            sl_.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
-            list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
-            D3D12_RESOURCE_BARRIER bs[2]{};
-            for (int i = 0; i < 2; i++)
-            {
-                bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                bs[i].Transition.pResource = i ? texDepth.Get() : texMvec.Get();
-                bs[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                bs[i].Transition.StateAfter =
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            }
-            list->ResourceBarrier(2, bs);
-            list->Close();
-            queue->ExecuteCommandLists(1, ls);
-            if (!waitQueue())
-                return 1;
-        }
-        if (useSL)
-        {
-            panOn = panTex.init(device.Get(), texMvec.Get(), scW(), scH());
-            if (!panOn)
-                LOG("pan vectors: the descriptor heaps did not allocate, zero vectors\n");
         }
         if (lzOn && !lzInit())
         {
             LOG("DLSS 4.5's final enlarge: its passes did not build\n");
             return 1;
         }
-
-        fillConstants(consts);
         return 0;
-    }
-
-    // a pan measured on a W x H frame, for the winW x winH vectors (lzOn): the shift scaled, a still rect outward
-    panvec::Result panForTags(const panvec::Result& r) const
-    {
-        if (!lzOn || !r.on)
-            return r;
-        const double sx = (double)winW / W, sy = (double)winH / H;
-        panvec::Result o = r;
-        o.mx = (float)(r.mx * sx);
-        o.my = (float)(r.my * sy);
-        for (D3D12_RECT& q : o.still)
-            q = {(LONG)floor(q.left * sx), (LONG)floor(q.top * sy), (LONG)ceil(q.right * sx),
-                 (LONG)ceil(q.bottom * sy)};
-        return o;
     }
 
     // ---- the final enlarge (lzOn) ----
@@ -850,7 +596,7 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&lzSrv))))
             return false;
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 4;
+        hd.NumDescriptors = 1 + bufCount;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&lzRtv))))
             return false;
@@ -872,7 +618,7 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             return false;
         D3D12_CPU_DESCRIPTOR_HANDLE r = lzRtv->GetCPUDescriptorHandleForHeapStart();
         device->CreateRenderTargetView(lzTmp.Get(), nullptr, r);
-        for (UINT i = 0; i < 3; i++)
+        for (UINT i = 0; i < bufCount; i++)
         {
             r.ptr += lzRtvInc;
             device->CreateRenderTargetView(backbuffers[i].Get(), nullptr, r);
@@ -1124,118 +870,18 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         LOG("DLSS 4.5's final enlarge: enlarge %llu dumped to %s\n", (unsigned long long)lzCount, lzDumpDir.c_str());
     }
 
-    // the session's pan vector summary
-    void logPan() const
-    {
-        if (!panOn || !pan.frames)
-            return;
-        char rb[64] = "";
-        if (pan.readMs > 0) // the effects route's slots: the readback and the measure together
-            snprintf(rb, sizeof(rb), ", %.2f ms a frame with the slot readback", pan.readMs / (double)pan.frames);
-        LOG("pan vectors: %llu of %llu frames moved (mean %.1f px, %.1f %% of their area still), %.2f ms a frame "
-            "(max %.2f)%s\n",
-            (unsigned long long)pan.tagged, (unsigned long long)pan.frames,
-            pan.tagged ? pan.sumLen / (double)pan.tagged : 0.0,
-            pan.tagged ? 100.0 * pan.sumStill / (double)pan.tagged : 0.0, pan.sumMs / (double)pan.frames, pan.maxMs,
-            rb);
-    }
-
     // CPU path: copy a frame into the upload buffer, then run the present tail.
-    // srcPitch = source row stride in bytes (0 = tight W*4; shm slots are 256-aligned); swz = BGRA rows (the mapped
-    // capture), swapped to the route's RGBA on the way in.
-    bool presentFrame(const uint8_t* rgba, UINT srcPitch = 0, bool swz = false)
+    // srcPitch = source row stride in bytes (0 = tight W*4; shm slots are 256-aligned)
+    bool presentFrame(const uint8_t* px, UINT srcPitch = 0)
     {
         if (!srcPitch)
             srcPitch = W * 4;
-        // the estimate (R and B in either order) reads the frame on a pool thread while this one copies it into the
-        // upload buffer
-        const bool panAsync = panOn && startPan(rgba, srcPitch);
-        if (panOn && !panAsync)
-            panNext = pan.run(rgba, W, H, srcPitch, texFmt == DXGI_FORMAT_R10G10B10A2_UNORM);
-        // the SL route's presents do not wait for the GPU: fill the ring's other buffer once its last copy ran
-        bool ringFree = true;
-        if (useSL)
-        {
-            uploadIdx ^= 1;
-            uploadBuf = uploadRing[uploadIdx];
-            if (fence->GetCompletedValue() < uploadFence[uploadIdx])
-            {
-                fence->SetEventOnCompletion(uploadFence[uploadIdx], fenceEvent);
-                ringFree = WaitForSingleObject(fenceEvent, 5000) == WAIT_OBJECT_0;
-            }
-        }
         uint8_t* dst = nullptr;
-        const bool mapped = ringFree && SUCCEEDED(uploadBuf->Map(0, nullptr, (void**)&dst));
-        if (mapped)
-        {
-            copyRows(dst, rowPitch, rgba, srcPitch, W, H, swz);
-            uploadBuf->Unmap(0, nullptr);
-        }
-        if (panAsync)
-            WaitForSingleObject(panDone, INFINITE); // the caller may reuse rgba once this returns
-        if (!mapped)
+        if (FAILED(uploadBuf->Map(0, nullptr, (void**)&dst)))
             return false;
+        copyRows(dst, rowPitch, px, srcPitch, W, H);
+        uploadBuf->Unmap(0, nullptr);
         return presentTail(uploadBuf.Get(), 0, rowPitch);
-    }
-
-    // the capture device's half of the GPU handoff (its slots' and dgWrote's handles); false = unavailable, closed again
-    bool dgOpen(HANDLE t0, HANDLE t1, HANDLE wrote)
-    {
-        dgClose();
-        const HANDLE th[2] = {t0, t1};
-        bool ok = true;
-        for (int i = 0; i < 2 && ok; i++)
-            ok = SUCCEEDED(device->OpenSharedHandle(th[i], IID_PPV_ARGS(&dgTex[i])));
-        ok = ok && SUCCEEDED(device->OpenSharedHandle(wrote, IID_PPV_ARGS(&dgWrote))) &&
-             SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&dgCopied))) &&
-             SUCCEEDED(device->CreateSharedHandle(dgCopied.Get(), nullptr, GENERIC_ALL, nullptr, &dgCopiedH));
-        if (!ok)
-            dgClose();
-        return ok;
-    }
-
-    void dgClose()
-    {
-        for (auto& t : dgTex)
-            t.Reset();
-        dgWrote.Reset();
-        dgCopied.Reset();
-        if (dgCopiedH)
-            CloseHandle(dgCopiedH);
-        dgCopiedH = nullptr;
-        dgCopiedVal = 0;
-        dgPend = dgLast = -1;
-    }
-
-    // the GPU handoff's present: the estimate on the frame's 1/4 thumbnail (rows `pitch` apart), then slot `slot`
-    // copied into the back buffer once the capture device's dgWrote reaches `wrote`. Returns the dgCopied value that
-    // frees the slot, 0 = the present failed
-    uint64_t presentShared(const uint8_t* thumb, UINT pitch, int slot, uint64_t wrote)
-    {
-        if (panOn)
-            panNext = pan.runThumb(thumb, pitch, W, H);
-        dgPend = slot;
-        dgPendWrote = wrote;
-        return presentTail(nullptr, 0, 0) ? dgCopiedVal : 0;
-    }
-
-    // queues pan.run on the thread pool; false = no event or no pool thread, the caller measures inline
-    bool startPan(const uint8_t* rgba, UINT srcPitch)
-    {
-        if (!panDone && !(panDone = CreateEventW(nullptr, FALSE, FALSE, nullptr)))
-            return false;
-        panJob = {rgba, srcPitch, _mm_getcsr()};
-        return TrySubmitThreadpoolCallback(
-                   [](PTP_CALLBACK_INSTANCE, void* ctx) {
-                       Host* h = (Host*)ctx;
-                       const unsigned csr = _mm_getcsr();
-                       _mm_setcsr(h->panJob.csr);
-                       h->panNext =
-                           h->pan.run(h->panJob.src, W, H, h->panJob.pitch, h->texFmt == DXGI_FORMAT_R10G10B10A2_UNORM);
-                       _mm_setcsr(csr);
-                       SetEvent(h->panDone);
-                   },
-                   this, nullptr) != FALSE;
     }
 
     bool presentTail(ID3D12Resource* src, UINT64 srcOffset, UINT srcPitch)
@@ -1248,17 +894,13 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         return ok;
     }
 
-    // src null on the SL route = the GPU handoff's slot dgPend (presentShared), else its slot presented last again
-    // (presentLast; the caller moves that slot's dgFree to dgCopiedVal), else texFrame as it is (the last CPU frame)
     bool presentTailInner(ID3D12Resource* src, UINT64 srcOffset, UINT srcPitch)
     {
         pumpMessages();
-        const int pend = src ? -1 : dgPend >= 0 ? dgPend : dgLast;
-        dgPend = -1;
 
-        // Pipelining: the shared VRAM slot buffer (stable until the next group) and, on the SL route, a CPU frame
-        // (its upload buffer = one of uploadRing's two, see the end). Any other source stays fully synchronous.
-        const bool pipelined = !useSL && outBuf && src == outBuf.Get();
+        // Pipelining: the shared VRAM slot buffer (stable until the next group). Any other source stays fully
+        // synchronous.
+        const bool pipelined = outBuf && src == outBuf.Get();
         const UINT ai = allocIdx;
         allocIdx = (allocIdx + 1) % 3;
         if (allocFence[ai] && fence->GetCompletedValue() < allocFence[ai])
@@ -1270,32 +912,12 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             prMsWait += (nowQpc100() - tw) / 1e4;
         }
 
-        sl::FrameToken* tok{};
-        if (useSL)
-        {
-            uint32_t fi = frameIndex++;
-            if (slGetNewFrameToken(tok, &fi) != sl::Result::eOk)
-                return false;
-
-            slReflexSleep(*tok);
-            slPCLSetMarker(sl::PCLMarker::eSimulationStart, *tok);
-            if (slSetConstants(consts, *tok, vp) != sl::Result::eOk)
-                return false;
-            slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *tok);
-        }
-
         UINT bb = sc->GetCurrentBackBufferIndex();
         if (lzOn && !lzTables())
             return false;
 
         allocs[ai]->Reset();
         list->Reset(allocs[ai].Get(), nullptr);
-        if (panOn)
-        {
-            // a frame presentFrame measured carries its vectors; a slot of the shared VRAM ring keeps zero
-            panTex.record(list.Get(), texMvec.Get(), panForTags(panNext));
-            panNext = panvec::Result{};
-        }
         D3D12_TEXTURE_COPY_LOCATION sl_{src, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         sl_.PlacedFootprint.Offset = srcOffset;
         sl_.PlacedFootprint.Footprint = {texFmt, W, H, 1, srcPitch};
@@ -1303,32 +925,11 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        if (useSL && pend >= 0)
+        if (lzOn)
         {
-            // the capture device's slot (resting in COMMON) straight into the back buffer
-            D3D12_RESOURCE_BARRIER bs[2]{b, b};
-            bs[0].Transition.pResource = dgTex[pend].Get();
-            bs[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-            bs[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            bs[1].Transition.pResource = backbuffers[bb].Get();
-            bs[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-            bs[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-            list->ResourceBarrier(2, bs);
-            list->CopyResource(backbuffers[bb].Get(), dgTex[pend].Get());
-            for (D3D12_RESOURCE_BARRIER& x : bs)
-                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
-            list->ResourceBarrier(2, bs);
-            dgLast = pend;
-        }
-        else if (useSL && lzOn)
-        {
-            // the final enlarge: texFrame (W x H) into the back buffer
+            // the final enlarge: the frame (W x H) through texFrame into the back buffer
             D3D12_TEXTURE_COPY_LOCATION dl{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            if (src)
-            {
-                list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
-                dgLast = -1;
-            }
+            list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
             b.Transition.pResource = texFrame.Get();
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -1337,36 +938,9 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
             list->ResourceBarrier(1, &b);
         }
-        else if (useSL)
-        {
-            // SL route: stage through texFrame (unchanged, verified pipeline)
-            D3D12_TEXTURE_COPY_LOCATION dl{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            if (src)
-            {
-                list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
-                dgLast = -1;
-            }
-            b.Transition.pResource = texFrame.Get();
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            list->ResourceBarrier(1, &b);
-            b.Transition.pResource = backbuffers[bb].Get();
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-            list->ResourceBarrier(1, &b);
-            list->CopyResource(backbuffers[bb].Get(), texFrame.Get());
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-            list->ResourceBarrier(1, &b);
-            b.Transition.pResource = texFrame.Get();
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-            list->ResourceBarrier(1, &b);
-        }
         else
         {
-            // server/identity route: footprint-copy straight into the backbuffer, no
-            // texFrame hop (one less full-frame GPU copy per present)
+            // the footprint copied straight into the back buffer
             b.Transition.pResource = backbuffers[bb].Get();
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -1379,93 +953,27 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         }
         list->Close();
 
-        if (useSL)
+        ID3D12CommandList* ls[] = {list.Get()};
+        queue->ExecuteCommandLists(1, ls);
+        const int64_t tp = nowQpc100();
+        HRESULT hr = presentPlain();
+        const int64_t tp2 = nowQpc100();
+        prMsFlip += (tp2 - tp) / 1e4;
+        if (prLastQpc100 && refreshQpc100 && tp2 - prLastQpc100 < refreshQpc100 / 2)
+            prBunch++;
+        if (prLastQpc100)
+            recordSpacing((double)(tp2 - prLastQpc100) / 1e4);
+        prLastQpc100 = tp2;
+        if (FAILED(hr))
         {
-            sl::Extent vecExtent{0, 0, panvec::vecSize(scW()), panvec::vecSize(scH())};
-            sl::Resource depthRes(sl::ResourceType::eTex2d, texDepth.Get(),
-                                  (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-            depthRes.width = vecExtent.width;
-            depthRes.height = vecExtent.height;
-            depthRes.nativeFormat = DXGI_FORMAT_R32_FLOAT;
-            sl::Resource mvecRes(sl::ResourceType::eTex2d, texMvec.Get(),
-                                 (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-            mvecRes.width = vecExtent.width;
-            mvecRes.height = vecExtent.height;
-            mvecRes.nativeFormat = DXGI_FORMAT_R16G16_FLOAT;
-            // NOTE: do NOT tag kBufferTypeBackbuffer (see dlssg-two-frame: it flips sl.dlss_g
-            // into the subrect present path)
-            sl::ResourceTag tags[] = {
-                sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &vecExtent),
-                sl::ResourceTag(&mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
-                                &vecExtent),
-            };
-            if (slSetTagForFrame(*tok, vp, tags, _countof(tags), nullptr) != sl::Result::eOk)
-                return false;
-
-            slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *tok);
-            ID3D12CommandList* ls[] = {list.Get()};
-            if (pend >= 0)
-                queue->Wait(dgWrote.Get(), dgPendWrote); // the capture device wrote the slot
-            queue->ExecuteCommandLists(1, ls);
-            if (pend >= 0)
-                queue->Signal(dgCopied.Get(), ++dgCopiedVal); // the slot may be rewritten
-            slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *tok);
-
-            slPCLSetMarker(sl::PCLMarker::ePresentStart, *tok);
-            HRESULT hr = presentSl();
-            slPCLSetMarker(sl::PCLMarker::ePresentEnd, *tok);
-            if (FAILED(hr))
-            {
-                LOG("Present failed hr=0x%08lx\n", hr);
-                return false;
-            }
-        }
-        else
-        {
-            ID3D12CommandList* ls[] = {list.Get()};
-            queue->ExecuteCommandLists(1, ls);
-            const int64_t tp = nowQpc100();
-            // ALLOW_TEARING (sync interval 0 only): without it DXGI throttles the flip queue
-            // to the panel's refresh, so an above-refresh output target (1000fps on a 360Hz
-            // panel) cannot get its Presents out. The swapchain always carries the tearing
-            // FLAG, but if the runtime ever rejects the PRESENT flag, drop it permanently
-            // rather than failing the session.
-            HRESULT hr = sc->Present(syncInterval, (syncInterval == 0 && tearPresent) ? DXGI_PRESENT_ALLOW_TEARING : 0);
-            if (hr == DXGI_ERROR_INVALID_CALL && syncInterval == 0 && tearPresent)
-            {
-                tearPresent = false;
-                LOG("present: ALLOW_TEARING rejected, falling back to plain sync-0 presents\n");
-                hr = sc->Present(0, 0);
-            }
-            const int64_t tp2 = nowQpc100();
-            prMsFlip += (tp2 - tp) / 1e4;
-            if (prLastQpc100 && refreshQpc100 && tp2 - prLastQpc100 < refreshQpc100 / 2)
-                prBunch++;
-            if (prLastQpc100)
-                recordSpacing((double)(tp2 - prLastQpc100) / 1e4);
-            prLastQpc100 = tp2;
-            if (FAILED(hr))
-            {
-                LOG("Present failed hr=0x%08lx\n", hr);
-                return false;
-            }
+            LOG("Present failed hr=0x%08lx\n", hr);
+            return false;
         }
 
         queue->Signal(fence.Get(), ++fenceValue);
         allocFence[ai] = fenceValue;
         if (pipelined)
             return true;
-        if (useSL && !src)
-            return true; // the slot (or texFrame) is the GPU's alone (the capture device waits on dgCopied)
-        if (useSL && src == uploadBuf.Get())
-        {
-            // a CPU frame on the SL route: the next one fills the ring's other buffer, this one is free once the fence
-            // passes (the queue keeps the copies in order; the allocator ring bounds the frames in flight)
-            uploadFence[uploadIdx] = fenceValue;
-            return true;
-        }
         if (fence->GetCompletedValue() < fenceValue)
         {
             fence->SetEventOnCompletion(fenceValue, fenceEvent);
@@ -1475,34 +983,291 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         return true;
     }
 
-    // A present through Streamline's proxy (the DLSS-G route). Sync interval 0 passes ALLOW_TEARING, as the server
-    // route's presents do: a rate past the panel's refresh is allowed to tear on every route. (The flag does not lift
-    // the hold of this session's own DLSS-G pass to the refresh on a 60 Hz mode: the live loop's refresh hold does.)
-    // A runtime that rejects the flag gets plain sync-0 presents from then on. SMV_LIVE_SL_TEAR=0 = without the flag
-    // (the A/B)
-    bool slTear = [] {
-        wchar_t v[4]{};
-        return !(GetEnvironmentVariableW(L"SMV_LIVE_SL_TEAR", v, 4) == 1 && v[0] == L'0');
-    }();
-    HRESULT presentSl()
+    // a present on the swap chain. ALLOW_TEARING (sync interval 0 only): without it DXGI throttles the flip queue to
+    // the panel's refresh, so an above-refresh output target (1000fps on a 360Hz panel) cannot get its Presents out.
+    // The swapchain always carries the tearing FLAG, but if the runtime ever rejects the PRESENT flag, drop it
+    // permanently rather than failing the session.
+    HRESULT presentPlain()
     {
-        HRESULT hr = sc->Present(syncInterval, syncInterval == 0 && slTear ? DXGI_PRESENT_ALLOW_TEARING : 0);
-        if (hr == DXGI_ERROR_INVALID_CALL && syncInterval == 0 && slTear)
+        HRESULT hr = sc->Present(syncInterval, (syncInterval == 0 && tearPresent) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        if (hr == DXGI_ERROR_INVALID_CALL && syncInterval == 0 && tearPresent)
         {
-            slTear = false;
-            LOG("present: ALLOW_TEARING rejected on the DLSS-G route, falling back to plain sync-0 presents\n");
+            tearPresent = false;
+            LOG("present: ALLOW_TEARING rejected, falling back to plain sync-0 presents\n");
             hr = sc->Present(0, 0);
         }
         return hr;
     }
 
-    // The live cascade's stage 2: present a texture another device fills (a stage-1
-    // ring slot resting in COMMON, the same format and size as the back buffer) once `wf` reaches `wv` on this queue;
-    // presentTailInner's SL sequence with the slot copied straight into the back buffer
-    bool presentRing(ID3D12Resource* tex, ID3D12Fence* wf, uint64_t wv)
+    // DISPLAY-TIMED PRESENTS (a DLSS 4.5 session presenting a stage's ring at a rate the panel can show: one
+    // to kDtStay refreshes a frame). The presented stage shares a source frame's frames together and each is queued
+    // here with a sync interval, the whole refreshes since the frame before it (a frame that stays more than DXGI's
+    // four is queued again for the rest, presentRing): the display gives every frame its time,
+    // exact to the refresh and without tearing, and the GPU is woken once a source frame instead of once a presented
+    // frame (a present timed on the CPU, sync interval 0, wakes it for every frame and holds its clock up). dtRatio =
+    // the refreshes a frame; a rate that is no whole divisor of the refresh gets the two whole intervals around it,
+    // mixed through dtAcc (2.4 = 2, 2, 3, 2, 3). The queue must not grow, or every later frame shows late: at a source
+    // frame's first frame dtShown (the refresh the frame queued last shows at, counted as the swap chain's statistics
+    // count) says how many whole refreshes the new frame would wait behind the queue: its wait. A source's frames do
+    // not come evenly (a player's own presents land some refreshes early or late), so the wait moves with every
+    // source frame and what it needs is the source's: a frame that comes after the queue ran empty shows at the next
+    // refresh (the frame before it stayed longer, the source was late) and the queue is that much ahead from then on,
+    // which covers the next frame that late. The wait is given back only when it was not needed: when the least wait
+    // of the last two windows (four seconds of source frames) left more than one refresh spare, the spare whole
+    // refreshes are taken out of dtAcc, so the next frames that have more than one refresh give them back, one
+    // refresh each; only at a rate near the refresh itself, where every frame has one, a frame is left out instead.
+    // A wait above dtSlack (a source that came far too early, the queue's room) is cut at once the same way.
+    bool dtOn = false;
+    double dtRatio = 0, dtAcc = 0;
+    double dtPeriod100 = 0;         // a refresh of the display mode, 100 ns
+    static const UINT kDtStay = 16; // the most refreshes a frame stays: four presents of it
+    double dtSlack = 2;             // the most whole refreshes a source frame's first frame may wait: two, or 24 ms
+    uint32_t dtRepeats = 0;         // presents that queued a frame again (no frames: the rates leave them out)
+    double dtMinPrev = 1e9, dtMinCur = 1e9; // the least wait of the window before and of this one
+    double dtWait = 0;                      // the last first frame's wait, refreshes (the refresh trace's figure)
+    double dtShown = 0;                     // valid once dtHave
+    bool dtHave = false;
+    // a vertical blank of the statistics: its count from the session's first one (dtRef0), its time
+    UINT dtRef0 = 0;
+    bool dtRefHave = false;
+    double dtSyncCount = 0;
+    int64_t dtSyncQpc = 0;
+    // the two-second window: where it began, the frames since, the first frames of a source frame's set that got a
+    // shorter interval, were left out, came late
+    double dtWin0 = 0;
+    double dtMeasPrev = 0; // the refreshes a frame as the window before this one's frames came (0 = none yet)
+    uint64_t dtWinFrames = 0;
+    uint32_t dtSets = 0, dtCuts = 0, dtLeft = 0, dtLate = 0;
+
+    // the plan's refreshes a frame (0 = not known) on a display mode of hz, plan = what tells one plan from another
+    // (its multiple and keep); true = the ring's frames are presented display-timed
+    double dtNomLast = 0, dtHz = 0;
+    int dtNomOff = 0, dtPlan = -1;
+    bool dtSet(double nominal, double hz, int plan)
+    {
+        const bool can = flipQueue && hz > 1.0 && nominal >= 0.95 && nominal <= kDtStay + 0.02;
+        if (can)
+        {
+            // a rate within 3 % of a whole divisor of the refresh is that divisor (23.976 for 24, a rate measured
+            // over two seconds); the window's own measure refines the rest
+            const double whole = floor(nominal + 0.5);
+            if (fabs(nominal - whole) < 0.03 * whole)
+                nominal = whole;
+            if (nominal < 1.0)
+                nominal = 1.0;
+        }
+        if (dtOn && plan == dtPlan && hz == dtHz && nominal > 0)
+        {
+            // the same plan on the same display mode: the nominal figure moves only with the source's rate as one
+            // stats window read it, and a window that got its frames late, then at once, reads 5 % and more off.
+            // That is no new rate: the pattern keeps the figure it measures itself (dtNext). Three such windows in
+            // a row are another rate
+            if (nominal != dtNomLast)
+            {
+                dtNomLast = nominal;
+                dtNomOff = !can || fabs(nominal - dtRatio) > 0.05 * dtRatio ? dtNomOff + 1 : 0;
+            }
+            if (dtNomOff < 3)
+                return true;
+        }
+        dtNomLast = nominal;
+        dtNomOff = 0;
+        dtPlan = plan;
+        dtHz = hz;
+        if (!can)
+        {
+            if (dtOn)
+                LOG("display-timed presents off at %.2f refreshes a frame: each frame presented at its time\n",
+                    nominal);
+            dtOn = false;
+            return false;
+        }
+        if (!dtOn || fabs(nominal - dtRatio) > 0.05 * dtRatio)
+        {
+            dtRatio = nominal;
+            dtPeriod100 = 1e7 / hz;
+            dtSlack = (std::max)(2.0, ceil(24e4 / dtPeriod100));
+            dtAcc = 0;
+            dtHave = false;
+            dtMeasPrev = 0;
+            dtMinPrev = dtMinCur = 1e9;
+            LOG("display-timed presents: %.3f refreshes a frame at %.0f Hz, a flip queue of %u, a wait of %.0f "
+                "refreshes at most\n",
+                dtRatio, hz, kFlipQueue, dtSlack);
+            dtOn = true;
+        }
+        return true;
+    }
+
+    // the refresh count now, fractional; fresh = read the statistics (once a source frame), else from the last read
+    bool dtRefresh(bool fresh, double& cur)
+    {
+        if (fresh || !dtSyncQpc)
+        {
+            DXGI_FRAME_STATISTICS fs{};
+            if (FAILED(sc->GetFrameStatistics(&fs)) || !fs.SyncQPCTime.QuadPart)
+            {
+                dtSyncQpc = 0;
+                return false;
+            }
+            if (!dtRefHave)
+            {
+                dtRef0 = fs.SyncRefreshCount;
+                dtRefHave = true;
+            }
+            dtSyncCount = (double)(UINT)(fs.SyncRefreshCount - dtRef0);
+            dtSyncQpc = fs.SyncQPCTime.QuadPart;
+        }
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        cur = dtSyncCount + (double)(c.QuadPart - dtSyncQpc) * 1e7 / (double)qpcFreq() / dtPeriod100;
+        return true;
+    }
+
+    // the next display-timed present's sync interval n; first = the first frame of a source frame's set; false = the
+    // frame is left out
+    bool dtNext(bool first, UINT& n)
+    {
+        dtAcc += dtRatio;
+        // the stay the pattern gives this frame: the whole refreshes in dtAcc, one at least, kDtStay at most
+        auto interval = [&] { return dtAcc < 1.0 ? 1u : dtAcc >= (double)kDtStay ? kDtStay : (UINT)dtAcc; };
+        double cur = 0;
+        const bool counted = dtRefresh(first, cur);
+        const double next = ceil(cur);
+        if (!counted || !dtHave)
+        {
+            // no count of refreshes (yet): the pattern alone
+            n = interval();
+            dtAcc -= n;
+            dtShown = next;
+            dtHave = counted;
+            dtWin0 = cur;
+            dtWinFrames = 1;
+            dtSets = dtCuts = dtLeft = dtLate = 0;
+            return true;
+        }
+        if (first)
+        {
+            // the refreshes a frame as the frames came, over two seconds: the plan's figure is a rate measured over
+            // a short window. A figure 5 % off is no measure of this rate (a pause, a new plan)
+            const double span = cur - dtWin0;
+            double spare = 0;
+            if (span * dtPeriod100 >= 2e7 && dtWinFrames > 8)
+            {
+                const double m = span / (double)dtWinFrames;
+                if (fabs(m - dtRatio) < 0.05 * dtRatio)
+                {
+                    const double whole = floor(m + 0.5);
+                    dtRatio = fabs(m - whole) < 0.004 * whole ? whole : 0.5 * (dtRatio + m);
+                    if (dtRatio < 1.0)
+                        dtRatio = 1.0;
+                }
+                else if (dtMeasPrev > 0 && fabs(m - dtMeasPrev) < 0.01 * m && m >= 0.95 && m <= kDtStay + 0.02)
+                {
+                    // two windows in a row came at the same rate, 5 % and more off the plan's figure: that is the
+                    // rate. The plan's figure is the source's rate over one stats window, a count of some ten
+                    // frames from a source under 10 fps, while this one counts every presented frame
+                    const double whole = floor(m + 0.5);
+                    dtRatio = fabs(m - whole) < 0.004 * whole ? whole : m;
+                    if (dtRatio < 1.0)
+                        dtRatio = 1.0;
+                    dtMinPrev = dtMinCur = 1e9;
+                }
+                dtMeasPrev = m;
+                // the wait no source frame of the last two windows needed, less one refresh kept; at a rate near the
+                // refresh, where giving a refresh back leaves a frame out, four are kept
+                const double least = (std::min)(dtMinPrev, dtMinCur), kept = dtRatio < 1.25 ? 4.0 : 1.0;
+                if (least < 1e8 && least >= kept + 1.0)
+                    spare = floor(least - kept);
+                LOG("display-timed: %.3f refreshes a frame (%.3f as they came), %u source frames: %u shortened, %u "
+                    "left out, %u late, least wait %.0f\n",
+                    dtRatio, m, dtSets, dtCuts, dtLeft, dtLate, dtMinCur < 1e8 ? dtMinCur : 0.0);
+                dtMinPrev = dtMinCur - spare;
+                dtMinCur = 1e9;
+                dtWin0 = cur;
+                dtWinFrames = 0;
+                dtSets = dtCuts = dtLeft = dtLate = 0;
+            }
+            dtSets++;
+            const double wait = dtShown + (double)interval() - next;
+            dtWait = wait;
+            if (wait > 1000.0)
+            {
+                // far more than a queue holds: the count of refreshes started again (another display mode)
+                dtShown = next;
+                dtAcc = dtRatio;
+                dtMinPrev = dtMinCur = 1e9;
+            }
+            else if (wait >= dtSlack)
+            {
+                const double cut = floor(wait - dtSlack) + 1.0;
+                dtAcc -= cut;
+                dtCuts++;
+                dtMinCur = (std::min)(dtMinCur, wait - cut);
+            }
+            else if (wait < -0.5)
+            {
+                // the frame before this one stayed -wait refreshes longer: that much of what dtAcc still owes is paid
+                dtLate++;
+                const double owed = dtRatio - dtAcc;
+                if (owed > 0)
+                    dtAcc += (std::min)(owed, -wait);
+                dtMinCur = (std::min)(dtMinCur, 0.0);
+            }
+            else
+            {
+                if (spare >= 1.0)
+                {
+                    dtAcc -= spare;
+                    dtCuts++;
+                }
+                dtMinCur = (std::min)(dtMinCur, wait - spare);
+            }
+        }
+        if (dtAcc < 0.5 && dtRatio < 1.25)
+        {
+            // every frame has one refresh and the queue is ahead: this frame's refresh is the one given back
+            dtLeft++;
+            dtWinFrames++;
+            return false;
+        }
+        n = interval();
+        dtAcc -= n;
+        dtShown = (std::max)(dtShown + n, next);
+        dtWinFrames++;
+        return true;
+    }
+
+    // A plan's presented stage on screen: present a texture another queue fills (a ring slot resting in COMMON, the
+    // same format and size as the back buffer, or W x H under the final enlarge) once `wf` reaches `wv` on this
+    // queue: the slot copied straight into the back buffer and a plain present, or a display-timed one (first = the
+    // first frame of a source frame's set)
+    bool presentRing(ID3D12Resource* tex, ID3D12Fence* wf, uint64_t wv, bool first = false)
     {
         const int64_t t0 = nowQpc100();
         pumpMessages();
+        UINT dtN = 0;
+        const bool left = dtOn && !dtNext(first, dtN);
+        if (rtRun && rtPres.size() < rtPres.capacity())
+            rtPres.push_back({t0, rtPubQpc, rtCapQpc, first ? dtWait : 0.0, dtAcc, dtN, first, left});
+        if (left)
+            return true; // left out: the queue is ahead of the display
+        // a sync interval ends at four refreshes: a frame that stays longer is queued again for the rest, in parts as
+        // equal as whole refreshes allow (6 = 3 + 3), so the display still times all of its stay
+        const UINT parts = dtN > 4 ? (dtN + 3) / 4 : 1;
+        for (UINT i = 0; i < parts; i++)
+            if (!presentRingOnce(tex, wf, wv, parts == 1 ? dtN : dtN / parts + (i < dtN % parts ? 1 : 0)))
+                return false;
+        dtRepeats += parts - 1;
+        prMsTot += (nowQpc100() - t0) / 1e4;
+        prN++;
+        lzDumpWrite();
+        return true;
+    }
+
+    // one present of presentRing: dtN = its sync interval on the display-timed route, 0 = a plain one
+    bool presentRingOnce(ID3D12Resource* tex, ID3D12Fence* wf, uint64_t wv, UINT dtN)
+    {
         const UINT ai = allocIdx;
         allocIdx = (allocIdx + 1) % 3;
         if (allocFence[ai] && fence->GetCompletedValue() < allocFence[ai])
@@ -1511,22 +1276,11 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             if (WaitForSingleObject(fenceEvent, 5000) != WAIT_OBJECT_0)
                 return false;
         }
-        sl::FrameToken* tok{};
-        uint32_t fi = frameIndex++;
-        if (slGetNewFrameToken(tok, &fi) != sl::Result::eOk)
-            return false;
-        slReflexSleep(*tok);
-        slPCLSetMarker(sl::PCLMarker::eSimulationStart, *tok);
-        if (slSetConstants(consts, *tok, vp) != sl::Result::eOk)
-            return false;
-        slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *tok);
         const UINT bb = sc->GetCurrentBackBufferIndex();
         if (lzOn && !lzTables())
             return false;
         allocs[ai]->Reset();
         list->Reset(allocs[ai].Get(), nullptr);
-        if (panOn) // stage 1's frames are a fraction of a source frame apart: zero vectors
-            panTex.record(list.Get(), texMvec.Get(), panvec::Result{});
         D3D12_RESOURCE_BARRIER b[2]{};
         for (auto& x : b)
         {
@@ -1559,34 +1313,10 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             list->ResourceBarrier(2, b);
         }
         list->Close();
-        sl::Extent vecExtent{0, 0, panvec::vecSize(scW()), panvec::vecSize(scH())};
-        sl::Resource depthRes(
-            sl::ResourceType::eTex2d, texDepth.Get(),
-            (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-        depthRes.width = vecExtent.width;
-        depthRes.height = vecExtent.height;
-        depthRes.nativeFormat = DXGI_FORMAT_R32_FLOAT;
-        sl::Resource mvecRes(
-            sl::ResourceType::eTex2d, texMvec.Get(),
-            (uint32_t)(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-        mvecRes.width = vecExtent.width;
-        mvecRes.height = vecExtent.height;
-        mvecRes.nativeFormat = DXGI_FORMAT_R16G16_FLOAT;
-        sl::ResourceTag tags[] = {
-            sl::ResourceTag(&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &vecExtent),
-            sl::ResourceTag(&mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
-                            &vecExtent),
-        };
-        if (slSetTagForFrame(*tok, vp, tags, _countof(tags), nullptr) != sl::Result::eOk)
-            return false;
-        queue->Wait(wf, wv); // the slot's copy on the other device is complete
-        slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *tok);
+        queue->Wait(wf, wv); // the slot's copy on the other queue is complete
         ID3D12CommandList* ls[] = {list.Get()};
         queue->ExecuteCommandLists(1, ls);
-        slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *tok);
-        slPCLSetMarker(sl::PCLMarker::ePresentStart, *tok);
-        const HRESULT hr = presentSl();
-        slPCLSetMarker(sl::PCLMarker::ePresentEnd, *tok);
+        const HRESULT hr = dtN ? sc->Present(dtN, 0) : presentPlain();
         if (FAILED(hr))
         {
             LOG("Present failed hr=0x%08lx\n", hr);
@@ -1600,9 +1330,6 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             if (WaitForSingleObject(fenceEvent, 5000) != WAIT_OBJECT_0)
                 return false;
         }
-        prMsTot += (nowQpc100() - t0) / 1e4;
-        prN++;
-        lzDumpWrite();
         return true;
     }
 
@@ -1659,23 +1386,110 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         return true;
     }
 
+    // SMV_LIVE_REFRESH_TRACE=<file> (a measurement aid, every Live route): a thread reads the swap chain's frame
+    // statistics every millisecond and keeps each reading that differs from the one before it: `<the reading's QPC>
+    // <the present on screen> <the refresh it came on> <the refresh count of the sync time> <the sync time> <the last
+    // present queued> <the time since the reading before>` (times in 100 ns), written at the session's end. Two rows
+    // in a row say how many refreshes a present stayed on screen, a present count that moves by more than one names
+    // presents that held no whole refresh, and queued less on screen is the flip queue's fill. The figure is the
+    // same whoever times the frames: a sync interval or a present timed on the CPU. Those rows
+    // begin with S. A ring frame's present (presentRing) adds a P row: `<the call's QPC> <when its stage shared the
+    // frame> <the newest capture's stamp> <a set's first frame: its wait in refreshes x 1000> <dtAcc x 1000> <the
+    // sync interval, 0 = timed on the CPU> <first of its set> <left out>`.
+    struct RefreshRow
+    {
+        int64_t qpc, syncQpc;
+        UINT shown, refresh, syncRefresh, queued;
+        uint32_t gap;
+    };
+    struct PresentRow
+    {
+        int64_t qpc, pub, cap;
+        double wait, acc;
+        UINT n;
+        bool first, left;
+    };
+    std::vector<RefreshRow> rtRows;
+    std::vector<PresentRow> rtPres;
+    int64_t rtPubQpc = 0, rtCapQpc = 0; // the loop's stamps of the ring frame presentRing takes next
+    std::thread rtThread;
+    std::atomic<bool> rtRun{false};
+    wchar_t rtPath[MAX_PATH] = L"";
+
+    void rtStart()
+    {
+        if (!GetEnvironmentVariableW(L"SMV_LIVE_REFRESH_TRACE", rtPath, MAX_PATH) || !sc)
+            return;
+        rtRows.reserve(1 << 18);
+        rtPres.reserve(1 << 18);
+        rtRun = true;
+        rtThread = std::thread([this] {
+            HANDLE t =
+                CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            LARGE_INTEGER due;
+            due.QuadPart = -10000;
+            DXGI_FRAME_STATISTICS last{};
+            int64_t prev = nowQpc100();
+            while (rtRun)
+            {
+                if (t && SetWaitableTimer(t, &due, 0, nullptr, nullptr, FALSE))
+                    WaitForSingleObject(t, 100);
+                else
+                    Sleep(1);
+                const int64_t now = nowQpc100();
+                DXGI_FRAME_STATISTICS fs{};
+                if (SUCCEEDED(sc->GetFrameStatistics(&fs)) && fs.SyncQPCTime.QuadPart &&
+                    (fs.PresentCount != last.PresentCount || fs.PresentRefreshCount != last.PresentRefreshCount ||
+                     fs.SyncRefreshCount != last.SyncRefreshCount) &&
+                    rtRows.size() < rtRows.capacity())
+                {
+                    UINT queued = 0;
+                    sc->GetLastPresentCount(&queued);
+                    rtRows.push_back({now, (int64_t)((double)fs.SyncQPCTime.QuadPart * 1e7 / (double)qpcFreq()),
+                                      fs.PresentCount, fs.PresentRefreshCount, fs.SyncRefreshCount, queued,
+                                      (uint32_t)(now - prev)});
+                    last = fs;
+                }
+                prev = now;
+            }
+            if (t)
+                CloseHandle(t);
+        });
+    }
+
+    void rtStop()
+    {
+        if (!rtThread.joinable())
+            return;
+        rtRun = false;
+        rtThread.join();
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, rtPath, L"w") == 0 && f)
+        {
+            for (const RefreshRow& r : rtRows)
+                fprintf(f, "S %lld %u %u %u %lld %u %u\n", (long long)r.qpc, r.shown, r.refresh, r.syncRefresh,
+                        (long long)r.syncQpc, r.queued, r.gap);
+            for (const PresentRow& r : rtPres)
+                fprintf(f, "P %lld %lld %lld %.0f %.0f %u %d %d\n", (long long)r.qpc, (long long)r.pub,
+                        (long long)r.cap, r.wait * 1000.0, r.acc * 1000.0, r.n, r.first ? 1 : 0, r.left ? 1 : 0);
+            fclose(f);
+        }
+        LOG("refresh trace: %zu statistics rows, %zu ring presents\n", rtRows.size(), rtPres.size());
+    }
+
+    // a session that ends before its loop's end leaves no trace thread reading the swap chain
+    ~Host()
+    {
+        rtRun = false;
+        if (rtThread.joinable())
+            rtThread.join();
+    }
+
     void shutdown()
     {
-        if (useSL)
-        {
-            sl::DLSSGOptions off{};
-            off.mode = sl::DLSSGMode::eOff;
-            slDLSSGSetOptions(vp, off);
-        }
         waitQueue();
-        dgClose();
         if (fenceEvent)
             CloseHandle(fenceEvent);
-        if (panDone)
-        {
-            CloseHandle(panDone);
-            panDone = nullptr;
-        }
         // the output ring's shared NT handle keeps the ring's video memory alive however the
         // resource and the CUDA import are released (the server's stop dropped the import already)
         if (hOutBuf)

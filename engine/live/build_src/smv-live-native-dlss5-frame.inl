@@ -186,6 +186,15 @@ static bool nativeLiveNrInit(NativeRife& nr)
     LUID luid{};
     const bool haveLuid = nativeCudaLuid(luid);
     std::string err;
+    // NGX keeps the application of its first start on a device. A DLSS 4.5 session's stages use NGX in this process
+    // too, so frame generation's start comes first: after DLSS 5's, the stages' feature is made under DLSS 5's
+    // application and its evaluate is refused. The session's first plan takes the limit read here
+    if (ID3D12Device* fgDev = g_fgDevice.load())
+    {
+        const int most = (int)ngxfg::maxGenOf(fgDev);
+        if (g_ngxMaxPre.load() < 0)
+            g_ngxMaxPre = most;
+    }
     nr::Host* host = new nr::Host();
     const int nrc = host->startup((uint32_t)w, (uint32_t)h, set, err, true, haveLuid ? &luid : nullptr);
     if (nrc != 0)

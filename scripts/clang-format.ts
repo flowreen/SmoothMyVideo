@@ -3,15 +3,14 @@
 // Extra file arguments are formatted too (a working copy of the host sources outside the repo).
 // Uses CLANG_FORMAT, else the clang-format that ships with Visual Studio (found with vswhere), else PATH.
 // Scope: every .cpp / .h / .inl directly in an engine/*/build_src folder, so a new bridge is formatted without a list
-// edit. Out of scope (they keep their own layout): the vendored NVIDIA headers in subfolders (nvofa, cuda_shim), the
-// RTX Video SDK bridge sources (engine/rtxvideo) and sl_focus_shim.h.
+// edit. Out of scope (they keep their own layout): the vendored NVIDIA headers in subfolders (nvofa, cuda_shim) and
+// the RTX Video SDK bridge sources (engine/rtxvideo).
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
 const ROOT = path.join(import.meta.dirname, '..');
 const SKIP_DIRS = new Set(['rtxvideo']);
-const SKIP_FILES = new Set(['sl_focus_shim.h']);
 const FILES = fs
   .readdirSync(path.join(ROOT, 'engine'), { withFileTypes: true })
   .filter((d) => d.isDirectory() && !SKIP_DIRS.has(d.name))
@@ -20,7 +19,7 @@ const FILES = fs
   .flatMap((dir) =>
     fs
       .readdirSync(path.join(ROOT, dir))
-      .filter((f) => /\.(cpp|h|inl)$/.test(f) && !SKIP_FILES.has(f))
+      .filter((f) => /\.(cpp|h|inl)$/.test(f))
       .map((f) => `${dir}/${f}`),
   );
 

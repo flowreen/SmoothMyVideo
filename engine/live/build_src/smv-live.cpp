@@ -1,9 +1,9 @@
-// smv-live - real-time frame generation overlay (Lossless-Scaling-style) built on the
-// dlssg-two-frame host: capture a target window with Windows.Graphics.Capture, feed every
-// captured frame through DLSS Frame Generation (Streamline sl.dlss_g) as if it were a game
-// render, and let SL's own pacer present real + generated frames into a borderless topmost
-// overlay window placed exactly over the target. The overlay is click-through, so the user
-// keeps interacting with the real window while looking at the smoothed one.
+// smv-live - real-time frame generation overlay: capture a target window with
+// Windows.Graphics.Capture, generate the frames between its captured frames (a model of the
+// native host, or DLSS Frame Generation on NGX's own calls) and present real + generated frames
+// into a borderless topmost overlay window placed exactly over the target. The overlay is
+// click-through, so the user keeps interacting with the real window while looking at the
+// smoothed one.
 //
 // Modes:
 //   smv-live.exe --live "title substring" [--gen N] [--vsync] [--no-clickthrough] [--diag S]
@@ -16,10 +16,6 @@
 //       verification source: a 960x540 window ("SMV Live TestSrc") whose red square jumps in
 //       discrete 120 px steps at 10 fps. Interpolated frames land at ~60 px midpoints, which
 //       cannot occur in the source - the smoking gun that FG frames reached the screen.
-//
-// Inherited from dlssg-two-frame (see BUILD.md there): the swap chain MUST carry
-// FRAME_LATENCY_WAITABLE_OBJECT | ALLOW_TEARING or SL's pacer kills the first Present; a
-// >500 ms input gap poisons the pacer and needs an off/on re-warm; HAGS must be ON.
 //
 // File map (ONE translation unit; this file holds the includes, the globals and LOG, then
 // #includes the parts below in this order, then keeps the test source, the HDR probe, the
@@ -83,11 +79,6 @@
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 
-#include <sl.h>
-#include <sl_consts.h>
-#include <sl_dlss_g.h>
-#include <sl_reflex.h>
-#include <sl_pcl.h>
 #include <nvapi.h> // the GPU's free video memory as its driver counts it (nativeVideoMemory)
 
 using Microsoft::WRL::ComPtr;
@@ -101,10 +92,9 @@ static uint32_t g_presW = 0, g_presH = 0;
 // Live DLSS 4.5 at the working size: the working size is at least kDlssgMinWork a side of the canvas (liveWorkSize)
 static bool g_dlssgWorkFloor = false;
 
-// Enhancement backend. BK_DLSSG = Streamline DLSS Frame Generation (SL interposes the swap
-// chain, its pacer presents generated frames, needs RTX 40/50 + foreground). BK_IDENTITY =
-// no Streamline at all: captured frames are presented directly (the SL-free base of the
-// backend-agnostic server route). BK_SERVER = a model backend (rife, gmfss, nvof, fruc,
+// Enhancement backend. BK_DLSSG = DLSS Frame Generation on the captured frames (stages on NGX's
+// own calls, needs RTX 40/50). BK_IDENTITY = captured frames are presented directly (the base
+// of the backend-agnostic server route). BK_SERVER = a model backend (rife, gmfss, nvof, fruc,
 // fsrfg, nvvfg, rifedrba, echo) run by the in-process native host (smv-live-native.inl); it returns N output
 // frames per input and this host paces their presentation across the measured capture
 // interval.
@@ -259,12 +249,16 @@ static bool g_hdr = false;
 // between sessions with the kernel module loaded and recreates only the per-session state
 // (capture, overlay, buffers). Sessions start and stop over stdin lines
 // ("start<TAB>arg<TAB>arg...", "stop", "quit"; residentMain at the end of the file). A session
-// that touched Streamline, NGX (native DLSS 5) or the TrueHDR bridge still ends the process.
+// that touched NGX (DLSS 4.5, native DLSS 5) or the TrueHDR bridge still ends the process.
 static bool g_resident = false;
-// --prewarm: this process paid Streamline's start before its one session's arguments arrived (prewarmMain); its
-// stdin is read by ResidentIo, as a resident host's is
+// --prewarm: this process paid a DLSS 4.5 session's start before its one session's arguments arrived (prewarmMain);
+// its stdin is read by ResidentIo, as a resident host's is
 static bool g_prewarmed = false;
-static bool g_slReady = false;             // slInit ran and slShutdown has not: slInitCommon is then a no-op
+// DLSS frame generation's most frames a pair, asked of NGX before the session's first plan: by a spare host before
+// its session came, or by DLSS 5's start (-1 = not asked)
+static std::atomic<int> g_ngxMaxPre{-1};
+// a Live DLSS 4.5 session's device while it runs (null in every other session): DLSS 5's start reads it
+static std::atomic<ID3D12Device*> g_fgDevice{nullptr};
 static std::atomic<bool> g_stopReq{false}; // stdin "stop": the session loops exit cleanly
 // stdin "set<TAB>key<TAB>value" during a session: a Live setting changed in place (nativeLiveSets lists the keys);
 // the native thread applies the queue before its next frame group, a key the session cannot change in place waits
@@ -340,6 +334,9 @@ static bool g_teardownTrace = false; // SMV_LIVE_TEARDOWN_TRACE=1: one line per 
 // stderr. One mutex: the reader, writer and compute threads all log.
 static HANDLE g_logPipe = nullptr;
 static std::mutex g_logMutex;
+// what this thread's lines start with (an in-process DLSS 4.5 stage: "cascade stage N: ", the prefix a helper
+// process's lines get)
+static thread_local const char* g_logTag = nullptr;
 static void logWrite(const char* fmt, ...)
 {
     char stackBuf[4096];
@@ -360,11 +357,16 @@ static void logWrite(const char* fmt, ...)
         va_end(ap);
     }
     std::lock_guard<std::mutex> lk(g_logMutex);
+    const size_t tn = g_logTag ? strlen(g_logTag) : 0;
+    if (tn)
+        fwrite(g_logTag, 1, tn, stderr);
     fwrite(buf, 1, (size_t)n, stderr);
     fflush(stderr);
     if (g_logPipe)
     {
         DWORD wr = 0;
+        if (tn)
+            WriteFile(g_logPipe, g_logTag, (DWORD)tn, &wr, nullptr);
         WriteFile(g_logPipe, buf, (DWORD)n, &wr, nullptr); // the client may be gone: ignored
     }
 }
@@ -376,16 +378,6 @@ static void logWrite(const char* fmt, ...)
         if (FAILED(_hr))                                                                                               \
         {                                                                                                              \
             LOG("smv-live FAIL hr=0x%08lx at %s:%d\n", _hr, __FILE__, __LINE__);                                       \
-            return 1;                                                                                                  \
-        }                                                                                                              \
-    } while (0)
-#define CHECK_SL(x)                                                                                                    \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        sl::Result _r = (x);                                                                                           \
-        if (_r != sl::Result::eOk)                                                                                     \
-        {                                                                                                              \
-            LOG("smv-live FAIL sl::Result=%d at %s:%d\n", (int)_r, __FILE__, __LINE__);                                \
             return 1;                                                                                                  \
         }                                                                                                              \
     } while (0)
@@ -427,31 +419,9 @@ static HWND g_targetHwnd = nullptr;
 
 static bool g_verbose = false;
 
-static void slLog(sl::LogType type, const char* msg)
-{
-    if (g_verbose)
-    {
-        LOG("[SL%d] %s", (int)type, msg);
-        return;
-    }
-    if (type == sl::LogType::eInfo)
-        return;
-    static const char* benign[] = {
-        "Invalid backbuffer resource extent",
-        "reseting frame timer",
-        "Frame rate over",
-        "duplicated unique id",
-        "invoked before slInit",
-        "must be synchronized with the present thread",
-    };
-    for (const char* b : benign)
-        if (strstr(msg, b))
-            return;
-    LOG("[SL%d] %s", (int)type, msg);
-}
-
-#include "sl_focus_shim.h"
 #include "pan_vectors.h"
+#include "ngx_direct.h" // DLSS frame generation on NGX's own calls: Live's in-process DLSS 4.5 stages
+#include "ngx_stage.h"
 #include "smv-live-host.inl"
 #include "smv-live-capture.inl"
 #include "smv-live-native.inl"
@@ -1557,7 +1527,7 @@ static void dgEnd(DgChild& c, bool kill)
     }
 }
 
-// The resident offline host keeps the server of a clean DLSS 4.5 render: Streamline and NGX take about three seconds
+// The resident offline host keeps the server of a clean DLSS 4.5 render: its process and NGX take about three seconds
 // to come up in every new server, and the next render of the same folder, padded size, multiplier and frame format
 // takes this one (dgTakeKept) and sets its cut event, so that render's first frame starts a new clip there and its
 // tweens are a new server's. Any other render ends it before its own video memory fits, and so does the host's exit
@@ -4148,7 +4118,7 @@ static int prewarmMain();
 int wmain(int argc, wchar_t** argv)
 {
     setvbuf(stderr, nullptr, _IONBF, 0);
-    g_verbose = GetEnvironmentVariableW(L"DLSSG_VERBOSE", nullptr, 0) != 0; // server backends skip slInitCommon
+    g_verbose = GetEnvironmentVariableW(L"DLSSG_VERBOSE", nullptr, 0) != 0;
     {
         wchar_t tv[8]{};
         g_teardownTrace = GetEnvironmentVariableW(L"SMV_LIVE_TEARDOWN_TRACE", tv, 8) && tv[0] == L'1';
@@ -4157,6 +4127,45 @@ int wmain(int argc, wchar_t** argv)
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CHECK_HR(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    // NGX stays up once Live's first in-process DLSS 4.5 stage starts it: DLSS 5 uses NGX on the same device, and
+    // NGX's shutdown would reach it
+    ngxfg::core().hold = true;
+
+    // Live's in-process DLSS 4.5 stage as a process, the arguments and the stdin / READY handshake of dlssg2f
+    // --stage1: the identity gates compare its ring with the helper's
+    if (argc >= 4 && wcscmp(argv[1], L"--stage1") == 0)
+    {
+        const uint32_t sw = (uint32_t)_wtoi(argv[2]), sh = (uint32_t)_wtoi(argv[3]);
+        int gen = 1;
+        bool hdr10 = false, bgra = false;
+        std::wstring tag, from;
+        for (int i = 4; i < argc; i++)
+        {
+            if (wcscmp(argv[i], L"--gen") == 0 && i + 1 < argc)
+                gen = _wtoi(argv[++i]);
+            else if (wcscmp(argv[i], L"--hdr10") == 0)
+                hdr10 = true;
+            else if (wcscmp(argv[i], L"--bgra") == 0)
+                bgra = true;
+            else if (wcscmp(argv[i], L"--share") == 0 && i + 1 < argc)
+                tag = argv[++i];
+            else if (wcscmp(argv[i], L"--from") == 0 && i + 1 < argc)
+                from = argv[++i];
+        }
+        if (sw < 128 || sh < 128 || sw > 8192 || sh > 8192 || gen < 1 || gen > 5 || tag.empty() || tag.size() > 40 ||
+            from.size() > 40 || from == tag)
+        {
+            LOG("--stage1 W H (128..8192) --gen 1..5 --share TAG (1..40 chars) [--from TAG] [--hdr10 | --bgra]\n");
+            return 1;
+        }
+        int rc = 1;
+        if (!ngxStage1Stdin(sw, sh, gen, hdr10, bgra, tag, from, false, rc))
+        {
+            LOG("--stage1: NGX's frame generation did not come up\n");
+            return 1;
+        }
+        return rc;
+    }
 
     // the app runs this after it killed a live host (or saw it crash) while Fill held the mouse
     if (argc >= 2 && wcscmp(argv[1], L"--restore-mouse") == 0)
@@ -4202,17 +4211,6 @@ int wmain(int argc, wchar_t** argv)
             printf("limit %d want %.1f -> %dx = %d x %d%s\n", lim, h2 / 2.0, m, m1, m2, tie ? " (tie, the lower)" : "");
         }
         return 0;
-    }
-
-    if (argc >= 2 && wcscmp(argv[1], L"--synth") == 0)
-    {
-        int genFrames = (argc >= 3) ? _wtoi(argv[2]) : 1;
-        if (genFrames < 1 || genFrames > 5)
-            genFrames = 1;
-        bool vsync = (argc >= 4 && wcscmp(argv[3], L"--vsync") == 0);
-        if (slInitCommon())
-            return 1;
-        return runSynth(genFrames, vsync);
     }
 
     if (argc >= 2 && wcscmp(argv[1], L"--list") == 0)
@@ -4338,6 +4336,7 @@ static void resetSessionGlobals()
     g_backend = BK_DLSSG;
     g_serverBackend.clear();
     g_fgOver = false;
+    g_fgDevice = nullptr;
     g_modelLabel.clear();
     g_modelNote.clear();
     g_hudNote.clear();
@@ -4582,7 +4581,7 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
     return 0;
 }
 
-// one session from parsed arguments: the foreground pick, the Streamline init, runLive
+// one session from parsed arguments: the foreground pick, runLive
 static int runLiveArgs(LiveArgs& la)
 {
     if (la.byFg)
@@ -4600,8 +4599,6 @@ static int runLiveArgs(LiveArgs& la)
         }
         la.targetOverride = fg;
     }
-    if ((g_backend == BK_DLSSG || g_fgOver) && slInitCommon())
-        return 1;
     // the app's live slider changes reach a single session too; a console stdin (a manual run) is left alone. The
     // resident host and a prewarmed one read their stdin in ResidentIo only: a second reader there takes whole chunks,
     // so a "start" line it read was lost and the next session never began
@@ -4717,25 +4714,23 @@ static int parseStartLine(const std::string& line, std::vector<std::wstring>& to
     return (byLive || byHwnd || byFg) ? parseLiveArgs((int)av.size(), av.data(), la) : 1;
 }
 
-// --prewarm: a spare host for the next Live session that runs DLSS 4.5. It pays Streamline's start now (slInit, the
-// device, the DLSS-G support check: most of such a session's start), then waits on stdin for that session's
-// "start<TAB>args" line, the resident host's. It runs that ONE session and ends with its exit code, as every DLSS 4.5
-// session's process does. "quit" or a closed stdin ends a spare nobody took; exit 8 = the line asked for a session
-// without Streamline, which a spare does not run.
+// --prewarm: a spare host for the next Live session that runs DLSS 4.5. It pays that session's start now: the device,
+// NGX's own start and the one-pass limit NGX reports, then waits on stdin for that session's "start<TAB>args" line,
+// the resident host's. It runs that ONE session and ends with its exit code, as every DLSS 4.5 session's process
+// does. "quit" or a closed stdin ends a spare nobody took; exit 8 = the line asked for a session of another backend,
+// which a spare does not run.
 static int prewarmMain()
 {
     g_prewarmed = true;
     g_rio = new ResidentIo();
     g_rio->start();
     const ULONGLONG t0 = GetTickCount64();
-    if (slInitCommon())
-        return 1;
-    if (const int rc = slDeviceInit(g_slWarm, true))
+    if (const int rc = deviceInit(g_devWarm))
     {
-        g_slWarm = SlWarm{};
-        slShutdownCommon();
+        g_devWarm = DeviceWarm{};
         return rc;
     }
+    g_ngxMaxPre = (int)ngxfg::maxGenOf(g_devWarm.device.Get());
     LOG("live host: prewarmed for DLSS 4.5 in %.2f s, waiting for its session\n", (GetTickCount64() - t0) / 1000.0);
     const int waitSecs = 30 * 24 * 3600; // the app ends a spare it no longer wants; a closed stdin ends it too
     LiveArgs la;
@@ -4751,14 +4746,12 @@ static int prewarmMain()
                 break;
             LOG(prc ? "live host: bad start command\n"
                     : "live host: prewarmed for DLSS 4.5, this session needs another host\n");
-            g_slWarm = SlWarm{};
-            slShutdownCommon();
+            g_devWarm = DeviceWarm{};
             return prc ? prc : 8;
         }
         if (!got || line == "quit")
         {
-            g_slWarm = SlWarm{};
-            slShutdownCommon();
+            g_devWarm = DeviceWarm{};
             return 0;
         }
         LOG("live host: unknown command \"%s\"\n", line.c_str());
@@ -5043,10 +5036,13 @@ static int offlineResidentMain(const OfflineArgs& base)
                         // the client opened both ends before "go", so these return at once
                         // (ERROR_PIPE_CONNECTED = connected before the call, a good connection)
                         const bool okIn = ConnectNamedPipe(hIn, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
+                        const DWORD errIn = okIn ? 0 : GetLastError();
                         const bool okOut = ConnectNamedPipe(hOut, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
+                        const DWORD errOut = okOut ? 0 : GetLastError();
                         if (!okIn || !okOut)
                         {
-                            LOG("offline host: frame pipe connect failed (%lu)\n", GetLastError());
+                            // each pipe's own error (0 = that one connected)
+                            LOG("offline host: frame pipe connect failed (in %lu, out %lu)\n", errIn, errOut);
                             irc = 2;
                         }
                         else

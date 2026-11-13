@@ -3,7 +3,7 @@
 // engine/live/smv-live.exe is never touched:
 //   analyze  MSVC /analyze (the C6xxx / C26xxx / C28xxx checks; the SDK headers are external, not analysed)
 //   w4       warning level 4 (the ship build uses /W3), the SDK headers external
-// Needs what build.bat needs: SL_SDK and NGX_SDK (SMV_CU defaults to build_src\cuda, which
+// Needs what build.bat needs: NVAPI_SDK and NGX_SDK (SMV_CU defaults to build_src\cuda, which
 // `node scripts/stage-gpu-runtime.ts --sdk` fills) and Visual Studio 2026 (vcvars64 through vswhere). Prints the warnings grouped by code and every warning line of our own
 // sources; exit 0 = none in our sources. --keep DIR writes the objects and the log there instead; --root DIR reads
 // engine/live/build_src and engine/dlssnr/build_src from another tree laid out like the repo (a working copy).
@@ -29,16 +29,16 @@ const root = option('--root');
 const SRC_ROOT = root ? path.resolve(root) : REPO;
 const BSRC = path.join(SRC_ROOT, 'engine', 'live', 'build_src');
 const NRSRC = path.join(SRC_ROOT, 'engine', 'dlssnr', 'build_src');
-const OWN = ['smv-live.cpp', 'smv-live-', 'nr_host.', 'sl_focus_shim.h'];
+const OWN = ['smv-live.cpp', 'smv-live-', 'nr_host.', 'ngx_direct.h', 'ngx_stage.h', 'pan_vectors.h'];
 
 function main(): number {
   const mode = args[0] ?? '';
   if (mode !== 'analyze' && mode !== 'w4') {
-    console.log('usage: node scripts/cpp-check.ts analyze|w4 [--keep DIR] [--root DIR] (needs SL_SDK, NGX_SDK)');
+    console.log('usage: node scripts/cpp-check.ts analyze|w4 [--keep DIR] [--root DIR] (needs NVAPI_SDK, NGX_SDK)');
     return 2;
   }
   const env: Record<string, string> = {};
-  for (const k of ['SL_SDK', 'NGX_SDK']) env[k] = (process.env[k] ?? '').trim();
+  for (const k of ['NVAPI_SDK', 'NGX_SDK']) env[k] = (process.env[k] ?? '').trim();
   const missing = Object.keys(env).filter((k) => !env[k]);
   if (missing.length) {
     console.log(`set ${missing.join(', ')} first (the same variables build.bat needs, see Building the native host)`);
@@ -68,7 +68,7 @@ function main(): number {
   const work = keep ? path.resolve(keep) : fs.mkdtempSync(path.join(os.tmpdir(), 'smv_cpp_check_'));
   fs.mkdirSync(work, { recursive: true });
   const external = [
-    `${env.SL_SDK}\\include`,
+    env.NVAPI_SDK,
     `${env.SMV_CU}\\include`,
     `${env.NGX_SDK}\\include`,
     path.join(BSRC, 'nvofa'),

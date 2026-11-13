@@ -247,7 +247,7 @@ function splitChunks(gpu: string, env: NodeJS.ProcessEnv): number {
   return /\bRTX 5090\b/.test(gpu) ? 3 : 2;
 }
 
-/** The most DLSS 4.5 makes in one pass on this GPU and driver = Streamline's numFramesToGenerateMax + 1 (the host's
+/** The most DLSS 4.5 makes in one pass on this GPU and driver = NGX's most frames a pair + 1 (the host's
  * `server max N` line): one 2-frame 256x128 render the first time, then dlssg_limit.json in the engine cache, keyed
  * by the GPU and driver; 0 = unknown. SMV_DLSSG_LIMIT=2..6 sets it (tests). */
 export async function dlssgLimit(
@@ -598,15 +598,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       );
   } else if (kind === 'dlssg') {
     const dgdir = env.SMV_DLSSG_DIR || path.join(ENGINE, 'dlssg');
-    const miss = [
-      'dlssg2f.exe',
-      'sl.interposer.dll',
-      'sl.common.dll',
-      'sl.dlss_g.dll',
-      'sl.pcl.dll',
-      'sl.reflex.dll',
-      'nvngx_dlssg.dll',
-    ].filter((d) => !isFile(path.join(dgdir, d)));
+    const miss = ['dlssg2f.exe', 'nvngx_dlssg.dll'].filter((d) => !isFile(path.join(dgdir, d)));
     if (miss.length)
       throw new RenderExit(`DLSS Frame Generation unavailable: DLSS host not found: ${miss[0]} is missing in ${dgdir}`);
   }

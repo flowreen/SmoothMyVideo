@@ -54,19 +54,11 @@ const NVOFFRUC_DIR = path.join(ENGINE, 'nvoffruc');
 const NVOFFRUC_DLLS = ['NvOFFRUC.dll', 'cudart64_110.dll'];
 const OF_SDK_URL = 'https://developer.nvidia.com/opticalflow/download';
 // "DLSS 4.5" (DLSS Frame Generation): fully bundled, no installer - the offline host exe
-// (engine/dlssg/dlssg2f.exe, built from build_src) plus NVIDIA's redistributable Streamline
-// runtime (~10 MB, licenses alongside). Readiness = all files present (False means a broken
+// (engine/dlssg/dlssg2f.exe, built from build_src) plus NVIDIA's redistributable frame generation
+// DLL (its license alongside). Readiness = all files present (False means a broken
 // install); actual GPU/driver support surfaces as a clear engine error at render time.
 const DLSSG_DIR = path.join(ENGINE, 'dlssg');
-const DLSSG_FILES = [
-  'dlssg2f.exe',
-  'sl.interposer.dll',
-  'sl.common.dll',
-  'sl.dlss_g.dll',
-  'sl.pcl.dll',
-  'sl.reflex.dll',
-  'nvngx_dlssg.dll',
-];
+const DLSSG_FILES = ['dlssg2f.exe', 'nvngx_dlssg.dll'];
 // "NVIDIA DLSS 5" (Neural Rendering): the caller shim engine/dlssnr/nvngx.dll (built from build_src;
 // the native host loads the runtime through it) ships, but the NR runtime nvngx_dlssnr.dll is NOT shipped: NVIDIA
 // publishes no download (no SDK, no driver copy, no NVIDIA App override as of 2026-09), the only

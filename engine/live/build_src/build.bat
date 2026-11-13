@@ -1,13 +1,14 @@
 @echo off
 setlocal
-if "%SL_SDK%"=="" (
-  echo Set SL_SDK to the extracted Streamline SDK first, see DEVELOPMENT.md
+rem NVAPI_SDK = NVIDIA's NVAPI folder (nvapi.h, amd64\nvapi64.lib), see DEVELOPMENT.md
+if "%NVAPI_SDK%"=="" (
+  echo Set NVAPI_SDK to the NVAPI folder that contains nvapi.h first, see DEVELOPMENT.md
   exit /b 1
 )
-rem "set SL_SDK=path && build.bat" leaves a trailing space that corrupts /I, trim it
+rem "set NVAPI_SDK=path && build.bat" leaves a trailing space that corrupts /I, trim it
 :trimsdk
-if "%SL_SDK:~-1%"==" " set "SL_SDK=%SL_SDK:~0,-1%"
-if "%SL_SDK:~-1%"==" " goto trimsdk
+if "%NVAPI_SDK:~-1%"==" " set "NVAPI_SDK=%NVAPI_SDK:~0,-1%"
+if "%NVAPI_SDK:~-1%"==" " goto trimsdk
 where cl >nul 2>nul
 if not errorlevel 1 goto compile
 rem no parens block here: the ^) in "Program Files (x86)" would close it early
@@ -47,24 +48,29 @@ if "%NGX_SDK%"=="" (
 :trimngx
 if "%NGX_SDK:~-1%"==" " set "NGX_SDK=%NGX_SDK:~0,-1%"
 if "%NGX_SDK:~-1%"==" " goto trimngx
+rem nvsdk_ngx_s.lib = NGX's static loader (it opens the driver's NGX at run time): Live's in-process DLSS 4.5 stages
+rem call NGX's frame generation through it (engine\dlssg\build_src\ngx_direct.h)
+if not exist "%NGX_SDK%\lib\Windows_x86_64\x64\nvsdk_ngx_s.lib" (
+  echo %NGX_SDK%\lib\Windows_x86_64\x64\nvsdk_ngx_s.lib not found, see DEVELOPMENT.md
+  exit /b 1
+)
 set "NRSRC=%~dp0..\..\dlssnr\build_src"
 rem Nothing below is a hard dependency of the exe: CUDA 13's cudart.lib and cuda.lib are lazy
 rem LOADER stubs that open their DLLs on first call, so the exe still starts on a machine that
 rem has none of them and no non-native route changes.
 rem nvofa\ = the MIT NVIDIA Optical Flow interface headers (the nvof model); nvofapi64.dll is
 rem driver-installed and opened at run time by full path, nothing to link or ship.
-rem No d3d12.lib on purpose: D3D12CreateDevice must keep resolving from sl.interposer.lib.
-rem NVAPI (the free video memory, NvAPI_GPU_GetMemoryInfoEx) = the MIT headers and static lib inside the
-rem Streamline SDK (external\nvapi); the lib opens the driver's own nvapi64.dll at run time, nothing to ship.
+rem NVAPI (the free video memory, NvAPI_GPU_GetMemoryInfoEx) = NVIDIA's MIT headers and static lib (NVAPI_SDK);
+rem the lib opens the driver's own nvapi64.dll at run time, nothing to ship.
 rem smv-live.manifest = the UTF-8 process code page, so a folder with a non-ASCII name works (its comment).
 cl /nologo /std:c++20 /EHsc /permissive- /O2 /W3 smv-live.cpp "%NRSRC%\nr_host.cpp" ^
-   /I "%SL_SDK%\include" /I "%SL_SDK%\external\nvapi" /I "%SMV_CU%\include" /I cuda_shim ^
+   /I "%NVAPI_SDK%" /I "%SMV_CU%\include" /I cuda_shim ^
    /I "%NRSRC%" /I "%~dp0..\..\dlssg\build_src" /I "%NGX_SDK%\include" /I nvofa ^
-   /link /LIBPATH:"%SL_SDK%\lib\x64" /LIBPATH:"%SL_SDK%\external\nvapi\amd64" ^
-   /LIBPATH:"%SMV_CU%\lib\x64" nvapi64.lib ^
-   sl.interposer.lib cudart.lib cuda.lib ^
+   /link /LIBPATH:"%NVAPI_SDK%\amd64" ^
+   /LIBPATH:"%SMV_CU%\lib\x64" /LIBPATH:"%NGX_SDK%\lib\Windows_x86_64\x64" nvapi64.lib ^
+   nvsdk_ngx_s.lib cudart.lib cuda.lib ^
    user32.lib gdi32.lib ole32.lib windowscodecs.lib dxguid.lib advapi32.lib ^
-   d3d11.lib d3dcompiler.lib dwmapi.lib shlwapi.lib winmm.lib windowsapp.lib ^
+   d3d12.lib dxgi.lib d3d11.lib d3dcompiler.lib dwmapi.lib shlwapi.lib winmm.lib windowsapp.lib ^
    /MANIFEST:EMBED /MANIFESTINPUT:"%~dp0smv-live.manifest" /MANIFESTUAC:NO ^
    /SUBSYSTEM:CONSOLE /OUT:..\smv-live.exe
 exit /b %errorlevel%

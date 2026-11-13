@@ -658,7 +658,7 @@ async function setup(a: PreviewArgs, env: NodeJS.ProcessEnv) {
   // `count` frames from idx `at` on: the render's decode (its pixel format, colour conversion and downscale fold);
   // the original pane decodes without the fold (fold empty, the source size). A VFR source takes the render's constant
   // average rate (vfrConform's flags) from a seek ON that grid a few frames early, the frames before `at` dropped: a
-  // seek between grid points moves the rate conversion's picks (harness compare_view vfr_decode_check.py)
+  // seek between grid points moves the rate conversion's picks
   const decode = async (at: number, count = 1, fold: string[] = plan.vf, dw: number = W, dh: number = H) => {
     const from = vfr.flags.length ? Math.max(0, at - 3) : at;
     const t = vfr.flags.length ? (from * vfr.den) / vfr.num : Math.max(0, ((at - 0.5) * vfr.den) / vfr.num);

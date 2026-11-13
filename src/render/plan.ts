@@ -89,9 +89,9 @@ export interface WorkPlan {
  * same rule live). */
 export const NR_MIN_WORK_W = 128;
 
-/** DLSS 4.5 makes its frames at the working size and generates none below Streamline's minimum extent (100 px on the
- * shorter side: it passes the frames through): with DLSS 4.5, a working size below the output keeps its shorter side
- * at least this long (the host's kDlssgMinWork, the same rule live). */
+/** DLSS 4.5 makes its frames at the working size and its helper takes no frame below 128 px a side: with DLSS 4.5, a
+ * working size below the output keeps its shorter side at least this long (the host's kDlssgMinWork, the same rule
+ * live). */
 export const DLSSG_MIN_WORK = 128;
 
 /** The pass sizes for a w x h source: the output (the --upscale factor, clamped; with it an anamorphic source's

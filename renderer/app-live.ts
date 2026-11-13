@@ -22,7 +22,7 @@ function liveTargetFps() {
 function liveModelInfo() {
   // fixed: the model cannot resample to the exact fps target; it approximates it with a whole
   // multiplier of the captured window's own rate (derived in the exe from the target) - DLSS-G
-  // by design (Streamline; past one pass's limit in two passes)
+  // by design (past one pass's limit in two or three passes)
   if (modelIsDlss()) return { model: 'dlssg', name: 'DLSS 4.5', note: '', fixed: true };
   // DRBA live: the rifedrba backend renders the three-frame window, so the picture trails
   // the capture by one source frame
@@ -405,8 +405,9 @@ $('lvgo').onclick = async () => {
 // intermittently drops the latency tail into the next chunk.
 let lvOutBuf = '';
 let lvRefused = false; // a refusal reason owns the status line until the next session
-// DLSS 4.5 above one pass: the session's plan, or why it stays at one pass, kept beside the stats until the next session
+// DLSS 4.5: the session's plan, or why none runs, kept beside the stats until the next session
 let lvNote: (() => string) | null = null;
+let lvMemLess = false; // this session's plan was cut to one pass for the free video memory: said beside its multiple
 function lvLine(t) {
   // The host's refusal reason ("native host: <reason>", or the engine lookup / build failure) is
   // the ONE thing the user must read: it stays the last word on the panel, because the exe's own
@@ -421,39 +422,44 @@ function lvLine(t) {
     return;
   }
   if (lvRefused) return;
-  const pl = /^DLSS 4\.5 at (\d+)x: (\d+)x in a second process, (?:(\d+)x in a third, )?then (\d+)x/.exec(t);
-  const one = /^DLSS 4\.5 stays at (\d+)x: (?:\d+x \(\d+x, then \d+x\) )?([^\r\n]+)/.exec(t);
-  const lost = /^DLSS 4\.5's second (and third )?pass(?:es)? ended \(([^)]+)\): back to one pass at (\d+)x/.exec(t);
-  // every pass in helpers ("at 36.00x: 6x in a second process, 6x in a third, ..."), and a plan switched in place
+  // the plan presenting ("at 36.00x: 6x in a second stage, 6x in a third, ..."), and a plan switched in place
   // ("steps to 12.00x in place (2x, 6x, 1x in the running ..."): the multiple and its passes, a 1x pass left out
-  const lz =
-    /^DLSS 4\.5 at ([\d.]+)x: (\d+)x in a second process(?:, (\d+)x in a third)?(?:, (\d+)x in a fourth)?, /.exec(t);
+  const at =
+    /^DLSS 4\.5 at ([\d.]+)x: (\d+)x in a second stage(?:, (\d+)x in a third)?(?:, (\d+)x in a fourth)?, /.exec(t);
   const st = /^DLSS 4\.5 steps to ([\d.]+)x in place \(([\dx, ]+) in the running/.exec(t);
+  // the session has no pass of its own to fall back to: its plan ended (made again, or for good), or the free
+  // video memory held one pass only, or none
+  const gone =
+    /^DLSS 4\.5's pass(?:es)? (?:ended \(([^)]+)\)|did not start): the captured frames are shown as they are (until|from)/.exec(
+      t,
+    );
+  const memOne =
+    /^DLSS 4\.5: [\d.]+x needs ~\d+ MiB of video memory for its passes, \d+ MiB are free; one pass at/.test(t);
+  const memNone = /^DLSS 4\.5: [\d.]+x needs ~\d+ MiB of video memory, \d+ MiB are free: the captured frames/.test(t);
+  if (memOne) lvMemLess = true;
   const passNote = (m: string, passes: string[]) => {
     const p = passes.filter((x) => x && x !== '1');
-    return 'DLSS 4.5 ' + String(+m) + '×' + (p.length > 1 ? ' (' + p.join('×, ') + '×)' : '');
+    const less = lvMemLess;
+    return () =>
+      'DLSS 4.5 ' +
+      String(+m) +
+      '×' +
+      (p.length > 1 ? ' (' + p.join('×, ') + '×)' : '') +
+      (less ? ' · ' + tr('lv.memLess') : '');
   };
-  if (pl) {
-    const [, all, a, b, c] = pl;
-    lvNote = () => 'DLSS 4.5 ' + all + '× (' + a + '×, ' + (b ? b + '×, ' : '') + tr('lv.then') + ' ' + c + '×)';
-  } else if (lz) {
-    const n = passNote(lz[1], [lz[2], lz[3], lz[4]]);
-    lvNote = () => n;
+  if (at) {
+    lvNote = passNote(at[1], [at[2], at[3], at[4]]);
   } else if (st) {
-    const n = passNote(
+    lvNote = passNote(
       st[1],
       st[2].split(',').map((x) => x.trim().replace(/x$/, '')),
     );
-    lvNote = () => n;
-  } else if (one) {
-    const n = one[1],
-      why = one[2].trim().slice(0, 120);
-    lvNote = () => tr('lv.stays', { n }) + ': ' + why;
-  } else if (lost) {
-    const key = lost[1] ? 'lv.lost2' : 'lv.lost1',
-      n = lost[3],
-      why = lost[2];
-    lvNote = () => tr(key, { n, why });
+  } else if (gone) {
+    const why = (gone[1] || 'it did not start').slice(0, 120),
+      key = gone[2] === 'until' ? 'lv.again' : 'lv.gone';
+    lvNote = () => tr(key, { why });
+  } else if (memNone) {
+    lvNote = () => tr('lv.memNone');
   }
   // surface the exe's 2s stats lines; pass real failures through verbatim (trimmed)
   const m =
@@ -504,6 +510,7 @@ ipcRenderer.on('lv-started', () => {
   lvStopReq = false;
   lvRefused = false;
   lvNote = null;
+  lvMemLess = false;
   lvUi();
   try {
     lvSpawnTarget = lvEffTarget();

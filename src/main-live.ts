@@ -13,7 +13,7 @@ import { current, dlssScaleArg } from './main-render';
 // --- Live mode: the real-time pipeline host (engine/live/smv-live.exe) -----------------------------
 // The exe captures the target window via Windows.Graphics.Capture and presents it enhanced into a
 // click-through topmost overlay. Backend today: DLSS Frame Generation at (gen+1)x (its own copy of
-// the Streamline runtime sits beside it); the design target is backend-agnostic (server route for
+// NVIDIA's frame generation DLL sits beside it); the design target is backend-agnostic (server route for
 // RIFE/GMFSS/FRUC + VSR/HDR/sharpen/restore is the planned phase 2). Gotcha (bisected in the
 // smv-live PoC): the overlay must hold foreground for the driver to generate, so the exe
 // force-activates its own window at start.
@@ -228,8 +228,8 @@ function onLiveSessionEnd(code: number | null) {
   liveSpareEnsure();
 }
 
-// The spare host. A Live session that runs DLSS 4.5 spends about three seconds in Streamline's start before its
-// overlay shows. While DLSS 4.5 is the panel's interpolator and Live is in use (the Live tab is open, or a session ran
+// The spare host. A Live session that runs DLSS 4.5 spends a second or two in its device's and NGX's start before
+// its frames come. While DLSS 4.5 is the panel's interpolator and Live is in use (the Live tab is open, or a session ran
 // since the app started) the app keeps ONE `smv-live.exe --prewarm` waiting with that start already paid: about 240 MB
 // of memory, 32 MB of video memory, no window. The next DLSS 4.5 session goes to it as the resident host's "start"
 // line and it ends with that session, like every DLSS 4.5 host. A spare nobody took ends when another model is
@@ -463,7 +463,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
       /* the spare died under us; its close handler below reports the session's end */
     }
   }
-  // the next spare only once this session's own start is over (two Streamline starts at once slow both): a resize
+  // the next spare only once this session's own start is over (two starts at once slow both): a resize
   // or stall revive then finds one ready
   if (liveModel === 'dlssg') {
     liveSpareHold = Date.now() + 5000;

@@ -144,11 +144,28 @@ third-party work.
   is built from NVIDIA's SDK convenience layer (sources in `engine/rtxvideo/build_src/`),
   used under the NVIDIA RTX Video SDK license. The SDK's AI feature models (`nvngx_vsr.dll`,
   `nvngx_truehdr.dll`) are NOT redistributed; users install them from NVIDIA directly.
-* **NVIDIA DLSS Frame Generation and Streamline** (the DLSS 4.5 frame generation model): NVIDIA's binaries
-  `nvngx_dlssg.dll`, `sl.interposer.dll`, `sl.common.dll`, `sl.dlss_g.dll`, `sl.pcl.dll` and `sl.reflex.dll` in
-  `engine/dlssg/`, redistributed unmodified beside this project's `dlssg2f.exe` (sources in `engine/dlssg/build_src/`),
-  under NVIDIA's licenses shipped beside them (`nvngx_dlss.license.txt`, `streamline.license.txt`,
-  `reflex.license.txt`).
+* **NVIDIA DLSS Frame Generation** (the DLSS 4.5 frame generation model): NVIDIA's binary `nvngx_dlssg.dll` in
+  `engine/dlssg/` and `engine/live/`, redistributed unmodified beside this project's `dlssg2f.exe` and
+  `smv-live.exe` (sources in `engine/dlssg/build_src/` and `engine/live/build_src/`), under NVIDIA's license shipped
+  beside it (`nvngx_dlss.license.txt`).
+* **NVIDIA NVAPI** (the free video memory figure): NVIDIA's static library `nvapi64.lib` (github.com/NVIDIA/nvapi) is
+  linked into `engine/live/smv-live.exe`. MIT License:
+
+  > Copyright (c) 2019-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  >
+  > Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+  > documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+  > the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  > permit persons to whom the Software is furnished to do so, subject to the following conditions:
+  >
+  > The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+  > the Software.
+  >
+  > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+  > THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  > AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  > TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  > SOFTWARE.
 
 ## Bundled in the release archive (not in this repository)
 

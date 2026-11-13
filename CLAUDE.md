@@ -38,7 +38,7 @@ a version bump in `package.json`.
 
 ### The native host is one translation unit
 
-`smv-live.cpp` includes, in this order, `smv-live-host.inl` (window, D3D12, swap chain, Streamline),
+`smv-live.cpp` includes, in this order, `smv-live-host.inl` (window, D3D12, swap chain, presents),
 `smv-live-capture.inl` (window capture), `smv-live-native.inl` (every model and pass, CUDA), `smv-live-pipe.inl`,
 `smv-live-loop.inl` (the live loop, pacing, the HUD). A name defined in an earlier file is visible in the later ones.
 
@@ -153,6 +153,9 @@ source paths in the table above; never search from the repo root.
 * A speed change must not change the picture. A model is called the way its author calls it. Nothing that changes
   the look runs unless the user ticked it.
 * Comments and these docs say what the code does and why. No history: no dates, no task names, no "used to".
+  Nothing of a developer's own machine either, since a reader has none of it: no private path (write
+  `X:\path\to\...`), no name of a test script or folder that is not in the repo. A measurement keeps its numbers and
+  its conditions.
 * Prettier never touches `engine/`, `renderer/index.html` or `renderer/app.js` (`.prettierignore`).
 * Git: the maintainer commits and pushes. An agent stages only work that passed its checks and never commits,
   pushes or reverts.

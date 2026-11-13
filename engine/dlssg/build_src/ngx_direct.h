@@ -1,11 +1,11 @@
 // DLSS frame generation through NGX's own D3D12 calls (the DLSS SDK's nvsdk_ngx_helpers_dlssg_d3d.h): colour, depth
-// and motion vectors in, each generated frame into a texture of this device. No Streamline, no swap chain, no window
-// and no pacer, so a pair costs its evaluates alone and nothing on the desktop (a focus change, another app's
-// presents) can stop the frames. The frames are byte for byte those Streamline's route presents when the calls match
-// its own: the vector scale is the vector texture's size (what Streamline makes of mvecScale {1, 1}), and a clip's
-// first frame is evaluated three times, the first with the reset flag (the three warm-up presents).
-// main.cpp includes it after pan_vectors.h; --server uses frame(), a live stage (--stage1) the stage* calls.
+// and motion vectors in, each generated frame into a texture of this device. No swap chain, no window and no pacer,
+// so a pair costs its evaluates alone and nothing on the desktop (a focus change, another app's presents) can stop
+// the frames. The calls every route's frames are pinned to: the vector scale is the vector texture's size, and a
+// clip's first frame is evaluated three times, the first with the reset flag.
+// Included after pan_vectors.h and a LOG macro; --server uses frame(), a live stage (ngx_stage.h) the stage* calls.
 #pragma once
+#include <mutex>
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers_dlssg_d3d.h>
 
@@ -17,11 +17,106 @@ static void NVSDK_CONV ngxLog(const char* msg, NVSDK_NGX_Logging_Level, NVSDK_NG
     LOG("[NGX] %s", msg);
 }
 
-// d3d12.dll's and dxgi.dll's own entry points: this exe links Streamline's interposer in their place
-template <typename F> static F systemProc(const wchar_t* dll, const char* name)
+// NGX starts once a process, on the one D3D12 device a process has on the adapter, and every Direct in the process
+// uses that start: the live host runs several stages at once, each on a thread of its own. It stops with the last
+// Direct, unless `hold` keeps it up for the process's life (a process with other NGX users on the same device, which
+// NGX's shutdown would reach too). NGX's calls are made one at a time (call()).
+struct Core
 {
-    const HMODULE m = LoadLibraryExW(dll, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    return m ? reinterpret_cast<F>(GetProcAddress(m, name)) : nullptr;
+    std::mutex m;
+    int users = 0;
+    bool up = false, hold = false;
+    ComPtr<ID3D12Device> device; // the device NGX started on, kept while it is up
+};
+static Core& core()
+{
+    static Core c;
+    return c;
+}
+static std::mutex& callLock()
+{
+    static std::mutex m;
+    return m;
+}
+
+// NGX started for the process on `device`, once (Core): each call that returns true is one use, given back by
+// coreStop(). nvngx_dlssg.dll beside this exe; no NGX log file, its lines go to stderr with DLSSG_VERBOSE=1. false =
+// NGX did not start, or runs on another device (the reason is logged)
+static bool coreStart(ID3D12Device* device)
+{
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring exeDir(exePath);
+    exeDir.resize(exeDir.find_last_of(L'\\'));
+    wchar_t tempDir[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, tempDir))
+        wcscpy_s(tempDir, exeDir.c_str());
+    const wchar_t* paths[] = {exeDir.c_str()};
+    const bool verbose = GetEnvironmentVariableW(L"DLSSG_VERBOSE", nullptr, 0) != 0;
+    NVSDK_NGX_FeatureCommonInfo fci{};
+    fci.PathListInfo.Path = paths;
+    fci.PathListInfo.Length = 1;
+    fci.LoggingInfo.LoggingCallback = ngxLog;
+    fci.LoggingInfo.MinimumLoggingLevel = verbose ? NVSDK_NGX_LOGGING_LEVEL_ON : NVSDK_NGX_LOGGING_LEVEL_OFF;
+    Core& c = core();
+    std::lock_guard<std::mutex> lk(c.m);
+    if (!c.up)
+    {
+        std::lock_guard<std::mutex> cl(callLock());
+        // NVIDIA's sample application id
+        const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(231313132ull, tempDir, device, &fci);
+        if (NVSDK_NGX_FAILED(r))
+        {
+            LOG("NGX: init failed (0x%08x)\n", (unsigned)r);
+            return false;
+        }
+        c.up = true;
+        c.device = device;
+    }
+    else if (c.device.Get() != device)
+    {
+        LOG("NGX: started on another device\n");
+        return false;
+    }
+    c.users++;
+    return true;
+}
+
+// one use of NGX given back: it stops with the last one, unless the process holds it up
+static void coreStop()
+{
+    Core& c = core();
+    std::lock_guard<std::mutex> lk(c.m);
+    if (--c.users == 0 && !c.hold && c.up)
+    {
+        {
+            std::lock_guard<std::mutex> cl(callLock());
+            NVSDK_NGX_D3D12_Shutdown1(c.device.Get());
+        }
+        c.up = false;
+        c.device.Reset();
+    }
+}
+
+// The most frames DLSS frame generation makes a pair on this GPU and driver (DLSSG.MultiFrameCountMax: 5 on an RTX
+// 50, 1 on an RTX 40), asked of NGX without a feature: what a plan of stages is made with before any stage runs.
+// 0 = not reported, or NGX did not start
+static uint32_t maxGenOf(ID3D12Device* device)
+{
+    if (!coreStart(device))
+        return 0;
+    uint32_t most = 0;
+    {
+        std::lock_guard<std::mutex> lk(callLock());
+        NVSDK_NGX_Parameter* p = nullptr;
+        if (NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_GetCapabilityParameters(&p)) && p)
+        {
+            p->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &most);
+            NVSDK_NGX_D3D12_DestroyParameters(p);
+        }
+    }
+    coreStop();
+    return most;
 }
 
 struct Direct
@@ -44,6 +139,7 @@ struct Direct
     panvec::Writer panTex; // writes texMvec
     bool panOn = false, ngxUp = false, hdr10 = false, bgra = false;
     bool resetNext = true; // the next evaluate starts a clip
+    uint32_t W = 0, H = 0; // the frames' size
     int gen = 1;
     uint32_t maxGen = 0; // DLSSG.MultiFrameCountMax, 0 = not reported
 
@@ -58,6 +154,15 @@ struct Direct
     ID3D12Fence* sFence = nullptr;   // the stage's fence (the ring's, shared with its readers)
     uint64_t sValue = 0;
     uint64_t sUpload = 0; // sFence's value behind the last copy out of uploadBuf
+
+    // one owner: a Direct gives its NGX use back when it goes (shutdown() before that is fine, a second one does nothing)
+    Direct() = default;
+    Direct(const Direct&) = delete;
+    Direct& operator=(const Direct&) = delete;
+    ~Direct()
+    {
+        shutdown();
+    }
 
     // both shader-resource bits: the state the colour, depth and vector textures are evaluated in
     static constexpr D3D12_RESOURCE_STATES kSrv =
@@ -142,7 +247,11 @@ struct Direct
         cp.RenderWidth = panvec::vecSize(W);
         cp.RenderHeight = panvec::vecSize(H);
         cp.DynamicResolutionScaling = false;
-        const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSSG(list.Get(), 1, 1, &feature, params, &cp);
+        NVSDK_NGX_Result r;
+        {
+            std::lock_guard<std::mutex> lk(callLock());
+            r = NGX_D3D12_CREATE_DLSSG(list.Get(), 1, 1, &feature, params, &cp);
+        }
         if (NVSDK_NGX_FAILED(r) || !submit())
         {
             LOG("NGX: the frame generation feature was refused (0x%08x)\n", (unsigned)r);
@@ -156,11 +265,14 @@ struct Direct
     void releaseFeature()
     {
         if (feature)
+        {
+            std::lock_guard<std::mutex> lk(callLock());
             NVSDK_NGX_D3D12_ReleaseFeature(feature);
+        }
         feature = nullptr;
     }
 
-    // dlssg2f's constants (the Streamline route's fillConstants) as NGX's optional evaluate parameters
+    // the camera a video frame is given (a static pinhole camera) as NGX's optional evaluate parameters
     void fillOptions()
     {
         const float fovY = 60.0f * 3.14159265f / 180.0f;
@@ -196,20 +308,18 @@ struct Direct
         opt.depthSubrectSize = {vw, vh};
     }
 
-    // true = ready for frames. false = this route is not available here (the reason is logged, everything it made
-    // is released): the caller uses Streamline's route. bgraFrames: SDR frames in B8G8R8A8 order; readBack false =
-    // no frame comes back to the CPU (a live stage)
-    bool init(int genFrames, bool hdr, bool bgraFrames = false, bool readBack = true)
+    // true = ready for frames of w x h. false = frame generation is not available here (the reason is logged,
+    // everything it made is released). bgraFrames: SDR frames in B8G8R8A8 order; readBack false = no frame comes back
+    // to the CPU (a live stage)
+    bool init(uint32_t w, uint32_t h, int genFrames, bool hdr, bool bgraFrames = false, bool readBack = true)
     {
+        W = w;
+        H = h;
         gen = genFrames;
         hdr10 = hdr;
         bgra = bgraFrames && !hdr;
-        typedef HRESULT(WINAPI * PfnCreateFactory)(REFIID, void**);
-        typedef HRESULT(WINAPI * PfnCreateDevice)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
-        const PfnCreateFactory createFactory = systemProc<PfnCreateFactory>(L"dxgi.dll", "CreateDXGIFactory1");
-        const PfnCreateDevice createDevice = systemProc<PfnCreateDevice>(L"d3d12.dll", "D3D12CreateDevice");
         ComPtr<IDXGIFactory1> factory;
-        if (!createFactory || !createDevice || FAILED(createFactory(IID_PPV_ARGS(&factory))))
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
         {
             LOG("NGX: no DXGI factory\n");
             return false;
@@ -225,7 +335,7 @@ struct Direct
         }
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        if (!adapter || FAILED(createDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))) ||
+        if (!adapter || FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))) ||
             FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) ||
             FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
             FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr,
@@ -238,31 +348,18 @@ struct Direct
         }
         fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-        // nvngx_dlssg.dll beside this exe; no NGX log file, its lines go to stderr with DLSSG_VERBOSE=1
-        wchar_t exePath[MAX_PATH];
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        std::wstring exeDir(exePath);
-        exeDir.resize(exeDir.find_last_of(L'\\'));
-        wchar_t tempDir[MAX_PATH];
-        if (!GetTempPathW(MAX_PATH, tempDir))
-            wcscpy_s(tempDir, exeDir.c_str());
-        const wchar_t* paths[] = {exeDir.c_str()};
-        const bool verbose = GetEnvironmentVariableW(L"DLSSG_VERBOSE", nullptr, 0) != 0;
-        NVSDK_NGX_FeatureCommonInfo fci{};
-        fci.PathListInfo.Path = paths;
-        fci.PathListInfo.Length = 1;
-        fci.LoggingInfo.LoggingCallback = ngxLog;
-        fci.LoggingInfo.MinimumLoggingLevel = verbose ? NVSDK_NGX_LOGGING_LEVEL_ON : NVSDK_NGX_LOGGING_LEVEL_OFF;
-        // the application id Streamline's route starts NGX with
-        NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(231313132ull, tempDir, device.Get(), &fci);
-        if (NVSDK_NGX_FAILED(r))
+        ngxUp = coreStart(device.Get());
+        if (!ngxUp)
         {
-            LOG("NGX: init failed (0x%08x)\n", (unsigned)r);
             shutdown();
             return false;
         }
-        ngxUp = true;
-        if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_GetCapabilityParameters(&params)) || !params)
+        bool capOk;
+        {
+            std::lock_guard<std::mutex> lk(callLock());
+            capOk = NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_GetCapabilityParameters(&params)) && params;
+        }
+        if (!capOk)
         {
             LOG("NGX: no capability parameters\n");
             shutdown();
@@ -357,7 +454,11 @@ struct Direct
             opt.multiFrameCount = (unsigned int)gen;
             opt.multiFrameIndex = (unsigned int)k;
             opt.reset = resetNext;
-            const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSSG(list.Get(), feature, params, &ep, &opt);
+            NVSDK_NGX_Result r;
+            {
+                std::lock_guard<std::mutex> lk(callLock());
+                r = NGX_D3D12_EVALUATE_DLSSG(list.Get(), feature, params, &ep, &opt);
+            }
             if (NVSDK_NGX_FAILED(r))
             {
                 LOG("NGX: evaluate failed (0x%08x)\n", (unsigned)r);
@@ -493,7 +594,11 @@ struct Direct
         opt.multiFrameCount = (unsigned int)gen;
         opt.multiFrameIndex = (unsigned int)k;
         opt.reset = resetNext;
-        const NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSSG(l, feature, params, &ep, &opt);
+        NVSDK_NGX_Result r;
+        {
+            std::lock_guard<std::mutex> lk(callLock());
+            r = NGX_D3D12_EVALUATE_DLSSG(l, feature, params, &ep, &opt);
+        }
         if (NVSDK_NGX_FAILED(r))
         {
             LOG("NGX: evaluate failed (0x%08x)\n", (unsigned)r);
@@ -556,10 +661,13 @@ struct Direct
     {
         releaseFeature();
         if (params)
+        {
+            std::lock_guard<std::mutex> lk(callLock());
             NVSDK_NGX_D3D12_DestroyParameters(params);
+        }
         params = nullptr;
         if (ngxUp)
-            NVSDK_NGX_D3D12_Shutdown1(device.Get());
+            coreStop();
         ngxUp = false;
         panTex = panvec::Writer();
         texFrame.Reset();

@@ -390,9 +390,7 @@ bool Host::resolveModules(std::string& err)
 
 bool Host::createDevice(std::string& err)
 {
-    // Both entry points from the System32 DLLs by name: linked into smv-live.exe (its offline
-    // host) the plain imports resolve to Streamline's sl.interposer, which
-    // that route never initialises (the WGC capture device follows the same rule).
+    // Both entry points from the System32 DLLs by name, never a DLL of that name beside the exe.
     wchar_t sys[MAX_PATH]{};
     GetSystemDirectoryW(sys, MAX_PATH);
     HMODULE dxgiDll = LoadLibraryW((std::wstring(sys) + L"\\dxgi.dll").c_str());
