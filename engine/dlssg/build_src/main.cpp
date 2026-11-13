@@ -974,7 +974,10 @@ struct Host
 // The header a reader maps (smv_dg1_TAG_hdr). A slot's copy is complete once the shared fence reaches its slotFence;
 // slotSeq = the present's number since the ring started (a reader that finds a newer number lost that slot). Version 2
 // adds wantGen / gen: the live host asks a running stage for another multiple, applied in place at its next present;
-// version 3 adds the ask kGenOff = 1x (DLSS-G off, each input passed through as it is; gen 0)
+// version 3 adds the ask kGenOff = 1x (DLSS-G off, each input passed through as it is; gen 0). wantKeep / keep come
+// after them and the version stays 3 (a host that knows version 3 reads a stage with them; a stage without them
+// leaves keep 0): a host that shows only every K-th frame of this stage (a non-whole multiple) asks wantKeep = K, and
+// a stage on NGX's own calls then makes and shares only those frames
 static const uint32_t kGenOff = 0xFFFFFFFFu;
 struct Stage1Hdr
 {
@@ -991,6 +994,8 @@ struct Stage1Hdr
     volatile uint32_t slotInput[16]; // lastInput at that moment
     volatile uint32_t wantGen;       // the host's ask: numFramesToGenerate from the next present (0 = none)
     volatile uint32_t gen;           // the stage's numFramesToGenerate now
+    volatile uint32_t wantKeep;      // the host's ask: only every wantKeep-th frame is shown (0 = none asked)
+    volatile uint32_t keep;          // the keep the stage runs, 1 = every frame; 0 = a stage that takes no keep
 };
 
 // Every native present copied into a ring of shared textures on rbQueue, the queue the native chain presents on
@@ -2240,6 +2245,7 @@ static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wst
     if (!ring.share(fg.device.Get(), fg.frameFormat(), genFrames, 16, tag) || !fg.stageInit(ring.fence.Get()) ||
         (!from.empty() && !up.open(fg.device.Get(), from, fg.frameFormat())))
         return true;
+    ring.hdr->keep = 1; // this stage takes a keep (wantKeep)
     ring.ready();
     _setmode(_fileno(stdin), _O_BINARY);
     // runStage1's handshake, plus ngx=1 = this route
@@ -2321,16 +2327,26 @@ static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wst
         in->done();
     ring.hdr->status = 1;
 
-    // a frame made and not shared yet: complete at the fence's `value`; the first of its input goes out as soon as it
-    // is complete, the others `after` ms behind that one
+    // an evaluate queued and not handled yet: complete at the fence's `value`. An input's first one sets the input's
+    // time base when it completes; a frame to share goes out `after` ms behind that base (the input's first tween:
+    // 0, as soon as it is complete). share = false: an evaluate whose frame the keep leaves out (the pair's last
+    // index, which DLSS-G needs)
     struct Made
     {
         uint64_t value;
         double after;
         bool first;
         uint32_t input;
+        bool share;
     };
     std::deque<Made> made;
+    // THE KEEP (the host's ask, wantKeep): the host shows only every keep-th frame of this stage, so only those are
+    // made and shared. wouldNo numbers the frames a stage without a keep shares (an input's tweens, then the input):
+    // frame n is kept when n % keep == 0, the frames a host that filters by itself shows. A pair's tweens need not
+    // all be evaluated: DLSS-G returns the same frame for an index whichever others were asked, as long as the
+    // pair's last index (index == count) is evaluated, and evaluated last: its history moves on at that call
+    uint64_t wouldNo = 0;
+    int keep = 1;
     uint64_t slotNo = 0; // frames written into the ring, shared or not
     auto slot = [&]() { return ring.ring[slotNo++ % ring.slots].Get(); };
     auto shareIt = [&](const Made& f) {
@@ -2366,31 +2382,56 @@ static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wst
                 ring.hdr->wantGen = 0;
             }
         }
+        const uint32_t wk = ring.hdr->wantKeep;
+        if (wk >= 1 && wk <= 6 && (int)wk != keep)
+        {
+            static const char* const which[] = {"",
+                                                "every frame",
+                                                "every 2nd frame",
+                                                "every 3rd frame",
+                                                "every 4th frame",
+                                                "every 5th frame",
+                                                "every 6th frame"};
+            LOG("stage1: %s made and shared from input %llu on (asked)\n", which[wk], (unsigned long long)inputs);
+            keep = (int)wk;
+            ring.hdr->keep = wk;
+        }
         const uint32_t no = (uint32_t)inputs++;
         ring.hdr->lastInput = no;
         uint64_t v = 0;
+        // the input's frame j (1 .. gen: its tweens, gen + 1: the input itself) is one the keep shows
+        auto kept = [&](int j) { return (wouldNo + (uint64_t)(j - 1)) % (uint64_t)keep == 0; };
         if (fg.gen > 0 && rewarm)
         {
             fg.resetNext = true;
-            if (!warm() || !(v = fg.stageEnd(slot())))
+            const bool sh = kept(1);
+            if (!warm() || !(v = fg.stageEnd(sh ? slot() : nullptr)))
                 return false;
             rewarm = false;
-            made.push_back({v, 0, true, no});
+            wouldNo++;
+            made.push_back({v, 0, true, no, sh});
         }
         else
         {
             if (!input())
                 return false;
             const double step = interval / (fg.gen + 1);
+            bool first = true;
             for (int k = 1; k <= fg.gen; k++)
             {
-                if (!(v = fg.stageTween(k, slot())))
+                const bool sh = kept(k);
+                if (!sh && k != fg.gen)
+                    continue;
+                if (!(v = fg.stageTween(k, sh ? slot() : nullptr)))
                     return false;
-                made.push_back({v, (k - 1) * step, k == 1, no});
+                made.push_back({v, (k - 1) * step, first, no, sh});
+                first = false;
             }
-            if (!(v = fg.stageEnd(slot())))
+            const bool sh = kept(fg.gen + 1);
+            if (!(v = fg.stageEnd(sh ? slot() : nullptr)))
                 return false;
-            made.push_back({v, fg.gen * step, fg.gen == 0, no});
+            made.push_back({v, fg.gen * step, first, no, sh});
+            wouldNo += (uint64_t)fg.gen + 1;
         }
         if (from.empty())
             in->done();
@@ -2407,7 +2448,7 @@ static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wst
         bool gpuWait = false;
         while (!made.empty())
         {
-            const Made& f = made.front();
+            Made& f = made.front();
             if (ring.fence->GetCompletedValue() < f.value)
             {
                 gpuWait = true;
@@ -2415,20 +2456,25 @@ static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wst
             }
             const double now = qpcMs();
             if (f.first)
+            {
                 base = now;
-            else if (now < base + f.after)
+                f.first = false;
+            }
+            if (f.share && now < base + f.after)
             {
                 wait = base + f.after - now;
                 break;
             }
-            shareIt(f);
+            if (f.share)
+                shareIt(f);
             made.pop_front();
         }
         if (takeInput(at, ended))
         {
             // frames still waiting: the source came sooner than its interval said, they go out now
             for (const Made& f : made)
-                shareIt(f);
+                if (f.share)
+                    shareIt(f);
             made.clear();
             if (!take())
             {
@@ -2476,7 +2522,8 @@ static bool runStage1Direct(int genFrames, bool hdr10, bool bgra, const std::wst
             YieldProcessor();
     }
     for (const Made& f : made)
-        shareIt(f);
+        if (f.share)
+            shareIt(f);
     // every shared frame's fence value is reached before the stage ends: a reader waits on it
     fg.stageWait(fg.sValue);
     ring.finish(2);

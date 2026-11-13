@@ -1306,10 +1306,11 @@ passes of 2..L (L = numFramesToGenerateMax + 1 read after the warm-up), the pass
 file route (one pass 2..6; two 4, 6, 8, 9, 10, 12, 15, 16, 18, 20, 24, 25, 30, 36: 12x = 2x then 6x, 360 fps
 from 24 = 15x = 3x then 5x; three up to 216, 72x = 2x, 6x, then 6x; the same multiple with fewer passes wins,
 then the smaller first pass) (`smv-live.exe --dlssg-snap-table L` prints the
-one- and two-pass table). A DLSS-G stage whose output rate lands on the panel's refresh (within 2 %) paces at
-about 96 % of it (15x of 24 fps on a 360 Hz panel presents 346 of 360, in the session and in a helper alike,
-while 16x presents 384 of 384), so such a whole rung steps up to the next rung and the panel shows its full
-rate (a kept plan takes its first candidate). The host then prices the helpers' video memory (Streamline's own estimate + each ring) against the
+one- and two-pass table). A rung whose rate lands on the panel's refresh runs like any other (360 fps from 30 on
+a 360 Hz panel = 12x): on screen it presents the refresh in full. A PARKED session (a test's overlay off the
+screen) is different: there the pass made in the session drifts to about 97 % of the refresh for seconds at a time
+(15x of 24 fps: 348 to 351 of 360), so a rate measured on such a rung counts only from an on-screen session.
+The host then prices the helpers' video memory (Streamline's own estimate + each ring) against the
 free memory (three passes the room does not hold = the best two), starts `--stage1` on a helper thread while
 the one pass keeps presenting (every stage at once, each one's init side by side, a later stage waiting up to
 15 s for its upstream's ring; `SMV_LIVE_DLSSG_SERIAL_START=1` = one after another), feeds it until it shares a
@@ -1338,7 +1339,15 @@ Mx in place (...)`. A target no whole multiple reaches within 3 % (60 fps from 2
 route's way: a rung R of one or two helper passes and a keep k of 2..6 with R / k within 3 % (the fewest passes,
 then the smallest R: 2.5x = 5x in a helper, 4.5x = 3x then 3x in two, 7.5x = 3x then 5x), the session presents every k-th frame of
 the presented ring and makes none itself, so the output stays evenly spaced (`SMV_LIVE_DLSSG_KEEP=0` = whole
-multiples only). THE REFRESH HOLD: on some display modes (measured at 60 Hz, not at 360 Hz) the session's own DLSS-G
+multiples only). A presented helper on NGX's own calls takes the keep itself (`Stage1Hdr`'s `wantKeep` / `keep`
+after `wantGen` / `gen`, asked before its first input and with any in-place step; helper line `stage1: every 2nd
+frame made and shared from input N on (asked)`): of a pair's frames it evaluates only the ones the keep shows, plus
+the pair's last index when the keep leaves that one out (DLSS-G moves its history on at that evaluate, and returns
+the same frame for an index whichever others were asked, so the frames stay the every-k-th ones byte for byte), and
+shares only the shown ones, each at its own place in the source's interval; the session then presents every frame of
+the ring (report `every 2nd shown, the others not made`). 2.5x = 5 evaluates for two pairs instead of 8.
+`SMV_LIVE_DLSSG_KEEPDIRECT=0` = the helper makes every frame and the session leaves the others out (the A/B; a
+helper on Streamline's stage always works that way). THE REFRESH HOLD: on some display modes (measured at 60 Hz, not at 360 Hz) the session's own DLSS-G
 pass presents exactly the panel's refresh whatever its multiple, each present call lasting its frames' refresh
 periods and the captures behind it dropped, while frames made in helpers and presented by the session with its pass
 off are not held. The session reads the hold from its 2 s windows (its pass asked past the refresh, 85 % to 103 % of
@@ -2035,6 +2044,7 @@ named here, and on a name here that no source holds.
 | `SMV_DLSSG_GAP_RESET=1` | `dlssg2f` resets DLSS 4.5 before every pair whose input came 500 ms after the last one (A/B) |
 | `SMV_LIVE_SL_TEAR=0` | the Live session's own DLSS 4.5 presents go out without `DXGI_PRESENT_ALLOW_TEARING`: by default a sync-0 present on that route passes the flag, as every other route's presents do (the flag alone does not lift the refresh hold below); the A/B only |
 | `SMV_LIVE_DLSSG_REFHOLD=0` / `=force` | the refresh hold of Live DLSS 4.5 (a display mode that holds the session's own pass to the panel's refresh): `0` = the pass stays in the session when the hold is seen, `force` = the hold counts as seen from the start at any rate, so every whole plan runs all its passes in helpers (a parked session's way to those plans); the A/B and gate lever |
+| `SMV_LIVE_DLSSG_KEEPDIRECT=0` | a kept Live DLSS 4.5 plan (a non-whole multiple) has its presented helper make every frame of its rung and the session present every k-th: by default a helper on NGX's own calls makes and shares only the frames the keep shows; the A/B and gate lever |
 | `SMV_DLSSG_NGX=0` / `=fail` | `dlssg2f` (`--server` and Live's `--stage1`) makes its frames through Streamline's swap chain instead of NGX's own calls (the A/B of the two routes: the same frames); `fail` = NGX's route treated as unavailable after its full start, the trigger test of the automatic fallback to Streamline's |
 | `SMV_DLSSG_HDR10=0` | DLSS 4.5 gets HDR planes as 8-bit codes on an RGBA8 swap chain (labelled SDR) instead of HDR10; an A/B lever, never a product setting |
 | `SMV_DLSSG_REFUSE_HDR10=1` | the DLSS 4.5 host treats the HDR10 colour space as refused (exit 5): the trigger test of the host's 8-bit fallback |
