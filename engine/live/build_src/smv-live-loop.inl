@@ -1998,6 +1998,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
     CHECK_HR(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic)));
     timeBeginPeriod(1);
     fillMouseRestore(); // a Fill session that was killed or crashed left the pointer speed changed
+    // the count as asked: DLSS 4.5 with effects zeroes genFrames (its echo route holds one slot), and a fixed
+    // multiple's plan still needs it
+    const int genAsked = genFrames;
 
     HWND target = targetOverride ? targetOverride : findTargetWindow(needle);
     if (targetOverride)
@@ -3657,7 +3660,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const bool cascOneOnly = cascMode == "off";
         // a fixed multiple (--gen, or no --target): a plan of one stage at it, made at the first stats window
         const bool cascFixed = dgSess && (g_genExplicit || g_targetFps <= 0);
-        const int cascFixedGen = genFrames;
+        const int cascFixedGen = g_fgOver ? genAsked : genFrames;
         if (cascFixed)
             cascNow = true;
         const bool cascAuto = (cascMode.empty() || cascOneOnly) && dgSess && cascW >= 128 && cascH >= 128;

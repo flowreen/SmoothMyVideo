@@ -303,7 +303,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + kFsrCompileMs);
     if (testHang && nr.fuN + 1 == (uint64_t)testHang)
         Sleep(kFsrCompileMs + 20000);
-    // FSR 4.1.1 gives byte-identical frames at any frame time (measured, harness fsr4_int8_upscaler): one 60 Hz frame
+    // FSR 4.1.1 gives byte-identical frames at any frame time (measured): one 60 Hz frame
     const int rc = g_fsrupK[nr.fuKind].frame(ready, done, first ? 1 : 0, 1000.0 / 60.0);
     if (first)
         InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + 10000);
