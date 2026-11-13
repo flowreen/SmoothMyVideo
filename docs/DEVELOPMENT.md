@@ -1339,7 +1339,9 @@ Mx in place (...)`. A target no whole multiple reaches within 3 % (60 fps from 2
 route's way: a rung R of one or two helper passes and a keep k of 2..6 with R / k within 3 % (the fewest passes,
 then the smallest R: 2.5x = 5x in a helper, 4.5x = 3x then 3x in two, 7.5x = 3x then 5x), the session presents every k-th frame of
 the presented ring and makes none itself, so the output stays evenly spaced (`SMV_LIVE_DLSSG_KEEP=0` = whole
-multiples only). A presented helper on NGX's own calls takes the keep itself (`Stage1Hdr`'s `wantKeep` / `keep`
+multiples only). A source above 100 fps takes no kept plan of two passes (two passes cost more than its frame
+interval leaves time for; the one pass's whole multiple runs instead), and a kept plan of two passes that fell short
+of its multiple is not planned again: the next plan holds at most what it held. A presented helper on NGX's own calls takes the keep itself (`Stage1Hdr`'s `wantKeep` / `keep`
 after `wantGen` / `gen`, asked before its first input and with any in-place step; helper line `stage1: every 2nd
 frame made and shared from input N on (asked)`): of a pair's frames it evaluates only the ones the keep shows, plus
 the pair's last index when the keep leaves that one out (DLSS-G moves its history on at that evaluate, and returns

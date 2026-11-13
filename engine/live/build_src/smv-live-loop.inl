@@ -3821,8 +3821,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // every pass of the plan runs in a helper and the session makes no frame: the final enlarge (host.lzOn), or a
         // plan the refresh hold sent there (cascHelpAll)
         auto cascAllHelp = [&]() { return host.lzOn || cascHelpAll; };
-        // the plan running has three passes in helpers or here (the shortfall rule's three-stage case)
-        auto cascThree = [&]() { return cascAllHelp() ? cascMid != nullptr : cascUp != nullptr; };
+        // the plan running has three passes in helpers or here (the shortfall rule's three-stage case). A kept plan
+        // never has: its two helpers are both of its passes, the session only presents
+        auto cascThree = [&]() { return cascKeep == 1 && (cascAllHelp() ? cascMid != nullptr : cascUp != nullptr); };
         std::thread cascTh;
         std::atomic<int> cascRes{-1};
         // the one-pass limit: numFramesToGenerateMax + 1 (6 on RTX 50, 2 on RTX 40), 6 while the driver has not said;
@@ -3927,13 +3928,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             int M0 = dlssgSnap(want, lim, m1, m2, nullptr, &m3);
             if (cascMaxM && M0 > cascMaxM)
                 M0 = dlssgAtMost(cascMaxM, lim, m1, m2, &m3);
-            // no whole rung within 3 % of the want: a rung and a keep (dlssgKeepPlan), unless the keep plan is off or
-            // the rung is above what a plan that fell short held (cascMaxM)
+            // no whole rung within 3 % of the want: a rung and a keep (dlssgKeepPlan), unless the keep plan is off, the
+            // rung is above what a plan that fell short held (cascMaxM), or it takes two passes on a source above 100
+            // fps (two passes cost more than such a source leaves time for: 5x then 5x of 119 fps held 2.5x to 2.9x of
+            // its 4.17x)
             if (cascKeepOn && fabs((double)M0 - want) > 0.03 * want)
             {
                 int k1 = 0, k2 = 0, kk = 1;
                 const int R = dlssgKeepPlan(want, lim, k1, k2, kk);
-                if (R && !(cascMaxM && R > cascMaxM))
+                if (R && !(cascMaxM && R > cascMaxM) && !(k2 > 1 && capFps > 100.0))
                 {
                     M0 = R;
                     m1 = k1;

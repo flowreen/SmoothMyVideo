@@ -115,7 +115,7 @@ picture, without adding frames. Hover a row in the app to see its exact version.
 
 | Model | Best for | Needs | Notes |
 |---|---|---|---|
-| **NVIDIA DLSS 4.5** (DLSS Frame Generation; default on RTX 40/50) | Most videos, high frame rates, Live | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | NVIDIA's game frame generation, on video, and the fastest model. Makes whole multiples of the source rate, and reaches other targets by making extra frames and keeping an even share of them (24 to 60 fps = 5&times;, every 2nd frame). An RTX 50 makes up to 6&times; in one pass, an RTX 40 2&times;; higher multipliers take several passes. |
+| **NVIDIA DLSS 4.5** (DLSS Frame Generation; default on RTX 40/50) | Most videos, high frame rates, Live | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | NVIDIA's game frame generation, on video, and the fastest model. Makes whole multiples of the source rate, and reaches other targets with evenly spaced frames of a higher multiple (24 to 60 fps = every 2nd frame of 5&times;). An RTX 50 makes up to 6&times; in one pass, an RTX 40 2&times;; higher multipliers take several passes. |
 | **GMFSS** (default on other GPUs) | Anime | Any RTX GPU | The cleanest frames, even at high multipliers; the heaviest on the GPU. |
 | **RIFE** (Practical-RIFE 4.25) | Live action, filmed content | Any RTX GPU | A strong all-round model. Its **DRBA** option (for anime) keeps characters moving at their drawn pace while camera pans get fully smooth; in Live it adds one frame of delay. |
 | **NVIDIA Optical Flow** | Slower PCs, fast renders, moderate motion | Any RTX GPU | Runs on a dedicated part of the GPU, so it is fast. Very fast motion turns into a soft double image instead of breaking up. Videos need a whole multiplier (2&times;, 3&times; ...). |
@@ -224,8 +224,9 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
   ticked.
 * **Adaptive:** with GMFSS, RIFE or NVIDIA Optical Flow the output holds your fps target whatever the source does (a
   game dropping from 30 to 10 fps still plays at the same smooth rate). AMD FSR 4, Intel XeSS-FG and Smooth Motion
-  double the frame rate per pass, so they pick the doubling that reaches your target (60 fps from 24 shows 96). DLSS 4.5 makes extra
-  frames and keeps an even share of them (60 fps from 24 = 5&times;, every 2nd frame).
+  double the frame rate per pass, so they pick the doubling that reaches your target (60 fps from 24 shows 96). DLSS 4.5 matches
+  your target, your screen's refresh rate included: a whole multiple when one fits, else evenly spaced frames of a
+  higher one (60 fps from 24 = every 2nd frame of 5&times;).
 * **Fit to the GPU** (on by default) lowers the frame rate to what your GPU can keep up with, never below the source,
   with every effect kept. Unticked, a target the GPU can't reach makes it skip frames.
 * **Readout:** a small green corner readout shows the source fps, the smoothed fps, and roughly how far the picture
@@ -250,8 +251,9 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
   the window is resized or moved to another monitor, and if the engine stalls. A closed window stops Live.
 * **Fill screen and the mouse:** clicks on the stretched picture reach the matching spot of your window, and the
   pointer speed follows the stretch; the normal pointer comes back when the cursor leaves the picture or Live stops.
-* **Fast restarts:** the loaded model stays ready after Stop, so the next session starts faster (not after DLSS 4.5,
-  DLSS 5 or RTX HDR); it is freed after 10 idle minutes or when you pick another model.
+* **Fast restarts:** the loaded model stays ready after Stop, so the next session starts faster (not after DLSS 5 or
+  RTX HDR; DLSS 4.5 keeps its own engine ready instead); it is freed after 10 idle minutes or when you pick another
+  model.
 * **RivaTuner (RTSS):** if it hooks the overlay, the engine log (`%TEMP%\smv-engine.log`) names it, with the fix.
 
 </details>
