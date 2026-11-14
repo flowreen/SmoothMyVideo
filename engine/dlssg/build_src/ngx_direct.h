@@ -135,8 +135,9 @@ struct Direct
     NVSDK_NGX_Parameter* params = nullptr;
     NVSDK_NGX_Handle* feature = nullptr;
     NVSDK_NGX_DLSSG_Opt_Eval_Params opt{};
-    panvec::Estimator pan; // measures each frame against the one before it
-    panvec::Writer panTex; // writes texMvec
+    panvec::Estimator pan;  // measures each frame against the one before it
+    panvec::Writer panTex;  // writes texMvec
+    panvec::Result lastPan; // a live stage: what the last CPU input measured against the one before it
     bool panOn = false, ngxUp = false, hdr10 = false, bgra = false;
     bool resetNext = true; // the next evaluate starts a clip
     uint32_t W = 0, H = 0; // the frames' size
@@ -535,11 +536,11 @@ struct Direct
         return sValue;
     }
 
-    // an input into the frame texture: CPU bytes (measured for the pan), or a texture of this device resting in
-    // COMMON once srcFence reaches srcValue (an upstream stage's ring slot: zero vectors), or neither = the input
-    // before it again
+    // an input into the frame texture: CPU bytes (measured for the pan, the result kept in lastPan), or a texture of
+    // this device resting in COMMON once srcFence reaches srcValue (an upstream stage's ring slot: the vectors `given`,
+    // which the stage derives from the slots' motion, else zero), or neither = the input before it again (zero)
     bool stageInput(const uint8_t* rgba, ID3D12Resource* src = nullptr, ID3D12Fence* srcFence = nullptr,
-                    uint64_t srcValue = 0)
+                    uint64_t srcValue = 0, const panvec::Result* given = nullptr)
     {
         panvec::Result panR{};
         if (rgba)
@@ -551,7 +552,10 @@ struct Direct
                 memcpy(upload + (size_t)y * rowPitch, rgba + (size_t)y * W * 4, (size_t)W * 4);
             if (panOn)
                 panR = pan.run(rgba, W, H, (size_t)W * 4, hdr10);
+            lastPan = panR;
         }
+        else if (src && given)
+            panR = *given;
         ID3D12GraphicsCommandList* l = stageList();
         if (!l)
             return false;
@@ -642,6 +646,7 @@ struct Direct
     {
         releaseFeature();
         pan = panvec::Estimator();
+        lastPan = panvec::Result();
         return createFeature();
     }
 

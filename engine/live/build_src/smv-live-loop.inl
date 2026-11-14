@@ -237,6 +237,8 @@ struct Stage1HdrView // dlssg2f's Stage1Hdr (engine\dlssg\build_src\main.cpp), v
     // after them, on a stage that takes the ask (0 on any other): 1 = it shares a frame as soon as it is made (the
     // session's display times the frames), and what it does now
     volatile uint32_t wantAtOnce, atOnce;
+    // after them: the slots' motion block (ngx_stage.h's Stage1Hdr from motionMagic on), which only the stage reading
+    // this ring uses; the session reads none of it
 };
 static const uint32_t kStageOff = 0xFFFFFFFFu; // version 3's ask for 1x (dlssg2f's kGenOff): DLSS-G off, gen 0
 
@@ -2828,6 +2830,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // at most (what the GPU held, 0 = none)
         int cascM = 0, cascM1 = 0, cascM2 = 0, cascM3 = 1, cascWantPrev = -1, cascShown = 0, cascLow = 0, cascMaxM = 0;
         bool cascTwoTopShort = false; // the two-pass top (the limit x the limit) fell short this session
+        bool cascFitOffSaid = false;  // Fit to the GPU off: this plan's shortfall line was logged
         ULONGLONG cascStepTick = 0;   // an in-place step's ask (cascSwitch), until every helper runs it
         // THE CLIMB (SMV_LIVE_DLSSG_CLIMB=0 = off: the target's rung first): a plan for a target past the panel's refresh
         // whose rung (cascTopM) lies past the first rung above one pass starts its helpers at the target's multiples
@@ -4062,6 +4065,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     }
                 }
             }
+            // Fit to the GPU off: the plan keeps the target's rung whatever share of it the GPU shows (the target or
+            // above; lowering it is the GPU fit's), one line a plan when it falls short
+            if (g_noGpuFit)
+            {
+                if (!cascFitOffSaid && outFps < cascHold * cascShown / cascKeep * capFps)
+                {
+                    cascFitOffSaid = true;
+                    LOG("DLSS 4.5: %.2fx of %.2fx shown, Fit to the GPU is off: the plan keeps its multiple\n",
+                        outFps / capFps, (double)cascShown / cascKeep);
+                }
+                cascLow = 0;
+                return;
+            }
             cascLow = outFps < cascHold * cascShown / cascKeep * capFps ? cascLow + 1 : 0;
             if (cascLow < 3)
                 return;
@@ -4239,14 +4255,17 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     cascKeep = keep;
                     // the climb: the first rung above one pass with the plan's passes, when the target lies past it and
                     // past the panel's refresh (a target at or under the refresh is a rate the user expects: its plan
-                    // runs as it is, a shortfall steps down in place; a target past it asks for what the GPU affords)
+                    // runs as it is, a shortfall steps down in place; a target past it asks for what the GPU affords).
+                    // Finding what the GPU affords is the GPU fit's: with Fit to the GPU off the target's rung runs at
+                    // once
                     cascTopM = cascCeilM = cascHoldWins = cascClimbWins = 0;
                     cascHeld[0] = cascFirst[0] = 0;
                     cascClimbing = false;
                     cascClimbWait = cascClimbTick = 0;
+                    cascFitOffSaid = false;
                     const int P = m3 > 1 ? 3 : m2 > 1 ? 2 : 1;
                     const bool pastPanel = panelHzMode > 1.0 ? g_targetFps > 1.02 * panelHzMode : P == 3;
-                    if (cascClimbOn && cascInPlaceOn && keep == 1 && pastPanel)
+                    if (cascClimbOn && cascInPlaceOn && keep == 1 && pastPanel && !g_noGpuFit)
                     {
                         const auto rs = dlssgRungs(lim, P);
                         for (const auto& r : rs)

@@ -35,6 +35,8 @@ static double qpcMs()
 // leaves keep 0): a host that shows only every K-th frame of this stage (a non-whole multiple) asks wantKeep = K, and
 // a stage on NGX's own calls then makes and shares only those frames
 static const uint32_t kGenOff = 0xFFFFFFFFu;
+static const uint32_t kSlotStills = 96;          // still rectangles a slot's motion holds
+static const uint32_t kMotionMagic = 0x4D564D53; // 'SMVM': the header's motion block is written
 struct Stage1Hdr
 {
     uint32_t magic;   // 'SMV1'
@@ -56,7 +58,68 @@ struct Stage1Hdr
     // asks a stage on NGX's own calls for each frame as soon as it is made
     volatile uint32_t wantAtOnce; // the host's ask: 1 = a frame is shared as soon as it is made, 0 = at its time
     volatile uint32_t atOnce;     // what the stage does now; stays 0 on a stage that takes no such ask
+    // after them, the version still 3: each slot's MOTION, for a stage that takes this ring as its input (its own
+    // vectors: pairMotion). pos = the frame's place on the first stage's input timeline (that stage's input n = n,
+    // its tween k of g + 1 between inputs n - 1 and n = n - 1 + k / (g + 1)); iv = the input interval the frame lies
+    // in (pos in (iv - 1, iv]) and that interval's pan (pan_vectors.h's Result, one input's motion, current ->
+    // previous) with its still rectangles; slotStillN past kSlotStills = more than fit: that slot's vectors stay zero.
+    // motionMagic = the block is written (a reader of a shorter header, or one without it, takes zero vectors)
+    volatile uint32_t motionMagic;
+    volatile uint32_t slotIv[16];
+    volatile double slotPos[16];
+    volatile float slotMx[16], slotMy[16];
+    volatile uint32_t slotPanOn[16];
+    volatile uint32_t slotStillN[16];
+    D3D12_RECT slotStill[16][kSlotStills];
 };
+
+// One ring frame's motion as the stage after it reads it (Stage1Hdr's motion block)
+struct SlotMotion
+{
+    double pos = 0;
+    uint32_t iv = 0;
+    panvec::Result pan; // the pan of input interval iv
+};
+
+// The vectors of a stage whose input pair is the ring frames a -> b (the newer): each input interval's pan times the
+// share of it between them (an interval a skipped slot hid takes b's pan); an interval in that span without a pan, or
+// a move under the estimator's own minimum (*under set), = zero vectors, as the first stage would record; the still
+// rectangles = b's interval's
+static panvec::Result pairMotion(const SlotMotion& a, const SlotMotion& b, bool* under = nullptr)
+{
+    panvec::Result r;
+    if (under)
+        *under = false;
+    if (!(b.pos > a.pos) || b.iv < a.iv)
+        return r;
+    double mx, my;
+    if (b.iv == a.iv)
+    {
+        if (!b.pan.on)
+            return r;
+        mx = b.pan.mx * (b.pos - a.pos);
+        my = b.pan.my * (b.pos - a.pos);
+    }
+    else
+    {
+        if (!a.pan.on || !b.pan.on)
+            return r;
+        const double fa = (double)a.iv - a.pos, fb = b.pos - (double)a.iv;
+        mx = a.pan.mx * fa + b.pan.mx * fb;
+        my = a.pan.my * fa + b.pan.my * fb;
+    }
+    if (mx * mx + my * my < panvec::Estimator::kMinMove * panvec::Estimator::kMinMove)
+    {
+        if (under)
+            *under = true;
+        return r;
+    }
+    r.on = true;
+    r.mx = (float)mx;
+    r.my = (float)my;
+    r.still = b.pan.still;
+    return r;
+}
 
 // What a stage shares with its readers, each by name (smv_dg1_TAG_...): a ring of textures resting in COMMON (the
 // state another device's queue may assume), the fence their copies complete on, the header, and the event a publish
@@ -130,6 +193,7 @@ struct StageShare
         hdr->ring = (uint32_t)slots;
         hdr->fmt = (uint32_t)fmt;
         hdr->allocSize = dev->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+        hdr->motionMagic = kMotionMagic;
         return true;
     }
 
@@ -141,14 +205,23 @@ struct StageShare
     }
 
     // the ring's next frame is in its slot (number % slots) once the fence reaches value; qpc = when it was shared,
-    // input = the source frame it belongs to
-    void publish(uint64_t value, int64_t qpc, uint32_t input)
+    // input = the source frame it belongs to, mot = its motion for the stage after this one
+    void publish(uint64_t value, int64_t qpc, uint32_t input, const SlotMotion& mot)
     {
         const int s = (int)(count % slots);
         hdr->slotFence[s] = value;
         hdr->slotSeq[s] = count;
         hdr->slotQpc[s] = qpc;
         hdr->slotInput[s] = input;
+        hdr->slotPos[s] = mot.pos;
+        hdr->slotIv[s] = mot.iv;
+        hdr->slotPanOn[s] = mot.pan.on ? 1u : 0u;
+        hdr->slotMx[s] = mot.pan.mx;
+        hdr->slotMy[s] = mot.pan.my;
+        const size_t ns = mot.pan.still.size();
+        hdr->slotStillN[s] = ns <= kSlotStills ? (uint32_t)ns : kSlotStills + 1;
+        for (size_t i = 0; i < ns && i < kSlotStills; i++)
+            hdr->slotStill[s][i] = mot.pan.still[i];
         MemoryBarrier();
         hdr->frames = ++count;
         frames++;
@@ -187,17 +260,19 @@ struct UpstreamRing
     uint32_t n = 0;
     uint64_t nextSeq = 0, skipped = 0;
     HANDLE wake = nullptr; // the upstream stage's publish event; null = it has none, its ring is polled
+    bool motion = false;   // the upstream header carries the slots' motion (Stage1Hdr's motion block)
 
     bool open(ID3D12Device* dev, const std::wstring& tag, DXGI_FORMAT fmt, uint32_t w, uint32_t h)
     {
         // the upstream stage may still be starting (the live host starts every stage at once): its header's magic,
-        // written last, is waited for up to 15 s
+        // written last, is waited for up to 15 s. The whole mapping is viewed: a stage built before the motion block
+        // shares a shorter header
         const std::wstring mn = L"smv_dg1_" + tag + L"_hdr";
         const ULONGLONG until = GetTickCount64() + 15000;
         for (;;)
         {
             map = OpenFileMappingW(FILE_MAP_READ, FALSE, mn.c_str());
-            hdr = map ? (const Stage1Hdr*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(Stage1Hdr)) : nullptr;
+            hdr = map ? (const Stage1Hdr*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) : nullptr;
             if ((hdr && hdr->magic == 0x31564D53) || GetTickCount64() > until)
                 break;
             if (hdr)
@@ -220,6 +295,11 @@ struct UpstreamRing
             return false;
         }
         n = hdr->ring;
+        MEMORY_BASIC_INFORMATION mbi{};
+        motion = VirtualQuery(hdr, &mbi, sizeof(mbi)) && mbi.RegionSize >= sizeof(Stage1Hdr) &&
+                 hdr->motionMagic == kMotionMagic;
+        if (!motion)
+            LOG("--from %ls: its header carries no slot motion: zero vectors\n", tag.c_str());
         wake = OpenEventW(SYNCHRONIZE, FALSE, (L"smv_dg1_" + tag + L"_wake").c_str());
         for (uint32_t i = 0; i <= n; i++)
         {
@@ -239,8 +319,9 @@ struct UpstreamRing
         return true;
     }
 
-    // the next shared present in order: its slot and fence value (false = none yet)
-    bool next(uint32_t& s, uint64_t& fv)
+    // the next shared present in order: its slot, fence value and motion (false = none yet; no motion block = the
+    // motion stays zero); a slot the writer took again while it was read counts as skipped
+    bool next(uint32_t& s, uint64_t& fv, SlotMotion& mot)
     {
         while (hdr->frames > nextSeq)
         {
@@ -253,6 +334,25 @@ struct UpstreamRing
                 continue;
             }
             fv = hdr->slotFence[s];
+            mot = SlotMotion();
+            if (motion)
+            {
+                mot.pos = hdr->slotPos[s];
+                mot.iv = hdr->slotIv[s];
+                const uint32_t ns = hdr->slotStillN[s];
+                mot.pan.on = hdr->slotPanOn[s] != 0 && ns <= kSlotStills;
+                mot.pan.mx = hdr->slotMx[s];
+                mot.pan.my = hdr->slotMy[s];
+                if (mot.pan.on)
+                    mot.pan.still.assign(&hdr->slotStill[s][0], &hdr->slotStill[s][0] + ns);
+                MemoryBarrier();
+                if (hdr->slotSeq[s] != seq)
+                {
+                    skipped++;
+                    nextSeq = seq + 1;
+                    continue;
+                }
+            }
             nextSeq++;
             return true;
         }
@@ -341,6 +441,17 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
     const uint8_t* cpu = nullptr;
     uint32_t upSlot = 0;
     uint64_t upValue = 0;
+    // THE MOTION a frame carries to the next stage (Stage1Hdr's motion block): the input taken last (taken), the
+    // input evaluated now (cur) and the one before it (prev). Fed CPU frames, this stage is the first: its input n
+    // sits at n, its interval's pan = what it measured (fg.lastPan); fed a ring, each input's motion is its slot's,
+    // and the vectors of the pair prev -> cur come from them (pairMotion)
+    SlotMotion taken, cur, prev;
+    bool haveCur = false, havePrev = false;
+    uint64_t fedNo = 0; // CPU inputs taken (the warm-up's = 0)
+    // the stat window's inputs: evaluated with vectors on, all of them, those whose derived move stayed under the
+    // estimator's minimum (a stage fed a ring), and the vectors' summed length (pixels)
+    uint64_t statVec = 0, statVecInputs = 0, statUnder = 0;
+    double statVecLen = 0;
     // the next input if one is there: at = when it arrived; ended = none will come
     auto takeInput = [&](double& at, bool& ended) -> bool {
         ended = false;
@@ -348,18 +459,66 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
         {
             const int r = feed->take(cpu, at);
             ended = r < 0;
+            if (r > 0)
+            {
+                taken = SlotMotion();
+                taken.pos = (double)fedNo;
+                taken.iv = (uint32_t)fedNo++;
+            }
             return r > 0;
         }
-        if (up->next(upSlot, upValue))
+        if (up->next(upSlot, upValue, taken))
         {
+            if (!up->motion) // an upstream without slot motion: one input interval a frame, no pan
+            {
+                taken.pos = haveCur ? cur.pos + 1.0 : 0.0;
+                taken.iv = (uint32_t)taken.pos;
+            }
             at = qpcMs();
             return true;
         }
         ended = (upEnd && *upEnd) || up->hdr->status >= 2;
         return false;
     };
+    // the input taken last into the frame texture with its vectors; a CPU frame evaluated again (the warm-up) stays
+    // the same input
     auto input = [&]() -> bool {
-        return feed ? fg.stageInput(cpu) : fg.stageInput(nullptr, up->ring[upSlot].Get(), up->fence.Get(), upValue);
+        const bool fresh = !haveCur || taken.pos != cur.pos;
+        panvec::Result r;
+        bool under = false;
+        if (feed)
+        {
+            if (!fg.stageInput(cpu))
+                return false;
+            if (fresh)
+                taken.pan = fg.lastPan;
+            r = fg.lastPan;
+        }
+        else
+        {
+            if (haveCur && fresh)
+                r = pairMotion(cur, taken, &under);
+            if (!fg.stageInput(nullptr, up->ring[upSlot].Get(), up->fence.Get(), upValue, &r))
+                return false;
+        }
+        if (fresh)
+        {
+            prev = cur;
+            havePrev = haveCur;
+            cur = taken;
+            haveCur = true;
+            statVecInputs++;
+            statVec += r.on ? 1 : 0;
+            statUnder += under ? 1 : 0;
+            statVecLen += r.on ? std::sqrt((double)r.mx * r.mx + (double)r.my * r.my) : 0.0;
+        }
+        return true;
+    };
+    // the motion of this stage's frame at `pos` between prev and cur: the interval it lies in, with that interval's pan
+    auto motionAt = [&](double pos) -> SlotMotion {
+        SlotMotion m = havePrev && cur.iv > prev.iv && pos <= (double)prev.iv ? prev : cur;
+        m.pos = pos;
+        return m;
     };
     // a clip's first input three times, each with its evaluates (--server's rule): the frame texture is left for
     // stageEnd
@@ -411,6 +570,7 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
         bool first;
         uint32_t input;
         bool share;
+        SlotMotion mot; // its motion for the stage after this one
     };
     std::deque<Made> made;
     // THE KEEP (the host's ask, wantKeep): the host shows only every keep-th frame of this stage, so only those are
@@ -426,7 +586,7 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
     auto shareIt = [&](const Made& f) {
         LARGE_INTEGER t;
         QueryPerformanceCounter(&t);
-        ring.publish(f.value, t.QuadPart, f.input);
+        ring.publish(f.value, t.QuadPart, f.input, f.mot);
     };
     SourceClock clock;
     double lastAt = at, base = 0;
@@ -491,7 +651,7 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
                 return false;
             rewarm = false;
             wouldNo++;
-            made.push_back({v, 0, true, no, sh});
+            made.push_back({v, 0, true, no, sh, cur});
         }
         else
         {
@@ -506,13 +666,14 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
                     continue;
                 if (!(v = fg.stageTween(k, sh ? slot() : nullptr)))
                     return false;
-                made.push_back({v, (k - 1) * step, first, no, sh});
+                const double pos = havePrev ? prev.pos + (cur.pos - prev.pos) * k / (fg.gen + 1) : cur.pos;
+                made.push_back({v, (k - 1) * step, first, no, sh, motionAt(pos)});
                 first = false;
             }
             const bool sh = kept(fg.gen + 1);
             if (!(v = fg.stageEnd(sh ? slot() : nullptr)))
                 return false;
-            made.push_back({v, fg.gen * step, first, no, sh});
+            made.push_back({v, fg.gen * step, first, no, sh, cur});
             wouldNo += (uint64_t)fg.gen + 1;
         }
         if (feed)
@@ -570,12 +731,20 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
             {
                 const double s = (tick - statTick) / 1000.0;
                 const uint64_t f = ring.frames, n = inputs - statInputs;
-                LOG("stage1: %.1f inputs/s, %.1f shared presents/s (%.2f an input)%s\n", n / s, (f - statFrames) / s,
-                    n ? (double)(f - statFrames) / n : 0.0,
-                    up ? (", " + std::to_string(up->skipped) + " upstream frames skipped").c_str() : "");
+                char under[48] = "";
+                if (up)
+                    sprintf_s(under, ", %llu under 1 px", (unsigned long long)statUnder);
+                LOG("stage1: %.1f inputs/s, %.1f shared presents/s (%.2f an input)%s, pan vectors on %llu of %llu "
+                    "inputs (mean %.1f px%s)\n",
+                    n / s, (f - statFrames) / s, n ? (double)(f - statFrames) / n : 0.0,
+                    up ? (", " + std::to_string(up->skipped) + " upstream frames skipped").c_str() : "",
+                    (unsigned long long)statVec, (unsigned long long)statVecInputs,
+                    statVec ? statVecLen / (double)statVec : 0.0, under);
                 statTick = tick;
                 statInputs = inputs;
                 statFrames = f;
+                statVec = statVecInputs = statUnder = 0;
+                statVecLen = 0;
             }
             continue;
         }

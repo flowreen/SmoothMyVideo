@@ -164,6 +164,8 @@ template <class F, class G> static void beside(F f, G g)
 class Estimator
 {
   public:
+    static constexpr double kMinMove = 1.0; // shorter moves keep zero vectors (frame pixels)
+
     // the counters the run's summary line reports (readMs: a caller's readback time for the measured frames)
     uint64_t frames = 0, tagged = 0;
     double sumLen = 0, sumStill = 0, sumMs = 0, maxMs = 0, readMs = 0;
@@ -208,7 +210,6 @@ class Estimator
     static constexpr int kRange32 = 12;     // the coarse search, in 1/32 pixels each way (384 frame pixels)
     static constexpr double kExplain = 0.6; // the translation's error must stay under this share of the still one's
     static constexpr double kCover = 0.5;   // the share of changed tiles the translation must explain
-    static constexpr double kMinMove = 1.0; // shorter moves keep zero vectors (frame pixels)
 
     std::vector<uint8_t> t4[2], t16[2], t32[2];
     int cur = 0;

@@ -1025,7 +1025,8 @@ outlast the move's 2 s window and cut the budget for about a minute (1440p RIFE 
 48.5 presented fps over the first 50 s instead of 56).
 The static-source hold keys on the source's arrivals (`sourceQuiet` / `sourceCadence`), not on the loop's sends.
 `--no-gpu-fit` (the GUI's "Fit to the GPU" unticked, main-live.ts `liveGpuFit`) holds the user's target (no throttle; a
-model that only doubles runs the first doubling that reaches it, "The node above the target") and
+model that only doubles runs the first doubling that reaches it, "The node above the target"; Live DLSS 4.5 runs the
+target's rung with no climb and no step down) and
 drops every video memory fit (`nativeVideoMemoryRoom` answers "no limit": the ring), logging `GPU fit off
 (--no-gpu-fit)`.
 
@@ -1211,8 +1212,17 @@ UAV clear; tiles a still picture explains clearly better (subtitles, logos, the 
 The depth and vector textures DLSS-G is given are half the frame per axis (`panvec::kVecDiv`; the still tiles scale
 exactly): the generated frames are byte for byte the full-size textures' at a quarter of the bytes.
 Anything else, and every move under 1 px, keeps the exact zero vectors, so those frames are the ones DLSS-G made
-without it. A frame a stage takes from another stage's ring keeps zero vectors. The
-run's summary line: `pan vectors: N of M frames moved (mean P px, S % of their area still), E ms a frame`. Every other
+without it. A stage fed from another stage's ring (Live's second and third passes) measures nothing: the ring's
+header carries each frame's MOTION (`Stage1Hdr` after `atOnce`, `motionMagic` set): its place on the first stage's
+input timeline (input n at n, its tween k of g + 1 at n - 1 + k / (g + 1)), the input interval it lies in and that
+interval's pan with its still tiles. The stage's vectors for its pair a -> b are each interval's pan times the share
+of it between the two frames (`pairMotion`; an interval without a pan, a slot holding more than 96 still rectangles,
+or a move under 1 px = zero vectors, the first stage's rule), and its own frames carry the same fields on, so a third
+stage reads the second the same way; a ring without the motion block (an older stage) gives zero vectors with a line.
+Each stage's 5 s line ends in `pan vectors on V of I inputs (mean P px[, U under 1 px])`. On a 896x512 texture
+moving 120 px a frame, 3x then 4x: the second stage's generated frames 39.8 dB against the exact truth, 14.6 with
+zero vectors (48 px: 42.9 / 26.8; 8 px: 34.4 / 33.1), the first stage's frames and a clip with no pan byte for byte
+unchanged. The run's summary line: `pan vectors: N of M frames moved (mean P px, S % of their area still), E ms a frame`. Every other
 frame of a clip as the input, the dropped frames as truth: an anime pan
 +3.4 dB median, the dragon pan +7.4 dB, clips with no pan unchanged.
 THE DLSS 4.5 CASCADE (`native.ts` `dlssgPasses`): one pass makes up to the GPU's own limit,
@@ -1311,7 +1321,9 @@ can show presents less at the rate of the rung below, its other frames made and 
 steps back to the rung that held, and the next try
 waits 15 s, doubling to 240 s; a shortfall steps down to the largest rung under what held
 (`SMV_LIVE_DLSSG_CLIMB=0` = the target's rung first). Lines `DLSS 4.5 climbs from Mx ...`, `DLSS 4.5 steps to
-Mx in place (...)`. A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
+Mx in place (...)`. The climb and the shortfall's step down are the GPU fit's: with `--no-gpu-fit` the target's
+rung runs at once and keeps its multiple whatever share of it the GPU shows (one line a plan, `DLSS 4.5: Xx of Mx
+shown, Fit to the GPU is off: the plan keeps its multiple`). A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
 route's way: a rung R of one or two helper passes and a keep k of 2..6 with R / k within 3 % (the fewest passes,
 then the smallest R: 2.5x = 5x in a helper, 4.5x = 3x then 3x in two, 7.5x = 3x then 5x), the session presents every k-th frame of
 the presented ring and makes none itself, so the output stays evenly spaced (`SMV_LIVE_DLSSG_KEEP=0` = whole
