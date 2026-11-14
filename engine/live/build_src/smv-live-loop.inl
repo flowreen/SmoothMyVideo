@@ -2882,6 +2882,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // a non-whole multiple (dlssgKeepPlan): the helpers make cascM, the session shows every cascKeep-th ring frame
         // and makes none itself; cascShown / cascKeep = the multiple presented
         int cascKeep = 1, cascKeepPrev = 1;
+        // THE FOLLOW DOWN (SMV_LIVE_DLSSG_FOLLOW=0 = off): a plan in its first 30 s of presenting whose settled capture
+        // rate derives a smaller plan two 2 s windows in a row steps down to it in place (cascFollowDown); cascDownM / cascDownKeep =
+        // the smaller plan the last window derived, cascDownWins = the windows in a row that derived it
+        const bool cascFollowOn = lkEnv("SMV_LIVE_DLSSG_FOLLOW") != "0";
+        int cascDownM = 0, cascDownKeep = 1, cascDownWins = 0;
         // display-timed presents (Host::dtSet): the source's rate over the last stats window, and the source frame the
         // ring's frame presented last belongs to (another one = the first frame of a source frame's set)
         double dtCapFps = 0;
@@ -4221,7 +4226,46 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             cascWantPrev = -1;
             cascFallback(why);
         };
-        // a 2 s window's checks of a presenting plan: a stalled stage, then the shortfall rule
+        // A plan is made on the first two windows' capture rate, which a player's first seconds can read low (28.5 and
+        // 29.0 fps of a 30 fps clip: 60 / 29.0 = 2.07 is past 2x's 3 %, so a 60 target took 3x, 90 fps on a 60 Hz
+        // screen, a third of the frames never shown, for the whole session). A plan in its first kFollowMs of
+        // presenting therefore steps DOWN in place to the plan the settled rate derives, once two windows in a row
+        // derive the same smaller one. Never up: a still scene lowers the capture rate (unchanged arrivals are
+        // dropped), and the plan does not chase it. Only at the start: a game's rate varies, and a step down after
+        // every burst of a few seconds would leave it lower for good (nothing steps back up). Not during the climb (it runs past the target's rung on purpose) or an in-place step's settling; a plan that fell
+        // short derives at most what it held (cascChoose's cascMaxM). A step the running stages cannot take in place
+        // (cascSwitch false) = the plan made again at the next window. True = it stepped or ended the plan
+        constexpr ULONGLONG kFollowMs = 30000;
+        auto cascFollowDown = [&](double capFps) -> bool {
+            if (!cascFollowOn || cascTopM || cascClimbing || cascStepTick || capFps <= 3.0 || !cascM ||
+                GetTickCount64() - cascUpTick > kFollowMs)
+            {
+                cascDownWins = 0;
+                return false;
+            }
+            int m1 = 0, m2 = 0, m3 = 1, keep = 1;
+            const int M = cascChoose(capFps, m1, m2, m3, keep);
+            if ((double)M / keep >= (double)cascM / cascKeep)
+            {
+                cascDownWins = 0;
+                return false;
+            }
+            cascDownWins = cascDownWins && M == cascDownM && keep == cascDownKeep ? cascDownWins + 1 : 1;
+            cascDownM = M;
+            cascDownKeep = keep;
+            if (cascDownWins < 2)
+                return false;
+            cascDownWins = 0;
+            char why[64];
+            snprintf(why, sizeof why, "the capture settled at %.1f fps", capFps);
+            if (cascSwitch(M, m1, m2, m3, keep, why))
+                return true;
+            cascTried = false;
+            cascWantPrev = -1;
+            cascFallback(why);
+            return true;
+        };
+        // a 2 s window's checks of a presenting plan: a stalled stage, the follow down, then the shortfall rule
         auto cascWatch = [&](double capFps, double outFps, double dropRate) {
             if (!casc || !casc->present || hidden)
                 return;
@@ -4229,7 +4273,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 cascLost = 0; // this plan has presented for a minute: a later loss counts from one again
             if (cascStalled())
                 cascFallback("it stopped presenting", true);
-            else
+            else if (!cascFollowDown(capFps))
                 cascShortCheck(capFps, outFps, dropRate);
         };
         // a plan's start done (cascRes >= 0): its probes join the session warming (fed, not shown yet), or end
@@ -4367,7 +4411,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     // runs as it is, a shortfall steps down in place; a target past it asks for what the GPU affords).
                     // Finding what the GPU affords is the GPU fit's: with Fit to the GPU off the target's rung runs at
                     // once
-                    cascTopM = cascCeilM = cascHoldWins = cascClimbWins = 0;
+                    cascTopM = cascCeilM = cascHoldWins = cascClimbWins = cascDownWins = 0;
                     cascHeld[0] = cascFirst[0] = 0;
                     cascClimbing = false;
                     cascClimbWait = cascClimbTick = 0;

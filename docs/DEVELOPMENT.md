@@ -1348,7 +1348,12 @@ waits 15 s, doubling to 240 s; a shortfall steps down to the largest rung under 
 (`SMV_LIVE_DLSSG_CLIMB=0` = the target's rung first). Lines `DLSS 4.5 climbs from Mx ...`, `DLSS 4.5 steps to
 Mx in place (...)`. The climb and the shortfall's step down are the GPU fit's: with `--no-gpu-fit` the target's
 rung runs at once and keeps its multiple whatever share of it the GPU shows (one line a plan, `DLSS 4.5: Xx of Mx
-shown, Fit to the GPU is off: the plan keeps its multiple`). A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
+shown, Fit to the GPU is off: the plan keeps its multiple`). A plan is made on the first two stats windows' capture
+rate, which a player's first seconds can read low (28.5 and 29.0 fps of a 30 fps clip made 3x for a 60 target, 90
+fps on a 60 Hz screen); in its first 30 s of presenting a plan steps DOWN in place to the plan the settled rate
+derives once two windows in a row derive the same smaller one (`DLSS 4.5 steps to Mx in place (...; the capture
+settled at N fps)`), never up, since a still scene lowers the capture rate, and only at the start, since a game's
+rate varies and nothing steps back up (`SMV_LIVE_DLSSG_FOLLOW=0` = the first plan stays). A target no whole multiple reaches within 3 % (60 fps from 24 = 2.5x) takes the file
 route's way: a rung R of one or two helper passes and a keep k of 2..6 with R / k within 3 % (the fewest passes,
 then the smallest R: 2.5x = 5x in a helper, 4.5x = 3x then 3x in two, 7.5x = 3x then 5x), the session presents every k-th frame of
 the presented ring and makes none itself, so the output stays evenly spaced (`SMV_LIVE_DLSSG_KEEP=0` = whole
@@ -2030,6 +2035,7 @@ named here, and on a name here that no source holds.
 | `SMV_DLSSG_WQ=0` | a file render's host reads each DLSS 4.5 pair before it sends the next frame, even to a `dlssg2f` with a pair writer (` wq=1`); the A/B and fallback test only, never a product setting |
 | `SMV_DLSSG_KEEP=0` | the resident file-render host starts a new `dlssg2f` for every DLSS 4.5 render instead of keeping the last render's server for the next one of the same padded size, multiplier and frame format; the A/B and fallback test only, never a product setting |
 | `SMV_LIVE_DLSSG_KEEPDIRECT=0` | a kept Live DLSS 4.5 plan (a non-whole multiple) has its presented stage make every frame of its rung and the session present every k-th: by default that stage makes and shares only the frames the keep shows; the A/B and gate lever |
+| `SMV_LIVE_DLSSG_FOLLOW=0` | a presenting Live DLSS 4.5 plan keeps the plan its first two stats windows derived: by default, in its first 30 s of presenting, it steps down in place to the smaller plan the settled capture rate derives two windows in a row (a capture that read low at the start); the A/B and gate lever |
 | `SMV_LIVE_DLSSG_LOCAL=0` | Live DLSS 4.5's helper passes run as `dlssg2f --stage1` processes: by default each one runs on a thread of the live host itself (`ngx_stage.h`, the stage code `dlssg2f` runs, its ring shared by the same names); the A/B and gate lever |
 | `SMV_LIVE_DLSSG_TIMED=0` | a Live DLSS 4.5 session presents each frame at its time on the CPU (sync interval 0, tearing allowed) on a swap chain of 3 buffers: by default, at a presented rate of one to sixteen refreshes a frame, the presented stage shares a source frame's frames together and each is queued with a sync interval on a flip queue of 16 buffers (a frame that stays more than four refreshes is queued again for the rest), so the display times them; the A/B lever |
 | `SMV_LIVE_DLSSG_LOCAL_END=S` | an in-process DLSS 4.5 stage's input ends S seconds after its ring is ready, so the stage ends while its frames are presented: the trigger test of a lost plan (`DLSS 4.5's pass ended (its stage ended): the captured frames are shown as they are until the plan is made again`); never a product setting |
