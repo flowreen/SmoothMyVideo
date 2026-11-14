@@ -158,19 +158,21 @@ static std::atomic<bool> g_noHudLat{false}; // --no-hud-latency: keep the readou
 static bool g_noFillMouse = false;          // --no-fill-mouse: Fill leaves the mouse alone (FillMouse)
 static double g_sharpen = 0.0;              // --sharpen S: Adaptive Sharpen strength 0..2 (both routes)
 static bool g_rtxVsr = false;               // --rtx-vsr: forwarded to the server (VSR fill upscaler)
-static int g_vsrQuality = 4;   // --vsr-quality N: RTX VSR's level 1..4, 4 = Ultra; 16..19 = its high-bitrate models
-static bool g_fsrUp = false;   // --fsr-upscale: AMD FSR upscaling in RTX VSR's resize (both routes)
-static bool g_a4kUp = false;   // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (both routes)
-static bool g_a4kAA = false;   // --anime4k-aa: Anime4K's Mode A+A, Restore CNN UL on the first x2 pass's 2x frame too
-static bool g_acnUp = false;   // --artcnn: ArtCNN C4F32_DN's x2 in RTX VSR's resize (both routes)
-static bool g_rgUp = false;    // --realesrgan: Real-ESRGAN animevideov3's x4 in RTX VSR's resize (both routes)
-static bool g_xessUp = false;  // --xess-upscale: Intel XeSS-SR in RTX VSR's resize (both routes)
-static bool g_xessFg = false;  // --xess-fg: Intel XeSS-FG on AMD FSR frame generation's route (both routes; offline it
-                               // picks that route itself, live it rides the fsrfg backend)
-static int g_upscaleH = 0;     // --upscale H: forwarded to the server (the app's "Upscale to"
-                               // height as the internal render size before the fit)
-static bool g_restore = false; // --restore: forwarded to the server (Real-ESRGAN first on
-                               // every composed frame, the app's Restore checkbox)
+static int g_vsrQuality = 4;    // --vsr-quality N: RTX VSR's level 1..4, 4 = Ultra; 16..19 = its high-bitrate models
+static bool g_fsrUp = false;    // --fsr-upscale: AMD FSR upscaling in RTX VSR's resize (both routes)
+static bool g_a4kUp = false;    // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (both routes)
+static bool g_a4kAA = false;    // --anime4k-aa: Anime4K's Mode A+A, Restore CNN UL on the first x2 pass's 2x frame too
+static bool g_acnUp = false;    // --artcnn: ArtCNN C4F32_DN's x2 in RTX VSR's resize (both routes)
+static bool g_rgUp = false;     // --realesrgan: Real-ESRGAN animevideov3's x4 in RTX VSR's resize (both routes)
+static bool g_ajUp = false;     // --animejanai-upscale FILE: AnimeJaNai HD's x2 in RTX VSR's resize (both routes)
+static std::string g_ajUpModel; // its file: the command line's FILE, or live the `ajupmodel` set
+static bool g_xessUp = false;   // --xess-upscale: Intel XeSS-SR in RTX VSR's resize (both routes)
+static bool g_xessFg = false;   // --xess-fg: Intel XeSS-FG on AMD FSR frame generation's route (both routes; offline it
+                                // picks that route itself, live it rides the fsrfg backend)
+static int g_upscaleH = 0;      // --upscale H: forwarded to the server (the app's "Upscale to"
+                                // height as the internal render size before the fit)
+static bool g_restore = false;  // --restore: forwarded to the server (Real-ESRGAN first on
+                                // every composed frame, the app's Restore checkbox)
 static bool g_restoreA4k = false;  // --restore-anime4k (implies --restore): Restore = Anime4K's Restore
                                    // CNN UL on the host's kernels (a --restore-model wins over it)
 static std::string g_restoreModel; // --restore-model PATH (implies --restore): Restore's model = this
@@ -1973,6 +1975,11 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_acnUp = true;
         else if (wcscmp(argv[i], L"--realesrgan") == 0)
             g_rgUp = true;
+        else if (wcscmp(argv[i], L"--animejanai-upscale") == 0 && i + 1 < argc)
+        {
+            g_ajUp = true;
+            g_ajUpModel = wideToUtf8(argv[++i]);
+        }
         else if (wcscmp(argv[i], L"--xess-upscale") == 0)
             g_xessUp = true;
         else if (wcscmp(argv[i], L"--restore") == 0)
@@ -2832,7 +2839,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.vsr ? (nr.fsrUp   ? (nr.fuKind ? ", intel xess upscale" : ", amd fsr upscale")
                   : nr.a4kUp ? ", anime4k"
                   : nr.acnUp ? ", artcnn"
-                  : nr.rgUp  ? ", real-esrgan"
+                  : nr.rgUp  ? (nr.rgAj ? ", animejanai upscale" : ", real-esrgan")
                              : ", rtx vsr")
                : ((outW != w || outH != h) ? ", lanczos upscale" : ""),
         nr.nrHost ? ", dlss 5" : "", nr.sharpen > 0.0f ? ", sharpen" : "", nr.rtxHdr ? ", rtx hdr" : "",
@@ -4357,6 +4364,8 @@ static void resetSessionGlobals()
     g_a4kAA = false;
     g_acnUp = false;
     g_rgUp = false;
+    g_ajUp = false;
+    g_ajUpModel.clear();
     g_xessUp = false;
     g_xessFg = false;
     g_upscaleH = 0;
@@ -4486,6 +4495,11 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_acnUp = true;
         else if (wcscmp(argv[i], L"--realesrgan") == 0)
             g_rgUp = true;
+        else if (wcscmp(argv[i], L"--animejanai-upscale") == 0 && i + 1 < argc)
+        {
+            g_ajUp = true;
+            g_ajUpModel = wideToUtf8(argv[++i]);
+        }
         else if (wcscmp(argv[i], L"--xess-upscale") == 0)
             g_xessUp = true;
         else if (wcscmp(argv[i], L"--xess-fg") == 0)
@@ -4992,6 +5006,8 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_a4kAA = false;
             g_acnUp = false;
             g_rgUp = false;
+            g_ajUp = false;
+            g_ajUpModel.clear();
             g_xessUp = false;
             g_xessFg = false;
             g_restore = false;

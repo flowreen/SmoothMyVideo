@@ -98,6 +98,7 @@ function prevSettingsSig() {
     a4kAaOn(),
     acnUpOn(),
     rgUpOn(),
+    ajUpOn(),
     xessUpOn(),
     nrOn(),
     nrStructure(),
@@ -133,6 +134,7 @@ async function loadPreview(frame, bg?) {
   const useA4k = lite ? false : a4kUpOn() && upFactor() > 1; // Anime4K too
   const useAcn = lite ? false : acnUpOn() && upFactor() > 1; // ArtCNN too
   const useRg = lite ? false : rgUpOn() && upFactor() > 1; // Real-ESRGAN too
+  const useAjUp = lite ? false : ajUpOn() && upFactor() > 1; // AnimeJaNai HD too
   const useXess = lite ? false : xessUpOn() && upFactor() > 1; // Intel XeSS too
   const useNr = lite ? false : nrOn(); // DLSS 5: its host takes seconds to start, so the lite pass skips it too
   inflightPrevKey = JSON.stringify([input, frame == null ? 'mid' : frame].concat(sig));
@@ -175,6 +177,7 @@ async function loadPreview(frame, bg?) {
           a4kaa: useA4k && a4kAaOn(),
           artcnn: useAcn,
           realesrgan: useRg,
+          ajup: useAjUp,
           xess: useXess,
           dlssnr: useNr,
           nrmask: useNr && nrMaskOn(),
@@ -234,7 +237,7 @@ async function loadPreview(frame, bg?) {
     (hdr ||
       nrOn() ||
       ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1) ||
-      ((fsrUpOn() || a4kUpOn() || acnUpOn() || rgUpOn() || xessUpOn()) && upFactor() > 1)); // RTX / FSR / Anime4K / ArtCNN / Real-ESRGAN / DLSS 5 on in settings but skipped for the fast auto-preview
+      ((fsrUpOn() || a4kUpOn() || acnUpOn() || rgUpOn() || ajUpOn() || xessUpOn()) && upFactor() > 1)); // RTX / FSR / Anime4K / ArtCNN / Real-ESRGAN / AnimeJaNai HD / DLSS 5 on in settings but skipped for the fast auto-preview
   const srcHdr = !!(info && info.srcHdr);
   // the pass names ('@key' = a language string, else a name that stays as is)
   const parts = [];
@@ -251,11 +254,13 @@ async function loadPreview(frame, bg?) {
               ? 'ArtCNN'
               : useRg
                 ? 'Real-ESRGAN'
-                : useXess
-                  ? 'XeSS'
-                  : upFactor() < 1
-                    ? '@prev.part.down'
-                    : '@prev.part.up',
+                : useAjUp
+                  ? 'AnimeJaNai HD'
+                  : useXess
+                    ? 'XeSS'
+                    : upFactor() < 1
+                      ? '@prev.part.down'
+                      : '@prev.part.up',
     );
   if (useNr) parts.push('DLSS 5');
   if (sharpen > 0) parts.push('@sharpen.k');

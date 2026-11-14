@@ -156,7 +156,7 @@ static void nativeRgUpRelease(NativeRife& nr);
 // s (planar, fp32 or fp16 by sHalf, plane / row strides) into dst at tw x th
 static const char* planarUpName(const NativeRife& nr)
 {
-    return nr.acnUp ? "ArtCNN" : nr.rgUp ? "Real-ESRGAN" : "Anime4K";
+    return nr.acnUp ? "ArtCNN" : nr.rgUp ? (nr.rgAj ? "AnimeJaNai HD" : "Real-ESRGAN") : "Anime4K";
 }
 static bool nativePlanarUpSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc)
 {

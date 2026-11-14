@@ -79,9 +79,11 @@ function liveLoadParts(mi, sharpen: string) {
           ? 'ArtCNN'
           : rgUpOn()
             ? 'Real-ESRGAN'
-            : xessUpOn()
-              ? 'Intel XeSS'
-              : '';
+            : ajUpOn()
+              ? 'AnimeJaNai HD'
+              : xessUpOn()
+                ? 'Intel XeSS'
+                : '';
   if (up) parts.push(up);
   if ($('sharpen').checked && (parseFloat($('sharpval').value) || 0) > 0) parts.push(sharpen);
   if (liveHdrOn()) parts.push('RTX HDR');
@@ -126,6 +128,7 @@ function lvSendOpts() {
     a4kaa: a4kAaOn(), // its Mode A+A
     artcnn: acnUpOn(), // ArtCNN the same way
     realesrgan: rgUpOn(), // Real-ESRGAN the same way
+    ajup: ajUpOn(), // AnimeJaNai HD the same way (main sends the installed file)
     xess: xessUpOn(), // Intel XeSS the same way
     // no "Upscale to": Live's size is what Display presents (the window or the screen), the DLSS mode its speed
     // Restore (AI detail): Real-ESRGAN or AnimeJaNai first on every presented frame
@@ -196,7 +199,7 @@ function lvTargetUi(mi = liveModelInfo()) {
 // host's Lanczos), which that line says instead.
 function upFitHintUi() {
   const fit = $('lvfit').value;
-  const key = !(liveVsrOn() || fsrUpOn() || a4kUpOn() || acnUpOn() || rgUpOn() || xessUpOn())
+  const key = !(liveVsrOn() || fsrUpOn() || a4kUpOn() || acnUpOn() || rgUpOn() || ajUpOn() || xessUpOn())
     ? ''
     : liveModelInfo().model === 'dlssg'
       ? 'up.live.dlssg'
@@ -242,9 +245,11 @@ function lvModelUi() {
                 ? tr('lv.fit.acn')
                 : rgUpOn()
                   ? tr('lv.fit.rg')
-                  : xessUpOn()
-                    ? tr('lv.fit.xess')
-                    : tr('lv.fit.up')) +
+                  : ajUpOn()
+                    ? tr('lv.fit.ajup')
+                    : xessUpOn()
+                      ? tr('lv.fit.xess')
+                      : tr('lv.fit.up')) +
         (effTxt ? ' · ' + effTxt : '')
       : $('lvfit').value === 'monitor'
         ? tr('lv.fit.monitor') + (effTxt ? ' · ' + effTxt : '')

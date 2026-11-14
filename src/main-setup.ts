@@ -464,6 +464,11 @@ export function restoreModelArgs(id?: string): string[] {
   if (id === 'anime4k') return ['--restore-anime4k'];
   return id === 'animejanai' && fileExists(ajPath()) ? ['--restore-model', ajPath()] : [];
 }
+/** The host's arguments for AnimeJaNai HD as the upscaler (the Upscale panel's row): the installed file, else none
+ * (the plain resize). */
+export function ajUpArgs(): string[] {
+  return fileExists(ajPath()) ? ['--animejanai-upscale', ajPath()] : [];
+}
 
 ipcMain.handle('aj-ready', () => {
   const ready = fileExists(ajPath());

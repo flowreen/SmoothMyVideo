@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import { ENGINE, PREVIEW_CLI } from './main-paths';
 import { win } from './main-window';
 import { displayPeakNits } from './main-dialogs';
-import { restoreModelArgs } from './main-setup';
+import { ajUpArgs, restoreModelArgs } from './main-setup';
 import { vsrQ, vsrQArgs } from './main-live';
 import { dlssScaleArg } from './main-render';
 
@@ -29,6 +29,7 @@ type PreviewOpts = {
   a4kaa?: boolean; // its Mode A+A box
   artcnn?: boolean;
   realesrgan?: boolean;
+  ajup?: boolean; // AnimeJaNai HD as the upscaler (the installed file)
   xess?: boolean;
   restore?: boolean;
   restoreModel?: string; // Restore's model id ('animejanai' / 'anime4k'; none = Real-ESRGAN)
@@ -72,6 +73,7 @@ function previewArgv(opts: PreviewOpts, prefix: string): string[] {
   else if (opts.anime4k) args.push('--anime4k', ...(opts.a4kaa ? ['--anime4k-aa'] : []));
   else if (opts.artcnn) args.push('--artcnn');
   else if (opts.realesrgan) args.push('--realesrgan');
+  else if (opts.ajup) args.push(...ajUpArgs());
   else if (opts.xess) args.push('--xess-upscale');
   if (opts.hdr)
     args.push(

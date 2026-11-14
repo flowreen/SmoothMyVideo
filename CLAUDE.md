@@ -72,7 +72,7 @@ table is the include order, which is the source order and matters: a later part 
 | `gmfss-chain` | the GMFSS pair and tween |
 | `drba` | DRBA's frame ring, windows and tween |
 | `restore-run` | the Restore run and its fold (`restFold`), TrueHDR's offline statistics |
-| `restore-up` | Real-ESRGAN as the upscaler after the model (`--realesrgan`): Restore's net with its own buffers |
+| `restore-up` | Restore's nets as the upscaler after the model (`--realesrgan`, `--animejanai-upscale`), with their own buffers |
 | `dlss5` | DLSS 5's change mask (`--nr-delta`), texture imports and motion field |
 | `video-memory` | the free video memory figure and the live ring's fit |
 | `dlss5-frame` | DLSS 5 on one frame (`nativeNrFrame`), its live init |

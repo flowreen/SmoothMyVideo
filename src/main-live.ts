@@ -7,7 +7,7 @@ import * as os from 'os';
 import { engineCacheDir } from './render/cache';
 import { ENGINE } from './main-paths';
 import { win } from './main-window';
-import { ajPath, fileExists, restoreModelArgs } from './main-setup';
+import { ajPath, ajUpArgs, fileExists, restoreModelArgs } from './main-setup';
 import { current, dlssScaleArg } from './main-render';
 
 // --- Live mode: the real-time pipeline host (engine/live/smv-live.exe) -----------------------------
@@ -104,7 +104,8 @@ let liveA4kUp = false; // Anime4K as the live upscaler instead (its checkbox; RT
 let liveA4kAA = false; // its Mode A+A box: Restore CNN UL on the first x2 pass's 2x frame too
 let liveAcnUp = false; // ArtCNN as the live upscaler instead (its checkbox; the other three clear it)
 let liveRgUp = false; // Real-ESRGAN as the live upscaler instead (its checkbox; the other four clear it)
-let liveXessUp = false; // Intel XeSS as the live upscaler instead (its checkbox; the other five clear it)
+let liveAjUp = false; // AnimeJaNai HD as the live upscaler instead (its checkbox; the other five clear it)
+let liveXessUp = false; // Intel XeSS as the live upscaler instead (its checkbox; the other six clear it)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
 let liveRestoreModel = ''; // Restore's model id ('animejanai' = the installed AnimeJaNai file, 'anime4k', '' = Real-ESRGAN)
@@ -344,6 +345,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   else if (liveA4kUp) args.push('--anime4k', ...(liveA4kAA ? ['--anime4k-aa'] : []));
   else if (liveAcnUp) args.push('--artcnn');
   else if (liveRgUp) args.push('--realesrgan');
+  else if (liveAjUp) args.push(...ajUpArgs());
   else if (liveXessUp) args.push('--xess-upscale');
   // Restore: Real-ESRGAN first on every presented frame; costs most
   // of a 1080p frame budget, the panel hint says so
@@ -386,6 +388,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   if (!liveGpuFit) args.push('--no-gpu-fit');
   liveSetVals = liveSetNow();
   liveSetAj = liveAjFile();
+  liveSetAjUp = liveAjUpFile();
   // Every server backend runs inside smv-live.exe (its native host), the only live route; a
   // session the host cannot run ends with its reason on the status line.
   // resident host: every server backend has something worth keeping (the native engines); the
@@ -561,6 +564,7 @@ ipcMain.on(
       a4kaa?: boolean; // its Mode A+A box
       artcnn?: boolean;
       realesrgan?: boolean;
+      ajup?: boolean;
       xess?: boolean;
       uph?: number;
       restore?: boolean;
@@ -599,6 +603,7 @@ ipcMain.on(
     liveA4kAA = !!opts.a4kaa;
     liveAcnUp = !!opts.artcnn;
     liveRgUp = !!opts.realesrgan;
+    liveAjUp = !!opts.ajup;
     liveXessUp = !!opts.xess;
     liveUpH = opts.uph ?? 0;
     liveRestore = !!opts.restore;
@@ -641,6 +646,9 @@ let liveSetVals: Record<string, number> | null = null;
 // it before `restore 2` to start AnimeJaNai in place
 let liveSetAj = '';
 const liveAjFile = () => (liveRestore && liveRestoreModel === 'animejanai' && fileExists(ajPath()) ? ajPath() : '');
+// the same file for the upscaler (the spawn's --animejanai-upscale, or the last `ajupmodel` sent), before `up 7`
+let liveSetAjUp = '';
+const liveAjUpFile = () => (liveAjUp && fileExists(ajPath()) ? ajPath() : '');
 function liveSetNow(): Record<string, number> {
   const out: Record<string, number> = {};
   out.sharpen = Math.min(2, Math.max(0, Number(liveSharpen) || 0));
@@ -660,7 +668,21 @@ function liveSetNow(): Record<string, number> {
   // value the host holds
   out.a4kaa = liveA4kUp && liveA4kAA ? 1 : 0;
   // the upscaler, Restore and RTX HDR by kind (the host switches the kind its session runs off and on again in place)
-  out.up = liveVsr ? 1 : liveFsrUp ? 2 : liveA4kUp ? 3 : liveAcnUp ? 4 : liveXessUp ? 5 : liveRgUp ? 6 : 0;
+  out.up = liveVsr
+    ? 1
+    : liveFsrUp
+      ? 2
+      : liveA4kUp
+        ? 3
+        : liveAcnUp
+          ? 4
+          : liveXessUp
+            ? 5
+            : liveRgUp
+              ? 6
+              : liveAjUpFile()
+                ? 7
+                : 0;
   out.restore = liveRestore ? (liveRestoreModel === 'animejanai' ? 2 : liveRestoreModel === 'anime4k' ? 3 : 1) : 0;
   out.rtxhdr = liveRtxHdr ? 1 : 0;
   out.hud = liveHud ? 1 : 0;
@@ -671,6 +693,8 @@ function liveSendSets() {
   if (!liveProc || liveIdle || liveStopping || !liveSetVals) return;
   const aj = liveAjFile();
   if (aj && aj !== liveSetAj && liveCommand(`set\trestoremodel\t${aj}`)) liveSetAj = aj;
+  const ajUp = liveAjUpFile();
+  if (ajUp && ajUp !== liveSetAjUp && liveCommand(`set\tajupmodel\t${ajUp}`)) liveSetAjUp = ajUp;
   // a key the spawn did not carry (an effect ticked since) goes too: the host takes it in place or says why not
   for (const [k, v] of Object.entries(liveSetNow())) {
     if (liveSetVals[k] === v) continue;

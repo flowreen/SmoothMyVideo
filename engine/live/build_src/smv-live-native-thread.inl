@@ -105,13 +105,15 @@ static void nativeUpRelease(NativeRife& nr)
         nativeAcnRelease(nr);
     if (nr.rgUp)
         nativeRgUpRelease(nr);
-    nr.vsr = nr.vsrWant = nr.fsrUp = nr.fuHdr = nr.a4kUp = nr.acnUp = nr.rgUp = nr.vsrFailed = nr.vsrUserOff = false;
+    nr.vsr = nr.vsrWant = nr.fsrUp = nr.fuHdr = nr.a4kUp = nr.acnUp = nr.rgUp = nr.rgAj = nr.vsrFailed = nr.vsrUserOff =
+        false;
     if (name)
         LOG("native: live upscale: %s released in place\n", name);
 }
 
 // an upscaler ticked in a running session that started without one, or another kind than the one it runs (stdin `set
-// up N`, N = the kind the renderer picked: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS, 6 Real-ESRGAN):
+// up N`, N = the kind the renderer picked: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS, 6 Real-ESRGAN,
+// 7 AnimeJaNai HD, its file from the `ajupmodel` key):
 // the live case where the fit after the model enlarges (the upscaler's resize under nativeRtxInit's rule), on SDR or
 // HDR planes, set up on the native thread between two groups the way the session start does (the DLL checks and HDR
 // levers, the
@@ -153,10 +155,16 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
                        : want == 4 ? "ArtCNN"
                        : want == 5 ? "Intel XeSS upscaling"
                        : want == 6 ? "Real-ESRGAN"
+                       : want == 7 ? "AnimeJaNai HD"
                                    : nullptr;
     if (!name)
     {
         why = "an unknown upscaler";
+        return false;
+    }
+    if (want == 7 && g_ajUpModel.empty())
+    {
+        why = "no AnimeJaNai file named (ajupmodel)";
         return false;
     }
     std::string dir;
@@ -205,7 +213,7 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
     // floats into the staging frame (under Upscale to the internal render frame, allocated), the bridges read and write
     // BGRA buffers; HDR planes add the staging frame for every kind (the way back to the codes lands there), the frame's
     // SDR view and the light the view never held at the target (dVsrView / dVsrRem)
-    const bool planar = want == 3 || want == 4 || want == 6;
+    const bool planar = want == 3 || want == 4 || want == 6 || want == 7;
     const bool pres = (planar && !nr.uw) || nr.hdr;
     const uint64_t fl = sizeof(float);
     const uint64_t need = (pres && !nr.dPres ? 3 * fl * nr.dw * nr.dh : 0) +
@@ -244,7 +252,8 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
         nr.fsrUpDir = dir;
     nr.a4kUp = want == 3;
     nr.acnUp = want == 4;
-    nr.rgUp = want == 6;
+    nr.rgUp = want == 6 || want == 7;
+    nr.rgAj = want == 7;
     nr.vsrFailed = nr.vsrUserOff = false;
     bool ok = true;
     if (want == 1 && g_rtxb.vsrMade)
@@ -281,7 +290,7 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
     if (!ok)
     {
         // Lanczos stays: the flags off (the kind's buffers go with the session's teardown)
-        nr.vsrWant = nr.fsrUp = nr.a4kUp = nr.acnUp = nr.rgUp = nr.vsrFailed = false;
+        nr.vsrWant = nr.fsrUp = nr.a4kUp = nr.acnUp = nr.rgUp = nr.rgAj = nr.vsrFailed = false;
         if (!nr.fuMade) // a bridge built before the failure is destroyed at the teardown by its kind
             nr.fuKind = 0;
         if (why.empty())
@@ -618,6 +627,23 @@ static void nativeLiveSets(NativeRife& nr)
                 continue;
             }
         }
+        else if (key == "ajupmodel")
+        {
+            // AnimeJaNai's file (a path) for the upscaler: held for its start in place (`up 7`); a running AnimeJaNai
+            // upscaler keeps the file it loaded
+            const bool ajRuns = nr.vsr && nr.rgUp && nr.rgAj;
+            if (ajRuns && val != g_ajUpModel)
+            {
+                LOG("live set: ajupmodel %s (the next session takes it: AnimeJaNai runs its file)\n", val.c_str());
+                continue;
+            }
+            g_ajUpModel = val;
+            if (!ajRuns)
+            {
+                LOG("live set: ajupmodel %s (held for the upscaler's start)\n", val.c_str());
+                continue;
+            }
+        }
         else if (key == "a4kaa")
         {
             const std::string note = nativeA4kAaSwitch(nr, v != 0.0);
@@ -629,13 +655,13 @@ static void nativeLiveSets(NativeRife& nr)
         }
         else if (key == "up" || key == "restore" || key == "rtxhdr")
         {
-            // the session's own kind (up: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS, 6 Real-ESRGAN;
-            // restore: 1 Real-ESRGAN, 2 AnimeJaNai, 3 Anime4K; rtxhdr: 1), 0 = it runs none
+            // the session's own kind (up: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS, 6 Real-ESRGAN,
+            // 7 AnimeJaNai HD; restore: 1 Real-ESRGAN, 2 AnimeJaNai, 3 Anime4K; rtxhdr: 1), 0 = it runs none
             const int kind = key == "up"        ? (!nr.vsr    ? 0
                                                    : nr.fsrUp ? (nr.fuKind ? 5 : 2)
                                                    : nr.a4kUp ? 3
                                                    : nr.acnUp ? 4
-                                                   : nr.rgUp  ? 6
+                                                   : nr.rgUp  ? (nr.rgAj ? 7 : 6)
                                                               : 1)
                              : key == "restore" ? (nr.restore && nr.restNat ? nr.restNatKind : 0)
                                                 : (nr.rtxHdr ? 1 : 0);
@@ -757,7 +783,7 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
         nr.vsr ? (nr.fsrUp   ? (nr.fuKind ? ", xessup=native" : ", fsrup=native")
                   : nr.a4kUp ? ", anime4k=native"
                   : nr.acnUp ? ", artcnn=native"
-                  : nr.rgUp  ? ", realesrgan=native"
+                  : nr.rgUp  ? (nr.rgAj ? ", animejanai-up=native" : ", realesrgan=native")
                              : ", vsr=native")
                : "",
         nr.uw ? ", upscale=native" : "", nr.fitAa ? ", fit=native-aa" : "",

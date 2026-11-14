@@ -83,7 +83,9 @@ async function checkAjReady() {
       });
   }
   $('ajbtns').style.display = r.ready ? 'none' : '';
-  $('ajsetup').style.display = $('restoreaj').checked && (!r.ready || r.known === false) ? 'block' : 'none';
+  placeAjSetup();
+  $('ajsetup').style.display =
+    ($('restoreaj').checked || $('ajup').checked) && (!r.ready || r.known === false) ? 'block' : 'none';
   refreshPreviewIfOpen();
   refresh();
   try {
@@ -95,8 +97,14 @@ async function checkAjReady() {
 function ajLink(which, text) {
   return '<a href="#" onclick="ipcRenderer.invoke(\'aj-open\', \'' + which + '\');return false;">' + text + '</a>';
 }
+// AnimeJaNai's setup serves two rows, Restore's and the Upscale panel's (app-upscalers.ts, ajup): it sits under
+// Restore's row, or under the Upscale row when only that one is ticked
+function placeAjSetup() {
+  const home = !$('restoreaj').checked && $('ajup').checked ? $('ajupsetupslot') : $('ajsetuphome');
+  if ($('ajsetup').parentElement !== home) home.appendChild($('ajsetup'));
+}
 function syncAj() {
-  if ($('restoreaj').checked) checkAjReady();
+  if ($('restoreaj').checked || $('ajup').checked) checkAjReady();
   else $('ajsetup').style.display = 'none';
 }
 i18nRelabel.push(() => syncAj());
@@ -111,6 +119,7 @@ async function doAjDownload() {
   if (ajDownloading) return;
   ajDownloading = true;
   $('ajdl').disabled = true;
+  placeAjSetup();
   $('ajsetup').style.display = 'block';
   $('ajstatus').textContent = tr('dl.start');
   $('ajstatus').style.color = 'var(--sub)';

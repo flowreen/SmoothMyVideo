@@ -59,21 +59,36 @@ localStorage.removeItem('rtxvsrOn'); // retired: its stored choice was made whil
 $('rtxvsr').checked = localStorage.getItem('vsrOn') !== '0'; // default ON: RTX VSR upscales unless unticked
 if (localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true; // default OFF
 // AMD FSR 4 upscaling: bundled (engine/fsrup), so always ready; Anime4K too (its weights are inside the host), ArtCNN too
-// (engine/artcnn), Real-ESRGAN too (Restore's bundled engine/realesrgan); Intel XeSS needs Intel's libxess.dll, which its
-// setup row downloads (xess-ready); RTX VSR, AMD FSR 4, Anime4K, ArtCNN, Real-ESRGAN and Intel XeSS exclude each other
-// (ticking one clears the others), none ticked = Lanczos3
+// (engine/artcnn), Real-ESRGAN too (Restore's bundled engine/realesrgan); AnimeJaNai HD runs once Restore's AnimeJaNai
+// setup installed it (aj-ready, app-effects.ts: its setup note shows under this row when only this row asks); Intel
+// XeSS needs Intel's libxess.dll, which its setup row downloads (xess-ready); RTX VSR, AMD FSR 4, Anime4K, ArtCNN,
+// Real-ESRGAN, AnimeJaNai HD and Intel XeSS exclude each other (ticking one clears the others), none ticked = Lanczos3
 $('fsrup').checked = localStorage.getItem('fsrupOn') === '1'; // default OFF: RTX VSR is the default upscaler
 $('a4kup').checked = !$('fsrup').checked && localStorage.getItem('a4kOn') === '1'; // default OFF
 $('acnup').checked = !$('fsrup').checked && !$('a4kup').checked && localStorage.getItem('acnOn') === '1'; // default OFF
 $('rgup').checked =
   !$('fsrup').checked && !$('a4kup').checked && !$('acnup').checked && localStorage.getItem('rgOn') === '1'; // default OFF
+$('ajup').checked =
+  !$('fsrup').checked &&
+  !$('a4kup').checked &&
+  !$('acnup').checked &&
+  !$('rgup').checked &&
+  localStorage.getItem('ajupOn') === '1'; // default OFF
 $('xessup').checked =
   !$('fsrup').checked &&
   !$('a4kup').checked &&
   !$('acnup').checked &&
   !$('rgup').checked &&
+  !$('ajup').checked &&
   localStorage.getItem('xessOn') === '1'; // default OFF
-if ($('fsrup').checked || $('a4kup').checked || $('acnup').checked || $('rgup').checked || $('xessup').checked)
+if (
+  $('fsrup').checked ||
+  $('a4kup').checked ||
+  $('acnup').checked ||
+  $('rgup').checked ||
+  $('ajup').checked ||
+  $('xessup').checked
+)
   $('rtxvsr').checked = false;
 function fsrUpOn() {
   return $('fsrup').checked && !$('rtxvsr').checked;
@@ -108,6 +123,18 @@ function acnUpOn() {
 function rgUpOn() {
   return $('rgup').checked && !$('rtxvsr').checked && !$('fsrup').checked && !$('a4kup').checked && !$('acnup').checked;
 }
+// AnimeJaNai HD: Restore's second model as the upscaler (`--animejanai-upscale` with the installed file), once installed
+function ajUpOn() {
+  return (
+    $('ajup').checked &&
+    !!ajReady.ready &&
+    !$('rtxvsr').checked &&
+    !$('fsrup').checked &&
+    !$('a4kup').checked &&
+    !$('acnup').checked &&
+    !$('rgup').checked
+  );
+}
 function xessUpOn() {
   return (
     $('xessup').checked &&
@@ -115,7 +142,8 @@ function xessUpOn() {
     !$('fsrup').checked &&
     !$('a4kup').checked &&
     !$('acnup').checked &&
-    !$('rgup').checked
+    !$('rgup').checked &&
+    !$('ajup').checked
   );
 }
 function upOnly(keep) {
@@ -126,6 +154,7 @@ function upOnly(keep) {
     ['a4kup', 'a4kOn'],
     ['acnup', 'acnOn'],
     ['rgup', 'rgOn'],
+    ['ajup', 'ajupOn'],
     ['xessup', 'xessOn'],
   ])
     if (id !== keep && $(id).checked) {
@@ -133,6 +162,7 @@ function upOnly(keep) {
       localStorage.setItem(key, '0');
     }
   if (keep !== 'xessup') syncXess(); // its setup row closes with its box
+  if (keep !== 'ajup') syncAj(); // AnimeJaNai's setup note goes back to Restore's row or closes
 }
 $('rtxvsr').onchange = () => {
   localStorage.setItem('vsrOn', $('rtxvsr').checked ? '1' : '0');
@@ -159,15 +189,18 @@ $('fsrup').onchange = () => {
   } catch {}
   fsrWarm();
 };
-// the upscaler boxes with no setup of their own (Anime4K, ArtCNN, Real-ESRGAN): the stored choice, the others cleared
+// the upscaler boxes with no setup row of their own (Anime4K, ArtCNN, Real-ESRGAN; AnimeJaNai HD shares Restore's): the
+// stored choice, the others cleared
 for (const [id, key] of [
   ['a4kup', 'a4kOn'],
   ['acnup', 'acnOn'],
   ['rgup', 'rgOn'],
+  ['ajup', 'ajupOn'],
 ])
   $(id).onchange = () => {
     localStorage.setItem(key, $(id).checked ? '1' : '0');
     if ($(id).checked) upOnly(id);
+    if (id === 'ajup') syncAj(); // its readiness, and the setup note under this row when it is missing
     syncRtx();
     syncUpscale();
     syncVsrQ();

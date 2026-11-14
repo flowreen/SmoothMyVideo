@@ -42,6 +42,7 @@ export interface PreviewArgs {
   anime4k_aa: boolean; // --anime4k-aa: Anime4K's Mode A+A
   artcnn: boolean;
   realesrgan: boolean;
+  animejanai_upscale: string | null; // --animejanai-upscale FILE
   xess_upscale: boolean;
   dlssnr: boolean;
   nr_structure: number;
@@ -103,6 +104,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     anime4k_aa: false,
     artcnn: false,
     realesrgan: false,
+    animejanai_upscale: null,
     xess_upscale: false,
     dlssnr: false,
     nr_structure: 1,
@@ -171,11 +173,23 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     if (k in flags) rec[flags[k]] = true;
     else if (k in floats) rec[floats[k]] = num(k, argv[++i]);
     else if (k in ints) rec[ints[k]] = num(k, argv[++i], true);
-    else if (['--frame', '--out', '--hdr-color', '--scale', '--model-a', '--model-b', '--restore-model'].includes(k)) {
+    else if (
+      [
+        '--frame',
+        '--out',
+        '--hdr-color',
+        '--scale',
+        '--model-a',
+        '--model-b',
+        '--restore-model',
+        '--animejanai-upscale',
+      ].includes(k)
+    ) {
       const v = argv[++i];
       if (v === undefined) throw new Error(`argument ${k}: expected one argument`);
       if (k === '--frame') a.frame = v;
       else if (k === '--restore-model') a.restore_model = v;
+      else if (k === '--animejanai-upscale') a.animejanai_upscale = v;
       else if (k === '--out') a.out = v;
       else if (k === '--scale') a.scale = v;
       else if (k === '--model-a') a.model_a = v;
@@ -744,6 +758,8 @@ function passFlags(
         args.push('--anime4k', ...(a.anime4k_aa ? ['--anime4k-aa'] : []));
       else if (a.artcnn && o.outW > s.W && o.outH > s.H) args.push('--artcnn');
       else if (a.realesrgan && o.outW > s.W && o.outH > s.H) args.push('--realesrgan');
+      else if (a.animejanai_upscale && o.outW > s.W && o.outH > s.H)
+        args.push('--animejanai-upscale', a.animejanai_upscale);
       else if (a.xess_upscale && o.outW > s.W && o.outH > s.H) args.push('--xess-upscale');
     }
   }
@@ -1060,6 +1076,7 @@ export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         else if (a.anime4k && OW > WW && OH > WH) st.push('--anime4k', ...(a.anime4k_aa ? ['--anime4k-aa'] : []));
         else if (a.artcnn && OW > WW && OH > WH) st.push('--artcnn');
         else if (a.realesrgan && OW > WW && OH > WH) st.push('--realesrgan');
+        else if (a.animejanai_upscale && OW > WW && OH > WH) st.push('--animejanai-upscale', a.animejanai_upscale);
         else if (a.xess_upscale && OW > WW && OH > WH) st.push('--xess-upscale');
       }
       if (s.srcHdr) st.push('--src-hdr', s.transfer === 'arib-std-b67' ? 'hlg' : 'pq');

@@ -65,6 +65,8 @@ const OPTS: Record<string, Spec> = {
   '--anime4k-aa': { dest: 'anime4k_aa', kind: 'bool', def: false },
   '--artcnn': { dest: 'artcnn', kind: 'bool', def: false },
   '--realesrgan': { dest: 'realesrgan', kind: 'bool', def: false },
+  // AnimeJaNai HD's file as the upscaler (the installed model; the host's --animejanai-upscale), none = off
+  '--animejanai-upscale': { dest: 'animejanai_upscale', kind: 'str', def: null },
   '--xess-upscale': { dest: 'xess_upscale', kind: 'bool', def: false },
   '--rtx-hdr': { dest: 'rtx_hdr', kind: 'bool', def: false },
   '--dv': { dest: 'dv', kind: 'bool', def: false },

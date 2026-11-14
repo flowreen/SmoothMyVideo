@@ -298,6 +298,20 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
         nr.vsrWant = true;
         nr.rgUp = true;
     }
+    // AnimeJaNai HD (--animejanai-upscale FILE, Restore's second model as the upscaler) the same way: any of the other
+    // five wins over it; its weights load at the session's setup (nativeRgUpSetup)
+    if (g_ajUp && (g_rtxVsr || g_fsrUp || g_a4kUp || g_acnUp || g_rgUp))
+        LOG("native: --animejanai-upscale ignored: %s holds the resize (the upscalers exclude each other)\n",
+            g_rtxVsr  ? "RTX VSR"
+            : g_fsrUp ? "AMD FSR upscaling"
+            : g_a4kUp ? "Anime4K"
+            : g_acnUp ? "ArtCNN"
+                      : "Real-ESRGAN");
+    else if (g_ajUp)
+    {
+        nr.vsrWant = true;
+        nr.rgUp = nr.rgAj = true;
+    }
     // Intel XeSS-SR (--xess-upscale) runs on AMD FSR upscaling's route through its own bridge (fuKind 1:
     // smv_xess_bridge.dll with Intel's libxess.dll, which the app's XeSS setup installs into engine\xess); every other
     // upscaler on the command line wins over it; SMV_FSRUP_HDR=0 turns the route off on HDR for both bridges
@@ -388,24 +402,27 @@ static size_t restNatBytes(const NativeRife& nr)
     return nr.restNat ? 2 * (size_t)srcW(nr) * (size_t)srcH(nr) * 128 : 0;
 }
 
-// AnimeJaNai on st: dRestIn -> k_ajFirst -> per block 3 x k_restConvMid + k_ajAtt -> k_ajCat -> k_restConvLast ->
-// dRestOut (48 fp16 sub-pixel planes at the half grid); false = a launch failed
-static bool ajNatRun(NativeRife& nr, cudaStream_t st)
+// AnimeJaNai on st at w x h: in (three fp16 planes) -> k_ajFirst -> per block 3 x k_restConvMid + k_ajAtt -> k_ajCat
+// -> k_restConvLast -> out (48 fp16 sub-pixel planes at the half grid); act = eight channels-last frames of the half
+// grid (128 bytes a pixel each); wb / off / blocks = ajNatLoad's block. Restore and the AnimeJaNai upscaler
+// (nativeRgUpRun) each pass their own buffers; false = a launch failed
+static bool ajConvChain(NativeRife& nr, cudaStream_t st, void* in, void* act, const void* wb,
+                        const std::vector<size_t>& off, int blocks, void* out, int w, int h)
 {
-    int sw = srcW(nr), sh = srcH(nr), hw = nr.restSubW, hh = nr.restSubH, n = hw * hh;
+    int sw = w, sh = h, hw = (w + 1) / 2, hh = (h + 1) / 2, n = hw * hh;
     const size_t nb = (size_t)n * 128;
-    auto at = [&](size_t i) { return (void*)((char*)nr.dRestW + nr.restNatOff[i]); };
-    auto buf = [&](int i) { return (void*)((char*)nr.dRestA + (size_t)i * nb); };
+    auto at = [&](size_t i) { return (void*)((const char*)wb + off[i]); };
+    auto buf = [&](int i) { return (void*)((char*)act + (size_t)i * nb); };
     void *x0 = buf(0), *out1 = buf(1), *tA = buf(2), *tB = buf(3), *c1 = buf(4), *c2 = buf(5), *c3 = buf(6),
          *cat = buf(7);
     const unsigned gx = (unsigned)(hw + 31) / 32, gy = (unsigned)(hh + 7) / 8, gp = (unsigned)(n + 127) / 128,
                    smem = 10 * 34 * 128;
     void *w0 = at(0), *b0 = at(1);
-    void* a0[] = {&nr.dRestIn, &sw, &sh, &x0, &w0, &b0, &hw, &hh};
+    void* a0[] = {&in, &sw, &sh, &x0, &w0, &b0, &hw, &hh};
     if (cuLaunchKernel(nr.fAjFirst, gx, gy, 1, 256, 1, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
         return false;
     void* t = x0;
-    for (int k = 0; k < nr.restNatBlocks; k++)
+    for (int k = 0; k < blocks; k++)
     {
         void* io[3][2] = {{t, c1}, {c1, c2}, {c2, c3}};
         for (int j = 0; j < 3; j++)
@@ -423,13 +440,20 @@ static bool ajNatRun(NativeRife& nr, cudaStream_t st)
             return false;
         t = dst;
     }
-    const size_t tail = (size_t)(2 + 11 * nr.restNatBlocks);
+    const size_t tail = (size_t)(2 + 11 * blocks);
     void *wc = at(tail), *bc = at(tail + 1), *wl = at(tail + 2), *bl = at(tail + 3);
     void* ac[] = {&x0, &t, &out1, &c1, &cat, &wc, &bc, &n};
     if (cuLaunchKernel(nr.fAjCat, gp, 1, 1, 128, 1, 1, 0, (CUstream)st, ac, nullptr) != CUDA_SUCCESS)
         return false;
-    void* al[] = {&cat, &nr.dRestOut, &wl, &bl, &hh, &hw};
+    void* al[] = {&cat, &out, &wl, &bl, &hh, &hw};
     return cuLaunchKernel(nr.fRestConvLast, gx, gy, 1, 128, 1, 1, smem, (CUstream)st, al, nullptr) == CUDA_SUCCESS;
+}
+
+// Restore's AnimeJaNai on st: dRestIn -> the net -> dRestOut; false = a launch failed
+static bool ajNatRun(NativeRife& nr, cudaStream_t st)
+{
+    return ajConvChain(nr, st, nr.dRestIn, nr.dRestA, nr.dRestW, nr.restNatOff, nr.restNatBlocks, nr.dRestOut, srcW(nr),
+                       srcH(nr));
 }
 
 // the bundled Real-ESRGAN's 18 convs on st at w x h: in (three fp16 planes) -> k_restConv0 -> 16 x k_restConvMid (the

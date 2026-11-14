@@ -2264,6 +2264,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                                                {g_a4kUp, "Anime4K"},
                                                {g_acnUp, "ArtCNN"},
                                                {g_rgUp, "Real-ESRGAN"},
+                                               {g_ajUp, "AnimeJaNai HD"},
                                                {g_upscaleH > 0, "Upscale to"}})
                     if (on)
                         off += (off.empty() ? "" : ", ") + std::string(name);
@@ -2272,7 +2273,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     LOG("DLSS 4.5 at the working size: %s not applied under Live DLSS 4.5 (every frame enlarged by the "
                         "native fit's Lanczos)\n",
                         off.c_str());
-                    g_rtxVsr = g_fsrUp = g_xessUp = g_a4kUp = g_acnUp = g_rgUp = false;
+                    g_rtxVsr = g_fsrUp = g_xessUp = g_a4kUp = g_acnUp = g_rgUp = g_ajUp = false;
                     g_upscaleH = 0;
                 }
                 g_presW = W;

@@ -302,7 +302,7 @@ What the app runs (any node works; the app uses its own Electron binary with `EL
 node dist\render\cli.js <input> <multi> [output] [--fps TARGET] [--scale MODE|F]
   [--sharpen S] [--restore | --restore-model PKL|ONNX | --restore-anime4k] [--dlssnr] [--nr-structure F] [--nr-tone F] [--nr-skin F] [--nr-automask 0|1] [--nr-style 0|1|2] [--nr-passes 1..20] [--no-interp]
   [--rife] [--rife-drba] [--nvof] [--fruc] [--fsrfg] [--xess-fg] [--nvvfg] [--dlssg] [--no-gpu-fit]
-  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4|16..19] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --realesrgan | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
+  [--upscale F] [--codec hevc|av1|vvc] [--rtx-vsr [--vsr-quality 1..4|16..19] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --realesrgan | --animejanai-upscale FILE | --xess-upscale] [--rtx-hdr] [--dv [--dv-profile 8.1|8.4]] [--hdr10plus]
   [--hdr-color raw|vivid|rtx] [--hdr-saturation N] [--hdr-contrast N] [--hdr-nits N] [--hdr-vibrance B] [--hdr-satboost S]
 ```
 
@@ -678,7 +678,12 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   every enlarge is the net's and Lanczos only shrinks. No room for the passes' buffers = Lanczos with `Real-ESRGAN
   upscaling needs N MB of video memory`; a missing or other .pkl = `Real-ESRGAN upscaling unavailable (...)`. It runs
   on every output frame, so it costs the frame-rate multiple times Restore's work. HDR frames go in as their SDR view
-  like ArtCNN's.
+  like ArtCNN's. `--animejanai-upscale FILE` runs Restore's second model there the same way (the five above win over
+  it): the AnimeJaNai HD file the Restore panel installs (`ajNatLoad`, the same net as `--restore-model`,
+  `ajConvChain`: x2, its activations and sub-pixel planes at the half grid, no nearest base), equal passes of at most
+  2x, so on a host-direct run without a working size it writes the bytes of `--restore-model FILE`. A missing or
+  other file = `AnimeJaNai HD upscaling unavailable (...)` and Lanczos. Live passes the file with `set ajupmodel FILE`
+  before an `up 7` in place.
   `--xess-upscale` puts Intel XeSS-SR (2.0.2, XeSS SDK 3.0.2) in that same resize instead, on AMD FSR upscaling's
   route (the same staging, HDR mode, Optical Flow vectors and 0.125 px gate, constant depth, no jitter) through our
   `engine/xess/smv_xess_bridge.dll` and Intel's `libxess.dll` beside it (see "Intel XeSS-SR bridge"); every other
@@ -950,7 +955,7 @@ parked session with a probe of our own overlay: per-frame difference, phase-corr
 CLI:
 ```
 smv-live.exe --live "title" | --hwnd 0xN | --fg [--exclude 0xN]
-  --backend NAME [--xess-fg] --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4|16..19] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --realesrgan | --xess-upscale --upscale H --restore
+  --backend NAME [--xess-fg] --gen N --target FPS --scale MODE|0.01..1 --fit fill|monitor --sharpen S --rtx-vsr [--vsr-quality 1..4|16..19] | --fsr-upscale | --anime4k [--anime4k-aa] | --artcnn | --realesrgan | --animejanai-upscale FILE | --xess-upscale --upscale H --restore
   --dlssnr --nr-structure F --nr-tone F --nr-skin F --nr-automask 0|1 --nr-style 0|1|2 --nr-passes 1..20 --rtx-hdr
   --vsync --no-clickthrough --no-hud --no-adapt --park --resident --diag S --no-fill-mouse --no-gpu-fit
 smv-live.exe --list            capturable windows as 0xHWND<TAB>title

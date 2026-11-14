@@ -415,7 +415,8 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const A4K_UP = args.anime4k && !RTX_VSR && !FSR_UP;
   const ACN_UP = args.artcnn && !RTX_VSR && !FSR_UP && !A4K_UP;
   const RG_UP = args.realesrgan && !RTX_VSR && !FSR_UP && !A4K_UP && !ACN_UP;
-  const XESS_UP = args.xess_upscale && !RTX_VSR && !FSR_UP && !A4K_UP && !ACN_UP && !RG_UP;
+  const AJ_UP = !RTX_VSR && !FSR_UP && !A4K_UP && !ACN_UP && !RG_UP ? args.animejanai_upscale || '' : '';
+  const XESS_UP = args.xess_upscale && !RTX_VSR && !FSR_UP && !A4K_UP && !ACN_UP && !RG_UP && !AJ_UP;
   let RTX_HDR = args.rtx_hdr;
   const DV_EXPORT = args.dv,
     HP_EXPORT = args.hdr10plus,
@@ -953,6 +954,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       if (A4K_UP && args.anime4k_aa) nargs.push('--anime4k-aa');
       if (ACN_UP) nargs.push('--artcnn');
       if (RG_UP) nargs.push('--realesrgan');
+      if (AJ_UP) nargs.push('--animejanai-upscale', AJ_UP);
       if (XESS_UP) nargs.push('--xess-upscale');
     }
   }
@@ -1073,6 +1075,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       if (A4K_UP && args.anime4k_aa) a.push('--anime4k-aa');
       if (ACN_UP) a.push('--artcnn');
       if (RG_UP) a.push('--realesrgan');
+      if (AJ_UP) a.push('--animejanai-upscale', AJ_UP);
       if (XESS_UP) a.push('--xess-upscale');
     }
     // PQ / HLG frames go to DLSS 4.5 as HDR10, as in the first pass

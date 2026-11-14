@@ -26,6 +26,7 @@ export interface RenderArgs {
   anime4k_aa: boolean; // --anime4k-aa: Anime4K's Mode A+A, Restore CNN UL on the first x2 pass's 2x frame too
   artcnn: boolean; // --artcnn: ArtCNN C4F32_DN's x2 in RTX VSR's resize (RTX VSR, AMD FSR 4 and Anime4K win over it)
   realesrgan: boolean; // --realesrgan: Real-ESRGAN animevideov3's x4 in RTX VSR's resize (the four above win over it)
+  animejanai_upscale: string | null; // --animejanai-upscale FILE: AnimeJaNai HD's x2 there (the five above win over it)
   xess_upscale: boolean; // --xess-upscale: Intel XeSS-SR in RTX VSR's resize (every other upscaler wins over it)
   rtx_hdr: boolean;
   restore: boolean;

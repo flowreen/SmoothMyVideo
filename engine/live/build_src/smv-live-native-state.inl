@@ -535,14 +535,20 @@ struct NativeRife
     void* dRgW = nullptr; // the weights (restNatLoad's block, rgOff's offsets)
     std::vector<size_t> rgOff;
     void* dRgIn = nullptr;   // a pass's input, three fp16 planes
-    void* dRgAct = nullptr;  // the net's ping-pong: two channels-last frames of 64 halves a pixel
+    void* dRgAct = nullptr;  // the net's activations (Real-ESRGAN: its ping-pong; AnimeJaNai: eight half-grid frames)
     void* dRgOut = nullptr;  // the net's 48 fp16 sub-pixel planes
     float* dRgMid = nullptr; // a pass's folded output, the next pass's input (more than one pass only)
     float* dRgTmp = nullptr; // the fold's horizontal pass
-    size_t rgInN = 0;        // pixels a pass's input may hold (dRgIn / dRgAct / dRgOut)
+    size_t rgInN = 0;        // pixels a pass's input may hold (dRgIn)
+    size_t rgActB = 0;       // bytes dRgAct holds
+    size_t rgOutN = 0;       // halves dRgOut holds
     size_t rgTmpN = 0;       // floats dRgTmp holds
     size_t rgMidN = 0;       // floats dRgMid holds
     int rgW = 0, rgH = 0;    // the first pass's input size
+    // the upscaler's net: false = the bundled Real-ESRGAN (x4), true = AnimeJaNai HD (`--animejanai-upscale FILE`, the
+    // Restore panel's download: SPAN-F3, x2, rgBlocks blocks, its activations at the half grid, no nearest base)
+    bool rgAj = false;
+    int rgBlocks = 0;
     // Anime4K (a4kUp, `--anime4k`): RTX VSR's resize too (vsr is set), on planar floats instead of the bridge's BGRA:
     // Upscale CNN x2 UL's conv passes in CUDA (its own module a4kMod, a4kKernelText: layers 1..6 on the tensor cores,
     // layer 0 inside layer 1's kernel and the last 1 x 1 inside layer 6's, both with literal weights) at the slot's
