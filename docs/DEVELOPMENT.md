@@ -675,8 +675,11 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   buffers (`smv-live-native-restore-up.inl`), so Restore before the model and this upscaler after it can run in one
   session; never the shared activation block, which the model may still hold between a pair's tweens. A ratio past 4x
   runs equal passes of at most 4x (the net's x4, then the fold down to that pass's size; at most three passes), so
-  every enlarge is the net's and Lanczos only shrinks. No room for the passes' buffers = Lanczos with `Real-ESRGAN
-  upscaling needs N MB of video memory`; a missing or other .pkl = `Real-ESRGAN upscaling unavailable (...)`. It runs
+  every enlarge is the net's and Lanczos only shrinks. Video memory: whole frames when the room holds the net's
+  activations, else the largest square tile that fits, down to 128 pixels (each tile read with the net's halo, one
+  pixel a 3 x 3 conv: 18 for Real-ESRGAN, 2 + 3 a block on AnimeJaNai HD's half grid, so the tiles' cores are the whole
+  frame's bits; the setup line names `N-px tiles`); no room for those = Lanczos with `Real-ESRGAN upscaling needs N MB
+  of video memory`; a missing or other .pkl = `Real-ESRGAN upscaling unavailable (...)`. It runs
   on every output frame, so it costs the frame-rate multiple times Restore's work. HDR frames go in as their SDR view
   like ArtCNN's. `--animejanai-upscale FILE` runs Restore's second model there the same way (the five above win over
   it): the AnimeJaNai HD file the Restore panel installs (`ajNatLoad`, the same net as `--restore-model`,

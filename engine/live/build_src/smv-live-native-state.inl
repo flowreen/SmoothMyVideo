@@ -535,7 +535,8 @@ struct NativeRife
     void* dRgW = nullptr; // the weights (restNatLoad's block, rgOff's offsets)
     std::vector<size_t> rgOff;
     void* dRgIn = nullptr;   // a pass's input, three fp16 planes
-    void* dRgAct = nullptr;  // the net's activations (Real-ESRGAN: its ping-pong; AnimeJaNai: eight half-grid frames)
+    void* dRgAct = nullptr;  // the net's activations (Real-ESRGAN: its ping-pong; AnimeJaNai: eight half-grid frames),
+                             // a tile's when rgCore is set
     void* dRgOut = nullptr;  // the net's 48 fp16 sub-pixel planes
     float* dRgMid = nullptr; // a pass's folded output, the next pass's input (more than one pass only)
     float* dRgTmp = nullptr; // the fold's horizontal pass
@@ -545,6 +546,13 @@ struct NativeRife
     size_t rgTmpN = 0;       // floats dRgTmp holds
     size_t rgMidN = 0;       // floats dRgMid holds
     int rgW = 0, rgH = 0;    // the first pass's input size
+    // tiles when whole frames do not fit the video memory room: rgCore = a tile's core side (0 = whole frames); a
+    // tile's input planes are copied out of dRgIn, the core of its sub-pixel planes into dRgOut
+    int rgCore = 0;
+    void* dRgTin = nullptr;  // a tile's input, three fp16 planes
+    void* dRgTout = nullptr; // a tile's 48 fp16 sub-pixel planes
+    size_t rgTinN = 0;       // pixels dRgTin holds
+    size_t rgToutN = 0;      // halves dRgTout holds
     // the upscaler's net: false = the bundled Real-ESRGAN (x4), true = AnimeJaNai HD (`--animejanai-upscale FILE`, the
     // Restore panel's download: SPAN-F3, x2, rgBlocks blocks, its activations at the half grid, no nearest base)
     bool rgAj = false;
