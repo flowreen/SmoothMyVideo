@@ -103,7 +103,8 @@ let liveFsrUp = false; // AMD FSR 4 as the live upscaler instead (its checkbox; 
 let liveA4kUp = false; // Anime4K as the live upscaler instead (its checkbox; RTX VSR and AMD FSR 4 clear it)
 let liveA4kAA = false; // its Mode A+A box: Restore CNN UL on the first x2 pass's 2x frame too
 let liveAcnUp = false; // ArtCNN as the live upscaler instead (its checkbox; the other three clear it)
-let liveXessUp = false; // Intel XeSS as the live upscaler instead (its checkbox; the other four clear it)
+let liveRgUp = false; // Real-ESRGAN as the live upscaler instead (its checkbox; the other four clear it)
+let liveXessUp = false; // Intel XeSS as the live upscaler instead (its checkbox; the other five clear it)
 let liveUpH = 0; // "Upscale to" height as the live internal render size (0 = off), inherited from the selector
 let liveRestore = false; // Real-ESRGAN on every presented frame, inherited from the Restore checkbox
 let liveRestoreModel = ''; // Restore's model id ('animejanai' = the installed AnimeJaNai file, 'anime4k', '' = Real-ESRGAN)
@@ -342,6 +343,7 @@ function startLiveSession(hwnd: string | null, restarts = 0) {
   else if (liveFsrUp) args.push('--fsr-upscale');
   else if (liveA4kUp) args.push('--anime4k', ...(liveA4kAA ? ['--anime4k-aa'] : []));
   else if (liveAcnUp) args.push('--artcnn');
+  else if (liveRgUp) args.push('--realesrgan');
   else if (liveXessUp) args.push('--xess-upscale');
   // Restore: Real-ESRGAN first on every presented frame; costs most
   // of a 1080p frame budget, the panel hint says so
@@ -558,6 +560,7 @@ ipcMain.on(
       anime4k?: boolean;
       a4kaa?: boolean; // its Mode A+A box
       artcnn?: boolean;
+      realesrgan?: boolean;
       xess?: boolean;
       uph?: number;
       restore?: boolean;
@@ -595,6 +598,7 @@ ipcMain.on(
     liveA4kUp = !!opts.anime4k;
     liveA4kAA = !!opts.a4kaa;
     liveAcnUp = !!opts.artcnn;
+    liveRgUp = !!opts.realesrgan;
     liveXessUp = !!opts.xess;
     liveUpH = opts.uph ?? 0;
     liveRestore = !!opts.restore;
@@ -656,7 +660,7 @@ function liveSetNow(): Record<string, number> {
   // value the host holds
   out.a4kaa = liveA4kUp && liveA4kAA ? 1 : 0;
   // the upscaler, Restore and RTX HDR by kind (the host switches the kind its session runs off and on again in place)
-  out.up = liveVsr ? 1 : liveFsrUp ? 2 : liveA4kUp ? 3 : liveAcnUp ? 4 : liveXessUp ? 5 : 0;
+  out.up = liveVsr ? 1 : liveFsrUp ? 2 : liveA4kUp ? 3 : liveAcnUp ? 4 : liveXessUp ? 5 : liveRgUp ? 6 : 0;
   out.restore = liveRestore ? (liveRestoreModel === 'animejanai' ? 2 : liveRestoreModel === 'anime4k' ? 3 : 1) : 0;
   out.rtxhdr = liveRtxHdr ? 1 : 0;
   out.hud = liveHud ? 1 : 0;

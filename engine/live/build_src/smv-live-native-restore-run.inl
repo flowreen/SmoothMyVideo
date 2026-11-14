@@ -48,6 +48,40 @@ static bool nativeHdrRestOut(NativeRife& nr, float* dst, int tw, int th, const v
     return true;
 }
 
+// Restore's fold on st (realesr.fit): the net's output (out; fp16 when outHalf) = the w4 x h4 frame, as 3 s^2 sub-pixel
+// planes at subW x subH when sub (+ the nearest base from base, three planes, fp16 when baseHalf, when base is set),
+// else three planes, through the Lanczos pair at every ratio (an exact copy at the net's own scale) into dst at tw x th,
+// `out.clamp(0,1)` folded into the taps and the final clamp in the vertical pass; tmp = the horizontal pass (3 x h4 x tw
+// floats). Restore and the Real-ESRGAN upscaler (nativeRgUpRun) each pass their own buffers. false = die was called
+static bool restFold(NativeRife& nr, cudaStream_t st, void* out, int outHalf, bool sub, const void* base, int baseHalf,
+                     int s, int subW, int subH, int w4, int h4, float* tmp, float* dst, int tw, int th)
+{
+    const void* tabH = rsTabFor(nr, w4, tw, st);
+    const void* tabV = rsTabFor(nr, h4, th, st);
+    if (!tabH || !tabV)
+    {
+        nr.die("restore fold tap tables failed");
+        return false;
+    }
+    int ps4 = w4 * h4;
+    void* ah[] = {&out, &outHalf, &ps4, &w4, &w4, &h4, &tmp, &tw, (void*)&tabH};
+    void* ahs[] = {&out, &outHalf, (void*)&base, &baseHalf, &s, &subW, &subH, &w4, &h4, &tmp, &tw, (void*)&tabH};
+    if (cuLaunchKernel(sub ? nr.fRestFoldHSub : nr.fRestFoldH, (tw + 15) / 16, (h4 + 15) / 16, 1, 16, 16, 1, 0,
+                       (CUstream)st, sub ? ahs : ah, nullptr) != CUDA_SUCCESS)
+    {
+        nr.die("restFoldH launch failed");
+        return false;
+    }
+    void* av[] = {&tmp, &tw, &h4, &dst, &th, (void*)&tabV};
+    if (cuLaunchKernel(nr.fRestFoldV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av, nullptr) !=
+        CUDA_SUCCESS)
+    {
+        nr.die("restFoldV launch failed");
+        return false;
+    }
+    return true;
+}
+
 // false = a launch failed (die was called); an engine enqueue refusal drops the pass for the rest
 // of the session instead, the caller then continues with the unrestored source.
 // HDR planes (enc 1 PQ, 2 HLG): the engine reads the frame's SDR view (hdrToModel, knee 1, head 0, the sign
@@ -112,34 +146,10 @@ static bool nativeRestoreRun(NativeRife& nr, const void* s, int ps_, int rs_, fl
         return false;
     }
     // w4 / h4 = the model's output size (restScale x the input: Real-ESRGAN 4, AnimeJaNai 2)
-    int half = nr.restHalfOut ? 1 : 0, w4 = nr.restScale * sw, h4 = nr.restScale * sh, ps4 = w4 * h4;
-    // realesr.fit: the Lanczos pair at every ratio (an exact copy at the model's own scale), with `out.clamp(0,1)`
-    // folded into the taps and the final clamp in the vertical pass
-    const void* tabH = rsTabFor(nr, w4, tw, st);
-    const void* tabV = rsTabFor(nr, h4, th, st);
-    if (!tabH || !tabV)
-    {
-        nr.die("restore fold tap tables failed");
-        return false;
-    }
-    int inHalf = nr.restHalfIn ? 1 : 0;
     const void* base = nr.restSubBase ? nr.dRestIn : nullptr; // Real-ESRGAN adds the nearest base, AnimeJaNai none
-    void* ah[] = {&nr.dRestOut, &half, &ps4, &w4, &w4, &h4, &nr.dRestTmp, &tw, (void*)&tabH};
-    void* ahs[] = {&nr.dRestOut, &half, (void*)&base, &inHalf,      &nr.restSubS, &nr.restSubW,
-                   &nr.restSubH, &w4,   &h4,          &nr.dRestTmp, &tw,          (void*)&tabH};
-    if (cuLaunchKernel(nr.restSub ? nr.fRestFoldHSub : nr.fRestFoldH, (tw + 15) / 16, (h4 + 15) / 16, 1, 16, 16, 1, 0,
-                       (CUstream)st, nr.restSub ? ahs : ah, nullptr) != CUDA_SUCCESS)
-    {
-        nr.die("restFoldH launch failed");
+    if (!restFold(nr, st, nr.dRestOut, nr.restHalfOut ? 1 : 0, nr.restSub, base, nr.restHalfIn ? 1 : 0, nr.restSubS,
+                  nr.restSubW, nr.restSubH, nr.restScale * sw, nr.restScale * sh, nr.dRestTmp, dst, tw, th))
         return false;
-    }
-    void* av[] = {&nr.dRestTmp, &tw, &h4, &dst, &th, (void*)&tabV};
-    if (cuLaunchKernel(nr.fRestFoldV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av, nullptr) !=
-        CUDA_SUCCESS)
-    {
-        nr.die("restFoldV launch failed");
-        return false;
-    }
     return !enc || nativeHdrRestOut(nr, dst, tw, th, s, sHalf, ps_, rs_, sw, sh, enc, viewRef);
 }
 

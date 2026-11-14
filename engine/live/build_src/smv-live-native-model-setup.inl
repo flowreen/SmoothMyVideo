@@ -285,15 +285,27 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
         nr.vsrWant = true;
         nr.acnUp = true;
     }
+    // Real-ESRGAN (--realesrgan, Restore's bundled net as the upscaler) the same way: any of the other four wins over it;
+    // its weights load at the session's setup (nativeRgUpSetup)
+    if (g_rgUp && (g_rtxVsr || g_fsrUp || g_a4kUp || g_acnUp))
+        LOG("native: --realesrgan ignored: %s holds the resize (the upscalers exclude each other)\n",
+            g_rtxVsr  ? "RTX VSR"
+            : g_fsrUp ? "AMD FSR upscaling"
+            : g_a4kUp ? "Anime4K"
+                      : "ArtCNN");
+    else if (g_rgUp)
+    {
+        nr.vsrWant = true;
+        nr.rgUp = true;
+    }
     // Intel XeSS-SR (--xess-upscale) runs on AMD FSR upscaling's route through its own bridge (fuKind 1:
     // smv_xess_bridge.dll with Intel's libxess.dll, which the app's XeSS setup installs into engine\xess); every other
     // upscaler on the command line wins over it; SMV_FSRUP_HDR=0 turns the route off on HDR for both bridges
-    if (g_xessUp && (g_rtxVsr || nr.fsrUp || nr.a4kUp || nr.acnUp))
+    if (g_xessUp && (g_rtxVsr || nr.fsrUp || nr.planarUp()))
         LOG("native: --xess-upscale ignored: %s holds the resize (the upscalers exclude each other)\n",
             g_rtxVsr   ? "RTX VSR"
             : nr.fsrUp ? "AMD FSR upscaling"
-            : nr.a4kUp ? "Anime4K"
-                       : "ArtCNN");
+                       : planarUpName(nr));
     else if (g_xessUp && (g_hdr || srcHdr) && GetEnvironmentVariableW(L"SMV_FSRUP_HDR", fh, 8) && fh[0] == L'0')
         LOG(g_hdr ? "native: Intel XeSS upscaling off on HDR planes (SMV_FSRUP_HDR=0), Lanczos\n"
                   : "native: Intel XeSS upscaling off on HDR video (SMV_FSRUP_HDR=0), Lanczos\n");
@@ -420,31 +432,40 @@ static bool ajNatRun(NativeRife& nr, cudaStream_t st)
     return cuLaunchKernel(nr.fRestConvLast, gx, gy, 1, 128, 1, 1, smem, (CUstream)st, al, nullptr) == CUDA_SUCCESS;
 }
 
-// one Restore on the host's kernels on st: dRestIn (three fp16 planes) -> k_restConv0 -> 16 x k_restConvMid ->
-// k_restConvLast -> dRestOut (48 fp16 sub-pixel planes); AnimeJaNai = ajNatRun; false = a launch failed
-static bool restNatRun(NativeRife& nr, cudaStream_t st)
+// the bundled Real-ESRGAN's 18 convs on st at w x h: in (three fp16 planes) -> k_restConv0 -> 16 x k_restConvMid (the
+// ping-pong a / b) -> k_restConvLast -> out (48 fp16 sub-pixel planes); wb = the weights block at restNatLoad's offsets
+// off. Restore and the Real-ESRGAN upscaler (nativeRgUpRun) each pass their own buffers; false = a launch failed
+static bool restConvChain(NativeRife& nr, cudaStream_t st, void* in, void* a, void* b, const void* wb,
+                          const std::vector<size_t>& off, void* out, int w, int h)
 {
-    if (nr.restNatKind == 2)
-        return ajNatRun(nr, st);
-    int w = srcW(nr), h = srcH(nr);
-    auto at = [&](int i) { return (void*)((char*)nr.dRestW + nr.restNatOff[(size_t)i]); };
+    auto at = [&](int i) { return (void*)((const char*)wb + off[(size_t)i]); };
     const unsigned gx = (unsigned)(w + 31) / 32, gy = (unsigned)(h + 7) / 8, smem = 10 * 34 * 128;
     void *w0 = at(0), *b0 = at(1), *s0 = at(2);
-    void* a0[] = {&nr.dRestIn, &nr.dRestA, &w0, &b0, &s0, &h, &w};
+    void* a0[] = {&in, &a, &w0, &b0, &s0, &h, &w};
     if (cuLaunchKernel(nr.fRestConv0, gx, gy, 1, 256, 1, 1, 0, (CUstream)st, a0, nullptr) != CUDA_SUCCESS)
         return false;
-    void *s = nr.dRestA, *d = nr.dRestB;
+    void *s = a, *d = b;
     for (int L = 0; L < 16; L++)
     {
         void *wf = at(3 + 3 * L), *bs = at(4 + 3 * L), *sl = at(5 + 3 * L);
-        void* a[] = {&s, &d, &wf, &bs, &sl, &h, &w};
-        if (cuLaunchKernel(nr.fRestConvMid, gx, gy, 1, 128, 1, 1, smem, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+        void* ak[] = {&s, &d, &wf, &bs, &sl, &h, &w};
+        if (cuLaunchKernel(nr.fRestConvMid, gx, gy, 1, 128, 1, 1, smem, (CUstream)st, ak, nullptr) != CUDA_SUCCESS)
             return false;
         std::swap(s, d);
     }
     void *wl = at(51), *bl = at(52);
-    void* al[] = {&s, &nr.dRestOut, &wl, &bl, &h, &w};
+    void* al[] = {&s, &out, &wl, &bl, &h, &w};
     return cuLaunchKernel(nr.fRestConvLast, gx, gy, 1, 128, 1, 1, smem, (CUstream)st, al, nullptr) == CUDA_SUCCESS;
+}
+
+// one Restore on the host's kernels on st: dRestIn (three fp16 planes) -> the 18 convs -> dRestOut (48 fp16 sub-pixel
+// planes); AnimeJaNai = ajNatRun; false = a launch failed
+static bool restNatRun(NativeRife& nr, cudaStream_t st)
+{
+    if (nr.restNatKind == 2)
+        return ajNatRun(nr, st);
+    return restConvChain(nr, st, nr.dRestIn, nr.dRestA, nr.dRestB, nr.dRestW, nr.restNatOff, nr.dRestOut, srcW(nr),
+                         srcH(nr));
 }
 
 // Restore on the host's kernels for this session: the weights uploaded, dRestIn / dRestOut, the ping-pong (inside the

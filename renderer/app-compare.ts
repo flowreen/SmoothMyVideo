@@ -98,6 +98,7 @@ function cmpOpts(frame, a, b, multi, pairs) {
       anime4k: a4kUpOn() && upFactor() > 1,
       a4kaa: a4kAaOn() && upFactor() > 1,
       artcnn: acnUpOn() && upFactor() > 1,
+      realesrgan: rgUpOn() && upFactor() > 1,
       xess: xessUpOn() && upFactor() > 1,
       dlssnr: nrOn(),
       nrstructure: nrStructure(),

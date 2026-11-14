@@ -5230,6 +5230,7 @@ static bool nativeModelShareMemory(NativeRife& nr)
 #include "smv-live-native-drba.inl"
 
 #include "smv-live-native-restore-run.inl"
+#include "smv-live-native-restore-up.inl"
 
 #include "smv-live-native-dlss5.inl"
 #include "smv-live-native-video-memory.inl"

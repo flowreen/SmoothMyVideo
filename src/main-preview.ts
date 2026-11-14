@@ -28,6 +28,7 @@ type PreviewOpts = {
   anime4k?: boolean;
   a4kaa?: boolean; // its Mode A+A box
   artcnn?: boolean;
+  realesrgan?: boolean;
   xess?: boolean;
   restore?: boolean;
   restoreModel?: string; // Restore's model id ('animejanai' / 'anime4k'; none = Real-ESRGAN)
@@ -70,6 +71,7 @@ function previewArgv(opts: PreviewOpts, prefix: string): string[] {
   else if (opts.fsrup) args.push('--fsr-upscale');
   else if (opts.anime4k) args.push('--anime4k', ...(opts.a4kaa ? ['--anime4k-aa'] : []));
   else if (opts.artcnn) args.push('--artcnn');
+  else if (opts.realesrgan) args.push('--realesrgan');
   else if (opts.xess) args.push('--xess-upscale');
   if (opts.hdr)
     args.push(

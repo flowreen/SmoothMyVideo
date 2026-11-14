@@ -148,6 +148,28 @@ static void nativeA4kRelease(NativeRife& nr);
 static bool nativeAcnSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc);
 static bool nativeAcnRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th);
 static void nativeAcnRelease(NativeRife& nr);
+static bool nativeRgUpSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc);
+static bool nativeRgUpRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th);
+static void nativeRgUpRelease(NativeRife& nr);
+
+// the session's planar-float upscaler (NativeRife::planarUp): its name, its setup for w x h -> ow x oh, one frame of
+// s (planar, fp32 or fp16 by sHalf, plane / row strides) into dst at tw x th
+static const char* planarUpName(const NativeRife& nr)
+{
+    return nr.acnUp ? "ArtCNN" : nr.rgUp ? "Real-ESRGAN" : "Anime4K";
+}
+static bool nativePlanarUpSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc)
+{
+    return nr.acnUp  ? nativeAcnSetup(nr, w, h, ow, oh, upEnc)
+           : nr.rgUp ? nativeRgUpSetup(nr, w, h, ow, oh, upEnc)
+                     : nativeA4kSetup(nr, w, h, ow, oh, upEnc);
+}
+static bool nativePlanarUpRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th)
+{
+    return nr.acnUp  ? nativeAcnRun(nr, s, sHalf, ps_, rs_, dst, tw, th)
+           : nr.rgUp ? nativeRgUpRun(nr, s, sHalf, ps_, rs_, dst, tw, th)
+                     : nativeA4kRun(nr, s, sHalf, ps_, rs_, dst, tw, th);
+}
 
 static bool nativeRtxInit(NativeRife& nr)
 {
@@ -169,10 +191,9 @@ static bool nativeRtxInit(NativeRife& nr)
         nr.vsrPost = nr.dw > nr.w && nr.dh > nr.h;
     if (nr.vsrWant)
     {
-        const char* up = nr.fsrUp   ? (nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling")
-                         : nr.a4kUp ? "Anime4K"
-                         : nr.acnUp ? "ArtCNN"
-                                    : "RTX VSR";
+        const char* up = nr.fsrUp        ? (nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling")
+                         : nr.planarUp() ? planarUpName(nr)
+                                         : "RTX VSR";
         if (vtw > vw && vth > vh)
             nr.vsr = true;
         else
@@ -182,6 +203,7 @@ static bool nativeRtxInit(NativeRife& nr)
     nr.fsrUp = nr.fsrUp && nr.vsr;
     nr.a4kUp = nr.a4kUp && nr.vsr;
     nr.acnUp = nr.acnUp && nr.vsr;
+    nr.rgUp = nr.rgUp && nr.vsr;
     // offline HDR planes at the upscaler's resize (the final one, after the model): HDR video's PQ / HLG codes, or RTX
     // HDR's PQ (its TrueHDR runs before the model), so RTX VSR reads their SDR view and AMD FSR upscaling runs in its
     // HDR mode, as live does on HDR planes
@@ -205,10 +227,10 @@ static bool nativeRtxInit(NativeRife& nr)
             nr.dh < fh ? "downscale" : "upscale");
     }
     // a resize stage's staging frame (nativeOfflineStage): Restore, or RTX VSR after the model on HDR planes (VSR's
-    // way back to the codes), and live Anime4K / ArtCNN after the model without Upscale to (their nets write planes,
-    // the slot's store reads them back); live's other stores never stage (RTX VSR straight into the slot, the Lanczos
-    // fit fused into the store, Upscale to through dUp), offline's emit allocates its own
-    if ((nr.restore && !nr.restPre) || (nr.vsr && nr.hdr) || (!g_offline && nr.vsr && (nr.a4kUp || nr.acnUp) && !nr.uw))
+    // way back to the codes), and live Anime4K / ArtCNN / Real-ESRGAN after the model without Upscale to (their nets
+    // write planes, the slot's store reads them back); live's other stores never stage (RTX VSR straight into the slot,
+    // the Lanczos fit fused into the store, Upscale to through dUp), offline's emit allocates its own
+    if ((nr.restore && !nr.restPre) || (nr.vsr && nr.hdr) || (!g_offline && nr.vsr && nr.planarUp() && !nr.uw))
         NCHK(cudaMalloc((void**)&nr.dPres, (size_t)3 * nr.dw * nr.dh * sizeof(float)), "alloc fit staging");
     if (nr.sharpen > 0.0f)
         NCHK(cudaMalloc((void**)&nr.dShOut, (size_t)3 * nr.w * nr.h * sizeof(float)), "alloc after-DLSS 5 output");
@@ -270,7 +292,7 @@ static bool nativeRtxInit(NativeRife& nr)
     }
     if (nr.vsr)
     {
-        if (!nr.a4kUp && !nr.acnUp) // Anime4K / ArtCNN read and write planar floats, never the bridge's BGRA buffers
+        if (!nr.planarUp()) // Anime4K / ArtCNN / Real-ESRGAN read and write planar floats, never the BGRA buffers
         {
             NCHK(cudaMalloc((void**)&nr.dVsrIn, (size_t)vw * vh * 4), "alloc VSR input");
             NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)vtw * vth * 4), "alloc VSR output");
@@ -342,7 +364,7 @@ static bool nativeRtxInit(NativeRife& nr)
             return false;
         }
     }
-    const bool rtxVsrNow = nr.vsr && !nr.fsrUp && !nr.a4kUp && !nr.acnUp; // NVIDIA's RTX VSR holds the slot
+    const bool rtxVsrNow = nr.vsr && !nr.fsrUp && !nr.planarUp(); // NVIDIA's RTX VSR holds the slot
     if (nr.rtxHdr || rtxVsrNow)
     {
         // the bridge retains the PRIMARY context (cuContext = NULL), which is the context this
@@ -365,19 +387,14 @@ static bool nativeRtxInit(NativeRife& nr)
     nr.fuHdr = nr.fsrUp && (g_offline ? upEnc != 0 : nr.hdr);
     if (nr.fsrUp && !nativeFsrupSetup(nr, vw, vh, vtw, vth))
         return false;
-    if ((nr.a4kUp || nr.acnUp) && nr.upHold)
+    if (nr.planarUp() && nr.upHold)
     {
         const int held[5] = {vw, vh, vtw, vth, upEnc};
         memcpy(nr.upHeld, held, sizeof(held));
         nr.upHeldSet = true;
     }
-    else
-    {
-        if (nr.a4kUp && !nativeA4kSetup(nr, vw, vh, vtw, vth, upEnc))
-            return false;
-        if (nr.acnUp && !nativeAcnSetup(nr, vw, vh, vtw, vth, upEnc))
-            return false;
-    }
+    else if (nr.planarUp() && !nativePlanarUpSetup(nr, vw, vh, vtw, vth, upEnc))
+        return false;
     if (rtxVsrNow)
     {
         // warm-up eval on an opaque black frame, so the first presented frame pays nothing
@@ -428,8 +445,8 @@ static bool nativeRtxInit(NativeRife& nr)
     return true;
 }
 
-// Anime4K's or ArtCNN's setup that nativeRtxInit held back (NativeRife's upHold), on the thread that ran the model's
-// init, after it: the memory fit of either now sees the model's buffers. true when nothing was held
+// the planar upscaler's setup that nativeRtxInit held back (NativeRife's upHold), on the thread that ran the model's
+// init, after it: its memory fit now sees the model's buffers. true when nothing was held
 static bool nativeUpHeldSetup(NativeRife& nr)
 {
     nr.upHold = false;
@@ -437,6 +454,5 @@ static bool nativeUpHeldSetup(NativeRife& nr)
         return true;
     nr.upHeldSet = false;
     const int* a = nr.upHeld;
-    return nr.a4kUp ? nativeA4kSetup(nr, a[0], a[1], a[2], a[3], a[4])
-                    : nativeAcnSetup(nr, a[0], a[1], a[2], a[3], a[4]);
+    return nativePlanarUpSetup(nr, a[0], a[1], a[2], a[3], a[4]);
 }

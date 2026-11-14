@@ -87,15 +87,15 @@ static bool nativeNrSwitch(NativeRife& nr, bool on, std::string& why)
 // the running upscaler's own state released between two groups before another kind starts in place (nativeUpSwitch),
 // the GPU idle first (the slot store's streams read its buffers): AMD FSR / Intel XeSS free their instance, imports and
 // vector session (the DLL stays loaded; a bridge whose start failed too), Anime4K its resize buffers (the statistics
-// and Restore's stay), ArtCNN its buffers and weights; RTX VSR keeps NGX (one create a process, its VSR feature reused
-// by a switch back); the buffers every kind shares at this geometry (dVsrIn / dVsrOut, dPres, dVsrView / dVsrRem) stay
+// and Restore's stay), ArtCNN and Real-ESRGAN their buffers and weights; RTX VSR keeps NGX (one create a process, its
+// VSR feature reused by a switch back); the buffers every kind shares at this geometry (dVsrIn / dVsrOut, dPres,
+// dVsrView / dVsrRem) stay
 static void nativeUpRelease(NativeRife& nr)
 {
-    const char* name = !nr.vsr    ? nullptr
-                       : nr.fsrUp ? (nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling")
-                       : nr.a4kUp ? "Anime4K"
-                       : nr.acnUp ? "ArtCNN"
-                                  : "RTX VSR";
+    const char* name = !nr.vsr         ? nullptr
+                       : nr.fsrUp      ? (nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling")
+                       : nr.planarUp() ? planarUpName(nr)
+                                       : "RTX VSR";
     cudaDeviceSynchronize();
     if (nr.fuMade)
         nativeFsrupRelease(nr);
@@ -103,15 +103,18 @@ static void nativeUpRelease(NativeRife& nr)
         nativeA4kUpFree(nr);
     if (nr.acnUp)
         nativeAcnRelease(nr);
-    nr.vsr = nr.vsrWant = nr.fsrUp = nr.fuHdr = nr.a4kUp = nr.acnUp = nr.vsrFailed = nr.vsrUserOff = false;
+    if (nr.rgUp)
+        nativeRgUpRelease(nr);
+    nr.vsr = nr.vsrWant = nr.fsrUp = nr.fuHdr = nr.a4kUp = nr.acnUp = nr.rgUp = nr.vsrFailed = nr.vsrUserOff = false;
     if (name)
         LOG("native: live upscale: %s released in place\n", name);
 }
 
 // an upscaler ticked in a running session that started without one, or another kind than the one it runs (stdin `set
-// up N`, N = the kind the renderer picked: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS): the live case
-// where the fit after the model enlarges (the upscaler's resize under nativeRtxInit's rule), on SDR or HDR planes, set
-// up on the native thread between two groups the way the session start does (the DLL checks and HDR levers, the
+// up N`, N = the kind the renderer picked: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS, 6 Real-ESRGAN):
+// the live case where the fit after the model enlarges (the upscaler's resize under nativeRtxInit's rule), on SDR or
+// HDR planes, set up on the native thread between two groups the way the session start does (the DLL checks and HDR
+// levers, the
 // buffers the slot store reads, the bridge or module, the warm-up; FSR / XeSS's first frames on a worker), when the
 // video memory room holds it; a running kind is released first (nativeUpRelease), after the checks that leave it
 // running. false = this session cannot (why says it); the next session takes it. Left to the next session, as at the
@@ -126,8 +129,8 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
     }
     if (nr.hdr)
     {
-        // HDR planes as the session start runs them (nativeConfigHdr's levers): RTX VSR, Anime4K and ArtCNN on the
-        // frame's SDR view and back to the codes, AMD FSR / Intel XeSS in the bridge's HDR mode
+        // HDR planes as the session start runs them (nativeConfigHdr's levers): RTX VSR, Anime4K, ArtCNN and
+        // Real-ESRGAN on the frame's SDR view and back to the codes, AMD FSR / Intel XeSS in the bridge's HDR mode
         wchar_t ev[8]{};
         const bool vsrOff = want == 1 && GetEnvironmentVariableW(L"SMV_VSR_HDR", ev, 8) && ev[0] == L'0';
         const bool fuOff =
@@ -149,6 +152,7 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
                        : want == 3 ? "Anime4K"
                        : want == 4 ? "ArtCNN"
                        : want == 5 ? "Intel XeSS upscaling"
+                       : want == 6 ? "Real-ESRGAN"
                                    : nullptr;
     if (!name)
     {
@@ -197,11 +201,11 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
     }
     if (nr.vsr || nr.fuMade)
         nativeUpRelease(nr); // the running kind (or a bridge whose start failed) first: its memory counts below
-    // the buffers the slot store reads at this geometry (nativeRtxInit's): Anime4K / ArtCNN write planar floats into
-    // the staging frame (under Upscale to the internal render frame, allocated), the bridges read and write BGRA
-    // buffers; HDR planes add the staging frame for every kind (the way back to the codes lands there), the frame's SDR
-    // view and the light the view never held at the target (dVsrView / dVsrRem)
-    const bool planar = want == 3 || want == 4;
+    // the buffers the slot store reads at this geometry (nativeRtxInit's): Anime4K / ArtCNN / Real-ESRGAN write planar
+    // floats into the staging frame (under Upscale to the internal render frame, allocated), the bridges read and write
+    // BGRA buffers; HDR planes add the staging frame for every kind (the way back to the codes lands there), the frame's
+    // SDR view and the light the view never held at the target (dVsrView / dVsrRem)
+    const bool planar = want == 3 || want == 4 || want == 6;
     const bool pres = (planar && !nr.uw) || nr.hdr;
     const uint64_t fl = sizeof(float);
     const uint64_t need = (pres && !nr.dPres ? 3 * fl * nr.dw * nr.dh : 0) +
@@ -240,6 +244,7 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
         nr.fsrUpDir = dir;
     nr.a4kUp = want == 3;
     nr.acnUp = want == 4;
+    nr.rgUp = want == 6;
     nr.vsrFailed = nr.vsrUserOff = false;
     bool ok = true;
     if (want == 1 && g_rtxb.vsrMade)
@@ -272,12 +277,11 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
     else if (nr.fsrUp)
         ok = nativeFsrupSetup(nr, nr.w, nr.h, tw, th);
     else
-        ok = (nr.a4kUp ? nativeA4kSetup(nr, nr.w, nr.h, tw, th, 0) : nativeAcnSetup(nr, nr.w, nr.h, tw, th, 0)) &&
-             !nr.vsrFailed;
+        ok = nativePlanarUpSetup(nr, nr.w, nr.h, tw, th, 0) && !nr.vsrFailed;
     if (!ok)
     {
         // Lanczos stays: the flags off (the kind's buffers go with the session's teardown)
-        nr.vsrWant = nr.fsrUp = nr.a4kUp = nr.acnUp = nr.vsrFailed = false;
+        nr.vsrWant = nr.fsrUp = nr.a4kUp = nr.acnUp = nr.rgUp = nr.vsrFailed = false;
         if (!nr.fuMade) // a bridge built before the failure is destroyed at the teardown by its kind
             nr.fuKind = 0;
         if (why.empty())
@@ -625,12 +629,13 @@ static void nativeLiveSets(NativeRife& nr)
         }
         else if (key == "up" || key == "restore" || key == "rtxhdr")
         {
-            // the session's own kind (up: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS; restore: 1
-            // Real-ESRGAN, 2 AnimeJaNai, 3 Anime4K; rtxhdr: 1), 0 = it runs none
+            // the session's own kind (up: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS, 6 Real-ESRGAN;
+            // restore: 1 Real-ESRGAN, 2 AnimeJaNai, 3 Anime4K; rtxhdr: 1), 0 = it runs none
             const int kind = key == "up"        ? (!nr.vsr    ? 0
                                                    : nr.fsrUp ? (nr.fuKind ? 5 : 2)
                                                    : nr.a4kUp ? 3
                                                    : nr.acnUp ? 4
+                                                   : nr.rgUp  ? 6
                                                               : 1)
                              : key == "restore" ? (nr.restore && nr.restNat ? nr.restNatKind : 0)
                                                 : (nr.rtxHdr ? 1 : 0);
@@ -691,7 +696,7 @@ static void nativeLiveSets(NativeRife& nr)
                 continue;
             }
         }
-        else if (key == "vsrq" && !nr.fsrUp && !nr.a4kUp && !nr.acnUp)
+        else if (key == "vsrq" && !nr.fsrUp && !nr.planarUp())
         {
             // RTX VSR's level: read at every evaluate while it runs; held for its start in place (nativeUpSwitch)
             nr.vsrSet.QualityLevel = vsrLevelOk((int)v) ? (uint32_t)v : clampU(v, 1.0, 4.0);
@@ -752,6 +757,7 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
         nr.vsr ? (nr.fsrUp   ? (nr.fuKind ? ", xessup=native" : ", fsrup=native")
                   : nr.a4kUp ? ", anime4k=native"
                   : nr.acnUp ? ", artcnn=native"
+                  : nr.rgUp  ? ", realesrgan=native"
                              : ", vsr=native")
                : "",
         nr.uw ? ", upscale=native" : "", nr.fitAa ? ", fit=native-aa" : "",

@@ -122,6 +122,7 @@ type RunOpts = {
   anime4k?: boolean;
   a4kaa?: boolean; // its Mode A+A box
   artcnn?: boolean;
+  realesrgan?: boolean;
   xess?: boolean;
   rtxhdr?: boolean;
   dv?: boolean;
@@ -199,12 +200,13 @@ function engineArgs(opts: RunOpts): string[] {
   // RTX VSR: the real RTX Video SDK (the engine/rtxvideo CUDA bridge) for an enlarging resize: the
   // final one from the working size (a mode below DLAA or an upscale), else the one before the
   // model; the plan skips it when nothing enlarges. Falls back to Lanczos3 if the bridge or the RTX
-  // Video runtime is unavailable. AMD FSR 4 (bundled), Anime4K or ArtCNN takes the same resize when its box is ticked
-  // instead.
+  // Video runtime is unavailable. AMD FSR 4 (bundled), Anime4K, ArtCNN or Real-ESRGAN takes the same resize when its box
+  // is ticked instead.
   if (opts.rtxvsr) args.push('--rtx-vsr', ...vsrQArgs(vsrQ(opts.vsrquality)));
   else if (opts.fsrup) args.push('--fsr-upscale');
   else if (opts.anime4k) args.push('--anime4k', ...(opts.a4kaa ? ['--anime4k-aa'] : []));
   else if (opts.artcnn) args.push('--artcnn');
+  else if (opts.realesrgan) args.push('--realesrgan');
   else if (opts.xess) args.push('--xess-upscale');
   // RTX HDR (TrueHDR): convert the output to HDR10. Works with or without --upscale (when both are
   // on, the RTX bridge does VSR then TrueHDR in one pass). The peak = the Peak box, else the app

@@ -97,6 +97,7 @@ function prevSettingsSig() {
     a4kUpOn(),
     a4kAaOn(),
     acnUpOn(),
+    rgUpOn(),
     xessUpOn(),
     nrOn(),
     nrStructure(),
@@ -131,6 +132,7 @@ async function loadPreview(frame, bg?) {
   const useFsr = lite ? false : fsrUpOn() && upFactor() > 1; // AMD FSR 4 the same way
   const useA4k = lite ? false : a4kUpOn() && upFactor() > 1; // Anime4K too
   const useAcn = lite ? false : acnUpOn() && upFactor() > 1; // ArtCNN too
+  const useRg = lite ? false : rgUpOn() && upFactor() > 1; // Real-ESRGAN too
   const useXess = lite ? false : xessUpOn() && upFactor() > 1; // Intel XeSS too
   const useNr = lite ? false : nrOn(); // DLSS 5: its host takes seconds to start, so the lite pass skips it too
   inflightPrevKey = JSON.stringify([input, frame == null ? 'mid' : frame].concat(sig));
@@ -172,6 +174,7 @@ async function loadPreview(frame, bg?) {
           anime4k: useA4k,
           a4kaa: useA4k && a4kAaOn(),
           artcnn: useAcn,
+          realesrgan: useRg,
           xess: useXess,
           dlssnr: useNr,
           nrmask: useNr && nrMaskOn(),
@@ -231,7 +234,7 @@ async function loadPreview(frame, bg?) {
     (hdr ||
       nrOn() ||
       ($('rtxvsr').checked && rtxReady.vsr && upFactor() > 1) ||
-      ((fsrUpOn() || a4kUpOn() || acnUpOn() || xessUpOn()) && upFactor() > 1)); // RTX / FSR / Anime4K / ArtCNN / DLSS 5 on in settings but skipped for the fast auto-preview
+      ((fsrUpOn() || a4kUpOn() || acnUpOn() || rgUpOn() || xessUpOn()) && upFactor() > 1)); // RTX / FSR / Anime4K / ArtCNN / Real-ESRGAN / DLSS 5 on in settings but skipped for the fast auto-preview
   const srcHdr = !!(info && info.srcHdr);
   // the pass names ('@key' = a language string, else a name that stays as is)
   const parts = [];
@@ -246,11 +249,13 @@ async function loadPreview(frame, bg?) {
             ? 'Anime4K'
             : useAcn
               ? 'ArtCNN'
-              : useXess
-                ? 'XeSS'
-                : upFactor() < 1
-                  ? '@prev.part.down'
-                  : '@prev.part.up',
+              : useRg
+                ? 'Real-ESRGAN'
+                : useXess
+                  ? 'XeSS'
+                  : upFactor() < 1
+                    ? '@prev.part.down'
+                    : '@prev.part.up',
     );
   if (useNr) parts.push('DLSS 5');
   if (sharpen > 0) parts.push('@sharpen.k');

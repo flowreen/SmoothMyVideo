@@ -64,6 +64,7 @@ const OPTS: Record<string, Spec> = {
   '--anime4k': { dest: 'anime4k', kind: 'bool', def: false },
   '--anime4k-aa': { dest: 'anime4k_aa', kind: 'bool', def: false },
   '--artcnn': { dest: 'artcnn', kind: 'bool', def: false },
+  '--realesrgan': { dest: 'realesrgan', kind: 'bool', def: false },
   '--xess-upscale': { dest: 'xess_upscale', kind: 'bool', def: false },
   '--rtx-hdr': { dest: 'rtx_hdr', kind: 'bool', def: false },
   '--dv': { dest: 'dv', kind: 'bool', def: false },

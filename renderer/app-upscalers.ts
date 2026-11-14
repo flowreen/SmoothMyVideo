@@ -59,14 +59,22 @@ localStorage.removeItem('rtxvsrOn'); // retired: its stored choice was made whil
 $('rtxvsr').checked = localStorage.getItem('vsrOn') !== '0'; // default ON: RTX VSR upscales unless unticked
 if (localStorage.getItem('rtxhdrOn') === '1') $('rtxhdr').checked = true; // default OFF
 // AMD FSR 4 upscaling: bundled (engine/fsrup), so always ready; Anime4K too (its weights are inside the host), ArtCNN too
-// (engine/artcnn); Intel XeSS needs Intel's libxess.dll, which its setup row downloads (xess-ready); RTX VSR, AMD FSR 4,
-// Anime4K, ArtCNN and Intel XeSS exclude each other (ticking one clears the others), none ticked = Lanczos3
+// (engine/artcnn), Real-ESRGAN too (Restore's bundled engine/realesrgan); Intel XeSS needs Intel's libxess.dll, which its
+// setup row downloads (xess-ready); RTX VSR, AMD FSR 4, Anime4K, ArtCNN, Real-ESRGAN and Intel XeSS exclude each other
+// (ticking one clears the others), none ticked = Lanczos3
 $('fsrup').checked = localStorage.getItem('fsrupOn') === '1'; // default OFF: RTX VSR is the default upscaler
 $('a4kup').checked = !$('fsrup').checked && localStorage.getItem('a4kOn') === '1'; // default OFF
 $('acnup').checked = !$('fsrup').checked && !$('a4kup').checked && localStorage.getItem('acnOn') === '1'; // default OFF
+$('rgup').checked =
+  !$('fsrup').checked && !$('a4kup').checked && !$('acnup').checked && localStorage.getItem('rgOn') === '1'; // default OFF
 $('xessup').checked =
-  !$('fsrup').checked && !$('a4kup').checked && !$('acnup').checked && localStorage.getItem('xessOn') === '1'; // default OFF
-if ($('fsrup').checked || $('a4kup').checked || $('acnup').checked || $('xessup').checked) $('rtxvsr').checked = false;
+  !$('fsrup').checked &&
+  !$('a4kup').checked &&
+  !$('acnup').checked &&
+  !$('rgup').checked &&
+  localStorage.getItem('xessOn') === '1'; // default OFF
+if ($('fsrup').checked || $('a4kup').checked || $('acnup').checked || $('rgup').checked || $('xessup').checked)
+  $('rtxvsr').checked = false;
 function fsrUpOn() {
   return $('fsrup').checked && !$('rtxvsr').checked;
 }
@@ -96,9 +104,18 @@ $('a4kaa').onchange = () => {
 function acnUpOn() {
   return $('acnup').checked && !$('rtxvsr').checked && !$('fsrup').checked && !$('a4kup').checked;
 }
+// Real-ESRGAN: Restore's bundled model as the upscaler after the interpolation (`--realesrgan`)
+function rgUpOn() {
+  return $('rgup').checked && !$('rtxvsr').checked && !$('fsrup').checked && !$('a4kup').checked && !$('acnup').checked;
+}
 function xessUpOn() {
   return (
-    $('xessup').checked && !$('rtxvsr').checked && !$('fsrup').checked && !$('a4kup').checked && !$('acnup').checked
+    $('xessup').checked &&
+    !$('rtxvsr').checked &&
+    !$('fsrup').checked &&
+    !$('a4kup').checked &&
+    !$('acnup').checked &&
+    !$('rgup').checked
   );
 }
 function upOnly(keep) {
@@ -108,6 +125,7 @@ function upOnly(keep) {
     ['fsrup', 'fsrupOn'],
     ['a4kup', 'a4kOn'],
     ['acnup', 'acnOn'],
+    ['rgup', 'rgOn'],
     ['xessup', 'xessOn'],
   ])
     if (id !== keep && $(id).checked) {
@@ -141,30 +159,24 @@ $('fsrup').onchange = () => {
   } catch {}
   fsrWarm();
 };
-$('a4kup').onchange = () => {
-  localStorage.setItem('a4kOn', $('a4kup').checked ? '1' : '0');
-  if ($('a4kup').checked) upOnly('a4kup');
-  syncRtx();
-  syncUpscale();
-  syncVsrQ();
-  refreshPreviewIfOpen();
-  try {
-    lvModelUi();
-    lvSendOpts();
-  } catch {}
-};
-$('acnup').onchange = () => {
-  localStorage.setItem('acnOn', $('acnup').checked ? '1' : '0');
-  if ($('acnup').checked) upOnly('acnup');
-  syncRtx();
-  syncUpscale();
-  syncVsrQ();
-  refreshPreviewIfOpen();
-  try {
-    lvModelUi();
-    lvSendOpts();
-  } catch {}
-};
+// the upscaler boxes with no setup of their own (Anime4K, ArtCNN, Real-ESRGAN): the stored choice, the others cleared
+for (const [id, key] of [
+  ['a4kup', 'a4kOn'],
+  ['acnup', 'acnOn'],
+  ['rgup', 'rgOn'],
+])
+  $(id).onchange = () => {
+    localStorage.setItem(key, $(id).checked ? '1' : '0');
+    if ($(id).checked) upOnly(id);
+    syncRtx();
+    syncUpscale();
+    syncVsrQ();
+    refreshPreviewIfOpen();
+    try {
+      lvModelUi();
+      lvSendOpts();
+    } catch {}
+  };
 $('xessup').onchange = () => {
   localStorage.setItem('xessOn', $('xessup').checked ? '1' : '0');
   if ($('xessup').checked) upOnly('xessup');

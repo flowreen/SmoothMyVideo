@@ -1,14 +1,14 @@
-// NVIDIA DLSS 5 (Neural Rendering; opt-in; both modes: renders run it per output frame, Live
-// once per captured frame before the smoothing, lvSendOpts carries it):
-// a DLAA-class per-frame pass at the output resolution, run by the native host through the caller
+// NVIDIA DLSS 5 (Neural Rendering; opt-in; both modes: once per original frame at the model size,
+// before the interpolation and any upscale; lvSendOpts carries it to Live):
+// a DLAA-class per-frame pass, run by the native host through the caller
 // shim engine/dlssnr/nvngx.dll (ships)
 // plus the NR runtime nvngx_dlssnr.dll, which the app never ships (NVIDIA offers no public download,
 // the only NVIDIA copy is inside NBA 2K27): one click downloads the community build every DLSS 5 tool
 // uses (rhi-repo on GitHub, checksum-verified twice in main), or the user drops a copy in, like the
 // RTX Video / NvOFFRUC DLLs.
 // Readiness = the shim + runtime present (dlssnr-ready). The two sliders are NVIDIA's global developer
-// controls, Structure Intensity and Tone Intensity (0..2, default 1.00); the pass always runs at
-// full resolution (no quality selector, by decision).
+// controls, Structure Intensity and Tone Intensity (0..2, default 1.00); the pass runs at the model
+// size itself, never at a smaller DLSS quality size (no quality selector, by decision).
 let dlssnrReady: any = { ready: false };
 function nrOn() {
   return $('dlssnr').checked && !!dlssnrReady.ready;

@@ -676,6 +676,7 @@ static void nativeFree(NativeRife& nr)
     nativeFsrupRelease(nr); // the FSR upscaler and its vector session (fsrUp sessions only)
     nativeA4kRelease(nr);   // Anime4K's buffers: the resize's, Restore's, the statistics (Anime4K sessions only)
     nativeAcnRelease(nr);   // ArtCNN's weights and frame buffers (ArtCNN sessions only)
+    nativeRgUpRelease(nr);  // the Real-ESRGAN upscaler's weights and frame buffers (its sessions only)
     // release the TrueHDR feature on the compute thread, before the CUDA teardown
     if (nr.thdrN && !g_offline) // offline logs its own line with the light levels
         LOG("native: TrueHDR eval %.2f ms mean, %.2f ms max, over %llu real frames\n", nr.thdrMs / (double)nr.thdrN,

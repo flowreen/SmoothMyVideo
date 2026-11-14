@@ -41,6 +41,7 @@ export interface PreviewArgs {
   anime4k: boolean;
   anime4k_aa: boolean; // --anime4k-aa: Anime4K's Mode A+A
   artcnn: boolean;
+  realesrgan: boolean;
   xess_upscale: boolean;
   dlssnr: boolean;
   nr_structure: number;
@@ -101,6 +102,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     anime4k: false,
     anime4k_aa: false,
     artcnn: false,
+    realesrgan: false,
     xess_upscale: false,
     dlssnr: false,
     nr_structure: 1,
@@ -137,6 +139,7 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     '--anime4k': 'anime4k',
     '--anime4k-aa': 'anime4k_aa',
     '--artcnn': 'artcnn',
+    '--realesrgan': 'realesrgan',
     '--xess-upscale': 'xess_upscale',
     '--dlssnr': 'dlssnr',
     '--nr-mask': 'nr_mask',
@@ -740,6 +743,7 @@ function passFlags(
       else if (a.anime4k && o.outW > s.W && o.outH > s.H)
         args.push('--anime4k', ...(a.anime4k_aa ? ['--anime4k-aa'] : []));
       else if (a.artcnn && o.outW > s.W && o.outH > s.H) args.push('--artcnn');
+      else if (a.realesrgan && o.outW > s.W && o.outH > s.H) args.push('--realesrgan');
       else if (a.xess_upscale && o.outW > s.W && o.outH > s.H) args.push('--xess-upscale');
     }
   }
@@ -1055,6 +1059,7 @@ export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
         else if (a.fsr_upscale && OW > WW && OH > WH) st.push('--fsr-upscale');
         else if (a.anime4k && OW > WW && OH > WH) st.push('--anime4k', ...(a.anime4k_aa ? ['--anime4k-aa'] : []));
         else if (a.artcnn && OW > WW && OH > WH) st.push('--artcnn');
+        else if (a.realesrgan && OW > WW && OH > WH) st.push('--realesrgan');
         else if (a.xess_upscale && OW > WW && OH > WH) st.push('--xess-upscale');
       }
       if (s.srcHdr) st.push('--src-hdr', s.transfer === 'arib-std-b67' ? 'hlg' : 'pq');

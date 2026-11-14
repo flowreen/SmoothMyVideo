@@ -154,7 +154,8 @@ The new frames are made from the video at its own size. Then every frame, origin
   FSR 4.1, Intel XeSS (Intel's files are downloaded on request), Anime4K or ArtCNN (both made for anime; each upscale
   pass doubles the picture, so 720p to 4K takes two passes; with Restore set to Anime4K too, Anime4K makes its Mode
   A, and its A+A box runs Anime4K's Restore again on the enlarged picture: crisper lines, slower, and it can add
-  ringing); with none ticked, a standard resize. They only run when the picture is enlarged. In Live with DLSS 4.5
+  ringing), or Real-ESRGAN (Restore's anime model, enlarging 4x after the smoothing: clean lines, heavy on the GPU);
+  with none ticked, a standard resize. They only run when the picture is enlarged. In Live with DLSS 4.5
   the upscaler stays off and DLSS 4.5's frames get the standard resize.
 
 In the preview, **Show changed pixels** turns the processed side into a heat map of where DLSS 5 changed the picture.
@@ -225,8 +226,8 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
 * **Stop:** press the hotkey again, or click **Stop**. The hotkey is reserved system-wide while the app runs.
 * **Display:** **Whole screen** (the default) smooths the whole monitor the active window is on, everything on it, and
   works with every model including DLSS 4.5. **Original size** smooths only the window. **Fill screen** fills its
-  monitor with the window (aspect kept), upscaled with RTX VSR, AMD FSR 4.1, Intel XeSS, Anime4K or ArtCNN when
-  ticked.
+  monitor with the window (aspect kept), upscaled with RTX VSR, AMD FSR 4.1, Intel XeSS, Anime4K, ArtCNN or
+  Real-ESRGAN when ticked.
 * **Adaptive:** with GMFSS, RIFE or NVIDIA Optical Flow the output holds your fps target whatever the source does (a
   game dropping from 30 to 10 fps still plays at the same smooth rate). AMD FSR 4, Intel XeSS-FG and Smooth Motion
   double the frame rate per pass, so they pick the doubling that reaches your target (60 fps from 24 shows 96). DLSS 4.5 matches

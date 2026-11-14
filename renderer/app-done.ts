@@ -45,6 +45,7 @@ ipcRenderer.on('engine-done', (_e, code) => {
   $('a4kup').disabled = false;
   a4kAaUi();
   $('acnup').disabled = false;
+  $('rgup').disabled = false;
   $('xessup').disabled = false;
   $('gpufit').disabled = false;
   $('rtxhdr').disabled = !!(info && info.srcHdr);

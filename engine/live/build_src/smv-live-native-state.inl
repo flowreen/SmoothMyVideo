@@ -28,6 +28,9 @@ constexpr int kFrPipeLearn = 8;
 // RIFE's feature planes: the encode's output and the IFNet / block0 inputs f0 / f1 (RIFE 4.25: 4)
 constexpr int kRifeFeatC = 4;
 
+// Real-ESRGAN as the upscaler (rgUp): the most passes of its x4 net a frame (64x)
+constexpr int kRgMaxPasses = 3;
+
 // a kernel chain on the host's kernels replayed as CUDA graphs (chainGraphRun): up to kN executable graphs, each
 // captured on the first call with its key (the chain's buffers, then its w and h), replaced oldest first; mode 0 =
 // direct launches, 1 = graphs, 2 = every capture thrown away (the fallback's trigger); logged = the graph line written;
@@ -524,12 +527,33 @@ struct NativeRife
     float* dAcnOut = nullptr;         // a pass's RGB, three planes = the next pass's input
     float* dAcnTmp = nullptr;         // the Lanczos pairs' horizontal pass
     size_t acnTmpN = 0;               // floats dAcnTmp holds
+    // Real-ESRGAN as the upscaler (rgUp, `--realesrgan`): RTX VSR's resize too (vsr is set), on planar floats like
+    // ArtCNN: Restore's bundled animevideov3 (x4) on the model-size frame after the model, its own weights and buffers
+    // (Restore before the model keeps its own), folded to the target by Restore's Lanczos pair; equal passes of at most
+    // 4x past 4x (rgUpPlan). The buffers hold the plan's largest pass
+    bool rgUp = false;
+    void* dRgW = nullptr; // the weights (restNatLoad's block, rgOff's offsets)
+    std::vector<size_t> rgOff;
+    void* dRgIn = nullptr;   // a pass's input, three fp16 planes
+    void* dRgAct = nullptr;  // the net's ping-pong: two channels-last frames of 64 halves a pixel
+    void* dRgOut = nullptr;  // the net's 48 fp16 sub-pixel planes
+    float* dRgMid = nullptr; // a pass's folded output, the next pass's input (more than one pass only)
+    float* dRgTmp = nullptr; // the fold's horizontal pass
+    size_t rgInN = 0;        // pixels a pass's input may hold (dRgIn / dRgAct / dRgOut)
+    size_t rgTmpN = 0;       // floats dRgTmp holds
+    size_t rgMidN = 0;       // floats dRgMid holds
+    int rgW = 0, rgH = 0;    // the first pass's input size
     // Anime4K (a4kUp, `--anime4k`): RTX VSR's resize too (vsr is set), on planar floats instead of the bridge's BGRA:
     // Upscale CNN x2 UL's conv passes in CUDA (its own module a4kMod, a4kKernelText: layers 1..6 on the tensor cores,
     // layer 0 inside layer 1's kernel and the last 1 x 1 inside layer 6's, both with literal weights) at the slot's
     // input size, then the fold (k_a4kFoldHSub: the shader's Depth-to-Space pass, and the Lanczos pair from 2w x 2h to
     // the slot's target); HDR frames go in as their SDR view and come back through RTX VSR's way to the codes
     bool a4kUp = false;
+    // the upscaler reads and writes planar floats (Anime4K, ArtCNN or Real-ESRGAN), never the bridges' BGRA buffers
+    bool planarUp() const
+    {
+        return a4kUp || acnUp || rgUp;
+    }
     CUmodule a4kMod = nullptr;
     // the module build and the statistics buffers are shared by Restore (nativeModelInit) and the resize
     // (nativeRtxInit), which the live early init runs on two threads at once: one builds, the other finds it

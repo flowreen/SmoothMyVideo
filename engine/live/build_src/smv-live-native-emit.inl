@@ -237,7 +237,7 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
 {
     cudaStream_t st = nr.stream;
     const bool resize = tw != sw || th != sh;
-    const bool vsrNow = vsrHere && nr.vsr && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp || nr.a4kUp || nr.acnUp);
+    const bool vsrNow = vsrHere && nr.vsr && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp || nr.planarUp());
     staged = false;
     if (withRestore && nr.restore && nr.restNat && !nr.restFailed)
     {
@@ -264,17 +264,17 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
     {
         bool haveVsr = false;
         const int hlg = enc == 2 ? 1 : 0;
-        if (vsrNow && (nr.a4kUp || nr.acnUp))
+        if (vsrNow && nr.planarUp())
         {
-            // Anime4K / ArtCNN: the planes (HDR video: their SDR view, as RTX VSR reads it) through its x2 net and the
-            // Lanczos pair into nr.dPres; HDR video comes back to the codes in RTX VSR's block below
+            // Anime4K / ArtCNN / Real-ESRGAN: the planes (HDR video: their SDR view, as RTX VSR reads it) through its
+            // net and the Lanczos pair into nr.dPres; HDR video comes back to the codes in RTX VSR's block below
             const void* a4kSrc = src;
             int aHalf = srcHalf, aps = ps, ars = rs;
             if (enc)
             {
                 if (!nativeHdrEnc(nr, src, srcHalf, ps, rs, sw, sh, nr.dVsrView, 0, sw * sh, sw, enc, 1.0f, 0.0f))
                 {
-                    nr.die(nr.acnUp ? "ArtCNN SDR view launch failed" : "Anime4K SDR view launch failed");
+                    nr.die((std::string(planarUpName(nr)) + " SDR view launch failed").c_str());
                     return false;
                 }
                 a4kSrc = nr.dVsrView;
@@ -282,8 +282,7 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
                 aps = sw * sh;
                 ars = sw;
             }
-            if (!(nr.acnUp ? nativeAcnRun(nr, a4kSrc, aHalf, aps, ars, nr.dPres, tw, th)
-                           : nativeA4kRun(nr, a4kSrc, aHalf, aps, ars, nr.dPres, tw, th)))
+            if (!nativePlanarUpRun(nr, a4kSrc, aHalf, aps, ars, nr.dPres, tw, th))
                 return false;
             haveVsr = true;
         }
@@ -357,7 +356,7 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
         else if (haveVsr)
         {
             void* a[] = {&nr.dVsrOut, (void*)&tw, (void*)&th, &nr.dPres};
-            if (!nr.a4kUp && !nr.acnUp && // Anime4K / ArtCNN wrote nr.dPres itself
+            if (!nr.planarUp() && // Anime4K / ArtCNN / Real-ESRGAN wrote nr.dPres itself
                 cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
                                1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {

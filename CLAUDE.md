@@ -71,7 +71,8 @@ table is the include order, which is the source order and matters: a later part 
 | `model-init` | GMFSS's setup, the tween buffers, the HDR model steps, the fits and blends, `nativeModelInit`, `nativeFree` |
 | `gmfss-chain` | the GMFSS pair and tween |
 | `drba` | DRBA's frame ring, windows and tween |
-| `restore-run` | the Restore run, TrueHDR's offline statistics |
+| `restore-run` | the Restore run and its fold (`restFold`), TrueHDR's offline statistics |
+| `restore-up` | Real-ESRGAN as the upscaler after the model (`--realesrgan`): Restore's net with its own buffers |
 | `dlss5` | DLSS 5's change mask (`--nr-delta`), texture imports and motion field |
 | `video-memory` | the free video memory figure and the live ring's fit |
 | `dlss5-frame` | DLSS 5 on one frame (`nativeNrFrame`), its live init |

@@ -163,6 +163,7 @@ static bool g_fsrUp = false;   // --fsr-upscale: AMD FSR upscaling in RTX VSR's 
 static bool g_a4kUp = false;   // --anime4k: Anime4K's x2 CNN in RTX VSR's resize (both routes)
 static bool g_a4kAA = false;   // --anime4k-aa: Anime4K's Mode A+A, Restore CNN UL on the first x2 pass's 2x frame too
 static bool g_acnUp = false;   // --artcnn: ArtCNN C4F32_DN's x2 in RTX VSR's resize (both routes)
+static bool g_rgUp = false;    // --realesrgan: Real-ESRGAN animevideov3's x4 in RTX VSR's resize (both routes)
 static bool g_xessUp = false;  // --xess-upscale: Intel XeSS-SR in RTX VSR's resize (both routes)
 static bool g_xessFg = false;  // --xess-fg: Intel XeSS-FG on AMD FSR frame generation's route (both routes; offline it
                                // picks that route itself, live it rides the fsrfg backend)
@@ -1970,6 +1971,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             g_a4kAA = true;
         else if (wcscmp(argv[i], L"--artcnn") == 0)
             g_acnUp = true;
+        else if (wcscmp(argv[i], L"--realesrgan") == 0)
+            g_rgUp = true;
         else if (wcscmp(argv[i], L"--xess-upscale") == 0)
             g_xessUp = true;
         else if (wcscmp(argv[i], L"--restore") == 0)
@@ -2829,6 +2832,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         nr.vsr ? (nr.fsrUp   ? (nr.fuKind ? ", intel xess upscale" : ", amd fsr upscale")
                   : nr.a4kUp ? ", anime4k"
                   : nr.acnUp ? ", artcnn"
+                  : nr.rgUp  ? ", real-esrgan"
                              : ", rtx vsr")
                : ((outW != w || outH != h) ? ", lanczos upscale" : ""),
         nr.nrHost ? ", dlss 5" : "", nr.sharpen > 0.0f ? ", sharpen" : "", nr.rtxHdr ? ", rtx hdr" : "",
@@ -4352,6 +4356,7 @@ static void resetSessionGlobals()
     g_a4kUp = false;
     g_a4kAA = false;
     g_acnUp = false;
+    g_rgUp = false;
     g_xessUp = false;
     g_xessFg = false;
     g_upscaleH = 0;
@@ -4479,6 +4484,8 @@ static int parseLiveArgs(int argc, wchar_t** argv, LiveArgs& la)
             g_a4kAA = true;
         else if (wcscmp(argv[i], L"--artcnn") == 0)
             g_acnUp = true;
+        else if (wcscmp(argv[i], L"--realesrgan") == 0)
+            g_rgUp = true;
         else if (wcscmp(argv[i], L"--xess-upscale") == 0)
             g_xessUp = true;
         else if (wcscmp(argv[i], L"--xess-fg") == 0)
@@ -4984,6 +4991,7 @@ static int offlineResidentMain(const OfflineArgs& base)
             g_a4kUp = false;
             g_a4kAA = false;
             g_acnUp = false;
+            g_rgUp = false;
             g_xessUp = false;
             g_xessFg = false;
             g_restore = false;

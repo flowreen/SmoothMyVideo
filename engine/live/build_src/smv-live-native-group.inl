@@ -782,7 +782,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (!src)
             return false; // a source that failed before (its line is logged)
         int ps = (int)plane, rs = nr.pw;
-        const bool vsrNow = nr.vsr && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp || nr.a4kUp || nr.acnUp);
+        const bool vsrNow = nr.vsr && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp || nr.planarUp());
         if (!vsrNow && !nr.fitAa && !nr.uw)
             return plainPack(src, slot, what, half);
         if (!vsrNow && nr.fitAa && !nr.uw)
@@ -792,10 +792,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
         float* stage = nr.uw ? nr.dUp : nr.dPres;
         bool haveVsr = false;
-        if (vsrNow && (nr.a4kUp || nr.acnUp))
+        if (vsrNow && nr.planarUp())
         {
-            // Anime4K / ArtCNN: the model frame (HDR planes: its SDR view, as RTX VSR reads it) through its x2 net and
-            // the Lanczos pair into the stage; HDR planes come back to the codes in RTX VSR's block below
+            // Anime4K / ArtCNN / Real-ESRGAN: the model frame (HDR planes: its SDR view, as RTX VSR reads it) through
+            // its net and the Lanczos pair into the stage; HDR planes come back to the codes in RTX VSR's block below
             const void* a4kSrc = src;
             int aHalf = half, aps = ps, ars = rs;
             if (nr.hdr)
@@ -804,14 +804,13 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 ars = nr.w;
                 if (!nativeHdrEnc(nr, src, half, ps, rs, nr.w, nr.h, nr.dVsrView, 0, aps, ars, 1, 1.0f, 0.0f))
                 {
-                    nr.die(nr.acnUp ? "ArtCNN SDR view launch failed" : "Anime4K SDR view launch failed");
+                    nr.die((std::string(planarUpName(nr)) + " SDR view launch failed").c_str());
                     return false;
                 }
                 a4kSrc = nr.dVsrView;
                 aHalf = 0;
             }
-            if (!(nr.acnUp ? nativeAcnRun(nr, a4kSrc, aHalf, aps, ars, stage, tw, th)
-                           : nativeA4kRun(nr, a4kSrc, aHalf, aps, ars, stage, tw, th)))
+            if (!nativePlanarUpRun(nr, a4kSrc, aHalf, aps, ars, stage, tw, th))
                 return false;
             haveVsr = true;
         }
@@ -881,7 +880,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                     return fitPack(src, ps, rs, nr.w, nr.h, slot, what, half);
             }
         }
-        if (haveVsr && !nr.uw && !nr.hdr && !nr.a4kUp && !nr.acnUp)
+        if (haveVsr && !nr.uw && !nr.hdr && !nr.planarUp())
         {
             // the bridge output is the presented frame: into the content rect, RTX VSR's R, G, B, A as the slot's
             // B, G, R, A in one pass; AMD FSR upscaling's buffer already holds the slot's order
@@ -918,7 +917,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         else if (haveVsr)
         {
             void* a[] = {&nr.dVsrOut, (void*)&tw, (void*)&th, &stage};
-            if (!nr.a4kUp && !nr.acnUp && // Anime4K / ArtCNN wrote the stage itself
+            if (!nr.planarUp() && // Anime4K / ArtCNN / Real-ESRGAN wrote the stage itself
                 cuLaunchKernel(nr.fsrUp ? nr.fUnpackBgraRgb : nr.fUnpackRgba, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16,
                                1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
             {

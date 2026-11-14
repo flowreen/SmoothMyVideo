@@ -81,6 +81,7 @@ function startRun() {
   const useFsrUp = factor > 1 && fsrUpOn(); // AMD FSR 4 instead of RTX VSR when ticked
   const useA4kUp = factor > 1 && a4kUpOn(); // Anime4K the same way
   const useAcnUp = factor > 1 && acnUpOn(); // ArtCNN the same way
+  const useRgUp = factor > 1 && rgUpOn(); // Real-ESRGAN the same way
   const useXessUp = factor > 1 && xessUpOn(); // Intel XeSS the same way
   const rtxhdr = hdrOn(); // HDR only when its runtime is installed and the source is SDR
   // Interpolation is the main effect; with it off the run still has work if sharpening, upscaling or
@@ -155,6 +156,7 @@ function startRun() {
   $('a4kup').disabled = true;
   $('a4kaa').disabled = true;
   $('acnup').disabled = true;
+  $('rgup').disabled = true;
   $('xessup').disabled = true;
   $('gpufit').disabled = true;
   $('rtxhdr').disabled = true;
@@ -239,6 +241,7 @@ function startRun() {
   if (useA4kUp) payload.anime4k = true; // Anime4K upscaling (inside the host)
   if (useA4kUp && a4kAaOn()) payload.a4kaa = true; // its Mode A+A
   if (useAcnUp) payload.artcnn = true; // ArtCNN upscaling (engine/artcnn)
+  if (useRgUp) payload.realesrgan = true; // Real-ESRGAN upscaling (Restore's engine/realesrgan)
   if (useXessUp) payload.xess = true; // Intel XeSS upscaling (engine/xess)
   if (rtxhdr) {
     payload.rtxhdr = true; // HDR10 at the Peak box's nits or the app window's display's
