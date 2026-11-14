@@ -622,10 +622,9 @@ static bool nativeAcnSetup(NativeRife& nr, int w, int h, int ow, int oh, int upE
         sprintf_s(passes, " in %d x2 passes", n);
     if (nr.acnCore)
         sprintf_s(tiles, ", %d-px tiles", nr.acnCore);
-    LOG("native: %s upscale: ArtCNN C4F32_DN %dx%d -> %dx%d%s -> Lanczos %dx%d%s%s%s (CUDA passes, tensor-core layers "
+    LOG("native: %s upscale: ArtCNN C4F32_DN %dx%d -> %dx%d%s -> Lanczos %dx%d%s%s (CUDA passes, tensor-core layers "
         "with fp16 sums, %.1fs)\n",
         g_offline ? "offline" : "live", w, h, w << n, h << n, passes, ow, oh, tiles,
-        nr.vsrPre ? ", the captured frame before the model" : "",
         nr.hdr ? ", on the HDR planes' SDR view" : (upEnc ? ", on the HDR video's SDR view" : ""),
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return true;

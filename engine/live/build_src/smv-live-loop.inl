@@ -2218,17 +2218,18 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 genFrames, genFrames + 1);
         }
 
-        // DLSS 4.5 AT THE WORKING SIZE (SMV_DLSSG_AT_WORK=0 = off): below DLAA with no upscaler picked (RTX VSR, AMD FSR
-        // 4, Anime4K and Upscale to make their frames at the presented size), DLSS-G runs at the working size itself
-        // (never more pixels than the share picked), which liveWorkSize then keeps at least kDlssgMinWork on the
+        // DLSS 4.5 AT THE WORKING SIZE (SMV_DLSSG_AT_WORK=0 = off): every model interpolates before any upscale, so
+        // whenever the working size is below the presented one (a share below DLAA, or the capture's cap under Fill /
+        // Upscale to) DLSS-G runs at the working size itself, which liveWorkSize keeps at least kDlssgMinWork on the
         // canvas's shorter side, so the capture is shrunk once, straight to it; every DLSS-G pass of a plan runs at
         // that size and the session enlarges every frame, real or generated, to the presented size with the native
-        // fit's Lanczos (Host::lzOn): the order RIFE's tweens take. The frames shown while no plan presents are
+        // fit's Lanczos (Host::lzOn): the order RIFE's tweens take. A picked upscaler (RTX VSR, AMD FSR 4, Intel
+        // XeSS-SR, Anime4K, ArtCNN) or Upscale to's own size does not apply under Live DLSS 4.5: its frames are
+        // enlarged by that Lanczos (one fit at ~1000 presents a second). The frames shown while no plan presents are
         // enlarged the same way
         g_presW = g_presH = 0;
         g_dlssgWorkFloor = false;
-        if (g_fgOver && !g_rtxVsr && !g_fsrUp && !g_a4kUp && !g_acnUp && !g_xessUp && g_upscaleH <= 0 &&
-            lkEnv("SMV_DLSSG_AT_WORK") != "0")
+        if (g_fgOver && lkEnv("SMV_DLSSG_AT_WORK") != "0")
         {
             g_dlssgWorkFloor = true;
             int pw = 0, ph = 0, md = 0, mw = 0, mh = 0, raised = 0;
@@ -2248,9 +2249,31 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 host.lzOn = lkEnv("SMV_DLSSG_STRETCH") != "1";
                 LOG("DLSS 4.5 at the working size: its frames %ux%u (the %dx%d working size%s), %s the %ux%u "
                     "presented%s\n",
-                    sw, sh, mw, mh, raised == 3 ? ", raised to DLSS 4.5's minimum, 128 px a side" : "",
+                    sw, sh, mw, mh,
+                    raised == 3   ? ", raised to DLSS 4.5's minimum, 128 px a side"
+                    : raised == 4 ? ", capped at the capture"
+                                  : "",
                     host.lzOn ? "enlarged to" : "stretched over", W, H,
                     host.lzOn ? " by the native fit's Lanczos" : " (SMV_DLSSG_STRETCH=1)");
+                // a picked upscaler or Upscale to's size has no enlarge left on the echo route (its canvas is now the
+                // working size): off for this session, named, so it neither sets up nor enlarges and shrinks back
+                std::string off;
+                for (const auto& [on, name] : {std::pair<bool, const char*>{g_rtxVsr, "RTX VSR"},
+                                               {g_fsrUp, "AMD FSR upscaling"},
+                                               {g_xessUp, "Intel XeSS upscaling"},
+                                               {g_a4kUp, "Anime4K"},
+                                               {g_acnUp, "ArtCNN"},
+                                               {g_upscaleH > 0, "Upscale to"}})
+                    if (on)
+                        off += (off.empty() ? "" : ", ") + std::string(name);
+                if (!off.empty())
+                {
+                    LOG("DLSS 4.5 at the working size: %s not applied under Live DLSS 4.5 (every frame enlarged by the "
+                        "native fit's Lanczos)\n",
+                        off.c_str());
+                    g_rtxVsr = g_fsrUp = g_xessUp = g_a4kUp = g_acnUp = false;
+                    g_upscaleH = 0;
+                }
                 g_presW = W;
                 g_presH = H;
                 host.winW = W;

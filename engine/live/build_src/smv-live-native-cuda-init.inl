@@ -157,65 +157,35 @@ static bool nativeRtxInit(NativeRife& nr)
     // the fit rect; VSR and the aa rule read that target
     const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
     const int sw = srcW(nr), sh = srcH(nr);
-    // the resize RTX VSR runs (vw x vh -> vtw x vth): the first one; offline with a working size there
-    // are two, the pre-model one (the decoded frame to the working size) and the final one (the
-    // working size to the output): VSR is ONE bridge instance, so it takes the final one when that
-    // enlarges, else the pre-model one, and the other is Lanczos. Live has the same two: the capture
-    // to the working size before the model, and the fit after it
-    int vw = g_offline ? sw : nr.w, vh = g_offline ? sh : nr.h, vtw = tw, vth = th;
-    nr.vsrPre = false;
-    if (!g_offline && nr.vsrWant && !(tw > nr.w && th > nr.h) && nr.w > nr.cw && nr.h > nr.ch)
-    {
-        nr.vsrPre = true;
-        vw = nr.cw;
-        vh = nr.ch;
-        vtw = nr.w;
-        vth = nr.h;
-    }
+    // the resize the picked upscaler runs (vw x vh -> vtw x vth): every model interpolates before any upscale, so it is
+    // the resize after the model, never the one before it. Offline with a working size there are two, the pre-model
+    // one (the decoded frame to the working size: a shrink, or Lanczos up to a model's minimum size for a source below
+    // it) and the final one (the working size to the output), which the upscaler takes when it enlarges; live the fit
+    // after the model (the capture -> working-size resize before the model is the same Lanczos). With RTX HDR the
+    // frames there are PQ, which the upscaler reads the way it reads HDR video (RTX VSR the SDR view and the light
+    // above white back from the Lanczos fit, AMD FSR upscaling its HDR mode)
+    const int vw = nr.w, vh = nr.h, vtw = tw, vth = th;
     if (g_offline && nr.nvPre)
-    {
-        // with RTX HDR the frames after the model are PQ and RTX VSR takes SDR only (NVIDIA: TrueHDR after
-        // VSR), so VSR can only take the pre-model resize
-        nr.vsrPost = nr.dw > nr.w && nr.dh > nr.h && !nr.rtxHdr;
-        if (nr.vsrWant && nr.rtxHdr && nr.dw > nr.w && nr.dh > nr.h)
-            LOG("native: %s takes SDR only and RTX HDR runs before the model: the resize after it is Lanczos\n",
-                nr.fsrUp   ? (nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling")
-                : nr.a4kUp ? "Anime4K"
-                : nr.acnUp ? "ArtCNN"
-                           : "RTX VSR");
-        if (nr.vsrPost)
-        {
-            vw = nr.w;
-            vh = nr.h;
-        }
-        else
-        {
-            vtw = nr.w;
-            vth = nr.h;
-        }
-    }
+        nr.vsrPost = nr.dw > nr.w && nr.dh > nr.h;
     if (nr.vsrWant)
     {
         const char* up = nr.fsrUp   ? (nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling")
                          : nr.a4kUp ? "Anime4K"
                          : nr.acnUp ? "ArtCNN"
                                     : "RTX VSR";
-        if (g_offline && !nr.nvPre && nr.rtxHdr)
-            LOG("native: %s skipped (it takes SDR only, and the one resize follows RTX HDR and the model), Lanczos\n",
-                up);
-        else if (vtw > vw && vth > vh)
+        if (vtw > vw && vth > vh)
             nr.vsr = true;
         else
-            LOG("native: live %s skipped (upscales only; this resize does not enlarge), Lanczos\n", up);
+            LOG("native: %s %s skipped (upscales only; this resize does not enlarge), Lanczos\n",
+                g_offline ? "offline" : "live", up);
     }
     nr.fsrUp = nr.fsrUp && nr.vsr;
     nr.a4kUp = nr.a4kUp && nr.vsr;
     nr.acnUp = nr.acnUp && nr.vsr;
-    nr.vsrPre = nr.vsrPre && nr.vsr;
-    // offline HDR video (--src-hdr): the upscaler's frames are the source's PQ / HLG codes at either stage (RTX HDR,
-    // which would make them PQ after the model, keeps the upscaler off that resize), so RTX VSR reads their SDR view
-    // and AMD FSR upscaling runs in its HDR mode, as live does on HDR planes
-    const int upEnc = g_offline ? nr.encPre : 0;
+    // offline HDR planes at the upscaler's resize (the final one, after the model): HDR video's PQ / HLG codes, or RTX
+    // HDR's PQ (its TrueHDR runs before the model), so RTX VSR reads their SDR view and AMD FSR upscaling runs in its
+    // HDR mode, as live does on HDR planes
+    const int upEnc = g_offline ? nr.encPost : 0;
     if (nr.uw)
     {
         NCHK(cudaMalloc((void**)&nr.dUp, (size_t)3 * nr.uw * nr.uh * sizeof(float)), "alloc internal render frame");
@@ -234,18 +204,12 @@ static bool nativeRtxInit(NativeRife& nr)
         LOG("native: fit: %dx%d -> %dx%d, Lanczos (%s)\n", nr.uw ? nr.uw : nr.w, fh, nr.dw, nr.dh,
             nr.dh < fh ? "downscale" : "upscale");
     }
-    // a resize stage's staging frame (nativeOfflineStage): Restore after the model, or RTX VSR before it (the
-    // working-size frame, from the capture's planes) or after it on HDR planes (VSR's way back to the codes), and live
-    // Anime4K / ArtCNN after the model without Upscale to (their nets write planes, the slot's store reads them back);
-    // live's other stores never stage (RTX VSR straight into the slot, the Lanczos fit fused into the store, Upscale
-    // to through dUp), offline's emit allocates its own
-    if ((nr.restore && !nr.restPre) || nr.vsrPre || (nr.vsr && nr.hdr) ||
-        (!g_offline && nr.vsr && (nr.a4kUp || nr.acnUp) && !nr.uw))
-        NCHK(cudaMalloc((void**)&nr.dPres,
-                        (size_t)3 * (std::max)(nr.dw * nr.dh, nr.vsrPre ? nr.w * nr.h : 0) * sizeof(float)),
-             "alloc fit staging");
-    if (nr.vsrPre && !nr.dCapF)
-        NCHK(cudaMalloc((void**)&nr.dCapF, (size_t)3 * nr.ch * nr.cw * sizeof(float)), "alloc capture planes");
+    // a resize stage's staging frame (nativeOfflineStage): Restore, or RTX VSR after the model on HDR planes (VSR's
+    // way back to the codes), and live Anime4K / ArtCNN after the model without Upscale to (their nets write planes,
+    // the slot's store reads them back); live's other stores never stage (RTX VSR straight into the slot, the Lanczos
+    // fit fused into the store, Upscale to through dUp), offline's emit allocates its own
+    if ((nr.restore && !nr.restPre) || (nr.vsr && nr.hdr) || (!g_offline && nr.vsr && (nr.a4kUp || nr.acnUp) && !nr.uw))
+        NCHK(cudaMalloc((void**)&nr.dPres, (size_t)3 * nr.dw * nr.dh * sizeof(float)), "alloc fit staging");
     if (nr.sharpen > 0.0f)
         NCHK(cudaMalloc((void**)&nr.dShOut, (size_t)3 * nr.w * nr.h * sizeof(float)), "alloc after-DLSS 5 output");
     if (nr.sharpen > 0.0f && nr.encPost && nr.shHdrView)
@@ -261,14 +225,13 @@ static bool nativeRtxInit(NativeRife& nr)
                       "outside the view is added back"
                     : "the sharpen on the PQ / HLG codes (SMV_HDR_SHARPEN_VIEW=0)");
     }
-    // Restore's fold target. Offline with a
-    // working size, and live, Restore runs before the model: the target is the working / model size,
-    // or the source (the capture live) when VSR runs the pre-model resize right after it. Offline without a
-    // working size restores the model output: back to its size when VSR follows (so VSR sees the
-    // restored frame), else the first resize target directly (restore-as-upscaler, one resize)
+    // Restore's fold target. Offline with a working size, and live, Restore runs before the model: the target is the
+    // working / model size. Offline without a working size (the host's command line alone: the app always sends one
+    // with Restore) restores the model output: back to its size when VSR follows (so VSR sees the restored frame),
+    // else the first resize target directly (one resize)
     if (nr.restore)
     {
-        const bool vsrAfter = nr.vsr && (g_offline ? !nr.vsrPost : nr.vsrPre);
+        const bool vsrAfter = nr.vsr && g_offline && !nr.nvPre;
         const bool toModel = (g_offline && nr.nvPre) || nr.restPre;
         nr.restTw = vsrAfter ? sw : (toModel ? nr.w : tw);
         nr.restTh = vsrAfter ? sh : (toModel ? nr.h : th);
@@ -397,9 +360,9 @@ static bool nativeRtxInit(NativeRife& nr)
         g_rtxb.vsrMade = rtxVsrNow;
         g_rtxUsed = true; // resident host: NGX is single-instance per process, end it after this session
     }
-    // AMD FSR upscaling on HDR planes runs in the bridge's HDR mode (linear light); with RTX HDR on, the frame before
-    // the model is the SDR planes (NVIDIA's order: the upscale, then TrueHDR), the SDR mode
-    nr.fuHdr = nr.fsrUp && (g_offline ? upEnc != 0 : nr.hdr && !(nr.vsrPre && nr.rtxHdr));
+    // AMD FSR upscaling on HDR planes runs in the bridge's HDR mode (linear light): after the model the frames are HDR
+    // video's codes or RTX HDR's PQ
+    nr.fuHdr = nr.fsrUp && (g_offline ? upEnc != 0 : nr.hdr);
     if (nr.fsrUp && !nativeFsrupSetup(nr, vw, vh, vtw, vth))
         return false;
     if ((nr.a4kUp || nr.acnUp) && nr.upHold)
@@ -432,8 +395,7 @@ static bool nativeRtxInit(NativeRife& nr)
             return false;
         }
         NCHK(cudaDeviceSynchronize(), "VSR warm-up eval sync");
-        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d%s%s\n", vw, vh, vtw, vth,
-            nr.vsrPre ? ", the captured frame before the model" : "",
+        LOG("native: live upscale: RTX VSR %dx%d -> %dx%d%s\n", vw, vh, vtw, vth,
             nr.hdr ? ", on the HDR planes' SDR view" : (upEnc ? ", on the HDR video's SDR view" : ""));
     }
     if (nr.rtxHdr)

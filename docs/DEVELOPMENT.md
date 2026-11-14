@@ -141,7 +141,7 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
   RTX HDR (2.7 dB) and an enlarged working size (5 to 8 dB), and a sharpened picture keeps its
   flow; `SMV_RIFE_TWO_DOMAIN=0` runs the IFNet on the pictures as before. Live RIFE does the
   same: the motion frame is the finished picture at the working size, or at the
-  capture size when the working size enlarges it (Fill at DLAA), the HDR desktop's PQ read as SDR
+  capture size when the working size enlarges it (a capture below a model's minimum), the HDR desktop's PQ read as SDR
   sRGB over the desktop's SDR white (with RTX HDR: the SDR picture before TrueHDR), so the live
   IFNet and encode run at the motion frame's size (`mph` / `mpw` / `motw` / `moth`
   on the LIVE READY line). RIFE (DRBA) does the same on both routes: its ring keeps each frame's
@@ -480,16 +480,17 @@ Passes, in this order (both modes): on each source or captured frame Restore, th
 resize to the working size (the DLSS mode's share of the output, live of the presented size), DLSS 5,
 Adaptive Sharpen and RTX TrueHDR (SDR to HDR10); then the interpolation at the working size on those
 finished frames, so frame generation comes last and the generated frames inherit the sharpen and the
-HDR; then on every output or presented frame the final resize. RTX VSR takes SDR only, so offline with
-RTX HDR on it can take only the resize before the model and the one after it is Lanczos (a log line
-says so). Live on HDR planes it reads the frame's SDR view and comes back through the sRGB EOTF, a
-frame with light outside the view adding it from the frame's Lanczos fit, Restore's way back
+HDR; then on every output or presented frame the final resize, the only enlarge: every model interpolates before
+any upscale, so the picked upscaler (RTX VSR, AMD FSR 4, Intel XeSS-SR, ArtCNN, Anime4K) runs there and the resize
+before the model only shrinks (or reaches a model's minimum size for a source below it, Lanczos). RTX VSR takes SDR
+only: on HDR planes (HDR video, or RTX HDR's PQ after the model) it reads the frame's SDR view and comes back through
+the sRGB EOTF, a frame with light outside the view adding it from the frame's Lanczos fit, Restore's way back
 (`SMV_VSR_HDR=0` = Lanczos there). AMD FSR 4 upscaling takes HDR itself: on HDR planes the bridge runs in its HDR
 mode, the frame handed over as linear light (FP16, SDR white at 1.0, FSR's high dynamic range flag) and taken back to
-the codes, highlights included (`SMV_FSRUP_HDR=0` = Lanczos there); with RTX HDR on and the resize before the model it
-takes the SDR planes, the upscale then TrueHDR. The order follows NVIDIA's documents: DLSS Frame Generation generates from the finished,
-tone-mapped (HDR-encoded) image, the RTX Video SDK runs TrueHDR after VSR, and sharpening is
-post-processing after the upscaler (NIS).
+the codes, highlights included (`SMV_FSRUP_HDR=0` = Lanczos there). The order follows NVIDIA's documents where they
+reach: DLSS Frame Generation generates from the finished, tone-mapped (HDR-encoded) image, and sharpening is
+post-processing; the RTX Video SDK runs TrueHDR after VSR, while here TrueHDR runs once a real frame before the model
+and the upscaler after it, on TrueHDR's output.
 
 On HDR planes the resize to the working size (live the capture, offline the decoded frame) and
 Restore's reference at a size change test each source frame against the SDR range (`k_hdrRange`,
@@ -518,18 +519,21 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   (the GUI's Live slider offers 1..100 % in 1 % steps: on a mode's rounded share, 100 / 67 / 58 / 50
   / 33, it sends that mode, anywhere else that share, which the dropdown shows as a hidden, unpickable
   `Custom (N%)` entry; main-render.ts `dlssScaleArg`). `plan.ts` `workPlan` computes it once (even, at least 64,
-  capped at 3840x2160 keeping the aspect: the interpolation's reach) and prints `DLSS mode ...:
-  working size WxH for the WxH output`. A working size below the source folds the downscale into
+  never above the source on either axis, the output's aspect kept: every model interpolates before any upscale, so
+  an upscaled output is enlarged after the model, and a pipeline minimum is the one enlarge before it; capped at
+  3840x2160 keeping the aspect: the interpolation's reach) and prints `DLSS mode ...: working size WxH for the WxH
+  output` (`, capped at the source: the enlarge runs after the model` when the source capped it). Live's working
+  size takes the same cap at the captured size. A working size below the source folds the downscale into
   the decode (`zscale` Lanczos at radius 7 on the decoded RGB, in the source's own transfer: through
   SMV's enlarge back it measured 1.5 to 1.7 dB above the same shrink in linear light at radius 3, 4 or 6
   on average, and above linear Lanczos3 on every one of the universal test's 44 cells); otherwise the
   host gets `--work-w W --work-h H` (sent
   when it differs from the decode or with Restore): it packs each decoded frame at its own size,
-  runs Restore and the resize to the working size on it (RTX VSR or Lanczos, or Restore's own
+  runs Restore and the resize to the working size on it (Lanczos, or Restore's own
   fold), pads the result into the model frame, runs DLSS 5 and the model there (every model buffer,
   engine and the DLSS 5 host follow the working size), and the emit's final resize takes each
-  output frame to the output size. RTX VSR is ONE bridge instance, so it takes the final resize when
-  that enlarges, else the pre-model one; the other enlarging resize is Lanczos. Every resize the
+  output frame to the output size. The picked upscaler takes the final resize when it enlarges in both
+  axes, else it is skipped with a line and Lanczos runs; it never runs before the model. Every resize the
   host does itself is Lanczos placed the way zimg places it (a shrinking axis widens the filter by
   the ratio, mirrored edges, normalised taps), per axis radius 4 where it enlarges or keeps the size and 7
   where it shrinks (`kLzUp` / `kLzDown` in the kernel text: the universal resizer test's picks, the best no-sharpen
@@ -1111,13 +1115,14 @@ How the server route works:
   share of the PRESENTED rect (the capture aspect-fit into the overlay: the window itself, or the Fill
   rect), even, at least 64 px and at most the presented rect a side, capped at 3840x2160 keeping the
   aspect; DLAA = the presented rect
-  (window mode: the capture, odd sizes kept). Restore, the resize to it (Lanczos either way; Fill at
-  DLAA enlarges here), DLSS 5, Sharpen, RTX HDR and the model run at it, the fit takes it to the whole
+  (window mode: the capture, odd sizes kept); never above the capture on either axis (every model interpolates
+  before any upscale: Fill at DLAA on a smaller window runs at the capture and the fit enlarges after the model),
+  a capture below a model's minimum enlarged to it. Restore, the resize to it (Lanczos), DLSS 5, Sharpen, RTX HDR
+  and the model run at it, the fit takes it to the whole
   presented rect (each axis on its own: the even rounding can miss the aspect by under 1 %);
-  echo follows it too. RTX VSR takes ONE resize: the fit when it enlarges, else the capture to the
-  working size before the model (offline's pre-model stage, Restore folded back to the capture size
-  first); `native: live working size WxH = DLSS mode M of the WxH presented, capture WxH` names it. A
-  changed mode restarts the session.
+  echo follows it too. The picked upscaler runs the fit when it enlarges in both axes, else Lanczos;
+  `native: live working size WxH = DLSS mode M of the WxH presented, capture WxH` names it (followed by ` (capped
+  at the capture: the fit enlarges after the model)` when the capture set it). A changed mode restarts the session.
 * GUI: every interpolation checkbox works live (DRBA as `rifedrba`, Smooth Motion
   as `fruc`); nothing falls back silently any more.
 
@@ -1645,7 +1650,7 @@ resize buffers set up again with the A+A sizes at the session's geometry (`nativ
 short = Mode A with its reason); while Anime4K is not set up the value is held for its start in place. Restore in a
 session that started without it starts in place (`nativeRestoreSwitch`): `restoremodel` (AnimeJaNai's file, a path,
 sent before `restore 2`; held for Restore's start, a running AnimeJaNai keeps the file it loaded), then `restore N`
-runs the checks first (the route, an upscaler before the model, the kind's weights or file, an earlier start in place
+runs the checks first (the route, the kind's weights or file, an earlier start in place
 that failed), the room check for Restore's frames and the kind's buffers (the activations go into the shared GMFSS
 block when it holds them), and the kind's setup and warm-up as the session start runs them, with the capture as
 Restore's source and the model size as its fold target. A key the session cannot take logs `(the next session takes it: why)`; the next spawn carries the new value either way.
@@ -1997,7 +2002,7 @@ named here, and on a name here that no source holds.
 | `SMV_NVENC_LEVEL=0` | NVENC without the lookahead level, the call a device without the level gets (HEVC CQ 17, AV1 CQ 22), for an A/B |
 | `SMV_ENC_LOSSLESS=1` | NVENC constant QP 0 lossless instead of the quality ladder, for measurement runs that need the rendered pixels back out of the file (the shipped CQ 17 VBR + AQ encode reconstructs two identical input frames a few levels apart) |
 | `SMV_DLSSG_LIMIT=N` | the most DLSS 4.5 makes in one pass (2..6) instead of the GPU's measured limit (`dlssg_limit.json`; Live: what NGX reports + 1): `2` renders and runs Live with an RTX 40's passes on an RTX 50 (the cascade's trigger test) |
-| `SMV_DLSSG_AT_WORK=0` | Live DLSS 4.5 never runs at the working size: below DLAA it generates at the presented size (A/B) |
+| `SMV_DLSSG_AT_WORK=0` | Live DLSS 4.5 never runs at the working size: below DLAA, or on a capture smaller than the presented rect (Fill), it generates at the presented size from the enlarged frames (A/B) |
 | `SMV_DLSSG_STRETCH=1` | Live DLSS 4.5 at the working size: DXGI's bilinear stretch of a swap chain at the frames' size instead of the session's own enlarge (the look A/B) |
 | `SMV_DLSSG_LZ_TAB=cpu` | that enlarge's tap tables from the CPU port instead of the native table kernel (the A/B of the two) |
 | `SMV_DLSSG_LZ_PIPE=0` | that enlarge waits for the GPU after every present instead of leaving frames in flight |
@@ -2428,8 +2433,7 @@ shared fence as NT handles; `fsrup_frame(wait, signal, reset, frameTimeMs)`: the
 sharpening off), copies the result out and signals; `fsrup_destroy`, `fsrup_last_error`. The host feeds it RTX VSR's
 BGRA8 buffers through two byte-swap kernels (on HDR planes one pass, `k_fsrHdrPack`, writes both the SDR view the
 vectors read and the frame in linear light for the bridge from one read of the planes; the result comes back to the
-PQ codes through `k_fsrHdrOut`; the live pre-model call, whose stored view Restore reads first, keeps `k_fsrHdrIn` on
-the frame) and computes the vectors with the FSR FG route's Optical Flow session.
+PQ codes through `k_fsrHdrOut`) and computes the vectors with the FSR FG route's Optical Flow session.
 
 ### DLSS 4.5 Frame Generation host (`dlssg2f.exe`)
 

@@ -682,12 +682,10 @@ static void nativeFree(NativeRife& nr)
             nr.thdrMaxMs, (unsigned long long)nr.thdrN);
     if (nr.vsrN && nr.vsrAsync)
         LOG("native: RTX VSR eval ordered by events over %llu %s frames (SMV_VSR_SYNC=1 times each call)\n",
-            (unsigned long long)nr.vsrN,
-            g_offline ? (nr.nvPre && !nr.vsrPost ? "decoded" : "output") : (nr.vsrPre ? "captured" : "presented"));
+            (unsigned long long)nr.vsrN, g_offline ? "output" : "presented");
     else if (nr.vsrN)
         LOG("native: RTX VSR eval %.2f ms mean, %.2f ms max, over %llu %s frames\n", nr.vsrMs / (double)nr.vsrN,
-            nr.vsrMaxMs, (unsigned long long)nr.vsrN,
-            g_offline ? (nr.nvPre && !nr.vsrPost ? "decoded" : "output") : (nr.vsrPre ? "captured" : "presented"));
+            nr.vsrMaxMs, (unsigned long long)nr.vsrN, g_offline ? "output" : "presented");
     if (nr.liveNr)
         LOG("native: live DLSS 5 %.2f ms mean, %.2f ms max over %llu captured frames (host submit, zero-copy), "
             "its last output reused on %llu identical captures\n",

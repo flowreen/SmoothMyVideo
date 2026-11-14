@@ -215,7 +215,8 @@ static const int kDlssgMinWork = 128;
 // the canvas W x H: the window itself, or the Fill rect), even, at most the presented rect a side, the share raised
 // (aspect kept) to the largest minimum of the session's pipeline, so the capture is shrunk once and never below what a
 // model needs: the shorter side 64 px, with DLSS 5 the width kNrMinWorkW, with DLSS 4.5 at the working size the
-// canvas's shorter side kDlssgMinWork (*raised: 1 = the 64 px floor, 2 = DLSS 5's width, 3 = DLSS 4.5's minimum);
+// canvas's shorter side kDlssgMinWork (*raised: 1 = the 64 px floor, 2 = DLSS 5's width, 3 = DLSS 4.5's minimum,
+// 4 = liveWorkSize's cap at the capture);
 // capped at 3840x2160 keeping the aspect (offline's workPlan). DLAA = the presented rect itself (in window
 // mode the capture, odd sizes kept). liveWorkSizeFor = the size a mode gives the presented presW x presH (mode = 1 +
 // the kDlssModeName index, 0 = --scale's share; fDg = DLSS 4.5's minimum share, 0 = none); liveWorkSize = the
@@ -261,6 +262,30 @@ static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int&
     mode = g_dlssMode;
     liveWorkSizeFor(mode, presW, presH, mw, mh, raised,
                     g_dlssgWorkFloor ? (double)kDlssgMinWork / (std::min)(outW, outH) : 0.0);
+    // every model interpolates before any upscale: the working size never exceeds the capture on either axis (the fit
+    // after the model enlarges), the presented rect's aspect kept; a side the cap lands on exactly keeps the capture's
+    // own length. The pipeline's minimums stay the floor: a capture below one is enlarged to it, the one enlarge before
+    // a model
+    if (mw > 0 && mh > 0 && cw > 0 && ch > 0)
+    {
+        const double kMin = (std::max)({64.0 / mw, 64.0 / mh, g_dlssnr ? (double)kNrMinWorkW / mw : 0.0,
+                                        g_dlssgWorkFloor ? (double)kDlssgMinWork / (std::min)(mw, mh) : 0.0});
+        const double kCw = (double)cw / mw, kCh = (double)ch / mh;
+        const double kSrc = (std::max)((std::min)({1.0, kCw, kCh}), (std::min)(1.0, kMin));
+        if (kSrc < 1.0)
+        {
+            mw = kCw == kSrc ? cw : lkRound(mw * kSrc) & ~1;
+            mh = kCh == kSrc ? ch : lkRound(mh * kSrc) & ~1;
+            // a side within one even step under the capture keeps the capture's length: the fit takes the sub-pixel
+            // aspect, never a resample of the capture before the model
+            if (mw >= cw - 2 && mw < cw)
+                mw = cw;
+            if (mh >= ch - 2 && mh < ch)
+                mh = ch;
+            if (raised && kSrc == (std::min)({1.0, kCw, kCh}))
+                *raised = 4; // the capture set it, not a floor
+        }
+    }
 }
 
 // The model cache sits in the app's top folder: the repo root in a dev tree, the folder holding
@@ -347,8 +372,9 @@ static bool lkSession(const std::wstring& script, const std::wstring& backendW, 
     s.ipw = s.pw;
     // RIFE's two domains live (rife / rifedrba): the IFNet, its encode and DRBA's block0 find
     // the motion on the finished picture at the working size, or at the capture size when the working
-    // size enlarges it (Fill at DLAA: an enlarged picture costs RIFE its motion); the warp + blend runs
-    // on the pictures at the working size. SMV_RIFE_TWO_DOMAIN=0: the IFNet reads the pictures.
+    // size enlarges it (only a capture below the pipeline's minimum, liveWorkSize: an enlarged picture costs RIFE its
+    // motion); the warp + blend runs on the pictures at the working size. SMV_RIFE_TWO_DOMAIN=0: the IFNet reads the
+    // pictures.
     if (!g_offline && (s.backend == "rife" || s.drba) && lkEnv("SMV_RIFE_TWO_DOMAIN") != "0")
     {
         const bool up = s.mw > s.cw || s.mh > s.ch;

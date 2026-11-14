@@ -168,18 +168,19 @@ $('restorea4k').addEventListener('change', () => {
   } catch {}
 });
 
-// The pass order in both modes: on each source or captured frame Restore and the resize to the
-// working size (the DLSS mode), DLSS 5, Sharpen and RTX HDR (with the Dolby Vision and HDR10+ metadata of
-// a file render), then the interpolation (frame generation last), then the final resize to the output.
-// The numbered panels follow it.
+// The pass order in both modes: on each source or captured frame Restore and the shrink to the
+// working size (the DLSS mode, never above the source), DLSS 5, Sharpen and RTX HDR (with the Dolby Vision and
+// HDR10+ metadata of a file render), then the interpolation (frame generation last), then the enlarge to the output
+// (the Upscale panel: the picked upscaler or Lanczos). Every model interpolates before any upscale. The numbered
+// panels follow it.
 function applyOrder() {
   $('nrpanel').before($('restorepanel'));
-  $('nrpanel').before($('uppanel'));
   $('nrpanel').after($('sharpenpanel'));
   $('sharpenpanel').after($('hdrpanel'));
   $('hdrpanel').after($('dvpanel'));
   $('dvpanel').after($('hppanel'));
   $('hppanel').after($('interppanel'));
+  $('interppanel').after($('uppanel'));
 }
 localStorage.removeItem('nvorderOn'); // retired: the pass order is no longer a setting
 applyOrder();
@@ -286,9 +287,10 @@ function syncUpscale() {
   refresh(); // the target height is tagged into the output filename
 }
 
-// DLSS mode, Live only (a file render runs every pass at its output size): Live's working size as NVIDIA's share of
-// what it presents (the window, or the screen in Fill), Restore, DLSS 5 and the smoothing run at it; the host applies
-// the floors (aspect kept, DLSS 5 >= 128 px wide). Persisted, DLAA by default.
+// DLSS mode, Live only (a file render runs every pass at the source size, or the output's when that is smaller): Live's
+// working size as NVIDIA's share of what it presents (the window, or the screen in Fill), Restore, DLSS 5 and the
+// smoothing run at it; the host applies the floors (aspect kept, DLSS 5 >= 128 px wide) and the cap at the captured
+// size. Persisted, DLAA by default.
 var dlssUiReady = false; // var: setMode runs before this block and must skip the sync
 // a mode's share in whole percent, as the option labels round it
 const DLSS_PCT = { dlaa: 100, quality: 67, balanced: 58, performance: 50, ultra: 33 };

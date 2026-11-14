@@ -814,8 +814,7 @@ struct NativeRife
     // model frame (no working size, and live)
     int sw = 0, sh = 0;
     bool nvPre = false;
-    bool vsrPost = false;       // RTX VSR runs the final resize (it enlarges), not the first
-    bool vsrPre = false;        // live: RTX VSR runs the capture -> working-size resize before the model, not the fit
+    bool vsrPost = false;       // offline: the final resize enlarges, the picked upscaler runs it
     bool restPre = false;       // live: Restore on the captured frame, folded to the model size, before the model
     float* dSrcPl = nullptr;    // the decoded frame, planar fp32 at sw x sh
     float* dPres = nullptr;     // a resize stage's staging frame, planar fp32 at dw x dh (nativeOfflineStage)

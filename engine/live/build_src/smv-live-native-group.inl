@@ -301,75 +301,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             return false;
         }
     }
-    // RTX VSR before the model (the working size above the capture while the fit after the model does not
-    // enlarge): the capture's planes through Restore (folded back to the capture size) and VSR to the working
-    // size, offline's pre-model stage. It replaces Restore and the resize below; after a VSR failure those
-    // run instead. VSR takes SDR: RTX HDR's SDR planes as they are (TrueHDR follows, NVIDIA's order), other HDR
-    // planes as their SDR view, back to the codes after it with the light the view never held.
+    // every model interpolates before any upscale: the picked upscaler runs after the model (storeSlot); before it the
+    // capture only goes through Restore or the Lanczos resize below
     bool restored = false;
     bool hdrIn = false; // this capture stayed inside the SDR range (the range test ran and said so)
-    if (!nrSame && nr.vsrPre && !nr.vsrFailed)
-    {
-        const int cps = nr.cw * nr.ch;
-        const bool viewHere = nr.hdr && !sdrPre;
-        if (viewHere)
-        {
-            void* a0[] = {&nr.dCap, &nr.cw, &nr.ch, &nr.dCapF};
-            if (cuLaunchKernel(nr.fPqPlanar, (nr.cw + 15) / 16, (nr.ch + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a0,
-                               nullptr) != CUDA_SUCCESS ||
-                !nativeHdrEnc(nr, nr.dCapF, 0, cps, nr.cw, nr.cw, nr.ch, nr.dVsrView, 0, cps, nr.cw, 1, 1.0f, 0.0f))
-            {
-                nr.die("capture SDR view (RTX VSR) launch failed");
-                return false;
-            }
-            int in = 0;
-            if (nr.dRsView && (in = nativeRsInRange(nr, nr.dCapF, cps, nr.cw, nr.cw, nr.ch, 1)) < 0)
-            {
-                nr.die("resize range test failed");
-                return false;
-            }
-            hdrIn = in == 1;
-        }
-        else if (!sdrPre)
-        {
-            void* ap[] = {&nr.dCap, &nr.cw, &nr.ch, &nr.dCapF, &nr.ch, &nr.cw, (void*)&cps};
-            if (cuLaunchKernel(nr.fPackInDirect, (nr.cw + 15) / 16, (nr.ch + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st,
-                               ap, nullptr) != CUDA_SUCCESS)
-            {
-                nr.die("capture planes (RTX VSR) launch failed");
-                return false;
-            }
-        }
-        const void* src = viewHere ? nr.dVsrView : (sdrPre ? nr.dSrcG : nr.dCapF);
-        int ps = cps, rs = nr.cw, half = 0;
-        bool staged = false;
-        if (!nativeOfflineStage(nr, src, ps, rs, half, staged, nr.cw, nr.ch, nr.w, nr.h, true, true, 0, false, nr.dCapF,
-                                0, cps, nr.cw))
-            return false;
-        if (staged)
-        {
-            const int wps = nr.w * nr.h;
-            // (AMD FSR upscaling on HDR planes staged the codes itself: k_fsrHdrOut; after a failure the view's fit)
-            if (viewHere && !(nr.fuHdr && !nr.vsrFailed) &&
-                (hdrIn ? !nativeHdrFromSdr(nr, nr.dPres, 0, wps, nr.w, nr.w, nr.h, nr.dPres, wps, nr.w, 1)
-                       : !nativeFitPlanar(nr, nr.dCapF, 0, cps, nr.cw, nr.cw, nr.ch, nr.dVsrRem, nr.w, nr.h, st) ||
-                             !nativeHdrRestOut(nr, nr.dPres, nr.w, nr.h, nr.dVsrRem, 0, wps, nr.w, nr.w, nr.h, 1)))
-            {
-                nr.die("capture HDR codes (RTX VSR) launch failed");
-                return false;
-            }
-            const float* from = nr.dPres;
-            int fps = wps, dps = (int)plane;
-            void* a[] = {&from, &fps, &nr.w, &nr.w, &nr.h, &dCur, &nr.pw, &nr.ph, &dps};
-            if (cuLaunchKernel(nr.fPadPlanar, (nr.pw + 15) / 16, (nr.ph + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
-                               nullptr) != CUDA_SUCCESS)
-            {
-                nr.die("padPlanar (RTX VSR) launch failed");
-                return false;
-            }
-            restored = true;
-        }
-    }
     // Restore: once per captured frame, on the capture itself (its SDR planes when
     // RTX HDR converts later), folded straight to the model size and into the model frame with the packers'
     // replicate pad, so every model reads restored frames; it replaces the resize below. When the
@@ -847,8 +782,7 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
         if (!src)
             return false; // a source that failed before (its line is logged)
         int ps = (int)plane, rs = nr.pw;
-        const bool vsrNow =
-            nr.vsr && !nr.vsrPre && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp || nr.a4kUp || nr.acnUp);
+        const bool vsrNow = nr.vsr && !nr.vsrFailed && (g_rtxb.created || nr.fsrUp || nr.a4kUp || nr.acnUp);
         if (!vsrNow && !nr.fitAa && !nr.uw)
             return plainPack(src, slot, what, half);
         if (!vsrNow && nr.fitAa && !nr.uw)

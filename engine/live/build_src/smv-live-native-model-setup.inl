@@ -83,7 +83,8 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
             sprintf_s(how, "%.2f", g_flowScale);
         LOG("native: live working size %dx%d = %s of the %dx%d presented, capture %dx%d%s\n", nr.w, nr.h, how, presW,
             presH, nr.cw, nr.ch,
-            raised == 3   ? " (raised to DLSS 4.5's minimum, 128 px a side, aspect kept)"
+            raised == 4   ? " (capped at the capture: the fit enlarges after the model)"
+            : raised == 3 ? " (raised to DLSS 4.5's minimum, 128 px a side, aspect kept)"
             : raised == 2 ? " (raised to DLSS 5's minimum width, 128 px, aspect kept)"
             : raised == 1 ? " (raised to the 64 px floor, aspect kept)"
                           : "");

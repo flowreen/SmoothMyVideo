@@ -4436,10 +4436,10 @@ static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upE
         sprintf_s(passes, " in %d x2 passes", n);
     if (aa)
         sprintf_s(aaNote, ", A+A (Restore CNN UL on the %dx%d frame)", 2 * w, 2 * h);
-    LOG("native: %s upscale: Anime4K Upscale CNN x2 UL %dx%d -> %dx%d%s%s -> Lanczos %dx%d%s%s%s (CUDA passes, "
+    LOG("native: %s upscale: Anime4K Upscale CNN x2 UL %dx%d -> %dx%d%s%s -> Lanczos %dx%d%s%s (CUDA passes, "
         "tensor-core layers with fp16 sums, %.1fs)\n",
         g_offline ? "offline" : "live", w, h, w << n, h << n, passes, aaNote, ow, oh,
-        a4kClampOn() ? ", Clamp_Highlights" : "", nr.vsrPre ? ", the captured frame before the model" : "",
+        a4kClampOn() ? ", Clamp_Highlights" : "",
         nr.hdr ? ", on the HDR planes' SDR view" : (upEnc ? ", on the HDR video's SDR view" : ""),
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return true;

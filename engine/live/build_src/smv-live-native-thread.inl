@@ -115,8 +115,8 @@ static void nativeUpRelease(NativeRife& nr)
 // buffers the slot store reads, the bridge or module, the warm-up; FSR / XeSS's first frames on a worker), when the
 // video memory room holds it; a running kind is released first (nativeUpRelease), after the checks that leave it
 // running. false = this session cannot (why says it); the next session takes it. Left to the next session, as at the
-// start: a resize that does not enlarge, the resize before the model (vsrPre), RTX VSR once NGX was created without it
-// (single-instance a process: TrueHDR holds it), another route; a setup that fails after the release = Lanczos
+// start: a resize that does not enlarge, RTX VSR once NGX was created without it (single-instance a process: TrueHDR
+// holds it), another route; a setup that fails after the release = Lanczos
 static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
 {
     if (g_offline || g_backend != BK_SERVER)
@@ -233,9 +233,8 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
         return false;
     }
     nr.vsrWant = true;
-    nr.vsrPre = false;
     nr.fsrUp = want == 2 || want == 5;
-    nr.fuHdr = nr.fsrUp && nr.hdr; // the start's rule (nativeRtxInit) with no resize before the model
+    nr.fuHdr = nr.fsrUp && nr.hdr; // the start's rule (nativeRtxInit)
     nr.fuKind = want == 5 ? 1 : 0;
     if (nr.fsrUp)
         nr.fsrUpDir = dir;
@@ -315,8 +314,8 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
 // the way the session start does: the capture as Restore's source (restPre, srcW / srcH = the capture; every reader
 // of those is Restore's own), the fold to the model size, the buffers the handoff allocates (dRestTmp, dRest, dCapF,
 // dRestRem on HDR planes at a size change), then restNatSetup (weights, activations, warm-up), when the video memory
-// room holds them. Left to the next session: another route, an upscaler before the model (it moves Restore's fold
-// target), a start in place that failed earlier (its buffers stay for the teardown). false = why says it
+// room holds them. Left to the next session: another route, a start in place that failed earlier (its buffers stay
+// for the teardown). false = why says it
 static bool nativeRestoreSwitch(NativeRife& nr, int want, std::string& why)
 {
     if (g_offline || g_backend != BK_SERVER)
@@ -327,11 +326,6 @@ static bool nativeRestoreSwitch(NativeRife& nr, int want, std::string& why)
     if (want < 1 || want > 3)
     {
         why = "an unknown Restore kind";
-        return false;
-    }
-    if (nr.vsrPre)
-    {
-        why = "an upscaler runs before the model";
         return false;
     }
     if (nr.dRest)

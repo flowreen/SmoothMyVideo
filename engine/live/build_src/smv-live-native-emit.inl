@@ -229,12 +229,11 @@ static bool nativeVsrEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, 
 }
 
 // Restore and the resize of one frame into nr.dPres (staged) or in place. enc = the frame's encoding (0 SDR planes; 1 PQ,
-// 2 HLG = offline HDR video, src holds the codes); live hands an SDR view as src and the HDR planes it came from as pl.
-// inRange = the caller's range test of src (1 inside the SDR range, 0 outside, -1 none).
+// 2 HLG = HDR video or RTX HDR's PQ, src holds the codes). inRange = the caller's range test of src (1 inside the SDR
+// range, 0 outside, -1 none).
 static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& rs, int& srcHalf, bool& staged, int sw,
                                int sh, int tw, int th, bool withRestore, bool vsrHere, int enc = 0,
-                               bool viewFit = false, const void* pl = nullptr, int plHalf = 0, int plPs = 0,
-                               int plRs = 0, int inRange = -1)
+                               bool viewFit = false, int inRange = -1)
 {
     cudaStream_t st = nr.stream;
     const bool resize = tw != sw || th != sh;
@@ -264,7 +263,7 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
     if (!staged && resize)
     {
         bool haveVsr = false;
-        const int hlg = (enc ? enc : nr.encPost) == 2 ? 1 : 0;
+        const int hlg = enc == 2 ? 1 : 0;
         if (vsrNow && (nr.a4kUp || nr.acnUp))
         {
             // Anime4K / ArtCNN: the planes (HDR video: their SDR view, as RTX VSR reads it) through its x2 net and the
@@ -327,38 +326,6 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
                                    nullptr) != CUDA_SUCCESS)
                 {
                     nr.die("FSR HDR pack launch failed");
-                    return false;
-                }
-            }
-            else if (nr.fuHdr)
-            {
-                // AMD FSR upscaling on HDR planes: the frame in linear light into the bridge's buffer. Live hands the
-                // planes (pl, the SDR view src came from; after Restore on the view, the restored view goes back to
-                // the codes first: dVsrRem as the scratch, the planes as the reference); offline src is the codes
-                const void* fp = enc ? src : pl;
-                int fh = enc ? srcHalf : plHalf, fps = enc ? ps : plPs, frs = enc ? rs : plRs;
-                if (!enc && src == nr.dRest)
-                {
-                    const int n = sw * sh;
-                    if (cudaMemcpyAsync(nr.dVsrRem, nr.dRest, (size_t)3 * n * sizeof(float), cudaMemcpyDeviceToDevice,
-                                        st) != cudaSuccess ||
-                        !nativeHdrRestOut(nr, nr.dVsrRem, sw, sh, fp, fh, fps, frs, sw, sh, nr.encPost))
-                    {
-                        nr.die("restored HDR codes (FSR) launch failed");
-                        return false;
-                    }
-                    fp = nr.dVsrRem;
-                    fh = 0;
-                    fps = n;
-                    frs = sw;
-                }
-                const float scale = 125.0f / nr.encWhite;
-                void* f[] = {(void*)&fp, &fh,           &fps,        &frs,      &sw,
-                             &sh,        (void*)&scale, (void*)&hlg, &nr.dFuIn, &nr.fuInPitch};
-                if (!fp || cuLaunchKernel(nr.fFsrHdrIn, (sw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st,
-                                          f, nullptr) != CUDA_SUCCESS)
-                {
-                    nr.die("FSR HDR input launch failed");
                     return false;
                 }
             }
@@ -467,8 +434,8 @@ static bool nativeOfflineStage(NativeRife& nr, const void*& src, int& ps, int& r
 }
 
 // Before DLSS 5 and the model: the decoded frame in nr.dSrcPl (srcW x srcH)
-// through Restore and RTX VSR / Lanczos to the working size, which is the model size, then into
-// the model frame dCur (pw x ph, planes dps apart) with the packers' replicate pad
+// through Restore and the Lanczos resize to the working size, which is the model size (the picked upscaler runs
+// after the model), then into the model frame dCur (pw x ph, planes dps apart) with the packers' replicate pad
 static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
 {
     const void* src = nr.dSrcPl;
@@ -481,8 +448,8 @@ static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
         nr.die("resize range test failed");
         return false;
     }
-    if (!nativeOfflineStage(nr, src, ps, rs, half, staged, srcW(nr), srcH(nr), nr.w, nr.h, true, !nr.vsrPost, nr.encPre,
-                            in == 1, nullptr, 0, 0, 0, nr.dRsView ? in : -1))
+    if (!nativeOfflineStage(nr, src, ps, rs, half, staged, srcW(nr), srcH(nr), nr.w, nr.h, true, false, nr.encPre,
+                            in == 1, nr.dRsView ? in : -1))
         return false;
     // unstaged = no resize and Restore dropped: the source already has the model size
     const float* from = staged ? nr.dPres : (const float*)src;
@@ -502,8 +469,9 @@ static bool nativeOfflinePreModel(NativeRife& nr, float* dCur, int dps)
 // nativeOfflineStage (Restore and the resize; with a working size Restore ran before the model and
 // only the final resize from the working size is left). DLSS 5, Sharpen and RTX TrueHDR already ran on
 // the decoded frame before the interpolation (nativeNrFrame, nativePreModelPost): with RTX HDR the
-// frame is PQ, the resize is Lanczos (RTX VSR takes SDR only) and nativeOfflinePqOut writes the
-// x2rgb10le words and the frame's statistics. A pass that fails is dropped for the rest of the render
+// frame is PQ, the picked upscaler reads it as it reads HDR video (RTX VSR the SDR view, the light
+// above white back from the Lanczos fit) and nativeOfflinePqOut writes the x2rgb10le words and the
+// frame's statistics. A pass that fails is dropped for the rest of the render
 // with a line. false = a launch failed.
 static bool nativeOfflineEmit(NativeRife& nr, const void* src, int ps, int rs, uint8_t* dO, bool out16, int srcHalf = 0)
 {
@@ -512,8 +480,7 @@ static bool nativeOfflineEmit(NativeRife& nr, const void* src, int ps, int rs, u
     bool staged = false; // nr.dPres holds the output-size frame
     if (!nr.nvPre)
     {
-        if (!nativeOfflineStage(nr, src, ps, rs, srcHalf, staged, srcW(nr), srcH(nr), tw, th, true, !nr.rtxHdr,
-                                nr.encPost))
+        if (!nativeOfflineStage(nr, src, ps, rs, srcHalf, staged, srcW(nr), srcH(nr), tw, th, true, true, nr.encPost))
             return false;
     }
     else if ((nr.w != tw || nr.h != th) &&

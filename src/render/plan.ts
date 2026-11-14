@@ -96,7 +96,8 @@ export const DLSSG_MIN_WORK = 128;
 
 /** The pass sizes for a w x h source: the output (the --upscale factor, clamped; with it an anamorphic source's
  * pixels are made square, without it the output keeps their shape, `sar`), the working size =
- * the DLSS mode (--scale) x the output (even, at most WORK_MAX_PX keeping the aspect; the share raised, aspect kept,
+ * the DLSS mode (--scale) x the output (even, never above the source on either axis: the enlarge to the output runs
+ * after the model; at most WORK_MAX_PX keeping the aspect; the share raised, aspect kept,
  * to the largest minimum of the pipeline: the shorter side 64 px, with DLSS 5 (nr) the width NR_MIN_WORK_W, with
  * DLSS 4.5 (dlssg) the shorter side DLSSG_MIN_WORK), and the decode (a working size below the source folds the
  * downscale into the decode, Lanczos at radius 7: the one shrink). A string = why --scale is refused. */
@@ -135,6 +136,26 @@ export function workPlan(
     ww = Math.min(ow, Math.max(nr ? NR_MIN_WORK_W : 64, pyRound(ow * k) & ~1));
     wh = Math.min(oh, Math.max(64, pyRound(oh * k) & ~1));
   }
+  // every model interpolates before any upscale: the working size never exceeds the source on either axis (an
+  // upscaled output is enlarged after the model), the output's aspect kept; a side the cap lands on exactly keeps the
+  // source's own length, odd or even (as DLAA keeps an odd output). The pipeline's minimums above stay the floor: a
+  // source below one is enlarged to it, the one enlarge before a model
+  let atSource = false,
+    atFloor = false;
+  const kMin = Math.max(64 / ww, 64 / wh, nr ? NR_MIN_WORK_W / ww : 0, dlssg ? DLSSG_MIN_WORK / Math.min(ww, wh) : 0);
+  const kCap = Math.min(1, w / ww, h / wh);
+  const kSrc = Math.max(kCap, Math.min(1, kMin));
+  if (kSrc < 1) {
+    ww = w / ww === kSrc ? w : pyRound(ww * kSrc) & ~1;
+    wh = h / wh === kSrc ? h : pyRound(wh * kSrc) & ~1;
+    // a side within one even step under the source keeps the source's length: the final resize takes the sub-pixel
+    // aspect (a source of near-square pixels), never a resample of the source before the model
+    if (ww >= w - 2 && ww < w) ww = w;
+    if (wh >= h - 2 && wh < h) wh = h;
+    // which limit set it: the source (the enlarge runs after the model), or a model's minimum above the source
+    if (kSrc === kCap) atSource = true;
+    else atFloor = true;
+  }
   let capped = false;
   if (ww * wh > WORK_MAX_PX) {
     const k = Math.sqrt(WORK_MAX_PX / (ww * wh));
@@ -153,6 +174,8 @@ export function workPlan(
     (srcSar[0] !== srcSar[1]
       ? `, its ${srcSar[0]}:${srcSar[1]} pixels ` + (upscaleF !== 1.0 ? 'made square' : 'kept, the output tagged')
       : '') +
+    (atSource ? ', capped at the source: the enlarge runs after the model' : '') +
+    (atFloor ? ", raised to a model's minimum size: the one enlarge before the model" : '') +
     (vf.length ? ', the downscale folded into the decode, Lanczos at radius 7' : '') +
     (capped ? "; capped at 3840x2160, the interpolation's reach" : '') +
     ')\n';

@@ -60,8 +60,8 @@ settings both share. The panels are numbered in the order the passes run.
     <td align="center" width="50%"><b>Live</b>: smooth any window in real time</td>
   </tr>
   <tr>
-    <td><img src="docs/ui.png" alt="The Smooth My Video window in Video mode: the Video / Live switch, Select video, then the numbered panels in processing order (Restore, Upscale with the output Size, DLSS 5, Sharpen, HDR with Dolby Vision and HDR10+, Interpolate with the Speed target, Output)" width="100%"></td>
-    <td><img src="docs/ui-live.png" alt="The same window in Live mode: the Video / Live switch, the Smooth It Live button with its display, FPS meter and hotkey options, and the shared numbered panels (Restore, Upscale with the DLSS mode, DLSS 5, Sharpen, RTX HDR, Interpolate with the Speed target)" width="100%"></td>
+    <td><img src="docs/ui.png" alt="The Smooth My Video window in Video mode: the Video / Live switch, Select video, then the numbered panels in processing order (Restore, DLSS 5, Sharpen, HDR with Dolby Vision and HDR10+, Interpolate with the Speed target, Upscale with the output Size, Output)" width="100%"></td>
+    <td><img src="docs/ui-live.png" alt="The same window in Live mode: the Video / Live switch, the Smooth It Live button with its display, FPS meter and hotkey options, and the shared numbered panels (Restore, DLSS 5, Sharpen, RTX HDR, Interpolate with the Speed target, Upscale with the DLSS mode)" width="100%"></td>
   </tr>
   <tr>
     <td valign="top">Pick a video (or several, or drag them in), set a <b>target frame rate</b> and click
@@ -139,12 +139,6 @@ These run before the new frames are made, in videos and in Live:
 * 🔍 **Restore**: cleans up compression noise and blur, with Real-ESRGAN (it can flatten fine texture), AnimeJaNai
   HD (downloaded on request) or Anime4K's line restore (light, made for anime, keeps the frame's size). Off by
   default.
-* 📐 **Upscale**: makes the picture bigger and sharper with NVIDIA RTX Video Super Resolution (on by default; its Disable artifact
-  removal tick is for high-bitrate or lossless video, whose clean detail it leaves as it is), AMD
-  FSR 4.1, Intel XeSS (Intel's files are downloaded on request), Anime4K or ArtCNN (both made for anime; each upscale
-  pass doubles the picture, so 720p to 4K takes two passes; with Restore set to Anime4K too, Anime4K makes its Mode
-  A, and its A+A box runs Anime4K's Restore again on the enlarged picture: crisper lines, slower, and it can add
-  ringing); with none ticked, a standard resize. They only run when the picture is enlarged.
 * 🧠 **NVIDIA DLSS 5** (optional): NVIDIA's Neural Rendering, an AI picture enhancement on every original frame.
   [Details](#nvidia-dlss-5).
 * ✏️ **Sharpen**: bacondither's Adaptive Sharpen, strength 0 to 2 (on at 1.00 by default).
@@ -152,6 +146,16 @@ These run before the new frames are made, in videos and in Live:
   **Contrast** and **Saturation** sliders, plus optional **RTX Dynamic Vibrance** (richer colours, skin tones kept).
   Its brightest white matches your HDR display; type a **Peak** in nits to make a file for another screen. HDR sources
   stay as they are.
+
+The new frames are made from the video at its own size. Then every frame, original and new, is enlarged:
+
+* 📐 **Upscale**: makes the picture bigger and sharper with NVIDIA RTX Video Super Resolution (on by default; its Disable artifact
+  removal tick is for high-bitrate or lossless video, whose clean detail it leaves as it is), AMD
+  FSR 4.1, Intel XeSS (Intel's files are downloaded on request), Anime4K or ArtCNN (both made for anime; each upscale
+  pass doubles the picture, so 720p to 4K takes two passes; with Restore set to Anime4K too, Anime4K makes its Mode
+  A, and its A+A box runs Anime4K's Restore again on the enlarged picture: crisper lines, slower, and it can add
+  ringing); with none ticked, a standard resize. They only run when the picture is enlarged. In Live with DLSS 4.5
+  the upscaler stays off and DLSS 4.5's frames get the standard resize.
 
 In the preview, **Show changed pixels** turns the processed side into a heat map of where DLSS 5 changed the picture.
 
@@ -161,7 +165,8 @@ In the preview, **Show changed pixels** turns the processed side into a heat map
   frame is kept and the AI only draws the frames in between. At other targets every output frame is a new one. A
   still picture stays perfectly still.
 * 📏 **One Size control.** Pick the output **Size**: Off, your screen's resolution, 720p up to 8640p, or a custom
-  height (240p to 16K). Above 4K, the AI work runs at 4K and the result is enlarged at the end.
+  height (240p to 16K). The AI work runs at the video's own size (or the Size, when that is smaller; at most 4K), and
+  the result is enlarged at the end.
 * 🌈 **Proper HDR10**, with real brightness data and accurate colour. Optional **Dolby Vision** and **HDR10+**,
   together or apart. Dolby Vision comes two ways: Profile 8.1 keeps the HDR10 video (other TVs play HDR10), Profile
   8.4 writes the video as HLG (other HDR TVs play HDR, SDR TVs show it close to right; not combined with HDR10+). All
@@ -242,8 +247,8 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
 * **DLSS mode** trades sharpness for speed: the work runs at a smaller size, then the picture is enlarged. DLAA (the
   default) is the full size; Quality 67%, Balanced 58%, Performance 50%, Ultra Performance 33%, or any size down to 1%
   with the slider. Lower is faster and softer.
-* **Effects** (Restore, DLSS 5, Sharpen, the upscaler) work with every model, DLSS 4.5 included. Untick every model
-  to get just the effects, at the window's own frame rate.
+* **Effects** (Restore, DLSS 5, Sharpen) work with every model, DLSS 4.5 included; the upscaler works with every model
+  but DLSS 4.5. Untick every model to get just the effects, at the window's own frame rate.
 * **On an HDR display** every model runs in HDR, and RTX HDR can turn SDR windows into HDR.
 * **Pauses by itself** when the window is minimized, on another virtual desktop, or covered by the window in front,
   and resumes when it is back.
@@ -265,7 +270,8 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
 <details>
 <summary><b>Where it runs, its controls, and the one-click download</b></summary>
 
-* **Where:** after Restore and the resize, at the output size up to 4K (in Live, at the DLSS mode's size).
+* **Where:** after Restore, at the video's own size (or a smaller Size; at most 4K), before the new frames and the
+  upscale (in Live, at the DLSS mode's size).
 * **How:** fed the way games feed it, so it follows the motion, and a paused picture stays perfectly still.
 * **Controls:** NVIDIA's three looks as a **Style** selector (Default, Natural, Cinematic; Default is preselected),
   **Structure Intensity** and **Tone Intensity** sliders, and **Passes** (1 to 20): DLSS 5 again on its own result,
