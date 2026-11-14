@@ -3084,6 +3084,32 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         const double kUpHold = 1.10, kUpPeriod = 0.98, kUpOverMs = 1000.0, kUpResetMs = 120000.0;
         double upK = kUpKDefault, upPred = 0, upFailT = 0, upBackoffMs = kUpBackoff0, upOverT = 0;
         uint32_t upM = 0;
+        // A DEEP TRY: a Smooth Motion step-up to a deeper pipelined ladder is priced at the running ladder's pipelined
+        // calls (or the ratios learned there), yet a call costs less the more bridge instances run side by side
+        // (2560x1440, 21.5 fps: x4's prices put x8 at ~1.23 x what x8 then measured running, ~1.3 x the budget with
+        // kUpKDefault for an x8 whose own price fits). Such a ladder is admitted up to kDeepTry x the budget as a timed
+        // run, entering the pipelined route at once (deepTry = that ladder until it settles); its own prices then hold
+        // it in the band or let it fall. A tried ladder keeps a back-off of its own (deepBackoff: kDeepBackoff0
+        // doubling, kUpBackoffMax once its own price came out at or above the price it was tried at: no overprice to
+        // find), so a failed try never holds back the step-ups the prices admit (the shared back-off above); deepLock
+        // = the tried ladder while it is the lock, until it has held kUpResetMs. Only one node up from x4 or below
+        // (kDeepFromMax): the compute thread's call price holds its wait for the worker's join, spread over 2 calls at
+        // x4 and over 32 at x64, so the overprice is a shallow ladder's (x2 -> x4 0.91-0.94 x, x4 -> x8 0.81-0.85 x
+        // their own prices; x16 -> x32 at 854x480 and x64 -> x128 1.03-1.05 x: none, a try there only falls)
+        const double kDeepTry = 1.4, kDeepBackoff0 = 15000.0;
+        const uint32_t kDeepFromMax = 4;
+        uint32_t deepTry = 0, deepLock = 0;
+        double deepPred = 0;
+        bool deepSettled = false;
+        std::map<uint32_t, double> deepFailAt, deepBackoff;
+        // the tried ladder falls (c = its price now, 0 = not read): its back-off in seconds
+        auto deepFall = [&](double c) {
+            double& b = deepBackoff[deepLock];
+            b = c > 0.0 && c >= deepPred ? kUpBackoffMax : b > 0.0 ? (std::min)(b * 2.0, kUpBackoffMax) : kDeepBackoff0;
+            deepFailAt[deepLock] = nowMs();
+            deepLock = deepTry = 0;
+            return b / 1000.0;
+        };
         std::map<uint32_t, double> upKAt; // the excess each stepped-up ladder showed over its prediction, by ladder
         bool upSettled = false;           // the stepped-up lock has logged its settled price
         // an M ladder's route (fruc-pipe), before the switch dwell: the sender runs it, lockedMultiple prices it. The
@@ -3211,6 +3237,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // the faster of the two period averages: a source-rate rise tightens the budget within a few pairs
             const double period = (std::min)(lockDtMs, emaDt);
             const double budget = period * thrBudget;
+            // Smooth Motion on the pipelined route: M stores + the pipelined calls
+            auto frucPipedCost = [&](uint32_t m) {
+                double pm, pw;
+                frucPipePrices(fc, pm, pw);
+                return pre + m * fs + frucPipeCalls(m, pm, pw);
+            };
             auto cost = [&](uint32_t m) {
                 if (!tree)
                     return pre + (m - 1) * tw;
@@ -3225,11 +3257,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     return piped ? fsrfgPipeCost(m, fc, fs) : fb + (m - 2.0) * (fc + fs);
                 }
                 const bool piped = m >= 4 && (frucPipeForce || (frucPipeOn && thrMd > 0.0 && frucPipeWant(m)));
-                if (!piped)
-                    return pre + m * fs + (m - 1.0) * fc;
-                double pm, pw;
-                frucPipePrices(fc, pm, pw);
-                return pre + m * fs + frucPipeCalls(m, pm, pw);
+                return piped ? frucPipedCost(m) : pre + m * fs + (m - 1.0) * fc;
             };
             // a lock holds within slotOk and the hold band (kUpHold, under kUpPeriod of the period), never within
             // kUpSettleMs of its lock; before a group is timed the throttle's r stands in for the price (the node
@@ -3268,6 +3296,18 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     return tree && (m == above || m - 1 <= r * 0.97);
                 return cost(m) * kFor(m) <= budget || (probe && cost(m) * kProbe(m) <= budget);
             };
+            // a deep try's admission (kDeepTry): a pipelined Smooth Motion ladder within the slots and the target (the
+            // throttle's r stands aside: it comes off the same shallower prices), past the shared back-off like afford
+            // and past its own ladder's
+            auto deepOk = [&](uint32_t m) {
+                if (!tree || fsr || !timed || !frucPipeOn || thrMd <= 0.0 || m < 4 || !slotOk(m) ||
+                    (upFailT > 0 && !probe && m >= upM))
+                    return false;
+                const auto f = deepFailAt.find(m);
+                if (f != deepFailAt.end() && nowMs() - f->second < deepBackoff[m])
+                    return false;
+                return frucPipedCost(m) * kFor(m) <= budget * kDeepTry;
+            };
             // the stepped-up lock's live price: what it costs now over the prediction that admitted it (re-read on
             // every settled pair and at its fall, so a sag raises it and its end lowers it again), never under the
             // default, kept for its ladder
@@ -3283,6 +3323,14 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (settled)
                 {
                     learn();
+                    if (deepLock == lockLogged && !deepSettled)
+                    {
+                        // the try's own prices hold it: the route rule takes over
+                        deepSettled = true;
+                        deepTry = 0;
+                        LOG("ladder price: x%u costs %.1f ms, %.2f x the %.1f ms it was tried at\n", lockLogged,
+                            cost(lockLogged), cost(lockLogged) / deepPred, deepPred);
+                    }
                     if (!upSettled && upPred > 0 && upM == lockLogged)
                     {
                         upSettled = true;
@@ -3295,9 +3343,26 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     upFailT = 0; // the ladder the back-off guards has held: the next failure starts the ladder over
                     upBackoffMs = kUpBackoff0;
                 }
+                if (deepLock == lockLogged && nowMs() - lockT >= kUpResetMs)
+                {
+                    deepBackoff.erase(deepLock); // the tried ladder has held: a later fall is any lock's
+                    deepFailAt.erase(deepLock);
+                    deepLock = 0;
+                }
                 const uint32_t next = tree ? lockLogged * 2 : lockLogged + 1;
                 if (!(settled && fits(next) && afford(next)))
                 {
+                    // a deep try: the next node, from x4 or below
+                    const uint32_t dt = settled && tree && lockLogged <= kDeepFromMax ? next : 0;
+                    if (dt && deepOk(dt))
+                    {
+                        deepPred = frucPipedCost(dt);
+                        deepTry = deepLock = dt;
+                        deepSettled = false;
+                        LOG("ladder price: x%u tried at %.1f ms, %.2f x the budget at x%u's pipelined prices\n", dt,
+                            deepPred, deepPred / budget, lockLogged);
+                        return dt;
+                    }
                     // a refused probe of the ladder that fell: its excess relaxes to the probe's price, the next look
                     // waits for the doubled back-off
                     if (probe && timed && next == upM && upKAt.count(upM))
@@ -3316,12 +3381,22 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 upPred = timed ? cost(up) : 0.0;
                 upM = up;
                 upSettled = false;
+                deepTry = deepLock = 0;
                 return up;
             }
-            if (lockLogged)
+            if (lockLogged && lockLogged == deepLock)
+            {
+                // the tried ladder falls: its own back-off, the step-ups' left as they were
+                upOverT = 0;
+                const double c = cost(lockLogged), pred = deepPred, s = deepFall(c);
+                LOG("ladder price: x%u falls at %.1f ms (%.2f x the price it was tried at); tried again in %.0f s\n",
+                    lockLogged, c, c / pred, s);
+            }
+            else if (lockLogged)
             {
                 learn(); // the lock falls: what it costs now is its price
                 upOverT = 0;
+                deepTry = 0;
                 if (lockLogged == upM)
                 {
                     // a stepped-up ladder falls: admitted again only after the back-off
@@ -3348,6 +3423,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     upPred = timed ? cost(2) : 0.0;
                     upM = 2;
                     upSettled = false;
+                    deepTry = deepLock = 0;
                     return 2;
                 }
                 return gridLock ? m : 0;
@@ -3416,7 +3492,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // drove the throttle to the floor fell: its back-off starts now)
                 if (lockLogged)
                 {
-                    if (lockLogged == upM && upPred > 0)
+                    if (lockLogged == deepLock)
+                    {
+                        const double s = deepFall(0.0);
+                        LOG("ladder price: x%u falls at the floor; tried again in %.0f s\n", lockLogged, s);
+                    }
+                    else if (lockLogged == upM && upPred > 0)
                     {
                         upBackoffMs = upFailT > 0 ? (std::min)(upBackoffMs * 2.0, kUpBackoffMax) : kUpBackoff0;
                         upFailT = nowMs();
@@ -3424,6 +3505,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             upBackoffMs / 1000.0);
                     }
                     upOverT = 0;
+                    deepTry = 0;
                     LOG("present grid: unlocked (target %.1f, source %.3f fps)\n", effTarget, 1000.0 / lockDtMs);
                     lockLogged = 0;
                 }
@@ -3479,11 +3561,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                               ? (thrMd > 0 || thrMp > 0 || noFitPriced()) && fsrfgPipeOn && fsrfgPipeOk(*srv.nr)
                               : (thrMd > 0 || noFitPriced()) && frucPipeOn))
                 {
-                    bool want = frucPipeWant(m);
+                    // a deep try runs pipelined from its first group, the switch dwell aside (it holds a ladder's
+                    // route; this is a new ladder)
+                    bool want = frucPipeWant(m) || m == deepTry;
                     // Fit to the GPU off: a node neither route holds runs on the one that affords more of it
                     if (g_noGpuFit && !want && m - 1 > frucAffD * 1.03 && frucAffP > frucAffD)
                         want = true;
-                    pipeThis = want != frucPiped && nowMs() - frucPipeT < 2000.0 ? frucPiped : want;
+                    pipeThis = want != frucPiped && nowMs() - frucPipeT < 2000.0 && m != deepTry ? frucPiped : want;
                 }
             }
             else if (adaptTarget > 0)

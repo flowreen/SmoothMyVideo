@@ -2247,7 +2247,15 @@ and 2 s since the last lock change to enter, 3 % to hold, and while its slots fi
 however far past the target or the panel that node lands. The present floor follows a node above the
 target (0.95 x the node's own period, from the faster of the two source clocks), so its slots are all
 presented (tear-allowed past the panel) and no group overruns its source period. Otherwise the largest
-node that fits. A target on a node (within 3 %) never steps up. With `--no-gpu-fit` the first node
+node that fits. A target on a node (within 3 %) never steps up. A deeper Smooth Motion node is priced
+at the pipelined calls of the ladder that runs, yet a call costs less the more bridge instances run side
+by side (2560x1440 at 21.5 fps: x4's prices put x8 at about 1.23 x what x8 then measured running; from
+x16 on the prices matched), so a step up one node from x4 or below is tried when that price is within
+1.4 x the budget: it runs pipelined from its
+first group, and its own prices then hold it or let it fall. A fallen try waits 15 s before that node is
+tried again, doubling up to 300 s, and 300 s at once when its own price came out at or above the price it
+was tried at; that wait is the node's own, so the step-ups the prices admit go on (log `ladder price: xM
+tried at N ms, ...`). With `--no-gpu-fit` the first node
 that reaches the target runs at once and unpriced (Fit to the GPU off = the target is reached whatever
 it costs: 120 fps from 24 = x8, even where that node skips source frames), with no step, hold band or
 back-off, and on the pipelined route whenever the direct tree cannot hold the node and the pipelined
