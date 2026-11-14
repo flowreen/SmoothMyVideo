@@ -230,10 +230,22 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
     return true;
 }
 
+// frame generation's edge fill (ofAt in the kernel text: the vector kernels fill the field's edge bands as they read it,
+// the engine's buffer stays as written); SMV_OFVEC_EDGE=0 = the field as the engine wrote it
+static bool ofEdgeEnvOn()
+{
+    static const bool on = [] {
+        char v[8] = "";
+        return !(GetEnvironmentVariableA("SMV_OFVEC_EDGE", v, sizeof(v)) > 0 && v[0] == '0');
+    }();
+    return on;
+}
+
 // the vectors between slots `prev` and `cur`, both holding their ABGR8 frames: the field cur -> prev in px (the backward
-// field of the pair), into dst as R16G16_FLOAT texels, rows dstPitch bytes apart
+// field of the pair), into dst as R16G16_FLOAT texels, rows dstPitch bytes apart. edge = frame generation: the edge
+// fill (ofEdgeEnvOn); upscaling reads the field as the engine wrote it
 static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int cur, uint8_t* dst, int dstPitch,
-                           const char* tag, cudaEvent_t evOf = nullptr, float gate = 0.0f)
+                           const char* tag, cudaEvent_t evOf = nullptr, float gate = 0.0f, bool edge = false)
 {
     cudaStream_t st = o.st ? o.st : nr.stream;
     NV_OF_EXECUTE_INPUT_PARAMS ei{};
@@ -264,11 +276,11 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
         cudaEventRecord(evOf, st);
     const unsigned gx = (unsigned)(o.w + 15) / 16, gy = (unsigned)(o.h + 15) / 16;
     const int f = o.both ? 1 : o.wr;
-    int grid = o.grid, vp = (int)o.outPitch[f], cp = 0, mp = dstPitch;
+    int grid = o.grid, vp = (int)o.outPitch[f], cp = 0, mp = dstPitch, ed = edge && ofEdgeEnvOn() ? 1 : 0;
     CUdeviceptr v = o.outP[f], c = 0;
     if (grid == 1) // the field is the texels' grid: one pass, no float planes in between
     {
-        void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp, &gate};
+        void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp, &gate, &ed};
         if (cuLaunchKernel(nr.fMvHalfG1, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, g1, nullptr) != CUDA_SUCCESS)
         {
             nr.die("FSR vector launch failed");
@@ -279,7 +291,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
     float* flow = o.dFlow;
     float* cost = nullptr; // k_nvofUp: the flow alone, the cost never read
     void* b[] = {&v, &vp, &c, &cp, &o.gw, &o.gh, &grid, &o.w, &o.h, &flow, &cost};
-    void* m[] = {&flow, &o.w, &o.h, &dst, &mp, &gate};
+    void* m[] = {&flow, &o.w, &o.h, &dst, &mp, &gate, &ed};
     if (cuLaunchKernel(nr.fNvofUp, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS ||
         cuLaunchKernel(nr.fMvHalf, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, m, nullptr) != CUDA_SUCCESS)
     {
@@ -350,12 +362,13 @@ static bool fsrfgDeriveOn(const NativeRife& nr)
 }
 
 // a level-2+ call's derived vectors (its frames at t0 and t1 of the pair) into dst (rows fgMvPitch apart) on stream st,
-// from fgOf's level-1 output: no level-2+ call runs fgOf once its vectors are derived, so the field holds for the pair
+// from fgOf's level-1 output with the edge fill (ofEdgeEnvOn): no level-2+ call runs fgOf once its vectors are derived,
+// so the field holds for the pair
 static bool nativeFsrfgChildVec(NativeRife& nr, uint8_t* dst, cudaStream_t st, float t0, float t1)
 {
     CUdeviceptr v = nr.fgOf.outP[nr.fgOfRd];
-    int vp = (int)nr.fgOf.outPitch[nr.fgOfRd], mp = nr.fgMvPitch;
-    void* a[] = {&v, &vp, &nr.w, &nr.h, &t0, &t1, &dst, &mp};
+    int vp = (int)nr.fgOf.outPitch[nr.fgOfRd], mp = nr.fgMvPitch, ed = ofEdgeEnvOn() ? 1 : 0;
+    void* a[] = {&v, &vp, &nr.w, &nr.h, &t0, &t1, &dst, &mp, &ed};
     if (cuLaunchKernel(nr.fMvDerive, (unsigned)(nr.w + 15) / 16, (unsigned)(nr.h + 15) / 16, 1, 16, 16, 1, 0,
                        (CUstream)st, a, nullptr) != CUDA_SUCCESS)
     {
@@ -429,7 +442,7 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
                 return false;
             mark(2);
             if (!nativeOfVecRun(nr, nr.fgOf, slotPrev, slotCur, mvBuf, nr.fgMvPitch, "fsrfg",
-                                nr.fgProf ? nr.fgEv[3] : nullptr))
+                                nr.fgProf ? nr.fgEv[3] : nullptr, 0.0f, true))
                 return false;
             if (l1 && nr.grOfArmed[es])
                 nr.grOfArmed[es] = cudaEventRecord(nr.fgOfEv[es][1], os) == cudaSuccess;
@@ -710,7 +723,8 @@ static bool nativeFsrfgAheadVec(NativeRife& nr, int s, const uint8_t* prev, cons
     {
         int slotPrev = 0, slotCur = 1;
         if (!nativeFsrfgOfIn(nr, nr.fgOf2, prev, frame, false, slotPrev, slotCur) ||
-            !nativeOfVecRun(nr, nr.fgOf2, slotPrev, slotCur, nr.dFgMvR[s], nr.fgMvPitch, "fsrfg side vectors"))
+            !nativeOfVecRun(nr, nr.fgOf2, slotPrev, slotCur, nr.dFgMvR[s], nr.fgMvPitch, "fsrfg side vectors", nullptr,
+                            0.0f, true))
             return false;
     }
     if (cudaEventRecord(nr.fgEvVec[s], nr.fgOfSt) != cudaSuccess)

@@ -3268,31 +3268,116 @@ __global__ void k_unpackRgbaH(const unsigned short* __restrict__ src, int srcPit
     dst[(size_t)dps + d] = q[1];
     dst[2 * (size_t)dps + d] = q[2];
 }
+// the Optical Flow engine's field as frame generation's vectors read it, two layouts: OfCells = its short2 cells
+// (raw / 32 = px, rows p bytes apart), OfPlanes = k_nvofUp's two w x h planes in px
+struct OfCells
+{
+    const short* v;
+    int p;
+    __device__ __forceinline__ void at(int x, int y, float& a, float& b) const
+    {
+        const short* r = (const short*)((const char*)v + (size_t)y * p);
+        a = (float)r[2 * x];
+        b = (float)r[2 * x + 1];
+    }
+};
+struct OfPlanes
+{
+    const float* f;
+    int w, h;
+    __device__ __forceinline__ void at(int x, int y, float& a, float& b) const
+    {
+        const size_t o = (size_t)y * w + x;
+        a = f[o];
+        b = f[(size_t)w * h + o];
+    }
+};
+// frame generation's field at the frame's edges: content whose source lies outside the previous frame has no match,
+// and the engine's vectors there fall short (a 64 px pan read 64 down to ~18 px over the entering side's last 64
+// columns). A point within 128 px of the left or right edge whose source, by the vector of the point 128 px inside,
+// lies outside the frame takes that vector; then the same across the top and bottom bands, on that result. Only the
+// readers apply it (the engine's buffer is never written); on a 64 px pan the entering side's error against the true
+// midpoint: XeSS-FG 6.4 -> 2.6, AMD FSR 4 FG 8.8 -> 7.5 codes.
+// ofInner: the band's inner point for point i of n (bc points a band), -1 outside the bands or on an axis under 2 bands
+__device__ __forceinline__ int ofInner(int i, int n, int bc)
+{
+    return n <= 2 * bc || (i >= bc && i <= n - 1 - bc) ? -1 : (i < bc ? bc : n - 1 - bc);
+}
+// whether the inner point ii's vector m (px) puts point i's source (g px a point) outside [0, lim) on i's side
+__device__ __forceinline__ bool ofLeaves(int i, int ii, int g, int lim, float m)
+{
+    const float s = (float)(i * g) + m;
+    return (i > ii && m > 0.0f && s >= (float)lim) || (i < ii && m < 0.0f && s < 0.0f);
+}
+// the left / right bands' rule at (x, y): n points a row of g px over a frame w px wide, k = px per field unit; the two
+// templates take C++ linkage inside the text's extern "C" block
+extern "C++" {
+template <class F>
+__device__ __forceinline__ void ofAtH(const F& fld, int n, int g, int w, float k, int x, int y, float& a, float& b)
+{
+    const int xi = ofInner(x, n, 128 / g);
+    if (xi >= 0)
+    {
+        float ia, ib;
+        fld.at(xi, y, ia, ib);
+        if (ofLeaves(x, xi, g, w, ia * k))
+        {
+            a = ia;
+            b = ib;
+            return;
+        }
+    }
+    fld.at(x, y, a, b);
+}
+// the field at point (x, y) of n x m points (g px each, a w x h frame) in its own units, the edges filled when edge != 0
+// (frame generation; upscaling passes 0 and reads the field as the engine wrote it)
+template <class F>
+__device__ __forceinline__ void ofAt(const F& fld, int n, int m, int g, int w, int h, float k, int edge, int x, int y,
+                                     float& a, float& b)
+{
+    if (!edge)
+    {
+        fld.at(x, y, a, b);
+        return;
+    }
+    ofAtH(fld, n, g, w, k, x, y, a, b);
+    const int yi = ofInner(y, m, 128 / g);
+    if (yi < 0) return;
+    float ia, ib;
+    ofAtH(fld, n, g, w, k, x, yi, ia, ib);
+    if (ofLeaves(y, yi, g, h, ib * k))
+    {
+        a = ia;
+        b = ib;
+    }
+}
+}
 // FSR's motion vectors: a field in px (two w x h planes, k_nvofUp's output) as R16G16_FLOAT texels, rows dstPitch bytes
-// apart, every vector as it is (k_nrMv without its test)
+// apart, every vector as it is (k_nrMv without its test); edge = the frame-generation edge fill (ofAt)
 // gate: a vector shorter than it (px) is written as exactly zero (0 = off): FSR upscaling's history holds still
 // detail only under exact zeros (nativeFsrupEval)
 __global__ void k_mvHalf(const float* __restrict__ flow, int w, int h, unsigned int* __restrict__ dst, int dstPitch,
-                         float gate)
+                         float gate, int edge)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
-    const size_t o = (size_t)y * w + x;
-    const float fx = flow[o], fy = flow[(size_t)w * h + o];
+    float fx, fy;
+    ofAt(OfPlanes{flow, w, h}, w, h, 1, w, h, 1.0f, edge, x, y, fx, fy);
     dst[(size_t)y * (dstPitch >> 2) + x] =
         fx * fx + fy * fy < gate * gate ? 0u : (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
 }
 // the same texels from the engine's grid-1 field in one pass: vec = w x h short2 (raw / 32 = px, rows vecPitch bytes),
 // k_nvofUp at grid 1 (weights 0 and 1, an exact copy) then k_mvHalf, byte for byte
 __global__ void k_mvHalfG1(const short* __restrict__ vec, int vecPitch, int w, int h, unsigned int* __restrict__ dst,
-                           int dstPitch, float gate)
+                           int dstPitch, float gate, int edge)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
-    const short* r = (const short*)((const char*)vec + (size_t)y * vecPitch);
-    const float fx = (float)r[2 * x] * (1.0f / 32.0f), fy = (float)r[2 * x + 1] * (1.0f / 32.0f);
+    float rx, ry;
+    ofAt(OfCells{vec, vecPitch}, w, h, 1, w, h, 1.0f / 32.0f, edge, x, y, rx, ry);
+    const float fx = rx * (1.0f / 32.0f), fy = ry * (1.0f / 32.0f);
     dst[(size_t)y * (dstPitch >> 2) + x] =
         fx * fx + fy * fy < gate * gate ? 0u : (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
 }
@@ -3313,26 +3398,31 @@ __global__ void k_fuMvScale(const unsigned int* __restrict__ src, int srcPitch, 
                 : (unsigned int)f2h(kx * h2f((unsigned short)(v & 0xFFFFu))) |
                       ((unsigned int)f2h(ky * h2f((unsigned short)(v >> 16))) << 16);
 }
-// the engine's grid-1 field (short2, raw / 32 = px) bilinear at (x, y), clamped to the frame
-__device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch, int w, int h, float x, float y,
-                                     float& vx, float& vy)
+// the engine's grid-1 field (short2, raw / 32 = px) bilinear at (x, y), clamped to the frame; edge = the frame-
+// generation edge fill on each of the four cells (ofAt)
+__device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch, int w, int h, int edge, float x,
+                                     float y, float& vx, float& vy)
 {
     x = fminf(fmaxf(x, 0.0f), (float)(w - 1));
     y = fminf(fmaxf(y, 0.0f), (float)(h - 1));
     const int x0 = (int)x, y0 = (int)y, x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
     const float fx = x - (float)x0, fy = y - (float)y0;
-    const short* r0 = (const short*)((const char*)vec + (size_t)y0 * vecPitch);
-    const short* r1 = (const short*)((const char*)vec + (size_t)y1 * vecPitch);
+    const OfCells fld{vec, vecPitch};
+    float p00, q00, p10, q10, p01, q01, p11, q11;
+    ofAt(fld, w, h, 1, w, h, 1.0f / 32.0f, edge, x0, y0, p00, q00);
+    ofAt(fld, w, h, 1, w, h, 1.0f / 32.0f, edge, x1, y0, p10, q10);
+    ofAt(fld, w, h, 1, w, h, 1.0f / 32.0f, edge, x0, y1, p01, q01);
+    ofAt(fld, w, h, 1, w, h, 1.0f / 32.0f, edge, x1, y1, p11, q11);
     const float a = (1.0f - fx) * (1.0f - fy), b = fx * (1.0f - fy), c = (1.0f - fx) * fy, d = fx * fy;
-    vx = (a * r0[2 * x0] + b * r0[2 * x1] + c * r1[2 * x0] + d * r1[2 * x1]) * (1.0f / 32.0f);
-    vy = (a * r0[2 * x0 + 1] + b * r0[2 * x1 + 1] + c * r1[2 * x0 + 1] + d * r1[2 * x1 + 1]) * (1.0f / 32.0f);
+    vx = (a * p00 + b * p10 + c * p01 + d * p11) * (1.0f / 32.0f);
+    vy = (a * q00 + b * q10 + c * q01 + d * q11) * (1.0f / 32.0f);
 }
 // AMD FSR 4's level-2+ call (its two frames at t0 and t1 of the pair) as R16G16_FLOAT texels from the pair's level-1
 // field (B -> A at B's positions, grid 1): under the pair's straight-line motion the content at p in the frame at t1
 // sits at the B position q with p = q + (1 - t1) v(q) (a 3-step fixed point) and at t0 at q + (1 - t0) v(q), so the
-// call's field (its frame -> its previous, FSR's convention) = (t1 - t0) v(q)
+// call's field (its frame -> its previous, FSR's convention) = (t1 - t0) v(q); edge = the edge fill (ofAt)
 __global__ void k_mvDerive(const short* __restrict__ vec, int vecPitch, int w, int h, float t0, float t1,
-                           unsigned int* __restrict__ dst, int dstPitch)
+                           unsigned int* __restrict__ dst, int dstPitch, int edge)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -3340,11 +3430,11 @@ __global__ void k_mvDerive(const short* __restrict__ vec, int vecPitch, int w, i
     float vx, vy, qx = (float)x, qy = (float)y;
     for (int it = 0; it < 3; it++)
     {
-        mvAt(vec, vecPitch, w, h, qx, qy, vx, vy);
+        mvAt(vec, vecPitch, w, h, edge, qx, qy, vx, vy);
         qx = (float)x - (1.0f - t1) * vx;
         qy = (float)y - (1.0f - t1) * vy;
     }
-    mvAt(vec, vecPitch, w, h, qx, qy, vx, vy);
+    mvAt(vec, vecPitch, w, h, edge, qx, qy, vx, vy);
     dst[(size_t)y * (dstPitch >> 2) + x] =
         (unsigned int)f2h((t1 - t0) * vx) | ((unsigned int)f2h((t1 - t0) * vy) << 16);
 }
