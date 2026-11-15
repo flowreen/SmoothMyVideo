@@ -284,6 +284,7 @@ struct CascadeProbe
     // the share tag (live<pid>; a third stage's middle probe live<pid>b) and, for that probe, the probe it takes its
     // frames from (dlssg2f --from) instead of the session's feed
     std::wstring tag;
+    int tagGen = 0; // prepare(): 0 = live<pid>..., N = live<pid>rN... (a plan started beside the presenting one)
     const CascadeProbe* up = nullptr;
     // the stage on a thread of this process (SMV_LIVE_DLSSG_LOCAL=0 = a dlssg2f --stage1 process): ngx_stage.h's
     // ngxStageMain, the code dlssg2f runs, sharing its ring and header by the same names, its inputs taken from mail
@@ -389,10 +390,12 @@ struct CascadeProbe
 
     // the probe's place in the chain before any start: its upstream and its share tag (a probe on another probe's ring:
     // b, one on a b probe's ring, the final enlarge's third helper: c), so stages started at once name each other
+    // tagGen > 0: a plan started while the one before it still presents (make before break) names its stages apart
     void prepare(const CascadeProbe* upstream)
     {
         up = upstream;
-        tag = L"live" + std::to_wstring(GetCurrentProcessId()) + (up ? (up->up ? L"c" : L"b") : L"");
+        tag = L"live" + std::to_wstring(GetCurrentProcessId()) + (tagGen ? L"r" + std::to_wstring(tagGen) : L"") +
+              (up ? (up->up ? L"c" : L"b") : L"");
     }
 
     // stage stageNo as dlssg2f --stage1, a child in a job object that ends it with this process; true = its READY line
@@ -2899,6 +2902,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         bool cascNow = false;
         int cascLost = 0;
         ULONGLONG cascUpTick = 0;
+        // the old plan's multiple on screen while the next one starts (make before break, cascOld*; 0 = none)
+        int oldShown = 0, oldKeep = 1;
         bool hidden = false;
         // the HUD switched by a stdin set (nativeLiveSets flags it, this thread owns the window): off hides it, on shows
         // it, made here when the session started without one; read at the top of both loops
@@ -3686,7 +3691,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         auto logLiveStats = [&](double capFps, double outFps, double latAvg, double secs) {
             const double ratio = capFps > 0 ? outFps / capFps : 0.0;
             const double tgt = g_backend == BK_IDENTITY ? 1.0
-                               : dgSess                 ? (cascShown ? (double)cascShown / cascKeep : 1.0)
+                               : dgSess                 ? (cascShown  ? (double)cascShown / cascKeep
+                                                           : oldShown ? (double)oldShown / oldKeep
+                                                                      : 1.0)
                                : adaptTarget <= 0       ? (double)(genFrames + 1)
                                                         : (capFps > 0 ? effTarget / capFps : 0.0);
             const double prTot = host.prN ? host.prMsTot / host.prN : 0.0;
@@ -3786,6 +3793,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // every pass of a plan is a stage: casc = the presented one (the last), cascUp = stage 1 of two or three, fed
         // by the session, cascMid = stage 2 of three; a later stage reads the ring of the one before it
         std::unique_ptr<CascadeProbe> cascUp, cascPendUp, cascMid, cascPendMid;
+        // MAKE BEFORE BREAK: a plan the session replaces itself (an in-place step a helper refused, a shortfall or a
+        // follow down no in-place step takes, a climb's try that fell short with no rung that held) keeps presenting
+        // while the next plan starts: its stages move here (cascReplace; oldShown / oldKeep = what they show), are
+        // fed and shown until the next plan's presented stage shares its first frame (cascTakeover), and end there.
+        // A lost plan (a stage ended or stopped) has nothing to show and ends at once (cascFallback). The next plan
+        // starts beside the old one only in the video memory left (cascPlan); else the old one ends first and the plan
+        // is made at the next window. SMV_LIVE_DLSSG_BRIDGE=0 = it ends at once (the A/B and the gates' trigger)
+        std::unique_ptr<CascadeProbe> cascOld, cascOldUp, cascOldMid;
+        // the old plans stopped beside the loop (cascOldRetire): a stage's stop joins its work and releases its
+        // feature, which would hold the loop's presents; joined at the session's end
+        std::vector<std::thread> cascReap;
+        const bool cascBridgeOn = lkEnv("SMV_LIVE_DLSSG_BRIDGE") != "0";
+        int cascBridgeSeq = 0; // plans started beside an old one: their stages' names carry it (CascadeProbe::tagGen)
         // the plan running has three stages (the shortfall rule's three-stage case). A kept plan never has: it is two
         // stages at most
         auto cascThree = [&]() { return cascMid != nullptr; };
@@ -3851,10 +3871,66 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             return ((uint64_t)60 << 20) + frame / 4 * 250 + 19 * frame +
                    2 * (uint64_t)panvec::vecSize(cascW) * panvec::vecSize(cascH) * 4;
         };
+        // the old plan (make before break) ends: why = its line (null = none, the caller says what follows)
+        auto cascOldEnd = [&](const char* why) {
+            if (!cascOld)
+                return;
+            if (why)
+                LOG("DLSS 4.5's old plan stopped (%s): the captured frames are shown as they are until the new plan "
+                    "presents\n",
+                    why);
+            cascOld->kill();
+            if (cascOldMid)
+                cascOldMid->kill();
+            if (cascOldUp)
+                cascOldUp->kill();
+            cascOld->stop();
+            cascOld.reset();
+            if (cascOldMid)
+            {
+                cascOldMid->stop();
+                cascOldMid.reset();
+            }
+            if (cascOldUp)
+            {
+                cascOldUp->stop();
+                cascOldUp.reset();
+            }
+            oldShown = 0;
+            oldKeep = 1;
+        };
+        // the old plan at the new plan's first frame: its inputs end now, its stop runs on a thread of its own so the
+        // loop presents the new plan's frames at once (the stop joins each stage's last work and releases its feature)
+        auto cascOldRetire = [&]() {
+            if (!cascOld)
+                return;
+            cascOld->kill();
+            if (cascOldMid)
+                cascOldMid->kill();
+            if (cascOldUp)
+                cascOldUp->kill();
+            cascReap.emplace_back([a = std::move(cascOld), m = std::move(cascOldMid), u = std::move(cascOldUp)]() {
+                const double t0 = qpcMs();
+                a->stop();
+                if (m)
+                    m->stop();
+                if (u)
+                    u->stop();
+                LOG("DLSS 4.5's old plan stopped beside the new one (%.0f ms)\n", qpcMs() - t0);
+            });
+            oldShown = 0;
+            oldKeep = 1;
+        };
+        auto cascOldDead = [&]() {
+            return cascOld &&
+                   (cascOld->dead() || (cascOldUp && cascOldUp->dead()) || (cascOldMid && cascOldMid->dead()));
+        };
         // the plan lost, failed or not wanted any more: its stages end, and the captured frames are shown as they are
         // while the plan is made again, at the next stats window. lost = a stage ended or stopped presenting (not a
-        // plan the session itself replaces): a plan lost four times in a row is not made again
+        // plan the session itself replaces): a plan lost four times in a row is not made again. An old plan still
+        // presenting (make before break) ends with it
         auto cascFallback = [&](const char* why, bool lost = false) {
+            cascOldEnd(nullptr);
             if (lost)
                 cascTried = ++cascLost > 3;
             cascNow = !cascTried;
@@ -3884,41 +3960,81 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             cascKeep = 1;
             cascLow = 0;
         };
-        // the effects route's cascade feed: one output slot read back and handed to stage 1, so every frame it
-        // generates from carries the effects
-        auto cascFeedSlot = [&](uint32_t set, uint32_t i) -> bool {
-            CascadeProbe* to = cascUp ? cascUp.get() : casc.get();
-            return host.readSlot(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, (UINT64)srv.shmPitch * H,
-                                 [&](const uint8_t* p) { to->feedRows(p, srv.shmPitch); });
+        // a plan the session replaces itself (the caller set cascTried false: the next stats window plans at once):
+        // its stages keep presenting while the next plan starts (make before break, cascOld*); a plan not on screen,
+        // or SMV_LIVE_DLSSG_BRIDGE=0, ends at once (cascFallback)
+        auto cascReplace = [&](const char* why) {
+            if (!cascBridgeOn || !casc || !casc->present)
+            {
+                cascFallback(why);
+                return;
+            }
+            cascOldEnd(nullptr);
+            LOG("DLSS 4.5's plan of %.2fx is made again (%s): its pass%s until the new plan's first frame\n",
+                (double)cascShown / cascKeep, why, cascUp ? "es present" : " presents");
+            cascOld = std::move(casc);
+            cascOldUp = std::move(cascUp);
+            cascOldMid = std::move(cascMid);
+            oldShown = cascShown;
+            oldKeep = cascKeep;
+            cascNow = true;
+            cascStepTick = 0;
+            cascWarm = false;
+            cascShown = 0;
+            cascKeep = 1;
+            cascLow = 0;
         };
-        // the presented stage's ring on screen: every frame it shared since the last pass, in order. On a flip queue
-        // the frames are display-timed (Host::dtSet with the refreshes a presented frame at the plan's rate; the stage
-        // then shares a source frame's frames together, and a frame of another source frame is a set's first).
-        // false = a present failed
-        auto cascPresentShared = [&]() -> bool {
+        // a plan's frames are on screen: the plan's, or the old plan's while the next one starts
+        auto cascOnScreen = [&]() { return (casc && casc->present) || cascOld != nullptr; };
+        // the effects route's cascade feed: one output slot read back and handed to stage 1, so every frame it
+        // generates from carries the effects (the old plan's stage 1 too, while it presents)
+        auto cascFeedSlot = [&](uint32_t set, uint32_t i) -> bool {
+            CascadeProbe* to = casc ? (cascUp ? cascUp.get() : casc.get()) : nullptr;
+            CascadeProbe* old = cascOld ? (cascOldUp ? cascOldUp.get() : cascOld.get()) : nullptr;
+            return host.readSlot(host.outBuf.Get(), slotOffset(set, i) - srv.shmInBytes, (UINT64)srv.shmPitch * H,
+                                 [&](const uint8_t* p) {
+                                     if (to)
+                                         to->feedRows(p, srv.shmPitch);
+                                     if (old)
+                                         old->feedRows(p, srv.shmPitch);
+                                 });
+        };
+        // a presented stage's ring on screen (pr, showing shown / keep): every frame it shared since the last pass, in
+        // order. On a flip queue the frames are display-timed (Host::dtSet with the refreshes a presented frame at the
+        // plan's rate; the stage then shares a source frame's frames together, and a frame of another source frame is
+        // a set's first). false = a present failed
+        auto cascPresentShared = [&](CascadeProbe* pr, int shown, int keep) -> bool {
             if (host.flipQueue)
-                casc->setAtOnce(host.dtSet(cascShown && dtCapFps > 3.0 && panelHzMode > 1.0
-                                               ? panelHzMode * cascKeep / (cascShown * dtCapFps)
-                                               : 0.0,
-                                           panelHzMode, cascShown * 16 + cascKeep));
+                pr->setAtOnce(host.dtSet(
+                    shown && dtCapFps > 3.0 && panelHzMode > 1.0 ? panelHzMode * keep / (shown * dtCapFps) : 0.0,
+                    panelHzMode, shown * 16 + keep));
             uint32_t s = 0;
             uint64_t fv = 0;
-            while (casc->nextFrame(s, fv))
+            while (pr->nextFrame(s, fv))
             {
-                const uint32_t in = casc->hdr->slotInput[s];
+                const uint32_t in = pr->hdr->slotInput[s];
                 const bool first = in != dtInput;
                 dtInput = in;
                 if (host.rtRun)
                 {
-                    host.rtPubQpc = (int64_t)((double)casc->hdr->slotQpc[s] * 1e7 / (double)qpcFreq());
+                    host.rtPubQpc = (int64_t)((double)pr->hdr->slotQpc[s] * 1e7 / (double)qpcFreq());
                     host.rtCapQpc = cap.lastFrameTs;
                 }
-                if (!host.presentRing(casc->ring[s].Get(), casc->shared.Get(), fv, first))
+                if (!host.presentRing(pr->ring[s].Get(), pr->shared.Get(), fv, first))
                 {
                     LOG("presentRing failed\n");
                     return false;
                 }
             }
+            return true;
+        };
+        // the frames on screen this pass: the plan's, or the old plan's while the next one starts. false = a present
+        // failed
+        auto cascPresentOn = [&]() -> bool {
+            if (casc && casc->present)
+                return cascPresentShared(casc.get(), cascShown, cascKeep);
+            if (cascOld)
+                return cascPresentShared(cascOld.get(), oldShown, oldKeep);
             return true;
         };
         // every check covers every probe of a plan (the session feeds cascUp, presents casc)
@@ -4105,7 +4221,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     cascStepTick = 0;
                     cascTried = false;
                     cascWantPrev = -1;
-                    cascFallback("a helper kept its multiple");
+                    cascReplace("a helper kept its multiple");
                     return;
                 }
                 if (held(casc) && held(cascUp) && held(cascMid))
@@ -4148,7 +4264,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     cascTopM = 0;
                     cascTried = false;
                     cascWantPrev = -1;
-                    cascFallback(why);
+                    cascReplace(why);
                     return;
                 }
                 cascHoldWins = good ? cascHoldWins + 1 : 0;
@@ -4224,7 +4340,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 return;
             cascTried = false;
             cascWantPrev = -1;
-            cascFallback(why);
+            cascReplace(why);
         };
         // A plan is made on the first two windows' capture rate, which a player's first seconds can read low (28.5 and
         // 29.0 fps of a 30 fps clip: 60 / 29.0 = 2.07 is past 2x's 3 %, so a 60 target took 3x, 90 fps on a 60 Hz
@@ -4262,11 +4378,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 return true;
             cascTried = false;
             cascWantPrev = -1;
-            cascFallback(why);
+            cascReplace(why);
             return true;
         };
-        // a 2 s window's checks of a presenting plan: a stalled stage, the follow down, then the shortfall rule
+        // a 2 s window's checks of a presenting plan: a stalled stage, the follow down, then the shortfall rule. An old
+        // plan presenting while the next one starts: a stalled stage of it ends it
         auto cascWatch = [&](double capFps, double outFps, double dropRate) {
+            if (cascOld && !hidden)
+            {
+                const bool a = cascOld->stalled(), b = cascOldUp && cascOldUp->stalled(),
+                           c = cascOldMid && cascOldMid->stalled();
+                if (a || b || c)
+                    cascOldEnd("it stopped presenting");
+            }
             if (!casc || !casc->present || hidden)
                 return;
             if (cascLost && GetTickCount64() - cascUpTick > 60000)
@@ -4320,15 +4444,18 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 cascPendUp->stop();
                 cascPendUp.reset();
             }
-            // a plan that did not start counts as one lost (cascFallback)
+            // a plan that did not start counts as one lost (cascFallback); an old plan still presenting ends with it
+            cascOldEnd(nullptr);
             cascTried = ++cascLost > 3;
             cascNow = !cascTried;
             LOG("DLSS 4.5's pass did not start: the captured frames are shown as they are %s\n",
                 cascNow ? "until the plan is made again"
                         : "from here on (the plan ended this way four times in a row)");
         };
-        // the presented stage shared its first frame: the session presents its frames from now on
+        // the presented stage shared its first frame: the session presents its frames from now on (an old plan
+        // presenting until now ends here)
         auto cascTakeover = [&]() {
+            cascOldRetire();
             cascWarm = false;
             cascUpTick = GetTickCount64();
             casc->present = true;
@@ -4360,6 +4487,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             const double want = (double)g_targetFps / capFps;
             const int M0 = cascChoose(capFps, m1, m2, m3, keep);
             int M = M0;
+            // an old plan presenting while this one is made: the captured rate needs no plan any more = it ends
+            if (cascOld && limKnown && M < 2 && keep == 1)
+                cascOldEnd("the captured rate needs no frames made");
             if (limKnown && (M >= 2 || keep > 1) && ((M == cascWantPrev && keep == cascKeepPrev) || cascNow))
             {
                 cascTried = true;
@@ -4368,6 +4498,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // the stages: stage 1 at m1, m2 > 1 a second on its ring, m3 > 1 a third on the second's
                 bool two = m2 > 1, three = m3 > 1;
                 uint64_t need = cascPrice() * (1 + (two ? 1 : 0) + (three ? 1 : 0));
+                // the old plan's stages still hold their memory: the new plan starts beside them only in the room
+                // left; else they end now and the plan is made at the next window, in the room they gave back
+                if (cascOld && room && need > room)
+                {
+                    cascOldEnd("their video memory is needed for the new plan");
+                    cascTried = false;
+                    cascNow = true;
+                    return;
+                }
                 if (three && room && need > room)
                 {
                     LOG("DLSS 4.5: %dx (%dx, %dx, then %dx) needs ~%.0f MiB of video memory for its second and third "
@@ -4454,6 +4593,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         cascPendUp = std::make_unique<CascadeProbe>();
                     if (three)
                         cascPendMid = std::make_unique<CascadeProbe>();
+                    // beside an old plan's stages (make before break): names of their own
+                    const int gen = cascOld ? ++cascBridgeSeq : 0;
+                    for (CascadeProbe* q : {cascPend.get(), cascPendUp.get(), cascPendMid.get()})
+                        if (q)
+                            q->tagGen = gen;
                     cascRes = -1;
                     CascadeProbe *p = cascPend.get(), *u = cascPendUp.get(), *mid = cascPendMid.get();
                     ID3D12Device* dev = host.device.Get();
@@ -4950,13 +5094,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     lastPresSched = (tNow - dueMs <= 0.5) ? dueMs : tNow;
                     // the effects route's cascade: stage 1 takes the slot (its frames are presented below); while it
                     // warms up it is fed beside the one-pass present
-                    if (!(casc && casc->present) && !presentSlotFrom(s.set, s.idx))
+                    if (!cascOnScreen() && !presentSlotFrom(s.set, s.idx))
                     {
                         LOG("presentFrame failed\n");
                         rc2 = 1;
                         break;
                     }
-                    if (casc && !cascFeedSlot(s.set, s.idx))
+                    if ((casc || cascOld) && !cascFeedSlot(s.set, s.idx))
                     {
                         LOG("slot readback failed\n");
                         rc2 = 1;
@@ -5012,12 +5156,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // not; a dead one = the plan made again; the presented stage's first shared frame = the takeover
                 if (cascPend && cascRes.load() >= 0)
                     cascTakePend();
+                if (cascOldDead())
+                    cascOldEnd(cascOld->local ? "its stage ended" : "its process ended");
                 if (casc && (casc->present || cascWarm) && cascDead())
                     cascFallback(casc->local ? "its stage ended" : "its process ended", true);
                 else if (cascWarm && casc->hdr && casc->hdr->frames > 0 && idleSlotIdx >= 0)
                     cascTakeover();
-                // the presented stage: every frame it shared since the last pass, in order
-                if (casc && casc->present && !hidden && !cascPresentShared())
+                // the presented stage (or the old plan's while the next one starts): every frame it shared since the
+                // last pass, in order
+                if (!hidden && !cascPresentOn())
                 {
                     rc2 = 1;
                     break;
@@ -5040,6 +5187,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                             g_liveNrReset.store(true); // DLSS 5: a new stream after the gap
                         if (!hidden && casc && casc->present)
                             casc->skipToNewest(); // stage 1 idled with the session: no stale pre-pause tail
+                        if (!hidden && cascOld)
+                            cascOld->skipToNewest();
                     }
                     if (!hidden && g_fill)
                     {
@@ -5191,7 +5340,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     }
                     // while the cascade presents, stage 1 keeps going on the capture's 500 ms keepalive, as on the direct
                     // route: no re-present here
-                    if (idleSlotIdx >= 0 && !(casc && casc->present))
+                    if (idleSlotIdx >= 0 && !cascOnScreen())
                     {
                         const double nowQ = nowMs();
                         if (nextIdleTick <= 0)
@@ -5376,7 +5525,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 const bool following = !host.park && !g_monitor && !hidden && !g_fill;
                 if (following && waitMs > 16)
                     waitMs = 16;
-                if (casc && casc->present)
+                if (cascOnScreen())
                     waitMs = 1; // stage 1's frames arrive at its rate (~7 ms apart at x6 of 24 fps)
                 if (following && followTimer && GetTickCount64() < followUntil)
                 {
@@ -5424,6 +5573,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         LOG(hidden ? "paused (the player is covered or minimized)\n" : "resumed\n");
                         if (!hidden && casc && casc->present)
                             casc->skipToNewest(); // stage 1 idled with the session: no stale pre-pause tail
+                        if (!hidden && cascOld)
+                            cascOld->skipToNewest();
                     }
                     if (!hidden && g_fill)
                     {
@@ -5464,19 +5615,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // paused (alt-tab): frames are drained but not processed (the overlay is hidden)
                 if (got == 1 && !hidden)
                 {
-                    if (casc && casc->present)
-                        (cascUp ? cascUp : casc)->feed(buf.data(), capBytes); // stage 1 takes it; presented below
-                    else
+                    // a plan's frames on screen: stage 1 takes it, presented below; else it is shown as it is (and a
+                    // warming plan's stage 1 takes it too). An old plan presenting while the next one starts: both
+                    // plans' stage 1 take it
+                    if (!cascOnScreen() && !host.presentFrame(buf.data()))
                     {
-                        if (!host.presentFrame(buf.data()))
-                        {
-                            LOG("presentFrame failed\n");
-                            rc2 = 1;
-                            break;
-                        }
-                        if (casc)
-                            (cascUp ? cascUp : casc)->feed(buf.data(), capBytes);
+                        LOG("presentFrame failed\n");
+                        rc2 = 1;
+                        break;
                     }
+                    if (casc)
+                        (cascUp ? cascUp : casc)->feed(buf.data(), capBytes);
+                    if (cascOld)
+                        (cascOldUp ? cascOldUp : cascOld)->feed(buf.data(), capBytes);
                     // direct routes (dlssg/identity): latency of the frame just presented
                     const double latDirect = (nowQpc100() - cap.lastFrameTs) / 10000.0 + stampLagMs();
                     statLatSum += latDirect;
@@ -5498,12 +5649,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 // the plan's stages came up (fed until the presented one shares a frame) or did not
                 if (cascPend && cascRes.load() >= 0)
                     cascTakePend();
+                if (cascOldDead())
+                    cascOldEnd(cascOld->local ? "its stage ended" : "its process ended");
                 if (casc && (casc->present || cascWarm) && cascDead())
                     cascFallback(casc->local ? "its stage ended" : "its process ended", true);
                 else if (cascWarm && casc->hdr && casc->hdr->frames > 0)
                     cascTakeover();
-                // the presented stage: every frame it shared since the last pass, in order
-                if (casc && casc->present && !hidden && !cascPresentShared())
+                // the presented stage (or the old plan's while the next one starts): every frame it shared since the
+                // last pass, in order
+                if (!hidden && !cascPresentOn())
                 {
                     rc2 = 1;
                     break;
@@ -5520,7 +5674,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     if (meter.read(nowQpc100(), cap, pc, stampLagMs() > 0 ? 1000.0 / stampLagMs() : 0.0, inF, outF,
                                    latM))
                     {
-                        const bool between = casc && casc->present;
+                        const bool between = cascOnScreen();
                         const double latShown = between && inF > 0.5 ? latM + 1000.0 / inF : latM;
                         hud.update(inF, outF, latShown);
                         if (latOn && latRows.size() < latRows.capacity())
@@ -5670,6 +5824,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             cascMid->stop();
         if (cascUp)
             cascUp->stop();
+        for (CascadeProbe* q : {cascOld.get(), cascOldMid.get(), cascOldUp.get()}) // an old plan still presenting
+            if (q)
+                q->stop();
+        for (std::thread& t : cascReap) // old plans stopping beside the loop
+            if (t.joinable())
+                t.join();
         if (g_teardownTrace)
             LOG("teardown: capture stopped, shutting the host down\n");
         host.shutdown();

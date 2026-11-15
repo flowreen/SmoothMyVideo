@@ -1347,7 +1347,15 @@ the second's; three stages below the hold share of their multiple (90 %, below) 
 next plan holds two. A stage that ends, does not start or shares nothing for 2 s ends the plan: the captured
 frames are shown as they are and the plan is made again at the next stats window (`DLSS 4.5's pass ended (...): the
 captured frames are shown as they are until the plan is made again`; four losses in a row are the last, the count
-starts over once a plan has presented for a minute). Plans change in place: `Stage1Hdr` version 3 carries the
+starts over once a plan has presented for a minute). A plan the session replaces itself (a shortfall or a step no
+in-place change takes, a helper that kept its multiple, a climb's try that fell short with no rung that held) makes
+the next one before it breaks: its stages keep being fed and presented while the next plan starts beside them, under
+names of their own (`live<pid>rN`), and end when the next plan's presented stage shares its first frame (`DLSS 4.5's
+plan of Nx is made again (...): its passes present until the new plan's first frame`): their inputs end there and
+their stop (each stage's last work and its feature's release, a few hundred ms) runs on a thread of its own, so the new
+plan's frames are presented meanwhile (`DLSS 4.5's old plan stopped beside the new one (N ms)`); the next plan starts beside
+them only in the video memory left, else they end first and the plan is made at the next window (`DLSS 4.5's old
+plan stopped (...)`; `SMV_LIVE_DLSSG_BRIDGE=0` = they end at once, the captured frames shown meanwhile). Plans change in place: `Stage1Hdr` version 3 carries the
 host's ask (`wantGen`), which a helper applies at its next input (1x = no frame generated there, its input passed
 through; the count is an argument of every evaluate, and the first input after 1x is evaluated as a
 clip's first and shared without generated frames, since DLSS-G saw none of the inputs passed through), so any rung
@@ -2053,6 +2061,7 @@ named here, and on a name here that no source holds.
 | `SMV_DLSSG_WQ=0` | a file render's host reads each DLSS 4.5 pair before it sends the next frame, even to a `dlssg2f` with a pair writer (` wq=1`); the A/B and fallback test only, never a product setting |
 | `SMV_DLSSG_KEEP=0` | the resident file-render host starts a new `dlssg2f` for every DLSS 4.5 render instead of keeping the last render's server for the next one of the same padded size, multiplier and frame format; the A/B and fallback test only, never a product setting |
 | `SMV_LIVE_DLSSG_KEEPDIRECT=0` | a kept Live DLSS 4.5 plan (a non-whole multiple) has its presented stage make every frame of its rung and the session present every k-th: by default that stage makes and shares only the frames the keep shows; the A/B and gate lever |
+| `SMV_LIVE_DLSSG_BRIDGE=0` | a Live DLSS 4.5 plan the session replaces itself ends at once and the captured frames are shown until the next plan presents: by default its stages keep presenting while the next plan starts beside them (make before break); the A/B and gate lever |
 | `SMV_LIVE_DLSSG_FOLLOW=0` | a presenting Live DLSS 4.5 plan keeps the plan its first two stats windows derived: by default, in its first 30 s of presenting, it steps down in place to the smaller plan the settled capture rate derives two windows in a row (a capture that read low at the start); the A/B and gate lever |
 | `SMV_LIVE_DLSSG_LOCAL=0` | Live DLSS 4.5's helper passes run as `dlssg2f --stage1` processes: by default each one runs on a thread of the live host itself (`ngx_stage.h`, the stage code `dlssg2f` runs, its ring shared by the same names); the A/B and gate lever |
 | `SMV_LIVE_DLSSG_TIMED=0` | a Live DLSS 4.5 session presents each frame at its time on the CPU (sync interval 0, tearing allowed) on a swap chain of 3 buffers: by default, at a presented rate of one to sixteen refreshes a frame, the presented stage shares a source frame's frames together and each is queued with a sync interval on a flip queue of 16 buffers (a frame that stays more than four refreshes is queued again for the rest), so the display times them; the A/B lever |
