@@ -67,6 +67,73 @@ static bool nativeFsrfgLoad(const std::string& dir, const std::string& cacheDir,
     return true;
 }
 
+// the pan guard's decision count (a log line only: a ring that does not set up leaves the guard uncounted)
+static void fsrfgSeenFree(NativeRife& nr)
+{
+    for (cudaEvent_t& e : nr.fgSeenEv)
+        if (e)
+        {
+            cudaEventDestroy(e);
+            e = nullptr;
+        }
+    if (nr.hFgSeen)
+    {
+        cudaFreeHost(nr.hFgSeen);
+        nr.hFgSeen = nullptr;
+    }
+}
+static void fsrfgSeenInit(NativeRife& nr)
+{
+    bool ok =
+        cudaHostAlloc((void**)&nr.hFgSeen, NativeRife::kFgSeen * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
+    if (!ok)
+        nr.hFgSeen = nullptr;
+    for (cudaEvent_t& e : nr.fgSeenEv)
+        ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+    if (!ok)
+        fsrfgSeenFree(nr);
+}
+
+// decision i of the session counted from its ring slot (its event marks the copy done: kFgSeen decisions later it is
+// long done, so the wait is a formality)
+static void fsrfgSeenCountOne(NativeRife& nr, uint64_t i)
+{
+    const int k = (int)(i % NativeRife::kFgSeen);
+    cudaEventSynchronize(nr.fgSeenEv[k]);
+    nr.fgAsked++;
+    nr.fgTook += nr.hFgSeen[k] > 0.5f ? 1 : 0;
+}
+
+// a level-1 decision's copy into the ring (pg = its block, written by k_panGuard on st just before); the slot's
+// previous decision is counted first
+static void fsrfgSeenRecord(NativeRife& nr, const float* pg, cudaStream_t st)
+{
+    if (!nr.hFgSeen)
+        return;
+    if (nr.fgSeenN >= NativeRife::kFgSeen)
+        fsrfgSeenCountOne(nr, nr.fgSeenN - NativeRife::kFgSeen);
+    const int k = (int)(nr.fgSeenN % NativeRife::kFgSeen);
+    cudaMemcpyAsync(nr.hFgSeen + k, pg, sizeof(float), cudaMemcpyDeviceToHost, st);
+    cudaEventRecord(nr.fgSeenEv[k], st);
+    nr.fgSeenN++;
+}
+
+// the teardown: the decisions still in the ring counted, the session's line, the ring freed
+static void fsrfgSeenEnd(NativeRife& nr)
+{
+    if (nr.hFgSeen)
+    {
+        const uint64_t n = nr.fgSeenN, k = NativeRife::kFgSeen;
+        for (uint64_t i = n > k ? n - k : 0; i < n; i++)
+            fsrfgSeenCountOne(nr, i);
+        if (nr.fgAsked)
+            LOG("native: fsrfg: the pan guard took the pan for %llu of %llu pairs\n", (unsigned long long)nr.fgTook,
+                (unsigned long long)nr.fgAsked);
+    }
+    fsrfgSeenFree(nr);
+    nr.fgSeenN = nr.fgAsked = nr.fgTook = 0;
+}
+
 // instance i at w x h (RGBA16F) with its shared textures (as CUDA arrays) and fence imported into this CUDA context
 static bool nativeFsrfgCreate(NativeRife& nr, int i)
 {
@@ -138,6 +205,8 @@ static bool nativeFsrfgCreate(NativeRife& nr, int i)
         LOG("native: fsrfg: the pan guard block did not allocate\n");
         return false;
     }
+    if (!nr.hFgSeen)
+        fsrfgSeenInit(nr);
     g.val = 0;
     nr.frLastKey[i] = 0;
     nr.frCalls[i] = 0;
@@ -254,12 +323,92 @@ static bool fsrfgPanGuardEnvOn()
     return on;
 }
 
-// the pan guard block of fgOf's field slot (out[slot]), null = no guard this session (the lever, no pan measured: Live)
+// the pan guard block of fgOf's field slot (out[slot]), null = no guard this session (the lever, no pan measured yet)
 static const float* fsrfgPanGuard(const NativeRife& nr, int slot)
 {
     return fsrfgPanGuardEnvOn() && nr.fgPanHave && nr.dFgGuard ? nr.dFgGuard + slot * NativeRife::kFgGuardFloats
                                                                : nullptr;
 }
+
+// panvec's quarter-size luma thumbnail of a frame's host bytes: per 4 x 4 block, R + 2G + B of its pixels 1 and 2 in
+// rows 1 and 2, summed, >> 4 (the capture's kFeedThumbCS makes the same integers on the GPU). A pixel is `bpp` bytes,
+// its three colours `chan` bytes apart from byte `off` (rgb24 3 / 1 / 0, rgb48le's high bytes 6 / 2 / 1, BGRA 4 / 1 /
+// 0: red and blue weigh the same, so their order is free); t4 = (w / 4) x (h / 4) bytes
+static void fsrfgPanThumb(const uint8_t* src, size_t pitch, uint32_t w, uint32_t h, uint32_t bpp, uint32_t chan,
+                          uint32_t off, uint8_t* t4)
+{
+    const uint32_t w4 = w / 4, h4 = h / 4;
+    for (uint32_t y = 0; y < h4; y++)
+    {
+        const uint8_t* r1 = src + (size_t)(y * 4 + 1) * pitch;
+        const uint8_t* r2 = r1 + pitch;
+        for (uint32_t x = 0; x < w4; x++)
+        {
+            uint32_t s = 0;
+            for (const uint8_t* r : {r1, r2})
+                for (uint32_t c = x * 4 + 1; c <= x * 4 + 2; c++)
+                {
+                    const uint8_t* p = r + (size_t)c * bpp + off;
+                    s += (uint32_t)p[0] + 2u * p[chan] + p[2 * chan];
+                }
+            t4[(size_t)y * w4 + x] = (uint8_t)(s >> 4);
+        }
+    }
+}
+
+// panvec's result as the guard's input at the frame's px: the pan and its still rects (more than the block holds = no
+// guard for that pair, the field as it is)
+static void fsrfgPanFill(NativeRife::FgPanIn& p, const panvec::Result& r)
+{
+    p.on = r.on ? 1.0f : 0.0f;
+    p.mx = r.mx;
+    p.my = r.my;
+    int n = 0;
+    for (const D3D12_RECT& q : r.still)
+    {
+        if (n == 96)
+            break;
+        p.rect[4 * n] = (float)q.left;
+        p.rect[4 * n + 1] = (float)q.top;
+        p.rect[4 * n + 2] = (float)q.right;
+        p.rect[4 * n + 3] = (float)q.bottom;
+        n++;
+    }
+    if (r.still.size() > 96)
+        p.on = 0.0f;
+    p.n = (float)n;
+}
+
+// a frame's pan at its px (fw x fh) into nr.fgPanIn at the working size, for the pair the frame closes
+static void fsrfgPanTake(NativeRife& nr, const NativeRife::FgPanIn& in, float fw, float fh)
+{
+    const float sx = (float)nr.w / fw, sy = (float)nr.h / fh;
+    NativeRife::FgPanIn& p = nr.fgPanIn;
+    p.on = in.on;
+    p.mx = in.mx * sx;
+    p.my = in.my * sy;
+    p.n = in.n;
+    for (int k = 0; k < 4 * (int)in.n; k += 4)
+    {
+        p.rect[k] = in.rect[k] * sx;
+        p.rect[k + 1] = in.rect[k + 1] * sy;
+        p.rect[k + 2] = in.rect[k + 2] * sx;
+        p.rect[k + 3] = in.rect[k + 3] * sy;
+    }
+    if (!nr.fgPanHave)
+        LOG("native: fsrfg: the pan guard on: a pair whose Optical Flow field misses the frames' pan by more than 8 px "
+            "takes the pan (SMV_FSRFG_PANGUARD=0 = off)\n");
+    nr.fgPanHave = true;
+}
+
+// Live's pan for the frame a group message closes, appended after its fractions (the count's bit 30 set): the
+// capture's thumbnail measured on the loop's thread, at the captured frame's px
+struct LivePanMsg
+{
+    NativeRife::FgPanIn pan;
+    float fw = 0.0f, fh = 0.0f;
+};
+static constexpr uint32_t kMsgPanBit = 0x40000000u;
 
 // the vectors between slots `prev` and `cur`, both holding their ABGR8 frames: the field cur -> prev in px (the backward
 // field of the pair), into dst as R16G16_FLOAT texels, rows dstPitch bytes apart. edge = frame generation: the edge
@@ -319,6 +468,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
             nr.die("fsrfg pan guard launch failed");
             return false;
         }
+        fsrfgSeenRecord(nr, pg, st);
     }
     if (grid == 1) // the field is the texels' grid: one pass, no float planes in between
     {
@@ -1377,6 +1527,7 @@ static void nativeFsrfgRelease(NativeRife& nr)
         cudaFree(nr.dFgMv);
         nr.dFgMv = nullptr;
     }
+    fsrfgSeenEnd(nr); // before the guard block its copies read goes
     if (nr.dFgGuard)
     {
         cudaFree(nr.dFgGuard);

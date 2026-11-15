@@ -392,11 +392,12 @@ struct NativeRife
     LUID fgLuid = {};
     int fgPitch = 0, fgMvPitch = 0; // the bridge's row pitches (bytes), the same for every instance
     uint8_t* dFgMv = nullptr;       // a call's vectors (RG16F rows fgMvPitch apart) before their copy into its texture
-    // THE PAN GUARD (file renders; SMV_FSRFG_PANGUARD=0 = off): the offline loop measures each source frame's pan
-    // against the one before it from its host bytes (fgPanIn at the working size, fgPanHave once one is measured);
-    // a pair's level-1 call hands it to k_panGuard, which writes the decision into that field slot's block of
-    // dFgGuard (kFgGuardFloats floats each, out[0] / out[1] as fgOf's fields): its writers take the pan where the
-    // field's median misses it by more than 8 px (pgAt in the kernel text)
+    // THE PAN GUARD (SMV_FSRFG_PANGUARD=0 = off): each source frame's pan against the one before it on panvec's quarter-
+    // size luma thumbnail (fgPanIn at the working size, fgPanHave once one is measured): a file render measures it from
+    // the frame's host bytes, Live from the capture's thumbnail (the loop sends it with the frame, LivePanMsg); a
+    // pair's level-1 call hands it to k_panGuard, which writes the decision into that field slot's block of dFgGuard
+    // (kFgGuardFloats floats each, out[0] / out[1] as fgOf's fields): its writers take the pan where the field's median
+    // misses it by more than 8 px (pgAt in the kernel text)
     struct FgPanIn // = the kernel text's PanGuardIn, byte for byte
     {
         float on = 0.0f, mx = 0.0f, my = 0.0f, n = 0.0f;
@@ -406,6 +407,12 @@ struct NativeRife
     FgPanIn fgPanIn;
     bool fgPanHave = false;
     float* dFgGuard = nullptr;
+    // the session's count of the guard's decisions: each one copied into a pinned ring (hFgSeen, one event a slot),
+    // counted when its slot comes round again or at the teardown (the line `the pan guard took the pan for N of M`)
+    static constexpr int kFgSeen = 8;
+    float* hFgSeen = nullptr;
+    cudaEvent_t fgSeenEv[kFgSeen] = {};
+    uint64_t fgSeenN = 0, fgAsked = 0, fgTook = 0;
     // SMV_FSRFG_PROF=1: CUDA events between a call's stages (copy in, the Optical Flow inputs, the Optical Flow, the
     // vector kernels, the vector copy, FSR on vkd3d, the copy out), means at the session's end; every call then waits
     // for its last event, so the stages do not overlap the next call's. A derived call's k_mvDerive counts apart

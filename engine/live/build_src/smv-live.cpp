@@ -3153,49 +3153,12 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     panvec::Estimator panEst;
     std::vector<uint8_t> panT4(panGuard ? (size_t)(srcW / 4) * (srcH / 4) : 0);
     auto measurePan = [&](const uint8_t* src) {
-        const uint32_t w4 = (uint32_t)srcW / 4, h4 = (uint32_t)srcH / 4, bpp = fmt16 ? 6u : 3u, hi = fmt16 ? 1u : 0u;
-        const size_t pitch = (size_t)srcW * bpp;
-        for (uint32_t y = 0; y < h4; y++)
-        {
-            const uint8_t* r1 = src + (size_t)(y * 4 + 1) * pitch;
-            const uint8_t* r2 = r1 + pitch;
-            for (uint32_t x = 0; x < w4; x++)
-            {
-                uint32_t s = 0;
-                for (const uint8_t* r : {r1, r2})
-                    for (uint32_t c = x * 4 + 1; c <= x * 4 + 2; c++)
-                    {
-                        const uint8_t* p = r + (size_t)c * bpp + hi; // a 16-bit channel's high byte (little endian)
-                        s += (uint32_t)p[0] + 2u * p[bpp / 3] + p[2 * bpp / 3];
-                    }
-                panT4[(size_t)y * w4 + x] = (uint8_t)(s >> 4);
-            }
-        }
-        const panvec::Result r = panEst.runThumb(panT4.data(), w4, (uint32_t)srcW, (uint32_t)srcH);
-        const float sx = (float)nr.w / (float)srcW, sy = (float)nr.h / (float)srcH;
-        NativeRife::FgPanIn& p = nr.fgPanIn;
-        p.on = r.on ? 1.0f : 0.0f;
-        p.mx = r.mx * sx;
-        p.my = r.my * sy;
-        int n = 0;
-        for (const D3D12_RECT& q : r.still)
-        {
-            if (n == 96)
-                break;
-            p.rect[4 * n] = (float)q.left * sx;
-            p.rect[4 * n + 1] = (float)q.top * sy;
-            p.rect[4 * n + 2] = (float)q.right * sx;
-            p.rect[4 * n + 3] = (float)q.bottom * sy;
-            n++;
-        }
-        // more still rects than the block holds: no guard for this pair (the field as it is)
-        if (r.still.size() > 96)
-            p.on = 0.0f;
-        p.n = (float)n;
-        if (!nr.fgPanHave)
-            LOG("native: fsrfg: the pan guard on: a pair whose Optical Flow field misses the frames' pan by more than 8 "
-                "px takes the pan (SMV_FSRFG_PANGUARD=0 = off)\n");
-        nr.fgPanHave = true;
+        const uint32_t bpp = fmt16 ? 6u : 3u; // rgb48le: each channel's high byte (little endian)
+        fsrfgPanThumb(src, (size_t)srcW * bpp, (uint32_t)srcW, (uint32_t)srcH, bpp, bpp / 3, fmt16 ? 1u : 0u,
+                      panT4.data());
+        NativeRife::FgPanIn p;
+        fsrfgPanFill(p, panEst.runThumb(panT4.data(), (uint32_t)srcW / 4, (uint32_t)srcW, (uint32_t)srcH));
+        fsrfgPanTake(nr, p, (float)srcW, (float)srcH);
     };
     for (uint64_t i = 0; !failed; i++)
     {

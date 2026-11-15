@@ -3682,7 +3682,46 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // the fraction list, write the message. Returns nfr, or UINT32_MAX on a write failure.
         // fraction message: one f32 per slot the server was actually sized for (shmSlots),
         // so the drift tracker can raise the ladder up to the ceiling without overrunning it
-        std::vector<uint8_t> msgBuf(4 + 4 * (size_t)(srv.shmSlots ? srv.shmSlots : (uint32_t)genFrames + 1));
+        std::vector<uint8_t> msgBuf(4 + 4 * (size_t)(srv.shmSlots ? srv.shmSlots : (uint32_t)genFrames + 1) +
+                                    sizeof(LivePanMsg));
+        // FRAME GENERATION'S PAN GUARD (AMD FSR 4 / Intel XeSS-FG, SMV_FSRFG_PANGUARD=0 = off): each frame sent, its pan
+        // against the frame sent before it, from the capture's quarter-size luma thumbnail (the GPU's on the interop
+        // route, the read bytes' otherwise) on this thread, sent with the frame (LivePanMsg: the host's guard takes it
+        // for the pair the frame closes, as a file render's does from the frame's bytes)
+        const bool panLive = g_backend == BK_SERVER && g_serverBackend == L"fsrfg" && fsrfgPanGuardEnvOn();
+        panvec::Estimator panLiveEst;
+        std::vector<uint8_t> panLiveT4;
+        LivePanMsg panLiveMsg;
+        bool panLiveReady = false;
+        double panLiveMs = 0.0;
+        int panLiveN = 0;
+        auto panLiveMeasure = [&](bool gpu, const uint8_t* bytes) {
+            const double t0 = nowMs();
+            size_t pitch = cap.cw / 4;
+            if (gpu)
+            {
+                if (!cap.initThumb(g_hdr))
+                    return;
+                pitch = cap.thumbPitch;
+                panLiveT4.resize((size_t)cap.thumbPitch * cap.thumbH);
+                if (!cap.thumbShared(panLiveT4.data()))
+                    return;
+            }
+            else
+            {
+                panLiveT4.resize(pitch * (cap.ch / 4));
+                fsrfgPanThumb(bytes, (size_t)cap.cw * 4, cap.cw, cap.ch, 4, 1, 0, panLiveT4.data());
+            }
+            fsrfgPanFill(panLiveMsg.pan, panLiveEst.runThumb(panLiveT4.data(), pitch, cap.cw, cap.ch));
+            panLiveMsg.fw = (float)cap.cw;
+            panLiveMsg.fh = (float)cap.ch;
+            panLiveReady = true;
+            panLiveMs += nowMs() - t0;
+            if (++panLiveN == 300)
+                LOG("frame generation's pan guard: the capture's pan %.2f ms a frame on the loop (%s thumbnail, 300 "
+                    "frames)\n",
+                    panLiveMs / panLiveN, gpu ? "the GPU's" : "the read bytes'");
+        };
         auto sendPairStream = [&](int64_t sentTs) -> uint32_t {
             // SMOOTHED PAIR CLOCK for the adaptive grid: WGC delivery times quantize to the
             // panel/VRR refresh cadence (measured +-4ms), which makes pair spans bimodal
@@ -3882,9 +3921,17 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 frucPipeT = nowMs();
             }
             sendLag = pipeThis ? 1 : 0;
-            const uint32_t hdr = nfr | (pipeThis ? 0x80000000u : 0u); // the host's route bit (nativeGroup)
+            uint32_t hdr = nfr | (pipeThis ? 0x80000000u : 0u); // the host's route bit (nativeGroup)
+            DWORD len = 4 + 4 * nfr;
+            if (panLiveReady) // the sent frame's pan, after the fractions
+            {
+                memcpy(msg + len, &panLiveMsg, sizeof panLiveMsg);
+                len += (DWORD)sizeof panLiveMsg;
+                hdr |= kMsgPanBit;
+                panLiveReady = false;
+            }
             memcpy(msg, &hdr, 4);
-            if (!srv.writeFull(msg, 4 + 4 * nfr))
+            if (!srv.writeFull(msg, len))
                 return UINT32_MAX;
             prevSentTs = sentTs;
             return nfr;
@@ -5631,6 +5678,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         {
                             const double arrMs = nowMs();
                             const int64_t sentTs = cap.lastFrameTs;
+                            if (panLive)
+                                panLiveMeasure(gpuCap, buf.data());
                             const uint32_t nfr = sendPairStream(sentTs);
                             if (nfr == UINT32_MAX)
                             {

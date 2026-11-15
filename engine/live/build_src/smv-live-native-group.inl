@@ -9,10 +9,20 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
     memcpy(&nfr, msg.data(), 4);
     // the exe's route bit (sendPairStream): this Smooth Motion / AMD FSR 4 group shows the previous pair, pipelined
     const bool pipeAsk = (nfr & 0x80000000u) != 0;
-    nfr &= 0x7fffffffu;
+    // Live's pan of the frame this message closes (the loop's capture thumbnail): after the fractions, for the guard
+    // of the pair it closes (fsrfgPanTake before the frame is fed)
+    const bool panIn = (nfr & kMsgPanBit) != 0;
+    nfr &= ~(0x80000000u | kMsgPanBit);
     const float* fr = (const float*)(msg.data() + 4);
-    if (msg.size() < 4 + 4ull * nfr)
+    if (msg.size() < 4 + 4ull * nfr + (panIn ? sizeof(LivePanMsg) : 0))
         return false;
+    if (panIn && nr.fsrfg)
+    {
+        LivePanMsg lp;
+        memcpy(&lp, msg.data() + 4 + 4ull * nfr, sizeof lp);
+        if (lp.fw > 0.0f && lp.fh > 0.0f)
+            fsrfgPanTake(nr, lp.pan, lp.fw, lp.fh);
+    }
     if (nfr > nr.slots)
         nfr = nr.slots;
     const bool pipe =

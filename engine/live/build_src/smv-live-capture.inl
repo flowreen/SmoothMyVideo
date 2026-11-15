@@ -61,14 +61,16 @@ static const char kSamePictureCS[] =
     "    if (d) flag.Store(0, 1u);\n"
     "}\n";
 
-// The Live direct DLSS 4.5 route fed from the GPU (Capture::latestFrameFeed): the pan estimator's 1/4 luma thumbnail of
-// a B8G8R8A8 frame, the same integers as pan_vectors.h's thumbRows: per 4 x 4 block, R + 2 G + B of its pixels 1 and 2
-// in rows 1 and 2, summed, >> 4 (unorm bytes read back exactly as v * 255). A thread writes four bytes of a row (one
-// word); pitch = a row's bytes, a multiple of 4
+// The pan estimator's 1/4 luma thumbnail of a captured frame on the GPU (Capture::thumbDispatch: the Live direct DLSS
+// 4.5 route's GPU feed, frame generation's pan guard on the native route), the same integers as pan_vectors.h's
+// thumbRows: per 4 x 4 block, R + 2 G + B of its pixels 1 and 2 in rows 1 and 2, summed, >> 4 (B8G8R8A8 unorm bytes
+// read back exactly as v * 255). An FP16 scRGB frame (hdr) first takes v = (v / 4)^(1 / 2.2), clamped: a byte scale
+// that moves with the picture (the estimator compares frames with each other, not with any reference). A thread
+// writes four bytes of a row (one word); pitch = a row's bytes, a multiple of 4
 static const char kFeedThumbCS[] =
     "Texture2D<float4> src : register(t0);\n"
     "RWByteAddressBuffer dst : register(u0);\n"
-    "cbuffer size : register(b0) { uint w4; uint h4; uint pitch; uint unused; };\n"
+    "cbuffer size : register(b0) { uint w4; uint h4; uint pitch; uint hdr; };\n"
     "[numthreads(64,1,1)]\n"
     "void main(uint3 id : SV_DispatchThreadID)\n"
     "{\n"
@@ -82,7 +84,9 @@ static const char kFeedThumbCS[] =
     "        {\n"
     "            [unroll] for (uint k = 0; k < 4; k++)\n"
     "            {\n"
-    "                uint3 c = (uint3)(src[uint2(x * 4 + 1 + (k & 1), id.y * 4 + 1 + (k >> 1))].rgb * 255.0 + 0.5);\n"
+    "                float3 v = src[uint2(x * 4 + 1 + (k & 1), id.y * 4 + 1 + (k >> 1))].rgb;\n"
+    "                if (hdr) v = pow(max(v, 0.0) * 0.25, 1.0 / 2.2);\n"
+    "                uint3 c = (uint3)(saturate(v) * 255.0 + 0.5);\n"
     "                s += c.r + 2 * c.g + c.b;\n"
     "            }\n"
     "        }\n"
@@ -265,41 +269,20 @@ struct Capture
     ComPtr<ID3D11ComputeShader> thumbCS;
     ComPtr<ID3D11Buffer> thumbBuf, thumbStaging, thumbCb;
     ComPtr<ID3D11UnorderedAccessView> thumbUav;
+    ComPtr<ID3D11ShaderResourceView> sharedSrv; // the thumbnail's view of sharedTex (frame generation's pan guard)
     uint32_t thumbW = 0, thumbH = 0, thumbPitch = 0;
-    bool feedOn = false;
+    bool feedOn = false, thumbOn = false;
 
-    bool initFeed()
+    // the thumbnail's shader and buffers at cw / 4 x ch / 4 (hdr = the source an FP16 scRGB frame); once a capture
+    bool initThumb(bool hdr)
     {
-        ComPtr<ID3D11Device5> dev5;
-        if (FAILED(dev11.As(&dev5)) || FAILED(ctx11.As(&ctx4)))
-            return false;
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width = cw;
-        td.Height = ch;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        td.SampleDesc = {1, 0};
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-        for (int i = 0; i < kFeedSlots; i++)
-        {
-            ComPtr<IDXGIResource1> r1;
-            if (FAILED(dev11->CreateTexture2D(&td, nullptr, &feedTex[i])) || FAILED(feedTex[i].As(&r1)) ||
-                FAILED(r1->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &hFeedTex[i])) ||
-                FAILED(dev11->CreateShaderResourceView(feedTex[i].Get(), nullptr, &feedSrv[i])))
-                return false;
-        }
-        if (FAILED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&feedFence))) ||
-            FAILED(feedFence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &hFeedFence)))
-            return false;
+        if (thumbOn)
+            return true;
         ComPtr<ID3DBlob> cs, err;
         if (FAILED(D3DCompile(kFeedThumbCS, sizeof(kFeedThumbCS) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0,
                               &cs, &err)))
         {
-            LOG("capture feed: thumbnail shader compile failed: %s\n",
-                err ? (const char*)err->GetBufferPointer() : "?");
+            LOG("capture: thumbnail shader compile failed: %s\n", err ? (const char*)err->GetBufferPointer() : "?");
             return false;
         }
         if (FAILED(dev11->CreateComputeShader(cs->GetBufferPointer(), cs->GetBufferSize(), nullptr, &thumbCS)))
@@ -333,9 +316,81 @@ struct Capture
         cd.ByteWidth = 16;
         cd.Usage = D3D11_USAGE_DEFAULT;
         cd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        const UINT size[4] = {thumbW, thumbH, thumbPitch, 0};
+        const UINT size[4] = {thumbW, thumbH, thumbPitch, hdr ? 1u : 0u};
         const D3D11_SUBRESOURCE_DATA sd{size, 0, 0};
         if (FAILED(dev11->CreateBuffer(&cd, &sd, &thumbCb)))
+            return false;
+        thumbOn = true;
+        return true;
+    }
+
+    // the thumbnail of srv's texture into the staging buffer (read by thumbRead)
+    void thumbDispatch(ID3D11ShaderResourceView* srv)
+    {
+        ID3D11UnorderedAccessView* uav = thumbUav.Get();
+        ID3D11Buffer* cb = thumbCb.Get();
+        ctx11->CSSetShader(thumbCS.Get(), nullptr, 0);
+        ctx11->CSSetShaderResources(0, 1, &srv);
+        ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        ctx11->CSSetConstantBuffers(0, 1, &cb);
+        ctx11->Dispatch((thumbW + 255) / 256, thumbH, 1);
+        ID3D11ShaderResourceView* noSrv = nullptr;
+        ID3D11UnorderedAccessView* noUav = nullptr;
+        ctx11->CSSetShaderResources(0, 1, &noSrv);
+        ctx11->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+        ctx11->CopyResource(thumbStaging.Get(), thumbBuf.Get());
+    }
+
+    // the dispatched thumbnail into `thumb` (thumbPitch * thumbH bytes); waits for its copy
+    bool thumbRead(uint8_t* thumb)
+    {
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx11->Map(thumbStaging.Get(), 0, D3D11_MAP_READ, 0, &m)))
+            return false;
+        memcpy(thumb, m.pData, (size_t)thumbPitch * thumbH);
+        ctx11->Unmap(thumbStaging.Get(), 0);
+        return true;
+    }
+
+    // the interop route's newest frame (sharedTex, copied by latestFrameGpu) as its thumbnail: frame generation's pan
+    // guard; false = no thumbnail (no guard for that pair)
+    bool thumbShared(uint8_t* thumb)
+    {
+        if (!interop || !initThumb(g_hdr))
+            return false;
+        if (!sharedSrv && FAILED(dev11->CreateShaderResourceView(sharedTex.Get(), nullptr, &sharedSrv)))
+            return false;
+        thumbDispatch(sharedSrv.Get());
+        return thumbRead(thumb);
+    }
+
+    bool initFeed()
+    {
+        ComPtr<ID3D11Device5> dev5;
+        if (FAILED(dev11.As(&dev5)) || FAILED(ctx11.As(&ctx4)))
+            return false;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = cw;
+        td.Height = ch;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc = {1, 0};
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        for (int i = 0; i < kFeedSlots; i++)
+        {
+            ComPtr<IDXGIResource1> r1;
+            if (FAILED(dev11->CreateTexture2D(&td, nullptr, &feedTex[i])) || FAILED(feedTex[i].As(&r1)) ||
+                FAILED(r1->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &hFeedTex[i])) ||
+                FAILED(dev11->CreateShaderResourceView(feedTex[i].Get(), nullptr, &feedSrv[i])))
+                return false;
+        }
+        if (FAILED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&feedFence))) ||
+            FAILED(feedFence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &hFeedFence)))
+            return false;
+        if (!initThumb(false)) // the feed's slots are B8G8R8A8 (SDR only)
             return false;
         feedOn = true;
         return true;
@@ -355,27 +410,10 @@ struct Capture
         copyCropped(feedTex[slot].Get(), tex.get());
         release(frame);
         newestIn = 0;
-        ID3D11ShaderResourceView* srv = feedSrv[slot].Get();
-        ID3D11UnorderedAccessView* uav = thumbUav.Get();
-        ID3D11Buffer* cb = thumbCb.Get();
-        ctx11->CSSetShader(thumbCS.Get(), nullptr, 0);
-        ctx11->CSSetShaderResources(0, 1, &srv);
-        ctx11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-        ctx11->CSSetConstantBuffers(0, 1, &cb);
-        ctx11->Dispatch((thumbW + 255) / 256, thumbH, 1);
-        ID3D11ShaderResourceView* noSrv = nullptr;
-        ID3D11UnorderedAccessView* noUav = nullptr;
-        ctx11->CSSetShaderResources(0, 1, &noSrv);
-        ctx11->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
-        ctx11->CopyResource(thumbStaging.Get(), thumbBuf.Get());
+        thumbDispatch(feedSrv[slot].Get());
         value = ++feedValue;
         ctx4->Signal(feedFence.Get(), value);
-        D3D11_MAPPED_SUBRESOURCE m{};
-        if (FAILED(ctx11->Map(thumbStaging.Get(), 0, D3D11_MAP_READ, 0, &m)))
-            return -1;
-        memcpy(thumb, m.pData, (size_t)thumbPitch * thumbH);
-        ctx11->Unmap(thumbStaging.Get(), 0);
-        return 1;
+        return thumbRead(thumb) ? 1 : -1;
     }
 
     // dlssg HDR: compile the pack shader and create the conversion chain (cw x ch known by
@@ -687,6 +725,8 @@ struct Capture
         thumbStaging.Reset();
         thumbCb.Reset();
         thumbUav.Reset();
+        sharedSrv.Reset();
+        thumbOn = false;
         ctx4.Reset();
         staging.Reset();
         convCS.Reset();
