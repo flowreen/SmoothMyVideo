@@ -208,6 +208,26 @@ static int dlssgKeepPlan(double w, int lim, int& m1, int& m2, int& keep)
     return 0;
 }
 
+// Fit to the GPU's floor between 1x and 2x: the largest one-pass rung R (2..lim) over a keep k (2..6) at most p and
+// above 1x (lim 6: 6/5 = 1.2x .. 5/3 = 1.67x), the smaller R on a tie; 0 = none
+static int dlssgKeepAtMost(double p, int lim, int& keep)
+{
+    int bestR = 0;
+    double best = 1.0;
+    for (int r = 2; r <= lim; r++)
+        for (int k = 2; k <= 6; k++)
+        {
+            const double v = (double)r / k;
+            if (v > best && v <= p)
+            {
+                best = v;
+                bestR = r;
+                keep = k;
+            }
+        }
+    return bestR;
+}
+
 // "2nd" .. "6th": the keep's ordinal in the log lines
 static const char* dlssgNth(int k)
 {
@@ -3036,8 +3056,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // comes out of dlssgSnap twice in a row (cascWantPrev; cascPlan), M = cascM1 x cascM2 x cascM3 in up to three
         // stages (cascM3 1 = two, cascM2 1 = one); cascWarm = the stages run and are fed until the presented one
         // shares a frame; cascShown = the multiple the stats line reports while the session presents the plan's
-        // frames (0 = no plan presents); cascLow = 2 s windows in a row a watched plan (three stages, or two above
-        // the one-pass limit) ran short of its multiple; cascMaxM = such a plan fell short: the next plan's multiple
+        // frames (0 = no plan presents); cascLow = 2 s windows in a row a watched plan (every plan with Fit to the GPU
+        // on; off: three stages, or two above the one-pass limit) ran short of its multiple; cascMaxM = such a plan
+        // fell short: the next plan's multiple
         // at most (what the GPU held, 0 = none)
         int cascM = 0, cascM1 = 0, cascM2 = 0, cascM3 = 1, cascWantPrev = -1, cascShown = 0, cascLow = 0, cascMaxM = 0;
         bool cascTwoTopShort = false; // the two-pass top (the limit x the limit) fell short this session
@@ -4449,8 +4470,32 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             cascClimbWait = cascClimbWait ? (std::min)(cascClimbWait * 2, (ULONGLONG)240000) : 15000;
             cascClimbTick = GetTickCount64() + cascClimbWait;
         };
-        // three stages, or two above the one-pass limit (no keep: a keep is never capped by its cost), below cascHold of
-        // their multiple three 2 s windows in a row: what the GPU affords is less, so they end and the next plan takes
+        // THE FLOOR (Fit to the GPU on, a plan that held under 2x of the source): interpolation gives the GPU up to the
+        // other effects only as far as it must, as every model's throttle does: the largest one-pass keep at most what
+        // the plan held, under the multiple it shows (dlssgKeepAtMost: 1.2x .. 1.67x), sits there; under 1.1x (or no
+        // keep, the keep plan off) 1x in place (cascAtOne: the source frames alone, the upscaler after DLSS 4.5 still on
+        // every shown frame), 2x tried again after `wait`. False = the running stages took neither
+        auto cascFloorStep = [&](double held, const char* why, ULONGLONG wait) -> bool {
+            int k = 1;
+            const int R = cascKeepOn && held >= 1.1 ? dlssgKeepAtMost(held, liveDlssgLimit(), k) : 0;
+            if (R && (double)R / k < (double)cascShown / cascKeep && cascSwitch(R, R, 1, 1, k, why))
+            {
+                cascAtOne = cascOneTry = false;
+                return true;
+            }
+            char why1[160];
+            snprintf(why1, sizeof why1, "%s: 2x tried again in %llu s", why, (unsigned long long)(wait / 1000));
+            if (!cascSwitch(1, 1, 1, 1, 1, why1))
+                return false;
+            cascAtOne = true;
+            cascOneTry = false;
+            cascOneWait = wait;
+            cascOneTick = GetTickCount64() + wait;
+            return true;
+        };
+        // a plan (with Fit to the GPU on every plan; off: three stages, or two above the one-pass limit, for the off
+        // line), below cascHold of its multiple three 2 s windows in a row: what the GPU affords is less, so it ends and
+        // the next plan takes (a keep is never capped by an estimated cost when chosen; a measured shortfall steps it down)
         // the largest multiple at most what they held, with a tenth to spare (cascMaxM). Three stages that held less
         // than the two-pass top (the limit x the limit) leave that rung its own try: the third stage's cost leaves
         // with it (1 % of 2560x1440 from 21.5 fps: three passes held 28.5x, the next plan's 30x presented 634, 6x then
@@ -4474,7 +4519,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (held(casc) && held(cascUp) && held(cascMid))
                     cascStepTick = 0;
             }
-            const bool watched = cascUp || (cascKeep == 1 && cascM > lim);
+            // Fit to the GPU on: every plan (one pass, a keep, several stages) steps down when it falls short, to 1x at
+            // the floor, as every model does; off: the target's rung, only the plans the off line names are watched
+            const bool watched = !g_noGpuFit || cascUp || (cascKeep == 1 && cascM > lim);
             if (!watched || !cascShown || hidden || capFps < 0.5)
             {
                 cascLow = 0;
@@ -4498,13 +4545,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                         cascLow = 0;
                         return;
                     }
-                    cascOneWait = (std::min)(cascOneWait * 2, (ULONGLONG)240000);
-                    cascOneTick = now + cascOneWait;
-                    char why[112];
-                    snprintf(why, sizeof why, "%.2fx of 2x, what the GPU affords is less: 2x tried again in %llu s",
-                             outFps / capFps, (unsigned long long)(cascOneWait / 1000));
-                    if (!cascSwitch(1, 1, 1, 1, 1, why))
-                        cascAtOne = false; // the stages took no 1x: the plan's own rules from here
+                    // short: the floor again from what the try held (a keep it sustains sits there), 1x with the
+                    // back-off doubled
+                    char why[96];
+                    snprintf(why, sizeof why, "%.2fx of 2x, what the GPU affords is less", outFps / capFps);
+                    if (!cascFloorStep(outFps / capFps, why, (std::min)(cascOneWait * 2, (ULONGLONG)240000)))
+                        cascAtOne = false; // the stages took neither: the plan's own rules from here
                     return;
                 }
                 if (now >= cascOneTick)
@@ -4601,17 +4647,15 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             char why[96];
             snprintf(why, sizeof(why), "%.2fx of %.2fx, what the GPU affords is less", outFps / capFps,
                      (double)cascShown / cascKeep);
-            // a plan at 2x that still falls short: 1x in place, as every model's floor shows the source frames alone
-            // (its stages keep running, the upscaler after DLSS 4.5 still on every shown frame); the try back up = above
-            if (cascShown <= 2 * cascKeep && cascSwitch(1, 1, 1, 1, 1, why))
-            {
-                cascAtOne = true;
-                cascOneTry = false;
-                cascOneWait = 15000;
-                cascOneTick = GetTickCount64() + cascOneWait;
+            // a plan at 2x or less, or one that held under 1.9x of the source: the floor (a keep it sustains, else 1x;
+            // the try back up from 1x = above)
+            if ((cascShown <= 2 * cascKeep || outFps / capFps < 1.9) && cascFloorStep(outFps / capFps, why, 15000))
                 return;
-            }
-            cascMaxM = (std::max)(2, (std::min)(cascShown - 1, (int)(outFps / capFps * cascKeep / 0.9)));
+            // the next plan's multiple at most what this one held with a tenth to spare; a keep's in SHOWN frames (the
+            // largest whole rung under its own shown multiple: a cap in made frames would let a whole rung show more
+            // than the keep held)
+            cascMaxM = cascKeep > 1 ? (std::max)(2, (std::min)(cascShown / cascKeep, (int)(outFps / capFps / 0.9)))
+                                    : (std::max)(2, (std::min)(cascShown - 1, (int)(outFps / capFps * cascKeep / 0.9)));
             if (cascTopM && cascKeep == 1) // the climb: the largest rung under what held, in place; the climb waits
             {
                 int m1 = 0, m2 = 0, m3 = 1;
