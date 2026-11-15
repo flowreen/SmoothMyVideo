@@ -152,7 +152,7 @@
   "up.opt.8640": "8640p · 16K",
   "up.opt.custom": "Altura personalizada…",
   "dlssmode.k": "Modo DLSS",
-  "dlssmode.tip": "A velocidade do modo ao vivo: cada passagem roda nesta porcentagem da janela ou da tela, nunca acima do tamanho próprio da janela capturada, e o resultado é ampliado para caber. DLAA = o tamanho total; menor = mais rápido e mais suave.",
+  "dlssmode.tip": "A velocidade do modo ao vivo: cada passagem roda nesta porcentagem do tamanho próprio da janela capturada (ou da janela ou tela exibida, se for menor), e o resultado é ampliado para caber. DLAA = o tamanho total; menor = mais rápido e mais suave.",
   "dlssmode.dlaa": "DLAA (100%)",
   "dlssmode.quality": "Qualidade (67%)",
   "dlssmode.balanced": "Equilibrado (58%)",

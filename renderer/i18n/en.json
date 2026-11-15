@@ -152,7 +152,7 @@
   "up.opt.8640": "8640p · 16K",
   "up.opt.custom": "Custom height…",
   "dlssmode.k": "DLSS mode",
-  "dlssmode.tip": "Live's speed: every pass runs at this share of the window or screen, never above the captured window's own size, then the result is enlarged to fit. DLAA = the full size; lower = faster and softer.",
+  "dlssmode.tip": "Live's speed: every pass runs at this share of the captured window's own size (or of the window or screen shown, when that is smaller), then the result is enlarged to fit. DLAA = the full size; lower = faster and softer.",
   "dlssmode.dlaa": "DLAA (100%)",
   "dlssmode.quality": "Quality (67%)",
   "dlssmode.balanced": "Balanced (58%)",

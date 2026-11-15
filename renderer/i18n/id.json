@@ -152,7 +152,7 @@
   "up.opt.8640": "8640p · 16K",
   "up.opt.custom": "Tinggi kustom…",
   "dlssmode.k": "Mode DLSS",
-  "dlssmode.tip": "Kecepatan mode langsung: setiap lintasan berjalan di porsi jendela atau layar ini, tidak pernah melebihi ukuran asli jendela yang ditangkap, lalu hasilnya diperbesar agar pas. DLAA = ukuran penuh; lebih rendah = lebih cepat dan lebih lembut.",
+  "dlssmode.tip": "Kecepatan mode langsung: setiap lintasan berjalan di porsi ini dari ukuran asli jendela yang ditangkap (atau jendela atau layar yang ditampilkan, jika lebih kecil), lalu hasilnya diperbesar agar pas. DLAA = ukuran penuh; lebih rendah = lebih cepat dan lebih lembut.",
   "dlssmode.dlaa": "DLAA (100%)",
   "dlssmode.quality": "Kualitas (67%)",
   "dlssmode.balanced": "Seimbang (58%)",

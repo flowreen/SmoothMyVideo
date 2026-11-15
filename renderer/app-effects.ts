@@ -297,9 +297,9 @@ function syncUpscale() {
 }
 
 // DLSS mode, Live only (a file render runs every pass at the source size, or the output's when that is smaller): Live's
-// working size as NVIDIA's share of what it presents (the window, or the screen in Fill), Restore, DLSS 5 and the
-// smoothing run at it; the host applies the floors (aspect kept, DLSS 5 >= 128 px wide) and the cap at the captured
-// size. Persisted, DLAA by default.
+// working size as NVIDIA's share of the DLAA size (what it presents, the window or the screen in Fill, capped at the
+// captured size), Restore, DLSS 5 and the smoothing run at it; the host applies it and the floors (aspect kept, DLSS 5
+// >= 128 px wide). Persisted, DLAA by default.
 var dlssUiReady = false; // var: setMode runs before this block and must skip the sync
 // a mode's share in whole percent, as the option labels round it
 const DLSS_PCT = { dlaa: 100, quality: 67, balanced: 58, performance: 50, ultra: 33 };

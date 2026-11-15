@@ -494,7 +494,8 @@ the CLI's default with no model flag stays GMFSS):
   above what one pass makes on the GPU runs in passes (the DLSS 4.5 cascade below).
 
 Passes, in this order (both modes): on each source or captured frame Restore, the
-resize to the working size (the DLSS mode's share of the output, live of the presented size), DLSS 5,
+resize to the working size (the DLSS mode's share of the DLAA size: the output capped at the source, live the
+presented size capped at the capture), DLSS 5,
 Adaptive Sharpen and RTX TrueHDR (SDR to HDR10); then the interpolation at the working size on those
 finished frames, so frame generation comes last and the generated frames inherit the sharpen and the
 HDR; then on every output or presented frame the final resize, the only enlarge: every model interpolates before
@@ -531,7 +532,9 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   live command line that still passes the flag has it ignored (the live parser skips unknown flags);
   offline it is refused (`unknown argument`).
 * `--scale MODE|F` (the GUI's DLSS mode): the WORKING size, NVIDIA's DLSS modes as the share of the
-  output per axis: `dlaa` 1 (the default, the output itself), `quality` 1 / 1.5, `balanced`
+  DLAA size per axis (the output capped at the source on either axis, aspect kept: so a mode lowers the picture
+  whatever the output's size, and Upscale to sets only the enlarge after the model): `dlaa` 1 (the default, the DLAA
+  size itself), `quality` 1 / 1.5, `balanced`
   1 / 1.724, `performance` 1 / 2, `ultra` 1 / 3, or any number in (0, 1]
   (the GUI's Live slider offers 1..100 % in 1 % steps: on a mode's rounded share, 100 / 67 / 58 / 50
   / 33, it sends that mode, anywhere else that share, which the dropdown shows as a hidden, unpickable
@@ -540,7 +543,8 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   an upscaled output is enlarged after the model, and a pipeline minimum is the one enlarge before it; capped at
   3840x2160 keeping the aspect: the interpolation's reach) and prints `DLSS mode ...: working size WxH for the WxH
   output` (`, capped at the source: the enlarge runs after the model` when the source capped it). Live's working
-  size takes the same cap at the captured size. A working size below the source folds the downscale into
+  size is the same share of the presented rect capped at the captured size (Fill on a smaller window: the
+  window's own size is the DLAA size). A working size below the source folds the downscale into
   the decode (`zscale` Lanczos at radius 7 on the decoded RGB, in the source's own transfer: through
   SMV's enlarge back it measured 1.5 to 1.7 dB above the same shrink in linear light at radius 3, 4 or 6
   on average, and above linear Lanczos3 on every one of the universal test's 44 cells); otherwise the

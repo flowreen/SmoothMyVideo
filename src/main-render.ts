@@ -167,7 +167,7 @@ function engineArgs(opts: RunOpts): string[] {
     if (opts.fps && opts.fps > 0) args.push('--fps', String(opts.fps));
   }
   // DLSS mode (the mode selector): the working size Restore's output, DLSS 5 and the model run at,
-  // NVIDIA's share of the output (plan.ts workPlan); DLAA, the default, is the output itself
+  // NVIDIA's share of the output capped at the source (plan.ts workPlan); DLAA, the default, is that size itself
   const scaleArg = dlssScaleArg(opts.dlssmode);
   if (scaleArg) args.push('--scale', scaleArg);
   // Adaptive Sharpen strength 0..2 (GUI checkbox + slider, 1 = the author's default). 0/omitted = off,

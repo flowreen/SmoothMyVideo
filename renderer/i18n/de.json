@@ -152,7 +152,7 @@
   "up.opt.8640": "8640p · 16K",
   "up.opt.custom": "Eigene Höhe…",
   "dlssmode.k": "DLSS-Modus",
-  "dlssmode.tip": "Die Geschwindigkeit in Live: Jeder Durchlauf läuft mit diesem Anteil des Fensters oder Bildschirms, nie über der eigenen Größe des erfassten Fensters, danach wird das Ergebnis passend vergrößert. DLAA = volle Größe; niedriger = schneller und weicher.",
+  "dlssmode.tip": "Die Geschwindigkeit in Live: Jeder Durchlauf läuft mit diesem Anteil der eigenen Größe des erfassten Fensters (oder des angezeigten Fensters oder Bildschirms, wenn das kleiner ist), danach wird das Ergebnis passend vergrößert. DLAA = volle Größe; niedriger = schneller und weicher.",
   "dlssmode.dlaa": "DLAA (100%)",
   "dlssmode.quality": "Qualität (67%)",
   "dlssmode.balanced": "Ausgewogen (58%)",

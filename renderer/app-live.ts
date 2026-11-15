@@ -115,7 +115,7 @@ function lvSendOpts() {
     label: liveLoadLabel(mi), // what is ticked, for the exe's loading note + substitution note
     hudnote: liveHudNote(mi),
     note: mi.note, // message/HUD (the raw backend id reads as the wrong model)
-    dlssmode: dlssMode(), // the working size's share of the presented size
+    dlssmode: dlssMode(), // the working size's share of the presented size capped at the capture
     fit: $('lvfit').value,
     target: liveTargetFps(),
     // live effects: sharpen inherits the file-render setting; RTX VSR (liveVsrOn above) takes the live

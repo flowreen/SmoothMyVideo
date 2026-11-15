@@ -73,21 +73,27 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
     // the live working size the handoff sized the model frame with (liveWorkSize), and where it came from
     if (!g_offline)
     {
-        int presW, presH, mode, mw, mh, raised;
-        liveWorkSize(nr.cw, nr.ch, presW, presH, mode, mw, mh, &raised);
+        int presW, presH, mode, mw, mh, raised, bw, bh;
+        liveWorkSize(nr.cw, nr.ch, presW, presH, mode, mw, mh, &raised, &bw, &bh);
         const int shown = mode ? mode : (g_flowScale >= 0.995 ? 1 : 0); // no --scale = DLAA
         char how[64];
         if (shown)
             sprintf_s(how, "DLSS mode %ls", kDlssModeName[shown - 1]);
         else
             sprintf_s(how, "%.2f", g_flowScale);
-        LOG("native: live working size %dx%d = %s of the %dx%d presented, capture %dx%d%s\n", nr.w, nr.h, how, presW,
+        // the share is of the DLAA size: the presented rect, capped at the capture when that is smaller (named at the
+        // end of the line, below DLAA)
+        char base[96] = "";
+        if ((bw != presW || bh != presH) && raised != 4)
+            sprintf_s(base, " (the share of %dx%d: the presented rect capped at the capture)", bw, bh);
+        LOG("native: live working size %dx%d = %s of the %dx%d presented, capture %dx%d%s%s\n", nr.w, nr.h, how, presW,
             presH, nr.cw, nr.ch,
             raised == 4   ? " (capped at the capture: the fit enlarges after the model)"
             : raised == 3 ? " (raised to DLSS 4.5's minimum, 128 px a side, aspect kept)"
             : raised == 2 ? " (raised to DLSS 5's minimum width, 128 px, aspect kept)"
             : raised == 1 ? " (raised to the 64 px floor, aspect kept)"
-                          : "");
+                          : "",
+            base);
     }
     // live: Restore reads the captured frame and folds it to the model size before the model runs, so srcW /
     // srcH name the capture from here on (Restore's setup in nativeModelInit and its target in nativeRtxInit read

@@ -152,7 +152,7 @@
   "up.opt.8640": "8640p · 16K",
   "up.opt.custom": "Hauteur personnalisée…",
   "dlssmode.k": "Mode DLSS",
-  "dlssmode.tip": "La vitesse du mode en direct : chaque passe tourne à cette part de la fenêtre ou de l'écran, jamais au-dessus de la taille propre de la fenêtre capturée, puis le résultat est agrandi pour remplir. DLAA = la taille complète ; plus bas = plus rapide et plus doux.",
+  "dlssmode.tip": "La vitesse du mode en direct : chaque passe tourne à cette part de la taille propre de la fenêtre capturée (ou de la fenêtre ou de l'écran affiché, s'il est plus petit), puis le résultat est agrandi pour remplir. DLAA = la taille complète ; plus bas = plus rapide et plus doux.",
   "dlssmode.dlaa": "DLAA (100%)",
   "dlssmode.quality": "Qualité (67%)",
   "dlssmode.balanced": "Équilibré (58%)",

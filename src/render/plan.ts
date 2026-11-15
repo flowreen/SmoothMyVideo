@@ -7,7 +7,7 @@ import { pyFixed, pyRound } from './pyfmt';
  * matter: a float argument prints as "2.0"). */
 export interface RenderArgs {
   multi: number; // int
-  work_scale: string | null; // --scale: a DLSS mode or a number, the working size's share of the output
+  work_scale: string | null; // --scale: a DLSS mode or a number, the working size's share of the DLAA size
   upscale: number; // float
   sharpen: number; // float
   rife: boolean;
@@ -51,7 +51,8 @@ export interface RenderArgs {
   nr_passes: number; // int, 1..20: DLSS 5 chained per frame
 }
 
-/** NVIDIA's DLSS modes: the working size's share of the output per axis (DLSS Programming Guide:
+/** NVIDIA's DLSS modes: the working size's share of the DLAA size (the output capped at the source) per axis (DLSS
+ * Programming Guide:
  * DLAA 1, Quality 1 / 1.5, Balanced 1 / 1.724, Performance 1 / 2, Ultra Performance 1 / 3). */
 export const DLSS_MODES: Record<string, number> = {
   dlaa: 1.0,
@@ -98,8 +99,8 @@ export const DLSSG_MIN_WORK = 128;
 
 /** The pass sizes for a w x h source: the output (the --upscale factor, clamped; with it an anamorphic source's
  * pixels are made square, without it the output keeps their shape, `sar`), the working size =
- * the DLSS mode (--scale) x the output (even, never above the source on either axis: the enlarge to the output runs
- * after the model; at most WORK_MAX_PX keeping the aspect; the share raised, aspect kept,
+ * the DLSS mode (--scale) x the DLAA size = the output capped at the source on either axis (even; the enlarge to the
+ * output runs after the model; at most WORK_MAX_PX keeping the aspect; the share raised, aspect kept,
  * to the largest minimum of the pipeline: the shorter side 64 px, with DLSS 5 (nr) the width NR_MIN_WORK_W, with
  * DLSS 4.5 (dlssg) the shorter side DLSSG_MIN_WORK), and the decode (a working size below the source folds the
  * downscale into the decode, Lanczos at radius 7: the one shrink). A string = why --scale is refused. */
@@ -118,14 +119,26 @@ export function workPlan(
   const wf = workFactor(scale);
   if (!wf)
     return `--scale takes a DLSS mode (dlaa, quality, balanced, performance, ultra) or a number in (0, 1], not '${scale}'`;
-  // DLAA is the output itself (an odd source width stays odd, no 1-px fold)
+  // THE DLAA SIZE = the output capped at the source: every model interpolates before any upscale, so the working size
+  // never exceeds the source on either axis (an upscaled output is enlarged after the model), the output's aspect kept;
+  // a side the cap lands on exactly keeps the source's own length, odd or even (as DLAA keeps an odd output). The DLSS
+  // mode's share applies to it, so a mode lowers the picture whatever the output's size (Upscale to sets only the
+  // enlarge after the model)
+  // (unrounded: the share below rounds once, so the output's aspect holds within one even step)
+  const kb = Math.min(1, w / ow, h / oh);
+  const bw = ow * kb;
+  const bh = oh * kb;
+  const baseCapped = kb < 1;
+  // DLAA = the output, capped at the source below = the DLAA size (an odd source width stays odd, no 1-px fold)
   let ww = ow;
   let wh = oh;
   let raised = '';
+  let atSource = false,
+    atFloor = false;
   if (wf.factor !== 1) {
-    const fFloor = Math.max(64 / ow, 64 / oh);
-    const fNr = nr ? NR_MIN_WORK_W / ow : 0;
-    const fDg = dlssg ? DLSSG_MIN_WORK / Math.min(ow, oh) : 0;
+    const fFloor = Math.max(64 / bw, 64 / bh);
+    const fNr = nr ? NR_MIN_WORK_W / bw : 0;
+    const fDg = dlssg ? DLSSG_MIN_WORK / Math.min(bw, bh) : 0;
     const fModel = Math.max(fFloor, fNr);
     const k = Math.max(wf.factor, fDg, fModel);
     if (k > wf.factor)
@@ -135,15 +148,13 @@ export function workPlan(
           : fNr >= fFloor
             ? `, raised to DLSS 5's minimum width, ${NR_MIN_WORK_W} px, aspect kept`
             : ', raised to the 64 px floor, aspect kept';
-    ww = Math.min(ow, Math.max(nr ? NR_MIN_WORK_W : 64, pyRound(ow * k) & ~1));
-    wh = Math.min(oh, Math.max(64, pyRound(oh * k) & ~1));
+    // the share of the DLAA size; a model's minimum may lift it above that, up to the output (the one enlarge before a
+    // model, kept by the source's cap below)
+    ww = Math.min(ow, Math.max(nr ? NR_MIN_WORK_W : 64, pyRound(bw * k) & ~1));
+    wh = Math.min(oh, Math.max(64, pyRound(bh * k) & ~1));
+    atSource = baseCapped;
   }
-  // every model interpolates before any upscale: the working size never exceeds the source on either axis (an
-  // upscaled output is enlarged after the model), the output's aspect kept; a side the cap lands on exactly keeps the
-  // source's own length, odd or even (as DLAA keeps an odd output). The pipeline's minimums above stay the floor: a
-  // source below one is enlarged to it, the one enlarge before a model
-  let atSource = false,
-    atFloor = false;
+  // the pipeline's minimums above stay the floor: a source below one is enlarged to it, the one enlarge before a model
   const kMin = Math.max(64 / ww, 64 / wh, nr ? NR_MIN_WORK_W / ww : 0, dlssg ? DLSSG_MIN_WORK / Math.min(ww, wh) : 0);
   const kCap = Math.min(1, w / ww, h / wh);
   const kSrc = Math.max(kCap, Math.min(1, kMin));
@@ -156,7 +167,10 @@ export function workPlan(
     if (wh >= h - 2 && wh < h) wh = h;
     // which limit set it: the source (the enlarge runs after the model), or a model's minimum above the source
     if (kSrc === kCap) atSource = true;
-    else atFloor = true;
+    else {
+      atFloor = true;
+      atSource = false;
+    }
   }
   let capped = false;
   if (ww * wh > WORK_MAX_PX) {

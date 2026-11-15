@@ -211,18 +211,26 @@ static const int kNrMinWorkW = 128, kNrMinWorkH = 64;
 static const int kDlssgMinWork = 128;
 
 // Live's working size (Restore, the resize, DLSS 5, Sharpen, RTX HDR and the model run at it, the fit
-// takes it to the canvas after the model): the DLSS mode's share of the PRESENTED rect (the capture aspect-fit into
-// the canvas W x H: the window itself, or the Fill rect), even, at most the presented rect a side, the share raised
+// takes it to the canvas after the model): the DLSS mode's share of the DLAA size = the PRESENTED rect (the capture
+// aspect-fit into the canvas W x H: the window itself, or the Fill rect) capped at the capture, even, the share raised
 // (aspect kept) to the largest minimum of the session's pipeline, so the capture is shrunk once and never below what a
 // model needs: the shorter side 64 px, with DLSS 5 the width kNrMinWorkW, with DLSS 4.5 at the working size the
 // canvas's shorter side kDlssgMinWork (*raised: 1 = the 64 px floor, 2 = DLSS 5's width, 3 = DLSS 4.5's minimum,
 // 4 = liveWorkSize's cap at the capture);
-// capped at 3840x2160 keeping the aspect (offline's workPlan). DLAA = the presented rect itself (in window
-// mode the capture, odd sizes kept). liveWorkSizeFor = the size a mode gives the presented presW x presH (mode = 1 +
+// capped at 3840x2160 keeping the aspect (offline's workPlan). DLAA = the DLAA size itself (in window
+// mode the capture, odd sizes kept). liveWorkSizeFor = the size a mode gives a DLAA size presW x presH (mode = 1 +
 // the kDlssModeName index, 0 = --scale's share; fDg = DLSS 4.5's minimum share, 0 = none); liveWorkSize = the
-// session's, and the mode it came from.
-static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh, int* raised = nullptr, double fDg = 0.0)
+// session's (baseW / baseH = its DLAA size), and the mode it came from.
+static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh, int* raised = nullptr, double fDg = 0.0,
+                            int outW = 0, int outH = 0)
 {
+    // outW x outH (0 = presW x presH) = DLAA's size before the cap at the capture, and how far a model's minimum may
+    // lift a smaller share (the one enlarge before a model)
+    if (outW <= 0 || outH <= 0)
+    {
+        outW = presW;
+        outH = presH;
+    }
     double f = 1.0;
     if (mode)
         f = kDlssModeShare[mode - 1];
@@ -232,8 +240,8 @@ static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh, in
         sprintf_s(sb, "%.2f", g_flowScale);
         f = (std::max)(0.01, (std::min)(1.0, strtod(sb, nullptr)));
     }
-    mw = presW;
-    mh = presH;
+    mw = outW;
+    mh = outH;
     if (raised)
         *raised = 0;
     if (f < 1.0)
@@ -244,8 +252,8 @@ static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh, in
         const double k = (std::max)((std::max)(f, fDg), fModel);
         if (raised && k > f)
             *raised = fDg >= fModel ? 3 : fNr >= fFloor ? 2 : 1;
-        mw = (std::min)(presW, (std::max)(g_dlssnr ? kNrMinWorkW : 64, lkRound(presW * k) & ~1));
-        mh = (std::min)(presH, (std::max)(64, lkRound(presH * k) & ~1));
+        mw = (std::min)(outW, (std::max)(g_dlssnr ? kNrMinWorkW : 64, lkRound(presW * k) & ~1));
+        mh = (std::min)(outH, (std::max)(64, lkRound(presH * k) & ~1));
     }
     if ((double)mw * mh > 3840.0 * 2160)
     {
@@ -254,14 +262,38 @@ static void liveWorkSizeFor(int mode, int presW, int presH, int& mw, int& mh, in
         mh = (int)std::floor(mh * k) & ~1;
     }
 }
-static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int& mw, int& mh, int* raised = nullptr)
+static void liveWorkSize(int cw, int ch, int& presW, int& presH, int& mode, int& mw, int& mh, int* raised = nullptr,
+                         int* baseW = nullptr, int* baseH = nullptr)
 {
     const int outW = g_presW ? (int)g_presW : W ? (int)W : cw, outH = g_presW ? (int)g_presH : W ? (int)H : ch;
     int x0, y0;
     lkFitRect(cw, ch, outW, outH, presW, presH, x0, y0);
     mode = g_dlssMode;
-    liveWorkSizeFor(mode, presW, presH, mw, mh, raised,
-                    g_dlssgWorkFloor ? (double)kDlssgMinWork / (std::min)(outW, outH) : 0.0);
+    // THE DLAA SIZE = the presented rect capped at the capture (aspect kept; a side the cap lands on keeps the
+    // capture's own length): the DLSS mode's share applies to it, so the mode lowers the picture in every target (Fill
+    // and Upscale to set only the enlarge after the model)
+    int bw = presW, bh = presH;
+    if (cw > 0 && ch > 0 && presW > 0 && presH > 0)
+    {
+        const double kb = (std::min)({1.0, (double)cw / presW, (double)ch / presH});
+        if (kb < 1.0)
+        {
+            bw = (double)cw / presW == kb ? cw : lkRound(presW * kb) & ~1;
+            bh = (double)ch / presH == kb ? ch : lkRound(presH * kb) & ~1;
+            if (bw >= cw - 2 && bw < cw)
+                bw = cw;
+            if (bh >= ch - 2 && bh < ch)
+                bh = ch;
+        }
+    }
+    if (baseW)
+        *baseW = bw;
+    if (baseH)
+        *baseH = bh;
+    // DLSS 4.5's floor keeps the canvas's shorter side at the working scale (the working size over the presented rect)
+    // at least kDlssgMinWork: as a share of the base. DLAA = the presented rect, capped at the capture below (as before)
+    liveWorkSizeFor(mode, bw, bh, mw, mh, raised,
+                    g_dlssgWorkFloor ? (double)kDlssgMinWork / (std::min)(outW, outH) * presW / bw : 0.0, presW, presH);
     // every model interpolates before any upscale: the working size never exceeds the capture on either axis (the fit
     // after the model enlarges), the presented rect's aspect kept; a side the cap lands on exactly keeps the capture's
     // own length. The pipeline's minimums stay the floor: a capture below one is enlarged to it, the one enlarge before
