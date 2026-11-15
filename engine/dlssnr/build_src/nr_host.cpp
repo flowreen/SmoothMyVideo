@@ -4,6 +4,7 @@
 #include "shim_abi.h"
 
 #include <dxgi1_6.h>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -638,6 +639,24 @@ static std::string driverVersionText(IDXGIAdapter* a)
     return b;
 }
 
+// The NGX call lock (Host::setNgxLock) held for one call; no lock given = nothing taken
+struct NgxCall
+{
+    std::mutex* m;
+    explicit NgxCall(std::mutex* x) : m(x)
+    {
+        if (m)
+            m->lock();
+    }
+    ~NgxCall()
+    {
+        if (m)
+            m->unlock();
+    }
+    NgxCall(const NgxCall&) = delete;
+    NgxCall& operator=(const NgxCall&) = delete;
+};
+
 // The create under a fault guard: on a driver too old for DLSS 5, NVIDIA's runtime has faulted inside the create
 // instead of refusing it (NeuralScreen #145, 576.x drivers); a fault here becomes a refusal line, never the end of the
 // process. testFault = the trigger test's fault (SMV_NR_TEST=fault). No C++ object lives in this frame (__try).
@@ -746,8 +765,11 @@ int Host::initNgx(std::string& err)
         }
     }
 
-    m_last = sInit(pInit, kInitArgOrder, kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "0.1", dataPath.c_str(), m_dev.Get(),
-                   &fci, NVSDK_NGX_Version_API);
+    {
+        const NgxCall lk(m_ngxLock);
+        m_last = sInit(pInit, kInitArgOrder, kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "0.1", dataPath.c_str(),
+                       m_dev.Get(), &fci, NVSDK_NGX_Version_API);
+    }
     if (m_last != NVSDK_NGX_Result_Success)
     {
         err = "NGX init failed: " + resultString(m_last);
@@ -768,11 +790,18 @@ int Host::initNgx(std::string& err)
         err = "nvngx_dlssnr.dll has no NVSDK_NGX_D3D12_Init_Ext";
         return 2;
     }
-    const NVSDK_NGX_Result rs = sInitF(pSnipInit, kCmsAppId, dataPath.c_str(), m_dev.Get(), 0x15, &fci);
+    NVSDK_NGX_Result rs;
+    {
+        const NgxCall lk(m_ngxLock);
+        rs = sInitF(pSnipInit, kCmsAppId, dataPath.c_str(), m_dev.Get(), 0x15, &fci);
+    }
     fprintf(stderr, "dlssnr: snippet Init_Ext -> %s\n", resultString(rs).c_str());
     fflush(stderr);
 
-    m_last = sAlloc(pAlloc, &m_params);
+    {
+        const NgxCall lk(m_ngxLock);
+        m_last = sAlloc(pAlloc, &m_params);
+    }
     if (m_last != NVSDK_NGX_Result_Success || !m_params)
     {
         err = "AllocateParameters failed: " + resultString(m_last);
@@ -791,6 +820,7 @@ int Host::initNgx(std::string& err)
 
     bool faulted = false;
     auto create = [&](NVSDK_NGX_Parameter* p, NVSDK_NGX_Handle** f) {
+        const NgxCall lk(m_ngxLock);
         return guardedCreate(sCreate, pCreate, m_list.Get(), kFeatureId, p, f, testFault, faulted);
     };
     m_last = create(m_params, &m_feature);
@@ -814,7 +844,11 @@ int Host::initNgx(std::string& err)
     for (int k = 1; k < wanted; ++k)
     {
         NVSDK_NGX_Parameter* p = nullptr;
-        NVSDK_NGX_Result r = sAlloc(pAlloc, &p);
+        NVSDK_NGX_Result r;
+        {
+            const NgxCall lk(m_ngxLock);
+            r = sAlloc(pAlloc, &p);
+        }
         if (r != NVSDK_NGX_Result_Success || !p)
         {
             m_passNote = "pass " + std::to_string(k + 1) + " AllocateParameters " + resultString(r);
@@ -882,7 +916,11 @@ int Host::growPasses(int n, std::string& note)
             break;
         }
         NVSDK_NGX_Parameter* p = nullptr;
-        NVSDK_NGX_Result r = sAlloc(pAlloc, &p);
+        NVSDK_NGX_Result r;
+        {
+            const NgxCall lk(m_ngxLock);
+            r = sAlloc(pAlloc, &p);
+        }
         if (r != NVSDK_NGX_Result_Success || !p)
         {
             m_passOut[k - 1].Reset();
@@ -893,7 +931,10 @@ int Host::growPasses(int n, std::string& note)
         setPassParams(k, k);
         NVSDK_NGX_Handle* f = nullptr;
         bool faulted = false;
-        r = guardedCreate(sCreate, pCreate, m_list.Get(), kFeatureId, p, &f, false, faulted);
+        {
+            const NgxCall lk(m_ngxLock);
+            r = guardedCreate(sCreate, pCreate, m_list.Get(), kFeatureId, p, &f, false, faulted);
+        }
         if (faulted || r != NVSDK_NGX_Result_Success || !f)
         {
             m_passOut[k - 1].Reset();
@@ -1016,7 +1057,16 @@ bool Host::evaluateOn(ID3D12GraphicsCommandList* list, bool reset, std::string& 
         p->Set("DLSSNR.LocalToneStrength", passTone(k));
         p->Set("DLSSNR.SkinStructureStrength", m_set.skin < 0.0f ? -1.0f : m_set.skin);
         p->Set("DLSSNR.UseAutoMask", autoMaskParam(m_set.automask));
-        m_last = sEval(pEval, list, m_pfeature[k], p);
+        {
+            const NgxCall lk(m_ngxLock);
+            const auto t0 = std::chrono::steady_clock::now();
+            m_last = sEval(pEval, list, m_pfeature[k], p);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            m_evalMs += ms;
+            m_evalN++;
+            if (ms > m_evalMaxMs)
+                m_evalMaxMs = ms;
+        }
         if (m_last != NVSDK_NGX_Result_Success)
         {
             err = std::string("EvaluateFeature failed") +

@@ -698,6 +698,11 @@ static void nativeFree(NativeRife& nr)
             "its last output reused on %llu identical captures\n",
             nr.nrN ? nr.nrMs / (double)nr.nrN : 0.0, nr.nrMaxMs, (unsigned long long)nr.nrN,
             (unsigned long long)nr.nrReused);
+    // the time DLSS 5's evaluate calls hold the process's NGX call lock (DLSS 4.5's stages wait that long at most)
+    if (nr.liveNr && nr.nrHost && nr.nrHost->evalCalls())
+        LOG("native: live DLSS 5 NGX evaluate calls under the shared lock: %.3f ms mean, %.3f ms max over %llu calls\n",
+            nr.nrHost->evalCallMs() / (double)nr.nrHost->evalCalls(), nr.nrHost->evalCallMaxMs(),
+            (unsigned long long)nr.nrHost->evalCalls());
     if (g_rtxb.created && g_rtxb.shutdown)
     {
         g_rtxb.shutdown();

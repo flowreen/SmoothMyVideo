@@ -2612,6 +2612,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         std::string err;
         g_nrAttempted = true;
         nr::Host* host = new nr::Host();
+        host->setNgxLock(&ngxfg::callLock()); // NGX is not thread-safe: DLSS frame generation's calls hold it too
         LUID cudaLuid{}; // the core's device on the CUDA GPU's adapter, whatever GPU drives the display
         const bool haveLuid = nativeCudaLuid(cudaLuid);
         const int nrc = host->startup((uint32_t)w, (uint32_t)h, set, err, true, haveLuid ? &cudaLuid : nullptr);

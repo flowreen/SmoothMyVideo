@@ -196,6 +196,8 @@ static bool nativeLiveNrInit(NativeRife& nr)
             g_ngxMaxPre = most;
     }
     nr::Host* host = new nr::Host();
+    // NGX is not thread-safe: Live's DLSS 4.5 stages call it from their threads in this process under the same lock
+    host->setNgxLock(&ngxfg::callLock());
     const int nrc = host->startup((uint32_t)w, (uint32_t)h, set, err, true, haveLuid ? &luid : nullptr);
     if (nrc != 0)
     {

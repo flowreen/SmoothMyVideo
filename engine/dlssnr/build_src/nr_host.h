@@ -15,6 +15,7 @@
 #include <wrl/client.h>
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include <nvsdk_ngx.h>
@@ -72,6 +73,28 @@ class Host
     // first hardware adapter, which is not the NVIDIA one when another GPU drives the main display.
     int startup(uint32_t w, uint32_t h, const Settings& s, std::string& err, bool quietLog = false,
                 const LUID* adapter = nullptr);
+
+    // The process's NGX call lock, given before startup by a host that also calls NGX for DLSS frame generation
+    // (NVIDIA: the NGX APIs are not thread-safe): the init, every parameter allocation, create and evaluate below
+    // holds it for that call alone; nullptr = no other NGX caller. The teardown (ngxShutdown, inside a fault guard)
+    // takes no lock. evalCalls = the evaluate calls made, evalCallMs = their CPU time in all and evalCallMaxMs the longest
+    // one: the time the lock is held for them
+    void setNgxLock(std::mutex* m)
+    {
+        m_ngxLock = m;
+    }
+    uint64_t evalCalls() const
+    {
+        return m_evalN;
+    }
+    double evalCallMs() const
+    {
+        return m_evalMs;
+    }
+    double evalCallMaxMs() const
+    {
+        return m_evalMaxMs;
+    }
 
     // One frame in, one frame out. src and dst are w*h*8 bytes of RGBA16F.
     // reset must be true for the first frame of a stream and after any
@@ -230,6 +253,10 @@ class Host
     uint64_t m_shDone[kSharedLists] = {}; // fence value that frees each allocator
     int m_shNext = 0;
     void closeSharedHandles();
+
+    std::mutex* m_ngxLock = nullptr; // setNgxLock
+    uint64_t m_evalN = 0;
+    double m_evalMs = 0.0, m_evalMaxMs = 0.0;
 
     NVSDK_NGX_Parameter* m_params = nullptr; // pass 0 (m_pparams[0])
     NVSDK_NGX_Handle* m_feature = nullptr;   // pass 0 (m_pfeature[0])
