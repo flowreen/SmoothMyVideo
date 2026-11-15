@@ -3268,8 +3268,7 @@ __global__ void k_unpackRgbaH(const unsigned short* __restrict__ src, int srcPit
     dst[(size_t)dps + d] = q[1];
     dst[2 * (size_t)dps + d] = q[2];
 }
-// the Optical Flow engine's field as frame generation's vectors read it, two layouts: OfCells = its short2 cells
-// (raw / 32 = px, rows p bytes apart), OfPlanes = k_nvofUp's two w x h planes in px
+// the Optical Flow engine's field as its readers take it: short2 cells (raw / 32 = px, rows p bytes apart)
 struct OfCells
 {
     const short* v;
@@ -3279,17 +3278,6 @@ struct OfCells
         const short* r = (const short*)((const char*)v + (size_t)y * p);
         a = (float)r[2 * x];
         b = (float)r[2 * x + 1];
-    }
-};
-struct OfPlanes
-{
-    const float* f;
-    int w, h;
-    __device__ __forceinline__ void at(int x, int y, float& a, float& b) const
-    {
-        const size_t o = (size_t)y * w + x;
-        a = f[o];
-        b = f[(size_t)w * h + o];
     }
 };
 // an Optical Flow field at the frame's edges (frame generation's vectors, the nvof model's two fields): content whose
@@ -3342,42 +3330,58 @@ __device__ __forceinline__ void ofPick(const F& fld, int n, int m, int g, int w,
         cy = yi;
     }
 }
-// the field at point (x, y) in its own units, the edges filled when edge != 0 (frame generation; upscaling passes 0 and
-// reads the field as the engine wrote it)
+// ofPick, then the engine's cost test (cost = its uint8 cells, costPitch bytes a row; null = none): the picked cell only
+// where it matched better (a lower cost) than the cell itself, so an edge whose content truly moves unlike the point
+// 128 px inside keeps its own vector
 template <class F>
-__device__ __forceinline__ void ofAt(const F& fld, int n, int m, int g, int w, int h, float k, int edge, int x, int y,
-                                     float& a, float& b)
+__device__ __forceinline__ void ofPickC(const F& fld, const unsigned char* __restrict__ cost, int costPitch, int n, int m,
+                                        int g, int w, int h, float k, int x, int y, int& cx, int& cy)
+{
+    ofPick(fld, n, m, g, w, h, k, x, y, cx, cy);
+    // a cell the rule left in place reads no cost (the test would keep it anyway)
+    if (cost && (cx != x || cy != y) && cost[(size_t)cy * costPitch + cx] >= cost[(size_t)y * costPitch + x])
+    {
+        cx = x;
+        cy = y;
+    }
+}
+// the field at point (x, y) in its own units, the edges filled when edge != 0 (frame generation; upscaling passes 0 and
+// reads the field as the engine wrote it), with the cost test when cost is given
+template <class F>
+__device__ __forceinline__ void ofAt(const F& fld, const unsigned char* __restrict__ cost, int costPitch, int n, int m,
+                                     int g, int w, int h, float k, int edge, int x, int y, float& a, float& b)
 {
     int cx = x, cy = y;
-    if (edge) ofPick(fld, n, m, g, w, h, k, x, y, cx, cy);
+    if (edge) ofPickC(fld, cost, costPitch, n, m, g, w, h, k, x, y, cx, cy);
     fld.at(cx, cy, a, b);
 }
 }
 // FSR's motion vectors: a field in px (two w x h planes, k_nvofUp's output) as R16G16_FLOAT texels, rows dstPitch bytes
-// apart, every vector as it is (k_nrMv without its test); edge = the frame-generation edge fill (ofAt)
+// apart, every vector as it is (k_nrMv without its test)
 // gate: a vector shorter than it (px) is written as exactly zero (0 = off): FSR upscaling's history holds still
 // detail only under exact zeros (nativeFsrupEval)
 __global__ void k_mvHalf(const float* __restrict__ flow, int w, int h, unsigned int* __restrict__ dst, int dstPitch,
-                         float gate, int edge)
+                         float gate)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
-    float fx, fy;
-    ofAt(OfPlanes{flow, w, h}, w, h, 1, w, h, 1.0f, edge, x, y, fx, fy);
+    const size_t o = (size_t)y * w + x;
+    const float fx = flow[o], fy = flow[(size_t)w * h + o];
     dst[(size_t)y * (dstPitch >> 2) + x] =
         fx * fx + fy * fy < gate * gate ? 0u : (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
 }
 // the same texels from the engine's grid-1 field in one pass: vec = w x h short2 (raw / 32 = px, rows vecPitch bytes),
-// k_nvofUp at grid 1 (weights 0 and 1, an exact copy) then k_mvHalf, byte for byte
+// k_nvofUp at grid 1 (weights 0 and 1, an exact copy) then k_mvHalf, byte for byte; edge = the frame-generation edge
+// fill (ofAt), with the cost test when cost (w x h uint8, costPitch bytes a row) is given
 __global__ void k_mvHalfG1(const short* __restrict__ vec, int vecPitch, int w, int h, unsigned int* __restrict__ dst,
-                           int dstPitch, float gate, int edge)
+                           int dstPitch, float gate, int edge, const unsigned char* __restrict__ cost, int costPitch)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     float rx, ry;
-    ofAt(OfCells{vec, vecPitch}, w, h, 1, w, h, 1.0f / 32.0f, edge, x, y, rx, ry);
+    ofAt(OfCells{vec, vecPitch}, cost, costPitch, w, h, 1, w, h, 1.0f / 32.0f, edge, x, y, rx, ry);
     const float fx = rx * (1.0f / 32.0f), fy = ry * (1.0f / 32.0f);
     dst[(size_t)y * (dstPitch >> 2) + x] =
         fx * fx + fy * fy < gate * gate ? 0u : (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
@@ -3400,9 +3404,10 @@ __global__ void k_fuMvScale(const unsigned int* __restrict__ src, int srcPitch, 
                       ((unsigned int)f2h(ky * h2f((unsigned short)(v >> 16))) << 16);
 }
 // the engine's grid-1 field (short2, raw / 32 = px) bilinear at (x, y), clamped to the frame; edge = the frame-
-// generation edge fill on each of the four cells (ofAt)
-__device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch, int w, int h, int edge, float x,
-                                     float y, float& vx, float& vy)
+// generation edge fill on each of the four cells (ofAt, with the cost test when cost is given)
+__device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch, int w, int h, int edge,
+                                     const unsigned char* __restrict__ cost, int costPitch, float x, float y, float& vx,
+                                     float& vy)
 {
     x = fminf(fmaxf(x, 0.0f), (float)(w - 1));
     y = fminf(fmaxf(y, 0.0f), (float)(h - 1));
@@ -3410,10 +3415,10 @@ __device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch
     const float fx = x - (float)x0, fy = y - (float)y0;
     const OfCells fld{vec, vecPitch};
     float p00, q00, p10, q10, p01, q01, p11, q11;
-    ofAt(fld, w, h, 1, w, h, 1.0f / 32.0f, edge, x0, y0, p00, q00);
-    ofAt(fld, w, h, 1, w, h, 1.0f / 32.0f, edge, x1, y0, p10, q10);
-    ofAt(fld, w, h, 1, w, h, 1.0f / 32.0f, edge, x0, y1, p01, q01);
-    ofAt(fld, w, h, 1, w, h, 1.0f / 32.0f, edge, x1, y1, p11, q11);
+    ofAt(fld, cost, costPitch, w, h, 1, w, h, 1.0f / 32.0f, edge, x0, y0, p00, q00);
+    ofAt(fld, cost, costPitch, w, h, 1, w, h, 1.0f / 32.0f, edge, x1, y0, p10, q10);
+    ofAt(fld, cost, costPitch, w, h, 1, w, h, 1.0f / 32.0f, edge, x0, y1, p01, q01);
+    ofAt(fld, cost, costPitch, w, h, 1, w, h, 1.0f / 32.0f, edge, x1, y1, p11, q11);
     const float a = (1.0f - fx) * (1.0f - fy), b = fx * (1.0f - fy), c = (1.0f - fx) * fy, d = fx * fy;
     vx = (a * p00 + b * p10 + c * p01 + d * p11) * (1.0f / 32.0f);
     vy = (a * q00 + b * q10 + c * q01 + d * q11) * (1.0f / 32.0f);
@@ -3421,9 +3426,11 @@ __device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch
 // AMD FSR 4's level-2+ call (its two frames at t0 and t1 of the pair) as R16G16_FLOAT texels from the pair's level-1
 // field (B -> A at B's positions, grid 1): under the pair's straight-line motion the content at p in the frame at t1
 // sits at the B position q with p = q + (1 - t1) v(q) (a 3-step fixed point) and at t0 at q + (1 - t0) v(q), so the
-// call's field (its frame -> its previous, FSR's convention) = (t1 - t0) v(q); edge = the edge fill (ofAt)
+// call's field (its frame -> its previous, FSR's convention) = (t1 - t0) v(q); edge = the edge fill (ofAt, with the
+// cost test when cost is given)
 __global__ void k_mvDerive(const short* __restrict__ vec, int vecPitch, int w, int h, float t0, float t1,
-                           unsigned int* __restrict__ dst, int dstPitch, int edge)
+                           unsigned int* __restrict__ dst, int dstPitch, int edge, const unsigned char* __restrict__ cost,
+                           int costPitch)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -3431,11 +3438,11 @@ __global__ void k_mvDerive(const short* __restrict__ vec, int vecPitch, int w, i
     float vx, vy, qx = (float)x, qy = (float)y;
     for (int it = 0; it < 3; it++)
     {
-        mvAt(vec, vecPitch, w, h, edge, qx, qy, vx, vy);
+        mvAt(vec, vecPitch, w, h, edge, cost, costPitch, qx, qy, vx, vy);
         qx = (float)x - (1.0f - t1) * vx;
         qy = (float)y - (1.0f - t1) * vy;
     }
-    mvAt(vec, vecPitch, w, h, edge, qx, qy, vx, vy);
+    mvAt(vec, vecPitch, w, h, edge, cost, costPitch, qx, qy, vx, vy);
     dst[(size_t)y * (dstPitch >> 2) + x] =
         (unsigned int)f2h((t1 - t0) * vx) | ((unsigned int)f2h((t1 - t0) * vy) << 16);
 }
@@ -3873,15 +3880,7 @@ extern "C" __global__ void k_nvofUp(const short* __restrict__ vec, int vecPitch,
         const OfCells fld{vec, vecPitch};
 #pragma unroll
         for (int q = 0; q < 4; q++)
-        {
-            const int ox = cx[q], oy = cy[q];
-            ofPick(fld, gw, gh, grid, w, h, 1.0f / 32.0f, ox, oy, cx[q], cy[q]);
-            if (cost && cost[(size_t)cy[q] * costPitch + cx[q]] >= cost[(size_t)oy * costPitch + ox])
-            {
-                cx[q] = ox;
-                cy[q] = oy;
-            }
-        }
+            ofPickC(fld, cost, costPitch, gw, gh, grid, w, h, 1.0f / 32.0f, cx[q], cy[q], cx[q], cy[q]);
     }
     // exact in fp32 at grid <= 8: the weights carry at most 4 fraction bits, the shorts 15 bits
     const short* p00 = (const short*)((const char*)vec + (size_t)cy[0] * vecPitch) + 2 * cx[0];

@@ -437,9 +437,12 @@ the CLI's default with no model flag stays GMFSS):
   the vector kernels fill the field as they read it (the engine's buffer is never written): content whose source
   lies outside the previous frame has no match, and the engine's vectors there fall short, so a point within 128 px
   of the left or right edge whose source, by the vector of the point 128 px inside, lies outside the frame takes that
-  vector, then the same across the top and bottom bands (on a 64 px pan the entering side's error against the true
-  midpoint: XeSS-FG 6.4 -> 2.6, FSR 4 FG 8.8 -> 7.5 codes; `SMV_OFVEC_EDGE=0` = off; upscaling reads the field as
-  the engine wrote it). Only the
+  vector, then the same across the top and bottom bands, and only where that point matched better (a lower engine
+  cost: with the fill on, frame generation's sessions have the engine write its cost too). On a 64 px pan the entering
+  side's error against the true midpoint: XeSS-FG 6.4 -> 2.6, FSR 4 FG 8.8 -> 7.5 codes; on real 1000 fps footage at
+  62.5 fps the tweens' PSNR XeSS-FG 34.81 -> 34.85 dB, FSR 4 FG 33.08 -> 33.10 (without the cost test more tweens got
+  worse than better); about 0.02 ms a call at 1080p, the Optical Flow pass unchanged; `SMV_OFVEC_EDGE=0` = off;
+  upscaling reads the field as the engine wrote it. Only the
   level-1 call (the pair's two real frames) runs an optical flow pass: a level-2+ call between the pair's
   positions t0 and t1 takes vectors derived from the pair's level-1 field (`k_mvDerive`, straight-line motion
   inside the pair: the content at p sits at the B position q with p = q + (1 - t1) v(q), a 3-step fixed
@@ -2014,7 +2017,7 @@ named here, and on a name here that no source holds.
 | `SMV_FSRFG_STANDIN_LOG=1`, `VKD3D_DEBUG=warn` | AMD FSR 4 frame generation's debug output: the driver-extension stand-in's calls, vkd3d-proton's log (the bridge sets `VKD3D_DEBUG=none` unless set) |
 | `SMV_FSRFG_SDR_PAIRS=0` | on HDR planes AMD FSR frame generation gets every frame pair as the HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_OFVEC_BOTH=1` | AMD FSR's motion vectors (frame generation and upscaling) from NVIDIA Optical Flow in both directions, the backward field read, instead of the forward field with the two frames swapped (the same field, byte for byte, at about half the Optical Flow time); A/B lever, never a product setting |
-| `SMV_OFVEC_EDGE=0` | AMD FSR and Intel XeSS frame generation and the NVIDIA Optical Flow model: NVIDIA Optical Flow's fields read as the engine wrote them, without the edge fill (a point within 128 px of an edge whose source lies outside the frame takes the vector of the point 128 px inside; the Optical Flow model only where that point matched better); A/B lever, never a product setting |
+| `SMV_OFVEC_EDGE=0` | AMD FSR and Intel XeSS frame generation and the NVIDIA Optical Flow model: NVIDIA Optical Flow's fields read as the engine wrote them, without the edge fill (a point within 128 px of an edge whose source lies outside the frame takes the vector of the point 128 px inside, where that point matched better by the engine's cost); frame generation's sessions then write no cost; A/B lever, never a product setting |
 | `SMV_OF_LEVEL=fast\|medium` | Every NVIDIA Optical Flow session (the NVIDIA Optical Flow model, DLSS 5's motion vectors, AMD FSR's vectors for frame generation and upscaling) at that perf level instead of slow, the engine's highest quality level (frame generation at fast = the repro of its tweens turning to garbage after ~320 calls at 1080p; the FSR 4 gate's like-for-like pan against AMD's path, whose vectors are fast grid 1); A/B lever, never a product setting |
 | `SMV_FSRFG_PROF=1` / `SMV_FSRUP_PROF=1` | AMD FSR frame generation / upscaling: CUDA events between a call's stages (the copies, the Optical Flow inputs, the Optical Flow, the vector kernels, the derived vectors, FSR itself, the unpack), `[fsrfg-prof]` / `[fsrup-prof]` ms a call at the session's end; every call then waits for its last event (profiling only, slower) |
 | `SMV_FSRUP_TEST=hang1` / `=hang2` | AMD FSR upscaling's first / second frame blocks past the Live stall watchdog: its trigger test. The watchdog holds up to 180 s during a session's first dispatch, where the driver compiles FSR's shaders (per exe location and upscale ratio), and its 10 s start over when that call returns |

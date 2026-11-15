@@ -136,9 +136,10 @@ static bool nativeFsrfgCreate(NativeRife& nr, int i)
 
 // an OfVec session at w x h (FSR's vectors: ABGR8, one direction, grid 1 = the measurement harness's vectors, or grid 4
 // with k_nvofUp's bilinear taps where the engine refuses grid 1) at nativeOfLevel(); tag names
-// it in the log lines; st = the stream it runs on (null = nr.stream)
+// it in the log lines; st = the stream it runs on (null = nr.stream); fill = frame generation's session: with the edge
+// fill on (ofEdgeEnvOn) the engine also writes its cost, the fill's cost test
 static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h, const char* tag,
-                             cudaStream_t st = nullptr)
+                             cudaStream_t st = nullptr, bool fill = false)
 {
     if (!nativeNvofLoad())
         return false;
@@ -161,6 +162,7 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
         o.both = GetEnvironmentVariableA("SMV_OFVEC_BOTH", ev, sizeof(ev)) > 0 && ev[0] == '1';
     }
     o.level = nativeOfLevel();
+    o.withCost = fill && ofEdgeEnvOn();
     for (int grid : {1, 4})
     {
         if (g_nvofApi.nvCreateOpticalFlowCuda(ctx, &o.of) != NV_OF_SUCCESS)
@@ -177,8 +179,8 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
         ip.mode = NV_OF_MODE_OPTICALFLOW;
         ip.perfLevel = o.level;
         ip.enableExternalHints = NV_OF_FALSE;
-        // FSR reads no cost: off
-        ip.enableOutputCost = NV_OF_FALSE;
+        // the cost only for the edge fill's test (FSR and XeSS read none)
+        ip.enableOutputCost = o.withCost ? NV_OF_TRUE : NV_OF_FALSE;
         ip.disparityRange = NV_OF_STEREO_DISPARITY_RANGE_UNDEFINED;
         ip.enableRoi = NV_OF_FALSE;
         // FSR reads one field, current -> previous: the forward field with the two frames swapped (half the work of
@@ -209,7 +211,9 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
         if (!nativeNvofBufOn(o.of, w, h, NV_OF_BUFFER_USAGE_INPUT, NV_OF_BUFFER_FORMAT_ABGR8, o.in[k], o.inP[k],
                              inPitch, "FSR vector input") ||
             !nativeNvofBufOn(o.of, o.gw, o.gh, NV_OF_BUFFER_USAGE_OUTPUT, NV_OF_BUFFER_FORMAT_SHORT2, o.out[k],
-                             o.outP[k], o.outPitch[k], "FSR vector flow"))
+                             o.outP[k], o.outPitch[k], "FSR vector flow") ||
+            (o.withCost && !nativeNvofBufOn(o.of, o.gw, o.gh, NV_OF_BUFFER_USAGE_COST, NV_OF_BUFFER_FORMAT_UINT8,
+                                            o.cost[k], o.costP[k], o.costPitch[k], "FSR vector cost")))
             return false;
         if (k == 0)
             o.inPitch = inPitch;
@@ -246,6 +250,8 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
         ei.referenceFrame = o.in[cur];
         eo.outputBuffer = o.out[0];
         eo.bwdOutputBuffer = o.out[1];
+        eo.outputCostBuffer = o.cost[0];
+        eo.bwdOutputCostBuffer = o.cost[1];
     }
     else
     {
@@ -253,6 +259,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
         ei.inputFrame = o.in[cur];
         ei.referenceFrame = o.in[prev];
         eo.outputBuffer = o.out[o.wr];
+        eo.outputCostBuffer = o.cost[o.wr];
     }
     const NV_OF_STATUS s = g_nvofApi.nvOFExecute(o.of, &ei, &eo);
     if (s != NV_OF_SUCCESS)
@@ -265,11 +272,13 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
         cudaEventRecord(evOf, st);
     const unsigned gx = (unsigned)(o.w + 15) / 16, gy = (unsigned)(o.h + 15) / 16;
     const int f = o.both ? 1 : o.wr;
-    int grid = o.grid, vp = (int)o.outPitch[f], cp = 0, mp = dstPitch, ed = edge && ofEdgeEnvOn() ? 1 : 0;
-    CUdeviceptr v = o.outP[f], c = 0;
+    int grid = o.grid, vp = (int)o.outPitch[f], mp = dstPitch, ed = edge && ofEdgeEnvOn() ? 1 : 0;
+    // the engine's cost for the fill's test (null without it: the fill alone)
+    int cp = o.withCost ? (int)o.costPitch[f] : 0;
+    CUdeviceptr v = o.outP[f], c = o.withCost ? o.costP[f] : 0;
     if (grid == 1) // the field is the texels' grid: one pass, no float planes in between
     {
-        void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp, &gate, &ed};
+        void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp, &gate, &ed, &c, &cp};
         if (cuLaunchKernel(nr.fMvHalfG1, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, g1, nullptr) != CUDA_SUCCESS)
         {
             nr.die("FSR vector launch failed");
@@ -278,10 +287,9 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
         return true;
     }
     float* flow = o.dFlow;
-    float* cost = nullptr; // k_nvofUp: the flow alone, the cost never read
-    int upEdge = 0;        // the fill runs in k_mvHalf on the px planes
-    void* b[] = {&v, &vp, &c, &cp, &o.gw, &o.gh, &grid, &o.w, &o.h, &flow, &cost, &upEdge};
-    void* m[] = {&flow, &o.w, &o.h, &dst, &mp, &gate, &ed};
+    float* cost = nullptr; // k_nvofUp: the flow alone (the engine's cost read only by the fill's test)
+    void* b[] = {&v, &vp, &c, &cp, &o.gw, &o.gh, &grid, &o.w, &o.h, &flow, &cost, &ed};
+    void* m[] = {&flow, &o.w, &o.h, &dst, &mp, &gate};
     if (cuLaunchKernel(nr.fNvofUp, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS ||
         cuLaunchKernel(nr.fMvHalf, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, m, nullptr) != CUDA_SUCCESS)
     {
@@ -293,7 +301,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
 
 static void nativeOfVecFree(NativeRife::OfVec& o)
 {
-    for (NvOFGPUBufferHandle* b : {&o.in[0], &o.in[1], &o.out[0], &o.out[1]})
+    for (NvOFGPUBufferHandle* b : {&o.in[0], &o.in[1], &o.out[0], &o.out[1], &o.cost[0], &o.cost[1]})
         if (*b)
             g_nvofApi.nvOFDestroyGPUBufferCuda(*b);
     if (o.of)
@@ -356,9 +364,11 @@ static bool fsrfgDeriveOn(const NativeRife& nr)
 // so the field holds for the pair
 static bool nativeFsrfgChildVec(NativeRife& nr, uint8_t* dst, cudaStream_t st, float t0, float t1)
 {
-    CUdeviceptr v = nr.fgOf.outP[nr.fgOfRd];
-    int vp = (int)nr.fgOf.outPitch[nr.fgOfRd], mp = nr.fgMvPitch, ed = ofEdgeEnvOn() ? 1 : 0;
-    void* a[] = {&v, &vp, &nr.w, &nr.h, &t0, &t1, &dst, &mp, &ed};
+    const NativeRife::OfVec& o = nr.fgOf;
+    CUdeviceptr v = o.outP[nr.fgOfRd], c = o.withCost ? o.costP[nr.fgOfRd] : 0;
+    int vp = (int)o.outPitch[nr.fgOfRd], mp = nr.fgMvPitch, ed = ofEdgeEnvOn() ? 1 : 0;
+    int cp = o.withCost ? (int)o.costPitch[nr.fgOfRd] : 0;
+    void* a[] = {&v, &vp, &nr.w, &nr.h, &t0, &t1, &dst, &mp, &ed, &c, &cp};
     if (cuLaunchKernel(nr.fMvDerive, (unsigned)(nr.w + 15) / 16, (unsigned)(nr.h + 15) / 16, 1, 16, 16, 1, 0,
                        (CUstream)st, a, nullptr) != CUDA_SUCCESS)
     {
@@ -676,7 +686,7 @@ static bool nativeFsrfgAhead(NativeRife& nr)
     }
     // derived level-2+ vectors need no side Optical Flow session (fsrfgDeriveOn)
     const bool derive = fsrfgDeriveOn(nr);
-    if (!ok || (!derive && !nativeOfVecSetup(nr, nr.fgOf2, nr.w, nr.h, "fsrfg side vectors", nr.fgOfSt)) ||
+    if (!ok || (!derive && !nativeOfVecSetup(nr, nr.fgOf2, nr.w, nr.h, "fsrfg side vectors", nr.fgOfSt, true)) ||
         strcmp(ev, "fail") == 0)
     {
         LOG(derive ? "native: fsrfg: the side stream did not start, every call's vectors stay in its turn\n"
@@ -840,7 +850,7 @@ static bool nativeFsrfgSetup(NativeRife& nr)
     }
     // never the fast perf level here: at fast, grid 1, the engine's vectors can go wrong after ~320 calls of a 1080p
     // session with vkd3d-proton in the process (garbage tweens from then on, run to run different)
-    if (!nativeFsrfgCreate(nr, 0) || !nativeOfVecSetup(nr, nr.fgOf, nr.w, nr.h, "fsrfg", nr.fgOfL1St))
+    if (!nativeFsrfgCreate(nr, 0) || !nativeOfVecSetup(nr, nr.fgOf, nr.w, nr.h, "fsrfg", nr.fgOfL1St, true))
         return false;
     if (nr.fgL1St)
         NCHK(cudaMalloc((void**)&nr.dFgMvL1, (size_t)nr.fgMvPitch * nr.h), "alloc fsrfg level-1 vectors");

@@ -402,13 +402,15 @@ struct NativeRife
     uint64_t fgProfN = 0, fgProfVecN = 0, fgProfDerN = 0;
     // FSR's motion vectors (frame generation and upscaling): an Optical Flow session at w x h, ABGR8 (R, G, B, A
     // bytes), one direction, fast, its output grid: the field from slot `cur` to slot `prev` = the current frame -> its
-    // predecessor (FSR's convention), in px: two planes (FSR reads no cost: no cost buffers, k_nvofUp writes none)
+    // predecessor (FSR's convention), in px: two planes; frame generation's sessions with the edge fill on also take the
+    // engine's cost (withCost: cost[] beside out[], the fill's cost test), upscaling's none
     struct OfVec
     {
         NvOFHandle of = nullptr;
-        NvOFGPUBufferHandle in[2] = {}, out[2] = {};
-        CUdeviceptr inP[2] = {}, outP[2] = {};
-        uint32_t inPitch = 0, outPitch[2] = {};
+        NvOFGPUBufferHandle in[2] = {}, out[2] = {}, cost[2] = {};
+        CUdeviceptr inP[2] = {}, outP[2] = {}, costP[2] = {};
+        uint32_t inPitch = 0, outPitch[2] = {}, costPitch[2] = {};
+        bool withCost = false;
         int w = 0, h = 0, grid = 1, gw = 0, gh = 0;
         float* dFlow = nullptr;
         bool both = false; // SMV_OFVEC_BOTH=1: both directions, the backward field read (else forward, frames swapped)
