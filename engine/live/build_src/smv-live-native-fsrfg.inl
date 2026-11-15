@@ -230,17 +230,6 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
     return true;
 }
 
-// frame generation's edge fill (ofAt in the kernel text: the vector kernels fill the field's edge bands as they read it,
-// the engine's buffer stays as written); SMV_OFVEC_EDGE=0 = the field as the engine wrote it
-static bool ofEdgeEnvOn()
-{
-    static const bool on = [] {
-        char v[8] = "";
-        return !(GetEnvironmentVariableA("SMV_OFVEC_EDGE", v, sizeof(v)) > 0 && v[0] == '0');
-    }();
-    return on;
-}
-
 // the vectors between slots `prev` and `cur`, both holding their ABGR8 frames: the field cur -> prev in px (the backward
 // field of the pair), into dst as R16G16_FLOAT texels, rows dstPitch bytes apart. edge = frame generation: the edge
 // fill (ofEdgeEnvOn); upscaling reads the field as the engine wrote it
@@ -290,7 +279,8 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
     }
     float* flow = o.dFlow;
     float* cost = nullptr; // k_nvofUp: the flow alone, the cost never read
-    void* b[] = {&v, &vp, &c, &cp, &o.gw, &o.gh, &grid, &o.w, &o.h, &flow, &cost};
+    int upEdge = 0;        // the fill runs in k_mvHalf on the px planes
+    void* b[] = {&v, &vp, &c, &cp, &o.gw, &o.gh, &grid, &o.w, &o.h, &flow, &cost, &upEdge};
     void* m[] = {&flow, &o.w, &o.h, &dst, &mp, &gate, &ed};
     if (cuLaunchKernel(nr.fNvofUp, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS ||
         cuLaunchKernel(nr.fMvHalf, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, m, nullptr) != CUDA_SUCCESS)

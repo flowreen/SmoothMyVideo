@@ -35,6 +35,18 @@ static const char* nativeOfLevelName(NV_OF_PERF_LEVEL l)
     return l == NV_OF_PERF_LEVEL_FAST ? "fast" : l == NV_OF_PERF_LEVEL_MEDIUM ? "medium" : "slow";
 }
 
+// the Optical Flow edge fill (ofPick in the kernel text: frame generation's vector kernels and the nvof model's
+// k_nvofUp fill the field's edge bands as they read it, the engine's buffer stays as written); DLSS 5's vectors and
+// upscaling read the field as the engine wrote it; SMV_OFVEC_EDGE=0 = off everywhere
+static bool ofEdgeEnvOn()
+{
+    static const bool on = [] {
+        char v[8] = "";
+        return !(GetEnvironmentVariableA("SMV_OFVEC_EDGE", v, sizeof(v)) > 0 && v[0] == '0');
+    }();
+    return on;
+}
+
 static bool nativeNvofLoad()
 {
     if (g_nvofLoaded)
@@ -255,12 +267,15 @@ static bool nativeNvofPair(NativeRife& nr, const float* dPrev, const float* dCur
         nr.die("nvof execute failed");
         return false;
     }
-    int grid = kNvofGrid;
+    // both fields with the edge fill (ofEdgeEnvOn): in a pan each direction loses the match on one side (0 -> 1 where
+    // content leaves, 1 -> 0 where it enters), the two directions disagree there and the fallback mask took the plain
+    // blend at both edges
+    int grid = kNvofGrid, ed = ofEdgeEnvOn() ? 1 : 0;
     for (int k = 0; k < 2; k++)
     {
         CUdeviceptr v = nr.ofOutP[k], c = nr.ofCostP[k];
         int vp = (int)nr.ofOutPitch[k], cp = (int)nr.ofCostPitch[k];
-        void* a[] = {&v, &vp, &c, &cp, &nr.ofGw, &nr.ofGh, &grid, &nr.w, &nr.h, &nr.dNvFlow[k], &nr.dNvCost[k]};
+        void* a[] = {&v, &vp, &c, &cp, &nr.ofGw, &nr.ofGh, &grid, &nr.w, &nr.h, &nr.dNvFlow[k], &nr.dNvCost[k], &ed};
         if (cuLaunchKernel(nr.fNvofUp, (nr.w + 15) / 16, (nr.h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
             CUDA_SUCCESS)
         {

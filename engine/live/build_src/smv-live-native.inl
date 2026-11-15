@@ -3292,7 +3292,8 @@ struct OfPlanes
         b = f[(size_t)w * h + o];
     }
 };
-// frame generation's field at the frame's edges: content whose source lies outside the previous frame has no match,
+// an Optical Flow field at the frame's edges (frame generation's vectors, the nvof model's two fields): content whose
+// source lies outside the other frame has no match,
 // and the engine's vectors there fall short (a 64 px pan read 64 down to ~18 px over the entering side's last 64
 // columns). A point within 128 px of the left or right edge whose source, by the vector of the point 128 px inside,
 // lies outside the frame takes that vector; then the same across the top and bottom bands, on that result. Only the
@@ -3309,47 +3310,47 @@ __device__ __forceinline__ bool ofLeaves(int i, int ii, int g, int lim, float m)
     const float s = (float)(i * g) + m;
     return (i > ii && m > 0.0f && s >= (float)lim) || (i < ii && m < 0.0f && s < 0.0f);
 }
-// the left / right bands' rule at (x, y): n points a row of g px over a frame w px wide, k = px per field unit; the two
-// templates take C++ linkage inside the text's extern "C" block
+// the left / right bands' rule at (x, y): n points a row of g px over a frame w px wide, k = px per field unit; the
+// point whose value (x, y) takes (its column); the templates take C++ linkage inside the text's extern "C" block
 extern "C++" {
 template <class F>
-__device__ __forceinline__ void ofAtH(const F& fld, int n, int g, int w, float k, int x, int y, float& a, float& b)
+__device__ __forceinline__ int ofPickH(const F& fld, int n, int g, int w, float k, int x, int y)
 {
     const int xi = ofInner(x, n, 128 / g);
-    if (xi >= 0)
-    {
-        float ia, ib;
-        fld.at(xi, y, ia, ib);
-        if (ofLeaves(x, xi, g, w, ia * k))
-        {
-            a = ia;
-            b = ib;
-            return;
-        }
-    }
-    fld.at(x, y, a, b);
+    if (xi < 0) return x;
+    float ia, ib;
+    fld.at(xi, y, ia, ib);
+    return ofLeaves(x, xi, g, w, ia * k) ? xi : x;
 }
-// the field at point (x, y) of n x m points (g px each, a w x h frame) in its own units, the edges filled when edge != 0
-// (frame generation; upscaling passes 0 and reads the field as the engine wrote it)
+// the point (cx, cy) whose value point (x, y) of n x m points (g px each, a w x h frame) takes under the edge fill: the
+// left / right rule on the field, then the top / bottom rule on that result (a reader taking more than the vector from
+// the field, the nvof model's cost, reads it at the same point)
+template <class F>
+__device__ __forceinline__ void ofPick(const F& fld, int n, int m, int g, int w, int h, float k, int x, int y, int& cx,
+                                       int& cy)
+{
+    cx = ofPickH(fld, n, g, w, k, x, y);
+    cy = y;
+    const int yi = ofInner(y, m, 128 / g);
+    if (yi < 0) return;
+    const int ix = ofPickH(fld, n, g, w, k, x, yi);
+    float ia, ib;
+    fld.at(ix, yi, ia, ib);
+    if (ofLeaves(y, yi, g, h, ib * k))
+    {
+        cx = ix;
+        cy = yi;
+    }
+}
+// the field at point (x, y) in its own units, the edges filled when edge != 0 (frame generation; upscaling passes 0 and
+// reads the field as the engine wrote it)
 template <class F>
 __device__ __forceinline__ void ofAt(const F& fld, int n, int m, int g, int w, int h, float k, int edge, int x, int y,
                                      float& a, float& b)
 {
-    if (!edge)
-    {
-        fld.at(x, y, a, b);
-        return;
-    }
-    ofAtH(fld, n, g, w, k, x, y, a, b);
-    const int yi = ofInner(y, m, 128 / g);
-    if (yi < 0) return;
-    float ia, ib;
-    ofAtH(fld, n, g, w, k, x, yi, ia, ib);
-    if (ofLeaves(y, yi, g, h, ib * k))
-    {
-        a = ia;
-        b = ib;
-    }
+    int cx = x, cy = y;
+    if (edge) ofPick(fld, n, m, g, w, h, k, x, y, cx, cy);
+    fld.at(cx, cy, a, b);
 }
 }
 // FSR's motion vectors: a field in px (two w x h planes, k_nvofUp's output) as R16G16_FLOAT texels, rows dstPitch bytes
@@ -3827,11 +3828,12 @@ __device__ __forceinline__ void nvUpTap(int o, int grid, int g, int& i0, int& i1
 
 // vec: gw x gh short2 (x, y) with a row pitch of vecPitch BYTES; cost: gw x gh uint8, costPitch
 // bytes; out: flow (2 planes of w x h, px) and cost (1 plane, 0..255 as float); costOut null = the
-// flow alone (cost is then never read)
+// flow alone (cost is then never read); edge = the edge fill (ofPick: each of the four cells, its
+// vector and its cost from the picked cell; the nvof model passes 1, the other readers 0)
 extern "C" __global__ void k_nvofUp(const short* __restrict__ vec, int vecPitch,
                                     const unsigned char* __restrict__ cost, int costPitch,
                                     int gw, int gh, int grid, int w, int h,
-                                    float* __restrict__ flow, float* __restrict__ costOut)
+                                    float* __restrict__ flow, float* __restrict__ costOut, int edge)
 {
     // the taps depend on x alone (x0, x1, lx) or y alone (y0, y1, ly), so lane t of the block
     // fills column t and row t ONCE with nvUpTap, the pixels
@@ -3861,21 +3863,43 @@ extern "C" __global__ void k_nvofUp(const short* __restrict__ vec, int vecPitch,
         nvUpTap(x, grid, gw, x0, x1, lx);
         nvUpTap(y, grid, gh, y0, y1, ly);
     }
+    // the four cells (00, 10, 01, 11 = x0 y0, x1 y0, x0 y1, x1 y1), each moved by the edge fill when edge != 0, and
+    // only where the picked cell matched better (a lower engine cost) than the cell itself: an edge whose content
+    // truly moves unlike the point 128 px inside keeps its own vector (on real 1000 fps footage at 62.5 fps the worst
+    // tween -0.71 dB without this test, -0.41 dB with it)
+    int cx[4] = {x0, x1, x0, x1}, cy[4] = {y0, y0, y1, y1};
+    if (edge)
+    {
+        const OfCells fld{vec, vecPitch};
+#pragma unroll
+        for (int q = 0; q < 4; q++)
+        {
+            const int ox = cx[q], oy = cy[q];
+            ofPick(fld, gw, gh, grid, w, h, 1.0f / 32.0f, ox, oy, cx[q], cy[q]);
+            if (cost && cost[(size_t)cy[q] * costPitch + cx[q]] >= cost[(size_t)oy * costPitch + ox])
+            {
+                cx[q] = ox;
+                cy[q] = oy;
+            }
+        }
+    }
     // exact in fp32 at grid <= 8: the weights carry at most 4 fraction bits, the shorts 15 bits
-    const short* r0 = (const short*)((const char*)vec + (size_t)y0 * vecPitch);
-    const short* r1 = (const short*)((const char*)vec + (size_t)y1 * vecPitch);
+    const short* p00 = (const short*)((const char*)vec + (size_t)cy[0] * vecPitch) + 2 * cx[0];
+    const short* p10 = (const short*)((const char*)vec + (size_t)cy[1] * vecPitch) + 2 * cx[1];
+    const short* p01 = (const short*)((const char*)vec + (size_t)cy[2] * vecPitch) + 2 * cx[2];
+    const short* p11 = (const short*)((const char*)vec + (size_t)cy[3] * vecPitch) + 2 * cx[3];
     const size_t plane = (size_t)w * h, o = (size_t)y * w + x;
     for (int c = 0; c < 2; c++)
     {
-        const float a = (1.0f - lx) * (float)r0[2 * x0 + c] + lx * (float)r0[2 * x1 + c];
-        const float b = (1.0f - lx) * (float)r1[2 * x0 + c] + lx * (float)r1[2 * x1 + c];
+        const float a = (1.0f - lx) * (float)p00[c] + lx * (float)p10[c];
+        const float b = (1.0f - lx) * (float)p01[c] + lx * (float)p11[c];
         flow[(size_t)c * plane + o] = ((1.0f - ly) * a + ly * b) * (1.0f / 32.0f);
     }
     if (!costOut) return;
-    const unsigned char* c0 = cost + (size_t)y0 * costPitch;
-    const unsigned char* c1 = cost + (size_t)y1 * costPitch;
-    const float a = (1.0f - lx) * (float)c0[x0] + lx * (float)c0[x1];
-    const float b = (1.0f - lx) * (float)c1[x0] + lx * (float)c1[x1];
+    const float a = (1.0f - lx) * (float)cost[(size_t)cy[0] * costPitch + cx[0]] +
+                    lx * (float)cost[(size_t)cy[1] * costPitch + cx[1]];
+    const float b = (1.0f - lx) * (float)cost[(size_t)cy[2] * costPitch + cx[2]] +
+                    lx * (float)cost[(size_t)cy[3] * costPitch + cx[3]];
     costOut[o] = (1.0f - ly) * a + ly * b;
 }
 

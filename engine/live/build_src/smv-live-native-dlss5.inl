@@ -342,7 +342,8 @@ static bool nativeNrMotion(NativeRife& nr, const float* frame, int pw, int ps)
         return m.empty() ? kNrMvCoh : (float)atof(m.c_str());
     }();
     float real = realSet, share = shareSet, flat = flatSet, coh = cohSet;
-    void* b[] = {&v, &vp, &c, &cp, &nr.nrOfGw, &nr.nrOfGh, &grid, &w, &h, &flow, &cost};
+    int edge = 0; // DLSS 5 reads the field as the engine wrote it (no edge fill)
+    void* b[] = {&v, &vp, &c, &cp, &nr.nrOfGw, &nr.nrOfGh, &grid, &w, &h, &flow, &cost, &edge};
     void* m[] = {&flow, &lc, &lp, &lpitch, &w, &h, &margin, &real, &share, &flat, &coh, &nr.sfNrMv};
     if (cuLaunchKernel(nr.fNvofUp, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) !=
             CUDA_SUCCESS ||

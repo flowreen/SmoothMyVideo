@@ -358,6 +358,14 @@ the CLI's default with no model flag stays GMFSS):
   mask blurred 6 px) the output fades to the plain blend, so failed vectors show as ghosting,
   never as speckle (the first cut, a forward splat of the colours, shredded fast non-rigid
   motion into speckle; every warp built on the same vectors did, the fallback is what fixed it).
+  The upsample fills both fields at the frame's edges (frame generation's rule, see AMD FSR 4 frame
+  generation below: a cell within 128 px of an edge whose source, by the cell 128 px inside, lies
+  outside the other frame takes that cell's vector and cost), and only where that cell matched better
+  (a lower engine cost): in a pan each direction loses the match on one side, the two fields disagree
+  there and the fallback took the plain blend at both edges. A 64 px pan's edge bands against the
+  true midpoint: 14.2 / 13.4 -> 1.4 / 3.0 codes; on real 1000 fps footage at 62.5 fps the tweens'
+  PSNR 33.64 -> 34.06 dB (13 tweens better, 4 worse, the worst -0.41 dB; only the bands change);
+  `SMV_OFVEC_EDGE=0` = off.
   NATIVE HOST ONLY, no
   engine to build: integer `<multi>`, Sharpen, the upscale (Lanczos or RTX VSR, image scale
   included), Restore, DLSS 5 and RTX HDR run in the host's pass chain, the
@@ -2006,7 +2014,7 @@ named here, and on a name here that no source holds.
 | `SMV_FSRFG_STANDIN_LOG=1`, `VKD3D_DEBUG=warn` | AMD FSR 4 frame generation's debug output: the driver-extension stand-in's calls, vkd3d-proton's log (the bridge sets `VKD3D_DEBUG=none` unless set) |
 | `SMV_FSRFG_SDR_PAIRS=0` | on HDR planes AMD FSR frame generation gets every frame pair as the HDR codes instead of an SDR pair's SDR view; A/B lever, never a product setting |
 | `SMV_OFVEC_BOTH=1` | AMD FSR's motion vectors (frame generation and upscaling) from NVIDIA Optical Flow in both directions, the backward field read, instead of the forward field with the two frames swapped (the same field, byte for byte, at about half the Optical Flow time); A/B lever, never a product setting |
-| `SMV_OFVEC_EDGE=0` | AMD FSR and Intel XeSS frame generation: the motion vectors read NVIDIA Optical Flow's field as the engine wrote it, without the edge fill (a point within 128 px of an edge whose source lies outside the frame takes the vector of the point 128 px inside); A/B lever, never a product setting |
+| `SMV_OFVEC_EDGE=0` | AMD FSR and Intel XeSS frame generation and the NVIDIA Optical Flow model: NVIDIA Optical Flow's fields read as the engine wrote them, without the edge fill (a point within 128 px of an edge whose source lies outside the frame takes the vector of the point 128 px inside; the Optical Flow model only where that point matched better); A/B lever, never a product setting |
 | `SMV_OF_LEVEL=fast\|medium` | Every NVIDIA Optical Flow session (the NVIDIA Optical Flow model, DLSS 5's motion vectors, AMD FSR's vectors for frame generation and upscaling) at that perf level instead of slow, the engine's highest quality level (frame generation at fast = the repro of its tweens turning to garbage after ~320 calls at 1080p; the FSR 4 gate's like-for-like pan against AMD's path, whose vectors are fast grid 1); A/B lever, never a product setting |
 | `SMV_FSRFG_PROF=1` / `SMV_FSRUP_PROF=1` | AMD FSR frame generation / upscaling: CUDA events between a call's stages (the copies, the Optical Flow inputs, the Optical Flow, the vector kernels, the derived vectors, FSR itself, the unpack), `[fsrfg-prof]` / `[fsrup-prof]` ms a call at the session's end; every call then waits for its last event (profiling only, slower) |
 | `SMV_FSRUP_TEST=hang1` / `=hang2` | AMD FSR upscaling's first / second frame blocks past the Live stall watchdog: its trigger test. The watchdog holds up to 180 s during a session's first dispatch, where the driver compiles FSR's shaders (per exe location and upscale ratio), and its 10 s start over when that call returns |
