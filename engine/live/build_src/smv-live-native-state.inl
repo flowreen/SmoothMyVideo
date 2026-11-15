@@ -891,9 +891,14 @@ struct NativeRife
     uint8_t* dPuOut = nullptr;
     cudaStream_t puSt = nullptr;
     bool puFailed = false; // a failed upscaler call: its line said once
-    // the stage's upscaler (nativeUpSwitch's numbering): 1 RTX VSR, 3 Anime4K, 4 ArtCNN, 6 Real-ESRGAN, 7 AnimeJaNai HD;
-    // a planar net reads dPuPl (the frame's planes, puW x puH) and writes dPuPres (puTw x puTh), both planar fp32
+    // the stage's upscaler (nativeUpSwitch's numbering): 1 RTX VSR, 2 AMD FSR, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS,
+    // 6 Real-ESRGAN, 7 AnimeJaNai HD; a planar net reads dPuPl (the frame's planes, puW x puH) and writes dPuPres
+    // (puTw x puTh), both planar fp32; AMD FSR / Intel XeSS = the fu* bridge fields (unused at the working size by the
+    // compute thread), their first frames on a worker: puWarm 1 = warming, 2 = warm, 3 = failed (puWarmT0 = its start)
     int puKind = 0;
+    volatile LONG puWarm = 0;
+    HANDLE puWarmTh = nullptr;
+    ULONGLONG puWarmT0 = 0;
     float* dPuPl = nullptr;
     float* dPuPres = nullptr;
     // HDR (puHdr): the frame's R10G10B10A2 PQ words -> its code planes (dPuPl) -> their SDR view (dPuView, puW x puH)

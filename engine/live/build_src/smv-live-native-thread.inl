@@ -188,24 +188,10 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
             return false;
         }
     }
-    else if (want == 2 || want == 5)
+    else if ((want == 2 || want == 5) && !nativeFuDir(want == 5 ? 1 : 0, dir))
     {
-        dir = lkEnv(want == 2 ? "SMV_FSRUP_DIR" : "SMV_XESS_DIR");
-        if (dir.empty() && !g_nativeEngineDir.empty())
-            dir = wideToUtf8(g_nativeEngineDir) + (want == 2 ? "\\fsrup" : "\\xess");
-        bool have = !dir.empty();
-        if (want == 2)
-            for (const char* f :
-                 {"smv_fsrup_bridge.dll", "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll"})
-                have = have && lkFile(dir + "\\" + f);
-        else
-            for (const char* f : {"smv_xess_bridge.dll", "libxess.dll"})
-                have = have && lkFile(dir + "\\" + f);
-        if (!have)
-        {
-            why = want == 2 ? "AMD's FidelityFX DLLs are missing" : "Intel's XeSS DLLs are missing";
-            return false;
-        }
+        why = want == 2 ? "AMD's FidelityFX DLLs are missing" : "Intel's XeSS DLLs are missing";
+        return false;
     }
     if (nr.vsr || nr.fuMade)
         nativeUpRelease(nr); // the running kind (or a bridge whose start failed) first: its memory counts below

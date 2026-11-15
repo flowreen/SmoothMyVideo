@@ -62,6 +62,24 @@ static bool nativeFsrupLoad(const std::string& dir, int kind)
     return true;
 }
 
+// the bridge's folder for fuKind (SMV_FSRUP_DIR / SMV_XESS_DIR, else engine\fsrup / engine\xess) into dir; true = the
+// bridge and the vendor's DLLs it loads are there
+static bool nativeFuDir(int kind, std::string& dir)
+{
+    dir = lkEnv(kind ? "SMV_XESS_DIR" : "SMV_FSRUP_DIR");
+    if (dir.empty() && !g_nativeEngineDir.empty())
+        dir = wideToUtf8(g_nativeEngineDir) + (kind ? "\\xess" : "\\fsrup");
+    bool have = !dir.empty();
+    if (kind)
+        for (const char* f : {"smv_xess_bridge.dll", "libxess.dll"})
+            have = have && lkFile(dir + "\\" + f);
+    else
+        for (const char* f :
+             {"smv_fsrup_bridge.dll", "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll"})
+            have = have && lkFile(dir + "\\" + f);
+    return have;
+}
+
 // AMD FSR / Intel XeSS-SR past 3x a side (FSR's named presets end at 3.0x and past about 9x it leaves one dot an input
 // pixel; XeSS-SR refuses past 3.0x): the fewest equal passes of at most 3x, the last landing on ow x oh, the sizes in
 // between even (the upscaler leaves an odd last column / row untouched). pw / ph [0 .. n] = the sizes; returns n (1 =
@@ -104,8 +122,9 @@ static int fuChainPlan(int w, int h, int ow, int oh, int* pw, int* ph)
 }
 
 // the upscaler at RTX VSR's resize (w x h -> ow x oh, nativeRtxInit's slot; past 3x a side in fuChainPlan's passes),
-// its shared buffers and fences imported, and the vectors' Optical Flow session at the render size
-static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
+// its shared buffers and fences imported, and the vectors' Optical Flow session at the render size on ofSt (null =
+// nr.stream; the upscaler after Live DLSS 4.5: its own stream)
+static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh, cudaStream_t ofSt)
 {
     if (!nativeFsrupLoad(nr.fsrUpDir, nr.fuKind))
         return false;
@@ -207,7 +226,7 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh)
             s = 0.0;
         nr.fuProfN = nr.fuProfVecN = 0;
     }
-    if (!nativeOfVecSetup(nr, nr.fuOf, w, h, "fsr upscale"))
+    if (!nativeOfVecSetup(nr, nr.fuOf, w, h, "fsr upscale", ofSt))
         return false;
     char via[160] = "";
     if (chain)
@@ -232,7 +251,9 @@ static constexpr int kFsrCompileMs = 180000;
 
 // one frame of the slot's stream: nr.dVsrIn (tight BGRA8 ri) upscaled into nr.dVsrOut (tight BGRA8 ro), queued on st;
 // the frame into the bridge's buffer and the vector session's slot, the vectors from the previous frame's slot (the
-// stream's first frame: zero vectors and a reset), the bridge's queue waits on the stream and the stream on the bridge
+// stream's first frame: zero vectors and a reset), the bridge's queue waits on the stream and the stream on the bridge.
+// Also the upscaler after Live DLSS 4.5 on the present thread (st = puSt): a failure there stops only that stage
+// (nativeFail)
 static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, cudaStream_t st, unsigned int& rv)
 {
     int w = (int)ri.right, h = (int)ri.bottom, ow = (int)ro.right, oh = (int)ro.bottom;
@@ -251,7 +272,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     if (cuLaunchKernel(nr.fBgraRgbaFsr, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a, nullptr) !=
         CUDA_SUCCESS)
     {
-        nr.die("bgraRgbaFsr launch failed");
+        nativeFail(nr, "bgraRgbaFsr launch failed");
         return false;
     }
     mark(1);
@@ -277,7 +298,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     {
         if (cudaMemset2DAsync(nr.dFuMv, nr.fuMvPitch, 0, (size_t)w * 4, h, st) != cudaSuccess)
         {
-            nr.die("fsr upscale vector clear failed");
+            nativeFail(nr, "fsr upscale vector clear failed");
             return false;
         }
         mark(2);
@@ -290,7 +311,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     sp.params.fence.value = ++nr.fuVal;
     if (cudaSignalExternalSemaphoresAsync(&nr.fuSem, &sp, 1, st) != cudaSuccess)
     {
-        nr.die("fsr upscale fence signal failed");
+        nativeFail(nr, "fsr upscale fence signal failed");
         return false;
     }
     const uint64_t ready = nr.fuVal, done = ++nr.fuVal;
@@ -311,7 +332,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     {
         LOG("native: fsr upscale: frame %llu failed: %s (rc %d)\n", (unsigned long long)nr.fuN,
             g_fsrupK[nr.fuKind].lastError(), rc);
-        nr.die("fsr upscale failed");
+        nativeFail(nr, "fsr upscale failed");
         return false;
     }
     cudaExternalSemaphoreWaitParams wp{};
@@ -320,7 +341,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     void* b[] = {&nr.dFuOut, &op, &ow, &oh, &nr.dVsrOut, &otp};
     if (cudaWaitExternalSemaphoresAsync(&nr.fuSem, &wp, 1, st) != cudaSuccess)
     {
-        nr.die("fsr upscale result failed");
+        nativeFail(nr, "fsr upscale result failed");
         return false;
     }
     // past 3x (fuChainPlan): passes 1.. on their own instances, each on the previous pass's output with pass 0's
@@ -341,14 +362,14 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
                               cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
             !vecOk)
         {
-            nr.die("fsr upscale pass input failed");
+            nativeFail(nr, "fsr upscale pass input failed");
             return false;
         }
         cudaExternalSemaphoreSignalParams ps{};
         ps.params.fence.value = ++p.val;
         if (cudaSignalExternalSemaphoresAsync(&p.sem, &ps, 1, st) != cudaSuccess)
         {
-            nr.die("fsr upscale fence signal failed");
+            nativeFail(nr, "fsr upscale fence signal failed");
             return false;
         }
         const uint64_t pReady = p.val, pDone = ++p.val;
@@ -361,14 +382,14 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         {
             LOG("native: fsr upscale: pass %d, frame %llu failed: %s (rc %d)\n", k + 1, (unsigned long long)nr.fuN,
                 g_fsrupK[nr.fuKind].lastError(), prc);
-            nr.die("fsr upscale failed");
+            nativeFail(nr, "fsr upscale failed");
             return false;
         }
         cudaExternalSemaphoreWaitParams pw{};
         pw.params.fence.value = pDone;
         if (cudaWaitExternalSemaphoresAsync(&p.sem, &pw, 1, st) != cudaSuccess)
         {
-            nr.die("fsr upscale result failed");
+            nativeFail(nr, "fsr upscale result failed");
             return false;
         }
     }
@@ -378,14 +399,14 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         if (cuLaunchKernel(nr.fRgbaBgra, (ow + 15) / 16, (oh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) !=
             CUDA_SUCCESS)
         {
-            nr.die("fsr upscale result failed");
+            nativeFail(nr, "fsr upscale result failed");
             return false;
         }
         void* e[] = {&nr.dVsrOut, &ow, &oh};
         if (((ow | oh) & 1) && cuLaunchKernel(nr.fOddEdge, (ow + 15) / 16, (oh + 15) / 16, 1, 16, 16, 1, 0,
                                               (CUstream)st, e, nullptr) != CUDA_SUCCESS)
         {
-            nr.die("fsr upscale edge failed");
+            nativeFail(nr, "fsr upscale edge failed");
             return false;
         }
     }
@@ -407,12 +428,12 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
     return true;
 }
 
-// nativeUpSwitch's warm-up (fuWarm): two black frames with zero vectors through every pass, the first a reset, on its
-// own stream, as the app's fsrWarm session runs them. The native thread touches none of these fields while fuWarm is 1
-// (every per-frame reader waits for nr.vsr, set by nativeUpWarmEnd); the session's first real frame resets again (fuN 0)
-static DWORD WINAPI nativeFsrupWarmProc(void* p)
+// the warm-up on a worker: two black frames with zero vectors through every pass, the first a reset, on its own
+// stream, as the app's fsrWarm session runs them (the driver compiles FSR's shaders inside the first dispatch, so the
+// thread that shows frames never waits for it); the session's first real frame resets again (fuN 0). true = every
+// frame went through
+static bool nativeFsrupWarm(NativeRife& nr)
 {
-    NativeRife& nr = *(NativeRife*)p;
     FsrupBridge& br = g_fsrupK[nr.fuKind];
     const int bpp = nr.fuHdr ? 8 : 4;
     cudaStream_t st = nullptr;
@@ -447,7 +468,24 @@ static DWORD WINAPI nativeFsrupWarmProc(void* p)
     if (st)
         cudaStreamDestroy(st);
     InterlockedExchange64(&g_wdogHold, (LONGLONG)GetTickCount64() + 10000);
-    InterlockedExchange(&nr.fuWarm, ok ? 2 : 3);
+    return ok;
+}
+
+// nativeUpSwitch's warm-up (fuWarm): the native thread touches none of these fields while fuWarm is 1 (every per-frame
+// reader waits for nr.vsr, set by nativeUpWarmEnd)
+static DWORD WINAPI nativeFsrupWarmProc(void* p)
+{
+    NativeRife& nr = *(NativeRife*)p;
+    InterlockedExchange(&nr.fuWarm, nativeFsrupWarm(nr) ? 2 : 3);
+    return 0;
+}
+
+// the upscaler after Live DLSS 4.5's warm-up (puWarm, nativePresentUpKind): the present thread runs no frame through
+// the stage while puWarm is 1 (puOn stays false until nativePresentUpWarmPoll sees its end)
+static DWORD WINAPI nativePuWarmProc(void* p)
+{
+    NativeRife& nr = *(NativeRife*)p;
+    InterlockedExchange(&nr.puWarm, nativeFsrupWarm(nr) ? 2 : 3);
     return 0;
 }
 
@@ -476,21 +514,24 @@ static void nativeUpWarmEnd(NativeRife& nr)
 
 static void nativeFsrupRelease(NativeRife& nr)
 {
-    if (nr.fuWarmTh)
-    {
-        // a start in place still warming (nativeUpSwitch): its frames end before the bridge goes; past the compile's
-        // bound the worker is still inside the bridge, so its state is left to the process exit
-        const DWORD w = WaitForSingleObject(nr.fuWarmTh, (DWORD)kFsrCompileMs + 10000);
-        if (w != WAIT_OBJECT_0)
+    // a warm-up still running (a start in place, nativeUpSwitch, or the upscaler after Live DLSS 4.5's): its frames
+    // end before the bridge goes; past the compile's bound the worker is still inside the bridge, so its state is left
+    // to the process exit
+    for (const auto& [th, state] :
+         {std::pair<HANDLE*, volatile LONG*>{&nr.fuWarmTh, &nr.fuWarm}, {&nr.puWarmTh, &nr.puWarm}})
+        if (*th)
         {
-            LOG("native: fsr upscale: its warm-up still runs after %d s, its state is left to the process exit\n",
-                kFsrCompileMs / 1000 + 10);
-            return;
+            const DWORD w = WaitForSingleObject(*th, (DWORD)kFsrCompileMs + 10000);
+            if (w != WAIT_OBJECT_0)
+            {
+                LOG("native: fsr upscale: its warm-up still runs after %d s, its state is left to the process exit\n",
+                    kFsrCompileMs / 1000 + 10);
+                return;
+            }
+            CloseHandle(*th);
+            *th = nullptr;
+            InterlockedExchange(state, 0);
         }
-        CloseHandle(nr.fuWarmTh);
-        nr.fuWarmTh = nullptr;
-        InterlockedExchange(&nr.fuWarm, 0);
-    }
     if (nr.stream)
         cudaStreamSynchronize(nr.stream);
     if (nr.fuMade)

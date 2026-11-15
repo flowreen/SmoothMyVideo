@@ -156,8 +156,7 @@ The new frames are made from the video at its own size. Then every frame, origin
   A, and its A+A box runs Anime4K's Restore again on the enlarged picture: crisper lines, slower, and it can add
   ringing), or Restore's anime models after the smoothing: Real-ESRGAN (4x, clean lines, heavy on the GPU) or
   AnimeJaNai HD (2x, once Restore's AnimeJaNai is installed); with none ticked, a standard resize. They only run when the picture is enlarged. In Live with DLSS 4.5
-  the upscaler enlarges every frame DLSS 4.5 shows, except AMD FSR 4.1 and Intel XeSS: with those DLSS 4.5's frames
-  get the standard resize.
+  the upscaler enlarges every frame DLSS 4.5 shows.
 
 In the preview, **Show changed pixels** turns the processed side into a heat map of where DLSS 5 changed the picture.
 
@@ -249,8 +248,8 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
 * **DLSS mode** trades sharpness for speed: the work runs at a smaller size, then the picture is enlarged. DLAA (the
   default) is the full size; Quality 67%, Balanced 58%, Performance 50%, Ultra Performance 33%, or any size down to 1%
   with the slider. Lower is faster and softer.
-* **Effects** (Restore, DLSS 5, Sharpen) work with every model, DLSS 4.5 included; the upscaler works with every model
-  (with DLSS 4.5, AMD FSR 4.1 and Intel XeSS stay off). Untick every model to get just the effects, at the window's own frame rate.
+* **Effects** (Restore, DLSS 5, Sharpen) work with every model, DLSS 4.5 included; the upscaler works with every model.
+  Untick every model to get just the effects, at the window's own frame rate.
 * **On an HDR display** every model runs in HDR, and RTX HDR can turn SDR windows into HDR.
 * **Pauses by itself** when the window is minimized, on another virtual desktop, or covered by the window in front,
   and resumes when it is back.

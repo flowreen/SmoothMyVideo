@@ -251,14 +251,8 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
                   : "native: AMD FSR upscaling off on HDR video (SMV_FSRUP_HDR=0), Lanczos\n");
     else if (g_fsrUp)
     {
-        std::string dir = lkEnv("SMV_FSRUP_DIR");
-        if (dir.empty() && !g_nativeEngineDir.empty())
-            dir = wideToUtf8(g_nativeEngineDir) + "\\fsrup";
-        bool have = !dir.empty();
-        for (const char* f :
-             {"smv_fsrup_bridge.dll", "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll"})
-            have = have && lkFile(dir + "\\" + f);
-        if (!have)
+        std::string dir;
+        if (!nativeFuDir(0, dir))
             LOG("native: AMD FSR upscaling unavailable (smv_fsrup_bridge.dll and AMD's FidelityFX loader + upscaler "
                 "needed in %s), Lanczos\n",
                 dir.c_str());
@@ -331,13 +325,8 @@ static bool nativeConfigHdr(NativeRife& nr, int srcHdr = 0)
                   : "native: Intel XeSS upscaling off on HDR video (SMV_FSRUP_HDR=0), Lanczos\n");
     else if (g_xessUp)
     {
-        std::string dir = lkEnv("SMV_XESS_DIR");
-        if (dir.empty() && !g_nativeEngineDir.empty())
-            dir = wideToUtf8(g_nativeEngineDir) + "\\xess";
-        bool have = !dir.empty();
-        for (const char* f : {"smv_xess_bridge.dll", "libxess.dll"})
-            have = have && lkFile(dir + "\\" + f);
-        if (!have)
+        std::string dir;
+        if (!nativeFuDir(1, dir))
             LOG("native: Intel XeSS upscaling unavailable (smv_xess_bridge.dll and Intel's libxess.dll needed in %s; the "
                 "app's XeSS setup installs them), Lanczos\n",
                 dir.c_str());

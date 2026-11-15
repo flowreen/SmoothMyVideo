@@ -2336,17 +2336,20 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                                                {g_upscaleH > 0, "Upscale to"}})
                     if (on)
                         off += (off.empty() ? "" : ", ") + std::string(name);
-                // THE UPSCALER AFTER DLSS 4.5 (host.upOn): the picked upscaler (RTX VSR, Anime4K, ArtCNN, Real-ESRGAN,
-                // AnimeJaNai HD; SDR or HDR frames, the HDR ones through their SDR view) runs on every frame the plan
-                // shows (the present's stage, nativePresentUp*; SMV_DLSSG_UP_AFTER=0 = the Lanczos pair as for AMD FSR /
-                // Intel XeSS upscaling). The echo route itself stays at the working size without it
-                const int nUp = (int)g_rtxVsr + (int)g_a4kUp + (int)g_acnUp + (int)g_rgUp + (int)g_ajUp;
-                const int upKind = nUp != 1 || g_fsrUp || g_xessUp ? 0
-                                   : g_rtxVsr                      ? 1
-                                   : g_a4kUp                       ? 3
-                                   : g_acnUp                       ? 4
-                                   : g_rgUp                        ? 6
-                                                                   : 7;
+                // THE UPSCALER AFTER DLSS 4.5 (host.upOn): the picked upscaler (RTX VSR, AMD FSR, Anime4K, ArtCNN,
+                // Intel XeSS, Real-ESRGAN, AnimeJaNai HD; SDR or HDR frames) runs on every frame the plan shows (the
+                // present's stage, nativePresentUp*; SMV_DLSSG_UP_AFTER=0 = the Lanczos pair). The echo route itself
+                // stays at the working size without it
+                const int nUp = (int)g_rtxVsr + (int)g_fsrUp + (int)g_a4kUp + (int)g_acnUp + (int)g_xessUp +
+                                (int)g_rgUp + (int)g_ajUp;
+                const int upKind = nUp != 1   ? 0
+                                   : g_rtxVsr ? 1
+                                   : g_fsrUp  ? 2
+                                   : g_a4kUp  ? 3
+                                   : g_acnUp  ? 4
+                                   : g_xessUp ? 5
+                                   : g_rgUp   ? 6
+                                              : 7;
                 // a stdin `set up N` of this session switches the stage on the loop thread (g_puWant, host.upPollFn)
                 const bool upAfter = host.lzOn && lkEnv("SMV_DLSSG_UP_AFTER") != "0";
                 g_puLive = upAfter;
@@ -2376,7 +2379,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     host.upKind = upKind;
                     LOG("DLSS 4.5 at the working size: %s enlarges every frame DLSS 4.5 shows%s\n", puName(upKind),
                         upTo);
-                    g_rtxVsr = g_a4kUp = g_acnUp = g_rgUp = g_ajUp = false;
+                    g_rtxVsr = g_fsrUp = g_xessUp = g_a4kUp = g_acnUp = g_rgUp = g_ajUp = false;
                     g_upscaleH = 0;
                 }
                 else if (!off.empty())
@@ -2709,8 +2712,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 LOG("present path: direct from VRAM (shared output buffer)\n");
             // the upscaler after DLSS 4.5: its shared buffers and fences and the native host's upscaler on them (the
             // warm-up runs here, before the plan's stages start, or between two shown frames for a live `set up N`,
-            // host.upPollFn); the shared part is made once a session (upTried), a later kind switches in place
-            auto upStart = [&](int kind) -> bool {
+            // host.upPollFn; AMD FSR / Intel XeSS's on a worker: started = upWarm, the stage on at its end); the shared
+            // part is made once a session (upTried), a later kind switches in place
+            auto upRun = [&srv](uint64_t v) { return srv.nr && nativePresentUpRun(*srv.nr, v); };
+            auto upStart = [&, upRun](int kind) -> bool {
                 NativeRife* nrp = srv.nr;
                 bool ok = false;
                 if (nrp && nrp->puSemOut)
@@ -2724,43 +2729,56 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                                              (int)W, (int)H, (int)host.winW, (int)host.winH, host.upUw, host.upUh, kind,
                                              g_hdr);
                 }
+                host.upWarm = ok && !nrp->puOn; // the bridges' first frames still on their worker
                 if (ok)
                 {
                     host.upKind = kind;
-                    host.upRunFn = [&srv](uint64_t v) { return srv.nr && nativePresentUpRun(*srv.nr, v); };
+                    if (!host.upWarm)
+                        host.upRunFn = upRun;
                 }
                 else
                     LOG("DLSS 4.5 at the working size: %s after DLSS 4.5 did not start, the native fit's Lanczos "
                         "enlarges\n",
                         puName(kind));
-                host.upOn = ok;
+                host.upOn = ok && !host.upWarm;
                 return ok;
             };
             if (host.upOn)
                 upStart(host.upKind);
-            // a live `set up N` (nativeLiveSets hands it over): applied by the present sites before a frame
+            // a live `set up N` (nativeLiveSets hands it over) and the bridges' warm-up end: applied by the present
+            // sites before a frame
             if (g_puLive)
-                host.upPollFn = [&, upStart]() {
+                host.upPollFn = [&, upStart, upRun]() {
+                    if (host.upWarm)
+                    {
+                        // AMD FSR / Intel XeSS's first frames on their worker: a `set up N` meanwhile waits for the end
+                        const int s = srv.nr ? nativePresentUpWarmPoll(*srv.nr) : -1;
+                        if (s == 0)
+                            return;
+                        host.upWarm = false;
+                        host.upOn = s > 0;
+                        host.upRunFn = s > 0 ? std::function<bool(uint64_t)>(upRun) : nullptr;
+                    }
                     const int want = g_puWant.exchange(-1);
                     if (want < 0)
                         return;
-                    const bool on = want == 1 || want == 3 || want == 4 || want == 6 || want == 7;
+                    const bool on = want >= 1 && want <= 7;
                     if (on && host.upOn && want == host.upKind)
                         return;
-                    // the running upscaler stops first: off, AMD FSR / Intel XeSS, or another kind
+                    // the running upscaler stops first: off or another kind
                     host.upOn = false;
                     host.upRunFn = nullptr;
                     if (on)
                     {
                         if (upStart(want))
-                            LOG("live set: up %d: %s enlarges every frame DLSS 4.5 shows\n", want, puName(want));
+                            LOG("live set: up %d: %s enlarges every frame DLSS 4.5 shows%s\n", want, puName(want),
+                                host.upWarm ? " once its first frames ended on a worker" : "");
                         return;
                     }
                     if (srv.nr && srv.nr->puSemOut)
                         nativePresentUpSwitch(*srv.nr, 0);
-                    LOG("live set: up %d: %s, the native fit's Lanczos enlarges\n", want,
-                        want ? "AMD FSR 4.1 and Intel XeSS stay off under Live DLSS 4.5"
-                             : "the upscaler after DLSS 4.5 is off");
+                    LOG("live set: up %d: the upscaler after DLSS 4.5 is off, the native fit's Lanczos enlarges\n",
+                        want);
                 };
             // a started host always holds the zero-copy capture import (nativeRefusal)
             LOG("capture path: zero-copy (shared texture, no CPU readback)\n");

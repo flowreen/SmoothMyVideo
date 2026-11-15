@@ -295,7 +295,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
     if (s != NV_OF_SUCCESS)
     {
         LOG("native: %s: nvOFExecute failed (status %d)\n", tag, (int)s);
-        nr.die("FSR optical flow failed");
+        nativeFail(nr, "FSR optical flow failed");
         return false;
     }
     if (evOf) // a profiler's mark between the Optical Flow and the vector kernels (the session's stream)
@@ -325,7 +325,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
         void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp, &gate, &ed, &c, &cp, &pgp, &ps};
         if (cuLaunchKernel(nr.fMvHalfG1, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, g1, nullptr) != CUDA_SUCCESS)
         {
-            nr.die("FSR vector launch failed");
+            nativeFail(nr, "FSR vector launch failed");
             return false;
         }
         return true;
@@ -337,7 +337,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
     if (cuLaunchKernel(nr.fNvofUp, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS ||
         cuLaunchKernel(nr.fMvHalf, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, m, nullptr) != CUDA_SUCCESS)
     {
-        nr.die("FSR vector launch failed");
+        nativeFail(nr, "FSR vector launch failed");
         return false;
     }
     return true;

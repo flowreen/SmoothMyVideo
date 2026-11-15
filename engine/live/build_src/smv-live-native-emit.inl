@@ -504,13 +504,15 @@ static bool nativeOfflineEmit(NativeRife& nr, const void* src, int ps, int rs, u
 // presented size here, the one enlarge after the model that every other model's frames get in the slot store. The
 // present copies the frame (BGRA8, w x h) into hIn's buffer and signals hFenceIn; nativePresentUpRun waits for it on
 // puSt, turns the bytes into R, G, B, A order, runs the upscaler (kind, nativeUpSwitch's numbering: 1 RTX VSR into
-// dVsrOut; 3 Anime4K, 4 ArtCNN, 6 Real-ESRGAN, 7 AnimeJaNai HD = the planar net from the frame's planes into dPuPres,
-// on puSt) to uw x uh (Upscale to's size, else the presented tw x th; Lanczos to tw x th after it, Live's second
-// resize), writes BGRA8 into hOut's buffer and signals hFenceOut, which the present waits on before its copy: the GPU
-// orders the three, no thread waits. HDR (hdr: the frames are R10G10B10A2 PQ words): the upscaler reads the frame's SDR
-// view and its result comes back to the codes as on Live's own route (storeSlot), the way picked by the last four
-// captures' range bits (hdrInBits) instead of a readback; R10G10B10A2 out. The caller's thread binds the device; false =
-// it did not start (the present keeps the Lanczos pair)
+// dVsrOut; 2 AMD FSR, 5 Intel XeSS = their bridge on the B, G, R, A bytes (dVsrIn -> dVsrOut) with Optical Flow vectors
+// between consecutive shown frames, its first frames on a worker (nativePresentUpWarmPoll turns it on); 3 Anime4K,
+// 4 ArtCNN, 6 Real-ESRGAN, 7 AnimeJaNai HD = the planar net from the frame's planes into dPuPres, on puSt) to uw x uh
+// (Upscale to's size, else the presented tw x th; Lanczos to tw x th after it, Live's second resize), writes BGRA8 into
+// hOut's buffer and signals hFenceOut, which the present waits on before its copy: the GPU orders the three, no thread
+// waits. HDR (hdr: the frames are R10G10B10A2 PQ words): the upscaler reads the frame's SDR view and its result comes
+// back to the codes as on Live's own route (storeSlot), the way picked by the last four captures' range bits
+// (hdrInBits) instead of a readback (the bridges: their HDR mode on the codes' linear light, as Live's own route);
+// R10G10B10A2 out. The caller's thread binds the device; false = it did not start (the present keeps the Lanczos pair)
 // (the present thread's rsTabFor calls go to the stage's own tables while it runs: t_puTabs)
 struct PuTabsScope
 {
@@ -526,8 +528,10 @@ struct PuTabsScope
 static const char* puName(int kind)
 {
     return kind == 1   ? "RTX VSR"
+           : kind == 2 ? "AMD FSR upscaling"
            : kind == 3 ? "Anime4K"
            : kind == 4 ? "ArtCNN"
+           : kind == 5 ? "Intel XeSS upscaling"
            : kind == 6 ? "Real-ESRGAN"
            : kind == 7 ? "AnimeJaNai HD"
                        : "an unknown upscaler";
@@ -606,18 +610,78 @@ static bool nativePresentUpInit(NativeRife& nr, HANDLE hIn, uint64_t inBytes, in
     return nativePresentUpKind(nr, kind);
 }
 
+// the stage's start line (`live upscale: NAME WxH -> UWxUH after DLSS 4.5`, the stage's harness reads it); extra = what
+// goes before the HDR note
+static void nativePresentUpLine(const NativeRife& nr, const char* extra)
+{
+    const int kind = nr.puKind;
+    char then[64] = "";
+    if (nr.puUw != nr.puTw || nr.puUh != nr.puTh)
+        sprintf_s(then, ", then Lanczos to %dx%d (Upscale to)", nr.puTw, nr.puTh);
+    char vsrQ[24] = "";
+    if (kind == 1)
+        sprintf_s(vsrQ, " (quality %u)", nr.vsrSet.QualityLevel);
+    const char* hdrNote = !nr.puHdr                  ? ""
+                          : (kind == 2 || kind == 5) ? ", on the HDR frames' linear light (the bridge's HDR mode)"
+                                                     : ", on the HDR frames' SDR view";
+    LOG("native: live upscale: %s %dx%d -> %dx%d after DLSS 4.5%s, on every shown frame%s%s%s\n", puName(kind), nr.puW,
+        nr.puH, nr.puUw, nr.puUh, then, vsrQ, extra, hdrNote);
+}
+
 // the stage's upscaler at its geometry (nativePresentUpInit's; a live switch: nativePresentUpSwitch): RTX VSR's NGX
-// feature (one create a process) and its warm-up eval, or a planar net's setup (its own warm-up); the planar buffers a
-// planar net, HDR or Upscale to reads; false = it did not start
+// feature (one create a process) and its warm-up eval, AMD FSR / Intel XeSS's bridge with its first frames on a worker
+// (the stage on at their end, nativePresentUpWarmPoll), or a planar net's setup (its own warm-up); the planar buffers
+// a planar net, HDR or Upscale to reads; false = it did not start
 static bool nativePresentUpKind(NativeRife& nr, int kind)
 {
     const PuTabsScope tabsHere;
     const char* name = puName(kind);
     const int w = nr.puW, h = nr.puH, uw = nr.puUw, uh = nr.puUh, tw = nr.puTw, th = nr.puTh;
-    const bool hdr = nr.puHdr, fit2 = uw != tw || uh != th;
-    if (kind != 1 && kind != 3 && kind != 4 && kind != 6 && kind != 7)
+    const bool hdr = nr.puHdr, fit2 = uw != tw || uh != th, fu = kind == 2 || kind == 5;
+    if (kind < 1 || kind > 7)
         return false;
-    if (kind == 1)
+    if (fu)
+    {
+        // the bridge on the route's fu* fields (the compute thread runs no upscaler at the working size), its vectors'
+        // Optical Flow session on puSt; HDR frames in the bridge's HDR mode, as Live's own route (SMV_FSRUP_HDR=0 = off)
+        wchar_t ev[8]{};
+        if (hdr && GetEnvironmentVariableW(L"SMV_FSRUP_HDR", ev, 8) && ev[0] == L'0')
+        {
+            LOG("native: %s after DLSS 4.5: off on HDR frames (SMV_FSRUP_HDR=0)\n", name);
+            return false;
+        }
+        nr.fuKind = kind == 5 ? 1 : 0;
+        if (!nativeFuDir(nr.fuKind, nr.fsrUpDir))
+        {
+            LOG("native: %s after DLSS 4.5: %s are missing in %s\n", name,
+                nr.fuKind ? "Intel's XeSS DLLs" : "AMD's FidelityFX DLLs", nr.fsrUpDir.c_str());
+            return false;
+        }
+        if (!hdr && !nr.dVsrOut)
+            NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)uw * uh * 4), "the upscaler after DLSS 4.5: output");
+        nr.fuHdr = hdr;
+        bool ok = nativeFsrupSetup(nr, w, h, uw, uh, nr.puSt);
+        if (ok)
+        {
+            nr.puWarmT0 = GetTickCount64();
+            InterlockedExchange(&nr.puWarm, 1);
+            nr.puWarmTh = CreateThread(nullptr, 0, nativePuWarmProc, &nr, 0, nullptr);
+            if (!nr.puWarmTh)
+            {
+                InterlockedExchange(&nr.puWarm, 0);
+                LOG("native: %s after DLSS 4.5: its warm-up thread did not start\n", name);
+                ok = false;
+            }
+        }
+        if (!ok)
+        {
+            LOG("native: %s after DLSS 4.5: its setup failed\n", name);
+            nativeFsrupRelease(nr); // what the setup made
+            nr.fuHdr = false;
+            return false;
+        }
+    }
+    else if (kind == 1)
     {
         if (!rtxBridgeLoad())
             return false;
@@ -670,7 +734,7 @@ static bool nativePresentUpKind(NativeRife& nr, int kind)
     }
     // the planar buffers: a net's planes in and result out; on HDR or with Upscale to every upscaler's (the codes, their
     // view, the way back, the second resize); kept across a live switch
-    if ((kind != 1 || hdr || fit2) && !nr.dPuPl)
+    if (((kind != 1 && !fu) || hdr || fit2) && !nr.dPuPl)
     {
         NCHK(cudaMalloc((void**)&nr.dPuPl, (size_t)3 * w * h * sizeof(float)), "the upscaler after DLSS 4.5: planes");
         NCHK(cudaMalloc((void**)&nr.dPuPres, (size_t)3 * uw * uh * sizeof(float)),
@@ -678,16 +742,46 @@ static bool nativePresentUpKind(NativeRife& nr, int kind)
     }
     nr.puKind = kind;
     nr.puFailed = false;
+    if (fu)
+    {
+        // on at the warm-up's end: until then the present shows the frames through the Lanczos pair
+        nr.puOn = false;
+        LOG("native: %s %dx%d -> %dx%d after DLSS 4.5: its first frames on a worker (the driver may compile its "
+            "shaders), the native fit's Lanczos enlarges meanwhile\n",
+            name, w, h, uw, uh);
+        return true;
+    }
     nr.puOn = true;
-    char then[64] = "";
-    if (fit2)
-        sprintf_s(then, ", then Lanczos to %dx%d (Upscale to)", tw, th);
-    char vsrQ[24] = "";
-    if (kind == 1)
-        sprintf_s(vsrQ, " (quality %u)", nr.vsrSet.QualityLevel);
-    LOG("native: live upscale: %s %dx%d -> %dx%d after DLSS 4.5%s, on every shown frame%s%s\n", name, w, h, uw, uh,
-        then, vsrQ, hdr ? ", on the HDR frames' SDR view" : "");
+    nativePresentUpLine(nr, "");
     return true;
+}
+
+// AMD FSR / Intel XeSS's warm-up in the stage (the present thread, before a shown frame): 0 = still warming (or none),
+// 1 = it ended and the stage is on from this frame, -1 = it failed (the Lanczos pair stays)
+static int nativePresentUpWarmPoll(NativeRife& nr)
+{
+    if (!nr.puWarmTh)
+        return 0;
+    const LONG s = InterlockedCompareExchange(&nr.puWarm, 0, 0);
+    if (s < 2)
+        return 0;
+    WaitForSingleObject(nr.puWarmTh, INFINITE); // its last store done: the thread is returning
+    CloseHandle(nr.puWarmTh);
+    nr.puWarmTh = nullptr;
+    InterlockedExchange(&nr.puWarm, 0);
+    const double ms = (double)(GetTickCount64() - nr.puWarmT0);
+    if (s != 2)
+    {
+        LOG("native: %s after DLSS 4.5: its first frames failed after %.0f ms, the native fit's Lanczos stays\n",
+            puName(nr.puKind), ms);
+        nr.puFailed = true;
+        return -1;
+    }
+    char extra[64];
+    sprintf_s(extra, " (its first frames on a worker: %.0f ms)", ms);
+    nr.puOn = true;
+    nativePresentUpLine(nr, extra);
+    return 1;
 }
 
 // a live `set up N` on a session whose DLSS 4.5 frames the stage enlarges (the loop thread, between two shown frames,
@@ -708,25 +802,35 @@ static bool nativePresentUpSwitch(NativeRife& nr, int kind)
 }
 
 // one shown frame on puSt, its bytes already waited for in dPuIn (nativePresentUpRun): the frame -> the upscaler's input
-// (SDR: k_rgbaBgra into tight RGBA8 in dVsrIn; HDR: the words tight in dVsrIn -> the code planes, k_unpackR10 -> their
-// SDR view in dPuView, knee 1, head 0) -> the upscaler to puUw x puUh (RTX VSR: dVsrIn -> dVsrOut, k_packBgra of the
-// view first on HDR, k_unpackRgba into dPuPres when planes follow; a planar net from the planes into dPuPres) -> HDR:
-// back to the codes (Live's storeSlot rule) -> Upscale to: Lanczos into dPuFin at puTw x puTh -> the store into dPuOut
-// (BGRA8, R10G10B10A2 on HDR). false = a call failed (an upscaler's own failure says its line here, puFailed set)
+// (SDR: k_rgbaBgra into tight RGBA8 in dVsrIn, the bridges' B, G, R, A rows copied tight; HDR: the words tight in dVsrIn
+// -> the code planes, k_unpackR10 -> their SDR view in dPuView, knee 1, head 0) -> the upscaler to puUw x puUh (RTX
+// VSR: dVsrIn -> dVsrOut, k_packBgra of the view first on HDR, k_unpackRgba into dPuPres when planes follow; the
+// bridges: dVsrIn -> dVsrOut, on HDR k_fsrHdrPack from the code planes in and k_fsrHdrOut into dPuPres out, already the
+// codes; a planar net from the planes into dPuPres) -> HDR: back to the codes (Live's storeSlot rule) -> Upscale to:
+// Lanczos into dPuFin at puTw x puTh -> the store into dPuOut (BGRA8, R10G10B10A2 on HDR). false = a call failed (an
+// upscaler's own failure says its line here, puFailed set)
 static bool nativePresentUpFrame(NativeRife& nr)
 {
     cudaStream_t st = nr.puSt;
     int w = nr.puW, h = nr.puH, uw = nr.puUw, uh = nr.puUh, tw = nr.puTw, th = nr.puTh;
     int ps = w * h, ups = uw * uh, tps = tw * th, zero = 0, mode = 1, tight = w * 4;
-    const bool hdr = nr.puHdr, fit2 = uw != tw || uh != th;
+    const bool hdr = nr.puHdr, fit2 = uw != tw || uh != th, fu = nr.puKind == 2 || nr.puKind == 5;
     if (hdr)
     {
+        // the bridges make their own view below (k_fsrHdrPack), from the same code planes
         void* u[] = {&nr.dVsrIn, &w, &h, &zero, &nr.dPuPl};
         if (cudaMemcpy2DAsync(nr.dVsrIn, (size_t)w * 4, nr.dPuIn, (size_t)nr.puInPitch, (size_t)w * 4, h,
                               cudaMemcpyDeviceToDevice, st) != cudaSuccess ||
             cuLaunchKernel(nr.fUnpackR10, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, u, nullptr) !=
                 CUDA_SUCCESS ||
-            !nativeHdrEnc(nr, nr.dPuPl, 0, ps, w, w, h, nr.dPuView, 0, ps, w, mode, 1.0f, 0.0f, st))
+            (!fu && !nativeHdrEnc(nr, nr.dPuPl, 0, ps, w, w, h, nr.dPuView, 0, ps, w, mode, 1.0f, 0.0f, st)))
+            return false;
+    }
+    else if (fu)
+    {
+        // the bridges read B, G, R, A bytes: the rows as they are, tight
+        if (cudaMemcpy2DAsync(nr.dVsrIn, (size_t)w * 4, nr.dPuIn, (size_t)nr.puInPitch, (size_t)w * 4, h,
+                              cudaMemcpyDeviceToDevice, st) != cudaSuccess)
             return false;
     }
     else
@@ -736,7 +840,51 @@ static bool nativePresentUpFrame(NativeRife& nr)
             CUDA_SUCCESS)
             return false;
     }
-    if (nr.puKind == 1)
+    if (fu)
+    {
+        const int hlg = nr.encPost == 2 ? 1 : 0;
+        if (hdr)
+        {
+            // the SDR view packed for the vectors and the frame in linear light for the bridge, from one read of the
+            // code planes (Live's own route's call)
+            const float scale = 125.0f / nr.encWhite;
+            void* f[] = {&nr.dPuPl,    &zero,         &ps,         &w,         &w,        &h,           &mode,
+                         &nr.encWhite, (void*)&scale, (void*)&hlg, &nr.dVsrIn, &nr.dFuIn, &nr.fuInPitch};
+            if (cuLaunchKernel(nr.fFsrHdrPack, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, f,
+                               nullptr) != CUDA_SUCCESS)
+                return false;
+        }
+        const RtxRect ri{0, 0, (uint32_t)w, (uint32_t)h};
+        const RtxRect ro{0, 0, (uint32_t)uw, (uint32_t)uh};
+        unsigned int rv = 0;
+        if (!nativeFsrupEval(nr, ri, ro, st, rv))
+        {
+            LOG("native: %s after DLSS 4.5 failed, Lanczos for the rest of the session\n", puName(nr.puKind));
+            nr.puFailed = true;
+            return false;
+        }
+        if (hdr)
+        {
+            // the bridge's linear light back to the codes, no view to come back from
+            const float inv = nr.encWhite / 125.0f;
+            void* a[] = {&nr.dFuOut, &nr.fuOutPitch, &uw, &uh, (void*)&inv, (void*)&hlg, &nr.dPuPres};
+            if (cuLaunchKernel(nr.fFsrHdrOut, (uw + 15) / 16, (uh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
+                               nullptr) != CUDA_SUCCESS)
+                return false;
+        }
+        else if (!fit2)
+            // the bridge's bytes straight into the store (SDR at the presented size: the store's order already)
+            return cudaMemcpy2DAsync(nr.dPuOut, (size_t)nr.puOutPitch, nr.dVsrOut, (size_t)uw * 4, (size_t)uw * 4, uh,
+                                     cudaMemcpyDeviceToDevice, st) == cudaSuccess;
+        else
+        {
+            void* b[] = {&nr.dVsrOut, &uw, &uh, &nr.dPuPres};
+            if (cuLaunchKernel(nr.fUnpackBgraRgb, (uw + 15) / 16, (uh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, b,
+                               nullptr) != CUDA_SUCCESS)
+                return false;
+        }
+    }
+    else if (nr.puKind == 1)
     {
         void* a[] = {&nr.dPuView, &zero, &ps, &w, &w, &h, &nr.dVsrIn};
         if (hdr && cuLaunchKernel(nr.fPackBgra, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, a,
@@ -791,7 +939,7 @@ static bool nativePresentUpFrame(NativeRife& nr)
     }
     // back to the codes (Live's storeSlot rule): the view's way when the last four captures stayed inside the SDR
     // range (a shown frame comes from the newest few), else the light the view never held from the codes' Lanczos fit
-    if (hdr)
+    if (hdr && !fu)
     {
         const unsigned bits = std::atomic_ref<unsigned>(nr.hdrInBits).load(std::memory_order_acquire);
         if ((bits & 15u) == 15u

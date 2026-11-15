@@ -350,7 +350,6 @@
   "lv.effectsOnly": "hanya efek ({restore}, {up}, {nr}, {sharpen}, {hdr}) di frame rate sumber, dibatasi pengaturan Kecepatan {fps} fps; centang sebuah model untuk menghaluskan",
   "up.live.monitor": "{whole} merekam layar seperti yang ditampilkan pemutar, sudah diregangkan oleh penskala pemutar itu sendiri, jadi upscaler tidak pernah mendapat frame asli video (di DLAA tidak ada yang bisa diperbesar dan upscaler tetap mati). Untuk video terbaik: putar dalam jendela pada ukuran aslinya (100%, mis. 1280x720 untuk 720p), pilih jendela itu dan atur {display} ke {fill}.",
   "up.live.window": "{orig} di DLAA mempertahankan ukuran jendela: upscaler tidak punya apa pun untuk diperbesar dan tetap mati; {fill} memperbesar jendela ke monitornya lewat upscaler.",
-  "up.live.dlssg": "Dengan DLSS 4.5 di mode Langsung, AMD FSR 4.1 dan Intel XeSS tetap mati: frame DLSS 4.5 diperbesar dengan Lanczos. Keduanya berlaku untuk setiap model lain dan di mode Video.",
   "lv.fixed": "kelipatan bulat pertama dari rate tangkapan yang mencapai {fps} fps",
   "lv.fixed.dlssg": "(banyak lintasan melewati batas satu lintasan, lintasan penuh lebih dulu)",
   "lv.targets": "menargetkan {fps} fps (pengaturan Kecepatan di bawah)",

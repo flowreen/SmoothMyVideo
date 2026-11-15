@@ -350,7 +350,6 @@
   "lv.effectsOnly": "só efeitos ({restore}, {up}, {nr}, {sharpen}, {hdr}) na taxa de origem, limitados pelos {fps} fps da Velocidade; marque um modelo para suavizar",
   "up.live.monitor": "{whole} captura a tela como o player a mostra, já esticada pelo próprio redimensionamento dele, então o upscaler nunca recebe os quadros reais do vídeo (em DLAA não há nada para ampliar e ele fica desligado). Para um vídeo no máximo: reproduza-o numa janela no tamanho original (100%, ex. 1280x720 para 720p), escolha essa janela e ponha {display} em {fill}.",
   "up.live.window": "{orig} em DLAA mantém o tamanho da janela: o upscaler não tem nada para ampliar e fica desligado; {fill} amplia a janela até o monitor pelo upscaler.",
-  "up.live.dlssg": "Com o DLSS 4.5 no modo Ao vivo, o AMD FSR 4.1 e o Intel XeSS ficam desligados: os quadros do DLSS 4.5 são ampliados com Lanczos. Eles valem para qualquer outro modelo e no modo Vídeo.",
   "lv.fixed": "o primeiro múltiplo inteiro da taxa capturada que chega a {fps} fps",
   "lv.fixed.dlssg": "(várias passagens além do limite de uma passagem, passagens completas primeiro)",
   "lv.targets": "mira em {fps} fps (a configuração de Velocidade abaixo)",

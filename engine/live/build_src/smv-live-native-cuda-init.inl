@@ -138,7 +138,7 @@ static int srcH(const NativeRife& nr)
 }
 
 // AMD FSR upscaling at RTX VSR's resize (NativeRife's fsrUp notes; defined after nativeFsrfgRelease)
-static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh);
+static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh, cudaStream_t ofSt = nullptr);
 static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, cudaStream_t st, unsigned int& rv);
 static void nativeFsrupRelease(NativeRife& nr);
 static uint64_t nativeVideoMemoryRoom();

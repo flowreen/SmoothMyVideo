@@ -350,7 +350,6 @@
   "lv.effectsOnly": "effets seuls ({restore}, {up}, {nr}, {sharpen}, {hdr}) à la fréquence source, plafonnés par le réglage Vitesse de {fps} fps ; cochez un modèle pour fluidifier",
   "up.live.monitor": "{whole} capture l'écran tel que le lecteur l'affiche, déjà étiré par son propre redimensionnement : l'upscaler ne reçoit jamais les vraies images de la vidéo (en DLAA il n'a rien à agrandir et reste éteint). Pour une vidéo au mieux : lisez-la dans une fenêtre à sa taille d'origine (100 %, p. ex. 1280x720 pour du 720p), choisissez cette fenêtre et réglez {display} sur {fill}.",
   "up.live.window": "{orig} en DLAA garde la taille de la fenêtre : l'upscaler n'a rien à agrandir et reste éteint ; {fill} agrandit la fenêtre à son écran via l'upscaler.",
-  "up.live.dlssg": "Avec DLSS 4.5 en mode En direct, AMD FSR 4.1 et Intel XeSS restent éteints : les images de DLSS 4.5 sont agrandies avec Lanczos. Ils s'appliquent avec tout autre modèle et en mode Vidéo.",
   "lv.fixed": "le premier multiple entier de la fréquence capturée qui atteint {fps} fps",
   "lv.fixed.dlssg": "(plusieurs passes au-delà de sa limite en une passe, passes complètes d'abord)",
   "lv.targets": "vise {fps} fps (le réglage Vitesse ci-dessous)",

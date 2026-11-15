@@ -223,8 +223,11 @@ struct Host
     // upRunFn queues the upscaler into upOut at winW x winH, upOut copied into the back buffer; upFenceIn / upFenceOut
     // (shared) order the three on the GPU
     bool upOn = false;
-    int upKind =
-        0; // the upscaler (nativeUpSwitch's numbering: 1 RTX VSR, 3 Anime4K, 4 ArtCNN, 6 Real-ESRGAN, 7 AnimeJaNai)
+    // the upscaler (nativeUpSwitch's numbering: 1 RTX VSR, 2 AMD FSR, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS, 6 Real-ESRGAN,
+    // 7 AnimeJaNai HD)
+    int upKind = 0;
+    // AMD FSR / Intel XeSS started, their first frames still on a worker: upOn waits for its end (upPollFn)
+    bool upWarm = false;
     int upUw = 0, upUh = 0; // Upscale to: the upscaler's own size (Lanczos to winW x winH after it); 0 = winW x winH
     ComPtr<ID3D12Resource> upIn, upOut;
     ComPtr<ID3D12Fence> upFenceIn, upFenceOut;

@@ -350,7 +350,6 @@
   "lv.effectsOnly": "仅特效（{restore}、{up}、{nr}、{sharpen}、{hdr}），保持源帧率，上限为速度中设置的 {fps} fps；勾选一个模型即可补帧",
   "up.live.monitor": "{whole}会按播放器显示的样子捕获屏幕，画面已被播放器自己的缩放拉伸过，所以放大器拿不到视频的原始帧（在 DLAA 下没有可放大的内容，会保持关闭）。想要最佳效果：在窗口中以视频原始大小播放（100%，例如 720p 为 1280x720），选择该窗口，并把{display}设为{fill}。",
   "up.live.window": "DLAA 下的{orig}保持窗口原来的大小，放大器没有可放大的内容，会保持关闭；{fill}会通过放大器把窗口放大到所在显示器。",
-  "up.live.dlssg": "实时模式下使用 DLSS 4.5 时，AMD FSR 4.1 和 Intel XeSS 保持关闭：DLSS 4.5 的帧用 Lanczos 放大。它们在其他所有模型和视频模式下都会生效。",
   "lv.fixed": "采集帧率的第一个达到 {fps} fps 的整数倍",
   "lv.fixed.dlssg": "（超过单遍上限时多遍处理，先运行完整遍）",
   "lv.targets": "目标 {fps} fps（下方的速度设置）",

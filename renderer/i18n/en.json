@@ -350,7 +350,6 @@
   "lv.effectsOnly": "effects only ({restore}, {up}, {nr}, {sharpen}, {hdr}) at the source rate, capped by the {fps} fps Speed setting; tick a model to smooth",
   "up.live.monitor": "{whole} captures the screen as the player shows it, already stretched by the player's own scaler, so the upscaler never gets the video's real frames (at DLAA it has nothing to enlarge and stays off). For a video at its best: play it in a window at its own size (100%, e.g. 1280x720 for 720p), pick that window and set {display} to {fill}.",
   "up.live.window": "{orig} at DLAA keeps the window's size, so the upscaler has nothing to enlarge and stays off; {fill} enlarges the window to its monitor through the upscaler.",
-  "up.live.dlssg": "With DLSS 4.5 in Live, AMD FSR 4.1 and Intel XeSS stay off: DLSS 4.5's frames are enlarged with Lanczos. They apply with every other model and in Video mode.",
   "lv.fixed": "the first whole multiple of the captured rate that reaches {fps} fps",
   "lv.fixed.dlssg": "(multi-pass past its one-pass limit, full passes first)",
   "lv.targets": "targets {fps} fps (the Speed setting below)",

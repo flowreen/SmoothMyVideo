@@ -1066,6 +1066,17 @@ static bool nativeBindKernels(NativeRife& nr)
 // the stage's own list, so the compute thread's list is never read or grown from another thread
 static thread_local bool t_puTabs = false;
 
+// a failed call inside a helper both routes share (AMD FSR / Intel XeSS upscaling, their Optical Flow vectors): on the
+// compute thread it ends the session (nr.die); on the present thread's stage (t_puTabs) only that stage stops, its
+// caller shows the rest of the session through the Lanczos pair
+static void nativeFail(NativeRife& nr, const char* why)
+{
+    if (t_puTabs)
+        LOG("native: %s\n", why);
+    else
+        nr.die(why);
+}
+
 // one resize axis's tap table (in -> out: lzTaps x out entries of 8 bytes), built by k_rsTab on the reader's stream at
 // its first use (so it is ready before that read) and kept for the session; nullptr = the allocation or the launch failed
 static const void* rsTabFor(NativeRife& nr, int in, int out, cudaStream_t st)

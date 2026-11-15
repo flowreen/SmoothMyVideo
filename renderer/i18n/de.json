@@ -350,7 +350,6 @@
   "lv.effectsOnly": "nur Effekte ({restore}, {up}, {nr}, {sharpen}, {hdr}) mit der Quell-Bildrate, begrenzt durch die {fps} fps der Geschwindigkeit; ein Modell anhaken zum Glätten",
   "up.live.monitor": "{whole} nimmt den Bildschirm so auf, wie der Player ihn zeigt, schon von dessen eigenem Skalierer gestreckt: der Upscaler bekommt nie die echten Bilder des Videos (bei DLAA hat er nichts zu vergrößern und bleibt aus). Für ein Video in bester Qualität: es in einem Fenster in seiner eigenen Größe abspielen (100 %, z. B. 1280x720 bei 720p), dieses Fenster wählen und {display} auf {fill} stellen.",
   "up.live.window": "{orig} bei DLAA behält die Größe des Fensters: der Upscaler hat nichts zu vergrößern und bleibt aus; {fill} vergrößert das Fenster über den Upscaler auf seinen Monitor.",
-  "up.live.dlssg": "Mit DLSS 4.5 in Live bleiben AMD FSR 4.1 und Intel XeSS aus: Die Bilder von DLSS 4.5 werden mit Lanczos vergrößert. Sie wirken mit jedem anderen Modell und im Modus Video.",
   "lv.fixed": "das erste ganze Vielfache der erfassten Rate, das {fps} fps erreicht",
   "lv.fixed.dlssg": "(mehrere Durchläufe über der Grenze eines Durchlaufs, volle Durchläufe zuerst)",
   "lv.targets": "zielt auf {fps} fps (die Geschwindigkeits-Einstellung unten)",

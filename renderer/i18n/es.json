@@ -350,7 +350,6 @@
   "lv.effectsOnly": "solo efectos ({restore}, {up}, {nr}, {sharpen}, {hdr}) a la tasa de origen, con el límite de {fps} fps de Velocidad; marca un modelo para suavizar",
   "up.live.monitor": "{whole} captura la pantalla tal como la muestra el reproductor, ya estirada por su propio escalador, así que el escalador nunca recibe los fotogramas reales del vídeo (en DLAA no tiene nada que ampliar y queda apagado). Para ver un vídeo al máximo: reprodúcelo en una ventana a su propio tamaño (100 %, p. ej. 1280x720 para 720p), elige esa ventana y pon {display} en {fill}.",
   "up.live.window": "{orig} en DLAA mantiene el tamaño de la ventana: el escalador no tiene nada que ampliar y queda apagado; {fill} amplía la ventana a su monitor con el escalador.",
-  "up.live.dlssg": "Con DLSS 4.5 en el modo En vivo, AMD FSR 4.1 e Intel XeSS quedan apagados: los fotogramas de DLSS 4.5 se amplían con Lanczos. Se aplican con cualquier otro modelo y en el modo Video.",
   "lv.fixed": "el primer múltiplo entero de la tasa capturada que llega a {fps} fps",
   "lv.fixed.dlssg": "(varias pasadas al superar el límite de una pasada, primero las pasadas completas)",
   "lv.targets": "apunta a {fps} fps (el ajuste de Velocidad de abajo)",
