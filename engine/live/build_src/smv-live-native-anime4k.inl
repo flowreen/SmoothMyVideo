@@ -4451,9 +4451,10 @@ static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upE
 // frame (k_a4kFold2x, unclipped) into dA4kMid, the next pass's input; the last one the Depth-to-Space pass with
 // Clamp_Highlights on the 2^n frame (the shader's PREKERNEL hook, before any resize) and the Lanczos pair from 2w x 2h
 // to tw x th (one pass, k_a4kFold2x, when tw x th is exactly 2w x 2h) into dst (planar fp32, tight, clipped to 0..1)
-static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th)
+static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th,
+                         cudaStream_t stIn)
 {
-    cudaStream_t st = nr.stream;
+    cudaStream_t st = stIn ? stIn : nr.stream;
     if (tw > nr.a4kOw)
     {
         nr.die("Anime4K fold target wider than its buffer");

@@ -143,17 +143,21 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
 static void nativeFsrupRelease(NativeRife& nr);
 static uint64_t nativeVideoMemoryRoom();
 static bool nativeA4kSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc);
-static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th);
+// a planar upscaler's run: on stIn when given (the upscaler after Live DLSS 4.5 runs on its own stream), else nr.stream
+static bool nativeA4kRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th,
+                         cudaStream_t stIn = nullptr);
 static void nativeA4kRelease(NativeRife& nr);
 static bool nativeAcnSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc);
-static bool nativeAcnRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th);
+static bool nativeAcnRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th,
+                         cudaStream_t stIn = nullptr);
 static void nativeAcnRelease(NativeRife& nr);
 static bool nativeRgUpSetup(NativeRife& nr, int w, int h, int ow, int oh, int upEnc);
-static bool nativeRgUpRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th);
+static bool nativeRgUpRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th,
+                          cudaStream_t stIn = nullptr);
 static void nativeRgUpRelease(NativeRife& nr);
 
 // the session's planar-float upscaler (NativeRife::planarUp): its name, its setup for w x h -> ow x oh, one frame of
-// s (planar, fp32 or fp16 by sHalf, plane / row strides) into dst at tw x th
+// s (planar, fp32 or fp16 by sHalf, plane / row strides) into dst at tw x th (on st when given, else nr.stream)
 static const char* planarUpName(const NativeRife& nr)
 {
     return nr.acnUp ? "ArtCNN" : nr.rgUp ? (nr.rgAj ? "AnimeJaNai HD" : "Real-ESRGAN") : "Anime4K";
@@ -164,11 +168,12 @@ static bool nativePlanarUpSetup(NativeRife& nr, int w, int h, int ow, int oh, in
            : nr.rgUp ? nativeRgUpSetup(nr, w, h, ow, oh, upEnc)
                      : nativeA4kSetup(nr, w, h, ow, oh, upEnc);
 }
-static bool nativePlanarUpRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th)
+static bool nativePlanarUpRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th,
+                              cudaStream_t st = nullptr)
 {
-    return nr.acnUp  ? nativeAcnRun(nr, s, sHalf, ps_, rs_, dst, tw, th)
-           : nr.rgUp ? nativeRgUpRun(nr, s, sHalf, ps_, rs_, dst, tw, th)
-                     : nativeA4kRun(nr, s, sHalf, ps_, rs_, dst, tw, th);
+    return nr.acnUp  ? nativeAcnRun(nr, s, sHalf, ps_, rs_, dst, tw, th, st)
+           : nr.rgUp ? nativeRgUpRun(nr, s, sHalf, ps_, rs_, dst, tw, th, st)
+                     : nativeA4kRun(nr, s, sHalf, ps_, rs_, dst, tw, th, st);
 }
 
 static bool nativeRtxInit(NativeRife& nr)

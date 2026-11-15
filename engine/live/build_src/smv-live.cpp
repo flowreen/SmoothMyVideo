@@ -190,8 +190,12 @@ static bool g_nrNative = false;    // DLSS 5 NR runs inside this exe (the native
 static bool g_liveNrCuda = false;  // live DLSS 5: the native host runs it on the
                                    // model frame after Restore and the resize (nativeLiveNrInit)
 static std::atomic<bool> g_liveNrReset{false}; // the overlay was hidden: the next evaluate starts a new stream
-static bool g_nrAttempted = false;             // NGX was initialised in this process (even if it then
-                                               // refused): leave through ExitProcess, see the end of run()
+// a Live DLSS 4.5 session whose frames the present's stage enlarges (the upscaler after DLSS 4.5): a stdin `set up N`
+// goes to the loop thread (g_puWant, -1 = none), which switches the stage between two shown frames
+static std::atomic<bool> g_puLive{false};
+static std::atomic<int> g_puWant{-1};
+static bool g_nrAttempted = false; // NGX was initialised in this process (even if it then
+                                   // refused): leave through ExitProcess, see the end of run()
 // Live TrueHDR (SDR window -> HDR out). Applied only when the HDR live mode is on (server
 // backends; not DLSS-G).
 static bool g_rtxHdr = false;          // --rtx-hdr
@@ -4422,6 +4426,8 @@ static void resetSessionGlobals()
     g_xessUp = false;
     g_xessFg = false;
     g_upscaleH = 0;
+    g_puLive = false;
+    g_puWant = -1;
     g_restore = false;
     g_restoreModel.clear();
     g_restoreA4k = false;

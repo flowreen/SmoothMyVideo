@@ -453,8 +453,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
             }
         }
     }
+    // (an atomic store: the upscaler after Live DLSS 4.5 reads the bits on the present thread; this thread alone writes)
     if (!nrSame)
-        nr.hdrInBits = (nr.hdrInBits << 1) | (hdrIn ? 1u : 0u);
+        std::atomic_ref<unsigned>(nr.hdrInBits)
+            .store((nr.hdrInBits << 1) | (hdrIn ? 1u : 0u), std::memory_order_release);
     // DLSS 5: once per captured frame on the model frame, after Restore and the
     // resize and before any model reads it; then Sharpen and RTX TrueHDR (nativePreModelPost), and the
     // frame the model reads is kept for the reuse above

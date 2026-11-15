@@ -668,6 +668,14 @@ static void nativeLiveSets(NativeRife& nr)
             bool& failed = key == "up" ? nr.vsrFailed : key == "restore" ? nr.restFailed : nr.rtxFailed;
             bool& userOff = key == "up" ? nr.vsrUserOff : key == "restore" ? nr.restUserOff : nr.rtxUserOff;
             const int want = (int)clampU(v, 0.0, 9.0);
+            if (key == "up" && g_puLive.load())
+            {
+                // a Live DLSS 4.5 session whose frames the present's stage enlarges: the loop thread switches the stage
+                // (the echo route here stays at the working size, where no upscaler runs)
+                g_puWant.store(want);
+                LOG("live set: up %s (the upscaler after DLSS 4.5 takes it at the next shown frame)\n", val.c_str());
+                continue;
+            }
             if (key == "up" && nr.fuWarmTh)
             {
                 // an FSR / XeSS start in place still warming: the tick's last state decides at its end

@@ -772,6 +772,7 @@ struct NativeRife
         void* d;
     };
     std::vector<RsTab> rsTabs;
+    std::vector<RsTab> puRsTabs;  // the same for the upscaler after Live DLSS 4.5 (the present thread, its stream)
     float* dCapF = nullptr;       // HDR + image scale under 1: planar PQ at capture resolution
     uint8_t* dThdrIn = nullptr;   // RGBA8 bridge input, pitch 4*cw
     uint32_t* dThdrOut = nullptr; // packed 10:10:10:2 bridge output, B in the low bits
@@ -879,12 +880,41 @@ struct NativeRife
     uint8_t* dVsrOut = nullptr; // VSR: tight RGBA8 (FSR upscaling: BGRA8) at the presented size dw x dh
     float* dVsrView = nullptr;  // live HDR planes: the SDR view RTX VSR reads, planar fp32 at its input size
     float* dVsrRem = nullptr;   // live HDR planes: the Lanczos fit at VSR's target (k_hdrRestOut's remainder)
-    unsigned hdrInBits = 0;     // live HDR planes: one bit a capture, newest lowest: it stayed inside the SDR range
-    float* dX = nullptr;        // (1,6,ph,pw): prev in planes 0..2, cur in 3..5 (xSwap: the reverse)
-    bool xSwap = false;         // live: dX's halves trade roles instead of the cur -> prev copy (nativeXPrev / Cur)
-    uint16_t* dXh = nullptr;    // dX in fp16 for an IFNet that takes fp16 frames (xHalf)
-    float* dF[2]{};             // f_prev / f_cur, (1,kRifeFeatC,ph,pw) in the IFNet's feature dtype (featHalf: fp16)
-    float* dEncOwn = nullptr;   // the encode's half-size planes when no shared activation block holds them
+    // the upscaler after Live DLSS 4.5 (nativePresentUp*): a shown frame (BGRA8, puW x puH, rows puInPitch apart) the
+    // present copied into a shared D3D12 buffer, RTX VSR (dVsrIn -> dVsrOut) to puTw x puTh into a second shared
+    // buffer (BGRA8, puOutPitch); the present signals puSemIn, this stage puSemOut
+    bool puOn = false;
+    int puW = 0, puH = 0, puTw = 0, puTh = 0, puInPitch = 0, puOutPitch = 0;
+    cudaExternalMemory_t puEmIn = nullptr, puEmOut = nullptr;
+    cudaExternalSemaphore_t puSemIn = nullptr, puSemOut = nullptr;
+    uint8_t* dPuIn = nullptr;
+    uint8_t* dPuOut = nullptr;
+    cudaStream_t puSt = nullptr;
+    bool puFailed = false; // a failed upscaler call: its line said once
+    // the stage's upscaler (nativeUpSwitch's numbering): 1 RTX VSR, 3 Anime4K, 4 ArtCNN, 6 Real-ESRGAN, 7 AnimeJaNai HD;
+    // a planar net reads dPuPl (the frame's planes, puW x puH) and writes dPuPres (puTw x puTh), both planar fp32
+    int puKind = 0;
+    float* dPuPl = nullptr;
+    float* dPuPres = nullptr;
+    // HDR (puHdr): the frame's R10G10B10A2 PQ words -> its code planes (dPuPl) -> their SDR view (dPuView, puW x puH)
+    // the upscaler reads; back to the codes the view's way when the last four captures stayed inside the SDR range
+    // (hdrInBits), else with the light the view never held from the codes' Lanczos fit (dPuRem at puTw x puTh, its
+    // horizontal pass in dPuTmp); every planar buffer fp32
+    bool puHdr = false;
+    float* dPuView = nullptr;
+    float* dPuRem = nullptr;
+    float* dPuTmp = nullptr;
+    size_t puTmpN = 0;
+    // Upscale to: the upscaler's own size puUw x puUh (the presented puTw x puTh without it), its result into dPuPres
+    // there, then Lanczos into dPuFin (planar fp32, puTw x puTh) before the store
+    int puUw = 0, puUh = 0;
+    float* dPuFin = nullptr;
+    unsigned hdrInBits = 0;   // live HDR planes: one bit a capture, newest lowest: it stayed inside the SDR range
+    float* dX = nullptr;      // (1,6,ph,pw): prev in planes 0..2, cur in 3..5 (xSwap: the reverse)
+    bool xSwap = false;       // live: dX's halves trade roles instead of the cur -> prev copy (nativeXPrev / Cur)
+    uint16_t* dXh = nullptr;  // dX in fp16 for an IFNet that takes fp16 frames (xHalf)
+    float* dF[2]{};           // f_prev / f_cur, (1,kRifeFeatC,ph,pw) in the IFNet's feature dtype (featHalf: fp16)
+    float* dEncOwn = nullptr; // the encode's half-size planes when no shared activation block holds them
     // the IFNet's features, timestep, flow and mask and the tweens, allocated once the engine's dtypes are
     // known (nativeTweenBuffers)
     void* dT = nullptr;        // (B,1,mph,mpw), fp32 or fp16 by tHalf

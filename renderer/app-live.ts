@@ -194,14 +194,14 @@ function lvTargetUi(mi = liveModelInfo()) {
 // Live's upscalers enlarge only what reaches them: Whole screen captures the screen as the player shows it (a fullscreen
 // player has already stretched the video with its own scaler), and Original size at DLAA leaves nothing to enlarge; a
 // ticked upscaler says so under its rows, with the setup that hands it the video's own frames (a window at the video's
-// size, Fill screen). The names come from the Display row's own labels. Under Live DLSS 4.5 the ticked upscaler does
-// not run at all (every model interpolates before any upscale, and DLSS 4.5's presented frames are enlarged by the
+// size, Fill screen). The names come from the Display row's own labels. Under Live DLSS 4.5 the upscaler enlarges every
+// frame DLSS 4.5 shows, except AMD FSR 4.1 and Intel XeSS: those stay off there (DLSS 4.5's frames are enlarged by the
 // host's Lanczos), which that line says instead.
 function upFitHintUi() {
   const fit = $('lvfit').value;
   const key = !(liveVsrOn() || fsrUpOn() || a4kUpOn() || acnUpOn() || rgUpOn() || ajUpOn() || xessUpOn())
     ? ''
-    : liveModelInfo().model === 'dlssg'
+    : liveModelInfo().model === 'dlssg' && (fsrUpOn() || xessUpOn())
       ? 'up.live.dlssg'
       : fit === 'monitor'
         ? 'up.live.monitor'

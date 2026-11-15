@@ -1062,11 +1062,16 @@ static bool nativeBindKernels(NativeRife& nr)
     return true;
 }
 
+// set on the present thread while it runs the upscaler after Live DLSS 4.5 (nativePresentUp*): its rsTabFor calls use
+// the stage's own list, so the compute thread's list is never read or grown from another thread
+static thread_local bool t_puTabs = false;
+
 // one resize axis's tap table (in -> out: lzTaps x out entries of 8 bytes), built by k_rsTab on the reader's stream at
 // its first use (so it is ready before that read) and kept for the session; nullptr = the allocation or the launch failed
 static const void* rsTabFor(NativeRife& nr, int in, int out, cudaStream_t st)
 {
-    for (const NativeRife::RsTab& e : nr.rsTabs)
+    std::vector<NativeRife::RsTab>& tabs = t_puTabs ? nr.puRsTabs : nr.rsTabs;
+    for (const NativeRife::RsTab& e : tabs)
         if (e.in == in && e.out == out)
             return e.d;
     void* d = nullptr;
@@ -1078,7 +1083,7 @@ static const void* rsTabFor(NativeRife& nr, int in, int out, cudaStream_t st)
         cudaFree(d);
         return nullptr;
     }
-    nr.rsTabs.push_back({in, out, d});
+    tabs.push_back({in, out, d});
     return d;
 }
 

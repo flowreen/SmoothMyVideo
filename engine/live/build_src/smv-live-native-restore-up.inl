@@ -274,9 +274,10 @@ static bool nativeRgUpSetup(NativeRife& nr, int w, int h, int ow, int oh, int up
 // size, pass by pass: fp16 planes (k_restIn), the net, the fold to the pass's size (Real-ESRGAN adds the nearest base,
 // AnimeJaNai none; the last pass into dst, planar fp32, tight, clipped to 0..1; an earlier one into dRgMid, the next
 // pass's input)
-static bool nativeRgUpRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th)
+static bool nativeRgUpRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th,
+                          cudaStream_t stIn)
 {
-    cudaStream_t st = nr.stream;
+    cudaStream_t st = stIn ? stIn : nr.stream;
     const int sc = rgScale(nr);
     int pw[kRgMaxPasses + 1], ph[kRgMaxPasses + 1];
     const int n = rgUpPlan(nr.rgW, nr.rgH, tw, th, sc, pw, ph);

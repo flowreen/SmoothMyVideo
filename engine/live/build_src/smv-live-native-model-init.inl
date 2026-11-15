@@ -420,20 +420,21 @@ static void nativeHdrModelSetup(NativeRife& nr, int pre, int post, float white)
 }
 
 // one planar frame (w x h, strides in elements) into its SDR view (fp32, or fp16 when dstHalf; hdrToModel's knee and
-// head given), and a GMFSS tween of an SDR pair back to the HDR codes, on the render stream; false = the launch failed
+// head given), and a GMFSS tween of an SDR pair back to the HDR codes, on the render stream (st when given); false = the
+// launch failed
 static bool nativeHdrEnc(NativeRife& nr, const void* src, int half, int sps, int srs, int w, int h, void* dst,
-                         int dstHalf, int dps, int drs, int mode, float knee, float head)
+                         int dstHalf, int dps, int drs, int mode, float knee, float head, cudaStream_t st = nullptr)
 {
     void* a[] = {(void*)&src, &half, &sps, &srs, &w, &h, &dst, &dstHalf, &dps, &drs, &mode, &nr.encWhite, &knee, &head};
-    return cuLaunchKernel(nr.fHdrEnc, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, a, nullptr) ==
-           CUDA_SUCCESS;
+    return cuLaunchKernel(nr.fHdrEnc, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)(st ? st : nr.stream), a,
+                          nullptr) == CUDA_SUCCESS;
 }
 static bool nativeHdrFromSdr(NativeRife& nr, const void* src, int half, int sps, int srs, int w, int h, float* dst,
-                             int dps, int drs, int mode)
+                             int dps, int drs, int mode, cudaStream_t st = nullptr)
 {
     void* a[] = {(void*)&src, &half, &sps, &srs, &w, &h, (void*)&dst, &dps, &drs, &mode, &nr.encWhite};
-    return cuLaunchKernel(nr.fHdrFromSdr, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)nr.stream, a,
-                          nullptr) == CUDA_SUCCESS;
+    return cuLaunchKernel(nr.fHdrFromSdr, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0,
+                          (CUstream)(st ? st : nr.stream), a, nullptr) == CUDA_SUCCESS;
 }
 // a resize's source frame (HDR planes, fp32, w x h, planes ps apart, rows rs apart): 1 inside the SDR range (k_hdrRange,
 // read back), 0 outside, -1 when a launch or the readback failed; the mode is logged on the first frame and on up to 3
@@ -462,11 +463,13 @@ static int nativeRsInRange(NativeRife& nr, const float* src, int ps, int rs, int
 }
 // one planar Lanczos resize: the separable pair, k_fitAaH into dTmp (3, sh, tw) then k_fitAaV (a size kept on
 // both axes = an exact copy); dTmp holds the session's largest such pass (tmpN floats: live nativeCudaInitEarly,
-// offline runOfflineSession). false = dTmp cannot hold the pass or a launch failed.
+// offline runOfflineSession), or tmp (tmpN floats) when given: a pass off the compute thread brings its own.
+// false = the pass buffer cannot hold the pass or a launch failed.
 static bool nativeFitPlanar(NativeRife& nr, const void* src, int half, int ps, int rs, int sw, int sh, float* dst,
-                            int tw, int th, cudaStream_t st)
+                            int tw, int th, cudaStream_t st, float* tmp = nullptr, size_t tmpN = 0)
 {
-    if (!nr.dTmp || (size_t)3 * sh * tw > nr.tmpN)
+    float* pass = tmp ? tmp : nr.dTmp;
+    if (!pass || (size_t)3 * sh * tw > (tmp ? tmpN : nr.tmpN))
     {
         LOG("native: the resize pass buffer cannot hold %dx%d -> %dx%d\n", sw, sh, tw, th);
         return false;
@@ -478,8 +481,8 @@ static bool nativeFitPlanar(NativeRife& nr, const void* src, int half, int ps, i
         LOG("native: the resize tap tables for %dx%d -> %dx%d failed\n", sw, sh, tw, th);
         return false;
     }
-    void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &nr.dTmp, &tw, (void*)&tabH};
-    void* av[] = {&nr.dTmp, &tw, &sh, &dst, &th, (void*)&tabV};
+    void* ah[] = {(void*)&src, &half, &ps, &rs, &sw, &sh, &pass, &tw, (void*)&tabH};
+    void* av[] = {&pass, &tw, &sh, &dst, &th, (void*)&tabV};
     return cuLaunchKernel(nr.fFitAaH, (tw + 15) / 16, (sh + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, ah, nullptr) ==
                CUDA_SUCCESS &&
            cuLaunchKernel(nr.fFitAaV, (tw + 15) / 16, (th + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, av, nullptr) ==
@@ -671,6 +674,9 @@ static void nativeFree(NativeRife& nr)
 {
     if (nr.stream)
         cudaStreamSynchronize(nr.stream);
+    // the upscaler after Live DLSS 4.5 runs the nets below on its own stream: drained before their buffers go
+    if (nr.puSt)
+        cudaStreamSynchronize(nr.puSt);
     nativeNvofFree(nr);     // the Optical Flow session and its buffers (nvof sessions only)
     nativeFrucFree(nr);     // the bridge's FRUC instance and its surfaces (fruc sessions only)
     nativeFsrupRelease(nr); // the FSR upscaler and its vector session (fsrUp sessions only)
@@ -789,6 +795,41 @@ static void nativeFree(NativeRife& nr)
         cudaFree(nr.dOutRing);
         nr.dOutRing = nullptr;
     }
+    // the upscaler after Live DLSS 4.5: its stream drained, then the mappings, the buffers and the fences
+    nr.puOn = false;
+    if (nr.puSt)
+    {
+        cudaStreamSynchronize(nr.puSt);
+        cudaStreamDestroy(nr.puSt);
+        nr.puSt = nullptr;
+    }
+    for (void** p : {(void**)&nr.dPuIn, (void**)&nr.dPuOut, (void**)&nr.dPuPl, (void**)&nr.dPuPres, (void**)&nr.dPuView,
+                     (void**)&nr.dPuRem, (void**)&nr.dPuTmp, (void**)&nr.dPuFin})
+        if (*p)
+        {
+            cudaFree(*p);
+            *p = nullptr;
+        }
+    for (const NativeRife::RsTab& e : nr.puRsTabs)
+        cudaFree(e.d);
+    nr.puRsTabs.clear();
+    nr.puKind = 0;
+    nr.puHdr = false;
+    nr.puTmpN = 0;
+    nr.puUw = nr.puUh = 0;
+    for (cudaExternalMemory_t* m : {&nr.puEmIn, &nr.puEmOut})
+        if (*m)
+        {
+            cudaDestroyExternalMemory(*m);
+            *m = nullptr;
+        }
+    for (cudaExternalSemaphore_t* s : {&nr.puSemIn, &nr.puSemOut})
+        if (*s)
+        {
+            cudaDestroyExternalSemaphore(*s);
+            *s = nullptr;
+        }
+    nr.puFailed = false;
     if (nr.capMip)
     {
         cudaFreeMipmappedArray(nr.capMip);

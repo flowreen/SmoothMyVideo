@@ -635,9 +635,10 @@ static bool nativeAcnSetup(NativeRife& nr, int w, int h, int ow, int oh, int upE
 // (k_acnMerge: the colour's YCbCr with the net's luma, the author's way back to RGB, clipped); a pass that is not the
 // last writes dAcnOut, the next pass's input; the last one writes dst at an exact 2x target, else dAcnOut and then
 // the Lanczos pair to tw x th into dst (planar fp32, tight, clipped to 0..1)
-static bool nativeAcnRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th)
+static bool nativeAcnRun(NativeRife& nr, const void* s, int sHalf, int ps_, int rs_, float* dst, int tw, int th,
+                         cudaStream_t stIn)
 {
-    cudaStream_t st = nr.stream;
+    cudaStream_t st = stIn ? stIn : nr.stream;
     if (tw > nr.acnOw)
     {
         nr.die("ArtCNN fit target wider than its buffer");

@@ -217,6 +217,96 @@ struct Host
     // views cover them; a 12-slot helper ring is overwritten under a read only when the session lags it by 9+ frames,
     // where nextFrame skips anyway); SMV_DLSSG_LZ_PIPE=0 = the wait after every present
     bool lzPipe = true;
+    // THE UPSCALER AFTER DLSS 4.5 (upOn, with lzOn: one upscaler picked on a Live DLSS 4.5 session at the working size,
+    // SDR or HDR; loop.inl sets it): every shown frame (W x H, texFmt), the ring's and the session's own, goes to the
+    // native host's upscaler instead of the Lanczos pair: the frame copied into upIn (a shared buffer CUDA imported),
+    // upRunFn queues the upscaler into upOut at winW x winH, upOut copied into the back buffer; upFenceIn / upFenceOut
+    // (shared) order the three on the GPU
+    bool upOn = false;
+    int upKind =
+        0; // the upscaler (nativeUpSwitch's numbering: 1 RTX VSR, 3 Anime4K, 4 ArtCNN, 6 Real-ESRGAN, 7 AnimeJaNai)
+    int upUw = 0, upUh = 0; // Upscale to: the upscaler's own size (Lanczos to winW x winH after it); 0 = winW x winH
+    ComPtr<ID3D12Resource> upIn, upOut;
+    ComPtr<ID3D12Fence> upFenceIn, upFenceOut;
+    HANDLE hUpIn = nullptr, hUpOut = nullptr, hUpFenceIn = nullptr, hUpFenceOut = nullptr;
+    UINT upInPitch = 0, upOutPitch = 0;
+    uint64_t upInBytes = 0, upOutBytes = 0, upV = 0;
+    ComPtr<ID3D12GraphicsCommandList> upList;
+    std::function<bool(uint64_t)> upRunFn;
+    // a live `set up N` applied before a frame (loop.inl sets it on such a session); upTried = the shared part was
+    // attempted this session (made once)
+    std::function<void()> upPollFn;
+    bool upTried = false;
+    bool upCreate()
+    {
+        upInPitch = (W * 4 + 255) & ~255u;
+        upOutPitch = (winW * 4 + 255) & ~255u;
+        // a buffer's allocation = its width rounded to 64 KiB, the size CUDA's import names
+        upInBytes = ((uint64_t)upInPitch * H + 0xFFFFull) & ~0xFFFFull;
+        upOutBytes = ((uint64_t)upOutPitch * winH + 0xFFFFull) & ~0xFFFFull;
+        auto buf = [&](uint64_t bytes, ComPtr<ID3D12Resource>& r, HANDLE& h) {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = bytes;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.SampleDesc = {1, 0};
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            return SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &bd,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r))) &&
+                   SUCCEEDED(device->CreateSharedHandle(r.Get(), nullptr, GENERIC_ALL, nullptr, &h));
+        };
+        auto fen = [&](ComPtr<ID3D12Fence>& f, HANDLE& h) {
+            return SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&f))) &&
+                   SUCCEEDED(device->CreateSharedHandle(f.Get(), nullptr, GENERIC_ALL, nullptr, &h));
+        };
+        return buf(upInBytes, upIn, hUpIn) && buf(upOutBytes, upOut, hUpOut) && fen(upFenceIn, hUpFenceIn) &&
+               fen(upFenceOut, hUpFenceOut) &&
+               SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocs[0].Get(), nullptr,
+                                                   IID_PPV_ARGS(&upList))) &&
+               SUCCEEDED(upList->Close());
+    }
+    // the stage's half of an upOn present, once the caller executed its copy of the frame into upIn: RTX VSR queued
+    // behind upFenceIn, then upList (allocator ai) copies upOut into back buffer bb behind upFenceOut. A refused or
+    // failed stage: `fallback` records the Lanczos pair into upList instead, for this frame and the rest of the session
+    void upFinish(UINT ai, UINT bb, const std::function<void(ID3D12GraphicsCommandList*)>& fallback)
+    {
+        queue->Signal(upFenceIn.Get(), ++upV);
+        const bool up = upRunFn(upV);
+        upList->Reset(allocs[ai].Get(), nullptr);
+        if (up)
+        {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.pResource = backbuffers[bb].Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            upList->ResourceBarrier(1, &b);
+            D3D12_TEXTURE_COPY_LOCATION so{upOut.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            so.PlacedFootprint.Footprint = {texFmt, winW, winH, 1, upOutPitch};
+            D3D12_TEXTURE_COPY_LOCATION db{backbuffers[bb].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            upList->CopyTextureRegion(&db, 0, 0, 0, &so, nullptr);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            upList->ResourceBarrier(1, &b);
+        }
+        else
+        {
+            LOG("DLSS 4.5 at the working size: the upscaler after DLSS 4.5 stopped, the native fit's Lanczos enlarges "
+                "from here on\n");
+            upOn = false;
+            upRunFn = nullptr;
+            fallback(upList.Get());
+        }
+        upList->Close();
+        if (up)
+            queue->Wait(upFenceOut.Get(), upV);
+        ID3D12CommandList* ls[] = {upList.Get()};
+        queue->ExecuteCommandLists(1, ls);
+    }
     uint32_t scW() const
     {
         return lzOn ? winW : W;
@@ -886,6 +976,8 @@ float4 psV(float4 pos : SV_Position) : SV_Target
 
     bool presentTail(ID3D12Resource* src, UINT64 srcOffset, UINT srcPitch)
     {
+        if (upPollFn)
+            upPollFn(); // a live `set up N` for the upscaler after DLSS 4.5, between two frames
         const int64_t t0 = nowQpc100();
         const bool ok = presentTailInner(src, srcOffset, srcPitch);
         prMsTot += (nowQpc100() - t0) / 1e4;
@@ -925,19 +1017,25 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        if (lzOn)
-        {
-            // the final enlarge: the frame (W x H) through texFrame into the back buffer
+        // the final enlarge: the frame (W x H) through texFrame into the back buffer, recorded on l
+        auto lzFrame = [&](ID3D12GraphicsCommandList* l) {
             D3D12_TEXTURE_COPY_LOCATION dl{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-            list->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
+            l->CopyTextureRegion(&dl, 0, 0, 0, &sl_, nullptr);
             b.Transition.pResource = texFrame.Get();
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
             b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            list->ResourceBarrier(1, &b);
-            lzRecord(list.Get(), texFrame.Get(), bb);
+            l->ResourceBarrier(1, &b);
+            lzRecord(l, texFrame.Get(), bb);
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-            list->ResourceBarrier(1, &b);
-        }
+            l->ResourceBarrier(1, &b);
+        };
+        // the upscaler after DLSS 4.5 on the session's own frames too (before the plan, after a lost one): the frame's
+        // rows into upIn as they are, then the stage's half (upFinish executes both lists)
+        const bool upHere = upOn && upRunFn && srcPitch == upInPitch; // upRunFn = the stage started
+        if (upHere)
+            list->CopyBufferRegion(upIn.Get(), 0, src, srcOffset, (UINT64)srcPitch * H);
+        else if (lzOn)
+            lzFrame(list.Get());
         else
         {
             // the footprint copied straight into the back buffer
@@ -955,6 +1053,8 @@ float4 psV(float4 pos : SV_Position) : SV_Target
 
         ID3D12CommandList* ls[] = {list.Get()};
         queue->ExecuteCommandLists(1, ls);
+        if (upHere)
+            upFinish(ai, bb, lzFrame);
         const int64_t tp = nowQpc100();
         HRESULT hr = presentPlain();
         const int64_t tp2 = nowQpc100();
@@ -1268,6 +1368,8 @@ float4 psV(float4 pos : SV_Position) : SV_Target
     // one present of presentRing: dtN = its sync interval on the display-timed route, 0 = a plain one
     bool presentRingOnce(ID3D12Resource* tex, ID3D12Fence* wf, uint64_t wv, UINT dtN)
     {
+        if (upPollFn)
+            upPollFn(); // a live `set up N` for the upscaler after DLSS 4.5, between two frames
         const UINT ai = allocIdx;
         allocIdx = (allocIdx + 1) % 3;
         if (allocFence[ai] && fence->GetCompletedValue() < allocFence[ai])
@@ -1287,35 +1389,58 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         }
-        if (lzOn)
-        {
-            // the final enlarge: the slot (W x H) into the back buffer
+        // the Lanczos pair's enlarge of the slot (W x H) into the back buffer, recorded on l
+        auto lzSlot = [&](ID3D12GraphicsCommandList* l) {
             b[0].Transition.pResource = tex;
             b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
             b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            list->ResourceBarrier(1, b);
-            lzRecord(list.Get(), tex, bb);
+            l->ResourceBarrier(1, b);
+            lzRecord(l, tex, bb);
             std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
-            list->ResourceBarrier(1, b);
-        }
-        else
+            l->ResourceBarrier(1, b);
+        };
+        if (upOn && upRunFn) // upRunFn = the stage started
         {
+            // the upscaler after DLSS 4.5: the slot into upIn on this list, then the stage's half (upFinish)
             b[0].Transition.pResource = tex;
             b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
             b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            b[1].Transition.pResource = backbuffers[bb].Get();
-            b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-            b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-            list->ResourceBarrier(2, b);
-            list->CopyResource(backbuffers[bb].Get(), tex);
-            for (auto& x : b)
-                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
-            list->ResourceBarrier(2, b);
+            list->ResourceBarrier(1, b);
+            D3D12_TEXTURE_COPY_LOCATION si{tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            D3D12_TEXTURE_COPY_LOCATION di{upIn.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            di.PlacedFootprint.Footprint = {texFmt, W, H, 1, upInPitch};
+            list->CopyTextureRegion(&di, 0, 0, 0, &si, nullptr);
+            std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
+            list->ResourceBarrier(1, b);
+            list->Close();
+            queue->Wait(wf, wv); // the slot's copy on the other queue is complete
+            ID3D12CommandList* ls[] = {list.Get()};
+            queue->ExecuteCommandLists(1, ls);
+            upFinish(ai, bb, lzSlot);
         }
-        list->Close();
-        queue->Wait(wf, wv); // the slot's copy on the other queue is complete
-        ID3D12CommandList* ls[] = {list.Get()};
-        queue->ExecuteCommandLists(1, ls);
+        else
+        {
+            if (lzOn)
+                lzSlot(list.Get()); // the final enlarge: the slot (W x H) into the back buffer
+            else
+            {
+                b[0].Transition.pResource = tex;
+                b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                b[1].Transition.pResource = backbuffers[bb].Get();
+                b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+                b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                list->ResourceBarrier(2, b);
+                list->CopyResource(backbuffers[bb].Get(), tex);
+                for (auto& x : b)
+                    std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+                list->ResourceBarrier(2, b);
+            }
+            list->Close();
+            queue->Wait(wf, wv); // the slot's copy on the other queue is complete
+            ID3D12CommandList* ls[] = {list.Get()};
+            queue->ExecuteCommandLists(1, ls);
+        }
         const HRESULT hr = dtN ? sc->Present(dtN, 0) : presentPlain();
         if (FAILED(hr))
         {
@@ -1497,6 +1622,12 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             CloseHandle(hOutBuf);
             hOutBuf = nullptr;
         }
+        for (HANDLE* h : {&hUpIn, &hUpOut, &hUpFenceIn, &hUpFenceOut})
+            if (*h)
+            {
+                CloseHandle(*h);
+                *h = nullptr;
+            }
         if (hwnd)
             DestroyWindow(hwnd);
         pumpMessages();

@@ -11,11 +11,12 @@ static const void* mergedAt(const NativeRife& nr, size_t k, size_t plane)
 // a working size, else the model frame; fp16 when sHalf: a tween as the IFNet wrote it), the
 // result folded into dst (tw x th).
 // Restore's way back on HDR planes (k_hdrRestOut, in place on dst, tw x th): the remainder comes from the source
-// (sw x sh, planes ps_ apart, rows rs_ apart, fp16 when sHalf), fitted to the target first when the sizes differ
+// (sw x sh, planes ps_ apart, rows rs_ apart, fp16 when sHalf), fitted to the target first when the sizes differ; on
+// stIn when given (a caller off the compute thread passes a source already at the target size)
 static bool nativeHdrRestOut(NativeRife& nr, float* dst, int tw, int th, const void* s, int sHalf, int ps_, int rs_,
-                             int sw, int sh, int mode, bool viewRef = false)
+                             int sw, int sh, int mode, bool viewRef = false, cudaStream_t stIn = nullptr)
 {
-    cudaStream_t st = nr.stream;
+    cudaStream_t st = stIn ? stIn : nr.stream;
     const void* ref = s;
     int half = sHalf, fps = ps_, frs = rs_, rps = tw * th;
     if (tw != sw || th != sh)
