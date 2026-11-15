@@ -3062,6 +3062,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 cascHold = h;
         }
         int cascTopM = 0, cascCeilM = 0, cascHoldWins = 0, cascClimbWins = 0;
+        // AT 1x (Fit to the GPU took a watched plan below 2x, every model's floor): cascAtOne; cascOneTry = 2x tried in
+        // place again, judged on its second full window (cascOneWins); cascOneTick = when the next try may start,
+        // cascOneWait its back-off (15 s, doubling to 240 s)
+        bool cascAtOne = false, cascOneTry = false;
+        int cascOneWins = 0;
+        ULONGLONG cascOneTick = 0, cascOneWait = 0;
         int cascHeld[4] = {0, 0, 0, 0}, cascFirst[4] = {0, 0, 0, 0}; // cascFirst = the first rung, asked at takeover
         bool cascClimbing = false; // the rung on show is a climb's try, judged on its second full window
         ULONGLONG cascClimbTick = 0, cascClimbWait = 0;
@@ -4474,6 +4480,46 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 cascLow = 0;
                 return;
             }
+            // AT 1x (below): after the wait 2x is tried in place again and judged on its second full window (the first
+            // straddles the switch): held = the plan runs on from 2x under its own rules, short = back to 1x and the next
+            // try twice as late. Nothing lower to step to, so no shortfall check meanwhile
+            if (cascAtOne && !cascStepTick)
+            {
+                const ULONGLONG now = GetTickCount64();
+                if (cascOneTry)
+                {
+                    if (++cascOneWins < 2)
+                        return;
+                    cascOneTry = false;
+                    if (outFps >= cascHold * cascShown * capFps && dropRate <= 3.0)
+                    {
+                        cascAtOne = false;
+                        cascOneWait = 0;
+                        cascLow = 0;
+                        return;
+                    }
+                    cascOneWait = (std::min)(cascOneWait * 2, (ULONGLONG)240000);
+                    cascOneTick = now + cascOneWait;
+                    char why[112];
+                    snprintf(why, sizeof why, "%.2fx of 2x, what the GPU affords is less: 2x tried again in %llu s",
+                             outFps / capFps, (unsigned long long)(cascOneWait / 1000));
+                    if (!cascSwitch(1, 1, 1, 1, 1, why))
+                        cascAtOne = false; // the stages took no 1x: the plan's own rules from here
+                    return;
+                }
+                if (now >= cascOneTick)
+                {
+                    if (cascSwitch(2, 2, 1, 1, 1, "1x held, 2x tried again"))
+                    {
+                        cascOneTry = true;
+                        cascOneWins = 0;
+                    }
+                    else
+                        cascOneTick = now + 240000;
+                }
+                cascLow = 0;
+                return;
+            }
             // the climb (cascTopM): a rung holds when it presents cascHold of its multiple (the shortfall rule's own
             // bar) with at most 3 capture drops a second; a climb's try is judged on its second full window (the
             // first straddles the switch)
@@ -4555,6 +4601,16 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             char why[96];
             snprintf(why, sizeof(why), "%.2fx of %.2fx, what the GPU affords is less", outFps / capFps,
                      (double)cascShown / cascKeep);
+            // a plan at 2x that still falls short: 1x in place, as every model's floor shows the source frames alone
+            // (its stages keep running, the upscaler after DLSS 4.5 still on every shown frame); the try back up = above
+            if (cascShown <= 2 * cascKeep && cascSwitch(1, 1, 1, 1, 1, why))
+            {
+                cascAtOne = true;
+                cascOneTry = false;
+                cascOneWait = 15000;
+                cascOneTick = GetTickCount64() + cascOneWait;
+                return;
+            }
             cascMaxM = (std::max)(2, (std::min)(cascShown - 1, (int)(outFps / capFps * cascKeep / 0.9)));
             if (cascTopM && cascKeep == 1) // the climb: the largest rung under what held, in place; the climb waits
             {
@@ -4795,6 +4851,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     cascHeld[0] = cascFirst[0] = 0;
                     cascClimbing = false;
                     cascClimbWait = cascClimbTick = 0;
+                    cascAtOne = cascOneTry = false;
+                    cascOneWins = 0;
+                    cascOneTick = cascOneWait = 0;
                     cascFitOffSaid = false;
                     const int P = m3 > 1 ? 3 : m2 > 1 ? 2 : 1;
                     const bool pastPanel = panelHzMode > 1.0 ? g_targetFps > 1.02 * panelHzMode : P == 3;
