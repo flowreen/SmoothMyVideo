@@ -809,7 +809,7 @@ static void nativeFree(NativeRife& nr)
         nr.puSt = nullptr;
     }
     for (void** p : {(void**)&nr.dPuIn, (void**)&nr.dPuOut, (void**)&nr.dPuPl, (void**)&nr.dPuPres, (void**)&nr.dPuView,
-                     (void**)&nr.dPuRem, (void**)&nr.dPuTmp, (void**)&nr.dPuFin})
+                     (void**)&nr.dPuRem, (void**)&nr.dPuTmp, (void**)&nr.dPuFin, (void**)&nr.dPuMvSet})
         if (*p)
         {
             cudaFree(*p);
@@ -822,6 +822,8 @@ static void nativeFree(NativeRife& nr)
     nr.puHdr = false;
     nr.puTmpN = 0;
     nr.puUw = nr.puUh = 0;
+    nr.puVecSrc = ~0u;
+    nr.puMvSetPitch = 0;
     for (cudaExternalMemory_t* m : {&nr.puEmIn, &nr.puEmOut})
         if (*m)
         {

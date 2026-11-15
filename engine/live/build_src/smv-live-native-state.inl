@@ -899,6 +899,17 @@ struct NativeRife
     volatile LONG puWarm = 0;
     HANDLE puWarmTh = nullptr;
     ULONGLONG puWarmT0 = 0;
+    // the bridges' vectors ONCE AN INPUT (nativePresentUpFrame): the shown frame's input (puFrSrc: the presented
+    // stage's input index, ~0u = unknown), its step in shown frames (puFrStep) and the plan's shown frames a source
+    // frame (puFrMul, 0 = unknown) come with each frame; the first shown frame of a new input runs the Optical Flow
+    // against the last such frame into dPuMvSet (R16G16_FLOAT, puW x puH, rows puMvSetPitch bytes), a field over
+    // puVecSpan shown steps (counted between the two; puVecSrc = the input it ends at, ~0u = none yet), every shown
+    // frame takes it scaled to its own step and read where its content was at the field's frame (puVecAge shown steps
+    // ago, k_fuMvAdvect)
+    uint32_t puFrSrc = ~0u, puFrStep = 1, puVecSrc = ~0u, puVecSpan = 0, puVecAge = 0;
+    double puFrMul = 0.0;
+    uint8_t* dPuMvSet = nullptr;
+    int puMvSetPitch = 0;
     float* dPuPl = nullptr;
     float* dPuPres = nullptr;
     // HDR (puHdr): the frame's R10G10B10A2 PQ words -> its code planes (dPuPl) -> their SDR view (dPuView, puW x puH)
@@ -1002,7 +1013,8 @@ struct NativeRife
         fPanGuard = nullptr,                                                // frame generation's pan guard decision
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr, fOddEdge = nullptr, // FSR upscaling: BGRA8 <-> RGBA8; VSR's slot
         fFuMvScale = nullptr,                                            // its chained passes' vectors
-        fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,  // offline DLSS 4.5 frames, RTX VSR
+        fFuMvAdvect = nullptr, // the upscaler after Live DLSS 4.5: its field once an input, at a later frame
+        fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr, // offline DLSS 4.5 frames, RTX VSR
         fUnpackR10 = nullptr;
     CUfunction fFitAaH = nullptr, fFitAaV = nullptr, fRsTab = nullptr;           // the separable fit, its tap tables
     CUfunction fFsrHdrIn = nullptr, fFsrHdrOut = nullptr, fFsrHdrPack = nullptr; // AMD FSR upscaling on HDR planes

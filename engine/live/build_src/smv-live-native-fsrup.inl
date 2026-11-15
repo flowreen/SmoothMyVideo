@@ -253,8 +253,14 @@ static constexpr int kFsrCompileMs = 180000;
 // the frame into the bridge's buffer and the vector session's slot, the vectors from the previous frame's slot (the
 // stream's first frame: zero vectors and a reset), the bridge's queue waits on the stream and the stream on the bridge.
 // Also the upscaler after Live DLSS 4.5 on the present thread (st = puSt): a failure there stops only that stage
-// (nativeFail)
-static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, cudaStream_t st, unsigned int& rv)
+// (nativeFail). vecMode: 0 = the Optical Flow between this frame and the previous one; 1 = a new field (the stage, once a
+// source frame): the Optical Flow between this frame and the slot's previous field frame into dPuMvSet, gated at
+// kFuVecGate x vecGateK (the field spans vecGateK shown steps), then scaled by vecScale into the bridge's vectors; 2 =
+// the field kept: dPuMvSet scaled by vecScale, no Optical Flow, the slots stay (this frame packs into the spare one);
+// 3 = zero vectors, this frame's slot the next field's first frame. Modes 1 and 2 read the field where this frame's
+// content was at the field's frame (k_fuMvAdvect: vecAdv = the share of the span since then)
+static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro, cudaStream_t st, unsigned int& rv,
+                            int vecMode, float vecScale, float vecGateK, float vecAdv)
 {
     int w = (int)ri.right, h = (int)ri.bottom, ow = (int)ro.right, oh = (int)ro.bottom;
     const int cur = nr.fuCur, prev = cur ^ 1;
@@ -294,7 +300,7 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         return GetEnvironmentVariableW(L"SMV_FSRUP_TEST", v, 16) && !wcscmp(v, L"zerovec");
     }();
     const bool first = nr.fuN == 0;
-    if (first || zeroVec)
+    if (first || zeroVec || vecMode == 3)
     {
         if (cudaMemset2DAsync(nr.dFuMv, nr.fuMvPitch, 0, (size_t)w * 4, h, st) != cudaSuccess)
         {
@@ -302,6 +308,23 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
             return false;
         }
         mark(2);
+    }
+    else if (vecMode)
+    {
+        // the stage's field once an input (1: made now; 2: kept), scaled to this frame's step
+        if (vecMode == 1 && !nativeOfVecRun(nr, nr.fuOf, prev, cur, nr.dPuMvSet, nr.puMvSetPitch, "fsr upscale",
+                                            nr.fuProf ? nr.fuEv[2] : nullptr, gate * vecGateK))
+            return false;
+        if (vecMode == 2)
+            mark(2);
+        int setPitch = nr.puMvSetPitch, mvPitch = nr.fuMvPitch;
+        void* sc[] = {&nr.dPuMvSet, &setPitch, &w, &h, &nr.dFuMv, &mvPitch, &vecAdv, &vecScale};
+        if (cuLaunchKernel(nr.fFuMvAdvect, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, sc, nullptr) !=
+            CUDA_SUCCESS)
+        {
+            nativeFail(nr, "fsr upscale vector scale failed");
+            return false;
+        }
     }
     else if (!nativeOfVecRun(nr, nr.fuOf, prev, cur, nr.dFuMv, nr.fuMvPitch, "fsr upscale",
                              nr.fuProf ? nr.fuEv[2] : nullptr, gate))
@@ -422,7 +445,8 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         nr.fuProfN++;
         nr.fuProfVecN += first ? 0 : 1;
     }
-    nr.fuCur = prev;
+    if (vecMode != 2) // a kept field keeps its frame in the slot (this frame went into the spare one)
+        nr.fuCur = prev;
     nr.fuN++;
     rv = 1u;
     return true;

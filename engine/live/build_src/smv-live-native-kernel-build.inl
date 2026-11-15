@@ -1043,6 +1043,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fPanGuard, "k_panGuard"},
         {&nr.fBgraRgbaFsr, "k_bgraRgbaFsr"},
         {&nr.fFuMvScale, "k_fuMvScale"},
+        {&nr.fFuMvAdvect, "k_fuMvAdvect"},
         {&nr.fRgbaBgra, "k_rgbaBgra"},
         {&nr.fOddEdge, "k_oddEdge"},
         {&nr.fHdrRestOut, "k_hdrRestOut"},

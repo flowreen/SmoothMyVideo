@@ -659,6 +659,14 @@ static bool nativePresentUpKind(NativeRife& nr, int kind)
         }
         if (!hdr && !nr.dVsrOut)
             NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)uw * uh * 4), "the upscaler after DLSS 4.5: output");
+        // the vectors' field once an input (nativePresentUpFrame), zero until its first Optical Flow
+        if (!nr.dPuMvSet)
+        {
+            nr.puMvSetPitch = w * 4;
+            NCHK(cudaMalloc((void**)&nr.dPuMvSet, (size_t)nr.puMvSetPitch * h), "the upscaler after DLSS 4.5: vectors");
+        }
+        NCHK(cudaMemset(nr.dPuMvSet, 0, (size_t)nr.puMvSetPitch * h), "the upscaler after DLSS 4.5: vector clear");
+        nr.puVecSrc = ~0u;
         nr.fuHdr = hdr;
         bool ok = nativeFsrupSetup(nr, w, h, uw, uh, nr.puSt);
         if (ok)
@@ -856,8 +864,49 @@ static bool nativePresentUpFrame(NativeRife& nr)
         }
         const RtxRect ri{0, 0, (uint32_t)w, (uint32_t)h};
         const RtxRect ro{0, 0, (uint32_t)uw, (uint32_t)uh};
+        // THE VECTORS ONCE AN INPUT: a shown frame's step is a fraction of its input pair's motion (the presented
+        // stage's inputs: the source frames, in a cascade the earlier stage's frames), so the first shown frame of a
+        // new input runs the Optical Flow against the last such frame, a field over the shown steps counted between
+        // the two (puVecSpan: each frame's step includes the frames the display timing left out), and every shown
+        // frame takes that field times its own step over that span (the gate scaled the same way), read where the
+        // frame's content was at the field's frame (puVecAge shown steps ago: moving edges stay on their own vectors),
+        // instead of an Optical Flow between every two shown frames. A frame of unknown input (the session's own) or a
+        // plan of one shown frame a source frame: the Optical Flow between every two frames. A field that starts (the
+        // stage's first frame, after such frames): zero vectors until the next input. SMV_FSRUP_STAGE_VEC=frame = the
+        // Optical Flow between every two frames
+        static const bool perFrame = lkEnv("SMV_FSRUP_STAGE_VEC") == "frame";
+        int vecMode = 0;
+        float vecScale = 1.0f, vecGateK = 1.0f, vecAdv = 0.0f;
+        if (perFrame || nr.puFrSrc == ~0u || nr.puFrMul < 1.5)
+            nr.puVecSrc = ~0u;
+        else if (nr.fuN == 0 || nr.puVecSrc == ~0u)
+        {
+            vecMode = 3; // this frame starts the field: zero vectors, its slot the field's first frame
+            nr.puVecSrc = nr.puFrSrc;
+            nr.puVecSpan = 0;
+            nr.puVecAge = 0;
+            if (cudaMemsetAsync(nr.dPuMvSet, 0, (size_t)nr.puMvSetPitch * h, st) != cudaSuccess)
+                return false;
+        }
+        else
+        {
+            nr.puVecAge += nr.puFrStep; // shown steps since the last field frame, this one's included
+            if (nr.puFrSrc != nr.puVecSrc)
+            {
+                vecMode = 1; // the new field spans the steps from the last field frame to this one
+                nr.puVecSpan = nr.puVecAge;
+                nr.puVecAge = 0;
+                nr.puVecSrc = nr.puFrSrc;
+            }
+            else
+                vecMode = 2; // the field as it stands (all zero before the first one)
+            const double span = nr.puVecSpan ? (double)nr.puVecSpan : 1.0;
+            vecScale = (float)(nr.puFrStep / span);
+            vecGateK = (float)span;
+            vecAdv = (float)(nr.puVecAge / span);
+        }
         unsigned int rv = 0;
-        if (!nativeFsrupEval(nr, ri, ro, st, rv))
+        if (!nativeFsrupEval(nr, ri, ro, st, rv, vecMode, vecScale, vecGateK, vecAdv))
         {
             LOG("native: %s after DLSS 4.5 failed, Lanczos for the rest of the session\n", puName(nr.puKind));
             nr.puFailed = true;
@@ -965,12 +1014,17 @@ static bool nativePresentUpFrame(NativeRife& nr)
 }
 
 // one shown frame through the present's stage (nativePresentUpInit): queued on puSt behind hFenceIn's value v, ends by
-// setting hFenceOut to v. Runs on the present thread (its first call binds the device there). false = nothing queued
-// past the wait, the caller shows the frame its own way
-static bool nativePresentUpRun(NativeRife& nr, uint64_t v)
+// setting hFenceOut to v. Runs on the present thread (its first call binds the device there). src / step / mul = the
+// frame's source frame (~0u = unknown), its step in shown frames, the plan's shown frames a source frame (0 = unknown:
+// the bridges' vectors between every two frames). false = nothing queued past the wait, the caller shows the frame its
+// own way
+static bool nativePresentUpRun(NativeRife& nr, uint64_t v, uint32_t src, uint32_t step, double mul)
 {
     if (!nr.puOn || nr.puFailed)
         return false;
+    nr.puFrSrc = src;
+    nr.puFrStep = step ? step : 1;
+    nr.puFrMul = mul;
     const PuTabsScope tabsHere;
     static thread_local bool bound = false;
     if (!bound)

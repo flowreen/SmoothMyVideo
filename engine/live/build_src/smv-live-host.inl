@@ -236,6 +236,11 @@ struct Host
     uint64_t upInBytes = 0, upOutBytes = 0, upV = 0;
     ComPtr<ID3D12GraphicsCommandList> upList;
     std::function<bool(uint64_t)> upRunFn;
+    // the shown frame upRunFn runs on (presentRing sets it, presentTail clears it): its source frame (upSrc, ~0u =
+    // unknown), its step in shown frames since the stage's last frame (upStep: 1 + the frames the display timing left
+    // out, upLeft counts them) and the plan's shown frames a source frame (upMul, 0 = unknown)
+    uint32_t upSrc = ~0u, upStep = 1, upLeft = 0;
+    double upMul = 0.0;
     // a live `set up N` applied before a frame (loop.inl sets it on such a session); upTried = the shared part was
     // attempted this session (made once)
     std::function<void()> upPollFn;
@@ -274,11 +279,17 @@ struct Host
     }
     // the stage's half of an upOn present, once the caller executed its copy of the frame into upIn: RTX VSR queued
     // behind upFenceIn, then upList (allocator ai) copies upOut into back buffer bb behind upFenceOut. A refused or
-    // failed stage: `fallback` records the Lanczos pair into upList instead, for this frame and the rest of the session
-    void upFinish(UINT ai, UINT bb, const std::function<void(ID3D12GraphicsCommandList*)>& fallback)
+    // failed stage: `fallback` records the Lanczos pair into upList instead, for this frame and the rest of the session.
+    // repeat = the same frame presented again (presentRing's later parts): upOut still holds its result, no new work
+    void upFinish(UINT ai, UINT bb, const std::function<void(ID3D12GraphicsCommandList*)>& fallback,
+                  bool repeat = false)
     {
-        queue->Signal(upFenceIn.Get(), ++upV);
-        const bool up = upRunFn(upV);
+        bool up = true;
+        if (!repeat)
+        {
+            queue->Signal(upFenceIn.Get(), ++upV);
+            up = upRunFn(upV);
+        }
         upList->Reset(allocs[ai].Get(), nullptr);
         if (up)
         {
@@ -1035,6 +1046,9 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         // the upscaler after DLSS 4.5 on the session's own frames too (before the plan, after a lost one): the frame's
         // rows into upIn as they are, then the stage's half (upFinish executes both lists)
         const bool upHere = upOn && upRunFn && srcPitch == upInPitch; // upRunFn = the stage started
+        upSrc = ~0u;                                                  // a frame of no plan: no source frame known
+        upStep = 1;
+        upMul = 0.0;
         if (upHere)
             list->CopyBufferRegion(upIn.Get(), 0, src, srcOffset, (UINT64)srcPitch * H);
         else if (lzOn)
@@ -1344,8 +1358,10 @@ float4 psV(float4 pos : SV_Position) : SV_Target
     // A plan's presented stage on screen: present a texture another queue fills (a ring slot resting in COMMON, the
     // same format and size as the back buffer, or W x H under the final enlarge) once `wf` reaches `wv` on this
     // queue: the slot copied straight into the back buffer and a plain present, or a display-timed one (first = the
-    // first frame of a source frame's set)
-    bool presentRing(ID3D12Resource* tex, ID3D12Fence* wf, uint64_t wv, bool first = false)
+    // first frame of a source frame's set; src = its source frame, mul = the plan's shown frames a source frame: the
+    // upscaler after DLSS 4.5 reads them, upSrc / upMul)
+    bool presentRing(ID3D12Resource* tex, ID3D12Fence* wf, uint64_t wv, bool first = false, uint32_t src = ~0u,
+                     double mul = 0.0)
     {
         const int64_t t0 = nowQpc100();
         pumpMessages();
@@ -1354,12 +1370,20 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         if (rtRun && rtPres.size() < rtPres.capacity())
             rtPres.push_back({t0, rtPubQpc, rtCapQpc, first ? dtWait : 0.0, dtAcc, dtN, first, left});
         if (left)
+        {
+            upLeft++;
             return true; // left out: the queue is ahead of the display
+        }
+        upSrc = src;
+        upStep = 1 + upLeft;
+        upLeft = 0;
+        upMul = mul;
         // a sync interval ends at four refreshes: a frame that stays longer is queued again for the rest, in parts as
-        // equal as whole refreshes allow (6 = 3 + 3), so the display still times all of its stay
+        // equal as whole refreshes allow (6 = 3 + 3), so the display still times all of its stay (a later part = the
+        // same frame: the upscaler after DLSS 4.5 shows its result again, repeat)
         const UINT parts = dtN > 4 ? (dtN + 3) / 4 : 1;
         for (UINT i = 0; i < parts; i++)
-            if (!presentRingOnce(tex, wf, wv, parts == 1 ? dtN : dtN / parts + (i < dtN % parts ? 1 : 0)))
+            if (!presentRingOnce(tex, wf, wv, parts == 1 ? dtN : dtN / parts + (i < dtN % parts ? 1 : 0), i > 0))
                 return false;
         dtRepeats += parts - 1;
         prMsTot += (nowQpc100() - t0) / 1e4;
@@ -1368,8 +1392,9 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         return true;
     }
 
-    // one present of presentRing: dtN = its sync interval on the display-timed route, 0 = a plain one
-    bool presentRingOnce(ID3D12Resource* tex, ID3D12Fence* wf, uint64_t wv, UINT dtN)
+    // one present of presentRing: dtN = its sync interval on the display-timed route, 0 = a plain one; repeat = a later
+    // part of the same frame
+    bool presentRingOnce(ID3D12Resource* tex, ID3D12Fence* wf, uint64_t wv, UINT dtN, bool repeat = false)
     {
         if (upPollFn)
             upPollFn(); // a live `set up N` for the upscaler after DLSS 4.5, between two frames
@@ -1402,7 +1427,13 @@ float4 psV(float4 pos : SV_Position) : SV_Target
             std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
             l->ResourceBarrier(1, b);
         };
-        if (upOn && upRunFn) // upRunFn = the stage started
+        if (upOn && upRunFn && repeat)
+        {
+            // the same frame again: the stage's result as it stands (upFinish's repeat), nothing copied or run
+            list->Close();
+            upFinish(ai, bb, lzSlot, true);
+        }
+        else if (upOn && upRunFn) // upRunFn = the stage started
         {
             // the upscaler after DLSS 4.5: the slot into upIn on this list, then the stage's half (upFinish)
             b[0].Transition.pResource = tex;

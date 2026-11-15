@@ -2714,7 +2714,9 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
             // warm-up runs here, before the plan's stages start, or between two shown frames for a live `set up N`,
             // host.upPollFn; AMD FSR / Intel XeSS's on a worker: started = upWarm, the stage on at its end); the shared
             // part is made once a session (upTried), a later kind switches in place
-            auto upRun = [&srv](uint64_t v) { return srv.nr && nativePresentUpRun(*srv.nr, v); };
+            auto upRun = [&srv, &host](uint64_t v) {
+                return srv.nr && nativePresentUpRun(*srv.nr, v, host.upSrc, host.upStep, host.upMul);
+            };
             auto upStart = [&, upRun](int kind) -> bool {
                 NativeRife* nrp = srv.nr;
                 bool ok = false;
@@ -4258,7 +4260,8 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     host.rtPubQpc = (int64_t)((double)pr->hdr->slotQpc[s] * 1e7 / (double)qpcFreq());
                     host.rtCapQpc = cap.lastFrameTs;
                 }
-                if (!host.presentRing(pr->ring[s].Get(), pr->shared.Get(), fv, first))
+                if (!host.presentRing(pr->ring[s].Get(), pr->shared.Get(), fv, first, in,
+                                      keep > 0 ? (double)shown / keep : 0.0))
                 {
                     LOG("presentRing failed\n");
                     return false;

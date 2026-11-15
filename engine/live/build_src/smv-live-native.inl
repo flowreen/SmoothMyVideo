@@ -3507,6 +3507,28 @@ __global__ void k_fuMvScale(const unsigned int* __restrict__ src, int srcPitch, 
                 : (unsigned int)f2h(kx * h2f((unsigned short)(v & 0xFFFFu))) |
                       ((unsigned int)f2h(ky * h2f((unsigned short)(v >> 16))) << 16);
 }
+// the upscaler after Live DLSS 4.5, its field once an input (R16G16_FLOAT texels, w x h, backward vectors over
+// the field's span; an exact zero = gated) at a shown frame `adv` of that span after the frame it was measured at: a
+// pixel's content was where the field's own vector, times adv, points from it (content moves against a backward
+// vector), so the field is read there (the nearest texel, clamped to the frame), times k = this frame's step over the
+// span; an exact zero stays zero
+__global__ void k_fuMvAdvect(const unsigned int* __restrict__ src, int srcPitch, int w, int h,
+                             unsigned int* __restrict__ dst, int dstPitch, float adv, float k)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const unsigned int v0 = src[(size_t)y * (srcPitch >> 2) + x];
+    const float ax = v0 ? adv * h2f((unsigned short)(v0 & 0xFFFFu)) : 0.0f;
+    const float ay = v0 ? adv * h2f((unsigned short)(v0 >> 16)) : 0.0f;
+    const int sx = min(w - 1, max(0, __float2int_rn((float)x + ax)));
+    const int sy = min(h - 1, max(0, __float2int_rn((float)y + ay)));
+    const unsigned int v = src[(size_t)sy * (srcPitch >> 2) + sx];
+    dst[(size_t)y * (dstPitch >> 2) + x] =
+        v == 0u ? 0u
+                : (unsigned int)f2h(k * h2f((unsigned short)(v & 0xFFFFu))) |
+                      ((unsigned int)f2h(k * h2f((unsigned short)(v >> 16))) << 16);
+}
 // the engine's grid-1 field (short2, raw / 32 = px) bilinear at (x, y), clamped to the frame; edge = the frame-
 // generation edge fill on each of the four cells (ofAt, with the cost test when cost is given)
 __device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch, int w, int h, int edge,
