@@ -128,6 +128,16 @@ static bool nativeFsrfgCreate(NativeRife& nr, int i)
         LOG("native: fsrfg: the vector buffer did not allocate\n");
         return false;
     }
+    if (!nr.dFgGuard &&
+        (cudaMalloc((void**)&nr.dFgGuard, 2 * NativeRife::kFgGuardFloats * sizeof(float)) != cudaSuccess ||
+         cudaMemset(nr.dFgGuard, 0, 2 * NativeRife::kFgGuardFloats * sizeof(float)) != cudaSuccess))
+    {
+        if (nr.dFgGuard)
+            cudaFree(nr.dFgGuard);
+        nr.dFgGuard = nullptr;
+        LOG("native: fsrfg: the pan guard block did not allocate\n");
+        return false;
+    }
     g.val = 0;
     nr.frLastKey[i] = 0;
     nr.frCalls[i] = 0;
@@ -234,11 +244,31 @@ static bool nativeOfVecSetup(NativeRife& nr, NativeRife::OfVec& o, int w, int h,
     return true;
 }
 
+// SMV_FSRFG_PANGUARD=0: no pan guard (every field as the Optical Flow made it)
+static bool fsrfgPanGuardEnvOn()
+{
+    static const bool on = [] {
+        char v[8] = "";
+        return !(GetEnvironmentVariableA("SMV_FSRFG_PANGUARD", v, sizeof(v)) > 0 && v[0] == '0');
+    }();
+    return on;
+}
+
+// the pan guard block of fgOf's field slot (out[slot]), null = no guard this session (the lever, no pan measured: Live)
+static const float* fsrfgPanGuard(const NativeRife& nr, int slot)
+{
+    return fsrfgPanGuardEnvOn() && nr.fgPanHave && nr.dFgGuard ? nr.dFgGuard + slot * NativeRife::kFgGuardFloats
+                                                               : nullptr;
+}
+
 // the vectors between slots `prev` and `cur`, both holding their ABGR8 frames: the field cur -> prev in px (the backward
 // field of the pair), into dst as R16G16_FLOAT texels, rows dstPitch bytes apart. edge = frame generation: the edge
-// fill (ofEdgeEnvOn); upscaling reads the field as the engine wrote it
+// fill (ofEdgeEnvOn); upscaling reads the field as the engine wrote it. pg = frame generation's pan guard block (null =
+// none), ps = the call's share of its pair (the pan's scale); decide = a pair's level-1 field: k_panGuard first writes
+// pg's decision from this field and nr.fgPanIn
 static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int cur, uint8_t* dst, int dstPitch,
-                           const char* tag, cudaEvent_t evOf = nullptr, float gate = 0.0f, bool edge = false)
+                           const char* tag, cudaEvent_t evOf = nullptr, float gate = 0.0f, bool edge = false,
+                           const float* pg = nullptr, float ps = 1.0f, bool decide = false)
 {
     cudaStream_t st = o.st ? o.st : nr.stream;
     NV_OF_EXECUTE_INPUT_PARAMS ei{};
@@ -276,9 +306,23 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
     // the engine's cost for the fill's test (null without it: the fill alone)
     int cp = o.withCost ? (int)o.costPitch[f] : 0;
     CUdeviceptr v = o.outP[f], c = o.withCost ? o.costP[f] : 0;
+    CUdeviceptr pgp = (CUdeviceptr)pg;
+    if (pg && decide)
+    {
+        // the field's cells (grid 1: one a pixel), every step-th each way: at most 4096 samples
+        int cw = grid == 1 ? o.w : o.gw, ch = grid == 1 ? o.h : o.gh, step = 1;
+        while (((cw + step - 1) / step) * ((ch + step - 1) / step) > 4096)
+            step++;
+        void* pa[] = {&v, &vp, &cw, &ch, &step, &nr.fgPanIn, &pgp};
+        if (cuLaunchKernel(nr.fPanGuard, 1, 1, 1, 1024, 1, 1, 0, (CUstream)st, pa, nullptr) != CUDA_SUCCESS)
+        {
+            nr.die("fsrfg pan guard launch failed");
+            return false;
+        }
+    }
     if (grid == 1) // the field is the texels' grid: one pass, no float planes in between
     {
-        void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp, &gate, &ed, &c, &cp};
+        void* g1[] = {&v, &vp, &o.w, &o.h, &dst, &mp, &gate, &ed, &c, &cp, &pgp, &ps};
         if (cuLaunchKernel(nr.fMvHalfG1, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, g1, nullptr) != CUDA_SUCCESS)
         {
             nr.die("FSR vector launch failed");
@@ -289,7 +333,7 @@ static bool nativeOfVecRun(NativeRife& nr, NativeRife::OfVec& o, int prev, int c
     float* flow = o.dFlow;
     float* cost = nullptr; // k_nvofUp: the flow alone (the engine's cost read only by the fill's test)
     void* b[] = {&v, &vp, &c, &cp, &o.gw, &o.gh, &grid, &o.w, &o.h, &flow, &cost, &ed};
-    void* m[] = {&flow, &o.w, &o.h, &dst, &mp, &gate};
+    void* m[] = {&flow, &o.w, &o.h, &dst, &mp, &gate, &pgp, &ps};
     if (cuLaunchKernel(nr.fNvofUp, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, b, nullptr) != CUDA_SUCCESS ||
         cuLaunchKernel(nr.fMvHalf, gx, gy, 1, 16, 16, 1, 0, (CUstream)st, m, nullptr) != CUDA_SUCCESS)
     {
@@ -361,14 +405,15 @@ static bool fsrfgDeriveOn(const NativeRife& nr)
 
 // a level-2+ call's derived vectors (its frames at t0 and t1 of the pair) into dst (rows fgMvPitch apart) on stream st,
 // from fgOf's level-1 output with the edge fill (ofEdgeEnvOn): no level-2+ call runs fgOf once its vectors are derived,
-// so the field holds for the pair
+// so the field holds for the pair; the field slot's pan guard too (the pan times t1 - t0 where it holds)
 static bool nativeFsrfgChildVec(NativeRife& nr, uint8_t* dst, cudaStream_t st, float t0, float t1)
 {
     const NativeRife::OfVec& o = nr.fgOf;
     CUdeviceptr v = o.outP[nr.fgOfRd], c = o.withCost ? o.costP[nr.fgOfRd] : 0;
     int vp = (int)o.outPitch[nr.fgOfRd], mp = nr.fgMvPitch, ed = ofEdgeEnvOn() ? 1 : 0;
     int cp = o.withCost ? (int)o.costPitch[nr.fgOfRd] : 0;
-    void* a[] = {&v, &vp, &nr.w, &nr.h, &t0, &t1, &dst, &mp, &ed, &c, &cp};
+    CUdeviceptr pgp = (CUdeviceptr)fsrfgPanGuard(nr, nr.fgOfRd);
+    void* a[] = {&v, &vp, &nr.w, &nr.h, &t0, &t1, &dst, &mp, &ed, &c, &cp, &pgp};
     if (cuLaunchKernel(nr.fMvDerive, (unsigned)(nr.w + 15) / 16, (unsigned)(nr.h + 15) / 16, 1, 16, 16, 1, 0,
                        (CUstream)st, a, nullptr) != CUDA_SUCCESS)
     {
@@ -441,8 +486,13 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
             if (!nativeFsrfgOfIn(nr, nr.fgOf, prev, frame, i == 0, slotPrev, slotCur))
                 return false;
             mark(2);
+            // the pan guard: instance 0's call = the pair's level-1 field, decided here into its slot's block; a
+            // serial level-2+ call on this session (no derived vectors) reads the pair's decision, the pan scaled
+            const int fslot = nr.fgOf.both ? 1 : nr.fgOf.wr;
+            const float* pg = fsrfgPanGuard(nr, i == 0 ? fslot : nr.fgOfRd);
             if (!nativeOfVecRun(nr, nr.fgOf, slotPrev, slotCur, mvBuf, nr.fgMvPitch, "fsrfg",
-                                nr.fgProf ? nr.fgEv[3] : nullptr, 0.0f, true))
+                                nr.fgProf ? nr.fgEv[3] : nullptr, 0.0f, true, pg,
+                                i == 0 ? 1.0f : nr.fgChildT1 - nr.fgChildT0, i == 0))
                 return false;
             if (l1 && nr.grOfArmed[es])
                 nr.grOfArmed[es] = cudaEventRecord(nr.fgOfEv[es][1], os) == cudaSuccess;
@@ -724,7 +774,7 @@ static bool nativeFsrfgAheadVec(NativeRife& nr, int s, const uint8_t* prev, cons
         int slotPrev = 0, slotCur = 1;
         if (!nativeFsrfgOfIn(nr, nr.fgOf2, prev, frame, false, slotPrev, slotCur) ||
             !nativeOfVecRun(nr, nr.fgOf2, slotPrev, slotCur, nr.dFgMvR[s], nr.fgMvPitch, "fsrfg side vectors", nullptr,
-                            0.0f, true))
+                            0.0f, true, fsrfgPanGuard(nr, nr.fgOfRd), t1 - t0))
             return false;
     }
     if (cudaEventRecord(nr.fgEvVec[s], nr.fgOfSt) != cudaSuccess)
@@ -1327,6 +1377,12 @@ static void nativeFsrfgRelease(NativeRife& nr)
         cudaFree(nr.dFgMv);
         nr.dFgMv = nullptr;
     }
+    if (nr.dFgGuard)
+    {
+        cudaFree(nr.dFgGuard);
+        nr.dFgGuard = nullptr;
+    }
+    nr.fgPanHave = false;
     nativeFsrfgAheadFree(nr);
     nativeOfVecFree(nr.fgOf);
     for (uint8_t** b : {&nr.dFgMvL1, &nr.dFgL1Node})

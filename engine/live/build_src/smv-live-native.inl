@@ -3356,33 +3356,137 @@ __device__ __forceinline__ void ofAt(const F& fld, const unsigned char* __restri
     fld.at(cx, cy, a, b);
 }
 }
+// THE PAN GUARD (frame generation): a pair whose Optical Flow field lost a big single shift the pan estimator found
+// takes the pan instead. pg = the pair's block, k_panGuard writes it: [0] 1 = the guard holds, [1] [2] the pan's shift
+// (px, this frame -> the previous), [3] its still rects' count, then each rect's left, top, right, bottom (px of the
+// field's frame); null = no guard (upscaling, Live). (vx, vy) = the pan times s (a call's share of the pair, t1 - t0)
+// at (x, y), zero inside a still rect; false = the guard does not hold, the field's own vector stands
+__device__ __forceinline__ bool pgAt(const float* __restrict__ pg, int x, int y, float s, float& vx, float& vy)
+{
+    if (!pg || pg[0] == 0.0f) return false;
+    vx = pg[1] * s;
+    vy = pg[2] * s;
+    const int n = (int)pg[3];
+    for (int i = 0; i < n; i++)
+    {
+        const float* r = pg + 4 + 4 * i;
+        if ((float)x >= r[0] && (float)y >= r[1] && (float)x < r[2] && (float)y < r[3])
+        {
+            vx = 0.0f;
+            vy = 0.0f;
+            break;
+        }
+    }
+    return true;
+}
 // FSR's motion vectors: a field in px (two w x h planes, k_nvofUp's output) as R16G16_FLOAT texels, rows dstPitch bytes
 // apart, every vector as it is (k_nrMv without its test)
 // gate: a vector shorter than it (px) is written as exactly zero (0 = off): FSR upscaling's history holds still
-// detail only under exact zeros (nativeFsrupEval)
+// detail only under exact zeros (nativeFsrupEval); pg, ps = the pan guard (pgAt)
 __global__ void k_mvHalf(const float* __restrict__ flow, int w, int h, unsigned int* __restrict__ dst, int dstPitch,
-                         float gate)
+                         float gate, const float* __restrict__ pg, float ps)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t o = (size_t)y * w + x;
-    const float fx = flow[o], fy = flow[(size_t)w * h + o];
+    float fx, fy;
+    if (!pgAt(pg, x, y, ps, fx, fy))
+    {
+        fx = flow[o];
+        fy = flow[(size_t)w * h + o];
+    }
     dst[(size_t)y * (dstPitch >> 2) + x] =
         fx * fx + fy * fy < gate * gate ? 0u : (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
 }
+// the pan guard's decision for a pair (one block of 1024 threads): the median of up to 4096 cells of the engine's field
+// (gw x gh short2 cells, raw / 32 = px, rows vecPitch bytes apart; every step-th cell each way) against the pan in `in`
+// (on, mx, my, n rects, the rects); pg[0] = 1 when the pan is on and the median is more than 8 px off it, the pan and
+// its rects copied behind it for the writers. A bitonic sort of each component in shared memory (padded with +inf)
+struct PanGuardIn
+{
+    float on, mx, my, n;
+    float rect[96 * 4];
+};
+__global__ void k_panGuard(const short* __restrict__ vec, int vecPitch, int gw, int gh, int step, PanGuardIn in,
+                           float* __restrict__ pg)
+{
+    __shared__ float sa[4096], sb[4096];
+    const int t = threadIdx.x;
+    const int cols = (gw + step - 1) / step, rows = (gh + step - 1) / step;
+    const int n = min(4096, cols * rows);
+    for (int i = t; i < 4096; i += blockDim.x)
+    {
+        if (i < n)
+        {
+            const int cx = (i % cols) * step, cy = (i / cols) * step;
+            const short* c = (const short*)((const char*)vec + (size_t)cy * vecPitch) + 2 * cx;
+            sa[i] = (float)c[0] * (1.0f / 32.0f);
+            sb[i] = (float)c[1] * (1.0f / 32.0f);
+        }
+        else
+        {
+            sa[i] = 3.0e38f;
+            sb[i] = 3.0e38f;
+        }
+    }
+    __syncthreads();
+    for (int k = 2; k <= 4096; k <<= 1)
+        for (int j = k >> 1; j > 0; j >>= 1)
+        {
+            for (int i = t; i < 4096; i += blockDim.x)
+            {
+                const int l = i ^ j;
+                if (l > i)
+                {
+                    const bool up = (i & k) == 0;
+                    if ((sa[i] > sa[l]) == up)
+                    {
+                        const float v = sa[i];
+                        sa[i] = sa[l];
+                        sa[l] = v;
+                    }
+                    if ((sb[i] > sb[l]) == up)
+                    {
+                        const float v = sb[i];
+                        sb[i] = sb[l];
+                        sb[l] = v;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    if (t == 0)
+    {
+        const float dx = sa[n / 2] - in.mx, dy = sb[n / 2] - in.my;
+        const int nr = min(96, (int)in.n);
+        pg[0] = in.on != 0.0f && n > 0 && dx * dx + dy * dy > 64.0f ? 1.0f : 0.0f;
+        pg[1] = in.mx;
+        pg[2] = in.my;
+        pg[3] = (float)nr;
+    }
+    const int nr = min(96, (int)in.n);
+    for (int i = t; i < 4 * nr; i += blockDim.x)
+        pg[4 + i] = in.rect[i];
+}
 // the same texels from the engine's grid-1 field in one pass: vec = w x h short2 (raw / 32 = px, rows vecPitch bytes),
 // k_nvofUp at grid 1 (weights 0 and 1, an exact copy) then k_mvHalf, byte for byte; edge = the frame-generation edge
-// fill (ofAt), with the cost test when cost (w x h uint8, costPitch bytes a row) is given
+// fill (ofAt), with the cost test when cost (w x h uint8, costPitch bytes a row) is given; pg, ps = the pan guard (pgAt)
 __global__ void k_mvHalfG1(const short* __restrict__ vec, int vecPitch, int w, int h, unsigned int* __restrict__ dst,
-                           int dstPitch, float gate, int edge, const unsigned char* __restrict__ cost, int costPitch)
+                           int dstPitch, float gate, int edge, const unsigned char* __restrict__ cost, int costPitch,
+                           const float* __restrict__ pg, float ps)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
-    float rx, ry;
-    ofAt(OfCells{vec, vecPitch}, cost, costPitch, w, h, 1, w, h, 1.0f / 32.0f, edge, x, y, rx, ry);
-    const float fx = rx * (1.0f / 32.0f), fy = ry * (1.0f / 32.0f);
+    float fx, fy;
+    if (!pgAt(pg, x, y, ps, fx, fy))
+    {
+        float rx, ry;
+        ofAt(OfCells{vec, vecPitch}, cost, costPitch, w, h, 1, w, h, 1.0f / 32.0f, edge, x, y, rx, ry);
+        fx = rx * (1.0f / 32.0f);
+        fy = ry * (1.0f / 32.0f);
+    }
     dst[(size_t)y * (dstPitch >> 2) + x] =
         fx * fx + fy * fy < gate * gate ? 0u : (unsigned int)f2h(fx) | ((unsigned int)f2h(fy) << 16);
 }
@@ -3427,14 +3531,20 @@ __device__ __forceinline__ void mvAt(const short* __restrict__ vec, int vecPitch
 // field (B -> A at B's positions, grid 1): under the pair's straight-line motion the content at p in the frame at t1
 // sits at the B position q with p = q + (1 - t1) v(q) (a 3-step fixed point) and at t0 at q + (1 - t0) v(q), so the
 // call's field (its frame -> its previous, FSR's convention) = (t1 - t0) v(q); edge = the edge fill (ofAt, with the
-// cost test when cost is given)
+// cost test when cost is given); pg = the pair's pan guard (pgAt: the pan times t1 - t0 instead)
 __global__ void k_mvDerive(const short* __restrict__ vec, int vecPitch, int w, int h, float t0, float t1,
                            unsigned int* __restrict__ dst, int dstPitch, int edge, const unsigned char* __restrict__ cost,
-                           int costPitch)
+                           int costPitch, const float* __restrict__ pg)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
+    float gx, gy;
+    if (pgAt(pg, x, y, t1 - t0, gx, gy))
+    {
+        dst[(size_t)y * (dstPitch >> 2) + x] = (unsigned int)f2h(gx) | ((unsigned int)f2h(gy) << 16);
+        return;
+    }
     float vx, vy, qx = (float)x, qy = (float)y;
     for (int it = 0; it < 3; it++)
     {

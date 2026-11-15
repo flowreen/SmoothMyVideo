@@ -392,6 +392,20 @@ struct NativeRife
     LUID fgLuid = {};
     int fgPitch = 0, fgMvPitch = 0; // the bridge's row pitches (bytes), the same for every instance
     uint8_t* dFgMv = nullptr;       // a call's vectors (RG16F rows fgMvPitch apart) before their copy into its texture
+    // THE PAN GUARD (file renders; SMV_FSRFG_PANGUARD=0 = off): the offline loop measures each source frame's pan
+    // against the one before it from its host bytes (fgPanIn at the working size, fgPanHave once one is measured);
+    // a pair's level-1 call hands it to k_panGuard, which writes the decision into that field slot's block of
+    // dFgGuard (kFgGuardFloats floats each, out[0] / out[1] as fgOf's fields): its writers take the pan where the
+    // field's median misses it by more than 8 px (pgAt in the kernel text)
+    struct FgPanIn // = the kernel text's PanGuardIn, byte for byte
+    {
+        float on = 0.0f, mx = 0.0f, my = 0.0f, n = 0.0f;
+        float rect[96 * 4] = {};
+    };
+    static constexpr int kFgGuardFloats = 4 + 96 * 4;
+    FgPanIn fgPanIn;
+    bool fgPanHave = false;
+    float* dFgGuard = nullptr;
     // SMV_FSRFG_PROF=1: CUDA events between a call's stages (copy in, the Optical Flow inputs, the Optical Flow, the
     // vector kernels, the vector copy, FSR on vkd3d, the copy out), means at the session's end; every call then waits
     // for its last event, so the stages do not overlap the next call's. A derived call's k_mvDerive counts apart
@@ -950,6 +964,7 @@ struct NativeRife
         fPackBgraRgb = nullptr, fUnpackBgraRgb = nullptr,                   // FSR upscaling / FRUC: (R, G, B) <-> BGRA8
         fPackRgbaH = nullptr, fRgbaHAbgr = nullptr, fUnpackRgbaH = nullptr, // FSR frame generation: RGBA16F frames,
         fMvHalf = nullptr, fMvHalfG1 = nullptr, fMvDerive = nullptr,        // the Optical Flow input, the vectors
+        fPanGuard = nullptr,                                                // frame generation's pan guard decision
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr, fOddEdge = nullptr, // FSR upscaling: BGRA8 <-> RGBA8; VSR's slot
         fFuMvScale = nullptr,                                            // its chained passes' vectors
         fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr,  // offline DLSS 4.5 frames, RTX VSR
