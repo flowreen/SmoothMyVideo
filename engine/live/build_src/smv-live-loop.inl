@@ -255,6 +255,22 @@ struct CascadeProbe
     std::condition_variable cv;
     std::vector<uint8_t> mail;
     bool mailFull = false, quit = false;
+    // THE GPU FEED (an in-process stage 1 on the Live direct route, feedShared): a capture slot's frame instead of
+    // its bytes, one in flight like mail (one or the other); the slot textures and their fence = the session's
+    // imports (gpuFeedInit), feedDone = what this stage signals once a slot's frame is copied out, feedHanded[s] =
+    // the last value handed from slot s (a slot is free for this stage once feedDone reached it)
+    struct GpuMail
+    {
+        int slot = 0;
+        uint64_t value = 0;
+        std::vector<uint8_t> thumb;
+    } gmail, gheld;
+    bool gmailFull = false;
+    size_t gPitch = 0;
+    ID3D12Resource* const* feedTex = nullptr;
+    ID3D12Fence* feedFence = nullptr;
+    ComPtr<ID3D12Fence> feedDone;
+    uint64_t feedHanded[Capture::kFeedSlots] = {};
     std::atomic<bool> readerQuit{false};
     // abortStart: the session ended while start() waits for READY; writerFailed: stage 1's stdin broke
     std::atomic<bool> abortStart{false}, writerFailed{false}, writerDone{false}, pumpDone{false};
@@ -603,6 +619,15 @@ struct CascadeProbe
         std::lock_guard<std::mutex> lk(m);
         if (quit || localEnd.load() || (localEndAt > 0 && qpcMs() >= localEndAt))
             return -1;
+        if (gmailFull)
+        {
+            std::swap(gheld, gmail);
+            gmailFull = false;
+            lfeed.shared = {feedTex[gheld.slot], feedFence, gheld.value, gheld.thumb.data(), gPitch, feedDone.Get()};
+            at = mailAt;
+            fed++;
+            return 2;
+        }
         if (!mailFull)
             return 0;
         held.swap(mail);
@@ -712,13 +737,53 @@ struct CascadeProbe
     void feed(const uint8_t* p, size_t bytes)
     {
         std::lock_guard<std::mutex> lk(m);
-        if (mailFull || bytes != mail.size())
+        if (mailFull || gmailFull || bytes != mail.size())
         {
             dropped++;
             return;
         }
         memcpy(mail.data(), p, bytes);
         mailFull = true;
+        mailAt = qpcMs();
+        cv.notify_one();
+        if (lfeed.ev)
+            SetEvent(lfeed.ev);
+    }
+
+    // the GPU feed's setup (once a stage): the session's slot imports and fence, this stage's done fence on `dev`
+    bool gpuFeedInit(ID3D12Device* dev, ID3D12Resource* const* tex, ID3D12Fence* fence)
+    {
+        if (feedDone)
+            return true;
+        if (!local || FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&feedDone))))
+            return false;
+        feedTex = tex;
+        feedFence = fence;
+        return true;
+    }
+
+    // slot s may take another frame: this stage copied out every frame handed from it
+    bool slotFree(int s) const
+    {
+        return !feedHanded[s] || feedDone->GetCompletedValue() >= feedHanded[s];
+    }
+
+    // the newest captured frame as capture slot `slot` (its fence value, its thumbnail of `bytes`, rows `pitch` apart);
+    // one in flight at most, like feed()
+    void feedShared(int slot, uint64_t value, const uint8_t* thumb, size_t bytes, size_t pitch)
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (mailFull || gmailFull)
+        {
+            dropped++;
+            return;
+        }
+        gmail.slot = slot;
+        gmail.value = value;
+        gmail.thumb.assign(thumb, thumb + bytes);
+        gPitch = pitch;
+        gmailFull = true;
+        feedHanded[slot] = value;
         mailAt = qpcMs();
         cv.notify_one();
         if (lfeed.ev)
@@ -3771,6 +3836,20 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         // the previous capture).
         const bool xqRoute = g_backend == BK_SERVER; // every model server runs the queue
         LOG("present queue: xq=%d (%s)\n", xqRoute ? 1 : 0, xqRoute ? "cross-group queue" : "direct present");
+        // THE GPU FEED (the direct route, SDR, a plan on screen whose stage 1 runs in this process at the captured
+        // size): the capture copies each frame into one of its shared slots and reads back only its 1/4 luma
+        // thumbnail; stage 1 copies the slot into its frame texture and measures the pan from the thumbnail (the
+        // frames and the pan = the CPU feed's). The loop reads no frame back while it runs.
+        // SMV_LIVE_DLSSG_GPUFEED=0 = the CPU feed (the A/B and the identity gates' reference). Declared before the
+        // plans: their stages copy from these imports until they stop
+        const bool feedLever = lkEnv("SMV_LIVE_DLSSG_GPUFEED") != "0";
+        ComPtr<ID3D12Resource> feedTex12[Capture::kFeedSlots];
+        ID3D12Resource* feedTexRaw[Capture::kFeedSlots] = {};
+        ComPtr<ID3D12Fence> feedFence12;
+        bool feedTried = false, feedReady = false;
+        std::vector<uint8_t> feedThumb;
+        uint64_t feedVal = 0;
+        int feedNext = 0;
         std::unique_ptr<CascadeProbe> casc;
         const std::string cascMode = lkEnv("SMV_LIVE_CASCADE");
         // SMV_LIVE_DLSSG_KEEP=0: whole multiples only (no kept ring: the rule before the keep plan, an A/B)
@@ -3986,6 +4065,49 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         };
         // a plan's frames are on screen: the plan's, or the old plan's while the next one starts
         auto cascOnScreen = [&]() { return (casc && casc->present) || cascOld != nullptr; };
+        // the GPU feed's slot for the next captured frame, -1 = the CPU feed for it (no plan on screen, HDR, a stage 1
+        // in a process or at another size, the feed not set up, or every slot still read by a stage)
+        auto gpuFeedPick = [&]() -> int {
+            if (!feedLever || g_hdr || !casc || !cascOnScreen())
+                return -1;
+            CascadeProbe* a = cascUp ? cascUp.get() : casc.get();
+            CascadeProbe* b = cascOld ? (cascOldUp ? cascOldUp.get() : cascOld.get()) : nullptr;
+            for (CascadeProbe* p : {a, b})
+                if (p && (!p->local || p->fw != cap.cw || p->fh != cap.ch))
+                    return -1;
+            if (!feedTried)
+            {
+                feedTried = true;
+                feedReady = cap.initFeed();
+                for (int i = 0; feedReady && i < Capture::kFeedSlots; i++)
+                {
+                    feedReady = SUCCEEDED(host.device->OpenSharedHandle(cap.hFeedTex[i], IID_PPV_ARGS(&feedTex12[i])));
+                    feedTexRaw[i] = feedTex12[i].Get();
+                }
+                feedReady =
+                    feedReady && SUCCEEDED(host.device->OpenSharedHandle(cap.hFeedFence, IID_PPV_ARGS(&feedFence12)));
+                if (feedReady)
+                    feedThumb.resize((size_t)cap.thumbPitch * cap.thumbH);
+                LOG(feedReady
+                        ? "DLSS 4.5's stage 1 takes the captured frames on the GPU (no readback)\n"
+                        : "DLSS 4.5's stage 1 takes the captured frames as bytes (the GPU feed did not set up)\n");
+            }
+            if (!feedReady)
+                return -1;
+            for (CascadeProbe* p : {a, b})
+                if (p && !p->gpuFeedInit(host.device.Get(), feedTexRaw, feedFence12.Get()))
+                    return -1;
+            for (int k = 0; k < Capture::kFeedSlots; k++)
+            {
+                const int s = (feedNext + k) % Capture::kFeedSlots;
+                if (a->slotFree(s) && (!b || b->slotFree(s)))
+                {
+                    feedNext = s + 1;
+                    return s;
+                }
+            }
+            return -1;
+        };
         // the effects route's cascade feed: one output slot read back and handed to stage 1, so every frame it
         // generates from carries the effects (the old plan's stage 1 too, while it presents)
         auto cascFeedSlot = [&](uint32_t set, uint32_t i) -> bool {
@@ -5598,7 +5720,10 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 if (g_verbose)
                     LOG("[loop] top hidden=%d\n", (int)hidden);
                 const bool gpuCap = cap.interop && srv.captexAck; // zero-copy capture active
-                int got = gpuCap ? cap.latestFrameGpu() : cap.latestFrame(buf.data());
+                const int feedSlot = hidden || gpuCap ? -1 : gpuFeedPick();
+                int got = feedSlot >= 0 ? cap.latestFrameFeed(feedSlot, feedThumb.data(), feedVal)
+                          : gpuCap      ? cap.latestFrameGpu()
+                                        : cap.latestFrame(buf.data());
                 if (g_verbose)
                     LOG("[loop] latest=%d\n", got);
                 if (got == -1)
@@ -5617,17 +5742,20 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 {
                     // a plan's frames on screen: stage 1 takes it, presented below; else it is shown as it is (and a
                     // warming plan's stage 1 takes it too). An old plan presenting while the next one starts: both
-                    // plans' stage 1 take it
+                    // plans' stage 1 take it (the GPU feed only while a plan is on screen: buf is not read then)
                     if (!cascOnScreen() && !host.presentFrame(buf.data()))
                     {
                         LOG("presentFrame failed\n");
                         rc2 = 1;
                         break;
                     }
-                    if (casc)
-                        (cascUp ? cascUp : casc)->feed(buf.data(), capBytes);
-                    if (cascOld)
-                        (cascOldUp ? cascOldUp : cascOld)->feed(buf.data(), capBytes);
+                    CascadeProbe* in1 = casc ? (cascUp ? cascUp.get() : casc.get()) : nullptr;
+                    CascadeProbe* in0 = cascOld ? (cascOldUp ? cascOldUp.get() : cascOld.get()) : nullptr;
+                    for (CascadeProbe* p : {in1, in0})
+                        if (p && feedSlot >= 0)
+                            p->feedShared(feedSlot, feedVal, feedThumb.data(), feedThumb.size(), cap.thumbPitch);
+                        else if (p)
+                            p->feed(buf.data(), capBytes);
                     // direct routes (dlssg/identity): latency of the frame just presented
                     const double latDirect = (nowQpc100() - cap.lastFrameTs) / 10000.0 + stampLagMs();
                     statLatSum += latDirect;

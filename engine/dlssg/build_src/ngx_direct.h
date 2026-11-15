@@ -583,6 +583,33 @@ struct Direct
         return v != 0;
     }
 
+    // an input from a texture another API shares on this device (the Live direct route's capture slot, in the frame
+    // texture's format, resting in COMMON once srcFence reaches srcValue) with its 1/4 luma thumbnail (rows `pitch`
+    // bytes apart; the pan measured from it = the Result its frame's bytes give, kept in lastPan); `done` is signalled
+    // with srcValue once the copy out of the slot ran, so the slot can take another frame
+    bool stageInputShared(ID3D12Resource* src, ID3D12Fence* srcFence, uint64_t srcValue, const uint8_t* thumb,
+                          size_t pitch, ID3D12Fence* done)
+    {
+        panvec::Result panR{};
+        if (panOn)
+            panR = pan.runThumb(thumb, pitch, W, H);
+        lastPan = panR;
+        ID3D12GraphicsCommandList* l = stageList();
+        if (!l)
+            return false;
+        if (panOn)
+            panTex.record(l, texMvec.Get(), panR);
+        transition(l, src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        l->CopyResource(texFrame.Get(), src);
+        transition(l, src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        transition(l, texFrame.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kSrv);
+        queue->Wait(srcFence, srcValue);
+        const uint64_t v = stageRun(l);
+        if (v && done)
+            queue->Signal(done, srcValue);
+        return v != 0;
+    }
+
     // generated frame k of `gen` between the last two inputs, copied into slot (a texture resting in COMMON; null =
     // made and left where it is, the warm-up)
     uint64_t stageTween(int k, ID3D12Resource* slot)

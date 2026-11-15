@@ -1000,8 +1000,13 @@ DLSS-G (the default backend, no `--backend`) with any effect (`--sharpen` > 0, `
 echo route (`engine=none`, one slot) runs the effects on every captured frame through the cross-group queue, and each
 slot is read back and fed to the plan's first stage in the server's slot format (BGRA8 SDR, R10G10B10A2 PQ HDR), so
 every generated frame carries the effects; until the plan's stages are up the slots are presented as they are.
-Plain DLSS-G (no effect) feeds its stages the captured frames on the direct route. Checked per effect on parked
-sessions: the red square stays red, and DLSS-G + Sharpen's real frames are exact twins of echo + Sharpen.
+Checked per effect on parked sessions: the red square stays red, and DLSS-G + Sharpen's real frames are exact twins
+of echo + Sharpen. Plain DLSS-G (no effect) feeds its stages the captured frames on the direct route. In SDR, while a
+plan is on screen and its first stage runs in the host at the captured size, no frame is read back: the capture copies
+each frame into one of three textures it shares with the stages' D3D12 device and reads back only its quarter-size
+luma thumbnail (what the pan estimate measures), and the stage copies the texture into its frame
+(`SMV_LIVE_DLSSG_GPUFEED=0` = the bytes as before; measured on a parked 3840x2160 source: the session's CPU time
+9.5-9.8 ms a captured frame instead of 18.9-21.9, the same at 1920x1080).
 `--gen`: server backends any count the video memory's output ring holds (at most 4095), dlssg,
 identity and DLSS 4.5 with effects 1..5. `--fg` targets the current foreground window (the
 app's hotkey and countdown use it). Exit codes: 2 unsupported GPU, 3 multi-frame limit, 4 target
@@ -2061,6 +2066,7 @@ named here, and on a name here that no source holds.
 | `SMV_DLSSG_WQ=0` | a file render's host reads each DLSS 4.5 pair before it sends the next frame, even to a `dlssg2f` with a pair writer (` wq=1`); the A/B and fallback test only, never a product setting |
 | `SMV_DLSSG_KEEP=0` | the resident file-render host starts a new `dlssg2f` for every DLSS 4.5 render instead of keeping the last render's server for the next one of the same padded size, multiplier and frame format; the A/B and fallback test only, never a product setting |
 | `SMV_LIVE_DLSSG_KEEPDIRECT=0` | a kept Live DLSS 4.5 plan (a non-whole multiple) has its presented stage make every frame of its rung and the session present every k-th: by default that stage makes and shares only the frames the keep shows; the A/B and gate lever |
+| `SMV_LIVE_DLSSG_GPUFEED=0` | Live DLSS 4.5's direct route (SDR) feeds stage 1 the captured frames as bytes, read back on the CPU: by default, while a plan is on screen and its stage 1 runs in the host at the captured size, the capture copies each frame into one of three textures shared with the stages' D3D12 device and reads back only its quarter-size luma thumbnail, stage 1 copies the texture into its frame and measures the pan from the thumbnail (the same frames and vectors); the A/B and the identity gates' reference |
 | `SMV_LIVE_DLSSG_BRIDGE=0` | a Live DLSS 4.5 plan the session replaces itself ends at once and the captured frames are shown until the next plan presents: by default its stages keep presenting while the next plan starts beside them (make before break); the A/B and gate lever |
 | `SMV_LIVE_DLSSG_FOLLOW=0` | a presenting Live DLSS 4.5 plan keeps the plan its first two stats windows derived: by default, in its first 30 s of presenting, it steps down in place to the smaller plan the settled capture rate derives two windows in a row (a capture that read low at the start); the A/B and gate lever |
 | `SMV_LIVE_DLSSG_LOCAL=0` | Live DLSS 4.5's helper passes run as `dlssg2f --stage1` processes: by default each one runs on a thread of the live host itself (`ngx_stage.h`, the stage code `dlssg2f` runs, its ring shared by the same names); the A/B and gate lever |

@@ -422,9 +422,18 @@ struct SourceClock
 struct StageFeed
 {
     HANDLE ev = nullptr; // set at every hand-over and at the end
-    // 1 = a frame (its bytes, the stage's until done(), and when it arrived on qpcMs's clock), 0 = none yet, -1 = no
-    // more will come
+    // 1 = a frame (its bytes, the stage's until done(), and when it arrived on qpcMs's clock), 2 = a frame on the GPU
+    // (`shared` below, p unset: Direct::stageInputShared), 0 = none yet, -1 = no more will come
     virtual int take(const uint8_t*& p, double& at) = 0;
+    struct Shared
+    {
+        ID3D12Resource* tex = nullptr; // the frame, in the frame texture's format, resting in COMMON
+        ID3D12Fence* fence = nullptr;  // ... once this fence reaches value
+        uint64_t value = 0;
+        const uint8_t* thumb = nullptr; // its 1/4 luma thumbnail (pan_vectors.h's thumbRows), rows pitch bytes apart
+        size_t pitch = 0;
+        ID3D12Fence* done = nullptr; // signalled with value once the stage copied the frame out
+    } shared;
     virtual void done() = 0;
     virtual ~StageFeed() = default;
 };
@@ -439,6 +448,7 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
                        const std::atomic<bool>* upEnd)
 {
     const uint8_t* cpu = nullptr;
+    bool gpuIn = false; // the input taken last is feed->shared (a frame on the GPU), not cpu
     uint32_t upSlot = 0;
     uint64_t upValue = 0;
     // THE MOTION a frame carries to the next stage (Stage1Hdr's motion block): the input taken last (taken), the
@@ -461,6 +471,7 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
             ended = r < 0;
             if (r > 0)
             {
+                gpuIn = r == 2;
                 taken = SlotMotion();
                 taken.pos = (double)fedNo;
                 taken.iv = (uint32_t)fedNo++;
@@ -488,7 +499,8 @@ static int ngxStageRun(ngxfg::Direct& fg, StageShare& ring, StageFeed* feed, Ups
         bool under = false;
         if (feed)
         {
-            if (!fg.stageInput(cpu))
+            const StageFeed::Shared& g = feed->shared;
+            if (!(gpuIn ? fg.stageInputShared(g.tex, g.fence, g.value, g.thumb, g.pitch, g.done) : fg.stageInput(cpu)))
                 return false;
             if (fresh)
                 taken.pan = fg.lastPan;
