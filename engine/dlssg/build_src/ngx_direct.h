@@ -427,6 +427,23 @@ struct Direct
         return true;
     }
 
+    // an input's pan as the camera's step in clip space, beside the vectors, the form a game gives it (a pixel sat at
+    // x + mx, y + my one frame earlier; clip y points up): clipToPrevClip moves a clip position by the step,
+    // prevClipToClip moves it back; no pan = identity. DLSS-G reads the matrices only beside vectors (the step with zero
+    // vectors gives the zero vectors' frames). With them, the first tween of a clip that starts mid-pan takes the strip
+    // the pan brings in at the frame's edge from the picture instead of a displaced column (1080p, frame generation 2x, a
+    // pan of 24 px left and 12 px down a frame: that tween's outer 48 px 35.9 -> 48.3 dB, the whole tween +4.0 dB); the
+    // later tweens and the first after a cut inside a clip move by at most 0.2 dB either way
+    void camStep(const panvec::Result& r)
+    {
+        const float tx = r.on ? 2.0f * r.mx / (float)W : 0.0f;
+        const float ty = r.on ? -2.0f * r.my / (float)H : 0.0f;
+        opt.clipToPrevClip[3][0] = tx;
+        opt.clipToPrevClip[3][1] = ty;
+        opt.prevClipToClip[3][0] = -tx;
+        opt.prevClipToClip[3][1] = -ty;
+    }
+
     // one frame of the clip: uploaded, measured for the pan, then one evaluate per generated frame of the pair it
     // closes. outs = `gen` buffers of W * H * 4 bytes in temporal order; null = nothing is read back (the warm-up)
     bool frame(const uint8_t* rgba, uint8_t* const* outs)
@@ -441,6 +458,7 @@ struct Direct
             {
                 if (panOn)
                     panTex.record(list.Get(), texMvec.Get(), panR);
+                camStep(panR);
                 D3D12_TEXTURE_COPY_LOCATION dst{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
                 D3D12_TEXTURE_COPY_LOCATION src{uploadBuf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
                 src.PlacedFootprint.Footprint = {fmt, W, H, 1, rowPitch};
@@ -561,6 +579,7 @@ struct Direct
             return false;
         if (panOn)
             panTex.record(l, texMvec.Get(), panR);
+        camStep(panR);
         if (rgba)
         {
             D3D12_TEXTURE_COPY_LOCATION dst{texFrame.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -599,6 +618,7 @@ struct Direct
             return false;
         if (panOn)
             panTex.record(l, texMvec.Get(), panR);
+        camStep(panR);
         transition(l, src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         l->CopyResource(texFrame.Get(), src);
         transition(l, src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);

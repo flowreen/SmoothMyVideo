@@ -1271,7 +1271,15 @@ every tween better; a still top of 14 % given the pan: its first tween's still p
 still rectangle still (it has no motion estimate of its own). The depth and vector textures DLSS-G is given are half the frame per axis (`panvec::kVecDiv`; the still tiles scale
 exactly): the generated frames are byte for byte the full-size textures' at a quarter of the bytes.
 Anything else, and every move under 1 px, keeps the exact zero vectors, so those frames are the ones DLSS-G made
-without it. A stage fed from another stage's ring (Live's second and third passes) measures nothing: the ring's
+without it. The same pan also goes into the evaluate's camera matrices, the form a game gives it beside its vectors
+(`camStep` in `ngx_direct.h`: the step in clip space in the fourth row of `clipToPrevClip`, negated in
+`prevClipToClip`; no pan = identity), for a file render's frames and every Live stage's inputs. DLSS-G reads the
+matrices only beside vectors (the step with zero vectors gives the zero vectors' frames). With them, the first tween of
+a clip that starts mid-pan takes the strip the pan brings in at the frame's edge from the picture instead of a
+displaced column: 1080p, frame generation 2x, a pan of 24 px left and 12 px down a frame, that tween's outer 48 px
+35.9 -> 48.3 dB and the whole tween +4.0 dB; the later tweens and the first after a cut inside a clip (DLSS-G's own
+scene change detection keeps its history there) move by at most 0.2 dB either way, and on a real anime pan with every
+second frame as the truth the tweens moved by +0.002 dB on average. A stage fed from another stage's ring (Live's second and third passes) measures nothing: the ring's
 header carries each frame's MOTION (`Stage1Hdr` after `atOnce`, `motionMagic` set): its place on the first stage's
 input timeline (input n at n, its tween k of g + 1 at n - 1 + k / (g + 1)), the input interval it lies in and that
 interval's pan with its still tiles (the 10 % rule above applies to them the same way). The stage's vectors for its pair a -> b are each interval's pan times the share
