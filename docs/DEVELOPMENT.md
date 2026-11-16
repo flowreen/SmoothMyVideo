@@ -1731,7 +1731,10 @@ thread (`nativeFsrupWarmProc`): the driver compiles FSR's shaders inside them (a
 ratio it has not seen), and the session presents without the upscaler until they end. RTX VSR's first create in the
 process runs on a worker the same way (`nativeUpVsrProc`): NGX loads NVIDIA's model there, about 1.7 s at 480x270 ->
 960x540 on an RTX 5090 Laptop GPU, which held the picture that long on the thread that makes the frames; a `dlssnr 1`
-meanwhile waits for it, since DLSS 5's core starts after the RTX Video bridge's NGX create, never beside it. `a4kaa` (Anime4K's Mode A+A,
+meanwhile waits for it, since DLSS 5's core starts after the RTX Video bridge's NGX create, never beside it.
+Anime4K's and ArtCNN's kernels, their own modules, are compiled into the kernel cache on a background thread once a
+Live session runs (`nativeUpPrewarmStart`), so ticking one of them later loads the cached cubin; on an empty cache the
+compile at the tick held the picture 0.7 s (Anime4K) and 0.2 s (ArtCNN) at 640x360. `a4kaa` (Anime4K's Mode A+A,
 sent before `up`): off = Anime4K's first pass skips the Restore CNN on its 2x frame (the buffers stay); on = Anime4K's
 resize buffers set up again with the A+A sizes at the session's geometry (`nativeA4kAaSwitch`, the room check first:
 short = Mode A with its reason); while Anime4K is not set up the value is held for its start in place. Restore in a

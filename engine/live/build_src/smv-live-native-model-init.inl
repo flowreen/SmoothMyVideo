@@ -672,6 +672,8 @@ static bool nativeModelInit(NativeRife& nr)
 
 static void nativeFree(NativeRife& nr)
 {
+    if (nr.upPrewarm.joinable())
+        nr.upPrewarm.join(); // the kernel cache's background compile (nativeUpPrewarmStart) ends first
     if (nr.stream)
         cudaStreamSynchronize(nr.stream);
     // the upscaler after Live DLSS 4.5 runs the nets below on its own stream: drained before their buffers go

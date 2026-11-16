@@ -531,6 +531,9 @@ struct NativeRife
     bool fuWarmWant = false;
     bool fuWarmVsr = false;
     ULONGLONG fuWarmT0 = 0;
+    // Anime4K's and ArtCNN's kernels compiled into the cache beside a Live session (nativeUpPrewarmStart), joined by
+    // nativeFree
+    std::thread upPrewarm;
     // ArtCNN (acnUp, `--artcnn`): RTX VSR's resize too (vsr is set), on planar floats like Anime4K: C4F32_DN v1.6.2's
     // luma x2 in its own module (acnMod, kAcnA + kAcnB), the weights from engine\artcnn\artcnn_c4f32_dn_v1.6.2_fp16.pkl,
     // the colour from the frame's Lanczos enlargement (nativeAcnRun); x2 passes as Anime4K's (a4kPassesFor)

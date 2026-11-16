@@ -753,6 +753,37 @@ static void nativeLiveSets(NativeRife& nr)
     }
 }
 
+// Anime4K's and ArtCNN's kernels (their own modules, compiled at their first setup) compiled into the kernel cache on a
+// background thread once a Live session runs, when the session has not loaded them: an upscaler or Restore ticked
+// later in the session then loads the cached cubin instead of compiling it where the tick lands (the present thread
+// after Live DLSS 4.5, else the compute thread; 0.7 s / 0.2 s of held picture at 640x360 on an empty cache). On a
+// cache that holds them it only reads the files; nothing is loaded into the session
+static void nativeUpPrewarmStart(NativeRife& nr)
+{
+    const bool a4k = !nr.a4kMod, acn = !nr.acnMod;
+    if (nr.upPrewarm.joinable() || nr.kernCacheDir.empty() || (!a4k && !acn))
+        return;
+    NativeRife* p = &nr;
+    const std::wstring dir = nr.kernCacheDir;
+    nr.upPrewarm = std::thread([p, dir, a4k, acn] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        if (!nativeBindDevice(*p))
+            return;
+        std::vector<char> cubin;
+        if (a4k)
+        {
+            std::string text;
+            a4kKernelText(text);
+            nativeCubin(text.c_str(), "smv_anime4k.cu", L"smv_anime4k", "Anime4K kernels", dir, cubin, true);
+        }
+        if (acn)
+        {
+            const std::string text = std::string(kAcnA) + kAcnB;
+            nativeCubin(text.c_str(), "smv_artcnn.cu", L"smv_artcnn", "ArtCNN kernels", dir, cubin, true);
+        }
+    });
+}
+
 static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, HANDLE hFence, HANDLE hOutBuf,
                          uint64_t outBytes, bool earlyDone)
 {
@@ -795,6 +826,7 @@ static void nativeThread(NativeRife* nrp, IDXGIAdapter1* adapter, HANDLE hTex, H
                : "",
         nr.uw ? ", upscale=native" : "", nr.fitAa ? ", fit=native-aa" : "",
         nr.restore && nr.restNat ? (nr.restNatKind == 3 ? ", restore=anime4k" : ", restore=native") : "");
+    nativeUpPrewarmStart(nr);
     for (;;)
     {
         std::vector<uint8_t> msg;

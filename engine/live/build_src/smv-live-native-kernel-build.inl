@@ -1196,8 +1196,10 @@ static const int g_nativeArch = nativeArchLever();
 // one NVRTC program's cubin: read from cacheDir\<tag>_<source hash>_sm<arch>.cubin, else compiled (the arch the only
 // option) and saved there; `what` names it in the lines. Under SMV_NATIVE_ARCH the buffer holds PTX instead
 // (<tag>_<hash>_ptx<arch>.ptx, NUL-terminated), which cuModuleLoadData JIT-compiles the same way it loads a cubin.
+// Two threads may compile the same text at once (nativeUpPrewarmStart beside a setup): each writes its own temporary
+// file and renames it in, so the cache only ever holds a whole cubin. quiet = no line for a compile that succeeded
 static bool nativeCubin(const char* src, const char* file, const wchar_t* tag, const char* what,
-                        const std::wstring& cacheDir, std::vector<char>& cubin)
+                        const std::wstring& cacheDir, std::vector<char>& cubin, bool quiet = false)
 {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess)
@@ -1300,7 +1302,7 @@ static bool nativeCubin(const char* src, const char* file, const wchar_t* tag, c
         }
         nv.destroy(&prog);
         FILE* f = nullptr;
-        const std::wstring tmp = cubinPath + L".tmp";
+        const std::wstring tmp = cubinPath + L"." + std::to_wstring(GetCurrentThreadId()) + L".tmp";
         if (!_wfopen_s(&f, tmp.c_str(), L"wb") && f)
         {
             fwrite(cubin.data(), 1, cubin.size(), f);
@@ -1308,14 +1310,16 @@ static bool nativeCubin(const char* src, const char* file, const wchar_t* tag, c
             _wunlink(cubinPath.c_str());
             if (_wrename(tmp.c_str(), cubinPath.c_str()) != 0)
             {
-                LOG("native: kernel cache not saved (%s, rename failed)\n", what);
+                // another thread's rename of the same text came first: its cubin is the same bytes
+                if (GetFileAttributesW(cubinPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+                    LOG("native: kernel cache not saved (%s, rename failed)\n", what);
                 _wunlink(tmp.c_str());
             }
         }
-        if (g_nativeArch)
+        if (!quiet && g_nativeArch)
             LOG("native: %s compiled as compute_%d PTX for the driver's JIT on sm_%d%d (SMV_NATIVE_ARCH, %zu bytes)\n",
                 what, g_nativeArch, prop.major, prop.minor, cubin.size());
-        else
+        else if (!quiet)
             LOG("native: %s compiled for sm_%d%d (%zu bytes cubin)\n", what, prop.major, prop.minor, cubin.size());
     }
     return true;
