@@ -1,5 +1,5 @@
 diff --git a/include/vkd3d_shader.h b/include/vkd3d_shader.h
-index 78132c51..bea8e87b 100644
+index 892a33f2..4f86eaf3 100644
 --- a/include/vkd3d_shader.h
 +++ b/include/vkd3d_shader.h
 @@ -448,6 +448,8 @@ enum vkd3d_shader_target_extension
@@ -35,7 +35,7 @@ index 12b1d03f..086e33a4 100644
  EXPORTS
      D3D12CreateDevice @101
 diff --git a/libs/d3d12/meson.build b/libs/d3d12/meson.build
-index d99da14c..a2005b1b 100644
+index 3c502255..b2fc0801 100644
 --- a/libs/d3d12/meson.build
 +++ b/libs/d3d12/meson.build
 @@ -3,7 +3,8 @@ d3d12_src = [
@@ -46,8 +46,8 @@ index d99da14c..a2005b1b 100644
 +  # SMV patch: renamed so it never shares a module name with the system d3d12.dll in the same process
 +  d3d12_name_prefix = 'smv_vkd3d_'
    d3d12_dependencies = [ vkd3d_common_dep, lib_gdi32, lib_dxgi ]
- else
-   d3d12_name_prefix = 'libvkd3d-proton-'
+   windows = import('windows')
+   d3d12_res = windows.compile_resources('version.rc')
 diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
 index abd56d6d..a542b743 100644
 --- a/libs/d3d12core/d3d12core.def
@@ -59,7 +59,7 @@ index abd56d6d..a542b743 100644
  EXPORTS
      D3D12GetInterface
 diff --git a/libs/d3d12core/meson.build b/libs/d3d12core/meson.build
-index dd1f7799..7e168e0f 100644
+index 5665df30..0454ebfc 100644
 --- a/libs/d3d12core/meson.build
 +++ b/libs/d3d12core/meson.build
 @@ -4,7 +4,8 @@ d3d12core_src = [
@@ -70,13 +70,13 @@ index dd1f7799..7e168e0f 100644
 +  # SMV patch: renamed so it never shares a module name with the system D3D12Core.dll in the same process
 +  d3d12core_name_prefix = 'smv_vkd3d_'
    d3d12core_dependencies = [ vkd3d_dep, lib_gdi32, lib_dxgi ]
- else
-   d3d12core_name_prefix = 'libvkd3d-proton-'
+   windows = import('windows')
+   d3d12core_res = windows.compile_resources('version.rc')
 diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
-index faf378d0..6c48ae0e 100644
+index 02beb74d..8834e393 100644
 --- a/libs/vkd3d-shader/dxil.c
 +++ b/libs/vkd3d-shader/dxil.c
-@@ -1226,6 +1226,10 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
+@@ -1230,6 +1230,10 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
              {
                  float8.nv_cooperative_matrix2_conversions = DXIL_SPV_TRUE;
              }
@@ -88,7 +88,7 @@ index faf378d0..6c48ae0e 100644
              {
                  static const dxil_spv_option_extended_non_semantic non_semantic = {
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index a0a01bf1..41e5b9d7 100644
+index b4d0976b..5317fbc1 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -394,26 +394,32 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device, VkSemaphore vk_se
@@ -181,7 +181,7 @@ index a0a01bf1..41e5b9d7 100644
  
          type_info.pNext = &export_info;
      }
-@@ -7189,6 +7218,7 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+@@ -7188,6 +7217,7 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
  
  static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *list)
  {
@@ -189,7 +189,7 @@ index a0a01bf1..41e5b9d7 100644
  #ifdef VKD3D_ENABLE_RENDERDOC
      list->debug_capture = vkd3d_renderdoc_active() && vkd3d_renderdoc_should_capture_shader_hash(0);
  #else
-@@ -9243,6 +9273,28 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
+@@ -9266,6 +9296,28 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
      VKD3D_BREADCRUMB_COMMAND(DRAW_INDEXED);
  }
  
@@ -218,7 +218,7 @@ index a0a01bf1..41e5b9d7 100644
  static void d3d12_command_list_check_pre_compute_barrier(
          struct d3d12_command_list *list, VkPipelineStageFlagBits2 vk_dst_stage)
  {
-@@ -9253,6 +9305,15 @@ static void d3d12_command_list_check_pre_compute_barrier(
+@@ -9276,6 +9328,15 @@ static void d3d12_command_list_check_pre_compute_barrier(
       * Beginning render pass does the same thing. */
      d3d12_command_list_flush_rtas_batch(list);
  
@@ -233,8 +233,8 @@ index a0a01bf1..41e5b9d7 100644
 +
      if ((list->current_meta_flags & (VKD3D_SHADER_META_FLAG_FORCE_GRAPHICS_BEFORE_DISPATCH |
              VKD3D_SHADER_META_FLAG_FORCE_PRE_RASTERIZATION_BEFORE_DISPATCH |
-             VKD3D_SHADER_META_FLAG_FORCE_COMPUTE_BARRIER_BEFORE_DISPATCH)) || list->cmd.clear_uav_pending)
-@@ -9441,6 +9502,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
+             VKD3D_SHADER_META_FLAG_FORCE_COMPUTE_BARRIER_BEFORE_DISPATCH)) ||
+@@ -9466,6 +9527,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
      VkCopyBufferInfo2 copy_info;
      VkBufferCopy2 buffer_copy;
  
@@ -242,7 +242,7 @@ index a0a01bf1..41e5b9d7 100644
      TRACE("iface %p, dst_resource %p, dst_offset %#"PRIx64", src_resource %p, "
              "src_offset %#"PRIx64", byte_count %#"PRIx64".\n",
              iface, dst, dst_offset, src, src_offset, byte_count);
-@@ -11104,6 +11166,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
+@@ -11141,6 +11203,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
      bool alias;
      size_t i;
  
@@ -250,7 +250,7 @@ index a0a01bf1..41e5b9d7 100644
      TRACE("iface %p, dst %p, dst_x %u, dst_y %u, dst_z %u, src %p, src_box %p.\n",
              iface, dst, dst_x, dst_y, dst_z, src, src_box);
  
-@@ -11217,6 +11280,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
+@@ -11267,6 +11330,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
      unsigned int plane_count;
      unsigned int i, j;
  
@@ -258,7 +258,7 @@ index a0a01bf1..41e5b9d7 100644
      TRACE("iface %p, dst_resource %p, src_resource %p.\n", iface, dst, src);
  
      d3d12_command_list_check_render_pass_validation(list, "CopyResource called within a render pass.\n", true);
-@@ -13991,6 +14055,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
+@@ -14048,6 +14112,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
      unsigned int i, j;
  
      TRACE("iface %p, barrier_count %u, barriers %p.\n", iface, barrier_count, barriers);
@@ -266,7 +266,7 @@ index a0a01bf1..41e5b9d7 100644
  
      /* Ignore enhanced barriers. They are much harder to reason about due to the transient nature of Vulkan-style
       * barriers. This is more or less just a workaround too for terribly written games,
-@@ -16837,6 +16902,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewUint(d3
+@@ -17056,6 +17121,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewUint(d3
      struct vkd3d_clear_uav_info args;
      VkClearColorValue color;
  
@@ -274,7 +274,7 @@ index a0a01bf1..41e5b9d7 100644
      TRACE("iface %p, gpu_handle %#"PRIx64", cpu_handle %zx, resource %p, values %p, rect_count %u, rects %p.\n",
              iface, gpu_handle.ptr, cpu_handle.ptr, resource, values, rect_count, rects);
  
-@@ -17004,6 +17070,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewFloat(d
+@@ -17223,6 +17289,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewFloat(d
      struct vkd3d_clear_uav_info args;
      VkClearColorValue color;
  
@@ -282,7 +282,7 @@ index a0a01bf1..41e5b9d7 100644
      TRACE("iface %p, gpu_handle %#"PRIx64", cpu_handle %zx, resource %p, values %p, rect_count %u, rects %p.\n",
              iface, gpu_handle.ptr, cpu_handle.ptr, resource, values, rect_count, rects);
  
-@@ -22780,6 +22847,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_Barrier(d3d12_command_list_ifac
+@@ -23019,6 +23086,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_Barrier(d3d12_command_list_ifac
  
      TRACE("iface %p, NumBarrierGroups %u, D3D12_BARRIER_GROUP %p\n",
              iface, NumBarrierGroups, pBarrierGroups);
@@ -306,7 +306,7 @@ index 8fabb245..588d2335 100644
      win32_handle_info.pNext = NULL;
      win32_handle_info.semaphore = fence->timeline_semaphore;
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index 6064e100..af017710 100644
+index b580de5b..69952ff9 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
 @@ -2438,9 +2438,19 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
@@ -329,7 +329,7 @@ index 6064e100..af017710 100644
          }
      }
  
-@@ -2673,6 +2683,16 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+@@ -2659,6 +2669,16 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
  
      if (physical_device_info->cooperative_matrix_features.cooperativeMatrix)
      {
@@ -346,7 +346,7 @@ index 6064e100..af017710 100644
          if (!vkd3d_supports_minimum_coopmat_caps(device))
          {
              physical_device_info->cooperative_matrix_features.cooperativeMatrix = VK_FALSE;
-@@ -6760,12 +6780,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
+@@ -6746,12 +6766,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
              return DXGI_ERROR_INVALID_CALL;
          }
  
@@ -361,7 +361,7 @@ index 6064e100..af017710 100644
          if (attributes)
              FIXME("attributes %p not handled.\n", attributes);
          if (access)
-@@ -6847,7 +6863,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
+@@ -6833,7 +6849,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
          win32_handle_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
          win32_handle_info.pNext = NULL;
          win32_handle_info.semaphore = fence->timeline_semaphore;
@@ -371,7 +371,7 @@ index 6064e100..af017710 100644
  
          vr = VK_CALL(vkGetSemaphoreWin32HandleKHR(device->vk_device, &win32_handle_info, handle));
  
-@@ -10280,10 +10297,27 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
+@@ -10266,10 +10283,27 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
                  VKD3D_SHADER_TARGET_EXTENSION_WMMA_FP8;
      }
  
@@ -402,10 +402,10 @@ index 6064e100..af017710 100644
  
      if (VKD3D_CONFIG_FLAG_IS_SET(EXTENDED_DEBUG_UTILS))
 diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
-index 25754b76..fbc352a7 100644
+index 39e4b0b6..8d98b93e 100644
 --- a/libs/vkd3d/resource.c
 +++ b/libs/vkd3d/resource.c
-@@ -4404,6 +4404,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+@@ -4405,6 +4405,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
  
  #ifdef _WIN32
          VkImportMemoryWin32HandleInfoKHR import_info;
@@ -413,7 +413,7 @@ index 25754b76..fbc352a7 100644
  #endif
  
          if (FAILED(hr = d3d12_resource_create_vk_resource(object, num_castable_formats, castable_formats, device)))
-@@ -4477,8 +4478,15 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+@@ -4478,8 +4479,15 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
              }
              else
              {
@@ -430,7 +430,7 @@ index 25754b76..fbc352a7 100644
                  export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
                  allocate_info.pNext = &export_info;
              }
-@@ -4522,8 +4530,8 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+@@ -4523,8 +4531,8 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
          if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, allocation)))
              goto fail;
  
@@ -442,7 +442,7 @@ index 25754b76..fbc352a7 100644
          bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
          bind_info.pNext = NULL;
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index 076d5c5c..7842e51d 100644
+index b0ebd552..08f7afe9 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
 @@ -342,6 +342,7 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device,
@@ -453,7 +453,7 @@ index 076d5c5c..7842e51d 100644
  HRESULT vkd3d_enqueue_timeline_semaphore(struct vkd3d_fence_worker *worker,
          const struct vkd3d_fence_wait_info *fence_info,
          const struct vkd3d_queue_timeline_trace_cookie *timeline_cookie);
-@@ -3415,6 +3416,9 @@ struct d3d12_command_list
+@@ -3439,6 +3440,9 @@ struct d3d12_command_list
  
      D3D12_COMMAND_LIST_TYPE type;
      VkQueueFlags vk_queue_flags;

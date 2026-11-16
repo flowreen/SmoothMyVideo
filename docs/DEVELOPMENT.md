@@ -1594,8 +1594,10 @@ FLAGS`, `FfConv` in smv-live.cpp; `SMV_OUT_CONV=0` = off): when the encode takes
 cut, padded or stepped, and one host feeds the encoder (no DLSS 4.5 cascade), the host runs that `-vf` itself, with the
 encoder's `-sws_flags`, in ffmpeg's own `avutil-61.dll` / `avfilter-12.dll` from `engine\bin` (loaded at the first
 such render; another major version = the render stops before its first frame with the reason), and writes p010le;
-the encoder then takes p010le as raw input with no `-vf` (a `setsar` only for a non-square source). The bytes are the
-ones the encoder's own `-vf` made; the encoder's input is half of rgb48le's, the share of ffmpeg's raw-frame ingest that
+the encoder then takes p010le as raw input, and its `-vf` only tags the frames (`setparams` with the colour the
+conversion made: the matrix, HLG's transfer for a Dolby Vision 8.4 video; a `setsar` for a non-square source). The
+bytes are the ones the encoder's own `-vf` made. SDR and RTX HDR (its x2rgb10le frames, PQ and HLG) take this route; the
+encoder's input is half of rgb48le's and three quarters of x2rgb10le's, the share of ffmpeg's raw-frame ingest that
 bounded large renders.
 
 Resident offline host: the exe of that route stays alive between renders as
@@ -2349,12 +2351,12 @@ loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
 vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
-github.com/HansKristian-Work/vkd3d-proton at 87983f34c5cffa6691b7deb665d09d06376772ea with its submodules
-(dxil-spirv at 788f3e22968ee79d145a680279531389b439cb96), then
+github.com/HansKristian-Work/vkd3d-proton at 5b1089c89dbc5cb9f662650feb60d2d3df3e55ca with its submodules
+(dxil-spirv at 114e664efca411c926380b2f3bd1930c1faeaf4d), then
 
 ```
-git apply engine/fsrfg/source/vkd3d-proton-87983f3-smv.patch        (in the vkd3d-proton checkout)
-git apply engine/fsrfg/source/dxil-spirv-788f3e2-smv.patch          (in subprojects/dxil-spirv)
+git apply engine/fsrfg/source/vkd3d-proton-5b1089c-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/dxil-spirv-114e664-smv.patch          (in subprojects/dxil-spirv)
 meson setup build --buildtype=release -Denable_extended_emulation=true
 ninja -C build
 ```

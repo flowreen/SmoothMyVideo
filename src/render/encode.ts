@@ -653,16 +653,20 @@ export function encodePlan(e: EncodeInput, env: Env = process.env): Encode {
   const sarTag = e.sar[0] !== e.sar[1] ? `,setsar=${e.sar[0]}/${e.sar[1]}` : '';
   const keep = e.keep && e.keep > 1 ? e.keep : 1;
   // the host runs the zimg route to p010le itself (its --out-vf / --out-sws in ffmpeg's own avfilter DLL, the same bytes)
-  // for SDR when nothing is cut, padded or stepped: ffmpeg then ingests p010le, half the bytes of rgb48le, and its -vf
-  // only tags the frames (setparams, the colour the encoder's VUI and format negotiation read from them: untagged
-  // frames get the stream's transfer / primaries unknown and a colour conversion of their own)
+  // when nothing is cut, padded or stepped: ffmpeg then ingests p010le (half the bytes of rgb48le, three quarters of
+  // RTX HDR's x2rgb10le, and no conversion on its CPU threads), and its -vf only tags the frames (setparams, the colour
+  // the encoder's VUI and format negotiation read from them: untagged frames get the stream's transfer / primaries
+  // unknown and a colour conversion of their own)
   const hostVf =
-    e.hostConv && !e.hdrActive && outPix === 'p010le' && !pad && !cut && keep === 1 && zimgRoute(e.encInFmt, matrix)
-      ? encodeVf(sp, outPix, e.encInFmt, matrix, null, null, false)
+    e.hostConv && outPix === 'p010le' && !pad && !cut && keep === 1 && zimgRoute(e.encInFmt, matrix)
+      ? encodeVf(sp, outPix, e.encInFmt, matrix, null, null, !!e.hlg)
       : '';
-  // the encoder-side zimg step stamps its matrix on the frames; with the host converting, setparams does, so an
-  // untagged source's output still names the matrix its conversion used
-  const hostSp = sp.some((s) => s.startsWith('colorspace=')) ? sp : sp.concat(`colorspace=${matrix}`);
+  // the encoder-side zimg step stamps what it made on the frames; with the host converting, setparams does: an
+  // untagged source's output still names the matrix its conversion used, an HLG video the transfer it was converted to
+  // (sp names the host's PQ frames, the conversion's input)
+  const hostSp = (sp.some((s) => s.startsWith('colorspace=')) ? sp : sp.concat(`colorspace=${matrix}`)).map((s) =>
+    e.hlg && s.startsWith('color_trc=') ? 'color_trc=arib-std-b67' : s,
+  );
   const vf = hostVf
     ? ['setparams=' + hostSp.join(':')].concat(sarTag ? [sarTag.slice(1)] : []).join(',')
     : (keep > 1 ? `framestep=${keep},` : '') + encodeVf(sp, outPix, e.encInFmt, matrix, pad, cut, !!e.hlg) + sarTag;

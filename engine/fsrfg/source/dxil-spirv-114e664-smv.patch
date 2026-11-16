@@ -1,8 +1,8 @@
 diff --git a/dxil_converter.cpp b/dxil_converter.cpp
-index 98fb6938..19122933 100644
+index 26e858a3..1a42e42c 100644
 --- a/dxil_converter.cpp
 +++ b/dxil_converter.cpp
-@@ -9928,6 +9928,7 @@ void Converter::Impl::set_option(const OptionBase &cap)
+@@ -10026,6 +10026,7 @@ void Converter::Impl::set_option(const OptionBase &cap)
  		auto &float8 = static_cast<const OptionFloat8Support &>(cap);
  		options.wmma_fp8 = float8.wmma_fp8;
  		options.nv_cooperative_matrix2_conversions = float8.nv_cooperative_matrix2_conversions;
@@ -10,7 +10,7 @@ index 98fb6938..19122933 100644
  		break;
  	}
  
-@@ -10096,15 +10097,29 @@ const GlobalConfiguration &GlobalConfiguration::get()
+@@ -10194,15 +10195,29 @@ const GlobalConfiguration &GlobalConfiguration::get()
  	return config;
  }
  
@@ -41,7 +41,7 @@ index 98fb6938..19122933 100644
  			simulate_min16float_min_spec = true;
  #ifdef DXIL_SPIRV_DEBUG_DUMPING
 diff --git a/dxil_converter.hpp b/dxil_converter.hpp
-index ab91bad8..02a9a38e 100644
+index 86c60435..4913347f 100644
 --- a/dxil_converter.hpp
 +++ b/dxil_converter.hpp
 @@ -848,6 +848,7 @@ struct OptionFloat8Support : OptionBase
@@ -53,10 +53,10 @@ index ab91bad8..02a9a38e 100644
  
  struct OptionNvAPI : OptionBase
 diff --git a/dxil_spirv.cpp b/dxil_spirv.cpp
-index 13d3d5ca..c8b32b6f 100644
+index fe517389..698ef915 100644
 --- a/dxil_spirv.cpp
 +++ b/dxil_spirv.cpp
-@@ -268,6 +268,7 @@ struct Arguments
+@@ -270,6 +270,7 @@ struct Arguments
  	bool vkmm = false;
  	bool wmma_fp8 = false;
  	bool wmma_nv_coopmat2 = false;
@@ -64,7 +64,7 @@ index 13d3d5ca..c8b32b6f 100644
  	bool non_semantic = false;
  	bool mixed_float_dot_product = false;
  	bool legacy_structurizer = false;
-@@ -925,7 +926,10 @@ int main(int argc, char **argv)
+@@ -927,7 +928,10 @@ int main(int argc, char **argv)
  	});
  	cbs.add("--full-wmma", [&](CLIParser &parser) {
  		args.wmma_fp8 = parser.next_uint() != 0;
@@ -76,7 +76,7 @@ index 13d3d5ca..c8b32b6f 100644
  	});
  	cbs.add("--shader-quirk", [&](CLIParser &parser) {
  		args.quirks.push_back(dxil_spv_shader_quirk(parser.next_uint()));
-@@ -1323,7 +1327,7 @@ int main(int argc, char **argv)
+@@ -1326,7 +1330,7 @@ int main(int argc, char **argv)
  	if (args.wmma_fp8 || args.wmma_nv_coopmat2)
  	{
  		dxil_spv_option_float8_support wmma = {
@@ -86,10 +86,10 @@ index 13d3d5ca..c8b32b6f 100644
  	}
  
 diff --git a/dxil_spirv_c.cpp b/dxil_spirv_c.cpp
-index b52e1a8f..13b99df3 100644
+index f59e0c71..53e42677 100644
 --- a/dxil_spirv_c.cpp
 +++ b/dxil_spirv_c.cpp
-@@ -1450,6 +1450,7 @@ dxil_spv_result dxil_spv_converter_add_option(dxil_spv_converter converter, cons
+@@ -1452,6 +1452,7 @@ dxil_spv_result dxil_spv_converter_add_option(dxil_spv_converter converter, cons
  		auto *float8 = reinterpret_cast<const dxil_spv_option_float8_support *>(option);
  		helper.wmma_fp8 = float8->wmma_fp8;
  		helper.nv_cooperative_matrix2_conversions = float8->nv_cooperative_matrix2_conversions;
@@ -98,7 +98,7 @@ index b52e1a8f..13b99df3 100644
  		converter->options.emplace_back(duplicate(helper));
  		break;
 diff --git a/dxil_spirv_c.h b/dxil_spirv_c.h
-index da93ba0f..84d38fbc 100644
+index 5f4de3e9..f3c13051 100644
 --- a/dxil_spirv_c.h
 +++ b/dxil_spirv_c.h
 @@ -853,6 +853,8 @@ typedef struct dxil_spv_option_float8_support
@@ -111,7 +111,7 @@ index da93ba0f..84d38fbc 100644
  
  typedef struct dxil_spv_option_nvapi
 diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
-index 02b2ba83..e7e8999e 100644
+index 0da1d9e0..5961e2f7 100644
 --- a/opcodes/converter_impl.hpp
 +++ b/opcodes/converter_impl.hpp
 @@ -171,6 +171,8 @@ public:
@@ -123,7 +123,7 @@ index 02b2ba83..e7e8999e 100644
  	bool simulate_min16float_min_spec = false;
  	bool experimental_unstructured_control_flow = false;
  
-@@ -796,6 +798,7 @@ struct Converter::Impl
+@@ -816,6 +818,7 @@ struct Converter::Impl
  		bool nv_raw_access_chains = false;
  		bool wmma_fp8 = false;
  		bool nv_cooperative_matrix2_conversions = false;
