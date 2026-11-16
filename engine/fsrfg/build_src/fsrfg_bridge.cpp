@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -564,6 +565,23 @@ FSRFG_API int fsrfg_create_i(int i, uint32_t w, uint32_t h, uint32_t luidLow, in
     return 0;
 }
 
+// The pan as FSR's camera step, given by the host right before an fsrfg_frame_i of instance i: mx / my = the frame's
+// pan as the vectors' field (current -> previous, px), on = take it. The camera position then moves by the step that
+// carries a still point at the flat depth's view distance by that pan (FSR reads the camera beside the vectors: one
+// that agrees with them helps where the picture moves with it); on = 0 = no step, the position held. One call's
+// worth: the next call takes nothing unless the host gives it again.
+static float g_camPan[kMaxInstances][2] = {};
+static int g_camOn[kMaxInstances] = {};
+static float g_camPos[kMaxInstances][3] = {};
+FSRFG_API void fsrfg_set_camera_i(int i, float mx, float my, int on)
+{
+    if (i < 0 || i >= kMaxInstances)
+        return;
+    g_camPan[i][0] = mx;
+    g_camPan[i][1] = my;
+    g_camOn[i] = on;
+}
+
 // instance i: the queue waits for `waitValue` (the caller wrote the frame into sh.in and its vectors into sh.mv), then
 // generates the frame halfway between the previous call's frame and this one into sh.out and signals `signalValue`.
 // reset = the first frame of a sequence (no previous frame: sh.out then holds no tween). Non-blocking but for the
@@ -618,6 +636,21 @@ FSRFG_API int fsrfg_frame_i(int i, uint64_t waitValue, uint64_t signalValue, int
     memcpy(prep.cameraUp, up, sizeof(up));
     memcpy(prep.cameraRight, right, sizeof(right));
     memcpy(prep.cameraForward, forward, sizeof(forward));
+    {
+        float* p = g_camPos[i];
+        if (reset)
+            p[0] = p[1] = p[2] = 0.0f;
+        if (g_camOn[i])
+        {
+            // the view distance of the flat depth 0.5 (standard depth, near / far above), the half view height at it
+            const float n = prep.cameraNear, fa = prep.cameraFar;
+            const float z = n / (1.0f - 0.5f * (fa - n) / fa), t = tanf(0.5f * prep.cameraFovAngleVertical);
+            p[0] += 2.0f * g_camPan[i][0] / (float)s.w * z * t * ((float)s.w / (float)s.h);
+            p[1] += -2.0f * g_camPan[i][1] / (float)s.h * z * t;
+        }
+        g_camOn[i] = 0;
+        memcpy(prep.cameraPosition, p, 3 * sizeof(float));
+    }
     if (g_ffx.Dispatch(&s.ctx, &prep.header) != FFX_API_RETURN_OK)
         return l->Close(), fail("ffxDispatch(prepare V2) failed"), -5;
 

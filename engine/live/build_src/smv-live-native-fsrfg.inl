@@ -24,6 +24,7 @@ struct FsrfgBridge
     int (*devices)() = nullptr; // 1 = an own vkd3d device for every instance (optional; an older bridge has none)
     // XeSS-FG's counters of instance i: calls, calls with no frame presented, presents with no call, frames out
     int (*stats)(int, uint64_t*, uint64_t*, uint64_t*, uint64_t*) = nullptr; // optional (the XeSS-FG bridge's)
+    void (*setCamera)(int, float, float, int) = nullptr; // optional (AMD FSR's bridge): the pan as the camera's step
 };
 static FsrfgBridge g_fsrfgK[2];
 static const char* const kFgDll[2] = {"smv_fsrfg_bridge.dll", "smv_xefg_bridge.dll"};
@@ -54,6 +55,7 @@ static bool nativeFsrfgLoad(const std::string& dir, const std::string& cacheDir,
     b.destroy = (void (*)())fn("destroy");
     b.devices = (int (*)())fn("devices");
     b.stats = (int (*)(int, uint64_t*, uint64_t*, uint64_t*, uint64_t*))fn("stats");
+    b.setCamera = (void (*)(int, float, float, int))fn("set_camera_i");
     if (!b.lastError || !b.setCacheDir || !b.provider || !b.createI || !b.frameI || !b.destroy)
     {
         LOG("native: fsrfg: %s lacks an expected export\n", kFgDll[kind]);
@@ -321,6 +323,37 @@ static bool fsrfgPanGuardEnvOn()
         return !(GetEnvironmentVariableA("SMV_FSRFG_PANGUARD", v, sizeof(v)) > 0 && v[0] == '0');
     }();
     return on;
+}
+
+// SMV_FSRFG_CAMERA=0: no pan as AMD FSR's camera step (fsrfgCameraStep)
+static bool fsrfgCameraEnvOn()
+{
+    static const bool on = [] {
+        char v[8] = "";
+        return !(GetEnvironmentVariableA("SMV_FSRFG_CAMERA", v, sizeof(v)) > 0 && v[0] == '0');
+    }();
+    return on;
+}
+
+// AMD FSR 4 FG reads the camera beside the vectors: a camera step that agrees with them helps where the picture moves
+// with it, one that disagrees costs, and FSR reads the camera's motion over two consecutive pairs. So instance 0's call
+// gets the frame's pan as the camera's step only where the pan guard took the pan for the TWO pairs before (their
+// vectors were the pan itself), read from the decisions already copied to the host (fsrfgSeenRecord's ring, an event
+// query, never a wait: waiting cost 1 ms a pair at 1080p 2x); every other call gets none (1080p, 2x, a ~430 px a frame
+// pan the optical flow loses: +1.3 dB, with a still subtitle line +1.5 dB, no tween worse; every pair the guard leaves
+// alone byte for byte as without it)
+static void fsrfgCameraStep(const NativeRife& nr, const FsrfgBridge& br, int i, bool reset)
+{
+    if (!br.setCamera)
+        return;
+    const NativeRife::FgPanIn& p = nr.fgPanIn;
+    bool on = i == 0 && !reset && fsrfgCameraEnvOn() && nr.fgPanHave && p.on > 0.0f && nr.hFgSeen && nr.fgSeenN >= 3;
+    for (uint64_t back = 2; on && back <= 3; back++)
+    {
+        const int k = (int)((nr.fgSeenN - back) % NativeRife::kFgSeen);
+        on = cudaEventQuery(nr.fgSeenEv[k]) == cudaSuccess && nr.hFgSeen[k] > 0.5f;
+    }
+    br.setCamera(i, p.mx, p.my, on ? 1 : 0);
 }
 
 // the pan guard block of fgOf's field slot (out[slot]), null = no guard this session (the lever, no pan measured yet)
@@ -715,6 +748,7 @@ static bool nativeFsrfgFeed(NativeRife& nr, int i, const uint8_t* frame, const u
     // the frame time changes neither FSR 4's output (a 24 and a 60 fps run byte for byte the same) nor XeSS-FG's (33 and
     // 0 ms the same): one 60 Hz frame
     const FsrfgBridge& br = g_fsrfgK[nr.fgKind];
+    fsrfgCameraStep(nr, br, i, reset);
     const int rc = br.frameI(i, ready, done, reset ? 1 : 0, 1000.0 / 60.0);
     if (nr.fgProf)
         nr.fgCpuMs += (double)(nowQpc100() - c0) / 10000.0;
