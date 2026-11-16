@@ -379,7 +379,11 @@ static void fsrfgPanFill(NativeRife::FgPanIn& p, const panvec::Result& r)
     p.n = (float)n;
 }
 
-// a frame's pan at its px (fw x fh) into nr.fgPanIn at the working size, for the pair the frame closes
+// a frame's pan at its px (fw x fh) into nr.fgPanIn at the working size, for the pair the frame closes. Intel XeSS-FG
+// gets no still rects: where the guard takes the pan, the pan covers the still areas too, because XeSS-FG keeps a still
+// overlay still by itself and zero vectors on the still tiles drag the moving picture inside them (1080p, frame
+// generation 2x, a 432 px a frame pan the optical flow loses: +0.25 dB, with a still subtitle line +0.33 dB and its
+// glyphs +0.59 dB); AMD FSR 4 draws what the vectors say, so its still tiles stay zero (given the pan, the glyphs -3.0 dB)
 static void fsrfgPanTake(NativeRife& nr, const NativeRife::FgPanIn& in, float fw, float fh)
 {
     const float sx = (float)nr.w / fw, sy = (float)nr.h / fh;
@@ -387,8 +391,8 @@ static void fsrfgPanTake(NativeRife& nr, const NativeRife::FgPanIn& in, float fw
     p.on = in.on;
     p.mx = in.mx * sx;
     p.my = in.my * sy;
-    p.n = in.n;
-    for (int k = 0; k < 4 * (int)in.n; k += 4)
+    p.n = nr.fgKind == 1 ? 0.0f : in.n;
+    for (int k = 0; k < 4 * (int)p.n; k += 4)
     {
         p.rect[k] = in.rect[k] * sx;
         p.rect[k + 1] = in.rect[k + 1] * sy;
