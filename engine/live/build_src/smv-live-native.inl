@@ -3507,23 +3507,63 @@ __global__ void k_fuMvScale(const unsigned int* __restrict__ src, int srcPitch, 
                 : (unsigned int)f2h(kx * h2f((unsigned short)(v & 0xFFFFu))) |
                       ((unsigned int)f2h(ky * h2f((unsigned short)(v >> 16))) << 16);
 }
-// the upscaler after Live DLSS 4.5, its field once an input (R16G16_FLOAT texels, w x h, backward vectors over
-// the field's span; an exact zero = gated) at a shown frame `adv` of that span after the frame it was measured at: a
-// pixel's content was where the field's own vector, times adv, points from it (content moves against a backward
-// vector), so the field is read there (the nearest texel, clamped to the frame), times k = this frame's step over the
-// span; an exact zero stays zero
-__global__ void k_fuMvAdvect(const unsigned int* __restrict__ src, int srcPitch, int w, int h,
-                             unsigned int* __restrict__ dst, int dstPitch, float adv, float k)
+// an ABGR8 pixel's luma (R + 2G + B; rows pitch bytes apart), clamped to the w x h frame
+__device__ __forceinline__ int fuLuma(const unsigned char* __restrict__ f, int pitch, int w, int h, int x, int y)
+{
+    x = min(max(x, 0), w - 1);
+    y = min(max(y, 0), h - 1);
+    const unsigned char* p = f + (size_t)y * pitch + 4 * x;
+    return (int)p[0] + 2 * (int)p[1] + (int)p[2];
+}
+// the upscaler after Live DLSS 4.5: its field (as k_fuMvAdvect reads it) pushed forward to a shown frame `adv` of its
+// span later: every texel q, a zero vector too, lands on the texel nearest q - adv * F(q) (its content moves against
+// the backward vector), and where several land the one whose 3 x 3 luma around q in the field's frame fa best matches
+// the 3 x 3 around the landing texel in this frame fs wins (ABGR8 frames, rows fp bytes apart): a 64-bit atomicMin of
+// (the difference + 1) over the texel's bits, acc cleared to all ones first. The match picks the content that is
+// really there, so a still overlay keeps its own zero where a moving background lands under it
+__global__ void k_fuMvSplat(const unsigned int* __restrict__ src, int srcPitch, int w, int h,
+                            unsigned long long* __restrict__ acc, float adv, const unsigned char* __restrict__ fa,
+                            const unsigned char* __restrict__ fs, int fp)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
-    const unsigned int v0 = src[(size_t)y * (srcPitch >> 2) + x];
-    const float ax = v0 ? adv * h2f((unsigned short)(v0 & 0xFFFFu)) : 0.0f;
-    const float ay = v0 ? adv * h2f((unsigned short)(v0 >> 16)) : 0.0f;
-    const int sx = min(w - 1, max(0, __float2int_rn((float)x + ax)));
-    const int sy = min(h - 1, max(0, __float2int_rn((float)y + ay)));
-    const unsigned int v = src[(size_t)sy * (srcPitch >> 2) + sx];
+    const unsigned int v = src[(size_t)y * (srcPitch >> 2) + x];
+    const float fx = v ? h2f((unsigned short)(v & 0xFFFFu)) : 0.0f, fy = v ? h2f((unsigned short)(v >> 16)) : 0.0f;
+    const int px = __float2int_rn((float)x - adv * fx), py = __float2int_rn((float)y - adv * fy);
+    if (px < 0 || py < 0 || px >= w || py >= h) return;
+    int d = 0;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++)
+            d += abs(fuLuma(fa, fp, w, h, x + i, y + j) - fuLuma(fs, fp, w, h, px + i, py + j));
+    atomicMin(acc + (size_t)py * w + px, ((unsigned long long)(d + 1) << 32) | v);
+}
+// the upscaler after Live DLSS 4.5, its field once an input (R16G16_FLOAT texels, w x h, backward vectors over
+// the field's span; an exact zero = gated) at a shown frame `adv` of that span after the frame it was measured at: a
+// texel k_fuMvSplat landed on (acc, w x h, null = none) takes the vector that landed there; any other pixel's content
+// was where the field's own vector, times adv, points from it (content moves against a backward vector), so the field
+// is read there (the nearest texel, clamped to the frame); times k = this frame's step over the span; an exact zero
+// stays zero
+__global__ void k_fuMvAdvect(const unsigned int* __restrict__ src, int srcPitch, int w, int h,
+                             unsigned int* __restrict__ dst, int dstPitch, float adv, float k,
+                             const unsigned long long* __restrict__ acc)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const unsigned long long a = acc ? acc[(size_t)y * w + x] : ~0ull;
+    unsigned int v;
+    if (a != ~0ull)
+        v = (unsigned int)(a & 0xFFFFFFFFull);
+    else
+    {
+        const unsigned int v0 = src[(size_t)y * (srcPitch >> 2) + x];
+        const float ax = v0 ? adv * h2f((unsigned short)(v0 & 0xFFFFu)) : 0.0f;
+        const float ay = v0 ? adv * h2f((unsigned short)(v0 >> 16)) : 0.0f;
+        const int sx = min(w - 1, max(0, __float2int_rn((float)x + ax)));
+        const int sy = min(h - 1, max(0, __float2int_rn((float)y + ay)));
+        v = src[(size_t)sy * (srcPitch >> 2) + sx];
+    }
     dst[(size_t)y * (dstPitch >> 2) + x] =
         v == 0u ? 0u
                 : (unsigned int)f2h(k * h2f((unsigned short)(v & 0xFFFFu))) |

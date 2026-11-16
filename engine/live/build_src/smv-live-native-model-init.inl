@@ -808,8 +808,9 @@ static void nativeFree(NativeRife& nr)
         cudaStreamDestroy(nr.puSt);
         nr.puSt = nullptr;
     }
-    for (void** p : {(void**)&nr.dPuIn, (void**)&nr.dPuOut, (void**)&nr.dPuPl, (void**)&nr.dPuPres, (void**)&nr.dPuView,
-                     (void**)&nr.dPuRem, (void**)&nr.dPuTmp, (void**)&nr.dPuFin, (void**)&nr.dPuMvSet})
+    for (void** p :
+         {(void**)&nr.dPuIn, (void**)&nr.dPuOut, (void**)&nr.dPuPl, (void**)&nr.dPuPres, (void**)&nr.dPuView,
+          (void**)&nr.dPuRem, (void**)&nr.dPuTmp, (void**)&nr.dPuFin, (void**)&nr.dPuMvSet, (void**)&nr.dPuSplat})
         if (*p)
         {
             cudaFree(*p);

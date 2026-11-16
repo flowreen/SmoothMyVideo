@@ -917,6 +917,8 @@ struct NativeRife
     double puFrMul = 0.0;
     uint8_t* dPuMvSet = nullptr;
     int puMvSetPitch = 0;
+    unsigned long long* dPuSplat = nullptr; // the field pushed forward to a shown frame (k_fuMvSplat), puW x puH
+    int puSplatW = 0, puSplatH = 0;
     float* dPuPl = nullptr;
     float* dPuPres = nullptr;
     // HDR (puHdr): the frame's R10G10B10A2 PQ words -> its code planes (dPuPl) -> their SDR view (dPuView, puW x puH)
@@ -1021,6 +1023,7 @@ struct NativeRife
         fBgraRgbaFsr = nullptr, fRgbaBgra = nullptr, fOddEdge = nullptr, // FSR upscaling: BGRA8 <-> RGBA8; VSR's slot
         fFuMvScale = nullptr,                                            // its chained passes' vectors
         fFuMvAdvect = nullptr, // the upscaler after Live DLSS 4.5: its field once an input, at a later frame
+        fFuMvSplat = nullptr,  // that field pushed forward to the later frame
         fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr, // offline DLSS 4.5 frames, RTX VSR
         fUnpackR10 = nullptr;
     CUfunction fFitAaH = nullptr, fFitAaV = nullptr, fRsTab = nullptr;           // the separable fit, its tap tables

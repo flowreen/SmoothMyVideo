@@ -249,6 +249,25 @@ static bool nativeFsrupSetup(NativeRife& nr, int w, int h, int ow, int oh, cudaS
 static volatile LONGLONG g_wdogHold = 0;
 static constexpr int kFsrCompileMs = 180000;
 
+// The upscaler after Live DLSS 4.5 reads its field once an input at every later shown frame (k_fuMvAdvect). Reading it
+// back from each pixel loses a moving object once it has moved past its own place at the field's frame (the pixel finds
+// the background's vector there), so the field is pushed forward first (k_fuMvSplat), each landing decided by which
+// content matches the shown frame, and the read-back only fills what nothing landed on. FSR 2x after DLSS 4.5 15x at
+// 640x360 -> 1280x720, an 80 px square stepping 120 px a 10 fps source frame over a still background: the share of
+// half-red edge pixels a frame (median over 210 shown frames) 0.0017 % -> 0.0000 %; a still striped box over a 24 px a
+// frame pan 0.0504 % -> 0.0501 % (a push without the match, the longest vector winning, smeared it: 0.0620 %); the same
+// presented rate at 1440p / 360 (208.5 / 207.7 fps). AMD FSR only: Intel XeSS's halo on the square is already 0.0001 %,
+// the push raised the striped box's to 0.0520 % and cost ~1.6 % of the rate. SMV_FSRUP_STAGE_SPLAT=0 = the read-back
+// alone
+static bool fsrupSplatEnvOn()
+{
+    static const bool on = [] {
+        char v[8] = "";
+        return !(GetEnvironmentVariableA("SMV_FSRUP_STAGE_SPLAT", v, sizeof(v)) > 0 && v[0] == '0');
+    }();
+    return on;
+}
+
 // one frame of the slot's stream: nr.dVsrIn (tight BGRA8 ri) upscaled into nr.dVsrOut (tight BGRA8 ro), queued on st;
 // the frame into the bridge's buffer and the vector session's slot, the vectors from the previous frame's slot (the
 // stream's first frame: zero vectors and a reset), the bridge's queue waits on the stream and the stream on the bridge.
@@ -318,7 +337,24 @@ static bool nativeFsrupEval(NativeRife& nr, const RtxRect& ri, const RtxRect& ro
         if (vecMode == 2)
             mark(2);
         int setPitch = nr.puMvSetPitch, mvPitch = nr.fuMvPitch;
-        void* sc[] = {&nr.dPuMvSet, &setPitch, &w, &h, &nr.dFuMv, &mvPitch, &vecAdv, &vecScale};
+        // the push forward (fsrupSplatEnvOn) once the frame lies past the field's own frame; the field's frame = the
+        // kept slot (prev: this frame packed into the spare one), this frame = cur
+        CUdeviceptr acc = 0;
+        if (vecAdv > 0.0f && nr.fuKind == 0 && nr.dPuSplat && nr.puSplatW == w && nr.puSplatH == h)
+        {
+            CUdeviceptr fa = nr.fuOf.inP[prev], fs = nr.fuOf.inP[cur];
+            int fp = (int)nr.fuOf.inPitch;
+            void* sp[] = {&nr.dPuMvSet, &setPitch, &w, &h, &nr.dPuSplat, &vecAdv, &fa, &fs, &fp};
+            if (cudaMemsetAsync(nr.dPuSplat, 0xFF, (size_t)w * h * 8, st) != cudaSuccess ||
+                cuLaunchKernel(nr.fFuMvSplat, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, sp,
+                               nullptr) != CUDA_SUCCESS)
+            {
+                nativeFail(nr, "fsr upscale vector push failed");
+                return false;
+            }
+            acc = (CUdeviceptr)nr.dPuSplat;
+        }
+        void* sc[] = {&nr.dPuMvSet, &setPitch, &w, &h, &nr.dFuMv, &mvPitch, &vecAdv, &vecScale, &acc};
         if (cuLaunchKernel(nr.fFuMvAdvect, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, (CUstream)st, sc, nullptr) !=
             CUDA_SUCCESS)
         {

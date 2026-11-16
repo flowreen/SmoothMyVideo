@@ -666,6 +666,16 @@ static bool nativePresentUpKind(NativeRife& nr, int kind)
             NCHK(cudaMalloc((void**)&nr.dPuMvSet, (size_t)nr.puMvSetPitch * h), "the upscaler after DLSS 4.5: vectors");
         }
         NCHK(cudaMemset(nr.dPuMvSet, 0, (size_t)nr.puMvSetPitch * h), "the upscaler after DLSS 4.5: vector clear");
+        // AMD FSR's field pushed forward to each later frame (nativeFsrupEval, fsrupSplatEnvOn)
+        if (nr.fuKind == 0 && fsrupSplatEnvOn() && (!nr.dPuSplat || nr.puSplatW != w || nr.puSplatH != h))
+        {
+            if (nr.dPuSplat)
+                cudaFree(nr.dPuSplat);
+            nr.dPuSplat = nullptr;
+            NCHK(cudaMalloc((void**)&nr.dPuSplat, (size_t)w * h * 8), "the upscaler after DLSS 4.5: vector push");
+            nr.puSplatW = w;
+            nr.puSplatH = h;
+        }
         nr.puVecSrc = ~0u;
         nr.fuHdr = hdr;
         bool ok = nativeFsrupSetup(nr, w, h, uw, uh, nr.puSt);
