@@ -1617,6 +1617,12 @@ bytes are the ones the encoder's own `-vf` made. SDR and RTX HDR (its x2rgb10le 
 encoder's input is half of rgb48le's and three quarters of x2rgb10le's, the share of ffmpeg's raw-frame ingest that
 bounded large renders.
 
+DLSS 4.5 at a target between whole multiples (`dlssgFpsPlan`: 24 -> 60 fps = 5x, then every 2nd frame) keeps its
+frames in the host: the pass that feeds the encoder gets `--keep K` and its writer sends output frames 0, K, 2K ...
+(the frames an encoder-side `framestep=K` keeps, the same bytes) and drops the rest before the pipe; the encoder then
+takes the kept frames as an ordinary render, the conversion above included. `SMV_HOST_KEEP=0` = every frame to the
+encoder and its `framestep` drops them. `--keep` refuses a resumed render (such a render is not resumable anyway).
+
 Resident offline host: the exe of that route stays alive between renders as
 `smv-live.exe --offline --resident --pipe NAME` with the kernel module loaded (the same per-process
 cache as the resident live host), so a later render pays only its own buffers instead of the process
@@ -2029,6 +2035,7 @@ named here, and on a name here that no source holds.
 | `DLSSG_VERBOSE=1` | NGX's log lines on stderr, in the live host's DLSS 4.5 stages and in `dlssg2f.exe`; the live host's loop trace lines |
 | `SMV_OFFLINE_GRAPH=1` | the IFNets' CUDA graphs on for offline renders (off by default) |
 | `SMV_NATIVE_ARCH=75` | every NVRTC module compiled as compute_75 PTX that the driver JIT-compiles for the running card (cached as `<tag>_<hash>_ptx75.ptx`): the RTX 20 code paths run on a newer GPU; a test lever, never a product setting |
+| `SMV_HOST_KEEP=0` | a DLSS 4.5 render at a target between whole multiples: the host writes every frame and the encoder's `framestep` drops the ones the file skips, instead of the host keeping every K-th frame itself (`--keep`); A/B lever |
 | `SMV_OFFLINE_RESIDENT=0` / `SMV_OFFLINE_RESIDENT_IDLE_S` / `SMV_OFFLINE_HOST_PIPE` / `SMV_OFFLINE_HOST_LOG` | one exe per plain RIFE render instead of the resident offline host / its idle limit in seconds (default 600) / its pipe name (the app sets one per process) / a file for its stderr |
 | `SMV_HANDOFF_DUMP=1` | the live host logs every handoff line it answers |
 | `SMV_NR_NOHOOK=1`, `SMV_NR_HOOKLOG=1` | DLSS 5 caller hook off / trace |

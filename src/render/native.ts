@@ -850,6 +850,10 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     (env.SMV_OUT_CONV || '') !== '0' &&
     !CASCADE &&
     ['avutil-61.dll', 'avfilter-12.dll'].every((d) => fs.existsSync(path.join(ENGINE, 'bin', d)));
+  // DLSS 4.5 at a target between whole multiples: the host keeps every DG_KEEP-th output frame itself (--keep, on the
+  // pass that feeds the encoder), so the dropped frames never cross the pipe and the encoder takes the kept ones as an
+  // ordinary render (the host's conversion too); SMV_HOST_KEEP=0 = every frame to the encoder, its framestep drops them
+  const HOST_KEEP = DG_KEEP > 1 && (env.SMV_HOST_KEEP || '') !== '0';
   const encArgs = {
     ffmpeg: FFMPEG,
     inp,
@@ -877,7 +881,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     dvOrHp: DV_ACTIVE || HP_ACTIVE,
     hlg: HLG_OUT,
     inRateStr: IN_RATE,
-    keep: DG_KEEP,
+    keep: HOST_KEEP ? 1 : DG_KEEP,
     subsBeside: SUBS_BESIDE,
     hostConv: HOST_CONV,
   };
@@ -940,6 +944,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   if (kind === 'xefg') nargs.push('--xess-fg');
   if (kind === 'nvvfg') nargs.push('--nvvfg');
   if (kind === 'dlssg') nargs.push('--dlssg');
+  if (HOST_KEEP && !CASCADE) nargs.push('--keep', String(DG_KEEP));
   if (FPS_MODE && !NO_INTERP) nargs.push('--fps-ratio', pyFloatRepr(ratio as number));
   // a cascade's first pass ends at the working size: its last pass makes the final resize, and RTX VSR / the FSR
   // upscaler stay on the one resize that enlarges (here the decode's to the working size only when no final one exists)
@@ -1067,6 +1072,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       cacheDir,
       '--dlssg',
     ];
+    if (last && HOST_KEEP) a.push('--keep', String(DG_KEEP));
     if (last && lastResize) {
       a.push('--out-w', String(OUT_W), '--out-h', String(OUT_H));
       if (RTX_VSR) a.push('--rtx-vsr', ...VSR_Q);

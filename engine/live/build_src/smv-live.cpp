@@ -800,6 +800,7 @@ static int runProbe(HWND target, int frames, const wchar_t* dumpPath)
 //               [--nr-delta PATH]] [--sharpen S]
 //               [--rtx-hdr ...]
 //               [--out-vf FILTERS [--out-sws FLAGS]] (the encoder's conversion to p010le run here, FfConv)
+//               [--keep K] (only every K-th output frame leaves: DLSS 4.5 at a target between whole multiples)
 // Raw frames in on stdin (W*H*bpp each, the decoder pipe the render already runs), raw frames out on
 // stdout in the same pixfmt (the encoder pipe), or with --out-vf as the encoder's p010le. Real frames go
 // out from the host buffer they came in (bit exact); the N-1 tweens of every pair run pack-in, Head
@@ -1127,6 +1128,9 @@ struct OfflineIo
     std::condition_variable cv;
     bool readerEof = false, fail = false;
     uint64_t framesIn = 0, framesOut = 0, totalFrames = 0, lastPairs = 0;
+    int keep = 1;         // --keep: the writer writes output frames 0, keep, 2 keep ... (framesOut counts them all)
+    uint64_t keepSeq = 0; // output frames the writer has seen, written or dropped
+    uint64_t written = 0; // output frames that left on the pipe
     int multi = 2;
     bool frameUnits = false; // --no-interp: PROGRESS counts frames over --frames
     double fpsRatio = 0.0;   // --fps mode: pairs close on the output rate's slot grid, not per multi
@@ -1365,15 +1369,21 @@ static void offlineWriter(OfflineIo* io)
         }
         if (it.kind == 2)
             break;
+        // --keep: output frames 0, keep, 2 keep ... leave; the others are counted as made and dropped here
+        const bool leave = io->keep <= 1 || io->keepSeq++ % (uint64_t)io->keep == 0;
         if (it.kind == 0)
         {
-            if (io->conv ? !ffConvWrite(*io->conv, io->hStdout, io->hIn[it.idx])
-                         : !offlineWriteAll(io->hStdout, io->hIn[it.idx], io->frameBytes))
+            if (leave && (io->conv ? !ffConvWrite(*io->conv, io->hStdout, io->hIn[it.idx])
+                                   : !offlineWriteAll(io->hStdout, io->hIn[it.idx], io->frameBytes)))
             {
                 io->setFail("writer: real frame write failed");
                 return;
             }
-            offlineThumb(io, io->hIn[it.idx]); // kind 0 = same pixfmt, no passes: the output frame as is
+            if (leave)
+            {
+                io->written++;
+                offlineThumb(io, io->hIn[it.idx]); // kind 0 = same pixfmt, no passes: the output frame as is
+            }
             {
                 std::lock_guard<std::mutex> lk(io->m);
                 io->inWritten[it.idx] = 1;
@@ -1389,13 +1399,17 @@ static void offlineWriter(OfflineIo* io)
                 io->setFail("writer: tween event sync failed");
                 return;
             }
-            if (io->conv ? !ffConvWrite(*io->conv, io->hStdout, io->hOut[it.idx])
-                         : !offlineWriteAll(io->hStdout, io->hOut[it.idx], io->frameBytesOut))
+            if (leave && (io->conv ? !ffConvWrite(*io->conv, io->hStdout, io->hOut[it.idx])
+                                   : !offlineWriteAll(io->hStdout, io->hOut[it.idx], io->frameBytesOut)))
             {
                 io->setFail("writer: tween write failed");
                 return;
             }
-            offlineThumb(io, io->hOut[it.idx]);
+            if (leave)
+            {
+                io->written++;
+                offlineThumb(io, io->hOut[it.idx]);
+            }
             {
                 std::lock_guard<std::mutex> lk(io->m);
                 io->outFree.push_back(it.idx);
@@ -1428,6 +1442,9 @@ static void offlineWriter(OfflineIo* io)
         io->setFail("writer: the conversion's end failed");
         return;
     }
+    if (io->keep > 1)
+        LOG("offline: --keep %d: %llu of %llu output frames left on the pipe\n", io->keep,
+            (unsigned long long)io->written, (unsigned long long)io->framesOut);
     LOG("OUTFRAMES %llu\n", (unsigned long long)(io->outBase + io->framesOut));
 }
 
@@ -1844,6 +1861,8 @@ struct OfflineArgs
     bool vfg = false;                  // --nvvfg: NVIDIA Video Frame Generation (FRUC's route, NVIDIA's own runtime)
     double fpsRatio = 0.0; // --fps-ratio R: --fps mode, the render's ratio (round-trip text: the same double)
     bool dlssg = false;    // --dlssg: DLSS 4.5, the dlssg2f.exe --server child (DgChild), 2x..6x
+    int keep = 1; // --keep K: only every K-th output frame leaves (0, K, 2K ...: ffmpeg's framestep), DLSS 4.5 at a
+                  // target between whole multiples; the rest are made and dropped before the pipe
     // resume: the render's mapping (src/render/resume.ts). The decoder already skipped
     // to source frame P, so this run's pair i is the render's pair P + i (the --fps grid, the
     // closing slot); its first D outputs are banked already and are dropped BEFORE any pass (no
@@ -1935,6 +1954,8 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
         }
         else if (wcscmp(argv[i], L"--dlssg") == 0)
             oa.dlssg = true;
+        else if (wcscmp(argv[i], L"--keep") == 0 && i + 1 < argc)
+            oa.keep = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--fps-ratio") == 0 && i + 1 < argc)
             oa.fpsRatio = wcstod(argv[++i], nullptr);
         else if (wcscmp(argv[i], L"--cache") == 0 && i + 1 < argc)
@@ -2079,6 +2100,11 @@ static bool offlineArgsValid(const OfflineArgs& oa)
     if (oa.dlssg && (oa.multi < 2 || oa.multi > 6))
     {
         LOG("offline: --dlssg generates 1..5 frames per pair: --multi 2..6\n");
+        return false;
+    }
+    if (oa.keep < 1 || oa.keep > 64 || (oa.keep > 1 && oa.resumed))
+    {
+        LOG("offline: --keep K writes every K-th output frame: 1 <= K <= 64, and no --resume-pair with K > 1\n");
         return false;
     }
     return true;
@@ -2719,6 +2745,7 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
     io.nIn = 4;
     io.nOut = 3;
     io.totalFrames = frames;
+    io.keep = oa.keep;
     io.multi = multi;
     io.frameUnits = oa.echo;
     io.fpsRatio = fpsMode ? ratio : 0.0;
