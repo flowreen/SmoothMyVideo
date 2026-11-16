@@ -4,8 +4,16 @@
 // camera pan (past ~60-90 px a frame) it loses track: the new frames melt or show people twice. The presenter measures
 // how far the picture moved since the frame it presented before (luma thumbnails at 1/4, 1/16 and 1/32 of the size, a
 // coarse-to-fine SAD search, a sub-pixel fit) and, when one translation explains the change, tags it as the vectors.
-// Tiles a still picture explains better (subtitles, logos, the edge of a letterbox bar) keep zero vectors. Everything
-// else keeps the exact zero vectors, so those frames stay the ones DLSS-G made without this.
+// Tiles a still picture explains better (subtitles, logos, the edge of a letterbox bar) are measured as `still`
+// rectangles. AMD FSR 4 frame generation's pan guard, which has no motion estimate of its own, keeps them still.
+// DLSS-G's texture takes the translation over them too while they cover at most kStillKeep (10 %) of the frame: with
+// the flat depth it is given, DLSS-G keeps small still things still by its own flow and loses its edges where moving
+// background gets zero vectors (1080p, frame generation 2x, against zero vectors on the still tiles: a still subtitle
+// over a 32 px a frame pan +2.9 dB over the frame, +7.7 dB in the 24 px around the text, +2.1 dB in the text itself;
+// a still 800 x 120 box +8.3 dB; a still top 8.9 % of the frame +2.9 dB, every tween better). A larger still area keeps
+// zero vectors: there DLSS-G's first frames after a clip start follow the vectors and drag the still part (a still top
+// 14 % of the frame: its first tween 44.9 dB against 56.7, the whole frame -0.3 dB; 33 %: 32.7 against 55.8). A frame
+// no translation explains keeps the exact zero vectors, so it stays the one DLSS-G made without this.
 #pragma once
 #include <emmintrin.h>
 #include <immintrin.h>
@@ -15,7 +23,8 @@ namespace panvec
 {
 
 // what the vector texture holds: off = all zero; on = (mx, my) pixels, current -> previous (a pixel sat at x + mx,
-// y + my one frame earlier), except the `still` rectangles, which stay zero
+// y + my one frame earlier); `still` = the tiles a still picture explains better, frame pixels: zero in the texture
+// only when they cover more than kStillKeep of the frame (the FSR 4 frame generation pan guard keeps them still always)
 struct Result
 {
     bool on = false;
@@ -422,7 +431,7 @@ class Estimator
             return r;
 
         // tiles: the translation must explain most of the changed ones; the ones a still picture explains clearly
-        // better keep zero. A tile row's sums row by row: the SAD against the same place two tiles a SSE2 step (each
+        // better become the still rectangles. A tile row's sums row by row: the SAD against the same place two tiles a SSE2 step (each
         // 64-bit lane of _mm_sad_epu8 = one tile's 8 bytes), against the moved place a tile a step where the tile lies
         // inside the overlap, pixel by pixel at its edges
         static_assert(kTile == 8, "the tile sums take 8 bytes a lane");
@@ -542,6 +551,8 @@ class Estimator
 // DLSS-G's depth and motion vector textures are the frame / kVecDiv per axis: the generated frames are byte for byte
 // the full-size textures' at a quarter of the bytes (the still rects sit on 32 px tiles, so they scale exactly)
 constexpr uint32_t kVecDiv = 2;
+// the still rectangles' share of the frame above which they keep zero vectors in DLSS-G's texture (the header says why)
+constexpr double kStillKeep = 0.10;
 inline uint32_t vecSize(uint32_t n)
 {
     return (n + kVecDiv - 1) / kVecDiv;
@@ -600,7 +611,12 @@ struct Writer
         {
             const float v[4] = {r.mx / fw, r.my / fh, 0, 0};
             list->ClearUnorderedAccessViewFloat(g, c, tex, v, 0, nullptr);
-            if (!r.still.empty())
+            // the still rectangles keep zero only when they cover more than kStillKeep of the frame (the header says
+            // why)
+            double area = 0;
+            for (const D3D12_RECT& q : r.still)
+                area += (double)(q.right - q.left) * (q.bottom - q.top);
+            if (area > kStillKeep * (double)fw * fh)
             {
                 D3D12_RESOURCE_BARRIER u{};
                 u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

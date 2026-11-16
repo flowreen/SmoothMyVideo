@@ -1259,14 +1259,22 @@ the new frames melt or show people twice, at x2 as at x6). `dlssg2f --server` an
 every frame they upload against the frame before it: luma thumbnails at 1/4, 1/16 and 1/32 of the size, a full SAD search at 1/32 (up to 384 px
 each way), refines at 1/16 and 1/4, a sub-pixel fit. When one translation explains the change (its error under 0.6 x
 the still picture's, and at least half of the changed 32 px tiles agree), the vector texture holds it, written by a
-UAV clear; tiles a still picture explains clearly better (subtitles, logos, the edge of a letterbox bar) stay zero.
-The depth and vector textures DLSS-G is given are half the frame per axis (`panvec::kVecDiv`; the still tiles scale
+UAV clear. Tiles a still picture explains clearly better (subtitles, logos, the edge of a letterbox bar) are measured as
+still rectangles: they get the pan too while they cover at most 10 % of the frame (`panvec::kStillKeep`), and zero
+vectors above that. With the flat depth it is given, DLSS-G keeps a small still thing still by its own flow and loses
+its edges where moving background gets zero vectors; a large still area given the pan is dragged along on the first
+frames after a clip start, before DLSS-G has history. Measured at 1080p, frame generation 2x, against zero vectors on
+the still tiles, the tweens against the exact truth: a still subtitle over a 32 px a frame pan +2.9 dB (+7.7 dB in the
+24 px around the text, +2.1 dB in the text), a still 800 x 120 box +8.3 dB, a still top 8.9 % of the frame +2.9 dB with
+every tween better; a still top of 14 % given the pan: its first tween's still part 44.9 dB against 56.7, the frame
+-0.3 dB (33 %: 32.7 against 55.8), which is why those keep zero. AMD FSR 4 frame generation's pan guard keeps every
+still rectangle still (it has no motion estimate of its own). The depth and vector textures DLSS-G is given are half the frame per axis (`panvec::kVecDiv`; the still tiles scale
 exactly): the generated frames are byte for byte the full-size textures' at a quarter of the bytes.
 Anything else, and every move under 1 px, keeps the exact zero vectors, so those frames are the ones DLSS-G made
 without it. A stage fed from another stage's ring (Live's second and third passes) measures nothing: the ring's
 header carries each frame's MOTION (`Stage1Hdr` after `atOnce`, `motionMagic` set): its place on the first stage's
 input timeline (input n at n, its tween k of g + 1 at n - 1 + k / (g + 1)), the input interval it lies in and that
-interval's pan with its still tiles. The stage's vectors for its pair a -> b are each interval's pan times the share
+interval's pan with its still tiles (the 10 % rule above applies to them the same way). The stage's vectors for its pair a -> b are each interval's pan times the share
 of it between the two frames (`pairMotion`; an interval without a pan, a slot holding more than 96 still rectangles,
 or a move under 1 px = zero vectors, the first stage's rule), and its own frames carry the same fields on, so a third
 stage reads the second the same way; a ring without the motion block (an older stage) gives zero vectors with a line.
