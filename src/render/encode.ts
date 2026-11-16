@@ -84,29 +84,59 @@ export function runChecked(cmd: string[]): void {
 }
 
 // --- decode -----------------------------------------------------------------------------------
-/** (the decode -vf chain, the frames to discard from the pipe instead). select counts the stream's frames while the
- * decoder's own rate conversion runs after it (a video that starts after the file gets its first frame repeated
- * there): the fps filter first (rate = the source's num/den) puts select on the numbering of the frames a plain decode
- * emits, so a cut at resumeSkip continues that decode exactly. */
+/** The frames a seeked decode starts ahead of its cut: the fps filter sees the frames around the cut as a whole decode
+ * does. */
+const DEC_SEEK_MARGIN = 48;
+
+/** (the decode -vf chain, the frames to discard from the pipe instead, the input arguments that seek). select counts
+ * the stream's frames while the decoder's own rate conversion runs after it (a video that starts after the file gets
+ * its first frame repeated there): the fps filter first (rate = the source's num/den) puts select on the numbering of
+ * the frames a plain decode emits, so a cut at resumeSkip continues that decode exactly. A cut past DEC_SEEK_MARGIN
+ * frames in an indexed container (seekIndexed) seeks the input (`-ss T0`, T0 = DEC_SEEK_MARGIN frames before the cut)
+ * instead of decoding every frame before it: a seeked input's timestamps start at the seek, `setpts=PTS+T0/TB` puts
+ * them back on the plain decode's timeline, so the numbering stays the same (SMV_DEC_SEEK=0 = decode from the start).
+ * A VFR source is cut in the pipe (the second value). */
 export function decodeFilters(
   resumeSkip: number,
   vfrDec: string[],
   imgScaleVf: string[],
   rate: string,
-): [string[], number] {
+  indexed = false,
+  env: Env = process.env,
+): [string[], number, string[]] {
   const vfr = vfrDec.length > 0;
+  const [num, den] = (rate || '').split('/').map(Number);
+  const from = resumeSkip - DEC_SEEK_MARGIN;
+  const t0 =
+    resumeSkip && !vfr && indexed && env.SMV_DEC_SEEK !== '0' && from > 0 && num > 0 && den > 0
+      ? ((from * den) / num).toFixed(6)
+      : '';
   const filters =
-    resumeSkip && !vfr ? [`fps=${rate}:start_time=0,select=gte(n\\,${resumeSkip}),setpts=PTS-STARTPTS`] : [];
-  return [filters.concat(imgScaleVf), resumeSkip && vfr ? resumeSkip : 0];
+    resumeSkip && !vfr
+      ? [
+          (t0 ? `setpts=PTS+${t0}/TB,` : '') +
+            `fps=${rate}:start_time=0,select=gte(n\\,${resumeSkip}),setpts=PTS-STARTPTS`,
+        ]
+      : [];
+  return [filters.concat(imgScaleVf), resumeSkip && vfr ? resumeSkip : 0, t0 ? ['-ss', t0] : []];
 }
 
 /** The raw-frame decoder argv (stdout = the frame pipe); -sws_flags = accurate rounding for the conversions
- * swscale still does (the pack to the pipe's format, a source zimg does not take). */
-export function decodeCmd(ffmpeg: string, inp: string, vfrDec: string[], filters: string[], decFmt: string): string[] {
+ * swscale still does (the pack to the pipe's format, a source zimg does not take); seek = decodeFilters' input
+ * arguments. */
+export function decodeCmd(
+  ffmpeg: string,
+  inp: string,
+  vfrDec: string[],
+  filters: string[],
+  decFmt: string,
+  seek: string[] = [],
+): string[] {
   return [
     ffmpeg,
     '-v',
     'error',
+    ...seek,
     '-i',
     inp,
     '-sws_flags',

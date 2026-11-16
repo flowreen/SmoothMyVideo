@@ -30,7 +30,18 @@ import {
 } from './encode';
 import { isGmfss, nvofRefusal, RenderArgs, workPlan } from './plan';
 import { thumbPng } from './preview';
-import { decodeRgbVf, frameCount, needMkv, outputRate, probe, probeTracks, sourceBits, tag, vfrConform } from './probe';
+import {
+  decodeRgbVf,
+  frameCount,
+  needMkv,
+  outputRate,
+  probe,
+  probeTracks,
+  seekIndexed,
+  sourceBits,
+  tag,
+  vfrConform,
+} from './probe';
 import { pyFixed, pyFloatRepr, pyG, pyRound } from './pyfmt';
 import {
   applyResume,
@@ -434,7 +445,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const encFirstOk = encWorksAsync(FFMPEG, ENC_FIRST);
   const power = powerQuery();
 
-  let { w: W, h: H, num, den, nb: NB, st: ST } = probe(FFPROBE, inp);
+  let { w: W, h: H, num, den, nb: NB, st: ST, fmt: SRC_FMT } = probe(FFPROBE, inp);
   const vfr = vfrConform(ST, num, den);
   [num, den] = [vfr.num, vfr.den];
   const VFR_DEC = vfr.flags;
@@ -815,11 +826,12 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     if (hp.note) dvhpNote = hp.note;
   }
   // the decode's colour conversion: inside the downscale's chain, else its own (zimg, empty = swscale's)
-  const [decFilters, pipeDiscard] = decodeFilters(
+  const [decFilters, pipeDiscard, decSeek] = decodeFilters(
     R.skipSrc,
     VFR_DEC,
     IMG_SCALE_VF.length ? IMG_SCALE_VF : decodeRgbVf(ST, W, H),
     `${num}/${den}`,
+    seekIndexed(SRC_FMT),
   );
 
   // the encoder
@@ -1148,7 +1160,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
       if (v !== undefined && /^\s*[+-]?\d+\s*$/.test(v)) nout = parseInt(v, 10);
     } else if (ln) say('[native] ' + ln + '\n');
   };
-  const decCmd = decodeCmd(FFMPEG, inp, VFR_DEC, decFilters, DEC_FMT);
+  const decCmd = decodeCmd(FFMPEG, inp, VFR_DEC, decFilters, DEC_FMT, decSeek);
   const spawnOpts = { cwd: ENGINE, windowsHide: true };
   /** One decoder, one host of its own (`--offline hargs`) and one encoder, joined by two pipes. Each ffmpeg keeps the
    * end of its pipe that was made for it, which is opened for synchronous I/O; the host takes node's two ends, which
@@ -1238,9 +1250,10 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     const vf = IMG_SCALE_VF.length ? IMG_SCALE_VF : decodeRgbVf(ST, W, H);
     const rate = `${num}/${den}`;
     // a chunk's decoder = the whole render's decode from its first frame (decodeFilters' cut at that pair: one
-    // numbering), cut after its last frame
+    // numbering, the input seeked ahead of it), cut after its last frame
     const decOf = (k: Chunk) => {
-      const dec = decodeCmd(FFMPEG, inp, VFR_DEC, decodeFilters(k.p, VFR_DEC, vf, rate)[0], DEC_FMT);
+      const [kf, , ks] = decodeFilters(k.p, VFR_DEC, vf, rate, seekIndexed(SRC_FMT));
+      const dec = decodeCmd(FFMPEG, inp, VFR_DEC, kf, DEC_FMT, ks);
       if (k.i + 1 < n) dec.splice(dec.lastIndexOf('-f'), 0, '-frames:v', String(k.end + 1 - k.p));
       return dec;
     };

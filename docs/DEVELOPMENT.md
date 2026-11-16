@@ -1564,7 +1564,10 @@ over about 6% of its output, which bounds the Restore then VSR cases. Resume and
 banking: a fragmented part file, a
 sidecar and the resume mapping; the decoder starts at the resume source
 frame (`decodeFilters`: `fps=num/den:start_time=0` before the `select`, so the cut counts the frames a plain decode
-emits, which repeats frame 0 when the video starts after the file does) and `native.ts` tells the host `--resume-pair P --resume-out C --resume-drop D` (the render's
+emits, which repeats frame 0 when the video starts after the file does; in an MP4 / MOV / Matroska source a cut past
+48 frames seeks the input to 48 frames before it, `-ss T0` with `setpts=PTS+T0/TB` putting the frames back on the
+plain decode's timeline, instead of decoding every earlier frame; MPEG-TS and the other containers without a seek
+index decode from the start, a seek there can land after its time; the same cut starts every later file-split chunk) and `native.ts` tells the host `--resume-pair P --resume-out C --resume-drop D` (the render's
 index of its first decoded frame for the `--fps` grid and the closing slot; the banked output
 count for PROGRESS / OUTFRAMES; the outputs this run would repeat, dropped at each emission point
 before any pass: on-grid the pair's real frame plus its banked tween slots, `--fps` and DRBA the
@@ -2045,6 +2048,7 @@ named here, and on a name here that no source holds.
 | `SMV_NATIVE_ARCH=75` | every NVRTC module compiled as compute_75 PTX that the driver JIT-compiles for the running card (cached as `<tag>_<hash>_ptx75.ptx`): the RTX 20 code paths run on a newer GPU; a test lever, never a product setting |
 | `SMV_HOST_KEEP=0` | a DLSS 4.5 render at a target between whole multiples: the host writes every frame and the encoder's `framestep` drops the ones the file skips, instead of the host keeping every K-th frame itself (`--keep`); A/B lever |
 | `SMV_OFFLINE_RESIDENT=0` / `SMV_OFFLINE_RESIDENT_IDLE_S` / `SMV_OFFLINE_HOST_PIPE` / `SMV_OFFLINE_HOST_LOG` | one exe per plain RIFE render instead of the resident offline host / its idle limit in seconds (default 600) / its pipe name (the app sets one per process) / a file for its stderr |
+| `SMV_DEC_SEEK=0` | A resume or a later file-split chunk decodes the source from its start and drops the frames before its cut, instead of seeking an MP4 / MOV / Matroska input to 48 frames ahead of the cut; A/B: the same frames |
 | `SMV_HANDOFF_DUMP=1` | the live host logs every handoff line it answers |
 | `SMV_NR_NOHOOK=1`, `SMV_NR_HOOKLOG=1` | DLSS 5 caller hook off / trace |
 | `SMV_NR_RESET_EVERY=1` | DLSS 5 resets its history on every frame and gets no motion vectors (both routes; the live pass as it ran before motion vectors), for A/Bs and tests; never a product setting |

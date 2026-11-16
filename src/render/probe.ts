@@ -14,6 +14,15 @@ export interface Probe {
   den: number;
   nb: number;
   st: Stream;
+  /** the container's format_name, e.g. "mov,mp4,m4a,3gp,3g2,mj2" */
+  fmt: string;
+}
+
+/** A container whose demuxer seeks through an index (MP4 / MOV, Matroska / WebM): a keyframe seek there lands at or
+ * before the time asked. MPEG-TS and the other index-free containers can land after it, so a decode that must start
+ * exactly reads them from the start. */
+export function seekIndexed(fmt: string): boolean {
+  return fmt.split(',').some((f) => f === 'mov' || f === 'mp4' || f === 'matroska' || f === 'webm');
 }
 
 function ffprobeText(ffprobe: string, args: string[]): string {
@@ -43,17 +52,18 @@ export function probe(ffprobe: string, path: string): Probe {
     'v:0',
     '-show_entries',
     'stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,codec_name,pix_fmt,' +
-      'bits_per_raw_sample,color_space,color_transfer,color_primaries,color_range,sample_aspect_ratio',
+      'bits_per_raw_sample,color_space,color_transfer,color_primaries,color_range,sample_aspect_ratio:format=format_name',
     '-of',
     'json',
     path,
   ]);
-  const st: Stream = (JSON.parse(out).streams || [{}])[0];
+  const js = JSON.parse(out);
+  const st: Stream = (js.streams || [{}])[0];
   const w = toInt(String(st.width)),
     h = toInt(String(st.height));
   const [num, den] = splitRate(st.r_frame_rate, '0/1');
   const nb = /^\d+$/.test(String(st.nb_frames || '')) ? toInt(String(st.nb_frames)) : 0;
-  return { w, h, num: toInt(num), den: toInt(den || '1'), nb, st };
+  return { w, h, num: toInt(num), den: toInt(den || '1'), nb, st, fmt: String((js.format || {}).format_name || '') };
 }
 
 /** A colour / format tag of the stream, null when absent or a placeholder. */
