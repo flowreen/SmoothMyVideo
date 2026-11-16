@@ -1036,7 +1036,8 @@ struct NativeRife
     CUfunction fFsrHdrIn = nullptr, fFsrHdrOut = nullptr, fFsrHdrPack = nullptr; // AMD FSR upscaling on HDR planes
     CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                      // its vertical pass + the slot store
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr,    // live Restore
-        fRestFoldHSub = nullptr, fA4kFoldHSub = nullptr, fA4kFold2x = nullptr, fRestToF = nullptr, fClamp01 = nullptr;
+        fRestFoldHSub = nullptr, fA4kFoldHSub = nullptr, fA4kFold2x = nullptr, fRestToF = nullptr, fClamp01 = nullptr,
+               fRestFoldHSubT = nullptr; // the fold's shared-memory form (SMV_REST_FOLD=old = fRestFoldHSub)
     CUfunction fRestConv0 = nullptr, fRestConvMid = nullptr, fRestConvLast = nullptr; // Restore on the host's kernels
     CUfunction fAjFirst = nullptr, fAjAtt = nullptr, fAjCat = nullptr;                // AnimeJaNai's own three
     CUfunction fPadPlanar = nullptr; // the decoded frame into the model frame
@@ -1064,6 +1065,7 @@ struct NativeRife
     CUfunction fPackBgraSdr = nullptr, fUnpackBgraSdr = nullptr;              // FRUC's SDR pairs on HDR planes
     CUfunction fHdrRestOut = nullptr;                                         // Restore's way back on HDR planes
     CUfunction fLocalCorr = nullptr;                                          // gmflow's local correlation, fused
+    CUfunction fLocalCorrT = nullptr; // the same on the tensor cores (the default; SMV_GM_LCORR=old = fLocalCorr)
     CUfunction fAttn2 = nullptr;      // gmflow's global matching and propagation (k_attn2)
     CUfunction fFuTail = nullptr;     // GMFSS fusion's pixel shuffle + conv_last on the cut graph's out (k_fuTail)
     CUfunction fFuTailNhwc = nullptr; // the same on a channels-last out (k_fuTailNhwc)

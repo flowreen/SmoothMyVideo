@@ -724,6 +724,70 @@ __global__ void k_restFoldHSub(const void* __restrict__ sub, int half, const voi
     tmp[2 * plane + o] = a2;
 }
 
+// k_restFoldHSub with each virtual pixel read once (the default; SMV_REST_FOLD=old = the form above): a block = 64
+// output columns of 4 virtual rows; per row the virtual columns its taps reach (lo .. hi, at most `span`) are loaded,
+// base-added and clamped into shared memory once, then every output sums its taps from there in the same order with
+// the same weights = the same fp32 sums. A tap outside the loaded run (a window wider than the axis) reads its pixel
+// directly the old way. Shared memory: 4 x 3 x span floats.
+__device__ __forceinline__ float restFoldPix(const void* __restrict__ sub, int half, const void* __restrict__ in,
+                                             int inHalf, int s, size_t ps, size_t row, size_t sy, size_t cs, int c, int i)
+{
+    const int x = i / s;
+    const size_t o = row + x;
+    const size_t p = sy + (size_t)(i - x * s) * ps + o;
+    const float v = restRaw(sub, half, c * cs + p) + (in ? restRaw(in, inHalf, c * ps + o) : 0.0f);
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+__global__ void __launch_bounds__(256)
+    k_restFoldHSubT(const void* __restrict__ sub, int half, const void* __restrict__ in, int inHalf, int s, int w, int h,
+                    int ow, int oh, float* __restrict__ tmp, int dw, const RsTap* __restrict__ tab, int span)
+{
+    extern __shared__ float rfT[];
+    const int ox0 = blockIdx.x * 64, ox = ox0 + (int)threadIdx.x;
+    const int Y = blockIdx.y * 4 + (int)threadIdx.y;
+    const int fs = rsTaps(ow, dw);
+    const int lo = max(0, rsBegin(ox0, ow, dw, fs));
+    const int hi = min(ow - 1, rsBegin(min(ox0 + 63, dw - 1), ow, dw, fs) + fs - 1);
+    const int n = min(hi - lo + 1, span);
+    float* sm = rfT + (size_t)threadIdx.y * 3 * span;
+    const int y = Y / s;
+    const size_t ps = (size_t)w * h, row = (size_t)y * w, cs = (size_t)s * s * ps;
+    const size_t sy = (size_t)(Y - y * s) * s * ps;
+    if (Y < oh)
+        for (int j = (int)threadIdx.x; j < n; j += 64)
+            for (int c = 0; c < 3; c++)
+                sm[c * span + j] = restFoldPix(sub, half, in, inHalf, s, ps, row, sy, cs, c, lo + j);
+    __syncthreads();
+    if (ox >= dw || Y >= oh) return;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    for (int k = 0; k < fs; k++)
+    {
+        const RsTap t = tab[(size_t)k * dw + ox];
+        const int j = t.i - lo;
+        float v0, v1, v2;
+        if (j >= 0 && j < n)
+        {
+            v0 = sm[j];
+            v1 = sm[span + j];
+            v2 = sm[2 * span + j];
+        }
+        else
+        {
+            v0 = restFoldPix(sub, half, in, inHalf, s, ps, row, sy, cs, 0, t.i);
+            v1 = restFoldPix(sub, half, in, inHalf, s, ps, row, sy, cs, 1, t.i);
+            v2 = restFoldPix(sub, half, in, inHalf, s, ps, row, sy, cs, 2, t.i);
+        }
+        a0 += t.w * v0;
+        a1 += t.w * v1;
+        a2 += t.w * v2;
+    }
+    const size_t plane = (size_t)oh * dw;
+    const size_t o = (size_t)Y * dw + ox;
+    tmp[o] = a0;
+    tmp[plane + o] = a1;
+    tmp[2 * plane + o] = a2;
+}
+
 // Real-ESRGAN animevideov3 on the host's own kernels (restNat): k_restConv0 (3 -> 64 + PReLU),
 // 16 x k_restConvMid (64 -> 64 + PReLU), k_restConvLast (64 -> 48 sub-pixel planes = k_restFoldHSub's input); between
 // them channels-last fp16 (64 halves = 128 B a pixel). The 64 -> 64 layers are implicit GEMMs on the tensor cores
@@ -4727,6 +4791,117 @@ extern "C" __global__ void k_localCorr(const unsigned short* __restrict__ qf, fl
         const float top = __fmaf_rn(d[1], ax, __fmul_rn(d[0], bx));
         const float bot = __fmaf_rn(ax, d[gs + 1], __fmul_rn(d[gs], bx));
         out[((size_t)b * HW + p) * K + k] = __fmaf_rn(by, top, __fmul_rn(ay, bot));
+    }
+}
+
+// k_localCorr's dots on the tensor cores (the default; SMV_GM_LCORR=old = the warp-a-pixel form above): a warp = 16
+// consecutive pixels of one row, a block = 4 warps (128 threads, grid = ceil(B H ceil(W / 16) / 4)). The pixels of a
+// row share the window's row origin oy, their column origins ox grow with x (normalize_coords is monotonic), so the 11
+// x 11 tap grids of the 16 pixels lie inside 32 grid columns from the first pixel's ox: per tap row, Q [16 x 128] x F
+// [128 x 32] on mma m16n8k16 (fp16 products, fp32 accumulation; SMV_MMA_F32, so RTX 20 runs the same text as two k8
+// halves), each pixel keeps its 11 dots in shared memory; grid points outside the frame are zero (GridSample's zero
+// padding). Then the same bilinear combine with its roundings pinned. The dots' fp32 sum order is the tensor cores',
+// so the outputs differ from the warp form in their last bits (random fp16 features: mean error against fp64 within
+// 1-10 % of the warp form's, about 4e-6 of the outputs' size); 4.0x faster at 1080p's quarter, 4.8x at 4K's
+extern "C" __global__ void __launch_bounds__(128) k_localCorrT(const unsigned short* __restrict__ qf,
+                                                               float* __restrict__ out, int B, int H, int W, int HW,
+                                                               int K)
+{
+    __shared__ float dots[4][16][121];
+    __shared__ int sox[4][16];
+    const int wib = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int segs = (W + 15) >> 4;
+    const int seg = blockIdx.x * 4 + wib;
+    if (seg >= B * H * segs) return; // a whole warp (the block shares no barrier)
+    const int b = seg / (H * segs), rem = seg % (H * segs), py = rem / segs, px0 = (rem % segs) * 16;
+    int side = 1;
+    while (side * side < K) side++;
+    const int r = side / 2, gs = side + 2;
+    const float cxn = 0.5f * (float)(W - 1), cyn = 0.5f * (float)(H - 1);
+    float mny = 1e30f;
+    for (int dy = 0; dy < side; dy++)
+    {
+        const float gy = __fdiv_rn((float)(py + dy - r) - cyn, cyn);
+        mny = fminf(mny, floorf((gy + 1.f) * 0.5f * (float)(H - 1)));
+    }
+    const int oy = (int)mny;
+    if (lane < 16)
+    {
+        const int px = px0 + lane;
+        float mnx = 1e30f;
+        for (int dx = 0; dx < side; dx++)
+        {
+            const float gx = __fdiv_rn((float)(px + dx - r) - cxn, cxn);
+            mnx = fminf(mnx, floorf((gx + 1.f) * 0.5f * (float)(W - 1)));
+        }
+        sox[wib][lane] = (int)mnx;
+    }
+    __syncwarp();
+    const int xbase = sox[wib][0];
+    // the A fragments of Q (rows g and g + 8 = the segment's pixels, 8 k-steps of 16 channels)
+    const int g = lane >> 2, t = lane & 3;
+    const int pA = px0 + g, pB = px0 + g + 8;
+    const unsigned* qa = (const unsigned*)(qf + ((size_t)b * HW + (size_t)py * W + (pA < W ? pA : 0)) * 128);
+    const unsigned* qb = (const unsigned*)(qf + ((size_t)b * HW + (size_t)py * W + (pB < W ? pB : 0)) * 128);
+    unsigned a[8][4];
+    for (int ks = 0; ks < 8; ks++)
+    {
+        const int w0 = ks * 8 + t;
+        a[ks][0] = pA < W ? qa[w0] : 0u;
+        a[ks][1] = pB < W ? qb[w0] : 0u;
+        a[ks][2] = pA < W ? qa[w0 + 4] : 0u;
+        a[ks][3] = pB < W ? qb[w0 + 4] : 0u;
+    }
+    const unsigned short* fb = qf + (size_t)(B + b) * HW * 128;
+    for (int j = 0; j < gs; j++)
+    {
+        const int yy = oy + j;
+        float acc[4][4];
+        for (int nt = 0; nt < 4; nt++)
+            acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
+        if (yy >= 0 && yy < H)
+            for (int nt = 0; nt < 4; nt++)
+            {
+                const int xx = xbase + nt * 8 + g;
+                const bool inF = xx >= 0 && xx < W;
+                const unsigned* fp = (const unsigned*)(fb + ((size_t)yy * W + (inF ? xx : 0)) * 128);
+                for (int ks = 0; ks < 8; ks++)
+                {
+                    const unsigned b0 = inF ? fp[ks * 8 + t] : 0u, b1 = inF ? fp[ks * 8 + t + 4] : 0u;
+                    asm volatile(SMV_MMA_F32 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                 : "+f"(acc[nt][0]), "+f"(acc[nt][1]), "+f"(acc[nt][2]), "+f"(acc[nt][3])
+                                 : "r"(a[ks][0]), "r"(a[ks][1]), "r"(a[ks][2]), "r"(a[ks][3]), "r"(b0), "r"(b1));
+                }
+            }
+        // D rows g, g + 8 x columns 2t, 2t + 1 of each n-tile: a pixel keeps the columns inside its own 11
+        for (int nt = 0; nt < 4; nt++)
+            for (int h = 0; h < 2; h++)
+            {
+                const int m = g + 8 * h;
+                for (int c = 0; c < 2; c++)
+                {
+                    const int cx = xbase + nt * 8 + 2 * t + c - sox[wib][m];
+                    if (cx >= 0 && cx < gs) dots[wib][m][j * gs + cx] = acc[nt][2 * h + c];
+                }
+            }
+    }
+    __syncwarp();
+    for (int i = lane; i < 16 * K; i += 32)
+    {
+        const int m = i / K, k = i % K, px = px0 + m;
+        if (px >= W) continue;
+        const float gx = __fdiv_rn((float)(px + k % side - r) - cxn, cxn);
+        const float gy = __fdiv_rn((float)(py + k / side - r) - cyn, cyn);
+        const float x = (gx + 1.f) * 0.5f * (float)(W - 1);
+        const float y = (gy + 1.f) * 0.5f * (float)(H - 1);
+        const float x0f = floorf(x), y0f = floorf(y);
+        const float ax = x - x0f, ay = y - y0f;
+        const int cx = (int)x0f - sox[wib][m], cy = (int)y0f - oy;
+        const float* d = dots[wib][m] + cy * gs + cx;
+        const float bx = 1.f - ax, by = 1.f - ay;
+        const float top = __fmaf_rn(d[1], ax, __fmul_rn(d[0], bx));
+        const float bot = __fmaf_rn(ax, d[gs + 1], __fmul_rn(d[gs], bx));
+        out[((size_t)b * HW + (size_t)py * W + px) * K + k] = __fmaf_rn(by, top, __fmul_rn(ay, bot));
     }
 }
 

@@ -67,8 +67,18 @@ static bool restFold(NativeRife& nr, cudaStream_t st, void* out, int outHalf, bo
     int ps4 = w4 * h4;
     void* ah[] = {&out, &outHalf, &ps4, &w4, &w4, &h4, &tmp, &tw, (void*)&tabH};
     void* ahs[] = {&out, &outHalf, (void*)&base, &baseHalf, &s, &subW, &subH, &w4, &h4, &tmp, &tw, (void*)&tabH};
-    if (cuLaunchKernel(sub ? nr.fRestFoldHSub : nr.fRestFoldH, (tw + 15) / 16, (h4 + 15) / 16, 1, 16, 16, 1, 0,
-                       (CUstream)st, sub ? ahs : ah, nullptr) != CUDA_SUCCESS)
+    // the sub-pixel fold reads each virtual pixel once through shared memory (4 rows x 3 planes x span floats, at most
+    // 48 KB), SMV_REST_FOLD=old = a thread an output reading every tap's pixel itself
+    static const bool foldOld = lkEnv("SMV_REST_FOLD") == "old";
+    int span = (int)((63LL * w4 + tw - 1) / tw) + lzTaps(w4, tw) + 2;
+    const unsigned spanBytes = 4u * 3u * (unsigned)span * 4u;
+    void* aht[] = {&out, &outHalf, (void*)&base, &baseHalf, &s, &subW, &subH, &w4, &h4, &tmp, &tw, (void*)&tabH, &span};
+    const bool tile = sub && !foldOld && spanBytes <= 48u * 1024u;
+    const CUresult fr = tile ? cuLaunchKernel(nr.fRestFoldHSubT, (tw + 63) / 64, (h4 + 3) / 4, 1, 64, 4, 1, spanBytes,
+                                              (CUstream)st, aht, nullptr)
+                             : cuLaunchKernel(sub ? nr.fRestFoldHSub : nr.fRestFoldH, (tw + 15) / 16, (h4 + 15) / 16, 1,
+                                              16, 16, 1, 0, (CUstream)st, sub ? ahs : ah, nullptr);
+    if (fr != CUDA_SUCCESS)
     {
         nr.die("restFoldH launch failed");
         return false;

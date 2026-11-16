@@ -2020,6 +2020,8 @@ named here, and on a name here that no source holds.
 |---|---|
 | `SMV_TRT_CACHE` | the model cache's location (the kernels' cubins; default `model_cache_safe_to_delete` in the app's top folder) |
 | `SMV_GM_SPLAT=old` | GMFSS's splats by the scatter kernels (k_splatSoft + k_splatNorm) instead of the gather ones (A/B; the same output) |
+| `SMV_GM_LCORR=old` | GMFlow's local correlation by the warp-a-pixel kernel (k_localCorr, exact fp32 dot sums) instead of its tensor-core form (k_localCorrT); A/B: the outputs differ in their last bits |
+| `SMV_REST_FOLD=old` | The sub-pixel fold of Real-ESRGAN / AnimeJaNai (Restore and both upscalers) by the thread-an-output kernel (k_restFoldHSub, every tap reads its own pixel) instead of the shared-memory form (k_restFoldHSubT); A/B: the same frames |
 | `SMV_GM_SCRATCH=own` | GMFSS's pair scratch in its own buffers instead of carved from the splat accumulator (A/B; the same output) |
 | `SMV_GM_CTXSHARE=0` | each of GMFSS's nets on its own activation block instead of the one block they share (A/B) |
 | `SMV_FU_R4=0` | GMFSS's fusion net never runs a wide conv as its 4-row twin (A/B; the same output) |

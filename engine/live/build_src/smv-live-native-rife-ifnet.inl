@@ -281,8 +281,10 @@ __device__ __forceinline__ void ifInBody(const unsigned short* __restrict__ x, c
     }
 }
 
-#define IF_IN(K)                                                                                                       \
-    extern "C" __global__ void __launch_bounds__(256)                                                                  \
+// LB = the launch bounds: k_ifIn3h asks for two blocks an SM (128 registers and a small spill run faster than one
+// block at the compiler's 146); k_ifIn1h and k_ifIn2h keep the compiler's pick (two blocks run k_ifIn2h slower)
+#define IF_IN(K, LB)                                                                                                   \
+    extern "C" __global__ void __launch_bounds__ LB                                                                    \
         k_ifIn##K##h(const unsigned short* __restrict__ x, const unsigned short* __restrict__ f0,                      \
                      const unsigned short* __restrict__ f1, const unsigned short* __restrict__ ts, int W, int H,        \
                      const float* __restrict__ t0, const float* __restrict__ t1, const float* __restrict__ t2,         \
@@ -290,9 +292,9 @@ __device__ __forceinline__ void ifInBody(const unsigned short* __restrict__ x, c
     {                                                                                                                  \
         ifInBody<K>(x, f0, f1, ts, W, H, t0, t1, t2, t3, out);                                                         \
     }
-IF_IN(1)
-IF_IN(2)
-IF_IN(3)
+IF_IN(1, (256))
+IF_IN(2, (256))
+IF_IN(3, (256, 2))
 
 )IFNSRC";
 static const char kIfnB[] = R"IFNSRC(

@@ -206,8 +206,12 @@ static bool nativeGmfssPair(NativeRife& nr, float* dPrev, float* dCur, bool need
     }
     int nb = 2, hw4 = nr.gmH * nr.gmW;
     void* ac[] = {(void*)&nr.dGmA[0], (void*)&nr.dGmCorr, &nb, &nr.gmH, &nr.gmW, &hw4, &nr.gmK};
-    if (cuLaunchKernel(nr.fLocalCorr, (unsigned)((2LL * hw4 * 32 + 127) / 128), 1, 1, 128, 1, 1, 0, (CUstream)st, ac,
-                       nullptr) != CUDA_SUCCESS)
+    // the tensor-core form (16 pixels of a row a warp, 4 warps a block); SMV_GM_LCORR=old = a warp a pixel
+    static const bool lcOld = lkEnv("SMV_GM_LCORR") == "old";
+    const unsigned lcGrid =
+        lcOld ? (unsigned)((2LL * hw4 * 32 + 127) / 128) : (unsigned)((2LL * nr.gmH * ((nr.gmW + 15) / 16) + 3) / 4);
+    if (cuLaunchKernel(lcOld ? nr.fLocalCorr : nr.fLocalCorrT, lcGrid, 1, 1, 128, 1, 1, 0, (CUstream)st, ac, nullptr) !=
+        CUDA_SUCCESS)
     {
         nr.die("gmfss local correlation launch failed");
         return false;
