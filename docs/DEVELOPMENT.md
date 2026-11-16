@@ -1728,7 +1728,10 @@ running kind's own state released (`nativeUpRelease`: the bridges' instances, An
 buffers and weights; RTX VSR keeps NGX, a switch back reuses its feature), the buffers the slot store reads, the room
 check and the kind's setup as the session start runs it. AMD FSR / Intel XeSS run their first two frames on a worker
 thread (`nativeFsrupWarmProc`): the driver compiles FSR's shaders inside them (about 30 s for an exe location and
-ratio it has not seen), and the session presents without the upscaler until they end. `a4kaa` (Anime4K's Mode A+A,
+ratio it has not seen), and the session presents without the upscaler until they end. RTX VSR's first create in the
+process runs on a worker the same way (`nativeUpVsrProc`): NGX loads NVIDIA's model there, about 1.7 s at 480x270 ->
+960x540 on an RTX 5090 Laptop GPU, which held the picture that long on the thread that makes the frames; a `dlssnr 1`
+meanwhile waits for it, since DLSS 5's core starts after the RTX Video bridge's NGX create, never beside it. `a4kaa` (Anime4K's Mode A+A,
 sent before `up`): off = Anime4K's first pass skips the Restore CNN on its 2x frame (the buffers stay); on = Anime4K's
 resize buffers set up again with the A+A sizes at the session's geometry (`nativeA4kAaSwitch`, the room check first:
 short = Mode A with its reason); while Anime4K is not set up the value is held for its start in place. Restore in a
@@ -2054,6 +2057,7 @@ named here, and on a name here that no source holds.
 | `SMV_HDR_RESIZE_VIEW=0` | on HDR planes the resize to the working size and Restore's reference run on the PQ / HLG codes for every frame instead of an SDR-range frame's SDR view (its ringing then crosses white and its pairs leave the SDR range); A/B lever, never a product setting |
 | `SMV_VSR_HDR=0` / `SMV_FSRUP_HDR=0` | on HDR planes (live) and HDR video (`--src-hdr`): Lanczos instead of RTX VSR on the frame's SDR view / instead of AMD FSR upscaling in its HDR mode; the refusal triggers of their gates |
 | `SMV_TWEEN_FP16=1` | RIFE and DRBA store their tweens in fp16 (`k_rifeBlend`) instead of fp32 (`k_rifeBlendF`), half the tween buffer and a second rounding (about 9 % of 10-bit codes one off); the host logs `RIFE's tweens are stored in fp16`; A/B lever, never a product setting |
+| `SMV_VSR_CREATE=fail` | RTX VSR's create for an upscaler started in a running Live session (`set up 1`) and for the upscaler after Live DLSS 4.5, in a process that has not made the feature yet, counts as failed (`rtx_video_api_cuda_create failed (SMV_VSR_CREATE=fail)`): Lanczos instead; a session's start through `nativeRtxInit` is not affected; the trigger test of that failure, never a product setting |
 | `SMV_VSR_SYNC=1` | RTX VSR runs through the bridge's blocking export (a drain of the stream before each call, a device-wide sync after it) instead of the event-ordered one, and the host times each call (`RTX VSR eval N ms mean`); the same path an older bridge without the async export takes; A/B lever, never a product setting |
 | `SMV_VRAM_MIB=<MiB>` | the GPU's memory as the app's memory checks see it, the free memory shrinks with it (both routes): a smaller card's trigger test of the cap and of the `video memory ran out` line on a card everything fits in |
 | `SMV_DLSSG_DIR`, `SMV_DLSSNR_DIR`, `SMV_NVOFFRUC_DIR`, `SMV_FSRFG_DIR`, `SMV_FSRUP_DIR`, `SMV_RTXVIDEO_DIR`, `SMV_NVVFX_DIR` | override the runtime folders |

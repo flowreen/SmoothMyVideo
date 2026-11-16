@@ -524,10 +524,12 @@ struct NativeRife
     // (nativeFsrupWarmProc), so the driver's shader compile inside them (up to kFsrCompileMs on an exe location and
     // upscale ratio it has not seen) blocks the worker, not the native thread, while the session presents without the
     // upscaler. fuWarm: 1 = warming, 2 = warm, 3 = failed; nativeUpWarmEnd turns it on at the next group when the tick
-    // still stands (fuWarmWant: an `up 0` meanwhile clears it)
+    // still stands (fuWarmWant: an `up 0` meanwhile clears it). fuWarmVsr = the worker is RTX VSR's first create of
+    // the process instead (nativeUpVsrProc: NVIDIA's model loads, ~1.5 s), the same handshake
     volatile LONG fuWarm = 0;
     HANDLE fuWarmTh = nullptr;
     bool fuWarmWant = false;
+    bool fuWarmVsr = false;
     ULONGLONG fuWarmT0 = 0;
     // ArtCNN (acnUp, `--artcnn`): RTX VSR's resize too (vsr is set), on planar floats like Anime4K: C4F32_DN v1.6.2's
     // luma x2 in its own module (acnMod, kAcnA + kAcnB), the weights from engine\artcnn\artcnn_c4f32_dn_v1.6.2_fp16.pkl,
@@ -901,7 +903,8 @@ struct NativeRife
     // the stage's upscaler (nativeUpSwitch's numbering): 1 RTX VSR, 2 AMD FSR, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS,
     // 6 Real-ESRGAN, 7 AnimeJaNai HD; a planar net reads dPuPl (the frame's planes, puW x puH) and writes dPuPres
     // (puTw x puTh), both planar fp32; AMD FSR / Intel XeSS = the fu* bridge fields (unused at the working size by the
-    // compute thread), their first frames on a worker: puWarm 1 = warming, 2 = warm, 3 = failed (puWarmT0 = its start)
+    // compute thread), their first frames on a worker, as RTX VSR's first create of the process at a live tick
+    // (nativePuVsrProc): puWarm 1 = warming, 2 = warm, 3 = failed (puWarmT0 = its start)
     int puKind = 0;
     volatile LONG puWarm = 0;
     HANDLE puWarmTh = nullptr;

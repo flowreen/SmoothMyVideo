@@ -111,6 +111,23 @@ static void nativeUpRelease(NativeRife& nr)
         LOG("native: live upscale: %s released in place\n", name);
 }
 
+// RTX VSR's first create of the process at a live `set up 1` (nativeUpSwitch's vsrNew) on a worker: the bridge's load,
+// the create and the warm-up eval on an opaque black frame, on the worker's own stream (the native thread keeps
+// nr.stream); fuWarm 2 = made, 3 = failed (its line said), nativeUpWarmEnd turns RTX VSR on
+static DWORD WINAPI nativeUpVsrProc(void* p)
+{
+    NativeRife& nr = *(NativeRife*)p;
+    const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
+    cudaStream_t st = nullptr;
+    const bool ok =
+        nativeBindDevice(nr) && cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess &&
+        nativeVsrMake(nr, nr.dVsrIn, nr.dVsrOut, nr.w, nr.h, tw, th, 0xFF000000u, st, "live upscale: RTX VSR");
+    if (st)
+        cudaStreamDestroy(st);
+    InterlockedExchange(&nr.fuWarm, ok ? 2 : 3);
+    return 0;
+}
+
 // an upscaler ticked in a running session that started without one, or another kind than the one it runs (stdin `set
 // up N`, N = the kind the renderer picked: 1 RTX VSR, 2 AMD FSR 4, 3 Anime4K, 4 ArtCNN, 5 Intel XeSS, 6 Real-ESRGAN,
 // 7 AnimeJaNai HD, its file from the `ajupmodel` key):
@@ -242,32 +259,12 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
     nr.rgAj = want == 7;
     nr.vsrFailed = nr.vsrUserOff = false;
     bool ok = true;
-    if (want == 1 && g_rtxb.vsrMade)
-        LOG("native: live upscale: RTX VSR runs the feature of this process's create (warmed then)\n");
-    else if (want == 1)
+    // the process's first RTX VSR: its create and warm-up on a worker (nativeUpVsrProc), as FSR's first frames below
+    const bool vsrNew = want == 1 && !g_rtxb.vsrMade;
+    if (want == 1)
     {
-        if (g_rtxb.create(nullptr, nullptr, 0, 0u, 1u) != 1u)
-        {
-            why = "rtx_video_api_cuda_create failed";
-            ok = false;
-        }
-        else
-        {
-            g_rtxb.created = g_rtxb.vsrMade = true;
-            g_rtxUsed = true; // resident host: NGX is single-instance per process, end it after this session
-            // the warm-up eval on an opaque black frame, as the session start runs it
-            const RtxRect ri{0, 0, (uint32_t)nr.w, (uint32_t)nr.h};
-            const RtxRect ro{0, 0, (uint32_t)tw, (uint32_t)th};
-            if (cuMemsetD32Async((CUdeviceptr)nr.dVsrIn, 0xFF000000u, (size_t)nr.w * nr.h, (CUstream)nr.stream) !=
-                    CUDA_SUCCESS ||
-                cudaStreamSynchronize(nr.stream) != cudaSuccess ||
-                g_rtxb.evalVsr(nr.dVsrIn, nr.dVsrOut, ri, ro, &nr.vsrSet) != 1u ||
-                cudaDeviceSynchronize() != cudaSuccess)
-            {
-                why = "the RTX VSR warm-up eval failed";
-                ok = false;
-            }
-        }
+        if (!vsrNew)
+            LOG("native: live upscale: RTX VSR runs the feature of this process's create (warmed then)\n");
     }
     else if (nr.fsrUp)
         ok = nativeFsrupSetup(nr, nr.w, nr.h, tw, th);
@@ -283,24 +280,30 @@ static bool nativeUpSwitch(NativeRife& nr, int want, std::string& why)
             why = "its setup failed (the line above)";
         return false;
     }
-    if (nr.fsrUp)
+    if (nr.fsrUp || vsrNew)
     {
-        // the first frames on a worker (nativeFsrupWarmProc); the session presents without the upscaler meanwhile,
-        // nativeUpWarmEnd turns it on
+        // the first frames (nativeFsrupWarmProc) or RTX VSR's create (nativeUpVsrProc) on a worker; the session
+        // presents without the upscaler meanwhile, nativeUpWarmEnd turns it on
         nr.vsrWant = nr.fsrUp = false;
+        nr.fuWarmVsr = vsrNew;
         nr.fuWarmWant = true;
         nr.fuWarmT0 = GetTickCount64();
         InterlockedExchange(&nr.fuWarm, 1);
-        nr.fuWarmTh = CreateThread(nullptr, 0, nativeFsrupWarmProc, &nr, 0, nullptr);
+        nr.fuWarmTh = CreateThread(nullptr, 0, vsrNew ? nativeUpVsrProc : nativeFsrupWarmProc, &nr, 0, nullptr);
         if (!nr.fuWarmTh)
         {
             InterlockedExchange(&nr.fuWarm, 0);
             why = "its warm-up thread did not start";
             return false;
         }
-        LOG("native: live upscale: %s %dx%d -> %dx%d, its first frames on a worker (the driver may compile its "
-            "shaders), the picture goes on without it\n",
-            name, nr.w, nr.h, tw, th);
+        if (vsrNew)
+            LOG("native: live upscale: %s %dx%d -> %dx%d, its create on a worker (NVIDIA's model loads), the picture "
+                "goes on without it\n",
+                name, nr.w, nr.h, tw, th);
+        else
+            LOG("native: live upscale: %s %dx%d -> %dx%d, its first frames on a worker (the driver may compile its "
+                "shaders), the picture goes on without it\n",
+                name, nr.w, nr.h, tw, th);
         return true;
     }
     nr.vsr = true;
@@ -585,6 +588,15 @@ static void nativeLiveSets(NativeRife& nr)
         }
         else if (key == "dlssnr")
         {
+            // DLSS 5's core starts after the RTX Video bridge's NGX create, never beside it: an RTX VSR create still on
+            // a worker (this thread's start in place, or the present's stage after Live DLSS 4.5) ends first
+            if (v != 0.0)
+            {
+                if (nr.fuWarmTh && nr.fuWarmVsr)
+                    nativeUpWarmEnd(nr);
+                while (nr.puKind == 1 && InterlockedCompareExchange(&nr.puWarm, 0, 0) == 1)
+                    Sleep(1);
+            }
             std::string why;
             if (!nativeNrSwitch(nr, v != 0.0, why))
             {
@@ -664,8 +676,9 @@ static void nativeLiveSets(NativeRife& nr)
             }
             if (key == "up" && nr.fuWarmTh)
             {
-                // an FSR / XeSS start in place still warming: the tick's last state decides at its end
-                const int pend = nr.fuKind ? 5 : 2;
+                // an FSR / XeSS start in place still warming, or RTX VSR's create: the tick's last state decides at
+                // its end
+                const int pend = nr.fuWarmVsr ? 1 : nr.fuKind ? 5 : 2;
                 if (want == 0 || want == pend)
                 {
                     nr.fuWarmWant = want != 0;

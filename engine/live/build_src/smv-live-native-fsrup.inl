@@ -551,25 +551,36 @@ static DWORD WINAPI nativePuWarmProc(void* p)
 
 // the warm-up's end (nativeLiveSets, on the native thread): warm = the upscaler on, as nativeUpSwitch turns the other
 // kinds on; an `up 0` meanwhile = built and off (an `up N` of its kind turns it on); failed = Lanczos stays, and the
-// built bridge stays with the session (nativeUpSwitch refuses another start while fuMade)
+// built bridge stays with the session (nativeUpSwitch refuses another start while fuMade). RTX VSR's create
+// (fuWarmVsr) ends the same way
 static void nativeUpWarmEnd(NativeRife& nr)
 {
     WaitForSingleObject(nr.fuWarmTh, INFINITE);
     CloseHandle(nr.fuWarmTh);
     nr.fuWarmTh = nullptr;
     const bool ok = InterlockedExchange(&nr.fuWarm, 0) == 2;
-    const char* name = nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling";
+    const bool vsr = nr.fuWarmVsr;
+    const char* name = vsr ? "RTX VSR" : nr.fuKind ? "Intel XeSS upscaling" : "AMD FSR upscaling";
     const double ms = (double)(GetTickCount64() - nr.fuWarmT0);
     if (!ok)
     {
-        LOG("native: live upscale: %s's first frames failed after %.0f ms, Lanczos stays\n", name, ms);
+        if (vsr)
+            LOG("native: live upscale: %s's create failed after %.0f ms, Lanczos stays\n", name, ms);
+        else
+            LOG("native: live upscale: %s's first frames failed after %.0f ms, Lanczos stays\n", name, ms);
         return;
     }
     const int tw = nr.uw ? nr.uw : nr.dw, th = nr.uw ? nr.uh : nr.dh;
-    nr.vsrWant = nr.fsrUp = nr.vsr = true;
+    nr.vsrWant = nr.vsr = true;
+    nr.fsrUp = !vsr;
     nr.vsrFailed = nr.vsrUserOff = !nr.fuWarmWant;
-    LOG("native: live upscale: %s %dx%d -> %dx%d, started in place (its first frames on a worker: %.0f ms)%s\n", name,
-        nr.w, nr.h, tw, th, ms, nr.fuWarmWant ? "" : ", off: unticked meanwhile");
+    const char* off = nr.fuWarmWant ? "" : ", off: unticked meanwhile";
+    if (vsr)
+        LOG("native: live upscale: %s %dx%d -> %dx%d, started in place (its create on a worker: %.0f ms)%s\n", name,
+            nr.w, nr.h, tw, th, ms, off);
+    else
+        LOG("native: live upscale: %s %dx%d -> %dx%d, started in place (its first frames on a worker: %.0f ms)%s\n",
+            name, nr.w, nr.h, tw, th, ms, off);
 }
 
 static void nativeFsrupRelease(NativeRife& nr)

@@ -2732,12 +2732,13 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 LOG("present path: direct from VRAM (shared output buffer)\n");
             // the upscaler after DLSS 4.5: its shared buffers and fences and the native host's upscaler on them (the
             // warm-up runs here, before the plan's stages start, or between two shown frames for a live `set up N`,
-            // host.upPollFn; AMD FSR / Intel XeSS's on a worker: started = upWarm, the stage on at its end); the shared
-            // part is made once a session (upTried), a later kind switches in place
+            // host.upPollFn; AMD FSR / Intel XeSS's first frames and, at a live tick, RTX VSR's first create of the
+            // process on a worker: started = upWarm, the stage on at its end); the shared part is made once a session
+            // (upTried), a later kind switches in place
             auto upRun = [&srv, &host](uint64_t v) {
                 return srv.nr && nativePresentUpRun(*srv.nr, v, host.upSrc, host.upStep, host.upMul);
             };
-            auto upStart = [&, upRun](int kind) -> bool {
+            auto upStart = [&, upRun](int kind, bool live) -> bool {
                 NativeRife* nrp = srv.nr;
                 bool ok = false;
                 if (nrp && nrp->puSemOut)
@@ -2749,7 +2750,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                          nativePresentUpInit(*nrp, host.hUpIn, host.upInBytes, (int)host.upInPitch, host.hUpOut,
                                              host.upOutBytes, (int)host.upOutPitch, host.hUpFenceIn, host.hUpFenceOut,
                                              (int)W, (int)H, (int)host.winW, (int)host.winH, host.upUw, host.upUh, kind,
-                                             g_hdr);
+                                             g_hdr, live);
                 }
                 host.upWarm = ok && !nrp->puOn; // the bridges' first frames still on their worker
                 if (ok)
@@ -2766,7 +2767,7 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                 return ok;
             };
             if (host.upOn)
-                upStart(host.upKind);
+                upStart(host.upKind, false);
             // a live `set up N` (nativeLiveSets hands it over) and the bridges' warm-up end: applied by the present
             // sites before a frame
             if (g_puLive)
@@ -2792,9 +2793,11 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     host.upRunFn = nullptr;
                     if (on)
                     {
-                        if (upStart(want))
+                        if (upStart(want, true))
                             LOG("live set: up %d: %s enlarges every frame DLSS 4.5 shows%s\n", want, puName(want),
-                                host.upWarm ? " once its first frames ended on a worker" : "");
+                                !host.upWarm ? ""
+                                : want == 1  ? " once its create ended on a worker"
+                                             : " once its first frames ended on a worker");
                         return;
                     }
                     if (srv.nr && srv.nr->puSemOut)

@@ -536,12 +536,63 @@ static const char* puName(int kind)
            : kind == 7 ? "AnimeJaNai HD"
                        : "an unknown upscaler";
 }
+// RTX VSR's feature for a live upscaler started in a running session (the stage's or nativeUpSwitch's): the bridge
+// loaded, NGX's one create a process when this process has not made it (every later start reuses the feature), then
+// the warm-up eval of in (w x h RGBA8, cleared to the word `fill` on st) into out (uw x uh), so the first shown frame
+// pays nothing. The caller's thread has the device bound. The create loads NVIDIA's model: ~1.5 s at 640x360 ->
+// 1280x720, the reason a tick mid-session runs this on a worker. false = a failure, its line said (who names the site)
+static bool nativeVsrMake(NativeRife& nr, uint8_t* in, uint8_t* out, int w, int h, int uw, int uh, uint32_t fill,
+                          cudaStream_t st, const char* who)
+{
+    if (!rtxBridgeLoad())
+        return false;
+    if (!g_rtxb.created)
+    {
+        // the primary context (the bridge's create with no context, as nativeRtxInit makes it); SMV_VSR_CREATE=fail =
+        // the create counts as failed (the trigger of this failure's way out)
+        static const bool fail = lkEnv("SMV_VSR_CREATE") == "fail";
+        if (fail || g_rtxb.create(nullptr, nullptr, 0, 0u, 1u) != 1u)
+        {
+            LOG("native: %s: rtx_video_api_cuda_create failed%s\n", who, fail ? " (SMV_VSR_CREATE=fail)" : "");
+            return false;
+        }
+        g_rtxb.created = g_rtxb.vsrMade = true;
+        g_rtxUsed = true; // resident host: NGX is single-instance per process, end it after this session
+    }
+    const RtxRect ri{0, 0, (uint32_t)w, (uint32_t)h};
+    const RtxRect ro{0, 0, (uint32_t)uw, (uint32_t)uh};
+    if (cuMemsetD32Async((CUdeviceptr)in, fill, (size_t)w * h, (CUstream)st) != CUDA_SUCCESS ||
+        cudaStreamSynchronize(st) != cudaSuccess || g_rtxb.evalVsr(in, out, ri, ro, &nr.vsrSet) != 1u ||
+        cudaDeviceSynchronize() != cudaSuccess)
+    {
+        LOG("native: %s: the warm-up eval failed\n", who);
+        return false;
+    }
+    return true;
+}
+
+// the stage's RTX VSR made on a worker (nativePresentUpKind at a live tick, the process's first create): the present
+// runs no frame through the stage while puWarm is 1 (puOn stays false until nativePresentUpWarmPoll sees its end)
+static DWORD WINAPI nativePuVsrProc(void* p)
+{
+    NativeRife& nr = *(NativeRife*)p;
+    cudaStream_t st = nullptr;
+    const bool ok =
+        nativeBindDevice(nr) && cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess &&
+        nativeVsrMake(nr, nr.dVsrIn, nr.dVsrOut, nr.puW, nr.puH, nr.puUw, nr.puUh, 0u, st, "RTX VSR after DLSS 4.5");
+    if (st)
+        cudaStreamDestroy(st);
+    InterlockedExchange(&nr.puWarm, ok ? 2 : 3);
+    return 0;
+}
+
 // the stage's geometry part: its stream, the two imported frame buffers and fences, the buffers every kind uses at this
-// size (the input, HDR's, Upscale to's); then the upscaler itself (nativePresentUpKind)
-static bool nativePresentUpKind(NativeRife& nr, int kind);
+// size (the input, HDR's, Upscale to's); then the upscaler itself (nativePresentUpKind; live = a `set up N` in a
+// running session, false = the session's start)
+static bool nativePresentUpKind(NativeRife& nr, int kind, bool live);
 static bool nativePresentUpInit(NativeRife& nr, HANDLE hIn, uint64_t inBytes, int inPitch, HANDLE hOut,
                                 uint64_t outBytes, int outPitch, HANDLE hFenceIn, HANDLE hFenceOut, int w, int h,
-                                int tw, int th, int uw, int uh, int kind, bool hdr)
+                                int tw, int th, int uw, int uh, int kind, bool hdr, bool live)
 {
     const PuTabsScope tabsHere;
     // uw x uh = the upscaler's own size (Upscale to), 0 = the presented tw x th
@@ -607,7 +658,7 @@ static bool nativePresentUpInit(NativeRife& nr, HANDLE hIn, uint64_t inBytes, in
     nr.puTh = th;
     nr.puInPitch = inPitch;
     nr.puOutPitch = outPitch;
-    return nativePresentUpKind(nr, kind);
+    return nativePresentUpKind(nr, kind, live);
 }
 
 // the stage's start line (`live upscale: NAME WxH -> UWxUH after DLSS 4.5`, the stage's harness reads it); extra = what
@@ -629,15 +680,17 @@ static void nativePresentUpLine(const NativeRife& nr, const char* extra)
 }
 
 // the stage's upscaler at its geometry (nativePresentUpInit's; a live switch: nativePresentUpSwitch): RTX VSR's NGX
-// feature (one create a process) and its warm-up eval, AMD FSR / Intel XeSS's bridge with its first frames on a worker
-// (the stage on at their end, nativePresentUpWarmPoll), or a planar net's setup (its own warm-up); the planar buffers
-// a planar net, HDR or Upscale to reads; false = it did not start
-static bool nativePresentUpKind(NativeRife& nr, int kind)
+// feature (one create a process; at a live tick of a process that has not made it, the create on a worker) and its
+// warm-up eval, AMD FSR / Intel XeSS's bridge with its first frames on a worker (the stage on at the worker's end,
+// nativePresentUpWarmPoll), or a planar net's setup (its own warm-up); the planar buffers a planar net, HDR or Upscale
+// to reads; false = it did not start
+static bool nativePresentUpKind(NativeRife& nr, int kind, bool live)
 {
     const PuTabsScope tabsHere;
     const char* name = puName(kind);
     const int w = nr.puW, h = nr.puH, uw = nr.puUw, uh = nr.puUh, tw = nr.puTw, th = nr.puTh;
     const bool hdr = nr.puHdr, fit2 = uw != tw || uh != th, fu = kind == 2 || kind == 5;
+    bool vsrBg = false; // RTX VSR's create on a worker
     if (kind < 1 || kind > 7)
         return false;
     if (fu)
@@ -701,38 +754,33 @@ static bool nativePresentUpKind(NativeRife& nr, int kind)
     }
     else if (kind == 1)
     {
-        if (!rtxBridgeLoad())
-            return false;
         if (g_rtxb.created && !g_rtxb.vsrMade)
         {
             LOG("native: RTX VSR after DLSS 4.5: this process made its RTX Video feature without RTX VSR\n");
             return false;
         }
-        if (!g_rtxb.created)
-        {
-            // one create per process (NGX is single-instance), the primary context, as nativeRtxInit makes it
-            if (g_rtxb.create(nullptr, nullptr, 0, 0u, 1u) != 1u)
-            {
-                LOG("native: RTX VSR after DLSS 4.5: rtx_video_api_cuda_create failed\n");
-                return false;
-            }
-            g_rtxb.created = true;
-            g_rtxb.vsrMade = true;
-            g_rtxUsed = true; // resident host: NGX is single-instance per process, end it after this session
-        }
         if (!nr.dVsrOut)
             NCHK(cudaMalloc((void**)&nr.dVsrOut, (size_t)uw * uh * 4), "RTX VSR after DLSS 4.5: output");
-        // the warm-up eval on an opaque black frame, so the first shown frame pays nothing
-        NCHK(cudaMemsetAsync(nr.dVsrIn, 0, (size_t)w * h * 4, nr.puSt), "RTX VSR after DLSS 4.5: warm-up clear");
-        NCHK(cudaStreamSynchronize(nr.puSt), "RTX VSR after DLSS 4.5: warm-up clear sync");
-        const RtxRect ri{0, 0, (uint32_t)w, (uint32_t)h};
-        const RtxRect ro{0, 0, (uint32_t)uw, (uint32_t)uh};
-        if (g_rtxb.evalVsr(nr.dVsrIn, nr.dVsrOut, ri, ro, &nr.vsrSet) != 1u)
+        if (live && !g_rtxb.created)
         {
-            LOG("native: RTX VSR after DLSS 4.5: the warm-up eval failed\n");
-            return false;
+            // a tick mid-session in a process without the feature: the bridge's load, the create and the warm-up on
+            // a worker, the present thread keeps showing frames through the Lanczos pair meanwhile (the session's
+            // start makes it here, before the plan's stages start)
+            nr.puKind = kind; // before the worker: a DLSS 5 start on the compute thread waits for it (nativeLiveSets)
+            nr.puWarmT0 = GetTickCount64();
+            InterlockedExchange(&nr.puWarm, 1);
+            nr.puWarmTh = CreateThread(nullptr, 0, nativePuVsrProc, &nr, 0, nullptr);
+            if (!nr.puWarmTh)
+            {
+                InterlockedExchange(&nr.puWarm, 0);
+                nr.puKind = 0;
+                LOG("native: %s after DLSS 4.5: its create thread did not start\n", name);
+                return false;
+            }
+            vsrBg = true;
         }
-        NCHK(cudaDeviceSynchronize(), "RTX VSR after DLSS 4.5: warm-up eval sync");
+        else if (!nativeVsrMake(nr, nr.dVsrIn, nr.dVsrOut, w, h, uw, uh, 0u, nr.puSt, "RTX VSR after DLSS 4.5"))
+            return false;
     }
     else
     {
@@ -760,13 +808,18 @@ static bool nativePresentUpKind(NativeRife& nr, int kind)
     }
     nr.puKind = kind;
     nr.puFailed = false;
-    if (fu)
+    if (fu || vsrBg)
     {
-        // on at the warm-up's end: until then the present shows the frames through the Lanczos pair
+        // on at the worker's end: until then the present shows the frames through the Lanczos pair
         nr.puOn = false;
-        LOG("native: %s %dx%d -> %dx%d after DLSS 4.5: its first frames on a worker (the driver may compile its "
-            "shaders), the native fit's Lanczos enlarges meanwhile\n",
-            name, w, h, uw, uh);
+        if (fu)
+            LOG("native: %s %dx%d -> %dx%d after DLSS 4.5: its first frames on a worker (the driver may compile its "
+                "shaders), the native fit's Lanczos enlarges meanwhile\n",
+                name, w, h, uw, uh);
+        else
+            LOG("native: %s %dx%d -> %dx%d after DLSS 4.5: its create on a worker (NVIDIA's model loads), the native "
+                "fit's Lanczos enlarges meanwhile\n",
+                name, w, h, uw, uh);
         return true;
     }
     nr.puOn = true;
@@ -774,8 +827,8 @@ static bool nativePresentUpKind(NativeRife& nr, int kind)
     return true;
 }
 
-// AMD FSR / Intel XeSS's warm-up in the stage (the present thread, before a shown frame): 0 = still warming (or none),
-// 1 = it ended and the stage is on from this frame, -1 = it failed (the Lanczos pair stays)
+// the stage's worker (AMD FSR / Intel XeSS's first frames, RTX VSR's create; the present thread, before a shown frame):
+// 0 = still warming (or none), 1 = it ended and the stage is on from this frame, -1 = it failed (the Lanczos pair stays)
 static int nativePresentUpWarmPoll(NativeRife& nr)
 {
     if (!nr.puWarmTh)
@@ -788,15 +841,23 @@ static int nativePresentUpWarmPoll(NativeRife& nr)
     nr.puWarmTh = nullptr;
     InterlockedExchange(&nr.puWarm, 0);
     const double ms = (double)(GetTickCount64() - nr.puWarmT0);
+    const bool vsr = nr.puKind == 1; // RTX VSR's create, else AMD FSR / Intel XeSS's first frames
     if (s != 2)
     {
-        LOG("native: %s after DLSS 4.5: its first frames failed after %.0f ms, the native fit's Lanczos stays\n",
-            puName(nr.puKind), ms);
+        if (vsr)
+            LOG("native: %s after DLSS 4.5: its create failed after %.0f ms, the native fit's Lanczos stays\n",
+                puName(nr.puKind), ms);
+        else
+            LOG("native: %s after DLSS 4.5: its first frames failed after %.0f ms, the native fit's Lanczos stays\n",
+                puName(nr.puKind), ms);
         nr.puFailed = true;
         return -1;
     }
     char extra[64];
-    sprintf_s(extra, " (its first frames on a worker: %.0f ms)", ms);
+    if (vsr)
+        sprintf_s(extra, " (its create on a worker: %.0f ms)", ms);
+    else
+        sprintf_s(extra, " (its first frames on a worker: %.0f ms)", ms);
     nr.puOn = true;
     nativePresentUpLine(nr, extra);
     return 1;
@@ -816,7 +877,7 @@ static bool nativePresentUpSwitch(NativeRife& nr, int kind)
     if (nr.puKind > 1)
         nativeUpRelease(nr);
     nr.puKind = 0;
-    return kind == 0 || nativePresentUpKind(nr, kind);
+    return kind == 0 || nativePresentUpKind(nr, kind, true);
 }
 
 // one shown frame on puSt, its bytes already waited for in dPuIn (nativePresentUpRun): the frame -> the upscaler's input
