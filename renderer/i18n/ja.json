@@ -325,7 +325,7 @@
   "nr.line.sr": "{file} (同じパックの DLSS SR ランタイム、任意)",
   "nr.installed": "DLSS 5 ランタイムはインストール済みです。",
   "nr.noBridge": "DLSS 5 ブリッジ (nvngx.dll) が engine/dlssnr にありません。再ビルドしてください (DEVELOPMENT.md の「Building the native components」を参照)。",
-  "nr.howto": "NVIDIA は <code>nvngx_dlssnr.dll</code> を公開していません (SDK もドライバー内のコピーも NVIDIA App のオーバーライドもなし)。NBA 2K27 の中にのみ含まれています。<b>DLSS 5 ランタイムをダウンロード</b> は、DLSS 5 ツールが共通して使うコミュニティビルド ({link} の {mb} MB の zip、RTX 40 + 50) を取得し、チェックサムを検証してインストールします。",
+  "nr.howto": "NVIDIA は <code>nvngx_dlssnr.dll</code> を公開していません (SDK もドライバー内のコピーも NVIDIA App のオーバーライドもなし)。NBA 2K27 の中にのみ含まれています。<b>DLSS 5 ランタイムをダウンロード</b> は、お使いの GPU 向けのビルド ({link} の {mb} MB の zip。RTX 50 では NVIDIA 署名済みのコピー、RTX 40 では DLSS 5 ツールが共通して使うコミュニティビルド) を取得し、チェックサムを検証してインストールします。",
   "nr.rhiLink": "GitHub の rhi-repo",
   "aj.line": "{file} (AnimeJaNai モデル、同梱なし)",
   "aj.installed": "AnimeJaNai モデルはインストール済みです。",

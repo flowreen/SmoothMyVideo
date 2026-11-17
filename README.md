@@ -280,8 +280,9 @@ One checkbox runs NVIDIA's DLSS 5 Neural Rendering on every original frame, in v
   character mask: DLSS 5 finds the characters and treats their skin on its own, as much as the **Skin Structure**
   slider says (at 1.00, the default, skin follows Structure Intensity).
 * **The download:** NVIDIA's Neural Rendering file (`nvngx_dlssnr.dll`) isn't included, and NVIDIA offers no download for it.
-  The one-click **Download the DLSS 5 runtime** button fetches the community RTX 40 + 50 build
-  ([rhi-repo](https://github.com/RankFTW/rhi-repo/releases) on GitHub), checks it and installs it.
+  The one-click **Download the DLSS 5 runtime** button fetches the right copy for your card from
+  [rhi-repo](https://github.com/RankFTW/rhi-repo/releases) on GitHub (NVIDIA's own signed file on an RTX 50, the
+  community build on an RTX 40), checks it and installs it.
 * **In Live:** on every captured frame of SDR content.
 
 </details>

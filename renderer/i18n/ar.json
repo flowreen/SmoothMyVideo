@@ -325,7 +325,7 @@
   "nr.line.sr": "{file} (وقت تشغيل DLSS SR من الحزمة نفسها، اختياري)",
   "nr.installed": "وقت تشغيل DLSS 5 مثبت.",
   "nr.noBridge": "جسر DLSS 5 (nvngx.dll) مفقود من engine/dlssnr. أعد بناءه (راجع DEVELOPMENT.md، \"Building the native components\").",
-  "nr.howto": "لا تنشر NVIDIA الملف <code>nvngx_dlssnr.dll</code> (لا SDK، ولا نسخة في برنامج التشغيل، ولا تجاوز في NVIDIA App)؛ إنه يأتي فقط داخل NBA 2K27. يجلب <b>تنزيل وقت تشغيل DLSS 5</b> النسخة المجتمعية التي تستخدمها كل أدوات DLSS 5 (ملف zip بحجم {mb} MB من {link}، RTX 40 + 50)، ويتحقق من مجموعها الاختباري ويثبّتها.",
+  "nr.howto": "لا تنشر NVIDIA الملف <code>nvngx_dlssnr.dll</code> (لا SDK، ولا نسخة في برنامج التشغيل، ولا تجاوز في NVIDIA App)؛ إنه يأتي فقط داخل NBA 2K27. يجلب <b>تنزيل وقت تشغيل DLSS 5</b> النسخة المناسبة لبطاقة الرسوميات لديك (ملف zip بحجم {mb} MB من {link}: نسخة NVIDIA الموقّعة على RTX 50، والنسخة المجتمعية التي تستخدمها كل أدوات DLSS 5 على RTX 40)، ويتحقق من مجموعها الاختباري ويثبّتها.",
   "nr.rhiLink": "rhi-repo على GitHub",
   "aj.line": "{file} (نموذج AnimeJaNai، غير مضمّن)",
   "aj.installed": "نموذج AnimeJaNai مثبت.",

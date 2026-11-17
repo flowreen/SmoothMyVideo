@@ -325,7 +325,7 @@
   "nr.line.sr": "{file}（同一包中的 DLSS SR 运行库，可选）",
   "nr.installed": "DLSS 5 运行库已安装。",
   "nr.noBridge": "engine/dlssnr 中缺少 DLSS 5 桥接组件（nvngx.dll）。请重新构建（见 DEVELOPMENT.md 中的“Building the native components”）。",
-  "nr.howto": "NVIDIA 没有公开发布 <code>nvngx_dlssnr.dll</code>（没有 SDK，驱动里没有，NVIDIA App 也无法覆盖）；它只包含在 NBA 2K27 中。<b>下载 DLSS 5 运行库</b> 会获取所有 DLSS 5 工具都在用的社区版本（{mb} MB 的 zip，来自 {link}，适用于 RTX 40 + 50），校验后安装。",
+  "nr.howto": "NVIDIA 没有公开发布 <code>nvngx_dlssnr.dll</code>（没有 SDK，驱动里没有，NVIDIA App 也无法覆盖）；它只包含在 NBA 2K27 中。<b>下载 DLSS 5 运行库</b> 会获取适合你 GPU 的版本（{mb} MB 的 zip，来自 {link}：RTX 50 上为 NVIDIA 签名的副本，RTX 40 上为所有 DLSS 5 工具都在用的社区版本），校验后安装。",
   "nr.rhiLink": "GitHub 上的 rhi-repo",
   "aj.line": "{file}（AnimeJaNai 模型，未附带）",
   "aj.installed": "AnimeJaNai 模型已安装。",

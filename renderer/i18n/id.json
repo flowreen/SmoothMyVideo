@@ -325,7 +325,7 @@
   "nr.line.sr": "{file} (runtime DLSS SR dari paket yang sama, opsional)",
   "nr.installed": "Runtime DLSS 5 sudah terpasang.",
   "nr.noBridge": "Bridge DLSS 5 (nvngx.dll) tidak ada di engine/dlssnr. Build ulang (lihat DEVELOPMENT.md, \"Building the native components\").",
-  "nr.howto": "NVIDIA tidak merilis <code>nvngx_dlssnr.dll</code> (tidak ada SDK, tidak ada salinan di driver, tidak ada override di NVIDIA App); file ini hanya ada di dalam NBA 2K27. <b>Unduh runtime DLSS 5</b> mengambil build komunitas yang dipakai semua alat DLSS 5 (zip {mb} MB dari {link}, RTX 40 + 50), memverifikasi checksum-nya, lalu memasangnya.",
+  "nr.howto": "NVIDIA tidak merilis <code>nvngx_dlssnr.dll</code> (tidak ada SDK, tidak ada salinan di driver, tidak ada override di NVIDIA App); file ini hanya ada di dalam NBA 2K27. <b>Unduh runtime DLSS 5</b> mengambil build untuk GPU Anda (zip {mb} MB dari {link}: salinan bertanda tangan NVIDIA di RTX 50, build komunitas yang dipakai semua alat DLSS 5 di RTX 40), memverifikasi checksum-nya, lalu memasangnya.",
   "nr.rhiLink": "rhi-repo di GitHub",
   "aj.line": "{file} (model AnimeJaNai, tidak disertakan)",
   "aj.installed": "Model AnimeJaNai sudah terpasang.",

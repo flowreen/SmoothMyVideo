@@ -71,9 +71,9 @@ const DLSSNR_DIR = path.join(ENGINE, 'dlssnr');
 const DLSSNR_HOST = ['nvngx.dll'];
 const DLSSNR_RUNTIME = 'nvngx_dlssnr.dll';
 const DLSSNR_SR = 'nvngx_dlss.dll';
-// The one-click source: the pinned rhi-repo asset, and the ONE hash this app holds: the
-// SHA256 of the nvngx_dlssnr.dll inside it (probe-verified on the host). The download refuses to install any other
-// DLL. Bump tag, asset and hash together when moving to a
+// The one-click sources: two pinned rhi-repo assets (this cross-gen build, and DLSSNR_DL_RTX50 below for RTX 50,
+// dlssnrPick), each with the SHA256 of the nvngx_dlssnr.dll inside it (probe-verified on the host). The download
+// refuses to install any other DLL. Bump tag, asset and hash together when moving to a
 // newer build and add the replaced one to DLSSNR_RETIRED (the zip's own digest is at
 // https://api.github.com/repos/RankFTW/rhi-repo/releases).
 const DLSSNR_DL = {
@@ -83,8 +83,24 @@ const DLSSNR_DL = {
   label: '310.9.16 (rhi-repo, RTX 40 + 50)',
   zipBytes: 192378839,
 };
+// NVIDIA's own signed copy of the same 310.9.16 build (rhi-repo republishes it unchanged, Authenticode-signed by
+// NVIDIA): its CUDA code targets RTX 50 only (sm_120), so only an RTX 50 gets it; every other GPU keeps DLSSNR_DL's
+// build, which carries RTX 20 .. 50 code. On an RTX 50 the two give the same frames.
+const DLSSNR_DL_RTX50 = {
+  url: 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.9.16-nvidia/nvngx_dlssnr_310.9.16-nvidia.zip',
+  page: 'https://github.com/RankFTW/rhi-repo/releases/tag/dlssnr-310.9.16-nvidia',
+  dllSha256: '2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f',
+  label: '310.9.16 (NVIDIA signed, RTX 50)',
+  zipBytes: 184678049,
+};
+/** The download for this GPU: NVIDIA's signed copy on a card nvidia-smi names GeForce RTX 50xx or Blackwell, else
+ *  (any other card, or no name) the cross-gen build. */
+async function dlssnrPick(): Promise<typeof DLSSNR_DL> {
+  const s = await dlssgSupportOnce();
+  return /GeForce RTX\s*50\d{2}\b|Blackwell/i.test(s.gpu) ? DLSSNR_DL_RTX50 : DLSSNR_DL;
+}
 // Superseded one-click builds (size + SHA256 of nvngx_dlssnr.dll). An installed copy, downloaded or dropped, is
-// removed at app start so the DLSS 5 row offers DLSSNR_DL's build: SMV offers one build only.
+// removed at app start so the DLSS 5 row offers the build for this GPU (dlssnrPick).
 const DLSSNR_RETIRED: Retired[] = [
   {
     label: '310.8.SF-v2',
@@ -116,7 +132,8 @@ export function retireOldRuntimes(): string[] {
   const lines: string[] = [];
   const nr = path.join(DLSSNR_DIR, DLSSNR_RUNTIME);
   const old = DLSSNR_RETIRED.find((r) => isBuild(nr, r.bytes, r.sha256));
-  if (old) lines.push(retire('DLSS 5', nr, old.label, DLSSNR_DL.label));
+  // the start runs before nvidia-smi names the GPU, so the line names both builds the download picks from
+  if (old) lines.push(retire('DLSS 5', nr, old.label, `${DLSSNR_DL.label} or ${DLSSNR_DL_RTX50.label}`));
   for (const [file, pin] of Object.entries(RTX_PINNED)) {
     const p = path.join(RTX_DIR, file);
     if (fileExists(p) && !isBuild(p, pin.bytes, pin.sha256)) lines.push(retire('RTX Video', p, file, RTX_LABEL));
@@ -312,7 +329,9 @@ function dlssgSupportOnce(): Promise<{ gpu: string; hags: boolean; supported: bo
           const key = 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers';
           execFile('reg', ['query', key, '/v', 'HwSchMode'], { timeout: 5000, windowsHide: true }, (e2, o2) => {
             const hags = !e2 && /HwSchMode\s+REG_DWORD\s+0x2\b/i.test(String(o2));
-            resolve({ gpu, hags, supported: hags && /RTX\s*(40|50)\d{2}\b|\bAda\b|Blackwell/i.test(gpu) });
+            // GeForce names carry the family; a workstation card carries its architecture (an "RTX 5000 Ada" is RTX
+            // 40 class, a "Quadro RTX 5000" is RTX 20)
+            resolve({ gpu, hags, supported: hags && /GeForce RTX\s*(40|50)\d{2}\b|\bAda\b|Blackwell/i.test(gpu) });
           });
         },
       );
@@ -328,10 +347,11 @@ ipcMain.handle('dlssg-ready', async () => {
 
 // "NVIDIA DLSS 5" (Neural Rendering): ready when the shipped caller shim AND the user-supplied
 // runtime are present in engine/dlssnr (see the DLSSNR_* constants).
-ipcMain.handle('dlssnr-ready', () => {
+ipcMain.handle('dlssnr-ready', async () => {
   const host = DLSSNR_HOST.every((f) => fileExists(path.join(DLSSNR_DIR, f)));
   const runtime = fileExists(path.join(DLSSNR_DIR, DLSSNR_RUNTIME));
   const sr = fileExists(path.join(DLSSNR_DIR, DLSSNR_SR));
+  const dl = await dlssnrPick();
   return {
     ready: host && runtime,
     host,
@@ -340,7 +360,7 @@ ipcMain.handle('dlssnr-ready', () => {
     dir: DLSSNR_DIR,
     file: DLSSNR_RUNTIME,
     srFile: DLSSNR_SR,
-    download: { page: DLSSNR_DL.page, mb: Math.round(DLSSNR_DL.zipBytes / 1048576) },
+    download: { page: dl.page, mb: Math.round(dl.zipBytes / 1048576) },
   };
 });
 
@@ -358,9 +378,10 @@ ipcMain.handle('dlssnr-download', async () => {
     }
   };
   try {
-    const res = await fetch(DLSSNR_DL.url, { headers: { 'user-agent': 'SmoothMyVideo' } });
+    const dl = await dlssnrPick();
+    const res = await fetch(dl.url, { headers: { 'user-agent': 'SmoothMyVideo' } });
     if (!res.ok || !res.body) return { ok: false, error: `download failed: HTTP ${res.status}`, copied: [] };
-    const total = parseInt(res.headers.get('content-length') || '0', 10) || DLSSNR_DL.zipBytes;
+    const total = parseInt(res.headers.get('content-length') || '0', 10) || dl.zipBytes;
     let received = 0;
     let last = 0;
     const src = Readable.fromWeb(res.body as never);
@@ -378,7 +399,7 @@ ipcMain.handle('dlssnr-download', async () => {
     if (!found)
       return { ok: false, error: DLSSNR_RUNTIME + ' not in the downloaded zip, nothing installed', copied: [] };
     const dh = sha256File(found);
-    if (dh !== DLSSNR_DL.dllSha256)
+    if (dh !== dl.dllSha256)
       return { ok: false, error: `runtime checksum mismatch (${dh.slice(0, 12)}...), nothing installed`, copied: [] };
     fs.mkdirSync(DLSSNR_DIR, { recursive: true });
     const dest = path.join(DLSSNR_DIR, DLSSNR_RUNTIME);
@@ -388,7 +409,7 @@ ipcMain.handle('dlssnr-download', async () => {
       /* best effort */
     }
     fs.copyFileSync(found, dest);
-    return { ok: true, copied: [DLSSNR_RUNTIME], sha256: dh, known: DLSSNR_DL.label };
+    return { ok: true, copied: [DLSSNR_RUNTIME], sha256: dh, known: dl.label };
   } catch (e) {
     return { ok: false, error: String(e), copied: [] };
   } finally {
@@ -400,8 +421,8 @@ ipcMain.handle('dlssnr-download', async () => {
   }
 });
 
-ipcMain.handle('dlssnr-open-download', () => {
-  shell.openExternal(DLSSNR_DL.page);
+ipcMain.handle('dlssnr-open-download', async () => {
+  shell.openExternal((await dlssnrPick()).page);
   return true;
 });
 

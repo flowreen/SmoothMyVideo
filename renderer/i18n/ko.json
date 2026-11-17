@@ -325,7 +325,7 @@
   "nr.line.sr": "{file}(같은 팩의 DLSS SR 런타임, 선택 사항)",
   "nr.installed": "DLSS 5 런타임이 설치되어 있습니다.",
   "nr.noBridge": "engine/dlssnr에 DLSS 5 브리지(nvngx.dll)가 없습니다. 다시 빌드하세요(DEVELOPMENT.md의 \"Building the native components\" 참조).",
-  "nr.howto": "NVIDIA는 <code>nvngx_dlssnr.dll</code>을 공개하지 않습니다(SDK도, 드라이버 사본도, NVIDIA App 오버라이드도 없음). NBA 2K27 안에만 들어 있습니다. <b>DLSS 5 런타임 다운로드</b>는 모든 DLSS 5 도구가 쓰는 커뮤니티 빌드({link}의 {mb} MB zip, RTX 40 + 50)를 받아 체크섬을 확인한 뒤 설치합니다.",
+  "nr.howto": "NVIDIA는 <code>nvngx_dlssnr.dll</code>을 공개하지 않습니다(SDK도, 드라이버 사본도, NVIDIA App 오버라이드도 없음). NBA 2K27 안에만 들어 있습니다. <b>DLSS 5 런타임 다운로드</b>는 사용 중인 GPU에 맞는 빌드({link}의 {mb} MB zip: RTX 50에서는 NVIDIA가 서명한 사본, RTX 40에서는 모든 DLSS 5 도구가 쓰는 커뮤니티 빌드)를 받아 체크섬을 확인한 뒤 설치합니다.",
   "nr.rhiLink": "GitHub의 rhi-repo",
   "aj.line": "{file}(AnimeJaNai 모델, 포함되지 않음)",
   "aj.installed": "AnimeJaNai 모델이 설치되어 있습니다.",

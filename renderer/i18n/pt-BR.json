@@ -325,7 +325,7 @@
   "nr.line.sr": "{file} (runtime do DLSS SR do mesmo pacote, opcional)",
   "nr.installed": "O runtime do DLSS 5 está instalado.",
   "nr.noBridge": "A ponte do DLSS 5 (nvngx.dll) está faltando em engine/dlssnr. Compile-a de novo (veja DEVELOPMENT.md, \"Building the native components\").",
-  "nr.howto": "A NVIDIA não publica o <code>nvngx_dlssnr.dll</code> (sem SDK, sem cópia no driver, sem substituição pelo NVIDIA App); ele só vem dentro do NBA 2K27. <b>Baixar o runtime do DLSS 5</b> obtém a versão da comunidade que todas as ferramentas de DLSS 5 usam (zip de {mb} MB em {link}, RTX 40 + 50), verifica o checksum e instala.",
+  "nr.howto": "A NVIDIA não publica o <code>nvngx_dlssnr.dll</code> (sem SDK, sem cópia no driver, sem substituição pelo NVIDIA App); ele só vem dentro do NBA 2K27. <b>Baixar o runtime do DLSS 5</b> obtém a versão para a sua GPU (zip de {mb} MB em {link}: a cópia assinada da NVIDIA na RTX 50, a versão da comunidade que todas as ferramentas de DLSS 5 usam na RTX 40), verifica o checksum e instala.",
   "nr.rhiLink": "rhi-repo no GitHub",
   "aj.line": "{file} (o modelo AnimeJaNai, não incluído)",
   "aj.installed": "O modelo AnimeJaNai está instalado.",

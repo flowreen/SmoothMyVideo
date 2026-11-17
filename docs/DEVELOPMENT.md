@@ -208,8 +208,10 @@ RTX 5090 Laptop (Blackwell, sm_120) across RTX VSR / HDR and all three codecs.
 * `engine/dlssnr/`: the DLSS 5 Neural Rendering pass (`--dlssnr`): the NR core around NGX feature
   18 (`build_src/nr_host.*`, compiled into the native host) and the `nvngx.dll` caller shim it
   loads (built from `build_src/`, shipped). The runtime `nvngx_dlssnr.dll` is gitignored and never shipped: the DLSS 5
-  panel downloads the pinned community build (`DLSSNR_DL` in `src/main-setup.ts`, one rhi-repo release
-  asset, the DLL's SHA256 checked before the copy) or installs a dropped copy (other builds install
+  panel downloads one of two pinned rhi-repo release assets by GPU (`dlssnrPick` in `src/main-setup.ts`:
+  `DLSSNR_DL_RTX50` = NVIDIA's signed original, whose CUDA code is RTX 50 only, on a card nvidia-smi names RTX 50 /
+  Blackwell; `DLSSNR_DL` = the community build with RTX 20 .. 50 code everywhere else; the two give the same frames on
+  an RTX 50), the DLL's SHA256 checked before the copy, or installs a dropped copy (other builds install
   with an "unverified" notice). `nvngx_dlss.dll` is optional (the NGX core only warns without it).
 * `engine/rtxvideo/`: RTX Video (VSR + TrueHDR) over the locally built `rtxvideo_cuda.dll`, called
   by the host. The NGX feature DLLs are user-installed through the in-app RTX setup box; the

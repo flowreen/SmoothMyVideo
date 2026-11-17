@@ -325,7 +325,7 @@
   "nr.line.sr": "{file} (उसी पैक का DLSS SR रनटाइम, वैकल्पिक)",
   "nr.installed": "DLSS 5 रनटाइम इंस्टॉल है।",
   "nr.noBridge": "engine/dlssnr में DLSS 5 ब्रिज (nvngx.dll) नहीं है। इसे दोबारा बिल्ड करें (DEVELOPMENT.md में \"Building the native components\" देखें)।",
-  "nr.howto": "NVIDIA <code>nvngx_dlssnr.dll</code> पब्लिश नहीं करता (कोई SDK नहीं, ड्राइवर में कॉपी नहीं, NVIDIA App ओवरराइड नहीं); यह सिर्फ़ NBA 2K27 के अंदर आती है। <b>DLSS 5 रनटाइम डाउनलोड करें</b> वह कम्युनिटी बिल्ड लाता है जिसे हर DLSS 5 टूल इस्तेमाल करता है ({link} से {mb} MB की zip, RTX 40 + 50), उसका चेकसम जाँचता है और इंस्टॉल करता है।",
+  "nr.howto": "NVIDIA <code>nvngx_dlssnr.dll</code> पब्लिश नहीं करता (कोई SDK नहीं, ड्राइवर में कॉपी नहीं, NVIDIA App ओवरराइड नहीं); यह सिर्फ़ NBA 2K27 के अंदर आती है। <b>DLSS 5 रनटाइम डाउनलोड करें</b> आपके GPU के लिए सही बिल्ड लाता है ({link} से {mb} MB की zip: RTX 50 पर NVIDIA की साइन की हुई कॉपी, RTX 40 पर वह कम्युनिटी बिल्ड जिसे हर DLSS 5 टूल इस्तेमाल करता है), उसका चेकसम जाँचता है और इंस्टॉल करता है।",
   "nr.rhiLink": "GitHub पर rhi-repo",
   "aj.line": "{file} (AnimeJaNai मॉडल, साथ में नहीं)",
   "aj.installed": "AnimeJaNai मॉडल इंस्टॉल है।",

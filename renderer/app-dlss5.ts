@@ -3,9 +3,9 @@
 // a DLAA-class per-frame pass, run by the native host through the caller
 // shim engine/dlssnr/nvngx.dll (ships)
 // plus the NR runtime nvngx_dlssnr.dll, which the app never ships (NVIDIA offers no public download,
-// the only NVIDIA copy is inside NBA 2K27): one click downloads the community build every DLSS 5 tool
-// uses (rhi-repo on GitHub, checksum-verified twice in main), or the user drops a copy in, like the
-// RTX Video / NvOFFRUC DLLs.
+// NVIDIA's copies ship only inside its apps): one click downloads the build for the GPU (main's dlssnrPick:
+// NVIDIA's signed copy on RTX 50, the community build every DLSS 5 tool uses elsewhere; rhi-repo on GitHub,
+// checksum-verified twice in main), or the user drops a copy in, like the RTX Video / NvOFFRUC DLLs.
 // Readiness = the shim + runtime present (dlssnr-ready). The two sliders are NVIDIA's global developer
 // controls, Structure Intensity and Tone Intensity (0..2, default 1.00); the pass runs at the model
 // size itself, never at a smaller DLSS quality size (no quality selector, by decision).
