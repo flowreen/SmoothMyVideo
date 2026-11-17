@@ -1,7 +1,7 @@
 // --- Dolby Vision export tools (mirrors the RTX library flow) ------------------------------------
 // DV 8.1 export needs ONE non-shippable open-source binary - dovi_tool - dropped into engine/dvtools;
 // the RPU it injects is muxed by the bundled ffmpeg and the DV signaling box is written by the engine
-// itself (hdr10_meta.inject_dv_config), so no GPAC/MP4Box is involved. The setup box appears when the
+// itself (src/render/hdr10meta.ts injectDvConfig), so no GPAC/MP4Box is involved. The setup box appears when the
 // toggle is on and dovi_tool is missing, and collapses to nothing once it is installed (dv-ready).
 let dvReady: any = { dovi: false, ready: false };
 // Two Dolby Vision boxes that exclude each other: Profile 8.1 on the HDR10 video, 8.4 with the video written as HLG

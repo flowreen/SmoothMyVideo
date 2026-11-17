@@ -1122,7 +1122,11 @@ How the server route works:
   costs ~r model calls a pair), so whenever a whole multiple M = ceil(0.97 r) of the source's rate
   fits the user's target (r = the throttle's target over the source's rate) the pair runs M's
   ladder instead: M - 1 tweens at k / M plus the real frame as it is, more frames for no more work.
-  The grid stays for a target between two multiples that binds. The ladder above a lock is admitted
+  The grid stays for a target between two multiples that binds, and a lock gives way to it: a lock
+  more than 5 % under the throttle's target whose ladder reaching that target would pass the user's
+  target +3 % is let go (a lock is taken within 3 %, so the two never trade places); otherwise the x2
+  lock of Fit to the GPU's start (twice the source's rate) would hold under a 60 fps target from a
+  21.5 fps source for the whole session (43 fps). The ladder above a lock is admitted
   at a price: its cost predicted from the lock's own readings, times the excess that ladder showed
   over such a prediction the last time it ran (never under 1.05), inside the throttle's 95 % budget.
   A lock holds while its cost stays under 1.10 x that budget and under 98 % of the source period: a
@@ -1828,7 +1832,7 @@ kernels, so there is no engine to find, build, warm or keep resident (offline: `
 engine)`; a session logs `gmfss ready in N s`). The glue kernels sit in the host's
 NVRTC block (the chain below launches them):
 `k_half` (the 2x2 box halves of both frames as adjacent planes), `k_pyr` (the per-pair flow and metric
-pyramids at 1/2 and 1/4), `k_splatSoft` (softsplat.py's int64 fixed-point forward with the 'soft'
+pyramids at 1/2 and 1/4), `k_splatSoft` (the forward softmax splat as int64 fixed-point sums with the 'soft'
 mode's `exp(s * Z)` products formed on the fly in fp32; the target cell and the corner weights from
 `land`, since an fp32 `x + s * flow` is one ulp = 6e-5 px off
 at x ~ 600..960; products bound for the same target pixel are summed across neighbouring threads, a warp
@@ -1837,7 +1841,7 @@ the accumulators bit-identical and cut the feature splats ~20 %) and
 `k_splatNorm` (the `acc / (accN + 1e-7)` tail into the fusionnet input planes). The kernels are checked,
 compiled from the host source, against the exact
 maths in fp64 on real-motion inputs, plus a quantized-flow control where the
-accumulators must match softsplat.py's own kernel bit for bit.
+accumulators must match an int64 splat that forms the position in fp32 bit for bit.
 
 The chain splats by GATHER (`k_gsCount`, `k_gsScanA` / `B` / `C`, `k_gsFill`, `k_gsGather`): a list per
 target cell of the (source pixel, corner) pairs landing on it (a count, an exclusive scan, a fill), then one thread per
@@ -2362,9 +2366,11 @@ however far past the target or the panel that node lands. The present floor foll
 target (0.95 x the node's own period, from the faster of the two source clocks), so its slots are all
 presented (tear-allowed past the panel) and no group overruns its source period. Otherwise the largest
 node that fits. A target on a node (within 3 %) never steps up. A deeper Smooth Motion node is priced
-at the pipelined calls of the ladder that runs, yet a call costs less the more bridge instances run side
-by side (2560x1440 at 21.5 fps: x4's prices put x8 at about 1.23 x what x8 then measured running; from
-x16 on the prices matched), so a step up one node from x4 or below is tried when that price is within
+at the pipelined calls of the ladder that runs, yet where the GPU is the limit a call costs less on the
+deeper ladder: the GPU's clock follows its load, and a light shallow ladder holds it low (2560x1440 at
+21.5 fps: a call 13.0 ms at x4 with the SM clock at 1733 MHz, 10.6 ms at x8 at 2525 MHz; x4's prices put
+x8 at about 1.23 x what x8 then measured running; from x16 on the prices matched), so a step up one node
+from x4 or below is tried when that price is within
 1.4 x the budget: it runs pipelined from its
 first group, and its own prices then hold it or let it fall. A fallen try waits 15 s before that node is
 tried again, doubling up to 300 s, and 300 s at once when its own price came out at or above the price it

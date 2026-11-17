@@ -1,6 +1,6 @@
-// Sharpen (CAS): a checkbox enables Contrast Adaptive Sharpening and reveals a 0..1 strength slider;
-// unchecking hides the slider and disables it. Default is on at full strength (1.0). The strength is
-// forwarded to the engine as --sharpen; both the on/off state and the value persist between sessions.
+// Sharpen: a checkbox enables Adaptive Sharpen and reveals a 0..2 strength slider; unchecking hides
+// the slider and sends no --sharpen. Default is on at strength 1.0. The strength is forwarded to the
+// engine as --sharpen; both the on/off state and the value persist between sessions.
 function syncSharpen() {
   const on = $('sharpen').checked;
   $('sharpwrap').style.display = on ? 'flex' : 'none';

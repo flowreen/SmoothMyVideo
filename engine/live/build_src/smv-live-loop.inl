@@ -3333,17 +3333,19 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
         double upK = kUpKDefault, upPred = 0, upFailT = 0, upBackoffMs = kUpBackoff0, upOverT = 0;
         uint32_t upM = 0;
         // A DEEP TRY: a Smooth Motion step-up to a deeper pipelined ladder is priced at the running ladder's pipelined
-        // calls (or the ratios learned there), yet a call costs less the more bridge instances run side by side
-        // (2560x1440, 21.5 fps: x4's prices put x8 at ~1.23 x what x8 then measured running, ~1.3 x the budget with
-        // kUpKDefault for an x8 whose own price fits). Such a ladder is admitted up to kDeepTry x the budget as a timed
+        // calls (or the ratios learned there), yet where the GPU is the limit a call costs less on the deeper ladder:
+        // the GPU's clock follows its load, and a light shallow ladder holds it low (2560x1440, 21.5 fps: a call
+        // 13.0 ms at x4 with the SM clock at 1733 MHz, 10.6 ms at x8 at 2525 MHz; x4's prices put x8 at ~1.23 x what
+        // x8 then measured running, ~1.3 x the budget with kUpKDefault for an x8 whose own price fits). Such a ladder is admitted up to kDeepTry x the budget as a timed
         // run, entering the pipelined route at once (deepTry = that ladder until it settles); its own prices then hold
         // it in the band or let it fall. A tried ladder keeps a back-off of its own (deepBackoff: kDeepBackoff0
         // doubling, kUpBackoffMax once its own price came out at or above the price it was tried at: no overprice to
         // find), so a failed try never holds back the step-ups the prices admit (the shared back-off above); deepLock
         // = the tried ladder while it is the lock, until it has held kUpResetMs. Only one node up from x4 or below
-        // (kDeepFromMax): the compute thread's call price holds its wait for the worker's join, spread over 2 calls at
-        // x4 and over 32 at x64, so the overprice is a shallow ladder's (x2 -> x4 0.91-0.94 x, x4 -> x8 0.81-0.85 x
-        // their own prices; x16 -> x32 at 854x480 and x64 -> x128 1.03-1.05 x: none, a try there only falls)
+        // (kDeepFromMax): from x8 up the load keeps the clock near its top, so the overprice is a shallow ladder's
+        // (x2 -> x4 0.91-0.94 x, x4 -> x8 0.81-0.85 x their own prices; x16 -> x32 at 854x480 and x64 -> x128
+        // 1.03-1.05 x: none, a try there only falls). The compute thread waits ~0 ms in the worker's join at every
+        // depth, so its call price carries no wait
         const double kDeepTry = 1.4, kDeepBackoff0 = 15000.0;
         const uint32_t kDeepFromMax = 4;
         uint32_t deepTry = 0, deepLock = 0;
@@ -3596,6 +3598,17 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
                     deepBackoff.erase(deepLock); // the tried ladder has held: a later fall is any lock's
                     deepFailAt.erase(deepLock);
                     deepLock = 0;
+                }
+                // a target between multiples runs the grid, the choice the unlocked branch below makes: a lock more than
+                // 5 % under the throttle's r whose ladder reaching r is past the user's target +3 % (or the slots) is let
+                // go, else a lock taken at the throttle's start (twice the source rate) or a step-up that stopped under
+                // such a target holds below it for the session (60 on a 21.5 fps source: x2 = 43). The 2 % between
+                // this 0.95 and the 0.97 a lock is taken at keeps the two from trading places. The midpoint tree runs
+                // its nodes only.
+                if (!tree && settled && lockLogged < r * 0.95 && !fits((uint32_t)ceil(r * 0.97)))
+                {
+                    upOverT = 0;
+                    return 0;
                 }
                 const uint32_t next = tree ? lockLogged * 2 : lockLogged + 1;
                 if (!(settled && fits(next) && afford(next)))

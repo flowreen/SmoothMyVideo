@@ -1,9 +1,8 @@
 // part of smv-live-native.inl (included there, in place); not a standalone translation unit
 // ---- ArtCNN (`--artcnn`): C4F32_DN v1.6.2 (Artoriuz, MIT) in RTX VSR's resize, both routes ----
-// kAcnA + kAcnB = the module text exactly as its kernel kit gated it (a splice script writes them and checks them after
-// every clang-format; never edit the raw strings by hand): the luma net's four kernels (conv0, the 32 -> 32 body on
-// the tensor cores with fp16 sums, conv6 with the DepthToSpace in its store) + k_acnY / k_acnMerge. The kit gates the
-// text (acn_c4_gate.py: the net vs the author's ONNX in fp64, tiles vs whole frames byte for byte).
+// kAcnA + kAcnB = the module text: the luma net's four kernels (conv0, the 32 -> 32 body on
+// the tensor cores with fp16 sums, conv6 with the DepthToSpace in its store) + k_acnY / k_acnMerge. The text is checked
+// against the author's ONNX net in fp64, and tiles against whole frames byte for byte.
 static const char kAcnA[] = R"ACNSRC(
 // ArtCNN C4F32_DN v1.6.2 (Artoriuz, MIT) on the tensor cores, the host's own module text: the luma x2. conv0 1 -> 32,
 // conv1 .. conv4 32 -> 32 + ReLU, conv5 32 -> 32 + conv0's output, conv6 32 -> 4 = DepthToSpace DCR 2, clipped 0..1;

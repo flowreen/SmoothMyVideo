@@ -242,8 +242,8 @@ __global__ void k_resizeV(const float* __restrict__ tmp, int w, int ch,
     dst[2 * planeStride + o] = a2 < 0.0f ? 0.0f : (a2 > 1.0f ? 1.0f : a2);
 }
 
-// ---- HDR. Verbatim math of live_server.py _scrgb_to_pq2020 (~48-64) and
-// _pack_r10a2 (~66-73): the BT.2087 709 to 2020 matrix runs FIRST, the >= 0 clamp is AFTER it
+// ---- HDR. scRGB to PQ in BT.2020 and its R10G10B10A2 pack: the BT.2087 709 to 2020 matrix runs FIRST, the >= 0
+// clamp is AFTER it
 // (negative scRGB is valid wide-gamut colour that only goes out of range once in BT.2020),
 // scRGB 1.0 = 80 nits against PQ 1.0 = 10000, then the ST 2084 inverse EOTF. The capture
 // texture is R16G16B16A16_FLOAT, so the channels come in as (R,G,B); the SDR packers read
@@ -399,8 +399,7 @@ __global__ void k_packOutHdr(const void* __restrict__ src, int half, int planeSt
 }
 
 // ---- live Sharpen and RTX VSR inside the native host ---------------------------------------
-// Both effects run at the PRESENTED size, after the fit, exactly like live_server.py's compose
-// (upscale, then the sharpen): the fit lands in a planar staging frame at dw x dh (the Lanczos pair, or
+// Both effects run at the PRESENTED size, after the fit, the upscale first, then the sharpen: the fit lands in a planar staging frame at dw x dh (the Lanczos pair, or
 // the VSR bridge output unpacked by k_unpackBgraRgb), and the sharpen kernels apply Adaptive Sharpen
 // on it while doing the slot store that k_packOut / k_packOutHdr do without effects.
 
@@ -456,7 +455,7 @@ __global__ void k_unpackBgraRgb(const unsigned char* __restrict__ src, int dw, i
 }
 
 // RGBA8 back to the offline (R, G, B) planes: a DLSS 4.5 host frame or RTX VSR's output,
-// dlssg.py _recv (uint8 / 255.0, a division, as python and k_unpackBgraRgb)
+// each byte / 255.0 (a division, as k_unpackBgraRgb)
 __global__ void k_unpackRgba(const unsigned char* __restrict__ src, int dw, int dh,
                              float* __restrict__ dst)
 {
@@ -1505,9 +1504,9 @@ __device__ __forceinline__ void nrGet(unsigned long long surf, const unsigned sh
     }
 }
 
-// offline DLSS 5: dlssnr.py process() around the NR host's RGBA16F frame. In: the dw x dh
-// picture of a planar (R, G, B) frame, clamp(0, 1).to(float16) (round to nearest even, torch's
-// cast) plus alpha 1.0. Out: the first three channels, .float().clamp(0, 1), written back over
+// offline DLSS 5: the NR host's RGBA16F frame in and out. In: the dw x dh
+// picture of a planar (R, G, B) frame, clamped to 0..1 and rounded to fp16 (round to nearest even)
+// plus alpha 1.0. Out: the first three channels as fp32, clamped to 0..1, written back over
 // the whole pw x ph padded frame with the edge replicated into the pad, as k_packInRaw8 / 16
 // pad a decoded frame. Zero-copy (surf != 0): the texels go straight into the core's Color texture
 // and come straight out of its Output texture, no copy between the kernels and the core; CPU staging:
@@ -1788,17 +1787,16 @@ __global__ void k_clamp01(float* __restrict__ p, int n)
 //               1. The taps are integers, no fp centre exists to drift. The timestep is NOT
 //               folded in: python's `interp(t * flow) * 0.5` equals `t * (interp(flow) * 0.5)`,
 //               so the pyramids are built once per pair and k_splatSoft applies s.
-//   k_splatSoft softsplat.py's softsplat_out_det (the SMV int64 fixed-point forward) with the
+//   k_splatSoft the forward softmax splat as int64 fixed-point sums (deterministic) with the
 //               'soft' mode's cat(in * exp(Z), exp(Z)) computed on the fly in fp32: Z = s *
 //               metric, the flow = s * flow, s = t for the 0 -> 1 splat, 1 - t for the 1 -> 0
-//               splat. Same four corner weights, same `llrintf(v * w * 2^26)` product order,
-//               same int64 atomics; the cell and the weights come from the offset s * flow
-//               (floor + exact fraction, below), so the accumulators match python's kernel bit
-//               for bit only where the position is exactly representable (the harness's
-//               quantized-flow control) and sit nearer the exact splat than python's fp32
-//               `x + s * flow` everywhere else; python also takes exp and the product in fp16
-//               under autocast (~1e-3 off fp64), this kernel in fp32.
-//   k_splatNorm python's tail: acc.to(float32) * 2^-26 per plane, out = v / (vN + 1e-7),
+//               splat. Four corner weights, `llrintf(v * w * 2^26)` products, int64 atomics;
+//               the cell and the weights come from the offset s * flow (floor + exact fraction,
+//               below), so the accumulators equal a splat that forms the position as an fp32
+//               `x + s * flow` bit for bit only where that position is exactly representable (a
+//               quantized flow), and sit nearer the exact splat everywhere else; exp and the
+//               product run in fp32 (fp16 under autocast is ~1e-3 off fp64).
+//   k_splatNorm the tail: acc.to(float32) * 2^-26 per plane, out = v / (vN + 1e-7),
 //               written as C planes of the target (the fusionnet input planes: a channel concat
 //               is adjacent planes, so no cat).
 // Checked against fp64 references on real-motion inputs through the engines.
@@ -1890,7 +1888,7 @@ __global__ void k_splatSoft(const void* __restrict__ in, int inHalf, int C, int 
     bool act = x < w && y < h;
     const size_t o = act ? (size_t)y * w + x : 0;
     // the target cell and the corner weights from land(), never an fp32 absolute position:
-    // python's fp32 `x + s * flow` carries a 6e-5 px error at x ~ 600..960 (one fp32 ulp), which
+    // an fp32 `x + s * flow` carries a 6e-5 px error at x ~ 600..960 (one fp32 ulp), which
     // measures up to 8.7e-4 of the normalized output where the weight sum is small
     int nwX = 0, nwY = 0;
     float dx = 0.0f, dy = 0.0f;
@@ -2480,12 +2478,11 @@ __global__ void k_sharpPlanar(const float* __restrict__ src, int ps, int rs, int
 }
 
 // ---- live RTX TrueHDR inside the native host ----------------------------------------------
-// Verbatim math of live_server.py _cap_to_pq2020 (~88) and rtxvideo.py _eval_thdr (~248),
-// run_hdr_pq (~280), _ictcp_linear (~330), _rtx_linear (~355), _vibrance_gain and
-// _luma_weight. TrueHDR runs ONCE PER REAL FRAME at capture resolution; the PQ result is
-// resized on PQ afterwards, exactly as python does.
+// The capture to PQ step, TrueHDR's input and its colour step (vivid = through ICtCp, rtx = in
+// linear RGB), the vibrance gain and the luma weight. TrueHDR runs ONCE PER REAL FRAME at capture
+// resolution; the PQ result is resized on PQ afterwards.
 
-// ST 2084 EOTF (_pq_to_linear): PQ code' in [0,1] -> display-linear in [0,1].
+// ST 2084 EOTF: PQ code' in [0,1] -> display-linear in [0,1].
 __device__ __forceinline__ float pq_eotf(float e)
 {
     const float M1 = 0.1593017578125f, M2 = 78.84375f;
@@ -2499,7 +2496,7 @@ __device__ __forceinline__ float pq_eotf(float e)
     return powf(num / den, 1.0f / M1);
 }
 
-// ST 2084 inverse EOTF (_linear_to_pq): display-linear in [0,1] -> PQ code' in [0,1].
+// ST 2084 inverse EOTF: display-linear in [0,1] -> PQ code' in [0,1].
 __device__ __forceinline__ float pq_oetf(float lin)
 {
     const float M1 = 0.1593017578125f, M2 = 78.84375f;
@@ -2587,8 +2584,8 @@ __global__ void k_unpackR10(const unsigned int* __restrict__ src, int dw, int dh
     dst[2 * plane + o] = v[2];
 }
 
-// the two numerically inverted matrices (python inverts in float64 then casts to fp32); the
-// host computes them in double at init and uploads them here.
+// the two numerically inverted matrices: the host inverts them in double at init, casts them to
+// fp32 and uploads them here.
 __device__ float g_ictcp2lms[9];
 __device__ float g_lms2rgb[9];
 
@@ -2667,8 +2664,8 @@ __global__ void k_sdrEncode(const unsigned short* __restrict__ src, int cw, int 
     dstG[2 * plane + o] = g[2];
 }
 
-// the vivid / rtx colour step of one pixel (_source_at_thdr_luma + _ictcp_linear / _rtx_linear +
-// _pack_out's nan_to_num): the bridge word u (10:10:10:2, R in the LOW 10 bits) and the
+// the vivid / rtx colour step of one pixel (the source at TrueHDR's luma, the ICtCp or linear RGB
+// correction, NaN to 0 on the way out): the bridge word u (10:10:10:2, R in the LOW 10 bits) and the
 // unquantised SDR source s0..s2 (gamma BT.709, R, G, B) -> the corrected linear BT.2020 in
 // [0,1]. mode 0 = vivid, 1 = rtx. k_thdrColor's colour step (both routes).
 __device__ __forceinline__ void thdr_linear(unsigned int u, float s0, float s1, float s2,
@@ -2757,7 +2754,7 @@ __device__ __forceinline__ void thdr_vibrance(float& p0, float& p1, float& p2, f
 // colour mode against the unquantised source, and write planar PQ into the padded model frame
 // (pw x ph, planes dps apart) with the edge replicated as k_padPlanar pads it: a pad pixel takes
 // the result of the edge pixel it repeats.
-// mode 0 = vivid (_ictcp_linear), 1 = rtx (_rtx_linear), 2 = raw (TrueHDR's result as is, Dynamic Vibrance when on).
+// mode 0 = vivid (through ICtCp), 1 = rtx (in linear RGB), 2 = raw (TrueHDR's result as is, Dynamic Vibrance when on).
 __global__ void k_thdrColor(const unsigned int* __restrict__ thdrOut,
                             const float* __restrict__ srcG, int cw, int ch,
                             float* __restrict__ dst, int pw, int ph, int dps,
@@ -2789,9 +2786,9 @@ __global__ void k_thdrColor(const unsigned int* __restrict__ thdrOut,
     dst[2 * (size_t)dps + o] = p2;
 }
 
-// ---- offline RTX TrueHDR (rtxvideo.run_hdr on every output frame) -------------------------
-// The output-size SDR frame after the pass chain -> the bridge's RGBA8 input (_eval_thdr: clamp,
-// * 255, round) and the unquantised planar source the colour step reads (R, G, B, tight).
+// ---- offline RTX TrueHDR (on every output frame) -------------------------------------------
+// The output-size SDR frame after the pass chain -> the bridge's RGBA8 input (clamp, * 255,
+// round) and the unquantised planar source the colour step reads (R, G, B, tight).
 __device__ __forceinline__ void thdr_in_store(float r, float g, float b, size_t o, size_t plane,
                                               unsigned char* __restrict__ rgba, float* __restrict__ dstG)
 {
@@ -2836,7 +2833,7 @@ __global__ void k_sharpThdrIn(const float* __restrict__ src, int ps, int rs, int
     thdr_in_store(c[0], c[1], c[2], (size_t)oy * dw + ox, (size_t)dw * dh, rgba, dstG);
 }
 
-// the 10-bit PQ code -> display-linear table of _accum_hp (_pq_to_linear(arange(1024) / 1023))
+// the 10-bit PQ code -> display-linear table of the statistics' accumulation (pq_eotf(i / 1023), i = 0..1023)
 __global__ void k_pqLut(float* __restrict__ dst)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2897,9 +2894,9 @@ __global__ void k_pqOut(const void* __restrict__ src, int half, int planeStride,
     if (tid < 4 && shMax[tid]) atomicMax(&misc[tid], shMax[tid]);
 }
 
-// Offline render: raw interleaved RGB frames (rgb48le or rgb24, the decoder pipe format
-// render.py uses) <-> the model's planar fp32 [0,1] with replicate pad, channel order R,G,B exactly
-// as render.py's to_tensor / to_bytes (the live route packs BGRA8 and is a different contract).
+// Offline render: raw interleaved RGB frames (rgb48le or rgb24, the decoder pipe's format)
+// <-> the model's planar fp32 [0,1] with replicate pad, channel order R,G,B (the live route
+// packs BGRA8 and is a different contract).
 __global__ void k_packInRaw16(const unsigned short* __restrict__ src, int w, int h,
                               float* __restrict__ dst, int ph, int pw, int planeStride)
 {
@@ -4506,8 +4503,8 @@ extern "C" __global__ void k_nvofCompose(const float* __restrict__ i0, const flo
 }
 
 // ---- native DRBA glue -----------------------------------------------------------------------
-// The two pieces DRBA adds around the IFNet, ported from the python reference:
-//   rife_backend.RIFE.calc_flow's tail: block0's flow (4 planes, 0->0.5 | 1->0.5, sampled from
+// The two pieces DRBA adds around the IFNet, as its author's code (routineLife1/DRBA) computes them:
+//   RIFE.calc_flow's tail: block0's flow (4 planes, 0->0.5 | 1->0.5, sampled from
 //     block0's 1/16 planes, drbaFlowAt) splatted by
 //     itself with softsplat 'avg', negated, holes (splatted ones < 0.999) filled with
 //     max(H, W), times 2 = flow05 * 2 | flow15 * 2.
@@ -4905,7 +4902,7 @@ extern "C" __global__ void __launch_bounds__(128) k_localCorrT(const unsigned sh
     }
 }
 
-// GMFlow's global matching and its flow propagation (between gmflow_bidir_a_m and A, trt_runtime.gmflow_matching_cut):
+// GMFlow's global matching and its flow propagation (between `_m` and A):
 // O[b, i] = sum_j softmax_j(Q[b, i] . K[b ^ kswap, j] * scale) V[b, j] with 128 channels and a 2-channel value. The
 // matching: Q = K = mf (f0, f1 token-major), kswap 1 (each frame's tokens attend to the other's), V = the pixel grid
 // (mode 1: x = j % gw, y = j / gw) and O minus the query's own grid point = the flow (mode 2); the propagation: mq / mk,
